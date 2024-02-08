@@ -1,0 +1,13 @@
+BUILD_ID=rolling
+ANSI_COLOR="38;2;23;147;209"
+IMAGE_ID=aios
+IMAGE_VERSION=2024.02.11
+NAME=ai os
+PRETTY_NAME=ai os
+ID=ai
+HOME_URL=https://git.syui.ai/ai/os
+DOCUMENTATION_URL=https://git.syui.ai/ai/os/wiki
+SUPPORT_URL=https://git.syui.ai/ai/os/issues
+BUG_REPORT_URL=https://git.syui.ai/ai/os/issues
+PRIVACY_POLICY_URL=https://git.syui.ai/ai/os
+LOGO=ai-logo
