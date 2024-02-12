@@ -3,58 +3,32 @@
 <img src="./icon/ai.png" width="100">
 
 - name : ai os
+- image : [aios-bootstrap.tar.gz](https://github.com/syui/aios/releases/tag/latest)
 - base : [archlinux](https://gitlab.archlinux.org/archlinux)
 
 ### docker
 
 ```sh
-$ docker run --rm syui/aios ai
+$ docker run -it syui/aios ai
 ```
 
-### archiso
-
-- [profile.rst](https://gitlab.archlinux.org/archlinux/archiso/-/blob/master/docs/README.profile.rst)
+> Dockerfile
 
 ```sh
-$ pacman -S archiso
+FROM syui/aios
 ```
+
+- https://hub.docker.com/r/syui/aios
+
+### github
 
 ```sh
-$ git clone https://git.syui.ai/ai/os
-$ cd os
-$ git clone https://gitlab.archlinux.org/archlinux/archlinux-docker
-$ git clone https://gitlab.archlinux.org/archlinux/archiso
-
-$ vim ./archiso/configs/releng/profiledef.sh
-
-$ mkarchiso -v -o ./ ./archiso/configs/releng
+$ docker run -it ghcr.io/syui/aios ai
 ```
 
-### system
+- https://github.com/users/syui/packages/container/package/aios
 
-> ./archiso/configs/releng/profiledef.sh
+### link
 
-```sh
-buildmodes=('bootstrap')
-```
-
-```sh
-$ mkarchiso -v -o ./ ./archiso/configs/releng
-$ tar xf aios-bootstrap*.tar.gz
-$ echo -e 'Server = http://mirrors.cat.net/archlinux/$repo/os/$arch\nServer = https://geo.mirror.pkgbuild.com/$repo/os/$arch' >> ./root.x86_64/etc/pacman.d/mirrorlist
-$ sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/etc/pacman.conf
-$ arch-chroot ./root.x86_64
----
-$ pacman -S base base-devel linux vim git zsh rust
-$ pacman-key --init
-$ pacman-key --populate archlinux
-$ exit
----
-$ tar -C root.x86_64 -c . | docker import - syui/aios
-$ docker images
-
-$ docker run --rm syui/aios cargo version
-cargo 1.75.0
-```
-
-
+- https://git.syui.ai/ai/os
+- https://github.com/syui/aios
