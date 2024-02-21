@@ -1,0 +1,25 @@
+name: Build and Push Image
+on: [ push ]
+
+env:
+  USERNAME: ai
+  TAG: latest
+  IMAGE_NAME: ${{ gitea.repository }}
+  APP_TOKEN: ${{ secrets.APP_TOKEN }}
+  REGISTRY: localhost:8088
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    container: 
+      image: archlinux 
+      options: --privileged
+    steps:
+      - name: Initialize
+        run: |
+          pacman -Syuu --noconfirm base-devel archiso docker git
+          docker pull syui/aios
+          docker tag syui/aios  ${{ env.REGISTRY }}/${{ env.USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          echo "${{ env.APP_TOKEN }}" | docker login ${{ env.REGISTRY }} -u syui --password-stdin
+          docker push ${{ env.REGISTRY }}/${{ env.USERNAME }}/${{ env.IMAGE_NAME }}:latest
