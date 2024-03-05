@@ -1,5 +1,11 @@
-name: Build and Push Image
-on: [ push ]
+name: build and push image
+
+on: 
+  push:
+    branches:
+      - main
+    paths:
+      - '!README.md'
 
 env:
   TAG: latest
