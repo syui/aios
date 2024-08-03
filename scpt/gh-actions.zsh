@@ -9,8 +9,6 @@ on:
   push:
     branches:
     - main
-  schedule:
-    - cron:  "0 0 * * *"
 
 permissions:
   contents: write
@@ -68,4 +66,6 @@ cat $dd/cfg/gh-actions.yml
 echo '#!/bin/zsh' >! $dd/build.zsh
 echo $yml_b >> $dd/build.zsh
 cat $dd/build.zsh
+
+cp -rf $dd/cfg/gh-actions.yml $dd/.github/workflows/release.yml
 

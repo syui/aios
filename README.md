@@ -80,6 +80,18 @@ Copying blob c7e55fecf0be [====================>-----------------] 917.4MiB / 1.
 
 stop
 
+```sh
+  schedule:
+      - cron:  "0 0 * * *"
+```
+
+## update action
+
+```sh
+$ vim build.zszh
+$ ./scpt/gh-actions.zsh
+```
+
 ## link
 
 - https://git.syui.ai/ai/os
