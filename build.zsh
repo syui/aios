@@ -1,5 +1,5 @@
 #!/bin/zsh
-pacman -Syuu --noconfirm base-devel archiso docker git nodejs
+pacman -Syuu --noconfirm base-devel archiso docker git nodejs bc
 git clone https://gitlab.archlinux.org/archlinux/archiso
 cp -rf ./cfg/profiledef.sh /usr/share/archiso/configs/releng/
 cp -rf ./cfg/profiledef.sh ./archiso/configs/releng/profiledef.sh

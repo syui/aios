@@ -55,11 +55,16 @@ $ docker run -it ghcr.io/syui/aios ai
 
 ```sh
 $ podman pull aios
+
+$ podman machine init
+$ podman machine start
 ```
 
 https://github.com/containers/shortnames
 
 > /etc/containers/registries.conf.d/ai.conf
+>
+> ~/.config/containers/registries.conf
 
 ```sh
 unqualified-search-registries = ['docker.io', 'git.syui.ai', 'ghcr.io']
@@ -79,6 +84,18 @@ Copying blob c7e55fecf0be [====================>-----------------] 917.4MiB / 1.
 ## cron
 
 stop
+
+```sh
+  schedule:
+      - cron:  "0 0 * * *"
+```
+
+## update action
+
+```sh
+$ vim build.zszh
+$ ./scpt/gh-actions.zsh
+```
 
 ## link
 
