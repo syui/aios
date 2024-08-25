@@ -101,3 +101,4 @@ $ ./scpt/gh-actions.zsh
 
 - https://git.syui.ai/ai/os
 - https://github.com/syui/aios
+
