@@ -14,7 +14,7 @@ Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' >> ./root.x86_64/etc/pa
 sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/etc/pacman.conf
 arch-chroot root.x86_64 /bin/sh -c 'pacman-key --init'
 arch-chroot root.x86_64 /bin/sh -c 'pacman-key --populate archlinux'
-arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs docker podman'
+arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs docker podman bc'
 arch-chroot root.x86_64 /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'
 arch-chroot root.x86_64 /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
 arch-chroot root.x86_64 /bin/sh -c 'chsh -s /bin/zsh'
