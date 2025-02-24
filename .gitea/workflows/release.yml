@@ -2,12 +2,8 @@ name: build and push image
 
 on: 
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 0 * * *'
   push:
-    branches:
-      - main
-    paths:
-      - '!README.md'
 
 env:
   TAG: latest
@@ -21,14 +17,14 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     container: 
-      image: syui/aios
+      image: ghcr.io/syui/aios
       options: --privileged
     steps:
       - name: Initialize
         run: |
           pacman -Syuu --noconfirm base-devel archiso docker git curl
-          docker pull syui/aios
-          docker tag syui/aios  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          docker pull ghcr.io/syui/aios
+          docker tag syui/aios ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
           echo "${{ env.APP_TOKEN }}" | docker login ${{ env.REGISTRY }} -u syui --password-stdin
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
 
