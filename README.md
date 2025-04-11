@@ -54,20 +54,26 @@ $ docker run -it ghcr.io/syui/aios ai
 ## podman
 
 ```sh
-$ podman pull aios
-
-$ podman machine init
-$ podman machine start
+if [ ! -d ~/ai/os/.git ];then
+    mkdir -p ~/ai
+    git clone https://git.syui.ai/ai/os ~/ai/os
+fi
+if [ ! -d ~/.config/containers/registries.conf.d ];then
+    mkdir -p ~/.config/containers/registries.conf.d
+fi
+ln -s ~/ai/os/.config/containers/registries.conf.d/ai.conf ~/.config/containers/registries.conf.d/ai.conf
 ```
 
-https://github.com/containers/shortnames
+```sh
+$ podman pull aios
+```
 
-> /etc/containers/registries.conf.d/ai.conf
->
-> ~/.config/containers/registries.conf
+> ~/.config/containers/registries.conf.d/ai.conf
 
 ```sh
-unqualified-search-registries = ['docker.io', 'git.syui.ai', 'ghcr.io']
+# https://github.com/containers/shortnames
+# ~/.config/containers/registries.conf.d/ai.conf
+unqualified-search-registries = ['git.syui.ai', 'docker.io', 'ghcr.io']
 
 [aliases]
 "aios" = "git.syui.ai/ai/os"
