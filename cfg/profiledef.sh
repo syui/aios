@@ -3,8 +3,8 @@
 
 iso_name="aios"
 iso_label="AI_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"
-iso_publisher="ai os <https://git.syui.ai/ai/os>"
-iso_application="ai os Live/Rescue DVD"
+iso_publisher="aios <https://git.syui.ai/ai/os>"
+iso_application="aios Live/Rescue DVD"
 iso_version="$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y.%m.%d)"
 install_dir="ai"
 #buildmodes=('iso')
