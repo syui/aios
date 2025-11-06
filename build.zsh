@@ -25,8 +25,27 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai
 # Copy os-release
 cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 
-# Copy .zshrc
+# Create default user 'ai'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "ai:root" | chpasswd'
+
+# Enable wheel group for sudo
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'sed -i "s/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/" /etc/sudoers'
+
+# Setup auto-login for user 'ai'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
+cat > root.x86_64/var/lib/machines/arch/etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin ai --noclear %I $TERM
+EOF
+
+# Copy .zshrc for root
 cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
+
+# Copy .zshrc for user 'ai'
+cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/home/ai/.zshrc
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
 # Install aigpt (AI memory system)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
