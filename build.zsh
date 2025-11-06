@@ -31,8 +31,18 @@ cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
 # Install aigpt (AI memory system)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
 
-# Register aigpt to Claude MCP
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'claude mcp add aigpt $(which aigpt) server'
+# Setup Claude Code MCP configuration
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p ~/.config/claude'
+cat > root.x86_64/var/lib/machines/arch/root/.config/claude/claude_desktop_config.json <<'EOF'
+{
+  "mcpServers": {
+    "aigpt": {
+      "command": "aigpt",
+      "args": ["server", "--enable-layer4"]
+    }
+  }
+}
+EOF
 
 # Install ai/bot (optional, for backward compatibility)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
