@@ -1,110 +1,232 @@
-# <img src="./icon/ai.png" width="30"> ai `os` 
+# <img src="./icon/ai.png" width="30"> ai `os`
 
-`aios` is a simple linux distribution based on `archlinux`.
+**aios** = AI-managed OS with shared memory
 
-|rule|var|
-|---|---|
-|name|ai os|
-|code|aios|
-|id|ai|
-|container|[git.syui.ai/ai/os](https://git.syui.ai/ai/-/packages/container/os/latest)|
-|image|[aios-bootstrap.tar.gz](https://github.com/syui/aios/releases/download/latest/aios-bootstrap.tar.gz)|
+An ArchLinux-based OS where AI conversation interface replaces the traditional shell.
 
-```sh
-$ docker run -it git.syui.ai/ai/os ai
+```
+User → AI Chat → Commands → Execution
+          ↓
+      aigpt (shared memory)
+          ↓
+    systemd-nspawn (isolated environment)
 ```
 
-## link
+## Philosophy
 
-|host|command|url|
-|---|---|---|
-|docker|syui/aios|https://hub.docker.com/r/syui/aios|
-|github|ghcr.io/syui/aios|https://github.com/users/syui/packages/container/package/aios|
-|syui|git.syui.ai/ai/os|https://git.syui.ai/ai/-/packages/container/os|
+**Insert AI into existing flows**
 
-## base
+- Traditional: `User → Shell → Commands`
+- aios: `User → AI Chat → Commands`
 
-```sh
-# https://gitlab.archlinux.org/archlinux
-$ git clone https://gitlab.archlinux.org/archlinux/archiso
-```
+Simply insert AI layer into the existing workflow.
 
-## docker
+## Core Features
+
+### 1. AI-First Interface
+
+Default interface is AI conversation, not shell.
 
 ```sh
-# https://git.syui.ai/ai/-/packages/container/os
-$ docker run -it git.syui.ai/ai/os ai
+> Install rust development environment
+✓ Installing rust, rust-analyzer, neovim
+✓ Done
 
-# https://hub.docker.com/r/syui/aios
-$ docekr run -it syui/aios ai
-
-# https://github.com/users/syui/packages/container/package/aios
-$ docker run -it ghcr.io/syui/aios ai
+> What did I install yesterday?
+Yesterday you installed Python with poetry.
 ```
 
-## token
+### 2. Shared Memory (aigpt)
 
-|env|body|
-|---|---|
-|${{ github.repository }}|syui/aios|
-|${{ secrets.DOCKER_USERNAME }}|syui|
-|${{ secrets.DOCKER_TOKEN }}|[token](https://matsuand.github.io/docs.docker.jp.onthefly/docker-hub/access-tokens/)|
-|${{ secrets.APP_TOKEN }}|[token](https://docs.github.com/ja/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens), pacakge|
+All containers share the same memory database.
 
-## podman
+```
+Host: ~/.config/syui/ai/gpt/memory.db (shared)
+  ↓
+aios-dev  → bind mount → same DB
+aios-prod → bind mount → same DB
+```
+
+AI learns from all environments and remembers your preferences.
+
+### 3. Environment Isolation
+
+Execution environments are isolated using systemd-nspawn.
 
 ```sh
-if [ ! -d ~/ai/os/.git ];then
-    mkdir -p ~/ai
-    git clone https://git.syui.ai/ai/os ~/ai/os
-fi
-if [ ! -d ~/.config/containers/registries.conf.d ];then
-    mkdir -p ~/.config/containers/registries.conf.d
-fi
-ln -s ~/ai/os/.config/containers/registries.conf.d/ai.conf ~/.config/containers/registries.conf.d/ai.conf
+# Development environment
+$ systemd-nspawn --machine=aios-dev
+
+# Production environment
+$ systemd-nspawn --machine=aios-prod
 ```
+
+Memory is shared, but environments are separated.
+
+## Architecture
+
+```
+aios (ArchLinux base)
+├── aigpt (memory system)
+│   ├── SQLite with WAL mode
+│   ├── Layer 3: Personality analysis
+│   └── Layer 4: Relationship inference
+├── MCP (AI connection standard)
+│   └── Claude Code / ChatGPT / Custom AI
+├── systemd-nspawn (container runtime)
+│   └── Shared memory bind mount
+└── Permission system
+    ├── Auto-allow
+    ├── Notify
+    ├── Require approval
+    └── Deny
+```
+
+## Quick Start
+
+### Installation
 
 ```sh
-$ podman pull aios
+# Clone repository
+$ git clone https://github.com/syui/aios
+$ cd aios
+
+# Run installer
+$ sudo ./aios-install.sh
 ```
 
-> ~/.config/containers/registries.conf.d/ai.conf
+### Usage
 
 ```sh
-# https://github.com/containers/shortnames
-# ~/.config/containers/registries.conf.d/ai.conf
-unqualified-search-registries = ['git.syui.ai', 'docker.io', 'ghcr.io']
+# Start aios container
+$ sudo systemctl start systemd-nspawn@aios
 
-[aliases]
-"aios" = "git.syui.ai/ai/os"
+# Enter aios shell
+$ sudo machinectl shell aios
+
+# Inside aios, AI chat interface starts
+[aios] >
 ```
+
+## Container Distribution
+
+Pre-built containers are available:
 
 ```sh
-$ podman pull aios
-Resolved "aios" as an alias (/etc/containers/registries.conf.d/ai.conf)
-Trying to pull git.syui.ai/ai/os:latest...
-Getting image source signatures
-Copying blob c7e55fecf0be [====================>-----------------] 917.4MiB / 1.7GiB
+# Docker
+$ docker run -it git.syui.ai/ai/os
+$ docker run -it ghcr.io/syui/aios
+
+# Podman
+$ podman pull aios  # using shortname alias
 ```
 
-## cron
+## Configuration
 
-stop
+### Directory Structure
+
+```
+~/.config/syui/ai/
+├── gpt/
+│   ├── memory.db       # Shared memory (SQLite WAL)
+│   ├── memory.db-wal
+│   └── memory.db-shm
+├── mcp.json           # MCP server configuration
+└── config.toml        # aios configuration
+```
+
+### MCP Configuration
+
+`~/.config/syui/ai/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "aigpt": {
+      "command": "aigpt",
+      "args": ["server", "--enable-layer4"]
+    }
+  }
+}
+```
+
+### Permission System
+
+`~/.config/syui/ai/config.toml`:
+
+```toml
+[permissions]
+# Auto-allow (no approval)
+auto_allow = ["pacman -Q*", "ls", "cat"]
+
+# Notify (log only)
+notify = ["pacman -S*", "git clone*"]
+
+# Require approval
+require_approval = ["rm -rf*", "systemctl stop*"]
+
+# Deny
+deny = ["rm -rf /", "mkfs*"]
+```
+
+## Building from Source
 
 ```sh
-  schedule:
-      - cron:  "0 0 * * *"
+# Install dependencies
+$ pacman -S base-devel archiso docker git rust
+
+# Build bootstrap image
+$ ./build.zsh
+
+# Result: aios-bootstrap.tar.gz
 ```
 
-## update action
+## Integration with aigpt
 
-```sh
-$ vim build.zszh
-$ ./scpt/gh-actions.zsh
-```
+aios is designed to work with [aigpt](https://git.syui.ai/ai/gpt) (AI memory system).
 
-## link
+aigpt provides:
+- **Layer 1**: Memory storage
+- **Layer 2**: Priority scoring
+- **Layer 3**: Personality analysis (Big Five)
+- **Layer 4**: Relationship inference
 
-- https://git.syui.ai/ai/os
-- https://github.com/syui/aios
+All memories are shared across containers through bind-mounted SQLite database.
 
+## Comparison
+
+| Aspect | Traditional OS | aios |
+|--------|---------------|------|
+| Interface | Shell (bash/zsh) | AI Chat |
+| Command | Memorize syntax | Natural language |
+| Configuration | Manual editing | AI executes |
+| Learning | No | Yes (aigpt) |
+| Memory | No | Shared (SQLite) |
+| Isolation | Docker/Podman | systemd-nspawn |
+
+## Links
+
+- Repository: https://github.com/syui/aios
+- Git: https://git.syui.ai/ai/os
+- aigpt: https://git.syui.ai/ai/gpt
+- Container: https://git.syui.ai/ai/-/packages/container/os
+
+## Philosophy Detail
+
+From conversation with AI about aigpt:
+
+> "What is the essence of this design?"
+> "Simply insert AI into existing flows"
+>
+> - aigpt: Insert AI between conversation and memory
+> - aios: Insert AI between user and commands
+>
+> Not building something entirely new.
+> Just adding an AI layer to existing workflows.
+> And prepare the environment for that.
+
+This is aios.
+
+---
+
+© syui

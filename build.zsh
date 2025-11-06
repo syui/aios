@@ -18,5 +18,24 @@ arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linu
 arch-chroot root.x86_64 /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'
 arch-chroot root.x86_64 /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
 arch-chroot root.x86_64 /bin/sh -c 'chsh -s /bin/zsh'
+
+# Install aigpt (AI memory system)
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+
+# Install ai/bot (optional, for backward compatibility)
 arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
+
+# Create config directory
+arch-chroot root.x86_64 /bin/sh -c 'mkdir -p /root/.config/syui/ai/gpt'
+
+# Copy MCP and aios configuration
+cp -rf ./cfg/mcp.json root.x86_64/root/.config/syui/ai/mcp.json
+cp -rf ./cfg/config.toml root.x86_64/root/.config/syui/ai/config.toml
+
+# Initialize aigpt database with WAL mode
+arch-chroot root.x86_64 /bin/sh -c 'aigpt server --enable-layer4 &'
+sleep 2
+arch-chroot root.x86_64 /bin/sh -c 'pkill aigpt'
+arch-chroot root.x86_64 /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
+
 tar -zcvf aios-bootstrap.tar.gz root.x86_64/
