@@ -22,6 +22,9 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chsh -s /bin/zsh'
 # Install Claude Code
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
+# Copy os-release
+cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
+
 # Copy .zshrc
 cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
 
