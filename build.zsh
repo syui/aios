@@ -99,4 +99,11 @@ sleep 2
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pkill aigpt'
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
 
-tar -zcvf aios-bootstrap.tar.gz root.x86_64/
+# Copy aios-ctl.zsh for host machine control
+cp -rf ./cfg/aios-ctl.zsh root.x86_64/var/lib/machines/arch/opt/aios-ctl.zsh
+
+# Copy install script to root for easy access
+cp -rf ./cfg/install.sh ./install.sh
+chmod +x ./install.sh
+
+tar -zcvf aios-bootstrap.tar.gz root.x86_64/ install.sh
