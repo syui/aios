@@ -1,111 +1,98 @@
 # <img src="./icon/ai.png" width="30"> ai `os`
 
-**aios** = AI-managed OS with shared memory
+**aios** = ArchLinux + Claude Code + aigpt in systemd-nspawn
 
-An ArchLinux-based OS where AI conversation interface replaces the traditional shell.
+A minimal ArchLinux environment optimized for Claude Code with shared AI memory.
 
 ```
-User → AI Chat → Commands → Execution
-          ↓
-      aigpt (shared memory)
-          ↓
-    systemd-nspawn (isolated environment)
+systemd-nspawn container
+├── Claude Code (AI interface)
+├── aigpt (shared memory)
+└── zsh (.zshrc configured)
+
+$ sudo machinectl shell aios
+$ claude  # Start Claude Code
 ```
 
 ## Philosophy
 
 **Insert AI into existing flows**
 
-- Traditional: `User → Shell → Commands`
-- aios: `User → AI Chat → Commands`
+Instead of building a new AI chat interface, use **Claude Code** (which already works).
 
-Simply insert AI layer into the existing workflow.
+aios provides:
+1. Pre-installed **aigpt** (MCP server for shared memory)
+2. Pre-installed **Claude Code** (`npm i -g @anthropic-ai/claude-code`)
+3. Environment isolation with **systemd-nspawn**
+4. Shared memory across containers
 
-## Core Features
+## What's Included
 
-### 1. AI-First Interface
+### 1. Claude Code
 
-Default interface is AI conversation, not shell.
+Pre-installed and ready to use:
 
 ```sh
+$ claude
+# Claude Code starts, with MCP connection to aigpt
 > Install rust development environment
 ✓ Installing rust, rust-analyzer, neovim
-✓ Done
-
-> What did I install yesterday?
-Yesterday you installed Python with poetry.
 ```
 
-### 2. Shared Memory (aigpt)
+### 2. aigpt (Shared Memory)
 
-All containers share the same memory database.
+MCP server that provides persistent memory to Claude Code:
 
 ```
-Host: ~/.config/syui/ai/gpt/memory.db (shared)
-  ↓
-aios-dev  → bind mount → same DB
-aios-prod → bind mount → same DB
+~/.config/syui/ai/gpt/memory.db (SQLite, WAL mode)
+  ↓ bind mount
+aios-dev, aios-prod, etc. (all share same DB)
 ```
 
-AI learns from all environments and remembers your preferences.
+AI remembers your preferences across all containers.
 
-### 3. Environment Isolation
+### 3. systemd-nspawn
 
-Execution environments are isolated using systemd-nspawn.
+Lightweight container environment:
 
 ```sh
-# Development environment
-$ systemd-nspawn --machine=aios-dev
-
-# Production environment
-$ systemd-nspawn --machine=aios-prod
+$ sudo machinectl shell aios
+# Inside container with aigpt + Claude Code
 ```
 
-Memory is shared, but environments are separated.
+Multiple containers can share the same memory.
 
 ## Architecture
 
 ```
-aios (ArchLinux base)
-├── aigpt (memory system)
-│   ├── SQLite with WAL mode
-│   ├── Layer 3: Personality analysis
-│   └── Layer 4: Relationship inference
-├── MCP (AI connection standard)
-│   └── Claude Code / ChatGPT / Custom AI
-├── systemd-nspawn (container runtime)
-│   └── Shared memory bind mount
-└── Permission system
-    ├── Auto-allow
-    ├── Notify
-    ├── Require approval
-    └── Deny
+Host
+├── ~/.config/syui/ai/gpt/memory.db (shared)
+│
+└── /var/lib/machines/aios/ (container)
+    ├── ArchLinux base
+    ├── aigpt (MCP server)
+    ├── Claude Code
+    ├── .zshrc (aliases: ai=claude)
+    └── Bind mount → shared memory
 ```
 
 ## Quick Start
 
-### Installation
-
 ```sh
-# Clone repository
+# 1. Clone repository
 $ git clone https://github.com/syui/aios
 $ cd aios
 
-# Run installer
+# 2. Run installer (creates systemd-nspawn container)
 $ sudo ./aios-install.sh
-```
 
-### Usage
-
-```sh
-# Start aios container
-$ sudo systemctl start systemd-nspawn@aios
-
-# Enter aios shell
+# 3. Enter container
 $ sudo machinectl shell aios
 
-# Inside aios, AI chat interface starts
-[aios] >
+# 4. Start Claude Code
+$ claude
+# or
+$ ai
 ```
 
 ## Container Distribution
@@ -127,17 +114,14 @@ $ podman pull aios  # using shortname alias
 
 ```
 ~/.config/syui/ai/
-├── gpt/
-│   ├── memory.db       # Shared memory (SQLite WAL)
-│   ├── memory.db-wal
-│   └── memory.db-shm
-├── mcp.json           # MCP server configuration
-└── config.toml        # aios configuration
+├── gpt/memory.db      # Shared memory (SQLite WAL)
+├── mcp.json           # MCP server config
+└── config.toml        # aios config
 ```
 
 ### MCP Configuration
 
-`~/.config/syui/ai/mcp.json`:
+Claude Code connects to aigpt via MCP:
 
 ```json
 {
@@ -150,59 +134,32 @@ $ podman pull aios  # using shortname alias
 }
 ```
 
-### Permission System
-
-`~/.config/syui/ai/config.toml`:
-
-```toml
-[permissions]
-# Auto-allow (no approval)
-auto_allow = ["pacman -Q*", "ls", "cat"]
-
-# Notify (log only)
-notify = ["pacman -S*", "git clone*"]
-
-# Require approval
-require_approval = ["rm -rf*", "systemctl stop*"]
-
-# Deny
-deny = ["rm -rf /", "mkfs*"]
-```
+This enables Claude Code to use aigpt's memory system.
 
 ## Building from Source
 
 ```sh
-# Install dependencies
-$ pacman -S base-devel archiso docker git rust
-
-# Build bootstrap image
+$ pacman -S base-devel archiso docker git rust nodejs npm
 $ ./build.zsh
-
-# Result: aios-bootstrap.tar.gz
+# Creates: aios-bootstrap.tar.gz
 ```
 
-## Integration with aigpt
+## How It Works
 
-aios is designed to work with [aigpt](https://git.syui.ai/ai/gpt) (AI memory system).
+1. **systemd-nspawn** provides lightweight containers
+2. **aigpt** runs as MCP server, stores memories in SQLite
+3. **Claude Code** connects to aigpt via MCP
+4. Shared memory (`~/.config/syui/ai/gpt/memory.db`) is bind-mounted
 
-aigpt provides:
-- **Layer 1**: Memory storage
-- **Layer 2**: Priority scoring
-- **Layer 3**: Personality analysis (Big Five)
-- **Layer 4**: Relationship inference
+**Result:** Claude Code can remember your preferences across all containers.
 
-All memories are shared across containers through bind-mounted SQLite database.
+## Why Not Just Use Claude Code?
 
-## Comparison
-
-| Aspect | Traditional OS | aios |
-|--------|---------------|------|
-| Interface | Shell (bash/zsh) | AI Chat |
-| Command | Memorize syntax | Natural language |
-| Configuration | Manual editing | AI executes |
-| Learning | No | Yes (aigpt) |
-| Memory | No | Shared (SQLite) |
-| Isolation | Docker/Podman | systemd-nspawn |
+You can! aios just provides:
+- Pre-configured environment
+- Shared memory (aigpt) pre-installed
+- Container isolation
+- Easy multi-environment setup
 
 ## Links
 
@@ -211,21 +168,20 @@ All memories are shared across containers through bind-mounted SQLite database.
 - aigpt: https://git.syui.ai/ai/gpt
 - Container: https://git.syui.ai/ai/-/packages/container/os
 
-## Philosophy Detail
+## Philosophy
 
-From conversation with AI about aigpt:
+**Insert AI into existing flows**
 
-> "What is the essence of this design?"
-> "Simply insert AI into existing flows"
->
-> - aigpt: Insert AI between conversation and memory
-> - aios: Insert AI between user and commands
->
-> Not building something entirely new.
-> Just adding an AI layer to existing workflows.
-> And prepare the environment for that.
+Don't build a new AI chat interface. Use Claude Code (which already works).
 
-This is aios.
+Don't create a new container system. Use systemd-nspawn (lightweight, standard).
+
+Just provide:
+1. aigpt for shared memory
+2. Pre-configured environment
+3. Automation scripts
+
+Simple. Minimal. Effective.
 
 ---
 

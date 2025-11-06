@@ -1,5 +1,5 @@
 #!/bin/bash
-# aios installer - AI-managed OS with shared memory
+# aios installer - systemd-nspawn with aigpt + Claude Code
 
 set -e
 
@@ -9,17 +9,8 @@ AIOS_CONFIG="$HOME/.config/syui/ai"
 
 echo "=== aios installer v${AIOS_VERSION} ==="
 echo ""
-echo "aios = AI-managed OS with shared memory"
-echo "- Default interface: AI chat (not shell)"
-echo "- Shared memory: aigpt (SQLite)"
-echo "- Environment isolation: systemd-nspawn"
+echo "Installing: aigpt + Claude Code in systemd-nspawn"
 echo ""
-
-# Check if running as root for container creation
-if [ "$EUID" -ne 0 ] && [ ! -d "$AIOS_ROOT" ]; then
-    echo "Note: Container creation requires root privileges"
-    echo "      User config will be created in: $AIOS_CONFIG"
-fi
 
 # 1. Create shared memory directory
 echo "[1/6] Creating shared memory directory..."
@@ -127,25 +118,17 @@ echo "================================================"
 echo "✓ aios installation complete!"
 echo "================================================"
 echo ""
-
-if command -v aigpt &>/dev/null; then
-    echo "Next steps:"
-    echo ""
-    echo "  # Enter aios container:"
-    echo "  $ sudo machinectl shell aios"
-    echo ""
-    echo "  # Or start AI chat interface:"
-    echo "  $ aios shell"
-    echo ""
-else
-    echo "To complete installation:"
-    echo "  1. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    echo "  2. Run this installer again: ./aios-install.sh"
-fi
-
+echo "Next steps:"
+echo ""
+echo "  # Enter aios container:"
+echo "  $ sudo machinectl shell aios"
+echo ""
+echo "  # Inside container, start Claude Code:"
+echo "  $ claude"
+echo "  # or"
+echo "  $ ai"
 echo ""
 echo "Configuration:"
-echo "  Config dir: ${AIOS_CONFIG}"
-echo "  Memory DB:  ${AIOS_CONFIG}/gpt/memory.db"
-echo "  MCP config: ${AIOS_CONFIG}/mcp.json"
+echo "  Shared memory: ${AIOS_CONFIG}/gpt/memory.db"
+echo "  MCP config:    ${AIOS_CONFIG}/mcp.json"
 echo ""

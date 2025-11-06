@@ -14,10 +14,16 @@ Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' >> ./root.x86_64/etc/pa
 sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/etc/pacman.conf
 arch-chroot root.x86_64 /bin/sh -c 'pacman-key --init'
 arch-chroot root.x86_64 /bin/sh -c 'pacman-key --populate archlinux'
-arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs docker podman bc'
+arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs npm docker podman bc sqlite'
 arch-chroot root.x86_64 /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'
 arch-chroot root.x86_64 /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
 arch-chroot root.x86_64 /bin/sh -c 'chsh -s /bin/zsh'
+
+# Install Claude Code
+arch-chroot root.x86_64 /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
+
+# Copy .zshrc
+cp -rf ./cfg/zshrc root.x86_64/root/.zshrc
 
 # Install aigpt (AI memory system)
 arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
