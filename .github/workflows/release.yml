@@ -74,8 +74,8 @@ jobs:
           source /usr/local/bin/aios-startup
           EOF
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
-          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p ~/.config/claude'
-          cat > root.x86_64/var/lib/machines/arch/root/.config/claude/claude_desktop_config.json <<'EOF'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /root/.config/syui/ai/claude'
+          cat > root.x86_64/var/lib/machines/arch/root/.config/syui/ai/claude/claude_desktop_config.json <<'EOF'
           {
             "mcpServers": {
               "aigpt": {
@@ -85,6 +85,11 @@ jobs:
             }
           }
           EOF
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'ln -sf /root/.config/syui/ai/claude /root/.config/claude'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/claude'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'cp /root/.config/syui/ai/claude/claude_desktop_config.json /home/ai/.config/syui/ai/claude/'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'ln -sf /home/ai/.config/syui/ai/claude /home/ai/.config/claude'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown -R ai:ai /home/ai/.config/syui'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /root/.config/syui/ai/gpt'
           cp -rf ./cfg/mcp.json root.x86_64/var/lib/machines/arch/root/.config/syui/ai/mcp.json

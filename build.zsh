@@ -70,9 +70,10 @@ EOF
 # Install aigpt (AI memory system)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
 
-# Setup Claude Code MCP configuration
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p ~/.config/claude'
-cat > root.x86_64/var/lib/machines/arch/root/.config/claude/claude_desktop_config.json <<'EOF'
+# Setup Claude Code MCP configuration (shared via symlink)
+# Create actual config in syui/ai/claude (bind-mounted)
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /root/.config/syui/ai/claude'
+cat > root.x86_64/var/lib/machines/arch/root/.config/syui/ai/claude/claude_desktop_config.json <<'EOF'
 {
   "mcpServers": {
     "aigpt": {
@@ -82,6 +83,15 @@ cat > root.x86_64/var/lib/machines/arch/root/.config/claude/claude_desktop_confi
   }
 }
 EOF
+
+# Create symlink for root
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'ln -sf /root/.config/syui/ai/claude /root/.config/claude'
+
+# Setup for ai user too
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/claude'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'cp /root/.config/syui/ai/claude/claude_desktop_config.json /home/ai/.config/syui/ai/claude/'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'ln -sf /home/ai/.config/syui/ai/claude /home/ai/.config/claude'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown -R ai:ai /home/ai/.config/syui'
 
 # Install ai/bot (optional, for backward compatibility)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
