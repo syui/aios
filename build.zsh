@@ -47,6 +47,26 @@ cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
 cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/home/ai/.zshrc
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
+# Copy aios startup script
+cp -rf ./cfg/aios.zsh root.x86_64/var/lib/machines/arch/usr/local/bin/aios-startup
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chmod +x /usr/local/bin/aios-startup'
+
+# Create default config directory and file for user 'ai'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/os'
+cat > root.x86_64/var/lib/machines/arch/home/ai/.config/syui/ai/os/config.json <<'EOF'
+{
+  "shell": false
+}
+EOF
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown -R ai:ai /home/ai/.config'
+
+# Update .zshrc to source startup script
+cat >> root.x86_64/var/lib/machines/arch/home/ai/.zshrc <<'EOF'
+
+# aios startup
+source /usr/local/bin/aios-startup
+EOF
+
 # Install aigpt (AI memory system)
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
 

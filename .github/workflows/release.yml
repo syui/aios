@@ -47,12 +47,52 @@ jobs:
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chsh -s /bin/zsh'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
           cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "ai:root" | chpasswd'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot" >> /etc/sudoers'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
+          cat > root.x86_64/var/lib/machines/arch/etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
+          [Service]
+          ExecStart=
+          ExecStart=-/usr/bin/agetty --autologin ai --noclear %I $TERM
+          EOF
           cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
+          cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/home/ai/.zshrc
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
+          cp -rf ./cfg/aios.zsh root.x86_64/var/lib/machines/arch/usr/local/bin/aios-startup
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chmod +x /usr/local/bin/aios-startup'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/os'
+          cat > root.x86_64/var/lib/machines/arch/home/ai/.config/syui/ai/os/config.json <<'EOF'
+          {
+            "shell": false
+          }
+          EOF
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown -R ai:ai /home/ai/.config'
+          cat >> root.x86_64/var/lib/machines/arch/home/ai/.zshrc <<'EOF'
+
+          # aios startup
+          source /usr/local/bin/aios-startup
+          EOF
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p ~/.config/claude'
+          cat > root.x86_64/var/lib/machines/arch/root/.config/claude/claude_desktop_config.json <<'EOF'
+          {
+            "mcpServers": {
+              "aigpt": {
+                "command": "aigpt",
+                "args": ["server", "--enable-layer4"]
+              }
+            }
+          }
+          EOF
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /root/.config/syui/ai/gpt'
           cp -rf ./cfg/mcp.json root.x86_64/var/lib/machines/arch/root/.config/syui/ai/mcp.json
           cp -rf ./cfg/config.toml root.x86_64/var/lib/machines/arch/root/.config/syui/ai/config.toml
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'aigpt server --enable-layer4 &'
+          sleep 2
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pkill aigpt'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
           tar -zcvf aios-bootstrap.tar.gz root.x86_64/
           tar -C ./root.x86_64 -c . | docker import - ${{ env.IMAGE_NAME }}
           echo "${{ env.DOCKER_TOKEN }}" | docker login -u syui --password-stdin
