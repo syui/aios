@@ -29,8 +29,8 @@ cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "ai:root" | chpasswd'
 
-# Enable wheel group for sudo
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'sed -i "s/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/" /etc/sudoers'
+# Enable wheel group for sudo (specific commands without password)
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot" >> /etc/sudoers'
 
 # Setup auto-login for user 'ai'
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
