@@ -75,7 +75,7 @@ if [[ -o login ]] && [[ -o interactive ]]; then
     if [[ -z "$INSIDE_WORKSPACE" ]]; then
         # Running as ai user on aios OS - enter workspace container
         export INSIDE_WORKSPACE=1
-        exec sudo machinectl shell workspace
+        exec sudo systemd-nspawn -q -D /var/lib/machines/workspace /bin/zsh
     else
         # Running as root inside workspace container - start claude
         if command -v claude &>/dev/null; then
