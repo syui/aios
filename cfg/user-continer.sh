@@ -1,20 +1,27 @@
 #!/bin/bash
 # Create child containers inside aios for ai user
-# Simply copy the aios itself as child containers
+# Backup aios before creating /var/lib/machines to avoid recursion
 
 ROOTFS="root.x86_64"
 
 echo "=== Creating child containers ==="
 
+# Backup current aios to temp location (before creating /var/lib/machines)
+echo "Backing up aios..."
+cp -a $ROOTFS /tmp/aios-backup-$$
+
 # Create directory for child containers
 mkdir -p $ROOTFS/var/lib/machines
 
-# Copy aios as workspace
+# Copy backup as workspace
 echo "Creating workspace container..."
-cp -a $ROOTFS $ROOTFS/var/lib/machines/workspace
+cp -a /tmp/aios-backup-$$ $ROOTFS/var/lib/machines/workspace
 
-# Copy aios as restore-img
+# Copy backup as restore-img
 echo "Creating restore-img container..."
-cp -a $ROOTFS $ROOTFS/var/lib/machines/restore-img
+cp -a /tmp/aios-backup-$$ $ROOTFS/var/lib/machines/restore-img
+
+# Cleanup temp backup
+rm -rf /tmp/aios-backup-$$
 
 echo "✓ Child containers created"
