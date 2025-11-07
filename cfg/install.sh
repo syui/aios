@@ -4,7 +4,6 @@
 set -e
 
 NAME="aios"
-BACKUP="${NAME}back"
 TARBALL="aios-bootstrap.tar.gz"
 
 echo "=== aios installation ==="
