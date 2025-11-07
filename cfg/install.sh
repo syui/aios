@@ -36,6 +36,8 @@ mv root.x86_64/var/lib/machines/arch /var/lib/machines/$NAME
 # Copy nspawn configuration
 echo "3. Installing systemd-nspawn configuration..."
 mkdir -p /etc/systemd/nspawn
+
+# Create aios.nspawn
 cat > /etc/systemd/nspawn/$NAME.nspawn <<'EOF'
 [Exec]
 Boot=yes
@@ -43,12 +45,42 @@ PrivateUsers=pick
 ResolvConf=copy-host
 
 [Files]
-Bind=%h/.config/syui/ai:/root/.config/syui/ai
+Bind=/root/.config/syui/ai:/root/.config/syui/ai
 
 [Network]
-Private=yes
-VirtualEthernet=yes
+VirtualEthernet=no
 EOF
+
+# Create aiosback.nspawn
+cat > /etc/systemd/nspawn/$BACKUP.nspawn <<'EOF'
+[Exec]
+Boot=yes
+PrivateUsers=pick
+ResolvConf=copy-host
+
+[Files]
+Bind=/root/.config/syui/ai:/root/.config/syui/ai
+
+[Network]
+VirtualEthernet=no
+EOF
+
+# Create workspace.nspawn
+cat > /etc/systemd/nspawn/workspace.nspawn <<'EOF'
+[Exec]
+Boot=yes
+PrivateUsers=pick
+ResolvConf=copy-host
+
+[Files]
+Bind=/root/.config/syui/ai:/root/.config/syui/ai
+
+[Network]
+VirtualEthernet=no
+EOF
+
+# Create bind mount directory
+mkdir -p /root/.config/syui/ai
 
 # Enable systemd-machined
 echo "4. Enabling systemd-machined..."

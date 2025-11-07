@@ -22,10 +22,6 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chsh -s /bin/zsh'
 # Install Claude Code
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
-# Setup Claude Code systemd service for auto-start
-cp -rf ./cfg/claude.service root.x86_64/var/lib/machines/arch/etc/systemd/system/claude.service
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'systemctl enable claude'
-
 # Copy os-release
 cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 

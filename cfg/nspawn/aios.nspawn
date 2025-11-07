@@ -8,9 +8,8 @@ ResolvConf=copy-host
 
 [Files]
 # Bind mount shared memory directory
-# Host: ~/.config/syui/ai -> Container: /root/.config/syui/ai
-Bind=%h/.config/syui/ai:/root/.config/syui/ai
+# Host: /root/.config/syui/ai -> Container: /root/.config/syui/ai
+Bind=/root/.config/syui/ai:/root/.config/syui/ai
 
 [Network]
-Private=yes
-VirtualEthernet=yes
+VirtualEthernet=no
