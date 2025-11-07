@@ -27,8 +27,15 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add claude auto-start for ai user (login shell only)
+# Add MCP auto-setup and claude auto-start for ai user (login shell only)
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
+
+# MCP auto-setup (run once after .claude.json is created)
+if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
+    if command -v claude &>/dev/null && command -v aigpt &>/dev/null; then
+        claude mcp add aigpt aigpt server &>/dev/null || true
+    fi
+fi
 
 # Auto-start claude in interactive login shell
 if [[ -o login ]] && [[ -o interactive ]]; then
