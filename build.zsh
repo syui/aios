@@ -4,8 +4,6 @@
 # 2. Setup user (ai) and shell
 # 3. Setup Claude Code and aigpt
 
-set -e
-
 echo "=== aios build ==="
 echo ""
 
