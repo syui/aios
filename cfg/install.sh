@@ -92,10 +92,15 @@ for img in $BACKUP workspace; do
     if machinectl list-images | grep -q "^$img"; then
         echo "  Removing existing image: $img"
         machinectl poweroff $img 2>/dev/null || true
-        sleep 1
+        sleep 2
         machinectl terminate $img 2>/dev/null || true
-        sleep 1
-        machinectl remove $img
+        sleep 2
+        # Force kill if still running
+        if machinectl status $img &>/dev/null; then
+            machinectl kill $img --signal=SIGKILL 2>/dev/null || true
+            sleep 2
+        fi
+        machinectl remove $img 2>/dev/null || echo "  Warning: Could not remove $img (will skip)"
     fi
 done
 
