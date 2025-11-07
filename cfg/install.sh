@@ -86,12 +86,25 @@ mkdir -p /root/.config/syui/ai
 echo "4. Enabling systemd-machined..."
 systemctl enable --now systemd-machined
 
+# Remove existing images if they exist
+echo "5. Checking for existing images..."
+for img in $BACKUP workspace; do
+    if machinectl list-images | grep -q "^$img"; then
+        echo "  Removing existing image: $img"
+        machinectl poweroff $img 2>/dev/null || true
+        sleep 1
+        machinectl terminate $img 2>/dev/null || true
+        sleep 1
+        machinectl remove $img
+    fi
+done
+
 # Create initial backup
-echo "5. Creating initial backup image..."
+echo "6. Creating initial backup image..."
 machinectl clone $NAME $BACKUP
 
 # Create workspace container for AI operations
-echo "6. Creating workspace container..."
+echo "7. Creating workspace container..."
 machinectl clone $NAME workspace
 
 echo ""
