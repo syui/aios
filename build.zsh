@@ -65,7 +65,7 @@ cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 
 # Configure sudoers for wheel group
 echo "Configuring sudoers..."
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl" >> /etc/sudoers'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacstrap, /usr/bin/arch-chroot, /usr/bin/rm, /usr/bin/mkdir, /usr/bin/mv, /usr/bin/cp, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl, /bin/bash" >> /etc/sudoers'
 
 # Install aigpt (aios core package)
 echo "Installing aigpt..."
