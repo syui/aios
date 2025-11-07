@@ -32,9 +32,6 @@ cp -rf ./cfg/profiledef.sh ./archiso/configs/releng/profiledef.sh
 cp -rf ./cfg/profiledef.sh ./archiso/configs/baseline/profiledef.sh
 cp -rf ./scpt/mkarchiso ./archiso/archiso/mkarchiso
 
-# Create empty bootstrap_packages file
-touch ./archiso/configs/releng/bootstrap_packages.x86_64
-
 # Build bootstrap
 ./archiso/archiso/mkarchiso -v -o ./ ./archiso/configs/releng/
 
