@@ -27,7 +27,7 @@ fi
 echo "1. Extracting $TARBALL..."
 tar xf "$TARBALL"
 
-# Install aios (contains child containers inside)
+# Install aios (base container)
 echo "2. Installing aios to /var/lib/machines/..."
 rm -rf /var/lib/machines/$NAME
 mkdir -p /var/lib/machines
