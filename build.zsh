@@ -47,8 +47,8 @@ sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/var/lib/machines/arch/etc/pacman.c
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pacman-key --init'
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pacman-key --populate archlinux'
 
-# Install base packages
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs npm docker podman bc sqlite'
+# Install base packages (including systemd-container for machinectl)
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs npm docker podman bc sqlite systemd arch-install-scripts'
 
 # Configure containers
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'

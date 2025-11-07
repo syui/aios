@@ -11,6 +11,25 @@ echo "Creating user 'ai'..."
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
 arch-chroot $ROOTFS /bin/sh -c 'echo "ai:root" | chpasswd'
 
+# Configure securetty for pts login (required for systemd-nspawn)
+echo "Configuring securetty..."
+cat >> $ROOTFS/etc/securetty <<'EOF'
+pts/0
+pts/1
+pts/2
+pts/3
+pts/4
+pts/5
+pts/6
+pts/7
+pts/8
+pts/9
+EOF
+
+# Enable systemd-machined for container management
+echo "Enabling systemd-machined..."
+arch-chroot $ROOTFS /bin/sh -c 'systemctl enable systemd-machined'
+
 # Setup auto-login for user 'ai'
 echo "Setting up auto-login..."
 arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
