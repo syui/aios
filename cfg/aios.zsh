@@ -18,11 +18,21 @@ SHELL_MODE=$(cat "$CONFIG_FILE" | jq -r '.shell // false')
 
 if [ "$SHELL_MODE" = "true" ]; then
     echo "aios - AI-managed OS"
-    echo "  Shell mode enabled"
+    echo "  Starting workspace container..."
     echo ""
 
-    # claudeを起動
-    if command -v claude &>/dev/null; then
-        exec claude
+    # Check if workspace exists
+    if ! sudo machinectl list-images | grep -q "^workspace"; then
+        echo "Error: workspace container not found"
+        echo "Please run install.sh first to create workspace container"
+        return
     fi
+
+    # Start workspace container
+    sudo machinectl start workspace 2>/dev/null || true
+    sleep 2
+
+    # Login to workspace (claude.service will auto-start inside)
+    echo "Connecting to workspace container..."
+    exec sudo machinectl login workspace
 fi

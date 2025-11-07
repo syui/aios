@@ -58,6 +58,10 @@ systemctl enable --now systemd-machined
 echo "5. Creating initial backup image..."
 machinectl clone $NAME $BACKUP
 
+# Create workspace container for AI operations
+echo "6. Creating workspace container..."
+machinectl clone $NAME workspace
+
 echo ""
 echo "=== Installation complete ==="
 echo ""

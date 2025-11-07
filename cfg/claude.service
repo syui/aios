@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code AI Assistant
+After=network.target
+
+[Service]
+Type=simple
+User=ai
+WorkingDirectory=/home/ai
+Environment=HOME=/home/ai
+ExecStart=/usr/bin/claude
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

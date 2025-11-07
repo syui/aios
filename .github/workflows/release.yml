@@ -46,10 +46,12 @@ jobs:
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chsh -s /bin/zsh'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
+          cp -rf ./cfg/claude.service root.x86_64/var/lib/machines/arch/etc/systemd/system/claude.service
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'systemctl enable claude'
           cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "ai:root" | chpasswd'
-          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot" >> /etc/sudoers'
+          arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl" >> /etc/sudoers'
           arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
           cat > root.x86_64/var/lib/machines/arch/etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
           [Service]

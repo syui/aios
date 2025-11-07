@@ -22,6 +22,10 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chsh -s /bin/zsh'
 # Install Claude Code
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
+# Setup Claude Code systemd service for auto-start
+cp -rf ./cfg/claude.service root.x86_64/var/lib/machines/arch/etc/systemd/system/claude.service
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'systemctl enable claude'
+
 # Copy os-release
 cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 
@@ -30,7 +34,7 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'useradd -m -G wheel -s
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "ai:root" | chpasswd'
 
 # Enable wheel group for sudo (specific commands without password)
-arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot" >> /etc/sudoers'
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl" >> /etc/sudoers'
 
 # Setup auto-login for user 'ai'
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
