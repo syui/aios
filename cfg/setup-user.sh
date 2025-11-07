@@ -2,7 +2,7 @@
 # User setup for aios
 # Creates ai user, configures auto-login, sudo, zshrc
 
-ROOTFS="root.x86_64/var/lib/machines/arch"
+ROOTFS="root.x86_64/var/lib/machines/aios"
 
 echo "=== User Setup ==="
 

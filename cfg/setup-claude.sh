@@ -2,7 +2,7 @@
 # Claude Code MCP setup for aios
 # Configures MCP, sets up shared memory
 
-ROOTFS="root.x86_64/var/lib/machines/arch"
+ROOTFS="root.x86_64/var/lib/machines/aios"
 
 echo "=== Claude MCP Setup ==="
 
