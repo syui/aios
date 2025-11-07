@@ -1,14 +1,10 @@
 #!/bin/bash
-# Claude Code and aigpt setup for aios
-# Installs aigpt, configures MCP, sets up shared memory
+# Claude Code MCP setup for aios
+# Configures MCP, sets up shared memory
 
 ROOTFS="root.x86_64/var/lib/machines/arch"
 
-echo "=== Claude & aigpt Setup ==="
-
-# Install aigpt (AI memory system)
-echo "Installing aigpt..."
-arch-chroot $ROOTFS /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+echo "=== Claude MCP Setup ==="
 
 # Setup Claude Code MCP configuration (shared via symlink)
 echo "Configuring MCP..."
@@ -34,10 +30,6 @@ arch-chroot $ROOTFS /bin/sh -c 'cp /root/.config/syui/ai/claude/claude_desktop_c
 arch-chroot $ROOTFS /bin/sh -c 'ln -sf /home/ai/.config/syui/ai/claude /home/ai/.config/claude'
 arch-chroot $ROOTFS /bin/sh -c 'chown -R ai:ai /home/ai/.config/syui'
 
-# Install ai/bot (optional, for backward compatibility)
-echo "Installing ai/bot..."
-arch-chroot $ROOTFS /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/ai /bin/ && ai ai'
-
 # Create config directory
 arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /root/.config/syui/ai/gpt'
 
@@ -53,4 +45,4 @@ sleep 2
 arch-chroot $ROOTFS /bin/sh -c 'pkill aigpt'
 arch-chroot $ROOTFS /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
 
-echo "✓ Claude & aigpt setup complete"
+echo "✓ Claude MCP setup complete"

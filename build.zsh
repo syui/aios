@@ -60,6 +60,18 @@ arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'npm i -g @anthropic-ai
 # Copy os-release
 cp -rf ./cfg/os-release root.x86_64/var/lib/machines/arch/etc/os-release
 
+# Configure sudoers for wheel group
+echo "Configuring sudoers..."
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl" >> /etc/sudoers'
+
+# Install aigpt (aios core package)
+echo "Installing aigpt..."
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+
+# Install aibot (aios core package)
+echo "Installing aibot..."
+arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai'
+
 echo "✓ Arch Linux base complete"
 echo ""
 

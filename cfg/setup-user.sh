@@ -11,10 +11,6 @@ echo "Creating user 'ai'..."
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
 arch-chroot $ROOTFS /bin/sh -c 'echo "ai:root" | chpasswd'
 
-# Enable wheel group for sudo (specific commands without password)
-echo "Configuring sudoers..."
-arch-chroot $ROOTFS /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/rm -rf /var/lib/pacman/db.lck, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl" >> /etc/sudoers'
-
 # Setup auto-login for user 'ai'
 echo "Setting up auto-login..."
 arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
