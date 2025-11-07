@@ -35,45 +35,45 @@ cp -rf ./scpt/mkarchiso ./archiso/archiso/mkarchiso
 
 # Extract and prepare
 tar xf aios-bootstrap*.tar.gz
-mkdir -p root.x86_64/var/lib/machines/aios
-pacstrap -c root.x86_64/var/lib/machines/aios base
+mkdir -p root.x86_64
+pacstrap -c root.x86_64 base
 
 # Configure pacman
 echo -e 'Server = http://mirrors.cat.net/archlinux/$repo/os/$arch
-Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' >> ./root.x86_64/var/lib/machines/aios/etc/pacman.d/mirrorlist
-sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/var/lib/machines/aios/etc/pacman.conf
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' >> ./root.x86_64/etc/pacman.d/mirrorlist
+sed -i s/CheckSpace/#CheckeSpace/ root.x86_64/etc/pacman.conf
 
 # Initialize pacman keys
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'pacman-key --init'
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'pacman-key --populate archlinux'
+arch-chroot root.x86_64 /bin/sh -c 'pacman-key --init'
+arch-chroot root.x86_64 /bin/sh -c 'pacman-key --populate archlinux'
 
 # Install base packages (including systemd-container for machinectl)
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs npm docker podman bc sqlite systemd arch-install-scripts'
+arch-chroot root.x86_64 /bin/sh -c 'pacman -Syu --noconfirm base base-devel linux vim git zsh rust openssh openssl jq go nodejs npm docker podman bc sqlite systemd arch-install-scripts'
 
 # Configure containers
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
+arch-chroot root.x86_64 /bin/sh -c 'mkdir -p /etc/containers/registries.conf.d'
+arch-chroot root.x86_64 /bin/sh -c 'curl -sL -o /etc/containers/registries.conf.d/ai.conf https://git.syui.ai/ai/os/raw/branch/main/cfg/ai.conf'
 
 # Set default shell
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'chsh -s /bin/zsh'
+arch-chroot root.x86_64 /bin/sh -c 'chsh -s /bin/zsh'
 
 # Install Claude Code
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
+arch-chroot root.x86_64 /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
 # Copy os-release
-cp -rf ./cfg/os-release root.x86_64/var/lib/machines/aios/etc/os-release
+cp -rf ./cfg/os-release root.x86_64/etc/os-release
 
 # Configure sudoers for wheel group
 echo "Configuring sudoers..."
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacstrap, /usr/bin/arch-chroot, /usr/bin/rm, /usr/bin/mkdir, /usr/bin/mv, /usr/bin/cp, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl, /bin/bash" >> /etc/sudoers'
+arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacstrap, /usr/bin/arch-chroot, /usr/bin/rm, /usr/bin/mkdir, /usr/bin/mv, /usr/bin/cp, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl, /bin/bash" >> /etc/sudoers'
 
 # Install aigpt (aios core package)
 echo "Installing aigpt..."
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
 
 # Install aibot (aios core package)
 echo "Installing aibot..."
-arch-chroot root.x86_64/var/lib/machines/aios /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai'
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai'
 
 echo "✓ Arch Linux base complete"
 echo ""
@@ -93,23 +93,26 @@ bash ./cfg/setup-claude.sh
 echo ""
 
 # ============================================
+# 4. Create child containers (after all configuration)
+# ============================================
+
+bash ./cfg/user-continer.sh
+echo ""
+
+# ============================================
 # Finalize
 # ============================================
 
 echo "=== Finalizing ==="
 
 # Copy aios-ctl.zsh for host machine control
-cp -rf ./cfg/aios-ctl.zsh root.x86_64/var/lib/machines/aios/opt/aios-ctl.zsh
-
-# Prepare directory for child containers (ai user will create them as needed)
-echo "Preparing directory for child containers..."
-mkdir -p root.x86_64/var/lib/machines/aios/var/lib/machines
+cp -rf ./cfg/aios-ctl.zsh root.x86_64/opt/aios-ctl.zsh
 
 # Copy install script
 cp -rf ./cfg/install.sh ./install.sh
 chmod +x ./install.sh
 
-# Create tarball with aios (ready for child containers)
+# Create tarball with aios (includes child containers)
 echo "Creating tarball..."
 tar -zcvf aios-bootstrap.tar.gz root.x86_64/ install.sh
 

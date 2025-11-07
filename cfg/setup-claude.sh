@@ -2,7 +2,7 @@
 # Claude Code MCP setup for aios
 # Configures MCP, sets up shared memory
 
-ROOTFS="root.x86_64/var/lib/machines/aios"
+ROOTFS="root.x86_64"
 
 echo "=== Claude MCP Setup ==="
 
@@ -44,5 +44,7 @@ arch-chroot $ROOTFS /bin/sh -c 'aigpt server --enable-layer4 &'
 sleep 2
 arch-chroot $ROOTFS /bin/sh -c 'pkill aigpt'
 arch-chroot $ROOTFS /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
+
+# Note: claude auto-start is configured in ai user's .zshrc (shared with workspace root via bind mount)
 
 echo "✓ Claude MCP setup complete"

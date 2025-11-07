@@ -2,7 +2,7 @@
 # User setup for aios
 # Creates ai user, configures auto-login, sudo, zshrc
 
-ROOTFS="root.x86_64/var/lib/machines/aios"
+ROOTFS="root.x86_64"
 
 echo "=== User Setup ==="
 
@@ -30,6 +30,22 @@ EOF
 echo "Enabling systemd-machined..."
 arch-chroot $ROOTFS /bin/sh -c 'systemctl enable systemd-machined'
 
+# Create workspace container configuration (bind ai user dir to container root)
+echo "Creating workspace container configuration..."
+mkdir -p $ROOTFS/etc/systemd/nspawn
+cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
+[Exec]
+Boot=yes
+PrivateUsers=pick
+ResolvConf=copy-host
+
+[Files]
+Bind=/home/ai:/root
+
+[Network]
+VirtualEthernet=no
+EOF
+
 # Setup auto-login for user 'ai'
 echo "Setting up auto-login..."
 arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
@@ -46,20 +62,8 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Copy container initialization script
-cp -rf ./cfg/init-containers.sh $ROOTFS/usr/local/bin/init-containers.sh
-arch-chroot $ROOTFS /bin/sh -c 'chmod +x /usr/local/bin/init-containers.sh'
-
-# Add initialization, MCP auto-setup and claude auto-start for ai user (login shell only)
+# Add workspace container auto-start and entry (shared .zshrc for ai user and workspace root)
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
-
-# Initialize workspace containers on first login
-if [ ! -f ~/.aios-initialized ]; then
-    echo "First login detected. Initializing workspace containers..."
-    if command -v sudo &>/dev/null && [ -x /usr/local/bin/init-containers.sh ]; then
-        /usr/local/bin/init-containers.sh && touch ~/.aios-initialized
-    fi
-fi
 
 # MCP auto-setup (run once after .claude.json is created)
 if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
@@ -68,10 +72,19 @@ if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; th
     fi
 fi
 
-# Auto-start claude in interactive login shell
+# aios concept: container from start (ai user and workspace root share this .zshrc)
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if command -v claude &>/dev/null; then
-        claude
+    if [[ -z "$INSIDE_WORKSPACE" ]]; then
+        # Running as ai user on aios OS - enter workspace container
+        export INSIDE_WORKSPACE=1
+        sudo machinectl start workspace 2>/dev/null || true
+        sleep 1
+        exec sudo machinectl shell workspace
+    else
+        # Running as root inside workspace container - start claude
+        if command -v claude &>/dev/null; then
+            claude
+        fi
     fi
 fi
 EOF
