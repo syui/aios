@@ -5,5 +5,5 @@
 aios-bootstrap*.tar.gz
 root.x86_64/
 archiso/
-#install.sh
+install.sh
 build.log
