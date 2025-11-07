@@ -27,11 +27,13 @@ fi
 echo "1. Extracting $TARBALL..."
 tar xf "$TARBALL"
 
-# Move to /var/lib/machines/
-echo "2. Installing to /var/lib/machines/$NAME..."
-rm -rf /var/lib/machines/$NAME
+# Move all containers to /var/lib/machines/
+echo "2. Installing containers to /var/lib/machines/..."
+rm -rf /var/lib/machines/$NAME /var/lib/machines/$BACKUP /var/lib/machines/workspace
 mkdir -p /var/lib/machines
 mv root.x86_64/var/lib/machines/arch /var/lib/machines/$NAME
+mv root.x86_64/var/lib/machines/aiosback /var/lib/machines/$BACKUP
+mv root.x86_64/var/lib/machines/workspace /var/lib/machines/workspace
 
 # Copy nspawn configuration
 echo "3. Installing systemd-nspawn configuration..."
@@ -85,32 +87,6 @@ mkdir -p /root/.config/syui/ai
 # Enable systemd-machined
 echo "4. Enabling systemd-machined..."
 systemctl enable --now systemd-machined
-
-# Remove existing images if they exist
-echo "5. Checking for existing images..."
-for img in $BACKUP workspace; do
-    if machinectl list-images | grep -q "^$img"; then
-        echo "  Removing existing image: $img"
-        machinectl poweroff $img 2>/dev/null || true
-        sleep 2
-        machinectl terminate $img 2>/dev/null || true
-        sleep 2
-        # Force kill if still running
-        if machinectl status $img &>/dev/null; then
-            machinectl kill $img --signal=SIGKILL 2>/dev/null || true
-            sleep 2
-        fi
-        machinectl remove $img 2>/dev/null || echo "  Warning: Could not remove $img (will skip)"
-    fi
-done
-
-# Create initial backup
-echo "6. Creating initial backup image..."
-machinectl clone $NAME $BACKUP
-
-# Create workspace container for AI operations
-echo "7. Creating workspace container..."
-machinectl clone $NAME workspace
 
 echo ""
 echo "=== Installation complete ==="

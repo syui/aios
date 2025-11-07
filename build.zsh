@@ -98,11 +98,17 @@ echo "=== Finalizing ==="
 # Copy aios-ctl.zsh for host machine control
 cp -rf ./cfg/aios-ctl.zsh root.x86_64/var/lib/machines/arch/opt/aios-ctl.zsh
 
+# Create backup and workspace containers
+echo "Creating aiosback and workspace containers..."
+cp -a root.x86_64/var/lib/machines/arch root.x86_64/var/lib/machines/aiosback
+cp -a root.x86_64/var/lib/machines/arch root.x86_64/var/lib/machines/workspace
+
 # Copy install script
 cp -rf ./cfg/install.sh ./install.sh
 chmod +x ./install.sh
 
-# Create tarball
+# Create tarball with all containers
+echo "Creating tarball..."
 tar -zcvf aios-bootstrap.tar.gz root.x86_64/ install.sh
 
 echo ""
