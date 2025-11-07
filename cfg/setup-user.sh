@@ -36,7 +36,6 @@ mkdir -p $ROOTFS/etc/systemd/nspawn
 cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
 [Exec]
 Boot=yes
-PrivateUsers=pick
 ResolvConf=copy-host
 
 [Files]
