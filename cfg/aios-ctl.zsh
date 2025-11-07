@@ -21,9 +21,9 @@ function aios-shell() {
     sudo machinectl shell $NAME
 }
 
-# Login to aios container
+# Login to aios container as ai user
 function aios-login() {
-    sudo machinectl login $NAME
+    sudo machinectl shell $NAME /bin/su - ai
 }
 
 # Create backup of current aios

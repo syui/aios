@@ -101,16 +101,25 @@ echo "=== Finalizing ==="
 # Copy aios-ctl.zsh for host machine control
 cp -rf ./cfg/aios-ctl.zsh root.x86_64/var/lib/machines/arch/opt/aios-ctl.zsh
 
-# Create backup and workspace containers
-echo "Creating aiosback and workspace containers..."
-cp -a root.x86_64/var/lib/machines/arch root.x86_64/var/lib/machines/aiosback
-cp -a root.x86_64/var/lib/machines/arch root.x86_64/var/lib/machines/workspace
+# Create child containers inside aios (not separate containers)
+echo "Creating child containers inside aios..."
+mkdir -p root.x86_64/var/lib/machines/arch/var/lib/machines
+
+# Copy the base system to temporary location to avoid recursion
+cp -a root.x86_64/var/lib/machines/arch /tmp/aios-base-$$
+
+# Create child containers inside aios
+cp -a /tmp/aios-base-$$ root.x86_64/var/lib/machines/arch/var/lib/machines/restore-img
+cp -a /tmp/aios-base-$$ root.x86_64/var/lib/machines/arch/var/lib/machines/workspace
+
+# Cleanup temporary
+rm -rf /tmp/aios-base-$$
 
 # Copy install script
 cp -rf ./cfg/install.sh ./install.sh
 chmod +x ./install.sh
 
-# Create tarball with all containers
+# Create tarball with aios (contains child containers inside)
 echo "Creating tarball..."
 tar -zcvf aios-bootstrap.tar.gz root.x86_64/ install.sh
 

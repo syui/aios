@@ -27,48 +27,18 @@ fi
 echo "1. Extracting $TARBALL..."
 tar xf "$TARBALL"
 
-# Move all containers to /var/lib/machines/
-echo "2. Installing containers to /var/lib/machines/..."
-rm -rf /var/lib/machines/$NAME /var/lib/machines/$BACKUP /var/lib/machines/workspace
+# Install aios (contains child containers inside)
+echo "2. Installing aios to /var/lib/machines/..."
+rm -rf /var/lib/machines/$NAME
 mkdir -p /var/lib/machines
 mv root.x86_64/var/lib/machines/arch /var/lib/machines/$NAME
-mv root.x86_64/var/lib/machines/aiosback /var/lib/machines/$BACKUP
-mv root.x86_64/var/lib/machines/workspace /var/lib/machines/workspace
 
 # Copy nspawn configuration
 echo "3. Installing systemd-nspawn configuration..."
 mkdir -p /etc/systemd/nspawn
 
-# Create aios.nspawn
+# Create aios.nspawn (only one container needed)
 cat > /etc/systemd/nspawn/$NAME.nspawn <<'EOF'
-[Exec]
-Boot=yes
-PrivateUsers=pick
-ResolvConf=copy-host
-
-[Files]
-Bind=/root/.config/syui/ai:/root/.config/syui/ai
-
-[Network]
-VirtualEthernet=no
-EOF
-
-# Create aiosback.nspawn
-cat > /etc/systemd/nspawn/$BACKUP.nspawn <<'EOF'
-[Exec]
-Boot=yes
-PrivateUsers=pick
-ResolvConf=copy-host
-
-[Files]
-Bind=/root/.config/syui/ai:/root/.config/syui/ai
-
-[Network]
-VirtualEthernet=no
-EOF
-
-# Create workspace.nspawn
-cat > /etc/systemd/nspawn/workspace.nspawn <<'EOF'
 [Exec]
 Boot=yes
 PrivateUsers=pick
