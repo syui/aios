@@ -30,6 +30,22 @@ EOF
 echo "Enabling systemd-machined..."
 arch-chroot $ROOTFS /bin/sh -c 'systemctl enable systemd-machined'
 
+# Create workspace container configuration (bind ai user dir to container root)
+echo "Creating workspace container configuration..."
+mkdir -p $ROOTFS/etc/systemd/nspawn
+cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
+[Exec]
+Boot=yes
+PrivateUsers=pick
+ResolvConf=copy-host
+
+[Files]
+Bind=/home/ai:/root
+
+[Network]
+VirtualEthernet=no
+EOF
+
 # Setup auto-login for user 'ai'
 echo "Setting up auto-login..."
 arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /etc/systemd/system/getty@tty1.service.d'
@@ -46,23 +62,29 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add workspace container setup and claude wrapper for ai user
+# Add workspace container auto-start and entry (shared .zshrc for ai user and workspace root)
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# Start workspace container on login
-if [[ -o login ]]; then
-    sudo machinectl start workspace 2>/dev/null || true
+# MCP auto-setup (run once after .claude.json is created)
+if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
+    if command -v claude &>/dev/null && command -v aigpt &>/dev/null; then
+        claude mcp add aigpt aigpt server &>/dev/null || true
+    fi
 fi
 
-# Claude wrapper - always use container's claude (shared config/memory)
-claude() {
-    sudo machinectl shell workspace /bin/sh -c "claude $*"
-}
-
-# Auto-start claude in interactive login shell
+# aios concept: container from start (ai user and workspace root share this .zshrc)
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if command -v claude &>/dev/null; then
-        claude
+    if [[ -z "$INSIDE_WORKSPACE" ]]; then
+        # Running as ai user on aios OS - enter workspace container
+        export INSIDE_WORKSPACE=1
+        sudo machinectl start workspace 2>/dev/null || true
+        sleep 1
+        exec sudo machinectl shell workspace
+    else
+        # Running as root inside workspace container - start claude
+        if command -v claude &>/dev/null; then
+            claude
+        fi
     fi
 fi
 EOF
