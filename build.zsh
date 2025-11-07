@@ -45,6 +45,18 @@ cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/root/.zshrc
 
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc root.x86_64/var/lib/machines/arch/home/ai/.zshrc
+
+# Add claude auto-start for ai user (login shell only)
+cat >> root.x86_64/var/lib/machines/arch/home/ai/.zshrc <<'EOF'
+
+# Auto-start claude in interactive login shell
+if [[ -o login ]] && [[ -o interactive ]]; then
+    if command -v claude &>/dev/null; then
+        exec claude
+    fi
+fi
+EOF
+
 arch-chroot root.x86_64/var/lib/machines/arch /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
 # Copy aios startup script
