@@ -9,6 +9,10 @@ set -e
 echo "=== aios build ==="
 echo ""
 
+# Clean up previous build artifacts
+echo "Cleaning up previous build..."
+rm -rf root.x86_64/ archiso/ aios-bootstrap*.tar.gz install.sh
+
 # ============================================
 # 1. Arch Linux Base Construction
 # ============================================
