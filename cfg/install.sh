@@ -9,7 +9,7 @@ echo "=== aios installation ==="
 # Extract and install
 tar xf "$TARBALL"
 mkdir -p /var/lib/machines
-mv root.x86_64/var/lib/machines/aios /var/lib/machines/$NAME
+mv root.x86_64 /var/lib/machines/$NAME
 
 echo "=== Installation complete ==="
 echo ""

@@ -2,7 +2,7 @@
 # Create child containers inside aios for ai user
 # Simply copy the aios itself as child containers
 
-ROOTFS="root.x86_64/var/lib/machines/aios"
+ROOTFS="root.x86_64"
 
 echo "=== Creating child containers ==="
 
