@@ -46,21 +46,16 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add MCP auto-setup and claude auto-start for ai user (login shell only)
+# Add auto container login for ai user
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# MCP auto-setup (run once after .claude.json is created)
-if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
-    if command -v claude &>/dev/null && command -v aigpt &>/dev/null; then
-        claude mcp add aigpt aigpt server &>/dev/null || true
-    fi
-fi
-
-# Auto-start claude in interactive login shell
+# Auto-start workspace container and login (aios concept: start from container)
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if command -v claude &>/dev/null; then
-        claude
-    fi
+    # Start workspace container
+    sudo machinectl start workspace 2>/dev/null || true
+    sleep 2
+    # Enter workspace container as root
+    exec sudo machinectl shell workspace
 fi
 EOF
 

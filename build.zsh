@@ -79,24 +79,24 @@ echo "✓ Arch Linux base complete"
 echo ""
 
 # ============================================
-# 2. Create child containers (before user setup)
-# ============================================
-
-bash ./cfg/user-continer.sh
-echo ""
-
-# ============================================
-# 3. User Setup
+# 2. User Setup
 # ============================================
 
 bash ./cfg/setup-user.sh
 echo ""
 
 # ============================================
-# 4. Claude & aigpt Setup
+# 3. Claude & aigpt Setup
 # ============================================
 
 bash ./cfg/setup-claude.sh
+echo ""
+
+# ============================================
+# 4. Create child containers (after all configuration)
+# ============================================
+
+bash ./cfg/user-continer.sh
 echo ""
 
 # ============================================

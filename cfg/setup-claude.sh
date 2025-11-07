@@ -45,4 +45,23 @@ sleep 2
 arch-chroot $ROOTFS /bin/sh -c 'pkill aigpt'
 arch-chroot $ROOTFS /bin/sh -c 'if command -v sqlite3 &>/dev/null; then sqlite3 /root/.config/syui/ai/gpt/memory.db "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"; fi'
 
+# Add claude auto-start for root user (container concept)
+echo "Configuring claude auto-start for root..."
+cat >> $ROOTFS/root/.zshrc <<'EOF'
+
+# MCP auto-setup (run once after .claude.json is created)
+if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
+    if command -v claude &>/dev/null && command -v aigpt &>/dev/null; then
+        claude mcp add aigpt aigpt server &>/dev/null || true
+    fi
+fi
+
+# Auto-start claude in interactive login shell
+if [[ -o login ]] && [[ -o interactive ]]; then
+    if command -v claude &>/dev/null; then
+        claude
+    fi
+fi
+EOF
+
 echo "✓ Claude MCP setup complete"
