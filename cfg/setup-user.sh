@@ -37,13 +37,9 @@ cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
 [Exec]
 Boot=yes
 ResolvConf=copy-host
-Capability=all
-SystemCallFilter=@keyring bpf
-PrivateUsers=no
 
 [Files]
 Bind=/home/ai:/root
-SuppressSync=false
 
 [Network]
 VirtualEthernet=no
