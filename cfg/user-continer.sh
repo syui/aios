@@ -17,9 +17,9 @@ mkdir -p $ROOTFS/var/lib/machines
 echo "Creating workspace container..."
 cp -a /tmp/aios-backup-$$ $ROOTFS/var/lib/machines/workspace
 
-# Copy backup as restore-img
-echo "Creating restore-img container..."
-cp -a /tmp/aios-backup-$$ $ROOTFS/var/lib/machines/restore-img
+# Copy backup as restore
+echo "Creating restore container..."
+cp -a /tmp/aios-backup-$$ $ROOTFS/var/lib/machines/restore
 
 # Cleanup temp backup
 rm -rf /tmp/aios-backup-$$
