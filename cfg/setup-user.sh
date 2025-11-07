@@ -33,7 +33,7 @@ cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 # Auto-start claude in interactive login shell
 if [[ -o login ]] && [[ -o interactive ]]; then
     if command -v claude &>/dev/null; then
-        exec claude
+        claude
     fi
 fi
 EOF
