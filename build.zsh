@@ -79,14 +79,21 @@ echo "✓ Arch Linux base complete"
 echo ""
 
 # ============================================
-# 2. User Setup
+# 2. Create child containers (before user setup)
+# ============================================
+
+bash ./cfg/user-continer.sh
+echo ""
+
+# ============================================
+# 3. User Setup
 # ============================================
 
 bash ./cfg/setup-user.sh
 echo ""
 
 # ============================================
-# 3. Claude & aigpt Setup
+# 4. Claude & aigpt Setup
 # ============================================
 
 bash ./cfg/setup-claude.sh
@@ -100,9 +107,6 @@ echo "=== Finalizing ==="
 
 # Copy aios-ctl.zsh for host machine control
 cp -rf ./cfg/aios-ctl.zsh root.x86_64/var/lib/machines/aios/opt/aios-ctl.zsh
-
-# Create child containers (workspace, restore-img)
-bash ./cfg/user-continer.sh
 
 # Copy install script
 cp -rf ./cfg/install.sh ./install.sh
