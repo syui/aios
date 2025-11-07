@@ -11,7 +11,8 @@ echo ""
 
 # Clean up previous build artifacts
 echo "Cleaning up previous build..."
-rm -rf root.x86_64/ archiso/ aios-bootstrap*.tar.gz install.sh
+rm -rf root.x86_64/ archiso/ install.sh
+rm -f aios-bootstrap*.tar.gz 2>/dev/null || true
 
 # ============================================
 # 1. Arch Linux Base Construction
