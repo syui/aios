@@ -1,0 +1,15 @@
+# systemd-nspawn configuration for aios
+# Place this file in /etc/systemd/nspawn/aios.nspawn
+
+[Exec]
+Boot=yes
+PrivateUsers=pick
+ResolvConf=copy-host
+
+[Files]
+# Bind mount shared memory directory
+# Host: /root/.config/syui/ai -> Container: /root/.config/syui/ai
+Bind=/root/.config/syui/ai:/root/.config/syui/ai
+
+[Network]
+VirtualEthernet=no

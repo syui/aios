@@ -1,0 +1,59 @@
+# aios configuration
+
+[general]
+version = "0.1.0"
+name = "aios"
+description = "AI-managed OS with shared memory"
+
+[paths]
+config_dir = "~/.config/syui/ai"
+memory_db = "~/.config/syui/ai/gpt/memory.db"
+mcp_config = "~/.config/syui/ai/mcp.json"
+
+[permissions]
+# Level 0: Auto-allow (no approval required)
+auto_allow = [
+    "pacman -Q*",
+    "pacman -Ss*",
+    "systemctl status*",
+    "ls", "cat", "grep", "find",
+    "ps", "top", "htop",
+    "df", "free", "uname"
+]
+
+# Level 1: Notify (log only, no approval)
+notify = [
+    "pacman -S*",
+    "pacman -Sy*",
+    "git clone*",
+    "cargo install*",
+    "systemctl start*",
+    "systemctl enable*"
+]
+
+# Level 2: Require approval
+require_approval = [
+    "pacman -R*",
+    "rm -rf*",
+    "systemctl stop*",
+    "systemctl disable*",
+    "dd*"
+]
+
+# Level 3: Deny
+deny = [
+    "rm -rf /",
+    "rm -rf /*",
+    "mkfs*",
+    ":(){ :|:& };:"
+]
+
+[aigpt]
+enable_layer4 = true
+wal_mode = true
+cache_size_mb = 64
+
+[container]
+runtime = "systemd-nspawn"
+private_users = true
+virtual_ethernet = true
