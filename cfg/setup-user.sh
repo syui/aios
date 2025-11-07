@@ -46,20 +46,8 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Copy container initialization script
-cp -rf ./cfg/init-containers.sh $ROOTFS/usr/local/bin/init-containers.sh
-arch-chroot $ROOTFS /bin/sh -c 'chmod +x /usr/local/bin/init-containers.sh'
-
-# Add initialization, MCP auto-setup and claude auto-start for ai user (login shell only)
+# Add MCP auto-setup and claude auto-start for ai user (login shell only)
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
-
-# Initialize workspace containers on first login
-if [ ! -f ~/.aios-initialized ]; then
-    echo "First login detected. Initializing workspace containers..."
-    if command -v sudo &>/dev/null && [ -x /usr/local/bin/init-containers.sh ]; then
-        /usr/local/bin/init-containers.sh && touch ~/.aios-initialized
-    fi
-fi
 
 # MCP auto-setup (run once after .claude.json is created)
 if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
