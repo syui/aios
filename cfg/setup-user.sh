@@ -46,16 +46,24 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add auto container login for ai user
+# Add workspace container setup and claude wrapper for ai user
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# Auto-start workspace container and login (aios concept: start from container)
-if [[ -o login ]] && [[ -o interactive ]]; then
-    # Start workspace container
+# Start workspace container on login
+if [[ -o login ]]; then
     sudo machinectl start workspace 2>/dev/null || true
-    sleep 2
-    # Enter workspace container as root
-    exec sudo machinectl shell workspace
+fi
+
+# Claude wrapper - always use container's claude (shared config/memory)
+claude() {
+    sudo machinectl shell workspace /bin/sh -c "claude $*"
+}
+
+# Auto-start claude in interactive login shell
+if [[ -o login ]] && [[ -o interactive ]]; then
+    if command -v claude &>/dev/null; then
+        claude
+    fi
 fi
 EOF
 
