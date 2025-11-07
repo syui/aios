@@ -35,8 +35,6 @@ echo "Creating workspace container configuration..."
 mkdir -p $ROOTFS/etc/systemd/nspawn
 cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
 [Exec]
-Boot=yes
-PrivateUsers=pick
 ResolvConf=copy-host
 
 [Files]
@@ -77,8 +75,6 @@ if [[ -o login ]] && [[ -o interactive ]]; then
     if [[ -z "$INSIDE_WORKSPACE" ]]; then
         # Running as ai user on aios OS - enter workspace container
         export INSIDE_WORKSPACE=1
-        sudo machinectl start workspace 2>/dev/null || true
-        sleep 1
         exec sudo machinectl shell workspace
     else
         # Running as root inside workspace container - start claude
