@@ -69,11 +69,11 @@ arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bi
 
 # Install aigpt (aios core package)
 echo "Installing aigpt..."
-arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/'
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd gpt && cargo build --release && cp -rf ./target/release/aigpt /bin/ && cd .. && rm -rf gpt'
 
 # Install aibot (aios core package)
 echo "Installing aibot..."
-arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai'
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai && cd .. && rm -rf bot'
 
 echo "✓ Arch Linux base complete"
 echo ""
