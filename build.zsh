@@ -65,7 +65,8 @@ cp -rf ./cfg/os-release root.x86_64/etc/os-release
 
 # Configure sudoers for wheel group (full access for container operation)
 echo "Configuring sudoers..."
-arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers'
+arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman -Syu --noconfirm, /usr/bin/poweroff, /usr/bin/reboot" >> /etc/sudoers'
+arch-chroot root.x86_64 /bin/sh -c 'echo "ai ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers'
 
 # Install aigpt (aios core package)
 echo "Installing aigpt..."
