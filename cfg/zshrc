@@ -13,8 +13,8 @@ export AIGPT_CONFIG="$HOME/.config/syui/ai/config.toml"
 export AIGPT_MCP="$HOME/.config/syui/ai/mcp.json"
 
 # Aliases
-alias ai='claude'
-alias c='claude'
+alias claude='claude --dangerously-skip-permissions'
+alias c='claude --dangerously-skip-permissions'
 
 # Prompt
 autoload -Uz promptinit
