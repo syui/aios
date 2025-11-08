@@ -35,6 +35,7 @@ echo "Creating workspace container configuration..."
 mkdir -p $ROOTFS/etc/systemd/nspawn
 cat > $ROOTFS/etc/systemd/nspawn/workspace.nspawn <<'EOF'
 [Exec]
+Boot=yes
 ResolvConf=copy-host
 
 [Files]
@@ -60,27 +61,13 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add workspace container auto-start and entry (shared .zshrc for ai user and workspace root)
+# Add claude auto-start on login (once, not exec)
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# MCP auto-setup (run once after .claude.json is created)
-if [[ -f ~/.claude.json ]] && ! grep -q '"aigpt"' ~/.claude.json 2>/dev/null; then
-    if command -v claude &>/dev/null && command -v aigpt &>/dev/null; then
-        claude mcp add aigpt aigpt server &>/dev/null || true
-    fi
-fi
-
-# aios concept: container from start (ai user and workspace root share this .zshrc)
+# Start claude on login (once)
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if [[ -z "$INSIDE_WORKSPACE" ]]; then
-        # Running as ai user on aios OS - enter workspace container
-        export INSIDE_WORKSPACE=1
-        exec sudo machinectl shell workspace
-    else
-        # Running as root inside workspace container - start claude
-        if command -v claude &>/dev/null; then
-            claude
-        fi
+    if command -v claude &>/dev/null; then
+        claude
     fi
 fi
 EOF

@@ -65,7 +65,7 @@ cp -rf ./cfg/os-release root.x86_64/etc/os-release
 
 # Configure sudoers for wheel group
 echo "Configuring sudoers..."
-arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacstrap, /usr/bin/arch-chroot, /usr/bin/rm, /usr/bin/mkdir, /usr/bin/mv, /usr/bin/cp, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl, /bin/bash" >> /etc/sudoers'
+arch-chroot root.x86_64 /bin/sh -c 'echo "%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacstrap, /usr/bin/arch-chroot, /usr/bin/rm, /usr/bin/mkdir, /usr/bin/mv, /usr/bin/cp, /usr/bin/poweroff, /usr/bin/reboot, /usr/bin/machinectl, /usr/bin/systemd-nspawn, /usr/bin/mount, /usr/bin/chroot, /bin/bash" >> /etc/sudoers'
 
 # Install aigpt (aios core package)
 echo "Installing aigpt..."
@@ -86,14 +86,7 @@ bash ./cfg/setup-user.sh
 echo ""
 
 # ============================================
-# 3. Claude & aigpt Setup
-# ============================================
-
-bash ./cfg/setup-claude.sh
-echo ""
-
-# ============================================
-# 4. Create child containers (after all configuration)
+# 3. Create workspace container (after all configuration)
 # ============================================
 
 bash ./cfg/user-continer.sh
