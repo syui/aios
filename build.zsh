@@ -86,14 +86,7 @@ bash ./cfg/setup-user.sh
 echo ""
 
 # ============================================
-# 3. Claude & aigpt Setup
-# ============================================
-
-bash ./cfg/setup-claude.sh
-echo ""
-
-# ============================================
-# 4. Create child containers (after all configuration)
+# 3. Create workspace container (after all configuration)
 # ============================================
 
 bash ./cfg/user-continer.sh
