@@ -11,6 +11,17 @@ tar xf "$TARBALL"
 mkdir -p /var/lib/machines
 mv root.x86_64 /var/lib/machines/$NAME
 
+# Create aios.nspawn for network access
+echo "Creating network configuration..."
+mkdir -p /etc/systemd/nspawn
+cat > /etc/systemd/nspawn/$NAME.nspawn <<'EOF'
+[Exec]
+Boot=yes
+
+[Network]
+Private=no
+EOF
+
 echo "=== Installation complete ==="
 echo ""
 echo "Usage:"

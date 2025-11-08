@@ -61,37 +61,24 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add claude auto-start on login (once, not exec)
+# Add workspace auto-entry and claude auto-start
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# Start claude on login (once)
+# aios: auto-enter workspace container
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if command -v claude &>/dev/null; then
-        claude
+    if [[ -z "$INSIDE_WORKSPACE" ]]; then
+        # Enter workspace container
+        export INSIDE_WORKSPACE=1
+        exec sudo systemd-nspawn -q -D /var/lib/machines/workspace /bin/zsh
+    else
+        # Inside workspace - start claude with skip permissions
+        if command -v claude &>/dev/null; then
+            claude --dangerously-skip-permissions
+        fi
     fi
 fi
 EOF
 
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
-
-# Copy aios startup script
-cp -rf ./cfg/aios.zsh $ROOTFS/usr/local/bin/aios-startup
-arch-chroot $ROOTFS /bin/sh -c 'chmod +x /usr/local/bin/aios-startup'
-
-# Create default config directory and file for user 'ai'
-arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/os'
-cat > $ROOTFS/home/ai/.config/syui/ai/os/config.json <<'EOF'
-{
-  "shell": false
-}
-EOF
-arch-chroot $ROOTFS /bin/sh -c 'chown -R ai:ai /home/ai/.config'
-
-# Update .zshrc to source startup script
-cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
-
-# aios startup
-source /usr/local/bin/aios-startup
-EOF
 
 echo "✓ User setup complete"
