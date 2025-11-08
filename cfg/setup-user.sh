@@ -74,24 +74,4 @@ EOF
 
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
-# Copy aios startup script
-cp -rf ./cfg/aios.zsh $ROOTFS/usr/local/bin/aios-startup
-arch-chroot $ROOTFS /bin/sh -c 'chmod +x /usr/local/bin/aios-startup'
-
-# Create default config directory and file for user 'ai'
-arch-chroot $ROOTFS /bin/sh -c 'mkdir -p /home/ai/.config/syui/ai/os'
-cat > $ROOTFS/home/ai/.config/syui/ai/os/config.json <<'EOF'
-{
-  "shell": false
-}
-EOF
-arch-chroot $ROOTFS /bin/sh -c 'chown -R ai:ai /home/ai/.config'
-
-# Update .zshrc to source startup script
-cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
-
-# aios startup
-source /usr/local/bin/aios-startup
-EOF
-
 echo "✓ User setup complete"
