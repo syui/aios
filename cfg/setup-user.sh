@@ -61,13 +61,20 @@ cp -rf ./cfg/zshrc $ROOTFS/root/.zshrc
 # Copy .zshrc for user 'ai'
 cp -rf ./cfg/zshrc $ROOTFS/home/ai/.zshrc
 
-# Add claude auto-start on login (once, not exec)
+# Add workspace auto-entry and claude auto-start
 cat >> $ROOTFS/home/ai/.zshrc <<'EOF'
 
-# Start claude on login (once)
+# aios: auto-enter workspace container
 if [[ -o login ]] && [[ -o interactive ]]; then
-    if command -v claude &>/dev/null; then
-        claude
+    if [[ -z "$INSIDE_WORKSPACE" ]]; then
+        # Enter workspace container
+        export INSIDE_WORKSPACE=1
+        exec sudo systemd-nspawn -q -D /var/lib/machines/workspace /bin/zsh
+    else
+        # Inside workspace - start claude with skip permissions
+        if command -v claude &>/dev/null; then
+            claude --dangerously-skip-permissions
+        fi
     fi
 fi
 EOF
