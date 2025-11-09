@@ -1,188 +1,258 @@
-# <img src="./icon/ai.png" width="30"> ai `os`
+# AIOS - AI Operating System
 
-**aios** = ArchLinux + Claude Code + aigpt in systemd-nspawn
+**A complete redesign of AI-powered operating system management**
 
-A minimal ArchLinux environment optimized for Claude Code with shared AI memory.
+## Overview
 
-```
-systemd-nspawn container
-├── Claude Code (AI interface)
-├── aigpt (shared memory)
-└── zsh (.zshrc configured)
-
-$ sudo machinectl shell aios
-$ claude  # Start Claude Code
-```
-
-## Philosophy
-
-**Insert AI into existing flows**
-
-Instead of building a new AI chat interface, use **Claude Code** (which already works).
-
-aios provides:
-1. Pre-installed **aigpt** (MCP server for shared memory)
-2. Pre-installed **Claude Code** (`npm i -g @anthropic-ai/claude-code`)
-3. Environment isolation with **systemd-nspawn**
-4. Shared memory across containers
-
-## What's Included
-
-### 1. Claude Code
-
-Pre-installed and ready to use:
-
-```sh
-$ claude
-# Claude Code starts, with MCP connection to aigpt
-> Install rust development environment
-✓ Installing rust, rust-analyzer, neovim
-```
-
-### 2. aigpt (Shared Memory)
-
-MCP server that provides persistent memory to Claude Code:
-
-```
-~/.config/syui/ai/gpt/memory.db (SQLite, WAL mode)
-  ↓ bind mount
-aios-dev, aios-prod, etc. (all share same DB)
-```
-
-AI remembers your preferences across all containers.
-
-### 3. systemd-nspawn
-
-Lightweight container environment:
-
-```sh
-$ sudo machinectl shell aios
-# Inside container with aigpt + Claude Code
-```
-
-Multiple containers can share the same memory.
+AIOS is a unified AI Operating System built from scratch with a daemon-first architecture. Unlike the separate aigpt/aishell approach, AIOS integrates everything into a single cohesive system.
 
 ## Architecture
 
 ```
-Host
-├── ~/.config/syui/ai/gpt/memory.db (shared)
-│
-└── /var/lib/machines/aios/ (container)
-    ├── ArchLinux base
-    ├── aigpt (MCP server)
-    ├── Claude Code
-    ├── .zshrc (aliases: ai=claude)
-    └── Bind mount → shared memory
+┌─────────────────────────────────────────┐
+│  AIOS - AI Operating System             │
+├─────────────────────────────────────────┤
+│                                         │
+│  Layer 1: Configuration (TOML-based)    │
+│  Layer 2: Agent Runtime (daemon)        │
+│  Layer 3: Memory & Tools                │
+│  Layer 4: Recovery & Safety             │
+│  Layer 5: CLI Interface                 │
+└─────────────────────────────────────────┘
 ```
 
-## Quick Start
+### Components
 
-```sh
-# 1. Clone repository
-$ git clone https://github.com/syui/aios
-$ cd aios
+- **aios-runtime**: Core daemon that runs as a systemd service
+- **aios-cli**: Command-line client (`aios` command)
+- **aios-memory**: Unified memory system (SQLite + FTS)
+- **aios-agents**: LLM agent implementation with multi-provider support
+- **aios-tools**: Extensible tool registry (bash, read, write, list, etc.)
+- **aios-recovery**: Snapshot and rollback system
+- **aios-config**: Declarative TOML configuration
 
-# 2. Run installer (creates systemd-nspawn container)
-$ sudo ./aios-install.sh
+## Installation
 
-# 3. Enter container
-$ sudo machinectl shell aios
+```bash
+# Build all components
+cargo build --release
 
-# 4. Start Claude Code
-$ claude
-# or
-$ ai
-```
+# Install binaries
+cargo install --path runtime --bin aios-runtime
+cargo install --path cli --bin aios
 
-## Container Distribution
-
-Pre-built containers are available:
-
-```sh
-# Docker
-$ docker run -it git.syui.ai/ai/os
-$ docker run -it ghcr.io/syui/aios
-
-# Podman
-$ podman pull aios  # using shortname alias
+# Or use the workspace
+cargo install --path .
 ```
 
 ## Configuration
 
-### Directory Structure
+Create `/etc/aios/config.toml`:
+
+```toml
+[aios]
+version = "0.1.0"
+data_dir = "/var/lib/aios"
+socket_path = "/tmp/aios-runtime.sock"
+
+[llm]
+default_provider = "openai"
+
+[llm.openai]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4"
+
+[agents]
+core_agent = true
+security_agent = false
+system_agent = false
+
+[recovery]
+enabled = true
+snapshot_interval = "hourly"
+max_snapshots = 24
+auto_rollback = false
+
+[security]
+mode = "normal"  # safe, normal, paranoid
+sandbox = false
+dangerous_patterns = ["rm -rf /", "mkfs.*"]
+require_confirm = ["sudo.*", "systemctl.*"]
+```
+
+## Usage
+
+### 1. Start the daemon
+
+```bash
+# Foreground
+export OPENAI_API_KEY="your-key"
+aios-runtime
+
+# Or as systemd service
+sudo systemctl start aios-runtime
+sudo systemctl enable aios-runtime
+```
+
+### 2. Interact via CLI
+
+```bash
+# One-shot command
+aios chat "Install nginx and configure it"
+
+# Interactive shell
+aios shell
+
+# Check status
+aios status
+
+# System info
+aios info
+```
+
+### 3. Snapshot management
+
+```bash
+# Create snapshot
+aios snapshot --description "Before system upgrade"
+
+# List snapshots
+aios snapshots
+
+# Restore from snapshot
+aios restore <snapshot-id>
+```
+
+## Features
+
+### Unified Daemon
+
+- Single process handles all AI interactions
+- Unix socket IPC (fast, secure)
+- Persistent memory across sessions
+- Tool execution with safety checks
+
+### Memory System
+
+- SQLite + Full-Text Search
+- Cross-container memory sharing
+- Command history and chat logs
+- Semantic search capabilities
+
+### Recovery System
+
+- Automatic periodic snapshots
+- Manual snapshot creation
+- Rollback to any snapshot
+- Configurable retention policy
+
+### Declarative Configuration
+
+- TOML-based system config
+- Override via environment variables
+- Hot-reload support (planned)
+
+## Comparison: Old vs New
+
+| Aspect | Old (aigpt + aishell) | New (AIOS) |
+|--------|----------------------|-----------|
+| **Architecture** | Separate tools | Unified daemon |
+| **IPC** | None (separate processes) | Unix socket |
+| **Memory** | aigpt only | Unified across all |
+| **Configuration** | Separate configs | Single TOML |
+| **Recovery** | Manual | Built-in snapshots |
+| **Tools** | Hardcoded | Plugin registry |
+| **Deployment** | Two binaries | Daemon + CLI |
+
+## Development
+
+```bash
+# Build workspace
+cargo build
+
+# Run tests
+cargo test
+
+# Check all packages
+cargo check --workspace
+
+# Format code
+cargo fmt --all
+
+# Run linter
+cargo clippy --workspace
+```
+
+## Project Structure
 
 ```
-~/.config/syui/ai/
-├── gpt/memory.db      # Shared memory (SQLite WAL)
-├── mcp.json           # MCP server config
-└── config.toml        # aios config
+aios/
+├── Cargo.toml              # Workspace definition
+├── runtime/                # Core daemon
+│   ├── src/
+│   │   ├── main.rs
+│   │   └── daemon.rs
+│   └── Cargo.toml
+├── cli/                    # CLI client
+│   ├── src/main.rs
+│   └── Cargo.toml
+├── memory/                 # Memory system
+│   ├── src/lib.rs
+│   └── Cargo.toml
+├── agents/                 # LLM agents
+│   ├── src/lib.rs
+│   └── Cargo.toml
+├── tools/                  # Tool registry
+│   ├── src/lib.rs
+│   └── Cargo.toml
+├── recovery/               # Snapshot system
+│   ├── src/lib.rs
+│   └── Cargo.toml
+└── config/                 # Configuration
+    ├── src/lib.rs
+    └── Cargo.toml
 ```
 
-### MCP Configuration
+## Roadmap
 
-Claude Code connects to aigpt via MCP:
+- [x] Core daemon architecture
+- [x] Unified memory system
+- [x] Tool registry
+- [x] Agent loop implementation
+- [x] CLI client
+- [x] Snapshot system
+- [ ] Systemd integration
+- [ ] Multi-agent coordination
+- [ ] Plugin system
+- [ ] Security sandbox
+- [ ] Vector database for semantic memory
+- [ ] Anthropic Claude support
+- [ ] Ollama (local LLM) support
 
-```json
-{
-  "mcpServers": {
-    "aigpt": {
-      "command": "aigpt",
-      "args": ["server", "--enable-layer4"]
-    }
-  }
-}
+## Integration with Containers
+
+AIOS is designed to work seamlessly with containers:
+
+```bash
+# In container
+machinectl shell aios
+export OPENAI_API_KEY="..."
+aios-runtime &
+aios chat "Configure this container"
+
+# Memory is shared at ~/.config/aios/memory.db
+# Accessible from all containers
 ```
 
-This enables Claude Code to use aigpt's memory system.
+## License
 
-## Building from Source
+MIT License
 
-```sh
-$ pacman -S base-devel archiso docker git rust nodejs npm
-$ ./build.zsh
-# Creates: aios-bootstrap.tar.gz
-```
+## Authors
 
-## How It Works
+syui
 
-1. **systemd-nspawn** provides lightweight containers
-2. **aigpt** runs as MCP server, stores memories in SQLite
-3. **Claude Code** connects to aigpt via MCP
-4. Shared memory (`~/.config/syui/ai/gpt/memory.db`) is bind-mounted
+## Related Projects
 
-**Result:** Claude Code can remember your preferences across all containers.
-
-## Why Not Just Use Claude Code?
-
-You can! aios just provides:
-- Pre-configured environment
-- Shared memory (aigpt) pre-installed
-- Container isolation
-- Easy multi-environment setup
-
-## Links
-
-- Repository: https://github.com/syui/aios
-- Git: https://git.syui.ai/ai/os
-- aigpt: https://git.syui.ai/ai/gpt
-- Container: https://git.syui.ai/ai/-/packages/container/os
-
-## Philosophy
-
-**Insert AI into existing flows**
-
-Don't build a new AI chat interface. Use Claude Code (which already works).
-
-Don't create a new container system. Use systemd-nspawn (lightweight, standard).
-
-Just provide:
-1. aigpt for shared memory
-2. Pre-configured environment
-3. Automation scripts
-
-Simple. Minimal. Effective.
-
----
-
-© syui
+- [aigpt](https://github.com/syui/aigpt) - Original memory system
+- [aishell](../aishell) - Shell automation tool

@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "runtime",
+    "cli",
+    "memory",
+    "agents",
+    "tools",
+    "recovery",
+    "config",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["syui"]
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "io-std", "process", "fs", "net", "sync"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Database
+rusqlite = { version = "0.30", features = ["bundled"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# IPC
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+ulid = "1.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+
+# Shell execution
+duct = "0.13"
