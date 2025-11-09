@@ -52,6 +52,44 @@ impl RecoveryManager {
         let metadata_json = serde_json::to_string_pretty(&snapshot)?;
         tokio::fs::write(metadata_path, metadata_json).await?;
 
+        // Backup AIOS configuration and data
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/var/lib"))
+            .join("aios");
+
+        let data_path = snapshot_path.join("data");
+        std::fs::create_dir_all(&data_path)?;
+
+        // Backup config.toml if exists
+        let config_file = config_dir.join("config.toml");
+        if config_file.exists() {
+            let dest = data_path.join("config.toml");
+            tokio::fs::copy(&config_file, &dest).await?;
+            tracing::debug!("Backed up config.toml");
+        }
+
+        // Backup memory.db if exists
+        let memory_db = config_dir.join("memory.db");
+        if memory_db.exists() {
+            let dest = data_path.join("memory.db");
+            tokio::fs::copy(&memory_db, &dest).await?;
+            tracing::debug!("Backed up memory.db");
+        }
+
+        // Backup memory.db-wal if exists (SQLite WAL file)
+        let memory_wal = config_dir.join("memory.db-wal");
+        if memory_wal.exists() {
+            let dest = data_path.join("memory.db-wal");
+            tokio::fs::copy(&memory_wal, &dest).await?;
+        }
+
+        // Backup memory.db-shm if exists (SQLite shared memory file)
+        let memory_shm = config_dir.join("memory.db-shm");
+        if memory_shm.exists() {
+            let dest = data_path.join("memory.db-shm");
+            tokio::fs::copy(&memory_shm, &dest).await?;
+        }
+
         tracing::info!("Created snapshot: {}", snapshot.id);
 
         // Cleanup old snapshots
@@ -113,11 +151,51 @@ impl RecoveryManager {
 
         tracing::info!("Restoring from snapshot: {}", snapshot.id);
 
-        // This is a placeholder - actual restore logic would depend on
-        // what you're snapshotting (filesystem, configuration, etc.)
-        // For now, we just log it
+        let snapshot_path = self.snapshots_dir.join(id);
+        let data_path = snapshot_path.join("data");
 
-        tracing::warn!("Snapshot restore is not yet implemented");
+        if !data_path.exists() {
+            anyhow::bail!("Snapshot data not found for: {}", id);
+        }
+
+        // Get AIOS config directory
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/var/lib"))
+            .join("aios");
+
+        std::fs::create_dir_all(&config_dir)?;
+
+        // Restore config.toml if exists in snapshot
+        let config_snapshot = data_path.join("config.toml");
+        if config_snapshot.exists() {
+            let dest = config_dir.join("config.toml");
+            tokio::fs::copy(&config_snapshot, &dest).await?;
+            tracing::info!("Restored config.toml");
+        }
+
+        // Restore memory.db if exists in snapshot
+        let memory_snapshot = data_path.join("memory.db");
+        if memory_snapshot.exists() {
+            let dest = config_dir.join("memory.db");
+            tokio::fs::copy(&memory_snapshot, &dest).await?;
+            tracing::info!("Restored memory.db");
+        }
+
+        // Restore WAL file if exists
+        let wal_snapshot = data_path.join("memory.db-wal");
+        if wal_snapshot.exists() {
+            let dest = config_dir.join("memory.db-wal");
+            tokio::fs::copy(&wal_snapshot, &dest).await?;
+        }
+
+        // Restore SHM file if exists
+        let shm_snapshot = data_path.join("memory.db-shm");
+        if shm_snapshot.exists() {
+            let dest = config_dir.join("memory.db-shm");
+            tokio::fs::copy(&shm_snapshot, &dest).await?;
+        }
+
+        tracing::info!("Successfully restored snapshot: {}", snapshot.id);
 
         Ok(())
     }

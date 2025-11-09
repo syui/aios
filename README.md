@@ -2,9 +2,36 @@
 
 **A complete redesign of AI-powered operating system management**
 
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)]()
+
 ## Overview
 
 AIOS is a unified AI Operating System built from scratch with a daemon-first architecture. Unlike the separate aigpt/aishell approach, AIOS integrates everything into a single cohesive system.
+
+## Quick Start
+
+```bash
+# Clone and build
+git clone https://github.com/syui/aios.git
+cd aios
+cargo build --release
+
+# Install
+./install.sh
+
+# Set API key
+export OPENAI_API_KEY="sk-your-key"
+
+# Start daemon
+systemctl --user start aios-runtime
+
+# Use AIOS
+aios chat "What is my current directory?"
+aios shell  # Interactive mode
+```
+
+👉 **See [QUICKSTART.md](QUICKSTART.md) for detailed instructions**
 
 ## Architecture
 
@@ -215,19 +242,28 @@ aios/
 
 ## Roadmap
 
-- [x] Core daemon architecture
-- [x] Unified memory system
-- [x] Tool registry
-- [x] Agent loop implementation
-- [x] CLI client
-- [x] Snapshot system
-- [ ] Systemd integration
+### Completed ✅
+- [x] Core daemon architecture with Arc<Mutex> for concurrent access
+- [x] Unified memory system (SQLite + FTS5)
+- [x] Tool registry (bash, read, write, list)
+- [x] Agent loop implementation with OpenAI
+- [x] CLI client (chat, shell, snapshot commands)
+- [x] Snapshot & restore system (config + memory backup)
+- [x] Systemd user service integration
+- [x] Installation script
+
+### In Progress 🚧
+- [ ] End-to-end testing
+- [ ] Documentation improvements
+
+### Planned 📋
 - [ ] Multi-agent coordination
-- [ ] Plugin system
-- [ ] Security sandbox
+- [ ] Plugin system for custom tools
+- [ ] Security sandbox modes
 - [ ] Vector database for semantic memory
 - [ ] Anthropic Claude support
 - [ ] Ollama (local LLM) support
+- [ ] Web UI dashboard
 
 ## Integration with Containers
 

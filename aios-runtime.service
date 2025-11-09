@@ -1,0 +1,23 @@
+[Unit]
+Description=AIOS Runtime Daemon
+Documentation=https://github.com/syui/aios
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Environment="RUST_LOG=info"
+Environment="OPENAI_API_KEY="
+ExecStart=/usr/local/bin/aios-runtime
+Restart=on-failure
+RestartSec=5s
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.config/aios /tmp
+
+[Install]
+WantedBy=default.target
