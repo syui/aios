@@ -74,7 +74,10 @@ arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/gpt && cd g
 
 # Install aibot (aios core package)
 echo "Installing aibot..."
-arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build && cp -rf ./target/debug/aibot /bin/ && aibot ai && cd .. && rm -rf bot'
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/bot && cd bot && cargo build --release && cp -rf ./target/release/aibot /bin/ && aibot ai && cd .. && rm -rf bot'
+
+echo "Installing aishell..."
+arch-chroot root.x86_64 /bin/sh -c 'git clone https://git.syui.ai/ai/shell && cd shell && cargo build --release && cp -rf ./target/release/aishell /bin/ && cd .. && rm -rf shell'
 
 echo "✓ Arch Linux base complete"
 echo ""
