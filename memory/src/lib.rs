@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,13 +22,13 @@ pub enum MemoryType {
     Snapshot,   // System snapshots
 }
 
-impl ToString for MemoryType {
-    fn to_string(&self) -> String {
+impl fmt::Display for MemoryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MemoryType::Command => "command".to_string(),
-            MemoryType::Chat => "chat".to_string(),
-            MemoryType::System => "system".to_string(),
-            MemoryType::Snapshot => "snapshot".to_string(),
+            MemoryType::Command => write!(f, "command"),
+            MemoryType::Chat => write!(f, "chat"),
+            MemoryType::System => write!(f, "system"),
+            MemoryType::Snapshot => write!(f, "snapshot"),
         }
     }
 }
@@ -54,7 +55,7 @@ impl MemoryStore {
     }
 
     /// Open default memory database
-    pub fn default() -> Result<Self> {
+    pub fn open_default() -> Result<Self> {
         let path = Self::default_path();
         Self::new(path)
     }

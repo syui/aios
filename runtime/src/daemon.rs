@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use aios_agents::{Agent, OpenAIProvider};
 use aios_config::AIOSConfig;
@@ -37,9 +39,9 @@ impl Daemon {
         tracing::info!("Loaded configuration from {:?}", AIOSConfig::default_config_path());
 
         // Initialize components
-        let memory = MemoryStore::default()?;
+        let memory = MemoryStore::open_default()?;
         let tools = ToolRegistry::new();
-        let recovery = RecoveryManager::default()?;
+        let recovery = RecoveryManager::new_with_defaults()?;
 
         // Create LLM provider
         let llm_provider = OpenAIProvider::from_env()
@@ -67,7 +69,7 @@ impl Daemon {
         })
     }
 
-    pub async fn serve(&self) -> Result<()> {
+    pub async fn serve(self) -> Result<()> {
         let socket_path = &self.config.aios.socket_path;
 
         // Remove old socket if exists
@@ -80,22 +82,25 @@ impl Daemon {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let listener = UnixListener::bind(&socket_path)
+        let listener = UnixListener::bind(socket_path)
             .context("Failed to bind Unix socket")?;
 
         tracing::info!("AIOS daemon listening on {:?}", socket_path);
+
+        // Wrap daemon in Arc<Mutex<>> for concurrent access
+        let daemon = Arc::new(Mutex::new(self));
 
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     tracing::debug!("New client connected");
 
+                    // Clone Arc for this connection
+                    let daemon_clone = Arc::clone(&daemon);
+
                     // Handle each connection in a separate task
-                    // Note: In a real implementation, we'd need to handle
-                    // the agent mutability properly (e.g., using Arc<Mutex<Agent>>)
-                    // For now, this is a simplified version
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream).await {
+                        if let Err(e) = Self::handle_connection(stream, daemon_clone).await {
                             tracing::error!("Connection error: {}", e);
                         }
                     });
@@ -177,39 +182,35 @@ impl Daemon {
             },
         }
     }
-}
 
-async fn handle_connection(mut stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    async fn handle_connection(mut stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<()> {
+        let (reader, mut writer) = stream.split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
 
-    while reader.read_line(&mut line).await? > 0 {
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to parse request: {}", e);
-                line.clear();
-                continue;
-            }
-        };
+        while reader.read_line(&mut line).await? > 0 {
+            let request: Request = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Failed to parse request: {}", e);
+                    line.clear();
+                    continue;
+                }
+            };
 
-        // For this simplified version, we just echo back a response
-        // In a real implementation, we'd pass this to the daemon
-        let response = Response {
-            id: request.id.clone(),
-            result: Some(serde_json::json!({
-                "message": "Request received (simplified response)"
-            })),
-            error: None,
-        };
+            // Lock daemon and handle request
+            let response = {
+                let mut daemon_guard = daemon.lock().await;
+                daemon_guard.handle_request(request).await
+            };
 
-        let response_str = serde_json::to_string(&response)? + "\n";
-        writer.write_all(response_str.as_bytes()).await?;
-        writer.flush().await?;
+            let response_str = serde_json::to_string(&response)? + "\n";
+            writer.write_all(response_str.as_bytes()).await?;
+            writer.flush().await?;
 
-        line.clear();
+            line.clear();
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }

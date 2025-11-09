@@ -1,5 +1,4 @@
 use anyhow::Result;
-use tracing_subscriber;
 
 mod daemon;
 use daemon::Daemon;

@@ -58,8 +58,8 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
-    pub fn get(&self, name: &str) -> Option<&Box<dyn Tool>> {
-        self.tools.get(name)
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools.get(name).map(|b| &**b)
     }
 
     pub fn list(&self) -> Vec<ToolDefinition> {

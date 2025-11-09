@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// AIOS system configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AIOSConfig {
     #[serde(default)]
     pub aios: SystemConfig,
@@ -209,17 +209,6 @@ impl Default for SecurityConfig {
     }
 }
 
-impl Default for AIOSConfig {
-    fn default() -> Self {
-        Self {
-            aios: SystemConfig::default(),
-            llm: LLMConfig::default(),
-            agents: AgentsConfig::default(),
-            recovery: RecoveryConfig::default(),
-            security: SecurityConfig::default(),
-        }
-    }
-}
 
 impl AIOSConfig {
     /// Load configuration from file

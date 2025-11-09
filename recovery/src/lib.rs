@@ -26,7 +26,7 @@ impl RecoveryManager {
         })
     }
 
-    pub fn default() -> Result<Self> {
+    pub fn new_with_defaults() -> Result<Self> {
         let snapshots_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/var/lib"))
             .join("aios")
@@ -164,8 +164,3 @@ impl RecoveryManager {
     }
 }
 
-impl Default for RecoveryManager {
-    fn default() -> Self {
-        Self::default().expect("Failed to create RecoveryManager")
-    }
-}
