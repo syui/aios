@@ -7,3 +7,6 @@ root.x86_64/
 archiso/
 install.sh
 build.log
+/claude.md
+/CLAUDE.md
+.claude
