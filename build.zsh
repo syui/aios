@@ -2,7 +2,7 @@
 
 set -e
 
-ROOTFS="root.x86_64"
+ROOTFS="$(pwd)/root.x86_64"
 BUILD_MODE="${1:-tarball}"
 BUILD_DATE=$(date +%Y.%m.%d)
 
@@ -14,6 +14,11 @@ mkdir -p $ROOTFS
 # --- rootfs構築 (共通) ---
 
 pacstrap -c $ROOTFS base
+
+# pacman.conf がない場合はホストからコピー
+if [[ ! -f $ROOTFS/etc/pacman.conf ]]; then
+  cp /etc/pacman.conf $ROOTFS/etc/pacman.conf
+fi
 
 echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
 Server = http://mirrors.cat.net/archlinux/$repo/os/$arch' > $ROOTFS/etc/pacman.d/mirrorlist
