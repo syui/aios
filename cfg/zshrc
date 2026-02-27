@@ -1,14 +1,27 @@
-export EDITOR=vim
-export LANG=en_US.UTF-8
-export PATH=$HOME/.local/bin:$PATH
+export PATH=$HOME/.cargo/bin:$PATH
 
+alias u="sudo pacman -Syu --noconfirm"
+alias zs="vim ~/.zshrc"
+alias zr="exec $SHELL && source ~/.zshrc"
 alias claude='claude --dangerously-skip-permissions'
 alias c='claude --dangerously-skip-permissions'
 
-autoload -Uz promptinit && promptinit && prompt adam1
-autoload -Uz compinit && compinit
+autoload -Uz compinit
+compinit
+fpath=(/usr/share/zsh/site-functions $fpath)
 
-HISTFILE=~/.zsh_history
+#source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+source /usr/share/zsh/plugins/zsh-history-substring-search/zsh-history-substring-search.zsh
+
 HISTSIZE=10000
 SAVEHIST=10000
+HISTFILE=~/.zsh_history
 setopt SHARE_HISTORY
+setopt HIST_IGNORE_DUPS
+bindkey '^[[A' history-substring-search-up
+bindkey '^[[B' history-substring-search-down
+
+if [[ -o login ]] && [[ -o interactive ]] && command -v aishell &>/dev/null; then
+	exec aishell
+fi

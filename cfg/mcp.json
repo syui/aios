@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "aigpt": {
+      "command": "aigpt",
+      "args": ["server"],
+      "env": {}
+    },
+    "ailog": {
+      "command": "ailog",
+      "args": ["mcp"],
+      "env": {
+        "CHAT_SYSTEM_FILE": "/home/ai/.config/aigpt/core.md",
+        "CHAT_OUTPUT": "/home/ai/log/public/content"
+      }
+    }
+  }
+}

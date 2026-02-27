@@ -1,12 +1,9 @@
-.config/ai
+/.config/ai
+/claude.md
+/CLAUDE.md
 **.DS_Store
-
-# Build artifacts
 aios-bootstrap*.tar.gz
 root.x86_64/
 archiso/
-install.sh
 build.log
-/claude.md
-/CLAUDE.md
 .claude

@@ -19,9 +19,12 @@ Server = http://mirrors.cat.net/archlinux/$repo/os/$arch' > $ROOTFS/etc/pacman.d
 sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust openssh jq nodejs npm'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
 arch-chroot $ROOTFS /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
+bash cfg/pkg.sh $ROOTFS
+
+arch-chroot $ROOTFS /bin/sh -c 'chsh -s /bin/zsh'
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
 arch-chroot $ROOTFS /bin/sh -c 'echo "ai:ai" | chpasswd'
 echo "ai ALL=(ALL:ALL) NOPASSWD: ALL" >> $ROOTFS/etc/sudoers
@@ -35,6 +38,10 @@ EOF
 
 cp cfg/zshrc $ROOTFS/home/ai/.zshrc
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
+
+mkdir -p $ROOTFS/home/ai/.config/claude
+cp cfg/mcp.json $ROOTFS/home/ai/.config/claude/mcp.json
+arch-chroot $ROOTFS /bin/sh -c 'chown -R ai:ai /home/ai/.config'
 
 cat > $ROOTFS/etc/os-release <<EOF
 NAME=aios
