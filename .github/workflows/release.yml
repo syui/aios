@@ -7,53 +7,37 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 env:
-  DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
-  IMAGE_NAME: ${{ github.repository }}
-  GITHUB_TOKEN: ${{ secrets.APP_TOKEN }}
-  REGISTRY: ghcr.io
+  APP_TOKEN: ${{ secrets.APP_TOKEN }}
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    container:
-      image: archlinux
-      options: --privileged
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: pacman -Sy --noconfirm arch-install-scripts zsh
-
       - name: Build aios
-        run: zsh ./build.zsh
-
-      - name: Create Docker images
         run: |
-          tar -C ./root.x86_64 -c . | docker import - ${{ env.IMAGE_NAME }}
-          echo "${{ env.DOCKER_TOKEN }}" | docker login -u syui --password-stdin
-          docker push ${{ env.IMAGE_NAME }}
-
-      - name: Log in to the Container registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ env.GITHUB_TOKEN }}
+          docker run --rm --privileged \
+            -v ${{ github.workspace }}:/work -w /work \
+            archlinux:latest \
+            bash -c "pacman -Sy --noconfirm arch-install-scripts zsh && zsh ./build.zsh"
 
       - name: Push to GitHub Container Registry
         run: |
-          docker tag ${{ env.IMAGE_NAME }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          cat aios.tar.gz | docker import - syui/aios
+          echo "${{ env.APP_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag syui/aios ghcr.io/syui/aios
+          docker push ghcr.io/syui/aios
 
       - name: Create new release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: latest
-          tag_name: latest
-          files:
-            aios.tar.gz
+        env:
+          GH_TOKEN: ${{ env.APP_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          git tag -f latest
+          git push -f origin latest
+          gh release create latest aios.tar.gz --title "latest" --notes "build $(date +%Y.%m.%d)"
