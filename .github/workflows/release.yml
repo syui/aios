@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
@@ -18,15 +19,18 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    container: 
+    container:
       image: archlinux
       options: --privileged
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install build dependencies
+        run: pacman -Sy --noconfirm arch-install-scripts zsh
+
       - name: Build aios
-        run: bash ./build.zsh
+        run: zsh ./build.zsh
 
       - name: Create Docker images
         run: |
@@ -40,7 +44,8 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ env.GITHUB_TOKEN }}
-      - name: github container registry
+
+      - name: Push to GitHub Container Registry
         run: |
           docker tag ${{ env.IMAGE_NAME }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -51,5 +56,4 @@ jobs:
           name: latest
           tag_name: latest
           files:
-            aios-bootstrap.tar.gz
-
+            aios.tar.gz

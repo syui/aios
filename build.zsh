@@ -3,14 +3,15 @@
 set -e
 
 ROOTFS="root.x86_64"
-OUTPUT="aios.tar.gz"
+BUILD_MODE="${1:-tarball}"
 BUILD_DATE=$(date +%Y.%m.%d)
 
-echo "=== aios build $BUILD_DATE ==="
+echo "=== aios build $BUILD_DATE (mode: $BUILD_MODE) ==="
 
 rm -rf $ROOTFS
-rm -f $OUTPUT
 mkdir -p $ROOTFS
+
+# --- rootfs構築 (共通) ---
 
 pacstrap -c $ROOTFS base
 
@@ -20,6 +21,11 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
 arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
+
+if [[ "$BUILD_MODE" == "image" ]]; then
+  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux linux-firmware mkinitcpio'
+fi
+
 arch-chroot $ROOTFS /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
 bash cfg/pkg.sh $ROOTFS
@@ -56,6 +62,12 @@ EOF
 
 echo "aios" > $ROOTFS/etc/hostname
 
-tar czf $OUTPUT -C $ROOTFS .
+# --- 出力 ---
 
-echo "=== build complete: $OUTPUT ==="
+if [[ "$BUILD_MODE" == "image" ]]; then
+  bash cfg/image.sh $ROOTFS
+  echo "=== build complete: aios.img ==="
+else
+  tar czf aios.tar.gz -C $ROOTFS .
+  echo "=== build complete: aios.tar.gz ==="
+fi
