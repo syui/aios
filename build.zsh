@@ -61,7 +61,7 @@ ID=ai
 ID_LIKE=arch
 BUILD_ID=rolling
 IMAGE_ID=aios
-IMAGE_VERSION=$BUILD_DATE
+IMAGE_VERSION=0.0.1
 HOME_URL=https://git.syui.ai/ai/os
 EOF
 
