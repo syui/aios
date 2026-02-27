@@ -10,6 +10,7 @@ permissions:
 
 env:
   APP_TOKEN: ${{ secrets.APP_TOKEN }}
+  DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
 
 jobs:
   release:
@@ -26,9 +27,14 @@ jobs:
             archlinux:latest \
             bash -c "pacman -Sy --noconfirm arch-install-scripts zsh && zsh ./build.zsh"
 
-      - name: Push to GitHub Container Registry
+      - name: Push to Docker Hub
         run: |
           cat aios.tar.gz | docker import - syui/aios
+          echo "${{ env.DOCKER_TOKEN }}" | docker login -u syui --password-stdin
+          docker push syui/aios
+
+      - name: Push to GitHub Container Registry
+        run: |
           echo "${{ env.APP_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker tag syui/aios ghcr.io/syui/aios
           docker push ghcr.io/syui/aios
