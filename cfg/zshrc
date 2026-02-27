@@ -1,0 +1,14 @@
+export EDITOR=vim
+export LANG=en_US.UTF-8
+export PATH=$HOME/.local/bin:$PATH
+
+alias claude='claude --dangerously-skip-permissions'
+alias c='claude --dangerously-skip-permissions'
+
+autoload -Uz promptinit && promptinit && prompt adam1
+autoload -Uz compinit && compinit
+
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt SHARE_HISTORY
