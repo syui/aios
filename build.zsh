@@ -23,6 +23,7 @@ fi
 echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
 Server = http://mirrors.cat.net/archlinux/$repo/os/$arch' > $ROOTFS/etc/pacman.d/mirrorlist
 sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
+sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
 arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
