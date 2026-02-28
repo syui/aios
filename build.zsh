@@ -5,6 +5,7 @@ set -e
 ROOTFS="$(pwd)/root.x86_64"
 BUILD_MODE="${1:-tarball}"
 BUILD_DATE=$(date +%Y.%m.%d)
+GPG_KEY=B6A582E551A2F6181A5CC99E338E6F42F9544D9B
 
 echo "=== aios build $BUILD_DATE (mode: $BUILD_MODE) ==="
 
@@ -20,12 +21,12 @@ if [[ ! -f $ROOTFS/etc/pacman.conf ]]; then
   cp /etc/pacman.conf $ROOTFS/etc/pacman.conf
 fi
 
-echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
-Server = http://mirrors.cat.net/archlinux/$repo/os/$arch' > $ROOTFS/etc/pacman.d/mirrorlist
+echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > $ROOTFS/etc/pacman.d/mirrorlist
 sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
+sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust clang openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux linux-firmware mkinitcpio'
@@ -33,7 +34,20 @@ fi
 
 arch-chroot $ROOTFS /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
 
-bash cfg/pkg.sh $ROOTFS
+cat >> $ROOTFS/etc/pacman.conf <<'EOF'
+
+[aios]
+SigLevel = Required DatabaseOptional
+Server = https://git.syui.ai/ai/repo/raw/branch/main/$arch
+EOF
+
+mv cfg/aios.gpg $ROOTFS/aios.gpg
+arch-chroot $ROOTFS /bin/sh -c "
+  pacman-key --add /aios.gpg
+  pacman-key --lsign-key $GPG_KEY
+  rm /aios.gpg
+"
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Sy --noconfirm ailog aigpt aishell'
 
 arch-chroot $ROOTFS /bin/sh -c 'chsh -s /bin/zsh'
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
@@ -49,10 +63,6 @@ EOF
 
 cp cfg/zshrc $ROOTFS/home/ai/.zshrc
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
-
-mkdir -p $ROOTFS/home/ai/.config/claude
-cp cfg/mcp.json $ROOTFS/home/ai/.config/claude/mcp.json
-arch-chroot $ROOTFS /bin/sh -c 'chown -R ai:ai /home/ai/.config'
 
 cat > $ROOTFS/etc/os-release <<EOF
 NAME=aios

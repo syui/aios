@@ -3,8 +3,6 @@ export PATH=$HOME/.cargo/bin:$PATH
 alias u="sudo pacman -Syu --noconfirm"
 alias zs="vim ~/.zshrc"
 alias zr="exec $SHELL && source ~/.zshrc"
-alias claude='claude --dangerously-skip-permissions'
-alias c='claude --dangerously-skip-permissions'
 
 autoload -Uz compinit
 compinit
@@ -25,3 +23,15 @@ bindkey '^[[B' history-substring-search-down
 if [[ -o login ]] && [[ -o interactive ]] && command -v aishell &>/dev/null; then
 	exec aishell
 fi
+
+function setup() {
+	ailog setup
+	# --- login ---
+	# ailog oauth $handle
+	# ailog oauth $handle_bot --bot
+	# --- login ---
+	ailog gpt core -d
+	ailog gpt memory -d
+	aigpt setup
+	claude
+}

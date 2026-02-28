@@ -7,3 +7,4 @@ root.x86_64/
 archiso/
 build.log
 .claude
+/cfg/repo.sh

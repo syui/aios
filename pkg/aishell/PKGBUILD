@@ -1,0 +1,24 @@
+pkgname=aishell
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='custom shell for aios'
+arch=('x86_64')
+url='https://git.syui.ai/ai/shell'
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('rust' 'cargo' 'git')
+options=('!lto')
+source=("git+https://git.syui.ai/ai/shell.git#branch=main")
+sha256sums=('SKIP')
+
+build() {
+  cd shell
+  export CC=gcc
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+  cargo build --release
+}
+
+package() {
+  cd shell
+  install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+}

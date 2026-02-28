@@ -46,4 +46,4 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           git tag -f latest
           git push -f origin latest
-          gh release create latest aios.tar.gz --title "latest" --notes "build $(date +%Y.%m.%d)"
+          gh release create latest aios.tar.gz --title "latest" --notes "build $(date +%Y.%m.%d)" --target main
