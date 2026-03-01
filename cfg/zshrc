@@ -1,4 +1,6 @@
 export PATH=$HOME/.cargo/bin:$PATH
+export RUSTUP_HOME="$HOME/.rustup"
+export CARGO_HOME="$HOME/.cargo"
 
 alias u="sudo pacman -Syu --noconfirm"
 alias zs="vim ~/.zshrc"
@@ -25,3 +27,4 @@ bindkey '^[[B' history-substring-search-down
 if [[ -o login ]] && [[ -o interactive ]] && command -v aishell &>/dev/null; then
 	exec aishell
 fi
+
