@@ -9,8 +9,8 @@
       "command": "ailog",
       "args": ["mcp"],
       "env": {
-        "CHAT_SYSTEM_FILE": "/home/ai/.config/aigpt/core.md",
-        "CHAT_OUTPUT": "/home/ai/log/public/content"
+        "CHAT_SYSTEM_FILE": "/home/ai/ai/log/public/content/did:plc:6qyecktefllvenje24fcxnie/ai.syui.gpt.core/self.json",
+        "CHAT_OUTPUT": "/home/ai/ai/log/public/content"
       }
     }
   }
