@@ -16,8 +16,8 @@ WORK="${HOME}/aios-pkg"
 if [ ! -d "$REPO_DIR/.git" ]; then
   git clone git@git.syui.ai:ai/repo.git "$REPO_DIR"
   cd "$REPO_DIR"
-  git config user.email 'syui@syui.ai'
-  git config user.name 'syui'
+  git config user.email $USER_EMAIL
+  git config user.name $USER_NAME
 fi
 
 cd "$REPO_DIR"
