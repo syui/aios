@@ -72,8 +72,8 @@ EOF
 
 cat > /mnt/aios/boot/loader/entries/aios.conf <<EOF
 title   aios
-linux   /vmlinuz-linux
-initrd  /initramfs-linux.img
+linux   /vmlinuz-linux-aios
+initrd  /initramfs-linux-aios.img
 options root=UUID=$ROOT_UUID rw
 EOF
 
