@@ -1,0 +1,101 @@
+--- a/PKGBUILD
++++ b/PKGBUILD
+@@ -1,9 +1,10 @@
+-# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
++# Maintainer: syui <syui@syui.ai>
++# Based on: Arch Linux linux package by Jan Alexander Steffens (heftig)
+ 
+-pkgbase=linux
++pkgbase=linux-aios
+ pkgver=6.19.8.arch1
+ pkgrel=1
+-pkgdesc='Linux'
++pkgdesc='Linux (aios)'
+ url='https://github.com/archlinux/linux'
+ arch=(
+   x86_64
+@@ -23,12 +24,6 @@
+   tar
+   xz
+ 
+-  # htmldocs
+-  graphviz
+-  imagemagick
+-  python-sphinx
+-  python-yaml
+-  texlive-latexextra
+ )
+ options=(
+   !debug
+@@ -65,9 +60,6 @@
+ prepare() {
+   cd $_srcname
+ 
+-  echo "Setting version..."
+-  echo "-$pkgrel" > localversion.10-pkgrel
+-  echo "${pkgbase#linux}" > localversion.20-pkgname
+ 
+   local src
+   for src in "${source[@]}"; do
+@@ -79,6 +71,11 @@
+     patch -Np1 < "../$src"
+   done
+ 
++  echo "Setting version..."
++  sed -i "s/^EXTRAVERSION = .*/EXTRAVERSION =/" Makefile
++  echo "" > localversion.10-pkgrel
++  echo "-aios" > localversion.20-pkgname
++
+   echo "Setting config..."
+   cp ../config.$CARCH .config
+   make olddefconfig
+@@ -92,7 +89,6 @@
+   cd $_srcname
+   make all
+   make -C tools/bpf/bpftool vmlinux.h feature-clang-bpf-co-re=1
+-  make htmldocs SPHINXOPTS=-QT
+ }
+ 
+ _package() {
+@@ -208,6 +204,11 @@
+     rm -r "$arch"
+   done
+ 
++  echo "Setting version..."
++  sed -i "s/^EXTRAVERSION = .*/EXTRAVERSION =/" Makefile
++  echo "" > localversion.10-pkgrel
++  echo "-aios" > localversion.20-pkgname
++
+   echo "Removing documentation..."
+   rm -r "$builddir/Documentation"
+ 
+@@ -240,29 +241,10 @@
+   ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+ }
+ 
+-_package-docs() {
+-  pkgdesc="Documentation for the $pkgdesc kernel"
+-
+-  cd $_srcname
+-  local builddir="$pkgdir/usr/lib/modules/$(<version)/build"
+-
+-  echo "Installing documentation..."
+-  local src dst
+-  while read -rd '' src; do
+-    dst="${src#Documentation/}"
+-    dst="$builddir/Documentation/${dst#output/}"
+-    install -Dm644 "$src" "$dst"
+-  done < <(find Documentation -name '.*' -prune -o ! -type d -print0)
+-
+-  echo "Adding symlink..."
+-  mkdir -p "$pkgdir/usr/share/doc"
+-  ln -sr "$builddir/Documentation" "$pkgdir/usr/share/doc/$pkgbase"
+-}
+ 
+ pkgname=(
+   "$pkgbase"
+   "$pkgbase-headers"
+-  "$pkgbase-docs"
+ )
+ for _p in "${pkgname[@]}"; do
+   eval "package_$_p() {

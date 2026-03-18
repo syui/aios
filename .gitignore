@@ -1,10 +1,11 @@
 /.config/ai
 /claude.md
 /CLAUDE.md
+.claude
 **.DS_Store
 aios-bootstrap*.tar.gz
 root.x86_64/
 archiso/
 build.log
-.claude
 /.env
+/repos

@@ -4,12 +4,14 @@ set -e
 d=${0:a:h:h}
 source $d/.env
 
-BUILD_KERNEL=false
-[[ "$1" == "--kernel" ]] && BUILD_KERNEL=true
+function repo-env() {
+  REPO_NAME="aios"
+  GPG_KEY="$GPG_KEY"
+}
 
-# --- Build packages on HOST (aiosc) ---
-echo "=== Building packages on $HOST ==="
-ssh "$HOST" zsh -s -- "$GPG_KEY" <<'REMOTE'
+function repo-pkg-build() {
+  echo "=== Building packages on $HOST ==="
+  ssh "$HOST" zsh -s -- "$GPG_KEY" <<'REMOTE'
 set -e
 setopt nonomatch 2>/dev/null || true
 GPG_KEY="$1"
@@ -56,38 +58,62 @@ done
 rm -rf "$WORK"
 echo "=== Packages built ==="
 REMOTE
+}
 
-# --- Build kernel on HOST_KERNEL (arch) if requested ---
-if [[ "$BUILD_KERNEL" == "true" ]]; then
-  echo "=== Building linux-aios on $HOST_KERNEL ==="
-  KERNEL_WORK="\${HOME}/aios-kernel"
-
-  ssh "$HOST_KERNEL" zsh -s <<'KERNEL_REMOTE'
+function repo-kernel-patch() {
+  echo "=== Patching linux-aios on $HOST_KERNEL ==="
+  ssh "$HOST_KERNEL" zsh -s <<'REMOTE'
 set -e
+REPOS="${HOME}/repos"
 WORK="${HOME}/aios-kernel"
-rm -rf "$WORK"
-mkdir -p "$WORK"
-cd "$WORK"
-git clone --depth 1 https://git.syui.ai/ai/os.git
-cp -r "$WORK/os/pkg/linux-aios" "$WORK/linux-aios"
-cd "$WORK/linux-aios"
-makepkg -sf --noconfirm --skippgpcheck
-echo "=== Kernel built ==="
-KERNEL_REMOTE
 
-  # Transfer kernel packages: HOST_KERNEL -> local -> HOST
-  echo "=== Transferring kernel packages ==="
-  tmpdir=$(mktemp -d)
-  scp "$HOST_KERNEL":~/aios-kernel/linux-aios/linux-aios-*.pkg.tar.zst "$tmpdir/"
-  scp "$tmpdir"/linux-aios-*.pkg.tar.zst "$HOST":~/ai/repo/x86_64/
-  rm -rf "$tmpdir"
-
-  ssh "$HOST_KERNEL" "rm -rf ~/aios-kernel"
+mkdir -p "$REPOS"
+if [ -d "$REPOS/archlinux" ]; then
+  cd "$REPOS/archlinux"
+  git pull
+else
+  git clone --depth 1 https://gitlab.archlinux.org/archlinux/packaging/packages/linux.git "$REPOS/archlinux"
 fi
 
-# --- Update repo database on HOST ---
-echo "=== Updating repo database ==="
-ssh "$HOST" zsh -s -- "$GPG_KEY" <<'REPO_REMOTE'
+rm -rf "$WORK"
+mkdir -p "$WORK/linux-aios"
+cp "$REPOS/archlinux/PKGBUILD" "$WORK/linux-aios/"
+cp "$REPOS/archlinux/config.x86_64" "$WORK/linux-aios/"
+
+cd "$WORK"
+git clone --depth 1 https://git.syui.ai/ai/os.git
+cd "$WORK/linux-aios"
+patch -p1 < "$WORK/os/pkg/linux-aios/aios.patch"
+
+echo "=== Patch result ==="
+head -5 PKGBUILD
+echo "--- prepare() version setting ---"
+grep -A5 "^  done$" PKGBUILD | head -8
+REMOTE
+}
+
+function repo-kernel-build() {
+  echo "=== Building linux-aios on $HOST_KERNEL ==="
+  ssh "$HOST_KERNEL" zsh -s <<'REMOTE'
+set -e
+cd "${HOME}/aios-kernel/linux-aios"
+makepkg -sf --noconfirm --skippgpcheck
+echo "=== Kernel built ==="
+REMOTE
+}
+
+function repo-kernel-transfer() {
+  echo "=== Transferring kernel packages ==="
+  tmpdir=$(mktemp -d)
+  ssh "$HOST_KERNEL" "ls ~/aios-kernel/linux-aios/linux-aios-*.pkg.tar.zst" | while read f; do scp "${HOST_KERNEL}:$f" "$tmpdir/"; done
+  scp "$tmpdir"/linux-aios-*.pkg.tar.zst "$HOST":~/ai/repo/x86_64/
+  rm -rf "$tmpdir"
+  ssh "$HOST_KERNEL" "rm -rf ~/aios-kernel"
+}
+
+function repo-db-update() {
+  echo "=== Updating repo database ==="
+  ssh "$HOST" zsh -s -- "$GPG_KEY" <<'REMOTE'
 set -e
 setopt nonomatch 2>/dev/null || true
 GPG_KEY="$1"
@@ -114,4 +140,26 @@ git commit -m "update $(date +%Y.%m.%d)" || true
 git push
 
 echo "=== Done ==="
-REPO_REMOTE
+REMOTE
+}
+
+repo-env
+case "$1" in
+  pkg)
+    repo-pkg-build
+    repo-db-update
+    ;;
+  kernel)
+    repo-kernel-patch
+    repo-kernel-build
+    repo-kernel-transfer
+    repo-db-update
+    ;;
+  kernel-test)
+    repo-kernel-patch
+    ;;
+  *)
+    repo-pkg-build
+    repo-db-update
+    ;;
+esac
