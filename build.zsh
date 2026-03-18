@@ -29,7 +29,7 @@ arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archl
 arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust clang openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search jq'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
-  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux linux-firmware mkinitcpio'
+  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
 fi
 
 arch-chroot $ROOTFS /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
