@@ -141,6 +141,16 @@ REPO_NAME="aios"
 REPO_DIR="${HOME}/ai/repo"
 
 cd "$REPO_DIR/x86_64"
+
+# Sign unsigned packages
+for pkg in *.pkg.tar.zst; do
+  [ -f "$pkg" ] || continue
+  if [ ! -f "${pkg}.sig" ]; then
+    echo "Signing $pkg..."
+    gpg --detach-sign --default-key "$GPG_KEY" "$pkg"
+  fi
+done
+
 rm -f "${REPO_NAME}".{db,files}*
 repo-add --sign --key "$GPG_KEY" "${REPO_NAME}.db.tar.gz" *.pkg.tar.zst
 gpg --export "$GPG_KEY" > "$REPO_DIR/aios.gpg"
