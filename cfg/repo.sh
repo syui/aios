@@ -79,11 +79,31 @@ rm -rf "$WORK"
 mkdir -p "$WORK/linux-aios"
 cp "$REPOS/archlinux/PKGBUILD" "$WORK/linux-aios/"
 cp "$REPOS/archlinux/config.x86_64" "$WORK/linux-aios/"
+cp "$REPOS/archlinux/PKGBUILD" "$WORK/linux-aios/PKGBUILD.orig"
 
-cd "$WORK"
-git clone --depth 1 https://git.syui.ai/ai/os.git
+# Generate patch from current upstream
 cd "$WORK/linux-aios"
-patch -p1 < "$WORK/os/pkg/linux-aios/aios.patch"
+cp PKGBUILD PKGBUILD.modified
+sed -i "1s/.*/# Maintainer: syui <syui@syui.ai>\n# Based on: Arch Linux linux package by Jan Alexander Steffens (heftig)/" PKGBUILD.modified
+sed -i "s/^pkgbase=linux$/pkgbase=linux-aios/" PKGBUILD.modified
+sed -i "s/^pkgdesc='Linux'$/pkgdesc='Linux (aios)'/" PKGBUILD.modified
+sed -i '/# htmldocs/,/texlive-latexextra/d' PKGBUILD.modified
+sed -i '/make htmldocs/d' PKGBUILD.modified
+sed -i '/_package-docs()/,/^}/d' PKGBUILD.modified
+sed -i '/"$pkgbase-docs"/d' PKGBUILD.modified
+sed -i '/^  echo "Setting version\.\.\."/d' PKGBUILD.modified
+sed -i '/echo "-$pkgrel" > localversion.10-pkgrel/d' PKGBUILD.modified
+sed -i '/echo "${pkgbase#linux}" > localversion.20-pkgname/d' PKGBUILD.modified
+sed -i '/^  done$/a\\n  echo "Setting version..."\n  sed -i "s/^EXTRAVERSION = .*/EXTRAVERSION =/" Makefile\n  echo "" > localversion.10-pkgrel\n  echo "-aios" > localversion.20-pkgname' PKGBUILD.modified
+
+# Generate and apply patch
+diff -u PKGBUILD.orig PKGBUILD.modified \
+  | sed "1s|--- .*|--- a/PKGBUILD|" \
+  | sed "2s|+++ .*|+++ b/PKGBUILD|" \
+  > "$WORK/linux-aios/aios.patch"
+cp PKGBUILD.orig PKGBUILD
+patch -p1 < aios.patch
+rm -f PKGBUILD.orig PKGBUILD.modified
 
 echo "=== Patch result ==="
 head -5 PKGBUILD
