@@ -36,17 +36,27 @@ mkdir -p "$WORK"
 cd "$WORK"
 git clone --depth 1 https://git.syui.ai/ai/os.git
 
-for pkg in ailog aigpt aishell; do
-  echo "=== Building $pkg ==="
-  cp -r "$WORK/os/pkg/$pkg" "$WORK/$pkg"
-  cd "$WORK/$pkg"
-  makepkg -sf --noconfirm --sign --key "$GPG_KEY"
-  cd "$WORK"
-done
+typeset -A PKG_REPOS
+PKG_REPOS=(ailog log aigpt gpt aishell shell)
 
 mkdir -p "$REPO_DIR/x86_64"
 
 for pkg in ailog aigpt aishell; do
+  repo_name="${PKG_REPOS[$pkg]}"
+  remote_hash=$(git ls-remote --heads "https://git.syui.ai/ai/${repo_name}.git" main | cut -c1-7)
+  existing=$(ls "$REPO_DIR/x86_64/${pkg}"-*.pkg.tar.zst 2>/dev/null | head -1)
+
+  if [ -n "$existing" ] && echo "$existing" | grep -q "\.g${remote_hash}-"; then
+    echo "=== $pkg unchanged (${remote_hash}), skipping ==="
+    continue
+  fi
+
+  echo "=== Building $pkg (${remote_hash}) ==="
+  cp -r "$WORK/os/pkg/$pkg" "$WORK/$pkg"
+  cd "$WORK/$pkg"
+  makepkg -sf --noconfirm --sign --key "$GPG_KEY"
+  cd "$WORK"
+
   rm -f "$REPO_DIR/x86_64/${pkg}"-*.pkg.tar.zst
   rm -f "$REPO_DIR/x86_64/${pkg}"-*.pkg.tar.zst.sig
   rm -f "$REPO_DIR/x86_64/${pkg}-debug"-*.pkg.tar.zst
