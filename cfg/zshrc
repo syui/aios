@@ -1,6 +1,7 @@
 export PATH=$HOME/.cargo/bin:$PATH
 
 alias u="sudo pacman -Syu --noconfirm"
+alias c="claude --dangerously-skip-permissions"
 alias zs="vim ~/.zshrc"
 alias zr="exec $SHELL && source ~/.zshrc"
 
@@ -34,4 +35,6 @@ function setup() {
 	ailog gpt memory -d
 	aigpt setup
 	claude
+	ailog bot start --user
+	ailog bot chat
 }
