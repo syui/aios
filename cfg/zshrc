@@ -1,4 +1,4 @@
-export PATH=$HOME/.cargo/bin:$PATH
+export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
 
 alias u="sudo pacman -Syu --noconfirm"
 alias c="claude --dangerously-skip-permissions"
@@ -21,10 +21,6 @@ setopt HIST_IGNORE_DUPS
 bindkey '^[[A' history-substring-search-up
 bindkey '^[[B' history-substring-search-down
 
-if [[ -o login ]] && [[ -o interactive ]] && command -v aishell &>/dev/null; then
-	exec aishell
-fi
-
 function setup() {
 	ailog setup
 	# --- login ---
@@ -34,7 +30,6 @@ function setup() {
 	ailog gpt core -d
 	ailog gpt memory -d
 	aigpt setup
-	claude
+	# ailog bot chat
 	ailog bot start --user
-	ailog bot chat
 }
