@@ -132,6 +132,8 @@ REMOTE
 
 function repo-kernel-transfer() {
   echo "=== Transferring kernel packages ==="
+  # Remove old kernel packages
+  ssh "$HOST" "rm -f ~/ai/repo/x86_64/linux-aios-*.pkg.tar.zst ~/ai/repo/x86_64/linux-aios-*.pkg.tar.zst.sig"
   tmpdir=$(mktemp -d)
   ssh "$HOST_KERNEL" "ls ~/aios-kernel/linux-aios/linux-aios-*.pkg.tar.zst" | while read f; do scp "${HOST_KERNEL}:$f" "$tmpdir/"; done
   scp "$tmpdir"/linux-aios-*.pkg.tar.zst "$HOST":~/ai/repo/x86_64/
