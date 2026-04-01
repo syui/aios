@@ -27,8 +27,6 @@ if [ ! -d "$REPO_DIR/.git" ]; then
 fi
 
 cd "$REPO_DIR"
-git config user.signingkey "$GPG_KEY"
-git config commit.gpgsign true
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
