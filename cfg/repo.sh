@@ -35,11 +35,11 @@ cd "$WORK"
 git clone --depth 1 https://git.syui.ai/ai/os.git
 
 typeset -A PKG_REPOS
-PKG_REPOS=(ailog log aigpt gpt aishell shell)
+PKG_REPOS=(ailog log aigpt gpt aishell shell aifont font)
 
 mkdir -p "$REPO_DIR/x86_64"
 
-for pkg in ailog aigpt aishell; do
+for pkg in ailog aigpt aishell aifont; do
   repo_name="${PKG_REPOS[$pkg]}"
   remote_hash=$(git ls-remote --heads "https://git.syui.ai/ai/${repo_name}.git" main | cut -c1-7)
   existing=$(ls "$REPO_DIR/x86_64/${pkg}"-*.pkg.tar.zst 2>/dev/null | head -1)
