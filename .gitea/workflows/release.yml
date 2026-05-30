@@ -7,7 +7,6 @@ env:
   TAG: latest
   IMAGE_NAME: ${{ gitea.repository }}
   REGISTRY: git.syui.ai
-  GITEA_URL: https://git.syui.ai
 
 jobs:
   release:
@@ -22,16 +21,5 @@ jobs:
           pacman -Sy --noconfirm docker
           docker pull ghcr.io/syui/aios
           docker tag ghcr.io/syui/aios ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
-          echo "${{ secrets.GITEA_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
-
-      - name: Create release
-        run: |
-          existing=$(curl -s -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" "${{ env.GITEA_URL }}/api/v1/repos/${{ env.IMAGE_NAME }}/releases/tags/${{ env.TAG }}" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-          if [ -n "$existing" ]; then
-            curl --fail-with-body -sS -X DELETE -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" "${{ env.GITEA_URL }}/api/v1/repos/${{ env.IMAGE_NAME }}/releases/$existing"
-          fi
-          git tag -f ${{ env.TAG }} 2>/dev/null || true
-          curl --fail-with-body -sS -X POST -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" -H "Content-Type: application/json" \
-            -d '{"tag_name":"${{ env.TAG }}","name":"${{ env.TAG }}","body":"build '$(date +%Y.%m.%d)'\n\ndownload: https://github.com/syui/aios/releases/download/latest/aios.tar.gz"}' \
-            "${{ env.GITEA_URL }}/api/v1/repos/${{ env.IMAGE_NAME }}/releases"
