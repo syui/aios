@@ -47,7 +47,17 @@ arch-chroot $ROOTFS /bin/sh -c "
   pacman-key --lsign-key $GPG_KEY
   rm /aios.gpg
 "
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Sy --noconfirm ailog aigpt aishell'
+# [aios] repo is self-hosted (git.syui.ai) and intermittently stalls from CI
+# runners (pacman aborts at <1B/s for 10s); retry before giving up.
+synced=0
+for i in 1 2 3 4 5; do
+  if arch-chroot $ROOTFS /bin/sh -c 'pacman -Sy --noconfirm ailog aigpt aishell'; then
+    synced=1; break
+  fi
+  echo "aios repo sync failed ($i/5), retrying in 10s..."
+  sleep 10
+done
+[[ $synced == 1 ]] || { echo "error: aios repo unreachable after 5 attempts"; exit 1; }
 
 arch-chroot $ROOTFS /bin/sh -c 'chsh -s /bin/zsh'
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
