@@ -51,7 +51,9 @@ arch-chroot $ROOTFS /bin/sh -c 'pacman -Sy --noconfirm ailog aigpt aishell'
 
 arch-chroot $ROOTFS /bin/sh -c 'chsh -s /bin/zsh'
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
-arch-chroot $ROOTFS /bin/sh -c 'echo "ai:ai" | chpasswd'
+# no baked password: console autologin + NOPASSWD sudo only. Lock password login
+# (su from root via `machinectl shell` and ssh-key login still work).
+arch-chroot $ROOTFS /bin/sh -c 'passwd -l ai'
 echo "ai ALL=(ALL:ALL) NOPASSWD: ALL" >> $ROOTFS/etc/sudoers
 
 mkdir -p $ROOTFS/etc/systemd/system/console-getty.service.d

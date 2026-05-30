@@ -7,10 +7,8 @@ on:
 
 permissions:
   contents: write
-
-env:
-  APP_TOKEN: ${{ secrets.APP_TOKEN }}
-  DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+  packages: write
+  id-token: write
 
 jobs:
   release:
@@ -27,21 +25,23 @@ jobs:
             archlinux:latest \
             bash -c "pacman -Sy --noconfirm arch-install-scripts zsh && zsh ./build.zsh"
 
-      - name: Push to Docker Hub
-        run: |
-          cat aios.tar.gz | docker import - syui/aios
-          echo "${{ env.DOCKER_TOKEN }}" | docker login -u syui --password-stdin
-          docker push syui/aios
-
       - name: Push to GitHub Container Registry
         run: |
-          echo "${{ env.APP_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          docker tag syui/aios ghcr.io/syui/aios
+          cat aios.tar.gz | docker import - ghcr.io/syui/aios
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/syui/aios
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/syui/aios | cut -d@ -f2)
+          cosign sign --yes ghcr.io/syui/aios@${DIGEST}
 
       - name: Create new release
         env:
-          GH_TOKEN: ${{ env.APP_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
           git tag -f latest
