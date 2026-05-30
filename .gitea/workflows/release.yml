@@ -21,5 +21,5 @@ jobs:
           pacman -Sy --noconfirm docker
           docker pull ghcr.io/syui/aios
           docker tag ghcr.io/syui/aios ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
-          echo "${{ secrets.GITEA_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
