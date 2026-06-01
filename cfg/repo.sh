@@ -72,7 +72,7 @@ function repo-kernel-patch() {
   echo "=== Patching linux-aios on $HOST_KERNEL ==="
   ssh "$HOST_KERNEL" zsh -s <<'REMOTE'
 set -e
-REPOS="${HOME}/repos"
+REPOS="${HOME}/ai"
 WORK="${HOME}/aios-kernel"
 
 mkdir -p "$REPOS"
