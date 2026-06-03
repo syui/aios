@@ -6,7 +6,7 @@ on:
 env:
   TAG: latest
   IMAGE_NAME: ${{ gitea.repository }}
-  REGISTRY: localhost:8088
+  REGISTRY: gitea:3000
 
 jobs:
   release:
