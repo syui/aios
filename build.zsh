@@ -89,8 +89,12 @@ EOF
 
 echo "aios" > $ROOTFS/etc/hostname
 
-install -Dm755 cfg/coreutils.sh $ROOTFS/usr/local/bin/coreutils
-arch-chroot $ROOTFS /usr/local/bin/coreutils apply
+# uutils coreutils + sudo-rs を /usr/local/bin で GNU に被せる(移行確定 / revert なし)。
+# PATH も sudo secure_path も /usr/local/bin が先なので Rust 版が既定になる。
+arch-chroot $ROOTFS /bin/bash -c '
+  for b in /usr/bin/uu-*; do [ -e "$b" ] || continue; n=${b##*/uu-}; [ "$n" = coreutils ] && continue; ln -sf "$b" "/usr/local/bin/$n"; done
+  for p in sudo:sudo-rs su:su-rs visudo:visudo-rs; do t="/usr/bin/${p#*:}"; [ -e "$t" ] && ln -sf "$t" "/usr/local/bin/${p%:*}"; done
+'
 
 # --- 出力 ---
 
