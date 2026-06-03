@@ -12,11 +12,8 @@ echo "=== aios build $BUILD_DATE (mode: $BUILD_MODE) ==="
 rm -rf $ROOTFS
 mkdir -p $ROOTFS
 
-# --- rootfs構築 (共通) ---
-
 pacstrap -c $ROOTFS base
 
-# pacman.conf がない場合はホストからコピー
 if [[ ! -f $ROOTFS/etc/pacman.conf ]]; then
   cp /etc/pacman.conf $ROOTFS/etc/pacman.conf
 fi
@@ -47,8 +44,6 @@ arch-chroot $ROOTFS /bin/sh -c "
   pacman-key --lsign-key $GPG_KEY
   rm /aios.gpg
 "
-# [aios] repo is self-hosted (git.syui.ai) and intermittently stalls from CI
-# runners (pacman aborts at <1B/s for 10s); retry before giving up.
 synced=0
 for i in 1 2 3 4 5; do
   if arch-chroot $ROOTFS /bin/sh -c 'pacman -Sy --noconfirm ailog aigpt aishell'; then
@@ -61,8 +56,6 @@ done
 
 arch-chroot $ROOTFS /bin/sh -c 'chsh -s /bin/zsh'
 arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
-# no baked password: console autologin + NOPASSWD sudo only. Lock password login
-# (su from root via `machinectl shell` and ssh-key login still work).
 arch-chroot $ROOTFS /bin/sh -c 'passwd -l ai'
 echo "ai ALL=(ALL:ALL) NOPASSWD: ALL" >> $ROOTFS/etc/sudoers
 
@@ -89,14 +82,11 @@ EOF
 
 echo "aios" > $ROOTFS/etc/hostname
 
-# uutils coreutils + sudo-rs を /usr/local/bin で GNU に被せる(移行確定 / revert なし)。
-# PATH も sudo secure_path も /usr/local/bin が先なので Rust 版が既定になる。
+# gnu-coreutils -> uutils-coreutils
 arch-chroot $ROOTFS /bin/bash -c '
   for b in /usr/bin/uu-*; do [ -e "$b" ] || continue; n=${b##*/uu-}; [ "$n" = coreutils ] && continue; ln -sf "$b" "/usr/local/bin/$n"; done
   for p in sudo:sudo-rs su:su-rs visudo:visudo-rs; do t="/usr/bin/${p#*:}"; [ -e "$t" ] && ln -sf "$t" "/usr/local/bin/${p%:*}"; done
 '
-
-# --- 出力 ---
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   bash cfg/image.sh $ROOTFS
