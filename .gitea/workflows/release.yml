@@ -6,8 +6,6 @@ on:
 env:
   TAG: latest
   IMAGE_NAME: ${{ gitea.repository }}
-  # Gitea registry via the internal port — NOT git.syui.ai, which is behind
-  # Cloudflare (100MB upload cap → 413 on the large rootfs layer).
   REGISTRY: localhost:8088
 
 jobs:
