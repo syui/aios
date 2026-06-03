@@ -26,7 +26,7 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust clang openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust clang openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
@@ -88,6 +88,16 @@ HOME_URL=https://git.syui.ai/ai/os
 EOF
 
 echo "aios" > $ROOTFS/etc/hostname
+
+# --- Rust userland overlay (uutils coreutils + sudo-rs) ---
+# GNU 版は /usr/bin に温存し、/usr/local/bin へ Rust 版の symlink を張る。PATH も
+# sudo secure_path も /usr/local/bin が先なので Rust 版が既定になる(image 内で
+# `rustify-coreutils revert` で GNU に戻せる)。最後に置くことでビルド処理自体は
+# 全て GNU で完了させ、Rust 依存を持ち込まない。
+# ※ image モードでは後続の image.sh が mkinitcpio を Rust coreutils 上で走らせる
+#   (tarball モードはこの後 host 側の tar のみなので無影響)。
+install -Dm755 cfg/rustify-coreutils.sh $ROOTFS/usr/local/bin/rustify-coreutils
+arch-chroot $ROOTFS /usr/local/bin/rustify-coreutils apply
 
 # --- 出力 ---
 
