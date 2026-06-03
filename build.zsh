@@ -23,7 +23,7 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm base-devel vim git zsh rust clang openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
@@ -87,6 +87,9 @@ arch-chroot $ROOTFS /bin/bash -c '
   for b in /usr/bin/uu-*; do [ -e "$b" ] || continue; n=${b##*/uu-}; [ "$n" = coreutils ] && continue; ln -sf "$b" "/usr/local/bin/$n"; done
   for p in sudo:sudo-rs su:su-rs visudo:visudo-rs; do t="/usr/bin/${p#*:}"; [ -e "$t" ] && ln -sf "$t" "/usr/local/bin/${p%:*}"; done
 '
+
+# pacman cache 削除 — downloaded pkg は runtime 不要 / イメージ軽量化
+rm -rf $ROOTFS/var/cache/pacman/pkg
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   bash cfg/image.sh $ROOTFS
