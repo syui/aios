@@ -12,14 +12,11 @@ jobs:
   release:
     name: Release
     runs-on: archlinux
-    container:
-      image: ghcr.io/syui/aios
-      options: --privileged
     steps:
-      - name: Push image to Gitea container registry
+      - name: Mirror ghcr -> Gitea registry (skopeo, no docker daemon)
         run: |
-          pacman -Sy --noconfirm docker
-          docker pull ghcr.io/syui/aios
-          docker tag ghcr.io/syui/aios ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
-          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          command -v skopeo >/dev/null 2>&1 || apk add --no-cache skopeo
+          skopeo copy --dest-tls-verify=false \
+            --dest-creds "${{ gitea.actor }}:${{ secrets.REGISTRY_TOKEN }}" \
+            docker://ghcr.io/syui/aios:${{ env.TAG }} \
+            docker://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
