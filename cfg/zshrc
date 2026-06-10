@@ -3,13 +3,13 @@ export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
 alias u="sudo pacman -Syu --noconfirm"
 alias c="claude --dangerously-skip-permissions"
 alias zs="vim ~/.zshrc"
-alias zr="exec $SHELL && source ~/.zshrc"
+alias zr="exec $SHELL"
 
 autoload -Uz compinit
 compinit
 fpath=(/usr/share/zsh/site-functions $fpath)
 
-#source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
 source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 source /usr/share/zsh/plugins/zsh-history-substring-search/zsh-history-substring-search.zsh
 

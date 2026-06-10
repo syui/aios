@@ -14,7 +14,7 @@ fi
 echo "=== aios install ==="
 
 mkdir -p "$DEST"
-tar xzf "$TARBALL" -C "$DEST"
+tar xzf "$TARBALL" --numeric-owner -C "$DEST"
 
 mkdir -p /etc/systemd/nspawn
 cp cfg/aios.nspawn /etc/systemd/nspawn/$NAME.nspawn

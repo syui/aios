@@ -4,7 +4,6 @@ set -e
 
 ROOTFS="$1"
 IMG="aios.img"
-IMG_SIZE="4G"
 ESP_SIZE=512  # MiB
 LOOP=""
 
@@ -21,6 +20,9 @@ if [[ -z "$ROOTFS" || ! -d "$ROOTFS" ]]; then
   echo "Usage: $0 <rootfs-dir>"
   exit 1
 fi
+
+# rootfs実測 +30%マージン + ESP。固定4Gは image モード(kernel+firmware上乗せ)で溢れる。
+IMG_SIZE="$(( $(du -sm "$ROOTFS" | cut -f1) * 130 / 100 + ESP_SIZE ))M"
 
 rm -f "$IMG"
 

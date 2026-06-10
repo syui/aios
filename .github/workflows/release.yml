@@ -4,6 +4,9 @@ on:
   push:
     branches:
     - main
+    paths-ignore:
+    - '.gitea/**'
+    - '**.md'
 
 permissions:
   contents: write

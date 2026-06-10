@@ -13,6 +13,8 @@ jobs:
     name: Release
     runs-on: archlinux
     steps:
+      # NOTE: ghcr.io/syui/aios:latest をそのまま引く。GitHub 側のビルドが未完なら
+      # 「前の image」を mirror する。この commit の image が要るなら GitHub release 完了後に再実行。
       - name: Mirror ghcr -> Gitea registry (skopeo, no docker daemon)
         run: |
           command -v skopeo >/dev/null 2>&1 || apk add --no-cache skopeo

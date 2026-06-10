@@ -4,11 +4,6 @@ set -e
 d=${0:a:h:h}
 source $d/.env
 
-function repo-env() {
-  REPO_NAME="aios"
-  GPG_KEY="$GPG_KEY"
-}
-
 function repo-pkg-build() {
   echo "=== Building packages on $HOST ==="
   ssh "$HOST" zsh -s -- "$GPG_KEY" <<'REMOTE'
@@ -106,6 +101,12 @@ echo "=== Patch result ==="
 head -5 PKGBUILD
 echo "--- prepare() version setting ---"
 grep -A5 "^  done$" PKGBUILD | head -8
+
+# sed はパターン不一致でも exit 0 = 黙って空振りする。適用結果を検証しドリフトを大声で落とす。
+grep -q '^pkgbase=linux-aios$' PKGBUILD || { echo "PATCH DRIFT: pkgbase=linux-aios not set"; exit 1; }
+grep -q 'localversion.20-pkgname' PKGBUILD || { echo "PATCH DRIFT: -aios localversion missing"; exit 1; }
+if grep -q 'htmldocs' PKGBUILD; then echo "PATCH DRIFT: htmldocs not removed"; exit 1; fi
+echo "=== Patch verified (no drift) ==="
 REMOTE
 }
 
@@ -174,7 +175,6 @@ echo "=== Done ==="
 REMOTE
 }
 
-repo-env
 case "$1" in
   pkg)
     repo-pkg-build

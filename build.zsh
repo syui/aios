@@ -38,7 +38,7 @@ SigLevel = Required DatabaseOptional
 Server = https://git.syui.ai/ai/repo/raw/branch/main/$arch
 EOF
 
-mv cfg/aios.gpg $ROOTFS/aios.gpg
+cp cfg/aios.gpg $ROOTFS/aios.gpg
 arch-chroot $ROOTFS /bin/sh -c "
   pacman-key --add /aios.gpg
   pacman-key --lsign-key $GPG_KEY
@@ -95,6 +95,6 @@ if [[ "$BUILD_MODE" == "image" ]]; then
   bash cfg/image.sh $ROOTFS
   echo "=== build complete: aios.img ==="
 else
-  tar czf aios.tar.gz -C $ROOTFS .
+  tar czf aios.tar.gz --numeric-owner -C $ROOTFS .
   echo "=== build complete: aios.tar.gz ==="
 fi
