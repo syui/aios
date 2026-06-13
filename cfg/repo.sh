@@ -168,7 +168,12 @@ rm -f *.old *.old.sig
 
 cd "$REPO_DIR"
 git add -A
-git commit -m "update $(date +%Y.%m.%d)" || true
+# commit only when there are staged changes (no-op skip), without GPG signing
+# (global commit.gpgsign=true + missing secret key would otherwise fail the commit,
+# and a masked failure used to leave packages un-pushed silently).
+if ! git diff --cached --quiet; then
+  git commit --no-gpg-sign -m "update $(date +%Y.%m.%d)"
+fi
 git push
 
 echo "=== Done ==="
