@@ -168,11 +168,12 @@ rm -f *.old *.old.sig
 
 cd "$REPO_DIR"
 git add -A
-# commit only when there are staged changes (no-op skip), without GPG signing
-# (global commit.gpgsign=true + missing secret key would otherwise fail the commit,
-# and a masked failure used to leave packages un-pushed silently).
+# commit only when there are staged changes (avoids a "nothing to commit" abort).
+# signing follows the repo-local config on the repo host
+# (git config user.signingkey <ai key>; git config commit.gpgsign true).
+# the old silent-drop bug was a masked commit failure via `... || true`.
 if ! git diff --cached --quiet; then
-  git commit --no-gpg-sign -m "update $(date +%Y.%m.%d)"
+  git commit -m "update $(date +%Y.%m.%d)"
 fi
 git push
 
