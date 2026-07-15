@@ -1,5 +1,0 @@
-[Exec]
-Boot=yes
-
-[Network]
-Private=no

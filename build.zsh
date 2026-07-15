@@ -92,7 +92,7 @@ arch-chroot $ROOTFS /bin/bash -c '
 rm -rf $ROOTFS/var/cache/pacman/pkg
 
 if [[ "$BUILD_MODE" == "image" ]]; then
-  bash cfg/image.sh $ROOTFS
+  zsh cfg/image.zsh $ROOTFS
   echo "=== build complete: aios.img ==="
 else
   tar czf aios.tar.gz --numeric-owner -C $ROOTFS .
