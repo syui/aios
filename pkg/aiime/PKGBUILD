@@ -1,0 +1,51 @@
+pkgname=aiime
+pkgver=0.0.1
+pkgrel=1
+
+pkgdesc='japanese input method for aios (claude-based dictionary)'
+arch=('x86_64')
+url='https://git.syui.ai/ai/ime'
+license=('MIT')
+depends=('gcc-libs' 'libxkbcommon')
+makedepends=('rust' 'cargo' 'git')
+options=('!lto' '!debug')
+source=("git+https://git.syui.ai/ai/ime.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd ime
+  printf "%s.r%s.g%s" \
+    "$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd ime
+  export CC=gcc
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+  cargo build --release -p aiime -p aiime-wayland
+}
+
+package() {
+  cd ime
+  install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm755 "target/release/aiime-wayland" "${pkgdir}/usr/bin/aiime-wayland"
+  install -Dm644 icon.png "${pkgdir}/usr/share/aiime/icon.png"
+  # serve 常駐 (systemd user)
+  install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/user/aiime.service" <<'EOF'
+[Unit]
+Description=aiime serve
+
+[Service]
+ExecStart=/usr/bin/aiime serve
+Restart=always
+
+[Install]
+WantedBy=default.target
+EOF
+  # 全ユーザーでデフォルト有効(ログイン時に serve が立つ)。
+  # package() では systemctl を実行できないため、symlink 同梱で有効化する(pipewire 方式)
+  install -d "${pkgdir}/usr/lib/systemd/user/default.target.wants"
+  ln -s ../aiime.service "${pkgdir}/usr/lib/systemd/user/default.target.wants/aiime.service"
+}
