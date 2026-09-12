@@ -1,0 +1,11 @@
+[Unit]
+Description=aios default firewall (ufw: deny incoming, allow SSH)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aios-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

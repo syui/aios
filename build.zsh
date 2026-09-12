@@ -23,7 +23,7 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs ufw'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
@@ -81,6 +81,41 @@ HOME_URL=https://git.syui.ai/ai/os
 EOF
 
 echo "aios" > $ROOTFS/etc/hostname
+
+# security hardening defaults — IPv6 off, rare fs/net-proto modules blacklisted, ufw on
+cat > $ROOTFS/etc/sysctl.d/99-aios-hardening.conf <<'EOF'
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+EOF
+
+cat > $ROOTFS/etc/modprobe.d/aios-blacklist.conf <<'EOF'
+# Rare/legacy filesystems
+blacklist cramfs
+blacklist freevxfs
+blacklist jffs2
+blacklist hfs
+blacklist hfsplus
+blacklist udf
+
+# Rare/legacy network protocols
+blacklist dccp
+blacklist sctp
+blacklist rds
+blacklist tipc
+blacklist n-hdlc
+blacklist ax25
+blacklist netrom
+blacklist x25
+blacklist decnet
+blacklist appletalk
+EOF
+
+cp cfg/aios-firewall.sh $ROOTFS/usr/local/bin/aios-firewall.sh
+cp cfg/aios-firewall.service $ROOTFS/etc/systemd/system/aios-firewall.service
+arch-chroot $ROOTFS /bin/sh -c '
+  chmod +x /usr/local/bin/aios-firewall.sh
+  systemctl enable aios-firewall.service
+'
 
 # gnu-coreutils -> uutils-coreutils
 arch-chroot $ROOTFS /bin/bash -c '
