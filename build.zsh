@@ -23,13 +23,16 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs npm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs ufw'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs pnpm zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs ufw'
 
 if [[ "$BUILD_MODE" == "image" ]]; then
   arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
 fi
 
-arch-chroot $ROOTFS /bin/sh -c 'npm i -g @anthropic-ai/claude-code'
+# PNPM_HOME=/usr/local/bin (not a dedicated pnpm dir): global bin shims land directly on
+# the default PATH, so `claude` stays reachable even under a minimal PATH (e.g. a
+# systemd service's) with no extra symlink step.
+arch-chroot $ROOTFS /bin/sh -c 'export PNPM_HOME=/usr/local/bin PATH="/usr/local/bin:$PATH"; pnpm add -g @anthropic-ai/claude-code'
 
 cat >> $ROOTFS/etc/pacman.conf <<'EOF'
 
