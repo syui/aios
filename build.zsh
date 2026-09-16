@@ -32,7 +32,16 @@ fi
 # PNPM_HOME=/usr/local/bin (not a dedicated pnpm dir): global bin shims land directly on
 # the default PATH, so `claude` stays reachable even under a minimal PATH (e.g. a
 # systemd service's) with no extra symlink step.
-arch-chroot $ROOTFS /bin/sh -c 'export PNPM_HOME=/usr/local/bin PATH="/usr/local/bin:$PATH"; pnpm add -g @anthropic-ai/claude-code'
+#
+# pnpm skips packages' postinstall scripts by default (supply-chain safety) — but
+# claude-code's postinstall is what actually fetches its native binary, so without it
+# `claude` installs but exits with "claude native binary not installed" on every run.
+# Find and run it explicitly; its path is content-hashed so can't be hardcoded.
+arch-chroot $ROOTFS /bin/sh -c '
+  export PNPM_HOME=/usr/local/bin PATH="/usr/local/bin:$PATH"
+  pnpm add -g @anthropic-ai/claude-code
+  node "$(find /usr/local/bin/store -path "*claude-code/install.cjs" | head -1)"
+'
 
 cat >> $ROOTFS/etc/pacman.conf <<'EOF'
 
