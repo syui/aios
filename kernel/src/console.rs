@@ -75,10 +75,10 @@ pub fn intr(c: u8) {
 }
 
 /// 1 行 (または Ctrl-D まで) 読む
-pub fn read(dst: &mut [u8]) -> usize {
+pub fn read(dst: &mut [u8]) -> Result<usize, i64> {
     let i = input();
     while i.r == i.w {
-        proc::sleep(chan());
+        proc::sleep(chan())?;
     }
     let mut n = 0;
     while n < dst.len() && i.r != i.w {
@@ -97,7 +97,7 @@ pub fn read(dst: &mut [u8]) -> usize {
             break;
         }
     }
-    n
+    Ok(n)
 }
 
 pub fn write(src: &[u8]) {

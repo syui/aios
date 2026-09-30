@@ -2,254 +2,435 @@
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
 use crate::proc;
 use crate::sysfile;
+use crate::timer;
 use crate::trap::TrapFrame;
 use crate::vm::{pg_up, Perm};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+const ENOENT: i64 = 2;
+const E2BIG: i64 = 7;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
+const ENODATA: i64 = 61;
+const EOPNOTSUPP: i64 = 95;
+const ETIMEDOUT: i64 = 110;
 
-const SYS_GETCWD: u64 = 17;
-const SYS_DUP: u64 = 23;
-const SYS_DUP3: u64 = 24;
-const SYS_FCNTL: u64 = 25;
-const SYS_IOCTL: u64 = 29;
-const SYS_FACCESSAT: u64 = 48;
-const SYS_CHDIR: u64 = 49;
-const SYS_OPENAT: u64 = 56;
-const SYS_CLOSE: u64 = 57;
-const SYS_PIPE2: u64 = 59;
-const SYS_GETDENTS64: u64 = 61;
-const SYS_LSEEK: u64 = 62;
-const SYS_READ: u64 = 63;
-const SYS_WRITE: u64 = 64;
-const SYS_READV: u64 = 65;
-const SYS_WRITEV: u64 = 66;
-const SYS_READLINKAT: u64 = 78;
-const SYS_NEWFSTATAT: u64 = 79;
-const SYS_FSTAT: u64 = 80;
-const SYS_PPOLL: u64 = 73;
-const SYS_EXIT: u64 = 93;
-const SYS_EXIT_GROUP: u64 = 94;
-const SYS_SET_TID_ADDRESS: u64 = 96;
-const SYS_FUTEX: u64 = 98;
-const SYS_SET_ROBUST_LIST: u64 = 99;
-const SYS_NANOSLEEP: u64 = 101;
-const SYS_CLOCK_NANOSLEEP: u64 = 115;
-const SYS_CLOCK_GETTIME: u64 = 113;
-const SYS_SCHED_YIELD: u64 = 124;
-const SYS_SIGALTSTACK: u64 = 132;
-const SYS_RT_SIGACTION: u64 = 134;
-const SYS_RT_SIGPROCMASK: u64 = 135;
-const SYS_KILL: u64 = 129;
-const SYS_TGKILL: u64 = 131;
-const SYS_SETPGID: u64 = 154;
-const SYS_GETPGID: u64 = 155;
-const SYS_SETSID: u64 = 157;
-const SYS_UNAME: u64 = 160;
-const SYS_UMASK: u64 = 166;
-const SYS_GETPID: u64 = 172;
-const SYS_GETPPID: u64 = 173;
-const SYS_GETUID: u64 = 174;
-const SYS_GETEUID: u64 = 175;
-const SYS_GETGID: u64 = 176;
-const SYS_GETEGID: u64 = 177;
-const SYS_GETTID: u64 = 178;
-const SYS_BRK: u64 = 214;
-const SYS_CLONE: u64 = 220;
-const SYS_EXECVE: u64 = 221;
-const SYS_MUNMAP: u64 = 215;
-const SYS_MMAP: u64 = 222;
-const SYS_MPROTECT: u64 = 226;
-const SYS_MADVISE: u64 = 233;
-const SYS_WAIT4: u64 = 260;
-const SYS_GETRANDOM: u64 = 278;
-const SYS_FACCESSAT2: u64 = 439;
+mod nr {
+    pub const SETXATTR: u64 = 5;
+    pub const FSETXATTR: u64 = 7;
+    pub const GETXATTR: u64 = 8;
+    pub const FGETXATTR: u64 = 10;
+    pub const LISTXATTR: u64 = 11;
+    pub const FLISTXATTR: u64 = 13;
+    pub const GETCWD: u64 = 17;
+    pub const DUP: u64 = 23;
+    pub const DUP3: u64 = 24;
+    pub const FCNTL: u64 = 25;
+    pub const IOCTL: u64 = 29;
+    pub const FACCESSAT: u64 = 48;
+    pub const CHDIR: u64 = 49;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const PIPE2: u64 = 59;
+    pub const GETDENTS64: u64 = 61;
+    pub const LSEEK: u64 = 62;
+    pub const READ: u64 = 63;
+    pub const WRITE: u64 = 64;
+    pub const READV: u64 = 65;
+    pub const WRITEV: u64 = 66;
+    pub const PPOLL: u64 = 73;
+    pub const SPLICE: u64 = 76;
+    pub const READLINKAT: u64 = 78;
+    pub const NEWFSTATAT: u64 = 79;
+    pub const FSTAT: u64 = 80;
+    pub const EXIT: u64 = 93;
+    pub const EXIT_GROUP: u64 = 94;
+    pub const SET_TID_ADDRESS: u64 = 96;
+    pub const FUTEX: u64 = 98;
+    pub const SET_ROBUST_LIST: u64 = 99;
+    pub const NANOSLEEP: u64 = 101;
+    pub const CLOCK_GETTIME: u64 = 113;
+    pub const CLOCK_GETRES: u64 = 114;
+    pub const CLOCK_NANOSLEEP: u64 = 115;
+    pub const SCHED_GETAFFINITY: u64 = 123;
+    pub const SCHED_YIELD: u64 = 124;
+    pub const KILL: u64 = 129;
+    pub const TKILL: u64 = 130;
+    pub const TGKILL: u64 = 131;
+    pub const SIGALTSTACK: u64 = 132;
+    pub const RT_SIGACTION: u64 = 134;
+    pub const RT_SIGPROCMASK: u64 = 135;
+    pub const SETPGID: u64 = 154;
+    pub const PRCTL: u64 = 167;
+    pub const GETPGID: u64 = 155;
+    pub const SETSID: u64 = 157;
+    pub const UNAME: u64 = 160;
+    pub const GETRLIMIT: u64 = 163;
+    pub const UMASK: u64 = 166;
+    pub const GETTIMEOFDAY: u64 = 169;
+    pub const GETPID: u64 = 172;
+    pub const GETPPID: u64 = 173;
+    pub const GETUID: u64 = 174;
+    pub const GETEUID: u64 = 175;
+    pub const GETGID: u64 = 176;
+    pub const GETEGID: u64 = 177;
+    pub const GETTID: u64 = 178;
+    pub const SYSINFO: u64 = 179;
+    pub const BRK: u64 = 214;
+    pub const MUNMAP: u64 = 215;
+    pub const CLONE: u64 = 220;
+    pub const EXECVE: u64 = 221;
+    pub const MMAP: u64 = 222;
+    pub const FADVISE64: u64 = 223;
+    pub const MPROTECT: u64 = 226;
+    pub const MADVISE: u64 = 233;
+    pub const WAIT4: u64 = 260;
+    pub const PRLIMIT64: u64 = 261;
+    pub const GETRANDOM: u64 = 278;
+    pub const MEMBARRIER: u64 = 283;
+    pub const RSEQ: u64 = 293;
+    pub const FACCESSAT2: u64 = 439;
+}
 
 pub fn dispatch(tf: &mut TrapFrame) {
+    use nr::*;
     let a = tf.x;
-    let file = |r: Result<i64, i64>| r.unwrap_or_else(|e| e);
-    let ret = match tf.x[8] {
-        SYS_GETCWD => file(sysfile::getcwd(a[0] as usize, a[1] as usize)),
-        SYS_DUP => file(sysfile::dup(a[0])),
-        SYS_DUP3 => file(sysfile::dup3(a[0], a[1], a[2])),
-        SYS_FCNTL => file(sysfile::fcntl(a[0], a[1], a[2])),
-        SYS_IOCTL => file(sysfile::ioctl(a[0], a[1], a[2] as usize)),
-        SYS_FACCESSAT | SYS_FACCESSAT2 => file(sysfile::faccessat(a[0] as i64, a[1] as usize)),
-        SYS_CHDIR => file(sysfile::chdir(a[0] as usize)),
-        SYS_OPENAT => file(sysfile::openat(a[0] as i64, a[1] as usize, a[2])),
-        SYS_CLOSE => file(sysfile::close(a[0])),
-        SYS_PIPE2 => file(sysfile::pipe2(a[0] as usize, a[1])),
-        SYS_GETDENTS64 => file(sysfile::getdents64(a[0], a[1] as usize, a[2] as usize)),
-        SYS_LSEEK => file(sysfile::lseek(a[0], a[1] as i64, a[2])),
-        SYS_READ => file(sysfile::read(a[0], a[1] as usize, a[2] as usize)),
-        SYS_WRITE => file(sysfile::write(a[0], a[1] as usize, a[2] as usize)),
-        SYS_READV => file(sysfile::readv(a[0], a[1] as usize, a[2] as usize)),
-        SYS_WRITEV => file(sysfile::writev(a[0], a[1] as usize, a[2] as usize)),
-        SYS_READLINKAT => file(sysfile::readlinkat(a[0] as i64, a[1] as usize, a[2] as usize, a[3] as usize)),
-        SYS_NEWFSTATAT => file(sysfile::newfstatat(a[0] as i64, a[1] as usize, a[2] as usize, a[3])),
-        SYS_FSTAT => file(sysfile::fstat(a[0], a[1] as usize)),
-        SYS_UMASK => 0o022,
-        SYS_SETPGID | SYS_SETSID => 0,
-        SYS_GETPGID => proc::current().pid as i64,
-        SYS_KILL | SYS_TGKILL => sys_kill(a[0] as i64, a[1] as i64, a[2] as i64, tf.x[8] == SYS_TGKILL),
-        SYS_PPOLL => 0,
-        SYS_EXIT | SYS_EXIT_GROUP => proc::exit(a[0] as i32 & 0xff),
-        SYS_SET_TID_ADDRESS | SYS_GETPID | SYS_GETTID => proc::current().pid as i64,
-        SYS_GETPPID => proc::current().ppid as i64,
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
-        SYS_FUTEX | SYS_SET_ROBUST_LIST => 0,
-        SYS_SCHED_YIELD => {
-            proc::yield_now();
-            0
+    let r = match tf.x[8] {
+        GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
+        DUP => sysfile::dup(a[0]),
+        DUP3 => sysfile::dup3(a[0], a[1], a[2]),
+        FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
+        IOCTL => sysfile::ioctl(a[0], a[1], a[2] as usize),
+        FACCESSAT | FACCESSAT2 => sysfile::faccessat(a[0] as i64, a[1] as usize),
+        CHDIR => sysfile::chdir(a[0] as usize),
+        OPENAT => sysfile::openat(a[0] as i64, a[1] as usize, a[2]),
+        CLOSE => sysfile::close(a[0]),
+        PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
+        GETDENTS64 => sysfile::getdents64(a[0], a[1] as usize, a[2] as usize),
+        LSEEK => sysfile::lseek(a[0], a[1] as i64, a[2]),
+        READ => sysfile::read(a[0], a[1] as usize, a[2] as usize),
+        WRITE => sysfile::write(a[0], a[1] as usize, a[2] as usize),
+        READV => sysfile::readv(a[0], a[1] as usize, a[2] as usize),
+        WRITEV => sysfile::writev(a[0], a[1] as usize, a[2] as usize),
+        READLINKAT => sysfile::readlinkat(a[0] as i64, a[1] as usize, a[2] as usize, a[3] as usize),
+        NEWFSTATAT => sysfile::newfstatat(a[0] as i64, a[1] as usize, a[2] as usize, a[3]),
+        FSTAT => sysfile::fstat(a[0], a[1] as usize),
+        PPOLL => Ok(0),
+        // xattr は持っていない
+        LISTXATTR..=FLISTXATTR => Ok(0),
+        GETXATTR..=FGETXATTR => Err(-ENODATA),
+        SETXATTR..=FSETXATTR => Err(-EOPNOTSUPP),
+        SPLICE => Err(-EINVAL),
+        FADVISE64 => Ok(0),
+
+        EXIT => proc::exit(a[0] as i32 & 0xff),
+        EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
+        CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
+        EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
+        WAIT4 => sys_wait4(a[0] as i64, a[1] as usize, a[2]),
+        KILL => sys_kill(a[0] as i64, a[1] as i32),
+        TKILL => proc::kill_thread(a[0] as u32, a[1] as i32).map(|_| 0),
+        TGKILL => proc::kill_thread(a[1] as u32, a[2] as i32).map(|_| 0),
+        SET_TID_ADDRESS => {
+            let p = proc::current();
+            p.clear_tid = a[0] as usize;
+            Ok(p.pid as i64)
         }
-        SYS_NANOSLEEP => sys_nanosleep(a[0] as usize),
-        SYS_CLOCK_NANOSLEEP => sys_nanosleep(a[2] as usize),
-        SYS_CLONE => sys_clone(a[0], a[1] as usize, a[3]),
-        SYS_EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
-        SYS_WAIT4 => sys_wait4(a[0] as i64, a[1] as usize, a[2]),
-        SYS_SIGALTSTACK | SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK => 0,
-        SYS_MPROTECT | SYS_MADVISE => 0,
-        SYS_CLOCK_GETTIME => sys_clock_gettime(a[1] as usize),
-        SYS_UNAME => sys_uname(a[0] as usize),
-        SYS_BRK => sys_brk(a[0] as usize),
-        SYS_MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], a[4] as i64),
-        SYS_MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
-        SYS_GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
-        nr => {
-            println!("syscall: unknown {} (pid {})", nr, proc::current().pid);
-            -ENOSYS
+        FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize),
+        GETPID | GETPGID => Ok(proc::current().tgid as i64),
+        GETTID => Ok(proc::current().pid as i64),
+        GETPPID => Ok(proc::current().ppid as i64),
+        GETUID | GETEUID | GETGID | GETEGID => Ok(0),
+        SETPGID | SETSID => Ok(0),
+        UMASK => Ok(0o022),
+        SET_ROBUST_LIST | MEMBARRIER => Ok(0),
+        RSEQ => Err(-ENOSYS),
+        SIGALTSTACK | RT_SIGPROCMASK => Ok(0),
+        RT_SIGACTION => sys_rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
+        PRCTL => Ok(0),
+        SCHED_YIELD => {
+            proc::yield_now();
+            Ok(0)
+        }
+        SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
+        NANOSLEEP => sys_nanosleep(a[0] as usize),
+        CLOCK_NANOSLEEP => sys_nanosleep(a[2] as usize),
+        CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
+        CLOCK_GETRES => sys_clock_getres(a[1] as usize),
+        GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
+        UNAME => sys_uname(a[0] as usize),
+        SYSINFO => sys_sysinfo(a[0] as usize),
+        GETRLIMIT => sys_prlimit(a[0], 0, a[1] as usize),
+        PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
+
+        BRK => Ok(sys_brk(a[0] as usize)),
+        MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], a[4] as i64),
+        MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
+        MPROTECT | MADVISE => Ok(0),
+        GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
+        n => {
+            println!("syscall: unknown {} (pid {})", n, proc::current().pid);
+            Err(-ENOSYS)
         }
     };
-    tf.x[0] = ret as u64;
+    tf.x[0] = r.unwrap_or_else(|e| e) as u64;
 }
 
-fn sys_clock_gettime(ts: usize) -> i64 {
-    let (cnt, frq): (u64, u64);
-    unsafe {
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt);
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq);
-    }
-    let sec = cnt / frq;
-    let nsec = (cnt % frq) * 1_000_000_000 / frq;
+type R = Result<i64, i64>;
+
+fn out(va: usize, b: &[u8]) -> Result<(), i64> {
+    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
+}
+
+fn timespec(ns: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&sec.to_le_bytes());
-    b[8..].copy_from_slice(&nsec.to_le_bytes());
-    match proc::current().pt().copy_out(ts, &b) {
-        Some(()) => 0,
-        None => -EFAULT,
-    }
+    b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    b[8..].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
+    b
 }
 
-fn sys_uname(buf: usize) -> i64 {
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+
+fn sys_clock_gettime(clk: u64, ts: usize) -> R {
+    let ns = match clk {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => timer::epoch_ns(),
+        _ => timer::uptime_ns(),
+    };
+    out(ts, &timespec(ns))?;
+    Ok(0)
+}
+
+fn sys_clock_getres(ts: usize) -> R {
+    if ts != 0 {
+        out(ts, &timespec(1))?;
+    }
+    Ok(0)
+}
+
+fn sys_gettimeofday(tv: usize) -> R {
+    if tv != 0 {
+        let ns = timer::epoch_ns();
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+        b[8..].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+        out(tv, &b)?;
+    }
+    Ok(0)
+}
+
+fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
     let fields: [&[u8]; 6] = [b"aios", b"aios", env!("CARGO_PKG_VERSION").as_bytes(), b"aios", b"aarch64", b""];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
         u[i * FIELD..i * FIELD + f.len()].copy_from_slice(f);
     }
-    match proc::current().pt().copy_out(buf, &u) {
-        Some(()) => 0,
-        None => -EFAULT,
+    out(buf, &u)?;
+    Ok(0)
+}
+
+fn sys_sysinfo(buf: usize) -> R {
+    use crate::memlayout::{PGSIZE, PHYSBASE, PHYSTOP};
+    let mut b = [0u8; 112];
+    b[0..8].copy_from_slice(&(timer::uptime_ns() / 1_000_000_000).to_le_bytes());
+    b[32..40].copy_from_slice(&((PHYSTOP - PHYSBASE) as u64).to_le_bytes());
+    b[40..48].copy_from_slice(&((crate::kalloc::nfree() * PGSIZE) as u64).to_le_bytes());
+    b[80..82].copy_from_slice(&(proc::nprocs() as u16).to_le_bytes());
+    b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+    out(buf, &b)?;
+    Ok(0)
+}
+
+fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
+    if len < 8 {
+        return Err(-EINVAL);
     }
+    out(mask, &1u64.to_le_bytes())?;
+    Ok(8)
+}
+
+fn sys_prlimit(resource: u64, new: usize, old: usize) -> R {
+    const RLIMIT_STACK: u64 = 3;
+    const RLIMIT_NOFILE: u64 = 7;
+    const INF: u64 = u64::MAX;
+    let _ = new;
+    if old != 0 {
+        let (cur, max) = match resource {
+            RLIMIT_STACK => (8 * 1024 * 1024, INF),
+            RLIMIT_NOFILE => (proc::NOFILE as u64, proc::NOFILE as u64),
+            _ => (INF, INF),
+        };
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&cur.to_le_bytes());
+        b[8..].copy_from_slice(&max.to_le_bytes());
+        out(old, &b)?;
+    }
+    Ok(0)
 }
 
 fn sys_brk(addr: usize) -> i64 {
-    let p = proc::current();
-    if addr < p.heap_start {
-        return p.brk as i64;
+    let m = proc::current().mm();
+    if addr < m.heap_start {
+        return m.brk as i64;
     }
-    let (old, new) = (pg_up(p.brk), pg_up(addr));
+    let (old, new) = (pg_up(m.brk), pg_up(addr));
     if new > old {
-        if p.pt().alloc_range(old, new, Perm::RW).is_none() {
-            p.pt().unmap_range(old, new);
-            return p.brk as i64;
+        if m.pt.alloc_range(old, new, Perm::RW).is_none() {
+            m.pt.unmap_range(old, new);
+            return m.brk as i64;
         }
     } else if new < old {
-        p.pt().unmap_range(new, old);
+        m.pt.unmap_range(new, old);
     }
-    p.brk = addr;
+    m.brk = addr;
     addr as i64
 }
 
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 
-fn sys_mmap(addr: usize, len: usize, flags: u64, fd: i64) -> i64 {
+fn sys_mmap(addr: usize, len: usize, flags: u64, fd: i64) -> R {
     if len == 0 {
-        return -EINVAL;
+        return Err(-EINVAL);
     }
     if flags & MAP_ANONYMOUS == 0 || fd != -1 {
-        return -ENODEV;
+        return Err(-ENODEV);
     }
-    let p = proc::current();
+    let m = proc::current().mm();
     let len = pg_up(len);
     let va = if flags & MAP_FIXED != 0 {
         if addr & 0xfff != 0 {
-            return -EINVAL;
+            return Err(-EINVAL);
         }
-        p.pt().unmap_range(addr, addr + len);
+        m.pt.unmap_range(addr, addr + len);
         addr
     } else {
-        let va = p.mmap_next;
-        p.mmap_next += len;
+        let va = m.mmap_next;
+        m.mmap_next += len;
         va
     };
     // TODO: prot を反映する。いまは常に RW
-    if p.pt().alloc_range(va, va + len, Perm::RW).is_none() {
-        p.pt().unmap_range(va, va + len);
-        return -ENOMEM;
+    if m.pt.alloc_range(va, va + len, Perm::RW).is_none() {
+        m.pt.unmap_range(va, va + len);
+        return Err(-ENOMEM);
     }
-    va as i64
+    Ok(va as i64)
 }
 
-fn sys_munmap(addr: usize, len: usize) -> i64 {
+fn sys_munmap(addr: usize, len: usize) -> R {
     if addr & 0xfff != 0 {
-        return -EINVAL;
+        return Err(-EINVAL);
     }
     proc::current().pt().unmap_range(addr, addr + pg_up(len));
-    0
+    Ok(0)
 }
 
-fn sys_getrandom(buf: usize, len: usize) -> i64 {
-    let p = proc::current().pt();
+fn sys_getrandom(buf: usize, len: usize) -> R {
     let mut done = 0;
     while done < len {
         let b = crate::rand::bytes16();
         let n = b.len().min(len - done);
-        if p.copy_out(buf + done, &b[..n]).is_none() {
-            return -EFAULT;
-        }
+        out(buf + done, &b[..n])?;
         done += n;
     }
-    len as i64
+    Ok(len as i64)
 }
 
-fn sys_nanosleep(req: usize) -> i64 {
+fn read_timespec(va: usize) -> Result<u64, i64> {
     let mut ts = [0u8; 16];
-    if proc::current().pt().copy_in(&mut ts, req).is_none() {
-        return -EFAULT;
-    }
+    proc::current().pt().copy_in(&mut ts, va).ok_or(-EFAULT)?;
     let sec = u64::from_le_bytes(ts[..8].try_into().unwrap());
     let nsec = u64::from_le_bytes(ts[8..].try_into().unwrap());
-    let hz = crate::timer::HZ;
-    let n = sec * hz + (nsec * hz).div_ceil(1_000_000_000);
-    let until = crate::timer::ticks() + n;
-    while crate::timer::ticks() < until {
-        proc::sleep(crate::timer::chan());
-    }
-    0
+    Ok(sec.saturating_mul(1_000_000_000).saturating_add(nsec))
 }
 
-fn sys_clone(flags: u64, stack: usize, tls: u64) -> i64 {
-    match proc::clone(flags, stack, tls) {
-        Ok(pid) => pid as i64,
-        Err(e) => e,
+fn ns_to_ticks(ns: u64) -> u64 {
+    (ns / 1000).saturating_mul(timer::HZ).div_ceil(1_000_000).max(1)
+}
+
+fn sys_nanosleep(req: usize) -> R {
+    let until = timer::ticks() + ns_to_ticks(read_timespec(req)?);
+    while timer::ticks() < until {
+        // chan 0 は誰も起こさないので、期限まで眠る
+        proc::sleep_until(0, until)?;
     }
+    Ok(0)
+}
+
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+
+fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
+    let p = proc::current();
+    let chan = proc::futex_chan(p, uaddr);
+    match op & 0x7f {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let mut cur = [0u8; 4];
+            p.pt().copy_in(&mut cur, uaddr).ok_or(-EFAULT)?;
+            if u32::from_le_bytes(cur) != val {
+                return Err(-EAGAIN);
+            }
+            let deadline = if timeout == 0 {
+                0
+            } else {
+                let ns = read_timespec(timeout)?;
+                // WAIT は相対時間、WAIT_BITSET は絶対時間
+                let rel = if op & 0x7f == FUTEX_WAIT_BITSET {
+                    let now = if op & 256 != 0 { timer::epoch_ns() } else { timer::uptime_ns() };
+                    ns.saturating_sub(now)
+                } else {
+                    ns
+                };
+                timer::ticks() + ns_to_ticks(rel)
+            };
+            if proc::sleep_until(chan, deadline)? {
+                Ok(0)
+            } else {
+                Err(-ETIMEDOUT)
+            }
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // 数は数えずに全員起こす (起きすぎても待つ側が確かめなおす)
+            Ok(proc::wakeup(chan).min(val as usize) as i64)
+        }
+        _ => Err(-ENOSYS),
+    }
+}
+
+fn sys_kill(pid: i64, sig: i32) -> R {
+    let target = if pid <= 0 { proc::current().tgid } else { pid as u32 };
+    proc::kill_thread(target, sig).map(|_| 0)
+}
+
+/// ハンドラを覚えるだけ (SIGPIPE などの既定動作を決めるのに使う)
+fn sys_rt_sigaction(sig: usize, act: usize, oact: usize) -> R {
+    if sig == 0 || sig >= proc::NSIG {
+        return Err(-EINVAL);
+    }
+    let p = proc::current();
+    let old = p.sig_handlers[sig];
+    if act != 0 {
+        let mut h = [0u8; 8];
+        p.pt().copy_in(&mut h, act).ok_or(-EFAULT)?;
+        p.sig_handlers[sig] = u64::from_le_bytes(h);
+    }
+    if oact != 0 {
+        // struct k_sigaction { handler, flags, restorer, mask }
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&old.to_le_bytes());
+        out(oact, &b)?;
+    }
+    Ok(0)
 }
 
 const MAXARG: usize = 256;
@@ -261,56 +442,35 @@ fn copy_in_strv(mut va: usize) -> Result<Vec<Vec<u8>>, i64> {
     if va == 0 {
         return Ok(v);
     }
+    let pt = proc::current().pt();
     loop {
         let mut w = [0u8; 8];
-        proc::current().pt().copy_in(&mut w, va).ok_or(-EFAULT)?;
+        pt.copy_in(&mut w, va).ok_or(-EFAULT)?;
         let p = u64::from_le_bytes(w) as usize;
         if p == 0 {
             return Ok(v);
         }
         if v.len() >= MAXARG {
-            return Err(-7); // E2BIG
+            return Err(-E2BIG);
         }
-        v.push(proc::current().pt().copy_in_str(p, MAXSTR).ok_or(-EFAULT)?);
+        v.push(pt.copy_in_str(p, MAXSTR).ok_or(-EFAULT)?);
         va += 8;
     }
 }
 
-fn sys_execve(path: usize, argv: usize, envp: usize) -> i64 {
-    let r = (|| {
-        let path = proc::current().pt().copy_in_str(path, 4096).ok_or(-EFAULT)?;
-        let path = String::from_utf8(path).map_err(|_| -2i64)?;
-        let argv = copy_in_strv(argv)?;
-        let envp = copy_in_strv(envp)?;
-        proc::execve(&path, &argv, &envp)
-    })();
-    match r {
-        Ok(()) => 0,
-        Err(e) => e,
-    }
+fn sys_execve(path: usize, argv: usize, envp: usize) -> R {
+    let path = proc::current().pt().copy_in_str(path, 4096).ok_or(-EFAULT)?;
+    let path = String::from_utf8(path).map_err(|_| -ENOENT)?;
+    let argv = copy_in_strv(argv)?;
+    let envp = copy_in_strv(envp)?;
+    proc::execve(&path, &argv, &envp)?;
+    Ok(0)
 }
 
-fn sys_wait4(pid: i64, status: usize, options: u64) -> i64 {
-    match proc::wait(pid, options) {
-        Ok((pid, xstatus)) => {
-            if status != 0 && pid != 0 {
-                let w = ((xstatus as u32 & 0xff) << 8).to_le_bytes();
-                if proc::current().pt().copy_out(status, &w).is_none() {
-                    return -EFAULT;
-                }
-            }
-            pid as i64
-        }
-        Err(e) => e,
+fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
+    let (pid, xstatus) = proc::wait(pid, options)?;
+    if status != 0 && pid != 0 {
+        out(status, &xstatus.to_le_bytes())?;
     }
-}
-
-/// シグナルはまだないので、自分宛ての致命的なもの (abort など) だけ終了として扱う
-fn sys_kill(pid: i64, a1: i64, a2: i64, tgkill: bool) -> i64 {
-    let (target, sig) = if tgkill { (a1, a2) } else { (pid, a1) };
-    let me = proc::current().pid as i64;
-    if sig != 0 && (target == me || target == 0) {
-        proc::exit(128 + sig as i32);
-    }
-    0
+    Ok(pid as i64)
 }

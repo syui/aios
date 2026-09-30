@@ -1,4 +1,4 @@
-// aios の小さなシェル: パイプ (|)、入出力のつけかえ (< >)、cd / pwd / exit
+// aios の小さなシェル: パイプ (|)、入出力のつけかえ (< >)、; と &&、cd / exit
 use std::ffi::CString;
 use std::io::{self, BufRead, Write};
 
@@ -64,6 +64,8 @@ fn run(cmds: Vec<Cmd>) -> i32 {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
+                // Rust は SIGPIPE を無視するが、子には既定の動作で渡す
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 if prev_read >= 0 {
                     libc::dup2(prev_read, 0);
                     libc::close(prev_read);
@@ -115,7 +117,7 @@ fn run(cmds: Vec<Cmd>) -> i32 {
     for pid in pids {
         let mut st = 0;
         unsafe { libc::waitpid(pid, &mut st, 0) };
-        last = libc::WEXITSTATUS(st);
+        last = if libc::WIFSIGNALED(st) { 128 + libc::WTERMSIG(st) } else { libc::WEXITSTATUS(st) };
     }
     last
 }
@@ -134,27 +136,34 @@ fn main() {
             return;
         }
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut words = line.split_whitespace();
-        match words.next() {
-            Some("exit") => std::process::exit(words.next().and_then(|s| s.parse().ok()).unwrap_or(status)),
-            Some("cd") => {
-                let dir = words.next().unwrap_or("/");
-                status = match std::env::set_current_dir(dir) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        eprintln!("cd: {}: {}", dir, e);
-                        1
-                    }
-                };
+        for list in line.split(';') {
+            for (j, cmd) in list.split("&&").enumerate() {
+                if j > 0 && status != 0 {
+                    break;
+                }
+                status = run_line(cmd.trim(), status);
             }
-            Some("pwd") => {
-                println!("{}", cwd);
-                status = 0;
-            }
-            _ => status = run(parse(line)),
         }
+    }
+}
+
+fn run_line(line: &str, status: i32) -> i32 {
+    if line.is_empty() || line.starts_with('#') {
+        return status;
+    }
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("exit") => std::process::exit(words.next().and_then(|s| s.parse().ok()).unwrap_or(status)),
+        Some("cd") => {
+            let dir = words.next().unwrap_or("/");
+            match std::env::set_current_dir(dir) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("cd: {}: {}", dir, e);
+                    1
+                }
+            }
+        }
+        _ => run(parse(line)),
     }
 }
