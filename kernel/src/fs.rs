@@ -1,5 +1,5 @@
 // 起動時にルートファイルシステムを組み立てる
-use crate::ext2::Ext2;
+use crate::extfs::ExtFs;
 use crate::initrd;
 use crate::tmpfs::{self, TmpInode};
 use crate::virtio_blk;
@@ -8,9 +8,10 @@ use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 /// ディスクに ext2 があればそれを、なければ initramfs を展開した tmpfs をルートにする
 pub fn init() {
     if virtio_blk::init() {
-        match Ext2::mount() {
+        match ExtFs::mount() {
             Ok(fs) => {
-                println!("fs: root is ext2 on virtio-blk");
+                println!("fs: root is {} on virtio-blk", fs.kind());
+                let kind = fs.kind();
                 vfs::set_root(fs.root());
                 // /dev と /tmp はメモリ上に
                 for d in ["dev", "tmp", "run"] {
@@ -18,7 +19,8 @@ pub fn init() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                setup_dirs("/dev/vda / ext2 rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\n");
+                let mtab = alloc::format!("/dev/vda / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\n", kind);
+                setup_dirs(&mtab);
                 return;
             }
             Err(e) => println!("fs: disk not usable ({}), using initramfs", e),
