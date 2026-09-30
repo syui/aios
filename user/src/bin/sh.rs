@@ -1,5 +1,6 @@
 // aios の小さなシェル (sh -c CMD、sh FILE も)
-//   パイプ |、つけかえ < > >> 2> 2>&1 >&2、並べる ; && &、クォート ' " \、変数 $VAR $? $! $0..$9 $# "$@"
+//   パイプ |、つけかえ < > >> 2> 2>&1 >&2、並べる ; && || &、クォート ' " \、変数 $VAR $? $! $0..$9 $# "$@"
+//   ワイルドカード * ? [...] (クォートの外だけ。当たらなければそのまま)
 //   組み込み: cd, exit, export, exec, jobs, fg, bg, wait, kill %N
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
 use std::ffi::CString;
@@ -196,6 +197,10 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
             '~' if word.is_none() && matches!(cs.get(i), None | Some('/' | ' ')) => {
                 word = Some(var("HOME", status));
             }
+            // クォートの外のワイルドカードは印にしておき、実行の前に広げる
+            '*' => word.get_or_insert_with(String::new).push(GLOB_STAR),
+            '?' => word.get_or_insert_with(String::new).push(GLOB_ONE),
+            '[' => word.get_or_insert_with(String::new).push(GLOB_SET),
             c => word.get_or_insert_with(String::new).push(c),
         }
     }
@@ -203,6 +208,166 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
         toks.push(Tok::Word(w));
     }
     Ok(toks)
+}
+
+// ---- ワイルドカード ----
+
+/// クォートの外にあった * ? [ の印 (Unicode の私用領域の文字)
+const GLOB_STAR: char = '\u{f0000}';
+const GLOB_ONE: char = '\u{f0001}';
+const GLOB_SET: char = '\u{f0002}';
+
+fn is_mark(c: char) -> bool {
+    matches!(c, GLOB_STAR | GLOB_ONE | GLOB_SET)
+}
+
+/// 印をもとの文字に戻す
+fn unmark(w: &str) -> String {
+    w.chars()
+        .map(|c| match c {
+            GLOB_STAR => '*',
+            GLOB_ONE => '?',
+            GLOB_SET => '[',
+            c => c,
+        })
+        .collect()
+}
+
+/// 語をファイル名に広げる。印がないか、何にも当たらなければ、もとの語 1 つ
+fn glob(w: &str) -> Vec<String> {
+    if !w.chars().any(is_mark) {
+        return vec![w.to_string()];
+    }
+    let (mut found, parts): (Vec<String>, Vec<&str>) = if let Some(rest) = w.strip_prefix('/') {
+        (vec!["/".into()], rest.split('/').collect())
+    } else {
+        (vec![String::new()], w.split('/').collect())
+    };
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let mut next = vec![];
+        for base in &found {
+            if part.is_empty() {
+                // "a//b" や末尾の "/"
+                if !last || !base.is_empty() {
+                    next.push(format!("{}/", base.trim_end_matches('/')));
+                }
+                continue;
+            }
+            let join = |name: &str| if base.is_empty() || base.ends_with('/') { format!("{}{}", base, name) } else { format!("{}/{}", base, name) };
+            if !part.chars().any(is_mark) {
+                let p = join(part);
+                if last || std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
+                    next.push(p);
+                }
+                continue;
+            }
+            let dir = if base.is_empty() { "." } else { base.as_str() };
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            let pat: Vec<char> = part.chars().collect();
+            let mut names: Vec<String> = rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                // . で始まる名前は、パターンも . で始まるときだけ
+                .filter(|n| !n.starts_with('.') || pat[0] == '.')
+                .filter(|n| glob_match(&pat, &n.chars().collect::<Vec<_>>()))
+                .collect();
+            names.sort();
+            for n in names {
+                let p = join(&n);
+                if last || std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
+                    next.push(p);
+                }
+            }
+        }
+        found = next;
+    }
+    // 存在しない普通の部分だけの候補は、最後の要素にしか印がないときに出うるので、確かめる
+    found.retain(|p| std::fs::symlink_metadata(p).is_ok());
+    if found.is_empty() { vec![unmark(w)] } else { found }
+}
+
+/// パターン (印つき) が名前全体に当たるか
+fn glob_match(p: &[char], s: &[char]) -> bool {
+    let (mut pi, mut si) = (0, 0);
+    // 最後に見た * の場所 (そこからやり直す)
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() {
+            match p[pi] {
+                GLOB_STAR => {
+                    star = Some((pi, si));
+                    pi += 1;
+                    continue;
+                }
+                GLOB_ONE => {
+                    pi += 1;
+                    si += 1;
+                    continue;
+                }
+                GLOB_SET => {
+                    if let Some((ok, len)) = match_set(&p[pi + 1..], s[si]) {
+                        if ok {
+                            pi += 1 + len;
+                            si += 1;
+                            continue;
+                        }
+                    } else if s[si] == '[' {
+                        // 閉じていない [ はただの文字
+                        pi += 1;
+                        si += 1;
+                        continue;
+                    }
+                }
+                c if c == s[si] => {
+                    pi += 1;
+                    si += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match star {
+            Some((sp, ss)) => {
+                pi = sp + 1;
+                si = ss + 1;
+                star = Some((sp, ss + 1));
+            }
+            None => return false,
+        }
+    }
+    p[pi..].iter().all(|&c| c == GLOB_STAR)
+}
+
+/// [ の後ろ (set) を c に当てる。(当たったか, ] までの長さ)。] がなければ None
+fn match_set(set: &[char], c: char) -> Option<(bool, usize)> {
+    let lit = |x: char| unmark(&x.to_string()).chars().next().unwrap();
+    let mut i = 0;
+    let neg = matches!(set.first(), Some('!' | '^'));
+    if neg {
+        i += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while i < set.len() {
+        let x = lit(set[i]);
+        if x == ']' && !first {
+            return Some((hit != neg, i + 1));
+        }
+        first = false;
+        if i + 2 < set.len() && set[i + 1] == '-' && lit(set[i + 2]) != ']' {
+            if (x..=lit(set[i + 2])).contains(&c) {
+                hit = true;
+            }
+            i += 3;
+        } else {
+            if x == c {
+                hit = true;
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -224,7 +389,7 @@ fn pipeline(toks: &[Tok]) -> Result<Vec<Cmd>, String> {
     while let Some(t) = it.next() {
         let cur = cmds.last_mut().unwrap();
         match t {
-            Tok::Word(w) => cur.args.push(w.clone()),
+            Tok::Word(w) => cur.args.extend(glob(w)),
             Tok::Pipe => cmds.push(Cmd::default()),
             Tok::Redir(fd, Op::Dup(n)) => cur.redirs.push((*fd, Target::Dup(*n))),
             Tok::Redir(fd, op) => {
@@ -234,7 +399,7 @@ fn pipeline(toks: &[Tok]) -> Result<Vec<Cmd>, String> {
                     Op::Append => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
                     _ => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
                 };
-                cur.redirs.push((*fd, Target::File(f.clone(), flags)));
+                cur.redirs.push((*fd, Target::File(unmark(f), flags)));
             }
         }
     }
@@ -707,11 +872,21 @@ fn builtin(args: &[String], status: i32) -> Option<i32> {
     }
 }
 
-/// クォートの外にある ; && & で区切る。(コマンド, 前が成功したときだけ, うしろで動かす)
-fn split_list(line: &str) -> Vec<(String, bool, bool)> {
+/// 前のコマンドの結果で動かすかどうか
+#[derive(Clone, Copy, PartialEq)]
+enum Cond {
+    Always,
+    /// && : 前が成功したときだけ
+    And,
+    /// || : 前が失敗したときだけ
+    Or,
+}
+
+/// クォートの外にある ; && || & で区切る。(コマンド, 条件, うしろで動かす)
+fn split_list(line: &str) -> Vec<(String, Cond, bool)> {
     let mut out = vec![];
     let mut cur = String::new();
-    let mut and = false;
+    let mut and = Cond::Always;
     let mut quote = None;
     let mut cs = line.chars().peekable();
     while let Some(c) = cs.next() {
@@ -727,20 +902,26 @@ fn split_list(line: &str) -> Vec<(String, bool, bool)> {
             (Some(q), _) if q == c => quote = None,
             (None, ';') => {
                 out.push((std::mem::take(&mut cur), and, false));
-                and = false;
+                and = Cond::Always;
                 continue;
             }
             (None, '&') if cs.peek() == Some(&'&') => {
                 cs.next();
                 out.push((std::mem::take(&mut cur), and, false));
-                and = true;
+                and = Cond::And;
+                continue;
+            }
+            (None, '|') if cs.peek() == Some(&'|') => {
+                cs.next();
+                out.push((std::mem::take(&mut cur), and, false));
+                and = Cond::Or;
                 continue;
             }
             // >&2 や 2>&1 の & はつけかえの一部
             (None, '&') if cur.ends_with('>') || cur.ends_with('<') => {}
             (None, '&') => {
                 out.push((std::mem::take(&mut cur), and, true));
-                and = false;
+                and = Cond::Always;
                 continue;
             }
             _ => {}
@@ -752,13 +933,9 @@ fn split_list(line: &str) -> Vec<(String, bool, bool)> {
 }
 
 fn run(line: &str, mut status: i32) -> i32 {
-    let mut skip = false;
-    for (part, after_and, bg) in split_list(line) {
-        if !after_and {
-            skip = false;
-        }
-        if skip || (after_and && status != 0) {
-            skip = true;
+    // a && b || c は左から: 飛ばしたコマンドは結果を変えない
+    for (part, cond, bg) in split_list(line) {
+        if (cond == Cond::And && status != 0) || (cond == Cond::Or && status == 0) {
             continue;
         }
         // 変数は実行する直前に展開する
