@@ -7,8 +7,8 @@
 #   FS=ext2 ...                     root を ext2 に
 #   OUT=FILE で出力先を変える (bin/mksd.sh が root の区画を作るのに使う。いつも区画なし)
 #   NOBOOT=1 で root の /boot を空に (boot は別の FAT の区画に入れるとき)
-# ESP には rootfs/boot の中身 (aios-kernel の Image と EFI/BOOT/BOOTAA64.EFI) を入れる。
-# UEFI のファームウェアは EFI/BOOT/BOOTAA64.EFI (= Image、EFI スタブつき) を起動し、
+# ESP には rootfs/boot の中身 (aios-kernel の Image と loader entry、aiboot) を入れる。
+# UEFI のファームウェアは EFI/BOOT/BOOTAA64.EFI (aiboot) を起動し、aiboot が entry の Image を起動する。
 # aios は起動後に ESP を /boot にマウントするので、aipkg でカーネルを入れかえられる
 # GPT には sfdisk、FAT には mkfs.vfat と mcopy (dosfstools, mtools) が要る
 # aios はまだ htree (dir_index) の索引を書きかえられないので外しておく
@@ -90,7 +90,10 @@ rm -f "$tmp/root.img"
 # ESP
 truncate -s $((esp * 512)) "$tmp/esp.img"
 mkfs.vfat -F 32 -n ESP "$tmp/esp.img" >/dev/null
+# ブートローダー (aiboot パッケージ) がなければ、カーネルそのものを既定の場所に置く
+# (起動はできるが、aipkg でカーネルを上げてもこの写しは古いまま)
 if [ -f "$tmp/boot/Image" ] && [ ! -f "$tmp/boot/EFI/BOOT/BOOTAA64.EFI" ]; then
+  echo "aiboot がないので EFI/BOOT/BOOTAA64.EFI は Image の写しです (bin/mkrootfs.sh aios-kernel aiboot ...)" >&2
   mkdir -p "$tmp/boot/EFI/BOOT"
   cp "$tmp/boot/Image" "$tmp/boot/EFI/BOOT/BOOTAA64.EFI"
 fi

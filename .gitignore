@@ -3,6 +3,7 @@
 /docs
 /rootfs
 /user/target
+/boot/target
 /build
 /disk.img
 /repo

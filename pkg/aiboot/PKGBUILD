@@ -1,0 +1,39 @@
+# aiboot: 小さな UEFI のブートローダー (このリポジトリの boot/)
+# systemd-boot と同じ /loader/loader.conf と /loader/entries/*.conf を読んで、カーネルを起動する。
+# ESP (/boot) の既定の場所 EFI/BOOT/BOOTAA64.EFI に入るので、UEFI はこれを起動する。
+# すでに systemd-boot を使っている ESP なら、これは入れずに aios-kernel の entry だけでよい
+pkgname=aiboot
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A tiny UEFI boot loader that reads systemd-boot style loader entries'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+makedepends=('rustup')
+backup=(boot/loader/loader.conf)
+
+pkgver() {
+  cd "$startdir/../.."
+  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD -- boot)" "$(git log -1 --format=%h -- boot)"
+}
+
+build() {
+  cd "$startdir/../../boot"
+  unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release
+}
+
+package() {
+  local efi=$srcdir/target/aarch64-unknown-uefi/release/aiboot.efi
+  install -Dm644 "$efi" "$pkgdir/boot/EFI/BOOT/BOOTAA64.EFI"
+  install -Dm644 "$efi" "$pkgdir/boot/EFI/aiboot/aibootaa64.efi"
+  install -d "$pkgdir/boot/loader/entries"
+  cat > "$pkgdir/boot/loader/loader.conf" <<'CONF'
+# aiboot (systemd-boot と同じ書き方)
+# default: 既定の entry (/boot/loader/entries/ のファイル名。* が使える)
+# timeout: 一覧を出して待つ秒数 (0 ですぐ起動、menu-force で待ちつづける)
+default aios*
+timeout 0
+CONF
+  chmod 644 "$pkgdir/boot/loader/loader.conf"
+}
