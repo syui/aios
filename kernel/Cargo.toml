@@ -1,0 +1,11 @@
+[package]
+name = "aios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aios"
+path = "src/main.rs"
+test = false
+bench = false
