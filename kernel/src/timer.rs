@@ -49,6 +49,7 @@ pub fn tick() {
     // 割り込み中の cpu0 だけが書く
     let now = TICKS.load(Ordering::Relaxed) + 1;
     TICKS.store(now, Ordering::Relaxed);
+    crate::proc::account_tick();
     crate::proc::wake_expired(now);
     crate::signal::tick(now);
     // TCP の再送などのため、ときどき回す

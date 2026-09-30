@@ -169,6 +169,10 @@ pub struct Proc {
     pub stopped: bool,
     pub stop_report: i32,
     pub cont_report: bool,
+    /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
+    pub utime: u64,
+    /// 回収した子 (とその子孫) の utime
+    pub cutime: u64,
     chan: usize,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
@@ -208,6 +212,8 @@ impl Proc {
         stopped: false,
         stop_report: 0,
         cont_report: false,
+        utime: 0,
+        cutime: 0,
         chan: 0,
         wake_at: 0,
         context: Context::ZERO,
@@ -597,6 +603,12 @@ fn exit_status(status: i32) -> ! {
     let p = current();
     clear_child_tid(p);
     if p.thread {
+        // 使った時間は代表スレッドに持たせる
+        let t = core::mem::take(&mut p.utime);
+        if let Some(l) = find(p.tgid) {
+            l.utime += t;
+        }
+        let p = current();
         p.files = None;
         p.state = State::Zombie;
         sched();
@@ -833,7 +845,11 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             if c.state == State::Zombie && options & WEXITED != 0 {
                 let r = (c.pid, c.xstatus);
                 if !keep {
+                    let t = c.utime + c.cutime;
                     *c = Proc::UNUSED;
+                    if let Some(me) = find(my_tgid) {
+                        me.cutime += t;
+                    }
                 }
                 return Ok(r);
             }
@@ -862,6 +878,19 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
         let leader = find(me.tgid).map_or(me as *mut Proc as usize, |l| l as *mut Proc as usize);
         sleep(leader)?;
     }
+}
+
+/// タイマの割り込みから: いま動いているプロセスに 1 tick つける。
+/// カーネルの中では割り込みを止めているので、動いていたのはユーザーモード
+pub fn account_tick() {
+    if let Some(i) = unsafe { CURRENT } {
+        procs()[i].utime += 1;
+    }
+}
+
+/// スレッドグループ全体の utime (tick)
+pub fn group_utime(tgid: u32) -> u64 {
+    procs().iter().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
 }
 
 /// pidfd: そのプロセスが終わった (ゾンビか、もういない) か

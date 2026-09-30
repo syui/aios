@@ -2,7 +2,8 @@
 //
 // 読み書きできるもの: 直接/間接ブロック (ext2)、extents・64bit・flex_bg・
 // metadata_csum (crc32c)・未初期化グループ (ext4)、filetype、sparse_super、large_file
-// ジャーナルには書かない (きれいなジャーナルはそのまま)。回復が必要なら読み取り専用。
+// ext4 のジャーナル (jbd2) を使う: メタデータはジャーナルに書いてから本当の場所へ
+// (data=ordered: ファイルの中身は先に直接)。マウントのときに残っていれば再生する (jbd2.rs)。
 // htree で索引のついたディレクトリは読めるが、metadata_csum の上では書きかえない。
 use crate::kalloc;
 use crate::memlayout::PGSIZE;
@@ -16,6 +17,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::RefCell;
+
+#[path = "jbd2.rs"]
+mod jbd2;
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
@@ -106,8 +110,10 @@ fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
 struct Cache {
     map: BTreeMap<u64, *mut u8>,
     order: VecDeque<u64>,
-    /// まだディスクに書いていないブロック
+    /// まだディスクに書いていないメタデータのブロック (ジャーナルを通す)
     dirty: BTreeSet<u64>,
+    /// まだディスクに書いていないファイルの中身のブロック (直接書く)
+    data: BTreeSet<u64>,
     sb_dirty: bool,
     /// チェックサムを直して書き出すグループ
     gd_dirty: BTreeSet<u32>,
@@ -136,6 +142,7 @@ pub struct ExtFs {
     sb: RefCell<Vec<u8>>,
     gdt: RefCell<Vec<u8>>,
     cache: RefCell<Cache>,
+    journal: RefCell<Option<jbd2::Journal>>,
 }
 
 /// ディスク上の inode (inode_size バイトまるごと)
@@ -260,10 +267,6 @@ impl ExtFs {
             println!("extfs: unsupported features for writing ({:#x}), read-only", ro_compat & !RO_WRITE);
             ro = true;
         }
-        if incompat & INCOMPAT_RECOVER != 0 {
-            println!("extfs: journal needs recovery, read-only");
-            ro = true;
-        }
         let fs = Rc::new(ExtFs {
             fs: new_fs_id(),
             bsize,
@@ -284,11 +287,13 @@ impl ExtFs {
                 map: BTreeMap::new(),
                 order: VecDeque::new(),
                 dirty: BTreeSet::new(),
+                data: BTreeSet::new(),
                 sb_dirty: false,
                 gd_dirty: BTreeSet::new(),
                 bb_dirty: BTreeSet::new(),
                 ib_dirty: BTreeSet::new(),
             }),
+            journal: RefCell::new(None),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -296,6 +301,28 @@ impl ExtFs {
             chunk.copy_from_slice(&fs.read_block(first_data_block + 1 + i as u64).map_err(|_| "read error")?);
         }
         *fs.gdt.borrow_mut() = gdt;
+        if !fs.ro {
+            match fs.journal_open() {
+                Ok(j) => {
+                    let has = j.is_some();
+                    *fs.journal.borrow_mut() = j;
+                    // 再生で書きかわったかもしれないので、覚えていたものを捨てて読みなおす
+                    fs.drop_cache();
+                    for (i, chunk) in fs.gdt.borrow_mut().chunks_mut(bsize).enumerate() {
+                        chunk.copy_from_slice(&fs.read_block(first_data_block + 1 + i as u64).map_err(|_| "read error")?);
+                    }
+                    if has {
+                        println!("extfs: journal on");
+                    }
+                }
+                Err(e) => {
+                    println!("extfs: journal: {}", e);
+                    return Err(e);
+                }
+            }
+        } else if incompat & INCOMPAT_RECOVER != 0 {
+            println!("extfs: journal needs recovery");
+        }
         let kind = if fs.extents { "ext4" } else { "ext2" };
         println!("extfs: {} {} MiB, {} groups{}{}", kind, blocks * bsize as u64 / (1024 * 1024), groups, if csum { ", metadata_csum" } else { "" }, if fs.ro { ", read-only" } else { "" });
         Ok(fs)
@@ -348,11 +375,44 @@ impl ExtFs {
         self.with_block(b, |d| d.to_vec())
     }
 
-    /// ブロックを書きかえる (ディスクへは flush で)
+    /// メタデータのブロックを書きかえる (ディスクへは flush でジャーナルを通して)
     fn modify_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         let r = self.with_block(b, f)?;
-        self.cache.borrow_mut().dirty.insert(b);
+        let mut c = self.cache.borrow_mut();
+        c.data.remove(&b);
+        c.dirty.insert(b);
         Ok(r)
+    }
+
+    /// ファイルの中身のブロックを書きかえる (flush で、ジャーナルより先に直接)
+    fn modify_data_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let r = self.with_block(b, f)?;
+        let mut c = self.cache.borrow_mut();
+        c.dirty.remove(&b);
+        c.data.insert(b);
+        Ok(r)
+    }
+
+    /// 覚えているブロックをぜんぶ捨てる (書いていないものはないこと)
+    fn drop_cache(&self) {
+        let mut c = self.cache.borrow_mut();
+        for (_, p) in core::mem::take(&mut c.map) {
+            kalloc::free(p);
+        }
+        c.order.clear();
+    }
+
+    /// スーパーブロックの入ったブロックと、その中の場所
+    fn sb_block(&self) -> (u64, usize) {
+        if self.bsize == 1024 { (1, 0) } else { (0, 1024) }
+    }
+
+    /// キャッシュにあるスーパーブロックの入ったブロックを data に合わせる
+    fn sync_sb_cache(&self, data: &[u8]) {
+        let (b, off) = self.sb_block();
+        if let Some(&p) = self.cache.borrow().map.get(&b) {
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), p.add(off), 1024) };
+        }
     }
 
     // ---- スーパーブロックとグループディスクリプタ ----
@@ -703,16 +763,30 @@ impl ExtFs {
             }
             let data = sb.clone();
             drop(sb);
-            virtio_blk::write(2, &data)?;
-            // 1KiB ブロックなら、スーパーブロックはキャッシュのブロック 1 にもいる
-            if self.bsize == 1024 {
-                self.cache.borrow_mut().map.remove(&1).map(kalloc::free);
-                self.cache.borrow_mut().order.retain(|&x| x != 1);
-            } else if let Some(&p) = self.cache.borrow().map.get(&0) {
-                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), p.add(1024), 1024) };
+            // スーパーブロックもメタデータとして、入っているブロックごとジャーナルを通す
+            let (b, off) = self.sb_block();
+            self.modify_block(b, |d| d[off..off + 1024].copy_from_slice(&data))?;
+        }
+        // ファイルの中身を先に (data=ordered)
+        let data: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().data).into_iter().collect();
+        self.write_blocks(&data)?;
+        let meta: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().dirty).into_iter().collect();
+        if meta.is_empty() {
+            return Ok(());
+        }
+        let mut j = self.journal.borrow_mut();
+        if let Some(jr) = j.as_mut() {
+            if self.journal_commit(jr, &meta)? {
+                self.write_blocks(&meta)?;
+                return self.journal_done(jr);
             }
         }
-        let dirty: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().dirty).into_iter().collect();
+        // ジャーナルがない (ext2 など) か、1 つのトランザクションに入りきらない
+        self.write_blocks(&meta)
+    }
+
+    /// ブロックをディスクの本当の場所へ。となりあうものは 1 回の要求にまとめる
+    fn write_blocks(&self, dirty: &[u64]) -> Result<(), i64> {
         const RUN: usize = 64;
         let spb = (self.bsize / virtio_blk::SECTOR) as u64;
         let mut i = 0;
@@ -1164,7 +1238,7 @@ impl ExtFs {
                 }
                 Err(e) => return Err(e),
             };
-            self.modify_block(b, |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
+            self.modify_data_block(b, |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
             done += n;
         }
         if (off + done) as u64 > r.size() {
@@ -1592,7 +1666,7 @@ impl Inode for ExtInode {
                 if len % bs != 0 {
                     let b = self.fs.map(self.ino, &mut r, (len / bs) as u64, false)?;
                     if b != 0 {
-                        self.fs.modify_block(b, |d| d[len % bs..].fill(0))?;
+                        self.fs.modify_data_block(b, |d| d[len % bs..].fill(0))?;
                     }
                 }
             }
