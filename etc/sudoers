@@ -1,0 +1,9 @@
+# /etc/sudoers (sudo-rs)。visudo で編集する
+Defaults env_reset
+Defaults secure_path="/usr/bin:/bin"
+# aios にはまだ疑似端末 (pty) がないので、コマンドはそのまま端末で動かす
+Defaults !use_pty
+
+root ALL=(ALL:ALL) ALL
+%wheel ALL=(ALL:ALL) ALL
+ai ALL=(ALL:ALL) NOPASSWD: ALL

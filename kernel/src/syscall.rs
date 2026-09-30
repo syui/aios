@@ -31,6 +31,7 @@ mod nr {
     pub const LISTXATTR: u64 = 11;
     pub const FLISTXATTR: u64 = 13;
     pub const GETCWD: u64 = 17;
+    pub const FLOCK: u64 = 32;
     pub const MKNODAT: u64 = 33;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
@@ -164,6 +165,7 @@ mod nr {
     pub const GETRANDOM: u64 = 278;
     pub const MEMBARRIER: u64 = 283;
     pub const RSEQ: u64 = 293;
+    pub const CLOSE_RANGE: u64 = 436;
     pub const FACCESSAT2: u64 = 439;
 }
 
@@ -180,6 +182,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     proc::current().orig_x0 = tf.x[0];
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
+        FLOCK => sysfile::flock(a[0], a[1]),
+        CLOSE_RANGE => sysfile::close_range(a[0], a[1], a[2]),
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),

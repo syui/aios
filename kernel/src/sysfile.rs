@@ -870,3 +870,79 @@ pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
     let w = f.borrow_mut().write(&tmp[..n])?;
     Ok(w as i64)
 }
+
+/// flock のロック表: inode ごとに (開いたファイル, 専有か)
+static mut LOCKS: alloc::vec::Vec<((usize, u64), usize, bool)> = alloc::vec::Vec::new();
+
+fn locks() -> &'static mut alloc::vec::Vec<((usize, u64), usize, bool)> {
+    unsafe { &mut *(&raw mut LOCKS) }
+}
+
+fn locks_chan() -> usize {
+    (&raw const LOCKS) as usize
+}
+
+/// OpenFile が閉じられたら、その持っていたロックを外す
+pub fn release_locks(file: usize) {
+    let l = locks();
+    let before = l.len();
+    l.retain(|(_, f, _)| *f != file);
+    if l.len() != before {
+        proc::wakeup(locks_chan());
+    }
+}
+
+/// flock(fd, op): LOCK_SH / LOCK_EX / LOCK_UN (| LOCK_NB)
+pub fn flock(fd: u64, op: u64) -> R {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    const EWOULDBLOCK: i64 = 11;
+    let f = file_of(fd)?;
+    let id = match &f.borrow().kind {
+        Kind::Inode(i, _) => i.id(),
+        _ => return Err(-EINVAL),
+    };
+    let me = &*f.borrow() as *const file::OpenFile as usize;
+    // すでに持っているロックは外してから取りなおす (変換)
+    locks().retain(|(i, fl, _)| !(*i == id && *fl == me));
+    proc::wakeup(locks_chan());
+    let excl = match op & !LOCK_NB {
+        LOCK_UN => return Ok(0),
+        LOCK_SH => false,
+        LOCK_EX => true,
+        _ => return Err(-EINVAL),
+    };
+    loop {
+        let busy = locks().iter().any(|(i, _, e)| *i == id && (excl || *e));
+        if !busy {
+            locks().push((id, me, excl));
+            return Ok(0);
+        }
+        if op & LOCK_NB != 0 {
+            return Err(-EWOULDBLOCK);
+        }
+        proc::sleep(locks_chan())?;
+    }
+}
+
+/// close_range(first, last, flags): まとめて閉じる (CLOSE_RANGE_CLOEXEC なら印をつけるだけ)
+pub fn close_range(first: u64, last: u64, flags: u64) -> R {
+    const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    if first > last {
+        return Err(-EINVAL);
+    }
+    let files = proc::current().files();
+    let end = (last as usize).min(files.fds.len().saturating_sub(1));
+    for i in first as usize..=end {
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            if let Some(f) = files.fds[i].as_mut() {
+                f.cloexec = true;
+            }
+        } else {
+            files.fds[i] = None;
+        }
+    }
+    Ok(0)
+}
