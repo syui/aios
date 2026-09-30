@@ -2,7 +2,7 @@
 //   パイプ |、つけかえ < > >>、並べる ; &&、クォート ' " \、変数 $VAR $?
 //   組み込み: cd, exit, export
 use std::ffi::CString;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 #[derive(Debug, PartialEq)]
 enum Tok {
@@ -256,7 +256,8 @@ fn spawn(cmds: Vec<Cmd>) -> i32 {
     let mut last = 0;
     for pid in pids {
         let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
+        // Ctrl-C でシェルのハンドラが動くと EINTR で戻るので、待ちなおす
+        while unsafe { libc::waitpid(pid, &mut st, 0) } < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {}
         last = if libc::WIFSIGNALED(st) { 128 + libc::WTERMSIG(st) } else { libc::WEXITSTATUS(st) };
     }
     last
@@ -381,13 +382,15 @@ fn main() {
         }
         std::process::exit(status);
     }
-    // 対話するシェルは Ctrl-C で終わらず、自分のグループを端末の前に出す
+    // 対話するシェルは Ctrl-C で終わらず (打ちかけの行を捨てて新しいプロンプトへ)、
+    // 自分のグループを端末の前に出す
     unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigint as *const () as usize;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
         libc::tcsetpgrp(0, libc::getpgrp());
     }
-    let stdin = io::stdin();
     let mut status = 0;
     loop {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
@@ -395,11 +398,39 @@ fn main() {
         print!("{} {} ", cwd, mark);
         io::stdout().flush().ok();
 
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            println!();
-            return;
-        }
+        let line = match read_line() {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                println!();
+                return;
+            }
+            Err(_) => {
+                println!();
+                status = 130;
+                continue;
+            }
+        };
         status = run(line.trim(), status);
+    }
+}
+
+extern "C" fn on_sigint(_: libc::c_int) {}
+
+/// 端末から 1 行。Ctrl-C (SIGINT で read が EINTR) なら Err、終わりなら None
+fn read_line() -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let mut c = 0u8;
+        let n = unsafe { libc::read(0, &mut c as *mut u8 as *mut libc::c_void, 1) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Ok(if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) });
+        }
+        buf.push(c);
+        if c == b'\n' {
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
     }
 }

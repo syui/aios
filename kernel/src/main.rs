@@ -7,6 +7,7 @@ mod boot;
 #[macro_use]
 mod uart;
 mod console;
+mod tty;
 mod cred;
 mod exec;
 mod extfs;

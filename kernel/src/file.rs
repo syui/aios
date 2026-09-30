@@ -1,5 +1,5 @@
 // 開いたファイル (fd の向こう側)
-use crate::console;
+use crate::tty::{self, TtyRef};
 use crate::memlayout::PGSIZE;
 use crate::vfs::{self, InodeRef, S_IFMT};
 use crate::proc;
@@ -18,11 +18,16 @@ pub const O_ACCMODE: u32 = 3;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
+const O_NOCTTY: u32 = 0o400;
 
 const S_IFIFO: u32 = 0o010000;
 
 pub enum Kind {
-    Console,
+    /// 端末 (コンソールと、疑似端末の子の口)
+    Tty(TtyRef),
+    /// 疑似端末の親の口 (/dev/ptmx)
+    PtyMaster(TtyRef),
     Null,
     Zero,
     Random,
@@ -39,14 +44,22 @@ pub enum Kind {
 
 impl Kind {
     /// デバイスファイルを開いたときの中身
-    pub fn of_dev(major: u32, minor: u32) -> Option<Kind> {
-        Some(match (major, minor) {
-            (1, 3) => Kind::Null,
-            (1, 5) => Kind::Zero,
-            (1, 8) | (1, 9) => Kind::Random,
-            (5, 0) | (5, 1) => Kind::Console,
-            _ => return None,
-        })
+    pub fn of_dev(major: u32, minor: u32, flags: u32) -> Result<Kind, i64> {
+        const ENXIO: i64 = 6;
+        let tty = match (major, minor) {
+            (1, 3) => return Ok(Kind::Null),
+            (1, 5) => return Ok(Kind::Zero),
+            (1, 8) | (1, 9) => return Ok(Kind::Random),
+            (5, 0) => tty::controlling().ok_or(-ENXIO)?,
+            (5, 1) => tty::console(),
+            (5, 2) => return Ok(Kind::PtyMaster(tty::open_ptmx()?)),
+            (136, n) => tty::open_slave(n as usize)?,
+            _ => return Err(-ENXIO),
+        };
+        if flags & O_NOCTTY == 0 {
+            tty::maybe_acquire(&tty);
+        }
+        Ok(Kind::Tty(tty))
     }
 }
 
@@ -132,7 +145,8 @@ impl OpenFile {
             return Err(-EBADF);
         }
         match &self.kind {
-            Kind::Console => console::read(dst),
+            Kind::Tty(t) => tty::read(t, dst, self.flags & O_NONBLOCK != 0),
+            Kind::PtyMaster(t) => tty::master_read(t, dst, self.flags & O_NONBLOCK != 0),
             Kind::Null => Ok(0),
             Kind::Zero => {
                 dst.fill(0);
@@ -161,10 +175,8 @@ impl OpenFile {
             return Err(-EBADF);
         }
         match &self.kind {
-            Kind::Console => {
-                console::write(src);
-                Ok(src.len())
-            }
+            Kind::Tty(t) => tty::write(t, src, self.flags & O_NONBLOCK != 0),
+            Kind::PtyMaster(t) => tty::master_write(t, src, self.flags & O_NONBLOCK != 0),
             Kind::Null | Kind::Zero | Kind::Random => Ok(src.len()),
             Kind::Inode(ino, _) => {
                 if self.flags & O_APPEND != 0 {
@@ -182,7 +194,8 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         match &self.kind {
-            Kind::Console => Stat::dev(vfs::S_IFCHR | 0o620, (5 << 8) | 1),
+            Kind::Tty(t) => Stat::dev(vfs::S_IFCHR | 0o620, tty::rdev(t, false)),
+            Kind::PtyMaster(t) => Stat::dev(vfs::S_IFCHR | 0o666, tty::rdev(t, true)),
             Kind::Null => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 3),
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
@@ -195,7 +208,8 @@ impl OpenFile {
     /// poll 用: (読める, 書ける, 閉じた/エラー)
     pub fn readiness(&self) -> (bool, bool, bool) {
         match &self.kind {
-            Kind::Console => (console::ready(), true, false),
+            Kind::Tty(t) => tty::readiness(t),
+            Kind::PtyMaster(t) => tty::master_readiness(t),
             Kind::PipeRead(p) => {
                 let p = p.borrow();
                 (p.len() > 0 || p.writers == 0, false, p.writers == 0 && p.len() == 0)
@@ -319,6 +333,8 @@ impl Drop for OpenFile {
                 proc::wakeup(Rc::as_ptr(tx) as usize);
                 proc::wakeup(proc::poll_chan());
             }
+            Kind::Tty(t) if matches!(t.borrow().dev, tty::Dev::Pty(_)) => tty::close_slave(t),
+            Kind::PtyMaster(t) => tty::close_master(t),
             _ => {}
         }
     }

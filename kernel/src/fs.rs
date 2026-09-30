@@ -48,9 +48,12 @@ fn setup_dirs(mtab: &str) {
         ("urandom", 0o666, 1, 9),
         ("tty", 0o666, 5, 0),
         ("console", 0o620, 5, 1),
+        ("ptmx", 0o666, 5, 2),
     ] {
         let _ = dev.create(name, mode, NewNode::Dev(ma, mi));
     }
+    // 疑似端末の子の口 (/dev/pts/N) は ptmx を開くたびにここへ作る
+    let _ = vfs::mkdir_p("dev/pts", 0o755);
     let tmp = vfs::mkdir_p("tmp", 0o1777).expect("mkdir /tmp");
     let _ = tmp.set_mode(0o1777);
     for d in ["etc", "home", "root", "run", "var/tmp", "var/log"] {

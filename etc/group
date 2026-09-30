@@ -3,3 +3,4 @@ wheel:x:10:ai
 users:x:100:
 ai:x:1000:
 nobody:x:65534:
+tty:x:5:
