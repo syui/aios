@@ -1,4 +1,4 @@
-// 小さな HTTP/1.1 クライアント (GET だけ)。Content-Length / chunked / 切断まで、リダイレクトに対応
+// 小さな HTTP/1.1 クライアント (GET だけ)。Content-Length / chunked / 切断まで、リダイレクト、プロキシ (CONNECT) に対応
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -92,10 +92,89 @@ pub type Connector = fn(&Url) -> io::Result<Box<dyn ReadWrite>>;
 pub trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+/// url のホストへの TCP。https_proxy / http_proxy (all_proxy, no_proxy も) があれば
+/// そのプロキシに CONNECT してトンネルを作る (curl や pacman と同じ環境変数)
 pub fn tcp(url: &Url) -> io::Result<TcpStream> {
-    let s = TcpStream::connect((url.host, url.port))?;
+    let s = match proxy_for(url) {
+        Some(p) => connect_via(&p, url)?,
+        None => TcpStream::connect((url.host, url.port))?,
+    };
     s.set_read_timeout(Some(Duration::from_secs(60)))?;
     Ok(s)
+}
+
+fn env_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| std::env::var(n).ok()).filter(|v| !v.is_empty())
+}
+
+/// 使うプロキシの URL (no_proxy に当たれば None)
+fn proxy_for(url: &Url) -> Option<String> {
+    let p = if url.scheme == "https" {
+        env_any(&["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"])
+    } else {
+        env_any(&["http_proxy", "all_proxy", "ALL_PROXY"])
+    }?;
+    let no = env_any(&["no_proxy", "NO_PROXY"]).unwrap_or_default();
+    let host = url.host.trim_start_matches('[').trim_end_matches(']');
+    let skip = no.split(',').map(str::trim).filter(|d| !d.is_empty()).any(|d| {
+        let d = d.trim_start_matches('.');
+        d == "*" || host == d || host.ends_with(&format!(".{}", d))
+    });
+    (!skip).then_some(p)
+}
+
+/// プロキシ (http://[user:pass@]host:port) に CONNECT host:port を送る
+fn connect_via(proxy: &str, url: &Url) -> io::Result<TcpStream> {
+    let rest = proxy.split_once("://").map_or(proxy, |(_, r)| r);
+    let rest = rest.trim_end_matches('/');
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((a, h)) => (Some(a), h),
+        None => (None, rest),
+    };
+    let (ph, pp) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().map_err(|_| io::Error::other(format!("bad proxy: {}", proxy)))?),
+        None => (hostport, 80),
+    };
+    let mut s = TcpStream::connect((ph, pp))?;
+    s.set_read_timeout(Some(Duration::from_secs(60)))?;
+    let target = format!("{}:{}", url.host, url.port);
+    let mut req = format!("CONNECT {t} HTTP/1.1\r\nHost: {t}\r\nUser-Agent: aipkg/0.1 (aios)\r\n", t = target);
+    if let Some(a) = auth {
+        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", base64(a.as_bytes())));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes())?;
+    // 応答の頭だけを 1 バイトずつ読む (その後ろは TLS なので読みすぎない)
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b)? == 0 || head.len() > 16 * 1024 {
+            return Err(io::Error::other("proxy closed the connection"));
+        }
+        head.push(b[0]);
+    }
+    let status = String::from_utf8_lossy(&head);
+    let code = status.split_whitespace().nth(1).unwrap_or("");
+    if code != "200" {
+        return Err(io::Error::other(format!("proxy {}: CONNECT {}: {}", hostport, target, status.lines().next().unwrap_or(""))));
+    }
+    Ok(s)
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// url を GET して中身を返す。https は tls で包む
