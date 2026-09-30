@@ -1,11 +1,11 @@
 #!/bin/sh
 # rootfs/ からディスクイメージ disk.img を作る
-#   ./mkdisk.sh [size]          ext4 (既定 1G)
-#   FS=ext2 ./mkdisk.sh [size]  ext2
+#   bin/mkdisk.sh [size]          ext4 (既定 1G)
+#   FS=ext2 bin/mkdisk.sh [size]  ext2
 # aios はまだ htree (dir_index) の索引を書きかえられないので外しておく
 set -e
-cd "$(dirname "$0")"
-[ -d rootfs ] || { echo "rootfs/ がありません。先に ./mkrootfs.sh を実行してください" >&2; exit 1; }
+cd "$(dirname "$0")/.."
+[ -d rootfs ] || { echo "rootfs/ がありません。先に bin/mkrootfs.sh を実行してください" >&2; exit 1; }
 # 中のファイルは root のものにする (root でなければ fakeroot の中で)
 if [ "$(id -u)" != 0 ]; then
   command -v fakeroot >/dev/null || { echo "root か fakeroot が必要です" >&2; exit 1; }

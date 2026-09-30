@@ -1,9 +1,9 @@
 #!/bin/sh
 # user/ と pkg をビルドして rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
-#   ./mkrootfs.sh            user/ だけ
-#   ./mkrootfs.sh coreutils  uutils/coreutils も入れる (初回は build/ に clone してビルド)
+#   bin/mkrootfs.sh            user/ だけ
+#   bin/mkrootfs.sh coreutils  uutils/coreutils も入れる (初回は build/ に clone してビルド)
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 (cd user && cargo build --release)
 bin=user/target/aarch64-unknown-linux-musl/release

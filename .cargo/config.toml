@@ -2,4 +2,5 @@
 target = "aarch64-unknown-none-softfloat"
 
 [target.aarch64-unknown-none-softfloat]
-runner = "sh run.sh"
+# どこで cargo run しても、リポジトリの bin/run.sh を使う (CARGO_MANIFEST_DIR は kernel/)
+runner = ["sh", "-c", 'exec sh "$CARGO_MANIFEST_DIR/../bin/run.sh" "$@"', "run"]
