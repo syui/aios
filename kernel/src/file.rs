@@ -291,6 +291,8 @@ fn dtype(mode: u32) -> u8 {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
+        // flock のロックは OpenFile ごと (その場所で見分ける)
+        crate::sysfile::release_locks(self as *const OpenFile as usize);
         match &self.kind {
             Kind::PipeRead(p) => {
                 p.borrow_mut().readers -= 1;
