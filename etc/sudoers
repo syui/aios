@@ -1,5 +1,7 @@
 # /etc/sudoers (sudo-rs)。visudo で編集する
 Defaults env_reset
+# aipkg などがプロキシを通れるように
+Defaults env_keep += "http_proxy https_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY"
 Defaults secure_path="/usr/bin:/bin"
 
 root ALL=(ALL:ALL) ALL

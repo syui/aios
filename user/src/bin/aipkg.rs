@@ -334,6 +334,12 @@ fn install(bytes: &[u8], explicit: bool) {
         None => println!("installing {} ({})", name, ver),
     }
 
+    // 設定ファイル (backup): 入っている版を変えていたら上書きせず、新しいものは .pacnew に
+    let backup: BTreeSet<&String> = list(&info, "BACKUP").iter().collect();
+    let old_hashes: BTreeMap<&str, &str> =
+        old.map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).collect()).unwrap_or_default();
+    let mut new_backup = vec![];
+
     let mut ar = tar::Archive::new(tar_reader(bytes));
     ar.set_preserve_permissions(true);
     ar.set_preserve_mtime(true);
@@ -342,6 +348,27 @@ fn install(bytes: &[u8], explicit: bool) {
         let mut e = e.unwrap_or_else(|e| die(e));
         let path = e.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         if path.starts_with('.') {
+            continue;
+        }
+        if backup.contains(&path) {
+            let mut data = vec![];
+            e.read_to_end(&mut data).unwrap_or_else(|err| die(format!("{}: /{}: {}", name, path, err)));
+            let mode = e.header().mode().unwrap_or(0o644);
+            let hash = sha256_hex(&data);
+            let dest = format!("{}{}", ROOT, path);
+            // 今あるものが新しい版とも、前に入れた版とも違えば、手で変えたもの
+            let changed = fs::read(&dest).is_ok_and(|cur| {
+                let h = sha256_hex(&cur);
+                h != hash && old_hashes.get(path.as_str()) != Some(&h.as_str())
+            });
+            let target = if changed {
+                println!("warning: /{} installed as /{}.pacnew", path, path);
+                format!("{}.pacnew", dest)
+            } else {
+                dest
+            };
+            write_file(&target, &data, mode).unwrap_or_else(|err| die(format!("{}: {}: {}", name, target, err)));
+            new_backup.push(format!("{}\t{}", path, hash));
             continue;
         }
         if let Err(err) = e.unpack_in(ROOT) {
@@ -358,6 +385,10 @@ fn install(bytes: &[u8], explicit: bool) {
 
     let mut desc = info.clone();
     desc.insert("INSTALLDATE".into(), vec![now().to_string()]);
+    // BACKUP は「パス<TAB>入れたときの sha256」で覚えておく (次の更新と削除で比べる)
+    if !new_backup.is_empty() {
+        desc.insert("BACKUP".into(), new_backup);
+    }
     let reason = match old {
         Some((od, _)) => get(od, "REASON").to_string(),
         None if explicit => "0".into(),
@@ -372,13 +403,27 @@ fn install(bytes: &[u8], explicit: bool) {
     fs::write(format!("{}/files", dir), write_desc(&fd)).unwrap_or_else(|e| die(e));
 }
 
+fn sha256_hex(b: &[u8]) -> String {
+    Sha256::digest(b).iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// 別名に書いてから置きかえる (途中で止まっても半端なファイルを残さない)
+fn write_file(path: &str, data: &[u8], mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = format!("{}.aipkg-new", path);
+    fs::write(&tmp, data)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode & 0o7777))?;
+    fs::rename(&tmp, path)
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// 基本のディレクトリ (Arch では filesystem パッケージが持つもの)。空になっても消さない
 const KEEP_DIRS: &[&str] = &[
-    "bin/", "etc/", "home/", "lib/", "opt/", "root/", "srv/", "tmp/", "var/", "var/lib/", "var/cache/",
+    "bin/", "etc/", "home/", "lib/", "opt/", "root/", "run/", "srv/", "tmp/", "var/", "var/lib/", "var/cache/", "var/log/",
+    "var/lib/aipkg/", "var/lib/aipkg/local/", "var/cache/aipkg/",
     "usr/", "usr/bin/", "usr/lib/", "usr/share/", "usr/share/licenses/", "usr/local/",
 ];
 
@@ -411,6 +456,13 @@ fn remove(names: &[String]) {
             }
         }
         println!("removing {} ({})", name, get(d, "VERSION"));
+        // 手で変えた設定ファイルは .pacsave として残す
+        for (path, hash) in list(d, "BACKUP").iter().filter_map(|b| b.split_once('\t')) {
+            let p = format!("{}{}", ROOT, path);
+            if fs::read(&p).is_ok_and(|cur| sha256_hex(&cur) != hash) && fs::rename(&p, format!("{}.pacsave", p)).is_ok() {
+                println!("warning: /{} saved as /{}.pacsave", path, path);
+            }
+        }
         remove_files(files.iter());
         let _ = fs::remove_dir_all(local_dir(name, get(d, "VERSION")));
     }
@@ -474,7 +526,7 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
         let bytes = fetch_any(&repos[*ri].servers, file).unwrap_or_else(|e| die(format!("{}: {}", file, e)));
         let want = get(d, "SHA256SUM");
         if !want.is_empty() {
-            let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
+            let got = sha256_hex(&bytes);
             if got != want {
                 die(format!("{}: checksum mismatch", file));
             }

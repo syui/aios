@@ -1,36 +1,16 @@
 #!/bin/sh
-# user/ とパッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
-#   bin/mkrootfs.sh                  user/ (init, sh, aipkg, ...) だけ
+# パッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
+#   bin/mkrootfs.sh                  aios-base (init, sh, aipkg, ... と /etc) だけ
 #   bin/mkrootfs.sh grep sed ...     pkg/NAME のパッケージも入れる
 #   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
-# パッケージは repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
+# aios-base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
+# repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
-# 並びは Arch と同じく /usr にまとめる: /usr/bin が本体で、/bin と /sbin はそこへのリンク
 set -e
 cd "$(dirname "$0")/.."
 
-(cd user && cargo build --release)
-bin=user/target/aarch64-unknown-linux-musl/release
-
 rm -rf rootfs
-mkdir -p rootfs/usr/bin
-ln -s usr/bin rootfs/bin
-ln -s usr/bin rootfs/sbin
-ln -s bin rootfs/usr/sbin
-cp "$bin/init" rootfs/init
-for p in sh hello aipkg fetch systemctl journalctl login passwd su; do
-  cp "$bin/$p" rootfs/usr/bin/$p
-done
-# passwd と su は root の権限で動く
-chmod 4755 rootfs/usr/bin/passwd rootfs/usr/bin/su
-ln -s systemctl rootfs/usr/bin/poweroff
-ln -s systemctl rootfs/usr/bin/reboot
-cp -r etc rootfs/etc
-chmod 600 rootfs/etc/shadow
-chmod 440 rootfs/etc/sudoers
-mkdir -p rootfs/root rootfs/home rootfs/var/log rootfs/var/lib/aipkg/local rootfs/var/cache/aipkg rootfs/run rootfs/tmp
-chmod 700 rootfs/root
-chmod 1777 rootfs/tmp
+mkdir rootfs
 
 # register FILE: 入れたパッケージを aipkg の記録 (desc と files) に書く
 register() {
@@ -51,13 +31,23 @@ register() {
     END {
       v["INSTALLDATE"] = now "\n"
       v["REASON"] = "0\n"
-      for (k in v) printf "%%%s%%\n%s\n", k, v[k]
+      for (k in v) if (k != "BACKUP") printf "%%%s%%\n%s\n", k, v[k]
     }' > "$dir/desc"
+  # 設定ファイルは「パス<TAB>sha256」で (aipkg が更新のときに手で変えたかを比べる)
+  backup=$(printf '%s\n' "$info" | sed -n 's/^backup = //p')
+  if [ -n "$backup" ]; then
+    echo '%BACKUP%' >> "$dir/desc"
+    for b in $backup; do
+      printf '%s\t%s\n' "$b" "$(sha256sum "rootfs/$b" | cut -d' ' -f1)" >> "$dir/desc"
+    done
+    echo >> "$dir/desc"
+  fi
   { echo '%FILES%'; zstd -dcq "$1" | tar -tf - | grep -v '^\.'; echo; } > "$dir/files"
 }
 
-[ "$*" = all ] && set -- $(ls pkg | grep -v '\.')
-for pkg in "$@"; do
+bin/mkpkg.sh pkg/aios-base
+[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
+for pkg in aios-base "$@"; do
   [ -f "pkg/$pkg/PKGBUILD" ] || { echo "unknown pkg: $pkg" >&2; exit 1; }
   f=$(ls repo/aarch64/"$pkg"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
   if [ -z "$f" ]; then
