@@ -1,7 +1,10 @@
 // ディスク: virtio-blk (QEMU virt) か SD カード (ラズパイ)。パーティション表を読んで、
 //   root: ext の区画 (GPT の Linux root / Linux filesystem、MBR の 0x83)
 //   boot: FAT の区画 (GPT の EFI System Partition、MBR の 0x0b / 0x0c / 0x0e / 0xef)
-// を決める。root=/dev/vda2 や root=/dev/mmcblk0p2 で root の区画の番号を選べる。
+// を決める。root= で root の区画を選べる (systemd-boot などの loader entry と同じ書き方):
+//   root=/dev/vda2, root=/dev/mmcblk0p2      番号
+//   root=PARTUUID=<GPT の区画の GUID>        MBR なら PARTUUID=<ディスクの署名 8 桁>-<番号 2 桁>
+//   root=UUID=<ext の UUID>                  (blkid の UUID)
 // 表がなく、ディスク全体が ext なら、それが root。
 use crate::{sd, virtio_blk};
 use alloc::format;
@@ -94,6 +97,58 @@ pub fn name() -> String {
     part_name(&root())
 }
 
+/// 16 進の文字列 (- は飛ばす) を 16 バイトに。足りなければ None
+fn hex16(s: &str) -> Option<[u8; 16]> {
+    let digits: alloc::vec::Vec<u8> = s.bytes().filter(|&c| c != b'-').collect();
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(core::str::from_utf8(&digits[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// GUID の並び (始めの 3 つは little endian) と文字列の並びを入れかえる (どちら向きにも使える)
+fn swap_guid(r: [u8; 16]) -> [u8; 16] {
+    [r[3], r[2], r[1], r[0], r[5], r[4], r[7], r[6], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]]
+}
+
+/// root= で選ぶもの
+enum Want {
+    Num(usize),
+    /// GPT の区画の GUID (ディスク上の並び)
+    PartGuid([u8; 16]),
+    /// MBR: ディスクの署名と番号
+    PartMbr(u32, usize),
+    /// ext の UUID
+    FsUuid([u8; 16]),
+}
+
+fn parse_root(r: &str) -> Option<Want> {
+    if let Some(u) = r.strip_prefix("PARTUUID=") {
+        if let Some((sig, n)) = u.split_once('-').filter(|(a, _)| a.len() == 8 && u.len() == 11) {
+            return Some(Want::PartMbr(u32::from_str_radix(sig, 16).ok()?, usize::from_str_radix(n, 16).ok()?));
+        }
+        return hex16(u).map(|g| Want::PartGuid(swap_guid(g)));
+    }
+    if let Some(u) = r.strip_prefix("UUID=") {
+        return hex16(u).map(Want::FsUuid);
+    }
+    // 最後の数字 (vda2 の 2、mmcblk0p2 の 2)
+    let digits = r.len() - r.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let n = &r[r.len() - digits..];
+    (r.contains('p') || r.starts_with("/dev/vd") || r.starts_with("/dev/sd")).then(|| n.parse::<usize>().ok().map(Want::Num)).flatten()
+}
+
+/// 区画の中の ext の UUID
+fn fs_uuid(d: Dev, p: &Part) -> Option<[u8; 16]> {
+    let mut sb = [0u8; SECTOR * 2];
+    raw_read(d, p.start + 2, &mut sb).ok()?;
+    (u16::from_le_bytes([sb[56], sb[57]]) == 0xef53).then(|| sb[104..120].try_into().unwrap())
+}
+
 /// GUID の文字列 (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) をディスク上の並びに
 const fn guid(s: &[u8; 36]) -> [u8; 16] {
     const fn hex(c: u8) -> u8 {
@@ -133,12 +188,7 @@ pub fn init() -> bool {
         return false;
     };
     unsafe { DEV = Some(d) };
-    // root=... の最後の数字 (vda2 の 2、mmcblk0p2 の 2) が root の区画の番号
-    let want = crate::dtb::arg("root").and_then(|r| {
-        let digits = r.len() - r.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-        let n = &r[r.len() - digits..];
-        (r.contains('p') || r.starts_with("/dev/vd") || r.starts_with("/dev/sd")).then(|| n.parse::<usize>().ok()).flatten()
-    });
+    let want = crate::dtb::arg("root").and_then(parse_root);
     let mut head = [0u8; SECTOR * 4];
     if raw_read(d, 0, &mut head).is_err() {
         return true;
@@ -152,9 +202,14 @@ pub fn init() -> bool {
     }
     let mut root: Option<Part> = None;
     let mut boot: Option<Part> = None;
-    let mut pick = |p: Part, is_root: bool, is_boot: bool| {
-        let chosen = match want {
-            Some(n) => n == p.num,
+    // id: GPT なら区画の GUID、MBR なら (署名, 番号) で照らし合わせる
+    let sig = u32::from_le_bytes(head[440..444].try_into().unwrap());
+    let mut pick = |p: Part, guid: Option<[u8; 16]>, is_root: bool, is_boot: bool| {
+        let chosen = match &want {
+            Some(Want::Num(n)) => *n == p.num,
+            Some(Want::PartGuid(g)) => guid == Some(*g),
+            Some(Want::PartMbr(s, n)) => guid.is_none() && *s == sig && *n == p.num,
+            Some(Want::FsUuid(u)) => fs_uuid(d, &p) == Some(*u),
             None => is_root,
         };
         if chosen && root.is_none() {
@@ -189,7 +244,7 @@ pub fn init() -> bool {
             let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
             let last = u64::from_le_bytes(e[40..48].try_into().unwrap());
             let p = Part { start: first, len: last + 1 - first, num: i + 1 };
-            pick(p, ty == GPT_ROOT_ARM64 || ty == GPT_LINUX_FS, ty == GPT_ESP);
+            pick(p, Some(e[16..32].try_into().unwrap()), ty == GPT_ROOT_ARM64 || ty == GPT_LINUX_FS, ty == GPT_ESP);
         }
     } else {
         for i in 0..4 {
@@ -200,8 +255,11 @@ pub fn init() -> bool {
             if ty == 0 || start == 0 {
                 continue;
             }
-            pick(Part { start, len, num: i + 1 }, ty == 0x83, matches!(ty, 0x0b | 0x0c | 0x0e | 0xef));
+            pick(Part { start, len, num: i + 1 }, None, ty == 0x83, matches!(ty, 0x0b | 0x0c | 0x0e | 0xef));
         }
+    }
+    if root.is_none() && want.is_some() {
+        println!("block: {} not found", crate::dtb::arg("root").unwrap_or(""));
     }
     if let Some(r) = root {
         println!("block: root {} (sector {})", part_name(&r), r.start);

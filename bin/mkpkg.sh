@@ -111,6 +111,7 @@ make_one() (
     pkginfo provides "${provides[@]}"
     pkginfo backup "${backup[@]}"
     pkginfo depend "${depends[@]}"
+    pkginfo optdepend "${optdepends[@]}"
   } > "$pkgdir/.PKGINFO"
 
   # 同じパッケージの古い版は消す

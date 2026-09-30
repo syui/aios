@@ -335,6 +335,7 @@ fn install(bytes: &[u8], explicit: bool) {
     }
 
     // 設定ファイル (backup): 入っている版を変えていたら上書きせず、新しいものは .pacnew に
+    // (パッケージの版が前と変わっていなければ、何もしない)
     let backup: BTreeSet<&String> = list(&info, "BACKUP").iter().collect();
     let old_hashes: BTreeMap<&str, &str> =
         old.map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).collect()).unwrap_or_default();
@@ -361,6 +362,11 @@ fn install(bytes: &[u8], explicit: bool) {
                 let h = sha256_hex(&cur);
                 h != hash && old_hashes.get(path.as_str()) != Some(&h.as_str())
             });
+            // 手で変えていても、パッケージの版が前と同じなら今のものをそのまま使う (pacman と同じ)
+            if changed && old_hashes.get(path.as_str()) == Some(&hash.as_str()) {
+                new_backup.push(format!("{}\t{}", path, hash));
+                continue;
+            }
             let target = if changed {
                 println!("warning: /{} installed as /{}.pacnew", path, path);
                 format!("{}.pacnew", dest)

@@ -42,6 +42,7 @@ for f in "$dir"/*.pkg.tar.zst; do
     section CONFLICTS "$(get conflict)"
     section PROVIDES "$(get provides)"
     section DEPENDS "$(get depend)"
+    section OPTDEPENDS "$(get optdepend)"
   } > "$tmp/$name-$ver/desc"
   echo "  $name $ver"
   n=$((n + 1))
