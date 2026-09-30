@@ -6,16 +6,20 @@ extern crate alloc;
 mod boot;
 #[macro_use]
 mod uart;
+mod console;
 mod exec;
+mod file;
 mod gic;
 mod heap;
 mod initrd;
 mod kalloc;
 mod memlayout;
+mod path;
 mod proc;
 mod rand;
 mod spinlock;
 mod syscall;
+mod sysfile;
 mod timer;
 mod trap;
 mod vm;
@@ -42,6 +46,7 @@ pub extern "C" fn kmain() -> ! {
 
     gic::init();
     timer::init();
+    uart::init();
 
     proc::user_init();
     proc::scheduler()

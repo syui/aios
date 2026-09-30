@@ -5,6 +5,7 @@ use core::ptr::{read_volatile, write_volatile};
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_ITARGETSR: usize = 0x800;
 
 const GICC_CTLR: usize = 0x000;
 const GICC_PMR: usize = 0x004;
@@ -30,6 +31,10 @@ pub fn enable(id: u32) {
     unsafe {
         let pri = (GICD + GICD_IPRIORITYR + id) as *mut u8;
         write_volatile(pri, 0);
+        if id >= 32 {
+            // SPI は cpu0 に届ける
+            write_volatile((GICD + GICD_ITARGETSR + id) as *mut u8, 1);
+        }
         write_volatile(reg(GICD, GICD_ISENABLER + (id / 32) * 4), 1 << (id % 32));
     }
 }

@@ -3,9 +3,19 @@
 // カーネルの中では割り込みを止めたまま動く。切り替えが起きるのは
 // EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。
 use crate::exec::{self, Image};
+use crate::file::{self, FileRef, Kind};
 use crate::trap::TrapFrame;
 use crate::vm::PageTable;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+pub const NOFILE: usize = 256;
+
+#[derive(Clone)]
+pub struct Fd {
+    pub file: FileRef,
+    pub cloexec: bool,
+}
 
 pub const NPROC: usize = 64;
 const KSTACK_SIZE: usize = 16 * 1024;
@@ -56,6 +66,9 @@ pub struct Proc {
     /// 次に mmap で渡す場所
     pub mmap_next: usize,
     pub xstatus: i32,
+    /// fd テーブルとカレントディレクトリ (先頭 / なし)
+    pub fds: Vec<Option<Fd>>,
+    pub cwd: String,
     chan: usize,
     context: Context,
     tpidr: u64,
@@ -72,6 +85,8 @@ impl Proc {
         brk: 0,
         mmap_next: 0,
         xstatus: 0,
+        fds: Vec::new(),
+        cwd: String::new(),
         chan: 0,
         context: Context::ZERO,
         tpidr: 0,
@@ -80,6 +95,20 @@ impl Proc {
 
     pub fn pt(&mut self) -> &mut PageTable {
         self.pagetable.as_mut().expect("proc without pagetable")
+    }
+
+    pub fn fd(&self, fd: u64) -> Option<&FileRef> {
+        self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
+    }
+
+    /// minfd 以上で空いている一番小さい fd に置く
+    pub fn add_fd(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
+        let i = (minfd..NOFILE).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
+        if self.fds.len() <= i {
+            self.fds.resize(i + 1, None);
+        }
+        self.fds[i] = Some(Fd { file, cloexec });
+        Some(i)
     }
 
     fn slot(&self) -> usize {
@@ -119,6 +148,14 @@ static mut NEXT_PID: u32 = 1;
 
 fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *(&raw mut PROCS) }
+}
+
+/// exec が使う cwd。user_init のときはまだ current がないのでルート
+pub fn current_cwd() -> String {
+    match unsafe { CURRENT } {
+        Some(i) => procs()[i].cwd.clone(),
+        None => String::new(),
+    }
 }
 
 pub fn current() -> &'static mut Proc {
@@ -238,6 +275,10 @@ pub fn user_init() {
     };
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
+    let console = file::new(Kind::Console, 2);
+    for _ in 0..3 {
+        p.add_fd(console.clone(), false, 0);
+    }
     p.state = State::Runnable;
 }
 
@@ -315,6 +356,7 @@ pub fn exit(status: i32) -> ! {
             c.ppid = 1;
         }
     }
+    p.fds.clear();
     p.xstatus = status;
     p.state = State::Zombie;
     if let Some(parent) = find(p.ppid) {
@@ -344,6 +386,8 @@ pub fn clone(flags: u64, stack: usize, tls: u64) -> Result<u32, i64> {
     child.heap_start = parent.heap_start;
     child.brk = parent.brk;
     child.mmap_next = parent.mmap_next;
+    child.fds = parent.fds.clone();
+    child.cwd = parent.cwd.clone();
     unsafe {
         fp_save(&mut child.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) child.tpidr);
@@ -369,6 +413,11 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
     p.load_image(img);
     p.pt().activate();
     drop(old);
+    for f in p.fds.iter_mut() {
+        if f.as_ref().is_some_and(|f| f.cloexec) {
+            *f = None;
+        }
+    }
     Ok(())
 }
 

@@ -17,5 +17,9 @@ strip = true
 name = "hello"
 path = "src/bin/hello.rs"
 
+[[bin]]
+name = "sh"
+path = "src/bin/sh.rs"
+
 [dependencies]
 libc = "0.2"

@@ -1,23 +1,37 @@
 // aarch64 Linux 互換のシステムコール
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
 use crate::proc;
+use crate::sysfile;
 use crate::trap::TrapFrame;
 use crate::vm::{pg_up, Perm};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
-const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
 
+const SYS_GETCWD: u64 = 17;
+const SYS_DUP: u64 = 23;
+const SYS_DUP3: u64 = 24;
+const SYS_FCNTL: u64 = 25;
 const SYS_IOCTL: u64 = 29;
+const SYS_FACCESSAT: u64 = 48;
+const SYS_CHDIR: u64 = 49;
+const SYS_OPENAT: u64 = 56;
+const SYS_CLOSE: u64 = 57;
+const SYS_PIPE2: u64 = 59;
+const SYS_GETDENTS64: u64 = 61;
+const SYS_LSEEK: u64 = 62;
 const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
+const SYS_READV: u64 = 65;
 const SYS_WRITEV: u64 = 66;
+const SYS_READLINKAT: u64 = 78;
+const SYS_NEWFSTATAT: u64 = 79;
+const SYS_FSTAT: u64 = 80;
 const SYS_PPOLL: u64 = 73;
 const SYS_EXIT: u64 = 93;
 const SYS_EXIT_GROUP: u64 = 94;
@@ -31,7 +45,13 @@ const SYS_SCHED_YIELD: u64 = 124;
 const SYS_SIGALTSTACK: u64 = 132;
 const SYS_RT_SIGACTION: u64 = 134;
 const SYS_RT_SIGPROCMASK: u64 = 135;
+const SYS_KILL: u64 = 129;
+const SYS_TGKILL: u64 = 131;
+const SYS_SETPGID: u64 = 154;
+const SYS_GETPGID: u64 = 155;
+const SYS_SETSID: u64 = 157;
 const SYS_UNAME: u64 = 160;
+const SYS_UMASK: u64 = 166;
 const SYS_GETPID: u64 = 172;
 const SYS_GETPPID: u64 = 173;
 const SYS_GETUID: u64 = 174;
@@ -48,14 +68,35 @@ const SYS_MPROTECT: u64 = 226;
 const SYS_MADVISE: u64 = 233;
 const SYS_WAIT4: u64 = 260;
 const SYS_GETRANDOM: u64 = 278;
+const SYS_FACCESSAT2: u64 = 439;
 
 pub fn dispatch(tf: &mut TrapFrame) {
     let a = tf.x;
+    let file = |r: Result<i64, i64>| r.unwrap_or_else(|e| e);
     let ret = match tf.x[8] {
-        SYS_IOCTL => -ENOTTY,
-        SYS_READ => 0, // 入力はまだない (EOF)
-        SYS_WRITE => sys_write(a[0], a[1] as usize, a[2] as usize),
-        SYS_WRITEV => sys_writev(a[0], a[1] as usize, a[2] as usize),
+        SYS_GETCWD => file(sysfile::getcwd(a[0] as usize, a[1] as usize)),
+        SYS_DUP => file(sysfile::dup(a[0])),
+        SYS_DUP3 => file(sysfile::dup3(a[0], a[1], a[2])),
+        SYS_FCNTL => file(sysfile::fcntl(a[0], a[1], a[2])),
+        SYS_IOCTL => file(sysfile::ioctl(a[0], a[1], a[2] as usize)),
+        SYS_FACCESSAT | SYS_FACCESSAT2 => file(sysfile::faccessat(a[0] as i64, a[1] as usize)),
+        SYS_CHDIR => file(sysfile::chdir(a[0] as usize)),
+        SYS_OPENAT => file(sysfile::openat(a[0] as i64, a[1] as usize, a[2])),
+        SYS_CLOSE => file(sysfile::close(a[0])),
+        SYS_PIPE2 => file(sysfile::pipe2(a[0] as usize, a[1])),
+        SYS_GETDENTS64 => file(sysfile::getdents64(a[0], a[1] as usize, a[2] as usize)),
+        SYS_LSEEK => file(sysfile::lseek(a[0], a[1] as i64, a[2])),
+        SYS_READ => file(sysfile::read(a[0], a[1] as usize, a[2] as usize)),
+        SYS_WRITE => file(sysfile::write(a[0], a[1] as usize, a[2] as usize)),
+        SYS_READV => file(sysfile::readv(a[0], a[1] as usize, a[2] as usize)),
+        SYS_WRITEV => file(sysfile::writev(a[0], a[1] as usize, a[2] as usize)),
+        SYS_READLINKAT => file(sysfile::readlinkat(a[0] as i64, a[1] as usize, a[2] as usize, a[3] as usize)),
+        SYS_NEWFSTATAT => file(sysfile::newfstatat(a[0] as i64, a[1] as usize, a[2] as usize, a[3])),
+        SYS_FSTAT => file(sysfile::fstat(a[0], a[1] as usize)),
+        SYS_UMASK => 0o022,
+        SYS_SETPGID | SYS_SETSID => 0,
+        SYS_GETPGID => proc::current().pid as i64,
+        SYS_KILL | SYS_TGKILL => sys_kill(a[0] as i64, a[1] as i64, a[2] as i64, tf.x[8] == SYS_TGKILL),
         SYS_PPOLL => 0,
         SYS_EXIT | SYS_EXIT_GROUP => proc::exit(a[0] as i32 & 0xff),
         SYS_SET_TID_ADDRESS | SYS_GETPID | SYS_GETTID => proc::current().pid as i64,
@@ -85,48 +126,6 @@ pub fn dispatch(tf: &mut TrapFrame) {
         }
     };
     tf.x[0] = ret as u64;
-}
-
-fn sys_write(fd: u64, buf: usize, len: usize) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -EBADF;
-    }
-    let p = proc::current().pt();
-    let mut chunk = [0u8; 128];
-    let mut done = 0;
-    while done < len {
-        let n = chunk.len().min(len - done);
-        if p.copy_in(&mut chunk[..n], buf + done).is_none() {
-            return if done == 0 { -EFAULT } else { done as i64 };
-        }
-        let _g = crate::uart::LOCK.lock();
-        for &c in &chunk[..n] {
-            if c == b'\n' {
-                crate::uart::putc(b'\r');
-            }
-            crate::uart::putc(c);
-        }
-        done += n;
-    }
-    done as i64
-}
-
-fn sys_writev(fd: u64, iov: usize, cnt: usize) -> i64 {
-    let mut total = 0;
-    for i in 0..cnt {
-        let mut v = [0u8; 16];
-        if proc::current().pt().copy_in(&mut v, iov + i * 16).is_none() {
-            return -EFAULT;
-        }
-        let base = u64::from_le_bytes(v[..8].try_into().unwrap()) as usize;
-        let len = u64::from_le_bytes(v[8..].try_into().unwrap()) as usize;
-        let n = sys_write(fd, base, len);
-        if n < 0 {
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-    }
-    total
 }
 
 fn sys_clock_gettime(ts: usize) -> i64 {
@@ -304,4 +303,14 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> i64 {
         }
         Err(e) => e,
     }
+}
+
+/// シグナルはまだないので、自分宛ての致命的なもの (abort など) だけ終了として扱う
+fn sys_kill(pid: i64, a1: i64, a2: i64, tgkill: bool) -> i64 {
+    let (target, sig) = if tgkill { (a1, a2) } else { (pid, a1) };
+    let me = proc::current().pid as i64;
+    if sig != 0 && (target == me || target == 0) {
+        proc::exit(128 + sig as i32);
+    }
+    0
 }

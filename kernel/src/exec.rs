@@ -1,6 +1,5 @@
 // ELF (静的リンク, ET_EXEC) を新しいアドレス空間に読み込み、
 // Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る
-use crate::initrd;
 use crate::memlayout::PGSIZE;
 use crate::vm::{pg_up, PageTable, Perm};
 use alloc::vec::Vec;
@@ -9,7 +8,7 @@ pub const USER_STACK_TOP: usize = 0x40_0000_0000;
 const USER_STACK_SIZE: usize = 256 * 1024;
 const ARG_MAX: usize = 64 * 1024;
 
-const ENOENT: i64 = 2;
+const EACCES: i64 = 13;
 const ENOEXEC: i64 = 8;
 const ENOMEM: i64 = 12;
 const E2BIG: i64 = 7;
@@ -51,7 +50,12 @@ fn u64_at(b: &[u8], o: usize) -> usize {
 }
 
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
-    let elf = initrd::read(path).ok_or(-ENOENT)?;
+    let cwd = crate::proc::current_cwd();
+    let e = crate::path::resolve(&cwd, path, true)?;
+    if e.is_dir() {
+        return Err(-EACCES);
+    }
+    let elf = e.data;
     if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || u16_at(elf, 16) != 2 || u16_at(elf, 18) != 183 {
         return Err(-ENOEXEC);
     }
