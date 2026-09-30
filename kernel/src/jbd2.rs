@@ -8,7 +8,6 @@
 // ジャーナルの中はビッグエンディアン。metadata_csum のファイルシステムでは Linux と同じく
 // CSUM_V3 (crc32c) を使う。
 use super::{crc32c, ExtFs, INCOMPAT_RECOVER};
-use crate::virtio_blk;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -66,14 +65,14 @@ impl Journal {
 
 impl ExtFs {
     fn jwrite(&self, j: &Journal, lb: u32, data: &[u8]) -> Result<(), i64> {
-        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
-        virtio_blk::write(j.blocks[lb as usize] * spb, data)
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
+        crate::block::write(j.blocks[lb as usize] * spb, data)
     }
 
     fn jread(&self, j: &Journal, lb: u32) -> Result<Vec<u8>, i64> {
-        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut b = vec![0u8; self.bsize];
-        virtio_blk::read(j.blocks[lb as usize] * spb, &mut b)?;
+        crate::block::read(j.blocks[lb as usize] * spb, &mut b)?;
         Ok(b)
     }
 
@@ -109,9 +108,9 @@ impl ExtFs {
             }
             blocks.push(b);
         }
-        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut sb = vec![0u8; self.bsize];
-        virtio_blk::read(blocks[0] * spb, &mut sb).map_err(|_| "read error")?;
+        crate::block::read(blocks[0] * spb, &mut sb).map_err(|_| "read error")?;
         if be32(&sb, 0) != MAGIC || be32(&sb, 4) != SB_V2 && be32(&sb, 4) != 3 {
             return Err("bad journal superblock");
         }
@@ -173,7 +172,7 @@ impl ExtFs {
             }
             sb.clone()
         };
-        virtio_blk::write(2, &data)?;
+        crate::block::write(2, &data)?;
         // キャッシュにあるスーパーブロックの入ったブロックにも映す
         self.sync_sb_cache(&data);
         Ok(())
@@ -244,7 +243,7 @@ impl ExtFs {
                 _ => break,
             }
         }
-        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut replayed = 0;
         for (s, target, jpos, escaped) in writes {
             if revoked.get(&target).is_some_and(|&r| r >= s) {
@@ -254,7 +253,7 @@ impl ExtFs {
             if escaped {
                 put_be32(&mut d, 0, MAGIC);
             }
-            virtio_blk::write(target * spb, &d)?;
+            crate::block::write(target * spb, &d)?;
             replayed += 1;
         }
         println!("extfs: journal replayed {} blocks (up to transaction {})", replayed, seq.wrapping_sub(1));
@@ -264,7 +263,7 @@ impl ExtFs {
         self.write_jsb(j)?;
         // スーパーブロックとグループディスクリプタは再生で変わったかもしれないので読みなおす
         let mut sb = vec![0u8; 1024];
-        virtio_blk::read(2, &mut sb)?;
+        crate::block::read(2, &mut sb)?;
         *self.sb.borrow_mut() = sb;
         Ok(())
     }
