@@ -89,6 +89,7 @@ mod nr {
     pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const REBOOT: u64 = 142;
     pub const SETPGID: u64 = 154;
     pub const PRCTL: u64 = 167;
     pub const GETPGID: u64 = 155;
@@ -106,6 +107,7 @@ mod nr {
     pub const GETTID: u64 = 178;
     pub const SYSINFO: u64 = 179;
     pub const SOCKET: u64 = 198;
+    pub const SOCKETPAIR: u64 = 199;
     pub const BIND: u64 = 200;
     pub const LISTEN: u64 = 201;
     pub const ACCEPT: u64 = 202;
@@ -190,6 +192,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
         PPOLL => sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize),
         SOCKET => socket::socket(a[0], a[1], a[2]),
+        SOCKETPAIR => socket::socketpair(a[0], a[1], a[3] as usize),
         BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),
         LISTEN => socket::listen(a[0]),
         ACCEPT => socket::accept(a[0], a[1] as usize, a[2] as usize, 0),
@@ -248,6 +251,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         CLOCK_GETRES => sys_clock_getres(a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
         UNAME => sys_uname(a[0] as usize),
+        REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
         SYSINFO => sys_sysinfo(a[0] as usize),
         GETRLIMIT => sys_prlimit(a[0], 0, a[1] as usize),
         PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
@@ -558,4 +562,29 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
         out(status, &xstatus.to_le_bytes())?;
     }
     Ok(pid as i64)
+}
+
+/// 電源を切る / 再起動する (PSCI を hvc で呼ぶ)
+fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
+    const MAGIC1: u32 = 0xfee1_dead;
+    const MAGIC2: [u32; 4] = [672274793, 85072278, 369367448, 537993216];
+    const CMD_RESTART: u32 = 0x0123_4567;
+    const CMD_HALT: u32 = 0xcdef_0123;
+    const CMD_POWER_OFF: u32 = 0x4321_fedc;
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    if magic1 != MAGIC1 || !MAGIC2.contains(&magic2) {
+        return Err(-EINVAL);
+    }
+    let fid = match cmd {
+        CMD_POWER_OFF | CMD_HALT => PSCI_SYSTEM_OFF,
+        CMD_RESTART => PSCI_SYSTEM_RESET,
+        _ => return Err(-EINVAL),
+    };
+    println!("aios: {}", if fid == PSCI_SYSTEM_OFF { "power off" } else { "restart" });
+    unsafe { core::arch::asm!("hvc #0", in("x0") fid, options(nostack)) };
+    // PSCI が無ければ止まる
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
 }

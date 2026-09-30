@@ -1,0 +1,10 @@
+[Unit]
+Description=Show the message of the day
+
+[Service]
+Type=oneshot
+ExecStart=/bin/cat /etc/motd
+StandardInput=tty
+
+[Install]
+WantedBy=multi-user.target

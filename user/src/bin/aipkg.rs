@@ -523,6 +523,8 @@ fn info(d: &Desc, repo: Option<&str>) {
 }
 
 fn main() {
+    // 読み手のいないパイプに書いたら、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(op) = args.first().filter(|a| a.starts_with('-') && !a.starts_with("--")) else {
         eprintln!("usage: aipkg -S|-Sy|-Syu|-Ss|-Si|-U|-R|-Q|-Qi|-Ql [targets]");
