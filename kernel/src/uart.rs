@@ -24,11 +24,12 @@ pub fn init() {
 /// 受信した文字をすべてコンソールへ渡す
 pub fn intr() {
     unsafe {
+        // 先に下げてから読む (読んだ後に下げると、その間に来た文字の割り込みを消してしまう)
+        write_volatile(ICR, INT_RX | INT_RT);
         while read_volatile(FR) & FR_RXFE == 0 {
             let c = read_volatile(DR) as u8;
             crate::console::intr(c);
         }
-        write_volatile(ICR, INT_RX | INT_RT);
     }
 }
 

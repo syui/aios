@@ -6,27 +6,117 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::RefCell;
+use crate::memlayout::PGSIZE;
+
+/// ファイルの中身をページ (4KiB) の並びで持つ。書いていないところ (None) は 0
+pub struct Pages {
+    pages: Vec<Option<*mut u8>>,
+    len: usize,
+}
+
+impl Pages {
+    const fn new() -> Self {
+        Pages { pages: Vec::new(), len: 0 }
+    }
+
+    fn read(&self, off: usize, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.len.saturating_sub(off));
+        let mut done = 0;
+        while done < n {
+            let pos = off + done;
+            let (pi, po) = (pos / PGSIZE, pos % PGSIZE);
+            let k = (PGSIZE - po).min(n - done);
+            match self.pages.get(pi).copied().flatten() {
+                Some(p) => unsafe { core::ptr::copy_nonoverlapping(p.add(po), buf[done..].as_mut_ptr(), k) },
+                None => buf[done..done + k].fill(0),
+            }
+            done += k;
+        }
+        n
+    }
+
+    fn write(&mut self, off: usize, buf: &[u8]) -> Result<(), i64> {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = off + done;
+            let (pi, po) = (pos / PGSIZE, pos % PGSIZE);
+            let k = (PGSIZE - po).min(buf.len() - done);
+            if self.pages.len() <= pi {
+                self.pages.resize(pi + 1, None);
+            }
+            let p = match self.pages[pi] {
+                Some(p) => p,
+                None => {
+                    let p = crate::kalloc::alloc().ok_or(-ENOSPC)?;
+                    self.pages[pi] = Some(p);
+                    p
+                }
+            };
+            unsafe { core::ptr::copy_nonoverlapping(buf[done..].as_ptr(), p.add(po), k) };
+            done += k;
+        }
+        self.len = self.len.max(off + buf.len());
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: usize) {
+        if len < self.len {
+            let keep = len.div_ceil(PGSIZE);
+            for p in self.pages.drain(keep.min(self.pages.len())..).flatten() {
+                crate::kalloc::free(p);
+            }
+            // 残ったページの後ろを 0 に
+            if len % PGSIZE != 0 {
+                if let Some(Some(p)) = self.pages.get(len / PGSIZE) {
+                    unsafe { core::ptr::write_bytes(p.add(len % PGSIZE), 0, PGSIZE - len % PGSIZE) };
+                }
+            }
+        }
+        self.len = len;
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        for p in self.pages.drain(..).flatten() {
+            crate::kalloc::free(p);
+        }
+    }
+}
 
 /// ファイルの中身。initramfs から来たものは書くまでそのまま参照する
 pub enum Data {
     Static(&'static [u8]),
-    Owned(Vec<u8>),
+    Owned(Pages),
 }
 
 impl Data {
-    fn bytes(&self) -> &[u8] {
+    fn len(&self) -> usize {
         match self {
-            Data::Static(b) => b,
-            Data::Owned(v) => v,
+            Data::Static(b) => b.len(),
+            Data::Owned(p) => p.len,
         }
     }
 
-    fn owned(&mut self) -> &mut Vec<u8> {
+    fn read(&self, off: usize, buf: &mut [u8]) -> usize {
+        match self {
+            Data::Static(b) => {
+                let n = buf.len().min(b.len().saturating_sub(off));
+                buf[..n].copy_from_slice(&b[off..off + n]);
+                n
+            }
+            Data::Owned(p) => p.read(off, buf),
+        }
+    }
+
+    fn owned(&mut self) -> Result<&mut Pages, i64> {
         if let Data::Static(b) = self {
-            *self = Data::Owned(b.to_vec());
+            let mut p = Pages::new();
+            p.write(0, b)?;
+            *self = Data::Owned(p);
         }
         match self {
-            Data::Owned(v) => v,
+            Data::Owned(p) => Ok(p),
             Data::Static(_) => unreachable!(),
         }
     }
@@ -142,7 +232,7 @@ impl Inode for TmpInode {
     fn meta(&self) -> Meta {
         let a = self.attr.borrow();
         let (size, rdev) = match &*self.node.borrow() {
-            Node::File(d) => (d.bytes().len() as u64, 0),
+            Node::File(d) => (d.len() as u64, 0),
             Node::Symlink(t) => (t.len() as u64, 0),
             Node::Dir(m) => (m.len() as u64, 0),
             Node::Dev(ma, mi) => (0, ((*ma as u64) << 8) | *mi as u64),
@@ -153,12 +243,7 @@ impl Inode for TmpInode {
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
         match &*self.node.borrow() {
-            Node::File(d) => {
-                let data = d.bytes();
-                let n = buf.len().min(data.len().saturating_sub(off));
-                buf[..n].copy_from_slice(&data[off..off + n]);
-                Ok(n)
-            }
+            Node::File(d) => Ok(d.read(off, buf)),
             Node::Dir(_) => Err(-EISDIR),
             _ => Err(-EINVAL),
         }
@@ -166,13 +251,7 @@ impl Inode for TmpInode {
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
         match &mut *self.node.borrow_mut() {
-            Node::File(d) => {
-                let v = d.owned();
-                if v.len() < off + buf.len() {
-                    v.resize(off + buf.len(), 0);
-                }
-                v[off..off + buf.len()].copy_from_slice(buf);
-            }
+            Node::File(d) => d.owned()?.write(off, buf)?,
             Node::Dir(_) => return Err(-EISDIR),
             _ => return Err(-EINVAL),
         }
@@ -182,7 +261,7 @@ impl Inode for TmpInode {
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
         match &mut *self.node.borrow_mut() {
-            Node::File(d) => d.owned().resize(len, 0),
+            Node::File(d) => d.owned()?.truncate(len),
             Node::Dir(_) => return Err(-EISDIR),
             _ => return Err(-EINVAL),
         }
@@ -212,7 +291,7 @@ impl Inode for TmpInode {
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
         let mode = node.type_bits() | (mode & 0o7777);
         let node = match node {
-            NewNode::File => Node::File(Data::Owned(Vec::new())),
+            NewNode::File => Node::File(Data::Owned(Pages::new())),
             NewNode::Dir => Node::Dir(BTreeMap::new()),
             NewNode::Symlink(t) => Node::Symlink(t),
             NewNode::Dev(ma, mi) => Node::Dev(ma, mi),

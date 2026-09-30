@@ -41,7 +41,10 @@ const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
 const FD_CLOEXEC: u64 = 1;
 
+const O_NONBLOCK: u32 = 0o4000;
+
 const TCGETS: u64 = 0x5401;
+const FIONBIO: u64 = 0x5421;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCGPGRP: u64 = 0x540f;
 
@@ -462,13 +465,29 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         }
         F_GETFL => Ok(entry.file.borrow().flags as i64),
         F_SETFL => {
-            // 変えられるのは O_APPEND などの状態フラグだけ
+            // 変えられるのは O_APPEND と O_NONBLOCK だけ
             let mut f = entry.file.borrow_mut();
-            f.flags = (f.flags & file::O_ACCMODE) | (arg as u32 & !file::O_ACCMODE & file::O_APPEND);
+            f.flags = (f.flags & !(file::O_APPEND | O_NONBLOCK)) | (arg as u32 & (file::O_APPEND | O_NONBLOCK));
+            if let Kind::Socket(s) = &f.kind {
+                s.borrow_mut().nonblock = arg as u32 & O_NONBLOCK != 0;
+            }
             Ok(0)
         }
-        F_GETPIPE_SZ | F_SETPIPE_SZ => match entry.file.borrow().kind {
-            Kind::PipeRead(_) | Kind::PipeWrite(_) => Ok(file::PIPE_SIZE as i64),
+        F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
+            Kind::PipeRead(p) | Kind::PipeWrite(p) => {
+                let mut p = p.borrow_mut();
+                if cmd == F_SETPIPE_SZ {
+                    let want = (arg as usize).clamp(4096, usize::MAX).next_power_of_two();
+                    if want > file::PIPE_MAX {
+                        return Err(-1); // EPERM
+                    }
+                    if want < p.len() {
+                        return Err(-16); // EBUSY
+                    }
+                    p.cap = want;
+                }
+                Ok(p.cap as i64)
+            }
             _ => Err(-EBADF),
         },
         _ => Err(-EINVAL),
@@ -497,6 +516,12 @@ pub fn pipe2(fds: usize, flags: u64) -> R {
 
 pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     let f = file_of(fd)?;
+    if let (FIONBIO, Kind::Socket(s)) = (req, &f.borrow().kind) {
+        let mut v = [0u8; 4];
+        proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
+        s.borrow_mut().nonblock = u32::from_le_bytes(v) != 0;
+        return Ok(0);
+    }
     if !matches!(f.borrow().kind, Kind::Console) {
         return Err(-ENOTTY);
     }
@@ -555,3 +580,129 @@ pub fn fchdir(fd: u64) -> R {
     Ok(0)
 }
 
+
+const POLLIN: i16 = 0x1;
+const POLLOUT: i16 = 0x4;
+const POLLERR: i16 = 0x8;
+const POLLHUP: i16 = 0x10;
+const POLLNVAL: i16 = 0x20;
+
+/// ppoll(fds, nfds, timeout) (シグナルマスクは無視)
+pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
+    if nfds > proc::NOFILE {
+        return Err(-EINVAL);
+    }
+    let mut raw = vec![0u8; nfds * 8];
+    proc::current().pt().copy_in(&mut raw, fds).ok_or(-EFAULT)?;
+    let deadline = if tmo == 0 {
+        None
+    } else {
+        let mut ts = [0u8; 16];
+        proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
+        let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
+        Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
+    };
+    loop {
+        let mut count = 0;
+        for i in 0..nfds {
+            let e = &mut raw[i * 8..i * 8 + 8];
+            let fd = i32::from_le_bytes(e[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(e[4..6].try_into().unwrap());
+            let mut rev = 0i16;
+            if fd >= 0 {
+                match proc::current().files().get(fd as u64) {
+                    None => rev = POLLNVAL,
+                    Some(f) => {
+                        let (r, w, hup) = f.borrow().readiness();
+                        if r {
+                            rev |= events & POLLIN;
+                        }
+                        if w {
+                            rev |= events & POLLOUT;
+                        }
+                        if hup {
+                            rev |= POLLHUP | (events & POLLOUT != 0).then_some(POLLERR).unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            e[6..8].copy_from_slice(&rev.to_le_bytes());
+            if rev != 0 {
+                count += 1;
+            }
+        }
+        let expired = deadline.is_some_and(|d| crate::timer::ticks() >= d);
+        if count > 0 || expired {
+            out(fds, &raw)?;
+            return Ok(count);
+        }
+        proc::sleep_until(proc::poll_chan(), deadline.unwrap_or(0))?;
+    }
+}
+
+fn pipe_of(fd: u64) -> Option<alloc::rc::Rc<core::cell::RefCell<Pipe>>> {
+    let f = file_of(fd).ok()?;
+    let f = f.borrow();
+    match &f.kind {
+        Kind::PipeRead(p) | Kind::PipeWrite(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+const SPLICE_F_NONBLOCK: u64 = 2;
+
+/// splice: in から out へ len まで移す (中身はいったんカーネルでコピーする)
+pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> R {
+    if pipe_of(fd_in).is_none() && pipe_of(fd_out).is_none() {
+        return Err(-EINVAL);
+    }
+    let mut tmp = vec![0u8; len.min(64 * 1024)];
+    let n = match (pipe_of(fd_in), off_in) {
+        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, false, flags & SPLICE_F_NONBLOCK != 0)?,
+        (None, 0) => file_of(fd_in)?.borrow_mut().read(&mut tmp)?,
+        (None, at) => {
+            let off = read_off(at)?;
+            let n = inode_of(fd_in)?.read_at(off as usize, &mut tmp)?;
+            out(at, &(off + n as i64).to_le_bytes())?;
+            n
+        }
+    };
+    if n == 0 {
+        return Ok(0);
+    }
+    if off_out != 0 {
+        let off = read_off(off_out)?;
+        inode_of(fd_out)?.write_at(off as usize, &tmp[..n])?;
+        out(off_out, &(off + n as i64).to_le_bytes())?;
+        return Ok(n as i64);
+    }
+    let f = file_of(fd_out)?;
+    let mut done = 0;
+    while done < n {
+        done += f.borrow_mut().write(&tmp[done..n])?;
+    }
+    Ok(n as i64)
+}
+
+fn read_off(va: usize) -> Result<i64, i64> {
+    let mut b = [0u8; 8];
+    proc::current().pt().copy_in(&mut b, va).ok_or(-EFAULT)?;
+    Ok(i64::from_le_bytes(b))
+}
+
+/// tee: パイプの中身を読み減らさずに、別のパイプへ写す
+pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
+    let (Some(pin), Some(pout)) = (pipe_of(fd_in), pipe_of(fd_out)) else { return Err(-EINVAL) };
+    let room = {
+        let o = pout.borrow();
+        o.cap.saturating_sub(o.len())
+    };
+    let mut tmp = vec![0u8; len.min(room).min(64 * 1024)];
+    if tmp.is_empty() {
+        return Err(-11); // EAGAIN
+    }
+    let n = Pipe::read_ex(&pin, &mut tmp, true, flags & SPLICE_F_NONBLOCK != 0)?;
+    let f = file_of(fd_out)?;
+    let w = f.borrow_mut().write(&tmp[..n])?;
+    Ok(w as i64)
+}

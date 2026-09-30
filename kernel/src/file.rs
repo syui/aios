@@ -1,5 +1,6 @@
 // 開いたファイル (fd の向こう側)
 use crate::console;
+use crate::memlayout::PGSIZE;
 use crate::vfs::{self, InodeRef, S_IFMT};
 use crate::proc;
 use alloc::rc::Rc;
@@ -29,6 +30,7 @@ pub enum Kind {
     Inode(InodeRef, String),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
+    Socket(crate::socket::SockRef),
 }
 
 impl Kind {
@@ -146,6 +148,7 @@ impl OpenFile {
             }
             Kind::PipeRead(p) => Pipe::read(p, dst),
             Kind::PipeWrite(_) => Err(-EBADF),
+            Kind::Socket(s) => s.borrow_mut().read(dst),
         }
     }
 
@@ -169,6 +172,7 @@ impl OpenFile {
             }
             Kind::PipeWrite(p) => Pipe::write(p, src),
             Kind::PipeRead(_) => Err(-EBADF),
+            Kind::Socket(s) => s.borrow_mut().write(src),
         }
     }
 
@@ -180,6 +184,24 @@ impl OpenFile {
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::dev(S_IFIFO | 0o600, 0),
+            Kind::Socket(_) => Stat::dev(0o140000 | 0o777, 0),
+        }
+    }
+
+    /// poll 用: (読める, 書ける, 閉じた/エラー)
+    pub fn readiness(&self) -> (bool, bool, bool) {
+        match &self.kind {
+            Kind::Console => (console::ready(), true, false),
+            Kind::PipeRead(p) => {
+                let p = p.borrow();
+                (p.len() > 0 || p.writers == 0, false, p.writers == 0 && p.len() == 0)
+            }
+            Kind::PipeWrite(p) => {
+                let p = p.borrow();
+                (false, p.len() < p.cap, p.readers == 0)
+            }
+            Kind::Socket(s) => s.borrow().readiness(),
+            _ => (true, true, false),
         }
     }
 
@@ -261,58 +283,132 @@ impl Drop for OpenFile {
             Kind::PipeRead(p) => {
                 p.borrow_mut().readers -= 1;
                 proc::wakeup(Rc::as_ptr(p) as usize);
+                proc::wakeup(proc::poll_chan());
             }
             Kind::PipeWrite(p) => {
                 p.borrow_mut().writers -= 1;
                 proc::wakeup(Rc::as_ptr(p) as usize);
+                proc::wakeup(proc::poll_chan());
             }
             _ => {}
         }
     }
 }
 
-pub const PIPE_SIZE: usize = 4096;
+/// パイプの大きさ (Linux と同じ既定値と、F_SETPIPE_SZ で広げられる上限)
+pub const PIPE_SIZE: usize = 64 * 1024;
+pub const PIPE_MAX: usize = 1024 * 1024;
+
+/// ページ (4KiB) をつないだ FIFO
+struct PageQueue {
+    /// (ページ, 読むところ, 書いたところ)
+    pages: alloc::collections::VecDeque<(*mut u8, usize, usize)>,
+    len: usize,
+}
+
+impl PageQueue {
+    fn push(&mut self, src: &[u8]) -> Result<(), i64> {
+        let mut done = 0;
+        while done < src.len() {
+            let need_new = self.pages.back().is_none_or(|p| p.2 == PGSIZE);
+            if need_new {
+                let p = crate::kalloc::alloc().ok_or(-12i64)?; // ENOMEM
+                self.pages.push_back((p, 0, 0));
+            }
+            let last = self.pages.back_mut().unwrap();
+            let k = (PGSIZE - last.2).min(src.len() - done);
+            unsafe { core::ptr::copy_nonoverlapping(src[done..].as_ptr(), last.0.add(last.2), k) };
+            last.2 += k;
+            done += k;
+        }
+        self.len += src.len();
+        Ok(())
+    }
+
+    /// 先頭から読む。consume なら取り除く
+    fn pop(&mut self, dst: &mut [u8], consume: bool) -> usize {
+        let mut done = 0;
+        let mut i = 0;
+        while done < dst.len() && i < self.pages.len() {
+            let (p, r, w) = self.pages[i];
+            let k = (w - r).min(dst.len() - done);
+            unsafe { core::ptr::copy_nonoverlapping(p.add(r), dst[done..].as_mut_ptr(), k) };
+            done += k;
+            if consume {
+                self.pages[i].1 += k;
+                if self.pages[i].1 == PGSIZE {
+                    crate::kalloc::free(p);
+                    self.pages.pop_front();
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if consume {
+            self.len -= done;
+        }
+        done
+    }
+}
+
+impl Drop for PageQueue {
+    fn drop(&mut self) {
+        for (p, _, _) in self.pages.drain(..) {
+            crate::kalloc::free(p);
+        }
+    }
+}
 
 pub struct Pipe {
-    buf: [u8; PIPE_SIZE],
-    r: usize,
-    w: usize,
+    data: PageQueue,
+    pub cap: usize,
     readers: usize,
     writers: usize,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
-        let p = Rc::new(RefCell::new(Pipe { buf: [0; PIPE_SIZE], r: 0, w: 0, readers: 1, writers: 1 }));
+        let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1 }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
-    fn read(p: &Rc<RefCell<Pipe>>, dst: &mut [u8]) -> Result<usize, i64> {
-        let chan = Rc::as_ptr(p) as usize;
+    pub fn len(&self) -> usize {
+        self.data.len
+    }
+
+    fn wake(p: &Rc<RefCell<Pipe>>) {
+        proc::wakeup(Rc::as_ptr(p) as usize);
+        proc::wakeup(proc::poll_chan());
+    }
+
+    /// 読む。peek なら取り除かない (tee 用)
+    pub fn read_ex(p: &Rc<RefCell<Pipe>>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
         loop {
             {
                 let mut pp = p.borrow_mut();
-                if pp.r != pp.w {
-                    let mut n = 0;
-                    while n < dst.len() && pp.r != pp.w {
-                        dst[n] = pp.buf[pp.r % PIPE_SIZE];
-                        pp.r += 1;
-                        n += 1;
-                    }
+                if pp.data.len > 0 {
+                    let n = pp.data.pop(dst, !peek);
                     drop(pp);
-                    proc::wakeup(chan);
+                    Pipe::wake(p);
                     return Ok(n);
                 }
                 if pp.writers == 0 {
                     return Ok(0);
                 }
             }
-            proc::sleep(chan)?;
+            if nonblock {
+                return Err(-11); // EAGAIN
+            }
+            proc::sleep(Rc::as_ptr(p) as usize)?;
         }
     }
 
+    fn read(p: &Rc<RefCell<Pipe>>, dst: &mut [u8]) -> Result<usize, i64> {
+        Pipe::read_ex(p, dst, false, false)
+    }
+
     fn write(p: &Rc<RefCell<Pipe>>, src: &[u8]) -> Result<usize, i64> {
-        let chan = Rc::as_ptr(p) as usize;
         let mut done = 0;
         while done < src.len() {
             {
@@ -320,16 +416,16 @@ impl Pipe {
                 if pp.readers == 0 {
                     return if done > 0 { Ok(done) } else { Err(-EPIPE) };
                 }
-                while done < src.len() && pp.w - pp.r < PIPE_SIZE {
-                    let w = pp.w;
-                    pp.buf[w % PIPE_SIZE] = src[done];
-                    pp.w += 1;
-                    done += 1;
+                let room = pp.cap.saturating_sub(pp.data.len);
+                let k = room.min(src.len() - done);
+                if k > 0 {
+                    pp.data.push(&src[done..done + k])?;
+                    done += k;
                 }
             }
-            proc::wakeup(chan);
+            Pipe::wake(p);
             if done < src.len() {
-                if let Err(e) = proc::sleep(chan) {
+                if let Err(e) = proc::sleep(Rc::as_ptr(p) as usize) {
                     return if done > 0 { Ok(done) } else { Err(e) };
                 }
             }
@@ -337,4 +433,3 @@ impl Pipe {
         Ok(done)
     }
 }
-

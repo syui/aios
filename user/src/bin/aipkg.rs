@@ -9,6 +9,11 @@
 //   aipkg -Q / -Qi / -Ql [pkg]  入っているもの / 情報 / ファイル一覧
 //
 // 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)
+#[path = "../lib/http.rs"]
+mod http;
+#[path = "../lib/tls.rs"]
+mod tls;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -198,7 +203,7 @@ fn fetch(url: &str) -> io::Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
         return fs::read(path);
     }
-    Err(io::Error::other(format!("{}: only file:// is supported for now (no network yet)", url)))
+    http::get(url, Some(tls::connect))
 }
 
 fn fetch_any(servers: &[String], file: &str) -> io::Result<Vec<u8>> {

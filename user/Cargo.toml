@@ -25,9 +25,16 @@ path = "src/bin/sh.rs"
 name = "aipkg"
 path = "src/bin/aipkg.rs"
 
+[[bin]]
+name = "fetch"
+path = "src/bin/fetch.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sha2 = { version = "0.10", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+
