@@ -1,33 +1,50 @@
-// PL011 UART (qemu virt: PA 0x0900_0000)
-use crate::memlayout::UART0 as BASE;
+// PL011 UART。場所と割り込みは DTB から (なければ qemu virt の PA 0x0900_0000, SPI 1)
 use crate::spinlock::SpinLock;
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 
-const DR: *mut u32 = BASE as *mut u32;
-const FR: *const u32 = (BASE + 0x18) as *const u32;
-const IMSC: *mut u32 = (BASE + 0x38) as *mut u32;
-const ICR: *mut u32 = (BASE + 0x44) as *mut u32;
+const DR: usize = 0x00;
+const FR: usize = 0x18;
+const IMSC: usize = 0x38;
+const ICR: usize = 0x44;
 const FR_RXFE: u32 = 1 << 4;
 const FR_TXFF: u32 = 1 << 5;
 const INT_RX: u32 = 1 << 4;
 const INT_RT: u32 = 1 << 6;
 
-/// PL011 は SPI 1
-pub const IRQ: u32 = 33;
+static mut BASE: usize = 0;
+static mut IRQ: u32 = 33;
 
+fn reg(off: usize) -> *mut u32 {
+    unsafe { (BASE + off) as *mut u32 }
+}
+
+/// 何よりも先に (dtb::init のすぐ後): 出力の場所を決める
+pub fn early_init() {
+    let pa = crate::dtb::reg_of("arm,pl011", 0).map_or(0x0900_0000, |(a, _)| a as usize);
+    unsafe { BASE = crate::memlayout::p2v(pa) };
+}
+
+pub fn irq() -> u32 {
+    unsafe { IRQ }
+}
+
+/// 受信の割り込みを有効にする (irq::init の後)
 pub fn init() {
-    unsafe { write_volatile(IMSC, INT_RX | INT_RT) };
-    crate::gic::enable(IRQ);
+    if let Some(i) = crate::irq::from_dt("arm,pl011") {
+        unsafe { IRQ = i };
+    }
+    unsafe { write_volatile(reg(IMSC), INT_RX | INT_RT) };
+    crate::irq::enable(irq());
 }
 
 /// 受信した文字をすべてコンソールへ渡す
 pub fn intr() {
     unsafe {
         // 先に下げてから読む (読んだ後に下げると、その間に来た文字の割り込みを消してしまう)
-        write_volatile(ICR, INT_RX | INT_RT);
-        while read_volatile(FR) & FR_RXFE == 0 {
-            let c = read_volatile(DR) as u8;
+        write_volatile(reg(ICR), INT_RX | INT_RT);
+        while read_volatile(reg(FR)) & FR_RXFE == 0 {
+            let c = read_volatile(reg(DR)) as u8;
             crate::console::intr(c);
         }
     }
@@ -35,8 +52,11 @@ pub fn intr() {
 
 pub fn putc(c: u8) {
     unsafe {
-        while read_volatile(FR) & FR_TXFF != 0 {}
-        write_volatile(DR, c as u32);
+        if BASE == 0 {
+            return;
+        }
+        while read_volatile(reg(FR)) & FR_TXFF != 0 {}
+        write_volatile(reg(DR), c as u32);
     }
 }
 

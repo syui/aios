@@ -85,7 +85,7 @@ pub fn init() {
     let iface = Interface::new(cfg, &mut dev, now());
     let mut sockets = SocketSet::new(Vec::new());
     let dhcp = sockets.add(dhcpv4::Socket::new());
-    crate::gic::enable(dev.mmio.irq);
+    crate::irq::enable(dev.mmio.irq);
     println!("net: {} (dhcp)", mac);
     unsafe { *(&raw mut NET) = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp, lease: None }) };
     poll();

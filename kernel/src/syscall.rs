@@ -17,6 +17,7 @@ const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
+const EBADF: i64 = 9;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 const ENODATA: i64 = 61;
@@ -342,7 +343,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
 
         BRK => Ok(sys_brk(a[0] as usize)),
-        MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], int(a[4])),
+        MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[2], a[3], int(a[4]), a[5] as usize),
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
         MPROTECT | MADVISE => Ok(0),
         MREMAP => Err(-ENOMEM), // musl は自分で確保しなおす
@@ -415,10 +416,10 @@ fn sys_uname(buf: usize) -> R {
 }
 
 fn sys_sysinfo(buf: usize) -> R {
-    use crate::memlayout::{phystop, PGSIZE, PHYSBASE};
+    use crate::memlayout::{ram_size, PGSIZE};
     let mut b = [0u8; 112];
     b[0..8].copy_from_slice(&(timer::uptime_ns() / 1_000_000_000).to_le_bytes());
-    b[32..40].copy_from_slice(&((phystop() - PHYSBASE) as u64).to_le_bytes());
+    b[32..40].copy_from_slice(&(ram_size() as u64).to_le_bytes());
     b[40..48].copy_from_slice(&((crate::kalloc::nfree() * PGSIZE) as u64).to_le_bytes());
     b[80..82].copy_from_slice(&(proc::nprocs() as u16).to_le_bytes());
     b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
@@ -474,13 +475,32 @@ fn sys_brk(addr: usize) -> i64 {
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 
-fn sys_mmap(addr: usize, len: usize, flags: u64, fd: i64) -> R {
-    if len == 0 {
+/// mmap。無名のメモリと、ファイルの写し (MAP_PRIVATE、または書かない MAP_SHARED):
+/// ファイルの中身をその時に読んで新しいページに入れる (書き戻しはしない)
+fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize) -> R {
+    const MAP_SHARED: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const EACCES: i64 = 13;
+    if len == 0 || off % 4096 != 0 {
         return Err(-EINVAL);
     }
-    if flags & MAP_ANONYMOUS == 0 || fd != -1 {
-        return Err(-ENODEV);
-    }
+    // ファイルを写すなら、その inode
+    let file = if flags & MAP_ANONYMOUS == 0 {
+        if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
+            return Err(-ENODEV); // 書き戻す共有の写像はまだない
+        }
+        let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
+        let f = f.borrow();
+        if f.flags & crate::file::O_ACCMODE == crate::file::O_WRONLY {
+            return Err(-EACCES);
+        }
+        match &f.kind {
+            crate::file::Kind::Inode(ino, _) if !ino.meta().is_dir() => Some(ino.clone()),
+            _ => return Err(-ENODEV),
+        }
+    } else {
+        None
+    };
     let m = proc::current().mm();
     let len = pg_up(len);
     let va = if flags & MAP_FIXED != 0 {
@@ -498,6 +518,20 @@ fn sys_mmap(addr: usize, len: usize, flags: u64, fd: i64) -> R {
     if m.pt.alloc_range(va, va + len, Perm::RW).is_none() {
         m.pt.unmap_range(va, va + len);
         return Err(-ENOMEM);
+    }
+    if let Some(ino) = file {
+        let size = ino.meta().size as usize;
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let mut done = 0;
+        while done < len && off + done < size {
+            let want = buf.len().min(len - done).min(size - off - done);
+            let n = ino.read_at(off + done, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            m.pt.copy_out(va + done, &buf[..n]).ok_or(-EFAULT)?;
+            done += n;
+        }
     }
     Ok(va as i64)
 }
@@ -766,7 +800,7 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
     Ok(0)
 }
 
-/// 電源を切る / 再起動する (PSCI を hvc で呼ぶ)
+/// 電源を切る / 再起動する (PSCI)
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     if proc::current().cred.euid != 0 {
         return Err(-(cred::EPERM));
@@ -787,7 +821,12 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
         _ => return Err(-EINVAL),
     };
     println!("aios: {}", if fid == PSCI_SYSTEM_OFF { "power off" } else { "restart" });
-    unsafe { core::arch::asm!("hvc #0", in("x0") fid, options(nostack)) };
+    // PSCI の呼び方は DTB の /psci の method (DTB がなければ qemu virt の hvc)。無ければ止まるだけ
+    match crate::dtb::psci_method() {
+        Some("hvc") => unsafe { core::arch::asm!("hvc #0", in("x0") fid, options(nostack)) },
+        Some("smc") => unsafe { core::arch::asm!("smc #0", in("x0") fid, options(nostack)) },
+        _ => println!("aios: no PSCI; halted"),
+    }
     // PSCI が無ければ止まる
     loop {
         unsafe { core::arch::asm!("wfi") };

@@ -16,6 +16,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AIOS_RELEASE");
     let release = std::env::var("AIOS_RELEASE").unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
     println!("cargo:rustc-env=AIOS_RELEASE={}", release);
+    // RTC のない機械 (ラズパイ) の時計の始まり
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").ok().unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string()
+    });
+    println!("cargo:rustc-env=AIOS_BUILD_EPOCH={}", epoch);
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     let initrd = std::env::var("AIOS_INITRD").ok();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("initrd.cpio");

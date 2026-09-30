@@ -1,5 +1,5 @@
 // 例外ベクタ (VBAR_EL1) とトラップ処理
-use crate::{gic, proc, signal, syscall, timer};
+use crate::{irq, proc, signal, syscall, timer};
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -183,15 +183,15 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             }
         }
         EL1H_IRQ | EL0_IRQ => {
-            let id = gic::claim();
+            let id = irq::claim();
             match id {
                 timer::IRQ => timer::tick(),
-                crate::uart::IRQ => crate::uart::intr(),
-                gic::SPURIOUS => return,
+                id if id == crate::uart::irq() => crate::uart::intr(),
+                irq::SPURIOUS => return,
                 id if Some(id) == crate::net::irq() => crate::net::intr(),
                 _ => println!("irq: unexpected {}", id),
             }
-            gic::complete(id);
+            irq::complete(id);
             // EL0 で走っていたなら順番をゆずる
             if kind == EL0_IRQ {
                 if id == timer::IRQ {
