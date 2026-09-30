@@ -5,6 +5,9 @@ mod boot;
 #[macro_use]
 mod uart;
 mod gic;
+mod kalloc;
+mod memlayout;
+mod spinlock;
 mod timer;
 mod trap;
 
@@ -23,6 +26,9 @@ pub extern "C" fn kmain() -> ! {
     println!("hello from EL{}", current_el());
 
     trap::init();
+    kalloc::init();
+    println!("kalloc: {} pages free", kalloc::nfree());
+
     unsafe { core::arch::asm!("brk #1") };
 
     gic::init();

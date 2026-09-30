@@ -1,8 +1,6 @@
-// GICv2 (qemu virt: distributor 0x0800_0000, cpu interface 0x0801_0000)
+// GICv2 (qemu virt: distributor PA 0x0800_0000, cpu interface PA 0x0801_0000)
+use crate::memlayout::{GICC, GICD};
 use core::ptr::{read_volatile, write_volatile};
-
-const GICD: usize = 0x0800_0000;
-const GICC: usize = 0x0801_0000;
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
