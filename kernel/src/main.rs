@@ -7,9 +7,12 @@ mod uart;
 mod gic;
 mod kalloc;
 mod memlayout;
+mod proc;
 mod spinlock;
+mod syscall;
 mod timer;
 mod trap;
+mod vm;
 
 use core::panic::PanicInfo;
 
@@ -29,15 +32,10 @@ pub extern "C" fn kmain() -> ! {
     kalloc::init();
     println!("kalloc: {} pages free", kalloc::nfree());
 
-    unsafe { core::arch::asm!("brk #1") };
-
     gic::init();
     timer::init();
-    trap::intr_on();
 
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    proc::user_init()
 }
 
 fn halt() -> ! {

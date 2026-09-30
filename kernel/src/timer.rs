@@ -26,10 +26,6 @@ pub fn init() {
 
 pub fn tick() {
     // 割り込み中の cpu0 だけが書く
-    let t = TICKS.load(Ordering::Relaxed) + 1;
-    TICKS.store(t, Ordering::Relaxed);
-    if t % HZ == 0 {
-        println!("uptime {}s", t / HZ);
-    }
+    TICKS.store(TICKS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     rearm();
 }

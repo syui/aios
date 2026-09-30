@@ -1,12 +1,18 @@
 // 例外ベクタ (VBAR_EL1) とトラップ処理
-use crate::{gic, timer};
+use crate::{gic, proc, syscall, timer};
 
 #[repr(C)]
 pub struct TrapFrame {
     pub x: [u64; 31],
     pub elr: u64,
     pub spsr: u64,
-    _pad: u64,
+    pub sp_el0: u64,
+}
+
+impl TrapFrame {
+    pub const fn zeroed() -> Self {
+        Self { x: [0; 31], elr: 0, spsr: 0, sp_el0: 0 }
+    }
 }
 
 core::arch::global_asm!(
@@ -58,13 +64,17 @@ trap_common:
     mrs     x2, elr_el1
     stp     x30, x2, [sp, #240]
     mrs     x2, spsr_el1
-    str     x2, [sp, #256]
+    mrs     x3, sp_el0
+    stp     x2, x3, [sp, #256]
 
     mov     x0, sp
     bl      trap_handler
 
-    ldr     x2, [sp, #256]
+.global trap_ret
+trap_ret:
+    ldp     x2, x3, [sp, #256]
     msr     spsr_el1, x2
+    msr     sp_el0, x3
     ldp     x30, x2, [sp, #240]
     msr     elr_el1, x2
     ldp     x2, x3, [sp, #16]
@@ -90,7 +100,12 @@ trap_common:
 // ベクタの並び: [EL1t, EL1h, EL0 64bit, EL0 32bit] x [sync, irq, fiq, serror]
 const EL1H_SYNC: u64 = 4;
 const EL1H_IRQ: u64 = 5;
+const EL0_SYNC: u64 = 8;
+const EL0_IRQ: u64 = 9;
 
+const EC_SVC64: u64 = 0x15;
+const EC_IABT_LOW: u64 = 0x20;
+const EC_DABT_LOW: u64 = 0x24;
 const EC_BRK64: u64 = 0x3c;
 
 pub fn init() {
@@ -106,6 +121,28 @@ pub fn init() {
     }
 }
 
+/// tf を復元して eret する (EL0 へ入るときに使う)
+pub fn user_return(tf: &mut TrapFrame) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {}",
+            "b trap_ret",
+            in(reg) tf as *mut TrapFrame,
+            options(noreturn),
+        )
+    }
+}
+
+fn esr_far() -> (u64, u64) {
+    let esr: u64;
+    let far: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
+        core::arch::asm!("mrs {}, far_el1", out(reg) far);
+    }
+    (esr, far)
+}
+
 pub fn intr_on() {
     unsafe { core::arch::asm!("msr daifclr, #2") };
 }
@@ -114,12 +151,7 @@ pub fn intr_on() {
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     match kind {
         EL1H_SYNC => {
-            let esr: u64;
-            let far: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
-                core::arch::asm!("mrs {}, far_el1", out(reg) far);
-            }
+            let (esr, far) = esr_far();
             let ec = esr >> 26;
             if ec == EC_BRK64 {
                 println!("trap: brk #{} at {:#x}", esr & 0xffff, tf.elr);
@@ -131,7 +163,24 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                 esr, ec, tf.elr, far
             );
         }
-        EL1H_IRQ => {
+        EL0_SYNC => {
+            let (esr, far) = esr_far();
+            match esr >> 26 {
+                EC_SVC64 => {
+                    intr_on();
+                    syscall::dispatch(tf);
+                }
+                ec @ (EC_IABT_LOW | EC_DABT_LOW) => {
+                    println!("user fault: ec={:#x} elr={:#x} far={:#x}", ec, tf.elr, far);
+                    proc::exit(-1);
+                }
+                ec => {
+                    println!("user exception: esr={:#x} (ec={:#x}) elr={:#x}", esr, ec, tf.elr);
+                    proc::exit(-1);
+                }
+            }
+        }
+        EL1H_IRQ | EL0_IRQ => {
             let id = gic::claim();
             match id {
                 timer::IRQ => timer::tick(),
