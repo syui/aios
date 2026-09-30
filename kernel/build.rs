@@ -1,4 +1,7 @@
 // kernel.ld を渡し、ワークスペース直下の rootfs/ を initramfs (cpio newc) に固める
+//   AIOS_INITRD=none   initramfs を空にする (パッケージのカーネル。ルートはディスク)
+//   AIOS_INITRD=DIR    DIR を initramfs にする
+//   AIOS_RELEASE=VER   uname -r に出す版 (なければ Cargo の版)
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -9,12 +12,20 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", dir.join("kernel.ld").display());
     println!("cargo:rerun-if-changed=kernel.ld");
 
-    let rootfs = dir.join("../rootfs");
-    println!("cargo:rerun-if-changed={}", rootfs.display());
+    println!("cargo:rerun-if-env-changed=AIOS_INITRD");
+    println!("cargo:rerun-if-env-changed=AIOS_RELEASE");
+    let release = std::env::var("AIOS_RELEASE").unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!("cargo:rustc-env=AIOS_RELEASE={}", release);
+
+    let initrd = std::env::var("AIOS_INITRD").ok();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("initrd.cpio");
     let mut cpio = Cpio::default();
-    if rootfs.is_dir() {
-        cpio.add_tree(&rootfs, "");
+    if initrd.as_deref() != Some("none") {
+        let rootfs = initrd.map_or_else(|| dir.join("../rootfs"), PathBuf::from);
+        println!("cargo:rerun-if-changed={}", rootfs.display());
+        if rootfs.is_dir() {
+            cpio.add_tree(&rootfs, "");
+        }
     }
     fs::write(out, cpio.finish()).unwrap();
 }
