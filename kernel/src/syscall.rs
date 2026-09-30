@@ -46,6 +46,11 @@ mod nr {
     pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
+    pub const EVENTFD2: u64 = 19;
+    pub const EPOLL_CREATE1: u64 = 20;
+    pub const EPOLL_CTL: u64 = 21;
+    pub const EPOLL_PWAIT: u64 = 22;
+    pub const EPOLL_PWAIT2: u64 = 441;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
     pub const FCHDIR: u64 = 50;
@@ -159,6 +164,9 @@ mod nr {
     pub const MADVISE: u64 = 233;
     pub const ACCEPT4: u64 = 242;
     pub const WAIT4: u64 = 260;
+    pub const WAITID: u64 = 95;
+    pub const PIDFD_SEND_SIGNAL: u64 = 424;
+    pub const PIDFD_OPEN: u64 = 434;
     pub const PRLIMIT64: u64 = 261;
     pub const RENAMEAT2: u64 = 276;
     pub const COPY_FILE_RANGE: u64 = 285;
@@ -187,6 +195,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
+        EVENTFD2 => crate::epoll::eventfd2(a[0], a[1]),
+        EPOLL_CREATE1 => crate::epoll::create1(a[0]),
+        EPOLL_CTL => crate::epoll::ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
+        EPOLL_PWAIT => crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ticks(int(a[3]))),
+        EPOLL_PWAIT2 => crate::epoll::pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize),
         // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
@@ -255,6 +268,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
+        WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
+        PIDFD_OPEN => sys_pidfd_open(int(a[0]), a[1]),
+        PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
         KILL => signal::kill(int(a[0]), a[1] as i32),
         TKILL => signal::tgkill(0, a[0] as u32, a[1] as i32),
         TGKILL => signal::tgkill(a[0] as u32, a[1] as u32, a[2] as i32),
@@ -334,7 +350,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
-    let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
+    let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
     (r == Err(-EINTR_)).then_some(Restart { restartable })
 }
 
@@ -614,11 +630,96 @@ fn sys_execve(path: usize, argv: usize, envp: usize) -> R {
 }
 
 fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
-    let (pid, xstatus) = proc::wait(pid, options)?;
+    let (pid, xstatus) = proc::wait(pid, options | proc::WEXITED)?;
     if status != 0 && pid != 0 {
         out(status, &xstatus.to_le_bytes())?;
     }
     Ok(pid as i64)
+}
+
+/// pidfd の番号から pid
+fn pidfd_pid(fd: i64) -> Result<u32, i64> {
+    let f = proc::current().files().get(fd as u64).cloned().ok_or(-9)?;
+    let b = f.borrow();
+    match b.kind {
+        crate::file::Kind::PidFd(pid) => Ok(pid),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// pidfd_open(pid, flags): プロセスを指す fd (終わると読めるようになる)
+fn sys_pidfd_open(pid: i64, flags: u64) -> R {
+    const PIDFD_NONBLOCK: u64 = 0o4000;
+    const ESRCH: i64 = 3;
+    if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
+        return Err(-EINVAL);
+    }
+    if proc::find_leader(pid as u32).is_none() {
+        return Err(-ESRCH);
+    }
+    let fl = crate::file::O_RDWR | if flags & PIDFD_NONBLOCK != 0 { crate::file::O_NONBLOCK } else { 0 };
+    let f = crate::file::new(crate::file::Kind::PidFd(pid as u32), fl);
+    // pidfd はいつも close-on-exec
+    let fd = proc::current().files().add(f, true, 0).ok_or(-24)?;
+    Ok(fd as i64)
+}
+
+fn sys_pidfd_send_signal(fd: i64, sig: i32) -> R {
+    let pid = pidfd_pid(fd)?;
+    if sig == 0 {
+        return if proc::has_exited(pid) { Err(-3) } else { Ok(0) };
+    }
+    signal::send_group(pid, sig, signal::SigInfo::from(0)).map(|_| 0)
+}
+
+/// waitid(idtype, id, siginfo, options, rusage): 結果を siginfo で返す wait
+fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) -> R {
+    const P_ALL: u64 = 0;
+    const P_PID: u64 = 1;
+    const P_PGID: u64 = 2;
+    const P_PIDFD: u64 = 3;
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        return Err(-EINVAL);
+    }
+    let pid = match idtype {
+        P_ALL => -1,
+        P_PID if id > 0 => id,
+        P_PGID => if id == 0 { 0 } else { -id },
+        P_PIDFD => pidfd_pid(id)? as i64,
+        _ => return Err(-EINVAL),
+    };
+    // wait4 の WUNTRACED は WSTOPPED と同じ値
+    let (cpid, st) = proc::wait(pid, options & (WNOHANG | WSTOPPED | WEXITED | WCONTINUED | proc::WNOWAIT))?;
+    if rusage != 0 {
+        out(rusage, &[0u8; 144])?;
+    }
+    if info != 0 {
+        // siginfo_t: signo, errno, code, (詰め物), pid, uid, status
+        let mut b = [0u8; 128];
+        if cpid != 0 {
+            let (code, status) = if st == 0xffff {
+                (signal::CLD_CONTINUED, signal::SIGCONT)
+            } else if st & 0xff == 0x7f {
+                (signal::CLD_STOPPED, (st >> 8) & 0xff)
+            } else if st & 0x7f == 0 {
+                (signal::CLD_EXITED, (st >> 8) & 0xff)
+            } else {
+                (if st & 0x80 != 0 { 3 } else { signal::CLD_KILLED }, st & 0x7f)
+            };
+            let uid = proc::current().cred.uid;
+            b[0..4].copy_from_slice(&signal::SIGCHLD.to_le_bytes());
+            b[8..12].copy_from_slice(&code.to_le_bytes());
+            b[16..20].copy_from_slice(&(cpid as i32).to_le_bytes());
+            b[20..24].copy_from_slice(&uid.to_le_bytes());
+            b[24..28].copy_from_slice(&status.to_le_bytes());
+        }
+        out(info, &b)?;
+    }
+    Ok(0)
 }
 
 /// 電源を切る / 再起動する (PSCI を hvc で呼ぶ)
