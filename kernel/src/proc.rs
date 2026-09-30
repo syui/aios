@@ -634,6 +634,8 @@ fn exit_status(status: i32) -> ! {
     if let Some(init) = find(1) {
         wakeup(init as *mut Proc as usize);
     }
+    // pidfd を poll / epoll しているもの
+    wakeup(poll_chan());
     sched();
     unreachable!("zombie ran");
 }
@@ -800,6 +802,10 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
+/// waitid の WNOWAIT: 知らせるだけで、回収しない (状態もそのまま)
+pub const WNOWAIT: u64 = 0x100_0000;
+/// 終わった子を知らせる (wait4 はいつも。waitid は WEXITED のときだけ)
+pub const WEXITED: u64 = 4;
 
 /// 子の終了 (と WUNTRACED なら停止、WCONTINUED なら再開) を待つ。(pid, status) を返す。
 /// pid: > 0 はその子、0 は同じプロセスグループ、-1 はどれでも、< -1 はグループ -pid
@@ -823,17 +829,25 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 continue;
             }
             have = true;
-            if c.state == State::Zombie {
+            let keep = options & WNOWAIT != 0;
+            if c.state == State::Zombie && options & WEXITED != 0 {
                 let r = (c.pid, c.xstatus);
-                *c = Proc::UNUSED;
+                if !keep {
+                    *c = Proc::UNUSED;
+                }
                 return Ok(r);
             }
             if options & WUNTRACED != 0 && c.stop_report != 0 {
-                let sig = core::mem::take(&mut c.stop_report);
+                let sig = c.stop_report;
+                if !keep {
+                    c.stop_report = 0;
+                }
                 return Ok((c.pid, (sig << 8) | 0x7f));
             }
             if options & WCONTINUED != 0 && c.cont_report {
-                c.cont_report = false;
+                if !keep {
+                    c.cont_report = false;
+                }
                 return Ok((c.pid, 0xffff));
             }
         }
@@ -848,6 +862,11 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
         let leader = find(me.tgid).map_or(me as *mut Proc as usize, |l| l as *mut Proc as usize);
         sleep(leader)?;
     }
+}
+
+/// pidfd: そのプロセスが終わった (ゾンビか、もういない) か
+pub fn has_exited(pid: u32) -> bool {
+    !procs().iter().any(|p| p.pid == pid && !p.thread && p.state != State::Unused && p.state != State::Zombie)
 }
 
 /// 止められたスレッドグループの再開を待つ (SIGCONT か SIGKILL まで)。

@@ -611,9 +611,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
 pub fn pipe2(fds: usize, flags: u64) -> R {
     let (r, w) = Pipe::new();
     let cloexec = flags & O_CLOEXEC != 0;
+    let nb = flags as u32 & O_NONBLOCK;
     let p = proc::current().files();
-    let rfd = p.add(file::new(r, file::O_RDONLY), cloexec, 0).ok_or(-EMFILE)?;
-    let Some(wfd) = p.add(file::new(w, file::O_WRONLY), cloexec, 0) else {
+    let rfd = p.add(file::new(r, file::O_RDONLY | nb), cloexec, 0).ok_or(-EMFILE)?;
+    let Some(wfd) = p.add(file::new(w, file::O_WRONLY | nb), cloexec, 0) else {
         p.fds[rfd] = None;
         return Err(-EMFILE);
     };

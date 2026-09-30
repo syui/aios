@@ -17,6 +17,7 @@ pub const ENOTDIR: i64 = 20;
 pub const O_ACCMODE: u32 = 3;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
 const O_NOCTTY: u32 = 0o400;
@@ -41,6 +42,10 @@ pub enum Kind {
     /// socketpair の片方: rx から読み、tx へ書く
     Pair(Rc<RefCell<Pipe>>, Rc<RefCell<Pipe>>),
     Socket(crate::socket::SockRef),
+    Epoll(crate::epoll::EpollRef),
+    EventFd(crate::epoll::EventFdRef),
+    /// pidfd_open で開いたプロセス (終わると読める)
+    PidFd(u32),
 }
 
 impl Kind {
@@ -79,6 +84,15 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
 /// (同じ OpenFile を共有する他のプロセスが poll や read をできるように)
 pub fn read(f: &FileRef, dst: &mut [u8]) -> Result<usize, i64> {
+    read_opt(f, dst, false)
+}
+
+pub fn write(f: &FileRef, src: &[u8]) -> Result<usize, i64> {
+    write_opt(f, src, false)
+}
+
+/// dontwait なら O_NONBLOCK がなくても待たない (recv/send の MSG_DONTWAIT)
+pub fn read_opt(f: &FileRef, dst: &mut [u8], dontwait: bool) -> Result<usize, i64> {
     let stream = {
         let b = f.borrow();
         if !b.readable() {
@@ -88,12 +102,12 @@ pub fn read(f: &FileRef, dst: &mut [u8]) -> Result<usize, i64> {
     };
     match stream {
         Some((Kind::PipeWrite(_), _)) => Err(-EBADF),
-        Some((k, nonblock)) => read_stream(&k, dst, nonblock),
+        Some((k, nonblock)) => read_stream(&k, dst, nonblock || dontwait),
         None => f.borrow_mut().read(dst),
     }
 }
 
-pub fn write(f: &FileRef, src: &[u8]) -> Result<usize, i64> {
+pub fn write_opt(f: &FileRef, src: &[u8], dontwait: bool) -> Result<usize, i64> {
     let stream = {
         let b = f.borrow();
         if !b.writable() {
@@ -103,7 +117,7 @@ pub fn write(f: &FileRef, src: &[u8]) -> Result<usize, i64> {
     };
     match stream {
         Some((Kind::PipeRead(_), _)) => Err(-EBADF),
-        Some((k, nonblock)) => write_stream(&k, src, nonblock),
+        Some((k, nonblock)) => write_stream(&k, src, nonblock || dontwait),
         None => f.borrow_mut().write(src),
     }
 }
@@ -112,8 +126,9 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     match k {
         Kind::Tty(t) => tty::read(t, dst, nonblock),
         Kind::PtyMaster(t) => tty::master_read(t, dst, nonblock),
-        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read(p, dst),
+        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read_ex(p, dst, false, nonblock),
         Kind::Socket(s) => s.borrow_mut().read(dst),
+        Kind::EventFd(e) => crate::epoll::read(e, dst, nonblock),
         _ => Err(-EBADF),
     }
 }
@@ -122,8 +137,9 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     match k {
         Kind::Tty(t) => tty::write(t, src, nonblock),
         Kind::PtyMaster(t) => tty::master_write(t, src, nonblock),
-        Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src),
+        Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
+        Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
         _ => Err(-EBADF),
     }
 }
@@ -223,7 +239,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) => self.kind.clone(),
             _ => return None,
         };
         Some((k, self.flags & O_NONBLOCK != 0))
@@ -264,6 +280,19 @@ impl OpenFile {
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
             Kind::Socket(_) | Kind::Pair(..) => Stat::dev(0o140000 | 0o777, 0),
+            // 名前のない inode (anon_inode)
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::PidFd(_) => Stat::dev(0o600, 0),
+        }
+    }
+
+    /// 状態が変わるたびに増える数 (epoll の EPOLLET 用)。数えていないものは 0
+    pub fn event_gen(&self) -> u64 {
+        match &self.kind {
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().generation,
+            Kind::Pair(rx, tx) => rx.borrow().generation.wrapping_add(tx.borrow().generation),
+            Kind::EventFd(e) => crate::epoll::generation(e),
+            Kind::Tty(t) | Kind::PtyMaster(t) => t.borrow().generation.get(),
+            _ => 0,
         }
     }
 
@@ -279,6 +308,9 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
+            Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
+            Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
+            Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
         }
     }
 
@@ -304,6 +336,9 @@ impl OpenFile {
                 (rx.len() > 0 || rx.writers == 0, tx.len() < tx.cap, rx.writers == 0 && rx.len() == 0)
             }
             Kind::Socket(s) => s.borrow().readiness(),
+            Kind::EventFd(e) => crate::epoll::readiness(e),
+            Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
+            Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
             _ => (true, true, false),
         }
     }
@@ -386,12 +421,12 @@ impl Drop for OpenFile {
         crate::sysfile::release_locks(self as *const OpenFile as usize);
         match &self.kind {
             Kind::PipeRead(p) => {
-                p.borrow_mut().readers -= 1;
+                { let mut pp = p.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::wakeup(proc::poll_chan());
             }
             Kind::PipeWrite(p) => {
-                p.borrow_mut().writers -= 1;
+                { let mut pp = p.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::wakeup(proc::poll_chan());
             }
@@ -399,13 +434,14 @@ impl Drop for OpenFile {
                 let mut pp = p.borrow_mut();
                 pp.readers -= 1;
                 pp.writers -= 1;
+                pp.generation += 1;
                 drop(pp);
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::wakeup(proc::poll_chan());
             }
             Kind::Pair(rx, tx) => {
-                rx.borrow_mut().readers -= 1;
-                tx.borrow_mut().writers -= 1;
+                { let mut pp = rx.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
+                { let mut pp = tx.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(rx) as usize);
                 proc::wakeup(Rc::as_ptr(tx) as usize);
                 proc::wakeup(proc::poll_chan());
@@ -489,12 +525,14 @@ pub struct Pipe {
     /// FIFO が読み/書きで開かれた回数 (相手がすぐ閉じても、来たことはわかる)
     r_opened: u64,
     w_opened: u64,
+    /// 書かれたり口が閉じたりするたびに増える (epoll の EPOLLET が「新しいこと」を見分ける)
+    pub generation: u64,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1 }));
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0 }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -546,7 +584,7 @@ impl Pipe {
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
         let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1 }));
+        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0 }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
     }
@@ -554,7 +592,7 @@ impl Pipe {
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<RefCell<Pipe>> {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0 }))
+        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0 }))
     }
 
     fn wake(p: &Rc<RefCell<Pipe>>) {
@@ -584,11 +622,8 @@ impl Pipe {
         }
     }
 
-    fn read(p: &Rc<RefCell<Pipe>>, dst: &mut [u8]) -> Result<usize, i64> {
-        Pipe::read_ex(p, dst, false, false)
-    }
-
-    fn write(p: &Rc<RefCell<Pipe>>, src: &[u8]) -> Result<usize, i64> {
+    /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN
+    fn write(p: &Rc<RefCell<Pipe>>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut done = 0;
         while done < src.len() {
             {
@@ -600,11 +635,16 @@ impl Pipe {
                 let k = room.min(src.len() - done);
                 if k > 0 {
                     pp.data.push(&src[done..done + k])?;
+                    pp.generation += 1;
                     done += k;
                 }
             }
             Pipe::wake(p);
             if done < src.len() {
+                if nonblock {
+                    const EAGAIN: i64 = 11;
+                    return if done > 0 { Ok(done) } else { Err(-EAGAIN) };
+                }
                 if let Err(e) = proc::sleep(Rc::as_ptr(p) as usize) {
                     return if done > 0 { Ok(done) } else { Err(e) };
                 }

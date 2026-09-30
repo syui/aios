@@ -1,0 +1,24 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/brush)
+pkgname=brush
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='Bash/POSIX-compatible shell implemented in Rust'
+arch=('aarch64')
+url='https://github.com/reubeno/brush'
+license=('MIT')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/reubeno/brush#tag=brush-shell-v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd brush
+  musl_build --bin brush
+}
+
+package() {
+  cd brush
+  install -Dm755 target/aarch64-unknown-linux-musl/release/brush "$pkgdir/usr/bin/brush"
+  # bash として呼ばれてもいいように
+  ln -s brush "$pkgdir/usr/bin/bash"
+}

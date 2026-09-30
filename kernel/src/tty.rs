@@ -128,6 +128,8 @@ pub enum Dev {
 
 pub struct Tty {
     pub t: Termios,
+    /// 入出力が動くたびに増える (epoll の EPOLLET 用)
+    pub generation: core::cell::Cell<u64>,
     /// 読める入力 (カノニカルでは確定した行)
     inq: VecDeque<u16>,
     /// inq の中の行の区切りの数
@@ -161,6 +163,7 @@ impl Tty {
             session: 0,
             winsize,
             dev,
+            generation: core::cell::Cell::new(0),
         }
     }
 
@@ -367,6 +370,7 @@ impl Tty {
     }
 
     fn wake(&self) {
+        self.generation.set(self.generation.get() + 1);
         proc::wakeup(self.chan(READ));
         proc::wakeup(proc::poll_chan());
     }

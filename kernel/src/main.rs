@@ -9,6 +9,7 @@ mod uart;
 mod console;
 mod tty;
 mod cred;
+mod epoll;
 mod exec;
 mod extfs;
 mod file;

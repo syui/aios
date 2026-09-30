@@ -291,9 +291,10 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
     }
     let (a, b) = file::Pipe::pair();
     let cloexec = typ & SOCK_CLOEXEC != 0;
+    let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
     let files = proc::current().files();
-    let fa = files.add(file::new(a, 2), cloexec, 0).ok_or(-EMFILE)?;
-    let Some(fb) = files.add(file::new(b, 2), cloexec, 0) else {
+    let fa = files.add(file::new(a, flags), cloexec, 0).ok_or(-EMFILE)?;
+    let Some(fb) = files.add(file::new(b, flags), cloexec, 0) else {
         files.fds[fa] = None;
         return Err(-EMFILE);
     };
@@ -420,8 +421,10 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
 }
 
 pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: usize) -> R {
-    if pair_of(fd).is_some() {
-        return crate::sysfile::write(fd, buf, len);
+    if let Some(f) = pair_of(fd) {
+        let mut data = vec![0u8; len.min(64 * 1024)];
+        proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
+        return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
     }
     let s = sock_of(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
@@ -432,8 +435,11 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
 }
 
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
-    if pair_of(fd).is_some() {
-        return crate::sysfile::read(fd, buf, len);
+    if let Some(f) = pair_of(fd) {
+        let mut data = vec![0u8; len.min(64 * 1024)];
+        let n = file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?;
+        proc::current().pt().copy_out(buf, &data[..n]).ok_or(-EFAULT)?;
+        return Ok(n as i64);
     }
     let s = sock_of(fd)?;
     let mut data = vec![0u8; len.min(64 * 1024)];
@@ -545,7 +551,7 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
             data.resize(start + len, 0);
             proc::current().pt().copy_in(&mut data[start..], *base).ok_or(-EFAULT)?;
         }
-        return file::write(&f, &data).map(|n| n as i64);
+        return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
     }
     let s = sock_of(fd)?;
     let to = if m.name != 0 {
@@ -570,7 +576,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
     let mut data = vec![0u8; total.min(64 * 1024)];
     let (k, from) = match pair_of(fd) {
-        Some(f) => (file::read(&f, &mut data)?, None),
+        Some(f) => (file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?, None),
         None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?,
     };
     let pt = proc::current().pt();
