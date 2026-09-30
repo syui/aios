@@ -5,7 +5,7 @@ fn main() {
     println!("aios init (pid {})", std::process::id());
     let sh = CString::new("/bin/sh").unwrap();
     let argv = [sh.as_ptr(), std::ptr::null()];
-    let envp = [c"PATH=/bin".as_ptr(), c"HOME=/".as_ptr(), c"TERM=vt100".as_ptr(), std::ptr::null()];
+    let envp = [c"PATH=/usr/bin:/bin".as_ptr(), c"HOME=/".as_ptr(), c"TERM=vt100".as_ptr(), std::ptr::null()];
     loop {
         let pid = unsafe { libc::fork() };
         if pid == 0 {

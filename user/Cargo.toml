@@ -21,5 +21,13 @@ path = "src/bin/hello.rs"
 name = "sh"
 path = "src/bin/sh.rs"
 
+[[bin]]
+name = "aipkg"
+path = "src/bin/aipkg.rs"
+
 [dependencies]
 libc = "0.2"
+ruzstd = "0.9"
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = { version = "0.10", default-features = false }
