@@ -48,7 +48,7 @@ fn current_el() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
     println!();
-    println!("aios {} (aarch64)", env!("CARGO_PKG_VERSION"));
+    println!("aios {} (aarch64)", env!("AIOS_RELEASE"));
     println!("hello from EL{}", current_el());
 
     trap::init();

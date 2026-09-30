@@ -401,7 +401,7 @@ fn sys_gettimeofday(tv: usize) -> R {
 
 fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
-    let fields: [&[u8]; 6] = [b"aios", b"aios", env!("CARGO_PKG_VERSION").as_bytes(), b"aios", b"aarch64", b""];
+    let fields: [&[u8]; 6] = [b"aios", b"aios", env!("AIOS_RELEASE").as_bytes(), b"#1 aios", b"aarch64", b""];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
         u[i * FIELD..i * FIELD + f.len()].copy_from_slice(f);
