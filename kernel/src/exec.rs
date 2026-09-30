@@ -33,6 +33,9 @@ const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 
 pub struct Image {
+    /// setuid / setgid のビットで変わる euid / egid
+    pub setuid: Option<u32>,
+    pub setgid: Option<u32>,
     pub pagetable: PageTable,
     pub entry: usize,
     pub sp: usize,
@@ -53,9 +56,11 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
     let cwd = crate::proc::current_cwd();
     let ino = crate::vfs::resolve(&cwd, path, true)?;
     let m = ino.meta();
-    if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || m.mode & 0o111 == 0 {
+    if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
+    let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
+    let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
     // ヘッダとプログラムヘッダだけ先に読む
     let mut ehdr = [0u8; 64];
@@ -173,7 +178,7 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
         put(v)?;
     }
 
-    Ok(Image { pagetable: pt, entry, sp, brk })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk })
 }
 
 

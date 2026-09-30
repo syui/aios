@@ -1,5 +1,6 @@
 // aarch64 Linux 互換のシステムコール
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
+use crate::cred;
 use crate::proc;
 use crate::socket;
 use crate::sysfile;
@@ -90,6 +91,18 @@ mod nr {
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const REBOOT: u64 = 142;
+    pub const SETREGID: u64 = 143;
+    pub const SETGID: u64 = 144;
+    pub const SETREUID: u64 = 145;
+    pub const SETUID: u64 = 146;
+    pub const SETRESUID: u64 = 147;
+    pub const GETRESUID: u64 = 148;
+    pub const SETRESGID: u64 = 149;
+    pub const GETRESGID: u64 = 150;
+    pub const SETFSUID: u64 = 151;
+    pub const SETFSGID: u64 = 152;
+    pub const GETGROUPS: u64 = 158;
+    pub const SETGROUPS: u64 = 159;
     pub const SETPGID: u64 = 154;
     pub const PRCTL: u64 = 167;
     pub const GETPGID: u64 = 155;
@@ -155,7 +168,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
         IOCTL => sysfile::ioctl(a[0], a[1], a[2] as usize),
-        FACCESSAT | FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize),
+        FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
+        FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         MKNODAT => sysfile::mknodat(int(a[0]), a[1] as usize, a[2], a[3]),
@@ -232,7 +246,22 @@ pub fn dispatch(tf: &mut TrapFrame) {
         GETPID | GETPGID => Ok(proc::current().tgid as i64),
         GETTID => Ok(proc::current().pid as i64),
         GETPPID => Ok(proc::current().ppid as i64),
-        GETUID | GETEUID | GETGID | GETEGID => Ok(0),
+        GETUID => Ok(proc::current().cred.uid as i64),
+        GETEUID => Ok(proc::current().cred.euid as i64),
+        GETGID => Ok(proc::current().cred.gid as i64),
+        GETEGID => Ok(proc::current().cred.egid as i64),
+        SETUID => cred::setuid(a[0]),
+        SETGID => cred::setgid(a[0]),
+        SETREUID => cred::setreuid(a[0], a[1]),
+        SETREGID => cred::setregid(a[0], a[1]),
+        SETRESUID => cred::setresuid(a[0], a[1], a[2]),
+        SETRESGID => cred::setresgid(a[0], a[1], a[2]),
+        GETRESUID => cred::getresuid(a[0] as usize, a[1] as usize, a[2] as usize),
+        GETRESGID => cred::getresgid(a[0] as usize, a[1] as usize, a[2] as usize),
+        SETFSUID => cred::setfsuid(a[0]),
+        SETFSGID => cred::setfsgid(a[0]),
+        GETGROUPS => cred::getgroups(a[0] as usize, a[1] as usize),
+        SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
         SETPGID | SETSID => Ok(0),
         UMASK => Ok(0o022),
         SET_ROBUST_LIST | MEMBARRIER => Ok(0),
@@ -566,6 +595,9 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
 
 /// 電源を切る / 再起動する (PSCI を hvc で呼ぶ)
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
+    if proc::current().cred.euid != 0 {
+        return Err(-(cred::EPERM));
+    }
     const MAGIC1: u32 = 0xfee1_dead;
     const MAGIC2: [u32; 4] = [672274793, 85072278, 369367448, 537993216];
     const CMD_RESTART: u32 = 0x0123_4567;

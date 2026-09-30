@@ -13,6 +13,17 @@ struct Input {
 
 static mut INPUT: Input = Input { buf: [0; BUF], r: 0, w: 0, e: 0 };
 
+/// 打った文字を画面に出すか (termios の ECHO)
+static mut ECHO: bool = true;
+
+pub fn echo_enabled() -> bool {
+    unsafe { ECHO }
+}
+
+pub fn set_echo(on: bool) {
+    unsafe { ECHO = on };
+}
+
 fn input() -> &'static mut Input {
     unsafe { &mut *(&raw mut INPUT) }
 }
@@ -28,6 +39,9 @@ const BS: u8 = 0x08;
 const DEL: u8 = 0x7f;
 
 fn echo(c: u8) {
+    if !echo_enabled() {
+        return;
+    }
     let _g = uart::LOCK.lock();
     uart::putc(c);
 }
@@ -39,6 +53,9 @@ pub fn intr(c: u8) {
         BS | DEL => {
             if i.e != i.w {
                 i.e -= 1;
+                if !echo_enabled() {
+                    return;
+                }
                 let _g = uart::LOCK.lock();
                 uart::putc(BS);
                 uart::putc(b' ');
@@ -62,7 +79,7 @@ pub fn intr(c: u8) {
             let c = if c == b'\r' { b'\n' } else { c };
             i.buf[i.e % BUF] = c;
             i.e += 1;
-            if c == b'\n' {
+            if c == b'\n' && echo_enabled() {
                 echo(b'\r');
             }
             if c != CTRL_D {
