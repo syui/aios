@@ -7,10 +7,12 @@ pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which and /etc'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
+# ログインシェルは bash (brush)。自作の sh は /bin/sh として入れる
+depends=('brush')
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
-        etc/hostname etc/hosts etc/resolv.conf etc/motd)
+        etc/hostname etc/hosts etc/resolv.conf etc/motd etc/profile etc/shells)
 
 pkgver() {
   cd "$startdir/../.."

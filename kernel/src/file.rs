@@ -56,7 +56,11 @@ impl Kind {
             (1, 3) => return Ok(Kind::Null),
             (1, 5) => return Ok(Kind::Zero),
             (1, 8) | (1, 9) => return Ok(Kind::Random),
-            (5, 0) => tty::controlling().ok_or(-ENXIO)?,
+            (5, 0) => {
+                let t = tty::controlling().ok_or(-ENXIO)?;
+                tty::ref_slave(&t);
+                t
+            }
             (5, 1) => tty::console(),
             (5, 2) => return Ok(Kind::PtyMaster(tty::open_ptmx()?)),
             (136, n) => tty::open_slave(n as usize)?,

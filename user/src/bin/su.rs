@@ -1,6 +1,6 @@
 // su [-] [USER] [-c CMD]: ほかのユーザーになる (setuid root)
-//   root からは確かめない。wheel グループの人が root になるときも確かめない
-//   (pam_wheel の trust と同じ。sudo-rs が入るまでのつなぎ)。それ以外はそのユーザーのパスワード
+//   root からは確かめない。それ以外はなる先のユーザーのパスワード
+//   (root のパスワードはロックしてあるので、root になるには sudo を使う)
 #[path = "../lib/crypt.rs"]
 mod crypt;
 #[path = "../lib/users.rs"]
@@ -19,13 +19,11 @@ fn main() {
         .unwrap_or_else(|| "root".into());
 
     let ruid = unsafe { libc::getuid() };
-    let me = users::by_uid(ruid);
     let Some(target) = users::by_name(&name) else {
         eprintln!("su: user {} does not exist", name);
         std::process::exit(1);
     };
-    let trusted = ruid == 0 || (target.uid == 0 && me.as_ref().is_some_and(|m| users::in_group(m, "wheel")));
-    if !trusted {
+    if ruid != 0 {
         let hash = users::shadow_hash(&name).unwrap_or_default();
         let pw = users::read_password("Password: ").unwrap_or_default();
         if !crypt::verify(&pw, &hash) {
