@@ -415,10 +415,10 @@ fn sys_uname(buf: usize) -> R {
 }
 
 fn sys_sysinfo(buf: usize) -> R {
-    use crate::memlayout::{PGSIZE, PHYSBASE, PHYSTOP};
+    use crate::memlayout::{phystop, PGSIZE, PHYSBASE};
     let mut b = [0u8; 112];
     b[0..8].copy_from_slice(&(timer::uptime_ns() / 1_000_000_000).to_le_bytes());
-    b[32..40].copy_from_slice(&((PHYSTOP - PHYSBASE) as u64).to_le_bytes());
+    b[32..40].copy_from_slice(&((phystop() - PHYSBASE) as u64).to_le_bytes());
     b[40..48].copy_from_slice(&((crate::kalloc::nfree() * PGSIZE) as u64).to_le_bytes());
     b[80..82].copy_from_slice(&(proc::nprocs() as u16).to_le_bytes());
     b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit

@@ -4,6 +4,7 @@
  */
 KBASE = 0xffffff8000000000;
 _start_pa = _start - KBASE;
+_image_size = __kernel_end - _start;
 ENTRY(_start_pa)
 
 SECTIONS

@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/brush)
 pkgname=brush
 pkgver=0.4.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Bash/POSIX-compatible shell implemented in Rust'
 arch=('aarch64')
 url='https://github.com/reubeno/brush'
@@ -9,6 +9,15 @@ license=('MIT')
 makedepends=('git' 'rustup')
 source=("git+https://github.com/reubeno/brush#tag=brush-shell-v$pkgver")
 sha256sums=('SKIP')
+
+prepare() {
+  cd brush
+  # bash の readline と同じく、TERM=dumb の端末では飾りのない入力にする
+  # (カーソル位置の問い合わせ ESC[6n に答えない端末でもログインできるように)
+  sed -i 's|if std::io::stdin().is_terminal() \&\& will_run_interactively(args) {|if std::io::stdin().is_terminal() \&\& will_run_interactively(args) \&\& std::env::var("TERM").map_or(true, \|t\| t != "dumb") {|' \
+    brush-shell/src/entry.rs
+  grep -q 'TERM").map_or' brush-shell/src/entry.rs
+}
 
 build() {
   . "$startdir/../cross.sh"

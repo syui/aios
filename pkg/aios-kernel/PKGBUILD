@@ -1,5 +1,6 @@
-# aios のカーネル。/boot/aios に置く (Arch ARM の linux-* が /boot にカーネルを置くのと同じ)
-# QEMU では bin/run.sh が disk.img の /boot/aios を読んで起動する (小さなブートローダーのかわり)
+# aios のカーネル。Linux の arm64 Image 形式で /boot/Image に置く
+# (Arch ARM の linux-aarch64 と同じ場所。QEMU もラズパイのファームウェアもこの形式を起動でき、DTB を渡してくれる)
+# QEMU では bin/run.sh が disk.img の /boot/Image を読んで起動する (小さなブートローダーのかわり)
 # initramfs は空にして作るので、ルートはディスク (bin/mkdisk.sh)
 pkgname=aios-kernel
 pkgver=0.1.0
@@ -8,7 +9,7 @@ pkgdesc='The aios kernel (aarch64, QEMU virt)'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
-makedepends=('rustup')
+makedepends=('rustup' 'llvm')
 
 pkgver() {
   cd "$startdir/../.."
@@ -24,5 +25,9 @@ build() {
 }
 
 package() {
-  install -Dm644 "$srcdir/target/aarch64-unknown-none-softfloat/release/aios" "$pkgdir/boot/aios"
+  install -d "$pkgdir/boot"
+  local objcopy
+  objcopy=$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy)
+  "$objcopy" -O binary "$srcdir/target/aarch64-unknown-none-softfloat/release/aios" "$pkgdir/boot/Image"
+  chmod 644 "$pkgdir/boot/Image"
 }
