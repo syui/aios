@@ -9,11 +9,12 @@ cd "$(dirname "$0")"
 bin=user/target/aarch64-unknown-linux-musl/release
 
 rm -rf rootfs
-mkdir -p rootfs/bin
+mkdir -p rootfs/bin rootfs/usr/bin
 cp "$bin/init" rootfs/init
-for p in sh hello; do
+for p in sh hello aipkg; do
   cp "$bin/$p" rootfs/bin/$p
 done
+cp -r etc rootfs/etc
 
 for pkg in "$@"; do
   case "$pkg" in
