@@ -6,7 +6,31 @@ use core::ptr::{read_volatile, write_volatile};
 
 const DR: *mut u32 = BASE as *mut u32;
 const FR: *const u32 = (BASE + 0x18) as *const u32;
+const IMSC: *mut u32 = (BASE + 0x38) as *mut u32;
+const ICR: *mut u32 = (BASE + 0x44) as *mut u32;
+const FR_RXFE: u32 = 1 << 4;
 const FR_TXFF: u32 = 1 << 5;
+const INT_RX: u32 = 1 << 4;
+const INT_RT: u32 = 1 << 6;
+
+/// PL011 は SPI 1
+pub const IRQ: u32 = 33;
+
+pub fn init() {
+    unsafe { write_volatile(IMSC, INT_RX | INT_RT) };
+    crate::gic::enable(IRQ);
+}
+
+/// 受信した文字をすべてコンソールへ渡す
+pub fn intr() {
+    unsafe {
+        while read_volatile(FR) & FR_RXFE == 0 {
+            let c = read_volatile(DR) as u8;
+            crate::console::intr(c);
+        }
+        write_volatile(ICR, INT_RX | INT_RT);
+    }
+}
 
 pub fn putc(c: u8) {
     unsafe {
