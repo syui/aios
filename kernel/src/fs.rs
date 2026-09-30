@@ -18,7 +18,18 @@ pub fn init() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                let mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", crate::block::name(), kind);
+                let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", crate::block::name(), kind);
+                // FAT の boot の区画 (ESP / ラズパイの boot) を /boot に
+                if let Some(p) = crate::block::boot() {
+                    match crate::vfat::FatFs::mount(p) {
+                        Ok(b) if vfs::mkdir_p("boot", 0o755).is_ok() && vfs::mount("boot", b.root()).is_ok() => {
+                            println!("fs: /boot is {} on {}", b.kind(), crate::block::part_name(&p));
+                            mtab.push_str(&alloc::format!("{} /boot vfat rw 0 0\n", crate::block::part_name(&p)));
+                        }
+                        Ok(_) => {}
+                        Err(e) => println!("fs: boot partition not usable ({})", e),
+                    }
+                }
                 setup_dirs(&mtab);
                 return;
             }
