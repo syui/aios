@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 const EIO: i64 = 5;
+const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
 const EPERM: i64 = 1;
 const ENOTTY: i64 = 25;
@@ -58,7 +59,6 @@ const VEOL2: usize = 16;
 const NCCS: usize = 19;
 
 const SIGHUP: i32 = 1;
-const SIGTSTP: i32 = 20;
 
 /// 入力をためておける量
 const INQ: usize = 4096;
@@ -297,7 +297,7 @@ impl Tty {
             } else if c == cc[VQUIT] {
                 Some(signal::SIGQUIT)
             } else if c == cc[VSUSP] {
-                Some(SIGTSTP)
+                Some(signal::SIGTSTP)
             } else {
                 None
             };
@@ -448,6 +448,22 @@ pub fn read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> 
     }
     let mut deadline = 0u64;
     loop {
+        // 端末の前にいないグループ (うしろのジョブ) が読もうとしたら SIGTTIN で止める
+        {
+            let me = proc::current();
+            let (session, pgrp) = {
+                let t = tty.borrow();
+                (t.session, t.pgrp)
+            };
+            if session == me.sid && pgrp != 0 && me.pgid != pgrp {
+                if signal::blocked_or_ignored(me, signal::SIGTTIN) {
+                    return Err(-EIO);
+                }
+                let pg = me.pgid;
+                send(pg, signal::SIGTTIN);
+                return Err(-EINTR);
+            }
+        }
         {
             let mut t = tty.borrow_mut();
             if t.canon() {

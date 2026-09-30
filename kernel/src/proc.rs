@@ -164,6 +164,11 @@ pub struct Proc {
     thread: bool,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
     pub clear_tid: usize,
+    /// ジョブ制御 (代表スレッドだけが使う): 止められているか、
+    /// wait (WUNTRACED / WCONTINUED) にまだ知らせていない停止のシグナル / 再開
+    pub stopped: bool,
+    pub stop_report: i32,
+    pub cont_report: bool,
     chan: usize,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
@@ -200,6 +205,9 @@ impl Proc {
         comm: [0; 16],
         thread: false,
         clear_tid: 0,
+        stopped: false,
+        stop_report: 0,
+        cont_report: false,
         chan: 0,
         wake_at: 0,
         context: Context::ZERO,
@@ -790,15 +798,28 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
 }
 
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
 
-/// 子の終了を待つ。(pid, status) を返す
+/// 子の終了 (と WUNTRACED なら停止、WCONTINUED なら再開) を待つ。(pid, status) を返す。
+/// pid: > 0 はその子、0 は同じプロセスグループ、-1 はどれでも、< -1 はグループ -pid
 pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     const ECHILD: i64 = 10;
     let me = current();
+    let (my_tgid, my_pgid) = (me.tgid, me.pgid);
     loop {
         let mut have = false;
         for c in procs().iter_mut() {
-            if c.state == State::Unused || c.thread || c.ppid != me.tgid || (pid > 0 && c.pid as i64 != pid) {
+            if c.state == State::Unused || c.thread || c.ppid != my_tgid {
+                continue;
+            }
+            let wanted = match pid {
+                p if p > 0 => c.pid as i64 == p,
+                0 => c.pgid == my_pgid,
+                -1 => true,
+                p => c.pgid as i64 == -p,
+            };
+            if !wanted {
                 continue;
             }
             have = true;
@@ -806,6 +827,14 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 let r = (c.pid, c.xstatus);
                 *c = Proc::UNUSED;
                 return Ok(r);
+            }
+            if options & WUNTRACED != 0 && c.stop_report != 0 {
+                let sig = core::mem::take(&mut c.stop_report);
+                return Ok((c.pid, (sig << 8) | 0x7f));
+            }
+            if options & WCONTINUED != 0 && c.cont_report {
+                c.cont_report = false;
+                return Ok((c.pid, 0xffff));
             }
         }
         if !have {
@@ -815,9 +844,33 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             return Ok((0, 0));
         }
         // 親が待つのは代表スレッドのアドレス
+        let me = current();
         let leader = find(me.tgid).map_or(me as *mut Proc as usize, |l| l as *mut Proc as usize);
         sleep(leader)?;
     }
+}
+
+/// 止められたスレッドグループの再開を待つ (SIGCONT か SIGKILL まで)。
+/// 止まっている間に来た他のシグナルは、再開してから届ける
+pub fn stop_while_stopped() {
+    loop {
+        let p = current();
+        if p.killed {
+            return;
+        }
+        let Some(l) = find(p.tgid) else { return };
+        if !l.stopped {
+            return;
+        }
+        p.chan = stop_chan(l);
+        p.state = State::Sleeping;
+        sched();
+        current().chan = 0;
+    }
+}
+
+pub fn stop_chan(leader: &Proc) -> usize {
+    leader as *const Proc as usize + 1
 }
 
 /// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る)

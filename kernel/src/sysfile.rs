@@ -131,7 +131,7 @@ fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
     let mut tmp = vec![0u8; len.min(64 * 1024)];
-    let n = f.borrow_mut().read(&mut tmp)?;
+    let n = file::read(&f, &mut tmp)?;
     out(buf, &tmp[..n])?;
     Ok(n as i64)
 }
@@ -140,7 +140,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
-    let r = f.borrow_mut().write(&tmp);
+    let r = file::write(&f, &tmp);
     if r == Err(-file::EPIPE) {
         // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
         let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
@@ -777,7 +777,7 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     let n = match (pipe_of(fd_in), off_in) {
         (Some(p), _) => Pipe::read_ex(&p, &mut tmp, false, flags & SPLICE_F_NONBLOCK != 0)?,
-        (None, 0) => file_of(fd_in)?.borrow_mut().read(&mut tmp)?,
+        (None, 0) => file::read(&file_of(fd_in)?, &mut tmp)?,
         (None, at) => {
             let off = read_off(at)?;
             let n = inode_of(fd_in)?.read_at(off as usize, &mut tmp)?;
@@ -797,7 +797,7 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     let f = file_of(fd_out)?;
     let mut done = 0;
     while done < n {
-        done += f.borrow_mut().write(&tmp[done..n])?;
+        done += file::write(&f, &tmp[done..n])?;
     }
     Ok(n as i64)
 }
@@ -821,7 +821,7 @@ pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
     }
     let n = Pipe::read_ex(&pin, &mut tmp, true, flags & SPLICE_F_NONBLOCK != 0)?;
     let f = file_of(fd_out)?;
-    let w = f.borrow_mut().write(&tmp[..n])?;
+    let w = file::write(&f, &tmp[..n])?;
     Ok(w as i64)
 }
 

@@ -42,6 +42,12 @@ pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
+const SA_NOCLDSTOP: u64 = 0x1;
 
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
@@ -135,13 +141,16 @@ const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 enum Default {
     Ignore,
     Terminate,
+    Stop,
 }
+
+/// 止めるシグナル (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU)
+const STOP_MASK: u64 = bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(SIGTTOU);
 
 fn default_action(sig: i32) -> Default {
     match sig {
         SIGCHLD | SIGCONT | SIGURG | SIGWINCH => Default::Ignore,
-        // 止める (SIGSTOP など) はまだないので無視する
-        19..=22 => Default::Ignore,
+        SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => Default::Stop,
         _ => Default::Terminate,
     }
 }
@@ -154,6 +163,11 @@ pub fn action(p: &Proc, sig: i32) -> SigAction {
 fn ignored(p: &Proc, sig: i32) -> bool {
     let a = action(p, sig);
     a.handler == SIG_IGN || (a.handler == SIG_DFL && matches!(default_action(sig), Default::Ignore))
+}
+
+/// ブロックしているか無視しているか (端末が SIGTTIN / SIGTTOU の代わりに EIO を返す)
+pub fn blocked_or_ignored(p: &Proc, sig: i32) -> bool {
+    p.sig_mask & bit(sig) != 0 || action(p, sig).handler == SIG_IGN
 }
 
 /// いま受け取れるシグナルがあるか (sleep を中断する)
@@ -172,6 +186,13 @@ pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
     if sig == SIGKILL {
         proc::kill_group(t.tgid, sig);
         return;
+    }
+    // SIGCONT は無視されていても、止まっているグループを動かす。
+    // 止めるシグナルが来たら、たまっている SIGCONT は捨てる (逆も)
+    if sig == SIGCONT {
+        continue_group(t.tgid);
+    } else if bit(sig) & STOP_MASK != 0 {
+        t.sig_pending &= !bit(SIGCONT);
     }
     let b = bit(sig);
     // ブロックされていない無視されるシグナルは捨てる
@@ -228,6 +249,53 @@ pub fn send_pgrp(pgid: u32, sig: i32, info: SigInfo) -> usize {
         }
     }
     n
+}
+
+/// 親に子の停止 / 再開を知らせる (SIGCHLD と wait の起床)
+fn notify_parent(tgid: u32, code: i32, sig: i32) {
+    let Some(child) = proc::find_leader(tgid) else { return };
+    let (ppid, uid) = (child.ppid, child.cred.uid);
+    let Some(parent) = proc::find_leader(ppid) else { return };
+    let quiet = code == CLD_STOPPED && action(parent, SIGCHLD).flags & SA_NOCLDSTOP != 0;
+    proc::wakeup(parent as *mut Proc as usize);
+    if !quiet {
+        let _ = send_group(ppid, SIGCHLD, SigInfo { code, pid: tgid, uid, status: sig, ..SigInfo::ZERO });
+    }
+}
+
+/// スレッドグループを止める (既定の動作が Stop のシグナルを受けたとき)
+fn stop_group(tgid: u32, sig: i32) {
+    let Some(l) = proc::find_leader(tgid) else { return };
+    if l.stopped {
+        return;
+    }
+    l.stopped = true;
+    l.stop_report = sig;
+    l.cont_report = false;
+    // 他のスレッドも、ユーザーに戻る前に止まるよう起こす
+    let me = proc::current().pid;
+    for th in proc::threads_of(tgid) {
+        if th.pid != me {
+            proc::interrupt(th);
+        }
+    }
+    notify_parent(tgid, CLD_STOPPED, sig);
+}
+
+/// 止まっているスレッドグループを動かす (SIGCONT)
+fn continue_group(tgid: u32) {
+    for th in proc::threads_of(tgid) {
+        th.sig_pending &= !STOP_MASK;
+    }
+    let Some(l) = proc::find_leader(tgid) else { return };
+    if !l.stopped {
+        return;
+    }
+    l.stopped = false;
+    l.stop_report = 0;
+    l.cont_report = true;
+    proc::wakeup(proc::stop_chan(l));
+    notify_parent(tgid, CLD_CONTINUED, SIGCONT);
 }
 
 /// SIGCHLD を無視していれば、子はゾンビにならずに消える
@@ -344,6 +412,8 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
 /// EL0 へ戻る前に: たまっているシグナルを処理する。
 /// interrupted はシステムコールが待ちを割り込まれて EINTR を返したところ
 pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
+    // 他のスレッドがグループを止めたなら、ここで止まる
+    proc::stop_while_stopped();
     let p = proc::current();
     let mut handled = false;
     loop {
@@ -360,6 +430,11 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             SIG_DFL => match default_action(sig) {
                 Default::Ignore => continue,
                 Default::Terminate => proc::die(sig),
+                Default::Stop => {
+                    stop_group(p.tgid, sig);
+                    proc::stop_while_stopped();
+                    continue;
+                }
             },
             _ => {
                 if let Some(r) = &interrupted {
