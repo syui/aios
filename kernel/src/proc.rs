@@ -420,7 +420,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
 
 pub fn user_init() {
     let argv = [b"/init".to_vec()];
-    let envp = [b"HOME=/".to_vec(), b"PATH=/bin".to_vec(), b"TERM=vt100".to_vec()];
+    let envp = [b"HOME=/".to_vec(), b"PATH=/usr/bin:/bin".to_vec(), b"TERM=vt100".to_vec()];
     let img = match exec::exec("/init", &argv, &envp) {
         Ok(img) => img,
         Err(e) => panic!("user_init: cannot exec /init ({})", e),

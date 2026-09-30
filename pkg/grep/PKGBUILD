@@ -1,0 +1,26 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/grep)
+pkgname=grep
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Rust implementation of GNU grep (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/grep'
+license=('MIT')
+makedepends=('git' 'rustup' 'aarch64-linux-gnu-gcc')
+source=("git+https://github.com/uutils/grep#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd grep
+  musl_build
+}
+
+package() {
+  cd grep
+  install -Dm755 target/aarch64-unknown-linux-musl/release/grep "$pkgdir/usr/bin/grep"
+  # GNU と同じく egrep / fgrep は grep -E / -F を呼ぶだけのスクリプト
+  printf '#!/bin/sh\nexec grep -E "$@"\n' > "$pkgdir/usr/bin/egrep"
+  printf '#!/bin/sh\nexec grep -F "$@"\n' > "$pkgdir/usr/bin/fgrep"
+  chmod 755 "$pkgdir/usr/bin/egrep" "$pkgdir/usr/bin/fgrep"
+}

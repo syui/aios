@@ -1,0 +1,24 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/tar)
+# uutils/tar はまだリリースがないので、コミットを決めて日付を版にする
+pkgname=tar
+pkgver=0.1.0.20260930
+pkgrel=1
+_commit=93e211febed55aa118e47b0ac054ed92641d13df
+pkgdesc='Rust implementation of tar (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/tar'
+license=('MIT')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/uutils/tar#commit=$_commit")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd tar
+  musl_build --bin tarapp
+}
+
+package() {
+  cd tar
+  install -Dm755 target/aarch64-unknown-linux-musl/release/tarapp "$pkgdir/usr/bin/tar"
+}

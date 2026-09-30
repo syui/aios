@@ -1,0 +1,31 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/coreutils)
+pkgname=coreutils
+pkgver=0.12.0
+pkgrel=1
+pkgdesc='Cross-platform Rust rewrite of the GNU coreutils (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/coreutils'
+license=('MIT')
+makedepends=('git' 'rustup' 'aarch64-linux-gnu-gcc')
+source=("git+https://github.com/uutils/coreutils#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd coreutils
+  musl_build --no-default-features --features feat_os_unix_musl
+}
+
+package() {
+  cd coreutils
+  local out=target/aarch64-unknown-linux-musl/release
+  install -Dm755 "$out/coreutils" "$pkgdir/usr/bin/coreutils"
+  # 1 つのバイナリを、入っているコマンドの名前で呼ぶ
+  local f n
+  for f in "$out"/deps/libuu_*.rlib; do
+    n=${f##*/libuu_}
+    n=${n%%-*}
+    case "$n" in *_common) continue ;; esac
+    [ -e "$pkgdir/usr/bin/$n" ] || ln -s coreutils "$pkgdir/usr/bin/$n"
+  done
+}

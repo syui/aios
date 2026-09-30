@@ -248,7 +248,7 @@ fn find(cmd: &str) -> Option<CString> {
     if cmd.contains('/') {
         return CString::new(cmd).ok();
     }
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/bin".into());
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
     path.split(':')
         .map(|d| format!("{}/{}", d, cmd))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
