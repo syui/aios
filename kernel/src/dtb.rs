@@ -47,7 +47,11 @@ pub fn init() -> bool {
     if be32(head, 0) != MAGIC {
         return false;
     }
-    let size = be32(head, 4) as usize;
+    // totalsize には後ろの空き (ブートローダーが書き足すための) も入るので、
+    // 中身 (構造ブロックと文字列ブロックの終わり) だけを写す
+    let total = be32(head, 4) as usize;
+    let used = (be32(head, 8) + be32(head, 36)).max(be32(head, 12) + be32(head, 32)).max(be32(head, 16)) as usize;
+    let size = used.min(total);
     if !(40..=MAX).contains(&size) || !crate::memlayout::is_mapped_ram(pa, size) {
         return false;
     }
