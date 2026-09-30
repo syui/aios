@@ -9,3 +9,4 @@ bin=user/target/aarch64-unknown-linux-musl/release
 rm -rf rootfs
 mkdir -p rootfs/bin
 cp "$bin/init" rootfs/init
+cp "$bin/hello" rootfs/bin/hello

@@ -168,6 +168,50 @@ impl PageTable {
         Some(())
     }
 
+    /// NUL 終端の文字列を max バイトまで読む
+    pub fn copy_in_str(&self, mut va: usize, max: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut out = alloc::vec::Vec::new();
+        loop {
+            let pa = self.user_pa(va)?;
+            let n = PGSIZE - (va & (PGSIZE - 1));
+            let page = unsafe { core::slice::from_raw_parts(p2v(pa) as *const u8, n) };
+            if let Some(i) = page.iter().position(|&c| c == 0) {
+                out.extend_from_slice(&page[..i]);
+                return (out.len() <= max).then_some(out);
+            }
+            out.extend_from_slice(page);
+            if out.len() > max {
+                return None;
+            }
+            va += n;
+        }
+    }
+
+    /// ユーザーページをすべて複製した新しいページテーブル
+    pub fn fork(&self) -> Option<PageTable> {
+        let mut new = PageTable::new()?;
+        fn copy_level(src: *mut u64, level: usize, base: usize, new: &mut PageTable) -> Option<()> {
+            for i in 0..512 {
+                let e = unsafe { *src.add(i) };
+                if e & PTE_VALID == 0 {
+                    continue;
+                }
+                let va = base | (i << (12 + 9 * (3 - level)));
+                if level < 3 {
+                    copy_level(table_at(e), level + 1, va, new)?;
+                } else {
+                    let page = kalloc::alloc()?;
+                    unsafe { core::ptr::copy_nonoverlapping(table_at(e) as *const u8, page, PGSIZE) };
+                    let pte = new.walk(va, true)?;
+                    unsafe { *pte = v2p(page as usize) as u64 | (e & !PTE_ADDR) };
+                }
+            }
+            Some(())
+        }
+        copy_level(self.root, 1, 0, &mut new)?;
+        Some(new)
+    }
+
     pub fn activate(&self) {
         unsafe {
             core::arch::asm!(

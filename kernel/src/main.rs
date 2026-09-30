@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod boot;
 #[macro_use]
 mod uart;
 mod exec;
 mod gic;
+mod heap;
 mod initrd;
 mod kalloc;
 mod memlayout;
@@ -33,13 +36,15 @@ pub extern "C" fn kmain() -> ! {
 
     trap::init();
     kalloc::init();
+    heap::init();
     println!("kalloc: {} pages free", kalloc::nfree());
     println!("initrd: {} entries", initrd::count());
 
     gic::init();
     timer::init();
 
-    proc::user_init()
+    proc::user_init();
+    proc::scheduler()
 }
 
 fn halt() -> ! {

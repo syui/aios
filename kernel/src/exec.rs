@@ -3,6 +3,7 @@
 use crate::initrd;
 use crate::memlayout::PGSIZE;
 use crate::vm::{pg_up, PageTable, Perm};
+use alloc::vec::Vec;
 
 pub const USER_STACK_TOP: usize = 0x40_0000_0000;
 const USER_STACK_SIZE: usize = 256 * 1024;
@@ -49,7 +50,7 @@ fn u64_at(b: &[u8], o: usize) -> usize {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) as usize
 }
 
-pub fn exec(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Image, i64> {
+pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
     let elf = initrd::read(path).ok_or(-ENOENT)?;
     if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || u16_at(elf, 16) != 2 || u16_at(elf, 18) != 183 {
         return Err(-ENOEXEC);
@@ -103,13 +104,10 @@ pub fn exec(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Image, i64> {
         }
         Ok(sp)
     };
-    let mut ptrs = [0usize; 64];
     let (argc, envc) = (argv.len(), envp.len());
-    if argc + envc > ptrs.len() {
-        return Err(-E2BIG);
-    }
-    for (i, s) in argv.iter().chain(envp.iter()).enumerate() {
-        ptrs[i] = push_bytes(&pt, s, true)?;
+    let mut ptrs = Vec::with_capacity(argc + envc);
+    for s in argv.iter().chain(envp.iter()) {
+        ptrs.push(push_bytes(&pt, s, true)?);
     }
     let execfn = push_bytes(&pt, path.as_bytes(), true)?;
     let random = push_bytes(&pt, &crate::rand::bytes16(), false)?;
