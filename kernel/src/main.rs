@@ -4,10 +4,13 @@
 mod boot;
 #[macro_use]
 mod uart;
+mod exec;
 mod gic;
+mod initrd;
 mod kalloc;
 mod memlayout;
 mod proc;
+mod rand;
 mod spinlock;
 mod syscall;
 mod timer;
@@ -31,6 +34,7 @@ pub extern "C" fn kmain() -> ! {
     trap::init();
     kalloc::init();
     println!("kalloc: {} pages free", kalloc::nfree());
+    println!("initrd: {} entries", initrd::count());
 
     gic::init();
     timer::init();

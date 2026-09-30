@@ -50,7 +50,11 @@ _start:
     str     xzr, [x0], #8
     b       3b
 
-4:  bl      kmain
+    // EL0/EL1 の FP/SIMD を使えるようにする (カーネルは softfloat で触らない)
+4:  mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+    bl      kmain
     b       0b
 
 .section .data

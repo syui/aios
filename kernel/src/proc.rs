@@ -1,15 +1,20 @@
 // プロセス (いまは init 1 つだけ)
+use crate::exec;
 use crate::kalloc;
-use crate::memlayout::{v2p, PGSIZE};
+use crate::memlayout::PGSIZE;
 use crate::trap::TrapFrame;
-use crate::vm::{PageTable, Perm};
+use crate::vm::PageTable;
 
-pub const USER_TEXT: usize = 0x40_0000;
-pub const USER_STACK_TOP: usize = 0x40_0000_0000;
+pub const MMAP_BASE: usize = 0x10_0000_0000;
 
 pub struct Proc {
     pub pid: u32,
     pub pagetable: PageTable,
+    /// brk の下限 (ELF の末尾) と現在値
+    pub heap_start: usize,
+    pub brk: usize,
+    /// 次に mmap で渡す場所
+    pub mmap_next: usize,
     kstack: *mut u8,
 }
 
@@ -19,51 +24,24 @@ pub fn current() -> &'static mut Proc {
     unsafe { (*(&raw mut INIT)).as_mut().expect("no current proc") }
 }
 
-// 最初のユーザープログラム。位置独立で USER_TEXT に写される。
-core::arch::global_asm!(
-    r#"
-.section .rodata
-.balign 4
-.global initcode
-.global initcode_end
-initcode:
-    mov     x0, #1
-    adr     x1, 1f
-    mov     x2, #(2f - 1f)
-    mov     x8, #64
-    svc     #0
-    mov     x0, #0
-    mov     x8, #94
-    svc     #0
-0:  b       0b
-1:  .ascii  "hello from EL0 (aios init)\n"
-2:
-.balign 4
-initcode_end:
-"#
-);
-
 pub fn user_init() -> ! {
-    unsafe extern "C" {
-        static initcode: u8;
-        static initcode_end: u8;
-    }
-    let code = unsafe {
-        let start = &raw const initcode;
-        let len = (&raw const initcode_end).offset_from(start) as usize;
-        core::slice::from_raw_parts(start, len)
+    let argv: [&[u8]; 1] = [b"/init"];
+    let envp: [&[u8]; 3] = [b"HOME=/", b"PATH=/bin", b"TERM=vt100"];
+    let img = match exec::exec("/init", &argv, &envp) {
+        Ok(img) => img,
+        Err(e) => panic!("user_init: cannot exec /init ({})", e),
     };
-    assert!(code.len() <= PGSIZE);
-
-    let mut pt = PageTable::new().expect("user_init: out of memory");
-    let text = kalloc::alloc().expect("user_init: out of memory");
-    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), text, code.len()) };
-    pt.map(USER_TEXT, v2p(text as usize), Perm::RX).unwrap();
-    let stack = kalloc::alloc().expect("user_init: out of memory");
-    pt.map(USER_STACK_TOP - PGSIZE, v2p(stack as usize), Perm::RW).unwrap();
 
     let kstack = kalloc::alloc().expect("user_init: out of memory");
-    unsafe { *(&raw mut INIT) = Some(Proc { pid: 1, pagetable: pt, kstack }) };
+    let proc = Proc {
+        pid: 1,
+        pagetable: img.pagetable,
+        heap_start: img.brk,
+        brk: img.brk,
+        mmap_next: MMAP_BASE,
+        kstack,
+    };
+    unsafe { *(&raw mut INIT) = Some(proc) };
 
     let p = current();
     p.pagetable.activate();
@@ -71,8 +49,8 @@ pub fn user_init() -> ! {
     // カーネルスタックの天辺に TrapFrame を置いて eret で EL0 へ
     let tf = unsafe { &mut *((p.kstack as usize + PGSIZE - size_of::<TrapFrame>()) as *mut TrapFrame) };
     *tf = TrapFrame::zeroed();
-    tf.elr = USER_TEXT as u64;
-    tf.sp_el0 = USER_STACK_TOP as u64;
+    tf.elr = img.entry as u64;
+    tf.sp_el0 = img.sp as u64;
     tf.spsr = 0; // EL0t, 割り込み許可
     crate::trap::user_return(tf)
 }
