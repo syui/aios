@@ -279,6 +279,13 @@ impl Init {
         let w: Vec<&str> = line.split_whitespace().collect();
         let Some((&reply, rest)) = w.split_last() else { return };
         let (cmd, arg) = (rest.first().copied().unwrap_or(""), rest.get(1).map(|a| unit::full_name(a)).unwrap_or_default());
+        // 変える操作は root だけ (返事の FIFO の持ち主が頼んだ人)
+        let requester = std::fs::metadata(reply).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(u32::MAX);
+        let read_only = matches!(cmd, "status" | "is-active" | "list-units");
+        if !read_only && requester != 0 {
+            reply_to(reply, "Access denied (run as root).\n", 4);
+            return;
+        }
         let (out, code) = match cmd {
             "start" => res(self.start(&arg, 0)),
             "stop" => res(self.stop(&arg)),
@@ -364,7 +371,8 @@ fn main() {
     let ctl = cstr(unit::CTL);
     let fd = unsafe {
         libc::unlink(ctl.as_ptr());
-        libc::mknod(ctl.as_ptr(), libc::S_IFIFO | 0o600, 0);
+        libc::mknod(ctl.as_ptr(), libc::S_IFIFO | 0o622, 0);
+        libc::chmod(ctl.as_ptr(), 0o622);
         libc::open(ctl.as_ptr(), libc::O_RDWR)
     };
     let mut buf = String::new();

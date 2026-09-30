@@ -2,6 +2,7 @@
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
 use crate::cred;
 use crate::proc;
+use crate::signal::{self, Restart};
 use crate::socket;
 use crate::sysfile;
 use crate::timer;
@@ -79,6 +80,13 @@ mod nr {
     pub const FUTEX: u64 = 98;
     pub const SET_ROBUST_LIST: u64 = 99;
     pub const NANOSLEEP: u64 = 101;
+    pub const GETITIMER: u64 = 102;
+    pub const SETITIMER: u64 = 103;
+    pub const TIMER_CREATE: u64 = 107;
+    pub const TIMER_GETTIME: u64 = 108;
+    pub const TIMER_GETOVERRUN: u64 = 109;
+    pub const TIMER_SETTIME: u64 = 110;
+    pub const TIMER_DELETE: u64 = 111;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -87,9 +95,13 @@ mod nr {
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
+    pub const RT_SIGSUSPEND: u64 = 133;
     pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGPENDING: u64 = 136;
+    pub const RT_SIGTIMEDWAIT: u64 = 137;
+    pub const RT_SIGRETURN: u64 = 139;
     pub const REBOOT: u64 = 142;
     pub const SETREGID: u64 = 143;
     pub const SETGID: u64 = 144;
@@ -106,6 +118,7 @@ mod nr {
     pub const SETPGID: u64 = 154;
     pub const PRCTL: u64 = 167;
     pub const GETPGID: u64 = 155;
+    pub const GETSID: u64 = 156;
     pub const SETSID: u64 = 157;
     pub const UNAME: u64 = 160;
     pub const GETRLIMIT: u64 = 163;
@@ -159,9 +172,12 @@ fn int(v: u64) -> i64 {
     v as i32 as i64
 }
 
-pub fn dispatch(tf: &mut TrapFrame) {
+/// システムコールを動かす。待ちが割り込まれて EINTR になったら、その情報を返す
+pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
     let a = tf.x;
+    let nr = tf.x[8];
+    proc::current().orig_x0 = tf.x[0];
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         DUP => sysfile::dup(a[0]),
@@ -234,16 +250,29 @@ pub fn dispatch(tf: &mut TrapFrame) {
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
-        KILL => sys_kill(int(a[0]), a[1] as i32),
-        TKILL => proc::kill_thread(a[0] as u32, a[1] as i32).map(|_| 0),
-        TGKILL => proc::kill_thread(a[1] as u32, a[2] as i32).map(|_| 0),
+        KILL => signal::kill(int(a[0]), a[1] as i32),
+        TKILL => signal::tgkill(0, a[0] as u32, a[1] as i32),
+        TGKILL => signal::tgkill(a[0] as u32, a[1] as u32, a[2] as i32),
+        RT_SIGSUSPEND => signal::rt_sigsuspend(a[0] as usize),
+        RT_SIGPENDING => signal::rt_sigpending(a[0] as usize),
+        RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(a[0] as usize, a[1] as usize, a[2] as usize),
+        RT_SIGRETURN => signal::rt_sigreturn(tf),
+        SETITIMER => signal::setitimer(a[0], a[1] as usize, a[2] as usize),
+        GETITIMER => signal::getitimer(a[0], a[1] as usize),
+        TIMER_CREATE => signal::timer_create(a[0], a[1] as usize, a[2] as usize),
+        TIMER_SETTIME => signal::timer_settime(a[0] as i32, a[1], a[2] as usize, a[3] as usize),
+        TIMER_GETTIME => signal::timer_gettime(a[0] as i32, a[1] as usize),
+        TIMER_GETOVERRUN => signal::timer_getoverrun(a[0] as i32),
+        TIMER_DELETE => signal::timer_delete(a[0] as i32),
         SET_TID_ADDRESS => {
             let p = proc::current();
             p.clear_tid = a[0] as usize;
             Ok(p.pid as i64)
         }
         FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize),
-        GETPID | GETPGID => Ok(proc::current().tgid as i64),
+        GETPID => Ok(proc::current().tgid as i64),
+        GETPGID => signal::getpgid(a[0] as u32),
+        GETSID => signal::getsid(a[0] as u32),
         GETTID => Ok(proc::current().pid as i64),
         GETPPID => Ok(proc::current().ppid as i64),
         GETUID => Ok(proc::current().cred.uid as i64),
@@ -262,20 +291,22 @@ pub fn dispatch(tf: &mut TrapFrame) {
         SETFSGID => cred::setfsgid(a[0]),
         GETGROUPS => cred::getgroups(a[0] as usize, a[1] as usize),
         SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
-        SETPGID | SETSID => Ok(0),
+        SETPGID => signal::setpgid(a[0] as u32, a[1] as u32),
+        SETSID => signal::setsid(),
         UMASK => Ok(0o022),
         SET_ROBUST_LIST | MEMBARRIER => Ok(0),
         RSEQ => Err(-ENOSYS),
-        SIGALTSTACK | RT_SIGPROCMASK => Ok(0),
-        RT_SIGACTION => sys_rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
+        SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),
+        RT_SIGPROCMASK => signal::rt_sigprocmask(a[0], a[1] as usize, a[2] as usize),
+        RT_SIGACTION => signal::rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
         PRCTL => Ok(0),
         SCHED_YIELD => {
             proc::yield_now();
             Ok(0)
         }
         SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
-        NANOSLEEP => sys_nanosleep(a[0] as usize),
-        CLOCK_NANOSLEEP => sys_nanosleep(a[2] as usize),
+        NANOSLEEP => sys_nanosleep(1, 0, a[0] as usize, a[1] as usize),
+        CLOCK_NANOSLEEP => sys_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
         CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
         CLOCK_GETRES => sys_clock_getres(a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
@@ -297,7 +328,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
+    // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
+    let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
+    (r == Err(-EINTR_)).then_some(Restart { restartable })
 }
+
+const EINTR_: i64 = 4;
 
 type R = Result<i64, i64>;
 
@@ -472,11 +508,23 @@ fn ns_to_ticks(ns: u64) -> u64 {
     (ns / 1000).saturating_mul(timer::HZ).div_ceil(1_000_000).max(1)
 }
 
-fn sys_nanosleep(req: usize) -> R {
-    let until = timer::ticks() + ns_to_ticks(read_timespec(req)?);
+/// nanosleep / clock_nanosleep。シグナルで起こされたら残りを rem に書いて EINTR
+fn sys_nanosleep(clock: u64, flags: u64, req: usize, rem: usize) -> R {
+    const TIMER_ABSTIME: u64 = 1;
+    let want = read_timespec(req)?;
+    let now_ns = || if clock == CLOCK_REALTIME { timer::epoch_ns() } else { timer::uptime_ns() };
+    let rel = if flags & TIMER_ABSTIME != 0 { want.saturating_sub(now_ns()) } else { want };
+    let start = timer::ticks();
+    let until = start + ns_to_ticks(rel);
     while timer::ticks() < until {
         // chan 0 は誰も起こさないので、期限まで眠る
-        proc::sleep_until(0, until)?;
+        if let Err(e) = proc::sleep_until(0, until) {
+            if rem != 0 && flags & TIMER_ABSTIME == 0 {
+                let left = (until - timer::ticks().min(until)) * 1_000_000_000 / timer::HZ;
+                out(rem, &timespec(left))?;
+            }
+            return Err(e);
+        }
     }
     Ok(0)
 }
@@ -525,31 +573,6 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
     }
 }
 
-fn sys_kill(pid: i64, sig: i32) -> R {
-    let target = if pid <= 0 { proc::current().tgid } else { pid as u32 };
-    proc::kill_thread(target, sig).map(|_| 0)
-}
-
-/// ハンドラを覚えるだけ (SIGPIPE などの既定動作を決めるのに使う)
-fn sys_rt_sigaction(sig: usize, act: usize, oact: usize) -> R {
-    if sig == 0 || sig >= proc::NSIG {
-        return Err(-EINVAL);
-    }
-    let p = proc::current();
-    let old = p.sig_handlers[sig];
-    if act != 0 {
-        let mut h = [0u8; 8];
-        p.pt().copy_in(&mut h, act).ok_or(-EFAULT)?;
-        p.sig_handlers[sig] = u64::from_le_bytes(h);
-    }
-    if oact != 0 {
-        // struct k_sigaction { handler, flags, restorer, mask }
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&old.to_le_bytes());
-        out(oact, &b)?;
-    }
-    Ok(0)
-}
 
 const MAXARG: usize = 256;
 const MAXSTR: usize = 32 * 1024;

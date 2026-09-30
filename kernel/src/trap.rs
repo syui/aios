@@ -1,5 +1,5 @@
 // 例外ベクタ (VBAR_EL1) とトラップ処理
-use crate::{gic, proc, syscall, timer};
+use crate::{gic, proc, signal, syscall, timer};
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -107,6 +107,9 @@ const EC_SVC64: u64 = 0x15;
 const EC_IABT_LOW: u64 = 0x20;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_BRK64: u64 = 0x3c;
+const EC_PC_ALIGN: u64 = 0x22;
+const EC_SP_ALIGN: u64 = 0x26;
+const EC_FP: u64 = 0x2c;
 
 pub fn init() {
     unsafe extern "C" {
@@ -159,16 +162,23 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             let (esr, far) = esr_far();
             match esr >> 26 {
                 EC_SVC64 => {
-                    syscall::dispatch(tf);
+                    let intr = syscall::dispatch(tf);
                     proc::check_killed();
-                }
-                ec @ (EC_IABT_LOW | EC_DABT_LOW) => {
-                    println!("user fault: ec={:#x} elr={:#x} far={:#x}", ec, tf.elr, far);
-                    proc::exit(-1);
+                    signal::deliver(tf, intr);
                 }
                 ec => {
-                    println!("user exception: esr={:#x} (ec={:#x}) elr={:#x}", esr, ec, tf.elr);
-                    proc::exit(-1);
+                    // 例外はシグナルにして、今のスレッドに必ず届ける
+                    let (sig, code, addr) = match ec {
+                        EC_IABT_LOW | EC_DABT_LOW => (signal::SIGSEGV, signal::SEGV_MAPERR, far),
+                        EC_PC_ALIGN | EC_SP_ALIGN => (signal::SIGBUS, 1, far),
+                        EC_BRK64 => (signal::SIGTRAP, 1, tf.elr),
+                        EC_FP => (signal::SIGFPE, 0, tf.elr),
+                        _ => (signal::SIGILL, 1, tf.elr),
+                    };
+                    let _ = esr;
+                    signal::force(sig, signal::SigInfo { code, addr, ..signal::SigInfo::ZERO });
+                    proc::check_killed();
+                    signal::deliver(tf, None);
                 }
             }
         }
@@ -188,6 +198,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                     proc::yield_now();
                 }
                 proc::check_killed();
+                signal::deliver(tf, None);
             }
         }
         _ => panic!("unexpected exception kind {} elr={:#x}", kind, tf.elr),

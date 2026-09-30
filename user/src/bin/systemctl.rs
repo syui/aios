@@ -12,7 +12,8 @@ use std::process::exit;
 
 /// init に 1 つ頼んで、(終了コード, 本文) を受け取る
 fn ask(cmd: &str, arg: &str) -> (i32, String) {
-    let reply = format!("/run/systemctl.{}", std::process::id());
+    // 返事の FIFO は誰でも作れる /tmp に。init はその持ち主で頼んだ人を見分ける
+    let reply = format!("/tmp/.systemctl.{}", std::process::id());
     let c = CString::new(reply.as_str()).unwrap();
     unsafe {
         libc::unlink(c.as_ptr());

@@ -201,8 +201,10 @@ fn spawn(cmds: Vec<Cmd>) -> i32 {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
-                // Rust は SIGPIPE を無視するが、子には既定の動作で渡す
+                // Rust は SIGPIPE を、シェルは SIGINT/SIGQUIT を無視するが、子には既定の動作で渡す
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
                 if prev_read >= 0 {
                     libc::dup2(prev_read, 0);
                     libc::close(prev_read);
@@ -378,6 +380,12 @@ fn main() {
             status = run(line.trim(), status);
         }
         std::process::exit(status);
+    }
+    // 対話するシェルは Ctrl-C で終わらず、自分のグループを端末の前に出す
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::tcsetpgrp(0, libc::getpgrp());
     }
     let stdin = io::stdin();
     let mut status = 0;

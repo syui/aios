@@ -55,6 +55,8 @@ const ECHO: u32 = 0o10;
 const FIONBIO: u64 = 0x5421;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCGPGRP: u64 = 0x540f;
+const TIOCSPGRP: u64 = 0x5410;
+const TIOCSCTTY: u64 = 0x540e;
 
 const UMASK: u32 = 0o022;
 
@@ -153,10 +155,10 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
     let r = f.borrow_mut().write(&tmp);
-    if r == Err(-file::EPIPE) && proc::current().sig_handlers[proc::SIGPIPE as usize] == 0 {
-        // 読み手のいないパイプ: SIGPIPE の既定動作で終わる
-        drop(f);
-        proc::die(proc::SIGPIPE);
+    if r == Err(-file::EPIPE) {
+        // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
+        let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
+        crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
     }
     Ok(r? as i64)
 }
@@ -675,7 +677,18 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
             Ok(0)
         }
         TIOCGPGRP => {
-            out(arg, &(proc::current().tgid as i32).to_le_bytes())?;
+            let pg = crate::console::fg_pgrp();
+            out(arg, &(if pg == 0 { proc::current().pgid } else { pg } as i32).to_le_bytes())?;
+            Ok(0)
+        }
+        TIOCSPGRP => {
+            let mut b = [0u8; 4];
+            proc::current().pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
+            crate::console::set_fg_pgrp(u32::from_le_bytes(b));
+            Ok(0)
+        }
+        TIOCSCTTY => {
+            crate::console::set_fg_pgrp(proc::current().pgid);
             Ok(0)
         }
         _ => Err(-ENOTTY),

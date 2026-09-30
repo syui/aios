@@ -20,6 +20,7 @@ mod memlayout;
 mod net;
 mod proc;
 mod rand;
+mod signal;
 mod socket;
 mod spinlock;
 mod syscall;

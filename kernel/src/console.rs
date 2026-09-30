@@ -13,6 +13,17 @@ struct Input {
 
 static mut INPUT: Input = Input { buf: [0; BUF], r: 0, w: 0, e: 0 };
 
+/// 前にいるプロセスグループ (Ctrl-C の SIGINT を受け取る)
+static mut FG_PGRP: u32 = 0;
+
+pub fn fg_pgrp() -> u32 {
+    unsafe { FG_PGRP }
+}
+
+pub fn set_fg_pgrp(pg: u32) {
+    unsafe { FG_PGRP = pg };
+}
+
 /// 打った文字を画面に出すか (termios の ECHO)
 static mut ECHO: bool = true;
 
@@ -33,6 +44,8 @@ fn chan() -> usize {
 }
 
 const CTRL_D: u8 = 4;
+const CTRL_C: u8 = 0x03;
+const CTRL_BACKSLASH: u8 = 0x1c;
 const CTRL_P: u8 = 0x10;
 const CTRL_U: u8 = 0x15;
 const BS: u8 = 0x08;
@@ -63,6 +76,21 @@ pub fn intr(c: u8) {
             }
         }
         CTRL_P => proc::dump(),
+        CTRL_C | CTRL_BACKSLASH => {
+            // 編集中の行を捨て、前にいるグループへ SIGINT / SIGQUIT
+            i.e = i.w;
+            {
+                let _g = uart::LOCK.lock();
+                for &ch in if c == CTRL_C { b"^C\r\n" } else { b"^\\\r\n" } {
+                    uart::putc(ch);
+                }
+            }
+            let sig = if c == CTRL_C { crate::signal::SIGINT } else { crate::signal::SIGQUIT };
+            let pg = fg_pgrp();
+            if pg != 0 {
+                crate::signal::send_pgrp(pg, sig, crate::signal::SigInfo { code: crate::signal::SI_KERNEL, ..crate::signal::SigInfo::ZERO });
+            }
+        }
         CTRL_U => {
             while i.e != i.w && i.buf[(i.e - 1) % BUF] != b'\n' {
                 i.e -= 1;
