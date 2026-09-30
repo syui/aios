@@ -42,6 +42,32 @@ pub struct Image {
     pub brk: usize,
 }
 
+/// "#!" の後ろの 1 行を (インタプリタ, 引数) に分ける。
+/// Linux と同じく、引数は空白で分けず残り全部を 1 つとして渡す
+fn parse_shebang(b: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let line = &b[..b.iter().position(|&c| c == b'\n')?];
+    let is_sp = |c: &u8| *c == b' ' || *c == b'\t';
+    let line = trim(line, is_sp);
+    let (interp, rest) = match line.iter().position(is_sp) {
+        Some(i) => (&line[..i], trim(&line[i..], is_sp)),
+        None => (line, &line[..0]),
+    };
+    if interp.is_empty() {
+        return None;
+    }
+    Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
+}
+
+fn trim(mut s: &[u8], sp: impl Fn(&u8) -> bool) -> &[u8] {
+    while s.first().is_some_and(&sp) {
+        s = &s[1..];
+    }
+    while s.last().is_some_and(&sp) {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
 fn u16_at(b: &[u8], o: usize) -> usize {
     u16::from_le_bytes([b[o], b[o + 1]]) as usize
 }
@@ -53,11 +79,31 @@ fn u64_at(b: &[u8], o: usize) -> usize {
 }
 
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
+    exec_depth(path, argv, envp, 0)
+}
+
+fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
     let ino = crate::vfs::resolve(&cwd, path, true)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
+    }
+    // #! で始まるスクリプトは、書かれたインタプリタにスクリプトのパスを渡して動かす
+    let mut head = [0u8; 256];
+    let n = ino.read_at(0, &mut head)?;
+    if n >= 2 && &head[..2] == b"#!" {
+        const ELOOP: i64 = 40;
+        if depth >= 4 {
+            return Err(-ELOOP);
+        }
+        let (interp, arg) = parse_shebang(&head[2..n]).ok_or(-ENOEXEC)?;
+        let interp_s = core::str::from_utf8(&interp).map_err(|_| -ENOEXEC)?;
+        let mut nargv = alloc::vec![interp.clone()];
+        nargv.extend(arg);
+        nargv.push(path.as_bytes().to_vec());
+        nargv.extend(argv.iter().skip(1).cloned());
+        return exec_depth(interp_s, &nargv, envp, depth + 1);
     }
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);

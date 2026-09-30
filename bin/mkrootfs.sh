@@ -50,6 +50,11 @@ for pkg in "$@"; do
       out=build/grep/target/aarch64-unknown-linux-musl/release
       [ -x "$out/grep" ] || pkg/grep.sh
       cp "$out/grep" rootfs/bin/grep
+      # GNU と同じく egrep / fgrep は grep -E / -F を呼ぶだけのスクリプト
+      for v in egrep:E fgrep:F; do
+        printf '#!/bin/sh\nexec grep -%s "$@"\n' "${v#*:}" > "rootfs/bin/${v%:*}"
+        chmod 755 "rootfs/bin/${v%:*}"
+      done
       ;;
     *) echo "unknown pkg: $pkg" >&2; exit 1 ;;
   esac

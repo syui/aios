@@ -1,6 +1,6 @@
 // aios の小さなシェル (sh -c CMD、sh FILE も)
-//   パイプ |、つけかえ < > >>、並べる ; &&、クォート ' " \、変数 $VAR $?
-//   組み込み: cd, exit, export
+//   パイプ |、つけかえ < > >>、並べる ; &&、クォート ' " \、変数 $VAR $? $0..$9 $# "$@"
+//   組み込み: cd, exit, export, exec
 use std::ffi::CString;
 use std::io::{self, Write};
 
@@ -13,10 +13,24 @@ enum Tok {
     GtGt,
 }
 
+/// 位置パラメータ ($0 と $1 以降)
+static mut ARGS: Vec<String> = Vec::new();
+
+fn params() -> &'static [String] {
+    unsafe { &*(&raw const ARGS) }
+}
+
+fn set_params(v: Vec<String>) {
+    unsafe { *(&raw mut ARGS) = v };
+}
+
 fn var(name: &str, status: i32) -> String {
     match name {
         "?" => status.to_string(),
         "$" => std::process::id().to_string(),
+        "#" => params().len().saturating_sub(1).to_string(),
+        "@" | "*" => params().get(1..).unwrap_or(&[]).join(" "),
+        n if n.chars().all(|c| c.is_ascii_digit()) => n.parse::<usize>().ok().and_then(|i| params().get(i)).cloned().unwrap_or_default(),
         _ => std::env::var(name).unwrap_or_default(),
     }
 }
@@ -29,7 +43,7 @@ fn read_var(cs: &[char], i: &mut usize, status: i32) -> String {
         *i = (end + 1).min(cs.len());
         return var(&cs[start..end].iter().collect::<String>(), status);
     }
-    if *i < cs.len() && (cs[*i] == '?' || cs[*i] == '$') {
+    if *i < cs.len() && matches!(cs[*i], '?' | '$' | '#' | '@' | '*' | '0'..='9') {
         *i += 1;
         return var(&cs[*i - 1].to_string(), status);
     }
@@ -88,6 +102,7 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             '"' => {
+                let mut empty_at = false;
                 let w = word.get_or_insert_with(String::new);
                 loop {
                     match cs.get(i) {
@@ -95,6 +110,23 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
                         Some('\\') if matches!(cs.get(i + 1), Some('"' | '\\' | '$')) => {
                             w.push(cs[i + 1]);
                             i += 1;
+                        }
+                        Some('$') if cs.get(i + 1) == Some(&'@') => {
+                            // "$@" は引数ごとに別の語になる
+                            i += 2;
+                            let ps = params().get(1..).unwrap_or(&[]);
+                            for (k, p) in ps.iter().enumerate() {
+                                if k > 0 {
+                                    toks.push(Tok::Word(std::mem::take(w)));
+                                }
+                                w.push_str(p);
+                            }
+                            if ps.is_empty() && w.is_empty() && cs.get(i) == Some(&'"') {
+                                // 引数がなければ "$@" は何も残さない
+                                empty_at = true;
+                                break;
+                            }
+                            continue;
                         }
                         Some('$') => {
                             i += 1;
@@ -107,6 +139,9 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
                     i += 1;
                 }
                 i += 1;
+                if empty_at {
+                    word = None;
+                }
             }
             '\\' => {
                 if let Some(&n) = cs.get(i) {
@@ -277,6 +312,24 @@ fn builtin(args: &[String], status: i32) -> Option<i32> {
                 }
             })
         }
+        "exec" if args.len() > 1 => {
+            let Some(prog) = find(&args[1]) else {
+                eprintln!("sh: {}: command not found", args[1]);
+                std::process::exit(127);
+            };
+            let cargs: Vec<CString> = args[1..].iter().map(|a| CString::new(a.as_str()).unwrap()).collect();
+            let mut argv: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
+            argv.push(std::ptr::null());
+            let env: Vec<CString> = std::env::vars().map(|(k, v)| CString::new(format!("{k}={v}")).unwrap()).collect();
+            let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
+            envp.push(std::ptr::null());
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            }
+            eprintln!("sh: {}: {}", args[1], io::Error::last_os_error());
+            std::process::exit(126);
+        }
         "export" => {
             for a in &args[1..] {
                 if let Some((k, v)) = a.split_once('=') {
@@ -364,11 +417,18 @@ fn run(line: &str, mut status: i32) -> i32 {
 fn main() {
     // sh -c CMD / sh FILE
     let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "-c") {
+    if let Some(i) = args.get(1).filter(|a| *a == "-c").map(|_| 1) {
         let cmd = args.get(i + 1).cloned().unwrap_or_default();
+        // sh -c CMD NAME ARGS... は NAME が $0
+        let mut ps: Vec<String> = args.get(i + 2..).unwrap_or(&[]).to_vec();
+        if ps.is_empty() {
+            ps.push(args[0].clone());
+        }
+        set_params(ps);
         std::process::exit(run(&cmd, 0));
     }
     if let Some(file) = args.get(1).filter(|a| !a.starts_with('-')) {
+        set_params(args[1..].to_vec());
         let text = match std::fs::read_to_string(file) {
             Ok(t) => t,
             Err(e) => {
@@ -382,6 +442,7 @@ fn main() {
         }
         std::process::exit(status);
     }
+    set_params(vec![args[0].clone()]);
     // 対話するシェルは Ctrl-C で終わらず (打ちかけの行を捨てて新しいプロンプトへ)、
     // 自分のグループを端末の前に出す
     unsafe {
