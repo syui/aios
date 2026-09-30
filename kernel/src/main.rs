@@ -15,7 +15,7 @@ mod exec;
 mod extfs;
 mod file;
 mod fs;
-mod gic;
+mod irq;
 mod heap;
 mod initrd;
 mod kalloc;
@@ -48,12 +48,15 @@ fn current_el() -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
+    // 出力の場所 (UART) は DTB で決まるので、何よりも先に DTB を読む
+    let has_dtb = dtb::init();
+    uart::early_init();
     println!();
     println!("aios {} (aarch64)", env!("AIOS_RELEASE"));
     println!("hello from EL{}", current_el());
 
     trap::init();
-    if dtb::init() {
+    if has_dtb {
         if let Some((base, size)) = dtb::memory() {
             memlayout::set_ram(base as usize, size as usize);
         }
@@ -64,7 +67,7 @@ pub extern "C" fn kmain() -> ! {
     println!("initrd: {} entries", initrd::count());
     dtb::summary();
 
-    gic::init();
+    irq::init();
     timer::init();
     uart::init();
     fs::init();

@@ -1,7 +1,7 @@
 // ARM generic timer (EL1 physical timer, PPI 14 = INTID 30)
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const IRQ: u32 = 30;
+pub const IRQ: u32 = crate::irq::TIMER;
 pub const HZ: u64 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -9,7 +9,8 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 fn freq() -> u64 {
     let f: u64;
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f) };
-    f
+    // ファームウェアが設定していなければ、ラズパイの水晶 (19.2 MHz)
+    if f == 0 { 19_200_000 } else { f }
 }
 
 fn rearm() {
@@ -19,13 +20,18 @@ fn rearm() {
     }
 }
 
-/// 起動したときの時刻 (UNIX 秒, PL031 RTC から)
+/// 起動したときの時刻 (UNIX 秒)。PL031 RTC があればそこから、なければ (ラズパイには
+/// RTC がない) カーネルを作った時刻から始める
 static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
-    let epoch = unsafe { core::ptr::read_volatile(crate::memlayout::RTC as *const u32) };
-    BOOT_EPOCH.store(epoch as u64 - uptime_ns() / 1_000_000_000, Ordering::Relaxed);
-    crate::gic::enable(IRQ);
+    let rtc = if crate::dtb::present() { crate::dtb::reg_of("arm,pl031", 0).map(|(a, _)| a as usize) } else { Some(0x0901_0000) };
+    let epoch = match rtc {
+        Some(pa) => (unsafe { core::ptr::read_volatile(crate::memlayout::p2v(pa) as *const u32) }) as u64,
+        None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),
+    };
+    BOOT_EPOCH.store(epoch.saturating_sub(uptime_ns() / 1_000_000_000), Ordering::Relaxed);
+    crate::irq::enable(IRQ);
     rearm();
 }
 

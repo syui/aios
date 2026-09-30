@@ -1,11 +1,12 @@
 // virtio-mmio (version 2) の共通部分: デバイス探し、初期化、virtqueue
 use crate::kalloc;
-use crate::memlayout::{v2p, KBASE, PGSIZE};
+use crate::memlayout::{p2v, v2p, PGSIZE};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
 /// qemu virt は PA 0x0a00_0000 から 0x200 おきに 32 個のスロット。割り込みは SPI 16 + スロット
-const MMIO_BASE: usize = KBASE + 0x0a00_0000;
+/// DTB がないときの場所 (qemu virt)
+const MMIO_BASE: usize = 0x0a00_0000;
 const MMIO_STRIDE: usize = 0x200;
 const MMIO_SLOTS: usize = 32;
 const IRQ_BASE: u32 = 32 + 16;
@@ -70,8 +71,16 @@ impl Mmio {
 /// device_id のデバイスを探して、wanted の機能 (VERSION_1 は自動で足す) で初期化する。
 /// キューの設定は呼ぶ側が Queue::new で行い、最後に ready を呼ぶ
 pub fn probe(device_id: u32, wanted: u64) -> Option<(Mmio, u64)> {
-    for i in 0..MMIO_SLOTS {
-        let m = Mmio { base: MMIO_BASE + i * MMIO_STRIDE, irq: IRQ_BASE + i as u32 };
+    // DTB があればそこに書かれたもの (base, GIC の INTID)、なければ qemu virt の決まった場所
+    let mut slots = alloc::vec::Vec::new();
+    if crate::dtb::present() {
+        crate::dtb::each_virtio(|base, spi| slots.push((base as usize, 32 + spi)));
+        slots.sort();
+    } else {
+        slots.extend((0..MMIO_SLOTS).map(|i| (MMIO_BASE + i * MMIO_STRIDE, IRQ_BASE + i as u32)));
+    }
+    for (pa, irq) in slots {
+        let m = Mmio { base: p2v(pa), irq };
         if m.rd(MAGIC) != 0x7472_6976 || m.rd(DEVICE_ID) != device_id {
             continue;
         }
