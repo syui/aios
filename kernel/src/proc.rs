@@ -18,10 +18,8 @@ const KSTACK_SIZE: usize = 16 * 1024;
 pub const MMAP_BASE: usize = 0x10_0000_0000;
 
 pub const EINTR: i64 = 4;
-pub const NSIG: usize = 65;
-pub const SIG_IGN: u64 = 1;
-pub const SIGKILL: i32 = 9;
-pub const SIGPIPE: i32 = 13;
+pub use crate::signal::{NSIG, SIGKILL};
+use crate::signal::{AltStack, PosixTimer, SigInfo, SigTable};
 
 /// exit(code) の wait status
 fn exited(code: i32) -> i32 {
@@ -113,10 +111,10 @@ impl Context {
 /// EL0 の FP/SIMD レジスタ (q0-q31, fpcr, fpsr)
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
-struct FpState {
-    q: [u128; 32],
-    fpcr: u64,
-    fpsr: u64,
+pub struct FpState {
+    pub q: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
 impl FpState {
@@ -137,8 +135,27 @@ pub struct Proc {
     pub killed: bool,
     /// スレッドグループ全体の終了 status (代表スレッドに置く)
     group_exit: Option<i32>,
-    /// シグナルごとのハンドラ (SIG_DFL = 0, SIG_IGN = 1)。まだ呼び出しはしない
-    pub sig_handlers: [u64; NSIG],
+    /// シグナルのハンドラ (スレッドグループで共有)
+    pub sigacts: Option<Shared<SigTable>>,
+    /// たまっているシグナルと、ブロックしているシグナル (ビット sig-1)
+    pub sig_pending: u64,
+    pub sig_mask: u64,
+    pub sig_info: [SigInfo; NSIG],
+    /// sigsuspend で一時的に変える前のマスク
+    pub saved_mask: Option<u64>,
+    /// rt_sigtimedwait で待っているシグナル (ブロックされていても起こす)
+    pub sigwait: u64,
+    pub altstack: AltStack,
+    /// プロセスグループとセッション
+    pub pgid: u32,
+    pub sid: u32,
+    /// システムコールに入ったときの x0 (やり直し用)
+    pub orig_x0: u64,
+    /// setitimer の (期限, 間隔) と POSIX タイマー (代表スレッドに置く)
+    pub itimer: (u64, u64),
+    pub timers: Vec<PosixTimer>,
+    /// 親が SIGCHLD を無視しているので、終わったらすぐ片付ける
+    autoreap: bool,
     /// ユーザーとグループ
     pub cred: crate::cred::Cred,
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
@@ -164,7 +181,19 @@ impl Proc {
         xstatus: 0,
         killed: false,
         group_exit: None,
-        sig_handlers: [0; NSIG],
+        sigacts: None,
+        sig_pending: 0,
+        sig_mask: 0,
+        sig_info: [SigInfo::ZERO; NSIG],
+        saved_mask: None,
+        sigwait: 0,
+        altstack: AltStack::NONE,
+        pgid: 0,
+        sid: 0,
+        orig_x0: 0,
+        itimer: (0, 0),
+        timers: Vec::new(),
+        autoreap: false,
         cred: crate::cred::Cred::ROOT,
         thread: false,
         clear_tid: 0,
@@ -382,6 +411,9 @@ pub fn user_init() {
         files.add(console.clone(), false, 0);
     }
     p.files = Some(Shared::new(files));
+    p.sigacts = Some(crate::signal::new_table());
+    p.pgid = p.pid;
+    p.sid = p.pid;
     p.state = State::Runnable;
 }
 
@@ -391,7 +423,7 @@ pub fn scheduler() -> ! {
         let mut ran = false;
         for i in 0..NPROC {
             let p = &mut procs()[i];
-            if p.state == State::Zombie && p.thread {
+            if p.state == State::Zombie && (p.thread || p.autoreap) {
                 // 終わったスレッドは誰も wait しないのでここで片付ける
                 *p = Proc::UNUSED;
                 continue;
@@ -442,7 +474,7 @@ pub fn sleep(chan: usize) -> Result<(), i64> {
 /// chan で起こされるか deadline (tick, 0 なら無し) まで眠る。時間切れなら Ok(false)
 pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     let p = current();
-    if p.killed {
+    if p.killed || crate::signal::deliverable(p) {
         return Err(-EINTR);
     }
     p.chan = chan;
@@ -453,7 +485,7 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     p.chan = 0;
     let timed_out = p.wake_at != 0 && crate::timer::ticks() >= p.wake_at;
     p.wake_at = 0;
-    if p.killed {
+    if p.killed || crate::signal::deliverable(p) {
         return Err(-EINTR);
     }
     Ok(!timed_out)
@@ -560,10 +592,21 @@ fn exit_status(status: i32) -> ! {
         }
     }
     p.files = None;
+    p.timers.clear();
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
     if let Some(parent) = find(p.ppid) {
-        wakeup(parent as *mut Proc as usize);
+        if crate::signal::parent_reaps_automatically(parent) {
+            p.autoreap = true;
+        } else {
+            let (code, st) = if p.xstatus & 0x7f != 0 { (crate::signal::CLD_KILLED, p.xstatus & 0x7f) } else { (crate::signal::CLD_EXITED, (p.xstatus >> 8) & 0xff) };
+            let info = SigInfo { code, pid: p.tgid, uid: p.cred.uid, status: st, ..SigInfo::ZERO };
+            let ppid = p.ppid;
+            let _ = crate::signal::send_group(ppid, crate::signal::SIGCHLD, info);
+        }
+        if let Some(parent) = find(current().ppid) {
+            wakeup(parent as *mut Proc as usize);
+        }
     }
     if let Some(init) = find(1) {
         wakeup(init as *mut Proc as usize);
@@ -607,6 +650,7 @@ pub fn check_killed() {
 
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -638,7 +682,17 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     let child = alloc_proc().ok_or(-EAGAIN)?;
     child.mm = Some(mm);
     child.files = Some(files);
-    child.sig_handlers = parent.sig_handlers;
+    child.sigacts = if flags & CLONE_SIGHAND != 0 {
+        parent.sigacts.clone()
+    } else {
+        parent.sigacts.as_ref().map(|t| crate::signal::copy_table(t))
+    };
+    child.sig_mask = parent.sig_mask;
+    child.pgid = parent.pgid;
+    child.sid = parent.sid;
+    if !thread {
+        child.altstack = parent.altstack;
+    }
     child.cred = parent.cred.clone();
     child.thread = thread;
     if thread {
@@ -691,11 +745,18 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
     for t in p.siblings() {
         kill_proc(t);
     }
-    for h in p.sig_handlers.iter_mut() {
-        if *h != SIG_IGN {
-            *h = 0;
+    // 呼ばれるハンドラは既定に戻す (無視はそのまま)。他のスレッドとは切り離す
+    if let Some(t) = p.sigacts.as_ref() {
+        let mut table = *t.get();
+        for a in table.iter_mut() {
+            if a.handler != crate::signal::SIG_IGN {
+                *a = crate::signal::SigAction::DFL;
+            }
         }
+        p.sigacts = Some(Shared::new(table));
     }
+    p.altstack = AltStack::NONE;
+    p.timers.clear();
     let old = p.mm.take();
     p.load_image(img);
     p.pt().activate();
@@ -742,31 +803,67 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     }
 }
 
-/// tid 宛てのシグナル。まだハンドラは呼べないので、無視されていなければグループごと終える
-pub fn kill_thread(tid: u32, sig: i32) -> Result<(), i64> {
-    const ESRCH: i64 = 3;
-    let me = current();
-    let target = find(tid).ok_or(-ESRCH)?;
-    // root でなければ、実 uid か実効 uid が相手の実 uid か保存された uid と同じときだけ
-    let (a, b) = (&me.cred, &target.cred);
-    if a.euid != 0 && a.uid != b.uid && a.uid != b.suid && a.euid != b.uid && a.euid != b.suid {
-        return Err(-crate::cred::EPERM);
+/// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る)
+pub fn interrupt(t: &mut Proc) {
+    if t.state == State::Sleeping {
+        t.state = State::Runnable;
     }
-    if sig <= 0 || sig as usize >= NSIG {
-        return if sig == 0 { Ok(()) } else { Err(-22) };
+}
+
+/// スレッドグループ全体を終わらせる (SIGKILL)
+pub fn kill_group(tgid: u32, sig: i32) {
+    if let Some(leader) = find(tgid) {
+        leader.group_exit.get_or_insert(sig & 0x7f);
     }
-    if target.sig_handlers[sig as usize] == SIG_IGN || sig == 17 || sig == 28 {
-        // 無視、または既定で無視される SIGCHLD / SIGWINCH
-        return Ok(());
-    }
-    if target.tgid == me.tgid {
-        die(sig);
-    }
-    let leader = find(target.tgid).ok_or(-ESRCH)?;
-    leader.group_exit.get_or_insert(sig & 0x7f);
-    kill_proc(leader);
-    for t in procs().iter_mut().filter(|p| p.state != State::Unused && p.tgid == leader.tgid) {
+    for t in procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid) {
         kill_proc(t);
     }
-    Ok(())
+}
+
+pub fn threads_of(tgid: u32) -> Vec<&'static mut Proc> {
+    procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid).collect()
+}
+
+pub fn find_thread(tid: u32) -> Option<&'static mut Proc> {
+    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tid)
+}
+
+pub fn find_leader(tgid: u32) -> Option<&'static mut Proc> {
+    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tgid && !p.thread)
+}
+
+pub fn all_leaders() -> Vec<u32> {
+    procs().iter().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).map(|p| p.tgid).collect()
+}
+
+pub fn all_leader_procs() -> Vec<&'static mut Proc> {
+    procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).collect()
+}
+
+pub fn leaders_in_pgrp(pgid: u32) -> Vec<u32> {
+    procs().iter().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread && p.pgid == pgid).map(|p| p.tgid).collect()
+}
+
+pub fn current_leader() -> &'static mut Proc {
+    let tgid = current().tgid;
+    find_leader(tgid).unwrap_or_else(current)
+}
+
+/// (tgid, 実 uid): siginfo の送り主
+pub fn current_ids() -> (u32, u32) {
+    match unsafe { CURRENT } {
+        Some(i) => (procs()[i].tgid, procs()[i].cred.uid),
+        None => (0, 0),
+    }
+}
+
+/// いまの EL0 の FP/SIMD レジスタ (ハードウェアにあるもの) を写す / 戻す
+pub fn fp_snapshot() -> FpState {
+    let mut f = FpState::ZERO;
+    unsafe { fp_save(&mut f) };
+    f
+}
+
+pub fn fp_restore(f: &FpState) {
+    unsafe { fp_load(f) };
 }
