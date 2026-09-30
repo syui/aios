@@ -12,3 +12,10 @@ path = "src/bin/init.rs"
 panic = "abort"
 opt-level = "s"
 strip = true
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+[dependencies]
+libc = "0.2"

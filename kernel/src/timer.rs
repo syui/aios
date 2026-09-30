@@ -24,8 +24,18 @@ pub fn init() {
     rearm();
 }
 
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// sleep している人が待つ channel
+pub fn chan() -> usize {
+    (&raw const TICKS) as usize
+}
+
 pub fn tick() {
     // 割り込み中の cpu0 だけが書く
     TICKS.store(TICKS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    crate::proc::wakeup(chan());
     rearm();
 }

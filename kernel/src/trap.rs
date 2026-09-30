@@ -121,18 +121,6 @@ pub fn init() {
     }
 }
 
-/// tf を復元して eret する (EL0 へ入るときに使う)
-pub fn user_return(tf: &mut TrapFrame) -> ! {
-    unsafe {
-        core::arch::asm!(
-            "mov sp, {}",
-            "b trap_ret",
-            in(reg) tf as *mut TrapFrame,
-            options(noreturn),
-        )
-    }
-}
-
 fn esr_far() -> (u64, u64) {
     let esr: u64;
     let far: u64;
@@ -145,6 +133,10 @@ fn esr_far() -> (u64, u64) {
 
 pub fn intr_on() {
     unsafe { core::arch::asm!("msr daifclr, #2") };
+}
+
+pub fn intr_off() {
+    unsafe { core::arch::asm!("msr daifset, #2") };
 }
 
 #[unsafe(no_mangle)]
@@ -166,10 +158,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         EL0_SYNC => {
             let (esr, far) = esr_far();
             match esr >> 26 {
-                EC_SVC64 => {
-                    intr_on();
-                    syscall::dispatch(tf);
-                }
+                EC_SVC64 => syscall::dispatch(tf),
                 ec @ (EC_IABT_LOW | EC_DABT_LOW) => {
                     println!("user fault: ec={:#x} elr={:#x} far={:#x}", ec, tf.elr, far);
                     proc::exit(-1);
@@ -188,6 +177,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                 _ => println!("irq: unexpected {}", id),
             }
             gic::complete(id);
+            // EL0 で走っていたなら順番をゆずる
+            if kind == EL0_IRQ && id == timer::IRQ {
+                proc::yield_now();
+            }
         }
         _ => panic!("unexpected exception kind {} elr={:#x}", kind, tf.elr),
     }
