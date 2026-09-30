@@ -2,12 +2,13 @@
 //
 // UEFI はこの Image を好きな場所に読み込み、恒等写像の MMU を入れたまま efi_entry を呼ぶ。
 // カーネルは RAM の先頭 + 0x80000 で動く作りなので (boot.rs)、
-//   1. 設定テーブルから DTB を探す
+//   1. 設定テーブルから DTB を探し、LoadOptions (systemd-boot の options や UEFI シェルの引数) を
+//      カーネルのコマンドラインとして覚える
 //   2. RAM の先頭 + 0x80000 を AllocatePages で押さえる
 //   3. ExitBootServices
 //   4. そこへ自分を写し、キャッシュを掃き出し、MMU とキャッシュを切って primary へ (x0 = DTB)
 // ここはリンクした場所 (上位アドレス) ではないところで動くので、PC 相対でしか
-// 読み書きしない (static を使わない、パニックしない)。
+// 読み書きしない (パニックしない。static は adrp で PC 相対に指されるので、写す前の自分に書ける)。
 use core::ptr::read_volatile;
 
 type Status = usize;
@@ -22,11 +23,63 @@ const ST_TABLES: usize = 0x70;
 const BS_ALLOCATE_PAGES: usize = 0x28;
 const BS_GET_MEMORY_MAP: usize = 0x38;
 const BS_ALLOCATE_POOL: usize = 0x40;
+const BS_HANDLE_PROTOCOL: usize = 0x98;
 const BS_EXIT_BOOT_SERVICES: usize = 0xe8;
 const ALLOCATE_ADDRESS: usize = 2;
 const LOADER_DATA: usize = 2;
 
 /// DTB の設定テーブルの GUID (b1b621d5-f19c-41a5-830b-d9152c69aae0)
+/// EFI_LOADED_IMAGE_PROTOCOL (5b1b31a1-9562-11d2-8e3f-00a0c969723b) と、その中の LoadOptionsSize / LoadOptions
+const LOADED_IMAGE_GUID: [u8; 16] = [0xa1, 0x31, 0x1b, 0x5b, 0x62, 0x95, 0xd2, 0x11, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b];
+const LI_OPTIONS_SIZE: usize = 0x30;
+const LI_OPTIONS: usize = 0x38;
+
+/// UEFI から渡されたコマンドライン (NUL まで)。bss は primary で消されるので .data に置く
+#[unsafe(link_section = ".data")]
+static mut CMDLINE: [u8; 512] = [0; 512];
+
+/// UEFI から起動したときのコマンドライン (DTB の bootargs より優先する)
+pub fn cmdline() -> Option<&'static str> {
+    let b = unsafe { &*(&raw const CMDLINE) };
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    core::str::from_utf8(&b[..n]).ok().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// LoadOptions (UTF-16) を CMDLINE へ。表示できる ASCII だけのときだけ (ブートメニューの
+/// 項目は文字列でないデータを渡してくることがある)
+unsafe fn save_options(image: usize, bs: usize, st: usize) {
+    unsafe {
+        let handle: extern "efiapi" fn(usize, usize, usize) -> Status = core::mem::transmute(rd64(bs + BS_HANDLE_PROTOCOL));
+        let mut li = 0usize;
+        if handle(image, LOADED_IMAGE_GUID.as_ptr() as usize, &mut li as *mut usize as usize) != EFI_SUCCESS || li == 0 {
+            return;
+        }
+        let size = read_volatile((li + LI_OPTIONS_SIZE) as *const u32) as usize;
+        let opts = rd64(li + LI_OPTIONS);
+        if opts == 0 || size < 2 {
+            return;
+        }
+        let buf = &mut *(&raw mut CMDLINE);
+        let mut n = 0;
+        for i in 0..size / 2 {
+            let c = read_volatile((opts + i * 2) as *const u16);
+            if c == 0 {
+                break;
+            }
+            if !(0x20..0x7f).contains(&c) || n + 1 >= buf.len() {
+                buf[0] = 0;
+                return;
+            }
+            buf[n] = c as u8;
+            n += 1;
+        }
+        buf[n] = 0;
+        if n > 0 {
+            say(st, b"aios: command line from LoadOptions\n");
+        }
+    }
+}
+
 const DTB_GUID: [u8; 16] = [0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0];
 
 core::arch::global_asm!(
@@ -149,6 +202,7 @@ fn guid_eq(a: usize, b: &[u8; 16]) -> bool {
 unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
     unsafe {
         say(st, b"aios: EFI stub\n");
+
         let bs = rd64(st + ST_BOOT_SERVICES);
 
         // 1. DTB
@@ -166,6 +220,7 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
             return EFI_LOAD_ERROR;
         }
         let dtb_size = u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize;
+        save_options(image, bs, st);
 
         // 2. RAM の先頭 (読み込まれた場所を含む 1 GiB の頭) + 0x80000
         // Image ヘッダーの image_size (bss まで)

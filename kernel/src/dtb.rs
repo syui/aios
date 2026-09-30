@@ -261,8 +261,11 @@ pub fn memory() -> Option<(u64, u64)> {
     scan(|n| (n.depth() == 1 && (n.name() == "memory" || n.name().starts_with("memory@"))).then(|| n.reg(0)).flatten())
 }
 
-/// /chosen/bootargs (カーネルのコマンドライン)
+/// カーネルのコマンドライン: UEFI の LoadOptions か、/chosen/bootargs
 pub fn bootargs() -> Option<&'static str> {
+    if let Some(c) = crate::efi::cmdline() {
+        return Some(c);
+    }
     scan(|n| (n.depth() == 1 && n.name() == "chosen").then(|| n.str("bootargs")).flatten()).filter(|s| !s.is_empty())
 }
 

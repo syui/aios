@@ -1,11 +1,13 @@
 # aios のカーネル。Linux の arm64 Image 形式で /boot/Image に置く
 # (Arch ARM の linux-aarch64 と同じ場所。QEMU もラズパイのファームウェアもこの形式を起動でき、DTB を渡してくれる)
-# QEMU では bin/run.sh が disk.img の /boot/Image を読んで起動する (小さなブートローダーのかわり)
+# EFI スタブつきなので、同じものを ESP の既定の場所 (/boot/EFI/BOOT/BOOTAA64.EFI) にも置き、
+# UEFI のファームウェアがそのまま起動できるようにする (/boot は ESP、bin/mkdisk.sh)
+# QEMU では bin/run.sh が disk.img を UEFI (AAVMF) で、なければ /boot/Image を直に起動する
 # initramfs は空にして作るので、ルートはディスク (bin/mkdisk.sh)
 pkgname=aios-kernel
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='The aios kernel (aarch64, QEMU virt)'
+pkgdesc='The aios kernel (aarch64: QEMU virt, UEFI, Raspberry Pi 3)'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
@@ -30,4 +32,5 @@ package() {
   objcopy=$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy)
   "$objcopy" -O binary "$srcdir/target/aarch64-unknown-none-softfloat/release/aios" "$pkgdir/boot/Image"
   chmod 644 "$pkgdir/boot/Image"
+  install -Dm644 "$pkgdir/boot/Image" "$pkgdir/boot/EFI/BOOT/BOOTAA64.EFI"
 }

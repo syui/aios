@@ -1,8 +1,10 @@
 #!/bin/sh
 # ラズパイ用の SD カードのイメージ sd.img を作る (1 GiB。QEMU の SD は 2 のべき乗の大きさ)
-#   区画 1: FAT32 (0x0c) の boot  128 MiB  kernel8.img (= aios の Image)、config.txt、DTB
+#   区画 1: FAT32 (0x0c) の boot  128 MiB  rootfs/boot の中身 (aios-kernel の Image)、config.txt、DTB
 #   区画 2: Linux (0x83) の root  残り     rootfs/ から ext4
-#   bin/mksd.sh [KERNEL]    KERNEL は ELF か Image (既定は開発用カーネル)
+#   bin/mksd.sh [KERNEL]    KERNEL は ELF か Image (既定は rootfs/boot/Image、なければ開発用カーネル)
+# aios は区画 1 を /boot にマウントするので、aipkg で aios-kernel を上げるとファームウェアが
+# 読む Image (config.txt の kernel=Image) も新しくなる
 # 本物のラズパイ 3 で動かすなら、boot にファームウェア (bootcode.bin start.elf fixup.dat)
 # を足す: FIRMWARE=1 bin/mksd.sh (raspberrypi/firmware から取ってくる)。FAT を作るのに
 # mkfs.vfat と mcopy (dosfstools, mtools) が要る。なければ boot は空のまま
@@ -10,7 +12,8 @@
 set -e
 cd "$(dirname "$0")/.."
 [ -d rootfs ] || { echo "rootfs/ がありません。先に bin/mkrootfs.sh を実行してください" >&2; exit 1; }
-k=${1:-target/aarch64-unknown-none-softfloat/debug/aios}
+k=$1
+[ -n "$k" ] || [ -f rootfs/boot/Image ] || k=target/aarch64-unknown-none-softfloat/debug/aios
 out=sd.img
 total=2097152        # 1 GiB (セクタ)
 p1=2048
@@ -46,7 +49,7 @@ dd if=/dev/zero of="$out" bs=512 count=0 seek=$total 2>/dev/null
 } | dd of="$out" conv=notrunc 2>/dev/null
 
 # root
-OUT=build/sd-root.img sh bin/mkdisk.sh "$((p2n / 2))k" >/dev/null
+NOBOOT=1 OUT=build/sd-root.img sh bin/mkdisk.sh "$((p2n / 2))k" >/dev/null
 dd if=build/sd-root.img of="$out" bs=512 seek=$p2 conv=notrunc 2>/dev/null
 rm -f build/sd-root.img
 
@@ -55,15 +58,18 @@ if command -v mkfs.vfat >/dev/null && command -v mcopy >/dev/null; then
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   objcopy=$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy)
-  if [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
-    "$objcopy" -O binary "$k" "$tmp/kernel8.img"
+  cp -r rootfs/boot/. "$tmp/"
+  if [ -z "$k" ]; then
+    :
+  elif [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
+    "$objcopy" -O binary "$k" "$tmp/Image"
   else
-    cp "$k" "$tmp/kernel8.img"
+    cp "$k" "$tmp/Image"
   fi
   cat > "$tmp/config.txt" <<'CFG'
 # aios
 arm_64bit=1
-kernel=kernel8.img
+kernel=Image
 enable_uart=1
 # PL011 (aios のコンソール) を GPIO 14/15 に (Bluetooth には mini UART)
 dtoverlay=disable-bt

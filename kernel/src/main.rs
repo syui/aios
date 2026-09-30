@@ -35,6 +35,7 @@ mod sysfile;
 mod timer;
 mod tmpfs;
 mod trap;
+mod vfat;
 mod vfs;
 mod virtio;
 mod virtio_blk;
