@@ -270,10 +270,43 @@ fn sock_of(fd: u64) -> Result<SockRef, i64> {
     }
 }
 
+/// socketpair の口なら、その OpenFile (send/recv はただの write/read)
+fn pair_of(fd: u64) -> Option<FileRef> {
+    let f = proc::current().files().get(fd).cloned()?;
+    let is_pair = matches!(f.borrow().kind, Kind::Pair(..));
+    is_pair.then_some(f)
+}
+
 fn add_fd(s: Socket, cloexec: bool) -> R {
     let f: FileRef = file::new(Kind::Socket(Rc::new(RefCell::new(s))), 2);
     let fd = proc::current().files().add(f, cloexec, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
+}
+
+/// AF_UNIX の socketpair だけ (中身はパイプ 2 本)
+pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
+    const AF_UNIX: u64 = 1;
+    if domain != AF_UNIX {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (a, b) = file::Pipe::pair();
+    let cloexec = typ & SOCK_CLOEXEC != 0;
+    let files = proc::current().files();
+    let fa = files.add(file::new(a, 2), cloexec, 0).ok_or(-EMFILE)?;
+    let Some(fb) = files.add(file::new(b, 2), cloexec, 0) else {
+        files.fds[fa] = None;
+        return Err(-EMFILE);
+    };
+    let mut v = [0u8; 8];
+    v[..4].copy_from_slice(&(fa as i32).to_le_bytes());
+    v[4..].copy_from_slice(&(fb as i32).to_le_bytes());
+    if proc::current().pt().copy_out(sv, &v).is_none() {
+        let files = proc::current().files();
+        files.fds[fa] = None;
+        files.fds[fb] = None;
+        return Err(-EFAULT);
+    }
+    Ok(0)
 }
 
 pub fn socket(domain: u64, typ: u64, _proto: u64) -> R {
@@ -387,6 +420,9 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
 }
 
 pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: usize) -> R {
+    if pair_of(fd).is_some() {
+        return crate::sysfile::write(fd, buf, len);
+    }
     let s = sock_of(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
     let mut data = vec![0u8; len.min(64 * 1024)];
@@ -396,6 +432,9 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
 }
 
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
+    if pair_of(fd).is_some() {
+        return crate::sysfile::read(fd, buf, len);
+    }
     let s = sock_of(fd)?;
     let mut data = vec![0u8; len.min(64 * 1024)];
     let (k, from) = s.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?;
@@ -497,8 +536,18 @@ fn read_msghdr(va: usize) -> Result<MsgHdr, i64> {
 }
 
 pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
-    let s = sock_of(fd)?;
     let m = read_msghdr(msg)?;
+    if let Some(f) = pair_of(fd) {
+        // 付帯データ (SCM_RIGHTS など) はまだ運べないので中身だけ
+        let mut data = alloc::vec::Vec::new();
+        for (base, len) in &m.iov {
+            let start = data.len();
+            data.resize(start + len, 0);
+            proc::current().pt().copy_in(&mut data[start..], *base).ok_or(-EFAULT)?;
+        }
+        return f.borrow_mut().write(&data).map(|n| n as i64);
+    }
+    let s = sock_of(fd)?;
     let to = if m.name != 0 {
         let mut l = [0u8; 4];
         proc::current().pt().copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
@@ -517,11 +566,13 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
 }
 
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
-    let s = sock_of(fd)?;
     let m = read_msghdr(msg)?;
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
     let mut data = vec![0u8; total.min(64 * 1024)];
-    let (k, from) = s.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?;
+    let (k, from) = match pair_of(fd) {
+        Some(f) => (f.borrow_mut().read(&mut data)?, None),
+        None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?,
+    };
     let pt = proc::current().pt();
     let mut done = 0;
     for (base, len) in &m.iov {

@@ -11,10 +11,13 @@ bin=user/target/aarch64-unknown-linux-musl/release
 rm -rf rootfs
 mkdir -p rootfs/bin rootfs/usr/bin
 cp "$bin/init" rootfs/init
-for p in sh hello aipkg fetch; do
+for p in sh hello aipkg fetch systemctl journalctl; do
   cp "$bin/$p" rootfs/bin/$p
 done
+ln -s systemctl rootfs/bin/poweroff
+ln -s systemctl rootfs/bin/reboot
 cp -r etc rootfs/etc
+mkdir -p rootfs/root rootfs/var/log rootfs/run
 
 for pkg in "$@"; do
   case "$pkg" in

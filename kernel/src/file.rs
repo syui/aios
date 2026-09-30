@@ -30,6 +30,10 @@ pub enum Kind {
     Inode(InodeRef, String),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
+    /// O_RDWR で開いた FIFO (読み書き両方の口)
+    PipeRw(Rc<RefCell<Pipe>>),
+    /// socketpair の片方: rx から読み、tx へ書く
+    Pair(Rc<RefCell<Pipe>>, Rc<RefCell<Pipe>>),
     Socket(crate::socket::SockRef),
 }
 
@@ -146,7 +150,7 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
-            Kind::PipeRead(p) => Pipe::read(p, dst),
+            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read(p, dst),
             Kind::PipeWrite(_) => Err(-EBADF),
             Kind::Socket(s) => s.borrow_mut().read(dst),
         }
@@ -170,7 +174,7 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
-            Kind::PipeWrite(p) => Pipe::write(p, src),
+            Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src),
             Kind::PipeRead(_) => Err(-EBADF),
             Kind::Socket(s) => s.borrow_mut().write(src),
         }
@@ -183,8 +187,8 @@ impl OpenFile {
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
-            Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::dev(S_IFIFO | 0o600, 0),
-            Kind::Socket(_) => Stat::dev(0o140000 | 0o777, 0),
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
+            Kind::Socket(_) | Kind::Pair(..) => Stat::dev(0o140000 | 0o777, 0),
         }
     }
 
@@ -199,6 +203,14 @@ impl OpenFile {
             Kind::PipeWrite(p) => {
                 let p = p.borrow();
                 (false, p.len() < p.cap, p.readers == 0)
+            }
+            Kind::PipeRw(p) => {
+                let p = p.borrow();
+                (p.len() > 0, p.len() < p.cap, false)
+            }
+            Kind::Pair(rx, tx) => {
+                let (rx, tx) = (rx.borrow(), tx.borrow());
+                (rx.len() > 0 || rx.writers == 0, tx.len() < tx.cap, rx.writers == 0 && rx.len() == 0)
             }
             Kind::Socket(s) => s.borrow().readiness(),
             _ => (true, true, false),
@@ -290,6 +302,21 @@ impl Drop for OpenFile {
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::wakeup(proc::poll_chan());
             }
+            Kind::PipeRw(p) => {
+                let mut pp = p.borrow_mut();
+                pp.readers -= 1;
+                pp.writers -= 1;
+                drop(pp);
+                proc::wakeup(Rc::as_ptr(p) as usize);
+                proc::wakeup(proc::poll_chan());
+            }
+            Kind::Pair(rx, tx) => {
+                rx.borrow_mut().readers -= 1;
+                tx.borrow_mut().writers -= 1;
+                proc::wakeup(Rc::as_ptr(rx) as usize);
+                proc::wakeup(Rc::as_ptr(tx) as usize);
+                proc::wakeup(proc::poll_chan());
+            }
             _ => {}
         }
     }
@@ -364,17 +391,75 @@ pub struct Pipe {
     pub cap: usize,
     readers: usize,
     writers: usize,
+    /// FIFO が読み/書きで開かれた回数 (相手がすぐ閉じても、来たことはわかる)
+    r_opened: u64,
+    w_opened: u64,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1 }));
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1 }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
     pub fn len(&self) -> usize {
         self.data.len
+    }
+
+    /// FIFO を開く。相手 (読み手なら書き手) が来るまで待つ (nonblock なら待たない)
+    pub fn open_fifo(p: &Rc<RefCell<Pipe>>, read: bool, write: bool, nonblock: bool) -> Result<Kind, i64> {
+        const ENXIO: i64 = 6;
+        // 待ち始めたときの相手の開いた回数
+        let seen = {
+            let mut pp = p.borrow_mut();
+            if write && !read && nonblock && pp.readers == 0 {
+                return Err(-ENXIO);
+            }
+            if read {
+                pp.readers += 1;
+                pp.r_opened += 1;
+            }
+            if write {
+                pp.writers += 1;
+                pp.w_opened += 1;
+            }
+            if read { pp.w_opened } else { pp.r_opened }
+        };
+        Pipe::wake(p);
+        let kind = match (read, write) {
+            (true, true) => Kind::PipeRw(p.clone()),
+            (true, false) => Kind::PipeRead(p.clone()),
+            _ => Kind::PipeWrite(p.clone()),
+        };
+        if !(read && write) && !nonblock {
+            // 相手がいるか、待っている間に一度でも来たら進む。
+            // 割り込まれたら kind が落ちて数は戻る
+            loop {
+                let pp = p.borrow();
+                let (now, opened) = if read { (pp.writers, pp.w_opened) } else { (pp.readers, pp.r_opened) };
+                if now > 0 || opened != seen {
+                    break;
+                }
+                drop(pp);
+                proc::sleep(Rc::as_ptr(p) as usize)?;
+            }
+        }
+        Ok(kind)
+    }
+
+    /// socketpair: 向かい合わせにつないだ 2 本のパイプ
+    pub fn pair() -> (Kind, Kind) {
+        let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1 }));
+        let (a, b) = (mk(), mk());
+        (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
+    }
+
+    /// 誰も開いていない FIFO 用
+    pub fn empty() -> Rc<RefCell<Pipe>> {
+        let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0 }))
     }
 
     fn wake(p: &Rc<RefCell<Pipe>>) {

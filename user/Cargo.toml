@@ -29,6 +29,14 @@ path = "src/bin/aipkg.rs"
 name = "fetch"
 path = "src/bin/fetch.rs"
 
+[[bin]]
+name = "systemctl"
+path = "src/bin/systemctl.rs"
+
+[[bin]]
+name = "journalctl"
+path = "src/bin/journalctl.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"

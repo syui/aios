@@ -13,12 +13,12 @@ pub fn init() {
                 println!("fs: root is ext2 on virtio-blk");
                 vfs::set_root(fs.root());
                 // /dev と /tmp はメモリ上に
-                for d in ["dev", "tmp"] {
+                for d in ["dev", "tmp", "run"] {
                     if vfs::mkdir_p(d, 0o755).is_ok() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                setup_dirs("/dev/vda / ext2 rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n");
+                setup_dirs("/dev/vda / ext2 rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\n");
                 return;
             }
             Err(e) => println!("fs: disk not usable ({}), using initramfs", e),
@@ -51,7 +51,7 @@ fn setup_dirs(mtab: &str) {
     }
     let tmp = vfs::mkdir_p("tmp", 0o1777).expect("mkdir /tmp");
     let _ = tmp.set_mode(0o1777);
-    for d in ["etc", "home", "root", "var/tmp"] {
+    for d in ["etc", "home", "root", "run", "var/tmp", "var/log"] {
         let _ = vfs::mkdir_p(d, 0o755);
     }
     // df などが読むマウント表 (起動のたびに書きなおす)

@@ -7,6 +7,8 @@ mod tls;
 use std::io::Write;
 
 fn main() {
+    // 読み手のいないパイプに書いたら、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(url) = args.first() else {
         eprintln!("usage: fetch URL [-o FILE]");

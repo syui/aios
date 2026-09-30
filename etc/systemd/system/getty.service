@@ -1,0 +1,13 @@
+[Unit]
+Description=Console shell (autologin)
+After=motd.service
+
+[Service]
+ExecStart=/bin/sh
+StandardInput=tty
+Restart=always
+RestartSec=0.5
+WorkingDirectory=/root
+
+[Install]
+WantedBy=multi-user.target

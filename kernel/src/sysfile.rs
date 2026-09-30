@@ -217,7 +217,15 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             let (ma, mi) = fs::dev_of(&ino).unwrap();
             Some(Kind::of_dev(ma, mi).ok_or(-ENXIO)?)
         }
-        vfs::S_IFIFO => return Err(-ENXIO),
+        vfs::S_IFIFO => {
+            let p = fifo_pipe(&ino);
+            let (r, w) = match accmode {
+                file::O_RDONLY => (true, false),
+                file::O_WRONLY => (false, true),
+                _ => (true, true),
+            };
+            Some(Pipe::open_fifo(&p, r, w, flags as u32 & O_NONBLOCK != 0)?)
+        }
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
         _ => {
             if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
@@ -474,7 +482,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             Ok(0)
         }
         F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
-            Kind::PipeRead(p) | Kind::PipeWrite(p) => {
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let mut p = p.borrow_mut();
                 if cmd == F_SETPIPE_SZ {
                     let want = (arg as usize).clamp(4096, usize::MAX).next_power_of_two();
@@ -640,11 +648,25 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
     }
 }
 
+/// FIFO の inode ごとのパイプ (誰かが開いている間だけ生きている)
+static mut FIFOS: alloc::vec::Vec<((usize, u64), alloc::rc::Weak<core::cell::RefCell<Pipe>>)> = alloc::vec::Vec::new();
+
+fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<core::cell::RefCell<Pipe>> {
+    let fifos = unsafe { &mut *(&raw mut FIFOS) };
+    fifos.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(p) = fifos.iter().find(|(id, _)| *id == ino.id()).and_then(|(_, w)| w.upgrade()) {
+        return p;
+    }
+    let p = Pipe::empty();
+    fifos.push((ino.id(), alloc::rc::Rc::downgrade(&p)));
+    p
+}
+
 fn pipe_of(fd: u64) -> Option<alloc::rc::Rc<core::cell::RefCell<Pipe>>> {
     let f = file_of(fd).ok()?;
     let f = f.borrow();
     match &f.kind {
-        Kind::PipeRead(p) | Kind::PipeWrite(p) => Some(p.clone()),
+        Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Some(p.clone()),
         _ => None,
     }
 }
