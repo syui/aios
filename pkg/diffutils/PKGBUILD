@@ -1,0 +1,25 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/diffutils)
+pkgname=diffutils
+pkgver=0.5.0
+pkgrel=1
+pkgdesc='Rust implementation of GNU diffutils: diff, cmp (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/diffutils'
+license=('MIT' 'Apache-2.0')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/uutils/diffutils#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd diffutils
+  musl_build
+}
+
+package() {
+  cd diffutils
+  install -Dm755 target/aarch64-unknown-linux-musl/release/diffutils "$pkgdir/usr/bin/diffutils"
+  # 呼ばれた名前 (diff / cmp) で動きが変わる
+  ln -s diffutils "$pkgdir/usr/bin/diff"
+  ln -s diffutils "$pkgdir/usr/bin/cmp"
+}

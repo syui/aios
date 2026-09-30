@@ -1,0 +1,22 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/sed)
+pkgname=sed
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Rust implementation of GNU sed (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/sed'
+license=('MIT')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/uutils/sed#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd sed
+  musl_build
+}
+
+package() {
+  cd sed
+  install -Dm755 target/aarch64-unknown-linux-musl/release/sed "$pkgdir/usr/bin/sed"
+}

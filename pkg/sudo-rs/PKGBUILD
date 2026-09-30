@@ -1,0 +1,37 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/sudo-rs)
+# aios には PAM ライブラリがないので、aios_pam.rs (/etc/shadow を見る小さな PAM) を中に入れる
+pkgname=sudo-rs
+pkgver=0.2.15
+pkgrel=1
+pkgdesc='Memory safe implementation of sudo and su, with a built-in PAM for aios'
+arch=('aarch64')
+url='https://github.com/trifectatechfoundation/sudo-rs'
+license=('Apache-2.0' 'MIT')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/trifectatechfoundation/sudo-rs#tag=v$pkgver"
+        'aios_pam.rs')
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  cd sudo-rs
+  cp "$srcdir/aios_pam.rs" src/pam/aios_pam.rs
+  if ! grep -q "mod aios_pam;" src/pam/mod.rs; then
+    # libpam にリンクする代わりに aios_pam を使う
+    sed -i 's|^#\[link(name = "pam")\]$|mod aios_pam;|; /^mod aios_pam;$/{n; s|^unsafe extern "C" {}$||}' src/pam/mod.rs
+  fi
+  grep -q "mod aios_pam;" src/pam/mod.rs
+}
+
+build() {
+  . "$startdir/../cross.sh"
+  cd sudo-rs
+  musl_build --bin sudo --bin visudo
+}
+
+package() {
+  cd sudo-rs
+  local out=target/aarch64-unknown-linux-musl/release
+  install -Dm4755 "$out/sudo" "$pkgdir/usr/bin/sudo"
+  install -Dm755 "$out/visudo" "$pkgdir/usr/bin/visudo"
+}

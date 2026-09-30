@@ -1,0 +1,24 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/findutils)
+pkgname=findutils
+pkgver=0.10.0
+pkgrel=1
+pkgdesc='Rust implementation of GNU findutils: find, xargs (uutils)'
+arch=('aarch64')
+url='https://github.com/uutils/findutils'
+license=('MIT')
+makedepends=('git' 'rustup' 'aarch64-linux-gnu-gcc')
+source=("git+https://github.com/uutils/findutils#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd findutils
+  musl_build --bin find --bin xargs
+}
+
+package() {
+  cd findutils
+  local out=target/aarch64-unknown-linux-musl/release
+  install -Dm755 "$out/find" "$pkgdir/usr/bin/find"
+  install -Dm755 "$out/xargs" "$pkgdir/usr/bin/xargs"
+}
