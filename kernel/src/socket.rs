@@ -545,7 +545,7 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
             data.resize(start + len, 0);
             proc::current().pt().copy_in(&mut data[start..], *base).ok_or(-EFAULT)?;
         }
-        return f.borrow_mut().write(&data).map(|n| n as i64);
+        return file::write(&f, &data).map(|n| n as i64);
     }
     let s = sock_of(fd)?;
     let to = if m.name != 0 {
@@ -570,7 +570,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
     let mut data = vec![0u8; total.min(64 * 1024)];
     let (k, from) = match pair_of(fd) {
-        Some(f) => (f.borrow_mut().read(&mut data)?, None),
+        Some(f) => (file::read(&f, &mut data)?, None),
         None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?,
     };
     let pt = proc::current().pt();

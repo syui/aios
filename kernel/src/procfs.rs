@@ -129,6 +129,9 @@ impl ProcInode {
 }
 
 fn state_char(p: &Proc) -> char {
+    if p.stopped && p.state != State::Zombie {
+        return 'T';
+    }
     match p.state {
         State::Running | State::Runnable => 'R',
         State::Sleeping => 'S',
@@ -142,6 +145,7 @@ fn state_name(p: &Proc) -> &'static str {
         'R' => "R (running)",
         'S' => "S (sleeping)",
         'Z' => "Z (zombie)",
+        'T' => "T (stopped)",
         _ => "X (dead)",
     }
 }

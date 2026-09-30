@@ -23,6 +23,7 @@ const O_NOCTTY: u32 = 0o400;
 
 const S_IFIFO: u32 = 0o010000;
 
+#[derive(Clone)]
 pub enum Kind {
     /// 端末 (コンソールと、疑似端末の子の口)
     Tty(TtyRef),
@@ -73,6 +74,58 @@ pub type FileRef = Rc<RefCell<OpenFile>>;
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
     Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags }))
+}
+
+/// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
+/// (同じ OpenFile を共有する他のプロセスが poll や read をできるように)
+pub fn read(f: &FileRef, dst: &mut [u8]) -> Result<usize, i64> {
+    let stream = {
+        let b = f.borrow();
+        if !b.readable() {
+            return Err(-EBADF);
+        }
+        b.stream()
+    };
+    match stream {
+        Some((Kind::PipeWrite(_), _)) => Err(-EBADF),
+        Some((k, nonblock)) => read_stream(&k, dst, nonblock),
+        None => f.borrow_mut().read(dst),
+    }
+}
+
+pub fn write(f: &FileRef, src: &[u8]) -> Result<usize, i64> {
+    let stream = {
+        let b = f.borrow();
+        if !b.writable() {
+            return Err(-EBADF);
+        }
+        b.stream()
+    };
+    match stream {
+        Some((Kind::PipeRead(_), _)) => Err(-EBADF),
+        Some((k, nonblock)) => write_stream(&k, src, nonblock),
+        None => f.borrow_mut().write(src),
+    }
+}
+
+fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+    match k {
+        Kind::Tty(t) => tty::read(t, dst, nonblock),
+        Kind::PtyMaster(t) => tty::master_read(t, dst, nonblock),
+        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read(p, dst),
+        Kind::Socket(s) => s.borrow_mut().read(dst),
+        _ => Err(-EBADF),
+    }
+}
+
+fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+    match k {
+        Kind::Tty(t) => tty::write(t, src, nonblock),
+        Kind::PtyMaster(t) => tty::master_write(t, src, nonblock),
+        Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src),
+        Kind::Socket(s) => s.borrow_mut().write(src),
+        _ => Err(-EBADF),
+    }
 }
 
 /// Linux (asm-generic) の struct stat
@@ -145,8 +198,6 @@ impl OpenFile {
             return Err(-EBADF);
         }
         match &self.kind {
-            Kind::Tty(t) => tty::read(t, dst, self.flags & O_NONBLOCK != 0),
-            Kind::PtyMaster(t) => tty::master_read(t, dst, self.flags & O_NONBLOCK != 0),
             Kind::Null => Ok(0),
             Kind::Zero => {
                 dst.fill(0);
@@ -164,10 +215,18 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
-            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read(p, dst),
             Kind::PipeWrite(_) => Err(-EBADF),
-            Kind::Socket(s) => s.borrow_mut().read(dst),
+            k => read_stream(k, dst, self.flags & O_NONBLOCK != 0),
         }
+    }
+
+    /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
+    fn stream(&self) -> Option<(Kind, bool)> {
+        let k = match &self.kind {
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) => self.kind.clone(),
+            _ => return None,
+        };
+        Some((k, self.flags & O_NONBLOCK != 0))
     }
 
     pub fn write(&mut self, src: &[u8]) -> Result<usize, i64> {
@@ -175,8 +234,6 @@ impl OpenFile {
             return Err(-EBADF);
         }
         match &self.kind {
-            Kind::Tty(t) => tty::write(t, src, self.flags & O_NONBLOCK != 0),
-            Kind::PtyMaster(t) => tty::master_write(t, src, self.flags & O_NONBLOCK != 0),
             Kind::Null | Kind::Zero | Kind::Random => Ok(src.len()),
             Kind::Inode(ino, _) => {
                 if self.flags & O_APPEND != 0 {
@@ -186,9 +243,8 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
-            Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src),
             Kind::PipeRead(_) => Err(-EBADF),
-            Kind::Socket(s) => s.borrow_mut().write(src),
+            k => write_stream(k, src, self.flags & O_NONBLOCK != 0),
         }
     }
 
