@@ -187,7 +187,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
-        IOCTL => sysfile::ioctl(a[0], a[1], a[2] as usize),
+        // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
+        IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
         FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
         CHDIR => sysfile::chdir(a[0] as usize),

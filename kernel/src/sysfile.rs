@@ -9,7 +9,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const ENOENT: i64 = 2;
-const ENXIO: i64 = 6;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
@@ -43,20 +42,7 @@ const F_GETPIPE_SZ: u64 = 1032;
 const FD_CLOEXEC: u64 = 1;
 
 const O_NONBLOCK: u32 = 0o4000;
-
-const TCGETS: u64 = 0x5401;
-const TCSETS: u64 = 0x5402;
-const TCSETSW: u64 = 0x5403;
-const TCSETSF: u64 = 0x5404;
-/// termios の c_lflag
-const ISIG: u32 = 0o1;
-const ICANON: u32 = 0o2;
-const ECHO: u32 = 0o10;
 const FIONBIO: u64 = 0x5421;
-const TIOCGWINSZ: u64 = 0x5413;
-const TIOCGPGRP: u64 = 0x540f;
-const TIOCSPGRP: u64 = 0x5410;
-const TIOCSCTTY: u64 = 0x540e;
 
 const UMASK: u32 = 0o022;
 
@@ -263,7 +249,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         _ if flags & O_DIRECTORY != 0 => return Err(-ENOTDIR),
         vfs::S_IFCHR => {
             let (ma, mi) = fs::dev_of(&ino).unwrap();
-            Some(Kind::of_dev(ma, mi).ok_or(-ENXIO)?)
+            Some(Kind::of_dev(ma, mi, flags as u32)?)
         }
         vfs::S_IFIFO => {
             let p = fifo_pipe(&ino);
@@ -644,55 +630,23 @@ pub fn pipe2(fds: usize, flags: u64) -> R {
 
 pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     let f = file_of(fd)?;
-    if let (FIONBIO, Kind::Socket(s)) = (req, &f.borrow().kind) {
+    if req == FIONBIO {
         let mut v = [0u8; 4];
         proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
-        s.borrow_mut().nonblock = u32::from_le_bytes(v) != 0;
+        let on = u32::from_le_bytes(v) != 0;
+        let mut f = f.borrow_mut();
+        f.flags = if on { f.flags | O_NONBLOCK } else { f.flags & !O_NONBLOCK };
+        if let Kind::Socket(s) = &f.kind {
+            s.borrow_mut().nonblock = on;
+        }
         return Ok(0);
     }
-    if !matches!(f.borrow().kind, Kind::Console) {
-        return Err(-ENOTTY);
-    }
-    match req {
-        TCGETS => {
-            // struct termios (カーネル版 36 バイト)。いま意味があるのは ECHO だけ
-            let mut t = [0u8; 36];
-            let lflag = ISIG | ICANON | if crate::console::echo_enabled() { ECHO } else { 0 };
-            t[12..16].copy_from_slice(&lflag.to_le_bytes());
-            out(arg, &t)?;
-            Ok(0)
-        }
-        TCSETS | TCSETSW | TCSETSF => {
-            let mut t = [0u8; 16];
-            proc::current().pt().copy_in(&mut t, arg).ok_or(-EFAULT)?;
-            let lflag = u32::from_le_bytes(t[12..16].try_into().unwrap());
-            crate::console::set_echo(lflag & ECHO != 0);
-            Ok(0)
-        }
-        TIOCGWINSZ => {
-            let mut ws = [0u8; 8];
-            ws[0..2].copy_from_slice(&24u16.to_le_bytes());
-            ws[2..4].copy_from_slice(&80u16.to_le_bytes());
-            out(arg, &ws)?;
-            Ok(0)
-        }
-        TIOCGPGRP => {
-            let pg = crate::console::fg_pgrp();
-            out(arg, &(if pg == 0 { proc::current().pgid } else { pg } as i32).to_le_bytes())?;
-            Ok(0)
-        }
-        TIOCSPGRP => {
-            let mut b = [0u8; 4];
-            proc::current().pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
-            crate::console::set_fg_pgrp(u32::from_le_bytes(b));
-            Ok(0)
-        }
-        TIOCSCTTY => {
-            crate::console::set_fg_pgrp(proc::current().pgid);
-            Ok(0)
-        }
-        _ => Err(-ENOTTY),
-    }
+    let (tty, master) = match &f.borrow().kind {
+        Kind::Tty(t) => (t.clone(), false),
+        Kind::PtyMaster(t) => (t.clone(), true),
+        _ => return Err(-ENOTTY),
+    };
+    crate::tty::ioctl(&tty, master, req, arg)
 }
 
 pub fn getcwd(buf: usize, len: usize) -> R {

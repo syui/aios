@@ -406,7 +406,7 @@ pub fn user_init() {
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
     let mut files = Files { fds: Vec::new(), cwd: String::new() };
-    let console = file::new(Kind::Console, 2);
+    let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);
     }
