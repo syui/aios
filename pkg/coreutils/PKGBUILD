@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/coreutils)
 pkgname=coreutils
 pkgver=0.12.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Cross-platform Rust rewrite of the GNU coreutils (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/coreutils'
@@ -28,4 +28,6 @@ package() {
     case "$n" in *_common) continue ;; esac
     [ -e "$pkgdir/usr/bin/$n" ] || ln -s coreutils "$pkgdir/usr/bin/$n"
   done
+  # test は [ という名前でも呼ばれる
+  [ -e "$pkgdir/usr/bin/test" ] && ln -s coreutils "$pkgdir/usr/bin/["
 }
