@@ -698,6 +698,13 @@ pub fn open_slave(index: usize) -> Result<TtyRef, i64> {
     Ok(tty)
 }
 
+/// /dev/tty から疑似端末の子を開いた: 開いている数に入れる (閉じるときに close_slave で減る)
+pub fn ref_slave(tty: &TtyRef) {
+    if let Some(p) = tty.borrow_mut().pty() {
+        p.slaves += 1;
+    }
+}
+
 /// 子の口を閉じた (最後の OpenFile が消えた)
 pub fn close_slave(tty: &TtyRef) {
     let mut t = tty.borrow_mut();

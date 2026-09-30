@@ -45,16 +45,28 @@ register() {
   { echo '%FILES%'; zstd -dcq "$1" | tar -tf - | grep -v '^\.'; echo; } > "$dir/files"
 }
 
-bin/mkpkg.sh pkg/aios-base
-[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
-for pkg in aios-base "$@"; do
-  [ -f "pkg/$pkg/PKGBUILD" ] || { echo "unknown pkg: $pkg" >&2; exit 1; }
-  f=$(ls repo/aarch64/"$pkg"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
+# install NAME: パッケージ (と depends) を rootfs に入れる。入れたものは done に覚える
+done=" "
+install() {
+  case "$done" in *" $1 "*) return 0 ;; esac
+  done="$done$1 "
+  [ -f "pkg/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
+  f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
   if [ -z "$f" ]; then
-    bin/mkpkg.sh "pkg/$pkg"
-    f=$(ls repo/aarch64/"$pkg"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
+    bin/mkpkg.sh "pkg/$1"
+    f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
   fi
   echo "rootfs: $(basename "$f")"
   zstd -dcq "$f" | tar -xpf - -C rootfs --exclude=.PKGINFO
   register "$f"
+  # depends (版の条件 >= などは見ない)
+  for d in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^depend = //p' | sed 's/[<>=].*//'); do
+    install "$d"
+  done
+}
+
+bin/mkpkg.sh pkg/aios-base
+[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
+for pkg in aios-base "$@"; do
+  install "$pkg"
 done

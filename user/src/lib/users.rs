@@ -181,5 +181,12 @@ pub fn exec_shell(u: &User, login: bool, cmd: Option<&str>) -> ! {
     let sh = CString::new(u.shell.as_str()).unwrap();
     unsafe { libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     eprintln!("{}: {}", u.shell, io::Error::last_os_error());
+    // ログインシェル (brush など) が消えていても入れるよう、/bin/sh で動かす
+    if u.shell != "/bin/sh" {
+        eprintln!("falling back to /bin/sh");
+        let arg0 = CString::new(if login { "-sh" } else { "sh" }).unwrap();
+        argv[0] = arg0.as_ptr();
+        unsafe { libc::execve(c"/bin/sh".as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    }
     std::process::exit(127);
 }
