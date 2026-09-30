@@ -4,6 +4,7 @@
 // 先頭は Linux の arm64 Image ヘッダー (Documentation/arch/arm64/booting.rst)。
 // これがあると QEMU やラズパイのファームウェアが Linux と同じように、
 // RAM の先頭 + text_offset に置き、x0 に DTB の物理アドレスを入れて跳んでくる。
+// Linux の EFI スタブと同じく PE/COFF のヘッダーも持つので、UEFI からも起動できる (efi.rs)。
 // EL2 で来たら (ラズパイ、QEMU の raspi3b) EL1 に下りる。
 //
 // RAM の先頭 (= 置かれた場所 - 0x80000) は機械ごとに違う (qemu virt 0x4000_0000、ラズパイ 0)
@@ -27,15 +28,57 @@ core::arch::global_asm!(
 .section .text.boot
 .global _start
 _start:
-    b       primary             // code0
-    .long   0                   // code1
+    // code0: "MZ" (PE/COFF の印) になる、何もしない命令 (ccmp x18, #0, #0xd, pl)
+    .long   0xfa405a4d
+    b       primary             // code1
     .quad   0x80000             // text_offset: RAM の先頭 + 0x80000 に置く
     .quad   _image_size         // image_size (bss まで)
     .quad   0x2                 // flags: little endian, 4KiB ページ
     .quad   0, 0, 0             // res2 - res4
     .ascii  "ARM\x64"           // magic
-    .long   0                   // res5
+    .long   pe_header - _start  // res5: PE ヘッダーの場所
 
+    // PE/COFF: UEFI のアプリとしても起動できるように (入口は efi.rs の efi_entry)
+pe_header:
+    .ascii  "PE\0\0"
+    .short  0xaa64              // Machine: arm64
+    .short  1                   // NumberOfSections
+    .long   0, 0, 0             // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols
+    .short  opt_end - opt_header // SizeOfOptionalHeader
+    .short  0x206               // EXECUTABLE_IMAGE | LINE_NUMS_STRIPPED | DEBUG_STRIPPED
+opt_header:
+    .short  0x20b               // PE32+
+    .byte   0x02, 0x14          // リンカの版
+    .long   _pe_raw_size        // SizeOfCode
+    .long   0                   // SizeOfInitializedData
+    .long   0                   // SizeOfUninitializedData
+    .long   _efi_entry_rva      // AddressOfEntryPoint
+    .long   0x1000              // BaseOfCode
+    .quad   0                   // ImageBase
+    .long   0x1000              // SectionAlignment
+    .long   0x1000              // FileAlignment
+    .short  0, 0, 0, 0, 0, 0    // OS / Image / Subsystem の版
+    .long   0                   // Win32VersionValue
+    .long   _pe_image_size      // SizeOfImage
+    .long   0x1000              // SizeOfHeaders
+    .long   0                   // CheckSum
+    .short  10                  // Subsystem: EFI アプリ
+    .short  0                   // DllCharacteristics
+    .quad   0, 0, 0, 0          // Stack / Heap の Reserve, Commit
+    .long   0                   // LoaderFlags
+    .long   6                   // NumberOfRvaAndSizes
+    .quad   0, 0, 0, 0, 0, 0    // データディレクトリ (再配置はなく、どこに置かれてもよい)
+opt_end:
+    .ascii  ".text\0\0\0"
+    .long   _pe_virt_size       // VirtualSize (bss まで)
+    .long   0x1000              // VirtualAddress
+    .long   _pe_raw_size        // SizeOfRawData
+    .long   0x1000              // PointerToRawData
+    .long   0, 0                // PointerToRelocations, PointerToLinenumbers
+    .short  0, 0
+    .long   0xe0000020          // code | execute | read | write
+
+    .balign 4096
 primary:
     mov     x21, x0             // DTB の物理アドレス (ELF で起動したときは 0 など)
     mrs     x0, mpidr_el1

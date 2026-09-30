@@ -11,6 +11,7 @@ mod tty;
 mod block;
 mod cred;
 mod dtb;
+mod efi;
 mod epoll;
 mod exec;
 mod extfs;
