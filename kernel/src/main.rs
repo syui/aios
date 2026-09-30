@@ -13,7 +13,7 @@ fn current_el() -> u64 {
     (el >> 2) & 0b11
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
     println!();
     println!("aios {} (aarch64)", env!("CARGO_PKG_VERSION"));
