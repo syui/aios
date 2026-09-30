@@ -1,25 +1,32 @@
-// プロセスとスケジューラ (1 CPU)
+// プロセス・スレッドとスケジューラ (1 CPU)
 //
 // カーネルの中では割り込みを止めたまま動く。切り替えが起きるのは
 // EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。
+// スレッドは mm (アドレス空間) と files を共有する Proc。
 use crate::exec::{self, Image};
 use crate::file::{self, FileRef, Kind};
 use crate::trap::TrapFrame;
 use crate::vm::PageTable;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-
-pub const NOFILE: usize = 256;
-
-#[derive(Clone)]
-pub struct Fd {
-    pub file: FileRef,
-    pub cloexec: bool,
-}
+use core::cell::UnsafeCell;
 
 pub const NPROC: usize = 64;
+pub const NOFILE: usize = 256;
 const KSTACK_SIZE: usize = 16 * 1024;
 pub const MMAP_BASE: usize = 0x10_0000_0000;
+
+pub const EINTR: i64 = 4;
+pub const NSIG: usize = 65;
+pub const SIG_IGN: u64 = 1;
+pub const SIGKILL: i32 = 9;
+pub const SIGPIPE: i32 = 13;
+
+/// exit(code) の wait status
+fn exited(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -28,6 +35,67 @@ pub enum State {
     Running,
     Sleeping,
     Zombie,
+}
+
+/// 複数の Proc から使う持ち物。1 CPU で割り込みを止めているので、同時には触られない
+pub struct Shared<T>(Rc<UnsafeCell<T>>);
+
+impl<T> Shared<T> {
+    pub fn new(v: T) -> Self {
+        Self(Rc::new(UnsafeCell::new(v)))
+    }
+    #[allow(clippy::mut_from_ref)]
+    pub fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+    fn id(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// アドレス空間
+pub struct Mm {
+    pub pt: PageTable,
+    /// brk の下限 (ELF の末尾) と現在値
+    pub heap_start: usize,
+    pub brk: usize,
+    /// 次に mmap で渡す場所
+    pub mmap_next: usize,
+}
+
+#[derive(Clone)]
+pub struct Fd {
+    pub file: FileRef,
+    pub cloexec: bool,
+}
+
+/// fd テーブルとカレントディレクトリ (先頭 / なし)
+#[derive(Clone)]
+pub struct Files {
+    pub fds: Vec<Option<Fd>>,
+    pub cwd: String,
+}
+
+impl Files {
+    pub fn get(&self, fd: u64) -> Option<&FileRef> {
+        self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
+    }
+
+    /// minfd 以上で空いている一番小さい fd に置く
+    pub fn add(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
+        let i = (minfd..NOFILE).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
+        if self.fds.len() <= i {
+            self.fds.resize(i + 1, None);
+        }
+        self.fds[i] = Some(Fd { file, cloexec });
+        Some(i)
+    }
 }
 
 /// swtch で保存する callee-saved レジスタ
@@ -57,19 +125,27 @@ impl FpState {
 
 pub struct Proc {
     pub state: State,
+    /// スレッド ID。プロセスの代表スレッドでは tgid と同じ
     pub pid: u32,
+    pub tgid: u32,
     pub ppid: u32,
-    pub pagetable: Option<PageTable>,
-    /// brk の下限 (ELF の末尾) と現在値
-    pub heap_start: usize,
-    pub brk: usize,
-    /// 次に mmap で渡す場所
-    pub mmap_next: usize,
+    pub mm: Option<Shared<Mm>>,
+    pub files: Option<Shared<Files>>,
+    /// wait4 が返す status (終了コード << 8、またはシグナル番号)
     pub xstatus: i32,
-    /// fd テーブルとカレントディレクトリ (先頭 / なし)
-    pub fds: Vec<Option<Fd>>,
-    pub cwd: String,
+    /// 終わるように言われた。sleep から戻ったら確かめる
+    pub killed: bool,
+    /// スレッドグループ全体の終了 status (代表スレッドに置く)
+    group_exit: Option<i32>,
+    /// シグナルごとのハンドラ (SIG_DFL = 0, SIG_IGN = 1)。まだ呼び出しはしない
+    pub sig_handlers: [u64; NSIG],
+    /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
+    thread: bool,
+    /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
+    pub clear_tid: usize,
     chan: usize,
+    /// この tick になったら起こす (0 なら無し)
+    wake_at: u64,
     context: Context,
     tpidr: u64,
     fp: FpState,
@@ -79,36 +155,38 @@ impl Proc {
     const UNUSED: Self = Self {
         state: State::Unused,
         pid: 0,
+        tgid: 0,
         ppid: 0,
-        pagetable: None,
-        heap_start: 0,
-        brk: 0,
-        mmap_next: 0,
+        mm: None,
+        files: None,
         xstatus: 0,
-        fds: Vec::new(),
-        cwd: String::new(),
+        killed: false,
+        group_exit: None,
+        sig_handlers: [0; NSIG],
+        thread: false,
+        clear_tid: 0,
         chan: 0,
+        wake_at: 0,
         context: Context::ZERO,
         tpidr: 0,
         fp: FpState::ZERO,
     };
 
-    pub fn pt(&mut self) -> &mut PageTable {
-        self.pagetable.as_mut().expect("proc without pagetable")
+    pub fn mm(&self) -> &mut Mm {
+        self.mm.as_ref().expect("proc without mm").get()
     }
 
-    pub fn fd(&self, fd: u64) -> Option<&FileRef> {
-        self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
+    pub fn pt(&self) -> &mut PageTable {
+        &mut self.mm().pt
     }
 
-    /// minfd 以上で空いている一番小さい fd に置く
-    pub fn add_fd(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
-        let i = (minfd..NOFILE).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
-        if self.fds.len() <= i {
-            self.fds.resize(i + 1, None);
-        }
-        self.fds[i] = Some(Fd { file, cloexec });
-        Some(i)
+    pub fn files(&self) -> &mut Files {
+        self.files.as_ref().expect("proc without files").get()
+    }
+
+    /// futex の channel を作るための、アドレス空間ごとの値
+    pub fn mm_id(&self) -> usize {
+        self.mm.as_ref().map_or(0, |m| m.id())
     }
 
     fn slot(&self) -> usize {
@@ -125,15 +203,18 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
-        self.pagetable = Some(img.pagetable);
-        self.heap_start = img.brk;
-        self.brk = img.brk;
-        self.mmap_next = MMAP_BASE;
+        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
         tf.sp_el0 = img.sp as u64;
         tf.spsr = 0; // EL0t, 割り込み許可
+    }
+
+    /// 同じスレッドグループの他の Proc
+    fn siblings(&self) -> impl Iterator<Item = &'static mut Proc> {
+        let (tgid, pid) = (self.tgid, self.pid);
+        procs().iter_mut().filter(move |p| p.state != State::Unused && p.tgid == tgid && p.pid != pid)
     }
 }
 
@@ -150,17 +231,21 @@ fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *(&raw mut PROCS) }
 }
 
+pub fn current() -> &'static mut Proc {
+    let i = unsafe { CURRENT }.expect("no current proc");
+    &mut procs()[i]
+}
+
 /// exec が使う cwd。user_init のときはまだ current がないのでルート
 pub fn current_cwd() -> String {
     match unsafe { CURRENT } {
-        Some(i) => procs()[i].cwd.clone(),
+        Some(i) => procs()[i].files().cwd.clone(),
         None => String::new(),
     }
 }
 
-pub fn current() -> &'static mut Proc {
-    let i = unsafe { CURRENT }.expect("no current proc");
-    &mut procs()[i]
+pub fn nprocs() -> usize {
+    procs().iter().filter(|p| p.state != State::Unused).count()
 }
 
 core::arch::global_asm!(
@@ -261,6 +346,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
         p.pid = NEXT_PID;
         NEXT_PID += 1;
     }
+    p.tgid = p.pid;
     p.context.x19_x30[11] = forkret as *const () as u64; // x30 (lr)
     p.context.sp = (p.kstack_top() - size_of::<TrapFrame>()) as u64;
     Some(p)
@@ -275,10 +361,12 @@ pub fn user_init() {
     };
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
+    let mut files = Files { fds: Vec::new(), cwd: String::new() };
     let console = file::new(Kind::Console, 2);
     for _ in 0..3 {
-        p.add_fd(console.clone(), false, 0);
+        files.add(console.clone(), false, 0);
     }
+    p.files = Some(Shared::new(files));
     p.state = State::Runnable;
 }
 
@@ -288,6 +376,11 @@ pub fn scheduler() -> ! {
         let mut ran = false;
         for i in 0..NPROC {
             let p = &mut procs()[i];
+            if p.state == State::Zombie && p.thread {
+                // 終わったスレッドは誰も wait しないのでここで片付ける
+                *p = Proc::UNUSED;
+                continue;
+            }
             if p.state != State::Runnable {
                 continue;
             }
@@ -326,19 +419,56 @@ pub fn yield_now() {
     sched();
 }
 
-pub fn sleep(chan: usize) {
-    let p = current();
-    p.chan = chan;
-    p.state = State::Sleeping;
-    sched();
-    current().chan = 0;
+/// chan で起こされるまで眠る。killed なら Err(-EINTR)
+pub fn sleep(chan: usize) -> Result<(), i64> {
+    sleep_until(chan, 0).map(|_| ())
 }
 
-pub fn wakeup(chan: usize) {
+/// chan で起こされるか deadline (tick, 0 なら無し) まで眠る。時間切れなら Ok(false)
+pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
+    let p = current();
+    if p.killed {
+        return Err(-EINTR);
+    }
+    p.chan = chan;
+    p.wake_at = deadline;
+    p.state = State::Sleeping;
+    sched();
+    let p = current();
+    p.chan = 0;
+    let timed_out = p.wake_at != 0 && crate::timer::ticks() >= p.wake_at;
+    p.wake_at = 0;
+    if p.killed {
+        return Err(-EINTR);
+    }
+    Ok(!timed_out)
+}
+
+/// chan で眠っている Proc を起こし、起こした数を返す
+pub fn wakeup(chan: usize) -> usize {
+    let mut n = 0;
     for p in procs().iter_mut() {
         if p.state == State::Sleeping && p.chan == chan {
             p.state = State::Runnable;
+            n += 1;
         }
+    }
+    n
+}
+
+/// タイマから: 期限の来た Proc を起こす
+pub fn wake_expired(now: u64) {
+    for p in procs().iter_mut() {
+        if p.state == State::Sleeping && p.wake_at != 0 && p.wake_at <= now {
+            p.state = State::Runnable;
+        }
+    }
+}
+
+fn kill_proc(p: &mut Proc) {
+    p.killed = true;
+    if p.state == State::Sleeping {
+        p.state = State::Runnable;
     }
 }
 
@@ -346,48 +476,134 @@ fn find(pid: u32) -> Option<&'static mut Proc> {
     procs().iter_mut().find(|p| p.state != State::Unused && p.pid == pid)
 }
 
-pub fn exit(status: i32) -> ! {
+/// clear_tid に 0 を書いて、それを待つ futex を起こす
+fn clear_child_tid(p: &mut Proc) {
+    if p.clear_tid != 0 {
+        let addr = p.clear_tid;
+        p.clear_tid = 0;
+        if p.pt().copy_out(addr, &0u32.to_le_bytes()).is_some() {
+            wakeup(futex_chan(p, addr));
+        }
+    }
+}
+
+pub fn futex_chan(p: &Proc, uaddr: usize) -> usize {
+    p.mm_id() ^ (uaddr << 1) ^ 1
+}
+
+/// いまのスレッドだけを終える。代表スレッドならプロセスの終了になる
+pub fn exit(code: i32) -> ! {
+    exit_status(exited(code))
+}
+
+fn exit_status(status: i32) -> ! {
     let p = current();
-    if p.pid == 1 {
+    clear_child_tid(p);
+    if p.thread {
+        p.files = None;
+        p.state = State::Zombie;
+        sched();
+        unreachable!("zombie thread ran");
+    }
+    // 代表スレッド: 残りのスレッドも止める
+    for t in p.siblings() {
+        kill_proc(t);
+    }
+    if p.tgid == 1 {
         panic!("init exited with status {}", status);
     }
     for c in procs().iter_mut() {
-        if c.state != State::Unused && c.ppid == p.pid {
+        if c.state != State::Unused && c.ppid == p.tgid && !c.thread {
             c.ppid = 1;
         }
     }
-    p.fds.clear();
-    p.xstatus = status;
+    p.files = None;
+    p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
     if let Some(parent) = find(p.ppid) {
         wakeup(parent as *mut Proc as usize);
     }
-    wakeup(find(1).map(|i| i as *mut Proc as usize).unwrap_or(0));
+    if let Some(init) = find(1) {
+        wakeup(init as *mut Proc as usize);
+    }
     sched();
     unreachable!("zombie ran");
 }
 
-const CLONE_SETTLS: u64 = 0x0008_0000;
-const CLONE_THREAD: u64 = 0x0001_0000;
+/// スレッドグループ全体を終える
+pub fn exit_group(code: i32) -> ! {
+    group_exit_status(exited(code))
+}
 
-/// fork / clone。CLONE_VM でもアドレス空間はコピーする (vfork と同じ振る舞いになる)
-pub fn clone(flags: u64, stack: usize, tls: u64) -> Result<u32, i64> {
+/// シグナルで終わる (既定の動作)
+pub fn die(sig: i32) -> ! {
+    group_exit_status(sig & 0x7f)
+}
+
+fn group_exit_status(status: i32) -> ! {
+    let p = current();
+    if p.thread {
+        if let Some(leader) = find(p.tgid) {
+            leader.group_exit.get_or_insert(status);
+            kill_proc(leader);
+        }
+        for t in p.siblings() {
+            kill_proc(t);
+        }
+    }
+    exit_status(status)
+}
+
+/// EL0 へ戻る前に: 終わるように言われていたら終わる
+pub fn check_killed() {
+    let p = current();
+    if p.killed {
+        let status = if p.thread { 0 } else { p.group_exit.unwrap_or(SIGKILL) };
+        exit_status(status);
+    }
+}
+
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+/// fork / スレッド作成。CLONE_THREAD でない CLONE_VM (vfork) はアドレス空間をコピーする
+pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
     const EAGAIN: i64 = 11;
     const ENOMEM: i64 = 12;
     const EINVAL: i64 = 22;
-    if flags & CLONE_THREAD != 0 {
+    let thread = flags & CLONE_THREAD != 0;
+    if thread && flags & CLONE_VM == 0 {
         return Err(-EINVAL);
     }
     let parent = current();
-    let pt = parent.pt().fork().ok_or(-ENOMEM)?;
+    let mm = if thread {
+        parent.mm.clone().unwrap()
+    } else {
+        let m = parent.mm();
+        let pt = m.pt.fork().ok_or(-ENOMEM)?;
+        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next })
+    };
+    let files = if flags & CLONE_FILES != 0 && thread {
+        parent.files.clone().unwrap()
+    } else {
+        Shared::new(parent.files().clone())
+    };
     let child = alloc_proc().ok_or(-EAGAIN)?;
-    child.pagetable = Some(pt);
-    child.ppid = parent.pid;
-    child.heap_start = parent.heap_start;
-    child.brk = parent.brk;
-    child.mmap_next = parent.mmap_next;
-    child.fds = parent.fds.clone();
-    child.cwd = parent.cwd.clone();
+    child.mm = Some(mm);
+    child.files = Some(files);
+    child.sig_handlers = parent.sig_handlers;
+    child.thread = thread;
+    if thread {
+        child.tgid = parent.tgid;
+        child.ppid = parent.ppid;
+    } else {
+        child.ppid = parent.tgid;
+    }
     unsafe {
         fp_save(&mut child.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) child.tpidr);
@@ -402,18 +618,40 @@ pub fn clone(flags: u64, stack: usize, tls: u64) -> Result<u32, i64> {
     if stack != 0 {
         ctf.sp_el0 = stack as u64;
     }
+    let tid = child.pid;
+    if flags & CLONE_PARENT_SETTID != 0 {
+        parent.pt().copy_out(ptid, &tid.to_le_bytes());
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        child.pt().copy_out(ctid, &tid.to_le_bytes());
+    }
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        child.clear_tid = ctid;
+    }
     child.state = State::Runnable;
-    Ok(child.pid)
+    Ok(tid)
 }
 
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
     let img = exec::exec(path, argv, envp)?;
     let p = current();
-    let old = p.pagetable.take();
+    // 他のスレッドは消える
+    for t in p.siblings() {
+        kill_proc(t);
+    }
+    for h in p.sig_handlers.iter_mut() {
+        if *h != SIG_IGN {
+            *h = 0;
+        }
+    }
+    let old = p.mm.take();
     p.load_image(img);
     p.pt().activate();
     drop(old);
-    for f in p.fds.iter_mut() {
+    // files を他と共有していたなら切り離す
+    let files = p.files().clone();
+    p.files = Some(Shared::new(files));
+    for f in p.files().fds.iter_mut() {
         if f.as_ref().is_some_and(|f| f.cloexec) {
             *f = None;
         }
@@ -430,14 +668,13 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     loop {
         let mut have = false;
         for c in procs().iter_mut() {
-            if c.state == State::Unused || c.ppid != me.pid || (pid > 0 && c.pid as i64 != pid) {
+            if c.state == State::Unused || c.thread || c.ppid != me.tgid || (pid > 0 && c.pid as i64 != pid) {
                 continue;
             }
             have = true;
             if c.state == State::Zombie {
                 let r = (c.pid, c.xstatus);
-                c.pagetable = None;
-                c.state = State::Unused;
+                *c = Proc::UNUSED;
                 return Ok(r);
             }
         }
@@ -447,6 +684,32 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
         if options & WNOHANG != 0 {
             return Ok((0, 0));
         }
-        sleep(me as *mut Proc as usize);
+        // 親が待つのは代表スレッドのアドレス
+        let leader = find(me.tgid).map_or(me as *mut Proc as usize, |l| l as *mut Proc as usize);
+        sleep(leader)?;
     }
+}
+
+/// tid 宛てのシグナル。まだハンドラは呼べないので、無視されていなければグループごと終える
+pub fn kill_thread(tid: u32, sig: i32) -> Result<(), i64> {
+    const ESRCH: i64 = 3;
+    let me = current();
+    let target = find(tid).ok_or(-ESRCH)?;
+    if sig <= 0 || sig as usize >= NSIG {
+        return if sig == 0 { Ok(()) } else { Err(-22) };
+    }
+    if target.sig_handlers[sig as usize] == SIG_IGN || sig == 17 || sig == 28 {
+        // 無視、または既定で無視される SIGCHLD / SIGWINCH
+        return Ok(());
+    }
+    if target.tgid == me.tgid {
+        die(sig);
+    }
+    let leader = find(target.tgid).ok_or(-ESRCH)?;
+    leader.group_exit.get_or_insert(sig & 0x7f);
+    kill_proc(leader);
+    for t in procs().iter_mut().filter(|p| p.state != State::Unused && p.tgid == leader.tgid) {
+        kill_proc(t);
+    }
+    Ok(())
 }

@@ -48,13 +48,13 @@ fn out(va: usize, b: &[u8]) -> Result<(), i64> {
 }
 
 fn file_of(fd: u64) -> Result<file::FileRef, i64> {
-    proc::current().fd(fd).cloned().ok_or(-EBADF)
+    proc::current().files().get(fd).cloned().ok_or(-EBADF)
 }
 
 /// dirfd と path から、探索の基準にするディレクトリ (先頭 / なし)
 fn base_dir(dirfd: i64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd == AT_FDCWD {
-        return Ok(proc::current().cwd.clone());
+        return Ok(proc::current().files().cwd.clone());
     }
     let f = file_of(dirfd as u64)?;
     let f = f.borrow();
@@ -76,8 +76,13 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
-    let n = f.borrow_mut().write(&tmp)?;
-    Ok(n as i64)
+    let r = f.borrow_mut().write(&tmp);
+    if r == Err(-file::EPIPE) && proc::current().sig_handlers[proc::SIGPIPE as usize] == 0 {
+        // 読み手のいないパイプ: SIGPIPE の既定動作で終わる
+        drop(f);
+        proc::die(proc::SIGPIPE);
+    }
+    Ok(r? as i64)
 }
 
 fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
@@ -148,12 +153,12 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64) -> R {
         }
     };
     let f = file::new(kind, flags as u32);
-    let fd = proc::current().add_fd(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+    let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
 
 pub fn close(fd: u64) -> R {
-    let p = proc::current();
+    let p = proc::current().files();
     match p.fds.get_mut(fd as usize) {
         Some(f @ Some(_)) => {
             *f = None;
@@ -225,7 +230,7 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn dup(fd: u64) -> R {
     let f = file_of(fd)?;
-    let n = proc::current().add_fd(f, false, 0).ok_or(-EMFILE)?;
+    let n = proc::current().files().add(f, false, 0).ok_or(-EMFILE)?;
     Ok(n as i64)
 }
 
@@ -234,7 +239,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
         return Err(-EINVAL);
     }
     let f = file_of(old)?;
-    let p = proc::current();
+    let p = proc::current().files();
     let new = new as usize;
     if new >= proc::NOFILE {
         return Err(-EBADF);
@@ -247,12 +252,12 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
 }
 
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
-    let p = proc::current();
+    let p = proc::current().files();
     let entry = p.fds.get_mut(fd as usize).and_then(|f| f.as_mut()).ok_or(-EBADF)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let f = entry.file.clone();
-            let n = p.add_fd(f, cmd == F_DUPFD_CLOEXEC, arg as usize).ok_or(-EMFILE)?;
+            let n = p.add(f, cmd == F_DUPFD_CLOEXEC, arg as usize).ok_or(-EMFILE)?;
             Ok(n as i64)
         }
         F_GETFD => Ok(if entry.cloexec { FD_CLOEXEC as i64 } else { 0 }),
@@ -269,9 +274,9 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
 pub fn pipe2(fds: usize, flags: u64) -> R {
     let (r, w) = Pipe::new();
     let cloexec = flags & O_CLOEXEC != 0;
-    let p = proc::current();
-    let rfd = p.add_fd(file::new(r, 0), cloexec, 0).ok_or(-EMFILE)?;
-    let Some(wfd) = p.add_fd(file::new(w, 1), cloexec, 0) else {
+    let p = proc::current().files();
+    let rfd = p.add(file::new(r, 0), cloexec, 0).ok_or(-EMFILE)?;
+    let Some(wfd) = p.add(file::new(w, 1), cloexec, 0) else {
         p.fds[rfd] = None;
         return Err(-EMFILE);
     };
@@ -305,7 +310,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
             Ok(0)
         }
         TIOCGPGRP => {
-            out(arg, &(proc::current().pid as i32).to_le_bytes())?;
+            out(arg, &(proc::current().tgid as i32).to_le_bytes())?;
             Ok(0)
         }
         _ => Err(-ENOTTY),
@@ -313,7 +318,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
 }
 
 pub fn getcwd(buf: usize, len: usize) -> R {
-    let cwd = proc::current().cwd.clone();
+    let cwd = proc::current().files().cwd.clone();
     let mut s = Vec::with_capacity(cwd.len() + 2);
     s.push(b'/');
     s.extend_from_slice(cwd.as_bytes());
@@ -327,11 +332,11 @@ pub fn getcwd(buf: usize, len: usize) -> R {
 
 pub fn chdir(pathp: usize) -> R {
     let path = user_str(pathp)?;
-    let p = proc::current();
-    let e = path::resolve(&p.cwd, &path, true)?;
+    let files = proc::current().files();
+    let e = path::resolve(&files.cwd, &path, true)?;
     if !e.is_dir() {
         return Err(-ENOTDIR);
     }
-    p.cwd = String::from(e.name);
+    files.cwd = String::from(e.name);
     Ok(0)
 }

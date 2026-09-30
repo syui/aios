@@ -78,7 +78,7 @@ impl Stat {
 impl OpenFile {
     pub fn read(&mut self, dst: &mut [u8]) -> Result<usize, i64> {
         match &self.kind {
-            Kind::Console => Ok(console::read(dst)),
+            Kind::Console => console::read(dst),
             Kind::Null => Ok(0),
             Kind::Initrd(e) => {
                 if e.is_dir() {
@@ -231,7 +231,7 @@ impl Pipe {
                     return Ok(0);
                 }
             }
-            proc::sleep(chan);
+            proc::sleep(chan)?;
         }
     }
 
@@ -253,7 +253,9 @@ impl Pipe {
             }
             proc::wakeup(chan);
             if done < src.len() {
-                proc::sleep(chan);
+                if let Err(e) = proc::sleep(chan) {
+                    return if done > 0 { Ok(done) } else { Err(e) };
+                }
             }
         }
         Ok(done)

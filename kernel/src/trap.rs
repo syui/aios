@@ -158,7 +158,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         EL0_SYNC => {
             let (esr, far) = esr_far();
             match esr >> 26 {
-                EC_SVC64 => syscall::dispatch(tf),
+                EC_SVC64 => {
+                    syscall::dispatch(tf);
+                    proc::check_killed();
+                }
                 ec @ (EC_IABT_LOW | EC_DABT_LOW) => {
                     println!("user fault: ec={:#x} elr={:#x} far={:#x}", ec, tf.elr, far);
                     proc::exit(-1);
@@ -179,8 +182,11 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             }
             gic::complete(id);
             // EL0 で走っていたなら順番をゆずる
-            if kind == EL0_IRQ && id == timer::IRQ {
-                proc::yield_now();
+            if kind == EL0_IRQ {
+                if id == timer::IRQ {
+                    proc::yield_now();
+                }
+                proc::check_killed();
             }
         }
         _ => panic!("unexpected exception kind {} elr={:#x}", kind, tf.elr),

@@ -3,6 +3,7 @@
 pub const KBASE: usize = 0xffff_ff80_0000_0000;
 
 pub const UART0: usize = KBASE + 0x0900_0000;
+pub const RTC: usize = KBASE + 0x0901_0000;
 pub const GICD: usize = KBASE + 0x0800_0000;
 pub const GICC: usize = KBASE + 0x0801_0000;
 
