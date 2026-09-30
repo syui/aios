@@ -1,4 +1,4 @@
-// ext2 (rev 1)。書いたらすぐディスクへ書き戻す (write-through)
+// ext2 (rev 1)。書きかえたブロックは印をつけておき、操作の終わりにまとめて書き出す
 //
 // 対応: 4KiB/1KiB ブロック、直接/間接ブロック、filetype、sparse_super、large_file
 // 非対応: extents (ext4)、64bit、ジャーナル、htree (書くときは索引の印を消す)
@@ -7,7 +7,7 @@ use crate::memlayout::PGSIZE;
 use crate::tmpfs::statfs_bytes;
 use crate::vfs::*;
 use crate::virtio_blk;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -43,6 +43,11 @@ fn now_secs() -> u32 {
 struct Cache {
     map: BTreeMap<u32, *mut u8>,
     order: VecDeque<u32>,
+    /// まだディスクに書いていないブロック
+    dirty: BTreeSet<u32>,
+    sb_dirty: bool,
+    /// まだ書いていないグループディスクリプタ表のブロック (表の中の番号)
+    gdt_dirty: BTreeSet<usize>,
 }
 
 pub struct Ext2 {
@@ -154,7 +159,7 @@ impl Ext2 {
             groups,
             sb: RefCell::new(sb),
             gdt: RefCell::new(Vec::new()),
-            cache: RefCell::new(Cache { map: BTreeMap::new(), order: VecDeque::new() }),
+            cache: RefCell::new(Cache { map: BTreeMap::new(), order: VecDeque::new(), dirty: BTreeSet::new(), sb_dirty: false, gdt_dirty: BTreeSet::new() }),
         });
         let gdt_len = groups as usize * 32;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -177,7 +182,9 @@ impl Ext2 {
             Some(&p) => p,
             None => {
                 if c.map.len() >= CACHE_BLOCKS {
-                    if let Some(old) = c.order.pop_front() {
+                    // 書いていないものは追い出さない
+                    let victim = c.order.iter().position(|b| !c.dirty.contains(b));
+                    if let Some(old) = victim.and_then(|i| c.order.remove(i)) {
                         if let Some(p) = c.map.remove(&old) {
                             kalloc::free(p);
                         }
@@ -202,26 +209,54 @@ impl Ext2 {
         self.with_block(b, |d| d.to_vec())
     }
 
-    /// ブロックを書きかえてディスクへ書き戻す
+    /// ブロックを書きかえる (ディスクへは flush で)
     fn modify_block<T>(&self, b: u32, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
-        let (r, data) = self.with_block(b, |d| {
-            let r = f(d);
-            (r, d.to_vec())
-        })?;
-        virtio_blk::write(b as u64 * (self.bsize / virtio_blk::SECTOR) as u64, &data)?;
+        let r = self.with_block(b, f)?;
+        self.cache.borrow_mut().dirty.insert(b);
         Ok(r)
     }
 
     fn write_sb(&self) -> Result<(), i64> {
-        let sb = self.sb.borrow().clone();
-        virtio_blk::write(2, &sb)
+        self.cache.borrow_mut().sb_dirty = true;
+        Ok(())
     }
 
     fn write_gdt(&self, g: u32) -> Result<(), i64> {
-        let off = g as usize * 32;
-        let blk = off / self.bsize;
-        let data = self.gdt.borrow()[blk * self.bsize..(blk + 1) * self.bsize].to_vec();
-        self.modify_block(self.first_data_block + 1 + blk as u32, |d| d.copy_from_slice(&data))
+        self.cache.borrow_mut().gdt_dirty.insert(g as usize * 32 / self.bsize);
+        Ok(())
+    }
+
+    /// 書きかえたものをディスクへ。となりあうブロックは 1 回の要求にまとめる
+    pub fn flush(&self) -> Result<(), i64> {
+        let (sb_dirty, gdt_dirty) = {
+            let mut c = self.cache.borrow_mut();
+            (core::mem::take(&mut c.sb_dirty), core::mem::take(&mut c.gdt_dirty))
+        };
+        for blk in gdt_dirty {
+            let data = self.gdt.borrow()[blk * self.bsize..(blk + 1) * self.bsize].to_vec();
+            self.modify_block(self.first_data_block + 1 + blk as u32, |d| d.copy_from_slice(&data))?;
+        }
+        if sb_dirty {
+            let sb = self.sb.borrow().clone();
+            virtio_blk::write(2, &sb)?;
+        }
+        let dirty: Vec<u32> = core::mem::take(&mut self.cache.borrow_mut().dirty).into_iter().collect();
+        const RUN: usize = 64;
+        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
+        let mut i = 0;
+        while i < dirty.len() {
+            let mut j = i + 1;
+            while j < dirty.len() && j - i < RUN && dirty[j] == dirty[j - 1] + 1 {
+                j += 1;
+            }
+            let mut buf = vec![0u8; (j - i) * self.bsize];
+            for (k, &b) in dirty[i..j].iter().enumerate() {
+                self.with_block(b, |d| buf[k * self.bsize..(k + 1) * self.bsize].copy_from_slice(d))?;
+            }
+            virtio_blk::write(dirty[i] as u64 * spb, &buf)?;
+            i = j;
+        }
+        Ok(())
     }
 
     fn gd(&self, g: u32, field: usize) -> u32 {
@@ -293,7 +328,12 @@ impl Ext2 {
         self.sb_add(12, 1);
         self.write_gdt(g)?;
         self.write_sb()?;
-        self.cache.borrow_mut().map.remove(&b).map(kalloc::free);
+        let mut c = self.cache.borrow_mut();
+        c.dirty.remove(&b);
+        if let Some(p) = c.map.remove(&b) {
+            kalloc::free(p);
+            c.order.retain(|&x| x != b);
+        }
         Ok(())
     }
 
@@ -639,6 +679,196 @@ pub struct Ext2Inode {
 }
 
 impl Ext2Inode {
+    fn set_mtime_inner(&self, ns: u64) -> Result<(), i64> {
+        self.update(|r| put32(&mut r.0, 16, (ns / 1_000_000_000) as u32))
+    }
+
+    fn set_owner_inner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        self.update(|r| {
+            if let Some(u) = uid {
+                put16(&mut r.0, 2, u as u16);
+                put16(&mut r.0, 120, (u >> 16) as u16);
+            }
+            if let Some(g) = gid {
+                put16(&mut r.0, 24, g as u16);
+                put16(&mut r.0, 122, (g >> 16) as u16);
+            }
+            put32(&mut r.0, 12, now_secs());
+        })
+    }
+
+    fn set_mode_inner(&self, mode: u32) -> Result<(), i64> {
+        self.update(|r| {
+            let m = (r.mode() & S_IFMT) | (mode & 0o7777);
+            put16(&mut r.0, 0, m as u16);
+            put32(&mut r.0, 12, now_secs());
+        })
+    }
+
+    fn rename_inner(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        self.dir_only()?;
+        let nd = self.other(newdir)?;
+        let fs = &self.fs;
+        let child = fs.find(self.ino, old)?;
+        let r = fs.read_inode(child)?;
+        let is_dir = r.mode() & S_IFMT == S_IFDIR;
+        if is_dir && fs.is_under(nd, child)? {
+            return Err(-EINVAL);
+        }
+        if let Ok(existing) = fs.find(nd, new) {
+            if existing == child {
+                return Ok(());
+            }
+            Ext2Inode { fs: fs.clone(), ino: nd }.unlink(new, is_dir)?;
+        }
+        fs.add_entry(nd, new, child, r.mode())?;
+        fs.remove_entry(self.ino, old)?;
+        if is_dir && nd != self.ino {
+            fs.set_dotdot(child, nd)?;
+            fs.add_links(self.ino, -1)?;
+            fs.add_links(nd, 1)?;
+        }
+        Ok(())
+    }
+
+    fn unlink_inner(&self, name: &str, rmdir: bool) -> Result<(), i64> {
+        self.dir_only()?;
+        if name == "." || name == ".." {
+            return Err(-EINVAL);
+        }
+        let fs = &self.fs;
+        let child = fs.find(self.ino, name)?;
+        let mut r = fs.read_inode(child)?;
+        let is_dir = r.mode() & S_IFMT == S_IFDIR;
+        match (is_dir, rmdir) {
+            (true, false) => return Err(-EISDIR),
+            (false, true) => return Err(-ENOTDIR),
+            (true, true) if !fs.is_empty_dir(child)? => return Err(-ENOTEMPTY),
+            _ => {}
+        }
+        fs.remove_entry(self.ino, name)?;
+        if is_dir {
+            fs.add_links(self.ino, -1)?;
+            r.set_links(0);
+        } else {
+            r.set_links(r.links().saturating_sub(1));
+        }
+        put32(&mut r.0, 12, now_secs());
+        if r.links() == 0 {
+            fs.release(child, &mut r)
+        } else {
+            fs.write_inode(child, &r)
+        }
+    }
+
+    fn link_inner(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
+        self.dir_only()?;
+        let t = self.other(target)?;
+        let r = self.fs.read_inode(t)?;
+        if r.mode() & S_IFMT == S_IFDIR {
+            return Err(-EPERM);
+        }
+        if self.fs.find(self.ino, name).is_ok() {
+            return Err(-EEXIST);
+        }
+        self.fs.add_entry(self.ino, name, t, r.mode())?;
+        self.fs.add_links(t, 1)?;
+        Ok(())
+    }
+
+    fn create_inner(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
+        self.dir_only()?;
+        if self.fs.find(self.ino, name).is_ok() {
+            return Err(-EEXIST);
+        }
+        let fs = &self.fs;
+        let mode = node.type_bits() | (mode & 0o7777);
+        let is_dir = matches!(node, NewNode::Dir);
+        let ino = fs.alloc_inode(fs.group_of(self.ino), is_dir)?;
+        let mut r = Raw([0; 128]);
+        put16(&mut r.0, 0, mode as u16);
+        let t = now_secs();
+        for o in [8, 12, 16] {
+            put32(&mut r.0, o, t);
+        }
+        r.set_links(if is_dir { 2 } else { 1 });
+        match &node {
+            NewNode::Dev(ma, mi) => r.set_block(0, (ma << 8) | mi),
+            NewNode::Symlink(t) if t.len() < 60 => {
+                r.0[40..40 + t.len()].copy_from_slice(t.as_bytes());
+                r.set_size(t.len() as u64);
+            }
+            _ => {}
+        }
+        // inode 表には 128 バイトより大きい場合の残りもあるので 0 にしてから書く
+        let (b, off) = fs.inode_loc(ino);
+        let isz = fs.inode_size;
+        fs.modify_block(b, |d| d[off..off + isz].fill(0))?;
+        fs.write_inode(ino, &r)?;
+        match &node {
+            NewNode::Dir => {
+                let blk = fs.bmap(ino, &mut r, 0, true)?;
+                let bsize = fs.bsize;
+                let me = self.ino;
+                fs.modify_block(blk, |d| {
+                    put32(d, 0, ino);
+                    put16(d, 4, 12);
+                    d[6] = 1;
+                    d[7] = 2;
+                    d[8] = b'.';
+                    put32(d, 12, me);
+                    put16(d, 16, (bsize - 12) as u16);
+                    d[18] = 2;
+                    d[19] = 2;
+                    d[20..22].copy_from_slice(b"..");
+                })?;
+                r.set_size(fs.bsize as u64);
+                fs.write_inode(ino, &r)?;
+                fs.add_links(self.ino, 1)?;
+            }
+            NewNode::Symlink(t) if t.len() >= 60 => {
+                fs.write_data(ino, &mut r, 0, t.as_bytes())?;
+                fs.write_inode(ino, &r)?;
+            }
+            _ => {}
+        }
+        fs.add_entry(self.ino, name, ino, mode)?;
+        Ok(self.at(ino))
+    }
+
+    fn truncate_inner(&self, len: usize) -> Result<(), i64> {
+        let mut r = self.raw()?;
+        if r.mode() & S_IFMT != S_IFREG {
+            return Err(if r.mode() & S_IFMT == S_IFDIR { -EISDIR } else { -EINVAL });
+        }
+        let bs = self.fs.bsize;
+        if (len as u64) < r.size() {
+            self.fs.trunc_blocks(&mut r, len.div_ceil(bs) as u64)?;
+            // 残ったブロックの末尾を 0 にしておく (あとで伸ばしたとき用)
+            if len % bs != 0 {
+                let b = self.fs.bmap(self.ino, &mut r, (len / bs) as u64, false)?;
+                if b != 0 {
+                    self.fs.modify_block(b, |d| d[len % bs..].fill(0))?;
+                }
+            }
+        }
+        r.set_size(len as u64);
+        r.touch();
+        self.fs.write_inode(self.ino, &r)
+    }
+
+    fn write_at_inner(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        let mut r = self.raw()?;
+        match r.mode() & S_IFMT {
+            S_IFREG => {}
+            S_IFDIR => return Err(-EISDIR),
+            _ => return Err(-EINVAL),
+        }
+        let res = self.fs.write_data(self.ino, &mut r, off, buf);
+        self.fs.write_inode(self.ino, &r)?;
+        res
+    }
+
     fn at(&self, ino: u32) -> InodeRef {
         Rc::new(Ext2Inode { fs: self.fs.clone(), ino })
     }
@@ -714,36 +944,15 @@ impl Inode for Ext2Inode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
-        let mut r = self.raw()?;
-        match r.mode() & S_IFMT {
-            S_IFREG => {}
-            S_IFDIR => return Err(-EISDIR),
-            _ => return Err(-EINVAL),
-        }
-        let res = self.fs.write_data(self.ino, &mut r, off, buf);
-        self.fs.write_inode(self.ino, &r)?;
-        res
+        let r = self.write_at_inner(off, buf);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
-        let mut r = self.raw()?;
-        if r.mode() & S_IFMT != S_IFREG {
-            return Err(if r.mode() & S_IFMT == S_IFDIR { -EISDIR } else { -EINVAL });
-        }
-        let bs = self.fs.bsize;
-        if (len as u64) < r.size() {
-            self.fs.trunc_blocks(&mut r, len.div_ceil(bs) as u64)?;
-            // 残ったブロックの末尾を 0 にしておく (あとで伸ばしたとき用)
-            if len % bs != 0 {
-                let b = self.fs.bmap(self.ino, &mut r, (len / bs) as u64, false)?;
-                if b != 0 {
-                    self.fs.modify_block(b, |d| d[len % bs..].fill(0))?;
-                }
-            }
-        }
-        r.set_size(len as u64);
-        r.touch();
-        self.fs.write_inode(self.ino, &r)
+        let r = self.truncate_inner(len);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn readlink(&self) -> Result<String, i64> {
@@ -787,160 +996,45 @@ impl Inode for Ext2Inode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
-        self.dir_only()?;
-        if self.fs.find(self.ino, name).is_ok() {
-            return Err(-EEXIST);
-        }
-        let fs = &self.fs;
-        let mode = node.type_bits() | (mode & 0o7777);
-        let is_dir = matches!(node, NewNode::Dir);
-        let ino = fs.alloc_inode(fs.group_of(self.ino), is_dir)?;
-        let mut r = Raw([0; 128]);
-        put16(&mut r.0, 0, mode as u16);
-        let t = now_secs();
-        for o in [8, 12, 16] {
-            put32(&mut r.0, o, t);
-        }
-        r.set_links(if is_dir { 2 } else { 1 });
-        match &node {
-            NewNode::Dev(ma, mi) => r.set_block(0, (ma << 8) | mi),
-            NewNode::Symlink(t) if t.len() < 60 => {
-                r.0[40..40 + t.len()].copy_from_slice(t.as_bytes());
-                r.set_size(t.len() as u64);
-            }
-            _ => {}
-        }
-        // inode 表には 128 バイトより大きい場合の残りもあるので 0 にしてから書く
-        let (b, off) = fs.inode_loc(ino);
-        let isz = fs.inode_size;
-        fs.modify_block(b, |d| d[off..off + isz].fill(0))?;
-        fs.write_inode(ino, &r)?;
-        match &node {
-            NewNode::Dir => {
-                let blk = fs.bmap(ino, &mut r, 0, true)?;
-                let bsize = fs.bsize;
-                let me = self.ino;
-                fs.modify_block(blk, |d| {
-                    put32(d, 0, ino);
-                    put16(d, 4, 12);
-                    d[6] = 1;
-                    d[7] = 2;
-                    d[8] = b'.';
-                    put32(d, 12, me);
-                    put16(d, 16, (bsize - 12) as u16);
-                    d[18] = 2;
-                    d[19] = 2;
-                    d[20..22].copy_from_slice(b"..");
-                })?;
-                r.set_size(fs.bsize as u64);
-                fs.write_inode(ino, &r)?;
-                fs.add_links(self.ino, 1)?;
-            }
-            NewNode::Symlink(t) if t.len() >= 60 => {
-                fs.write_data(ino, &mut r, 0, t.as_bytes())?;
-                fs.write_inode(ino, &r)?;
-            }
-            _ => {}
-        }
-        fs.add_entry(self.ino, name, ino, mode)?;
-        Ok(self.at(ino))
+        let r = self.create_inner(name, mode, node);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
-        self.dir_only()?;
-        let t = self.other(target)?;
-        let r = self.fs.read_inode(t)?;
-        if r.mode() & S_IFMT == S_IFDIR {
-            return Err(-EPERM);
-        }
-        if self.fs.find(self.ino, name).is_ok() {
-            return Err(-EEXIST);
-        }
-        self.fs.add_entry(self.ino, name, t, r.mode())?;
-        self.fs.add_links(t, 1)?;
-        Ok(())
+        let r = self.link_inner(name, target);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
-        self.dir_only()?;
-        if name == "." || name == ".." {
-            return Err(-EINVAL);
-        }
-        let fs = &self.fs;
-        let child = fs.find(self.ino, name)?;
-        let mut r = fs.read_inode(child)?;
-        let is_dir = r.mode() & S_IFMT == S_IFDIR;
-        match (is_dir, rmdir) {
-            (true, false) => return Err(-EISDIR),
-            (false, true) => return Err(-ENOTDIR),
-            (true, true) if !fs.is_empty_dir(child)? => return Err(-ENOTEMPTY),
-            _ => {}
-        }
-        fs.remove_entry(self.ino, name)?;
-        if is_dir {
-            fs.add_links(self.ino, -1)?;
-            r.set_links(0);
-        } else {
-            r.set_links(r.links().saturating_sub(1));
-        }
-        put32(&mut r.0, 12, now_secs());
-        if r.links() == 0 {
-            fs.release(child, &mut r)
-        } else {
-            fs.write_inode(child, &r)
-        }
+        let r = self.unlink_inner(name, rmdir);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
-        self.dir_only()?;
-        let nd = self.other(newdir)?;
-        let fs = &self.fs;
-        let child = fs.find(self.ino, old)?;
-        let r = fs.read_inode(child)?;
-        let is_dir = r.mode() & S_IFMT == S_IFDIR;
-        if is_dir && fs.is_under(nd, child)? {
-            return Err(-EINVAL);
-        }
-        if let Ok(existing) = fs.find(nd, new) {
-            if existing == child {
-                return Ok(());
-            }
-            Ext2Inode { fs: fs.clone(), ino: nd }.unlink(new, is_dir)?;
-        }
-        fs.add_entry(nd, new, child, r.mode())?;
-        fs.remove_entry(self.ino, old)?;
-        if is_dir && nd != self.ino {
-            fs.set_dotdot(child, nd)?;
-            fs.add_links(self.ino, -1)?;
-            fs.add_links(nd, 1)?;
-        }
-        Ok(())
+        let r = self.rename_inner(old, newdir, new);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {
-        self.update(|r| {
-            let m = (r.mode() & S_IFMT) | (mode & 0o7777);
-            put16(&mut r.0, 0, m as u16);
-            put32(&mut r.0, 12, now_secs());
-        })
+        let r = self.set_mode_inner(mode);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
-        self.update(|r| {
-            if let Some(u) = uid {
-                put16(&mut r.0, 2, u as u16);
-                put16(&mut r.0, 120, (u >> 16) as u16);
-            }
-            if let Some(g) = gid {
-                put16(&mut r.0, 24, g as u16);
-                put16(&mut r.0, 122, (g >> 16) as u16);
-            }
-            put32(&mut r.0, 12, now_secs());
-        })
+        let r = self.set_owner_inner(uid, gid);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn set_mtime(&self, ns: u64) -> Result<(), i64> {
-        self.update(|r| put32(&mut r.0, 16, (ns / 1_000_000_000) as u32))
+        let r = self.set_mtime_inner(ns);
+        let f = self.fs.flush();
+        r.and_then(|v| f.map(|_| v))
     }
 
     fn statfs(&self) -> [u8; 120] {

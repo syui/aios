@@ -22,6 +22,7 @@ fn chan() -> usize {
 }
 
 const CTRL_D: u8 = 4;
+const CTRL_P: u8 = 0x10;
 const CTRL_U: u8 = 0x15;
 const BS: u8 = 0x08;
 const DEL: u8 = 0x7f;
@@ -44,6 +45,7 @@ pub fn intr(c: u8) {
                 uart::putc(BS);
             }
         }
+        CTRL_P => proc::dump(),
         CTRL_U => {
             while i.e != i.w && i.buf[(i.e - 1) % BUF] != b'\n' {
                 i.e -= 1;
@@ -69,9 +71,16 @@ pub fn intr(c: u8) {
             if c == b'\n' || c == CTRL_D || i.e - i.r == BUF {
                 i.w = i.e;
                 proc::wakeup(chan());
+                proc::wakeup(proc::poll_chan());
             }
         }
     }
+}
+
+/// 読める行があるか
+pub fn ready() -> bool {
+    let i = input();
+    i.r != i.w
 }
 
 /// 1 行 (または Ctrl-D まで) 読む

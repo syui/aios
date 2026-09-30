@@ -9,3 +9,6 @@ name = "aios"
 path = "src/main.rs"
 test = false
 bench = false
+
+[dependencies]
+smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }

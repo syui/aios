@@ -16,8 +16,10 @@ mod heap;
 mod initrd;
 mod kalloc;
 mod memlayout;
+mod net;
 mod proc;
 mod rand;
+mod socket;
 mod spinlock;
 mod syscall;
 mod sysfile;
@@ -25,7 +27,9 @@ mod timer;
 mod tmpfs;
 mod trap;
 mod vfs;
+mod virtio;
 mod virtio_blk;
+mod virtio_net;
 mod vm;
 
 use core::panic::PanicInfo;
@@ -52,6 +56,7 @@ pub extern "C" fn kmain() -> ! {
     timer::init();
     uart::init();
     fs::init();
+    net::init();
 
     proc::user_init();
     proc::scheduler()

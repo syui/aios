@@ -197,6 +197,10 @@ impl Proc {
         (&raw const KSTACKS) as usize + (self.slot() + 1) * KSTACK_SIZE
     }
 
+    fn tf_ref(&self) -> &TrapFrame {
+        unsafe { &*((self.kstack_top() - size_of::<TrapFrame>()) as *const TrapFrame) }
+    }
+
     /// EL0 から入ってきたときの TrapFrame はいつもカーネルスタックの天辺にある
     pub fn tf(&mut self) -> &mut TrapFrame {
         unsafe { &mut *((self.kstack_top() - size_of::<TrapFrame>()) as *mut TrapFrame) }
@@ -454,6 +458,33 @@ pub fn wakeup(chan: usize) -> usize {
         }
     }
     n
+}
+
+/// Ctrl-P: プロセスの一覧 (デバッグ用)
+pub fn dump() {
+    println!();
+    for (i, p) in procs().iter().enumerate() {
+        if p.state == State::Unused {
+            continue;
+        }
+        let st = match p.state {
+            State::Runnable => "runnable",
+            State::Running => "running",
+            State::Sleeping => "sleeping",
+            State::Zombie => "zombie",
+            State::Unused => "unused",
+        };
+        let tf = p.tf_ref();
+        println!("[{}] pid {} tgid {} ppid {} {} chan {:#x} wake_at {} pc {:#x} x8 {} x0 {:#x}", i, p.pid, p.tgid, p.ppid, st, p.chan, p.wake_at, tf.elr, tf.x[8], tf.x[0]);
+    }
+    println!("ticks {} current {:?}", crate::timer::ticks(), unsafe { CURRENT });
+}
+
+static POLL: u8 = 0;
+
+/// poll で待っている人が眠る channel。何かの状態が変わったらここを起こす
+pub fn poll_chan() -> usize {
+    (&raw const POLL) as usize
 }
 
 /// タイマから: 期限の来た Proc を起こす

@@ -4,3 +4,8 @@ target = "aarch64-unknown-linux-musl"
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+# ring (rustls の暗号) の C/アセンブリ部分
+[env]
+CC_aarch64_unknown_linux_musl = "aarch64-linux-gnu-gcc"
+AR_aarch64_unknown_linux_musl = "aarch64-linux-gnu-ar"

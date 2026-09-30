@@ -1,6 +1,7 @@
 // aarch64 Linux 互換のシステムコール
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
 use crate::proc;
+use crate::socket;
 use crate::sysfile;
 use crate::timer;
 use crate::trap::TrapFrame;
@@ -63,6 +64,7 @@ mod nr {
     pub const SENDFILE: u64 = 71;
     pub const PPOLL: u64 = 73;
     pub const SPLICE: u64 = 76;
+    pub const TEE: u64 = 77;
     pub const READLINKAT: u64 = 78;
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
@@ -103,14 +105,30 @@ mod nr {
     pub const GETEGID: u64 = 177;
     pub const GETTID: u64 = 178;
     pub const SYSINFO: u64 = 179;
+    pub const SOCKET: u64 = 198;
+    pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
+    pub const CONNECT: u64 = 203;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const GETPEERNAME: u64 = 205;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const GETSOCKOPT: u64 = 209;
+    pub const SHUTDOWN: u64 = 210;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
+    pub const MREMAP: u64 = 216;
     pub const CLONE: u64 = 220;
     pub const EXECVE: u64 = 221;
     pub const MMAP: u64 = 222;
     pub const FADVISE64: u64 = 223;
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
+    pub const ACCEPT4: u64 = 242;
     pub const WAIT4: u64 = 260;
     pub const PRLIMIT64: u64 = 261;
     pub const RENAMEAT2: u64 = 276;
@@ -170,12 +188,28 @@ pub fn dispatch(tf: &mut TrapFrame) {
         READLINKAT => sysfile::readlinkat(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
         NEWFSTATAT => sysfile::newfstatat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
-        PPOLL => Ok(0),
+        PPOLL => sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize),
+        SOCKET => socket::socket(a[0], a[1], a[2]),
+        BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),
+        LISTEN => socket::listen(a[0]),
+        ACCEPT => socket::accept(a[0], a[1] as usize, a[2] as usize, 0),
+        ACCEPT4 => socket::accept(a[0], a[1] as usize, a[2] as usize, a[3]),
+        CONNECT => socket::connect(a[0], a[1] as usize, a[2] as usize),
+        GETSOCKNAME => socket::getsockname(a[0], a[1] as usize, a[2] as usize),
+        GETPEERNAME => socket::getpeername(a[0], a[1] as usize, a[2] as usize),
+        SENDTO => socket::sendto(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
+        RECVFROM => socket::recvfrom(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
+        SETSOCKOPT => Ok(0),
+        GETSOCKOPT => socket::getsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
+        SHUTDOWN => socket::shutdown(a[0], a[1]),
+        SENDMSG => socket::sendmsg(a[0], a[1] as usize, a[2]),
+        RECVMSG => socket::recvmsg(a[0], a[1] as usize, a[2]),
         // xattr は持っていない
         LISTXATTR..=FLISTXATTR => Ok(0),
         GETXATTR..=FGETXATTR => Err(-ENODATA),
         SETXATTR..=FSETXATTR => Err(-EOPNOTSUPP),
-        SPLICE => Err(-EINVAL),
+        SPLICE => sysfile::splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
+        TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
         FADVISE64 => Ok(0),
 
         EXIT => proc::exit(a[0] as i32 & 0xff),
@@ -222,6 +256,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], int(a[4])),
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
         MPROTECT | MADVISE => Ok(0),
+        MREMAP => Err(-ENOMEM), // musl は自分で確保しなおす
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
         n => {
             println!("syscall: unknown {} (pid {})", n, proc::current().pid);

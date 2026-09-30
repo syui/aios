@@ -3,7 +3,7 @@ use crate::spinlock::SpinLock;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-const HEAP_SIZE: usize = 8 * 1024 * 1024;
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 const ALIGN: usize = 16;
 
 #[repr(C, align(16))]

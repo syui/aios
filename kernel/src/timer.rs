@@ -50,5 +50,9 @@ pub fn tick() {
     let now = TICKS.load(Ordering::Relaxed) + 1;
     TICKS.store(now, Ordering::Relaxed);
     crate::proc::wake_expired(now);
+    // TCP の再送などのため、ときどき回す
+    if now % 5 == 0 {
+        crate::net::poll();
+    }
     rearm();
 }

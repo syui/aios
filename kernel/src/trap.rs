@@ -178,6 +178,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                 timer::IRQ => timer::tick(),
                 crate::uart::IRQ => crate::uart::intr(),
                 gic::SPURIOUS => return,
+                id if Some(id) == crate::net::irq() => crate::net::intr(),
                 _ => println!("irq: unexpected {}", id),
             }
             gic::complete(id);
