@@ -1,0 +1,14 @@
+[package]
+name = "aios-user"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+strip = true

@@ -1,0 +1,6 @@
+# ユーザープログラムは Linux (aarch64, musl, 静的リンク) のバイナリとしてビルドする
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
