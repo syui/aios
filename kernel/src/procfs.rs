@@ -7,6 +7,7 @@
 //   /proc/PID/cwd       -> カレントディレクトリ
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo
+//   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 use crate::proc::{self, Proc, State};
 use crate::vfs::*;
 use alloc::format;
@@ -25,6 +26,8 @@ enum Node {
     Mounts,
     Uptime,
     Meminfo,
+    NetDir,
+    Pnp,
     Pid(u32),
     Stat(u32),
     Status(u32),
@@ -59,6 +62,8 @@ impl ProcInode {
             Node::Mounts => 3,
             Node::Uptime => 4,
             Node::Meminfo => 5,
+            Node::NetDir => 6,
+            Node::Pnp => 7,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
@@ -94,6 +99,18 @@ impl ProcInode {
                 let total = (PHYSTOP - PHYSBASE) / 1024;
                 let free = crate::kalloc::nfree() * PGSIZE / 1024;
                 format!("MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\n", total, free, free)
+            }
+            Node::Pnp => {
+                let mut s = String::from("#PROTO: DHCP\n");
+                if let Some(l) = crate::net::get().and_then(|n| n.lease.clone()) {
+                    for d in &l.dns {
+                        s.push_str(&format!("nameserver {}\n", d));
+                    }
+                    if let Some(r) = l.router {
+                        s.push_str(&format!("bootserver {}\n", r));
+                    }
+                }
+                s
             }
             Node::Stat(pid) => stat_line(leader(pid)?),
             Node::Status(pid) => {
@@ -194,7 +211,7 @@ impl Inode for ProcInode {
     fn meta(&self) -> Meta {
         let (uid, gid) = self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid));
         let mode = match self.node {
-            Node::Root | Node::Pid(_) => S_IFDIR | 0o555,
+            Node::Root | Node::Pid(_) | Node::NetDir => S_IFDIR | 0o555,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::SelfLink | Node::Cwd(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
@@ -239,6 +256,8 @@ impl Inode for ProcInode {
             (Node::Root, "mounts") => Node::Mounts,
             (Node::Root, "uptime") => Node::Uptime,
             (Node::Root, "meminfo") => Node::Meminfo,
+            (Node::Root, "net") => Node::NetDir,
+            (Node::NetDir, "pnp") => Node::Pnp,
             (Node::Root, _) => Node::Pid(leader(num.ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
@@ -267,10 +286,12 @@ impl Inode for ProcInode {
                 add("mounts".into(), Node::Mounts);
                 add("uptime".into(), Node::Uptime);
                 add("meminfo".into(), Node::Meminfo);
+                add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {
                     add(format!("{}", p.tgid), Node::Pid(p.tgid));
                 }
             }
+            Node::NetDir => add("pnp".into(), Node::Pnp),
             Node::Pid(p) => {
                 add("stat".into(), Node::Stat(p));
                 add("status".into(), Node::Status(p));

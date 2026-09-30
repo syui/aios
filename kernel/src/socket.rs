@@ -454,7 +454,7 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
     let s = s.borrow();
     let ep = match (s.proto == Proto::Tcp, s.handle) {
         (true, Some(h)) => tcp(h).local_endpoint(),
-        _ => s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::ADDR)), l.port)),
+        _ => s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::addr())), l.port)),
     };
     write_addr(addr, lenp, ep)?;
     Ok(0)

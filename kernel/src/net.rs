@@ -1,4 +1,6 @@
 // ネットワーク: virtio-net を smoltcp (TCP/IP) につなぐ
+// アドレスは DHCP でもらう (Linux の ip=dhcp のように、カーネルの中で)。
+// もらった DNS は /proc/net/pnp に出す (/etc/resolv.conf はそこへのリンク)
 use crate::proc;
 use crate::timer;
 use crate::virtio_net::VirtioNet;
@@ -8,10 +10,8 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
-/// QEMU の user ネットワーク (slirp) の決まった値
-pub const ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-pub const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
-const PREFIX: u8 = 24;
+use smoltcp::socket::dhcpv4;
+use smoltcp::wire::Ipv4Cidr;
 
 pub struct Net {
     pub iface: Interface,
@@ -19,6 +19,16 @@ pub struct Net {
     dev: VirtioNet,
     /// close されたが、まだ FIN のやりとりが残っている TCP
     orphans: Vec<SocketHandle>,
+    dhcp: SocketHandle,
+    /// DHCP でもらったもの
+    pub lease: Option<Lease>,
+}
+
+#[derive(Clone)]
+pub struct Lease {
+    pub addr: Ipv4Cidr,
+    pub router: Option<Ipv4Address>,
+    pub dns: Vec<Ipv4Address>,
 }
 
 static mut NET: Option<Net> = None;
@@ -72,14 +82,62 @@ pub fn init() {
     let mac = EthernetAddress(dev.mac);
     let mut cfg = Config::new(mac.into());
     cfg.random_seed = crate::rand::next();
-    let mut iface = Interface::new(cfg, &mut dev, now());
-    iface.update_ip_addrs(|a| {
-        let _ = a.push(IpCidr::new(ADDR.into(), PREFIX));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
+    let iface = Interface::new(cfg, &mut dev, now());
+    let mut sockets = SocketSet::new(Vec::new());
+    let dhcp = sockets.add(dhcpv4::Socket::new());
     crate::gic::enable(dev.mmio.irq);
-    println!("net: {} addr {}/{} gw {}", mac, ADDR, PREFIX, GATEWAY);
-    unsafe { *(&raw mut NET) = Some(Net { iface, sockets: SocketSet::new(Vec::new()), dev, orphans: Vec::new() }) };
+    println!("net: {} (dhcp)", mac);
+    unsafe { *(&raw mut NET) = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp, lease: None }) };
+    poll();
+}
+
+/// 今のアドレス (まだなければ 0.0.0.0)
+pub fn addr() -> Ipv4Address {
+    get().and_then(|n| n.lease.as_ref()).map_or(Ipv4Address::UNSPECIFIED, |l| l.addr.address())
+}
+
+/// DHCP の知らせをインターフェースに映す
+fn dhcp_event(n: &mut Net) {
+    let ev = n.sockets.get_mut::<dhcpv4::Socket>(n.dhcp).poll();
+    match ev {
+        Some(dhcpv4::Event::Configured(c)) => {
+            n.iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            match c.router {
+                Some(r) => {
+                    let _ = n.iface.routes_mut().add_default_ipv4_route(r);
+                }
+                None => {
+                    n.iface.routes_mut().remove_default_ipv4_route();
+                }
+            }
+            let lease = Lease { addr: c.address, router: c.router, dns: c.dns_servers.iter().copied().collect() };
+            let changed = n.lease.as_ref().is_none_or(|l| l.addr != lease.addr || l.router != lease.router);
+            if changed {
+                print!("net: dhcp {}", lease.addr);
+                if let Some(r) = lease.router {
+                    print!(" gw {}", r);
+                }
+                for d in &lease.dns {
+                    print!(" dns {}", d);
+                }
+                println!();
+            }
+            n.lease = Some(lease);
+        }
+        Some(dhcpv4::Event::Deconfigured) => {
+            // 始めにも来るので、持っていたときだけ知らせる
+            if n.lease.is_some() {
+                println!("net: dhcp lease lost");
+            }
+            n.iface.update_ip_addrs(|a| a.clear());
+            n.iface.routes_mut().remove_default_ipv4_route();
+            n.lease = None;
+        }
+        None => {}
+    }
 }
 
 pub fn get() -> Option<&'static mut Net> {
@@ -99,6 +157,7 @@ pub fn chan() -> usize {
 pub fn poll() {
     let Some(n) = get() else { return };
     n.iface.poll(now(), &mut n.dev, &mut n.sockets);
+    dhcp_event(n);
     // 終わった孤児を片付ける
     let sockets = &mut n.sockets;
     n.orphans.retain(|&h| {
