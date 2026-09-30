@@ -20,6 +20,7 @@ mod kalloc;
 mod memlayout;
 mod net;
 mod proc;
+mod procfs;
 mod rand;
 mod signal;
 mod socket;

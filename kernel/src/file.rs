@@ -193,6 +193,12 @@ impl OpenFile {
     }
 
     pub fn stat(&self) -> Stat {
+        // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random) {
+            if let Ok(i) = vfs::resolve("", &self.describe(), true) {
+                return Stat::of_inode(&i);
+            }
+        }
         match &self.kind {
             Kind::Tty(t) => Stat::dev(vfs::S_IFCHR | 0o620, tty::rdev(t, false)),
             Kind::PtyMaster(t) => Stat::dev(vfs::S_IFCHR | 0o666, tty::rdev(t, true)),
@@ -202,6 +208,21 @@ impl OpenFile {
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
             Kind::Socket(_) | Kind::Pair(..) => Stat::dev(0o140000 | 0o777, 0),
+        }
+    }
+
+    /// 何を開いているか (/proc/PID/fd/N の readlink)
+    pub fn describe(&self) -> String {
+        match &self.kind {
+            Kind::Tty(t) => tty::name(t, false),
+            Kind::PtyMaster(t) => tty::name(t, true),
+            Kind::Null => "/dev/null".into(),
+            Kind::Zero => "/dev/zero".into(),
+            Kind::Random => "/dev/urandom".into(),
+            Kind::Inode(_, path) => alloc::format!("/{}", path),
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
+            Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
+            Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
         }
     }
 

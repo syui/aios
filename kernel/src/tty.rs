@@ -930,11 +930,28 @@ pub fn ioctl(tty: &TtyRef, master: bool, req: u64, arg: usize) -> Result<i64, i6
     Ok(0)
 }
 
+/// セッションの制御端末の (番号, 前にいるグループ) (/proc/PID/stat 用)
+pub fn of_session(sid: u32) -> Option<(u64, u32)> {
+    let t = controlling_of(sid)?;
+    let r = rdev(&t, false);
+    let pg = t.borrow().pgrp;
+    Some((r, pg))
+}
+
 fn controlling_of(sid: u32) -> Option<TtyRef> {
     all().into_iter().find(|t| t.borrow().session == sid)
 }
 
-/// /dev/tty の番号 (stat 用)
+/// 開いた口の名前 (/proc/PID/fd/N)
+pub fn name(tty: &TtyRef, master: bool) -> alloc::string::String {
+    match &tty.borrow().dev {
+        Dev::Console => "/dev/console".into(),
+        Dev::Pty(_) if master => "/dev/ptmx".into(),
+        Dev::Pty(p) => alloc::format!("/dev/pts/{}", p.index),
+    }
+}
+
+/// 端末のデバイス番号 (stat 用)。疑似端末の子は Linux と同じく major 136
 pub fn rdev(tty: &TtyRef, master: bool) -> u64 {
     match &tty.borrow().dev {
         Dev::Console => (5 << 8) | 1,

@@ -158,6 +158,8 @@ pub struct Proc {
     autoreap: bool,
     /// ユーザーとグループ
     pub cred: crate::cred::Cred,
+    /// プログラムの名前 (/proc/PID/stat や ps に出る。最大 15 バイト)
+    pub comm: [u8; 16],
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
     thread: bool,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
@@ -195,6 +197,7 @@ impl Proc {
         timers: Vec::new(),
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
+        comm: [0; 16],
         thread: false,
         clear_tid: 0,
         chan: 0,
@@ -234,6 +237,17 @@ impl Proc {
     }
 
     /// EL0 から入ってきたときの TrapFrame はいつもカーネルスタックの天辺にある
+    pub fn set_comm(&mut self, name: &[u8]) {
+        let n = name.iter().position(|&c| c == 0).unwrap_or(name.len()).min(15);
+        self.comm = [0; 16];
+        self.comm[..n].copy_from_slice(&name[..n]);
+    }
+
+    pub fn comm(&self) -> &str {
+        let n = self.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        core::str::from_utf8(&self.comm[..n]).unwrap_or("?")
+    }
+
     pub fn tf(&mut self) -> &mut TrapFrame {
         unsafe { &mut *((self.kstack_top() - size_of::<TrapFrame>()) as *mut TrapFrame) }
     }
@@ -412,6 +426,7 @@ pub fn user_init() {
     }
     p.files = Some(Shared::new(files));
     p.sigacts = Some(crate::signal::new_table());
+    p.set_comm(b"init");
     p.pgid = p.pid;
     p.sid = p.pid;
     p.state = State::Runnable;
@@ -694,6 +709,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.altstack = parent.altstack;
     }
     child.cred = parent.cred.clone();
+    child.comm = parent.comm;
     child.thread = thread;
     if thread {
         child.tgid = parent.tgid;
@@ -741,6 +757,7 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
     }
     p.cred.suid = p.cred.euid;
     p.cred.sgid = p.cred.egid;
+    p.set_comm(path.rsplit('/').next().unwrap_or(path).as_bytes());
     // 他のスレッドは消える
     for t in p.siblings() {
         kill_proc(t);
