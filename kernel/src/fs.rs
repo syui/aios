@@ -19,7 +19,7 @@ pub fn init() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                let mtab = alloc::format!("/dev/vda / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\n", kind);
+                let mtab = alloc::format!("/dev/vda / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", kind);
                 setup_dirs(&mtab);
                 return;
             }
@@ -36,7 +36,7 @@ pub fn init() {
             let _ = p.add_static(name, e.mode, e.data, e.mtime as u64 * 1_000_000_000);
         }
     }
-    setup_dirs("tmpfs / tmpfs rw 0 0\n");
+    setup_dirs("tmpfs / tmpfs rw 0 0\nproc /proc proc rw 0 0\n");
 }
 
 fn setup_dirs(mtab: &str) {
@@ -58,6 +58,9 @@ fn setup_dirs(mtab: &str) {
     let _ = tmp.set_mode(0o1777);
     for d in ["etc", "home", "root", "run", "var/tmp", "var/log"] {
         let _ = vfs::mkdir_p(d, 0o755);
+    }
+    if vfs::mkdir_p("proc", 0o555).is_ok() {
+        let _ = vfs::mount("proc", crate::procfs::new_root());
     }
     // df などが読むマウント表 (起動のたびに書きなおす)
     if let Ok(etc) = vfs::resolve("", "etc", true) {

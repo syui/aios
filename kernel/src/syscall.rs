@@ -304,7 +304,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),
         RT_SIGPROCMASK => signal::rt_sigprocmask(a[0], a[1] as usize, a[2] as usize),
         RT_SIGACTION => signal::rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
-        PRCTL => Ok(0),
+        PRCTL => sys_prctl(a[0], a[1] as usize),
         SCHED_YIELD => {
             proc::yield_now();
             Ok(0)
@@ -647,4 +647,24 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+/// prctl: 名前の設定と取得 (PR_SET_NAME / PR_GET_NAME) のほかは何もしない
+fn sys_prctl(op: u64, arg: usize) -> R {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    let p = proc::current();
+    match op {
+        PR_SET_NAME => {
+            let mut b = [0u8; 16];
+            p.pt().copy_in(&mut b[..15], arg).ok_or(-14)?;
+            p.set_comm(&b);
+        }
+        PR_GET_NAME => {
+            let c = p.comm;
+            p.pt().copy_out(arg, &c).ok_or(-14)?;
+        }
+        _ => {}
+    }
+    Ok(0)
 }
