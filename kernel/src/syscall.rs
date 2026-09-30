@@ -165,6 +165,8 @@ mod nr {
     pub const ACCEPT4: u64 = 242;
     pub const WAIT4: u64 = 260;
     pub const WAITID: u64 = 95;
+    pub const GETRUSAGE: u64 = 165;
+    pub const TIMES: u64 = 153;
     pub const PIDFD_SEND_SIGNAL: u64 = 424;
     pub const PIDFD_OPEN: u64 = 434;
     pub const PRLIMIT64: u64 = 261;
@@ -268,6 +270,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
+        GETRUSAGE => sys_getrusage(int(a[0]), a[1] as usize),
+        TIMES => sys_times(a[0] as usize),
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
         PIDFD_OPEN => sys_pidfd_open(int(a[0]), a[1]),
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
@@ -635,6 +639,46 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
         out(status, &xstatus.to_le_bytes())?;
     }
     Ok(pid as i64)
+}
+
+/// tick を timeval (秒, マイクロ秒) に
+fn tick_timeval(t: u64) -> [u8; 16] {
+    let us = t * (1_000_000 / timer::HZ);
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
+    b[8..].copy_from_slice(&(us % 1_000_000).to_le_bytes());
+    b
+}
+
+/// getrusage: 使った CPU 時間。カーネルの中の時間 (stime) は数えていないので 0
+fn sys_getrusage(who: i64, buf: usize) -> R {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    let me = proc::current();
+    let t = match who {
+        RUSAGE_SELF => proc::group_utime(me.tgid),
+        RUSAGE_CHILDREN => proc::find_leader(me.tgid).map_or(0, |l| l.cutime),
+        RUSAGE_THREAD => me.utime,
+        _ => return Err(-EINVAL),
+    };
+    let mut b = [0u8; 144];
+    b[..16].copy_from_slice(&tick_timeval(t));
+    out(buf, &b)?;
+    Ok(0)
+}
+
+/// times: struct tms (utime, stime, cutime, cstime。単位は tick = 1/100 秒)。起動からの tick を返す
+fn sys_times(buf: usize) -> R {
+    if buf != 0 {
+        let me = proc::current();
+        let c = proc::find_leader(me.tgid).map_or(0, |l| l.cutime);
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&proc::group_utime(me.tgid).to_le_bytes());
+        b[16..24].copy_from_slice(&c.to_le_bytes());
+        out(buf, &b)?;
+    }
+    Ok(timer::ticks() as i64)
 }
 
 /// pidfd の番号から pid

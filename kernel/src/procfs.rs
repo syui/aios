@@ -172,7 +172,7 @@ fn stat_line(p: &Proc) -> String {
     let (tty_nr, tpgid) = crate::tty::of_session(p.sid).map_or((0, -1), |(rdev, pg)| (rdev, pg as i64));
     let threads = proc::threads_of(p.tgid).len();
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 0 0 0",
         p.tgid,
         p.comm(),
         state_char(p),
@@ -181,6 +181,8 @@ fn stat_line(p: &Proc) -> String {
         p.sid,
         tty_nr,
         tpgid,
+        proc::group_utime(p.tgid),
+        p.cutime,
         threads
     );
     // 残り (rsslim から exit_code まで) は 0
