@@ -3,6 +3,8 @@
 #   bin/mkrootfs.sh            user/ だけ
 #   bin/mkrootfs.sh coreutils  uutils/coreutils も入れる (初回は build/ に clone してビルド)
 #   bin/mkrootfs.sh sudo-rs    sudo-rs も入れる
+#   ほかのパッケージ: grep diffutils sed awk tar findutils (ビルドは pkg/NAME.sh)
+#   ぜんぶ: bin/mkrootfs.sh coreutils sudo-rs grep diffutils sed awk tar findutils
 set -e
 cd "$(dirname "$0")/.."
 
@@ -55,6 +57,29 @@ for pkg in "$@"; do
         printf '#!/bin/sh\nexec grep -%s "$@"\n' "${v#*:}" > "rootfs/bin/${v%:*}"
         chmod 755 "rootfs/bin/${v%:*}"
       done
+      ;;
+    diffutils)
+      out=build/diffutils/target/aarch64-unknown-linux-musl/release
+      [ -x "$out/diffutils" ] || pkg/diffutils.sh
+      cp "$out/diffutils" rootfs/bin/diffutils
+      # 呼ばれた名前 (diff / cmp) で動きが変わる
+      ln -sf diffutils rootfs/bin/diff
+      ln -sf diffutils rootfs/bin/cmp
+      ;;
+    sed | awk)
+      out=build/$pkg/target/aarch64-unknown-linux-musl/release
+      [ -x "$out/$pkg" ] || "pkg/$pkg.sh"
+      cp "$out/$pkg" "rootfs/bin/$pkg"
+      ;;
+    tar)
+      out=build/tar/target/aarch64-unknown-linux-musl/release
+      [ -x "$out/tarapp" ] || pkg/tar.sh
+      cp "$out/tarapp" rootfs/bin/tar
+      ;;
+    findutils)
+      out=build/findutils/target/aarch64-unknown-linux-musl/release
+      [ -x "$out/find" ] || pkg/findutils.sh
+      cp "$out/find" "$out/xargs" rootfs/bin/
       ;;
     *) echo "unknown pkg: $pkg" >&2; exit 1 ;;
   esac
