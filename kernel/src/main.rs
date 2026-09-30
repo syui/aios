@@ -4,6 +4,9 @@
 mod boot;
 #[macro_use]
 mod uart;
+mod gic;
+mod timer;
+mod trap;
 
 use core::panic::PanicInfo;
 
@@ -18,7 +21,17 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("aios {} (aarch64)", env!("CARGO_PKG_VERSION"));
     println!("hello from EL{}", current_el());
-    halt()
+
+    trap::init();
+    unsafe { core::arch::asm!("brk #1") };
+
+    gic::init();
+    timer::init();
+    trap::intr_on();
+
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
 }
 
 fn halt() -> ! {
