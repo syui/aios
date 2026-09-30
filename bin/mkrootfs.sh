@@ -46,6 +46,11 @@ for pkg in "$@"; do
       cp "$out/sudo" "$out/visudo" rootfs/bin/
       chmod 4755 rootfs/bin/sudo
       ;;
+    grep)
+      out=build/grep/target/aarch64-unknown-linux-musl/release
+      [ -x "$out/grep" ] || pkg/grep.sh
+      cp "$out/grep" rootfs/bin/grep
+      ;;
     *) echo "unknown pkg: $pkg" >&2; exit 1 ;;
   esac
 done
