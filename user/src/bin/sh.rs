@@ -1,5 +1,5 @@
 // aios の小さなシェル (sh -c CMD、sh FILE も)
-//   パイプ |、つけかえ < > >>、並べる ; && &、クォート ' " \、変数 $VAR $? $! $0..$9 $# "$@"
+//   パイプ |、つけかえ < > >> 2> 2>&1 >&2、並べる ; && &、クォート ' " \、変数 $VAR $? $! $0..$9 $# "$@"
 //   組み込み: cd, exit, export, exec, jobs, fg, bg, wait, kill %N
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
 use std::ffi::CString;
@@ -9,9 +9,16 @@ use std::io::{self, Write};
 enum Tok {
     Word(String),
     Pipe,
-    Lt,
-    Gt,
-    GtGt,
+    /// つけかえ: [fd]< [fd]> [fd]>> [fd]>&N
+    Redir(i32, Op),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Op {
+    In,
+    Out,
+    Append,
+    Dup(i32),
 }
 
 /// 位置パラメータ ($0 と $1 以降)
@@ -70,14 +77,42 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
     while i < cs.len() {
         let c = cs[i];
         i += 1;
+        if c == '<' || c == '>' {
+            // すぐ前の数字だけの語は fd の番号 (2>file)
+            let fd = match &word {
+                Some(w) if !w.is_empty() && w.len() <= 2 && w.chars().all(|c| c.is_ascii_digit()) => {
+                    let n = w.parse().unwrap();
+                    word = None;
+                    n
+                }
+                _ => {
+                    if let Some(w) = word.take() {
+                        toks.push(Tok::Word(w));
+                    }
+                    if c == '<' { 0 } else { 1 }
+                }
+            };
+            let op = if c == '>' && cs.get(i) == Some(&'>') {
+                i += 1;
+                Op::Append
+            } else if cs.get(i) == Some(&'&') {
+                i += 1;
+                let start = i;
+                while i < cs.len() && cs[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: String = cs[start..i].iter().collect();
+                Op::Dup(n.parse().map_err(|_| format!("bad fd for {}&", c))?)
+            } else if c == '<' {
+                Op::In
+            } else {
+                Op::Out
+            };
+            toks.push(Tok::Redir(fd, op));
+            continue;
+        }
         let op = match c {
             '|' => Some(Tok::Pipe),
-            '<' => Some(Tok::Lt),
-            '>' if cs.get(i) == Some(&'>') => {
-                i += 1;
-                Some(Tok::GtGt)
-            }
-            '>' => Some(Tok::Gt),
             '#' if word.is_none() => break,
             _ => None,
         };
@@ -173,9 +208,13 @@ fn lex(line: &str, status: i32) -> Result<Vec<Tok>, String> {
 #[derive(Default)]
 struct Cmd {
     args: Vec<String>,
-    stdin: Option<String>,
-    /// (path, append)
-    stdout: Option<(String, bool)>,
+    /// 書いた順につけかえる: (fd, ファイルと open の flags / 別の fd の写し)
+    redirs: Vec<(i32, Target)>,
+}
+
+enum Target {
+    File(String, i32),
+    Dup(i32),
 }
 
 /// 1 本のパイプライン (| でつながったもの)
@@ -187,12 +226,15 @@ fn pipeline(toks: &[Tok]) -> Result<Vec<Cmd>, String> {
         match t {
             Tok::Word(w) => cur.args.push(w.clone()),
             Tok::Pipe => cmds.push(Cmd::default()),
-            Tok::Lt | Tok::Gt | Tok::GtGt => {
+            Tok::Redir(fd, Op::Dup(n)) => cur.redirs.push((*fd, Target::Dup(*n))),
+            Tok::Redir(fd, op) => {
                 let Some(Tok::Word(f)) = it.next() else { return Err("missing file for redirection".into()) };
-                match t {
-                    Tok::Lt => cur.stdin = Some(f.clone()),
-                    _ => cur.stdout = Some((f.clone(), *t == Tok::GtGt)),
-                }
+                let flags = match op {
+                    Op::In => libc::O_RDONLY,
+                    Op::Append => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                    _ => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                };
+                cur.redirs.push((*fd, Target::File(f.clone(), flags)));
             }
         }
     }
@@ -249,7 +291,7 @@ fn spawn(cmds: Vec<Cmd>, bg: bool, text: &str) -> i32 {
                     if !bg {
                         libc::tcsetpgrp(0, libc::getpgrp());
                     }
-                } else if bg && c.stdin.is_none() && prev_read < 0 {
+                } else if bg && !c.redirs.iter().any(|(fd, _)| *fd == 0) && prev_read < 0 {
                     // ジョブ制御のないうしろのジョブは端末を読まない
                     redirect("/dev/null", 0, libc::O_RDONLY);
                 }
@@ -268,14 +310,12 @@ fn spawn(cmds: Vec<Cmd>, bg: bool, text: &str) -> i32 {
                     libc::close(fds[0]);
                 }
             }
-            if let Some(f) = &c.stdin {
-                if !redirect(f, 0, libc::O_RDONLY) {
-                    unsafe { libc::_exit(1) };
-                }
-            }
-            if let Some((f, append)) = &c.stdout {
-                let mode = if *append { libc::O_APPEND } else { libc::O_TRUNC };
-                if !redirect(f, 1, libc::O_WRONLY | libc::O_CREAT | mode) {
+            for (fd, t) in &c.redirs {
+                let ok = match t {
+                    Target::File(f, flags) => redirect(f, *fd, *flags),
+                    Target::Dup(n) => (unsafe { libc::dup2(*n, *fd) }) >= 0,
+                };
+                if !ok {
                     unsafe { libc::_exit(1) };
                 }
             }
@@ -696,6 +736,8 @@ fn split_list(line: &str) -> Vec<(String, bool, bool)> {
                 and = true;
                 continue;
             }
+            // >&2 や 2>&1 の & はつけかえの一部
+            (None, '&') if cur.ends_with('>') || cur.ends_with('<') => {}
             (None, '&') => {
                 out.push((std::mem::take(&mut cur), and, true));
                 and = false;
