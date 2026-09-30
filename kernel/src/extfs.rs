@@ -9,7 +9,6 @@ use crate::kalloc;
 use crate::memlayout::PGSIZE;
 use crate::tmpfs::statfs_bytes;
 use crate::vfs::*;
-use crate::virtio_blk;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -238,7 +237,7 @@ impl ExtFs {
     /// ディスクの先頭にある ext2/ext4 を開く
     pub fn mount() -> Result<Rc<ExtFs>, &'static str> {
         let mut sb = vec![0u8; 1024];
-        virtio_blk::read(2, &mut sb).map_err(|_| "read error")?;
+        crate::block::read(2, &mut sb).map_err(|_| "read error")?;
         if u16_at(&sb, 56) != MAGIC {
             return Err("not ext2/ext4");
         }
@@ -358,7 +357,7 @@ impl ExtFs {
                 }
                 let p = kalloc::alloc().ok_or(-ENOSPC)?;
                 let buf = unsafe { core::slice::from_raw_parts_mut(p, self.bsize) };
-                if virtio_blk::read(b * (self.bsize / virtio_blk::SECTOR) as u64, buf).is_err() {
+                if crate::block::read(b * (self.bsize / crate::block::SECTOR) as u64, buf).is_err() {
                     kalloc::free(p);
                     return Err(-EIO);
                 }
@@ -788,7 +787,7 @@ impl ExtFs {
     /// ブロックをディスクの本当の場所へ。となりあうものは 1 回の要求にまとめる
     fn write_blocks(&self, dirty: &[u64]) -> Result<(), i64> {
         const RUN: usize = 64;
-        let spb = (self.bsize / virtio_blk::SECTOR) as u64;
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut i = 0;
         while i < dirty.len() {
             let mut j = i + 1;
@@ -799,7 +798,7 @@ impl ExtFs {
             for (k, &b) in dirty[i..j].iter().enumerate() {
                 self.with_block(b, |d| buf[k * self.bsize..(k + 1) * self.bsize].copy_from_slice(d))?;
             }
-            virtio_blk::write(dirty[i] * spb, &buf)?;
+            crate::block::write(dirty[i] * spb, &buf)?;
             i = j;
         }
         Ok(())

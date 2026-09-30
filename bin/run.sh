@@ -6,7 +6,7 @@
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
 # ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
-# AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。ルートは initramfs、ネットワークなし)
+# AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
 k=$1
 case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
@@ -36,7 +36,10 @@ if [ "${AIOS_MACHINE:-virt}" = raspi3b ]; then
     mkdir -p build/rpi
     curl -fsSL -o "$dtb" https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/bcm2710-rpi-3-b.dtb || exit 1
   fi
-  qemu-system-aarch64 -M raspi3b -serial stdio -display none -dtb "$dtb" -kernel "$k" -append "${AIOS_CMDLINE:-}"
+  sd=
+  [ -f sd.img ] && sd="-drive if=sd,file=sd.img,format=raw"
+  # shellcheck disable=SC2086
+  qemu-system-aarch64 -M raspi3b -serial stdio -display none -dtb "$dtb" $sd -kernel "$k" -append "${AIOS_CMDLINE:-}"
   exit
 fi
 set -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false

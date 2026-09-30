@@ -2,15 +2,14 @@
 use crate::extfs::ExtFs;
 use crate::initrd;
 use crate::tmpfs::{self, TmpInode};
-use crate::virtio_blk;
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 
 /// ディスクに ext2 があればそれを、なければ initramfs を展開した tmpfs をルートにする
 pub fn init() {
-    if virtio_blk::init() {
+    if crate::block::init() {
         match ExtFs::mount() {
             Ok(fs) => {
-                println!("fs: root is {} on virtio-blk", fs.kind());
+                println!("fs: root is {} on {}", fs.kind(), crate::block::name());
                 let kind = fs.kind();
                 vfs::set_root(fs.root());
                 // /dev と /tmp はメモリ上に
@@ -19,7 +18,7 @@ pub fn init() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                let mtab = alloc::format!("/dev/vda / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", kind);
+                let mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", crate::block::name(), kind);
                 setup_dirs(&mtab);
                 return;
             }
