@@ -1,5 +1,6 @@
 // ファイルまわりのシステムコール
 use crate::file::{self, FileRef, Kind, Pipe, Stat, EBADF, EINVAL};
+use crate::cred::{self, Cred, R as PR, W as PW, X as PX};
 use crate::fs;
 use crate::proc::{self, Fd};
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
@@ -44,6 +45,13 @@ const FD_CLOEXEC: u64 = 1;
 const O_NONBLOCK: u32 = 0o4000;
 
 const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
+/// termios の c_lflag
+const ISIG: u32 = 0o1;
+const ICANON: u32 = 0o2;
+const ECHO: u32 = 0o10;
 const FIONBIO: u64 = 0x5421;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCGPGRP: u64 = 0x540f;
@@ -104,6 +112,32 @@ fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
     vfs::parent_of(&base, &path)
+}
+
+/// 親ディレクトリに書ける (w と x) か
+fn parent_writable(c: &Cred, parent: &InodeRef) -> Result<(), i64> {
+    c.check(&parent.meta(), PW | PX)
+}
+
+/// sticky なディレクトリでは、消す/動かすのは持ち主 (ファイルかディレクトリ) か root だけ
+fn sticky_ok(c: &Cred, parent: &InodeRef, name: &str) -> Result<(), i64> {
+    let pm = parent.meta();
+    if pm.mode & cred::S_ISVTX == 0 || c.euid == 0 || c.euid == pm.uid {
+        return Ok(());
+    }
+    let child = parent.lookup(name)?;
+    if child.meta().uid == c.euid { Ok(()) } else { Err(-cred::EPERM) }
+}
+
+/// 作ったものの持ち主を決める (setgid のディレクトリの下ならそのグループ)
+fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
+    let pm = parent.meta();
+    let gid = if pm.mode & cred::S_ISGID != 0 { pm.gid } else { c.egid };
+    ino.set_owner(Some(c.euid), Some(gid))?;
+    if pm.mode & cred::S_ISGID != 0 && ino.meta().is_dir() {
+        ino.set_mode(ino.meta().mode | cred::S_ISGID)?;
+    }
+    Ok(())
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
@@ -199,12 +233,24 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         }
         Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
             let (parent, name) = vfs::parent_of(&base, &path)?;
+            let c = cred::current();
+            parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::File)?;
-            (vfs::normalize(&base, &path), ino)
+            own_new(&c, &parent, &ino)?;
+            // 作ったばかりのものは、mode に関係なく開ける
+            let f = file::new(Kind::Inode(ino, vfs::normalize(&base, &path)), flags as u32);
+            let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+            return Ok(fd as i64);
         }
         Err(e) => return Err(e),
     };
     let accmode = flags as u32 & file::O_ACCMODE;
+    let want = match accmode {
+        file::O_RDONLY => PR,
+        file::O_WRONLY => PW,
+        _ => PR | PW,
+    } | if flags & O_TRUNC != 0 { PW } else { 0 };
+    cred::current().check(&ino.meta(), want)?;
     let kind = match ino.meta().mode & S_IFMT {
         vfs::S_IFDIR => {
             if accmode != file::O_RDONLY {
@@ -274,8 +320,14 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
     Ok(0)
 }
 
-pub fn faccessat(dirfd: i64, pathp: usize) -> R {
-    at(dirfd, pathp, 0)?;
+/// access(2): 実 uid/gid で確かめる (AT_EACCESS なら実効)
+pub fn faccessat(dirfd: i64, pathp: usize, mode: u64, flags: u64) -> R {
+    const AT_EACCESS: u64 = 0x200;
+    let ino = at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
+    let want = (mode & 7) as u32;
+    if want != 0 && !cred::current().may(&ino.meta(), want, flags & AT_EACCESS == 0) {
+        return Err(-cred::EACCES);
+    }
     Ok(0)
 }
 
@@ -297,7 +349,10 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
-    parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::Dir)?;
+    let c = cred::current();
+    parent_writable(&c, &parent)?;
+    let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::Dir)?;
+    own_new(&c, &parent, &ino)?;
     Ok(0)
 }
 
@@ -310,12 +365,21 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
         0 | vfs::S_IFREG => NewNode::File,
         _ => return Err(-EINVAL),
     };
-    parent.create(&name, mode & 0o7777 & !UMASK, node)?;
+    let c = cred::current();
+    if matches!(node, NewNode::Dev(..)) && c.euid != 0 {
+        return Err(-cred::EPERM);
+    }
+    parent_writable(&c, &parent)?;
+    let ino = parent.create(&name, mode & 0o7777 & !UMASK, node)?;
+    own_new(&c, &parent, &ino)?;
     Ok(0)
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
+    let c = cred::current();
+    parent_writable(&c, &parent)?;
+    sticky_ok(&c, &parent, &name)?;
     parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
     Ok(0)
 }
@@ -323,7 +387,10 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
     let (parent, name) = parent_at(dirfd, pathp)?;
-    parent.create(&name, 0o777, NewNode::Symlink(target))?;
+    let c = cred::current();
+    parent_writable(&c, &parent)?;
+    let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
+    own_new(&c, &parent, &ino)?;
     Ok(0)
 }
 
@@ -334,6 +401,7 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
         return Err(-vfs::EPERM);
     }
     let (parent, name) = parent_at(newdir, newp)?;
+    parent_writable(&cred::current(), &parent)?;
     parent.link(&name, &ino)?;
     Ok(0)
 }
@@ -351,12 +419,23 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if flags & RENAME_NOREPLACE != 0 && np.lookup(&nname).is_ok() {
         return Err(-EEXIST);
     }
+    let c = cred::current();
+    parent_writable(&c, &op)?;
+    parent_writable(&c, &np)?;
+    sticky_ok(&c, &op, &oname)?;
+    if np.lookup(&nname).is_ok() {
+        sticky_ok(&c, &np, &nname)?;
+    }
     op.rename(&oname, &np, &nname)?;
     Ok(0)
 }
 
 pub fn ftruncate(fd: u64, len: i64) -> R {
     if len < 0 {
+        return Err(-EINVAL);
+    }
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_ACCMODE == file::O_RDONLY {
         return Err(-EINVAL);
     }
     inode_of(fd)?.truncate(len as usize)?;
@@ -367,38 +446,77 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     if len < 0 {
         return Err(-EINVAL);
     }
-    at(AT_FDCWD, pathp, 0)?.truncate(len as usize)?;
+    let ino = at(AT_FDCWD, pathp, 0)?;
+    cred::current().check(&ino.meta(), PW)?;
+    ino.truncate(len as usize)?;
+    Ok(0)
+}
+
+/// 持ち主か root だけ。グループに入っていなければ setgid は落とす
+fn chmod(ino: &InodeRef, mode: u64) -> R {
+    let c = cred::current();
+    let m = ino.meta();
+    if !c.owns(&m) {
+        return Err(-cred::EPERM);
+    }
+    let mut mode = mode as u32;
+    if c.euid != 0 && !c.in_group(m.gid) {
+        mode &= !cred::S_ISGID;
+    }
+    ino.set_mode(mode)?;
     Ok(0)
 }
 
 pub fn fchmod(fd: u64, mode: u64) -> R {
-    inode_of(fd)?.set_mode(mode as u32)?;
-    Ok(0)
+    chmod(&inode_of(fd)?, mode)
 }
 
 pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
-    at(dirfd, pathp, 0)?.set_mode(mode as u32)?;
-    Ok(0)
+    chmod(&at(dirfd, pathp, 0)?, mode)
 }
 
 fn id_arg(v: u64) -> Option<u32> {
     (v as u32 != u32::MAX).then_some(v as u32)
 }
 
-pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
-    inode_of(fd)?.set_owner(id_arg(uid), id_arg(gid))?;
+/// root は何でも。持ち主は、自分が入っているグループへ変えることだけできる
+fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
+    let c = cred::current();
+    let m = ino.meta();
+    let (uid, gid) = (id_arg(uid), id_arg(gid));
+    if c.euid != 0 {
+        let uid_ok = uid.is_none_or(|u| u == m.uid);
+        let gid_ok = gid.is_none_or(|g| g == m.gid || c.in_group(g));
+        if c.euid != m.uid || !uid_ok || !gid_ok {
+            return Err(-cred::EPERM);
+        }
+    }
+    ino.set_owner(uid, gid)?;
+    // 持ち主が変わった実行ファイルの setuid/setgid は落とす
+    if m.mode & vfs::S_IFMT == vfs::S_IFREG && m.mode & (cred::S_ISUID | cred::S_ISGID) != 0 && (uid.is_some() || gid.is_some()) {
+        ino.set_mode(m.mode & !(cred::S_ISUID | cred::S_ISGID))?;
+    }
     Ok(0)
 }
 
+pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
+    chown(&inode_of(fd)?, uid, gid)
+}
+
 pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
-    at(dirfd, pathp, flags)?.set_owner(id_arg(uid), id_arg(gid))?;
-    Ok(0)
+    chown(&at(dirfd, pathp, flags)?, uid, gid)
 }
 
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
     const UTIME_NOW: u64 = (1 << 30) - 1;
     const UTIME_OMIT: u64 = (1 << 30) - 2;
     let ino = if pathp == 0 { inode_of(dirfd as u64)? } else { at(dirfd, pathp, flags)? };
+    let c = cred::current();
+    let m = ino.meta();
+    // 時刻を指定するのは持ち主か root。「いま」にするだけなら書ければよい
+    if !c.owns(&m) && (times != 0 || !c.may(&m, PW, false)) {
+        return Err(if times != 0 { -cred::EPERM } else { -cred::EACCES });
+    }
     let mtime = if times == 0 {
         Some(crate::timer::epoch_ns())
     } else {
@@ -535,8 +653,18 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     }
     match req {
         TCGETS => {
-            // 端末であることだけ伝える (中身は 0 の termios)
-            out(arg, &[0u8; 60])?;
+            // struct termios (カーネル版 36 バイト)。いま意味があるのは ECHO だけ
+            let mut t = [0u8; 36];
+            let lflag = ISIG | ICANON | if crate::console::echo_enabled() { ECHO } else { 0 };
+            t[12..16].copy_from_slice(&lflag.to_le_bytes());
+            out(arg, &t)?;
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            let mut t = [0u8; 16];
+            proc::current().pt().copy_in(&mut t, arg).ok_or(-EFAULT)?;
+            let lflag = u32::from_le_bytes(t[12..16].try_into().unwrap());
+            crate::console::set_echo(lflag & ECHO != 0);
             Ok(0)
         }
         TIOCGWINSZ => {
@@ -574,6 +702,7 @@ pub fn chdir(pathp: usize) -> R {
     if !ino.meta().is_dir() {
         return Err(-ENOTDIR);
     }
+    cred::current().check(&ino.meta(), PX)?;
     files.cwd = full;
     Ok(0)
 }

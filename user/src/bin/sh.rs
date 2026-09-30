@@ -1,4 +1,4 @@
-// aios の小さなシェル
+// aios の小さなシェル (sh -c CMD、sh FILE も)
 //   パイプ |、つけかえ < > >>、並べる ; &&、クォート ' " \、変数 $VAR $?
 //   組み込み: cd, exit, export
 use std::ffi::CString;
@@ -359,11 +359,32 @@ fn run(line: &str, mut status: i32) -> i32 {
 }
 
 fn main() {
+    // sh -c CMD / sh FILE
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "-c") {
+        let cmd = args.get(i + 1).cloned().unwrap_or_default();
+        std::process::exit(run(&cmd, 0));
+    }
+    if let Some(file) = args.get(1).filter(|a| !a.starts_with('-')) {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("sh: {}: {}", file, e);
+                std::process::exit(127);
+            }
+        };
+        let mut status = 0;
+        for line in text.lines() {
+            status = run(line.trim(), status);
+        }
+        std::process::exit(status);
+    }
     let stdin = io::stdin();
     let mut status = 0;
     loop {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-        print!("{} {} ", cwd, if status == 0 { "%" } else { "!" });
+        let mark = if status != 0 { "!" } else if unsafe { libc::geteuid() } == 0 { "#" } else { "%" };
+        print!("{} {} ", cwd, mark);
         io::stdout().flush().ok();
 
         let mut line = String::new();

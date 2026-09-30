@@ -163,14 +163,18 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         return Err(-ENOENT);
     }
     let mut path = normalize(cwd, path);
+    let cred = crate::cred::current();
     'restart: for _ in 0..16 {
         let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
         let mut cur = cross(root());
         let mut walked = String::new();
         for (i, c) in comps.iter().enumerate() {
-            if !cur.meta().is_dir() {
+            let m = cur.meta();
+            if !m.is_dir() {
                 return Err(-ENOTDIR);
             }
+            // ディレクトリを通るには x が要る
+            cred.check(&m, crate::cred::X)?;
             let next = cross(cur.lookup(c)?);
             let last = i + 1 == comps.len();
             if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {

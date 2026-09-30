@@ -6,6 +6,17 @@
 set -e
 cd "$(dirname "$0")"
 [ -d rootfs ] || { echo "rootfs/ がありません。先に ./mkrootfs.sh を実行してください" >&2; exit 1; }
+# 中のファイルは root のものにする (root でなければ fakeroot の中で)
+if [ "$(id -u)" != 0 ]; then
+  command -v fakeroot >/dev/null || { echo "root か fakeroot が必要です" >&2; exit 1; }
+  exec fakeroot "$0" "$@"
+fi
+# chown は setuid/setgid のビットを消すので、覚えておいて付けなおす
+suid=$(find rootfs -type f -perm -4000)
+sgid=$(find rootfs -type f -perm -2000)
+chown -R 0:0 rootfs
+[ -z "$suid" ] || chmod u+s $suid
+[ -z "$sgid" ] || chmod g+s $sgid
 rm -f disk.img
 case "${FS:-ext4}" in
   ext4) mkfs.ext4 -q -F -O ^dir_index -E root_owner=0:0 -d rootfs disk.img "${1:-1G}" ;;

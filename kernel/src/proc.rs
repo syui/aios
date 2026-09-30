@@ -139,6 +139,8 @@ pub struct Proc {
     group_exit: Option<i32>,
     /// シグナルごとのハンドラ (SIG_DFL = 0, SIG_IGN = 1)。まだ呼び出しはしない
     pub sig_handlers: [u64; NSIG],
+    /// ユーザーとグループ
+    pub cred: crate::cred::Cred,
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
     thread: bool,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
@@ -163,6 +165,7 @@ impl Proc {
         killed: false,
         group_exit: None,
         sig_handlers: [0; NSIG],
+        cred: crate::cred::Cred::ROOT,
         thread: false,
         clear_tid: 0,
         chan: 0,
@@ -238,6 +241,14 @@ fn procs() -> &'static mut [Proc; NPROC] {
 pub fn current() -> &'static mut Proc {
     let i = unsafe { CURRENT }.expect("no current proc");
     &mut procs()[i]
+}
+
+/// いまのプロセスの資格情報。まだプロセスがなければ root
+pub fn current_cred() -> crate::cred::Cred {
+    match unsafe { CURRENT } {
+        Some(i) => procs()[i].cred.clone(),
+        None => crate::cred::Cred::ROOT,
+    }
 }
 
 /// exec が使う cwd。user_init のときはまだ current がないのでルート
@@ -628,6 +639,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     child.mm = Some(mm);
     child.files = Some(files);
     child.sig_handlers = parent.sig_handlers;
+    child.cred = parent.cred.clone();
     child.thread = thread;
     if thread {
         child.tgid = parent.tgid;
@@ -666,6 +678,15 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
     let img = exec::exec(path, argv, envp)?;
     let p = current();
+    // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる
+    if let Some(u) = img.setuid {
+        p.cred.euid = u;
+    }
+    if let Some(g) = img.setgid {
+        p.cred.egid = g;
+    }
+    p.cred.suid = p.cred.euid;
+    p.cred.sgid = p.cred.egid;
     // 他のスレッドは消える
     for t in p.siblings() {
         kill_proc(t);
@@ -726,6 +747,11 @@ pub fn kill_thread(tid: u32, sig: i32) -> Result<(), i64> {
     const ESRCH: i64 = 3;
     let me = current();
     let target = find(tid).ok_or(-ESRCH)?;
+    // root でなければ、実 uid か実効 uid が相手の実 uid か保存された uid と同じときだけ
+    let (a, b) = (&me.cred, &target.cred);
+    if a.euid != 0 && a.uid != b.uid && a.uid != b.suid && a.euid != b.uid && a.euid != b.suid {
+        return Err(-crate::cred::EPERM);
+    }
     if sig <= 0 || sig as usize >= NSIG {
         return if sig == 0 { Ok(()) } else { Err(-22) };
     }

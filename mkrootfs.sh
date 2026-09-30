@@ -11,13 +11,18 @@ bin=user/target/aarch64-unknown-linux-musl/release
 rm -rf rootfs
 mkdir -p rootfs/bin rootfs/usr/bin
 cp "$bin/init" rootfs/init
-for p in sh hello aipkg fetch systemctl journalctl; do
+for p in sh hello aipkg fetch systemctl journalctl login passwd su; do
   cp "$bin/$p" rootfs/bin/$p
 done
+# passwd と su は root の権限で動く
+chmod 4755 rootfs/bin/passwd rootfs/bin/su
 ln -s systemctl rootfs/bin/poweroff
 ln -s systemctl rootfs/bin/reboot
 cp -r etc rootfs/etc
-mkdir -p rootfs/root rootfs/var/log rootfs/run
+chmod 600 rootfs/etc/shadow
+mkdir -p rootfs/root rootfs/home rootfs/var/log rootfs/run rootfs/tmp
+chmod 700 rootfs/root
+chmod 1777 rootfs/tmp
 
 for pkg in "$@"; do
   case "$pkg" in
