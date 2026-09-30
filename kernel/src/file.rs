@@ -1,6 +1,6 @@
 // 開いたファイル (fd の向こう側)
 use crate::console;
-use crate::fs::{self, InodeRef, Node, S_IFMT};
+use crate::vfs::{self, InodeRef, S_IFMT};
 use crate::proc;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub const EBADF: i64 = 9;
-pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ESPIPE: i64 = 29;
 pub const EPIPE: i64 = 32;
@@ -26,7 +25,7 @@ pub enum Kind {
     Null,
     Zero,
     Random,
-    /// tmpfs の inode と、開いたときのパス (dirfd の基準に使う)
+    /// ファイルシステムの inode と、開いたときのパス (dirfd の基準に使う)
     Inode(InodeRef, String),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
@@ -66,28 +65,30 @@ pub struct Stat {
     pub gid: u32,
     pub rdev: u64,
     pub size: u64,
+    pub blocks: u64,
     pub mtime: u64,
     pub ctime: u64,
 }
 
 impl Stat {
     pub fn of_inode(i: &InodeRef) -> Stat {
-        let i = i.borrow();
+        let m = i.meta();
         Stat {
-            ino: i.ino,
-            mode: i.mode,
-            nlink: i.nlink,
-            uid: i.uid,
-            gid: i.gid,
-            rdev: i.rdev(),
-            size: i.size(),
-            mtime: i.mtime,
-            ctime: i.ctime,
+            ino: m.ino,
+            mode: m.mode,
+            nlink: m.nlink,
+            uid: m.uid,
+            gid: m.gid,
+            rdev: m.rdev,
+            size: m.size,
+            blocks: m.blocks,
+            mtime: m.mtime,
+            ctime: m.ctime,
         }
     }
 
     fn dev(mode: u32, rdev: u64) -> Stat {
-        Stat { ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, mtime: 0, ctime: 0 }
+        Stat { ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, mtime: 0, ctime: 0 }
     }
 
     pub fn to_bytes(&self) -> [u8; 128] {
@@ -101,7 +102,7 @@ impl Stat {
         b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize
-        b[64..72].copy_from_slice(&self.size.div_ceil(512).to_le_bytes()); // st_blocks
+        b[64..72].copy_from_slice(&self.blocks.to_le_bytes()); // st_blocks
         let times = [(72, self.mtime), (88, self.mtime), (104, self.ctime)];
         for (off, ns) in times {
             b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
@@ -139,26 +140,12 @@ impl OpenFile {
                 Ok(dst.len())
             }
             Kind::Inode(ino, _) => {
-                let n = Self::pread(ino, dst, self.offset)?;
+                let n = ino.read_at(self.offset, dst)?;
                 self.offset += n;
                 Ok(n)
             }
             Kind::PipeRead(p) => Pipe::read(p, dst),
             Kind::PipeWrite(_) => Err(-EBADF),
-        }
-    }
-
-    pub fn pread(ino: &InodeRef, dst: &mut [u8], off: usize) -> Result<usize, i64> {
-        let i = ino.borrow();
-        match &i.node {
-            Node::File(d) => {
-                let data = d.bytes();
-                let n = dst.len().min(data.len().saturating_sub(off));
-                dst[..n].copy_from_slice(&data[off..off + n]);
-                Ok(n)
-            }
-            Node::Dir(_) => Err(-EISDIR),
-            _ => Err(-EINVAL),
         }
     }
 
@@ -173,11 +160,10 @@ impl OpenFile {
             }
             Kind::Null | Kind::Zero | Kind::Random => Ok(src.len()),
             Kind::Inode(ino, _) => {
-                let ino = ino.clone();
                 if self.flags & O_APPEND != 0 {
-                    self.offset = ino.borrow().size() as usize;
+                    self.offset = ino.meta().size as usize;
                 }
-                let n = Self::pwrite(&ino, src, self.offset)?;
+                let n = ino.write_at(self.offset, src)?;
                 self.offset += n;
                 Ok(n)
             }
@@ -186,24 +172,12 @@ impl OpenFile {
         }
     }
 
-    pub fn pwrite(ino: &InodeRef, src: &[u8], off: usize) -> Result<usize, i64> {
-        let mut i = ino.borrow_mut();
-        let Node::File(d) = &mut i.node else { return Err(-EINVAL) };
-        let v = d.owned();
-        if v.len() < off + src.len() {
-            v.resize(off + src.len(), 0);
-        }
-        v[off..off + src.len()].copy_from_slice(src);
-        i.touch();
-        Ok(src.len())
-    }
-
     pub fn stat(&self) -> Stat {
         match &self.kind {
-            Kind::Console => Stat::dev(fs::S_IFCHR | 0o620, (5 << 8) | 1),
-            Kind::Null => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 3),
-            Kind::Zero => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 5),
-            Kind::Random => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 9),
+            Kind::Console => Stat::dev(vfs::S_IFCHR | 0o620, (5 << 8) | 1),
+            Kind::Null => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 3),
+            Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
+            Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::dev(S_IFIFO | 0o600, 0),
         }
@@ -211,7 +185,7 @@ impl OpenFile {
 
     pub fn lseek(&mut self, off: i64, whence: u32) -> Result<usize, i64> {
         let size = match &self.kind {
-            Kind::Inode(ino, _) => ino.borrow().size() as i64,
+            Kind::Inode(ino, _) => ino.meta().size as i64,
             Kind::Null | Kind::Zero | Kind::Random => 0,
             _ => return Err(-ESPIPE),
         };
@@ -239,17 +213,15 @@ impl OpenFile {
     /// linux_dirent64 を詰める。offset は「何番目まで返したか」
     pub fn getdents(&mut self, out: &mut Vec<u8>, max: usize) -> Result<(), i64> {
         let Kind::Inode(dir, path) = &self.kind else { return Err(-ENOTDIR) };
-        let parent = fs::resolve("", &fs::normalize(path, ".."), true).unwrap_or_else(|_| fs::root());
+        if !dir.meta().is_dir() {
+            return Err(-ENOTDIR);
+        }
+        let parent = vfs::resolve("", &vfs::normalize(path, ".."), true).unwrap_or_else(|_| dir.clone());
         let mut list = Vec::new();
-        {
-            let d = dir.borrow();
-            let Node::Dir(m) = &d.node else { return Err(-ENOTDIR) };
-            list.push((d.ino, String::from("."), fs::S_IFDIR));
-            list.push((parent.borrow().ino, String::from(".."), fs::S_IFDIR));
-            for (name, ino) in m {
-                let i = ino.borrow();
-                list.push((i.ino, name.clone(), i.mode));
-            }
+        list.push((dir.meta().ino, String::from("."), vfs::S_IFDIR));
+        list.push((parent.meta().ino, String::from(".."), vfs::S_IFDIR));
+        for e in dir.readdir()? {
+            list.push((e.ino, e.name, e.mode));
         }
         for (i, (ino, name, mode)) in list.into_iter().enumerate().skip(self.offset) {
             let reclen = (19 + name.len() + 1 + 7) & !7;

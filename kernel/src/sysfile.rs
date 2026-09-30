@@ -1,8 +1,8 @@
 // ファイルまわりのシステムコール
-use crate::file::{self, FileRef, Kind, OpenFile, Pipe, Stat, EBADF, EINVAL};
-use crate::fs::{self, InodeRef, Node, S_IFMT};
+use crate::file::{self, FileRef, Kind, Pipe, Stat, EBADF, EINVAL};
+use crate::fs;
 use crate::proc::{self, Fd};
-use alloc::collections::BTreeMap;
+use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -79,7 +79,7 @@ fn base_dir(dirfd: i64, path: &str) -> Result<String, i64> {
     let f = file_of(dirfd as u64)?;
     let f = f.borrow();
     match &f.kind {
-        Kind::Inode(i, p) if i.borrow().is_dir() => Ok(p.clone()),
+        Kind::Inode(i, p) if i.meta().is_dir() => Ok(p.clone()),
         _ => Err(-ENOTDIR),
     }
 }
@@ -94,13 +94,13 @@ fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
         return Err(-ENOENT);
     }
     let base = base_dir(dirfd, &path)?;
-    fs::resolve(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
+    vfs::resolve(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
 }
 
 fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
-    fs::parent_of(&base, &path)
+    vfs::parent_of(&base, &path)
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
@@ -127,7 +127,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?; // ESPIPE
     let mut tmp = vec![0u8; len.min(64 * 1024)];
-    let n = OpenFile::pread(&ino, &mut tmp, off.max(0) as usize)?;
+    let n = ino.read_at(off.max(0) as usize, &mut tmp)?;
     out(buf, &tmp[..n])?;
     Ok(n as i64)
 }
@@ -136,7 +136,7 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?;
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
-    let n = OpenFile::pwrite(&ino, &tmp, off.max(0) as usize)?;
+    let n = ino.write_at(off.max(0) as usize, &tmp)?;
     Ok(n as i64)
 }
 
@@ -187,7 +187,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
     let follow = flags & O_NOFOLLOW == 0;
-    let (full, ino) = match fs::lookup(&base, &path, follow) {
+    let (full, ino) = match vfs::lookup(&base, &path, follow) {
         Ok(found) => {
             if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
                 return Err(-EEXIST);
@@ -195,34 +195,32 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             found
         }
         Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
-            let (parent, name) = fs::parent_of(&base, &path)?;
-            let ino = fs::new_inode(fs::S_IFREG | (mode as u32 & 0o7777 & !UMASK), Node::File(fs::Data::Owned(Vec::new())));
-            fs::link_into(&parent, &name, ino.clone())?;
-            (fs::normalize(&base, &path), ino)
+            let (parent, name) = vfs::parent_of(&base, &path)?;
+            let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::File)?;
+            (vfs::normalize(&base, &path), ino)
         }
         Err(e) => return Err(e),
     };
     let accmode = flags as u32 & file::O_ACCMODE;
-    let kind = {
-        let mut i = ino.borrow_mut();
-        match &mut i.node {
-            Node::Dir(_) => {
-                if accmode != file::O_RDONLY {
-                    return Err(-EISDIR);
-                }
-                None
+    let kind = match ino.meta().mode & S_IFMT {
+        vfs::S_IFDIR => {
+            if accmode != file::O_RDONLY {
+                return Err(-EISDIR);
             }
-            _ if flags & O_DIRECTORY != 0 => return Err(-ENOTDIR),
-            Node::Dev(ma, mi) => Some(Kind::of_dev(*ma, *mi).ok_or(-ENXIO)?),
-            Node::Fifo => return Err(-ENXIO),
-            Node::Symlink(_) => return Err(-40), // ELOOP (O_NOFOLLOW)
-            Node::File(d) => {
-                if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
-                    *d = fs::Data::Owned(Vec::new());
-                    i.touch();
-                }
-                None
+            None
+        }
+        _ if flags & O_DIRECTORY != 0 => return Err(-ENOTDIR),
+        vfs::S_IFCHR => {
+            let (ma, mi) = fs::dev_of(&ino).unwrap();
+            Some(Kind::of_dev(ma, mi).ok_or(-ENXIO)?)
+        }
+        vfs::S_IFIFO => return Err(-ENXIO),
+        vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
+        _ => {
+            if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
+                ino.truncate(0)?;
             }
+            None
         }
     };
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
@@ -272,8 +270,7 @@ pub fn faccessat(dirfd: i64, pathp: usize) -> R {
 
 pub fn readlinkat(dirfd: i64, pathp: usize, buf: usize, len: usize) -> R {
     let ino = at(dirfd, pathp, AT_SYMLINK_NOFOLLOW)?;
-    let i = ino.borrow();
-    let Node::Symlink(t) = &i.node else { return Err(-EINVAL) };
+    let t = ino.readlink()?;
     let n = t.len().min(len);
     out(buf, &t.as_bytes()[..n])?;
     Ok(n as i64)
@@ -289,8 +286,7 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
-    let d = fs::new_inode(fs::S_IFDIR | (mode as u32 & 0o7777 & !UMASK), Node::Dir(BTreeMap::new()));
-    fs::link_into(&parent, &name, d)?;
+    parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::Dir)?;
     Ok(0)
 }
 
@@ -298,110 +294,94 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
     let mode = mode as u32;
     let node = match mode & S_IFMT {
-        fs::S_IFIFO => Node::Fifo,
-        fs::S_IFCHR => Node::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
-        0 | fs::S_IFREG => Node::File(fs::Data::Owned(Vec::new())),
+        vfs::S_IFIFO => NewNode::Fifo,
+        vfs::S_IFCHR => NewNode::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
+        0 | vfs::S_IFREG => NewNode::File,
         _ => return Err(-EINVAL),
     };
-    let fmt = if mode & S_IFMT == 0 { fs::S_IFREG } else { mode & S_IFMT };
-    fs::link_into(&parent, &name, fs::new_inode(fmt | (mode & 0o7777 & !UMASK), node))?;
+    parent.create(&name, mode & 0o7777 & !UMASK, node)?;
     Ok(0)
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
-    fs::unlink(&parent, &name, flags & AT_REMOVEDIR != 0)?;
+    parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
     Ok(0)
 }
 
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
     let (parent, name) = parent_at(dirfd, pathp)?;
-    fs::link_into(&parent, &name, fs::new_inode(fs::S_IFLNK | 0o777, Node::Symlink(target)))?;
+    parent.create(&name, 0o777, NewNode::Symlink(target))?;
     Ok(0)
 }
 
 pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) -> R {
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
     let ino = at(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
-    if ino.borrow().is_dir() {
-        return Err(-1); // EPERM
+    if ino.meta().is_dir() {
+        return Err(-vfs::EPERM);
     }
     let (parent, name) = parent_at(newdir, newp)?;
-    fs::link_into(&parent, &name, ino.clone())?;
-    ino.borrow_mut().nlink += 1;
+    parent.link(&name, &ino)?;
     Ok(0)
 }
 
 pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) -> R {
     const RENAME_NOREPLACE: u64 = 1;
-    let (op, oname) = parent_at(olddir, oldp)?;
-    let (np, nname) = parent_at(newdir, newp)?;
-    if flags & RENAME_NOREPLACE != 0 && np.borrow_mut().dir()?.contains_key(&nname) {
-        return Err(-EEXIST);
-    }
     if flags & !RENAME_NOREPLACE != 0 {
         return Err(-EINVAL);
     }
-    fs::rename(&op, &oname, &np, &nname)?;
-    Ok(0)
-}
-
-fn truncate_inode(ino: &InodeRef, len: i64) -> R {
-    if len < 0 {
-        return Err(-EINVAL);
+    let (op, oname) = parent_at(olddir, oldp)?;
+    let (np, nname) = parent_at(newdir, newp)?;
+    if op.id().0 != np.id().0 {
+        return Err(-vfs::EXDEV);
     }
-    let mut i = ino.borrow_mut();
-    match &mut i.node {
-        Node::File(d) => d.owned().resize(len as usize, 0),
-        Node::Dir(_) => return Err(-EISDIR),
-        _ => return Err(-EINVAL),
+    if flags & RENAME_NOREPLACE != 0 && np.lookup(&nname).is_ok() {
+        return Err(-EEXIST);
     }
-    i.touch();
+    op.rename(&oname, &np, &nname)?;
     Ok(0)
 }
 
 pub fn ftruncate(fd: u64, len: i64) -> R {
-    truncate_inode(&inode_of(fd)?, len)
+    if len < 0 {
+        return Err(-EINVAL);
+    }
+    inode_of(fd)?.truncate(len as usize)?;
+    Ok(0)
 }
 
 pub fn truncate(pathp: usize, len: i64) -> R {
-    truncate_inode(&at(AT_FDCWD, pathp, 0)?, len)
-}
-
-fn chmod_inode(ino: &InodeRef, mode: u64) -> R {
-    let mut i = ino.borrow_mut();
-    i.mode = (i.mode & S_IFMT) | (mode as u32 & 0o7777);
-    i.ctime = crate::timer::epoch_ns();
+    if len < 0 {
+        return Err(-EINVAL);
+    }
+    at(AT_FDCWD, pathp, 0)?.truncate(len as usize)?;
     Ok(0)
 }
 
 pub fn fchmod(fd: u64, mode: u64) -> R {
-    chmod_inode(&inode_of(fd)?, mode)
-}
-
-pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
-    chmod_inode(&at(dirfd, pathp, 0)?, mode)
-}
-
-fn chown_inode(ino: &InodeRef, uid: u32, gid: u32) -> R {
-    let mut i = ino.borrow_mut();
-    if uid != u32::MAX {
-        i.uid = uid;
-    }
-    if gid != u32::MAX {
-        i.gid = gid;
-    }
-    i.ctime = crate::timer::epoch_ns();
+    inode_of(fd)?.set_mode(mode as u32)?;
     Ok(0)
 }
 
+pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
+    at(dirfd, pathp, 0)?.set_mode(mode as u32)?;
+    Ok(0)
+}
+
+fn id_arg(v: u64) -> Option<u32> {
+    (v as u32 != u32::MAX).then_some(v as u32)
+}
+
 pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
-    chown_inode(&inode_of(fd)?, uid as u32, gid as u32)
+    inode_of(fd)?.set_owner(id_arg(uid), id_arg(gid))?;
+    Ok(0)
 }
 
 pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
-    chown_inode(&at(dirfd, pathp, flags)?, uid as u32, gid as u32)
+    at(dirfd, pathp, flags)?.set_owner(id_arg(uid), id_arg(gid))?;
+    Ok(0)
 }
 
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
@@ -422,13 +402,24 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         }
     };
     if let Some(t) = mtime {
-        ino.borrow_mut().mtime = t;
+        ino.set_mtime(t)?;
     }
     Ok(0)
 }
 
-pub fn statfs(buf: usize) -> R {
-    out(buf, &fs::statfs_bytes())?;
+pub fn statfs(pathp: usize, buf: usize) -> R {
+    let ino = at(AT_FDCWD, pathp, 0)?;
+    out(buf, &ino.statfs())?;
+    Ok(0)
+}
+
+pub fn fstatfs(fd: u64, buf: usize) -> R {
+    let f = file_of(fd)?;
+    let b = match &f.borrow().kind {
+        Kind::Inode(i, _) => i.statfs(),
+        _ => vfs::root().statfs(),
+    };
+    out(buf, &b)?;
     Ok(0)
 }
 
@@ -546,8 +537,8 @@ pub fn getcwd(buf: usize, len: usize) -> R {
 pub fn chdir(pathp: usize) -> R {
     let path = user_str(pathp)?;
     let files = proc::current().files();
-    let (full, ino) = fs::lookup(&files.cwd, &path, true)?;
-    if !ino.borrow().is_dir() {
+    let (full, ino) = vfs::lookup(&files.cwd, &path, true)?;
+    if !ino.meta().is_dir() {
         return Err(-ENOTDIR);
     }
     files.cwd = full;
@@ -557,7 +548,7 @@ pub fn chdir(pathp: usize) -> R {
 pub fn fchdir(fd: u64) -> R {
     let f = file_of(fd)?;
     let path = match &f.borrow().kind {
-        Kind::Inode(i, p) if i.borrow().is_dir() => p.clone(),
+        Kind::Inode(i, p) if i.meta().is_dir() => p.clone(),
         _ => return Err(-ENOTDIR),
     };
     proc::current().files().cwd = path;
