@@ -8,7 +8,7 @@ mod boot;
 mod uart;
 mod console;
 mod exec;
-mod ext2;
+mod extfs;
 mod file;
 mod fs;
 mod gic;
