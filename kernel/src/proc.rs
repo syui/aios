@@ -425,12 +425,17 @@ fn alloc_proc() -> Option<&'static mut Proc> {
 }
 
 pub fn user_init() {
-    let argv = [b"/init".to_vec()];
+    // Linux と同じく、カーネルのコマンドラインの init= で最初のプログラムを選べる (init=/bin/sh など)
+    let init = crate::dtb::arg("init").unwrap_or("/init");
+    let argv = [init.as_bytes().to_vec()];
     let envp = [b"HOME=/".to_vec(), b"PATH=/usr/bin:/bin".to_vec(), b"TERM=vt100".to_vec()];
-    let img = match exec::exec("/init", &argv, &envp) {
+    let img = match exec::exec(init, &argv, &envp) {
         Ok(img) => img,
-        Err(e) => panic!("user_init: cannot exec /init ({})", e),
+        Err(e) => panic!("user_init: cannot exec {} ({})", init, e),
     };
+    if init != "/init" {
+        println!("init: {}", init);
+    }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
     let mut files = Files { fds: Vec::new(), cwd: String::new() };
@@ -440,7 +445,7 @@ pub fn user_init() {
     }
     p.files = Some(Shared::new(files));
     p.sigacts = Some(crate::signal::new_table());
-    p.set_comm(b"init");
+    p.set_comm(init.rsplit('/').next().unwrap_or("init").as_bytes());
     p.pgid = p.pid;
     p.sid = p.pid;
     p.state = State::Runnable;

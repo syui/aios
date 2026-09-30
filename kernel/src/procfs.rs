@@ -95,8 +95,8 @@ impl ProcInode {
                 format!("{}.{:02} 0.00\n", t / 100, t % 100)
             }
             Node::Meminfo => {
-                use crate::memlayout::{PGSIZE, PHYSBASE, PHYSTOP};
-                let total = (PHYSTOP - PHYSBASE) / 1024;
+                use crate::memlayout::{phystop, PGSIZE, PHYSBASE};
+                let total = (phystop() - PHYSBASE) / 1024;
                 let free = crate::kalloc::nfree() * PGSIZE / 1024;
                 format!("MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\n", total, free, free)
             }

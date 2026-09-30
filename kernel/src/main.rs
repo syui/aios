@@ -9,6 +9,7 @@ mod uart;
 mod console;
 mod tty;
 mod cred;
+mod dtb;
 mod epoll;
 mod exec;
 mod extfs;
@@ -52,10 +53,16 @@ pub extern "C" fn kmain() -> ! {
     println!("hello from EL{}", current_el());
 
     trap::init();
+    if dtb::init() {
+        if let Some((base, size)) = dtb::memory() {
+            memlayout::set_ram(base as usize, size as usize);
+        }
+    }
     kalloc::init();
     heap::init();
     println!("kalloc: {} pages free", kalloc::nfree());
     println!("initrd: {} entries", initrd::count());
+    dtb::summary();
 
     gic::init();
     timer::init();

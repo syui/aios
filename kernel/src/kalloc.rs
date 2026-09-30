@@ -3,7 +3,7 @@
 // 返されたページはフリーリストに積む。リストが空なら、まだ一度も
 // 使っていない領域 [fresh, end) から切り出す。起動時に全ページへ
 // 触らないので速い。
-use crate::memlayout::{p2v, pg_round_up, PGSIZE, PHYSTOP};
+use crate::memlayout::{p2v, pg_round_up, phystop, PGSIZE};
 use crate::spinlock::SpinLock;
 use core::ptr;
 
@@ -29,7 +29,7 @@ pub fn init() {
     }
     let mut k = KMEM.lock();
     k.fresh = pg_round_up(&raw const __kernel_end as usize);
-    k.end = p2v(PHYSTOP);
+    k.end = p2v(phystop());
 }
 
 /// 仮想アドレス (KBASE 側) のページを返す

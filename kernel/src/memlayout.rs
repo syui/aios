@@ -8,7 +8,19 @@ pub const GICD: usize = KBASE + 0x0800_0000;
 pub const GICC: usize = KBASE + 0x0801_0000;
 
 pub const PHYSBASE: usize = 0x4000_0000;
-pub const PHYSTOP: usize = PHYSBASE + 512 * 1024 * 1024;
+/// RAM の終わり。DTB の /memory から決める (なければ 512 MiB)。
+/// boot.rs が写像するのは PHYSBASE から 1 GiB なので、それより大きくはしない
+static mut PHYSTOP: usize = PHYSBASE + 512 * 1024 * 1024;
+
+pub fn phystop() -> usize {
+    unsafe { PHYSTOP }
+}
+
+pub fn set_ram(base: usize, size: usize) {
+    if base == PHYSBASE && size >= 64 * 1024 * 1024 {
+        unsafe { PHYSTOP = PHYSBASE + size.min(0x4000_0000) };
+    }
+}
 
 pub const PGSIZE: usize = 4096;
 

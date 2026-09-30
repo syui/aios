@@ -1,6 +1,10 @@
 // cpu0 だけが起き、MMU を有効にして上位アドレスへ跳び、kmain へ。
 // ほかの core は wfe で眠る。
 //
+// 先頭は Linux の arm64 Image ヘッダー (Documentation/arch/arm64/booting.rst)。
+// これがあると QEMU やラズパイのファームウェアが Linux と同じように、
+// RAM の先頭 + text_offset に置き、x0 に DTB の物理アドレスを入れて跳んでくる。
+//
 // boot_l1 は TTBR0 (恒等写像) と TTBR1 (KBASE + PA) で共用する 1GiB ブロック表:
 //   [0] PA 0x0000_0000.. デバイス (UART, GIC)
 //   [1] PA 0x4000_0000.. RAM
@@ -14,6 +18,17 @@ core::arch::global_asm!(
 .section .text.boot
 .global _start
 _start:
+    b       primary             // code0
+    .long   0                   // code1
+    .quad   0x80000             // text_offset: RAM の先頭 + 0x80000 (0x4008_0000) に置く
+    .quad   _image_size         // image_size (bss まで)
+    .quad   0x2                 // flags: little endian, 4KiB ページ
+    .quad   0, 0, 0             // res2 - res4
+    .ascii  "ARM\x64"           // magic
+    .long   0                   // res5
+
+primary:
+    mov     x21, x0             // DTB の物理アドレス (ELF で起動したときは 0 など)
     mrs     x0, mpidr_el1
     and     x0, x0, #0xff
     cbz     x0, 1f
@@ -50,14 +65,21 @@ _start:
     str     xzr, [x0], #8
     b       3b
 
+    // DTB の場所を覚える (bss は消したあとなので .data に置く)
+4:  ldr     x0, =boot_dtb
+    str     x21, [x0]
     // EL0/EL1 の FP/SIMD を使えるようにする (カーネルは softfloat で触らない)
-4:  mov     x0, #(3 << 20)
+    mov     x0, #(3 << 20)
     msr     cpacr_el1, x0
     isb
     bl      kmain
     b       0b
 
 .section .data
+.balign 8
+.global boot_dtb
+boot_dtb:
+    .quad   0
 .balign 4096
 .global boot_l1
 boot_l1:

@@ -381,8 +381,8 @@ impl Inode for TmpInode {
     }
 
     fn statfs(&self) -> [u8; 120] {
-        use crate::memlayout::{PGSIZE, PHYSBASE, PHYSTOP};
-        let total = ((PHYSTOP - PHYSBASE) / PGSIZE) as u64;
+        use crate::memlayout::{phystop, PGSIZE, PHYSBASE};
+        let total = ((phystop() - PHYSBASE) / PGSIZE) as u64;
         let free = crate::kalloc::nfree() as u64;
         statfs_bytes(0x0102_1994, PGSIZE as u64, total, free, 65536, 65536)
     }
