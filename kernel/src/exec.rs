@@ -51,11 +51,13 @@ fn u64_at(b: &[u8], o: usize) -> usize {
 
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
-    let e = crate::path::resolve(&cwd, path, true)?;
-    if e.is_dir() {
+    let ino = crate::fs::resolve(&cwd, path, true)?;
+    let ino = ino.borrow();
+    let crate::fs::Node::File(data) = &ino.node else { return Err(-EACCES) };
+    if ino.mode & 0o111 == 0 {
         return Err(-EACCES);
     }
-    let elf = e.data;
+    let elf = data.bytes();
     if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || u16_at(elf, 16) != 2 || u16_at(elf, 18) != 183 {
         return Err(-ENOEXEC);
     }

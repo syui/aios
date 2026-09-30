@@ -28,12 +28,27 @@ mod nr {
     pub const LISTXATTR: u64 = 11;
     pub const FLISTXATTR: u64 = 13;
     pub const GETCWD: u64 = 17;
+    pub const MKNODAT: u64 = 33;
+    pub const MKDIRAT: u64 = 34;
+    pub const UNLINKAT: u64 = 35;
+    pub const SYMLINKAT: u64 = 36;
+    pub const LINKAT: u64 = 37;
+    pub const RENAMEAT: u64 = 38;
+    pub const STATFS: u64 = 43;
+    pub const FSTATFS: u64 = 44;
+    pub const TRUNCATE: u64 = 45;
+    pub const FTRUNCATE: u64 = 46;
     pub const DUP: u64 = 23;
     pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
+    pub const FCHDIR: u64 = 50;
+    pub const FCHMOD: u64 = 52;
+    pub const FCHMODAT: u64 = 53;
+    pub const FCHOWNAT: u64 = 54;
+    pub const FCHOWN: u64 = 55;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const PIPE2: u64 = 59;
@@ -43,11 +58,18 @@ mod nr {
     pub const WRITE: u64 = 64;
     pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
+    pub const PREAD64: u64 = 67;
+    pub const PWRITE64: u64 = 68;
+    pub const SENDFILE: u64 = 71;
     pub const PPOLL: u64 = 73;
     pub const SPLICE: u64 = 76;
     pub const READLINKAT: u64 = 78;
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
+    pub const SYNC: u64 = 81;
+    pub const FSYNC: u64 = 82;
+    pub const FDATASYNC: u64 = 83;
+    pub const UTIMENSAT: u64 = 88;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -91,10 +113,17 @@ mod nr {
     pub const MADVISE: u64 = 233;
     pub const WAIT4: u64 = 260;
     pub const PRLIMIT64: u64 = 261;
+    pub const RENAMEAT2: u64 = 276;
+    pub const COPY_FILE_RANGE: u64 = 285;
     pub const GETRANDOM: u64 = 278;
     pub const MEMBARRIER: u64 = 283;
     pub const RSEQ: u64 = 293;
     pub const FACCESSAT2: u64 = 439;
+}
+
+/// C の int 引数: 下位 32bit を符号拡張する
+fn int(v: u64) -> i64 {
+    v as i32 as i64
 }
 
 pub fn dispatch(tf: &mut TrapFrame) {
@@ -106,9 +135,29 @@ pub fn dispatch(tf: &mut TrapFrame) {
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
         IOCTL => sysfile::ioctl(a[0], a[1], a[2] as usize),
-        FACCESSAT | FACCESSAT2 => sysfile::faccessat(a[0] as i64, a[1] as usize),
+        FACCESSAT | FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize),
         CHDIR => sysfile::chdir(a[0] as usize),
-        OPENAT => sysfile::openat(a[0] as i64, a[1] as usize, a[2]),
+        OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
+        MKNODAT => sysfile::mknodat(int(a[0]), a[1] as usize, a[2], a[3]),
+        MKDIRAT => sysfile::mkdirat(int(a[0]), a[1] as usize, a[2]),
+        UNLINKAT => sysfile::unlinkat(int(a[0]), a[1] as usize, a[2]),
+        SYMLINKAT => sysfile::symlinkat(a[0] as usize, int(a[1]), a[2] as usize),
+        LINKAT => sysfile::linkat(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize, a[4]),
+        RENAMEAT => sysfile::renameat(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize, 0),
+        RENAMEAT2 => sysfile::renameat(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize, a[4]),
+        STATFS | FSTATFS => sysfile::statfs(a[1] as usize),
+        TRUNCATE => sysfile::truncate(a[0] as usize, a[1] as i64),
+        FTRUNCATE => sysfile::ftruncate(a[0], a[1] as i64),
+        FCHDIR => sysfile::fchdir(a[0]),
+        FCHMOD => sysfile::fchmod(a[0], a[1]),
+        FCHMODAT => sysfile::fchmodat(int(a[0]), a[1] as usize, a[2]),
+        FCHOWN => sysfile::fchown(a[0], a[1], a[2]),
+        FCHOWNAT => sysfile::fchownat(int(a[0]), a[1] as usize, a[2], a[3], a[4]),
+        UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
+        PREAD64 => sysfile::pread(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        SYNC | FSYNC | FDATASYNC => Ok(0),
+        SENDFILE | COPY_FILE_RANGE => Err(-ENOSYS),
         CLOSE => sysfile::close(a[0]),
         PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
         GETDENTS64 => sysfile::getdents64(a[0], a[1] as usize, a[2] as usize),
@@ -117,8 +166,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         WRITE => sysfile::write(a[0], a[1] as usize, a[2] as usize),
         READV => sysfile::readv(a[0], a[1] as usize, a[2] as usize),
         WRITEV => sysfile::writev(a[0], a[1] as usize, a[2] as usize),
-        READLINKAT => sysfile::readlinkat(a[0] as i64, a[1] as usize, a[2] as usize, a[3] as usize),
-        NEWFSTATAT => sysfile::newfstatat(a[0] as i64, a[1] as usize, a[2] as usize, a[3]),
+        READLINKAT => sysfile::readlinkat(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
+        NEWFSTATAT => sysfile::newfstatat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
         PPOLL => Ok(0),
         // xattr は持っていない
@@ -132,8 +181,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
-        WAIT4 => sys_wait4(a[0] as i64, a[1] as usize, a[2]),
-        KILL => sys_kill(a[0] as i64, a[1] as i32),
+        WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
+        KILL => sys_kill(int(a[0]), a[1] as i32),
         TKILL => proc::kill_thread(a[0] as u32, a[1] as i32).map(|_| 0),
         TGKILL => proc::kill_thread(a[1] as u32, a[2] as i32).map(|_| 0),
         SET_TID_ADDRESS => {
@@ -169,7 +218,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
 
         BRK => Ok(sys_brk(a[0] as usize)),
-        MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], a[4] as i64),
+        MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[3], int(a[4])),
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
         MPROTECT | MADVISE => Ok(0),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
