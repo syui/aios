@@ -1,8 +1,9 @@
 // 開いたファイル (fd の向こう側)
 use crate::console;
-use crate::initrd::{self, Entry, S_IFDIR};
+use crate::fs::{self, InodeRef, Node, S_IFMT};
 use crate::proc;
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -11,16 +12,37 @@ pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ESPIPE: i64 = 29;
 pub const EPIPE: i64 = 32;
+pub const ENOTDIR: i64 = 20;
 
-const S_IFCHR: u32 = 0o020000;
+pub const O_ACCMODE: u32 = 3;
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_APPEND: u32 = 0o2000;
+
 const S_IFIFO: u32 = 0o010000;
 
 pub enum Kind {
     Console,
     Null,
-    Initrd(Entry),
+    Zero,
+    Random,
+    /// tmpfs の inode と、開いたときのパス (dirfd の基準に使う)
+    Inode(InodeRef, String),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
+}
+
+impl Kind {
+    /// デバイスファイルを開いたときの中身
+    pub fn of_dev(major: u32, minor: u32) -> Option<Kind> {
+        Some(match (major, minor) {
+            (1, 3) => Kind::Null,
+            (1, 5) => Kind::Zero,
+            (1, 8) | (1, 9) => Kind::Random,
+            (5, 0) | (5, 1) => Kind::Console,
+            _ => return None,
+        })
+    }
 }
 
 pub struct OpenFile {
@@ -40,21 +62,32 @@ pub struct Stat {
     pub ino: u64,
     pub mode: u32,
     pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub rdev: u64,
     pub size: u64,
     pub mtime: u64,
+    pub ctime: u64,
 }
 
 impl Stat {
-    pub fn of_entry(e: &Entry) -> Stat {
+    pub fn of_inode(i: &InodeRef) -> Stat {
+        let i = i.borrow();
         Stat {
-            ino: e.ino as u64,
-            mode: e.mode,
-            nlink: if e.is_dir() { 2 } else { 1 },
-            rdev: 0,
-            size: e.data.len() as u64,
-            mtime: e.mtime as u64,
+            ino: i.ino,
+            mode: i.mode,
+            nlink: i.nlink,
+            uid: i.uid,
+            gid: i.gid,
+            rdev: i.rdev(),
+            size: i.size(),
+            mtime: i.mtime,
+            ctime: i.ctime,
         }
+    }
+
+    fn dev(mode: u32, rdev: u64) -> Stat {
+        Stat { ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, mtime: 0, ctime: 0 }
     }
 
     pub fn to_bytes(&self) -> [u8; 128] {
@@ -63,30 +96,50 @@ impl Stat {
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());
         b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
-        // uid, gid = 0
+        b[24..28].copy_from_slice(&self.uid.to_le_bytes());
+        b[28..32].copy_from_slice(&self.gid.to_le_bytes());
         b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize
         b[64..72].copy_from_slice(&self.size.div_ceil(512).to_le_bytes()); // st_blocks
-        for t in [72, 88, 104] {
-            b[t..t + 8].copy_from_slice(&self.mtime.to_le_bytes());
+        let times = [(72, self.mtime), (88, self.mtime), (104, self.ctime)];
+        for (off, ns) in times {
+            b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            b[off + 8..off + 16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
         }
         b
     }
 }
 
 impl OpenFile {
+    fn readable(&self) -> bool {
+        self.flags & O_ACCMODE != O_WRONLY
+    }
+
+    fn writable(&self) -> bool {
+        self.flags & O_ACCMODE != O_RDONLY
+    }
+
     pub fn read(&mut self, dst: &mut [u8]) -> Result<usize, i64> {
+        if !self.readable() {
+            return Err(-EBADF);
+        }
         match &self.kind {
             Kind::Console => console::read(dst),
             Kind::Null => Ok(0),
-            Kind::Initrd(e) => {
-                if e.is_dir() {
-                    return Err(-EISDIR);
+            Kind::Zero => {
+                dst.fill(0);
+                Ok(dst.len())
+            }
+            Kind::Random => {
+                for c in dst.chunks_mut(16) {
+                    let b = crate::rand::bytes16();
+                    c.copy_from_slice(&b[..c.len()]);
                 }
-                let data = e.data;
-                let n = dst.len().min(data.len().saturating_sub(self.offset));
-                dst[..n].copy_from_slice(&data[self.offset..self.offset + n]);
+                Ok(dst.len())
+            }
+            Kind::Inode(ino, _) => {
+                let n = Self::pread(ino, dst, self.offset)?;
                 self.offset += n;
                 Ok(n)
             }
@@ -95,37 +148,87 @@ impl OpenFile {
         }
     }
 
+    pub fn pread(ino: &InodeRef, dst: &mut [u8], off: usize) -> Result<usize, i64> {
+        let i = ino.borrow();
+        match &i.node {
+            Node::File(d) => {
+                let data = d.bytes();
+                let n = dst.len().min(data.len().saturating_sub(off));
+                dst[..n].copy_from_slice(&data[off..off + n]);
+                Ok(n)
+            }
+            Node::Dir(_) => Err(-EISDIR),
+            _ => Err(-EINVAL),
+        }
+    }
+
     pub fn write(&mut self, src: &[u8]) -> Result<usize, i64> {
+        if !self.writable() {
+            return Err(-EBADF);
+        }
         match &self.kind {
             Kind::Console => {
                 console::write(src);
                 Ok(src.len())
             }
-            Kind::Null => Ok(src.len()),
+            Kind::Null | Kind::Zero | Kind::Random => Ok(src.len()),
+            Kind::Inode(ino, _) => {
+                let ino = ino.clone();
+                if self.flags & O_APPEND != 0 {
+                    self.offset = ino.borrow().size() as usize;
+                }
+                let n = Self::pwrite(&ino, src, self.offset)?;
+                self.offset += n;
+                Ok(n)
+            }
             Kind::PipeWrite(p) => Pipe::write(p, src),
-            Kind::Initrd(_) | Kind::PipeRead(_) => Err(-EBADF),
+            Kind::PipeRead(_) => Err(-EBADF),
         }
+    }
+
+    pub fn pwrite(ino: &InodeRef, src: &[u8], off: usize) -> Result<usize, i64> {
+        let mut i = ino.borrow_mut();
+        let Node::File(d) = &mut i.node else { return Err(-EINVAL) };
+        let v = d.owned();
+        if v.len() < off + src.len() {
+            v.resize(off + src.len(), 0);
+        }
+        v[off..off + src.len()].copy_from_slice(src);
+        i.touch();
+        Ok(src.len())
     }
 
     pub fn stat(&self) -> Stat {
         match &self.kind {
-            Kind::Console => Stat { ino: 0, mode: S_IFCHR | 0o620, nlink: 1, rdev: (5 << 8) | 1, size: 0, mtime: 0 },
-            Kind::Null => Stat { ino: 0, mode: S_IFCHR | 0o666, nlink: 1, rdev: (1 << 8) | 3, size: 0, mtime: 0 },
-            Kind::Initrd(e) => Stat::of_entry(e),
-            Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat { ino: 0, mode: S_IFIFO | 0o600, nlink: 1, rdev: 0, size: 0, mtime: 0 },
+            Kind::Console => Stat::dev(fs::S_IFCHR | 0o620, (5 << 8) | 1),
+            Kind::Null => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 3),
+            Kind::Zero => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 5),
+            Kind::Random => Stat::dev(fs::S_IFCHR | 0o666, (1 << 8) | 9),
+            Kind::Inode(ino, _) => Stat::of_inode(ino),
+            Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::dev(S_IFIFO | 0o600, 0),
         }
     }
 
     pub fn lseek(&mut self, off: i64, whence: u32) -> Result<usize, i64> {
         let size = match &self.kind {
-            Kind::Initrd(e) => e.data.len() as i64,
-            Kind::Null => 0,
+            Kind::Inode(ino, _) => ino.borrow().size() as i64,
+            Kind::Null | Kind::Zero | Kind::Random => 0,
             _ => return Err(-ESPIPE),
         };
+        const SEEK_DATA: u32 = 3;
+        const SEEK_HOLE: u32 = 4;
+        const ENXIO: i64 = 6;
         let base = match whence {
             0 => 0,
             1 => self.offset as i64,
             2 => size,
+            // 穴はないので、データは末尾まで続き、穴は末尾にだけある
+            SEEK_DATA | SEEK_HOLE if off < 0 || off >= size => return Err(-ENXIO),
+            SEEK_DATA => 0,
+            SEEK_HOLE => return Ok({
+                self.offset = size as usize;
+                self.offset
+            }),
             _ => return Err(-EINVAL),
         };
         let new = base.checked_add(off).filter(|&n| n >= 0).ok_or(-EINVAL)?;
@@ -135,17 +238,20 @@ impl OpenFile {
 
     /// linux_dirent64 を詰める。offset は「何番目まで返したか」
     pub fn getdents(&mut self, out: &mut Vec<u8>, max: usize) -> Result<(), i64> {
-        let Kind::Initrd(dir) = &self.kind else { return Err(-EINVAL) };
-        if !dir.is_dir() {
-            return Err(-crate::file::ENOTDIR);
+        let Kind::Inode(dir, path) = &self.kind else { return Err(-ENOTDIR) };
+        let parent = fs::resolve("", &fs::normalize(path, ".."), true).unwrap_or_else(|_| fs::root());
+        let mut list = Vec::new();
+        {
+            let d = dir.borrow();
+            let Node::Dir(m) = &d.node else { return Err(-ENOTDIR) };
+            list.push((d.ino, String::from("."), fs::S_IFDIR));
+            list.push((parent.borrow().ino, String::from(".."), fs::S_IFDIR));
+            for (name, ino) in m {
+                let i = ino.borrow();
+                list.push((i.ino, name.clone(), i.mode));
+            }
         }
-        let parent = crate::path::normalize(dir.name, "..");
-        let parent_ino = initrd::lookup(&parent).map(|e| e.ino).unwrap_or(1);
-        let dots = [(dir.ino, ".", S_IFDIR), (parent_ino, "..", S_IFDIR)];
-        let list = dots
-            .into_iter()
-            .chain(initrd::children(dir.name).map(|e| (e.ino, e.name.rsplit('/').next().unwrap(), e.mode)));
-        for (i, (ino, name, mode)) in list.enumerate().skip(self.offset) {
+        for (i, (ino, name, mode)) in list.into_iter().enumerate().skip(self.offset) {
             let reclen = (19 + name.len() + 1 + 7) & !7;
             if out.len() + reclen > max {
                 if out.is_empty() {
@@ -154,7 +260,7 @@ impl OpenFile {
                 break;
             }
             let start = out.len();
-            out.extend_from_slice(&(ino as u64).to_le_bytes());
+            out.extend_from_slice(&ino.to_le_bytes());
             out.extend_from_slice(&((i + 1) as i64).to_le_bytes());
             out.extend_from_slice(&(reclen as u16).to_le_bytes());
             out.push(dtype(mode));
@@ -166,10 +272,8 @@ impl OpenFile {
     }
 }
 
-pub const ENOTDIR: i64 = 20;
-
 fn dtype(mode: u32) -> u8 {
-    match mode & initrd::S_IFMT {
+    match mode & S_IFMT {
         0o010000 => 1,  // DT_FIFO
         0o020000 => 2,  // DT_CHR
         0o040000 => 4,  // DT_DIR
@@ -195,7 +299,7 @@ impl Drop for OpenFile {
     }
 }
 
-const PIPE_SIZE: usize = 4096;
+pub const PIPE_SIZE: usize = 4096;
 
 pub struct Pipe {
     buf: [u8; PIPE_SIZE],
@@ -261,3 +365,4 @@ impl Pipe {
         Ok(done)
     }
 }
+

@@ -9,12 +9,12 @@ mod uart;
 mod console;
 mod exec;
 mod file;
+mod fs;
 mod gic;
 mod heap;
 mod initrd;
 mod kalloc;
 mod memlayout;
-mod path;
 mod proc;
 mod rand;
 mod spinlock;
@@ -47,6 +47,7 @@ pub extern "C" fn kmain() -> ! {
     gic::init();
     timer::init();
     uart::init();
+    fs::init();
 
     proc::user_init();
     proc::scheduler()
