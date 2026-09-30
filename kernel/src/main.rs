@@ -8,6 +8,7 @@ mod boot;
 mod uart;
 mod console;
 mod exec;
+mod ext2;
 mod file;
 mod fs;
 mod gic;
@@ -21,7 +22,10 @@ mod spinlock;
 mod syscall;
 mod sysfile;
 mod timer;
+mod tmpfs;
 mod trap;
+mod vfs;
+mod virtio_blk;
 mod vm;
 
 use core::panic::PanicInfo;

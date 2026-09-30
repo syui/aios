@@ -51,13 +51,18 @@ fn u64_at(b: &[u8], o: usize) -> usize {
 
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
-    let ino = crate::fs::resolve(&cwd, path, true)?;
-    let ino = ino.borrow();
-    let crate::fs::Node::File(data) = &ino.node else { return Err(-EACCES) };
-    if ino.mode & 0o111 == 0 {
+    let ino = crate::vfs::resolve(&cwd, path, true)?;
+    let m = ino.meta();
+    if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || m.mode & 0o111 == 0 {
         return Err(-EACCES);
     }
-    let elf = data.bytes();
+    let size = m.size as usize;
+    // ヘッダとプログラムヘッダだけ先に読む
+    let mut ehdr = [0u8; 64];
+    if ino.read_at(0, &mut ehdr)? < 64 {
+        return Err(-ENOEXEC);
+    }
+    let elf = &ehdr[..];
     if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || u16_at(elf, 16) != 2 || u16_at(elf, 18) != 183 {
         return Err(-ENOEXEC);
     }
@@ -65,15 +70,17 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
     let phoff = u64_at(elf, 32);
     let phentsize = u16_at(elf, 54);
     let phnum = u16_at(elf, 56);
-    if phoff + phentsize * phnum > elf.len() {
+    if phentsize < 56 || phnum > 64 || phoff + phentsize * phnum > size {
         return Err(-ENOEXEC);
     }
+    let mut phdrs = alloc::vec![0u8; phentsize * phnum];
+    ino.read_at(phoff, &mut phdrs)?;
 
     let mut pt = PageTable::new().ok_or(-ENOMEM)?;
     let mut brk = 0;
     let mut phdr_va = 0;
     for i in 0..phnum {
-        let ph = &elf[phoff + i * phentsize..];
+        let ph = &phdrs[i * phentsize..];
         if u32_at(ph, 0) != PT_LOAD {
             continue;
         }
@@ -82,12 +89,22 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
         let va = u64_at(ph, 16);
         let filesz = u64_at(ph, 32);
         let memsz = u64_at(ph, 40);
-        if filesz > memsz || off + filesz > elf.len() || va.checked_add(memsz).is_none() {
+        if filesz > memsz || off + filesz > size || va.checked_add(memsz).is_none() {
             return Err(-ENOEXEC);
         }
         let perm = Perm { write: flags & PF_W != 0, exec: flags & PF_X != 0 };
         pt.alloc_range(va, va + memsz, perm).ok_or(-ENOMEM)?;
-        pt.copy_out(va, &elf[off..off + filesz]).ok_or(-ENOEXEC)?;
+        // 中身は少しずつ読んでユーザー空間へ
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let mut done = 0;
+        while done < filesz {
+            let n = buf.len().min(filesz - done);
+            if ino.read_at(off + done, &mut buf[..n])? != n {
+                return Err(-ENOEXEC);
+            }
+            pt.copy_out(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
+            done += n;
+        }
         if off <= phoff && phoff < off + filesz {
             phdr_va = va + (phoff - off);
         }
