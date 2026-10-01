@@ -2,6 +2,7 @@
 # (sh として呼ばれたときは読まない。POSIX の sh と同じく $ENV だけ)
 # ai/dot の .zshrc と同じ使いごこちに: alias、cd のあとの ls (chpwd)
 # powerline のプロンプトなどの拡張は、パッケージ ([shell] リポジトリ) を入れて ~/.aishrc で source する
+# (~/.aishrc の見本: /usr/share/aish/aishrc.example)
 # キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
 
 alias ls='ls -a --color=auto'

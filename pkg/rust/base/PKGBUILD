@@ -13,7 +13,7 @@ depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
-        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc etc/skel/.aishrc root/.aishrc)
+        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc)
 
 pkgver() {
   cd "$startdir/../../.."
@@ -50,12 +50,12 @@ package() {
   ln -s aish "$pkgdir/usr/bin/sh"
 
   cp -r "$top/etc" "$pkgdir/etc"
+  # ~/.aishrc の見本 (使うときに cp する)
+  install -Dm644 "$startdir/aishrc.example" "$pkgdir/usr/share/aish/aishrc.example"
   chmod 600 "$pkgdir/etc/shadow"
   chmod 440 "$pkgdir/etc/sudoers"
 
   install -d -m700 "$pkgdir/root"
-  # root のホームはここで作るので、/etc/skel の .aishrc もここで (ほかのユーザーは login が写す)
-  install -m644 "$top/etc/skel/.aishrc" "$pkgdir/root/.aishrc"
   install -d -m1777 "$pkgdir/tmp"
   install -d "$pkgdir/home" "$pkgdir/run" "$pkgdir/var/log" \
     "$pkgdir/var/lib/aipkg/local" "$pkgdir/var/cache/aipkg"
