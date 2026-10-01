@@ -7,8 +7,9 @@ pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which, swapon and 
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
-# ログインシェルは自作の sh (/bin/sh)。bash (brush) は予備として入れておく
-depends=('brush')
+# aios-base + aios-kernel + aiboot で使える aios になる (Arch の base + linux のように)。
+# ログインシェルは自作の sh (/bin/sh)。bash (brush) は予備として入れておく。awk は作りかけなので入れない
+depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush')
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
