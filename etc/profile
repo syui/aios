@@ -1,7 +1,5 @@
 # /etc/profile: ログインシェル (bash = brush、sh) が最初に読む
 export PATH=/usr/local/bin:/usr/bin
 umask 022
-# bash (brush) のプロンプト。[ユーザー@ホスト ディレクトリ]$
-if [ -n "$BASH_VERSION" ]; then
-  PS1='[\u@\h \W]\$ '
-fi
+# プロンプト (bash = brush と sh で同じ)。[ユーザー@ホスト ディレクトリ]$
+PS1='[\u@\h \W]\$ '
