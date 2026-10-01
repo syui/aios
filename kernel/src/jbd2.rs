@@ -52,6 +52,11 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// 1 つのトランザクションに使えるブロックの数
+    pub fn capacity(&self) -> usize {
+        (self.maxlen - self.first) as usize
+    }
+
     fn tag_bytes(&self) -> usize {
         if self.v3 { 16 } else if self.bit64 { 12 } else { 8 }
     }
@@ -67,6 +72,23 @@ impl ExtFs {
     fn jwrite(&self, j: &Journal, lb: u32, data: &[u8]) -> Result<(), i64> {
         let spb = (self.bsize / crate::block::SECTOR) as u64;
         crate::block::write(j.blocks[lb as usize] * spb, data)
+    }
+
+    /// lb から続くブロックを書く。ディスクの上で続いているところは 1 回の要求にまとめる
+    fn jwrite_blocks(&self, j: &Journal, lb: u32, blocks: &[Vec<u8>]) -> Result<(), i64> {
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
+        let mut i = 0;
+        while i < blocks.len() {
+            let start = j.blocks[lb as usize + i];
+            let mut k = i + 1;
+            while k < blocks.len() && j.blocks[lb as usize + k] == start + (k - i) as u64 && k - i < 64 {
+                k += 1;
+            }
+            let buf: Vec<u8> = blocks[i..k].concat();
+            crate::block::write(start * spb, &buf)?;
+            i = k;
+        }
+        Ok(())
     }
 
     fn jread(&self, j: &Journal, lb: u32) -> Result<Vec<u8>, i64> {
@@ -186,6 +208,8 @@ impl ExtFs {
         let mut writes: Vec<(u32, u64, u32, bool)> = Vec::new();
         let mut revoked: BTreeMap<u64, u32> = BTreeMap::new();
         let mut pending: Vec<(u32, u64, u32, bool)> = Vec::new();
+        // CSUM_V3: 中身のブロックのチェックサム (コミットのときに確かめる)
+        let mut sums: Vec<(u32, u32)> = Vec::new();
         let next = |p: u32| if p + 1 >= j.maxlen { j.first } else { p + 1 };
         let mut n = 0;
         loop {
@@ -212,6 +236,9 @@ impl ExtFs {
                         };
                         let target = lo | if j.bit64 { hi << 32 } else { 0 };
                         pending.push((seq, target, dpos, flags & FLAG_ESCAPE != 0));
+                        if j.v3 {
+                            sums.push((dpos, be32(&b, o + 12)));
+                        }
                         dpos = next(dpos);
                         o += tb;
                         if flags & FLAG_SAME_UUID == 0 {
@@ -224,6 +251,26 @@ impl ExtFs {
                     pos = dpos;
                 }
                 COMMIT => {
+                    // CSUM_V3 なら、コミットと中身のチェックサムが合うトランザクションだけ
+                    // (中身とコミットはまとめて書くので、途中で切れたものはここで捨てる)
+                    if j.v3 {
+                        let mut c = b.clone();
+                        let want = be32(&c, 16);
+                        put_be32(&mut c, 16, 0);
+                        let mut ok = crc32c(j.seed, &c) == want;
+                        for &(jp, sum) in &sums {
+                            if !ok {
+                                break;
+                            }
+                            let d = self.jread(j, jp)?;
+                            ok = crc32c(crc32c(j.seed, &seq.to_be_bytes()), &d) == sum;
+                        }
+                        sums.clear();
+                        if !ok {
+                            println!("extfs: journal transaction {} is incomplete, dropped", seq);
+                            break;
+                        }
+                    }
                     writes.append(&mut pending);
                     seq = seq.wrapping_add(1);
                     pos = next(pos);
@@ -281,7 +328,8 @@ impl ExtFs {
             return Ok(false);
         }
         let seq = j.seq;
-        let mut pos = j.first;
+        let start = j.first;
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(total);
         for chunk in meta.chunks(per_desc) {
             let mut desc = vec![0u8; self.bsize];
             j.header(&mut desc, DESCRIPTOR, seq);
@@ -323,12 +371,8 @@ impl ExtFs {
                 let c = crc32c(j.seed, &desc);
                 put_be32(&mut desc, self.bsize - 4, c);
             }
-            self.jwrite(j, pos, &desc)?;
-            pos += 1;
-            for d in datas {
-                self.jwrite(j, pos, &d)?;
-                pos += 1;
-            }
+            out.push(desc);
+            out.extend(datas);
         }
         let mut commit = vec![0u8; self.bsize];
         j.header(&mut commit, COMMIT, seq);
@@ -337,8 +381,14 @@ impl ExtFs {
         if j.v3 {
             let c = crc32c(j.seed, &commit);
             put_be32(&mut commit, 16, c);
+            // チェックサムで確かめられるので、コミットも一緒に書く
+            out.push(commit);
+            self.jwrite_blocks(j, start, &out)?;
+        } else {
+            // チェックサムがないので、中身を書き終えてからコミットを書く
+            self.jwrite_blocks(j, start, &out)?;
+            self.jwrite(j, start + out.len() as u32, &commit)?;
         }
-        self.jwrite(j, pos, &commit)?;
         // ここでトランザクションは確かになる: ジャーナルの頭を指し、回復の印を立てる
         put_be32(&mut j.sb, 0x1c, j.first);
         put_be32(&mut j.sb, 0x18, seq);
