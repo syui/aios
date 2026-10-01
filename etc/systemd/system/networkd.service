@@ -1,0 +1,9 @@
+[Unit]
+Description=Network configuration from /etc/systemd/network (networkd)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/networkd
+
+[Install]
+WantedBy=multi-user.target

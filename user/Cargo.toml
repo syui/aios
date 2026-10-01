@@ -73,6 +73,14 @@ path = "src/bin/resize.rs"
 name = "aios"
 path = "src/bin/aios.rs"
 
+[[bin]]
+name = "ip"
+path = "src/bin/ip.rs"
+
+[[bin]]
+name = "networkd"
+path = "src/bin/networkd.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"

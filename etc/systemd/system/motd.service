@@ -1,6 +1,6 @@
 [Unit]
 Description=Show the logo, the system and /etc/motd (aios)
-After=swap.service
+After=swap.service networkd.service
 
 [Service]
 Type=oneshot
