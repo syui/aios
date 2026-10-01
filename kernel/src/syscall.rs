@@ -490,17 +490,34 @@ fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
     Ok(8)
 }
 
+/// getrlimit / prlimit64 (自分のプロセスだけ)。変えられるのは RLIMIT_NOFILE のソフトの上限
 fn sys_prlimit(resource: u64, new: usize, old: usize) -> R {
     const RLIMIT_STACK: u64 = 3;
     const RLIMIT_NOFILE: u64 = 7;
     const INF: u64 = u64::MAX;
-    let _ = new;
+    const EPERM: i64 = 1;
+    let files = proc::current().files();
+    // 先に今の値 (old) を読んでから変える
+    let (cur, max) = match resource {
+        RLIMIT_STACK => (8 * 1024 * 1024, INF),
+        RLIMIT_NOFILE => (files.nofile as u64, proc::NOFILE as u64),
+        _ => (INF, INF),
+    };
+    if new != 0 && resource == RLIMIT_NOFILE {
+        let mut b = [0u8; 16];
+        proc::current().pt().copy_in(&mut b, new).ok_or(-EFAULT)?;
+        let ncur = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let nmax = u64::from_le_bytes(b[8..].try_into().unwrap());
+        if ncur > nmax {
+            return Err(-EINVAL);
+        }
+        // ハードの上限は上げられない (RLIM_INFINITY は上限そのものとみなす)
+        if nmax != INF && nmax > proc::NOFILE as u64 && nmax > max {
+            return Err(-EPERM);
+        }
+        files.nofile = ncur.min(proc::NOFILE as u64).max(3) as usize;
+    }
     if old != 0 {
-        let (cur, max) = match resource {
-            RLIMIT_STACK => (8 * 1024 * 1024, INF),
-            RLIMIT_NOFILE => (proc::NOFILE as u64, proc::NOFILE as u64),
-            _ => (INF, INF),
-        };
         let mut b = [0u8; 16];
         b[..8].copy_from_slice(&cur.to_le_bytes());
         b[8..].copy_from_slice(&max.to_le_bytes());

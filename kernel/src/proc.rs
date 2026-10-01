@@ -14,7 +14,10 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
 pub const NPROC: usize = 64;
-pub const NOFILE: usize = 256;
+/// 開けるファイルの数の上限 (RLIMIT_NOFILE のハードの上限)。fd の表は使う分だけ伸びる
+pub const NOFILE: usize = 65536;
+/// はじめのソフトの上限 (Linux と同じ 1024。setrlimit で NOFILE まで上げられる)
+pub const NOFILE_SOFT: usize = 1024;
 const KSTACK_SIZE: usize = 16 * 1024;
 pub const MMAP_BASE: usize = 0x10_0000_0000;
 
@@ -81,6 +84,8 @@ pub struct Fd {
 pub struct Files {
     pub fds: Vec<Option<Fd>>,
     pub cwd: String,
+    /// RLIMIT_NOFILE のソフトの上限 (fork と exec で受けつぐ)
+    pub nofile: usize,
 }
 
 impl Files {
@@ -90,7 +95,7 @@ impl Files {
 
     /// minfd 以上で空いている一番小さい fd に置く
     pub fn add(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
-        let i = (minfd..NOFILE).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
+        let i = (minfd..self.nofile).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
         if self.fds.len() <= i {
             self.fds.resize(i + 1, None);
         }
@@ -471,7 +476,7 @@ pub fn user_init() {
     }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
-    let mut files = Files { fds: Vec::new(), cwd: String::new() };
+    let mut files = Files { fds: Vec::new(), cwd: String::new(), nofile: NOFILE_SOFT };
     let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);

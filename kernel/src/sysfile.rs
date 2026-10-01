@@ -682,7 +682,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
     let f = file_of(old)?;
     let p = proc::current().files();
     let new = new as usize;
-    if new >= proc::NOFILE {
+    if new >= p.nofile {
         return Err(-EBADF);
     }
     if p.fds.len() <= new {
