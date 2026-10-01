@@ -3,7 +3,7 @@
 // 1 ページの小さな ELF 共有ライブラリを起動のときに組み立て、すべてのプロセスの VDSO_VA に
 // 読み取り専用で写す (場所は auxv の AT_SYSINFO_EHDR で渡す)。musl は静的リンクでも
 // これを見つけて __kernel_clock_gettime (LINUX_2.6.39) を呼ぶ (Rust の Instant::now も)。
-// 中身はタイマのカウンタ (CNTPCT_EL0、CNTKCTL_EL1 で EL0 から読めるようにする) と、
+// 中身はタイマのカウンタ (CNTVCT_EL0、CNTKCTL_EL1 で EL0 から読めるようにする) と、
 // 同じページの終わりにある vvar (周波数、起動したときの UNIX 秒) から時刻を計算する。
 // 知らない時計は svc でふつうのシステムコールにする。計算は timer.rs と同じ。
 use crate::kalloc;
@@ -29,7 +29,7 @@ vdso_code_start:
     b.eq    9f
     adr     x9, vdso_vvar
     isb
-    mrs     x10, cntpct_el0
+    mrs     x10, cntvct_el0
     ldr     x11, [x9]           // 周波数
     ldr     x12, [x9, #8]       // 起動したときの UNIX 秒
     udiv    x13, x10, x11       // 秒 = cnt / f
@@ -164,5 +164,6 @@ pub fn map(pt: &mut crate::vm::PageTable) -> Option<()> {
 
 /// EL0 からタイマのカウンタを読めるようにする (CPU ごと)
 pub fn allow_counter() {
-    unsafe { core::arch::asm!("msr cntkctl_el1, {}", "isb", in(reg) 1u64) };
+    // EL0PCTEN と EL0VCTEN (物理と仮想のカウンタ)
+    unsafe { core::arch::asm!("msr cntkctl_el1, {}", "isb", in(reg) 3u64) };
 }

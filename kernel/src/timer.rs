@@ -1,4 +1,5 @@
-// ARM generic timer (EL1 physical timer, PPI 14 = INTID 30)
+// ARM generic timer (EL1 仮想タイマ, PPI 11 = INTID 27)。Mac の Hypervisor (HVF) では
+// 物理タイマは使えないので、仮想タイマとそのカウンタ (CNTVCT) を使う (EL2 から来たときは CNTVOFF = 0)
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const IRQ: u32 = crate::irq::TIMER;
@@ -15,8 +16,8 @@ pub fn freq() -> u64 {
 
 fn rearm() {
     unsafe {
-        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) freq() / HZ);
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) freq() / HZ);
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
     }
 }
 
@@ -39,7 +40,7 @@ pub fn init() {
 /// 起動してからの時間 (ns)
 pub fn uptime_ns() -> u64 {
     let cnt: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt) };
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
     let f = freq();
     (cnt / f) * 1_000_000_000 + (cnt % f) * 1_000_000_000 / f
 }

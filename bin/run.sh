@@ -16,6 +16,9 @@
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
 # ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
+# Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
+#   AIOS_ACCEL=tcg でソフトのエミュレーションに、AIOS_ACCEL=kvm で Linux (arm64) の KVM に
+#   AIOS_GIC=3 で TCG でも GICv3 に
 # AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
 k=$1
@@ -93,6 +96,17 @@ if [ "${AIOS_MACHINE:-virt}" = raspi3b ]; then
   qemu-system-aarch64 -M raspi3b -serial stdio -display none -dtb "$dtb" $sd -kernel "$k" -append "${AIOS_CMDLINE:-}"
   exit
 fi
+# 速くする: Mac なら HVF (M1 は物理アドレスが 36 bit なので highmem=off)
+accel=${AIOS_ACCEL:-}
+if [ -z "$accel" ] && [ "$(uname -s)" = Darwin ] && [ "$(sysctl -n kern.hv_support 2>/dev/null)" = 1 ]; then
+  accel=hvf
+fi
+case "$accel" in
+  hvf) cpu="-accel hvf -cpu host"; machine="virt,gic-version=3,highmem=off" ;;
+  kvm) cpu="-accel kvm -cpu host"; machine="virt,gic-version=host" ;;
+  *) cpu="-cpu cortex-a72"; machine="virt${AIOS_GIC:+,gic-version=$AIOS_GIC}" ;;
+esac
+[ -n "$accel" ] && [ "$accel" != tcg ] && echo "accel: $accel" >&2
 set -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f disk.img ]; then
   set -- "$@" \
@@ -113,9 +127,11 @@ if [ -n "$uefi" ]; then
     fi
   fi
   echo "boot: UEFI ($uefi) from disk.img" >&2
-  qemu-system-aarch64 -machine virt,acpi=off -cpu cortex-a72 -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
+  # shellcheck disable=SC2086
+  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"
   exit
 fi
-qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
+# shellcheck disable=SC2086
+qemu-system-aarch64 -machine "$machine" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
   -kernel "$k" -append "${AIOS_CMDLINE:-}"
