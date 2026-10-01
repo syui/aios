@@ -6,8 +6,8 @@
 alias ls='ls -a --color=auto'
 alias ll='ls -alh --color=auto'
 alias df='df -H'
-alias zs='${EDITOR:-vi} ~/.aishrc'
-alias zr='exec aish'
+alias as='${EDITOR:-vi} ~/.aishrc'
+alias ar='exec aish'
 alias u='sudo aipkg -Syu'
 
 HISTSIZE=10000
