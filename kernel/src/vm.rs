@@ -21,6 +21,7 @@ use crate::memlayout::{p2v, v2p, PGSIZE};
 use crate::vfs::InodeRef;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
 const PTE_VALID: u64 = 1 << 0;
 const PTE_TABLE: u64 = 1 << 1; // L1/L2 ではテーブル、L3 ではページ
@@ -136,6 +137,9 @@ pub enum FaultErr {
 pub struct PageTable {
     root: *mut u64,
     vmas: BTreeMap<usize, Vma>,
+    /// 大きなロックなしでユーザーのメモリに書いている CPU の数 (copy_out_nofault)。
+    /// ページを手放す前に 0 になるのを待つ (quiesce)
+    fast_users: AtomicUsize,
 }
 
 fn index(va: usize, level: usize) -> usize {
@@ -212,7 +216,7 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new() })
+        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0) })
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -236,6 +240,8 @@ impl PageTable {
                     return None;
                 }
                 let next = kalloc::alloc()? as *mut u64;
+                // 0 にした中身が見えてから、ほかの CPU (copy_out_nofault) にたどらせる
+                unsafe { core::arch::asm!("dmb ishst") };
                 unsafe { *pte = v2p(next as usize) as u64 | PTE_VALID | PTE_TABLE };
                 table = next;
             }
@@ -346,6 +352,7 @@ impl PageTable {
             *pte = 0;
         });
         flush_all();
+        self.quiesce();
         for p in pages {
             kalloc::put(p);
         }
@@ -369,6 +376,7 @@ impl PageTable {
             }
         });
         flush_all();
+        self.quiesce();
         for p in pages {
             kalloc::put(p);
         }
@@ -402,6 +410,7 @@ impl PageTable {
             }
         }
         flush_all();
+        self.quiesce();
         Ok(())
     }
 
@@ -522,6 +531,7 @@ impl PageTable {
                 unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
                 flush_va(page_va);
+                self.quiesce();
                 kalloc::put(old);
             } else {
                 unsafe { *pte = make_pte(e & PTE_ADDR, prot, false) };
@@ -605,6 +615,46 @@ impl PageTable {
         }
     }
 
+    /// 大きなロックなしで、もう写っていて書けるページにだけ書く (clock_gettime などの速い道)。
+    /// ページが写っていない・書けないなら false (ロックを取ってふつうの道で)
+    pub fn copy_out_nofault(&self, dst: usize, src: &[u8]) -> bool {
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let mut pas = [(0usize, 0usize); 2];
+        let mut n = 0;
+        let mut ok = true;
+        let (mut va, mut done) = (dst, 0);
+        while done < src.len() {
+            let e = self.walk(va, false).map_or(0, |p| unsafe { core::ptr::read_volatile(p) });
+            let len = (PGSIZE - (va & (PGSIZE - 1))).min(src.len() - done);
+            if e & PTE_VALID == 0 || e & PTE_USER == 0 || e & PTE_RDONLY != 0 || n == pas.len() {
+                ok = false;
+                break;
+            }
+            pas[n] = ((e & PTE_ADDR) as usize + (va & (PGSIZE - 1)), len);
+            n += 1;
+            done += len;
+            va += len;
+        }
+        if ok {
+            let mut off = 0;
+            for &(pa, len) in &pas[..n] {
+                unsafe { core::ptr::copy_nonoverlapping(src[off..].as_ptr(), p2v(pa) as *mut u8, len) };
+                off += len;
+            }
+        }
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        ok
+    }
+
+    /// PTE を消した (TLB も消した) あと、ページを手放す前に: ロックなしで書いている CPU を待つ
+    fn quiesce(&self) {
+        fence(Ordering::SeqCst);
+        while self.fast_users.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+
     /// 同じ中身の新しいアドレス空間 (fork)。ページは写さずに共有し、書けるものは COW にする
     pub fn fork(&mut self) -> Option<PageTable> {
         let mut new = PageTable::new()?;
@@ -635,6 +685,7 @@ impl PageTable {
             }
         }
         flush_all();
+        self.quiesce();
         Some(new)
     }
 

@@ -149,6 +149,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if kind == EL1H_SYNC {
         return handle(tf, kind);
     }
+    // 自分のことを読むだけのシステムコールはロックなしで
+    if kind == EL0_SYNC && esr_far().0 >> 26 == EC_SVC64 && syscall::fast(tf) {
+        return;
+    }
     crate::smp::lock();
     handle(tf, kind);
     crate::smp::unlock();
