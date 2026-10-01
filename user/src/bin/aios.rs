@@ -1,5 +1,9 @@
 // aios: aios の様子をロゴといっしょに出す (neofetch のようなもの)。あとに /etc/motd も
 //   aios   起動のときは motd.service が動かす
+#[path = "../lib/netif.rs"]
+#[allow(dead_code)]
+mod netif;
+
 use std::fs;
 
 const LOGO: &str = "\
@@ -41,6 +45,7 @@ fn main() {
     add("Memory", memory());
     add("Swap", swap());
     add("Disk (/)", disk("/"));
+    add("IP", ip());
 
     let logo: Vec<&str> = LOGO.lines().collect();
     let width = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0);
@@ -153,4 +158,12 @@ fn disk(path: &str) -> Option<String> {
     let total = s.f_blocks as u64 * s.f_frsize as u64 / 1024;
     let free = s.f_bfree as u64 * s.f_frsize as u64 / 1024;
     Some(format!("{} / {}", mib(total - free), mib(total)))
+}
+
+/// 最初のインターフェースのアドレス (DHCP か手で決めたか)
+fn ip() -> Option<String> {
+    let name = netif::names().ok()?.into_iter().next()?;
+    let i = netif::get(&name).ok()?;
+    let a = i.addr?;
+    Some(format!("{}/{} ({}, {})", netif::fmt(a), i.prefix, name, if i.dhcp { "dhcp" } else { "static" }))
 }

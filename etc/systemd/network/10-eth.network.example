@@ -1,0 +1,10 @@
+# アドレスを手で決めるときの例。10-eth.network という名前にすると、起動のときに networkd が読む
+# (.network のファイルがなければ、カーネルが DHCP でもらう)。書きかたは systemd-networkd と同じ
+[Match]
+Name=eth0
+
+[Network]
+Address=10.0.2.20/24
+Gateway=10.0.2.2
+DNS=10.0.2.3
+# DHCP=yes にすれば DHCP (DNS= を書けば、その DNS を使う)
