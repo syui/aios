@@ -7,6 +7,8 @@
 //             return break continue exec command type、ジョブ: jobs fg bg wait kill %N
 //   set -e (失敗で終わる)、set -x (実行するコマンドを見せる)
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
+//   対話するときは行の編集と履歴 (edit.rs)、alias、~/.shrc ($ENV) を読む
+mod edit;
 mod expand;
 mod glob;
 mod jobs;
@@ -73,11 +75,15 @@ pub struct Shell {
     subst_status: Option<i32>,
     /// ジョブの表示に使う、いま動かしているもののソース
     text: String,
+    /// alias NAME=VALUE
+    aliases: HashMap<String, String>,
+    /// いま展開している alias (自分自身をくりかえし展開しない)
+    expanding: Vec<String>,
 }
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
-    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -128,6 +134,8 @@ impl Shell {
             sourcing: 0,
             subst_status: None,
             text: String::new(),
+            aliases: HashMap::new(),
+            expanding: vec![],
         }
     }
 
@@ -269,8 +277,9 @@ impl Shell {
     /// 単純なコマンドの語、代入、つけかえを展開する
     fn prepare(&mut self, assigns: &[(String, String)], words: &[String], redirs: &[Redir]) -> Result<Ready, String> {
         self.subst_status = None;
+        let words = self.expand_alias(words);
         let mut args = vec![];
-        for w in words {
+        for w in &words {
             args.extend(self.expand(w, Mode::Fields)?);
         }
         let mut avals = vec![];
@@ -283,6 +292,38 @@ impl Shell {
             eprintln!("+ {}", a.join(" "));
         }
         Ok(Ready { args, assigns: avals, redirs })
+    }
+
+    /// 最初の語が alias なら置きかえる (引用していない語だけ)。
+    /// 値が 1 つの単純なコマンドなら語を並べかえ、ほか (| ; && など) なら eval にまかせる
+    fn expand_alias(&mut self, words: &[String]) -> Vec<String> {
+        let Some(first) = words.first() else { return vec![] };
+        let Some(value) = self.aliases.get(first).cloned().filter(|_| !self.expanding.contains(first)) else {
+            return words.to_vec();
+        };
+        if let Ok(list) = Parser::new(&format!("{}\n", value)).program()
+            && let [item] = list.as_slice()
+            && item.ao.rest.is_empty()
+            && !item.bg
+            && !item.ao.first.neg
+            && let [Cmd::Simple { assigns, words: aw, redirs }] = item.ao.first.cmds.as_slice()
+            && assigns.is_empty()
+            && redirs.is_empty()
+            && !aw.is_empty()
+        {
+            // 置きかえた先の最初の語も alias かもしれない (自分自身はのぞく)
+            self.expanding.push(first.clone());
+            let mut out = self.expand_alias(aw);
+            self.expanding.pop();
+            out.extend(words[1..].iter().cloned());
+            return out;
+        }
+        let mut src = value;
+        for w in &words[1..] {
+            src.push(' ');
+            src.push_str(w);
+        }
+        vec!["eval".into(), quote(&src)]
     }
 
     fn run_simple(&mut self, assigns: &[(String, String)], words: &[String], redirs: &[Redir]) -> i32 {
@@ -912,6 +953,46 @@ impl Shell {
                 }
                 0
             }
+            "alias" => {
+                if a.is_empty() {
+                    let mut v: Vec<_> = self.aliases.iter().collect();
+                    v.sort();
+                    for (k, x) in v {
+                        println!("alias {}={}", k, quote(x));
+                    }
+                    return 0;
+                }
+                let mut st = 0;
+                for x in a {
+                    match x.split_once('=') {
+                        Some((k, v)) if !k.is_empty() => {
+                            self.aliases.insert(k.to_string(), v.to_string());
+                        }
+                        _ => match self.aliases.get(x) {
+                            Some(v) => println!("alias {}={}", x, quote(v)),
+                            None => {
+                                eprintln!("alias: {}: not found", x);
+                                st = 1;
+                            }
+                        },
+                    }
+                }
+                st
+            }
+            "unalias" => {
+                if a.first().map(|s| s.as_str()) == Some("-a") {
+                    self.aliases.clear();
+                    return 0;
+                }
+                let mut st = 0;
+                for x in a {
+                    if self.aliases.remove(x).is_none() {
+                        eprintln!("unalias: {}: not found", x);
+                        st = 1;
+                    }
+                }
+                st
+            }
             "eval" => {
                 let src = a.join(" ");
                 self.run_source(&src, "eval")
@@ -1500,12 +1581,19 @@ fn main() {
         exit_shell(st);
     }
     // ログインシェル (argv[0] が -sh) は /etc/profile と ~/.profile を読む
+    let home = sh.get_var("HOME").unwrap_or_default();
     if args[0].starts_with('-') {
-        let home = sh.get_var("HOME").unwrap_or_default();
         for f in ["/etc/profile".to_string(), format!("{}/.profile", home)] {
             if std::path::Path::new(&f).is_file() {
                 sh.builtin(&[".".into(), f]);
             }
+        }
+    }
+    // 対話するシェルは $ENV (なければ ~/.shrc) も読む: alias や PS1 など
+    if unsafe { libc::isatty(0) } == 1 {
+        let rc = sh.get_var("ENV").and_then(|e| sh.expand_one(&e).ok()).unwrap_or_else(|| format!("{}/.shrc", home));
+        if std::path::Path::new(&rc).is_file() {
+            sh.builtin(&[".".into(), rc]);
         }
     }
     sh.interactive();
@@ -1536,19 +1624,30 @@ impl Shell {
                 }
             }
         }
+        // 履歴: $HISTFILE (なければ ~/.sh_history)、$HISTSIZE 行
+        let mut ed = edit::Editor::new();
+        if tty {
+            let home = self.get_var("HOME").unwrap_or_default();
+            let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.sh_history", home));
+            let size = self.get_var("HISTSIZE").and_then(|n| n.parse().ok()).unwrap_or(10000);
+            ed.load((!home.is_empty() || file.starts_with('/')).then_some(file), size);
+        }
         let mut buf = String::new();
         loop {
             if buf.is_empty() {
                 jobs::report_jobs();
             }
-            if tty {
-                if buf.is_empty() {
-                    eprint!("{}", self.prompt());
-                } else {
-                    eprint!("{}", self.get_var("PS2").unwrap_or_else(|| "> ".into()));
+            let read = if tty {
+                let p = if buf.is_empty() { self.prompt() } else { self.get_var("PS2").unwrap_or_else(|| "> ".into()) };
+                match ed.read(&p) {
+                    edit::Input::Line(l) => Ok(Some(l)),
+                    edit::Input::Eof => Ok(None),
+                    edit::Input::Interrupt => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 }
-            }
-            let line = match read_line() {
+            } else {
+                read_line()
+            };
+            let line = match read {
                 Ok(Some(l)) => l,
                 Ok(None) => {
                     if !buf.is_empty() {
@@ -1561,7 +1660,9 @@ impl Shell {
                     exit_shell(self.status);
                 }
                 Err(_) => {
-                    eprintln!();
+                    if !tty {
+                        eprintln!();
+                    }
                     buf.clear();
                     self.status = 130;
                     continue;
@@ -1573,6 +1674,9 @@ impl Shell {
             }
             match Parser::new(&buf).program() {
                 Ok(list) => {
+                    if tty {
+                        ed.add(&buf);
+                    }
                     buf.clear();
                     self.run_list(&list);
                     self.flow = Flow::None;
@@ -1615,6 +1719,10 @@ impl Shell {
                 Some('w') => out.push_str(&short),
                 Some('W') => out.push_str(if short == "~" || cwd == "/" { &short } else { short.rsplit('/').next().unwrap_or("") }),
                 Some('$') => out.push(if root { '#' } else { '$' }),
+                // 色: \e は ESC、\[ \] は幅に数えないところ (bash と同じ)
+                Some('e') => out.push('\x1b'),
+                Some('[') => out.push('\x01'),
+                Some(']') => out.push('\x02'),
                 Some('n') => out.push('\n'),
                 Some('\\') => out.push('\\'),
                 Some(o) => {
