@@ -124,16 +124,28 @@ pub fn read_password(prompt: &str) -> Option<String> {
     (n > 0).then(|| line.trim_end_matches(['\n', '\r']).to_string())
 }
 
-/// ホームがなければ作る (pam_mkhomedir と同じ)
+/// ホームがなければ作り、/etc/skel のファイル (.aishrc など) を写す (pam_mkhomedir と同じ)
 pub fn make_home(u: &User) {
     if u.home.is_empty() || u.home == "/" || fs::metadata(&u.home).is_ok() {
         return;
     }
-    if fs::create_dir_all(&u.home).is_ok() {
-        let c = CString::new(u.home.as_str()).unwrap();
+    if fs::create_dir_all(&u.home).is_err() {
+        return;
+    }
+    let own = |path: &str, mode: libc::mode_t| {
+        let c = CString::new(path).unwrap();
         unsafe {
             libc::chown(c.as_ptr(), u.uid, u.gid);
-            libc::chmod(c.as_ptr(), 0o700);
+            libc::chmod(c.as_ptr(), mode);
+        }
+    };
+    own(&u.home, 0o700);
+    for e in fs::read_dir("/etc/skel").into_iter().flatten().flatten() {
+        if e.file_type().is_ok_and(|t| t.is_file()) {
+            let dst = format!("{}/{}", u.home, e.file_name().to_string_lossy());
+            if fs::copy(e.path(), &dst).is_ok() {
+                own(&dst, 0o644);
+            }
         }
     }
 }

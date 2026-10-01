@@ -1,0 +1,17 @@
+# aish-powerline: aish の powerline のプロンプト (aish の拡張。[shell] リポジトリ)
+#   aipkg -S aish-powerline してから、~/.aishrc に
+#   source /usr/share/aish/plugins/aish-powerline/aish-powerline.sh
+pkgname=aish-powerline
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Powerline prompt for aish (needs aifont or a Nerd Font in the terminal)'
+arch=('any')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('base')
+source=('aish-powerline.sh')
+sha256sums=('SKIP')
+
+package() {
+  install -Dm644 aish-powerline.sh "$pkgdir/usr/share/aish/plugins/aish-powerline/aish-powerline.sh"
+}
