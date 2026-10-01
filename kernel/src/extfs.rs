@@ -324,6 +324,9 @@ impl ExtFs {
                     if has {
                         println!("extfs: journal on");
                     }
+                    if let Err(e) = fs.process_orphans() {
+                        println!("extfs: orphan list: error {}", e);
+                    }
                 }
                 Err(e) => {
                     println!("extfs: journal: {}", e);
@@ -453,6 +456,76 @@ impl ExtFs {
         put32(&mut sb, 16, v);
         drop(sb);
         self.cache.borrow_mut().sb_dirty = true;
+    }
+
+    // ---- orphan リスト ----
+    // 消したがまだ使われている inode は、superblock の s_last_orphan から i_dtime でつないでおく
+    // (ext4 と同じ)。いきなり電源が切れても、次のマウント (や e2fsck) で片付けられる
+
+    fn last_orphan(&self) -> u32 {
+        u32_at(&self.sb.borrow(), 0xe8)
+    }
+
+    fn set_last_orphan(&self, ino: u32) {
+        put32(&mut self.sb.borrow_mut(), 0xe8, ino);
+        self.cache.borrow_mut().sb_dirty = true;
+    }
+
+    /// リストの頭に足す (r は呼ぶ側が書く)
+    fn orphan_add(&self, ino: u32, r: &mut Raw) {
+        put32(&mut r.0, 20, self.last_orphan());
+        self.set_last_orphan(ino);
+    }
+
+    /// リストから外す
+    fn orphan_del(&self, ino: u32) -> Result<(), i64> {
+        let next = u32_at(&self.read_inode(ino)?.0, 20);
+        if self.last_orphan() == ino {
+            self.set_last_orphan(next);
+            return Ok(());
+        }
+        let mut cur = self.last_orphan();
+        for _ in 0..self.ipg.saturating_mul(self.groups) {
+            if cur == 0 {
+                break;
+            }
+            let mut r = self.read_inode(cur)?;
+            let d = u32_at(&r.0, 20);
+            if d == ino {
+                put32(&mut r.0, 20, next);
+                return self.write_inode(cur, &r);
+            }
+            cur = d;
+        }
+        Ok(())
+    }
+
+    /// マウントのとき: 前に残った orphan を片付ける
+    fn process_orphans(&self) -> Result<(), i64> {
+        let mut cur = self.last_orphan();
+        if cur == 0 {
+            return Ok(());
+        }
+        let mut n = 0;
+        while cur != 0 && n < 1_000_000 {
+            if cur < ROOT_INO || cur > self.ipg.saturating_mul(self.groups) {
+                break;
+            }
+            let mut r = self.read_inode(cur)?;
+            let next = u32_at(&r.0, 20);
+            if r.links() == 0 {
+                self.release(cur, &mut r)?;
+            } else {
+                put32(&mut r.0, 20, 0);
+                self.write_inode(cur, &r)?;
+            }
+            cur = next;
+            n += 1;
+        }
+        self.set_last_orphan(0);
+        self.flush()?;
+        println!("extfs: freed {} orphan inode(s)", n);
+        Ok(())
     }
 
     fn gd_off(&self, g: u32) -> usize {
@@ -1491,7 +1564,7 @@ impl Drop for ExtInode {
         };
         if last && self.fs.orphans.borrow_mut().remove(&self.ino) {
             let fs = &self.fs;
-            let res = fs.read_inode(self.ino).and_then(|mut r| if r.links() == 0 { fs.release(self.ino, &mut r) } else { Ok(()) });
+            let res = fs.orphan_del(self.ino).and_then(|_| fs.read_inode(self.ino)).and_then(|mut r| if r.links() == 0 { fs.release(self.ino, &mut r) } else { Ok(()) });
             if res.is_err() || fs.maybe_flush().is_err() {
                 println!("extfs: could not free orphan inode {}", self.ino);
             }
@@ -1640,6 +1713,7 @@ impl ExtInode {
             if fs.users.borrow().get(&child).is_some_and(|&n| n > 0) {
                 // まだ開かれている (実行中のプログラムなど): 最後に閉じられたときに片付ける
                 fs.orphans.borrow_mut().insert(child);
+                fs.orphan_add(child, &mut r);
                 fs.write_inode(child, &r)
             } else {
                 fs.release(child, &mut r)
