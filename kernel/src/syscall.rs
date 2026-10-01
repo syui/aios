@@ -384,6 +384,37 @@ fn timespec(ns: u64) -> [u8; 16] {
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 
+/// 大きなロックなしで済むシステムコール: 自分のことを読むだけのもの (smp.rs)。済ませたら true。
+/// ユーザーのメモリに書くのは、もう写っていて書けるページだけ (なければ false でふつうの道へ)。
+/// シグナルや kill はほかの CPU から割り込み (IPI) で来るので、ここでは見なくてよい
+pub fn fast(tf: &mut TrapFrame) -> bool {
+    use nr::*;
+    let a = tf.x;
+    let p = proc::current();
+    let r = match a[8] {
+        GETPID => p.tgid as i64,
+        GETTID => p.pid as i64,
+        GETPPID => p.ppid as i64,
+        GETUID => p.cred.uid as i64,
+        GETEUID => p.cred.euid as i64,
+        GETGID => p.cred.gid as i64,
+        GETEGID => p.cred.egid as i64,
+        CLOCK_GETTIME => {
+            let ns = match a[0] {
+                CLOCK_REALTIME | CLOCK_REALTIME_COARSE => timer::epoch_ns(),
+                _ => timer::uptime_ns(),
+            };
+            if !p.pt().copy_out_nofault(a[1] as usize, &timespec(ns)) {
+                return false;
+            }
+            0
+        }
+        _ => return false,
+    };
+    tf.x[0] = r as u64;
+    true
+}
+
 fn sys_clock_gettime(clk: u64, ts: usize) -> R {
     let ns = match clk {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => timer::epoch_ns(),
