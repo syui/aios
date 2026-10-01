@@ -34,7 +34,7 @@ trap 'rm -rf "$tmp"' EXIT
 # -r: リポジトリの aios.db (desc の tar.gz) を読んでおく
 if [ -n "$remote" ]; then
   echo "rootfs: packages from $server"
-  curl -fsSL "$server/aios.db" -o "$tmp/aios.db"
+  curl -fsSL --retry 3 "$server/aios.db" -o "$tmp/aios.db"
   mkdir "$tmp/db"
   tar -xzf "$tmp/aios.db" -C "$tmp/db"
 fi
@@ -56,7 +56,7 @@ fetch() {
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "repo/aarch64/$file" ]; then
     echo "fetch: $file"
-    curl -fsSL "$server/$file" -o "repo/aarch64/$file.part"
+    curl -fsSL --retry 3 "$server/$file" -o "repo/aarch64/$file.part"
     mv "repo/aarch64/$file.part" "repo/aarch64/$file"
   fi
   if [ -n "$sum" ] && [ "$(sha256 "repo/aarch64/$file")" != "$sum" ]; then
