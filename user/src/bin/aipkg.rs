@@ -8,7 +8,9 @@
 //   aipkg -R pkg...     外す
 //   aipkg -Q / -Qi / -Ql [pkg]  入っているもの / 情報 / ファイル一覧
 //
-// 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)
+// 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)。
+// どのリポジトリも、Server のところの db は aios.db (aarch64/rust/aios.db, aarch64/c/aios.db)。
+// パッケージはメモリにためずに /var/cache/aipkg へ書き (切れたら続きから)、そこから入れる
 #[path = "../lib/http.rs"]
 mod http;
 #[path = "../lib/tls.rs"]
@@ -17,12 +19,14 @@ mod tls;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::process::exit;
 
 const CONF: &str = "/etc/aipkg.conf";
 const DBPATH: &str = "/var/lib/aipkg";
 const CACHE: &str = "/var/cache/aipkg";
+/// Server のところにあるデータベースの名前 (リポジトリの名前によらない)
+const DB_FILE: &str = "aios.db";
 const ROOT: &str = "/";
 const ARCH: &str = "aarch64";
 
@@ -206,6 +210,26 @@ fn fetch(url: &str) -> io::Result<Vec<u8>> {
     http::get(url, Some(tls::connect))
 }
 
+/// url を path へ (http(s) は続きから取れる download、file:// は写す)
+fn fetch_to(url: &str, path: &str) -> io::Result<()> {
+    if let Some(src) = url.strip_prefix("file://") {
+        return fs::copy(src, path).map(|_| ());
+    }
+    http::download(url, Some(tls::connect), path)
+}
+
+/// servers のどれかから file を path へ
+fn fetch_any_to(servers: &[String], file: &str, path: &str) -> io::Result<()> {
+    let mut last = io::Error::other("no Server configured");
+    for s in servers {
+        match fetch_to(&format!("{}/{}", s.trim_end_matches('/'), file), path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 fn fetch_any(servers: &[String], file: &str) -> io::Result<Vec<u8>> {
     let mut last = io::Error::other("no Server configured");
     for s in servers {
@@ -217,23 +241,45 @@ fn fetch_any(servers: &[String], file: &str) -> io::Result<Vec<u8>> {
     Err(last)
 }
 
-/// zstd / gzip / 無圧縮の tar
-fn tar_reader(bytes: &[u8]) -> Box<dyn Read + '_> {
-    match bytes {
-        [0x28, 0xb5, 0x2f, 0xfd, ..] => match ruzstd::decoding::StreamingDecoder::new(bytes) {
+/// zstd / gzip / 無圧縮の tar (頭の数バイトで見分ける)
+fn tar_reader<'a>(mut r: Box<dyn BufRead + 'a>) -> Box<dyn Read + 'a> {
+    let head = r.fill_buf().map(|b| b.get(..4).map(|h| h.to_vec()).unwrap_or_default()).unwrap_or_default();
+    match head.as_slice() {
+        [0x28, 0xb5, 0x2f, 0xfd] => match ruzstd::decoding::StreamingDecoder::new(r) {
             Ok(d) => Box::new(d),
             Err(e) => die(format!("bad zstd data: {}", e)),
         },
-        [0x1f, 0x8b, ..] => Box::new(flate2::read::GzDecoder::new(bytes)),
-        _ => Box::new(bytes),
+        [0x1f, 0x8b, ..] => Box::new(flate2::read::GzDecoder::new(r)),
+        _ => Box::new(r),
     }
+}
+
+/// パッケージのファイルを tar として開く
+fn open_pkg(path: &str) -> io::Result<Box<dyn Read>> {
+    let f = fs::File::open(path)?;
+    Ok(tar_reader(Box::new(BufReader::with_capacity(256 * 1024, f))))
+}
+
+/// ファイルの sha256 (少しずつ読む)
+fn sha256_file(path: &str) -> io::Result<String> {
+    let mut f = fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|x| format!("{:02x}", x)).collect())
 }
 
 /// 同期データベース (repo.db) の中身: パッケージ名 → desc
 fn sync_db(repo: &str) -> BTreeMap<String, Desc> {
     let mut out = BTreeMap::new();
     let Ok(bytes) = fs::read(format!("{}/sync/{}.db", DBPATH, repo)) else { return out };
-    let mut ar = tar::Archive::new(tar_reader(&bytes));
+    let mut ar = tar::Archive::new(tar_reader(Box::new(io::Cursor::new(bytes))));
     let Ok(entries) = ar.entries() else { return out };
     for e in entries.flatten() {
         let mut e = e;
@@ -283,8 +329,8 @@ fn installed() -> BTreeMap<String, (Desc, Vec<String>)> {
 // ---- 入れる / 外す ----
 
 /// パッケージの中身を読む: (.PKGINFO, ファイル一覧)
-fn scan(bytes: &[u8]) -> io::Result<(Desc, Vec<String>)> {
-    let mut ar = tar::Archive::new(tar_reader(bytes));
+fn scan(path: &str) -> io::Result<(Desc, Vec<String>)> {
+    let mut ar = tar::Archive::new(open_pkg(path)?);
     let mut info = None;
     let mut files = vec![];
     for e in ar.entries()? {
@@ -306,8 +352,8 @@ fn scan(bytes: &[u8]) -> io::Result<(Desc, Vec<String>)> {
     Ok((info, files))
 }
 
-fn install(bytes: &[u8], explicit: bool) {
-    let (info, files) = scan(bytes).unwrap_or_else(|e| die(e));
+fn install(path: &str, explicit: bool) {
+    let (info, files) = scan(path).unwrap_or_else(|e| die(format!("{}: {}", path, e)));
     let name = get(&info, "NAME").to_string();
     let ver = get(&info, "VERSION").to_string();
     let arch = get(&info, "ARCH");
@@ -341,7 +387,7 @@ fn install(bytes: &[u8], explicit: bool) {
         old.map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).collect()).unwrap_or_default();
     let mut new_backup = vec![];
 
-    let mut ar = tar::Archive::new(tar_reader(bytes));
+    let mut ar = tar::Archive::new(open_pkg(path).unwrap_or_else(|e| die(format!("{}: {}", path, e))));
     ar.set_preserve_permissions(true);
     ar.set_preserve_mtime(true);
     ar.set_overwrite(true);
@@ -479,7 +525,7 @@ fn remove(names: &[String]) {
 fn refresh(repos: &[Repo]) {
     fs::create_dir_all(format!("{}/sync", DBPATH)).unwrap_or_else(|e| die(e));
     for r in repos {
-        match fetch_any(&r.servers, &format!("{}.db", r.name)) {
+        match fetch_any(&r.servers, DB_FILE) {
             Ok(b) => {
                 fs::write(format!("{}/sync/{}.db", DBPATH, r.name), b).unwrap_or_else(|e| die(e));
                 println!(":: {} is up to date", r.name);
@@ -529,16 +575,19 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
     for n in &order {
         let (ri, d) = &sync[n];
         let file = get(d, "FILENAME");
-        let bytes = fetch_any(&repos[*ri].servers, file).unwrap_or_else(|e| die(format!("{}: {}", file, e)));
         let want = get(d, "SHA256SUM");
-        if !want.is_empty() {
-            let got = sha256_hex(&bytes);
-            if got != want {
+        let path = format!("{}/{}", CACHE, file);
+        // キャッシュにあってチェックサムが合えば、それを使う
+        let cached = !want.is_empty() && sha256_file(&path).is_ok_and(|h| h == want);
+        if !cached {
+            println!("downloading {}", file);
+            fetch_any_to(&repos[*ri].servers, file, &path).unwrap_or_else(|e| die(format!("{}: {}", file, e)));
+            if !want.is_empty() && sha256_file(&path).ok().as_deref() != Some(want) {
+                let _ = fs::remove_file(&path);
                 die(format!("{}: checksum mismatch", file));
             }
         }
-        let _ = fs::write(format!("{}/{}", CACHE, file), &bytes);
-        install(&bytes, explicit.contains(n));
+        install(&path, explicit.contains(n));
     }
 }
 
@@ -616,8 +665,7 @@ fn main() {
         }
     } else if flags.contains(&'U') {
         for t in &targets {
-            let bytes = fs::read(t).unwrap_or_else(|e| die(format!("{}: {}", t, e)));
-            install(&bytes, true);
+            install(t, true);
         }
     } else if flags.contains(&'R') {
         remove(&targets);

@@ -1,4 +1,5 @@
 // fetch URL [-o FILE]: URL の中身を取ってくる (http, https)
+//   -o FILE なら、メモリにためずに FILE へ書く (途中は FILE.part。切れたら続きから)
 #[path = "../lib/http.rs"]
 mod http;
 #[path = "../lib/tls.rs"]
@@ -14,23 +15,22 @@ fn main() {
         eprintln!("usage: fetch URL [-o FILE]");
         std::process::exit(2);
     };
-    let body = match http::get(url, Some(tls::connect)) {
-        Ok(b) => b,
-        Err(e) => {
+    if let Some(path) = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)) {
+        if let Err(e) = http::download(url, Some(tls::connect), path) {
             eprintln!("fetch: {}", e);
             std::process::exit(1);
         }
-    };
-    match args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)) {
-        Some(path) => {
-            if let Err(e) = std::fs::write(path, &body) {
-                eprintln!("fetch: {}: {}", path, e);
-                std::process::exit(1);
-            }
-            eprintln!("{} bytes -> {}", body.len(), path);
+        let n = std::fs::metadata(path).map_or(0, |m| m.len());
+        eprintln!("{} bytes -> {}", n, path);
+        return;
+    }
+    match http::get(url, Some(tls::connect)) {
+        Ok(b) => {
+            std::io::stdout().write_all(&b).ok();
         }
-        None => {
-            std::io::stdout().write_all(&body).ok();
+        Err(e) => {
+            eprintln!("fetch: {}", e);
+            std::process::exit(1);
         }
     }
 }

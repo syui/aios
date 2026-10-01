@@ -1,4 +1,4 @@
-# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/tar)
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/tar)
 # uutils/tar はまだリリースがないので、コミットを決めて日付を版にする
 pkgname=tar
 pkgver=0.1.0.20260930

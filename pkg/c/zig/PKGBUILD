@@ -1,0 +1,35 @@
+# Zig: aios の C の拡張の中心。C/C++ のコンパイラ (zig cc) と、Zig そのもの
+# 公式の aarch64-linux 版 (静的なバイナリ) を /opt/zig に入れて、/opt/c/bin/zig から呼ぶ。
+# aios で作るのは aarch64-linux-musl だけなので、ほかの OS の libc とヘッダー (Windows, mac, glibc,
+# BSD, wasm ...) は入れない (383 MiB → 230 MiB、パッケージは 60 MiB → 44 MiB)。
+# 版とチェックサムは pkg/c/zig.sh (ビルドする側の Zig) と同じにしておく
+pkgname=zig
+pkgver=0.16.0
+pkgrel=2
+pkgdesc='Zig compiler and toolchain (also a C/C++ compiler: zig cc)'
+arch=('aarch64')
+url='https://ziglang.org'
+license=('MIT')
+source=("https://ziglang.org/download/$pkgver/zig-aarch64-linux-$pkgver.tar.xz")
+sha256sums=('ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17')
+
+prepare() {
+  rm -rf "zig-aarch64-linux-$pkgver"
+  tar -xf "zig-aarch64-linux-$pkgver.tar.xz"
+}
+
+package() {
+  install -d "$pkgdir/opt/zig" "$pkgdir/opt/c/bin"
+  cp -R "zig-aarch64-linux-$pkgver/." "$pkgdir/opt/zig/"
+  # aarch64-linux-musl に要らない libc
+  local libc=$pkgdir/opt/zig/lib/libc d
+  rm -rf "$libc"/{mingw,glibc,wasi,darwin,freebsd,netbsd,openbsd}
+  for d in "$libc"/include/*; do
+    case ${d##*/} in
+      aarch64-linux-musl | aarch64-linux-any | any-linux-any | generic-musl) ;;
+      *) rm -rf "$d" ;;
+    esac
+  done
+  # Zig は /proc/self/exe から lib/ を探すので、リンクでよい
+  ln -s ../../zig/zig "$pkgdir/opt/c/bin/zig"
+}

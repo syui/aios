@@ -13,12 +13,12 @@ makedepends=('rustup')
 backup=(boot/loader/loader.conf)
 
 pkgver() {
-  cd "$startdir/../.."
+  cd "$startdir/../../.."
   printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- boot)" "$(git log -1 --format=%h -- boot)"
 }
 
 build() {
-  cd "$startdir/../../boot"
+  cd "$startdir/../../../boot"
   unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
   CARGO_TARGET_DIR="$srcdir/target" cargo build --release
 }

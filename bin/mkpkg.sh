@@ -1,13 +1,13 @@
 #!/bin/bash
 # PKGBUILD から pacman と同じ形のパッケージ (NAME-VER-REL-ARCH.pkg.tar.zst) を作る小さな makepkg
-#   bin/mkpkg.sh pkg/NAME [pkg/NAME2 ...]
-#   できたものは repo/aarch64/ に置く (PKGDEST で変えられる)。リポジトリの db は bin/mkrepo.sh
-# Arch の上なら本物の makepkg でも同じものができる: cd pkg/NAME && CARCH=aarch64 makepkg
+#   bin/mkpkg.sh pkg/rust/NAME [pkg/c/NAME ...]
+#   pkg/rust/NAME は repo/aarch64/rust/、pkg/c/NAME (C の拡張) は repo/aarch64/c/ に置く
+#   (PKGDEST で変えられる)。リポジトリの db は bin/mkrepo.sh
+# Arch の上なら本物の makepkg でも同じものができる: cd pkg/rust/NAME && CARCH=aarch64 makepkg
 #
 # できること: source の git+URL (#tag= #commit= #branch=)、http(s)、PKGBUILD の横のファイル、
 #   sha256sums (SKIP 以外は確かめる)、pkgver()、prepare()、build()、package()。
 #   check() や分割パッケージ、アーカイブの展開はしない (prepare() で tar xf する)
-# C の拡張 (pkg-c/NAME) は repo/aarch64-c/ に置く
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 CARCH=aarch64
@@ -54,10 +54,11 @@ pkginfo() {
 
 make_one() (
   startdir=$(cd "$1" && pwd)
-  # pkg-c/ (C の拡張) は別のリポジトリへ
+  # pkg/rust/NAME → repo/aarch64/rust、pkg/c/NAME → repo/aarch64/c
   dest=$PKGDEST
   if [ -z "$dest" ]; then
-    case $startdir in "$root"/pkg-c/*) dest=$root/repo/$CARCH-c ;; *) dest=$root/repo/$CARCH ;; esac
+    kind=$(basename "$(dirname "$startdir")")
+    dest=$root/repo/$CARCH/$kind
   fi
   mkdir -p "$dest"
   cd "$startdir"
@@ -153,7 +154,7 @@ make_one() (
   echo "==> made ${out#"$root"/}"
 )
 
-[ $# -gt 0 ] || { echo "usage: $0 pkg/NAME..." >&2; exit 1; }
+[ $# -gt 0 ] || { echo "usage: $0 pkg/rust/NAME | pkg/c/NAME ..." >&2; exit 1; }
 for d in "$@"; do
   make_one "$d"
 done

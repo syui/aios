@@ -1,6 +1,6 @@
 # /etc/profile: ログインシェル (sh、予備の bash = brush) が最初に読む
 export PATH=/usr/local/bin:/usr/bin
-# C の拡張 ([aios-c] のパッケージ) が入っていれば
+# C の拡張 ([c] のパッケージ) が入っていれば
 [ -d /opt/c/bin ] && PATH=$PATH:/opt/c/bin
 umask 022
 # プロンプト (bash = brush 用。sh は /etc/shrc の powerline のプロンプトにする)。[ユーザー@ホスト ディレクトリ]$

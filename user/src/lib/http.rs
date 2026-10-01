@@ -1,4 +1,5 @@
-// 小さな HTTP/1.1 クライアント (GET だけ)。Content-Length / chunked / 切断まで、リダイレクト、プロキシ (CONNECT) に対応
+// 小さな HTTP/1.1 クライアント (GET だけ)。Content-Length / chunked / 切断まで、リダイレクト、プロキシ (CONNECT) に対応。
+// download はメモリにためずにファイルへ書き、切れたら Range で続きから取る
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -29,45 +30,52 @@ pub fn parse_url(url: &str) -> io::Result<Url<'_>> {
     Ok(Url { scheme, host, port, path })
 }
 
-fn read_body(r: &mut impl BufRead, headers: &[(String, String)]) -> io::Result<Vec<u8>> {
+/// 中身を out へ (Content-Length / chunked / 切断まで)。書いたバイト数
+fn read_body_to(r: &mut impl BufRead, headers: &[(String, String)], out: &mut dyn Write) -> io::Result<u64> {
     let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str());
-    let mut body = Vec::new();
+    let short = || io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed before the end of the body");
     if h("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+        let mut total = 0;
         loop {
             let mut line = String::new();
             r.read_line(&mut line)?;
-            let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
+            let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
                 .map_err(|_| io::Error::other("bad chunk size"))?;
             if size == 0 {
-                break;
+                return Ok(total);
             }
-            let start = body.len();
-            body.resize(start + size, 0);
-            r.read_exact(&mut body[start..])?;
+            if io::copy(&mut r.by_ref().take(size), out)? < size {
+                return Err(short());
+            }
+            total += size;
             let mut crlf = String::new();
             r.read_line(&mut crlf)?;
         }
-    } else if let Some(len) = h("content-length").and_then(|v| v.parse::<usize>().ok()) {
-        body.resize(len, 0);
-        r.read_exact(&mut body)?;
+    } else if let Some(len) = h("content-length").and_then(|v| v.parse::<u64>().ok()) {
+        if io::copy(&mut r.by_ref().take(len), out)? < len {
+            return Err(short());
+        }
+        Ok(len)
     } else {
-        r.read_to_end(&mut body)?;
+        io::copy(r, out)
     }
-    Ok(body)
 }
 
-/// 1 回だけの要求。(status, headers, body)
-fn request(url: &Url, stream: impl Read + Write) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+type Headers = Vec<(String, String)>;
+
+/// 要求を送って、応答の頭まで読む。(status, headers, 中身の読み手)。from > 0 なら Range: bytes=from-
+fn send(url: &Url, stream: Box<dyn ReadWrite>, from: u64) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>)> {
     let mut r = BufReader::new(stream);
     let host = if (url.scheme, url.port) == ("http", 80) || (url.scheme, url.port) == ("https", 443) {
         url.host.to_string()
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    let range = if from > 0 { format!("Range: bytes={}-\r\n", from) } else { String::new() };
     write!(
         r.get_mut(),
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: aipkg/0.1 (aios)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        url.path, host
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: aipkg/0.1 (aios)\r\nAccept: */*\r\n{}Connection: close\r\n\r\n",
+        url.path, host, range
     )?;
     r.get_mut().flush()?;
     let mut status = String::new();
@@ -83,8 +91,7 @@ fn request(url: &Url, stream: impl Read + Write) -> io::Result<(u16, Vec<(String
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let body = read_body(&mut r, &headers)?;
-    Ok((code, headers, body))
+    Ok((code, headers, r))
 }
 
 pub type Connector = fn(&Url) -> io::Result<Box<dyn ReadWrite>>;
@@ -177,27 +184,83 @@ fn base64(b: &[u8]) -> String {
     out
 }
 
-/// url を GET して中身を返す。https は tls で包む
-pub fn get(url: &str, tls: Option<Connector>) -> io::Result<Vec<u8>> {
+/// url を開いて (リダイレクトをたどって) 応答の頭まで。https は tls で包む
+fn open(url: &str, tls: Option<Connector>, from: u64) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>, String)> {
     let mut url = url.to_string();
     for _ in 0..5 {
         let u = parse_url(&url)?;
-        let (code, headers, body) = match u.scheme {
-            "http" => request(&u, tcp(&u)?)?,
+        let stream: Box<dyn ReadWrite> = match u.scheme {
+            "http" => Box::new(tcp(&u)?),
             _ => match tls {
-                Some(c) => request(&u, c(&u)?)?,
+                Some(c) => c(&u)?,
                 None => return Err(io::Error::other("https is not supported")),
             },
         };
-        match code {
-            200 => return Ok(body),
-            301 | 302 | 303 | 307 | 308 => {
-                let loc = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
-                let loc = loc.ok_or_else(|| io::Error::other("redirect without location"))?;
-                url = if loc.starts_with("http") { loc } else { format!("{}://{}:{}{}", u.scheme, u.host, u.port, loc) };
-            }
-            c => return Err(io::Error::other(format!("{}: HTTP {}", url, c))),
+        let (code, headers, r) = send(&u, stream, from)?;
+        if matches!(code, 301 | 302 | 303 | 307 | 308) {
+            let loc = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
+            let loc = loc.ok_or_else(|| io::Error::other("redirect without location"))?;
+            url = if loc.starts_with("http") { loc } else { format!("{}://{}:{}{}", u.scheme, u.host, u.port, loc) };
+            continue;
         }
+        return Ok((code, headers, r, url));
     }
     Err(io::Error::other("too many redirects"))
+}
+
+/// url を GET して中身を返す (小さいもの用。大きいものは download)
+pub fn get(url: &str, tls: Option<Connector>) -> io::Result<Vec<u8>> {
+    let (code, headers, mut r, url) = open(url, tls, 0)?;
+    if code != 200 {
+        return Err(io::Error::other(format!("{}: HTTP {}", url, code)));
+    }
+    let mut body = Vec::new();
+    read_body_to(&mut r, &headers, &mut body)?;
+    Ok(body)
+}
+
+/// url を path へ、メモリにためずに書く。途中は path.part に置き、切れたら続きから (Range) 取りなおす
+pub fn download(url: &str, tls: Option<Connector>, path: &str) -> io::Result<()> {
+    use std::fs::{self, OpenOptions};
+    let part = format!("{}.part", path);
+    let mut last = io::Error::other("download failed");
+    for _ in 0..5 {
+        let have = fs::metadata(&part).map_or(0, |m| m.len());
+        let (code, headers, mut r, u) = match open(url, tls, have) {
+            Ok(x) => x,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        let mut f = match code {
+            // 続きから
+            206 => OpenOptions::new().append(true).open(&part)?,
+            200 => fs::File::create(&part)?,
+            // 範囲の外: .part がおかしいので、はじめから
+            416 => {
+                fs::remove_file(&part)?;
+                last = io::Error::other(format!("{}: HTTP 416", u));
+                continue;
+            }
+            // サーバーの一時的なエラーはやりなおす
+            500..=599 => {
+                last = io::Error::other(format!("{}: HTTP {}", u, code));
+                continue;
+            }
+            c => return Err(io::Error::other(format!("{}: HTTP {}", u, c))),
+        };
+        let mut w = io::BufWriter::with_capacity(64 * 1024, &mut f);
+        let res = read_body_to(&mut r, &headers, &mut w).and_then(|_| w.flush());
+        drop(w);
+        match res {
+            Ok(()) => {
+                f.sync_all()?;
+                return fs::rename(&part, path);
+            }
+            // 切れた: 書けたところまで残して、続きから
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }

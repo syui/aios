@@ -1,5 +1,5 @@
 # aios (aarch64) の土台: init, sh, aipkg, systemctl, login などと /etc、ファイルシステムの並び
-# このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/base
+# このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/rust/base
 pkgname=base
 pkgver=0.0.1
 pkgrel=1
@@ -16,18 +16,18 @@ backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
         etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/shrc)
 
 pkgver() {
-  cd "$startdir/../.."
+  cd "$startdir/../../.."
   printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
-  cd "$startdir/../../user"
+  cd "$startdir/../../../user"
   unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
   cargo build --release
 }
 
 package() {
-  local top=$startdir/../..
+  local top=$startdir/../../..
   local bin=$top/user/target/aarch64-unknown-linux-musl/release
   local p
 
