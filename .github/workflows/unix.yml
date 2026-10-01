@@ -90,11 +90,13 @@ jobs:
           aios (unix) ${VER} (${GITHUB_SHA::7}), aarch64
 
           \`\`\`sh
-          # Mac: brew install qemu zstd   Linux: qemu-system-arm qemu-efi-aarch64 zstd
           git clone -b unix https://git.syui.ai/ai/os aios && cd aios
           curl -fLO https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst
-          bin/run.sh    # disk.img に展開して、UEFI → aiboot → カーネルで起動
+          bin/run.sh
           \`\`\`
+
+          Mac は brew install qemu zstd、Linux は qemu-system-arm qemu-efi-aarch64 zstd。
+          bin/run.sh は aios-unix-aarch64.img.zst を disk.img に展開して、UEFI → aiboot → カーネルで起動する
 
           disk.img: GPT (p1 ESP = /boot, p2 ext4 = /, p3 swap 256 MiB)。終わるのは Ctrl-a x か sudo poweroff
           NOTES

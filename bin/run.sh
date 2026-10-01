@@ -20,6 +20,11 @@
 dev=target/aarch64-unknown-none-softfloat/debug/aios
 k=$1
 case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
+# 渡されたカーネルがなければ止まる (zsh で「bin/run.sh  # コメント」と打つと # からが引数になる)
+if [ -n "$k" ] && [ ! -f "$k" ]; then
+  echo "bin/run.sh: カーネル $1 がありません (引数なしなら disk.img か aios-unix-aarch64.img.zst から起動)" >&2
+  exit 1
+fi
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -57,6 +62,12 @@ if [ -z "$k" ] && [ -z "$uefi" ] && [ -z "$gpt" ] && [ -f disk.img ] && command 
   done
 fi
 if [ -z "$uefi" ]; then [ -n "$k" ] && [ -f "$k" ] || k=$dev; fi
+if [ -z "$uefi" ] && [ ! -f "$k" ]; then
+  echo "bin/run.sh: 起動するものがありません。どれかを:" >&2
+  echo "  curl -fLO https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst" >&2
+  echo "  bin/mkrootfs.sh -r all && cargo run" >&2
+  exit 1
+fi
 # ELF なら中身だけの Image に
 if [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
   objcopy=$(command -v llvm-objcopy || command -v rust-objcopy || command -v aarch64-linux-gnu-objcopy)
