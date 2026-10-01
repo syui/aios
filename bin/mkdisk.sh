@@ -34,6 +34,15 @@ chown -R 0:0 rootfs
 [ -z "$suid" ] || chmod u+s $suid
 [ -z "$sgid" ] || chmod g+s $sgid
 
+# put FILE SECTOR: FILE をディスクの SECTOR から書く (区画は 1 MiB ごとなので 1 MiB ずつ)
+put() {
+  if [ $(($2 % 2048)) = 0 ]; then
+    dd if="$1" of="$out" bs=1048576 seek=$(($2 / 2048)) conv=notrunc 2>/dev/null
+  else
+    dd if="$1" of="$out" bs=512 seek="$2" conv=notrunc 2>/dev/null
+  fi
+}
+
 # mkext FILE SIZE: rootfs/ から ext の FS を作る
 mkext() {
   rm -f "$1"
@@ -92,7 +101,7 @@ start=$sstart, size=$swap, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F, name="swap
 EOF
   truncate -s $((swap * 512)) "$tmp/swap.img"
   mkswap -q "$tmp/swap.img"
-  dd if="$tmp/swap.img" of="$out" bs=512 seek=$sstart conv=notrunc 2>/dev/null
+  put "$tmp/swap.img" $sstart
   rm -f "$tmp/swap.img"
   # ディスクの root にだけ書く (rootfs/ は initramfs にもなるので、あとで元にもどす)
   mkdir -p rootfs/etc
@@ -109,7 +118,7 @@ fi
 # root: 区画 2 の大きさ (sfdisk -d の出力から)
 rsize=$(sfdisk -d "$out" | sed -n 's/.*start= *\([0-9]*\), size= *\([0-9]*\), type=B921B045.*/\2/p')
 mkext "$tmp/root.img" "$((rsize / 2))k"
-dd if="$tmp/root.img" of="$out" bs=512 seek=$((2048 + esp)) conv=notrunc 2>/dev/null
+put "$tmp/root.img" $((2048 + esp))
 rm -f "$tmp/root.img"
 
 # ESP
@@ -125,5 +134,5 @@ fi
 if [ -n "$(ls -A "$tmp/boot")" ]; then
   (cd "$tmp/boot" && mcopy -s -i "$tmp/esp.img" ./* ::/)
 fi
-dd if="$tmp/esp.img" of="$out" bs=512 seek=2048 conv=notrunc 2>/dev/null
+put "$tmp/esp.img" 2048
 echo "$out ready (GPT: p1 ESP $((esp / 2048)) MiB = /boot, p2 root ${FS:-ext4} $((rsize / 2048)) MiB${swap:+, p3 swap $((swap / 2048)) MiB})"
