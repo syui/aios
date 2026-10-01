@@ -7,7 +7,8 @@
 #   GITEA_TOKEN  gitea のアクセストークン (ディスクには書かない)。なければ、通信に認証をつけてくれる
 #                プロキシ (Claude Code の環境の API 認証情報) にまかせる
 #   GITEA_USER   トークンの持ち主 (既定 ai.syui.ai)
-#   GPG_KEY      ASCII armor の GPG 秘密鍵 (AI_GPG_KEY でも。あれば: コミットの名前とメールはキーの uid から、署名つき)
+#   GPG_KEY      ASCII armor の GPG 秘密鍵 (AI_GPG_KEY でも。あれば: コミットの名前とメールはキーの uid から、署名つき)。
+#                なければ gpg の鍵の束 (setup script で取りこんだもの) の最初の秘密鍵を使う
 set -e
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
@@ -26,10 +27,15 @@ auth() {
 
 # GPG_KEY (AI_GPG_KEY) を取りこみ、そのキーの uid と指紋を返す ("名前 <メール>" と指紋)
 import_key() {
-  [ -n "$AI_GPG_KEY" ] || return 1
-  printf '%s\n' "$AI_GPG_KEY" | gpg --batch --quiet --import 2>/dev/null
-  fpr=$(printf '%s\n' "$AI_GPG_KEY" | gpg --batch --with-colons --import-options show-only --import 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
-  uid=$(printf '%s\n' "$AI_GPG_KEY" | gpg --batch --with-colons --import-options show-only --import 2>/dev/null | awk -F: '/^uid:/ {print $10; exit}')
+  if [ -n "$AI_GPG_KEY" ]; then
+    printf '%s\n' "$AI_GPG_KEY" | gpg --batch --quiet --import 2>/dev/null
+    list=$(printf '%s\n' "$AI_GPG_KEY" | gpg --batch --with-colons --import-options show-only --import 2>/dev/null)
+  else
+    # 鍵の束にある秘密鍵 (setup script などで取りこんだもの)
+    list=$(gpg --batch --with-colons --list-secret-keys 2>/dev/null)
+  fi
+  fpr=$(printf '%s\n' "$list" | awk -F: '/^fpr:/ {print $10; exit}')
+  uid=$(printf '%s\n' "$list" | awk -F: '/^uid:/ {print $10; exit}')
   [ -n "$fpr" ] && [ -n "$uid" ]
 }
 
