@@ -21,6 +21,7 @@ pub const S_IFMT: u32 = 0o170000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 
@@ -52,6 +53,8 @@ pub enum NewNode {
     Dir,
     Symlink(String),
     Dev(u32, u32),
+    /// ブロックデバイス (major, minor)
+    Blk(u32, u32),
     Fifo,
 }
 
@@ -62,6 +65,7 @@ impl NewNode {
             NewNode::Dir => S_IFDIR,
             NewNode::Symlink(_) => S_IFLNK,
             NewNode::Dev(..) => S_IFCHR,
+            NewNode::Blk(..) => S_IFBLK,
             NewNode::Fifo => S_IFIFO,
         }
     }

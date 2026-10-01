@@ -1,0 +1,3 @@
+# /etc/fstab: ルートと /boot はカーネルが決める (root= と ESP)。ここは swapon -a が読む swap の行だけ
+# <device>   <dir>  <type>  <options>
+#/dev/vda3   none   swap    defaults

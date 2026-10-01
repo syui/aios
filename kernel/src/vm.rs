@@ -16,7 +16,13 @@
 // PTE のうち、ハードウェアが見ないビットを使う:
 //   COW       (55) 書けるはずだが共有しているので読み取り専用にしてあるページ
 //   PROTNONE  (56) PROT_NONE にしたので無効にしてあるが、中身は持っているページ (VALID は 0)
+//   SWAP      (57) スワップへ追い出したページ (VALID は 0)。アドレスのところにスロットの番号 (swap.rs)
+//
+// スワップ: 自分だけの領域 (MAP_SHARED でない) の、ほかと共有していないページを追い出せる。
+// 選ぶのは clock: AF (アクセスフラグ) を落としておき、次に見たときにまだ落ちていれば追い出す。
+// AF が落ちたページに触れるとアクセスフラグのフォールトになり、fault_page が立てなおす。
 use crate::kalloc;
+use crate::swap;
 use crate::memlayout::{p2v, v2p, PGSIZE};
 use crate::vfs::InodeRef;
 use alloc::collections::BTreeMap;
@@ -35,6 +41,7 @@ const PTE_PXN: u64 = 1 << 53;
 const PTE_UXN: u64 = 1 << 54;
 const PTE_COW: u64 = 1 << 55;
 const PTE_PROTNONE: u64 = 1 << 56;
+const PTE_SWAP: u64 = 1 << 57;
 const PTE_ADDR: u64 = 0x0000_ffff_ffff_f000;
 
 pub const MAXVA: usize = 1 << 39;
@@ -140,6 +147,8 @@ pub struct PageTable {
     /// 大きなロックなしでユーザーのメモリに書いている CPU の数 (copy_out_nofault)。
     /// ページを手放す前に 0 になるのを待つ (quiesce)
     fast_users: AtomicUsize,
+    /// clock の針 (次にスワップへ追い出すページを探しはじめる va)
+    clock: usize,
 }
 
 fn index(va: usize, level: usize) -> usize {
@@ -153,6 +162,19 @@ fn table_at(e: u64) -> *mut u64 {
 /// ページを持っている PTE か (PROT_NONE で無効にしてあるものも)
 fn has_page(e: u64) -> bool {
     e & PTE_VALID != 0 || e & PTE_PROTNONE != 0
+}
+
+/// スワップへ追い出したページの PTE か
+fn is_swap(e: u64) -> bool {
+    e & PTE_VALID == 0 && e & PTE_SWAP != 0
+}
+
+fn swap_pte(slot: swap::Slot) -> u64 {
+    (slot << 12) & PTE_ADDR | PTE_SWAP
+}
+
+fn slot_of(e: u64) -> swap::Slot {
+    (e & PTE_ADDR) >> 12
 }
 
 fn page_of(e: u64) -> *mut u8 {
@@ -216,7 +238,7 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0) })
+        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), clock: 0 })
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -264,6 +286,32 @@ impl PageTable {
                 None => va = (va | 0x1f_ffff) + 1,
             }
         }
+    }
+
+    /// each_pte と同じだが、スワップへ追い出したページの PTE も
+    fn each_entry(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
+        let mut va = pg_down(start);
+        while va < end {
+            match self.walk(va, false) {
+                Some(pte) => {
+                    let e = unsafe { *pte };
+                    if has_page(e) || is_swap(e) {
+                        f(va, pte);
+                    }
+                    va += PGSIZE;
+                }
+                None => va = (va | 0x1f_ffff) + 1,
+            }
+        }
+    }
+
+    /// ユーザーのページを 1 枚。足りなければ、ほかのアドレス空間のページをスワップへ追い出して作る
+    /// (自分のページ表は借りられているので触らない)
+    fn alloc_page(&self) -> Option<*mut u8> {
+        kalloc::alloc().or_else(|| {
+            swap::reclaim(swap::BATCH, self.root as usize);
+            kalloc::alloc()
+        })
     }
 
     // ---- 領域 ----
@@ -347,8 +395,12 @@ impl PageTable {
         }
         // PTE を消して TLB を消してから、ページを返す (ほかの CPU がまだ使っているかもしれない)
         let mut pages = Vec::new();
-        self.each_pte(start, end, |_, pte| unsafe {
-            pages.push(page_of(*pte));
+        self.each_entry(start, end, |_, pte| unsafe {
+            if is_swap(*pte) {
+                swap::free(slot_of(*pte));
+            } else {
+                pages.push(page_of(*pte));
+            }
             *pte = 0;
         });
         flush_all();
@@ -368,10 +420,14 @@ impl PageTable {
             }
         }
         let mut pages = Vec::new();
-        self.each_pte(start, end, |va, pte| unsafe {
+        self.each_entry(start, end, |va, pte| unsafe {
             // 共有のメモリは捨てない (ほかのプロセスが使っている)
             if !shared.iter().any(|&(s, e)| s <= va && va < e) {
-                pages.push(page_of(*pte));
+                if is_swap(*pte) {
+                    swap::free(slot_of(*pte));
+                } else {
+                    pages.push(page_of(*pte));
+                }
                 *pte = 0;
             }
         });
@@ -484,7 +540,7 @@ impl PageTable {
                 let page = match shared_file().get(&key) {
                     Some(c) => c.page,
                     None => {
-                        let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
+                        let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
                         let size = ino.meta().size as usize;
                         let foff = key.2 * PGSIZE;
                         if foff < size {
@@ -510,8 +566,17 @@ impl PageTable {
             flush_va(page_va);
             return Ok(());
         }
-        if !has_page(e) {
-            let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
+        if is_swap(e) {
+            // スワップから読み戻す。スロットはほかのアドレス空間 (fork) とまだ共有しているかもしれない
+            let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
+            if swap::read(slot_of(e), page).is_err() {
+                kalloc::free(page);
+                return Err(FaultErr::NoMem);
+            }
+            swap::free(slot_of(e));
+            unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
+        } else if !has_page(e) {
+            let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
             if let Backing::File { ino, off, fend } = &back {
                 let n = PGSIZE.min(fend.saturating_sub(page_va));
                 if n > 0 {
@@ -527,7 +592,7 @@ impl PageTable {
             let old = page_of(e);
             if !shared && kalloc::refs(old) > 1 {
                 // 共有しているので写す
-                let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
+                let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
                 unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
                 flush_va(page_va);
@@ -670,19 +735,29 @@ impl PageTable {
         let areas: Vec<(usize, usize, u8, bool)> = self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect();
         for (s, e, prot, shared) in areas {
             let mut fail = false;
-            self.each_pte(s, e, |va, pte| unsafe {
+            self.each_entry(s, e, |va, pte| unsafe {
                 if fail {
                     return;
                 }
-                kalloc::get(page_of(*pte));
-                // 共有の領域はそのまま (書いた印はページの表にある)。private は COW に
-                if !shared {
-                    *pte = remake_pte(*pte, prot, false);
+                let swapped = is_swap(*pte);
+                if swapped {
+                    // スワップのスロットも共有する (先に読み戻した方が自分のページを作る)
+                    swap::dup(slot_of(*pte));
+                } else {
+                    kalloc::get(page_of(*pte));
+                    // 共有の領域はそのまま (書いた印はページの表にある)。private は COW に
+                    if !shared {
+                        *pte = remake_pte(*pte, prot, false);
+                    }
                 }
                 match new.walk(va, true) {
                     Some(np) => *np = *pte,
                     None => {
-                        kalloc::put(page_of(*pte));
+                        if swapped {
+                            swap::free(slot_of(*pte));
+                        } else {
+                            kalloc::put(page_of(*pte));
+                        }
                         fail = true;
                     }
                 }
@@ -715,6 +790,107 @@ impl PageTable {
         self.vmas.iter().map(|(&s, v)| v.end - s).sum()
     }
 
+    // ---- スワップ ----
+
+    /// clock の針から、追い出せるページを want 枚までスワップへ書き出す。追い出した数を返す。
+    /// 見たページの AF が立っていれば落とすだけ (次に回ってきたときまで触れられなければ追い出す)
+    pub fn swap_out(&mut self, want: usize) -> usize {
+        // 自分だけの領域を、針のところから一周
+        let mut ranges = Vec::new();
+        let hand = self.clock;
+        for (&s, v) in &self.vmas {
+            if !v.shared && v.end > hand {
+                ranges.push((s.max(hand), v.end));
+            }
+        }
+        for (&s, v) in &self.vmas {
+            if !v.shared && s < hand {
+                ranges.push((s, v.end.min(hand)));
+            }
+        }
+        let mut victims = Vec::new();
+        let mut aged = false;
+        let mut next = 0;
+        for (s, e) in ranges {
+            self.each_pte(s, e, |va, pte| unsafe {
+                if victims.len() >= want {
+                    return;
+                }
+                let e = *pte;
+                // PROT_NONE のものや、fork や vDSO で共有しているものは追い出さない
+                if e & PTE_VALID == 0 || kalloc::refs(page_of(e)) != 1 {
+                    return;
+                }
+                if e & PTE_AF != 0 {
+                    *pte = e & !PTE_AF;
+                    aged = true;
+                } else {
+                    victims.push((va, pte, e));
+                }
+                next = va + PGSIZE;
+            });
+            if victims.len() >= want {
+                break;
+            }
+        }
+        // 一周したら針は先頭へ
+        self.clock = if victims.len() >= want { next } else { 0 };
+        // PTE を外してから (ほかの CPU のスレッドがもう触れないようにして) 書き出す
+        let mut out = Vec::new();
+        for &(_, pte, e) in &victims {
+            let Some(slot) = swap::alloc() else { break };
+            unsafe { *pte = swap_pte(slot) };
+            out.push((pte, e, slot));
+        }
+        if aged || !out.is_empty() {
+            flush_all();
+            self.quiesce();
+        }
+        let mut n = 0;
+        for (pte, e, slot) in out {
+            let page = page_of(e);
+            if swap::write(slot, page).is_err() {
+                unsafe { *pte = e };
+                swap::free(slot);
+                continue;
+            }
+            kalloc::put(page);
+            n += 1;
+        }
+        n
+    }
+
+    /// スワップの区画 area に追い出したページを、ぜんぶ読み戻す (swapoff)。足りなければ Err
+    pub fn swap_in_area(&mut self, area: usize) -> Result<(), ()> {
+        let vmas: Vec<(usize, usize, u8)> = self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot)).collect();
+        let mut ok = true;
+        for (s, e, prot) in vmas {
+            self.each_entry(s, e, |_, pte| unsafe {
+                let e = *pte;
+                if !ok || !is_swap(e) || swap::area_of(slot_of(e)) != area {
+                    return;
+                }
+                let Some(page) = kalloc::alloc() else {
+                    ok = false;
+                    return;
+                };
+                if swap::read(slot_of(e), page).is_err() {
+                    kalloc::free(page);
+                    ok = false;
+                    return;
+                }
+                swap::free(slot_of(e));
+                *pte = make_pte(v2p(page as usize) as u64, prot, false);
+            });
+        }
+        if ok { Ok(()) } else { Err(()) }
+    }
+
+    /// ページ表のルート (スワップの回収で、自分を除くのに使う)
+    pub fn id(&self) -> usize {
+        self.root as usize
+    }
+
     /// 持っているページの数 (/proc の VmRSS)
     pub fn resident(&self) -> usize {
         let mut n = 0;
@@ -737,6 +913,8 @@ impl Drop for PageTable {
                     }
                 } else if has_page(e) {
                     kalloc::put(page_of(e));
+                } else if is_swap(e) {
+                    swap::free(slot_of(e));
                 }
             }
             kalloc::free(table as *mut u8);

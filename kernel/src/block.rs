@@ -19,7 +19,7 @@ enum Dev {
 }
 
 /// 区画 (始まりのセクタ、セクタ数、番号。番号 0 はディスク全体)
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Part {
     pub start: u64,
     pub len: u64,
@@ -29,6 +29,27 @@ pub struct Part {
 static mut DEV: Option<Dev> = None;
 static mut ROOT: Part = Part { start: 0, len: u64::MAX, num: 0 };
 static mut BOOT: Option<Part> = None;
+/// 見つけた区画 (/dev の vda1 など)。番号 0 はディスク全体 (大きさがわかるときだけ)
+static mut PARTS: alloc::vec::Vec<Part> = alloc::vec::Vec::new();
+
+/// /dev のブロックデバイスの major (Linux の virtblk と mmcblk)
+const VD_MAJOR: u32 = 254;
+const MMC_MAJOR: u32 = 179;
+
+pub fn parts() -> alloc::vec::Vec<Part> {
+    unsafe { (*(&raw const PARTS)).clone() }
+}
+
+/// 区画の (major, minor)。minor は区画の番号
+pub fn dev_of_part(p: &Part) -> (u32, u32) {
+    let ma = if unsafe { DEV } == Some(Dev::Sd) { MMC_MAJOR } else { VD_MAJOR };
+    (ma, p.num as u32)
+}
+
+/// /dev のノードの (major, minor) の区画
+pub fn part_of_dev(ma: u32, mi: u32) -> Option<Part> {
+    parts().into_iter().find(|p| dev_of_part(p) == (ma, mi))
+}
 
 fn dev() -> Result<Dev, i64> {
     unsafe { DEV }.ok_or(-6)
@@ -188,6 +209,9 @@ pub fn init() -> bool {
         return false;
     };
     unsafe { DEV = Some(d) };
+    if let Some(n) = virtio_blk::capacity().filter(|_| d == Dev::Virtio) {
+        unsafe { (*(&raw mut PARTS)).push(Part { start: 0, len: n, num: 0 }) };
+    }
     let want = crate::dtb::arg("root").and_then(parse_root);
     let mut head = [0u8; SECTOR * 4];
     if raw_read(d, 0, &mut head).is_err() {
@@ -205,6 +229,7 @@ pub fn init() -> bool {
     // id: GPT なら区画の GUID、MBR なら (署名, 番号) で照らし合わせる
     let sig = u32::from_le_bytes(head[440..444].try_into().unwrap());
     let mut pick = |p: Part, guid: Option<[u8; 16]>, is_root: bool, is_boot: bool| {
+        unsafe { (*(&raw mut PARTS)).push(p) };
         let chosen = match &want {
             Some(Want::Num(n)) => *n == p.num,
             Some(Want::PartGuid(g)) => guid == Some(*g),

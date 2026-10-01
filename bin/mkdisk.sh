@@ -7,6 +7,7 @@
 #   FS=ext2 ...                     root を ext2 に
 #   OUT=FILE で出力先を変える (bin/mksd.sh が root の区画を作るのに使う。いつも区画なし)
 #   NOBOOT=1 で root の /boot を空に (boot は別の FAT の区画に入れるとき)
+#   SWAP=256M で区画 3 にスワップ (GPT のとき。mkswap が要る)。/etc/fstab に足すので起動すると swapon -a で使う
 # ESP には rootfs/boot の中身 (aios-kernel の Image と loader entry、aiboot) を入れる。
 # UEFI のファームウェアは EFI/BOOT/BOOTAA64.EFI (aiboot) を起動し、aiboot が entry の Image を起動する。
 # aios は起動後に ESP を /boot にマウントするので、aipkg でカーネルを入れかえられる
@@ -50,6 +51,7 @@ esac
 tmp=$(mktemp -d)
 # /boot の中身は FAT の区画へ。root の /boot はマウント先の空のディレクトリ
 restore() {
+  [ -f "$tmp/fstab" ] && cp -p "$tmp/fstab" rootfs/etc/fstab
   if [ -d "$tmp/boot" ]; then
     rm -rf rootfs/boot
     mv "$tmp/boot" rootfs/boot
@@ -75,11 +77,35 @@ size=${1:-1G}
 esp=262144        # 128 MiB (セクタ)
 rm -f "$out"
 truncate -s "$size" "$out"
-sfdisk -q "$out" <<EOF
+if [ -n "$SWAP" ]; then
+  command -v mkswap >/dev/null || { echo "mkswap がありません (util-linux)" >&2; exit 1; }
+  swap=$(($(numfmt --from=iec "$SWAP") / 512 / 2048 * 2048))
+  # GPT の後ろの写し (33 セクタ) の分をあけて、ディスクの終わりに置く
+  total=$(($(stat -c %s "$out") / 512))
+  sstart=$(((total - 34 - swap) / 2048 * 2048))
+  rsize=$((sstart - 2048 - esp))
+  sfdisk -q "$out" <<EOF
+label: gpt
+start=2048, size=$esp, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="ESP"
+start=$((2048 + esp)), size=$rsize, type=B921B045-1DF0-41C3-AF44-4C6F280D3FAE, name="root"
+start=$sstart, size=$swap, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F, name="swap"
+EOF
+  truncate -s $((swap * 512)) "$tmp/swap.img"
+  mkswap -q "$tmp/swap.img"
+  dd if="$tmp/swap.img" of="$out" bs=512 seek=$sstart conv=notrunc 2>/dev/null
+  rm -f "$tmp/swap.img"
+  # ディスクの root にだけ書く (rootfs/ は initramfs にもなるので、あとで元にもどす)
+  mkdir -p rootfs/etc
+  touch rootfs/etc/fstab
+  cp -p rootfs/etc/fstab "$tmp/fstab"
+  grep -qs '^/dev/vda3[[:space:]]' rootfs/etc/fstab || echo '/dev/vda3   none   swap    defaults' >> rootfs/etc/fstab
+else
+  sfdisk -q "$out" <<EOF
 label: gpt
 start=2048, size=$esp, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="ESP"
 start=$((2048 + esp)), type=B921B045-1DF0-41C3-AF44-4C6F280D3FAE, name="root"
 EOF
+fi
 # root: 区画 2 の大きさ (sfdisk -d の出力から)
 rsize=$(sfdisk -d "$out" | sed -n 's/.*start= *\([0-9]*\), size= *\([0-9]*\), type=B921B045.*/\2/p')
 mkext "$tmp/root.img" "$((rsize / 2))k"
@@ -100,4 +126,4 @@ if [ -n "$(ls -A "$tmp/boot")" ]; then
   (cd "$tmp/boot" && mcopy -s -i "$tmp/esp.img" ./* ::/)
 fi
 dd if="$tmp/esp.img" of="$out" bs=512 seek=2048 conv=notrunc 2>/dev/null
-echo "$out ready (GPT: p1 ESP $((esp / 2048)) MiB = /boot, p2 root ${FS:-ext4} $((rsize / 2048)) MiB)"
+echo "$out ready (GPT: p1 ESP $((esp / 2048)) MiB = /boot, p2 root ${FS:-ext4} $((rsize / 2048)) MiB${swap:+, p3 swap $((swap / 2048)) MiB})"

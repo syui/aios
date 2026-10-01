@@ -251,6 +251,10 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             let (ma, mi) = fs::dev_of(&ino).unwrap();
             Some(Kind::of_dev(ma, mi, flags as u32)?)
         }
+        vfs::S_IFBLK => {
+            let (ma, mi) = fs::dev_of(&ino).unwrap();
+            Some(Kind::Block(crate::block::part_of_dev(ma, mi).ok_or(-6)?))
+        }
         vfs::S_IFIFO => {
             let p = fifo_pipe(&ino);
             let (r, w) = match accmode {
@@ -344,17 +348,42 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     Ok(0)
 }
 
+/// swapon / swapoff の path: ブロックデバイスのノードの区画と、その名前
+fn swap_part(pathp: usize) -> Result<(crate::block::Part, String), i64> {
+    if cred::current().euid != 0 {
+        return Err(-cred::EPERM);
+    }
+    let ino = at(AT_FDCWD, pathp, 0)?;
+    if ino.meta().mode & S_IFMT != vfs::S_IFBLK {
+        return Err(-EINVAL);
+    }
+    let (ma, mi) = fs::dev_of(&ino).ok_or(-EINVAL)?;
+    let p = crate::block::part_of_dev(ma, mi).ok_or(-6)?;
+    Ok((p, crate::block::part_name(&p)))
+}
+
+pub fn swapon(pathp: usize) -> R {
+    let (p, name) = swap_part(pathp)?;
+    crate::swap::on(p, name).map(|_| 0)
+}
+
+pub fn swapoff(pathp: usize) -> R {
+    let (_, name) = swap_part(pathp)?;
+    crate::swap::off(&name).map(|_| 0)
+}
+
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
     let mode = mode as u32;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
         vfs::S_IFCHR => NewNode::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
+        vfs::S_IFBLK => NewNode::Blk((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
         0 | vfs::S_IFREG => NewNode::File,
         _ => return Err(-EINVAL),
     };
     let c = cred::current();
-    if matches!(node, NewNode::Dev(..)) && c.euid != 0 {
+    if matches!(node, NewNode::Dev(..) | NewNode::Blk(..)) && c.euid != 0 {
         return Err(-cred::EPERM);
     }
     parent_writable(&c, &parent)?;
@@ -641,6 +670,19 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
             s.borrow_mut().nonblock = on;
         }
         return Ok(0);
+    }
+    if let Kind::Block(p) = &f.borrow().kind {
+        // BLKGETSIZE64 (バイト数)、BLKGETSIZE (セクタ数)、BLKSSZGET / BLKBSZGET (セクタの大きさ)
+        const BLKGETSIZE: u64 = 0x1260;
+        const BLKSSZGET: u64 = 0x1268;
+        const BLKBSZGET: u64 = 0x80081270;
+        const BLKGETSIZE64: u64 = 0x80081272;
+        return match req {
+            BLKGETSIZE64 => out(arg, &(file::blk_size(p) as u64).to_le_bytes()).map(|_| 0),
+            BLKGETSIZE => out(arg, &p.len.to_le_bytes()).map(|_| 0),
+            BLKSSZGET | BLKBSZGET => out(arg, &(crate::block::SECTOR as u32).to_le_bytes()).map(|_| 0),
+            _ => Err(-ENOTTY),
+        };
     }
     let (tty, master) = match &f.borrow().kind {
         Kind::Tty(t) => (t.clone(), false),

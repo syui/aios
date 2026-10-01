@@ -294,7 +294,7 @@ impl Inode for TmpInode {
             NewNode::File => Node::File(Data::Owned(Pages::new())),
             NewNode::Dir => Node::Dir(BTreeMap::new()),
             NewNode::Symlink(t) => Node::Symlink(t),
-            NewNode::Dev(ma, mi) => Node::Dev(ma, mi),
+            NewNode::Dev(ma, mi) | NewNode::Blk(ma, mi) => Node::Dev(ma, mi),
             NewNode::Fifo => Node::Fifo,
         };
         let child = TmpInode::new(self.fs, mode, node);

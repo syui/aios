@@ -1,0 +1,9 @@
+[Unit]
+Description=Enable swap from /etc/fstab
+
+[Service]
+Type=oneshot
+ExecStart=/bin/swapon -a
+
+[Install]
+WantedBy=multi-user.target

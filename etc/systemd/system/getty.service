@@ -1,6 +1,6 @@
 [Unit]
 Description=Console shell (autologin)
-After=motd.service
+After=motd.service swap.service
 
 [Service]
 ExecStart=/bin/login -f ai
