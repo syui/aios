@@ -1,7 +1,7 @@
 #!/bin/bash
 # PKGBUILD から pacman と同じ形のパッケージ (NAME-VER-REL-ARCH.pkg.tar.zst) を作る小さな makepkg
-#   bin/mkpkg.sh pkg/rust/NAME [pkg/c/NAME ...]
-#   pkg/rust/NAME は repo/aarch64/rust/、pkg/c/NAME (C の拡張) は repo/aarch64/c/ に置く
+#   bin/mkpkg.sh pkg/rust/NAME [pkg/c/NAME pkg/shell/NAME ...]
+#   pkg/KIND/NAME は repo/aarch64/KIND/ に置く (rust: 本体、c: C の拡張、shell: aish の拡張)
 #   (PKGDEST で変えられる)。リポジトリの db は bin/mkrepo.sh
 # Arch の上なら本物の makepkg でも同じものができる: cd pkg/rust/NAME && CARCH=aarch64 makepkg
 #
@@ -54,7 +54,7 @@ pkginfo() {
 
 make_one() (
   startdir=$(cd "$1" && pwd)
-  # pkg/rust/NAME → repo/aarch64/rust、pkg/c/NAME → repo/aarch64/c
+  # pkg/KIND/NAME → repo/aarch64/KIND (rust, c, shell)
   dest=$PKGDEST
   if [ -z "$dest" ]; then
     kind=$(basename "$(dirname "$startdir")")

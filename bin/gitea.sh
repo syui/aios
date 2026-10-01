@@ -2,7 +2,7 @@
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
-#   bin/gitea.sh repo    repo/aarch64 (rust/ と c/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
+#   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
@@ -73,9 +73,9 @@ case "$1" in
     trap 'rm -rf "$tmp"' EXIT
     git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$tmp/repo"
     use_identity "$tmp/repo"
-    # aarch64/ をこのリポジトリの repo/aarch64 (rust/ と c/) と同じにする
+    # aarch64/ をこのリポジトリの repo/aarch64 (rust/ c/ shell/) と同じにする
     rm -rf "$tmp/repo/aarch64"
-    for d in rust c; do
+    for d in rust c shell; do
       [ -f "repo/aarch64/$d/aios.db" ] || continue
       mkdir -p "$tmp/repo/aarch64/$d"
       cp repo/aarch64/$d/*.pkg.tar.zst repo/aarch64/$d/aios.db repo/aarch64/$d/aios.db.tar.gz "$tmp/repo/aarch64/$d/"
