@@ -10,7 +10,13 @@ set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 CARCH=aarch64
 PKGDEST=${PKGDEST:-$root/repo/$CARCH}
-PACKAGER=${PACKAGER:-Unknown Packager}
+# 作った人: PACKAGER がなければ git の user.name と user.email (makepkg の PACKAGER と同じ形)
+if [ -z "$PACKAGER" ]; then
+  name=$(git -C "$root" config user.name 2>/dev/null)
+  mail=$(git -C "$root" config user.email 2>/dev/null)
+  PACKAGER=${name:+$name${mail:+ <$mail>}}
+  PACKAGER=${PACKAGER:-Unknown Packager}
+fi
 export CARCH PACKAGER
 mkdir -p "$PKGDEST"
 
