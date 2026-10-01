@@ -1,19 +1,26 @@
 #!/bin/sh
 # git.syui.ai (gitea) へ push する
+#   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
-#   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ
-#   bin/gitea.sh id      GPG_KEY を取りこんで、このリポジトリのコミットをそのキーの持ち主の名前と署名にする
-# 環境変数:
-#   GITEA_TOKEN  gitea のアクセストークン (ディスクには書かない)。なければ、通信に認証をつけてくれる
-#                プロキシ (Claude Code の環境の API 認証情報) にまかせる
-#   GITEA_USER   トークンの持ち主 (既定 ai.syui.ai)
-#   GPG_KEY      ASCII armor の GPG 秘密鍵 (AI_GPG_KEY でも。あれば: コミットの名前とメールはキーの uid から、署名つき)。
-#                なければ gpg の鍵の束 (setup script で取りこんだもの) の最初の秘密鍵を使う
+#   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ (署名つきのコミット)
+#
+# 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
+#   gpg --batch --import <<'EOF'
+#   -----BEGIN PGP PRIVATE KEY BLOCK-----
+#   ...
+#   EOF
+# 名前とメールはその鍵の uid から。鍵がいくつかあれば GPG_SIGNER (指紋か uid のメール) で選ぶ。
+# 認証は git.syui.ai への通信に環境の API 認証情報がつくのにまかせる
+# (GITEA_TOKEN があればそれを使う。ユーザーは GITEA_USER、既定 ai.syui.ai)。トークンはディスクに書かない
 set -e
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
-AI_GPG_KEY=${AI_GPG_KEY:-$GPG_KEY}
+
+usage() {
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
 
 # git に認証のヘッダを渡す (コマンドラインの -c なので、設定ファイルにもログにも残らない)。
 # トークンがなければ何もしない設定 (プロキシが認証をつける)
@@ -25,28 +32,27 @@ auth() {
   fi
 }
 
-# GPG_KEY (AI_GPG_KEY) を取りこみ、そのキーの uid と指紋を返す ("名前 <メール>" と指紋)
-import_key() {
-  if [ -n "$AI_GPG_KEY" ]; then
-    printf '%s\n' "$AI_GPG_KEY" | gpg --batch --quiet --import 2>/dev/null
-    list=$(printf '%s\n' "$AI_GPG_KEY" | gpg --batch --with-colons --import-options show-only --import 2>/dev/null)
-  else
-    # 鍵の束にある秘密鍵 (setup script などで取りこんだもの)
-    list=$(gpg --batch --with-colons --list-secret-keys 2>/dev/null)
-  fi
+# 鍵の束から署名に使う秘密鍵を選ぶ: fpr (指紋) と uid ("名前 <メール>")。なければ失敗
+find_key() {
+  list=$(gpg --batch --with-colons --list-secret-keys ${GPG_SIGNER:+"$GPG_SIGNER"} 2>/dev/null) || true
   fpr=$(printf '%s\n' "$list" | awk -F: '/^fpr:/ {print $10; exit}')
   uid=$(printf '%s\n' "$list" | awk -F: '/^uid:/ {print $10; exit}')
-  [ -n "$fpr" ] && [ -n "$uid" ]
+  if [ -z "$fpr" ] || [ -z "$uid" ]; then
+    echo "gpg の鍵の束に秘密鍵がありません (環境の setup script で gpg --import してください)" >&2
+    return 1
+  fi
 }
 
-# git の名前・メール・署名をキーに合わせる (引数のディレクトリのリポジトリ)
+# 引数のリポジトリのコミットを、その鍵の持ち主の名前と署名にする
 use_identity() {
-  import_key || return 0
+  find_key
   name=${uid% <*}
   mail=${uid##*<}
   mail=${mail%>}
   git -C "$1" config user.name "$name"
   git -C "$1" config user.email "$mail"
+  # この環境の git は SSH の鍵で署名する設定 (gpg.format=ssh) なので、GPG に戻す
+  git -C "$1" config gpg.format openpgp
   git -C "$1" config user.signingkey "$fpr"
   git -C "$1" config commit.gpgsign true
   echo "commits by $name <$mail>, signed with $fpr" >&2
@@ -60,7 +66,8 @@ case "$1" in
     git -c "$(auth)" push "$host/ai/os.git" unix:unix
     ;;
   repo)
-    [ -f repo/aarch64/aios.db ] || { echo "repo/aarch64/aios.db がありません (bin/mkrepo.sh)" >&2; exit 1; }
+    [ -f repo/aarch64/aios.db ] || { echo "repo/aarch64/aios.db がありません (bin/mkrepo.sh、または pkg ブランチの aarch64/ を repo/aarch64 へ)" >&2; exit 1; }
+    find_key
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$tmp/repo"
@@ -80,7 +87,6 @@ case "$1" in
     echo "ai/repo: pushed $(git rev-parse --short HEAD)"
     ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
-    exit 1
+    usage
     ;;
 esac
