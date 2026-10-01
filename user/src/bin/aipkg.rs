@@ -1,7 +1,7 @@
 // aipkg: pacman と同じ形式 (.pkg.tar.zst, .PKGINFO, repo の .db) を扱う小さなパッケージマネージャ
 //
 //   aipkg -S pkg...     リポジトリから入れる (依存も)
-//   aipkg -Sy / -Syu    データベースの更新 / 全部を新しくする
+//   aipkg -Sy / -Syu [pkg...]   データベースの更新 / 全部を新しくする (pkg も一緒に入れる)
 //   aipkg -Ss [word]    リポジトリを探す
 //   aipkg -Si pkg       リポジトリのパッケージの情報
 //   aipkg -U file...    パッケージファイルを入れる
@@ -591,7 +591,8 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
     }
 }
 
-fn upgrade_all(repos: &[Repo]) {
+/// -Su: 新しい版のあるものを全部。名前を渡されたら、それも一緒に入れる (pacman -Syu pkg と同じ)
+fn upgrade_all(repos: &[Repo], extra: &[String]) {
     let sync = sync_all(repos);
     let mut targets = vec![];
     for (name, (d, _)) in installed() {
@@ -601,11 +602,16 @@ fn upgrade_all(repos: &[Repo]) {
             }
         }
     }
+    for t in extra {
+        if !targets.contains(t) {
+            targets.push(t.clone());
+        }
+    }
     if targets.is_empty() {
         println!(" there is nothing to do");
         return;
     }
-    sync_install(repos, &targets, &[]);
+    sync_install(repos, &targets, extra);
 }
 
 fn info(d: &Desc, repo: Option<&str>) {
@@ -659,7 +665,7 @@ fn main() {
                 info(d, Some(&repos[*ri].name));
             }
         } else if flags.contains(&'u') {
-            upgrade_all(&repos);
+            upgrade_all(&repos, &targets);
         } else if !targets.is_empty() {
             sync_install(&repos, &targets, &targets);
         }
