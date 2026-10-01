@@ -1,4 +1,6 @@
 # ログインに使えるシェル
+/bin/aish
+/usr/bin/aish
 /bin/sh
 /usr/bin/sh
 /bin/bash

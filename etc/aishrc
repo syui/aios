@@ -1,12 +1,13 @@
-# /etc/shrc: 自作の sh (/bin/sh) が対話するときに読む。そのあと ~/.shrc を読む
+# /etc/aishrc: aish が対話するときに読む。そのあと ~/.aishrc を読む
+# (sh として呼ばれたときは読まない。POSIX の sh と同じく $ENV だけ)
 # ai/dot の .zshrc と同じ使いごこちに: alias、cd のあとの ls (chpwd)、powerline のプロンプト
 # キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
 
 alias ls='ls -a --color=auto'
 alias ll='ls -alh --color=auto'
 alias df='df -H'
-alias zs='${EDITOR:-vi} ~/.shrc'
-alias zr='exec /bin/sh'
+alias zs='${EDITOR:-vi} ~/.aishrc'
+alias zr='exec aish'
 alias u='sudo aipkg -Syu'
 
 HISTSIZE=10000
