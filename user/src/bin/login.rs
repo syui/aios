@@ -2,6 +2,8 @@
 //   -f USER は確かめずにログインする (自動ログイン用)
 #[path = "../lib/crypt.rs"]
 mod crypt;
+#[path = "../lib/term.rs"]
+mod term;
 #[path = "../lib/users.rs"]
 mod users;
 
@@ -41,6 +43,8 @@ fn main() {
             }
         },
     };
+    // シリアルのコンソールは画面の大きさを知らない (24x80) ので、端末に聞いて合わせる
+    term::fit(0);
     users::make_home(&user);
     if let Err(e) = users::become_user(&user) {
         eprintln!("login: {}", e);

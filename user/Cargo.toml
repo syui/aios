@@ -65,6 +65,10 @@ path = "src/bin/swapon.rs"
 name = "free"
 path = "src/bin/free.rs"
 
+[[bin]]
+name = "resize"
+path = "src/bin/resize.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"
