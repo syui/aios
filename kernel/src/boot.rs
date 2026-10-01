@@ -13,7 +13,10 @@
 //   TTBR1: KBASE + i GiB (1 GiB ブロック) = RAM の先頭 + (i - 1) GiB
 //     [0] 1 つ前の 1 GiB   デバイス (qemu virt: UART, GIC, virtio)
 //     [1] RAM              通常 (ラズパイは 2 MiB ずつの表にして 0x3f00_0000 から上をデバイス)
-//     [2], [3]             デバイス (ラズパイ: 0x4000_0000 の local intc)
+//     [2] .. [16]          RAM が 0 からでなければ (qemu virt) 通常 = RAM の 1 GiB から先 (MAX_RAM まで。
+//                          UEFI は DTB を RAM の上のほうに置く)。ラズパイは [2], [3] がデバイス
+//                          (0x4000_0000 の local intc)
+//     DTB で RAM の大きさがわかったら、memlayout::set_ram が RAM に合わせてなおす
 core::arch::global_asm!(
     r#"
 .equ MAIR_VALUE, 0xff00
@@ -157,13 +160,25 @@ primary:
     b       6f
 5:  orr     x3, x19, x5
     str     x3, [x1, #8]
-6:  // [2], [3]: 後ろの 2 GiB はデバイス
+6:  // [2] から: RAM が 0 からなら (ラズパイ) [2], [3] をデバイス
+    cbnz    x19, 7f
     add     x3, x19, x7
     orr     x3, x3, x6
     str     x3, [x1, #16]
     add     x3, x19, x7, lsl #1
     orr     x3, x3, x6
     str     x3, [x1, #24]
+    b       9f
+    // ほかは [2] .. [MAX_RAM_GIB] を RAM の続き (通常)。RAM の大きさがわかったら set_ram がなおす
+7:  mov     x10, #2
+    add     x9, x19, x7
+8:  orr     x3, x9, x5
+    str     x3, [x1, x10, lsl #3]
+    add     x9, x9, x7
+    add     x10, x10, #1
+    cmp     x10, #({max_ram_gib} + 1)
+    b.lo    8b
+9:
 
     adrp    x0, boot_l1_lo
     add     x0, x0, :lo12:boot_l1_lo
@@ -225,5 +240,6 @@ boot_l1_hi:
     .fill   512, 8, 0
 boot_l2_hi:
     .fill   512, 8, 0
-"#
+"#,
+    max_ram_gib = const crate::memlayout::MAX_RAM >> 30
 );

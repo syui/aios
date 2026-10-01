@@ -72,7 +72,7 @@ if [ -z "$uefi" ] && [ ! -f "$k" ]; then
   exit 1
 fi
 # ELF なら中身だけの Image に
-if [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
+if [ -n "$k" ] && [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
   objcopy=$(command -v llvm-objcopy || command -v rust-objcopy || command -v aarch64-linux-gnu-objcopy)
   # rustup component add llvm-tools の llvm-objcopy (Mac など)
   if [ -z "$objcopy" ] && command -v rustc >/dev/null; then

@@ -23,8 +23,8 @@ struct Kmem {
 
 unsafe impl Send for Kmem {}
 
-/// RAM のページごとの参照の数 (RAM は 1 GiB まで)
-const MAX_PAGES: usize = 1 << 18;
+/// RAM のページごとの参照の数 (RAM は memlayout::MAX_RAM まで)
+const MAX_PAGES: usize = crate::memlayout::MAX_RAM / PGSIZE;
 static mut REFS: [u16; MAX_PAGES] = [0; MAX_PAGES];
 
 fn ref_slot(page: *mut u8) -> &'static mut u16 {
