@@ -137,6 +137,8 @@ pub fn mount(path: &str, fsroot: InodeRef) -> Result<(), i64> {
 
 /// マウントしているすべてのファイルシステムを書き出す (sync)
 pub fn sync_all() {
+    // MAP_SHARED で書いたページを先にファイルへ
+    crate::vm::sync_shared();
     let roots: Vec<InodeRef> = unsafe {
         let mut v: Vec<InodeRef> = (*(&raw const ROOT)).iter().cloned().collect();
         v.extend((*(&raw const MOUNTS)).iter().map(|(_, r)| r.clone()));

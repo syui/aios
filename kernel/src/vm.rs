@@ -8,6 +8,11 @@
 // 書こうとしたときに、まだ共有されていれば写し、自分だけなら書けるように戻す (コピーオンライト)。
 // ページの共有の数は kalloc が持つ。
 //
+// MAP_SHARED のファイルは、(ファイルシステム, inode, ページ番号) ごとに 1 枚のページを共有する
+// (SHARED_FILE)。最初は読み取り専用で写し、書かれたら「書いた」印をつけて書けるようにする。
+// 書いたページは msync、munmap、プロセスの終わり、sync でファイルに書き戻す (ファイルの終わりの先は捨てる)。
+// read()/write() とは別なので、写している間に write() で書いたものは写しには映らない。
+//
 // PTE のうち、ハードウェアが見ないビットを使う:
 //   COW       (55) 書けるはずだが共有しているので読み取り専用にしてあるページ
 //   PROTNONE  (56) PROT_NONE にしたので無効にしてあるが、中身は持っているページ (VALID は 0)
@@ -44,6 +49,61 @@ pub const fn pg_down(a: usize) -> usize {
 
 pub const fn pg_up(a: usize) -> usize {
     (a + PGSIZE - 1) & !(PGSIZE - 1)
+}
+
+// ---- MAP_SHARED のファイルのページ ----
+
+type FileKey = (usize, u64, usize);
+
+struct Cached {
+    page: *mut u8,
+    dirty: bool,
+    ino: InodeRef,
+}
+
+/// 表も 1 つ参照を持つ。だれも写さなくなったら (参照が表だけになったら) 書き戻して捨てる
+static mut SHARED_FILE: BTreeMap<FileKey, Cached> = BTreeMap::new();
+
+fn shared_file() -> &'static mut BTreeMap<FileKey, Cached> {
+    unsafe { &mut *(&raw mut SHARED_FILE) }
+}
+
+fn file_key(ino: &InodeRef, off: usize) -> FileKey {
+    let (fs, i) = ino.id();
+    (fs, i, off / PGSIZE)
+}
+
+fn write_back(key: &FileKey, c: &Cached) {
+    let size = c.ino.meta().size as usize;
+    let off = key.2 * PGSIZE;
+    if off < size {
+        let n = (size - off).min(PGSIZE);
+        let data = unsafe { core::slice::from_raw_parts(c.page, n) };
+        if c.ino.write_at(off, data).is_err() {
+            println!("vm: write back of a shared mapping failed");
+        }
+    }
+}
+
+/// 書いたページをファイルに書き戻す (sync)。印はそのまま (まだ書けるように写っているかもしれない)
+pub fn sync_shared() {
+    for (k, c) in shared_file().iter().filter(|(_, c)| c.dirty) {
+        write_back(k, c);
+    }
+}
+
+/// keys のページを書き戻し、もうだれも写していないものは捨てる
+fn release_shared(keys: &[FileKey]) {
+    for k in keys {
+        let Some(c) = shared_file().get(k) else { continue };
+        if c.dirty {
+            write_back(k, c);
+        }
+        if kalloc::refs(c.page) <= 1 {
+            let c = shared_file().remove(k).unwrap();
+            kalloc::put(c.page);
+        }
+    }
 }
 
 /// 領域の中身のもと
@@ -221,6 +281,33 @@ impl PageTable {
         self.vmas.insert(addr, hi);
     }
 
+    /// [start, end) にある MAP_SHARED のファイルのページの鍵
+    fn shared_keys(&self, start: usize, end: usize) -> Vec<FileKey> {
+        let mut keys = Vec::new();
+        for (&s, v) in self.vmas.range(..end) {
+            if v.end <= start || !v.shared {
+                continue;
+            }
+            if let Backing::File { ino, off, .. } = &v.back {
+                let mut va = s.max(start);
+                while va < v.end.min(end) {
+                    keys.push(file_key(ino, off + (va - s)));
+                    va += PGSIZE;
+                }
+            }
+        }
+        keys
+    }
+
+    /// msync: 範囲の書いたページをファイルへ
+    pub fn msync(&self, start: usize, end: usize) {
+        for k in self.shared_keys(pg_down(start), pg_up(end)) {
+            if let Some(c) = shared_file().get(&k).filter(|c| c.dirty) {
+                write_back(&k, c);
+            }
+        }
+    }
+
     /// [start, end) に領域を置く (前にあったものは外す)。中身は触れたときに作る
     pub fn map(&mut self, start: usize, end: usize, prot: u8, shared: bool, back: Backing) -> Option<()> {
         if start >= end || end > MAXVA {
@@ -229,7 +316,7 @@ impl PageTable {
         self.unmap(start, end);
         self.vmas.insert(start, Vma { end, prot, shared, back });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
-        if shared {
+        if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
             while va < end {
                 self.fault_page(va, false, true).ok()?;
@@ -247,6 +334,7 @@ impl PageTable {
         }
         self.split(start);
         self.split(end);
+        let file_keys = self.shared_keys(start, end);
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(&k, _)| k).collect();
         for k in keys {
             self.vmas.remove(&k);
@@ -261,6 +349,7 @@ impl PageTable {
         for p in pages {
             kalloc::put(p);
         }
+        release_shared(&file_keys);
     }
 
     /// [start, end) のページを捨てる (領域は残す。次に触れたら作りなおす: MADV_DONTNEED)
@@ -303,6 +392,14 @@ impl PageTable {
         }
         for (s, e, shared) in shared_at {
             self.each_pte(s, e, |_, pte| unsafe { *pte = remake_pte(*pte, prot, shared) });
+        }
+        // 共有のファイルのページが書けるようになった: もう書いたものとして扱う
+        if prot & PROT_WRITE != 0 {
+            for k in self.shared_keys(start, end) {
+                if let Some(c) = shared_file().get_mut(&k) {
+                    c.dirty = true;
+                }
+            }
         }
         flush_all();
         Ok(())
@@ -368,6 +465,42 @@ impl PageTable {
         let page_va = pg_down(va);
         let pte = self.walk(page_va, true).ok_or(FaultErr::NoMem)?;
         let e = unsafe { *pte };
+        if let (true, Backing::File { ino, off, .. }) = (shared, &back) {
+            // MAP_SHARED のファイル: みんなで 1 枚のページ。書くときに印をつける
+            let key = file_key(ino, off + (page_va - start));
+            let wr = write || force;
+            let page = if has_page(e) {
+                page_of(e)
+            } else {
+                let page = match shared_file().get(&key) {
+                    Some(c) => c.page,
+                    None => {
+                        let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
+                        let size = ino.meta().size as usize;
+                        let foff = key.2 * PGSIZE;
+                        if foff < size {
+                            let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
+                            if ino.read_at(foff, buf).is_err() {
+                                kalloc::free(page);
+                                return Err(FaultErr::NoMem);
+                            }
+                        }
+                        shared_file().insert(key, Cached { page, dirty: false, ino: ino.clone() });
+                        page
+                    }
+                };
+                kalloc::get(page);
+                page
+            };
+            let c = shared_file().get_mut(&key).ok_or(FaultErr::NoMem)?;
+            if wr {
+                c.dirty = true;
+            }
+            let p = if c.dirty { prot } else { prot & !PROT_WRITE };
+            unsafe { *pte = make_pte(v2p(page as usize) as u64, p, false) };
+            flush_va(page_va);
+            return Ok(());
+        }
         if !has_page(e) {
             let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
             if let Backing::File { ino, off, fend } = &back {
@@ -484,7 +617,10 @@ impl PageTable {
                     return;
                 }
                 kalloc::get(page_of(*pte));
-                *pte = remake_pte(*pte, prot, shared);
+                // 共有の領域はそのまま (書いた印はページの表にある)。private は COW に
+                if !shared {
+                    *pte = remake_pte(*pte, prot, false);
+                }
                 match new.walk(va, true) {
                     Some(np) => *np = *pte,
                     None => {
@@ -532,6 +668,7 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
+        let file_keys = self.shared_keys(0, MAXVA);
         fn free_level(table: *mut u64, level: usize) {
             for i in 0..512 {
                 let e = unsafe { *table.add(i) };
@@ -546,5 +683,6 @@ impl Drop for PageTable {
             kalloc::free(table as *mut u8);
         }
         free_level(self.root, 1);
+        release_shared(&file_keys);
     }
 }
