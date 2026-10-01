@@ -615,6 +615,14 @@ impl PageTable {
         }
     }
 
+    /// va に決まったページを写す (vDSO)。ページはカーネルも持ちつづける
+    pub fn install(&mut self, va: usize, page: *mut u8, prot: u8) -> Option<()> {
+        let pte = self.walk(va, true)?;
+        kalloc::get(page);
+        unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
+        Some(())
+    }
+
     /// 大きなロックなしで、もう写っていて書けるページにだけ書く (clock_gettime などの速い道)。
     /// ページが写っていない・書けないなら false (ロックを取ってふつうの道で)
     pub fn copy_out_nofault(&self, dst: usize, src: &[u8]) -> bool {

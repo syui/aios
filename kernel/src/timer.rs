@@ -32,6 +32,7 @@ pub fn init() {
     };
     BOOT_EPOCH.store(epoch.saturating_sub(uptime_ns() / 1_000_000_000), Ordering::Relaxed);
     crate::irq::enable(IRQ);
+    crate::vdso::allow_counter();
     rearm();
 }
 
@@ -41,6 +42,11 @@ pub fn uptime_ns() -> u64 {
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt) };
     let f = freq();
     (cnt / f) * 1_000_000_000 + (cnt % f) * 1_000_000_000 / f
+}
+
+/// 起動したときの UNIX 秒 (vDSO の vvar に入れる)
+pub fn boot_epoch() -> u64 {
+    BOOT_EPOCH.load(Ordering::Relaxed)
 }
 
 pub fn epoch_ns() -> u64 {
@@ -54,6 +60,7 @@ pub fn ticks() -> u64 {
 /// 2 つめからの CPU: 自分のタイマを動かす
 pub fn init_cpu() {
     crate::irq::enable(IRQ);
+    crate::vdso::allow_counter();
     rearm();
 }
 

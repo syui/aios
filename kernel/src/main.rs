@@ -41,6 +41,7 @@ mod vfs;
 mod virtio;
 mod virtio_blk;
 mod virtio_net;
+mod vdso;
 mod vm;
 
 use core::panic::PanicInfo;
@@ -77,6 +78,7 @@ pub extern "C" fn kmain() -> ! {
     irq::init();
     irq::enable_ipi();
     timer::init();
+    vdso::init();
     uart::init();
     fs::init();
     net::init();
