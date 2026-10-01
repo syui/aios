@@ -1,9 +1,10 @@
 [Unit]
-Description=Show the message of the day
+Description=Show the logo, the system and /etc/motd (aios)
+After=swap.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/cat /etc/motd
+ExecStart=/bin/aios
 StandardInput=tty
 
 [Install]
