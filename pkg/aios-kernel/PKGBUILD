@@ -6,7 +6,7 @@
 # QEMU では bin/run.sh が disk.img を UEFI (AAVMF) で、なければ /boot/Image を直に起動する
 # initramfs は空にして作るので、ルートはディスク (bin/mkdisk.sh)
 pkgname=aios-kernel
-pkgver=0.1.0
+pkgver=0.0.1
 pkgrel=1
 pkgdesc='The aios kernel (aarch64: QEMU virt, UEFI, Raspberry Pi 3)'
 arch=('aarch64')
@@ -18,7 +18,7 @@ backup=(boot/loader/entries/aios.conf)
 
 pkgver() {
   cd "$startdir/../.."
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {

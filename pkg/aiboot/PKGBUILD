@@ -3,7 +3,7 @@
 # ESP (/boot) の既定の場所 EFI/BOOT/BOOTAA64.EFI に入るので、UEFI はこれを起動する。
 # すでに systemd-boot を使っている ESP なら、これは入れずに aios-kernel の entry だけでよい
 pkgname=aiboot
-pkgver=0.1.0
+pkgver=0.0.1
 pkgrel=1
 pkgdesc='A tiny UEFI boot loader that reads systemd-boot style loader entries'
 arch=('aarch64')
@@ -14,7 +14,7 @@ backup=(boot/loader/loader.conf)
 
 pkgver() {
   cd "$startdir/../.."
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD -- boot)" "$(git log -1 --format=%h -- boot)"
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- boot)" "$(git log -1 --format=%h -- boot)"
 }
 
 build() {
