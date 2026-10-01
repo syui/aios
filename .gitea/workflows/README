@@ -1,0 +1,3 @@
+gitea の Actions は .gitea/workflows があればこちらを読み、なければ .github/workflows を読む。
+unix ブランチのリリース (.github/workflows/unix.yml) は GitHub の arm64 のランナー
+(ubuntu-24.04-arm) で動かすので、gitea では何も動かさないようにここを置いておく。

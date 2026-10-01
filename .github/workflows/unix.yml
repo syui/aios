@@ -1,0 +1,106 @@
+# unix ブランチ: disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
+# リリース unix-latest に置く (main の latest とは別)
+#   aios-base, aios-kernel, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
+name: unix
+
+on:
+  push:
+    branches:
+    - unix
+    paths-ignore:
+    - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unix-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Release
+    # arm64 の Linux: aarch64 のパッケージをそのままビルドできる
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # パッケージの版 (0.0.1.rN) にコミットの数を使う
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl zstd fdisk dosfstools mtools e2fsprogs fakeroot \
+            qemu-system-arm qemu-efi-aarch64
+          # arm64 の Ubuntu では、ふつうの gcc が aarch64-linux-gnu-gcc (ring の C の部分に)
+          command -v aarch64-linux-gnu-gcc
+
+      - name: Install Rust
+        run: |
+          # edition 2024 なので新しい stable を
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarch64-unknown-uefi
+
+      - name: Build disk.img
+        run: |
+          git config user.name ai
+          git config user.email ai@syui.ai
+          AIOS_BUILD="aios-base aios-kernel aiboot" bin/mkrootfs.sh -r all
+          SWAP=256M bin/mkdisk.sh 1G
+
+      - name: Boot test
+        run: |
+          # UEFI → aiboot → カーネル → init → swap.service まで来るか
+          bin/run.sh < /dev/null > boot.log 2>&1 &
+          ok=
+          for i in $(seq 1 150); do
+            if grep -q '^aios init:' boot.log && grep -q '^swap: /dev/vda3' boot.log; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          sleep 5
+          pkill -f '^qemu-system-aarch64' || true
+          cat boot.log
+          [ -n "$ok" ]
+
+      - name: Assets
+        run: |
+          mkdir release
+          zstd -q -19 -T0 disk.img -o release/aios-unix-aarch64.img.zst
+          start=$(od -An -tu8 -j $((1024 + 32)) -N 8 disk.img | tr -d ' ')
+          mcopy -n -i "disk.img@@$((start * 512))" ::/Image release/Image
+          cp bin/run-image.sh release/run.sh
+          ver=$(ls repo/aarch64/aios-kernel-*.pkg.tar.zst | sed 's|.*/aios-kernel-||; s|-aarch64.pkg.tar.zst||')
+          echo "VER=$ver" >> "$GITHUB_ENV"
+          (cd release && sha256sum * > SHA256SUMS)
+          cat release/SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > notes.md <<NOTES
+          aios (unix) ${VER} (${GITHUB_SHA::7}), aarch64
+
+          \`\`\`sh
+          brew install qemu zstd        # Linux なら qemu-system-arm zstd
+          zstd -d aios-unix-aarch64.img.zst -o disk.img
+          chmod +x run.sh && ./run.sh   # Image と disk.img を同じディレクトリに
+          \`\`\`
+
+          disk.img: GPT (p1 ESP = /boot, p2 ext4 = /, p3 swap 256 MiB)。終わるのは Ctrl-a x か sudo poweroff
+          NOTES
+          gh release delete unix-latest --yes --cleanup-tag || true
+          gh release create unix-latest release/* --title "unix-latest (${VER})" --notes-file notes.md --target "$GITHUB_SHA" --prerelease

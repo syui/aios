@@ -5,6 +5,8 @@
 #   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
 #   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
 #                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
+#   AIOS_BUILD="aios-base aios-kernel" bin/mkrootfs.sh -r all
+#                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
 # aios-base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
 # repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
@@ -36,6 +38,12 @@ if [ -n "$remote" ]; then
   mkdir "$tmp/db"
   tar -xzf "$tmp/aios.db" -C "$tmp/db"
 fi
+
+# built NAME: -r でも、ここでビルドするパッケージか (AIOS_BUILD)
+built() {
+  case " $AIOS_BUILD " in *" $1 "*) return 0 ;; esac
+  return 1
+}
 
 # fetch NAME: aios.db にある NAME のパッケージを repo/aarch64 に取ってくる (チェックサムを確かめる)
 fetch() {
@@ -98,7 +106,7 @@ install() {
   case "$done" in *" $1 "*) return 0 ;; esac
   done="$done$1 "
   [ -f "pkg/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
-  if [ -n "$remote" ]; then
+  if [ -n "$remote" ] && ! built "$1"; then
     fetch "$1"
   else
     f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
@@ -116,7 +124,9 @@ install() {
   done
 }
 
-[ -n "$remote" ] || bin/mkpkg.sh pkg/aios-base
+if [ -z "$remote" ] || built aios-base; then
+  bin/mkpkg.sh pkg/aios-base
+fi
 [ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
 for pkg in aios-base "$@"; do
   install "$pkg"
