@@ -56,7 +56,7 @@ jobs:
           git config user.name ai
           git config user.email ai@syui.ai
           AIOS_BUILD="aios-base aios-kernel aiboot" bin/mkrootfs.sh -r all
-          SWAP=256M bin/mkdisk.sh 1G
+          SWAP=256M bin/mkdisk.sh 3G
 
       - name: Boot test
         run: |
