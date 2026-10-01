@@ -34,6 +34,7 @@ const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
+const AT_SYSINFO_EHDR: u64 = 33;
 
 pub struct Image {
     /// setuid / setgid のビットで変わる euid / egid
@@ -188,6 +189,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         return Err(-E2BIG);
     }
     let args_area = pg_up(strs + ptrs_size + 64);
+    crate::vdso::map(&mut pt).ok_or(-ENOMEM)?;
     pt.map(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, PROT_RW, false, Backing::Anon).ok_or(-ENOMEM)?;
 
     // 文字列を天辺から積む
@@ -226,6 +228,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_SECURE, 0),
         (AT_RANDOM, random as u64),
         (AT_EXECFN, execfn as u64),
+        (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64),
         (AT_NULL, 0),
     ];
     let words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
