@@ -3,14 +3,61 @@
 #   bin/mkrootfs.sh                  aios-base (init, sh, aipkg, ... と /etc) だけ
 #   bin/mkrootfs.sh grep sed ...     pkg/NAME のパッケージも入れる
 #   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
+#   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
+#                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
 # aios-base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
 # repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
 set -e
 cd "$(dirname "$0")/.."
 
+remote=
+if [ "$1" = -r ]; then
+  remote=1
+  shift
+fi
+server=${AIOS_SERVER:-https://git.syui.ai/ai/repo/raw/branch/main/aarch64}
+
+# sha256sum がなければ (Mac) shasum で
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+
 rm -rf rootfs
 mkdir rootfs
+mkdir -p repo/aarch64
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# -r: リポジトリの aios.db (desc の tar.gz) を読んでおく
+if [ -n "$remote" ]; then
+  echo "rootfs: packages from $server"
+  curl -fsSL "$server/aios.db" -o "$tmp/aios.db"
+  mkdir "$tmp/db"
+  tar -xzf "$tmp/aios.db" -C "$tmp/db"
+fi
+
+# fetch NAME: aios.db にある NAME のパッケージを repo/aarch64 に取ってくる (チェックサムを確かめる)
+fetch() {
+  d=
+  for x in "$tmp/db/$1"-[0-9]*; do
+    [ "$(sed -n '/^%NAME%$/{n;p;}' "$x/desc")" = "$1" ] && d=$x
+  done
+  [ -n "$d" ] || { echo "not in $server: $1" >&2; exit 1; }
+  file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
+  sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
+  if [ ! -f "repo/aarch64/$file" ]; then
+    echo "fetch: $file"
+    curl -fsSL "$server/$file" -o "repo/aarch64/$file.part"
+    mv "repo/aarch64/$file.part" "repo/aarch64/$file"
+  fi
+  if [ -n "$sum" ] && [ "$(sha256 "repo/aarch64/$file")" != "$sum" ]; then
+    echo "$file: checksum mismatch" >&2
+    rm -f "repo/aarch64/$file"
+    exit 1
+  fi
+  f=repo/aarch64/$file
+}
 
 # register FILE: 入れたパッケージを aipkg の記録 (desc と files) に書く
 register() {
@@ -38,7 +85,7 @@ register() {
   if [ -n "$backup" ]; then
     echo '%BACKUP%' >> "$dir/desc"
     for b in $backup; do
-      printf '%s\t%s\n' "$b" "$(sha256sum "rootfs/$b" | cut -d' ' -f1)" >> "$dir/desc"
+      printf '%s\t%s\n' "$b" "$(sha256 "rootfs/$b")" >> "$dir/desc"
     done
     echo >> "$dir/desc"
   fi
@@ -51,7 +98,11 @@ install() {
   case "$done" in *" $1 "*) return 0 ;; esac
   done="$done$1 "
   [ -f "pkg/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
-  f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
+  if [ -n "$remote" ]; then
+    fetch "$1"
+  else
+    f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
+  fi
   if [ -z "$f" ]; then
     bin/mkpkg.sh "pkg/$1"
     f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
@@ -65,7 +116,7 @@ install() {
   done
 }
 
-bin/mkpkg.sh pkg/aios-base
+[ -n "$remote" ] || bin/mkpkg.sh pkg/aios-base
 [ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
 for pkg in aios-base "$@"; do
   install "$pkg"

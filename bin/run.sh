@@ -25,7 +25,8 @@ gpt=
 if [ -z "$k" ] && [ -n "$gpt" ]; then
   if [ -z "$AIOS_CMDLINE" ]; then
     for f in "$AIOS_EFI_CODE" /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd /usr/share/AAVMF/AAVMF_CODE.fd \
-      /usr/share/edk2/aarch64/QEMU_CODE.fd /usr/share/edk2-armvirt/aarch64/QEMU_CODE.fd /usr/share/qemu/edk2-aarch64-code.fd; do
+      /usr/share/edk2/aarch64/QEMU_CODE.fd /usr/share/edk2-armvirt/aarch64/QEMU_CODE.fd /usr/share/qemu/edk2-aarch64-code.fd \
+      /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd; do
       [ -n "$f" ] && [ -f "$f" ] && { uefi=$f; break; }
     done
   fi
@@ -51,6 +52,12 @@ if [ -z "$uefi" ]; then [ -n "$k" ] && [ -f "$k" ] || k=$dev; fi
 # ELF なら中身だけの Image に
 if [ "$(head -c 4 "$k" | od -An -c | tr -d ' ')" = '177ELF' ]; then
   objcopy=$(command -v llvm-objcopy || command -v rust-objcopy || command -v aarch64-linux-gnu-objcopy)
+  # rustup component add llvm-tools の llvm-objcopy (Mac など)
+  if [ -z "$objcopy" ] && command -v rustc >/dev/null; then
+    for f in "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-objcopy; do
+      [ -x "$f" ] && objcopy=$f
+    done
+  fi
   if [ -n "$objcopy" ] && "$objcopy" -O binary "$k" "$tmp/Image"; then
     k=$tmp/Image
   fi
@@ -82,7 +89,8 @@ if [ -n "$uefi" ]; then
     if [ "$tmpl" != "$uefi" ] && [ -f "$tmpl" ]; then
       cp "$tmpl" "$vars"
     else
-      truncate -s "$(wc -c < "$uefi")" "$vars"
+      # truncate のない Mac でも
+      dd if=/dev/zero of="$vars" bs=1 count=0 seek="$(wc -c < "$uefi" | tr -d ' ')" 2>/dev/null
     fi
   fi
   echo "boot: UEFI ($uefi) from disk.img" >&2
