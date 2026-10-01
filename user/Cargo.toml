@@ -69,6 +69,10 @@ path = "src/bin/free.rs"
 name = "resize"
 path = "src/bin/resize.rs"
 
+[[bin]]
+name = "aios"
+path = "src/bin/aios.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"

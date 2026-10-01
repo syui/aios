@@ -1,4 +1,2 @@
-
-  aios (unix) - aarch64
-  systemctl list-units / journalctl -u UNIT / aipkg -S PKG
+  systemctl list-units / journalctl -u UNIT / aipkg -S PKG / aios
 

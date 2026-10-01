@@ -35,7 +35,7 @@ package() {
   ln -s usr/bin "$pkgdir/bin"
   ln -s usr/bin "$pkgdir/sbin"
   ln -s bin "$pkgdir/usr/sbin"
-  for p in init sh aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize; do
+  for p in init sh aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす
