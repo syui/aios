@@ -417,6 +417,11 @@ pub fn console() -> TtyRef {
     }
 }
 
+/// コンソールがふつうの (行ごとの) モードか。1 文字ずつ読むプログラム (シェルの行の編集など) なら false
+pub fn console_canonical() -> bool {
+    console().borrow().canon()
+}
+
 fn ptys() -> &'static mut Vec<Option<TtyRef>> {
     unsafe { &mut *(&raw mut PTYS) }
 }
