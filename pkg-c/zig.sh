@@ -1,7 +1,7 @@
 # C の拡張 (pkg-c/) を作るときの Zig。PKGBUILD の build() で読む:
 #   . "$startdir/../zig.sh"; zig_env
 # このマシン (Linux / Mac、aarch64 / x86_64) の公式の Zig を build/zig/ に取ってきて (sha256 を確かめる)、
-# aios 用 (aarch64-linux-musl、静的) の CC CXX AR RANLIB を用意する。aios の中の aios-devel と同じ Zig
+# aios 用 (aarch64-linux-musl、静的) の CC CXX AR RANLIB を用意する。aios の中の base-devel と同じ Zig
 # 入れる場所は /opt/c (PREFIX)
 ZIG_VERSION=0.16.0
 PREFIX=/opt/c

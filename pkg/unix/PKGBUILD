@@ -1,11 +1,11 @@
-# aios のカーネル。Linux の arm64 Image 形式で /boot/Image に置く
+# unix: aios のカーネル (Arch の linux にあたる)。Linux の arm64 Image 形式で /boot/Image に置く
 # (Arch ARM の linux-aarch64 と同じ場所。QEMU もラズパイのファームウェアもこの形式を起動でき、DTB を渡してくれる)
 # EFI スタブつきで、UEFI からは loader entry (/boot/loader/entries/aios.conf) を読む
 # ブートローダー (aiboot か systemd-boot) が起動する。/boot は ESP (bin/mkdisk.sh)
 # root= などは entry の options に書く (なければ最初の Linux root の区画)
 # QEMU では bin/run.sh が disk.img を UEFI (AAVMF) で、なければ /boot/Image を直に起動する
 # initramfs は空にして作るので、ルートはディスク (bin/mkdisk.sh)
-pkgname=aios-kernel
+pkgname=unix
 pkgver=0.0.1
 pkgrel=1
 pkgdesc='The aios kernel (aarch64: QEMU virt, UEFI, Raspberry Pi 3)'
