@@ -2,7 +2,8 @@
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
-#   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ (署名つきのコミット)
+#   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ (署名つきのコミット)。
+#                        repo/aarch64-c (C の拡張、aios-c.db) があれば aarch64-c/ へも
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -18,7 +19,7 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -72,17 +73,24 @@ case "$1" in
     trap 'rm -rf "$tmp"' EXIT
     git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$tmp/repo"
     use_identity "$tmp/repo"
-    # aarch64/ をこのリポジトリの repo/aarch64 と同じにする
+    # aarch64/ (と aarch64-c/) をこのリポジトリの repo/ と同じにする
+    dirs=aarch64
     rm -rf "$tmp/repo/aarch64"
     mkdir -p "$tmp/repo/aarch64"
     cp repo/aarch64/*.pkg.tar.zst repo/aarch64/aios.db repo/aarch64/aios.db.tar.gz "$tmp/repo/aarch64/"
+    if [ -f repo/aarch64-c/aios-c.db ]; then
+      dirs="$dirs aarch64-c"
+      rm -rf "$tmp/repo/aarch64-c"
+      mkdir -p "$tmp/repo/aarch64-c"
+      cp repo/aarch64-c/*.pkg.tar.zst repo/aarch64-c/aios-c.db repo/aarch64-c/aios-c.db.tar.gz "$tmp/repo/aarch64-c/"
+    fi
     cd "$tmp/repo"
-    git add -A aarch64
+    git add -A $dirs
     if git diff --cached --quiet; then
       echo "ai/repo: no change"
       exit 0
     fi
-    git commit -q -m "aarch64: update packages" -m "$(git diff --cached --name-status | sed 's/^/  /')"
+    git commit -q -m "$(echo $dirs | tr ' ' ,): update packages" -m "$(git diff --cached --name-status | sed 's/^/  /')"
     git -c "$(auth)" push -q origin main
     echo "ai/repo: pushed $(git rev-parse --short HEAD)"
     ;;

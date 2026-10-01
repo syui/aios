@@ -1,0 +1,24 @@
+# aios-devel: aios の中で C をビルドする道具 (Arch の base-devel のようなもの)
+#   aipkg -S aios-devel
+# cc / c++ / ar / ranlib は Zig を呼ぶだけ。できるのは aios で動く静的なバイナリ (aarch64-linux-musl)
+# 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
+pkgname=aios-devel
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'
+arch=('any')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('zig')
+
+package() {
+  local d=$pkgdir/opt/c/bin
+  install -d "$d"
+  w() { printf '#!/bin/sh\nexec /opt/zig/zig %s "$@"\n' "$2" > "$d/$1"; chmod 755 "$d/$1"; }
+  w cc 'cc -target aarch64-linux-musl -static'
+  w gcc 'cc -target aarch64-linux-musl -static'
+  w c++ 'c++ -target aarch64-linux-musl -static'
+  w g++ 'c++ -target aarch64-linux-musl -static'
+  w ar ar
+  w ranlib ranlib
+}
