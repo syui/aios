@@ -1,11 +1,11 @@
 #!/bin/bash
 # repo-add の代わり: DIR の *.pkg.tar.zst から同期データベース DIR/REPO.db を作りなおす
-#   bin/mkrepo.sh [DIR] [REPO]    (既定は repo/aarch64 と aios)
+#   bin/mkrepo.sh [DIR] [REPO]    (既定は repo/aarch64 と aios。C の拡張は repo/aarch64-c aios-c)
 # できた DIR をそのまま git.syui.ai/ai/repo の aarch64/ に置けば
 # aipkg.conf の Server = https://git.syui.ai/ai/repo/raw/branch/main/$arch で読める
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
-dir=${1:-$root/repo/aarch64}
+dir=$(cd "${1:-$root/repo/aarch64}" && pwd)
 repo=${2:-aios}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

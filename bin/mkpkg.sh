@@ -5,11 +5,13 @@
 # Arch の上なら本物の makepkg でも同じものができる: cd pkg/NAME && CARCH=aarch64 makepkg
 #
 # できること: source の git+URL (#tag= #commit= #branch=)、http(s)、PKGBUILD の横のファイル、
-#   pkgver()、prepare()、build()、package()。check() や分割パッケージ、アーカイブの展開はしない
+#   sha256sums (SKIP 以外は確かめる)、pkgver()、prepare()、build()、package()。
+#   check() や分割パッケージ、アーカイブの展開はしない (prepare() で tar xf する)
+# C の拡張 (pkg-c/NAME) は repo/aarch64-c/ に置く
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 CARCH=aarch64
-PKGDEST=${PKGDEST:-$root/repo/$CARCH}
+PKGDEST=${PKGDEST:-}
 # 作った人: PACKAGER がなければ git の user.name と user.email (makepkg の PACKAGER と同じ形)
 if [ -z "$PACKAGER" ]; then
   name=$(git -C "$root" config user.name 2>/dev/null)
@@ -18,7 +20,11 @@ if [ -z "$PACKAGER" ]; then
   PACKAGER=${PACKAGER:-Unknown Packager}
 fi
 export CARCH PACKAGER
-mkdir -p "$PKGDEST"
+
+# sha256 FILE: (Mac なら shasum)
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
 
 # fetch_git DIR URL FRAGMENT: DIR に URL の指定された版だけを取ってくる
 fetch_git() {
@@ -48,6 +54,12 @@ pkginfo() {
 
 make_one() (
   startdir=$(cd "$1" && pwd)
+  # pkg-c/ (C の拡張) は別のリポジトリへ
+  dest=$PKGDEST
+  if [ -z "$dest" ]; then
+    case $startdir in "$root"/pkg-c/*) dest=$root/repo/$CARCH-c ;; *) dest=$root/repo/$CARCH ;; esac
+  fi
+  mkdir -p "$dest"
   cd "$startdir"
   # shellcheck disable=SC1091
   source ./PKGBUILD
@@ -57,7 +69,10 @@ make_one() (
   export startdir srcdir pkgdir
   mkdir -p "$srcdir"
 
+  i=0
   for s in "${source[@]}"; do
+    want=${sha256sums[$i]:-SKIP}
+    i=$((i + 1))
     name=
     src=$s
     case $s in *::*) name=${s%%::*}; src=${s#*::} ;; esac
@@ -72,7 +87,15 @@ make_one() (
         ;;
       *://*)
         [ -n "$name" ] || name=${src##*/}
-        [ -f "$srcdir/$name" ] || curl -fL -o "$srcdir/$name" "$src"
+        if [ ! -f "$srcdir/$name" ]; then
+          curl -fL -o "$srcdir/$name.part" "$src"
+          mv "$srcdir/$name.part" "$srcdir/$name"
+        fi
+        if [ "$want" != SKIP ] && [ "$(sha256 "$srcdir/$name")" != "$want" ]; then
+          echo "mkpkg: $name: sha256 mismatch" >&2
+          rm -f "$srcdir/$name"
+          exit 1
+        fi
         ;;
       *)
         [ -n "$name" ] || name=$src
@@ -121,8 +144,8 @@ make_one() (
   } > "$pkgdir/.PKGINFO"
 
   # 同じパッケージの古い版は消す
-  rm -f "$PKGDEST/$pkgname"-[0-9]*-[0-9]*-"$pkgarch".pkg.tar.zst
-  out=$PKGDEST/$pkgname-$fullver-$pkgarch.pkg.tar.zst
+  rm -f "$dest/$pkgname"-[0-9]*-[0-9]*-"$pkgarch".pkg.tar.zst
+  out=$dest/$pkgname-$fullver-$pkgarch.pkg.tar.zst
   cd "$pkgdir"
   # .PKGINFO を先頭に、持ち主は root で
   mapfile -t top < <(LC_ALL=C ls -A | grep -vx '.PKGINFO')
