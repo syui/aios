@@ -1,13 +1,13 @@
 # aios (aarch64) の土台: init, sh, aipkg, systemctl, login などと /etc、ファイルシステムの並び
-# このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/aios-base
-pkgname=aios-base
+# このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/base
+pkgname=base
 pkgver=0.0.1
 pkgrel=1
 pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which, swapon and /etc'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
-# aios-base + aios-kernel + aiboot で使える aios になる (Arch の base + linux のように)。
+# base + unix + aiboot で使える aios になる (Arch の base + linux のように)。
 # ログインシェルは自作の sh (/bin/sh)。bash (brush) は予備として入れておく。awk は作りかけなので入れない
 depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush')
 makedepends=('rustup')

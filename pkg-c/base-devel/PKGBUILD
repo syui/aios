@@ -1,8 +1,8 @@
-# aios-devel: aios の中で C をビルドする道具 (Arch の base-devel のようなもの)
-#   aipkg -S aios-devel
+# base-devel: aios の中で C をビルドする道具 (Arch の base-devel のようなもの)
+#   aipkg -S base-devel
 # cc / c++ / ar / ranlib は Zig を呼ぶだけ。できるのは aios で動く静的なバイナリ (aarch64-linux-musl)
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
-pkgname=aios-devel
+pkgname=base-devel
 pkgver=0.0.1
 pkgrel=1
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'

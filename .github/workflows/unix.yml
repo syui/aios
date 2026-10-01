@@ -1,6 +1,6 @@
 # unix ブランチ: disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
 # リリース unix-latest に aios-unix-aarch64.img.zst を置く (main の latest とは別)。使いかたは bin/run.sh
-#   aios-base, aios-kernel, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
+#   base, unix, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
 name: unix
 
 on:
@@ -55,7 +55,7 @@ jobs:
         run: |
           git config user.name ai
           git config user.email ai@syui.ai
-          AIOS_BUILD="aios-base aios-kernel aiboot" bin/mkrootfs.sh -r all
+          AIOS_BUILD="base unix aiboot" bin/mkrootfs.sh -r all
           SWAP=256M bin/mkdisk.sh 3G
 
       - name: Boot test
@@ -84,7 +84,7 @@ jobs:
         run: |
           mkdir release
           zstd -q -19 -T0 disk.img -o release/aios-unix-aarch64.img.zst
-          ver=$(ls repo/aarch64/aios-kernel-*.pkg.tar.zst | sed 's|.*/aios-kernel-||; s|-aarch64.pkg.tar.zst||')
+          ver=$(ls repo/aarch64/unix-*.pkg.tar.zst | sed 's|.*/unix-||; s|-aarch64.pkg.tar.zst||')
           echo "VER=$ver" >> "$GITHUB_ENV"
 
       - name: Release

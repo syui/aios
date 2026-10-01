@@ -1,13 +1,13 @@
 #!/bin/sh
 # パッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
-#   bin/mkrootfs.sh                  aios-base (init, sh, aipkg, ... と /etc) とその依存 (coreutils など)
+#   bin/mkrootfs.sh                  base (init, sh, aipkg, ... と /etc) とその依存 (coreutils など)
 #   bin/mkrootfs.sh grep sed ...     pkg/NAME のパッケージも入れる
 #   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
 #   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
 #                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
-#   AIOS_BUILD="aios-base aios-kernel" bin/mkrootfs.sh -r all
+#   AIOS_BUILD="base unix" bin/mkrootfs.sh -r all
 #                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
-# aios-base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
+# base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
 # repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
 set -e
@@ -124,10 +124,10 @@ install() {
   done
 }
 
-if [ -z "$remote" ] || built aios-base; then
-  bin/mkpkg.sh pkg/aios-base
+if [ -z "$remote" ] || built base; then
+  bin/mkpkg.sh pkg/base
 fi
-[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^aios-base$')
-for pkg in aios-base "$@"; do
+[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^base$')
+for pkg in base "$@"; do
   install "$pkg"
 done
