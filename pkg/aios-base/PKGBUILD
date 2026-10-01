@@ -1,7 +1,7 @@
 # aios (aarch64) の土台: init, sh, aipkg, systemctl, login などと /etc、ファイルシステムの並び
 # このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/aios-base
 pkgname=aios-base
-pkgver=0.1.0
+pkgver=0.0.1
 pkgrel=1
 pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which, swapon and /etc'
 arch=('aarch64')
@@ -16,7 +16,7 @@ backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
 
 pkgver() {
   cd "$startdir/../.."
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
@@ -35,7 +35,7 @@ package() {
   ln -s usr/bin "$pkgdir/bin"
   ln -s usr/bin "$pkgdir/sbin"
   ln -s bin "$pkgdir/usr/sbin"
-  for p in init sh aipkg fetch systemctl journalctl login passwd su which mkswap swapon free; do
+  for p in init sh aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす
