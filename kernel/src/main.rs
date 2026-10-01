@@ -31,6 +31,7 @@ mod rand;
 mod signal;
 mod socket;
 mod spinlock;
+mod swap;
 mod syscall;
 mod sysfile;
 mod timer;

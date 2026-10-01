@@ -53,6 +53,18 @@ path = "src/bin/passwd.rs"
 name = "su"
 path = "src/bin/su.rs"
 
+[[bin]]
+name = "mkswap"
+path = "src/bin/mkswap.rs"
+
+[[bin]]
+name = "swapon"
+path = "src/bin/swapon.rs"
+
+[[bin]]
+name = "free"
+path = "src/bin/free.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"

@@ -34,6 +34,11 @@ pub fn init() -> bool {
     true
 }
 
+/// ディスクのセクタ数
+pub fn capacity() -> Option<u64> {
+    unsafe { (*(&raw const DISK)).as_ref().map(|d| d.capacity) }
+}
+
 fn disk() -> &'static mut Disk {
     unsafe { (*(&raw mut DISK)).as_mut().expect("no disk") }
 }

@@ -337,6 +337,19 @@ pub fn nprocs() -> usize {
     procs().iter().filter(|p| p.state != State::Unused).count()
 }
 
+/// 使われているアドレス空間ごとに 1 回 f (スレッドで共有しているものも 1 回)
+pub fn each_pagetable(mut f: impl FnMut(&mut PageTable)) {
+    let mut seen: Vec<usize> = Vec::new();
+    for p in procs().iter() {
+        let Some(mm) = p.mm.as_ref().filter(|_| p.state != State::Unused) else { continue };
+        if seen.contains(&mm.id()) {
+            continue;
+        }
+        seen.push(mm.id());
+        f(&mut mm.get().pt);
+    }
+}
+
 core::arch::global_asm!(
     r#"
 .section .text

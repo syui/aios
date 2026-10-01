@@ -34,6 +34,8 @@ mod nr {
     pub const GETCWD: u64 = 17;
     pub const FLOCK: u64 = 32;
     pub const MKNODAT: u64 = 33;
+    pub const SWAPON: u64 = 224;
+    pub const SWAPOFF: u64 = 225;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
     pub const SYMLINKAT: u64 = 36;
@@ -212,6 +214,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         MKNODAT => sysfile::mknodat(int(a[0]), a[1] as usize, a[2], a[3]),
+        SWAPON => sysfile::swapon(a[0] as usize),
+        SWAPOFF => sysfile::swapoff(a[0] as usize),
         MKDIRAT => sysfile::mkdirat(int(a[0]), a[1] as usize, a[2]),
         UNLINKAT => sysfile::unlinkat(int(a[0]), a[1] as usize, a[2]),
         SYMLINKAT => sysfile::symlinkat(a[0] as usize, int(a[1]), a[2] as usize),
@@ -459,6 +463,9 @@ fn sys_sysinfo(buf: usize) -> R {
     b[0..8].copy_from_slice(&(timer::uptime_ns() / 1_000_000_000).to_le_bytes());
     b[32..40].copy_from_slice(&(ram_size() as u64).to_le_bytes());
     b[40..48].copy_from_slice(&((crate::kalloc::nfree() * PGSIZE) as u64).to_le_bytes());
+    let (st, sf) = crate::swap::totals();
+    b[56..64].copy_from_slice(&((st * PGSIZE) as u64).to_le_bytes());
+    b[64..72].copy_from_slice(&((sf * PGSIZE) as u64).to_le_bytes());
     b[80..82].copy_from_slice(&(proc::nprocs() as u16).to_le_bytes());
     b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
     out(buf, &b)?;

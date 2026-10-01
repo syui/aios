@@ -1643,7 +1643,7 @@ impl ExtInode {
         r.set_links(if is_dir { 2 } else { 1 });
         let long_link = matches!(&node, NewNode::Symlink(t) if t.len() >= 60);
         match &node {
-            NewNode::Dev(ma, mi) => r.set_block(0, (ma << 8) | mi),
+            NewNode::Dev(ma, mi) | NewNode::Blk(ma, mi) => r.set_block(0, (ma << 8) | mi),
             NewNode::Symlink(t) if t.len() < 60 => {
                 r.0[40..40 + t.len()].copy_from_slice(t.as_bytes());
                 r.set_size(t.len() as u64);

@@ -62,6 +62,20 @@ fn setup_dirs(mtab: &str) {
     ] {
         let _ = dev.create(name, mode, NewNode::Dev(ma, mi));
     }
+    // ディスクと区画 (/dev/vda, /dev/vda1, ...)
+    for p in crate::block::parts() {
+        let (ma, mi) = crate::block::dev_of_part(&p);
+        let name = crate::block::part_name(&p);
+        let name = name.trim_start_matches("/dev/");
+        // 前の起動で作ったもの (ディスクのルート) が違う番号なら作りなおす
+        if let Ok(old) = dev.lookup(name) {
+            if old.meta().rdev == ((ma as u64) << 8 | mi as u64) && old.meta().mode & S_IFMT == vfs::S_IFBLK {
+                continue;
+            }
+            let _ = dev.unlink(name, false);
+        }
+        let _ = dev.create(name, 0o660, NewNode::Blk(ma, mi));
+    }
     // 疑似端末の子の口 (/dev/pts/N) は ptmx を開くたびにここへ作る
     let _ = vfs::mkdir_p("dev/pts", 0o755);
     let tmp = vfs::mkdir_p("tmp", 0o1777).expect("mkdir /tmp");
@@ -85,5 +99,5 @@ fn setup_dirs(mtab: &str) {
 /// デバイスファイルなら (major, minor)
 pub fn dev_of(i: &InodeRef) -> Option<(u32, u32)> {
     let m = i.meta();
-    (m.mode & S_IFMT == vfs::S_IFCHR).then_some(((m.rdev >> 8) as u32, (m.rdev & 0xff) as u32))
+    matches!(m.mode & S_IFMT, vfs::S_IFCHR | vfs::S_IFBLK).then_some(((m.rdev >> 8) as u32, (m.rdev & 0xff) as u32))
 }

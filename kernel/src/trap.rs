@@ -175,6 +175,8 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
         }
         EL0_SYNC => {
             let (esr, far) = esr_far();
+            // 空きが少なければ、使っていないページをスワップへ
+            crate::swap::balance();
             match esr >> 26 {
                 EC_SVC64 => {
                     let intr = syscall::dispatch(tf);
@@ -188,7 +190,12 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                     let mut fault = None;
                     if (ec == EC_IABT_LOW || ec == EC_DABT_LOW) && (4..=15).contains(&fsc) {
                         let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0;
-                        match proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW) {
+                        let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
+                        // 足りなければ自分のページもスワップへ追い出して、もう一度
+                        if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::swap::reclaim(crate::swap::BATCH, 0) > 0 {
+                            r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
+                        }
+                        match r {
                             Ok(()) => {
                                 proc::check_killed();
                                 signal::deliver(tf, None);

@@ -46,6 +46,8 @@ pub enum Kind {
     EventFd(crate::epoll::EventFdRef),
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
+    /// ディスクか区画 (/dev/vda2 など)。セクタに合わないところは読んでから書く
+    Block(crate::block::Part),
 }
 
 impl Kind {
@@ -235,6 +237,11 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
+            Kind::Block(p) => {
+                let n = blk_read(p, self.offset, dst)?;
+                self.offset += n;
+                Ok(n)
+            }
             Kind::PipeWrite(_) => Err(-EBADF),
             k => read_stream(k, dst, self.flags & O_NONBLOCK != 0),
         }
@@ -263,6 +270,11 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
+            Kind::Block(p) => {
+                let n = blk_write(p, self.offset, src)?;
+                self.offset += n;
+                Ok(n)
+            }
             Kind::PipeRead(_) => Err(-EBADF),
             k => write_stream(k, src, self.flags & O_NONBLOCK != 0),
         }
@@ -270,7 +282,7 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
-        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random) {
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_)) {
             if let Ok(i) = vfs::resolve("", &self.describe(), true) {
                 return Stat::of_inode(&i);
             }
@@ -282,6 +294,10 @@ impl OpenFile {
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
+            Kind::Block(p) => {
+                let (ma, mi) = crate::block::dev_of_part(p);
+                Stat::dev(vfs::S_IFBLK | 0o660, ((ma as u64) << 8) | mi as u64)
+            }
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
             Kind::Socket(_) | Kind::Pair(..) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
@@ -315,6 +331,7 @@ impl OpenFile {
             Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
             Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
+            Kind::Block(p) => crate::block::part_name(p),
         }
     }
 
@@ -351,6 +368,7 @@ impl OpenFile {
         let size = match &self.kind {
             Kind::Inode(ino, _) => ino.meta().size as i64,
             Kind::Null | Kind::Zero | Kind::Random => 0,
+            Kind::Block(p) => blk_size(p) as i64,
             _ => return Err(-ESPIPE),
         };
         const SEEK_DATA: u32 = 3;
@@ -656,4 +674,63 @@ impl Pipe {
         }
         Ok(done)
     }
+}
+
+// ---- ブロックデバイス ----
+
+const SECTOR: usize = crate::block::SECTOR;
+/// 1 回の読み書きの大きさ
+const BLK_CHUNK: usize = 64 * 1024;
+
+/// 区画のバイト数
+pub fn blk_size(p: &crate::block::Part) -> usize {
+    p.len as usize * SECTOR
+}
+
+fn blk_read(p: &crate::block::Part, off: usize, dst: &mut [u8]) -> Result<usize, i64> {
+    let n = dst.len().min(blk_size(p).saturating_sub(off));
+    let mut sec = [0u8; SECTOR];
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
+        if skip == 0 && n - done >= SECTOR {
+            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
+            crate::block::read_part(p, s, &mut dst[done..done + len])?;
+            done += len;
+        } else {
+            crate::block::read_part(p, s, &mut sec)?;
+            let len = (SECTOR - skip).min(n - done);
+            dst[done..done + len].copy_from_slice(&sec[skip..skip + len]);
+            done += len;
+        }
+    }
+    Ok(n)
+}
+
+fn blk_write(p: &crate::block::Part, off: usize, src: &[u8]) -> Result<usize, i64> {
+    const ENOSPC: i64 = 28;
+    let n = src.len().min(blk_size(p).saturating_sub(off));
+    if n == 0 && !src.is_empty() {
+        return Err(-ENOSPC);
+    }
+    let mut sec = [0u8; SECTOR];
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
+        if skip == 0 && n - done >= SECTOR {
+            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
+            crate::block::write_part(p, s, &src[done..done + len])?;
+            done += len;
+        } else {
+            // セクタの一部: 読んでから書く
+            crate::block::read_part(p, s, &mut sec)?;
+            let len = (SECTOR - skip).min(n - done);
+            sec[skip..skip + len].copy_from_slice(&src[done..done + len]);
+            crate::block::write_part(p, s, &sec)?;
+            done += len;
+        }
+    }
+    Ok(n)
 }

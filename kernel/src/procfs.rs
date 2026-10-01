@@ -26,6 +26,7 @@ enum Node {
     Mounts,
     Uptime,
     Meminfo,
+    Swaps,
     NetDir,
     Pnp,
     KernelCmdline,
@@ -68,6 +69,7 @@ impl ProcInode {
             Node::Pnp => 7,
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
+            Node::Swaps => 10,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
@@ -120,8 +122,17 @@ impl ProcInode {
                 use crate::memlayout::{ram_size, PGSIZE};
                 let total = ram_size() / 1024;
                 let free = crate::kalloc::nfree() * PGSIZE / 1024;
-                format!("MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\n", total, free, free)
+                let (st, sf) = crate::swap::totals();
+                format!(
+                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\n",
+                    total,
+                    free,
+                    free,
+                    st * PGSIZE / 1024,
+                    sf * PGSIZE / 1024
+                )
             }
+            Node::Swaps => crate::swap::proc_swaps(),
             Node::Pnp => {
                 let mut s = String::from("#PROTO: DHCP\n");
                 if let Some(l) = crate::net::get().and_then(|n| n.lease.clone()) {
@@ -298,6 +309,7 @@ impl Inode for ProcInode {
             (Node::Root, "cmdline") => Node::KernelCmdline,
             (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
+            (Node::Root, "swaps") => Node::Swaps,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::Root, _) => Node::Pid(leader(num.ok_or(-ENOENT)?)?.tgid),
@@ -330,6 +342,7 @@ impl Inode for ProcInode {
                 add("cmdline".into(), Node::KernelCmdline);
                 add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);
+                add("swaps".into(), Node::Swaps);
                 add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {
                     add(format!("{}", p.tgid), Node::Pid(p.tgid));

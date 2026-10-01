@@ -3,7 +3,7 @@
 pkgname=aios-base
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which and /etc'
+pkgdesc='aios base system: init, sh, aipkg, systemctl, login, which, swapon and /etc'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
@@ -12,7 +12,7 @@ depends=('brush')
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
-        etc/hostname etc/hosts etc/motd etc/profile etc/shells)
+        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab)
 
 pkgver() {
   cd "$startdir/../.."
@@ -35,7 +35,7 @@ package() {
   ln -s usr/bin "$pkgdir/bin"
   ln -s usr/bin "$pkgdir/sbin"
   ln -s bin "$pkgdir/usr/sbin"
-  for p in init sh aipkg fetch systemctl journalctl login passwd su which; do
+  for p in init sh aipkg fetch systemctl journalctl login passwd su which mkswap swapon free; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす
@@ -44,6 +44,7 @@ package() {
   chmod 4755 "$pkgdir/usr/bin/passwd" "$pkgdir/usr/bin/su"
   ln -s systemctl "$pkgdir/usr/bin/poweroff"
   ln -s systemctl "$pkgdir/usr/bin/reboot"
+  ln -s swapon "$pkgdir/usr/bin/swapoff"
 
   cp -r "$top/etc" "$pkgdir/etc"
   chmod 600 "$pkgdir/etc/shadow"
