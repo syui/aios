@@ -75,6 +75,7 @@ pub extern "C" fn kmain() -> ! {
     dtb::summary();
 
     irq::init();
+    irq::enable_ipi();
     timer::init();
     uart::init();
     fs::init();

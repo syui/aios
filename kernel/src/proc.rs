@@ -124,6 +124,8 @@ impl FpState {
 
 pub struct Proc {
     pub state: State,
+    /// 走っている (最後に走った) CPU
+    pub cpu: usize,
     /// スレッド ID。プロセスの代表スレッドでは tgid と同じ
     pub pid: u32,
     pub tgid: u32,
@@ -185,6 +187,7 @@ pub struct Proc {
 impl Proc {
     const UNUSED: Self = Self {
         state: State::Unused,
+        cpu: 0,
         pid: 0,
         tgid: 0,
         ppid: 0,
@@ -486,6 +489,7 @@ pub fn scheduler() -> ! {
                 continue;
             }
             p.state = State::Running;
+            p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
                 p.pt().activate();
@@ -610,9 +614,7 @@ pub fn wake_expired(now: u64) {
 
 fn kill_proc(p: &mut Proc) {
     p.killed = true;
-    if p.state == State::Sleeping {
-        p.state = State::Runnable;
-    }
+    interrupt(p);
 }
 
 fn find(pid: u32) -> Option<&'static mut Proc> {
@@ -964,8 +966,14 @@ pub fn stop_chan(leader: &Proc) -> usize {
 
 /// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る)
 pub fn interrupt(t: &mut Proc) {
-    if t.state == State::Sleeping {
-        t.state = State::Runnable;
+    match t.state {
+        State::Sleeping => {
+            t.state = State::Runnable;
+            unsafe { core::arch::asm!("sev") };
+        }
+        // ほかの CPU のユーザーモードで走っている: すぐに戻ってきてもらう
+        State::Running => crate::smp::kick(t.cpu),
+        _ => {}
     }
 }
 

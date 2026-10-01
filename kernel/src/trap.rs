@@ -216,15 +216,18 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
             }
         }
         EL1H_IRQ | EL0_IRQ => {
-            let id = irq::claim();
+            let raw = irq::claim();
+            let id = raw & 0x3ff;
             match id {
                 timer::IRQ => timer::tick(),
+                // ほかの CPU から: EL0 へ戻る前に、殺されたか、シグナルが来たかを見るだけ
+                irq::IPI => {}
                 id if id == crate::uart::irq() => crate::uart::intr(),
                 irq::SPURIOUS => return,
                 id if Some(id) == crate::net::irq() => crate::net::intr(),
                 _ => println!("irq: unexpected {}", id),
             }
-            irq::complete(id);
+            irq::complete(raw);
             // EL0 で走っていたなら順番をゆずる
             if kind == EL0_IRQ {
                 if id == timer::IRQ {
