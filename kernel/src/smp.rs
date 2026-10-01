@@ -25,6 +25,15 @@ static mut secondary_stacks: Stacks = Stacks([[0; STACK_SIZE]; MAXCPU]);
 
 /// 動いている CPU の数
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
+/// CPU の番号ごとの MPIDR の Aff0 (CPU 間の割り込みの宛先)
+static mut TARGET: [usize; MAXCPU] = [0; MAXCPU];
+
+/// ほかの CPU に、EL0 から戻ってくるように知らせる (殺された、シグナルが来た)
+pub fn kick(cpu: usize) {
+    if cpu != id() && cpu < online() {
+        crate::irq::send_ipi(unsafe { TARGET[cpu] });
+    }
+}
 
 /// いまの CPU の番号 (0 から)
 pub fn id() -> usize {
@@ -225,6 +234,7 @@ pub fn start() {
     let me: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) me) };
     let me = me & 0xff_00ff_ffff;
+    unsafe { TARGET[0] = (me & 0xff) as usize };
     let mut n = 1;
     let mut started = 0;
     crate::dtb::each_cpu(|mpidr, method, release| {
@@ -233,6 +243,7 @@ pub fn start() {
         }
         let cpu = n;
         n += 1;
+        unsafe { TARGET[cpu] = (mpidr & 0xff) as usize };
         match (method, release) {
             (Some("spin-table"), Some(rel)) => {
                 spin_table_on(rel, cpu);

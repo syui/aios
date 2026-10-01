@@ -13,12 +13,15 @@ use core::ptr::{read_volatile, write_volatile};
 
 pub const SPURIOUS: u32 = 1023;
 pub const TIMER: u32 = 30;
+/// CPU から CPU への割り込み (GIC の SGI 0、BCM2836 のメールボックス 0)
+pub const IPI: u32 = 0;
 
 // GICv2
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
+const GICD_SGIR: usize = 0xf00;
 const GICC_CTLR: usize = 0x000;
 const GICC_PMR: usize = 0x004;
 const GICC_IAR: usize = 0x00c;
@@ -26,7 +29,11 @@ const GICC_EOIR: usize = 0x010;
 
 // BCM2836 local intc (コア n は + 4 * n)
 const LOCAL_TIMER_CTL0: usize = 0x40;
+const LOCAL_MBOX_CTL0: usize = 0x50;
 const LOCAL_IRQ_SRC0: usize = 0x60;
+const LOCAL_MBOX0_SET: usize = 0x80;
+const LOCAL_MBOX0_CLR: usize = 0xc0;
+const SRC_MBOX0: u32 = 1 << 4;
 
 /// BCM2836 のコアの番号 (MPIDR の Aff0)
 fn core_no() -> usize {
@@ -68,6 +75,27 @@ pub fn init_cpu() {
     if let Ctrl::Gic { c, .. } = ctrl() {
         wr(c + GICC_PMR, 0xff);
         wr(c + GICC_CTLR, 1);
+    }
+    enable_ipi();
+}
+
+/// この CPU で CPU 間の割り込みを受ける
+pub fn enable_ipi() {
+    match ctrl() {
+        Ctrl::Gic { .. } => enable(IPI),
+        Ctrl::Bcm { local, .. } => {
+            let r = local + LOCAL_MBOX_CTL0 + 4 * core_no();
+            wr(r, rd(r) | 1);
+        }
+    }
+}
+
+/// CPU (GIC の CPU インターフェースの番号 / BCM2836 のコアの番号) に割り込みを送る
+pub fn send_ipi(target: usize) {
+    unsafe { core::arch::asm!("dsb ishst") };
+    match ctrl() {
+        Ctrl::Gic { d, .. } => wr(d + GICD_SGIR, (1 << (16 + target)) | IPI),
+        Ctrl::Bcm { local, .. } => wr(local + LOCAL_MBOX0_SET + 0x10 * target, 1),
     }
 }
 
@@ -139,12 +167,18 @@ pub fn enable(id: u32) {
     }
 }
 
-/// いま来ている割り込みの番号 (なければ SPURIOUS)
+/// いま来ている割り込み。番号は & 0x3ff (なければ SPURIOUS)。complete にはこの値のまま渡す
+/// (GIC の SGI は送り元の CPU の番号も入っていて、EOIR にもそれが要る)
 pub fn claim() -> u32 {
     match ctrl() {
-        Ctrl::Gic { c, .. } => rd(c + GICC_IAR) & 0x3ff,
+        Ctrl::Gic { c, .. } => rd(c + GICC_IAR),
         Ctrl::Bcm { local, arm } => {
-            let src = rd(local + LOCAL_IRQ_SRC0 + 4 * core_no());
+            let core = core_no();
+            let src = rd(local + LOCAL_IRQ_SRC0 + 4 * core);
+            if src & SRC_MBOX0 != 0 {
+                wr(local + LOCAL_MBOX0_CLR + 0x10 * core, !0);
+                return IPI;
+            }
             if src & SRC_CNTPNS != 0 {
                 return TIMER;
             }
