@@ -84,7 +84,7 @@ jobs:
         run: |
           mkdir release
           zstd -q -19 -T0 disk.img -o release/aios-unix-aarch64.img.zst
-          ver=$(ls repo/aarch64/unix-*.pkg.tar.zst | sed 's|.*/unix-||; s|-aarch64.pkg.tar.zst||')
+          ver=$(ls repo/aarch64/rust/unix-*.pkg.tar.zst | sed 's|.*/unix-||; s|-aarch64.pkg.tar.zst||')
           echo "VER=$ver" >> "$GITHUB_ENV"
 
       - name: Release

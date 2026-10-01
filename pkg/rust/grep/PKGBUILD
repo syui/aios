@@ -1,4 +1,4 @@
-# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/grep)
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/grep)
 pkgname=grep
 pkgver=0.2.0
 pkgrel=1

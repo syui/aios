@@ -17,12 +17,12 @@ makedepends=('rustup' 'llvm')
 backup=(boot/loader/entries/aios.conf)
 
 pkgver() {
-  cd "$startdir/../.."
+  cd "$startdir/../../.."
   printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
-  cd "$startdir/../.."
+  cd "$startdir/../../.."
   unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
   # 作業中の開発用カーネル (target/.../debug) とは別の場所に作る
   AIOS_INITRD=none AIOS_RELEASE="$pkgver-$pkgrel" CARGO_TARGET_DIR="$srcdir/target" \

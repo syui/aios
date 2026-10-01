@@ -2,8 +2,8 @@
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
-#   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ (署名つきのコミット)。
-#                        repo/aarch64-c (C の拡張、aios-c.db) があれば aarch64-c/ へも
+#   bin/gitea.sh repo    repo/aarch64 (rust/ と c/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
+#                        (署名つきのコミット)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -19,7 +19,7 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -67,30 +67,28 @@ case "$1" in
     git -c "$(auth)" push "$host/ai/os.git" unix:unix
     ;;
   repo)
-    [ -f repo/aarch64/aios.db ] || { echo "repo/aarch64/aios.db がありません (bin/mkrepo.sh、または pkg ブランチの aarch64/ を repo/aarch64 へ)" >&2; exit 1; }
+    [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh、または pkg ブランチの aarch64/ を repo/aarch64 へ)" >&2; exit 1; }
     find_key
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$tmp/repo"
     use_identity "$tmp/repo"
-    # aarch64/ (と aarch64-c/) をこのリポジトリの repo/ と同じにする
-    dirs=aarch64
+    # aarch64/ をこのリポジトリの repo/aarch64 (rust/ と c/) と同じにする
     rm -rf "$tmp/repo/aarch64"
-    mkdir -p "$tmp/repo/aarch64"
-    cp repo/aarch64/*.pkg.tar.zst repo/aarch64/aios.db repo/aarch64/aios.db.tar.gz "$tmp/repo/aarch64/"
-    if [ -f repo/aarch64-c/aios-c.db ]; then
-      dirs="$dirs aarch64-c"
-      rm -rf "$tmp/repo/aarch64-c"
-      mkdir -p "$tmp/repo/aarch64-c"
-      cp repo/aarch64-c/*.pkg.tar.zst repo/aarch64-c/aios-c.db repo/aarch64-c/aios-c.db.tar.gz "$tmp/repo/aarch64-c/"
-    fi
+    for d in rust c; do
+      [ -f "repo/aarch64/$d/aios.db" ] || continue
+      mkdir -p "$tmp/repo/aarch64/$d"
+      cp repo/aarch64/$d/*.pkg.tar.zst repo/aarch64/$d/aios.db repo/aarch64/$d/aios.db.tar.gz "$tmp/repo/aarch64/$d/"
+    done
+    # 前の置き場所 (aarch64-c/) は消す
+    rm -rf "$tmp/repo/aarch64-c"
     cd "$tmp/repo"
-    git add -A $dirs
+    git add -A .
     if git diff --cached --quiet; then
       echo "ai/repo: no change"
       exit 0
     fi
-    git commit -q -m "$(echo $dirs | tr ' ' ,): update packages" -m "$(git diff --cached --name-status | sed 's/^/  /')"
+    git commit -q -m "aarch64: update packages" -m "$(git diff --cached --name-status | sed 's/^/  /')"
     git -c "$(auth)" push -q origin main
     echo "ai/repo: pushed $(git rev-parse --short HEAD)"
     ;;

@@ -1,4 +1,4 @@
-# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/awk)
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/awk)
 # uutils/awk はまだリリースがないので、コミットを決めて日付を版にする (まだ作りかけ: -F や split() など)
 pkgname=awk
 pkgver=0.1.0.20260929

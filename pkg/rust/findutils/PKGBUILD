@@ -1,4 +1,4 @@
-# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/findutils)
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/findutils)
 pkgname=findutils
 pkgver=0.10.0
 pkgrel=1

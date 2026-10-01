@@ -1,4 +1,4 @@
-# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/sudo-rs)
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/sudo-rs)
 # aios には PAM ライブラリがないので、aios_pam.rs (/etc/shadow を見る小さな PAM) を中に入れる
 pkgname=sudo-rs
 pkgver=0.2.15

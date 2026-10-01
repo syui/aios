@@ -1,4 +1,4 @@
-# C の拡張 (pkg-c/) を作るときの Zig。PKGBUILD の build() で読む:
+# C の拡張 (pkg/c/) を作るときの Zig。PKGBUILD の build() で読む:
 #   . "$startdir/../zig.sh"; zig_env
 # このマシン (Linux / Mac、aarch64 / x86_64) の公式の Zig を build/zig/ に取ってきて (sha256 を確かめる)、
 # aios 用 (aarch64-linux-musl、静的) の CC CXX AR RANLIB を用意する。aios の中の base-devel と同じ Zig
@@ -23,7 +23,7 @@ zig_env() {
   case $(uname -s) in Darwin) os=macos ;; *) os=linux ;; esac
   host=$m-$os
   want=$(zig_sha256 "$host") || { echo "zig.sh: no Zig for $host" >&2; return 1; }
-  top=$(cd "$startdir/../.." && pwd)
+  top=$(cd "$startdir/../../.." && pwd)
   dir=$top/build/zig/zig-$host-$ZIG_VERSION
   if [ ! -x "$dir/zig" ]; then
     tarball=$top/build/zig/zig-$host-$ZIG_VERSION.tar.xz

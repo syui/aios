@@ -1,14 +1,14 @@
 #!/bin/sh
 # パッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
 #   bin/mkrootfs.sh                  base (init, sh, aipkg, ... と /etc) とその依存 (coreutils など)
-#   bin/mkrootfs.sh grep sed ...     pkg/NAME のパッケージも入れる
-#   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
+#   bin/mkrootfs.sh grep sed ...     pkg/rust/NAME のパッケージも入れる
+#   bin/mkrootfs.sh all              pkg/rust/ のパッケージをぜんぶ入れる (C の拡張 pkg/c/ は入れない)
 #   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
 #                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
 #   AIOS_BUILD="base unix" bin/mkrootfs.sh -r all
 #                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
 # base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
-# repo/aarch64/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
+# repo/aarch64/rust/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
 set -e
 cd "$(dirname "$0")/.."
@@ -18,7 +18,8 @@ if [ "$1" = -r ]; then
   remote=1
   shift
 fi
-server=${AIOS_SERVER:-https://git.syui.ai/ai/repo/raw/branch/main/aarch64}
+server=${AIOS_SERVER:-https://git.syui.ai/ai/repo/raw/branch/main/aarch64/rust}
+repo=repo/aarch64/rust
 
 # sha256sum がなければ (Mac) shasum で
 sha256() {
@@ -27,7 +28,7 @@ sha256() {
 
 rm -rf rootfs
 mkdir rootfs
-mkdir -p repo/aarch64
+mkdir -p "$repo"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -45,7 +46,7 @@ built() {
   return 1
 }
 
-# fetch NAME: aios.db にある NAME のパッケージを repo/aarch64 に取ってくる (チェックサムを確かめる)
+# fetch NAME: aios.db にある NAME のパッケージを repo/aarch64/rust に取ってくる (チェックサムを確かめる)
 fetch() {
   d=
   for x in "$tmp/db/$1"-[0-9]*; do
@@ -54,17 +55,17 @@ fetch() {
   [ -n "$d" ] || { echo "not in $server: $1" >&2; exit 1; }
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
-  if [ ! -f "repo/aarch64/$file" ]; then
+  if [ ! -f "$repo/$file" ]; then
     echo "fetch: $file"
-    curl -fsSL --retry 3 "$server/$file" -o "repo/aarch64/$file.part"
-    mv "repo/aarch64/$file.part" "repo/aarch64/$file"
+    curl -fsSL --retry 3 "$server/$file" -o "$repo/$file.part"
+    mv "$repo/$file.part" "$repo/$file"
   fi
-  if [ -n "$sum" ] && [ "$(sha256 "repo/aarch64/$file")" != "$sum" ]; then
+  if [ -n "$sum" ] && [ "$(sha256 "$repo/$file")" != "$sum" ]; then
     echo "$file: checksum mismatch" >&2
-    rm -f "repo/aarch64/$file"
+    rm -f "$repo/$file"
     exit 1
   fi
-  f=repo/aarch64/$file
+  f=$repo/$file
 }
 
 # register FILE: 入れたパッケージを aipkg の記録 (desc と files) に書く
@@ -105,15 +106,15 @@ done=" "
 install() {
   case "$done" in *" $1 "*) return 0 ;; esac
   done="$done$1 "
-  [ -f "pkg/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
+  [ -f "pkg/rust/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
   if [ -n "$remote" ] && ! built "$1"; then
     fetch "$1"
   else
-    f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
+    f=$(ls "$repo/$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
   fi
   if [ -z "$f" ]; then
-    bin/mkpkg.sh "pkg/$1"
-    f=$(ls repo/aarch64/"$1"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
+    bin/mkpkg.sh "pkg/rust/$1"
+    f=$(ls "$repo/$1"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
   fi
   echo "rootfs: $(basename "$f")"
   zstd -dcq "$f" | tar -xpf - -C rootfs --exclude=.PKGINFO
@@ -125,9 +126,9 @@ install() {
 }
 
 if [ -z "$remote" ] || built base; then
-  bin/mkpkg.sh pkg/base
+  bin/mkpkg.sh pkg/rust/base
 fi
-[ "$*" = all ] && set -- $(ls pkg | grep -v -e '\.' -e '^base$')
+[ "$*" = all ] && set -- $(ls pkg/rust | grep -v -e '\.' -e '^base$')
 for pkg in base "$@"; do
   install "$pkg"
 done
