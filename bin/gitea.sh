@@ -4,22 +4,24 @@
 #   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ
 #   bin/gitea.sh id      GPG_KEY を取りこんで、このリポジトリのコミットをそのキーの持ち主の名前と署名にする
 # 環境変数:
-#   GITEA_TOKEN  gitea のアクセストークン (必須。ディスクには書かない)
-#   GITEA_USER   トークンの持ち主 (既定 ai)
+#   GITEA_TOKEN  gitea のアクセストークン (ディスクには書かない)。なければ、通信に認証をつけてくれる
+#                プロキシ (Claude Code の環境の API 認証情報) にまかせる
+#   GITEA_USER   トークンの持ち主 (既定 ai.syui.ai)
 #   GPG_KEY      ASCII armor の GPG 秘密鍵 (AI_GPG_KEY でも。あれば: コミットの名前とメールはキーの uid から、署名つき)
 set -e
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
-user=${GITEA_USER:-ai}
+user=${GITEA_USER:-ai.syui.ai}
 AI_GPG_KEY=${AI_GPG_KEY:-$GPG_KEY}
 
-need_token() {
-  [ -n "$GITEA_TOKEN" ] || { echo "GITEA_TOKEN がありません (環境の設定で環境変数として入れてください)" >&2; exit 1; }
-}
-
-# git に認証のヘッダを渡す (コマンドラインの -c なので、設定ファイルにもログにも残らない)
+# git に認証のヘッダを渡す (コマンドラインの -c なので、設定ファイルにもログにも残らない)。
+# トークンがなければ何もしない設定 (プロキシが認証をつける)
 auth() {
-  printf 'http.%s/.extraheader=Authorization: Basic %s' "$host" "$(printf '%s:%s' "$user" "$GITEA_TOKEN" | base64 | tr -d '\n')"
+  if [ -n "$GITEA_TOKEN" ]; then
+    printf 'http.%s/.extraheader=Authorization: Basic %s' "$host" "$(printf '%s:%s' "$user" "$GITEA_TOKEN" | base64 | tr -d '\n')"
+  else
+    printf 'gitea.noauth=1'
+  fi
 }
 
 # GPG_KEY (AI_GPG_KEY) を取りこみ、そのキーの uid と指紋を返す ("名前 <メール>" と指紋)
@@ -49,11 +51,9 @@ case "$1" in
     use_identity .
     ;;
   os)
-    need_token
     git -c "$(auth)" push "$host/ai/os.git" unix:unix
     ;;
   repo)
-    need_token
     [ -f repo/aarch64/aios.db ] || { echo "repo/aarch64/aios.db がありません (bin/mkrepo.sh)" >&2; exit 1; }
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
