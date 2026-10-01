@@ -1,11 +1,12 @@
 // ELF (静的リンク, ET_EXEC) を新しいアドレス空間に読み込み、
 // Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る
 use crate::memlayout::PGSIZE;
-use crate::vm::{pg_up, PageTable, Perm};
+use crate::vm::{pg_down, pg_up, Backing, PageTable, PROT_EXEC, PROT_READ, PROT_RW, PROT_WRITE};
 use alloc::vec::Vec;
 
 pub const USER_STACK_TOP: usize = 0x40_0000_0000;
-const USER_STACK_SIZE: usize = 256 * 1024;
+/// スタックの領域 (RLIMIT_STACK と同じ 8 MiB。触れたところだけページを作る)
+const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// 引数と環境の合計の上限 (Linux の既定と同じく、スタックの上限 8 MiB の 1/4)。
 /// スタックは引数の分だけ広げて確保する
 const ARG_MAX: usize = 2 * 1024 * 1024;
@@ -145,18 +146,34 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         if filesz > memsz || off + filesz > size || va.checked_add(memsz).is_none() {
             return Err(-ENOEXEC);
         }
-        let perm = Perm { write: flags & PF_W != 0, exec: flags & PF_X != 0 };
-        pt.alloc_range(va, va + memsz, perm).ok_or(-ENOMEM)?;
-        // 中身は少しずつ読んでユーザー空間へ
-        let mut buf = alloc::vec![0u8; 64 * 1024];
-        let mut done = 0;
-        while done < filesz {
-            let n = buf.len().min(filesz - done);
-            if ino.read_at(off + done, &mut buf[..n])? != n {
-                return Err(-ENOEXEC);
+        let prot = PROT_READ | if flags & PF_W != 0 { PROT_WRITE } else { 0 } | if flags & PF_X != 0 { PROT_EXEC } else { 0 };
+        let (start, end) = (pg_down(va), pg_up(va + memsz));
+        if (va - start) > off {
+            return Err(-ENOEXEC);
+        }
+        if pt.find(start).is_none() && pt.find(end - 1).is_none() {
+            // ふつう: ページはファイルから、触れたときに読む (filesz の先は 0)
+            let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz };
+            pt.map(start, end, prot, false, back).ok_or(-ENOMEM)?;
+        } else {
+            // 前のセグメントとページを分けあう: 残りを無名にして、中身を今読む
+            let mut s = start;
+            while pt.find(s).is_some() {
+                s += PGSIZE;
             }
-            pt.copy_out(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
-            done += n;
+            if s < end {
+                pt.map(s, end, prot, false, Backing::Anon).ok_or(-ENOMEM)?;
+            }
+            let mut buf = alloc::vec![0u8; 64 * 1024];
+            let mut done = 0;
+            while done < filesz {
+                let n = buf.len().min(filesz - done);
+                if ino.read_at(off + done, &mut buf[..n])? != n {
+                    return Err(-ENOEXEC);
+                }
+                pt.copy_out_force(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
+                done += n;
+            }
         }
         if off <= phoff && phoff < off + filesz {
             phdr_va = va + (phoff - off);
@@ -171,11 +188,11 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         return Err(-E2BIG);
     }
     let args_area = pg_up(strs + ptrs_size + 64);
-    pt.alloc_range(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, Perm::RW).ok_or(-ENOMEM)?;
+    pt.map(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, PROT_RW, false, Backing::Anon).ok_or(-ENOMEM)?;
 
     // 文字列を天辺から積む
     let mut sp = USER_STACK_TOP;
-    let mut push_bytes = |pt: &PageTable, b: &[u8], nul: bool| -> Result<usize, i64> {
+    let mut push_bytes = |pt: &mut PageTable, b: &[u8], nul: bool| -> Result<usize, i64> {
         let n = b.len() + nul as usize;
         if sp - n < USER_STACK_TOP - ARG_MAX {
             return Err(-E2BIG);
@@ -190,10 +207,10 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let (argc, envc) = (argv.len(), envp.len());
     let mut ptrs = Vec::with_capacity(argc + envc);
     for s in argv.iter().chain(envp.iter()) {
-        ptrs.push(push_bytes(&pt, s, true)?);
+        ptrs.push(push_bytes(&mut pt, s, true)?);
     }
-    let execfn = push_bytes(&pt, path.as_bytes(), true)?;
-    let random = push_bytes(&pt, &crate::rand::bytes16(), false)?;
+    let execfn = push_bytes(&mut pt, path.as_bytes(), true)?;
+    let random = push_bytes(&mut pt, &crate::rand::bytes16(), false)?;
 
     let auxv = [
         (AT_PHDR, phdr_va as u64),
