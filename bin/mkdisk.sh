@@ -11,7 +11,6 @@
 # UEFI のファームウェアは EFI/BOOT/BOOTAA64.EFI (aiboot) を起動し、aiboot が entry の Image を起動する。
 # aios は起動後に ESP を /boot にマウントするので、aipkg でカーネルを入れかえられる
 # GPT には sfdisk、FAT には mkfs.vfat と mcopy (dosfstools, mtools) が要る
-# aios はまだ htree (dir_index) の索引を書きかえられないので外しておく
 set -e
 cd "$(dirname "$0")/.."
 [ -d rootfs ] || { echo "rootfs/ がありません。先に bin/mkrootfs.sh を実行してください" >&2; exit 1; }
@@ -38,8 +37,8 @@ chown -R 0:0 rootfs
 mkext() {
   rm -f "$1"
   case "${FS:-ext4}" in
-    ext4) mkfs.ext4 -q -F -O ^dir_index -E root_owner=0:0 -d rootfs "$1" "$2" ;;
-    ext2) mkfs.ext2 -q -F -b 4096 -O ^dir_index,^resize_inode,^ext_attr -E root_owner=0:0 -d rootfs "$1" "$2" ;;
+    ext4) mkfs.ext4 -q -F -E root_owner=0:0 -d rootfs "$1" "$2" ;;
+    ext2) mkfs.ext2 -q -F -b 4096 -O ^resize_inode,^ext_attr -E root_owner=0:0 -d rootfs "$1" "$2" ;;
     *) echo "FS は ext4 か ext2" >&2; exit 1 ;;
   esac
 }

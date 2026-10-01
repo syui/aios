@@ -4,7 +4,7 @@
 // metadata_csum (crc32c)・未初期化グループ (ext4)、filetype、sparse_super、large_file
 // ext4 のジャーナル (jbd2) を使う: メタデータはジャーナルに書いてから本当の場所へ
 // (data=ordered: ファイルの中身は先に直接)。マウントのときに残っていれば再生する (jbd2.rs)。
-// htree で索引のついたディレクトリは読めるが、metadata_csum の上では書きかえない。
+// htree で索引のついたディレクトリは、索引を保ったまま名前を足す (htree.rs)。
 use crate::kalloc;
 use crate::memlayout::PGSIZE;
 use crate::tmpfs::statfs_bytes;
@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::RefCell;
 
+#[path = "htree.rs"]
+mod htree;
 #[path = "jbd2.rs"]
 mod jbd2;
 
@@ -142,6 +144,8 @@ pub struct ExtFs {
     gdt: RefCell<Vec<u8>>,
     cache: RefCell<Cache>,
     journal: RefCell<Option<jbd2::Journal>>,
+    /// 最後に書き出した時刻 (ticks)
+    last_flush: core::cell::Cell<u64>,
 }
 
 /// ディスク上の inode (inode_size バイトまるごと)
@@ -293,6 +297,7 @@ impl ExtFs {
                 ib_dirty: BTreeSet::new(),
             }),
             journal: RefCell::new(None),
+            last_flush: core::cell::Cell::new(0),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -347,8 +352,8 @@ impl ExtFs {
             Some(&p) => p,
             None => {
                 if c.map.len() >= CACHE_BLOCKS {
-                    // 書いていないものは追い出さない
-                    let victim = c.order.iter().position(|x| !c.dirty.contains(x));
+                    // 書いていないもの (メタデータもファイルの中身も) は追い出さない
+                    let victim = c.order.iter().position(|x| !c.dirty.contains(x) && !c.data.contains(x));
                     if let Some(old) = victim.and_then(|i| c.order.remove(i)) {
                         if let Some(p) = c.map.remove(&old) {
                             kalloc::free(p);
@@ -723,7 +728,25 @@ impl ExtFs {
     }
 
     /// 書きかえたものをディスクへ。となりあうブロックは 1 回の要求にまとめる
+    /// たまっていれば (ジャーナルの 1/4 か 512 ブロック)、または 5 秒たっていれば書き出す。
+    /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
+    fn maybe_flush(&self) -> Result<(), i64> {
+        let limit = match self.journal.borrow().as_ref() {
+            Some(j) => (j.capacity() / 4).min(512),
+            None => 512,
+        };
+        let pending = {
+            let c = self.cache.borrow();
+            c.dirty.len() + c.data.len()
+        };
+        if pending >= limit || crate::timer::ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
+            return self.flush();
+        }
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), i64> {
+        self.last_flush.set(crate::timer::ticks());
         let (bb, ib) = {
             let mut c = self.cache.borrow_mut();
             (core::mem::take(&mut c.bb_dirty), core::mem::take(&mut c.ib_dirty))
@@ -1279,6 +1302,14 @@ impl ExtFs {
     }
 
     fn find(&self, dir: u32, name: &str) -> Result<u32, i64> {
+        // 索引があれば 1 つの葉だけ (決められなければ全部)
+        if self.read_inode(dir)?.flags() & INDEX_FL != 0 && name != "." && name != ".." {
+            match self.dx_find(dir, name) {
+                Ok(Some(ino)) => return Ok(ino),
+                Ok(None) => return Err(-ENOENT),
+                Err(_) => {}
+            }
+        }
         self.dir_entries(dir)?
             .into_iter()
             .find(|e| e.2 != 0 && e.4 == name)
@@ -1294,14 +1325,9 @@ impl ExtFs {
         })
     }
 
-    /// ディレクトリの中身を書きかえてよいか (索引つきは metadata_csum では触らない)
     fn dir_writable(&self, dir: u32) -> Result<Raw, i64> {
         self.check_rw()?;
-        let r = self.read_inode(dir)?;
-        if r.flags() & INDEX_FL != 0 && self.csum {
-            return Err(-EROFS);
-        }
-        Ok(r)
+        self.read_inode(dir)
     }
 
     /// 空のディレクトリブロック (metadata_csum なら末尾に偽エントリ)
@@ -1321,6 +1347,10 @@ impl ExtFs {
             return Err(-ENAMETOOLONG);
         }
         let mut r = self.dir_writable(dir)?;
+        if r.flags() & INDEX_FL != 0 {
+            self.dx_add_entry(dir, &mut r, name, ino, mode)?;
+            return self.dir_changed(dir);
+        }
         let generation = r.gen_no();
         let need = rec_len_for(name.len());
         let write_entry = |d: &mut [u8], o: usize, rl: usize| {
@@ -1345,6 +1375,11 @@ impl ExtFs {
                 return self.dir_changed(dir);
             }
         }
+        // 1 ブロックに入りきらなくなったら索引つきに
+        if self.make_indexed(dir, &mut r)? {
+            self.dx_add_entry(dir, &mut r, name, ino, mode)?;
+            return self.dir_changed(dir);
+        }
         // 新しいブロックを足す
         let fb = r.size() / self.bsize as u64;
         let b = self.map(dir, &mut r, fb, true)?;
@@ -1360,6 +1395,12 @@ impl ExtFs {
 
     fn remove_entry(&self, dir: u32, name: &str) -> Result<(), i64> {
         let r = self.dir_writable(dir)?;
+        if r.flags() & INDEX_FL != 0 {
+            match self.dx_remove(dir, r.gen_no(), name) {
+                Err(e) if e == -11 => {}
+                res => return res.and_then(|_| self.dir_changed(dir)),
+            }
+        }
         let ents = self.dir_entries(dir)?;
         let pos = ents.iter().position(|e| e.2 != 0 && e.4 == name).ok_or(-ENOENT)?;
         let (b, o, _, rl, _, _) = ents[pos];
@@ -1372,13 +1413,10 @@ impl ExtFs {
         self.dir_changed(dir)
     }
 
-    /// 中身が変わったので時刻を進め、(csum でなければ) htree の印を消す
+    /// 中身が変わったので時刻を進める
     fn dir_changed(&self, dir: u32) -> Result<(), i64> {
         let mut r = self.read_inode(dir)?;
         r.touch();
-        if r.flags() & INDEX_FL != 0 {
-            r.set_flags(r.flags() & !INDEX_FL);
-        }
         self.write_inode(dir, &r)
     }
 
@@ -1468,7 +1506,7 @@ impl ExtInode {
     fn write_op<T>(&self, f: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
         self.fs.check_rw()?;
         let r = f();
-        let fl = self.fs.flush();
+        let fl = self.fs.maybe_flush();
         r.and_then(|v| fl.map(|_| v))
     }
 
@@ -1772,6 +1810,10 @@ impl Inode for ExtInode {
 
     fn set_mtime(&self, ns: u64) -> Result<(), i64> {
         self.write_op(|| self.update(|r| put32(&mut r.0, 16, (ns / 1_000_000_000) as u32)))
+    }
+
+    fn sync(&self) -> Result<(), i64> {
+        self.fs.flush()
     }
 
     fn statfs(&self) -> [u8; 120] {

@@ -6,7 +6,9 @@ use alloc::vec::Vec;
 
 pub const USER_STACK_TOP: usize = 0x40_0000_0000;
 const USER_STACK_SIZE: usize = 256 * 1024;
-const ARG_MAX: usize = 64 * 1024;
+/// 引数と環境の合計の上限 (Linux の既定と同じく、スタックの上限 8 MiB の 1/4)。
+/// スタックは引数の分だけ広げて確保する
+const ARG_MAX: usize = 2 * 1024 * 1024;
 
 const EACCES: i64 = 13;
 const ENOEXEC: i64 = 8;
@@ -162,7 +164,14 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         brk = brk.max(pg_up(va + memsz));
     }
 
-    pt.alloc_range(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP, Perm::RW).ok_or(-ENOMEM)?;
+    // 引数と環境の文字列、ポインタの並び (argc, argv, envp, auxv) の分を足す
+    let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1 + 16;
+    let ptrs_size = (argv.len() + envp.len() + 3 + 2 * 32) * 8;
+    if strs > ARG_MAX {
+        return Err(-E2BIG);
+    }
+    let args_area = pg_up(strs + ptrs_size + 64);
+    pt.alloc_range(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, Perm::RW).ok_or(-ENOMEM)?;
 
     // 文字列を天辺から積む
     let mut sp = USER_STACK_TOP;

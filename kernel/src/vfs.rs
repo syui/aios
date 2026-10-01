@@ -99,6 +99,10 @@ pub trait Inode {
     fn set_mtime(&self, ns: u64) -> Result<(), i64>;
     /// struct statfs
     fn statfs(&self) -> [u8; 120];
+    /// まだディスクに書いていないものを書く (sync、fsync)
+    fn sync(&self) -> Result<(), i64> {
+        Ok(())
+    }
 }
 
 static mut ROOT: Option<InodeRef> = None;
@@ -129,6 +133,34 @@ pub fn mount(path: &str, fsroot: InodeRef) -> Result<(), i64> {
     }
     unsafe { (*(&raw mut MOUNTS)).push((dir.id(), fsroot)) };
     Ok(())
+}
+
+/// マウントしているすべてのファイルシステムを書き出す (sync)
+pub fn sync_all() {
+    let roots: Vec<InodeRef> = unsafe {
+        let mut v: Vec<InodeRef> = (*(&raw const ROOT)).iter().cloned().collect();
+        v.extend((*(&raw const MOUNTS)).iter().map(|(_, r)| r.clone()));
+        v
+    };
+    for r in roots {
+        if let Err(e) = r.sync() {
+            println!("sync: error {}", e);
+        }
+    }
+}
+
+/// 次に暇なときに書き出す時刻 (ticks)
+static mut NEXT_IDLE_SYNC: u64 = 0;
+
+/// することがないとき (スケジューラから): 1 秒ごとに書き出す
+pub fn idle_sync() {
+    let now = crate::timer::ticks();
+    unsafe {
+        if now >= NEXT_IDLE_SYNC {
+            NEXT_IDLE_SYNC = now + crate::timer::HZ;
+            sync_all();
+        }
+    }
 }
 
 /// マウント先ならかぶせたものの根に置きかえる

@@ -80,6 +80,7 @@ mod nr {
     pub const SYNC: u64 = 81;
     pub const FSYNC: u64 = 82;
     pub const FDATASYNC: u64 = 83;
+    pub const SYNCFS: u64 = 267;
     pub const UTIMENSAT: u64 = 88;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
@@ -228,7 +229,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         PREAD64 => sysfile::pread(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
-        SYNC | FSYNC | FDATASYNC => Ok(0),
+        SYNC | FSYNC | FDATASYNC | SYNCFS => {
+            crate::vfs::sync_all();
+            Ok(0)
+        }
         SENDFILE | COPY_FILE_RANGE => Err(-ENOSYS),
         CLOSE => sysfile::close(a[0]),
         PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
@@ -633,8 +637,9 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
 }
 
 
-const MAXARG: usize = 256;
-const MAXSTR: usize = 32 * 1024;
+/// 引数 (と環境) の合計と 1 つの長さの上限 (Linux の ARG_MAX の既定と MAX_ARG_STRLEN)
+const ARGS_TOTAL: usize = 2 * 1024 * 1024;
+const MAXSTR: usize = 128 * 1024;
 
 /// NULL 終端のポインタ配列が指す文字列たち
 fn copy_in_strv(mut va: usize) -> Result<Vec<Vec<u8>>, i64> {
@@ -643,6 +648,7 @@ fn copy_in_strv(mut va: usize) -> Result<Vec<Vec<u8>>, i64> {
         return Ok(v);
     }
     let pt = proc::current().pt();
+    let mut total = 0;
     loop {
         let mut w = [0u8; 8];
         pt.copy_in(&mut w, va).ok_or(-EFAULT)?;
@@ -650,10 +656,12 @@ fn copy_in_strv(mut va: usize) -> Result<Vec<Vec<u8>>, i64> {
         if p == 0 {
             return Ok(v);
         }
-        if v.len() >= MAXARG {
+        let s = pt.copy_in_str(p, MAXSTR).ok_or(-EFAULT)?;
+        total += s.len() + 1 + 8;
+        if total > ARGS_TOTAL {
             return Err(-E2BIG);
         }
-        v.push(pt.copy_in_str(p, MAXSTR).ok_or(-EFAULT)?);
+        v.push(s);
         va += 8;
     }
 }
@@ -820,6 +828,7 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
         CMD_RESTART => PSCI_SYSTEM_RESET,
         _ => return Err(-EINVAL),
     };
+    crate::vfs::sync_all();
     println!("aios: {}", if fid == PSCI_SYSTEM_OFF { "power off" } else { "restart" });
     // PSCI の呼び方は DTB の /psci の method (DTB がなければ qemu virt の hvc)。無ければ止まるだけ
     match crate::dtb::psci_method() {

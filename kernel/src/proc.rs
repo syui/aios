@@ -477,7 +477,11 @@ pub fn scheduler() -> ! {
             ran = true;
         }
         if !ran {
-            // することがないので割り込みを待つ
+            // 書き残しがあれば書いてから (1 秒ごと)、割り込みを待つ
+            crate::vfs::idle_sync();
+            if procs().iter().any(|p| p.state == State::Runnable) {
+                continue;
+            }
             crate::trap::intr_on();
             unsafe { core::arch::asm!("wfi") };
             crate::trap::intr_off();
