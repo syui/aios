@@ -79,6 +79,9 @@ pub struct Shell {
     aliases: HashMap<String, String>,
     /// いま展開している alias (自分自身をくりかえし展開しない)
     expanding: Vec<String>,
+    /// 最近のディレクトリ (新しいものが先。対話するときは ~/.sh_dirs に残す)
+    dirs: Vec<String>,
+    dirs_file: Option<String>,
 }
 
 const BUILTINS: &[&str] = &[
@@ -136,6 +139,8 @@ impl Shell {
             text: String::new(),
             aliases: HashMap::new(),
             expanding: vec![],
+            dirs: vec![],
+            dirs_file: None,
         }
     }
 
@@ -292,6 +297,33 @@ impl Shell {
             eprintln!("+ {}", a.join(" "));
         }
         Ok(Ready { args, assigns: avals, redirs })
+    }
+
+    /// 最近のディレクトリに足す (50 まで)
+    fn remember_dir(&mut self, d: &str) {
+        self.dirs.retain(|x| x != d);
+        self.dirs.insert(0, d.to_string());
+        self.dirs.truncate(50);
+        if let Some(f) = &self.dirs_file {
+            let _ = std::fs::write(f, self.dirs.join("\n") + "\n");
+        }
+    }
+
+    /// 行の編集に渡す、補完などのための様子
+    fn edit_ctx(&self) -> edit::Ctx {
+        let home = self.get_var("HOME").unwrap_or_default();
+        let mut cmds: Vec<String> = BUILTINS.iter().map(|s| s.to_string()).collect();
+        cmds.extend(self.aliases.keys().cloned());
+        cmds.extend(self.funcs.keys().cloned());
+        let mut vars: Vec<String> = self.vars.keys().cloned().collect();
+        vars.extend(std::env::vars().map(|(k, _)| k));
+        // ~ で短く見せる (選んだら edit.rs が戻す)
+        let dirs = self
+            .dirs
+            .iter()
+            .map(|d| if !home.is_empty() && (d == &home || d.starts_with(&format!("{}/", home))) { format!("~{}", &d[home.len()..]) } else { d.clone() })
+            .collect();
+        edit::Ctx { cmds, vars, dirs, path: self.get_var("PATH").unwrap_or_default(), home }
     }
 
     /// 最初の語が alias なら置きかえる (引用していない語だけ)。
@@ -855,8 +887,15 @@ impl Shell {
                 match std::env::set_current_dir(&dir) {
                     Ok(()) => {
                         let new = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-                        self.export("OLDPWD", Some(old));
-                        self.export("PWD", Some(new));
+                        self.export("OLDPWD", Some(old.clone()));
+                        self.export("PWD", Some(new.clone()));
+                        if new != old {
+                            self.remember_dir(&new);
+                            // zsh と同じく、chpwd という関数があれば動かす
+                            if let Some(body) = self.funcs.get("chpwd").cloned() {
+                                return self.call(&body, &["chpwd".to_string()]);
+                            }
+                        }
                         0
                     }
                     Err(e) => {
@@ -1631,6 +1670,12 @@ impl Shell {
             let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.sh_history", home));
             let size = self.get_var("HISTSIZE").and_then(|n| n.parse().ok()).unwrap_or(10000);
             ed.load((!home.is_empty() || file.starts_with('/')).then_some(file), size);
+            // 最近のディレクトリ (C-j)
+            if !home.is_empty() {
+                let f = format!("{}/.sh_dirs", home);
+                self.dirs = std::fs::read_to_string(&f).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect();
+                self.dirs_file = Some(f);
+            }
         }
         let mut buf = String::new();
         loop {
@@ -1639,8 +1684,17 @@ impl Shell {
             }
             let read = if tty {
                 let p = if buf.is_empty() { self.prompt() } else { self.get_var("PS2").unwrap_or_else(|| "> ".into()) };
-                match ed.read(&p) {
+                let ctx = self.edit_ctx();
+                match ed.read(&p, &ctx) {
                     edit::Input::Line(l) => Ok(Some(l)),
+                    edit::Input::Silent(l) => {
+                        // 履歴に残さずに動かす (C-k の cd ..、C-j の cd)
+                        if let Ok(list) = Parser::new(&l).program() {
+                            self.run_list(&list);
+                            self.flow = Flow::None;
+                        }
+                        continue;
+                    }
                     edit::Input::Eof => Ok(None),
                     edit::Input::Interrupt => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 }
