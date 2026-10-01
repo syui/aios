@@ -8,6 +8,29 @@ use core::any::Any;
 use core::cell::RefCell;
 use crate::memlayout::PGSIZE;
 
+/// tmpfs のファイルが持っているページの数 (ぜんぶの tmpfs で)
+static mut USED: usize = 0;
+
+/// tmpfs に使えるのは RAM の半分まで (Linux の tmpfs の既定と同じ)。
+/// それより書くと ENOSPC (メモリを使いきって止まらないように。tmpfs のページはスワップへ出せない)
+fn limit() -> usize {
+    crate::memlayout::ram_size() / PGSIZE / 2
+}
+
+fn take_page() -> Result<*mut u8, i64> {
+    if unsafe { USED } >= limit() {
+        return Err(-ENOSPC);
+    }
+    let p = crate::kalloc::alloc().ok_or(-ENOSPC)?;
+    unsafe { USED += 1 };
+    Ok(p)
+}
+
+fn put_page(p: *mut u8) {
+    crate::kalloc::free(p);
+    unsafe { USED -= 1 };
+}
+
 /// ファイルの中身をページ (4KiB) の並びで持つ。書いていないところ (None) は 0
 pub struct Pages {
     pages: Vec<Option<*mut u8>>,
@@ -47,7 +70,7 @@ impl Pages {
             let p = match self.pages[pi] {
                 Some(p) => p,
                 None => {
-                    let p = crate::kalloc::alloc().ok_or(-ENOSPC)?;
+                    let p = take_page()?;
                     self.pages[pi] = Some(p);
                     p
                 }
@@ -63,7 +86,7 @@ impl Pages {
         if len < self.len {
             let keep = len.div_ceil(PGSIZE);
             for p in self.pages.drain(keep.min(self.pages.len())..).flatten() {
-                crate::kalloc::free(p);
+                put_page(p);
             }
             // 残ったページの後ろを 0 に
             if len % PGSIZE != 0 {
@@ -79,7 +102,7 @@ impl Pages {
 impl Drop for Pages {
     fn drop(&mut self) {
         for p in self.pages.drain(..).flatten() {
-            crate::kalloc::free(p);
+            put_page(p);
         }
     }
 }
@@ -381,9 +404,9 @@ impl Inode for TmpInode {
     }
 
     fn statfs(&self) -> [u8; 120] {
-        use crate::memlayout::{ram_size, PGSIZE};
-        let total = (ram_size() / PGSIZE) as u64;
-        let free = crate::kalloc::nfree() as u64;
+        // df に出る大きさは使える上限 (RAM の半分)
+        let total = limit() as u64;
+        let free = (limit().saturating_sub(unsafe { USED })).min(crate::kalloc::nfree()) as u64;
         statfs_bytes(0x0102_1994, PGSIZE as u64, total, free, 65536, 65536)
     }
 }

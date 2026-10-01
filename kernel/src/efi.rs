@@ -4,7 +4,7 @@
 // カーネルは RAM の先頭 + 0x80000 で動く作りなので (boot.rs)、
 //   1. 設定テーブルから DTB を探し、LoadOptions (systemd-boot の options や UEFI シェルの引数) を
 //      カーネルのコマンドラインとして覚える
-//   2. RAM の先頭 + 0x80000 を AllocatePages で押さえる
+//   2. メモリマップから RAM の先頭を探し、RAM の先頭 + 0x80000 を AllocatePages で押さえる
 //   3. ExitBootServices
 //   4. そこへ自分を写し、キャッシュを掃き出し、MMU とキャッシュを切って primary へ (x0 = DTB)
 // ここはリンクした場所 (上位アドレス) ではないところで動くので、PC 相対でしか
@@ -222,21 +222,7 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
         let dtb_size = u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize;
         save_options(image, bs, st);
 
-        // 2. RAM の先頭 (読み込まれた場所を含む 1 GiB の頭) + 0x80000
-        // Image ヘッダーの image_size (bss まで)
-        let size = rd64(base + 0x10);
-        let dest = (base & !0x3fff_ffff) + 0x80000;
-        if dest != base {
-            let alloc: Fn4 = core::mem::transmute(rd64(bs + BS_ALLOCATE_PAGES));
-            let mut addr = dest;
-            let st2 = alloc(ALLOCATE_ADDRESS, LOADER_DATA, size.div_ceil(4096), &mut addr as *mut usize as usize);
-            if st2 != EFI_SUCCESS {
-                say(st, b"aios: cannot reserve RAM base + 0x80000\n");
-                return EFI_LOAD_ERROR;
-            }
-        }
-
-        // 3. ExitBootServices (メモリマップの key が要る。変わっていたらもう一度)
+        // 2. メモリマップ (RAM の先頭を探すのと、ExitBootServices の key に使う)
         let get_map: Fn5 = core::mem::transmute(rd64(bs + BS_GET_MEMORY_MAP));
         let pool: extern "efiapi" fn(usize, usize, usize) -> Status = core::mem::transmute(rd64(bs + BS_ALLOCATE_POOL));
         let exit: Fn2 = core::mem::transmute(rd64(bs + BS_EXIT_BOOT_SERVICES));
@@ -247,6 +233,38 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
         if pool(LOADER_DATA, cap, &mut buf as *mut usize as usize) != EFI_SUCCESS {
             return EFI_LOAD_ERROR;
         }
+        map_size = cap;
+        if get_map(&mut map_size as *mut usize as usize, buf, &mut key as *mut usize as usize, &mut desc_size as *mut usize as usize, &mut ver as *mut u32 as usize) != EFI_SUCCESS
+            || desc_size == 0
+        {
+            say(st, b"aios: cannot get the memory map\n");
+            return EFI_LOAD_ERROR;
+        }
+        // RAM の先頭: RAM の種類 (LoaderCode .. ACPI NVS と Persistent) でいちばん低いところの 1 GiB の頭。
+        // 読み込まれた場所 (base) は RAM の上のほうのこともある (RAM が 1 GiB より大きいとき)
+        let mut ram = base;
+        for i in 0..map_size / desc_size {
+            let d = buf + i * desc_size;
+            let ty = read_volatile(d as *const u32);
+            if (1..=10).contains(&ty) || ty == 14 {
+                ram = ram.min(rd64(d + 8));
+            }
+        }
+
+        // 3. RAM の先頭 + 0x80000 へ写す。Image ヘッダーの image_size (bss まで)
+        let size = rd64(base + 0x10);
+        let dest = (ram & !0x3fff_ffff) + 0x80000;
+        if dest != base {
+            let alloc: Fn4 = core::mem::transmute(rd64(bs + BS_ALLOCATE_PAGES));
+            let mut addr = dest;
+            let st2 = alloc(ALLOCATE_ADDRESS, LOADER_DATA, size.div_ceil(4096), &mut addr as *mut usize as usize);
+            if st2 != EFI_SUCCESS {
+                say(st, b"aios: cannot reserve RAM base + 0x80000\n");
+                return EFI_LOAD_ERROR;
+            }
+        }
+
+        // 4. ExitBootServices (メモリマップの key が要る。変わっていたらもう一度)
         say(st, b"aios: exiting boot services\n");
         let mut ok = false;
         for _ in 0..4 {
