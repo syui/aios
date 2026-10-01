@@ -1,5 +1,5 @@
 # unix ブランチ: disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
-# リリース unix-latest に置く (main の latest とは別)
+# リリース unix-latest に aios-unix-aarch64.img.zst を置く (main の latest とは別)。使いかたは bin/run.sh
 #   aios-base, aios-kernel, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
 name: unix
 
@@ -79,13 +79,8 @@ jobs:
         run: |
           mkdir release
           zstd -q -19 -T0 disk.img -o release/aios-unix-aarch64.img.zst
-          start=$(od -An -tu8 -j $((1024 + 32)) -N 8 disk.img | tr -d ' ')
-          mcopy -n -i "disk.img@@$((start * 512))" ::/Image release/Image
-          cp bin/run-image.sh release/run.sh
           ver=$(ls repo/aarch64/aios-kernel-*.pkg.tar.zst | sed 's|.*/aios-kernel-||; s|-aarch64.pkg.tar.zst||')
           echo "VER=$ver" >> "$GITHUB_ENV"
-          (cd release && sha256sum * > SHA256SUMS)
-          cat release/SHA256SUMS
 
       - name: Release
         env:
@@ -95,9 +90,10 @@ jobs:
           aios (unix) ${VER} (${GITHUB_SHA::7}), aarch64
 
           \`\`\`sh
-          brew install qemu zstd        # Linux なら qemu-system-arm zstd
-          zstd -d aios-unix-aarch64.img.zst -o disk.img
-          chmod +x run.sh && ./run.sh   # Image と disk.img を同じディレクトリに
+          # Mac: brew install qemu zstd   Linux: qemu-system-arm qemu-efi-aarch64 zstd
+          git clone -b unix https://git.syui.ai/ai/os aios && cd aios
+          curl -fLO https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst
+          bin/run.sh    # disk.img に展開して、UEFI → aiboot → カーネルで起動
           \`\`\`
 
           disk.img: GPT (p1 ESP = /boot, p2 ext4 = /, p3 swap 256 MiB)。終わるのは Ctrl-a x か sudo poweroff
