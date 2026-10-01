@@ -6,7 +6,7 @@ pub const HZ: u64 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-fn freq() -> u64 {
+pub fn freq() -> u64 {
     let f: u64;
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f) };
     // ファームウェアが設定していなければ、ラズパイの水晶 (19.2 MHz)
@@ -51,11 +51,21 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// 2 つめからの CPU: 自分のタイマを動かす
+pub fn init_cpu() {
+    crate::irq::enable(IRQ);
+    rearm();
+}
+
+/// タイマの割り込み (CPU ごと)。時刻を進めるなどは cpu0 だけ
 pub fn tick() {
-    // 割り込み中の cpu0 だけが書く
+    crate::proc::account_tick();
+    if crate::smp::id() != 0 {
+        rearm();
+        return;
+    }
     let now = TICKS.load(Ordering::Relaxed) + 1;
     TICKS.store(now, Ordering::Relaxed);
-    crate::proc::account_tick();
     crate::proc::wake_expired(now);
     crate::signal::tick(now);
     // TCP の再送などのため、ときどき回す

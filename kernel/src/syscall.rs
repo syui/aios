@@ -436,7 +436,9 @@ fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
     if len < 8 {
         return Err(-EINVAL);
     }
-    out(mask, &1u64.to_le_bytes())?;
+    // 動いている CPU すべて
+    let bits = (1u64 << crate::smp::online()) - 1;
+    out(mask, &bits.to_le_bytes())?;
     Ok(8)
 }
 

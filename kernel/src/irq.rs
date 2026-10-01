@@ -5,6 +5,8 @@
 // 割り込みの番号はこのカーネルの中では GIC の INTID に合わせる:
 //   タイマ (EL1 物理タイマ) = 30、GIC の SPI n = 32 + n
 //   BCM2835 の周辺機器 (DTB の <bank irq>) = 64 + bank * 32 + irq
+// タイマは CPU ごと (GIC の PPI は CPU ごとにある。BCM2836 はコアごとのレジスタ)。
+// 機器の割り込みはすべて cpu0 に届ける。
 use crate::dtb;
 use crate::memlayout::p2v;
 use core::ptr::{read_volatile, write_volatile};
@@ -22,9 +24,16 @@ const GICC_PMR: usize = 0x004;
 const GICC_IAR: usize = 0x00c;
 const GICC_EOIR: usize = 0x010;
 
-// BCM2836 local intc (コア 0)
+// BCM2836 local intc (コア n は + 4 * n)
 const LOCAL_TIMER_CTL0: usize = 0x40;
 const LOCAL_IRQ_SRC0: usize = 0x60;
+
+/// BCM2836 のコアの番号 (MPIDR の Aff0)
+fn core_no() -> usize {
+    let m: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) m) };
+    (m & 0xff) as usize
+}
 const SRC_CNTPNS: u32 = 1 << 1;
 const SRC_GPU: u32 = 1 << 8;
 // BCM2835 ARM control の IC
@@ -52,6 +61,14 @@ fn rd(a: usize) -> u32 {
 
 fn wr(a: usize, v: u32) {
     unsafe { write_volatile(a as *mut u32, v) }
+}
+
+/// 2 つめからの CPU: GIC の CPU インターフェース (タイマは timer::init_cpu が有効にする)
+pub fn init_cpu() {
+    if let Ctrl::Gic { c, .. } = ctrl() {
+        wr(c + GICC_PMR, 0xff);
+        wr(c + GICC_CTLR, 1);
+    }
 }
 
 pub fn init() {
@@ -107,7 +124,8 @@ pub fn enable(id: u32) {
         }
         Ctrl::Bcm { local, arm } => {
             if id == TIMER {
-                wr(local + LOCAL_TIMER_CTL0, rd(local + LOCAL_TIMER_CTL0) | SRC_CNTPNS);
+                let r = local + LOCAL_TIMER_CTL0 + 4 * core_no();
+                wr(r, rd(r) | SRC_CNTPNS);
             } else if id >= 64 {
                 let (bank, n) = ((id - 64) / 32, (id - 64) % 32);
                 let reg = match bank {
@@ -126,7 +144,7 @@ pub fn claim() -> u32 {
     match ctrl() {
         Ctrl::Gic { c, .. } => rd(c + GICC_IAR) & 0x3ff,
         Ctrl::Bcm { local, arm } => {
-            let src = rd(local + LOCAL_IRQ_SRC0);
+            let src = rd(local + LOCAL_IRQ_SRC0 + 4 * core_no());
             if src & SRC_CNTPNS != 0 {
                 return TIMER;
             }

@@ -11,6 +11,7 @@
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
 # ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
+# AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
 # AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
 k=$1
@@ -85,9 +86,9 @@ if [ -n "$uefi" ]; then
     fi
   fi
   echo "boot: UEFI ($uefi) from disk.img" >&2
-  qemu-system-aarch64 -machine virt,acpi=off -cpu cortex-a72 -m "${AIOS_MEM:-512M}" -nographic "$@" \
+  qemu-system-aarch64 -machine virt,acpi=off -cpu cortex-a72 -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"
   exit
 fi
-qemu-system-aarch64 -machine virt -cpu cortex-a72 -m "${AIOS_MEM:-512M}" -nographic "$@" \
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
   -kernel "$k" -append "${AIOS_CMDLINE:-}"

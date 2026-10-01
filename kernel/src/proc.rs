@@ -1,7 +1,8 @@
-// プロセス・スレッドとスケジューラ (1 CPU)
+// プロセス・スレッドとスケジューラ
 //
-// カーネルの中では割り込みを止めたまま動く。切り替えが起きるのは
-// EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。
+// カーネルの中では割り込みを止めたまま、大きなロック (smp.rs) を持って動く。切り替えが起きるのは
+// EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。CPU ごとにスケジューラがあり、
+// 同じ Proc の表から Runnable のものを取って走らせる (次にどの CPU で走るかは決まっていない)。
 // スレッドは mm (アドレス空間) と files を共有する Proc。
 use crate::exec::{self, Image};
 use crate::file::{self, FileRef, Kind};
@@ -35,7 +36,7 @@ pub enum State {
     Zombie,
 }
 
-/// 複数の Proc から使う持ち物。1 CPU で割り込みを止めているので、同時には触られない
+/// 複数の Proc から使う持ち物。カーネルの中は大きなロックで 1 つの CPU だけなので、同時には触られない
 pub struct Shared<T>(Rc<UnsafeCell<T>>);
 
 impl<T> Shared<T> {
@@ -287,8 +288,21 @@ struct KStacks([[u8; KSTACK_SIZE]; NPROC]);
 
 static mut KSTACKS: KStacks = KStacks([[0; KSTACK_SIZE]; NPROC]);
 static mut PROCS: [Proc; NPROC] = [const { Proc::UNUSED }; NPROC];
-static mut CURRENT: Option<usize> = None;
-static mut SCHEDULER: Context = Context::ZERO;
+/// CPU ごと: いま走らせている Proc の添字と、スケジューラの文脈
+static mut CURRENT: [Option<usize>; crate::smp::MAXCPU] = [None; crate::smp::MAXCPU];
+static mut SCHEDULER: [Context; crate::smp::MAXCPU] = [Context::ZERO; crate::smp::MAXCPU];
+
+fn cur() -> Option<usize> {
+    unsafe { CURRENT[crate::smp::id()] }
+}
+
+fn set_cur(v: Option<usize>) {
+    unsafe { CURRENT[crate::smp::id()] = v };
+}
+
+fn sched_ctx() -> *mut Context {
+    unsafe { &raw mut SCHEDULER[crate::smp::id()] }
+}
 static mut NEXT_PID: u32 = 1;
 
 fn procs() -> &'static mut [Proc; NPROC] {
@@ -296,13 +310,13 @@ fn procs() -> &'static mut [Proc; NPROC] {
 }
 
 pub fn current() -> &'static mut Proc {
-    let i = unsafe { CURRENT }.expect("no current proc");
+    let i = cur().expect("no current proc");
     &mut procs()[i]
 }
 
 /// いまのプロセスの資格情報。まだプロセスがなければ root
 pub fn current_cred() -> crate::cred::Cred {
-    match unsafe { CURRENT } {
+    match cur() {
         Some(i) => procs()[i].cred.clone(),
         None => crate::cred::Cred::ROOT,
     }
@@ -310,7 +324,7 @@ pub fn current_cred() -> crate::cred::Cred {
 
 /// exec が使う cwd。user_init のときはまだ current がないのでルート
 pub fn current_cwd() -> String {
-    match unsafe { CURRENT } {
+    match cur() {
         Some(i) => procs()[i].files().cwd.clone(),
         None => String::new(),
     }
@@ -344,9 +358,10 @@ swtch:
     mov     sp, x9
     ret
 
-// 新しいプロセスは swtch からここへ戻り、TrapFrame を戻して EL0 へ
+// 新しいプロセスは swtch からここへ戻り、大きなロックを放し、TrapFrame を戻して EL0 へ
 .global forkret
 forkret:
+    bl      forkret_unlock
     b       trap_ret
 
 .arch_extension fp
@@ -451,7 +466,12 @@ pub fn user_init() {
     p.state = State::Runnable;
 }
 
-/// 実行できるプロセスを順番に走らせ続ける
+#[unsafe(no_mangle)]
+extern "C" fn forkret_unlock() {
+    crate::smp::unlock();
+}
+
+/// 実行できるプロセスを順番に走らせ続ける (CPU ごと。大きなロックを持って呼ぶ)
 pub fn scheduler() -> ! {
     loop {
         let mut ran = false;
@@ -467,35 +487,42 @@ pub fn scheduler() -> ! {
             }
             p.state = State::Running;
             unsafe {
-                CURRENT = Some(i);
+                set_cur(Some(i));
                 p.pt().activate();
                 fp_load(&p.fp);
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
-                swtch(&raw mut SCHEDULER, &p.context);
-                CURRENT = None;
+                swtch(sched_ctx(), &p.context);
+                set_cur(None);
+                // 終わったプロセスのページ表はほかの CPU が片付けるかもしれないので、外しておく
+                crate::vm::deactivate();
             }
             ran = true;
         }
         if !ran {
-            // 書き残しがあれば書いてから (1 秒ごと)、割り込みを待つ
-            crate::vfs::idle_sync();
+            // 書き残しがあれば書いてから (1 秒ごと、cpu0 で)、ロックを放して割り込みか sev を待つ
+            if crate::smp::id() == 0 {
+                crate::vfs::idle_sync();
+            }
             if procs().iter().any(|p| p.state == State::Runnable) {
                 continue;
             }
+            crate::smp::unlock();
             crate::trap::intr_on();
-            unsafe { core::arch::asm!("wfi") };
+            unsafe { core::arch::asm!("wfe") };
             crate::trap::intr_off();
+            crate::smp::lock();
         }
     }
 }
 
 /// スケジューラへ戻る。state は呼ぶ側が変えておく
 fn sched() {
+    debug_assert!(crate::smp::holding(), "sched without the big kernel lock");
     let p = current();
     unsafe {
         fp_save(&mut p.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) p.tpidr);
-        swtch(&mut p.context, &raw const SCHEDULER);
+        swtch(&mut p.context, sched_ctx());
     }
 }
 
@@ -538,6 +565,10 @@ pub fn wakeup(chan: usize) -> usize {
             n += 1;
         }
     }
+    if n > 0 {
+        // 眠っている CPU を起こす
+        unsafe { core::arch::asm!("sev") };
+    }
     n
 }
 
@@ -558,7 +589,7 @@ pub fn dump() {
         let tf = p.tf_ref();
         println!("[{}] pid {} tgid {} ppid {} {} chan {:#x} wake_at {} pc {:#x} x8 {} x0 {:#x}", i, p.pid, p.tgid, p.ppid, st, p.chan, p.wake_at, tf.elr, tf.x[8], tf.x[0]);
     }
-    println!("ticks {} current {:?}", crate::timer::ticks(), unsafe { CURRENT });
+    println!("ticks {} current {:?}", crate::timer::ticks(), cur());
 }
 
 static POLL: u8 = 0;
@@ -773,6 +804,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.clear_tid = ctid;
     }
     child.state = State::Runnable;
+    unsafe { core::arch::asm!("sev") };
     Ok(tid)
 }
 
@@ -892,7 +924,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
 /// タイマの割り込みから: いま動いているプロセスに 1 tick つける。
 /// カーネルの中では割り込みを止めているので、動いていたのはユーザーモード
 pub fn account_tick() {
-    if let Some(i) = unsafe { CURRENT } {
+    if let Some(i) = cur() {
         procs()[i].utime += 1;
     }
 }
@@ -978,7 +1010,7 @@ pub fn current_leader() -> &'static mut Proc {
 
 /// (tgid, 実 uid): siginfo の送り主
 pub fn current_ids() -> (u32, u32) {
-    match unsafe { CURRENT } {
+    match cur() {
         Some(i) => (procs()[i].tgid, procs()[i].cred.uid),
         None => (0, 0),
     }

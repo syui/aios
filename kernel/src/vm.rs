@@ -120,14 +120,34 @@ fn remake_pte(e: u64, prot: u8, shared_vma: bool) -> u64 {
     make_pte(pa, prot, cow)
 }
 
+// TLB はすべての CPU に (inner shareable) 消す: 同じアドレス空間のスレッドがほかの CPU で動いているかも
 fn flush_va(va: usize) {
     unsafe {
-        core::arch::asm!("dsb ishst", "tlbi vaae1, {}", "dsb ish", "isb", in(reg) (va >> 12) as u64);
+        core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) (va >> 12) as u64);
     }
 }
 
 fn flush_all() {
-    unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb") };
+    unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
+}
+
+/// 何も写していない L1 (スケジューラの中で TTBR0 に載せる)
+#[repr(C, align(4096))]
+struct Empty([u64; 512]);
+static EMPTY_L1: Empty = Empty([0; 512]);
+
+/// この CPU の TTBR0 からプロセスのページ表を外す
+pub fn deactivate() {
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            in(reg) v2p(&raw const EMPTY_L1 as usize),
+        );
+    }
 }
 
 impl PageTable {
@@ -231,11 +251,16 @@ impl PageTable {
         for k in keys {
             self.vmas.remove(&k);
         }
+        // PTE を消して TLB を消してから、ページを返す (ほかの CPU がまだ使っているかもしれない)
+        let mut pages = Vec::new();
         self.each_pte(start, end, |_, pte| unsafe {
-            kalloc::put(page_of(*pte));
+            pages.push(page_of(*pte));
             *pte = 0;
         });
         flush_all();
+        for p in pages {
+            kalloc::put(p);
+        }
     }
 
     /// [start, end) のページを捨てる (領域は残す。次に触れたら作りなおす: MADV_DONTNEED)
@@ -246,14 +271,18 @@ impl PageTable {
                 shared.push((s.max(start), v.end.min(end)));
             }
         }
+        let mut pages = Vec::new();
         self.each_pte(start, end, |va, pte| unsafe {
             // 共有のメモリは捨てない (ほかのプロセスが使っている)
             if !shared.iter().any(|&(s, e)| s <= va && va < e) {
-                kalloc::put(page_of(*pte));
+                pages.push(page_of(*pte));
                 *pte = 0;
             }
         });
         flush_all();
+        for p in pages {
+            kalloc::put(p);
+        }
     }
 
     /// mprotect。領域でないところが混じっていれば ENOMEM (Err)
@@ -358,8 +387,9 @@ impl PageTable {
                 // 共有しているので写す
                 let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
                 unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
-                kalloc::put(old);
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
+                flush_va(page_va);
+                kalloc::put(old);
             } else {
                 unsafe { *pte = make_pte(e & PTE_ADDR, prot, false) };
             }
