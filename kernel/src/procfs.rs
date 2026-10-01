@@ -120,8 +120,9 @@ impl ProcInode {
                 let p = leader(pid)?;
                 let c = &p.cred;
                 let threads = proc::threads_of(p.tgid).len();
+                let (vsize, rss) = mem_of(p);
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t{}\n",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
                     p.comm(),
                     state_name(p),
                     p.tgid,
@@ -135,6 +136,8 @@ impl ProcInode {
                     c.egid,
                     c.sgid,
                     c.egid,
+                    vsize / 1024,
+                    rss * 4,
                     threads
                 )
             }
@@ -171,11 +174,22 @@ fn state_name(p: &Proc) -> &'static str {
 }
 
 /// /proc/PID/stat (Linux の fs/proc/array.c と同じ 52 項目)
+/// (VmSize バイト, RSS ページ)
+fn mem_of(p: &Proc) -> (usize, usize) {
+    match &p.mm {
+        Some(m) => {
+            let m = m.get();
+            (m.pt.vsize(), m.pt.resident())
+        }
+        None => (0, 0),
+    }
+}
+
 fn stat_line(p: &Proc) -> String {
     let (tty_nr, tpgid) = crate::tty::of_session(p.sid).map_or((0, -1), |(rdev, pg)| (rdev, pg as i64));
     let threads = proc::threads_of(p.tgid).len();
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 0 0 0",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 0 {} {}",
         p.tgid,
         p.comm(),
         state_char(p),
@@ -186,7 +200,9 @@ fn stat_line(p: &Proc) -> String {
         tpgid,
         proc::group_utime(p.tgid),
         p.cutime,
-        threads
+        threads,
+        mem_of(p).0,
+        mem_of(p).1
     );
     // 残り (rsslim から exit_code まで) は 0
     for _ in 25..=52 {

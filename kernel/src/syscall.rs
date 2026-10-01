@@ -7,7 +7,7 @@ use crate::socket;
 use crate::sysfile;
 use crate::timer;
 use crate::trap::TrapFrame;
-use crate::vm::{pg_up, Perm};
+use crate::vm::{pg_up, Backing};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -349,7 +349,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         BRK => Ok(sys_brk(a[0] as usize)),
         MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[2], a[3], int(a[4]), a[5] as usize),
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
-        MPROTECT | MADVISE => Ok(0),
+        MPROTECT => sys_mprotect(a[0] as usize, a[1] as usize, a[2]),
+        MADVISE => sys_madvise(a[0] as usize, a[1] as usize, a[2]),
         MREMAP => Err(-ENOMEM), // musl は自分で確保しなおす
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
         n => {
@@ -464,32 +465,29 @@ fn sys_brk(addr: usize) -> i64 {
         return m.brk as i64;
     }
     let (old, new) = (pg_up(m.brk), pg_up(addr));
-    if new > old {
-        if m.pt.alloc_range(old, new, Perm::RW).is_none() {
-            m.pt.unmap_range(old, new);
-            return m.brk as i64;
-        }
-    } else if new < old {
-        m.pt.unmap_range(new, old);
+    if new != old && m.pt.resize(m.heap_start, old, new).is_none() {
+        return m.brk as i64;
     }
     m.brk = addr;
     addr as i64
 }
 
+const MAP_SHARED: u64 = 0x1;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+const PROT_WRITE: u64 = 0x2;
 
-/// mmap。無名のメモリと、ファイルの写し (MAP_PRIVATE、または書かない MAP_SHARED):
-/// ファイルの中身をその時に読んで新しいページに入れる (書き戻しはしない)
+/// mmap。無名のメモリと、ファイルの写し (MAP_PRIVATE、または書かない MAP_SHARED)。
+/// ページは触れたときに作る (ファイルなら、そのときに読む。書き戻しはしない)
 fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize) -> R {
-    const MAP_SHARED: u64 = 0x1;
-    const PROT_WRITE: u64 = 0x2;
     const EACCES: i64 = 13;
+    const EEXIST: i64 = 17;
     if len == 0 || off % 4096 != 0 {
         return Err(-EINVAL);
     }
     // ファイルを写すなら、その inode
-    let file = if flags & MAP_ANONYMOUS == 0 {
+    let back = if flags & MAP_ANONYMOUS == 0 {
         if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
             return Err(-ENODEV); // 書き戻す共有の写像はまだない
         }
@@ -499,52 +497,68 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             return Err(-EACCES);
         }
         match &f.kind {
-            crate::file::Kind::Inode(ino, _) if !ino.meta().is_dir() => Some(ino.clone()),
+            // fend はここではまだ「off から先のファイルの長さ」。場所が決まってから va にする
+            crate::file::Kind::Inode(ino, _) if !ino.meta().is_dir() => {
+                Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off) }
+            }
             _ => return Err(-ENODEV),
         }
     } else {
-        None
+        Backing::Anon
     };
     let m = proc::current().mm();
     let len = pg_up(len);
-    let va = if flags & MAP_FIXED != 0 {
+    let va = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         if addr & 0xfff != 0 {
             return Err(-EINVAL);
         }
-        m.pt.unmap_range(addr, addr + len);
+        if flags & MAP_FIXED_NOREPLACE != 0 && (addr..addr + len).step_by(4096).any(|a| m.pt.find(a).is_some()) {
+            return Err(-EEXIST);
+        }
         addr
     } else {
-        let va = m.mmap_next;
-        m.mmap_next += len;
+        let va = m.pt.free_area(m.mmap_next, len);
+        m.mmap_next = va + len;
         va
     };
-    // TODO: prot を反映する。いまは常に RW
-    if m.pt.alloc_range(va, va + len, Perm::RW).is_none() {
-        m.pt.unmap_range(va, va + len);
-        return Err(-ENOMEM);
-    }
-    if let Some(ino) = file {
-        let size = ino.meta().size as usize;
-        let mut buf = alloc::vec![0u8; 64 * 1024];
-        let mut done = 0;
-        while done < len && off + done < size {
-            let want = buf.len().min(len - done).min(size - off - done);
-            let n = ino.read_at(off + done, &mut buf[..want])?;
-            if n == 0 {
-                break;
-            }
-            m.pt.copy_out(va + done, &buf[..n]).ok_or(-EFAULT)?;
-            done += n;
-        }
-    }
+    let back = match back {
+        // ファイルの終わりの va (その先は 0)
+        Backing::File { ino, off, fend } => Backing::File { ino, off, fend: va.saturating_add(fend) },
+        b => b,
+    };
+    let shared = flags & MAP_SHARED != 0 && matches!(back, Backing::Anon);
+    m.pt.map(va, va + len, prot_bits(prot), shared, back).ok_or(-ENOMEM)?;
     Ok(va as i64)
+}
+
+fn prot_bits(prot: u64) -> u8 {
+    (prot & 7) as u8
 }
 
 fn sys_munmap(addr: usize, len: usize) -> R {
     if addr & 0xfff != 0 {
         return Err(-EINVAL);
     }
-    proc::current().pt().unmap_range(addr, addr + pg_up(len));
+    proc::current().pt().unmap(addr, addr + pg_up(len));
+    Ok(0)
+}
+
+fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
+    if addr & 0xfff != 0 {
+        return Err(-EINVAL);
+    }
+    proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map(|_| 0).map_err(|_| -ENOMEM)
+}
+
+/// MADV_DONTNEED は無名のページを捨てる (次に触れると 0)。ほかは何もしない
+fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
+    const MADV_DONTNEED: u64 = 4;
+    if addr & 0xfff != 0 {
+        return Err(-EINVAL);
+    }
+    if advice == MADV_DONTNEED {
+        proc::current().pt().discard(addr, addr + pg_up(len));
+    }
     Ok(0)
 }
 

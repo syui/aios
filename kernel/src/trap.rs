@@ -167,9 +167,31 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                     signal::deliver(tf, intr);
                 }
                 ec => {
+                    // ページがまだない / 共有している (コピーオンライト): 用意して、同じ命令からやりなおす
+                    // DFSC/IFSC: 0b0001xx 変換、0b0010xx アクセスフラグ、0b0011xx 権限
+                    let fsc = esr & 0x3f;
+                    let mut fault = None;
+                    if (ec == EC_IABT_LOW || ec == EC_DABT_LOW) && (4..=15).contains(&fsc) {
+                        let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0;
+                        match proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW) {
+                            Ok(()) => {
+                                proc::check_killed();
+                                signal::deliver(tf, None);
+                                return;
+                            }
+                            Err(e) => fault = Some(e),
+                        }
+                    }
                     // 例外はシグナルにして、今のスレッドに必ず届ける
                     let (sig, code, addr) = match ec {
-                        EC_IABT_LOW | EC_DABT_LOW => (signal::SIGSEGV, signal::SEGV_MAPERR, far),
+                        EC_IABT_LOW | EC_DABT_LOW => match fault {
+                            Some(crate::vm::FaultErr::NoMem) => {
+                                println!("pid {}: out of memory at {:#x}", proc::current().pid, far);
+                                (signal::SIGKILL, 0, far)
+                            }
+                            Some(crate::vm::FaultErr::Access) => (signal::SIGSEGV, signal::SEGV_ACCERR, far),
+                            _ => (signal::SIGSEGV, signal::SEGV_MAPERR, far),
+                        },
                         EC_PC_ALIGN | EC_SP_ALIGN => (signal::SIGBUS, 1, far),
                         EC_BRK64 => (signal::SIGTRAP, 1, tf.elr),
                         EC_FP => (signal::SIGFPE, 0, tf.elr),

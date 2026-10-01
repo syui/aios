@@ -40,6 +40,7 @@ pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_STOPPED: i32 = 5;

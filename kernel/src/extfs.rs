@@ -146,6 +146,10 @@ pub struct ExtFs {
     journal: RefCell<Option<jbd2::Journal>>,
     /// 最後に書き出した時刻 (ticks)
     last_flush: core::cell::Cell<u64>,
+    /// inode ごとの、いま生きている ExtInode の数 (開いているファイル、mmap、カレントディレクトリ ...)
+    users: RefCell<BTreeMap<u32, usize>>,
+    /// リンクが 0 になったが、まだ使われているので残してある inode (最後の利用者がいなくなったら片付ける)
+    orphans: RefCell<BTreeSet<u32>>,
 }
 
 /// ディスク上の inode (inode_size バイトまるごと)
@@ -298,6 +302,8 @@ impl ExtFs {
             }),
             journal: RefCell::new(None),
             last_flush: core::cell::Cell::new(0),
+            users: RefCell::new(BTreeMap::new()),
+            orphans: RefCell::new(BTreeSet::new()),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -333,7 +339,7 @@ impl ExtFs {
     }
 
     pub fn root(self: &Rc<Self>) -> InodeRef {
-        Rc::new(ExtInode { fs: self.clone(), ino: ROOT_INO })
+        ExtInode::make(self, ROOT_INO)
     }
 
     pub fn kind(&self) -> &'static str {
@@ -1471,9 +1477,41 @@ pub struct ExtInode {
     ino: u32,
 }
 
+impl Drop for ExtInode {
+    fn drop(&mut self) {
+        let last = {
+            let mut u = self.fs.users.borrow_mut();
+            let n = u.entry(self.ino).or_insert(1);
+            *n -= 1;
+            let last = *n == 0;
+            if last {
+                u.remove(&self.ino);
+            }
+            last
+        };
+        if last && self.fs.orphans.borrow_mut().remove(&self.ino) {
+            let fs = &self.fs;
+            let res = fs.read_inode(self.ino).and_then(|mut r| if r.links() == 0 { fs.release(self.ino, &mut r) } else { Ok(()) });
+            if res.is_err() || fs.maybe_flush().is_err() {
+                println!("extfs: could not free orphan inode {}", self.ino);
+            }
+        }
+    }
+}
+
 impl ExtInode {
+    /// 作るたびに数え、Drop で減らす
+    fn make(fs: &Rc<ExtFs>, ino: u32) -> InodeRef {
+        Rc::new(ExtInode::counted(fs, ino))
+    }
+
+    fn counted(fs: &Rc<ExtFs>, ino: u32) -> ExtInode {
+        *fs.users.borrow_mut().entry(ino).or_insert(0) += 1;
+        ExtInode { fs: fs.clone(), ino }
+    }
+
     fn at(&self, ino: u32) -> InodeRef {
-        Rc::new(ExtInode { fs: self.fs.clone(), ino })
+        ExtInode::make(&self.fs, ino)
     }
 
     fn other(&self, i: &InodeRef) -> Result<u32, i64> {
@@ -1599,7 +1637,13 @@ impl ExtInode {
         }
         put32(&mut r.0, 12, now_secs());
         if r.links() == 0 {
-            fs.release(child, &mut r)
+            if fs.users.borrow().get(&child).is_some_and(|&n| n > 0) {
+                // まだ開かれている (実行中のプログラムなど): 最後に閉じられたときに片付ける
+                fs.orphans.borrow_mut().insert(child);
+                fs.write_inode(child, &r)
+            } else {
+                fs.release(child, &mut r)
+            }
         } else {
             fs.write_inode(child, &r)
         }
@@ -1619,7 +1663,7 @@ impl ExtInode {
             if existing == child {
                 return Ok(());
             }
-            ExtInode { fs: fs.clone(), ino: nd }.unlink_node(new, is_dir)?;
+            ExtInode::counted(fs, nd).unlink_node(new, is_dir)?;
         }
         fs.add_entry(nd, new, child, r.mode())?;
         fs.remove_entry(self.ino, old)?;
