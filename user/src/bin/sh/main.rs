@@ -1628,8 +1628,11 @@ fn main() {
             }
         }
     }
-    // 対話するシェルは $ENV (なければ ~/.shrc) も読む: alias や PS1 など
+    // 対話するシェルは /etc/shrc と $ENV (なければ ~/.shrc) も読む: alias や PS1 など
     if unsafe { libc::isatty(0) } == 1 {
+        if std::path::Path::new("/etc/shrc").is_file() {
+            sh.builtin(&[".".into(), "/etc/shrc".into()]);
+        }
         let rc = sh.get_var("ENV").and_then(|e| sh.expand_one(&e).ok()).unwrap_or_else(|| format!("{}/.shrc", home));
         if std::path::Path::new(&rc).is_file() {
             sh.builtin(&[".".into(), rc]);
@@ -1747,8 +1750,9 @@ impl Shell {
 }
 
 impl Shell {
-    /// プロンプト: PS1 (\u \h \w \W \$ \n \\ が使える)。なければ「ディレクトリ %」(失敗のあとは !)
-    fn prompt(&self) -> String {
+    /// プロンプト: PS1 (\u \h \w \W \$ \n \\ \e \[ \] が使える)。なければ「ディレクトリ %」(失敗のあとは !)。
+    /// そのあと bash と同じく $NAME や $(cmd) を展開する (zsh の PROMPT_SUBST)
+    fn prompt(&mut self) -> String {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
         let root = unsafe { libc::geteuid() } == 0;
         let Some(ps1) = self.get_var("PS1") else {
@@ -1785,6 +1789,14 @@ impl Shell {
                 }
                 None => out.push('\\'),
             }
+        }
+        if out.contains('$') || out.contains('`') {
+            // 展開しても $? は変えない
+            let st = self.status;
+            if let Ok(e) = self.expand_one(&out) {
+                out = e;
+            }
+            self.status = st;
         }
         out
     }
