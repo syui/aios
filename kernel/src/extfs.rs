@@ -24,7 +24,12 @@ mod jbd2;
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
+/// 覚えておくブロックの数の上限 (RAM の 1/8 まで)
 const CACHE_BLOCKS: usize = 16384;
+
+fn cache_limit(bsize: usize) -> usize {
+    CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
+}
 const EROFS: i64 = 30;
 const EFBIG: i64 = 27;
 
@@ -108,6 +113,18 @@ fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
 }
 
 /// ブロックの読み書き。1 ブロックを 1 ページに入れて覚えておく
+impl Cache {
+    /// 書いていないもの (メタデータもファイルの中身も) でない、いちばん古いブロックを 1 つ捨てる
+    fn evict_one(&mut self) -> bool {
+        let victim = self.order.iter().position(|x| !self.dirty.contains(x) && !self.data.contains(x));
+        let Some(old) = victim.and_then(|i| self.order.remove(i)) else { return false };
+        if let Some(p) = self.map.remove(&old) {
+            kalloc::free(p);
+        }
+        true
+    }
+}
+
 struct Cache {
     map: BTreeMap<u64, *mut u8>,
     order: VecDeque<u64>,
@@ -150,6 +167,8 @@ pub struct ExtFs {
     users: RefCell<BTreeMap<u32, usize>>,
     /// リンクが 0 になったが、まだ使われているので残してある inode (最後の利用者がいなくなったら片付ける)
     orphans: RefCell<BTreeSet<u32>>,
+    /// スワップに使っているファイル (書きかえさせない)
+    swapfiles: RefCell<BTreeSet<u32>>,
 }
 
 /// ディスク上の inode (inode_size バイトまるごと)
@@ -304,6 +323,7 @@ impl ExtFs {
             last_flush: core::cell::Cell::new(0),
             users: RefCell::new(BTreeMap::new()),
             orphans: RefCell::new(BTreeSet::new()),
+            swapfiles: RefCell::new(BTreeSet::new()),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -360,16 +380,15 @@ impl ExtFs {
         let page = match c.map.get(&b) {
             Some(&p) => p,
             None => {
-                if c.map.len() >= CACHE_BLOCKS {
-                    // 書いていないもの (メタデータもファイルの中身も) は追い出さない
-                    let victim = c.order.iter().position(|x| !c.dirty.contains(x) && !c.data.contains(x));
-                    if let Some(old) = victim.and_then(|i| c.order.remove(i)) {
-                        if let Some(p) = c.map.remove(&old) {
-                            kalloc::free(p);
-                        }
-                    }
+                if c.map.len() >= cache_limit(self.bsize) {
+                    c.evict_one();
                 }
-                let p = kalloc::alloc().ok_or(-ENOSPC)?;
+                // ページがなければ、書き終わったブロックを捨てて作る
+                let p = match kalloc::alloc() {
+                    Some(p) => p,
+                    None if c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
+                    None => return Err(-ENOSPC),
+                };
                 let buf = unsafe { core::slice::from_raw_parts_mut(p, self.bsize) };
                 if crate::block::read(b * (self.bsize / crate::block::SECTOR) as u64, buf).is_err() {
                     kalloc::free(p);
@@ -1599,6 +1618,74 @@ impl ExtInode {
         self.fs.read_inode(self.ino)
     }
 
+    /// スワップに使っている間は書けない (ETXTBSY)
+    fn not_swapfile(&self) -> Result<(), i64> {
+        const ETXTBSY: i64 = 26;
+        if self.fs.swapfiles.borrow().contains(&self.ino) {
+            return Err(-ETXTBSY);
+        }
+        Ok(())
+    }
+
+    /// スワップファイルにする (swapon): ファイルのページがディスク (root の区画) のどこにあるかを
+    /// (ファイルのページ, セクタ, ページ数) の並びで返す。穴や、まだ書いていないところ、
+    /// 1 ページの中でブロックがとぎれているところがあれば EINVAL。
+    /// 書きかけの中身を先にディスクへ出し、覚えているブロックは捨てる (このあとは直接読み書きされる)
+    pub fn swap_map(&self) -> Result<Vec<(u64, u64, u64)>, i64> {
+        let fs = &self.fs;
+        fs.check_rw()?;
+        let mut r = self.raw()?;
+        if r.mode() & S_IFMT != S_IFREG {
+            return Err(-EINVAL);
+        }
+        fs.flush()?;
+        let per = PGSIZE / fs.bsize;
+        let spb = (fs.bsize / crate::block::SECTOR) as u64;
+        let pages = r.size() / PGSIZE as u64;
+        let mut out: Vec<(u64, u64, u64)> = Vec::new();
+        let mut blocks = Vec::new();
+        for pg in 0..pages {
+            let first = fs.map(self.ino, &mut r, pg * per as u64, false)?;
+            if first == 0 {
+                return Err(-EINVAL);
+            }
+            for k in 1..per as u64 {
+                if fs.map(self.ino, &mut r, pg * per as u64 + k, false)? != first + k {
+                    return Err(-EINVAL);
+                }
+            }
+            blocks.extend(first..first + per as u64);
+            let sector = first * spb;
+            match out.last_mut() {
+                Some((p, s, n)) if *p + *n == pg && *s + *n * (PGSIZE / crate::block::SECTOR) as u64 == sector => *n += 1,
+                _ => out.push((pg, sector, 1)),
+            }
+        }
+        {
+            let mut c = fs.cache.borrow_mut();
+            for b in blocks {
+                if c.dirty.contains(&b) || c.data.contains(&b) {
+                    continue;
+                }
+                if let Some(p) = c.map.remove(&b) {
+                    kalloc::free(p);
+                    c.order.retain(|&x| x != b);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// スワップに使っている印 (swapon で true、swapoff で false)
+    pub fn set_swapfile(&self, on: bool) {
+        let mut s = self.fs.swapfiles.borrow_mut();
+        if on {
+            s.insert(self.ino);
+        } else {
+            s.remove(&self.ino);
+        }
+    }
+
     fn dir_only(&self) -> Result<(), i64> {
         if self.raw()?.mode() & S_IFMT != S_IFDIR {
             return Err(-ENOTDIR);
@@ -1766,7 +1853,7 @@ impl Inode for ExtInode {
         let b = &r.0;
         let uid = u16_at(b, 2) as u32 | (u16_at(b, 120) as u32) << 16;
         let gid = u16_at(b, 24) as u32 | (u16_at(b, 122) as u32) << 16;
-        let rdev = if r.mode() & S_IFMT == S_IFCHR {
+        let rdev = if matches!(r.mode() & S_IFMT, S_IFCHR | S_IFBLK) {
             let old = r.block(0);
             if old != 0 { old as u64 } else { let new = r.block(1); (((new >> 8) & 0xfff) << 8 | (new & 0xff)) as u64 }
         } else {
@@ -1795,6 +1882,7 @@ impl Inode for ExtInode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        self.not_swapfile()?;
         self.write_op(|| {
             let mut r = self.raw()?;
             match r.mode() & S_IFMT {
@@ -1809,6 +1897,7 @@ impl Inode for ExtInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        self.not_swapfile()?;
         self.write_op(|| {
             let mut r = self.raw()?;
             if r.mode() & S_IFMT != S_IFREG {

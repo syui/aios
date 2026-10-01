@@ -3,6 +3,9 @@
 // 区画は mkswap の形 (Linux と同じ): ページ 0 が見出しで、1024 バイト目から
 // version (1)、last_page、nr_badpages、そのあと悪いページの番号。4086 バイト目に "SWAPSPACE2"。
 // ページ 1..=last_page に 1 枚ずつ書く (スロット)。
+// スワップファイル (ext4/ext2 の上のファイル) は、swapon のときにファイルのページがディスクの
+// どこにあるかを表 (extfs::swap_map) にしておき、あとはファイルシステムを通らずに直接読み書きする
+// (Linux と同じ。穴のない、mkswap したファイル。使っている間は書きかえさせない)。
 // 追い出したページの PTE はスロットの番号を持つ (vm.rs)。fork で共有されるので、スロットごとに参照の数を持つ。
 //
 // 回収 (reclaim) は、ユーザーへ戻る前に空きが LOW を割っていたら HIGH まで、と、
@@ -33,9 +36,20 @@ pub type Slot = u64;
 
 const BAD: u16 = u16::MAX;
 
+/// スワップに使うもの
+pub enum Source {
+    Part(Part),
+    /// root の区画の上のファイル
+    File(crate::vfs::InodeRef),
+}
+
 struct Area {
     part: Part,
+    /// ファイルなら、そのページの場所 (ファイルのページ, 区画の中のセクタ, ページ数)。区画なら空
+    map: Vec<(u64, u64, u64)>,
+    file: Option<crate::vfs::InodeRef>,
     name: String,
+    key: (usize, u64),
     /// スロットごとの参照の数 (0 は空き、BAD は見出しと悪いページ)
     refs: Vec<u16>,
     /// 使えるスロットの数と、使っている数
@@ -65,18 +79,45 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
 
-/// swapon: 区画 part (名前は name) をスワップに使う
-pub fn on(part: Part, name: String) -> Result<(), i64> {
-    if areas().iter().flatten().any(|a| a.name == name) {
+/// スワップの区画やファイルを見分ける鍵 (区画は番号、ファイルは inode)
+fn key(src: &Source) -> (usize, u64) {
+    match src {
+        Source::Part(p) => (usize::MAX, p.num as u64),
+        Source::File(i) => i.id(),
+    }
+}
+
+fn swap_file(a: &Area) -> Option<&crate::extfs::ExtInode> {
+    a.file.as_ref()?.as_any().downcast_ref::<crate::extfs::ExtInode>()
+}
+
+/// swapon: 区画かファイル (名前は name) をスワップに使う
+pub fn on(src: Source, name: String) -> Result<(), i64> {
+    if areas().iter().flatten().any(|a| a.key == key(&src)) {
         return Err(-EBUSY);
     }
     let i = areas().iter().position(|a| a.is_none()).ok_or(-EPERM)?;
+    let k = key(&src);
+    let (part, map, file, max) = match src {
+        Source::Part(p) => (p, Vec::new(), None, p.len as usize * SECTOR / PGSIZE),
+        Source::File(ino) => {
+            let ext = ino.as_any().downcast_ref::<crate::extfs::ExtInode>().ok_or(-EINVAL)?;
+            let map = ext.swap_map()?;
+            let max = map.last().map_or(0, |&(p, _, n)| (p + n) as usize);
+            // ファイルのページは、はじめから穴なくつづいている
+            if map.first().is_none_or(|&(p, _, _)| p != 0) {
+                return Err(-EINVAL);
+            }
+            (block::root(), map, Some(ino), max)
+        }
+    };
+    let mut a = Area { part, map, file, name, key: k, refs: Vec::new(), size: 0, used: 0, next: 1, draining: false };
     let mut h = vec![0u8; PGSIZE];
-    block::read_part(&part, 0, &mut h)?;
+    block::read_part(&a.part, sector_of_page(&a, 0), &mut h)?;
     if &h[PGSIZE - 10..] != b"SWAPSPACE2" || u32_at(&h, 1024) != 1 {
         return Err(-EINVAL);
     }
-    let pages = (u32_at(&h, 1028) as usize + 1).min(part.len as usize * SECTOR / PGSIZE);
+    let pages = (u32_at(&h, 1028) as usize + 1).min(max);
     if pages < 2 {
         return Err(-EINVAL);
     }
@@ -89,15 +130,19 @@ pub fn on(part: Part, name: String) -> Result<(), i64> {
             refs[b] = BAD;
         }
     }
-    let size = refs.iter().filter(|&&r| r == 0).count();
-    println!("swap: {} ({} KiB)", name, size * PGSIZE / 1024);
-    areas()[i] = Some(Area { part, name, refs, size, used: 0, next: 1, draining: false });
+    a.size = refs.iter().filter(|&&r| r == 0).count();
+    a.refs = refs;
+    if let Some(f) = swap_file(&a) {
+        f.set_swapfile(true);
+    }
+    println!("swap: {} ({} KiB)", a.name, a.size * PGSIZE / 1024);
+    areas()[i] = Some(a);
     Ok(())
 }
 
 /// swapoff: 追い出したページをぜんぶ読み戻してから外す
-pub fn off(name: &str) -> Result<(), i64> {
-    let i = areas().iter().position(|a| a.as_ref().is_some_and(|a| a.name == name)).ok_or(-EINVAL)?;
+pub fn off(src: &Source) -> Result<(), i64> {
+    let i = areas().iter().position(|a| a.as_ref().is_some_and(|a| a.key == key(src))).ok_or(-EINVAL)?;
     areas()[i].as_mut().unwrap().draining = true;
     let mut ok = true;
     crate::proc::each_pagetable(|pt| {
@@ -109,6 +154,9 @@ pub fn off(name: &str) -> Result<(), i64> {
     if !ok || a.used != 0 {
         a.draining = false;
         return Err(-ENOMEM);
+    }
+    if let Some(f) = swap_file(a) {
+        f.set_swapfile(false);
     }
     areas()[i] = None;
     Ok(())
@@ -157,22 +205,34 @@ pub fn free(slot: Slot) {
     }
 }
 
-fn sector_of(slot: Slot) -> u64 {
-    (slot as u32 as u64) * (PGSIZE / SECTOR) as u64
+const SECTORS: u64 = (PGSIZE / SECTOR) as u64;
+
+/// 区画の中で、page 番目のページのはじめのセクタ
+fn sector_of_page(a: &Area, page: u64) -> u64 {
+    if a.map.is_empty() {
+        return page * SECTORS;
+    }
+    let i = a.map.partition_point(|&(p, _, _)| p <= page);
+    let (p, s, _) = a.map[i.saturating_sub(1)];
+    s + (page - p) * SECTORS
+}
+
+fn sector_of(a: &Area, slot: Slot) -> u64 {
+    sector_of_page(a, slot as u32 as u64)
 }
 
 /// スロットからページ (カーネルの仮想アドレス) へ読む
 pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
     let a = area(slot).ok_or(-EINVAL)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(page, PGSIZE) };
-    block::read_part(&a.part, sector_of(slot), buf)
+    block::read_part(&a.part, sector_of(a, slot), buf)
 }
 
 /// ページをスロットへ書く
 pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
     let a = area(slot).ok_or(-EINVAL)?;
     let buf = unsafe { core::slice::from_raw_parts(page, PGSIZE) };
-    block::write_part(&a.part, sector_of(slot), buf)
+    block::write_part(&a.part, sector_of(a, slot), buf)
 }
 
 /// 次に回収をはじめるページ表 (順番に回す)
@@ -231,8 +291,9 @@ pub fn proc_swaps() -> String {
     for (i, a) in areas().iter().enumerate() {
         let Some(a) = a else { continue };
         s.push_str(&alloc::format!(
-            "{:<40}partition\t{}\t\t{}\t\t-{}\n",
+            "{:<40}{}\t{}\t\t{}\t\t-{}\n",
             a.name,
+            if a.file.is_some() { "file\t" } else { "partition" },
             a.size * PGSIZE / 1024,
             a.used * PGSIZE / 1024,
             i + 2
