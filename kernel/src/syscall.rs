@@ -163,6 +163,7 @@ mod nr {
     pub const MMAP: u64 = 222;
     pub const FADVISE64: u64 = 223;
     pub const MPROTECT: u64 = 226;
+    pub const MSYNC: u64 = 227;
     pub const MADVISE: u64 = 233;
     pub const ACCEPT4: u64 = 242;
     pub const WAIT4: u64 = 260;
@@ -351,6 +352,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
         MPROTECT => sys_mprotect(a[0] as usize, a[1] as usize, a[2]),
         MADVISE => sys_madvise(a[0] as usize, a[1] as usize, a[2]),
+        MSYNC => sys_msync(a[0] as usize, a[1] as usize),
         MREMAP => Err(-ENOMEM), // musl は自分で確保しなおす
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
         n => {
@@ -480,8 +482,8 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const PROT_WRITE: u64 = 0x2;
 
-/// mmap。無名のメモリと、ファイルの写し (MAP_PRIVATE、または書かない MAP_SHARED)。
-/// ページは触れたときに作る (ファイルなら、そのときに読む。書き戻しはしない)
+/// mmap。無名のメモリとファイルの写し。ページは触れたときに作る (ファイルならそのときに読む)。
+/// MAP_SHARED のファイルは写している人どうしでページを共有し、書いたものは msync などで書き戻す (vm.rs)
 fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize) -> R {
     const EACCES: i64 = 13;
     const EEXIST: i64 = 17;
@@ -490,12 +492,11 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     }
     // ファイルを写すなら、その inode
     let back = if flags & MAP_ANONYMOUS == 0 {
-        if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
-            return Err(-ENODEV); // 書き戻す共有の写像はまだない
-        }
         let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
         let f = f.borrow();
-        if f.flags & crate::file::O_ACCMODE == crate::file::O_WRONLY {
+        let mode = f.flags & crate::file::O_ACCMODE;
+        // 読めること。共有で書くなら書けることも
+        if mode == crate::file::O_WRONLY || (flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && mode != crate::file::O_RDWR) {
             return Err(-EACCES);
         }
         match &f.kind {
@@ -528,7 +529,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         Backing::File { ino, off, fend } => Backing::File { ino, off, fend: va.saturating_add(fend) },
         b => b,
     };
-    let shared = flags & MAP_SHARED != 0 && matches!(back, Backing::Anon);
+    let shared = flags & MAP_SHARED != 0;
     m.pt.map(va, va + len, prot_bits(prot), shared, back).ok_or(-ENOMEM)?;
     Ok(va as i64)
 }
@@ -542,6 +543,15 @@ fn sys_munmap(addr: usize, len: usize) -> R {
         return Err(-EINVAL);
     }
     proc::current().pt().unmap(addr, addr + pg_up(len));
+    Ok(0)
+}
+
+/// msync: MAP_SHARED のファイルで書いたページを書き戻す (MS_ASYNC でもすぐに)
+fn sys_msync(addr: usize, len: usize) -> R {
+    if addr & 0xfff != 0 {
+        return Err(-EINVAL);
+    }
+    proc::current().pt().msync(addr, addr + len);
     Ok(0)
 }
 
