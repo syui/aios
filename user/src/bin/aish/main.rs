@@ -1,4 +1,6 @@
-// aios の小さなシェル (POSIX sh のだいたい)。sh -c CMD、sh FILE ARGS...、対話も
+// aish: aios のシェル (POSIX sh のだいたい + 対話の機能)。aish -c CMD、aish FILE ARGS...、対話も
+//   /bin/sh は aish へのリンク (bash と同じやり方)。sh として呼ばれたら POSIX の sh として
+//   設定は $ENV だけ読み、aish として呼ばれたら /etc/aishrc と ~/.aishrc を読む
 //   パイプ |、つけかえ < > >> <> >| N>&M N<&- <<EOF <<-EOF、並べる ; && || &、! パイプライン
 //   if / while / until / for / case / { } / ( )、関数 NAME() { ... } (local, return)
 //   展開: ~ $NAME ${NAME} ${NAME:-x} ${NAME:=x} ${NAME:+x} ${NAME:?x} ${#NAME} ${NAME#p} ${NAME##p} ${NAME%p} ${NAME%%p}
@@ -7,7 +9,9 @@
 //             return break continue exec command type、ジョブ: jobs fg bg wait kill %N
 //   set -e (失敗で終わる)、set -x (実行するコマンドを見せる)
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
-//   対話するときは行の編集と履歴 (edit.rs)、alias、~/.shrc ($ENV) を読む
+//   対話するときは行の編集と履歴 (edit.rs)、alias
+//   読むファイル: ログインのとき /etc/profile, ~/.profile。対話するとき aish は /etc/aishrc, ~/.aishrc、
+//   sh は $ENV
 mod edit;
 mod expand;
 mod glob;
@@ -18,6 +22,14 @@ use expand::Mode;
 use jobs::{exit_code, interactive, jobs};
 use parse::{AndOr, Cmd, Compound, Error, List, Parser, Pipeline, RKind, Redir};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// 呼ばれた名前 ("aish" か "sh")。エラーの頭にも使う
+static NAME: OnceLock<&'static str> = OnceLock::new();
+
+fn shell_name() -> &'static str {
+    NAME.get().copied().unwrap_or("aish")
+}
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::rc::Rc;
@@ -79,7 +91,7 @@ pub struct Shell {
     aliases: HashMap<String, String>,
     /// いま展開している alias (自分自身をくりかえし展開しない)
     expanding: Vec<String>,
-    /// 最近のディレクトリ (新しいものが先。対話するときは ~/.sh_dirs に残す)
+    /// 最近のディレクトリ (新しいものが先。対話するときは ~/.aish_dirs に残す)
     dirs: Vec<String>,
     dirs_file: Option<String>,
 }
@@ -271,7 +283,7 @@ impl Shell {
             Cmd::Compound(c, redirs) => match self.expand_redirs(redirs) {
                 Ok(r) => self.with_redirs(&r, |sh| sh.run_compound(c)),
                 Err(e) => {
-                    eprintln!("sh: {}", e);
+                    eprintln!("{}: {}", shell_name(), e);
                     1
                 }
             },
@@ -362,7 +374,7 @@ impl Shell {
         let r = match self.prepare(assigns, words, redirs) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("sh: {}", e);
+                eprintln!("{}: {}", shell_name(), e);
                 if !interactive() && self.sourcing == 0 && self.locals.is_empty() {
                     exit_shell(1);
                 }
@@ -449,7 +461,7 @@ impl Shell {
                             match self.expand(w, Mode::Fields) {
                                 Ok(x) => v.extend(x),
                                 Err(e) => {
-                                    eprintln!("sh: {}", e);
+                                    eprintln!("{}: {}", shell_name(), e);
                                     return 1;
                                 }
                             }
@@ -474,7 +486,7 @@ impl Shell {
                 let s: Vec<char> = match self.expand_one(w) {
                     Ok(s) => s.chars().collect(),
                     Err(e) => {
-                        eprintln!("sh: {}", e);
+                        eprintln!("{}: {}", shell_name(), e);
                         return 1;
                     }
                 };
@@ -483,7 +495,7 @@ impl Shell {
                         let pat: Vec<char> = match self.expand(p, Mode::Pattern) {
                             Ok(mut v) => v.pop().unwrap_or_default().chars().collect(),
                             Err(e) => {
-                                eprintln!("sh: {}", e);
+                                eprintln!("{}: {}", shell_name(), e);
                                 return 1;
                             }
                         };
@@ -649,7 +661,7 @@ impl Shell {
         for (i, part) in parts.into_iter().enumerate() {
             let mut fds = [-1, -1];
             if i + 1 < n && unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                eprintln!("sh: pipe: {}", last_err());
+                eprintln!("{}: pipe: {}", shell_name(), last_err());
                 break;
             }
             flush();
@@ -703,7 +715,7 @@ impl Shell {
                 }
                 pids.push(pid);
             } else {
-                eprintln!("sh: fork: {}", last_err());
+                eprintln!("{}: fork: {}", shell_name(), last_err());
             }
         }
         jobs::add_job(pgid, pids, text, bg)
@@ -724,7 +736,7 @@ impl Shell {
                     self.run_compound(&c)
                 }
                 Err(e) => {
-                    eprintln!("sh: {}", e);
+                    eprintln!("{}: {}", shell_name(), e);
                     1
                 }
             },
@@ -749,7 +761,7 @@ impl Shell {
                 }
                 Ok(r) => self.exec_ready(r),
                 Err(e) => {
-                    eprintln!("sh: {}", e);
+                    eprintln!("{}: {}", shell_name(), e);
                     1
                 }
             },
@@ -777,11 +789,11 @@ impl Shell {
             unsafe { std::env::set_var(k, v) };
         }
         let Some(prog) = self.find(&r.args[0]) else {
-            eprintln!("sh: {}: command not found", r.args[0]);
+            eprintln!("{}: {}: command not found", shell_name(), r.args[0]);
             return 127;
         };
         self.execve(&prog, &r.args);
-        eprintln!("sh: {}: {}", r.args[0], last_err());
+        eprintln!("{}: {}: {}", shell_name(), r.args[0], last_err());
         126
     }
 
@@ -806,7 +818,7 @@ impl Shell {
         let list = match Parser::new(src).program() {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("sh: $(...): {}", match e {
+                eprintln!("{}: $(...): {}", shell_name(), match e {
                     Error::Incomplete => "syntax error: unexpected end of file".into(),
                     Error::Syntax(s) => s,
                 });
@@ -1098,11 +1110,11 @@ impl Shell {
             }
             "exec" => {
                 let Some(prog) = self.find(&a[0]) else {
-                    eprintln!("sh: {}: command not found", a[0]);
+                    eprintln!("{}: {}: command not found", shell_name(), a[0]);
                     exit_shell(127);
                 };
                 self.execve(&prog, a);
-                eprintln!("sh: {}: {}", a[0], last_err());
+                eprintln!("{}: {}: {}", shell_name(), a[0], last_err());
                 exit_shell(126)
             }
             "command" | "type" => {
@@ -1139,7 +1151,7 @@ impl Shell {
                 st
             }
             _ => {
-                eprintln!("sh: {}: not a builtin", name);
+                eprintln!("{}: {}: not a builtin", shell_name(), name);
                 1
             }
         }
@@ -1312,7 +1324,7 @@ fn apply_redir(fd: i32, t: &RT) -> bool {
                 let p = cstr(path);
                 let f = libc::open(p.as_ptr(), *flags, 0o666);
                 if f < 0 {
-                    eprintln!("sh: {}: {}", path, last_err());
+                    eprintln!("{}: {}: {}", shell_name(), path, last_err());
                     return false;
                 }
                 if f != fd {
@@ -1322,7 +1334,7 @@ fn apply_redir(fd: i32, t: &RT) -> bool {
             }
             RT::Dup(n) => {
                 if *n != fd && libc::dup2(*n, fd) < 0 {
-                    eprintln!("sh: {}: {}", n, last_err());
+                    eprintln!("{}: {}: {}", shell_name(), n, last_err());
                     return false;
                 }
             }
@@ -1344,7 +1356,7 @@ fn apply_redir(fd: i32, t: &RT) -> bool {
                     let path = cstr(&format!("/tmp/.sh-here-{}-{}", std::process::id(), fd));
                     let f = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o600);
                     if f < 0 {
-                        eprintln!("sh: heredoc: {}", last_err());
+                        eprintln!("{}: heredoc: {}", shell_name(), last_err());
                         return false;
                     }
                     libc::unlink(path.as_ptr());
@@ -1588,6 +1600,9 @@ fn binary_test(l: &str, op: &str, r: &str) -> Result<bool, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 呼ばれた名前: sh (と -sh) なら POSIX の sh として
+    let base = args.first().map_or("aish", |a| a.rsplit('/').next().unwrap_or(a).trim_start_matches('-'));
+    let _ = NAME.set(if base == "sh" { "sh" } else { "aish" });
     // sh -c CMD [NAME ARGS...]: NAME が $0
     if args.get(1).is_some_and(|a| a == "-c") {
         let cmd = args.get(2).cloned().unwrap_or_default();
@@ -1596,7 +1611,7 @@ fn main() {
             ps.push(args[0].clone());
         }
         let mut sh = Shell::new(ps);
-        let st = sh.run_source(&cmd, "sh");
+        let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
     }
     // sh [-e] [-x] FILE ARGS...
@@ -1619,7 +1634,7 @@ fn main() {
         let text = match std::fs::read_to_string(file) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("sh: {}: {}", file, e);
+                eprintln!("{}: {}: {}", shell_name(), file, e);
                 std::process::exit(127);
             }
         };
@@ -1635,14 +1650,19 @@ fn main() {
             }
         }
     }
-    // 対話するシェルは /etc/shrc と $ENV (なければ ~/.shrc) も読む: alias や PS1 など
+    // 対話するシェルは設定も読む: alias や PS1 など
+    //   aish: /etc/aishrc と ~/.aishrc (zsh の /etc/zsh/zshrc と ~/.zshrc のように)
+    //   sh:   $ENV だけ (POSIX)
     if unsafe { libc::isatty(0) } == 1 {
-        if std::path::Path::new("/etc/shrc").is_file() {
-            sh.builtin(&[".".into(), "/etc/shrc".into()]);
-        }
-        let rc = sh.get_var("ENV").and_then(|e| sh.expand_one(&e).ok()).unwrap_or_else(|| format!("{}/.shrc", home));
-        if std::path::Path::new(&rc).is_file() {
-            sh.builtin(&[".".into(), rc]);
+        let rcs = if shell_name() == "sh" {
+            sh.get_var("ENV").and_then(|e| sh.expand_one(&e).ok()).into_iter().collect()
+        } else {
+            vec!["/etc/aishrc".to_string(), format!("{}/.aishrc", home)]
+        };
+        for rc in rcs {
+            if std::path::Path::new(&rc).is_file() {
+                sh.builtin(&[".".into(), rc]);
+            }
         }
     }
     sh.interactive();
@@ -1673,16 +1693,16 @@ impl Shell {
                 }
             }
         }
-        // 履歴: $HISTFILE (なければ ~/.sh_history)、$HISTSIZE 行
+        // 履歴: $HISTFILE (なければ ~/.aish_history)、$HISTSIZE 行
         let mut ed = edit::Editor::new();
         if tty {
             let home = self.get_var("HOME").unwrap_or_default();
-            let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.sh_history", home));
+            let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.aish_history", home));
             let size = self.get_var("HISTSIZE").and_then(|n| n.parse().ok()).unwrap_or(10000);
             ed.load((!home.is_empty() || file.starts_with('/')).then_some(file), size);
             // 最近のディレクトリ (C-j)
             if !home.is_empty() {
-                let f = format!("{}/.sh_dirs", home);
+                let f = format!("{}/.aish_dirs", home);
                 self.dirs = std::fs::read_to_string(&f).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect();
                 self.dirs_file = Some(f);
             }
@@ -1715,7 +1735,7 @@ impl Shell {
                 Ok(Some(l)) => l,
                 Ok(None) => {
                     if !buf.is_empty() {
-                        eprintln!("sh: syntax error: unexpected end of file");
+                        eprintln!("{}: syntax error: unexpected end of file", shell_name());
                         exit_shell(2);
                     }
                     if tty {
@@ -1747,7 +1767,7 @@ impl Shell {
                 }
                 Err(Error::Incomplete) => {}
                 Err(Error::Syntax(e)) => {
-                    eprintln!("sh: {}", e);
+                    eprintln!("{}: {}", shell_name(), e);
                     buf.clear();
                     self.status = 2;
                 }
