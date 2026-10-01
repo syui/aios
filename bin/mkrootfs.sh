@@ -1,6 +1,6 @@
 #!/bin/sh
 # パッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
-#   bin/mkrootfs.sh                  aios-base (init, sh, aipkg, ... と /etc) だけ
+#   bin/mkrootfs.sh                  aios-base (init, sh, aipkg, ... と /etc) とその依存 (coreutils など)
 #   bin/mkrootfs.sh grep sed ...     pkg/NAME のパッケージも入れる
 #   bin/mkrootfs.sh all              pkg/ のパッケージをぜんぶ入れる
 #   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
