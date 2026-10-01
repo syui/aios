@@ -251,6 +251,12 @@ pub fn reg_of(c: &str, i: usize) -> Option<(u64, u64)> {
     scan(|n| (n.is_compatible(c) && n.enabled()).then(|| n.reg(i)).flatten())
 }
 
+/// reg_of と同じだが、status が disabled のノードも (UEFI はファームウェアが使う RTC を
+/// disabled にして渡す。読むだけなら使える)
+pub fn reg_of_any(c: &str, i: usize) -> Option<(u64, u64)> {
+    scan(|n| n.is_compatible(c).then(|| n.reg(i)).flatten())
+}
+
 /// compatible が c のノードの interrupts の i 番目のセル
 pub fn irq_cell(c: &str, i: usize) -> Option<u32> {
     scan(|n| (n.is_compatible(c) && n.enabled()).then(|| n.interrupt_cell(i)).flatten())
