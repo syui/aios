@@ -128,25 +128,59 @@ fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
     Ok(())
 }
 
+/// 一度に運ぶ大きさ
+const CHUNK: usize = 64 * 1024;
+
+/// 待つことのないもの (ふつうのファイル、/dev/zero など、ディスク): 頼まれた分を最後まで運ぶ (Linux と同じ)。
+/// パイプや端末やソケットは、1 回分 (届いている分) だけ
+fn whole(f: &FileRef) -> bool {
+    matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_))
+}
+
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
-    let mut tmp = vec![0u8; len.min(64 * 1024)];
-    let n = file::read(&f, &mut tmp)?;
-    out(buf, &tmp[..n])?;
-    Ok(n as i64)
+    let whole = whole(&f);
+    let mut done = 0;
+    loop {
+        let mut tmp = vec![0u8; (len - done).min(CHUNK)];
+        let n = match file::read(&f, &mut tmp) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        out(buf + done, &tmp[..n])?;
+        done += n;
+        if !whole || n < tmp.len() || done >= len {
+            break;
+        }
+    }
+    Ok(done as i64)
 }
 
 pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
-    let mut tmp = vec![0u8; len.min(64 * 1024)];
-    proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
-    let r = file::write(&f, &tmp);
-    if r == Err(-file::EPIPE) {
-        // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
-        let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
-        crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
+    let whole = whole(&f);
+    let mut done = 0;
+    loop {
+        let mut tmp = vec![0u8; (len - done).min(CHUNK)];
+        proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
+        let r = file::write(&f, &tmp);
+        if r == Err(-file::EPIPE) {
+            // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
+            let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
+            crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
+        }
+        let n = match r {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        done += n;
+        if !whole || n < tmp.len() || done >= len {
+            break;
+        }
     }
-    Ok(r? as i64)
+    Ok(done as i64)
 }
 
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
@@ -348,28 +382,36 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     Ok(0)
 }
 
-/// swapon / swapoff の path: ブロックデバイスのノードの区画と、その名前
-fn swap_part(pathp: usize) -> Result<(crate::block::Part, String), i64> {
+/// swapon / swapoff の path: ブロックデバイスのノードの区画か、ふつうのファイル。と、その名前
+fn swap_source(pathp: usize) -> Result<(crate::swap::Source, String), i64> {
+    use crate::swap::Source;
     if cred::current().euid != 0 {
         return Err(-cred::EPERM);
     }
+    let path = user_str(pathp)?;
     let ino = at(AT_FDCWD, pathp, 0)?;
-    if ino.meta().mode & S_IFMT != vfs::S_IFBLK {
-        return Err(-EINVAL);
+    match ino.meta().mode & S_IFMT {
+        vfs::S_IFBLK => {
+            let (ma, mi) = fs::dev_of(&ino).ok_or(-EINVAL)?;
+            let p = crate::block::part_of_dev(ma, mi).ok_or(-6)?;
+            Ok((Source::Part(p), crate::block::part_name(&p)))
+        }
+        vfs::S_IFREG => {
+            let name = if path.starts_with('/') { path } else { alloc::format!("/{}/{}", proc::current().files().cwd, path).replace("//", "/") };
+            Ok((Source::File(ino), name))
+        }
+        _ => Err(-EINVAL),
     }
-    let (ma, mi) = fs::dev_of(&ino).ok_or(-EINVAL)?;
-    let p = crate::block::part_of_dev(ma, mi).ok_or(-6)?;
-    Ok((p, crate::block::part_name(&p)))
 }
 
 pub fn swapon(pathp: usize) -> R {
-    let (p, name) = swap_part(pathp)?;
-    crate::swap::on(p, name).map(|_| 0)
+    let (src, name) = swap_source(pathp)?;
+    crate::swap::on(src, name).map(|_| 0)
 }
 
 pub fn swapoff(pathp: usize) -> R {
-    let (_, name) = swap_part(pathp)?;
-    crate::swap::off(&name).map(|_| 0)
+    let (src, _) = swap_source(pathp)?;
+    crate::swap::off(&src).map(|_| 0)
 }
 
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
@@ -818,8 +860,10 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
         return Err(-EINVAL);
     }
     let mut tmp = vec![0u8; len.min(64 * 1024)];
-    let n = match (pipe_of(fd_in), off_in) {
-        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, false, flags & SPLICE_F_NONBLOCK != 0)?,
+    // パイプからは読み減らさずに見て、書けた分だけ取る (書けなければパイプに残す。Linux と同じ)
+    let pin = pipe_of(fd_in);
+    let n = match (pin.clone(), off_in) {
+        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, true, flags & SPLICE_F_NONBLOCK != 0)?,
         (None, 0) => file::read(&file_of(fd_in)?, &mut tmp)?,
         (None, at) => {
             let off = read_off(at)?;
@@ -831,18 +875,28 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     if n == 0 {
         return Ok(0);
     }
-    if off_out != 0 {
+    let done = if off_out != 0 {
         let off = read_off(off_out)?;
-        inode_of(fd_out)?.write_at(off as usize, &tmp[..n])?;
-        out(off_out, &(off + n as i64).to_le_bytes())?;
-        return Ok(n as i64);
+        let w = inode_of(fd_out)?.write_at(off as usize, &tmp[..n])?;
+        out(off_out, &(off + w as i64).to_le_bytes())?;
+        w
+    } else {
+        let f = file_of(fd_out)?;
+        let mut done = 0;
+        while done < n {
+            match file::write(&f, &tmp[done..n]) {
+                Ok(0) => break,
+                Ok(w) => done += w,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        done
+    };
+    if let Some(p) = pin {
+        let _ = Pipe::read_ex(&p, &mut tmp[..done], false, true);
     }
-    let f = file_of(fd_out)?;
-    let mut done = 0;
-    while done < n {
-        done += file::write(&f, &tmp[done..n])?;
-    }
-    Ok(n as i64)
+    Ok(done as i64)
 }
 
 fn read_off(va: usize) -> Result<i64, i64> {
