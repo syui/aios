@@ -322,7 +322,7 @@ pub fn summary() {
         print!(", memory {:#x} {} MiB", base, size / (1024 * 1024));
     }
     println!();
-    for c in ["arm,pl011", "arm,cortex-a15-gic", "arm,gic-400", "brcm,bcm2836-l1-intc", "brcm,bcm2836-armctrl-ic", "arm,pl031", "brcm,bcm2835-sdhost"] {
+    for c in ["arm,pl011", "arm,cortex-a15-gic", "arm,gic-400", "arm,gic-v3", "brcm,bcm2836-l1-intc", "brcm,bcm2836-armctrl-ic", "arm,pl031", "brcm,bcm2835-sdhost"] {
         if let Some((a, _)) = reg_of(c, 0) {
             println!("dtb:   {} at {:#x}", c, a);
         }

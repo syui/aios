@@ -60,20 +60,25 @@ jobs:
 
       - name: Boot test
         run: |
-          # UEFI → aiboot → カーネル → init → swap.service まで来るか
-          bin/run.sh < /dev/null > boot.log 2>&1 &
-          ok=
-          for i in $(seq 1 150); do
-            if grep -q '^aios init:' boot.log && grep -q '^swap: /dev/vda3' boot.log; then
-              ok=1
-              break
-            fi
-            sleep 2
+          # UEFI → aiboot → カーネル → init → swap.service まで来るか。
+          # GICv2 と、Mac の HVF と同じ GICv3 (仮想タイマ) の両方で
+          for gic in "" 3; do
+            AIOS_GIC=$gic bin/run.sh < /dev/null > boot.log 2>&1 &
+            ok=
+            for i in $(seq 1 150); do
+              if grep -q '^aios init:' boot.log && grep -q '^swap: /dev/vda3' boot.log; then
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+            sleep 5
+            pkill -f '^qemu-system-aarch64' || true
+            wait || true
+            echo "== gic ${gic:-2}"
+            cat boot.log
+            [ -n "$ok" ] || exit 1
           done
-          sleep 5
-          pkill -f '^qemu-system-aarch64' || true
-          cat boot.log
-          [ -n "$ok" ]
 
       - name: Assets
         run: |

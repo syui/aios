@@ -7,7 +7,7 @@ pub fn next() -> u64 {
     let mut x = STATE.load(Ordering::Relaxed);
     if x == 0 {
         let c: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) c) };
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) c) };
         x = c | 1;
     }
     x ^= x << 13;

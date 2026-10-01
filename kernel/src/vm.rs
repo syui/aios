@@ -177,6 +177,20 @@ fn slot_of(e: u64) -> swap::Slot {
     (e & PTE_ADDR) >> 12
 }
 
+/// カーネルが書いたところを命令として実行できるように: データキャッシュを PoU まで書き出し、
+/// 命令キャッシュを (すべての CPU で) 消す。QEMU の TCG では要らないが、本物の CPU (HVF) では要る
+pub fn sync_icache(kva: usize, len: usize) {
+    let ctr: u64;
+    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    let line = 4usize << ((ctr >> 16) & 0xf);
+    let mut a = kva & !(line - 1);
+    while a < kva + len {
+        unsafe { core::arch::asm!("dc cvau, {}", in(reg) a) };
+        a += line;
+    }
+    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };
+}
+
 fn page_of(e: u64) -> *mut u8 {
     table_at(e) as *mut u8
 }
@@ -551,6 +565,9 @@ impl PageTable {
                             }
                         }
                         shared_file().insert(key, Cached { page, dirty: false, ino: ino.clone() });
+                        if prot & PROT_EXEC != 0 {
+                            sync_icache(page as usize, PGSIZE);
+                        }
                         page
                     }
                 };
@@ -574,6 +591,9 @@ impl PageTable {
                 return Err(FaultErr::NoMem);
             }
             swap::free(slot_of(e));
+            if prot & PROT_EXEC != 0 {
+                sync_icache(page as usize, PGSIZE);
+            }
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
         } else if !has_page(e) {
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
@@ -586,6 +606,9 @@ impl PageTable {
                         return Err(FaultErr::NoMem);
                     }
                 }
+                if prot & PROT_EXEC != 0 {
+                    sync_icache(page as usize, PGSIZE);
+                }
             }
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
         } else if write || force {
@@ -594,6 +617,9 @@ impl PageTable {
                 // 共有しているので写す
                 let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
                 unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
+                if prot & PROT_EXEC != 0 {
+                    sync_icache(page as usize, PGSIZE);
+                }
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
                 flush_va(page_va);
                 self.quiesce();
@@ -644,8 +670,10 @@ impl PageTable {
 
     /// 書けない領域にも書く (exec が ELF を読み込むとき)
     pub fn copy_out_force(&mut self, dst: usize, src: &[u8]) -> Option<()> {
+        // ELF のコードかもしれないので、命令キャッシュも合わせる
         self.each_chunk(dst, src.len(), true, true, |pa, off, n| unsafe {
             core::ptr::copy_nonoverlapping(src[off..].as_ptr(), p2v(pa) as *mut u8, n);
+            sync_icache(p2v(pa), n);
         })
     }
 
