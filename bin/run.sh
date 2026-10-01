@@ -7,6 +7,10 @@
 #                         あるときは ESP の /Image を直に (mtools が要る)
 #                         区画なしの ext4 なら /boot/Image を (debugfs が要る)
 #                       どれもなければ開発用カーネルで
+#                       disk.img がなく aios-unix-aarch64.img.zst (リリース unix-latest) があれば、展開して使う:
+#                         git clone -b unix https://git.syui.ai/ai/os aios && cd aios
+#                         curl -fLO https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst
+#                         bin/run.sh      (Mac: brew install qemu zstd)
 #   AIOS_EFI_CODE=FILE  UEFI のファームウェア (既定はよくある場所から探す)。変数は build/efivars.fd
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
@@ -19,6 +23,10 @@ case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+if [ -z "$k" ] && [ ! -f disk.img ] && [ -f aios-unix-aarch64.img.zst ]; then
+  echo "disk.img: aios-unix-aarch64.img.zst を展開します" >&2
+  zstd -d -q aios-unix-aarch64.img.zst -o disk.img || exit 1
+fi
 uefi=
 gpt=
 [ -f disk.img ] && [ "$(dd if=disk.img bs=1 skip=512 count=8 2>/dev/null)" = "EFI PART" ] && gpt=1
