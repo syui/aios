@@ -23,6 +23,7 @@ mod initrd;
 mod kalloc;
 mod memlayout;
 mod net;
+mod netif;
 mod proc;
 mod sd;
 mod smp;

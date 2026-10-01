@@ -713,6 +713,10 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         }
         return Ok(0);
     }
+    // ネットワークのインターフェース (ip、networkd): ソケットの fd に
+    if matches!(f.borrow().kind, Kind::Socket(_)) && crate::netif::handles(req) {
+        return crate::netif::ioctl(req, arg);
+    }
     if let Kind::Block(p) = &f.borrow().kind {
         // BLKGETSIZE64 (バイト数)、BLKGETSIZE (セクタ数)、BLKSSZGET / BLKBSZGET (セクタの大きさ)
         const BLKGETSIZE: u64 = 0x1260;
