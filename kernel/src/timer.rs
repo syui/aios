@@ -22,11 +22,12 @@ fn rearm() {
 }
 
 /// 起動したときの時刻 (UNIX 秒)。PL031 RTC があればそこから、なければ (ラズパイには
-/// RTC がない) カーネルを作った時刻から始める
+/// RTC がない) カーネルを作った時刻から始める。
+/// UEFI から起動すると DTB の PL031 は disabled (ファームウェアの時計) だが、読むだけなのでそれも使う
 static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
-    let rtc = if crate::dtb::present() { crate::dtb::reg_of("arm,pl031", 0).map(|(a, _)| a as usize) } else { Some(0x0901_0000) };
+    let rtc = if crate::dtb::present() { crate::dtb::reg_of_any("arm,pl031", 0).map(|(a, _)| a as usize) } else { Some(0x0901_0000) };
     let epoch = match rtc {
         Some(pa) => (unsafe { core::ptr::read_volatile(crate::memlayout::p2v(pa) as *const u32) }) as u64,
         None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),
