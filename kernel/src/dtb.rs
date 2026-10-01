@@ -282,6 +282,18 @@ pub fn psci_method() -> Option<&'static str> {
     scan(|n| (n.is_compatible("arm,psci") || n.is_compatible("arm,psci-0.2") || n.is_compatible("arm,psci-1.0")).then(|| n.str("method")).flatten())
 }
 
+/// CPU ごとに f(MPIDR の値, 起こし方 ("psci" / "spin-table"), spin-table の cpu-release-addr)
+pub fn each_cpu(mut f: impl FnMut(u64, Option<&'static str>, Option<u64>)) {
+    scan::<()>(|n| {
+        if n.str("device_type") == Some("cpu") && n.enabled() {
+            let mpidr = n.reg(0).map_or(0, |(a, _)| a);
+            let release = n.prop("cpu-release-addr").map(|v| cells(v, 0, v.len() / 4));
+            f(mpidr, n.str("enable-method"), release);
+        }
+        None
+    });
+}
+
 /// ルートの model
 pub fn model() -> &'static str {
     scan(|n| (n.depth() == 0).then(|| n.str("model")).flatten()).unwrap_or("")

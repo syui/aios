@@ -25,6 +25,7 @@ mod memlayout;
 mod net;
 mod proc;
 mod sd;
+mod smp;
 mod procfs;
 mod rand;
 mod signal;
@@ -52,6 +53,8 @@ fn current_el() -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
+    // CPU の番号 (smp::id) は 0
+    unsafe { core::arch::asm!("msr tpidr_el1, xzr") };
     // 出力の場所 (UART) は DTB で決まるので、何よりも先に DTB を読む
     let has_dtb = dtb::init();
     uart::early_init();
@@ -77,7 +80,10 @@ pub extern "C" fn kmain() -> ! {
     fs::init();
     net::init();
 
+    // ここからは大きなロックを持って (smp.rs)
+    smp::lock();
     proc::user_init();
+    smp::start();
     proc::scheduler()
 }
 

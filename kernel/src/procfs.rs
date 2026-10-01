@@ -6,7 +6,7 @@
 //   /proc/PID/cmdline   (いまは comm だけ)
 //   /proc/PID/cwd       -> カレントディレクトリ
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
-//   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン)
+//   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 use crate::proc::{self, Proc, State};
 use crate::vfs::*;
@@ -29,6 +29,7 @@ enum Node {
     NetDir,
     Pnp,
     KernelCmdline,
+    CpuInfo,
     Pid(u32),
     Stat(u32),
     Status(u32),
@@ -66,6 +67,7 @@ impl ProcInode {
             Node::NetDir => 6,
             Node::Pnp => 7,
             Node::KernelCmdline => 8,
+            Node::CpuInfo => 9,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
@@ -93,6 +95,23 @@ impl ProcInode {
                 String::from_utf8_lossy(&b[..n]).into_owned()
             }
             Node::KernelCmdline => format!("{}\n", crate::dtb::bootargs().unwrap_or("")),
+            Node::CpuInfo => {
+                let midr: u64;
+                unsafe { core::arch::asm!("mrs {}, midr_el1", out(reg) midr) };
+                let mut s = String::new();
+                for i in 0..crate::smp::online() {
+                    s += &format!(
+                        "processor\t: {}\nBogoMIPS\t: {}.00\nFeatures\t: fp asimd\nCPU implementer\t: {:#04x}\nCPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
+                        i,
+                        crate::timer::freq() * 2 / 1_000_000,
+                        (midr >> 24) & 0xff,
+                        (midr >> 20) & 0xf,
+                        (midr >> 4) & 0xfff,
+                        midr & 0xf
+                    );
+                }
+                s
+            }
             Node::Uptime => {
                 let t = crate::timer::ticks();
                 format!("{}.{:02} 0.00\n", t / 100, t % 100)
@@ -277,6 +296,7 @@ impl Inode for ProcInode {
             (Node::Root, "mounts") => Node::Mounts,
             (Node::Root, "uptime") => Node::Uptime,
             (Node::Root, "cmdline") => Node::KernelCmdline,
+            (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
@@ -308,6 +328,7 @@ impl Inode for ProcInode {
                 add("mounts".into(), Node::Mounts);
                 add("uptime".into(), Node::Uptime);
                 add("cmdline".into(), Node::KernelCmdline);
+                add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);
                 add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {

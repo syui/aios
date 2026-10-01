@@ -142,8 +142,19 @@ pub fn intr_off() {
     unsafe { core::arch::asm!("msr daifset, #2") };
 }
 
+/// 例外の入口: 大きなロックを取ってから処理し、戻る前に放す (smp.rs)。
+/// EL1 の割り込みはスケジューラが割り込みを待っているとき (ロックを放している) だけ来る
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
+    if kind == EL1H_SYNC {
+        return handle(tf, kind);
+    }
+    crate::smp::lock();
+    handle(tf, kind);
+    crate::smp::unlock();
+}
+
+fn handle(tf: &mut TrapFrame, kind: u64) {
     match kind {
         EL1H_SYNC => {
             let (esr, far) = esr_far();
