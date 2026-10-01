@@ -242,6 +242,52 @@ pub fn readv(fd: u64, iov: usize, cnt: usize) -> R {
     Ok(total)
 }
 
+/// preadv / pwritev: off から順に、iovec ごとに pread / pwrite。
+/// preadv2 / pwritev2 で off が -1 なら、いまの位置で readv / writev
+pub fn preadv(fd: u64, iov: usize, cnt: usize, off: i64) -> R {
+    if off == -1 {
+        return readv(fd, iov, cnt);
+    }
+    if off < 0 {
+        return Err(-EINVAL);
+    }
+    let mut total = 0;
+    for (base, len) in iovecs(iov, cnt)? {
+        let mut done = 0;
+        while done < len {
+            let n = pread(fd, base + done, len - done, off + total + done as i64)?;
+            if n == 0 {
+                return Ok(total + done as i64);
+            }
+            done += n as usize;
+        }
+        total += len as i64;
+    }
+    Ok(total)
+}
+
+pub fn pwritev(fd: u64, iov: usize, cnt: usize, off: i64) -> R {
+    if off == -1 {
+        return writev(fd, iov, cnt);
+    }
+    if off < 0 {
+        return Err(-EINVAL);
+    }
+    let mut total = 0;
+    for (base, len) in iovecs(iov, cnt)? {
+        let mut done = 0;
+        while done < len {
+            let n = pwrite(fd, base + done, len - done, off + total + done as i64)?;
+            if n == 0 {
+                return Ok(total + done as i64);
+            }
+            done += n as usize;
+        }
+        total += len as i64;
+    }
+    Ok(total)
+}
+
 pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
@@ -343,6 +389,18 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
     }
     let ino = at(dirfd, pathp, flags)?;
     out(st, &Stat::of_inode(&ino).to_bytes())?;
+    Ok(0)
+}
+
+/// statx(2): newfstatat と同じものを struct statx で
+pub fn statx(dirfd: i64, pathp: usize, flags: u64, buf: usize) -> R {
+    let path = user_str(pathp)?;
+    let s = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        file_of(dirfd as u64)?.borrow().stat()
+    } else {
+        Stat::of_inode(&at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?)
+    };
+    out(buf, &s.to_statx())?;
     Ok(0)
 }
 

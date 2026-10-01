@@ -2,6 +2,7 @@
 // Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る
 use crate::memlayout::PGSIZE;
 use crate::vm::{pg_down, pg_up, Backing, PageTable, PROT_EXEC, PROT_READ, PROT_RW, PROT_WRITE};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 pub const USER_STACK_TOP: usize = 0x40_0000_0000;
@@ -44,6 +45,8 @@ pub struct Image {
     pub entry: usize,
     pub sp: usize,
     pub brk: usize,
+    /// 動かしているプログラムの絶対パス (/proc/PID/exe。先頭 / なし)
+    pub exe: String,
 }
 
 /// "#!" の後ろの 1 行を (インタプリタ, 引数) に分ける。
@@ -88,7 +91,7 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
 
 fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
-    let ino = crate::vfs::resolve(&cwd, path, true)?;
+    let (exe, ino) = crate::vfs::lookup(&cwd, path, true)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
@@ -253,7 +256,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         put(v)?;
     }
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe })
 }
 
 

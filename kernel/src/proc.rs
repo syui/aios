@@ -66,6 +66,8 @@ pub struct Mm {
     pub brk: usize,
     /// 次に mmap で渡す場所
     pub mmap_next: usize,
+    /// /proc/PID/exe
+    pub exe: String,
 }
 
 #[derive(Clone)]
@@ -271,7 +273,7 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
-        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE }));
+        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -764,7 +766,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
-        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next })
+        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone() })
     };
     let files = if flags & CLONE_FILES != 0 && thread {
         parent.files.clone().unwrap()

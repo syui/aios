@@ -204,6 +204,33 @@ impl Stat {
         }
         b
     }
+
+    /// struct statx (STATX_BASIC_STATS だけ)
+    pub fn to_statx(&self) -> [u8; 256] {
+        let mut b = [0u8; 256];
+        b[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // stx_mask = STATX_BASIC_STATS
+        b[4..8].copy_from_slice(&4096u32.to_le_bytes());
+        b[16..20].copy_from_slice(&self.nlink.to_le_bytes());
+        b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+        b[24..28].copy_from_slice(&self.gid.to_le_bytes());
+        b[28..30].copy_from_slice(&(self.mode as u16).to_le_bytes());
+        b[32..40].copy_from_slice(&self.ino.to_le_bytes());
+        b[40..48].copy_from_slice(&self.size.to_le_bytes());
+        b[48..56].copy_from_slice(&self.blocks.to_le_bytes());
+        // atime, (btime なし), ctime, mtime
+        for (off, ns) in [(64, self.mtime), (96, self.ctime), (112, self.mtime)] {
+            b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            b[off + 8..off + 12].copy_from_slice(&((ns % 1_000_000_000) as u32).to_le_bytes());
+        }
+        // st_rdev と同じ番号 (makedev の形) を major / minor に
+        let d = self.rdev;
+        let major = ((d >> 32) & 0xffff_f000) | ((d >> 8) & 0xfff);
+        let minor = ((d >> 12) & 0xffff_ff00) | (d & 0xff);
+        b[128..132].copy_from_slice(&(major as u32).to_le_bytes());
+        b[132..136].copy_from_slice(&(minor as u32).to_le_bytes());
+        b[140..144].copy_from_slice(&1u32.to_le_bytes()); // st_dev = 1
+        b
+    }
 }
 
 impl OpenFile {
