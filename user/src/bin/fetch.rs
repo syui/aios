@@ -2,6 +2,8 @@
 //   -o FILE なら、メモリにためずに FILE へ書く (途中は FILE.part。切れたら続きから)
 #[path = "../lib/http.rs"]
 mod http;
+#[path = "../lib/meter.rs"]
+mod meter;
 #[path = "../lib/tls.rs"]
 mod tls;
 
@@ -16,12 +18,17 @@ fn main() {
         std::process::exit(2);
     };
     if let Some(path) = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)) {
-        if let Err(e) = http::download(url, Some(tls::connect), path) {
+        let mut m = meter::Meter::new(path, 0);
+        let r = http::download(url, Some(tls::connect), path, &mut |done, total| {
+            m.set_total(total);
+            m.update(done);
+        });
+        let n = std::fs::metadata(path).map_or(0, |m| m.len());
+        m.finish(n);
+        if let Err(e) = r {
             eprintln!("fetch: {}", e);
             std::process::exit(1);
         }
-        let n = std::fs::metadata(path).map_or(0, |m| m.len());
-        eprintln!("{} bytes -> {}", n, path);
         return;
     }
     match http::get(url, Some(tls::connect)) {
