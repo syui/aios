@@ -81,6 +81,10 @@ path = "src/bin/ip.rs"
 name = "networkd"
 path = "src/bin/networkd.rs"
 
+[[bin]]
+name = "chsh"
+path = "src/bin/chsh.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"

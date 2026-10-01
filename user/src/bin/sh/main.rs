@@ -1601,6 +1601,13 @@ fn main() {
     }
     // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);
+    // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.display().to_string();
+        if sh.get_var("PWD").as_deref() != Some(cwd.as_str()) {
+            sh.export("PWD", Some(cwd));
+        }
+    }
     let mut i = 1;
     while let Some(a) = args.get(i).filter(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "exs".contains(c))) {
         sh.errexit |= a.contains('e');
