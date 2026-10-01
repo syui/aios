@@ -28,7 +28,7 @@ pub fn init() -> bool {
     let Some((mmio, _)) = virtio::probe(DEVICE_BLOCK, 0) else { return false };
     let Some(q) = Queue::new(&mmio, 0, 8) else { return false };
     virtio::ready(&mmio);
-    let capacity: u64 = mmio.config(0);
+    let capacity = mmio.config64(0);
     println!("virtio-blk: {} MiB", capacity * SECTOR as u64 / (1024 * 1024));
     unsafe { *(&raw mut DISK) = Some(Disk { mmio, q, capacity }) };
     true

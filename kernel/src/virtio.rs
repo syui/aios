@@ -49,15 +49,22 @@ pub struct Mmio {
 
 impl Mmio {
     pub fn rd(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.base + off) as *const u32) }
+        crate::mmio::r32(self.base + off)
     }
 
     pub fn wr(&self, off: usize, v: u32) {
-        unsafe { write_volatile((self.base + off) as *mut u32, v) }
+        crate::mmio::w32(self.base + off, v)
     }
 
-    pub fn config<T: Copy>(&self, off: usize) -> T {
-        unsafe { read_volatile((self.base + CONFIG + off) as *const T) }
+    /// 設定の領域の 1 バイト
+    pub fn config8(&self, off: usize) -> u8 {
+        crate::mmio::r8(self.base + CONFIG + off)
+    }
+
+    /// 設定の領域の 64 ビット (32 ビットずつ、下から)
+    pub fn config64(&self, off: usize) -> u64 {
+        let a = self.base + CONFIG + off;
+        crate::mmio::r32(a) as u64 | (crate::mmio::r32(a + 4) as u64) << 32
     }
 
     /// 割り込みの理由を読んで下げる

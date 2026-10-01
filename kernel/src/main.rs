@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod boot;
+mod mmio;
 #[macro_use]
 mod uart;
 mod console;

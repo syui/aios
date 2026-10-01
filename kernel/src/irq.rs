@@ -11,7 +11,7 @@
 // 機器の割り込みはすべて cpu0 に届ける。
 use crate::dtb;
 use crate::memlayout::p2v;
-use core::ptr::{read_volatile, write_volatile};
+use crate::mmio;
 
 pub const SPURIOUS: u32 = 1023;
 pub const TIMER: u32 = 27;
@@ -68,11 +68,11 @@ fn ctrl() -> Ctrl {
 }
 
 fn rd(a: usize) -> u32 {
-    unsafe { read_volatile(a as *const u32) }
+    mmio::r32(a)
 }
 
 fn wr(a: usize, v: u32) {
-    unsafe { write_volatile(a as *mut u32, v) }
+    mmio::w32(a, v)
 }
 
 // ---- GICv3 ----
@@ -92,7 +92,7 @@ fn my_redist(r: usize) -> usize {
     let aff = (m & 0xff_ffff) | ((m >> 32) & 0xff) << 24;
     let mut f = r;
     for _ in 0..64 {
-        let t = unsafe { read_volatile((f + GICR_TYPER) as *const u64) };
+        let t = mmio::r64(f + GICR_TYPER);
         if (t >> 32) == aff {
             return f;
         }
@@ -224,10 +224,10 @@ pub fn enable(id: u32) {
     match ctrl() {
         Ctrl::Gic { d, .. } => {
             let i = id as usize;
-            unsafe { write_volatile((d + GICD_IPRIORITYR + i) as *mut u8, 0) };
+            mmio::w8(d + GICD_IPRIORITYR + i, 0);
             if i >= 32 {
                 // SPI は cpu0 に届ける
-                unsafe { write_volatile((d + GICD_ITARGETSR + i) as *mut u8, 1) };
+                mmio::w8(d + GICD_ITARGETSR + i, 1);
             }
             wr(d + GICD_ISENABLER + (i / 32) * 4, 1 << (i % 32));
         }
@@ -236,13 +236,13 @@ pub fn enable(id: u32) {
             if i < 32 {
                 // SGI と PPI はこの CPU の redistributor で
                 let s = my_redist(r) + GICR_SGI;
-                unsafe { write_volatile((s + GICD_IPRIORITYR + i) as *mut u8, 0) };
+                mmio::w8(s + GICD_IPRIORITYR + i, 0);
                 wr(s + GICD_ISENABLER, 1 << i);
             } else {
                 // SPI は group 1、cpu0 (affinity 0) へ
                 wr(d + GICD_IGROUPR + (i / 32) * 4, rd(d + GICD_IGROUPR + (i / 32) * 4) | 1 << (i % 32));
-                unsafe { write_volatile((d + GICD_IPRIORITYR + i) as *mut u8, 0) };
-                unsafe { write_volatile((d + GICD_IROUTER + i * 8) as *mut u64, 0) };
+                mmio::w8(d + GICD_IPRIORITYR + i, 0);
+                mmio::w64(d + GICD_IROUTER + i * 8, 0);
                 wr(d + GICD_ISENABLER + (i / 32) * 4, 1 << (i % 32));
             }
         }
