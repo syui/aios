@@ -1,0 +1,1648 @@
+// aios の小さなシェル (POSIX sh のだいたい)。sh -c CMD、sh FILE ARGS...、対話も
+//   パイプ |、つけかえ < > >> <> >| N>&M N<&- <<EOF <<-EOF、並べる ; && || &、! パイプライン
+//   if / while / until / for / case / { } / ( )、関数 NAME() { ... } (local, return)
+//   展開: ~ $NAME ${NAME} ${NAME:-x} ${NAME:=x} ${NAME:+x} ${NAME:?x} ${#NAME} ${NAME#p} ${NAME##p} ${NAME%p} ${NAME%%p}
+//         $(cmd) `cmd` $((式)) "$@"、IFS で分ける、ワイルドカード * ? [...]
+//   組み込み: cd pwd exit export unset set shift read local eval . source echo test [ true false :
+//             return break continue exec command type、ジョブ: jobs fg bg wait kill %N
+//   set -e (失敗で終わる)、set -x (実行するコマンドを見せる)
+//   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
+mod expand;
+mod glob;
+mod jobs;
+mod parse;
+
+use expand::Mode;
+use jobs::{exit_code, interactive, jobs};
+use parse::{AndOr, Cmd, Compound, Error, List, Parser, Pipeline, RKind, Redir};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io::{self, Write};
+use std::rc::Rc;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Flow {
+    None,
+    Break(u32),
+    Continue(u32),
+    Return,
+}
+
+/// 展開したつけかえ
+#[derive(Clone)]
+enum RT {
+    File(String, i32),
+    Dup(i32),
+    Close,
+    Here(String),
+}
+
+/// 展開を終えた外のコマンド
+struct Ready {
+    args: Vec<String>,
+    assigns: Vec<(String, String)>,
+    redirs: Vec<(i32, RT)>,
+}
+
+/// パイプラインの 1 つ (子の中で動かす)
+enum Part {
+    Ready(Ready),
+    Ast(Cmd),
+    AndOr(AndOr),
+}
+
+pub struct Shell {
+    /// export していない変数 (export したものは環境変数)
+    vars: HashMap<String, String>,
+    funcs: HashMap<String, Rc<Compound>>,
+    /// $0 と $1 以降
+    pub params: Vec<String>,
+    pub status: i32,
+    pub pid: i32,
+    pub errexit: bool,
+    pub xtrace: bool,
+    flow: Flow,
+    /// if / while の条件、! の中 (set -e で終わらない)
+    cond: u32,
+    loops: u32,
+    /// 関数ごとに local で変えたもの (名前, 前の値, export されていたか)
+    locals: Vec<Vec<(String, Option<String>, bool)>>,
+    /// . で読んでいる深さ (return できる)
+    sourcing: u32,
+    /// $( ) の終了ステータス (代入だけのコマンドの $? に)
+    subst_status: Option<i32>,
+    /// ジョブの表示に使う、いま動かしているもののソース
+    text: String,
+}
+
+const BUILTINS: &[&str] = &[
+    ":", "true", "false", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait",
+];
+
+fn is_builtin(args: &[String]) -> bool {
+    BUILTINS.contains(&args[0].as_str()) || (args[0] == "kill" && args.iter().any(|a| a.starts_with('%')))
+}
+
+fn flush() {
+    io::stdout().flush().ok();
+    io::stderr().flush().ok();
+}
+
+fn exit_shell(st: i32) -> ! {
+    flush();
+    std::process::exit(st)
+}
+
+/// エラーの文 ("(os error N)" を除く)
+fn err_text(e: &io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+fn last_err() -> String {
+    err_text(&io::Error::last_os_error())
+}
+
+fn cstr(s: &str) -> CString {
+    CString::new(s.replace('\0', "")).unwrap()
+}
+
+impl Shell {
+    fn new(params: Vec<String>) -> Shell {
+        Shell {
+            vars: HashMap::new(),
+            funcs: HashMap::new(),
+            params,
+            status: 0,
+            pid: std::process::id() as i32,
+            errexit: false,
+            xtrace: false,
+            flow: Flow::None,
+            cond: 0,
+            loops: 0,
+            locals: vec![],
+            sourcing: 0,
+            subst_status: None,
+            text: String::new(),
+        }
+    }
+
+    // ---- 変数 ----
+
+    pub fn get_var(&self, k: &str) -> Option<String> {
+        self.vars.get(k).cloned().or_else(|| std::env::var(k).ok())
+    }
+
+    pub fn set_var(&mut self, k: &str, v: &str) {
+        if std::env::var_os(k).is_some() {
+            unsafe { std::env::set_var(k, v) };
+        } else {
+            self.vars.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    fn export(&mut self, k: &str, v: Option<String>) {
+        let v = v.or_else(|| self.vars.get(k).cloned());
+        self.vars.remove(k);
+        if let Some(v) = v {
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+
+    fn unset(&mut self, k: &str) {
+        self.vars.remove(k);
+        unsafe { std::env::remove_var(k) };
+    }
+
+    // ---- 動かす ----
+
+    /// ソースを 1 コマンドずつ読んで動かす (sh FILE、sh -c、. 、eval)
+    fn run_source(&mut self, src: &str, name: &str) -> i32 {
+        let mut p = Parser::new(src);
+        loop {
+            match p.complete_command() {
+                Ok(Some(list)) => {
+                    self.run_list(&list);
+                    if self.flow != Flow::None {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let msg = match e {
+                        Error::Incomplete => "syntax error: unexpected end of file".into(),
+                        Error::Syntax(s) => s,
+                    };
+                    eprintln!("{}: {}", name, msg);
+                    self.status = 2;
+                    break;
+                }
+            }
+        }
+        self.status
+    }
+
+    fn run_list(&mut self, list: &List) -> i32 {
+        for item in list {
+            if self.flow != Flow::None {
+                break;
+            }
+            self.text = item.text.clone();
+            if item.bg {
+                let parts = if item.ao.rest.is_empty() && !item.ao.first.neg {
+                    item.ao.first.cmds.iter().cloned().map(Part::Ast).collect()
+                } else {
+                    vec![Part::AndOr(item.ao.clone())]
+                };
+                let text = item.text.clone();
+                self.status = self.spawn(parts, true, &text);
+            } else {
+                self.status = self.run_andor(&item.ao);
+            }
+        }
+        self.status
+    }
+
+    fn run_andor(&mut self, ao: &AndOr) -> i32 {
+        let mut st = self.run_pipeline(&ao.first, ao.rest.is_empty());
+        for (k, (and, p)) in ao.rest.iter().enumerate() {
+            if self.flow != Flow::None {
+                break;
+            }
+            if (*and && st != 0) || (!*and && st == 0) {
+                continue;
+            }
+            st = self.run_pipeline(p, k + 1 == ao.rest.len());
+        }
+        st
+    }
+
+    /// last: && || の最後 (set -e で見る)
+    fn run_pipeline(&mut self, p: &Pipeline, last: bool) -> i32 {
+        if !last || p.neg {
+            self.cond += 1;
+        }
+        let mut st = if p.cmds.len() == 1 {
+            self.run_cmd(&p.cmds[0])
+        } else {
+            let text = self.text.clone();
+            self.spawn(p.cmds.iter().cloned().map(Part::Ast).collect(), false, &text)
+        };
+        if !last || p.neg {
+            self.cond -= 1;
+        }
+        if p.neg {
+            st = (st == 0) as i32;
+        }
+        self.status = st;
+        if self.errexit && st != 0 && last && !p.neg && self.cond == 0 && self.flow == Flow::None {
+            exit_shell(st);
+        }
+        st
+    }
+
+    fn run_cmd(&mut self, cmd: &Cmd) -> i32 {
+        match cmd {
+            Cmd::Func(name, body) => {
+                self.funcs.insert(name.clone(), body.clone());
+                0
+            }
+            Cmd::Compound(c, _) if matches!(**c, Compound::Subshell(_)) => {
+                let text = self.text.clone();
+                self.spawn(vec![Part::Ast(cmd.clone())], false, &text)
+            }
+            Cmd::Compound(c, redirs) => match self.expand_redirs(redirs) {
+                Ok(r) => self.with_redirs(&r, |sh| sh.run_compound(c)),
+                Err(e) => {
+                    eprintln!("sh: {}", e);
+                    1
+                }
+            },
+            Cmd::Simple { assigns, words, redirs } => self.run_simple(assigns, words, redirs),
+        }
+    }
+
+    /// 単純なコマンドの語、代入、つけかえを展開する
+    fn prepare(&mut self, assigns: &[(String, String)], words: &[String], redirs: &[Redir]) -> Result<Ready, String> {
+        self.subst_status = None;
+        let mut args = vec![];
+        for w in words {
+            args.extend(self.expand(w, Mode::Fields)?);
+        }
+        let mut avals = vec![];
+        for (k, w) in assigns {
+            avals.push((k.clone(), self.expand_one(w)?));
+        }
+        let redirs = self.expand_redirs(redirs)?;
+        if self.xtrace {
+            let a: Vec<String> = avals.iter().map(|(k, v)| format!("{}={}", k, v)).chain(args.iter().cloned()).collect();
+            eprintln!("+ {}", a.join(" "));
+        }
+        Ok(Ready { args, assigns: avals, redirs })
+    }
+
+    fn run_simple(&mut self, assigns: &[(String, String)], words: &[String], redirs: &[Redir]) -> i32 {
+        let r = match self.prepare(assigns, words, redirs) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("sh: {}", e);
+                if !interactive() && self.sourcing == 0 && self.locals.is_empty() {
+                    exit_shell(1);
+                }
+                return 1;
+            }
+        };
+        if r.args.is_empty() {
+            for (k, v) in &r.assigns {
+                self.set_var(k, v);
+            }
+            let st = self.with_redirs(&r.redirs, |_| 0);
+            return if st != 0 { st } else { self.subst_status.unwrap_or(0) };
+        }
+        if let Some(body) = self.funcs.get(&r.args[0]).cloned() {
+            let args = r.args.clone();
+            return self.with_temp_vars(&r.assigns, |sh| sh.with_redirs(&r.redirs, |sh| sh.call(&body, &args)));
+        }
+        if is_builtin(&r.args) {
+            // exec だけならつけかえはそのまま残す
+            if r.args[0] == "exec" && r.args.len() == 1 {
+                flush();
+                for (fd, t) in &r.redirs {
+                    if !apply_redir(*fd, t) {
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+            let args = r.args.clone();
+            return self.with_temp_vars(&r.assigns, |sh| sh.with_redirs(&r.redirs, |sh| sh.builtin(&args)));
+        }
+        let text = self.text.clone();
+        self.spawn(vec![Part::Ready(r)], false, &text)
+    }
+
+    fn run_compound(&mut self, c: &Compound) -> i32 {
+        match c {
+            Compound::Brace(l) | Compound::Subshell(l) => self.run_list(l),
+            Compound::If(arms, els) => {
+                for (cond, body) in arms {
+                    self.cond += 1;
+                    let st = self.run_list(cond);
+                    self.cond -= 1;
+                    if self.flow != Flow::None {
+                        return st;
+                    }
+                    if st == 0 {
+                        return self.run_list(body);
+                    }
+                }
+                match els {
+                    Some(e) => self.run_list(e),
+                    None => 0,
+                }
+            }
+            Compound::While(cond, body, until) => {
+                let mut last = 0;
+                self.loops += 1;
+                loop {
+                    self.cond += 1;
+                    let st = self.run_list(cond);
+                    self.cond -= 1;
+                    if self.flow != Flow::None || (st == 0) == *until {
+                        if self.loop_flow() {
+                            continue;
+                        }
+                        break;
+                    }
+                    last = self.run_list(body);
+                    if self.flow != Flow::None && !self.loop_flow() {
+                        break;
+                    }
+                }
+                self.loops -= 1;
+                self.status = last;
+                last
+            }
+            Compound::For(name, items, body) => {
+                let vals = match items {
+                    None => self.params.get(1..).unwrap_or(&[]).to_vec(),
+                    Some(ws) => {
+                        let mut v = vec![];
+                        for w in ws {
+                            match self.expand(w, Mode::Fields) {
+                                Ok(x) => v.extend(x),
+                                Err(e) => {
+                                    eprintln!("sh: {}", e);
+                                    return 1;
+                                }
+                            }
+                        }
+                        v
+                    }
+                };
+                let mut last = 0;
+                self.loops += 1;
+                for v in vals {
+                    self.set_var(name, &v);
+                    last = self.run_list(body);
+                    if self.flow != Flow::None && !self.loop_flow() {
+                        break;
+                    }
+                }
+                self.loops -= 1;
+                self.status = last;
+                last
+            }
+            Compound::Case(w, arms) => {
+                let s: Vec<char> = match self.expand_one(w) {
+                    Ok(s) => s.chars().collect(),
+                    Err(e) => {
+                        eprintln!("sh: {}", e);
+                        return 1;
+                    }
+                };
+                for (pats, body) in arms {
+                    for p in pats {
+                        let pat: Vec<char> = match self.expand(p, Mode::Pattern) {
+                            Ok(mut v) => v.pop().unwrap_or_default().chars().collect(),
+                            Err(e) => {
+                                eprintln!("sh: {}", e);
+                                return 1;
+                            }
+                        };
+                        if glob::glob_match(&pat, &s) {
+                            return self.run_list(body);
+                        }
+                    }
+                }
+                0
+            }
+        }
+    }
+
+    /// ループの中で break / continue を受けとる。続けるなら true
+    fn loop_flow(&mut self) -> bool {
+        match self.flow {
+            Flow::Break(n) => {
+                self.flow = if n > 1 { Flow::Break(n - 1) } else { Flow::None };
+                false
+            }
+            Flow::Continue(n) if n > 1 => {
+                self.flow = Flow::Continue(n - 1);
+                false
+            }
+            Flow::Continue(_) => {
+                self.flow = Flow::None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn call(&mut self, body: &Rc<Compound>, args: &[String]) -> i32 {
+        let mut ps = vec![self.params[0].clone()];
+        ps.extend_from_slice(&args[1..]);
+        let saved = std::mem::replace(&mut self.params, ps);
+        let saved_loops = std::mem::replace(&mut self.loops, 0);
+        self.locals.push(vec![]);
+        let mut st = self.run_compound(body);
+        if self.flow == Flow::Return {
+            self.flow = Flow::None;
+            st = self.status;
+        }
+        for (k, old, exported) in self.locals.pop().unwrap().into_iter().rev() {
+            self.vars.remove(&k);
+            match (old, exported) {
+                (Some(v), true) => unsafe { std::env::set_var(&k, v) },
+                (Some(v), false) => {
+                    unsafe { std::env::remove_var(&k) };
+                    self.vars.insert(k, v);
+                }
+                (None, _) => unsafe { std::env::remove_var(&k) },
+            }
+        }
+        self.loops = saved_loops;
+        self.params = saved;
+        self.status = st;
+        st
+    }
+
+    /// VAR=x cmd: cmd の間だけ変数を変える
+    fn with_temp_vars(&mut self, assigns: &[(String, String)], f: impl FnOnce(&mut Shell) -> i32) -> i32 {
+        let saved: Vec<(String, Option<String>, Option<String>)> =
+            assigns.iter().map(|(k, _)| (k.clone(), self.vars.get(k).cloned(), std::env::var(k).ok())).collect();
+        for (k, v) in assigns {
+            self.set_var(k, v);
+        }
+        let st = f(self);
+        for (k, var, env) in saved {
+            self.vars.remove(&k);
+            unsafe { std::env::remove_var(&k) };
+            if let Some(v) = var {
+                self.vars.insert(k.clone(), v);
+            }
+            if let Some(v) = env {
+                unsafe { std::env::set_var(&k, v) };
+            }
+        }
+        st
+    }
+
+    // ---- つけかえ ----
+
+    fn expand_redirs(&mut self, redirs: &[Redir]) -> Result<Vec<(i32, RT)>, String> {
+        let mut out = vec![];
+        for r in redirs {
+            let t = match &r.kind {
+                RKind::File(w, flags) => RT::File(self.expand_one(w)?, *flags),
+                RKind::Dup(w) => {
+                    let n = self.expand_one(w)?;
+                    if n == "-" {
+                        RT::Close
+                    } else {
+                        RT::Dup(n.parse().map_err(|_| format!("{}: bad file descriptor", n))?)
+                    }
+                }
+                RKind::Here(body, expand) => {
+                    let b = body.borrow().clone();
+                    RT::Here(if *expand { self.expand_heredoc(&b)? } else { b })
+                }
+            };
+            out.push((r.fd, t));
+        }
+        Ok(out)
+    }
+
+    /// heredoc の中: $ ` \ だけを扱う (" や ' はそのまま)
+    fn expand_heredoc(&mut self, s: &str) -> Result<String, String> {
+        let mut w = String::from("\"");
+        for c in s.chars() {
+            if c == '"' {
+                w.push_str("\\\"");
+            } else {
+                w.push(c);
+            }
+        }
+        w.push('"');
+        // \" を " に戻す以外は " の中と同じ
+        self.expand_one(&w)
+    }
+
+    /// つけかえて f を動かし、もとに戻す (組み込みや { } で)
+    fn with_redirs(&mut self, r: &[(i32, RT)], f: impl FnOnce(&mut Shell) -> i32) -> i32 {
+        if r.is_empty() {
+            return f(self);
+        }
+        flush();
+        let mut saved = vec![];
+        let mut ok = true;
+        for (fd, t) in r {
+            if !saved.iter().any(|(s, _)| s == fd) {
+                let s = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 10) };
+                saved.push((*fd, s));
+            }
+            if !apply_redir(*fd, t) {
+                ok = false;
+                break;
+            }
+        }
+        let st = if ok { f(self) } else { 1 };
+        flush();
+        for (fd, s) in saved.into_iter().rev() {
+            unsafe {
+                if s >= 0 {
+                    libc::dup2(s, fd);
+                    libc::close(s);
+                } else {
+                    libc::close(fd);
+                }
+            }
+        }
+        st
+    }
+
+    // ---- 子のプロセス ----
+
+    fn spawn(&mut self, parts: Vec<Part>, bg: bool, text: &str) -> i32 {
+        let n = parts.len();
+        let job_ctl = interactive();
+        let mut pgid = 0;
+        let mut pids = vec![];
+        let mut prev_read = -1;
+        for (i, part) in parts.into_iter().enumerate() {
+            let mut fds = [-1, -1];
+            if i + 1 < n && unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                eprintln!("sh: pipe: {}", last_err());
+                break;
+            }
+            flush();
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe {
+                    if job_ctl {
+                        // パイプラインごとに 1 つのプロセスグループ。前で動くならそれを端末の前に
+                        libc::setpgid(0, pgid);
+                        if !bg {
+                            libc::tcsetpgrp(0, libc::getpgrp());
+                        }
+                    } else if bg && prev_read < 0 {
+                        // ジョブ制御のないうしろのジョブは端末を読まない
+                        apply_redir(0, &RT::File("/dev/null".into(), libc::O_RDONLY));
+                    }
+                    // Rust は SIGPIPE を、シェルは SIGINT/SIGQUIT (と止めるシグナル) を無視するが、
+                    // 子には既定の動作で渡す
+                    for sig in [libc::SIGPIPE, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
+                    if prev_read >= 0 {
+                        libc::dup2(prev_read, 0);
+                        libc::close(prev_read);
+                    }
+                    if fds[1] >= 0 {
+                        libc::dup2(fds[1], 1);
+                        libc::close(fds[1]);
+                        libc::close(fds[0]);
+                    }
+                    jobs::INTERACTIVE = false;
+                }
+                jobs().clear();
+                let st = self.in_child(part);
+                exit_shell(st);
+            }
+            if prev_read >= 0 {
+                unsafe { libc::close(prev_read) };
+            }
+            if fds[1] >= 0 {
+                unsafe { libc::close(fds[1]) };
+            }
+            prev_read = fds[0];
+            if pid > 0 {
+                if job_ctl {
+                    if pgid == 0 {
+                        pgid = pid;
+                    }
+                    // 子と同じことを親でもする (どちらが先に動いても揃うように)
+                    unsafe { libc::setpgid(pid, pgid) };
+                }
+                pids.push(pid);
+            } else {
+                eprintln!("sh: fork: {}", last_err());
+            }
+        }
+        jobs::add_job(pgid, pids, text, bg)
+    }
+
+    /// 子の中で動かす。外のコマンドなら exec して戻らない
+    fn in_child(&mut self, part: Part) -> i32 {
+        match part {
+            Part::Ready(r) => self.exec_ready(r),
+            Part::AndOr(ao) => self.run_andor(&ao),
+            Part::Ast(Cmd::Compound(c, redirs)) => match self.expand_redirs(&redirs) {
+                Ok(r) => {
+                    for (fd, t) in &r {
+                        if !apply_redir(*fd, t) {
+                            return 1;
+                        }
+                    }
+                    self.run_compound(&c)
+                }
+                Err(e) => {
+                    eprintln!("sh: {}", e);
+                    1
+                }
+            },
+            Part::Ast(Cmd::Simple { assigns, words, redirs }) => match self.prepare(&assigns, &words, &redirs) {
+                Ok(r) if r.args.is_empty() || self.funcs.contains_key(&r.args[0]) || is_builtin(&r.args) => {
+                    for (fd, t) in &r.redirs {
+                        if !apply_redir(*fd, t) {
+                            return 1;
+                        }
+                    }
+                    let Ready { args, assigns, .. } = r;
+                    for (k, v) in &assigns {
+                        self.set_var(k, v);
+                    }
+                    if args.is_empty() {
+                        return 0;
+                    }
+                    match self.funcs.get(&args[0]).cloned() {
+                        Some(body) => self.call(&body, &args),
+                        None => self.builtin(&args),
+                    }
+                }
+                Ok(r) => self.exec_ready(r),
+                Err(e) => {
+                    eprintln!("sh: {}", e);
+                    1
+                }
+            },
+            Part::Ast(cmd) => self.run_cmd(&cmd),
+        }
+    }
+
+    fn find(&self, cmd: &str) -> Option<String> {
+        if cmd.contains('/') {
+            return Some(cmd.to_string());
+        }
+        let path = self.get_var("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+        path.split(':')
+            .map(|d| format!("{}/{}", if d.is_empty() { "." } else { d }, cmd))
+            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+    }
+
+    fn exec_ready(&mut self, r: Ready) -> i32 {
+        for (fd, t) in &r.redirs {
+            if !apply_redir(*fd, t) {
+                return 1;
+            }
+        }
+        for (k, v) in &r.assigns {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let Some(prog) = self.find(&r.args[0]) else {
+            eprintln!("sh: {}: command not found", r.args[0]);
+            return 127;
+        };
+        self.execve(&prog, &r.args);
+        eprintln!("sh: {}: {}", r.args[0], last_err());
+        126
+    }
+
+    /// 環境は export したもの
+    fn execve(&self, prog: &str, args: &[String]) {
+        let prog = cstr(prog);
+        let cargs: Vec<CString> = args.iter().map(|a| cstr(a)).collect();
+        let mut argv: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let env: Vec<CString> = std::env::vars().map(|(k, v)| cstr(&format!("{k}={v}"))).collect();
+        let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
+        envp.push(std::ptr::null());
+        flush();
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        }
+    }
+
+    /// $( ): 子で動かして、出力の最後の改行を除いたもの
+    pub fn command_subst(&mut self, src: &str) -> String {
+        let list = match Parser::new(src).program() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("sh: $(...): {}", match e {
+                    Error::Incomplete => "syntax error: unexpected end of file".into(),
+                    Error::Syntax(s) => s,
+                });
+                self.subst_status = Some(2);
+                return String::new();
+            }
+        };
+        let mut fds = [-1, -1];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return String::new();
+        }
+        flush();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::dup2(fds[1], 1);
+                libc::close(fds[1]);
+                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                jobs::INTERACTIVE = false;
+            }
+            jobs().clear();
+            let st = self.run_list(&list);
+            exit_shell(st);
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut out = vec![];
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+            } else if n == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        unsafe { libc::close(fds[0]) };
+        if pid > 0 {
+            let mut st = 0;
+            while unsafe { libc::waitpid(pid, &mut st, 0) } < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {}
+            self.subst_status = Some(exit_code(st));
+        }
+        let mut s = String::from_utf8_lossy(&out).into_owned();
+        while s.ends_with('\n') {
+            s.pop();
+        }
+        s
+    }
+
+    // ---- 組み込み ----
+
+    fn builtin(&mut self, args: &[String]) -> i32 {
+        if let Some(s) = jobs::job_builtin(args) {
+            return s;
+        }
+        let a = &args[1..];
+        let name = args[0].as_str();
+        match name {
+            ":" | "true" => 0,
+            "false" => 1,
+            "exit" => {
+                let st = a.first().and_then(|s| s.parse().ok()).unwrap_or(self.status);
+                exit_shell(st & 0xff)
+            }
+            "cd" => {
+                let dir = match a.first().map(|s| s.as_str()) {
+                    None => self.get_var("HOME").unwrap_or_else(|| "/".into()),
+                    Some("-") => {
+                        let d = self.get_var("OLDPWD").unwrap_or_default();
+                        println!("{}", d);
+                        d
+                    }
+                    Some(d) => d.to_string(),
+                };
+                let old = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+                match std::env::set_current_dir(&dir) {
+                    Ok(()) => {
+                        let new = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+                        self.export("OLDPWD", Some(old));
+                        self.export("PWD", Some(new));
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("cd: {}: {}", dir, err_text(&e));
+                        1
+                    }
+                }
+            }
+            "umask" => {
+                match a.first() {
+                    None => {
+                        let m = unsafe { libc::umask(0) };
+                        unsafe { libc::umask(m) };
+                        println!("{:04o}", m);
+                    }
+                    Some(m) => match u32::from_str_radix(m, 8) {
+                        Ok(m) if m <= 0o777 => unsafe {
+                            libc::umask(m as libc::mode_t);
+                        },
+                        _ => {
+                            eprintln!("umask: {}: invalid octal number", m);
+                            return 1;
+                        }
+                    },
+                }
+                0
+            }
+            "pwd" => {
+                println!("{}", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
+                0
+            }
+            "export" => {
+                if a.is_empty() || a[0] == "-p" {
+                    let mut vs: Vec<(String, String)> = std::env::vars().collect();
+                    vs.sort();
+                    for (k, v) in vs {
+                        println!("export {}={}", k, quote(&v));
+                    }
+                    return 0;
+                }
+                for x in a {
+                    match x.split_once('=') {
+                        Some((k, v)) => self.export(k, Some(v.to_string())),
+                        None => self.export(x, None),
+                    }
+                }
+                0
+            }
+            "unset" => {
+                let mut funcs = false;
+                for x in a {
+                    match x.as_str() {
+                        "-f" => funcs = true,
+                        "-v" => funcs = false,
+                        _ if funcs => {
+                            self.funcs.remove(x);
+                        }
+                        _ => self.unset(x),
+                    }
+                }
+                0
+            }
+            "set" => self.set(a),
+            "shift" => {
+                let n: usize = a.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+                if n + 1 > self.params.len() {
+                    eprintln!("shift: shift count out of range");
+                    return 1;
+                }
+                self.params.drain(1..1 + n);
+                0
+            }
+            "read" => self.read(a),
+            "local" => {
+                let Some(frame) = self.locals.len().checked_sub(1) else {
+                    eprintln!("local: can only be used in a function");
+                    return 1;
+                };
+                for x in a {
+                    let (k, v) = match x.split_once('=') {
+                        Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                        None => (x.clone(), None),
+                    };
+                    if !parse::valid_name(&k) {
+                        eprintln!("local: {}: not a valid identifier", k);
+                        return 1;
+                    }
+                    if !self.locals[frame].iter().any(|(n, ..)| *n == k) {
+                        let exported = std::env::var_os(&k).is_some();
+                        let old = self.get_var(&k);
+                        self.locals[frame].push((k.clone(), old, exported));
+                    }
+                    self.set_var(&k, &v.unwrap_or_default());
+                }
+                0
+            }
+            "eval" => {
+                let src = a.join(" ");
+                self.run_source(&src, "eval")
+            }
+            "." | "source" => {
+                let Some(file) = a.first() else {
+                    eprintln!("{}: filename argument required", name);
+                    return 2;
+                };
+                let path = if file.contains('/') { Some(file.clone()) } else { self.find(file).or(Some(file.clone())) };
+                let text = match std::fs::read_to_string(path.as_deref().unwrap()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{}: {}: {}", name, file, err_text(&e));
+                        return 1;
+                    }
+                };
+                let saved = (a.len() > 1).then(|| {
+                    let mut ps = vec![self.params[0].clone()];
+                    ps.extend_from_slice(&a[1..]);
+                    std::mem::replace(&mut self.params, ps)
+                });
+                self.sourcing += 1;
+                let st = self.run_source(&text, file);
+                self.sourcing -= 1;
+                if self.flow == Flow::Return {
+                    self.flow = Flow::None;
+                }
+                if let Some(p) = saved {
+                    self.params = p;
+                }
+                st
+            }
+            "return" => {
+                if self.locals.is_empty() && self.sourcing == 0 {
+                    eprintln!("return: can only `return' from a function or sourced script");
+                    return 1;
+                }
+                let st = a.first().and_then(|s| s.parse().ok()).unwrap_or(self.status);
+                self.status = st;
+                self.flow = Flow::Return;
+                st
+            }
+            "break" | "continue" => {
+                if self.loops == 0 {
+                    eprintln!("{}: only meaningful in a loop", name);
+                    return 0;
+                }
+                let n = a.first().and_then(|s| s.parse().ok()).unwrap_or(1u32).clamp(1, self.loops);
+                self.flow = if name == "break" { Flow::Break(n) } else { Flow::Continue(n) };
+                0
+            }
+            "echo" => echo(a),
+            "test" | "[" => {
+                let mut a = a.to_vec();
+                if name == "[" {
+                    if a.last().map(|s| s.as_str()) != Some("]") {
+                        eprintln!("[: missing `]'");
+                        return 2;
+                    }
+                    a.pop();
+                }
+                test(&a)
+            }
+            "exec" => {
+                let Some(prog) = self.find(&a[0]) else {
+                    eprintln!("sh: {}: command not found", a[0]);
+                    exit_shell(127);
+                };
+                self.execve(&prog, a);
+                eprintln!("sh: {}: {}", a[0], last_err());
+                exit_shell(126)
+            }
+            "command" | "type" => {
+                let verbose = name == "type";
+                let list: Vec<&String> = a.iter().filter(|x| !x.starts_with('-')).collect();
+                if name == "command" && a.first().map(|s| s.as_str()) != Some("-v") && a.first().map(|s| s.as_str()) != Some("-V") {
+                    // command CMD ...: 関数を飛ばして動かす
+                    if a.is_empty() {
+                        return 0;
+                    }
+                    if is_builtin(a) {
+                        return self.builtin(a);
+                    }
+                    let text = self.text.clone();
+                    return self.spawn(vec![Part::Ready(Ready { args: a.to_vec(), assigns: vec![], redirs: vec![] })], false, &text);
+                }
+                let mut st = 0;
+                for x in list {
+                    if parse::is_reserved(x) {
+                        if verbose { println!("{} is a shell keyword", x) } else { println!("{}", x) }
+                    } else if self.funcs.contains_key(x) {
+                        if verbose { println!("{} is a function", x) } else { println!("{}", x) }
+                    } else if BUILTINS.contains(&x.as_str()) {
+                        if verbose { println!("{} is a shell builtin", x) } else { println!("{}", x) }
+                    } else if let Some(p) = self.find(x).filter(|p| std::fs::metadata(p).is_ok()) {
+                        if verbose { println!("{} is {}", x, p) } else { println!("{}", p) }
+                    } else {
+                        if verbose {
+                            eprintln!("type: {}: not found", x);
+                        }
+                        st = 1;
+                    }
+                }
+                st
+            }
+            _ => {
+                eprintln!("sh: {}: not a builtin", name);
+                1
+            }
+        }
+    }
+
+    fn set(&mut self, a: &[String]) -> i32 {
+        if a.is_empty() {
+            let mut vs: Vec<(String, String)> = self.vars.iter().map(|(k, v)| (k.clone(), v.clone())).chain(std::env::vars()).collect();
+            vs.sort();
+            for (k, v) in vs {
+                println!("{}={}", k, quote(&v));
+            }
+            return 0;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            let x = &a[i];
+            if x == "--" {
+                i += 1;
+                break;
+            }
+            let on = x.starts_with('-');
+            if !(on || x.starts_with('+')) || x.len() < 2 {
+                break;
+            }
+            if &x[1..] == "o" {
+                // set -o errexit / xtrace
+                i += 1;
+                match a.get(i).map(|s| s.as_str()) {
+                    Some("errexit") => self.errexit = on,
+                    Some("xtrace") => self.xtrace = on,
+                    Some(_) | None => {}
+                }
+            } else {
+                for c in x[1..].chars() {
+                    match c {
+                        'e' => self.errexit = on,
+                        'x' => self.xtrace = on,
+                        'u' | 'f' | 'h' | 'm' | 'b' | 'C' | 'v' | 'n' => {}
+                        _ => {
+                            eprintln!("set: -{}: invalid option", c);
+                            return 2;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if i < a.len() || a.last().is_some_and(|x| x == "--") {
+            let mut ps = vec![self.params[0].clone()];
+            ps.extend_from_slice(&a[i..]);
+            self.params = ps;
+        }
+        0
+    }
+
+    /// read [-r] [-p PROMPT] [NAME...]
+    fn read(&mut self, a: &[String]) -> i32 {
+        let mut raw = false;
+        let mut names = vec![];
+        let mut i = 0;
+        while i < a.len() {
+            match a[i].as_str() {
+                "-r" => raw = true,
+                "-p" => {
+                    i += 1;
+                    eprint!("{}", a.get(i).map(|s| s.as_str()).unwrap_or(""));
+                }
+                x => names.push(x.to_string()),
+            }
+            i += 1;
+        }
+        if names.is_empty() {
+            names.push("REPLY".into());
+        }
+        let mut line = String::new();
+        let mut got = false;
+        let mut bytes = vec![];
+        loop {
+            let mut c = 0u8;
+            let n = unsafe { libc::read(0, &mut c as *mut u8 as *mut libc::c_void, 1) };
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                return 130;
+            }
+            if n <= 0 {
+                break;
+            }
+            got = true;
+            if c == b'\n' {
+                bytes.push(b'\n');
+                break;
+            }
+            bytes.push(c);
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let ended = text.ends_with('\n');
+        let mut cs = text.trim_end_matches('\n').chars().peekable();
+        // \ をはずす (-r でなければ)。\ で守った文字は分けない印 (\u{0}) をつける
+        let mut protected = vec![];
+        while let Some(c) = cs.next() {
+            if c == '\\' && !raw {
+                if let Some(n) = cs.next() {
+                    line.push(n);
+                    protected.push(true);
+                }
+                continue;
+            }
+            line.push(c);
+            protected.push(false);
+        }
+        let ifs = self.get_var("IFS").unwrap_or_else(|| " \t\n".into());
+        let chars: Vec<char> = line.chars().collect();
+        let is_sep = |k: usize| !protected[k] && ifs.contains(chars[k]);
+        let mut k = 0;
+        // 前の空白を飛ばす
+        while k < chars.len() && is_sep(k) && chars[k].is_whitespace() {
+            k += 1;
+        }
+        for (ni, name) in names.iter().enumerate() {
+            let mut v = String::new();
+            if ni + 1 == names.len() {
+                // 最後の名前に残りぜんぶ (後ろの IFS の空白は除く)
+                let mut end = chars.len();
+                while end > k && is_sep(end - 1) && chars[end - 1].is_whitespace() {
+                    end -= 1;
+                }
+                v = chars[k.min(end)..end].iter().collect();
+                k = chars.len();
+            } else {
+                while k < chars.len() && !is_sep(k) {
+                    v.push(chars[k]);
+                    k += 1;
+                }
+                // 区切りを 1 つ (と空白) 飛ばす
+                let mut seen_hard = false;
+                while k < chars.len() && is_sep(k) {
+                    if !chars[k].is_whitespace() {
+                        if seen_hard {
+                            break;
+                        }
+                        seen_hard = true;
+                    }
+                    k += 1;
+                }
+            }
+            if !parse::valid_name(name) {
+                eprintln!("read: {}: not a valid identifier", name);
+                return 2;
+            }
+            self.set_var(name, &v);
+        }
+        if got && (ended || !line.is_empty()) { 0 } else { 1 }
+    }
+}
+
+/// export や set で見せるクォート
+fn quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// つけかえる (fd を置きかえる)。失敗したら知らせて false
+fn apply_redir(fd: i32, t: &RT) -> bool {
+    unsafe {
+        match t {
+            RT::File(path, flags) => {
+                let p = cstr(path);
+                let f = libc::open(p.as_ptr(), *flags, 0o666);
+                if f < 0 {
+                    eprintln!("sh: {}: {}", path, last_err());
+                    return false;
+                }
+                if f != fd {
+                    libc::dup2(f, fd);
+                    libc::close(f);
+                }
+            }
+            RT::Dup(n) => {
+                if *n != fd && libc::dup2(*n, fd) < 0 {
+                    eprintln!("sh: {}: {}", n, last_err());
+                    return false;
+                }
+            }
+            RT::Close => {
+                libc::close(fd);
+            }
+            RT::Here(text) => {
+                // 小さければパイプに、大きければ /tmp の消したファイルに
+                let b = text.as_bytes();
+                let f = if b.len() <= 4096 {
+                    let mut p = [-1, -1];
+                    if libc::pipe(p.as_mut_ptr()) < 0 {
+                        return false;
+                    }
+                    libc::write(p[1], b.as_ptr() as *const libc::c_void, b.len());
+                    libc::close(p[1]);
+                    p[0]
+                } else {
+                    let path = cstr(&format!("/tmp/.sh-here-{}-{}", std::process::id(), fd));
+                    let f = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o600);
+                    if f < 0 {
+                        eprintln!("sh: heredoc: {}", last_err());
+                        return false;
+                    }
+                    libc::unlink(path.as_ptr());
+                    libc::write(f, b.as_ptr() as *const libc::c_void, b.len());
+                    libc::lseek(f, 0, libc::SEEK_SET);
+                    f
+                };
+                if f != fd {
+                    libc::dup2(f, fd);
+                    libc::close(f);
+                }
+            }
+        }
+    }
+    true
+}
+
+fn echo(a: &[String]) -> i32 {
+    let mut newline = true;
+    let mut escapes = false;
+    let mut i = 0;
+    while i < a.len() && a[i].len() > 1 && a[i].starts_with('-') && a[i][1..].chars().all(|c| "neE".contains(c)) {
+        for c in a[i][1..].chars() {
+            match c {
+                'n' => newline = false,
+                'e' => escapes = true,
+                _ => escapes = false,
+            }
+        }
+        i += 1;
+    }
+    let mut out = a[i..].join(" ");
+    if escapes {
+        let mut s = String::new();
+        let mut cs = out.chars().peekable();
+        while let Some(c) = cs.next() {
+            if c != '\\' {
+                s.push(c);
+                continue;
+            }
+            match cs.next() {
+                Some('n') => s.push('\n'),
+                Some('t') => s.push('\t'),
+                Some('r') => s.push('\r'),
+                Some('a') => s.push('\x07'),
+                Some('b') => s.push('\x08'),
+                Some('e') => s.push('\x1b'),
+                Some('v') => s.push('\x0b'),
+                Some('f') => s.push('\x0c'),
+                Some('\\') => s.push('\\'),
+                Some('c') => {
+                    newline = false;
+                    break;
+                }
+                Some('0') => {
+                    let mut v = 0u32;
+                    for _ in 0..3 {
+                        match cs.peek() {
+                            Some(d) if d.is_digit(8) => {
+                                v = v * 8 + d.to_digit(8).unwrap();
+                                cs.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    s.push(char::from_u32(v).unwrap_or('?'));
+                }
+                Some(o) => {
+                    s.push('\\');
+                    s.push(o);
+                }
+                None => s.push('\\'),
+            }
+        }
+        out = s;
+    }
+    if newline {
+        out.push('\n');
+    }
+    let mut so = io::stdout().lock();
+    if so.write_all(out.as_bytes()).and_then(|_| so.flush()).is_err() {
+        return 1;
+    }
+    0
+}
+
+// ---- test / [ ----
+
+fn test(a: &[String]) -> i32 {
+    let mut t = Test { a, i: 0 };
+    if a.is_empty() {
+        return 1;
+    }
+    match t.or() {
+        Ok(v) if t.i == a.len() => !v as i32,
+        Ok(_) => {
+            eprintln!("test: {}: unexpected argument", a[t.i]);
+            2
+        }
+        Err(e) => {
+            eprintln!("test: {}", e);
+            2
+        }
+    }
+}
+
+struct Test<'a> {
+    a: &'a [String],
+    i: usize,
+}
+
+const UNARY: &[&str] = &["-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h", "-z", "-n", "-b", "-c", "-p", "-S", "-t", "-g", "-u", "-k", "-O", "-G"];
+const BINARY: &[&str] = &["=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef"];
+
+impl Test<'_> {
+    fn get(&self, k: usize) -> Option<&str> {
+        self.a.get(self.i + k).map(|s| s.as_str())
+    }
+
+    fn or(&mut self) -> Result<bool, String> {
+        let mut v = self.and()?;
+        while self.get(0) == Some("-o") {
+            self.i += 1;
+            let r = self.and()?;
+            v = v || r;
+        }
+        Ok(v)
+    }
+
+    fn and(&mut self) -> Result<bool, String> {
+        let mut v = self.not()?;
+        while self.get(0) == Some("-a") {
+            self.i += 1;
+            let r = self.not()?;
+            v = v && r;
+        }
+        Ok(v)
+    }
+
+    fn not(&mut self) -> Result<bool, String> {
+        // "!" の後ろに何かあるときだけ否定
+        if self.get(0) == Some("!") && self.get(1).is_some() && !(self.get(1).is_some_and(|x| BINARY.contains(&x)) && self.get(2).is_some()) {
+            self.i += 1;
+            return Ok(!self.not()?);
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<bool, String> {
+        let Some(x) = self.get(0).map(|s| s.to_string()) else { return Err("argument expected".into()) };
+        let x = x.as_str();
+        let rem = self.a.len() - self.i;
+        // 二項 (3 つ以上残っていて真ん中が演算子) を先に
+        if rem >= 3
+            && let (Some(op), Some(r)) = (self.get(1), self.get(2))
+            && BINARY.contains(&op)
+        {
+            let (l, op, r) = (x.to_string(), op.to_string(), r.to_string());
+            self.i += 3;
+            return binary_test(&l, &op, &r);
+        }
+        if x == "(" && rem >= 2 {
+            self.i += 1;
+            let v = self.or()?;
+            if self.get(0) != Some(")") {
+                return Err("missing `)'".into());
+            }
+            self.i += 1;
+            return Ok(v);
+        }
+        if UNARY.contains(&x)
+            && let Some(arg) = self.get(1)
+        {
+            let (op, arg) = (x.to_string(), arg.to_string());
+            self.i += 2;
+            return Ok(unary_test(&op, &arg));
+        }
+        self.i += 1;
+        Ok(!x.is_empty())
+    }
+}
+
+fn unary_test(op: &str, arg: &str) -> bool {
+    let md = || std::fs::metadata(arg);
+    let access = |m: i32| {
+        let p = cstr(arg);
+        unsafe { libc::access(p.as_ptr(), m) == 0 }
+    };
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    match op {
+        "-e" => md().is_ok(),
+        "-f" => md().is_ok_and(|m| m.is_file()),
+        "-d" => md().is_ok_and(|m| m.is_dir()),
+        "-s" => md().is_ok_and(|m| m.len() > 0),
+        "-L" | "-h" => std::fs::symlink_metadata(arg).is_ok_and(|m| m.file_type().is_symlink()),
+        "-b" => md().is_ok_and(|m| m.file_type().is_block_device()),
+        "-c" => md().is_ok_and(|m| m.file_type().is_char_device()),
+        "-p" => md().is_ok_and(|m| m.file_type().is_fifo()),
+        "-S" => md().is_ok_and(|m| m.file_type().is_socket()),
+        "-u" => md().is_ok_and(|m| m.mode() & 0o4000 != 0),
+        "-g" => md().is_ok_and(|m| m.mode() & 0o2000 != 0),
+        "-k" => md().is_ok_and(|m| m.mode() & 0o1000 != 0),
+        "-O" => md().is_ok_and(|m| m.uid() == unsafe { libc::geteuid() }),
+        "-G" => md().is_ok_and(|m| m.gid() == unsafe { libc::getegid() }),
+        "-r" => access(libc::R_OK),
+        "-w" => access(libc::W_OK),
+        "-x" => access(libc::X_OK),
+        "-z" => arg.is_empty(),
+        "-n" => !arg.is_empty(),
+        "-t" => arg.parse().is_ok_and(|fd: i32| unsafe { libc::isatty(fd) } == 1),
+        _ => false,
+    }
+}
+
+fn binary_test(l: &str, op: &str, r: &str) -> Result<bool, String> {
+    let num = |s: &str| s.trim().parse::<i64>().map_err(|_| format!("{}: integer expression expected", s));
+    use std::os::unix::fs::MetadataExt;
+    let mtime = |p: &str| std::fs::metadata(p).ok().map(|m| (m.mtime(), m.mtime_nsec()));
+    Ok(match op {
+        "=" | "==" => l == r,
+        "!=" => l != r,
+        "<" => l < r,
+        ">" => l > r,
+        "-eq" => num(l)? == num(r)?,
+        "-ne" => num(l)? != num(r)?,
+        "-lt" => num(l)? < num(r)?,
+        "-le" => num(l)? <= num(r)?,
+        "-gt" => num(l)? > num(r)?,
+        "-ge" => num(l)? >= num(r)?,
+        "-nt" => matches!((mtime(l), mtime(r)), (Some(a), Some(b)) if a > b) || (mtime(l).is_some() && mtime(r).is_none()),
+        "-ot" => matches!((mtime(l), mtime(r)), (Some(a), Some(b)) if a < b) || (mtime(l).is_none() && mtime(r).is_some()),
+        "-ef" => match (std::fs::metadata(l), std::fs::metadata(r)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        },
+        _ => return Err(format!("{}: unknown operator", op)),
+    })
+}
+
+// ---- 入口 ----
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // sh -c CMD [NAME ARGS...]: NAME が $0
+    if args.get(1).is_some_and(|a| a == "-c") {
+        let cmd = args.get(2).cloned().unwrap_or_default();
+        let mut ps: Vec<String> = args.get(3..).unwrap_or(&[]).to_vec();
+        if ps.is_empty() {
+            ps.push(args[0].clone());
+        }
+        let mut sh = Shell::new(ps);
+        let st = sh.run_source(&cmd, "sh");
+        exit_shell(st);
+    }
+    // sh [-e] [-x] FILE ARGS...
+    let mut sh = Shell::new(vec![args[0].clone()]);
+    let mut i = 1;
+    while let Some(a) = args.get(i).filter(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "exs".contains(c))) {
+        sh.errexit |= a.contains('e');
+        sh.xtrace |= a.contains('x');
+        i += 1;
+    }
+    if let Some(file) = args.get(i) {
+        sh.params = args[i..].to_vec();
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("sh: {}: {}", file, e);
+                std::process::exit(127);
+            }
+        };
+        let st = sh.run_source(&text, file);
+        exit_shell(st);
+    }
+    // ログインシェル (argv[0] が -sh) は /etc/profile と ~/.profile を読む
+    if args[0].starts_with('-') {
+        let home = sh.get_var("HOME").unwrap_or_default();
+        for f in ["/etc/profile".to_string(), format!("{}/.profile", home)] {
+            if std::path::Path::new(&f).is_file() {
+                sh.builtin(&[".".into(), f]);
+            }
+        }
+    }
+    sh.interactive();
+}
+
+extern "C" fn on_sigint(_: libc::c_int) {}
+
+impl Shell {
+    fn interactive(&mut self) {
+        // 対話するシェルは Ctrl-C で終わらず (打ちかけの行を捨てて新しいプロンプトへ)、
+        // 自分のグループを端末の前に出す
+        let tty = unsafe { libc::isatty(0) == 1 };
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_sigint as *const () as usize;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            if tty {
+                for sig in [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                    libc::signal(sig, libc::SIG_IGN);
+                }
+                // 端末があればジョブ制御をする
+                jobs::INTERACTIVE = true;
+                libc::setpgid(0, 0);
+                libc::tcsetpgrp(0, libc::getpgrp());
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(0, &mut t) == 0 {
+                    *(&raw mut jobs::SHELL_TMODES) = Some(t);
+                }
+            }
+        }
+        let mut buf = String::new();
+        loop {
+            if buf.is_empty() {
+                jobs::report_jobs();
+            }
+            if tty {
+                if buf.is_empty() {
+                    eprint!("{}", self.prompt());
+                } else {
+                    eprint!("{}", self.get_var("PS2").unwrap_or_else(|| "> ".into()));
+                }
+            }
+            let line = match read_line() {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    if !buf.is_empty() {
+                        eprintln!("sh: syntax error: unexpected end of file");
+                        exit_shell(2);
+                    }
+                    if tty {
+                        eprintln!();
+                    }
+                    exit_shell(self.status);
+                }
+                Err(_) => {
+                    eprintln!();
+                    buf.clear();
+                    self.status = 130;
+                    continue;
+                }
+            };
+            buf.push_str(&line);
+            if !buf.ends_with('\n') {
+                buf.push('\n');
+            }
+            match Parser::new(&buf).program() {
+                Ok(list) => {
+                    buf.clear();
+                    self.run_list(&list);
+                    self.flow = Flow::None;
+                }
+                Err(Error::Incomplete) => {}
+                Err(Error::Syntax(e)) => {
+                    eprintln!("sh: {}", e);
+                    buf.clear();
+                    self.status = 2;
+                }
+            }
+        }
+    }
+}
+
+impl Shell {
+    /// プロンプト: PS1 (\u \h \w \W \$ \n \\ が使える)。なければ「ディレクトリ %」(失敗のあとは !)
+    fn prompt(&self) -> String {
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        let root = unsafe { libc::geteuid() } == 0;
+        let Some(ps1) = self.get_var("PS1") else {
+            let mark = if self.status != 0 { "!" } else if root { "#" } else { "%" };
+            return format!("{} {} ", cwd, mark);
+        };
+        let home = self.get_var("HOME").unwrap_or_default();
+        let short = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{}/", home))) { format!("~{}", &cwd[home.len()..]) } else { cwd.clone() };
+        let mut out = String::new();
+        let mut cs = ps1.chars();
+        while let Some(c) = cs.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match cs.next() {
+                Some('u') => out.push_str(&self.get_var("USER").or_else(|| self.get_var("LOGNAME")).unwrap_or_else(|| if root { "root".into() } else { "?".into() })),
+                Some('h') | Some('H') => {
+                    let h = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+                    out.push_str(h.trim().split('.').next().unwrap_or(""));
+                }
+                Some('w') => out.push_str(&short),
+                Some('W') => out.push_str(if short == "~" || cwd == "/" { &short } else { short.rsplit('/').next().unwrap_or("") }),
+                Some('$') => out.push(if root { '#' } else { '$' }),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(o) => {
+                    out.push('\\');
+                    out.push(o);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+}
+
+/// 端末から 1 行。Ctrl-C (SIGINT で read が EINTR) なら Err、終わりなら None
+fn read_line() -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let mut c = 0u8;
+        let n = unsafe { libc::read(0, &mut c as *mut u8 as *mut libc::c_void, 1) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Ok(if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) });
+        }
+        buf.push(c);
+        if c == b'\n' {
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+    }
+}

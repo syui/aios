@@ -23,7 +23,7 @@ path = "src/bin/hello.rs"
 
 [[bin]]
 name = "sh"
-path = "src/bin/sh.rs"
+path = "src/bin/sh/main.rs"
 
 [[bin]]
 name = "aipkg"
