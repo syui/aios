@@ -72,6 +72,8 @@ mod nr {
     pub const WRITEV: u64 = 66;
     pub const PREAD64: u64 = 67;
     pub const PWRITE64: u64 = 68;
+    pub const PREADV: u64 = 69;
+    pub const PWRITEV: u64 = 70;
     pub const SENDFILE: u64 = 71;
     pub const PPOLL: u64 = 73;
     pub const SPLICE: u64 = 76;
@@ -177,6 +179,9 @@ mod nr {
     pub const PRLIMIT64: u64 = 261;
     pub const RENAMEAT2: u64 = 276;
     pub const COPY_FILE_RANGE: u64 = 285;
+    pub const PREADV2: u64 = 286;
+    pub const PWRITEV2: u64 = 287;
+    pub const STATX: u64 = 291;
     pub const GETRANDOM: u64 = 278;
     pub const MEMBARRIER: u64 = 283;
     pub const RSEQ: u64 = 293;
@@ -234,6 +239,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         PREAD64 => sysfile::pread(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        PREADV | PREADV2 => sysfile::preadv(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        PWRITEV | PWRITEV2 => sysfile::pwritev(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        STATX => sysfile::statx(int(a[0]), a[1] as usize, a[2], a[4] as usize),
         SYNC | FSYNC | FDATASYNC | SYNCFS => {
             crate::vfs::sync_all();
             Ok(0)

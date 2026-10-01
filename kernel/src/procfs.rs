@@ -37,6 +37,7 @@ enum Node {
     Status(u32),
     Cmdline(u32),
     Cwd(u32),
+    Exe(u32),
     FdDir(u32),
     Fd(u32, usize),
 }
@@ -77,6 +78,7 @@ impl ProcInode {
             Node::Status(p) => (p as u64) << 16 | 3,
             Node::Cmdline(p) => (p as u64) << 16 | 4,
             Node::Cwd(p) => (p as u64) << 16 | 5,
+            Node::Exe(p) => (p as u64) << 16 | 7,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
         }
@@ -84,7 +86,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
             _ => None,
         }
     }
@@ -268,7 +270,7 @@ impl Inode for ProcInode {
         let mode = match self.node {
             Node::Root | Node::Pid(_) | Node::NetDir => S_IFDIR | 0o555,
             Node::FdDir(_) => S_IFDIR | 0o500,
-            Node::SelfLink | Node::Cwd(_) => S_IFLNK | 0o777,
+            Node::SelfLink | Node::Cwd(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
             _ => S_IFREG | 0o444,
         };
@@ -299,6 +301,11 @@ impl Inode for ProcInode {
         match self.node {
             Node::SelfLink => Ok(format!("{}", proc::current().tgid)),
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),
+            Node::Exe(pid) => {
+                let p = leader(pid)?;
+                p.mm.as_ref().ok_or(-ENOENT)?;
+                Ok(format!("/{}", p.mm().exe))
+            }
             Node::Fd(pid, n) => fd_target(pid, n),
             _ => Err(-EINVAL),
         }
@@ -322,6 +329,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
+            (Node::Pid(p), "exe") => Node::Exe(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
@@ -362,6 +370,7 @@ impl Inode for ProcInode {
                 add("status".into(), Node::Status(p));
                 add("cmdline".into(), Node::Cmdline(p));
                 add("cwd".into(), Node::Cwd(p));
+                add("exe".into(), Node::Exe(p));
                 add("fd".into(), Node::FdDir(p));
             }
             Node::FdDir(p) => {
