@@ -29,6 +29,7 @@ enum Node {
     Swaps,
     NetDir,
     Pnp,
+    Route,
     KernelCmdline,
     CpuInfo,
     Pid(u32),
@@ -70,6 +71,7 @@ impl ProcInode {
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
             Node::Swaps => 10,
+            Node::Route => 11,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
@@ -133,8 +135,10 @@ impl ProcInode {
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),
+            Node::Route => crate::netif::proc_route(),
             Node::Pnp => {
-                let mut s = String::from("#PROTO: DHCP\n");
+                // Linux と同じく、DHCP なら #PROTO: DHCP、手で決めたなら #MANUAL
+                let mut s = String::from(if crate::net::is_dhcp() { "#PROTO: DHCP\n" } else { "#MANUAL\n" });
                 if let Some(l) = crate::net::get().and_then(|n| n.lease.clone()) {
                     for d in &l.dns {
                         s.push_str(&format!("nameserver {}\n", d));
@@ -312,6 +316,7 @@ impl Inode for ProcInode {
             (Node::Root, "swaps") => Node::Swaps,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
+            (Node::NetDir, "route") => Node::Route,
             (Node::Root, _) => Node::Pid(leader(num.ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
@@ -348,7 +353,10 @@ impl Inode for ProcInode {
                     add(format!("{}", p.tgid), Node::Pid(p.tgid));
                 }
             }
-            Node::NetDir => add("pnp".into(), Node::Pnp),
+            Node::NetDir => {
+                add("pnp".into(), Node::Pnp);
+                add("route".into(), Node::Route);
+            }
             Node::Pid(p) => {
                 add("stat".into(), Node::Stat(p));
                 add("status".into(), Node::Status(p));

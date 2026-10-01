@@ -1,6 +1,8 @@
 // ネットワーク: virtio-net を smoltcp (TCP/IP) につなぐ
 // アドレスは DHCP でもらう (Linux の ip=dhcp のように、カーネルの中で)。
 // もらった DNS は /proc/net/pnp に出す (/etc/resolv.conf はそこへのリンク)
+// アドレスを手で決める (ioctl の SIOCSIFADDR、ip addr add、networkd) と DHCP はやめる。
+// 0.0.0.0 にすると DHCP にもどす。インターフェースは 1 つ (eth0)
 use crate::proc;
 use crate::timer;
 use crate::virtio_net::VirtioNet;
@@ -19,8 +21,9 @@ pub struct Net {
     dev: VirtioNet,
     /// close されたが、まだ FIN のやりとりが残っている TCP
     orphans: Vec<SocketHandle>,
-    dhcp: SocketHandle,
-    /// DHCP でもらったもの
+    /// DHCP のソケット (アドレスを手で決めたら None)
+    dhcp: Option<SocketHandle>,
+    /// DHCP でもらったもの、または手で決めたもの (dns は DHCP でもらっていたもの)
     pub lease: Option<Lease>,
 }
 
@@ -87,7 +90,7 @@ pub fn init() {
     let dhcp = sockets.add(dhcpv4::Socket::new());
     crate::irq::enable(dev.mmio.irq);
     println!("net: {} (dhcp)", mac);
-    unsafe { *(&raw mut NET) = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp, lease: None }) };
+    unsafe { *(&raw mut NET) = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None }) };
     poll();
 }
 
@@ -96,9 +99,81 @@ pub fn addr() -> Ipv4Address {
     get().and_then(|n| n.lease.as_ref()).map_or(Ipv4Address::UNSPECIFIED, |l| l.addr.address())
 }
 
+/// インターフェースの名前 (1 つだけ)
+pub const IFNAME: &str = "eth0";
+
+/// DHCP でアドレスをもらっているか (false なら手で決めた)
+pub fn is_dhcp() -> bool {
+    get().is_some_and(|n| n.dhcp.is_some())
+}
+
+pub fn mac() -> Option<[u8; 6]> {
+    get().map(|n| n.dev.mac)
+}
+
+/// 今のアドレスとネットマスクの長さ
+pub fn cidr() -> Option<Ipv4Cidr> {
+    get().and_then(|n| n.lease.as_ref()).map(|l| l.addr)
+}
+
+pub fn gateway() -> Option<Ipv4Address> {
+    get().and_then(|n| n.lease.as_ref()).and_then(|l| l.router)
+}
+
+/// アドレスを手で決める (DHCP はやめる)。0.0.0.0 なら DHCP にもどす。prefix がなければ今のまま (はじめは 24)
+pub fn set_addr(addr: Ipv4Address, prefix: Option<u8>) {
+    let Some(n) = get() else { return };
+    if addr == Ipv4Address::UNSPECIFIED {
+        if n.dhcp.is_none() {
+            n.dhcp = Some(n.sockets.add(dhcpv4::Socket::new()));
+            n.iface.update_ip_addrs(|a| a.clear());
+            n.iface.routes_mut().remove_default_ipv4_route();
+            n.lease = None;
+            println!("net: dhcp");
+        }
+        poll();
+        return;
+    }
+    if let Some(h) = n.dhcp.take() {
+        n.sockets.remove(h);
+    }
+    let prefix = prefix.or(n.lease.as_ref().map(|l| l.addr.prefix_len())).unwrap_or(24);
+    let c = Ipv4Cidr::new(addr, prefix);
+    n.iface.update_ip_addrs(|a| {
+        a.clear();
+        let _ = a.push(IpCidr::Ipv4(c));
+    });
+    // ゲートウェイと DNS はそのまま (Linux の ip addr と同じく、DNS はさわらない)
+    let (router, dns) = n.lease.as_ref().map_or((None, Vec::new()), |l| (l.router, l.dns.clone()));
+    let changed = n.lease.as_ref().is_none_or(|l| l.addr != c);
+    n.lease = Some(Lease { addr: c, router, dns });
+    if changed {
+        println!("net: static {}", c);
+    }
+    poll();
+}
+
+/// デフォルトのゲートウェイ (None で消す)
+pub fn set_gateway(gw: Option<Ipv4Address>) {
+    let Some(n) = get() else { return };
+    match gw {
+        Some(r) => {
+            let _ = n.iface.routes_mut().add_default_ipv4_route(r);
+        }
+        None => {
+            n.iface.routes_mut().remove_default_ipv4_route();
+        }
+    }
+    if let Some(l) = n.lease.as_mut() {
+        l.router = gw;
+    }
+    poll();
+}
+
 /// DHCP の知らせをインターフェースに映す
 fn dhcp_event(n: &mut Net) {
-    let ev = n.sockets.get_mut::<dhcpv4::Socket>(n.dhcp).poll();
+    let Some(h) = n.dhcp else { return };
+    let ev = n.sockets.get_mut::<dhcpv4::Socket>(h).poll();
     match ev {
         Some(dhcpv4::Event::Configured(c)) => {
             n.iface.update_ip_addrs(|a| {
