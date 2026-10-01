@@ -1,7 +1,7 @@
 // PL011 UART。場所と割り込みは DTB から (なければ qemu virt の PA 0x0900_0000, SPI 1)
 use crate::spinlock::SpinLock;
 use core::fmt;
-use core::ptr::{read_volatile, write_volatile};
+use crate::mmio;
 
 const DR: usize = 0x00;
 const FR: usize = 0x18;
@@ -15,8 +15,8 @@ const INT_RT: u32 = 1 << 6;
 static mut BASE: usize = 0;
 static mut IRQ: u32 = 33;
 
-fn reg(off: usize) -> *mut u32 {
-    unsafe { (BASE + off) as *mut u32 }
+fn reg(off: usize) -> usize {
+    unsafe { BASE + off }
 }
 
 /// 何よりも先に (dtb::init のすぐ後): 出力の場所を決める
@@ -34,19 +34,17 @@ pub fn init() {
     if let Some(i) = crate::irq::from_dt("arm,pl011") {
         unsafe { IRQ = i };
     }
-    unsafe { write_volatile(reg(IMSC), INT_RX | INT_RT) };
+    mmio::w32(reg(IMSC), INT_RX | INT_RT);
     crate::irq::enable(irq());
 }
 
 /// 受信した文字をすべてコンソールへ渡す
 pub fn intr() {
-    unsafe {
-        // 先に下げてから読む (読んだ後に下げると、その間に来た文字の割り込みを消してしまう)
-        write_volatile(reg(ICR), INT_RX | INT_RT);
-        while read_volatile(reg(FR)) & FR_RXFE == 0 {
-            let c = read_volatile(reg(DR)) as u8;
-            crate::console::intr(c);
-        }
+    // 先に下げてから読む (読んだ後に下げると、その間に来た文字の割り込みを消してしまう)
+    mmio::w32(reg(ICR), INT_RX | INT_RT);
+    while mmio::r32(reg(FR)) & FR_RXFE == 0 {
+        let c = mmio::r32(reg(DR)) as u8;
+        crate::console::intr(c);
     }
 }
 
@@ -55,8 +53,8 @@ pub fn putc(c: u8) {
         if BASE == 0 {
             return;
         }
-        while read_volatile(reg(FR)) & FR_TXFF != 0 {}
-        write_volatile(reg(DR), c as u32);
+        while mmio::r32(reg(FR)) & FR_TXFF != 0 {}
+        mmio::w32(reg(DR), c as u32);
     }
 }
 

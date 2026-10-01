@@ -4,7 +4,6 @@
 // ラズパイ 4 の emmc2 はどちらも SDHCI。BCM2835 の SDHCI は 8/16 ビットの書き込みを
 // 受けつけないので、レジスタはいつも 32 ビットで読み書きする。
 use crate::memlayout::p2v;
-use core::ptr::{read_volatile, write_volatile};
 
 const ARG2: usize = 0x00;
 const BLKSIZECNT: usize = 0x04;
@@ -65,11 +64,11 @@ struct Sd {
 static mut SD: Option<Sd> = None;
 
 fn rd(s: &Sd, r: usize) -> u32 {
-    unsafe { read_volatile((s.base + r) as *const u32) }
+    crate::mmio::r32(s.base + r)
 }
 
 fn wr(s: &Sd, r: usize, v: u32) {
-    unsafe { write_volatile((s.base + r) as *mut u32, v) }
+    crate::mmio::w32(s.base + r, v)
 }
 
 /// 条件が立つまで待つ (だいたいの回数で打ち切る)

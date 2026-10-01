@@ -43,7 +43,7 @@ impl VirtioNet {
         let mut mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         if feats & F_MAC != 0 {
             for (i, m) in mac.iter_mut().enumerate() {
-                *m = mmio.config::<u8>(i);
+                *m = mmio.config8(i);
             }
         }
         let rx = Queue::new(&mmio, RX, QSIZE)?;
