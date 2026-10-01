@@ -219,8 +219,30 @@ pub fn get(url: &str, tls: Option<Connector>) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
-/// url を path へ、メモリにためずに書く。途中は path.part に置き、切れたら続きから (Range) 取りなおす
-pub fn download(url: &str, tls: Option<Connector>, path: &str) -> io::Result<()> {
+/// 書いたバイト数を数えて progress(合わせて何バイト目か) を呼ぶ
+struct Count<'a, W: Write> {
+    w: W,
+    n: u64,
+    progress: &'a mut dyn FnMut(u64, u64),
+    total: u64,
+}
+
+impl<W: Write> Write for Count<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let k = self.w.write(buf)?;
+        self.n += k as u64;
+        (self.progress)(self.n, self.total);
+        Ok(k)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// url を path へ、メモリにためずに書く。途中は path.part に置き、切れたら続きから (Range) 取りなおす。
+/// 進むたびに progress(書けたバイト数, 全体のバイト数 (わからなければ 0)) を呼ぶ
+pub fn download(url: &str, tls: Option<Connector>, path: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
     use std::fs::{self, OpenOptions};
     let part = format!("{}.part", path);
     let mut last = io::Error::other("download failed");
@@ -250,7 +272,11 @@ pub fn download(url: &str, tls: Option<Connector>, path: &str) -> io::Result<()>
             }
             c => return Err(io::Error::other(format!("{}: HTTP {}", u, c))),
         };
-        let mut w = io::BufWriter::with_capacity(64 * 1024, &mut f);
+        // 続きからなら、すでにあるところから数える
+        let base = if code == 206 { have } else { 0 };
+        let len = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.parse::<u64>().ok());
+        let total = len.map_or(0, |l| base + l);
+        let mut w = Count { w: io::BufWriter::with_capacity(64 * 1024, &mut f), n: base, progress: &mut *progress, total };
         let res = read_body_to(&mut r, &headers, &mut w).and_then(|_| w.flush());
         drop(w);
         match res {

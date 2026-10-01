@@ -13,6 +13,8 @@
 // パッケージはメモリにためずに /var/cache/aipkg へ書き (切れたら続きから)、そこから入れる
 #[path = "../lib/http.rs"]
 mod http;
+#[path = "../lib/meter.rs"]
+mod meter;
 #[path = "../lib/tls.rs"]
 mod tls;
 
@@ -211,18 +213,18 @@ fn fetch(url: &str) -> io::Result<Vec<u8>> {
 }
 
 /// url を path へ (http(s) は続きから取れる download、file:// は写す)
-fn fetch_to(url: &str, path: &str) -> io::Result<()> {
+fn fetch_to(url: &str, path: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
     if let Some(src) = url.strip_prefix("file://") {
-        return fs::copy(src, path).map(|_| ());
+        return fs::copy(src, path).map(|n| progress(n, n));
     }
-    http::download(url, Some(tls::connect), path)
+    http::download(url, Some(tls::connect), path, progress)
 }
 
 /// servers のどれかから file を path へ
-fn fetch_any_to(servers: &[String], file: &str, path: &str) -> io::Result<()> {
+fn fetch_any_to(servers: &[String], file: &str, path: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
     let mut last = io::Error::other("no Server configured");
     for s in servers {
-        match fetch_to(&format!("{}/{}", s.trim_end_matches('/'), file), path) {
+        match fetch_to(&format!("{}/{}", s.trim_end_matches('/'), file), path, &mut *progress) {
             Ok(()) => return Ok(()),
             Err(e) => last = e,
         }
@@ -254,10 +256,27 @@ fn tar_reader<'a>(mut r: Box<dyn BufRead + 'a>) -> Box<dyn Read + 'a> {
     }
 }
 
-/// パッケージのファイルを tar として開く
-fn open_pkg(path: &str) -> io::Result<Box<dyn Read>> {
+/// 読んだバイト数を数えて progress(合わせて何バイト目か) を呼ぶ
+struct Count<'a, R: Read> {
+    r: R,
+    n: u64,
+    progress: &'a mut dyn FnMut(u64),
+}
+
+impl<R: Read> Read for Count<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let k = self.r.read(buf)?;
+        self.n += k as u64;
+        (self.progress)(self.n);
+        Ok(k)
+    }
+}
+
+/// パッケージのファイルを tar として開く。読み進めるたびに progress(読んだバイト数) を呼ぶ
+fn open_pkg<'a>(path: &str, progress: &'a mut dyn FnMut(u64)) -> io::Result<Box<dyn Read + 'a>> {
     let f = fs::File::open(path)?;
-    Ok(tar_reader(Box::new(BufReader::with_capacity(256 * 1024, f))))
+    let c = Count { r: f, n: 0, progress };
+    Ok(tar_reader(Box::new(BufReader::with_capacity(256 * 1024, c))))
 }
 
 /// ファイルの sha256 (少しずつ読む)
@@ -330,7 +349,11 @@ fn installed() -> BTreeMap<String, (Desc, Vec<String>)> {
 
 /// パッケージの中身を読む: (.PKGINFO, ファイル一覧)
 fn scan(path: &str) -> io::Result<(Desc, Vec<String>)> {
-    let mut ar = tar::Archive::new(open_pkg(path)?);
+    let size = fs::metadata(path)?.len();
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let mut m = meter::Meter::new(&format!("checking {}", file), size);
+    let mut progress = |n: u64| m.update(n);
+    let mut ar = tar::Archive::new(open_pkg(path, &mut progress)?);
     let mut info = None;
     let mut files = vec![];
     for e in ar.entries()? {
@@ -348,6 +371,8 @@ fn scan(path: &str) -> io::Result<(Desc, Vec<String>)> {
             files.push(p);
         }
     }
+    drop(ar);
+    m.finish(size);
     let info = info.ok_or_else(|| io::Error::other("no .PKGINFO in package"))?;
     Ok((info, files))
 }
@@ -375,10 +400,13 @@ fn install(path: &str, explicit: bool) {
         }
     }
 
-    match old {
-        Some((od, _)) => println!("upgrading {} ({} -> {})", name, get(od, "VERSION"), ver),
-        None => println!("installing {} ({})", name, ver),
-    }
+    let label = match old {
+        Some((od, _)) => format!("upgrading {} ({} -> {})", name, get(od, "VERSION"), ver),
+        None => format!("installing {} ({})", name, ver),
+    };
+    let size = fs::metadata(path).map_or(0, |m| m.len());
+    let mut m = meter::Meter::new(&label, size);
+    let mut progress = |n: u64| m.update(n);
 
     // 設定ファイル (backup): 入っている版を変えていたら上書きせず、新しいものは .pacnew に
     // (パッケージの版が前と変わっていなければ、何もしない)
@@ -387,7 +415,7 @@ fn install(path: &str, explicit: bool) {
         old.map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).collect()).unwrap_or_default();
     let mut new_backup = vec![];
 
-    let mut ar = tar::Archive::new(open_pkg(path).unwrap_or_else(|e| die(format!("{}: {}", path, e))));
+    let mut ar = tar::Archive::new(open_pkg(path, &mut progress).unwrap_or_else(|e| die(format!("{}: {}", path, e))));
     ar.set_preserve_permissions(true);
     ar.set_preserve_mtime(true);
     ar.set_overwrite(true);
@@ -427,6 +455,8 @@ fn install(path: &str, explicit: bool) {
             die(format!("{}: /{}: {}", name, path, err));
         }
     }
+    drop(ar);
+    m.finish(size);
 
     // 古い版にだけあったファイルを消す
     if let Some((od, ofiles)) = old {
@@ -561,6 +591,14 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
 
 fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
     let sync = sync_all(repos);
+    // まだデータベースを取ってきていないリポジトリがあれば、-Sy をすすめる
+    if let Some(t) = targets.iter().find(|t| !sync.contains_key(*t)) {
+        let missing: Vec<&str> =
+            repos.iter().filter(|r| fs::metadata(format!("{}/sync/{}.db", DBPATH, r.name)).is_err()).map(|r| r.name.as_str()).collect();
+        if !missing.is_empty() {
+            die(format!("target not found: {} (no database for {} yet; run aipkg -Sy)", t, missing.join(", ")));
+        }
+    }
     let order = resolve(targets, &sync);
     if order.is_empty() {
         println!(" there is nothing to do");
@@ -580,8 +618,16 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
         // キャッシュにあってチェックサムが合えば、それを使う
         let cached = !want.is_empty() && sha256_file(&path).is_ok_and(|h| h == want);
         if !cached {
-            println!("downloading {}", file);
-            fetch_any_to(&repos[*ri].servers, file, &path).unwrap_or_else(|e| die(format!("{}: {}", file, e)));
+            let csize = get(d, "CSIZE").parse().unwrap_or(0);
+            let mut m = meter::Meter::new(file, csize);
+            let mut done = 0;
+            let r = fetch_any_to(&repos[*ri].servers, file, &path, &mut |n, total| {
+                m.set_total(total);
+                m.update(n);
+                done = n;
+            });
+            m.finish(done);
+            r.unwrap_or_else(|e| die(format!("{}: {}", file, e)));
             if !want.is_empty() && sha256_file(&path).ok().as_deref() != Some(want) {
                 let _ = fs::remove_file(&path);
                 die(format!("{}: checksum mismatch", file));
