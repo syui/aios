@@ -2,15 +2,16 @@
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
 #   bin/gitea.sh repo    repo/aarch64 (パッケージと aios.db) を ai/repo の main の aarch64/ へ
-#   bin/gitea.sh id      AI_GPG_KEY を取りこんで、このリポジトリのコミットをそのキーの持ち主の名前と署名にする
+#   bin/gitea.sh id      GPG_KEY を取りこんで、このリポジトリのコミットをそのキーの持ち主の名前と署名にする
 # 環境変数:
 #   GITEA_TOKEN  gitea のアクセストークン (必須。ディスクには書かない)
 #   GITEA_USER   トークンの持ち主 (既定 ai)
-#   AI_GPG_KEY   ASCII armor の GPG 秘密鍵 (あれば: コミットの名前とメールはキーの uid から、署名つき)
+#   GPG_KEY      ASCII armor の GPG 秘密鍵 (AI_GPG_KEY でも。あれば: コミットの名前とメールはキーの uid から、署名つき)
 set -e
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
 user=${GITEA_USER:-ai}
+AI_GPG_KEY=${AI_GPG_KEY:-$GPG_KEY}
 
 need_token() {
   [ -n "$GITEA_TOKEN" ] || { echo "GITEA_TOKEN がありません (環境の設定で環境変数として入れてください)" >&2; exit 1; }
@@ -21,7 +22,7 @@ auth() {
   printf 'http.%s/.extraheader=Authorization: Basic %s' "$host" "$(printf '%s:%s' "$user" "$GITEA_TOKEN" | base64 | tr -d '\n')"
 }
 
-# AI_GPG_KEY を取りこみ、そのキーの uid と指紋を返す ("名前 <メール>" と指紋)
+# GPG_KEY (AI_GPG_KEY) を取りこみ、そのキーの uid と指紋を返す ("名前 <メール>" と指紋)
 import_key() {
   [ -n "$AI_GPG_KEY" ] || return 1
   printf '%s\n' "$AI_GPG_KEY" | gpg --batch --quiet --import 2>/dev/null
