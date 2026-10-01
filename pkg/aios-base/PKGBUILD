@@ -12,7 +12,7 @@ depends=('brush')
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
-        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab)
+        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/shrc)
 
 pkgver() {
   cd "$startdir/../.."
