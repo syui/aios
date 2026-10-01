@@ -1,5 +1,5 @@
 # aish-powerline: aish の powerline のプロンプト (aish の拡張。[shell] リポジトリ)
-#   aipkg -S aish-powerline してから、~/.aishrc に
+#   aipkg -S aish-powerline してから、~/.aishrc (見本は /usr/share/aish/aishrc.example) に
 #   source /usr/share/aish/plugins/aish-powerline/aish-powerline.sh
 pkgname=aish-powerline
 pkgver=0.0.1
