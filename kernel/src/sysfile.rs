@@ -197,6 +197,7 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?;
     let mut tmp = vec![0u8; len.min(64 * 1024)];
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
+    vfs::write_sealed(&ino, off.max(0) as usize, tmp.len())?;
     let n = ino.write_at(off.max(0) as usize, &tmp)?;
     Ok(n as i64)
 }
@@ -563,9 +564,25 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
 
 /// memfd_create: どこにも名前のない tmpfs のファイル (Wayland の共有メモリなど)
 pub fn memfd_create(name: usize, flags: u64) -> R {
+    use crate::tmpfs::{F_SEAL_EXEC, F_SEAL_SEAL};
     const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
+    const MFD_EXEC: u64 = 0x10;
+    const MFD_NOEXEC_SEAL: u64 = 8;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC | MFD_NOEXEC_SEAL) != 0 || flags & (MFD_EXEC | MFD_NOEXEC_SEAL) == MFD_EXEC | MFD_NOEXEC_SEAL {
+        return Err(-EINVAL);
+    }
     let name = user_str(name)?;
-    let ino = crate::tmpfs::anon_file();
+    // 封: MFD_ALLOW_SEALING がなければ「もう封はつけられない」から。MFD_NOEXEC_SEAL は封ができて、実行できない
+    let seals = if flags & MFD_NOEXEC_SEAL != 0 {
+        F_SEAL_EXEC
+    } else if flags & MFD_ALLOW_SEALING != 0 {
+        0
+    } else {
+        F_SEAL_SEAL
+    };
+    let c = crate::cred::current();
+    let ino = crate::tmpfs::anon_file(c.euid, c.egid, seals);
     let f = file::new(Kind::Inode(ino, alloc::format!("/memfd:{} (deleted)", name)), file::O_RDWR);
     let fd = proc::current().files().add(f, flags & MFD_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
@@ -766,8 +783,19 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             }
             Ok(0)
         }
-        // 封 (seal) は覚えない: 受けつけるだけ
-        F_ADD_SEALS | F_GET_SEALS => Ok(0),
+        // memfd の封 (seal)。memfd でなければ EINVAL
+        F_GET_SEALS | F_ADD_SEALS => {
+            let f = entry.file.borrow();
+            let Kind::Inode(ino, _) = &f.kind else { return Err(-EINVAL) };
+            if cmd == F_GET_SEALS {
+                return ino.seals().map(|s| s as i64).ok_or(-EINVAL);
+            }
+            if f.flags & file::O_ACCMODE == file::O_RDONLY {
+                return Err(-cred::EPERM);
+            }
+            ino.add_seals(arg as u32)?;
+            Ok(0)
+        }
         // POSIX のレコードロック (F_GETLK / F_SETLK / F_SETLKW) と OFD ロック (36〜38)。
         // まだ本当には錠をかけない: かけるのはいつも成功し、聞かれたら「だれもかけていない」と答える
         // (SQLite などが使う。ほかのプロセスとの取り合いはまだ守らない)
@@ -1085,7 +1113,9 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     }
     let done = if off_out != 0 {
         let off = read_off(off_out)?;
-        let w = inode_of(fd_out)?.write_at(off as usize, &tmp[..n])?;
+        let dst = inode_of(fd_out)?;
+        vfs::write_sealed(&dst, off as usize, n)?;
+        let w = dst.write_at(off as usize, &tmp[..n])?;
         out(off_out, &(off + w as i64).to_le_bytes())?;
         w
     } else {

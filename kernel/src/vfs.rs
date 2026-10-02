@@ -107,6 +107,35 @@ pub trait Inode {
     fn sync(&self) -> Result<(), i64> {
         Ok(())
     }
+    /// /proc/PID/fd/N のような「魔法のリンク」: たどると、名前ではなくその fd のファイルそのもの
+    /// (消えた memfd も開ける)。(パス, inode)
+    fn magic_link(&self) -> Option<(String, InodeRef)> {
+        None
+    }
+    /// memfd の封 (F_GET_SEALS の F_SEAL_*)。封のないファイルは None
+    fn seals(&self) -> Option<u32> {
+        None
+    }
+    /// 封を足す (F_ADD_SEALS)
+    fn add_seals(&self, _seals: u32) -> Result<(), i64> {
+        Err(-EINVAL)
+    }
+}
+
+/// write / pwrite / sendfile で off から len 書いてよいか (memfd の封)。
+/// 共有の写像の書き戻しはここを通らない (Linux でも F_SEAL_FUTURE_WRITE の前の写像は書ける)
+pub fn write_sealed(ino: &InodeRef, off: usize, len: usize) -> Result<(), i64> {
+    const F_SEAL_GROW: u32 = 4;
+    const F_SEAL_WRITE: u32 = 8;
+    const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+    let Some(s) = ino.seals() else { return Ok(()) };
+    if len > 0 && s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        return Err(-EPERM);
+    }
+    if s & F_SEAL_GROW != 0 && off + len > ino.meta().size as usize {
+        return Err(-EPERM);
+    }
+    Ok(())
 }
 
 static mut ROOT: Option<InodeRef> = None;
@@ -216,6 +245,12 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             let next = cross(cur.lookup(c)?);
             let last = i + 1 == comps.len();
             if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {
+                if let Some((p, ino)) = next.magic_link() {
+                    if !last {
+                        return Err(-ENOTDIR);
+                    }
+                    return Ok((p.trim_start_matches('/').to_string(), ino));
+                }
                 let t = next.readlink()?;
                 let mut np = normalize(&walked, &t);
                 for rest in &comps[i + 1..] {

@@ -273,6 +273,16 @@ impl Inode for ProcInode {
         (self.fs, self.ino())
     }
 
+    fn magic_link(&self) -> Option<(String, InodeRef)> {
+        let Node::Fd(pid, n) = self.node else { return None };
+        let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
+        let f = f.borrow();
+        match &f.kind {
+            crate::file::Kind::Inode(ino, path) => Some((path.clone(), ino.clone())),
+            _ => None,
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
