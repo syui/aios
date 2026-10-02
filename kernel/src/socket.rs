@@ -277,6 +277,13 @@ fn pair_of(fd: u64) -> Option<FileRef> {
     is_pair.then_some(f)
 }
 
+/// AF_UNIX のまだつながっていない口なら、その OpenFile
+fn unix_file(fd: u64) -> Option<FileRef> {
+    let f = proc::current().files().get(fd).cloned()?;
+    let is_unix = matches!(f.borrow().kind, Kind::Unix(_));
+    is_unix.then_some(f)
+}
+
 fn add_fd(s: Socket, cloexec: bool) -> R {
     let f: FileRef = file::new(Kind::Socket(Rc::new(RefCell::new(s))), 2);
     let fd = proc::current().files().add(f, cloexec, 0).ok_or(-EMFILE)?;
@@ -311,6 +318,15 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
 }
 
 pub fn socket(domain: u64, typ: u64, _proto: u64) -> R {
+    const AF_UNIX: u64 = 1;
+    if domain == AF_UNIX {
+        if typ & 0xf != SOCK_STREAM {
+            return Err(-EPROTONOSUPPORT);
+        }
+        let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
+        let fd = proc::current().files().add(file::new(crate::unix::new_kind(), flags), typ & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     if domain != AF_INET {
         return Err(-EAFNOSUPPORT);
     }
@@ -325,6 +341,9 @@ pub fn socket(domain: u64, typ: u64, _proto: u64) -> R {
 }
 
 pub fn bind(fd: u64, addr: usize, len: usize) -> R {
+    if let Some(f) = unix_file(fd) {
+        return crate::unix::bind(&f, addr, len);
+    }
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
     let mut s = s.borrow_mut();
@@ -337,6 +356,9 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
 }
 
 pub fn listen(fd: u64) -> R {
+    if let Some(f) = unix_file(fd) {
+        return crate::unix::listen(&f);
+    }
     let s = sock_of(fd)?;
     let mut s = s.borrow_mut();
     if s.proto != Proto::Tcp {
@@ -353,6 +375,11 @@ pub fn listen(fd: u64) -> R {
 }
 
 pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
+    if let Some(f) = unix_file(fd) {
+        let n = crate::unix::accept(&f, flags)?;
+        crate::unix::write_family(addr, lenp)?;
+        return Ok(n);
+    }
     let s = sock_of(fd)?;
     let mut s = s.borrow_mut();
     if !s.listening {
@@ -378,6 +405,12 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
 }
 
 pub fn connect(fd: u64, addr: usize, len: usize) -> R {
+    if let Some(f) = unix_file(fd) {
+        return crate::unix::connect(&f, addr, len);
+    }
+    if pair_of(fd).is_some() {
+        return Err(-EISCONN);
+    }
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
     let mut s = s.borrow_mut();
@@ -450,6 +483,9 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
 }
 
 pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
+    if unix_file(fd).is_some() || pair_of(fd).is_some() {
+        return crate::unix::write_family(addr, lenp);
+    }
     let s = sock_of(fd)?;
     let s = s.borrow();
     let ep = match (s.proto == Proto::Tcp, s.handle) {
@@ -461,6 +497,12 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
 }
 
 pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
+    if pair_of(fd).is_some() {
+        return crate::unix::write_family(addr, lenp);
+    }
+    if unix_file(fd).is_some() {
+        return Err(-ENOTCONN);
+    }
     let s = sock_of(fd)?;
     let s = s.borrow();
     let ep = match (s.proto == Proto::Tcp, s.handle) {
@@ -478,6 +520,17 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SOL_SOCKET: u64 = 1;
     const SO_ERROR: u64 = 4;
     const SO_TYPE: u64 = 3;
+    if unix_file(fd).is_some() || pair_of(fd).is_some() {
+        let v: i32 = if (level, opt) == (SOL_SOCKET, SO_TYPE) { 1 } else { 0 };
+        if val != 0 {
+            let pt = proc::current().pt();
+            pt.copy_out(val, &v.to_le_bytes()).ok_or(-EFAULT)?;
+            if lenp != 0 {
+                pt.copy_out(lenp, &4u32.to_le_bytes()).ok_or(-EFAULT)?;
+            }
+        }
+        return Ok(0);
+    }
     let s = sock_of(fd)?;
     let v: i32 = match (level, opt) {
         (SOL_SOCKET, SO_ERROR) => {
@@ -503,6 +556,9 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
 
 pub fn shutdown(fd: u64, how: u64) -> R {
     const SHUT_RD: u64 = 0;
+    if unix_file(fd).is_some() || pair_of(fd).is_some() {
+        return Ok(0);
+    }
     let s = sock_of(fd)?;
     let s = s.borrow();
     if let (Proto::Tcp, Some(h)) = (&s.proto, s.handle) {
@@ -519,6 +575,8 @@ struct MsgHdr {
     name: usize,
     namelen_at: usize,
     iov: alloc::vec::Vec<(usize, usize)>,
+    control: usize,
+    controllen: usize,
     controllen_at: usize,
     flags_at: usize,
 }
@@ -538,18 +596,26 @@ fn read_msghdr(va: usize) -> Result<MsgHdr, i64> {
         pt.copy_in(&mut e, iov_at + i * 16).ok_or(-EFAULT)?;
         iov.push((u64::from_le_bytes(e[..8].try_into().unwrap()) as usize, u64::from_le_bytes(e[8..].try_into().unwrap()) as usize));
     }
-    Ok(MsgHdr { name: u(0), namelen_at: va + 8, iov, controllen_at: va + 40, flags_at: va + 48 })
+    Ok(MsgHdr { name: u(0), namelen_at: va + 8, iov, control: u(32), controllen: u(40), controllen_at: va + 40, flags_at: va + 48 })
 }
 
 pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
     let m = read_msghdr(msg)?;
     if let Some(f) = pair_of(fd) {
-        // 付帯データ (SCM_RIGHTS など) はまだ運べないので中身だけ
+        // 付帯データの SCM_RIGHTS は、このデータの始まりにつけて送る
+        let fds = crate::unix::take_rights(m.control, m.controllen)?;
         let mut data = alloc::vec::Vec::new();
         for (base, len) in &m.iov {
             let start = data.len();
             data.resize(start + len, 0);
             proc::current().pt().copy_in(&mut data[start..], *base).ok_or(-EFAULT)?;
+        }
+        if !fds.is_empty() {
+            let tx = match &f.borrow().kind {
+                Kind::Pair(_, tx) => tx.clone(),
+                _ => unreachable!(),
+            };
+            crate::unix::attach(&tx, fds);
         }
         return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
     }
@@ -575,8 +641,19 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let m = read_msghdr(msg)?;
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
     let mut data = vec![0u8; total.min(64 * 1024)];
+    let mut ctl = (0, 0);
     let (k, from) = match pair_of(fd) {
-        Some(f) => (file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?, None),
+        Some(f) => {
+            let rx = match &f.borrow().kind {
+                Kind::Pair(rx, _) => rx.clone(),
+                _ => unreachable!(),
+            };
+            let k = file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?;
+            // 読んだところまでについてきた fd
+            let end = rx.borrow().taken;
+            ctl = crate::unix::deliver(&rx, end, m.control, m.controllen, flags)?;
+            (k, None)
+        }
         None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?,
     };
     let pt = proc::current().pt();
@@ -592,7 +669,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     if m.name != 0 {
         write_addr(m.name, m.namelen_at, from)?;
     }
-    pt.copy_out(m.controllen_at, &0u64.to_le_bytes()).ok_or(-EFAULT)?;
-    pt.copy_out(m.flags_at, &0u32.to_le_bytes()).ok_or(-EFAULT)?;
+    pt.copy_out(m.controllen_at, &(ctl.0 as u64).to_le_bytes()).ok_or(-EFAULT)?;
+    pt.copy_out(m.flags_at, &ctl.1.to_le_bytes()).ok_or(-EFAULT)?;
     Ok(k as i64)
 }

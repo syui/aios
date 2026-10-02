@@ -187,6 +187,7 @@ mod nr {
     pub const PWRITEV2: u64 = 287;
     pub const STATX: u64 = 291;
     pub const GETRANDOM: u64 = 278;
+    pub const MEMFD_CREATE: u64 = 279;
     pub const MEMBARRIER: u64 = 283;
     pub const RSEQ: u64 = 293;
     pub const CLOSE_RANGE: u64 = 436;
@@ -235,6 +236,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FSTATFS => sysfile::fstatfs(a[0], a[1] as usize),
         TRUNCATE => sysfile::truncate(a[0] as usize, a[1] as i64),
         FTRUNCATE => sysfile::ftruncate(a[0], a[1] as i64),
+        MEMFD_CREATE => sysfile::memfd_create(a[0] as usize, a[1]),
         FCHDIR => sysfile::fchdir(a[0]),
         FCHMOD => sysfile::fchmod(a[0], a[1]),
         FCHMODAT => sysfile::fchmodat(int(a[0]), a[1] as usize, a[2]),

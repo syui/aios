@@ -42,6 +42,8 @@ pub enum Kind {
     /// socketpair の片方: rx から読み、tx へ書く
     Pair(Rc<RefCell<Pipe>>, Rc<RefCell<Pipe>>),
     Socket(crate::socket::SockRef),
+    /// AF_UNIX のソケットで、まだつながっていないもの (bind / listen 中)。つながると Pair になる
+    Unix(crate::unix::UnixRef),
     Epoll(crate::epoll::EpollRef),
     EventFd(crate::epoll::EventFdRef),
     /// pidfd_open で開いたプロセス (終わると読める)
@@ -348,7 +350,7 @@ impl OpenFile {
                 Stat::dev(vfs::S_IFBLK | 0o660, ((ma as u64) << 8) | mi as u64)
             }
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
-            Kind::Socket(_) | Kind::Pair(..) => Stat::dev(0o140000 | 0o777, 0),
+            Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
             Kind::Epoll(_) | Kind::EventFd(_) | Kind::PidFd(_) => Stat::dev(0o600, 0),
         }
@@ -379,6 +381,7 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
+            Kind::Unix(u) => alloc::format!("socket:[{}]", Rc::as_ptr(u) as usize & 0xffffff),
             Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
             Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
@@ -408,6 +411,7 @@ impl OpenFile {
                 (rx.len() > 0 || rx.writers == 0, tx.len() < tx.cap, rx.writers == 0 && rx.len() == 0)
             }
             Kind::Socket(s) => s.borrow().readiness(),
+            Kind::Unix(u) => crate::unix::readiness(u),
             Kind::EventFd(e) => crate::epoll::readiness(e),
             Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
@@ -422,6 +426,7 @@ impl OpenFile {
             Kind::Tty(t) | Kind::PtyMaster(t) => alloc::vec![t.borrow().poll_key()],
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
             Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
+            Kind::Unix(u) => alloc::vec![Rc::as_ptr(u) as usize],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
@@ -616,12 +621,17 @@ pub struct Pipe {
     w_opened: u64,
     /// 書かれたり口が閉じたりするたびに増える (epoll の EPOLLET が「新しいこと」を見分ける)
     pub generation: u64,
+    /// これまでに書かれた / 読まれたバイト数 (SCM_RIGHTS の fd がどのバイトについてきたか)
+    pub wrote: u64,
+    pub taken: u64,
+    /// sendmsg の SCM_RIGHTS で送られた fd (wrote のどこから始まるデータについてきたか)
+    pub rights: alloc::collections::VecDeque<(u64, Vec<FileRef>)>,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0 }));
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -673,7 +683,7 @@ impl Pipe {
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
         let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0 }));
+        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
     }
@@ -681,7 +691,7 @@ impl Pipe {
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<RefCell<Pipe>> {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0 }))
+        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }))
     }
 
     fn wake(p: &Rc<RefCell<Pipe>>) {
@@ -696,6 +706,9 @@ impl Pipe {
                 let mut pp = p.borrow_mut();
                 if pp.data.len > 0 {
                     let n = pp.data.pop(dst, !peek);
+                    if !peek {
+                        pp.taken += n as u64;
+                    }
                     drop(pp);
                     Pipe::wake(p);
                     return Ok(n);
@@ -725,6 +738,7 @@ impl Pipe {
                 if k > 0 {
                     pp.data.push(&src[done..done + k])?;
                     pp.generation += 1;
+                    pp.wrote += k as u64;
                     done += k;
                 }
             }
