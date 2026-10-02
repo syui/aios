@@ -167,6 +167,7 @@ mod nr {
     pub const EXECVE: u64 = 221;
     pub const MMAP: u64 = 222;
     pub const FADVISE64: u64 = 223;
+    pub const READAHEAD: u64 = 213;
     pub const MPROTECT: u64 = 226;
     pub const MSYNC: u64 = 227;
     pub const MADVISE: u64 = 233;
@@ -288,7 +289,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETXATTR..=FSETXATTR => Err(-EOPNOTSUPP),
         SPLICE => sysfile::splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
-        FADVISE64 => Ok(0),
+        // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
+        FADVISE64 | READAHEAD => Ok(0),
 
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
