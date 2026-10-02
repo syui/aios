@@ -29,6 +29,7 @@ enum Node {
     Swaps,
     Threads,
     Strace,
+    Sysstat,
     Modules,
     NetDir,
     Pnp,
@@ -78,6 +79,7 @@ impl ProcInode {
             Node::Swaps => 10,
             Node::Threads => 31,
             Node::Strace => 32,
+            Node::Sysstat => 33,
             Node::Modules => 12,
             Node::Route => 11,
             Node::Pid(p) => (p as u64) << 16 | 1,
@@ -147,6 +149,7 @@ impl ProcInode {
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
             Node::Strace => crate::syscall::strace_get(),
+            Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
             Node::Pnp => {
@@ -355,6 +358,7 @@ impl Inode for ProcInode {
             (Node::Root, "swaps") => Node::Swaps,
             (Node::Root, "threads") => Node::Threads,
             (Node::Root, "strace") => Node::Strace,
+            (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
@@ -394,6 +398,7 @@ impl Inode for ProcInode {
                 add("swaps".into(), Node::Swaps);
                 add("threads".into(), Node::Threads);
                 add("strace".into(), Node::Strace);
+                add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {

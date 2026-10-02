@@ -211,6 +211,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     let nr = tf.x[8];
     proc::current().orig_x0 = tf.x[0];
     proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
+    count(nr);
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -404,6 +405,40 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
 
 const EINTR_: i64 = 4;
 
+/// /proc/sysstat: スレッドの名前ごとの、システムコールの回数 (空回りを探す調べもの用)。
+/// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える
+static mut COUNTS: alloc::collections::BTreeMap<([u8; 16], u64), u64> = alloc::collections::BTreeMap::new();
+static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
+
+fn count(nr: u64) {
+    // スレッドの名前 (pthread_setname_np) ごと
+    let comm = proc::current().comm;
+    unsafe {
+        *(*(&raw mut COUNTS)).entry((comm, nr)).or_insert(0) += 1;
+    }
+}
+
+/// 数えたものを多い順に (読むと 0 にもどる)
+pub fn sysstat() -> alloc::string::String {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    let m = unsafe { core::mem::take(&mut *(&raw mut COUNTS)) };
+    let mut v: alloc::vec::Vec<_> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut s = alloc::string::String::new();
+    for ((comm, nr), n) in v.into_iter().take(40) {
+        let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let _ = writeln!(s, "{:>10} {:>4} {}", n, nr, core::str::from_utf8(&comm[..len]).unwrap_or("?"));
+    }
+    for (nr, c) in FAST.iter().enumerate() {
+        let n = c.swap(0, Ordering::Relaxed);
+        if n > 1000 {
+            let _ = writeln!(s, "{:>10} {:>4} (fast)", n, nr);
+        }
+    }
+    s
+}
+
 /// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを出す (調べもの用)
 static mut STRACE: [u8; 16] = [0; 16];
 
@@ -459,6 +494,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
     let a = tf.x;
     let p = proc::current();
+    if let Some(c) = FAST.get(a[8] as usize) {
+        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let r = match a[8] {
         GETPID => p.tgid as i64,
         GETTID => p.pid as i64,
