@@ -883,6 +883,21 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if let Kind::Input(n) = f.borrow().kind {
         return crate::input::ioctl(n, req, arg);
     }
+    // FIONREAD: いま読めるバイト数 (パイプ、socketpair と AF_UNIX のソケット、ふつうのファイル)。
+    // 端末のものは tty の ioctl で
+    const FIONREAD: u64 = 0x541b;
+    if req == FIONREAD {
+        let f = f.borrow();
+        let n = match &f.kind {
+            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Some(p.borrow().len()),
+            Kind::Unix(_) => Some(0),
+            Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => Some((ino.meta().size as usize).saturating_sub(f.offset)),
+            _ => None,
+        };
+        if let Some(n) = n {
+            return out(arg, &(n.min(i32::MAX as usize) as i32).to_le_bytes()).map(|_| 0);
+        }
+    }
     let (tty, master) = match &f.borrow().kind {
         Kind::Tty(t) => (t.clone(), false),
         Kind::PtyMaster(t) => (t.clone(), true),
