@@ -1,0 +1,7 @@
+# useradd の既定 (shadow-utils と同じ書き方)
+# ログインシェル
+SHELL=/bin/aish
+# ホームを置くところ (HOME/NAME)
+HOME=/home
+# yes なら -m がなくてもホームを作る (/etc/skel を写す)
+CREATE_HOME=yes

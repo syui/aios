@@ -13,7 +13,8 @@ depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
-        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc)
+        etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc
+        etc/default/useradd)
 
 pkgver() {
   cd "$startdir/../../.."
@@ -36,7 +37,7 @@ package() {
   ln -s usr/bin "$pkgdir/bin"
   ln -s usr/bin "$pkgdir/sbin"
   ln -s bin "$pkgdir/usr/sbin"
-  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios ip networkd chsh modprobe; do
+  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios ip networkd chsh modprobe useradd; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす
@@ -48,6 +49,10 @@ package() {
   ln -s swapon "$pkgdir/usr/bin/swapoff"
   for p in lsmod rmmod insmod; do
     ln -s modprobe "$pkgdir/usr/bin/$p"
+  done
+  # ユーザーとグループ (shadow-utils と同じ名前): useradd が呼ばれた名前で動きを変える
+  for p in usermod userdel groupadd groupdel; do
+    ln -s useradd "$pkgdir/usr/bin/$p"
   done
   # sh として呼ばれた aish は POSIX の sh として動く
   ln -s aish "$pkgdir/usr/bin/sh"

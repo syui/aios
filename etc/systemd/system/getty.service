@@ -7,7 +7,7 @@
 #     ExecStart=/bin/login
 #   (ExecStart= で空にしてから書く。/bin/login はユーザー名とパスワードを聞く。
 #    /bin/login -f NAME なら NAME で自動ログイン)
-# パスワードを付けるのは: sudo passwd ai
+# ユーザーを足すのは: sudo useradd -G wheel NAME; sudo passwd NAME (wheel なら sudo が使える)
 [Unit]
 Description=Console shell (autologin)
 After=motd.service swap.service networkd.service
