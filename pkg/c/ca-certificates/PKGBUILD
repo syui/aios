@@ -1,0 +1,17 @@
+# ca-certificates: TLS のサーバーを確かめるための、信頼する認証局の一覧 (Mozilla のもの)
+# curl の配っている日付つきの cacert を、チェックサムを固定して入れる。Arch と同じ場所:
+#   /etc/ssl/certs/ca-certificates.crt  (curl や git など C の拡張が使う。aios の Rust のものは持っている)
+pkgname=ca-certificates
+pkgver=20260925
+pkgrel=1
+pkgdesc='Mozilla CA certificates for TLS (PEM bundle)'
+arch=('any')
+url='https://curl.se/docs/caextract.html'
+license=('MPL-2.0')
+source=("https://curl.se/ca/cacert-2026-09-25.pem")
+sha256sums=('a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505')
+
+package() {
+  install -Dm644 cacert-2026-09-25.pem "$pkgdir/etc/ssl/certs/ca-certificates.crt"
+  ln -s certs/ca-certificates.crt "$pkgdir/etc/ssl/cert.pem"
+}
