@@ -347,116 +347,130 @@ fn installed() -> BTreeMap<String, (Desc, Vec<String>)> {
 
 // ---- 入れる / 外す ----
 
-/// パッケージの中身を読む: (.PKGINFO, ファイル一覧)
-fn scan(path: &str) -> io::Result<(Desc, Vec<String>)> {
-    let size = fs::metadata(path)?.len();
-    let file = path.rsplit('/').next().unwrap_or(path);
-    let mut m = meter::Meter::new(&format!("checking {}", file), size);
-    let mut progress = |n: u64| m.update(n);
-    let mut ar = tar::Archive::new(open_pkg(path, &mut progress)?);
-    let mut info = None;
-    let mut files = vec![];
-    for e in ar.entries()? {
-        let mut e = e?;
-        let path = e.path()?.to_string_lossy().to_string();
-        if path == ".PKGINFO" {
-            let mut s = String::new();
-            e.read_to_string(&mut s)?;
-            info = Some(parse_pkginfo(&s));
-        } else if !path.starts_with('.') {
-            let mut p = path.trim_start_matches("./").to_string();
-            if e.header().entry_type().is_dir() && !p.ends_with('/') {
-                p.push('/');
-            }
-            files.push(p);
-        }
-    }
-    drop(ar);
-    m.finish(size);
-    let info = info.ok_or_else(|| io::Error::other("no .PKGINFO in package"))?;
-    Ok((info, files))
-}
-
+/// パッケージを入れる。中身は 1 回だけ読む (先頭の .PKGINFO を読んでから、ファイルを順に展開する)。
+/// ほかのパッケージのファイルとぶつかったら、ここで作ったファイルを消して止まる
 fn install(path: &str, explicit: bool) {
-    let (info, files) = scan(path).unwrap_or_else(|e| die(format!("{}: {}", path, e)));
-    let name = get(&info, "NAME").to_string();
-    let ver = get(&info, "VERSION").to_string();
-    let arch = get(&info, "ARCH");
-    if arch != ARCH && arch != "any" {
-        die(format!("{}: package is for {}, not {}", name, arch, ARCH));
-    }
-    let db = installed();
-    let old = db.get(&name);
-
-    // 他のパッケージが持っているファイルとぶつからないか
-    for (other, (_, ofiles)) in &db {
-        if *other == name {
-            continue;
-        }
-        for f in files.iter().filter(|f| !f.ends_with('/')) {
-            if ofiles.contains(f) {
-                die(format!("{}: /{} exists in {}", name, f, other));
-            }
-        }
-    }
-
-    let label = match old {
-        Some((od, _)) => format!("upgrading {} ({} -> {})", name, get(od, "VERSION"), ver),
-        None => format!("installing {} ({})", name, ver),
-    };
     let size = fs::metadata(path).map_or(0, |m| m.len());
-    let mut m = meter::Meter::new(&label, size);
-    let mut progress = |n: u64| m.update(n);
-
-    // 設定ファイル (backup): 入っている版を変えていたら上書きせず、新しいものは .pacnew に
-    // (パッケージの版が前と変わっていなければ、何もしない)
-    let backup: BTreeSet<&String> = list(&info, "BACKUP").iter().collect();
-    let old_hashes: BTreeMap<&str, &str> =
-        old.map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).collect()).unwrap_or_default();
-    let mut new_backup = vec![];
-
+    let read = std::cell::Cell::new(0u64);
+    let mut progress = |n: u64| read.set(n);
     let mut ar = tar::Archive::new(open_pkg(path, &mut progress).unwrap_or_else(|e| die(format!("{}: {}", path, e))));
     ar.set_preserve_permissions(true);
     ar.set_preserve_mtime(true);
     ar.set_overwrite(true);
+
+    // .PKGINFO を読んでから決まるもの
+    struct Ready<'a> {
+        info: Desc,
+        name: String,
+        ver: String,
+        old: Option<&'a (Desc, Vec<String>)>,
+        /// ほかのパッケージのファイル → そのパッケージ
+        owners: BTreeMap<&'a str, &'a str>,
+        backup: BTreeSet<String>,
+        old_hashes: BTreeMap<String, String>,
+        meter: meter::Meter,
+    }
+    let db = installed();
+    let mut ready: Option<Ready> = None;
+    let mut files: Vec<String> = vec![];
+    let mut created: Vec<String> = vec![];
+    let mut new_backup = vec![];
+    let fail = |created: &[String], msg: String| -> ! {
+        // メーターの行のあとに出す
+        if unsafe { libc::isatty(1) } == 1 {
+            println!();
+        }
+        // 作りかけのファイルを片付ける (前からあったものは触らない)
+        for f in created.iter().rev() {
+            let p = format!("{}{}", ROOT, f);
+            let _ = if f.ends_with('/') { fs::remove_dir(&p) } else { fs::remove_file(&p) };
+        }
+        die(msg)
+    };
     for e in ar.entries().unwrap_or_else(|e| die(e)) {
-        let mut e = e.unwrap_or_else(|e| die(e));
-        let path = e.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        if path.starts_with('.') {
+        let mut e = e.unwrap_or_else(|e| fail(&created, format!("{}: {}", path, e)));
+        let epath = e.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        if epath.starts_with('.') {
+            if epath == ".PKGINFO" {
+                let mut s = String::new();
+                e.read_to_string(&mut s).unwrap_or_else(|err| die(format!("{}: {}", path, err)));
+                let info = parse_pkginfo(&s);
+                let name = get(&info, "NAME").to_string();
+                let ver = get(&info, "VERSION").to_string();
+                let arch = get(&info, "ARCH");
+                if arch != ARCH && arch != "any" {
+                    die(format!("{}: package is for {}, not {}", name, arch, ARCH));
+                }
+                let old = db.get(&name);
+                let mut owners = BTreeMap::new();
+                for (other, (_, ofiles)) in &db {
+                    if *other != name {
+                        for f in ofiles.iter().filter(|f| !f.ends_with('/')) {
+                            owners.insert(f.as_str(), other.as_str());
+                        }
+                    }
+                }
+                let label = match old {
+                    Some((od, _)) => format!("upgrading {} ({} -> {})", name, get(od, "VERSION"), ver),
+                    None => format!("installing {} ({})", name, ver),
+                };
+                let backup = list(&info, "BACKUP").iter().cloned().collect();
+                let old_hashes = old
+                    .map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).map(|(a, b)| (a.to_string(), b.to_string())).collect())
+                    .unwrap_or_default();
+                ready = Some(Ready { info, name, ver, old, owners, backup, old_hashes, meter: meter::Meter::new(&label, size) });
+            }
             continue;
         }
-        if backup.contains(&path) {
+        let Some(r) = ready.as_mut() else { die(format!("{}: no .PKGINFO before the files", path)) };
+        r.meter.update(read.get());
+        let mut rel = epath.trim_start_matches("./").to_string();
+        if e.header().entry_type().is_dir() && !rel.ends_with('/') {
+            rel.push('/');
+        }
+        if let Some(other) = r.owners.get(rel.as_str()) {
+            let msg = format!("{}: /{} exists in {}", r.name, rel, other);
+            fail(&created, msg);
+        }
+        files.push(rel.clone());
+        let dest = format!("{}{}", ROOT, rel.trim_end_matches('/'));
+        if fs::symlink_metadata(&dest).is_err() {
+            created.push(rel.clone());
+        }
+        if r.backup.contains(&epath) {
             let mut data = vec![];
-            e.read_to_end(&mut data).unwrap_or_else(|err| die(format!("{}: /{}: {}", name, path, err)));
+            e.read_to_end(&mut data).unwrap_or_else(|err| fail(&created, format!("{}: /{}: {}", r.name, epath, err)));
             let mode = e.header().mode().unwrap_or(0o644);
             let hash = sha256_hex(&data);
-            let dest = format!("{}{}", ROOT, path);
+            let old_hash = r.old_hashes.get(&epath).map(String::as_str);
             // 今あるものが新しい版とも、前に入れた版とも違えば、手で変えたもの
             let changed = fs::read(&dest).is_ok_and(|cur| {
                 let h = sha256_hex(&cur);
-                h != hash && old_hashes.get(path.as_str()) != Some(&h.as_str())
+                h != hash && old_hash != Some(h.as_str())
             });
             // 手で変えていても、パッケージの版が前と同じなら今のものをそのまま使う (pacman と同じ)
-            if changed && old_hashes.get(path.as_str()) == Some(&hash.as_str()) {
-                new_backup.push(format!("{}\t{}", path, hash));
+            if changed && old_hash == Some(hash.as_str()) {
+                new_backup.push(format!("{}\t{}", epath, hash));
                 continue;
             }
             let target = if changed {
-                println!("warning: /{} installed as /{}.pacnew", path, path);
+                println!("warning: /{} installed as /{}.pacnew", epath, epath);
                 format!("{}.pacnew", dest)
             } else {
                 dest
             };
-            write_file(&target, &data, mode).unwrap_or_else(|err| die(format!("{}: {}: {}", name, target, err)));
-            new_backup.push(format!("{}\t{}", path, hash));
+            write_file(&target, &data, mode).unwrap_or_else(|err| fail(&created, format!("{}: {}: {}", r.name, target, err)));
+            new_backup.push(format!("{}\t{}", epath, hash));
             continue;
         }
         if let Err(err) = e.unpack_in(ROOT) {
-            die(format!("{}: /{}: {}", name, path, err));
+            let msg = format!("{}: /{}: {}", r.name, epath, err);
+            fail(&created, msg);
         }
     }
     drop(ar);
-    m.finish(size);
+    let Some(Ready { info, name, ver, old, mut meter, .. }) = ready else { die(format!("{}: no .PKGINFO in package", path)) };
+    meter.finish(size);
 
     // 古い版にだけあったファイルを消す
     if let Some((od, ofiles)) = old {
