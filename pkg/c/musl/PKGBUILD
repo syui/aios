@@ -1,0 +1,47 @@
+# musl: C の標準ライブラリの共有版 (libc.so)。動的リンクのプログラムを動かすのに要る
+#   /usr/lib/libc.so がそのまま動的リンカ (/lib/ld-musl-aarch64.so.1 はそこへのリンク)。
+#   共有ライブラリを探すところは /etc/ld-musl-aarch64.path (/usr/lib と /opt/c/lib)
+# aios の本体 (Rust) は静的リンクのままなので、これがなくても aios は動く。
+# 動的リンクのプログラムを作るのは base-devel の cc -dynamic (ヘッダーは Zig のもの)
+pkgname=musl
+pkgver=1.2.5
+pkgrel=1
+pkgdesc='Lightweight implementation of the C standard library: shared libc.so and the dynamic linker'
+arch=('aarch64')
+url='https://musl.libc.org/'
+license=('MIT')
+backup=(etc/ld-musl-aarch64.path)
+source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz"
+        0001-iconv-fix-erroneous-input-validation-in-EUC-KR-decoder.patch
+        0002-iconv-harden-UTF-8-output-code-path.patch)
+sha256sums=('a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4'
+            '0896fcdb5125d9d0723f4e165f13c209830e7045a75cba4e858060837cb7292e'
+            '0620fcee4e8a4e52ebe1ea75e2b51d2197ebda242489c0586924eafa9e9606a1')
+
+prepare() {
+  rm -rf "musl-$pkgver"
+  tar -xzf "musl-$pkgver.tar.gz"
+  cd "musl-$pkgver"
+  # CVE-2025-26519 (iconv)
+  patch -p1 < "$srcdir/0001-iconv-fix-erroneous-input-validation-in-EUC-KR-decoder.patch"
+  patch -p1 < "$srcdir/0002-iconv-harden-UTF-8-output-code-path.patch"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "musl-$pkgver"
+  # libc.so は静的にはしない (zig_env の -static を外す)。-s で小さく
+  LDFLAGS="-s" ./configure --target=aarch64-linux-musl --prefix=/usr --syslibdir=/usr/lib --disable-static
+  make lib/libc.so
+}
+
+package() {
+  cd "musl-$pkgver"
+  install -Dm755 lib/libc.so "$pkgdir/usr/lib/libc.so"
+  ln -s libc.so "$pkgdir/usr/lib/ld-musl-aarch64.so.1"
+  install -d "$pkgdir/etc"
+  printf '/usr/lib\n/usr/local/lib\n/opt/c/lib\n' > "$pkgdir/etc/ld-musl-aarch64.path"
+  chmod 644 "$pkgdir/etc/ld-musl-aarch64.path"
+  install -Dm644 COPYRIGHT "$pkgdir/usr/share/licenses/musl/COPYRIGHT"
+}
