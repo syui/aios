@@ -26,6 +26,8 @@ const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
 /// 覚えておくブロックの数の上限 (RAM の 1/8 まで)
 const CACHE_BLOCKS: usize = 16384;
+/// ファイルを読むとき、まとめて読むブロックの数 (128 KiB)
+const READ_AHEAD: usize = 32;
 
 fn cache_limit(bsize: usize) -> usize {
     CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
@@ -403,6 +405,57 @@ impl ExtFs {
         Ok(f(unsafe { core::slice::from_raw_parts_mut(page, self.bsize) }))
     }
 
+    /// ディスクから読まずに、b のページを用意する (中身はゼロ。すでにキャッシュにあればそのまま)。
+    /// 新しく作ったブロックや、ブロックまるごと書きかえるときに (読んでもすぐ上書きするので)
+    fn with_block_new<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let mut c = self.cache.borrow_mut();
+        let page = match c.map.get(&b) {
+            Some(&p) => p,
+            None => {
+                if c.map.len() >= cache_limit(self.bsize) {
+                    c.evict_one();
+                }
+                let p = match kalloc::alloc() {
+                    Some(p) => p,
+                    None if c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
+                    None => return Err(-ENOSPC),
+                };
+                unsafe { core::ptr::write_bytes(p, 0, self.bsize) };
+                c.map.insert(b, p);
+                c.order.push_back(b);
+                p
+            }
+        };
+        drop(c);
+        Ok(f(unsafe { core::slice::from_raw_parts_mut(page, self.bsize) }))
+    }
+
+    /// 先読み: ディスクの b から n ブロックを 1 回で読み、キャッシュにないものを覚える
+    fn read_ahead(&self, b: u64, n: usize) -> Result<(), i64> {
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
+        let mut buf = vec![0u8; n * self.bsize];
+        crate::block::read(b * spb, &mut buf)?;
+        let mut c = self.cache.borrow_mut();
+        for k in 0..n {
+            let blk = b + k as u64;
+            if c.map.contains_key(&blk) {
+                continue;
+            }
+            if c.map.len() >= cache_limit(self.bsize) && !c.evict_one() {
+                break;
+            }
+            let Some(p) = kalloc::alloc() else { break };
+            unsafe { core::ptr::copy_nonoverlapping(buf[k * self.bsize..].as_ptr(), p, self.bsize) };
+            c.map.insert(blk, p);
+            c.order.push_back(blk);
+        }
+        Ok(())
+    }
+
+    fn cached(&self, b: u64) -> bool {
+        self.cache.borrow().map.contains_key(&b)
+    }
+
     fn read_block(&self, b: u64) -> Result<Vec<u8>, i64> {
         self.with_block(b, |d| d.to_vec())
     }
@@ -416,9 +469,14 @@ impl ExtFs {
         Ok(r)
     }
 
-    /// ファイルの中身のブロックを書きかえる (flush で、ジャーナルより先に直接)
+    /// ファイルの中身のブロックを書きかえる (flush で、ジャーナルより先に直接)。
+    /// fresh なら、ディスクから読まずにゼロから (新しいブロックか、まるごと書きかえるとき)
     fn modify_data_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
-        let r = self.with_block(b, f)?;
+        self.modify_data_block_as(b, false, f)
+    }
+
+    fn modify_data_block_as<T>(&self, b: u64, fresh: bool, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let r = if fresh { self.with_block_new(b, f)? } else { self.with_block(b, f)? };
         let mut c = self.cache.borrow_mut();
         c.dirty.remove(&b);
         c.data.insert(b);
@@ -701,7 +759,12 @@ impl ExtFs {
                 self.sb_add_free_blocks(-1);
                 self.cache.borrow_mut().bb_dirty.insert(g);
                 let b = self.group_start(g) + bit as u64;
-                self.modify_block(b, |d| d.fill(0))?;
+                // 新しいブロックはゼロから (ディスクの古い中身は読まない)。ファイルの中身に使うなら
+                // write_data が中身のブロックに付けかえる
+                self.with_block_new(b, |d| d.fill(0))?;
+                let mut c = self.cache.borrow_mut();
+                c.data.remove(&b);
+                c.dirty.insert(b);
                 return Ok(b);
             }
         }
@@ -826,18 +889,21 @@ impl ExtFs {
     }
 
     /// 書きかえたものをディスクへ。となりあうブロックは 1 回の要求にまとめる
-    /// たまっていれば (ジャーナルの 1/4 か 512 ブロック)、または 5 秒たっていれば書き出す。
+    /// たまっていれば (メタデータはジャーナルの 1/4 か 512 ブロック、中身はキャッシュの 1/4)、
+    /// または 5 秒たっていれば書き出す。
     /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
+    /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身はキャッシュの 1/4 までためる
     fn maybe_flush(&self) -> Result<(), i64> {
         let limit = match self.journal.borrow().as_ref() {
             Some(j) => (j.capacity() / 4).min(512),
             None => 512,
         };
-        let pending = {
+        let data_limit = (cache_limit(self.bsize) / 4).max(512);
+        let (meta, data) = {
             let c = self.cache.borrow();
-            c.dirty.len() + c.data.len()
+            (c.dirty.len(), c.data.len())
         };
-        if pending >= limit || crate::timer::ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
+        if meta >= limit || data >= data_limit || crate::timer::ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
             return self.flush();
         }
         Ok(())
@@ -907,7 +973,8 @@ impl ExtFs {
 
     /// ブロックをディスクの本当の場所へ。となりあうものは 1 回の要求にまとめる
     fn write_blocks(&self, dirty: &[u64]) -> Result<(), i64> {
-        const RUN: usize = 64;
+        // 1 回に 1 MiB まで (4 KiB のブロックで)
+        const RUN: usize = 256;
         let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut i = 0;
         while i < dirty.len() {
@@ -1337,6 +1404,18 @@ impl ExtFs {
             if b == 0 {
                 buf[done..done + n].fill(0);
             } else {
+                if !self.cached(b) {
+                    // ディスクの上でつながっている後ろのブロックも 1 回で読む (最大 READ_AHEAD)
+                    let last = (size.div_ceil(self.bsize) as u64).saturating_sub(fb);
+                    let mut k = 1;
+                    while (k as u64) < last.min(READ_AHEAD as u64)
+                        && self.map(ino, &mut r, fb + k as u64, false)? == b + k as u64
+                        && !self.cached(b + k as u64)
+                    {
+                        k += 1;
+                    }
+                    self.read_ahead(b, k)?;
+                }
                 self.with_block(b, |d| buf[done..done + n].copy_from_slice(&d[bo..bo + n]))?;
             }
             done += n;
@@ -1350,6 +1429,8 @@ impl ExtFs {
             let pos = off + done;
             let (fb, bo) = ((pos / self.bsize) as u64, pos % self.bsize);
             let n = (self.bsize - bo).min(buf.len() - done);
+            // まだないブロック (これから作る) か、まるごと書きかえるなら、ディスクから読まない
+            let fresh = (bo == 0 && n == self.bsize) || self.map(ino, r, fb, false)? == 0;
             let b = match self.map(ino, r, fb, true) {
                 Ok(b) => b,
                 Err(e) if done > 0 => {
@@ -1358,7 +1439,7 @@ impl ExtFs {
                 }
                 Err(e) => return Err(e),
             };
-            self.modify_data_block(b, |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
+            self.modify_data_block_as(b, fresh, |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
             done += n;
         }
         if (off + done) as u64 > r.size() {
