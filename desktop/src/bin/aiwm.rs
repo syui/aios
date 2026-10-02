@@ -49,7 +49,8 @@ enum Obj {
     Surface,
     Region,
     Shm,
-    Pool(Pool),
+    /// バッファは作ったあとプールが消されても使える (Rc で分けあう)
+    Pool(std::rc::Rc<Pool>),
     Buffer(Buffer),
     Seat,
     Keyboard,
@@ -132,7 +133,7 @@ impl Drop for Pool {
 
 #[derive(Clone)]
 struct Buffer {
-    pool: u32,
+    pool: std::rc::Rc<Pool>,
     offset: usize,
     w: usize,
     h: usize,
@@ -719,7 +720,7 @@ impl Wm {
                 let size = m.int().max(0) as usize;
                 match fd.and_then(|fd| Pool::map(fd, size)) {
                     Some(p) => {
-                        c.objs.insert(nid, Obj::Pool(p));
+                        c.objs.insert(nid, Obj::Pool(std::rc::Rc::new(p)));
                     }
                     None => c.dead = true,
                 }
@@ -727,7 +728,8 @@ impl Wm {
             (K::Pool, 0) => {
                 let nid = m.uint();
                 let (offset, w, h, stride, _format) = (m.int(), m.int(), m.int(), m.int(), m.uint());
-                let pool = m.id;
+                let Some(Obj::Pool(pool)) = c.objs.get(&m.id) else { return };
+                let pool = pool.clone();
                 if offset < 0 || w <= 0 || h <= 0 || stride < w * 4 {
                     c.dead = true;
                     return;
@@ -740,7 +742,7 @@ impl Wm {
                 let Some(Obj::Pool(p)) = c.objs.get(&m.id) else { return };
                 let fd = unsafe { libc::dup(p.fd) };
                 if let Some(np) = Pool::map(fd, size) {
-                    c.objs.insert(m.id, Obj::Pool(np));
+                    c.objs.insert(m.id, Obj::Pool(std::rc::Rc::new(np)));
                 }
             }
             (K::Buffer, 0) => self.destroy(cid, m.id),
@@ -863,7 +865,8 @@ impl Wm {
                 s.iw = 0;
                 s.ih = 0;
             } else if let Some(Obj::Buffer(b)) = c.objs.get(&bid) {
-                if let Some(Obj::Pool(p)) = c.objs.get(&b.pool) {
+                {
+                    let p = &b.pool;
                     if b.offset + b.stride * (b.h - 1) + b.w * 4 <= p.size {
                         s.image.resize(b.w * b.h, 0);
                         for y in 0..b.h {

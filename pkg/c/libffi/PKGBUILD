@@ -1,0 +1,34 @@
+# libffi: 関数の呼び方 (ABI) を実行時に組み立てるライブラリ。libwayland が使う
+#   共有ライブラリ (/opt/c/lib/libffi.so.8)。動かすには musl
+pkgname=libffi
+pkgver=3.5.2
+pkgrel=1
+pkgdesc='Portable foreign function interface library (shared, for aios)'
+arch=('aarch64')
+url='https://sourceware.org/libffi/'
+license=('MIT')
+depends=('musl')
+source=("https://github.com/libffi/libffi/releases/download/v$pkgver/libffi-$pkgver.tar.gz")
+sha256sums=('f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc')
+
+prepare() {
+  rm -rf "libffi-$pkgver"
+  tar -xzf "libffi-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "libffi-$pkgver"
+  # 共有ライブラリなので -static は外す (libtool は -s を通さないので -Wl,-s)
+  CCAS="$CC" LDFLAGS="-Wl,-s" ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+    --disable-static --enable-shared --disable-docs --disable-multi-os-directory
+  make
+}
+
+package() {
+  cd "libffi-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share" "$pkgdir"/opt/c/lib/*.la
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/libffi/LICENSE"
+}
