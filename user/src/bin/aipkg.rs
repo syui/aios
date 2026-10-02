@@ -184,7 +184,11 @@ struct Repo {
 }
 
 fn read_conf() -> Vec<Repo> {
-    let text = fs::read_to_string(CONF).unwrap_or_default();
+    parse_conf(CONF)
+}
+
+fn parse_conf(path: &str) -> Vec<Repo> {
+    let text = fs::read_to_string(path).unwrap_or_default();
     let mut repos: Vec<Repo> = vec![];
     for line in text.lines().map(str::trim) {
         if line.starts_with('#') || line.is_empty() {
@@ -612,6 +616,21 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
         if !missing.is_empty() {
             die(format!("target not found: {} (no database for {} yet; run aipkg -Sy)", t, missing.join(", ")));
         }
+        // 設定を書きかえていると、更新で増えたリポジトリは /etc/aipkg.conf.pacnew にだけある
+        let new: Vec<String> = parse_conf(&format!("{}.pacnew", CONF))
+            .into_iter()
+            .filter(|n| !repos.iter().any(|r| r.name == n.name))
+            .map(|n| format!("[{}]", n.name))
+            .collect();
+        if !new.is_empty() {
+            die(format!(
+                "target not found: {} ({} is not in {}; see {}.pacnew, add it and run aipkg -Sy)",
+                t,
+                new.join(", "),
+                CONF,
+                CONF
+            ));
+        }
     }
     let order = resolve(targets, &sync);
     if order.is_empty() {
@@ -662,16 +681,41 @@ fn upgrade_all(repos: &[Repo], extra: &[String]) {
             }
         }
     }
-    for t in extra {
+    // まだどのリポジトリにもない名前は、更新で増えるリポジトリにあるかもしれないので後で入れる
+    let (now, later): (Vec<String>, Vec<String>) = extra.iter().cloned().partition(|t| sync.contains_key(t));
+    for t in &now {
         if !targets.contains(t) {
             targets.push(t.clone());
         }
     }
-    if targets.is_empty() {
+    if targets.is_empty() && later.is_empty() {
         println!(" there is nothing to do");
         return;
     }
-    sync_install(repos, &targets, extra);
+    if !targets.is_empty() {
+        sync_install(repos, &targets, &now);
+    }
+    let repos = refresh_new(repos);
+    if !later.is_empty() {
+        sync_install(&repos, &later, &later);
+    }
+}
+
+/// 更新で /etc/aipkg.conf が新しくなり、リポジトリが増えていたら、そのデータベースも取ってくる
+/// (aipkg -Syu の一度で、base の新しい設定にある [desktop] なども使えるように)
+fn refresh_new(old: &[Repo]) -> Vec<Repo> {
+    let repos = read_conf();
+    let new: Vec<Repo> = repos
+        .iter()
+        .filter(|r| !old.iter().any(|o| o.name == r.name) || fs::metadata(format!("{}/sync/{}.db", DBPATH, r.name)).is_err())
+        .map(|r| Repo { name: r.name.clone(), servers: r.servers.clone() })
+        .collect();
+    if !new.is_empty() {
+        let names: Vec<String> = new.iter().map(|r| format!("[{}]", r.name)).collect();
+        println!(":: new repository {} in {}", names.join(", "), CONF);
+        refresh(&new);
+    }
+    repos
 }
 
 fn info(d: &Desc, repo: Option<&str>) {
