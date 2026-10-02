@@ -89,6 +89,10 @@ path = "src/bin/modprobe.rs"
 name = "chsh"
 path = "src/bin/chsh.rs"
 
+[[bin]]
+name = "useradd"
+path = "src/bin/useradd.rs"
+
 [dependencies]
 libc = "0.2"
 ruzstd = "0.9"
