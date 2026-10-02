@@ -260,7 +260,9 @@ struct Wm {
     dirty: Option<(i32, i32)>,
     /// 次に画面を出したあと done を送る frame コールバック
     frames: Vec<(usize, u32)>,
+    /// xkb のキーマップ (memfd、NUL まで) と大きさ
     keymap_fd: RawFd,
+    keymap_size: u32,
     env: Vec<(String, String)>,
     quit: bool,
     /// バーの右に出すもの (status_command の最後の行。なければ時計)
@@ -284,7 +286,7 @@ fn main() {
         eprintln!("aiwm: {}", e);
         exit(1)
     });
-    let keymap_fd = unsafe { libc::memfd_create(c"aiwm-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+    let (keymap_fd, keymap_size) = make_keymap(&config.layout);
     let mut env = vec![("XDG_RUNTIME_DIR".to_string(), dir.clone()), ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string())];
     if !config.layout.is_empty() {
         env.push(("XKB_DEFAULT_LAYOUT".into(), config.layout.clone()));
@@ -311,6 +313,7 @@ fn main() {
         dirty: Some((0, h)),
         frames: vec![],
         keymap_fd,
+        keymap_size,
         env,
         quit: false,
         status: String::new(),
@@ -329,6 +332,29 @@ fn main() {
     wm.fb.fill(0);
     wm.fb.present();
     let _ = std::fs::remove_file(format!("{}/wayland-0", dir));
+}
+
+/// キーボードの配列 (xkb_layout) の xkb キーマップを memfd に書く: (fd, NUL までの大きさ)。
+/// 中身は desktop/share/xkb の、xkbcli compile-keymap で作ったもの (us と jp)
+fn make_keymap(layout: &str) -> (RawFd, u32) {
+    const US: &str = include_str!("../../share/xkb/us.xkb");
+    const JP: &str = include_str!("../../share/xkb/jp.xkb");
+    let text = match layout {
+        "jp" => JP,
+        "us" | "" => US,
+        other => {
+            eprintln!("aiwm: no xkb keymap for layout '{}', using us", other);
+            US
+        }
+    };
+    let fd = unsafe { libc::memfd_create(c"aiwm-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+    let mut data = text.as_bytes().to_vec();
+    data.push(0);
+    if fd < 0 || unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) } != data.len() as isize {
+        eprintln!("aiwm: cannot make the keymap: {}", std::io::Error::last_os_error());
+        return (fd, 0);
+    }
+    (fd, data.len() as u32)
 }
 
 /// $XDG_RUNTIME_DIR (なければ /run/user/UID、だめなら /tmp/runtime-UID) に wayland-0 を作って listen
@@ -774,7 +800,9 @@ impl Wm {
             (K::Seat, 1) => {
                 let k = new_obj!(Obj::Keyboard);
                 c.keyboards.push(k);
-                c.conn.send(k, 0, &[Arg::U(0), Arg::Fd(self.keymap_fd), Arg::U(0)]);
+                // 1 = XKB_V1 (クライアントは libxkbcommon で読む)。0 なら「キーマップなし」
+                let format = if self.keymap_size > 0 { 1 } else { 0 };
+                c.conn.send(k, 0, &[Arg::U(format), Arg::Fd(self.keymap_fd), Arg::U(self.keymap_size)]);
                 c.conn.send(k, 5, &[Arg::I(25), Arg::I(600)]);
                 // すでに作業中の窓なら、すぐ enter
                 if let Some(f) = self.focus.filter(|f| f.client == cid) {
