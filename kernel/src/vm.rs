@@ -120,6 +120,8 @@ pub enum Backing {
     Anon,
     /// 領域の先頭がファイルの off。va が fend 以上のところは 0 (ELF の .bss の始まりなど)
     File { ino: InodeRef, off: usize, fend: usize },
+    /// カーネルが持っているページをそのまま見せる (/dev/fb0 のフレームバッファ)。off はバイト
+    Pages { pages: alloc::rc::Rc<Vec<*mut u8>>, off: usize },
 }
 
 #[derive(Clone)]
@@ -342,8 +344,9 @@ impl PageTable {
             return;
         }
         let mut hi = v.clone();
-        if let Backing::File { off, .. } = &mut hi.back {
-            *off += addr - start;
+        match &mut hi.back {
+            Backing::File { off, .. } | Backing::Pages { off, .. } => *off += addr - start,
+            Backing::Anon => {}
         }
         self.vmas.get_mut(&start).unwrap().end = addr;
         self.vmas.insert(addr, hi);
@@ -580,6 +583,14 @@ impl PageTable {
             }
             let p = if c.dirty { prot } else { prot & !PROT_WRITE };
             unsafe { *pte = make_pte(v2p(page as usize) as u64, p, false) };
+            flush_va(page_va);
+            return Ok(());
+        }
+        if let (false, Backing::Pages { pages, off }) = (has_page(e), &back) {
+            // カーネルのページ (フレームバッファ) をそのまま。共有で、外すときに参照を返す
+            let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::NoMap)?;
+            kalloc::get(page);
+            unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
             flush_va(page_va);
             return Ok(());
         }

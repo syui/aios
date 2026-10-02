@@ -62,6 +62,10 @@ fn setup_dirs(mtab: &str) {
     ] {
         let _ = dev.create(name, mode, NewNode::Dev(ma, mi));
     }
+    // 画面 (virtio-gpu があれば)
+    if crate::gpu::get().is_some() {
+        let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
+    }
     // ディスクと区画 (/dev/vda, /dev/vda1, ...)
     for p in crate::block::parts() {
         let (ma, mi) = crate::block::dev_of_part(&p);

@@ -48,6 +48,8 @@ pub enum Kind {
     PidFd(u32),
     /// ディスクか区画 (/dev/vda2 など)。セクタに合わないところは読んでから書く
     Block(crate::block::Part),
+    /// 画面 (/dev/fb0、virtio-gpu)
+    Fb,
 }
 
 impl Kind {
@@ -58,6 +60,7 @@ impl Kind {
             (1, 3) => return Ok(Kind::Null),
             (1, 5) => return Ok(Kind::Zero),
             (1, 8) | (1, 9) => return Ok(Kind::Random),
+            (29, 0) if crate::gpu::get().is_some() => return Ok(Kind::Fb),
             (5, 0) => {
                 let t = tty::controlling().ok_or(-ENXIO)?;
                 tty::ref_slave(&t);
@@ -269,6 +272,11 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
+            Kind::Fb => {
+                let n = crate::gpu::read(self.offset, dst);
+                self.offset += n;
+                Ok(n)
+            }
             Kind::PipeWrite(_) => Err(-EBADF),
             k => read_stream(k, dst, self.flags & O_NONBLOCK != 0),
         }
@@ -302,6 +310,14 @@ impl OpenFile {
                 self.offset += n;
                 Ok(n)
             }
+            Kind::Fb => {
+                let n = crate::gpu::write(self.offset, src);
+                self.offset += n;
+                if n == 0 && !src.is_empty() {
+                    return Err(-28); // ENOSPC (画面の終わり)
+                }
+                Ok(n)
+            }
             Kind::PipeRead(_) => Err(-EBADF),
             k => write_stream(k, src, self.flags & O_NONBLOCK != 0),
         }
@@ -309,7 +325,7 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
-        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_)) {
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb) {
             if let Ok(i) = vfs::resolve("", &self.describe(), true) {
                 return Stat::of_inode(&i);
             }
@@ -320,6 +336,7 @@ impl OpenFile {
             Kind::Null => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 3),
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
+            Kind::Fb => Stat::dev(vfs::S_IFCHR | 0o666, 29 << 8),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::Block(p) => {
                 let (ma, mi) = crate::block::dev_of_part(p);
@@ -351,6 +368,7 @@ impl OpenFile {
             Kind::Null => "/dev/null".into(),
             Kind::Zero => "/dev/zero".into(),
             Kind::Random => "/dev/urandom".into(),
+            Kind::Fb => "/dev/fb0".into(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
@@ -398,7 +416,7 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
             Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
             // いつでも読み書きできる (待たない)
-            Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) => alloc::vec![],
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             _ => return None,
         })
     }
@@ -408,6 +426,7 @@ impl OpenFile {
             Kind::Inode(ino, _) => ino.meta().size as i64,
             Kind::Null | Kind::Zero | Kind::Random => 0,
             Kind::Block(p) => blk_size(p) as i64,
+            Kind::Fb => crate::gpu::get().map_or(0, |g| g.size()) as i64,
             _ => return Err(-ESPIPE),
         };
         const SEEK_DATA: u32 = 3;
