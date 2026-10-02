@@ -70,7 +70,9 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
         }
-        if inputs.wait(500).iter().any(|e| e.typ == input::EV_KEY && e.value == 1) {
+        // キーボードのキーだけ (マウスのボタン BTN_* は 0x100 から。窓をクリックしただけでは消さない)
+        if let Some(e) = inputs.wait(500).iter().find(|e| e.typ == input::EV_KEY && e.value == 1 && e.code < 0x100) {
+            eprintln!("aisplash: key {}", e.code);
             break;
         }
     }
