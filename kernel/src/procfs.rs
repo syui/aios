@@ -27,6 +27,8 @@ enum Node {
     Uptime,
     Meminfo,
     Swaps,
+    Threads,
+    Strace,
     Modules,
     NetDir,
     Pnp,
@@ -39,6 +41,7 @@ enum Node {
     Cmdline(u32),
     Cwd(u32),
     Exe(u32),
+    Maps(u32),
     FdDir(u32),
     Fd(u32, usize),
 }
@@ -73,6 +76,8 @@ impl ProcInode {
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
             Node::Swaps => 10,
+            Node::Threads => 31,
+            Node::Strace => 32,
             Node::Modules => 12,
             Node::Route => 11,
             Node::Pid(p) => (p as u64) << 16 | 1,
@@ -81,6 +86,7 @@ impl ProcInode {
             Node::Cmdline(p) => (p as u64) << 16 | 4,
             Node::Cwd(p) => (p as u64) << 16 | 5,
             Node::Exe(p) => (p as u64) << 16 | 7,
+            Node::Maps(p) => (p as u64) << 16 | 8,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
         }
@@ -88,7 +94,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
             _ => None,
         }
     }
@@ -139,6 +145,8 @@ impl ProcInode {
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),
+            Node::Threads => proc::threads_text(),
+            Node::Strace => crate::syscall::strace_get(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
             Node::Pnp => {
@@ -155,6 +163,7 @@ impl ProcInode {
                 s
             }
             Node::Stat(pid) => stat_line(leader(pid)?),
+            Node::Maps(pid) => leader(pid)?.mm().pt.maps_text(),
             Node::Status(pid) => {
                 let p = leader(pid)?;
                 let c = &p.cred;
@@ -275,6 +284,7 @@ impl Inode for ProcInode {
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::SelfLink | Node::Cwd(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
+            Node::Strace => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
         };
         let now = crate::timer::epoch_ns();
@@ -292,11 +302,20 @@ impl Inode for ProcInode {
         Ok(n)
     }
 
-    fn write_at(&self, _: usize, _: &[u8]) -> Result<usize, i64> {
+    fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/strace: root が名前を書くと、その名前のプロセスの失敗したシステムコールを出す (空で止める)
+        if self.node == Node::Strace && crate::cred::current().euid == 0 {
+            crate::syscall::strace_set(b);
+            return Ok(b.len());
+        }
         Err(-EACCES)
     }
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
+        // > /proc/strace (O_TRUNC) は受けつける
+        if self.node == Node::Strace && crate::cred::current().euid == 0 {
+            return Ok(());
+        }
         Err(-EACCES)
     }
 
@@ -324,6 +343,8 @@ impl Inode for ProcInode {
             (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
             (Node::Root, "swaps") => Node::Swaps,
+            (Node::Root, "threads") => Node::Threads,
+            (Node::Root, "strace") => Node::Strace,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
@@ -334,6 +355,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
+            (Node::Pid(p), "maps") => Node::Maps(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
@@ -360,6 +382,8 @@ impl Inode for ProcInode {
                 add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);
                 add("swaps".into(), Node::Swaps);
+                add("threads".into(), Node::Threads);
+                add("strace".into(), Node::Strace);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {
@@ -376,6 +400,7 @@ impl Inode for ProcInode {
                 add("cmdline".into(), Node::Cmdline(p));
                 add("cwd".into(), Node::Cwd(p));
                 add("exe".into(), Node::Exe(p));
+                add("maps".into(), Node::Maps(p));
                 add("fd".into(), Node::FdDir(p));
             }
             Node::FdDir(p) => {

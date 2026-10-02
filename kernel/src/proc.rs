@@ -13,7 +13,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-pub const NPROC: usize = 64;
+/// プロセスとスレッドの数の上限 (スレッドも 1 つずつ使う。Firefox のように数十のスレッドを持つものがある)
+pub const NPROC: usize = 512;
 /// 開けるファイルの数の上限 (RLIMIT_NOFILE のハードの上限)。fd の表は使う分だけ伸びる
 pub const NOFILE: usize = 65536;
 /// はじめのソフトの上限 (Linux と同じ 1024。setrlimit で NOFILE まで上げられる)
@@ -184,6 +185,13 @@ pub struct Proc {
     /// 回収した子 (とその子孫) の utime
     pub cutime: u64,
     chan: usize,
+    /// 最後に呼んだシステムコールの番号と最初の 2 つの引数 (/proc/threads で見る)
+    pub last_sys: (u64, u64, u64),
+    /// 最後の例外 (pc、アドレス、ESR の EC)。シグナルで落ちたときに出す
+    pub last_fault: (u64, u64, u64),
+    pub last_lr: u64,
+    /// そのときの x0, x1, x19 (落ちたときに、文字列なら出す)
+    pub last_regs: [u64; 3],
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
     /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
@@ -228,6 +236,10 @@ impl Proc {
         utime: 0,
         cutime: 0,
         chan: 0,
+        last_sys: (0, 0, 0),
+        last_fault: (0, 0, 0),
+        last_lr: 0,
+        last_regs: [0; 3],
         wake_at: 0,
         poll_keys: None,
         context: Context::ZERO,
@@ -453,7 +465,10 @@ unsafe extern "C" {
 
 /// 空きスロットを取り、forkret から EL0 へ戻れるようにする
 fn alloc_proc() -> Option<&'static mut Proc> {
-    let p = procs().iter_mut().find(|p| p.state == State::Unused)?;
+    let Some(p) = procs().iter_mut().find(|p| p.state == State::Unused) else {
+        println!("proc: no free slot (NPROC = {})", NPROC);
+        return None;
+    };
     *p = Proc::UNUSED;
     unsafe {
         p.pid = NEXT_PID;
@@ -1091,4 +1106,33 @@ pub fn fp_snapshot() -> FpState {
 
 pub fn fp_restore(f: &FpState) {
     unsafe { fp_load(f) };
+}
+
+/// /proc/threads: すべてのスレッドの pid、tgid、状態、待っているもの、最後のシステムコール (調べもの用)
+pub fn threads_text() -> alloc::string::String {
+    let mut out = alloc::string::String::from("  PID  TGID ST CHAN             SYSCALL ARG0             ARG1             NAME\n");
+    for p in procs().iter() {
+        if p.state == State::Unused {
+            continue;
+        }
+        let st = match p.state {
+            State::Running | State::Runnable => 'R',
+            State::Sleeping => 'S',
+            State::Zombie => 'Z',
+            State::Unused => 'X',
+        };
+        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        out.push_str(&alloc::format!(
+            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {}\n",
+            p.pid,
+            p.tgid,
+            st,
+            p.chan,
+            p.last_sys.0,
+            p.last_sys.1,
+            p.last_sys.2,
+            core::str::from_utf8(&p.comm[..n]).unwrap_or("?")
+        ));
+    }
+    out
 }

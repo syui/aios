@@ -7,7 +7,8 @@ use crate::socket;
 use crate::sysfile;
 use crate::timer;
 use crate::trap::TrapFrame;
-use crate::vm::{pg_up, Backing};
+use crate::vm::{pg_up, Backing, PROT_READ};
+use crate::memlayout::PGSIZE;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -168,6 +169,9 @@ mod nr {
     pub const MMAP: u64 = 222;
     pub const FADVISE64: u64 = 223;
     pub const READAHEAD: u64 = 213;
+    pub const FALLOCATE: u64 = 47;
+    pub const SETPRIORITY: u64 = 140;
+    pub const GETPRIORITY: u64 = 141;
     pub const MPROTECT: u64 = 226;
     pub const MSYNC: u64 = 227;
     pub const MADVISE: u64 = 233;
@@ -206,6 +210,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     let a = tf.x;
     let nr = tf.x[8];
     proc::current().orig_x0 = tf.x[0];
+    proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -237,6 +242,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FSTATFS => sysfile::fstatfs(a[0], a[1] as usize),
         TRUNCATE => sysfile::truncate(a[0] as usize, a[1] as i64),
         FTRUNCATE => sysfile::ftruncate(a[0], a[1] as i64),
+        FALLOCATE => sysfile::fallocate(a[0], a[1], a[2] as i64, a[3] as i64),
         MEMFD_CREATE => sysfile::memfd_create(a[0] as usize, a[1]),
         FCHDIR => sysfile::fchdir(a[0]),
         FCHMOD => sysfile::fchmod(a[0], a[1]),
@@ -291,6 +297,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
         FADVISE64 | READAHEAD => Ok(0),
+        // 優先度 (nice) はまだ持たない: いつも 0 (システムコールの返り値は Linux と同じく 20 - nice)、変えるのは受けつけるだけ
+        GETPRIORITY => Ok(20),
+        SETPRIORITY => Ok(0),
 
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
@@ -377,7 +386,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MPROTECT => sys_mprotect(a[0] as usize, a[1] as usize, a[2]),
         MADVISE => sys_madvise(a[0] as usize, a[1] as usize, a[2]),
         MSYNC => sys_msync(a[0] as usize, a[1] as usize),
-        MREMAP => Err(-ENOMEM), // musl は自分で確保しなおす
+        MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
         n => {
             println!("syscall: unknown {} (pid {})", n, proc::current().pid);
@@ -385,12 +394,47 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
+    if let Err(e) = r {
+        strace(nr, &a, e);
+    }
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
     (r == Err(-EINTR_)).then_some(Restart { restartable })
 }
 
 const EINTR_: i64 = 4;
+
+/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを出す (調べもの用)
+static mut STRACE: [u8; 16] = [0; 16];
+
+pub fn strace_set(name: &[u8]) {
+    let n = name.iter().position(|&c| c == b'\n' || c == 0).unwrap_or(name.len()).min(15);
+    unsafe {
+        let s = &mut *(&raw mut STRACE);
+        s.fill(0);
+        s[..n].copy_from_slice(&name[..n]);
+    }
+}
+
+pub fn strace_get() -> alloc::string::String {
+    let s = unsafe { &*(&raw const STRACE) };
+    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
+    alloc::format!("{}\n", core::str::from_utf8(&s[..n]).unwrap_or(""))
+}
+
+fn strace(nr: u64, a: &[u64], e: i64) {
+    let s = unsafe { &*(&raw const STRACE) };
+    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
+    // EAGAIN / EINTR / ETIMEDOUT はよくあるので出さない
+    if n == 0 || matches!(-e, 11 | 4 | 110) {
+        return;
+    }
+    let p = proc::current_leader();
+    if !p.comm.starts_with(&s[..n]) {
+        return;
+    }
+    println!("strace [{} {}] {}({:#x}, {:#x}, {:#x}) = {}", p.pid, proc::current().pid, nr, a[0], a[1], a[2], e);
+}
 
 type R = Result<i64, i64>;
 
@@ -565,7 +609,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     if len == 0 || off % 4096 != 0 {
         return Err(-EINVAL);
     }
-    // ファイルを写すなら、その inode
+    // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
+    let mut path: Option<alloc::string::String> = None;
     let back = if flags & MAP_ANONYMOUS == 0 {
         let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
         let f = f.borrow();
@@ -576,7 +621,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         }
         match &f.kind {
             // fend はここではまだ「off から先のファイルの長さ」。場所が決まってから va にする
-            crate::file::Kind::Inode(ino, _) if !ino.meta().is_dir() => {
+            crate::file::Kind::Inode(ino, p) if !ino.meta().is_dir() => {
+                path = Some(p.clone());
                 Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off) }
             }
             // 画面 (/dev/fb0): フレームバッファのページをそのまま
@@ -614,6 +660,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     };
     let shared = flags & MAP_SHARED != 0;
     m.pt.map(va, va + len, prot_bits(prot), shared, back).ok_or(-ENOMEM)?;
+    if let Some(p) = path {
+        m.pt.set_name(va, &p);
+    }
     Ok(va as i64)
 }
 
@@ -627,6 +676,71 @@ fn sys_munmap(addr: usize, len: usize) -> R {
     }
     proc::current().pt().unmap(addr, addr + pg_up(len));
     Ok(0)
+}
+
+/// mremap: 領域の大きさを変える (縮める、その場で伸ばす、MREMAP_MAYMOVE なら別の場所へ写す)。
+/// 古い場所に領域がなければ EFAULT (Firefox などは mremap でページがあるかを確かめる)
+fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr: usize) -> R {
+    const EFAULT: i64 = 14;
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+    const MREMAP_DONTUNMAP: u64 = 4;
+    if old & 0xfff != 0 || new_size == 0 || flags & !7 != 0 || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0) {
+        return Err(-EINVAL);
+    }
+    let (old_size, new_size) = (pg_up(old_size), pg_up(new_size));
+    let m = proc::current().mm();
+    // 古い場所は 1 つの領域の中でなければならない
+    let Some((vstart, v)) = m.pt.find(old).map(|(s, v)| (s, v.clone())) else { return Err(-EFAULT) };
+    let old_end = old.checked_add(old_size.max(PGSIZE)).ok_or(-EFAULT)?;
+    if old_size == 0 || v.end < old_end {
+        return Err(-EFAULT);
+    }
+    if flags & MREMAP_FIXED == 0 {
+        if new_size == old_size {
+            return Ok(old as i64);
+        }
+        if new_size < old_size {
+            m.pt.unmap(old + new_size, old_end);
+            return Ok(old as i64);
+        }
+        // その場で伸ばす (領域の終わりまで使っていて、その先が空いているとき)
+        if v.end == old_end && m.pt.extend(vstart, old + new_size).is_some() {
+            return Ok(old as i64);
+        }
+        if flags & MREMAP_MAYMOVE == 0 {
+            return Err(-ENOMEM);
+        }
+    }
+    // 別の場所へ: 新しい領域を作って中身を写す (共有の領域は写すと分かれてしまうので動かさない)
+    if v.shared {
+        return Err(-ENOMEM);
+    }
+    let dst = if flags & MREMAP_FIXED != 0 {
+        if new_addr & 0xfff != 0 || (new_addr < old_end && old < new_addr + new_size) {
+            return Err(-EINVAL);
+        }
+        m.pt.unmap(new_addr, new_addr + new_size);
+        new_addr
+    } else {
+        let va = m.pt.free_area(m.mmap_next, new_size);
+        m.mmap_next = va + new_size;
+        va
+    };
+    m.pt.map(dst, dst + new_size, v.prot, false, Backing::Anon).ok_or(-ENOMEM)?;
+    if v.prot & PROT_READ != 0 {
+        let mut buf = alloc::vec![0u8; PGSIZE];
+        for off in (0..old_size.min(new_size)).step_by(PGSIZE) {
+            if m.pt.copy_in(&mut buf, old + off).is_none() {
+                break;
+            }
+            m.pt.copy_out_force(dst + off, &buf).ok_or(-ENOMEM)?;
+        }
+    }
+    if flags & MREMAP_DONTUNMAP == 0 {
+        m.pt.unmap(old, old_end);
+    }
+    Ok(dst as i64)
 }
 
 /// msync: MAP_SHARED のファイルで書いたページを書き戻す (MS_ASYNC でもすぐに)

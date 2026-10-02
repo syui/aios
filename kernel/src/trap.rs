@@ -219,7 +219,25 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                         EC_FP => (signal::SIGFPE, 0, tf.elr),
                         _ => (signal::SIGILL, 1, tf.elr),
                     };
-                    let _ = esr;
+                    proc::current().last_fault = (tf.elr, far, ec);
+                    proc::current().last_lr = tf.x[30];
+                    proc::current().last_regs = [tf.x[0], tf.x[1], tf.x[19]];
+                    if sig == signal::SIGILL {
+                        // 何の命令で止まったか (調べもの用)
+                        let mut w = [0u8; 4];
+                        let insn = proc::current().pt().copy_in(&mut w, tf.elr as usize).map(|_| u32::from_le_bytes(w));
+                        let p = proc::current();
+                        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+                        println!(
+                            "pid {} ({}): SIGILL ec {:#x} esr {:#x} pc {:#x} insn {:x?}",
+                            p.pid,
+                            core::str::from_utf8(&p.comm[..n]).unwrap_or("?"),
+                            ec,
+                            esr,
+                            tf.elr,
+                            insn
+                        );
+                    }
                     signal::force(sig, signal::SigInfo { code, addr, ..signal::SigInfo::ZERO });
                     proc::check_killed();
                     signal::deliver(tf, None);

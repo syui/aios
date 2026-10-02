@@ -131,6 +131,8 @@ pub struct Vma {
     /// MAP_SHARED (fork しても共有のまま)
     pub shared: bool,
     pub back: Backing,
+    /// 写したファイルのパス (/proc/PID/maps と、落ちたときの知らせ)
+    pub name: Option<alloc::rc::Rc<str>>,
 }
 
 /// ページフォールトの結果
@@ -385,7 +387,7 @@ impl PageTable {
             return None;
         }
         self.unmap(start, end);
-        self.vmas.insert(start, Vma { end, prot, shared, back });
+        self.vmas.insert(start, Vma { end, prot, shared, back, name: None });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
@@ -497,12 +499,56 @@ impl PageTable {
             match self.vmas.get_mut(&start) {
                 Some(v) if v.end == old_end => v.end = new_end,
                 _ => {
-                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon });
+                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None });
                 }
             }
         } else if new_end < old_end {
             self.unmap(new_end, old_end);
         }
+        Some(())
+    }
+
+    /// start から始まる領域に名前 (写したファイルのパス) をつける
+    pub fn set_name(&mut self, start: usize, name: &str) {
+        if let Some(v) = self.vmas.get_mut(&start) {
+            v.name = Some(alloc::rc::Rc::from(name));
+        }
+    }
+
+    /// va のある領域の (名前, ファイルの中の場所)
+    pub fn name_at(&self, va: usize) -> Option<(alloc::rc::Rc<str>, usize)> {
+        let (s, v) = self.find(va)?;
+        let off = match &v.back {
+            Backing::File { off, .. } => *off,
+            _ => 0,
+        };
+        Some((v.name.clone()?, off + (va - s)))
+    }
+
+    /// /proc/PID/maps (Linux と同じ形)
+    pub fn maps_text(&self) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for (&s, v) in self.vmas.iter() {
+            let off = match &v.back {
+                Backing::File { off, .. } => *off,
+                _ => 0,
+            };
+            let r = if v.prot & PROT_READ != 0 { 'r' } else { '-' };
+            let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
+            let x = if v.prot & PROT_EXEC != 0 { 'x' } else { '-' };
+            let p = if v.shared { 's' } else { 'p' };
+            out.push_str(&alloc::format!("{:08x}-{:08x} {}{}{}{} {:08x} 00:00 0 {}\n", s, v.end, r, w, x, p, off, v.name.as_deref().unwrap_or("")));
+        }
+        out
+    }
+
+    /// start から始まる領域の終わりを new_end まで伸ばす (その先が空いているときだけ。mremap)
+    pub fn extend(&mut self, start: usize, new_end: usize) -> Option<()> {
+        let old_end = self.vmas.get(&start)?.end;
+        if new_end <= old_end || self.vmas.range(old_end..new_end).next().is_some() {
+            return None;
+        }
+        self.vmas.get_mut(&start)?.end = new_end;
         Some(())
     }
 

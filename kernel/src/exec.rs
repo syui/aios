@@ -36,6 +36,7 @@ const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
+const AT_HWCAP: u64 = 16;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
@@ -128,14 +129,14 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
     let mut pt = PageTable::new().ok_or(-ENOMEM)?;
-    let main = load_elf(&mut pt, &ino, size, PIE_BASE)?;
+    let main = load_elf(&mut pt, &ino, size, PIE_BASE, &exe)?;
     let brk = main.end;
     // 動的リンク: インタプリタ (ld.so) も読み、そちらから始める
     let (entry, interp_base) = match &main.interp {
         Some(ip) => {
-            let (_, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
+            let (ipath, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
             let isize = iino.meta().size as usize;
-            let i = load_elf(&mut pt, &iino, isize, INTERP_BASE)?;
+            let i = load_elf(&mut pt, &iino, isize, INTERP_BASE, &ipath)?;
             if i.interp.is_some() {
                 return Err(-ENOEXEC);
             }
@@ -181,6 +182,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_PHDR, phdr_va as u64),
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
+        (AT_HWCAP, hwcap()),
         (AT_PAGESZ, PGSIZE as u64),
         (AT_BASE, interp_base as u64),
         (AT_ENTRY, main.entry as u64),
@@ -233,7 +235,7 @@ struct Loaded {
 }
 
 /// ino の ELF の PT_LOAD を pt に置く。ET_DYN なら base をずらして (いちばん低いところが base に来る)
-fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: usize) -> Result<Loaded, i64> {
+fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: usize, path: &str) -> Result<Loaded, i64> {
     let mut ehdr = [0u8; 64];
     if ino.read_at(0, &mut ehdr)? < 64 {
         return Err(-ENOEXEC);
@@ -300,6 +302,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
             // ふつう: ページはファイルから、触れたときに読む (filesz の先は 0)
             let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz };
             pt.map(start, seg_end, prot, false, back).ok_or(-ENOMEM)?;
+            pt.set_name(start, path);
         } else {
             // 前のセグメントとページを分けあう: 残りを無名にして、中身を今読む
             let mut s = start;
@@ -326,4 +329,41 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
         end = end.max(seg_end);
     }
     Ok(Loaded { entry: u64_at(elf, 24) + bias, phdr_va, phentsize, phnum, end, interp })
+}
+
+/// AT_HWCAP: この CPU で使える命令 (Linux の arm64 と同じ印)。ID レジスタから
+fn hwcap() -> u64 {
+    let (isar0, pfr0): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0);
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0);
+    }
+    let f = |r: u64, shift: u32| (r >> shift) & 0xf;
+    let mut h = 0;
+    // FP と AdvSIMD (0xf は「ない」)
+    if f(pfr0, 16) != 0xf {
+        h |= 1 << 0; // FP
+    }
+    if f(pfr0, 20) != 0xf {
+        h |= 1 << 1; // ASIMD
+    }
+    if f(isar0, 4) >= 1 {
+        h |= 1 << 3; // AES
+    }
+    if f(isar0, 4) >= 2 {
+        h |= 1 << 4; // PMULL
+    }
+    if f(isar0, 8) >= 1 {
+        h |= 1 << 5; // SHA1
+    }
+    if f(isar0, 12) >= 1 {
+        h |= 1 << 6; // SHA2
+    }
+    if f(isar0, 16) >= 1 {
+        h |= 1 << 7; // CRC32
+    }
+    if f(isar0, 20) >= 2 {
+        h |= 1 << 8; // ATOMICS (LSE)
+    }
+    h
 }
