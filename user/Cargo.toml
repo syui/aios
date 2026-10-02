@@ -82,6 +82,10 @@ name = "networkd"
 path = "src/bin/networkd.rs"
 
 [[bin]]
+name = "modprobe"
+path = "src/bin/modprobe.rs"
+
+[[bin]]
 name = "chsh"
 path = "src/bin/chsh.rs"
 

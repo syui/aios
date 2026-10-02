@@ -3,6 +3,8 @@
 //   /usr/lib/systemd/system, /etc/systemd/system の *.service を読み、
 //   /etc/systemd/system/multi-user.target.wants にあるものを起動する。
 //   systemctl とは /run/aiinit.ctl (FIFO) で話す。
+#[path = "../lib/kmod.rs"]
+mod kmod;
 #[path = "../lib/unit.rs"]
 mod unit;
 
@@ -356,6 +358,13 @@ fn main() {
     if std::process::id() != 1 {
         eprintln!("init: must be run as pid 1");
         std::process::exit(1);
+    }
+    // モジュール: /etc/modules-load.d/*.conf に書いてあるドライバを起こす (systemd-modules-load と同じ)
+    for m in kmod::boot_list() {
+        match kmod::load(&m) {
+            Ok(()) => println!("init: module {}", m),
+            Err(e) => println!("init: module {}: {}", m, e),
+        }
     }
     let mut init = Init::load();
     let enabled = unit::enabled();

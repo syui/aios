@@ -42,4 +42,12 @@ linux   /Image
 # options root=PARTUUID=... init=/bin/sh
 CONF
   chmod 644 "$pkgdir/boot/loader/entries/aios.conf"
+  # モジュール: カーネルに入っていて眠っているドライバの札 (modprobe NAME で起こす)。
+  # 起動のときに起こすものは /etc/modules-load.d/*.conf に書く (desktop パッケージなど)
+  install -d "$pkgdir/usr/lib/modules"
+  local m
+  for m in virtio_gpu virtio_input; do
+    printf 'aios-module %s\n' "$m" > "$pkgdir/usr/lib/modules/$m.ko"
+    chmod 644 "$pkgdir/usr/lib/modules/$m.ko"
+  done
 }

@@ -49,6 +49,21 @@ pub fn init() {
     setup_dirs("tmpfs / tmpfs rw 0 0\nproc /proc proc rw 0 0\n");
 }
 
+/// モジュール (module.rs) が見つけた装置の /dev のノード: 画面 (/dev/fb0) とキーボードやマウス
+pub fn add_device_nodes() {
+    let Ok(dev) = vfs::mkdir_p("dev", 0o755) else { return };
+    if crate::gpu::get().is_some() {
+        let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
+    }
+    if crate::input::count() > 0 {
+        if let Ok(d) = vfs::mkdir_p("dev/input", 0o755) {
+            for n in 0..crate::input::count() {
+                let _ = d.create(&alloc::format!("event{}", n), 0o666, NewNode::Dev(13, 64 + n as u32));
+            }
+        }
+    }
+}
+
 fn setup_dirs(mtab: &str) {
     let dev = vfs::mkdir_p("dev", 0o755).expect("mkdir /dev");
     for (name, mode, ma, mi) in [
@@ -62,18 +77,7 @@ fn setup_dirs(mtab: &str) {
     ] {
         let _ = dev.create(name, mode, NewNode::Dev(ma, mi));
     }
-    // 画面 (virtio-gpu があれば)
-    if crate::gpu::get().is_some() {
-        let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
-    }
-    // キーボードやマウス (virtio-input)
-    if crate::input::count() > 0 {
-        if let Ok(d) = vfs::mkdir_p("dev/input", 0o755) {
-            for n in 0..crate::input::count() {
-                let _ = d.create(&alloc::format!("event{}", n), 0o666, NewNode::Dev(13, 64 + n as u32));
-            }
-        }
-    }
+
     // ディスクと区画 (/dev/vda, /dev/vda1, ...)
     for p in crate::block::parts() {
         let (ma, mi) = crate::block::dev_of_part(&p);

@@ -27,6 +27,7 @@ enum Node {
     Uptime,
     Meminfo,
     Swaps,
+    Modules,
     NetDir,
     Pnp,
     Route,
@@ -72,6 +73,7 @@ impl ProcInode {
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
             Node::Swaps => 10,
+            Node::Modules => 12,
             Node::Route => 11,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
@@ -137,6 +139,7 @@ impl ProcInode {
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),
+            Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
             Node::Pnp => {
                 // Linux と同じく、DHCP なら #PROTO: DHCP、手で決めたなら #MANUAL
@@ -321,6 +324,7 @@ impl Inode for ProcInode {
             (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
             (Node::Root, "swaps") => Node::Swaps,
+            (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::NetDir, "route") => Node::Route,
@@ -356,6 +360,7 @@ impl Inode for ProcInode {
                 add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);
                 add("swaps".into(), Node::Swaps);
+                add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
                 for p in proc::all_leader_procs() {
                     add(format!("{}", p.tgid), Node::Pid(p.tgid));
