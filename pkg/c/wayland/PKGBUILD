@@ -1,0 +1,65 @@
+# wayland: libwayland (client / server / cursor / egl)。よその Wayland アプリが aiwm と話すのに使う
+#   共有ライブラリとヘッダーと pkg-config を /opt/c に。プロトコルの XML は /opt/c/share/wayland
+# ビルドには meson と ninja、このマシン用の cc と expat (wayland-scanner をこのマシン用に作る) が要る
+pkgname=wayland
+pkgver=1.24.0
+pkgrel=1
+pkgdesc='A computer display server protocol: libwayland-client, -server, -cursor, -egl (shared, for aios)'
+arch=('aarch64')
+url='https://wayland.freedesktop.org/'
+license=('MIT')
+depends=('musl' 'libffi')
+makedepends=('meson' 'ninja' 'expat')
+source=("https://gitlab.freedesktop.org/wayland/wayland/-/releases/$pkgver/downloads/wayland-$pkgver.tar.xz")
+sha256sums=('82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536')
+
+prepare() {
+  rm -rf "wayland-$pkgver"
+  tar -xJf "wayland-$pkgver.tar.xz"
+}
+
+build() {
+  cd "wayland-$pkgver"
+  # 1. このマシンで動く wayland-scanner (プロトコルの XML から C を作る)
+  (unset CC CFLAGS LDFLAGS
+   meson setup build-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
+     -Ddtd_validation=false --prefix="$srcdir/native" --libdir=lib
+   ninja -C build-native install)
+  # 2. aios 用のライブラリ (Zig、aarch64-linux-musl)
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps libffi
+  local root=$srcdir/sysroot
+  cat > "$srcdir/cross.ini" <<INI
+[binaries]
+c = ['zig', 'cc', '-target', 'aarch64-linux-musl']
+ar = ['zig', 'ar']
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-O2']
+c_link_args = ['-s']
+
+[properties]
+pkg_config_libdir = '$root$PREFIX/lib/pkgconfig'
+sys_root = '$root'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+INI
+  # c_deps の PKG_CONFIG_* はこのマシン用の wayland-scanner の検索まで変えるので、cross.ini にまかせる
+  unset PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR CPPFLAGS LDFLAGS CFLAGS
+  PATH=$srcdir/native/bin:$PATH PKG_CONFIG_PATH_FOR_BUILD=$srcdir/native/lib/pkgconfig \
+    meson setup build-cross --cross-file "$srcdir/cross.ini" -Dscanner=false -Dlibraries=true \
+    -Ddocumentation=false -Dtests=false -Ddtd_validation=false --prefix="$PREFIX" --libdir=lib
+  ninja -C build-cross
+}
+
+package() {
+  cd "wayland-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build-cross install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/wayland/COPYING"
+}

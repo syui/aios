@@ -5,12 +5,13 @@
 # 動的リンクのプログラムを作るのは base-devel の cc -dynamic (ヘッダーは Zig のもの)
 pkgname=musl
 pkgver=1.2.5
-pkgrel=1
+pkgrel=2
 pkgdesc='Lightweight implementation of the C standard library: shared libc.so and the dynamic linker'
 arch=('aarch64')
 url='https://musl.libc.org/'
 license=('MIT')
 backup=(etc/ld-musl-aarch64.path)
+makedepends=('aarch64-linux-gnu-gcc')
 source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz"
         0001-iconv-fix-erroneous-input-validation-in-EUC-KR-decoder.patch
         0002-iconv-harden-UTF-8-output-code-path.patch)
@@ -28,11 +29,13 @@ prepare() {
 }
 
 build() {
-  . "$startdir/../zig.sh"
-  zig_env
   cd "musl-$pkgver"
-  # libc.so は静的にはしない (zig_env の -static を外す)。-s で小さく
-  LDFLAGS="-s" ./configure --target=aarch64-linux-musl --prefix=/usr --syslibdir=/usr/lib --disable-static
+  # libc.so は Zig ではなく aarch64 の gcc でビルドする: Zig は自分の compiler-rt (memcpy, strlen,
+  # sqrt などを hidden で持つ) を必ずリンクするので、libc.so からそれらが外に見えなくなってしまう。
+  # gcc は libgcc から要るもの (long double の計算) だけを取る。MUSL_CC で変えられる
+  local cc=${MUSL_CC:-aarch64-linux-gnu-gcc}
+  command -v "$cc" >/dev/null || { echo "musl: $cc がありません (Debian: gcc-aarch64-linux-gnu、Arch: aarch64-linux-gnu-gcc)" >&2; return 1; }
+  CC=$cc CFLAGS="-O2" LDFLAGS="-s" ./configure --target=aarch64-linux-musl --prefix=/usr --syslibdir=/usr/lib --disable-static
   make lib/libc.so
 }
 
