@@ -144,6 +144,11 @@ secondary_entry:
     orr     x0, x0, #(1 << 0)
     orr     x0, x0, #(1 << 2)
     orr     x0, x0, #(1 << 12)
+    // EL0 にも Linux と同じく許す: DC ZVA (14、memset)、CTR_EL0 を読む (15)、
+    // キャッシュの掃除 DC CVAU / IC IVAU (26、JIT が書いた命令を流すのに使う)
+    orr     x0, x0, #(1 << 14)
+    orr     x0, x0, #(1 << 15)
+    orr     x0, x0, #(1 << 26)
     msr     sctlr_el1, x0
     isb
     ldr     x0, =2f

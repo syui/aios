@@ -430,7 +430,42 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             SIG_IGN => continue,
             SIG_DFL => match default_action(sig) {
                 Default::Ignore => continue,
-                Default::Terminate => proc::die(sig),
+                Default::Terminate => {
+                    // 異常で落ちたもの (Linux が core を吐く種類) は知らせる (調べもの用)
+                    if matches!(sig, 4..=8 | 11 | 31) {
+                        // SIGILL 4, SIGTRAP 5, SIGABRT 6, SIGBUS 7, SIGFPE 8, SIGSEGV 11, SIGSYS 31
+                        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+                        let (pc, addr, ec) = p.last_fault;
+                        if let Some((name, off)) = p.mm.as_ref().and_then(|_| p.mm().pt.name_at(pc as usize)) {
+                            println!("pid {}: pc {:#x} is {} + {:#x}", p.pid, pc, name, off);
+                        }
+                        if p.mm.as_ref().is_some() {
+                            for (r, v) in ["x0", "x1", "x19"].iter().zip(p.last_regs) {
+                                let mut b = [0u8; 160];
+                                if v > 0x1000 && p.mm().pt.copy_in(&mut b, v as usize).is_some() {
+                                    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                                    if n >= 4 && b[..n].iter().all(|&c| (0x20..0x7f).contains(&c) || c == b'\n') {
+                                        println!("pid {}: {} -> \"{}\"", p.pid, r, core::str::from_utf8(&b[..n]).unwrap_or(""));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((name, off)) = p.mm.as_ref().and_then(|_| p.mm().pt.name_at(p.last_lr as usize)) {
+                            println!("pid {}: lr {:#x} is {} + {:#x}", p.pid, p.last_lr, name, off);
+                        }
+                        println!(
+                            "pid {} ({}): killed by signal {} (last fault: pc {:#x} addr {:#x} ec {:#x}, last syscall {})",
+                            p.pid,
+                            core::str::from_utf8(&p.comm[..n]).unwrap_or("?"),
+                            sig,
+                            pc,
+                            addr,
+                            ec,
+                            p.last_sys.0
+                        );
+                    }
+                    proc::die(sig)
+                }
                 Default::Stop => {
                     stop_group(p.tgid, sig);
                     proc::stop_while_stopped();

@@ -583,6 +583,32 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     Ok(0)
 }
 
+/// fallocate: mode 0 (場所を確保する) だけ。足りなければファイルを伸ばす (中身は 0、ページは使うときに)。
+/// KEEP_SIZE (1) は何もしない。穴をあけるもの (PUNCH_HOLE など) はまだできない
+pub fn fallocate(fd: u64, mode: u64, off: i64, len: i64) -> R {
+    const EOPNOTSUPP: i64 = 95;
+    const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    if off < 0 || len <= 0 {
+        return Err(-EINVAL);
+    }
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_ACCMODE == file::O_RDONLY {
+        return Err(-EBADF);
+    }
+    let ino = inode_of(fd)?;
+    match mode {
+        0 => {
+            let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
+            if (ino.meta().size as usize) < end {
+                ino.truncate(end)?;
+            }
+            Ok(0)
+        }
+        FALLOC_FL_KEEP_SIZE => Ok(0),
+        _ => Err(-EOPNOTSUPP),
+    }
+}
+
 pub fn truncate(pathp: usize, len: i64) -> R {
     if len < 0 {
         return Err(-EINVAL);
@@ -742,6 +768,15 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         }
         // 封 (seal) は覚えない: 受けつけるだけ
         F_ADD_SEALS | F_GET_SEALS => Ok(0),
+        // POSIX のレコードロック (F_GETLK / F_SETLK / F_SETLKW) と OFD ロック (36〜38)。
+        // まだ本当には錠をかけない: かけるのはいつも成功し、聞かれたら「だれもかけていない」と答える
+        // (SQLite などが使う。ほかのプロセスとの取り合いはまだ守らない)
+        5 | 36 => {
+            const F_UNLCK: i16 = 2;
+            proc::current().pt().copy_out(arg as usize, &F_UNLCK.to_le_bytes()).ok_or(-EFAULT)?;
+            Ok(0)
+        }
+        6 | 7 | 37 | 38 => Ok(0),
         F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let mut p = p.borrow_mut();

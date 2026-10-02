@@ -521,9 +521,34 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SO_ERROR: u64 = 4;
     const SO_TYPE: u64 = 3;
     if unix_file(fd).is_some() || pair_of(fd).is_some() {
-        let v: i32 = if (level, opt) == (SOL_SOCKET, SO_TYPE) { 1 } else { 0 };
+        const SO_SNDBUF: u64 = 7;
+        const SO_RCVBUF: u64 = 8;
+        const SO_PEERCRED: u64 = 17;
+        const SO_DOMAIN: u64 = 39;
+        let pt = proc::current().pt();
+        if (level, opt) == (SOL_SOCKET, SO_PEERCRED) {
+            // 相手の pid / uid / gid (struct ucred)。いまは自分と同じとして答える
+            let c = crate::cred::current();
+            let mut b = [0u8; 12];
+            b[..4].copy_from_slice(&proc::current().tgid.to_le_bytes());
+            b[4..8].copy_from_slice(&c.euid.to_le_bytes());
+            b[8..].copy_from_slice(&c.egid.to_le_bytes());
+            if val != 0 {
+                pt.copy_out(val, &b).ok_or(-EFAULT)?;
+            }
+            if lenp != 0 {
+                pt.copy_out(lenp, &12u32.to_le_bytes()).ok_or(-EFAULT)?;
+            }
+            return Ok(0);
+        }
+        let v: i32 = match (level, opt) {
+            (SOL_SOCKET, SO_TYPE) => 1,
+            (SOL_SOCKET, SO_DOMAIN) => 1, // AF_UNIX
+            // 送り受けのバッファ (パイプの大きさ)
+            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => file::PIPE_SIZE as i32,
+            _ => 0,
+        };
         if val != 0 {
-            let pt = proc::current().pt();
             pt.copy_out(val, &v.to_le_bytes()).ok_or(-EFAULT)?;
             if lenp != 0 {
                 pt.copy_out(lenp, &4u32.to_le_bytes()).ok_or(-EFAULT)?;

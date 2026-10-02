@@ -94,6 +94,10 @@ fn setup_dirs(mtab: &str) {
     }
     // 疑似端末の子の口 (/dev/pts/N) は ptmx を開くたびにここへ作る
     let _ = vfs::mkdir_p("dev/pts", 0o755);
+    // POSIX の共有メモリ (shm_open は /dev/shm/NAME を開く)。/tmp と同じく、だれでも作れて他人のは消せない
+    if let Ok(shm) = vfs::mkdir_p("dev/shm", 0o1777) {
+        let _ = shm.set_mode(0o1777);
+    }
     let tmp = vfs::mkdir_p("tmp", 0o1777).expect("mkdir /tmp");
     let _ = tmp.set_mode(0o1777);
     for d in ["etc", "home", "root", "run", "var/tmp", "var/log"] {
