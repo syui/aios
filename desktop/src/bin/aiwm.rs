@@ -4,7 +4,7 @@
 //   窓は横に並べる (sway の splith)。設定は ~/.config/aiwm/config か /etc/aiwm/config (sway と同じ書き方)
 //
 // できる Wayland: wl_compositor, wl_subcompositor, wl_shm, wl_seat (キーボード、ポインタ), wl_output,
-//   xdg_wm_base (toplevel)。
+//   xdg_wm_base (toplevel と popup: メニューや候補の一覧)。
 // クライアントの絵 (wl_shm のバッファ) は commit のときに写して、すぐ release する
 #[path = "../lib/fb.rs"]
 mod fb;
@@ -64,7 +64,9 @@ enum Obj {
     WmBase,
     XdgSurface(u32),
     Toplevel(u32),
-    Positioner,
+    Positioner(Positioner),
+    /// xdg_popup の surface
+    Popup(u32),
     DataManager,
     DataSource,
     DataDevice,
@@ -93,6 +95,7 @@ enum K {
     XdgSurface(u32),
     Toplevel(u32),
     Positioner,
+    Popup(u32),
     DataManager,
     DataSource,
     DataDevice,
@@ -118,7 +121,8 @@ fn kind(o: &Obj) -> K {
         Obj::WmBase => K::WmBase,
         Obj::XdgSurface(s) => K::XdgSurface(*s),
         Obj::Toplevel(s) => K::Toplevel(*s),
-        Obj::Positioner => K::Positioner,
+        Obj::Positioner(_) => K::Positioner,
+        Obj::Popup(s) => K::Popup(*s),
         Obj::DataManager => K::DataManager,
         Obj::DataSource => K::DataSource,
         Obj::DataDevice => K::DataDevice,
@@ -163,6 +167,73 @@ struct Buffer {
     format: u32,
 }
 
+/// xdg_positioner: popup をどこに出すか (親の窓の中の四角 anchor_rect のどこに、どちら向きに)
+#[derive(Clone, Copy, Default)]
+struct Positioner {
+    size: (i32, i32),
+    anchor_rect: (i32, i32, i32, i32),
+    anchor: u32,
+    gravity: u32,
+    offset: (i32, i32),
+    adjust: u32,
+}
+
+impl Positioner {
+    /// 親の窓 (window geometry) の中での popup の左上
+    fn place(&self) -> (i32, i32) {
+        let (ax, ay, aw, ah) = self.anchor_rect;
+        let (w, h) = self.size;
+        // anchor: 0 none 1 top 2 bottom 3 left 4 right 5 top_left 6 bottom_left 7 top_right 8 bottom_right (gravity も同じ)
+        let px = match self.anchor {
+            3 | 5 | 6 => ax,
+            4 | 7 | 8 => ax + aw,
+            _ => ax + aw / 2,
+        };
+        let py = match self.anchor {
+            1 | 5 | 7 => ay,
+            2 | 6 | 8 => ay + ah,
+            _ => ay + ah / 2,
+        };
+        let x = match self.gravity {
+            3 | 5 | 6 => px - w,
+            4 | 7 | 8 => px,
+            _ => px - w / 2,
+        };
+        let y = match self.gravity {
+            1 | 5 | 7 => py - h,
+            2 | 6 | 8 => py,
+            _ => py - h / 2,
+        };
+        (x + self.offset.0, y + self.offset.1)
+    }
+
+    /// 上下をひっくり返したもの (下にはみ出すメニューを上に出す)
+    fn flip_y(&self) -> Positioner {
+        let f = |v: u32| match v {
+            1 => 2,
+            2 => 1,
+            5 => 6,
+            6 => 5,
+            7 => 8,
+            8 => 7,
+            v => v,
+        };
+        Positioner { anchor: f(self.anchor), gravity: f(self.gravity), offset: (self.offset.0, -self.offset.1), ..*self }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Popup {
+    id: u32,
+    /// 親 (toplevel か、ほかの popup) の surface
+    parent: u32,
+    pos: Positioner,
+    /// 親の窓 (window geometry) の中の場所と大きさ (configure で送ったもの)
+    x: i32,
+    y: i32,
+    configured: bool,
+}
+
 #[derive(Default)]
 struct Surface {
     /// attach されたバッファ (Some(0) は外す)
@@ -184,6 +255,7 @@ struct Surface {
     pos: (i32, i32),
     /// 子を持つ surface の重なり順 (下から)。自分自身も入る。空なら自分だけ
     stack: Vec<u32>,
+    popup: Option<Popup>,
 }
 
 struct Client {
@@ -284,6 +356,8 @@ struct Wm {
     ptr: (i32, i32),
     ptr_shown: bool,
     ptr_win: Option<Win>,
+    /// 出ている popup (下から)
+    popups: Vec<Win>,
     abs_max: (i32, i32),
     config: Config,
     /// 描きなおす行 [y0, y1)
@@ -343,6 +417,7 @@ fn main() {
         ptr: (w / 2, h / 2),
         ptr_shown: false,
         ptr_win: None,
+        popups: vec![],
         config,
         dirty: Some((0, h)),
         frames: vec![],
@@ -695,6 +770,10 @@ impl Wm {
             self.ptr_win = None;
         }
         self.frames.retain(|(c, _)| *c != id);
+        if self.popups.iter().any(|p| p.client == id) {
+            self.popups.retain(|p| p.client != id);
+            self.mark_all();
+        }
         let gone: Vec<Win> = self.spaces.values().flat_map(|s| s.wins.iter().copied()).filter(|w| w.client == id).collect();
         for w in gone {
             self.unmap(w);
@@ -789,7 +868,33 @@ impl Wm {
             // wl_data_device: start_drag (0)、set_selection (1)、release (2)
             (K::DataDevice, 2) => self.destroy(cid, m.id),
             (K::DataDevice, _) => {}
-            (K::Region, _) | (K::Positioner, _) => {}
+            (K::Region, _) => {}
+            // xdg_positioner: set_size (1)、set_anchor_rect (2)、set_anchor (3)、set_gravity (4)、
+            // set_constraint_adjustment (5)、set_offset (6)
+            (K::Positioner, op) => {
+                let v: Vec<i32> = match op {
+                    1 | 6 => vec![m.int(), m.int()],
+                    2 => vec![m.int(), m.int(), m.int(), m.int()],
+                    3..=5 => vec![m.int()],
+                    _ => vec![],
+                };
+                let Some(Obj::Positioner(p)) = c.objs.get_mut(&m.id) else { return };
+                match op {
+                    1 => p.size = (v[0], v[1]),
+                    2 => p.anchor_rect = (v[0], v[1], v[2], v[3]),
+                    3 => p.anchor = v[0] as u32,
+                    4 => p.gravity = v[0] as u32,
+                    5 => p.adjust = v[0] as u32,
+                    6 => p.offset = (v[0], v[1]),
+                    _ => {}
+                }
+            }
+            // xdg_popup: destroy (0)、grab (1)
+            (K::Popup(sid), 0) => {
+                self.destroy(cid, m.id);
+                self.close_popup(cid, sid);
+            }
+            (K::Popup(_), _) => {}
             // wl_subcompositor: destroy (0)、get_subsurface (1)
             (K::Subcompositor, 0) => self.destroy(cid, m.id),
             (K::Subcompositor, 1) => {
@@ -879,6 +984,7 @@ impl Wm {
                     }
                 }
                 self.unmap(Win { client: cid, surface: sid });
+                self.close_popup(cid, sid);
             }
             (K::Surface, 1) => {
                 let b = m.uint();
@@ -931,7 +1037,7 @@ impl Wm {
             (K::Output, _) => {}
             (K::WmBase, 0) => self.destroy(cid, m.id),
             (K::WmBase, 1) => {
-                new_obj!(Obj::Positioner);
+                new_obj!(Obj::Positioner(Positioner::default()));
             }
             (K::WmBase, 2) => {
                 let nid = m.uint();
@@ -949,6 +1055,27 @@ impl Wm {
                 if let Some(s) = c.surfaces.get_mut(&sid) {
                     s.toplevel = Some(nid);
                 }
+            }
+            (K::XdgSurface(sid), 2) => {
+                // get_popup: 親 (xdg_surface、なくてもよい) と positioner。configure は最初の commit のあとで送る
+                let nid = m.uint();
+                let (parent, posid) = (m.uint(), m.uint());
+                let pos = match c.objs.get(&posid) {
+                    Some(Obj::Positioner(p)) => *p,
+                    _ => Positioner::default(),
+                };
+                let psid = match c.objs.get(&parent) {
+                    Some(Obj::XdgSurface(p)) => *p,
+                    _ => 0,
+                };
+                if std::env::var_os("AIWM_DEBUG").is_some() {
+                    eprintln!("aiwm: popup {} (surface {}) parent {} size {:?} anchor {:?} {} gravity {} offset {:?} adjust {}", nid, sid, psid, pos.size, pos.anchor_rect, pos.anchor, pos.gravity, pos.offset, pos.adjust);
+                }
+                c.objs.insert(nid, Obj::Popup(sid));
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.popup = Some(Popup { id: nid, parent: psid, pos, x: 0, y: 0, configured: false });
+                }
+                self.popups.push(Win { client: cid, surface: sid });
             }
             (K::XdgSurface(sid), 3) => {
                 let g = (m.int(), m.int(), m.int(), m.int());
@@ -1020,6 +1147,20 @@ impl Wm {
         }
         let is_top = s.toplevel.is_some();
         let w = Win { client: cid, surface: sid };
+        if let Some(p) = s.popup {
+            if std::env::var_os("AIWM_DEBUG").is_some() {
+                eprintln!("aiwm: popup surface {} commit {}x{} configured {}", sid, s.iw, s.ih, p.configured);
+            }
+            if !p.configured {
+                self.configure_popup(cid, sid);
+            }
+            self.mark_all();
+            // 出てきた popup がポインタの下なら、そちらに enter
+            if self.ptr_shown {
+                self.pointer_moved(self.ptr);
+            }
+            return;
+        }
         if is_top && self.ws_of(w).is_none() {
             // 新しい窓: 今のワークスペースの作業中の窓のうしろに入れて、作業中にする
             let focus = self.focus;
@@ -1051,6 +1192,116 @@ impl Wm {
         if let Some(r) = self.rect_of(self.root_of(cid, sid)) {
             self.mark(r.y, r.y + r.h);
         }
+    }
+
+    /// popup を置く場所を決めて configure を送る。画面からはみ出すなら上下を返し、それでもだめなら画面の中へずらす
+    fn configure_popup(&mut self, cid: usize, sid: u32) {
+        let Some(p) = self.clients[&cid].surfaces.get(&sid).and_then(|s| s.popup) else { return };
+        let origin = self.geom_origin(cid, p.parent).unwrap_or((0, 0));
+        let (mut w, mut h) = (p.pos.size.0.max(1), p.pos.size.1.max(1));
+        let (sw, sh) = (self.width(), self.height());
+        let (mut x, mut y) = p.pos.place();
+        // constraint_adjustment: slide_x 1, slide_y 2, flip_x 4, flip_y 8, resize_x 16, resize_y 32。
+        // 上下にはみ出すなら: 返して入ればそれ、だめなら (resize_y なら) 入るところまで縮める、それでもだめならずらす
+        if origin.1 + y + h > sh || origin.1 + y < 0 {
+            let (_, fy) = p.pos.flip_y().place();
+            if p.pos.adjust & 8 != 0 && origin.1 + fy >= 0 && origin.1 + fy + h <= sh {
+                y = fy;
+            } else if p.pos.adjust & 32 != 0 {
+                let top = (origin.1 + y).max(0);
+                if sh - top >= 64 {
+                    y = top - origin.1;
+                    h = sh - top;
+                }
+            }
+        }
+        if p.pos.adjust & 16 != 0 && w > sw {
+            w = sw;
+        }
+        x = (origin.0 + x).clamp(0, (sw - w).max(0)) - origin.0;
+        y = (origin.1 + y).clamp(0, (sh - h).max(0)) - origin.1;
+        let serial = self.next_serial();
+        let c = self.clients.get_mut(&cid).unwrap();
+        let Some(s) = c.surfaces.get_mut(&sid) else { return };
+        let Some(pp) = s.popup.as_mut() else { return };
+        pp.x = x;
+        pp.y = y;
+        pp.configured = true;
+        let (pid, xdg) = (pp.id, s.xdg);
+        c.conn.send(pid, 0, &[Arg::I(x), Arg::I(y), Arg::I(w), Arg::I(h)]);
+        if let Some(xdg) = xdg {
+            c.conn.send(xdg, 0, &[Arg::U(serial)]);
+        }
+    }
+
+    /// popup が消えた (destroy されたか、surface ごとなくなった)
+    fn close_popup(&mut self, cid: usize, sid: u32) {
+        let w = Win { client: cid, surface: sid };
+        if !self.popups.contains(&w) {
+            return;
+        }
+        self.popups.retain(|p| *p != w);
+        if let Some(s) = self.clients.get_mut(&cid).and_then(|c| c.surfaces.get_mut(&sid)) {
+            s.popup = None;
+        }
+        if self.ptr_win == Some(w) {
+            self.ptr_win = None;
+        }
+        self.mark_all();
+        if self.ptr_shown {
+            self.pointer_moved(self.ptr);
+        }
+    }
+
+    /// 出ている popup をみんな閉じてもらう (外をクリックしたとき)。上のものから popup_done
+    fn dismiss_popups(&mut self) {
+        for w in self.popups.clone().into_iter().rev() {
+            if let Some(c) = self.clients.get_mut(&w.client) {
+                if let Some(id) = c.surfaces.get(&w.surface).and_then(|s| s.popup).map(|p| p.id) {
+                    c.conn.send(id, 1, &[]);
+                }
+            }
+        }
+    }
+
+    /// xdg_surface の「窓」(window geometry) の左上が、画面のどこにあるか
+    fn geom_origin(&self, cid: usize, sid: u32) -> Option<(i32, i32)> {
+        self.geom_origin_n(cid, sid, 0)
+    }
+
+    fn geom_origin_n(&self, cid: usize, sid: u32, depth: u32) -> Option<(i32, i32)> {
+        let s = self.clients.get(&cid)?.surfaces.get(&sid)?;
+        if let Some(p) = s.popup {
+            if depth > 16 {
+                return None;
+            }
+            let (ox, oy) = self.geom_origin_n(cid, p.parent, depth + 1)?;
+            return Some((ox + p.x, oy + p.y));
+        }
+        let r = self.rect_of(Win { client: cid, surface: sid })?;
+        Some((r.x, r.y))
+    }
+
+    /// surface の絵の左上 (0, 0) が画面のどこか (window geometry の分だけずらす)
+    fn surface_origin(&self, w: Win) -> Option<(i32, i32)> {
+        let (x, y) = self.geom_origin(w.client, w.surface)?;
+        let (gx, gy) = self.geom_off(w);
+        Some((x - gx, y - gy))
+    }
+
+    /// (x, y) にあるもの: popup (上から) か窓と、その surface の左上
+    fn target_at(&self, x: i32, y: i32) -> Option<(Win, (i32, i32))> {
+        for &w in self.popups.iter().rev() {
+            let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { continue };
+            let Some((ox, oy)) = self.geom_origin(w.client, w.surface) else { continue };
+            let (gw, gh) = s.geometry.map_or((s.iw as i32, s.ih as i32), |g| (g.2, g.3));
+            if (Rect { x: ox, y: oy, w: gw, h: gh }).contains(x, y) {
+                return Some((w, self.surface_origin(w)?));
+            }
+        }
+        let (w, r) = self.win_at(x, y)?;
+        let (gx, gy) = self.geom_off(w);
+        Some((w, (r.x - gx, r.y - gy)))
     }
 
     /// subsurface をやめる (親の重なり順から外す)
@@ -1396,8 +1647,7 @@ impl Wm {
         self.ptr_shown = true;
         self.mark(old.1 - 1, old.1 + CURSOR_H + 1);
         self.mark(self.ptr.1 - 1, self.ptr.1 + CURSOR_H + 1);
-        let hit = self.win_at(self.ptr.0, self.ptr.1);
-        let goff = hit.map_or((0, 0), |(w, _)| self.geom_off(w));
+        let hit = self.target_at(self.ptr.0, self.ptr.1);
         let now = hit.map(|(w, _)| w);
         let serial = self.next_serial();
         if now != self.ptr_win {
@@ -1409,19 +1659,22 @@ impl Wm {
                     }
                 }
             }
-            if let Some((n, r)) = hit {
+            if let Some((n, o)) = hit {
                 if let Some(c) = self.clients.get_mut(&n.client) {
                     for p in c.pointers.clone() {
-                        c.conn.send(p, 0, &[Arg::U(serial), Arg::O(n.surface), Arg::F((self.ptr.0 - r.x + goff.0) as f64), Arg::F((self.ptr.1 - r.y + goff.1) as f64)]);
+                        c.conn.send(p, 0, &[Arg::U(serial), Arg::O(n.surface), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
+                        c.conn.send(p, 5, &[]);
+                        // enter のあとに motion も (GTK は motion で「上にいる」を決めるものがある)
+                        c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
                         c.conn.send(p, 5, &[]);
                     }
                 }
             }
             self.ptr_win = now;
-        } else if let Some((n, r)) = hit {
+        } else if let Some((n, o)) = hit {
             if let Some(c) = self.clients.get_mut(&n.client) {
                 for p in c.pointers.clone() {
-                    c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - r.x + goff.0) as f64), Arg::F((self.ptr.1 - r.y + goff.1) as f64)]);
+                    c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
                     c.conn.send(p, 5, &[]);
                 }
             }
@@ -1434,6 +1687,21 @@ impl Wm {
         }
         if value == 1 {
             let (x, y) = self.ptr;
+            // popup の外を押した: popup を閉じてもらい、この押したのは使わない (メニューの外のクリック)
+            if !self.popups.is_empty() && !self.target_at(x, y).is_some_and(|(w, _)| self.popups.contains(&w)) {
+                self.dismiss_popups();
+                return;
+            }
+            if let Some(w) = self.ptr_win.filter(|w| self.popups.contains(w)) {
+                let serial = self.next_serial();
+                if let Some(c) = self.clients.get_mut(&w.client) {
+                    for p in c.pointers.clone() {
+                        c.conn.send(p, 3, &[Arg::U(serial), Arg::U(wl::now_ms()), Arg::U(code as u32), Arg::U(value as u32)]);
+                        c.conn.send(p, 5, &[]);
+                    }
+                }
+                return;
+            }
             if let Some(n) = self.bar_hit(x, y) {
                 self.switch_to(n);
                 return;
@@ -1448,6 +1716,9 @@ impl Wm {
         }
         if let Some(w) = self.ptr_win {
             let serial = self.next_serial();
+            if std::env::var_os("AIWM_DEBUG").is_some() {
+                eprintln!("aiwm: button {} {} -> client {} surface {} at {:?}", code, value, w.client, w.surface, self.ptr);
+            }
             if let Some(c) = self.clients.get_mut(&w.client) {
                 for p in c.pointers.clone() {
                     c.conn.send(p, 3, &[Arg::U(serial), Arg::U(wl::now_ms()), Arg::U(code as u32), Arg::U(value as u32)]);
@@ -1502,6 +1773,14 @@ impl Wm {
         }
         if full.is_none() {
             self.draw_bar(y0, y1);
+        }
+        // popup (メニューなど) はいちばん上に
+        for w in self.popups.clone() {
+            let Some((ox, oy)) = self.surface_origin(w) else { continue };
+            let Some(c) = self.clients.get(&w.client) else { continue };
+            let clip = Rect { x: 0, y: y0, w: sw as i32, h: y1 - y0 };
+            let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
+            draw_tree(px, stride, c, w.surface, ox, oy, clip, 0);
         }
         if self.ptr_shown {
             self.draw_cursor(y0, y1);
