@@ -59,6 +59,19 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// 仕事がなくて眠る CPU (cpu0 以外) はタイマを止める (起こすのは IPI。時刻や期限は cpu0 が見る)。
+/// 眠っている CPU が 1 秒に 100 回起きると、QEMU (TCG / HVF) の中で取りあいになって遅くなる
+pub fn idle(on: bool) {
+    if crate::smp::id() == 0 {
+        return;
+    }
+    if on {
+        unsafe { core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64) };
+    } else {
+        rearm();
+    }
+}
+
 /// 2 つめからの CPU: 自分のタイマを動かす
 pub fn init_cpu() {
     crate::irq::enable(IRQ);

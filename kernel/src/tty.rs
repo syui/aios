@@ -372,11 +372,16 @@ impl Tty {
     fn wake(&self) {
         self.generation.set(self.generation.get() + 1);
         proc::wakeup(self.chan(READ));
-        proc::wakeup(proc::poll_chan());
+        proc::poll_wake(self.chan(0));
     }
 
     fn chan(&self, what: usize) -> usize {
         self as *const Tty as usize + what
+    }
+
+    /// poll で待つときの印 (この端末で何か変わったら poll_wake する)
+    pub fn poll_key(&self) -> usize {
+        self.chan(0)
     }
 
     /// 読める (poll)
@@ -541,7 +546,7 @@ impl Tty {
     fn wake_writers(&self) {
         if let Dev::Pty(_) = self.dev {
             proc::wakeup(self.chan(MWRITE));
-            proc::wakeup(proc::poll_chan());
+            proc::poll_wake(self.chan(0));
         }
     }
 }
@@ -563,7 +568,7 @@ pub fn write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
                 done += n;
                 if let Dev::Pty(_) = t.dev {
                     proc::wakeup(t.chan(MREAD));
-                    proc::wakeup(proc::poll_chan());
+                    proc::poll_wake(t.chan(0));
                 }
             }
             if done == src.len() {
@@ -586,6 +591,7 @@ pub fn master_read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize
         {
             let mut t = tty.borrow_mut();
             let chan = t.chan(SWRITE);
+            let key = t.chan(0);
             let p = t.pty().unwrap();
             if !p.out.is_empty() {
                 let n = dst.len().min(p.out.len());
@@ -593,7 +599,7 @@ pub fn master_read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize
                     *d = c;
                 }
                 proc::wakeup(chan);
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(key);
                 return Ok(n);
             }
             if p.slaves == 0 {
@@ -629,7 +635,7 @@ pub fn master_write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i
             // 子のエコーが親の読むものに入ったかもしれない
             let t = tty.borrow();
             proc::wakeup(t.chan(MREAD));
-            proc::wakeup(proc::poll_chan());
+            proc::poll_wake(t.chan(0));
         }
         if done == src.len() {
             return Ok(done);
@@ -714,11 +720,12 @@ pub fn ref_slave(tty: &TtyRef) {
 pub fn close_slave(tty: &TtyRef) {
     let mut t = tty.borrow_mut();
     let chan = t.chan(MREAD);
+    let key = t.chan(0);
     if let Some(p) = t.pty() {
         p.slaves -= 1;
     }
     proc::wakeup(chan);
-    proc::wakeup(proc::poll_chan());
+    proc::poll_wake(key);
 }
 
 /// 親の口を閉じた: 子の側はハングアップ

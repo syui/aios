@@ -28,6 +28,30 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// CPU の番号ごとの MPIDR の Aff0 (CPU 間の割り込みの宛先)
 static mut TARGET: [usize; MAXCPU] = [0; MAXCPU];
 
+/// 仕事がなくて眠っている CPU (ビット)
+static IDLE: AtomicUsize = AtomicUsize::new(0);
+
+/// この CPU は眠る / 起きた (スケジューラが、大きなロックを持ったまま呼ぶ)
+pub fn set_idle(on: bool) {
+    let bit = 1 << id();
+    if on {
+        IDLE.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        IDLE.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// 眠っている CPU を起こす (動けるプロセスができた)。sev ではなく割り込みで:
+/// Mac の Hypervisor.framework (HVF) では wfe が眠らず sev も届かないので、ひまな CPU は wfi で眠っている
+pub fn wake_idle() {
+    let idle = IDLE.load(Ordering::Acquire) & !(1 << id());
+    for cpu in 0..online() {
+        if idle & (1 << cpu) != 0 {
+            crate::irq::send_ipi(unsafe { TARGET[cpu] });
+        }
+    }
+}
+
 /// ほかの CPU に、EL0 から戻ってくるように知らせる (殺された、シグナルが来た)
 pub fn kick(cpu: usize) {
     if cpu != id() && cpu < online() {
