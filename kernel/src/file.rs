@@ -50,6 +50,8 @@ pub enum Kind {
     Block(crate::block::Part),
     /// 画面 (/dev/fb0、virtio-gpu)
     Fb,
+    /// キーボードやマウス (/dev/input/eventN、virtio-input)
+    Input(usize),
 }
 
 impl Kind {
@@ -61,6 +63,7 @@ impl Kind {
             (1, 5) => return Ok(Kind::Zero),
             (1, 8) | (1, 9) => return Ok(Kind::Random),
             (29, 0) if crate::gpu::get().is_some() => return Ok(Kind::Fb),
+            (13, n) if n >= 64 && ((n - 64) as usize) < crate::input::count() => return Ok(Kind::Input((n - 64) as usize)),
             (5, 0) => {
                 let t = tty::controlling().ok_or(-ENXIO)?;
                 tty::ref_slave(&t);
@@ -138,6 +141,7 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read_ex(p, dst, false, nonblock),
         Kind::Socket(s) => s.borrow_mut().read(dst),
         Kind::EventFd(e) => crate::epoll::read(e, dst, nonblock),
+        Kind::Input(n) => crate::input::read(*n, dst, nonblock),
         _ => Err(-EBADF),
     }
 }
@@ -285,7 +289,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Input(_) => self.kind.clone(),
             _ => return None,
         };
         Some((k, self.flags & O_NONBLOCK != 0))
@@ -325,7 +329,7 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
-        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb) {
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_)) {
             if let Ok(i) = vfs::resolve("", &self.describe(), true) {
                 return Stat::of_inode(&i);
             }
@@ -337,6 +341,7 @@ impl OpenFile {
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Fb => Stat::dev(vfs::S_IFCHR | 0o666, 29 << 8),
+            Kind::Input(n) => Stat::dev(vfs::S_IFCHR | 0o666, 13 << 8 | (64 + *n as u64)),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::Block(p) => {
                 let (ma, mi) = crate::block::dev_of_part(p);
@@ -369,6 +374,7 @@ impl OpenFile {
             Kind::Zero => "/dev/zero".into(),
             Kind::Random => "/dev/urandom".into(),
             Kind::Fb => "/dev/fb0".into(),
+            Kind::Input(n) => alloc::format!("/dev/input/event{}", n),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
@@ -405,6 +411,7 @@ impl OpenFile {
             Kind::EventFd(e) => crate::epoll::readiness(e),
             Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
+            Kind::Input(n) => (crate::input::readable(*n), false, false),
             _ => (true, true, false),
         }
     }
@@ -417,6 +424,7 @@ impl OpenFile {
             Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
+            Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
             _ => return None,
         })
     }

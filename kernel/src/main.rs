@@ -43,6 +43,7 @@ mod vfat;
 mod vfs;
 mod virtio;
 mod gpu;
+mod input;
 mod virtio_blk;
 mod virtio_net;
 mod vdso;
@@ -85,6 +86,7 @@ pub extern "C" fn kmain() -> ! {
     vdso::init();
     uart::init();
     gpu::init();
+    input::init();
     fs::init();
     net::init();
 
