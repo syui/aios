@@ -134,7 +134,7 @@ const CHUNK: usize = 64 * 1024;
 /// 待つことのないもの (ふつうのファイル、/dev/zero など、ディスク): 頼まれた分を最後まで運ぶ (Linux と同じ)。
 /// パイプや端末やソケットは、1 回分 (届いている分) だけ
 fn whole(f: &FileRef) -> bool {
-    matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_))
+    matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb)
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
@@ -787,6 +787,9 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
             BLKSSZGET | BLKBSZGET => out(arg, &(crate::block::SECTOR as u32).to_le_bytes()).map(|_| 0),
             _ => Err(-ENOTTY),
         };
+    }
+    if matches!(f.borrow().kind, Kind::Fb) {
+        return crate::gpu::ioctl(req, arg);
     }
     let (tty, master) = match &f.borrow().kind {
         Kind::Tty(t) => (t.clone(), false),

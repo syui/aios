@@ -16,6 +16,9 @@
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
 # ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
+# AIOS_DISPLAY=1 で画面の窓を出す (virtio-gpu と virtio のキーボード・タブレット。Mac は cocoa、
+#   ほかは gtk)。AIOS_DISPLAY=cocoa / gtk / sdl / none で選べる。シリアル (この端末) もそのまま使える
+# AIOS_QEMU_ARGS で QEMU に引数を足せる
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
 #   AIOS_ACCEL=tcg でソフトのエミュレーションに、AIOS_ACCEL=kvm で Linux (arm64) の KVM に
 #   AIOS_GIC=3 で TCG でも GICv3 に
@@ -113,6 +116,19 @@ if [ -f disk.img ]; then
     -drive file=disk.img,if=none,format=raw,id=hd0 \
     -device virtio-blk-device,drive=hd0
 fi
+# 画面: あれば窓とシリアル、なければシリアルだけ (-nographic)。
+# virtio の装置はディスクのあとに足す (前に足すとディスクの場所が変わり、UEFI が起動の項目を見失う)
+out=-nographic
+if [ -n "$AIOS_DISPLAY" ]; then
+  disp=$AIOS_DISPLAY
+  if [ "$disp" = 1 ]; then
+    if [ "$(uname -s)" = Darwin ]; then disp=cocoa; else disp=gtk; fi
+  fi
+  set -- "$@" -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device
+  out="-display $disp -serial mon:stdio"
+fi
+# shellcheck disable=SC2086
+set -- "$@" ${AIOS_QEMU_ARGS:-}
 if [ -n "$uefi" ]; then
   # ACPI を切ると、ファームウェアは QEMU の DTB を渡してくれる
   vars=build/efivars.fd
@@ -128,10 +144,10 @@ if [ -n "$uefi" ]; then
   fi
   echo "boot: UEFI ($uefi) from disk.img" >&2
   # shellcheck disable=SC2086
-  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
+  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" $out "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"
   exit
 fi
 # shellcheck disable=SC2086
-qemu-system-aarch64 -machine "$machine" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" -nographic "$@" \
+qemu-system-aarch64 -machine "$machine" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" $out "$@" \
   -kernel "$k" -append "${AIOS_CMDLINE:-}"

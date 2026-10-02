@@ -569,6 +569,14 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             crate::file::Kind::Inode(ino, _) if !ino.meta().is_dir() => {
                 Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off) }
             }
+            // 画面 (/dev/fb0): フレームバッファのページをそのまま
+            crate::file::Kind::Fb => {
+                let g = crate::gpu::get().ok_or(-ENODEV)?;
+                if off + len > pg_up(g.size()) {
+                    return Err(-EINVAL);
+                }
+                Backing::Pages { pages: g.pages.clone(), off }
+            }
             _ => return Err(-ENODEV),
         }
     } else {
