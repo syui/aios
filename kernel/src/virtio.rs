@@ -116,6 +116,7 @@ pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)>
         m.wr(DEVICE_FEATURES_SEL, 1);
         let dev = lo | (m.rd(DEVICE_FEATURES) as u64) << 32;
         if dev & F_VERSION_1 == 0 {
+            println!("virtio: device {} at {:#x} has no VERSION_1", device_id, pa);
             return None;
         }
         let feats = dev & (wanted | F_VERSION_1);
@@ -125,11 +126,34 @@ pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)>
         m.wr(DRIVER_FEATURES, (feats >> 32) as u32);
         m.wr(STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
         if m.rd(STATUS) & STATUS_FEATURES_OK == 0 {
+            println!("virtio: device {} at {:#x} refused features {:#x}", device_id, pa, feats);
             return None;
         }
         return Some((m, feats));
     }
     None
+}
+
+/// 見えている virtio の装置 (「ID@番地」の並び。モジュールが装置を見つけられないときに出す)
+pub fn list() -> alloc::string::String {
+    let mut slots = alloc::vec::Vec::new();
+    if crate::dtb::present() {
+        crate::dtb::each_virtio(|base, _| slots.push(base as usize));
+        slots.sort();
+    } else {
+        slots.extend((0..MMIO_SLOTS).map(|i| MMIO_BASE + i * MMIO_STRIDE));
+    }
+    let mut s = alloc::string::String::new();
+    for pa in slots {
+        let m = Mmio { base: p2v(pa), irq: 0 };
+        if m.rd(MAGIC) == 0x7472_6976 && m.rd(DEVICE_ID) != 0 {
+            s.push_str(&alloc::format!(" {}@{:#x}", m.rd(DEVICE_ID), pa));
+        }
+    }
+    if s.is_empty() {
+        s.push_str(" none");
+    }
+    s
 }
 
 pub fn ready(m: &Mmio) {
@@ -158,6 +182,7 @@ impl Queue {
     pub fn new(m: &Mmio, idx: u32, size: usize) -> Option<Queue> {
         m.wr(QUEUE_SEL, idx);
         if (m.rd(QUEUE_NUM_MAX) as usize) < size || size * 16 > PGSIZE {
+            println!("virtio: queue {} has {} entries, {} wanted", idx, m.rd(QUEUE_NUM_MAX), size);
             return None;
         }
         m.wr(QUEUE_NUM, size as u32);

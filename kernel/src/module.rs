@@ -53,6 +53,7 @@ pub fn load(image: &[u8]) -> Result<i64, i64> {
         return Err(-EEXIST);
     }
     if !(m.init)() {
+        println!("module {}: no device (virtio:{})", name, crate::virtio::list());
         return Err(-ENODEV);
     }
     m.loaded = true;
