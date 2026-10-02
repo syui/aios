@@ -7,6 +7,8 @@
 mod kmod;
 #[path = "../lib/unit.rs"]
 mod unit;
+#[path = "../lib/users.rs"]
+mod users;
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -66,13 +68,39 @@ fn spawn(u: &Unit) -> Result<i32, String> {
     env.insert("HOME".into(), "/root".into());
     env.insert("USER".into(), "root".into());
     env.insert("TERM".into(), "vt100".into());
+    // User=: そのユーザーの HOME などと、/run/user/UID (XDG_RUNTIME_DIR)
+    let mut who: Option<users::User> = None;
+    if let Some(name) = &u.user {
+        let mut usr = users::by_name(name).ok_or(format!("User={}: no such user", name))?;
+        if let Some(g) = &u.group {
+            usr.gid = users::groups().into_iter().find(|(n, _, _)| n == g).map(|(_, gid, _)| gid).ok_or(format!("Group={}: no such group", g))?;
+        }
+        users::make_home(&usr);
+        let run = format!("/run/user/{}", usr.uid);
+        let _ = fs::create_dir_all(&run);
+        let c = cstr(&run);
+        unsafe {
+            libc::chown(c.as_ptr(), usr.uid, usr.gid);
+            libc::chmod(c.as_ptr(), 0o700);
+        }
+        env.insert("HOME".into(), usr.home.clone());
+        env.insert("USER".into(), usr.name.clone());
+        env.insert("LOGNAME".into(), usr.name.clone());
+        env.insert("SHELL".into(), usr.shell.clone());
+        env.insert("XDG_RUNTIME_DIR".into(), run);
+        who = Some(usr);
+    }
     for (k, v) in &u.env {
         env.insert(k.clone(), v.clone());
     }
     let envs: Vec<CString> = env.iter().map(|(k, v)| cstr(&format!("{}={}", k, v))).collect();
     let log = format!("/var/log/{}.log", u.name);
     let (exe, log) = (cstr(&exe), cstr(&log));
-    let workdir = u.workdir.as_deref().map(cstr);
+    // WorkingDirectory=~ はホーム
+    let workdir = match u.workdir.as_deref() {
+        Some("~") => Some(cstr(env.get("HOME").map_or("/", |h| h.as_str()))),
+        w => w.map(cstr),
+    };
     let tty = u.tty;
 
     let pid = unsafe { libc::fork() };
@@ -103,6 +131,12 @@ fn spawn(u: &Unit) -> Result<i32, String> {
         if out > 2 && out != inp {
             libc::close(out);
         }
+        if let Some(usr) = &who {
+            if let Err(e) = users::become_user(usr) {
+                eprintln!("init: {}", e);
+                libc::_exit(217); // systemd の EXIT_USER
+            }
+        }
         if let Some(d) = &workdir {
             libc::chdir(d.as_ptr());
         }
@@ -132,6 +166,15 @@ impl Init {
         }
         let u = s.unit.clone();
         self.pending.remove(name);
+        // ConditionPathExists=: 合わなければ起動しないで飛ばす (失敗ではない)
+        let unmet = u.cond_paths.iter().find(|p| match p.strip_prefix('!') {
+            Some(q) => fs::metadata(q).is_ok(),
+            None => fs::metadata(p).is_err(),
+        });
+        if let Some(p) = unmet {
+            println!("init: {}: skipped (ConditionPathExists={})", name, p);
+            return Ok(());
+        }
         for a in &u.after {
             if self.pending.contains(a) {
                 let _ = self.start(a, depth + 1);

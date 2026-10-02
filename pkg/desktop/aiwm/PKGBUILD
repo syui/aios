@@ -1,5 +1,6 @@
 # aiwm: aios のタイル型 Wayland コンポジタ (sway の小さな親戚)。このリポジトリの desktop/ から
 #   設定は /etc/aiwm/config (~/.config/aiwm/config があればそちら)。aiwm で始め、$mod+Shift+e で終わる
+#   起動のときに画面に出すには sudo systemctl enable aiwm (aiwm.service、User=ai)
 pkgname=aiwm
 pkgver=0.0.1
 pkgrel=1
@@ -25,4 +26,5 @@ build() {
 package() {
   install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aiwm" "$pkgdir/usr/bin/aiwm"
   install -Dm644 "$startdir/../../../desktop/etc/aiwm/config" "$pkgdir/etc/aiwm/config"
+  install -Dm644 "$startdir/../../../desktop/etc/systemd/aiwm.service" "$pkgdir/usr/lib/systemd/system/aiwm.service"
 }

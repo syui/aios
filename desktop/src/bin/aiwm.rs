@@ -339,8 +339,8 @@ fn open_socket() -> Result<(String, RawFd), String> {
     };
     let mut last = String::new();
     for dir in dirs {
-        if std::fs::create_dir_all(&dir).is_err() {
-            last = format!("{}: cannot create", dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            last = format!("{}: {}", dir, e);
             continue;
         }
         unsafe { libc::chmod(format!("{}\0", dir).as_ptr() as *const _, 0o700) };
