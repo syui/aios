@@ -44,3 +44,25 @@ zig_env() {
   export ZIG_GLOBAL_CACHE_DIR=$top/build/zig/cache
   unset RUSTFLAGS
 }
+
+# c_deps NAME...: ほかの C のパッケージ (repo/aarch64/c/NAME-*.pkg.tar.zst、なければ作る) を
+# $srcdir/sysroot に広げ、そこの include と lib を CPPFLAGS / LDFLAGS / PKG_CONFIG に足す
+# (makepkg の makedepends の代わり。ビルドするマシンの /opt/c は触らない)
+c_deps() {
+  local top root n f
+  top=$(cd "$startdir/../../.." && pwd)
+  root=$srcdir/sysroot
+  rm -rf "$root"
+  mkdir -p "$root"
+  for n in "$@"; do
+    f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
+    if [ -z "$f" ]; then
+      "$top/bin/mkpkg.sh" "$top/pkg/c/$n" >&2
+      f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
+    fi
+    zstd -dcq "$f" | tar -xf - -C "$root" --exclude=.PKGINFO
+  done
+  SYSROOT=$root$PREFIX
+  export CPPFLAGS="-I$SYSROOT/include" LDFLAGS="$LDFLAGS -L$SYSROOT/lib"
+  export PKG_CONFIG_LIBDIR=$SYSROOT/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$root
+}
