@@ -1,0 +1,150 @@
+# firefox: Mozilla Firefox (Wayland only, for aios)
+#   aarch64-linux-musl へクロスビルドする。C / C++ は Zig (zig cc / zig c++、libc++ は静的)、Rust は rustc の
+#   aarch64-unknown-linux-musl。GTK などは [c] のパッケージを sysroot に広げて使う。/opt/c/lib/firefox に入る
+#   ビルドに要るもの: rustup (target aarch64-unknown-linux-musl)、cbindgen、clang-20 と libclang-20
+#   (ビルドするマシンのための道具と bindgen)、llvm-20 (ar nm objcopy ...)、nodejs、python3、qemu-user はいらない
+#   ディスクは 15GB ほど、時間は 4 コアで数時間
+#   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
+pkgname=firefox
+pkgver=157.0
+pkgrel=1
+pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
+arch=('aarch64')
+license=('MPL-2.0')
+depends=('musl' 'gtk3' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2' 'atk' 'wayland' 'libxkbcommon' 'fontconfig' 'freetype2' 'harfbuzz' 'libffi' 'zlib')
+makedepends=('rust' 'cbindgen' 'clang' 'llvm' 'nodejs' 'python')
+source=("https://archive.mozilla.org/pub/firefox/releases/$pkgver/source/firefox-$pkgver.source.tar.xz"
+        fix-fortify-system-wrappers.patch
+        musl-no-linux-prctl.patch
+        sandbox-sched_setscheduler.patch
+        musl-pthread_t.patch
+        aios-configure.patch
+        wayland-without-dbus.patch)
+sha256sums=('259c564dd4bbd56bbe8a9a6cf001fc8812853567fd3a78e77c9ddf10d7d4e982'
+            SKIP SKIP SKIP SKIP SKIP SKIP)
+
+# ビルドするマシンの LLVM (clang-20 / llvm-20 があればそれ)
+_llvm=${FIREFOX_LLVM:-20}
+
+prepare() {
+  rm -rf "firefox-$pkgver"
+  tar -xf "${source[0]##*/}"
+  cd "firefox-$pkgver"
+  local p
+  for p in fix-fortify-system-wrappers musl-no-linux-prctl sandbox-sched_setscheduler musl-pthread_t aios-configure wayland-without-dbus; do
+    patch -p1 < "$srcdir/$p.patch"
+  done
+  # vendor の crate を書きかえたので、cargo の中身の確かめをやめる
+  sed -i 's/\("files":{\)[^}]*/\1/' third_party/rust/audio_thread_priority/.cargo-checksum.json
+}
+
+# _zig_wrappers DIR: Firefox の CC / CXX にする zig の包み
+#   -Wl,--version: Firefox はリンカの名前をこれで調べる (zig ld は "LLD" と言わない)
+#   -fuse-ld= / --target= / -target X: zig が自分で決めるので外す (Rust の cc crate が --target を渡す)
+#   -march=armv8.2-a+dotprod: zig は読めないので -mcpu=generic+v8_2a+dotprod に
+#   -Wl,-h,NAME: zig のリンカは -soname だけ読める
+#   -E と -c が両方: -c を外す (zig は -c を勝たせる)
+#   リンクのとき: -dynamic (zig の musl は静的が既定)
+_zig_wrappers() {
+  local t
+  for t in cc c++; do
+    cat > "$1/aarch64-linux-musl-$t" <<SH
+#!/bin/sh
+link=1
+for a in "\$@"; do
+  case "\$a" in
+    -Wl,--version) echo "LLD 21.1.0 (compatible with GNU linkers)"; exit 0 ;;
+    -c|-E|-S|-M|-MM|--version|-v|-dumpversion|-print-*) link= ;;
+  esac
+done
+pre=
+skip=
+for a in "\$@"; do [ "\$a" = -E ] && pre=1; done
+n=\$#
+while [ \$n -gt 0 ]; do
+  a=\$1; shift; n=\$((n - 1))
+  [ -n "\$skip" ] && { skip=; continue; }
+  case "\$a" in
+    -fuse-ld=*|--target=*) continue ;;
+    -target) skip=1; continue ;;
+    -c) [ -n "\$pre" ] && continue ;;
+    -Wl,-h,*) a=-Wl,-soname,\${a#-Wl,-h,} ;;
+    -march=armv8*)
+      a=\${a#-march=armv}; base=\${a%%+*}; ext=; [ "\$base" = "\$a" ] || ext=+\${a#*+}
+      base=\${base%-a}
+      case \$base in 8) v= ;; *) v=+v\$(echo \$base | tr . _)a ;; esac
+      a=-mcpu=generic\$v\$ext ;;
+  esac
+  set -- "\$@" "\$a"
+done
+[ -n "\$link" ] && set -- -dynamic "\$@"
+exec zig $t -target aarch64-linux-musl "\$@"
+SH
+    chmod 755 "$1/aarch64-linux-musl-$t"
+  done
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols
+  local root=$srcdir/sysroot tc=$srcdir/tc zlib z d
+  unset CPPFLAGS LDFLAGS CFLAGS CXXFLAGS CC CXX AR RANLIB
+  mkdir -p "$tc"
+  _zig_wrappers "$tc"
+  # bindgen (libclang) には zig の libc++ と musl のヘッダと、zig が libc++ に渡す -D を教える
+  z=$(dirname "$(command -v zig)")/lib
+  d=$(cd "$srcdir" && echo 'int x;' > bg.cc && "$tc/aarch64-linux-musl-c++" -c bg.cc -o /dev/null -### 2>&1 |
+    grep -o '"-D" "[^"]*"' | sort -u | sed 's/"-D" "\(.*\)"/-D\1/' | tr '\n' ' ')
+  cat > "$srcdir/mozconfig" <<EOF
+mk_add_options MOZ_OBJDIR=$srcdir/obj
+export CC=$tc/aarch64-linux-musl-cc
+export CXX=$tc/aarch64-linux-musl-c++
+export HOST_CC=clang-$_llvm
+export HOST_CXX=clang++-$_llvm
+export AR=llvm-ar-$_llvm
+export NM=llvm-nm-$_llvm
+export RANLIB=llvm-ranlib-$_llvm
+export PKG_CONFIG_SYSROOT_DIR=$root
+export PKG_CONFIG_LIBDIR=$root$PREFIX/lib/pkgconfig:$root$PREFIX/share/pkgconfig
+export MOZBUILD_STATE_PATH=$srcdir/mozbuild
+export MACH_BUILD_PYTHON_NATIVE_PACKAGE_SOURCE=none
+export MOZ_NOSPAM=1
+# libxul などが互いを名前で見つけられるように (musl の dlopen はフルパスで読んだものを名前で探さない)
+export LDFLAGS="-Wl,-rpath,$PREFIX/lib/firefox"
+export BINDGEN_CFLAGS="-nostdinc -nostdinc++ -isystem $z/libcxx/include -isystem $z/libcxxabi/include -isystem $(clang-$_llvm -print-resource-dir)/include -isystem $z/libc/include/aarch64-linux-musl -isystem $z/libc/include/generic-musl -isystem $z/libc/include/aarch64-linux-any -isystem $z/libc/include/any-linux-any $d"
+
+ac_add_options --target=aarch64-linux-musl
+ac_add_options --enable-application=browser
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --prefix=$PREFIX
+ac_add_options --enable-release
+ac_add_options --enable-optimize=-O2
+ac_add_options --disable-bootstrap
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --disable-tests
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-dbus
+ac_add_options --disable-jemalloc
+ac_add_options --disable-sandbox
+ac_add_options --disable-webrtc
+ac_add_options --disable-audio-backends
+ac_add_options --disable-necko-wifi
+ac_add_options --disable-elf-hack
+ac_add_options --without-wasm-sandboxed-libraries
+ac_add_options --with-libclang-path=$(llvm-config-$_llvm --libdir)
+EOF
+  cd "firefox-$pkgver"
+  MOZCONFIG=$srcdir/mozconfig ./mach build
+}
+
+package() {
+  local PREFIX=/opt/c
+  cd "firefox-$pkgver"
+  MOZCONFIG=$srcdir/mozconfig DESTDIR="$pkgdir" ./mach install
+  install -d "$pkgdir$PREFIX/bin"
+  ln -sf ../lib/firefox/firefox "$pkgdir$PREFIX/bin/firefox"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

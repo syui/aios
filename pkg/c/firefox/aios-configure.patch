@@ -1,0 +1,22 @@
+--- a/build/moz.configure/flags.configure
++++ b/build/moz.configure/flags.configure
+@@ -74,7 +74,7 @@
+             )
+ 
+ 
+-@depends(when=link_libstdcxx_statically)
++@depends(when=never)
+ def check_libstdcxx_linkage():
+     die("Firefox does not support linking statically with libstdc++")
+ 
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -241,7 +241,7 @@
+ @depends(target)
+ def midir_linux_support(target):
+     return (
+-        target.kernel == "Linux" and target.os != "Android" and target.cpu != "riscv64"
++        target.kernel == "Linux" and target.os != "Android" and target.cpu != "riscv64" and target.raw_os != "linux-musl"
+     )
+ 
+ 
