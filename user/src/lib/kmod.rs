@@ -22,7 +22,9 @@ pub fn load(name: &str) -> io::Result<()> {
         return Ok(());
     }
     if e.raw_os_error() == Some(libc::ENODEV) {
-        return Err(io::Error::other("no such device"));
+        // QEMU に装置がない (画面とキーボード・マウスは bin/run.sh を AIOS_DISPLAY=1 で起動したときだけ)
+        let hint = if name.starts_with("virtio_gpu") || name.starts_with("virtio_input") { " (QEMU: AIOS_DISPLAY=1 bin/run.sh)" } else { "" };
+        return Err(io::Error::other(format!("no such device{}", hint)));
     }
     Err(e)
 }
