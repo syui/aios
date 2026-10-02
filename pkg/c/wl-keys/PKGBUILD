@@ -1,0 +1,23 @@
+# wl-keys: Wayland のキーボードを libxkbcommon で読み、押したキーを文字にして出す小さな C のアプリ
+#   コンポジタ (aiwm) が渡すキーマップ (XKB_V1、xkb_layout の us / jp) と修飾キーの確かめ
+pkgname=wl-keys
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Tiny Wayland client that prints the keys it gets, read with libxkbcommon'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('musl' 'wayland' 'libxkbcommon')
+source=(wl-keys.c xdg-shell-client-protocol.h xdg-shell-protocol.c)
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps libffi wayland libxkbcommon
+  $CC -dynamic -O2 -s $CPPFLAGS -I. -o wl-keys wl-keys.c xdg-shell-protocol.c -L"$SYSROOT/lib" -lwayland-client -lxkbcommon
+}
+
+package() {
+  install -Dm755 wl-keys "$pkgdir/opt/c/bin/wl-keys"
+}

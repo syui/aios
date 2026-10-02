@@ -1,0 +1,48 @@
+# libxkbcommon: キーボードのキーマップ (xkb) を読み、キーを文字や keysym にするライブラリ
+#   Wayland のアプリは、コンポジタ (aiwm) が渡すキーマップをこれで読む。共有ライブラリ (/opt/c/lib)
+#   キーマップの名前から組み立てる (xkeyboard-config) ことはせず、渡された文字列から読むのに使う
+# ビルドには meson と ninja と bison が要る
+pkgname=libxkbcommon
+pkgver=1.11.0
+pkgrel=1
+pkgdesc='Keymap handling library for toolkits and window systems (shared, for aios)'
+arch=('aarch64')
+url='https://xkbcommon.org/'
+license=('MIT')
+depends=('musl')
+makedepends=('meson' 'ninja' 'bison')
+source=("git+https://github.com/xkbcommon/libxkbcommon#tag=xkbcommon-$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cat > "$srcdir/cross.ini" <<INI
+[binaries]
+c = ['zig', 'cc', '-target', 'aarch64-linux-musl']
+ar = ['zig', 'ar']
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-O2']
+c_link_args = ['-s']
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+INI
+  unset CPPFLAGS LDFLAGS CFLAGS
+  cd libxkbcommon
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib \
+    -Denable-x11=false -Denable-wayland=false -Denable-docs=false -Denable-xkbregistry=false \
+    -Denable-tools=false -Denable-bash-completion=false -Dxkb-config-root=/usr/share/X11/xkb
+  ninja -C build
+}
+
+package() {
+  cd libxkbcommon
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/libxkbcommon/LICENSE"
+}
