@@ -1,0 +1,46 @@
+# curl: URL でデータをやりとりする道具とライブラリ (git の https に使う)
+# TLS は mbedtls、圧縮は zlib。静的な curl と libcurl.a を /opt/c に入れる
+pkgname=curl
+pkgver=8.22.0
+pkgrel=1
+pkgdesc='Command line tool and library for transferring data with URLs (mbedTLS, static)'
+arch=('aarch64')
+url='https://curl.se'
+license=('curl')
+depends=('ca-certificates')
+source=("https://curl.se/download/curl-$pkgver.tar.xz")
+sha256sums=('f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7')
+
+prepare() {
+  rm -rf "curl-$pkgver"
+  tar -xJf "curl-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib mbedtls
+  cd "curl-$pkgver"
+  # 外のライブラリは zlib と mbedtls だけ。IPv6 はまだない (aios の方針)
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+    --disable-shared --enable-static \
+    --with-mbedtls="$SYSROOT" --with-zlib="$SYSROOT" \
+    --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --without-ca-path \
+    --disable-ipv6 --disable-ldap --disable-ldaps --disable-rtsp --disable-dict \
+    --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smtp \
+    --disable-gopher --disable-mqtt --disable-docs --disable-manual \
+    --without-libpsl --without-brotli --without-zstd --without-nghttp2 \
+    --without-libidn2 --without-libssh2 --without-librtmp
+  make -j"$(nproc)" LDFLAGS="$LDFLAGS -all-static"
+}
+
+package() {
+  # install は ranlib (zig) を呼ぶ
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "curl-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share"
+  # libtool の .la は要らない
+  rm -f "$pkgdir"/opt/c/lib/*.la
+}
