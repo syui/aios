@@ -297,6 +297,12 @@ fn open_socket() -> Result<(String, RawFd), String> {
         unsafe { libc::chmod(format!("{}\0", dir).as_ptr() as *const _, 0o700) };
         let path = format!("{}/wayland-0", dir);
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(format!(
+                "unix socket: {} (the kernel is too old: sudo aipkg -Syu unix, then reboot)",
+                std::io::Error::last_os_error()
+            ));
+        }
         let (a, len) = wl::sockaddr(&path).map_err(|e| e.to_string())?;
         if unsafe { libc::bind(fd, &a as *const _ as *const libc::sockaddr, len) } != 0 || unsafe { libc::listen(fd, 16) } != 0 {
             last = format!("{}: {} (another aiwm?)", path, std::io::Error::last_os_error());
