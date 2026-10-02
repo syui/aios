@@ -1,0 +1,16 @@
+# aifont: aios のフォント (JetBrains Mono + Nerd Fonts + syui の字)。git.syui.ai/ai/font をコミットで固定
+#   /usr/share/fonts/aifont/aifont.ttf (デスクトップのプログラムが使う)
+pkgname=aifont
+pkgver=2.304
+pkgrel=1
+pkgdesc='aifont: JetBrains Mono with Nerd Fonts and custom glyphs'
+arch=('any')
+url='https://git.syui.ai/ai/font'
+license=('OFL-1.1' 'MIT')
+source=("git+https://git.syui.ai/ai/font#commit=96d2478331dfa11c0fe2a4da98b4c7143ec4fbdd")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm644 font/aifont.ttf "$pkgdir/usr/share/fonts/aifont/aifont.ttf"
+  install -Dm644 font/LICENSE "$pkgdir/usr/share/licenses/aifont/LICENSE"
+}

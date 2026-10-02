@@ -4,6 +4,7 @@
 /rootfs
 /user/target
 /boot/target
+/desktop/target
 /build
 /disk.img
 /repo

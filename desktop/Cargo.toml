@@ -1,0 +1,20 @@
+# aios のデスクトップ ([desktop] リポジトリのパッケージになる)。最小構成には入らない
+[package]
+name = "aios-desktop"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "aisplash"
+path = "src/bin/aisplash.rs"
+
+[dependencies]
+libc = "0.2"
+# フォント (aifont) を点にする / PNG (アイコン) を読む。どちらも Rust だけのもの
+fontdue = "0.9"
+png = "0.18"
+
+[profile.release]
+panic = "abort"
+strip = true

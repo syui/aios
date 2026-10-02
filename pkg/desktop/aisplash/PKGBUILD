@@ -1,0 +1,25 @@
+# aisplash: 画面に aios のロゴと文字を出す (デスクトップの最初のプログラム)。このリポジトリの desktop/ から
+pkgname=aisplash
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Show the aios logo and text on the screen (/dev/fb0)'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('aifont' 'ai-icons')
+makedepends=('rustup')
+
+pkgver() {
+  cd "$startdir/../../.."
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- desktop)" "$(git log -1 --format=%h -- desktop)"
+}
+
+build() {
+  cd "$startdir/../../../desktop"
+  unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release --bin aisplash
+}
+
+package() {
+  install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aisplash" "$pkgdir/usr/bin/aisplash"
+}
