@@ -39,6 +39,8 @@ const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
+const F_ADD_SEALS: u64 = 1033;
+const F_GET_SEALS: u64 = 1034;
 const FD_CLOEXEC: u64 = 1;
 
 const O_NONBLOCK: u32 = 0o4000;
@@ -547,6 +549,16 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     Ok(0)
 }
 
+/// memfd_create: どこにも名前のない tmpfs のファイル (Wayland の共有メモリなど)
+pub fn memfd_create(name: usize, flags: u64) -> R {
+    const MFD_CLOEXEC: u64 = 1;
+    let name = user_str(name)?;
+    let ino = crate::tmpfs::anon_file();
+    let f = file::new(Kind::Inode(ino, alloc::format!("/memfd:{} (deleted)", name)), file::O_RDWR);
+    let fd = proc::current().files().add(f, flags & MFD_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+    Ok(fd as i64)
+}
+
 pub fn ftruncate(fd: u64, len: i64) -> R {
     if len < 0 {
         return Err(-EINVAL);
@@ -716,6 +728,8 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             }
             Ok(0)
         }
+        // 封 (seal) は覚えない: 受けつけるだけ
+        F_ADD_SEALS | F_GET_SEALS => Ok(0),
         F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let mut p = p.borrow_mut();

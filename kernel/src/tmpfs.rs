@@ -239,6 +239,18 @@ impl TmpInode {
     }
 }
 
+/// どのディレクトリにも入っていないファイル (memfd_create)。みんな同じ見えない tmpfs のもの
+pub fn anon_file() -> InodeRef {
+    static mut FS: usize = 0;
+    let fs = unsafe {
+        if FS == 0 {
+            FS = new_fs_id();
+        }
+        FS
+    };
+    TmpInode::new(fs, S_IFREG | 0o600, Node::File(Data::Owned(Pages::new())))
+}
+
 pub fn new_root() -> Rc<TmpInode> {
     TmpInode::new(new_fs_id(), S_IFDIR | 0o755, Node::Dir(BTreeMap::new()))
 }

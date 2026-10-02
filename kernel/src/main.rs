@@ -38,6 +38,7 @@ mod syscall;
 mod sysfile;
 mod timer;
 mod tmpfs;
+mod unix;
 mod trap;
 mod vfat;
 mod vfs;
