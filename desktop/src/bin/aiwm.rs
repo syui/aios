@@ -3,7 +3,8 @@
 //   $XDG_RUNTIME_DIR/wayland-0 で Wayland のクライアント (aiterm など) を待つ。
 //   窓は横に並べる (sway の splith)。設定は ~/.config/aiwm/config か /etc/aiwm/config (sway と同じ書き方)
 //
-// できる Wayland: wl_compositor, wl_shm, wl_seat (キーボード、ポインタ), wl_output, xdg_wm_base (toplevel)。
+// できる Wayland: wl_compositor, wl_subcompositor, wl_shm, wl_seat (キーボード、ポインタ), wl_output,
+//   xdg_wm_base (toplevel)。
 // クライアントの絵 (wl_shm のバッファ) は commit のときに写して、すぐ release する
 #[path = "../lib/fb.rs"]
 mod fb;
@@ -33,7 +34,7 @@ const BAR_FONT: f32 = 14.0;
 const TAB_H: i32 = 22;
 
 // グローバル (wl_registry で見せるもの): (名前, インターフェース, 版)
-const GLOBALS: [(u32, &str, u32); 6] = [
+const GLOBALS: [(u32, &str, u32); 7] = [
     (1, "wl_compositor", 4),
     (2, "wl_shm", 1),
     (3, "wl_seat", 5),
@@ -41,6 +42,8 @@ const GLOBALS: [(u32, &str, u32); 6] = [
     (5, "xdg_wm_base", 2),
     // クリップボードとドラッグ (まだ中身は運ばない。GTK はこれがないと seat を作らない)
     (6, "wl_data_device_manager", 3),
+    // 窓の中の子の窓 (Firefox はページの中身をこれに描く)
+    (7, "wl_subcompositor", 1),
 ];
 
 enum Obj {
@@ -65,6 +68,9 @@ enum Obj {
     DataManager,
     DataSource,
     DataDevice,
+    Subcompositor,
+    /// wl_subsurface: 子の surface
+    Subsurface(u32),
 }
 
 /// 要求を振り分けるための Obj の種類
@@ -90,6 +96,8 @@ enum K {
     DataManager,
     DataSource,
     DataDevice,
+    Subcompositor,
+    Subsurface(u32),
 }
 
 fn kind(o: &Obj) -> K {
@@ -114,6 +122,8 @@ fn kind(o: &Obj) -> K {
         Obj::DataManager => K::DataManager,
         Obj::DataSource => K::DataSource,
         Obj::DataDevice => K::DataDevice,
+        Obj::Subcompositor => K::Subcompositor,
+        Obj::Subsurface(s) => K::Subsurface(*s),
     }
 }
 
@@ -149,6 +159,8 @@ struct Buffer {
     w: usize,
     h: usize,
     stride: usize,
+    /// wl_shm の形式: 0 = ARGB8888、1 = XRGB8888 (アルファは使わない)
+    format: u32,
 }
 
 #[derive(Default)]
@@ -167,6 +179,11 @@ struct Surface {
     sent: Option<(i32, i32, bool, bool, u8)>,
     /// xdg_surface.set_window_geometry: 絵の中の「窓」の場所 (影などを除いたところ)
     geometry: Option<(i32, i32, i32, i32)>,
+    /// subsurface なら親の surface と、親の中の場所
+    parent: Option<u32>,
+    pos: (i32, i32),
+    /// 子を持つ surface の重なり順 (下から)。自分自身も入る。空なら自分だけ
+    stack: Vec<u32>,
 }
 
 struct Client {
@@ -303,6 +320,10 @@ fn main() {
     let mut env = vec![("XDG_RUNTIME_DIR".to_string(), dir.clone()), ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string())];
     if !config.layout.is_empty() {
         env.push(("XKB_DEFAULT_LAYOUT".into(), config.layout.clone()));
+    }
+    // GTK (firefox など、[c] のもの) は /opt/c/share の schema やアイコンを XDG_DATA_DIRS で探す
+    if std::env::var_os("XDG_DATA_DIRS").is_none() {
+        env.push(("XDG_DATA_DIRS".into(), "/opt/c/share:/usr/local/share:/usr/share".into()));
     }
     let (w, h) = (fb.width as i32, fb.height as i32);
     let mut wm = Wm {
@@ -720,6 +741,7 @@ impl Wm {
                     4 => Obj::Output,
                     5 => Obj::WmBase,
                     6 => Obj::DataManager,
+                    7 => Obj::Subcompositor,
                     _ => {
                         c.dead = true;
                         return;
@@ -768,6 +790,49 @@ impl Wm {
             (K::DataDevice, 2) => self.destroy(cid, m.id),
             (K::DataDevice, _) => {}
             (K::Region, _) | (K::Positioner, _) => {}
+            // wl_subcompositor: destroy (0)、get_subsurface (1)
+            (K::Subcompositor, 0) => self.destroy(cid, m.id),
+            (K::Subcompositor, 1) => {
+                let nid = m.uint();
+                let (sid, pid) = (m.uint(), m.uint());
+                if sid == pid || !c.surfaces.contains_key(&sid) || !c.surfaces.contains_key(&pid) {
+                    c.dead = true;
+                    return;
+                }
+                c.objs.insert(nid, Obj::Subsurface(sid));
+                let s = c.surfaces.get_mut(&sid).unwrap();
+                s.parent = Some(pid);
+                s.pos = (0, 0);
+                let p = c.surfaces.get_mut(&pid).unwrap();
+                if p.stack.is_empty() {
+                    p.stack.push(pid);
+                }
+                p.stack.push(sid);
+            }
+            (K::Subcompositor, _) => {}
+            // wl_subsurface: destroy (0)、set_position (1)、place_above (2)、place_below (3)、set_sync (4)、set_desync (5)。
+            // commit はいつもすぐ見せる (desync と同じ)
+            (K::Subsurface(sid), 0) => {
+                self.destroy(cid, m.id);
+                self.detach_sub(cid, sid);
+            }
+            (K::Subsurface(sid), 1) => {
+                let pos = (m.int(), m.int());
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.pos = pos;
+                }
+                self.mark_surface(cid, sid);
+            }
+            (K::Subsurface(sid), op @ (2 | 3)) => {
+                let sib = m.uint();
+                let Some(pid) = c.surfaces.get(&sid).and_then(|s| s.parent) else { return };
+                let Some(p) = c.surfaces.get_mut(&pid) else { return };
+                p.stack.retain(|&x| x != sid);
+                let i = p.stack.iter().position(|&x| x == sib).unwrap_or(p.stack.len() - 1);
+                p.stack.insert(if op == 2 { i + 1 } else { i }, sid);
+                self.mark_surface(cid, sid);
+            }
+            (K::Subsurface(_), _) => {}
             (K::Shm, 0) => {
                 let nid = m.uint();
                 let fd = c.conn.take_fd();
@@ -781,14 +846,14 @@ impl Wm {
             }
             (K::Pool, 0) => {
                 let nid = m.uint();
-                let (offset, w, h, stride, _format) = (m.int(), m.int(), m.int(), m.int(), m.uint());
+                let (offset, w, h, stride, format) = (m.int(), m.int(), m.int(), m.int(), m.uint());
                 let Some(Obj::Pool(pool)) = c.objs.get(&m.id) else { return };
                 let pool = pool.clone();
                 if offset < 0 || w <= 0 || h <= 0 || stride < w * 4 {
                     c.dead = true;
                     return;
                 }
-                c.objs.insert(nid, Obj::Buffer(Buffer { pool, offset: offset as usize, w: w as usize, h: h as usize, stride: stride as usize }));
+                c.objs.insert(nid, Obj::Buffer(Buffer { pool, offset: offset as usize, w: w as usize, h: h as usize, stride: stride as usize, format }));
             }
             (K::Pool, 1) => self.destroy(cid, m.id),
             (K::Pool, 2) => {
@@ -803,8 +868,16 @@ impl Wm {
             (K::Surface, 0) => {
                 let sid = m.id;
                 self.destroy(cid, sid);
+                self.detach_sub(cid, sid);
                 let c = self.clients.get_mut(&cid).unwrap();
-                c.surfaces.remove(&sid);
+                if let Some(s) = c.surfaces.remove(&sid) {
+                    // 子は親をなくす (もう見えない)
+                    for k in s.stack {
+                        if let Some(ks) = c.surfaces.get_mut(&k).filter(|_| k != sid) {
+                            ks.parent = None;
+                        }
+                    }
+                }
                 self.unmap(Win { client: cid, surface: sid });
             }
             (K::Surface, 1) => {
@@ -935,6 +1008,9 @@ impl Wm {
                             let src = unsafe { std::slice::from_raw_parts(p.ptr.add(b.offset + y * b.stride) as *const u32, b.w) };
                             s.image[y * b.w..(y + 1) * b.w].copy_from_slice(src);
                         }
+                        if b.format != 0 {
+                            s.image.iter_mut().for_each(|p| *p |= 0xff00_0000);
+                        }
                         s.iw = b.w;
                         s.ih = b.h;
                     }
@@ -953,8 +1029,37 @@ impl Wm {
             ws.fullscreen = None;
             self.set_focus(Some(w));
             self.relayout();
-        } else if let Some(r) = self.rect_of(w) {
+        } else {
+            self.mark_surface(cid, sid);
+        }
+    }
+
+    /// surface (子の窓でも) が属している窓 (いちばん上の親)
+    fn root_of(&self, cid: usize, mut sid: u32) -> Win {
+        let c = &self.clients[&cid];
+        for _ in 0..32 {
+            match c.surfaces.get(&sid).and_then(|s| s.parent) {
+                Some(p) => sid = p,
+                None => break,
+            }
+        }
+        Win { client: cid, surface: sid }
+    }
+
+    /// surface の絵が変わった: その窓を描きなおす
+    fn mark_surface(&mut self, cid: usize, sid: u32) {
+        if let Some(r) = self.rect_of(self.root_of(cid, sid)) {
             self.mark(r.y, r.y + r.h);
+        }
+    }
+
+    /// subsurface をやめる (親の重なり順から外す)
+    fn detach_sub(&mut self, cid: usize, sid: u32) {
+        self.mark_surface(cid, sid);
+        let c = self.clients.get_mut(&cid).unwrap();
+        let Some(pid) = c.surfaces.get_mut(&sid).and_then(|s| s.parent.take()) else { return };
+        if let Some(p) = c.surfaces.get_mut(&pid) {
+            p.stack.retain(|&x| x != sid);
         }
     }
 
@@ -1382,22 +1487,18 @@ impl Wm {
                 self.fill_rect(outer, color, y0, y1);
             }
             self.fill_rect(r, term_bg(), y0, y1);
-            let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { continue };
-            // 絵のうち窓として見せるところ (set_window_geometry があれば、影などを除いた部分)
+            let Some(c) = self.clients.get(&w.client) else { continue };
+            let Some(s) = c.surfaces.get(&w.surface) else { continue };
+            // 絵のうち窓として見せるところ (set_window_geometry があれば、影などを除いた部分)。
+            // 子の窓もまとめて、その外は切る
             let (iw, ih) = (s.iw as i32, s.ih as i32);
             let (gx, gy, gw, gh) = match s.geometry {
-                Some((x, y, w, h)) => (x.clamp(0, iw), y.clamp(0, ih), w, h),
+                Some((x, y, w, h)) => (x, y, w, h),
                 None => (0, 0, iw, ih),
             };
-            let (vw, vh) = (r.w.min(gw).min(iw - gx).max(0), r.h.min(gh).min(ih - gy).max(0));
+            let clip = Rect { x: r.x, y: r.y.max(y0), w: r.w.min(gw), h: (r.y + r.h.min(gh)).min(y1) - r.y.max(y0) };
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
-            for y in r.y.max(y0)..(r.y + vh).min(y1) {
-                let sy = (y - r.y + gy) as usize;
-                let n = vw as usize;
-                let dst = y as usize * stride + r.x as usize;
-                let src = sy * s.iw + gx as usize;
-                px[dst..dst + n].copy_from_slice(&s.image[src..src + n]);
-            }
+            draw_tree(px, stride, c, w.surface, r.x - gx, r.y - gy, clip, 0);
         }
         if full.is_none() {
             self.draw_bar(y0, y1);
@@ -1604,6 +1705,47 @@ impl Wm {
 }
 
 /// 時計の文字 (年-月-日 時:分)
+/// surface とその子の窓を、下から順に (ox, oy) を左上にして描く。clip の外は描かない。
+/// 透明 (アルファ 0) のところは描かず、半透明は重ねる (premultiplied)
+#[allow(clippy::too_many_arguments)]
+fn draw_tree(px: &mut [u32], stride: usize, c: &Client, sid: u32, ox: i32, oy: i32, clip: Rect, depth: u32) {
+    let Some(s) = c.surfaces.get(&sid) else { return };
+    let own = [sid];
+    let order: &[u32] = if s.stack.is_empty() { &own } else { &s.stack };
+    for &k in order {
+        if k != sid {
+            if depth < 8 {
+                if let Some(ks) = c.surfaces.get(&k) {
+                    draw_tree(px, stride, c, k, ox + ks.pos.0, oy + ks.pos.1, clip, depth + 1);
+                }
+            }
+            continue;
+        }
+        let (iw, ih) = (s.iw as i32, s.ih as i32);
+        let x0 = ox.max(clip.x);
+        let x1 = (ox + iw).min(clip.x + clip.w);
+        let ya = oy.max(clip.y);
+        let yb = (oy + ih).min(clip.y + clip.h);
+        if x0 >= x1 || ya >= yb {
+            continue;
+        }
+        for y in ya..yb {
+            let src = &s.image[((y - oy) as usize) * s.iw + (x0 - ox) as usize..][..(x1 - x0) as usize];
+            let dst = &mut px[y as usize * stride + x0 as usize..][..(x1 - x0) as usize];
+            for (d, &p) in dst.iter_mut().zip(src) {
+                let a = p >> 24;
+                if a == 255 {
+                    *d = p;
+                } else if a != 0 {
+                    let inv = 255 - a;
+                    let ch = |sh: u32| (((p >> sh) & 255) + (((*d >> sh) & 255) * inv) / 255).min(255) << sh;
+                    *d = ch(16) | ch(8) | ch(0);
+                }
+            }
+        }
+    }
+}
+
 fn clock() -> String {
     let t = unsafe { libc::time(std::ptr::null_mut()) };
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
