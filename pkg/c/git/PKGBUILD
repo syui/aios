@@ -1,0 +1,52 @@
+# git: 分散型のバージョン管理 (C の拡張。https は curl、圧縮は zlib)
+# 静的なバイナリを /opt/c に入れる。perl / python / tcl / gettext には頼らない
+# git の Rust の部品 (libgitcore、Git 3.0 からは必須) は aarch64-unknown-linux-musl で作ってつなぐ
+# (Rust の std が使う _Unwind_* は Zig の libunwind)
+pkgname=git
+pkgver=2.56.0
+pkgrel=1
+pkgdesc='Distributed version control system (static, https via curl + mbedTLS)'
+arch=('aarch64')
+url='https://git-scm.com'
+license=('GPL-2.0-only')
+depends=('ca-certificates')
+makedepends=('rustup')
+source=("https://mirrors.edge.kernel.org/pub/software/scm/git/git-$pkgver.tar.xz")
+sha256sums=('26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3')
+
+prepare() {
+  rm -rf "git-$pkgver"
+  tar -xJf "git-$pkgver.tar.xz"
+}
+
+# git の Makefile に渡す設定 (build と package で同じものを)
+_make() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib mbedtls curl
+  cd "$srcdir/git-$pkgver"
+  # このリポジトリの .cargo/config (カーネルのターゲット) ではなく、aios のユーザーランドのターゲットで
+  export CARGO_BUILD_TARGET=aarch64-unknown-linux-musl CARGO_TARGET_DIR="$srcdir/git-$pkgver/target"
+  make "$@" \
+    CC="$CC" AR="$AR" CFLAGS="$CFLAGS $CPPFLAGS" LDFLAGS="$LDFLAGS -lunwind" \
+    uname_S=Linux uname_M=aarch64 uname_O=GNU/Linux uname_R=6 \
+    prefix="$PREFIX" gitexecdir="$PREFIX/libexec/git-core" \
+    CURLDIR="$SYSROOT" CURL_LDFLAGS="-lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz" \
+    ZLIB_PATH="$SYSROOT" \
+    NO_OPENSSL=YesPlease NO_EXPAT=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease \
+    NO_TCLTK=YesPlease NO_GETTEXT=YesPlease NO_ICONV=YesPlease NO_REGEX=NeedsStartEnd \
+    NO_INSTALL_HARDLINKS=YesPlease INSTALL_SYMLINKS=YesPlease \
+    NO_CROSS_DIRECTORY_HARDLINKS=YesPlease SKIP_DASHED_BUILT_INS=YesPlease LINK_FUZZ_PROGRAMS=
+}
+
+build() {
+  _make -j"$(nproc)" all
+}
+
+package() {
+  _make DESTDIR="$pkgdir" install
+  # perl が要るもの (cvsserver) は入れない
+  rm -f "$pkgdir/opt/c/bin/git-cvsserver" "$pkgdir/opt/c/libexec/git-core/git-cvsserver"
+  rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/opt/c/share/perl5" "$pkgdir/opt/c/share/gitweb" \
+    "$pkgdir/opt/c/share/git-gui" "$pkgdir/opt/c/share/gitk" "$pkgdir/opt/c/share/bash-completion"
+}

@@ -40,7 +40,8 @@ zig_env() {
   export CC="zig cc -target aarch64-linux-musl"
   export CXX="zig c++ -target aarch64-linux-musl"
   export AR="zig ar" RANLIB="zig ranlib"
-  export CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static"
+  # -s: デバッグ情報は入れない (Zig は入れるのが既定)
+  export CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static -s"
   export ZIG_GLOBAL_CACHE_DIR=$top/build/zig/cache
   unset RUSTFLAGS
 }
