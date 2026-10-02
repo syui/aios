@@ -553,8 +553,13 @@ pub fn scheduler() -> ! {
             }
             crate::smp::unlock();
             crate::timer::idle(true);
+            // 割り込みを止めたまま wfi で眠る (止めていても、来ている割り込みがあれば起きる)。
+            // 先に割り込みを開けると、そのすきに来た IPI をここで受けてしまい、そのあとの wfi で
+            // 仕事があるのに眠りこむ (ほかの CPU が起こしたのに起きない)
+            unsafe { core::arch::asm!("dsb sy", "wfi") };
+            // 起こした割り込みをここで受ける
             crate::trap::intr_on();
-            unsafe { core::arch::asm!("wfi") };
+            unsafe { core::arch::asm!("isb") };
             crate::trap::intr_off();
             crate::timer::idle(false);
             crate::smp::set_idle(false);
