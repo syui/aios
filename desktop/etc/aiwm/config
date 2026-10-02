@@ -11,15 +11,51 @@ set $term aiterm
 bindsym $mod+Return exec $term
 bindsym $mod+Shift+q kill
 
-# 窓を移る / 窓を動かす (窓は横に並ぶ)
+# 窓を移る / 窓を動かす
 bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
 bindsym $mod+l focus right
 bindsym $mod+Left focus left
+bindsym $mod+Down focus down
+bindsym $mod+Up focus up
 bindsym $mod+Right focus right
 bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
 bindsym $mod+Shift+l move right
 bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Down move down
+bindsym $mod+Shift+Up move up
 bindsym $mod+Shift+Right move right
+
+# ワークスペース
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+3 workspace number 3
+bindsym $mod+4 workspace number 4
+bindsym $mod+5 workspace number 5
+bindsym $mod+6 workspace number 6
+bindsym $mod+7 workspace number 7
+bindsym $mod+8 workspace number 8
+bindsym $mod+9 workspace number 9
+bindsym $mod+0 workspace number 10
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+bindsym $mod+Shift+3 move container to workspace number 3
+bindsym $mod+Shift+4 move container to workspace number 4
+bindsym $mod+Shift+5 move container to workspace number 5
+bindsym $mod+Shift+6 move container to workspace number 6
+bindsym $mod+Shift+7 move container to workspace number 7
+bindsym $mod+Shift+8 move container to workspace number 8
+bindsym $mod+Shift+9 move container to workspace number 9
+bindsym $mod+Shift+0 move container to workspace number 10
+
+# 並べ方: 横 (splith) と縦 (splitv) を切りかえ / タブ / 全画面
+#   (ワークスペースごと。sway のように入れ子にはしない)
+bindsym $mod+e layout toggle split
+bindsym $mod+w layout tabbed
+bindsym $mod+f fullscreen
 
 # aiwm を終わる
 bindsym $mod+Shift+e exit
@@ -29,6 +65,12 @@ bindsym $mod+Shift+e exit
 
 # 背景の色
 # output * bg #0e1018 solid_color
+
+# バー: ワークスペース、作業中の窓の名前、右に時計 (status_command があれば、その最後の行)
+bar {
+    position top
+    # status_command while date +'%Y-%m-%d %H:%M:%S'; do sleep 1; done
+}
 
 # 起動したときに動かすもの
 exec $term
