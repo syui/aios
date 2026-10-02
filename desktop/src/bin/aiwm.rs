@@ -33,12 +33,14 @@ const BAR_FONT: f32 = 14.0;
 const TAB_H: i32 = 22;
 
 // グローバル (wl_registry で見せるもの): (名前, インターフェース, 版)
-const GLOBALS: [(u32, &str, u32); 5] = [
+const GLOBALS: [(u32, &str, u32); 6] = [
     (1, "wl_compositor", 4),
     (2, "wl_shm", 1),
     (3, "wl_seat", 5),
     (4, "wl_output", 2),
     (5, "xdg_wm_base", 2),
+    // クリップボードとドラッグ (まだ中身は運ばない。GTK はこれがないと seat を作らない)
+    (6, "wl_data_device_manager", 3),
 ];
 
 enum Obj {
@@ -60,6 +62,9 @@ enum Obj {
     XdgSurface(u32),
     Toplevel(u32),
     Positioner,
+    DataManager,
+    DataSource,
+    DataDevice,
 }
 
 /// 要求を振り分けるための Obj の種類
@@ -82,6 +87,9 @@ enum K {
     XdgSurface(u32),
     Toplevel(u32),
     Positioner,
+    DataManager,
+    DataSource,
+    DataDevice,
 }
 
 fn kind(o: &Obj) -> K {
@@ -103,6 +111,9 @@ fn kind(o: &Obj) -> K {
         Obj::XdgSurface(s) => K::XdgSurface(*s),
         Obj::Toplevel(s) => K::Toplevel(*s),
         Obj::Positioner => K::Positioner,
+        Obj::DataManager => K::DataManager,
+        Obj::DataSource => K::DataSource,
+        Obj::DataDevice => K::DataDevice,
     }
 }
 
@@ -154,6 +165,8 @@ struct Surface {
     title: String,
     /// 最後に送った configure の大きさと、作業中か
     sent: Option<(i32, i32, bool, bool, u8)>,
+    /// xdg_surface.set_window_geometry: 絵の中の「窓」の場所 (影などを除いたところ)
+    geometry: Option<(i32, i32, i32, i32)>,
 }
 
 struct Client {
@@ -706,6 +719,7 @@ impl Wm {
                     3 => Obj::Seat,
                     4 => Obj::Output,
                     5 => Obj::WmBase,
+                    6 => Obj::DataManager,
                     _ => {
                         c.dead = true;
                         return;
@@ -739,6 +753,20 @@ impl Wm {
                 new_obj!(Obj::Region);
             }
             (K::Region, 0) | (K::Callback, _) | (K::Positioner, 0) => self.destroy(cid, m.id),
+            // wl_data_device_manager: create_data_source (0)、get_data_device (1)
+            (K::DataManager, 0) => {
+                new_obj!(Obj::DataSource);
+            }
+            (K::DataManager, 1) => {
+                new_obj!(Obj::DataDevice);
+            }
+            (K::DataManager, _) => {}
+            // wl_data_source: offer (0)、destroy (1)、set_actions (2)
+            (K::DataSource, 1) => self.destroy(cid, m.id),
+            (K::DataSource, _) => {}
+            // wl_data_device: start_drag (0)、set_selection (1)、release (2)
+            (K::DataDevice, 2) => self.destroy(cid, m.id),
+            (K::DataDevice, _) => {}
             (K::Region, _) | (K::Positioner, _) => {}
             (K::Shm, 0) => {
                 let nid = m.uint();
@@ -847,6 +875,12 @@ impl Wm {
                 c.objs.insert(nid, Obj::Toplevel(sid));
                 if let Some(s) = c.surfaces.get_mut(&sid) {
                     s.toplevel = Some(nid);
+                }
+            }
+            (K::XdgSurface(sid), 3) => {
+                let g = (m.int(), m.int(), m.int(), m.int());
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.geometry = (g.2 > 0 && g.3 > 0).then_some(g);
                 }
             }
             (K::XdgSurface(_), _) => {}
@@ -1258,6 +1292,7 @@ impl Wm {
         self.mark(old.1 - 1, old.1 + CURSOR_H + 1);
         self.mark(self.ptr.1 - 1, self.ptr.1 + CURSOR_H + 1);
         let hit = self.win_at(self.ptr.0, self.ptr.1);
+        let goff = hit.map_or((0, 0), |(w, _)| self.geom_off(w));
         let now = hit.map(|(w, _)| w);
         let serial = self.next_serial();
         if now != self.ptr_win {
@@ -1272,7 +1307,7 @@ impl Wm {
             if let Some((n, r)) = hit {
                 if let Some(c) = self.clients.get_mut(&n.client) {
                     for p in c.pointers.clone() {
-                        c.conn.send(p, 0, &[Arg::U(serial), Arg::O(n.surface), Arg::F((self.ptr.0 - r.x) as f64), Arg::F((self.ptr.1 - r.y) as f64)]);
+                        c.conn.send(p, 0, &[Arg::U(serial), Arg::O(n.surface), Arg::F((self.ptr.0 - r.x + goff.0) as f64), Arg::F((self.ptr.1 - r.y + goff.1) as f64)]);
                         c.conn.send(p, 5, &[]);
                     }
                 }
@@ -1281,7 +1316,7 @@ impl Wm {
         } else if let Some((n, r)) = hit {
             if let Some(c) = self.clients.get_mut(&n.client) {
                 for p in c.pointers.clone() {
-                    c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - r.x) as f64), Arg::F((self.ptr.1 - r.y) as f64)]);
+                    c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - r.x + goff.0) as f64), Arg::F((self.ptr.1 - r.y + goff.1) as f64)]);
                     c.conn.send(p, 5, &[]);
                 }
             }
@@ -1348,13 +1383,20 @@ impl Wm {
             }
             self.fill_rect(r, term_bg(), y0, y1);
             let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { continue };
+            // 絵のうち窓として見せるところ (set_window_geometry があれば、影などを除いた部分)
             let (iw, ih) = (s.iw as i32, s.ih as i32);
+            let (gx, gy, gw, gh) = match s.geometry {
+                Some((x, y, w, h)) => (x.clamp(0, iw), y.clamp(0, ih), w, h),
+                None => (0, 0, iw, ih),
+            };
+            let (vw, vh) = (r.w.min(gw).min(iw - gx).max(0), r.h.min(gh).min(ih - gy).max(0));
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
-            for y in r.y.max(y0)..(r.y + r.h.min(ih)).min(y1) {
-                let sy = (y - r.y) as usize;
-                let n = r.w.min(iw) as usize;
+            for y in r.y.max(y0)..(r.y + vh).min(y1) {
+                let sy = (y - r.y + gy) as usize;
+                let n = vw as usize;
                 let dst = y as usize * stride + r.x as usize;
-                px[dst..dst + n].copy_from_slice(&s.image[sy * s.iw..sy * s.iw + n]);
+                let src = sy * s.iw + gx as usize;
+                px[dst..dst + n].copy_from_slice(&s.image[src..src + n]);
             }
         }
         if full.is_none() {
@@ -1364,6 +1406,11 @@ impl Wm {
             self.draw_cursor(y0, y1);
         }
         self.fb.present_rows(y0 as usize, y1 as usize);
+    }
+
+    /// 窓の絵の中で、窓が始まるところ (set_window_geometry の x, y)。ポインタの場所をずらすのに使う
+    fn geom_off(&self, w: Win) -> (i32, i32) {
+        self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)).and_then(|s| s.geometry).map_or((0, 0), |g| (g.0, g.1))
     }
 
     fn title_of(&self, w: Win) -> String {

@@ -2,8 +2,8 @@
 # 静的なライブラリ (libz.a) とヘッダーを /opt/c に入れる。ビルドは pkg/c/zig.sh の Zig (aarch64-linux-musl)
 pkgname=zlib
 pkgver=1.3.2
-pkgrel=1
-pkgdesc='Compression library implementing the deflate method (static, for aios)'
+pkgrel=2
+pkgdesc='Compression library implementing the deflate method (static and shared, for aios)'
 arch=('aarch64')
 url='https://zlib.net'
 license=('Zlib')
@@ -19,14 +19,24 @@ build() {
   . "$startdir/../zig.sh"
   zig_env
   cd "zlib-$pkgver"
-  # configure は CC と AR を見る (クロスなので CHOST も)
-  CHOST=aarch64-linux-musl ./configure --prefix="$PREFIX" --static
+  # configure は CC と AR を見る (クロスなので CHOST も)。静的 (libz.a、curl や git が使う) と
+  # 共有 (libz.so、libpng や glib などの共有ライブラリが使う) の両方
+  # configure は Zig を共有ライブラリを作れるコンパイラと思わないので、-fPIC の libz.a から自分で作る
+  CFLAGS="-O2 -fPIC" CHOST=aarch64-linux-musl ./configure --prefix="$PREFIX" --static
   make libz.a
+  $CC -shared -Wl,-s -Wl,-soname,libz.so.1 -Wl,--version-script,zlib.map \
+    -o libz.so.$pkgver -Wl,--whole-archive libz.a -Wl,--no-whole-archive
 }
 
 package() {
+  # install でリンクしなおすことがある (libtool) ので Zig を使えるようにしておく
+  . "$startdir/../zig.sh"
+  zig_env
   cd "zlib-$pkgver"
   make DESTDIR="$pkgdir" install
+  install -m755 libz.so.$pkgver "$pkgdir/opt/c/lib/"
+  ln -s libz.so.$pkgver "$pkgdir/opt/c/lib/libz.so.1"
+  ln -s libz.so.1 "$pkgdir/opt/c/lib/libz.so"
   # 文書 (man) は入れない
   rm -rf "$pkgdir/opt/c/share"
 }

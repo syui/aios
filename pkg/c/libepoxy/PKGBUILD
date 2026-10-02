@@ -1,0 +1,35 @@
+# libepoxy: Library handling OpenGL function pointer management (shared, for aios; EGL, no GLX)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=libepoxy
+pkgver=1.5.10
+pkgrel=1
+pkgdesc='Library handling OpenGL function pointer management (shared, for aios; EGL, no GLX)'
+arch=('aarch64')
+license=('MIT')
+depends=('musl')
+# EGL のヘッダー (Khronos) を使う。EGL そのもの (libEGL) は動くときに dlopen で探す (Mesa があれば)
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://download.gnome.org/sources/libepoxy/${pkgver%.*}/libepoxy-$pkgver.tar.xz")
+sha256sums=('072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623')
+
+prepare() {
+  rm -rf "libepoxy-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross egl-headers
+  cd "libepoxy-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Degl=yes -Dglx=no -Dx11=false -Dtests=false -Ddocs=false
+  ninja -C build
+}
+
+package() {
+  cd "libepoxy-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

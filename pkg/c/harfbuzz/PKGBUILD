@@ -1,0 +1,34 @@
+# harfbuzz: OpenType text shaping engine (shared, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=harfbuzz
+pkgver=11.2.1
+pkgrel=1
+pkgdesc='OpenType text shaping engine (shared, for aios)'
+arch=('aarch64')
+license=('MIT')
+depends=('musl' 'freetype2' 'glib2')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://github.com/harfbuzz/harfbuzz/releases/download/$pkgver/harfbuzz-$pkgver.tar.xz")
+sha256sums=('093714c8548a285094685f0bdc999e202d666b59eeb3df2ff921ab68b8336a49')
+
+prepare() {
+  rm -rf "harfbuzz-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross zlib libpng freetype2 pcre2 libffi glib2
+  cd "harfbuzz-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dfreetype=enabled -Dglib=enabled -Dgobject=enabled -Dicu=disabled -Dcairo=disabled -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled -Dutilities=disabled -Dbenchmark=disabled
+  ninja -C build
+}
+
+package() {
+  cd "harfbuzz-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

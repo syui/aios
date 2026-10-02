@@ -1,0 +1,34 @@
+# pixman: Low-level pixel manipulation library (shared, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=pixman
+pkgver=0.46.4
+pkgrel=1
+pkgdesc='Low-level pixel manipulation library (shared, for aios)'
+arch=('aarch64')
+license=('MIT')
+depends=('musl')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://www.cairographics.org/releases/pixman-$pkgver.tar.gz")
+sha256sums=('d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c')
+
+prepare() {
+  rm -rf "pixman-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross 
+  cd "pixman-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dtests=disabled -Ddemos=disabled -Dgtk=disabled -Dlibpng=disabled
+  ninja -C build
+}
+
+package() {
+  cd "pixman-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

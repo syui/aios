@@ -1,0 +1,34 @@
+# fontconfig: Library for configuring and customizing font access (shared, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=fontconfig
+pkgver=2.17.1
+pkgrel=1
+pkgdesc='Library for configuring and customizing font access (shared, for aios)'
+arch=('aarch64')
+license=('HPND AND Unicode-DFS-2016')
+depends=('musl' 'freetype2' 'expat')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/$pkgver/fontconfig-$pkgver.tar.xz")
+sha256sums=('9f5cae93f4fffc1fbc05ae99cdfc708cd60dfd6612ffc0512827025c026fa541')
+
+prepare() {
+  rm -rf "fontconfig-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross zlib libpng freetype2 expat
+  cd "fontconfig-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Ddoc=disabled -Dtests=disabled -Dtools=disabled -Dcache-build=disabled -Dnls=disabled -Dsysconfdir=/etc -Dlocalstatedir=/var -Ddefault-fonts-dirs=/usr/share/fonts -Dcache-dir=/var/cache/fontconfig
+  ninja -C build
+}
+
+package() {
+  cd "fontconfig-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

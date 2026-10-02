@@ -1,0 +1,36 @@
+# gtk3: GObject-based multi-platform GUI toolkit (GTK 3; Wayland only, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=gtk3
+pkgver=3.24.50
+pkgrel=2
+pkgdesc='GObject-based multi-platform GUI toolkit (GTK 3; Wayland only, for aios)'
+arch=('aarch64')
+license=('LGPL-2.1-or-later')
+depends=('musl' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2' 'atk' 'libepoxy' 'wayland' 'libxkbcommon' 'fribidi' 'harfbuzz' 'fontconfig' 'freetype2' 'xkeyboard-config')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://download.gnome.org/sources/gtk/${pkgver%.*}/gtk-$pkgver.tar.xz")
+sha256sums=('399118a5699314622165a11b769ea9b6ed68e037b6d46d57cfcf4851dec07529')
+
+prepare() {
+  rm -rf "gtk-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross zlib libpng freetype2 expat fontconfig pixman pcre2 libffi glib2 harfbuzz fribidi cairo pango gdk-pixbuf2 atk libepoxy egl-headers wayland libxkbcommon wayland-protocols
+  cd "gtk-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dx11_backend=false -Dwayland_backend=true -Dbroadway_backend=false -Dintrospection=false -Ddemos=true -Dexamples=false -Dtests=false -Dinstalled_tests=false -Dgtk_doc=false -Dman=false -Dprint_backends=file -Dcolord=no -Dcloudproviders=false -Dtracker3=false -Dxinerama=no
+  ninja -C build
+}
+
+package() {
+  cd "gtk-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  # GSettings の schema をまとめる (GTK は動くときに gschemas.compiled を読む)
+  glib-compile-schemas "$pkgdir/opt/c/share/glib-2.0/schemas"
+}

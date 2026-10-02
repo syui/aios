@@ -1,0 +1,30 @@
+# egl-headers: EGL のヘッダー (Khronos の EGL-Registry)。libepoxy や GTK のビルドに使う
+#   EGL/egl.h, eglext.h, eglplatform.h と KHR/khrplatform.h を /opt/c/include に
+_commit=db3425b8246136faccb5e2782b5694960bd6edf1
+pkgname=egl-headers
+pkgver=0.0.1.r${_commit:0:7}
+pkgrel=1
+pkgdesc='EGL headers from the Khronos EGL-Registry'
+arch=('any')
+url='https://github.com/KhronosGroup/EGL-Registry'
+license=('Apache-2.0' 'MIT')
+source=("git+https://github.com/KhronosGroup/EGL-Registry#commit=$_commit")
+sha256sums=('SKIP')
+
+package() {
+  cd EGL-Registry
+  local f
+  for f in EGL/egl.h EGL/eglext.h EGL/eglplatform.h KHR/khrplatform.h; do
+    install -Dm644 api/$f "$pkgdir/opt/c/include/$f"
+  done
+  install -d "$pkgdir/opt/c/lib/pkgconfig"
+  cat > "$pkgdir/opt/c/lib/pkgconfig/egl.pc" <<PC
+prefix=/opt/c
+includedir=\${prefix}/include
+
+Name: egl
+Description: EGL headers (Khronos)
+Version: 1.5
+Cflags: -I\${includedir}
+PC
+}

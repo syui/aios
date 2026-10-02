@@ -10,6 +10,7 @@ arch=('aarch64')
 url='https://xkbcommon.org/'
 license=('MIT')
 depends=('musl')
+optdepends=('xkeyboard-config: build keymaps from names (us, jp ...); GTK needs it')
 makedepends=('meson' 'ninja' 'bison')
 source=("git+https://github.com/xkbcommon/libxkbcommon#tag=xkbcommon-$pkgver")
 sha256sums=('SKIP')
