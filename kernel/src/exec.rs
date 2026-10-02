@@ -1,5 +1,7 @@
-// ELF (静的リンク, ET_EXEC) を新しいアドレス空間に読み込み、
-// Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る
+// ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る。
+//   静的リンク (ET_EXEC) はそのまま、位置によらないもの (ET_DYN、PIE) は PIE_BASE に置く。
+//   PT_INTERP (動的リンク) があれば、そのインタプリタ (ld.so) も INTERP_BASE に置いて、そちらから始める
+//   (AT_BASE にその場所、AT_ENTRY にプログラムの入口を渡す。あとは ld.so が共有ライブラリを読む)
 use crate::memlayout::PGSIZE;
 use crate::vm::{pg_down, pg_up, Backing, PageTable, PROT_EXEC, PROT_READ, PROT_RW, PROT_WRITE};
 use alloc::string::String;
@@ -14,10 +16,19 @@ const ARG_MAX: usize = 2 * 1024 * 1024;
 
 const EACCES: i64 = 13;
 const ENOEXEC: i64 = 8;
+const ENOENT: i64 = 2;
 const ENOMEM: i64 = 12;
 const E2BIG: i64 = 7;
 
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
+const ET_EXEC: usize = 2;
+const ET_DYN: usize = 3;
+/// PIE を置くところ (brk はそのうしろから)
+const PIE_BASE: usize = 0x5555_0000;
+/// ld.so を置くところ (vDSO の下)
+const INTERP_BASE: usize = 0x3e_0000_0000;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
@@ -26,6 +37,7 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
@@ -115,75 +127,23 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
-    // ヘッダとプログラムヘッダだけ先に読む
-    let mut ehdr = [0u8; 64];
-    if ino.read_at(0, &mut ehdr)? < 64 {
-        return Err(-ENOEXEC);
-    }
-    let elf = &ehdr[..];
-    if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || u16_at(elf, 16) != 2 || u16_at(elf, 18) != 183 {
-        return Err(-ENOEXEC);
-    }
-    let entry = u64_at(elf, 24);
-    let phoff = u64_at(elf, 32);
-    let phentsize = u16_at(elf, 54);
-    let phnum = u16_at(elf, 56);
-    if phentsize < 56 || phnum > 64 || phoff + phentsize * phnum > size {
-        return Err(-ENOEXEC);
-    }
-    let mut phdrs = alloc::vec![0u8; phentsize * phnum];
-    ino.read_at(phoff, &mut phdrs)?;
-
     let mut pt = PageTable::new().ok_or(-ENOMEM)?;
-    let mut brk = 0;
-    let mut phdr_va = 0;
-    for i in 0..phnum {
-        let ph = &phdrs[i * phentsize..];
-        if u32_at(ph, 0) != PT_LOAD {
-            continue;
-        }
-        let flags = u32_at(ph, 4);
-        let off = u64_at(ph, 8);
-        let va = u64_at(ph, 16);
-        let filesz = u64_at(ph, 32);
-        let memsz = u64_at(ph, 40);
-        if filesz > memsz || off + filesz > size || va.checked_add(memsz).is_none() {
-            return Err(-ENOEXEC);
-        }
-        let prot = PROT_READ | if flags & PF_W != 0 { PROT_WRITE } else { 0 } | if flags & PF_X != 0 { PROT_EXEC } else { 0 };
-        let (start, end) = (pg_down(va), pg_up(va + memsz));
-        if (va - start) > off {
-            return Err(-ENOEXEC);
-        }
-        if pt.find(start).is_none() && pt.find(end - 1).is_none() {
-            // ふつう: ページはファイルから、触れたときに読む (filesz の先は 0)
-            let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz };
-            pt.map(start, end, prot, false, back).ok_or(-ENOMEM)?;
-        } else {
-            // 前のセグメントとページを分けあう: 残りを無名にして、中身を今読む
-            let mut s = start;
-            while pt.find(s).is_some() {
-                s += PGSIZE;
+    let main = load_elf(&mut pt, &ino, size, PIE_BASE)?;
+    let brk = main.end;
+    // 動的リンク: インタプリタ (ld.so) も読み、そちらから始める
+    let (entry, interp_base) = match &main.interp {
+        Some(ip) => {
+            let (_, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
+            let isize = iino.meta().size as usize;
+            let i = load_elf(&mut pt, &iino, isize, INTERP_BASE)?;
+            if i.interp.is_some() {
+                return Err(-ENOEXEC);
             }
-            if s < end {
-                pt.map(s, end, prot, false, Backing::Anon).ok_or(-ENOMEM)?;
-            }
-            let mut buf = alloc::vec![0u8; 64 * 1024];
-            let mut done = 0;
-            while done < filesz {
-                let n = buf.len().min(filesz - done);
-                if ino.read_at(off + done, &mut buf[..n])? != n {
-                    return Err(-ENOEXEC);
-                }
-                pt.copy_out_force(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
-                done += n;
-            }
+            (i.entry, INTERP_BASE)
         }
-        if off <= phoff && phoff < off + filesz {
-            phdr_va = va + (phoff - off);
-        }
-        brk = brk.max(pg_up(va + memsz));
-    }
+        None => (main.entry, 0),
+    };
+    let (phdr_va, phentsize, phnum) = (main.phdr_va, main.phentsize, main.phnum);
 
     // 引数と環境の文字列、ポインタの並び (argc, argv, envp, auxv) の分を足す
     let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1 + 16;
@@ -222,7 +182,8 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
         (AT_PAGESZ, PGSIZE as u64),
-        (AT_ENTRY, entry as u64),
+        (AT_BASE, interp_base as u64),
+        (AT_ENTRY, main.entry as u64),
         (AT_UID, 0),
         (AT_EUID, 0),
         (AT_GID, 0),
@@ -260,3 +221,109 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
 }
 
 
+
+/// 読み込んだ ELF: 入口、プログラムヘッダの場所、終わり (brk の始まり)、PT_INTERP のパス
+struct Loaded {
+    entry: usize,
+    phdr_va: usize,
+    phentsize: usize,
+    phnum: usize,
+    end: usize,
+    interp: Option<String>,
+}
+
+/// ino の ELF の PT_LOAD を pt に置く。ET_DYN なら base をずらして (いちばん低いところが base に来る)
+fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: usize) -> Result<Loaded, i64> {
+    let mut ehdr = [0u8; 64];
+    if ino.read_at(0, &mut ehdr)? < 64 {
+        return Err(-ENOEXEC);
+    }
+    let elf = &ehdr[..];
+    let etype = u16_at(elf, 16);
+    if &elf[..4] != b"\x7fELF" || elf[4] != 2 || !(etype == ET_EXEC || etype == ET_DYN) || u16_at(elf, 18) != 183 {
+        return Err(-ENOEXEC);
+    }
+    let phoff = u64_at(elf, 32);
+    let phentsize = u16_at(elf, 54);
+    let phnum = u16_at(elf, 56);
+    if phentsize < 56 || phnum > 64 || phoff + phentsize * phnum > size {
+        return Err(-ENOEXEC);
+    }
+    let mut phdrs = alloc::vec![0u8; phentsize * phnum];
+    ino.read_at(phoff, &mut phdrs)?;
+    let ph = |i: usize| &phdrs[i * phentsize..(i + 1) * phentsize];
+    // ずらす量: ET_DYN なら、いちばん低い PT_LOAD を base に
+    let bias = if etype == ET_DYN {
+        let low = (0..phnum).filter(|&i| u32_at(ph(i), 0) == PT_LOAD).map(|i| pg_down(u64_at(ph(i), 16))).min().ok_or(-ENOEXEC)?;
+        base.checked_sub(low).ok_or(-ENOEXEC)?
+    } else {
+        0
+    };
+    let mut end = 0;
+    let mut phdr_va = 0;
+    let mut interp = None;
+    for i in 0..phnum {
+        let ph = ph(i);
+        match u32_at(ph, 0) {
+            PT_INTERP => {
+                let (off, n) = (u64_at(ph, 8), u64_at(ph, 32));
+                if n == 0 || n > 256 || off + n > size {
+                    return Err(-ENOEXEC);
+                }
+                let mut b = alloc::vec![0u8; n];
+                ino.read_at(off, &mut b)?;
+                let p = core::str::from_utf8(&b).map_err(|_| -ENOEXEC)?.trim_end_matches('\0');
+                interp = Some(String::from(p));
+                continue;
+            }
+            PT_PHDR => {
+                phdr_va = u64_at(ph, 16) + bias;
+                continue;
+            }
+            PT_LOAD => {}
+            _ => continue,
+        }
+        let flags = u32_at(ph, 4);
+        let off = u64_at(ph, 8);
+        let va = u64_at(ph, 16).checked_add(bias).ok_or(-ENOEXEC)?;
+        let filesz = u64_at(ph, 32);
+        let memsz = u64_at(ph, 40);
+        if filesz > memsz || off + filesz > size || va.checked_add(memsz).is_none_or(|e| e > USER_STACK_TOP) {
+            return Err(-ENOEXEC);
+        }
+        let prot = PROT_READ | if flags & PF_W != 0 { PROT_WRITE } else { 0 } | if flags & PF_X != 0 { PROT_EXEC } else { 0 };
+        let (start, seg_end) = (pg_down(va), pg_up(va + memsz));
+        if (va - start) > off {
+            return Err(-ENOEXEC);
+        }
+        if pt.find(start).is_none() && pt.find(seg_end - 1).is_none() {
+            // ふつう: ページはファイルから、触れたときに読む (filesz の先は 0)
+            let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz };
+            pt.map(start, seg_end, prot, false, back).ok_or(-ENOMEM)?;
+        } else {
+            // 前のセグメントとページを分けあう: 残りを無名にして、中身を今読む
+            let mut s = start;
+            while pt.find(s).is_some() {
+                s += PGSIZE;
+            }
+            if s < seg_end {
+                pt.map(s, seg_end, prot, false, Backing::Anon).ok_or(-ENOMEM)?;
+            }
+            let mut buf = alloc::vec![0u8; 64 * 1024];
+            let mut done = 0;
+            while done < filesz {
+                let n = buf.len().min(filesz - done);
+                if ino.read_at(off + done, &mut buf[..n])? != n {
+                    return Err(-ENOEXEC);
+                }
+                pt.copy_out_force(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
+                done += n;
+            }
+        }
+        if phdr_va == 0 && off <= phoff && phoff < off + filesz {
+            phdr_va = va + (phoff - off);
+        }
+        end = end.max(seg_end);
+    }
+    Ok(Loaded { entry: u64_at(elf, 24) + bias, phdr_va, phentsize, phnum, end, interp })
+}
