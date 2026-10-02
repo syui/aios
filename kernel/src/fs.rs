@@ -66,6 +66,14 @@ fn setup_dirs(mtab: &str) {
     if crate::gpu::get().is_some() {
         let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
     }
+    // キーボードやマウス (virtio-input)
+    if crate::input::count() > 0 {
+        if let Ok(d) = vfs::mkdir_p("dev/input", 0o755) {
+            for n in 0..crate::input::count() {
+                let _ = d.create(&alloc::format!("event{}", n), 0o666, NewNode::Dev(13, 64 + n as u32));
+            }
+        }
+    }
     // ディスクと区画 (/dev/vda, /dev/vda1, ...)
     for p in crate::block::parts() {
         let (ma, mi) = crate::block::dev_of_part(&p);

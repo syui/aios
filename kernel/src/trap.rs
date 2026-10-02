@@ -236,6 +236,7 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                 id if id == crate::uart::irq() => crate::uart::intr(),
                 irq::SPURIOUS => return,
                 id if Some(id) == crate::net::irq() => crate::net::intr(),
+                id if crate::input::intr(id) => {}
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);

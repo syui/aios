@@ -791,6 +791,9 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if matches!(f.borrow().kind, Kind::Fb) {
         return crate::gpu::ioctl(req, arg);
     }
+    if let Kind::Input(n) = f.borrow().kind {
+        return crate::input::ioctl(n, req, arg);
+    }
     let (tty, master) = match &f.borrow().kind {
         Kind::Tty(t) => (t.clone(), false),
         Kind::PtyMaster(t) => (t.clone(), true),

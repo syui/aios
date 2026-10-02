@@ -57,6 +57,10 @@ impl Mmio {
     }
 
     /// 設定の領域の 1 バイト
+    pub fn config_w8(&self, off: usize, v: u8) {
+        crate::mmio::w8(self.base + CONFIG + off, v)
+    }
+
     pub fn config8(&self, off: usize) -> u8 {
         crate::mmio::r8(self.base + CONFIG + off)
     }
@@ -78,6 +82,12 @@ impl Mmio {
 /// device_id のデバイスを探して、wanted の機能 (VERSION_1 は自動で足す) で初期化する。
 /// キューの設定は呼ぶ側が Queue::new で行い、最後に ready を呼ぶ
 pub fn probe(device_id: u32, wanted: u64) -> Option<(Mmio, u64)> {
+    probe_nth(device_id, wanted, 0)
+}
+
+/// device_id の装置の nth 番目 (0 から)。キーボードとタブレットのように、同じ種類がいくつもあるとき
+pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)> {
+    let mut seen = 0;
     // DTB があればそこに書かれたもの (base, GIC の INTID)、なければ qemu virt の決まった場所
     let mut slots = alloc::vec::Vec::new();
     if crate::dtb::present() {
@@ -89,6 +99,10 @@ pub fn probe(device_id: u32, wanted: u64) -> Option<(Mmio, u64)> {
     for (pa, irq) in slots {
         let m = Mmio { base: p2v(pa), irq };
         if m.rd(MAGIC) != 0x7472_6976 || m.rd(DEVICE_ID) != device_id {
+            continue;
+        }
+        seen += 1;
+        if seen <= nth {
             continue;
         }
         if m.rd(VERSION) != 2 {
