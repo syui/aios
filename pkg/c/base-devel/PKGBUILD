@@ -4,7 +4,7 @@
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
 pkgname=base-devel
 pkgver=0.0.1
-pkgrel=2
+pkgrel=3
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'
 arch=('any')
 url='https://github.com/syui/aios'
@@ -16,7 +16,8 @@ package() {
   install -d "$d"
   w() { printf '#!/bin/sh\nexec /opt/zig/zig %s "$@"\n' "$2" > "$d/$1"; chmod 755 "$d/$1"; }
   # zig cc は -O がないと UBSan を入れる (gcc とちがう)。gcc と同じにして切っておく
-  local opt='-target aarch64-linux-musl -static -fno-sanitize=undefined'
+  # /opt/c の C のライブラリ (zlib など) をそのまま使えるように: cc foo.c -lz
+  local opt='-target aarch64-linux-musl -static -fno-sanitize=undefined -I/opt/c/include -L/opt/c/lib'
   w cc "cc $opt"
   w gcc "cc $opt"
   w c++ "c++ $opt"
