@@ -75,6 +75,7 @@ mod nr {
     pub const PREADV: u64 = 69;
     pub const PWRITEV: u64 = 70;
     pub const SENDFILE: u64 = 71;
+    pub const PSELECT6: u64 = 72;
     pub const PPOLL: u64 = 73;
     pub const SPLICE: u64 = 76;
     pub const TEE: u64 = 77;
@@ -259,6 +260,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         NEWFSTATAT => sysfile::newfstatat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
         PPOLL => sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize),
+        PSELECT6 => sysfile::pselect6(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize),
         SOCKET => socket::socket(a[0], a[1], a[2]),
         SOCKETPAIR => socket::socketpair(a[0], a[1], a[3] as usize),
         BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),

@@ -891,6 +891,63 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
     }
 }
 
+/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask): ppoll と同じ待ち方を fd_set (ビットの並び) で。
+/// 読める = データがあるか相手が閉じた、書ける = 書けるか相手が閉じた。例外 (帯域外データ) はないので空にする。
+/// sigmask は ppoll と同じく見ない
+pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
+    if nfds > proc::NOFILE {
+        return Err(-EINVAL);
+    }
+    let bytes = nfds.div_ceil(64) * 8;
+    let load = |va: usize| -> Result<alloc::vec::Vec<u8>, i64> {
+        let mut b = vec![0u8; bytes];
+        if va != 0 {
+            proc::current().pt().copy_in(&mut b, va).ok_or(-EFAULT)?;
+        }
+        Ok(b)
+    };
+    let (want_r, want_w) = (load(rd)?, load(wr)?);
+    let bit = |b: &[u8], i: usize| b[i / 8] & (1 << (i % 8)) != 0;
+    let deadline = if tmo == 0 {
+        None
+    } else {
+        let mut ts = [0u8; 16];
+        proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
+        let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
+        Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
+    };
+    loop {
+        let (mut got_r, mut got_w) = (vec![0u8; bytes], vec![0u8; bytes]);
+        let mut count = 0;
+        for i in 0..nfds {
+            let (r_, w_) = (bit(&want_r, i), bit(&want_w, i));
+            if !r_ && !w_ {
+                continue;
+            }
+            let f = proc::current().files().get(i as u64).cloned().ok_or(-EBADF)?;
+            let (r, w, hup) = f.borrow().readiness();
+            if r_ && (r || hup) {
+                got_r[i / 8] |= 1 << (i % 8);
+                count += 1;
+            }
+            if w_ && (w || hup) {
+                got_w[i / 8] |= 1 << (i % 8);
+                count += 1;
+            }
+        }
+        let expired = deadline.is_some_and(|d| crate::timer::ticks() >= d);
+        if count > 0 || expired {
+            for (va, b) in [(rd, &got_r), (wr, &got_w), (ex, &vec![0u8; bytes])] {
+                if va != 0 {
+                    out(va, b)?;
+                }
+            }
+            return Ok(count);
+        }
+        proc::sleep_until(proc::poll_chan(), deadline.unwrap_or(0))?;
+    }
+}
+
 /// FIFO の inode ごとのパイプ (誰かが開いている間だけ生きている)
 static mut FIFOS: alloc::vec::Vec<((usize, u64), alloc::rc::Weak<core::cell::RefCell<Pipe>>)> = alloc::vec::Vec::new();
 
