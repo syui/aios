@@ -1,0 +1,36 @@
+# expat: XML parser library (shared, for aios)
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
+pkgname=expat
+pkgver=2.7.1
+pkgrel=1
+pkgdesc='XML parser library (shared, for aios)'
+arch=('aarch64')
+license=('MIT')
+depends=('musl')
+source=("https://github.com/libexpat/libexpat/releases/download/R_${pkgver//./_}/expat-$pkgver.tar.xz")
+sha256sums=('354552544b8f99012e5062f7d570ec77f14b412a3ff5c7d8d0dae62c0d217c30')
+
+prepare() {
+  rm -rf "expat-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  shared_env
+  cd "expat-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-static --enable-shared \
+    --without-docbook --without-examples --without-tests --without-xmlwf
+  make
+}
+
+package() {
+  # install でリンクしなおすことがある (libtool) ので Zig を使えるようにしておく
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "expat-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/opt/c/share/doc" "$pkgdir"/opt/c/lib/*.la
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

@@ -67,3 +67,70 @@ c_deps() {
   export CPPFLAGS="-I$SYSROOT/include" LDFLAGS="$LDFLAGS -L$SYSROOT/lib"
   export PKG_CONFIG_LIBDIR=$SYSROOT/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$root
 }
+
+# meson_cross DEP...: meson で aios 用にクロスビルドする準備。c_deps DEP... (と、動かすための musl) を
+# sysroot に広げ、$srcdir/cross.ini を作る。ビルドの途中で aios 用のプログラムを動かすもの (glib など) は
+# qemu-aarch64 で動かす (exe_wrapper。Debian / Ubuntu なら qemu-user)。
+#   meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib ...
+meson_cross() {
+  c_deps musl "$@"
+  local root=$srcdir/sysroot
+  # musl の動的リンカは /lib/ld-musl-aarch64.so.1 (qemu -L で sysroot をつける)
+  [ -e "$root/lib" ] || ln -s usr/lib "$root/lib"
+  # zig cc は -E と -c が両方あると -c (コンパイル) にしてしまう。meson の cc.preprocess は両方を渡すので、
+  # -E のときは -c を外す小さな包みを通す
+  local zb=$srcdir/zigbin t
+  mkdir -p "$zb"
+  for t in cc c++; do
+    cat > "$zb/$t" <<SH
+#!/bin/sh
+pre=
+for a in "\$@"; do [ "\$a" = -E ] && pre=1; done
+if [ -n "\$pre" ]; then
+  n=\$#
+  while [ \$n -gt 0 ]; do
+    a=\$1; shift; n=\$((n - 1))
+    [ "\$a" = -c ] || set -- "\$@" "\$a"
+  done
+fi
+exec zig $t -target aarch64-linux-musl "\$@"
+SH
+    chmod 755 "$zb/$t"
+  done
+  local wrap=
+  if command -v qemu-aarch64 >/dev/null; then
+    wrap="exe_wrapper = ['qemu-aarch64', '-L', '$root']"
+  fi
+  cat > "$srcdir/cross.ini" <<INI
+[binaries]
+c = '$zb/cc'
+cpp = '$zb/c++'
+ar = ['zig', 'ar']
+ranlib = ['zig', 'ranlib']
+pkg-config = 'pkg-config'
+$wrap
+
+[built-in options]
+c_args = ['-O2', '-Wno-date-time']
+cpp_args = ['-O2', '-Wno-date-time']
+c_link_args = ['-s']
+cpp_link_args = ['-s']
+
+[properties]
+sys_root = '$root'
+pkg_config_libdir = '$root$PREFIX/lib/pkgconfig:$root$PREFIX/share/pkgconfig'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+INI
+  # c_deps の環境変数はこのマシン用のもの (wayland-scanner など) の検索まで変えるので、cross.ini にまかせる
+  unset PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR CPPFLAGS LDFLAGS CFLAGS CXXFLAGS
+}
+
+# autotools / cmake で共有ライブラリを作るときの環境 (zig_env の -static を外す)
+shared_env() {
+  export LDFLAGS="-Wl,-s${SYSROOT:+ -L$SYSROOT/lib}"
+}

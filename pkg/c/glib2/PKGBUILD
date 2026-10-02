@@ -1,0 +1,36 @@
+# glib2: Low level core library (GLib, GObject, GIO; shared, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=glib2
+pkgver=2.84.4
+pkgrel=1
+pkgdesc='Low level core library (GLib, GObject, GIO; shared, for aios)'
+arch=('aarch64')
+license=('LGPL-2.1-or-later')
+depends=('musl' 'pcre2' 'libffi' 'zlib')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://download.gnome.org/sources/glib/${pkgver%.*}/glib-$pkgver.tar.xz")
+sha256sums=('8a9ea10943c36fc117e253f80c91e477b673525ae45762942858aef57631bb90')
+
+prepare() {
+  rm -rf "glib-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross pcre2 libffi zlib
+  cd "glib-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dtests=false -Dintrospection=disabled -Dman-pages=disabled -Ddocumentation=false -Dselinux=disabled -Dxattr=false -Dlibmount=disabled -Dnls=disabled -Dsysprof=disabled -Dglib_debug=disabled
+  ninja -C build
+}
+
+package() {
+  cd "glib-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  # 動かすときの schema の置き場所
+  install -d "$pkgdir/opt/c/share/glib-2.0/schemas"
+}

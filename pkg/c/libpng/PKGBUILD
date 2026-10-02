@@ -1,0 +1,37 @@
+# libpng: PNG reference library (shared, for aios)
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
+pkgname=libpng
+pkgver=1.6.50
+pkgrel=1
+pkgdesc='PNG reference library (shared, for aios)'
+arch=('aarch64')
+license=('libpng-2.0')
+depends=('musl' 'zlib')
+source=("https://download.sourceforge.net/libpng/libpng-$pkgver.tar.xz")
+sha256sums=('4df396518620a7aa3651443e87d1b2862e4e88cad135a8b93423e01706232307')
+
+prepare() {
+  rm -rf "libpng-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib
+  shared_env
+  cd "libpng-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-static --enable-shared \
+    --disable-tools
+  make
+}
+
+package() {
+  # install でリンクしなおすことがある (libtool) ので Zig を使えるようにしておく
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "libpng-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/opt/c/share/doc" "$pkgdir"/opt/c/lib/*.la
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,34 @@
+# freetype2: Font rasterization library (shared, for aios)
+#   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
+pkgname=freetype2
+pkgver=2.13.3
+pkgrel=1
+pkgdesc='Font rasterization library (shared, for aios)'
+arch=('aarch64')
+license=('FTL OR GPL-2.0-or-later')
+depends=('musl' 'zlib' 'libpng')
+makedepends=('meson' 'ninja' 'qemu-user')
+source=("https://download.savannah.gnu.org/releases/freetype/freetype-$pkgver.tar.xz")
+sha256sums=('0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289')
+
+prepare() {
+  rm -rf "freetype-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross zlib libpng
+  cd "freetype-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dharfbuzz=disabled -Dpng=enabled -Dzlib=enabled -Dbrotli=disabled -Dbzip2=disabled
+  ninja -C build
+}
+
+package() {
+  cd "freetype-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 LICENSE.TXT "$pkgdir/usr/share/licenses/$pkgname/LICENSE.TXT"
+}
