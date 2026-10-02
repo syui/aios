@@ -167,7 +167,16 @@ pub struct TmpInode {
     ino: u64,
     attr: RefCell<Attr>,
     node: RefCell<Node>,
+    /// memfd の封 (F_SEAL_*)。memfd でなければ None
+    seals: core::cell::Cell<Option<u32>>,
 }
+
+pub const F_SEAL_SEAL: u32 = 1;
+pub const F_SEAL_SHRINK: u32 = 2;
+pub const F_SEAL_GROW: u32 = 4;
+pub const F_SEAL_WRITE: u32 = 8;
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+pub const F_SEAL_EXEC: u32 = 0x20;
 
 static mut NEXT_INO: u64 = 1;
 
@@ -183,7 +192,7 @@ impl TmpInode {
         };
         let nlink = if matches!(node, Node::Dir(_)) { 2 } else { 1 };
         let t = now();
-        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t }), node: RefCell::new(node) })
+        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t }), node: RefCell::new(node), seals: core::cell::Cell::new(None) })
     }
 
     fn touch(&self) {
@@ -239,8 +248,9 @@ impl TmpInode {
     }
 }
 
-/// どのディレクトリにも入っていないファイル (memfd_create)。みんな同じ見えない tmpfs のもの
-pub fn anon_file() -> InodeRef {
+/// どのディレクトリにも入っていないファイル (memfd_create)。みんな同じ見えない tmpfs のもの。
+/// 作ったプロセスのもので、封は seals から始まる
+pub fn anon_file(uid: u32, gid: u32, seals: u32) -> InodeRef {
     static mut FS: usize = 0;
     let fs = unsafe {
         if FS == 0 {
@@ -248,7 +258,14 @@ pub fn anon_file() -> InodeRef {
         }
         FS
     };
-    TmpInode::new(fs, S_IFREG | 0o600, Node::File(Data::Owned(Pages::new())))
+    let t = TmpInode::new(fs, S_IFREG | 0o600, Node::File(Data::Owned(Pages::new())));
+    {
+        let mut a = t.attr.borrow_mut();
+        a.uid = uid;
+        a.gid = gid;
+    }
+    t.seals.set(Some(seals));
+    t
 }
 
 pub fn new_root() -> Rc<TmpInode> {
@@ -295,12 +312,35 @@ impl Inode for TmpInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        if let Some(s) = self.seals.get() {
+            let size = self.meta().size as usize;
+            if (len < size && s & F_SEAL_SHRINK != 0) || (len > size && s & F_SEAL_GROW != 0) {
+                return Err(-EPERM);
+            }
+        }
         match &mut *self.node.borrow_mut() {
             Node::File(d) => d.owned()?.truncate(len),
             Node::Dir(_) => return Err(-EISDIR),
             _ => return Err(-EINVAL),
         }
         self.touch();
+        Ok(())
+    }
+
+    fn seals(&self) -> Option<u32> {
+        self.seals.get()
+    }
+
+    fn add_seals(&self, s: u32) -> Result<(), i64> {
+        let cur = self.seals.get().ok_or(-EINVAL)?;
+        if s & !(F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE | F_SEAL_EXEC) != 0 {
+            return Err(-EINVAL);
+        }
+        if cur & F_SEAL_SEAL != 0 {
+            return Err(-EPERM);
+        }
+        // F_SEAL_WRITE は、書ける共有の写像が残っていると Linux では EBUSY。まだ写像までは見ない
+        self.seals.set(Some(cur | s));
         Ok(())
     }
 

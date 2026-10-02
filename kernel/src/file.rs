@@ -307,6 +307,7 @@ impl OpenFile {
                 if self.flags & O_APPEND != 0 {
                     self.offset = ino.meta().size as usize;
                 }
+                vfs::write_sealed(ino, self.offset, src.len())?;
                 let n = ino.write_at(self.offset, src)?;
                 self.offset += n;
                 Ok(n)
