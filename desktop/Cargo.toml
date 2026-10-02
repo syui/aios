@@ -9,6 +9,14 @@ license = "MIT"
 name = "aisplash"
 path = "src/bin/aisplash.rs"
 
+[[bin]]
+name = "aiwm"
+path = "src/bin/aiwm.rs"
+
+[[bin]]
+name = "aiterm"
+path = "src/bin/aiterm.rs"
+
 [dependencies]
 libc = "0.2"
 # フォント (aifont) を点にする / PNG (アイコン) を読む。どちらも Rust だけのもの

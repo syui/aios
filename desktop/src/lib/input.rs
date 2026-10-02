@@ -33,6 +33,25 @@ impl Inputs {
         self.files.is_empty()
     }
 
+    pub fn fds(&self) -> Vec<std::os::fd::RawFd> {
+        self.files.iter().map(|f| f.as_raw_fd()).collect()
+    }
+
+    /// i 番目の装置から、来ているイベントを読む
+    pub fn read(&mut self, i: usize) -> Vec<Event> {
+        let mut out = vec![];
+        let mut b = [0u8; 24 * 64];
+        let n = self.files[i].read(&mut b).unwrap_or(0);
+        for e in b[..n - n % 24].chunks(24) {
+            out.push(Event {
+                typ: u16::from_le_bytes([e[16], e[17]]),
+                code: u16::from_le_bytes([e[18], e[19]]),
+                value: i32::from_le_bytes(e[20..24].try_into().unwrap()),
+            });
+        }
+        out
+    }
+
     /// イベントが来るまで (timeout ミリ秒、-1 でずっと) 待って、来たものを返す
     pub fn wait(&mut self, timeout: i32) -> Vec<Event> {
         let mut pfd: Vec<libc::pollfd> = self.files.iter().map(|f| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();

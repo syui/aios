@@ -73,6 +73,31 @@ impl Fb {
     }
 }
 
+impl Fb {
+    #[allow(dead_code)]
+    /// [y0, y1) の行だけ画面へ (その行を自分自身へ書くと、カーネルがその行だけ送る)
+    pub fn present_rows(&self, y0: usize, y1: usize) {
+        let (y0, y1) = (y0.min(self.height), y1.min(self.height));
+        if y0 >= y1 {
+            return;
+        }
+        let off = y0 * self.stride * 4;
+        let len = (y1 - y0) * self.stride * 4;
+        let fd = self.file.as_raw_fd();
+        unsafe {
+            libc::lseek(fd, off as _, libc::SEEK_SET);
+            let mut done = 0;
+            while done < len {
+                let n = libc::write(fd, (self.mem as *const u8).add(off + done) as *const _, len - done);
+                if n <= 0 {
+                    break;
+                }
+                done += n as usize;
+            }
+        }
+    }
+}
+
 impl Drop for Fb {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.mem as *mut _, self.len) };
