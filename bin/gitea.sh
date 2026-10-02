@@ -3,7 +3,7 @@
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
-#                        (署名つきのコミット)
+#                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -84,13 +84,19 @@ case "$1" in
     rm -rf "$tmp/repo/aarch64-c"
     cd "$tmp/repo"
     git add -A .
-    if git diff --cached --quiet; then
+    # 中身が同じでも、前の歴史が残っていれば (親のあるコミット) まとめる
+    if git diff --cached --quiet && ! git cat-file -p HEAD | grep -q '^parent '; then
       echo "ai/repo: no change"
       exit 0
     fi
-    git commit -q -m "aarch64: update packages" -m "$(git diff --cached --name-status | sed 's/^/  /')"
-    git -c "$(auth)" push -q origin main
-    echo "ai/repo: pushed $(git rev-parse --short HEAD)"
+    changes=$(git diff --cached --name-status | sed 's/^/  /')
+    # 歴史は残さない: いまのファイル (x86_64/ や aios.gpg もそのまま) だけの 1 コミットで main を置きかえる。
+    # パッケージは圧縮したバイナリで差分がとれず、作りなおすたびに積もるので
+    # (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
+    git checkout -q --orphan new
+    git commit -q -m "aarch64: update packages" -m "$changes"
+    git -c "$(auth)" push -q --force origin new:main
+    echo "ai/repo: pushed $(git rev-parse --short HEAD) (history squashed)"
     ;;
   *)
     usage
