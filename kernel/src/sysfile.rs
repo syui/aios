@@ -853,6 +853,18 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
         Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
     };
+    // 見張るものの印 (どれかわからないものがあれば、何でも起こしてもらう)
+    let mut keys = Some(alloc::vec::Vec::new());
+    for i in 0..nfds {
+        let fd = i32::from_le_bytes(raw[i * 8..i * 8 + 4].try_into().unwrap());
+        if fd >= 0 {
+            match proc::current().files().get(fd as u64).map(|f| f.borrow().poll_keys()) {
+                Some(Some(k)) => keys.as_mut().map_or((), |v: &mut alloc::vec::Vec<usize>| v.extend(k)),
+                Some(None) => keys = None,
+                None => {}
+            }
+        }
+    }
     loop {
         let mut count = 0;
         for i in 0..nfds {
@@ -887,7 +899,7 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
             out(fds, &raw)?;
             return Ok(count);
         }
-        proc::sleep_until(proc::poll_chan(), deadline.unwrap_or(0))?;
+        proc::poll_sleep(keys.clone(), deadline.unwrap_or(0))?;
     }
 }
 
@@ -916,6 +928,16 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
         Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
     };
+    let mut keys = Some(alloc::vec::Vec::new());
+    for i in 0..nfds {
+        if bit(&want_r, i) || bit(&want_w, i) {
+            match proc::current().files().get(i as u64).map(|f| f.borrow().poll_keys()) {
+                Some(Some(k)) => keys.as_mut().map_or((), |v: &mut alloc::vec::Vec<usize>| v.extend(k)),
+                Some(None) => keys = None,
+                None => {}
+            }
+        }
+    }
     loop {
         let (mut got_r, mut got_w) = (vec![0u8; bytes], vec![0u8; bytes]);
         let mut count = 0;
@@ -944,7 +966,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
             }
             return Ok(count);
         }
-        proc::sleep_until(proc::poll_chan(), deadline.unwrap_or(0))?;
+        proc::poll_sleep(keys.clone(), deadline.unwrap_or(0))?;
     }
 }
 

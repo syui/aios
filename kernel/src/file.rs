@@ -391,6 +391,18 @@ impl OpenFile {
         }
     }
 
+    /// poll で待つときの印 (変わったときに poll_wake されるもの)。None はわからない (何かあれば起こす)
+    pub fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(match &self.kind {
+            Kind::Tty(t) | Kind::PtyMaster(t) => alloc::vec![t.borrow().poll_key()],
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
+            Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
+            // いつでも読み書きできる (待たない)
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) => alloc::vec![],
+            _ => return None,
+        })
+    }
+
     pub fn lseek(&mut self, off: i64, whence: u32) -> Result<usize, i64> {
         let size = match &self.kind {
             Kind::Inode(ino, _) => ino.meta().size as i64,
@@ -472,12 +484,12 @@ impl Drop for OpenFile {
             Kind::PipeRead(p) => {
                 { let mut pp = p.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(Rc::as_ptr(p) as usize);
             }
             Kind::PipeWrite(p) => {
                 { let mut pp = p.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(Rc::as_ptr(p) as usize);
             }
             Kind::PipeRw(p) => {
                 let mut pp = p.borrow_mut();
@@ -486,14 +498,15 @@ impl Drop for OpenFile {
                 pp.generation += 1;
                 drop(pp);
                 proc::wakeup(Rc::as_ptr(p) as usize);
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(Rc::as_ptr(p) as usize);
             }
             Kind::Pair(rx, tx) => {
                 { let mut pp = rx.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
                 { let mut pp = tx.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(rx) as usize);
                 proc::wakeup(Rc::as_ptr(tx) as usize);
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(Rc::as_ptr(rx) as usize);
+                proc::poll_wake(Rc::as_ptr(tx) as usize);
             }
             Kind::Tty(t) if matches!(t.borrow().dev, tty::Dev::Pty(_)) => tty::close_slave(t),
             Kind::PtyMaster(t) => tty::close_master(t),
@@ -646,7 +659,7 @@ impl Pipe {
 
     fn wake(p: &Rc<RefCell<Pipe>>) {
         proc::wakeup(Rc::as_ptr(p) as usize);
-        proc::wakeup(proc::poll_chan());
+        proc::poll_wake(Rc::as_ptr(p) as usize);
     }
 
     /// 読む。peek なら取り除かない (tee 用)

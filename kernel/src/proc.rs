@@ -186,6 +186,8 @@ pub struct Proc {
     chan: usize,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
+    /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
+    poll_keys: Option<Vec<usize>>,
     context: Context,
     tpidr: u64,
     fp: FpState,
@@ -227,6 +229,7 @@ impl Proc {
         cutime: 0,
         chan: 0,
         wake_at: 0,
+        poll_keys: None,
         context: Context::ZERO,
         tpidr: 0,
         fp: FpState::ZERO,
@@ -523,17 +526,23 @@ pub fn scheduler() -> ! {
             ran = true;
         }
         if !ran {
-            // 書き残しがあれば書いてから (1 秒ごと、cpu0 で)、ロックを放して割り込みか sev を待つ
+            // 書き残しがあれば書いてから (1 秒ごと、cpu0 で)、ロックを放して割り込みを待つ
             if crate::smp::id() == 0 {
                 crate::vfs::idle_sync();
             }
+            // 眠ると印をつけてから確かめる (そのあとに起こす CPU は、印を見て割り込みを送る)
+            crate::smp::set_idle(true);
             if procs().iter().any(|p| p.state == State::Runnable) {
+                crate::smp::set_idle(false);
                 continue;
             }
             crate::smp::unlock();
+            crate::timer::idle(true);
             crate::trap::intr_on();
-            unsafe { core::arch::asm!("wfe") };
+            unsafe { core::arch::asm!("wfi") };
             crate::trap::intr_off();
+            crate::timer::idle(false);
+            crate::smp::set_idle(false);
             crate::smp::lock();
         }
     }
@@ -591,7 +600,7 @@ pub fn wakeup(chan: usize) -> usize {
     }
     if n > 0 {
         // 眠っている CPU を起こす
-        unsafe { core::arch::asm!("sev") };
+        crate::smp::wake_idle();
     }
     n
 }
@@ -623,12 +632,41 @@ pub fn poll_chan() -> usize {
     (&raw const POLL) as usize
 }
 
+/// poll / select で眠る: keys (見張っているものの印) のどれかが poll_wake されるか、
+/// 何でも起こす wakeup(poll_chan) か、deadline まで
+pub fn poll_sleep(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> {
+    current().poll_keys = keys;
+    let r = sleep_until(poll_chan(), deadline);
+    current().poll_keys = None;
+    r
+}
+
+/// key (パイプや端末など) が変わった: それを見張って poll で眠っているものだけを起こす
+pub fn poll_wake(key: usize) {
+    let chan = poll_chan();
+    let mut n = 0;
+    for p in procs().iter_mut() {
+        if p.state == State::Sleeping && p.chan == chan && p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)) {
+            p.state = State::Runnable;
+            n += 1;
+        }
+    }
+    if n > 0 {
+        crate::smp::wake_idle();
+    }
+}
+
 /// タイマから: 期限の来た Proc を起こす
 pub fn wake_expired(now: u64) {
+    let mut n = 0;
     for p in procs().iter_mut() {
         if p.state == State::Sleeping && p.wake_at != 0 && p.wake_at <= now {
             p.state = State::Runnable;
+            n += 1;
         }
+    }
+    if n > 0 {
+        crate::smp::wake_idle();
     }
 }
 
@@ -826,7 +864,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.clear_tid = ctid;
     }
     child.state = State::Runnable;
-    unsafe { core::arch::asm!("sev") };
+    crate::smp::wake_idle();
     Ok(tid)
 }
 
@@ -989,7 +1027,7 @@ pub fn interrupt(t: &mut Proc) {
     match t.state {
         State::Sleeping => {
             t.state = State::Runnable;
-            unsafe { core::arch::asm!("sev") };
+            crate::smp::wake_idle();
         }
         // ほかの CPU のユーザーモードで走っている: すぐに戻ってきてもらう
         State::Running => crate::smp::kick(t.cpu),
