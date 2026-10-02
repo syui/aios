@@ -27,6 +27,10 @@ const GAP: i32 = 4;
 const FOCUS: u32 = 0xf5c518;
 const UNFOCUS: u32 = 0x3b3f4c;
 const DESK: u32 = 0x0e1018;
+const BAR_H: i32 = 24;
+const BAR_BG: u32 = 0x0b0d14;
+const BAR_FONT: f32 = 14.0;
+const TAB_H: i32 = 22;
 
 // グローバル (wl_registry で見せるもの): (名前, インターフェース, 版)
 const GLOBALS: [(u32, &str, u32); 5] = [
@@ -148,7 +152,7 @@ struct Surface {
     toplevel: Option<u32>,
     title: String,
     /// 最後に送った configure の大きさと、作業中か
-    sent: Option<(i32, i32, bool)>,
+    sent: Option<(i32, i32, bool, bool, u8)>,
 }
 
 struct Client {
@@ -180,11 +184,39 @@ impl Rect {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    /// 横に並べる (sway の splith)
+    SplitH,
+    /// 縦に積む (splitv)
+    SplitV,
+    /// タブ (tabbed): 作業中の窓だけを大きく、上にタブ
+    Tabbed,
+}
+
+/// ワークスペース: 窓の並びと、その中の作業中の窓
+struct Ws {
+    wins: Vec<Win>,
+    focus: Option<Win>,
+    layout: Layout,
+    fullscreen: Option<Win>,
+}
+
+impl Ws {
+    fn new() -> Ws {
+        Ws { wins: vec![], focus: None, layout: Layout::SplitH, fullscreen: None }
+    }
+}
+
 enum Action {
     Exec(String),
     Kill,
     Focus(i32),
     Move(i32),
+    Workspace(u32),
+    MoveTo(u32),
+    Layout(Option<Layout>),
+    Fullscreen,
     Exit,
 }
 
@@ -199,6 +231,8 @@ struct Config {
     layout: String,
     autostart: Vec<String>,
     bg: u32,
+    /// バー: None なら出さない。(上か, status_command)
+    bar: Option<(bool, Option<String>)>,
 }
 
 struct Wm {
@@ -208,7 +242,9 @@ struct Wm {
     inputs: input::Inputs,
     clients: BTreeMap<usize, Client>,
     next_client: usize,
-    wins: Vec<Win>,
+    /// ワークスペース (番号 → 中身) と、見えているもの
+    spaces: BTreeMap<u32, Ws>,
+    cur: u32,
     focus: Option<Win>,
     serial: u32,
     mods: Mods,
@@ -226,6 +262,11 @@ struct Wm {
     keymap_fd: RawFd,
     env: Vec<(String, String)>,
     quit: bool,
+    /// バーの右に出すもの (status_command の最後の行。なければ時計)
+    status: String,
+    status_fd: Option<RawFd>,
+    status_buf: Vec<u8>,
+    clock: String,
 }
 
 fn main() {
@@ -256,7 +297,8 @@ fn main() {
         inputs,
         clients: BTreeMap::new(),
         next_client: 1,
-        wins: vec![],
+        spaces: BTreeMap::from([(1, Ws::new())]),
+        cur: 1,
         focus: None,
         serial: 1,
         mods: Mods::default(),
@@ -270,7 +312,14 @@ fn main() {
         keymap_fd,
         env,
         quit: false,
+        status: String::new(),
+        status_fd: None,
+        status_buf: vec![],
+        clock: String::new(),
     };
+    if let Some((_, Some(cmd))) = wm.config.bar.clone() {
+        wm.status_fd = wm.spawn_status(&cmd);
+    }
     eprintln!("aiwm: {}x{}, WAYLAND_DISPLAY={}/wayland-0", w, h, dir);
     for cmd in wm.config.autostart.clone() {
         wm.spawn(&cmd);
@@ -334,10 +383,28 @@ fn load_config() -> Config {
 
 fn parse_config(text: &str) -> Config {
     let mut vars: Vec<(String, String)> = vec![];
-    let mut c = Config { binds: vec![], layout: String::new(), autostart: vec![], bg: DESK };
+    let mut c = Config { binds: vec![], layout: String::new(), autostart: vec![], bg: DESK, bar: None };
+    let mut in_bar = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // bar { ... }
+        if in_bar {
+            let bar = c.bar.get_or_insert((true, None));
+            let ws: Vec<&str> = line.split_whitespace().collect();
+            match ws.as_slice() {
+                ["}"] => in_bar = false,
+                ["position", pos] => bar.0 = *pos != "bottom",
+                ["status_command", rest @ ..] => bar.1 = Some(rest.join(" ")),
+                _ => eprintln!("aiwm: config: bar: ignored: {}", line),
+            }
+            continue;
+        }
+        if line == "bar {" || line == "bar{" {
+            in_bar = true;
+            c.bar.get_or_insert((true, None));
             continue;
         }
         let mut line = line.to_string();
@@ -362,6 +429,17 @@ fn parse_config(text: &str) -> Config {
                     ["focus", "right" | "down" | "next"] => Action::Focus(1),
                     ["move", "left" | "up"] => Action::Move(-1),
                     ["move", "right" | "down"] => Action::Move(1),
+                    ["workspace", "number", n] | ["workspace", n] if n.parse::<u32>().is_ok() => Action::Workspace(n.parse().unwrap()),
+                    ["move", "container" | "window", "to", "workspace", "number", n] | ["move", "container" | "window", "to", "workspace", n]
+                        if n.parse::<u32>().is_ok() =>
+                    {
+                        Action::MoveTo(n.parse().unwrap())
+                    }
+                    ["layout", "splith"] => Action::Layout(Some(Layout::SplitH)),
+                    ["layout", "splitv"] => Action::Layout(Some(Layout::SplitV)),
+                    ["layout", "tabbed" | "stacking"] => Action::Layout(Some(Layout::Tabbed)),
+                    ["layout", "toggle", "split"] => Action::Layout(None),
+                    ["fullscreen"] | ["fullscreen", "toggle"] => Action::Fullscreen,
                     ["exit"] => Action::Exit,
                     _ => {
                         eprintln!("aiwm: config: unknown command {}", cmd.join(" "));
@@ -456,8 +534,13 @@ impl Wm {
             for fd in &in_fds {
                 pfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
             }
-            // 描くものがあれば、前の画面から 16ms たったら描く
-            let timeout = if self.dirty.is_some() { (16 - wl::now_ms().wrapping_sub(last_frame) as i32).clamp(0, 16) } else { -1 };
+            let status_at = pfds.len();
+            if let Some(fd) = self.status_fd {
+                pfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+            }
+            // 描くものがあれば、前の画面から 16ms たったら描く。時計があれば 1 秒ごとに見る
+            let idle = if self.config.bar.is_some() && self.status.is_empty() { 1000 } else { -1 };
+            let timeout = if self.dirty.is_some() { (16 - wl::now_ms().wrapping_sub(last_frame) as i32).clamp(0, 16) } else { idle };
             let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
             if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 eprintln!("aiwm: poll: {}", std::io::Error::last_os_error());
@@ -479,6 +562,10 @@ impl Wm {
                     }
                 }
             }
+            if pfds.get(status_at).is_some_and(|p| p.revents != 0) {
+                self.read_status();
+            }
+            self.tick();
             if self.dirty.is_some() && wl::now_ms().wrapping_sub(last_frame) >= 16 {
                 self.render();
                 last_frame = wl::now_ms();
@@ -540,8 +627,6 @@ impl Wm {
 
     fn drop_client(&mut self, id: usize) {
         self.clients.remove(&id);
-        let before = self.wins.len();
-        self.wins.retain(|w| w.client != id);
         if self.focus.is_some_and(|f| f.client == id) {
             self.focus = None;
         }
@@ -549,8 +634,9 @@ impl Wm {
             self.ptr_win = None;
         }
         self.frames.retain(|(c, _)| *c != id);
-        if self.wins.len() != before {
-            self.relayout();
+        let gone: Vec<Win> = self.spaces.values().flat_map(|s| s.wins.iter().copied()).filter(|w| w.client == id).collect();
+        for w in gone {
+            self.unmap(w);
         }
     }
 
@@ -793,72 +879,144 @@ impl Wm {
         }
         let is_top = s.toplevel.is_some();
         let w = Win { client: cid, surface: sid };
-        if is_top && !self.wins.contains(&w) {
-            // 新しい窓: 作業中にして並べなおす (ここで初めての configure を送る)
-            let at = self.focus.and_then(|f| self.wins.iter().position(|x| *x == f)).map_or(self.wins.len(), |i| i + 1);
-            self.wins.insert(at, w);
+        if is_top && self.ws_of(w).is_none() {
+            // 新しい窓: 今のワークスペースの作業中の窓のうしろに入れて、作業中にする
+            let focus = self.focus;
+            let ws = self.cur_ws();
+            let at = focus.and_then(|f| ws.wins.iter().position(|x| *x == f)).map_or(ws.wins.len(), |i| i + 1);
+            ws.wins.insert(at, w);
+            ws.fullscreen = None;
             self.set_focus(Some(w));
             self.relayout();
         } else if let Some(r) = self.rect_of(w) {
             self.mark(r.y, r.y + r.h);
         }
-        if !is_top {
-            // 役割のない surface (カーソルなど) は、frame だけすぐ返す
-        }
+    }
+
+    fn cur_ws(&mut self) -> &mut Ws {
+        self.spaces.entry(self.cur).or_insert_with(Ws::new)
+    }
+
+    fn ws_of(&self, w: Win) -> Option<u32> {
+        self.spaces.iter().find(|(_, s)| s.wins.contains(&w)).map(|(n, _)| *n)
     }
 
     fn unmap(&mut self, w: Win) {
-        if let Some(i) = self.wins.iter().position(|x| *x == w) {
-            self.wins.remove(i);
-            if self.focus == Some(w) {
-                let next = if self.wins.is_empty() { None } else { Some(self.wins[i.min(self.wins.len() - 1)]) };
-                self.focus = None;
-                self.set_focus(next);
-            }
-            if self.ptr_win == Some(w) {
-                self.ptr_win = None;
-            }
-            self.relayout();
+        let Some(n) = self.ws_of(w) else { return };
+        let ws = self.spaces.get_mut(&n).unwrap();
+        let i = ws.wins.iter().position(|x| *x == w).unwrap();
+        ws.wins.remove(i);
+        if ws.fullscreen == Some(w) {
+            ws.fullscreen = None;
         }
+        if ws.focus == Some(w) {
+            ws.focus = if ws.wins.is_empty() { None } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
+        }
+        let next = ws.focus;
+        let empty = ws.wins.is_empty();
+        if n == self.cur {
+            if self.focus == Some(w) {
+                self.focus = None;
+            }
+            self.set_focus(next);
+        } else if empty {
+            self.spaces.remove(&n);
+        }
+        if self.ptr_win == Some(w) {
+            self.ptr_win = None;
+        }
+        self.relayout();
     }
 
     // ---- 並べ方 ----
 
-    /// 窓 (枠の内側) の場所
-    fn rect_of(&self, w: Win) -> Option<Rect> {
-        let i = self.wins.iter().position(|x| *x == w)?;
-        let n = self.wins.len() as i32;
-        let (sw, sh) = (self.width(), self.height());
-        let x0 = GAP + (sw - GAP) * i as i32 / n;
-        let x1 = (sw - GAP) * (i as i32 + 1) / n;
-        Some(Rect { x: x0 + BORDER, y: GAP + BORDER, w: (x1 - x0 - 2 * BORDER).max(1), h: (sh - 2 * GAP - 2 * BORDER).max(1) })
+    fn bar_h(&self) -> i32 {
+        if self.config.bar.is_some() { BAR_H } else { 0 }
     }
 
-    /// 大きさや作業中かが変わった窓に configure を送る
+    /// 窓を並べるところ (バーを除く)
+    fn area(&self) -> Rect {
+        let (sw, sh, bh) = (self.width(), self.height(), self.bar_h());
+        let top = self.config.bar.as_ref().is_none_or(|b| b.0);
+        Rect { x: GAP, y: if top { bh } else { 0 } + GAP, w: sw - 2 * GAP, h: sh - bh - 2 * GAP }
+    }
+
+    /// ワークスペース ws の窓 w (枠の内側) の場所。タブで隠れている窓も大きさは返す
+    fn tile_rect(&self, ws: &Ws, w: Win) -> Option<Rect> {
+        let i = ws.wins.iter().position(|x| *x == w)? as i32;
+        if ws.fullscreen == Some(w) {
+            return Some(Rect { x: 0, y: 0, w: self.width(), h: self.height() });
+        }
+        let a = self.area();
+        let n = ws.wins.len() as i32;
+        let outer = match ws.layout {
+            Layout::SplitH => {
+                let x0 = a.x + (a.w + GAP) * i / n;
+                let x1 = a.x + (a.w + GAP) * (i + 1) / n - GAP;
+                Rect { x: x0, y: a.y, w: x1 - x0, h: a.h }
+            }
+            Layout::SplitV => {
+                let y0 = a.y + (a.h + GAP) * i / n;
+                let y1 = a.y + (a.h + GAP) * (i + 1) / n - GAP;
+                Rect { x: a.x, y: y0, w: a.w, h: y1 - y0 }
+            }
+            Layout::Tabbed => Rect { x: a.x, y: a.y + TAB_H, w: a.w, h: a.h - TAB_H },
+        };
+        Some(Rect { x: outer.x + BORDER, y: outer.y + BORDER, w: (outer.w - 2 * BORDER).max(1), h: (outer.h - 2 * BORDER).max(1) })
+    }
+
+    /// 今見えている窓の場所 (ほかのワークスペースや、タブ・全画面で隠れているものは None)
+    fn rect_of(&self, w: Win) -> Option<Rect> {
+        let ws = self.spaces.get(&self.cur)?;
+        if !ws.wins.contains(&w) {
+            return None;
+        }
+        if ws.fullscreen.is_some_and(|f| f != w) {
+            return None;
+        }
+        if ws.layout == Layout::Tabbed && ws.fullscreen.is_none() && ws.focus != Some(w) {
+            return None;
+        }
+        self.tile_rect(ws, w)
+    }
+
+    /// 大きさや状態が変わった窓に configure を送る
     fn relayout(&mut self) {
-        for w in self.wins.clone() {
-            let Some(r) = self.rect_of(w) else { continue };
-            let active = self.focus == Some(w);
+        let mut todo = vec![];
+        for ws in self.spaces.values() {
+            for &w in &ws.wins {
+                if let Some(r) = self.tile_rect(ws, w) {
+                    todo.push((w, r, self.focus == Some(w), ws.fullscreen == Some(w), ws.layout));
+                }
+            }
+        }
+        for (w, r, active, full, layout) in todo {
             let serial = self.next_serial();
             let Some(c) = self.clients.get_mut(&w.client) else { continue };
             let Some(s) = c.surfaces.get_mut(&w.surface) else { continue };
-            if s.sent == Some((r.w, r.h, active)) {
+            let key = (r.w, r.h, active, full, layout as u8);
+            if s.sent == Some(key) {
                 continue;
             }
-            s.sent = Some((r.w, r.h, active));
+            s.sent = Some(key);
             let (Some(top), Some(xdg)) = (s.toplevel, s.xdg) else { continue };
-            // 状態: activated (4)、tiled left/right/top/bottom (5..8)
-            let mut states = vec![];
-            for st in if active { vec![4u32, 5, 6, 7, 8] } else { vec![5, 6, 7, 8] } {
-                states.extend_from_slice(&st.to_le_bytes());
+            // 状態: fullscreen (2)、activated (4)、tiled left/right/top/bottom (5..8)
+            let mut sts: Vec<u32> = if full { vec![2] } else { vec![5, 6, 7, 8] };
+            if active {
+                sts.push(4);
             }
+            let states: Vec<u8> = sts.iter().flat_map(|v| v.to_le_bytes()).collect();
             c.conn.send(top, 0, &[Arg::I(r.w), Arg::I(r.h), Arg::A(&states)]);
             c.conn.send(xdg, 0, &[Arg::U(serial)]);
         }
         self.mark_all();
     }
 
+    /// キーボードの作業中の窓 (今のワークスペースの窓か None)
     fn set_focus(&mut self, w: Option<Win>) {
+        if let Some(n) = w {
+            self.cur_ws().focus = Some(n);
+        }
         if self.focus == w {
             return;
         }
@@ -880,6 +1038,47 @@ impl Wm {
                 }
             }
         }
+        self.relayout();
+    }
+
+    /// ワークスペース n を見せる (空になった前のワークスペースは消す)
+    fn switch_to(&mut self, n: u32) {
+        if n == self.cur {
+            return;
+        }
+        let old = self.cur;
+        self.set_focus(None);
+        self.cur = n;
+        let f = self.cur_ws().focus;
+        if self.spaces.get(&old).is_some_and(|s| s.wins.is_empty()) {
+            self.spaces.remove(&old);
+        }
+        self.set_focus(f);
+        self.relayout();
+        if self.ptr_shown {
+            let p = self.ptr;
+            self.pointer_moved(p);
+        }
+    }
+
+    /// 作業中の窓をワークスペース n へ
+    fn move_to(&mut self, n: u32) {
+        let Some(w) = self.focus else { return };
+        if n == self.cur {
+            return;
+        }
+        let ws = self.cur_ws();
+        let i = ws.wins.iter().position(|x| *x == w).unwrap();
+        ws.wins.remove(i);
+        if ws.fullscreen == Some(w) {
+            ws.fullscreen = None;
+        }
+        ws.focus = if ws.wins.is_empty() { None } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
+        let next = ws.focus;
+        let dst = self.spaces.entry(n).or_insert_with(Ws::new);
+        dst.wins.push(w);
+        dst.focus = Some(w);
+        self.set_focus(next);
         self.relayout();
     }
 
@@ -970,29 +1169,57 @@ impl Wm {
             }
             Action::Focus(d) => {
                 let d = *d;
-                if let Some(i) = self.focus.and_then(|f| self.wins.iter().position(|x| *x == f)) {
-                    let n = self.wins.len() as i32;
-                    let j = (i as i32 + d).rem_euclid(n) as usize;
-                    let w = self.wins[j];
+                let ws = self.cur_ws();
+                if let Some(i) = ws.focus.and_then(|f| ws.wins.iter().position(|x| *x == f)) {
+                    let n = ws.wins.len() as i32;
+                    let w = ws.wins[(i as i32 + d).rem_euclid(n) as usize];
+                    if ws.fullscreen.is_some() {
+                        ws.fullscreen = Some(w);
+                    }
                     self.set_focus(Some(w));
                 }
             }
             Action::Move(d) => {
                 let d = *d;
-                if let Some(i) = self.focus.and_then(|f| self.wins.iter().position(|x| *x == f)) {
+                let ws = self.cur_ws();
+                if let Some(i) = ws.focus.and_then(|f| ws.wins.iter().position(|x| *x == f)) {
                     let j = i as i32 + d;
-                    if j >= 0 && (j as usize) < self.wins.len() {
-                        self.wins.swap(i, j as usize);
+                    if j >= 0 && (j as usize) < ws.wins.len() {
+                        ws.wins.swap(i, j as usize);
                         self.relayout();
                     }
                 }
+            }
+            Action::Workspace(n) => {
+                let n = *n;
+                self.switch_to(n);
+            }
+            Action::MoveTo(n) => {
+                let n = *n;
+                self.move_to(n);
+            }
+            Action::Layout(l) => {
+                let l = *l;
+                let ws = self.cur_ws();
+                ws.layout = match (l, ws.layout) {
+                    (Some(l), _) => l,
+                    (None, Layout::SplitH) => Layout::SplitV,
+                    (None, _) => Layout::SplitH,
+                };
+                self.relayout();
+            }
+            Action::Fullscreen => {
+                let ws = self.cur_ws();
+                ws.fullscreen = if ws.fullscreen.is_some() { None } else { ws.focus };
+                self.relayout();
             }
             Action::Exit => self.quit = true,
         }
     }
 
     fn win_at(&self, x: i32, y: i32) -> Option<(Win, Rect)> {
-        self.wins.iter().find_map(|w| self.rect_of(*w).filter(|r| r.contains(x, y)).map(|r| (*w, r)))
+        let ws = self.spaces.get(&self.cur)?;
+        ws.wins.iter().find_map(|w| self.rect_of(*w).filter(|r| r.contains(x, y)).map(|r| (*w, r)))
     }
 
     fn pointer_moved(&mut self, old: (i32, i32)) {
@@ -1035,7 +1262,16 @@ impl Wm {
             return;
         }
         if value == 1 {
-            if let Some((w, _)) = self.win_at(self.ptr.0, self.ptr.1) {
+            let (x, y) = self.ptr;
+            if let Some(n) = self.bar_hit(x, y) {
+                self.switch_to(n);
+                return;
+            }
+            if let Some(w) = self.tab_hit(x, y) {
+                self.set_focus(Some(w));
+                return;
+            }
+            if let Some((w, _)) = self.win_at(x, y) {
                 self.set_focus(Some(w));
             }
         }
@@ -1062,15 +1298,23 @@ impl Wm {
                 px[y as usize * stride..y as usize * stride + sw].fill(bg);
             }
         }
-        if self.wins.is_empty() {
+        let (wins, layout, full) = match self.spaces.get(&self.cur) {
+            Some(ws) => (ws.wins.clone(), ws.layout, ws.fullscreen),
+            None => (vec![], Layout::SplitH, None),
+        };
+        if wins.is_empty() {
             self.draw_hint(y0, y1);
         }
-        for w in self.wins.clone() {
+        if layout == Layout::Tabbed && full.is_none() && !wins.is_empty() {
+            self.draw_tabs(&wins, y0, y1);
+        }
+        for w in wins {
             let Some(r) = self.rect_of(w) else { continue };
-            let color = if self.focus == Some(w) { FOCUS } else { UNFOCUS };
-            // 枠
-            let outer = Rect { x: r.x - BORDER, y: r.y - BORDER, w: r.w + 2 * BORDER, h: r.h + 2 * BORDER };
-            self.fill_rect(outer, color, y0, y1);
+            if full != Some(w) {
+                let color = if self.focus == Some(w) { FOCUS } else { UNFOCUS };
+                let outer = Rect { x: r.x - BORDER, y: r.y - BORDER, w: r.w + 2 * BORDER, h: r.h + 2 * BORDER };
+                self.fill_rect(outer, color, y0, y1);
+            }
             self.fill_rect(r, term_bg(), y0, y1);
             let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { continue };
             let (iw, ih) = (s.iw as i32, s.ih as i32);
@@ -1082,10 +1326,151 @@ impl Wm {
                 px[dst..dst + n].copy_from_slice(&s.image[sy * s.iw..sy * s.iw + n]);
             }
         }
+        if full.is_none() {
+            self.draw_bar(y0, y1);
+        }
         if self.ptr_shown {
             self.draw_cursor(y0, y1);
         }
         self.fb.present_rows(y0 as usize, y1 as usize);
+    }
+
+    fn title_of(&self, w: Win) -> String {
+        self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)).map(|s| s.title.clone()).unwrap_or_default()
+    }
+
+    /// バーの場所
+    fn bar_rect(&self) -> Option<Rect> {
+        let (top, _) = self.config.bar.as_ref()?;
+        let y = if *top { 0 } else { self.height() - BAR_H };
+        Some(Rect { x: 0, y, w: self.width(), h: BAR_H })
+    }
+
+    /// バーのワークスペースの札: (番号, 場所)
+    fn bar_labels(&self) -> Vec<(u32, Rect)> {
+        let (Some(b), Some(t)) = (self.bar_rect(), self.text.as_ref()) else { return vec![] };
+        let mut x = 0;
+        let mut out = vec![];
+        for &n in self.spaces.keys() {
+            let w = t.width(&n.to_string(), BAR_FONT) + 16;
+            out.push((n, Rect { x, y: b.y, w, h: b.h }));
+            x += w + 1;
+        }
+        out
+    }
+
+    fn bar_hit(&self, x: i32, y: i32) -> Option<u32> {
+        self.bar_labels().into_iter().find(|(_, r)| r.contains(x, y)).map(|(n, _)| n)
+    }
+
+    fn draw_bar(&mut self, y0: i32, y1: i32) {
+        let Some(b) = self.bar_rect() else { return };
+        if b.y >= y1 || b.y + b.h <= y0 {
+            return;
+        }
+        self.fill_rect(b, BAR_BG, y0, y1);
+        let labels = self.bar_labels();
+        let Some(t) = self.text.take() else { return };
+        let base = b.y + BAR_H - 7;
+        for (n, r) in &labels {
+            let cur = *n == self.cur;
+            self.fill_rect(*r, if cur { FOCUS } else { 0x262a36 }, y0, y1);
+            t.draw(&mut self.fb, &n.to_string(), r.x + 8, base, BAR_FONT, if cur { 0x101218 } else { 0xc8d0e0 });
+        }
+        let left = labels.last().map_or(0, |(_, r)| r.x + r.w) + 12;
+        // 真ん中: 作業中の窓の名前
+        if let Some(f) = self.focus {
+            let title = self.title_of(f);
+            t.draw(&mut self.fb, &title, left, base, BAR_FONT, 0xc8d0e0);
+        }
+        // 右: status_command の行か時計
+        let right = if self.status.is_empty() { self.clock.clone() } else { self.status.clone() };
+        let w = t.width(&right, BAR_FONT);
+        t.draw(&mut self.fb, &right, b.w - w - 10, base, BAR_FONT, 0xc8d0e0);
+        self.text = Some(t);
+    }
+
+    /// タブの並び (Tabbed のとき、窓の上)
+    fn tab_rects(&self, wins: &[Win]) -> Vec<(Win, Rect)> {
+        let a = self.area();
+        let n = wins.len().max(1) as i32;
+        wins.iter().enumerate().map(|(i, w)| {
+            let x0 = a.x + a.w * i as i32 / n;
+            let x1 = a.x + a.w * (i as i32 + 1) / n;
+            (*w, Rect { x: x0, y: a.y, w: x1 - x0 - 1, h: TAB_H - 1 })
+        }).collect()
+    }
+
+    fn tab_hit(&self, x: i32, y: i32) -> Option<Win> {
+        let ws = self.spaces.get(&self.cur)?;
+        if ws.layout != Layout::Tabbed || ws.fullscreen.is_some() {
+            return None;
+        }
+        self.tab_rects(&ws.wins).into_iter().find(|(_, r)| r.contains(x, y)).map(|(w, _)| w)
+    }
+
+    fn draw_tabs(&mut self, wins: &[Win], y0: i32, y1: i32) {
+        let tabs = self.tab_rects(wins);
+        let Some(t) = self.text.take() else { return };
+        for (w, r) in tabs {
+            let on = self.focus == Some(w);
+            self.fill_rect(r, if on { FOCUS } else { 0x262a36 }, y0, y1);
+            let title = self.title_of(w);
+            t.draw(&mut self.fb, &title, r.x + 8, r.y + TAB_H - 7, BAR_FONT, if on { 0x101218 } else { 0xc8d0e0 });
+        }
+        self.text = Some(t);
+    }
+
+    /// 時計をすすめる (変わったらバーを描きなおす)
+    fn tick(&mut self) {
+        if self.config.bar.is_none() || !self.status.is_empty() {
+            return;
+        }
+        let now = clock();
+        if now != self.clock {
+            self.clock = now;
+            if let Some(b) = self.bar_rect() {
+                self.mark(b.y, b.y + b.h);
+            }
+        }
+    }
+
+    /// status_command を動かし、その標準出力を読む fd
+    fn spawn_status(&self, cmd: &str) -> Option<RawFd> {
+        use std::os::fd::IntoRawFd;
+        let mut c = std::process::Command::new("/bin/sh");
+        c.arg("-c").arg(cmd).stdout(std::process::Stdio::piped());
+        for (k, v) in &self.env {
+            c.env(k, v);
+        }
+        let child = c.spawn().map_err(|e| eprintln!("aiwm: status_command: {}", e)).ok()?;
+        let fd = child.stdout?.into_raw_fd();
+        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        Some(fd)
+    }
+
+    fn read_status(&mut self) {
+        let Some(fd) = self.status_fd else { return };
+        let mut buf = [0u8; 4096];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n <= 0 {
+            if n == 0 {
+                unsafe { libc::close(fd) };
+                self.status_fd = None;
+            }
+            return;
+        }
+        self.status_buf.extend_from_slice(&buf[..n as usize]);
+        if let Some(end) = self.status_buf.iter().rposition(|&b| b == b'\n') {
+            let text = String::from_utf8_lossy(&self.status_buf[..end]).to_string();
+            self.status_buf.drain(..=end);
+            if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
+                self.status = line.trim().to_string();
+                if let Some(b) = self.bar_rect() {
+                    self.mark(b.y, b.y + b.h);
+                }
+            }
+        }
     }
 
     fn fill_rect(&mut self, r: Rect, rgb: u32, y0: i32, y1: i32) {
@@ -1138,6 +1523,14 @@ impl Wm {
             }
         }
     }
+}
+
+/// 時計の文字 (年-月-日 時:分)
+fn clock() -> String {
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{}-{:02}-{:02} {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
 }
 
 fn term_bg() -> u32 {
