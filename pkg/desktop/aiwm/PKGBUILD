@@ -1,0 +1,28 @@
+# aiwm: aios のタイル型 Wayland コンポジタ (sway の小さな親戚)。このリポジトリの desktop/ から
+#   設定は /etc/aiwm/config (~/.config/aiwm/config があればそちら)。aiwm で始め、$mod+Shift+e で終わる
+pkgname=aiwm
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Tiling Wayland compositor for aios (sway-like config)'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('aifont' 'aiterm')
+makedepends=('rustup')
+backup=(etc/aiwm/config)
+
+pkgver() {
+  cd "$startdir/../../.."
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- desktop)" "$(git log -1 --format=%h -- desktop)"
+}
+
+build() {
+  cd "$startdir/../../../desktop"
+  unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release --bin aiwm
+}
+
+package() {
+  install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aiwm" "$pkgdir/usr/bin/aiwm"
+  install -Dm644 "$startdir/../../../desktop/etc/aiwm/config" "$pkgdir/etc/aiwm/config"
+}

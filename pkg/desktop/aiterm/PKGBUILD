@@ -1,0 +1,25 @@
+# aiterm: aios の端末 (Wayland のクライアント)。aifont で描き、$SHELL (aish) を動かす。このリポジトリの desktop/ から
+pkgname=aiterm
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Terminal emulator for aios (Wayland, aifont)'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+depends=('aifont')
+makedepends=('rustup')
+
+pkgver() {
+  cd "$startdir/../../.."
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- desktop)" "$(git log -1 --format=%h -- desktop)"
+}
+
+build() {
+  cd "$startdir/../../../desktop"
+  unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release --bin aiterm
+}
+
+package() {
+  install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aiterm" "$pkgdir/usr/bin/aiterm"
+}

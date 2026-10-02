@@ -1,0 +1,34 @@
+# aiwm の設定 (sway と同じ書き方)。~/.config/aiwm/config があれば、こちらの代わりにそれを読む
+#   cp /etc/aiwm/config ~/.config/aiwm/config して書きかえる。読みなおすには aiwm を起動しなおす
+
+# 修飾キー: Mod1 は Alt (Mac の Option)、Mod4 は Super (Windows キー、Mac の Command)
+#   Mac の QEMU の窓では Command が QEMU に取られることがあるので、既定は Mod1
+set $mod Mod1
+
+# 端末
+set $term aiterm
+
+bindsym $mod+Return exec $term
+bindsym $mod+Shift+q kill
+
+# 窓を移る / 窓を動かす (窓は横に並ぶ)
+bindsym $mod+h focus left
+bindsym $mod+l focus right
+bindsym $mod+Left focus left
+bindsym $mod+Right focus right
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+l move right
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Right move right
+
+# aiwm を終わる
+bindsym $mod+Shift+e exit
+
+# キーボードの配列 (us か jp)。端末などには XKB_DEFAULT_LAYOUT で伝わる
+# input type:keyboard xkb_layout jp
+
+# 背景の色
+# output * bg #0e1018 solid_color
+
+# 起動したときに動かすもの
+exec $term
