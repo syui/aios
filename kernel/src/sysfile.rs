@@ -435,6 +435,10 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name) = parent_at(dirfd, pathp)?;
+    // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
+    if parent.lookup(&name).is_ok() {
+        return Err(-EEXIST);
+    }
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::Dir)?;
@@ -488,6 +492,10 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     if matches!(node, NewNode::Dev(..) | NewNode::Blk(..)) && c.euid != 0 {
         return Err(-cred::EPERM);
     }
+    // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
+    if parent.lookup(&name).is_ok() {
+        return Err(-EEXIST);
+    }
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !UMASK, node)?;
     own_new(&c, &parent, &ino)?;
@@ -506,6 +514,10 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
     let (parent, name) = parent_at(dirfd, pathp)?;
+    // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
+    if parent.lookup(&name).is_ok() {
+        return Err(-EEXIST);
+    }
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;

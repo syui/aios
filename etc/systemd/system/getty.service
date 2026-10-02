@@ -1,3 +1,13 @@
+# コンソールのシェル: 起動したら ai で自動ログインする (aios は AI がすぐシェルを使える OS)
+#
+# 自動ログインをやめる / ほかのユーザーにするには、この本体は書きかえずに上書き (drop-in) を置く:
+#   /etc/systemd/system/getty.service.d/override.conf
+#     [Service]
+#     ExecStart=
+#     ExecStart=/bin/login
+#   (ExecStart= で空にしてから書く。/bin/login はユーザー名とパスワードを聞く。
+#    /bin/login -f NAME なら NAME で自動ログイン)
+# パスワードを付けるのは: sudo passwd ai
 [Unit]
 Description=Console shell (autologin)
 After=motd.service swap.service networkd.service

@@ -37,6 +37,11 @@ pub struct Unit {
     pub workdir: Option<String>,
     pub tty: bool,
     pub wanted_by: Vec<String>,
+    /// User= / Group=: このユーザー (とグループ) で動かす
+    pub user: Option<String>,
+    pub group: Option<String>,
+    /// ConditionPathExists=: なければ起動しないで飛ばす ("!" で始まれば、あれば飛ばす)
+    pub cond_paths: Vec<String>,
 }
 
 /// systemd と同じように空白で区切る (クォートは外す)
@@ -130,6 +135,9 @@ pub fn parse(name: &str, path: &str, text: &str) -> Unit {
         workdir: kv.get("Service.WorkingDirectory").and_then(|v| v.last().cloned()),
         tty: matches!(one("Service.StandardInput").as_str(), "tty" | "tty-force"),
         wanted_by: many("Install.WantedBy"),
+        user: Some(one("Service.User")).filter(|v| !v.is_empty()),
+        group: Some(one("Service.Group")).filter(|v| !v.is_empty()),
+        cond_paths: kv.get("Unit.ConditionPathExists").cloned().unwrap_or_default().into_iter().filter(|v| !v.is_empty()).collect(),
     }
 }
 
@@ -138,9 +146,11 @@ pub fn full_name(name: &str) -> String {
     if name.contains('.') { name.to_string() } else { format!("{}.service", name) }
 }
 
-/// ユニットをすべて読む (/etc が /usr/lib より優先)
+/// ユニットをすべて読む (/etc が /usr/lib より優先)。
+/// NAME.service.d/*.conf (drop-in) があれば、うしろに足して読む (同じ項目はあとのものが勝つ。
+/// ExecStart= のように、空にしてから書きなおすのも systemd と同じ)
 pub fn load_all() -> BTreeMap<String, Unit> {
-    let mut out = BTreeMap::new();
+    let mut texts: BTreeMap<String, (String, String)> = BTreeMap::new();
     for dir in UNIT_DIRS {
         let Ok(rd) = fs::read_dir(dir) else { continue };
         for e in rd.flatten() {
@@ -150,9 +160,31 @@ pub fn load_all() -> BTreeMap<String, Unit> {
             }
             let path = format!("{}/{}", dir, name);
             if let Ok(text) = fs::read_to_string(&path) {
-                out.insert(name.clone(), parse(&name, &path, &text));
+                texts.insert(name, (path, text));
             }
         }
+    }
+    let mut out = BTreeMap::new();
+    for (name, (path, mut text)) in texts {
+        let mut drops: Vec<(String, String)> = vec![];
+        for dir in UNIT_DIRS {
+            for e in fs::read_dir(format!("{}/{}.d", dir, name)).into_iter().flatten().flatten() {
+                let f = e.file_name().to_string_lossy().to_string();
+                if f.ends_with(".conf") {
+                    // 同じ名前なら /etc のもの
+                    drops.retain(|(n, _)| *n != f);
+                    drops.push((f, e.path().to_string_lossy().to_string()));
+                }
+            }
+        }
+        drops.sort();
+        for (_, p) in drops {
+            if let Ok(t) = fs::read_to_string(&p) {
+                text.push('\n');
+                text.push_str(&t);
+            }
+        }
+        out.insert(name.clone(), parse(&name, &path, &text));
     }
     out
 }

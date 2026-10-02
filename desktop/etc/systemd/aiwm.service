@@ -1,0 +1,20 @@
+# aiwm を起動のときに画面に出す (最初は無効。有効にするのは sudo systemctl enable aiwm)
+#   コンソールのシェル (getty) とは別に動くので、シェルはそのまま使える。ログは journalctl -u aiwm
+#   ほかのユーザーで動かすには /etc/systemd/system/aiwm.service.d/override.conf に
+#     [Service]
+#     User=NAME
+[Unit]
+Description=aiwm (Wayland compositor on the screen)
+After=getty.service
+# 画面がない (QEMU を AIOS_DISPLAY なしで起動した) ときは動かさない
+ConditionPathExists=/dev/fb0
+
+[Service]
+User=ai
+WorkingDirectory=~
+ExecStart=/usr/bin/aiwm
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
