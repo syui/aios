@@ -36,7 +36,7 @@ package() {
   ln -s usr/bin "$pkgdir/bin"
   ln -s usr/bin "$pkgdir/sbin"
   ln -s bin "$pkgdir/usr/sbin"
-  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios ip networkd chsh; do
+  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios ip networkd chsh modprobe; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす
@@ -46,10 +46,15 @@ package() {
   ln -s systemctl "$pkgdir/usr/bin/poweroff"
   ln -s systemctl "$pkgdir/usr/bin/reboot"
   ln -s swapon "$pkgdir/usr/bin/swapoff"
+  for p in lsmod rmmod insmod; do
+    ln -s modprobe "$pkgdir/usr/bin/$p"
+  done
   # sh として呼ばれた aish は POSIX の sh として動く
   ln -s aish "$pkgdir/usr/bin/sh"
 
   cp -r "$top/etc" "$pkgdir/etc"
+  # 起動のときに起こすモジュール (desktop などのパッケージが置く)
+  install -d "$pkgdir/etc/modules-load.d"
   # ~/.aishrc の見本 (使うときに cp する)
   install -Dm644 "$startdir/aishrc.example" "$pkgdir/usr/share/aish/aishrc.example"
   chmod 600 "$pkgdir/etc/shadow"

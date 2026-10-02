@@ -178,6 +178,9 @@ mod nr {
     pub const PIDFD_SEND_SIGNAL: u64 = 424;
     pub const PIDFD_OPEN: u64 = 434;
     pub const PRLIMIT64: u64 = 261;
+    pub const INIT_MODULE: u64 = 105;
+    pub const DELETE_MODULE: u64 = 106;
+    pub const FINIT_MODULE: u64 = 273;
     pub const RENAMEAT2: u64 = 276;
     pub const COPY_FILE_RANGE: u64 = 285;
     pub const PREADV2: u64 = 286;
@@ -357,6 +360,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
         UNAME => sys_uname(a[0] as usize),
         REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
+        INIT_MODULE => sys_init_module(a[0] as usize, a[1] as usize),
+        FINIT_MODULE => sys_finit_module(a[0]),
+        DELETE_MODULE => sys_delete_module(a[0] as usize),
         SYSINFO => sys_sysinfo(a[0] as usize),
         GETRLIMIT => sys_prlimit(a[0], 0, a[1] as usize),
         PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
@@ -908,6 +914,27 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
 }
 
 /// 電源を切る / 再起動する (PSCI)
+/// init_module(image, len, params): 札 (module.rs) をメモリで
+fn sys_init_module(image: usize, len: usize) -> R {
+    let mut img = alloc::vec![0u8; len.min(4096)];
+    proc::current().pt().copy_in(&mut img, image).ok_or(-EFAULT)?;
+    crate::module::load(&img)
+}
+
+/// finit_module(fd, params, flags): 札のファイル (/usr/lib/modules/NAME.ko) を読む
+fn sys_finit_module(fd: u64) -> R {
+    let f = proc::current().files().get(fd).cloned().ok_or(-9)?;
+    let mut img = alloc::vec![0u8; 4096];
+    let n = f.borrow_mut().read(&mut img)?;
+    img.truncate(n);
+    crate::module::load(&img)
+}
+
+fn sys_delete_module(name: usize) -> R {
+    let name = proc::current().pt().copy_in_str(name, 64).ok_or(-EFAULT)?;
+    crate::module::unload(core::str::from_utf8(&name).map_err(|_| -EINVAL)?)
+}
+
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     if proc::current().cred.euid != 0 {
         return Err(-(cred::EPERM));
