@@ -126,6 +126,7 @@ if [ -n "$AIOS_DISPLAY" ]; then
   fi
   set -- "$@" -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device
   out="-display $disp -serial mon:stdio"
+  echo "display: $disp (virtio-gpu, keyboard, tablet)" >&2
 fi
 # shellcheck disable=SC2086
 set -- "$@" ${AIOS_QEMU_ARGS:-}
