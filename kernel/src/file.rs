@@ -403,6 +403,34 @@ impl OpenFile {
         }
     }
 
+    /// 調べるための様子 (/proc/PID/stack の fd の一覧)
+    pub fn debug_state(&self) -> String {
+        let (r, w, h) = self.readiness();
+        let rw = alloc::format!("r{}w{}h{}", r as u8, w as u8, h as u8);
+        match &self.kind {
+            Kind::Pair(rx, tx) => {
+                let (rx, tx) = (rx.borrow(), tx.borrow());
+                let types = |p: &Pipe| p.types.iter().map(|(t, (n, at))| alloc::format!("{}:{}@{}", t, n, at)).collect::<Vec<_>>().join(" ");
+                let heads = |p: &Pipe| {
+                    p.heads.iter().map(|h| {
+                        let u = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+                        alloc::format!("{:x}/{}/{}", u(8), u(0), u(4) as i32)
+                    }).collect::<Vec<_>>().join(" ")
+                };
+                alloc::format!(
+                    "{} {} rx={} (writers {}, gen {}, bytes {}) tx={} (readers {}, gen {}, bytes {})\n    in: {}\n    out: {}\n    intypes: {}\n    outtypes: {}",
+                    self.describe(), rw, rx.len(), rx.writers, rx.generation, rx.wrote, tx.len(), tx.readers, tx.generation, tx.wrote, heads(&rx), heads(&tx), types(&rx), types(&tx)
+                )
+            }
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
+                let p = p.borrow();
+                alloc::format!("{} {} len={} r={} w={}", self.describe(), rw, p.len(), p.readers, p.writers)
+            }
+            Kind::Epoll(e) => alloc::format!("epoll{}", e.borrow().debug()),
+            _ => alloc::format!("{} {}", self.describe(), rw),
+        }
+    }
+
     /// poll 用: (読める, 書ける, 閉じた/エラー)
     pub fn readiness(&self) -> (bool, bool, bool) {
         match &self.kind {
@@ -644,12 +672,16 @@ pub struct Pipe {
     pub taken: u64,
     /// sendmsg の SCM_RIGHTS で送られた fd (wrote のどこから始まるデータについてきたか)
     pub rights: alloc::collections::VecDeque<(u64, Vec<FileRef>)>,
+    /// 調べるための記録: 最近の書きこみの頭 20 バイト (IPC のメッセージの見出し)
+    pub heads: alloc::collections::VecDeque<[u8; 20]>,
+    /// 調べるための記録: 書きこみの頭の IPC のメッセージの型ごとの (回数, 最後に書いたのは何回目の書きこみか)
+    pub types: alloc::collections::BTreeMap<u32, (u32, u64)>,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }));
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -701,7 +733,7 @@ impl Pipe {
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
         let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }));
+        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
     }
@@ -709,7 +741,7 @@ impl Pipe {
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<RefCell<Pipe>> {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new() }))
+        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }))
     }
 
     fn wake(p: &Rc<RefCell<Pipe>>) {
@@ -754,6 +786,20 @@ impl Pipe {
                 let room = pp.cap.saturating_sub(pp.data.len);
                 let k = room.min(src.len() - done);
                 if k > 0 {
+                    if done == 0 && src.len() >= 20 {
+                        if pp.heads.len() >= 32 {
+                            pp.heads.pop_front();
+                        }
+                        pp.heads.push_back(src[..20].try_into().unwrap());
+                        // IPC でないもの (ふつうのパイプ) では型がばらばらなので、128 種類まで
+                        let t = u32::from_le_bytes(src[4..8].try_into().unwrap());
+                        let nth = pp.generation;
+                        if pp.types.len() < 128 || pp.types.contains_key(&t) {
+                            let e = pp.types.entry(t).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 = nth;
+                        }
+                    }
                     pp.data.push(&src[done..done + k])?;
                     pp.generation += 1;
                     pp.wrote += k as u64;

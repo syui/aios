@@ -104,6 +104,18 @@ impl Epoll {
         out
     }
 
+    /// 調べるための様子: 登録ごとに fd、見張るビット、いまのビット、前に知らせたビットと世代
+    pub fn debug(&self) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for (fd, e) in &self.entries {
+            let Some(f) = e.file.upgrade() else { continue };
+            let now = mask_of(&f);
+            let g = f.borrow().event_gen();
+            s.push_str(&alloc::format!(" [{} ev={:#x} now={:#x} last={:#x} gen={}/{}]", fd, e.events, now, e.last, g, e.last_gen));
+        }
+        s
+    }
+
     pub fn readable(&mut self) -> bool {
         !self.collect(1, false).is_empty()
     }
