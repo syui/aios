@@ -7,7 +7,7 @@
 #   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
 pkgname=firefox
 pkgver=157.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
 arch=('aarch64')
 license=('MPL-2.0')
@@ -23,9 +23,10 @@ source=("https://archive.mozilla.org/pub/firefox/releases/$pkgver/source/firefox
         sandbox-sched_setscheduler.patch
         musl-pthread_t.patch
         aios-configure.patch
-        wayland-without-dbus.patch)
+        wayland-without-dbus.patch
+        aios-prefs.js)
 sha256sums=('259c564dd4bbd56bbe8a9a6cf001fc8812853567fd3a78e77c9ddf10d7d4e982'
-            SKIP SKIP SKIP SKIP SKIP SKIP)
+            SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
 
 # ビルドするマシンの LLVM (clang-20 / llvm-20 があればそれ)
 _llvm=${FIREFOX_LLVM:-20}
@@ -150,5 +151,7 @@ package() {
   MOZCONFIG=$srcdir/mozconfig DESTDIR="$pkgdir" ./mach install
   install -d "$pkgdir$PREFIX/bin"
   ln -sf ../lib/firefox/firefox "$pkgdir$PREFIX/bin/firefox"
+  # aios の既定の設定 (画面の更新を 1 秒に 30 回に。中に理由)
+  install -Dm644 "$srcdir/aios-prefs.js" "$pkgdir$PREFIX/lib/firefox/defaults/pref/aios-prefs.js"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
