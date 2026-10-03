@@ -59,6 +59,8 @@ package() {
   done
   # sh として呼ばれた aish は POSIX の sh として動く
   ln -s aish "$pkgdir/usr/bin/sh"
+  # aipkg の短い名前 (sudo ap -Syu。sudo はシェルの alias を見ないのでリンクにする)
+  ln -s aipkg "$pkgdir/usr/bin/ap"
 
   cp -r "$top/etc" "$pkgdir/etc"
   # 起動のときに起こすモジュール (desktop などのパッケージが置く)

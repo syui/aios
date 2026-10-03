@@ -1,2 +1,2 @@
-  systemctl list-units / journalctl -u UNIT / aipkg -S PKG / aios
+  systemctl list-units / journalctl -u UNIT / ap -S PKG / aios
 

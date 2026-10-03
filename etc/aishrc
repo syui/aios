@@ -10,7 +10,7 @@ alias ll='ls -alh --color=auto'
 alias df='df -H'
 alias as='${EDITOR:-vi} ~/.aishrc'
 alias ar='exec aish'
-alias u='sudo aipkg -Syu'
+alias u='sudo ap -Syu'
 
 HISTSIZE=10000
 
