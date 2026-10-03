@@ -40,7 +40,7 @@ const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも�
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。";
 
 impl Shell {
-    pub fn mcp(&mut self) -> ! {
+    pub fn mcp(&mut self, rcs: &[String]) -> ! {
         PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
         unsafe { std::env::set_var("AISH_MCP", "1") };
         // プロトコルは自分だけが使う fd で話す。0 は /dev/null、1 は 2 (標準エラー) にして、
@@ -57,7 +57,8 @@ impl Shell {
         let home = self.get_var("HOME").unwrap_or_default();
         let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.aish_history", home));
         self.histfile = (!home.is_empty() || file.starts_with('/')).then_some(file);
-        for rc in ["/etc/aishrc".to_string(), format!("{}/.aishrc", home)] {
+        // /etc/aishrc、~/.aishrc、それから aish --mcp RC... で渡したもの (ホームに設定を置けないところで)
+        for rc in ["/etc/aishrc".to_string(), format!("{}/.aishrc", home)].into_iter().chain(rcs.iter().cloned()) {
             if std::path::Path::new(&rc).is_file() {
                 self.builtin(&[".".into(), rc]);
             }

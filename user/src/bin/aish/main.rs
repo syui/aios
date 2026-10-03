@@ -1665,9 +1665,9 @@ fn main() {
         let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
     }
-    // aish --mcp: MCP のサーバー (mcp.rs)
+    // aish --mcp [RC...]: MCP のサーバー (mcp.rs)
     if args.get(1).is_some_and(|a| a == "--mcp") {
-        Shell::new(vec![args[0].clone()]).mcp();
+        Shell::new(vec![args[0].clone()]).mcp(&args[2..]);
     }
     // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);

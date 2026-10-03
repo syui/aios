@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aish": {
+      "command": "bin/aish-mcp.sh",
+      "args": []
+    }
+  }
+}

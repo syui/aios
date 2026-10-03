@@ -1,0 +1,5 @@
+# bin/aish-mcp.sh (開発のマシンの aish --mcp) が読む設定。aios では /etc/aishrc が同じことをする
+plugin aish-pick
+plugin aish-edit
+plugin aish-wait
+plugin aish-map
