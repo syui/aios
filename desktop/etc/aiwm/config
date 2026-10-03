@@ -57,6 +57,13 @@ bindsym $mod+e layout toggle split
 bindsym $mod+w layout tabbed
 bindsym $mod+f fullscreen
 
+# 浮かせる窓: ダイアログ (親のある窓) と大きさの決まった窓は、タイルに入れずに浮かせる
+#   $mod+Shift+space で浮かせる / タイルに戻す。$mod を押しながら左ボタンでドラッグして動かす
+#   ほかに浮かせたいものは for_window [app_id="..."] floating enable (app_id で)
+floating_modifier $mod
+bindsym $mod+Shift+space floating toggle
+# for_window [app_id="aisplash"] floating enable
+
 # aiwm を終わる
 bindsym $mod+Shift+e exit
 
