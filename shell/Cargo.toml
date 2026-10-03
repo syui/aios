@@ -1,0 +1,22 @@
+# aish のプラグイン (aish とは別のプログラム。1 行 1 つの JSON で話す。README.md)
+#   plugin:   SDK (aish-plugin クレート)。プラグインはこれを使って書く
+#   complete: Tab の補完              suggest: グレーの候補 (履歴から)
+#   pick:     C-r C-f C-j C-k C-p C-p (絞りこみの選択、cd ..、端末へのコピー)
+#   powerline: powerline のプロンプト ([shell] リポジトリの aish-powerline)
+[workspace]
+resolver = "2"
+members = ["plugin", "complete", "suggest", "pick", "powerline"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serde_json = "1"
+aish-plugin = { path = "plugin" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+strip = true

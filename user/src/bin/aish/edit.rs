@@ -1,44 +1,45 @@
-// 対話するときの行の編集 (emacs のようなキー)、履歴、補完
+// 対話するときの行の編集 (emacs のようなキー) と履歴。ここにあるのは土台だけで、
+// 補完の候補、グレーの候補、キーに結んだ機能はプラグイン (plugin.rs) が出す
 //   ← → C-b             1 文字うごく (→ と End は、行の終わりならグレーの候補を決める)
 //   M-b M-f             1 語うごく       C-a Home / C-e End   行の頭 / 終わり
 //   C-h BS / C-d Del    消す (空の行で C-d は終わり)
-//   C-u                 頭まで消す       C-k   終わりまで消す (空の行なら cd ..)
+//   C-u                 頭まで消す       C-k   終わりまで消す
 //   C-w M-BS            前の 1 語を消す  C-l   画面を消す
 //   ↑ ↓                 打ちかけの文字をふくむ履歴をさかのぼる / もどる (zsh の history-substring-search)
-//   C-p C-n             履歴をさかのぼる / もどる。C-p C-p は打ちかけの行を端末へコピー (OSC 52)
-//   Tab                 補完 (コマンド、ファイル、$変数。大文字小文字は区別しない)。
-//                       決まらなければ候補を出し、もう一度 Tab で選ぶ (Tab / S-Tab / 矢印、Enter で決める)
-//   C-r                 履歴を絞りこんで選ぶ    C-f   ファイルを絞りこんで入れる
-//   C-j                 最近のディレクトリを絞りこんで cd   (絞りこみ: 空白で区切った語をすべてふくむもの)
+//   C-p C-n             履歴をさかのぼる / もどる
+//   Tab                 補完 (候補は complete のプラグイン)。決まらなければ候補を出し、
+//                       もう一度 Tab で選ぶ (Tab / S-Tab / 矢印、Enter で決める)
 //   C-c                 打ちかけの行を捨てる    Enter 決める
-// 打っている行に続く履歴があれば、グレーで出す (zsh-autosuggestions)。
+// bindkey で結んだキーは、上のものより先にプラグインの機能を呼ぶ ("C-p C-p" のように 2 つ続けても)。
+// 打っている行に続くもの (suggest のプラグイン) は、グレーで出す。
 // 履歴は $HISTFILE (なければ ~/.aish_history) に、打つたびに足す。$HISTSIZE 行まで (既定 10000)。
 // 前と同じ行は足さない。プロンプトの中の ESC [ ... m (色) と \x01 \x02 で囲んだところは幅に数えない
+use super::plugin::Plugins;
+use serde_json::json;
 use std::io::Write;
 
 pub enum Input {
     Line(String),
-    /// 履歴に残さずに動かすもの (C-k の cd ..、C-j の cd)
+    /// 履歴に残さずに動かすもの (プラグインの機能の run と silent)
     Silent(String),
     Eof,
     Interrupt,
 }
 
-/// 補完などに使う、シェルの様子
+/// 補完などのためにプラグインへ渡す、シェルの様子
 pub struct Ctx {
     /// 組み込み、alias、関数の名前
     pub cmds: Vec<String>,
     /// シェルの変数の名前
     pub vars: Vec<String>,
-    /// 最近のディレクトリ (新しいものが先)
-    pub dirs: Vec<String>,
     pub home: String,
     pub path: String,
+    pub pwd: String,
 }
 
 pub struct Editor {
     pub history: Vec<String>,
-    file: Option<String>,
+    pub file: Option<String>,
     size: usize,
 }
 
@@ -201,6 +202,29 @@ fn read_key() -> Option<Key> {
     })
 }
 
+/// ms だけ待ってキーを 1 つ (2 つ続けるキーの 2 つ目)
+fn read_key_within(ms: i32) -> Option<Key> {
+    let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    if unsafe { libc::poll(&mut p, 1, ms) } <= 0 {
+        return None;
+    }
+    read_key()
+}
+
+/// キーの名前 (bindkey の書き方): "C-r" "M-f" "Tab" "Enter" "Esc" "BS" ...。名前のないものは None
+fn key_name(k: &Key) -> Option<String> {
+    Some(match k {
+        Key::Byte(0x09) => "Tab".into(),
+        Key::Byte(0x0d) => "Enter".into(),
+        Key::Byte(0x7f) => "BS".into(),
+        Key::Byte(0) => "C-@".into(),
+        Key::Byte(c) if *c < 0x20 => format!("C-{}", (c + 0x60) as char),
+        Key::Alt(c) if *c >= 0x20 && *c < 0x7f => format!("M-{}", *c as char),
+        Key::Esc => "Esc".into(),
+        _ => return None,
+    })
+}
+
 /// 端末を 1 文字ずつ、エコーなしに (戻すときの設定を返す)
 fn raw_mode() -> Option<libc::termios> {
     let mut old: libc::termios = unsafe { std::mem::zeroed() };
@@ -228,6 +252,8 @@ struct Line {
     pos: usize,
     /// 前に描いたときの、カーソルの行 (プロンプトの頭から)
     row: usize,
+    /// 前に描いたときの、最後の行 (プロンプトの頭から。下に出したものはのぞく)
+    end_row: usize,
 }
 
 impl Line {
@@ -306,7 +332,7 @@ impl Editor {
     }
 
     /// プロンプトを出して 1 行読む
-    pub fn read(&mut self, prompt: &str, ctx: &Ctx) -> Input {
+    pub fn read(&mut self, prompt: &str, ctx: &Ctx, pl: &mut Plugins) -> Input {
         let Some(old) = raw_mode() else {
             // 端末でなければ、ふつうに 1 行
             return match super::read_line() {
@@ -315,36 +341,82 @@ impl Editor {
                 Err(_) => Input::Interrupt,
             };
         };
-        let r = self.edit(prompt, ctx);
+        let r = self.edit(prompt, ctx, pl);
         unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &old) };
         r
     }
 
-    /// 打っている行に続く、いちばん新しい履歴の残り (グレーで出す)
-    fn suggestion(&self, l: &Line) -> Option<String> {
-        if l.buf.is_empty() || l.pos != l.buf.len() {
+    /// 打っている行に続くもの (グレーで出す。suggest のプラグイン)
+    fn suggestion(&self, l: &Line, pl: &mut Plugins) -> Option<String> {
+        if l.buf.is_empty() || l.pos != l.buf.len() || !pl.wants("suggest") {
             return None;
         }
-        let t = l.text();
-        self.history.iter().rev().find(|h| h.len() > t.len() && h.starts_with(&t)).map(|h| h[t.len()..].to_string())
+        let r = pl.ask("suggest", json!({ "line": l.text() }))?;
+        r["suggest"].as_str().filter(|s| !s.is_empty() && !s.contains('\n')).map(String::from)
     }
 
-    fn edit(&mut self, prompt: &str, ctx: &Ctx) -> Input {
-        let mut l = Line { buf: Vec::new(), pos: 0, row: 0 };
+    /// キーに結んだ機能を呼ぶ。端末はプラグインに渡す (打ちかけの行の下の行の頭にカーソルを置いて)。
+    /// 行を決めて返すもの (run) があれば Some
+    fn call_widget(&mut self, prompt: &str, l: &mut Line, ctx: &Ctx, pl: &mut Plugins, b: usize) -> Option<Input> {
+        self.draw(prompt, l, None, &[]);
+        let down = l.end_row.saturating_sub(l.row);
+        let mut out = String::new();
+        if down > 0 {
+            out.push_str(&format!("\x1b[{}B", down));
+        }
+        out.push_str("\r\n");
+        print_flush(&out);
+        l.row = l.end_row + 1;
+        let ev = json!({
+            "line": l.text(),
+            "pos": l.pos,
+            "pwd": ctx.pwd,
+            "home": ctx.home,
+            "histfile": self.file.clone().unwrap_or_default(),
+        });
+        let r = pl.key(b, ev).unwrap_or(json!({}));
+        if let Some(t) = r["line"].as_str() {
+            l.set(t);
+            if let Some(p) = r["pos"].as_u64() {
+                l.pos = (p as usize).min(l.buf.len());
+            }
+        }
+        if let Some(t) = r["insert"].as_str() {
+            l.insert(t);
+        }
+        if let Some(cmd) = r["run"].as_str() {
+            self.draw(prompt, l, None, &[]);
+            print_flush("\r\n");
+            let cmd = format!("{}\n", cmd.trim_end_matches('\n'));
+            return Some(if r["silent"].as_bool().unwrap_or(false) { Input::Silent(cmd) } else { Input::Line(cmd) });
+        }
+        if r["accept"].as_bool().unwrap_or(false) {
+            l.pos = l.buf.len();
+            self.draw(prompt, l, None, &[]);
+            print_flush("\r\n");
+            return Some(Input::Line(l.text() + "\n"));
+        }
+        None
+    }
+
+    fn edit(&mut self, prompt: &str, ctx: &Ctx, pl: &mut Plugins) -> Input {
+        let mut l = Line { buf: Vec::new(), pos: 0, row: 0, end_row: 0 };
         // 履歴を見ている位置 (history.len() は打ちかけの行) と、さかのぼる前の打ちかけ
         let mut hi = self.history.len();
         let mut saved: Vec<char> = Vec::new();
         let mut search: Option<String> = None;
         let mut menu = Menu::None;
+        // 2 つ続けるキーで、1 つ目のあとに来たちがうキー (次にふつうに読む)
+        let mut pending: Option<Key> = None;
         // 先打ち: 編集を始める前に届いていた入力 (コマンドが動いている間に打ったものや、貼りつけ)。
         // その間の端末はふつうのモードで Enter (\r) が \n になっているので、\n も Enter とする (C-j ではなく)
         let mut typeahead = input_ready();
         self.draw(prompt, &mut l, None, &[]);
         loop {
-            if typeahead && !input_ready() {
+            if typeahead && pending.is_none() && !input_ready() {
                 typeahead = false;
             }
-            let Some(mut key) = read_key() else { return Input::Eof };
+            let Some(mut key) = pending.take().or_else(read_key) else { return Input::Eof };
             if typeahead && matches!(key, Key::Byte(b'\n')) {
                 key = Key::Byte(b'\r');
             }
@@ -384,7 +456,38 @@ impl Editor {
                 }
                 // ほかのキーは、決めてからそのまま続ける (空白を足したので、空白のキーはのぞく)
                 if matches!(key, Key::Byte(b' ')) {
-                    key = Key::Byte(0);
+                    key = Key::Byte(0xff);
+                }
+            }
+            // bindkey で結んだキー: プラグインの機能 (2 つ続けるものは、1 つ目のあと少し待つ)
+            if let Some(name) = key_name(&key) {
+                let two = pl.binds.iter().any(|b| b.keys.len() == 2 && b.keys[0] == name);
+                let mut hit = None;
+                if two {
+                    match read_key_within(400) {
+                        Some(k2) => {
+                            let n2 = key_name(&k2);
+                            hit = pl.binds.iter().position(|b| b.keys.len() == 2 && b.keys[0] == name && Some(&b.keys[1]) == n2.as_ref());
+                            if hit.is_none() {
+                                pending = Some(k2);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                if hit.is_none() && pending.is_none() {
+                    hit = pl.binds.iter().position(|b| b.keys.len() == 1 && b.keys[0] == name);
+                }
+                if let Some(b) = hit {
+                    menu = Menu::None;
+                    if let Some(done) = self.call_widget(prompt, &mut l, ctx, pl, b) {
+                        return done;
+                    }
+                    search = None;
+                    hi = self.history.len();
+                    let sug = self.suggestion(&l, pl);
+                    self.draw(prompt, &mut l, sug.as_deref(), &[]);
+                    continue;
                 }
             }
             let mut nav = false;
@@ -411,7 +514,7 @@ impl Editor {
                     }
                 }
                 Key::Byte(0x01) => l.pos = 0,
-                Key::Byte(0x05) => self.end_or_accept(&mut l),
+                Key::Byte(0x05) => self.end_or_accept(&mut l, pl),
                 Key::Byte(0x02) => l.pos = l.pos.saturating_sub(1),
                 Key::Byte(0x08) | Key::Byte(0x7f) => {
                     if l.pos > 0 {
@@ -419,13 +522,7 @@ impl Editor {
                         l.buf.remove(l.pos);
                     }
                 }
-                Key::Byte(0x0b) => {
-                    if l.buf.is_empty() {
-                        print_flush("\r\n");
-                        return Input::Silent("cd ..\n".into());
-                    }
-                    l.buf.truncate(l.pos);
-                }
+                Key::Byte(0x0b) => l.buf.truncate(l.pos),
                 Key::Byte(0x15) => {
                     l.buf.drain(..l.pos);
                     l.pos = 0;
@@ -436,13 +533,8 @@ impl Editor {
                     l.row = 0;
                 }
                 Key::Byte(0x10) => {
-                    // C-p C-p: 打ちかけの行を端末のクリップボードへ (OSC 52)
-                    if read_byte_within(400) == Some(0x10) {
-                        print_flush(&format!("\x1b]52;c;{}\x07", base64(l.text().as_bytes())));
-                    } else {
-                        self.step(&mut l, &mut hi, &mut saved, None, true);
-                        nav = true;
-                    }
+                    self.step(&mut l, &mut hi, &mut saved, None, true);
+                    nav = true;
                 }
                 Key::Byte(0x0e) => {
                     self.step(&mut l, &mut hi, &mut saved, None, false);
@@ -457,7 +549,7 @@ impl Editor {
                             self.draw(prompt, &mut l, None, &below);
                             Menu::Select(start, cands, 0, before)
                         }
-                        _ => self.tab(&mut l, ctx),
+                        _ => self.tab(&mut l, ctx, pl),
                     };
                     if let Menu::Select(..) = menu {
                         continue;
@@ -466,34 +558,9 @@ impl Editor {
                         Menu::Listed(_, c) => menu_lines(c, None),
                         _ => Vec::new(),
                     };
-                    let sug = self.suggestion(&l);
+                    let sug = self.suggestion(&l, pl);
                     self.draw(prompt, &mut l, sug.as_deref(), &below);
                     continue;
-                }
-                Key::Byte(0x12) => {
-                    // C-r: 履歴から
-                    let mut seen = std::collections::HashSet::new();
-                    let items: Vec<String> = self.history.iter().rev().filter(|h| seen.insert(h.as_str())).cloned().collect();
-                    if let Some(s) = self.select(prompt, &mut l, "hist", &items) {
-                        l.set(&s);
-                    }
-                }
-                Key::Byte(0x06) => {
-                    // C-f: ファイルを入れる
-                    let items = list_files(3, 5000);
-                    if let Some(s) = self.select(prompt, &mut l, "file", &items) {
-                        l.insert(&escape(&s));
-                    }
-                }
-                Key::Byte(b'\n') => {
-                    // C-j: 最近のディレクトリへ (短いものが先)
-                    let mut items = ctx.dirs.clone();
-                    items.sort_by_key(|d| d.chars().count());
-                    if let Some(s) = self.select(prompt, &mut l, "cd", &items) {
-                        let dir = if let Some(rest) = s.strip_prefix('~') { format!("{}{}", ctx.home, rest) } else { s };
-                        print_flush("\r\n");
-                        return Input::Silent(format!("cd {}\n", super::quote(&dir)));
-                    }
                 }
                 Key::Csi(s) => match s.as_slice() {
                     b"A" | b"B" => {
@@ -507,14 +574,14 @@ impl Editor {
                     }
                     b"C" => {
                         if l.pos == l.buf.len() {
-                            self.end_or_accept(&mut l);
+                            self.end_or_accept(&mut l, pl);
                         } else {
                             l.pos += 1;
                         }
                     }
                     b"D" => l.pos = l.pos.saturating_sub(1),
                     b"H" | b"1~" | b"7~" => l.pos = 0,
-                    b"F" | b"4~" | b"8~" => self.end_or_accept(&mut l),
+                    b"F" | b"4~" | b"8~" => self.end_or_accept(&mut l, pl),
                     b"3~" => {
                         if l.pos < l.buf.len() {
                             l.buf.remove(l.pos);
@@ -525,8 +592,8 @@ impl Editor {
                 Key::Alt(b'b') => l.pos = word_left(&l.buf, l.pos),
                 Key::Alt(b'f') => l.pos = word_right(&l.buf, l.pos),
                 Key::Text(t) => l.insert(&t),
-                Key::Byte(0) => {}
-                Key::Byte(c) if c >= 0x20 => l.insert(&(c as char).to_string()),
+                Key::Byte(0xff) => {}
+                Key::Byte(c) if (0x20..0x7f).contains(&c) => l.insert(&(c as char).to_string()),
                 _ => continue,
             }
             if !nav {
@@ -534,15 +601,15 @@ impl Editor {
                 hi = self.history.len();
             }
             menu = Menu::None;
-            let sug = self.suggestion(&l);
+            let sug = self.suggestion(&l, pl);
             self.draw(prompt, &mut l, sug.as_deref(), &[]);
         }
     }
 
     /// End / C-e / →: 行の終わりへ。終わりにいればグレーの候補を決める
-    fn end_or_accept(&self, l: &mut Line) {
+    fn end_or_accept(&self, l: &mut Line, pl: &mut Plugins) {
         if l.pos == l.buf.len()
-            && let Some(s) = self.suggestion(l)
+            && let Some(s) = self.suggestion(l, pl)
         {
             l.insert(&s);
         }
@@ -550,8 +617,8 @@ impl Editor {
     }
 
     /// Tab: 補完する。決まらなければ候補を出す
-    fn tab(&self, l: &mut Line, ctx: &Ctx) -> Menu {
-        let (start, cands) = complete(l, ctx);
+    fn tab(&self, l: &mut Line, ctx: &Ctx, pl: &mut Plugins) -> Menu {
+        let (start, cands) = complete(l, ctx, pl);
         let word: String = l.buf[start..l.pos].iter().collect();
         match cands.len() {
             0 => Menu::None,
@@ -578,67 +645,6 @@ impl Editor {
                     return Menu::None;
                 }
                 Menu::Listed(start, cands)
-            }
-        }
-    }
-
-    /// 絞りこんで選ぶ (C-r C-f C-j)。選んだものか、やめたら None
-    fn select(&self, prompt: &str, l: &mut Line, label: &str, items: &[String]) -> Option<String> {
-        let mut query = String::new();
-        let mut cur = 0usize;
-        let rows = 12;
-        loop {
-            let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
-            let hits: Vec<&String> = items
-                .iter()
-                .filter(|it| {
-                    let low = it.to_lowercase();
-                    words.iter().all(|w| low.contains(w.as_str()))
-                })
-                .collect();
-            cur = cur.min(hits.len().saturating_sub(1));
-            let top = cur.saturating_sub(rows - 1);
-            let mut below = vec![format!("\x1b[33m{}>\x1b[0m {} ({})", label, query, hits.len())];
-            for (k, h) in hits.iter().enumerate().skip(top).take(rows) {
-                if k == cur {
-                    below.push(format!("\x1b[7m  {}\x1b[0m", h));
-                } else {
-                    below.push(format!("  {}", h));
-                }
-            }
-            self.draw(prompt, l, None, &below);
-            let key = read_key()?;
-            match key {
-                Key::Byte(b'\r') => {
-                    let r = hits.get(cur).map(|s| s.to_string());
-                    self.draw(prompt, l, None, &[]);
-                    return r;
-                }
-                Key::Esc | Key::Byte(0x03) | Key::Byte(0x07) => {
-                    self.draw(prompt, l, None, &[]);
-                    return None;
-                }
-                Key::Byte(0x0e) | Key::Byte(0x09) => cur = (cur + 1).min(hits.len().saturating_sub(1)),
-                Key::Byte(0x10) => cur = cur.saturating_sub(1),
-                Key::Csi(s) if s == b"B" => cur = (cur + 1).min(hits.len().saturating_sub(1)),
-                Key::Csi(s) if s == b"A" => cur = cur.saturating_sub(1),
-                Key::Byte(0x7f) | Key::Byte(0x08) => {
-                    query.pop();
-                    cur = 0;
-                }
-                Key::Byte(0x15) => {
-                    query.clear();
-                    cur = 0;
-                }
-                Key::Text(t) => {
-                    query.push_str(&t);
-                    cur = 0;
-                }
-                Key::Byte(c) if c >= 0x20 => {
-                    query.push(c as char);
-                    cur = 0;
-                }
-                _ => {}
             }
         }
     }
@@ -703,6 +709,7 @@ impl Editor {
             out.push_str("\r\n");
         }
         let mut cur_row = total / cols;
+        l.end_row = pn + cur_row;
         for b in below {
             out.push_str("\r\n");
             out.push_str(&clip(b, cols.saturating_sub(1)));
@@ -775,146 +782,27 @@ fn is_break(b: &[char], i: usize) -> bool {
     " \t;|&<>()".contains(b[i]) && !(i > 0 && b[i - 1] == '\\')
 }
 
-/// 補完: (置きかえる語の頭, 候補)
-fn complete(l: &Line, ctx: &Ctx) -> (usize, Vec<Cand>) {
-    let mut start = l.pos;
-    while start > 0 && !is_break(&l.buf, start - 1) {
-        start -= 1;
+/// 補完: (置きかえる語の頭, 候補)。候補は complete のプラグインが出す
+fn complete(l: &Line, ctx: &Ctx, pl: &mut Plugins) -> (usize, Vec<Cand>) {
+    if !pl.wants("complete") {
+        return (l.pos, Vec::new());
     }
-    let word: String = l.buf[start..l.pos].iter().collect();
-    // コマンドの位置か: 行の頭、; | & ( のあと、sudo などのあと
-    let before: String = l.buf[..start].iter().collect();
-    let prev = before.trim_end();
-    let last_word = prev.rsplit(|c: char| " \t;|&(".contains(c)).next().unwrap_or("");
-    let cmd_pos = prev.is_empty() || prev.ends_with([';', '|', '&', '(']) || ["sudo", "exec", "command", "time", "nohup", "which", "type", "doas"].contains(&last_word);
-    let low = word.to_lowercase();
-    let mut out: Vec<Cand> = Vec::new();
-    if let Some(v) = word.strip_prefix('$') {
-        let lv = v.to_lowercase();
-        let mut names: Vec<String> = ctx.vars.iter().filter(|n| n.to_lowercase().starts_with(&lv)).cloned().collect();
-        names.sort();
-        names.dedup();
-        out = names.into_iter().map(|n| Cand { text: format!("${}", n), show: n, dir: false }).collect();
-    } else if cmd_pos && !word.contains('/') && !word.starts_with('~') && !word.starts_with('.') {
-        let mut names: Vec<String> = ctx.cmds.iter().filter(|n| n.to_lowercase().starts_with(&low)).cloned().collect();
-        for d in ctx.path.split(':').filter(|d| !d.is_empty()) {
-            let Ok(rd) = std::fs::read_dir(d) else { continue };
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if n.to_lowercase().starts_with(&low) && is_exec(&e.path()) {
-                    names.push(n);
-                }
-            }
-        }
-        names.sort();
-        names.dedup();
-        out = names.into_iter().map(|n| Cand { text: escape(&n), show: n, dir: false }).collect();
-    } else {
-        // ファイル: ~ は HOME として読む
-        let raw = unescape(&word);
-        let (dir, base) = match raw.rfind('/') {
-            Some(i) => (raw[..=i].to_string(), raw[i + 1..].to_string()),
-            None if raw == "~" => ("~/".to_string(), String::new()),
-            None => (String::new(), raw.clone()),
-        };
-        let real = if let Some(r) = dir.strip_prefix('~') { format!("{}{}", ctx.home, r) } else { dir.clone() };
-        let lb = base.to_lowercase();
-        if let Ok(rd) = std::fs::read_dir(if real.is_empty() { "." } else { &real }) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if !n.to_lowercase().starts_with(&lb) || (n.starts_with('.') && !base.starts_with('.')) {
-                    continue;
-                }
-                let is_dir = e.path().is_dir();
-                // コマンドの位置なら、ディレクトリと動かせるものだけ
-                if cmd_pos && !is_dir && !is_exec(&e.path()) {
-                    continue;
-                }
-                let suffix = if is_dir { "/" } else { "" };
-                out.push(Cand { text: format!("{}{}{}", escape(&dir), escape(&n), suffix), show: format!("{}{}", n, suffix), dir: is_dir });
-            }
-        }
-        out.sort_by(|a, b| a.show.cmp(&b.show));
-    }
-    (start, out)
-}
-
-fn is_exec(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-/// シェルの語として入れるときに、特別な文字の前に \ をつける (~ は頭ならそのまま)
-fn escape(s: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if " \t'\"\\$`&|;<>()*?[]#!{}".contains(c) || (c == '~' && i > 0) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut cs = s.chars();
-    while let Some(c) = cs.next() {
-        if c == '\\' {
-            if let Some(d) = cs.next() {
-                out.push(d);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// いまのディレクトリから depth 段までのファイル (.git はのぞく)
-fn list_files(depth: usize, max: usize) -> Vec<String> {
-    fn walk(dir: &std::path::Path, rel: &str, depth: usize, max: usize, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        let mut es: Vec<_> = rd.flatten().collect();
-        es.sort_by_key(|e| e.file_name());
-        for e in es {
-            if out.len() >= max {
-                return;
-            }
-            let n = e.file_name().to_string_lossy().into_owned();
-            if n == ".git" {
-                continue;
-            }
-            let r = if rel.is_empty() { n.clone() } else { format!("{}/{}", rel, n) };
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                if depth > 1 {
-                    walk(&e.path(), &r, depth - 1, max, out);
-                }
-            } else {
-                out.push(r);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(std::path::Path::new("."), "", depth, max, &mut out);
-    out
-}
-
-fn base64(b: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for ch in b.chunks(3) {
-        let n = (ch[0] as u32) << 16 | (*ch.get(1).unwrap_or(&0) as u32) << 8 | *ch.get(2).unwrap_or(&0) as u32;
-        for k in 0..4 {
-            if k <= ch.len() {
-                out.push(T[(n >> (18 - 6 * k)) as usize & 63] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    let ev = json!({ "line": l.text(), "pos": l.pos, "cmds": ctx.cmds, "vars": ctx.vars, "path": ctx.path, "home": ctx.home, "pwd": ctx.pwd });
+    let Some(r) = pl.ask("complete", ev) else { return (l.pos, Vec::new()) };
+    let start = (r["start"].as_u64().unwrap_or(l.pos as u64) as usize).min(l.pos);
+    let cands = r["cands"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let text = c["text"].as_str()?.to_string();
+                    let show = c["show"].as_str().map_or_else(|| text.clone(), String::from);
+                    Some(Cand { text, show, dir: c["dir"].as_bool().unwrap_or(false) })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (start, cands)
 }
 
 fn is_word(c: char) -> bool {

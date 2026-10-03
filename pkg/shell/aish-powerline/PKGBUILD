@@ -1,17 +1,29 @@
-# aish-powerline: aish の powerline のプロンプト (aish の拡張。[shell] リポジトリ)
-#   aipkg -S aish-powerline してから、~/.aishrc (見本は /usr/share/aish/aishrc.example) に
-#   source /usr/share/aish/plugins/aish-powerline/aish-powerline.sh
+# aish-powerline: aish の powerline のプロンプト (aish のプラグイン。[shell] リポジトリ)
+#   ap -S aish-powerline してから、~/.aishrc (見本は /usr/share/aish/aishrc.example) に
+#   plugin aish-powerline
+#   アイコンと区切りは aifont (Nerd Font と同じ位置) の文字。端末のフォントが要る
+#   このリポジトリの shell/ (プラグインのワークスペース) から作る
 pkgname=aish-powerline
 pkgver=0.0.1
 pkgrel=1
-pkgdesc='Powerline prompt for aish (needs aifont or a Nerd Font in the terminal)'
-arch=('any')
+pkgdesc='Powerline prompt for aish (a plugin; needs aifont or a Nerd Font in the terminal)'
+arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
 depends=('base')
-source=('aish-powerline.sh')
-sha256sums=('SKIP')
+makedepends=('rustup')
+
+pkgver() {
+  cd "$startdir/../../.."
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- shell)" "$(git log -1 --format=%h -- shell)"
+}
+
+build() {
+  cd "$startdir/../../../shell"
+  unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release -p aish-powerline
+}
 
 package() {
-  install -Dm644 aish-powerline.sh "$pkgdir/usr/share/aish/plugins/aish-powerline/aish-powerline.sh"
+  install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aish-powerline" "$pkgdir/usr/lib/aish/plugins/aish-powerline"
 }
