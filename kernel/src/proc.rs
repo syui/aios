@@ -1127,7 +1127,13 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
         let tf = p.tf_ref();
         let (pc, lr, fp, sp) = (tf.elr, tf.x[30], tf.x[29], tf.sp_el0);
         let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
-        let _ = writeln!(out, "thread {} {} sys {} chan {:x}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan);
+        let st = match p.state {
+            State::Running => "run",
+            State::Runnable => "ready",
+            State::Sleeping => "sleep",
+            _ => "other",
+        };
+        let _ = writeln!(out, "thread {} {} sys {} chan {:x} {} utime {}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan, st, p.utime);
         let pt = p.pt();
         let name = |pt: &mut crate::vm::PageTable, va: u64| -> Option<alloc::string::String> {
             let (_, v) = pt.find(va as usize)?;
@@ -1189,6 +1195,16 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
     }
     for (tid, a, op, n) in crate::syscall::futex_wakes(tgid) {
         let _ = writeln!(out, "wake by {} {:#x} op {} woke {}", tid, a, op, n);
+    }
+    // 開いている fd の様子 (ソケットに残っているバイト、epoll の見張り)
+    if let Some(l) = find_leader(tgid)
+        && let Some(files) = l.files.as_ref()
+    {
+        for (n, fd) in files.get().fds.iter().enumerate() {
+            if let Some(fd) = fd {
+                let _ = writeln!(out, "fd {} {}", n, fd.file.borrow().debug_state());
+            }
+        }
     }
     out
 }
