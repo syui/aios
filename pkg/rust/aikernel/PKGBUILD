@@ -50,7 +50,7 @@ CONF
   # 起動のときに起こすものは /etc/modules-load.d/*.conf に書く (desktop パッケージなど)
   install -d "$pkgdir/usr/lib/modules"
   local m
-  for m in virtio_gpu virtio_input; do
+  for m in virtio_gpu virtio_input virtio_snd; do
     printf 'aios-module %s\n' "$m" > "$pkgdir/usr/lib/modules/$m.ko"
     chmod 644 "$pkgdir/usr/lib/modules/$m.ko"
   done

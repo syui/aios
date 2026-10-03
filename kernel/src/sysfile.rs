@@ -883,6 +883,16 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if let Kind::Input(n) = f.borrow().kind {
         return crate::input::ioctl(n, req, arg);
     }
+    // 音 (ALSA の形)。DRAIN と WRITEI は待つことがあるので、OpenFile を借りたままにしない
+    let snd = match f.borrow().kind {
+        Kind::SndCtl => Some(false),
+        Kind::SndPcm => Some(true),
+        _ => None,
+    };
+    if let Some(pcm) = snd {
+        let nonblock = f.borrow().flags & crate::file::O_NONBLOCK != 0;
+        return if pcm { crate::sound::pcm_ioctl(req, arg, nonblock) } else { crate::sound::ctl_ioctl(req, arg) };
+    }
     // FIONREAD: いま読めるバイト数 (パイプ、socketpair と AF_UNIX のソケット、ふつうのファイル)。
     // 端末のものは tty の ioctl で
     const FIONREAD: u64 = 0x541b;

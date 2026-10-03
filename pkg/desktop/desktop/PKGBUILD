@@ -1,16 +1,18 @@
 # desktop: aios のデスクトップ (Arch の plasma のようなまとめのパッケージ)。[desktop] リポジトリ
-#   aipkg -S desktop して再起動すると、画面 (virtio_gpu) とキーボードやマウス (virtio_input) の
+#   aipkg -S desktop して再起動すると、画面 (virtio_gpu) とキーボードやマウス (virtio_input)、音 (virtio_snd) の
 #   モジュールが起きる (/etc/modules-load.d/desktop.conf)。窓は AIOS_DISPLAY=1 ./bin/run.sh
+#   音を鳴らす道具は ap -S alsa-utils (aplay、speaker-test)
 #   aiwm で始める (タイル型のコンポジタ。$mod+Return で端末、設定は /etc/aiwm/config)
 # 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=desktop
 pkgver=0.0.1
-pkgrel=4
+pkgrel=5
 pkgdesc='aios desktop: screen and input drivers, aiwm (tiling Wayland compositor), aiterm, aifont, icons'
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
 depends=('base' 'aikernel' 'aifont' 'ai-icons' 'aisplash' 'aiwm' 'aiterm')
+optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)')
 backup=(etc/modules-load.d/desktop.conf)
 
 package() {
@@ -19,6 +21,7 @@ package() {
 # desktop: 起動のときに起こすモジュール (modprobe -l で一覧、lsmod で起きているもの)
 virtio_gpu
 virtio_input
+virtio_snd
 CONF
   chmod 644 "$pkgdir/etc/modules-load.d/desktop.conf"
 }

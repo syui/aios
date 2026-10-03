@@ -1,0 +1,36 @@
+# alsa-lib: ALSA (音) のライブラリ libasound と、その設定 (/opt/c/share/alsa) (shared, for aios)
+#   カーネルの /dev/snd (virtio-sound) を使って音を出す。既定の出口 (default) は plug:hw (形やレートをかえて hw へ)
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
+pkgname=alsa-lib
+pkgver=1.2.16.1
+pkgrel=1
+pkgdesc='An alternative implementation of Linux sound support: libasound (shared, for aios)'
+arch=('aarch64')
+url='https://www.alsa-project.org/'
+license=('LGPL-2.1-or-later')
+depends=('musl')
+source=("https://www.alsa-project.org/files/pub/lib/alsa-lib-$pkgver.tar.bz2")
+sha256sums=('f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e')
+
+prepare() {
+  rm -rf "alsa-lib-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "alsa-lib-$pkgver"
+  # 共有ライブラリなので -static は外す (libtool は -s を通さないので -Wl,-s)
+  LDFLAGS="-Wl,-s" ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+    --disable-static --enable-shared --disable-python --disable-aload --disable-topology --without-debug \
+    --with-versioned=no
+  make
+}
+
+package() {
+  cd "alsa-lib-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -f "$pkgdir"/opt/c/lib/*.la
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

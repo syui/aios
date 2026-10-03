@@ -54,6 +54,10 @@ pub enum Kind {
     Fb,
     /// キーボードやマウス (/dev/input/eventN、virtio-input)
     Input(usize),
+    /// 音のカードの制御の口 (/dev/snd/controlC0、virtio-sound)
+    SndCtl,
+    /// 音の再生の口 (/dev/snd/pcmC0D0p)
+    SndPcm,
 }
 
 impl Kind {
@@ -66,6 +70,11 @@ impl Kind {
             (1, 8) | (1, 9) => return Ok(Kind::Random),
             (29, 0) if crate::gpu::get().is_some() => return Ok(Kind::Fb),
             (13, n) if n >= 64 && ((n - 64) as usize) < crate::input::count() => return Ok(Kind::Input((n - 64) as usize)),
+            (116, 0) if crate::sound::present() => return Ok(Kind::SndCtl),
+            (116, 16) if crate::sound::present() => {
+                crate::sound::open_pcm()?;
+                return Ok(Kind::SndPcm);
+            }
             (5, 0) => {
                 let t = tty::controlling().ok_or(-ENXIO)?;
                 tty::ref_slave(&t);
@@ -332,7 +341,7 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
-        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_)) {
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm) {
             if let Ok(i) = vfs::resolve("", &self.describe(), true) {
                 return Stat::of_inode(&i);
             }
@@ -345,6 +354,8 @@ impl OpenFile {
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
             Kind::Fb => Stat::dev(vfs::S_IFCHR | 0o666, 29 << 8),
             Kind::Input(n) => Stat::dev(vfs::S_IFCHR | 0o666, 13 << 8 | (64 + *n as u64)),
+            Kind::SndCtl => Stat::dev(vfs::S_IFCHR | 0o666, 116 << 8),
+            Kind::SndPcm => Stat::dev(vfs::S_IFCHR | 0o666, 116 << 8 | 16),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
             Kind::Block(p) => {
                 let (ma, mi) = crate::block::dev_of_part(p);
@@ -378,6 +389,8 @@ impl OpenFile {
             Kind::Random => "/dev/urandom".into(),
             Kind::Fb => "/dev/fb0".into(),
             Kind::Input(n) => alloc::format!("/dev/input/event{}", n),
+            Kind::SndCtl => "/dev/snd/controlC0".into(),
+            Kind::SndPcm => "/dev/snd/pcmC0D0p".into(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
@@ -417,6 +430,7 @@ impl OpenFile {
             Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
             Kind::Input(n) => (crate::input::readable(*n), false, false),
+            Kind::SndPcm => crate::sound::readiness(),
             _ => (true, true, false),
         }
     }
@@ -431,6 +445,8 @@ impl OpenFile {
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
+            Kind::SndCtl => alloc::vec![],
+            Kind::SndPcm => alloc::vec![crate::sound::chan()],
             _ => return None,
         })
     }
@@ -514,6 +530,7 @@ impl Drop for OpenFile {
         // flock のロックは OpenFile ごと (その場所で見分ける)
         crate::sysfile::release_locks(self as *const OpenFile as usize);
         match &self.kind {
+            Kind::SndPcm => crate::sound::close_pcm(),
             Kind::PipeRead(p) => {
                 { let mut pp = p.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
