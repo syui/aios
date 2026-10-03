@@ -503,7 +503,7 @@ fn open_socket() -> Result<(String, RawFd), String> {
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
             return Err(format!(
-                "unix socket: {} (the kernel is too old: sudo aipkg -Syu unix, then reboot)",
+                "unix socket: {} (the kernel is too old: sudo ap -Syu, then reboot)",
                 std::io::Error::last_os_error()
             ));
         }

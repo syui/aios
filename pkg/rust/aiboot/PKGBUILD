@@ -1,7 +1,7 @@
 # aiboot: 小さな UEFI のブートローダー (このリポジトリの boot/)
 # systemd-boot と同じ /loader/loader.conf と /loader/entries/*.conf を読んで、カーネルを起動する。
 # ESP (/boot) の既定の場所 EFI/BOOT/BOOTAA64.EFI に入るので、UEFI はこれを起動する。
-# すでに systemd-boot を使っている ESP なら、これは入れずに unix の entry だけでよい
+# すでに systemd-boot を使っている ESP なら、これは入れずに aikernel の entry だけでよい
 pkgname=aiboot
 pkgver=0.0.1
 pkgrel=1

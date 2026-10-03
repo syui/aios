@@ -7,7 +7,7 @@ pkgdesc='aios base system: init, aish, aipkg, systemctl, login, which, swapon an
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
-# base + unix + aiboot で使える aios になる (Arch の base + linux のように)。
+# base + aikernel + aiboot で使える aios になる (Arch の base + linux のように)。
 # ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく。awk は作りかけなので入れない
 depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush')
 makedepends=('rustup')

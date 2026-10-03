@@ -5,7 +5,7 @@
 #   bin/mkrootfs.sh all              pkg/rust/ のパッケージをぜんぶ入れる (C の拡張 pkg/c/ は入れない)
 #   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
 #                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
-#   AIOS_BUILD="base unix" bin/mkrootfs.sh -r all
+#   AIOS_BUILD="base aikernel" bin/mkrootfs.sh -r all
 #                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
 # base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
 # repo/aarch64/rust/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。

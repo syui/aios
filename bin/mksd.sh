@@ -1,9 +1,9 @@
 #!/bin/sh
 # ラズパイ用の SD カードのイメージ sd.img を作る (1 GiB。QEMU の SD は 2 のべき乗の大きさ)
-#   区画 1: FAT32 (0x0c) の boot  128 MiB  rootfs/boot の中身 (カーネル (unix パッケージ) の Image)、config.txt、DTB
+#   区画 1: FAT32 (0x0c) の boot  128 MiB  rootfs/boot の中身 (カーネル (aikernel パッケージ) の Image)、config.txt、DTB
 #   区画 2: Linux (0x83) の root  残り     rootfs/ から ext4
 #   bin/mksd.sh [KERNEL]    KERNEL は ELF か Image (既定は rootfs/boot/Image、なければ開発用カーネル)
-# aios は区画 1 を /boot にマウントするので、aipkg でカーネル (unix) を上げるとファームウェアが
+# aios は区画 1 を /boot にマウントするので、aipkg でカーネル (aikernel) を上げるとファームウェアが
 # 読む Image (config.txt の kernel=Image) も新しくなる
 # 本物のラズパイ 3 で動かすなら、boot にファームウェア (bootcode.bin start.elf fixup.dat)
 # を足す: FIRMWARE=1 bin/mksd.sh (raspberrypi/firmware から取ってくる)。FAT を作るのに
