@@ -1,6 +1,8 @@
 // aish-pick: キーに結びつける小さな機能 (aish の基本のプラグイン)
 //   C-r      history  履歴を絞りこんで選び、行に入れる
-//   C-f      file     いまのディレクトリから 3 段までのファイルを絞りこんで、カーソルのところに入れる
+//   C-f      file     いまのディレクトリの下のファイルを絞りこんで、カーソルのところに入れる
+//                     (rg があれば rg --files: .gitignore をのぞく。なければ 3 段まで)
+//   C-g      grep     打ちながら rg で探し、選んだら行を「$EDITOR +行 ファイル」にする (rg が要る)
 //   C-o      recent   よく使うパス (使った回数 × 新しさの順) を絞りこんで、カーソルのところに入れる
 //   C-j      dir      最近のディレクトリ (~/.aish_dirs、chpwd で覚える) を絞りこんで cd
 //   C-k      cdup     行が空なら cd ..、そうでなければカーソルから後ろを消す
@@ -11,7 +13,7 @@
 //   paths    よく使うファイルとディレクトリを順位の順に (paths.rs)
 mod paths;
 
-use aish_plugin::{Spec, Tool, Tty, Value, escape, json, pick, quote, s, tilde};
+use aish_plugin::{Spec, Tool, Tty, Value, escape, json, pick, pick_live, quote, s, tilde};
 
 const QUERY: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"これを含むものだけ (大文字小文字は区別しない)"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
 const PATHS: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"空白で区切った語がみな、この順にパスに入っているもの (z と同じ。例: \"aios kernel\")"},"kind":{"type":"string","enum":["file","dir"],"description":"ファイルだけ / ディレクトリだけ (なければどちらも)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"}}}"#;
@@ -28,7 +30,7 @@ fn main() {
     let spec = Spec {
         name: "pick",
         hooks: &["key", "chpwd", "preexec", "precmd"],
-        keys: &[("C-r", "history"), ("C-f", "file"), ("C-o", "recent"), ("C-j", "dir"), ("C-k", "cdup"), ("C-p C-p", "copy")],
+        keys: &[("C-r", "history"), ("C-f", "file"), ("C-g", "grep"), ("C-o", "recent"), ("C-j", "dir"), ("C-k", "cdup"), ("C-p C-p", "copy")],
         tools: &[
             Tool { name: "history", desc: "aish の履歴 (人が打ったコマンド) を新しい順に。{items: [...]}", input: QUERY },
             Tool { name: "dirs", desc: "最近 cd したディレクトリを新しい順に。{items: [...]}", input: QUERY },
@@ -118,11 +120,39 @@ fn key(v: &Value, st: &mut State) -> Value {
             }
         }
         "file" => {
-            let items = list_files(std::path::Path::new(s(v, "pwd")), 3, 5000);
+            let items = aish_plugin::rg_files(s(v, "pwd"), 20000).unwrap_or_else(|| list_files(std::path::Path::new(s(v, "pwd")), 3, 5000));
             match pick("file", &items) {
                 Some(f) => json!({ "insert": escape(&f) }),
                 None => json!({}),
             }
+        }
+        "grep" => {
+            let pwd = s(v, "pwd");
+            let picked = pick_live("rg", |q| {
+                if q.chars().count() < 2 {
+                    return vec![];
+                }
+                // 大文字があれば大文字小文字を区別する (smart case)
+                let args = ["-S".to_string(), "--max-columns".into(), "200".into(), "-e".into(), q.to_string()];
+                match aish_plugin::rg_json(pwd, &args, 300) {
+                    None => vec!["(rg がありません: sudo ap -S ripgrep)".into()],
+                    Some(r) => r
+                        .items
+                        .iter()
+                        .map(|it| {
+                            let d = &it["data"];
+                            let path = aish_plugin::rg_text(&d["path"]);
+                            format!("{}:{}: {}", path.strip_prefix("./").unwrap_or(&path), d["line_number"], aish_plugin::rg_text(&d["lines"]).trim())
+                        })
+                        .collect(),
+                }
+            });
+            // "path:line: text" → $EDITOR +line path (Enter で開く)
+            let Some((path, rest)) = picked.as_deref().and_then(|p| p.split_once(':')) else { return json!({}) };
+            let Some(n) = rest.split(':').next().and_then(|n| n.parse::<u64>().ok()) else { return json!({}) };
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+            let l = format!("{} +{} {}", editor, n, escape(path));
+            json!({ "line": l, "pos": l.chars().count() })
         }
         "recent" => {
             let items: Vec<String> = st.db.as_mut().map(|db| db.rank(&[], "", 500)).unwrap_or_default().iter().filter_map(|x| x["path"].as_str().map(|p| tilde(p, home))).collect();

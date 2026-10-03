@@ -1,0 +1,29 @@
+# aios (aarch64) 用。bin/mkpkg.sh pkg/rust/ailog
+pkgname=ailog
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='ATProto blog CLI'
+arch=('aarch64')
+url='https://git.syui.ai/ai/log'
+license=('MIT')
+makedepends=('git' 'rustup')
+source=("git+https://git.syui.ai/ai/log")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd log
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  . "$startdir/../cross.sh"
+  # rustls の aws-lc (C) を musl のヘッダーで
+  musl_zig
+  cd log
+  musl_build --bin ailog
+}
+
+package() {
+  cd log
+  install -Dm755 target/aarch64-unknown-linux-musl/release/ailog "$pkgdir/usr/bin/ailog"
+}

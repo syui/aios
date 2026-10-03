@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}},"required":["path"]}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"}},"required":["path","old","new"]}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
-const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。. で始まるもの、target、node_modules、バイナリはのぞく)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
+const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
 const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"}},"required":["path","pattern","replace"]}"#;
 const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
 const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
@@ -39,7 +39,7 @@ fn main() {
             Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}", input: READ },
             Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。undo で戻せる", input: EDIT },
             Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", input: WRITE },
-            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す。{matches: [{path, line, text, ctx?}], count, truncated}", input: GREP },
+            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}", input: GREP },
             Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", input: SED },
             Tool { name: "lines", desc: "行の番号で置きかえる / 入れる (insert) / 消す (text なし)。old でいまの中身を確かめる。undo で戻せる", input: LINES },
             Tool { name: "undo", desc: "edit / write / sed / lines のまえに戻す (aish が動いているあいだの 100 回まで)", input: UNDO },
@@ -81,14 +81,32 @@ fn matcher(a: &Value) -> Result<regex::Regex, Value> {
     regex::RegexBuilder::new(&pat).case_insensitive(a["i"].as_bool().unwrap_or(false)).build().map_err(|e| error(e))
 }
 
+/// 長い行は切る (minify した JS など。答えが読めなくならないように)
+const LINE_MAX: usize = 300;
+
+fn clip_line(l: &str) -> String {
+    let l = l.trim_end_matches(['\n', '\r']);
+    if l.chars().count() <= LINE_MAX {
+        return l.to_string();
+    }
+    let head: String = l.chars().take(LINE_MAX).collect();
+    format!("{}…(+{} chars)", head, l.chars().count() - LINE_MAX)
+}
+
 fn grep(pwd: &str, a: &Value) -> Value {
     let re = match matcher(a) {
         Ok(r) => r,
         Err(e) => return e,
     };
+    let limit = a["limit"].as_u64().unwrap_or(200) as usize;
+    if let Some(r) = grep_rg(pwd, a, limit) {
+        return r;
+    }
+    if a.get("glob").is_some() {
+        return error("glob needs rg (ripgrep: aipkg -S ripgrep)");
+    }
     let root = resolve(pwd, if s(a, "path").is_empty() { "." } else { s(a, "path") });
     let ctx = a["context"].as_u64().unwrap_or(0) as usize;
-    let limit = a["limit"].as_u64().unwrap_or(200) as usize;
     let mut files = Vec::new();
     walk(&root, &mut files);
     files.sort();
@@ -115,20 +133,66 @@ fn grep(pwd: &str, a: &Value) -> Value {
             }
             count += 1;
             for j in i.saturating_sub(ctx).max(last)..i {
-                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
+                out.push(json!({ "path": shown, "line": j + 1, "text": clip_line(ls[j]), "ctx": true }));
             }
-            out.push(json!({ "path": shown, "line": i + 1, "text": l }));
+            out.push(json!({ "path": shown, "line": i + 1, "text": clip_line(l) }));
             let end = (i + 1 + ctx).min(ls.len());
             for j in i + 1..end {
                 if re.is_match(ls[j]) {
                     break;
                 }
-                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
+                out.push(json!({ "path": shown, "line": j + 1, "text": clip_line(ls[j]), "ctx": true }));
             }
             last = end.max(i + 1);
         }
     }
-    json!({ "matches": out, "count": count, "truncated": truncated })
+    json!({ "matches": out, "count": count, "truncated": truncated, "engine": "aish" })
+}
+
+/// rg (ripgrep) で探す。rg がなければ None (aish の中のもので探す)
+fn grep_rg(pwd: &str, a: &Value, limit: usize) -> Option<Value> {
+    let mut args: Vec<String> = Vec::new();
+    if !a["regex"].as_bool().unwrap_or(false) {
+        args.push("-F".into());
+    }
+    if a["i"].as_bool().unwrap_or(false) {
+        args.push("-i".into());
+    }
+    if a["hidden"].as_bool().unwrap_or(false) {
+        args.push("--hidden".into());
+    }
+    if let Some(c) = a["context"].as_u64().filter(|c| *c > 0) {
+        args.push(format!("-C{}", c));
+    }
+    let globs: Vec<String> = match &a["glob"] {
+        Value::String(g) => vec![g.clone()],
+        Value::Array(v) => v.iter().filter_map(|g| g.as_str().map(String::from)).collect(),
+        _ => vec![],
+    };
+    for g in globs {
+        args.push("-g".into());
+        args.push(g);
+    }
+    args.extend(["-e".into(), s(a, "pattern").to_string(), "--".into(), if s(a, "path").is_empty() { ".".into() } else { s(a, "path").to_string() }]);
+    let r = aish_plugin::rg_json(pwd, &args, limit)?;
+    if r.status == 2 && r.items.is_empty() {
+        return Some(error(format!("rg: {}", r.err.trim())));
+    }
+    let mut out = Vec::new();
+    let mut count = 0;
+    for it in &r.items {
+        let d = &it["data"];
+        let path = aish_plugin::rg_text(&d["path"]);
+        let path = path.strip_prefix("./").unwrap_or(&path).to_string();
+        let mut m = json!({ "path": path, "line": d["line_number"], "text": clip_line(&aish_plugin::rg_text(&d["lines"])) });
+        if it["type"] == "context" {
+            m["ctx"] = json!(true);
+        } else {
+            count += 1;
+        }
+        out.push(m);
+    }
+    Some(json!({ "matches": out, "count": count, "truncated": r.truncated, "engine": "rg" }))
 }
 
 /// ディレクトリの下のファイル (. で始まるもの、target、node_modules はのぞく)
