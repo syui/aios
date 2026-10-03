@@ -104,8 +104,15 @@ mod nr {
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
+    pub const SCHED_SETPARAM: u64 = 118;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_GETSCHEDULER: u64 = 120;
+    pub const SCHED_GETPARAM: u64 = 121;
+    pub const SCHED_SETAFFINITY: u64 = 122;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
@@ -367,6 +374,22 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             Ok(0)
         }
         SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
+        // スケジューラはひとつ (SCHED_OTHER、優先度 0) だけ。CPU を選ぶこともしない (どれでも動く)
+        SCHED_SETAFFINITY => Ok(0),
+        SCHED_GETSCHEDULER => Ok(0),
+        SCHED_GETPARAM => out(a[1] as usize, &0i32.to_le_bytes()).map(|_| 0),
+        SCHED_SETPARAM => Ok(0),
+        // SCHED_OTHER / BATCH / IDLE はそのまま (同じに扱う)。実時間 (FIFO / RR) はできない
+        SCHED_SETSCHEDULER => match a[1] & 0xff {
+            0 | 3 | 5 => Ok(0),
+            1 | 2 => Err(-1),
+            _ => Err(-EINVAL),
+        },
+        SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => match a[0] {
+            1 | 2 => Ok(if nr == SCHED_GET_PRIORITY_MAX { 99 } else { 1 }),
+            0 | 3 | 5 => Ok(0),
+            _ => Err(-EINVAL),
+        },
         NANOSLEEP => sys_nanosleep(1, 0, a[0] as usize, a[1] as usize),
         CLOCK_NANOSLEEP => sys_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
         CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
