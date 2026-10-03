@@ -1,0 +1,10 @@
+[package]
+name = "aish-plugin"
+description = "SDK for aish plugins: the JSON-lines protocol, the terminal and a picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+libc = "0.2"

@@ -17,6 +17,7 @@ mod expand;
 mod glob;
 mod jobs;
 mod parse;
+mod plugin;
 
 use expand::Mode;
 use jobs::{exit_code, interactive, jobs};
@@ -91,14 +92,15 @@ pub struct Shell {
     aliases: HashMap<String, String>,
     /// いま展開している alias (自分自身をくりかえし展開しない)
     expanding: Vec<String>,
-    /// 最近のディレクトリ (新しいものが先。対話するときは ~/.aish_dirs に残す)
-    dirs: Vec<String>,
-    dirs_file: Option<String>,
+    /// プラグイン (plugin.rs。対話するシェルだけ)
+    plugins: plugin::Plugins,
+    /// 履歴のファイル (プラグインに教える)
+    histfile: Option<String>,
 }
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
-    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -151,8 +153,8 @@ impl Shell {
             text: String::new(),
             aliases: HashMap::new(),
             expanding: vec![],
-            dirs: vec![],
-            dirs_file: None,
+            plugins: plugin::Plugins::default(),
+            histfile: None,
         }
     }
 
@@ -311,16 +313,6 @@ impl Shell {
         Ok(Ready { args, assigns: avals, redirs })
     }
 
-    /// 最近のディレクトリに足す (50 まで)
-    fn remember_dir(&mut self, d: &str) {
-        self.dirs.retain(|x| x != d);
-        self.dirs.insert(0, d.to_string());
-        self.dirs.truncate(50);
-        if let Some(f) = &self.dirs_file {
-            let _ = std::fs::write(f, self.dirs.join("\n") + "\n");
-        }
-    }
-
     /// 行の編集に渡す、補完などのための様子
     fn edit_ctx(&self) -> edit::Ctx {
         let home = self.get_var("HOME").unwrap_or_default();
@@ -329,13 +321,8 @@ impl Shell {
         cmds.extend(self.funcs.keys().cloned());
         let mut vars: Vec<String> = self.vars.keys().cloned().collect();
         vars.extend(std::env::vars().map(|(k, _)| k));
-        // ~ で短く見せる (選んだら edit.rs が戻す)
-        let dirs = self
-            .dirs
-            .iter()
-            .map(|d| if !home.is_empty() && (d == &home || d.starts_with(&format!("{}/", home))) { format!("~{}", &d[home.len()..]) } else { d.clone() })
-            .collect();
-        edit::Ctx { cmds, vars, dirs, path: self.get_var("PATH").unwrap_or_default(), home }
+        let pwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        edit::Ctx { cmds, vars, path: self.get_var("PATH").unwrap_or_default(), home, pwd }
     }
 
     /// 最初の語が alias なら置きかえる (引用していない語だけ)。
@@ -405,6 +392,18 @@ impl Shell {
             }
             let args = r.args.clone();
             return self.with_temp_vars(&r.assigns, |sh| sh.with_redirs(&r.redirs, |sh| sh.builtin(&args)));
+        }
+        // コマンドが見つからない: not_found のプラグインにまかせる (答えに status があれば、それが結果)
+        if self.plugins.wants("not_found") && self.find(&r.args[0]).is_none() {
+            let ev = serde_json::json!({
+                "args": r.args,
+                "line": self.text,
+                "pwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+                "status": self.status,
+            });
+            if let Some(st) = self.plugins.ask("not_found", ev).and_then(|v| v["status"].as_i64()) {
+                return st as i32;
+            }
         }
         let text = self.text.clone();
         self.spawn(vec![Part::Ready(r)], false, &text)
@@ -902,7 +901,7 @@ impl Shell {
                         self.export("OLDPWD", Some(old.clone()));
                         self.export("PWD", Some(new.clone()));
                         if new != old {
-                            self.remember_dir(&new);
+                            self.plugins.tell("chpwd", serde_json::json!({ "pwd": new, "old": old }));
                             // zsh と同じく、chpwd という関数があれば動かす
                             if let Some(body) = self.funcs.get("chpwd").cloned() {
                                 return self.call(&body, &["chpwd".to_string()]);
@@ -1004,6 +1003,44 @@ impl Shell {
                 }
                 0
             }
+            "plugin" => {
+                // plugin NAME [ARGS...] / plugin (一覧)
+                let Some(name) = a.first() else {
+                    print!("{}", self.plugins.describe());
+                    return 0;
+                };
+                let home = self.get_var("HOME").unwrap_or_default();
+                let extra = serde_json::json!({ "histfile": self.histfile.clone().unwrap_or_default() });
+                let (pv, path) = (self.get_var("AISH_PLUGIN_PATH"), self.get_var("PATH").unwrap_or_default());
+                match self.plugins.load(name, &a[1..], &home, pv, &path, extra) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("plugin: {}", e);
+                        1
+                    }
+                }
+            }
+            "bindkey" => match a {
+                [] => {
+                    print!("{}", self.plugins.describe_keys());
+                    0
+                }
+                [r, key] if r == "-r" => {
+                    self.plugins.unbind(key);
+                    0
+                }
+                [key, target] => match self.plugins.bindkey(key, target) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("bindkey: {}", e);
+                        1
+                    }
+                },
+                _ => {
+                    eprintln!("usage: bindkey KEY PLUGIN:WIDGET | bindkey -r KEY | bindkey");
+                    2
+                }
+            },
             "alias" => {
                 if a.is_empty() {
                     let mut v: Vec<_> = self.aliases.iter().collect();
@@ -1654,6 +1691,9 @@ fn main() {
     //   aish: /etc/aishrc と ~/.aishrc (zsh の /etc/zsh/zshrc と ~/.zshrc のように)
     //   sh:   $ENV だけ (POSIX)
     if unsafe { libc::isatty(0) } == 1 {
+        // 履歴のファイル (プラグインにも教えるので、設定を読む前に決める。設定で HISTFILE を変えたら、あとで読みなおす)
+        let file = sh.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.aish_history", home));
+        sh.histfile = (!home.is_empty() || file.starts_with('/')).then_some(file);
         let rcs = if shell_name() == "sh" {
             sh.get_var("ENV").and_then(|e| sh.expand_one(&e).ok()).into_iter().collect()
         } else {
@@ -1696,16 +1736,8 @@ impl Shell {
         // 履歴: $HISTFILE (なければ ~/.aish_history)、$HISTSIZE 行
         let mut ed = edit::Editor::new();
         if tty {
-            let home = self.get_var("HOME").unwrap_or_default();
-            let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.aish_history", home));
             let size = self.get_var("HISTSIZE").and_then(|n| n.parse().ok()).unwrap_or(10000);
-            ed.load((!home.is_empty() || file.starts_with('/')).then_some(file), size);
-            // 最近のディレクトリ (C-j)
-            if !home.is_empty() {
-                let f = format!("{}/.aish_dirs", home);
-                self.dirs = std::fs::read_to_string(&f).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect();
-                self.dirs_file = Some(f);
-            }
+            ed.load(self.histfile.clone(), size);
         }
         let mut buf = String::new();
         loop {
@@ -1713,12 +1745,15 @@ impl Shell {
                 jobs::report_jobs();
             }
             let read = if tty {
+                if buf.is_empty() {
+                    self.plugins.tell("precmd", serde_json::json!({ "status": self.status }));
+                }
                 let p = if buf.is_empty() { self.prompt() } else { self.get_var("PS2").unwrap_or_else(|| "> ".into()) };
                 let ctx = self.edit_ctx();
-                match ed.read(&p, &ctx) {
+                match ed.read(&p, &ctx, &mut self.plugins) {
                     edit::Input::Line(l) => Ok(Some(l)),
                     edit::Input::Silent(l) => {
-                        // 履歴に残さずに動かす (C-k の cd ..、C-j の cd)
+                        // 履歴に残さずに動かす (プラグインの機能の run と silent)
                         if let Ok(list) = Parser::new(&l).program() {
                             self.run_list(&list);
                             self.flow = Flow::None;
@@ -1760,6 +1795,7 @@ impl Shell {
                 Ok(list) => {
                     if tty {
                         ed.add(&buf);
+                        self.plugins.tell("preexec", serde_json::json!({ "line": buf.trim_end_matches('\n') }));
                     }
                     buf.clear();
                     self.run_list(&list);
@@ -1782,6 +1818,23 @@ impl Shell {
     fn prompt(&mut self) -> String {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
         let root = unsafe { libc::geteuid() } == 0;
+        // prompt のプラグインがあれば、それが作る
+        if self.plugins.wants("prompt") {
+            let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+            let ev = serde_json::json!({
+                "pwd": cwd,
+                "home": self.get_var("HOME").unwrap_or_default(),
+                "user": self.get_var("USER").or_else(|| self.get_var("LOGNAME")).unwrap_or_default(),
+                "host": host.trim().split('.').next().unwrap_or(""),
+                "status": self.status,
+                "root": root,
+                "ssh": self.get_var("SSH_CONNECTION").is_some(),
+                "jobs": jobs().len(),
+            });
+            if let Some(p) = self.plugins.ask("prompt", ev).and_then(|r| r["prompt"].as_str().map(String::from)) {
+                return p;
+            }
+        }
         let Some(ps1) = self.get_var("PS1") else {
             let mark = if self.status != 0 { "!" } else if root { "#" } else { "%" };
             return format!("{} {} ", cwd, mark);

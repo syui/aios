@@ -3,7 +3,7 @@
 pkgname=base
 pkgver=0.0.1
 pkgrel=1
-pkgdesc='aios base system: init, aish, aipkg, systemctl, login, which, swapon and /etc'
+pkgdesc='aios base system: init, aish (and its basic plugins), aipkg, systemctl, login, which, swapon and /etc'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
@@ -25,6 +25,9 @@ build() {
   cd "$startdir/../../../user"
   unset CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
   cargo build --release
+  # aish の基本のプラグイン (補完、グレーの候補、C-r などのキー)。aish とは別のプログラムで、/etc/aishrc で読む
+  cd ../shell
+  cargo build --release -p aish-complete -p aish-suggest -p aish-pick
 }
 
 package() {
@@ -56,6 +59,9 @@ package() {
   # ユーザーとグループ (shadow-utils と同じ名前): useradd が呼ばれた名前で動きを変える
   for p in usermod userdel groupadd groupdel; do
     ln -s useradd "$pkgdir/usr/bin/$p"
+  done
+  for p in aish-complete aish-suggest aish-pick; do
+    install -Dm755 "$top/shell/target/aarch64-unknown-linux-musl/release/$p" "$pkgdir/usr/lib/aish/plugins/$p"
   done
   # sh として呼ばれた aish は POSIX の sh として動く
   ln -s aish "$pkgdir/usr/bin/sh"

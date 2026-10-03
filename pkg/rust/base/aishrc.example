@@ -1,5 +1,8 @@
 # ~/.aishrc の見本: cp /usr/share/aish/aishrc.example ~/.aishrc
 # aish が対話するときに、/etc/aishrc のあとで読む (as で開いて、ar で読みなおす)
 
-# 拡張 ([shell] リポジトリのパッケージ)。aipkg -S aish-powerline で入れてから、# をはずす
-#source /usr/share/aish/plugins/aish-powerline/aish-powerline.sh
+# プラグイン ([shell] リポジトリのパッケージ)。ap -S aish-powerline で入れてから、# をはずす
+#plugin aish-powerline
+
+# キーを変える: bindkey KEY PLUGIN:WIDGET (bindkey だけで一覧、bindkey -r KEY で外す)
+#bindkey C-g pick:dir

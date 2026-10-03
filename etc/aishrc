@@ -1,9 +1,15 @@
 # /etc/aishrc: aish が対話するときに読む。そのあと ~/.aishrc を読む
 # (sh として呼ばれたときは読まない。POSIX の sh と同じく $ENV だけ)
 # ai/dot の .zshrc と同じ使いごこちに: alias、cd のあとの ls (chpwd)
-# powerline のプロンプトなどの拡張は、パッケージ ([shell] リポジトリ) を入れて ~/.aishrc で source する
+# 機能の多くはプラグイン (aish とは別のプログラム。/usr/lib/aish/plugins)。plugin で読み、bindkey でキーを変える。
+# powerline のプロンプトなどほかのプラグインは、パッケージ ([shell] リポジトリ) を入れて ~/.aishrc で読む
 # (~/.aishrc の見本: /usr/share/aish/aishrc.example)
 # キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
+
+# 基本のプラグイン (base に入っている)
+plugin aish-complete
+plugin aish-suggest
+plugin aish-pick
 
 alias ls='ls -a --color=auto'
 alias ll='ls -alh --color=auto'
