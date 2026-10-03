@@ -1,8 +1,11 @@
 # aifont: aios のフォント (JetBrains Mono + Nerd Fonts + syui の字)。git.syui.ai/ai/font をコミットで固定
 #   /usr/share/fonts/aifont/aifont.ttf (デスクトップのプログラムが使う)
 pkgname=aifont
-pkgver=2.304
+# 自作のパッケージは版を 0.0.1 にそろえる (フォントそのものの版は 2.304)。
+# 前の 2.304 より新しくするため epoch=1 (aipkg -Syu で上がる)
+pkgver=0.0.1
 pkgrel=1
+epoch=1
 pkgdesc='aifont: JetBrains Mono with Nerd Fonts and custom glyphs'
 arch=('any')
 url='https://git.syui.ai/ai/font'
