@@ -1813,7 +1813,8 @@ impl Shell {
                 Ok(list) => {
                     if tty {
                         ed.add(&buf);
-                        self.plugins.tell("preexec", serde_json::json!({ "line": buf.trim_end_matches('\n') }));
+                        let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                        self.plugins.tell("preexec", serde_json::json!({ "line": buf.trim_end_matches('\n'), "pwd": pwd }));
                     }
                     buf.clear();
                     self.run_list(&list);

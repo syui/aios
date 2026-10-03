@@ -4,11 +4,10 @@
 # 機能の多くはプラグイン (aish とは別のプログラム。/usr/lib/aish/plugins)。plugin で読み、bindkey でキーを変える。
 # powerline のプロンプトなどほかのプラグインは、パッケージ ([shell] リポジトリ) を入れて ~/.aishrc で読む
 # (~/.aishrc の見本: /usr/share/aish/aishrc.example)
-# キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
+# キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-o よく使うパス / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
 
 # 基本のプラグイン (base に入っている)
-plugin aish-complete
-plugin aish-suggest
+[ -z "$AISH_MCP" ] && plugin aish-complete && plugin aish-suggest
 plugin aish-pick
 # aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、
 # 何かが起きるまで待つ aish-wait も

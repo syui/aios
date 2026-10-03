@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 aish-plugin.workspace = true
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
