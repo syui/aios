@@ -1,0 +1,44 @@
+# vulkan-tools: vulkaninfo (Vulkan のドライバと GPU のことを見る) と vkcube (回る立方体) (for aios)
+#   Wayland だけ (X11 はなし)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする
+#   ビルドには cmake、ninja、このマシンの wayland-scanner が要る。/opt/c に入る
+pkgname=vulkan-tools
+pkgver=1.4.365
+pkgrel=1
+pkgdesc='Vulkan utilities: vulkaninfo and vkcube (Wayland, for aios)'
+arch=('aarch64')
+url='https://github.com/KhronosGroup/Vulkan-Tools'
+license=('Apache-2.0')
+depends=('musl' 'vulkan-loader' 'wayland')
+makedepends=('cmake' 'ninja' 'vulkan-headers' 'wayland-protocols')
+source=("Vulkan-Tools::git+https://github.com/KhronosGroup/Vulkan-Tools.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross vulkan-headers vulkan-loader wayland wayland-protocols libffi
+  # vkcube は wayland-scanner を pkg-config で探す。このマシンのものを sysroot に見せる
+  # (pkg-config は値の頭に sysroot をつけるので、sysroot の中にこのマシンの wayland-scanner へのリンクを置く)
+  local root=$srcdir/sysroot
+  mkdir -p "$root/usr/bin"
+  ln -sf "$(command -v wayland-scanner)" "$root/usr/bin/wayland-scanner"
+  printf 'wayland_scanner=/usr/bin/wayland-scanner\nName: wayland-scanner\nDescription: host wayland-scanner\nVersion: %s\n' \
+    "$(wayland-scanner --version 2>&1 | awk '{print $2}')" > "$root$PREFIX/share/pkgconfig/wayland-scanner.pc"
+  # wayland.xml (コアのプロトコル) も。aios の wayland のパッケージには入れていないので、このマシンのもの
+  mkdir -p "$root$PREFIX/share/wayland"
+  [ -f "$root$PREFIX/share/wayland/wayland.xml" ] ||
+    cp "$(pkg-config --variable=pkgdatadir wayland-scanner)/wayland.xml" "$root$PREFIX/share/wayland/"
+  rm -rf build
+  cmake -S Vulkan-Tools -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_CUBE=ON -DBUILD_VULKANINFO=ON -DBUILD_ICD=OFF -DBUILD_TESTS=OFF \
+    -DBUILD_WSI_XCB_SUPPORT=OFF -DBUILD_WSI_XLIB_SUPPORT=OFF -DBUILD_WSI_WAYLAND_SUPPORT=ON \
+    -DBUILD_WSI_DIRECTFB_SUPPORT=OFF -DBUILD_WSI_DISPLAY_SUPPORT=OFF \
+    -DCUBE_WSI_SELECTION=WAYLAND
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 Vulkan-Tools/LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
+}

@@ -1,0 +1,91 @@
+# mesa: OpenGL / OpenGL ES / EGL と Vulkan を CPU で (for aios)
+#   llvmpipe (OpenGL / GLES、EGL)、lavapipe (Vulkan)。シェーダーは LLVM (pkg/c/llvm) でその場で機械語にする
+#   aios にはまだ GPU のドライバがないので、絵は CPU で描いて Wayland の wl_shm で aiwm へ渡す
+#   pkg/c/zig.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+#   ビルドには meson、ninja、flex、bison、glslangValidator、python の mako と pyyaml、qemu-aarch64
+#   (aios 用の llvm-config を動かす)、このマシンの cc と expat (wayland-scanner をこのマシン用に作る) が要る
+pkgname=mesa
+pkgver=26.2.4
+pkgrel=1
+pkgdesc='Open-source OpenGL, GLES, EGL and Vulkan on the CPU: llvmpipe and lavapipe (for aios)'
+arch=('aarch64')
+url='https://www.mesa3d.org/'
+license=('MIT')
+depends=('musl' 'llvm' 'libdrm' 'wayland' 'zlib' 'expat')
+makedepends=('meson' 'ninja' 'flex' 'bison' 'glslang' 'python-mako' 'python-yaml' 'wayland-protocols' 'qemu-user' 'expat')
+# Mesa は aios の libwayland と同じ版 (より新しい) の wayland-scanner を、このマシン用に欲しがる
+_wlver=1.24.0
+source=("https://archive.mesa3d.org/mesa-$pkgver.tar.xz"
+        "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$_wlver/downloads/wayland-$_wlver.tar.xz")
+sha256sums=('bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9'
+            '82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536')
+
+prepare() {
+  rm -rf "mesa-$pkgver" "wayland-$_wlver"
+  tar -xf "${source[0]##*/}"
+  tar -xf "${source[1]##*/}"
+}
+
+build() {
+  # このマシンで動く wayland-scanner
+  (cd "wayland-$_wlver"
+   unset CC CFLAGS LDFLAGS
+   meson setup build-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
+     -Ddtd_validation=false --prefix="$srcdir/native" --libdir=lib
+   ninja -C build-native install)
+  export PATH=$srcdir/native/bin:$PATH PKG_CONFIG_PATH_FOR_BUILD=$srcdir/native/lib/pkgconfig
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross llvm libdrm wayland wayland-protocols libffi zlib expat
+  local root=$srcdir/sysroot
+  # aios 用の llvm-config (静的なプログラム) を qemu-aarch64 で動かすと、sysroot の中の LLVM の場所を答える。
+  # LLVM は libLLVM.so ひとつだけ入れているが、llvm-config は --link-shared で部品ごとの .so を答えるので、
+  # ライブラリのことはこちらで答える
+  cat > "$srcdir/llvm-config" <<SH
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in
+    --shared-mode) echo shared; exit ;;
+    --libs) echo -L$root$PREFIX/lib -lLLVM-$(qemu-aarch64 "$root$PREFIX/bin/llvm-config" --version | cut -d. -f1); exit ;;
+    --libfiles) echo "$root$PREFIX/lib/libLLVM.so"; exit ;;
+    --system-libs) echo; exit ;;
+  esac
+done
+exec qemu-aarch64 "$root$PREFIX/bin/llvm-config" "\$@"
+SH
+  chmod 755 "$srcdir/llvm-config"
+  sed -i "/^\[binaries\]/a llvm-config = '$srcdir/llvm-config'" "$srcdir/cross.ini"
+  cd "mesa-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dplatforms=wayland \
+    -Dgallium-drivers=llvmpipe \
+    -Dvulkan-drivers=swrast \
+    -Dvulkan-layers= \
+    -Dglx=disabled \
+    -Degl=enabled \
+    -Dgles1=disabled \
+    -Dgles2=enabled \
+    -Dopengl=true \
+    -Dgbm=disabled \
+    -Dglvnd=disabled \
+    -Dllvm=enabled \
+    -Dshared-llvm=enabled \
+    -Dgallium-va=disabled \
+    -Dgallium-rusticl=false \
+    -Dvideo-codecs= \
+    -Dvalgrind=disabled \
+    -Dlibunwind=disabled \
+    -Dlmsensors=disabled \
+    -Dzstd=disabled \
+    -Dspirv-tools=disabled \
+    -Dandroid-libbacktrace=disabled \
+    -Dbuild-tests=false \
+    -Dtools=
+  ninja -C build
+}
+
+package() {
+  cd "mesa-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 docs/license.rst "$pkgdir/usr/share/licenses/$pkgname/license.rst"
+}
