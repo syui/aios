@@ -181,6 +181,7 @@ mod nr {
     pub const GETPRIORITY: u64 = 141;
     pub const MPROTECT: u64 = 226;
     pub const MSYNC: u64 = 227;
+    pub const MINCORE: u64 = 232;
     pub const MADVISE: u64 = 233;
     pub const ACCEPT4: u64 = 242;
     pub const WAIT4: u64 = 260;
@@ -409,6 +410,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MUNMAP => sys_munmap(a[0] as usize, a[1] as usize),
         MPROTECT => sys_mprotect(a[0] as usize, a[1] as usize, a[2]),
         MADVISE => sys_madvise(a[0] as usize, a[1] as usize, a[2]),
+        MINCORE => sys_mincore(a[0] as usize, a[1] as usize, a[2] as usize),
         MSYNC => sys_msync(a[0] as usize, a[1] as usize),
         MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
@@ -831,6 +833,22 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
     if advice == MADV_DONTNEED {
         proc::current().pt().discard(addr, addr + pg_up(len));
     }
+    Ok(0)
+}
+
+/// mincore: ページがメモリにあるか。写してある領域はみな「ある」と答える (スワップに出ていても読めば戻る)。
+/// 写していないところがあれば ENOMEM
+fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {
+    const ENOMEM: i64 = 12;
+    if addr & 0xfff != 0 {
+        return Err(-EINVAL);
+    }
+    let n = pg_up(len) / 4096;
+    let m = proc::current().mm();
+    if (0..n).any(|i| m.pt.find(addr + i * 4096).is_none()) {
+        return Err(-ENOMEM);
+    }
+    out(vec, &alloc::vec![1u8; n])?;
     Ok(0)
 }
 
