@@ -266,10 +266,27 @@ struct Surface {
 struct Client {
     conn: Conn,
     objs: HashMap<u32, Obj>,
+    /// bind した版 (wl_seat、wl_output と、seat から作った pointer / keyboard)。古い版のクライアントには
+    /// あとの版で増えたイベントを送らない (受け手がなくて落ちる)
+    vers: HashMap<u32, u32>,
     surfaces: HashMap<u32, Surface>,
     keyboards: Vec<u32>,
     pointers: Vec<u32>,
     dead: bool,
+}
+
+impl Client {
+    /// オブジェクトの版 (わからなければ 1)
+    fn ver(&self, id: u32) -> u32 {
+        self.vers.get(&id).copied().unwrap_or(1)
+    }
+
+    /// wl_pointer.frame (版 5 から)
+    fn frame(&mut self, p: u32) {
+        if self.ver(p) >= 5 {
+            self.conn.send(p, 5, &[]);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -770,7 +787,7 @@ impl Wm {
             objs.insert(1, Obj::Display);
             let id = self.next_client;
             self.next_client += 1;
-            self.clients.insert(id, Client { conn: Conn::new(fd), objs, surfaces: HashMap::new(), keyboards: vec![], pointers: vec![], dead: false });
+            self.clients.insert(id, Client { conn: Conn::new(fd), objs, vers: HashMap::new(), surfaces: HashMap::new(), keyboards: vec![], pointers: vec![], dead: false });
         }
     }
 
@@ -848,7 +865,7 @@ impl Wm {
             (K::Registry, 0) => {
                 let name = m.uint();
                 let _iface = m.string();
-                let _ver = m.uint();
+                let ver = m.uint();
                 let o = match name {
                     1 => Obj::Compositor,
                     2 => Obj::Shm,
@@ -864,6 +881,7 @@ impl Wm {
                     }
                 };
                 let nid = new_obj!(o);
+                c.vers.insert(nid, ver);
                 match name {
                     2 => {
                         c.conn.send(nid, 0, &[Arg::U(0)]);
@@ -871,14 +889,20 @@ impl Wm {
                     }
                     3 => {
                         c.conn.send(nid, 0, &[Arg::U(3)]);
-                        c.conn.send(nid, 1, &[Arg::S("seat0")]);
+                        // name は版 2 から
+                        if ver >= 2 {
+                            c.conn.send(nid, 1, &[Arg::S("seat0")]);
+                        }
                     }
                     4 => {
                         let (w, h) = (self.fb.width as i32, self.fb.height as i32);
                         c.conn.send(nid, 0, &[Arg::I(0), Arg::I(0), Arg::I(w * 254 / 960), Arg::I(h * 254 / 960), Arg::I(0), Arg::S("aios"), Arg::S("virtio-gpu"), Arg::I(0)]);
                         c.conn.send(nid, 1, &[Arg::U(3), Arg::I(w), Arg::I(h), Arg::I(60000)]);
-                        c.conn.send(nid, 3, &[Arg::I(1)]);
-                        c.conn.send(nid, 2, &[]);
+                        // scale と done は版 2 から
+                        if ver >= 2 {
+                            c.conn.send(nid, 3, &[Arg::I(1)]);
+                            c.conn.send(nid, 2, &[]);
+                        }
                     }
                     _ => {}
                 }
@@ -1043,16 +1067,23 @@ impl Wm {
             (K::Surface, 6) => self.commit(cid, m.id),
             (K::Surface, _) => {}
             (K::Seat, 0) => {
+                let v = c.ver(m.id);
                 let p = new_obj!(Obj::Pointer);
+                c.vers.insert(p, v);
                 c.pointers.push(p);
             }
             (K::Seat, 1) => {
+                let v = c.ver(m.id);
                 let k = new_obj!(Obj::Keyboard);
+                c.vers.insert(k, v);
                 c.keyboards.push(k);
                 // 1 = XKB_V1 (クライアントは libxkbcommon で読む)。0 なら「キーマップなし」
                 let format = if self.keymap_size > 0 { 1 } else { 0 };
                 c.conn.send(k, 0, &[Arg::U(format), Arg::Fd(self.keymap_fd), Arg::U(self.keymap_size)]);
-                c.conn.send(k, 5, &[Arg::I(25), Arg::I(600)]);
+                // repeat_info は版 4 から
+                if v >= 4 {
+                    c.conn.send(k, 5, &[Arg::I(25), Arg::I(600)]);
+                }
                 // すでに作業中の窓なら、すぐ enter
                 if let Some(f) = self.focus.filter(|f| f.client == cid) {
                     let s = self.next_serial();
@@ -1180,6 +1211,7 @@ impl Wm {
     fn destroy(&mut self, cid: usize, id: u32) {
         let c = self.clients.get_mut(&cid).unwrap();
         c.objs.remove(&id);
+        c.vers.remove(&id);
         if id < 0xff00_0000 {
             c.conn.send(1, 1, &[Arg::U(id)]);
         }
@@ -1860,7 +1892,7 @@ impl Wm {
                 if let Some(c) = self.clients.get_mut(&o.client) {
                     for p in c.pointers.clone() {
                         c.conn.send(p, 1, &[Arg::U(serial), Arg::O(o.surface)]);
-                        c.conn.send(p, 5, &[]);
+                        c.frame(p);
                     }
                 }
             }
@@ -1868,10 +1900,10 @@ impl Wm {
                 if let Some(c) = self.clients.get_mut(&n.client) {
                     for p in c.pointers.clone() {
                         c.conn.send(p, 0, &[Arg::U(serial), Arg::O(n.surface), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
-                        c.conn.send(p, 5, &[]);
+                        c.frame(p);
                         // enter のあとに motion も (GTK は motion で「上にいる」を決めるものがある)
                         c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
-                        c.conn.send(p, 5, &[]);
+                        c.frame(p);
                     }
                 }
             }
@@ -1880,7 +1912,7 @@ impl Wm {
             if let Some(c) = self.clients.get_mut(&n.client) {
                 for p in c.pointers.clone() {
                     c.conn.send(p, 2, &[Arg::U(wl::now_ms()), Arg::F((self.ptr.0 - o.0) as f64), Arg::F((self.ptr.1 - o.1) as f64)]);
-                    c.conn.send(p, 5, &[]);
+                    c.frame(p);
                 }
             }
         }
@@ -1918,7 +1950,7 @@ impl Wm {
                 if let Some(c) = self.clients.get_mut(&w.client) {
                     for p in c.pointers.clone() {
                         c.conn.send(p, 3, &[Arg::U(serial), Arg::U(wl::now_ms()), Arg::U(code as u32), Arg::U(value as u32)]);
-                        c.conn.send(p, 5, &[]);
+                        c.frame(p);
                     }
                 }
                 return;
@@ -1943,7 +1975,7 @@ impl Wm {
             if let Some(c) = self.clients.get_mut(&w.client) {
                 for p in c.pointers.clone() {
                     c.conn.send(p, 3, &[Arg::U(serial), Arg::U(wl::now_ms()), Arg::U(code as u32), Arg::U(value as u32)]);
-                    c.conn.send(p, 5, &[]);
+                    c.frame(p);
                 }
             }
         }
