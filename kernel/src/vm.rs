@@ -93,6 +93,11 @@ fn write_back(key: &FileKey, c: &Cached) {
     }
 }
 
+/// MAP_SHARED で写しているファイルのページの数 (/proc/meminfo の Shmem)
+pub fn shared_pages() -> usize {
+    shared_file().len()
+}
+
 /// 書いたページをファイルに書き戻す (sync)。印はそのまま (まだ書けるように写っているかもしれない)
 pub fn sync_shared() {
     for (k, c) in shared_file().iter().filter(|(_, c)| c.dirty) {

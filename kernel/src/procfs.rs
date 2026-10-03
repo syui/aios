@@ -43,6 +43,7 @@ enum Node {
     Cwd(u32),
     Exe(u32),
     Maps(u32),
+    Stack(u32),
     FdDir(u32),
     Fd(u32, usize),
 }
@@ -89,6 +90,7 @@ impl ProcInode {
             Node::Cwd(p) => (p as u64) << 16 | 5,
             Node::Exe(p) => (p as u64) << 16 | 7,
             Node::Maps(p) => (p as u64) << 16 | 8,
+            Node::Stack(p) => (p as u64) << 16 | 9,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
         }
@@ -96,7 +98,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
             _ => None,
         }
     }
@@ -138,10 +140,11 @@ impl ProcInode {
                 let free = crate::kalloc::nfree() * PGSIZE / 1024;
                 let (st, sf) = crate::swap::totals();
                 format!(
-                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\n",
+                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nShmem:        {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\n",
                     total,
                     free,
                     free,
+                    crate::vm::shared_pages() * PGSIZE / 1024,
                     st * PGSIZE / 1024,
                     sf * PGSIZE / 1024
                 )
@@ -167,6 +170,7 @@ impl ProcInode {
             }
             Node::Stat(pid) => stat_line(leader(pid)?),
             Node::Maps(pid) => leader(pid)?.mm().pt.maps_text(),
+            Node::Stack(pid) => proc::stacks_text(leader(pid)?.tgid),
             Node::Status(pid) => {
                 let p = leader(pid)?;
                 let c = &p.cred;
@@ -370,6 +374,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "cwd") => Node::Cwd(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
             (Node::Pid(p), "maps") => Node::Maps(p),
+            (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
@@ -416,6 +421,7 @@ impl Inode for ProcInode {
                 add("cwd".into(), Node::Cwd(p));
                 add("exe".into(), Node::Exe(p));
                 add("maps".into(), Node::Maps(p));
+                add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
             }
             Node::FdDir(p) => {

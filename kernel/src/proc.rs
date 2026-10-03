@@ -1114,6 +1114,76 @@ pub fn fp_restore(f: &FpState) {
 }
 
 /// /proc/threads: すべてのスレッドの pid、tgid、状態、待っているもの、最後のシステムコール (調べもの用)
+/// /proc/PID/stack (調べもの用): プロセスのスレッドごとに、EL0 の pc と lr、フレームポインタをたどった戻り先、
+/// それからスタック (sp から 32 KiB) の中で写したファイル (実行できるところ) を指す値を「ファイル+位置」で
+pub fn stacks_text(tgid: u32) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::new();
+    for i in 0..NPROC {
+        let p = &procs()[i];
+        if p.state == State::Unused || p.state == State::Zombie || p.tgid != tgid {
+            continue;
+        }
+        let tf = p.tf_ref();
+        let (pc, lr, fp, sp) = (tf.elr, tf.x[30], tf.x[29], tf.sp_el0);
+        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let _ = writeln!(out, "thread {} {} sys {} chan {:x}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan);
+        let pt = p.pt();
+        let name = |pt: &mut crate::vm::PageTable, va: u64| -> Option<alloc::string::String> {
+            let (_, v) = pt.find(va as usize)?;
+            if v.prot & 4 == 0 {
+                return None;
+            }
+            let (f, off) = pt.name_at(va as usize)?;
+            Some(alloc::format!("{}+{:#x}", f.rsplit('/').next().unwrap_or(&f), off))
+        };
+        for (what, va) in [("pc", pc), ("lr", lr)] {
+            let _ = writeln!(out, "  {} {:#x} {}", what, va, name(pt, va).unwrap_or_default());
+        }
+        // フレームポインタ: [fp] = 前の fp、[fp + 8] = 戻り先
+        let mut f = fp;
+        for _ in 0..48 {
+            if f == 0 || f & 7 != 0 {
+                break;
+            }
+            let mut b = [0u8; 16];
+            if pt.copy_in(&mut b, f as usize).is_none() {
+                break;
+            }
+            let next = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let ret = u64::from_le_bytes(b[8..].try_into().unwrap());
+            let _ = writeln!(out, "  fp {:#x} {}", ret, name(pt, ret).unwrap_or_default());
+            if next <= f {
+                break;
+            }
+            f = next;
+        }
+        // スタックの中の、コードを指す値
+        let mut buf = alloc::vec![0u8; 32 * 1024];
+        let mut got = 0;
+        while got < buf.len() {
+            let chunk = 4096 - ((sp as usize + got) & 4095);
+            let chunk = chunk.min(buf.len() - got);
+            if pt.copy_in(&mut buf[got..got + chunk], sp as usize + got).is_none() {
+                break;
+            }
+            got += chunk;
+        }
+        let mut shown = 0;
+        for w in buf[..got].chunks_exact(8) {
+            let va = u64::from_le_bytes(w.try_into().unwrap());
+            if let Some(nm) = name(pt, va) {
+                let _ = writeln!(out, "  scan {:#x} {}", va, nm);
+                shown += 1;
+                if shown >= 80 {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn threads_text() -> alloc::string::String {
     let mut out = alloc::string::String::from("  PID  TGID ST CHAN             SYSCALL ARG0             ARG1             NAME\n");
     for p in procs().iter() {
