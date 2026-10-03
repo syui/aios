@@ -1,0 +1,40 @@
+# openssh: ssh / scp / sftp / ssh-keygen / ssh-agent と sshd。OpenSSL なし (--without-openssl):
+#   鍵は ed25519、暗号は chacha20-poly1305 と aes-ctr、鍵の交換は mlkem768x25519 / sntrup761x25519 /
+#   curve25519 (どれも openssh の中のもの)。RSA と ECDSA の鍵は使えない。
+#   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
+pkgname=openssh
+pkgver=10.5p1
+pkgrel=1
+pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
+arch=('aarch64')
+url='https://www.openssh.com/portable.html'
+license=('SSH-OpenSSH')
+backup=(etc/ssh/ssh_config etc/ssh/sshd_config)
+source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz")
+sha256sums=('d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11')
+
+prepare() {
+  rm -rf "openssh-$pkgver"
+  tar -xzf "openssh-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "openssh-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --sysconfdir=/etc/ssh \
+    --without-openssl --without-zlib --without-pam --without-selinux --without-kerberos5 \
+    --without-security-key-builtin --disable-strip --with-pid-dir=/run \
+    --with-privsep-path=/var/empty --with-privsep-user=nobody \
+    --with-default-path=/opt/c/bin:/usr/local/bin:/usr/bin:/bin
+  make
+}
+
+package() {
+  cd "openssh-$pkgver"
+  # install-nokeys: ホストの鍵はここで作らない (クロスのバイナリは動かせない。sshd を使うときに ssh-keygen -A)
+  make DESTDIR="$pkgdir" install-nokeys
+  rm -rf "$pkgdir/opt/c/share/man"
+  install -d -m755 "$pkgdir/var/empty"
+  install -Dm644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
+}

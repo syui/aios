@@ -1,0 +1,31 @@
+# jq: JSON を読んで変える道具 (aios は JSON にそろえるので、よく使う)。静的なバイナリ 1 つ
+#   正規表現 (test / match / sub) の oniguruma は jq の中にあるものを使う。Zig でクロスビルドして /opt/c に入る
+pkgname=jq
+pkgver=1.8.2
+pkgrel=1
+pkgdesc='Command-line JSON processor (static, for aios)'
+arch=('aarch64')
+url='https://jqlang.org/'
+license=('MIT')
+source=("https://github.com/jqlang/jq/releases/download/jq-$pkgver/jq-$pkgver.tar.gz")
+sha256sums=('71b8d6e8f5fe81f6c6d0d110e3892251f6ce76ed095abd315e26e6e1193af3af')
+
+prepare() {
+  rm -rf "jq-$pkgver"
+  tar -xzf "jq-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "jq-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --with-oniguruma=builtin \
+    --disable-shared --enable-static --enable-all-static --disable-docs --disable-maintainer-mode
+  make
+}
+
+package() {
+  cd "jq-$pkgver"
+  install -Dm755 jq "$pkgdir/opt/c/bin/jq"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

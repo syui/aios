@@ -1,0 +1,53 @@
+# ncurses: 端末を扱うライブラリ (zsh、vim、tmux が使う)。静的な libncursesw.a とヘッダー、tput / clear / reset など
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。
+#   terminfo のデータベース (数千の端末) は入れず、使う端末だけをライブラリの中に入れる (--with-fallbacks)。
+#   aiterm は xterm-256color、tmux の中は tmux-256color、シリアルは linux / vt100。
+#   ほかの端末は /opt/c/share/terminfo か /usr/share/terminfo に置けば読む
+pkgname=ncurses
+pkgver=6.6
+pkgrel=1
+pkgdesc='System V Release 4.0 curses emulation library (static, with built-in terminal entries, for aios)'
+arch=('aarch64')
+url='https://invisible-island.net/ncurses/'
+license=('MIT')
+source=("https://ftp.gnu.org/gnu/ncurses/ncurses-$pkgver.tar.gz")
+sha256sums=('355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11')
+
+# ライブラリに入れる端末
+_terms=xterm-256color,xterm,tmux-256color,tmux,screen-256color,screen,linux,vt100,vt220,dumb,alacritty,foot,ghostty
+
+prepare() {
+  rm -rf "ncurses-$pkgver"
+  tar -xzf "ncurses-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "ncurses-$pkgver"
+  # 入れる端末の C は、このマシンの tic / infocmp で作る (BUILD_CC はこのマシンのコンパイラ)
+  BUILD_CC=cc ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+    --with-build-cc=cc --without-cxx --without-cxx-binding --without-ada --without-manpages \
+    --without-tests --without-debug --without-shared --with-normal --enable-widec --enable-overwrite \
+    --enable-pc-files --with-pkg-config-libdir="$PREFIX/lib/pkgconfig" \
+    --disable-db-install --with-fallbacks="$_terms" \
+    --with-terminfo-dirs="$PREFIX/share/terminfo:/usr/share/terminfo" \
+    --with-default-terminfo-dir="$PREFIX/share/terminfo" --disable-stripping
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "ncurses-$pkgver"
+  make DESTDIR="$pkgdir" install
+  # w のない名前でも見つかるように (zsh や vim の configure は -lncurses / -lcurses / -ltinfo も探す)
+  cd "$pkgdir/opt/c/lib"
+  for l in ncurses curses tinfo tinfow; do
+    ln -sf libncursesw.a lib$l.a
+  done
+  ln -sf ncursesw.pc pkgconfig/ncurses.pc
+  ln -sf ncursesw.pc pkgconfig/tinfo.pc
+  rm -rf "$pkgdir/opt/c/share/man"
+  install -Dm644 "$srcdir/ncurses-$pkgver/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
