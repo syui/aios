@@ -7,7 +7,7 @@
 #   powerline: powerline のプロンプト ([shell] リポジトリの aish-powerline)
 [workspace]
 resolver = "2"
-members = ["plugin", "complete", "suggest", "pick", "edit", "wait", "powerline"]
+members = ["plugin", "complete", "suggest", "pick", "edit", "wait", "map", "powerline"]
 
 [workspace.package]
 version = "0.0.1"

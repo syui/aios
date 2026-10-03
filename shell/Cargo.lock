@@ -27,6 +27,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-map"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "regex",
+]
+
+[[package]]
 name = "aish-pick"
 version = "0.0.1"
 dependencies = [

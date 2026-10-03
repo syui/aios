@@ -18,7 +18,8 @@ bindkey                       # 一覧
 | `aish-complete` | base | Tab の補完 (コマンド、ファイル、`$変数`) |
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
 | `aish-pick` | base | C-r 履歴 / C-f ファイル / C-g rg で探して開く / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
-| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `grep` (ripgrep があればそれで) `sed` `lines` (行の番号で) `undo`。`aish --mcp` で読む |
+| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `grep` (ripgrep があればそれで。よく使うファイルが先で、見つけた行に番号 `n`) `hit` (n 番のまわり) `each` (見つけた行だけ置きかえる) `sed` `lines` (行の番号で) `undo`。`aish --mcp` で読む |
+| `aish-map` | base | 探さなくていいように: ツール `where` (名前から定義の場所。ぴったり → 前が同じ → 含む、よく使うファイルが先) `outline` (ファイルの中の定義)。M-. で選んで `$EDITOR +行 ファイル`。rg が要る |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
