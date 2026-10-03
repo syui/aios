@@ -9,6 +9,9 @@ arch=('aarch64')
 url='https://github.com/astral-sh/uv'
 license=('MIT' 'Apache-2.0')
 makedepends=('git' 'rustup')
+# uv は /lib/ld-musl-aarch64.so.1 を見て musl の Python を選ぶ (aios のコマンドは静的なので、ほかに手がかりがない)。
+# その Python も musl の共有ライブラリを使う
+optdepends=('musl: uv python install (the Python is linked to musl)')
 source=("git+https://github.com/astral-sh/uv#tag=$pkgver")
 sha256sums=('SKIP')
 
