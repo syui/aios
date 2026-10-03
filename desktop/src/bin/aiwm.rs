@@ -256,6 +256,11 @@ struct Surface {
     /// 子を持つ surface の重なり順 (下から)。自分自身も入る。空なら自分だけ
     stack: Vec<u32>,
     popup: Option<Popup>,
+    /// xdg_toplevel.set_parent の親 (ダイアログ)、set_app_id、set_min_size / set_max_size
+    parent_top: Option<u32>,
+    app_id: String,
+    min_size: (i32, i32),
+    max_size: (i32, i32),
 }
 
 struct Client {
@@ -300,6 +305,8 @@ enum Layout {
 /// ワークスペース: 窓の並びと、その中の作業中の窓
 struct Ws {
     wins: Vec<Win>,
+    /// 浮いている窓 (タイルに入れない。ダイアログなど)。下から
+    floats: Vec<Win>,
     focus: Option<Win>,
     layout: Layout,
     fullscreen: Option<Win>,
@@ -307,7 +314,7 @@ struct Ws {
 
 impl Ws {
     fn new() -> Ws {
-        Ws { wins: vec![], focus: None, layout: Layout::SplitH, fullscreen: None }
+        Ws { wins: vec![], floats: vec![], focus: None, layout: Layout::SplitH, fullscreen: None }
     }
 }
 
@@ -320,6 +327,8 @@ enum Action {
     MoveTo(u32),
     Layout(Option<Layout>),
     Fullscreen,
+    /// floating toggle: 作業中の窓を浮かせる / タイルに戻す
+    FloatToggle,
     Exit,
 }
 
@@ -336,6 +345,10 @@ struct Config {
     bg: u32,
     /// バー: None なら出さない。(上か, status_command)
     bar: Option<(bool, Option<String>)>,
+    /// floating_modifier: これを押しながらドラッグで浮いた窓を動かす
+    float_mod: u32,
+    /// for_window [app_id="..."] floating enable の app_id
+    float_apps: Vec<String>,
 }
 
 struct Wm {
@@ -358,6 +371,10 @@ struct Wm {
     ptr_win: Option<Win>,
     /// 出ている popup (下から)
     popups: Vec<Win>,
+    /// 浮いている窓の「窓」(window geometry) の左上
+    float_at: HashMap<(usize, u32), (i32, i32)>,
+    /// floating_modifier + ドラッグで動かしている窓と、押したところからのずれ
+    drag: Option<(Win, i32, i32)>,
     abs_max: (i32, i32),
     config: Config,
     /// 描きなおす行 [y0, y1)
@@ -418,6 +435,8 @@ fn main() {
         ptr_shown: false,
         ptr_win: None,
         popups: vec![],
+        float_at: HashMap::new(),
+        drag: None,
         config,
         dirty: Some((0, h)),
         frames: vec![],
@@ -519,7 +538,7 @@ fn load_config() -> Config {
 
 fn parse_config(text: &str) -> Config {
     let mut vars: Vec<(String, String)> = vec![];
-    let mut c = Config { binds: vec![], layout: String::new(), autostart: vec![], bg: DESK, bar: None };
+    let mut c = Config { binds: vec![], layout: String::new(), autostart: vec![], bg: DESK, bar: None, float_mod: keys::MOD_ALT, float_apps: vec![] };
     let mut in_bar = false;
     for line in text.lines() {
         let line = line.trim();
@@ -576,6 +595,7 @@ fn parse_config(text: &str) -> Config {
                     ["layout", "tabbed" | "stacking"] => Action::Layout(Some(Layout::Tabbed)),
                     ["layout", "toggle", "split"] => Action::Layout(None),
                     ["fullscreen"] | ["fullscreen", "toggle"] => Action::Fullscreen,
+                    ["floating", "toggle"] => Action::FloatToggle,
                     ["exit"] => Action::Exit,
                     _ => {
                         eprintln!("aiwm: config: unknown command {}", cmd.join(" "));
@@ -585,6 +605,17 @@ fn parse_config(text: &str) -> Config {
                 c.binds.push(Binding { mods, code, action });
             }
             ["exec", rest @ ..] => c.autostart.push(rest.join(" ")),
+            ["floating_modifier", m, ..] => match parse_combo(&format!("{}+a", m)) {
+                Some((mods, _)) => c.float_mod = mods,
+                None => eprintln!("aiwm: config: unknown modifier {}", m),
+            },
+            ["for_window", crit, "floating", "enable"] => {
+                // [app_id="firefox"] だけ
+                match crit.strip_prefix("[app_id=").and_then(|r| r.strip_suffix(']')) {
+                    Some(id) => c.float_apps.push(id.trim_matches('"').to_string()),
+                    None => eprintln!("aiwm: config: for_window: only [app_id=\"...\"]: {}", crit),
+                }
+            }
             ["input", _, "xkb_layout", l] => c.layout = l.to_string(),
             ["output", _, "bg", color, ..] => {
                 if let Ok(v) = u32::from_str_radix(color.trim_start_matches('#'), 16) {
@@ -774,7 +805,7 @@ impl Wm {
             self.popups.retain(|p| p.client != id);
             self.mark_all();
         }
-        let gone: Vec<Win> = self.spaces.values().flat_map(|s| s.wins.iter().copied()).filter(|w| w.client == id).collect();
+        let gone: Vec<Win> = self.spaces.values().flat_map(|s| s.wins.iter().chain(s.floats.iter()).copied()).filter(|w| w.client == id).collect();
         for w in gone {
             self.unmap(w);
         }
@@ -1092,10 +1123,38 @@ impl Wm {
                 self.destroy(cid, m.id);
                 self.unmap(Win { client: cid, surface: sid });
             }
+            (K::Toplevel(sid), 1) => {
+                // set_parent: 親の xdg_toplevel (0 なら親なし)
+                let pid = m.uint();
+                let psid = match c.objs.get(&pid) {
+                    Some(Obj::Toplevel(p)) => Some(*p),
+                    _ => None,
+                };
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.parent_top = psid;
+                }
+            }
             (K::Toplevel(sid), 2) => {
                 let t = m.string();
                 if let Some(s) = c.surfaces.get_mut(&sid) {
                     s.title = t;
+                }
+            }
+            (K::Toplevel(sid), 3) => {
+                let t = m.string();
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.app_id = t;
+                }
+            }
+            (K::Toplevel(sid), op @ (7 | 8)) => {
+                // set_max_size (7)、set_min_size (8)
+                let wh = (m.int(), m.int());
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    if op == 7 {
+                        s.max_size = wh;
+                    } else {
+                        s.min_size = wh;
+                    }
                 }
             }
             (K::Toplevel(_), _) => {}
@@ -1161,7 +1220,14 @@ impl Wm {
             }
             return;
         }
-        if is_top && self.ws_of(w).is_none() {
+        if is_top && self.ws_of(w).is_none() && self.wants_float(w) {
+            // ダイアログなど: 浮かせる。場所は絵が来てから (place_float)
+            let ws = self.cur_ws();
+            ws.floats.push(w);
+            ws.fullscreen = None;
+            self.set_focus(Some(w));
+            self.relayout();
+        } else if is_top && self.ws_of(w).is_none() {
             // 新しい窓: 今のワークスペースの作業中の窓のうしろに入れて、作業中にする
             let focus = self.focus;
             let ws = self.cur_ws();
@@ -1171,8 +1237,49 @@ impl Wm {
             self.set_focus(Some(w));
             self.relayout();
         } else {
-            self.mark_surface(cid, sid);
+            if self.is_float(w) && !self.float_at.contains_key(&(cid, sid)) {
+                // 最初の絵: 大きすぎれば縮めてもらい (relayout)、真ん中に置く
+                self.relayout();
+                self.place_float(w);
+            }
+            if self.is_float(w) {
+                // 浮いた窓は大きさが変わるかもしれない (前の大きさのところも描きなおす)
+                self.mark_all();
+            } else {
+                self.mark_surface(cid, sid);
+            }
         }
+    }
+
+    /// 新しい窓を浮かせるか: 親がある (ダイアログ)、大きさが決まっている、for_window で決めた app_id
+    fn wants_float(&self, w: Win) -> bool {
+        let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { return false };
+        s.parent_top.is_some() || (s.min_size.0 > 0 && s.min_size == s.max_size) || self.config.float_apps.iter().any(|a| *a == s.app_id)
+    }
+
+    fn is_float(&self, w: Win) -> bool {
+        self.spaces.values().any(|s| s.floats.contains(&w))
+    }
+
+    /// 浮いた窓の大きさ (window geometry か絵の大きさ)
+    fn float_size(&self, w: Win) -> (i32, i32) {
+        let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { return (1, 1) };
+        let (gw, gh) = s.geometry.map_or((s.iw as i32, s.ih as i32), |g| (g.2, g.3));
+        (gw.max(1), gh.max(1))
+    }
+
+    /// 浮いた窓を、親の窓 (なければ窓を並べるところ) の真ん中に置く。絵がまだなければ置かない
+    fn place_float(&mut self, w: Win) {
+        let Some(s) = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)) else { return };
+        if s.iw == 0 {
+            return;
+        }
+        let parent = s.parent_top.and_then(|p| self.rect_of(Win { client: w.client, surface: p }));
+        let a = parent.unwrap_or_else(|| self.area());
+        let (fw, fh) = self.float_size(w);
+        let x = (a.x + (a.w - fw) / 2).clamp(0, (self.width() - fw).max(0));
+        let y = (a.y + (a.h - fh) / 2).clamp(self.bar_h(), (self.height() - fh).max(self.bar_h()));
+        self.float_at.insert((w.client, w.surface), (x, y));
     }
 
     /// surface (子の窓でも) が属している窓 (いちばん上の親)
@@ -1319,22 +1426,34 @@ impl Wm {
     }
 
     fn ws_of(&self, w: Win) -> Option<u32> {
-        self.spaces.iter().find(|(_, s)| s.wins.contains(&w)).map(|(n, _)| *n)
+        self.spaces.iter().find(|(_, s)| s.wins.contains(&w) || s.floats.contains(&w)).map(|(n, _)| *n)
     }
 
     fn unmap(&mut self, w: Win) {
         let Some(n) = self.ws_of(w) else { return };
+        self.float_at.remove(&(w.client, w.surface));
+        if self.drag.is_some_and(|d| d.0 == w) {
+            self.drag = None;
+        }
         let ws = self.spaces.get_mut(&n).unwrap();
-        let i = ws.wins.iter().position(|x| *x == w).unwrap();
-        ws.wins.remove(i);
+        if let Some(i) = ws.floats.iter().position(|x| *x == w) {
+            // 浮いた窓: 次はいちばん上の浮いた窓か、タイルの窓へ
+            ws.floats.remove(i);
+            if ws.focus == Some(w) {
+                ws.focus = ws.floats.last().copied().or(ws.wins.last().copied());
+            }
+        } else {
+            let i = ws.wins.iter().position(|x| *x == w).unwrap();
+            ws.wins.remove(i);
+            if ws.focus == Some(w) {
+                ws.focus = if ws.wins.is_empty() { ws.floats.last().copied() } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
+            }
+        }
         if ws.fullscreen == Some(w) {
             ws.fullscreen = None;
         }
-        if ws.focus == Some(w) {
-            ws.focus = if ws.wins.is_empty() { None } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
-        }
         let next = ws.focus;
-        let empty = ws.wins.is_empty();
+        let empty = ws.wins.is_empty() && ws.floats.is_empty();
         if n == self.cur {
             if self.focus == Some(w) {
                 self.focus = None;
@@ -1389,6 +1508,14 @@ impl Wm {
     /// 今見えている窓の場所 (ほかのワークスペースや、タブ・全画面で隠れているものは None)
     fn rect_of(&self, w: Win) -> Option<Rect> {
         let ws = self.spaces.get(&self.cur)?;
+        if ws.floats.contains(&w) {
+            if ws.fullscreen.is_some() {
+                return None;
+            }
+            let (x, y) = *self.float_at.get(&(w.client, w.surface))?;
+            let (fw, fh) = self.float_size(w);
+            return Some(Rect { x, y, w: fw, h: fh });
+        }
         if !ws.wins.contains(&w) {
             return None;
         }
@@ -1411,6 +1538,21 @@ impl Wm {
                 }
             }
         }
+        // 浮いた窓: 大きさは窓にまかせる (0x0)。ただし窓を並べるところより大きければ、そこまでにしてもらう
+        let a = self.area();
+        for ws in self.spaces.values() {
+            for &w in &ws.floats {
+                let (fw, fh) = self.float_size(w);
+                // 一度縮めてもらった大きさは送りつづける (0x0 にもどすと、また大きくなる)
+                let prev = self.clients.get(&w.client).and_then(|c| c.surfaces.get(&w.surface)).and_then(|s| s.sent).filter(|k| k.0 > 0).map(|k| (k.0, k.1));
+                let r = match prev {
+                    Some((pw, ph)) => Rect { x: 0, y: 0, w: pw, h: ph },
+                    None if fw > a.w || fh > a.h => Rect { x: 0, y: 0, w: fw.min(a.w), h: fh.min(a.h) },
+                    None => Rect { x: 0, y: 0, w: 0, h: 0 },
+                };
+                todo.push((w, r, self.focus == Some(w), false, ws.layout));
+            }
+        }
         for (w, r, active, full, layout) in todo {
             let serial = self.next_serial();
             let Some(c) = self.clients.get_mut(&w.client) else { continue };
@@ -1422,7 +1564,14 @@ impl Wm {
             s.sent = Some(key);
             let (Some(top), Some(xdg)) = (s.toplevel, s.xdg) else { continue };
             // 状態: fullscreen (2)、activated (4)、tiled left/right/top/bottom (5..8)
-            let mut sts: Vec<u32> = if full { vec![2] } else { vec![5, 6, 7, 8] };
+            let floating = self.spaces.values().any(|ws| ws.floats.contains(&w));
+            let mut sts: Vec<u32> = if full {
+                vec![2]
+            } else if floating {
+                vec![]
+            } else {
+                vec![5, 6, 7, 8]
+            };
             if active {
                 sts.push(4);
             }
@@ -1436,7 +1585,13 @@ impl Wm {
     /// キーボードの作業中の窓 (今のワークスペースの窓か None)
     fn set_focus(&mut self, w: Option<Win>) {
         if let Some(n) = w {
-            self.cur_ws().focus = Some(n);
+            let ws = self.cur_ws();
+            ws.focus = Some(n);
+            // 浮いた窓はいちばん上へ
+            if let Some(i) = ws.floats.iter().position(|x| *x == n) {
+                let f = ws.floats.remove(i);
+                ws.floats.push(f);
+            }
         }
         if self.focus == w {
             return;
@@ -1471,7 +1626,7 @@ impl Wm {
         self.set_focus(None);
         self.cur = n;
         let f = self.cur_ws().focus;
-        if self.spaces.get(&old).is_some_and(|s| s.wins.is_empty()) {
+        if self.spaces.get(&old).is_some_and(|s| s.wins.is_empty() && s.floats.is_empty()) {
             self.spaces.remove(&old);
         }
         self.set_focus(f);
@@ -1489,15 +1644,25 @@ impl Wm {
             return;
         }
         let ws = self.cur_ws();
-        let i = ws.wins.iter().position(|x| *x == w).unwrap();
-        ws.wins.remove(i);
+        let float = ws.floats.contains(&w);
+        if float {
+            ws.floats.retain(|x| *x != w);
+            ws.focus = ws.floats.last().copied().or(ws.wins.last().copied());
+        } else {
+            let i = ws.wins.iter().position(|x| *x == w).unwrap();
+            ws.wins.remove(i);
+            ws.focus = if ws.wins.is_empty() { ws.floats.last().copied() } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
+        }
         if ws.fullscreen == Some(w) {
             ws.fullscreen = None;
         }
-        ws.focus = if ws.wins.is_empty() { None } else { Some(ws.wins[i.min(ws.wins.len() - 1)]) };
         let next = ws.focus;
         let dst = self.spaces.entry(n).or_insert_with(Ws::new);
-        dst.wins.push(w);
+        if float {
+            dst.floats.push(w);
+        } else {
+            dst.wins.push(w);
+        }
         dst.focus = Some(w);
         self.set_focus(next);
         self.relayout();
@@ -1634,19 +1799,48 @@ impl Wm {
                 ws.fullscreen = if ws.fullscreen.is_some() { None } else { ws.focus };
                 self.relayout();
             }
+            Action::FloatToggle => {
+                let Some(w) = self.focus else { return };
+                let r = self.rect_of(w);
+                let ws = self.cur_ws();
+                if let Some(i) = ws.floats.iter().position(|x| *x == w) {
+                    ws.floats.remove(i);
+                    ws.wins.push(w);
+                    self.float_at.remove(&(w.client, w.surface));
+                } else if let Some(i) = ws.wins.iter().position(|x| *x == w) {
+                    ws.wins.remove(i);
+                    ws.floats.push(w);
+                    if ws.fullscreen == Some(w) {
+                        ws.fullscreen = None;
+                    }
+                    // 今の場所から少し内側に (大きさは窓が決めなおす)
+                    if let Some(r) = r {
+                        self.float_at.insert((w.client, w.surface), (r.x + r.w / 8, r.y + r.h / 8));
+                    }
+                }
+                self.relayout();
+            }
             Action::Exit => self.quit = true,
         }
     }
 
     fn win_at(&self, x: i32, y: i32) -> Option<(Win, Rect)> {
         let ws = self.spaces.get(&self.cur)?;
-        ws.wins.iter().find_map(|w| self.rect_of(*w).filter(|r| r.contains(x, y)).map(|r| (*w, r)))
+        ws.floats.iter().rev().chain(ws.wins.iter()).find_map(|w| self.rect_of(*w).filter(|r| r.contains(x, y)).map(|r| (*w, r)))
     }
 
     fn pointer_moved(&mut self, old: (i32, i32)) {
         self.ptr_shown = true;
         self.mark(old.1 - 1, old.1 + CURSOR_H + 1);
         self.mark(self.ptr.1 - 1, self.ptr.1 + CURSOR_H + 1);
+        if let Some((w, dx, dy)) = self.drag {
+            let (fw, _) = self.float_size(w);
+            let x = (self.ptr.0 - dx).clamp(-fw + 32, self.width() - 32);
+            let y = (self.ptr.1 - dy).clamp(self.bar_h(), self.height() - 32);
+            self.float_at.insert((w.client, w.surface), (x, y));
+            self.mark_all();
+            return;
+        }
         let hit = self.target_at(self.ptr.0, self.ptr.1);
         let now = hit.map(|(w, _)| w);
         let serial = self.next_serial();
@@ -1684,6 +1878,22 @@ impl Wm {
     fn button(&mut self, code: u16, value: i32) {
         if value == 2 {
             return;
+        }
+        // floating_modifier + 左ボタン: 浮いた窓をつかんで動かす (クライアントには送らない)
+        if self.drag.is_some() {
+            if value == 0 {
+                self.drag = None;
+            }
+            return;
+        }
+        let fm = self.config.float_mod;
+        if value == 1 && code == keys::BTN_LEFT && fm != 0 && self.mods.mask().0 & fm == fm {
+            let (x, y) = self.ptr;
+            if let Some((w, r)) = self.win_at(x, y).filter(|(w, _)| self.is_float(*w)) {
+                self.drag = Some((w, x - r.x, y - r.y));
+                self.set_focus(Some(w));
+                return;
+            }
         }
         if value == 1 {
             let (x, y) = self.ptr;
@@ -1768,6 +1978,24 @@ impl Wm {
                 None => (0, 0, iw, ih),
             };
             let clip = Rect { x: r.x, y: r.y.max(y0), w: r.w.min(gw), h: (r.y + r.h.min(gh)).min(y1) - r.y.max(y0) };
+            let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
+            draw_tree(px, stride, c, w.surface, r.x - gx, r.y - gy, clip, 0);
+        }
+        // 浮いた窓 (下から)。枠をつけて、窓の形で切る
+        let floats = self.spaces.get(&self.cur).map_or(vec![], |ws| ws.floats.clone());
+        for w in floats {
+            let Some(r) = self.rect_of(w) else { continue };
+            let color = if self.focus == Some(w) { FOCUS } else { UNFOCUS };
+            let outer = Rect { x: r.x - BORDER, y: r.y - BORDER, w: r.w + 2 * BORDER, h: r.h + 2 * BORDER };
+            self.fill_rect(outer, color, y0, y1);
+            self.fill_rect(r, term_bg(), y0, y1);
+            let Some(c) = self.clients.get(&w.client) else { continue };
+            let (gx, gy) = self.geom_off(w);
+            let top = r.y.max(y0).max(0);
+            let clip = Rect { x: r.x.max(0), y: top, w: (r.x + r.w).min(sw as i32) - r.x.max(0), h: (r.y + r.h).min(y1) - top };
+            if clip.w <= 0 || clip.h <= 0 {
+                continue;
+            }
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
             draw_tree(px, stride, c, w.surface, r.x - gx, r.y - gy, clip, 0);
         }
