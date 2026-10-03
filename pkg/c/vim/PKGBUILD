@@ -1,0 +1,47 @@
+# vim: エディタ。静的なバイナリと実行時のファイル (/opt/c/share/vim、:help の文書もふくむ。翻訳はのぞく)
+#   機能は huge (端末だけ。GUI、X、gpm、音、翻訳はなし)。Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。
+#   vi と view も vim へのリンク (aish の C-g / M-. は $EDITOR か vi で開く)
+pkgname=vim
+pkgver=9.2.1164
+pkgrel=1
+pkgdesc='Vi Improved, a highly configurable, improved version of the vi text editor (static, terminal, for aios)'
+arch=('aarch64')
+url='https://www.vim.org'
+license=('Vim')
+depends=('ncurses')
+makedepends=('git')
+source=("git+https://github.com/vim/vim#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  # vim の configure と Makefile は SRCDIR と srcdir (makepkg の環境にある) をソースの場所と思うので、
+  # 消すか、. にする
+  unset SRCDIR
+  cd vim
+  # クロスなので、動かして確かめるものは答えを渡す (Linux と musl ではこう)
+  vim_cv_toupper_broken=no vim_cv_terminfo=yes vim_cv_tgetent=zero vim_cv_getcwd_broken=no \
+  vim_cv_stat_ignores_slash=no vim_cv_memmove_handles_overlap=yes vim_cv_bcopy_handles_overlap=yes \
+  vim_cv_memcpy_handles_overlap=no vim_cv_tty_group=world vim_cv_tty_mode=0620 \
+  ac_cv_small_wchar_t=no srcdir=. \
+    ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --with-features=huge --enable-multibyte \
+    --disable-gui --without-x --disable-gpm --disable-sysmouse --disable-libsodium --disable-canberra \
+    --disable-nls --disable-selinux --disable-smack --disable-xattr --disable-netbeans \
+    --with-tlib=ncursesw --with-compiledby=aios
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  unset SRCDIR
+  cd vim
+  make DESTDIR="$pkgdir" STRIP=true install
+  cd "$pkgdir/opt/c"
+  rm -rf share/man share/applications share/icons share/vim/vim*/lang share/vim/vim*/tutor/tutor.*.*
+  ln -sf vim bin/vi
+  install -Dm644 "$srcdir/vim/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

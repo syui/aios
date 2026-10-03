@@ -1,0 +1,42 @@
+# zsh: シェル。静的なバイナリ (モジュールも中に入れる)。設定は /etc/zsh/zshrc と ~/.zshrc
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。補完の関数 (compinit) も入れる
+pkgname=zsh
+pkgver=5.9.2
+pkgrel=1
+pkgdesc='A very advanced and programmable command interpreter (shell) (static, for aios)'
+arch=('aarch64')
+url='https://www.zsh.org/'
+license=('MIT-Modern-Variant')
+depends=('ncurses')
+source=("https://www.zsh.org/pub/zsh-$pkgver.tar.xz")
+sha256sums=('36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81')
+
+prepare() {
+  rm -rf "zsh-$pkgver"
+  tar -xJf "zsh-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  cd "zsh-$pkgver"
+  # クロスなので、動かして確かめるものは答えを渡す (Linux と musl ではこう)
+  zsh_cv_shared_environ=yes zsh_cv_sys_nis=no zsh_cv_sys_nis_plus=no \
+  CPPFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS" \
+    ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --enable-etcdir=/etc/zsh \
+    --disable-dynamic --enable-multibyte --with-tcsetpgrp --with-term-lib=ncursesw \
+    --disable-gdbm --disable-pcre --disable-cap --enable-function-subdirs
+  make
+}
+
+package() {
+  # install でいくつかコンパイルしなおす (版の入ったファイル) ので Zig を使えるようにしておく
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  cd "zsh-$pkgver"
+  make DESTDIR="$pkgdir" install.bin install.modules install.fns
+  rm -f "$pkgdir/opt/c/bin/zsh-$pkgver"
+  install -Dm644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
+}

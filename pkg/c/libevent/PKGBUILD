@@ -1,0 +1,36 @@
+# libevent: イベントを待つライブラリ (tmux が使う)。静的な libevent.a とヘッダー (OpenSSL なし)
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
+pkgname=libevent
+pkgver=2.1.13
+pkgrel=1
+pkgdesc='Event notification library (static, without OpenSSL, for aios)'
+arch=('aarch64')
+url='https://libevent.org/'
+license=('BSD-3-Clause')
+source=("https://github.com/libevent/libevent/releases/download/release-$pkgver-stable/libevent-$pkgver-stable.tar.gz")
+sha256sums=('f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c')
+
+prepare() {
+  rm -rf "libevent-$pkgver-stable"
+  tar -xzf "libevent-$pkgver-stable.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "libevent-$pkgver-stable"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static \
+    --disable-openssl --disable-mbedtls --disable-samples --disable-libevent-regress --disable-debug-mode
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "libevent-$pkgver-stable"
+  make DESTDIR="$pkgdir" install
+  # python の道具 (event_rpcgen.py) は入れない
+  rm -f "$pkgdir/opt/c/bin/event_rpcgen.py"
+  rmdir "$pkgdir/opt/c/bin" 2>/dev/null || true
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
