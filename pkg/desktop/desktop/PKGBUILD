@@ -6,12 +6,12 @@
 # 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=desktop
 pkgver=0.0.1
-pkgrel=5
-pkgdesc='aios desktop: screen and input drivers, aiwm (tiling Wayland compositor), aiterm, aifont, icons'
+pkgrel=6
+pkgdesc='aios desktop: screen, input and sound drivers, aiwm (tiling Wayland compositor), aiterm, aifont (with the icons)'
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
-depends=('base' 'aikernel' 'aifont' 'ai-icons' 'aisplash' 'aiwm' 'aiterm')
+depends=('base' 'aikernel' 'aifont' 'aisplash' 'aiwm' 'aiterm')
 optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)')
 backup=(etc/modules-load.d/desktop.conf)
 
