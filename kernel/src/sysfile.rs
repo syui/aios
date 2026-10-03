@@ -46,7 +46,10 @@ const FD_CLOEXEC: u64 = 1;
 const O_NONBLOCK: u32 = 0o4000;
 const FIONBIO: u64 = 0x5421;
 
-const UMASK: u32 = 0o022;
+/// いまのプロセスの umask (作るファイルの mode から外すもの)
+fn umask() -> u32 {
+    proc::current().files().umask
+}
 
 type R = Result<i64, i64>;
 
@@ -306,7 +309,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             let (parent, name) = vfs::parent_of(&base, &path)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
-            let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::File)?;
+            let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
             // 作ったばかりのものは、mode に関係なく開ける
             let f = file::new(Kind::Inode(ino, vfs::normalize(&base, &path)), flags as u32);
@@ -442,7 +445,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     }
     let c = cred::current();
     parent_writable(&c, &parent)?;
-    let ino = parent.create(&name, mode as u32 & 0o7777 & !UMASK, NewNode::Dir)?;
+    let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::Dir)?;
     own_new(&c, &parent, &ino)?;
     Ok(0)
 }
@@ -498,7 +501,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
         return Err(-EEXIST);
     }
     parent_writable(&c, &parent)?;
-    let ino = parent.create(&name, mode & 0o7777 & !UMASK, node)?;
+    let ino = parent.create(&name, mode & 0o7777 & !umask(), node)?;
     own_new(&c, &parent, &ino)?;
     Ok(0)
 }

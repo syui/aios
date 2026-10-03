@@ -372,7 +372,12 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
         SETPGID => signal::setpgid(a[0] as u32, a[1] as u32),
         SETSID => signal::setsid(),
-        UMASK => Ok(0o022),
+        UMASK => {
+            let f = crate::proc::current().files();
+            let old = f.umask;
+            f.umask = a[0] as u32 & 0o777;
+            Ok(old as i64)
+        }
         SET_ROBUST_LIST | MEMBARRIER => Ok(0),
         RSEQ => Err(-ENOSYS),
         SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),

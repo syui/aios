@@ -87,6 +87,8 @@ pub struct Files {
     pub cwd: String,
     /// RLIMIT_NOFILE のソフトの上限 (fork と exec で受けつぐ)
     pub nofile: usize,
+    /// 作るファイルの mode から外すもの (umask。fork で受けつぐ。Linux の fs_struct と同じくスレッドで共有)
+    pub umask: u32,
 }
 
 impl Files {
@@ -494,7 +496,7 @@ pub fn user_init() {
     }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
-    let mut files = Files { fds: Vec::new(), cwd: String::new(), nofile: NOFILE_SOFT };
+    let mut files = Files { fds: Vec::new(), cwd: String::new(), nofile: NOFILE_SOFT, umask: 0o022 };
     let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);
