@@ -1,0 +1,46 @@
+# ffmpeg: 動画と音の形を読み書きするライブラリ (libavcodec ...) と ffmpeg / ffprobe (shared, for aios)
+#   Firefox は H.264 や AAC をこれで読む (dlopen)。外のライブラリは使わない (zlib と ALSA だけ)。LGPL のまま
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
+pkgname=ffmpeg
+pkgver=8.1.3
+pkgrel=1
+pkgdesc='Complete solution to record, convert and stream audio and video: libav* and ffmpeg, ffprobe (shared, for aios)'
+arch=('aarch64')
+url='https://ffmpeg.org/'
+license=('LGPL-2.1-or-later')
+depends=('musl' 'zlib' 'alsa-lib')
+makedepends=('clang' 'llvm')
+source=("https://ffmpeg.org/releases/ffmpeg-$pkgver.tar.xz")
+sha256sums=('7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3')
+
+# ビルドするマシンの clang と LLVM の道具
+_host_llvm=${HOST_LLVM:-20}
+
+prepare() {
+  rm -rf "ffmpeg-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib alsa-lib
+  shared_env
+  cd "ffmpeg-$pkgver"
+  # プログラムは libav*.so を使うので動的にリンクする (zig の musl は静的が既定)
+  ./configure --prefix="$PREFIX" --enable-cross-compile --arch=aarch64 --target-os=linux \
+    --cc="zig cc -target aarch64-linux-musl" --cxx="zig c++ -target aarch64-linux-musl" \
+    --ar="zig ar" --ranlib="zig ranlib" --nm="llvm-nm-$_host_llvm" --strip="llvm-strip-$_host_llvm" \
+    --host-cc="clang-$_host_llvm" --pkg-config=pkg-config \
+    --extra-cflags="$CPPFLAGS" --extra-ldflags="-L$SYSROOT/lib" --extra-ldexeflags="-dynamic" \
+    --enable-shared --disable-static --enable-pic --disable-doc --disable-debug --disable-autodetect \
+    --enable-zlib --enable-alsa --disable-ffplay
+  make
+}
+
+package() {
+  cd "ffmpeg-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share/ffmpeg/examples"
+  install -Dm644 COPYING.LGPLv2.1 "$pkgdir/usr/share/licenses/$pkgname/COPYING.LGPLv2.1"
+}
