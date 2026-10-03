@@ -168,6 +168,10 @@ mod nr {
     pub const SHUTDOWN: u64 = 210;
     pub const SENDMSG: u64 = 211;
     pub const RECVMSG: u64 = 212;
+    pub const RECVMMSG: u64 = 243;
+    pub const SENDMMSG: u64 = 269;
+    pub const IOPRIO_SET: u64 = 30;
+    pub const IOPRIO_GET: u64 = 31;
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
     pub const MREMAP: u64 = 216;
@@ -298,6 +302,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SHUTDOWN => socket::shutdown(a[0], a[1]),
         SENDMSG => socket::sendmsg(a[0], a[1] as usize, a[2]),
         RECVMSG => socket::recvmsg(a[0], a[1] as usize, a[2]),
+        RECVMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false),
+        SENDMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true),
+        // I/O の優先度はない (どれも同じ)。聞かれたら IOPRIO_CLASS_NONE
+        IOPRIO_SET => Ok(0),
+        IOPRIO_GET => Ok(0),
         // xattr は持っていない
         LISTXATTR..=FLISTXATTR => Ok(0),
         GETXATTR..=FGETXATTR => Err(-ENODATA),
@@ -903,9 +912,43 @@ const FUTEX_CMP_REQUEUE: u64 = 4;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 
+/// 調べるための記録: 最近の futex の WAKE (tgid, tid, アドレス, op, 起こした数)。/proc/PID/stack に出す
+static mut FUTEX_LOG: [(u32, u32, usize, u64, usize); 256] = [(0, 0, 0, 0, 0); 256];
+static mut FUTEX_LOG_AT: usize = 0;
+
+fn futex_log(tgid: u32, tid: u32, uaddr: usize, op: u64, n: usize) {
+    unsafe {
+        let i = FUTEX_LOG_AT % 256;
+        (*(&raw mut FUTEX_LOG))[i] = (tgid, tid, uaddr, op, n);
+        FUTEX_LOG_AT += 1;
+    }
+}
+
+/// tgid の最近の futex の WAKE (古い順)
+pub fn futex_wakes(tgid: u32) -> alloc::vec::Vec<(u32, usize, u64, usize)> {
+    let mut v = alloc::vec::Vec::new();
+    unsafe {
+        let at = FUTEX_LOG_AT;
+        for k in at.saturating_sub(256)..at {
+            let (t, tid, a, op, n) = (*(&raw const FUTEX_LOG))[k % 256];
+            if t == tgid {
+                v.push((tid, a, op, n));
+            }
+        }
+    }
+    v
+}
+
 fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
     let p = proc::current();
-    let chan = proc::futex_chan(p, uaddr);
+    // ふつうはアドレス空間とアドレスで待ち合わせる。PRIVATE でなく、共有の領域 (プロセスをまたぐ
+    // pthread のミューテックスやセマフォ) なら、ページの物理アドレスで (どのプロセスからも同じ)
+    let shared = if op & FUTEX_PRIVATE_FLAG == 0 { p.pt().shared_pa(uaddr) } else { None };
+    let chan = match shared {
+        Some(pa) => (pa << 1) ^ 1 ^ (1 << 63),
+        None => proc::futex_chan(p, uaddr),
+    };
     match op & 0x7f {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let mut cur = [0u8; 4];
@@ -934,7 +977,9 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             // 数は数えずに全員起こす (起きすぎても待つ側が確かめなおす)
-            Ok(proc::wakeup(chan).min(val as usize) as i64)
+            let n = proc::wakeup(chan);
+            futex_log(p.tgid, p.pid, uaddr, op, n);
+            Ok(n.min(val as usize) as i64)
         }
         _ => Err(-ENOSYS),
     }

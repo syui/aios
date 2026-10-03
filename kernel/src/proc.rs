@@ -1137,6 +1137,12 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
             let (f, off) = pt.name_at(va as usize)?;
             Some(alloc::format!("{}+{:#x}", f.rsplit('/').next().unwrap_or(&f), off))
         };
+        // futex で待っているなら、そのアドレスと、待つときの値と、いまの値
+        if p.last_sys.0 == 98 && p.state == State::Sleeping {
+            let mut w = [0u8; 4];
+            let now = pt.copy_in(&mut w, tf.x[0] as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
+            let _ = writeln!(out, "  futex {:#x} op {} val {} now {}", tf.x[0], tf.x[1], tf.x[2] as u32, now);
+        }
         for (what, va) in [("pc", pc), ("lr", lr)] {
             let _ = writeln!(out, "  {} {:#x} {}", what, va, name(pt, va).unwrap_or_default());
         }
@@ -1180,6 +1186,9 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
                 }
             }
         }
+    }
+    for (tid, a, op, n) in crate::syscall::futex_wakes(tgid) {
+        let _ = writeln!(out, "wake by {} {:#x} op {} woke {}", tid, a, op, n);
     }
     out
 }

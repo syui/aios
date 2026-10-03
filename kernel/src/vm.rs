@@ -716,6 +716,15 @@ impl PageTable {
         Some((e & PTE_ADDR) as usize + (va & (PGSIZE - 1)))
     }
 
+    /// 共有の領域 (MAP_SHARED) なら va の物理アドレス。プロセスをまたぐ futex は、同じページを
+    /// 違うアドレスに写していても会えるように、これで待ち合わせる
+    pub fn shared_pa(&mut self, va: usize) -> Option<usize> {
+        if !self.find(va)?.1.shared {
+            return None;
+        }
+        self.user_pa(va, false, false)
+    }
+
     /// ユーザー空間 src から dst へコピー
     pub fn copy_in(&mut self, dst: &mut [u8], src: usize) -> Option<()> {
         self.each_chunk(src, dst.len(), false, false, |pa, off, n| unsafe {

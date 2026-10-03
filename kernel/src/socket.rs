@@ -662,6 +662,31 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
     Ok(n as i64)
 }
 
+/// recvmmsg / sendmmsg: struct mmsghdr (msghdr 56 バイト + msg_len) の並びを 1 つずつ。
+/// 2 つ目からは待たない。1 つもできなければそのエラー。recvmmsg の timeout は見ない
+pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool) -> R {
+    const MSG_DONTWAIT: u64 = 0x40;
+    const MSG_WAITFORONE: u64 = 0x10000;
+    let mut done = 0;
+    for i in 0..vlen.min(1024) {
+        let hdr = vec + i * 64;
+        let mut f = flags & !MSG_WAITFORONE;
+        if i > 0 {
+            f |= MSG_DONTWAIT;
+        }
+        let r = if send { sendmsg(fd, hdr, f) } else { recvmsg(fd, hdr, f) };
+        match r {
+            Ok(n) => {
+                proc::current().pt().copy_out(hdr + 56, &(n as u32).to_le_bytes()).ok_or(-14)?;
+                done += 1;
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let m = read_msghdr(msg)?;
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
