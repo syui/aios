@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-edit"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+]
+
+[[package]]
 name = "aish-pick"
 version = "0.0.1"
 dependencies = [

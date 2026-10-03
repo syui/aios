@@ -6,7 +6,7 @@
 //! ```no_run
 //! use aish_plugin::{json, Spec, Value};
 //! fn main() {
-//!     let spec = Spec { name: "hello", hooks: &["prompt"], keys: &[] };
+//!     let spec = Spec { name: "hello", hooks: &["prompt"], keys: &[], tools: &[] };
 //!     aish_plugin::run(spec, |ev, v| match ev {
 //!         "prompt" => json!({ "prompt": format!("{} $ ", v["pwd"].as_str().unwrap_or("")) }),
 //!         _ => json!({}),
@@ -17,12 +17,26 @@
 //! キーに結びつけた機能 (`key`) が呼ばれているあいだは、端末はプラグインのもの:
 //! [`Tty`] で /dev/tty に描いて読み、[`pick`] で絞りこんで選ばせることができる。
 //! aish は打ちかけの行の下の行の頭にカーソルを置いてから呼ぶので、終わったらそこへ戻して返すこと
+//!
+//! 同じ機能を、端末なしで JSON だけで呼べるようにもできる (`tools`)。人はキーで、
+//! Claude は `aish --mcp` (MCP のツール) で、同じプラグインを使う。答えは JSON のオブジェクト
+//! (しくじったら [`error`])
 
 pub use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
-/// プロトコルの版 (hello の version)
-pub const VERSION: u64 = 1;
+/// プロトコルの版 (hello の version)。2 で tools が増えた
+pub const VERSION: u64 = 2;
+
+/// 端末なしで呼べる機能 (aish --mcp で MCP のツールになる)
+pub struct Tool {
+    /// 名前 (英数字と _ -)
+    pub name: &'static str,
+    /// 何をするか (Claude が読む)
+    pub desc: &'static str,
+    /// 引数の JSON Schema (JSON の文字列)
+    pub input: &'static str,
+}
 
 /// プラグインが何をするか (hello への答え)
 pub struct Spec {
@@ -34,6 +48,8 @@ pub struct Spec {
     /// 既定のキー: (キー, 機能の名前)。キーは "C-r"、"M-f"、"C-p C-p" (2 つ続けて) のように書く。
     /// ~/.aishrc の bindkey で変えられる
     pub keys: &'static [(&'static str, &'static str)],
+    /// 端末なしで呼べる機能。呼ばれると ev が "tool" で、v["name"] と v["args"] がくる
+    pub tools: &'static [Tool],
 }
 
 /// プラグインの本体: 標準入力から 1 行ずつ JSON を読み、f の答えを 1 行の JSON で返す。
@@ -52,7 +68,12 @@ pub fn run(spec: Spec, mut f: impl FnMut(&str, &Value) -> Value) {
         let reply = if ev == "hello" {
             f("hello", &v);
             let keys: serde_json::Map<String, Value> = spec.keys.iter().map(|(k, w)| (k.to_string(), json!(w))).collect();
-            json!({ "name": spec.name, "version": VERSION, "hooks": spec.hooks, "keys": keys })
+            let tools: Vec<Value> = spec
+                .tools
+                .iter()
+                .map(|t| json!({ "name": t.name, "description": t.desc, "input": serde_json::from_str::<Value>(t.input).unwrap_or(json!({ "type": "object" })) }))
+                .collect();
+            json!({ "name": spec.name, "version": VERSION, "hooks": spec.hooks, "keys": keys, "tools": tools })
         } else {
             let r = f(&ev, &v);
             if r.is_object() { r } else { json!({}) }
@@ -61,6 +82,11 @@ pub fn run(spec: Spec, mut f: impl FnMut(&str, &Value) -> Value) {
             break;
         }
     }
+}
+
+/// tool の答え: しくじった
+pub fn error(msg: impl std::fmt::Display) -> Value {
+    json!({ "error": msg.to_string() })
 }
 
 /// イベントの文字列のフィールド (なければ空)

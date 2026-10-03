@@ -16,6 +16,7 @@ mod edit;
 mod expand;
 mod glob;
 mod jobs;
+mod mcp;
 mod parse;
 mod plugin;
 
@@ -130,6 +131,11 @@ fn last_err() -> String {
     err_text(&io::Error::last_os_error())
 }
 
+/// 動かせるファイルか (PATH で探すとき。動かせないファイルは飛ばして先を探す。bash と同じ)
+pub fn is_exec(p: &str) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file()) && unsafe { libc::access(cstr(p).as_ptr(), libc::X_OK) } == 0
+}
+
 fn cstr(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap()
 }
@@ -215,7 +221,7 @@ impl Shell {
 
     fn run_list(&mut self, list: &List) -> i32 {
         for item in list {
-            if self.flow != Flow::None {
+            if self.flow != Flow::None || mcp::stopped() {
                 break;
             }
             self.text = item.text.clone();
@@ -237,7 +243,7 @@ impl Shell {
     fn run_andor(&mut self, ao: &AndOr) -> i32 {
         let mut st = self.run_pipeline(&ao.first, ao.rest.is_empty());
         for (k, (and, p)) in ao.rest.iter().enumerate() {
-            if self.flow != Flow::None {
+            if self.flow != Flow::None || mcp::stopped() {
                 break;
             }
             if (*and && st != 0) || (!*and && st == 0) {
@@ -436,6 +442,9 @@ impl Shell {
                     self.cond += 1;
                     let st = self.run_list(cond);
                     self.cond -= 1;
+                    if mcp::stopped() {
+                        break;
+                    }
                     if self.flow != Flow::None || (st == 0) == *until {
                         if self.loop_flow() {
                             continue;
@@ -775,7 +784,7 @@ impl Shell {
         let path = self.get_var("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
         path.split(':')
             .map(|d| format!("{}/{}", if d.is_empty() { "." } else { d }, cmd))
-            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+            .find(|p| is_exec(p))
     }
 
     fn exec_ready(&mut self, r: Ready) -> i32 {
@@ -882,6 +891,11 @@ impl Shell {
             "false" => 1,
             "exit" => {
                 let st = a.first().and_then(|s| s.parse().ok()).unwrap_or(self.status);
+                // aish --mcp では、サーバーは終わらずにその run だけを終える
+                if mcp::PID.load(std::sync::atomic::Ordering::Relaxed) == unsafe { libc::getpid() } {
+                    self.flow = Flow::Return;
+                    return st & 0xff;
+                }
                 exit_shell(st & 0xff)
             }
             "cd" => {
@@ -1650,6 +1664,10 @@ fn main() {
         let mut sh = Shell::new(ps);
         let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
+    }
+    // aish --mcp: MCP のサーバー (mcp.rs)
+    if args.get(1).is_some_and(|a| a == "--mcp") {
+        Shell::new(vec![args[0].clone()]).mcp();
     }
     // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);

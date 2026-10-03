@@ -8,7 +8,7 @@ const SEP: char = '\u{e0b0}';
 const BRANCH: char = '\u{e0a0}';
 
 fn main() {
-    let spec = Spec { name: "powerline", hooks: &["prompt"], keys: &[] };
+    let spec = Spec { name: "powerline", hooks: &["prompt"], keys: &[], tools: &[] };
     aish_plugin::run(spec, |ev, v| match ev {
         "prompt" => json!({ "prompt": prompt(v) }),
         _ => json!({}),

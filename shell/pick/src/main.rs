@@ -4,13 +4,22 @@
 //   C-j      dir      最近のディレクトリ (~/.aish_dirs、chpwd で覚える) を絞りこんで cd
 //   C-k      cdup     行が空なら cd ..、そうでなければカーソルから後ろを消す
 //   C-p C-p  copy     打ちかけの行を端末のクリップボードへ (OSC 52)
-use aish_plugin::{Spec, Tty, Value, escape, json, pick, quote, s, tilde};
+// 端末なしの顔 (tools。aish --mcp で Claude が使う):
+//   history  履歴を新しい順に (query で絞りこむ)
+//   dirs     最近のディレクトリ (query で絞りこむ)
+use aish_plugin::{Spec, Tool, Tty, Value, escape, json, pick, quote, s, tilde};
+
+const QUERY: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"これを含むものだけ (大文字小文字は区別しない)"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
 
 fn main() {
     let spec = Spec {
         name: "pick",
         hooks: &["key", "chpwd"],
         keys: &[("C-r", "history"), ("C-f", "file"), ("C-j", "dir"), ("C-k", "cdup"), ("C-p C-p", "copy")],
+        tools: &[
+            Tool { name: "history", desc: "aish の履歴 (人が打ったコマンド) を新しい順に。{items: [...]}", input: QUERY },
+            Tool { name: "dirs", desc: "最近 cd したディレクトリを新しい順に。{items: [...]}", input: QUERY },
+        ],
     };
     let mut dirs_file = String::new();
     aish_plugin::run(spec, |ev, v| match ev {
@@ -26,8 +35,27 @@ fn main() {
             json!({})
         }
         "key" => key(v, &dirs_file),
+        "tool" => tool(v, &dirs_file),
         _ => json!({}),
     });
+}
+
+/// 端末なしの顔: 一覧を JSON で
+fn tool(v: &Value, dirs_file: &str) -> Value {
+    let a = &v["args"];
+    let q = s(a, "query").to_lowercase();
+    let limit = a["limit"].as_u64().unwrap_or(50) as usize;
+    let all: Vec<String> = match s(v, "name") {
+        "history" => {
+            let hist = std::fs::read_to_string(s(v, "histfile")).unwrap_or_default();
+            let mut seen = std::collections::HashSet::new();
+            hist.lines().rev().filter(|h| !h.is_empty() && seen.insert(*h)).map(String::from).collect()
+        }
+        "dirs" => std::fs::read_to_string(dirs_file).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect(),
+        n => return aish_plugin::error(format!("{}: no such tool", n)),
+    };
+    let items: Vec<String> = all.into_iter().filter(|x| x.to_lowercase().contains(&q)).take(limit).collect();
+    json!({ "items": items })
 }
 
 fn key(v: &Value, dirs_file: &str) -> Value {

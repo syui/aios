@@ -4,7 +4,7 @@
 use aish_plugin::{Spec, Value, escape, json, s};
 
 fn main() {
-    let spec = Spec { name: "complete", hooks: &["complete"], keys: &[] };
+    let spec = Spec { name: "complete", hooks: &["complete"], keys: &[], tools: &[] };
     aish_plugin::run(spec, |ev, v| match ev {
         "complete" => complete(v),
         _ => json!({}),
