@@ -156,8 +156,29 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     crate::vdso::map(&mut pt).ok_or(-ENOMEM)?;
     pt.map(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, PROT_RW, false, Backing::Anon).ok_or(-ENOMEM)?;
 
-    // 文字列を天辺から積む
-    let mut sp = USER_STACK_TOP;
+    // 文字列は Linux と同じ並び: 天辺の 8 バイトは 0 のまま空け、その下に argv[0] argv[1] ... envp ... execfn を
+    // 低いほうから続けて置く (setproctitle などは argv と envp の文字列が続いて並ぶものとして、その終わりを数える)
+    let total: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1;
+    if total + 8 > ARG_MAX {
+        return Err(-E2BIG);
+    }
+    let base = USER_STACK_TOP - 8 - total;
+    let mut at = base;
+    let mut put_str = |pt: &mut PageTable, b: &[u8]| -> Result<usize, i64> {
+        let start = at;
+        pt.copy_out(at, b).ok_or(-ENOMEM)?;
+        pt.copy_out(at + b.len(), &[0]).ok_or(-ENOMEM)?;
+        at += b.len() + 1;
+        Ok(start)
+    };
+    let (argc, envc) = (argv.len(), envp.len());
+    let mut ptrs = Vec::with_capacity(argc + envc);
+    for s in argv.iter().chain(envp.iter()) {
+        ptrs.push(put_str(&mut pt, s)?);
+    }
+    let execfn = put_str(&mut pt, path.as_bytes())?;
+    // AT_RANDOM の 16 バイトは文字列の下に
+    let mut sp = base;
     let mut push_bytes = |pt: &mut PageTable, b: &[u8], nul: bool| -> Result<usize, i64> {
         let n = b.len() + nul as usize;
         if sp - n < USER_STACK_TOP - ARG_MAX {
@@ -170,12 +191,6 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         }
         Ok(sp)
     };
-    let (argc, envc) = (argv.len(), envp.len());
-    let mut ptrs = Vec::with_capacity(argc + envc);
-    for s in argv.iter().chain(envp.iter()) {
-        ptrs.push(push_bytes(&mut pt, s, true)?);
-    }
-    let execfn = push_bytes(&mut pt, path.as_bytes(), true)?;
     let random = push_bytes(&mut pt, &crate::rand::bytes16(), false)?;
 
     let auxv = [
