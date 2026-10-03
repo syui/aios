@@ -248,13 +248,16 @@ impl App {
             ptrs.push(std::ptr::null());
             std::env::set_var("TERM", "xterm-256color");
             std::env::set_var("COLORTERM", "truecolor");
+            // 子の口はフォークの前に開いておく。シェルが開くのを待たずに読むと、カーネルによっては
+            // (開いた子がない) EIO が返り、シェルが終わったと思ってしまう
+            let s = libc::open(slave.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            if s < 0 {
+                eprintln!("aiterm: {}: {}", slave.to_string_lossy(), std::io::Error::last_os_error());
+                exit(1);
+            }
             let pid = libc::fork();
             if pid == 0 {
                 libc::setsid();
-                let s = libc::open(slave.as_ptr(), libc::O_RDWR);
-                if s < 0 {
-                    libc::_exit(127);
-                }
                 libc::ioctl(s, libc::TIOCSCTTY, 0);
                 libc::dup2(s, 0);
                 libc::dup2(s, 1);
@@ -265,6 +268,8 @@ impl App {
                 libc::execv(prog.as_ptr(), ptrs.as_ptr());
                 libc::_exit(127);
             }
+            // 子の口はシェルが持つ。こちらは閉じる (シェルが終わると読みが EIO になる)
+            libc::close(s);
             libc::fcntl(m, libc::F_SETFL, libc::O_NONBLOCK);
             self.pty = m;
             self.child = pid;

@@ -115,6 +115,10 @@ pub struct Pty {
     pub master: bool,
     /// 開いている子の口の数
     pub slaves: usize,
+    /// 開いていた子の口がみんな閉じた (Linux の TTY_OTHER_CLOSED)。親が読むと EIO、poll で POLLHUP。
+    /// まだ一度も子を開いていないうちは立てない: シェルが /dev/pts/N を開くより先に端末が読みに来ても、
+    /// 「シェルが終わった」にならない
+    pub hung: bool,
     /// unlockpt するまでは子を開けない
     pub locked: bool,
     /// 子が書いて、親が読むもの
@@ -602,7 +606,7 @@ pub fn master_read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize
                 proc::poll_wake(key);
                 return Ok(n);
             }
-            if p.slaves == 0 {
+            if p.hung {
                 return Err(-EIO);
             }
             if nonblock {
@@ -663,7 +667,7 @@ pub fn master_readiness(tty: &TtyRef) -> (bool, bool, bool) {
     let t = tty.borrow();
     let Dev::Pty(p) = &t.dev else { return (false, false, false) };
     let room = t.canon() || t.inq.len() < INQ;
-    (!p.out.is_empty() || p.slaves == 0, room, p.slaves == 0 && p.out.is_empty())
+    (!p.out.is_empty() || p.hung, room, p.hung && p.out.is_empty())
 }
 
 // ---- 疑似端末を作る・閉じる ----
@@ -681,7 +685,7 @@ pub fn open_ptmx() -> Result<TtyRef, i64> {
             list.len() - 1
         }
     };
-    let pty = Pty { index, master: true, slaves: 0, locked: true, out: VecDeque::new() };
+    let pty = Pty { index, master: true, slaves: 0, hung: false, locked: true, out: VecDeque::new() };
     let tty = Rc::new(RefCell::new(Tty::new(Dev::Pty(pty))));
     list[index] = Some(tty.clone());
     // /dev/pts/N を作り、開いた人のものにする
@@ -705,6 +709,7 @@ pub fn open_slave(index: usize) -> Result<TtyRef, i64> {
             return Err(-EIO);
         }
         p.slaves += 1;
+        p.hung = false;
     }
     Ok(tty)
 }
@@ -713,6 +718,7 @@ pub fn open_slave(index: usize) -> Result<TtyRef, i64> {
 pub fn ref_slave(tty: &TtyRef) {
     if let Some(p) = tty.borrow_mut().pty() {
         p.slaves += 1;
+        p.hung = false;
     }
 }
 
@@ -723,6 +729,7 @@ pub fn close_slave(tty: &TtyRef) {
     let key = t.chan(0);
     if let Some(p) = t.pty() {
         p.slaves -= 1;
+        p.hung = p.slaves == 0;
     }
     proc::wakeup(chan);
     proc::poll_wake(key);
