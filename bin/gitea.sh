@@ -67,7 +67,7 @@ case "$1" in
     git -c "$(auth)" push "$host/ai/os.git" unix:unix
     ;;
   repo)
-    [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh、または pkg ブランチの aarch64/ を repo/aarch64 へ)" >&2; exit 1; }
+    [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
     find_key
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
