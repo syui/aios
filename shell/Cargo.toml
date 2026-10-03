@@ -3,10 +3,11 @@
 #   complete: Tab の補完              suggest: グレーの候補 (履歴から)
 #   pick:     C-r C-f C-j C-k C-p C-p (絞りこみの選択、cd ..、端末へのコピー)
 #   edit:     ファイルを読む、ぴったり置きかえる、書く、取り消す (端末なしの tools だけ。Claude が使う)
+#   wait:     プロセスが終わる、ファイルに文字が出る、ポートが開く、まで待つ (tools だけ)
 #   powerline: powerline のプロンプト ([shell] リポジトリの aish-powerline)
 [workspace]
 resolver = "2"
-members = ["plugin", "complete", "suggest", "pick", "edit", "powerline"]
+members = ["plugin", "complete", "suggest", "pick", "edit", "wait", "powerline"]
 
 [workspace.package]
 version = "0.0.1"

@@ -10,8 +10,9 @@
 plugin aish-complete
 plugin aish-suggest
 plugin aish-pick
-# aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit も
-[ -n "$AISH_MCP" ] && plugin aish-edit
+# aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、
+# 何かが起きるまで待つ aish-wait も
+[ -n "$AISH_MCP" ] && plugin aish-edit && plugin aish-wait
 
 alias ls='ls -a --color=auto'
 alias ll='ls -alh --color=auto'

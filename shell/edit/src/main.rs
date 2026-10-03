@@ -20,6 +20,8 @@ const KEEP: usize = 100;
 struct Snap {
     path: PathBuf,
     before: Option<Vec<u8>>,
+    /// write が作ったディレクトリ (深いものが先。undo で空なら消す)
+    dirs: Vec<PathBuf>,
 }
 
 fn main() {
@@ -98,6 +100,8 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
 
 fn write(path: &Path, content: &[u8], snaps: &mut Vec<Snap>) -> Value {
     let before = std::fs::read(path).ok();
+    // なかったディレクトリ (深いものが先)
+    let dirs: Vec<PathBuf> = path.ancestors().skip(1).take_while(|d| !d.as_os_str().is_empty() && !d.exists()).map(Path::to_path_buf).collect();
     if let Some(d) = path.parent()
         && let Err(e) = std::fs::create_dir_all(d)
     {
@@ -107,7 +111,7 @@ fn write(path: &Path, content: &[u8], snaps: &mut Vec<Snap>) -> Value {
         return error(format!("{}: {}", path.display(), e));
     }
     let created = before.is_none();
-    snaps.push(Snap { path: path.to_path_buf(), before });
+    snaps.push(Snap { path: path.to_path_buf(), before, dirs });
     if snaps.len() > KEEP {
         snaps.remove(0);
     }
@@ -123,6 +127,11 @@ fn undo(path: &Path, latest: bool, snaps: &mut Vec<Snap>) -> Value {
         Some(b) => std::fs::write(&snap.path, b),
         None => std::fs::remove_file(&snap.path),
     };
+    if r.is_ok() {
+        for d in &snap.dirs {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
     match r {
         Ok(()) => json!({ "path": snap.path.display().to_string(), "removed": snap.before.is_none() }),
         Err(e) => error(format!("{}: {}", snap.path.display(), e)),
