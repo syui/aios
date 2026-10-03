@@ -4,7 +4,7 @@
 #   アイコンと区切りは aifont (Nerd Font と同じ位置) の文字。端末のフォントが要る
 #   このリポジトリの shell/ (プラグインのワークスペース) から作る
 pkgname=aish-powerline
-pkgver=0.0.1
+pkgver=0.0.2
 pkgrel=1
 pkgdesc='Powerline prompt for aish (a plugin; needs aifont or a Nerd Font in the terminal)'
 arch=('aarch64')
@@ -13,9 +13,10 @@ license=('MIT')
 depends=('base')
 makedepends=('rustup')
 
+# 0.0.2: スクリプトの 0.0.1 より新しくするため (0.0.1.rN は 0.0.1 より古いとみなされる)
 pkgver() {
   cd "$startdir/../../.."
-  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- shell)" "$(git log -1 --format=%h -- shell)"
+  printf '0.0.2.r%s.g%s' "$(git rev-list --count HEAD -- shell)" "$(git log -1 --format=%h -- shell)"
 }
 
 build() {
