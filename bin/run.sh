@@ -18,6 +18,8 @@
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
 # AIOS_DISPLAY=1 で画面の窓を出す (virtio-gpu と virtio のキーボード・タブレット。Mac は cocoa、
 #   ほかは gtk)。AIOS_DISPLAY=cocoa / gtk / sdl / none で選べる。シリアル (この端末) もそのまま使える
+#   音 (virtio-sound、QEMU 8.2 から) もつける: Mac は coreaudio、ほかは pipewire / pa / alsa のあるもの。
+#   AIOS_SOUND=coreaudio / pipewire / pa / alsa / none (鳴らさない) で選べる。AIOS_SOUND=0 で音の装置なし
 # AIOS_QEMU_ARGS で QEMU に引数を足せる
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
 #   AIOS_ACCEL=tcg でソフトのエミュレーションに、AIOS_ACCEL=kvm で Linux (arm64) の KVM に
@@ -127,6 +129,19 @@ if [ -n "$AIOS_DISPLAY" ]; then
   set -- "$@" -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device
   out="-display $disp -serial mon:stdio"
   echo "display: $disp (virtio-gpu, keyboard, tablet)" >&2
+  snd=${AIOS_SOUND:-}
+  if [ -z "$snd" ]; then
+    if [ "$(uname -s)" = Darwin ]; then snd=coreaudio
+    elif command -v pw-cli >/dev/null 2>&1; then snd=pipewire
+    elif command -v pactl >/dev/null 2>&1; then snd=pa
+    elif [ -d /dev/snd ]; then snd=alsa
+    else snd=none
+    fi
+  fi
+  if [ "$snd" != 0 ] && qemu-system-aarch64 -device help 2>/dev/null | grep -q '"virtio-sound-device"'; then
+    set -- "$@" -audiodev "$snd,id=snd0" -device virtio-sound-device,audiodev=snd0
+    echo "sound: $snd (virtio-sound)" >&2
+  fi
 fi
 # shellcheck disable=SC2086
 set -- "$@" ${AIOS_QEMU_ARGS:-}

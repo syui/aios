@@ -1,0 +1,39 @@
+# alsa-utils: ALSA の道具 (aplay / arecord、speaker-test、amixer、aplay -l) (for aios)
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。alsamixer (ncurses が要る) はなし。/opt/c に入る
+pkgname=alsa-utils
+pkgver=1.2.16
+pkgrel=1
+pkgdesc='ALSA utilities: aplay, arecord, speaker-test, amixer (for aios)'
+arch=('aarch64')
+url='https://www.alsa-project.org/'
+license=('GPL-2.0-or-later')
+depends=('musl' 'alsa-lib')
+source=("https://www.alsa-project.org/files/pub/utils/alsa-utils-$pkgver.tar.bz2")
+sha256sums=('092399d5e8749a1d5e188e393157521cec4b75693b60ebb79bbce728cff2232c')
+
+prepare() {
+  rm -rf "alsa-utils-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps alsa-lib
+  cd "alsa-utils-$pkgver"
+  # libasound.so を使うので動的にリンクする (zig の musl は静的が既定。そのときは位置によらないコードに)
+  LDFLAGS="-dynamic -Wl,-s -L$SYSROOT/lib" CFLAGS="-O2 -fPIE $CPPFLAGS" \
+    ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --with-alsa-prefix="$SYSROOT/lib" \
+    --with-alsa-inc-prefix="$SYSROOT/include" --disable-alsamixer --disable-alsaconf --disable-bat \
+    --disable-xmlto --disable-rst2man --disable-nls --disable-alsaloop --disable-alsaucm \
+    --disable-topology --with-udev-rules-dir=no --with-systemdsystemunitdir=no \
+    --with-asound-state-dir=/var/lib/alsa
+  make
+}
+
+package() {
+  cd "alsa-utils-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/lib" "$pkgdir/usr/lib/udev"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

@@ -1,4 +1,4 @@
-// モジュール: カーネルに入っているが、起動しただけでは動かさないドライバ (画面、キーボードやマウス)
+// モジュール: カーネルに入っているが、起動しただけでは動かさないドライバ (画面、キーボードやマウス、音)
 //
 // aios のカーネルはあとから中身を読み込めないので、ドライバはぜんぶ中に入っていて、
 // modprobe (finit_module) で起こす。/usr/lib/modules/NAME.ko (unix パッケージ) は
@@ -14,9 +14,10 @@ struct Module {
     loaded: bool,
 }
 
-static mut MODULES: [Module; 2] = [
+static mut MODULES: [Module; 3] = [
     Module { name: "virtio_gpu", init: crate::gpu::init, loaded: false },
     Module { name: "virtio_input", init: input_init, loaded: false },
+    Module { name: "virtio_snd", init: crate::sound::init, loaded: false },
 ];
 
 fn input_init() -> bool {
@@ -24,7 +25,7 @@ fn input_init() -> bool {
     crate::input::count() > 0
 }
 
-fn modules() -> &'static mut [Module; 2] {
+fn modules() -> &'static mut [Module; 3] {
     unsafe { &mut *(&raw mut MODULES) }
 }
 

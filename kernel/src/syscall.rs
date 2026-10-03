@@ -671,6 +671,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                 }
                 Backing::Pages { pages: g.pages.clone(), off }
             }
+            // 音の再生の口: リングバッファのページ
+            crate::file::Kind::SndPcm => Backing::Pages { pages: crate::sound::mmap_pages(off, len)?, off },
             _ => return Err(-ENODEV),
         }
     } else {

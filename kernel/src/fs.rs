@@ -49,11 +49,17 @@ pub fn init() {
     setup_dirs("tmpfs / tmpfs rw 0 0\nproc /proc proc rw 0 0\n");
 }
 
-/// モジュール (module.rs) が見つけた装置の /dev のノード: 画面 (/dev/fb0) とキーボードやマウス
+/// モジュール (module.rs) が見つけた装置の /dev のノード: 画面 (/dev/fb0) とキーボードやマウス、音 (/dev/snd)
 pub fn add_device_nodes() {
     let Ok(dev) = vfs::mkdir_p("dev", 0o755) else { return };
     if crate::gpu::get().is_some() {
         let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
+    }
+    if crate::sound::present() {
+        if let Ok(d) = vfs::mkdir_p("dev/snd", 0o755) {
+            let _ = d.create("controlC0", 0o666, NewNode::Dev(116, 0));
+            let _ = d.create("pcmC0D0p", 0o666, NewNode::Dev(116, 16));
+        }
     }
     if crate::input::count() > 0 {
         if let Ok(d) = vfs::mkdir_p("dev/input", 0o755) {

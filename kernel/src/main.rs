@@ -45,6 +45,7 @@ mod vfs;
 mod virtio;
 mod gpu;
 mod input;
+mod sound;
 mod module;
 mod virtio_blk;
 mod virtio_net;
