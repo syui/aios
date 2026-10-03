@@ -19,6 +19,7 @@ bindkey                       # 一覧
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
 | `aish-pick` | base | C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` |
 | `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `undo`。`aish --mcp` で読む |
+| `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
 ## 書き方
