@@ -745,8 +745,9 @@ impl Wm {
                     }
                 }
             }
-            for c in self.clients.values_mut() {
-                if c.conn.flush().is_err() {
+            for (id, c) in self.clients.iter_mut() {
+                if let Err(e) = c.conn.flush() {
+                    eprintln!("aiwm: client {}: write: {} (closing it)", id, e);
                     c.dead = true;
                 }
             }
@@ -777,7 +778,11 @@ impl Wm {
         let Some(c) = self.clients.get_mut(&id) else { return };
         match c.conn.recv() {
             Ok(true) => {}
-            _ => {
+            r => {
+                // Ok(false) はクライアントが閉じた (ふつうの終わり)
+                if let Err(e) = r {
+                    eprintln!("aiwm: client {}: read: {} (closing it)", id, e);
+                }
                 c.dead = true;
                 return;
             }
@@ -853,6 +858,7 @@ impl Wm {
                     6 => Obj::DataManager,
                     7 => Obj::Subcompositor,
                     _ => {
+                        eprintln!("aiwm: client {}: bind of unknown global {} (closing it)", cid, name);
                         c.dead = true;
                         return;
                     }
@@ -932,6 +938,7 @@ impl Wm {
                 let nid = m.uint();
                 let (sid, pid) = (m.uint(), m.uint());
                 if sid == pid || !c.surfaces.contains_key(&sid) || !c.surfaces.contains_key(&pid) {
+                    eprintln!("aiwm: client {}: bad get_subsurface {} {} (closing it)", cid, sid, pid);
                     c.dead = true;
                     return;
                 }
@@ -977,7 +984,10 @@ impl Wm {
                     Some(p) => {
                         c.objs.insert(nid, Obj::Pool(std::rc::Rc::new(p)));
                     }
-                    None => c.dead = true,
+                    None => {
+                        eprintln!("aiwm: client {}: cannot map the shm pool ({} bytes) (closing it)", cid, size);
+                        c.dead = true;
+                    }
                 }
             }
             (K::Pool, 0) => {
@@ -986,6 +996,7 @@ impl Wm {
                 let Some(Obj::Pool(pool)) = c.objs.get(&m.id) else { return };
                 let pool = pool.clone();
                 if offset < 0 || w <= 0 || h <= 0 || stride < w * 4 {
+                    eprintln!("aiwm: client {}: bad buffer {}x{} stride {} offset {} (closing it)", cid, w, h, stride, offset);
                     c.dead = true;
                     return;
                 }

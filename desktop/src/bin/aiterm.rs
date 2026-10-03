@@ -76,6 +76,9 @@ struct App {
     layout: String,
     repeat: Option<(u16, u32)>,
     closed: bool,
+    /// シェルを始めた時刻と、シェルが終わったのを見せて待っているか (すぐ / エラーで終わったとき)
+    started: std::time::Instant,
+    held: bool,
 }
 
 fn main() {
@@ -131,6 +134,8 @@ fn main() {
         last_cursor: (0, 0),
         pty: -1,
         child: 0,
+        started: std::time::Instant::now(),
+        held: false,
         mods: Mods::default(),
         layout: keys::layout(),
         repeat: None,
@@ -263,6 +268,7 @@ impl App {
             libc::fcntl(m, libc::F_SETFL, libc::O_NONBLOCK);
             self.pty = m;
             self.child = pid;
+            self.started = std::time::Instant::now();
         }
     }
 
@@ -294,7 +300,8 @@ impl App {
         while !self.closed {
             let mut pfds = [
                 libc::pollfd { fd: self.conn.fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: self.pty, events: libc::POLLIN, revents: 0 },
+                // シェルが終わって待っているあいだは pty を見ない (負の fd は poll が飛ばす)
+                libc::pollfd { fd: if self.held { -1 } else { self.pty }, events: libc::POLLIN, revents: 0 },
             ];
             let timeout = match self.repeat {
                 Some((_, at)) => (at.wrapping_sub(wl::now_ms()) as i32).clamp(0, 1000),
@@ -302,8 +309,16 @@ impl App {
             };
             unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
             if pfds[0].revents != 0 {
-                if !self.conn.recv().unwrap_or(false) {
-                    break;
+                match self.conn.recv() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("aiterm: the compositor closed the connection");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("aiterm: the compositor connection: {}", e);
+                        break;
+                    }
                 }
                 while let Some(m) = self.conn.next() {
                     self.event(m);
@@ -322,8 +337,26 @@ impl App {
                         self.conn.send(self.toplevel, 2, &[Arg::S(&t)]);
                     }
                 } else if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
-                    // シェルが終わった
-                    break;
+                    // シェルが終わった。すぐ (3 秒たたずに) かエラーで終わったなら、わけを見せてキーを待つ
+                    // (何も言わずに窓が消えると、なぜ動かないのかわからない)
+                    let mut st = 0;
+                    if self.child > 0 {
+                        unsafe { libc::waitpid(self.child, &mut st, 0) };
+                        self.child = 0;
+                    }
+                    let why = if libc::WIFSIGNALED(st) {
+                        format!("killed by signal {}", libc::WTERMSIG(st))
+                    } else {
+                        format!("exit status {}", libc::WEXITSTATUS(st))
+                    };
+                    let ok = libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0;
+                    if ok && self.started.elapsed() >= std::time::Duration::from_secs(3) {
+                        break;
+                    }
+                    eprintln!("aiterm: the shell ended ({})", why);
+                    self.term.feed(format!("\r\n\x1b[33m[aiterm: the shell ended ({}). press a key to close]\x1b[0m", why).as_bytes());
+                    self.held = true;
+                    self.full_redraw = true;
                 }
             }
             if let Some((code, at)) = self.repeat {
@@ -421,6 +454,10 @@ impl App {
 
     /// キーをシェルへのバイトにして送る
     fn send_key(&mut self, key: u16) {
+        if self.held {
+            self.closed = true;
+            return;
+        }
         let app = self.term.app_cursor;
         let arrow = |c: char| if app { format!("\x1bO{}", c) } else { format!("\x1b[{}", c) };
         let seq: Option<String> = match key {
