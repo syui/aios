@@ -405,16 +405,16 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
 
 const EINTR_: i64 = 4;
 
-/// /proc/sysstat: スレッドの名前ごとの、システムコールの回数 (空回りを探す調べもの用)。
+/// /proc/sysstat: スレッドごと (名前と番号) の、システムコールの回数 (空回りを探す調べもの用)。
 /// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える
-static mut COUNTS: alloc::collections::BTreeMap<([u8; 16], u64), u64> = alloc::collections::BTreeMap::new();
+static mut COUNTS: alloc::collections::BTreeMap<([u8; 16], u32, u64), u64> = alloc::collections::BTreeMap::new();
 static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
 
 fn count(nr: u64) {
     // スレッドの名前 (pthread_setname_np) ごと
-    let comm = proc::current().comm;
+    let p = proc::current();
     unsafe {
-        *(*(&raw mut COUNTS)).entry((comm, nr)).or_insert(0) += 1;
+        *(*(&raw mut COUNTS)).entry((p.comm, p.pid, nr)).or_insert(0) += 1;
     }
 }
 
@@ -426,9 +426,9 @@ pub fn sysstat() -> alloc::string::String {
     let mut v: alloc::vec::Vec<_> = m.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     let mut s = alloc::string::String::new();
-    for ((comm, nr), n) in v.into_iter().take(40) {
+    for ((comm, tid, nr), n) in v.into_iter().take(40) {
         let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
-        let _ = writeln!(s, "{:>10} {:>4} {}", n, nr, core::str::from_utf8(&comm[..len]).unwrap_or("?"));
+        let _ = writeln!(s, "{:>10} {:>4} {:>5} {}", n, nr, tid, core::str::from_utf8(&comm[..len]).unwrap_or("?"));
     }
     for (nr, c) in FAST.iter().enumerate() {
         let n = c.swap(0, Ordering::Relaxed);
