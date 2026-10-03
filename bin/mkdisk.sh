@@ -57,6 +57,13 @@ case "$layout" in
   gpt | ext4) ;;
   *) echo "LAYOUT は gpt か ext4" >&2; exit 1 ;;
 esac
+# 使ってたまったもの (キャッシュ、履歴、aipkg が取ってきたパッケージ) はイメージに入れない
+# (rootfs/ はパッケージからいつでも作りなおせる。aish --mcp と aish-edit はもともとディスクに残さない)
+for x in rootfs/root rootfs/home/*; do
+  [ -d "$x" ] || continue
+  rm -rf "$x/.cache" "$x/.aish_history" "$x/.aish_dirs"
+done
+rm -rf rootfs/var/cache/aipkg/*
 tmp=$(mktemp -d)
 # /boot の中身は FAT の区画へ。root の /boot はマウント先の空のディレクトリ
 restore() {

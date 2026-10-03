@@ -4,7 +4,7 @@
 use aish_plugin::{Spec, json, s};
 
 fn main() {
-    let spec = Spec { name: "suggest", hooks: &["suggest", "preexec"], keys: &[] };
+    let spec = Spec { name: "suggest", hooks: &["suggest", "preexec"], keys: &[], tools: &[] };
     let mut history: Vec<String> = Vec::new();
     aish_plugin::run(spec, |ev, v| {
         match ev {

@@ -7,6 +7,8 @@
 // aish が { "ev": ..., ... } を送り、プラグインは 1 行の JSON で答える。最初は hello で、答えに
 // 受けとるフック (hooks) と既定のキー (keys) が入っている。そのあとはフックのあるものだけに送る。
 // 決まった時間に答えなければ (key と not_found は待ちつづける)、そのプラグインは止めて外す
+// 版 2: hello の答えに tools (端末なしで呼べる機能)。aish --mcp はそれを MCP のツールとして見せ、
+// { "ev": "tool", "name": ..., "args": {...} } で呼ぶ
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -24,6 +26,8 @@ struct Plugin {
     /// 読んだが、まだ行になっていないもの
     buf: Vec<u8>,
     hooks: Vec<String>,
+    /// 端末なしで呼べる機能 ({ name, description, input })
+    tools: Vec<Value>,
     alive: bool,
 }
 
@@ -101,7 +105,7 @@ fn find(name: &str, home: &str, path_var: Option<String>, path: &str) -> Option<
         return Some(name.to_string());
     }
     let dirs = path_var.unwrap_or_else(|| format!("{}/.local/lib/aish/plugins:/usr/lib/aish/plugins", home));
-    dirs.split(':').chain(path.split(':')).filter(|d| !d.is_empty()).map(|d| format!("{}/{}", d, name)).find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+    dirs.split(':').chain(path.split(':')).filter(|d| !d.is_empty()).map(|d| format!("{}/{}", d, name)).find(|p| super::is_exec(p))
 }
 
 /// キーの名前を、そろえた形に ("ctrl-r" "^R" "C-R" → "C-r"、"alt-f" → "M-f")
@@ -147,8 +151,8 @@ impl Plugins {
         }
         let mut child = cmd.spawn().map_err(|e| format!("{}: {}", prog, e))?;
         let (w, r) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), alive: true };
-        let mut hello = json!({ "ev": "hello", "version": 1, "shell": "aish", "args": args, "home": home });
+        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true };
+        let mut hello = json!({ "ev": "hello", "version": 2, "shell": "aish", "args": args, "home": home });
         if let (Some(h), Some(e)) = (hello.as_object_mut(), extra.as_object()) {
             h.extend(e.clone());
         }
@@ -157,6 +161,7 @@ impl Plugins {
             p.name = n.to_string();
         }
         p.hooks = reply["hooks"].as_array().map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect()).unwrap_or_default();
+        p.tools = reply["tools"].as_array().cloned().unwrap_or_default().into_iter().filter(|t| t["name"].is_string()).collect();
         let idx = self.list.len();
         // 既定のキー (あとから bindkey で変えられる)
         if let Some(keys) = reply["keys"].as_object() {
@@ -239,6 +244,27 @@ impl Plugins {
         for p in self.list.iter_mut().filter(|p| p.alive && p.hooks.iter().any(|h| h == hook)) {
             p.ask(&ev, false);
         }
+    }
+
+    /// 端末なしで呼べる機能の一覧: (プラグインの名前, { name, description, input })
+    pub fn tools(&self) -> Vec<(String, Value)> {
+        self.list.iter().filter(|p| p.alive).flat_map(|p| p.tools.iter().map(move |t| (p.name.clone(), t.clone()))).collect()
+    }
+
+    /// プラグインのプロセス (aish --mcp が時間切れで子を止めるとき、これは残す)
+    pub fn pids(&self) -> Vec<i32> {
+        self.list.iter().filter(|p| p.alive).map(|p| p.child.id() as i32).collect()
+    }
+
+    /// 端末なしの機能を呼ぶ (名前が同じなら先に読んだもの)。答えを待ちつづける
+    pub fn tool(&mut self, name: &str, mut ev: Value) -> Option<Value> {
+        if !self.mine() {
+            return None;
+        }
+        ev["ev"] = json!("tool");
+        ev["name"] = json!(name);
+        let p = self.list.iter_mut().find(|p| p.alive && p.tools.iter().any(|t| t["name"] == name))?;
+        p.ask(&ev, true)
     }
 
     /// キーに結んだ機能を呼ぶ (端末で人と話すかもしれないので待ちつづける)

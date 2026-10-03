@@ -17,7 +17,8 @@ bindkey                       # 一覧
 |---|---|---|
 | `aish-complete` | base | Tab の補完 (コマンド、ファイル、`$変数`) |
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
-| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー |
+| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` |
+| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `undo`。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
 ## 書き方
@@ -28,7 +29,7 @@ Rust なら SDK (`plugin/`、クレート名 `aish-plugin`) を使うと、イ�
 use aish_plugin::{json, s, Spec};
 
 fn main() {
-    let spec = Spec { name: "hello", hooks: &["prompt"], keys: &[("C-x", "greet")] };
+    let spec = Spec { name: "hello", hooks: &["prompt"], keys: &[("C-x", "greet")], tools: &[] };
     aish_plugin::run(spec, |ev, v| match ev {
         "prompt" => json!({ "prompt": format!("{} > ", s(v, "pwd")) }),
         "key" => json!({ "insert": "hello" }),
@@ -47,7 +48,25 @@ printf '%s\n' '{"ev":"hello","version":1}' '{"ev":"prompt","pwd":"/tmp"}' | aish
 
 ほかの言語でもよい (標準入力から 1 行読み、1 行の JSON を書いて flush するだけ)。
 
-## プロトコル (版 1)
+## 人はキーで、Claude は MCP で
+
+プラグインの機能には顔が 2 つある。人は `keys` (端末で絞りこんで選ぶ)、Claude は `tools`
+(端末なしで、JSON を渡して JSON が返る)。`aish --mcp` は aish を MCP のサーバーにして、
+組み込みの `run` と、読んだプラグインの `tools` を MCP のツールとして見せる。
+
+```sh
+claude mcp add aish -- aish --mcp     # Claude Code から
+```
+
+- `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
+  `cd` や変数、関数は次の `run` に残る。時間切れなら子と孫を止めて `status: 124, timeout: true`。
+  `exit` はその `run` だけを終える
+- 設定は対話のときと同じ `/etc/aishrc` と `~/.aishrc`。`AISH_MCP=1` なので `[ -n "$AISH_MCP" ] && ...` で分けられる
+- 出力はメモリー (memfd) に受けて答えに入れるだけ、`aish-edit` の取り消しの写しもメモリーだけ。
+  ディスクには何も残らないので、リポジトリやイメージにまざらない (`bin/mkdisk.sh` も、ホームの
+  `.cache` と履歴、aipkg のキャッシュをイメージに入れない)
+
+## プロトコル (版 2)
 
 aish がイベント `{"ev": NAME, ...}` を 1 行で送り、プラグインは**かならず 1 行の JSON オブジェクト**で答える
 (何もしないなら `{}`)。答えが 3 秒来ないか、JSON のオブジェクトでなければ、aish はそのプラグインを止めて外す
@@ -57,16 +76,19 @@ Ctrl-C (SIGINT) は無視するようにして起こされる。aish が終わ�
 ### hello (最初に 1 回)
 
 ```json
-{"ev":"hello","version":1,"shell":"aish","args":["plugin のあとの引数"],"home":"/home/ai","histfile":"/home/ai/.aish_history"}
+{"ev":"hello","version":2,"shell":"aish","args":["plugin のあとの引数"],"home":"/home/ai","histfile":"/home/ai/.aish_history"}
 ```
 答え:
 ```json
-{"name":"pick","version":1,"hooks":["key","chpwd"],"keys":{"C-r":"history","C-p C-p":"copy"}}
+{"name":"pick","version":2,"hooks":["key","chpwd"],"keys":{"C-r":"history","C-p C-p":"copy"},
+ "tools":[{"name":"history","description":"...","input":{"type":"object","properties":{"query":{"type":"string"}}}}]}
 ```
 - `hooks`: 受けとるフック。このあと、ここにあるものだけが送られてくる
 - `keys`: 既定のキー → 機能 (`widget`) の名前。`bindkey` であとから変えられる。キーは `C-r` `M-f` `Tab`
   `Enter` `Esc` `BS` で、`"C-p C-p"` のように空白で 2 つ続けたもの (1 つ目のあと 0.4 秒待つ) も書ける。
   aish の行の編集のキーより先に効く
+- `tools` (版 2): 端末なしで呼べる機能。`name` (英数字と `_` `-`)、`description` (Claude が読む)、
+  `input` (引数の JSON Schema)
 
 ### フック
 
@@ -80,6 +102,7 @@ Ctrl-C (SIGINT) は無視するようにして起こされる。aish が終わ�
 | `precmd` | `status` | `{}` | プロンプトを出す前 |
 | `chpwd` | `pwd old` | `{}` | `cd` でディレクトリが変わったとき |
 | `not_found` | `args line pwd status` | `{"status":N}` (引き受けたとき) | コマンドが見つからなかったとき。`{}` なら aish が "command not found" を出す |
+| `tool` | `name args pwd home histfile` | JSON のオブジェクト。しくじったら `{"error":"..."}` | `aish --mcp` でツールが呼ばれたとき (hooks に書かなくても来る)。答えを待ちつづける |
 
 `prompt` `suggest` `complete` `not_found` は、フックを持つプラグインに順に聞き、最初の空でない答えを使う。
 ほかは持っているものみなに知らせる。
