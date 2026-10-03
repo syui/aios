@@ -11,6 +11,8 @@ license=('MIT')
 # ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく。awk は作りかけなので入れない
 depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush')
 makedepends=('rustup')
+# aish の grep ツールと C-f / C-g は、ripgrep があればそれを使う (.gitignore を読む、速い)
+optdepends=('ripgrep: faster grep tool and C-f / C-g in aish')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
         etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc

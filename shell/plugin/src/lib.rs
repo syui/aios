@@ -236,6 +236,13 @@ impl Tty {
         }
     }
 
+    /// まだ読んでいないキーがあるか (打ちつづけているあいだは重い仕事をあとにする)
+    pub fn pending(&mut self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut p = libc::pollfd { fd: self.f.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut p, 1, 0) > 0 }
+    }
+
     /// キーを 1 つ読む (閉じたら None)
     pub fn key(&mut self) -> Option<Key> {
         let c = self.byte(-1)?;
@@ -294,19 +301,34 @@ fn base64(b: &[u8]) -> String {
 /// 区別しない) が残る。↑↓ C-p C-n Tab で動き、Enter で決める。Esc C-c C-g でやめる (None)。
 /// 終わったらカーソルを始めの場所に戻し、出したものは消す
 pub fn pick(label: &str, items: &[String]) -> Option<String> {
-    let mut tty = Tty::open().ok()?;
-    let mut query = String::new();
-    let mut cur = 0usize;
-    let rows = 12;
-    let r = loop {
+    pick_live(label, |query| {
         let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
-        let hits: Vec<&String> = items
+        items
             .iter()
             .filter(|it| {
                 let low = it.to_lowercase();
                 words.iter().all(|w| low.contains(w.as_str()))
             })
-            .collect();
+            .cloned()
+            .collect()
+    })
+}
+
+/// 打つたびに候補を作りなおして選ぶ (find は問いから候補を作る。rg で探すときなど)。キーは pick と同じ
+pub fn pick_live(label: &str, mut find: impl FnMut(&str) -> Vec<String>) -> Option<String> {
+    let mut tty = Tty::open().ok()?;
+    let mut query = String::new();
+    let mut cur = 0usize;
+    let rows = 12;
+    // 問いが変わったときだけ作りなおす
+    let mut asked: Option<String> = None;
+    let mut hits: Vec<String> = Vec::new();
+    let r = loop {
+        // 続けて打っているあいだは作りなおさない (遅いマシンで、打つたびの rg がたまらないように)
+        if asked.as_deref() != Some(query.as_str()) && !tty.pending() {
+            hits = find(&query);
+            asked = Some(query.clone());
+        }
         cur = cur.min(hits.len().saturating_sub(1));
         let top = cur.saturating_sub(rows - 1);
         let cols = tty.cols().saturating_sub(1);
@@ -356,4 +378,87 @@ pub fn pick(label: &str, items: &[String]) -> Option<String> {
     };
     tty.write("\r\x1b[J");
     r
+}
+
+/// ripgrep (rg) の答え
+pub struct Rg {
+    /// --json の行のうち match と context ({"type": ..., "data": {path, line_number, lines, ...}})
+    pub items: Vec<Value>,
+    /// match が max を超えたので途中でやめた
+    pub truncated: bool,
+    /// rg の標準エラー (パターンのまちがいなど)
+    pub err: String,
+    /// rg の終わりのステータス (0 見つかった、1 なかった、2 しくじった。途中でやめたら 0)
+    pub status: i32,
+}
+
+/// rg --json ARGS を dir で動かす。match が max を超えたら止める。rg がなければ None
+pub fn rg_json(dir: &str, args: &[String], max: usize) -> Option<Rg> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("rg")
+        .arg("--json")
+        .args(args)
+        .current_dir(if dir.is_empty() { "." } else { dir })
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let out = child.stdout.take()?;
+    // 標準エラーは別に読む (たくさん出ても rg が止まらないように)
+    let errs = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = e.read_to_string(&mut s);
+            s
+        })
+    });
+    let mut items = Vec::new();
+    let mut matches = 0;
+    let mut truncated = false;
+    for line in std::io::BufReader::new(out).lines() {
+        let Ok(line) = line else { break };
+        let Some(v) = parse(&line) else { continue };
+        match v["type"].as_str() {
+            Some("match") => {
+                if matches >= max {
+                    truncated = true;
+                    break;
+                }
+                matches += 1;
+                items.push(v);
+            }
+            Some("context") => items.push(v),
+            _ => {}
+        }
+    }
+    if truncated {
+        let _ = child.kill();
+    }
+    let st = child.wait();
+    let err = errs.and_then(|t| t.join().ok()).unwrap_or_default();
+    let st = st.ok().and_then(|s| s.code()).unwrap_or(0);
+    Some(Rg { items, truncated, err, status: if truncated { 0 } else { st } })
+}
+
+/// rg --files (.gitignore と隠しファイルをのぞいた、dir の下のファイル)。max まで。rg がなければ None
+pub fn rg_files(dir: &str, max: usize) -> Option<Vec<String>> {
+    let mut child = std::process::Command::new("rg")
+        .arg("--files")
+        .current_dir(if dir.is_empty() { "." } else { dir })
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let out = child.stdout.take()?;
+    let files: Vec<String> = std::io::BufReader::new(out).lines().map_while(Result::ok).take(max).collect();
+    let _ = child.kill();
+    let _ = child.wait();
+    Some(files)
+}
+
+/// rg の JSON の文字 ({"text": ...} か {"bytes": base64})
+pub fn rg_text(v: &Value) -> String {
+    v["text"].as_str().map(String::from).unwrap_or_default()
 }

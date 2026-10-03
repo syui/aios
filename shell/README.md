@@ -17,8 +17,8 @@ bindkey                       # 一覧
 |---|---|---|
 | `aish-complete` | base | Tab の補完 (コマンド、ファイル、`$変数`) |
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
-| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
-| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `grep` `sed` `lines` (行の番号で) `undo`。`aish --mcp` で読む |
+| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-g rg で探して開く / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
+| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `grep` (ripgrep があればそれで) `sed` `lines` (行の番号で) `undo`。`aish --mcp` で読む |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
@@ -65,6 +65,9 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 - 設定は対話のときと同じ `/etc/aishrc` と `~/.aishrc`。`AISH_MCP=1` なので `[ -n "$AISH_MCP" ] && ...` で分けられる
 - `paths` (aish-pick) は、コマンドの行とツールで使ったファイルとディレクトリを、使った回数 × 新しさ
   (zoxide と同じ) で並べる。覚えるのは `~/.cache/aish/paths` (1 行 1 つの JSON)
+- ripgrep (`rg`) があれば、`grep` ツールは `rg --json` で探す (.gitignore を読み、`glob` `hidden` も使える。
+  答えの `engine` が `rg`)。C-f は `rg --files`、C-g は打ちながら rg で探して `$EDITOR +行 ファイル` にする。
+  SDK の `rg_json` / `rg_files` / `pick_live` でほかのプラグインからも使える
 - 出力はメモリー (memfd) に受けて答えに入れるだけ、`aish-edit` の取り消しの写しもメモリーだけ。
   ディスクには何も残らないので、リポジトリやイメージにまざらない (`bin/mkdisk.sh` も、ホームの
   `.cache` と履歴、aipkg のキャッシュをイメージに入れない)

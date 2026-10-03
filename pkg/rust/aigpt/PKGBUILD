@@ -1,0 +1,27 @@
+# aios (aarch64) 用。bin/mkpkg.sh pkg/rust/aigpt
+pkgname=aigpt
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='AI identity and memory MCP server'
+arch=('aarch64')
+url='https://git.syui.ai/ai/gpt'
+license=('MIT')
+makedepends=('git' 'rustup')
+source=("git+https://git.syui.ai/ai/gpt")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd gpt
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  . "$startdir/../cross.sh"
+  cd gpt
+  musl_build --bin aigpt
+}
+
+package() {
+  cd gpt
+  install -Dm755 target/aarch64-unknown-linux-musl/release/aigpt "$pkgdir/usr/bin/aigpt"
+}

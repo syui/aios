@@ -1,0 +1,24 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/ripgrep)
+# rg: .gitignore を読んで速く探す。aish の grep ツールと C-g / C-f も、あればこれを使う
+pkgname=ripgrep
+pkgver=15.2.0
+pkgrel=1
+pkgdesc='A search tool that combines the usability of ag with the raw speed of grep'
+arch=('aarch64')
+url='https://github.com/BurntSushi/ripgrep'
+license=('MIT' 'Unlicense')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/BurntSushi/ripgrep#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd ripgrep
+  musl_build --bin rg
+}
+
+package() {
+  cd ripgrep
+  install -Dm755 target/aarch64-unknown-linux-musl/release/rg "$pkgdir/usr/bin/rg"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+}
