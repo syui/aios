@@ -1,6 +1,6 @@
 // モジュール (カーネルの中で眠っているドライバ) を起こす: modprobe と init が使う
 #![allow(dead_code)]
-//   札は /usr/lib/modules/NAME.ko (unix パッケージ)。起動のときに起こすものは /etc/modules-load.d/*.conf
+//   札は /usr/lib/modules/NAME.ko (aikernel パッケージ)。起動のときに起こすものは /etc/modules-load.d/*.conf
 use std::ffi::CString;
 use std::fs;
 use std::io;

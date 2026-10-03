@@ -98,6 +98,7 @@ fn parse_pkginfo(s: &str) -> Desc {
         ("depend", "DEPENDS"),
         ("provides", "PROVIDES"),
         ("conflict", "CONFLICTS"),
+        ("replaces", "REPLACES"),
         ("backup", "BACKUP"),
     ];
     let mut d = Desc::new();
@@ -547,10 +548,16 @@ fn remove_files<'a>(files: impl Iterator<Item = &'a String>) {
 }
 
 fn remove(names: &[String]) {
+    remove_with(names, true);
+}
+
+/// check_deps: ほかのパッケージが依存していれば止める (replaces で置きかえるときは見ない。
+/// 新しいパッケージが provides で同じ名前を持つ)
+fn remove_with(names: &[String], check_deps: bool) {
     let db = installed();
     for name in names {
         let Some((d, files)) = db.get(name) else { die(format!("target not found: {}", name)) };
-        for (other, (od, _)) in &db {
+        for (other, (od, _)) in db.iter().filter(|_| check_deps) {
             if !names.contains(other) && list(od, "DEPENDS").iter().any(|x| dep_name(x) == name) {
                 die(format!("{} is required by {}", name, other));
             }
@@ -598,7 +605,12 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
         }
         out.push(n.to_string());
     }
-    let local: BTreeSet<String> = installed().into_keys().collect();
+    // 入っているものと、それが provides で持つ名前 (unix を置きかえた aikernel など)
+    let mut local = BTreeSet::new();
+    for (n, (d, _)) in installed() {
+        local.extend(list(&d, "PROVIDES").iter().map(|p| dep_name(p).to_string()));
+        local.insert(n);
+    }
     let mut seen = BTreeSet::new();
     let mut out = vec![];
     for t in targets {
@@ -666,7 +678,14 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
                 die(format!("{}: checksum mismatch", file));
             }
         }
-        install(&path, explicit.contains(n));
+        // replaces: 置きかえられる古いパッケージ (入っていれば) を外してから入れる (同じファイルを持っているので)
+        let db = installed();
+        let old: Vec<String> = list(d, "REPLACES").iter().map(|r| dep_name(r).to_string()).filter(|r| r != n && db.contains_key(r)).collect();
+        if !old.is_empty() {
+            println!(":: replacing {} with {}", old.join(", "), n);
+            remove_with(&old, false);
+        }
+        install(&path, explicit.contains(n) || old.iter().any(|o| db.get(o).is_some_and(|(od, _)| get(od, "REASON") != "1")));
     }
 }
 
@@ -679,6 +698,13 @@ fn upgrade_all(repos: &[Repo], extra: &[String]) {
             if vercmp(get(sd, "VERSION"), get(&d, "VERSION")) == std::cmp::Ordering::Greater {
                 targets.push(name);
             }
+        }
+    }
+    // replaces: 入っているものを置きかえる新しいパッケージ (unix → aikernel のような名前の変更)
+    let local = installed();
+    for (name, (_, sd)) in &sync {
+        if !local.contains_key(name) && list(sd, "REPLACES").iter().any(|r| local.contains_key(dep_name(r))) && !targets.contains(name) {
+            targets.push(name.clone());
         }
     }
     // まだどのリポジトリにもない名前は、更新で増えるリポジトリにあるかもしれないので後で入れる

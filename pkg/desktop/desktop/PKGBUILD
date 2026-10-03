@@ -5,12 +5,12 @@
 # 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=desktop
 pkgver=0.0.1
-pkgrel=3
+pkgrel=4
 pkgdesc='aios desktop: screen and input drivers, aiwm (tiling Wayland compositor), aiterm, aifont, icons'
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
-depends=('base' 'unix' 'aifont' 'ai-icons' 'aisplash' 'aiwm' 'aiterm')
+depends=('base' 'aikernel' 'aifont' 'ai-icons' 'aisplash' 'aiwm' 'aiterm')
 backup=(etc/modules-load.d/desktop.conf)
 
 package() {
