@@ -7,11 +7,15 @@
 #   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
 pkgname=firefox
 pkgver=157.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
 arch=('aarch64')
 license=('MPL-2.0')
 depends=('musl' 'gtk3' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2' 'atk' 'wayland' 'libxkbcommon' 'fontconfig' 'freetype2' 'harfbuzz' 'libffi' 'zlib')
+# どれも dlopen で使う: 音 (ALSA)、H.264 や AAC (ffmpeg)、WebGL (Mesa の EGL)
+optdepends=('alsa-lib: 音を鳴らす'
+            'ffmpeg: H.264、AAC などの動画と音'
+            'mesa: WebGL')
 makedepends=('rust' 'cbindgen' 'clang' 'llvm' 'nodejs' 'python')
 source=("https://archive.mozilla.org/pub/firefox/releases/$pkgver/source/firefox-$pkgver.source.tar.xz"
         fix-fortify-system-wrappers.patch
@@ -87,7 +91,7 @@ SH
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols
+  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols alsa-lib
   local root=$srcdir/sysroot tc=$srcdir/tc zlib z d
   unset CPPFLAGS LDFLAGS CFLAGS CXXFLAGS CC CXX AR RANLIB
   mkdir -p "$tc"
@@ -130,7 +134,7 @@ ac_add_options --disable-dbus
 ac_add_options --disable-jemalloc
 ac_add_options --disable-sandbox
 ac_add_options --disable-webrtc
-ac_add_options --disable-audio-backends
+ac_add_options --enable-audio-backends=alsa
 ac_add_options --disable-necko-wifi
 ac_add_options --disable-elf-hack
 ac_add_options --without-wasm-sandboxed-libraries
