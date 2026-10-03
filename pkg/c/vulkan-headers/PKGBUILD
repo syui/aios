@@ -1,0 +1,23 @@
+# vulkan-headers: Vulkan のヘッダーと API の登録簿 (registry) (for aios)
+#   vulkan-loader や Vulkan を使うプログラムを作るときに要る。/opt/c に入る
+pkgname=vulkan-headers
+pkgver=1.4.365
+pkgrel=1
+pkgdesc='Vulkan header files and API registry (for aios)'
+arch=('any')
+url='https://github.com/KhronosGroup/Vulkan-Headers'
+license=('Apache-2.0 OR MIT')
+makedepends=('cmake' 'ninja')
+source=("Vulkan-Headers::git+https://github.com/KhronosGroup/Vulkan-Headers.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  rm -rf build
+  cmake -S Vulkan-Headers -B build -G Ninja -DCMAKE_INSTALL_PREFIX="$PREFIX" -DVULKAN_HEADERS_ENABLE_MODULE=OFF
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 Vulkan-Headers/LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

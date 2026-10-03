@@ -1,0 +1,36 @@
+# vulkan-loader: libvulkan.so、Vulkan を使うプログラムとドライバ (ICD) をつなぐもの (shared, for aios)
+#   ドライバは /opt/c/share/vulkan/icd.d などの JSON で見つける (mesa の lavapipe)。Wayland だけ (X11 はなし)
+#   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
+pkgname=vulkan-loader
+pkgver=1.4.365
+pkgrel=1
+pkgdesc='Vulkan Installable Client Driver (ICD) loader: libvulkan.so (shared, for aios)'
+arch=('aarch64')
+url='https://github.com/KhronosGroup/Vulkan-Loader'
+license=('Apache-2.0')
+depends=('musl')
+makedepends=('cmake' 'ninja' 'vulkan-headers' 'wayland')
+source=("Vulkan-Loader::git+https://github.com/KhronosGroup/Vulkan-Loader.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross vulkan-headers wayland libffi
+  rm -rf build
+  # ローダーは /opt/c/etc と、XDG_DATA_DIRS (なければ /usr/local/share:/usr/share) の vulkan/icd.d を探す。
+  # /opt/c/share も既定で探すように FALLBACK_DATA_DIRS に足す
+  cmake -S Vulkan-Loader -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
+    -DSYSCONFDIR="$PREFIX/etc" \
+    -DFALLBACK_DATA_DIRS="$PREFIX/share:/usr/local/share:/usr/share" \
+    -DBUILD_WSI_XCB_SUPPORT=OFF -DBUILD_WSI_XLIB_SUPPORT=OFF -DBUILD_WSI_XLIB_XRANDR_SUPPORT=OFF \
+    -DBUILD_WSI_WAYLAND_SUPPORT=ON -DBUILD_WSI_DIRECTFB_SUPPORT=OFF \
+    -DBUILD_TESTS=OFF -DENABLE_WERROR=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 Vulkan-Loader/LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
+}

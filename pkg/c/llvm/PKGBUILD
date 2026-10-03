@@ -1,0 +1,99 @@
+# llvm: LLVM のコンパイラの部品 (libLLVM.so、AArch64 だけ。for aios)
+#   Mesa の llvmpipe (OpenGL) と lavapipe (Vulkan) がシェーダーをその場で機械語にするのに使う
+#   Zig (aarch64-linux-musl) と cmake でクロスビルドする。llvm-tblgen など、ビルドの途中で動かす道具は
+#   LLVM がこのマシン用に別に作る (clang-20 を使う)。/opt/c に入る
+#   入るもの: libLLVM.so、ヘッダー、llvm-config (aios で動かすか、qemu-aarch64 で動かす)
+#   ビルドには cmake、ninja、clang-20 が要る。4 コアで 1 時間ほど
+pkgname=llvm
+pkgver=20.1.8
+pkgrel=1
+pkgdesc='Compiler infrastructure: libLLVM.so for the AArch64 target (for aios)'
+arch=('aarch64')
+url='https://llvm.org/'
+license=('Apache-2.0 WITH LLVM-exception')
+depends=('musl')
+makedepends=('cmake' 'ninja' 'clang')
+source=("https://github.com/llvm/llvm-project/releases/download/llvmorg-$pkgver/llvm-project-$pkgver.src.tar.xz")
+sha256sums=('6898f963c8e938981e6c4a302e83ec5beb4630147c7311183cf61069af16333d')
+
+# ビルドするマシンの clang (llvm-tblgen などを作る)
+_host_llvm=${HOST_LLVM:-20}
+
+prepare() {
+  rm -rf "llvm-project-$pkgver.src"
+  tar -xf "${source[0]##*/}" "llvm-project-$pkgver.src/llvm" "llvm-project-$pkgver.src/cmake" \
+    "llvm-project-$pkgver.src/third-party"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  local tc=$srcdir/tc t
+  mkdir -p "$tc"
+  # cmake は空白のあるコンパイラ ("zig cc ...") を扱えないので小さな包みにする。
+  # zig のリンカは -Bsymbolic-functions (libLLVM.so をつなぐときにいつも付く) を知らないので、
+  # 害のない --gc-sections (もう付いている) にかえる
+  for t in cc c++; do
+    cat > "$tc/$t" <<SH
+#!/bin/sh
+n=\$#
+while [ \$n -gt 0 ]; do
+  a=\$1; shift; n=\$((n - 1))
+  [ "\$a" = -Bsymbolic-functions ] && a=--gc-sections
+  set -- "\$@" "\$a"
+done
+exec zig $t -target aarch64-linux-musl "\$@"
+SH
+    chmod 755 "$tc/$t"
+  done
+  printf '#!/bin/sh\nexec zig ar "$@"\n' > "$tc/ar"
+  printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$tc/ranlib"
+  chmod 755 "$tc/ar" "$tc/ranlib"
+  unset CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS CPPFLAGS
+  cmake -S "llvm-project-$pkgver.src/llvm" -B build -G Ninja \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER="$tc/cc" \
+    -DCMAKE_CXX_COMPILER="$tc/c++" \
+    -DCMAKE_AR="$tc/ar" \
+    -DCMAKE_RANLIB="$tc/ranlib" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_SHARED_LINKER_FLAGS=-s \
+    -DCMAKE_EXE_LINKER_FLAGS=-s \
+    -DCROSS_TOOLCHAIN_FLAGS_NATIVE="-DCMAKE_C_COMPILER=clang-$_host_llvm;-DCMAKE_CXX_COMPILER=clang++-$_host_llvm" \
+    -DLLVM_HOST_TRIPLE=aarch64-unknown-linux-musl \
+    -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-unknown-linux-musl \
+    -DLLVM_TARGETS_TO_BUILD=AArch64 \
+    -DLLVM_TARGET_ARCH=AArch64 \
+    -DLLVM_BUILD_LLVM_DYLIB=ON \
+    -DLLVM_LINK_LLVM_DYLIB=OFF \
+    -DLLVM_ENABLE_RTTI=ON \
+    -DLLVM_ENABLE_PIC=ON \
+    -DLLVM_ENABLE_ASSERTIONS=OFF \
+    -DLLVM_BUILD_TOOLS=OFF \
+    -DLLVM_BUILD_UTILS=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_INCLUDE_BENCHMARKS=OFF \
+    -DLLVM_INCLUDE_DOCS=OFF \
+    -DLLVM_ENABLE_BINDINGS=OFF \
+    -DLLVM_ENABLE_ZLIB=OFF \
+    -DLLVM_ENABLE_ZSTD=OFF \
+    -DLLVM_ENABLE_LIBXML2=OFF \
+    -DLLVM_ENABLE_LIBEDIT=OFF \
+    -DLLVM_ENABLE_LIBPFM=OFF \
+    -DLLVM_ENABLE_FFI=OFF \
+    -DLLVM_ENABLE_TERMINFO=OFF
+  ninja -C build LLVM llvm-config
+}
+
+package() {
+  local c PREFIX=/opt/c
+  for c in LLVM llvm-headers cmake-exports; do
+    DESTDIR="$pkgdir" cmake --install build --component "$c"
+  done
+  # 道具は作らない設定 (LLVM_BUILD_TOOLS=OFF) なので、llvm-config は自分で入れる
+  install -Dm755 build/bin/llvm-config "$pkgdir$PREFIX/bin/llvm-config"
+  install -Dm644 "llvm-project-$pkgver.src/llvm/LICENSE.TXT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

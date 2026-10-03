@@ -78,7 +78,8 @@ meson_cross() {
   # musl の動的リンカは /lib/ld-musl-aarch64.so.1 (qemu -L で sysroot をつける)
   [ -e "$root/lib" ] || ln -s usr/lib "$root/lib"
   # zig cc は -E と -c が両方あると -c (コンパイル) にしてしまう。meson の cc.preprocess は両方を渡すので、
-  # -E のときは -c を外す小さな包みを通す
+  # -E のときは -c を外す小さな包みを通す。
+  # zig は "-Wl,--version-script" "FILE" のように 2 つに分かれたものを読めないので、"-Wl,--version-script=FILE" に
   local zb=$srcdir/zigbin t
   mkdir -p "$zb"
   for t in cc c++; do
@@ -86,13 +87,21 @@ meson_cross() {
 #!/bin/sh
 pre=
 for a in "\$@"; do [ "\$a" = -E ] && pre=1; done
-if [ -n "\$pre" ]; then
-  n=\$#
-  while [ \$n -gt 0 ]; do
-    a=\$1; shift; n=\$((n - 1))
-    [ "\$a" = -c ] || set -- "\$@" "\$a"
-  done
-fi
+n=\$#
+join=
+while [ \$n -gt 0 ]; do
+  a=\$1; shift; n=\$((n - 1))
+  if [ -n "\$join" ]; then
+    set -- "\$@" "\$join=\$a"
+    join=
+    continue
+  fi
+  case "\$a" in
+    -c) [ -n "\$pre" ] && continue ;;
+    -Wl,--version-script|-Wl,--dynamic-list) join=\$a; continue ;;
+  esac
+  set -- "\$@" "\$a"
+done
 exec zig $t -target aarch64-linux-musl "\$@"
 SH
     chmod 755 "$zb/$t"
@@ -133,4 +142,68 @@ INI
 # autotools / cmake で共有ライブラリを作るときの環境 (zig_env の -static を外す)
 shared_env() {
   export LDFLAGS="-Wl,-s${SYSROOT:+ -L$SYSROOT/lib}"
+}
+
+# cmake_cross DEP...: cmake で aios 用にクロスビルドする準備。c_deps DEP... を sysroot に広げ、
+# $srcdir/toolchain.cmake を作る (cmake は空白のあるコンパイラ "zig cc ..." を扱えないので小さな包みを通す)。
+# プログラムは動的にリンクする (共有ライブラリを使うので。zig の musl は静的が既定)
+#   cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" -DCMAKE_INSTALL_PREFIX="$PREFIX" ...
+cmake_cross() {
+  c_deps musl "$@"
+  local root=$srcdir/sysroot tc=$srcdir/tc t
+  [ -e "$root/lib" ] || ln -s usr/lib "$root/lib"
+  mkdir -p "$tc"
+  # zig cc は -E や -S と -c が両方あると -c (オブジェクト) にしてしまうので、そのときは -c を外す。
+  # -S と -MD / -MF が両方だと -o のファイルを書かないので、それらを外して依存のファイル (-MF) は自分で書く
+  for t in cc c++; do
+    cat > "$tc/$t" <<SH
+#!/bin/sh
+only= asm= mf= mt=
+for a in "\$@"; do case "\$a" in -E) only=1 ;; -S) only=1; asm=1 ;; esac; done
+if [ -n "\$only" ]; then
+  n=\$#
+  prev=
+  while [ \$n -gt 0 ]; do
+    a=\$1; shift; n=\$((n - 1))
+    p=\$prev; prev=\$a
+    if [ -n "\$asm" ]; then
+      case "\$p" in -MF) mf=\$a; continue ;; -MT) mt=\$a; continue ;; esac
+      case "\$a" in -MD|-MMD|-MF|-MT) continue ;; esac
+    fi
+    [ "\$a" = -c ] && continue
+    set -- "\$@" "\$a"
+  done
+fi
+if [ -n "\$asm" ] && [ -n "\$mf" ]; then
+  zig $t -target aarch64-linux-musl "\$@" || exit
+  echo "\$mt:" > "\$mf"
+  exit 0
+fi
+exec zig $t -target aarch64-linux-musl "\$@"
+SH
+  done
+  printf '#!/bin/sh\nexec zig ar "$@"\n' > "$tc/ar"
+  printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$tc/ranlib"
+  chmod 755 "$tc"/*
+  cat > "$srcdir/toolchain.cmake" <<CM
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_C_COMPILER $tc/cc)
+set(CMAKE_CXX_COMPILER $tc/c++)
+set(CMAKE_ASM_COMPILER $tc/cc)
+set(CMAKE_AR $tc/ar)
+set(CMAKE_RANLIB $tc/ranlib)
+set(CMAKE_C_FLAGS_INIT "-O2")
+set(CMAKE_CXX_FLAGS_INIT "-O2")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-dynamic -s")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-s")
+set(CMAKE_FIND_ROOT_PATH $root$PREFIX $root/usr)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+set(ENV{PKG_CONFIG_LIBDIR} "$root$PREFIX/lib/pkgconfig:$root$PREFIX/share/pkgconfig")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "$root")
+CM
+  unset PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR CPPFLAGS LDFLAGS CFLAGS CXXFLAGS CC CXX AR RANLIB
 }

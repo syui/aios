@@ -1,0 +1,39 @@
+# libdrm: Direct Rendering Manager のユーザー側のライブラリ (shared, for aios)
+#   Mesa の EGL / Vulkan の Wayland の口が使う (aios にはまだ GPU の DRM はないので、ヘッダーと関数の入れ物として)
+#   pkg/c/zig.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
+pkgname=libdrm
+pkgver=2.4.134
+pkgrel=1
+pkgdesc='Userspace interface to kernel DRM services (shared, for aios)'
+arch=('aarch64')
+url='https://dri.freedesktop.org/'
+license=('MIT')
+depends=('musl')
+makedepends=('meson' 'ninja')
+source=("https://dri.freedesktop.org/libdrm/libdrm-$pkgver.tar.xz")
+sha256sums=('ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95')
+
+prepare() {
+  rm -rf "libdrm-$pkgver"
+  tar -xf "${source[0]##*/}"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  meson_cross
+  cd "libdrm-$pkgver"
+  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled -Dnouveau=disabled -Dvmwgfx=disabled \
+    -Domap=disabled -Dexynos=disabled -Dfreedreno=disabled -Dtegra=disabled -Dvc4=disabled \
+    -Detnaviv=disabled -Dcairo-tests=disabled -Dman-pages=disabled -Dvalgrind=disabled \
+    -Dtests=false -Dudev=false -Dinstall-test-programs=false
+  ninja -C build
+}
+
+package() {
+  cd "libdrm-$pkgver"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -d "$pkgdir/usr/share/licenses/$pkgname"
+  sed -n '1,/\*\//p' xf86drm.c > "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
