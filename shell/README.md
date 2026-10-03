@@ -60,6 +60,10 @@ printf '%s\n' '{"ev":"hello","version":1}' '{"ev":"prompt","pwd":"/tmp"}' | aish
 claude mcp add aish -- aish --mcp     # Claude Code から
 ```
 
+このリポジトリの `.mcp.json` は `bin/aish-mcp.sh` を起こす: aios の中ならそこの aish を、開発の Linux なら
+このリポジトリの aish とプラグインをそのマシン向けにビルドして (`shell/mcp.rc` を読む)。`aish --mcp RC...` で
+設定を足せる。
+
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
   `cd` や変数、関数は次の `run` に残る。時間切れなら子と孫を止めて `status: 124, timeout: true`。
   `exit` はその `run` だけを終える
