@@ -124,10 +124,18 @@ impl Shell {
         } else {
             let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
             let ev = json!({ "args": args, "pwd": pwd, "home": self.get_var("HOME").unwrap_or_default(), "histfile": self.histfile.clone().unwrap_or_default() });
-            match self.plugins.tool(name, ev) {
+            let r = match self.plugins.tool(name, ev) {
                 Some(r) => r,
                 None => json!({ "error": format!("{}: no such tool (or the plugin stopped)", name) }),
+            };
+            // ツールで使ったファイルも、コマンドで使ったのと同じに知らせる (aish-pick の paths に入る)
+            if r.get("error").is_none()
+                && let Some(p) = args["path"].as_str()
+            {
+                self.plugins.tell("preexec", json!({ "line": format!(": {}", super::quote(p)), "pwd": pwd }));
+                self.plugins.tell("precmd", json!({ "status": 0 }));
             }
+            r
         };
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
         json!({ "content": [{ "type": "text", "text": r.to_string() }], "structuredContent": r, "isError": is_err })
@@ -177,6 +185,9 @@ impl Shell {
                 }
             })
         };
+        // プラグインには人が打ったときと同じように知らせる (aish-pick が使ったパスを覚える)
+        let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        self.plugins.tell("preexec", json!({ "line": cmd.trim_end_matches('\n'), "pwd": pwd }));
         let t0 = std::time::Instant::now();
         let mut status = self.run_source(cmd, "run");
         if self.flow != Flow::None {
@@ -204,6 +215,7 @@ impl Shell {
             r["status"] = json!(status);
             r["timeout"] = json!(true);
         }
+        self.plugins.tell("precmd", json!({ "status": status }));
         r
     }
 }

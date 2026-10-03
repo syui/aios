@@ -84,6 +84,11 @@ pub fn run(spec: Spec, mut f: impl FnMut(&str, &Value) -> Value) {
     }
 }
 
+/// 1 行の JSON を読む (読めなければ None)
+pub fn parse(s: &str) -> Option<Value> {
+    serde_json::from_str(s).ok()
+}
+
 /// tool の答え: しくじった
 pub fn error(msg: impl std::fmt::Display) -> Value {
     json!({ "error": msg.to_string() })

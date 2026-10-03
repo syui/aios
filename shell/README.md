@@ -17,8 +17,8 @@ bindkey                       # 一覧
 |---|---|---|
 | `aish-complete` | base | Tab の補完 (コマンド、ファイル、`$変数`) |
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
-| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` |
-| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `undo`。`aish --mcp` で読む |
+| `aish-pick` | base | C-r 履歴 / C-f ファイル / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
+| `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ) `write` `grep` `sed` `lines` (行の番号で) `undo`。`aish --mcp` で読む |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
@@ -63,6 +63,8 @@ claude mcp add aish -- aish --mcp     # Claude Code から
   `cd` や変数、関数は次の `run` に残る。時間切れなら子と孫を止めて `status: 124, timeout: true`。
   `exit` はその `run` だけを終える
 - 設定は対話のときと同じ `/etc/aishrc` と `~/.aishrc`。`AISH_MCP=1` なので `[ -n "$AISH_MCP" ] && ...` で分けられる
+- `paths` (aish-pick) は、コマンドの行とツールで使ったファイルとディレクトリを、使った回数 × 新しさ
+  (zoxide と同じ) で並べる。覚えるのは `~/.cache/aish/paths` (1 行 1 つの JSON)
 - 出力はメモリー (memfd) に受けて答えに入れるだけ、`aish-edit` の取り消しの写しもメモリーだけ。
   ディスクには何も残らないので、リポジトリやイメージにまざらない (`bin/mkdisk.sh` も、ホームの
   `.cache` と履歴、aipkg のキャッシュをイメージに入れない)
@@ -99,8 +101,8 @@ Ctrl-C (SIGINT) は無視するようにして起こされる。aish が終わ�
 | `suggest` | `line` | `{"suggest":"続き"}` | 1 文字打つたびに (カーソルが行の終わりのとき)。→ / End / C-e で決まる |
 | `complete` | `line pos cmds vars path home pwd` | `{"start":N,"cands":[{"text":"...","show":"...","dir":false}]}` | Tab。`start` から `pos` までを `text` と置きかえる (`pos` と `start` は文字の数)。1 つなら決め、たくさんなら aish が並べて選ばせる |
 | `key` | `widget key line pos pwd home histfile` | 下の「キーの答え」 | `keys` / `bindkey` で結んだキー |
-| `preexec` | `line` | `{}` | 行を動かす前 |
-| `precmd` | `status` | `{}` | プロンプトを出す前 |
+| `preexec` | `line pwd` | `{}` | 行を動かす前 (`aish --mcp` の `run` でも) |
+| `precmd` | `status` | `{}` | プロンプトを出す前 (`aish --mcp` では `run` のあと) |
 | `chpwd` | `pwd old` | `{}` | `cd` でディレクトリが変わったとき |
 | `not_found` | `args line pwd status` | `{"status":N}` (引き受けたとき) | コマンドが見つからなかったとき。`{}` なら aish が "command not found" を出す |
 | `tool` | `name args pwd home histfile` | JSON のオブジェクト。しくじったら `{"error":"..."}` | `aish --mcp` でツールが呼ばれたとき (hooks に書かなくても来る)。答えを待ちつづける |
