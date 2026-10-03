@@ -462,3 +462,34 @@ pub fn rg_files(dir: &str, max: usize) -> Option<Vec<String>> {
 pub fn rg_text(v: &Value) -> String {
     v["text"].as_str().map(String::from).unwrap_or_default()
 }
+
+/// 使ったパスの順位 (aish-pick が ~/.cache/aish/paths に書く) の点: 使った回数 × 新しさ
+/// (1 時間以内 4 倍、1 日 2 倍、1 週間 0.5 倍、それより前 0.25 倍。z と同じ)
+pub fn frecency(rank: f64, time: u64, now: u64) -> f64 {
+    let age = now.saturating_sub(time);
+    let w = if age < 3600 {
+        4.0
+    } else if age < 86400 {
+        2.0
+    } else if age < 604800 {
+        0.5
+    } else {
+        0.25
+    };
+    rank * w
+}
+
+/// いまの時刻 (秒)
+pub fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// パス → 点 (aish-pick の paths。ほかのプラグインが「よく使うものを先に」並べるのに使う)
+pub fn path_scores(home: &str) -> std::collections::HashMap<String, f64> {
+    let t = now();
+    let text = std::fs::read_to_string(format!("{}/.cache/aish/paths", home)).unwrap_or_default();
+    text.lines()
+        .filter_map(parse)
+        .filter_map(|v| Some((v["path"].as_str()?.to_string(), frecency(v["rank"].as_f64().unwrap_or(1.0), v["time"].as_u64().unwrap_or(0), t))))
+        .collect()
+}

@@ -156,19 +156,9 @@ impl Db {
 }
 
 impl Entry {
-    /// 使った回数 × 新しさ (1 時間以内 4 倍、1 日 2 倍、1 週間 0.5 倍、それより前 0.25 倍。z と同じ)
+    /// 使った回数 × 新しさ (aish_plugin::frecency)
     fn score(&self, now: u64) -> f64 {
-        let age = now.saturating_sub(self.time);
-        let w = if age < 3600 {
-            4.0
-        } else if age < 86400 {
-            2.0
-        } else if age < 604800 {
-            0.5
-        } else {
-            0.25
-        };
-        self.rank * w
+        aish_plugin::frecency(self.rank, self.time, now)
     }
 }
 

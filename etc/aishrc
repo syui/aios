@@ -9,6 +9,8 @@
 # 基本のプラグイン (base に入っている)
 [ -z "$AISH_MCP" ] && plugin aish-complete && plugin aish-suggest
 plugin aish-pick
+# 定義の場所 (where / outline、M-.)。rg が要る
+plugin aish-map
 # aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、
 # 何かが起きるまで待つ aish-wait も
 [ -n "$AISH_MCP" ] && plugin aish-edit && plugin aish-wait

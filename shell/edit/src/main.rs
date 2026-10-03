@@ -5,7 +5,10 @@
 //   grep   ファイルかディレクトリの下から、行の番号つきで探す (文字か正規表現)
 //   sed    文字か正規表現で置きかえる (行の範囲をしぼれる。正規表現なら $1 で取りだしたもの)
 //   lines  行の番号で置きかえる / 入れる / 消す (old でいまの中身を確かめられる)
-//   undo   edit / write / sed / lines のまえに戻す
+//   hit    grep で見つけた n 番のまわりを読む (パスも行もいらない)
+//   each   grep で見つけた行 (only で番号をしぼる) だけを置きかえる。grep のあと変わった行は飛ばす
+//   undo   edit / write / sed / lines / each のまえに戻す (each は何ファイルでも 1 回で)
+// grep の答えは、よく使うファイル (aish-pick の paths) のものが先で、見つけた行に番号 n がつく
 // aish --mcp で Claude が使う。取り消すための写しはこのプログラムのメモリーにだけ持つ
 // (ディスクに書かないので、リポジトリやイメージに入ることはない。aish が終わると消える)
 use aish_plugin::{Spec, Tool, Value, error, json, s};
@@ -19,11 +22,29 @@ const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pa
 const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
 const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
 
+const HIT: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"grep の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"}},"required":["n"]}"#;
+const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean"},"i":{"type":"boolean"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"}},"required":["pattern","replace"]}"#;
+
 /// 取り消すための写しの数
 const KEEP: usize = 100;
 
+/// いまの呼び出しの組 (tool が来るたびに 1 つ進める)
+static GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// grep で見つけた行 (hit と each が使う)
+struct Hit {
+    path: PathBuf,
+    /// grep の答えに出したパス (each の答えも同じ形で)
+    shown: String,
+    line: usize,
+    /// 見つけたときの行 (each はこれと同じときだけ変える)
+    text: String,
+}
+
 /// 変える前のファイル (なかったなら None)
 struct Snap {
+    /// 1 回の呼び出しで変えたもの (each は何ファイルでも同じ組。undo は組ごと戻す)
+    group: u64,
     path: PathBuf,
     before: Option<Vec<u8>>,
     /// write が作ったディレクトリ (深いものが先。undo で空なら消す)
@@ -42,19 +63,30 @@ fn main() {
             Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}", input: GREP },
             Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", input: SED },
             Tool { name: "lines", desc: "行の番号で置きかえる / 入れる (insert) / 消す (text なし)。old でいまの中身を確かめる。undo で戻せる", input: LINES },
-            Tool { name: "undo", desc: "edit / write / sed / lines のまえに戻す (aish が動いているあいだの 100 回まで)", input: UNDO },
+            Tool { name: "hit", desc: "grep の n 番のまわりを行の番号つきで読む。{n, path, line, text}", input: HIT },
+            Tool { name: "each", desc: "grep で見つけた行だけを置きかえる (only で番号をしぼる)。grep のあとで変わった行は飛ばす。undo 1 回で全部戻る。{changed: [{n, path, line, text}], skipped: [{n, why}]}", input: EACH },
+            Tool { name: "undo", desc: "edit / write / sed / lines / each のまえに戻す (each は 1 回で全部。aish が動いているあいだの 100 回まで)", input: UNDO },
         ],
     };
     let mut snaps: Vec<Snap> = Vec::new();
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut home = String::new();
     aish_plugin::run(spec, |ev, v| match ev {
+        "hello" => {
+            home = s(v, "home").to_string();
+            json!({})
+        }
         "tool" => {
+            GROUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let a = &v["args"];
             let path = resolve(s(v, "pwd"), s(a, "path"));
             match s(v, "name") {
                 "read" => read(&path, a),
                 "edit" => edit(&path, a, &mut snaps),
                 "write" => write(&path, s(a, "content").as_bytes(), &mut snaps),
-                "grep" => grep(s(v, "pwd"), a),
+                "grep" => grep(s(v, "pwd"), a, &home, &mut hits),
+                "hit" => hit(a, &hits),
+                "each" => each(a, &mut hits, &mut snaps),
                 "sed" => sed(&path, a, &mut snaps),
                 "lines" => lines(&path, a, &mut snaps),
                 "undo" => undo(&path, s(a, "path").is_empty(), &mut snaps),
@@ -93,7 +125,47 @@ fn clip_line(l: &str) -> String {
     format!("{}…(+{} chars)", head, l.chars().count() - LINE_MAX)
 }
 
-fn grep(pwd: &str, a: &Value) -> Value {
+fn grep(pwd: &str, a: &Value, home: &str, hits: &mut Vec<Hit>) -> Value {
+    let mut r = grep_raw(pwd, a);
+    if r.get("error").is_none() {
+        let ms = r["matches"].as_array().cloned().unwrap_or_default();
+        r["matches"] = json!(number(ms, pwd, home, hits));
+    }
+    r
+}
+
+/// 見つけたものを、よく使うファイルが先になるように並べ (ファイルの中の順はそのまま)、
+/// 見つけた行に番号 n をつけて hits に覚える。長い行はここで切る
+fn number(ms: Vec<Value>, pwd: &str, home: &str, hits: &mut Vec<Hit>) -> Vec<Value> {
+    let scores = aish_plugin::path_scores(home);
+    // ファイルごとのかたまり (出てきた順)
+    let mut blocks: Vec<(String, Vec<Value>)> = Vec::new();
+    for m in ms {
+        let p = s(&m, "path").to_string();
+        match blocks.last_mut() {
+            Some((q, v)) if *q == p => v.push(m),
+            _ => blocks.push((p, vec![m])),
+        }
+    }
+    let score = |p: &str| scores.get(&resolve(pwd, p).display().to_string()).copied().unwrap_or(0.0);
+    blocks.sort_by(|a, b| score(&b.0).total_cmp(&score(&a.0)));
+    hits.clear();
+    let mut out = Vec::new();
+    for (_, v) in blocks {
+        for mut m in v {
+            let full = s(&m, "text").trim_end_matches(['\n', '\r']).to_string();
+            m["text"] = json!(clip_line(&full));
+            if m.get("ctx").is_none() {
+                hits.push(Hit { path: resolve(pwd, s(&m, "path")), shown: s(&m, "path").to_string(), line: m["line"].as_u64().unwrap_or(0) as usize, text: full });
+                m["n"] = json!(hits.len());
+            }
+            out.push(m);
+        }
+    }
+    out
+}
+
+fn grep_raw(pwd: &str, a: &Value) -> Value {
     let re = match matcher(a) {
         Ok(r) => r,
         Err(e) => return e,
@@ -133,15 +205,15 @@ fn grep(pwd: &str, a: &Value) -> Value {
             }
             count += 1;
             for j in i.saturating_sub(ctx).max(last)..i {
-                out.push(json!({ "path": shown, "line": j + 1, "text": clip_line(ls[j]), "ctx": true }));
+                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
             }
-            out.push(json!({ "path": shown, "line": i + 1, "text": clip_line(l) }));
+            out.push(json!({ "path": shown, "line": i + 1, "text": l }));
             let end = (i + 1 + ctx).min(ls.len());
             for j in i + 1..end {
                 if re.is_match(ls[j]) {
                     break;
                 }
-                out.push(json!({ "path": shown, "line": j + 1, "text": clip_line(ls[j]), "ctx": true }));
+                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
             }
             last = end.max(i + 1);
         }
@@ -151,7 +223,8 @@ fn grep(pwd: &str, a: &Value) -> Value {
 
 /// rg (ripgrep) で探す。rg がなければ None (aish の中のもので探す)
 fn grep_rg(pwd: &str, a: &Value, limit: usize) -> Option<Value> {
-    let mut args: Vec<String> = Vec::new();
+    // 番号が呼ぶたびに変わらないように、パスの順で (rg は 1 つのスレッドで探す)
+    let mut args: Vec<String> = vec!["--sort".into(), "path".into()];
     if !a["regex"].as_bool().unwrap_or(false) {
         args.push("-F".into());
     }
@@ -184,7 +257,7 @@ fn grep_rg(pwd: &str, a: &Value, limit: usize) -> Option<Value> {
         let d = &it["data"];
         let path = aish_plugin::rg_text(&d["path"]);
         let path = path.strip_prefix("./").unwrap_or(&path).to_string();
-        let mut m = json!({ "path": path, "line": d["line_number"], "text": clip_line(&aish_plugin::rg_text(&d["lines"])) });
+        let mut m = json!({ "path": path, "line": d["line_number"], "text": aish_plugin::rg_text(&d["lines"]) });
         if it["type"] == "context" {
             m["ctx"] = json!(true);
         } else {
@@ -353,6 +426,80 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
     }
 }
 
+fn hit(a: &Value, hits: &[Hit]) -> Value {
+    let n = a["n"].as_u64().unwrap_or(0) as usize;
+    let Some(h) = n.checked_sub(1).and_then(|i| hits.get(i)) else { return error(format!("no hit {} (grep found {})", n, hits.len())) };
+    let c = a["context"].as_u64().unwrap_or(5) as usize;
+    let from = h.line.saturating_sub(c).max(1);
+    let mut r = read(&h.path, &json!({ "offset": from, "limit": c * 2 + 1 }));
+    r["n"] = json!(n);
+    r["line"] = json!(h.line);
+    r
+}
+
+fn each(a: &Value, hits: &mut [Hit], snaps: &mut Vec<Snap>) -> Value {
+    let re = match matcher(a) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if hits.is_empty() {
+        return error("grep first");
+    }
+    let only: Vec<usize> = a["only"].as_array().map(|v| v.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect()).unwrap_or_default();
+    let rep = s(a, "replace");
+    let lit = !a["regex"].as_bool().unwrap_or(false);
+    let mut changed = Vec::new();
+    let mut skipped = Vec::new();
+    // ファイルごとに読んで、まとめて書く
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (i, h) in hits.iter().enumerate() {
+        if (only.is_empty() || only.contains(&(i + 1))) && !files.contains(&h.path) {
+            files.push(h.path.clone());
+        }
+    }
+    for f in files {
+        let text = match std::fs::read_to_string(&f) {
+            Ok(t) => t,
+            Err(e) => {
+                skipped.push(json!({ "path": f.display().to_string(), "why": e.to_string() }));
+                continue;
+            }
+        };
+        let mut ls: Vec<String> = text.split_inclusive('\n').map(String::from).collect();
+        let mut any = false;
+        for (i, h) in hits.iter_mut().enumerate() {
+            if h.path != f || !(only.is_empty() || only.contains(&(i + 1))) {
+                continue;
+            }
+            let Some(l) = h.line.checked_sub(1).and_then(|k| ls.get_mut(k)) else {
+                skipped.push(json!({ "n": i + 1, "why": "line is gone" }));
+                continue;
+            };
+            let end = &l[l.trim_end_matches(['\n', '\r']).len()..];
+            let body = l.trim_end_matches(['\n', '\r']);
+            if body != h.text {
+                skipped.push(json!({ "n": i + 1, "why": "changed since grep", "now": clip_line(body) }));
+                continue;
+            }
+            if !re.is_match(body) {
+                skipped.push(json!({ "n": i + 1, "why": "pattern not in this line" }));
+                continue;
+            }
+            let new = if lit { re.replace_all(body, regex::NoExpand(rep)).into_owned() } else { re.replace_all(body, rep).into_owned() };
+            *l = format!("{}{}", new, end);
+            changed.push(json!({ "n": i + 1, "path": h.shown, "line": h.line, "text": clip_line(&new) }));
+            h.text = new;
+            any = true;
+        }
+        if any && let r = write(&f, ls.concat().as_bytes(), snaps)
+            && r.get("error").is_some()
+        {
+            return r;
+        }
+    }
+    json!({ "changed": changed, "skipped": skipped })
+}
+
 fn write(path: &Path, content: &[u8], snaps: &mut Vec<Snap>) -> Value {
     let before = std::fs::read(path).ok();
     // なかったディレクトリ (深いものが先)
@@ -366,7 +513,7 @@ fn write(path: &Path, content: &[u8], snaps: &mut Vec<Snap>) -> Value {
         return error(format!("{}: {}", path.display(), e));
     }
     let created = before.is_none();
-    snaps.push(Snap { path: path.to_path_buf(), before, dirs });
+    snaps.push(Snap { group: GROUP.load(std::sync::atomic::Ordering::Relaxed), path: path.to_path_buf(), before, dirs });
     if snaps.len() > KEEP {
         snaps.remove(0);
     }
@@ -374,21 +521,28 @@ fn write(path: &Path, content: &[u8], snaps: &mut Vec<Snap>) -> Value {
 }
 
 fn undo(path: &Path, latest: bool, snaps: &mut Vec<Snap>) -> Value {
-    let Some(i) = snaps.iter().rposition(|x| latest || x.path == path) else {
-        return error("nothing to undo");
+    // path があればそのファイルの最後の変更、なければいちばん新しい組 (each なら何ファイルでも) をみな
+    let take: Vec<Snap> = if latest {
+        let Some(g) = snaps.last().map(|x| x.group) else { return error("nothing to undo") };
+        let k = snaps.iter().position(|x| x.group == g).unwrap_or(snaps.len());
+        snaps.split_off(k)
+    } else {
+        let Some(i) = snaps.iter().rposition(|x| x.path == path) else { return error("nothing to undo") };
+        vec![snaps.remove(i)]
     };
-    let snap = snaps.remove(i);
-    let r = match &snap.before {
-        Some(b) => std::fs::write(&snap.path, b),
-        None => std::fs::remove_file(&snap.path),
-    };
-    if r.is_ok() {
+    let mut done = Vec::new();
+    for snap in take.iter().rev() {
+        let r = match &snap.before {
+            Some(b) => std::fs::write(&snap.path, b),
+            None => std::fs::remove_file(&snap.path),
+        };
+        if let Err(e) = r {
+            return error(format!("{}: {}", snap.path.display(), e));
+        }
         for d in &snap.dirs {
             let _ = std::fs::remove_dir(d);
         }
+        done.push(json!({ "path": snap.path.display().to_string(), "removed": snap.before.is_none() }));
     }
-    match r {
-        Ok(()) => json!({ "path": snap.path.display().to_string(), "removed": snap.before.is_none() }),
-        Err(e) => error(format!("{}: {}", snap.path.display(), e)),
-    }
+    if done.len() == 1 { done.remove(0) } else { json!({ "undone": done }) }
 }
