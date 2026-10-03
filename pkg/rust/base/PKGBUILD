@@ -71,6 +71,9 @@ package() {
   cp -r "$top/etc" "$pkgdir/etc"
   # 起動のときに起こすモジュール (desktop などのパッケージが置く)
   install -d "$pkgdir/etc/modules-load.d"
+  # OS の名前 (OS を知りたいプログラムは /etc/os-release を読む。ID=aios)
+  install -Dm644 "$startdir/os-release" "$pkgdir/usr/lib/os-release"
+  ln -s ../usr/lib/os-release "$pkgdir/etc/os-release"
   # ~/.aishrc の見本 (使うときに cp する)
   install -Dm644 "$startdir/aishrc.example" "$pkgdir/usr/share/aish/aishrc.example"
   chmod 600 "$pkgdir/etc/shadow"

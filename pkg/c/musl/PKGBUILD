@@ -5,7 +5,7 @@
 # 動的リンクのプログラムを作るのは base-devel の cc -dynamic (ヘッダーは Zig のもの)
 pkgname=musl
 pkgver=1.2.5
-pkgrel=2
+pkgrel=3
 pkgdesc='Lightweight implementation of the C standard library: shared libc.so and the dynamic linker'
 arch=('aarch64')
 url='https://musl.libc.org/'
@@ -43,6 +43,11 @@ package() {
   cd "musl-$pkgver"
   install -Dm755 lib/libc.so "$pkgdir/usr/lib/libc.so"
   ln -s libc.so "$pkgdir/usr/lib/ld-musl-aarch64.so.1"
+  # Alpine と同じ名前 (それをたよりにするプログラムがある) と ldd
+  # (musl のローダーは ldd という名前で呼ばれると、共有ライブラリの一覧を出す)
+  ln -s libc.so "$pkgdir/usr/lib/libc.musl-aarch64.so.1"
+  install -d "$pkgdir/usr/bin"
+  ln -s ../lib/libc.so "$pkgdir/usr/bin/ldd"
   install -d "$pkgdir/etc"
   printf '/usr/lib\n/usr/local/lib\n/opt/c/lib\n' > "$pkgdir/etc/ld-musl-aarch64.path"
   chmod 644 "$pkgdir/etc/ld-musl-aarch64.path"
