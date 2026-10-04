@@ -44,6 +44,12 @@ pub fn intr() {
     mmio::w32(reg(ICR), INT_RX | INT_RT);
     while mmio::r32(reg(FR)) & FR_RXFE == 0 {
         let c = mmio::r32(reg(DR)) as u8;
+        // Ctrl-] : 固まって見えるときのために、すべてのスレッドの状態をじかに出す
+        // (シェルが動かなくても、カーネルが生きていれば出る。Linux の SysRq のかわり)
+        if c == 0x1d {
+            crate::println!("\n{}", crate::proc::threads_text());
+            continue;
+        }
         crate::console::intr(c);
     }
 }
