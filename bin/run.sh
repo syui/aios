@@ -117,7 +117,14 @@ esac
 [ -n "$accel" ] && [ "$accel" != tcg ] && echo "accel: $accel" >&2
 ssh_port=${AIOS_SSH:-2222}
 fwd=
-[ "$ssh_port" != 0 ] && fwd=",hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+if [ "$ssh_port" != 0 ]; then
+  # もう使われている番号 (ほかの aios がまだ動いているなど) なら、転送せずに起動する
+  if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$ssh_port" 2>/dev/null; then
+    echo "ssh: 127.0.0.1:$ssh_port は使われているので転送しません (AIOS_SSH=PORT でほかの番号に)" >&2
+  else
+    fwd=",hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+  fi
+fi
 set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f disk.img ]; then
   set -- "$@" \
