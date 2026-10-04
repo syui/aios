@@ -2,7 +2,8 @@
 Defaults env_reset
 # aipkg などがプロキシを通れるように
 Defaults env_keep += "http_proxy https_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY"
-Defaults secure_path="/usr/bin:/bin"
+# /etc/profile と同じ並び: npm -g / pnpm add -g の /usr/local/bin、[c] のパッケージの /opt/c/bin (node、npm など)
+Defaults secure_path="/usr/local/bin:/usr/bin:/bin:/opt/c/bin"
 
 root ALL=(ALL:ALL) ALL
 %wheel ALL=(ALL:ALL) ALL
