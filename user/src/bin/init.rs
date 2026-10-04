@@ -402,6 +402,13 @@ fn main() {
         eprintln!("init: must be run as pid 1");
         std::process::exit(1);
     }
+    // ホスト名: /etc/hostname をカーネルに (uname の nodename。aios apply の host.name も変える)
+    if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+        let h = h.trim();
+        if !h.is_empty() {
+            unsafe { libc::sethostname(h.as_ptr() as *const libc::c_char, h.len()) };
+        }
+    }
     // モジュール: /etc/modules-load.d/*.conf に書いてあるドライバを起こす (systemd-modules-load と同じ)
     for m in kmod::boot_list() {
         match kmod::load(&m) {

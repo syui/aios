@@ -4,9 +4,22 @@
 //     {"op":"service","action":"start|stop|restart|enable|disable","name":"sshd"}
 //     {"op":"pkg","action":"install|remove|upgrade|refresh","names":["git"]}
 //     {"op":"power","action":"reboot|poweroff"}
+//     {"op":"apply"}      /etc/aios.json のとおりにそろえる (記録は /var/lib/aios/history/N.json)
+//     {"op":"rollback"}   ひとつ前の apply の設定に戻す (/etc/aios.json も戻し、そのとき入れたパッケージは外す)
 //   答え: {"ok":true|false,"status":N,"out":"...","err":"..."}
 // だれが頼んだかは SO_PEERCRED で見る。変える操作は root と wheel のグループの人だけ。
 // したことは /var/log/aiosd.log に 1 行 1 つの JSON で残す。読むだけのこと (状態) は aios get が自分で集める
+#[path = "../lib/config.rs"]
+mod config;
+#[path = "../lib/netif.rs"]
+#[allow(dead_code)]
+mod netif;
+#[path = "../lib/state.rs"]
+#[allow(dead_code)]
+mod state;
+#[path = "../lib/unit.rs"]
+mod unit;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -138,7 +151,20 @@ fn handle(req: &Value, uid: u32, pid: i32) -> Value {
             record(uid, pid, req, 0);
             return json!({ "ok": true, "status": 0 });
         }
-        _ => return fail(format!("unknown op {:?} (ping service pkg power)", op)),
+        "apply" | "rollback" => {
+            if !allowed(uid) {
+                return deny(uid, pid, req);
+            }
+            let _busy = BUSY.lock();
+            let r = if op == "apply" { apply() } else { rollback() };
+            let r = match r {
+                Ok((cfg, rollback_of)) => apply_cfg(&cfg, uid, rollback_of),
+                Err(e) => fail(e),
+            };
+            record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
+            return r;
+        }
+        _ => return fail(format!("unknown op {:?} (ping service pkg power apply rollback)", op)),
     };
     if !allowed(uid) {
         return deny(uid, pid, req);
@@ -171,4 +197,58 @@ fn record(uid: u32, pid: i32, req: &Value, status: i32) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LOG) {
         let _ = writeln!(f, "{}", line);
     }
+}
+
+// ---- /etc/aios.json ----
+
+/// apply: いまの /etc/aios.json
+fn apply() -> Result<(Value, Option<u64>), String> {
+    Ok((config::load(config::PATH)?, None))
+}
+
+/// rollback: 最後の apply の前の設定。/etc/aios.json をそれに戻し、最後の apply で入れたパッケージのうち
+/// 前の設定にないものを外す
+fn rollback() -> Result<(Value, Option<u64>), String> {
+    let h = config::history();
+    let (Some(&last), Some(&prev)) = (h.last(), h.len().checked_sub(2).and_then(|i| h.get(i))) else {
+        return Err("rollback: nothing to roll back to (needs two applies in /var/lib/aios/history)".into());
+    };
+    let (l, p) = (config::read_history(last).ok_or("rollback: cannot read the last record")?, config::read_history(prev).ok_or("rollback: cannot read the record before")?);
+    let cfg = p["config"].clone();
+    std::fs::write(config::PATH, serde_json::to_string_pretty(&cfg).unwrap_or_default() + "\n").map_err(|e| format!("{}: {}", config::PATH, e))?;
+    let keep: Vec<&str> = cfg["pkg"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+    let drop: Vec<String> = l["installed"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).filter(|n| !keep.contains(n)).map(String::from).collect()).unwrap_or_default();
+    if !drop.is_empty() {
+        let _ = Command::new("aipkg").arg("-R").args(&drop).env("PATH", PATH).stdin(std::process::Stdio::null()).output();
+    }
+    Ok((cfg, Some(last)))
+}
+
+/// cfg にそろえて、記録を残す
+fn apply_cfg(cfg: &Value, uid: u32, rollback_of: Option<u64>) -> Value {
+    let steps = match config::plan(cfg) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let mut done = Vec::new();
+    let mut installed: Vec<String> = Vec::new();
+    let mut all_ok = true;
+    for st in &steps {
+        let (ok, out) = config::exec(st, PATH);
+        all_ok &= ok;
+        if let (true, config::Act::Run(cmd)) = (ok, &st.act)
+            && cmd.first().map(String::as_str) == Some("aipkg")
+            && cmd.get(1).map(String::as_str) == Some("-S")
+        {
+            installed.extend(cmd[2..].iter().cloned());
+        }
+        let mut j = st.json();
+        j["ok"] = json!(ok);
+        let tail: String = out.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+        j["out"] = json!(tail);
+        done.push(j);
+    }
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let n = config::write_history(&json!({ "t": t, "uid": uid, "config": cfg, "steps": done, "installed": installed, "rollback_of": rollback_of }));
+    json!({ "ok": all_ok, "n": n, "steps": done })
 }
