@@ -6,7 +6,8 @@
 # Arch の上なら本物の makepkg でも同じものができる: cd pkg/rust/NAME && CARCH=aarch64 makepkg
 #
 # できること: source の git+URL (#tag= #commit= #branch=)、http(s)、PKGBUILD の横のファイル、
-#   sha256sums (SKIP 以外は確かめる)、pkgver()、prepare()、build()、package()。
+#   sha256sums (SKIP 以外は確かめる)、pkgver()、prepare()、build()、package()、
+#   install= (入れたあとなどに aipkg が動かす post_install などの関数。パッケージの .INSTALL になる)。
 #   check() や分割パッケージ、アーカイブの展開はしない (prepare() で tar xf する)
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -118,6 +119,10 @@ make_one() (
   rm -rf "$pkgdir"
   mkdir -p "$pkgdir"
   (cd "$srcdir" && umask 022 && package)
+  if [ -n "$install" ]; then
+    cp "$startdir/$install" "$pkgdir/.INSTALL"
+    chmod 644 "$pkgdir/.INSTALL"
+  fi
 
   fullver=$pkgver-$pkgrel
   [ -n "$epoch" ] && [ "$epoch" != 0 ] && fullver=$epoch:$fullver
