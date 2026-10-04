@@ -1222,7 +1222,7 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
 }
 
 pub fn threads_text() -> alloc::string::String {
-    let mut out = alloc::string::String::from("  PID  TGID ST CHAN             SYSCALL ARG0             ARG1             NAME\n");
+    let mut out = alloc::format!("ticks {}\n  PID  TGID ST CHAN             SYSCALL ARG0             ARG1                 WAKE NAME\n", crate::timer::ticks());
     for p in procs().iter() {
         if p.state == State::Unused {
             continue;
@@ -1235,7 +1235,7 @@ pub fn threads_text() -> alloc::string::String {
         };
         let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
         out.push_str(&alloc::format!(
-            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {}\n",
+            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {:8} {}\n",
             p.pid,
             p.tgid,
             st,
@@ -1243,6 +1243,7 @@ pub fn threads_text() -> alloc::string::String {
             p.last_sys.0,
             p.last_sys.1,
             p.last_sys.2,
+            p.wake_at,
             core::str::from_utf8(&p.comm[..n]).unwrap_or("?")
         ));
     }
