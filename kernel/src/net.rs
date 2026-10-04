@@ -231,7 +231,7 @@ pub fn chan() -> usize {
 /// パケットを出し入れし、待っている人を起こす。タイマ、割り込み、システムコールから呼ぶ
 pub fn poll() {
     let Some(n) = get() else { return };
-    n.iface.poll(now(), &mut n.dev, &mut n.sockets);
+    let changed = n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     dhcp_event(n);
     // 終わった孤児を片付ける
     let sockets = &mut n.sockets;
@@ -243,8 +243,12 @@ pub fn poll() {
         }
         !done
     });
-    proc::wakeup(chan());
-    proc::wakeup(proc::poll_chan());
+    // 起こすのはソケットが変わったときだけ。readiness からも呼ばれるので、いつも起こすと
+    // poll で待つものどうしが起こしあって CPU を使いきる (sshd と sshd-session で固まった)
+    if changed {
+        proc::wakeup(chan());
+        proc::wakeup(proc::poll_chan());
+    }
 }
 
 pub fn intr() {
