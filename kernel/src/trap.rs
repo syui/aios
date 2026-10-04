@@ -154,7 +154,16 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         return;
     }
     crate::smp::lock();
+    // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に
+    let cause = match kind {
+        EL0_SYNC if esr_far().0 >> 26 == EC_SVC64 => crate::smp::Cause::Sys(tf.x[8]),
+        EL0_SYNC => crate::smp::Cause::Fault,
+        _ => crate::smp::Cause::Irq,
+    };
+    let (t0, sw) = (crate::timer::uptime_ns(), crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed));
     handle(tf, kind);
+    let slept = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed) != sw;
+    crate::smp::account(cause, crate::timer::uptime_ns() - t0, slept);
     crate::smp::unlock();
 }
 
