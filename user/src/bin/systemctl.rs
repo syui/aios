@@ -98,14 +98,17 @@ fn main() {
         "enable" | "disable" => {
             for u in &units {
                 code |= if cmd == "enable" { enable(u) } else { disable(u) };
-                if now {
+            }
+            // 入れたばかりのユニットも init が知るように、読みなおしてから start / stop する
+            if code == 0 {
+                ask("daemon-reload", "-");
+            }
+            if now && code == 0 {
+                for u in &units {
                     let (c, out) = ask(if cmd == "enable" { "start" } else { "stop" }, u);
                     print!("{}", out);
                     code |= c;
                 }
-            }
-            if code == 0 {
-                ask("daemon-reload", "-");
             }
         }
         "list-units" | "daemon-reload" | "poweroff" | "reboot" | "halt" => {
