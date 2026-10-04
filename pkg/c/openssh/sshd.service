@@ -1,0 +1,14 @@
+# sshd: systemctl enable --now sshd で、起動のたびに動かす
+# ホストの鍵がなければ、先に sshdgenkeys.service が作る
+[Unit]
+Description=OpenSSH daemon
+Wants=sshdgenkeys.service
+After=sshdgenkeys.service networkd.service
+
+[Service]
+ExecStart=/opt/c/sbin/sshd -D -e
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
