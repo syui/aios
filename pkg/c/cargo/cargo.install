@@ -5,8 +5,11 @@ _t=aarch64-unknown-linux-musl
 _parts="rustc-$_v-$_t:72b20aec5f02fec76f7702749865232c12040222e1604a27fffbf16c5829f7a7
 cargo-$_v-$_t:1c107d9bcf4ab7573b7d3d9c553c543fb6f3b003c1d50fec7bf7fc31644fe7c3
 rust-std-$_v-$_t:202f95c683d30d2f65cb7e3b6b2c7853a364d268bff54dd44a1dcdbb63632374
-rust-std-$_v-aarch64-unknown-none-softfloat:80e2ed8f2d0157d0105c9be5ea4a6396ee61b6aea2e836aaa8eb7e8cafc7fc56"
+rust-std-$_v-aarch64-unknown-none-softfloat:80e2ed8f2d0157d0105c9be5ea4a6396ee61b6aea2e836aaa8eb7e8cafc7fc56
+rust-std-$_v-aarch64-unknown-uefi:65dffe99724de314eb0be224296a9c6d2c25ea040c9b4d1740b7f81c7017686b"
 _list=/usr/lib/rustlib/aios-cargo.files
+# 入れた部品 (_parts そのまま)。同じなら post_upgrade で取りなおさない
+_parts_file=/usr/lib/rustlib/aios-cargo.parts
 _tmp=/var/cache/cargo
 
 _install() {
@@ -37,6 +40,7 @@ _install() {
     rm -rf "$_tmp/$n"
   done
   mv "$_list.new" "$_list"
+  echo "$_parts" > "$_parts_file"
   rm -rf "$_tmp"
   echo "cargo: $(rustc -V) / $(cargo -V)"
 }
@@ -46,7 +50,7 @@ _remove() {
   while read -r f; do
     [ -n "$f" ] && rm -rf "/usr/$f"
   done < "$_list"
-  rm -f "$_list"
+  rm -f "$_list" "$_parts_file"
 }
 
 post_install() {
@@ -54,8 +58,8 @@ post_install() {
 }
 
 post_upgrade() {
-  # Rust の版が同じなら取りなおさない (パッケージの設定だけ変わったとき)
-  if [ -f "$_list" ] && [ "$(rustc -V 2>/dev/null | cut -d' ' -f2)" = "$_v" ]; then
+  # 入れた部品が同じなら取りなおさない (パッケージの設定だけ変わったとき)
+  if [ -f "$_list" ] && [ "$(cat "$_parts_file" 2>/dev/null)" = "$_parts" ]; then
     echo "cargo: Rust $_v is already installed"
     return 0
   fi
