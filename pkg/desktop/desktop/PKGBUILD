@@ -6,13 +6,15 @@
 # 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=desktop
 pkgver=0.0.1
-pkgrel=6
+pkgrel=7
 pkgdesc='aios desktop: screen, input and sound drivers, aiwm (tiling Wayland compositor), aiterm, aifont (with the icons)'
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
 depends=('base' 'aikernel' 'aifont' 'aisplash' 'aiwm' 'aiterm')
-optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)')
+optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)'
+            'mesa: Vulkan / OpenGL を CPU で (lavapipe、llvmpipe)。vulkan-loader と'
+            'xkeyboard-config: winit などの Wayland の窓のキーボード (libxkbcommon)')
 backup=(etc/modules-load.d/desktop.conf)
 
 package() {

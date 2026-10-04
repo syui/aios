@@ -1,11 +1,12 @@
 # base-devel: aios の中で C をビルドする道具 (Arch の base-devel のようなもの)
 #   aipkg -S base-devel
 # cc / c++ / ar / ranlib は Zig を呼ぶだけ。できるのは aios で動く静的なバイナリ (aarch64-linux-musl)。
-#   cc -dynamic で動的リンク、cc -shared -fPIC で共有ライブラリ (動かすには musl)
+#   cc -dynamic で動的リンク、cc -shared -fPIC で共有ライブラリ (動かすには musl)。
+#   rustc がリンカとして使うときは、rustc の crt-static に合わせる (aios の cargo は動的リンクが既定。cargo.sh)
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
 pkgname=base-devel
 pkgver=0.0.1
-pkgrel=5
+pkgrel=6
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'
 arch=('any')
 url='https://github.com/syui/aios'
@@ -23,16 +24,21 @@ package() {
     cat > "$d/$1" <<SH
 #!/bin/sh
 link=-static
+rustc= static=
 # --target= は外す (cc crate などが Rust の名前 aarch64-unknown-linux-musl で渡すが、zig は知らない。
-# 下で -target aarch64-linux-musl を渡す)
+# 下で -target aarch64-linux-musl を渡す)。rustc がリンカとして渡す --fix-cortex-a53-843419 も zig は知らない
 for a in "\$@"; do
   shift
   case "\$a" in
-    --target=*) continue ;;
+    --target=*|-Wl,--fix-cortex-a53-843419) continue ;;
     -dynamic|-shared) link= ;;
+    -nodefaultlibs) rustc=1 ;;
+    -static|-static-pie) static=1 ;;
   esac
   set -- "\$@" "\$a"
 done
+# rustc のリンカとして (-nodefaultlibs) -static なしで呼ばれたら動的リンク (target-feature=-crt-static。cargo.sh)
+[ -n "\$rustc" ] && [ -z "\$static" ] && link=
 exec /opt/zig/zig $2 -target aarch64-linux-musl \$link -fno-sanitize=undefined -I/opt/c/include -L/opt/c/lib "\$@"
 SH
     chmod 755 "$d/$1"

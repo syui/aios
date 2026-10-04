@@ -3,17 +3,22 @@
 #   static.rust-lang.org から取ってきて /usr に入れる (sha256 を確かめる)。大きい (取るのは 330 MB、入れると 1 GB ほど) ので
 #   パッケージには入れない (git.syui.ai は 1 回 100 MB まで)。rust-std は aarch64-unknown-linux-musl
 #   (aios のユーザープログラム)、aarch64-unknown-none-softfloat (aios のカーネル)、aarch64-unknown-uefi (aiboot)。
-#   リンクは rust-lld (/etc/profile.d/cargo.sh で CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld)。
+#   リンクは base-devel の cc (zig) で動的リンクが既定 (Alpine と同じ。dlopen で libvulkan などを読む crate のため)。
+#   base-devel がなければ rust-lld で静的リンク (/etc/profile.d/cargo.sh)。
 #   C の部分がある crate は base-devel (zig の cc) で。入れたファイルは /usr/lib/rustlib/aios-cargo.files
 pkgname=cargo
 pkgver=1.99.0
-pkgrel=4
+pkgrel=5
 pkgdesc='Rust compiler and cargo, installed from static.rust-lang.org (aarch64-unknown-linux-musl)'
 arch=('any')
 url='https://www.rust-lang.org'
 license=('MIT' 'Apache-2.0')
 depends=('musl' 'libunwind' 'curl')
-optdepends=('base-devel: cc and ar for crates with C code (ring and others)')
+optdepends=('base-devel: cc and ar for crates with C code (ring and others), and dynamic linking'
+            'vulkan-loader: Vulkan (ash など) のプログラム'
+            'mesa: Vulkan と OpenGL を CPU で (lavapipe、llvmpipe)'
+            'xkeyboard-config: winit などの Wayland の窓でキーボードを使う'
+            'alsa-lib: 音 (cpal など)')
 install=cargo.install
 
 package() {
