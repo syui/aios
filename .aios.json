@@ -26,7 +26,7 @@
   "pkg": {
     "aios": {
       "rust":    { "aiboot": "0.0.1", "aikernel": "0.0.1", "base": "0.0.1", "aigpt": "0.0.1", "ailog": "0.0.1" },
-      "c":       { "base-devel": "0.0.1" },
+      "c":       { "base-devel": "0.0.1", "claude": "0.0.1" },
       "shell":   { "aish-powerline": "0.0.1" },
       "desktop": { "aifont": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
     },
@@ -54,7 +54,7 @@
         "libunwind": "0.16.0", "nodejs": "26.10.0",
         "imagemagick": ""
       },
-      "npm": { "pnpm": "12.9.1", "@anthropic-ai/claude-code": "2.1.288" },
+      "npm": { "pnpm": "12.9.1", "@anthropic-ai/claude-code": "2.1.289 (ap -S claude)" },
       "uv":  { "python": "3.14.8" }
     }
   }

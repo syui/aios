@@ -1,0 +1,17 @@
+# claude: Claude Code を npm で入れるパッケージ (sudo ap -S claude)。
+#   本体はこのパッケージに入れない (Anthropic のもの)。入れたとき (post_install) に
+#   npm install -g --libc=musl で @anthropic-ai/claude-code を /usr/local に取ってくる。
+#   ap -Syu でこのパッケージが上がると、claude も新しくする。ap -R claude で npm からも消す
+pkgname=claude
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Claude Code, installed from npm (@anthropic-ai/claude-code, musl)'
+arch=('any')
+url='https://code.claude.com'
+license=('custom')
+depends=('nodejs')
+install=claude.install
+
+package() {
+  install -Dm644 "$startdir/claude.install" "$pkgdir/usr/share/claude/claude.install"
+}
