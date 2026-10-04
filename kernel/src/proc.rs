@@ -583,6 +583,7 @@ pub fn scheduler() -> ! {
 /// スケジューラへ戻る。state は呼ぶ側が変えておく
 fn sched() {
     debug_assert!(crate::smp::holding(), "sched without the big kernel lock");
+    crate::smp::SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let p = current();
     unsafe {
         fp_save(&mut p.fp);

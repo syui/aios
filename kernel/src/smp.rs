@@ -12,7 +12,7 @@
 // 起きた CPU は boot.rs と同じページ表で MMU を入れ、自分のスタックでスケジューラに入る。
 // TPIDR_EL1 に CPU の番号を入れておく。
 use crate::memlayout::{p2v, v2p};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const MAXCPU: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
@@ -78,13 +78,148 @@ static BKL: AtomicUsize = AtomicUsize::new(0);
 pub fn lock() {
     let me = id() + 1;
     debug_assert!(BKL.load(Ordering::Relaxed) != me, "BKL: cpu{} locks twice", me - 1);
+    let t0 = crate::timer::uptime_ns();
     while BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
+    let t1 = crate::timer::uptime_ns();
+    let c = &STATS.cpu[me - 1];
+    c.wait.fetch_add(t1 - t0, Ordering::Relaxed);
+    c.locks.fetch_add(1, Ordering::Relaxed);
+    c.since.store(t1, Ordering::Relaxed);
 }
 
 pub fn unlock() {
+    let c = &STATS.cpu[id()];
+    c.hold.fetch_add(crate::timer::uptime_ns().saturating_sub(c.since.load(Ordering::Relaxed)), Ordering::Relaxed);
     BKL.store(0, Ordering::Release);
+}
+
+// ---- 大きなロックの統計 (/proc/bkl。ロックを細かくするとき、どこから分けるかを決めるため) ----
+
+const NSYS: usize = 512;
+
+struct CpuStat {
+    /// ロックを待っていた時間 (ns)
+    wait: AtomicU64,
+    /// ロックを持っていた時間 (ns)
+    hold: AtomicU64,
+    locks: AtomicU64,
+    /// いま持ちはじめた時刻
+    since: AtomicU64,
+}
+
+struct Stats {
+    cpu: [CpuStat; MAXCPU],
+    /// システムコールの番号ごとの (回数, ロックを持っていた時間)。途中で眠ったもの (wait4 など) はのぞく
+    sys: [(AtomicU64, AtomicU64); NSYS],
+    fault: (AtomicU64, AtomicU64),
+    irq: (AtomicU64, AtomicU64),
+    /// 途中で眠ったので数えなかったもの
+    slept: AtomicU64,
+    /// 数えはじめた時刻 (書くと 0 からやりなおす)
+    start: AtomicU64,
+}
+
+const Z: AtomicU64 = AtomicU64::new(0);
+static STATS: Stats = Stats {
+    cpu: [const { CpuStat { wait: Z, hold: Z, locks: Z, since: Z } }; MAXCPU],
+    sys: [const { (Z, Z) }; NSYS],
+    fault: (Z, Z),
+    irq: (Z, Z),
+    slept: Z,
+    start: Z,
+};
+
+/// スケジューラでほかのプロセスへ切りかえた回数 (ロックを持ったまま眠ったかを見る)
+pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// 例外 1 つぶんの、ロックを持っていた時間を数える (trap.rs)。sys はシステムコールの番号
+pub enum Cause {
+    Sys(u64),
+    Fault,
+    Irq,
+}
+
+pub fn account(cause: Cause, ns: u64, slept: bool) {
+    if slept {
+        STATS.slept.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let slot = match cause {
+        Cause::Sys(n) if (n as usize) < NSYS => &STATS.sys[n as usize],
+        Cause::Sys(_) => return,
+        Cause::Fault => &STATS.fault,
+        Cause::Irq => &STATS.irq,
+    };
+    slot.0.fetch_add(1, Ordering::Relaxed);
+    slot.1.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 数えなおす (/proc/bkl に書く)
+pub fn stats_reset() {
+    for c in &STATS.cpu {
+        c.wait.store(0, Ordering::Relaxed);
+        c.hold.store(0, Ordering::Relaxed);
+        c.locks.store(0, Ordering::Relaxed);
+    }
+    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq]) {
+        n.store(0, Ordering::Relaxed);
+        t.store(0, Ordering::Relaxed);
+    }
+    STATS.slept.store(0, Ordering::Relaxed);
+    STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+}
+
+/// /proc/bkl
+pub fn stats() -> alloc::string::String {
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let span = crate::timer::uptime_ns().saturating_sub(STATS.start.load(Ordering::Relaxed)).max(1);
+    let pct = |ns: u64| ns as f64 * 100.0 / span as f64;
+    let mut s = String::new();
+    s.push_str(&format!("# 大きなロック (BKL)。{:.1} 秒のあいだ (echo > /proc/bkl で数えなおす)
+", span as f64 / 1e9));
+    s.push_str("cpu      wait (待った)          hold (持っていた)        locks
+");
+    let (mut tw, mut th) = (0, 0);
+    for (i, c) in STATS.cpu.iter().enumerate().take(online()) {
+        let (w, h) = (c.wait.load(Ordering::Relaxed), c.hold.load(Ordering::Relaxed));
+        tw += w;
+        th += h;
+        s.push_str(&format!("{:<4} {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%  {:>10}
+", i, ms(w), pct(w), ms(h), pct(h), c.locks.load(Ordering::Relaxed)));
+    }
+    s.push_str(&format!("all  {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%   (1 CPU = 100%)
+
+", ms(tw), pct(tw), ms(th), pct(th)));
+    // 持っていた時間の長いもの (眠らなかったものだけ)
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
+    for (i, (n, t)) in STATS.sys.iter().enumerate() {
+        let n = n.load(Ordering::Relaxed);
+        if n > 0 {
+            let name = crate::syscall::name(i as u64).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase());
+            rows.push((name, n, t.load(Ordering::Relaxed)));
+        }
+    }
+    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
+        let n = slot.0.load(Ordering::Relaxed);
+        if n > 0 {
+            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
+        }
+    }
+    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
+    s.push_str("hold の長いもの            回数       合計       平均
+");
+    for (name, n, t) in rows.iter().take(25) {
+        s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
+", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
+    }
+    s.push_str(&format!("(途中で眠ったので数えなかったもの: {})
+", STATS.slept.load(Ordering::Relaxed)));
+    s
 }
 
 /// この CPU がロックを持っているか

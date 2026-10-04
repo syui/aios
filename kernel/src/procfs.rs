@@ -29,6 +29,7 @@ enum Node {
     Swaps,
     Threads,
     Strace,
+    Bkl,
     Sysstat,
     Modules,
     NetDir,
@@ -80,6 +81,7 @@ impl ProcInode {
             Node::Swaps => 10,
             Node::Threads => 31,
             Node::Strace => 32,
+            Node::Bkl => 34,
             Node::Sysstat => 33,
             Node::Modules => 12,
             Node::Route => 11,
@@ -152,6 +154,7 @@ impl ProcInode {
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
             Node::Strace => crate::syscall::strace_get(),
+            Node::Bkl => crate::smp::stats(),
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
@@ -301,7 +304,7 @@ impl Inode for ProcInode {
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::SelfLink | Node::Cwd(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
-            Node::Strace => S_IFREG | 0o644,
+            Node::Strace | Node::Bkl => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
         };
         let now = crate::timer::epoch_ns();
@@ -325,12 +328,17 @@ impl Inode for ProcInode {
             crate::syscall::strace_set(b);
             return Ok(b.len());
         }
+        // /proc/bkl: 書くと (root) 大きなロックの統計を 0 から数えなおす
+        if self.node == Node::Bkl && crate::cred::current().euid == 0 {
+            crate::smp::stats_reset();
+            return Ok(b.len());
+        }
         Err(-EACCES)
     }
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // > /proc/strace (O_TRUNC) は受けつける
-        if self.node == Node::Strace && crate::cred::current().euid == 0 {
+        if matches!(self.node, Node::Strace | Node::Bkl) && crate::cred::current().euid == 0 {
             return Ok(());
         }
         Err(-EACCES)
@@ -362,6 +370,7 @@ impl Inode for ProcInode {
             (Node::Root, "swaps") => Node::Swaps,
             (Node::Root, "threads") => Node::Threads,
             (Node::Root, "strace") => Node::Strace,
+            (Node::Root, "bkl") => Node::Bkl,
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
@@ -403,6 +412,7 @@ impl Inode for ProcInode {
                 add("swaps".into(), Node::Swaps);
                 add("threads".into(), Node::Threads);
                 add("strace".into(), Node::Strace);
+                add("bkl".into(), Node::Bkl);
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
