@@ -30,6 +30,7 @@ enum Node {
     Threads,
     Strace,
     Bkl,
+    Kmsg,
     Sysstat,
     Modules,
     NetDir,
@@ -82,6 +83,7 @@ impl ProcInode {
             Node::Threads => 31,
             Node::Strace => 32,
             Node::Bkl => 34,
+            Node::Kmsg => 35,
             Node::Sysstat => 33,
             Node::Modules => 12,
             Node::Route => 11,
@@ -155,6 +157,7 @@ impl ProcInode {
             Node::Threads => proc::threads_text(),
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
+            Node::Kmsg => crate::kmsg::text(),
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
@@ -371,6 +374,7 @@ impl Inode for ProcInode {
             (Node::Root, "threads") => Node::Threads,
             (Node::Root, "strace") => Node::Strace,
             (Node::Root, "bkl") => Node::Bkl,
+            (Node::Root, "kmsg") => Node::Kmsg,
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
@@ -413,6 +417,7 @@ impl Inode for ProcInode {
                 add("threads".into(), Node::Threads);
                 add("strace".into(), Node::Strace);
                 add("bkl".into(), Node::Bkl);
+                add("kmsg".into(), Node::Kmsg);
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
