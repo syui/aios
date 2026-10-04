@@ -486,6 +486,12 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             }
         }
     }
+    // ハンドラを呼ばなかったなら、sigsuspend / ppoll などで一時的に変えたマスクを戻す
+    if !handled {
+        if let Some(m) = p.saved_mask.take() {
+            p.sig_mask = m;
+        }
+    }
     // ハンドラが呼ばれずに割り込みが終わったなら、黙ってやり直す
     if !handled {
         if let Some(r) = interrupted {
@@ -584,6 +590,25 @@ pub fn rt_sigsuspend(set: usize) -> R {
         }
         proc::sleep_until(0, 0).ok();
     }
+}
+
+/// ppoll / pselect6 / epoll_pwait の sigmask: 待つあいだだけマスクを set にする (0 ならそのまま)。
+/// 前のマスクは saved_mask にとっておき、システムコールのあとの deliver が戻す
+/// (シグナルで起きたなら、ハンドラから戻るとき (sigreturn) に戻る)
+pub fn wait_mask(set: usize) -> Result<(), i64> {
+    if set == 0 {
+        return Ok(());
+    }
+    let new = read_u64(set)? & !UNBLOCKABLE;
+    let p = proc::current();
+    p.saved_mask = Some(p.saved_mask.unwrap_or(p.sig_mask));
+    p.sig_mask = new;
+    Ok(())
+}
+
+/// pselect6 の 6 番目の引数 ({ sigset_t *ss; size_t len; }) から sigset のアドレスを
+pub fn pselect_mask(arg: usize) -> Result<usize, i64> {
+    if arg == 0 { Ok(0) } else { read_u64(arg).map(|v| v as usize) }
 }
 
 /// set のどれかがたまるまで待って、それを取り出す

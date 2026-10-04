@@ -209,13 +209,19 @@ fn cross(i: InodeRef) -> InodeRef {
 
 /// cwd (先頭 / なし) を基準に path を絶対化し、. と .. を畳む
 pub fn normalize(cwd: &str, path: &str) -> String {
+    // chroot: / はプロセスのルートから始まり、.. はルートより上に出ない
+    let root = crate::proc::current_root();
     let mut parts: Vec<&str> = Vec::new();
-    let base = if path.starts_with('/') { "" } else { cwd };
+    let base = if path.starts_with('/') { root.as_str() } else { cwd };
+    let inside = !root.is_empty() && (base == root || base.starts_with(&(root.clone() + "/")));
+    let floor = if inside { root.split('/').filter(|c| !c.is_empty()).count() } else { 0 };
     for c in base.split('/').chain(path.split('/')) {
         match c {
             "" | "." => {}
             ".." => {
-                parts.pop();
+                if parts.len() > floor {
+                    parts.pop();
+                }
             }
             c => parts.push(c),
         }

@@ -85,6 +85,8 @@ pub struct Fd {
 pub struct Files {
     pub fds: Vec<Option<Fd>>,
     pub cwd: String,
+    /// chroot のルート (先頭 / なし、"" は本当のルート。fork と exec で受けつぐ)
+    pub root: String,
     /// RLIMIT_NOFILE のソフトの上限 (fork と exec で受けつぐ)
     pub nofile: usize,
     /// 作るファイルの mode から外すもの (umask。fork で受けつぐ。Linux の fs_struct と同じくスレッドで共有)
@@ -357,6 +359,14 @@ pub fn current_cwd() -> String {
     }
 }
 
+/// chroot のルート。current がないときは本当のルート
+pub fn current_root() -> String {
+    match cur() {
+        Some(i) => procs()[i].files().root.clone(),
+        None => String::new(),
+    }
+}
+
 pub fn nprocs() -> usize {
     procs().iter().filter(|p| p.state != State::Unused).count()
 }
@@ -496,7 +506,7 @@ pub fn user_init() {
     }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
-    let mut files = Files { fds: Vec::new(), cwd: String::new(), nofile: NOFILE_SOFT, umask: 0o022 };
+    let mut files = Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022 };
     let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);
