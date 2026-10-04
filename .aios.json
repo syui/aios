@@ -12,6 +12,23 @@
     "uv":      { "lang": "Python", "prefix": "~/.local",   "via": "uv python install / uv tool install" }
   },
 
+  "toolchain": {
+    "rust":  { "via": "ap -S cargo base-devel", "target": "aarch64-unknown-linux-musl",
+               "link": "dynamic with cc (zig), like Alpine. static: RUSTFLAGS=\"-C target-feature=+crt-static\"" },
+    "c":     { "via": "ap -S base-devel", "cc": "zig cc (static by default, cc -dynamic for dynamic)" }
+  },
+
+  "graphics": {
+    "vulkan": "lavapipe (mesa, on the CPU)", "gl": "llvmpipe (mesa, EGL / GLES)", "wsi": "Wayland (aiwm)",
+    "pkg":    "ap -S desktop mesa vulkan-loader xkeyboard-config alsa-lib",
+    "tested": ["vkcube", "ai/engine (ash + winit + cpal)"]
+  },
+
+  "aish": {
+    "plugins": ["complete", "suggest", "pick", "edit", "wait", "map", "fix", "claude"],
+    "mcp":     "aish --mcp (run, job, and the plugins' tools)"
+  },
+
   "kernel": {
     "boot": ["UEFI (aiboot)", "Linux arm64 Image", "DTB", "Raspberry Pi 3"],
     "cpu":  ["SMP (PSCI, spin-table)", "GICv2", "GICv3"],
