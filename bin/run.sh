@@ -16,6 +16,7 @@
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
 # ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
+# AIOS_MEM=SIZE でメモリ (既定 2G。Claude Code (Bun) は 512M では足りない)
 # AIOS_DISPLAY=1 で画面の窓を出す (virtio-gpu と virtio のキーボード・タブレット。Mac は cocoa、
 #   ほかは gtk)。AIOS_DISPLAY=cocoa / gtk / sdl / none で選べる。シリアル (この端末) もそのまま使える
 #   音 (virtio-sound、QEMU 8.2 から) もつける: Mac は coreaudio、ほかは pipewire / pa / alsa のあるもの。
@@ -165,10 +166,10 @@ if [ -n "$uefi" ]; then
   fi
   echo "boot: UEFI ($uefi) from disk.img" >&2
   # shellcheck disable=SC2086
-  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" $out "$@" \
+  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-2G}" $out "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"
   exit
 fi
 # shellcheck disable=SC2086
-qemu-system-aarch64 -machine "$machine" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-512M}" $out "$@" \
+qemu-system-aarch64 -machine "$machine" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-2G}" $out "$@" \
   -kernel "$k" -append "${AIOS_CMDLINE:-}"
