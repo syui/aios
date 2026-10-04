@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const IRQ: u32 = crate::irq::TIMER;
 pub const HZ: u64 = 100;
 
+/// 前の割り込みのときの tick (cpu0 だけが使う)
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn freq() -> u64 {
@@ -55,8 +56,10 @@ pub fn epoch_ns() -> u64 {
     BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + uptime_ns()
 }
 
+/// 起動してからの tick (HZ 分の 1 秒)。割り込みの回数ではなく、カウンタ (CNTVCT) から計算する。
+/// 割り込みは遅れたりまとまったりする (Mac の HVF では特に) ので、数えると時計が遅れる
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    uptime_ns() / (1_000_000_000 / HZ)
 }
 
 /// 仕事がなくて眠る CPU (cpu0 以外) はタイマを止める (起こすのは IPI。時刻や期限は cpu0 が見る)。
@@ -86,12 +89,13 @@ pub fn tick() {
         rearm();
         return;
     }
-    let now = TICKS.load(Ordering::Relaxed) + 1;
-    TICKS.store(now, Ordering::Relaxed);
+    // 前の割り込みから何 tick も進んでいることがある (期限は <= で比べるので、飛んでもよい)
+    let now = ticks();
+    let prev = TICKS.swap(now, Ordering::Relaxed);
     crate::proc::wake_expired(now);
     crate::signal::tick(now);
-    // TCP の再送などのため、ときどき回す
-    if now % 5 == 0 {
+    // TCP の再送などのため、ときどき (5 tick ごと) 回す
+    if now / 5 != prev / 5 {
         crate::net::poll();
     }
     rearm();
