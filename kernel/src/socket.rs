@@ -561,6 +561,15 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
         return Ok(0);
     }
     let s = sock_of(fd)?;
+    const IPPROTO_IP: u64 = 0;
+    const IP_OPTIONS: u64 = 4;
+    if (level, opt) == (IPPROTO_IP, IP_OPTIONS) {
+        // IP オプションはない (長さ 0)。4 バイトの 0 を返すと sshd は「オプションつき」として切る
+        if lenp != 0 {
+            proc::current().pt().copy_out(lenp, &0u32.to_le_bytes()).ok_or(-EFAULT)?;
+        }
+        return Ok(0);
+    }
     let v: i32 = match (level, opt) {
         (SOL_SOCKET, SO_ERROR) => {
             // 非同期 connect の結果
