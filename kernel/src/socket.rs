@@ -34,10 +34,8 @@ const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_DONTWAIT: u64 = 0x40;
 
-/// TCP の受けと送りのバッファ。受けの窓はこれより大きくならない (smoltcp はこの大きさから窓のスケールを決める)。
-/// 64KB では遠いところ (往復が長い) から速く受けられないので、Linux がよく使う大きさに
-const TCP_RX: usize = 1024 * 1024;
-const TCP_TX: usize = 256 * 1024;
+const TCP_RX: usize = 64 * 1024;
+const TCP_TX: usize = 32 * 1024;
 const CONNECT_TIMEOUT_TICKS: u64 = 30 * crate::timer::HZ;
 
 #[derive(PartialEq)]
