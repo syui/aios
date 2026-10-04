@@ -1004,7 +1004,12 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
 }
 
 pub fn getcwd(buf: usize, len: usize) -> R {
-    let cwd = proc::current().files().cwd.clone();
+    let files = proc::current().files();
+    // chroot の中ではルートからのパス
+    let cwd = match files.cwd.strip_prefix(files.root.as_str()) {
+        Some(c) if !files.root.is_empty() && (c.is_empty() || c.starts_with('/')) => String::from(c.trim_start_matches('/')),
+        _ => files.cwd.clone(),
+    };
     let mut s = Vec::with_capacity(cwd.len() + 2);
     s.push(b'/');
     s.extend_from_slice(cwd.as_bytes());
@@ -1028,6 +1033,21 @@ pub fn chdir(pathp: usize) -> R {
     Ok(0)
 }
 
+/// chroot(path): このプロセス (と子) の / を path にする。root だけ
+pub fn chroot(pathp: usize) -> R {
+    let path = user_str(pathp)?;
+    if cred::current().euid != 0 {
+        return Err(-cred::EPERM);
+    }
+    let files = proc::current().files();
+    let (full, ino) = vfs::lookup(&files.cwd, &path, true)?;
+    if !ino.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    files.root = full;
+    Ok(0)
+}
+
 pub fn fchdir(fd: u64) -> R {
     let f = file_of(fd)?;
     let path = match &f.borrow().kind {
@@ -1045,7 +1065,7 @@ const POLLERR: i16 = 0x8;
 const POLLHUP: i16 = 0x10;
 const POLLNVAL: i16 = 0x20;
 
-/// ppoll(fds, nfds, timeout) (シグナルマスクは無視)
+/// ppoll(fds, nfds, timeout) (シグナルマスクは syscall.rs で signal::wait_mask)
 pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
     if nfds > proc::NOFILE {
         return Err(-EINVAL);
@@ -1112,7 +1132,7 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
 
 /// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask): ppoll と同じ待ち方を fd_set (ビットの並び) で。
 /// 読める = データがあるか相手が閉じた、書ける = 書けるか相手が閉じた。例外 (帯域外データ) はないので空にする。
-/// sigmask は ppoll と同じく見ない
+/// sigmask は ppoll と同じく signal::wait_mask で
 pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
     if nfds > proc::NOFILE {
         return Err(-EINVAL);

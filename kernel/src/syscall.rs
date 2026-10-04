@@ -61,6 +61,7 @@ mod nr {
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
     pub const FCHDIR: u64 = 50;
+    pub const CHROOT: u64 = 51;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const FCHOWNAT: u64 = 54;
@@ -245,8 +246,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         INOTIFY_RM_WATCH => crate::inotify::rm_watch(a[0], a[1] as i32),
         EPOLL_CREATE1 => crate::epoll::create1(a[0]),
         EPOLL_CTL => crate::epoll::ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
-        EPOLL_PWAIT => crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ticks(int(a[3]))),
-        EPOLL_PWAIT2 => crate::epoll::pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize),
+        EPOLL_PWAIT => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ticks(int(a[3])))),
+        EPOLL_PWAIT2 => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize)),
         // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
@@ -269,6 +270,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FALLOCATE => sysfile::fallocate(a[0], a[1], a[2] as i64, a[3] as i64),
         MEMFD_CREATE => sysfile::memfd_create(a[0] as usize, a[1]),
         FCHDIR => sysfile::fchdir(a[0]),
+        CHROOT => sysfile::chroot(a[0] as usize),
         FCHMOD => sysfile::fchmod(a[0], a[1]),
         FCHMODAT => sysfile::fchmodat(int(a[0]), a[1] as usize, a[2]),
         FCHOWN => sysfile::fchown(a[0], a[1], a[2]),
@@ -295,8 +297,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         READLINKAT => sysfile::readlinkat(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
         NEWFSTATAT => sysfile::newfstatat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
-        PPOLL => sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize),
-        PSELECT6 => sysfile::pselect6(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize),
+        PPOLL => signal::wait_mask(a[3] as usize).and_then(|_| sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize)),
+        PSELECT6 => signal::pselect_mask(a[5] as usize).and_then(signal::wait_mask).and_then(|_| sysfile::pselect6(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
         SOCKET => socket::socket(a[0], a[1], a[2]),
         SOCKETPAIR => socket::socketpair(a[0], a[1], a[3] as usize),
         BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),
@@ -449,9 +451,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
-    if let Err(e) = r {
-        strace(nr, &a, e);
-    }
+    strace(nr, &a, r);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
     (r == Err(-EINTR_)).then_some(Restart { restartable })
@@ -493,7 +493,8 @@ pub fn sysstat() -> alloc::string::String {
     s
 }
 
-/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを出す (調べもの用)
+/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを出す (調べもの用)。
+/// 名前の頭に + をつけると、うまくいったものも出す。名前は , で区切っていくつも書ける
 static mut STRACE: [u8; 16] = [0; 16];
 
 pub fn strace_set(name: &[u8]) {
@@ -511,18 +512,28 @@ pub fn strace_get() -> alloc::string::String {
     alloc::format!("{}\n", core::str::from_utf8(&s[..n]).unwrap_or(""))
 }
 
-fn strace(nr: u64, a: &[u64], e: i64) {
+/// いまのプロセスを strace で見ているか (見るなら、うまくいったものも出すか)
+fn strace_on() -> Option<bool> {
     let s = unsafe { &*(&raw const STRACE) };
     let n = s.iter().position(|&c| c == 0).unwrap_or(16);
+    if n == 0 {
+        return None;
+    }
+    let all = s[0] == b'+';
+    let name = if all { &s[1..n] } else { &s[..n] };
+    let p = proc::current_leader();
+    name.split(|&c| c == b',').any(|n| !n.is_empty() && p.comm.starts_with(n)).then_some(all)
+}
+
+fn strace(nr: u64, a: &[u64], r: R) {
+    let Some(all) = strace_on() else { return };
+    let e = r.unwrap_or_else(|e| e);
     // EAGAIN / EINTR / ETIMEDOUT はよくあるので出さない
-    if n == 0 || matches!(-e, 11 | 4 | 110) {
+    if !all && (r.is_ok() || matches!(-e, 11 | 4 | 110)) {
         return;
     }
     let p = proc::current_leader();
-    if !p.comm.starts_with(&s[..n]) {
-        return;
-    }
-    println!("strace [{} {}] {}({:#x}, {:#x}, {:#x}) = {}", p.pid, proc::current().pid, nr, a[0], a[1], a[2], e);
+    println!("strace [{} {}] t={} {}({:#x}, {:#x}, {:#x}) = {}", p.pid, proc::current().pid, crate::timer::ticks(), nr, a[0], a[1], a[2], e);
 }
 
 type R = Result<i64, i64>;
