@@ -76,7 +76,7 @@ fi
 if [ -z "$uefi" ]; then [ -n "$k" ] && [ -f "$k" ] || k=$dev; fi
 if [ -z "$uefi" ] && [ ! -f "$k" ]; then
   echo "./bin/run.sh: 起動するものがありません。どれかを:" >&2
-  echo "  curl -fLO https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst" >&2
+  echo "  curl -fLO https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst" >&2
   echo "  bin/mkrootfs.sh -r all && cargo run" >&2
   exit 1
 fi
