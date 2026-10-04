@@ -1,17 +1,25 @@
 # libunwind: C++ の例外をほどく (_Unwind_*) 共有ライブラリを、libgcc_s.so.1 の名前で入れる
 #   gcc の libgcc_s のかわり。Node (unofficial-builds の musl のもの) などが使う。
 #   Zig の中にある LLVM の libunwind を Zig で作る (gcc は要らない)。musl のローダーは記号の版 (@GCC_3.0 など) を
-#   見ないので、版なしで足りる。__clear_cache (libgcc_s にあるもの。V8 が使う) と __gcc_personality_v0 も入れる
+#   見ないので、版なしで足りる。__clear_cache (libgcc_s にあるもの。V8 が使う) と __gcc_personality_v0 も入れる。
+#   libgcc_s と同じく、コンパイラの助けの関数 (LLVM compiler-rt の builtins: 128 ビットの浮動小数点
+#   __divtf3 など。rust-lld が使う) と、crtbegin が呼ぶ __register_frame_info / __deregister_frame_info も入れる
 pkgname=libunwind
 pkgver=0.16.0
-pkgrel=1
-pkgdesc='LLVM libunwind as libgcc_s.so.1 (_Unwind_*, __clear_cache), built with Zig (for aios)'
+pkgrel=2
+pkgdesc='LLVM libunwind and compiler-rt builtins as libgcc_s.so.1, built with Zig (for aios)'
 arch=('aarch64')
 url='https://github.com/llvm/llvm-project/tree/main/libunwind'
 license=('Apache-2.0 WITH LLVM-exception')
 provides=('libgcc')
-source=()
-sha256sums=()
+_llvm=20.1.8
+source=("https://github.com/llvm/llvm-project/releases/download/llvmorg-$_llvm/compiler-rt-$_llvm.src.tar.xz")
+sha256sums=('15277402f6fd63397c0917a5c7171cda82d16d226094b828c1ed0f58f73b9c69')
+
+prepare() {
+  rm -rf "compiler-rt-$_llvm.src"
+  tar -xJf "compiler-rt-$_llvm.src.tar.xz"
+}
 
 build() {
   . "$startdir/../zig.sh"
@@ -35,6 +43,10 @@ void __clear_cache(void *start, void *end) {
     for (uintptr_t a = b & ~(iline - 1); a < e; a += iline) __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
   __asm__ volatile("dsb ish\n\tisb" ::: "memory");
 }
+/* gcc の crtbegin (frame_dummy) が呼ぶもの。glibc 用に作られたもの (rust-lld など) は libgcc_s に
+   あるものとして呼ぶ。libunwind は .eh_frame_hdr から探すので、登録はしなくてよい */
+void __register_frame_info(const void *begin, void *ob) { (void)begin; (void)ob; }
+void *__deregister_frame_info(const void *begin) { (void)begin; return 0; }
 EOF
   local f o objs=
   local flags="-O2 -fPIC -funwind-tables -I$src/include -D_LIBUNWIND_IS_NATIVE_ONLY -D_LIBUNWIND_HIDE_SYMBOLS=0 -fno-sanitize=undefined"
@@ -47,6 +59,20 @@ EOF
     objs="$objs $o"
   done
   $CC -O2 -fPIC -c clear_cache.c -o clear_cache.o
+  # compiler-rt の builtins (aarch64 で使えるもの。ほかの OS や CPU のもの、ここで作っているものは外す)
+  local rt=$srcdir/compiler-rt-$_llvm.src/lib/builtins n=0
+  mkdir -p rt
+  for f in "$rt"/*.c; do
+    case ${f##*/} in
+      clear_cache.c|gcc_personality_v0.c|emutls.c|enable_execute_stack.c|eprintf.c|os_version_check.c|apple_versioning.c|trampoline_setup.c|atomic*.c) continue ;;
+    esac
+    o=rt/$(basename "${f%.c}").o
+    if $CC -O2 -fPIC -fno-sanitize=undefined -std=c11 -I"$rt" -c "$f" -o "$o" 2>/dev/null; then
+      objs="$objs $o"
+      n=$((n + 1))
+    fi
+  done
+  echo "compiler-rt builtins: $n"
   # libc++ も libgcc もつながない (_Unwind_* はここにあるので)
   $CC -shared -nostdlib++ -Wl,-soname,libgcc_s.so.1 -Wl,-s -o libgcc_s.so.1 $objs clear_cache.o
 }
