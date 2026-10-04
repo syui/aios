@@ -1,0 +1,35 @@
+# pkgconf: pkg-config (C のライブラリの場所とリンクのしかたを答える)。静的なバイナリ 1 つ
+#   cargo の *-sys crate (alsa-sys など) や meson / configure が使う。base-devel が入れる
+#   探す場所は /opt/c (aios の C のライブラリ) と /usr
+pkgname=pkgconf
+pkgver=2.5.1
+pkgrel=1
+pkgdesc='pkg-config compatible tool to find C libraries (static, for aios)'
+arch=('aarch64')
+url='http://pkgconf.org/'
+license=('ISC')
+provides=('pkg-config')
+source=("https://distfiles.ariadne.space/pkgconf/pkgconf-$pkgver.tar.xz")
+sha256sums=('cd05c9589b9f86ecf044c10a2269822bc9eb001eced2582cfffd658b0a50c243')
+
+prepare() {
+  rm -rf "pkgconf-$pkgver"
+  tar -xJf "pkgconf-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "pkgconf-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static \
+    --with-pkg-config-dir=/opt/c/lib/pkgconfig:/opt/c/share/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig \
+    --with-system-libdir=/usr/lib --with-system-includedir=/usr/include
+  make
+}
+
+package() {
+  cd "pkgconf-$pkgver"
+  install -Dm755 pkgconf "$pkgdir/opt/c/bin/pkgconf"
+  ln -s pkgconf "$pkgdir/opt/c/bin/pkg-config"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
