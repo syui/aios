@@ -23,6 +23,11 @@ fn main() {
     println!("Changing password for {}.", target);
     if uid != 0 {
         let cur = users::shadow_hash(&target).unwrap_or_default();
+        // ロックされている (! や *、空): いまのパスワードはないので、root に決めてもらう
+        if !cur.starts_with('$') {
+            eprintln!("passwd: {} has no password yet (locked). Set it as root: sudo passwd {}", target, target);
+            std::process::exit(1);
+        }
         let pw = users::read_password("Current password: ").unwrap_or_default();
         if !crypt::verify(&pw, &cur) {
             eprintln!("passwd: Authentication token manipulation error");
