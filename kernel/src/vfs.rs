@@ -252,10 +252,16 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             let last = i + 1 == comps.len();
             if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {
                 if let Some((p, ino)) = next.magic_link() {
-                    if !last {
+                    if last {
+                        return Ok((p.trim_start_matches('/').to_string(), ino));
+                    }
+                    // /proc/self/fd/N/... : 開いているディレクトリから先をたどる
+                    if !ino.meta().is_dir() {
                         return Err(-ENOTDIR);
                     }
-                    return Ok((p.trim_start_matches('/').to_string(), ino));
+                    walked = p.trim_start_matches('/').to_string();
+                    cur = ino;
+                    continue;
                 }
                 let t = next.readlink()?;
                 let mut np = normalize(&walked, &t);
@@ -286,6 +292,11 @@ pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<InodeRef, i64> {
 
 /// 最後の要素の親ディレクトリと名前
 pub fn parent_of(cwd: &str, path: &str) -> Result<(InodeRef, String), i64> {
+    parent_path(cwd, path).map(|(parent, name, _)| (parent, name))
+}
+
+/// 最後の要素の親ディレクトリと名前、それに作るもののパス (リンクをたどったあとの、先頭 / なし)
+pub fn parent_path(cwd: &str, path: &str) -> Result<(InodeRef, String, String), i64> {
     let full = normalize(cwd, path);
     let (dir, name) = match full.rsplit_once('/') {
         Some((d, n)) => (d.to_string(), n.to_string()),
@@ -297,11 +308,12 @@ pub fn parent_of(cwd: &str, path: &str) -> Result<(InodeRef, String), i64> {
     if name.len() > 255 {
         return Err(-ENAMETOOLONG);
     }
-    let parent = resolve("", &dir, true)?;
+    let (dir, parent) = if dir.is_empty() { (String::new(), cross(root())) } else { lookup("", &dir, true)? };
     if !parent.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    Ok((parent, name))
+    let full = if dir.is_empty() { name.clone() } else { alloc::format!("{}/{}", dir, name) };
+    Ok((parent, name, full))
 }
 
 /// なければディレクトリを作りながら path をたどる (起動時用)

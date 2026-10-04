@@ -307,12 +307,11 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             found
         }
         Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
-            let (parent, name) = vfs::parent_of(&base, &path)?;
+            let (parent, name, full) = vfs::parent_path(&base, &path)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
-            let full = vfs::normalize(&base, &path);
             inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
             // 作ったばかりのものは、mode に関係なく開ける
