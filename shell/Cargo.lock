@@ -35,6 +35,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-fix"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "aish-map"
 version = "0.0.1"
 dependencies = [
