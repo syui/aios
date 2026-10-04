@@ -18,7 +18,7 @@
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
 3. **設定 (apply)** ✅: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
    apply のたびに前の設定とパッケージの版を `/var/lib/aios/history/` に残し、`aios rollback` で戻せる
-4. **改造 (src / build)**: aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
+4. **改造 (src / build)** (一部 ✅): aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
    カーネルは前のものを ESP に残し、起動しなかったら前のもので起動しなおせるようにする
 
 ## 状態の木 (aios get)
@@ -79,3 +79,18 @@ aios rollback                           # ひとつ前の apply の設定に戻�
   "user":    { "ai": { "shell": "/bin/aish", "groups": ["wheel"] } }
 }
 ```
+
+## 改造 (aios src / build / install)
+
+```sh
+aios src                       # /usr/src/aios に aios のソース (なければ git clone、あれば git pull)。wheel の人が書ける
+aios build kernel              # AIOS_INITRD=none でビルドし、target/Image (起動できる形) を作る (objcopy の代わりも aios がする)
+aios install kernel            # /boot/Image を入れかえる (aiosd)。前のものは /boot/Image.prev
+aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れかえる
+```
+
+- 前のカーネルは起動の一覧に「aios (previous kernel)」(`/boot/loader/entries/prev-aios.conf`) として出る。
+  一覧が出るように、loader.conf の `timeout 0` は 3 秒にする。新しいカーネルで起動しなければ、一覧で 2 を選ぶ
+- aikernel のパッケージを上げると /boot/Image はパッケージのものになる
+- まだ: 起動しなかったら自動で前のものに戻す (aiboot が ESP に「試した回数」を書く、systemd-boot の boot counting)、
+  ユーザーのプログラムとパッケージのビルド (aios build pkg)
