@@ -1,0 +1,33 @@
+# nodejs: JavaScript の実行 (node) と npm / npx。Claude Code や pnpm が動くところ
+#   これだけは自分でビルドしない: Node の unofficial-builds にある linux-arm64-musl のできあがったものを
+#   (SHASUMS256 と同じ sha256 を確かめて) /opt/c に入れる (V8 を Zig でビルドするのは重すぎるので)。
+#   共有ライブラリは musl の libc.so と libgcc_s.so.1 (libunwind パッケージ。Zig で作った LLVM の libunwind) だけ。
+#   npm -g で入れるもの (pnpm など) は /usr/local に (/opt/c/etc/npmrc の prefix)
+pkgname=nodejs
+pkgver=26.10.0
+pkgrel=1
+pkgdesc='JavaScript runtime built on V8, with npm (unofficial-builds linux-arm64-musl, for aios)'
+arch=('aarch64')
+url='https://nodejs.org'
+license=('MIT')
+depends=('musl' 'libunwind')
+backup=(opt/c/etc/npmrc)
+source=("https://unofficial-builds.nodejs.org/download/release/v$pkgver/node-v$pkgver-linux-arm64-musl.tar.xz")
+sha256sums=('f204193e885695e81f0d1368a15fa60e7acce7e9b15100bcf75e8d460a6012c8')
+
+prepare() {
+  rm -rf "node-v$pkgver-linux-arm64-musl"
+  tar -xJf "node-v$pkgver-linux-arm64-musl.tar.xz"
+}
+
+package() {
+  cd "node-v$pkgver-linux-arm64-musl"
+  install -d "$pkgdir/opt/c"
+  cp -a bin include lib "$pkgdir/opt/c/"
+  # npm -g の入れ先 (パッケージの /opt/c はさわらない)
+  install -Dm644 /dev/stdin "$pkgdir/opt/c/etc/npmrc" <<'EOF'
+# npm の全体の設定 (aios)。npm install -g で入れるものは /usr/local/bin と /usr/local/lib/node_modules に
+prefix=/usr/local
+EOF
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -141,6 +141,11 @@ mod nr {
     pub const SETGROUPS: u64 = 159;
     pub const SETPGID: u64 = 154;
     pub const PRCTL: u64 = 167;
+    pub const CAPGET: u64 = 90;
+    pub const CAPSET: u64 = 91;
+    pub const IO_URING_SETUP: u64 = 425;
+    pub const IO_URING_ENTER: u64 = 426;
+    pub const IO_URING_REGISTER: u64 = 427;
     pub const GETPGID: u64 = 155;
     pub const GETSID: u64 = 156;
     pub const SETSID: u64 = 157;
@@ -434,6 +439,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MSYNC => sys_msync(a[0] as usize, a[1] as usize),
         MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
+        CAPGET => sys_capget(a[0] as usize, a[1] as usize),
+        CAPSET => Err(-crate::cred::EPERM),
+        // io_uring はない (libuv などは ENOSYS を見て、ふつうのシステムコールで動く)
+        IO_URING_SETUP | IO_URING_ENTER | IO_URING_REGISTER => Err(-ENOSYS),
         n => {
             println!("syscall: unknown {} (pid {})", n, proc::current().pid);
             Err(-ENOSYS)
@@ -869,6 +878,34 @@ fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {
         return Err(-ENOMEM);
     }
     out(vec, &alloc::vec![1u8; n])?;
+    Ok(0)
+}
+
+/// capget(hdr, data): capability (root は全部、ほかはなし。aios は capability を分けない)。
+/// 版が違えば、知っている版 (3) を hdr に書いて EINVAL (Linux と同じ。libcap はそれで版を知る)
+fn sys_capget(hdr: usize, data: usize) -> R {
+    const V3: u32 = 0x2008_0522;
+    let pt = proc::current().pt();
+    let mut h = [0u8; 8];
+    pt.copy_in(&mut h, hdr).ok_or(-EFAULT)?;
+    let ver = u32::from_le_bytes(h[..4].try_into().unwrap());
+    if ver != V3 && ver != 0x1998_0330 && ver != 0x2007_1026 {
+        pt.copy_out(hdr, &V3.to_le_bytes()).ok_or(-EFAULT)?;
+        return if data == 0 { Ok(0) } else { Err(-EINVAL) };
+    }
+    if data == 0 {
+        return Ok(0);
+    }
+    // v1 は 1 組、v2 と v3 は 2 組の {effective, permitted, inheritable}
+    let n = if ver == 0x1998_0330 { 1 } else { 2 };
+    let all = if crate::cred::current().euid == 0 { u32::MAX } else { 0 };
+    let mut out = alloc::vec::Vec::new();
+    for _ in 0..n {
+        out.extend_from_slice(&all.to_le_bytes());
+        out.extend_from_slice(&all.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    pt.copy_out(data, &out).ok_or(-EFAULT)?;
     Ok(0)
 }
 
