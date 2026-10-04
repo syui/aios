@@ -51,6 +51,9 @@ mod nr {
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
     pub const EVENTFD2: u64 = 19;
+    pub const INOTIFY_INIT1: u64 = 26;
+    pub const INOTIFY_ADD_WATCH: u64 = 27;
+    pub const INOTIFY_RM_WATCH: u64 = 28;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
@@ -232,6 +235,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
         EVENTFD2 => crate::epoll::eventfd2(a[0], a[1]),
+        INOTIFY_INIT1 => crate::inotify::init1(a[0]),
+        INOTIFY_ADD_WATCH => sysfile::inotify_add_watch(a[0], a[1] as usize, a[2] as u32),
+        INOTIFY_RM_WATCH => crate::inotify::rm_watch(a[0], a[1] as i32),
         EPOLL_CREATE1 => crate::epoll::create1(a[0]),
         EPOLL_CTL => crate::epoll::ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
         EPOLL_PWAIT => crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ticks(int(a[3]))),

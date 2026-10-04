@@ -14,6 +14,7 @@ mod cred;
 mod dtb;
 mod efi;
 mod epoll;
+mod inotify;
 mod exec;
 mod extfs;
 mod file;
