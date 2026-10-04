@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-claude"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "libc",
+]
+
+[[package]]
 name = "aish-complete"
 version = "0.0.1"
 dependencies = [

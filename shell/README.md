@@ -20,6 +20,7 @@ bindkey                       # 一覧
 | `aish-pick` | base | C-r 履歴 / C-f ファイル / C-g rg で探して開く / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
 | `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ。`edits` でいくつも、ぜんぶかなにもしないか) `write` `grep` (ripgrep があればそれで。よく使うファイルが先で、見つけた行に番号 `n`) `hit` (n 番のまわり) `each` (見つけた行だけ置きかえる) `sed` (`each` と `sed` は `subs` で何組も) `lines` (行の番号で) `undo`。`aish --mcp` で読む |
 | `aish-map` | base | 探さなくていいように: ツール `where` (名前から定義の場所。ぴったり → 前が同じ → 含む、よく使うファイルが先) `outline` (ファイルの中の定義)。M-. で選んで `$EDITOR +行 ファイル`。rg が要る |
+| `aish-claude` | base | 見つからなかったコマンドの行を `claude -p` に渡し、答えを端末に出す (claude があれば。人が打つときだけ。`AISH_CLAUDE=0` で止める)。aios の Claude Code は `/etc/claude-code/managed-mcp.json` で `aish --mcp` を使う |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
@@ -119,7 +120,7 @@ Ctrl-C (SIGINT) は無視するようにして起こされる。aish が終わ�
 | `preexec` | `line pwd` | `{}` | 行を動かす前 (`aish --mcp` の `run` でも) |
 | `precmd` | `status` | `{}` | プロンプトを出す前 (`aish --mcp` では `run` のあと) |
 | `chpwd` | `pwd old` | `{}` | `cd` でディレクトリが変わったとき |
-| `not_found` | `args line pwd status` | `{"status":N}` (引き受けたとき) | コマンドが見つからなかったとき。`{}` なら aish が "command not found" を出す |
+| `not_found` | `args line pwd status env` (いまの環境。export したものと `VAR=x cmd` の VAR) | `{"status":N}` (引き受けたとき) | コマンドが見つからなかったとき。`{}` なら aish が "command not found" を出す |
 | `tool` | `name args pwd home histfile` | JSON のオブジェクト。しくじったら `{"error":"..."}` | `aish --mcp` でツールが呼ばれたとき (hooks に書かなくても来る)。答えを待ちつづける |
 
 `prompt` `suggest` `complete` `not_found` は、フックを持つプラグインに順に聞き、最初の空でない答えを使う。
