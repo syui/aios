@@ -3,11 +3,11 @@
 #   static.rust-lang.org から取ってきて /usr に入れる (sha256 を確かめる)。大きい (取るのは 290 MB、入れると 1 GB ほど) ので
 #   パッケージには入れない (git.syui.ai は 1 回 100 MB まで)。rust-std は aarch64-unknown-linux-musl
 #   (aios のユーザープログラム) と aarch64-unknown-none-softfloat (aios のカーネル)。
-#   リンクは rust-lld (cargo build に RUSTFLAGS='-C linker=rust-lld'、aios のソースは .cargo/config.toml で)。
+#   リンクは rust-lld (/etc/profile.d/cargo.sh で CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld)。
 #   C の部分がある crate は base-devel (zig の cc) で。入れたファイルは /usr/lib/rustlib/aios-cargo.files
 pkgname=cargo
 pkgver=1.99.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Rust compiler and cargo, installed from static.rust-lang.org (aarch64-unknown-linux-musl)'
 arch=('any')
 url='https://www.rust-lang.org'
@@ -18,4 +18,5 @@ install=cargo.install
 
 package() {
   install -Dm644 "$startdir/cargo.install" "$pkgdir/usr/share/cargo/cargo.install"
+  install -Dm644 "$startdir/cargo.sh" "$pkgdir/etc/profile.d/cargo.sh"
 }

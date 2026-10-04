@@ -54,6 +54,11 @@ post_install() {
 }
 
 post_upgrade() {
+  # Rust の版が同じなら取りなおさない (パッケージの設定だけ変わったとき)
+  if [ -f "$_list" ] && [ "$(rustc -V 2>/dev/null | cut -d' ' -f2)" = "$_v" ]; then
+    echo "cargo: Rust $_v is already installed"
+    return 0
+  fi
   _remove
   _install
 }
