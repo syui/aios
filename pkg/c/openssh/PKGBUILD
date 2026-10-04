@@ -4,14 +4,17 @@
 #   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
 pkgname=openssh
 pkgver=10.5p1
-pkgrel=1
+pkgrel=2
 pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
 arch=('aarch64')
 url='https://www.openssh.com/portable.html'
 license=('SSH-OpenSSH')
 backup=(etc/ssh/ssh_config etc/ssh/sshd_config)
-source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz")
-sha256sums=('d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11')
+source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz"
+        sshd.service sshdgenkeys.service)
+sha256sums=('d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11'
+            'SKIP'
+            'SKIP')
 
 prepare() {
   rm -rf "openssh-$pkgver"
@@ -25,6 +28,7 @@ build() {
   ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --sysconfdir=/etc/ssh \
     --without-openssl --without-zlib --without-pam --without-selinux --without-kerberos5 \
     --without-security-key-builtin --disable-strip --with-pid-dir=/run \
+    --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
     --with-privsep-path=/var/empty --with-privsep-user=nobody \
     --with-default-path=/opt/c/bin:/usr/local/bin:/usr/bin:/bin
   make
@@ -36,5 +40,7 @@ package() {
   make DESTDIR="$pkgdir" install-nokeys
   rm -rf "$pkgdir/opt/c/share/man"
   install -d -m755 "$pkgdir/var/empty"
+  install -Dm644 "$startdir/sshd.service" "$pkgdir/usr/lib/systemd/system/sshd.service"
+  install -Dm644 "$startdir/sshdgenkeys.service" "$pkgdir/usr/lib/systemd/system/sshdgenkeys.service"
   install -Dm644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
 }
