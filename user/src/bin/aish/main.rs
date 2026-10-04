@@ -273,6 +273,7 @@ impl Shell {
         if !last || p.neg {
             self.cond += 1;
         }
+        let start = p.time.then(|| (std::time::Instant::now(), cpu_times()));
         let mut st = if p.cmds.len() == 1 {
             self.run_cmd(&p.cmds[0])
         } else {
@@ -281,6 +282,11 @@ impl Shell {
         };
         if !last || p.neg {
             self.cond -= 1;
+        }
+        if let Some((t0, (u0, s0))) = start {
+            let (u1, s1) = cpu_times();
+            let f = |d: f64| format!("{}m{:.3}s", (d / 60.0) as u64, d % 60.0);
+            eprintln!("\nreal\t{}\nuser\t{}\nsys\t{}", f(t0.elapsed().as_secs_f64()), f(u1 - u0), f(s1 - s0));
         }
         if p.neg {
             st = (st == 0) as i32;
@@ -1949,4 +1955,18 @@ fn read_line() -> io::Result<Option<String>> {
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
         }
     }
+}
+
+/// time 用: このシェルと終わった子の CPU 時間 (user, sys) の秒
+fn cpu_times() -> (f64, f64) {
+    let sec = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    let mut u = (0.0, 0.0);
+    for who in [libc::RUSAGE_SELF, libc::RUSAGE_CHILDREN] {
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(who, &mut r) } == 0 {
+            u.0 += sec(r.ru_utime);
+            u.1 += sec(r.ru_stime);
+        }
+    }
+    u
 }
