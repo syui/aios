@@ -690,12 +690,14 @@ pub struct Pipe {
     pub heads: alloc::collections::VecDeque<[u8; 20]>,
     /// 調べるための記録: 書きこみの頭の IPC のメッセージの型ごとの (回数, 最後に書いたのは何回目の書きこみか)
     pub types: alloc::collections::BTreeMap<u32, (u32, u64)>,
+    /// AF_UNIX: このパイプに書くほうのプロセス (pid, uid, gid)。読むほうの SO_PEERCRED (unix.rs)
+    pub cred: Option<(u32, u32, u32)>,
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }));
+        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -747,7 +749,7 @@ impl Pipe {
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
         let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }));
+        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
     }
@@ -755,7 +757,7 @@ impl Pipe {
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<RefCell<Pipe>> {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new() }))
+        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None }))
     }
 
     fn wake(p: &Rc<RefCell<Pipe>>) {

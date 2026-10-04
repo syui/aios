@@ -13,8 +13,8 @@
 
 ## 段階
 
-1. **把握 (get)**: `aios get [PATH]` で状態の木を読む。読むだけなので aiosd なしで、呼んだプロセスの中で集める
-2. **操作 (do)**: aiosd (root で動くサービス) が `/run/aiosd.sock` で受ける。だれが呼んだかは SO_PEERCRED で見る
+1. **把握 (get)** ✅: `aios get [PATH]` で状態の木を読む。読むだけなので aiosd なしで、呼んだプロセスの中で集める
+2. **操作 (do)** ✅: aiosd (root で動くサービス) が `/run/aiosd.sock` で受ける。だれが呼んだかは SO_PEERCRED で見る
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
 3. **設定 (apply)**: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
    apply のたびに前の設定とパッケージの版を `/var/lib/aios/history/` に残し、`aios rollback` で戻せる
@@ -39,6 +39,17 @@
 - `PATH` は点でつなぐ: `kernel.cpus`、`pkg.installed.cargo`、`service.sshd.active`。
   配列は番号か名前 (name / mount / pid) で選ぶ
 - ふだんは `PATH = 値` の行 (sysctl と同じで、grep しやすい)。`--json` で JSON
+
+## 操作 (aios do)
+
+```sh
+aios do ping                          # aiosd が動いているか、自分が変えられるか
+aios do service restart sshd          # start stop restart enable disable
+aios do pkg install git vim           # install remove / pkg upgrade / pkg refresh
+aios do reboot                        # poweroff も
+```
+Claude は aish-sys の `do` ツールで同じことを頼む。aiosd は SO_PEERCRED で相手を見る (カーネルは connect / listen /
+socketpair のときのプロセスを覚えておく)。
 
 ## 設定ファイル (/etc/aios.json)
 
