@@ -1,0 +1,63 @@
+# ap が動かす (pacman と同じ形)。Rust の公式のビルドを取ってきて /usr に入れる
+_v=1.99.0
+_t=aarch64-unknown-linux-musl
+# 名前:sha256 (static.rust-lang.org/dist/NAME.tar.gz.sha256 と同じ)
+_parts="rustc-$_v-$_t:72b20aec5f02fec76f7702749865232c12040222e1604a27fffbf16c5829f7a7
+cargo-$_v-$_t:1c107d9bcf4ab7573b7d3d9c553c543fb6f3b003c1d50fec7bf7fc31644fe7c3
+rust-std-$_v-$_t:202f95c683d30d2f65cb7e3b6b2c7853a364d268bff54dd44a1dcdbb63632374
+rust-std-$_v-aarch64-unknown-none-softfloat:80e2ed8f2d0157d0105c9be5ea4a6396ee61b6aea2e836aaa8eb7e8cafc7fc56"
+_list=/usr/lib/rustlib/aios-cargo.files
+_tmp=/var/cache/cargo
+
+_install() {
+  mkdir -p "$_tmp" /usr/lib/rustlib
+  : > "$_list.new"
+  for p in $_parts; do
+    n=${p%%:*}
+    sum=${p#*:}
+    echo "cargo: $n"
+    curl -fL --progress-bar -o "$_tmp/$n.tar.gz" "https://static.rust-lang.org/dist/$n.tar.gz" || return 1
+    echo "$sum  $_tmp/$n.tar.gz" | sha256sum -c --quiet - || return 1
+    # aios の tar (uutils) は -C がないので、そこへ移ってからほどく
+    (cd "$_tmp" && tar -xzf "$n.tar.gz") || return 1
+    rm -f "$_tmp/$n.tar.gz"
+    # install.sh (bash) のかわりに manifest.in のとおり写す
+    for c in $(cat "$_tmp/$n/components"); do
+      while read -r l; do
+        case $l in
+          file:*) f=${l#file:} ;;
+          dir:*) f=${l#dir:} ;;
+          *) continue ;;
+        esac
+        mkdir -p "/usr/$(dirname "$f")"
+        cp -a "$_tmp/$n/$c/$f" "/usr/$(dirname "$f")/" || return 1
+        echo "$f" >> "$_list.new"
+      done < "$_tmp/$n/$c/manifest.in"
+    done
+    rm -rf "$_tmp/$n"
+  done
+  mv "$_list.new" "$_list"
+  rm -rf "$_tmp"
+  echo "cargo: $(rustc -V) / $(cargo -V)"
+}
+
+_remove() {
+  [ -f "$_list" ] || return 0
+  while read -r f; do
+    [ -n "$f" ] && rm -rf "/usr/$f"
+  done < "$_list"
+  rm -f "$_list"
+}
+
+post_install() {
+  _install
+}
+
+post_upgrade() {
+  _remove
+  _install
+}
+
+pre_remove() {
+  _remove
+}

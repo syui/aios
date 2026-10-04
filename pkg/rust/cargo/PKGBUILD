@@ -1,48 +1,21 @@
-# cargo: Rust (rustc, cargo, rust-std) を aios の中で使う (aios を aios の中でビルドするため)。
-#   Rust の公式のビルド (aarch64-unknown-linux-musl) をそのまま /usr に入れる (Arch の rust と同じ場所)。
-#   rust-std は aarch64-unknown-linux-musl (aios のユーザープログラム) と
-#   aarch64-unknown-none-softfloat (aios のカーネル) の 2 つ。リンクは rust-lld (rustc に入っている)。
-#   C の部分がある crate は base-devel (zig の cc) で
+# cargo: Rust (rustc, cargo, rust-std) を aios の中で使う (aios を aios の中でビルドするため)。sudo ap -S cargo
+#   Rust の公式のビルド (aarch64-unknown-linux-musl) を、入れるとき (post_install) に
+#   static.rust-lang.org から取ってきて /usr に入れる (sha256 を確かめる)。大きい (取るのは 290 MB、入れると 1 GB ほど) ので
+#   パッケージには入れない (git.syui.ai は 1 回 100 MB まで)。rust-std は aarch64-unknown-linux-musl
+#   (aios のユーザープログラム) と aarch64-unknown-none-softfloat (aios のカーネル)。
+#   リンクは rust-lld (cargo build に RUSTFLAGS='-C linker=rust-lld'、aios のソースは .cargo/config.toml で)。
+#   C の部分がある crate は base-devel (zig の cc) で。入れたファイルは /usr/lib/rustlib/aios-cargo.files
 pkgname=cargo
 pkgver=1.99.0
 pkgrel=1
-pkgdesc='Rust compiler and cargo (official aarch64-unknown-linux-musl build)'
-arch=('aarch64')
+pkgdesc='Rust compiler and cargo, installed from static.rust-lang.org (aarch64-unknown-linux-musl)'
+arch=('any')
 url='https://www.rust-lang.org'
 license=('MIT' 'Apache-2.0')
-depends=('musl' 'libunwind')
+depends=('musl' 'libunwind' 'curl')
 optdepends=('base-devel: cc for crates with C code')
-_t=aarch64-unknown-linux-musl
-source=("https://static.rust-lang.org/dist/rustc-$pkgver-$_t.tar.xz"
-        "https://static.rust-lang.org/dist/cargo-$pkgver-$_t.tar.xz"
-        "https://static.rust-lang.org/dist/rust-std-$pkgver-$_t.tar.xz"
-        "https://static.rust-lang.org/dist/rust-std-$pkgver-aarch64-unknown-none-softfloat.tar.xz")
-sha256sums=('678c660838d055a7beca6af6b06ce79e7596e15fb73bd854f6bde8aa6800b09f'
-            'bef13b92330b96e493ad9e3d15d2bf1ceade4a62e2501a6c06e9614acc2d1463'
-            'ea8fd309578a09c9e12401621a470e6d6b1047f25933207fb8a39d66647d4561'
-            'd49aacb9b09f0ed484a2ea89ba06b7d16785dc0cd755d3c7711004713219b359')
-
-prepare() {
-  for f in rustc cargo rust-std; do
-    rm -rf "$f-$pkgver-$_t"
-    tar -xJf "$f-$pkgver-$_t.tar.xz"
-  done
-  rm -rf "rust-std-$pkgver-aarch64-unknown-none-softfloat"
-  tar -xJf "rust-std-$pkgver-aarch64-unknown-none-softfloat.tar.xz"
-}
+install=cargo.install
 
 package() {
-  for d in "rustc-$pkgver-$_t" "cargo-$pkgver-$_t" "rust-std-$pkgver-$_t" "rust-std-$pkgver-aarch64-unknown-none-softfloat"; do
-    (cd "$d" && sh install.sh --prefix=/usr --destdir="$pkgdir" --disable-ldconfig > /dev/null)
-  done
-  # インストーラの記録は要らない (aipkg が持つ)。説明書きも外す
-  rm -rf "$pkgdir/usr/lib/rustlib/"{install.log,uninstall.sh,components,rust-installer-version,manifest-*} "$pkgdir/usr/share/doc"
-  # デバッグ情報を外す (librustc_driver は 300 MB ほど小さくなる)
-  local strip=aarch64-linux-gnu-strip
-  command -v $strip >/dev/null || strip=llvm-strip
-  find "$pkgdir/usr" -type f \( -name '*.so' -o -perm -u+x \) | while read -r f; do
-    file -b "$f" | grep -q '^ELF' && $strip --strip-debug "$f" 2>/dev/null || true
-  done
-  install -Dm644 "$srcdir/rustc-$pkgver-$_t/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
-  install -Dm644 "$srcdir/rustc-$pkgver-$_t/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 "$startdir/cargo.install" "$pkgdir/usr/share/cargo/cargo.install"
 }
