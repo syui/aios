@@ -49,6 +49,8 @@ pub enum Compound {
 #[derive(Clone, Debug)]
 pub struct Pipeline {
     pub neg: bool,
+    /// time: 終わったら、かかった時間 (real / user / sys) を標準エラーに (bash と同じ形)
+    pub time: bool,
     pub cmds: Vec<Cmd>,
 }
 
@@ -442,6 +444,10 @@ impl Parser {
     }
 
     fn pipeline(&mut self) -> Result<Pipeline, Error> {
+        let time = self.is_word("time")?;
+        if time {
+            self.take()?;
+        }
         let neg = self.is_word("!")?;
         if neg {
             self.take()?;
@@ -452,7 +458,7 @@ impl Parser {
             self.skip_newlines()?;
             cmds.push(self.command()?);
         }
-        Ok(Pipeline { neg, cmds })
+        Ok(Pipeline { neg, time, cmds })
     }
 
     fn command(&mut self) -> Result<Cmd, Error> {

@@ -5,3 +5,7 @@ export PATH=/usr/local/bin:/usr/bin:/opt/c/bin
 umask 022
 # プロンプト (bash = brush 用。aish は /etc/aishrc の powerline のプロンプトにする)。[ユーザー@ホスト ディレクトリ]$
 PS1='[\u@\h \W]\$ '
+# パッケージの設定 (cargo のリンカなど)。Arch と同じく /etc/profile.d/*.sh を読む
+for f in /etc/profile.d/*.sh; do
+  [ -r "$f" ] && . "$f"
+done
