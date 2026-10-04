@@ -21,6 +21,8 @@
 #   音 (virtio-sound、QEMU 8.2 から) もつける: Mac は coreaudio、ほかは pipewire / pa / alsa のあるもの。
 #   AIOS_SOUND=coreaudio / pipewire / pa / alsa / none (鳴らさない) で選べる。AIOS_SOUND=0 で音の装置なし
 # AIOS_QEMU_ARGS で QEMU に引数を足せる
+# AIOS_SSH=PORT でホストの 127.0.0.1:PORT を aios の 22 (sshd) につなぐ (既定 2222、0 でつながない)
+#   ssh -p 2222 ai@127.0.0.1 で入れる (aios で sudo ssh-keygen -A && sudo /opt/c/sbin/sshd)
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
 #   AIOS_ACCEL=tcg でソフトのエミュレーションに、AIOS_ACCEL=kvm で Linux (arm64) の KVM に
 #   AIOS_GIC=3 で TCG でも GICv3 に
@@ -112,7 +114,10 @@ case "$accel" in
   *) cpu="-cpu cortex-a72"; machine="virt${AIOS_GIC:+,gic-version=$AIOS_GIC}" ;;
 esac
 [ -n "$accel" ] && [ "$accel" != tcg ] && echo "accel: $accel" >&2
-set -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
+ssh_port=${AIOS_SSH:-2222}
+fwd=
+[ "$ssh_port" != 0 ] && fwd=",hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f disk.img ]; then
   set -- "$@" \
     -drive file=disk.img,if=none,format=raw,id=hd0 \
