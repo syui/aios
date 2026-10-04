@@ -2,6 +2,7 @@
 use crate::file::{self, FileRef, Kind, Pipe, Stat, EBADF, EINVAL};
 use crate::cred::{self, Cred, R as PR, W as PW, X as PX};
 use crate::fs;
+use crate::inotify;
 use crate::proc::{self, Fd};
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 use alloc::string::String;
@@ -311,8 +312,11 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
+            let full = vfs::normalize(&base, &path);
+            inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
+            inotify::file_event(&full, &ino, inotify::IN_OPEN);
             // 作ったばかりのものは、mode に関係なく開ける
-            let f = file::new(Kind::Inode(ino, vfs::normalize(&base, &path)), flags as u32);
+            let f = file::new(Kind::Inode(ino, full), flags as u32);
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
             return Ok(fd as i64);
         }
@@ -354,10 +358,14 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         _ => {
             if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
                 ino.truncate(0)?;
+                inotify::file_event(&full, &ino, inotify::IN_MODIFY);
             }
             None
         }
     };
+    if kind.is_none() {
+        inotify::file_event(&full, &ino, inotify::IN_OPEN);
+    }
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
     let f = file::new(kind, flags as u32);
     let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
@@ -447,6 +455,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::Dir)?;
     own_new(&c, &parent, &ino)?;
+    inotify::dir_event(&parent, &name, inotify::IN_CREATE | inotify::IN_ISDIR, 0);
     Ok(0)
 }
 
@@ -503,6 +512,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !umask(), node)?;
     own_new(&c, &parent, &ino)?;
+    inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -511,7 +521,19 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     let c = cred::current();
     parent_writable(&c, &parent)?;
     sticky_ok(&c, &parent, &name)?;
+    let victim = parent.lookup(&name).ok();
     parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
+    let dir = flags & AT_REMOVEDIR != 0;
+    // Linux と同じ順: 消えたもの (リンクの数が変わった IN_ATTRIB、なくなれば DELETE_SELF と IGNORED)、それから親に DELETE
+    if let Some(v) = victim {
+        if !dir {
+            inotify::self_event(&v, inotify::IN_ATTRIB);
+        }
+        if dir || v.meta().nlink == 0 {
+            inotify::gone(&v);
+        }
+    }
+    inotify::dir_event(&parent, &name, inotify::IN_DELETE | if dir { inotify::IN_ISDIR } else { 0 }, 0);
     Ok(0)
 }
 
@@ -526,6 +548,7 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
     own_new(&c, &parent, &ino)?;
+    inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -538,6 +561,8 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
     let (parent, name) = parent_at(newdir, newp)?;
     parent_writable(&cred::current(), &parent)?;
     parent.link(&name, &ino)?;
+    inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
+    inotify::self_event(&ino, inotify::IN_ATTRIB);
     Ok(0)
 }
 
@@ -561,7 +586,22 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if np.lookup(&nname).is_ok() {
         sticky_ok(&c, &np, &nname)?;
     }
+    let moved = op.lookup(&oname).ok();
+    let replaced = np.lookup(&nname).ok().filter(|r| moved.as_ref().is_none_or(|m| m.id() != r.id()));
     op.rename(&oname, &np, &nname)?;
+    if let Some(m) = moved {
+        let isdir = if m.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
+        let ck = inotify::cookie();
+        inotify::dir_event(&op, &oname, inotify::IN_MOVED_FROM | isdir, ck);
+        inotify::dir_event(&np, &nname, inotify::IN_MOVED_TO | isdir, ck);
+        inotify::self_event(&m, inotify::IN_MOVE_SELF | isdir);
+    }
+    // 上書きされたもの
+    if let Some(r) = replaced
+        && (r.meta().is_dir() || r.meta().nlink == 0)
+    {
+        inotify::gone(&r);
+    }
     Ok(0)
 }
 
@@ -599,7 +639,11 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     if f.borrow().flags & file::O_ACCMODE == file::O_RDONLY {
         return Err(-EINVAL);
     }
-    inode_of(fd)?.truncate(len as usize)?;
+    let ino = inode_of(fd)?;
+    ino.truncate(len as usize)?;
+    if let Kind::Inode(_, p) = &f.borrow().kind {
+        inotify::file_event(p, &ino, inotify::IN_MODIFY);
+    }
     Ok(0)
 }
 
@@ -636,6 +680,7 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     let ino = at(AT_FDCWD, pathp, 0)?;
     cred::current().check(&ino.meta(), PW)?;
     ino.truncate(len as usize)?;
+    inotify::self_event(&ino, inotify::IN_MODIFY);
     Ok(0)
 }
 
@@ -655,11 +700,40 @@ fn chmod(ino: &InodeRef, mode: u64) -> R {
 }
 
 pub fn fchmod(fd: u64, mode: u64) -> R {
-    chmod(&inode_of(fd)?, mode)
+    chmod(&inode_of(fd)?, mode)?;
+    attrib_fd(fd);
+    Ok(0)
 }
 
 pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
-    chmod(&at(dirfd, pathp, 0)?, mode)
+    chmod(&at(dirfd, pathp, 0)?, mode)?;
+    attrib_at(dirfd, pathp);
+    Ok(0)
+}
+
+/// 属性が変わった (inotify の IN_ATTRIB): Linux と同じく、入っているディレクトリ (名前つき)、それからそのもの
+fn attrib_at(dirfd: i64, pathp: usize) {
+    if inotify::active()
+        && let Ok((parent, name)) = parent_at(dirfd, pathp)
+        && let Ok(ino) = parent.lookup(&name)
+    {
+        let isdir = if ino.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
+        inotify::dir_event(&parent, &name, inotify::IN_ATTRIB | isdir, 0);
+        inotify::self_event(&ino, inotify::IN_ATTRIB | isdir);
+    }
+}
+
+fn attrib_fd(fd: u64) {
+    if inotify::active()
+        && let Ok(f) = file_of(fd)
+        && let Kind::Inode(ino, p) = &f.borrow().kind
+    {
+        let isdir = if ino.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
+        if let Ok((parent, name)) = vfs::parent_of("", &alloc::format!("/{}", p)) {
+            inotify::dir_event(&parent, &name, inotify::IN_ATTRIB | isdir, 0);
+        }
+        inotify::self_event(ino, inotify::IN_ATTRIB | isdir);
+    }
 }
 
 fn id_arg(v: u64) -> Option<u32> {
@@ -687,11 +761,15 @@ fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
 }
 
 pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
-    chown(&inode_of(fd)?, uid, gid)
+    chown(&inode_of(fd)?, uid, gid)?;
+    attrib_fd(fd);
+    Ok(0)
 }
 
 pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
-    chown(&at(dirfd, pathp, flags)?, uid, gid)
+    chown(&at(dirfd, pathp, flags)?, uid, gid)?;
+    attrib_at(dirfd, pathp);
+    Ok(0)
 }
 
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
@@ -719,6 +797,11 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
     };
     if let Some(t) = mtime {
         ino.set_mtime(t)?;
+    }
+    if pathp == 0 {
+        attrib_fd(dirfd as u64);
+    } else {
+        attrib_at(dirfd, pathp);
     }
     Ok(0)
 }
@@ -904,6 +987,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         let n = match &f.kind {
             Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Some(p.borrow().len()),
             Kind::Unix(_) => Some(0),
+            Kind::Inotify(n) => Some(inotify::pending(n)),
             Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => Some((ino.meta().size as usize).saturating_sub(f.offset)),
             _ => None,
         };
@@ -1262,4 +1346,10 @@ pub fn close_range(first: u64, last: u64, flags: u64) -> R {
         }
     }
     Ok(0)
+}
+
+/// inotify_add_watch(fd, path, mask) (inotify.rs)
+pub fn inotify_add_watch(fd: u64, pathp: usize, mask: u32) -> R {
+    let path = user_str(pathp)?;
+    inotify::add_watch(fd, &path, mask)
 }
