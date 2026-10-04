@@ -7,6 +7,7 @@ mod boot;
 mod mmio;
 #[macro_use]
 mod uart;
+mod kmsg;
 mod console;
 mod tty;
 mod block;

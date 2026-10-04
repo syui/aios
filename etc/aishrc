@@ -13,6 +13,8 @@ plugin aish-pick
 plugin aish-map
 # ビルドのエラーを番号つきの一覧に (build / errors / fix、M-e。vim の quickfix)
 plugin aish-fix
+# aios の様子 (sys / procs / kmsg / log / bkl / strace、M-s)
+plugin aish-sys
 # 見つからなかったコマンドの行を Claude に (claude があれば。人が打つときだけ。AISH_CLAUDE=0 で止める)
 [ -z "$AISH_MCP" ] && plugin aish-claude
 # aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、

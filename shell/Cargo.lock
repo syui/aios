@@ -80,6 +80,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-sys"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "libc",
+]
+
+[[package]]
 name = "aish-wait"
 version = "0.0.1"
 dependencies = [

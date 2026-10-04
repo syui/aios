@@ -70,6 +70,7 @@ pub static LOCK: SpinLock<()> = SpinLock::new(());
 
 impl fmt::Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        crate::kmsg::push(s);
         for b in s.bytes() {
             if b == b'\n' {
                 putc(b'\r');
