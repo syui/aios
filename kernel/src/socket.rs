@@ -348,7 +348,10 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     let ep = read_addr(addr, len)?;
     let mut s = s.borrow_mut();
     let a = if ep.addr.is_unspecified() { None } else { Some(ep.addr) };
-    s.local = Some(IpListenEndpoint { addr: a, port: ep.port });
+    // port 0 は「空いているものを」(Linux と同じく bind のときに決め、getsockname で見える。Claude Code の
+    // ログインの受け口など、port 0 で listen するものがある)
+    let port = if ep.port == 0 && s.proto == Proto::Tcp { ephemeral() } else { ep.port };
+    s.local = Some(IpListenEndpoint { addr: a, port });
     if s.proto == Proto::Udp {
         s.bind_udp()?;
     }
@@ -364,7 +367,8 @@ pub fn listen(fd: u64) -> R {
     if s.proto != Proto::Tcp {
         return Err(-EOPNOTSUPP);
     }
-    let ep = s.local.ok_or(-EINVAL)?;
+    // bind していなければ、空いているポートで (Linux と同じ)
+    let ep = *s.local.get_or_insert(IpListenEndpoint { addr: None, port: ephemeral() });
     if s.handle.is_none() {
         let h = tcp_new()?;
         tcp(h).listen(ep).map_err(|_| -EADDRINUSE)?;
