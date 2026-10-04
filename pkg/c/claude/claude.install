@@ -1,0 +1,17 @@
+# ap が動かす (pacman と同じ形)。npm は nodejs パッケージのもの (/usr/local に新しいのがあればそれ)
+_npm() {
+  PATH=/usr/local/bin:/opt/c/bin:$PATH npm "$@"
+}
+
+post_install() {
+  _npm install -g --libc=musl --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
+  echo "claude: $(PATH=/usr/local/bin:$PATH claude --version 2>/dev/null)"
+}
+
+post_upgrade() {
+  post_install
+}
+
+pre_remove() {
+  _npm uninstall -g @anthropic-ai/claude-code
+}
