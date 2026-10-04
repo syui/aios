@@ -34,12 +34,13 @@ chown -R 0:0 rootfs
 [ -z "$suid" ] || chmod u+s $suid
 [ -z "$sgid" ] || chmod g+s $sgid
 
-# put FILE SECTOR: FILE をディスクの SECTOR から書く (区画は 1 MiB ごとなので 1 MiB ずつ)
+# put FILE SECTOR: FILE をディスクの SECTOR から書く (区画は 1 MiB ごとなので 1 MiB ずつ)。
+# ゼロのところは書かない (sparse): 大きなディスクでも、ホストのディスクは使ったぶんだけ
 put() {
   if [ $(($2 % 2048)) = 0 ]; then
-    dd if="$1" of="$out" bs=1048576 seek=$(($2 / 2048)) conv=notrunc 2>/dev/null
+    dd if="$1" of="$out" bs=1048576 seek=$(($2 / 2048)) conv=notrunc,sparse 2>/dev/null
   else
-    dd if="$1" of="$out" bs=512 seek="$2" conv=notrunc 2>/dev/null
+    dd if="$1" of="$out" bs=512 seek="$2" conv=notrunc,sparse 2>/dev/null
   fi
 }
 
