@@ -1,0 +1,10 @@
+[Unit]
+Description=aiosd: change aios on request (aios do, /run/aiosd.sock)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aiosd
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

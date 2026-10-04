@@ -3,6 +3,10 @@
 //                              起動のときは motd.service が動かす
 //   aios get [PATH] [--json]   状態の木 (host kernel mem disk proc service pkg net user boot)。
 //                              PATH は点でつなぐ (kernel.cpus、service.sshd.active)。ふだんは PATH = 値 の行
+//   aios do OP ...  [--json]   aiosd (root で動く) に頼んで変える。root と wheel の人だけ:
+//                                service start|stop|restart|enable|disable NAME
+//                                pkg install|remove NAME... / pkg upgrade / pkg refresh
+//                                reboot / poweroff / ping
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
@@ -36,6 +40,7 @@ fn main() {
     match args.first().map(String::as_str) {
         None => info(),
         Some("get") => get(&args[1..]),
+        Some("do") => do_(&args[1..]),
         Some("-h" | "--help" | "help") => usage(0),
         Some(c) => {
             eprintln!("aios: unknown command {}", c);
@@ -47,6 +52,9 @@ fn main() {
 fn usage(code: i32) -> ! {
     eprintln!("usage: aios                       様子 (ロゴつき)");
     eprintln!("       aios get [PATH] [--json]   状態の木 ({})", state::ROOTS.join(" "));
+    eprintln!("       aios do service start|stop|restart|enable|disable NAME");
+    eprintln!("       aios do pkg install|remove NAME... | pkg upgrade | pkg refresh");
+    eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
     std::process::exit(code)
 }
 
@@ -81,6 +89,47 @@ fn get(args: &[String]) {
     } else {
         println!("{}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
     }
+}
+
+/// aios do: aiosd に 1 つ頼んで、答えを出す
+fn do_(args: &[String]) {
+    use std::io::{BufRead, BufReader, Write};
+    let as_json = args.iter().any(|a| a == "--json");
+    let w: Vec<&str> = args.iter().filter(|a| !a.starts_with("--")).map(String::as_str).collect();
+    let req = match w.as_slice() {
+        ["service", action, name] => serde_json::json!({ "op": "service", "action": action, "name": name }),
+        ["pkg", action, names @ ..] => serde_json::json!({ "op": "pkg", "action": action, "names": names }),
+        [p @ ("reboot" | "poweroff")] => serde_json::json!({ "op": "power", "action": p }),
+        ["ping"] => serde_json::json!({ "op": "ping" }),
+        _ => usage(2),
+    };
+    let mut c = match std::os::unix::net::UnixStream::connect("/run/aiosd.sock") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("aios do: /run/aiosd.sock: {} (sudo systemctl enable --now aiosd)", e);
+            std::process::exit(1);
+        }
+    };
+    let mut line = String::new();
+    if writeln!(c, "{}", req).is_err() || BufReader::new(&c).read_line(&mut line).is_err() || line.is_empty() {
+        eprintln!("aios do: aiosd did not answer");
+        std::process::exit(1);
+    }
+    let r: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+    if as_json {
+        println!("{}", line.trim_end());
+    } else {
+        if let Some(o) = r["out"].as_str() {
+            print!("{}", o);
+        }
+        if let Some(e) = r["err"].as_str() {
+            eprint!("{}{}", e, if e.ends_with('\n') || e.is_empty() { "" } else { "\n" });
+        }
+        if req["op"] == "ping" {
+            println!("aiosd {} (uid {}, {})", r["version"].as_str().unwrap_or("?"), r["uid"], if r["allowed"] == true { "can change" } else { "read only" });
+        }
+    }
+    std::process::exit(if r["ok"] == true { 0 } else { r["status"].as_i64().filter(|s| *s > 0).unwrap_or(1) as i32 });
 }
 
 fn info() {

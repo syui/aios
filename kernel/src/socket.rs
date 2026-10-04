@@ -297,6 +297,8 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
         return Err(-EAFNOSUPPORT);
     }
     let (a, b) = file::Pipe::pair();
+    // どちらの相手も自分 (SO_PEERCRED)
+    crate::unix::set_creds(&a, crate::unix::me(), crate::unix::me());
     let cloexec = typ & SOCK_CLOEXEC != 0;
     let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
     let files = proc::current().files();
@@ -536,12 +538,13 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
         const SO_DOMAIN: u64 = 39;
         let pt = proc::current().pt();
         if (level, opt) == (SOL_SOCKET, SO_PEERCRED) {
-            // 相手の pid / uid / gid (struct ucred)。いまは自分と同じとして答える
-            let c = crate::cred::current();
+            // 相手の pid / uid / gid (struct ucred)。connect / socketpair / listen のときのプロセス (unix.rs)。
+            // まだつながっていない口は自分
+            let (pid, uid, gid) = pair_of(fd).and_then(|f| crate::unix::peer_cred(&f)).unwrap_or_else(crate::unix::me);
             let mut b = [0u8; 12];
-            b[..4].copy_from_slice(&proc::current().tgid.to_le_bytes());
-            b[4..8].copy_from_slice(&c.euid.to_le_bytes());
-            b[8..].copy_from_slice(&c.egid.to_le_bytes());
+            b[..4].copy_from_slice(&pid.to_le_bytes());
+            b[4..8].copy_from_slice(&uid.to_le_bytes());
+            b[8..].copy_from_slice(&gid.to_le_bytes());
             if val != 0 {
                 pt.copy_out(val, &b).ok_or(-EFAULT)?;
             }

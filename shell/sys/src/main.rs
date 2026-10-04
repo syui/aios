@@ -1,5 +1,6 @@
 // aish-sys: aios の様子を見る (aios を作るための、aish の基本のプラグイン。doc/aios.md の Claude の入口)
 //   get     状態の木 (aios get --json。host kernel mem disk proc service pkg net user boot)
+//   do      aiosd に頼んで変える (サービス、パッケージ、再起動。aios do と同じ)
 //   sys     まとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、重いプロセス、BKL、カーネルのメッセージ
 //   procs   プロセスの一覧 (CPU の時間かメモリの順)
 //   kmsg    カーネルのメッセージ (/proc/kmsg。シリアルの画面にしか出なかった println! のもの)
@@ -16,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const GET: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"点でつなぐ: host kernel mem disk proc service pkg net user boot の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"}}}"#;
+const DO: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"service / pkg / power / ping"},"action":{"type":"string","description":"service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"},"name":{"type":"string","description":"service の名前 (sshd など)"},"names":{"type":"array","items":{"type":"string"},"description":"pkg install / remove のパッケージ"}},"required":["op"]}"#;
 const NONE: &str = r#"{"type":"object","properties":{}}"#;
 const PROCS: &str = r#"{"type":"object","properties":{"sort":{"type":"string","description":"cpu (既定。使った CPU の時間) か mem (メモリ)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"},"name":{"type":"string","description":"名前にこれをふくむものだけ"}}}"#;
 const KMSG: &str = r#"{"type":"object","properties":{"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
@@ -30,6 +32,7 @@ fn main() {
         keys: &[("M-s", "sys")],
         tools: &[
             Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。host kernel mem disk proc service pkg net user boot。path で一部だけ", input: GET },
+            Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
             Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", input: NONE },
             Tool { name: "procs", desc: "プロセスの一覧 (pid ppid 状態 スレッド CPU 秒 メモリ 名前)。sort: cpu / mem", input: PROCS },
             Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", input: KMSG },
@@ -44,6 +47,7 @@ fn main() {
             let pwd = s(v, "pwd");
             match s(v, "name") {
                 "get" => get(a),
+                "do" => do_(a),
                 "sys" => summary(),
                 "procs" => procs(a),
                 "kmsg" => kmsg(a),
@@ -107,6 +111,20 @@ fn get(a: &Value) -> Value {
         Ok(o) => error(String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => error(format!("aios: {} (aios の base パッケージのコマンド)", e)),
     }
+}
+
+/// aiosd に 1 つ頼む (/run/aiosd.sock に 1 行の JSON)
+fn do_(a: &Value) -> Value {
+    use std::io::BufRead;
+    let mut c = match std::os::unix::net::UnixStream::connect("/run/aiosd.sock") {
+        Ok(c) => c,
+        Err(e) => return error(format!("/run/aiosd.sock: {} (aiosd is not running: sudo systemctl enable --now aiosd)", e)),
+    };
+    let mut line = String::new();
+    if writeln!(c, "{}", a).is_err() || std::io::BufReader::new(&c).read_line(&mut line).is_err() {
+        return error("aiosd did not answer");
+    }
+    serde_json::from_str(&line).unwrap_or_else(|_| error("aiosd: bad answer"))
 }
 
 // ---- まとめ ----

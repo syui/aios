@@ -34,6 +34,30 @@ pub struct Unix {
     path: Option<String>,
     /// listen 中なら、accept を待っている口 (サーバー側の OpenFile)
     backlog: Option<VecDeque<FileRef>>,
+    /// listen したプロセス (pid, uid, gid)。つないだ側の SO_PEERCRED はこれ (Linux と同じ)
+    owner: (u32, u32, u32),
+}
+
+/// いまのプロセスの (pid, uid, gid) (SO_PEERCRED の答え)
+pub fn me() -> (u32, u32, u32) {
+    let c = crate::cred::current();
+    (proc::current().tgid, c.euid, c.egid)
+}
+
+/// つながった口の相手 (自分が読むパイプに書くほう)。わからなければ None
+pub fn peer_cred(f: &FileRef) -> Option<(u32, u32, u32)> {
+    match &f.borrow().kind {
+        Kind::Pair(rx, _) => rx.borrow().cred,
+        _ => None,
+    }
+}
+
+/// 口の両側のパイプに、書くほうのプロセスを覚えさせる (a に書くのは wa、b に書くのは wb)
+pub fn set_creds(k: &Kind, rx: (u32, u32, u32), tx: (u32, u32, u32)) {
+    if let Kind::Pair(r, t) = k {
+        r.borrow_mut().cred = Some(rx);
+        t.borrow_mut().cred = Some(tx);
+    }
 }
 
 pub type UnixRef = Rc<RefCell<Unix>>;
@@ -62,7 +86,7 @@ fn key(u: &UnixRef) -> usize {
 }
 
 pub fn new_kind() -> Kind {
-    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None })))
+    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0) })))
 }
 
 /// poll 用: listen 中で待っている相手がいれば読める
@@ -120,6 +144,7 @@ pub fn listen(f: &FileRef) -> R {
     if u.backlog.is_none() {
         u.backlog = Some(VecDeque::new());
     }
+    u.owner = me();
     Ok(0)
 }
 
@@ -133,6 +158,8 @@ pub fn connect(f: &FileRef, addr: usize, len: usize) -> R {
     let (mine, theirs) = Pipe::pair();
     {
         let mut lb = l.borrow_mut();
+        // 自分が読むほうに書くのは listen したプロセス、相手が読むほうに書くのは自分
+        set_creds(&mine, lb.owner, me());
         let q = lb.backlog.as_mut().ok_or(-ECONNREFUSED)?;
         q.push_back(file::new(theirs, file::O_RDWR));
     }
