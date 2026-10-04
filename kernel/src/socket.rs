@@ -431,7 +431,12 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
             let h = tcp_new()?;
             let port = s.local.map(|l| l.port).filter(|&p| p != 0).unwrap_or_else(ephemeral);
             let net = n()?;
-            if net.sockets.get_mut::<tcp::Socket>(h).connect(net.iface.context(), ep, port).is_err() {
+            // 127.x へは 127.0.0.1 から (Linux と同じ。ほかは smoltcp が eth0 のアドレスを選ぶ)
+            let local = match ep.addr {
+                IpAddress::Ipv4(a) if a.octets()[0] == 127 => IpListenEndpoint { addr: Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))), port },
+                _ => IpListenEndpoint { addr: None, port },
+            };
+            if net.sockets.get_mut::<tcp::Socket>(h).connect(net.iface.context(), ep, local).is_err() {
                 net.sockets.remove(h);
                 return Err(-EINVAL);
             }
