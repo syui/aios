@@ -415,11 +415,18 @@ impl Shell {
         }
         // コマンドが見つからない: not_found のプラグインにまかせる (答えに status があれば、それが結果)
         if self.plugins.wants("not_found") && self.find(&r.args[0]).is_none() {
+            // env: いまの環境 (export したものと、このコマンドの前の VAR=x)。プラグインは起こされたときの環境しか
+            // 知らないので、あとで変えた PATH などもここで渡す
+            let mut env: serde_json::Map<String, serde_json::Value> = std::env::vars().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+            for (k, v) in &r.assigns {
+                env.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
             let ev = serde_json::json!({
                 "args": r.args,
                 "line": self.text,
                 "pwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
                 "status": self.status,
+                "env": env,
             });
             if let Some(st) = self.plugins.ask("not_found", ev).and_then(|v| v["status"].as_i64()) {
                 return st as i32;

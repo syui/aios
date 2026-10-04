@@ -1,0 +1,9 @@
+[package]
+name = "aish-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aish-plugin.workspace = true
+libc = "0.2"
