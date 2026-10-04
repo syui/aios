@@ -15,6 +15,9 @@ use std::sync::Arc;
 /// MCP のサーバーのプロセス (exit でサーバーを終わらせない。子やサブシェルの exit はふつうに)
 pub static PID: AtomicI32 = AtomicI32::new(0);
 
+/// --json: 答えを structuredContent の JSON でも返す (ふだんは読む形の text だけ)
+static JSON: AtomicBool = AtomicBool::new(false);
+
 /// 時間切れになった run (シェルはそこで次のコマンドへ進まずに終える)
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -64,8 +67,11 @@ const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも�
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。";
 
 impl Shell {
-    pub fn mcp(&mut self, rcs: &[String]) -> ! {
+    pub fn mcp(&mut self, args: &[String]) -> ! {
         PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
+        // aish --mcp [--json] [RC...]
+        JSON.store(args.iter().any(|a| a == "--json"), Ordering::Relaxed);
+        let rcs: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
         unsafe { std::env::set_var("AISH_MCP", "1") };
         // プロトコルは自分だけが使う fd で話す。0 は /dev/null、1 は 2 (標準エラー) にして、
         // 設定や子が標準入力を食べたり、標準出力に書いてプロトコルをこわしたりしないように
@@ -169,7 +175,13 @@ impl Shell {
             r
         };
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
-        json!({ "content": [{ "type": "text", "text": render(&r) }], "structuredContent": r, "isError": is_err })
+        // ふだんは読む形の text だけ (Claude Code は structuredContent があるとそちらを Claude に見せるので)。
+        // aish --mcp --json なら、いままでどおり JSON (ほかのプログラムがつなぐとき)
+        if JSON.load(Ordering::Relaxed) {
+            json!({ "content": [{ "type": "text", "text": r.to_string() }], "structuredContent": r, "isError": is_err })
+        } else {
+            json!({ "content": [{ "type": "text", "text": render(&r) }], "isError": is_err })
+        }
     }
 
     /// run: 同じシェルで動かし、標準出力と標準エラーを分けて受ける
