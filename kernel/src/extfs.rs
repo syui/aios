@@ -955,22 +955,27 @@ impl ExtFs {
             let (b, off) = self.sb_block();
             self.modify_block(b, |d| d[off..off + 1024].copy_from_slice(&data))?;
         }
-        // ファイルの中身を先に (data=ordered)
-        let data: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().data).into_iter().collect();
-        if let Err(e) = self.write_blocks(&data) {
-            // 書けなかったものは覚えたまま (次の flush でもう一度)。捨てると古い中身が残る
-            self.cache.borrow_mut().data.extend(data);
-            return Err(e);
+        // ファイルの中身を先に (data=ordered)。印 (data / dirty) は書き終えてから外す: 書いているあいだに
+        // キャッシュがいっぱいになると evict_one が印のないページを捨てるので、先に外すと、まだ書いていない
+        // ページが捨てられて、ディスクの古い中身 (消したファイルのものなど) が書かれてしまう
+        let data: Vec<u64> = self.cache.borrow().data.iter().copied().collect();
+        self.write_blocks(&data)?;
+        {
+            let mut c = self.cache.borrow_mut();
+            for b in &data {
+                c.data.remove(b);
+            }
         }
-        let meta: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().dirty).into_iter().collect();
+        let meta: Vec<u64> = self.cache.borrow().dirty.iter().copied().collect();
         if meta.is_empty() {
             return Ok(());
         }
-        let r = self.flush_meta(&meta);
-        if r.is_err() {
-            self.cache.borrow_mut().dirty.extend(meta);
+        self.flush_meta(&meta)?;
+        let mut c = self.cache.borrow_mut();
+        for b in &meta {
+            c.dirty.remove(b);
         }
-        r
+        Ok(())
     }
 
     fn flush_meta(&self, meta: &[u64]) -> Result<(), i64> {
