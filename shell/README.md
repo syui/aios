@@ -67,8 +67,10 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 - `run {cmd, bg: true}` はうしろで動かしてすぐ `{job, pid}` を答える (シェルを fork した子なので、`cd` などはその中だけ)。
   `job {id, wait_ms?, kill?}` で様子と出力 (`{done, status, out, err, ms}`。id がなければ一覧)。重いビルドのあいだも
   ほかのツールが使える
-- 答えの `structuredContent` は JSON。Claude が読む `content` の text は読みやすい形にする: `out` と `text` (read、hit) は
-  エスケープせずにそのまま、`err` は `[err]` のあと、grep は 1 行に 1 つ (`n path:line: text`)、ほかは終わりに 1 行の JSON
+- 答えの `content` の text は読みやすい形: `out` と `text` (read、hit) はエスケープせずにそのまま、`err` は `[err]` のあと、
+  grep は 1 行に 1 つ (`n path:line: text`)、ほかは終わりに 1 行の JSON。`aish --mcp --json` なら、いままでどおり
+  JSON の text と `structuredContent` (ほかのプログラムがつなぐとき。Claude Code は structuredContent があると
+  そちらを見せるので、ふだんは付けない)
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
   `cd` や変数、関数は次の `run` に残る。時間切れ (既定 50 秒。Claude Code はツールの答えを 60 秒しか待たないので、長いものは `bg` で) なら子と孫を止めて `status: 124, timeout: true`。
   `exit` はその `run` だけを終える
