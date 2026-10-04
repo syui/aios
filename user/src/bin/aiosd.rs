@@ -6,11 +6,17 @@
 //     {"op":"power","action":"reboot|poweroff"}
 //     {"op":"apply"}      /etc/aios.json のとおりにそろえる (記録は /var/lib/aios/history/N.json)
 //     {"op":"rollback"}   ひとつ前の apply の設定に戻す (/etc/aios.json も戻し、そのとき入れたパッケージは外す)
+//     {"op":"src"}        /usr/src/aios を作る (root:wheel、2775。中身は aios src が wheel の人として git clone)
+//     {"op":"kernel","action":"install","path":"/usr/src/aios/target/Image"}
+//                         /boot/Image を入れかえる。前のものは /boot/Image.prev (起動の一覧の「previous kernel」)
+//     {"op":"kernel","action":"revert"}   /boot/Image と /boot/Image.prev を入れかえる
 //   答え: {"ok":true|false,"status":N,"out":"...","err":"..."}
 // だれが頼んだかは SO_PEERCRED で見る。変える操作は root と wheel のグループの人だけ。
 // したことは /var/log/aiosd.log に 1 行 1 つの JSON で残す。読むだけのこと (状態) は aios get が自分で集める
 #[path = "../lib/config.rs"]
 mod config;
+#[path = "../lib/image.rs"]
+mod image;
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
@@ -164,7 +170,20 @@ fn handle(req: &Value, uid: u32, pid: i32) -> Value {
             record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
             return r;
         }
-        _ => return fail(format!("unknown op {:?} (ping service pkg power apply rollback)", op)),
+        "src" | "kernel" => {
+            if !allowed(uid) {
+                return deny(uid, pid, req);
+            }
+            let _busy = BUSY.lock();
+            let r = if op == "src" { src_init() } else { kernel(s(req, "action"), s(req, "path")) };
+            let r = match r {
+                Ok(msg) => json!({ "ok": true, "status": 0, "out": msg }),
+                Err(e) => fail(e),
+            };
+            record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
+            return r;
+        }
+        _ => return fail(format!("unknown op {:?} (ping service pkg power apply rollback src kernel)", op)),
     };
     if !allowed(uid) {
         return deny(uid, pid, req);
@@ -251,4 +270,66 @@ fn apply_cfg(cfg: &Value, uid: u32, rollback_of: Option<u64>) -> Value {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let n = config::write_history(&json!({ "t": t, "uid": uid, "config": cfg, "steps": done, "installed": installed, "rollback_of": rollback_of }));
     json!({ "ok": all_ok, "n": n, "steps": done })
+}
+
+// ---- 改造 (段階 4) ----
+
+const SRC: &str = "/usr/src/aios";
+
+/// /usr/src/aios を wheel の人が書ける場所にする (中身は作らない)
+fn src_init() -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(SRC).map_err(|e| format!("{}: {}", SRC, e))?;
+    let gid = std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|g| g.lines().find_map(|l| l.strip_prefix("wheel:")?.split(':').nth(1)?.parse::<u32>().ok()))
+        .ok_or("no wheel group")?;
+    let c = std::ffi::CString::new(SRC).unwrap_or_default();
+    if unsafe { libc::chown(c.as_ptr(), 0, gid) } != 0 {
+        return Err(format!("chown {}: {}", SRC, std::io::Error::last_os_error()));
+    }
+    // setgid: 中に作るものも wheel のグループになる
+    std::fs::set_permissions(SRC, std::fs::Permissions::from_mode(0o2775)).map_err(|e| format!("chmod {}: {}", SRC, e))?;
+    Ok(format!("{} (root:wheel 2775)\n", SRC))
+}
+
+/// /boot/Image を入れかえる / 戻す。前のものは /boot/Image.prev と、起動の一覧の entry に残す
+fn kernel(action: &str, path: &str) -> Result<String, String> {
+    const IMAGE: &str = "/boot/Image";
+    const PREV: &str = "/boot/Image.prev";
+    match action {
+        "install" => {
+            let new = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+            if !image::is_image(&new) {
+                return Err(format!("{}: not an arm64 Image (aios build kernel makes one)", path));
+            }
+            if std::path::Path::new(IMAGE).exists() {
+                std::fs::copy(IMAGE, PREV).map_err(|e| format!("{} -> {}: {}", IMAGE, PREV, e))?;
+            }
+            std::fs::write(IMAGE, &new).map_err(|e| format!("{}: {}", IMAGE, e))?;
+            prev_entry()?;
+            Ok(format!("{} <- {} ({} bytes). the old one is {}. reboot to use it; if it does not boot, pick \"previous kernel\" in the boot menu\n", IMAGE, path, new.len(), PREV))
+        }
+        "revert" => {
+            let (a, b) = (std::fs::read(IMAGE).map_err(|e| format!("{}: {}", IMAGE, e))?, std::fs::read(PREV).map_err(|e| format!("{}: {} (nothing to revert to)", PREV, e))?);
+            std::fs::write(IMAGE, &b).map_err(|e| format!("{}: {}", IMAGE, e))?;
+            std::fs::write(PREV, &a).map_err(|e| format!("{}: {}", PREV, e))?;
+            Ok(format!("{} and {} swapped. reboot to use it\n", IMAGE, PREV))
+        }
+        a => Err(format!("kernel: unknown action {:?} (install revert)", a)),
+    }
+}
+
+/// 起動の一覧に前のカーネルを出し (prev-aios.conf。default の aios* には当たらない名前)、
+/// 一覧が出るように timeout を 0 から 3 秒にする
+fn prev_entry() -> Result<(), String> {
+    let dir = "/boot/loader/entries";
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
+    std::fs::write(format!("{}/prev-aios.conf", dir), "title   aios (previous kernel)\nlinux   /Image.prev\n").map_err(|e| format!("{}: {}", dir, e))?;
+    let conf = "/boot/loader/loader.conf";
+    if let Ok(t) = std::fs::read_to_string(conf) {
+        let fixed: Vec<String> = t.lines().map(|l| if l.split_whitespace().collect::<Vec<_>>() == ["timeout", "0"] { "timeout 3".to_string() } else { l.to_string() }).collect();
+        let _ = std::fs::write(conf, fixed.join("\n") + "\n");
+    }
+    Ok(())
 }

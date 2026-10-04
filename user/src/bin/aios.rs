@@ -12,8 +12,14 @@
 //   aios rollback              ひとつ前の apply の設定に戻す (aiosd に頼む)
 //   aios history [N]           apply の記録
 //   aios config                いまの状態を aios.json の形で (はじめて作るとき: aios config | sudo tee /etc/aios.json)
+//   aios src                   aios のソースを /usr/src/aios に (なければ git clone、あれば git pull。wheel の人)
+//   aios build kernel          /usr/src/aios のカーネルをビルドして target/Image に (起動できる形)
+//   aios install kernel [IMAGE] | --revert
+//                              /boot/Image を入れかえる (aiosd に頼む)。前のものは起動の一覧の「previous kernel」
 #[path = "../lib/config.rs"]
 mod config;
+#[path = "../lib/image.rs"]
+mod image;
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
@@ -52,6 +58,9 @@ fn main() {
         Some("apply") => send(serde_json::json!({ "op": "apply" }), args.iter().any(|a| a == "--json")),
         Some("rollback") => send(serde_json::json!({ "op": "rollback" }), args.iter().any(|a| a == "--json")),
         Some("history") => history(args.get(1)),
+        Some("src") => src(),
+        Some("build") if args.get(1).map(String::as_str) == Some("kernel") => build_kernel(),
+        Some("install") if args.get(1).map(String::as_str) == Some("kernel") => install_kernel(args.get(2)),
         Some("config") => println!("{}", serde_json::to_string_pretty(&config::export()).unwrap_or_default()),
         Some("-h" | "--help" | "help") => usage(0),
         Some(c) => {
@@ -68,6 +77,7 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios do pkg install|remove NAME... | pkg upgrade | pkg refresh");
     eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
     eprintln!("       aios diff | apply | rollback | history [N] | config   (/etc/aios.json)");
+    eprintln!("       aios src | build kernel | install kernel [IMAGE] | install kernel --revert   (改造)");
     std::process::exit(code)
 }
 
@@ -228,6 +238,86 @@ fn history(n: Option<&String>) {
             None => "apply".into(),
         };
         println!("{:>4}  t={}  uid={}  {}  {} steps{}", n, r["t"], r["uid"], what, steps, if bad > 0 { format!(", {} failed", bad) } else { String::new() });
+    }
+}
+
+// ---- 改造 ----
+
+const SRC: &str = "/usr/src/aios";
+const REPO: &str = "https://git.syui.ai/ai/os";
+
+fn src_dir() -> String {
+    std::env::var("AIOS_SRC").unwrap_or_else(|_| SRC.to_string())
+}
+
+fn sh(cmd: &mut std::process::Command) -> bool {
+    cmd.status().is_ok_and(|s| s.success())
+}
+
+/// aios src: なければ git clone (場所は aiosd に作ってもらう)、あれば git pull
+fn src() {
+    let dir = src_dir();
+    if std::path::Path::new(&dir).join(".git").exists() {
+        if !sh(std::process::Command::new("git").args(["-C", &dir, "pull", "--ff-only"])) {
+            std::process::exit(1);
+        }
+    } else {
+        if dir == SRC && !std::path::Path::new(SRC).exists() {
+            let (_, r) = ask(&serde_json::json!({ "op": "src" }));
+            if r["ok"] != true {
+                eprintln!("aios src: {}", r["err"].as_str().unwrap_or("aiosd failed"));
+                std::process::exit(1);
+            }
+        }
+        if !sh(std::process::Command::new("git").args(["clone", "-b", "unix", REPO, &dir])) {
+            std::process::exit(1);
+        }
+    }
+    let _ = sh(std::process::Command::new("git").args(["-C", &dir, "log", "--oneline", "-1"]));
+}
+
+/// aios build kernel: AIOS_INITRD=none でビルドして、ELF から Image を作る
+fn build_kernel() {
+    let dir = src_dir();
+    let rev = std::process::Command::new("git").args(["-C", &dir, "rev-parse", "--short", "HEAD"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let ok = sh(std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "aios"])
+        .current_dir(format!("{}/kernel", dir))
+        .env("AIOS_INITRD", "none")
+        .env("AIOS_RELEASE", format!("src-{}", if rev.is_empty() { "dirty" } else { &rev })));
+    if !ok {
+        eprintln!("aios build kernel: cargo build failed");
+        std::process::exit(1);
+    }
+    let elf = format!("{}/target/aarch64-unknown-none-softfloat/release/aios", dir);
+    let out = format!("{}/target/Image", dir);
+    let img = std::fs::read(&elf).map_err(|e| format!("{}: {}", elf, e)).and_then(|e| image::elf_to_image(&e));
+    match img.and_then(|i| std::fs::write(&out, &i).map(|_| i.len()).map_err(|e| format!("{}: {}", out, e))) {
+        Ok(n) => println!("{} ({} bytes, src-{}). next: aios install kernel", out, n, rev),
+        Err(e) => {
+            eprintln!("aios build kernel: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// aios install kernel [IMAGE] | --revert
+fn install_kernel(arg: Option<&String>) {
+    let req = match arg.map(String::as_str) {
+        Some("--revert") => serde_json::json!({ "op": "kernel", "action": "revert" }),
+        p => {
+            let path = p.map(String::from).unwrap_or_else(|| format!("{}/target/Image", src_dir()));
+            let abs = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path);
+            serde_json::json!({ "op": "kernel", "action": "install", "path": abs })
+        }
+    };
+    let (_, r) = ask(&req);
+    match r["err"].as_str() {
+        Some(e) => {
+            eprintln!("aios install kernel: {}", e);
+            std::process::exit(1);
+        }
+        None => print!("{}", r["out"].as_str().unwrap_or("")),
     }
 }
 
