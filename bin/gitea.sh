@@ -4,6 +4,8 @@
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する)
+#   bin/gitea.sh release ディスクのイメージ (aios-unix-aarch64.img.zst) を作り、ai/os のリリース unix-latest に置きかえる
+#                        (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -19,7 +21,7 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -97,6 +99,33 @@ case "$1" in
     git commit -q -m "aarch64: update packages" -m "$changes"
     git -c "$(auth)" push -q --force origin new:main
     echo "ai/repo: pushed $(git rev-parse --short HEAD) (history squashed)"
+    ;;
+  release)
+    # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース unix-latest に
+    # 置きかえる。rootfs はこのリポジトリと repo/aarch64 のパッケージから作る (AIOS_SERVER から取るなら -r)
+    api=$host/api/v1/repos/ai/os
+    hdr=
+    [ -n "$GITEA_TOKEN" ] && hdr="Authorization: token $GITEA_TOKEN"
+    call() { curl -fsS ${hdr:+-H "$hdr"} "$@"; }
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    bin/mkrootfs.sh ${AIOS_RELEASE_REMOTE:+-r} all > "$tmp/rootfs.log" 2>&1 || { tail "$tmp/rootfs.log" >&2; exit 1; }
+    SWAP=256M bin/mkdisk.sh 3G
+    zstd -q -19 -T0 -f disk.img -o "$tmp/aios-unix-aarch64.img.zst"
+    ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
+    sha=$(git rev-parse HEAD)
+    # 前の unix-latest (リリースとタグ) を消す
+    old=$(call "$api/releases/tags/unix-latest" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
+    [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
+    call -X DELETE "$api/tags/unix-latest" > /dev/null 2>&1 || true
+    notes=$(printf '%s\n' '```sh' '# brew install qemu zstd' 'git clone -b unix https://git.syui.ai/ai/os aios && cd aios' \
+      'curl -fLO https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst' './bin/run.sh' '```' '' 'exit: `sudo poweroff`')
+    body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": "unix-latest", "target_commitish": sys.argv[1], "name": "unix-latest (" + sys.argv[2] + ")", "body": sys.argv[3], "prerelease": True}))' "$sha" "$ver" "$notes")
+    id=$(call -X POST -H 'Content-Type: application/json' -d "$body" "$api/releases" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+    [ -n "$id" ] || { echo "ai/os: could not create the release" >&2; exit 1; }
+    call -X POST -F "attachment=@$tmp/aios-unix-aarch64.img.zst" "$api/releases/$id/assets?name=aios-unix-aarch64.img.zst" > /dev/null
+    echo "ai/os: released unix-latest ($ver, $(du -h "$tmp/aios-unix-aarch64.img.zst" | cut -f1))"
+    echo "  $host/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst"
     ;;
   *)
     usage
