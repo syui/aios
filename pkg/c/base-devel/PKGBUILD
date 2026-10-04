@@ -38,7 +38,7 @@ for a in "\$@"; do
   set -- "\$@" "\$a"
 done
 # rustc のリンカとして (-nodefaultlibs) -static なしで呼ばれたら動的リンク (target-feature=-crt-static。cargo.sh)
-[ -n "\$rustc" ] && [ -z "\$static" ] && link=
+[ -n "\$rustc" ] && [ -z "\$static" ] && link=-dynamic
 exec /opt/zig/zig $2 -target aarch64-linux-musl \$link -fno-sanitize=undefined -I/opt/c/include -L/opt/c/lib "\$@"
 SH
     chmod 755 "$d/$1"
