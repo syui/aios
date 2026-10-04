@@ -20,6 +20,7 @@ bindkey                       # 一覧
 | `aish-pick` | base | C-r 履歴 / C-f ファイル / C-g rg で探して開く / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
 | `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ。`edits` でいくつも、ぜんぶかなにもしないか) `write` `grep` (ripgrep があればそれで。よく使うファイルが先で、見つけた行に番号 `n`) `hit` (n 番のまわり) `each` (見つけた行だけ置きかえる) `sed` (`each` と `sed` は `subs` で何組も) `lines` (行の番号で) `undo`。`aish --mcp` で読む |
 | `aish-map` | base | 探さなくていいように: ツール `where` (名前から定義の場所。ぴったり → 前が同じ → 含む、よく使うファイルが先) `outline` (ファイルの中の定義)。M-. で選んで `$EDITOR +行 ファイル`。rg が要る |
+| `aish-fix` | base | vim の quickfix: ツール `build` (うしろでビルドして、エラーを番号 `n` つきで `n path:line: error[E..]: ...`。cargo には `--message-format=json` を足して rustc の診断をそのまま読み、cc や zig は `path:line:col: error:` の行を拾う。`wait_ms` を過ぎたら `running`) `errors` (待って同じ形で。`kill` で止める) `fix` (n 番の全文とまわりのソース)。M-e でビルドして選んで `$EDITOR +行 ファイル` |
 | `aish-claude` | base | 見つからなかったコマンドの行を `claude -p` に渡し、答えを端末に出す (claude があれば。人が打つときだけ。`AISH_CLAUDE=0` で止める)。aios の Claude Code は `/etc/claude-code/managed-mcp.json` で `aish --mcp` を使う |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
