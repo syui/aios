@@ -780,7 +780,9 @@ impl ExtFs {
         self.sb_add_free_blocks(1);
         let mut c = self.cache.borrow_mut();
         c.bb_dirty.insert(g);
+        // 捨てたブロックは書き出さない (data に残すと、flush がディスクの古い中身を読んで書き戻す)
         c.dirty.remove(&b);
+        c.data.remove(&b);
         if let Some(p) = c.map.remove(&b) {
             kalloc::free(p);
             c.order.retain(|&x| x != b);
@@ -955,20 +957,32 @@ impl ExtFs {
         }
         // ファイルの中身を先に (data=ordered)
         let data: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().data).into_iter().collect();
-        self.write_blocks(&data)?;
+        if let Err(e) = self.write_blocks(&data) {
+            // 書けなかったものは覚えたまま (次の flush でもう一度)。捨てると古い中身が残る
+            self.cache.borrow_mut().data.extend(data);
+            return Err(e);
+        }
         let meta: Vec<u64> = core::mem::take(&mut self.cache.borrow_mut().dirty).into_iter().collect();
         if meta.is_empty() {
             return Ok(());
         }
+        let r = self.flush_meta(&meta);
+        if r.is_err() {
+            self.cache.borrow_mut().dirty.extend(meta);
+        }
+        r
+    }
+
+    fn flush_meta(&self, meta: &[u64]) -> Result<(), i64> {
         let mut j = self.journal.borrow_mut();
         if let Some(jr) = j.as_mut() {
-            if self.journal_commit(jr, &meta)? {
-                self.write_blocks(&meta)?;
+            if self.journal_commit(jr, meta)? {
+                self.write_blocks(meta)?;
                 return self.journal_done(jr);
             }
         }
         // ジャーナルがない (ext2 など) か、1 つのトランザクションに入りきらない
-        self.write_blocks(&meta)
+        self.write_blocks(meta)
     }
 
     /// ブロックをディスクの本当の場所へ。となりあうものは 1 回の要求にまとめる
