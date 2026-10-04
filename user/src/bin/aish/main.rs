@@ -17,6 +17,7 @@ mod expand;
 mod glob;
 mod jobs;
 mod mcp;
+mod trap;
 mod parse;
 mod plugin;
 
@@ -101,7 +102,7 @@ pub struct Shell {
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
-    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -114,6 +115,8 @@ fn flush() {
 }
 
 fn exit_shell(st: i32) -> ! {
+    // EXIT の trap (trap を置いたシェルのプロセスだけ)
+    trap::run_exit();
     flush();
     std::process::exit(st)
 }
@@ -219,7 +222,17 @@ impl Shell {
         self.status
     }
 
+    /// 来たシグナルの trap を動かす ($? は変えない)
+    fn run_traps(&mut self) {
+        for cmd in trap::take_pending() {
+            let st = self.status;
+            self.run_source(&cmd, "trap");
+            self.status = st;
+        }
+    }
+
     fn run_list(&mut self, list: &List) -> i32 {
+        self.run_traps();
         for item in list {
             if self.flow != Flow::None || mcp::stopped() {
                 break;
@@ -236,6 +249,7 @@ impl Shell {
             } else {
                 self.status = self.run_andor(&item.ao);
             }
+            self.run_traps();
         }
         self.status
     }
@@ -899,6 +913,12 @@ impl Shell {
                 exit_shell(st & 0xff)
             }
             "cd" => {
+                // -L / -P (POSIX)。aish の cd はいつもリンクをたどったあとの場所 (カーネルの getcwd) なので、どちらも同じ
+                let a: Vec<String> = {
+                    let k = a.iter().take_while(|x| matches!(x.as_str(), "-L" | "-P" | "-LP" | "-PL")).count();
+                    let k = if a.get(k).is_some_and(|x| x == "--") { k + 1 } else { k };
+                    a[k..].to_vec()
+                };
                 let dir = match a.first().map(|s| s.as_str()) {
                     None => self.get_var("HOME").unwrap_or_else(|| "/".into()),
                     Some("-") => {
@@ -929,6 +949,7 @@ impl Shell {
                     }
                 }
             }
+            "trap" => trap::builtin(a),
             "umask" => {
                 match a.first() {
                     None => {
@@ -949,6 +970,7 @@ impl Shell {
                 0
             }
             "pwd" => {
+                // -L / -P も (どちらもリンクをたどったあとの場所)
                 println!("{}", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
                 0
             }
@@ -1662,6 +1684,7 @@ fn main() {
             ps.push(args[0].clone());
         }
         let mut sh = Shell::new(ps);
+        trap::set_shell(&mut sh);
         let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
     }
@@ -1671,6 +1694,7 @@ fn main() {
     }
     // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);
+    trap::set_shell(&mut sh);
     // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
     if let Ok(cwd) = std::env::current_dir() {
         let cwd = cwd.display().to_string();
