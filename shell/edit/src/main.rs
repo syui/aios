@@ -15,15 +15,15 @@ use aish_plugin::{Spec, Tool, Value, error, json, s};
 use std::path::{Path, PathBuf};
 
 const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}},"required":["path"]}"#;
-const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"}},"required":["path","old","new"]}"#;
+const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない"}},"required":["path"]}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
 const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
-const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"}},"required":["path","pattern","replace"]}"#;
+const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"}},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
 const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
 const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
 
 const HIT: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"grep の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"}},"required":["n"]}"#;
-const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean"},"i":{"type":"boolean"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"}},"required":["pattern","replace"]}"#;
+const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean"},"i":{"type":"boolean"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}}}"#;
 
 /// 取り消すための写しの数
 const KEEP: usize = 100;
@@ -111,6 +111,46 @@ fn matcher(a: &Value) -> Result<regex::Regex, Value> {
     }
     let pat = if a["regex"].as_bool().unwrap_or(false) { pat.to_string() } else { regex::escape(pat) };
     regex::RegexBuilder::new(&pat).case_insensitive(a["i"].as_bool().unwrap_or(false)).build().map_err(|e| error(e))
+}
+
+/// 置きかえ (sed と each): pattern → replace か、subs: [{pattern, replace, regex?, i?}, ...] を順に。
+/// regex と i は、subs の中になければ外のものを使う
+struct Subs(Vec<(regex::Regex, String, bool)>);
+
+impl Subs {
+    /// 順にあてた行と、置きかえた数
+    fn apply(&self, l: &str) -> (String, usize) {
+        let mut cur = l.to_string();
+        let mut n = 0;
+        for (re, rep, lit) in &self.0 {
+            let k = re.find_iter(&cur).count();
+            if k > 0 {
+                n += k;
+                cur = if *lit { re.replace_all(&cur, regex::NoExpand(rep)).into_owned() } else { re.replace_all(&cur, rep.as_str()).into_owned() };
+            }
+        }
+        (cur, n)
+    }
+}
+
+fn subs(a: &Value) -> Result<Subs, Value> {
+    let list: Vec<Value> = match a["subs"].as_array() {
+        Some(v) if !v.is_empty() => v.clone(),
+        Some(_) => return Err(error("subs is empty")),
+        None => vec![a.clone()],
+    };
+    let mut out = Vec::new();
+    for (k, x) in list.iter().enumerate() {
+        let mut x = x.clone();
+        for f in ["regex", "i"] {
+            if x.get(f).is_none() {
+                x[f] = a[f].clone();
+            }
+        }
+        let re = matcher(&x).map_err(|e| if list.len() > 1 { error(format!("{} (subs[{}])", s(&e, "error"), k)) } else { e })?;
+        out.push((re, s(&x, "replace").to_string(), !x["regex"].as_bool().unwrap_or(false)));
+    }
+    Ok(Subs(out))
 }
 
 /// 長い行は切る (minify した JS など。答えが読めなくならないように)
@@ -301,7 +341,7 @@ fn range(r: &str) -> Option<(usize, usize)> {
 }
 
 fn sed(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
-    let re = match matcher(a) {
+    let re = match subs(a) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -310,24 +350,16 @@ fn sed(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
         Ok(t) => t,
         Err(e) => return error(format!("{}: {}", path.display(), e)),
     };
-    let rep = s(a, "replace");
-    let lit = !a["regex"].as_bool().unwrap_or(false);
     let mut out = String::new();
     let mut n = 0;
     let mut changed = Vec::new();
     for (i, l) in text.split_inclusive('\n').enumerate() {
-        let k = re.find_iter(l).count();
-        if (from..=to).contains(&(i + 1)) && k > 0 {
+        let (new, k) = if (from..=to).contains(&(i + 1)) { re.apply(l) } else { (l.to_string(), 0) };
+        if k > 0 {
             n += k;
             changed.push(i + 1);
-            if lit {
-                out.push_str(&re.replace_all(l, regex::NoExpand(rep)));
-            } else {
-                out.push_str(&re.replace_all(l, rep));
-            }
-        } else {
-            out.push_str(l);
         }
+        out.push_str(&new);
     }
     if n == 0 {
         return error(format!("{}: pattern not found", path.display()));
@@ -402,27 +434,42 @@ fn read(path: &Path, a: &Value) -> Value {
     json!({ "path": path.display().to_string(), "lines": lines.len(), "text": out })
 }
 
+/// edit: old → new。edits: [{old, new, all?}, ...] なら順に (前のものを変えたあとの中身に) あてて、
+/// どれかがしくじれば何も書かない (ぜんぶか、なにもしないか)
 fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
-    let (old, new) = (s(a, "old"), s(a, "new"));
-    if old.is_empty() {
-        return error("old is empty");
+    let list: Vec<Value> = match a["edits"].as_array() {
+        Some(v) => v.clone(),
+        None => vec![a.clone()],
+    };
+    if list.is_empty() {
+        return error("edits is empty");
     }
-    let text = match std::fs::read_to_string(path) {
+    let mut text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => return error(format!("{}: {}", path.display(), e)),
     };
-    let n = text.matches(old).count();
-    let all = a["all"].as_bool().unwrap_or(false);
-    if n == 0 {
-        return error(format!("{}: old not found", path.display()));
+    let mut replaced = 0;
+    for (i, e) in list.iter().enumerate() {
+        // いくつもあるときは、どれでしくじったか (edits の何番目か) を言う
+        let at = if list.len() > 1 { format!(" (edits[{}])", i) } else { String::new() };
+        let (old, new) = (s(e, "old"), s(e, "new"));
+        if old.is_empty() {
+            return error(format!("old is empty{}", at));
+        }
+        let n = text.matches(old).count();
+        let all = e["all"].as_bool().unwrap_or(false);
+        if n == 0 {
+            return error(format!("{}: old not found{}", path.display(), at));
+        }
+        if n > 1 && !all {
+            return error(format!("{}: old found {} times (make it longer, or all: true){}", path.display(), n, at));
+        }
+        text = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
+        replaced += if all { n } else { 1 };
     }
-    if n > 1 && !all {
-        return error(format!("{}: old found {} times (make it longer, or all: true)", path.display(), n));
-    }
-    let out = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
-    match write(path, out.as_bytes(), snaps) {
+    match write(path, text.as_bytes(), snaps) {
         r if r.get("error").is_some() => r,
-        _ => json!({ "path": path.display().to_string(), "replaced": if all { n } else { 1 } }),
+        _ => json!({ "path": path.display().to_string(), "replaced": replaced }),
     }
 }
 
@@ -438,7 +485,7 @@ fn hit(a: &Value, hits: &[Hit]) -> Value {
 }
 
 fn each(a: &Value, hits: &mut [Hit], snaps: &mut Vec<Snap>) -> Value {
-    let re = match matcher(a) {
+    let re = match subs(a) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -446,8 +493,6 @@ fn each(a: &Value, hits: &mut [Hit], snaps: &mut Vec<Snap>) -> Value {
         return error("grep first");
     }
     let only: Vec<usize> = a["only"].as_array().map(|v| v.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect()).unwrap_or_default();
-    let rep = s(a, "replace");
-    let lit = !a["regex"].as_bool().unwrap_or(false);
     let mut changed = Vec::new();
     let mut skipped = Vec::new();
     // ファイルごとに読んで、まとめて書く
@@ -481,11 +526,11 @@ fn each(a: &Value, hits: &mut [Hit], snaps: &mut Vec<Snap>) -> Value {
                 skipped.push(json!({ "n": i + 1, "why": "changed since grep", "now": clip_line(body) }));
                 continue;
             }
-            if !re.is_match(body) {
+            let (new, k) = re.apply(body);
+            if k == 0 {
                 skipped.push(json!({ "n": i + 1, "why": "pattern not in this line" }));
                 continue;
             }
-            let new = if lit { re.replace_all(body, regex::NoExpand(rep)).into_owned() } else { re.replace_all(body, rep).into_owned() };
             *l = format!("{}{}", new, end);
             changed.push(json!({ "n": i + 1, "path": h.shown, "line": h.line, "text": clip_line(&new) }));
             h.text = new;
