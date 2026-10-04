@@ -1,13 +1,13 @@
 # cargo: Rust (rustc, cargo, rust-std) を aios の中で使う (aios を aios の中でビルドするため)。sudo ap -S cargo
 #   Rust の公式のビルド (aarch64-unknown-linux-musl) を、入れるとき (post_install) に
-#   static.rust-lang.org から取ってきて /usr に入れる (sha256 を確かめる)。大きい (取るのは 290 MB、入れると 1 GB ほど) ので
+#   static.rust-lang.org から取ってきて /usr に入れる (sha256 を確かめる)。大きい (取るのは 330 MB、入れると 1 GB ほど) ので
 #   パッケージには入れない (git.syui.ai は 1 回 100 MB まで)。rust-std は aarch64-unknown-linux-musl
-#   (aios のユーザープログラム) と aarch64-unknown-none-softfloat (aios のカーネル)。
+#   (aios のユーザープログラム)、aarch64-unknown-none-softfloat (aios のカーネル)、aarch64-unknown-uefi (aiboot)。
 #   リンクは rust-lld (/etc/profile.d/cargo.sh で CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld)。
 #   C の部分がある crate は base-devel (zig の cc) で。入れたファイルは /usr/lib/rustlib/aios-cargo.files
 pkgname=cargo
 pkgver=1.99.0
-pkgrel=3
+pkgrel=4
 pkgdesc='Rust compiler and cargo, installed from static.rust-lang.org (aarch64-unknown-linux-musl)'
 arch=('any')
 url='https://www.rust-lang.org'
