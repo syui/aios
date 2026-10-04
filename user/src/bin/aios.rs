@@ -1,8 +1,15 @@
-// aios: aios の様子をロゴといっしょに出す (neofetch のようなもの)。あとに /etc/motd も
-//   aios   起動のときは motd.service が動かす
+// aios: aios を把握・設定・操作するコマンド (doc/aios.md)
+//   aios                       様子をロゴといっしょに出す (neofetch のようなもの)。あとに /etc/motd も。
+//                              起動のときは motd.service が動かす
+//   aios get [PATH] [--json]   状態の木 (host kernel mem disk proc service pkg net user boot)。
+//                              PATH は点でつなぐ (kernel.cpus、service.sshd.active)。ふだんは PATH = 値 の行
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
+#[path = "../lib/state.rs"]
+mod state;
+#[path = "../lib/unit.rs"]
+mod unit;
 
 use std::fs;
 
@@ -25,6 +32,58 @@ const BOLD: &str = "\x1b[1;33m";
 const RESET: &str = "\x1b[0m";
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => info(),
+        Some("get") => get(&args[1..]),
+        Some("-h" | "--help" | "help") => usage(0),
+        Some(c) => {
+            eprintln!("aios: unknown command {}", c);
+            usage(2)
+        }
+    }
+}
+
+fn usage(code: i32) -> ! {
+    eprintln!("usage: aios                       様子 (ロゴつき)");
+    eprintln!("       aios get [PATH] [--json]   状態の木 ({})", state::ROOTS.join(" "));
+    std::process::exit(code)
+}
+
+/// aios get [PATH] [--json]
+fn get(args: &[String]) {
+    let as_json = args.iter().any(|a| a == "--json");
+    let path = args.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("");
+    let keys: Vec<&str> = path.split('.').filter(|k| !k.is_empty()).collect();
+    // 一番上だけ集める (proc や service を見ないときは、それを集めない)
+    let tree = match keys.first() {
+        None => state::collect_all(),
+        Some(r) => match state::collect(r) {
+            Some(v) => serde_json::json!({ *r: v }),
+            None => {
+                eprintln!("aios get: {}: not found (one of: {})", r, state::ROOTS.join(" "));
+                std::process::exit(1);
+            }
+        },
+    };
+    let Some(v) = state::select(&tree, &keys) else {
+        eprintln!("aios get: {}: not found", path);
+        std::process::exit(1);
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    } else if v.is_object() || v.is_array() {
+        let mut lines = Vec::new();
+        state::flatten(path, v, &mut lines);
+        for l in lines {
+            println!("{}", l);
+        }
+    } else {
+        println!("{}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+    }
+}
+
+fn info() {
     let host = fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| uname().1);
     let uid = unsafe { libc::getuid() };
     let user = passwd_field(uid, 0).unwrap_or_default();

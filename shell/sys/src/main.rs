@@ -1,4 +1,5 @@
-// aish-sys: aios の様子を見る (aios を作るための、aish の基本のプラグイン)
+// aish-sys: aios の様子を見る (aios を作るための、aish の基本のプラグイン。doc/aios.md の Claude の入口)
+//   get     状態の木 (aios get --json。host kernel mem disk proc service pkg net user boot)
 //   sys     まとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、重いプロセス、BKL、カーネルのメッセージ
 //   procs   プロセスの一覧 (CPU の時間かメモリの順)
 //   kmsg    カーネルのメッセージ (/proc/kmsg。シリアルの画面にしか出なかった println! のもの)
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+const GET: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"点でつなぐ: host kernel mem disk proc service pkg net user boot の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"}}}"#;
 const NONE: &str = r#"{"type":"object","properties":{}}"#;
 const PROCS: &str = r#"{"type":"object","properties":{"sort":{"type":"string","description":"cpu (既定。使った CPU の時間) か mem (メモリ)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"},"name":{"type":"string","description":"名前にこれをふくむものだけ"}}}"#;
 const KMSG: &str = r#"{"type":"object","properties":{"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
@@ -27,6 +29,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-s", "sys")],
         tools: &[
+            Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。host kernel mem disk proc service pkg net user boot。path で一部だけ", input: GET },
             Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", input: NONE },
             Tool { name: "procs", desc: "プロセスの一覧 (pid ppid 状態 スレッド CPU 秒 メモリ 名前)。sort: cpu / mem", input: PROCS },
             Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", input: KMSG },
@@ -40,6 +43,7 @@ fn main() {
             let a = &v["args"];
             let pwd = s(v, "pwd");
             match s(v, "name") {
+                "get" => get(a),
                 "sys" => summary(),
                 "procs" => procs(a),
                 "kmsg" => kmsg(a),
@@ -82,6 +86,26 @@ fn kib(kb: u64) -> String {
         format!("{:.1} GiB", kb as f64 / 1024.0 / 1024.0)
     } else {
         format!("{} MiB", kb / 1024)
+    }
+}
+
+// ---- 状態の木 (aios get) ----
+
+fn get(a: &Value) -> Value {
+    let path = a["path"].as_str().unwrap_or("");
+    let mut c = Command::new("aios");
+    c.arg("get");
+    if !path.is_empty() {
+        c.arg(path);
+    }
+    match c.arg("--json").output() {
+        Ok(o) if o.status.success() => match serde_json::from_slice::<Value>(&o.stdout) {
+            Ok(v) if v.is_object() => v,
+            Ok(v) => json!({ "value": v }),
+            Err(e) => error(format!("aios get: {}", e)),
+        },
+        Ok(o) => error(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => error(format!("aios: {} (aios の base パッケージのコマンド)", e)),
     }
 }
 
