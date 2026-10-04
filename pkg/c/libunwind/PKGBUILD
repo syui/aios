@@ -1,0 +1,57 @@
+# libunwind: C++ の例外をほどく (_Unwind_*) 共有ライブラリを、libgcc_s.so.1 の名前で入れる
+#   gcc の libgcc_s のかわり。Node (unofficial-builds の musl のもの) などが使う。
+#   Zig の中にある LLVM の libunwind を Zig で作る (gcc は要らない)。musl のローダーは記号の版 (@GCC_3.0 など) を
+#   見ないので、版なしで足りる。__clear_cache (libgcc_s にあるもの。V8 が使う) と __gcc_personality_v0 も入れる
+pkgname=libunwind
+pkgver=0.16.0
+pkgrel=1
+pkgdesc='LLVM libunwind as libgcc_s.so.1 (_Unwind_*, __clear_cache), built with Zig (for aios)'
+arch=('aarch64')
+url='https://github.com/llvm/llvm-project/tree/main/libunwind'
+license=('Apache-2.0 WITH LLVM-exception')
+provides=('libgcc')
+source=()
+sha256sums=()
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  local src
+  src=$(dirname "$(command -v zig)")/lib/libunwind
+  mkdir -p "$srcdir/b"
+  cd "$srcdir/b"
+  # __clear_cache: 書いた命令をデータのキャッシュから追い出し、命令のキャッシュを捨てる (compiler-rt の aarch64 と同じ)
+  cat > clear_cache.c <<'EOF'
+#include <stdint.h>
+void __clear_cache(void *start, void *end) {
+  uint64_t ctr;
+  __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+  uintptr_t b = (uintptr_t)start, e = (uintptr_t)end;
+  uintptr_t dline = 4u << ((ctr >> 16) & 15), iline = 4u << (ctr & 15);
+  if (!(ctr & (1u << 28)))
+    for (uintptr_t a = b & ~(dline - 1); a < e; a += dline) __asm__ volatile("dc cvau, %0" ::"r"(a) : "memory");
+  __asm__ volatile("dsb ish" ::: "memory");
+  if (!(ctr & (1u << 29)))
+    for (uintptr_t a = b & ~(iline - 1); a < e; a += iline) __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
+  __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+EOF
+  local f o objs=
+  local flags="-O2 -fPIC -funwind-tables -I$src/include -D_LIBUNWIND_IS_NATIVE_ONLY -D_LIBUNWIND_HIDE_SYMBOLS=0 -fno-sanitize=undefined"
+  for f in libunwind.cpp UnwindLevel1.c UnwindLevel1-gcc-ext.c UnwindRegistersSave.S UnwindRegistersRestore.S gcc_personality_v0.c; do
+    o=${f%.*}.o
+    case $f in
+      *.cpp) $CXX $flags -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c "$src/src/$f" -o "$o" ;;
+      *) $CC $flags -std=c11 -c "$src/src/$f" -o "$o" ;;
+    esac
+    objs="$objs $o"
+  done
+  $CC -O2 -fPIC -c clear_cache.c -o clear_cache.o
+  # libc++ も libgcc もつながない (_Unwind_* はここにあるので)
+  $CC -shared -nostdlib++ -Wl,-soname,libgcc_s.so.1 -Wl,-s -o libgcc_s.so.1 $objs clear_cache.o
+}
+
+package() {
+  install -Dm755 "$srcdir/b/libgcc_s.so.1" "$pkgdir/opt/c/lib/libgcc_s.so.1"
+  ln -s libgcc_s.so.1 "$pkgdir/opt/c/lib/libgcc_s.so"
+}
