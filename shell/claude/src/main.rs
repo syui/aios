@@ -1,9 +1,13 @@
 // aish-claude: コマンドが見つからなかった行を Claude に渡す (aish の基本のプラグイン)
 //   ふつうのコマンドは aish がそのまま動かす。見つからなかったとき (打ちまちがい、やりたいことを言葉で書いた) だけ、
-//   その行といまのディレクトリを `claude -p` に渡し、答えをそのまま端末に出す。Ctrl-C で止まる。
+//   その行といまのディレクトリを `claude -p` に渡し、答えをそのまま端末に出す。Ctrl-C で止まる
+//   (claude を自分のプロセスグループにして、動いているあいだだけ端末の前に出す)。
+//   claude は aish の MCP の読むだけのツール (read / grep / where など) を聞かずに使える。
+//   コマンドを動かす run や書きかえるものは使えない (AISH_CLAUDE_TOOLS で足せる。例: mcp__aish__run)
 //   claude がなければ何もしない (aish がいつもどおり "command not found")。AISH_CLAUDE=0 でも何もしない
 // Claude は aish --mcp (aios では /etc/claude-code/managed-mcp.json) で同じ aios を触れる
 use aish_plugin::{Spec, Value, json, s};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
@@ -46,21 +50,44 @@ fn ask(v: &Value) -> Value {
          打ちまちがいなら正しいコマンドを、やりたいことを言葉で書いたのなら、そのやり方を短く答えて。\
          動かす必要があれば aish の MCP (run など) で動かしてよい。"
     );
+    let mut allow: Vec<String> = READ_TOOLS.iter().map(|t| format!("mcp__aish__{}", t)).collect();
+    allow.extend(get("AISH_CLAUDE_TOOLS").unwrap_or("").split([',', ' ']).filter(|t| !t.is_empty()).map(String::from));
     let mut cmd = Command::new(bin);
     cmd.env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    cmd.arg("-p").arg(prompt).current_dir(if pwd.is_empty() { "." } else { pwd }).stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e));
-    // プラグインは Ctrl-C を無視して起こされるので、claude には戻す (Ctrl-C で止められるように)
+    cmd.arg("-p").arg(prompt).arg("--allowedTools").arg(allow.join(","));
+    cmd.current_dir(if pwd.is_empty() { "." } else { pwd }).stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e));
+    // claude は自分のプロセスグループで動かし、そのあいだ端末の前に出す (Ctrl-C は claude にだけ届く)。
+    // プラグインは Ctrl-C を無視して起こされるので、claude には戻す
     unsafe {
         cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             Ok(())
         });
     }
-    match cmd.status() {
+    let fd = tty.as_raw_fd();
+    let fg = unsafe { libc::tcgetpgrp(fd) };
+    let Ok(mut child) = cmd.spawn() else { return json!({}) };
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        // 端末の持ち主を変えるときの SIGTTOU で止まらないように
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::setpgid(pid, pid);
+        libc::tcsetpgrp(fd, pid);
+    }
+    let st = child.wait();
+    if fg > 0 {
+        unsafe { libc::tcsetpgrp(fd, fg) };
+    }
+    match st {
         Ok(st) => json!({ "status": st.code().unwrap_or(130) }),
         Err(_) => json!({}),
     }
 }
+
+/// claude が聞かずに使ってよい aish の MCP のツール (読むだけのもの)
+const READ_TOOLS: &[&str] = &["read", "grep", "hit", "where", "outline", "paths", "dirs", "history"];
 
 fn writeln_tty(mut t: &std::fs::File, s: &str) -> std::io::Result<()> {
     use std::io::Write;
