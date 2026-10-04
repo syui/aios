@@ -5,7 +5,7 @@
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
 pkgname=base-devel
 pkgver=0.0.1
-pkgrel=4
+pkgrel=5
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'
 arch=('any')
 url='https://github.com/syui/aios'
@@ -23,8 +23,15 @@ package() {
     cat > "$d/$1" <<SH
 #!/bin/sh
 link=-static
+# --target= は外す (cc crate などが Rust の名前 aarch64-unknown-linux-musl で渡すが、zig は知らない。
+# 下で -target aarch64-linux-musl を渡す)
 for a in "\$@"; do
-  case "\$a" in -dynamic|-shared) link= ;; esac
+  shift
+  case "\$a" in
+    --target=*) continue ;;
+    -dynamic|-shared) link= ;;
+  esac
+  set -- "\$@" "\$a"
 done
 exec /opt/zig/zig $2 -target aarch64-linux-musl \$link -fno-sanitize=undefined -I/opt/c/include -L/opt/c/lib "\$@"
 SH
