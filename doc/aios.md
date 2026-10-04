@@ -16,7 +16,7 @@
 1. **把握 (get)** ✅: `aios get [PATH]` で状態の木を読む。読むだけなので aiosd なしで、呼んだプロセスの中で集める
 2. **操作 (do)** ✅: aiosd (root で動くサービス) が `/run/aiosd.sock` で受ける。だれが呼んだかは SO_PEERCRED で見る
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
-3. **設定 (apply)**: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
+3. **設定 (apply)** ✅: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
    apply のたびに前の設定とパッケージの版を `/var/lib/aios/history/` に残し、`aios rollback` で戻せる
 4. **改造 (src / build)**: aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
    カーネルは前のものを ESP に残し、起動しなかったら前のもので起動しなおせるようにする
@@ -54,6 +54,21 @@ socketpair のときのプロセスを覚えておく)。
 ## 設定ファイル (/etc/aios.json)
 
 望む状態だけを書く。書いていないものは aios が触らない。
+
+```sh
+aios config | sudo tee /etc/aios.json   # はじめは、いまの状態から作る
+sudoedit /etc/aios.json                 # 望む状態を書く
+aios diff                               # いまとのちがいと、そろえる手順 (動かさない)
+aios apply                              # そろえる (aiosd に頼む)。記録は /var/lib/aios/history/N.json
+aios history [N]                        # apply の記録
+aios rollback                           # ひとつ前の apply の設定に戻す
+```
+
+- `host.name`: /etc/hostname とカーネル (sethostname)
+- `pkg`: 入っていてほしいもの (書いていないものは外さない。rollback は、最後の apply で入れたものを外す)
+- `service`: `"enabled"` (enable して動かす) か `"disabled"` (止めて disable)
+- `kernel.modules`: /etc/modules-load.d/aios.conf に書き、入っていないものは modprobe
+- `user`: いなければ useradd -m。`shell` と `groups` (足すだけ) をそろえる
 
 ```json
 {

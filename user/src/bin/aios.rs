@@ -7,6 +7,13 @@
 //                                service start|stop|restart|enable|disable NAME
 //                                pkg install|remove NAME... / pkg upgrade / pkg refresh
 //                                reboot / poweroff / ping
+//   aios diff                  /etc/aios.json (望む状態) といまのちがいと、そろえる手順 (読むだけ)
+//   aios apply                 /etc/aios.json のとおりにそろえる (aiosd に頼む)
+//   aios rollback              ひとつ前の apply の設定に戻す (aiosd に頼む)
+//   aios history [N]           apply の記録
+//   aios config                いまの状態を aios.json の形で (はじめて作るとき: aios config | sudo tee /etc/aios.json)
+#[path = "../lib/config.rs"]
+mod config;
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
@@ -41,6 +48,11 @@ fn main() {
         None => info(),
         Some("get") => get(&args[1..]),
         Some("do") => do_(&args[1..]),
+        Some("diff") => diff(),
+        Some("apply") => send(serde_json::json!({ "op": "apply" }), args.iter().any(|a| a == "--json")),
+        Some("rollback") => send(serde_json::json!({ "op": "rollback" }), args.iter().any(|a| a == "--json")),
+        Some("history") => history(args.get(1)),
+        Some("config") => println!("{}", serde_json::to_string_pretty(&config::export()).unwrap_or_default()),
         Some("-h" | "--help" | "help") => usage(0),
         Some(c) => {
             eprintln!("aios: unknown command {}", c);
@@ -55,6 +67,7 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios do service start|stop|restart|enable|disable NAME");
     eprintln!("       aios do pkg install|remove NAME... | pkg upgrade | pkg refresh");
     eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
+    eprintln!("       aios diff | apply | rollback | history [N] | config   (/etc/aios.json)");
     std::process::exit(code)
 }
 
@@ -93,7 +106,6 @@ fn get(args: &[String]) {
 
 /// aios do: aiosd に 1 つ頼んで、答えを出す
 fn do_(args: &[String]) {
-    use std::io::{BufRead, BufReader, Write};
     let as_json = args.iter().any(|a| a == "--json");
     let w: Vec<&str> = args.iter().filter(|a| !a.starts_with("--")).map(String::as_str).collect();
     let req = match w.as_slice() {
@@ -103,19 +115,7 @@ fn do_(args: &[String]) {
         ["ping"] => serde_json::json!({ "op": "ping" }),
         _ => usage(2),
     };
-    let mut c = match std::os::unix::net::UnixStream::connect("/run/aiosd.sock") {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("aios do: /run/aiosd.sock: {} (sudo systemctl enable --now aiosd)", e);
-            std::process::exit(1);
-        }
-    };
-    let mut line = String::new();
-    if writeln!(c, "{}", req).is_err() || BufReader::new(&c).read_line(&mut line).is_err() || line.is_empty() {
-        eprintln!("aios do: aiosd did not answer");
-        std::process::exit(1);
-    }
-    let r: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+    let (line, r) = ask(&req);
     if as_json {
         println!("{}", line.trim_end());
     } else {
@@ -130,6 +130,105 @@ fn do_(args: &[String]) {
         }
     }
     std::process::exit(if r["ok"] == true { 0 } else { r["status"].as_i64().filter(|s| *s > 0).unwrap_or(1) as i32 });
+}
+
+/// aiosd に 1 つ頼む (1 行の JSON を送り、1 行の答え)
+fn ask(req: &serde_json::Value) -> (String, serde_json::Value) {
+    use std::io::{BufRead, BufReader, Write};
+    let mut c = match std::os::unix::net::UnixStream::connect("/run/aiosd.sock") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("aios: /run/aiosd.sock: {} (sudo systemctl enable --now aiosd)", e);
+            std::process::exit(1);
+        }
+    };
+    let mut line = String::new();
+    if writeln!(c, "{}", req).is_err() || BufReader::new(&c).read_line(&mut line).is_err() || line.is_empty() {
+        eprintln!("aios: aiosd did not answer");
+        std::process::exit(1);
+    }
+    let r = serde_json::from_str(&line).unwrap_or_default();
+    (line, r)
+}
+
+/// 手順を 1 行ずつ
+fn show_steps(steps: &[serde_json::Value]) {
+    for s in steps {
+        let mark = match s["ok"].as_bool() {
+            Some(true) => "ok   ",
+            Some(false) => "FAIL ",
+            None => "",
+        };
+        println!("{}{}: {} -> {}   ({})", mark, s["what"].as_str().unwrap_or(""), s["from"].as_str().unwrap_or(""), s["to"].as_str().unwrap_or(""), s["do"].as_str().unwrap_or(""));
+        if s["ok"] == false
+            && let Some(o) = s["out"].as_str()
+        {
+            for l in o.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+                println!("       {}", l);
+            }
+        }
+    }
+}
+
+/// apply / rollback を aiosd に頼む
+fn send(req: serde_json::Value, as_json: bool) {
+    let (line, r) = ask(&req);
+    if as_json {
+        println!("{}", line.trim_end());
+    } else if let Some(e) = r["err"].as_str() {
+        eprintln!("aios: {}", e);
+    } else {
+        let steps = r["steps"].as_array().cloned().unwrap_or_default();
+        if steps.is_empty() {
+            println!("aios: nothing to do (already as /etc/aios.json says)");
+        }
+        show_steps(&steps);
+        println!("(record {}: aios history {})", r["n"], r["n"]);
+    }
+    std::process::exit(if r["ok"] == true { 0 } else { 1 });
+}
+
+/// aios diff: そろえる手順 (動かさない)
+fn diff() {
+    let cfg = match config::load(config::PATH) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("aios diff: {} (aios config | sudo tee /etc/aios.json で今の状態から作れる)", e);
+            std::process::exit(1);
+        }
+    };
+    match config::plan(&cfg) {
+        Ok(steps) if steps.is_empty() => println!("aios: no difference"),
+        Ok(steps) => show_steps(&steps.iter().map(|s| s.json()).collect::<Vec<_>>()),
+        Err(e) => {
+            eprintln!("aios diff: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// aios history [N]
+fn history(n: Option<&String>) {
+    if let Some(n) = n.and_then(|n| n.parse().ok()) {
+        match config::read_history(n) {
+            Some(r) => println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default()),
+            None => {
+                eprintln!("aios history: no record {}", n);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    for n in config::history() {
+        let Some(r) = config::read_history(n) else { continue };
+        let steps = r["steps"].as_array().map_or(0, |a| a.len());
+        let bad = r["steps"].as_array().map_or(0, |a| a.iter().filter(|s| s["ok"] == false).count());
+        let what = match r["rollback_of"].as_u64() {
+            Some(l) => format!("rollback of {}", l),
+            None => "apply".into(),
+        };
+        println!("{:>4}  t={}  uid={}  {}  {} steps{}", n, r["t"], r["uid"], what, steps, if bad > 0 { format!(", {} failed", bad) } else { String::new() });
+    }
 }
 
 fn info() {

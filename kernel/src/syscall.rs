@@ -168,6 +168,7 @@ nrs! {
     GETSID = 156,
     SETSID = 157,
     UNAME = 160,
+    SETHOSTNAME = 161,
     GETRLIMIT = 163,
     UMASK = 166,
     GETTIMEOFDAY = 169,
@@ -441,6 +442,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLOCK_GETRES => sys_clock_getres(a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
         UNAME => sys_uname(a[0] as usize),
+        SETHOSTNAME => sys_sethostname(a[0] as usize, a[1] as usize),
         REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
         INIT_MODULE => sys_init_module(a[0] as usize, a[1] as usize),
         FINIT_MODULE => sys_finit_module(a[0]),
@@ -631,9 +633,33 @@ fn sys_gettimeofday(tv: usize) -> R {
     Ok(0)
 }
 
+/// uname の nodename (sethostname で変わる。init が起動のときに /etc/hostname を入れる)
+static mut HOSTNAME: ([u8; 64], usize) = {
+    let mut b = [0u8; 64];
+    b[0] = b'a';
+    b[1] = b'i';
+    b[2] = b'o';
+    b[3] = b's';
+    (b, 4)
+};
+
+fn sys_sethostname(name: usize, len: usize) -> R {
+    if crate::cred::current().euid != 0 {
+        return Err(-1); // EPERM
+    }
+    if len > 64 {
+        return Err(-EINVAL);
+    }
+    let mut b = [0u8; 64];
+    proc::current().pt().copy_in(&mut b[..len], name).ok_or(-14)?;
+    unsafe { *(&raw mut HOSTNAME) = (b, len) };
+    Ok(0)
+}
+
 fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
-    let fields: [&[u8]; 6] = [b"aios", b"aios", env!("AIOS_RELEASE").as_bytes(), b"#1 aios", b"aarch64", b""];
+    let (hb, hl) = unsafe { *(&raw const HOSTNAME) };
+    let fields: [&[u8]; 6] = [b"aios", &hb[..hl], env!("AIOS_RELEASE").as_bytes(), b"#1 aios", b"aarch64", b""];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
         u[i * FIELD..i * FIELD + f.len()].copy_from_slice(f);
