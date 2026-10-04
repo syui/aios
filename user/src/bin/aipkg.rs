@@ -380,6 +380,8 @@ fn install(path: &str, explicit: bool) {
     let mut files: Vec<String> = vec![];
     let mut created: Vec<String> = vec![];
     let mut new_backup = vec![];
+    // .INSTALL (post_install などの関数)
+    let mut script: Option<String> = None;
     let fail = |created: &[String], msg: String| -> ! {
         // メーターの行のあとに出す
         if unsafe { libc::isatty(1) } == 1 {
@@ -424,6 +426,11 @@ fn install(path: &str, explicit: bool) {
                     .map(|(od, _)| list(od, "BACKUP").iter().filter_map(|b| b.split_once('\t')).map(|(a, b)| (a.to_string(), b.to_string())).collect())
                     .unwrap_or_default();
                 ready = Some(Ready { info, name, ver, old, owners, backup, old_hashes, meter: meter::Meter::new(&label, size) });
+            } else if epath == ".INSTALL" {
+                let mut s = String::new();
+                if e.read_to_string(&mut s).is_ok() {
+                    script = Some(s);
+                }
             }
             continue;
         }
@@ -477,6 +484,7 @@ fn install(path: &str, explicit: bool) {
     let Some(Ready { info, name, ver, old, mut meter, .. }) = ready else { die(format!("{}: no .PKGINFO in package", path)) };
     meter.finish(size);
 
+    let old_ver = old.map(|(od, _)| get(od, "VERSION").to_string());
     // 古い版にだけあったファイルを消す
     if let Some((od, ofiles)) = old {
         let keep: BTreeSet<&String> = files.iter().collect();
@@ -502,6 +510,34 @@ fn install(path: &str, explicit: bool) {
     let mut fd = Desc::new();
     fd.insert("FILES".into(), files);
     fs::write(format!("{}/files", dir), write_desc(&fd)).unwrap_or_else(|e| die(e));
+    // .INSTALL は pacman と同じく local の install に残す (消すときの pre_remove / post_remove のため)
+    if let Some(s) = script {
+        let at = format!("{}/install", dir);
+        fs::write(&at, s).unwrap_or_else(|e| die(e));
+        match &old_ver {
+            Some(o) => run_script(&at, "post_upgrade", &[&ver, o]),
+            None => run_script(&at, "post_install", &[&ver]),
+        }
+    }
+}
+
+/// .INSTALL の関数 (post_install など) を、あれば動かす (pacman と同じく bash の書き方。brush で、なければ sh で)。
+/// しくじっても入れたもの・消したものはそのまま (pacman と同じ)
+fn run_script(script: &str, func: &str, args: &[&str]) {
+    let Ok(text) = fs::read_to_string(script) else { return };
+    let defined = text.lines().any(|l| {
+        let l = l.trim_start();
+        l.strip_prefix(func).is_some_and(|r| r.trim_start().starts_with("()")) || l.strip_prefix("function ").is_some_and(|r| r.trim_start().starts_with(func))
+    });
+    if !defined || ROOT != "/" {
+        return;
+    }
+    let shell = ["/usr/bin/brush", "/bin/brush", "/bin/sh"].into_iter().find(|p| fs::metadata(p).is_ok()).unwrap_or("/bin/sh");
+    println!(":: running {}", func);
+    let st = std::process::Command::new(shell).arg("-c").arg(format!(". \"$0\"; {} \"$@\"", func)).arg(script).args(args).status();
+    if !st.is_ok_and(|s| s.success()) {
+        println!("warning: {} of {} failed", func, script);
+    }
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -570,8 +606,20 @@ fn remove_with(names: &[String], check_deps: bool) {
                 println!("warning: /{} saved as /{}.pacsave", path, path);
             }
         }
+        let ver = get(d, "VERSION");
+        let script = format!("{}/install", local_dir(name, ver));
+        // 消すまえに pre_remove。post_remove は local を消すまえに、とっておいた中身で
+        let saved = fs::read_to_string(&script).ok();
+        run_script(&script, "pre_remove", &[ver]);
         remove_files(files.iter());
-        let _ = fs::remove_dir_all(local_dir(name, get(d, "VERSION")));
+        let _ = fs::remove_dir_all(local_dir(name, ver));
+        if let Some(text) = saved {
+            let tmp = format!("/tmp/aipkg-{}.install", name);
+            if fs::write(&tmp, text).is_ok() {
+                run_script(&tmp, "post_remove", &[ver]);
+                let _ = fs::remove_file(&tmp);
+            }
+        }
     }
 }
 
