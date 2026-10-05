@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::fs;
 
 /// 木の一番上の名前 (この順に出す)
-pub const ROOTS: [&str; 10] = ["host", "kernel", "mem", "disk", "proc", "service", "pkg", "net", "user", "boot"];
+pub const ROOTS: [&str; 11] = ["host", "kernel", "mem", "disk", "proc", "service", "pkg", "net", "user", "boot", "log"];
 
 fn read(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
@@ -23,6 +23,7 @@ pub fn collect(root: &str) -> Option<Value> {
         "net" => net(),
         "user" => users(),
         "boot" => boot(),
+        "log" => log(),
         _ => return None,
     })
 }
@@ -376,5 +377,53 @@ fn boot() -> Value {
         v.into_iter().map(Value::from).collect()
     };
     let kernels: Vec<Value> = list("/boot").into_iter().filter(|n| n.as_str().is_some_and(|s| s.starts_with("Image"))).collect();
-    json!({ "esp": "/boot", "kernels": kernels, "entries": list("/boot/loader/entries") })
+    let cmdline = read("/proc/cmdline").unwrap_or_default();
+    // boot counting (doc/aios.md): try は新しいカーネルを試す残りの回数 (なければ試していない)、
+    // fallback は前のカーネルに戻して起動したか。last は aiosd が残した最後の起動の結果
+    let last = aiosd_log().into_iter().rev().find(|r| r["req"]["op"] == "boot").map(|r| json!({ "t": r["t"], "result": r["req"]["result"], "status": r["status"] }));
+    json!({
+        "esp": "/boot",
+        "kernels": kernels,
+        "entries": list("/boot/loader/entries"),
+        "try": read("/boot/loader/try").and_then(|t| t.trim().parse::<u64>().ok()),
+        "fallback": cmdline.split_whitespace().any(|w| w == "aios.fallback=1"),
+        "prev": fs::metadata("/boot/Image.prev").is_ok(),
+        "last": last,
+    })
+}
+
+// ---- log ----
+
+/// aiosd がしたこと (/var/log/aiosd.log、1 行 1 つの JSON)
+const AIOSD_LOG: &str = "/var/log/aiosd.log";
+/// log に出す新しいものの数
+const LOG_TAIL: usize = 20;
+
+fn aiosd_log() -> Vec<Value> {
+    read(AIOSD_LOG).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// aiosd の新しい記録と、apply の記録 (/var/lib/aios/history) の一覧
+fn log() -> Value {
+    let all = aiosd_log();
+    // pid は呼んだプロセス (配列の名前に pid を使わないように caller に)
+    let aiosd: Vec<Value> = all[all.len().saturating_sub(LOG_TAIL)..]
+        .iter()
+        .map(|r| json!({ "t": r["t"], "uid": r["uid"], "caller": r["pid"], "op": r["req"]["op"], "req": r["req"], "status": r["status"] }))
+        .collect();
+    let mut hist: Vec<(u64, Value)> = fs::read_dir("/var/lib/aios/history")
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().strip_suffix(".json")?.parse::<u64>().ok()?;
+                    let h: Value = serde_json::from_str(&read(&e.path().display().to_string())?).ok()?;
+                    let ok = h["steps"].as_array().is_none_or(|s| s.iter().all(|x| x["ok"] == true));
+                    Some((n, json!({ "n": n, "t": h["t"], "uid": h["uid"], "ok": ok, "steps": h["steps"].as_array().map_or(0, |s| s.len()), "rollback_of": h["rollback_of"] })))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    hist.sort_by_key(|h| h.0);
+    let apply: Vec<Value> = hist.into_iter().rev().take(LOG_TAIL).rev().map(|h| h.1).collect();
+    json!({ "aiosd": aiosd, "apply": apply })
 }

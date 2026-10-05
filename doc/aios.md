@@ -34,7 +34,8 @@
 | `pkg` | 入っているパッケージと版、リポジトリ |
 | `net` | インターフェイスとアドレス、経路、DNS |
 | `user` | ユーザー (uid、ホーム、シェル) |
-| `boot` | ESP のカーネルとローダーのエントリ |
+| `boot` | ESP のカーネルとローダーのエントリ、`try` (新しいカーネルを試す残りの回数)、`fallback` (前のカーネルに戻して起動したか)、`prev` (`/boot/Image.prev` があるか)、`last` (最後の起動の結果) |
+| `log` | `aiosd` (`/var/log/aiosd.log` の新しい 20 件)、`apply` (`aios apply` / `rollback` の記録の一覧: 番号、時刻、うまくいったか) |
 
 - `PATH` は点でつなぐ: `kernel.cpus`、`pkg.installed.cargo`、`service.sshd.active`。
   配列は番号か名前 (name / mount / pid) で選ぶ

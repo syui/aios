@@ -1,7 +1,7 @@
 // aios: aios を把握・設定・操作するコマンド (doc/aios.md)
 //   aios                       様子をロゴといっしょに出す (neofetch のようなもの)。あとに /etc/motd も。
 //                              起動のときは motd.service が動かす
-//   aios get [PATH] [--json]   状態の木 (host kernel mem disk proc service pkg net user boot)。
+//   aios get [PATH] [--json]   状態の木 (host kernel mem disk proc service pkg net user boot log)。
 //                              PATH は点でつなぐ (kernel.cpus、service.sshd.active)。ふだんは PATH = 値 の行
 //   aios do OP ...  [--json]   aiosd (root で動く) に頼んで変える。root と wheel の人だけ:
 //                                service start|stop|restart|enable|disable NAME
