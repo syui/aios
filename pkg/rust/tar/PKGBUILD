@@ -1,9 +1,9 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/tar)
 # uutils/tar はまだリリースがないので、コミットを決めて日付を版にする
 pkgname=tar
-pkgver=0.1.0.20260930
+pkgver=0.1.0.20261005
 pkgrel=1
-_commit=93e211febed55aa118e47b0ac054ed92641d13df
+_commit=f7858a00e944d3f9500e67814a8dc99581e4d277
 pkgdesc='Rust implementation of tar (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/tar'
