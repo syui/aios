@@ -275,9 +275,9 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);
-            // EL0 で走っていたなら順番をゆずる
+            // EL0 で走っていて、タイムスライスを使いきったなら順番をゆずる
             if kind == EL0_IRQ {
-                if id == timer::IRQ {
+                if id == timer::IRQ && proc::slice_expired() {
                     proc::yield_now();
                 }
                 proc::check_killed();
