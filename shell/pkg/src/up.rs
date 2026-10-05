@@ -3,8 +3,11 @@
 //     1. PKGBUILD の source が git (git+URL#tag=...) か GitHub / GitLab のリリースなら、そのリポジトリとタグの形
 //     2. ほかは Arch の .nvchecker.toml (gitlab.archlinux.org の packaging/packages/NAME。Arch と名前が
 //        ちがうものは PKGBUILD に _arch=NAME)
+//     3. PKGBUILD に _latest_url と _latest_regex があれば、そのページから (手で確かめていたもの。ca-certificates)
+//     4. source が #commit= (awk、tar、egl-headers) なら、そのリポジトリの最新のコミット (HEAD) とくらべる
+//     5. download.gnome.org のもので Arch にないもの (atk) は、その cache.json から
 //   最新はタグ (git ls-remote) か配布元のページ (nvchecker の regex) から。いまの pkgver とくらべる
-// 自作のもの (0.0.1) と、コミットで決めているもの (#commit=) は見ない。取ってくるのは git と fetch (なければ curl)
+// 自作のもの (0.0.1) は見ない。取ってくるのは git と fetch (なければ curl)
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,7 +55,7 @@ fn from_source(src: &str) -> Result<Option<(String, String)>, String> {
         let (url, frag) = rest.split_once('#').unwrap_or((rest, ""));
         return match frag.split_once('=') {
             Some(("tag", t)) => Ok(Some((url.to_string(), t.to_string()))),
-            Some(("commit", _)) => Err("pinned to a commit".into()),
+            Some(("commit", _)) => Err("commit".into()),
             _ => Ok(None),
         };
     }
@@ -159,11 +162,29 @@ fn rule(name: &str, path: &Path) -> Value {
     let text = fs::read_to_string(path).unwrap_or_default();
     let pkgver = scalar(&text, "pkgver").unwrap_or_default();
     let mut r = json!({ "name": name, "pkgver": pkgver });
-    if pkgver.starts_with("0.0.1") {
+    // 自作のもの: 版がちょうど 0.0.1 (pkgver() でビルドのときに決めるものも)、ソースがない、git.syui.ai のもの。
+    // egl-headers (0.0.1.r${_commit}) のように、よそのものをコミットで決めているものは見る
+    let src = first_source(&text).unwrap_or_default();
+    if pkgver == "0.0.1" || (src.is_empty() && scalar(&text, "_arch").is_none() && scalar(&text, "_latest_url").is_none()) || src.contains("git.syui.ai") {
         r["skip"] = json!("aios");
         return r;
     }
+    // 3. PKGBUILD に書いた見方 (_latest_url と _latest_regex。グループはつなげる: 2026-09-25 → 20260925)
+    if let (Some(url), Some(re)) = (scalar(&text, "_latest_url"), scalar(&text, "_latest_regex")) {
+        r["from"] = json!("pkgbuild");
+        r["nvchecker"] = json!({ "source": "regex", "url": url, "regex": re, "join": true });
+        return r;
+    }
     match first_source(&text).map(|s| from_source(&s)) {
+        // 4. コミットで決めているもの: リポジトリの HEAD とくらべる
+        Some(Err(e)) if e == "commit" => {
+            let src = first_source(&text).unwrap_or_default();
+            let url = src.trim_start_matches("git+").split('#').next().unwrap_or("").to_string();
+            r["from"] = json!("commit");
+            r["git"] = json!(url);
+            r["commit"] = json!(scalar(&text, "_commit").unwrap_or_default());
+            return r;
+        }
         Some(Err(e)) => {
             r["skip"] = json!(e);
             return r;
@@ -191,7 +212,17 @@ fn rule(name: &str, path: &Path) -> Value {
             r["from"] = json!(format!("arch:{}", arch));
             r["nvchecker"] = Value::Object(m);
         }
-        None => r["skip"] = json!(format!("no git source in the PKGBUILD, and no .nvchecker.toml for arch {}", arch)),
+        None => {
+            // 5. download.gnome.org/sources/NAME/ のものは、その cache.json (ファイルの一覧) から
+            let gnome = first_source(&text).and_then(|s| s.strip_prefix("https://download.gnome.org/sources/").and_then(|x| x.split('/').next()).map(String::from));
+            match gnome {
+                Some(g) => {
+                    r["from"] = json!("gnome");
+                    r["nvchecker"] = json!({ "source": "regex", "url": format!("https://download.gnome.org/sources/{}/cache.json", g), "regex": format!("{}-([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)\\.tar", regex::escape(&g)) });
+                }
+                None => r["skip"] = json!(format!("no git source in the PKGBUILD, and no .nvchecker.toml for arch {}", arch)),
+            }
+        }
     }
     r
 }
@@ -327,7 +358,12 @@ fn nvchecker(m: &Map<String, Value>) -> Result<String, String> {
         "regex" => {
             let page = get(s("url").ok_or("regex: no url")?)?;
             let re = regex::Regex::new(s("regex").ok_or("regex: no regex")?).map_err(|e| e.to_string())?;
-            re.captures_iter(&page).filter_map(|c| c.get(1).or(c.get(0)).map(|x| x.as_str().to_string())).collect()
+            if m.get("join").and_then(|v| v.as_bool()) == Some(true) {
+                // グループをみなつなげる (cacert-2026-09-25.pem → 20260925)
+                re.captures_iter(&page).map(|c| if c.len() > 1 { c.iter().skip(1).flatten().map(|x| x.as_str()).collect::<String>() } else { c[0].to_string() }).collect()
+            } else {
+                re.captures_iter(&page).filter_map(|c| c.get(1).or(c.get(0)).map(|x| x.as_str().to_string())).collect()
+            }
         }
         other => return Err(format!("nvchecker source {:?} is not supported", other)),
     };
@@ -357,8 +393,17 @@ fn nvchecker(m: &Map<String, Value>) -> Result<String, String> {
     vs.into_iter().max_by(|a, b| vercmp(a, b)).ok_or_else(|| "no version found".into())
 }
 
+/// リポジトリの HEAD (既定のブランチの最新のコミット)
+fn head(git: &str) -> Result<String, String> {
+    let out = Command::new("git").args(["ls-remote", git, "HEAD"]).env("GIT_TERMINAL_PROMPT", "0").output().map_err(|e| format!("git: {}", e))?;
+    String::from_utf8_lossy(&out.stdout).split_whitespace().next().filter(|h| h.len() == 40).map(String::from).ok_or_else(|| format!("git ls-remote {} HEAD: no answer", git))
+}
+
 /// upstream.json の 1 つの行から、いちばん新しい版
 pub fn latest(r: &Value) -> Result<String, String> {
+    if r["from"] == "commit" {
+        return head(r["git"].as_str().unwrap_or(""));
+    }
     if let Some(m) = r["nvchecker"].as_object() {
         return nvchecker(m);
     }
@@ -377,13 +422,26 @@ pub fn latest(r: &Value) -> Result<String, String> {
 pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, String> {
     let rules = rules(pkg, if refresh { only } else { &[] }, refresh)?;
     let now: std::collections::HashMap<String, String> =
-        pkgbuilds(pkg).into_iter().map(|(n, p)| (n, scalar(&fs::read_to_string(p).unwrap_or_default(), "pkgver").unwrap_or_default())).collect();
+        pkgbuilds(pkg)
+            .into_iter()
+            .map(|(n, p)| {
+                let text = fs::read_to_string(&p).unwrap_or_default();
+                let v = scalar(&text, "pkgver").unwrap_or_default();
+                let v = if v.contains('$') { expand_var(p.parent().unwrap_or(Path::new(".")), &text, "pkgver") } else { v };
+                (n, v)
+            })
+            .collect();
     let skips: Vec<(String, String)> = rules.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["skip"].as_str()?.to_string()))).collect();
     let todo: Vec<Value> = rules.into_iter().filter(|r| r.get("skip").is_none() && (only.is_empty() || only.iter().any(|o| r["name"] == o.as_str()))).collect();
     let rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
         let cur = now.get(&name).cloned().unwrap_or_default();
         match latest(&r) {
+            // コミットで決めているもの: HEAD が PKGBUILD の _commit とちがえば新しい
+            Ok(h) if r["from"] == "commit" => {
+                let pinned = r["commit"].as_str().unwrap_or("");
+                json!({ "name": name, "pkgver": cur, "latest": format!("commit {}", &h[..7]), "commit": h, "new": !pinned.is_empty() && !h.starts_with(pinned) && !pinned.starts_with(&h) })
+            }
             Ok(v) => json!({ "name": name, "pkgver": cur, "latest": v, "new": vercmp(&v, &cur).is_gt() }),
             Err(e) => json!({ "name": name, "pkgver": cur, "error": e }),
         }
@@ -391,7 +449,7 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
     // しくじったもの (配布元が切れたなど) は、一覧の前の値を残す
     let mut seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
     for (n, why) in skips {
-        let short = if why == "aios" { "aios" } else if why.contains("commit") { "commit" } else if why.contains("pkgver") { "follows another version" } else if why.contains("by hand") { "manual" } else { "no upstream" };
+        let short = if why == "aios" { "aios" } else if why.contains("pkgver") { "follows another version" } else if why.contains("by hand") { "manual" } else { "no upstream" };
         seen.insert(n, format!("({})", short));
     }
     overview(pkg, &seen);
@@ -471,14 +529,17 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     let (_, path) = pkgbuilds(&pkg).into_iter().find(|(n, _)| n == name).ok_or_else(|| format!("{}: no PKGBUILD", name))?;
     let old_text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let old = scalar(&old_text, "pkgver").unwrap_or_default();
+    let rule = rules(&pkg, &[], false)?.into_iter().find(|r| r["name"] == name).ok_or("no rule")?;
+    if rule["from"] == "commit" {
+        return edit_commit(root, name, &path, &old_text, &rule, ver);
+    }
     let ver = match ver {
         Some(v) => v.to_string(),
         None => {
-            let r = rules(&pkg, &[], false)?.into_iter().find(|r| r["name"] == name).ok_or("no rule")?;
-            if let Some(s) = r["skip"].as_str() {
+            if let Some(s) = rule["skip"].as_str() {
                 return Err(format!("{}: not checked ({})", name, s));
             }
-            latest(&r)?
+            latest(&rule)?
         }
     };
     if !ver.chars().all(|c| c.is_ascii_alphanumeric() || "._+".contains(c)) {
@@ -512,6 +573,58 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     }
     files.push(json!("pkg/pkg.json"));
     overview(&pkg, &std::collections::HashMap::new());
+    r["files"] = json!(files);
+    Ok(r)
+}
+
+/// コミットで決めているもの: _commit を新しいコミット (なければ HEAD) にし、pkgver の終わりの日付
+/// (0.1.0.20260929 の 20260929) をそのコミットの日付にする。pkgver が ${_commit} を使うもの (egl-headers) はそのまま
+fn edit_commit(root: &Path, name: &str, path: &Path, old_text: &str, rule: &Value, ver: Option<&str>) -> Result<Value, String> {
+    let git = rule["git"].as_str().unwrap_or("");
+    let pinned = scalar(old_text, "_commit").unwrap_or_default();
+    let new = match ver {
+        Some(v) if v.len() == 40 && v.chars().all(|c| c.is_ascii_hexdigit()) => v.to_string(),
+        Some(v) => return Err(format!("{}: give the full commit hash (40 hex)", v)),
+        None => head(git)?,
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let old_ver = expand_var(dir, old_text, "pkgver");
+    let mut r = json!({ "name": name, "from": old_ver, "commit": new, "files": [] });
+    if new == pinned {
+        r["to"] = json!(old_ver);
+        r["same"] = json!(true);
+        return Ok(r);
+    }
+    // コミットの日付 (そのコミットだけ浅く取ってくる)
+    let tmp = std::env::temp_dir().join(format!("aish-pkg-commit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let git_in = |args: &[&str]| Command::new("git").arg("-C").arg(&tmp).args(args).env("GIT_TERMINAL_PROMPT", "0").output();
+    let _ = fs::create_dir_all(&tmp);
+    let _ = git_in(&["init", "-q"]);
+    let _ = git_in(&["fetch", "-q", "--depth", "1", git, &new]);
+    let date = git_in(&["log", "-1", "--format=%cd", "--date=format:%Y%m%d", "FETCH_HEAD"]).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let _ = fs::remove_dir_all(&tmp);
+    if date.len() != 8 {
+        return Err(format!("{}: could not fetch commit {} from {}", name, new, git));
+    }
+    let set = |text: &str, key: &str, val: &str| -> String {
+        text.lines().map(|l| if l.starts_with(&format!("{}=", key)) { format!("{}={}", key, val) } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n"
+    };
+    let mut text = set(&set(old_text, "_commit", &new), "pkgrel", "1");
+    let raw = scalar(old_text, "pkgver").unwrap_or_default();
+    if let Some(m) = regex::Regex::new(r"^(.*\.)([0-9]{8})$").ok().and_then(|re| re.captures(&raw).map(|c| c[1].to_string())) {
+        text = set(&text, "pkgver", &format!("{}{}", m, date));
+    }
+    fs::write(path, &text).map_err(|e| e.to_string())?;
+    let to = expand_var(dir, &text, "pkgver");
+    let mut files = vec![json!(path.strip_prefix(root).unwrap_or(path).display().to_string())];
+    if aios_json(&root.join(".aios.json"), name, &to)? {
+        files.push(json!(".aios.json"));
+    }
+    files.push(json!("pkg/pkg.json"));
+    overview(&root.join("pkg"), &std::collections::HashMap::new());
+    r["to"] = json!(to);
+    r["date"] = json!(date);
     r["files"] = json!(files);
     Ok(r)
 }
