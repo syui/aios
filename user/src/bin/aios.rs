@@ -16,10 +16,16 @@
 //   aios build kernel          /usr/src/aios のカーネルをビルドして target/Image に (起動できる形)
 //   aios install kernel [IMAGE] | --revert
 //                              /boot/Image を入れかえる (aiosd に頼む)。前のものは起動の一覧の「previous kernel」
+//   aios build pkg NAME|DIR [-o DIR]
+//                              PKGBUILD からパッケージを作る (NAME は /usr/src/aios/pkg/*/NAME)。できたものは
+//                              いまのディレクトリ (-o で変える) に。作業は ~/.cache/aios/build/NAME
+//   aios install pkg FILE...   作ったパッケージを入れる (aiosd が aipkg -U で)
 #[path = "../lib/config.rs"]
 mod config;
 #[path = "../lib/image.rs"]
 mod image;
+#[path = "../lib/mkpkg.rs"]
+mod mkpkg;
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
@@ -61,6 +67,8 @@ fn main() {
         Some("src") => src(),
         Some("build") if args.get(1).map(String::as_str) == Some("kernel") => build_kernel(),
         Some("install") if args.get(1).map(String::as_str) == Some("kernel") => install_kernel(args.get(2)),
+        Some("build") if args.get(1).map(String::as_str) == Some("pkg") => build_pkg(&args[2..]),
+        Some("install") if args.get(1).map(String::as_str) == Some("pkg") => install_pkg(&args[2..]),
         Some("config") => println!("{}", serde_json::to_string_pretty(&config::export()).unwrap_or_default()),
         Some("-h" | "--help" | "help") => usage(0),
         Some(c) => {
@@ -78,6 +86,7 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
     eprintln!("       aios diff | apply | rollback | history [N] | config   (/etc/aios.json)");
     eprintln!("       aios src | build kernel | install kernel [IMAGE] | install kernel --revert   (改造)");
+    eprintln!("       aios build pkg NAME|DIR [-o DIR] | install pkg FILE...   (パッケージ)");
     std::process::exit(code)
 }
 
@@ -318,6 +327,64 @@ fn install_kernel(arg: Option<&String>) {
             std::process::exit(1);
         }
         None => print!("{}", r["out"].as_str().unwrap_or("")),
+    }
+}
+
+/// aios build pkg NAME|DIR [-o DIR]: PKGBUILD からパッケージを作る
+fn build_pkg(args: &[String]) {
+    let mut dest = std::path::PathBuf::from(".");
+    let mut what = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" => dest = it.next().map(Into::into).unwrap_or_else(|| usage(2)),
+            _ => what = Some(a.clone()),
+        }
+    }
+    let Some(what) = what else { usage(2) };
+    // DIR (PKGBUILD がある) か、/usr/src/aios/pkg/*/NAME
+    let dir = if std::path::Path::new(&what).join("PKGBUILD").exists() {
+        std::path::PathBuf::from(&what)
+    } else {
+        let found = std::fs::read_dir(format!("{}/pkg", src_dir()))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|k| k.path().join(&what))
+            .find(|d| d.join("PKGBUILD").exists());
+        match found {
+            Some(d) => d,
+            None => {
+                eprintln!("aios build pkg: {}: no PKGBUILD there or in {}/pkg/*/ (aios src)", what, src_dir());
+                std::process::exit(1);
+            }
+        }
+    };
+    match mkpkg::build(&dir, &dest) {
+        Ok(f) => {
+            let f = std::fs::canonicalize(&f).unwrap_or(f);
+            println!("{}. next: aios install pkg {}", f.display(), f.display());
+        }
+        Err(e) => {
+            eprintln!("aios build pkg: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// aios install pkg FILE...: aiosd が aipkg -U で入れる
+fn install_pkg(files: &[String]) {
+    if files.is_empty() {
+        usage(2);
+    }
+    let paths: Vec<String> = files.iter().map(|f| std::fs::canonicalize(f).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| f.clone())).collect();
+    let (_, r) = ask(&serde_json::json!({ "op": "pkg", "action": "file", "paths": paths }));
+    print!("{}", r["out"].as_str().unwrap_or(""));
+    if let Some(e) = r["err"].as_str().filter(|e| !e.is_empty()) {
+        eprint!("{}", e);
+    }
+    if r["ok"] != true {
+        std::process::exit(1);
     }
 }
 

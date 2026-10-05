@@ -18,7 +18,7 @@
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
 3. **設定 (apply)** ✅: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
    apply のたびに前の設定とパッケージの版を `/var/lib/aios/history/` に残し、`aios rollback` で戻せる
-4. **改造 (src / build)** (ほぼ ✅): aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
+4. **改造 (src / build)** ✅: aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
    カーネルは前のものを ESP に残し、起動しなかったら前のもので起動しなおせるようにする
 
 ## 状態の木 (aios get)
@@ -87,6 +87,8 @@ aios src                       # /usr/src/aios に aios のソース (なけれ�
 aios build kernel              # AIOS_INITRD=none でビルドし、target/Image (起動できる形) を作る (objcopy の代わりも aios がする)
 aios install kernel            # /boot/Image を入れかえる (aiosd)。前のものは /boot/Image.prev
 aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れかえる
+aios build pkg NAME|DIR [-o DIR]   # PKGBUILD からパッケージを作る (NAME は /usr/src/aios/pkg/*/NAME)
+aios install pkg FILE...       # 作ったパッケージを入れる (aiosd が aipkg -U で)
 ```
 
 - 前のカーネルは起動の一覧に「aios (previous kernel)」(`/boot/loader/entries/prev-aios.conf`) として出る。
@@ -99,4 +101,7 @@ aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れか�
      (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残る
   新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる
-- まだ: ユーザーのプログラムとパッケージのビルド (aios build pkg)
+- `aios build pkg` は bin/mkpkg.sh と同じものを aios の中で作る (user/src/lib/mkpkg.rs)。PKGBUILD の関数
+  (pkgver prepare build package) は bash (brush) で動かし、ソース (git+、http(s) は fetch、横のファイル)、sha256、
+  .PKGINFO、tar と zstd はこちらでする。zstd のコマンドがなければ ruzstd で縮める (速いが、-19 ほどは縮まない)。
+  作業の場所は ~/.cache/aios/build/NAME。root はいらない (ファイルの持ち主は tar の中で root にする)
