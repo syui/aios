@@ -4,28 +4,21 @@
 # aios の本体 (Rust) は静的リンクのままなので、これがなくても aios は動く。
 # 動的リンクのプログラムを作るのは base-devel の cc -dynamic (ヘッダーは Zig のもの)
 pkgname=musl
-pkgver=1.2.5
-pkgrel=3
+pkgver=1.2.6
+pkgrel=1
 pkgdesc='Lightweight implementation of the C standard library: shared libc.so and the dynamic linker'
 arch=('aarch64')
 url='https://musl.libc.org/'
 license=('MIT')
 backup=(etc/ld-musl-aarch64.path)
 makedepends=('aarch64-linux-gnu-gcc')
-source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz"
-        0001-iconv-fix-erroneous-input-validation-in-EUC-KR-decoder.patch
-        0002-iconv-harden-UTF-8-output-code-path.patch)
-sha256sums=('a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4'
-            '0896fcdb5125d9d0723f4e165f13c209830e7045a75cba4e858060837cb7292e'
-            '0620fcee4e8a4e52ebe1ea75e2b51d2197ebda242489c0586924eafa9e9606a1')
+source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz")
+sha256sums=('d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a')
 
 prepare() {
   rm -rf "musl-$pkgver"
   tar -xzf "musl-$pkgver.tar.gz"
-  cd "musl-$pkgver"
-  # CVE-2025-26519 (iconv)
-  patch -p1 < "$srcdir/0001-iconv-fix-erroneous-input-validation-in-EUC-KR-decoder.patch"
-  patch -p1 < "$srcdir/0002-iconv-harden-UTF-8-output-code-path.patch"
+  # CVE-2025-26519 (iconv) のパッチは 1.2.6 に入った
 }
 
 build() {

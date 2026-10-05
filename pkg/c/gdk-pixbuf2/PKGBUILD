@@ -2,7 +2,7 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=gdk-pixbuf2
-pkgver=2.42.12
+pkgver=2.44.8
 pkgrel=1
 pkgdesc='Image loading library (shared, for aios; PNG built in)'
 arch=('aarch64')
@@ -10,7 +10,7 @@ license=('LGPL-2.1-or-later')
 depends=('musl' 'glib2' 'libpng')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://download.gnome.org/sources/gdk-pixbuf/${pkgver%.*}/gdk-pixbuf-$pkgver.tar.xz")
-sha256sums=('b9505b3445b9a7e48ced34760c3bcb73e966df3ac94c95a148cb669ab748e3c7')
+sha256sums=('919f529512961a12e81cd4b4b466a48c3933469e7f9a310c6513cd4fb252ba3c')
 
 prepare() {
   rm -rf "gdk-pixbuf-$pkgver"
@@ -23,7 +23,7 @@ build() {
   meson_cross zlib libpng pcre2 libffi glib2
   cd "gdk-pixbuf-$pkgver"
   meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
-    -Dpng=enabled -Djpeg=disabled -Dtiff=disabled -Dgif=disabled -Dothers=disabled -Dbuiltin_loaders=png -Dintrospection=disabled -Dman=false -Dgtk_doc=false -Dinstalled_tests=false -Dtests=false -Dgio_sniffing=false
+    -Dpng=enabled -Djpeg=disabled -Dtiff=disabled -Dgif=disabled -Dothers=disabled -Dglycin=disabled -Dandroid=disabled -Dbuiltin_loaders=png -Dintrospection=disabled -Dman=false -Dgtk_doc=false -Dinstalled_tests=false -Dtests=false -Dgio_sniffing=false
   ninja -C build
 }
 
