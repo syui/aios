@@ -8,10 +8,13 @@ pkgdesc='Mozilla CA certificates for TLS (PEM bundle)'
 arch=('any')
 url='https://curl.se/docs/caextract.html'
 license=('MPL-2.0')
-source=("https://curl.se/ca/cacert-2026-09-25.pem")
+# 配布元の最新を見るところ (aish-pkg): ページの cacert-YYYY-MM-DD.pem の日付をつなげたものが pkgver
+_latest_url=https://curl.se/docs/caextract.html
+_latest_regex='cacert-([0-9]{4})-([0-9]{2})-([0-9]{2})\.pem'
+source=("https://curl.se/ca/cacert-${pkgver:0:4}-${pkgver:4:2}-${pkgver:6:2}.pem")
 sha256sums=('a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505')
 
 package() {
-  install -Dm644 cacert-2026-09-25.pem "$pkgdir/etc/ssl/certs/ca-certificates.crt"
+  install -Dm644 "${source[0]##*/}" "$pkgdir/etc/ssl/certs/ca-certificates.crt"
   ln -s certs/ca-certificates.crt "$pkgdir/etc/ssl/cert.pem"
 }
