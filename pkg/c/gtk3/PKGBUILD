@@ -2,15 +2,15 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=gtk3
-pkgver=3.24.50
-pkgrel=2
+pkgver=3.24.52
+pkgrel=1
 pkgdesc='GObject-based multi-platform GUI toolkit (GTK 3; Wayland only, for aios)'
 arch=('aarch64')
 license=('LGPL-2.1-or-later')
 depends=('musl' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2' 'atk' 'libepoxy' 'wayland' 'libxkbcommon' 'fribidi' 'harfbuzz' 'fontconfig' 'freetype2' 'xkeyboard-config')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://download.gnome.org/sources/gtk/${pkgver%.*}/gtk-$pkgver.tar.xz")
-sha256sums=('399118a5699314622165a11b769ea9b6ed68e037b6d46d57cfcf4851dec07529')
+sha256sums=('80931fa472a77b9a164f6740e3c0b444fac6770054632d35a7ff9d679e5e7b9f')
 
 prepare() {
   rm -rf "gtk-$pkgver"
