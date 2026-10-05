@@ -18,7 +18,7 @@
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
 3. **設定 (apply)** ✅: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
    apply のたびに前の設定とパッケージの版を `/var/lib/aios/history/` に残し、`aios rollback` で戻せる
-4. **改造 (src / build)** (一部 ✅): aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
+4. **改造 (src / build)** (ほぼ ✅): aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
    カーネルは前のものを ESP に残し、起動しなかったら前のもので起動しなおせるようにする
 
 ## 状態の木 (aios get)
@@ -90,7 +90,13 @@ aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れか�
 ```
 
 - 前のカーネルは起動の一覧に「aios (previous kernel)」(`/boot/loader/entries/prev-aios.conf`) として出る。
-  一覧が出るように、loader.conf の `timeout 0` は 3 秒にする。新しいカーネルで起動しなければ、一覧で 2 を選ぶ
+  一覧が出るように、loader.conf の `timeout 0` は 3 秒にする
+- 起動しなかったら自動で前のものに戻す (systemd-boot の boot counting を小さくしたもの):
+  1. `aios install kernel` で aiosd が `/boot/loader/try` に試す回数 (1) を書く
+  2. aiboot は try があれば 1 減らして新しいカーネルを起動する。もう 0 なら (前の起動が aiosd まで来なかった)、
+     前のカーネルを `aios.fallback=1` をつけて起動する (一覧で前のものを選んだときも同じ)
+  3. 起動して aiosd が動くと try を消す (起動できた)。`aios.fallback=1` で起きたときは `/boot/Image` を前のもの
+     (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残る
+  新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる
-- まだ: 起動しなかったら自動で前のものに戻す (aiboot が ESP に「試した回数」を書く、systemd-boot の boot counting)、
-  ユーザーのプログラムとパッケージのビルド (aios build pkg)
+- まだ: ユーザーのプログラムとパッケージのビルド (aios build pkg)
