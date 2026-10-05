@@ -2,28 +2,40 @@
 use crate::fb::Fb;
 
 pub const FONT: &str = "/usr/share/fonts/aifont/aifont.ttf";
+/// aifont にない字 (日本語など) を描くフォント (aifont-ja パッケージ。なくてもよい)
+pub const FONT_JA: &str = "/usr/share/fonts/aifont/aifont-ja.ttf";
 
 pub struct Text {
     font: fontdue::Font,
+    ja: Option<fontdue::Font>,
 }
 
 impl Text {
     pub fn load(path: &str) -> Result<Text, String> {
         let data = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
         let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).map_err(|e| format!("{}: {}", path, e))?;
-        Ok(Text { font })
+        let ja = std::fs::read(FONT_JA).ok().and_then(|d| fontdue::Font::from_bytes(d, fontdue::FontSettings::default()).ok());
+        Ok(Text { font, ja })
+    }
+
+    /// c を描くフォント (aifont になければ aifont-ja)
+    fn font_of(&self, c: char) -> &fontdue::Font {
+        match &self.ja {
+            Some(ja) if self.font.lookup_glyph_index(c) == 0 && ja.lookup_glyph_index(c) != 0 => ja,
+            _ => &self.font,
+        }
     }
 
     /// 幅 (画素)
     pub fn width(&self, s: &str, size: f32) -> i32 {
-        s.chars().map(|c| self.font.metrics(c, size).advance_width).sum::<f32>().round() as i32
+        s.chars().map(|c| self.font_of(c).metrics(c, size).advance_width).sum::<f32>().round() as i32
     }
 
     /// (x, y) を左、ベースラインにして描く
     pub fn draw(&self, fb: &mut Fb, s: &str, x: i32, y: i32, size: f32, rgb: u32) {
         let mut pen = x as f32;
         for c in s.chars() {
-            let (m, bitmap) = self.font.rasterize(c, size);
+            let (m, bitmap) = self.font_of(c).rasterize(c, size);
             let gx = pen.round() as i32 + m.xmin;
             let gy = y - m.height as i32 - m.ymin;
             for row in 0..m.height {

@@ -18,6 +18,8 @@ use term::Term;
 use wl::{Arg, Conn};
 
 const FONT: &str = "/usr/share/fonts/aifont/aifont.ttf";
+/// aifont にない字 (日本語など) を描くフォント (aifont-ja パッケージ。なくてもよい)
+const FONT_JA: &str = "/usr/share/fonts/aifont/aifont-ja.ttf";
 const SIZE: f32 = 16.0;
 const PAD: usize = 4;
 const CURSOR: u32 = 0xf5c518;
@@ -62,6 +64,8 @@ struct App {
     focused: bool,
     // 文字
     font: fontdue::Font,
+    /// aifont にない字のためのフォント
+    font_ja: Option<fontdue::Font>,
     glyphs: HashMap<(char, bool), Glyph>,
     cell_w: usize,
     cell_h: usize,
@@ -127,6 +131,7 @@ fn main() {
         waiting_frame: None,
         focused: false,
         font,
+        font_ja: std::fs::read(FONT_JA).ok().and_then(|d| fontdue::Font::from_bytes(d, fontdue::FontSettings::default()).ok()),
         glyphs: HashMap::new(),
         cell_w: cell_w.max(1),
         cell_h: cell_h.max(1),
@@ -585,7 +590,11 @@ impl App {
     }
 
     fn glyph(&mut self, c: char, bold: bool) -> &Glyph {
-        let font = &self.font;
+        // aifont になければ aifont-ja (日本語)
+        let font = match &self.font_ja {
+            Some(ja) if self.font.lookup_glyph_index(c) == 0 && ja.lookup_glyph_index(c) != 0 => ja,
+            _ => &self.font,
+        };
         self.glyphs.entry((c, bold)).or_insert_with(|| {
             let (m, alpha) = font.rasterize(c, SIZE);
             let alpha = if bold {
@@ -642,7 +651,13 @@ impl App {
             y_max = y_max.max(y0 + ch);
             for col in 0..self.term.cols {
                 let cell = self.term.view_cell(col, row);
-                let x0 = PAD + col * cw;
+                // 2 マスの字の右半分は、左半分といっしょに描いた
+                if cell.c == term::WIDE_CONT {
+                    continue;
+                }
+                let wide = col + 1 < self.term.cols && self.term.view_cell(col + 1, row).c == term::WIDE_CONT;
+                let cw = if wide { cw * 2 } else { cw };
+                let x0 = PAD + col * self.cell_w;
                 // さかのぼって見ているあいだはカーソルを出さない
                 let cursor = self.term.cursor_visible && self.term.view == 0 && row == self.term.cy && col == self.term.cx;
                 let (mut fg, mut bg) = (cell.fg, cell.bg);
