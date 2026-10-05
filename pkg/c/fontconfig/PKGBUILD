@@ -2,7 +2,7 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=fontconfig
-pkgver=2.17.1
+pkgver=2.18.3
 pkgrel=1
 pkgdesc='Library for configuring and customizing font access (shared, for aios)'
 arch=('aarch64')
@@ -10,7 +10,7 @@ license=('HPND AND Unicode-DFS-2016')
 depends=('musl' 'freetype2' 'expat')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/$pkgver/fontconfig-$pkgver.tar.xz")
-sha256sums=('9f5cae93f4fffc1fbc05ae99cdfc708cd60dfd6612ffc0512827025c026fa541')
+sha256sums=('4f7b554a38cdf78c033f666c8871f3749e14a094f65a07f630c91ed0b43d35e3')
 
 prepare() {
   rm -rf "fontconfig-$pkgver"

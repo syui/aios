@@ -2,7 +2,7 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=wayland-protocols
-pkgver=1.45
+pkgver=1.49
 pkgrel=1
 pkgdesc='Wayland protocol extensions (XML, for building Wayland programs)'
 arch=('any')
@@ -10,7 +10,7 @@ license=('MIT')
 depends=()
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/$pkgver/downloads/wayland-protocols-$pkgver.tar.xz")
-sha256sums=('4d2b2a9e3e099d017dc8107bf1c334d27bb87d9e4aff19a0c8d856d17cd41ef0')
+sha256sums=('ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14')
 
 prepare() {
   rm -rf "wayland-protocols-$pkgver"

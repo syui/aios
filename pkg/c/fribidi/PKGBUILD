@@ -2,7 +2,7 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=fribidi
-pkgver=1.0.16
+pkgver=1.0.17
 pkgrel=1
 pkgdesc='Unicode Bidirectional Algorithm library (shared, for aios)'
 arch=('aarch64')
@@ -10,7 +10,7 @@ license=('LGPL-2.1-or-later')
 depends=('musl')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://github.com/fribidi/fribidi/releases/download/v$pkgver/fribidi-$pkgver.tar.xz")
-sha256sums=('1b1cde5b235d40479e91be2f0e88a309e3214c8ab470ec8a2744d82a5a9ea05c')
+sha256sums=('6949dcde27d41cebad1fd741fcafc36d55a1020d2d872d4a6eb3914caabbada2')
 
 prepare() {
   rm -rf "fribidi-$pkgver"

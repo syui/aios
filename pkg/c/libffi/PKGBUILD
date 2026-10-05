@@ -1,7 +1,7 @@
 # libffi: 関数の呼び方 (ABI) を実行時に組み立てるライブラリ。libwayland が使う
 #   共有ライブラリ (/opt/c/lib/libffi.so.8)。動かすには musl
 pkgname=libffi
-pkgver=3.5.2
+pkgver=3.8.0
 pkgrel=1
 pkgdesc='Portable foreign function interface library (shared, for aios)'
 arch=('aarch64')
@@ -9,7 +9,7 @@ url='https://sourceware.org/libffi/'
 license=('MIT')
 depends=('musl')
 source=("https://github.com/libffi/libffi/releases/download/v$pkgver/libffi-$pkgver.tar.gz")
-sha256sums=('f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc')
+sha256sums=('7da3e2d9a171eb0a038f592ecad3ff2bb2550f3496d87b3b29ad0cf4430c0db4')
 
 prepare() {
   rm -rf "libffi-$pkgver"
