@@ -193,6 +193,8 @@ pub struct Proc {
     pub last_sys: (u64, u64, u64),
     /// 最後の例外 (pc、アドレス、ESR の EC)。シグナルで落ちたときに出す
     pub last_fault: (u64, u64, u64),
+    /// 最後に落ちたときの ESR (調べもの用: WnR、CM など)
+    pub last_esr: u64,
     pub last_lr: u64,
     /// そのときの x0, x1, x19 (落ちたときに、文字列なら出す)
     pub last_regs: [u64; 3],
@@ -244,6 +246,7 @@ impl Proc {
         chan: 0,
         last_sys: (0, 0, 0),
         last_fault: (0, 0, 0),
+        last_esr: 0,
         last_lr: 0,
         last_regs: [0; 3],
         last_sp: 0,

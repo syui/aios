@@ -458,6 +458,11 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                             let pt = &p.mm().pt;
                             println!("pid {}: addr {:#x} is {}", p.pid, addr, pt.region_text(addr as usize));
                             println!("pid {}: sp {:#x} is {}", p.pid, p.last_sp, pt.region_text(p.last_sp as usize));
+                            let e = p.last_esr;
+                            if matches!(e >> 26, 0x20 | 0x24) {
+                                // データ / 命令のアボート: ISS の WnR (書いた)、CM (キャッシュの命令)、FSC (なぜ)
+                                println!("pid {}: esr {:#x} (WnR {} CM {} FSC {:#x})", p.pid, e, (e >> 6) & 1, (e >> 8) & 1, e & 0x3f);
+                            }
                             // そのページにかかわった最近の mmap / mprotect / munmap (-N は N 回前)
                             for l in pt.hist_text(addr as usize).iter().rev().take(12).rev() {
                                 println!("pid {}: addr page: {}", p.pid, l);

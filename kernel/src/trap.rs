@@ -198,7 +198,11 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                     let fsc = esr & 0x3f;
                     let mut fault = None;
                     if (ec == EC_IABT_LOW || ec == EC_DABT_LOW) && (4..=15).contains(&fsc) {
-                        let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0;
+                        // WnR (書こうとした)。ただしキャッシュを整える命令 (DC CVAU など。CM = ISS の bit 8) は、
+                        // 読むだけでも WnR = 1 で来る。JIT (LLVM の __clear_cache) が実行だけの領域のまだないページに
+                        // DC CVAU すると、書いたと見て SIGSEGV にしてしまうので、読んだものとして扱う
+                        let cm = ec == EC_DABT_LOW && esr & (1 << 8) != 0;
+                        let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && !cm;
                         let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         // 足りなければ自分のページもスワップへ追い出して、もう一度
                         if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::swap::reclaim(crate::swap::BATCH, 0) > 0 {
@@ -229,6 +233,7 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                         _ => (signal::SIGILL, 1, tf.elr),
                     };
                     proc::current().last_fault = (tf.elr, far, ec);
+                    proc::current().last_esr = esr;
                     proc::current().last_lr = tf.x[30];
                     proc::current().last_regs = [tf.x[0], tf.x[1], tf.x[19]];
                     proc::current().last_sp = tf.sp_el0;
