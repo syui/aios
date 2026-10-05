@@ -109,6 +109,16 @@ sudo sysctl vm.min_free_kbytes=8192        # 書く
 sudo sysctl --system                       # /etc/sysctl.conf と /etc/sysctl.d/*.conf を入れる (起動のときに init がする)
 ```
 
+### 値をくらべる (aios tune)
+
+値を順に変えて、同じ仕事の時間をくらべる。終わったら元の値に戻す。`--apply` でいちばん速かった値を
+`/etc/aios.json` の `sysctl` に書いて `aios apply` する (root)。Claude は aish-sys の `tune` ツールで同じことをする。
+
+```sh
+sudo aios tune kernel.sched_timeslice_ms=10,20,50,100 -n 3 -- 'make -j8'
+sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release'
+```
+
 ## 改造 (aios src / build / install)
 
 ```sh

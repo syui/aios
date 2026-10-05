@@ -8,6 +8,7 @@
 //   log     サービスのログ (/var/log/UNIT.log。journalctl -u と同じもの)
 //   bkl     コマンドを 1 つ動かして、そのあいだの大きなロック (/proc/bkl) を測る
 //   strace  コマンドを 1 つ動かして、そのシステムコールを kmsg から取る (/proc/strace)
+//   tune    sysctl の値を順に変えてコマンドの時間をくらべる (aios tune。--apply でいちばん速い値を /etc/aios.json に)
 //   M-s     まとめを画面に出す (キーを押すと消える)
 // /proc/bkl、/proc/strace を 0 からにするのは root だけなので、root でなければ sudo -n tee で書く。
 // 開発の Linux でも動く (aios にしかないものは「ない」と答える)
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 const GET: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"点でつなぐ: host kernel mem disk proc service pkg net user boot log の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"}}}"#;
 const DO: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"service / pkg / power / apply (/etc/aios.json のとおりにそろえる) / rollback (ひとつ前の apply に戻す) / ping"},"action":{"type":"string","description":"service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"},"name":{"type":"string","description":"service の名前 (sshd など)"},"names":{"type":"array","items":{"type":"string"},"description":"pkg install / remove のパッケージ"}},"required":["op"]}"#;
 const DIFF: &str = r#"{"type":"object","properties":{}}"#;
+const TUNE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"sysctl の名前 (kernel.sched_timeslice_ms など。aios get kernel.sysctl で一覧)"},"values":{"type":"array","items":{"type":"string"},"description":"くらべる値"},"cmd":{"type":"string","description":"測る仕事 (sh -c)。値ごとに n 回動かす"},"n":{"type":"integer","description":"値ごとに動かす回数 (既定 3)"},"apply":{"type":"boolean","description":"いちばん速かった値を /etc/aios.json の sysctl に書いて aios apply する"}},"required":["name","values","cmd"]}"#;
 const NONE: &str = r#"{"type":"object","properties":{}}"#;
 const PROCS: &str = r#"{"type":"object","properties":{"sort":{"type":"string","description":"cpu (既定。使った CPU の時間) か mem (メモリ)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"},"name":{"type":"string","description":"名前にこれをふくむものだけ"}}}"#;
 const KMSG: &str = r#"{"type":"object","properties":{"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
@@ -36,6 +38,7 @@ fn main() {
             Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。host kernel mem disk proc service pkg net user boot log。path で一部だけ", input: GET },
             Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
             Tool { name: "diff", desc: "/etc/aios.json (望む状態) といまのちがいと、そろえる手順 (aios diff。動かさない)。そろえるのは do の apply", input: DIFF },
+            Tool { name: "tune", desc: "sysctl の値を順に変えて cmd を n 回ずつ動かし、かかった時間のまんなか (ms) でくらべる (aios tune。root で。終わったら元の値に戻す)。apply でいちばん速かった値を /etc/aios.json に書いて apply。50 秒をこえそうなら run の bg で sudo aios tune NAME=V1,V2 -- CMD", input: TUNE },
             Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", input: NONE },
             Tool { name: "procs", desc: "プロセスの一覧 (pid ppid 状態 スレッド CPU 秒 メモリ 名前)。sort: cpu / mem", input: PROCS },
             Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", input: KMSG },
@@ -55,6 +58,7 @@ fn main() {
                     Ok(o) => json!({ "status": o.status.code().unwrap_or(-1), "text": String::from_utf8_lossy(&o.stdout), "err": String::from_utf8_lossy(&o.stderr) }),
                     Err(e) => error(format!("aios: {}", e)),
                 },
+                "tune" => tune(a),
                 "sys" => summary(),
                 "procs" => procs(a),
                 "kmsg" => kmsg(a),
@@ -101,6 +105,44 @@ fn kib(kb: u64) -> String {
 }
 
 // ---- 状態の木 (aios get) ----
+
+/// tune: aios tune NAME=V1,V2 [-n N] [--apply] --json -- CMD。root でなければ sudo -n で
+fn tune(a: &Value) -> Value {
+    let vals: Vec<&str> = a["values"].as_array().map(|v| v.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+    let (name, cmd) = (s(a, "name"), s(a, "cmd"));
+    if name.is_empty() || vals.is_empty() || cmd.is_empty() {
+        return error("give name, values and cmd");
+    }
+    let mut args = vec!["aios".to_string(), "tune".into(), format!("{}={}", name, vals.join(",")), "-n".into(), a["n"].as_u64().unwrap_or(3).to_string(), "--json".into()];
+    if a["apply"] == true {
+        args.push("--apply".into());
+    }
+    args.push("--".into());
+    args.push(cmd.to_string());
+    let root = unsafe { libc::geteuid() } == 0;
+    let mut c = if root { Command::new(&args[0]) } else { Command::new("sudo") };
+    if root {
+        c.args(&args[1..]);
+    } else {
+        c.arg("-n").args(&args);
+    }
+    match c.stdin(Stdio::null()).output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let mut r = out.lines().find_map(|l| serde_json::from_str::<Value>(l).ok().filter(|v| v.is_object())).unwrap_or_else(|| json!({}));
+            if !o.status.success() {
+                r["error"] = json!(String::from_utf8_lossy(&o.stderr).trim().to_string());
+            }
+            // --apply のときは apply の結果の行も
+            let rest: Vec<&str> = out.lines().filter(|l| !l.starts_with('{')).collect();
+            if !rest.is_empty() {
+                r["text"] = json!(rest.join("\n"));
+            }
+            r
+        }
+        Err(e) => error(format!("aios: {}", e)),
+    }
+}
 
 fn get(a: &Value) -> Value {
     let path = a["path"].as_str().unwrap_or("");
