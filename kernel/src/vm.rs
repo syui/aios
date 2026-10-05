@@ -158,7 +158,12 @@ pub struct PageTable {
     fast_users: AtomicUsize,
     /// clock の針 (次にスワップへ追い出すページを探しはじめる va)
     clock: usize,
+    /// 最近の map / protect / unmap (操作, 始め, 終わり, prot)。落ちたときに、そのアドレスにかかわったものを出す (調べもの用)
+    hist: alloc::collections::VecDeque<(u8, usize, usize, u8)>,
 }
+
+/// hist に覚える数
+const HIST: usize = 512;
 
 fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * (3 - level))) & 0x1ff
@@ -261,7 +266,7 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), clock: 0 })
+        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), clock: 0, hist: alloc::collections::VecDeque::new() })
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -391,7 +396,8 @@ impl PageTable {
         if start >= end || end > MAXVA {
             return None;
         }
-        self.unmap(start, end);
+        self.unmap_inner(start, end);
+        self.note(b'm', start, end, prot);
         self.vmas.insert(start, Vma { end, prot, shared, back, name: None });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
@@ -406,6 +412,14 @@ impl PageTable {
 
     /// [start, end) の領域とページを外す
     pub fn unmap(&mut self, start: usize, end: usize) {
+        let (s, e) = (pg_down(start), pg_up(end));
+        if s < e {
+            self.note(b'u', s, e, 0);
+        }
+        self.unmap_inner(start, end);
+    }
+
+    fn unmap_inner(&mut self, start: usize, end: usize) {
         let (start, end) = (pg_down(start), pg_up(end));
         if start >= end {
             return;
@@ -465,6 +479,7 @@ impl PageTable {
     /// mprotect。領域でないところが混じっていれば ENOMEM (Err)
     pub fn protect(&mut self, start: usize, end: usize, prot: u8) -> Result<(), ()> {
         let (start, end) = (pg_down(start), pg_up(end));
+        self.note(b'p', start, end, prot);
         // すき間がないか
         let mut va = start;
         while va < end {
@@ -528,6 +543,34 @@ impl PageTable {
             _ => 0,
         };
         Some((v.name.clone()?, off + (va - s)))
+    }
+
+    fn note(&mut self, op: u8, start: usize, end: usize, prot: u8) {
+        if self.hist.len() >= HIST {
+            self.hist.pop_front();
+        }
+        self.hist.push_back((op, start, end, prot));
+    }
+
+    /// va のページにかかわった最近の map / protect / unmap (古い順。落ちたときの知らせ)
+    pub fn hist_text(&self, va: usize) -> alloc::vec::Vec<alloc::string::String> {
+        let page = pg_down(va);
+        let n = self.hist.len();
+        self.hist
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, s, e, _))| *s <= page && page < *e)
+            .map(|(i, &(op, s, e, prot))| {
+                let p = |b: u8, c: char| if prot & b != 0 { c } else { '-' };
+                let what = match op {
+                    b'm' => "map",
+                    b'p' => "protect",
+                    _ => "unmap",
+                };
+                let pr = if op == b'u' { alloc::string::String::new() } else { alloc::format!(" {}{}{}", p(PROT_READ, 'r'), p(PROT_WRITE, 'w'), p(PROT_EXEC, 'x')) };
+                alloc::format!("-{} {} [{:#x}-{:#x}){}", n - i, what, s, e, pr)
+            })
+            .collect()
     }
 
     /// va がどの領域か (落ちたときの知らせ): 中なら「[始め-終わり) 権限 名前」、外なら上と下の近い領域からの距離
