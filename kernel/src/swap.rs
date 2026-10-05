@@ -19,10 +19,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub const MAX_AREAS: usize = 4;
-/// 空きがこれを割ったら回収する (4 MiB)
-const LOW: usize = 1024;
-/// 回収するときは、空きがこれになるまで (16 MiB)
-const HIGH: usize = 4096;
+// 空きが LOW を割ったら回収する (既定 4 MiB)、回収するときは、空きが HIGH (LOW の 4 倍) になるまで。
+// LOW は /proc/sys/vm/min_free_kbytes (sysctl.rs) で変えられる
 /// ページが作れなかったときに回収する数
 pub const BATCH: usize = 256;
 
@@ -275,8 +273,9 @@ pub fn reclaim(want: usize, exclude: usize) -> usize {
 /// ユーザーへ戻る前に: 空きが少なければ回収しておく
 pub fn balance() {
     let free = crate::kalloc::nfree();
-    if free < LOW {
-        reclaim(HIGH - free, 0);
+    let low = crate::sysctl::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    if free < low {
+        reclaim(low * 4 - free, 0);
     }
 }
 

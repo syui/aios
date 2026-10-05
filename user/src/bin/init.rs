@@ -5,6 +5,8 @@
 //   systemctl とは /run/aiinit.ctl (FIFO) で話す。
 #[path = "../lib/kmod.rs"]
 mod kmod;
+#[path = "../lib/sysctl.rs"]
+mod sysctl;
 #[path = "../lib/unit.rs"]
 mod unit;
 #[path = "../lib/users.rs"]
@@ -414,6 +416,12 @@ fn main() {
         match kmod::load(&m) {
             Ok(()) => println!("init: module {}", m),
             Err(e) => println!("init: module {}: {}", m, e),
+        }
+    }
+    // カーネルの値: /etc/sysctl.conf と /etc/sysctl.d/*.conf を /proc/sys に (systemd-sysctl と同じ)
+    for f in sysctl::boot_files() {
+        for e in sysctl::apply_file(&f) {
+            println!("init: sysctl: {}", e);
         }
     }
     let mut init = Init::load();

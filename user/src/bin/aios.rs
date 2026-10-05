@@ -29,6 +29,8 @@ mod mkpkg;
 #[path = "../lib/netif.rs"]
 #[allow(dead_code)]
 mod netif;
+#[path = "../lib/sysctl.rs"]
+mod sysctl;
 #[path = "../lib/state.rs"]
 mod state;
 #[path = "../lib/unit.rs"]

@@ -10,9 +10,11 @@ pub const PATH: &str = "/etc/aios.json";
 pub const HISTORY: &str = "/var/lib/aios/history";
 /// aios が書く modules-load.d のファイル (kernel.modules)
 const MODULES: &str = "/etc/modules-load.d/aios.conf";
+/// networkd が読むところ (net)。aios が書くのは 00-aios-IFACE.network (名前の順で先に読まれる)
+const NETWORK: &str = "/etc/systemd/network";
 
 /// 一番上に書けるもの
-const KEYS: [&str; 5] = ["host", "pkg", "service", "kernel", "user"];
+const KEYS: [&str; 7] = ["host", "pkg", "service", "kernel", "user", "net", "sysctl"];
 
 /// そろえるための 1 つの手順
 #[derive(Clone)]
@@ -28,6 +30,7 @@ pub struct Step {
 pub enum Act {
     Run(Vec<String>),
     Write(String, String),
+    Remove(String),
     Hostname(String),
 }
 
@@ -36,6 +39,7 @@ impl Step {
         let how = match &self.act {
             Act::Run(c) => c.join(" "),
             Act::Write(p, _) => format!("write {}", p),
+            Act::Remove(p) => format!("rm {}", p),
             Act::Hostname(n) => format!("hostname {}", n),
         };
         json!({ "what": self.what, "from": self.from, "to": self.to, "do": how })
@@ -194,7 +198,130 @@ pub fn plan(cfg: &Value) -> Result<Vec<Step>, String> {
             }
         }
     }
+    // sysctl: /etc/sysctl.d/aios.conf に書き (起動のときに init が入れる)、いまの値がちがうものは /proc/sys に
+    if let Some(sc) = cfg.get("sysctl") {
+        let Some(m) = sc.as_object() else { return Err("sysctl: must be {\"NAME\": VALUE} (vm.min_free_kbytes ...)".into()) };
+        let mut content = String::from("# aios apply (/etc/aios.json の sysctl) が書く\n");
+        let mut now = Vec::new();
+        for (k, v) in m {
+            if !crate::sysctl::ok_key(k) {
+                return Err(format!("sysctl: bad name {:?}", k));
+            }
+            let val = match v {
+                Value::String(s) if !s.contains('\n') => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
+                _ => return Err(format!("sysctl.{}: must be a number or a string", k)),
+            };
+            content.push_str(&format!("{} = {}\n", k, val));
+            let cur = crate::sysctl::get(k).map_err(|_| format!("sysctl.{}: not in /proc/sys", k))?;
+            // 値がいくつもあるもの (タブで分ける) も、空白の数はくらべない
+            if cur.split_whitespace().ne(val.split_whitespace()) {
+                now.push(step(format!("sysctl {}", k), &cur, &val, Act::Write(crate::sysctl::path(k), format!("{}\n", val))));
+            }
+        }
+        let file = fs::read_to_string(crate::sysctl::AIOS_CONF).unwrap_or_default();
+        let keys = |t: &str| crate::sysctl::parse(t).into_iter().map(|(k, v, _)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" ");
+        if m.is_empty() {
+            if !file.is_empty() {
+                steps.push(step("sysctl.conf".into(), &keys(&file), "", Act::Remove(crate::sysctl::AIOS_CONF.into())));
+            }
+        } else if file != content {
+            steps.push(step("sysctl.conf".into(), &keys(&file), &keys(&content), Act::Write(crate::sysctl::AIOS_CONF.into(), content)));
+        }
+        steps.extend(now);
+    }
+
+    // net: インターフェースごとに 00-aios-IFACE.network を書いて networkd で決める。
+    // aios が書いたもので、もう書いていないインターフェースのものは消す
+    if let Some(net) = cfg.get("net") {
+        let Some(m) = net.as_object() else {
+            return Err("net: must be {\"IFACE\": {\"dhcp\": true} | {\"address\": \"A.B.C.D/N\", \"gateway\": ..., \"dns\": [...]}}".into());
+        };
+        let live = crate::state::collect("net").unwrap_or_default();
+        let mut redo = false;
+        for (name, n) in m {
+            if !ok_name(name) {
+                return Err(format!("net: bad interface name {:?}", name));
+            }
+            let (content, addr) = network_file(name, n)?;
+            let path = format!("{}/00-aios-{}.network", NETWORK, name);
+            let now = fs::read_to_string(&path).unwrap_or_default();
+            if now != content {
+                steps.push(step(format!("net.{}", name), &network_summary(&now), &network_summary(&content), Act::Write(path, content)));
+                redo = true;
+                continue;
+            }
+            // ファイルはそろっていても、いまのアドレスがちがえば networkd をもういちど
+            let cur = live["interfaces"].as_array().and_then(|a| a.iter().find(|i| i["name"] == name.as_str())).cloned().unwrap_or_default();
+            redo |= match &addr {
+                Some(a) => cur["addr"].as_str() != Some(a),
+                None => cur["dhcp"] != true,
+            };
+        }
+        let mut old: Vec<String> = fs::read_dir(NETWORK)
+            .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.strip_prefix("00-aios-")?.strip_suffix(".network").map(String::from)).collect())
+            .unwrap_or_default();
+        old.sort();
+        for name in old.iter().filter(|n| !m.contains_key(*n)) {
+            let path = format!("{}/00-aios-{}.network", NETWORK, name);
+            steps.push(step(format!("net.{}", name), &network_summary(&fs::read_to_string(&path).unwrap_or_default()), "", Act::Remove(path)));
+            redo = true;
+        }
+        if redo {
+            steps.push(step("net".into(), "", "applied", run(&["networkd"])));
+        }
+    }
     Ok(steps)
+}
+
+/// net.IFACE から networkd のファイルを作る。(中身, 手で決めたアドレス)
+fn network_file(name: &str, n: &Value) -> Result<(String, Option<String>), String> {
+    let Some(o) = n.as_object() else { return Err(format!("net.{}: must be {{\"dhcp\": true}} or {{\"address\": ...}}", name)) };
+    for k in o.keys() {
+        if !["dhcp", "address", "gateway", "dns"].contains(&k.as_str()) {
+            return Err(format!("net.{}: unknown key {:?} (one of: dhcp address gateway dns)", name, k));
+        }
+    }
+    let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().is_ok();
+    let dhcp = n["dhcp"].as_bool().unwrap_or(false);
+    let addr = n["address"].as_str();
+    if dhcp == addr.is_some() {
+        return Err(format!("net.{}: give either \"dhcp\": true or \"address\"", name));
+    }
+    let mut s = format!("# aios apply (/etc/aios.json の net.{}) が書く\n[Match]\nName={}\n\n[Network]\n", name, name);
+    if dhcp {
+        s.push_str("DHCP=yes\n");
+    }
+    if let Some(a) = addr {
+        let ok = a.split_once('/').is_some_and(|(h, p)| ip(h) && p.parse::<u8>().is_ok_and(|p| p <= 32));
+        if !ok {
+            return Err(format!("net.{}.address: must be A.B.C.D/N", name));
+        }
+        s.push_str(&format!("Address={}\n", a));
+    }
+    if let Some(g) = n.get("gateway") {
+        let Some(g) = g.as_str().filter(|g| ip(g)) else { return Err(format!("net.{}.gateway: must be A.B.C.D", name)) };
+        if dhcp {
+            return Err(format!("net.{}.gateway: DHCP gives the gateway", name));
+        }
+        s.push_str(&format!("Gateway={}\n", g));
+    }
+    if let Some(d) = n.get("dns") {
+        let list: Vec<&str> = d.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        if !d.is_array() || list.len() != d.as_array().map_or(0, |a| a.len()) || list.iter().any(|x| !ip(x)) {
+            return Err(format!("net.{}.dns: must be a list of A.B.C.D", name));
+        }
+        if !list.is_empty() {
+            s.push_str(&format!("DNS={}\n", list.join(" ")));
+        }
+    }
+    Ok((s, addr.map(String::from)))
+}
+
+/// networkd のファイルを 1 行に (diff の from / to)
+fn network_summary(t: &str) -> String {
+    t.lines().filter(|l| l.contains('=') && !l.starts_with("Name=") && !l.starts_with('#')).collect::<Vec<_>>().join(" ")
 }
 
 /// 手順を 1 つ動かす (root で)。(うまくいったか, 出力)
@@ -213,6 +340,10 @@ pub fn exec(s: &Step, path_env: &str) -> (bool, String) {
                 Err(e) => (false, format!("{}: {}", p, e)),
             }
         }
+        Act::Remove(p) => match fs::remove_file(p) {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, format!("{}: {}", p, e)),
+        },
         Act::Hostname(n) => {
             let r = fs::write("/etc/hostname", format!("{}\n", n));
             let c = std::ffi::CString::new(n.as_str()).unwrap_or_default();
@@ -257,6 +388,32 @@ pub fn export() -> Value {
         }
     }
     m.insert("user".into(), Value::Object(users));
+    // net: いまのアドレス (lo は書かない)。DHCP のものは dhcp だけ
+    let net = crate::state::collect("net").unwrap_or_default();
+    let mut ifs = Map::new();
+    let gw = |dev: &str| net["routes"].as_array().and_then(|a| a.iter().find(|r| r["dev"] == dev && r["dst"] == "0.0.0.0/0")).and_then(|r| r["gw"].as_str().map(String::from));
+    for i in net["interfaces"].as_array().cloned().unwrap_or_default() {
+        let Some(name) = i["name"].as_str().filter(|n| *n != "lo") else { continue };
+        if i["dhcp"] == true {
+            ifs.insert(name.into(), json!({ "dhcp": true }));
+        } else if let Some(a) = i["addr"].as_str() {
+            let mut o = json!({ "address": a });
+            if let Some(g) = gw(name) {
+                o["gateway"] = json!(g);
+            }
+            if net["dns"].as_array().is_some_and(|d| !d.is_empty()) {
+                o["dns"] = net["dns"].clone();
+            }
+            ifs.insert(name.into(), o);
+        }
+    }
+    m.insert("net".into(), Value::Object(ifs));
+    // sysctl: aios apply で書いたもの (ほかの /proc/sys は既定のまま)
+    let mut sc = Map::new();
+    for (k, v, _) in crate::sysctl::parse(&fs::read_to_string(crate::sysctl::AIOS_CONF).unwrap_or_default()) {
+        sc.insert(k, v.parse::<i64>().map_or(json!(v), |n| json!(n)));
+    }
+    m.insert("sysctl".into(), Value::Object(sc));
     Value::Object(m)
 }
 

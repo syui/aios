@@ -46,10 +46,8 @@ const IN_ONESHOT: u32 = 0x8000_0000;
 const IN_NONBLOCK: u64 = 0o4000;
 const IN_CLOEXEC: u64 = 0o2000000;
 
-/// ためておくできごとの数 (/proc/sys/fs/inotify/max_queued_events と同じ)。こえたら IN_Q_OVERFLOW
-const MAX_QUEUED: usize = 16384;
-/// 1 つの inotify の watch の数
-const MAX_WATCHES: usize = 8192;
+// ためておくできごとの数 (こえたら IN_Q_OVERFLOW) と 1 つの inotify の watch の数は
+// /proc/sys/fs/inotify/max_queued_events と max_user_watches (sysctl.rs)
 
 struct Watch {
     wd: i32,
@@ -127,7 +125,7 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
         w.mask = if mask & IN_MASK_ADD != 0 { w.mask | keep } else { keep };
         return Ok(w.wd as i64);
     }
-    if n.watches.len() >= MAX_WATCHES {
+    if n.watches.len() >= crate::sysctl::INOTIFY_MAX_WATCHES.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(-ENOSPC);
     }
     let wd = n.next_wd;
@@ -168,7 +166,7 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
         if b.queue.back() == Some(&ev) {
             return;
         }
-        if b.queue.len() >= MAX_QUEUED {
+        if b.queue.len() >= crate::sysctl::INOTIFY_MAX_QUEUED.load(core::sync::atomic::Ordering::Relaxed) {
             // あふれた: 最後に 1 つだけ IN_Q_OVERFLOW (wd は -1)
             let mut o = Vec::with_capacity(16);
             o.extend_from_slice(&(-1i32).to_le_bytes());
