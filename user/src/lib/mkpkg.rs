@@ -241,7 +241,7 @@ pub fn build(startdir: &Path, dest: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&pkgdir).map_err(|e| e.to_string())?;
     let verfile = work.join("pkgver");
     let script = format!(
-        "set -e\nsource ./PKGBUILD\n\
+        "set -e\nsha256() {{ sha256sum \"$1\" | cut -d' ' -f1; }}\nsource ./PKGBUILD\n\
          if declare -F pkgver >/dev/null; then pkgver=$(cd \"$srcdir\" && pkgver); fi\n\
          printf '%s' \"$pkgver\" > {ver}\n\
          for f in prepare build; do if declare -F $f >/dev/null; then echo \"==> $pkgname: $f()\"; (cd \"$srcdir\" && $f); fi; done\n\

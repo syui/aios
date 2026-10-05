@@ -6,12 +6,12 @@
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
 pkgname=base-devel
 pkgver=0.0.1
-pkgrel=7
+pkgrel=8
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib)'
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
-depends=('zig' 'pkgconf')
+depends=('zig' 'pkgconf' 'zstd')
 
 package() {
   local d=$pkgdir/opt/c/bin

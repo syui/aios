@@ -1,0 +1,37 @@
+# zstd: Zstandard の圧縮 (zstd、unzstd、zstdcat と libzstd)。aios build pkg がパッケージを -19 で縮めるのに使う
+# ビルドは pkg/c/zig.sh の Zig (aarch64-linux-musl)。/opt/c に入れる
+pkgname=zstd
+pkgver=1.5.7
+pkgrel=1
+pkgdesc='Zstandard compression (zstd command and libzstd, for aios)'
+arch=('aarch64')
+url='https://facebook.github.io/zstd/'
+license=('BSD-3-Clause' 'GPL-2.0-only')
+source=("https://github.com/facebook/zstd/releases/download/v$pkgver/zstd-$pkgver.tar.gz")
+sha256sums=('eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3')
+
+prepare() {
+  rm -rf "zstd-$pkgver"
+  tar -xzf "zstd-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "zstd-$pkgver"
+  # コマンドは静的に (どこでも動く)。ライブラリは静的と共有の両方
+  make -C lib CC="$CC" AR="$AR" PREFIX="$PREFIX" libzstd.a libzstd
+  make -C programs CC="$CC" AR="$AR" LDFLAGS="-static -s" HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0 zstd-release
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "zstd-$pkgver"
+  make -C lib CC="$CC" AR="$AR" PREFIX="$PREFIX" DESTDIR="$pkgdir" install-pc install-static install-shared install-includes
+  install -Dm755 programs/zstd "$pkgdir$PREFIX/bin/zstd"
+  ln -s zstd "$pkgdir$PREFIX/bin/unzstd"
+  ln -s zstd "$pkgdir$PREFIX/bin/zstdcat"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/zstd/LICENSE"
+  rm -rf "$pkgdir$PREFIX/share"
+}
