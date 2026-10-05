@@ -375,7 +375,7 @@ fn cut(s: String) -> String {
 
 /// 答えを読む形にする (Claude が読む content の text)。プロトコルとしての答えは structuredContent の JSON のまま。
 /// 出力や文書 (out err text) は JSON の中にエスケープせずにそのまま出し、ほかのものは終わりに 1 行の JSON で。
-/// grep の matches は 1 行に 1 つ (n path:line: text、前後の行は n のかわりに -)
+/// grep の matches はファイルごとにまとめる: パスの行のあとに 1 行に 1 つ (n line: text、前後の行は n のかわりに -)
 fn render(r: &Value) -> String {
     let Some(o) = r.as_object() else { return r.to_string() };
     let mut s = String::new();
@@ -385,9 +385,16 @@ fn render(r: &Value) -> String {
             ("out" | "text", Value::String(t)) => s.push_str(t),
             ("err", Value::String(_)) => {}
             ("matches", Value::Array(ms)) => {
+                let mut last = "";
                 for m in ms {
+                    let path = m["path"].as_str().unwrap_or("");
+                    if path != last {
+                        s.push_str(path);
+                        s.push('\n');
+                        last = path;
+                    }
                     let n = m["n"].as_u64().map_or("-".to_string(), |n| n.to_string());
-                    s.push_str(&format!("{} {}:{}: {}\n", n, m["path"].as_str().unwrap_or(""), m["line"], m["text"].as_str().unwrap_or("")));
+                    s.push_str(&format!("{} {}: {}\n", n, m["line"], m["text"].as_str().unwrap_or("")));
                 }
             }
             _ => {
@@ -409,7 +416,10 @@ fn render(r: &Value) -> String {
             s.push('\n');
         }
     }
-    s.push_str(&Value::Object(meta).to_string());
+    // 残りがなければ {} は出さない
+    if !meta.is_empty() {
+        s.push_str(&Value::Object(meta).to_string());
+    }
     s
 }
 

@@ -71,7 +71,7 @@ claude mcp add aish -- aish --mcp     # Claude Code から
   `job {id, wait_ms?, kill?}` で様子と出力 (`{done, status, out, err, ms}`。id がなければ一覧)。重いビルドのあいだも
   ほかのツールが使える
 - 答えの `content` の text は読みやすい形: `out` と `text` (read、hit) はエスケープせずにそのまま、`err` は `[err]` のあと、
-  grep は 1 行に 1 つ (`n path:line: text`)、ほかは終わりに 1 行の JSON。`aish --mcp --json` なら、いままでどおり
+  grep はファイルごとに、パスの行のあとに 1 行に 1 つ (`n line: text`)、ほかは終わりに 1 行の JSON (なにもなければ出さない)。`aish --mcp --json` なら、いままでどおり
   JSON の text と `structuredContent` (ほかのプログラムがつなぐとき。Claude Code は structuredContent があると
   そちらを見せるので、ふだんは付けない)
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
