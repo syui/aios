@@ -29,6 +29,30 @@ struct Plugin {
     /// 端末なしで呼べる機能 ({ name, description, input })
     tools: Vec<Value>,
     alive: bool,
+    /// 止めたわけ (die)
+    why: Option<String>,
+    /// 起こしたときのプログラムのファイル (ビルドしなおしたかを check で見る)
+    file: Option<FileId>,
+}
+
+/// ファイルの i-node と変えた時刻。cargo はビルドするとファイルを作りなおすので、どちらかが変わる
+#[derive(Clone, Copy, PartialEq)]
+pub struct FileId {
+    pub ino: u64,
+    pub mtime: std::time::SystemTime,
+}
+
+impl FileId {
+    pub fn of(path: &str) -> Option<FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileId { ino: m.ino(), mtime: m.modified().ok()? })
+    }
+
+    /// 変えた時刻 (1970 からの秒)
+    pub fn secs(&self) -> u64 {
+        self.mtime.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    }
 }
 
 /// キーの並び ("C-p C-p" なら 2 つ) と、プラグインの機能
@@ -44,6 +68,8 @@ pub struct Plugins {
     pub binds: Vec<Binding>,
     /// プラグインとつないだシェルのプロセス。fork した子 (パイプラインや $(...)) からは話さない
     owner: i32,
+    /// 読めなかったもの (名前, わけ)
+    failed: Vec<(String, String)>,
 }
 
 impl Plugin {
@@ -93,6 +119,7 @@ impl Plugin {
         if self.alive {
             eprintln!("{}: plugin {}: {} (stopped)", super::shell_name(), self.name, why);
             self.alive = false;
+            self.why = Some(why.to_string());
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -132,6 +159,15 @@ impl Plugins {
 
     /// プラグインを起こして hello を送る。hello に足すもの (histfile など) は extra
     pub fn load(&mut self, name: &str, args: &[String], home: &str, path_var: Option<String>, path: &str, extra: Value) -> Result<(), String> {
+        let r = self.load1(name, args, home, path_var, path, extra);
+        self.failed.retain(|(n, _)| n != name);
+        if let Err(e) = &r {
+            self.failed.push((name.to_string(), e.clone()));
+        }
+        r
+    }
+
+    fn load1(&mut self, name: &str, args: &[String], home: &str, path_var: Option<String>, path: &str, extra: Value) -> Result<(), String> {
         let prog = find(name, home, path_var, path).ok_or_else(|| format!("{}: not found", name))?;
         if self.owner == 0 {
             self.owner = unsafe { libc::getpid() };
@@ -149,9 +185,10 @@ impl Plugins {
                 Ok(())
             });
         }
+        let file = FileId::of(&prog);
         let mut child = cmd.spawn().map_err(|e| format!("{}: {}", prog, e))?;
         let (w, r) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true };
+        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file };
         let mut hello = json!({ "ev": "hello", "version": 2, "shell": "aish", "args": args, "home": home });
         if let (Some(h), Some(e)) = (hello.as_object_mut(), extra.as_object()) {
             h.extend(e.clone());
@@ -254,6 +291,30 @@ impl Plugins {
     /// プラグインのプロセス (aish --mcp が時間切れで子を止めるとき、これは残す)
     pub fn pids(&self) -> Vec<i32> {
         self.list.iter().filter(|p| p.alive).map(|p| p.child.id() as i32).collect()
+    }
+
+    /// check (aish --mcp): プラグインごとの様子。生きているか (知らないうちに終わっていないか)、ツール、
+    /// 起こしたあとにビルドしなおしたか (rebuilt: つなぎなおすと新しいものになる)。読めなかったものも
+    pub fn check(&mut self) -> Vec<Value> {
+        let mut v = Vec::new();
+        for p in self.list.iter_mut() {
+            if p.alive && let Ok(Some(st)) = p.child.try_wait() {
+                p.alive = false;
+                p.why = Some(format!("exited ({})", st));
+            }
+            let now = FileId::of(&p.prog);
+            let tools: Vec<Value> = p.tools.iter().map(|t| t["name"].clone()).collect();
+            let mut r = json!({ "name": p.name, "prog": p.prog, "alive": p.alive, "pid": p.child.id(), "tools": tools,
+                "rebuilt": now.is_some() && now != p.file, "mtime": p.file.map(|f| f.secs()) });
+            if let Some(w) = &p.why {
+                r["why"] = json!(w);
+            }
+            v.push(r);
+        }
+        for (n, e) in &self.failed {
+            v.push(json!({ "name": n, "alive": false, "why": e }));
+        }
+        v
     }
 
     /// 端末なしの機能を呼ぶ (名前が同じなら先に読んだもの)。答えを待ちつづける

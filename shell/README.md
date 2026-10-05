@@ -77,6 +77,9 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
   `cd` や変数、関数は次の `run` に残る。時間切れ (既定 50 秒。Claude Code はツールの答えを 60 秒しか待たないので、長いものは `bg` で) なら子と孫を止めて `status: 124, timeout: true`。
   `exit` はその `run` だけを終える
+- `check` はつながりの様子: aish の版と起きてからの時間、プラグインが生きているか (止まったわけ)、起きたあとに
+  ビルドしなおしたもの (`/mcp` でつなぎなおすと新しくなる)。`AISH_SRC` (`bin/aish-mcp.sh` がリポジトリを入れる)
+  があれば、ソースがバイナリより新しいもの (ビルドが要る) と、うしろで動いている cargo も。`problems` が空なら `ok`
 - 設定は対話のときと同じ `/etc/aishrc` と `~/.aishrc`。`AISH_MCP=1` なので `[ -n "$AISH_MCP" ] && ...` で分けられる
 - `paths` (aish-pick) は、コマンドの行とツールで使ったファイルとディレクトリを、使った回数 × 新しさ
   (zoxide と同じ) で並べる。覚えるのは `~/.cache/aish/paths` (1 行 1 つの JSON)

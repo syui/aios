@@ -5,6 +5,7 @@
 // 設定は対話するシェルと同じ /etc/aishrc と ~/.aishrc (AISH_MCP=1 なので、そこで分けられる)。
 // run の出力は memfd (メモリーの上のファイル) に受けて、そのまま答えに入れる。
 // ディスクには何も残さないので、リポジトリやイメージに入ることはない
+use super::plugin::FileId;
 use super::{Flow, Shell, cstr, flush};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -61,14 +62,20 @@ struct BgJob {
 static JOBS: std::sync::Mutex<Vec<BgJob>> = std::sync::Mutex::new(Vec::new());
 static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// サーバーが起きた時刻と、そのときの aish のファイル (check がビルドしなおしたかを見る)
+static STARTED: std::sync::OnceLock<(std::time::Instant, String, Option<FileId>)> = std::sync::OnceLock::new();
+
 const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも同じシェルで動くので、cd や変数は次の run に残ります。\
 答えは JSON: run は {status, out, err, ms, pwd} (時間切れなら timeout: true)。\
 重いもの (ビルドなど) は run の bg: true でうしろで動かし、job で様子と出力を見ると、そのあいだもほかのツールが使えます。\
-ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。";
+ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。\
+つながりやビルドが古くないかは check で見られます。";
 
 impl Shell {
     pub fn mcp(&mut self, args: &[String]) -> ! {
         PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
+        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+        let _ = STARTED.set((std::time::Instant::now(), exe.clone(), FileId::of(&exe)));
         // aish --mcp [--json] [RC...]
         JSON.store(args.iter().any(|a| a == "--json"), Ordering::Relaxed);
         let rcs: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
@@ -137,6 +144,10 @@ impl Shell {
             "name": "job",
             "description": "run bg で動かしたものの様子と出力。{id, pid, done, status, out, err, ms}。id がなければ一覧。終わったものは、見たら消える",
             "inputSchema": serde_json::from_str::<Value>(JOB_INPUT).unwrap(),
+        }), json!({
+            "name": "check",
+            "description": "aish のつながりの様子: 版、起きてからの時間、プラグインが生きているか、ビルドしなおしたもの (つなぎなおすと新しくなる) や、ソースがバイナリより新しいもの (ビルドが要る)。problems が空なら ok",
+            "inputSchema": { "type": "object", "properties": {} },
         })];
         for (plugin, t) in self.plugins.tools() {
             if tools.iter().any(|x| x["name"] == t["name"]) {
@@ -158,6 +169,8 @@ impl Shell {
             if args["bg"].as_bool().unwrap_or(false) { self.mcp_bg(&args) } else { self.mcp_run(&args) }
         } else if name == "job" {
             mcp_job(&args)
+        } else if name == "check" {
+            self.mcp_check()
         } else {
             let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
             let ev = json!({ "args": args, "pwd": pwd, "home": self.get_var("HOME").unwrap_or_default(), "histfile": self.histfile.clone().unwrap_or_default() });
@@ -182,6 +195,70 @@ impl Shell {
         } else {
             json!({ "content": [{ "type": "text", "text": render(&r) }], "isError": is_err })
         }
+    }
+
+    /// check: aish とプラグインの様子と、直すこと (problems)。
+    /// AISH_SRC (bin/aish-mcp.sh がリポジトリを入れる) があれば、ソースがバイナリより新しいかも見る
+    fn mcp_check(&mut self) -> Value {
+        let (t0, exe, file) = STARTED.get().cloned().unwrap_or((std::time::Instant::now(), String::new(), None));
+        let src = self.get_var("AISH_SRC").filter(|s| !s.is_empty());
+        let mut problems: Vec<String> = Vec::new();
+        let mut text = format!("aish {}  pid {}  up {}\n  {}\n", env!("CARGO_PKG_VERSION"), PID.load(Ordering::Relaxed), dur(t0.elapsed().as_secs()), exe);
+        let disk = FileId::of(&exe);
+        let rebuilt = disk.is_some() && disk != file;
+        if rebuilt {
+            problems.push("aish: rebuilt after the server started; reconnect (/mcp) to use the new one".into());
+        }
+        // ソースのほうが新しい: まだビルドしていない (ディスクのバイナリとくらべる)
+        let stale = |dirs: &[String], bin: Option<u64>| -> Option<String> {
+            let (t, p) = dirs.iter().filter_map(|d| newest(std::path::Path::new(d))).max()?;
+            (bin.is_some_and(|b| t > b)).then(|| p.strip_prefix(src.as_deref().unwrap_or("")).unwrap_or(&p).trim_start_matches('/').to_string())
+        };
+        if let Some(src) = &src
+            && let Some(p) = stale(&[format!("{}/user/src", src)], disk.map(|f| f.secs()))
+        {
+            problems.push(format!("aish: {} changed after the build; build (bin/aish-mcp.sh --build) and reconnect", p));
+        }
+        let plugins = self.plugins.check();
+        let alive = plugins.iter().filter(|p| p["alive"] == true).count();
+        text.push_str(&format!("plugins {}/{} alive\n", alive, plugins.len()));
+        for p in &plugins {
+            let name = p["name"].as_str().unwrap_or("?");
+            let tools: Vec<&str> = p["tools"].as_array().map(|a| a.iter().filter_map(|t| t.as_str()).collect()).unwrap_or_default();
+            let mut note = String::new();
+            if p["alive"] != true {
+                let why = p["why"].as_str().unwrap_or("stopped");
+                note = format!("  [stopped: {}]", why);
+                problems.push(format!("plugin {}: stopped ({}); reconnect (/mcp) to start it again", name, why));
+            } else if p["rebuilt"] == true {
+                note = "  [rebuilt]".into();
+                problems.push(format!("plugin {}: rebuilt after it started; reconnect (/mcp) to use the new one", name));
+            }
+            if let (Some(src), Some(prog)) = (&src, p["prog"].as_str()) {
+                // aish-edit は shell/edit (と SDK の shell/plugin)
+                let dir = prog.rsplit('/').next().unwrap_or("").trim_start_matches("aish-");
+                let dirs = [format!("{}/shell/{}/src", src, dir), format!("{}/shell/plugin/src", src)];
+                if std::path::Path::new(&dirs[0]).is_dir()
+                    && let Some(f) = stale(&dirs, FileId::of(prog).map(|f| f.secs()))
+                {
+                    problems.push(format!("plugin {}: {} changed after the build; build (bin/aish-mcp.sh --build) and reconnect", name, f));
+                }
+            }
+            text.push_str(&format!("  {:<8} {}{}\n", name, tools.join(" "), note));
+        }
+        let building = src.as_deref().map(building).unwrap_or_default();
+        if let Some(src) = &src {
+            text.push_str(&format!("source {}{}\n", src, if building.is_empty() { String::new() } else { format!("  (building: cargo pid {})", building.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")) }));
+        }
+        if problems.is_empty() {
+            text.push_str("ok\n");
+        } else {
+            text.push_str("problems\n");
+            for p in &problems {
+                text.push_str(&format!("  - {}\n", p));
+            }
+        }
+        json!({ "text": text, "ok": problems.is_empty(), "problems": problems, "building": !building.is_empty() })
     }
 
     /// run: 同じシェルで動かし、標準出力と標準エラーを分けて受ける
@@ -421,6 +498,42 @@ fn render(r: &Value) -> String {
         s.push_str(&Value::Object(meta).to_string());
     }
     s
+}
+
+/// 秒を "1h 2m 3s" に
+fn dur(s: u64) -> String {
+    match s {
+        0..60 => format!("{}s", s),
+        60..3600 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s / 60 % 60),
+    }
+}
+
+/// ディレクトリの下でいちばん新しく変えたファイル (1970 からの秒, パス)
+fn newest(dir: &std::path::Path) -> Option<(u64, String)> {
+    let mut best: Option<(u64, String)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let Ok(m) = e.metadata() else { continue };
+        let found = if m.is_dir() {
+            newest(&e.path())
+        } else {
+            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs(), e.path().display().to_string()))
+        };
+        if found.as_ref().is_some_and(|f| best.as_ref().is_none_or(|b| f.0 > b.0)) {
+            best = found;
+        }
+    }
+    best
+}
+
+/// src の下で動いている cargo (bin/aish-mcp.sh がうしろでビルドしているもの)
+fn building(src: &str) -> Vec<i32> {
+    let Ok(rd) = std::fs::read_dir("/proc") else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| std::fs::read_to_string(format!("/proc/{}/comm", pid)).is_ok_and(|c| c.trim() == "cargo"))
+        .filter(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).is_ok_and(|d| d.starts_with(src)))
+        .collect()
 }
 
 fn send(out: &mut std::fs::File, v: &Value) {

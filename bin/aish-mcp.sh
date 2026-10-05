@@ -29,5 +29,6 @@ if [ -x "user/target/$host/release/aish" ] && [ -d "shell/target/$host/release" 
 else
   build >&2 || exit 1
 fi
-AISH_PLUGIN_PATH=$PWD/shell/target/$host/release \
+# AISH_SRC: check ツールが、ソースがバイナリより新しいか (ビルドが要るか) を見る
+AISH_SRC=$PWD AISH_PLUGIN_PATH=$PWD/shell/target/$host/release \
   exec "user/target/$host/release/aish" --mcp shell/mcp.rc
