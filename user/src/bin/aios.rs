@@ -20,6 +20,10 @@
 //                              PKGBUILD からパッケージを作る (NAME は /usr/src/aios/pkg/*/NAME)。できたものは
 //                              いまのディレクトリ (-o で変える) に。作業は ~/.cache/aios/build/NAME
 //   aios install pkg FILE...   作ったパッケージを入れる (aiosd が aipkg -U で)
+//   aios tune NAME=V1,V2,... [-n N] [--apply] [--json] -- CMD...
+//                              カーネルの値 (sysctl) を順に変えて CMD を N 回 (既定 3) ずつ動かし、かかった時間の
+//                              まんなかでくらべる。終わったら元の値に戻す。--apply でいちばん速かった値を
+//                              /etc/aios.json の sysctl に書いて aios apply する (root)
 #[path = "../lib/config.rs"]
 mod config;
 #[path = "../lib/image.rs"]
@@ -71,6 +75,7 @@ fn main() {
         Some("install") if args.get(1).map(String::as_str) == Some("kernel") => install_kernel(args.get(2)),
         Some("build") if args.get(1).map(String::as_str) == Some("pkg") => build_pkg(&args[2..]),
         Some("install") if args.get(1).map(String::as_str) == Some("pkg") => install_pkg(&args[2..]),
+        Some("tune") => tune(&args[1..]),
         Some("config") => println!("{}", serde_json::to_string_pretty(&config::export()).unwrap_or_default()),
         Some("-h" | "--help" | "help") => usage(0),
         Some(c) => {
@@ -89,6 +94,7 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios diff | apply | rollback | history [N] | config   (/etc/aios.json)");
     eprintln!("       aios src | build kernel | install kernel [IMAGE] | install kernel --revert   (改造)");
     eprintln!("       aios build pkg NAME|DIR [-o DIR] | install pkg FILE...   (パッケージ)");
+    eprintln!("       aios tune NAME=V1,V2,... [-n N] [--apply] [--json] -- CMD...   (sysctl の値をくらべる。root)");
     std::process::exit(code)
 }
 
@@ -210,6 +216,90 @@ fn send(req: serde_json::Value, as_json: bool) {
 }
 
 /// aios diff: そろえる手順 (動かさない)
+/// aios tune NAME=V1,V2,... [-n N] [--apply] [--json] -- CMD...
+/// sysctl の値ごとに CMD を N 回動かして、かかった時間のまんなか (ms) でくらべる
+fn tune(args: &[String]) {
+    let die = |m: String| -> ! {
+        eprintln!("aios tune: {}", m);
+        std::process::exit(1)
+    };
+    let sep = args.iter().position(|a| a == "--").unwrap_or_else(|| die("give the command after -- (aios tune NAME=V1,V2 -- CMD)".into()));
+    let (opts, cmd) = (&args[..sep], args[sep + 1..].join(" "));
+    if cmd.trim().is_empty() {
+        die("no command after --".into());
+    }
+    let mut spec = None;
+    let (mut n, mut apply, mut as_json) = (3usize, false, false);
+    let mut it = opts.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-n" => n = it.next().and_then(|x| x.parse().ok()).filter(|&x| x > 0).unwrap_or_else(|| die("-n: give a number".into())),
+            "--apply" => apply = true,
+            "--json" => as_json = true,
+            s if s.contains('=') => spec = Some(s.to_string()),
+            s => die(format!("{}: unknown", s)),
+        }
+    }
+    let spec = spec.unwrap_or_else(|| die("give NAME=V1,V2,...".into()));
+    let (name, vals) = spec.split_once('=').unwrap_or_else(|| die("give NAME=V1,V2,...".into()));
+    let vals: Vec<&str> = vals.split(',').filter(|v| !v.is_empty()).collect();
+    if vals.is_empty() {
+        die("no values".into());
+    }
+    let orig = sysctl::get(name).unwrap_or_else(|e| die(e));
+    let mut rows = Vec::new();
+    for v in &vals {
+        if let Err(e) = sysctl::set(name, v) {
+            let _ = sysctl::set(name, &orig);
+            die(format!("{} (root で: sudo aios tune ...)", e));
+        }
+        let now = sysctl::get(name).unwrap_or_default();
+        let mut ms: Vec<u64> = Vec::new();
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let st = std::process::Command::new("sh").arg("-c").arg(&cmd).stdout(std::process::Stdio::null()).status();
+            if !st.is_ok_and(|s| s.success()) {
+                let _ = sysctl::set(name, &orig);
+                die(format!("the command failed with {}={}", name, v));
+            }
+            ms.push(t0.elapsed().as_millis() as u64);
+        }
+        let mut sorted = ms.clone();
+        sorted.sort();
+        rows.push(serde_json::json!({ "value": v, "set": now, "median_ms": sorted[sorted.len() / 2], "runs_ms": ms }));
+    }
+    let _ = sysctl::set(name, &orig);
+    let best = rows.iter().min_by_key(|r| r["median_ms"].as_u64().unwrap_or(u64::MAX)).cloned().unwrap_or_default();
+    let best_v = best["value"].as_str().unwrap_or("").to_string();
+    if as_json {
+        println!("{}", serde_json::json!({ "name": name, "orig": orig, "runs": n, "rows": rows, "best": best_v }));
+    } else {
+        println!("{} ({} runs each, median)", name, n);
+        for r in &rows {
+            let v = r["value"].as_str().unwrap_or("");
+            let runs: Vec<String> = r["runs_ms"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
+            let set = r["set"].as_str().unwrap_or("");
+            let note = if set != v { format!(" (kernel: {})", set) } else { String::new() };
+            println!("  {:>8}  {:>7} ms  [{}]{}{}", v, r["median_ms"].as_u64().unwrap_or(0), runs.join(" "), note, if *v == best_v { "  ← best" } else { "" });
+        }
+        println!("  back to {} = {}", name, orig);
+    }
+    if apply {
+        // /etc/aios.json の sysctl に書いて、aios apply (aiosd がそろえる)
+        let mut cfg = config::load(config::PATH).unwrap_or_else(|_| serde_json::json!({}));
+        let val = best_v.parse::<i64>().map_or(serde_json::json!(best_v), |x| serde_json::json!(x));
+        if !cfg["sysctl"].is_object() {
+            cfg["sysctl"] = serde_json::json!({});
+        }
+        cfg["sysctl"][name] = val;
+        if let Err(e) = std::fs::write(config::PATH, serde_json::to_string_pretty(&cfg).unwrap_or_default() + "\n") {
+            die(format!("{}: {} (root で)", config::PATH, e));
+        }
+        println!("{}: sysctl.{} = {}", config::PATH, name, best_v);
+        send(serde_json::json!({ "op": "apply" }), false);
+    }
+}
+
 fn diff() {
     let cfg = match config::load(config::PATH) {
         Ok(c) => c,
