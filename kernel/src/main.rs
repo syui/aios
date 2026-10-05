@@ -38,6 +38,7 @@ mod socket;
 mod spinlock;
 mod swap;
 mod syscall;
+mod sysctl;
 mod sysfile;
 mod timer;
 mod tmpfs;
