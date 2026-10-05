@@ -1,0 +1,23 @@
+# aifont-ja: 日本語のフォント。UDEV Gothic (JetBrains Mono + BIZ UDゴシック) を使う
+#   /usr/share/fonts/aifont/aifont-ja.ttf (aiterm などが aifont に無い字をここから引く)
+pkgname=aifont-ja
+# 自作のパッケージは版を 0.0.1 にそろえる (フォントそのものの版は 2.1.0)
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='aifont-ja: Japanese fallback font for aios (UDEV Gothic)'
+arch=('any')
+url='https://github.com/yuru7/udev-gothic'
+license=('OFL-1.1')
+source=("https://github.com/yuru7/udev-gothic/releases/download/v2.1.0/UDEVGothic_v2.1.0.zip"
+        "LICENSE::https://raw.githubusercontent.com/yuru7/udev-gothic/v2.1.0/LICENSE")
+sha256sums=('69c9321d3bac85589ddfee730e9582e3a9ca664d84d520fa7a70f656f1a0b8e5'
+            '3e04c747c9c9535224f6163a290caf022877759db5183a00aef6134d3f5643f0')
+
+prepare() {
+  unzip -oq UDEVGothic_v2.1.0.zip UDEVGothic_v2.1.0/UDEVGothic-Regular.ttf
+}
+
+package() {
+  install -Dm644 UDEVGothic_v2.1.0/UDEVGothic-Regular.ttf "$pkgdir/usr/share/fonts/aifont/aifont-ja.ttf"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/aifont-ja/LICENSE"
+}
