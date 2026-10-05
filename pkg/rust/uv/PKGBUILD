@@ -2,7 +2,7 @@
 # uv: Python のパッケージと Python そのものを入れる (uv python install 3.14 で
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
-pkgver=0.12.22
+pkgver=0.12.23
 pkgrel=1
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
