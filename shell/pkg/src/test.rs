@@ -2,7 +2,7 @@
 //   1. パッケージと、それが使うもの (.PKGINFO の depend をたどる) と musl を build/aish-pkg/test/NAME/ に広げる
 //   2. 中の ELF がみな aarch64 か
 //   3. .PKGINFO の版が PKGBUILD (pkgver-pkgrel) と同じか
-//   4. bin/ のプログラムを --version (なければ -V、version、--help) で動かす (aarch64 の上ならそのまま、ほかでは qemu-aarch64 -L 広げたところ)。
+//   4. bin/ のプログラムを --version (なければ -version、-V、version、--help) で動かす (aarch64 の上ならそのまま、ほかでは qemu-aarch64 -L 広げたところ)。
 //      1 つでも動けばよい。出力に pkgver があるかも見る
 // 通ったら build/aish-pkg/test/FILE.ok を置く。pkg_push は、変わるもののうち .ok のないものがあると止まる
 use serde_json::{Value, json};
@@ -163,9 +163,9 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
         let mut seen_ver = false;
         for b in &bins {
             let path = dir.join(b);
-            // --version がなければ -V (tmux)、version (zig)、それもなければ --help
+            // --version がなければ -version (ffmpeg)、-V (tmux)、version (zig)、それもなければ --help
             let (mut st, mut first) = (None, String::new());
-            for flag in ["--version", "-V", "version", "--help"] {
+            for flag in ["--version", "-version", "-V", "version", "--help"] {
                 let mut cmd = if native {
                     let mut c = Command::new(&path);
                     c.env("LD_LIBRARY_PATH", format!("{}/usr/lib:{}/opt/c/lib", dir.display(), dir.display()));
