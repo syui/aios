@@ -186,6 +186,10 @@ pub struct Proc {
     pub cont_report: bool,
     /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
     pub utime: u64,
+    /// 最近走った tick (走るたびに 1 足し、1 秒ごとに半分にする)。少ないものから走らせる
+    pub recent: u32,
+    /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
+    pub yielded: bool,
     /// 回収した子 (とその子孫) の utime
     pub cutime: u64,
     chan: usize,
@@ -242,6 +246,8 @@ impl Proc {
         stop_report: 0,
         cont_report: false,
         utime: 0,
+        recent: 0,
+        yielded: false,
         cutime: 0,
         chan: 0,
         last_sys: (0, 0, 0),
@@ -530,21 +536,54 @@ extern "C" fn forkret_unlock() {
     crate::smp::unlock();
 }
 
-/// 実行できるプロセスを順番に走らせ続ける (CPU ごと。大きなロックを持って呼ぶ)
+/// 次に走らせるもの: 実行できるもののうち recent が一番少ないもの (同じなら start から順に見て先のもの)。
+/// ふだん眠っているもの (aiwm、シェル、入力を待つもの) は recent が少ないので、起きるとすぐ走る。
+/// CPU を使い続けるもの (llvmpipe、ビルド) どうしは、recent が増えては減るので順番に回る
+fn pick(start: usize) -> Option<usize> {
+    let mut best: Option<(u32, usize)> = None;
+    for k in 0..NPROC {
+        let i = (start + k) % NPROC;
+        let p = &mut procs()[i];
+        if p.state == State::Zombie && (p.thread || p.autoreap) {
+            // 終わったスレッドは誰も wait しないのでここで片付ける
+            *p = Proc::UNUSED;
+            continue;
+        }
+        if p.state != State::Runnable {
+            continue;
+        }
+        // ゆずったものは 1 秒ぶん後ろに (スピンして待つ相手を先に走らせる)
+        let key = p.recent + if p.yielded { crate::timer::HZ as u32 } else { 0 };
+        if best.is_none_or(|(r, _)| key < r) {
+            best = Some((key, i));
+            if key == 0 {
+                break;
+            }
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// 1 秒ごと (cpu0 の tick) に recent を半分にする
+pub fn decay_recent() {
+    for p in procs().iter_mut() {
+        p.recent /= 2;
+    }
+}
+
+/// 次の pick を始める場所 (同じ recent のものを順番に回すため。CPU みんなで使う)
+static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 実行できるプロセスを選んで走らせ続ける (CPU ごと。大きなロックを持って呼ぶ)
 pub fn scheduler() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
     loop {
         let mut ran = false;
-        for i in 0..NPROC {
+        if let Some(i) = pick(NEXT.load(Relaxed)) {
+            NEXT.store((i + 1) % NPROC, Relaxed);
             let p = &mut procs()[i];
-            if p.state == State::Zombie && (p.thread || p.autoreap) {
-                // 終わったスレッドは誰も wait しないのでここで片付ける
-                *p = Proc::UNUSED;
-                continue;
-            }
-            if p.state != State::Runnable {
-                continue;
-            }
             p.state = State::Running;
+            p.yielded = false;
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
@@ -1024,8 +1063,16 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
 /// カーネルの中では割り込みを止めているので、動いていたのはユーザーモード
 pub fn account_tick() {
     if let Some(i) = cur() {
-        procs()[i].utime += 1;
+        let p = &mut procs()[i];
+        p.utime += 1;
+        p.recent = p.recent.saturating_add(1);
     }
+}
+
+/// sched_yield: 順番をゆずる (同じくらい走ったものより後ろに)
+pub fn yield_voluntary() {
+    current().yielded = true;
+    yield_now();
 }
 
 /// スレッドグループ全体の utime (tick)
