@@ -1,14 +1,14 @@
 # pcre2: Perl Compatible Regular Expressions, 8-bit (shared, for aios)
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=pcre2
-pkgver=10.45
+pkgver=10.49
 pkgrel=1
 pkgdesc='Perl Compatible Regular Expressions, 8-bit (shared, for aios)'
 arch=('aarch64')
 license=('BSD-3-Clause')
 depends=('musl')
 source=("https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$pkgver/pcre2-$pkgver.tar.bz2")
-sha256sums=('21547f3516120c75597e5b30a992e27a592a31950b5140e7b8bfde3f192033c4')
+sha256sums=('53c156e1ba416a20da8e65395daa132da0d80e76910424caca3fcdae7831d384')
 
 prepare() {
   rm -rf "pcre2-$pkgver"

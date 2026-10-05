@@ -1,14 +1,14 @@
 # expat: XML parser library (shared, for aios)
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=expat
-pkgver=2.7.1
+pkgver=2.8.5
 pkgrel=1
 pkgdesc='XML parser library (shared, for aios)'
 arch=('aarch64')
 license=('MIT')
 depends=('musl')
 source=("https://github.com/libexpat/libexpat/releases/download/R_${pkgver//./_}/expat-$pkgver.tar.xz")
-sha256sums=('354552544b8f99012e5062f7d570ec77f14b412a3ff5c7d8d0dae62c0d217c30')
+sha256sums=('1e727b8933ec51a77a9a9d9afcf8e688bce45d907c13e36ab7393fe36e703182')
 
 prepare() {
   rm -rf "expat-$pkgver"
