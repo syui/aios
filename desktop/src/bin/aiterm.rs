@@ -52,6 +52,7 @@ struct App {
     xdg: u32,
     toplevel: u32,
     keyboard: u32,
+    pointer: u32,
     configured: bool,
     width: usize,
     height: usize,
@@ -118,6 +119,7 @@ fn main() {
         xdg: 0,
         toplevel: 0,
         keyboard: 0,
+        pointer: 0,
         configured: false,
         width: 0,
         height: 0,
@@ -200,6 +202,9 @@ impl App {
         if self.seat != 0 {
             self.keyboard = self.new_id();
             self.conn.send(self.seat, 1, &[Arg::O(self.keyboard)]);
+            // マウスのホイールでスクロールバック
+            self.pointer = self.new_id();
+            self.conn.send(self.seat, 0, &[Arg::O(self.pointer)]);
         }
         self.conn.send(self.surface, 6, &[]);
         let _ = self.conn.flush();
@@ -418,6 +423,13 @@ impl App {
             // release: 写してもらったのでまた使える
         } else if id == self.keyboard {
             self.keyboard_event(m);
+        } else if id == self.pointer && m.op == 4 {
+            // wl_pointer.axis (時刻, 軸, 値)。縦 (0) だけ。1 段 (10) で 3 行、負は上へ
+            let (_time, axis, v) = (m.uint(), m.uint(), m.fixed());
+            if axis == 0 && v != 0.0 {
+                let lines = ((v / 10.0 * 3.0).round() as isize).clamp(-30, 30);
+                self.term.scroll_view(if lines == 0 { -v.signum() as isize } else { -lines });
+            }
         }
     }
 
@@ -462,6 +474,23 @@ impl App {
         if self.held {
             self.closed = true;
             return;
+        }
+        // Shift+PageUp / PageDown: スクロールバック (シェルには送らない)
+        let page = self.term.rows.saturating_sub(1).max(1) as isize;
+        match key {
+            keys::KEY_PAGEUP if self.mods.shift() => {
+                self.term.scroll_view(page);
+                return;
+            }
+            keys::KEY_PAGEDOWN if self.mods.shift() => {
+                self.term.scroll_view(-page);
+                return;
+            }
+            _ => {}
+        }
+        // ほかのキーは今の画面に戻ってから
+        if self.term.view > 0 {
+            self.term.scroll_view(-(self.term.view as isize));
         }
         let app = self.term.app_cursor;
         let arrow = |c: char| if app { format!("\x1bO{}", c) } else { format!("\x1b[{}", c) };
@@ -612,9 +641,10 @@ impl App {
             y_min = y_min.min(y0);
             y_max = y_max.max(y0 + ch);
             for col in 0..self.term.cols {
-                let cell = self.term.cell(col, row);
+                let cell = self.term.view_cell(col, row);
                 let x0 = PAD + col * cw;
-                let cursor = self.term.cursor_visible && row == self.term.cy && col == self.term.cx;
+                // さかのぼって見ているあいだはカーソルを出さない
+                let cursor = self.term.cursor_visible && self.term.view == 0 && row == self.term.cy && col == self.term.cx;
                 let (mut fg, mut bg) = (cell.fg, cell.bg);
                 if cursor && self.focused {
                     (fg, bg) = (term::BG, CURSOR);

@@ -612,6 +612,9 @@ pub fn readiness() -> (bool, bool, bool) {
     match p.state {
         ST_PREPARED | ST_RUNNING | ST_PAUSED => (false, avail(p) >= p.avail_min.max(1), false),
         ST_DRAINING => (false, false, false),
+        // アンダーラン: 書けるとだけ答える。書くと EPIPE が返り、アプリが snd_pcm_recover (prepare) で立てなおす。
+        // POLLERR を返すと、cpal は書かずにエラーを出しつづけて止まったままになる
+        ST_XRUN => (false, true, false),
         _ => (false, true, true),
     }
 }

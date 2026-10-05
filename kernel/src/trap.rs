@@ -231,6 +231,7 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
                     proc::current().last_fault = (tf.elr, far, ec);
                     proc::current().last_lr = tf.x[30];
                     proc::current().last_regs = [tf.x[0], tf.x[1], tf.x[19]];
+                    proc::current().last_sp = tf.sp_el0;
                     // SIGILL を自分で受けるもの (OpenSSL が CPU の命令を試すときなど) は、ふつうのことなので書かない
                     if sig == signal::SIGILL && signal::action(proc::current(), sig).handler == signal::SIG_DFL {
                         // 何の命令で止まったか (調べもの用)
