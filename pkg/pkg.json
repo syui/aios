@@ -62,7 +62,7 @@
   {"name": "sudo-rs",           "type": "rust",    "src": "git+https://github.com/trifectatechfoundation/sudo-rs#tag=v0.2.15",                                                "now": "0.2.15",         "latest": "0.2.15"},
   {"name": "tar",               "type": "rust",    "src": "git+https://github.com/uutils/tar#commit=93e211febed55aa118e47b0ac054ed92641d13df",                                "now": "0.1.0.20260930", "latest": "(commit)"},
   {"name": "tmux",              "type": "c",       "src": "https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz",                                             "now": "3.7c",           "latest": "3.7c"},
-  {"name": "uv",                "type": "rust",    "src": "git+https://github.com/astral-sh/uv#tag=0.12.22",                                                                  "now": "0.12.22",        "latest": "0.12.23"},
+  {"name": "uv",                "type": "rust",    "src": "git+https://github.com/astral-sh/uv#tag=0.12.23",                                                                  "now": "0.12.23",        "latest": "0.12.23"},
   {"name": "vim",               "type": "c",       "src": "git+https://github.com/vim/vim#tag=v9.2.1164",                                                                     "now": "9.2.1164",       "latest": "9.2.1164"},
   {"name": "vulkan-headers",    "type": "c",       "src": "git+https://github.com/KhronosGroup/Vulkan-Headers.git#tag=v1.4.365",                                              "now": "1.4.365",        "latest": "1.4.365"},
   {"name": "vulkan-loader",     "type": "c",       "src": "git+https://github.com/KhronosGroup/Vulkan-Loader.git#tag=v1.4.365",                                               "now": "1.4.365",        "latest": "1.4.365"},
