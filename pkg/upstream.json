@@ -18,7 +18,7 @@
   {"from":"pkgbuild","git":"https://github.com/reubeno/brush","name":"brush","pkgver":"0.4.0","tag":"^brush\\-shell\\-v([0-9][0-9A-Za-z.]*)$"},
   {"name":"ca-certificates","pkgver":"20260925","skip":"arch ca-certificates checks it by hand"},
   {"from":"arch:cairo","name":"cairo","nvchecker":{"git":"https://gitlab.freedesktop.org/cairo/cairo.git","include_regex":"\\d+\\.\\d*[02468]\\.\\d*[02468]","source":"git"},"pkgver":"1.18.4"},
-  {"name":"cargo","pkgver":"1.99.0","skip":"no git source in the PKGBUILD, and no .nvchecker.toml for arch cargo"},
+  {"from":"arch:rust","name":"cargo","nvchecker":{"git":"https://github.com/rust-lang/rust.git","source":"git"},"pkgver":"1.99.0"},
   {"name":"claude","pkgver":"0.0.1","skip":"aios"},
   {"from":"pkgbuild","git":"https://github.com/uutils/coreutils","name":"coreutils","pkgver":"0.12.0","tag":"^([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:curl","name":"curl","nvchecker":{"exclude_regex":".*(tiny|beta).*","from_pattern":"_","git":"https://github.com/curl/curl.git","prefix":"curl-","source":"git","to_pattern":"."},"pkgver":"8.22.0"},

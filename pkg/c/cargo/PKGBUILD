@@ -8,6 +8,8 @@
 #   C の部分がある crate は base-devel (zig の cc) で。入れたファイルは /usr/lib/rustlib/aios-cargo.files
 pkgname=cargo
 pkgver=1.99.0
+# 配布元の最新を見るときの Arch の名前 (aish-pkg)
+_arch=rust
 pkgrel=5
 pkgdesc='Rust compiler and cargo, installed from static.rust-lang.org (aarch64-unknown-linux-musl)'
 arch=('any')
