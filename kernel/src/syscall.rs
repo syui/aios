@@ -422,7 +422,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         RT_SIGACTION => signal::rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
         PRCTL => sys_prctl(a[0], a[1] as usize),
         SCHED_YIELD => {
-            proc::yield_now();
+            proc::yield_voluntary();
             Ok(0)
         }
         SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
