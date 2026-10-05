@@ -93,6 +93,7 @@ pub fn tick() {
     let now = ticks();
     let prev = TICKS.swap(now, Ordering::Relaxed);
     crate::proc::wake_expired(now);
+    crate::timerfd::tick();
     crate::signal::tick(now);
     // TCP の再送などのため、ときどき (5 tick ごと) 回す
     if now / 5 != prev / 5 {

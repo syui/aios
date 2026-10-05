@@ -458,6 +458,10 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                             let pt = &p.mm().pt;
                             println!("pid {}: addr {:#x} is {}", p.pid, addr, pt.region_text(addr as usize));
                             println!("pid {}: sp {:#x} is {}", p.pid, p.last_sp, pt.region_text(p.last_sp as usize));
+                            // そのページにかかわった最近の mmap / mprotect / munmap (-N は N 回前)
+                            for l in pt.hist_text(addr as usize).iter().rev().take(12).rev() {
+                                println!("pid {}: addr page: {}", p.pid, l);
+                            }
                         }
                         println!(
                             "pid {} ({}): killed by signal {} (last fault: pc {:#x} addr {:#x} ec {:#x}, last syscall {})",

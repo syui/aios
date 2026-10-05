@@ -46,6 +46,8 @@ pub enum Kind {
     Unix(crate::unix::UnixRef),
     Epoll(crate::epoll::EpollRef),
     EventFd(crate::epoll::EventFdRef),
+    /// timerfd_create で作ったもの (期限が来ると読める)
+    TimerFd(crate::timerfd::TimerRef),
     /// inotify_init1 で作ったもの (できごとが読める)
     Inotify(crate::inotify::InotifyRef),
     /// pidfd_open で開いたプロセス (終わると読める)
@@ -154,6 +156,7 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read_ex(p, dst, false, nonblock),
         Kind::Socket(s) => s.borrow_mut().read(dst),
         Kind::EventFd(e) => crate::epoll::read(e, dst, nonblock),
+        Kind::TimerFd(t) => crate::timerfd::read(t, dst, nonblock),
         Kind::Inotify(n) => crate::inotify::read(n, dst, nonblock),
         Kind::Input(n) => crate::input::read(*n, dst, nonblock),
         _ => Err(-EBADF),
@@ -167,6 +170,7 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
         Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
+        Kind::TimerFd(_) => Err(-EINVAL),
         _ => Err(-EBADF),
     }
 }
@@ -306,7 +310,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Inotify(_) | Kind::Input(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Input(_) => self.kind.clone(),
             _ => return None,
         };
         Some((k, self.flags & O_NONBLOCK != 0))
@@ -371,7 +375,7 @@ impl OpenFile {
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
             Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::Inotify(_) | Kind::PidFd(_) => Stat::dev(0o600, 0),
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) => Stat::dev(0o600, 0),
         }
     }
 
@@ -381,6 +385,7 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().generation,
             Kind::Pair(rx, tx) => rx.borrow().generation.wrapping_add(tx.borrow().generation),
             Kind::EventFd(e) => crate::epoll::generation(e),
+            Kind::TimerFd(t) => crate::timerfd::generation(t),
             Kind::Inotify(n) => crate::inotify::generation(n),
             Kind::Tty(t) | Kind::PtyMaster(t) => t.borrow().generation.get(),
             _ => 0,
@@ -406,6 +411,7 @@ impl OpenFile {
             Kind::Unix(u) => alloc::format!("socket:[{}]", Rc::as_ptr(u) as usize & 0xffffff),
             Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
             Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
+            Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
             Kind::Inotify(_) => "anon_inode:inotify".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
             Kind::Block(p) => crate::block::part_name(p),
@@ -464,6 +470,7 @@ impl OpenFile {
             Kind::Socket(s) => s.borrow().readiness(),
             Kind::Unix(u) => crate::unix::readiness(u),
             Kind::EventFd(e) => crate::epoll::readiness(e),
+            Kind::TimerFd(t) => crate::timerfd::readiness(t),
             Kind::Inotify(n) => crate::inotify::readiness(n),
             Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
@@ -480,6 +487,7 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
             Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
             Kind::Unix(u) => alloc::vec![Rc::as_ptr(u) as usize],
+            Kind::TimerFd(t) => alloc::vec![crate::timerfd::chan(t)],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
