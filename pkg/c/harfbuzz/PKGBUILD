@@ -2,7 +2,7 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=harfbuzz
-pkgver=11.2.1
+pkgver=14.5.1
 pkgrel=1
 pkgdesc='OpenType text shaping engine (shared, for aios)'
 arch=('aarch64')
@@ -10,7 +10,7 @@ license=('MIT')
 depends=('musl' 'freetype2' 'glib2')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://github.com/harfbuzz/harfbuzz/releases/download/$pkgver/harfbuzz-$pkgver.tar.xz")
-sha256sums=('093714c8548a285094685f0bdc999e202d666b59eeb3df2ff921ab68b8336a49')
+sha256sums=('7e2fa4e8c7c98e8d8140671f5772542afaaa6acccfbd746506886b6d85f7f8d6')
 
 prepare() {
   rm -rf "harfbuzz-$pkgver"
