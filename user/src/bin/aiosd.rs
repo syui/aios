@@ -3,6 +3,7 @@
 //     {"op":"ping"}
 //     {"op":"service","action":"start|stop|restart|enable|disable","name":"sshd"}
 //     {"op":"pkg","action":"install|remove|upgrade|refresh","names":["git"]}
+//     {"op":"pkg","action":"file","paths":["/home/ai/x-1-1-aarch64.pkg.tar.zst"]}   aipkg -U (aios install pkg)
 //     {"op":"power","action":"reboot|poweroff"}
 //     {"op":"apply"}      /etc/aios.json のとおりにそろえる (記録は /var/lib/aios/history/N.json)
 //     {"op":"rollback"}   ひとつ前の apply の設定に戻す (/etc/aios.json も戻し、そのとき入れたパッケージは外す)
@@ -132,6 +133,16 @@ fn handle(req: &Value, uid: u32, pid: i32) -> Value {
                 return fail("service: bad name");
             }
             vec!["systemctl".into(), action.into(), name.into()]
+        }
+        "pkg" if s(req, "action") == "file" => {
+            // 作ったパッケージのファイル (aios build pkg) を入れる
+            let paths: Vec<String> = req["paths"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
+            if paths.is_empty() || paths.iter().any(|p| !p.starts_with('/') || !p.ends_with(".pkg.tar.zst") || !std::path::Path::new(p).is_file()) {
+                return fail("pkg file: give the full paths of .pkg.tar.zst files");
+            }
+            let mut v = vec!["aipkg".to_string(), "-U".to_string()];
+            v.extend(paths);
+            v
         }
         "pkg" => {
             let names: Vec<String> = req["names"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
