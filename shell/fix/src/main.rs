@@ -107,7 +107,8 @@ fn main() {
 }
 
 fn wait_of(a: &Value) -> Duration {
-    Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(45_000))
+    // Claude Code はツールの答えを 60 秒しか待たないので、長くても 50 秒 (過ぎたら running で、errors で待ちなおす)
+    Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(45_000).min(50_000))
 }
 
 fn resolve(pwd: &str, p: &str) -> PathBuf {

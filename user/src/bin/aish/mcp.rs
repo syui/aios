@@ -42,7 +42,7 @@ const RUN_INPUT: &str = r#"{"type":"object","properties":{
 
 const JOB_INPUT: &str = r#"{"type":"object","properties":{
 "id":{"type":"integer","description":"run bg の job (なければ一覧)"},
-"wait_ms":{"type":"integer","description":"終わるまでこれだけ待つ (既定 0: すぐ答える)"},
+"wait_ms":{"type":"integer","description":"終わるまでこれだけ待つ (既定 0: すぐ答える。最大 50000: Claude Code はツールを 60 秒しか待たないので、長いものは何度か呼ぶ)"},
 "kill":{"type":"boolean","description":"止める (SIGTERM をそのグループに)"}}}"#;
 
 /// run bg で動かしているもの
@@ -326,7 +326,7 @@ fn mcp_job(a: &Value) -> Value {
         unsafe { libc::kill(-js[i].pid, libc::SIGTERM) };
     }
     // wait_ms まで、終わるのを待つ
-    let end = std::time::Instant::now() + std::time::Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(0));
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(0).min(50_000));
     while js[i].done.is_none() && std::time::Instant::now() < end {
         std::thread::sleep(std::time::Duration::from_millis(50));
         reap(&mut js[i..=i]);

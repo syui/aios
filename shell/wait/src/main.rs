@@ -12,7 +12,10 @@ const WAIT: &str = r#"{"type":"object","properties":{
 "text":{"type":"string","description":"path に出るのを待つ文字 (行の中にこの文字があればよい。正規表現ではない)"},
 "new":{"type":"boolean","description":"呼んだあとに足された行だけを見る (既定 false: はじめから)"},
 "port":{"type":"integer","description":"127.0.0.1 のこの TCP のポートにつながるまで"},
-"timeout_ms":{"type":"integer","description":"これを過ぎたらあきらめる (既定 600000)"}}}"#;
+"timeout_ms":{"type":"integer","description":"これを過ぎたら ok: false, running: true で答える (既定で最大 50000。Claude Code はツールを 60 秒しか待たないので、長いものは何度か呼ぶ)"}}}"#;
+
+/// 1 回に待つのはここまで (Claude Code はツールの答えを 60 秒しか待たない)
+const MAX_MS: u64 = 50_000;
 
 fn main() {
     let spec = Spec {
@@ -21,7 +24,7 @@ fn main() {
         keys: &[],
         tools: &[Tool {
             name: "wait",
-            desc: "pid が終わる / path に text が出る (text がなければ path ができる) / port が開く、まで待つ。どれか 1 つ。{ok, ms, line?}。時間切れならしくじる",
+            desc: "pid が終わる / path に text が出る (text がなければ path ができる) / port が開く、まで待つ。どれか 1 つ。{ok, ms, line?}。50 秒までに起きなければ {ok: false, running: true} なので、もう一度呼ぶ",
             input: WAIT,
         }],
     };
@@ -42,7 +45,7 @@ enum What {
 
 fn wait(v: &Value) -> Value {
     let a = &v["args"];
-    let timeout = Duration::from_millis(a["timeout_ms"].as_u64().unwrap_or(600_000));
+    let timeout = Duration::from_millis(a["timeout_ms"].as_u64().unwrap_or(MAX_MS).min(MAX_MS));
     let what = if let Some(pid) = a["pid"].as_i64() {
         What::Pid(pid as i32)
     } else if let Some(port) = a["port"].as_u64() {
@@ -69,7 +72,8 @@ fn wait(v: &Value) -> Value {
             return r;
         }
         if t0.elapsed() >= timeout {
-            return json!({ "error": "timeout", "ms": t0.elapsed().as_millis() as u64 });
+            // まだ: しくじりではなく、もう一度呼べばよい
+            return json!({ "ok": false, "running": true, "ms": t0.elapsed().as_millis() as u64 });
         }
         std::thread::sleep(Duration::from_millis(200));
     }
