@@ -12,7 +12,16 @@ if [ "$(uname -s)" != Linux ]; then
   exit 1
 fi
 host=$(rustc -vV | sed -n 's/^host: //p')
-(cd user && cargo build -q --release --bin aish --target "$host") >&2 || exit 1
-(cd shell && cargo build -q --release --target "$host") >&2 || exit 1
+build() {
+  (cd user && cargo build -q --release --bin aish --target "$host") &&
+    (cd shell && cargo build -q --release --target "$host")
+}
+# Claude Code は MCP のサーバーを 30 秒しか待たない。ソースを変えたあとのビルドはそれより長いことがあるので、
+# できているものがあればすぐそれで起こし、ビルドはうしろでする (新しいものは次に起こしたときから)
+if [ -x "user/target/$host/release/aish" ] && [ -d "shell/target/$host/release" ]; then
+  (build > /dev/null 2>&1 &)
+else
+  build >&2 || exit 1
+fi
 AISH_PLUGIN_PATH=$PWD/shell/target/$host/release \
   exec "user/target/$host/release/aish" --mcp shell/mcp.rc
