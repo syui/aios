@@ -3,6 +3,9 @@
 // systemd-boot と同じ書き方の設定を ESP から読んで、カーネル (EFI スタブつきの Image) を起動する。
 //   /loader/loader.conf         default PATTERN (* が使える), timeout N (秒、menu-force で待ちつづける)
 //   /loader/entries/*.conf      title, version, linux PATH, options ... (何行でも)
+//   /loader/try                 新しいカーネルを試す回数 (aiosd が aios install kernel で書き、起動できたら消す)。
+//                               あれば 1 減らして起動し、0 のときは前のカーネル (prev-aios.conf) を
+//                               aios.fallback=1 をつけて起動する (systemd-boot の boot counting を小さくしたもの)
 // 項目がなければ /Image をそのまま起動する。timeout があれば番号を選べる一覧を出す
 // (数字で選ぶ、Enter で既定、ほかのキーで数えるのを止める)。
 // カーネルは LoadImage でメモリから読み込み、options を LoadOptions (UTF-16) に入れて StartImage する。
@@ -44,7 +47,10 @@ const LI_OPTIONS: usize = 0x38;
 const F_OPEN: usize = 0x08;
 const F_CLOSE: usize = 0x10;
 const F_READ: usize = 0x20;
+const F_WRITE: usize = 0x28;
+const F_FLUSH: usize = 0x50;
 const FILE_MODE_READ: usize = 1;
+const FILE_MODE_WRITE: usize = 2;
 const FILE_DIRECTORY: u64 = 0x10;
 
 /// 5b1b31a1-9562-11d2-8e3f-00a0c969723b
@@ -150,6 +156,22 @@ impl File {
         (r == SUCCESS && h != 0).then_some(File(h))
     }
 
+    /// 読み書きで開く (あるファイルだけ)
+    fn open_rw(&self, path: &str) -> Option<File> {
+        let name = utf16(&path.replace('/', "\\"));
+        let mut h = 0usize;
+        let r = efi!(self.0, F_OPEN, (usize, *mut usize, *const u16, usize, usize), self.0, &mut h, name.as_ptr(), FILE_MODE_READ | FILE_MODE_WRITE, 0);
+        (r == SUCCESS && h != 0).then_some(File(h))
+    }
+
+    /// 頭から書く (前より短いと後ろが残るので、同じ長さで書く)
+    fn write(&self, data: &[u8]) -> bool {
+        let mut n = data.len();
+        efi!(self.0, F_WRITE, (usize, *mut usize, *const u8), self.0, &mut n, data.as_ptr()) == SUCCESS
+            && n == data.len()
+            && efi!(self.0, F_FLUSH, (usize), self.0) == SUCCESS
+    }
+
     fn read(&self, buf: &mut [u8]) -> Option<usize> {
         let mut n = buf.len();
         (efi!(self.0, F_READ, (usize, *mut usize, *mut u8), self.0, &mut n, buf.as_mut_ptr()) == SUCCESS).then_some(n)
@@ -201,6 +223,9 @@ fn read_text(root: &File, path: &str) -> Option<String> {
 }
 
 // ---- 設定 ----
+
+/// 前のカーネルのエントリ (aiosd が aios install kernel で作る)
+const PREV_ENTRY: &str = "prev-aios.conf";
 
 struct Entry {
     id: String,
@@ -370,12 +395,36 @@ extern "efiapi" fn efi_main(image: usize, st: usize) -> Status {
         say("aiboot: no entries in /loader/entries, booting /Image\n");
         return boot(image, &root, "/Image", "");
     }
-    let def = if default.is_empty() { 0 } else { entries.iter().position(|e| is_default(&default, e)).unwrap_or(0) };
+    let mut def = if default.is_empty() { 0 } else { entries.iter().position(|e| is_default(&default, e)).unwrap_or(0) };
+
+    // boot counting: /loader/try が 0 なら、新しいカーネルは前に起動しなかった
+    // 無いファイルを開くとファームウェア (edk2 の FAT) が例外で止まることがあるので、先に一覧で確かめる
+    let has_try = root.open("/loader").is_some_and(|d| d.list().iter().any(|n| n.eq_ignore_ascii_case("try")));
+    let trying = if has_try { read_text(&root, "/loader/try").map(|t| t.trim().parse::<u32>().unwrap_or(0)) } else { None };
+    if let Some(left) = trying {
+        if left == 0 {
+            if let Some(i) = entries.iter().position(|e| e.id == PREV_ENTRY) {
+                say("aiboot: the new kernel did not finish booting; booting the previous kernel\n");
+                def = i;
+            }
+        } else {
+            // 数字の桁は変わらないように (9 → 8 など、1 桁で使う)
+            let ok = root.open_rw("/loader/try").is_some_and(|f| f.write(alloc::format!("{}", left - 1).as_bytes()));
+            say(&alloc::format!("aiboot: trying the new kernel ({} more {})\n", left - 1, if ok { "after this" } else { "- cannot write /loader/try" }));
+        }
+    }
     let mut pick = if timeout == Some(0) { def } else { menu(&entries, def, timeout) };
     // 起動できなければ、ほかの項目を順に
     for _ in 0..entries.len() {
         let e = &entries[pick];
-        boot(image, &root, &e.linux, &e.options);
+        if trying.is_some() && e.id == PREV_ENTRY {
+            // 新しいカーネルを試しているのに前のもので起動する (自動で、一覧で選んだ、新しいものが読めなかった):
+            // aiosd が /boot/Image を前のものに戻す
+            let options = if e.options.is_empty() { "aios.fallback=1".into() } else { alloc::format!("{} aios.fallback=1", e.options) };
+            boot(image, &root, &e.linux, &options);
+        } else {
+            boot(image, &root, &e.linux, &e.options);
+        }
         pick = (pick + 1) % entries.len();
     }
     LOAD_ERROR
