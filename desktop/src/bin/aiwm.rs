@@ -1731,6 +1731,11 @@ impl Wm {
                 self.pointer_moved(old);
             }
             EV_REL => {
+                // ホイール (REL_WHEEL: 上が +1)
+                if e.code == 8 {
+                    self.wheel(-e.value);
+                    return;
+                }
                 let old = self.ptr;
                 match e.code {
                     0 => self.ptr.0 = (self.ptr.0 + e.value).clamp(0, self.width() - 1),
@@ -1918,8 +1923,26 @@ impl Wm {
         }
     }
 
+    /// ホイールを 1 段ずつ、指しているところの窓へ wl_pointer.axis で (steps: 正で下)
+    fn wheel(&mut self, steps: i32) {
+        let Some(w) = self.ptr_win else { return };
+        if let Some(c) = self.clients.get_mut(&w.client) {
+            for p in c.pointers.clone() {
+                c.conn.send(p, 4, &[Arg::U(wl::now_ms()), Arg::U(0), Arg::F(steps as f64 * 10.0)]);
+                c.frame(p);
+            }
+        }
+    }
+
     fn button(&mut self, code: u16, value: i32) {
         if value == 2 {
+            return;
+        }
+        // QEMU の virtio のタブレットはホイールを BTN_GEAR_DOWN (0x150) / BTN_GEAR_UP (0x151) で送る
+        if code == 0x150 || code == 0x151 {
+            if value == 1 {
+                self.wheel(if code == 0x151 { -1 } else { 1 });
+            }
             return;
         }
         // floating_modifier + 左ボタン: 浮いた窓をつかんで動かす (クライアントには送らない)

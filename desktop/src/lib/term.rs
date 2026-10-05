@@ -85,7 +85,14 @@ pub struct Term {
     pub reply: Vec<u8>,
     pub title: Option<String>,
     osc: String,
+    /// 上へ流れて消えた行 (スクロールバック。古いものから。代わりの画面のあいだはためない)
+    history: std::collections::VecDeque<Vec<Cell>>,
+    /// いま見ているところ: 何行ぶん上を見ているか (0 なら今の画面)
+    pub view: usize,
 }
+
+/// スクロールバックにためる行の数
+const HISTORY: usize = 5000;
 
 impl Term {
     pub fn new(cols: usize, rows: usize) -> Term {
@@ -111,11 +118,42 @@ impl Term {
             reply: Vec::new(),
             title: None,
             osc: String::new(),
+            history: std::collections::VecDeque::new(),
+            view: 0,
         }
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Cell {
         self.grid[y * self.cols + x]
+    }
+
+    /// 見ている画面の (x, y) (view 行ぶん上なら、スクロールバックの行も)
+    pub fn view_cell(&self, x: usize, y: usize) -> Cell {
+        if self.view == 0 {
+            return self.cell(x, y);
+        }
+        let i = self.history.len() + y - self.view;
+        match self.history.get(i) {
+            // 幅を変える前の行は、足りなければ空白
+            Some(row) => row.get(x).copied().unwrap_or(BLANK),
+            None => self.cell(x, i - self.history.len()),
+        }
+    }
+
+    /// 見るところを delta 行動かす (正で上 = 古いほう)。変わったら true
+    pub fn scroll_view(&mut self, delta: isize) -> bool {
+        let v = (self.view as isize + delta).clamp(0, self.history.len() as isize) as usize;
+        if v == self.view {
+            return false;
+        }
+        self.view = v;
+        self.dirty.fill(true);
+        true
+    }
+
+    /// スクロールバックの行の数
+    pub fn history_len(&self) -> usize {
+        self.history.len()
     }
 
     /// 大きさを変える (中身は左上にそろえて残す)
@@ -143,6 +181,7 @@ impl Term {
         self.bottom = rows - 1;
         self.wrap = false;
         self.dirty = vec![true; rows];
+        self.view = 0;
     }
 
     fn blank(&self) -> Cell {
@@ -179,6 +218,19 @@ impl Term {
     fn scroll_up(&mut self, n: usize) {
         let (t, b, w) = (self.top, self.bottom, self.cols);
         let n = n.min(b - t + 1);
+        // 画面の一番上から流れていく行はスクロールバックへ (代わりの画面 (vim など) と、範囲を決めた上下のスクロールはのぞく)
+        if t == 0 && self.saved_grid.is_none() {
+            for y in 0..n {
+                self.history.push_back(self.grid[y * w..(y + 1) * w].to_vec());
+                if self.history.len() > HISTORY {
+                    self.history.pop_front();
+                } else if self.view > 0 {
+                    // 見ているところが流れないように
+                    self.view += 1;
+                }
+            }
+            self.view = self.view.min(self.history.len());
+        }
         self.grid.copy_within((t + n) * w..(b + 1) * w, t * w);
         let blank = self.blank();
         self.grid[(b + 1 - n) * w..(b + 1) * w].fill(blank);
@@ -444,6 +496,7 @@ impl Term {
     }
 
     fn alt_screen(&mut self, on: bool) {
+        self.view = 0;
         if on && self.saved_grid.is_none() {
             self.saved = (self.cx, self.cy, self.pen);
             self.saved_grid = Some(std::mem::replace(&mut self.grid, vec![BLANK; self.cols * self.rows]));

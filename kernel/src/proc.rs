@@ -196,6 +196,8 @@ pub struct Proc {
     pub last_lr: u64,
     /// そのときの x0, x1, x19 (落ちたときに、文字列なら出す)
     pub last_regs: [u64; 3],
+    /// 最後に落ちたときの sp (調べもの用)
+    pub last_sp: u64,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
     /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
@@ -244,6 +246,7 @@ impl Proc {
         last_fault: (0, 0, 0),
         last_lr: 0,
         last_regs: [0; 3],
+        last_sp: 0,
         wake_at: 0,
         poll_keys: None,
         context: Context::ZERO,

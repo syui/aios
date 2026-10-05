@@ -453,6 +453,12 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                         if let Some((name, off)) = p.mm.as_ref().and_then(|_| p.mm().pt.name_at(p.last_lr as usize)) {
                             println!("pid {}: lr {:#x} is {} + {:#x}", p.pid, p.last_lr, name, off);
                         }
+                        if p.mm.as_ref().is_some() {
+                            // 落ちたアドレスとスタックがどこか (スタックのあふれと、外を読んだのを見分ける)
+                            let pt = &p.mm().pt;
+                            println!("pid {}: addr {:#x} is {}", p.pid, addr, pt.region_text(addr as usize));
+                            println!("pid {}: sp {:#x} is {}", p.pid, p.last_sp, pt.region_text(p.last_sp as usize));
+                        }
                         println!(
                             "pid {} ({}): killed by signal {} (last fault: pc {:#x} addr {:#x} ec {:#x}, last syscall {})",
                             p.pid,

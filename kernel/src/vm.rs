@@ -530,6 +530,34 @@ impl PageTable {
         Some((v.name.clone()?, off + (va - s)))
     }
 
+    /// va がどの領域か (落ちたときの知らせ): 中なら「[始め-終わり) 権限 名前」、外なら上と下の近い領域からの距離
+    pub fn region_text(&self, va: usize) -> alloc::string::String {
+        let desc = |s: usize, v: &Vma| {
+            let p = |b: u8, c: char| if v.prot & b != 0 { c } else { '-' };
+            alloc::format!(
+                "[{:#x}-{:#x}) {}{}{}{} {}",
+                s,
+                v.end,
+                p(PROT_READ, 'r'),
+                p(PROT_WRITE, 'w'),
+                p(PROT_EXEC, 'x'),
+                if v.shared { 's' } else { 'p' },
+                v.name.as_deref().unwrap_or("(anon)")
+            )
+        };
+        if let Some((s, v)) = self.find(va) {
+            let guard = if v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 { " (PROT_NONE: stack guard?)" } else { "" };
+            return alloc::format!("inside {}{}", desc(s, v), guard);
+        }
+        let below = self.vmas.range(..=va).next_back().map(|(&s, v)| alloc::format!("{:#x} above the end of {}", va - v.end, desc(s, v)));
+        let above = self.vmas.range(va..).next().map(|(&s, v)| alloc::format!("{:#x} below {}", s - va, desc(s, v)));
+        match (below, above) {
+            (Some(b), Some(a)) => alloc::format!("unmapped: {}; {}", b, a),
+            (Some(x), None) | (None, Some(x)) => alloc::format!("unmapped: {}", x),
+            (None, None) => "unmapped".into(),
+        }
+    }
+
     /// /proc/PID/maps (Linux と同じ形)
     pub fn maps_text(&self) -> alloc::string::String {
         let mut out = alloc::string::String::new();
