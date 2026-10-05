@@ -1,14 +1,14 @@
 # libpng: PNG reference library (shared, for aios)
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=libpng
-pkgver=1.6.50
+pkgver=1.6.59
 pkgrel=1
 pkgdesc='PNG reference library (shared, for aios)'
 arch=('aarch64')
 license=('libpng-2.0')
 depends=('musl' 'zlib')
 source=("https://download.sourceforge.net/libpng/libpng-$pkgver.tar.xz")
-sha256sums=('4df396518620a7aa3651443e87d1b2862e4e88cad135a8b93423e01706232307')
+sha256sums=('d80dd2a38a37f803cb9b6ac7b14bd6e74ddc3b654780a8380bdf93523fdb4389')
 
 prepare() {
   rm -rf "libpng-$pkgver"
