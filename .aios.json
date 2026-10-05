@@ -25,7 +25,7 @@
   },
 
   "aish": {
-    "plugins": ["complete", "suggest", "pick", "edit", "wait", "map", "fix", "claude"],
+    "plugins": ["complete", "suggest", "pick", "edit", "wait", "map", "fix", "sys", "pkg", "claude"],
     "mcp":     "aish --mcp (run, job, and the plugins' tools)"
   },
 
