@@ -441,6 +441,17 @@ pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
     let _ = fs::write(&file, text);
 }
 
+/// PKGBUILD の版 ([epoch:]pkgver-pkgrel)。pkgver() でビルドのときに決めるものは "" (くらべない)
+pub fn version(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    if text.lines().any(|l| l.trim_start().starts_with("pkgver()")) {
+        return String::new();
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let (ver, rel, epoch) = (expand_var(dir, &text, "pkgver"), expand_var(dir, &text, "pkgrel"), expand_var(dir, &text, "epoch"));
+    format!("{}{}-{}", if epoch.is_empty() { String::new() } else { format!("{}:", epoch) }, ver, rel)
+}
+
 /// PKGBUILD の変数を bash で展開する (pkgver=0.0.1.r${_commit:0:7} など)
 fn expand_var(dir: &Path, text: &str, key: &str) -> String {
     Command::new("bash")

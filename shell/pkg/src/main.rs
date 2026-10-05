@@ -3,13 +3,15 @@
 //              一覧は pkg/pkg.json に作る: 1 つのパッケージに 1 行で name type src (取ってくる URL) now latest
 //   pkg_edit   PKGBUILD (pkgver、pkgrel、sha256sums) と .aios.json を、配布元の最新か ver に書きかえる
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
+//   pkg_test   作ったものを確かめる (ELF が aarch64 か、版、bin/ を qemu か aarch64 で --version)
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // build と push は長いので、うしろで動かす (自分を aish-pkg build / push で起こす)。もういちど呼ぶと様子か結果
 // コマンドとしても動く (大きな tarball の edit は時間がかかるので、run の bg で):
-//   aish-pkg check [NAME...] [--all] [--refresh]   aish-pkg edit NAME [VER]   aish-pkg build NAME   aish-pkg push [--force]
+//   aish-pkg check [NAME...] [--all] [--refresh]   aish-pkg edit NAME [VER]   aish-pkg build NAME   aish-pkg test NAME   aish-pkg push [--force]
 // リポジトリは dir か、いまのディレクトリから上にたどって pkg/ があるところ、なければ $AIOS_SRC か /usr/src/aios
 mod repo;
+mod test;
 mod up;
 
 use aish_plugin::{Spec, Tool, Tty, Value, error, json, s};
@@ -24,7 +26,7 @@ const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","de
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "push")) {
+    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "test" | "push")) {
         std::process::exit(cli(&args));
     }
     let spec = Spec {
@@ -34,7 +36,8 @@ fn main() {
         tools: &[
             Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ", input: BUILD },
-            Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
+            Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
+            Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。大きな tarball は時間がかかるので run の bg で aish-pkg edit NAME", input: EDIT },
         ],
     };
@@ -58,6 +61,13 @@ fn main() {
                         return error("give name");
                     }
                     job(&mut jobs, &root, &format!("build-{}", n), &["build", n], a)
+                }
+                "pkg_test" => {
+                    let n = s(a, "name");
+                    if n.is_empty() || n.contains('/') {
+                        return error("give name");
+                    }
+                    job(&mut jobs, &root, &format!("test-{}", n), &["test", n], a)
                 }
                 "pkg_push" => {
                     let argv: &[&str] = if a["force"] == true { &["push", "--force"] } else { &["push"] };
@@ -183,13 +193,17 @@ fn cli(args: &[String]) -> i32 {
             Some(n) => repo::build(&root, n).unwrap_or_else(error),
             None => error("aish-pkg build NAME"),
         },
+        "test" => match rest.first() {
+            Some(n) => test::test(&root, n).unwrap_or_else(error),
+            None => error("aish-pkg test NAME"),
+        },
         "push" => repo::push(&root, args.iter().any(|a| a == "--force")).unwrap_or_else(error),
         _ => match rest.first() {
             Some(n) => up::edit(&root, n, rest.get(1).map(String::as_str)).unwrap_or_else(error),
             None => error("aish-pkg edit NAME [VER]"),
         },
     };
-    if matches!(args[0].as_str(), "build" | "push") {
+    if matches!(args[0].as_str(), "build" | "test" | "push") {
         // うしろで動かしたとき (pkg_build / pkg_push)、最後の行を答えにする
         println!("{}", r);
     } else if let Some(t) = r["text"].as_str() {

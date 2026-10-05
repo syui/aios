@@ -31,7 +31,7 @@ fn sync_cache(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// NAME-VER-REL-ARCH.pkg.tar.zst → (NAME, VER-REL)
-fn parse(file: &str) -> Option<(String, String)> {
+pub fn parse(file: &str) -> Option<(String, String)> {
     let base = file.strip_suffix(".pkg.tar.zst")?;
     let mut p: Vec<&str> = base.rsplitn(4, '-').collect();
     if p.len() != 4 {
@@ -114,10 +114,20 @@ pub fn push(root: &Path, force: bool) -> Result<Value, String> {
             conflicts.push(format!("{}/{} {} is in ai/repo but not here (would be removed)", key.0, key.1, tv));
         }
     }
-    let mut r = json!({ "changes": changes, "conflicts": conflicts });
+    // 変わるもののうち、pkg_test で確かめていないもの
+    let untested: Vec<String> = ours
+        .iter()
+        .filter(|(key, (v, _))| theirs.get(*key).is_none_or(|(tv, _)| tv != v))
+        .filter(|(_, (_, f))| !crate::test::stamp(root, f).exists())
+        .map(|(key, (v, _))| format!("{}/{} {}", key.0, key.1, v))
+        .collect();
+    let mut r = json!({ "changes": changes, "conflicts": conflicts, "untested": untested });
     if changes.is_empty() && conflicts.is_empty() {
         r["text"] = json!("ai/repo is up to date\n");
         return Ok(r);
+    }
+    if !untested.is_empty() && !force {
+        return Err(format!("not tested: {} (pkg_test first, or force)", untested.join("; ")));
     }
     if !conflicts.is_empty() && !force {
         return Err(format!("ai/repo is newer: {} (bring them into repo/aarch64, or force)", conflicts.join("; ")));
