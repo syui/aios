@@ -2,6 +2,7 @@
 //
 //   /proc/sys/kernel/hostname                uname の nodename (sethostname と同じ)
 //   /proc/sys/kernel/ostype, osrelease       読むだけ
+//   /proc/sys/kernel/sched_timeslice_ms      ほかに順番をゆずるまで走る長さ (tick の倍数に切り上げ)
 //   /proc/sys/fs/inotify/max_queued_events   inotify にためておくできごとの数
 //   /proc/sys/fs/inotify/max_user_watches    1 つの inotify の watch の数
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
@@ -19,6 +20,8 @@ const EINVAL: i64 = 22;
 pub static INOTIFY_MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
 /// 1 つの inotify の watch の数
 pub static INOTIFY_MAX_WATCHES: AtomicUsize = AtomicUsize::new(8192);
+/// タイムスライス (tick)。走りはじめてからタイマの割り込みがこれだけ来たら、ほかに順番をゆずる
+pub static SCHED_TIMESLICE_TICKS: AtomicUsize = AtomicUsize::new(1);
 /// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで
 pub static MIN_FREE_PAGES: AtomicUsize = AtomicUsize::new(1024);
 
@@ -57,6 +60,16 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/hostname", get: crate::syscall::hostname, set: Some(|s| crate::syscall::set_hostname(s.as_bytes())) },
     Entry { path: "kernel/ostype", get: || "aios".to_string(), set: None },
     Entry { path: "kernel/osrelease", get: || env!("AIOS_RELEASE").to_string(), set: None },
+    Entry {
+        path: "kernel/sched_timeslice_ms",
+        get: || format!("{}", SCHED_TIMESLICE_TICKS.load(Ordering::Relaxed) as u64 * 1000 / crate::timer::HZ),
+        // 1 tick (10 ms) から 1 秒。tick の倍数に切り上げる
+        set: Some(|s| {
+            let ms = num(s, 1, 1000)? as u64;
+            let tick = 1000 / crate::timer::HZ;
+            Ok(SCHED_TIMESLICE_TICKS.store(ms.div_ceil(tick) as usize, Ordering::Relaxed))
+        }),
+    },
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/nr_open", get: || format!("{}", crate::proc::NOFILE), set: None },

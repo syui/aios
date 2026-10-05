@@ -96,6 +96,7 @@ Linux と同じ場所と形。書けるのは root。値の表は kernel/src/sys
 |---|---|
 | `kernel.hostname` | uname の nodename (sethostname と同じ) |
 | `kernel.ostype` `kernel.osrelease` | 読むだけ |
+| `kernel.sched_timeslice_ms` | ほかに順番をゆずるまで走る長さ (既定 10 = 1 tick。10 ms の倍数に切り上げ、1 秒まで)。長くすると切りかえが減り、短いほど返事が速い |
 | `fs.inotify.max_queued_events` | inotify にためておくできごとの数 (こえたら IN_Q_OVERFLOW) |
 | `fs.inotify.max_user_watches` | 1 つの inotify の watch の数 |
 | `fs.nr_open` | 読むだけ (開けるファイルの数の上限) |
