@@ -47,12 +47,19 @@ built() {
 }
 
 # fetch NAME: aios.db にある NAME のパッケージを repo/aarch64/rust に取ってくる (チェックサムを確かめる)
+#   aios.db に無ければ f を空にして戻る (install がここのソースからビルドする)。
+#   pkg/rust/ に足したばかりでまだ ai/repo に出していないもの、ほかのリポジトリへ移したものなど
 fetch() {
   d=
+  f=
   for x in "$tmp/db/$1"-[0-9]*; do
+    [ -f "$x/desc" ] || continue
     [ "$(sed -n '/^%NAME%$/{n;p;}' "$x/desc")" = "$1" ] && d=$x
   done
-  [ -n "$d" ] || { echo "not in $server: $1" >&2; exit 1; }
+  if [ -z "$d" ]; then
+    echo "rootfs: $1 is not in $server; building it here"
+    return 0
+  fi
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
@@ -107,9 +114,11 @@ install() {
   case "$done" in *" $1 "*) return 0 ;; esac
   done="$done$1 "
   [ -f "pkg/rust/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
+  f=
   if [ -n "$remote" ] && ! built "$1"; then
     fetch "$1"
-  else
+  fi
+  if [ -z "$f" ]; then
     f=$(ls "$repo/$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
   fi
   if [ -z "$f" ]; then
