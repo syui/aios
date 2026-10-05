@@ -1,5 +1,6 @@
 // aish-pkg: aios のパッケージを最新にする (人は M-p、Claude は MCP のツール)
-//   pkg_check  配布元の最新の版といまの pkgver をくらべる (新しいものだけ。all で全部)
+//   pkg_check  配布元の最新の版といまの pkgver をくらべる (新しいものだけ。all で全部)。
+//              一覧は pkg/pkg.json に作る: 1 つのパッケージに 1 行で name type src (取ってくる URL) now latest
 //   pkg_edit   PKGBUILD (pkgver、pkgrel、sha256sums) と .aios.json を、配布元の最新か ver に書きかえる
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // コマンドとしても動く (大きな tarball の edit は時間がかかるので、run の bg で):
@@ -10,7 +11,7 @@ mod up;
 use aish_plugin::{Spec, Tool, Tty, Value, error, json, s};
 use std::path::{Path, PathBuf};
 
-const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"最新のものも出す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
+const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"ver":{"type":"string","description":"版 (なければ配布元の最新)"},"dir":{"type":"string"}},"required":["name"]}"#;
 
 fn main() {
@@ -23,7 +24,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-p", "check")],
         tools: &[
-            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新", input: CHECK },
+            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)", input: CHECK },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。大きな tarball は時間がかかるので run の bg で aish-pkg edit NAME", input: EDIT },
         ],
     };
@@ -85,6 +86,11 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
                 text.push_str(&format!("{:w$}  {}\n", n, cur));
             }
         }
+    }
+    // all なら一覧 (pkg/pkg.json: name type src now latest) をそのまま (names があればその行だけ)
+    if all {
+        let list = std::fs::read_to_string(root.join("pkg").join(up::OVERVIEW)).unwrap_or_default();
+        text = list.lines().filter(|l| names.is_empty() || names.iter().any(|n| l.contains(&format!("\"name\": \"{}\",", n)))).map(|l| format!("{}\n", l)).collect();
     }
     let news: Vec<&Value> = rs.iter().filter(|r| r["new"] == true).map(|r| &r["name"]).collect();
     json!({ "text": text, "new": news, "latest": same, "errors": bad, "count": new + same + bad })

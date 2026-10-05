@@ -341,17 +341,16 @@ fn nvchecker(m: &Map<String, Value>) -> Result<String, String> {
             continue;
         }
         let mut v = t.clone();
-        if let Some(p) = s("prefix") {
-            match v.strip_prefix(p) {
-                Some(x) => v = x.to_string(),
-                None => continue,
-            }
+        // nvchecker と同じく、prefix はついていればとる (なければそのまま)
+        if let Some(x) = s("prefix").and_then(|p| v.strip_prefix(p)) {
+            v = x.to_string();
         }
         // nvchecker と同じく、合わなければそのまま
         if let Some(f) = &from {
-            v = f.replace(&v, py_repl(s("to_pattern").unwrap_or(""))).into_owned();
+            v = f.replace_all(&v, py_repl(s("to_pattern").unwrap_or(""))).into_owned();
         }
-        if v.starts_with(|c: char| c.is_ascii_digit()) && !prerelease(&v) {
+        // 版らしいものだけ (数で始まり、- や空白がない。node-v26.10.0-linux-x64-musl の -linux... は落とす)
+        if v.starts_with(|c: char| c.is_ascii_digit()) && v.chars().all(|c| c.is_ascii_alphanumeric() || "._+".contains(c)) && !prerelease(&v) {
             vs.push(v);
         }
     }
@@ -379,15 +378,77 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
     let rules = rules(pkg, if refresh { only } else { &[] }, refresh)?;
     let now: std::collections::HashMap<String, String> =
         pkgbuilds(pkg).into_iter().map(|(n, p)| (n, scalar(&fs::read_to_string(p).unwrap_or_default(), "pkgver").unwrap_or_default())).collect();
+    let skips: Vec<(String, String)> = rules.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["skip"].as_str()?.to_string()))).collect();
     let todo: Vec<Value> = rules.into_iter().filter(|r| r.get("skip").is_none() && (only.is_empty() || only.iter().any(|o| r["name"] == o.as_str()))).collect();
-    Ok(par(todo, |r| {
+    let rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
         let cur = now.get(&name).cloned().unwrap_or_default();
         match latest(&r) {
             Ok(v) => json!({ "name": name, "pkgver": cur, "latest": v, "new": vercmp(&v, &cur).is_gt() }),
             Err(e) => json!({ "name": name, "pkgver": cur, "error": e }),
         }
-    }))
+    });
+    // しくじったもの (配布元が切れたなど) は、一覧の前の値を残す
+    let mut seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
+    for (n, why) in skips {
+        let short = if why == "aios" { "aios" } else if why.contains("commit") { "commit" } else if why.contains("pkgver") { "follows another version" } else if why.contains("by hand") { "manual" } else { "no upstream" };
+        seen.insert(n, format!("({})", short));
+    }
+    overview(pkg, &seen);
+    Ok(rs)
+}
+
+/// 一覧に作るファイル: 1 つのパッケージに 1 行で name type src now latest
+pub const OVERVIEW: &str = "pkg.json";
+
+/// pkg/pkg.json を作りなおす。latest は seen (いま見たもの) か、前のファイルのもの
+pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
+    let file = pkg.join(OVERVIEW);
+    let old: Vec<Value> = fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let items = pkgbuilds(pkg);
+    let rows: Vec<Vec<(&str, String)>> = par(items, |(name, path)| {
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let ty = dir.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        let src = if first_source(&text).is_some() { expand_source(dir, &text).unwrap_or_default() } else { String::new() };
+        let latest = seen.get(&name).cloned().or_else(|| old.iter().find(|o| o["name"] == name.as_str()).and_then(|o| o["latest"].as_str().map(String::from))).unwrap_or_default();
+        let now = scalar(&text, "pkgver").unwrap_or_default();
+        let now = if now.contains('$') { expand_var(dir, &text, "pkgver") } else { now };
+        vec![("name", name), ("type", ty), ("src", src), ("now", now), ("latest", latest)]
+    });
+    // 列をそろえる: "key": "value", のかたまりを、列ごとにいちばん長いものの幅に
+    let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|(k, v)| format!("{}: {}", json!(k), json!(v))).collect()).collect();
+    let n = cells.first().map_or(0, |c| c.len());
+    let w: Vec<usize> = (0..n).map(|i| cells.iter().map(|c| c[i].chars().count()).max().unwrap_or(0)).collect();
+    let mut text = String::from("[\n");
+    for (j, c) in cells.iter().enumerate() {
+        let mut line = String::from("  {");
+        for (i, cell) in c.iter().enumerate() {
+            if i + 1 < n {
+                line.push_str(&format!("{},{}", cell, " ".repeat(w[i] - cell.chars().count() + 1)));
+            } else {
+                line.push_str(cell);
+            }
+        }
+        line.push('}');
+        if j + 1 < cells.len() {
+            line.push(',');
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text.push_str("]\n");
+    let _ = fs::write(&file, text);
+}
+
+/// PKGBUILD の変数を bash で展開する (pkgver=0.0.1.r${_commit:0:7} など)
+fn expand_var(dir: &Path, text: &str, key: &str) -> String {
+    Command::new("bash")
+        .args(["-c", &format!("eval \"$1\"; printf %s \"${{{}}}\"", key), "-", text])
+        .current_dir(dir)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 // ---- edit ----
@@ -438,6 +499,8 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     if aios_json(&root.join(".aios.json"), name, &ver)? {
         files.push(json!(".aios.json"));
     }
+    files.push(json!("pkg/pkg.json"));
+    overview(&pkg, &std::collections::HashMap::new());
     r["files"] = json!(files);
     Ok(r)
 }
