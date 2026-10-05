@@ -190,6 +190,9 @@ pub struct Proc {
     pub recent: u32,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
     pub yielded: bool,
+    /// いま走りはじめてから来たタイマの割り込みの数。タイムスライス (sysctl kernel.sched_timeslice_ms) に
+    /// 着いたらゆずる
+    slice: u32,
     /// 回収した子 (とその子孫) の utime
     pub cutime: u64,
     chan: usize,
@@ -248,6 +251,7 @@ impl Proc {
         utime: 0,
         recent: 0,
         yielded: false,
+        slice: 0,
         cutime: 0,
         chan: 0,
         last_sys: (0, 0, 0),
@@ -584,6 +588,7 @@ pub fn scheduler() -> ! {
             let p = &mut procs()[i];
             p.state = State::Running;
             p.yielded = false;
+            p.slice = 0;
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
@@ -1066,7 +1071,14 @@ pub fn account_tick() {
         let p = &mut procs()[i];
         p.utime += 1;
         p.recent = p.recent.saturating_add(1);
+        p.slice = p.slice.saturating_add(1);
     }
+}
+
+/// タイマの割り込みから: いま動いているものがタイムスライスを使いきったか (ゆずるか)
+pub fn slice_expired() -> bool {
+    let ticks = crate::sysctl::SCHED_TIMESLICE_TICKS.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    cur().is_some_and(|i| procs()[i].slice >= ticks)
 }
 
 /// sched_yield: 順番をゆずる (同じくらい走ったものより後ろに)
