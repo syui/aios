@@ -658,8 +658,25 @@ fn sys_sethostname(name: usize, len: usize) -> R {
     }
     let mut b = [0u8; 64];
     proc::current().pt().copy_in(&mut b[..len], name).ok_or(-14)?;
-    unsafe { *(&raw mut HOSTNAME) = (b, len) };
+    set_hostname(&b[..len])?;
     Ok(0)
+}
+
+/// いまのホスト名 (/proc/sys/kernel/hostname)
+pub fn hostname() -> String {
+    let (hb, hl) = unsafe { *(&raw const HOSTNAME) };
+    String::from_utf8_lossy(&hb[..hl]).into_owned()
+}
+
+/// ホスト名を変える (sethostname と /proc/sys/kernel/hostname。root かは呼ぶほうで見る)
+pub fn set_hostname(name: &[u8]) -> Result<(), i64> {
+    if name.len() > 64 {
+        return Err(-EINVAL);
+    }
+    let mut b = [0u8; 64];
+    b[..name.len()].copy_from_slice(name);
+    unsafe { *(&raw mut HOSTNAME) = (b, name.len()) };
+    Ok(())
 }
 
 fn sys_uname(buf: usize) -> R {

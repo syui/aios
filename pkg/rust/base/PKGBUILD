@@ -45,7 +45,7 @@ package() {
   # 共有ライブラリも /usr/lib にまとめる (/lib/ld-musl-aarch64.so.1 などはここを通る)
   install -d "$pkgdir/usr/lib"
   ln -s usr/lib "$pkgdir/lib"
-  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios aiosd ip networkd chsh modprobe useradd; do
+  for p in init aish aipkg fetch systemctl journalctl login passwd su which mkswap swapon free resize aios aiosd ip networkd chsh modprobe useradd sysctl; do
     install -m755 "$bin/$p" "$pkgdir/usr/bin/$p"
   done
   # カーネルは /init を動かす

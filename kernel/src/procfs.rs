@@ -8,6 +8,7 @@
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
+//   /proc/sys/...       カーネルの値 (sysctl.rs の表。root は書ける)
 use crate::proc::{self, Proc, State};
 use crate::vfs::*;
 use alloc::format;
@@ -38,6 +39,10 @@ enum Node {
     Route,
     KernelCmdline,
     CpuInfo,
+    /// /proc/sys の下のディレクトリ: sysctl の表の番号と、そのパスのはじめのいくつか
+    SysDir(u16, u8),
+    /// /proc/sys の下のファイル: sysctl の表の番号
+    Sys(u16),
     Pid(u32),
     Stat(u32),
     Status(u32),
@@ -87,6 +92,8 @@ impl ProcInode {
             Node::Sysstat => 33,
             Node::Modules => 12,
             Node::Route => 11,
+            Node::SysDir(i, d) => 0x100 + i as u64 * 8 + d as u64,
+            Node::Sys(i) => 0x1000 + i as u64,
             Node::Pid(p) => (p as u64) << 16 | 1,
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
@@ -161,6 +168,7 @@ impl ProcInode {
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
+            Node::Sys(i) => crate::sysctl::TABLE[i as usize].read(),
             Node::Pnp => {
                 // Linux と同じく、DHCP なら #PROTO: DHCP、手で決めたなら #MANUAL
                 let mut s = String::from(if crate::net::is_dhcp() { "#PROTO: DHCP\n" } else { "#MANUAL\n" });
@@ -303,7 +311,8 @@ impl Inode for ProcInode {
     fn meta(&self) -> Meta {
         let (uid, gid) = self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid));
         let mode = match self.node {
-            Node::Root | Node::Pid(_) | Node::NetDir => S_IFDIR | 0o555,
+            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) => S_IFDIR | 0o555,
+            Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::SelfLink | Node::Cwd(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
@@ -326,6 +335,14 @@ impl Inode for ProcInode {
     }
 
     fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/sys/...: root が値を書く
+        if let Node::Sys(i) = self.node
+            && crate::sysctl::TABLE[i as usize].writable()
+            && crate::cred::current().euid == 0
+        {
+            crate::sysctl::TABLE[i as usize].write(b)?;
+            return Ok(b.len());
+        }
         // /proc/strace: root が名前を書くと、その名前のプロセスの失敗したシステムコールを出す (空で止める)
         if self.node == Node::Strace && crate::cred::current().euid == 0 {
             crate::syscall::strace_set(b);
@@ -341,7 +358,8 @@ impl Inode for ProcInode {
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // > /proc/strace (O_TRUNC) は受けつける
-        if matches!(self.node, Node::Strace | Node::Bkl) && crate::cred::current().euid == 0 {
+        let sys = matches!(self.node, Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable());
+        if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 {
             return Ok(());
         }
         Err(-EACCES)
@@ -380,6 +398,11 @@ impl Inode for ProcInode {
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::NetDir, "route") => Node::Route,
+            (Node::Root, "sys") => Node::SysDir(0, 0),
+            (Node::SysDir(i, d), _) => match crate::sysctl::lookup(i as usize, d as usize, name).ok_or(-ENOENT)? {
+                (j, true) => Node::Sys(j as u16),
+                (j, false) => Node::SysDir(j as u16, d + 1),
+            },
             (Node::Root, _) => Node::Pid(leader(num.ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
@@ -421,6 +444,7 @@ impl Inode for ProcInode {
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
+                add("sys".into(), Node::SysDir(0, 0));
                 for p in proc::all_leader_procs() {
                     add(format!("{}", p.tgid), Node::Pid(p.tgid));
                 }
@@ -428,6 +452,11 @@ impl Inode for ProcInode {
             Node::NetDir => {
                 add("pnp".into(), Node::Pnp);
                 add("route".into(), Node::Route);
+            }
+            Node::SysDir(i, d) => {
+                for (name, j, file) in crate::sysctl::list(i as usize, d as usize) {
+                    add(name.into(), if file { Node::Sys(j as u16) } else { Node::SysDir(j as u16, d + 1) });
+                }
             }
             Node::Pid(p) => {
                 add("stat".into(), Node::Stat(p));

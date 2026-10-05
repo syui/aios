@@ -26,7 +26,7 @@
 | PATH | 中身 |
 |---|---|
 | `host` | 名前、OS (base の版) |
-| `kernel` | 版、コマンドライン、起きてからの秒、CPU の数、モジュール、BKL (`/proc/bkl`)、メッセージの終わり (`/proc/kmsg`) |
+| `kernel` | 版、コマンドライン、起きてからの秒、CPU の数、モジュール、BKL (`/proc/bkl`)、メッセージの終わり (`/proc/kmsg`)、`sysctl` (`/proc/sys`) |
 | `mem` | メモリとスワップ (KiB) |
 | `disk` | マウントごとの使った量と大きさ |
 | `proc` | プロセス (pid ppid 状態 スレッド CPU 秒 メモリ コマンド) |
@@ -69,6 +69,11 @@ aios rollback                           # ひとつ前の apply の設定に戻�
 - `service`: `"enabled"` (enable して動かす) か `"disabled"` (止めて disable)
 - `kernel.modules`: /etc/modules-load.d/aios.conf に書き、入っていないものは modprobe
 - `user`: いなければ useradd -m。`shell` と `groups` (足すだけ) をそろえる
+- `net`: インターフェースごとに `{"dhcp": true}` か `{"address": "A.B.C.D/N", "gateway": ..., "dns": [...]}`
+  (dhcp でも `dns` は書ける)。`/etc/systemd/network/00-aios-IFACE.network` に書いて `networkd` で決める。
+  aios が書いたもので、もう書いていないインターフェースのものは消す
+- `sysctl`: カーネルの値 (`/proc/sys`)。`/etc/sysctl.d/aios.conf` に書き (起動のときに init が入れる)、
+  いまの値がちがうものは今 `/proc/sys` に書く
 
 ```json
 {
@@ -76,8 +81,30 @@ aios rollback                           # ひとつ前の apply の設定に戻�
   "pkg":     ["openssh", "cargo", "base-devel", "git", "desktop", "mesa"],
   "service": { "sshd": "enabled", "aiwm": "disabled" },
   "kernel":  { "modules": ["virtio_gpu", "virtio_input", "virtio_snd"] },
-  "user":    { "ai": { "shell": "/bin/aish", "groups": ["wheel"] } }
+  "user":    { "ai": { "shell": "/bin/aish", "groups": ["wheel"] } },
+  "net":     { "eth0": { "address": "10.0.2.15/24", "gateway": "10.0.2.2", "dns": ["1.1.1.1"] } },
+  "sysctl":  { "vm.min_free_kbytes": 8192, "fs.inotify.max_user_watches": 65536 }
 }
+```
+
+## カーネルの値 (/proc/sys と sysctl)
+
+Linux と同じ場所と形。書けるのは root。値の表は kernel/src/sysctl.rs (1 行足せば 1 つ増える)。
+
+| 名前 | |
+|---|---|
+| `kernel.hostname` | uname の nodename (sethostname と同じ) |
+| `kernel.ostype` `kernel.osrelease` | 読むだけ |
+| `fs.inotify.max_queued_events` | inotify にためておくできごとの数 (こえたら IN_Q_OVERFLOW) |
+| `fs.inotify.max_user_watches` | 1 つの inotify の watch の数 |
+| `fs.nr_open` | 読むだけ (開けるファイルの数の上限) |
+| `vm.min_free_kbytes` | 空きがこれを割ったら swap へ回収する (その 4 倍になるまで) |
+
+```sh
+sysctl -a                                  # ぜんぶ
+sysctl vm.min_free_kbytes                  # 読む
+sudo sysctl vm.min_free_kbytes=8192        # 書く
+sudo sysctl --system                       # /etc/sysctl.conf と /etc/sysctl.d/*.conf を入れる (起動のときに init がする)
 ```
 
 ## 改造 (aios src / build / install)

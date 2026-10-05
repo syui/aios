@@ -157,6 +157,12 @@ fn kernel() -> Value {
             let tail: Vec<Value> = lines[lines.len().saturating_sub(10)..].iter().map(|l| json!(l)).collect();
             k["kmsg_tail"] = Value::Array(tail);
         }
+        // /proc/sys (aios のものは少ないので、ぜんぶ。Linux では多すぎるので出さない)
+        let mut sc = Map::new();
+        for (name, v) in crate::sysctl::all() {
+            sc.insert(name, json!(v));
+        }
+        k["sysctl"] = Value::Object(sc);
     }
     k
 }
