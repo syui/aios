@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
-exclude = ["user", "boot", "build", "desktop"]
+exclude = ["user", "boot", "build", "desktop", "aimg"]
 
 [workspace.package]
 version = "0.0.1"

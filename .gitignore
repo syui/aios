@@ -5,6 +5,7 @@
 /user/target
 /boot/target
 /desktop/target
+/aimg/target
 /build
 /disk.img
 /repo

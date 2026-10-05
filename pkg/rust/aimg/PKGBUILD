@@ -1,0 +1,25 @@
+# aimg: 画像を変える (ImageMagick の代わり。Rust だけ)。このリポジトリの aimg/ から
+#   png jpg gif webp bmp ico の読み書き、svg を描く (resvg)、縮小・切りぬき・回転。aimg --help
+pkgname=aimg
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Convert, resize, crop and rotate images, and render svg (Rust, for aios)'
+arch=('aarch64')
+url='https://github.com/syui/aios'
+license=('MIT')
+makedepends=('rustup')
+
+pkgver() {
+  cd "$startdir/../../.."
+  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD -- aimg)" "$(git log -1 --format=%h -- aimg)"
+}
+
+build() {
+  . "$startdir/../cross.sh"
+  cd "$startdir/../../../aimg"
+  CARGO_TARGET_DIR="$srcdir/target" musl_build
+}
+
+package() {
+  install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aimg" "$pkgdir/usr/bin/aimg"
+}
