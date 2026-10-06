@@ -3,6 +3,7 @@
 //   /proc/sys/kernel/hostname                uname の nodename (sethostname と同じ)
 //   /proc/sys/kernel/ostype, osrelease       読むだけ
 //   /proc/sys/kernel/sched_timeslice_ms      ほかに順番をゆずるまで走る長さ (tick の倍数に切り上げ)
+//   /proc/sys/kernel/sched_wakeup_preempt    1 なら、起こされたものが CPU を使い続けているものに割りこむ
 //   /proc/sys/fs/inotify/max_queued_events   inotify にためておくできごとの数
 //   /proc/sys/fs/inotify/max_user_watches    1 つの inotify の watch の数
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
@@ -22,6 +23,8 @@ pub static INOTIFY_MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
 pub static INOTIFY_MAX_WATCHES: AtomicUsize = AtomicUsize::new(8192);
 /// タイムスライス (tick)。走りはじめてからタイマの割り込みがこれだけ来たら、ほかに順番をゆずる
 pub static SCHED_TIMESLICE_TICKS: AtomicUsize = AtomicUsize::new(1);
+/// 起こされたもの (あまり CPU を使っていない) が、走っているもの (使っている) に割りこむか
+pub static SCHED_WAKEUP_PREEMPT: AtomicUsize = AtomicUsize::new(1);
 /// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで
 pub static MIN_FREE_PAGES: AtomicUsize = AtomicUsize::new(1024);
 
@@ -70,6 +73,7 @@ pub static TABLE: &[Entry] = &[
             Ok(SCHED_TIMESLICE_TICKS.store(ms.div_ceil(tick) as usize, Ordering::Relaxed))
         }),
     },
+    Entry { path: "kernel/sched_wakeup_preempt", get: || format!("{}", SCHED_WAKEUP_PREEMPT.load(Ordering::Relaxed)), set: Some(|s| Ok(SCHED_WAKEUP_PREEMPT.store(num(s, 0, 1)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/nr_open", get: || format!("{}", crate::proc::NOFILE), set: None },

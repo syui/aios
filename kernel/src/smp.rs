@@ -46,13 +46,15 @@ pub fn set_idle(on: bool) {
 
 /// 眠っている CPU を起こす (動けるプロセスができた)。sev ではなく割り込みで:
 /// Mac の Hypervisor.framework (HVF) では wfe が眠らず sev も届かないので、ひまな CPU は wfi で眠っている
-pub fn wake_idle() {
+/// 眠っている CPU を起こす。起こしたものがあれば true
+pub fn wake_idle() -> bool {
     let idle = IDLE.load(Ordering::Acquire) & !(1 << id());
     for cpu in 0..online() {
         if idle & (1 << cpu) != 0 {
             crate::irq::send_ipi(unsafe { TARGET[cpu] });
         }
     }
+    idle != 0
 }
 
 /// ほかの CPU に、EL0 から戻ってくるように知らせる (殺された、シグナルが来た)
@@ -137,6 +139,8 @@ static STATS: Stats = Stats {
 /// スケジューラでほかのプロセスへ切りかえた回数 (ロックを持ったまま眠ったかを見る)
 pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+/// 起こされたものにゆずらせた数 (proc.rs preempt)
+pub static PREEMPTS: AtomicUsize = AtomicUsize::new(0);
 /// 大きなロックなしで片づけたページフォルト (vm.rs fast_fault)
 pub static FAST_FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -175,6 +179,7 @@ pub fn stats_reset() {
     }
     STATS.slept.store(0, Ordering::Relaxed);
     FAST_FAULTS.store(0, Ordering::Relaxed);
+    PREEMPTS.store(0, Ordering::Relaxed);
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
 }
 
@@ -224,8 +229,8 @@ pub fn stats() -> alloc::string::String {
         s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
-    s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {})
-", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed)));
+    s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
+", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s
 }
 
