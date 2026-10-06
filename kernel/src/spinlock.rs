@@ -31,6 +31,17 @@ impl<T> SpinLock<T> {
         }
         Guard { lock: self, daif }
     }
+
+    /// 取れたら Some (取れなければ待たない。println のように、どこからでも呼ばれるところ用)
+    pub fn try_lock(&self) -> Option<Guard<'_, T>> {
+        let daif = intr_save();
+        if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            Some(Guard { lock: self, daif })
+        } else {
+            intr_restore(daif);
+            None
+        }
+    }
 }
 
 impl<T> Deref for Guard<'_, T> {

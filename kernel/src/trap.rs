@@ -147,7 +147,7 @@ pub fn intr_off() {
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if kind == EL1H_SYNC {
-        return handle(tf, kind);
+        return handle(tf, kind, None);
     }
     // 自分のことを読むだけのシステムコールと、自分だけの無名の領域のページフォルトはロックなしで (smp.rs)
     if kind == EL0_SYNC {
@@ -165,6 +165,16 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             }
         }
     }
+    // コンソールの送信の割り込み (輪から次の文字を出すだけ) もロックなしで
+    let mut claimed = None;
+    if kind == EL1H_IRQ || kind == EL0_IRQ {
+        let raw = irq::claim();
+        if raw & 0x3ff == crate::uart::irq() && crate::uart::intr_fast() {
+            irq::complete(raw);
+            return;
+        }
+        claimed = Some(raw);
+    }
     crate::smp::lock();
     // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に
     let cause = match kind {
@@ -173,13 +183,13 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         _ => crate::smp::Cause::Irq,
     };
     let (t0, sw) = (crate::timer::uptime_ns(), crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed));
-    handle(tf, kind);
+    handle(tf, kind, claimed);
     let slept = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed) != sw;
     crate::smp::account(cause, crate::timer::uptime_ns() - t0, slept);
     crate::smp::unlock();
 }
 
-fn handle(tf: &mut TrapFrame, kind: u64) {
+fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
     match kind {
         EL1H_SYNC => {
             let (esr, far) = esr_far();
@@ -273,7 +283,7 @@ fn handle(tf: &mut TrapFrame, kind: u64) {
             }
         }
         EL1H_IRQ | EL0_IRQ => {
-            let raw = irq::claim();
+            let raw = claimed.unwrap_or_else(irq::claim);
             let id = raw & 0x3ff;
             match id {
                 timer::IRQ => timer::tick(),
