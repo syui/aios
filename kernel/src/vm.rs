@@ -258,6 +258,23 @@ fn flush_all() {
     unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
 
+/// 消した (無効にした) ページの TLB を消す: 少なければ 1 つずつ、多ければ全部。
+/// 全部消す (vmalle1is) はすべての CPU のすべてのプロセスの TLB を捨てるので、小さな munmap のたびにはしない
+fn flush_pages(vas: &[usize]) {
+    if vas.is_empty() {
+        return;
+    }
+    if vas.len() <= 64 {
+        unsafe { core::arch::asm!("dsb ishst") };
+        for &va in vas {
+            unsafe { core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12) as u64) };
+        }
+        unsafe { core::arch::asm!("dsb ish", "isb") };
+    } else {
+        flush_all();
+    }
+}
+
 /// 何も写していない L1 (スケジューラの中で TTBR0 に載せる)
 #[repr(C, align(4096))]
 struct Empty([u64; 512]);
@@ -439,6 +456,11 @@ impl PageTable {
         if start >= end {
             return;
         }
+        // 範囲に領域が 1 つもなければ (mmap が新しい場所に写すときはいつもそう)、することがない。
+        // 領域は重ならないので、end より前で最後のものだけ見ればよい
+        if !self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start) {
+            return;
+        }
         self.split(start);
         self.split(end);
         let file_keys = self.shared_keys(start, end);
@@ -448,16 +470,22 @@ impl PageTable {
         }
         // PTE を消して TLB を消してから、ページを返す (ほかの CPU がまだ使っているかもしれない)
         let mut pages = Vec::new();
-        self.each_entry(start, end, |_, pte| unsafe {
+        let mut vas = Vec::new();
+        self.each_entry(start, end, |va, pte| unsafe {
             if is_swap(*pte) {
                 swap::free(slot_of(*pte));
             } else {
                 pages.push(page_of(*pte));
+                if *pte & PTE_VALID != 0 {
+                    vas.push(va);
+                }
             }
             *pte = 0;
         });
-        flush_all();
-        self.quiesce();
+        flush_pages(&vas);
+        if !vas.is_empty() {
+            self.quiesce();
+        }
         for p in pages {
             kalloc::put(p);
         }
@@ -474,6 +502,7 @@ impl PageTable {
             }
         }
         let mut pages = Vec::new();
+        let mut vas = Vec::new();
         self.each_entry(start, end, |va, pte| unsafe {
             // 共有のメモリは捨てない (ほかのプロセスが使っている)
             if !shared.iter().any(|&(s, e)| s <= va && va < e) {
@@ -481,12 +510,17 @@ impl PageTable {
                     swap::free(slot_of(*pte));
                 } else {
                     pages.push(page_of(*pte));
+                    if *pte & PTE_VALID != 0 {
+                        vas.push(va);
+                    }
                 }
                 *pte = 0;
             }
         });
-        flush_all();
-        self.quiesce();
+        flush_pages(&vas);
+        if !vas.is_empty() {
+            self.quiesce();
+        }
         for p in pages {
             kalloc::put(p);
         }
@@ -651,7 +685,9 @@ impl PageTable {
     /// 次に mmap に渡せる、hint 以上で len のすき間
     pub fn free_area(&self, hint: usize, len: usize) -> usize {
         let mut va = hint;
-        for (&s, v) in self.vmas.range(..) {
+        // hint より前の領域は、hint にかかりうる最後の 1 つ (領域は重ならない) から見ればよい
+        let from = self.vmas.range(..=hint).next_back().map_or(hint, |(&s, _)| s);
+        for (&s, v) in self.vmas.range(from..) {
             if v.end <= va {
                 continue;
             }
