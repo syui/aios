@@ -9,6 +9,7 @@
 use crate::memlayout::{p2v, pg_round_up, phystop, v2p, ram_base, PGSIZE};
 use crate::spinlock::SpinLock;
 use core::ptr;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 struct Run {
     next: *mut Run,
@@ -25,11 +26,11 @@ unsafe impl Send for Kmem {}
 
 /// RAM のページごとの参照の数 (RAM は memlayout::MAX_RAM まで)
 const MAX_PAGES: usize = crate::memlayout::MAX_RAM / PGSIZE;
-static mut REFS: [u16; MAX_PAGES] = [0; MAX_PAGES];
+/// ページごとの、使っている人の数。大きなロックなしのページフォルト (vm.rs fast_fault) からも触るので atomic
+static REFS: [AtomicU16; MAX_PAGES] = [const { AtomicU16::new(0) }; MAX_PAGES];
 
-fn ref_slot(page: *mut u8) -> &'static mut u16 {
-    let i = (v2p(page as usize) - ram_base()) / PGSIZE;
-    unsafe { &mut (*(&raw mut REFS))[i] }
+fn ref_slot(page: *mut u8) -> &'static AtomicU16 {
+    &REFS[(v2p(page as usize) - ram_base()) / PGSIZE]
 }
 
 static KMEM: SpinLock<Kmem> =
@@ -46,7 +47,7 @@ pub fn init() {
 
 /// 仮想アドレス (KBASE 側) のページを返す
 pub fn free(page: *mut u8) {
-    *ref_slot(page) = 0;
+    ref_slot(page).store(0, Ordering::Relaxed);
     let r = page as *mut Run;
     let mut k = KMEM.lock();
     unsafe { (*r).next = k.head };
@@ -71,29 +72,26 @@ pub fn alloc() -> Option<*mut u8> {
     };
     drop(k);
     unsafe { ptr::write_bytes(page, 0, PGSIZE) };
-    *ref_slot(page) = 1;
+    ref_slot(page).store(1, Ordering::Relaxed);
     Some(page)
 }
 
 /// 共有する人が増える
 pub fn get(page: *mut u8) {
-    let r = ref_slot(page);
-    *r = r.saturating_add(1);
+    ref_slot(page).fetch_add(1, Ordering::AcqRel);
 }
 
 /// 共有をやめる。誰も使わなくなったら返す
 pub fn put(page: *mut u8) {
-    let r = ref_slot(page);
-    if *r <= 1 {
+    // 最後の 1 人なら返す (fetch_sub の前の値が 1 以下)
+    if ref_slot(page).fetch_sub(1, Ordering::AcqRel) <= 1 {
         free(page);
-    } else {
-        *r -= 1;
     }
 }
 
 /// 何人で使っているか
 pub fn refs(page: *mut u8) -> u16 {
-    *ref_slot(page)
+    ref_slot(page).load(Ordering::Acquire)
 }
 
 pub fn nfree() -> usize {

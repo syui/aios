@@ -153,9 +153,12 @@ pub enum FaultErr {
 pub struct PageTable {
     root: *mut u64,
     vmas: BTreeMap<usize, Vma>,
-    /// 大きなロックなしでユーザーのメモリに書いている CPU の数 (copy_out_nofault)。
+    /// 大きなロックなしでこの表を読み書きしている CPU の数 (copy_out_nofault、fast_fault)。
     /// ページを手放す前に 0 になるのを待つ (quiesce)
     fast_users: AtomicUsize,
+    /// 大きなロックを持ってこの表 (領域か PTE) を変えている途中の数。0 でないあいだ fast_fault は
+    /// ふつうの道 (大きなロック) へ回る。変える側は増やしてから quiesce する (Mutating)
+    mutators: AtomicUsize,
     /// clock の針 (次にスワップへ追い出すページを探しはじめる va)
     clock: usize,
     /// 最近の map / protect / unmap (操作, 始め, 終わり, prot)。落ちたときに、そのアドレスにかかわったものを出す (調べもの用)
@@ -164,6 +167,16 @@ pub struct PageTable {
 
 /// hist に覚える数
 const HIST: usize = 512;
+
+/// 表を変えている途中 (PageTable::mutating)。落とすと終わり。
+/// &mut self のメソッドの中で持つので、表そのものではなく数えるところだけを指す (表はそのあいだ動かない)
+pub struct Mutating(*const AtomicUsize);
+
+impl Drop for Mutating {
+    fn drop(&mut self) {
+        unsafe { (*self.0).fetch_sub(1, Ordering::SeqCst) };
+    }
+}
 
 fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * (3 - level))) & 0x1ff
@@ -266,7 +279,7 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), clock: 0, hist: alloc::collections::VecDeque::new() })
+        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, hist: alloc::collections::VecDeque::new() })
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -393,6 +406,7 @@ impl PageTable {
 
     /// [start, end) に領域を置く (前にあったものは外す)。中身は触れたときに作る
     pub fn map(&mut self, start: usize, end: usize, prot: u8, shared: bool, back: Backing) -> Option<()> {
+        let _m = self.mutating();
         if start >= end || end > MAXVA {
             return None;
         }
@@ -420,6 +434,7 @@ impl PageTable {
     }
 
     fn unmap_inner(&mut self, start: usize, end: usize) {
+        let _m = self.mutating();
         let (start, end) = (pg_down(start), pg_up(end));
         if start >= end {
             return;
@@ -451,6 +466,7 @@ impl PageTable {
 
     /// [start, end) のページを捨てる (領域は残す。次に触れたら作りなおす: MADV_DONTNEED)
     pub fn discard(&mut self, start: usize, end: usize) {
+        let _m = self.mutating();
         let mut shared = Vec::new();
         for (&s, v) in self.vmas.range(..end) {
             if v.end > start && v.shared {
@@ -478,6 +494,7 @@ impl PageTable {
 
     /// mprotect。領域でないところが混じっていれば ENOMEM (Err)
     pub fn protect(&mut self, start: usize, end: usize, prot: u8) -> Result<(), ()> {
+        let _m = self.mutating();
         let (start, end) = (pg_down(start), pg_up(end));
         self.note(b'p', start, end, prot);
         // すき間がないか
@@ -511,6 +528,7 @@ impl PageTable {
 
     /// 領域の終わり (brk で伸ばす)。start から始まる領域を end まで伸ばすか縮める
     pub fn resize(&mut self, start: usize, old_end: usize, new_end: usize) -> Option<()> {
+        let _m = self.mutating();
         if new_end > old_end {
             // 伸ばす先に別の領域があればだめ
             if self.vmas.range(old_end..new_end).next().is_some() {
@@ -530,6 +548,7 @@ impl PageTable {
 
     /// start から始まる領域に名前 (写したファイルのパス) をつける
     pub fn set_name(&mut self, start: usize, name: &str) {
+        let _m = self.mutating();
         if let Some(v) = self.vmas.get_mut(&start) {
             v.name = Some(alloc::rc::Rc::from(name));
         }
@@ -620,6 +639,7 @@ impl PageTable {
 
     /// start から始まる領域の終わりを new_end まで伸ばす (その先が空いているときだけ。mremap)
     pub fn extend(&mut self, start: usize, new_end: usize) -> Option<()> {
+        let _m = self.mutating();
         let old_end = self.vmas.get(&start)?.end;
         if new_end <= old_end || self.vmas.range(old_end..new_end).next().is_some() {
             return None;
@@ -664,6 +684,7 @@ impl PageTable {
     /// va のページを用意する。write なら自分だけのものにして書けるように。
     /// force はカーネルが書く (exec で読み取り専用の領域に読み込む): 権限は変えずに自分だけのものに
     fn fault_page(&mut self, va: usize, write: bool, force: bool) -> Result<(), FaultErr> {
+        let _m = self.mutating();
         let (start, v) = self.find(va).ok_or(FaultErr::NoMap)?;
         let (prot, shared, back) = (v.prot, v.shared, v.back.clone());
         let page_va = pg_down(va);
@@ -852,6 +873,7 @@ impl PageTable {
 
     /// va に決まったページを写す (vDSO)。ページはカーネルも持ちつづける
     pub fn install(&mut self, va: usize, page: *mut u8, prot: u8) -> Option<()> {
+        let _m = self.mutating();
         let pte = self.walk(va, true)?;
         kalloc::get(page);
         unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
@@ -890,6 +912,88 @@ impl PageTable {
         ok
     }
 
+    /// 領域か PTE を変えはじめる (大きなロックを持って)。fast_fault を止めて、ロックなしで触っている CPU が
+    /// いなくなるのを待つ。返ったものを持っているあいだが「変えている途中」
+    fn mutating(&self) -> Mutating {
+        self.mutators.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        self.quiesce();
+        Mutating(&self.mutators)
+    }
+
+    /// 大きなロックなしのページフォルト。自分だけの (MAP_SHARED でない) 無名の領域で、
+    ///   ページがまだない / 共有していて書く (コピーオンライト) / アクセスフラグが落ちている
+    /// ものを、途中のテーブルがもうあるときだけ、PTE の compare-exchange で片づける。
+    /// それ以外 (ファイル、スワップ、共有、テーブルがない、だれかが表を変えている途中) は false で、
+    /// 呼んだほうが大きなロックを取ってふつうの道 (fault) へ。
+    /// 同じ表のほかのスレッドと同時に走ってよい: PTE は compare-exchange で、負けたら false (やりなおし)
+    pub fn fast_fault(&self, va: usize, write: bool) -> bool {
+        if va >= MAXVA {
+            return false;
+        }
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let (ok, put) = if self.mutators.load(Ordering::SeqCst) == 0 { self.fast_fault_inner(va, write) } else { (false, None) };
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        if let Some(old) = put {
+            // 写しとった元のページを手放す。ロックなしで元のページを読んでいる CPU がいなくなってから
+            self.quiesce();
+            kalloc::put(old);
+        }
+        ok
+    }
+
+    /// (片づいたか, あとで手放すページ)
+    fn fast_fault_inner(&self, va: usize, write: bool) -> (bool, Option<*mut u8>) {
+        use core::sync::atomic::AtomicU64;
+        let Some((_, v)) = self.find(va) else { return (false, None) };
+        if v.shared || !matches!(v.back, Backing::Anon) {
+            return (false, None);
+        }
+        let prot = v.prot;
+        if (write && prot & PROT_WRITE == 0) || prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+            return (false, None);
+        }
+        let page_va = pg_down(va);
+        let Some(pte) = self.walk(page_va, false) else { return (false, None) };
+        let slot = unsafe { AtomicU64::from_ptr(pte) };
+        let e = slot.load(Ordering::Acquire);
+        if is_swap(e) {
+            return (false, None);
+        }
+        let (new, fresh, put) = if !has_page(e) {
+            let Some(page) = kalloc::alloc() else { return (false, None) };
+            (make_pte(v2p(page as usize) as u64, prot, false), Some(page), None)
+        } else if write {
+            if e & PTE_RDONLY == 0 && e & PTE_AF != 0 {
+                // もう書ける (ほかの CPU が先に片づけた)。TLB が古いだけ
+                flush_va(page_va);
+                return (true, None);
+            }
+            let old = page_of(e);
+            if kalloc::refs(old) > 1 {
+                // 共有しているので写す
+                let Some(page) = kalloc::alloc() else { return (false, None) };
+                unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
+                (make_pte(v2p(page as usize) as u64, prot, false), Some(page), Some(old))
+            } else {
+                (make_pte(e & PTE_ADDR, prot, false), None, None)
+            }
+        } else {
+            // 読む: アクセスフラグが落ちているだけ
+            (remake_pte(e, prot, false), None, None)
+        };
+        if slot.compare_exchange(e, new, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // ほかの CPU (同じ表のスレッド) が先に変えた。もらったページは返して、やりなおし
+            if let Some(page) = fresh {
+                kalloc::free(page);
+            }
+            return (false, None);
+        }
+        flush_va(page_va);
+        (true, put)
+    }
+
     /// PTE を消した (TLB も消した) あと、ページを手放す前に: ロックなしで書いている CPU を待つ
     fn quiesce(&self) {
         fence(Ordering::SeqCst);
@@ -900,6 +1004,7 @@ impl PageTable {
 
     /// 同じ中身の新しいアドレス空間 (fork)。ページは写さずに共有し、書けるものは COW にする
     pub fn fork(&mut self) -> Option<PageTable> {
+        let _m = self.mutating();
         let mut new = PageTable::new()?;
         new.vmas = self.vmas.clone();
         let areas: Vec<(usize, usize, u8, bool)> = self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect();
@@ -965,6 +1070,7 @@ impl PageTable {
     /// clock の針から、追い出せるページを want 枚までスワップへ書き出す。追い出した数を返す。
     /// 見たページの AF が立っていれば落とすだけ (次に回ってきたときまで触れられなければ追い出す)
     pub fn swap_out(&mut self, want: usize) -> usize {
+        let _m = self.mutating();
         // 自分だけの領域を、針のところから一周
         let mut ranges = Vec::new();
         let hand = self.clock;
@@ -1032,6 +1138,7 @@ impl PageTable {
 
     /// スワップの区画 area に追い出したページを、ぜんぶ読み戻す (swapoff)。足りなければ Err
     pub fn swap_in_area(&mut self, area: usize) -> Result<(), ()> {
+        let _m = self.mutating();
         let vmas: Vec<(usize, usize, u8)> = self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot)).collect();
         let mut ok = true;
         for (s, e, prot) in vmas {
@@ -1073,6 +1180,7 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
+        let _m = self.mutating();
         let file_keys = self.shared_keys(0, MAXVA);
         fn free_level(table: *mut u64, level: usize) {
             for i in 0..512 {

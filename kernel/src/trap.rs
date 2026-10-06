@@ -149,9 +149,21 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if kind == EL1H_SYNC {
         return handle(tf, kind);
     }
-    // 自分のことを読むだけのシステムコールはロックなしで
-    if kind == EL0_SYNC && esr_far().0 >> 26 == EC_SVC64 && syscall::fast(tf) {
-        return;
+    // 自分のことを読むだけのシステムコールと、自分だけの無名の領域のページフォルトはロックなしで (smp.rs)
+    if kind == EL0_SYNC {
+        let (esr, far) = esr_far();
+        let ec = esr >> 26;
+        if ec == EC_SVC64 && syscall::fast(tf) {
+            return;
+        }
+        // データのフォルト (変換、アクセスフラグ、権限)。WnR は、キャッシュを整える命令 (CM) なら読んだことに (handle と同じ)
+        if ec == EC_DABT_LOW && (4..=15).contains(&(esr & 0x3f)) {
+            let write = esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
+            if proc::current().pt().fast_fault(far as usize, write) {
+                crate::smp::FAST_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
     }
     crate::smp::lock();
     // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に

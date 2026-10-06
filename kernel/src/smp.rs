@@ -5,6 +5,8 @@
 //   EL0 から例外で入ったらロックを取り、EL0 へ戻る直前に放す (trap.rs、forkret)。
 //   スケジューラはロックを持ったまま回し、することがなければ放して割り込みを待つ。
 // これでいままでの 1 CPU 向けのコード (static mut、RefCell) はそのまま使える。
+// ロックなしで通すもの: 自分のことを読むだけのシステムコール (syscall::fast) と、自分だけの無名の
+// 領域のページフォルト (vm.rs fast_fault。表を変える側は mutating() でそれを止めて待つ)。
 //
 // 2 つめからの CPU は DTB の cpu ノードの enable-method で起こす:
 //   psci        PSCI の CPU_ON (QEMU virt、UEFI)
@@ -134,6 +136,9 @@ static STATS: Stats = Stats {
 /// スケジューラでほかのプロセスへ切りかえた回数 (ロックを持ったまま眠ったかを見る)
 pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+/// 大きなロックなしで片づけたページフォルト (vm.rs fast_fault)
+pub static FAST_FAULTS: AtomicU64 = AtomicU64::new(0);
+
 /// 例外 1 つぶんの、ロックを持っていた時間を数える (trap.rs)。sys はシステムコールの番号
 pub enum Cause {
     Sys(u64),
@@ -168,6 +173,7 @@ pub fn stats_reset() {
         t.store(0, Ordering::Relaxed);
     }
     STATS.slept.store(0, Ordering::Relaxed);
+    FAST_FAULTS.store(0, Ordering::Relaxed);
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
 }
 
@@ -217,8 +223,8 @@ pub fn stats() -> alloc::string::String {
         s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
-    s.push_str(&format!("(途中で眠ったので数えなかったもの: {})
-", STATS.slept.load(Ordering::Relaxed)));
+    s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {})
+", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed)));
     s
 }
 
