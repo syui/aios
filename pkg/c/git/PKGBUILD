@@ -4,13 +4,14 @@
 # (Rust の std が使う _Unwind_* は Zig の libunwind)
 pkgname=git
 pkgver=2.56.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Distributed version control system (static, https via curl + mbedTLS)'
 arch=('aarch64')
 url='https://git-scm.com'
 license=('GPL-2.0-only')
 depends=('ca-certificates')
 makedepends=('rustup')
+backup=(etc/gitconfig)
 source=("https://mirrors.edge.kernel.org/pub/software/scm/git/git-$pkgver.tar.xz")
 sha256sums=('26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3')
 
@@ -30,7 +31,7 @@ _make() {
   make "$@" \
     CC="$CC" AR="$AR" CFLAGS="$CFLAGS $CPPFLAGS" LDFLAGS="$LDFLAGS -lunwind" \
     uname_S=Linux uname_M=aarch64 uname_O=GNU/Linux uname_R=6 \
-    prefix="$PREFIX" gitexecdir="$PREFIX/libexec/git-core" \
+    prefix="$PREFIX" gitexecdir="$PREFIX/libexec/git-core" sysconfdir=/etc \
     CURLDIR="$SYSROOT" CURL_LDFLAGS="-lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz" \
     ZLIB_PATH="$SYSROOT" \
     NO_OPENSSL=YesPlease NO_EXPAT=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease \
@@ -49,4 +50,8 @@ package() {
   rm -f "$pkgdir/opt/c/bin/git-cvsserver" "$pkgdir/opt/c/libexec/git-core/git-cvsserver"
   rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/opt/c/share/perl5" "$pkgdir/opt/c/share/gitweb" \
     "$pkgdir/opt/c/share/git-gui" "$pkgdir/opt/c/share/gitk" "$pkgdir/opt/c/share/bash-completion"
+  # システムの設定 (/etc/gitconfig)。aios の base には less がないので、あれば less、なければ cat で
+  # (git log などがページャーを起こせずに止まらないように)
+  install -d "$pkgdir/etc"
+  printf '[core]\n\tpager = %s\n' 'command -v less >/dev/null 2>&1 && exec less -FRX || exec cat' > "$pkgdir/etc/gitconfig"
 }

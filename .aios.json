@@ -20,7 +20,7 @@
 
   "graphics": {
     "vulkan": "lavapipe (mesa, on the CPU)", "gl": "llvmpipe (mesa, EGL / GLES)", "wsi": "Wayland (aiwm)",
-    "pkg":    "ap -S desktop mesa vulkan-loader xkeyboard-config alsa-lib",
+    "pkg":    "ap -S desktop mesa vulkan-loader xkeyboard-config alsa-lib libxkbcommon",
     "tested": ["vkcube", "ai/engine (ash + winit + cpal)"]
   },
 
