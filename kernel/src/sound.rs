@@ -86,6 +86,10 @@ const INFO_PAUSE: u32 = 0x80000;
 const MAX_BUFFER: u32 = 512 * 1024;
 /// デバイスへ一度に渡す大きさ (1 ページ)
 const CHUNK: usize = PGSIZE;
+/// 周期の最短 (µs)。カーネルの tick も QEMU が音を取りにくる間隔も 10 ms なので、それより短い周期は
+/// 間に合わない。cpal は alsa-lib の選ぶ周期 (短いほう) の 2 倍をバッファにするので、ここで止めないと
+/// 5 ms の周期と 10 ms のバッファになり、10 ms ごとにアンダーランする
+const MIN_PERIOD_US: u64 = 20_000;
 
 /// 範囲 [min, max] (端を含まない印つき)。Linux の struct snd_interval
 #[derive(Clone, Copy, PartialEq)]
@@ -432,6 +436,7 @@ fn refine(s: &Snd, h: &mut Hw) -> Result<(), i64> {
     h.narrow(P_PERIOD_BYTES, Iv::of(64, MAX_BUFFER as u64 / 2));
     h.narrow(P_BUFFER_BYTES, Iv::of(128, MAX_BUFFER as u64));
     h.narrow(P_PERIODS, Iv::of(2, 1024));
+    h.narrow(P_PERIOD_TIME, Iv::of(MIN_PERIOD_US, u32::MAX as u64));
     // 周期の数 (PERIODS) は整数でなくてよい (バッファが周期の整数倍でなくてもよい。Linux と同じ)
     for p in [P_SAMPLE_BITS, P_FRAME_BITS, P_CHANNELS, P_PERIOD_SIZE, P_PERIOD_BYTES, P_BUFFER_SIZE, P_BUFFER_BYTES] {
         let mut v = h.iv(p);
