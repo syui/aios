@@ -41,6 +41,8 @@
   配列は番号か名前 (name / mount / pid) で選ぶ
 - ふだんは `PATH = 値` の行 (sysctl と同じで、grep しやすい)。`--json` で JSON
 
+`aios top [N]` は `proc` を CPU の時間 (起動からの秒) の多い順に N 個 (10 個) だけ出す。重いものを探すとき。
+
 ## 操作 (aios do)
 
 ```sh
