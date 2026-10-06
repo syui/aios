@@ -47,6 +47,7 @@ enum Node {
     Stat(u32),
     Status(u32),
     Cmdline(u32),
+    Comm(u32),
     Cwd(u32),
     Exe(u32),
     Maps(u32),
@@ -98,6 +99,7 @@ impl ProcInode {
             Node::Stat(p) => (p as u64) << 16 | 2,
             Node::Status(p) => (p as u64) << 16 | 3,
             Node::Cmdline(p) => (p as u64) << 16 | 4,
+            Node::Comm(p) => (p as u64) << 16 | 10,
             Node::Cwd(p) => (p as u64) << 16 | 5,
             Node::Exe(p) => (p as u64) << 16 | 7,
             Node::Maps(p) => (p as u64) << 16 | 8,
@@ -109,7 +111,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Comm(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
             _ => None,
         }
     }
@@ -215,6 +217,7 @@ impl ProcInode {
                 s.push('\0');
                 s
             }
+            Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
             _ => return Err(-EISDIR),
         })
     }
@@ -407,6 +410,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
+            (Node::Pid(p), "comm") => Node::Comm(p),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
             (Node::Pid(p), "maps") => Node::Maps(p),
@@ -462,6 +466,7 @@ impl Inode for ProcInode {
                 add("stat".into(), Node::Stat(p));
                 add("status".into(), Node::Status(p));
                 add("cmdline".into(), Node::Cmdline(p));
+                add("comm".into(), Node::Comm(p));
                 add("cwd".into(), Node::Cwd(p));
                 add("exe".into(), Node::Exe(p));
                 add("maps".into(), Node::Maps(p));
