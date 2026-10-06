@@ -60,6 +60,12 @@ pub fn build(root: &Path, name: &str) -> Result<Value, String> {
     let (_, path) = crate::up::pkgbuilds(&root.join("pkg")).into_iter().find(|(n, _)| n == name).ok_or_else(|| format!("{}: no PKGBUILD", name))?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let kind = dir.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    // pkgver() は git rev-list --count を使う。浅いクローン (クラウドのセッション) だと小さな数になって、
+    // ai/repo のものより古い版に見えてしまうので、先に履歴を全部取ってくる
+    let shallow = Command::new("git").arg("-C").arg(root).args(["rev-parse", "--is-shallow-repository"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true").unwrap_or(false);
+    if shallow {
+        sh(Command::new("git").arg("-C").arg(root).args(["fetch", "-q", "--unshallow", "origin"]))?;
+    }
     let local = root.join("repo/aarch64");
     if !local.is_dir() {
         // はじめて: ai/repo の aarch64/ をそろえてから (送るときに、ほかのパッケージが消えないように)

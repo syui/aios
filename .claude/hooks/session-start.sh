@@ -18,4 +18,6 @@ if [ ${#need[@]} -gt 0 ]; then
 fi
 command -v meson >/dev/null || pip install -q --break-system-packages meson >/dev/null 2>&1
 rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+# 浅いクローンだと pkgver() (git rev-list --count) が小さくなり、パッケージが古い版に見える
+[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ] && git fetch -q --unshallow origin || true
 bin/aish-mcp.sh --build
