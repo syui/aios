@@ -6,7 +6,8 @@
 //   スケジューラはロックを持ったまま回し、することがなければ放して割り込みを待つ。
 // これでいままでの 1 CPU 向けのコード (static mut、RefCell) はそのまま使える。
 // ロックなしで通すもの: 自分のことを読むだけのシステムコール (syscall::fast) と、自分だけの無名の
-// 領域のページフォルト (vm.rs fast_fault。表を変える側は mutating() でそれを止めて待つ)。
+// 領域のページフォルト (vm.rs fast_fault。表を変える側は mutating() でそれを止めて待つ)、コンソールの
+// 送信の割り込み (uart.rs intr_fast。輪から次の文字を出すだけ)。
 //
 // 2 つめからの CPU は DTB の cpu ノードの enable-method で起こす:
 //   psci        PSCI の CPU_ON (QEMU virt、UEFI)

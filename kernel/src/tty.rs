@@ -198,17 +198,16 @@ impl Tty {
         let ocrnl = post && self.t.oflag & OCRNL != 0;
         match &mut self.dev {
             Dev::Console => {
-                let _g = uart::LOCK.lock();
+                // 輪にためて、送信の割り込みで出す (write が送り終わるのを待たない)
+                let mut out = alloc::vec::Vec::with_capacity(src.len() * 2);
                 for &c in src {
                     match c {
-                        b'\n' if onlcr => {
-                            uart::putc(b'\r');
-                            uart::putc(b'\n');
-                        }
-                        b'\r' if ocrnl => uart::putc(b'\n'),
-                        _ => uart::putc(c),
+                        b'\n' if onlcr => out.extend_from_slice(b"\r\n"),
+                        b'\r' if ocrnl => out.push(b'\n'),
+                        _ => out.push(c),
                     }
                 }
+                uart::tx_push(&out);
             }
             Dev::Pty(p) => {
                 for &c in src {
@@ -562,7 +561,8 @@ pub fn write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         {
             let mut t = tty.borrow_mut();
             let room = match &t.dev {
-                Dev::Console => usize::MAX,
+                // 1 文字が \r\n の 2 つになることがあるので半分
+                Dev::Console => uart::tx_room() / 2,
                 Dev::Pty(p) if !p.master => return Err(-EIO),
                 Dev::Pty(p) => OUTQ.saturating_sub(p.out.len()),
             };
@@ -582,7 +582,10 @@ pub fn write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
                 return if done > 0 { Ok(done) } else { Err(-EAGAIN) };
             }
         }
-        let chan = tty.borrow().chan(SWRITE);
+        let chan = match &tty.borrow().dev {
+            Dev::Console => uart::tx_chan(),
+            _ => tty.borrow().chan(SWRITE),
+        };
         if let Err(e) = proc::sleep(chan) {
             return if done > 0 { Ok(done) } else { Err(e) };
         }
