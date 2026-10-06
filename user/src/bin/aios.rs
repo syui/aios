@@ -65,6 +65,7 @@ fn main() {
     match args.first().map(String::as_str) {
         None => info(),
         Some("get") => get(&args[1..]),
+        Some("top") => top(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10)),
         Some("do") => do_(&args[1..]),
         Some("diff") => diff(),
         Some("apply") => send(serde_json::json!({ "op": "apply" }), args.iter().any(|a| a == "--json")),
@@ -88,6 +89,7 @@ fn main() {
 fn usage(code: i32) -> ! {
     eprintln!("usage: aios                       様子 (ロゴつき)");
     eprintln!("       aios get [PATH] [--json]   状態の木 ({})", state::ROOTS.join(" "));
+    eprintln!("       aios top [N]               CPU をいちばん使っているプロセス N 個 (aios get proc を CPU の順に)");
     eprintln!("       aios do service start|stop|restart|enable|disable NAME");
     eprintln!("       aios do pkg install|remove NAME... | pkg upgrade | pkg refresh");
     eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
@@ -96,6 +98,17 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios build pkg NAME|DIR [-o DIR] | install pkg FILE...   (パッケージ)");
     eprintln!("       aios tune NAME=V1,V2,... [-n N] [--apply] [--json] -- CMD...   (sysctl の値をくらべる。root)");
     std::process::exit(code)
+}
+
+/// aios top [N]: CPU の時間 (起動からの秒) の多い順
+fn top(n: usize) {
+    let Some(serde_json::Value::Array(mut ps)) = state::collect("proc") else { return };
+    ps.sort_by(|a, b| b["cpu_s"].as_f64().partial_cmp(&a["cpu_s"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+    println!("   pid  cpu s      rss  cmd");
+    for p in ps.iter().take(n) {
+        let cmd = p["cmd"].as_str().filter(|c| !c.is_empty()).map(str::to_string).unwrap_or_else(|| format!("[{}]", p["name"].as_str().unwrap_or("?")));
+        println!("{:>6} {:>6.1} {:>7}K  {}", p["pid"].as_u64().unwrap_or(0), p["cpu_s"].as_f64().unwrap_or(0.0), p["rss_kib"].as_u64().unwrap_or(0), cmd.chars().take(60).collect::<String>());
+    }
 }
 
 /// aios get [PATH] [--json]
