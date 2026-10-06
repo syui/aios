@@ -3,7 +3,7 @@
 #   データだけなので、このマシンの meson でそのまま入れる
 pkgname=xkeyboard-config
 pkgver=2.48
-pkgrel=1
+pkgrel=2
 pkgdesc='X keyboard configuration files (xkb data, used by libxkbcommon)'
 arch=('any')
 url='https://www.freedesktop.org/wiki/Software/XKeyboardConfig/'
@@ -27,5 +27,13 @@ package() {
   cd "xkeyboard-config-$pkgver"
   DESTDIR="$pkgdir" ninja -C build install
   rm -rf "$pkgdir/usr/share/man"
+  # 2.48 からデータは /usr/share/xkeyboard-config-2 で、/usr/share/X11/xkb はそこへのリンク。
+  # 前の版の /usr/share/X11/xkb (ディレクトリ) が入っているところへはリンクを置けない (ap -Syu が止まる) ので、
+  # データはいままでどおり X11/xkb に置き、新しい名前のほうをリンクにする
+  if [ -L "$pkgdir/usr/share/X11/xkb" ] && [ -d "$pkgdir/usr/share/xkeyboard-config-2" ]; then
+    rm "$pkgdir/usr/share/X11/xkb"
+    mv "$pkgdir/usr/share/xkeyboard-config-2" "$pkgdir/usr/share/X11/xkb"
+    ln -s X11/xkb "$pkgdir/usr/share/xkeyboard-config-2"
+  fi
   install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
 }
