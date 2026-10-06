@@ -589,6 +589,8 @@ pub fn scheduler() -> ! {
             p.state = State::Running;
             p.yielded = false;
             p.slice = 0;
+            // 前の印は、選びなおしたので要らない
+            take_resched();
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
@@ -674,18 +676,52 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
 
 /// chan で眠っている Proc を起こし、起こした数を返す
 pub fn wakeup(chan: usize) -> usize {
+    wake_where(|p| p.chan == chan)
+}
+
+/// 眠っているもののうち f に合うものを起こす。眠っている CPU があれば起こし、なければ
+/// 走っているもののうち一番 CPU を使っている (recent) ものにゆずらせる (preempt)
+fn wake_where(f: impl Fn(&Proc) -> bool) -> usize {
     let mut n = 0;
+    let mut woken = u32::MAX;
+    let mut busiest: Option<(u32, usize)> = None;
     for p in procs().iter_mut() {
-        if p.state == State::Sleeping && p.chan == chan {
+        if p.state == State::Sleeping && f(p) {
             p.state = State::Runnable;
+            woken = woken.min(p.recent);
             n += 1;
+        } else if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
+            busiest = Some((p.recent, p.cpu));
         }
     }
-    if n > 0 {
-        // 眠っている CPU を起こす
-        crate::smp::wake_idle();
+    if n > 0 && !crate::smp::wake_idle() {
+        if let Some((r, cpu)) = busiest {
+            preempt(woken, r, cpu);
+        }
     }
     n
+}
+
+/// CPU ごとの「EL0 へ戻るときにゆずる」印 (起こされたものを、タイムスライスの終わりまで待たせない)
+static RESCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 起こしたもの (recent が woken) が、cpu で走っているもの (recent が running) より 2 tick 以上
+/// 使っていなければ、cpu にゆずらせる。ふだん眠っているもの (音、入力、aiwm) が、計算し続けるものに
+/// 割りこめる。sysctl kernel.sched_wakeup_preempt で止められる
+fn preempt(woken: u32, running: u32, cpu: usize) {
+    use core::sync::atomic::Ordering;
+    if crate::sysctl::SCHED_WAKEUP_PREEMPT.load(Ordering::Relaxed) == 0 || running < woken.saturating_add(2) {
+        return;
+    }
+    RESCHED.fetch_or(1 << cpu, Ordering::AcqRel);
+    crate::smp::kick(cpu);
+    crate::smp::PREEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// この CPU にゆずる印がついていたら消して true (EL0 へ戻る前に見る)
+pub fn take_resched() -> bool {
+    let bit = 1 << crate::smp::id();
+    RESCHED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 && RESCHED.fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
 }
 
 /// Ctrl-P: プロセスの一覧 (デバッグ用)
@@ -727,30 +763,12 @@ pub fn poll_sleep(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> 
 /// key (パイプや端末など) が変わった: それを見張って poll で眠っているものだけを起こす
 pub fn poll_wake(key: usize) {
     let chan = poll_chan();
-    let mut n = 0;
-    for p in procs().iter_mut() {
-        if p.state == State::Sleeping && p.chan == chan && p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)) {
-            p.state = State::Runnable;
-            n += 1;
-        }
-    }
-    if n > 0 {
-        crate::smp::wake_idle();
-    }
+    wake_where(|p| p.chan == chan && p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)));
 }
 
 /// タイマから: 期限の来た Proc を起こす
 pub fn wake_expired(now: u64) {
-    let mut n = 0;
-    for p in procs().iter_mut() {
-        if p.state == State::Sleeping && p.wake_at != 0 && p.wake_at <= now {
-            p.state = State::Runnable;
-            n += 1;
-        }
-    }
-    if n > 0 {
-        crate::smp::wake_idle();
-    }
+    wake_where(|p| p.wake_at != 0 && p.wake_at <= now);
 }
 
 fn kill_proc(p: &mut Proc) {

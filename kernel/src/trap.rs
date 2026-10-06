@@ -211,6 +211,10 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
             match esr >> 26 {
                 EC_SVC64 => {
                     let intr = syscall::dispatch(tf);
+                    // 起こしたものにゆずる (自分で起こしたとき)
+                    if proc::take_resched() {
+                        proc::yield_now();
+                    }
                     proc::check_killed();
                     signal::deliver(tf, intr);
                 }
@@ -299,7 +303,8 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
             irq::complete(raw);
             // EL0 で走っていて、タイムスライスを使いきったなら順番をゆずる
             if kind == EL0_IRQ {
-                if id == timer::IRQ && proc::slice_expired() {
+                // 起こされたものにゆずる印がついていても (ほかの CPU からの IPI か、この CPU の割り込みで起こした)
+                if (id == timer::IRQ && proc::slice_expired()) | proc::take_resched() {
                     proc::yield_now();
                 }
                 proc::check_killed();
