@@ -606,6 +606,27 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             0
         }
+        // 自分のアドレス空間だけの futex (PRIVATE) で、眠らない・起こさないもの (sys_futex も見よ)
+        FUTEX if a[1] & FUTEX_PRIVATE_FLAG != 0 => match a[1] & 0x7f {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                // 値がもう val でなければ EAGAIN (Linux と同じ)。同じなら、ロックを取って眠る道へ
+                let mut cur = [0u8; 4];
+                if !p.pt().copy_in_nofault(a[0] as usize, &mut cur) || u32::from_le_bytes(cur) == a[2] as u32 {
+                    return false;
+                }
+                -EAGAIN
+            }
+            FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+                // 起こす側はユーザーが値を書いたあとに来る。眠る側は数を増やしてから値を読む (sys_futex) ので、
+                // ここで 0 なら、眠っている (これから眠る) スレッドはいない: だれも起こさずに 0
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                if p.mm().futex_sleepers.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+                    return false;
+                }
+                0
+            }
+            _ => return false,
+        },
         _ => return false,
     };
     tf.x[0] = r as u64;
@@ -1065,8 +1086,18 @@ pub fn futex_wakes(tgid: u32) -> alloc::vec::Vec<(u32, usize, u64, usize)> {
     v
 }
 
+const FUTEX_PRIVATE_FLAG: u64 = 128;
+
+/// futex で眠ろうとしている数を 1 つ増やし、落とすと戻す (起こす側の速い道が見る)
+struct FutexSleeper(&'static core::sync::atomic::AtomicUsize);
+
+impl Drop for FutexSleeper {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
-    const FUTEX_PRIVATE_FLAG: u64 = 128;
     let p = proc::current();
     // ふつうはアドレス空間とアドレスで待ち合わせる。PRIVATE でなく、共有の領域 (プロセスをまたぐ
     // pthread のミューテックスやセマフォ) なら、ページの物理アドレスで (どのプロセスからも同じ)
@@ -1077,6 +1108,12 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
     };
     match op & 0x7f {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            // 数を増やしてから値を読む: 起こす側 (fast) は値を書いてから数を読むので、
+            // どちらかが必ず相手に気づく (値が変わったのを見て EAGAIN か、数を見てふつうに起こす)
+            let sleepers: &'static core::sync::atomic::AtomicUsize = unsafe { &*(&p.mm().futex_sleepers as *const _) };
+            sleepers.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let _sleeper = FutexSleeper(sleepers);
             let mut cur = [0u8; 4];
             p.pt().copy_in(&mut cur, uaddr).ok_or(-EFAULT)?;
             if u32::from_le_bytes(cur) != val {
