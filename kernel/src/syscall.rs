@@ -620,7 +620,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
                 // 起こす側はユーザーが値を書いたあとに来る。眠る側は数を増やしてから値を読む (sys_futex) ので、
                 // ここで 0 なら、眠っている (これから眠る) スレッドはいない: だれも起こさずに 0
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                if p.mm().futex_sleepers.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+                if futex_sleepers(proc::futex_chan(p, a[0] as usize)).load(core::sync::atomic::Ordering::SeqCst) != 0 {
                     return false;
                 }
                 0
@@ -1088,6 +1088,15 @@ pub fn futex_wakes(tgid: u32) -> alloc::vec::Vec<(u32, usize, u64, usize)> {
 
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 
+/// futex で眠っている (眠ろうとしている) スレッドの数を、待ち合わせの場所 (chan) のハッシュごとに。
+/// 起こす側が大きなロックなしに「ここにはだれもいない」と知るため (fast)。眠る側は増やしてから値を読む。
+/// ハッシュがぶつかれば、起こす側がロックを取ってふつうに探すだけ
+static FUTEX_SLEEPERS: [core::sync::atomic::AtomicUsize; 1024] = [const { core::sync::atomic::AtomicUsize::new(0) }; 1024];
+
+fn futex_sleepers(chan: usize) -> &'static core::sync::atomic::AtomicUsize {
+    &FUTEX_SLEEPERS[(chan.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize]
+}
+
 /// futex で眠ろうとしている数を 1 つ増やし、落とすと戻す (起こす側の速い道が見る)
 struct FutexSleeper(&'static core::sync::atomic::AtomicUsize);
 
@@ -1110,7 +1119,7 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // 数を増やしてから値を読む: 起こす側 (fast) は値を書いてから数を読むので、
             // どちらかが必ず相手に気づく (値が変わったのを見て EAGAIN か、数を見てふつうに起こす)
-            let sleepers: &'static core::sync::atomic::AtomicUsize = unsafe { &*(&p.mm().futex_sleepers as *const _) };
+            let sleepers = futex_sleepers(chan);
             sleepers.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             let _sleeper = FutexSleeper(sleepers);
