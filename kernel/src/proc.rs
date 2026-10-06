@@ -72,6 +72,9 @@ pub struct Mm {
     pub mmap_next: usize,
     /// /proc/PID/exe
     pub exe: String,
+    /// futex で眠っている (眠ろうとしている) スレッドの数。起こす側が大きなロックなしに
+    /// 「だれもいない」と知るため (syscall.rs の fast)。眠る側は増やしてから値を読む
+    pub futex_sleepers: core::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -313,7 +316,7 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
-        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe }));
+        self.mm = Some(Shared::new(Mm { futex_sleepers: core::sync::atomic::AtomicUsize::new(0), pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -892,7 +895,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
-        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone() })
+        Shared::new(Mm { futex_sleepers: core::sync::atomic::AtomicUsize::new(0), pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone() })
     };
     let files = if flags & CLONE_FILES != 0 && thread {
         parent.files.clone().unwrap()

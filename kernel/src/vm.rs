@@ -994,6 +994,28 @@ impl PageTable {
         (true, put)
     }
 
+    /// 大きなロックなしで、もう写っているページからだけ読む (futex の速い道)。写っていなければ false
+    pub fn copy_in_nofault(&self, src: usize, dst: &mut [u8]) -> bool {
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let mut ok = true;
+        let (mut va, mut done) = (src, 0);
+        while done < dst.len() {
+            let e = self.walk(va, false).map_or(0, |p| unsafe { core::ptr::read_volatile(p) });
+            let len = (PGSIZE - (va & (PGSIZE - 1))).min(dst.len() - done);
+            if e & PTE_VALID == 0 || e & PTE_USER == 0 {
+                ok = false;
+                break;
+            }
+            let pa = (e & PTE_ADDR) as usize + (va & (PGSIZE - 1));
+            unsafe { core::ptr::copy_nonoverlapping(p2v(pa) as *const u8, dst[done..].as_mut_ptr(), len) };
+            done += len;
+            va += len;
+        }
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        ok
+    }
+
     /// PTE を消した (TLB も消した) あと、ページを手放す前に: ロックなしで書いている CPU を待つ
     fn quiesce(&self) {
         fence(Ordering::SeqCst);
