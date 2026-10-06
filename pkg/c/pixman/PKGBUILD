@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross 
   cd "pixman-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dtests=disabled -Ddemos=disabled -Dgtk=disabled -Dlibpng=disabled
   ninja -C build
 }

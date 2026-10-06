@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=pango
 pkgver=1.58.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Library for layout and rendering of text (shared, for aios)'
 arch=('aarch64')
 license=('LGPL-2.1-or-later')
@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross zlib libpng freetype2 expat fontconfig pixman pcre2 libffi glib2 harfbuzz fribidi cairo
   cd "pango-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dintrospection=disabled -Dbuild-testsuite=false -Dbuild-examples=false -Dfontconfig=enabled -Dcairo=enabled -Dxft=disabled -Dlibthai=disabled -Dsysprof=disabled -Ddocumentation=false -Dman-pages=false
   ninja -C build
 }

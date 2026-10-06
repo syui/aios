@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross 
   cd "fribidi-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Ddocs=false -Dbin=false -Dtests=false
   ninja -C build
 }

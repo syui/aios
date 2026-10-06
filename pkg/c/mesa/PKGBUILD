@@ -30,7 +30,7 @@ build() {
   # このマシンで動く wayland-scanner
   (cd "wayland-$_wlver"
    unset CC CFLAGS LDFLAGS
-   meson setup build-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
+   meson setup build --wrap-mode=nofallback-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
      -Ddtd_validation=false --prefix="$srcdir/native" --libdir=lib
    ninja -C build-native install)
   export PATH=$srcdir/native/bin:$PATH PKG_CONFIG_PATH_FOR_BUILD=$srcdir/native/lib/pkgconfig
