@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross zlib libpng freetype2 pcre2 libffi glib2
   cd "harfbuzz-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dfreetype=enabled -Dglib=enabled -Dgobject=enabled -Dicu=disabled -Dcairo=disabled -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled -Dutilities=disabled -Dbenchmark=disabled
   ninja -C build
 }

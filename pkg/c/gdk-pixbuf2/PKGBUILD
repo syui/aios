@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross zlib libpng pcre2 libffi glib2
   cd "gdk-pixbuf-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dpng=enabled -Djpeg=disabled -Dtiff=disabled -Dgif=disabled -Dothers=disabled -Dglycin=disabled -Dandroid=disabled -Dbuiltin_loaders=png -Dintrospection=disabled -Dman=false -Dgtk_doc=false -Dinstalled_tests=false -Dtests=false -Dgio_sniffing=false
   ninja -C build
 }

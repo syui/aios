@@ -22,7 +22,7 @@ build() {
   zig_env
   meson_cross pcre2 libffi zlib
   cd "glib-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dtests=false -Dintrospection=disabled -Dman-pages=disabled -Ddocumentation=false -Dselinux=disabled -Dxattr=false -Dlibmount=disabled -Dnls=disabled -Dsysprof=disabled -Dglib_debug=disabled
   ninja -C build
 }

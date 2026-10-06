@@ -19,7 +19,7 @@ prepare() {
 
 build() {
   cd "xkeyboard-config-$pkgver"
-  meson setup build --prefix=/usr -Dxorg-rules-symlinks=false -Dnls=false
+  meson setup build --wrap-mode=nofallback --prefix=/usr -Dxorg-rules-symlinks=false -Dnls=false
   ninja -C build
 }
 

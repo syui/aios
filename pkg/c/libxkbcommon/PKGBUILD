@@ -36,7 +36,7 @@ endian = 'little'
 INI
   unset CPPFLAGS LDFLAGS CFLAGS
   cd libxkbcommon
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib \
+  meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib \
     -Denable-x11=false -Denable-wayland=false -Denable-docs=false -Denable-xkbregistry=false \
     -Denable-tools=false -Denable-bash-completion=false -Dxkb-config-root=/usr/share/X11/xkb
   ninja -C build

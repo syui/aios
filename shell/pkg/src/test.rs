@@ -1,7 +1,7 @@
 // 作ったパッケージを確かめる (pkg_test)
 //   1. パッケージと、それが使うもの (.PKGINFO の depend をたどる) と musl を build/aish-pkg/test/NAME/ に広げる
 //   2. 中の ELF がみな aarch64 か
-//   3. .PKGINFO の版が PKGBUILD (pkgver-pkgrel) と同じか
+//   3. .PKGINFO の版が PKGBUILD (pkgver-pkgrel) と同じか。repo/aarch64 のほかのパッケージとファイルがぶつかっていないか
 //   4. bin/ のプログラムを --version (なければ -version、-V、version、--help) で動かす (aarch64 の上ならそのまま、ほかでは qemu-aarch64 -L 広げたところ)。
 //      1 つでも動けばよい。出力に pkgver があるかも見る
 // 通ったら build/aish-pkg/test/FILE.ok を置く。pkg_push は、変わるもののうち .ok のないものがあると止まる
@@ -148,6 +148,26 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
     let wrong: Vec<String> = elves.iter().filter(|e| !e.1).map(|e| e.0.strip_prefix(&pkgdir).unwrap_or(&e.0).display().to_string()).collect();
     ok &= wrong.is_empty();
     checks.push(json!({ "check": "aarch64", "ok": wrong.is_empty(), "elf": elves.len(), "wrong": wrong }));
+    // ほかのパッケージとファイルがぶつかっていないか (pango 1.58 が glib を抱えこんで glib2 とぶつかった)
+    let mine_rel: std::collections::HashSet<String> = mine.iter().filter_map(|p| p.strip_prefix(&pkgdir).ok()).map(|p| p.display().to_string()).collect();
+    let mut clashes: Vec<String> = Vec::new();
+    for k in KINDS {
+        for e in fs::read_dir(root.join("repo/aarch64").join(k)).into_iter().flatten().flatten() {
+            let f = e.file_name().to_string_lossy().into_owned();
+            let Some((other, _)) = crate::repo::parse(&f) else { continue };
+            if other == name {
+                continue;
+            }
+            let list = Command::new("tar").arg("-I").arg("zstd").arg("-tf").arg(e.path()).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            for l in list.lines().filter(|l| !l.ends_with('/') && *l != ".PKGINFO" && *l != ".INSTALL") {
+                if mine_rel.contains(l) {
+                    clashes.push(format!("{} ({})", l, other));
+                }
+            }
+        }
+    }
+    ok &= clashes.is_empty();
+    checks.push(json!({ "check": "files", "ok": clashes.is_empty(), "clashes": clashes.len(), "with": clashes.iter().take(5).cloned().collect::<Vec<_>>() }));
     // 動かす: bin/ の ELF を --version で
     let native = std::env::consts::ARCH == "aarch64";
     let qemu = ["qemu-aarch64-static", "qemu-aarch64"].into_iter().find(|q| Command::new(q).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok());
@@ -200,6 +220,7 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
         .iter()
         .map(|c| format!("{} {}{}", if c["ok"] == true { "ok  " } else { "FAIL" }, c["check"].as_str().unwrap_or(""), match c["check"].as_str() {
             Some("version") => format!(" {} (PKGBUILD {})", c["pkginfo"].as_str().unwrap_or(""), c["pkgbuild"].as_str().unwrap_or("")),
+            Some("files") => c["with"].as_array().filter(|w| !w.is_empty()).map_or(" no clash with other packages".to_string(), |w| format!(" {} files also in other packages: {}", c["clashes"], w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))),
             Some("aarch64") => format!(" {} ELF{}", c["elf"], c["wrong"].as_array().filter(|w| !w.is_empty()).map_or(String::new(), |w| format!(", not aarch64: {}", w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")))),
             Some("run") => c["note"].as_str().map(|n| format!(" ({})", n)).unwrap_or_else(|| {
                 c["bins"].as_array().map_or(String::new(), |bs| bs.iter().map(|b| format!("\n       {} → {} {}", b["bin"].as_str().unwrap_or(""), b["status"], b["out"].as_str().unwrap_or(""))).collect())

@@ -71,7 +71,9 @@ c_deps() {
 # meson_cross DEP...: meson で aios 用にクロスビルドする準備。c_deps DEP... (と、動かすための musl) を
 # sysroot に広げ、$srcdir/cross.ini を作る。ビルドの途中で aios 用のプログラムを動かすもの (glib など) は
 # qemu-aarch64 で動かす (exe_wrapper。Debian / Ubuntu なら qemu-user)。
-#   meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib ...
+#   meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib ...
+#   (--wrap-mode=nofallback: 足りないライブラリを subproject で自分の中にビルドさせない。pango 1.58 が
+#    glib を丸ごと抱えこんで、glib2 のパッケージとファイルがぶつかった)
 meson_cross() {
   c_deps musl "$@"
   local root=$srcdir/sysroot
