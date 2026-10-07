@@ -114,7 +114,7 @@ pub struct Shell {
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
-    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -1203,6 +1203,52 @@ impl Shell {
                         1
                     }
                 }
+            }
+            "tool" => {
+                // tool NAME [JSON | KEY=VALUE...]: プラグインのツールをシェルから呼ぶ (VALUE は JSON として読めればそれ、
+                // ほかは文字)。MCP の客がツールの新しい引数をまだ知らないとき (つなぎなおすまで) も run から使える
+                let Some(name) = a.first() else {
+                    for (plugin, t) in self.plugins.tools() {
+                        println!("{}\t(aish-{}) {}", t["name"].as_str().unwrap_or(""), plugin, t["description"].as_str().unwrap_or(""));
+                    }
+                    return 0;
+                };
+                let args = match &a[1..] {
+                    [j] if j.trim_start().starts_with('{') => match serde_json::from_str::<serde_json::Value>(j) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("tool: {}: {}", j, e);
+                            return 2;
+                        }
+                    },
+                    kv => {
+                        let mut m = serde_json::Map::new();
+                        for x in kv {
+                            let Some((k, v)) = x.split_once('=') else {
+                                eprintln!("usage: tool NAME [JSON | KEY=VALUE...]");
+                                return 2;
+                            };
+                            m.insert(k.into(), serde_json::from_str(v).unwrap_or_else(|_| serde_json::Value::String(v.into())));
+                        }
+                        serde_json::Value::Object(m)
+                    }
+                };
+                let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                let ev = serde_json::json!({ "args": args, "pwd": pwd, "home": self.get_var("HOME").unwrap_or_default(), "histfile": self.histfile.clone().unwrap_or_default() });
+                let Some(r) = self.plugins.tool(name, ev) else {
+                    eprintln!("tool: {}: no such tool (or the plugin stopped)", name);
+                    return 1;
+                };
+                // 本文は標準出力、残り (行の数などの JSON) は標準エラーへ ($(...) やパイプで本文だけ使える)
+                let (text, meta) = mcp::render_split(&r);
+                print!("{}", text);
+                if !text.is_empty() && !text.ends_with('\n') {
+                    println!();
+                }
+                if !meta.is_empty() {
+                    eprintln!("{}", meta);
+                }
+                if r.get("error").is_some() { 1 } else { 0 }
             }
             "bindkey" => match a {
                 [] => {

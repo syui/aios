@@ -33,6 +33,9 @@ struct Plugin {
     why: Option<String>,
     /// 起こしたときのプログラムのファイル (ビルドしなおしたかを check で見る)
     file: Option<FileId>,
+    /// 起こしたときの引数と hello (fork した子が、一度だけ別に起こすとき)
+    args: Vec<String>,
+    hello: Value,
 }
 
 /// ファイルの i-node と変えた時刻。cargo はビルドするとファイルを作りなおすので、どちらかが変わる
@@ -188,11 +191,11 @@ impl Plugins {
         let file = FileId::of(&prog);
         let mut child = cmd.spawn().map_err(|e| format!("{}: {}", prog, e))?;
         let (w, r) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file };
         let mut hello = json!({ "ev": "hello", "version": 2, "shell": "aish", "args": args, "home": home });
         if let (Some(h), Some(e)) = (hello.as_object_mut(), extra.as_object()) {
             h.extend(e.clone());
         }
+        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file, args: args.to_vec(), hello: hello.clone() };
         let Some(reply) = p.ask(&hello, false) else { return Err(format!("{}: no answer to hello", name)) };
         if let Some(n) = reply["name"].as_str() {
             p.name = n.to_string();
@@ -319,13 +322,25 @@ impl Plugins {
 
     /// 端末なしの機能を呼ぶ (名前が同じなら先に読んだもの)。答えを待ちつづける
     pub fn tool(&mut self, name: &str, mut ev: Value) -> Option<Value> {
-        if !self.mine() {
-            return None;
-        }
         ev["ev"] = json!("tool");
         ev["name"] = json!(name);
+        if !self.mine() {
+            return self.tool_once(name, &ev);
+        }
         let p = self.list.iter_mut().find(|p| p.alive && p.tools.iter().any(|t| t["name"] == name))?;
         p.ask(&ev, true)
+    }
+
+    /// fork した子 (パイプラインや $(...)) から: 親のつなぎ口は使わず、同じプラグインを一度だけ起こして聞く
+    fn tool_once(&self, name: &str, ev: &Value) -> Option<Value> {
+        let src = self.list.iter().find(|p| p.alive && p.tools.iter().any(|t| t["name"] == name))?;
+        let mut child = std::process::Command::new(&src.prog).args(&src.args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().ok()?;
+        let (w, r) = (child.stdin.take()?, child.stdout.take()?);
+        let mut p = Plugin { name: src.name.clone(), prog: src.prog.clone(), child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file: None, args: Vec::new(), hello: Value::Null };
+        let r = p.ask(&src.hello, false).and_then(|_| p.ask(ev, true));
+        drop(p.w);
+        let _ = p.child.wait();
+        r
     }
 
     /// キーに結んだ機能を呼ぶ (端末で人と話すかもしれないので待ちつづける)
