@@ -3,10 +3,13 @@
 //   /proc/self          -> 自分の PID
 //   /proc/PID/stat      Linux と同じ並びの 1 行
 //   /proc/PID/status    Name, State, Pid, Uid など
-//   /proc/PID/cmdline   (いまは comm だけ)
+//   /proc/PID/cmdline   引数 (NUL で区切る。プロセスのメモリの argv の文字列から)
+//   /proc/PID/environ   環境 (同じく。自分のものか root だけ)
+//   /proc/PID/statm     メモリ (ページ): size resident shared text lib data dt
 //   /proc/PID/cwd       -> カレントディレクトリ
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
+//   /proc/stat (CPU の時間、btime、processes ...), /proc/loadavg, /proc/version (ps や top、psutil が読む)
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 //   /proc/sys/...       カーネルの値 (sysctl.rs の表。root は書ける)
 use crate::proc::{self, Proc, State};
@@ -39,6 +42,9 @@ enum Node {
     Route,
     KernelCmdline,
     CpuInfo,
+    StatAll,
+    Loadavg,
+    Version,
     /// /proc/sys の下のディレクトリ: sysctl の表の番号と、そのパスのはじめのいくつか
     SysDir(u16, u8),
     /// /proc/sys の下のファイル: sysctl の表の番号
@@ -47,8 +53,11 @@ enum Node {
     Stat(u32),
     Status(u32),
     Cmdline(u32),
+    Environ(u32),
+    Statm(u32),
     Comm(u32),
     Cwd(u32),
+    RootLink(u32),
     Exe(u32),
     Maps(u32),
     Stack(u32),
@@ -85,6 +94,9 @@ impl ProcInode {
             Node::Pnp => 7,
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
+            Node::StatAll => 13,
+            Node::Loadavg => 14,
+            Node::Version => 15,
             Node::Swaps => 10,
             Node::Threads => 31,
             Node::Strace => 32,
@@ -100,7 +112,10 @@ impl ProcInode {
             Node::Status(p) => (p as u64) << 16 | 3,
             Node::Cmdline(p) => (p as u64) << 16 | 4,
             Node::Comm(p) => (p as u64) << 16 | 10,
+            Node::Environ(p) => (p as u64) << 16 | 11,
+            Node::Statm(p) => (p as u64) << 16 | 12,
             Node::Cwd(p) => (p as u64) << 16 | 5,
+            Node::RootLink(p) => (p as u64) << 16 | 13,
             Node::Exe(p) => (p as u64) << 16 | 7,
             Node::Maps(p) => (p as u64) << 16 | 8,
             Node::Stack(p) => (p as u64) << 16 | 9,
@@ -111,7 +126,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Comm(p) | Node::Cwd(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
             _ => None,
         }
     }
@@ -215,14 +230,76 @@ impl ProcInode {
                 )
             }
             Node::Cmdline(pid) => {
-                let mut s = leader(pid)?.comm().to_string();
-                s.push('\0');
-                s
+                let p = leader(pid)?;
+                let (a, e, _) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
+                match user_bytes(p, a, e) {
+                    Some(b) if !b.is_empty() => String::from_utf8_lossy(&b).into_owned(),
+                    // カーネルのスレッドや、読めないとき: Linux はカーネルのスレッドなら空。comm を出す
+                    _ => format!("{}\0", p.comm()),
+                }
             }
+            Node::Environ(pid) => {
+                let p = leader(pid)?;
+                let me = crate::cred::current();
+                if me.euid != 0 && me.euid != p.cred.uid {
+                    return Err(-EACCES);
+                }
+                let (_, e, end) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
+                String::from_utf8_lossy(&user_bytes(p, e, end).unwrap_or_default()).into_owned()
+            }
+            Node::Statm(pid) => {
+                let p = leader(pid)?;
+                let (vsize, rss) = mem_of(p);
+                format!("{} {} 0 0 0 {} 0\n", vsize / crate::memlayout::PGSIZE, rss, rss)
+            }
+            Node::StatAll => stat_all(),
+            Node::Loadavg => {
+                use core::sync::atomic::Ordering::Relaxed;
+                let f = |i: usize| {
+                    let v = proc::LOAD[i].load(Relaxed);
+                    format!("{}.{:02}", v >> 11, ((v & 2047) * 100) >> 11)
+                };
+                let total = proc::nr_threads();
+                format!("{} {} {} {}/{} {}\n", f(0), f(1), f(2), proc::nr_running(), total, proc::last_pid())
+            }
+            Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
             _ => return Err(-EISDIR),
         })
     }
+}
+
+/// プロセスのメモリの [start, end) (引数や環境の文字列。64 KiB まで)
+fn user_bytes(p: &mut Proc, start: usize, end: usize) -> Option<Vec<u8>> {
+    if start == 0 || end <= start {
+        return None;
+    }
+    let mut b = alloc::vec![0u8; (end - start).min(64 << 10)];
+    p.mm().pt.copy_in(&mut b, start)?;
+    Some(b)
+}
+
+/// /proc/stat: CPU ごとの時間 (tick。user と idle だけ数える)、起動した時刻、作ったプロセスの数など
+fn stat_all() -> String {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::timer::ticks();
+    let n = crate::smp::online();
+    let busy: Vec<u64> = (0..n).map(|c| proc::BUSY[c].load(Relaxed).min(now)).collect();
+    let line = |name: &str, u: u64, idle: u64| format!("{} {} 0 0 {} 0 0 0 0 0 0\n", name, u, idle);
+    let mut s = line("cpu", busy.iter().sum(), busy.iter().map(|b| now - b).sum());
+    for (c, b) in busy.iter().enumerate() {
+        s += &line(&format!("cpu{}", c), *b, now - b);
+    }
+    let boot = (crate::timer::epoch_ns() / 1_000_000_000).saturating_sub(now / crate::timer::HZ);
+    let blocked = 0;
+    s += &format!(
+        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
+        boot,
+        proc::last_pid(),
+        proc::nr_running(),
+        blocked
+    );
+    s
 }
 
 fn state_char(p: &Proc) -> char {
@@ -263,7 +340,7 @@ fn stat_line(p: &Proc) -> String {
     let (tty_nr, tpgid) = crate::tty::of_session(p.sid).map_or((0, -1), |(rdev, pg)| (rdev, pg as i64));
     let threads = proc::threads_of(p.tgid).len();
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 0 {} {}",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {}",
         p.tgid,
         p.comm(),
         state_char(p),
@@ -275,6 +352,7 @@ fn stat_line(p: &Proc) -> String {
         proc::group_utime(p.tgid),
         p.cutime,
         threads,
+        p.start,
         mem_of(p).0,
         mem_of(p).1
     );
@@ -341,7 +419,7 @@ impl Inode for ProcInode {
             Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) => S_IFDIR | 0o555,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
-            Node::SelfLink | Node::Cwd(_) | Node::Exe(_) => S_IFLNK | 0o777,
+            Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
             Node::Strace | Node::Bkl => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
@@ -396,6 +474,8 @@ impl Inode for ProcInode {
         match self.node {
             Node::SelfLink => Ok(format!("{}", proc::current().tgid)),
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),
+            // chroot していれば、その場所 (pidof はこれが自分と同じものだけ探す)
+            Node::RootLink(pid) => Ok(format!("/{}", leader(pid)?.files().root)),
             Node::Exe(pid) => {
                 let p = leader(pid)?;
                 p.mm.as_ref().ok_or(-ENOENT)?;
@@ -412,6 +492,9 @@ impl Inode for ProcInode {
             (Node::Root, "self") => Node::SelfLink,
             (Node::Root, "mounts") => Node::Mounts,
             (Node::Root, "uptime") => Node::Uptime,
+            (Node::Root, "stat") => Node::StatAll,
+            (Node::Root, "loadavg") => Node::Loadavg,
+            (Node::Root, "version") => Node::Version,
             (Node::Root, "cmdline") => Node::KernelCmdline,
             (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
@@ -434,8 +517,11 @@ impl Inode for ProcInode {
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
+            (Node::Pid(p), "environ") => Node::Environ(p),
+            (Node::Pid(p), "statm") => Node::Statm(p),
             (Node::Pid(p), "comm") => Node::Comm(p),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
+            (Node::Pid(p), "root") => Node::RootLink(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
             (Node::Pid(p), "maps") => Node::Maps(p),
             (Node::Pid(p), "stack") => Node::Stack(p),
@@ -461,6 +547,9 @@ impl Inode for ProcInode {
                 add("self".into(), Node::SelfLink);
                 add("mounts".into(), Node::Mounts);
                 add("uptime".into(), Node::Uptime);
+                add("stat".into(), Node::StatAll);
+                add("loadavg".into(), Node::Loadavg);
+                add("version".into(), Node::Version);
                 add("cmdline".into(), Node::KernelCmdline);
                 add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);
@@ -490,8 +579,11 @@ impl Inode for ProcInode {
                 add("stat".into(), Node::Stat(p));
                 add("status".into(), Node::Status(p));
                 add("cmdline".into(), Node::Cmdline(p));
+                add("environ".into(), Node::Environ(p));
+                add("statm".into(), Node::Statm(p));
                 add("comm".into(), Node::Comm(p));
                 add("cwd".into(), Node::Cwd(p));
+                add("root".into(), Node::RootLink(p));
                 add("exe".into(), Node::Exe(p));
                 add("maps".into(), Node::Maps(p));
                 add("stack".into(), Node::Stack(p));
