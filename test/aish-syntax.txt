@@ -33,3 +33,11 @@ echo $((3 * (2 + 1)))	9
 case abc in a*) echo yes;; *) echo no;; esac	yes
 x=abc; echo ${x#a} ${x%c} ${#x}	bc ab 3
 echo "$(echo nested $(echo deep))"	nested deep
+echo $((2**10)) $((2**3**2)) $((3*2**2))	1024 512 12
+tr a-z A-Z <<< "v $((1+1))"	V 2
+read a b <<< "1 2"; echo $b	2
+cat <(echo hi) <(echo yo)	hi|yo
+while read l; do echo "g$l"; done < <(seq 2)	g1|g2
+diff <(echo a) <(echo a) && echo same	same
+f() { cat "$1"; }; f <(echo infunc)	infunc
+echo "<(no)" '>(no)'	<(no) >(no)

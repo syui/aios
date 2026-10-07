@@ -6,7 +6,7 @@
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
-#   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。小さなもの向け、1 MB まで)
+#   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。4 MB まで)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
 #   test/vm.py log [N]             シリアルの終わりの N 行 (既定 40)
 #   test/vm.py status / stop
@@ -123,6 +123,25 @@ class Serve:
             text = text[text.find('\n', i) + 1:] if '\n' in text[i:] else ''
         return {'status': int(mm.group(1)), 'out': clean(text)}
 
+    def put(self, path, b64, timeout=600):
+        # プロンプトで長い行を打つと、aish が 1 文字ごとに描きなおして遅いので、base64 -d を先に起こして、
+        # その標準入力 (端末のふつうの行の入力) へ流しこむ。終わりは Ctrl-D
+        import shlex
+        tag = 'VMEND%d' % int(time.time() * 1000)
+        with self.cv:
+            self.buf = b''
+        os.write(self.m, ('base64 -d > %s; echo %s $?\r' % (shlex.quote(path), tag)).encode())
+        time.sleep(1)
+        for i in range(0, len(b64), 4096):
+            os.write(self.m, b64[i:i + 4096].replace('\n', '\r').encode())
+        os.write(self.m, b'\x04')
+        out, mm = self.wait_for(re.compile((tag + r' (\d+)\r*\n').encode()), timeout)
+        if out is None:
+            os.write(self.m, b'\x03')
+            self.wait_for(PROMPT, 5)
+            return {'timeout': True}
+        return {'status': int(mm.group(1))}
+
     def type(self, text):
         c = socket.socket(socket.AF_UNIX)
         c.connect(MON)
@@ -189,6 +208,8 @@ def serve(www):
                 r = dict(ready, error='aios did not reach the prompt (see log)')
             elif op == 'run':
                 r = vm.run(req['cmd'], req.get('timeout', 600))
+            elif op == 'put':
+                r = vm.put(req['path'], req['b64'])
             elif op == 'type':
                 vm.type(req['text'])
                 r = {}
@@ -259,18 +280,11 @@ def main():
     elif op == 'type':
         ask({'op': 'type', 'text': a[1].replace('\\n', '\n')})
     elif op == 'put':
-        import base64, shlex
+        import base64
         data = open(a[1], 'rb').read()
-        if len(data) > 1 << 20:
-            sys.exit('vm: put is for small files (1 MB)')
-        b = base64.b64encode(data).decode()
-        tmp = shlex.quote(a[2] + '.b64')
-        ask({'op': 'run', 'cmd': ': > ' + tmp, 'timeout': 30})
-        for i in range(0, len(b), 2000):
-            r = ask({'op': 'run', 'cmd': "printf %s '" + b[i:i + 2000] + "' >> " + tmp, 'timeout': 30})
-            if r.get('status') != 0:
-                sys.exit('vm: put: %s' % json.dumps(r))
-        r = ask({'op': 'run', 'cmd': 'base64 -d ' + tmp + ' > ' + shlex.quote(a[2]) + ' && rm ' + tmp, 'timeout': 30})
+        if len(data) > 4 << 20:
+            sys.exit('vm: put is for small files (4 MB)')
+        r = ask({'op': 'put', 'path': a[2], 'b64': base64.encodebytes(data).decode()})
         if r.get('status') != 0:
             sys.exit('vm: put: %s' % json.dumps(r))
     elif op == 'mon':
