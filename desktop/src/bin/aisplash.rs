@@ -27,7 +27,7 @@ fn uname() -> String {
 fn main() {
     // 版だけ (画面や Wayland を開く前に。aish-pkg test が動くか確かめるのに使う)
     if std::env::args().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
-        println!("aisplash %s", env!("CARGO_PKG_VERSION"));
+        println!("aisplash {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     let secs: i32 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(30);
