@@ -7,6 +7,7 @@
 //   aipkg -U file...    パッケージファイルを入れる
 //   aipkg -R pkg...     外す
 //   aipkg -Q / -Qi / -Ql [pkg]  入っているもの / 情報 / ファイル一覧
+//   aipkg -Qo FILE...          そのファイルのパッケージ (/ のない名前は PATH から)
 //
 // 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)。
 // どのリポジトリも、Server のところの db は aios.db (aarch64/rust/aios.db, aarch64/c/aios.db)。
@@ -859,7 +860,7 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(op) = args.first().filter(|a| a.starts_with('-') && !a.starts_with("--")) else {
-        eprintln!("usage: aipkg -S|-Sy|-Syu|-Ss|-Si|-U|-R|-Q|-Qi|-Ql [targets]");
+        eprintln!("usage: aipkg -S|-Sy|-Syu|-Ss|-Si|-U|-R|-Q|-Qi|-Ql|-Qo [targets]");
         exit(1);
     };
     let flags: BTreeSet<char> = op[1..].chars().collect();
@@ -894,6 +895,38 @@ fn main() {
         }
     } else if flags.contains(&'R') {
         remove(&targets);
+    } else if flags.contains(&'Q') && flags.contains(&'o') {
+        // -Qo FILE: どのパッケージのファイルか (pacman と同じ。/ のない名前は PATH から)
+        let db = installed();
+        let mut st = 0;
+        for t in &targets {
+            let path = if t.contains('/') {
+                std::path::PathBuf::from(t)
+            } else {
+                match std::env::var("PATH").unwrap_or_default().split(':').map(|d| std::path::Path::new(d).join(t)).find(|p| p.exists()) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("error: failed to find '{}' in PATH", t);
+                        st = 1;
+                        continue;
+                    }
+                }
+            };
+            // ディレクトリのリンク (/bin → usr/bin など) はたどる。ファイルそのもののリンクはたどらない
+            let abs = std::fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")))
+                .map(|d| d.join(path.file_name().unwrap_or_default()))
+                .unwrap_or(path.clone());
+            let rel = abs.to_string_lossy().trim_start_matches('/').to_string();
+            let owners: Vec<_> = db.iter().filter(|(_, (_, files))| files.iter().any(|f| f.trim_end_matches('/') == rel)).collect();
+            if owners.is_empty() {
+                eprintln!("error: No package owns {}", abs.display());
+                st = 1;
+            }
+            for (name, (d, _)) in owners {
+                println!("{} is owned by {} {}", abs.display(), name, get(d, "VERSION"));
+            }
+        }
+        exit(st);
     } else if flags.contains(&'Q') {
         let db = installed();
         let pick: Vec<(&String, &(Desc, Vec<String>))> = if targets.is_empty() {
