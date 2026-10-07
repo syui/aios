@@ -116,7 +116,7 @@ pub struct Shell {
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
-    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool",
+    "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool", "hash",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -1466,6 +1466,18 @@ impl Shell {
                 self.execve(&prog, a);
                 eprintln!("{}: {}: {}", shell_name(), a[0], last_err());
                 exit_shell(126)
+            }
+            // hash: aish はコマンドの場所を覚えない (毎回 PATH から探す) ので、hash -r は何もしない。
+            // hash NAME は、見つからなければ 1 (bash と同じ。スクリプトが「入っているか」に使う)
+            "hash" => {
+                let mut st = 0;
+                for x in a.iter().filter(|x| !x.starts_with('-')) {
+                    if !BUILTINS.contains(&x.as_str()) && self.find(x).is_none_or(|p| std::fs::metadata(p).is_err()) {
+                        eprintln!("{}: hash: {}: not found", shell_name(), x);
+                        st = 1;
+                    }
+                }
+                st
             }
             "command" | "type" => {
                 let verbose = name == "type";

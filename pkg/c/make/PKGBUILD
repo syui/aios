@@ -1,0 +1,32 @@
+# make: GNU make。Makefile のあるものをビルドする (base-devel に入る)
+#   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る
+pkgname=make
+pkgver=4.4.1
+pkgrel=1
+pkgdesc='GNU make utility to maintain groups of programs (static, for aios)'
+arch=('aarch64')
+url='https://www.gnu.org/software/make/'
+license=('GPL-3.0-or-later')
+source=("https://ftp.gnu.org/gnu/make/make-$pkgver.tar.gz")
+sha256sums=('dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3')
+
+prepare() {
+  rm -rf "make-$pkgver"
+  tar -xzf "make-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "make-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-nls --without-guile
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "make-$pkgver"
+  install -Dm755 make "$pkgdir$PREFIX/bin/make"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

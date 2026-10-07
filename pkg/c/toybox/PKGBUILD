@@ -1,10 +1,11 @@
-# toybox: ネットワークの小さな道具だけ (nc / netcat、ping、netstat、host、traceroute)。
+# toybox: ほかのパッケージにない小さな道具だけ: ネットワーク (nc / netcat、ping、netstat、host、traceroute)、
+#   lsof、bc、rev、getconf、iconv。
 #   ほかのコマンドは coreutils などにあるので入れない。静的なバイナリ 1 つと、名前ごとのリンクで /opt/c に入る
 #   ping はカーネルの ping ソケット (SOCK_DGRAM + IPPROTO_ICMP) を使う (root でなくてよい)
 pkgname=toybox
 pkgver=0.8.15
-pkgrel=1
-pkgdesc='Network tools from toybox: nc, ping, netstat, host, traceroute (static, for aios)'
+pkgrel=2
+pkgdesc='Small tools from toybox: nc, ping, netstat, host, traceroute, lsof, bc, rev, getconf, iconv (static, for aios)'
 arch=('aarch64')
 url='https://landley.net/toybox/'
 license=('0BSD')
@@ -13,7 +14,7 @@ sha256sums=('44e2bab43dfe2c171743297631ce558c6d9ed38b87a66fd751cef617574b375e')
 _latest_url=https://landley.net/toybox/downloads/
 _latest_regex='toybox-([0-9.]+)\.tar\.gz'
 
-_cmds='netcat ping netstat host traceroute'
+_cmds='netcat ping netstat host traceroute lsof bc rev getconf iconv'
 
 prepare() {
   rm -rf "toybox-$pkgver"
@@ -41,7 +42,7 @@ package() {
   cd "toybox-$pkgver"
   local d="$pkgdir/opt/c/bin" c
   install -Dm755 toybox "$d/toybox"
-  for c in nc netcat ping ping6 netstat host traceroute traceroute6; do
+  for c in nc netcat ping ping6 netstat host traceroute traceroute6 lsof bc rev getconf iconv; do
     ln -s toybox "$d/$c"
   done
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
