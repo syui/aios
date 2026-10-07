@@ -11,4 +11,4 @@ test = false
 bench = false
 
 [dependencies]
-smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-dhcpv4"] }
+smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4"] }
