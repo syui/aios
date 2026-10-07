@@ -566,7 +566,8 @@ fn cut(s: String, id: Option<u64>) -> String {
 
 /// 答えを読む形にする (Claude が読む content の text)。プロトコルとしての答えは structuredContent の JSON のまま。
 /// 出力や文書 (out err text) は JSON の中にエスケープせずにそのまま出し、ほかのものは終わりに 1 行の JSON で。
-/// grep の matches はファイルごとにまとめる: パスの行のあとに 1 行に 1 つ (n line: text、前後の行は n のかわりに -)
+/// grep の matches はファイルごとにまとめる: パスの行のあとに 1 行に 1 つ (n line: text、前後の行は n のかわりに -)。
+/// where と outline の items も 1 行に 1 つ
 fn render(r: &Value) -> String {
     let Some(o) = r.as_object() else { return r.to_string() };
     let mut s = String::new();
@@ -575,6 +576,17 @@ fn render(r: &Value) -> String {
         match (k.as_str(), v) {
             ("out" | "text", Value::String(t)) => s.push_str(t),
             ("err", Value::String(_)) => {}
+            // where と outline (aish-map) の items: 1 行に 1 つ。where は path:line kind name: text、
+            // outline は字下げして line kind name (JSON のままより短く、grep の答えと同じように読める)
+            ("items", Value::Array(items)) if items.iter().all(|i| i["line"].is_u64() && i["name"].is_string()) => {
+                for i in items {
+                    let (line, kind, name) = (i["line"].as_u64().unwrap_or(0), i["kind"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
+                    match i["path"].as_str() {
+                        Some(p) => s.push_str(&format!("{}:{} {} {}: {}\n", p, line, kind, name, i["text"].as_str().unwrap_or("").trim())),
+                        None => s.push_str(&format!("{}{} {} {}\n", "  ".repeat(i["indent"].as_u64().unwrap_or(0) as usize), line, kind, name)),
+                    }
+                }
+            }
             ("matches", Value::Array(ms)) => {
                 let mut last = "";
                 for m in ms {
@@ -594,7 +606,7 @@ fn render(r: &Value) -> String {
         }
     }
     // out と text のないもの (edit の答えなど) は、いままでどおり JSON だけ
-    if s.is_empty() && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") {
+    if s.is_empty() && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") && !o.contains_key("items") {
         return r.to_string();
     }
     if !s.is_empty() && !s.ends_with('\n') {
