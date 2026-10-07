@@ -449,6 +449,7 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
         Err(e) => return error(format!("{}: {}", path.display(), e)),
     };
     let mut replaced = 0;
+    let mut spans: Vec<(usize, usize)> = vec![];
     for (i, e) in list.iter().enumerate() {
         // いくつもあるときは、どれでしくじったか (edits の何番目か) を言う
         let at = if list.len() > 1 { format!(" (edits[{}])", i) } else { String::new() };
@@ -464,13 +465,67 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
         if n > 1 && !all {
             return error(format!("{}: old found {} times (make it longer, or all: true){}", path.display(), n, at));
         }
-        text = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
-        replaced += if all { n } else { 1 };
+        // うしろから置きかえ、変えたところ (バイトの場所と長さ) を覚えておく。前のものの場所はずらす
+        let idxs: Vec<usize> = if all { text.match_indices(old).map(|(i, _)| i).collect() } else { text.find(old).into_iter().collect() };
+        for &p in idxs.iter().rev() {
+            text.replace_range(p..p + old.len(), new);
+            let d = new.len() as isize - old.len() as isize;
+            for sp in spans.iter_mut() {
+                if sp.0 > p {
+                    sp.0 = (sp.0 as isize + d) as usize;
+                }
+            }
+            spans.push((p, new.len()));
+        }
+        replaced += idxs.len();
     }
     match write(path, text.as_bytes(), snaps) {
         r if r.get("error").is_some() => r,
-        _ => json!({ "path": path.display().to_string(), "replaced": replaced }),
+        _ => {
+            let (lines, shown) = around(&text, &spans);
+            json!({ "path": path.display().to_string(), "replaced": replaced, "lines": lines, "text": shown })
+        }
     }
+}
+
+/// 変えたところ (spans) の行と、前後 2 行を read と同じ形で (40 行まで)。答えの lines は変えた行の番号
+fn around(text: &str, spans: &[(usize, usize)]) -> (Vec<usize>, String) {
+    let all: Vec<&str> = text.lines().collect();
+    let mut changed: Vec<(usize, usize)> = spans
+        .iter()
+        .map(|&(p, len)| {
+            let a = text[..p.min(text.len())].matches('\n').count() + 1;
+            let b = a + text[p.min(text.len())..(p + len).min(text.len())].matches('\n').count();
+            (a, b)
+        })
+        .collect();
+    changed.sort();
+    let mut show: Vec<(usize, usize)> = vec![];
+    for &(a, b) in &changed {
+        let (x, y) = (a.saturating_sub(2).max(1), (b + 2).min(all.len().max(1)));
+        match show.last_mut() {
+            Some(l) if x <= l.1 + 1 => l.1 = l.1.max(y),
+            _ => show.push((x, y)),
+        }
+    }
+    let mut out = String::new();
+    let mut n = 0;
+    for (k, &(x, y)) in show.iter().enumerate() {
+        if k > 0 {
+            out.push_str("   ...\n");
+        }
+        for i in x..=y {
+            if n == 40 {
+                out.push_str("   ... (more changes)\n");
+                return (changed.iter().map(|c| c.0).collect(), out);
+            }
+            if let Some(l) = all.get(i - 1) {
+                out.push_str(&format!("{:6}\t{}\n", i, l));
+                n += 1;
+            }
+        }
+    }
+    (changed.iter().map(|c| c.0).collect(), out)
 }
 
 fn hit(a: &Value, hits: &[Hit]) -> Value {
