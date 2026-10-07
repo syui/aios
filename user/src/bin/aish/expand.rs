@@ -1,6 +1,7 @@
 // 語の展開: ~、$NAME ${...} $(...) `...` $((...))、クォート、IFS で分ける、ワイルドカード
 use crate::Shell;
 use crate::glob::{self, GLOB_ONE, GLOB_SET, GLOB_STAR};
+use crate::parse;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -101,9 +102,165 @@ fn matching(cs: &[char], i: usize, open: char, close: char) -> usize {
     cs.len()
 }
 
+/// ブレース展開 (bash と zsh): a{b,c}d → abd acd、{1..3} → 1 2 3、{a..c} → a b c。
+/// クォートの中、${...}、$(...) の中は見ない。広げるものがなければ None
+pub fn braces(w: &str) -> Option<Vec<String>> {
+    let cs: Vec<char> = w.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 2,
+            '\'' => {
+                i += 1;
+                while i < cs.len() && cs[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                i += 1;
+                while i < cs.len() && cs[i] != '"' {
+                    if cs[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '$' if matches!(cs.get(i + 1), Some('{' | '(')) => {
+                let (o, c) = if cs[i + 1] == '{' { ('{', '}') } else { ('(', ')') };
+                i = matching(&cs, i + 1, o, c) + 1;
+            }
+            '{' => {
+                // 対になる } と、いちばん外の , を探す
+                let mut depth = 0;
+                let mut j = i;
+                let mut commas = vec![];
+                let mut end = None;
+                while j < cs.len() {
+                    match cs[j] {
+                        '\\' => j += 1,
+                        '\'' | '"' => {
+                            let q = cs[j];
+                            j += 1;
+                            while j < cs.len() && cs[j] != q {
+                                j += 1;
+                            }
+                        }
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(j);
+                                break;
+                            }
+                        }
+                        ',' if depth == 1 => commas.push(j),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let Some(e) = end else { return None };
+                let pre: String = cs[..i].iter().collect();
+                let post: String = cs[e + 1..].iter().collect();
+                let inner: String = cs[i + 1..e].iter().collect();
+                let items: Vec<String> = if !commas.is_empty() {
+                    let mut v = vec![];
+                    let mut st = i + 1;
+                    for &c in commas.iter().chain(std::iter::once(&e)) {
+                        v.push(cs[st..c].iter().collect());
+                        st = c + 1;
+                    }
+                    v
+                } else if let Some(r) = range(&inner) {
+                    r
+                } else {
+                    // {x} や ${ でないただの { は、そのまま (find -exec {} など)。その先を見る
+                    i += 1;
+                    continue;
+                };
+                let mut out = vec![];
+                for it in items {
+                    let w = format!("{}{}{}", pre, it, post);
+                    match braces(&w) {
+                        Some(v) => out.extend(v),
+                        None => out.push(w),
+                    }
+                }
+                return Some(out);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 語の終わりの zsh の修飾 (N) (.) (/) (@) とその前
+pub fn glob_qualifier(w: &str) -> Option<(&str, String)> {
+    let base = w.strip_suffix(')')?;
+    let k = base.rfind('(')?;
+    let q = &base[k + 1..];
+    if q.is_empty() || !q.chars().all(|c| matches!(c, 'N' | '.' | '/' | '@')) {
+        return None;
+    }
+    let base = &base[..k];
+    // ワイルドカードのない語 (a(/) や top.rs(.)) にも、zsh と同じく修飾をつけられる
+    (!base.is_empty()).then(|| (base, q.to_string()))
+}
+
+/// {1..5} {5..1} {01..10} {a..e} {1..10..2} の中身
+fn range(s: &str) -> Option<Vec<String>> {
+    let p: Vec<&str> = s.split("..").collect();
+    if !(2..=3).contains(&p.len()) {
+        return None;
+    }
+    let step: i64 = p.get(2).map_or(Some(1), |x| x.parse::<i64>().ok().map(|n| n.abs().max(1)))?;
+    if let (Ok(a), Ok(b)) = (p[0].parse::<i64>(), p[1].parse::<i64>()) {
+        // 0 で始まるものは桁をそろえる
+        let width = if (p[0].starts_with('0') && p[0].len() > 1) || (p[1].starts_with('0') && p[1].len() > 1) { p[0].len().max(p[1].len()) } else { 0 };
+        let n = ((a - b).abs() / step + 1) as usize;
+        if n > 100_000 {
+            return None;
+        }
+        let dir = if a <= b { step } else { -step };
+        return Some((0..n).map(|k| format!("{:0w$}", a + dir * k as i64, w = width)).collect());
+    }
+    let (a, b): (Vec<char>, Vec<char>) = (p[0].chars().collect(), p[1].chars().collect());
+    if a.len() == 1 && b.len() == 1 && a[0].is_ascii_alphabetic() && b[0].is_ascii_alphabetic() {
+        let (x, y) = (a[0] as i64, b[0] as i64);
+        let n = ((x - y).abs() / step + 1) as usize;
+        let dir = if x <= y { step } else { -step };
+        return Some((0..n).map(|k| char::from_u32((x + dir * k as i64) as u32).unwrap_or('?').to_string()).collect());
+    }
+    None
+}
+
 impl Shell {
     /// 語を展開する。Fields なら 0 個以上の語、ほかは 1 つ
     pub fn expand(&mut self, w: &str, mode: Mode) -> Result<Vec<String>, String> {
+        // ブレース展開は引数のときだけ、ほかの展開の前に
+        if mode == Mode::Fields
+            && let Some(ws) = braces(w)
+        {
+            let mut out = vec![];
+            for x in ws {
+                out.extend(self.expand_nobrace(&x)?);
+            }
+            return Ok(out);
+        }
+        self.expand_nobrace_mode(w, mode)
+    }
+
+    fn expand_nobrace(&mut self, w: &str) -> Result<Vec<String>, String> {
+        self.expand_nobrace_mode(w, Mode::Fields)
+    }
+
+    fn expand_nobrace_mode(&mut self, w: &str, mode: Mode) -> Result<Vec<String>, String> {
+        // zsh のワイルドカードの修飾: *.zsh(N) (当たらなければ消す)、(.) (/) (@)
+        let (w, qual) = match glob_qualifier(w) {
+            Some((base, q)) if mode == Mode::Fields => (base, q),
+            _ => (w, String::new()),
+        };
         let ifs = self.get_var("IFS").unwrap_or_else(|| " \t\n".into());
         let mut o = Out { mode, ifs, fields: vec![], cur: String::new(), has: false };
         let cs: Vec<char> = w.chars().collect();
@@ -177,7 +334,20 @@ impl Shell {
         o.split();
         let fields = o.fields;
         Ok(match mode {
-            Mode::Fields => fields.iter().flat_map(|f| glob::glob(f)).collect(),
+            Mode::Fields => {
+                let null = self.nullglob() || qual.contains('N');
+                let mut v: Vec<String> = fields.iter().flat_map(|f| if null { glob::glob_or_none(f) } else { glob::glob(f) }).collect();
+                // 修飾 (.) はふつうのファイル、(/) はディレクトリ、(@) はリンクだけ
+                if qual.contains(['.', '/', '@']) {
+                    v.retain(|p| {
+                        let m = std::fs::symlink_metadata(p);
+                        (qual.contains('.') && m.as_ref().is_ok_and(|m| m.is_file()))
+                            || (qual.contains('/') && std::fs::metadata(p).is_ok_and(|m| m.is_dir()))
+                            || (qual.contains('@') && m.as_ref().is_ok_and(|m| m.file_type().is_symlink()))
+                    });
+                }
+                v
+            }
             Mode::Single => vec![fields.join(" ")],
             Mode::Pattern => vec![fields.join(" ")],
         })
@@ -251,6 +421,16 @@ impl Shell {
                     j += 1;
                 }
                 let name: String = cs[i..j].iter().collect();
+                // 配列 ($path は $PATH ではなく path の配列): zsh と同じく、要素ごとに別の語 ("" の中ならつなぐ)
+                if name != "path" || self.arrays.contains_key("path") {
+                    if let Some(a) = self.arrays.get(&name).cloned() {
+                        self.put_array(o, &a, quoted, false);
+                        return Ok(j);
+                    }
+                } else if let Some(a) = self.array("path") {
+                    self.put_array(o, &a, quoted, false);
+                    return Ok(j);
+                }
                 let v = self.get_var(&name).unwrap_or_default();
                 put(self, o, &v);
                 Ok(j)
@@ -289,8 +469,59 @@ impl Shell {
     }
 
     /// ${...} の中
+    /// 配列を語に: 1 つずつ別の語 ("" の中の [@] も)。join なら空白でつないで 1 つ ("" の中の [*] と $a)
+    fn put_array(&mut self, o: &mut Out, a: &[String], quoted: bool, at: bool) {
+        if quoted && !at {
+            return o.quoted(&a.join(" "));
+        }
+        if quoted {
+            for (k, x) in a.iter().enumerate() {
+                if k > 0 {
+                    o.fields.push(std::mem::take(&mut o.cur));
+                }
+                o.quoted(x);
+            }
+            return;
+        }
+        // クォートの外: zsh と同じく、要素はそれ以上分けず、ワイルドカードも広げない。空の要素は消える
+        for (k, x) in a.iter().filter(|x| !x.is_empty()).enumerate() {
+            if k > 0 {
+                o.split();
+            }
+            o.quoted(x);
+        }
+    }
+
     fn param_expr(&mut self, s: &str, o: &mut Out, quoted: bool) -> Result<(), String> {
         let put = |o: &mut Out, v: &str| if quoted { o.quoted(v) } else { o.unquoted(v) };
+        // 配列: ${a[@]} ${a[*]} ${a[N]} ${#a[@]} ${#a}
+        {
+            let (count, body) = match s.strip_prefix('#') {
+                Some(b) if !b.is_empty() => (true, b),
+                _ => (false, s),
+            };
+            let (name, sub) = match body.split_once('[') {
+                Some((n, r)) if r.ends_with(']') => (n, Some(&r[..r.len() - 1])),
+                _ => (body, None),
+            };
+            if parse::valid_name(name) && (sub.is_some() || self.arrays.contains_key(name) || (name == "path" && count)) {
+                let a = self.array(name).unwrap_or_else(|| self.get_var(name).map(|v| vec![v]).unwrap_or_default());
+                match (count, sub) {
+                    (true, None | Some("@" | "*")) => put(o, &a.len().to_string()),
+                    (false, None) => self.put_array(o, &a, quoted, false),
+                    (false, Some("@")) => self.put_array(o, &a, quoted, true),
+                    (false, Some("*")) => self.put_array(o, &a, quoted, false),
+                    (c, Some(ix)) => {
+                        let ix = self.expand_one(ix)?;
+                        let n: i64 = self.arith(&ix)?;
+                        let k = if n < 0 { a.len() as i64 + n } else { n - self.array_base() };
+                        let v = usize::try_from(k).ok().and_then(|k| a.get(k)).cloned().unwrap_or_default();
+                        put(o, &if c { v.chars().count().to_string() } else { v });
+                    }
+                }
+                return Ok(());
+            }
+        }
         // ${#NAME}: 長さ
         if let Some(name) = s.strip_prefix('#').filter(|n| !n.is_empty()) {
             let v = self.special(name).unwrap_or_default();
@@ -325,6 +556,59 @@ impl Shell {
                 return Ok(());
             }
             put(o, &val.unwrap_or_default());
+            return Ok(());
+        }
+        // zsh の修飾 ${x:t} (最後の要素) :h (その前) :r (拡張子を除く) :e (拡張子) :l :u (小文字 / 大文字)。:t:r のように続けてよい
+        if let Some(m) = rest.strip_prefix(':')
+            && !m.is_empty()
+            && m.split(':').all(|x| x.len() == 1 && "htrelu".contains(x))
+        {
+            let mut v = val.unwrap_or_default();
+            for x in m.split(':') {
+                v = match x {
+                    "t" => v.rsplit('/').next().unwrap_or("").to_string(),
+                    "h" => match v.rfind('/') {
+                        Some(0) => "/".into(),
+                        Some(k) => v[..k].to_string(),
+                        None => ".".into(),
+                    },
+                    "r" => match v.rfind('.') {
+                        Some(k) if !v[k..].contains('/') => v[..k].to_string(),
+                        _ => v,
+                    },
+                    "e" => match v.rfind('.') {
+                        Some(k) if !v[k..].contains('/') => v[k + 1..].to_string(),
+                        _ => String::new(),
+                    },
+                    "l" => v.to_lowercase(),
+                    _ => v.to_uppercase(),
+                };
+            }
+            put(o, &v);
+            return Ok(());
+        }
+        // bash の ${x:OFFSET} ${x:OFFSET:LENGTH} (文字の番号。負は終わりから)
+        if let Some(m) = rest.strip_prefix(':')
+            && m.starts_with(|c: char| c.is_ascii_digit() || c == ' ' || c == '(' || c == '$')
+        {
+            let v: Vec<char> = val.unwrap_or_default().chars().collect();
+            let (off, len) = match m.split_once(':') {
+                Some((a, b)) => (a, Some(b)),
+                None => (m, None),
+            };
+            let off = self.expand_one(off)?;
+            let off = self.arith(&off)?;
+            let n = v.len() as i64;
+            let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
+            let end = match len {
+                Some(l) => {
+                    let l = self.expand_one(l)?;
+                    let l = self.arith(&l)?;
+                    if l < 0 { ((n + l).max(start as i64)) as usize } else { (start + l as usize).min(v.len()) }
+                }
+                None => v.len(),
+            };
+            put(o, &v[start..end.max(start)].iter().collect::<String>());
             return Ok(());
         }
         for op in [":-", ":=", ":+", ":?", "-", "=", "+", "?", "##", "#", "%%", "%"] {

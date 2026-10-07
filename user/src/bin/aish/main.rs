@@ -8,6 +8,12 @@
 //   組み込み: cd pwd exit export unset set shift read local eval . source echo test [ true false :
 //             return break continue exec command type、ジョブ: jobs fg bg wait kill %N
 //   set -e (失敗で終わる)、set -x (実行するコマンドを見せる)
+//   bash と zsh から: ブレース展開 {a,b} {1..3}、[[ ... ]] (== のパターン、=~ の正規表現、&& || ! ( ) < >)、
+//   ** (下のディレクトリぜんぶ)、配列 a=(x y) a+=(z) $a ${a[@]} ${a[*]} ${a[N]} ${#a}
+//   (番号は zsh と同じ 1 から。setopt ksharrays で bash と同じ 0 から)、path=(...) は $PATH とつながる、
+//   ${x:t} ${x:h} ${x:r} ${x:e} ${x:l} ${x:u} (zsh)、${x:OFF:LEN} (bash)、*.zsh(N) (.) (/) (@) (zsh のワイルドカードの修飾)、
+//   setopt / unsetopt (nullglob と ksharrays が効く)、typeset / declare、{ echo a } (zsh。} の前の ; はいらない)、
+//   zmodload zstyle autoload compinit compdef と bindkey -M はなにもしない (.zshrc をそのまま読めるように)、$OSTYPE
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
 //   対話するときは行の編集と履歴 (edit.rs)、alias
 //   読むファイル: ログインのとき /etc/profile, ~/.profile。対話するとき aish は /etc/aishrc, ~/.aishrc、
@@ -58,6 +64,8 @@ enum RT {
 struct Ready {
     args: Vec<String>,
     assigns: Vec<(String, String)>,
+    /// 配列の代入 (名前, 足すか, 要素)。コマンドのないときだけ
+    arrays: Vec<(String, bool, Vec<String>)>,
     redirs: Vec<(i32, RT)>,
 }
 
@@ -98,10 +106,14 @@ pub struct Shell {
     plugins: plugin::Plugins,
     /// 履歴のファイル (プラグインに教える)
     histfile: Option<String>,
+    /// setopt でつけたもの (zsh の名前を小文字にして _ を除いたもの。nullglob と ksharrays が効く)
+    opts: std::collections::BTreeSet<String>,
+    /// 配列 (a=(x y z))。path は $PATH とつながっている (zsh と同じ)
+    arrays: HashMap<String, Vec<String>>,
 }
 
 const BUILTINS: &[&str] = &[
-    ":", "true", "false", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
+    ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
     "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap",
 ];
 
@@ -164,7 +176,45 @@ impl Shell {
             expanding: vec![],
             plugins: plugin::Plugins::default(),
             histfile: None,
+            opts: Default::default(),
+            arrays: HashMap::new(),
         }
+        // zsh と bash の $OSTYPE (.zshrc の case $OSTYPE in linux*) で分けられるように)
+        .with_var("OSTYPE", "linux-musl")
+    }
+
+    fn with_var(mut self, k: &str, v: &str) -> Shell {
+        if self.get_var(k).is_none() {
+            self.vars.insert(k.into(), v.into());
+        }
+        self
+    }
+
+    /// 配列 (なければ None)。path は $PATH を : で分けたもの
+    pub fn array(&self, k: &str) -> Option<Vec<String>> {
+        if k == "path" {
+            return Some(self.get_var("PATH").unwrap_or_default().split(':').filter(|x| !x.is_empty()).map(String::from).collect());
+        }
+        self.arrays.get(k).cloned()
+    }
+
+    pub fn set_array(&mut self, k: &str, v: Vec<String>) {
+        if k == "path" {
+            let p = v.join(":");
+            return self.set_var("PATH", &p);
+        }
+        self.vars.remove(k);
+        self.arrays.insert(k.to_string(), v);
+    }
+
+    /// 配列の番号の始まり (zsh は 1、setopt ksharrays なら bash と同じ 0)
+    pub fn array_base(&self) -> i64 {
+        if self.opts.contains("ksharrays") { 0 } else { 1 }
+    }
+
+    /// 当たらないワイルドカードを消すか (setopt nullglob)
+    pub fn nullglob(&self) -> bool {
+        self.opts.contains("nullglob")
     }
 
     // ---- 変数 ----
@@ -174,6 +224,7 @@ impl Shell {
     }
 
     pub fn set_var(&mut self, k: &str, v: &str) {
+        self.arrays.remove(k);
         if std::env::var_os(k).is_some() {
             unsafe { std::env::set_var(k, v) };
         } else {
@@ -191,6 +242,7 @@ impl Shell {
 
     fn unset(&mut self, k: &str) {
         self.vars.remove(k);
+        self.arrays.remove(k);
         unsafe { std::env::remove_var(k) };
     }
 
@@ -324,11 +376,32 @@ impl Shell {
         self.subst_status = None;
         let words = self.expand_alias(words);
         let mut args = vec![];
-        for w in &words {
-            args.extend(self.expand(w, Mode::Fields)?);
+        // [[ ... ]] の中は分けず、ワイルドカードも広げない (== の右のパターンの印は残す)
+        let cond = words.first().is_some_and(|w| w == "[[");
+        for (k, w) in words.iter().enumerate() {
+            if cond && (k == 0 || k + 1 == words.len()) {
+                args.push(w.clone());
+            } else if cond {
+                args.push(self.expand(w, Mode::Pattern)?.pop().unwrap_or_default());
+            } else {
+                args.extend(self.expand(w, Mode::Fields)?);
+            }
         }
         let mut avals = vec![];
+        let mut arrays = vec![];
         for (k, w) in assigns {
+            if let Some(items) = w.strip_prefix(parse::ARRAY) {
+                let mut vals = vec![];
+                for x in items.split(parse::SEP).filter(|x| !x.is_empty()) {
+                    vals.extend(self.expand(x, Mode::Fields)?);
+                }
+                let (name, add) = match k.strip_suffix('+') {
+                    Some(n) => (n.to_string(), true),
+                    None => (k.clone(), false),
+                };
+                arrays.push((name, add, vals));
+                continue;
+            }
             avals.push((k.clone(), self.expand_one(w)?));
         }
         let redirs = self.expand_redirs(redirs)?;
@@ -336,7 +409,7 @@ impl Shell {
             let a: Vec<String> = avals.iter().map(|(k, v)| format!("{}={}", k, v)).chain(args.iter().cloned()).collect();
             eprintln!("+ {}", a.join(" "));
         }
-        Ok(Ready { args, assigns: avals, redirs })
+        Ok(Ready { args, assigns: avals, arrays, redirs })
     }
 
     /// 行の編集に渡す、補完などのための様子
@@ -397,6 +470,11 @@ impl Shell {
         if r.args.is_empty() {
             for (k, v) in &r.assigns {
                 self.set_var(k, v);
+            }
+            for (k, add, vals) in &r.arrays {
+                let mut v = if *add { self.array(k).unwrap_or_default() } else { vec![] };
+                v.extend(vals.iter().cloned());
+                self.set_array(k, v);
             }
             let st = self.with_redirs(&r.redirs, |_| 0);
             return if st != 0 { st } else { self.subst_status.unwrap_or(0) };
@@ -1029,6 +1107,63 @@ impl Shell {
                 0
             }
             "read" => self.read(a),
+            // zsh: setopt NAME (no を前につけると外す)。名前は大文字小文字と _ を気にしない
+            "setopt" | "unsetopt" => {
+                if a.is_empty() {
+                    for o in &self.opts {
+                        println!("{}", o);
+                    }
+                    return 0;
+                }
+                for x in a {
+                    let mut n: String = x.chars().filter(|c| *c != '_').collect::<String>().to_lowercase();
+                    let mut on = name == "setopt";
+                    if let Some(r) = n.strip_prefix("no").filter(|r| !r.is_empty() && *r != "tify") {
+                        n = r.to_string();
+                        on = !on;
+                    }
+                    if on {
+                        self.opts.insert(n);
+                    } else {
+                        self.opts.remove(&n);
+                    }
+                }
+                0
+            }
+            // zsh の補完とモジュールの設定: aish では補完はプラグインなので、なにもしない
+            "zmodload" | "zstyle" | "autoload" | "compinit" | "compdef" => 0,
+            // typeset / declare: 関数の中なら local、外なら代入。-x は export。ほかの印 (-U -r -i -g ...) は気にしない
+            "typeset" | "declare" => {
+                let flags: String = a.iter().filter(|x| x.starts_with('-') || x.starts_with('+')).flat_map(|x| x.chars().skip(1)).collect();
+                let names: Vec<String> = a.iter().filter(|x| !x.starts_with('-') && !x.starts_with('+')).cloned().collect();
+                let global = flags.contains('g') || self.locals.is_empty();
+                for x in &names {
+                    let (k, v) = match x.split_once('=') {
+                        Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                        None => (x.clone(), None),
+                    };
+                    if !parse::valid_name(&k) {
+                        eprintln!("{}: {}: not a valid identifier", name, k);
+                        return 1;
+                    }
+                    if !global {
+                        let frame = self.locals.len() - 1;
+                        if !self.locals[frame].iter().any(|(n, ..)| *n == k) {
+                            let exported = std::env::var_os(&k).is_some();
+                            let old = self.get_var(&k);
+                            self.locals[frame].push((k.clone(), old, exported));
+                        }
+                    }
+                    if flags.contains('x') {
+                        self.export(&k, v);
+                    } else if let Some(v) = v {
+                        self.set_var(&k, &v);
+                    } else if !global {
+                        self.set_var(&k, "");
+                    }
+                }
+                0
+            }
             "local" => {
                 let Some(frame) = self.locals.len().checked_sub(1) else {
                     eprintln!("local: can only be used in a function");
@@ -1078,6 +1213,10 @@ impl Shell {
                     self.plugins.unbind(key);
                     0
                 }
+                // zsh の bindkey -M (メニューのキー) や、zsh の widget 名 (: のないもの) は、aish にはないので黙って通す
+                // (↑ ↓ の履歴の部分一致は aish にはじめからある)
+                [m, ..] if m == "-M" || m == "-e" || m == "-v" => 0,
+                [_, target] if !target.contains(':') => 0,
                 [key, target] => match self.plugins.bindkey(key, target) {
                     Ok(()) => 0,
                     Err(e) => {
@@ -1183,6 +1322,15 @@ impl Shell {
                 0
             }
             "echo" => echo(a),
+            "[[" => {
+                let mut a = a.to_vec();
+                if a.last().map(|s| s.as_str()) != Some("]]") {
+                    eprintln!("[[: missing `]]'");
+                    return 2;
+                }
+                a.pop();
+                test_with(&a, true)
+            }
             "test" | "[" => {
                 let mut a = a.to_vec();
                 if name == "[" {
@@ -1215,7 +1363,7 @@ impl Shell {
                         return self.builtin(a);
                     }
                     let text = self.text.clone();
-                    return self.spawn(vec![Part::Ready(Ready { args: a.to_vec(), assigns: vec![], redirs: vec![] })], false, &text);
+                    return self.spawn(vec![Part::Ready(Ready { args: a.to_vec(), assigns: vec![], arrays: vec![], redirs: vec![] })], false, &text);
                 }
                 let mut st = 0;
                 for x in list {
@@ -1532,7 +1680,12 @@ fn echo(a: &[String]) -> i32 {
 // ---- test / [ ----
 
 fn test(a: &[String]) -> i32 {
-    let mut t = Test { a, i: 0 };
+    test_with(a, false)
+}
+
+/// dbl: [[ ]] のもの (&& || で、== != の右はパターン、=~ は正規表現。語にはワイルドカードの印が残っている)
+fn test_with(a: &[String], dbl: bool) -> i32 {
+    let mut t = Test { a, i: 0, dbl };
     if a.is_empty() {
         return 1;
     }
@@ -1552,6 +1705,7 @@ fn test(a: &[String]) -> i32 {
 struct Test<'a> {
     a: &'a [String],
     i: usize,
+    dbl: bool,
 }
 
 const UNARY: &[&str] = &["-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h", "-z", "-n", "-b", "-c", "-p", "-S", "-t", "-g", "-u", "-k", "-O", "-G"];
@@ -1564,7 +1718,7 @@ impl Test<'_> {
 
     fn or(&mut self) -> Result<bool, String> {
         let mut v = self.and()?;
-        while self.get(0) == Some("-o") {
+        while self.get(0) == Some(if self.dbl { "||" } else { "-o" }) {
             self.i += 1;
             let r = self.and()?;
             v = v || r;
@@ -1574,7 +1728,7 @@ impl Test<'_> {
 
     fn and(&mut self) -> Result<bool, String> {
         let mut v = self.not()?;
-        while self.get(0) == Some("-a") {
+        while self.get(0) == Some(if self.dbl { "&&" } else { "-a" }) {
             self.i += 1;
             let r = self.not()?;
             v = v && r;
@@ -1598,10 +1752,21 @@ impl Test<'_> {
         // 二項 (3 つ以上残っていて真ん中が演算子) を先に
         if rem >= 3
             && let (Some(op), Some(r)) = (self.get(1), self.get(2))
-            && BINARY.contains(&op)
+            && (BINARY.contains(&op) || (self.dbl && op == "=~"))
         {
             let (l, op, r) = (x.to_string(), op.to_string(), r.to_string());
             self.i += 3;
+            if self.dbl {
+                let l = glob::unmark(&l);
+                return match op.as_str() {
+                    "=" | "==" | "!=" => {
+                        let m = glob::glob_match(&r.chars().collect::<Vec<_>>(), &l.chars().collect::<Vec<_>>());
+                        Ok(m == (op != "!="))
+                    }
+                    "=~" => regex::Regex::new(&glob::unmark(&r)).map(|re| re.is_match(&l)).map_err(|e| format!("=~: {}", e)),
+                    _ => binary_test(&l, &op, &glob::unmark(&r)),
+                };
+            }
             return binary_test(&l, &op, &r);
         }
         if x == "(" && rem >= 2 {
@@ -1616,7 +1781,7 @@ impl Test<'_> {
         if UNARY.contains(&x)
             && let Some(arg) = self.get(1)
         {
-            let (op, arg) = (x.to_string(), arg.to_string());
+            let (op, arg) = (x.to_string(), if self.dbl { glob::unmark(arg) } else { arg.to_string() });
             self.i += 2;
             return Ok(unary_test(&op, &arg));
         }

@@ -43,6 +43,25 @@ pub fn glob(w: &str) -> Vec<String> {
                 continue;
             }
             let join = |name: &str| if base.is_empty() || base.ends_with('/') { format!("{}{}", base, name) } else { format!("{}/{}", base, name) };
+            // ** (それだけの要素): 0 個以上のディレクトリ (zsh と bash の globstar)。. で始まるものとリンクの先は見ない
+            if !last && *part == "\u{f0000}\u{f0000}" {
+                let mut stack = vec![base.clone()];
+                while let Some(d) = stack.pop() {
+                    next.push(d.clone());
+                    let Ok(rd) = std::fs::read_dir(if d.is_empty() { "." } else { d.as_str() }) else { continue };
+                    let mut subs: Vec<String> = rd
+                        .flatten()
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !n.starts_with('.'))
+                        .map(|n| if d.is_empty() || d.ends_with('/') { format!("{}{}", d, n) } else { format!("{}/{}", d, n) })
+                        .collect();
+                    subs.sort();
+                    subs.reverse();
+                    stack.extend(subs);
+                }
+                continue;
+            }
             if !part.chars().any(is_mark) {
                 let p = join(part);
                 if last || std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
@@ -72,7 +91,21 @@ pub fn glob(w: &str) -> Vec<String> {
     }
     // 存在しない普通の部分だけの候補は、最後の要素にしか印がないときに出うるので、確かめる
     found.retain(|p| std::fs::symlink_metadata(p).is_ok());
+    // ** を使ったら、zsh と同じく全部を名前の順に
+    if w.contains("\u{f0000}\u{f0000}") {
+        found.sort();
+        found.dedup();
+    }
     if found.is_empty() { vec![unmark(w)] } else { found }
+}
+
+/// glob と同じ。ただし何にも当たらなければ 0 個 (setopt nullglob と *(N))
+pub fn glob_or_none(w: &str) -> Vec<String> {
+    let v = glob(w);
+    if w.chars().any(is_mark) && v.len() == 1 && v[0] == unmark(w) && std::fs::symlink_metadata(&v[0]).is_err() {
+        return vec![];
+    }
+    v
 }
 
 /// パターン (印つき) が名前全体に当たるか
