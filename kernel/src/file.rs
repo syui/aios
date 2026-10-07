@@ -102,12 +102,15 @@ pub struct OpenFile {
     pub kind: Kind,
     pub offset: usize,
     pub flags: u32,
+    /// ディレクトリ: 最初の getdents (offset 0) で読んだ一覧。続きはここから返す
+    /// (読みながら消しても番号がずれず、読み飛ばさない。rewinddir で offset が 0 に戻れば読みなおす)
+    dirents: Option<Rc<Vec<(u64, String, u32)>>>,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None }))
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
@@ -535,14 +538,23 @@ impl OpenFile {
         if !dir.meta().is_dir() {
             return Err(-ENOTDIR);
         }
-        let parent = vfs::resolve("", &vfs::normalize(path, ".."), true).unwrap_or_else(|_| dir.clone());
-        let mut list = Vec::new();
-        list.push((dir.meta().ino, String::from("."), vfs::S_IFDIR));
-        list.push((parent.meta().ino, String::from(".."), vfs::S_IFDIR));
-        for e in dir.readdir()? {
-            list.push((e.ino, e.name, e.mode));
-        }
-        for (i, (ino, name, mode)) in list.into_iter().enumerate().skip(self.offset) {
+        let list = match &self.dirents {
+            Some(l) if self.offset != 0 => l.clone(),
+            _ => {
+                let parent = vfs::resolve("", &vfs::normalize(path, ".."), true).unwrap_or_else(|_| dir.clone());
+                let mut list = Vec::new();
+                list.push((dir.meta().ino, String::from("."), vfs::S_IFDIR));
+                list.push((parent.meta().ino, String::from(".."), vfs::S_IFDIR));
+                for e in dir.readdir()? {
+                    list.push((e.ino, e.name, e.mode));
+                }
+                let l = Rc::new(list);
+                self.dirents = Some(l.clone());
+                l
+            }
+        };
+        for (i, (ino, name, mode)) in list.iter().enumerate().skip(self.offset) {
+            let (ino, mode) = (*ino, *mode);
             let reclen = (19 + name.len() + 1 + 7) & !7;
             if out.len() + reclen > max {
                 if out.is_empty() {
