@@ -395,6 +395,8 @@ impl OpenFile {
             Kind::TimerFd(t) => crate::timerfd::generation(t),
             Kind::Inotify(n) => crate::inotify::generation(n),
             Kind::Tty(t) | Kind::PtyMaster(t) => t.borrow().generation.get(),
+            Kind::Socket(_) => crate::net::generation(),
+            Kind::Unix(u) => u.borrow().generation,
             _ => 0,
         }
     }

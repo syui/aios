@@ -527,6 +527,17 @@ fn open_socket() -> Result<(String, RawFd), String> {
         }
         unsafe { libc::chmod(format!("{}\0", dir).as_ptr() as *const _, 0o700) };
         let path = format!("{}/wayland-0", dir);
+        // ほかの Wayland の画面と同じく wayland-0.lock を握る。握れたら、前の aiwm が残したソケットのファイルを消す
+        // (握れなければ、ほかの aiwm が動いている)。lock の fd は閉じない (終わるまで握る)
+        let lock = unsafe { libc::open(format!("{}.lock\0", path).as_ptr() as *const _, libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
+        if lock < 0 || unsafe { libc::flock(lock, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            last = format!("{}.lock: {} (another aiwm?)", path, std::io::Error::last_os_error());
+            if lock >= 0 {
+                unsafe { libc::close(lock) };
+            }
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
             return Err(format!(
