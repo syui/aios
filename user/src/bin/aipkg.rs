@@ -379,6 +379,8 @@ fn install(path: &str, explicit: bool) {
     let mut ready: Option<Ready> = None;
     let mut files: Vec<String> = vec![];
     let mut created: Vec<String> = vec![];
+    // 新しい版が置いたリンク (古い版だけのファイルを消すとき、この先はたどらない)
+    let mut new_links: Vec<String> = vec![];
     let mut new_backup = vec![];
     // .INSTALL (post_install などの関数)
     let mut script: Option<String> = None;
@@ -454,6 +456,24 @@ fn install(path: &str, explicit: bool) {
         }
         files.push(rel.clone());
         let dest = format!("{}{}", ROOT, rel.trim_end_matches('/'));
+        if e.header().entry_type().is_symlink() {
+            new_links.push(rel.clone());
+        }
+        // 種類がかわった (古い版のディレクトリがリンクに、リンクがディレクトリに。xkeyboard-config 2.48 のように
+        // 配布元が置き場所を変えたとき): 古い版のもの (か、だれのものでもないリンク) なら外してから広げる。
+        // ほかのパッケージのものはそのまま (広げられずに止まる)
+        if let Ok(m) = fs::symlink_metadata(&dest) {
+            let is_dir = e.header().entry_type().is_dir();
+            let key = rel.trim_end_matches('/');
+            if is_dir && m.file_type().is_symlink() && !r.owners.contains_key(key) {
+                let _ = fs::remove_file(&dest);
+            } else if !is_dir && m.is_dir() {
+                let old_files: BTreeSet<&str> = r.old.map(|(_, of)| of.iter().map(|f| f.trim_end_matches('/')).collect()).unwrap_or_default();
+                if only_these(&dest, key, &old_files) {
+                    let _ = fs::remove_dir_all(&dest);
+                }
+            }
+        }
         if fs::symlink_metadata(&dest).is_err() {
             created.push(rel.clone());
         }
@@ -496,7 +516,9 @@ fn install(path: &str, explicit: bool) {
     // 古い版にだけあったファイルを消す
     if let Some((od, ofiles)) = old {
         let keep: BTreeSet<&String> = files.iter().collect();
-        remove_files(ofiles.iter().filter(|f| !keep.contains(f)));
+        // 新しい版がリンクにしたところの下は、たどると新しい版のファイルなので消さない
+        let under_link = |f: &String| new_links.iter().any(|l| f.starts_with(&format!("{}/", l)));
+        remove_files(ofiles.iter().filter(|f| !keep.contains(f) && !under_link(f)));
         let _ = fs::remove_dir_all(local_dir(&name, get(od, "VERSION")));
     }
 
@@ -573,6 +595,17 @@ const KEEP_DIRS: &[&str] = &[
 ];
 
 /// ファイルを消し、空になったディレクトリも片付ける
+/// dir (パッケージの中の名前は rel) の下にあるものが、みな files (古い版のファイル) か。空でもよい
+fn only_these(dir: &str, rel: &str, files: &BTreeSet<&str>) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else { return false };
+    rd.flatten().all(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let r = format!("{}/{}", rel, name);
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        files.contains(r.as_str()) && (!is_dir || only_these(&format!("{}/{}", dir, name), &r, files))
+    })
+}
+
 fn remove_files<'a>(files: impl Iterator<Item = &'a String>) {
     let mut dirs = vec![];
     for f in files {
