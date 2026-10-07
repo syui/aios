@@ -1,0 +1,35 @@
+# aish の書き方のテスト: 1 行に「コマンド<TAB>答え」(答えの改行は |)。test/aish.sh が aish -c で動かしてくらべる
+# bash と同じになるもの、zsh の書き方 (配列は 1 から、setopt ksharrays で 0 から) など
+echo {a,b}/c	a/c b/c
+echo x{1..3}y {05..10..5} {c..a}	x1y x2y x3y 05 10 c b a
+echo a{b,c{d,e}}f	abf acdf acef
+echo '{a,b}' "{a,b}" \{a,b}	{a,b} {a,b} {a,b}
+x=1; echo {$x,2}	1 2
+[[ abc == a* ]] && echo match	match
+[[ abc == "a*" ]] || echo quoted	quoted
+x="a b"; [[ $x == "a b" ]] && echo nosplit	nosplit
+[[ -z "" || -n x ]] && echo or	or
+[[ ( 1 -lt 2 ) && b > a ]] && echo paren	paren
+[[ foo123 =~ ^fo+[0-9]+$ ]] && echo re	re
+f() { echo in }; f	in
+{ echo a; echo b }	a|b
+echo }	}
+p=(a "b c" "" d); for x in $p; do echo "[$x]"; done	[a]|[b c]|[d]
+p=(a "b c"); for x in "${p[@]}"; do echo "[$x]"; done	[a]|[b c]
+p=(a b c); echo ${#p} ${p[2]} ${p[-1]}	3 b c
+setopt ksharrays; p=(a b c); echo ${p[0]}	a
+p=(a); p+=(b c); echo ${p[@]}	a b c
+f=/a/b/c.tar.gz; echo ${f:t} ${f:h} ${f:r} ${f:e} ${f:t:r} ${f:u}	c.tar.gz /a/b /a/b/c.tar gz c.tar /A/B/C.TAR.GZ
+x=abcdef; echo ${x:2:3} ${x:1} ${x: -2} ${x:1:-1}	cde bcdef ef bcde
+setopt nullglob; echo x nomatch*.zz y	x y
+echo nomatch*.zz(N) end	end
+typeset x=1; echo $x	1
+f() { typeset y=2; echo in $y; }; f; echo out[$y]	in 2|out[]
+zmodload zsh/complist; zstyle ':c:*' menu select; autoload -Uz compinit; compinit; echo ok	ok
+echo $OSTYPE	linux-musl
+x="1 2"; for i in $x; do echo $i; done	1|2
+set -- a "b c"; for i in "$@"; do echo "[$i]"; done	[a]|[b c]
+echo $((3 * (2 + 1)))	9
+case abc in a*) echo yes;; *) echo no;; esac	yes
+x=abc; echo ${x#a} ${x%c} ${#x}	bc ab 3
+echo "$(echo nested $(echo deep))"	nested deep

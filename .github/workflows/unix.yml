@@ -58,6 +58,10 @@ jobs:
           AIOS_BUILD="base aikernel aiboot" bin/mkrootfs.sh -r all
           SWAP=1G bin/mkdisk.sh 8G
 
+      - name: aish tests
+        # base を作ったときの aish とプラグイン (aarch64 の musl。この arm64 の Linux でそのまま動く)
+        run: sh test/aish.sh user/target/aarch64-unknown-linux-musl/release/aish shell/target/aarch64-unknown-linux-musl/release
+
       - name: Boot test
         run: |
           # UEFI → aiboot → カーネル → init → swap.service まで来るか。
