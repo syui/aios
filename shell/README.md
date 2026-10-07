@@ -77,6 +77,9 @@ claude mcp add aish -- aish --mcp     # Claude Code から
   grep はファイルごとに、パスの行のあとに 1 行に 1 つ (`n line: text`)、ほかは終わりに 1 行の JSON (なにもなければ出さない)。`aish --mcp --json` なら、いままでどおり
   JSON の text と `structuredContent` (ほかのプログラムがつなぐとき。Claude Code は structuredContent があると
   そちらを見せるので、ふだんは付けない)
+- 出力が長い (12000 バイトより) ときは、頭と終わりだけを行の切れ目で返し、まん中は `... (N lines, M bytes cut ...) ...` になる。
+  答えの `out_id` を `out {id, grep?, regex?, from?, to?, err?}` に渡すと、もう一度動かさずに、切ったところを行の番号つきで
+  探したり読んだりできる (メモリーに最近の 8 つだけ。ディスクには書かない)
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
   `cd` や変数、関数は次の `run` に残る。時間切れ (既定 50 秒。Claude Code はツールの答えを 60 秒しか待たないので、長いものは `bg` で) なら子と孫を止めて `status: 124, timeout: true`。
   `exit` はその `run` だけを終える

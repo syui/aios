@@ -29,8 +29,23 @@ pub fn stopped() -> bool {
 /// 既定の時間切れ (ms)
 /// (Claude Code は MCP のツールの答えを 60 秒しか待たない。それより前に止めて、bg を使うように言う)
 const TIMEOUT_MS: u64 = 50_000;
-/// 出力をそのまま返す長さ。これより長ければ頭と終わりだけ
-const MAX_OUT: usize = 30_000;
+/// 出力をそのまま返す長さ。これより長ければ頭と終わりだけ (行の切れ目で)。切ったものはメモリーに残して out で読む
+const MAX_OUT: usize = 12_000;
+/// 切った出力を残しておく数 (古いものから捨てる)
+const KEEP_OUT: usize = 8;
+
+/// 切った出力: (番号, 標準出力の memfd, 標準エラーの memfd)。ディスクには書かない
+static SAVED: std::sync::Mutex<std::collections::VecDeque<(u64, i32, i32)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+static NEXT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const OUT_INPUT: &str = r#"{"type":"object","properties":{
+"id":{"type":"integer","description":"run や job の答えの out_id (なければいちばん新しいもの)"},
+"err":{"type":"boolean","description":"標準エラーのほうを (既定: 標準出力)"},
+"grep":{"type":"string","description":"この文字をふくむ行だけ (行の番号つき)"},
+"regex":{"type":"boolean","description":"grep を正規表現として"},
+"from":{"type":"integer","description":"何行目から (1 から)"},
+"to":{"type":"integer","description":"何行目まで"},
+"limit":{"type":"integer","description":"返す行はいくつまで (既定 200)"}}}"#;
 
 const PROTOCOL: &str = "2025-06-18";
 
@@ -145,6 +160,10 @@ impl Shell {
             "description": "run bg で動かしたものの様子と出力。{id, pid, done, status, out, err, ms}。id がなければ一覧。終わったものは、見たら消える",
             "inputSchema": serde_json::from_str::<Value>(JOB_INPUT).unwrap(),
         }), json!({
+            "name": "out",
+            "description": "run や job で長すぎて切った出力 (答えに out_id がある) を、もう一度動かさずに読む。grep で行を探すか、from / to で行の番号のところを。{id, lines, text}",
+            "inputSchema": serde_json::from_str::<Value>(OUT_INPUT).unwrap(),
+        }), json!({
             "name": "check",
             "description": "aish のつながりの様子: 版、起きてからの時間、プラグインが生きているか、ビルドしなおしたもの (つなぎなおすと新しくなる) や、ソースがバイナリより新しいもの (ビルドが要る)。problems が空なら ok",
             "inputSchema": { "type": "object", "properties": {} },
@@ -169,6 +188,8 @@ impl Shell {
             if args["bg"].as_bool().unwrap_or(false) { self.mcp_bg(&args) } else { self.mcp_run(&args) }
         } else if name == "job" {
             mcp_job(&args)
+        } else if name == "out" {
+            mcp_out(&args)
         } else if name == "check" {
             self.mcp_check()
         } else {
@@ -329,7 +350,11 @@ impl Shell {
             }
         }
         let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
-        let mut r = json!({ "status": status, "out": take(o), "err": take(e), "ms": ms, "pwd": pwd });
+        let (out, err, id) = finish(o, e);
+        let mut r = json!({ "status": status, "out": out, "err": err, "ms": ms, "pwd": pwd });
+        if let Some(id) = id {
+            r["out_id"] = json!(id);
+        }
         if fired.load(Ordering::Relaxed) {
             // timeout(1) と同じ 124
             STOP.store(false, Ordering::Relaxed);
@@ -409,25 +434,106 @@ fn mcp_job(a: &Value) -> Value {
         reap(&mut js[i..=i]);
     }
     let j = &js[i];
-    let mut r = json!({ "id": j.id, "pid": j.pid, "done": j.done.is_some(), "out": peek(j.out), "err": peek(j.err) });
+    let mut r = json!({ "id": j.id, "pid": j.pid, "done": j.done.is_some() });
     match j.done {
         Some((st, ms)) => {
+            // 終わったものは見たら消す (長くて切ったものは out で読めるように残す)
+            let (out, err, oid) = finish(j.out, j.err);
+            r["out"] = json!(out);
+            r["err"] = json!(err);
+            if let Some(oid) = oid {
+                r["out_id"] = json!(oid);
+            }
             r["status"] = json!(st);
             r["ms"] = json!(ms);
-            // 終わったものは見たら消す
-            unsafe {
-                libc::close(j.out);
-                libc::close(j.err);
-            }
             js.remove(i);
         }
-        None => r["ms"] = json!(j.t0.elapsed().as_millis() as u64),
+        None => {
+            r["out"] = json!(cut(read_all(j.out), None));
+            r["err"] = json!(cut(read_all(j.err), None));
+            r["ms"] = json!(j.t0.elapsed().as_millis() as u64);
+        }
     }
     r
 }
 
-/// memfd の中身を、閉じずに (読む場所も動かさずに) 読む。長ければ頭と終わり
-fn peek(fd: i32) -> String {
+/// 終わったものの出力を答えにする。どちらかが長ければ頭と終わりだけにして、memfd は out のために残す (番号を返す)。
+/// 短ければ閉じる
+fn finish(o: i32, e: i32) -> (String, String, Option<u64>) {
+    let (out, err) = (read_all(o), read_all(e));
+    if out.len() <= MAX_OUT && err.len() <= MAX_OUT {
+        unsafe {
+            libc::close(o);
+            libc::close(e);
+        }
+        return (out, err, None);
+    }
+    let id = NEXT_OUT.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut sv) = SAVED.lock() {
+        sv.push_back((id, o, e));
+        while sv.len() > KEEP_OUT {
+            if let Some((_, a, b)) = sv.pop_front() {
+                unsafe {
+                    libc::close(a);
+                    libc::close(b);
+                }
+            }
+        }
+    }
+    (cut(out, Some(id)), cut(err, Some(id)), Some(id))
+}
+
+/// out: 切った出力を、grep か行の番号で読む
+fn mcp_out(a: &Value) -> Value {
+    let Ok(sv) = SAVED.lock() else { return json!({ "error": "busy" }) };
+    let ent = match a["id"].as_u64() {
+        Some(id) => sv.iter().find(|x| x.0 == id),
+        None => sv.back(),
+    };
+    let Some(&(id, o, e)) = ent else {
+        let have: Vec<u64> = sv.iter().map(|x| x.0).collect();
+        return json!({ "error": format!("no saved output {} (have: {:?}; only the last {} long outputs are kept)", a["id"], have, KEEP_OUT) });
+    };
+    let text = read_all(if a["err"].as_bool().unwrap_or(false) { e } else { o });
+    let lines: Vec<&str> = text.lines().collect();
+    let limit = a["limit"].as_u64().unwrap_or(200) as usize;
+    let from = a["from"].as_u64().unwrap_or(1).max(1) as usize;
+    let to = a["to"].as_u64().map_or(lines.len(), |t| (t as usize).min(lines.len()));
+    let re = match (a["grep"].as_str(), a["regex"].as_bool().unwrap_or(false)) {
+        (Some(g), true) => match regex::Regex::new(g) {
+            Ok(r) => Some(r),
+            Err(err) => return json!({ "error": format!("regex: {}", err) }),
+        },
+        _ => None,
+    };
+    let mut out = String::new();
+    let mut n = 0;
+    let mut more = 0;
+    for (k, l) in lines.iter().enumerate().take(to).skip(from - 1) {
+        let hit = match (a["grep"].as_str(), &re) {
+            (_, Some(r)) => r.is_match(l),
+            (Some(g), None) => l.contains(g),
+            (None, _) => true,
+        };
+        if !hit {
+            continue;
+        }
+        if n == limit {
+            more += 1;
+            continue;
+        }
+        out.push_str(&format!("{}: {}\n", k + 1, l));
+        n += 1;
+    }
+    let mut r = json!({ "id": id, "lines": lines.len(), "text": out });
+    if more > 0 {
+        r["more"] = json!(more);
+    }
+    r
+}
+
+/// memfd の中身を、閉じずに (読む場所も動かさずに) ぜんぶ読む
+fn read_all(fd: i32) -> String {
     let mut b = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -437,17 +543,25 @@ fn peek(fd: i32) -> String {
         }
         b.extend_from_slice(&buf[..n as usize]);
     }
-    cut(String::from_utf8_lossy(&b).into_owned())
+    String::from_utf8_lossy(&b).into_owned()
 }
 
-/// 長ければ頭と終わりだけ
-fn cut(s: String) -> String {
+/// 長ければ頭 (1/3) と終わり (2/3) だけ。行の切れ目で切り、切った行の数と、out で読むための番号を書く
+fn cut(s: String, id: Option<u64>) -> String {
     if s.len() <= MAX_OUT {
         return s;
     }
-    let head = floor(&s, MAX_OUT / 3);
-    let tail = ceil(&s, s.len() - MAX_OUT * 2 / 3);
-    format!("{}\n... ({} bytes cut) ...\n{}", &s[..head], tail - head, &s[tail..])
+    let mut head = floor(&s, MAX_OUT / 3);
+    if let Some(k) = s[..head].rfind('\n') {
+        head = k + 1;
+    }
+    let mut tail = ceil(&s, s.len() - MAX_OUT * 2 / 3);
+    if let Some(k) = s[tail..].find('\n') {
+        tail += k + 1;
+    }
+    let lines = s[head..tail].matches('\n').count();
+    let how = id.map_or(String::new(), |i| format!(". read it with the out tool: {{\"id\": {}, \"grep\": \"...\"}} or from/to", i));
+    format!("{}... ({} lines, {} bytes cut{}) ...\n{}", &s[..head], lines, tail - head, how, &s[tail..])
 }
 
 /// 答えを読む形にする (Claude が読む content の text)。プロトコルとしての答えは structuredContent の JSON のまま。
@@ -546,12 +660,6 @@ fn memfd(name: &str) -> i32 {
     unsafe { libc::memfd_create(cstr(name).as_ptr(), libc::MFD_CLOEXEC) }
 }
 
-/// memfd の中身を読んで閉じる (長ければ頭と終わり)
-fn take(fd: i32) -> String {
-    let s = peek(fd);
-    unsafe { libc::close(fd) };
-    s
-}
 
 fn floor(s: &str, mut i: usize) -> usize {
     while !s.is_char_boundary(i) {
