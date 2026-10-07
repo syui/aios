@@ -17,6 +17,8 @@ bindkey                       # 一覧
 |---|---|---|
 | `aish-complete` | base | Tab の補完 (コマンド、ファイル、`$変数`) |
 | `aish-suggest` | base | 打っている行に続く履歴をグレーで出す |
+| `aish-highlight` | base | 打っている行の色 (zsh-syntax-highlighting の既定の色): あるコマンド (組み込み、alias、関数、PATH) は緑、ないものは太い赤、sudo などの前置きは緑の下線、予約語と文字列は黄、`"..."` の中の `$変数` はシアン、あるファイルは下線、`* ?` は青、コメントは灰 |
+| `aish-time` | base | 長くかかったコマンドの時間と、しくじったときの終了コードを、終わったあとに 1 行で (`-- 12.3s, exit 1`。zsh の REPORTTIME)。`plugin aish-time 秒` で時間を出すしきい値 (既定 3 秒) |
 | `aish-pick` | base | C-r 履歴 / C-f ファイル / C-g rg で探して開く / C-o よく使うパス / C-j 最近のディレクトリ / C-k `cd ..` / C-p C-p コピー。ツール `history` `dirs` `paths` |
 | `aish-edit` | base | ツールだけ: `read` `edit` (ぴったり置きかえ。`edits` でいくつも、ぜんぶかなにもしないか) `write` `grep` (ripgrep があればそれで。よく使うファイルが先で、見つけた行に番号 `n`) `hit` (n 番のまわり) `each` (見つけた行だけ置きかえる) `sed` (`each` と `sed` は `subs` で何組も) `lines` (行の番号で) `undo`。`aish --mcp` で読む |
 | `aish-map` | base | 探さなくていいように: ツール `where` (名前から定義の場所。ぴったり → 前が同じ → 含む、よく使うファイルが先) `outline` (ファイルの中の定義)。M-. で選んで `$EDITOR +行 ファイル`。rg が要る |
@@ -121,6 +123,7 @@ Ctrl-C (SIGINT) は無視するようにして起こされる。aish が終わ�
 |---|---|---|---|
 | `prompt` | `pwd home user host status root ssh jobs` | `{"prompt":"..."}` | プロンプトを出すとき。最初に答えたものを使う (なければ `$PS1`) |
 | `suggest` | `line` | `{"suggest":"続き"}` | 1 文字打つたびに (カーソルが行の終わりのとき)。→ / End / C-e で決まる |
+| `highlight` | `line cmds path pwd home` | `{"spans":[[始め,終わり,"SGR"],...]}` | 行が変わるたびに。文字の番号で、重ならない並び。SGR は `32` や `1;31` のような数字と `;` だけ |
 | `complete` | `line pos cmds vars path home pwd` | `{"start":N,"cands":[{"text":"...","show":"...","dir":false}]}` | Tab。`start` から `pos` までを `text` と置きかえる (`pos` と `start` は文字の数)。1 つなら決め、たくさんなら aish が並べて選ばせる |
 | `key` | `widget key line pos pwd home histfile` | 下の「キーの答え」 | `keys` / `bindkey` で結んだキー |
 | `preexec` | `line pwd` | `{}` | 行を動かす前 (`aish --mcp` の `run` でも) |
