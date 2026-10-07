@@ -79,14 +79,20 @@ pub fn online() -> usize {
 
 /// 持っている CPU の番号 + 1 (0 なら空き)
 static BKL: AtomicUsize = AtomicUsize::new(0);
+/// チケット: 次に配る番号と、いま持てる番号。来た順に持つ (早い者勝ちだと、放したばかりの CPU が
+/// すぐまた取り、ほかの CPU (起こされた音のスレッドなど) がいつまでも取れないことがある)
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+static SERVING: AtomicUsize = AtomicUsize::new(0);
 
 pub fn lock() {
     let me = id() + 1;
     debug_assert!(BKL.load(Ordering::Relaxed) != me, "BKL: cpu{} locks twice", me - 1);
     let t0 = crate::timer::uptime_ns();
-    while BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+    while SERVING.load(Ordering::Acquire) != ticket {
         core::hint::spin_loop();
     }
+    BKL.store(me, Ordering::Relaxed);
     let t1 = crate::timer::uptime_ns();
     let c = &STATS.cpu[me - 1];
     c.wait.fetch_add(t1 - t0, Ordering::Relaxed);
@@ -97,7 +103,8 @@ pub fn lock() {
 pub fn unlock() {
     let c = &STATS.cpu[id()];
     c.hold.fetch_add(crate::timer::uptime_ns().saturating_sub(c.since.load(Ordering::Relaxed)), Ordering::Relaxed);
-    BKL.store(0, Ordering::Release);
+    BKL.store(0, Ordering::Relaxed);
+    SERVING.fetch_add(1, Ordering::Release);
 }
 
 // ---- 大きなロックの統計 (/proc/bkl。ロックを細かくするとき、どこから分けるかを決めるため) ----
