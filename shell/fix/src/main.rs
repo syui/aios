@@ -1,7 +1,8 @@
 // aish-fix: ビルドのエラーを番号つきの一覧に (vim の quickfix。aish の基本のプラグイン)
 //   build   コマンド (既定 cargo build) をうしろで動かし、終わるか wait_ms まで待って、エラーを n つきで
 //   errors  動いているビルドを待って (終わっていればそのまま) エラーを n つきで
-//   fix     n 番のエラーの全文 (rustc の rendered) と、そのまわりのソースを行の番号つきで
+//   fix     n 番のエラーの全文 (rustc の rendered) と、そのまわりのソースを行の番号つきで。
+//           rustc の直し方 (help の suggested_replacement) は suggestions に。apply: k であてる
 //   M-e     ビルドして、エラーを選んで「$EDITOR +行 ファイル」にする
 // cargo には --message-format=json を足して、rustc の診断をそのまま読む (場所がずれない)。
 // ほかのコマンド (make、cc、zig) は「path:line:col: error: ...」の行を拾う。
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 const BUILD: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c。既定 cargo build。cargo build/check/test/clippy/run には --message-format=json を足す)"},"dir":{"type":"string","description":"動かすディレクトリ (既定 いまのディレクトリ)"},"wait_ms":{"type":"integer","description":"終わるのをこれだけ待つ (既定 45000。過ぎたら running: true で答えるので、errors で待つ)"},"warnings":{"type":"boolean","description":"警告も一覧に (既定 false: 数だけ)"}}}"#;
 const ERRORS: &str = r#"{"type":"object","properties":{"wait_ms":{"type":"integer","description":"動いているビルドをこれだけ待つ (既定 45000)"},"warnings":{"type":"boolean","description":"警告も一覧に"},"kill":{"type":"boolean","description":"動いているビルドを止める"}}}"#;
-const FIX: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"build / errors の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"}},"required":["n"]}"#;
+const FIX: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"build / errors の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"},"apply":{"type":"integer","description":"rustc の直し方 (答えの suggestions の番号) をファイルにあてる。ビルドのあとで変えたファイルにはあてない"}},"required":["n"]}"#;
 
 /// 一覧に出す数の上限 (それより多ければ more に数だけ)
 const MAX_ITEMS: usize = 100;
@@ -36,6 +37,15 @@ struct Diag {
     line: usize,
     /// 全文 (rustc の rendered。なければ head)
     rendered: String,
+    /// rustc の直し方 (help の suggested_replacement)
+    suggestions: Vec<Suggestion>,
+}
+
+/// 直し方 1 つ: 説明と、置きかえ (ファイル, バイトの始め, 終わり, 新しい文字) の並び
+struct Suggestion {
+    label: String,
+    applicability: String,
+    edits: Vec<(PathBuf, usize, usize, String)>,
 }
 
 struct Build {
@@ -63,7 +73,7 @@ fn main() {
                 input: BUILD,
             },
             Tool { name: "errors", desc: "動いているビルドを待って、エラーを n つきで (build と同じ形)。kill: true で止める", input: ERRORS },
-            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで", input: FIX },
+            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで。rustc の直し方があれば suggestions に番号 k つきで出し、apply: k でファイルにあてる", input: FIX },
         ],
     };
     let mut cur: Option<Build> = None;
@@ -301,7 +311,23 @@ fn cargo_line(line: &str, dir: &Path, diags: &mut Vec<Diag>) {
         ln = sp["line_start"].as_u64().unwrap_or(0) as usize;
     }
     let rendered = m["rendered"].as_str().map(strip_ansi).unwrap_or_else(|| head.clone());
-    diags.push(Diag { error, head, path, file, line: ln, rendered });
+    // 直し方: children の spans に suggested_replacement があるもの (1 つの child が 1 つの直し方)
+    let mut suggestions = vec![];
+    for c in m["children"].as_array().into_iter().flatten() {
+        let mut edits = vec![];
+        let mut appl = String::new();
+        for sp in c["spans"].as_array().into_iter().flatten() {
+            let Some(rep) = sp["suggested_replacement"].as_str() else { continue };
+            let Some(f) = find_file(dir, s(sp, "file_name"), v["manifest_path"].as_str()) else { continue };
+            let (a, b) = (sp["byte_start"].as_u64().unwrap_or(0) as usize, sp["byte_end"].as_u64().unwrap_or(0) as usize);
+            appl = s(sp, "suggestion_applicability").to_string();
+            edits.push((f, a, b, rep.to_string()));
+        }
+        if !edits.is_empty() {
+            suggestions.push(Suggestion { label: s(c, "message").to_string(), applicability: appl, edits });
+        }
+    }
+    diags.push(Diag { error, head, path, file, line: ln, rendered, suggestions });
 }
 
 /// 「path:line:col: error: msg」(cc、zig、make、rustc の short) の行
@@ -325,7 +351,7 @@ fn text_line(line: &str, dir: &Path, diags: &mut Vec<Diag>) {
         }
         let f = find_file(dir, p, None);
         let head = format!("{}: {}", if error { "error" } else { "warning" }, msg.trim());
-        diags.push(Diag { error, path: show(dir, f.as_deref(), p), file: f, line: ln, rendered: line.clone(), head });
+        diags.push(Diag { error, path: show(dir, f.as_deref(), p), file: f, line: ln, rendered: line.clone(), head, suggestions: vec![] });
         return;
     }
 }
@@ -376,6 +402,9 @@ fn fix(b: &Build, a: &Value) -> Value {
     let n = a["n"].as_u64().unwrap_or(0) as usize;
     let shown: Vec<&Diag> = b.diags.iter().filter(|d| d.error).chain(b.diags.iter().filter(|d| !d.error)).collect();
     let Some(d) = n.checked_sub(1).and_then(|i| shown.get(i)) else { return error(format!("no error {} (the last build has {})", n, shown.len())) };
+    if let Some(k) = a["apply"].as_u64() {
+        return apply(b, d, n, k as usize);
+    }
     let mut text = d.rendered.trim_end().to_string();
     text.push('\n');
     if let Some(f) = d.file.as_ref().filter(|_| d.line > 0) {
@@ -389,7 +418,56 @@ fn fix(b: &Build, a: &Value) -> Value {
             }
         }
     }
-    json!({ "n": n, "path": d.path, "line": d.line, "text": text })
+    let sugg: Vec<Value> = d
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, sg)| {
+            let what: Vec<String> = sg.edits.iter().map(|(f, x0, x1, r)| {
+                let src = std::fs::read(f).unwrap_or_default();
+                let old = src.get(*x0..*x1).map(|x| String::from_utf8_lossy(x).into_owned()).unwrap_or_default();
+                let line = src.get(..*x0).map_or(0, |x| x.iter().filter(|&&c| c == b'\n').count() + 1);
+                format!("{}:{}: `{}` -> `{}`", show(&b.dir, Some(f), ""), line, old, r)
+            }).collect();
+            json!({ "k": i + 1, "label": sg.label, "applicability": sg.applicability, "edits": what })
+        })
+        .collect();
+    let mut r = json!({ "n": n, "path": d.path, "line": d.line, "text": text });
+    if !sugg.is_empty() {
+        r["suggestions"] = json!(sugg);
+        r["hint"] = json!("fix {n, apply: k} applies suggestion k");
+    }
+    r
+}
+
+/// rustc の直し方 k をあてる。ビルドを始めたあとで変わったファイルにはあてない (バイトの場所がずれるので)
+fn apply(b: &Build, d: &Diag, n: usize, k: usize) -> Value {
+    let Some(sg) = k.checked_sub(1).and_then(|i| d.suggestions.get(i)) else { return error(format!("error {} has no suggestion {} (it has {})", n, k, d.suggestions.len())) };
+    let mut by_file: std::collections::BTreeMap<&PathBuf, Vec<(usize, usize, &str)>> = Default::default();
+    for (f, a, e, r) in &sg.edits {
+        by_file.entry(f).or_default().push((*a, *e, r.as_str()));
+    }
+    let started = std::time::SystemTime::now() - b.start.elapsed();
+    let mut changed = vec![];
+    for (f, mut eds) in by_file {
+        if std::fs::metadata(f).and_then(|m| m.modified()).is_ok_and(|t| t > started) {
+            return error(format!("{}: changed after the build started; build again first", f.display()));
+        }
+        let Ok(mut src) = std::fs::read(f) else { return error(format!("{}: cannot read", f.display())) };
+        // うしろから (前の場所がずれないように)
+        eds.sort_by(|x, y| y.0.cmp(&x.0));
+        for (a, e, r) in eds {
+            if a > e || e > src.len() {
+                return error(format!("{}: suggestion is out of range; build again", f.display()));
+            }
+            src.splice(a..e, r.bytes());
+        }
+        if let Err(e) = std::fs::write(f, &src) {
+            return error(format!("{}: {}", f.display(), e));
+        }
+        changed.push(show(&b.dir, Some(f), ""));
+    }
+    json!({ "n": n, "applied": sg.label, "files": changed, "hint": "build again to check" })
 }
 
 /// M-e: ビルドして (cargo か make)、エラーを選んで $EDITOR +行 ファイル
