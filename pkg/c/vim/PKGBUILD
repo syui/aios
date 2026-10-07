@@ -2,7 +2,7 @@
 #   機能は huge (端末だけ。GUI、X、gpm、音、翻訳はなし)。Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。
 #   vi と view も vim へのリンク (aish の C-g / M-. は $EDITOR か vi で開く)
 pkgname=vim
-pkgver=9.2.1164
+pkgver=9.2.1169
 pkgrel=1
 pkgdesc='Vi Improved, a highly configurable, improved version of the vi text editor (static, terminal, for aios)'
 arch=('aarch64')

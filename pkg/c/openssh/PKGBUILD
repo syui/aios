@@ -3,8 +3,8 @@
 #   curve25519 (どれも openssh の中のもの)。RSA と ECDSA の鍵は使えない。
 #   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
 pkgname=openssh
-pkgver=10.5p1
-pkgrel=2
+pkgver=10.6p1
+pkgrel=1
 pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
 arch=('aarch64')
 url='https://www.openssh.com/portable.html'
@@ -12,7 +12,7 @@ license=('SSH-OpenSSH')
 backup=(etc/ssh/ssh_config etc/ssh/sshd_config)
 source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz"
         sshd.service sshdgenkeys.service)
-sha256sums=('d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11'
+sha256sums=('a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39'
             'SKIP'
             'SKIP')
 
