@@ -13,6 +13,8 @@ mod netif;
 use netif::{fmt, parse_addr, parse_cidr};
 
 fn main() {
+    // 読み手のいないパイプに書いたら (| head など)、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "-4").collect();
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let r = match a.as_slice() {

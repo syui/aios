@@ -61,6 +61,8 @@ const BOLD: &str = "\x1b[1;33m";
 const RESET: &str = "\x1b[0m";
 
 fn main() {
+    // 読み手のいないパイプに書いたら (| head など)、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => info(),

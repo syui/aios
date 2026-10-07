@@ -3,6 +3,8 @@
 use std::os::unix::fs::PermissionsExt;
 
 fn main() {
+    // 読み手のいないパイプに書いたら (| head など)、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let mut all = false;
     let mut names = vec![];
     for a in std::env::args().skip(1) {
