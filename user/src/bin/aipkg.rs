@@ -8,6 +8,7 @@
 //   aipkg -R pkg...     外す
 //   aipkg -Q / -Qi / -Ql [pkg]  入っているもの / 情報 / ファイル一覧
 //   aipkg -Qo FILE...          そのファイルのパッケージ (/ のない名前は PATH から)
+//   -S --needed で、同じ版が入っているものは飛ばす
 //
 // 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)。
 // どのリポジトリも、Server のところの db は aios.db (aarch64/rust/aios.db, aarch64/c/aios.db)。
@@ -511,6 +512,11 @@ fn install(path: &str, explicit: bool) {
             new_backup.push(format!("{}\t{}", epath, hash));
             continue;
         }
+        // ハードリンク (gzip の gunzip → uncompress、git など): 入れなおしや更新で同じ名前があると、tar の
+        // unpack は作れずに止まる (ふつうのファイルは上書きするのに)。先に外す
+        if e.header().entry_type().is_hard_link() && fs::symlink_metadata(&dest).is_ok_and(|m| !m.is_dir()) {
+            let _ = fs::remove_file(&dest);
+        }
         if let Err(err) = e.unpack_in(ROOT) {
             let msg = format!("{}: /{}: {}", r.name, epath, err);
             fail(&created, msg);
@@ -894,7 +900,22 @@ fn main() {
         } else if flags.contains(&'u') {
             upgrade_all(&repos, &targets);
         } else if !targets.is_empty() {
-            sync_install(&repos, &targets, &targets);
+            // --needed: もう同じ版が入っているものは入れなおさない (pacman と同じ)
+            let targets: Vec<String> = if args.iter().any(|a| a == "--needed") {
+                let (sync, db) = (sync_all(&repos), installed());
+                let (skip, keep): (Vec<String>, Vec<String>) = targets.iter().cloned().partition(|t| {
+                    matches!((sync.get(t), db.get(t)), (Some((_, sd)), Some((d, _))) if get(sd, "VERSION") == get(d, "VERSION"))
+                });
+                for t in &skip {
+                    eprintln!("warning: {} is up to date -- skipping", t);
+                }
+                keep
+            } else {
+                targets
+            };
+            if !targets.is_empty() {
+                sync_install(&repos, &targets, &targets);
+            }
         }
     } else if flags.contains(&'U') {
         for t in &targets {
