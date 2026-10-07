@@ -70,6 +70,11 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 このリポジトリの aish とプラグインをそのマシン向けにビルドして (`shell/mcp.rc` を読む)。`aish --mcp RC...` で
 設定を足せる。
 
+ツールはシェルからも呼べる: `tool NAME KEY=VALUE...` (または `tool NAME '{JSON}'`。`tool` だけなら一覧)。
+本文は標準出力、行の数などの残りは JSON の 1 行で標準エラーへ。パイプや `$(...)` の中でも動く
+(そのときはプラグインを一度だけ別に起こす)。ビルドしなおしたあと、MCP の客がツールの新しい引数をまだ知らないときも
+`run` から使える。
+
 - `run {cmd, bg: true}` はうしろで動かしてすぐ `{job, pid}` を答える (シェルを fork した子なので、`cd` などはその中だけ)。
   `job {id, wait_ms?, kill?}` で様子と出力 (`{done, status, out, err, ms}`。id がなければ一覧)。重いビルドのあいだも
   ほかのツールが使える

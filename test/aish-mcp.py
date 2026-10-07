@@ -89,6 +89,10 @@ open(work + '/m.rs', 'w').write('fn other() {}\n\nfn target(x: char) -> bool {\n
 t = tool('where', {'name': 'target', 'path': work, 'body': True})
 check('where body', 'needs rg' in t or '5\t    x == ' in t and '6\t}' in t and 'after' not in t, t)
 
+# tool: プラグインのツールをシェルから (パイプの中、$(...) からも)
+t = tool('run', {'cmd': 'tool read path=a.txt limit=1; tool read \'{"path":"a.txt","offset":2,"limit":1}\' | cat; x=$(tool read path=a.txt limit=1); echo "[$x]" | head -1; tool nosuch; echo st=$?'})
+check('tool builtin', t.startswith('     1\tone\n     2\tTWO\n[     1\tone]\nst=1\n'), t)
+
 # ビルドしなおし (新しい i-node) → 次のツールで入れかわる。cd したあとでも RC (相対パス) は読める
 tool('run', {'cmd': 'cd /tmp'})
 shutil.copy(work + '/plug/aish-edit', work + '/plug/n')

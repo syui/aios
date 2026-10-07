@@ -89,6 +89,7 @@ const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも�
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。\
 出力が長いと頭と終わりだけになり、まん中は答えの out_id を out に渡して探したり読んだりできます。\
 aish やプラグインをビルドしなおすと、次のツールで aish が自分で新しいものに入れかわります (変数は空に戻ります)。\
+入れかわったあと、ツールの新しい引数がまだ見えないときは run で tool NAME KEY=VALUE... (または JSON) と呼べます。\
 つながりやビルドが古くないかは check で見られます。";
 
 impl Shell {
@@ -691,7 +692,7 @@ fn cut(s: String, id: Option<u64>) -> String {
 /// 出力や文書 (out err text) は JSON の中にエスケープせずにそのまま出し、ほかのものは終わりに 1 行の JSON で。
 /// grep の matches はファイルごとにまとめる: パスの行のあとに 1 行に 1 つ (n line: text、前後の行は n のかわりに -)。
 /// where と outline の items も 1 行に 1 つ
-fn render(r: &Value) -> String {
+pub fn render(r: &Value) -> String {
     let Some(o) = r.as_object() else { return r.to_string() };
     let mut s = String::new();
     let mut meta = serde_json::Map::new();
@@ -756,6 +757,16 @@ fn render(r: &Value) -> String {
         s.push_str(&Value::Object(meta).to_string());
     }
     s
+}
+
+/// シェルの tool のため: 読む形の本文と、残り (JSON の 1 行。標準エラーへ) を分けて
+pub fn render_split(r: &Value) -> (String, String) {
+    // 本文のない答え (edit など) は JSON のまま本文に
+    let s = render(r);
+    match s.rsplit_once('\n') {
+        Some((text, meta)) if meta.starts_with('{') => (format!("{}\n", text), meta.to_string()),
+        _ => (s, String::new()),
+    }
 }
 
 /// 砂場の中なら、書けるところ (aibox の AIBOX_WRITE。なければ「決まったところ」)
