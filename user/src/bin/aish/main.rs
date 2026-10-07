@@ -85,6 +85,8 @@ pub struct Shell {
     pub status: i32,
     pub pid: i32,
     pub errexit: bool,
+    /// set -u: 決めていない変数を使ったらしくじる
+    pub nounset: bool,
     pub xtrace: bool,
     flow: Flow,
     /// if / while の条件、! の中 (set -e で終わらない)
@@ -112,15 +114,27 @@ pub struct Shell {
     opts: std::collections::BTreeSet<String>,
     /// 配列 (a=(x y z))。path は $PATH とつながっている (zsh と同じ)
     arrays: HashMap<String, Vec<String>>,
+    /// 連想配列 (declare -A)。キーと値を入れた順に
+    pub assoc: HashMap<String, Vec<(String, String)>>,
+    /// declare -i の変数 (代入を式として計算する)
+    pub int_vars: std::collections::HashSet<String>,
+    /// 起きた時刻 ($SECONDS)
+    pub started: std::time::Instant,
+    /// pushd の積み重ね (新しいものが後ろ)
+    pub dirstack: Vec<String>,
 }
 
 const BUILTINS: &[&str] = &[
-    ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
+    ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "readonly", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
     "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool", "hash",
+    "let", "mapfile", "readarray", "getopts", "pushd", "popd", "dirs", "shopt", "compgen",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
-    BUILTINS.contains(&args[0].as_str()) || (args[0] == "kill" && args.iter().any(|a| a.starts_with('%')))
+    BUILTINS.contains(&args[0].as_str())
+        || (args[0] == "kill" && args.iter().any(|a| a.starts_with('%')))
+        // printf -v VAR は変数に入れるので組み込み (ほかの printf はコマンド)
+        || (args[0] == "printf" && args.get(1).is_some_and(|a| a == "-v"))
 }
 
 fn flush() {
@@ -166,6 +180,7 @@ impl Shell {
             status: 0,
             pid: std::process::id() as i32,
             errexit: false,
+            nounset: false,
             xtrace: false,
             flow: Flow::None,
             cond: 0,
@@ -181,6 +196,10 @@ impl Shell {
             histfile: None,
             opts: Default::default(),
             arrays: HashMap::new(),
+            assoc: HashMap::new(),
+            int_vars: Default::default(),
+            started: std::time::Instant::now(),
+            dirstack: vec![],
         }
         // zsh と bash の $OSTYPE (.zshrc の case $OSTYPE in linux*) で分けられるように)
         .with_var("OSTYPE", "linux-musl")
@@ -207,7 +226,93 @@ impl Shell {
             return self.set_var("PATH", &p);
         }
         self.vars.remove(k);
+        self.assoc.remove(k);
         self.arrays.insert(k.to_string(), v);
+    }
+
+    /// (( 式 )) と for (( )) の式: $x などを広げてから計算する
+    pub fn arith_expr(&mut self, e: &str) -> Result<i64, String> {
+        let t = self.expand_one(&format!("\"{}\"", e.replace('"', "\\\"")))?;
+        self.arith(&t)
+    }
+
+    /// a=(x y) と a+=(x): 要素が [k]=v の形なら、連想配列のキーか、配列の番号 (bash の a=([0]=x [3]=y))
+    pub fn set_items(&mut self, name: &str, items: Vec<String>, add: bool) -> Result<(), String> {
+        let keyed = !items.is_empty() && items.iter().all(|x| x.starts_with('[') && x.contains("]="));
+        if self.assoc.contains_key(name) || (keyed && self.assoc.contains_key(name)) {
+            if !add {
+                self.assoc.insert(name.to_string(), vec![]);
+            }
+            for x in items {
+                let Some((k, v)) = x[1..].split_once("]=") else { return Err(format!("{}: {}: must use subscript when assigning associative array", name, x)) };
+                self.assign(&format!("{}[{}]", name, k), v)?;
+            }
+            return Ok(());
+        }
+        if keyed {
+            if !add {
+                self.set_array(name, vec![]);
+            }
+            for x in items {
+                let (k, v) = x[1..].split_once("]=").unwrap();
+                self.assign(&format!("{}[{}]", name, k), v)?;
+            }
+            return Ok(());
+        }
+        let mut v = if add { self.array(name).unwrap_or_default() } else { vec![] };
+        v.extend(items);
+        self.set_array(name, v);
+        Ok(())
+    }
+
+    /// 代入: NAME=v、NAME+=v (配列なら要素を足す、ほかは文字をつなぐ)、NAME[i]=v (配列の i 番。負は終わりから。
+    /// 連想配列ならキー i)、NAME[i]+=v
+    pub fn assign(&mut self, key: &str, v: &str) -> Result<(), String> {
+        let (key, add) = match key.strip_suffix('+') {
+            Some(k) => (k, true),
+            None => (key, false),
+        };
+        let Some((name, sub)) = key.split_once('[').map(|(n, r)| (n, &r[..r.len() - 1])) else {
+            if add {
+                if let Some(mut a) = self.array(key) {
+                    a.push(v.to_string());
+                    self.set_array(key, a);
+                } else {
+                    let old = self.get_var(key).unwrap_or_default();
+                    // declare -i なら足し算
+                    let new = if self.int_vars.contains(key) { (self.arith(&old).unwrap_or(0) + self.arith(v)?).to_string() } else { old + v };
+                    self.set_var(key, &new);
+                }
+            } else if self.int_vars.contains(key) {
+                let n = self.arith(v)?;
+                self.set_var(key, &n.to_string());
+            } else {
+                self.set_var(key, v);
+            }
+            return Ok(());
+        };
+        if let Some(m) = self.assoc.get_mut(name) {
+            match m.iter_mut().find(|(k, _)| k == sub) {
+                Some(e) if add => e.1.push_str(v),
+                Some(e) => e.1 = v.to_string(),
+                None => m.push((sub.to_string(), v.to_string())),
+            }
+            return Ok(());
+        }
+        let mut a = self.array(name).unwrap_or_else(|| self.get_var(name).map(|x| vec![x]).unwrap_or_default());
+        let n = self.arith(sub)?;
+        let k = if n < 0 { a.len() as i64 + n } else { n - self.array_base() };
+        let Ok(k) = usize::try_from(k) else { return Err(format!("{}[{}]: bad array subscript", name, sub)) };
+        if a.len() <= k {
+            a.resize(k + 1, String::new());
+        }
+        if add {
+            a[k].push_str(v);
+        } else {
+            a[k] = v.to_string();
+        }
+        self.set_array(name, a);
+        Ok(())
     }
 
     /// 配列の番号の始まり (zsh は 1、setopt ksharrays なら bash と同じ 0)
@@ -228,6 +333,7 @@ impl Shell {
 
     pub fn set_var(&mut self, k: &str, v: &str) {
         self.arrays.remove(k);
+        self.assoc.remove(k);
         if std::env::var_os(k).is_some() {
             unsafe { std::env::set_var(k, v) };
         } else {
@@ -244,8 +350,30 @@ impl Shell {
     }
 
     fn unset(&mut self, k: &str) {
+        // unset 'a[1]' (配列の 1 つ。bash は穴をあけるが、aish はつめる) と unset 'm[k]' (連想配列のキー)
+        if let Some((n, r)) = k.split_once('[')
+            && let Some(sub) = r.strip_suffix(']')
+        {
+            if let Some(m) = self.assoc.get_mut(n) {
+                m.retain(|(x, _)| x != sub);
+            } else if let Some(mut a) = self.arrays.get(n).cloned() {
+                let base = self.array_base();
+                if let Ok(i) = self.arith(sub) {
+                    let i = if i < 0 { a.len() as i64 + i } else { i - base };
+                    if let Ok(i) = usize::try_from(i)
+                        && i < a.len()
+                    {
+                        a.remove(i);
+                        self.arrays.insert(n.to_string(), a);
+                    }
+                }
+            }
+            return;
+        }
         self.vars.remove(k);
         self.arrays.remove(k);
+        self.assoc.remove(k);
+        self.int_vars.remove(k);
         unsafe { std::env::remove_var(k) };
     }
 
@@ -419,7 +547,18 @@ impl Shell {
                 arrays.push((name, add, vals));
                 continue;
             }
-            avals.push((k.clone(), self.expand_one(w)?));
+            // NAME[i]=v の i を展開する (連想配列のキーにも、配列の番号の式にも)
+            let k = match k.split_once('[') {
+                Some((n, r)) => {
+                    let (r, plus) = match r.strip_suffix('+') {
+                        Some(r) => (r, "+"),
+                        None => (r, ""),
+                    };
+                    format!("{}[{}]{}", n, self.expand_one(&r[..r.len() - 1])?, plus)
+                }
+                None => k.clone(),
+            };
+            avals.push((k, self.expand_one(w)?));
         }
         let redirs = self.expand_redirs(redirs)?;
         if self.xtrace {
@@ -486,12 +625,16 @@ impl Shell {
         };
         if r.args.is_empty() {
             for (k, v) in &r.assigns {
-                self.set_var(k, v);
+                if let Err(e) = self.assign(k, v) {
+                    eprintln!("{}: {}", shell_name(), e);
+                    return 1;
+                }
             }
             for (k, add, vals) in &r.arrays {
-                let mut v = if *add { self.array(k).unwrap_or_default() } else { vec![] };
-                v.extend(vals.iter().cloned());
-                self.set_array(k, v);
+                if let Err(e) = self.set_items(k, vals.clone(), *add) {
+                    eprintln!("{}: {}", shell_name(), e);
+                    return 1;
+                }
             }
             let st = self.with_redirs(&r.redirs, |_| 0);
             return if st != 0 { st } else { self.subst_status.unwrap_or(0) };
@@ -575,6 +718,55 @@ impl Shell {
                     }
                     last = self.run_list(body);
                     if self.flow != Flow::None && !self.loop_flow() {
+                        break;
+                    }
+                }
+                self.loops -= 1;
+                self.status = last;
+                last
+            }
+            Compound::Arith(e) => {
+                let st = match self.arith_expr(e) {
+                    Ok(v) => (v == 0) as i32,
+                    Err(err) => {
+                        eprintln!("{}: {}", shell_name(), err);
+                        2
+                    }
+                };
+                self.status = st;
+                st
+            }
+            Compound::ArithFor(init, cond, step, body) => {
+                if !init.is_empty()
+                    && let Err(e) = self.arith_expr(init)
+                {
+                    eprintln!("{}: {}", shell_name(), e);
+                    return 1;
+                }
+                let mut last = 0;
+                self.loops += 1;
+                loop {
+                    if mcp::stopped() {
+                        break;
+                    }
+                    match if cond.is_empty() { Ok(1) } else { self.arith_expr(cond) } {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("{}: {}", shell_name(), e);
+                            last = 1;
+                            break;
+                        }
+                    }
+                    last = self.run_list(body);
+                    if self.flow != Flow::None && !self.loop_flow() {
+                        break;
+                    }
+                    if !step.is_empty()
+                        && let Err(e) = self.arith_expr(step)
+                    {
+                        eprintln!("{}: {}", shell_name(), e);
+                        last = 1;
                         break;
                     }
                 }
@@ -671,6 +863,8 @@ impl Shell {
         }
         for (k, old, exported) in self.locals.pop().unwrap().into_iter().rev() {
             self.vars.remove(&k);
+            self.arrays.remove(&k);
+            self.assoc.remove(&k);
             match (old, exported) {
                 (Some(v), true) => unsafe { std::env::set_var(&k, v) },
                 (Some(v), false) => {
@@ -880,7 +1074,7 @@ impl Shell {
                     }
                     let Ready { args, assigns, .. } = r;
                     for (k, v) in &assigns {
-                        self.set_var(k, v);
+                        let _ = self.assign(k, v);
                     }
                     if args.is_empty() {
                         return 0;
@@ -1203,14 +1397,27 @@ impl Shell {
             // zsh の補完とモジュールの設定: aish では補完はプラグインなので、なにもしない
             "zmodload" | "zstyle" | "autoload" | "compinit" | "compdef" => 0,
             // typeset / declare: 関数の中なら local、外なら代入。-x は export。ほかの印 (-U -r -i -g ...) は気にしない
-            "typeset" | "declare" => {
-                let flags: String = a.iter().filter(|x| x.starts_with('-') || x.starts_with('+')).flat_map(|x| x.chars().skip(1)).collect();
-                let names: Vec<String> = a.iter().filter(|x| !x.starts_with('-') && !x.starts_with('+')).cloned().collect();
-                let global = flags.contains('g') || self.locals.is_empty();
+            "typeset" | "declare" | "local" | "readonly" => {
+                // -a 配列、-A 連想配列、-i 数、-x export、-r 書きかえない (aish は止めない)、-g 関数の中でも外の変数。
+                // NAME=(...) は配列の印つきの語で来る (parse.rs)
+                if name == "local" && self.locals.is_empty() {
+                    eprintln!("local: can only be used in a function");
+                    return 1;
+                }
+                let flags: String = a.iter().filter(|x| (x.starts_with('-') || x.starts_with('+')) && x.len() > 1).flat_map(|x| x.chars().skip(1)).collect();
+                let names: Vec<String> = a.iter().filter(|x| !((x.starts_with('-') || x.starts_with('+')) && x.len() > 1)).cloned().collect();
+                if names.is_empty() && flags.contains('p') {
+                    return 0;
+                }
+                let global = (flags.contains('g') || self.locals.is_empty()) && name != "local";
                 for x in &names {
                     let (k, v) = match x.split_once('=') {
                         Some((k, v)) => (k.to_string(), Some(v.to_string())),
                         None => (x.clone(), None),
+                    };
+                    let (k, add) = match k.strip_suffix('+') {
+                        Some(k) => (k.to_string(), true),
+                        None => (k, false),
                     };
                     if !parse::valid_name(&k) {
                         eprintln!("{}: {}: not a valid identifier", name, k);
@@ -1224,36 +1431,34 @@ impl Shell {
                             self.locals[frame].push((k.clone(), old, exported));
                         }
                     }
-                    if flags.contains('x') {
+                    if flags.contains('i') {
+                        self.int_vars.insert(k.clone());
+                    }
+                    if flags.contains('A') && !self.assoc.contains_key(&k) {
+                        self.vars.remove(&k);
+                        self.arrays.remove(&k);
+                        self.assoc.insert(k.clone(), vec![]);
+                    }
+                    let items = v.as_deref().and_then(|v| v.strip_prefix(parse::ARRAY));
+                    if let Some(items) = items {
+                        let items: Vec<String> = items.split(parse::SEP).filter(|x| !x.is_empty()).map(String::from).collect();
+                        if let Err(e) = self.set_items(&k, items, add) {
+                            eprintln!("{}: {}", name, e);
+                            return 1;
+                        }
+                    } else if flags.contains('x') {
                         self.export(&k, v);
                     } else if let Some(v) = v {
-                        self.set_var(&k, &v);
-                    } else if !global {
+                        let key = if add { format!("{}+", k) } else { k.clone() };
+                        if let Err(e) = self.assign(&key, &v) {
+                            eprintln!("{}: {}", name, e);
+                            return 1;
+                        }
+                    } else if flags.contains('a') && !self.arrays.contains_key(&k) {
+                        self.set_array(&k, vec![]);
+                    } else if !global && !flags.contains('A') && !flags.contains('a') {
                         self.set_var(&k, "");
                     }
-                }
-                0
-            }
-            "local" => {
-                let Some(frame) = self.locals.len().checked_sub(1) else {
-                    eprintln!("local: can only be used in a function");
-                    return 1;
-                };
-                for x in a {
-                    let (k, v) = match x.split_once('=') {
-                        Some((k, v)) => (k.to_string(), Some(v.to_string())),
-                        None => (x.clone(), None),
-                    };
-                    if !parse::valid_name(&k) {
-                        eprintln!("local: {}: not a valid identifier", k);
-                        return 1;
-                    }
-                    if !self.locals[frame].iter().any(|(n, ..)| *n == k) {
-                        let exported = std::env::var_os(&k).is_some();
-                        let old = self.get_var(&k);
-                        self.locals[frame].push((k.clone(), old, exported));
-                    }
-                    self.set_var(&k, &v.unwrap_or_default());
                 }
                 0
             }
@@ -1445,7 +1650,15 @@ impl Shell {
                     return 2;
                 }
                 a.pop();
-                test_with(&a, true)
+                REMATCH.with(|m| m.borrow_mut().take());
+                let st = test_with(&a, true);
+                // =~ で合ったもの: BASH_REMATCH (bash) と MATCH / match (zsh)
+                if let Some(caps) = REMATCH.with(|m| m.borrow_mut().take()) {
+                    self.set_var("MATCH", caps.first().map_or("", |s| s.as_str()));
+                    self.set_array("match", caps.get(1..).unwrap_or(&[]).to_vec());
+                    self.set_array("BASH_REMATCH", caps);
+                }
+                st
             }
             "test" | "[" => {
                 let mut a = a.to_vec();
@@ -1467,6 +1680,284 @@ impl Shell {
                 eprintln!("{}: {}: {}", shell_name(), a[0], last_err());
                 exit_shell(126)
             }
+            // let 式...: 最後の式が 0 なら 1 (bash)
+            "let" => {
+                let mut last = 0;
+                for x in a {
+                    match self.arith(x) {
+                        Ok(v) => last = v,
+                        Err(e) => {
+                            eprintln!("let: {}", e);
+                            return 1;
+                        }
+                    }
+                }
+                (last == 0) as i32
+            }
+            // printf -v VAR FORMAT ARGS...: printf のコマンドの出力を変数に
+            "printf" => {
+                let (Some(var), Some(_)) = (a.get(1), a.get(2)) else {
+                    eprintln!("printf: usage: printf -v var format [arguments]");
+                    return 2;
+                };
+                let Some(prog) = self.find("printf") else {
+                    eprintln!("printf: command not found");
+                    return 127;
+                };
+                match std::process::Command::new(prog).args(&a[2..]).stderr(std::process::Stdio::inherit()).output() {
+                    Ok(o) => {
+                        let v = String::from_utf8_lossy(&o.stdout).into_owned();
+                        let _ = self.assign(var, &v);
+                        o.status.code().unwrap_or(1)
+                    }
+                    Err(e) => {
+                        eprintln!("printf: {}", e);
+                        1
+                    }
+                }
+            }
+            // mapfile / readarray [-t] [-d C] [-n N] [-s N] [NAME]: 標準入力の行を配列に (既定は MAPFILE)
+            "mapfile" | "readarray" => {
+                let (mut trim, mut delim, mut max, mut skip, mut arr) = (false, b'\n', 0usize, 0usize, "MAPFILE".to_string());
+                let mut i = 0;
+                while i < a.len() {
+                    match a[i].as_str() {
+                        "-t" => trim = true,
+                        "-d" => {
+                            i += 1;
+                            delim = a.get(i).and_then(|v| v.bytes().next()).unwrap_or(0);
+                        }
+                        "-n" => {
+                            i += 1;
+                            max = a.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        }
+                        "-s" => {
+                            i += 1;
+                            skip = a.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        }
+                        x if !x.starts_with('-') => arr = x.to_string(),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let mut data = vec![];
+                let _ = io::Read::read_to_end(&mut io::stdin(), &mut data);
+                let mut items = vec![];
+                for chunk in data.split_inclusive(|&b| b == delim) {
+                    let mut c = chunk.to_vec();
+                    if trim && c.last() == Some(&delim) {
+                        c.pop();
+                    }
+                    items.push(String::from_utf8_lossy(&c).into_owned());
+                }
+                let items: Vec<String> = items.into_iter().skip(skip).take(if max == 0 { usize::MAX } else { max }).collect();
+                self.set_array(&arr, items);
+                0
+            }
+            // getopts OPTSTRING NAME [ARGS...]: OPTIND と OPTARG (POSIX)
+            "getopts" => {
+                let (Some(spec), Some(var)) = (a.first(), a.get(1)) else {
+                    eprintln!("getopts: usage: getopts optstring name [arg ...]");
+                    return 2;
+                };
+                let args: Vec<String> = if a.len() > 2 { a[2..].to_vec() } else { self.params.get(1..).unwrap_or(&[]).to_vec() };
+                let silent = spec.starts_with(':');
+                let spec = spec.trim_start_matches(':');
+                let mut ind: usize = self.get_var("OPTIND").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+                // 1 つの引数の中の何文字目か (-abc を 1 文字ずつ)
+                let mut pos: usize = self.get_var("_AISH_OPTPOS").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let Some(arg) = args.get(ind - 1).cloned() else {
+                    self.set_var(var, "?");
+                    return 1;
+                };
+                if pos == 1 && (!arg.starts_with('-') || arg == "-") {
+                    self.set_var(var, "?");
+                    return 1;
+                }
+                if pos == 1 && arg == "--" {
+                    self.set_var("OPTIND", &(ind + 1).to_string());
+                    self.set_var(var, "?");
+                    return 1;
+                }
+                let cs: Vec<char> = arg.chars().collect();
+                let c = cs[pos];
+                pos += 1;
+                let at_end = pos >= cs.len();
+                let mut next = |sh: &mut Shell, ind: &mut usize, pos: &mut usize| {
+                    *ind += 1;
+                    *pos = 1;
+                    sh.set_var("OPTIND", &ind.to_string());
+                };
+                match spec.find(c) {
+                    Some(k) if spec[k + 1..].starts_with(':') => {
+                        let val = if !at_end {
+                            cs[pos..].iter().collect::<String>()
+                        } else {
+                            match args.get(ind) {
+                                Some(v) => {
+                                    ind += 1;
+                                    v.clone()
+                                }
+                                None => {
+                                    next(self, &mut ind, &mut pos);
+                                    self.set_var("_AISH_OPTPOS", "1");
+                                    if silent {
+                                        self.set_var(var, ":");
+                                        self.set_var("OPTARG", &c.to_string());
+                                    } else {
+                                        eprintln!("{}: option requires an argument -- {}", shell_name(), c);
+                                        self.set_var(var, "?");
+                                    }
+                                    return 0;
+                                }
+                            }
+                        };
+                        self.set_var("OPTARG", &val);
+                        next(self, &mut ind, &mut pos);
+                    }
+                    Some(_) => {
+                        self.unset("OPTARG");
+                        if at_end {
+                            next(self, &mut ind, &mut pos);
+                        }
+                    }
+                    None => {
+                        if silent {
+                            self.set_var("OPTARG", &c.to_string());
+                        } else {
+                            eprintln!("{}: illegal option -- {}", shell_name(), c);
+                        }
+                        self.set_var(var, "?");
+                        if at_end {
+                            next(self, &mut ind, &mut pos);
+                        }
+                        self.set_var("_AISH_OPTPOS", &pos.to_string());
+                        return 0;
+                    }
+                }
+                self.set_var(var, &c.to_string());
+                self.set_var("OPTIND", &ind.to_string());
+                self.set_var("_AISH_OPTPOS", &pos.to_string());
+                0
+            }
+            // pushd DIR / popd / dirs: ディレクトリの積み重ね (bash と zsh)
+            "pushd" | "popd" | "dirs" => {
+                let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                match name {
+                    "pushd" => {
+                        let target = match a.iter().find(|x| !x.starts_with('-') || x.len() == 1) {
+                            Some(d) => d.clone(),
+                            None => match self.dirstack.pop() {
+                                Some(d) => d,
+                                None => {
+                                    eprintln!("pushd: no other directory");
+                                    return 1;
+                                }
+                            },
+                        };
+                        let st = self.builtin(&["cd".into(), target]);
+                        if st != 0 {
+                            return st;
+                        }
+                        self.dirstack.push(cwd);
+                    }
+                    "popd" => {
+                        let Some(d) = self.dirstack.pop() else {
+                            eprintln!("popd: directory stack empty");
+                            return 1;
+                        };
+                        let st = self.builtin(&["cd".into(), d]);
+                        if st != 0 {
+                            return st;
+                        }
+                    }
+                    _ => {}
+                }
+                if a.iter().any(|x| x == "-c") && name == "dirs" {
+                    self.dirstack.clear();
+                    return 0;
+                }
+                let now = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                let home = self.get_var("HOME").unwrap_or_default();
+                let show = |d: &str| if !home.is_empty() && d.starts_with(&home) { format!("~{}", &d[home.len()..]) } else { d.to_string() };
+                let all: Vec<String> = std::iter::once(now).chain(self.dirstack.iter().rev().cloned()).map(|d| show(&d)).collect();
+                if a.iter().any(|x| x == "-v") {
+                    for (k, d) in all.iter().enumerate() {
+                        println!("{:2}  {}", k, d);
+                    }
+                } else if name == "dirs" || !a.iter().any(|x| x == "-q") {
+                    println!("{}", all.join(" "));
+                }
+                0
+            }
+            // shopt -s/-u NAME (bash): nullglob と dotglob は setopt と同じ。extglob、globstar などは受けるだけ
+            // (aish の ** はいつも使える)。-q は様子だけ
+            "shopt" => {
+                let on = a.iter().any(|x| x == "-s");
+                let off = a.iter().any(|x| x == "-u");
+                let q = a.iter().any(|x| x == "-q");
+                let mut st = 0;
+                for n in a.iter().filter(|x| !x.starts_with('-')) {
+                    let key = match n.as_str() {
+                        "nullglob" | "dotglob" | "nocaseglob" | "failglob" => n.to_string(),
+                        _ => format!("shopt_{}", n),
+                    };
+                    if on {
+                        self.opts.insert(key);
+                    } else if off {
+                        self.opts.remove(&key);
+                    } else {
+                        let set = self.opts.contains(&key);
+                        if !q {
+                            println!("{:<15}{}", n, if set { "on" } else { "off" });
+                        }
+                        st |= (!set) as i32;
+                    }
+                }
+                st
+            }
+            // compgen -c / -f / -d PREFIX (補完の候補を出す)
+            "compgen" => {
+                let mode = a.iter().find(|x| x.starts_with('-')).map(|s| s.as_str()).unwrap_or("-c");
+                let pre = a.iter().find(|x| !x.starts_with('-')).cloned().unwrap_or_default();
+                let mut out: Vec<String> = vec![];
+                match mode {
+                    "-c" | "-b" | "-A" => {
+                        out.extend(BUILTINS.iter().map(|s| s.to_string()));
+                        out.extend(self.funcs.keys().cloned());
+                        out.extend(self.aliases.keys().cloned());
+                        if mode == "-c" {
+                            for d in self.get_var("PATH").unwrap_or_default().split(':') {
+                                if let Ok(rd) = std::fs::read_dir(d) {
+                                    out.extend(rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+                                }
+                            }
+                        }
+                    }
+                    "-f" | "-d" => {
+                        let (dir, base) = match pre.rsplit_once('/') {
+                            Some((d, b)) => (if d.is_empty() { "/".to_string() } else { d.to_string() }, b.to_string()),
+                            None => (".".to_string(), pre.clone()),
+                        };
+                        if let Ok(rd) = std::fs::read_dir(&dir) {
+                            for e in rd.flatten() {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if n.starts_with(&base) && (mode == "-f" || e.path().is_dir()) {
+                                    out.push(if dir == "." { n } else { format!("{}/{}", dir.trim_end_matches('/'), n) });
+                                }
+                            }
+                        }
+                        out.retain(|x| x.starts_with(&pre) || !pre.contains('/'));
+                    }
+                    _ => {}
+                }
+                out.retain(|x| x.starts_with(&pre) || mode == "-f" || mode == "-d");
+                out.sort();
+                for x in &out {
+                    println!("{}", x);
+                }
+                (out.is_empty()) as i32
+            }
             // hash: aish はコマンドの場所を覚えない (毎回 PATH から探す) ので、hash -r は何もしない。
             // hash NAME は、見つからなければ 1 (bash と同じ。スクリプトが「入っているか」に使う)
             "hash" => {
@@ -1476,6 +1967,28 @@ impl Shell {
                         eprintln!("{}: hash: {}: not found", shell_name(), x);
                         st = 1;
                     }
+                }
+                st
+            }
+            // type -t NAME: keyword / function / builtin / file / alias だけ
+            "type" if a.first().is_some_and(|x| x == "-t") => {
+                let mut st = 0;
+                for x in &a[1..] {
+                    let t = if parse::is_reserved(x) {
+                        "keyword"
+                    } else if self.aliases.contains_key(x) {
+                        "alias"
+                    } else if self.funcs.contains_key(x) {
+                        "function"
+                    } else if BUILTINS.contains(&x.as_str()) {
+                        "builtin"
+                    } else if self.find(x).is_some_and(|p| std::fs::metadata(p).is_ok()) {
+                        "file"
+                    } else {
+                        st = 1;
+                        continue;
+                    };
+                    println!("{}", t);
                 }
                 st
             }
@@ -1539,24 +2052,33 @@ impl Shell {
             if !(on || x.starts_with('+')) || x.len() < 2 {
                 break;
             }
-            if &x[1..] == "o" {
-                // set -o errexit / xtrace
-                i += 1;
-                match a.get(i).map(|s| s.as_str()) {
-                    Some("errexit") => self.errexit = on,
-                    Some("xtrace") => self.xtrace = on,
-                    Some(_) | None => {}
-                }
-            } else {
-                for c in x[1..].chars() {
-                    match c {
-                        'e' => self.errexit = on,
-                        'x' => self.xtrace = on,
-                        'u' | 'f' | 'h' | 'm' | 'b' | 'C' | 'v' | 'n' => {}
-                        _ => {
-                            eprintln!("set: -{}: invalid option", c);
-                            return 2;
+            // -euo pipefail のように、まとめた中の o は次の引数を名前として読む
+            for c in x[1..].chars() {
+                match c {
+                    'o' => {
+                        i += 1;
+                        match a.get(i).map(|s| s.as_str()) {
+                            Some("errexit") => self.errexit = on,
+                            Some("xtrace") => self.xtrace = on,
+                            Some("nounset") => self.nounset = on,
+                            Some("pipefail") => unsafe { jobs::PIPEFAIL = on },
+                            Some(_) => {}
+                            None => {
+                                // set -o だけ: 今の様子
+                                let p = unsafe { jobs::PIPEFAIL };
+                                for (n, v) in [("errexit", self.errexit), ("nounset", self.nounset), ("pipefail", p), ("xtrace", self.xtrace)] {
+                                    println!("{:<15}{}", n, if v { "on" } else { "off" });
+                                }
+                            }
                         }
+                    }
+                    'e' => self.errexit = on,
+                    'x' => self.xtrace = on,
+                    'u' => self.nounset = on,
+                    'f' | 'h' | 'm' | 'b' | 'C' | 'v' | 'n' | 'B' | 'H' | 'T' | 'E' | 'P' | 'a' | 'k' | 't' => {}
+                    _ => {
+                        eprintln!("set: -{}: invalid option", c);
+                        return 2;
                     }
                 }
             }
@@ -1572,17 +2094,51 @@ impl Shell {
 
     /// read [-r] [-p PROMPT] [NAME...]
     fn read(&mut self, a: &[String]) -> i32 {
-        let mut raw = false;
+        // -r (\ をそのまま) -a NAME (配列に) -d C (区切り。'' は NUL) -n N / -N N (N 文字まで) -p 文字 (前に出す)
+        // -t 秒 (待つ時間) -u FD (読むところ) -s -e (端末の設定。aish は気にしない)。-ra のようにまとめてよい
+        let (mut raw, mut arr, mut delim, mut count, mut timeout, mut fd) = (false, None::<String>, b'\n', None::<usize>, None::<f64>, 0);
         let mut names = vec![];
         let mut i = 0;
         while i < a.len() {
-            match a[i].as_str() {
-                "-r" => raw = true,
-                "-p" => {
-                    i += 1;
-                    eprint!("{}", a.get(i).map(|s| s.as_str()).unwrap_or(""));
+            let x = &a[i];
+            if !names.is_empty() || !x.starts_with('-') || x.len() < 2 {
+                names.push(x.to_string());
+                i += 1;
+                continue;
+            }
+            let cs: Vec<char> = x[1..].chars().collect();
+            let mut k = 0;
+            while k < cs.len() {
+                let c = cs[k];
+                k += 1;
+                // 値をとるもの: 残りか、次の引数
+                let mut val = || -> Option<String> {
+                    if k < cs.len() {
+                        let v: String = cs[k..].iter().collect();
+                        k = cs.len();
+                        Some(v)
+                    } else {
+                        i += 1;
+                        a.get(i).cloned()
+                    }
+                };
+                match c {
+                    'r' => raw = true,
+                    's' | 'e' => {}
+                    'a' => arr = val(),
+                    'd' => delim = val().and_then(|v| v.bytes().next()).unwrap_or(0),
+                    'n' | 'N' => count = val().and_then(|v| v.parse().ok()),
+                    't' => timeout = val().and_then(|v| v.parse().ok()),
+                    'u' => fd = val().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    'p' => eprint!("{}", val().unwrap_or_default()),
+                    'i' => {
+                        val();
+                    }
+                    _ => {
+                        eprintln!("read: -{}: invalid option", c);
+                        return 2;
+                    }
                 }
-                x => names.push(x.to_string()),
             }
             i += 1;
         }
@@ -1592,9 +2148,20 @@ impl Shell {
         let mut line = String::new();
         let mut got = false;
         let mut bytes = vec![];
+        let deadline = timeout.map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t));
         loop {
+            if count.is_some_and(|n| String::from_utf8_lossy(&bytes).chars().count() >= n) {
+                break;
+            }
+            if let Some(d) = deadline {
+                let left = d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+                let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                if unsafe { libc::poll(&mut p, 1, left) } <= 0 {
+                    return 142;
+                }
+            }
             let mut c = 0u8;
-            let n = unsafe { libc::read(0, &mut c as *mut u8 as *mut libc::c_void, 1) };
+            let n = unsafe { libc::read(fd, &mut c as *mut u8 as *mut libc::c_void, 1) };
             if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 return 130;
             }
@@ -1602,7 +2169,7 @@ impl Shell {
                 break;
             }
             got = true;
-            if c == b'\n' {
+            if c == delim {
                 bytes.push(b'\n');
                 break;
             }
@@ -1610,6 +2177,21 @@ impl Shell {
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let ended = text.ends_with('\n');
+        // -a: IFS で分けて配列に
+        if let Some(name) = arr {
+            let ifs = self.get_var("IFS").unwrap_or_else(|| " \t\n".into());
+            let body = text.trim_end_matches('\n');
+            let body = if raw { body.to_string() } else { body.replace("\\\n", "").replace('\\', "") };
+            let ws: String = ifs.chars().filter(|c| c.is_whitespace()).collect();
+            let hard: Vec<char> = ifs.chars().filter(|c| !c.is_whitespace()).collect();
+            let items: Vec<String> = if hard.is_empty() {
+                body.split(|c: char| ws.contains(c)).filter(|x| !x.is_empty()).map(String::from).collect()
+            } else {
+                body.trim_matches(|c: char| ws.contains(c)).split(|c: char| hard.contains(&c)).map(|x| x.trim_matches(|c: char| ws.contains(c)).to_string()).collect()
+            };
+            self.set_array(&name, items);
+            return if got && (ended || !body.is_empty()) { 0 } else { 1 };
+        }
         let mut cs = text.trim_end_matches('\n').chars().peekable();
         // \ をはずす (-r でなければ)。\ で守った文字は分けない印 (\u{0}) をつける
         let mut protected = vec![];
@@ -1830,6 +2412,11 @@ fn test_with(a: &[String], dbl: bool) -> i32 {
     }
 }
 
+thread_local! {
+    /// [[ x =~ re ]] で合ったもの (ぜんぶと、( ) ごと)
+    static REMATCH: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 struct Test<'a> {
     a: &'a [String],
     i: usize,
@@ -1891,7 +2478,14 @@ impl Test<'_> {
                         let m = glob::glob_match(&r.chars().collect::<Vec<_>>(), &l.chars().collect::<Vec<_>>());
                         Ok(m == (op != "!="))
                     }
-                    "=~" => regex::Regex::new(&glob::unmark(&r)).map(|re| re.is_match(&l)).map_err(|e| format!("=~: {}", e)),
+                    "=~" => regex::Regex::new(&glob::unmark(&r)).map_err(|e| format!("=~: {}", e)).map(|re| match re.captures(&l) {
+                        Some(c) => {
+                            let caps: Vec<String> = c.iter().map(|m| m.map_or(String::new(), |m| m.as_str().to_string())).collect();
+                            REMATCH.with(|m| *m.borrow_mut() = Some(caps));
+                            true
+                        }
+                        None => false,
+                    }),
                     _ => binary_test(&l, &op, &glob::unmark(&r)),
                 };
             }
@@ -1977,6 +2571,14 @@ fn binary_test(l: &str, op: &str, r: &str) -> Result<bool, String> {
 
 // ---- 入口 ----
 
+/// sh や bash の名前で呼ばれたら (/bin/sh は aish): 来るのは bash の書き方のスクリプトなので、配列の番号は 0 から
+/// (aish の名前のときは zsh と同じく 1 から。setopt ksharrays で変えられる)
+fn bash_like(sh: &mut Shell, base: &str) {
+    if matches!(base, "sh" | "bash") {
+        sh.opts.insert("ksharrays".into());
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // 呼ばれた名前: sh (と -sh) なら POSIX の sh として
@@ -1991,6 +2593,7 @@ fn main() {
         }
         let mut sh = Shell::new(ps);
         trap::set_shell(&mut sh);
+        bash_like(&mut sh, base);
         let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
     }
@@ -2001,6 +2604,7 @@ fn main() {
     // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);
     trap::set_shell(&mut sh);
+    bash_like(&mut sh, base);
     // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
     if let Ok(cwd) = std::env::current_dir() {
         let cwd = cwd.display().to_string();
@@ -2262,4 +2866,13 @@ fn cpu_times() -> (f64, f64) {
         }
     }
     u
+}
+
+/// $RANDOM: getrandom があればそれ、なければ時刻から
+pub fn rand_u32() -> u32 {
+    let mut b = [0u8; 4];
+    if unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, 4, 0) } == 4 {
+        return u32::from_le_bytes(b);
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos())
 }
