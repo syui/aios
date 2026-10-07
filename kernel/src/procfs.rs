@@ -294,6 +294,28 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
     Ok(f.describe())
 }
 
+/// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
+/// ファイルの名前があるもの (Kind::Inode) は magic_link でふつうに開くので、ここでは None
+pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
+    let (mut dir, mut p) = (String::from(cwd), String::from(path));
+    for _ in 0..8 {
+        let (full, ino) = crate::vfs::lookup(&dir, &p, false).ok()?;
+        if ino.meta().mode & crate::vfs::S_IFMT != crate::vfs::S_IFLNK {
+            return None;
+        }
+        if let Some(pi) = ino.as_any().downcast_ref::<ProcInode>() {
+            let Node::Fd(pid, n) = pi.node else { return None };
+            let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
+            let named = matches!(f.borrow().kind, crate::file::Kind::Inode(..));
+            return (!named).then_some(f);
+        }
+        // リンクの先は、リンクのあるディレクトリから
+        p = ino.readlink().ok()?;
+        dir = full.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
+    }
+    None
+}
+
 impl Inode for ProcInode {
     fn id(&self) -> (usize, u64) {
         (self.fs, self.ino())
