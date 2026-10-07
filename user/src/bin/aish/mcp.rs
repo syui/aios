@@ -10,6 +10,7 @@ use super::{Flow, Shell, cstr, flush};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::os::fd::FromRawFd;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
@@ -117,8 +118,30 @@ impl Shell {
         }
         flush();
         let mut out = out;
-        for line in std::io::BufReader::new(inp).lines() {
-            let Ok(line) = line else { break };
+        // 新しいビルドに入れかわったあと (reload): 読みかけの要求を先に、ツールが変わったことを知らせる
+        let pending = std::env::var("AISH_MCP_PENDING").unwrap_or_default();
+        let resumed = std::env::var_os("AISH_MCP_RESUMED").is_some();
+        unsafe {
+            std::env::remove_var("AISH_MCP_PENDING");
+            std::env::remove_var("AISH_MCP_RESUMED");
+        }
+        if resumed {
+            RELOADED.store(true, Ordering::Relaxed);
+            send(&mut out, &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }));
+        }
+        let mut reader = std::io::BufReader::new(inp);
+        let mut queue: std::collections::VecDeque<String> = pending.lines().map(String::from).collect();
+        loop {
+            let line = match queue.pop_front() {
+                Some(l) => l,
+                None => {
+                    let mut l = String::new();
+                    match reader.read_line(&mut l) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => l,
+                    }
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -128,10 +151,22 @@ impl Shell {
             };
             // id のないものは知らせ (notifications/initialized など)。答えない
             let Some(id) = req.get("id").cloned() else { continue };
+            // ツールを使う前に: aish かプラグインがビルドしなおされていたら、同じつながりのまま新しいものに入れかわる
+            // (/mcp でつなぎなおさなくていいように)。この要求と、まだ読んでいないものは新しいほうにわたす
+            if matches!(req["method"].as_str(), Some("tools/call" | "tools/list")) && self.should_reload() {
+                let mut rest = line.trim_end().to_string();
+                rest.push('\n');
+                for q in &queue {
+                    rest.push_str(q.trim_end());
+                    rest.push('\n');
+                }
+                rest.push_str(&String::from_utf8_lossy(reader.buffer()));
+                reload(&rest, &mut reader, &out);
+            }
             let reply = match req["method"].as_str().unwrap_or("") {
                 "initialize" => Ok(json!({
                     "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or(PROTOCOL),
-                    "capabilities": { "tools": {} },
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": { "name": "aish", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": INSTRUCTIONS,
                 })),
@@ -208,6 +243,12 @@ impl Shell {
             }
             r
         };
+        let mut r = r;
+        if RELOADED.swap(false, Ordering::Relaxed)
+            && let Some(o) = r.as_object_mut()
+        {
+            o.insert("reloaded".into(), json!("aish restarted with the new build (shell variables were reset; the directory is kept)"));
+        }
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
         // ふだんは読む形の text だけ (Claude Code は structuredContent があるとそちらを Claude に見せるので)。
         // aish --mcp --json なら、いままでどおり JSON (ほかのプログラムがつなぐとき)
@@ -216,6 +257,23 @@ impl Shell {
         } else {
             json!({ "content": [{ "type": "text", "text": render(&r) }], "isError": is_err })
         }
+    }
+
+    /// 入れかわるか: aish かプラグインのバイナリが起きたときと変わっていて、書き終わっている (2 秒たった) こと。
+    /// ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているときは入れかわらない
+    fn should_reload(&mut self) -> bool {
+        let Some((_, exe, file)) = STARTED.get().cloned() else { return false };
+        let settled = |f: &FileId| f.mtime.elapsed().is_ok_and(|d| d.as_secs() >= 2);
+        let me = FileId::of(&exe).filter(|d| Some(*d) != file && settled(d)).is_some();
+        let plugins = self.plugins.check().iter().any(|p| p["rebuilt"] == true && p["prog"].as_str().and_then(FileId::of).is_some_and(|f| settled(&f)));
+        if !me && !plugins {
+            return false;
+        }
+        if JOBS.lock().is_ok_and(|j| j.iter().any(|x| x.done.is_none())) {
+            return false;
+        }
+        let src = self.get_var("AISH_SRC").filter(|s| !s.is_empty());
+        src.as_deref().map(building).unwrap_or_default().is_empty()
     }
 
     /// check: aish とプラグインの様子と、直すこと (problems)。
@@ -228,7 +286,7 @@ impl Shell {
         let disk = FileId::of(&exe);
         let rebuilt = disk.is_some() && disk != file;
         if rebuilt {
-            problems.push("aish: rebuilt after the server started; reconnect (/mcp) to use the new one".into());
+            problems.push("aish: rebuilt after the server started; it restarts itself with the new build at the next tool call".into());
         }
         // ソースのほうが新しい: まだビルドしていない (ディスクのバイナリとくらべる)
         let stale = |dirs: &[String], bin: Option<u64>| -> Option<String> {
@@ -238,7 +296,7 @@ impl Shell {
         if let Some(src) = &src
             && let Some(p) = stale(&[format!("{}/user/src", src)], disk.map(|f| f.secs()))
         {
-            problems.push(format!("aish: {} changed after the build; build (bin/aish-mcp.sh --build) and reconnect", p));
+            problems.push(format!("aish: {} changed after the build; build it (bin/aish-mcp.sh --build) and aish restarts itself", p));
         }
         let plugins = self.plugins.check();
         let alive = plugins.iter().filter(|p| p["alive"] == true).count();
@@ -250,10 +308,10 @@ impl Shell {
             if p["alive"] != true {
                 let why = p["why"].as_str().unwrap_or("stopped");
                 note = format!("  [stopped: {}]", why);
-                problems.push(format!("plugin {}: stopped ({}); reconnect (/mcp) to start it again", name, why));
+                problems.push(format!("plugin {}: stopped ({}); rebuild it, or reconnect (/mcp), to start it again", name, why));
             } else if p["rebuilt"] == true {
                 note = "  [rebuilt]".into();
-                problems.push(format!("plugin {}: rebuilt after it started; reconnect (/mcp) to use the new one", name));
+                problems.push(format!("plugin {}: rebuilt after it started; aish restarts with it at the next tool call", name));
             }
             if let (Some(src), Some(prog)) = (&src, p["prog"].as_str()) {
                 // aish-edit は shell/edit (と SDK の shell/plugin)
@@ -262,7 +320,7 @@ impl Shell {
                 if std::path::Path::new(&dirs[0]).is_dir()
                     && let Some(f) = stale(&dirs, FileId::of(prog).map(|f| f.secs()))
                 {
-                    problems.push(format!("plugin {}: {} changed after the build; build (bin/aish-mcp.sh --build) and reconnect", name, f));
+                    problems.push(format!("plugin {}: {} changed after the build; build it (bin/aish-mcp.sh --build) and aish restarts itself", name, f));
                 }
             }
             text.push_str(&format!("  {:<8} {}{}\n", name, tools.join(" "), note));
@@ -624,6 +682,36 @@ fn render(r: &Value) -> String {
         s.push_str(&Value::Object(meta).to_string());
     }
     s
+}
+
+/// 入れかわったあとの最初の答えに、そう書く
+static RELOADED: AtomicBool = AtomicBool::new(false);
+
+/// 同じ引数で自分を exec しなおす。プロトコルの fd を 0 と 1 に戻し、読みかけのもの (pending) は環境変数でわたす。
+/// プラグインは閉じた標準入力で終わり、新しいほうがまた起こす。しくじったら、そのまま古いほうで続ける
+fn reload(pending: &str, reader: &mut std::io::BufReader<std::fs::File>, out: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    let exe = STARTED.get().map(|s| s.1.clone()).unwrap_or_default();
+    let args: Vec<CString> = std::env::args().map(|a| cstr(&a)).collect();
+    let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    unsafe {
+        std::env::set_var("AISH_MCP_PENDING", pending);
+        std::env::set_var("AISH_MCP_RESUMED", "1");
+        // AISH_MCP は mcp() がまたつける。ほかの子のための環境はそのまま
+        std::env::remove_var("AISH_MCP");
+        libc::dup2(reader.get_ref().as_raw_fd(), 0);
+        libc::dup2(out.as_raw_fd(), 1);
+        libc::execv(cstr(&exe).as_ptr(), argv.as_ptr());
+        // しくじった: 戻す
+        let null = libc::open(cstr("/dev/null").as_ptr(), libc::O_RDWR);
+        libc::dup2(null, 0);
+        libc::close(null);
+        libc::dup2(2, 1);
+        std::env::remove_var("AISH_MCP_PENDING");
+        std::env::remove_var("AISH_MCP_RESUMED");
+        std::env::set_var("AISH_MCP", "1");
+    }
 }
 
 /// 秒を "1h 2m 3s" に
