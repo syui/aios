@@ -3,7 +3,35 @@
 //   予約語 (if for ...) は黄、文字列は黄 ("..." の中の $変数 はシアン)、あるファイルは下線、* ? は青、コメントは灰。
 //   aish は行が変わるたびに highlight で聞く。答えは (始め, 終わり, SGR) の並び (文字の番号)
 use aish_plugin::{Spec, Value, json, s};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// 調べた答えを覚えておく長さ (打つたびに PATH のディレクトリを全部 stat しないように)
+const KEEP: Duration = Duration::from_secs(5);
+
+thread_local! {
+    /// (PATH, 名前) → (コマンドがあるか, 調べた時刻)、(pwd, 語) → (ファイルがあるか, 時刻)
+    static CMDS: RefCell<HashMap<(String, String), (bool, Instant)>> = RefCell::new(HashMap::new());
+    static FILES: RefCell<HashMap<(String, String), (bool, Instant)>> = RefCell::new(HashMap::new());
+}
+
+/// map に新しい答えがあればそれを、なければ f で調べて覚える
+fn cached(map: &'static std::thread::LocalKey<RefCell<HashMap<(String, String), (bool, Instant)>>>, key: (String, String), f: impl FnOnce() -> bool) -> bool {
+    if let Some(v) = map.with(|m| m.borrow().get(&key).filter(|(_, t)| t.elapsed() < KEEP).map(|(v, _)| *v)) {
+        return v;
+    }
+    let v = f();
+    map.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > 4096 {
+            m.clear();
+        }
+        m.insert(key, (v, Instant::now()));
+    });
+    v
+}
 
 const RESERVED: &[&str] = &["if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do", "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc"];
 /// このあとの語もコマンドの場所
@@ -45,10 +73,13 @@ impl Ctx<'_> {
         if self.cmds.contains(&w) {
             return true;
         }
-        if w.contains('/') {
-            return executable(&self.file(w));
-        }
-        self.path.split(':').filter(|d| !d.is_empty()).any(|d| executable(&Path::new(d).join(w)))
+        let key = (format!("{}\0{}", self.path, if w.contains('/') { self.pwd } else { "" }), w.to_string());
+        cached(&CMDS, key, || {
+            if w.contains('/') {
+                return executable(&self.file(w));
+            }
+            self.path.split(':').filter(|d| !d.is_empty()).any(|d| executable(&Path::new(d).join(w)))
+        })
     }
 }
 
@@ -167,7 +198,7 @@ fn highlight(line: &str, c: &Ctx) -> Vec<(usize, usize, &'static str)> {
             continue;
         }
         // 引数: あるファイルなら下線。文字列と * ? の色はそのうえに
-        if !word.is_empty() && !word.starts_with('-') && !word.contains(['*', '?']) && c.file(&word).symlink_metadata().is_ok() {
+        if !word.is_empty() && !word.starts_with('-') && !word.contains(['*', '?']) && cached(&FILES, (c.pwd.to_string(), word.clone()), || c.file(&word).symlink_metadata().is_ok()) {
             out.push((start, end, UNDER));
         }
         // 引用符の中の $変数 は、文字列 (黄) のあとに置いて上書きする
