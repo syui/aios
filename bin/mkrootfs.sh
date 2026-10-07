@@ -8,7 +8,8 @@
 #   AIOS_BUILD="base aikernel" bin/mkrootfs.sh -r all
 #                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
 # base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
-# repo/aarch64/rust/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
+# repo/aarch64/KIND/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
+# KIND は pkg/KIND/NAME のあるところ (rust、c、shell、desktop)。依存が c のもの (ca-certificates) でもよい
 # 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
 set -e
 cd "$(dirname "$0")/.."
@@ -19,7 +20,8 @@ if [ "$1" = -r ]; then
   shift
 fi
 server=${AIOS_SERVER:-https://git.syui.ai/ai/repo/raw/branch/main/aarch64/rust}
-repo=repo/aarch64/rust
+# ほかの種類 (c など) は server の rust を KIND にかえたところ
+top=${server%/rust}
 
 # sha256sum がなければ (Mac) shasum で
 sha256() {
@@ -28,17 +30,25 @@ sha256() {
 
 rm -rf rootfs
 mkdir rootfs
-mkdir -p "$repo"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+[ -n "$remote" ] && echo "rootfs: packages from $top"
 
-# -r: リポジトリの aios.db (desc の tar.gz) を読んでおく
-if [ -n "$remote" ]; then
-  echo "rootfs: packages from $server"
-  curl -fsSL --retry 3 "$server/aios.db" -o "$tmp/aios.db"
-  mkdir "$tmp/db"
-  tar -xzf "$tmp/aios.db" -C "$tmp/db"
-fi
+# kind_of NAME: pkg/KIND/NAME/PKGBUILD のある KIND
+kind_of() {
+  for k in rust c shell desktop; do
+    [ -f "pkg/$k/$1/PKGBUILD" ] && { echo "$k"; return 0; }
+  done
+  return 1
+}
+
+# db KIND: -r のとき、その種類の aios.db (desc の tar.gz) を $tmp/db-KIND に広げる (はじめの一度だけ)
+db() {
+  [ -d "$tmp/db-$1" ] && return 0
+  mkdir "$tmp/db-$1"
+  curl -fsSL --retry 3 "$top/$1/aios.db" -o "$tmp/aios-$1.db"
+  tar -xzf "$tmp/aios-$1.db" -C "$tmp/db-$1"
+}
 
 # built NAME: -r でも、ここでビルドするパッケージか (AIOS_BUILD)
 built() {
@@ -46,25 +56,29 @@ built() {
   return 1
 }
 
-# fetch NAME: aios.db にある NAME のパッケージを repo/aarch64/rust に取ってくる (チェックサムを確かめる)
+# fetch NAME KIND: aios.db にある NAME のパッケージを repo/aarch64/KIND に取ってくる (チェックサムを確かめる)
 #   aios.db に無ければ f を空にして戻る (install がここのソースからビルドする)。
 #   pkg/rust/ に足したばかりでまだ ai/repo に出していないもの、ほかのリポジトリへ移したものなど
 fetch() {
   d=
   f=
-  for x in "$tmp/db/$1"-[0-9]*; do
+  kind=$2
+  repo=repo/aarch64/$kind
+  db "$kind"
+  for x in "$tmp/db-$kind/$1"-[0-9]*; do
     [ -f "$x/desc" ] || continue
     [ "$(sed -n '/^%NAME%$/{n;p;}' "$x/desc")" = "$1" ] && d=$x
   done
   if [ -z "$d" ]; then
-    echo "rootfs: $1 is not in $server; building it here"
+    echo "rootfs: $1 is not in $top/$kind; building it here"
     return 0
   fi
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
     echo "fetch: $file"
-    curl -fsSL --retry 3 "$server/$file" -o "$repo/$file.part"
+    mkdir -p "$repo"
+    curl -fsSL --retry 3 "$top/$kind/$file" -o "$repo/$file.part"
     mv "$repo/$file.part" "$repo/$file"
   fi
   if [ -n "$sum" ] && [ "$(sha256 "$repo/$file")" != "$sum" ]; then
@@ -113,16 +127,17 @@ done=" "
 install() {
   case "$done" in *" $1 "*) return 0 ;; esac
   done="$done$1 "
-  [ -f "pkg/rust/$1/PKGBUILD" ] || { echo "unknown pkg: $1" >&2; exit 1; }
+  kind=$(kind_of "$1") || { echo "unknown pkg: $1" >&2; exit 1; }
+  repo=repo/aarch64/$kind
   f=
   if [ -n "$remote" ] && ! built "$1"; then
-    fetch "$1"
+    fetch "$1" "$kind"
   fi
   if [ -z "$f" ]; then
     f=$(ls "$repo/$1"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
   fi
   if [ -z "$f" ]; then
-    bin/mkpkg.sh "pkg/rust/$1"
+    bin/mkpkg.sh "pkg/$kind/$1"
     f=$(ls "$repo/$1"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
   fi
   echo "rootfs: $(basename "$f")"
