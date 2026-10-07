@@ -163,7 +163,7 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             }
             // conflicts と書いてある組 (どちらかに) は、いっしょに入らないので重なってよい (egl-headers と mesa)
             let theirs = pkginfo(&e.path());
-            if field(&mine_info, "conflict").iter().any(|c| dep(c) == other) || field(&theirs, "conflict").iter().any(|c| dep(c) == name) {
+            if field(mine_info, "conflict").iter().any(|c| dep(c) == other) || field(&theirs, "conflict").iter().any(|c| dep(c) == name) {
                 continue;
             }
             let list = Command::new("tar").arg("-I").arg("zstd").arg("-tf").arg(e.path()).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();

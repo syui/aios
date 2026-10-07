@@ -235,8 +235,7 @@ fn par<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
         for _ in 0..JOBS {
             s.spawn(|| {
                 while let Some((i, t)) = {
-                    let x = items.lock().unwrap().pop();
-                    x
+                    items.lock().unwrap().pop()
                 } {
                     let r = f(t);
                     out.lock().unwrap().push((i, r));

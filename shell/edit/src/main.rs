@@ -110,7 +110,7 @@ fn matcher(a: &Value) -> Result<regex::Regex, Value> {
         return Err(error("pattern is empty"));
     }
     let pat = if a["regex"].as_bool().unwrap_or(false) { pat.to_string() } else { regex::escape(pat) };
-    regex::RegexBuilder::new(&pat).case_insensitive(a["i"].as_bool().unwrap_or(false)).build().map_err(|e| error(e))
+    regex::RegexBuilder::new(&pat).case_insensitive(a["i"].as_bool().unwrap_or(false)).build().map_err(error)
 }
 
 /// 置きかえ (sed と each): pattern → replace か、subs: [{pattern, replace, regex?, i?}, ...] を順に。
@@ -244,16 +244,17 @@ fn grep_raw(pwd: &str, a: &Value) -> Value {
                 break 'files;
             }
             count += 1;
-            for j in i.saturating_sub(ctx).max(last)..i {
-                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
+            let from = i.saturating_sub(ctx).max(last);
+            for (j, t) in ls.iter().enumerate().take(i).skip(from) {
+                out.push(json!({ "path": shown, "line": j + 1, "text": t, "ctx": true }));
             }
             out.push(json!({ "path": shown, "line": i + 1, "text": l }));
             let end = (i + 1 + ctx).min(ls.len());
-            for j in i + 1..end {
-                if re.is_match(ls[j]) {
+            for (j, t) in ls.iter().enumerate().take(end).skip(i + 1) {
+                if re.is_match(t) {
                     break;
                 }
-                out.push(json!({ "path": shown, "line": j + 1, "text": ls[j], "ctx": true }));
+                out.push(json!({ "path": shown, "line": j + 1, "text": t, "ctx": true }));
             }
             last = end.max(i + 1);
         }
