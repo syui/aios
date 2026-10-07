@@ -73,6 +73,8 @@ pub struct Item {
     pub bg: bool,
     /// ジョブの表示に使うソース
     pub text: String,
+    /// はじまりの行 ($LINENO。1 から、0 はわからない)
+    pub line: usize,
 }
 
 pub type List = Vec<Item>;
@@ -104,6 +106,8 @@ pub struct Parser {
     heredocs: Vec<(String, bool, Rc<RefCell<String>>)>,
     /// { の中にいる深さ (zsh と同じく、{ echo a } の } を ; なしでも閉じとして読むため)
     braces: usize,
+    /// 行の数えかけ (位置, その位置の行)
+    lines: (usize, usize),
 }
 
 /// 配列の代入 a=(x y) の値の印: ARRAY のあとに、要素の語 (展開する前) を SEP でつないだもの
@@ -120,8 +124,27 @@ fn is_name(s: &str) -> bool {
 }
 
 impl Parser {
+    /// 行を数えない ($LINENO を変えない)
+    pub fn no_lines(&mut self) {
+        self.lines = (0, 0);
+    }
+
+    /// 位置 p の行 (前から数える。たいてい前に進むだけなので続きから)
+    fn line_at(&mut self, p: usize) -> usize {
+        if self.lines.1 == 0 {
+            return 0;
+        }
+        if p < self.lines.0 {
+            self.lines = (0, 1);
+        }
+        let p = p.min(self.src.len());
+        self.lines.1 += self.src[self.lines.0..p].iter().filter(|&&c| c == '\n').count();
+        self.lines.0 = p;
+        self.lines.1
+    }
+
     pub fn new(src: &str) -> Parser {
-        Parser { src: src.chars().collect(), pos: 0, peeked: None, heredocs: vec![], braces: 0 }
+        Parser { src: src.chars().collect(), pos: 0, peeked: None, heredocs: vec![], braces: 0, lines: (0, 1) }
     }
 
     // ---- 字句 ----
@@ -502,6 +525,7 @@ impl Parser {
                 _ => {}
             }
             let start = self.peeked.as_ref().unwrap().1;
+            let line = self.line_at(start);
             let ao = self.and_or()?;
             let end = self.pos.min(self.peeked.as_ref().map_or(self.pos, |p| p.1));
             let text: String = self.src[start..end].iter().collect::<String>().trim().to_string();
@@ -516,7 +540,7 @@ impl Parser {
                 }
                 _ => false,
             };
-            items.push(Item { ao, bg, text });
+            items.push(Item { ao, bg, text, line });
         }
         Ok(items)
     }
@@ -676,6 +700,11 @@ impl Parser {
         self.skip_newlines()?;
         match self.command()? {
             Cmd::Compound(body, r) if r.is_empty() => Ok(Cmd::Func(name, body)),
+            // f() { ...; } > out: 呼ぶたびにつけかえる (中身を { } でくるむ)
+            c @ Cmd::Compound(..) => {
+                let ao = AndOr { first: Pipeline { neg: false, time: false, cmds: vec![c] }, rest: vec![] };
+                Ok(Cmd::Func(name, Rc::new(Compound::Brace(vec![Item { ao, bg: false, text: String::new(), line: 0 }]))))
+            }
             _ => Err(Error::Syntax(format!("{}: function body must be a compound command", name))),
         }
     }

@@ -176,6 +176,31 @@ fn match_set(set: &[char], c: char) -> Option<(bool, usize)> {
             return Some((hit != neg, i + 1));
         }
         first = false;
+        // [:alpha:] などの文字の種類 (POSIX)
+        if x == '[' && set.get(i + 1) == Some(&':') {
+            let rest: String = set[i + 2..].iter().map(|&c| lit(c)).collect();
+            if let Some(end) = rest.find(":]") {
+                let name = &rest[..end];
+                hit |= match name {
+                    "alpha" => c.is_alphabetic(),
+                    "digit" => c.is_ascii_digit(),
+                    "alnum" => c.is_alphanumeric(),
+                    "upper" => c.is_uppercase(),
+                    "lower" => c.is_lowercase(),
+                    "space" => c.is_whitespace(),
+                    "blank" => c == ' ' || c == '\t',
+                    "punct" => c.is_ascii_punctuation(),
+                    "xdigit" => c.is_ascii_hexdigit(),
+                    "cntrl" => c.is_control(),
+                    "print" => !c.is_control(),
+                    "graph" => !c.is_control() && !c.is_whitespace(),
+                    "word" => c.is_alphanumeric() || c == '_',
+                    _ => false,
+                };
+                i += 2 + name.chars().count() + 2;
+                continue;
+            }
+        }
         if i + 2 < set.len() && set[i + 1] == '-' && lit(set[i + 2]) != ']' {
             if (x..=lit(set[i + 2])).contains(&c) {
                 hit = true;

@@ -34,3 +34,19 @@ echo $(( 5 > 3 ? 10 : 20 ))	10
 str="key=value"; echo "${str%%=*}" "${str#*=}"	key value
 n=0; for f in /etc/host*; do n=$((n+1)); done; [ $n -gt 0 ] && echo globbed	globbed
 x=( $(echo a b c) ); echo ${#x[@]}	3
+echo hi > /tmp/aish_t_f; x=$(< /tmp/aish_t_f); echo $x	hi
+x=1; [[ -v x ]] && echo set; [[ -v nope ]] || echo unset	set|unset
+a=(p q); [[ -v a[1] ]] && echo has; [[ -v a[5] ]] || echo no	has|no
+trap 'echo err' ERR; false; echo after	err|after
+f() { echo "$FUNCNAME"; }; f	f
+g() { echo "${FUNCNAME[0]}<-${FUNCNAME[1]}"; }; h() { g; }; h	g<-h
+f() { cat; } <<< "redir"; f	redir
+echo $[1+2]	3
+a=(x y); echo "${a[@]/#/pre-}"	pre-x pre-y
+a=(one two); echo "${a[@]^}"	One Two
+s="  trim  "; s="${s#"${s%%[![:space:]]*}"}"; echo "[$s]"	[trim  ]
+case 7 in [[:digit:]]) echo digit;; esac	digit
+f() { local IFS=,; echo "$*"; }; f a b c	a,b,c
+a=(x y z); echo $a ${#a}	x 1
+echo $LINENO	1
+readonly C=3; unset C 2>/dev/null; echo $C	3
