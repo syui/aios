@@ -1291,8 +1291,11 @@ impl Shell {
                         self.export("PWD", Some(new.clone()));
                         if new != old {
                             self.plugins.tell("chpwd", serde_json::json!({ "pwd": new, "old": old }));
-                            // zsh と同じく、chpwd という関数があれば動かす
-                            if let Some(body) = self.funcs.get("chpwd").cloned() {
+                            // zsh と同じく、chpwd という関数があれば動かす。ただし人と話している一番上のシェルだけ
+                            // ($(cd d && pwd) やパイプの中の cd で ls が答えにまざらないように)
+                            if interactive()
+                                && let Some(body) = self.funcs.get("chpwd").cloned()
+                            {
                                 return self.call(&body, &["chpwd".to_string()]);
                             }
                         }
