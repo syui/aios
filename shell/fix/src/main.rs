@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 const BUILD: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c。既定 cargo build。cargo build/check/test/clippy/run には --message-format=json を足す)"},"dir":{"type":"string","description":"動かすディレクトリ (既定 いまのディレクトリ)"},"wait_ms":{"type":"integer","description":"終わるのをこれだけ待つ (既定 45000。過ぎたら running: true で答えるので、errors で待つ)"},"warnings":{"type":"boolean","description":"警告も一覧に (既定 false: 数だけ)"}}}"#;
 const ERRORS: &str = r#"{"type":"object","properties":{"wait_ms":{"type":"integer","description":"動いているビルドをこれだけ待つ (既定 45000)"},"warnings":{"type":"boolean","description":"警告も一覧に"},"kill":{"type":"boolean","description":"動いているビルドを止める"}}}"#;
-const FIX: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"build / errors の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"},"apply":{"type":"integer","description":"rustc の直し方 (答えの suggestions の番号) をファイルにあてる。ビルドのあとで変えたファイルにはあてない"}},"required":["n"]}"#;
+const FIX: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"build / errors の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"},"apply":{"type":"integer","description":"rustc の直し方 (答えの suggestions の番号) をファイルにあてる。ビルドのあとで変えたファイルにはあてない"},"all":{"type":"boolean","description":"n のかわりに: このビルドのすべての診断の、1 つ目の直し方をまとめてあてる (cargo clippy --fix のように)"}}}"#;
 
 /// 一覧に出す数の上限 (それより多ければ more に数だけ)
 const MAX_ITEMS: usize = 100;
@@ -75,7 +75,7 @@ fn main() {
                 input: BUILD,
             },
             Tool { name: "errors", desc: "動いているビルドを待って、エラーを n つきで (build と同じ形)。kill: true で止める", input: ERRORS },
-            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで。rustc の直し方があれば suggestions に番号 k つきで出し、apply: k でファイルにあてる", input: FIX },
+            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで。rustc の直し方があれば suggestions に番号 k つきで出し、apply: k でファイルにあてる。all: true ならすべての直し方をまとめてあてる", input: FIX },
         ],
     };
     let mut cur: Option<Build> = None;
@@ -107,6 +107,7 @@ fn main() {
                     b.answer(a["warnings"].as_bool().unwrap_or(false))
                 }
                 "fix" => match cur.as_ref() {
+                    Some(b) if a["all"].as_bool().unwrap_or(false) => apply_all(b),
                     Some(b) => fix(b, a),
                     None => error("no build yet (use build first)"),
                 },
@@ -525,9 +526,58 @@ fn fix(b: &Build, a: &Value) -> Value {
     r
 }
 
+/// このビルドの、直し方のあるすべての診断の 1 つ目をまとめてあてる。ファイルごとにうしろから、重なるものは飛ばす
+fn apply_all(b: &Build) -> Value {
+    let started = std::time::SystemTime::now() - b.start.elapsed();
+    let mut by_file: std::collections::BTreeMap<&PathBuf, Vec<(usize, usize, &str, &str)>> = Default::default();
+    for d in &b.diags {
+        // まとめてあてるのは、確かなもの (MachineApplicable) だけ。MaybeIncorrect と穴あき (HasPlaceholders) は一つずつ見て
+        let Some(sg) = d.suggestions.iter().find(|s| s.applicability == "MachineApplicable") else { continue };
+        for (f, a, e, r) in &sg.edits {
+            by_file.entry(f).or_default().push((*a, *e, r.as_str(), d.head.as_str()));
+        }
+    }
+    if by_file.is_empty() {
+        return error("the last build has no machine-applicable suggestions (look at the others one by one with fix n)");
+    }
+    let (mut applied, mut skipped, mut files) = (vec![], vec![], vec![]);
+    for (f, mut eds) in by_file {
+        if std::fs::metadata(f).and_then(|m| m.modified()).is_ok_and(|t| t > started) {
+            skipped.push(format!("{}: changed after the build", show(&b.dir, Some(f), "")));
+            continue;
+        }
+        let Ok(mut src) = std::fs::read(f) else { continue };
+        eds.sort_by_key(|x| std::cmp::Reverse((x.0, x.1)));
+        eds.dedup();
+        let mut floor = usize::MAX;
+        for (a, e, r, head) in eds {
+            // うしろのものと重なる (同じところへの別の直し方) は飛ばす
+            if e > floor || a > e || e > src.len() {
+                skipped.push(format!("{}: {} (overlaps)", show(&b.dir, Some(f), ""), head));
+                continue;
+            }
+            src.splice(a..e, r.bytes());
+            floor = a;
+            let what = format!("{}: {}", show(&b.dir, Some(f), ""), head);
+            if !applied.contains(&what) {
+                applied.push(what);
+            }
+        }
+        if let Err(e) = std::fs::write(f, &src) {
+            return error(format!("{}: {}", f.display(), e));
+        }
+        files.push(show(&b.dir, Some(f), ""));
+    }
+    json!({ "applied": applied, "skipped": skipped, "files": files, "hint": "build again to check" })
+}
+
 /// rustc の直し方 k をあてる。ビルドを始めたあとで変わったファイルにはあてない (バイトの場所がずれるので)
 fn apply(b: &Build, d: &Diag, n: usize, k: usize) -> Value {
     let Some(sg) = k.checked_sub(1).and_then(|i| d.suggestions.get(i)) else { return error(format!("error {} has no suggestion {} (it has {})", n, k, d.suggestions.len())) };
+    // 穴あき (<item> のようなところを自分で書くもの) はあてられない
+    if sg.applicability == "HasPlaceholders" {
+        return error("this suggestion has placeholders to fill in; edit it by hand");
+    }
     let mut by_file: std::collections::BTreeMap<&PathBuf, Vec<(usize, usize, &str)>> = Default::default();
     for (f, a, e, r) in &sg.edits {
         by_file.entry(f).or_default().push((*a, *e, r.as_str()));
@@ -540,7 +590,7 @@ fn apply(b: &Build, d: &Diag, n: usize, k: usize) -> Value {
         }
         let Ok(mut src) = std::fs::read(f) else { return error(format!("{}: cannot read", f.display())) };
         // うしろから (前の場所がずれないように)
-        eds.sort_by(|x, y| y.0.cmp(&x.0));
+        eds.sort_by_key(|x| std::cmp::Reverse(x.0));
         for (a, e, r) in eds {
             if a > e || e > src.len() {
                 return error(format!("{}: suggestion is out of range; build again", f.display()));
