@@ -240,10 +240,7 @@ def serve(www):
 
 def ask(req, timeout=None):
     c = socket.socket(socket.AF_UNIX)
-    try:
-        c.connect(CTL)
-    except OSError:
-        sys.exit('vm: not started (test/vm.py start)')
+    c.connect(CTL)
     c.settimeout(timeout)
     f = c.makefile('rw')
     f.write(json.dumps(req) + '\n')
@@ -262,6 +259,7 @@ def main():
                 print(json.dumps(ask({'op': 'status'}, 5)))
                 return
             except OSError:
+                # 前に動いていたものの残り (止めずに消えた)
                 os.unlink(CTL)
         www = a[a.index('--www') + 1] if '--www' in a else ''
         os.makedirs(DIR, exist_ok=True)
@@ -343,4 +341,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (ConnectionRefusedError, FileNotFoundError):
+        sys.exit('vm: not started (test/vm.py start)')

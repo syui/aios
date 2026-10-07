@@ -3,7 +3,7 @@
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
 pkgver=0.12.23
-pkgrel=1
+pkgrel=2
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
 url='https://github.com/astral-sh/uv'
@@ -12,8 +12,18 @@ makedepends=('git' 'rustup')
 # uv は /lib/ld-musl-aarch64.so.1 を見て musl の Python を選ぶ (aios のコマンドは静的なので、ほかに手がかりがない)。
 # その Python も musl の共有ライブラリを使う
 optdepends=('musl: uv python install (the Python is linked to musl)')
-source=("git+https://github.com/astral-sh/uv#tag=$pkgver")
-sha256sums=('SKIP')
+# aios-platform.patch: uname の sysname が "aios" でも、sys.platform が linux の Python は Linux (musllinux) として
+# 扱う (でないと uv run が "Unknown operating system: aios" で止まり、wheel も選べない)
+source=("git+https://github.com/astral-sh/uv#tag=$pkgver"
+        aios-platform.patch)
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  cd uv
+  git checkout -- .
+  patch -p1 < "$srcdir/aios-platform.patch"
+}
 
 build() {
   . "$startdir/../cross.sh"

@@ -1,0 +1,16 @@
+diff --git a/crates/uv-python/python/get_interpreter_info.py b/crates/uv-python/python/get_interpreter_info.py
+index f45580b..bd01ac5 100644
+--- a/crates/uv-python/python/get_interpreter_info.py
++++ b/crates/uv-python/python/get_interpreter_info.py
+@@ -444,6 +444,11 @@ def get_operating_system_and_architecture():
+         version = None
+         architecture = version_arch
+ 
++    # aios: uname の sysname は "aios" なので get_platform() は "aios-<release>-aarch64" になるが、
++    # Linux の ABI (sys.platform == "linux") なので Linux として扱う (musllinux の wheel が使える)
++    if operating_system != "linux" and sys.platform == "linux" and not hasattr(sys, "getandroidapilevel"):
++        operating_system, version = "linux", None
++
+     if sys.version_info < (3, 6):
+         print(
+             json.dumps(

@@ -217,6 +217,10 @@ nrs! {
     MSYNC = 227,
     MINCORE = 232,
     MADVISE = 233,
+    // NUMA (メモリをどのノードに置くか)。aios はノードが 1 つなので、Linux の NUMA なしと同じく何もせず成功
+    MBIND = 235,
+    GET_MEMPOLICY = 236,
+    SET_MEMPOLICY = 237,
     ACCEPT4 = 242,
     WAIT4 = 260,
     WAITID = 95,
@@ -474,6 +478,14 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
         CAPGET => sys_capget(a[0] as usize, a[1] as usize),
         CAPSET => Err(-crate::cred::EPERM),
+        // OpenBLAS (numpy) などが呼ぶ。get_mempolicy は MPOL_DEFAULT (0) を返す
+        MBIND | SET_MEMPOLICY => Ok(0),
+        GET_MEMPOLICY => {
+            if a[0] != 0 {
+                let _ = proc::current().pt().copy_out(a[0] as usize, &0i32.to_le_bytes());
+            }
+            Ok(0)
+        }
         // io_uring はない (libuv などは ENOSYS を見て、ふつうのシステムコールで動く)
         IO_URING_SETUP | IO_URING_ENTER | IO_URING_REGISTER => Err(-ENOSYS),
         n => {
