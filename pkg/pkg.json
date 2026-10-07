@@ -60,7 +60,7 @@
   {"name": "pixman",            "type": "c",       "src": "https://www.cairographics.org/releases/pixman-0.46.4.tar.gz",                                                      "now": "0.46.4",         "latest": "0.46.4"},
   {"name": "pkgconf",           "type": "c",       "src": "https://distfiles.ariadne.space/pkgconf/pkgconf-3.0.7.tar.xz",                                                     "now": "3.0.7",          "latest": "3.0.7"},
   {"name": "ripgrep",           "type": "rust",    "src": "git+https://github.com/BurntSushi/ripgrep#tag=15.2.0",                                                             "now": "15.2.0",         "latest": "15.2.0"},
-  {"name": "sed",               "type": "rust",    "src": "git+https://github.com/uutils/sed#tag=0.2.0",                                                                      "now": "0.2.0",          "latest": "0.2.0"},
+  {"name": "sed",               "type": "rust",    "src": "git+https://github.com/uutils/sed#commit=e6829c3d1673aae6615708ce0b22d9e7e7266d37",                                "now": "0.2.0.20261006", "latest": "commit e6829c3"},
   {"name": "sudo-rs",           "type": "rust",    "src": "git+https://github.com/trifectatechfoundation/sudo-rs#tag=v0.2.15",                                                "now": "0.2.15",         "latest": "0.2.15"},
   {"name": "tar",               "type": "rust",    "src": "git+https://github.com/uutils/tar#commit=20658bbf4988c4fa0d6c728aa1fa2e293f22e0b1",                                "now": "0.1.0.20261006", "latest": "commit 20658bb"},
   {"name": "tmux",              "type": "c",       "src": "https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz",                                             "now": "3.7c",           "latest": "3.7c"},

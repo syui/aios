@@ -1,13 +1,15 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/sed)
+# 0.2.0 のあとのコミット: GNU と同じく -i の拡張子はくっついているときだけ (sed -i 's/a/b/' FILE が書ける)
 pkgname=sed
-pkgver=0.2.0
+pkgver=0.2.0.20261006
 pkgrel=1
+_commit=e6829c3d1673aae6615708ce0b22d9e7e7266d37
 pkgdesc='Rust implementation of GNU sed (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/sed'
 license=('MIT')
 makedepends=('git' 'rustup')
-source=("git+https://github.com/uutils/sed#tag=$pkgver")
+source=("git+https://github.com/uutils/sed#commit=$_commit")
 sha256sums=('SKIP')
 
 build() {
