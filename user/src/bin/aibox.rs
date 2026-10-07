@@ -73,7 +73,9 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+    // 中のプログラムが「どこに書けるか」を知れるように (aish --mcp が Permission denied のときに教える)
+    let writable: Vec<String> = write.iter().filter(|w| std::path::Path::new(w).exists()).cloned().collect();
+    let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).env("AIBOX_WRITE", writable.join(":")).exec();
     eprintln!("aibox: {}: {}", cmd[0], e);
     std::process::exit(127);
 }
