@@ -1,6 +1,7 @@
 #!/bin/sh
 # QEMU で aios を起動する。cargo run からも呼ばれる
 #   bin/run.sh KERNEL   そのカーネルで (cargo run は作ったばかりの開発用カーネルを渡す)
+#   人の手の代わりに外から動かす (起こしたままコマンドを送る、画面を撮る) なら test/vm.py
 #   bin/run.sh          disk.img から起動する:
 #                         GPT (bin/mkdisk.sh の既定) なら UEFI のファームウェア (AAVMF / edk2) で
 #                         ESP の EFI/BOOT/BOOTAA64.EFI を。ファームウェアがないか AIOS_CMDLINE が
