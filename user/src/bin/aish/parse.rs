@@ -46,6 +46,10 @@ pub enum Compound {
     While(List, List, bool),
     For(String, Option<Vec<Word>>, List),
     Case(Word, Vec<(Vec<Word>, List)>),
+    /// (( 式 )): 0 でなければ成功 (bash と zsh)
+    Arith(String),
+    /// for (( 初め; 条件; 次 )) do ... done
+    ArithFor(String, String, String, List),
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +268,11 @@ impl Parser {
                     }
                     self.pos += 2;
                 }
+                // "..." の中の $'...' はそのままの文字 (bash と同じ)
+                Some('$') if self.at(1) == Some('\'') => {
+                    w.push('$');
+                    self.pos += 1;
+                }
                 Some('$' | '`') => self.scan_dollar(w)?,
                 Some(c) => {
                     w.push(c);
@@ -276,6 +285,33 @@ impl Parser {
     /// $( ) $(( )) ${ } ` ` を対応する閉じまで
     fn scan_dollar(&mut self, w: &mut String) -> Result<(), Error> {
         let c = self.at(0).unwrap();
+        // $'...' (bash と zsh): \n \t \xHH \uHHHH などをほどいて、'...' の文字として
+        if c == '$' && self.at(1) == Some('\'') {
+            let mut k = self.pos + 2;
+            let mut raw = String::new();
+            loop {
+                match self.src.get(k) {
+                    None => return Err(Error::Incomplete),
+                    Some('\\') => {
+                        raw.push('\\');
+                        if let Some(&n) = self.src.get(k + 1) {
+                            raw.push(n);
+                        }
+                        k += 2;
+                    }
+                    Some('\'') => break,
+                    Some(&x) => {
+                        raw.push(x);
+                        k += 1;
+                    }
+                }
+            }
+            self.pos = k + 1;
+            w.push('\'');
+            w.push_str(&ansi_c(&raw).replace('\'', "'\\''"));
+            w.push('\'');
+            return Ok(());
+        }
         if c == '`' {
             let mut i = self.pos + 1;
             loop {
@@ -361,6 +397,33 @@ impl Parser {
             self.peeked = Some(self.next_tok()?);
         }
         Ok(&self.peeked.as_ref().unwrap().0)
+    }
+
+    /// 先読みした字句のところのソースがこれで始まるか
+    fn peeked_raw_is(&self, s: &str) -> bool {
+        let Some((_, start)) = self.peeked else { return false };
+        s.chars().enumerate().all(|(k, c)| self.src.get(start + k) == Some(&c))
+    }
+
+    /// (( ... )) を読む (先読みした ( から)。中はそのまま文字で
+    fn take_arith(&mut self) -> Result<String, Error> {
+        let (_, start) = self.peeked.take().unwrap();
+        let mut i = start + 2;
+        let mut depth = 0;
+        loop {
+            match self.src.get(i) {
+                None => return Err(Error::Incomplete),
+                Some('(') => depth += 1,
+                Some(')') if depth > 0 => depth -= 1,
+                Some(')') if self.src.get(i + 1) == Some(&')') => break,
+                Some(')') => return Err(Error::Syntax("syntax error: `))' expected".into())),
+                _ => {}
+            }
+            i += 1;
+        }
+        let e: String = self.src[start + 2..i].iter().collect();
+        self.pos = i + 2;
+        Ok(e)
     }
 
     fn take(&mut self) -> Result<(Tok, usize), Error> {
@@ -495,6 +558,8 @@ impl Parser {
     fn command(&mut self) -> Result<Cmd, Error> {
         let t = self.peek()?.clone();
         let compound = match &t {
+            // (( 式 ))
+            Tok::Op("(") if self.peeked_raw_is("((") => Some(Compound::Arith(self.take_arith()?)),
             Tok::Op("(") => {
                 self.take()?;
                 let l = self.list(&[], false)?;
@@ -658,6 +723,31 @@ impl Parser {
                 Tok::Redir(..) => redirs.push(self.redir()?),
                 Tok::Word(w) => {
                     let w = w.clone();
+                    // declare / local などの引数の配列: declare -A m=([a]=1) (語の中に配列の印を入れて渡す)
+                    if words.first().is_some_and(|c| matches!(c.as_str(), "declare" | "typeset" | "local" | "readonly" | "export"))
+                        && let Some(k) = w.strip_suffix('=')
+                        && is_name(k.strip_suffix('+').unwrap_or(k))
+                    {
+                        self.take()?;
+                        if self.is_op("(")? {
+                            self.take()?;
+                            let mut items = vec![];
+                            loop {
+                                match self.take()?.0 {
+                                    Tok::Op(")") => break,
+                                    Tok::Op("\n") => {}
+                                    Tok::Word(x) => items.push(x),
+                                    Tok::Eof => return Err(Error::Incomplete),
+                                    t => return Err(Error::Syntax(format!("syntax error near {} in an array", show(&t)))),
+                                }
+                            }
+                            let v: String = std::iter::once(ARRAY).chain(items.join(&SEP.to_string()).chars()).collect();
+                            words.push(format!("{}={}", k, v));
+                        } else {
+                            words.push(w);
+                        }
+                        continue;
+                    }
                     // 配列: a=(x y z) と a+=(w) (bash と zsh)。キーの + は足すこと
                     if words.is_empty()
                         && let Some(k) = w.strip_suffix('=')
@@ -687,9 +777,10 @@ impl Parser {
                         words.push(w);
                         continue;
                     }
+                    // NAME=v、NAME+=v (足す)、NAME[i]=v (配列の 1 つ。連想配列ならキー)、NAME[i]+=v
                     if words.is_empty()
                         && let Some((k, _)) = w.split_once('=')
-                        && is_name(k)
+                        && is_assign_key(k)
                     {
                         self.take()?;
                         assigns.push((k.to_string(), w[k.len() + 1..].to_string()));
@@ -747,6 +838,32 @@ impl Parser {
 
     fn for_clause(&mut self) -> Result<Compound, Error> {
         self.take()?; // for
+        // for (( 初め; 条件; 次 ))
+        if matches!(self.peek()?, Tok::Op("(")) && self.peeked_raw_is("((") {
+            let e = self.take_arith()?;
+            let mut parts = e.splitn(3, ';').map(|x| x.trim().to_string());
+            let (a, b, c) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+            self.skip_newlines()?;
+            if self.is_op(";")? {
+                self.take()?;
+            }
+            self.skip_newlines()?;
+            let body = if self.is_word("{")? {
+                self.take()?;
+                self.braces += 1;
+                let l = self.list(&["}"], false);
+                self.braces -= 1;
+                let l = l?;
+                self.expect_word("}")?;
+                l
+            } else {
+                self.expect_word("do")?;
+                let l = self.list(&["done"], false)?;
+                self.expect_word("done")?;
+                l
+            };
+            return Ok(Compound::ArithFor(a, b, c, body));
+        }
         let name = match self.take()?.0 {
             Tok::Word(w) if is_name(&w) => w,
             Tok::Eof => return Err(Error::Incomplete),
@@ -833,6 +950,81 @@ pub fn is_reserved(w: &str) -> bool {
 }
 
 /// 変数名として使えるか
+/// $'...' の中のエスケープ
+pub fn ansi_c(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let hex = |cs: &[char], i: usize, max: usize| -> (u32, usize) {
+        let mut v = 0;
+        let mut n = 0;
+        while n < max && i + n < cs.len() && cs[i + n].is_ascii_hexdigit() {
+            v = v * 16 + cs[i + n].to_digit(16).unwrap();
+            n += 1;
+        }
+        (v, n)
+    };
+    while i < cs.len() {
+        if cs[i] != '\\' || i + 1 >= cs.len() {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let c = cs[i];
+        i += 1;
+        match c {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\x07'),
+            'b' => out.push('\x08'),
+            'e' | 'E' => out.push('\x1b'),
+            'f' => out.push('\x0c'),
+            'v' => out.push('\x0b'),
+            '\\' | '\'' | '"' | '?' => out.push(c),
+            'x' => {
+                let (v, n) = hex(&cs, i, 2);
+                i += n;
+                out.push(char::from_u32(v).unwrap_or('?'));
+            }
+            'u' | 'U' => {
+                let (v, n) = hex(&cs, i, if c == 'u' { 4 } else { 8 });
+                i += n;
+                out.push(char::from_u32(v).unwrap_or('?'));
+            }
+            '0'..='7' => {
+                let mut v = c.to_digit(8).unwrap();
+                let mut n = 0;
+                while n < 2 && i < cs.len() && cs[i].is_digit(8) {
+                    v = v * 8 + cs[i].to_digit(8).unwrap();
+                    i += 1;
+                    n += 1;
+                }
+                out.push(char::from_u32(v).unwrap_or('?'));
+            }
+            'c' if i < cs.len() => {
+                out.push(char::from_u32((cs[i] as u32) & 0x1f).unwrap_or('?'));
+                i += 1;
+            }
+            _ => {
+                out.push('\\');
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// 代入の左: NAME、NAME+、NAME[...]、NAME[...]+
+pub fn is_assign_key(k: &str) -> bool {
+    let k = k.strip_suffix('+').unwrap_or(k);
+    match k.split_once('[') {
+        Some((n, r)) => is_name(n) && r.ends_with(']') && r.len() > 1,
+        None => is_name(k),
+    }
+}
+
 pub fn valid_name(s: &str) -> bool {
     is_name(s)
 }

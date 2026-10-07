@@ -388,6 +388,21 @@ impl Shell {
             if quoted { o.quoted(v) } else { o.unquoted(v) }
         };
         match cs.get(i) {
+            // ${v//$'\n'/,} のように ${...} の中に残った $'...' (語の中のものは字句のときにほどいてある)
+            Some('\'') if !quoted => {
+                let mut k = i + 1;
+                let mut raw = String::new();
+                while k < cs.len() && cs[k] != '\'' {
+                    if cs[k] == '\\' && k + 1 < cs.len() {
+                        raw.push(cs[k]);
+                        k += 1;
+                    }
+                    raw.push(cs[k]);
+                    k += 1;
+                }
+                o.quoted(&parse::ansi_c(&raw));
+                Ok(k + 1)
+            }
             Some('(') if cs.get(i + 1) == Some(&'(') => {
                 // $(( 式 ))
                 let end = matching(cs, i, '(', ')');
@@ -439,7 +454,16 @@ impl Shell {
                     self.put_array(o, &a, quoted, false);
                     return Ok(j);
                 }
-                let v = self.get_var(&name).unwrap_or_default();
+                if let Some(m) = self.assoc.get(&name) {
+                    let v = m.iter().find(|(k, _)| k == "0").map(|(_, v)| v.clone()).unwrap_or_default();
+                    put(self, o, &v);
+                    return Ok(j);
+                }
+                let v = match self.special(&name) {
+                    Some(v) => v,
+                    None if self.nounset => return Err(format!("{}: unbound variable", name)),
+                    None => String::new(),
+                };
                 put(self, o, &v);
                 Ok(j)
             }
@@ -471,6 +495,10 @@ impl Shell {
                 f
             }
             "@" | "*" => self.params.get(1..).unwrap_or(&[]).join(" "),
+            // 読むたびに変わるもの (bash と zsh)。代入されていればそちら
+            "RANDOM" if self.get_var("RANDOM").is_none() => (crate::rand_u32() & 0x7fff).to_string(),
+            "SECONDS" if self.get_var("SECONDS").is_none() => self.started.elapsed().as_secs().to_string(),
+            "EPOCHSECONDS" => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string(),
             n if n.chars().all(|c| c.is_ascii_digit()) => return n.parse::<usize>().ok().and_then(|i| self.params.get(i)).cloned(),
             n => return self.get_var(n),
         })
@@ -502,6 +530,92 @@ impl Shell {
 
     fn param_expr(&mut self, s: &str, o: &mut Out, quoted: bool) -> Result<(), String> {
         let put = |o: &mut Out, v: &str| if quoted { o.quoted(v) } else { o.unquoted(v) };
+        // ${!...}: ${!a[@]} 番号 (連想配列ならキー)、${!pre*} ${!pre@} その名前で始まる変数、${!name} 間接参照
+        if let Some(r) = s.strip_prefix('!')
+            && !r.is_empty()
+        {
+            if let Some(n) = r.strip_suffix("[@]").or_else(|| r.strip_suffix("[*]"))
+                && parse::valid_name(n)
+            {
+                let keys: Vec<String> = match self.assoc.get(n) {
+                    Some(m) => m.iter().map(|(k, _)| k.clone()).collect(),
+                    None => {
+                        let len = self.array(n).map_or(usize::from(self.get_var(n).is_some()), |a| a.len());
+                        let b = self.array_base();
+                        (0..len).map(|i| (i as i64 + b).to_string()).collect()
+                    }
+                };
+                self.put_array(o, &keys, quoted, r.ends_with("[@]"));
+                return Ok(());
+            }
+            if let Some(p) = r.strip_suffix('*').or_else(|| r.strip_suffix('@'))
+                && parse::valid_name(p)
+            {
+                let mut names: Vec<String> = self.vars.keys().cloned().chain(std::env::vars().map(|(k, _)| k)).chain(self.arrays.keys().cloned()).chain(self.assoc.keys().cloned()).filter(|k| k.starts_with(p)).collect();
+                names.sort();
+                names.dedup();
+                self.put_array(o, &names, quoted, r.ends_with('@'));
+                return Ok(());
+            }
+            if parse::valid_name(r) || r.chars().all(|c| c.is_ascii_digit()) {
+                let target = self.special(r).unwrap_or_default();
+                if target.is_empty() {
+                    return Ok(());
+                }
+                return self.param_expr(&target, o, quoted);
+            }
+        }
+        // 連想配列: ${m[k]} ${m[@]} ${#m[@]} ${#m[k]}
+        {
+            let (count, body) = match s.strip_prefix('#') {
+                Some(b) if !b.is_empty() => (true, b),
+                _ => (false, s),
+            };
+            if let Some((n, r)) = body.split_once('[')
+                && r.ends_with(']')
+                && let Some(m) = self.assoc.get(n).cloned()
+            {
+                let sub = &r[..r.len() - 1];
+                match sub {
+                    "@" | "*" if count => put(o, &m.len().to_string()),
+                    "@" | "*" => {
+                        let vals: Vec<String> = m.into_iter().map(|(_, v)| v).collect();
+                        self.put_array(o, &vals, quoted, sub == "@");
+                    }
+                    k => {
+                        let k = self.expand_one(k)?;
+                        let v = m.iter().find(|(x, _)| *x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                        put(o, &if count { v.chars().count().to_string() } else { v });
+                    }
+                }
+                return Ok(());
+            }
+        }
+        // 配列の一部: ${a[@]:OFF} ${a[@]:OFF:LEN} (bash。番号は 0 から)
+        if let Some((n, rest)) = s.split_once("[@]:").or_else(|| s.split_once("[*]:"))
+            && parse::valid_name(n)
+        {
+            let a = self.array(n).unwrap_or_default();
+            let (off, len) = match rest.split_once(':') {
+                Some((x, y)) => (x, Some(y)),
+                None => (rest, None),
+            };
+            let off = self.expand_one(off)?;
+            let off = self.arith(&off)?;
+            let l = a.len() as i64;
+            let start = if off < 0 { (l + off).max(0) } else { off.min(l) } as usize;
+            let end = match len {
+                Some(x) => {
+                    let x = self.expand_one(x)?;
+                    let x = self.arith(&x)?;
+                    if x < 0 { (l + x).max(start as i64) as usize } else { (start + x as usize).min(a.len()) }
+                }
+                None => a.len(),
+            };
+            let part = a[start..end.max(start)].to_vec();
+            self.put_array(o, &part, quoted, s.contains("[@]"));
+            return Ok(());
+        }
         // 配列: ${a[@]} ${a[*]} ${a[N]} ${#a[@]} ${#a}
         {
             let (count, body) = match s.strip_prefix('#') {
@@ -563,7 +677,96 @@ impl Shell {
                 }
                 return Ok(());
             }
+            if val.is_none() && self.nounset && !matches!(name.as_str(), "@" | "*" | "!" | "#" | "?" | "$" | "-") {
+                return Err(format!("{}: unbound variable", name));
+            }
             put(o, &val.unwrap_or_default());
+            return Ok(());
+        }
+        // bash の大文字・小文字: ${x^^} ${x^} ${x,,} ${x,}
+        if matches!(rest.as_str(), "^^" | "^" | ",," | ",") {
+            let v = val.unwrap_or_default();
+            let mut cs = v.chars();
+            let r = match rest.as_str() {
+                "^^" => v.to_uppercase(),
+                ",," => v.to_lowercase(),
+                "^" => cs.next().map_or(String::new(), |c| c.to_uppercase().chain(cs).collect()),
+                _ => cs.next().map_or(String::new(), |c| c.to_lowercase().chain(cs).collect()),
+            };
+            put(o, &r);
+            return Ok(());
+        }
+        // bash の ${x@Q} (シェルでそのまま読めるようにクォート) ${x@U} ${x@L} ${x@u}
+        if let Some(op) = rest.strip_prefix('@') {
+            let v = val.unwrap_or_default();
+            let r = match op {
+                "Q" => format!("'{}'", v.replace('\'', "'\\''")),
+                "U" => v.to_uppercase(),
+                "L" => v.to_lowercase(),
+                "u" => {
+                    let mut cs = v.chars();
+                    cs.next().map_or(String::new(), |c| c.to_uppercase().chain(cs).collect())
+                }
+                "E" | "P" | "A" | "a" | "K" => v,
+                _ => return Err(format!("${{{}}}: bad substitution", s)),
+            };
+            put(o, &r);
+            return Ok(());
+        }
+        // bash の置きかえ: ${x/pat/rep} (はじめの 1 つ) ${x//pat/rep} (ぜんぶ) ${x/#pat/rep} (前) ${x/%pat/rep} (後ろ)
+        if let Some(r) = rest.strip_prefix('/') {
+            let (mode, r) = match r.chars().next() {
+                Some('/') => ('a', &r[1..]),
+                Some('#') => ('b', &r[1..]),
+                Some('%') => ('e', &r[1..]),
+                _ => ('1', r),
+            };
+            // pat と rep を分ける / (\/ はそのまま)
+            let rc: Vec<char> = r.chars().collect();
+            let mut k = 0;
+            while k < rc.len() && rc[k] != '/' {
+                if rc[k] == '\\' {
+                    k += 1;
+                }
+                k += 1;
+            }
+            let pat_src: String = rc[..k.min(rc.len())].iter().collect();
+            let rep_src: String = if k < rc.len() { rc[k + 1..].iter().collect() } else { String::new() };
+            let v = val.unwrap_or_default();
+            let pat: Vec<char> = self.expand(&pat_src, Mode::Pattern)?.pop().unwrap_or_default().chars().collect();
+            let rep = self.expand_one(&rep_src)?;
+            let vc: Vec<char> = v.chars().collect();
+            let n = vc.len();
+            let mut out = String::new();
+            let r = match mode {
+                'b' => match (0..=n).rev().find(|&e| glob::glob_match(&pat, &vc[..e])) {
+                    Some(e) => format!("{}{}", rep, vc[e..].iter().collect::<String>()),
+                    None => v.clone(),
+                },
+                'e' => match (0..=n).find(|&b| glob::glob_match(&pat, &vc[b..])) {
+                    Some(b) => format!("{}{}", vc[..b].iter().collect::<String>(), rep),
+                    None => v.clone(),
+                },
+                _ => {
+                    // 前から、いちばん長く合うところを置きかえる (all ならくり返す)
+                    let mut i = 0;
+                    let mut done = false;
+                    while i < n {
+                        if !done && !pat.is_empty() && let Some(e) = (i + 1..=n).rev().find(|&e| glob::glob_match(&pat, &vc[i..e])) {
+                            out.push_str(&rep);
+                            i = e;
+                            if mode == '1' {
+                                done = true;
+                            }
+                            continue;
+                        }
+                        out.push(vc[i]);
+                        i += 1;
+                    }
+                    out
+                }
+            };
+            put(o, &r);
             return Ok(());
         }
         // zsh の修飾 ${x:t} (最後の要素) :h (その前) :r (拡張子を除く) :e (拡張子) :l :u (小文字 / 大文字)。:t:r のように続けてよい
@@ -727,6 +930,21 @@ fn arith_lex(s: &str) -> Result<Vec<AT>, String> {
             let st = i;
             while i < cs.len() && cs[i].is_ascii_alphanumeric() {
                 i += 1;
+            }
+            // BASE#DIGITS (bash: 16#ff 2#101)
+            if i < cs.len() && cs[i] == '#' {
+                let base: u32 = cs[st..i].iter().collect::<String>().parse().map_err(|_| "bad base".to_string())?;
+                let ds = i + 1;
+                i += 1;
+                while i < cs.len() && cs[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                let d: String = cs[ds..i].iter().collect();
+                if !(2..=36).contains(&base) {
+                    return Err(format!("{}#{}: invalid arithmetic base", base, d));
+                }
+                v.push(AT::Num(i64::from_str_radix(&d, base).map_err(|_| format!("{}#{}: value too great for base", base, d))?));
+                continue;
             }
             let t: String = cs[st..i].iter().collect();
             v.push(AT::Num(parse_num(&t).ok_or_else(|| format!("{}: bad number", t))?));

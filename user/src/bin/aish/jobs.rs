@@ -41,6 +41,9 @@ pub fn exit_code(st: i32) -> i32 {
 }
 
 /// waitpid で分かったことをジョブに書く
+/// set -o pipefail
+pub static mut PIPEFAIL: bool = false;
+
 pub fn record(pid: i32, st: i32) {
     for j in jobs().iter_mut() {
         let Some(k) = j.pids.iter().position(|(p, _)| *p == pid) else { continue };
@@ -52,8 +55,10 @@ pub fn record(pid: i32, st: i32) {
         } else {
             j.pids[k].1 = Some(exit_code(st));
             if j.pids.iter().all(|(_, s)| s.is_some()) {
-                // パイプラインのステータスは最後のコマンドのもの
-                j.state = JobState::Done(j.pids.last().unwrap().1.unwrap());
+                // パイプラインのステータスは最後のコマンドのもの (set -o pipefail なら、しくじった最後のもの)
+                let last = j.pids.last().unwrap().1.unwrap();
+                let st = if unsafe { PIPEFAIL } { j.pids.iter().rev().filter_map(|(_, s)| *s).find(|&s| s != 0).unwrap_or(0) } else { last };
+                j.state = JobState::Done(st);
                 j.notified = false;
             }
         }

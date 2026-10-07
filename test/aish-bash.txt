@@ -1,0 +1,36 @@
+# aish を sh / bash の名前で呼んだときの書き方 (bash と同じ答え。配列は 0 から): 1 行に「コマンド<TAB>答え」
+# 答えは bash で出したもの。test/aish.sh が sh という名前のリンクから動かしてくらべる
+printf -v v "%03d" 7; echo $v	007
+let x=3+2; echo $x	5
+mapfile -t l < <(printf "x\ny\n"); echo ${#l[@]} ${l[1]}	2 y
+while getopts "ab:" o -a -b val; do echo "$o=${OPTARG:-}"; done	a=|b=val
+pushd /tmp >/dev/null && popd >/dev/null && echo stack	stack
+type -t echo ls if	builtin|file|keyword
+shopt -s nullglob; f=(/nonexist*); echo ${#f[@]}	0
+x=(1 2 3); unset "x[1]"; echo ${x[@]}	1 3
+set -euo pipefail; false | true; echo $?	
+set -o pipefail; false | true; echo $?	1
+set -u; echo ${nope:-ok}	ok
+f() { getopts "x:" o; echo $o $OPTARG; }; f -x 1	x 1
+declare -A m=([a]=1 [b]=2); for k in "${!m[@]}"; do echo $k=${m[$k]}; done | sort	a=1|b=2
+declare -A m; m[k]=v; m[j]=w; echo ${m[k]} ${#m[@]}	v 2
+lt() { local -a a=(1 2); echo ${a[1]}; }; lt	2
+x=hello; echo ${x/l/L} ${x//l/L} ${x/#h/H} ${x/%o/O}	heLlo heLLo Hello hellO
+x=abc; echo ${x^^} ${x^} ${x,,}	ABC Abc abc
+arr=(a b c); echo ${#arr[@]} ${arr[1]} ${arr[@]:1} ${!arr[@]}	3 b b c 0 1 2
+x=1; x+=2; echo $x	12
+declare -i n=5; n+=1; echo $n	6
+readonly R=1; echo $R	1
+x="a'b"; echo "${x@Q}"	'a'\''b'
+echo ${!HO*} | grep -c HOME	1
+i=0; until (( i >= 2 )); do (( i++ )); done; echo $i	2
+a=(); a+=(x); a+=(y z); echo ${#a[@]} ${a[2]}	3 z
+s="a-b-c"; IFS=- read -r p q r <<< "$s"; echo $q	b
+for i in {1..3}; do (( i == 2 )) && continue; echo $i; done	1|3
+v=$(echo "x y"); arr=($v); echo ${arr[1]}	y
+printf '%s\n' "${arr[@]}" | wc -l	1
+case $((1+1)) in 2) echo two;; esac	two
+echo $(( 5 > 3 ? 10 : 20 ))	10
+str="key=value"; echo "${str%%=*}" "${str#*=}"	key value
+n=0; for f in /etc/host*; do n=$((n+1)); done; [ $n -gt 0 ] && echo globbed	globbed
+x=( $(echo a b c) ); echo ${#x[@]}	3
