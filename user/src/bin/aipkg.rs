@@ -694,6 +694,26 @@ fn refresh(repos: &[Repo]) {
 }
 
 /// targets を依存が先に来る順に並べる
+/// 入っているパッケージの依存のうち、入っていないもの (名前か provides で)
+fn missing_deps() -> Vec<String> {
+    let db = installed();
+    let mut have = BTreeSet::new();
+    for (n, (d, _)) in &db {
+        have.insert(n.clone());
+        have.extend(list(d, "PROVIDES").iter().map(|p| dep_name(p).to_string()));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (d, _) in db.values() {
+        for dep in list(d, "DEPENDS") {
+            let n = dep_name(dep).to_string();
+            if !have.contains(&n) && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
 fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<String> {
     fn visit(n: &str, sync: &BTreeMap<String, (usize, Desc)>, local: &BTreeSet<String>, seen: &mut BTreeSet<String>, out: &mut Vec<String>, top: bool) {
         if !seen.insert(n.to_string()) {
@@ -920,6 +940,12 @@ fn main() {
     } else if flags.contains(&'U') {
         for t in &targets {
             install(t, true);
+        }
+        // pacman と同じく、足りない依存はリポジトリから入れる (新しい base が頼るものが増えたときなど)
+        let missing = missing_deps();
+        if !missing.is_empty() {
+            println!(":: installing missing dependencies: {}", missing.join(" "));
+            sync_install(&repos, &missing, &[]);
         }
     } else if flags.contains(&'R') {
         remove(&targets);

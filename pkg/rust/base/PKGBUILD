@@ -8,10 +8,11 @@ arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
 # base + aikernel + aiboot で使える aios になる (Arch の base + linux のように)。
-# ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく。awk は作りかけなので入れない
+# ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく
 # ca-certificates は /etc/ssl/certs/ca-certificates.crt (curl、git、ssh の C のもの、pip などが TLS で使う。
 # aios の Rust のものは持っているが、なければ C のものが https につなげない)
-depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'tar' 'sudo-rs' 'brush' 'ca-certificates')
+# tar は libarchive (bsdtar)、awk は gawk、ps は procps-ng (uutils の tar / awk / ps はまだ足りないものが多い)
+depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'brush' 'ca-certificates')
 makedepends=('rustup')
 # aish の grep ツールと C-f / C-g は、ripgrep があればそれを使う (.gitignore を読む、速い)
 optdepends=('ripgrep: faster grep tool and C-f / C-g in aish')

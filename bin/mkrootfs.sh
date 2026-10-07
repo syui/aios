@@ -98,8 +98,8 @@ register() {
   mkdir -p "$dir"
   printf '%s\n' "$info" | awk -v now="$(date +%s)" '
     BEGIN {
-      split("pkgname NAME pkgbase BASE pkgver VERSION pkgdesc DESC url URL builddate BUILDDATE packager PACKAGER size SIZE arch ARCH license LICENSE depend DEPENDS provides PROVIDES conflict CONFLICTS backup BACKUP", a, " ")
-      for (i = 1; i < 30; i += 2) key[a[i]] = a[i + 1]
+      split("pkgname NAME pkgbase BASE pkgver VERSION pkgdesc DESC url URL builddate BUILDDATE packager PACKAGER size SIZE arch ARCH license LICENSE depend DEPENDS provides PROVIDES conflict CONFLICTS replaces REPLACES backup BACKUP", a, " ")
+      for (i = 1; i < 32; i += 2) key[a[i]] = a[i + 1]
     }
     / = / {
       k = substr($0, 1, index($0, " = ") - 1)
@@ -123,6 +123,8 @@ register() {
 }
 
 # install NAME: パッケージ (と depends) を rootfs に入れる。入れたものは done に覚える
+#   入れたものが provides / replaces で引きうける名前 (libarchive の tar、gawk の awk) も done に足す
+#   (all で pkg/rust/ をぜんぶ入れるときに、置きかえられた uutils の tar や awk を入れない)
 done=" "
 install() {
   case "$done" in *" $1 "*) return 0 ;; esac
@@ -143,6 +145,9 @@ install() {
   echo "rootfs: $(basename "$f")"
   zstd -dcq "$f" | tar -xpf - -C rootfs --exclude=.PKGINFO
   register "$f"
+  for p in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^\(provides\|replaces\) = //p' | sed 's/[<>=].*//'); do
+    case "$done" in *" $p "*) ;; *) done="$done$p " ;; esac
+  done
   # depends (版の条件 >= などは見ない)
   for d in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^depend = //p' | sed 's/[<>=].*//'); do
     install "$d"
