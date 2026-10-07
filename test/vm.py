@@ -3,7 +3,7 @@
 #
 #   test/vm.py start [--www DIR]   起こして、プロンプトが出るまで待つ (bin/run.sh。画面は AIOS_DISPLAY=none。
 #                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)
-#   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる
+#   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
 #   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。4 MB まで)
@@ -187,6 +187,8 @@ def serve(www):
         except FileNotFoundError:
             pass
     vm = Serve(www)
+    # 答えなくなったときに stop が止められるように
+    open(DIR + '/pids', 'w').write('%d %d\n' % (os.getpid(), vm.q.pid))
     t0 = time.time()
     ok, _ = vm.wait_for(PROMPT, 900)
     ready = {'ready': ok is not None, 'boot_s': round(time.time() - t0, 1)}
@@ -207,7 +209,13 @@ def serve(www):
             elif not ready['ready'] and op != 'stop':
                 r = dict(ready, error='aios did not reach the prompt (see log)')
             elif op == 'run':
-                r = vm.run(req['cmd'], req.get('timeout', 600))
+                cmd = req['cmd']
+                # 何行もあるもの: プロンプトに流すと続きを待って止まるので、ファイルにして . で読む (cd や変数は残る)
+                if '\n' in cmd.strip('\n'):
+                    import base64
+                    r = vm.put('/tmp/.vm-run.sh', base64.encodebytes(cmd.encode()).decode())
+                    cmd = '. /tmp/.vm-run.sh' if r.get('status') == 0 else cmd
+                r = vm.run(cmd, req.get('timeout', 600))
             elif op == 'put':
                 r = vm.put(req['path'], req['b64'])
             elif op == 'type':
@@ -309,7 +317,27 @@ def main():
         print(json.dumps(ask({'op': 'status'}, 10)))
     elif op == 'stop':
         if os.path.exists(CTL):
-            print(json.dumps(ask({'op': 'stop'}, 120)))
+            try:
+                print(json.dumps(ask({'op': 'stop'}, 60)))
+                return
+            except OSError:
+                pass
+        # サーバーが答えない (動かしたものが終わらないなど): サーバーと QEMU (のグループ) を止める
+        try:
+            serve_pid, q_pid = map(int, open(DIR + '/pids').read().split())
+        except (OSError, ValueError):
+            return
+        for kill in (lambda: os.kill(serve_pid, signal.SIGKILL), lambda: os.killpg(q_pid, signal.SIGKILL)):
+            try:
+                kill()
+            except ProcessLookupError:
+                pass
+        for f in (CTL, DIR + '/pids'):
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass
+        print('{"stopped": true, "killed": true}')
     else:
         sys.exit(__doc__ or 'usage: test/vm.py start|run|type|shot|mon|log|status|stop')
 
