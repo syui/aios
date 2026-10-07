@@ -1,6 +1,8 @@
 // free: メモリとスワップの使いかた (/proc/meminfo から)
 //   free [-k|-m|-g|-h]   既定は KiB
 fn main() {
+    // 読み手のいないパイプに書いたら (| head など)、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let mut unit = 'k';
     for a in std::env::args().skip(1) {
         match a.as_str() {

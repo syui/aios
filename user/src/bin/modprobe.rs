@@ -6,6 +6,8 @@ mod kmod;
 use std::process::exit;
 
 fn main() {
+    // 読み手のいないパイプに書いたら (| head など)、ほかのコマンドと同じように静かに終わる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().collect();
     let me = args[0].rsplit('/').next().unwrap_or("modprobe").to_string();
     let rest = &args[1..];
