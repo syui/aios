@@ -708,7 +708,8 @@ fn render(r: &Value) -> String {
                     }
                 }
             }
-            ("matches", Value::Array(ms)) => {
+            // each の changed も grep の matches と同じ形で (skipped はそのまま JSON に)
+            ("matches" | "changed", Value::Array(ms)) if ms.iter().all(|m| m["path"].is_string() && m["line"].is_u64()) => {
                 let mut last = "";
                 for m in ms {
                     let path = m["path"].as_str().unwrap_or("");
@@ -721,13 +722,15 @@ fn render(r: &Value) -> String {
                     s.push_str(&format!("{} {}: {}\n", n, m["line"], m["text"].as_str().unwrap_or("")));
                 }
             }
+            // 空の一覧 (skipped: [] など) は何も伝えないので出さない
+            (_, Value::Array(a)) if a.is_empty() => {}
             _ => {
                 meta.insert(k.clone(), v.clone());
             }
         }
     }
     // out と text のないもの (edit の答えなど) は、いままでどおり JSON だけ
-    if s.is_empty() && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") && !o.contains_key("items") {
+    if s.is_empty() && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") && !o.contains_key("items") && !o.contains_key("changed") {
         return r.to_string();
     }
     if !s.is_empty() && !s.ends_with('\n') {
