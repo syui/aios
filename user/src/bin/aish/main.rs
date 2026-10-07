@@ -984,6 +984,14 @@ impl Shell {
             unsafe { libc::close(mine) };
             return String::new();
         }
+        // 小さい番号のままだと exec 3< <(...) の 3 とぶつかる (行の終わりに閉じてしまう)。bash と同じく 60 から上へ
+        let high = unsafe { libc::fcntl(mine, libc::F_DUPFD, 60) };
+        let mine = if high >= 0 {
+            unsafe { libc::close(mine) };
+            high
+        } else {
+            mine
+        };
         self.procsubs.push((mine, pid));
         format!("/dev/fd/{}", mine)
     }
