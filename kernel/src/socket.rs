@@ -6,14 +6,15 @@ use alloc::rc::Rc;
 use alloc::vec;
 use core::cell::RefCell;
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::{icmp, tcp, udp};
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use smoltcp::socket::{icmp, raw, tcp, udp};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Address};
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EPIPE: i64 = 32;
+const EPERM: i64 = 1;
 const ENOTSOCK: i64 = 88;
 const EPROTONOSUPPORT: i64 = 93;
 const EOPNOTSUPP: i64 = 95;
@@ -31,6 +32,7 @@ const EINPROGRESS: i64 = 115;
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_DONTWAIT: u64 = 0x40;
@@ -45,6 +47,9 @@ enum Proto {
     Udp,
     /// ICMP の echo (Linux の ping ソケット: SOCK_DGRAM + IPPROTO_ICMP。root でなくても ping できる)
     Icmp,
+    /// raw の ICMP (SOCK_RAW + IPPROTO_ICMP、root だけ)。受けるのは IP ヘッダーからの ICMP ぜんぶ (traceroute が
+    /// 途中のルーターの「時間切れ」を受ける)。送るものには IP ヘッダーをつける
+    Raw,
 }
 
 pub struct Socket {
@@ -58,6 +63,8 @@ pub struct Socket {
     pub nonblock: bool,
     /// /proc/PID/fd の socket:[N] の N (add_fd で決まる)
     ino: usize,
+    /// setsockopt IP_TTL (なければ 64)
+    ttl: Option<u8>,
 }
 
 /// smoltcp のソケット → (inode, 持ち主の uid)。/proc/net/tcp が読む (待っているプロセスはソケットを
@@ -107,6 +114,10 @@ fn udp(h: SocketHandle) -> &'static mut udp::Socket<'static> {
     net::get().unwrap().sockets.get_mut::<udp::Socket>(h)
 }
 
+fn raw(h: SocketHandle) -> &'static mut raw::Socket<'static> {
+    net::get().unwrap().sockets.get_mut::<raw::Socket>(h)
+}
+
 fn icmp(h: SocketHandle) -> &'static mut icmp::Socket<'static> {
     net::get().unwrap().sockets.get_mut::<icmp::Socket>(h)
 }
@@ -143,7 +154,7 @@ impl Drop for Socket {
         let Some(n) = net::get() else { return };
         match self.proto {
             Proto::Tcp => net::orphan(h),
-            Proto::Udp | Proto::Icmp => {
+            Proto::Udp | Proto::Icmp | Proto::Raw => {
                 n.sockets.remove(h);
             }
         }
@@ -185,6 +196,19 @@ impl Socket {
                     if s.can_recv() {
                         let (k, meta) = s.recv_slice(buf).map_err(|_| -EINVAL)?;
                         return Ok((k, Some(meta.endpoint)));
+                    }
+                    wait(nb, 0)?;
+                }
+            }
+            // IP ヘッダーからぜんぶ。送り元は IP ヘッダーの中
+            Proto::Raw => {
+                let h = self.bind_raw()?;
+                loop {
+                    let s = raw(h);
+                    if s.can_recv() {
+                        let k = s.recv_slice(buf).map_err(|_| -EINVAL)?;
+                        let from = (k >= 20).then(|| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(buf[12], buf[13], buf[14], buf[15])), 0));
+                        return Ok((k, from));
                     }
                     wait(nb, 0)?;
                 }
@@ -233,6 +257,29 @@ impl Socket {
                 net::poll();
                 Ok(buf.len())
             }
+            // ICMP のメッセージに IP ヘッダーをつけて送る (Linux の raw で IP_HDRINCL なしと同じ)
+            Proto::Raw => {
+                let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
+                let IpAddress::Ipv4(dst) = to.addr;
+                let h = self.bind_raw()?;
+                let total = 20 + buf.len();
+                if total > 65535 {
+                    return Err(-EINVAL);
+                }
+                let mut pkt = alloc::vec![0u8; total];
+                pkt[0] = 0x45;
+                pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+                pkt[8] = self.ttl.unwrap_or(64);
+                pkt[9] = 1; // ICMP
+                pkt[12..16].copy_from_slice(&net::addr().octets());
+                pkt[16..20].copy_from_slice(&dst.octets());
+                let sum = inet_checksum(&pkt[..20]);
+                pkt[10..12].copy_from_slice(&sum.to_be_bytes());
+                pkt[20..].copy_from_slice(buf);
+                raw(h).send_slice(&pkt).map_err(|_| -EAGAIN)?;
+                net::poll();
+                Ok(buf.len())
+            }
             // ICMP の echo request: Linux と同じく id をこのソケットの番号にして、チェックサムを計算しなおす
             Proto::Icmp => {
                 let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
@@ -253,6 +300,30 @@ impl Socket {
         }
     }
 
+    fn bind_raw(&mut self) -> Result<SocketHandle, i64> {
+        if let Some(h) = self.handle {
+            return Ok(h);
+        }
+        let meta = || vec![raw::PacketMetadata::EMPTY; 16];
+        let sock = raw::Socket::new(IpVersion::Ipv4, IpProtocol::Icmp, raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]), raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]));
+        let h = n()?.sockets.add(sock);
+        self.handle = Some(h);
+        own(h, self.ino);
+        Ok(h)
+    }
+
+    /// setsockopt IP_TTL: 送るものの TTL (bind していれば、すぐ smoltcp のソケットに)
+    fn set_ttl(&mut self, ttl: Option<u8>) {
+        self.ttl = ttl;
+        if let Some(h) = self.handle {
+            match self.proto {
+                Proto::Udp => udp(h).set_hop_limit(ttl),
+                Proto::Icmp => icmp(h).set_hop_limit(ttl),
+                _ => {}
+            }
+        }
+    }
+
     /// ICMP も送る前に自動で bind する (id は空いている番号)
     fn bind_icmp(&mut self) -> Result<SocketHandle, i64> {
         if let Some(h) = self.handle {
@@ -262,6 +333,7 @@ impl Socket {
         let mut sock = icmp::Socket::new(icmp::PacketBuffer::new(meta(), vec![0; 16 * 1024]), icmp::PacketBuffer::new(meta(), vec![0; 16 * 1024]));
         let id = self.local.map(|l| l.port).filter(|&p| p != 0).unwrap_or_else(ephemeral);
         sock.bind(icmp::Endpoint::Ident(id)).map_err(|_| -EADDRINUSE)?;
+        sock.set_hop_limit(self.ttl);
         let h = n()?.sockets.add(sock);
         self.local = Some(IpListenEndpoint { addr: None, port: id });
         self.handle = Some(h);
@@ -278,6 +350,7 @@ impl Socket {
         let ep = self.local.unwrap_or(IpListenEndpoint { addr: None, port: 0 });
         let ep = if ep.port == 0 { IpListenEndpoint { addr: ep.addr, port: ephemeral() } } else { ep };
         udp(h).bind(ep).map_err(|_| -EADDRINUSE)?;
+        udp(h).set_hop_limit(self.ttl);
         self.local = Some(ep);
         self.handle = Some(h);
         own(h, self.ino);
@@ -299,6 +372,7 @@ impl Socket {
             }
             Proto::Udp => (udp(h).can_recv(), true, false),
             Proto::Icmp => (icmp(h).can_recv(), true, false),
+            Proto::Raw => (raw(h).can_recv(), true, false),
         }
     }
 }
@@ -425,11 +499,22 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     let proto = match typ & 0xf {
         SOCK_STREAM => Proto::Tcp,
         SOCK_DGRAM if protocol == IPPROTO_ICMP => Proto::Icmp,
+        // raw は ICMP だけ、root だけ (Linux の CAP_NET_RAW)
+        SOCK_RAW if protocol == IPPROTO_ICMP => {
+            if crate::cred::current().euid != 0 {
+                return Err(-EPERM);
+            }
+            Proto::Raw
+        }
         SOCK_DGRAM => Proto::Udp,
         _ => return Err(-EPROTONOSUPPORT),
     };
     n()?;
-    let s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0, ino: 0 };
+    let mut s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0, ino: 0, ttl: None };
+    // raw は作ったときから受ける (traceroute は受ける口を poll で待つだけで、送らない)
+    if s.proto == Proto::Raw {
+        s.bind_raw()?;
+    }
     add_fd(s, typ & SOCK_CLOEXEC != 0)
 }
 
@@ -497,7 +582,7 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
             tcp(nh).listen(s.local.unwrap()).map_err(|_| -EADDRINUSE)?;
             s.handle = Some(nh);
             own(nh, s.ino);
-            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0 };
+            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None };
             write_addr(addr, lenp, peer)?;
             return add_fd(c, flags & SOCK_CLOEXEC != 0);
         }
@@ -528,6 +613,11 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
         Proto::Icmp => {
             s.peer = Some(ep);
             s.bind_icmp()?;
+            Ok(0)
+        }
+        Proto::Raw => {
+            s.peer = Some(ep);
+            s.bind_raw()?;
             Ok(0)
         }
         Proto::Tcp => {
@@ -910,4 +1000,24 @@ pub fn proc_net(want_tcp: bool) -> alloc::string::String {
         i += 1;
     }
     s
+}
+
+/// setsockopt: IP_TTL だけ効かせる (ほかは受けて何もしない。いままでと同じ)
+pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
+    const IPPROTO_IP: u64 = 0;
+    const IP_TTL: u64 = 2;
+    if (level, opt) == (IPPROTO_IP, IP_TTL)
+        && let Ok(s) = sock_of(fd)
+    {
+        let mut b = [0u8; 4];
+        proc::current().pt().copy_in(&mut b[..len.min(4)], val).ok_or(-EFAULT)?;
+        let v = i32::from_le_bytes(b);
+        let ttl = match v {
+            -1 => None,
+            1..=255 => Some(v as u8),
+            _ => return Err(-EINVAL),
+        };
+        s.borrow_mut().set_ttl(ttl);
+    }
+    Ok(0)
 }

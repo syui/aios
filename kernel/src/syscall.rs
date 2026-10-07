@@ -341,7 +341,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         GETPEERNAME => socket::getpeername(a[0], a[1] as usize, a[2] as usize),
         SENDTO => socket::sendto(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
         RECVFROM => socket::recvfrom(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
-        SETSOCKOPT => Ok(0),
+        SETSOCKOPT => socket::setsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
         GETSOCKOPT => socket::getsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
         SHUTDOWN => socket::shutdown(a[0], a[1]),
         SENDMSG => socket::sendmsg(a[0], a[1] as usize, a[2]),
