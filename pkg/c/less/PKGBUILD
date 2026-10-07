@@ -1,0 +1,36 @@
+# less: ページャ。静的なバイナリ 1 つ (git や man が使う。なければ /etc/gitconfig は cat にする)
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
+pkgname=less
+pkgver=710
+pkgrel=1
+pkgdesc='A terminal based program for viewing text files (static, for aios)'
+arch=('aarch64')
+url='https://www.greenwoodsoftware.com/less/'
+license=('GPL-3.0-or-later OR BSD-2-Clause')
+depends=('ncurses')
+source=("https://www.greenwoodsoftware.com/less/less-$pkgver.tar.gz")
+sha256sums=('d1008fb78dcae1323ddab664bcb352a61f022b1b131bd8018548e021d975ec7a')
+_latest_url=https://www.greenwoodsoftware.com/less/download.html
+_latest_regex='less-([0-9]+)\.tar\.gz'
+
+prepare() {
+  rm -rf "less-$pkgver"
+  tar -xzf "less-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  cd "less-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --sysconfdir=/etc --with-regex=posix
+  make
+}
+
+package() {
+  cd "less-$pkgver"
+  install -Dm755 less "$pkgdir/opt/c/bin/less"
+  install -Dm755 lessecho "$pkgdir/opt/c/bin/lessecho"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
