@@ -1021,3 +1021,41 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     }
     Ok(0)
 }
+
+/// /proc/net/sockstat (ss -s が読む): 使っているソケットの数
+pub fn proc_sockstat() -> alloc::string::String {
+    let Some(n) = net::get() else { return alloc::string::String::new() };
+    let (mut tcp, mut udp, mut raw) = (0, 0, 0);
+    for (_, s) in n.sockets.iter() {
+        match s {
+            smoltcp::socket::Socket::Tcp(t) if t.state() != tcp::State::Closed => tcp += 1,
+            smoltcp::socket::Socket::Udp(_) => udp += 1,
+            smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Icmp(_) => raw += 1,
+            _ => {}
+        }
+    }
+    alloc::format!(
+        "sockets: used {}\nTCP: inuse {} orphan 0 tw 0 alloc {} mem 0\nUDP: inuse {} mem 0\nUDPLITE: inuse 0\nRAW: inuse {}\nFRAG: inuse 0 memory 0\n",
+        tcp + udp + raw,
+        tcp,
+        tcp,
+        udp,
+        raw
+    )
+}
+
+/// /proc/net/snmp (ss -s と netstat -s が読む): TCP のつながっている数のほかは 0
+pub fn proc_snmp() -> alloc::string::String {
+    let estab = net::get().map_or(0, |n| {
+        n.sockets.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(t) if t.state() == tcp::State::Established)).count()
+    });
+    alloc::format!(
+        "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates OutTransmits\n\
+Ip: 2 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+Tcp: 1 200 120000 -1 0 0 0 0 {} 0 0 0 0 0 0\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n\
+Udp: 0 0 0 0 0 0 0 0 0\n",
+        estab
+    )
+}

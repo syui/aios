@@ -1,0 +1,41 @@
+# iproute2: ss だけ (ソケットの一覧。ss -tlnp など)。ip は aios の base のものを使う
+#   aios には netlink の sock_diag がないので、ss は /proc/net/tcp と udp を読む (iproute2 の ss がそうする)
+#   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る
+pkgname=iproute2
+pkgver=7.2.0
+pkgrel=1
+pkgdesc='ss from iproute2, to list sockets (static, for aios)'
+arch=('aarch64')
+url='https://git.kernel.org/pub/scm/network/iproute2/iproute2.git'
+license=('GPL-2.0-or-later')
+source=("https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-$pkgver.tar.xz")
+sha256sums=('4c2fa124c2cf0afd7ca34d1eeacba6ba048a56f6374e2aab93dafbdbd4eea9c0')
+
+prepare() {
+  rm -rf "iproute2-$pkgver"
+  tar -xJf "iproute2-$pkgver.tar.xz"
+  # netlink がない (EAFNOSUPPORT) ときは、ss は /proc/net を読めばよいので、だまって切りかえる
+  # (毎回「Cannot open netlink socket」が出ると、うまくいったのにしくじったように見える)
+  sed -i 's|^\t\tperror("Cannot open netlink socket");|\t\tif (errno != EAFNOSUPPORT) perror("Cannot open netlink socket");|' \
+    "iproute2-$pkgver/lib/libnetlink.c"
+  grep -q 'errno != EAFNOSUPPORT' "iproute2-$pkgver/lib/libnetlink.c"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "iproute2-$pkgver"
+  # configure は libelf、libmnl、selinux などを pkg-config で探す。ss だけなので、どれも使わない
+  PKG_CONFIG=false ./configure
+  # include の場所などは上の Makefile が決めるので、そこから lib と misc だけ (zig_env の CFLAGS は使わない)
+  unset CFLAGS
+  make SUBDIRS="lib misc" CC="$CC" AR="$AR" CCOPTS="-O2" LDFLAGS="$LDFLAGS"
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "iproute2-$pkgver"
+  install -Dm755 misc/ss "$pkgdir$PREFIX/bin/ss"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

@@ -44,6 +44,7 @@
   {"name": "gtk3",              "type": "c",       "src": "https://download.gnome.org/sources/gtk/3.24/gtk-3.24.52.tar.xz",                                                   "now": "3.24.52",        "latest": "3.24.52"},
   {"name": "gzip",              "type": "c",       "src": "https://ftp.gnu.org/gnu/gzip/gzip-1.15.tar.xz",                                                                    "now": "1.15",           "latest": "1.15"},
   {"name": "harfbuzz",          "type": "c",       "src": "https://github.com/harfbuzz/harfbuzz/releases/download/14.6.0/harfbuzz-14.6.0.tar.xz",                             "now": "14.6.0",         "latest": "14.6.0"},
+  {"name": "iproute2",          "type": "c",       "src": "https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-7.2.0.tar.xz",                                        "now": "7.2.0",          "latest": "7.2.0"},
   {"name": "jq",                "type": "c",       "src": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-1.8.2.tar.gz",                                          "now": "1.8.2",          "latest": "1.8.2"},
   {"name": "less",              "type": "c",       "src": "https://www.greenwoodsoftware.com/less/less-710.tar.gz",                                                           "now": "710",            "latest": "710"},
   {"name": "libarchive",        "type": "c",       "src": "https://www.libarchive.org/downloads/libarchive-3.8.9.tar.xz",                                                     "now": "3.8.9",          "latest": "3.8.9"},
