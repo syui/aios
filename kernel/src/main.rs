@@ -8,6 +8,7 @@ mod mmio;
 #[macro_use]
 mod uart;
 mod kmsg;
+mod landlock;
 mod timerfd;
 mod console;
 mod tty;

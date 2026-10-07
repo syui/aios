@@ -193,7 +193,7 @@ impl ProcInode {
                 let threads = proc::threads_of(p.tgid).len();
                 let (vsize, rss) = mem_of(p);
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nNoNewPrivs:\t{}\nLandlock:\t{}\n",
                     p.comm(),
                     state_name(p),
                     p.tgid,
@@ -209,7 +209,9 @@ impl ProcInode {
                     c.egid,
                     vsize / 1024,
                     rss * 4,
-                    threads
+                    threads,
+                    c.no_new_privs as u8,
+                    crate::landlock::layers(c)
                 )
             }
             Node::Cmdline(pid) => {

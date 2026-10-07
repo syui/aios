@@ -224,6 +224,9 @@ nrs! {
     TIMES = 153,
     PIDFD_SEND_SIGNAL = 424,
     PIDFD_OPEN = 434,
+    LANDLOCK_CREATE_RULESET = 444,
+    LANDLOCK_ADD_RULE = 445,
+    LANDLOCK_RESTRICT_SELF = 446,
     PRLIMIT64 = 261,
     INIT_MODULE = 105,
     DELETE_MODULE = 106,
@@ -365,6 +368,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         TIMES => sys_times(a[0] as usize),
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
         PIDFD_OPEN => sys_pidfd_open(int(a[0]), a[1]),
+        LANDLOCK_CREATE_RULESET => crate::landlock::create_ruleset(a[0] as usize, a[1] as usize, a[2]),
+        LANDLOCK_ADD_RULE => crate::landlock::add_rule(a[0], a[1], a[2] as usize, a[3]),
+        LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
         KILL => signal::kill(int(a[0]), a[1] as i32),
         TKILL => signal::tgkill(0, a[0] as u32, a[1] as i32),
@@ -1388,8 +1394,18 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
 fn sys_prctl(op: u64, arg: usize) -> R {
     const PR_SET_NAME: u64 = 15;
     const PR_GET_NAME: u64 = 16;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
     let p = proc::current();
     match op {
+        // 一度つけたら外せない (arg は 1 だけ)
+        PR_SET_NO_NEW_PRIVS => {
+            if arg != 1 {
+                return Err(-22);
+            }
+            p.cred.no_new_privs = true;
+        }
+        PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
         PR_SET_NAME => {
             let mut b = [0u8; 16];
             p.pt().copy_in(&mut b[..15], arg).ok_or(-14)?;

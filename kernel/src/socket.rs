@@ -349,6 +349,9 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
     let mut s = s.borrow_mut();
+    if s.proto == Proto::Tcp {
+        crate::landlock::check_net(ep.port, crate::landlock::BIND_TCP)?;
+    }
     let a = if ep.addr.is_unspecified() { None } else { Some(ep.addr) };
     // port 0 は「空いているものを」(Linux と同じく bind のときに決め、getsockname で見える。Claude Code の
     // ログインの受け口など、port 0 で listen するものがある)
@@ -420,6 +423,9 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
     let mut s = s.borrow_mut();
+    if s.proto == Proto::Tcp {
+        crate::landlock::check_net(ep.port, crate::landlock::CONNECT_TCP)?;
+    }
     match s.proto {
         Proto::Udp => {
             s.peer = Some(ep);

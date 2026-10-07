@@ -25,10 +25,14 @@ pub struct Cred {
     pub egid: u32,
     pub sgid: u32,
     pub groups: Vec<u32>,
+    /// prctl(PR_SET_NO_NEW_PRIVS): exec で setuid / setgid のビットを見ない。外せない
+    pub no_new_privs: bool,
+    /// landlock の砂場 (かかっている層)
+    pub landlock: Option<crate::landlock::Domain>,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new() };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)

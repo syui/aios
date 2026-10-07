@@ -105,6 +105,7 @@ pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64
 fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
     let (exe, ino) = crate::vfs::lookup(&cwd, path, true)?;
+    crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
@@ -135,6 +136,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let (entry, interp_base) = match &main.interp {
         Some(ip) => {
             let (ipath, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
+            crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
             let isize = iino.meta().size as usize;
             let i = load_elf(&mut pt, &iino, isize, INTERP_BASE, &ipath)?;
             if i.interp.is_some() {
