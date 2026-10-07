@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "aish": {
-      "command": "aish",
-      "args": ["--mcp"]
+      "command": "aibox",
+      "args": ["-w", "~/.cache", "-w", "~/.cargo", "--", "aish", "--mcp"]
     }
   }
 }

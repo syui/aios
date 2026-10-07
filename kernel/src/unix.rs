@@ -124,6 +124,10 @@ fn unix_of(f: &FileRef) -> Option<UnixRef> {
 pub fn bind(f: &FileRef, addr: usize, len: usize) -> R {
     let u = unix_of(f).ok_or(-EINVAL)?;
     let name = read_name(addr, len)?;
+    // 砂場: ファイルシステムの名前なら、そのディレクトリに MAKE_SOCK
+    if name.starts_with('/') {
+        crate::landlock::check_parent(name.trim_start_matches('/'), crate::landlock::MAKE_SOCK)?;
+    }
     if u.borrow().path.is_some() {
         return Err(-EINVAL);
     }

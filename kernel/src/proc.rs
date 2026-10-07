@@ -972,11 +972,12 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
     let img = exec::exec(path, argv, envp)?;
     let p = current();
-    // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる
-    if let Some(u) = img.setuid {
+    // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
+    // (砂場の中から sudo で外へ出られないように)
+    if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs) {
         p.cred.euid = u;
     }
-    if let Some(g) = img.setgid {
+    if let Some(g) = img.setgid.filter(|_| !p.cred.no_new_privs) {
         p.cred.egid = g;
     }
     p.cred.suid = p.cred.euid;

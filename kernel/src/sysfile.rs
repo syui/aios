@@ -102,10 +102,35 @@ fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
     vfs::resolve(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
 }
 
+/// at と同じものを探し、そのパス (先頭 / なし) を返す
+fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
+    let path = user_str(pathp)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let f = file_of(dirfd as u64)?;
+        let f = f.borrow();
+        return match &f.kind {
+            Kind::Inode(_, p) => Ok(p.trim_start_matches('/').into()),
+            _ => Err(-EINVAL),
+        };
+    }
+    let base = base_dir(dirfd, &path)?;
+    vfs::lookup(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map(|(p, _)| p)
+}
+
 fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {
+    parent_full(dirfd, pathp).map(|(p, n, _)| (p, n))
+}
+
+/// parent_at と、作る・消すもののパス (先頭 / なし。landlock でくらべる)
+fn parent_full(dirfd: i64, pathp: usize) -> Result<(InodeRef, String, String), i64> {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
-    vfs::parent_of(&base, &path)
+    vfs::parent_path(&base, &path)
+}
+
+/// 親ディレクトリのパス (先頭 / なし)
+fn dir_of(full: &str) -> &str {
+    full.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
 /// 親ディレクトリに書ける (w と x) か
@@ -308,6 +333,10 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         }
         Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
             let (parent, name, full) = vfs::parent_path(&base, &path)?;
+            crate::landlock::check_parent(&full, crate::landlock::MAKE_REG)?;
+            if flags as u32 & file::O_ACCMODE != file::O_RDONLY {
+                crate::landlock::check_fs(&full, crate::landlock::WRITE_FILE)?;
+            }
             let c = cred::current();
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
@@ -328,6 +357,16 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         _ => PR | PW,
     } | if flags & O_TRUNC != 0 { PW } else { 0 };
     cred::current().check(&ino.meta(), want)?;
+    // 砂場: ディレクトリは READ_DIR、ほか (デバイスも) は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE
+    {
+        use crate::landlock::*;
+        let a = if ino.meta().is_dir() {
+            READ_DIR
+        } else {
+            (if want & PR != 0 { READ_FILE } else { 0 }) | (if accmode != file::O_RDONLY { WRITE_FILE } else { 0 }) | (if flags & O_TRUNC != 0 && accmode != file::O_RDONLY { TRUNCATE } else { 0 })
+        };
+        check_fs(&full, a)?;
+    }
     let kind = match ino.meta().mode & S_IFMT {
         vfs::S_IFDIR => {
             if accmode != file::O_RDONLY {
@@ -445,7 +484,8 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 }
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
-    let (parent, name) = parent_at(dirfd, pathp)?;
+    let (parent, name, full) = parent_full(dirfd, pathp)?;
+    crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
     // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
     if parent.lookup(&name).is_ok() {
         return Err(-EEXIST);
@@ -491,8 +531,9 @@ pub fn swapoff(pathp: usize) -> R {
 }
 
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
-    let (parent, name) = parent_at(dirfd, pathp)?;
+    let (parent, name, full) = parent_full(dirfd, pathp)?;
     let mode = mode as u32;
+    crate::landlock::check_parent(&full, crate::landlock::make_right(mode))?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
         vfs::S_IFCHR => NewNode::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
@@ -516,7 +557,8 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
-    let (parent, name) = parent_at(dirfd, pathp)?;
+    let (parent, name, full) = parent_full(dirfd, pathp)?;
+    crate::landlock::check_parent(&full, if flags & AT_REMOVEDIR != 0 { crate::landlock::REMOVE_DIR } else { crate::landlock::REMOVE_FILE })?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     sticky_ok(&c, &parent, &name)?;
@@ -538,7 +580,8 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
 
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
-    let (parent, name) = parent_at(dirfd, pathp)?;
+    let (parent, name, full) = parent_full(dirfd, pathp)?;
+    crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
     // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
     if parent.lookup(&name).is_ok() {
         return Err(-EEXIST);
@@ -557,7 +600,17 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
     if ino.meta().is_dir() {
         return Err(-vfs::EPERM);
     }
-    let (parent, name) = parent_at(newdir, newp)?;
+    let (parent, name, full) = parent_full(newdir, newp)?;
+    // 砂場: 作るところの MAKE_*。ほかのディレクトリのものをつなぐなら、両方に REFER も
+    {
+        use crate::landlock::*;
+        check_parent(&full, make_right(ino.meta().mode))?;
+        let src = old_path(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
+        if dir_of(&src) != dir_of(&full) {
+            check_parent(&src, REFER)?;
+            check_parent(&full, REFER)?;
+        }
+    }
     parent_writable(&cred::current(), &parent)?;
     parent.link(&name, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
@@ -570,10 +623,27 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if flags & !RENAME_NOREPLACE != 0 {
         return Err(-EINVAL);
     }
-    let (op, oname) = parent_at(olddir, oldp)?;
-    let (np, nname) = parent_at(newdir, newp)?;
+    let (op, oname, ofull) = parent_full(olddir, oldp)?;
+    let (np, nname, nfull) = parent_full(newdir, newp)?;
     if op.id().0 != np.id().0 {
         return Err(-vfs::EXDEV);
+    }
+    // 砂場: 元を消して、先に作る (先にあるものは消す)。ディレクトリをまたぐなら両方に REFER も
+    {
+        use crate::landlock::*;
+        let kind = |m: u32| if m & S_IFMT == vfs::S_IFDIR { REMOVE_DIR } else { REMOVE_FILE };
+        if let Ok(m) = op.lookup(&oname) {
+            let mode = m.meta().mode;
+            check_parent(&ofull, kind(mode))?;
+            check_parent(&nfull, make_right(mode))?;
+        }
+        if let Ok(r) = np.lookup(&nname) {
+            check_parent(&nfull, kind(r.meta().mode))?;
+        }
+        if dir_of(&ofull) != dir_of(&nfull) {
+            check_parent(&ofull, REFER)?;
+            check_parent(&nfull, REFER)?;
+        }
     }
     if flags & RENAME_NOREPLACE != 0 && np.lookup(&nname).is_ok() {
         return Err(-EEXIST);
@@ -676,7 +746,9 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     if len < 0 {
         return Err(-EINVAL);
     }
-    let ino = at(AT_FDCWD, pathp, 0)?;
+    let path = user_str(pathp)?;
+    let (full, ino) = vfs::lookup(&proc::current().files().cwd.clone(), &path, true)?;
+    crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
     cred::current().check(&ino.meta(), PW)?;
     ino.truncate(len as usize)?;
     inotify::self_event(&ino, inotify::IN_MODIFY);
@@ -1035,7 +1107,8 @@ pub fn chdir(pathp: usize) -> R {
 /// chroot(path): このプロセス (と子) の / を path にする。root だけ
 pub fn chroot(pathp: usize) -> R {
     let path = user_str(pathp)?;
-    if cred::current().euid != 0 {
+    // 砂場の中からは、見える根を変えられない (Linux の landlock と同じ)
+    if cred::current().euid != 0 || cred::current().landlock.is_some() {
         return Err(-cred::EPERM);
     }
     let files = proc::current().files();

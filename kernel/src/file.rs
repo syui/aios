@@ -62,6 +62,8 @@ pub enum Kind {
     SndCtl,
     /// 音の再生の口 (/dev/snd/pcmC0D0p)
     SndPcm,
+    /// landlock_create_ruleset の決まりの束
+    Landlock(crate::landlock::RulesetRef),
 }
 
 impl Kind {
@@ -375,7 +377,7 @@ impl OpenFile {
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
             Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) => Stat::dev(0o600, 0),
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => Stat::dev(0o600, 0),
         }
     }
 
@@ -414,6 +416,7 @@ impl OpenFile {
             Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
             Kind::Inotify(_) => "anon_inode:inotify".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
+            Kind::Landlock(_) => "anon_inode:landlock-ruleset".into(),
             Kind::Block(p) => crate::block::part_name(p),
         }
     }
