@@ -6,6 +6,7 @@
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
+#   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。小さなもの向け、1 MB まで)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
 #   test/vm.py log [N]             シリアルの終わりの N 行 (既定 40)
 #   test/vm.py status / stop
@@ -257,6 +258,21 @@ def main():
         sys.exit(r['status'])
     elif op == 'type':
         ask({'op': 'type', 'text': a[1].replace('\\n', '\n')})
+    elif op == 'put':
+        import base64, shlex
+        data = open(a[1], 'rb').read()
+        if len(data) > 1 << 20:
+            sys.exit('vm: put is for small files (1 MB)')
+        b = base64.b64encode(data).decode()
+        tmp = shlex.quote(a[2] + '.b64')
+        ask({'op': 'run', 'cmd': ': > ' + tmp, 'timeout': 30})
+        for i in range(0, len(b), 2000):
+            r = ask({'op': 'run', 'cmd': "printf %s '" + b[i:i + 2000] + "' >> " + tmp, 'timeout': 30})
+            if r.get('status') != 0:
+                sys.exit('vm: put: %s' % json.dumps(r))
+        r = ask({'op': 'run', 'cmd': 'base64 -d ' + tmp + ' > ' + shlex.quote(a[2]) + ' && rm ' + tmp, 'timeout': 30})
+        if r.get('status') != 0:
+            sys.exit('vm: put: %s' % json.dumps(r))
     elif op == 'mon':
         print(ask({'op': 'mon', 'cmd': a[1]})['out'])
     elif op == 'shot':
