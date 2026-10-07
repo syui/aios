@@ -70,6 +70,7 @@
   {"name": "sudo-rs",           "type": "rust",    "src": "git+https://github.com/trifectatechfoundation/sudo-rs#tag=v0.2.15",                                                "now": "0.2.15",         "latest": "0.2.15"},
   {"name": "tar",               "type": "rust",    "src": "git+https://github.com/uutils/tar#commit=20658bbf4988c4fa0d6c728aa1fa2e293f22e0b1",                                "now": "0.1.0.20261006", "latest": "commit 20658bb"},
   {"name": "tmux",              "type": "c",       "src": "https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz",                                             "now": "3.7c",           "latest": "3.7c"},
+  {"name": "toybox",            "type": "c",       "src": "https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz",                                                        "now": "0.8.15",         "latest": "0.8.15"},
   {"name": "uv",                "type": "rust",    "src": "git+https://github.com/astral-sh/uv#tag=0.12.23",                                                                  "now": "0.12.23",        "latest": "0.12.23"},
   {"name": "vim",               "type": "c",       "src": "git+https://github.com/vim/vim#tag=v9.2.1169",                                                                     "now": "9.2.1169",       "latest": "9.2.1169"},
   {"name": "vulkan-headers",    "type": "c",       "src": "git+https://github.com/KhronosGroup/Vulkan-Headers.git#tag=v1.4.365",                                              "now": "1.4.365",        "latest": "1.4.365"},

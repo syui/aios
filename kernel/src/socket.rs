@@ -6,7 +6,7 @@ use alloc::rc::Rc;
 use alloc::vec;
 use core::cell::RefCell;
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 const EAGAIN: i64 = 11;
@@ -18,6 +18,7 @@ const ENOTSOCK: i64 = 88;
 const EPROTONOSUPPORT: i64 = 93;
 const EOPNOTSUPP: i64 = 95;
 const EAFNOSUPPORT: i64 = 97;
+const EDESTADDRREQ: i64 = 89;
 const EADDRINUSE: i64 = 98;
 const ENETDOWN: i64 = 100;
 const ECONNRESET: i64 = 104;
@@ -42,6 +43,8 @@ const CONNECT_TIMEOUT_TICKS: u64 = 30 * crate::timer::HZ;
 enum Proto {
     Tcp,
     Udp,
+    /// ICMP の echo (Linux の ping ソケット: SOCK_DGRAM + IPPROTO_ICMP。root でなくても ping できる)
+    Icmp,
 }
 
 pub struct Socket {
@@ -53,6 +56,20 @@ pub struct Socket {
     peer: Option<IpEndpoint>,
     listening: bool,
     pub nonblock: bool,
+    /// /proc/PID/fd の socket:[N] の N (add_fd で決まる)
+    ino: usize,
+}
+
+/// smoltcp のソケット → (inode, 持ち主の uid)。/proc/net/tcp が読む (待っているプロセスはソケットを
+/// 借りたまま眠っているので、ソケットからは読めない)
+static mut OWNERS: alloc::collections::BTreeMap<SocketHandle, (usize, u32)> = alloc::collections::BTreeMap::new();
+
+fn owners() -> &'static mut alloc::collections::BTreeMap<SocketHandle, (usize, u32)> {
+    unsafe { &mut *(&raw mut OWNERS) }
+}
+
+fn own(h: SocketHandle, ino: usize) {
+    owners().insert(h, (ino, crate::cred::current().uid));
 }
 
 pub type SockRef = Rc<RefCell<Socket>>;
@@ -90,6 +107,22 @@ fn udp(h: SocketHandle) -> &'static mut udp::Socket<'static> {
     net::get().unwrap().sockets.get_mut::<udp::Socket>(h)
 }
 
+fn icmp(h: SocketHandle) -> &'static mut icmp::Socket<'static> {
+    net::get().unwrap().sockets.get_mut::<icmp::Socket>(h)
+}
+
+/// インターネットのチェックサム (RFC 1071)
+fn inet_checksum(b: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for c in b.chunks(2) {
+        sum += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// 眠って待つ。nonblock なら EAGAIN、deadline を過ぎたら ETIMEDOUT
 fn wait(nonblock: bool, deadline: u64) -> Result<(), i64> {
     if nonblock {
@@ -106,10 +139,11 @@ fn wait(nonblock: bool, deadline: u64) -> Result<(), i64> {
 impl Drop for Socket {
     fn drop(&mut self) {
         let Some(h) = self.handle.take() else { return };
+        owners().remove(&h);
         let Some(n) = net::get() else { return };
         match self.proto {
             Proto::Tcp => net::orphan(h),
-            Proto::Udp => {
+            Proto::Udp | Proto::Icmp => {
                 n.sockets.remove(h);
             }
         }
@@ -155,6 +189,18 @@ impl Socket {
                     wait(nb, 0)?;
                 }
             }
+            // ICMP の echo reply (IP ヘッダーなし、ICMP ヘッダーから)
+            Proto::Icmp => {
+                let h = self.bind_icmp()?;
+                loop {
+                    let s = icmp(h);
+                    if s.can_recv() {
+                        let (k, from) = s.recv_slice(buf).map_err(|_| -EINVAL)?;
+                        return Ok((k, Some(IpEndpoint::new(from, 0))));
+                    }
+                    wait(nb, 0)?;
+                }
+            }
         }
     }
 
@@ -187,7 +233,40 @@ impl Socket {
                 net::poll();
                 Ok(buf.len())
             }
+            // ICMP の echo request: Linux と同じく id をこのソケットの番号にして、チェックサムを計算しなおす
+            Proto::Icmp => {
+                let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
+                if buf.len() < 8 || buf[0] != 8 {
+                    return Err(-EINVAL);
+                }
+                let h = self.bind_icmp()?;
+                let id = self.local.map_or(0, |l| l.port);
+                let mut pkt = buf.to_vec();
+                pkt[4..6].copy_from_slice(&id.to_be_bytes());
+                pkt[2..4].copy_from_slice(&[0, 0]);
+                let sum = inet_checksum(&pkt);
+                pkt[2..4].copy_from_slice(&sum.to_be_bytes());
+                icmp(h).send_slice(&pkt, to.addr).map_err(|_| -EAGAIN)?;
+                net::poll();
+                Ok(buf.len())
+            }
         }
+    }
+
+    /// ICMP も送る前に自動で bind する (id は空いている番号)
+    fn bind_icmp(&mut self) -> Result<SocketHandle, i64> {
+        if let Some(h) = self.handle {
+            return Ok(h);
+        }
+        let meta = || vec![icmp::PacketMetadata::EMPTY; 16];
+        let mut sock = icmp::Socket::new(icmp::PacketBuffer::new(meta(), vec![0; 16 * 1024]), icmp::PacketBuffer::new(meta(), vec![0; 16 * 1024]));
+        let id = self.local.map(|l| l.port).filter(|&p| p != 0).unwrap_or_else(ephemeral);
+        sock.bind(icmp::Endpoint::Ident(id)).map_err(|_| -EADDRINUSE)?;
+        let h = n()?.sockets.add(sock);
+        self.local = Some(IpListenEndpoint { addr: None, port: id });
+        self.handle = Some(h);
+        own(h, self.ino);
+        Ok(h)
     }
 
     /// UDP は送る前に自動で bind する
@@ -201,13 +280,14 @@ impl Socket {
         udp(h).bind(ep).map_err(|_| -EADDRINUSE)?;
         self.local = Some(ep);
         self.handle = Some(h);
+        own(h, self.ino);
         Ok(h)
     }
 
     /// (読める, 書ける, 閉じた)
     pub fn readiness(&self) -> (bool, bool, bool) {
         net::poll();
-        let Some(h) = self.handle else { return (false, self.proto == Proto::Udp, false) };
+        let Some(h) = self.handle else { return (false, self.proto != Proto::Tcp, false) };
         match self.proto {
             Proto::Tcp => {
                 let s = tcp(h);
@@ -218,6 +298,7 @@ impl Socket {
                 (s.can_recv() || closed, s.can_send(), matches!(s.state(), tcp::State::Closed))
             }
             Proto::Udp => (udp(h).can_recv(), true, false),
+            Proto::Icmp => (icmp(h).can_recv(), true, false),
         }
     }
 }
@@ -285,7 +366,15 @@ fn unix_file(fd: u64) -> Option<FileRef> {
 }
 
 fn add_fd(s: Socket, cloexec: bool) -> R {
-    let f: FileRef = file::new(Kind::Socket(Rc::new(RefCell::new(s))), 2);
+    let rc = Rc::new(RefCell::new(s));
+    {
+        let mut b = rc.borrow_mut();
+        b.ino = Rc::as_ptr(&rc) as usize & 0xffffff;
+        if let Some(h) = b.handle {
+            own(h, b.ino);
+        }
+    }
+    let f: FileRef = file::new(Kind::Socket(rc), 2);
     let fd = proc::current().files().add(f, cloexec, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
@@ -319,7 +408,8 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
     Ok(0)
 }
 
-pub fn socket(domain: u64, typ: u64, _proto: u64) -> R {
+pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
+    const IPPROTO_ICMP: u64 = 1;
     const AF_UNIX: u64 = 1;
     if domain == AF_UNIX {
         if typ & 0xf != SOCK_STREAM {
@@ -334,11 +424,12 @@ pub fn socket(domain: u64, typ: u64, _proto: u64) -> R {
     }
     let proto = match typ & 0xf {
         SOCK_STREAM => Proto::Tcp,
+        SOCK_DGRAM if protocol == IPPROTO_ICMP => Proto::Icmp,
         SOCK_DGRAM => Proto::Udp,
         _ => return Err(-EPROTONOSUPPORT),
     };
     n()?;
-    let s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0 };
+    let s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0, ino: 0 };
     add_fd(s, typ & SOCK_CLOEXEC != 0)
 }
 
@@ -378,6 +469,7 @@ pub fn listen(fd: u64) -> R {
         let h = tcp_new()?;
         tcp(h).listen(ep).map_err(|_| -EADDRINUSE)?;
         s.handle = Some(h);
+        own(h, s.ino);
     }
     s.listening = true;
     Ok(0)
@@ -404,7 +496,8 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
             let nh = tcp_new()?;
             tcp(nh).listen(s.local.unwrap()).map_err(|_| -EADDRINUSE)?;
             s.handle = Some(nh);
-            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0 };
+            own(nh, s.ino);
+            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0 };
             write_addr(addr, lenp, peer)?;
             return add_fd(c, flags & SOCK_CLOEXEC != 0);
         }
@@ -432,6 +525,11 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
             s.bind_udp()?;
             Ok(0)
         }
+        Proto::Icmp => {
+            s.peer = Some(ep);
+            s.bind_icmp()?;
+            Ok(0)
+        }
         Proto::Tcp => {
             if s.handle.is_some() {
                 return Err(-EISCONN);
@@ -449,6 +547,7 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
                 return Err(-EINVAL);
             }
             s.handle = Some(h);
+            own(h, s.ino);
             s.peer = Some(ep);
             net::poll();
             if s.nonblock {
@@ -749,4 +848,66 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     pt.copy_out(m.controllen_at, &(ctl.0 as u64).to_le_bytes()).ok_or(-EFAULT)?;
     pt.copy_out(m.flags_at, &ctl.1.to_le_bytes()).ok_or(-EFAULT)?;
     Ok(k as i64)
+}
+
+/// /proc/net/tcp と /proc/net/udp (Linux と同じ形。ss と netstat が読む)。inode は /proc/PID/fd の socket:[N] と
+/// 同じ番号 (ss -p がプロセスを見つける)。閉じたあと残っているもの (TIME_WAIT など) は inode 0
+pub fn proc_net(want_tcp: bool) -> alloc::string::String {
+    use alloc::format;
+    let Some(n) = net::get() else { return alloc::string::String::new() };
+    let hex = |a: IpAddress| match a {
+        IpAddress::Ipv4(v) => format!("{:08X}", u32::from_le_bytes(v.octets())),
+        #[allow(unreachable_patterns)]
+        _ => "00000000".into(),
+    };
+    let mut s = alloc::string::String::from(if want_tcp {
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    } else {
+        "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+    });
+    let mut i = 0;
+    let unspec = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+    for (h, sock) in n.sockets.iter() {
+        let (inode, uid) = owners().get(&h).copied().unwrap_or((0, 0));
+        let line = match sock {
+            smoltcp::socket::Socket::Tcp(t) if want_tcp => {
+                let st = match t.state() {
+                    tcp::State::Established => 1,
+                    tcp::State::SynSent => 2,
+                    tcp::State::SynReceived => 3,
+                    tcp::State::FinWait1 => 4,
+                    tcp::State::FinWait2 => 5,
+                    tcp::State::TimeWait => 6,
+                    tcp::State::Closed => continue,
+                    tcp::State::CloseWait => 8,
+                    tcp::State::LastAck => 9,
+                    tcp::State::Listen => 10,
+                    tcp::State::Closing => 11,
+                };
+                let (la, lp) = match t.local_endpoint() {
+                    Some(e) => (e.addr, e.port),
+                    None => (t.listen_endpoint().addr.unwrap_or(unspec), t.listen_endpoint().port),
+                };
+                let (ra, rp) = t.remote_endpoint().map_or((unspec, 0), |e| (e.addr, e.port));
+                format!(
+                    "{:4}: {}:{:04X} {}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5}        0 {} 1 0000000000000000 100 0 0 10 0\n",
+                    i, hex(la), lp, hex(ra), rp, st, t.send_queue(), t.recv_queue(), uid, inode
+                )
+            }
+            smoltcp::socket::Socket::Udp(u) if !want_tcp => {
+                let e = u.endpoint();
+                if e.port == 0 {
+                    continue;
+                }
+                format!(
+                    "{:5}: {}:{:04X} 00000000:0000 07 00000000:00000000 00:00000000 00000000 {:5}        0 {} 2 0000000000000000 0\n",
+                    i, hex(e.addr.unwrap_or(unspec)), e.port, uid, inode
+                )
+            }
+            _ => continue,
+        };
+        s.push_str(&line);
+        i += 1;
+    }
+    s
 }

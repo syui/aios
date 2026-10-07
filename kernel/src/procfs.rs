@@ -10,6 +10,7 @@
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
 //   /proc/stat (CPU の時間、btime、processes ...), /proc/loadavg, /proc/version (ps や top、psutil が読む)
+//   /proc/net/tcp, udp  ソケットの一覧 (ss や netstat が読む)
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 //   /proc/sys/...       カーネルの値 (sysctl.rs の表。root は書ける)
 use crate::proc::{self, Proc, State};
@@ -40,6 +41,10 @@ enum Node {
     NetDir,
     Pnp,
     Route,
+    NetTcp,
+    NetUdp,
+    /// まだ中身のない /proc/net のファイル (見出しだけ。netstat が読む): NET_STUBS の番号
+    NetStub(u8),
     KernelCmdline,
     CpuInfo,
     StatAll,
@@ -74,6 +79,15 @@ pub fn new_root() -> InodeRef {
     Rc::new(ProcInode { fs: new_fs_id(), node: Node::Root })
 }
 
+/// IPv6、raw、unix のソケットの一覧は見出しだけ (IPv6 と raw はない。netstat がないと言って止まる)
+const NET_STUBS: [(&str, &str); 5] = [
+    ("tcp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"),
+    ("udp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
+    ("raw", "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
+    ("raw6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
+    ("unix", "Num       RefCount Protocol Flags    Type St Inode Path\n"),
+];
+
 fn leader(pid: u32) -> Result<&'static mut Proc, i64> {
     proc::find_leader(pid).filter(|p| p.state != State::Zombie).ok_or(-ENOENT)
 }
@@ -105,6 +119,9 @@ impl ProcInode {
             Node::Sysstat => 33,
             Node::Modules => 12,
             Node::Route => 11,
+            Node::NetTcp => 16,
+            Node::NetUdp => 17,
+            Node::NetStub(i) => 18 + i as u64,
             Node::SysDir(i, d) => 0x100 + i as u64 * 8 + d as u64,
             Node::Sys(i) => 0x1000 + i as u64,
             Node::Pid(p) => (p as u64) << 16 | 1,
@@ -185,6 +202,9 @@ impl ProcInode {
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
+            Node::NetTcp => crate::socket::proc_net(true),
+            Node::NetUdp => crate::socket::proc_net(false),
+            Node::NetStub(i) => NET_STUBS[i as usize].1.into(),
             Node::Sys(i) => crate::sysctl::TABLE[i as usize].read(),
             Node::Pnp => {
                 // Linux と同じく、DHCP なら #PROTO: DHCP、手で決めたなら #MANUAL
@@ -508,6 +528,9 @@ impl Inode for ProcInode {
             (Node::Root, "net") => Node::NetDir,
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::NetDir, "route") => Node::Route,
+            (Node::NetDir, "tcp") => Node::NetTcp,
+            (Node::NetDir, "udp") => Node::NetUdp,
+            (Node::NetDir, n) if NET_STUBS.iter().any(|(s, _)| *s == n) => Node::NetStub(NET_STUBS.iter().position(|(s, _)| *s == n).unwrap() as u8),
             (Node::Root, "sys") => Node::SysDir(0, 0),
             (Node::SysDir(i, d), _) => match crate::sysctl::lookup(i as usize, d as usize, name).ok_or(-ENOENT)? {
                 (j, true) => Node::Sys(j as u16),
@@ -569,6 +592,11 @@ impl Inode for ProcInode {
             Node::NetDir => {
                 add("pnp".into(), Node::Pnp);
                 add("route".into(), Node::Route);
+                add("tcp".into(), Node::NetTcp);
+                add("udp".into(), Node::NetUdp);
+                for (i, (n, _)) in NET_STUBS.iter().enumerate() {
+                    add((*n).into(), Node::NetStub(i as u8));
+                }
             }
             Node::SysDir(i, d) => {
                 for (name, j, file) in crate::sysctl::list(i as usize, d as usize) {

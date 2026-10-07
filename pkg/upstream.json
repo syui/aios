@@ -70,6 +70,7 @@
   {"from":"pkgbuild","git":"https://github.com/trifectatechfoundation/sudo-rs","name":"sudo-rs","pkgver":"0.2.15","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"commit":"f7858a00e944d3f9500e67814a8dc99581e4d277","from":"commit","git":"https://github.com/uutils/tar","name":"tar","pkgver":"0.1.0.20261005"},
   {"from":"pkgbuild","git":"https://github.com/tmux/tmux.git","name":"tmux","pkgver":"3.7c","tag":"^([0-9][0-9A-Za-z.]*)$"},
+  {"from":"pkgbuild","name":"toybox","nvchecker":{"join":true,"regex":"toybox-([0-9.]+)\\.tar\\.gz","source":"regex","url":"https://landley.net/toybox/downloads/"},"pkgver":"0.8.15"},
   {"from":"pkgbuild","git":"https://github.com/astral-sh/uv","name":"uv","pkgver":"0.12.23","tag":"^([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/vim/vim","name":"vim","pkgver":"9.2.1164","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/KhronosGroup/Vulkan-Headers.git","name":"vulkan-headers","pkgver":"1.4.365","tag":"^v([0-9][0-9A-Za-z.]*)$"},
