@@ -12,6 +12,8 @@ mod fb;
 mod input;
 #[path = "../lib/keys.rs"]
 mod keys;
+#[path = "../lib/glyph.rs"]
+mod glyph;
 #[path = "../lib/text.rs"]
 mod text;
 #[path = "../lib/wl.rs"]
@@ -261,6 +263,8 @@ struct Surface {
     app_id: String,
     min_size: (i32, i32),
     max_size: (i32, i32),
+    /// 透けない絵 (XRGB): 重ねるときに 1 画素ずつ混ぜず、そのまま写す
+    opaque: bool,
 }
 
 struct Client {
@@ -395,7 +399,8 @@ struct Wm {
     abs_max: (i32, i32),
     config: Config,
     /// 描きなおす行 [y0, y1)
-    dirty: Option<(i32, i32)>,
+    /// 描きなおすところ (x0, y0, x1, y1)
+    dirty: Option<(i32, i32, i32, i32)>,
     /// 次に画面を出したあと done を送る frame コールバック
     frames: Vec<(usize, u32)>,
     /// xkb のキーマップ (memfd、NUL まで) と大きさ
@@ -455,7 +460,7 @@ fn main() {
         float_at: HashMap::new(),
         drag: None,
         config,
-        dirty: Some((0, h)),
+        dirty: Some((0, 0, w, h)),
         frames: vec![],
         keymap_fd,
         keymap_size,
@@ -687,14 +692,21 @@ impl Wm {
         }
     }
 
+    /// 行 [y0, y1) を描きなおす
     fn mark(&mut self, y0: i32, y1: i32) {
-        let (y0, y1) = (y0.max(0), y1.min(self.height()));
-        if y0 >= y1 {
+        let w = self.width();
+        self.mark_rect(Rect { x: 0, y: y0, w, h: y1 - y0 });
+    }
+
+    /// 四角を描きなおす (前のものとあわせた四角)
+    fn mark_rect(&mut self, r: Rect) {
+        let (x0, y0, x1, y1) = (r.x.max(0), r.y.max(0), (r.x + r.w).min(self.width()), (r.y + r.h).min(self.height()));
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
         self.dirty = Some(match self.dirty {
-            Some((a, b)) => (a.min(y0), b.max(y1)),
-            None => (y0, y1),
+            Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+            None => (x0, y0, x1, y1),
         });
     }
 
@@ -1237,7 +1249,8 @@ impl Wm {
                             let src = unsafe { std::slice::from_raw_parts(p.ptr.add(b.offset + y * b.stride) as *const u32, b.w) };
                             s.image[y * b.w..(y + 1) * b.w].copy_from_slice(src);
                         }
-                        if b.format != 0 {
+                        s.opaque = b.format != 0;
+                        if s.opaque {
                             s.image.iter_mut().for_each(|p| *p |= 0xff00_0000);
                         }
                         s.iw = b.w;
@@ -1339,8 +1352,9 @@ impl Wm {
 
     /// surface の絵が変わった: その窓を描きなおす
     fn mark_surface(&mut self, cid: usize, sid: u32) {
+        // 窓の中だけ (枠やほかの窓は変わらない)
         if let Some(r) = self.rect_of(self.root_of(cid, sid)) {
-            self.mark(r.y, r.y + r.h);
+            self.mark_rect(r);
         }
     }
 
@@ -1879,8 +1893,9 @@ impl Wm {
 
     fn pointer_moved(&mut self, old: (i32, i32)) {
         self.ptr_shown = true;
-        self.mark(old.1 - 1, old.1 + CURSOR_H + 1);
-        self.mark(self.ptr.1 - 1, self.ptr.1 + CURSOR_H + 1);
+        // カーソルの絵のまわりだけ (いちばん長い行は 10 画素)
+        self.mark_rect(Rect { x: old.0 - 1, y: old.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
+        self.mark_rect(Rect { x: self.ptr.0 - 1, y: self.ptr.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
         if let Some((w, dx, dy)) = self.drag {
             let (fw, _) = self.float_size(w);
             let x = (self.ptr.0 - dx).clamp(-fw + 32, self.width() - 32);
@@ -2007,13 +2022,20 @@ impl Wm {
     // ---- 描く ----
 
     fn render(&mut self) {
-        let Some((y0, y1)) = self.dirty.take() else { return };
-        let (sw, stride) = (self.fb.width, self.fb.stride);
+        let Some((x0, y0, x1, y1)) = self.dirty.take() else { return };
+        let stride = self.fb.stride;
         let bg = self.config.bg;
+        // 変わった四角の外は描かない (文字やカーソルの blend も、fill_rect も、窓の絵も)
+        self.fb.clip = (x0, y0, x1, y1);
+        // 窓の絵を切る四角を、変わった四角の横の範囲にも狭める
+        let cut = |c: Rect| {
+            let (a, b) = (c.x.max(x0), (c.x + c.w).min(x1));
+            Rect { x: a, y: c.y, w: b - a, h: c.h }
+        };
         {
             let px = self.fb.pixels();
             for y in y0..y1 {
-                px[y as usize * stride..y as usize * stride + sw].fill(bg);
+                px[y as usize * stride + x0 as usize..y as usize * stride + x1 as usize].fill(bg);
             }
         }
         let (wins, layout, full) = match self.spaces.get(&self.cur) {
@@ -2043,7 +2065,7 @@ impl Wm {
                 Some((x, y, w, h)) => (x, y, w, h),
                 None => (0, 0, iw, ih),
             };
-            let clip = Rect { x: r.x, y: r.y.max(y0), w: r.w.min(gw), h: (r.y + r.h.min(gh)).min(y1) - r.y.max(y0) };
+            let clip = cut(Rect { x: r.x, y: r.y.max(y0), w: r.w.min(gw), h: (r.y + r.h.min(gh)).min(y1) - r.y.max(y0) });
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
             draw_tree(px, stride, c, w.surface, r.x - gx, r.y - gy, clip, 0);
         }
@@ -2058,7 +2080,7 @@ impl Wm {
             let Some(c) = self.clients.get(&w.client) else { continue };
             let (gx, gy) = self.geom_off(w);
             let top = r.y.max(y0).max(0);
-            let clip = Rect { x: r.x.max(0), y: top, w: (r.x + r.w).min(sw as i32) - r.x.max(0), h: (r.y + r.h).min(y1) - top };
+            let clip = cut(Rect { x: r.x.max(0), y: top, w: (r.x + r.w).min(x1) - r.x.max(0), h: (r.y + r.h).min(y1) - top });
             if clip.w <= 0 || clip.h <= 0 {
                 continue;
             }
@@ -2072,14 +2094,15 @@ impl Wm {
         for w in self.popups.clone() {
             let Some((ox, oy)) = self.surface_origin(w) else { continue };
             let Some(c) = self.clients.get(&w.client) else { continue };
-            let clip = Rect { x: 0, y: y0, w: sw as i32, h: y1 - y0 };
+            let clip = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
             draw_tree(px, stride, c, w.surface, ox, oy, clip, 0);
         }
         if self.ptr_shown {
             self.draw_cursor(y0, y1);
         }
-        self.fb.present_rows(y0 as usize, y1 as usize);
+        self.fb.present_rect(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+        self.fb.clip = (0, 0, self.width(), self.height());
     }
 
     /// 窓の絵の中で、窓が始まるところ (set_window_geometry の x, y)。ポインタの場所をずらすのに使う
@@ -2227,7 +2250,8 @@ impl Wm {
 
     fn fill_rect(&mut self, r: Rect, rgb: u32, y0: i32, y1: i32) {
         let (sw, sh, stride) = (self.width(), self.height(), self.fb.stride);
-        let (x0, x1) = (r.x.max(0), (r.x + r.w).min(sw));
+        let (cx0, _, cx1, _) = self.fb.clip;
+        let (x0, x1) = (r.x.max(0).max(cx0), (r.x + r.w).min(sw).min(cx1));
         if x0 >= x1 {
             return;
         }
@@ -2305,6 +2329,10 @@ fn draw_tree(px: &mut [u32], stride: usize, c: &Client, sid: u32, ox: i32, oy: i
         for y in ya..yb {
             let src = &s.image[((y - oy) as usize) * s.iw + (x0 - ox) as usize..][..(x1 - x0) as usize];
             let dst = &mut px[y as usize * stride + x0 as usize..][..(x1 - x0) as usize];
+            if s.opaque {
+                dst.copy_from_slice(src);
+                continue;
+            }
             for (d, &p) in dst.iter_mut().zip(src) {
                 let a = p >> 24;
                 if a == 255 {
@@ -2346,6 +2374,7 @@ fn combo_name(mods: u32, code: u16) -> String {
 }
 
 const CURSOR_H: i32 = 17;
+const CURSOR_W: i32 = 10;
 const CURSOR: [&str; 17] = [
     "#", "##", "#.#", "#..#", "#...#", "#....#", "#.....#", "#......#", "#.......#", "#........#", "#.....####", "#..#..#", "#.# #..#", "##  #..#", "#    #..#", "     #..#",
     "      ##",

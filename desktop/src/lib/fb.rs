@@ -16,6 +16,8 @@ pub struct Fb {
     pub height: usize,
     /// 1 行の画素の数 (line_length / 4)
     pub stride: usize,
+    /// blend が描くところ (x0, y0, x1, y1)。aiwm が変わったところだけ描くときに狭める
+    pub clip: (i32, i32, i32, i32),
 }
 
 impl Fb {
@@ -38,7 +40,8 @@ impl Fb {
         if mem == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Fb { file, mem: mem as *mut u32, len, width: var[0] as usize, height: var[1] as usize, stride: line / 4 })
+        let (width, height) = (var[0] as usize, var[1] as usize);
+        Ok(Fb { file, mem: mem as *mut u32, len, width, height, stride: line / 4, clip: (0, 0, width as i32, height as i32) })
     }
 
     pub fn pixels(&mut self) -> &mut [u32] {
@@ -47,7 +50,8 @@ impl Fb {
 
     /// (x, y) に色 (0xRRGGBB) を a (0..=255) の濃さで重ねる
     pub fn blend(&mut self, x: i32, y: i32, rgb: u32, a: u32) {
-        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height || a == 0 {
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        if x < cx0.max(0) || y < cy0.max(0) || x >= cx1.min(self.width as i32) || y >= cy1.min(self.height as i32) || a == 0 {
             return;
         }
         let i = y as usize * self.stride + x as usize;
@@ -74,6 +78,20 @@ impl Fb {
 }
 
 impl Fb {
+    #[allow(dead_code)]
+    /// 四角 [x0, x1) x [y0, y1) だけ画面へ (FBIO_DAMAGE。古いカーネルで使えなければ、その行を write)
+    pub fn present_rect(&self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        const FBIO_DAMAGE: libc::c_ulong = 0x4010_46a0;
+        let (x1, y1) = (x1.min(self.width), y1.min(self.height));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let r = [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32];
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), FBIO_DAMAGE as _, r.as_ptr()) } != 0 {
+            self.present_rows(y0, y1);
+        }
+    }
+
     #[allow(dead_code)]
     /// [y0, y1) の行だけ画面へ (その行を自分自身へ書くと、カーネルがその行だけ送る)
     pub fn present_rows(&self, y0: usize, y1: usize) {
