@@ -733,6 +733,8 @@ pub fn render(r: &Value) -> String {
             }
             // 空の一覧 (skipped: [] など) は何も伝えないので出さない
             (_, Value::Array(a)) if a.is_empty() => {}
+            // grep の engine (rg か aish か) と、切れていない truncated: false も
+            ("engine", _) | ("truncated", Value::Bool(false)) => {}
             _ => {
                 meta.insert(k.clone(), v.clone());
             }
