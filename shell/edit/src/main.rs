@@ -18,7 +18,7 @@ const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"o
 const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない"}},"required":["path"]}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
 const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
-const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"}},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
+const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
 const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
 const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
 
@@ -372,7 +372,13 @@ fn sed(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
     }
     match write(path, out.as_bytes(), snaps) {
         r if r.get("error").is_some() => r,
-        _ => json!({ "path": path.display().to_string(), "replaced": n, "lines": changed }),
+        _ => {
+            // 変えた行とまわり (edit と同じ形)
+            let starts: Vec<usize> = std::iter::once(0).chain(out.match_indices('\n').map(|(i, _)| i + 1)).collect();
+            let spans: Vec<(usize, usize)> = changed.iter().filter_map(|&l| starts.get(l - 1).map(|&a| (a, out[a..].find('\n').unwrap_or(out.len() - a)))).collect();
+            let (_, shown) = around(&out, &spans);
+            json!({ "path": path.display().to_string(), "replaced": n, "lines": changed, "text": shown })
+        }
     }
 }
 

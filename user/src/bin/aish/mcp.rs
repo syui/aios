@@ -345,6 +345,23 @@ impl Shell {
             }
             text.push_str(&format!("  {:<8} {}{}\n", name, tools.join(" "), note));
         }
+        // プラグインのツールの引数の形 (JSON Schema): 一番上は type properties required だけ。ほかのものがあると
+        // Claude Code は形を読めず、引数なしのツールに見える (aish-edit の sed で subs が properties の外にあった)
+        for (plugin, t) in self.plugins.tools() {
+            let input = &t["input"];
+            let bad: Vec<String> = input.as_object().map(|o| o.keys().filter(|k| !["type", "properties", "required", "description", "additionalProperties", "$schema"].contains(&k.as_str())).cloned().collect()).unwrap_or_default();
+            if let Some(why) = input["invalid"].as_str() {
+                problems.push(format!("plugin {}: tool {}: {}", plugin, t["name"].as_str().unwrap_or("?"), why));
+            } else if !input.is_object() || input["properties"].is_null() && input["type"] != "object" {
+                problems.push(format!("plugin {}: tool {}: input is not an object schema", plugin, t["name"].as_str().unwrap_or("?")));
+            } else if !bad.is_empty() {
+                problems.push(format!("plugin {}: tool {}: input has {} at the top (it belongs in properties)", plugin, t["name"].as_str().unwrap_or("?"), bad.join(", ")));
+            } else if let Some(req) = input["required"].as_array()
+                && let Some(missing) = req.iter().filter_map(|r| r.as_str()).find(|r| input["properties"].get(r).is_none())
+            {
+                problems.push(format!("plugin {}: tool {}: required {} is not in properties", plugin, t["name"].as_str().unwrap_or("?"), missing));
+            }
+        }
         let building = src.as_deref().map(building).unwrap_or_default();
         if let Some(src) = &src {
             text.push_str(&format!("source {}{}\n", src, if building.is_empty() { String::new() } else { format!("  (building: cargo pid {})", building.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")) }));
