@@ -90,6 +90,11 @@ struct App {
 }
 
 fn main() {
+    // 版だけ (画面や Wayland を開く前に。aish-pkg test が動くか確かめるのに使う)
+    if std::env::args().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("aiterm %s", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd: Vec<String> = match args.first().map(String::as_str) {
         Some("-e") => args[1..].to_vec(),
