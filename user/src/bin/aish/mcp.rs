@@ -87,6 +87,8 @@ const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも�
 答えは JSON: run は {status, out, err, ms, pwd} (時間切れなら timeout: true)。\
 重いもの (ビルドなど) は run の bg: true でうしろで動かし、job で様子と出力を見ると、そのあいだもほかのツールが使えます。\
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。\
+出力が長いと頭と終わりだけになり、まん中は答えの out_id を out に渡して探したり読んだりできます。\
+aish やプラグインをビルドしなおすと、次のツールで aish が自分で新しいものに入れかわります (変数は空に戻ります)。\
 つながりやビルドが古くないかは check で見られます。";
 
 impl Shell {
@@ -219,7 +221,7 @@ impl Shell {
             "inputSchema": serde_json::from_str::<Value>(OUT_INPUT).unwrap(),
         }), json!({
             "name": "check",
-            "description": "aish のつながりの様子: 版、起きてからの時間、プラグインが生きているか、ビルドしなおしたもの (つなぎなおすと新しくなる) や、ソースがバイナリより新しいもの (ビルドが要る)。problems が空なら ok",
+            "description": "aish のつながりの様子: 版、起きてからの時間、プラグインが生きているか、ツールの引数の形がこわれていないか、ソースがバイナリより新しいもの (ビルドが要る)。ビルドしなおしたものには次のツールで自分で入れかわる。problems が空なら ok",
             "inputSchema": { "type": "object", "properties": {} },
         })];
         for (plugin, t) in self.plugins.tools() {
