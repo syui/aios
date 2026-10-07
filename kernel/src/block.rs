@@ -69,19 +69,76 @@ fn raw_write(d: Dev, sector: u64, buf: &[u8]) -> Result<(), i64> {
     }
 }
 
+/// 区画ごとの読み書きの数 (/proc/diskstats): [番号] = (読んだ回数, 読んだセクタ, 読んだ ms, 書いた回数, 書いたセクタ, 書いた ms)。
+/// 番号 0 はディスク全体 (どの区画のものも足す)
+pub const MAX_PARTS: usize = 16;
+static mut IO: [[u64; 6]; MAX_PARTS] = [[0; 6]; MAX_PARTS];
+
+fn count(p: &Part, write: bool, sectors: u64, t0: u64) {
+    let ms = (crate::timer::uptime_ns() - t0) / 1_000_000;
+    let o = if write { 3 } else { 0 };
+    let io = unsafe { &mut *(&raw mut IO) };
+    for n in [0, p.num] {
+        if let Some(c) = io.get_mut(n) {
+            c[o] += 1;
+            c[o + 1] += sectors;
+            c[o + 2] += ms;
+        }
+        if p.num == 0 {
+            break;
+        }
+    }
+}
+
+/// 区画 (番号) の読み書きの数
+pub fn io_stats(num: usize) -> [u64; 6] {
+    unsafe { (*(&raw const IO)).get(num).copied().unwrap_or([0; 6]) }
+}
+
 /// 区画 p の中の sector から読む
 pub fn read_part(p: &Part, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);
     }
-    raw_read(dev()?, p.start + sector, buf)
+    let t0 = crate::timer::uptime_ns();
+    let r = raw_read(dev()?, p.start + sector, buf);
+    count(p, false, (buf.len() / SECTOR) as u64, t0);
+    r
 }
 
 pub fn write_part(p: &Part, sector: u64, buf: &[u8]) -> Result<(), i64> {
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);
     }
-    raw_write(dev()?, p.start + sector, buf)
+    let t0 = crate::timer::uptime_ns();
+    let r = raw_write(dev()?, p.start + sector, buf);
+    count(p, true, (buf.len() / SECTOR) as u64, t0);
+    r
+}
+
+/// /proc/diskstats (Linux と同じ 14 列: major minor 名前 読んだ回数 まとめた数 セクタ ms 書いた回数 まとめた数 セクタ ms
+/// 動いている数 ms 重みつき ms)
+pub fn proc_diskstats() -> String {
+    let mut s = String::new();
+    for p in parts() {
+        let (ma, mi) = dev_of_part(&p);
+        let c = io_stats(p.num);
+        s += &format!(
+            "{:4} {:7} {} {} 0 {} {} {} 0 {} {} 0 {} {}\n",
+            ma,
+            mi,
+            part_name(&p).trim_start_matches("/dev/"),
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[2] + c[5],
+            c[2] + c[5]
+        );
+    }
+    s
 }
 
 /// root の区画から読む (extfs)

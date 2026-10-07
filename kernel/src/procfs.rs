@@ -10,6 +10,7 @@
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
 //   /proc/stat (CPU の時間、btime、processes ...), /proc/loadavg, /proc/version (ps や top、psutil が読む)
+//   /proc/vmstat, /proc/diskstats (vmstat や iostat、psutil が読む)
 //   /proc/net/tcp, udp  ソケットの一覧 (ss や netstat が読む)
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 //   /proc/sys/...       カーネルの値 (sysctl.rs の表。root は書ける)
@@ -50,6 +51,8 @@ enum Node {
     StatAll,
     Loadavg,
     Version,
+    Vmstat,
+    Diskstats,
     /// /proc/sys の下のディレクトリ: sysctl の表の番号と、そのパスのはじめのいくつか
     SysDir(u16, u8),
     /// /proc/sys の下のファイル: sysctl の表の番号
@@ -109,6 +112,8 @@ impl ProcInode {
             Node::KernelCmdline => 8,
             Node::CpuInfo => 9,
             Node::StatAll => 13,
+            Node::Vmstat => 30,
+            Node::Diskstats => 36,
             Node::Loadavg => 14,
             Node::Version => 15,
             Node::Swaps => 10,
@@ -185,13 +190,22 @@ impl ProcInode {
                 let free = crate::kalloc::nfree() * PGSIZE / 1024;
                 let (st, sf) = crate::swap::totals();
                 format!(
-                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nShmem:        {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\n",
+                    // Buffers から下は、Linux の道具 (free、vmstat、top、psutil) が読む行。aios にない区分は 0
+                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nBuffers:      {:8} kB\nCached:       {:8} kB\nSwapCached:   {:8} kB\nActive:       {:8} kB\nInactive:     {:8} kB\nShmem:        {:8} kB\nSlab:         {:8} kB\nSReclaimable: {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\nDirty:        {:8} kB\n",
                     total,
                     free,
                     free,
+                    0,
+                    0,
+                    0,
+                    total - free,
+                    0,
                     crate::vm::shared_pages() * PGSIZE / 1024,
+                    0,
+                    0,
                     st * PGSIZE / 1024,
-                    sf * PGSIZE / 1024
+                    sf * PGSIZE / 1024,
+                    0
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),
@@ -273,6 +287,29 @@ impl ProcInode {
                 format!("{} {} 0 0 0 {} 0\n", vsize / crate::memlayout::PGSIZE, rss, rss)
             }
             Node::StatAll => stat_all(),
+            Node::Diskstats => crate::block::proc_diskstats(),
+            Node::Vmstat => {
+                use core::sync::atomic::Ordering::Relaxed;
+                // ページ (4 KiB) の数と、Linux の vmstat が読む数え (ないものは 0)
+                let free = crate::kalloc::nfree();
+                let (mut rd, mut wr) = (0, 0);
+                for p in crate::block::parts().iter().filter(|p| p.num != 0) {
+                    let c = crate::block::io_stats(p.num);
+                    rd += c[1];
+                    wr += c[4];
+                }
+                format!(
+                    "nr_free_pages {}\nnr_inactive_anon 0\nnr_active_anon 0\nnr_inactive_file 0\nnr_active_file 0\nnr_dirty 0\nnr_writeback 0\nnr_shmem {}\npgpgin {}\npgpgout {}\npswpin {}\npswpout {}\npgfault {}\npgmajfault {}\npgfree 0\n",
+                    free,
+                    crate::vm::shared_pages(),
+                    rd / 2,
+                    wr / 2,
+                    crate::swap::PSWPIN.load(Relaxed),
+                    crate::swap::PSWPOUT.load(Relaxed),
+                    crate::smp::FAULTS.load(Relaxed),
+                    crate::swap::PSWPIN.load(Relaxed)
+                )
+            }
             Node::Loadavg => {
                 use core::sync::atomic::Ordering::Relaxed;
                 let f = |i: usize| {
@@ -515,6 +552,8 @@ impl Inode for ProcInode {
             (Node::Root, "stat") => Node::StatAll,
             (Node::Root, "loadavg") => Node::Loadavg,
             (Node::Root, "version") => Node::Version,
+            (Node::Root, "vmstat") => Node::Vmstat,
+            (Node::Root, "diskstats") => Node::Diskstats,
             (Node::Root, "cmdline") => Node::KernelCmdline,
             (Node::Root, "cpuinfo") => Node::CpuInfo,
             (Node::Root, "meminfo") => Node::Meminfo,
@@ -573,6 +612,8 @@ impl Inode for ProcInode {
                 add("stat".into(), Node::StatAll);
                 add("loadavg".into(), Node::Loadavg);
                 add("version".into(), Node::Version);
+                add("vmstat".into(), Node::Vmstat);
+                add("diskstats".into(), Node::Diskstats);
                 add("cmdline".into(), Node::KernelCmdline);
                 add("cpuinfo".into(), Node::CpuInfo);
                 add("meminfo".into(), Node::Meminfo);

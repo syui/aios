@@ -161,6 +161,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             let write = esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
             if proc::current().pt().fast_fault(far as usize, write) {
                 crate::smp::FAST_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
             }
         }
@@ -229,6 +230,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
                         // DC CVAU すると、書いたと見て SIGSEGV にしてしまうので、読んだものとして扱う
                         let cm = ec == EC_DABT_LOW && esr & (1 << 8) != 0;
                         let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && !cm;
+                        crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         // 足りなければ自分のページもスワップへ追い出して、もう一度
                         if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::swap::reclaim(crate::swap::BATCH, 0) > 0 {
