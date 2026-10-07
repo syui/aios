@@ -705,7 +705,13 @@ fn render(r: &Value) -> String {
                 for i in items {
                     let (line, kind, name) = (i["line"].as_u64().unwrap_or(0), i["kind"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
                     match i["path"].as_str() {
-                        Some(p) => s.push_str(&format!("{}:{} {} {}: {}\n", p, line, kind, name, i["text"].as_str().unwrap_or("").trim())),
+                        Some(p) => {
+                            s.push_str(&format!("{}:{} {} {}: {}\n", p, line, kind, name, i["text"].as_str().unwrap_or("").trim()));
+                            // where の body: 定義の中身 (read と同じ形)
+                            if let Some(b) = i["body"].as_str() {
+                                s.push_str(b);
+                            }
+                        }
                         None => s.push_str(&format!("{}{} {} {}\n", "  ".repeat(i["indent"].as_u64().unwrap_or(0) as usize), line, kind, name)),
                     }
                 }
