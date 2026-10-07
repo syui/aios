@@ -219,8 +219,13 @@ fn sector_of(a: &Area, slot: Slot) -> u64 {
     sector_of_page(a, slot as u32 as u64)
 }
 
+/// スワップから読んだページと書いたページの数 (/proc/vmstat の pswpin、pswpout)
+pub static PSWPIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PSWPOUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// スロットからページ (カーネルの仮想アドレス) へ読む
 pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
+    PSWPIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let a = area(slot).ok_or(-EINVAL)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(page, PGSIZE) };
     block::read_part(&a.part, sector_of(a, slot), buf)
@@ -228,6 +233,7 @@ pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
 
 /// ページをスロットへ書く
 pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
+    PSWPOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let a = area(slot).ok_or(-EINVAL)?;
     let buf = unsafe { core::slice::from_raw_parts(page, PGSIZE) };
     block::write_part(&a.part, sector_of(a, slot), buf)

@@ -150,6 +150,8 @@ pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
 pub static PREEMPTS: AtomicUsize = AtomicUsize::new(0);
 /// 大きなロックなしで片づけたページフォルト (vm.rs fast_fault)
 pub static FAST_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// ページフォールトの数 (起きてからずっと。/proc/vmstat の pgfault)
+pub static FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// 例外 1 つぶんの、ロックを持っていた時間を数える (trap.rs)。sys はシステムコールの番号
 pub enum Cause {
