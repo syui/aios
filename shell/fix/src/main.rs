@@ -59,6 +59,8 @@ struct Build {
     ms: u128,
     status: Option<i32>,
     diags: Vec<Diag>,
+    /// cargo test の「test result: ...」の行
+    tests: Vec<String>,
 }
 
 fn main() {
@@ -174,7 +176,7 @@ impl Build {
         let out = Arc::new(Mutex::new(Vec::new()));
         let err = Arc::new(Mutex::new(Vec::new()));
         let readers = vec![reader(child.stdout.take().unwrap(), out.clone()), reader(child.stderr.take().unwrap(), err.clone())];
-        Ok(Build { cmd: full, dir: dir.to_path_buf(), child: Some(child), out, err, readers, start: Instant::now(), ms: 0, status: None, diags: vec![] })
+        Ok(Build { cmd: full, dir: dir.to_path_buf(), child: Some(child), out, err, readers, start: Instant::now(), ms: 0, status: None, diags: vec![], tests: vec![] })
     }
 
     /// 終わるか d が過ぎるまで待つ。終わったら診断を読む
@@ -216,6 +218,9 @@ impl Build {
         for line in err.lines() {
             text_line(line, &self.dir, &mut diags);
         }
+        // cargo test: 落ちたテスト (---- NAME stdout ---- のかたまり) と、まとめの行
+        test_failures(&out, &self.dir, &mut diags);
+        self.tests = out.lines().filter(|l| l.starts_with("test result:")).map(String::from).collect();
         // 同じもの (いくつものターゲットで同じエラー) は 1 つに
         let mut seen = std::collections::HashSet::new();
         diags.retain(|d| seen.insert((d.head.clone(), d.path.clone(), d.line)));
@@ -262,6 +267,9 @@ impl Build {
         if shown.len() > MAX_ITEMS {
             r["more"] = json!(shown.len() - MAX_ITEMS);
         }
+        if !self.tests.is_empty() {
+            r["tests"] = json!(self.tests);
+        }
         // しくじったのにエラーを拾えなかった (cargo そのもののエラーなど): 標準エラーの終わりを見せる
         if self.status != Some(0) && errors == 0 {
             let e = String::from_utf8_lossy(&self.err.lock().unwrap()).into_owned();
@@ -273,6 +281,83 @@ impl Build {
         }
         r
     }
+}
+
+/// cargo test (libtest) の落ちたテスト: 「---- NAME stdout ----」から次のかたまりまで。
+/// 「thread 'NAME' panicked at path:line:col:」の場所と、その次の行 (assert の説明) を一覧の 1 行に
+fn test_failures(out: &str, dir: &Path, diags: &mut Vec<Diag>) {
+    let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with('{')).collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(name) = lines[i].strip_prefix("---- ").and_then(|l| l.strip_suffix(" stdout ----")) else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let mut body = vec![];
+        while i < lines.len() && !lines[i].starts_with("---- ") && lines[i] != "failures:" && !lines[i].starts_with("test result:") {
+            body.push(lines[i]);
+            i += 1;
+        }
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        let (mut path, mut file, mut ln, mut msg) = (String::new(), None, 0, String::new());
+        for (k, l) in body.iter().enumerate() {
+            let Some(p) = l.find("panicked at ") else { continue };
+            let loc = l[p + 12..].trim_end_matches(':');
+            // 古い形: panicked at 'msg', path:line:col
+            let (loc, old_msg) = match loc.rsplit_once("', ") {
+                Some((m, l)) => (l, Some(m.trim_start_matches('\'').to_string())),
+                None => (loc, None),
+            };
+            let mut it = loc.rsplitn(3, ':');
+            let (_col, line, f) = (it.next(), it.next(), it.next());
+            if let (Some(line), Some(f)) = (line.and_then(|x| x.parse::<usize>().ok()), f) {
+                let found = find_file(dir, f, None);
+                path = show(dir, found.as_deref(), f);
+                file = found;
+                ln = line;
+            }
+            msg = old_msg.unwrap_or_else(|| body.get(k + 1).map(|x| x.trim().to_string()).unwrap_or_default());
+            break;
+        }
+        let head = if msg.is_empty() { format!("test failed: {}", name) } else { format!("test failed: {}: {}", name, msg) };
+        diags.push(Diag { error: true, head, path, file, line: ln, rendered: trim_backtrace(&body), suggestions: vec![] });
+    }
+}
+
+/// スタックトレースのうち、標準ライブラリの中 (/rustc/... と __rustc) の段を除く (自分のコードの段だけ残す)
+fn trim_backtrace(body: &[&str]) -> String {
+    let mut out: Vec<&str> = vec![];
+    let mut i = 0;
+    let mut cut = 0;
+    while i < body.len() {
+        let l = body[i];
+        let t = l.trim_start();
+        let frame = t.split_once(": ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !frame {
+            out.push(l);
+            i += 1;
+            continue;
+        }
+        let at = body.get(i + 1).filter(|n| n.trim_start().starts_with("at "));
+        let lib = t.contains("__rustc") || at.is_some_and(|a| a.contains("/rustc/"));
+        if lib {
+            cut += 1;
+        } else {
+            out.push(l);
+            if let Some(a) = at {
+                out.push(a);
+            }
+        }
+        i += if at.is_some() { 2 } else { 1 };
+    }
+    let mut s = out.join("\n");
+    if cut > 0 {
+        s.push_str(&format!("\n({} frames in the standard library left out)", cut));
+    }
+    s
 }
 
 /// cargo の 1 行の JSON (reason: compiler-message)
