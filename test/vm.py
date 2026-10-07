@@ -322,12 +322,12 @@ def main():
                 return
             except OSError:
                 pass
-        # サーバーが答えない (動かしたものが終わらないなど): サーバーと QEMU (のグループ) を止める
+        # サーバーが答えない (動かしたものが終わらないなど): サーバー (と http) と QEMU を、グループごと止める
         try:
             serve_pid, q_pid = map(int, open(DIR + '/pids').read().split())
         except (OSError, ValueError):
             return
-        for kill in (lambda: os.kill(serve_pid, signal.SIGKILL), lambda: os.killpg(q_pid, signal.SIGKILL)):
+        for kill in (lambda: os.killpg(serve_pid, signal.SIGKILL), lambda: os.killpg(q_pid, signal.SIGKILL)):
             try:
                 kill()
             except ProcessLookupError:

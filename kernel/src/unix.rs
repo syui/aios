@@ -36,6 +36,8 @@ pub struct Unix {
     backlog: Option<VecDeque<FileRef>>,
     /// listen したプロセス (pid, uid, gid)。つないだ側の SO_PEERCRED はこれ (Linux と同じ)
     owner: (u32, u32, u32),
+    /// 待ち行列に来た回数 (epoll の EPOLLET。accept で空にしたあとにまた来たのを知らせる)
+    pub generation: u64,
 }
 
 /// いまのプロセスの (pid, uid, gid) (SO_PEERCRED の答え)
@@ -86,7 +88,7 @@ fn key(u: &UnixRef) -> usize {
 }
 
 pub fn new_kind() -> Kind {
-    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0) })))
+    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0), generation: 0 })))
 }
 
 /// poll 用: listen 中で待っている相手がいれば読める
@@ -124,14 +126,20 @@ fn unix_of(f: &FileRef) -> Option<UnixRef> {
 pub fn bind(f: &FileRef, addr: usize, len: usize) -> R {
     let u = unix_of(f).ok_or(-EINVAL)?;
     let name = read_name(addr, len)?;
-    // 砂場: ファイルシステムの名前なら、そのディレクトリに MAKE_SOCK
-    if name.starts_with('/') {
+    // 砂場: ファイルシステムの名前 (抽象名前空間の @ でないもの。read_name は先頭の / なしで返す) なら、
+    // そのディレクトリに MAKE_SOCK
+    let in_fs = !name.starts_with('@');
+    if in_fs {
         crate::landlock::check_parent(name.trim_start_matches('/'), crate::landlock::MAKE_SOCK)?;
     }
     if u.borrow().path.is_some() {
         return Err(-EINVAL);
     }
-    if names().get(&name).is_some_and(|w| w.upgrade().is_some()) {
+    if in_fs {
+        // ファイルシステムの名前: Linux と同じくソケットのファイルを作る (ls や os.path.exists、chmod が見る)。
+        // ファイルがなければ (消された)、前に同じ名前で bind したものがいても、新しいほうがその名前になる
+        crate::sysfile::make_sock(&alloc::format!("/{}", name))?;
+    } else if names().get(&name).is_some_and(|w| w.upgrade().is_some()) {
         return Err(-EADDRINUSE);
     }
     names().insert(name.clone(), Rc::downgrade(&u));
@@ -158,7 +166,9 @@ pub fn connect(f: &FileRef, addr: usize, len: usize) -> R {
         return Err(-EISCONN);
     }
     let name = read_name(addr, len)?;
-    let l = names().get(&name).and_then(|w| w.upgrade()).ok_or(-ENOENT)?;
+    // 名前のファイルはあるが、だれも listen していない (前に動いていたものが残した): ECONNREFUSED
+    let gone = if !name.starts_with('@') && crate::sysfile::is_sock(&alloc::format!("/{}", name)) { -ECONNREFUSED } else { -ENOENT };
+    let l = names().get(&name).and_then(|w| w.upgrade()).ok_or(gone)?;
     let (mine, theirs) = Pipe::pair();
     {
         let mut lb = l.borrow_mut();
@@ -166,6 +176,7 @@ pub fn connect(f: &FileRef, addr: usize, len: usize) -> R {
         set_creds(&mine, lb.owner, me());
         let q = lb.backlog.as_mut().ok_or(-ECONNREFUSED)?;
         q.push_back(file::new(theirs, file::O_RDWR));
+        lb.generation += 1;
     }
     proc::wakeup(key(&l));
     proc::poll_wake(key(&l));

@@ -241,6 +241,7 @@ fn ftype(mode: u32) -> u8 {
         S_IFDIR => 2,
         S_IFCHR => 3,
         S_IFIFO => 5,
+        S_IFSOCK => 6,
         S_IFLNK => 7,
         _ => 0,
     }
@@ -2052,6 +2053,7 @@ impl Inode for ExtInode {
                 2 => S_IFDIR,
                 3 => S_IFCHR,
                 5 => S_IFIFO,
+                6 => S_IFSOCK,
                 7 => S_IFLNK,
                 _ => self.fs.read_inode(e.2).map_or(0, |r| r.mode()),
             };

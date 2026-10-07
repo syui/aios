@@ -397,6 +397,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             Some(Pipe::open_fifo(&p, r, w, flags as u32 & O_NONBLOCK != 0)?)
         }
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
+        vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
             if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
                 ino.truncate(0)?;
@@ -576,6 +577,26 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
     Ok(0)
+}
+
+/// unix ソケットの bind: 名前のファイル (S_IFSOCK) を作る。あれば EADDRINUSE (Linux と同じく、
+/// 前のものが残っていれば、使う側が unlink してから bind する)
+pub fn make_sock(path: &str) -> Result<(), i64> {
+    let (parent, name, _) = vfs::parent_path(&proc::current_cwd(), path)?;
+    if parent.lookup(&name).is_ok() {
+        return Err(-98); // EADDRINUSE
+    }
+    let c = cred::current();
+    parent_writable(&c, &parent)?;
+    let ino = parent.create(&name, 0o777 & !umask(), NewNode::Sock)?;
+    own_new(&c, &parent, &ino)?;
+    inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
+    Ok(())
+}
+
+/// path が unix ソケットのファイルか
+pub fn is_sock(path: &str) -> bool {
+    vfs::resolve(&proc::current_cwd(), path, true).is_ok_and(|i| i.meta().mode & S_IFMT == vfs::S_IFSOCK)
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {

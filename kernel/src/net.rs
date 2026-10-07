@@ -303,9 +303,18 @@ pub fn poll() {
     // 起こすのはソケットが変わったときだけ。readiness からも呼ばれるので、いつも起こすと
     // poll で待つものどうしが起こしあって CPU を使いきる (sshd と sshd-session で固まった)
     if changed {
+        GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         proc::wakeup(chan());
         proc::wakeup(proc::poll_chan());
     }
+}
+
+/// ソケットが変わった回数 (データが来た、送れるようになった、つながった、閉じた)。epoll の EPOLLET は
+/// これが進んだら知らせる (読みきって空になったあとにまた来たのを、ビットだけでは見分けられない)
+static GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    GEN.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn intr() {

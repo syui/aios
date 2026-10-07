@@ -370,7 +370,8 @@ impl Inode for TmpInode {
             NewNode::Dir => Node::Dir(BTreeMap::new()),
             NewNode::Symlink(t) => Node::Symlink(t),
             NewNode::Dev(ma, mi) | NewNode::Blk(ma, mi) => Node::Dev(ma, mi),
-            NewNode::Fifo => Node::Fifo,
+            // 中身のない特別なもの (種類は mode で見分ける)
+            NewNode::Fifo | NewNode::Sock => Node::Fifo,
         };
         let child = TmpInode::new(self.fs, mode, node);
         self.insert(name, child.clone())?;

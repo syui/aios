@@ -19,6 +19,7 @@ pub const EIO: i64 = 5;
 
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFSOCK: u32 = 0o140000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFBLK: u32 = 0o060000;
@@ -56,6 +57,8 @@ pub enum NewNode {
     /// ブロックデバイス (major, minor)
     Blk(u32, u32),
     Fifo,
+    /// unix ソケットの名前 (bind が作る。開けない)
+    Sock,
 }
 
 impl NewNode {
@@ -67,6 +70,7 @@ impl NewNode {
             NewNode::Dev(..) => S_IFCHR,
             NewNode::Blk(..) => S_IFBLK,
             NewNode::Fifo => S_IFIFO,
+            NewNode::Sock => S_IFSOCK,
         }
     }
 }
