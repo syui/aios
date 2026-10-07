@@ -151,11 +151,19 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
     // ほかのパッケージとファイルがぶつかっていないか (pango 1.58 が glib を抱えこんで glib2 とぶつかった)
     let mine_rel: std::collections::HashSet<String> = mine.iter().filter_map(|p| p.strip_prefix(&pkgdir).ok()).map(|p| p.display().to_string()).collect();
     let mut clashes: Vec<String> = Vec::new();
+    let mine_info: &str = &info;
+    // 依存の書き方 (name>=1.0 など) から名前だけ
+    let dep = |d: &str| d.split(['<', '>', '=']).next().unwrap_or("").to_string();
     for k in KINDS {
         for e in fs::read_dir(root.join("repo/aarch64").join(k)).into_iter().flatten().flatten() {
             let f = e.file_name().to_string_lossy().into_owned();
             let Some((other, _)) = crate::repo::parse(&f) else { continue };
             if other == name {
+                continue;
+            }
+            // conflicts と書いてある組 (どちらかに) は、いっしょに入らないので重なってよい (egl-headers と mesa)
+            let theirs = pkginfo(&e.path());
+            if field(&mine_info, "conflict").iter().any(|c| dep(c) == other) || field(&theirs, "conflict").iter().any(|c| dep(c) == name) {
                 continue;
             }
             let list = Command::new("tar").arg("-I").arg("zstd").arg("-tf").arg(e.path()).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();

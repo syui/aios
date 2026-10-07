@@ -3,11 +3,14 @@
 _commit=db3425b8246136faccb5e2782b5694960bd6edf1
 pkgname=egl-headers
 pkgver=0.0.1.r${_commit:0:7}
-pkgrel=1
+pkgrel=2
 pkgdesc='EGL headers from the Khronos EGL-Registry'
 arch=('any')
 url='https://github.com/KhronosGroup/EGL-Registry'
 license=('Apache-2.0' 'MIT')
+# mesa (-Degl=enabled) も同じヘッダーと egl.pc (こちらは -lEGL つき) を入れる。ビルドの材料 (c_deps) に使うもので、
+# mesa の入っているところへは入れない
+conflicts=('mesa')
 source=("git+https://github.com/KhronosGroup/EGL-Registry#commit=$_commit")
 sha256sums=('SKIP')
 

@@ -408,6 +408,14 @@ fn install(path: &str, explicit: bool) {
                 if arch != ARCH && arch != "any" {
                     die(format!("{}: package is for {}, not {}", name, arch, ARCH));
                 }
+                // conflicts: いっしょに入れられないもの (どちらに書いてあっても)。広げはじめる前に止める
+                let dep_n = |d: &String| dep_name(d).to_string();
+                if let Some(c) = list(&info, "CONFLICTS").iter().map(dep_n).find(|c| *c != name && db.contains_key(c)) {
+                    die(format!("{}: conflicts with {} (installed). remove it first, or keep {}", name, c, c));
+                }
+                if let Some((c, _)) = db.iter().find(|(o, (od, _))| **o != name && list(od, "CONFLICTS").iter().any(|x| dep_name(x) == name)) {
+                    die(format!("{}: {} (installed) conflicts with it", name, c));
+                }
                 let old = db.get(&name);
                 let mut owners = BTreeMap::new();
                 for (other, (_, ofiles)) in &db {
