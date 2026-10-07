@@ -59,6 +59,7 @@
   {"name": "pcre2",             "type": "c",       "src": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.bz2",                          "now": "10.49",          "latest": "10.49"},
   {"name": "pixman",            "type": "c",       "src": "https://www.cairographics.org/releases/pixman-0.46.4.tar.gz",                                                      "now": "0.46.4",         "latest": "0.46.4"},
   {"name": "pkgconf",           "type": "c",       "src": "https://distfiles.ariadne.space/pkgconf/pkgconf-3.0.7.tar.xz",                                                     "now": "3.0.7",          "latest": "3.0.7"},
+  {"name": "procps-ng",         "type": "c",       "src": "https://downloads.sourceforge.net/project/procps-ng/Production/procps-ng-4.0.7.tar.xz",                            "now": "4.0.7",          "latest": "4.0.7"},
   {"name": "ripgrep",           "type": "rust",    "src": "git+https://github.com/BurntSushi/ripgrep#tag=15.2.0",                                                             "now": "15.2.0",         "latest": "15.2.0"},
   {"name": "sed",               "type": "rust",    "src": "git+https://github.com/uutils/sed#commit=e6829c3d1673aae6615708ce0b22d9e7e7266d37",                                "now": "0.2.0.20261006", "latest": "commit e6829c3"},
   {"name": "sudo-rs",           "type": "rust",    "src": "git+https://github.com/trifectatechfoundation/sudo-rs#tag=v0.2.15",                                                "now": "0.2.15",         "latest": "0.2.15"},

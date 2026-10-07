@@ -1,0 +1,43 @@
+# procps-ng: ps (ps aux も ps -ef も)、top、pgrep / pkill、pidof、watch など。/proc を読む
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る (libproc2 は静的に)
+#   kill と uptime は coreutils、free と sysctl は base にあるので入れない
+pkgname=procps-ng
+pkgver=4.0.7
+pkgrel=1
+pkgdesc='Utilities for monitoring your system and its processes (static, for aios)'
+arch=('aarch64')
+url='https://gitlab.com/procps-ng/procps'
+license=('GPL-2.0-or-later' 'LGPL-2.0-or-later')
+depends=('ncurses')
+source=("https://downloads.sourceforge.net/project/procps-ng/Production/procps-ng-$pkgver.tar.xz")
+sha256sums=('9d2021f47a4501c667862c9942a92d1953694b21d11bcd1702e83eb594e3d67d')
+
+_bins='pgrep pkill pidof pidwait watch vmstat w pmap pwdx tload'
+
+prepare() {
+  rm -rf "procps-ng-$pkgver"
+  tar -xJf "procps-ng-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps ncurses
+  cd "procps-ng-$pkgver"
+  # クロスでは malloc(0) を試せず rpl_malloc にしてしまう。musl の malloc(0) は NULL でない
+  export ac_cv_func_malloc_0_nonnull=yes ac_cv_func_realloc_0_nonnull=yes
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static \
+    --disable-nls --disable-kill --without-systemd --without-elogind
+  make
+}
+
+package() {
+  cd "procps-ng-$pkgver"
+  local b
+  install -Dm755 src/ps/pscommand "$pkgdir/opt/c/bin/ps"
+  install -Dm755 src/top/top "$pkgdir/opt/c/bin/top"
+  for b in $_bins; do
+    install -Dm755 "src/$b" "$pkgdir/opt/c/bin/$b"
+  done
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
