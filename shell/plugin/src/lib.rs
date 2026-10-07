@@ -71,7 +71,7 @@ pub fn run(spec: Spec, mut f: impl FnMut(&str, &Value) -> Value) {
             let tools: Vec<Value> = spec
                 .tools
                 .iter()
-                .map(|t| json!({ "name": t.name, "description": t.desc, "input": serde_json::from_str::<Value>(t.input).unwrap_or(json!({ "type": "object" })) }))
+                .map(|t| json!({ "name": t.name, "description": t.desc, "input": serde_json::from_str::<Value>(t.input).unwrap_or_else(|e| json!({ "type": "object", "invalid": format!("the input schema is not valid JSON: {}", e) })) }))
                 .collect();
             json!({ "name": spec.name, "version": VERSION, "hooks": spec.hooks, "keys": keys, "tools": tools })
         } else {
