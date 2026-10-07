@@ -1,0 +1,34 @@
+# xz: LZMA の圧縮 (xz、unxz、xzcat、lzma) と liblzma (libarchive が使う)
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。コマンドは静的に
+pkgname=xz
+pkgver=5.8.4
+pkgrel=1
+pkgdesc='Library and command line tools for XZ and LZMA compressed files (static, for aios)'
+arch=('aarch64')
+url='https://tukaani.org/xz/'
+license=('0BSD' 'GPL-2.0-or-later')
+source=("https://github.com/tukaani-project/xz/releases/download/v$pkgver/xz-$pkgver.tar.gz")
+sha256sums=('0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9')
+
+prepare() {
+  rm -rf "xz-$pkgver"
+  tar -xzf "xz-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "xz-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static \
+    --disable-nls --disable-doc --disable-scripts
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "xz-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir$PREFIX/share" "$pkgdir$PREFIX/lib/"*.la
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

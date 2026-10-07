@@ -1,0 +1,36 @@
+# gzip: GNU gzip (gzip、gunzip、zcat、zgrep など)。静的なバイナリ
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
+pkgname=gzip
+pkgver=1.15
+pkgrel=1
+pkgdesc='GNU compression utility (static, for aios)'
+arch=('aarch64')
+url='https://www.gnu.org/software/gzip/'
+license=('GPL-3.0-or-later')
+source=("https://ftp.gnu.org/gnu/gzip/gzip-$pkgver.tar.xz")
+sha256sums=('9aa0cc780dec156b8282844833b342ab7cb08c25d2cd9a1869cdd0df31deff48')
+
+prepare() {
+  rm -rf "gzip-$pkgver"
+  tar -xJf "gzip-$pkgver.tar.xz"
+  # gzip.h のマクロ head が musl の aarch64 の bits/signal.h (struct _aarch64_ctx head) とぶつかるので、
+  # gzip.c では signal.h を gzip.h より先に読む
+  sed -i 's|^#include <config.h>$|#include <config.h>\n#include <signal.h>|' "gzip-$pkgver/gzip.c"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "gzip-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX"
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "gzip-$pkgver"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir$PREFIX/share"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

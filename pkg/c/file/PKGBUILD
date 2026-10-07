@@ -1,0 +1,41 @@
+# file: ファイルの種類を中身から見る (file コマンドと libmagic、magic.mgc)
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。magic.mgc はビルドするマシン用の同じ版の
+#   file で作る (クロスでは aios 用の file を動かせないので、先にこのマシン用を作る)
+pkgname=file
+pkgver=5.48
+pkgrel=1
+pkgdesc='File type identification utility (static, for aios)'
+arch=('aarch64')
+url='https://www.darwinsys.com/file/'
+license=('BSD-2-Clause')
+source=("https://astron.com/pub/file/file-$pkgver.tar.gz")
+sha256sums=('ed14656883b23a364b4057c05595d93252da9bc473d30106519519d0da141283')
+
+prepare() {
+  rm -rf "file-$pkgver" host
+  tar -xzf "file-$pkgver.tar.gz"
+  cp -a "file-$pkgver" host
+}
+
+build() {
+  # このマシン用 (magic.mgc を作るため)
+  (cd host && env -u CC -u CFLAGS -u LDFLAGS ./configure --disable-shared --disable-libseccomp \
+    --disable-zlib --disable-bzlib --disable-xzlib --disable-zstdlib --disable-lzlib && make -C src)
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "file-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --datadir="$PREFIX/share" --disable-shared --enable-static \
+    --disable-libseccomp --disable-zlib --disable-bzlib --disable-xzlib --disable-zstdlib --disable-lzlib
+  make FILE_COMPILE="$srcdir/host/src/file"
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "file-$pkgver"
+  install -Dm755 src/file "$pkgdir$PREFIX/bin/file"
+  install -Dm644 magic/magic.mgc "$pkgdir$PREFIX/share/misc/magic.mgc"
+  install -Dm644 src/magic.h "$pkgdir$PREFIX/include/magic.h"
+  install -Dm644 src/.libs/libmagic.a "$pkgdir$PREFIX/lib/libmagic.a"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
