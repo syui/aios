@@ -12,6 +12,9 @@ arch=('aarch64')
 url='https://www.mesa3d.org/'
 license=('MIT')
 depends=('musl' 'llvm' 'libdrm' 'wayland' 'zlib' 'expat')
+# EGL のヘッダーと egl.pc は egl-headers と同じ (こちらは libEGL もある)
+provides=('egl-headers')
+conflicts=('egl-headers')
 makedepends=('meson' 'ninja' 'flex' 'bison' 'glslang' 'python-mako' 'python-yaml' 'wayland-protocols' 'qemu-user' 'expat')
 # Mesa は aios の libwayland と同じ版 (より新しい) の wayland-scanner を、このマシン用に欲しがる
 _wlver=1.24.0
