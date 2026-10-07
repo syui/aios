@@ -122,6 +122,10 @@ pub struct Shell {
     pub started: std::time::Instant,
     /// pushd の積み重ね (新しいものが後ろ)
     pub dirstack: Vec<String>,
+    /// readonly (declare -r) の変数: 代入と unset はエラー
+    pub readonly: std::collections::HashSet<String>,
+    /// 呼ばれている関数の名前 (新しいものが後ろ。$FUNCNAME はこれを逆にしたもの)
+    pub funcstack: Vec<String>,
 }
 
 const BUILTINS: &[&str] = &[
@@ -199,6 +203,8 @@ impl Shell {
             assoc: HashMap::new(),
             int_vars: Default::default(),
             started: std::time::Instant::now(),
+            readonly: Default::default(),
+            funcstack: vec![],
             dirstack: vec![],
         }
         // zsh と bash の $OSTYPE (.zshrc の case $OSTYPE in linux*) で分けられるように)
@@ -272,6 +278,10 @@ impl Shell {
             Some(k) => (k, true),
             None => (key, false),
         };
+        let base = key.split_once('[').map_or(key, |(n, _)| n);
+        if self.readonly.contains(base) {
+            return Err(format!("{}: readonly variable", base));
+        }
         let Some((name, sub)) = key.split_once('[').map(|(n, r)| (n, &r[..r.len() - 1])) else {
             if add {
                 if let Some(mut a) = self.array(key) {
@@ -349,6 +359,32 @@ impl Shell {
         }
     }
 
+    /// test の -v NAME (変数があるか): シェルを見ないとわからないので、先に -n 1 か -n "" にしておく
+    fn test_v(&mut self, a: &mut [String], dbl: bool) {
+        for i in 0..a.len().saturating_sub(1) {
+            if a[i] != "-v" || (i > 0 && BINARY.contains(&a[i - 1].as_str())) {
+                continue;
+            }
+            let n = if dbl { glob::unmark(&a[i + 1]) } else { a[i + 1].clone() };
+            let set = match n.split_once('[').and_then(|(b, r)| Some((b, r.strip_suffix(']')?))) {
+                Some((b, k)) => match self.assoc.get(b) {
+                    Some(m) => m.iter().any(|(x, _)| x == k),
+                    None => match self.array(b) {
+                        Some(v) => {
+                            let i = self.arith(k).unwrap_or(-1);
+                            let i = if i < 0 { v.len() as i64 + i } else { i - self.array_base() };
+                            (0..v.len() as i64).contains(&i)
+                        }
+                        None => false,
+                    },
+                },
+                None => self.get_var(&n).is_some() || self.arrays.contains_key(&n) || self.assoc.contains_key(&n),
+            };
+            a[i] = "-n".into();
+            a[i + 1] = if set { "1".into() } else { String::new() };
+        }
+    }
+
     fn unset(&mut self, k: &str) {
         // unset 'a[1]' (配列の 1 つ。bash は穴をあけるが、aish はつめる) と unset 'm[k]' (連想配列のキー)
         if let Some((n, r)) = k.split_once('[')
@@ -382,6 +418,10 @@ impl Shell {
     /// ソースを 1 コマンドずつ読んで動かす (sh FILE、sh -c、. 、eval)
     fn run_source(&mut self, src: &str, name: &str) -> i32 {
         let mut p = Parser::new(src);
+        // trap の中の $LINENO は、trap を起こしたところの行のまま (bash と同じ)
+        if name == "trap" {
+            p.no_lines();
+        }
         loop {
             match p.complete_command() {
                 Ok(Some(list)) => {
@@ -421,6 +461,9 @@ impl Shell {
                 break;
             }
             self.text = item.text.clone();
+            if item.line > 0 {
+                self.vars.insert("LINENO".into(), item.line.to_string());
+            }
             if item.bg {
                 let parts = if item.ao.rest.is_empty() && !item.ao.first.neg {
                     item.ao.first.cmds.iter().cloned().map(Part::Ast).collect()
@@ -489,6 +532,9 @@ impl Shell {
             st = (st == 0) as i32;
         }
         self.status = st;
+        if st != 0 && last && !p.neg && self.cond == 0 && self.flow == Flow::None {
+            trap::take_err();
+        }
         if self.errexit && st != 0 && last && !p.neg && self.cond == 0 && self.flow == Flow::None {
             exit_shell(st);
         }
@@ -627,6 +673,10 @@ impl Shell {
             for (k, v) in &r.assigns {
                 if let Err(e) = self.assign(k, v) {
                     eprintln!("{}: {}", shell_name(), e);
+                    // readonly への代入: スクリプトはそこで止まる (bash と POSIX)
+                    if e.ends_with("readonly variable") && !interactive() {
+                        exit_shell(1);
+                    }
                     return 1;
                 }
             }
@@ -856,7 +906,16 @@ impl Shell {
         let saved = std::mem::replace(&mut self.params, ps);
         let saved_loops = std::mem::replace(&mut self.loops, 0);
         self.locals.push(vec![]);
+        self.funcstack.push(args[0].clone());
+        self.set_array("FUNCNAME", self.funcstack.iter().rev().cloned().collect());
         let mut st = self.run_compound(body);
+        self.funcstack.pop();
+        match self.funcstack.is_empty() {
+            true => {
+                self.arrays.remove("FUNCNAME");
+            }
+            false => self.set_array("FUNCNAME", self.funcstack.iter().rev().cloned().collect()),
+        }
         if self.flow == Flow::Return {
             self.flow = Flow::None;
             st = self.status;
@@ -1351,6 +1410,7 @@ impl Shell {
             }
             "unset" => {
                 let mut funcs = false;
+                let mut st = 0;
                 for x in a {
                     match x.as_str() {
                         "-f" => funcs = true,
@@ -1358,10 +1418,14 @@ impl Shell {
                         _ if funcs => {
                             self.funcs.remove(x);
                         }
+                        _ if self.readonly.contains(x.split_once('[').map_or(x.as_str(), |(n, _)| n)) => {
+                            eprintln!("unset: {}: cannot unset: readonly variable", x);
+                            st = 1;
+                        }
                         _ => self.unset(x),
                     }
                 }
-                0
+                st
             }
             "set" => self.set(a),
             "shift" => {
@@ -1426,6 +1490,10 @@ impl Shell {
                         eprintln!("{}: {}: not a valid identifier", name, k);
                         return 1;
                     }
+                    if self.readonly.contains(&k) && (v.is_some() || !(name == "readonly" || flags.contains('r'))) {
+                        eprintln!("{}: {}: readonly variable", name, k);
+                        return 1;
+                    }
                     if !global {
                         let frame = self.locals.len() - 1;
                         if !self.locals[frame].iter().any(|(n, ..)| *n == k) {
@@ -1461,6 +1529,9 @@ impl Shell {
                         self.set_array(&k, vec![]);
                     } else if !global && !flags.contains('A') && !flags.contains('a') {
                         self.set_var(&k, "");
+                    }
+                    if name == "readonly" || flags.contains('r') {
+                        self.readonly.insert(k);
                     }
                 }
                 0
@@ -1653,6 +1724,7 @@ impl Shell {
                     return 2;
                 }
                 a.pop();
+                self.test_v(&mut a, true);
                 REMATCH.with(|m| m.borrow_mut().take());
                 let st = test_with(&a, true);
                 // =~ で合ったもの: BASH_REMATCH (bash) と MATCH / match (zsh)
@@ -1672,6 +1744,7 @@ impl Shell {
                     }
                     a.pop();
                 }
+                self.test_v(&mut a, false);
                 test(&a)
             }
             "exec" => {
@@ -1786,7 +1859,7 @@ impl Shell {
                 let c = cs[pos];
                 pos += 1;
                 let at_end = pos >= cs.len();
-                let mut next = |sh: &mut Shell, ind: &mut usize, pos: &mut usize| {
+                let next = |sh: &mut Shell, ind: &mut usize, pos: &mut usize| {
                     *ind += 1;
                     *pos = 1;
                     sh.set_var("OPTIND", &ind.to_string());
@@ -2580,6 +2653,13 @@ fn bash_like(sh: &mut Shell, base: &str) {
     if matches!(base, "sh" | "bash") {
         sh.opts.insert("ksharrays".into());
     }
+    // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.display().to_string();
+        if sh.get_var("PWD").as_deref() != Some(cwd.as_str()) {
+            sh.export("PWD", Some(cwd));
+        }
+    }
 }
 
 fn main() {
@@ -2608,13 +2688,6 @@ fn main() {
     let mut sh = Shell::new(vec![args[0].clone()]);
     trap::set_shell(&mut sh);
     bash_like(&mut sh, base);
-    // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd = cwd.display().to_string();
-        if sh.get_var("PWD").as_deref() != Some(cwd.as_str()) {
-            sh.export("PWD", Some(cwd));
-        }
-    }
     let mut i = 1;
     while let Some(a) = args.get(i).filter(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "exs".contains(c))) {
         sh.errexit |= a.contains('e');

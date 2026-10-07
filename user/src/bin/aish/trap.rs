@@ -16,6 +16,8 @@ static mut SHELL: *mut super::Shell = std::ptr::null_mut();
 
 const SIGS: &[(&str, i32)] = &[
     ("EXIT", 0),
+    // bash: コマンドが失敗したとき (set -e で止まるのと同じところ)
+    ("ERR", -1),
     ("HUP", 1),
     ("INT", 2),
     ("QUIT", 3),
@@ -62,7 +64,7 @@ fn number(s: &str) -> Option<i32> {
 
 fn name(sig: i32) -> String {
     match SIGS.iter().find(|(_, v)| *v == sig) {
-        Some((n, 0)) => n.to_string(),
+        Some((n, v)) if *v <= 0 => n.to_string(),
         Some((n, _)) => format!("SIG{}", n),
         None => sig.to_string(),
     }
@@ -138,6 +140,25 @@ pub fn take_pending() -> Vec<String> {
         return vec![];
     }
     (1..64).filter(|s| p & (1 << s) != 0).filter_map(|s| traps().get(&s).filter(|c| !c.is_empty()).cloned()).collect()
+}
+
+/// 失敗したコマンドのあと: ERR の trap (なければ None。trap の中の失敗では動かさない)
+pub fn take_err() -> Option<String> {
+    static IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !mine() || IN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let cmd = traps().get(&-1).filter(|c| !c.is_empty()).cloned()?;
+    IN.store(true, Ordering::Relaxed);
+    let sh = unsafe { SHELL };
+    if !sh.is_null() {
+        let sh = unsafe { &mut *sh };
+        let st = sh.status;
+        sh.run_source(&cmd, "trap");
+        sh.status = st;
+    }
+    IN.store(false, Ordering::Relaxed);
+    Some(cmd)
 }
 
 /// シェルが終わるとき: EXIT の trap を 1 回だけ動かす

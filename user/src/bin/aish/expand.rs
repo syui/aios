@@ -412,9 +412,32 @@ impl Shell {
                 put(self, o, &v.to_string());
                 Ok(end + 1)
             }
+            Some('[') => {
+                // $[ 式 ] (古い bash の $(( )))
+                let end = matching(cs, i, '[', ']');
+                let inner: String = cs[i + 1..end.min(cs.len())].iter().collect();
+                let text = self.expand_one(&inner)?;
+                let v = self.arith(&text)?;
+                put(self, o, &v.to_string());
+                Ok(end + 1)
+            }
             Some('(') => {
                 let end = matching(cs, i, '(', ')');
                 let src: String = cs[i + 1..end.min(cs.len())].iter().collect();
+                // $(< FILE): ファイルの中身 (cat を起こさない。bash と同じ)
+                if let Some(f) = src.trim().strip_prefix('<').filter(|f| !f.starts_with(['<', '('])) {
+                    let f = self.expand_one(f.trim())?;
+                    let v = match std::fs::read(&f) {
+                        Ok(b) => String::from_utf8_lossy(&b).trim_end_matches('\n').to_string(),
+                        Err(e) => {
+                            eprintln!("{}: {}: {}", crate::shell_name(), f, crate::err_text(&e));
+                            self.subst_status = Some(1);
+                            String::new()
+                        }
+                    };
+                    put(self, o, &v);
+                    return Ok(end + 1);
+                }
                 let v = self.command_subst(&src);
                 put(self, o, &v);
                 Ok(end + 1)
@@ -447,7 +470,12 @@ impl Shell {
                 // 配列 ($path は $PATH ではなく path の配列): zsh と同じく、要素ごとに別の語 ("" の中ならつなぐ)
                 if name != "path" || self.arrays.contains_key("path") {
                     if let Some(a) = self.arrays.get(&name).cloned() {
-                        self.put_array(o, &a, quoted, false);
+                        // bash (ksharrays): $a は最初の要素だけ
+                        if self.opts.contains("ksharrays") {
+                            put(self, o, a.first().map_or("", |s| s.as_str()));
+                        } else {
+                            self.put_array(o, &a, quoted, false);
+                        }
                         return Ok(j);
                     }
                 } else if let Some(a) = self.array("path") {
@@ -474,6 +502,14 @@ impl Shell {
         }
     }
 
+    /// "$*" や "${a[*]}" をつなぐ字: IFS の最初の字 (IFS がなければ空白、空なら何もなし)
+    fn ifs_sep(&self) -> String {
+        match self.get_var("IFS") {
+            None => " ".into(),
+            Some(v) => v.chars().next().map(String::from).unwrap_or_default(),
+        }
+    }
+
     /// $? $# $1 ${10} など (なければ None)
     pub fn special(&self, name: &str) -> Option<String> {
         Some(match name {
@@ -494,7 +530,9 @@ impl Shell {
                 }
                 f
             }
-            "@" | "*" => self.params.get(1..).unwrap_or(&[]).join(" "),
+            "@" => self.params.get(1..).unwrap_or(&[]).join(" "),
+            // "$*" は IFS の最初の字でつなぐ
+            "*" => self.params.get(1..).unwrap_or(&[]).join(&self.ifs_sep()),
             // 読むたびに変わるもの (bash と zsh)。代入されていればそちら
             "RANDOM" if self.get_var("RANDOM").is_none() => (crate::rand_u32() & 0x7fff).to_string(),
             "SECONDS" if self.get_var("SECONDS").is_none() => self.started.elapsed().as_secs().to_string(),
@@ -508,7 +546,7 @@ impl Shell {
     /// 配列を語に: 1 つずつ別の語 ("" の中の [@] も)。join なら空白でつないで 1 つ ("" の中の [*] と $a)
     fn put_array(&mut self, o: &mut Out, a: &[String], quoted: bool, at: bool) {
         if quoted && !at {
-            return o.quoted(&a.join(" "));
+            return o.quoted(&a.join(&self.ifs_sep()));
         }
         if quoted {
             for (k, x) in a.iter().enumerate() {
@@ -591,6 +629,28 @@ impl Shell {
                 return Ok(());
             }
         }
+        // 配列の要素ごとに: ${a[@]/p/r} ${a[@]^} ${a[@],,} ${a[@]#p} ${a[@]%p} ${a[@]@Q} (bash)
+        if let Some((n, rest)) = s.split_once("[@]").or_else(|| s.split_once("[*]"))
+            && parse::valid_name(n)
+            && rest.starts_with(['/', '^', ',', '#', '%', '@'])
+        {
+            const EL: &str = "_AISH_EL";
+            let a = match self.assoc.get(n) {
+                Some(m) => m.iter().map(|(_, v)| v.clone()).collect(),
+                None => self.array(n).unwrap_or_else(|| self.get_var(n).map(|v| vec![v]).unwrap_or_default()),
+            };
+            let mut r = vec![];
+            for x in a {
+                self.vars.insert(EL.into(), x);
+                let mut t = Out { mode: Mode::Single, ifs: String::new(), fields: vec![], cur: String::new(), has: false };
+                let res = self.param_expr(&format!("{}{}", EL, rest), &mut t, true);
+                self.vars.remove(EL);
+                res?;
+                r.push(t.cur);
+            }
+            self.put_array(o, &r, quoted, s.contains("[@]"));
+            return Ok(());
+        }
         // 配列の一部: ${a[@]:OFF} ${a[@]:OFF:LEN} (bash。番号は 0 から)
         if let Some((n, rest)) = s.split_once("[@]:").or_else(|| s.split_once("[*]:"))
             && parse::valid_name(n)
@@ -628,7 +688,11 @@ impl Shell {
             };
             if parse::valid_name(name) && (sub.is_some() || self.arrays.contains_key(name) || (name == "path" && count)) {
                 let a = self.array(name).unwrap_or_else(|| self.get_var(name).map(|v| vec![v]).unwrap_or_default());
+                let ksh = self.opts.contains("ksharrays");
                 match (count, sub) {
+                    // bash (ksharrays): ${a} は最初の要素、${#a} はその長さ
+                    (true, None) if ksh => put(o, &a.first().map_or(0, |s| s.chars().count()).to_string()),
+                    (false, None) if ksh => put(o, a.first().map_or("", |s| s.as_str())),
                     (true, None | Some("@" | "*")) => put(o, &a.len().to_string()),
                     (false, None) => self.put_array(o, &a, quoted, false),
                     (false, Some("@")) => self.put_array(o, &a, quoted, true),
