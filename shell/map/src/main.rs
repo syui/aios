@@ -1,5 +1,6 @@
 // aish-map: 探さなくていいように (aish の基本のプラグイン)
 //   where    名前から定義の場所 (fn struct enum trait、C の関数と #define、シェルの関数、def class ...)
+//   where body: true  いちばん上の定義の中身もいっしょに (場所を見て read する 2 回が 1 回に)
 //   outline  ファイルの中の定義を行の番号つきで (ファイルをぜんぶ読まなくてよい)
 //   M-.      where を絞りこんで選び、行を「$EDITOR +行 ファイル」にする (エディタの「定義へ」と同じキー)
 // where は rg で定義の形を探す (そのたびにいまのファイルを見るので、索引もキャッシュも持たない)。
@@ -7,7 +8,7 @@
 use aish_plugin::{Spec, Tool, Value, error, json, pick_live, s};
 use std::path::{Path, PathBuf};
 
-const WHERE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"探す名前 (大文字小文字は区別しない。ぴったり、前が同じ、含む、の順)"},"kind":{"type":"string","description":"fn struct enum trait type mod const static macro impl define class def ... のどれかだけ"},"path":{"type":"string","description":"探すところ (既定: いまのディレクトリの git のいちばん上、なければいまのディレクトリ)"},"limit":{"type":"integer","description":"いくつまで (既定 30)"}},"required":["name"]}"#;
+const WHERE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"探す名前 (大文字小文字は区別しない。ぴったり、前が同じ、含む、の順)"},"kind":{"type":"string","description":"fn struct enum trait type mod const static macro impl define class def ... のどれかだけ"},"path":{"type":"string","description":"探すところ (既定: いまのディレクトリの git のいちばん上、なければいまのディレクトリ)"},"limit":{"type":"integer","description":"いくつまで (既定 30)"},"body":{"type":"boolean","description":"いちばん上のものに、定義の中身 (body: 行の番号つき、200 行まで) もつける。read しなくてよい"}},"required":["name"]}"#;
 const OUTLINE: &str = r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#;
 
 /// 言語: ファイルの名前 (拡張子か、名前そのもの) と、定義の形 (種類, 正規表現)。
@@ -80,7 +81,7 @@ fn main() {
         hooks: &[],
         keys: &[("M-.", "where")],
         tools: &[
-            Tool { name: "where", desc: "名前から定義の場所を返す (探さなくていい)。ぴったり → 前が同じ → 含む、同じならよく使うファイルが先。{items: [{name, kind, path, line, text}]}", input: WHERE },
+            Tool { name: "where", desc: "名前から定義の場所を返す (探さなくていい)。ぴったり → 前が同じ → 含む、同じならよく使うファイルが先。{items: [{name, kind, path, line, text, body?}]}。body: true でいちばん上の定義の中身も", input: WHERE },
             Tool { name: "outline", desc: "ファイルの中の定義の一覧 (行の番号、種類、名前、字下げ)。ファイルをぜんぶ読まずに形がわかる。{path, items: [{line, kind, name, indent}]}", input: OUTLINE },
         ],
     };
@@ -97,7 +98,17 @@ fn main() {
                 "where" => {
                     let root = if s(a, "path").is_empty() { git_root(pwd) } else { resolve(pwd, s(a, "path")) };
                     match find(&root, pwd, s(a, "name"), s(a, "kind"), a["limit"].as_u64().unwrap_or(30) as usize, &home) {
-                        Ok(items) => json!({ "items": items }),
+                        Ok(mut items) => {
+                            if a["body"].as_bool() == Some(true)
+                                && let Some(first) = items.first_mut()
+                            {
+                                let path = resolve(pwd, first["path"].as_str().unwrap_or(""));
+                                if let Some(b) = body(&path, first["line"].as_u64().unwrap_or(1) as usize) {
+                                    first["body"] = b.into();
+                                }
+                            }
+                            json!({ "items": items })
+                        }
                         Err(e) => e,
                     }
                 }
@@ -213,6 +224,90 @@ fn find(root: &Path, pwd: &str, name: &str, kind: &str, limit: usize, home: &str
     }
     found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2["path"].as_str().map(str::len).cmp(&b.2["path"].as_str().map(str::len))));
     Ok(found.into_iter().take(limit).map(|x| x.2).collect())
+}
+
+/// 定義の中身: line (1 から) から、かっこが閉じるまで (Python は字下げが戻るまで)。行の番号つき、200 行まで
+fn body(path: &Path, line: usize) -> Option<String> {
+    const MAX: usize = 200;
+    let b = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&b);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = line.checked_sub(1).filter(|&i| i < lines.len())?;
+    let end = if path.extension().is_some_and(|e| e == "py") { py_end(&lines, start) } else { brace_end(&lines, start) };
+    let last = end.min(start + MAX - 1);
+    let mut out: String = (start..=last).map(|i| format!("{:>6}\t{}\n", i + 1, lines[i])).collect();
+    if last < end {
+        out.push_str(&format!("... ({} more lines)\n", end - last));
+    }
+    Some(out)
+}
+
+/// { } が閉じる行 (文字と // のコメントの中はかぞえない)。開く前に ; で終わればそこ
+fn brace_end(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (i, l) in lines.iter().enumerate().skip(start) {
+        let mut q: Option<char> = None;
+        let mut esc = false;
+        let mut prev = ' ';
+        let cs: Vec<char> = l.chars().collect();
+        let mut j = 0;
+        while j < cs.len() {
+            let c = cs[j];
+            j += 1;
+            // '{' や '\'' (文字ひとつ) はとばす。'a のような寿命はそのまま
+            if q.is_none() && c == '\'' {
+                let n = if cs.get(j) == Some(&'\\') { 3 } else { 2 };
+                if cs.get(j + n - 1) == Some(&'\'') {
+                    j += n;
+                    continue;
+                }
+            }
+            if let Some(qc) = q {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == qc {
+                    q = None;
+                }
+            } else if c == '/' && prev == '/' {
+                break;
+            } else if c == '"' {
+                q = Some(c);
+            } else if c == '{' {
+                depth += 1;
+                opened = true;
+            } else if c == '}' {
+                depth -= 1;
+            }
+            prev = c;
+        }
+        if opened && depth <= 0 {
+            return i;
+        }
+        if !opened && l.trim_end().ends_with(';') {
+            return i;
+        }
+    }
+    lines.len() - 1
+}
+
+/// Python: 字下げが def の行と同じか浅い行の前まで
+fn py_end(lines: &[&str], start: usize) -> usize {
+    let ind = |l: &str| l.len() - l.trim_start().len();
+    let base = ind(lines[start]);
+    let mut end = start;
+    for (i, l) in lines.iter().enumerate().skip(start + 1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        if ind(l) <= base {
+            break;
+        }
+        end = i;
+    }
+    end
 }
 
 fn outline(path: &Path) -> Value {
