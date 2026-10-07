@@ -44,6 +44,7 @@
   {"from":"arch:gtk3","name":"gtk3","nvchecker":{"git":"https://gitlab.gnome.org/GNOME/gtk.git","include_regex":"3\\.([1-8]\\d*)?[02468]\\.\\d+","source":"git"},"pkgver":"3.24.52"},
   {"from":"arch:gzip","name":"gzip","nvchecker":{"git":"https://git.savannah.gnu.org/git/gzip.git","prefix":"v","source":"git"},"pkgver":"1.15"},
   {"from":"pkgbuild","git":"https://github.com/harfbuzz/harfbuzz.git","name":"harfbuzz","pkgver":"14.5.1","tag":"^([0-9][0-9A-Za-z.]*)$"},
+  {"from":"arch:iproute2","name":"iproute2","nvchecker":{"git":"https://git.kernel.org/pub/scm/network/iproute2/iproute2.git","prefix":"v","source":"git"},"pkgver":"7.2.0"},
   {"from":"pkgbuild","git":"https://github.com/jqlang/jq.git","name":"jq","pkgver":"1.8.2","tag":"^jq\\-([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","name":"less","nvchecker":{"join":true,"regex":"less-([0-9]+)\\.tar\\.gz","source":"regex","url":"https://www.greenwoodsoftware.com/less/download.html"},"pkgver":"710"},
   {"from":"arch:libarchive","name":"libarchive","nvchecker":{"git":"https://github.com/libarchive/libarchive.git","prefix":"v","source":"git"},"pkgver":"3.8.9"},
