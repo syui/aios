@@ -12,6 +12,7 @@
 //   C-c                 打ちかけの行を捨てる    Enter 決める
 // bindkey で結んだキーは、上のものより先にプラグインの機能を呼ぶ ("C-p C-p" のように 2 つ続けても)。
 // 打っている行に続くもの (suggest のプラグイン) は、グレーで出す。
+// 行の色 (highlight のプラグイン。zsh-syntax-highlighting のように) は、行が変わるたびに聞く。
 // 履歴は $HISTFILE (なければ ~/.aish_history) に、打つたびに足す。$HISTSIZE 行まで (既定 10000)。
 // 前と同じ行は足さない。プロンプトの中の ESC [ ... m (色) と \x01 \x02 で囲んだところは幅に数えない
 use super::plugin::Plugins;
@@ -254,6 +255,9 @@ struct Line {
     row: usize,
     /// 前に描いたときの、最後の行 (プロンプトの頭から。下に出したものはのぞく)
     end_row: usize,
+    /// 色 (highlight のプラグイン): どの行に対するものかと、(始め, 終わり, SGR) の並び (文字の番号)
+    hl_for: String,
+    hl: Vec<(usize, usize, String)>,
 }
 
 impl Line {
@@ -346,6 +350,28 @@ impl Editor {
         r
     }
 
+    /// 描く前に: 行の色を聞きなおし (変わっていれば)、グレーの候補を返す
+    fn decorate(&self, l: &mut Line, ctx: &Ctx, pl: &mut Plugins) -> Option<String> {
+        let text = l.text();
+        if text != l.hl_for {
+            l.hl.clear();
+            if !text.is_empty() && pl.wants("highlight") {
+                let ev = json!({ "line": text, "cmds": ctx.cmds, "path": ctx.path, "pwd": ctx.pwd, "home": ctx.home });
+                if let Some(r) = pl.ask("highlight", ev) {
+                    for sp in r["spans"].as_array().into_iter().flatten() {
+                        let (Some(a), Some(b), Some(c)) = (sp[0].as_u64(), sp[1].as_u64(), sp[2].as_str()) else { continue };
+                        // SGR は数字と ; だけ (端末を壊すものは通さない)
+                        if a < b && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit() || ch == ';') {
+                            l.hl.push((a as usize, b as usize, c.to_string()));
+                        }
+                    }
+                }
+            }
+            l.hl_for = text;
+        }
+        self.suggestion(l, pl)
+    }
+
     /// 打っている行に続くもの (グレーで出す。suggest のプラグイン)
     fn suggestion(&self, l: &Line, pl: &mut Plugins) -> Option<String> {
         if l.buf.is_empty() || l.pos != l.buf.len() || !pl.wants("suggest") {
@@ -400,7 +426,7 @@ impl Editor {
     }
 
     fn edit(&mut self, prompt: &str, ctx: &Ctx, pl: &mut Plugins) -> Input {
-        let mut l = Line { buf: Vec::new(), pos: 0, row: 0, end_row: 0 };
+        let mut l = Line { buf: Vec::new(), pos: 0, row: 0, end_row: 0, hl_for: String::new(), hl: Vec::new() };
         // 履歴を見ている位置 (history.len() は打ちかけの行) と、さかのぼる前の打ちかけ
         let mut hi = self.history.len();
         let mut saved: Vec<char> = Vec::new();
@@ -485,7 +511,7 @@ impl Editor {
                     }
                     search = None;
                     hi = self.history.len();
-                    let sug = self.suggestion(&l, pl);
+                    let sug = self.decorate(&mut l, ctx, pl);
                     self.draw(prompt, &mut l, sug.as_deref(), &[]);
                     continue;
                 }
@@ -558,7 +584,7 @@ impl Editor {
                         Menu::Listed(_, c) => menu_lines(c, None),
                         _ => Vec::new(),
                     };
-                    let sug = self.suggestion(&l, pl);
+                    let sug = self.decorate(&mut l, ctx, pl);
                     self.draw(prompt, &mut l, sug.as_deref(), &below);
                     continue;
                 }
@@ -601,7 +627,7 @@ impl Editor {
                 hi = self.history.len();
             }
             menu = Menu::None;
-            let sug = self.suggestion(&l, pl);
+            let sug = self.decorate(&mut l, ctx, pl);
             self.draw(prompt, &mut l, sug.as_deref(), &[]);
         }
     }
@@ -695,7 +721,7 @@ impl Editor {
         // プロンプトが何行かあれば、最後の行の幅から
         let pn = prompt.matches('\n').count();
         let pw = str_width(prompt.rsplit('\n').next().unwrap_or(prompt));
-        out.push_str(&l.text());
+        out.push_str(&colored(l));
         let mut total = pw + l.buf.iter().map(|&c| char_width(c)).sum::<usize>();
         if let Some(s) = sug {
             out.push_str("\x1b[90m");
@@ -727,6 +753,24 @@ impl Editor {
         l.row = pn + row;
         print_flush(&out);
     }
+}
+
+/// 行を色つきで (色が今の行のものなら)。色のないところはそのまま
+fn colored(l: &Line) -> String {
+    if l.hl.is_empty() || l.hl_for != l.text() {
+        return l.text();
+    }
+    let mut out = String::new();
+    for (i, &c) in l.buf.iter().enumerate() {
+        if let Some((_, _, sgr)) = l.hl.iter().find(|(a, _, _)| *a == i) {
+            out.push_str(&format!("\x1b[{}m", sgr));
+        }
+        out.push(c);
+        if l.hl.iter().any(|(_, b, _)| *b == i + 1) {
+            out.push_str("\x1b[0m");
+        }
+    }
+    out
 }
 
 /// 候補を語と置きかえる: before (置きかえる前の行) の start から語の終わりまでを c.text に

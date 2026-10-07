@@ -7,7 +7,9 @@
 # キー: Tab 補完 / ↑↓ 履歴 / C-r 履歴 / C-f ファイル / C-g rg で探す / C-o よく使うパス / C-j 最近のディレクトリ / C-k cd .. / C-p C-p コピー
 
 # 基本のプラグイン (base に入っている)
-[ -z "$AISH_MCP" ] && plugin aish-complete && plugin aish-suggest
+# 打っている行の色 (zsh-syntax-highlighting): あるコマンドは緑、ないものは赤、あるファイルは下線
+# 3 秒より長くかかったコマンドの時間と、しくじったときの終了コードを、終わったあとに出す (plugin aish-time 秒 で変える)
+[ -z "$AISH_MCP" ] && plugin aish-complete && plugin aish-suggest && plugin aish-highlight && plugin aish-time
 plugin aish-pick
 # 定義の場所 (where / outline、M-.)。rg が要る
 plugin aish-map
