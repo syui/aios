@@ -72,6 +72,8 @@ pub struct Mm {
     pub mmap_next: usize,
     /// /proc/PID/exe
     pub exe: String,
+    /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
+    pub args: (usize, usize, usize),
 }
 
 #[derive(Clone)]
@@ -195,6 +197,8 @@ pub struct Proc {
     slice: u32,
     /// 回収した子 (とその子孫) の utime
     pub cutime: u64,
+    /// 作った tick (/proc/PID/stat の starttime)
+    pub start: u64,
     chan: usize,
     /// 最後に呼んだシステムコールの番号と最初の 2 つの引数 (/proc/threads で見る)
     pub last_sys: (u64, u64, u64),
@@ -249,6 +253,7 @@ impl Proc {
         stop_report: 0,
         cont_report: false,
         utime: 0,
+        start: 0,
         recent: 0,
         yielded: false,
         slice: 0,
@@ -313,7 +318,7 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
-        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe }));
+        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, args: img.args }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -503,6 +508,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
         NEXT_PID += 1;
     }
     p.tgid = p.pid;
+    p.start = crate::timer::ticks();
     p.context.x19_x30[11] = forkret as *const () as u64; // x30 (lr)
     p.context.sp = (p.kstack_top() - size_of::<TrapFrame>()) as u64;
     Some(p)
@@ -568,10 +574,52 @@ fn pick(start: usize) -> Option<usize> {
     best.map(|(_, i)| i)
 }
 
-/// 1 秒ごと (cpu0 の tick) に recent を半分にする
+/// 1 秒ごと (cpu0 の tick) に recent を半分にする。5 秒ごとに load average を進める
 pub fn decay_recent() {
     for p in procs().iter_mut() {
         p.recent /= 2;
+    }
+    static SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SECS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 5 == 4 {
+        calc_load();
+    }
+}
+
+const MAXCPU: usize = 16;
+
+/// CPU ごとの、プロセスが走っていた tick (/proc/stat。残りは休んでいた)
+pub static BUSY: [core::sync::atomic::AtomicU64; MAXCPU] = [const { core::sync::atomic::AtomicU64::new(0) }; MAXCPU];
+
+/// load average (1, 5, 15 分。Linux と同じ 11 ビットの固定小数点、5 秒ごとに指数で平均)
+pub static LOAD: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// いちばん新しく渡した PID
+pub fn last_pid() -> u32 {
+    unsafe { NEXT_PID - 1 }
+}
+
+/// スレッドの数 (/proc/loadavg)
+pub fn nr_threads() -> usize {
+    procs().iter().filter(|p| p.state != State::Unused).count()
+}
+
+/// 走っているか、走れるスレッドの数
+pub fn nr_running() -> usize {
+    procs().iter().filter(|p| matches!(p.state, State::Running | State::Runnable)).count()
+}
+
+fn calc_load() {
+    use core::sync::atomic::Ordering::Relaxed;
+    const FIXED_1: u64 = 1 << 11;
+    const EXP: [u64; 3] = [1884, 2014, 2037];
+    let active = nr_running() as u64 * FIXED_1;
+    for (l, e) in LOAD.iter().zip(EXP) {
+        let old = l.load(Relaxed);
+        let mut new = old * e + active * (FIXED_1 - e);
+        if active >= old {
+            new += FIXED_1 - 1;
+        }
+        l.store(new / FIXED_1, Relaxed);
     }
 }
 
@@ -910,7 +958,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
-        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone() })
+        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), args: m.args })
     };
     let files = if flags & CLONE_FILES != 0 && thread {
         parent.files.clone().unwrap()
@@ -1086,7 +1134,9 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
 /// タイマの割り込みから: いま動いているプロセスに 1 tick つける。
 /// カーネルの中では割り込みを止めているので、動いていたのはユーザーモード
 pub fn account_tick() {
+    let c = crate::smp::id().min(MAXCPU - 1);
     if let Some(i) = cur() {
+        BUSY[c].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let p = &mut procs()[i];
         p.utime += 1;
         p.recent = p.recent.saturating_add(1);

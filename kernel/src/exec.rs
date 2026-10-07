@@ -60,6 +60,8 @@ pub struct Image {
     pub brk: usize,
     /// 動かしているプログラムの絶対パス (/proc/PID/exe。先頭 / なし)
     pub exe: String,
+    /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)。/proc/PID/cmdline と environ はここを読む
+    pub args: (usize, usize, usize),
 }
 
 /// "#!" の後ろの 1 行を (インタプリタ, 引数) に分ける。
@@ -178,6 +180,8 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     for s in argv.iter().chain(envp.iter()) {
         ptrs.push(put_str(&mut pt, s)?);
     }
+    let env_start = base + argv.iter().map(|s| s.len() + 1).sum::<usize>();
+    let args = (base, env_start, env_start + envp.iter().map(|s| s.len() + 1).sum::<usize>());
     let execfn = put_str(&mut pt, path.as_bytes())?;
     // AT_RANDOM の 16 バイトは文字列の下に
     let mut sp = base;
@@ -236,7 +240,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         put(v)?;
     }
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, args })
 }
 
 
