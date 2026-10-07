@@ -25,7 +25,8 @@ build() {
   zig_env
   cd "toybox-$pkgver"
   local c
-  : > mini.config
+  # --help (AI も人も使い方をこれで見る)
+  printf 'CONFIG_TOYBOX_HELP=y\nCONFIG_TOYBOX_HELP_DASHDASH=y\n' > mini.config
   for c in $_cmds; do
     echo "CONFIG_$(echo "$c" | tr a-z A-Z)=y" >> mini.config
   done
