@@ -423,6 +423,13 @@ impl Shell {
             r["timeout"] = json!(true);
             r["hint"] = json!("took too long: run it again with bg: true, and see it with job");
         }
+        // 砂場 (aibox) の中で書けなかった: どこなら書けるかを教える (ファイルの持ち主のせいと分けられるように)
+        if status != 0
+            && r["err"].as_str().is_some_and(|e| e.contains("Permission denied") || e.contains("Operation not permitted") || e.contains("no new privileges"))
+            && let Some(w) = sandboxed()
+        {
+            r["hint"] = json!(format!("aish runs in a sandbox (aibox, landlock): writable only under {}. sudo does not work inside; root actions go through `aios do`", w));
+        }
         self.plugins.tell("precmd", json!({ "status": status }));
         r
     }
@@ -703,6 +710,16 @@ fn render(r: &Value) -> String {
         s.push_str(&Value::Object(meta).to_string());
     }
     s
+}
+
+/// 砂場の中なら、書けるところ (aibox の AIBOX_WRITE。なければ「決まったところ」)
+fn sandboxed() -> Option<String> {
+    let st = std::fs::read_to_string("/proc/self/status").ok()?;
+    let n: u32 = st.lines().find_map(|l| l.strip_prefix("Landlock:"))?.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(std::env::var("AIBOX_WRITE").ok().filter(|w| !w.is_empty()).map(|w| w.replace(':', ", ")).unwrap_or_else(|| "the directories it was given".into()))
 }
 
 /// 入れかわったあとの最初の答えに、そう書く
