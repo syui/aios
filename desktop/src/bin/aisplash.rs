@@ -7,6 +7,8 @@ mod fb;
 mod image;
 #[path = "../lib/input.rs"]
 mod input;
+#[path = "../lib/glyph.rs"]
+mod glyph;
 #[path = "../lib/text.rs"]
 mod text;
 

@@ -2,6 +2,8 @@
 //   疑似端末 (/dev/ptmx) でシェル ($SHELL、なければ /bin/aish) を動かし、
 //   その出力を aifont で窓に描く。キーは evdev の番号から文字にして送る (配列は XKB_DEFAULT_LAYOUT)
 //   aiterm [-e コマンド...]
+#[path = "../lib/glyph.rs"]
+mod glyph;
 #[path = "../lib/keys.rs"]
 mod keys;
 #[path = "../lib/term.rs"]
@@ -63,9 +65,10 @@ struct App {
     waiting_frame: Option<u32>,
     focused: bool,
     // 文字
-    font: fontdue::Font,
+    font: glyph::Font,
     /// aifont にない字のためのフォント
-    font_ja: Option<fontdue::Font>,
+    /// aifont-ja は、aifont にない字がはじめて出たときに読む。None はまだ読んでいない
+    font_ja: Option<Option<glyph::Font>>,
     glyphs: HashMap<(char, bool), Glyph>,
     cell_w: usize,
     cell_h: usize,
@@ -104,11 +107,11 @@ fn main() {
         eprintln!("aiterm: {}: {} (aipkg -S aifont)", FONT, e);
         exit(1)
     });
-    let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).unwrap_or_else(|e| {
+    let font = glyph::Font::from_bytes(data).unwrap_or_else(|e| {
         eprintln!("aiterm: {}: {}", FONT, e);
         exit(1)
     });
-    let lm = font.horizontal_line_metrics(SIZE).expect("line metrics");
+    let lm = font.line_metrics(SIZE);
     let cell_w = font.metrics('M', SIZE).advance_width.ceil() as usize;
     let cell_h = (lm.ascent - lm.descent + lm.line_gap).ceil() as usize;
     let ascent = lm.ascent.ceil() as i32;
@@ -131,7 +134,7 @@ fn main() {
         waiting_frame: None,
         focused: false,
         font,
-        font_ja: std::fs::read(FONT_JA).ok().and_then(|d| fontdue::Font::from_bytes(d, fontdue::FontSettings::default()).ok()),
+        font_ja: None,
         glyphs: HashMap::new(),
         cell_w: cell_w.max(1),
         cell_h: cell_h.max(1),
@@ -591,8 +594,11 @@ impl App {
 
     fn glyph(&mut self, c: char, bold: bool) -> &Glyph {
         // aifont になければ aifont-ja (日本語)
+        if !self.glyphs.contains_key(&(c, bold)) && !self.font.has(c) && self.font_ja.is_none() {
+            self.font_ja = Some(std::fs::read(FONT_JA).ok().and_then(|d| glyph::Font::from_bytes(d).ok()));
+        }
         let font = match &self.font_ja {
-            Some(ja) if self.font.lookup_glyph_index(c) == 0 && ja.lookup_glyph_index(c) != 0 => ja,
+            Some(Some(ja)) if !self.font.has(c) && ja.has(c) => ja,
             _ => &self.font,
         };
         self.glyphs.entry((c, bold)).or_insert_with(|| {

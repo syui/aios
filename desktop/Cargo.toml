@@ -19,8 +19,8 @@ path = "src/bin/aiterm.rs"
 
 [dependencies]
 libc = "0.2"
-# フォント (aifont) を点にする / PNG (アイコン) を読む。どちらも Rust だけのもの
-fontdue = "0.9"
+# フォント (aifont) を点にする (使う字だけそのときに読む) / PNG (アイコン) を読む。どちらも Rust だけのもの
+ab_glyph = "0.2"
 png = "0.18"
 
 [profile.release]

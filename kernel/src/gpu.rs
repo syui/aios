@@ -4,6 +4,7 @@
 // (RESOURCE_CREATE_2D + ATTACH_BACKING)、画面 0 に映す (SET_SCANOUT)。
 // ユーザーは mmap で直に描くか write で書き、描き終わったら FBIOPAN_DISPLAY (か write、msync) で
 // 知らせる。そのときにデバイスへ写して (TRANSFER_TO_HOST_2D) 画面を描きなおす (RESOURCE_FLUSH)。
+// FBIO_DAMAGE (aios だけ) は変わった四角 (x, y, w, h) だけを送る (写しなおさない。aiwm が使う)。
 // 形は XRGB8888 (メモリの並びは B, G, R, X)。要求は virtio-blk と同じく、出して終わるまで待つ
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
@@ -236,6 +237,8 @@ pub fn ioctl(req: u64, arg: usize) -> Result<i64, i64> {
     const FBIOPAN_DISPLAY: u64 = 0x4606;
     const FBIOBLANK: u64 = 0x4611;
     const FBIO_WAITFORVSYNC: u64 = 0x4004_4620;
+    // _IOW('F', 0xa0, u32 x 4): 変わった四角 (x, y, w, h) だけを画面へ
+    const FBIO_DAMAGE: u64 = 0x4010_46a0;
     const ENOTTY: i64 = 25;
     const EFAULT: i64 = 14;
     let g = get().ok_or(-19)?;
@@ -274,6 +277,15 @@ pub fn ioctl(req: u64, arg: usize) -> Result<i64, i64> {
         FBIOPAN_DISPLAY => {
             // 描き終わった: 画面へ
             g.flush_all();
+            Ok(0)
+        }
+        FBIO_DAMAGE => {
+            let mut b = [0u8; 16];
+            crate::proc::current().pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
+            let v = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+            let (x, y) = (v(0).min(g.width), v(1).min(g.height));
+            let (w, h) = (v(2).min(g.width - x), v(3).min(g.height - y));
+            g.flush(x, y, w, h);
             Ok(0)
         }
         FBIOBLANK | FBIO_WAITFORVSYNC => Ok(0),
