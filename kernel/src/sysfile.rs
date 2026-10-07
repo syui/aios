@@ -324,6 +324,10 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
     let follow = flags & O_NOFOLLOW == 0;
+    if follow && let Some(f) = fd_link(&path) {
+        let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     let (full, ino) = match vfs::lookup(&base, &path, follow) {
         Ok(found) => {
             if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
@@ -427,6 +431,16 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
     Ok(n as i64)
 }
 
+/// /dev/stdin や /proc/self/fd/N で、開いているものが名前のないもの (パイプ、ソケット、端末): そのもの。
+/// 開くと stat はそれを分ける (Linux はパイプを開きなおし、端末はログインした人のもの。aios の端末は
+/// root のものなので、開きなおすと書けない)。ほかの場所では探さない (ふつうの open を遅くしない)
+fn fd_link(path: &str) -> Option<file::FileRef> {
+    if !(path.starts_with("/dev/") || path.starts_with("/proc/")) {
+        return None;
+    }
+    crate::procfs::fd_link_file("", path)
+}
+
 pub fn fstat(fd: u64, st: usize) -> R {
     let f = file_of(fd)?;
     let s = f.borrow().stat();
@@ -439,6 +453,10 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         return fstat(dirfd as u64, st);
     }
+    if flags & AT_SYMLINK_NOFOLLOW == 0 && let Some(f) = fd_link(&path) {
+        out(st, &f.borrow().stat().to_bytes())?;
+        return Ok(0);
+    }
     let ino = at(dirfd, pathp, flags)?;
     out(st, &Stat::of_inode(&ino).to_bytes())?;
     Ok(0)
@@ -449,6 +467,10 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, buf: usize) -> R {
     let path = user_str(pathp)?;
     let s = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         file_of(dirfd as u64)?.borrow().stat()
+    } else if flags & AT_SYMLINK_NOFOLLOW == 0
+        && let Some(f) = fd_link(&path)
+    {
+        f.borrow().stat()
     } else {
         Stat::of_inode(&at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?)
     };

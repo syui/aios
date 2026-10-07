@@ -84,6 +84,13 @@ fn setup_dirs(mtab: &str) {
         let _ = dev.create(name, mode, NewNode::Dev(ma, mi));
     }
 
+    // /dev/fd と /dev/stdin /dev/stdout /dev/stderr (Linux と同じく /proc/self/fd へのリンク)
+    for (name, to) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
+        if dev.lookup(name).is_err() {
+            let _ = dev.create(name, 0o777, NewNode::Symlink(to.into()));
+        }
+    }
+
     // ディスクと区画 (/dev/vda, /dev/vda1, ...)
     for p in crate::block::parts() {
         let (ma, mi) = crate::block::dev_of_part(&p);
