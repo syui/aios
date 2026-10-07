@@ -73,6 +73,8 @@ struct BgJob {
     t0: std::time::Instant,
     /// 終わったら (ステータス, かかった ms)。ステータスが -1 なら、ほかで待たれて分からない
     done: Option<(i32, u64)>,
+    /// もう見せた出力のバイト数 (job は新しい分だけ返す)
+    seen: (usize, usize),
 }
 
 static JOBS: std::sync::Mutex<Vec<BgJob>> = std::sync::Mutex::new(Vec::new());
@@ -192,7 +194,7 @@ impl Shell {
             "inputSchema": serde_json::from_str::<Value>(RUN_INPUT).unwrap(),
         }), json!({
             "name": "job",
-            "description": "run bg で動かしたものの様子と出力。{id, pid, done, status, out, err, ms}。id がなければ一覧。終わったものは、見たら消える",
+            "description": "run bg で動かしたものの様子と出力。{id, pid, done, status, out, err, ms}。出力は前に見せたところから先だけ (shown_before はもう見せたバイト数)。id がなければ一覧。終わったものは、見たら消える",
             "inputSchema": serde_json::from_str::<Value>(JOB_INPUT).unwrap(),
         }), json!({
             "name": "out",
@@ -449,7 +451,7 @@ impl Shell {
         let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
         let short: String = cmd.trim().chars().take(200).collect();
         if let Ok(mut js) = JOBS.lock() {
-            js.push(BgJob { id, pid, out: o, err: e, cmd: short, t0: std::time::Instant::now(), done: None });
+            js.push(BgJob { id, pid, out: o, err: e, cmd: short, t0: std::time::Instant::now(), done: None, seen: (0, 0) });
         }
         json!({ "job": id, "pid": pid })
     }
@@ -491,12 +493,28 @@ fn mcp_job(a: &Value) -> Value {
         std::thread::sleep(std::time::Duration::from_millis(50));
         reap(&mut js[i..=i]);
     }
-    let j = &js[i];
+    let j = &mut js[i];
     let mut r = json!({ "id": j.id, "pid": j.pid, "done": j.done.is_some() });
+    // 前に見せたところから先だけ (何度も見ても同じ出力をくりかえさない)
+    let fresh = |all: String, seen: usize| -> String { all.get(seen..).map(String::from).unwrap_or(all) };
+    if j.seen != (0, 0) {
+        r["shown_before"] = json!(j.seen.0 + j.seen.1);
+    }
     match j.done {
         Some((st, ms)) => {
             // 終わったものは見たら消す (長くて切ったものは out で読めるように残す)
-            let (out, err, oid) = finish(j.out, j.err);
+            let seen = j.seen;
+            let (out, err, oid) = if seen == (0, 0) {
+                finish(j.out, j.err)
+            } else {
+                let (o, e) = (fresh(read_all(j.out), seen.0), fresh(read_all(j.err), seen.1));
+                let (o, e, id) = (cut(o, None), cut(e, None), None);
+                unsafe {
+                    libc::close(j.out);
+                    libc::close(j.err);
+                }
+                (o, e, id)
+            };
             r["out"] = json!(out);
             r["err"] = json!(err);
             if let Some(oid) = oid {
@@ -507,8 +525,11 @@ fn mcp_job(a: &Value) -> Value {
             js.remove(i);
         }
         None => {
-            r["out"] = json!(cut(read_all(j.out), None));
-            r["err"] = json!(cut(read_all(j.err), None));
+            let (o, e) = (read_all(j.out), read_all(j.err));
+            let (no, ne) = (o.len(), e.len());
+            r["out"] = json!(cut(fresh(o, j.seen.0), None));
+            r["err"] = json!(cut(fresh(e, j.seen.1), None));
+            j.seen = (no, ne);
             r["ms"] = json!(j.t0.elapsed().as_millis() as u64);
         }
     }
