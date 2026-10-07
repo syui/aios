@@ -435,7 +435,9 @@ fn refine(s: &Snd, h: &mut Hw) -> Result<(), i64> {
     h.narrow(P_CHANNELS, Iv::of(s.channels_min.max(1) as u64, s.channels_max.min(2) as u64));
     h.narrow(P_PERIOD_BYTES, Iv::of(64, MAX_BUFFER as u64 / 2));
     h.narrow(P_BUFFER_BYTES, Iv::of(128, MAX_BUFFER as u64));
-    h.narrow(P_PERIODS, Iv::of(2, 1024));
+    // 周期は 3 つから: 起こされてから書くまでの余裕を 2 周期 (40 ms) にする。2 つだと 1 周期 (20 ms) しかなく、
+    // ビルドなどで CPU がふさがっているとアンダーランする (cpal はバッファを周期の 2 倍に頼むので、3 倍になる)
+    h.narrow(P_PERIODS, Iv::of(3, 1024));
     h.narrow(P_PERIOD_TIME, Iv::of(MIN_PERIOD_US, u32::MAX as u64));
     // 周期の数 (PERIODS) は整数でなくてよい (バッファが周期の整数倍でなくてもよい。Linux と同じ)
     for p in [P_SAMPLE_BITS, P_FRAME_BITS, P_CHANNELS, P_PERIOD_SIZE, P_PERIOD_BYTES, P_BUFFER_SIZE, P_BUFFER_BYTES] {
