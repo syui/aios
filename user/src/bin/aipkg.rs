@@ -411,8 +411,15 @@ fn install(path: &str, explicit: bool) {
                 if arch != ARCH && arch != "any" {
                     die(format!("{}: package is for {}, not {}", name, arch, ARCH));
                 }
-                // conflicts: いっしょに入れられないもの (どちらに書いてあっても)。広げはじめる前に止める
+                // replaces: -U でも、置きかえられる古いパッケージ (入っていれば) を先に外す (-S と同じ)
                 let dep_n = |d: &String| dep_name(d).to_string();
+                let replaced: Vec<String> = list(&info, "REPLACES").iter().map(dep_n).filter(|r| *r != name && db.contains_key(r)).collect();
+                if !replaced.is_empty() {
+                    println!(":: replacing {} with {}", replaced.join(", "), name);
+                    remove_with(&replaced, false);
+                    return install(path, explicit);
+                }
+                // conflicts: いっしょに入れられないもの (どちらに書いてあっても)。広げはじめる前に止める
                 if let Some(c) = list(&info, "CONFLICTS").iter().map(dep_n).find(|c| *c != name && db.contains_key(c)) {
                     die(format!("{}: conflicts with {} (installed). remove it first, or keep {}", name, c, c));
                 }

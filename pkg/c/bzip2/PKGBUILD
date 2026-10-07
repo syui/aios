@@ -1,0 +1,39 @@
+# bzip2: bzip2 の圧縮 (bzip2、bunzip2、bzcat) と libbz2 (libarchive が使う)
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。コマンドは静的に
+pkgname=bzip2
+pkgver=1.0.8
+pkgrel=1
+pkgdesc='A high-quality data compression program (static, for aios)'
+arch=('aarch64')
+url='https://sourceware.org/bzip2/'
+license=('bzip2-1.0.6')
+source=("https://sourceware.org/pub/bzip2/bzip2-$pkgver.tar.gz")
+sha256sums=('ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269')
+_latest_url=https://sourceware.org/pub/bzip2/
+_latest_regex='bzip2-([0-9.]+)\.tar\.gz'
+
+prepare() {
+  rm -rf "bzip2-$pkgver"
+  tar -xzf "bzip2-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "bzip2-$pkgver"
+  make CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS="$CFLAGS -D_FILE_OFFSET_BITS=64" LDFLAGS="$LDFLAGS" libbz2.a bzip2 bzip2recover
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "bzip2-$pkgver"
+  local d="$pkgdir$PREFIX"
+  install -Dm755 bzip2 "$d/bin/bzip2"
+  install -Dm755 bzip2recover "$d/bin/bzip2recover"
+  ln -s bzip2 "$d/bin/bunzip2"
+  ln -s bzip2 "$d/bin/bzcat"
+  install -Dm644 libbz2.a "$d/lib/libbz2.a"
+  install -Dm644 bzlib.h "$d/include/bzlib.h"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

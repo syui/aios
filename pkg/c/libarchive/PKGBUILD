@@ -1,0 +1,52 @@
+# libarchive: bsdtar (tar)、bsdunzip (unzip)、bsdcat、bsdcpio。tar.gz / xz / bz2 / zst / zip / 7z / iso などを
+#   自分で読み書きする (gzip などのコマンドを呼ばない)。静的なバイナリで /opt/c に入る
+#   uutils の tar には -C -J -j --strip-components --exclude がまだないので、tar はこちらに入れかわる
+#   (provides / conflicts / replaces: ap -Syu で uutils の tar と入れかわる。tar と unzip は bsdtar と bsdunzip へのリンク)
+pkgname=libarchive
+pkgver=3.8.9
+pkgrel=1
+pkgdesc='Multi-format archive and compression library, with bsdtar as tar (static, for aios)'
+arch=('aarch64')
+url='https://libarchive.org/'
+license=('BSD-2-Clause')
+provides=('tar')
+conflicts=('tar')
+replaces=('tar')
+source=("https://www.libarchive.org/downloads/libarchive-$pkgver.tar.xz")
+sha256sums=('888c934f9d95648ecb9163dc8e23ab80a476ecb81a8f1154704a227b5b676dde')
+
+prepare() {
+  rm -rf "libarchive-$pkgver"
+  tar -xJf "libarchive-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib xz bzip2 zstd
+  cd "libarchive-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static \
+    --enable-bsdtar=static --enable-bsdcpio=static --enable-bsdcat=static --enable-bsdunzip=static \
+    --with-zlib --with-lzma --with-bz2lib --with-zstd \
+    --without-openssl --without-xml2 --without-expat --without-lz4 --without-lzo2 --without-nettle \
+    --without-mbedtls --without-libb2 --disable-acl --disable-xattr
+  # libtool は -static を共有ライブラリを使わないことと読むだけなので、-all-static で musl も中に入れる
+  make LDFLAGS="$LDFLAGS -all-static"
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "libarchive-$pkgver"
+  local d="$pkgdir$PREFIX"
+  local b
+  for b in bsdtar bsdcpio bsdcat bsdunzip; do
+    install -Dm755 "$b" "$d/bin/$b"
+  done
+  ln -s bsdtar "$d/bin/tar"
+  ln -s bsdunzip "$d/bin/unzip"
+  install -Dm644 .libs/libarchive.a "$d/lib/libarchive.a"
+  install -Dm644 libarchive/archive.h "$d/include/archive.h"
+  install -Dm644 libarchive/archive_entry.h "$d/include/archive_entry.h"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
