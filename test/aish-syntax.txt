@@ -41,3 +41,4 @@ while read l; do echo "g$l"; done < <(seq 2)	g1|g2
 diff <(echo a) <(echo a) && echo same	same
 f() { cat "$1"; }; f <(echo infunc)	infunc
 echo "<(no)" '>(no)'	<(no) >(no)
+exec 3< <(echo q); cat <&3	q

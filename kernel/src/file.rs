@@ -377,7 +377,9 @@ impl OpenFile {
                 let (ma, mi) = crate::block::dev_of_part(p);
                 Stat::dev(vfs::S_IFBLK | 0o660, ((ma as u64) << 8) | mi as u64)
             }
-            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => Stat::dev(S_IFIFO | 0o600, 0),
+            // ino はパイプごとにちがう番号 (/proc/PID/fd の pipe:[N] と同じ)。diff <(a) <(b) などは
+            // dev と ino が同じなら同じファイルとみなす
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, ..Stat::dev(S_IFIFO | 0o600, 0) },
             Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
             Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => Stat::dev(0o600, 0),
