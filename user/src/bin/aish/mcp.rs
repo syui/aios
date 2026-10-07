@@ -84,7 +84,7 @@ static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static STARTED: std::sync::OnceLock<(std::time::Instant, String, Option<FileId>)> = std::sync::OnceLock::new();
 
 const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも同じシェルで動くので、cd や変数は次の run に残ります。\
-答えは JSON: run は {status, out, err, ms, pwd} (時間切れなら timeout: true)。\
+答えは JSON: run は {status, out, err, ms, pwd} (時間切れなら timeout: true。pwd は変わったとき、ms は 1 秒からだけ)。\
 重いもの (ビルドなど) は run の bg: true でうしろで動かし、job で様子と出力を見ると、そのあいだもほかのツールが使えます。\
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。\
 出力が長いと頭と終わりだけになり、まん中は答えの out_id を out に渡して探したり読んだりできます。\
@@ -242,7 +242,7 @@ impl Shell {
         let name = params["name"].as_str().unwrap_or("");
         let args = if params["arguments"].is_object() { params["arguments"].clone() } else { json!({}) };
         let r = if name == "run" {
-            if args["bg"].as_bool().unwrap_or(false) { self.mcp_bg(&args) } else { self.mcp_run(&args) }
+            if args["bg"].as_bool().unwrap_or(false) { self.mcp_bg(&args) } else { quiet(self.mcp_run(&args)) }
         } else if name == "job" {
             mcp_job(&args)
         } else if name == "out" {
@@ -757,6 +757,26 @@ pub fn render(r: &Value) -> String {
         s.push_str(&Value::Object(meta).to_string());
     }
     s
+}
+
+/// run の答えを短く (読む形のときだけ。--json はそのまま): pwd は前の答えから変わったときだけ、ms は 1 秒からだけ
+fn quiet(mut r: Value) -> Value {
+    static LAST_PWD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    if JSON.load(Ordering::Relaxed) {
+        return r;
+    }
+    let Some(o) = r.as_object_mut() else { return r };
+    if let (Some(p), Ok(mut last)) = (o.get("pwd").and_then(|p| p.as_str()).map(String::from), LAST_PWD.lock()) {
+        if *last == p {
+            o.remove("pwd");
+        } else {
+            *last = p;
+        }
+    }
+    if o.get("ms").and_then(|m| m.as_u64()).is_some_and(|m| m < 1000) {
+        o.remove("ms");
+    }
+    r
 }
 
 /// シェルの tool のため: 読む形の本文と、残り (JSON の 1 行。標準エラーへ) を分けて
