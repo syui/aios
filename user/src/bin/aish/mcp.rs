@@ -96,7 +96,15 @@ impl Shell {
         let _ = STARTED.set((std::time::Instant::now(), exe.clone(), FileId::of(&exe)));
         // aish --mcp [--json] [RC...]
         JSON.store(args.iter().any(|a| a == "--json"), Ordering::Relaxed);
-        let rcs: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
+        // RC は起きたときのディレクトリから見た絶対パスに (run で cd したあとに入れかわっても読めるように)
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let rcs: Vec<String> = args.iter().filter(|a| *a != "--json").map(|a| if a.starts_with('/') { a.clone() } else { cwd.join(a).display().to_string() }).collect();
+        let mut again: Vec<String> = vec![std::env::args().next().unwrap_or_else(|| "aish".into()), "--mcp".into()];
+        if JSON.load(Ordering::Relaxed) {
+            again.push("--json".into());
+        }
+        again.extend(rcs.iter().cloned());
+        let _ = ARGS.set(again);
         unsafe { std::env::set_var("AISH_MCP", "1") };
         // プロトコルは自分だけが使う fd で話す。0 は /dev/null、1 は 2 (標準エラー) にして、
         // 設定や子が標準入力を食べたり、標準出力に書いてプロトコルをこわしたりしないように
@@ -129,6 +137,13 @@ impl Shell {
         }
         if resumed {
             RELOADED.store(true, Ordering::Relaxed);
+            // 前より少ないプラグインしか起きなければ、答えに書く (設定が読めなかったなど)
+            let before: usize = std::env::var("AISH_MCP_NPLUG").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let now = self.plugins.check().len();
+            if now < before {
+                RELOAD_WARN.lock().map(|mut w| *w = format!("; only {} of {} plugins started again (check)", now, before)).ok();
+            }
+            unsafe { std::env::remove_var("AISH_MCP_NPLUG") };
             send(&mut out, &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }));
         }
         let mut reader = std::io::BufReader::new(inp);
@@ -163,7 +178,9 @@ impl Shell {
                     rest.push('\n');
                 }
                 rest.push_str(&String::from_utf8_lossy(reader.buffer()));
+                unsafe { std::env::set_var("AISH_MCP_NPLUG", self.plugins.check().len().to_string()) };
                 reload(&rest, &mut reader, &out);
+                unsafe { std::env::remove_var("AISH_MCP_NPLUG") };
             }
             let reply = match req["method"].as_str().unwrap_or("") {
                 "initialize" => Ok(json!({
@@ -249,7 +266,8 @@ impl Shell {
         if RELOADED.swap(false, Ordering::Relaxed)
             && let Some(o) = r.as_object_mut()
         {
-            o.insert("reloaded".into(), json!("aish restarted with the new build (shell variables were reset; the directory is kept)"));
+            let warn = RELOAD_WARN.lock().map(|w| w.clone()).unwrap_or_default();
+            o.insert("reloaded".into(), json!(format!("aish restarted with the new build (shell variables were reset; the directory is kept){}", warn)));
         }
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
         // ふだんは読む形の text だけ (Claude Code は structuredContent があるとそちらを Claude に見せるので)。
@@ -722,6 +740,11 @@ fn sandboxed() -> Option<String> {
     Some(std::env::var("AIBOX_WRITE").ok().filter(|w| !w.is_empty()).map(|w| w.replace(':', ", ")).unwrap_or_else(|| "the directories it was given".into()))
 }
 
+static RELOAD_WARN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// 入れかわるときの引数 (RC は絶対パスにしたもの)
+static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// 入れかわったあとの最初の答えに、そう書く
 static RELOADED: AtomicBool = AtomicBool::new(false);
 
@@ -730,7 +753,7 @@ static RELOADED: AtomicBool = AtomicBool::new(false);
 fn reload(pending: &str, reader: &mut std::io::BufReader<std::fs::File>, out: &std::fs::File) {
     use std::os::fd::AsRawFd;
     let exe = STARTED.get().map(|s| s.1.clone()).unwrap_or_default();
-    let args: Vec<CString> = std::env::args().map(|a| cstr(&a)).collect();
+    let args: Vec<CString> = ARGS.get().cloned().unwrap_or_else(|| std::env::args().collect()).iter().map(|a| cstr(a)).collect();
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
     unsafe {
