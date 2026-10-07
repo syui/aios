@@ -96,6 +96,8 @@ pub struct Shell {
     sourcing: u32,
     /// $( ) の終了ステータス (代入だけのコマンドの $? に)
     subst_status: Option<i32>,
+    /// <(...) >(...) の (親が持つ口, 子の pid)。その行が終わったら閉じて待つ
+    procsubs: Vec<(i32, i32)>,
     /// ジョブの表示に使う、いま動かしているもののソース
     text: String,
     /// alias NAME=VALUE
@@ -171,6 +173,7 @@ impl Shell {
             locals: vec![],
             sourcing: 0,
             subst_status: None,
+            procsubs: Vec::new(),
             text: String::new(),
             aliases: HashMap::new(),
             expanding: vec![],
@@ -322,6 +325,20 @@ impl Shell {
 
     /// last: && || の最後 (set -e で見る)
     fn run_pipeline(&mut self, p: &Pipeline, last: bool) -> i32 {
+        let subs = self.procsubs.len();
+        let st = self.run_pipeline1(p, last);
+        // この行で作った <(...) >(...): 口を閉じて (読む子は SIGPIPE、書く子は EOF で終わる)、待つ
+        for (fd, pid) in self.procsubs.split_off(subs) {
+            unsafe {
+                libc::close(fd);
+                let mut w = 0;
+                while libc::waitpid(pid, &mut w, 0) < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {}
+            }
+        }
+        st
+    }
+
+    fn run_pipeline1(&mut self, p: &Pipeline, last: bool) -> i32 {
         if !last || p.neg {
             self.cond += 1;
         }
@@ -709,6 +726,7 @@ impl Shell {
                     let b = body.borrow().clone();
                     RT::Here(if *expand { self.expand_heredoc(&b)? } else { b })
                 }
+                RKind::HereStr(w) => RT::Here(self.expand_one(w)? + "\n"),
             };
             out.push((r.fd, t));
         }
@@ -924,6 +942,50 @@ impl Shell {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
         }
+    }
+
+    /// <(...) (write なら >(...)): 子で動かし、その出力 (入力) とつないだパイプの口の名前 /dev/fd/N
+    pub fn proc_subst(&mut self, src: &str, write: bool) -> String {
+        let list = match Parser::new(src).program() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{}: <(...): {}", shell_name(), match e {
+                    Error::Incomplete => "syntax error: unexpected end of file".into(),
+                    Error::Syntax(s) => s,
+                });
+                return String::new();
+            }
+        };
+        let mut fds = [-1, -1];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return String::new();
+        }
+        // 親が持つ口と、子が使う口
+        let (mine, theirs, to) = if write { (fds[1], fds[0], 0) } else { (fds[0], fds[1], 1) };
+        flush();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::close(mine);
+                libc::dup2(theirs, to);
+                libc::close(theirs);
+                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                jobs::INTERACTIVE = false;
+            }
+            jobs().clear();
+            let st = self.run_list(&list);
+            exit_shell(st);
+        }
+        unsafe { libc::close(theirs) };
+        if pid < 0 {
+            unsafe { libc::close(mine) };
+            return String::new();
+        }
+        self.procsubs.push((mine, pid));
+        format!("/dev/fd/{}", mine)
     }
 
     /// $( ): 子で動かして、出力の最後の改行を除いたもの

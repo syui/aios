@@ -25,6 +25,8 @@ pub enum RKind {
     Dup(Word),
     /// <<EOF の中身 (読み終わるまでは空)。bool は展開するか
     Here(Rc<RefCell<String>>, bool),
+    /// <<< 語 (bash と zsh の here-string): 語を展開して、終わりに改行をつけたもの
+    HereStr(Word),
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +85,7 @@ enum Tok {
     Word(String),
     /// && || ;; ; & | ( ) と改行 ("\n")
     Op(&'static str),
-    /// fd とつけかえの記号 (< > >> <& >& << <<- <> >|)
+    /// fd とつけかえの記号 (< > >> <& >& << <<- <<< <> >|)
     Redir(i32, &'static str),
     Eof,
 }
@@ -158,9 +160,16 @@ impl Parser {
             None
         };
         let c = self.at(0).unwrap();
+        // <(...) >(...) は語 (コマンドの出力や入力をファイルの名前に)
+        if (c == '<' || c == '>') && self.at(1) == Some('(') && fd.is_none() {
+            let w = self.scan_word()?;
+            return Ok((Tok::Word(w), start));
+        }
         if c == '<' || c == '>' {
             let two: String = [Some(c), self.at(1), self.at(2)].iter().flatten().collect();
-            let op: &'static str = if two.starts_with("<<-") {
+            let op: &'static str = if two.starts_with("<<<") {
+                "<<<"
+            } else if two.starts_with("<<-") {
                 "<<-"
             } else {
                 ["<<", "<&", "<>", ">>", ">&", ">|"].into_iter().find(|o| two.starts_with(o)).unwrap_or(if c == '<' { "<" } else { ">" })
@@ -183,6 +192,10 @@ impl Parser {
     fn scan_word(&mut self) -> Result<String, Error> {
         let mut w = String::new();
         while let Some(c) = self.at(0) {
+            if (c == '<' || c == '>') && self.at(1) == Some('(') && w.is_empty() {
+                self.scan_dollar(&mut w)?;
+                continue;
+            }
             if is_meta(c) {
                 // zsh のワイルドカードの修飾 *.zsh(N) は、語のつづき
                 if c == '(' && !w.is_empty() && !w.ends_with('=') {
@@ -623,6 +636,7 @@ impl Parser {
             ">>" => RKind::File(target, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND),
             "<>" => RKind::File(target, libc::O_RDWR | libc::O_CREAT),
             "<&" | ">&" => RKind::Dup(target),
+            "<<<" => RKind::HereStr(target),
             _ => {
                 // heredoc: 区切りがクォートされていれば中は展開しない
                 let quoted = target.contains(['\'', '"', '\\']);

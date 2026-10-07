@@ -328,6 +328,14 @@ impl Shell {
                 }
                 '$' => i = self.dollar(&cs, i, &mut o, false)?,
                 '`' => i = self.backquote(&cs, i, &mut o, false),
+                // <(...) >(...): コマンドとパイプでつないで、その口の名前 (/dev/fd/N)
+                '<' | '>' if cs.get(i) == Some(&'(') => {
+                    let end = matching(&cs, i, '(', ')');
+                    let src: String = cs[i + 1..end.min(cs.len())].iter().collect();
+                    let v = self.proc_subst(&src, c == '>');
+                    o.quoted(&v);
+                    i = end + 1;
+                }
                 c => o.lit(c, false),
             }
         }
@@ -730,7 +738,7 @@ fn arith_lex(s: &str) -> Result<Vec<AT>, String> {
             v.push(AT::Name(cs[st..i].iter().collect()));
         } else {
             let three: String = cs[i..(i + 3).min(cs.len())].iter().collect();
-            let op = ["<<=", ">>=", "<=", ">=", "==", "!=", "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--"]
+            let op = ["**", "<<=", ">>=", "<=", ">=", "==", "!=", "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--"]
                 .into_iter()
                 .find(|o| three.starts_with(o))
                 .map(|o| o.to_string())
@@ -814,13 +822,15 @@ impl Arith {
                 "<<" | ">>" => 8,
                 "+" | "-" => 9,
                 "*" | "/" | "%" => 10,
+                "**" => 11,
                 _ => break,
             };
             if p < min {
                 break;
             }
             self.i += 1;
-            let r = self.binary(sh, p + 1)?;
+            // ** は右から (2**3**2 は 2**9)
+            let r = self.binary(sh, if p == 11 { p } else { p + 1 })?;
             l = binop(&op, l, r)?;
         }
         Ok(l)
@@ -882,6 +892,8 @@ fn binop(op: &str, l: i64, r: i64) -> Result<i64, String> {
         "+" => l.wrapping_add(r),
         "-" => l.wrapping_sub(r),
         "*" => l.wrapping_mul(r),
+        "**" if r < 0 => return Err("exponent less than 0".into()),
+        "**" => l.wrapping_pow(r.min(u32::MAX as i64) as u32),
         "/" | "%" if r == 0 => return Err("division by 0".into()),
         "/" => l.wrapping_div(r),
         "%" => l.wrapping_rem(r),
