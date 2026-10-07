@@ -96,7 +96,13 @@ pub struct Parser {
     peeked: Option<(Tok, usize)>,
     /// 改行で読む heredoc: (区切り, タブを消すか, 入れ物)
     heredocs: Vec<(String, bool, Rc<RefCell<String>>)>,
+    /// { の中にいる深さ (zsh と同じく、{ echo a } の } を ; なしでも閉じとして読むため)
+    braces: usize,
 }
+
+/// 配列の代入 a=(x y) の値の印: ARRAY のあとに、要素の語 (展開する前) を SEP でつないだもの
+pub const ARRAY: char = '\u{f0010}';
+pub const SEP: char = '\u{f0011}';
 
 fn is_meta(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')')
@@ -109,7 +115,7 @@ fn is_name(s: &str) -> bool {
 
 impl Parser {
     pub fn new(src: &str) -> Parser {
-        Parser { src: src.chars().collect(), pos: 0, peeked: None, heredocs: vec![] }
+        Parser { src: src.chars().collect(), pos: 0, peeked: None, heredocs: vec![], braces: 0 }
     }
 
     // ---- 字句 ----
@@ -178,6 +184,18 @@ impl Parser {
         let mut w = String::new();
         while let Some(c) = self.at(0) {
             if is_meta(c) {
+                // zsh のワイルドカードの修飾 *.zsh(N) は、語のつづき
+                if c == '(' && !w.is_empty() && !w.ends_with('=') {
+                    let mut k = 1;
+                    while self.at(k).is_some_and(|x| matches!(x, 'N' | '.' | '/' | '@')) {
+                        k += 1;
+                    }
+                    if k > 1 && self.at(k) == Some(')') && self.at(k + 1).is_none_or(is_meta) {
+                        w.extend(&self.src[self.pos..=self.pos + k]);
+                        self.pos += k + 1;
+                        continue;
+                    }
+                }
                 break;
             }
             match c {
@@ -476,11 +494,15 @@ impl Parser {
             Tok::Word(w) => match w.as_str() {
                 "{" => {
                     self.take()?;
-                    let l = self.list(&["}"], false)?;
+                    self.braces += 1;
+                    let l = self.list(&["}"], false);
+                    self.braces -= 1;
+                    let l = l?;
                     self.expect_word("}")?;
                     Some(Compound::Brace(l))
                 }
                 "if" => Some(self.if_clause()?),
+                "[[" => return self.cond(),
                 "while" | "until" => {
                     self.take()?;
                     let cond = self.list(&["do"], false)?;
@@ -514,6 +536,62 @@ impl Parser {
             return Ok(Cmd::Compound(Rc::new(c), redirs));
         }
         self.simple()
+    }
+
+    /// [[ ... ]] (bash と zsh): ]] までの語をそのまま。&& || ( ) < > も語にする (コマンドを区切らない)。
+    /// =~ の右は空白まで ( ) | もふくめて 1 語。動かすのは組み込みの [[ (main.rs)
+    fn cond(&mut self) -> Result<Cmd, Error> {
+        self.take()?; // [[
+        let mut words = vec!["[[".to_string()];
+        loop {
+            while matches!(self.at(0), Some(' ' | '\t' | '\n')) || (self.at(0) == Some('\\') && self.at(1) == Some('\n')) {
+                self.pos += if self.at(0) == Some('\\') { 2 } else { 1 };
+            }
+            let Some(c) = self.at(0) else { return Err(Error::Incomplete) };
+            if c == ']' && self.at(1) == Some(']') && self.at(2).is_none_or(is_meta) {
+                self.pos += 2;
+                words.push("]]".into());
+                break;
+            }
+            if words.last().is_some_and(|w| w == "=~") {
+                // 正規表現: クォートの外の空白まで
+                let mut w = String::new();
+                while let Some(c) = self.at(0) {
+                    if matches!(c, ' ' | '\t' | '\n') {
+                        break;
+                    }
+                    match c {
+                        '\'' | '"' => {
+                            let end = self.find(c, self.pos + 1)?;
+                            w.extend(&self.src[self.pos..=end]);
+                            self.pos = end + 1;
+                        }
+                        '\\' => {
+                            w.extend(self.src[self.pos..(self.pos + 2).min(self.src.len())].iter());
+                            self.pos += 2;
+                        }
+                        _ => {
+                            w.push(c);
+                            self.pos += 1;
+                        }
+                    }
+                }
+                words.push(w);
+                continue;
+            }
+            if let Some(op) = ["&&", "||", "(", ")", "<", ">"].into_iter().find(|o| self.src[self.pos..].iter().take(o.len()).copied().eq(o.chars())) {
+                self.pos += op.len();
+                words.push(op.into());
+                continue;
+            }
+            let w = self.scan_word()?;
+            if w.is_empty() {
+                return Err(Error::Syntax(format!("syntax error near {} in [[", c)));
+            }
+            words.push(w);
+        }
+        let redirs = self.redirs()?;
+        Ok(Cmd::Simple { assigns: vec![], words, redirs })
     }
 
     fn func_body(&mut self, name: String) -> Result<Cmd, Error> {
@@ -566,6 +644,35 @@ impl Parser {
                 Tok::Redir(..) => redirs.push(self.redir()?),
                 Tok::Word(w) => {
                     let w = w.clone();
+                    // 配列: a=(x y z) と a+=(w) (bash と zsh)。キーの + は足すこと
+                    if words.is_empty()
+                        && let Some(k) = w.strip_suffix('=')
+                        && is_name(k.strip_suffix('+').unwrap_or(k))
+                    {
+                        self.take()?;
+                        if self.is_op("(")? {
+                            self.take()?;
+                            let mut items = vec![];
+                            loop {
+                                match self.take()?.0 {
+                                    Tok::Op(")") => break,
+                                    Tok::Op("\n") => {}
+                                    Tok::Word(x) => items.push(x),
+                                    Tok::Eof => return Err(Error::Incomplete),
+                                    t => return Err(Error::Syntax(format!("syntax error near {} in an array", show(&t)))),
+                                }
+                            }
+                            let v: String = std::iter::once(ARRAY).chain(items.join(&SEP.to_string()).chars()).collect();
+                            assigns.push((k.to_string(), v));
+                            continue;
+                        }
+                        if is_name(k) {
+                            assigns.push((k.to_string(), String::new()));
+                            continue;
+                        }
+                        words.push(w);
+                        continue;
+                    }
                     if words.is_empty()
                         && let Some((k, _)) = w.split_once('=')
                         && is_name(k)
@@ -573,6 +680,10 @@ impl Parser {
                         self.take()?;
                         assigns.push((k.to_string(), w[k.len() + 1..].to_string()));
                         continue;
+                    }
+                    // zsh: { echo a } の } (語の始めから。; や改行なしで) は、{ の中なら閉じ
+                    if w == "}" && self.braces > 0 && !words.is_empty() {
+                        break;
                     }
                     self.take()?;
                     // NAME ( ) { ... } は関数
