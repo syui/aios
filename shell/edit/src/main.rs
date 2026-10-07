@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}},"required":["path"]}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない"}},"required":["path"]}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
-const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
-const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
+const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
+const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
 const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
 const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
 
 const HIT: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"grep の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"}},"required":["n"]}"#;
-const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean"},"i":{"type":"boolean"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}}}"#;
+const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean"},"i":{"type":"boolean"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}}}"#;
 
 /// 取り消すための写しの数
 const KEEP: usize = 100;
@@ -110,6 +110,8 @@ fn matcher(a: &Value) -> Result<regex::Regex, Value> {
         return Err(error("pattern is empty"));
     }
     let pat = if a["regex"].as_bool().unwrap_or(false) { pat.to_string() } else { regex::escape(pat) };
+    // word: 単語ぴったり (rg の -w。tool で tools や tool_once を拾わない)
+    let pat = if a["word"].as_bool().unwrap_or(false) { format!(r"\b(?:{})\b", pat) } else { pat };
     regex::RegexBuilder::new(&pat).case_insensitive(a["i"].as_bool().unwrap_or(false)).build().map_err(error)
 }
 
@@ -142,7 +144,7 @@ fn subs(a: &Value) -> Result<Subs, Value> {
     let mut out = Vec::new();
     for (k, x) in list.iter().enumerate() {
         let mut x = x.clone();
-        for f in ["regex", "i"] {
+        for f in ["regex", "i", "word"] {
             if x.get(f).is_none() {
                 x[f] = a[f].clone();
             }
@@ -271,6 +273,9 @@ fn grep_rg(pwd: &str, a: &Value, limit: usize) -> Option<Value> {
     }
     if a["i"].as_bool().unwrap_or(false) {
         args.push("-i".into());
+    }
+    if a["word"].as_bool().unwrap_or(false) {
+        args.push("-w".into());
     }
     if a["hidden"].as_bool().unwrap_or(false) {
         args.push("--hidden".into());

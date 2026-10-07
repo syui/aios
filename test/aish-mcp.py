@@ -84,6 +84,11 @@ check('edit shows lines', '2\tTWO' in t and '"lines":[2]' in t, t)
 t = tool('sed', {'path': f, 'pattern': 'four', 'replace': 'FOUR', 'count': 1})
 check('sed shows lines', '4\tFOUR' in t, t)
 
+# word: 単語ぴったり (rg でも aish の中のものでも)
+open(work + '/w.txt', 'w').write('a tool\ntools\ntool_once\n')
+t = tool('grep', {'pattern': 'tool', 'path': work + '/w.txt', 'word': True})
+check('grep word', '"count":1' in t and 'tools' not in t, t)
+
 # where の body: 定義の中身 ('{' の文字や文字列の中のかっこはかぞえない)
 open(work + '/m.rs', 'w').write('fn other() {}\n\nfn target(x: char) -> bool {\n    let s = "}";\n    x == \'{\'\n}\nfn after() {}\n')
 t = tool('where', {'name': 'target', 'path': work, 'body': True})
