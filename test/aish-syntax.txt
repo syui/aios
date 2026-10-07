@@ -42,3 +42,4 @@ diff <(echo a) <(echo a) && echo same	same
 f() { cat "$1"; }; f <(echo infunc)	infunc
 echo "<(no)" '>(no)'	<(no) >(no)
 exec 3< <(echo q); cat <&3	q
+hash -r; hash ls && echo found; hash nosuchcmd 2>/dev/null || echo missing	found|missing

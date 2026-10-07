@@ -1,0 +1,42 @@
+# gawk: GNU awk。awk はこれ (Linux で書かれた awk、AI の書く awk がそのまま動く)
+#   uutils の awk はまだ正規表現の条件、split()、printf が動かないので、awk はこちらに入れかわる
+#   (provides / conflicts / replaces: ap -Syu で入れかわる。/opt/c/bin/awk は gawk へのリンク)
+#   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る (動的な拡張は使わない)
+pkgname=gawk
+pkgver=5.4.1
+pkgrel=1
+pkgdesc='GNU version of awk, as awk (static, for aios)'
+arch=('aarch64')
+url='https://www.gnu.org/software/gawk/'
+license=('GPL-3.0-or-later')
+provides=('awk')
+conflicts=('awk')
+replaces=('awk')
+source=("https://ftp.gnu.org/gnu/gawk/gawk-$pkgver.tar.xz")
+sha256sums=('07f6f7342b7febe4313fc2c2542ad93d64fe20ad8717200109f105a826f5fd37')
+
+prepare() {
+  rm -rf "gawk-$pkgver"
+  tar -xJf "gawk-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "gawk-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-nls --disable-extensions \
+    --without-readline --without-mpfr --disable-pma
+  make -C support
+  make gawk
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "gawk-$pkgver"
+  install -Dm755 gawk "$pkgdir$PREFIX/bin/gawk"
+  ln -s gawk "$pkgdir$PREFIX/bin/awk"
+  install -d "$pkgdir$PREFIX/share/awk"
+  cp awklib/eg/lib/*.awk "$pkgdir$PREFIX/share/awk/"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

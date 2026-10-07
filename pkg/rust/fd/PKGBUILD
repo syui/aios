@@ -1,0 +1,24 @@
+# aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/fd)
+# fd: ファイルを名前で速く探す (find のかわり。.gitignore を読む)
+pkgname=fd
+pkgver=10.5.0
+pkgrel=1
+pkgdesc='Simple, fast and user-friendly alternative to find'
+arch=('aarch64')
+url='https://github.com/sharkdp/fd'
+license=('MIT' 'Apache-2.0')
+makedepends=('git' 'rustup')
+source=("git+https://github.com/sharkdp/fd#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../cross.sh"
+  cd fd
+  musl_build --bin fd
+}
+
+package() {
+  cd fd
+  install -Dm755 target/aarch64-unknown-linux-musl/release/fd "$pkgdir/usr/bin/fd"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+}
