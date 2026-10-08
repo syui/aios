@@ -71,3 +71,14 @@ shopt -s extglob; x=aaab; echo ${x//+(a)/A}	Ab
 [[ foo.h == *.@(c|h) ]] && echo exth	exth
 [[ foo.o == !(*.c) ]] && echo notc	notc
 [[ ab == ?(a)b ]] && [[ b == ?(a)b ]] && echo opt	opt
+printf '%q\n' 'a b' "it's" '' 'x$y' $'tab\there'	a\ b|it\'s|''|x\$y|$'tab\there'
+TZ=UTC printf '%(%Y-%m-%d %H:%M:%S)T\n' 86400	1970-01-02 00:00:00
+printf '%5s|%-5s|%.2s|%x %X %#o\n' a b abc 255 255 8	    a|b    |ab|ff FF 010
+printf '%e %f %g %.2f %+d %05d\n' 1.5 3.14159 0.0001 3.14159 5 42	1.500000e+00 3.141590 0.0001 3.14 +5 00042
+printf '%d %d %d\n' "'A" 0x10 010	65 16 8
+printf '%b|' 'a\tb' 'c\0101d'; printf 'x%by\n' 'stop\cnever'; echo	a	b|cAd|xstop
+printf '%*d|%.*f\n' 5 1 2 3.14159	    1|3.14
+printf '%s %s\n' a b c	a b|c 
+printf 'あ\x41\101\n'	あAA
+select x in a b c; do echo "[$x][$REPLY]"; [ "$REPLY" = 3 ] && break; done <<< $'2\n9\n3' 2>/dev/null	[b][2]|[][9]|[c][3]
+select x in a; do true; done <<< 1 2>/dev/null; echo "st $?"	|st 1

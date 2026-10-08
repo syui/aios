@@ -45,6 +45,8 @@ pub enum Compound {
     /// 条件, 本体, until か
     While(List, List, bool),
     For(String, Option<Vec<Word>>, List),
+    /// select NAME in WORDS; do ...; done (bash): 番号のメニューから選ぶ
+    Select(String, Option<Vec<Word>>, List),
     Case(Word, Vec<(Vec<Word>, List)>),
     /// (( 式 )): 0 でなければ成功 (bash と zsh)
     Arith(String),
@@ -96,7 +98,7 @@ enum Tok {
     Eof,
 }
 
-const RESERVED: &[&str] = &["if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "in", "case", "esac", "{", "}", "!"];
+const RESERVED: &[&str] = &["if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "in", "case", "esac", "{", "}", "!", "select"];
 
 pub struct Parser {
     src: Vec<char>,
@@ -636,7 +638,7 @@ impl Parser {
                     self.expect_word("done")?;
                     Some(Compound::While(cond, body, w == "until"))
                 }
-                "for" => Some(self.for_clause()?),
+                "for" | "select" => Some(self.for_clause()?),
                 "case" => Some(self.case_clause()?),
                 "function" => {
                     self.take()?;
@@ -889,9 +891,10 @@ impl Parser {
     }
 
     fn for_clause(&mut self) -> Result<Compound, Error> {
-        self.take()?; // for
+        // for か select (形は同じ)
+        let select = matches!(self.take()?.0, Tok::Word(w) if w == "select");
         // for (( 初め; 条件; 次 ))
-        if matches!(self.peek()?, Tok::Op("(")) && self.peeked_raw_is("((") {
+        if !select && matches!(self.peek()?, Tok::Op("(")) && self.peeked_raw_is("((") {
             let e = self.take_arith()?;
             let mut parts = e.splitn(3, ';').map(|x| x.trim().to_string());
             let (a, b, c) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
@@ -938,7 +941,7 @@ impl Parser {
         self.expect_word("do")?;
         let body = self.list(&["done"], false)?;
         self.expect_word("done")?;
-        Ok(Compound::For(name, items, body))
+        Ok(if select { Compound::Select(name, items, body) } else { Compound::For(name, items, body) })
     }
 
     fn case_clause(&mut self) -> Result<Compound, Error> {

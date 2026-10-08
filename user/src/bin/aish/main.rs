@@ -26,6 +26,7 @@ mod mcp;
 mod trap;
 mod parse;
 mod plugin;
+mod printf;
 
 use expand::Mode;
 use jobs::{exit_code, interactive, jobs};
@@ -136,14 +137,12 @@ const BUILTINS: &[&str] = &[
     ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "readonly", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
     "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool", "hash",
     "let", "mapfile", "readarray", "getopts", "pushd", "popd", "dirs", "shopt", "compgen",
-    "builtin", "ulimit",
+    "builtin", "ulimit", "printf",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
     BUILTINS.contains(&args[0].as_str())
         || (args[0] == "kill" && args.iter().any(|a| a.starts_with('%')))
-        // printf -v VAR は変数に入れるので組み込み (ほかの printf はコマンド)
-        || (args[0] == "printf" && args.get(1).is_some_and(|a| a == "-v"))
 }
 
 fn flush() {
@@ -914,6 +913,72 @@ impl Shell {
                 self.loops += 1;
                 for v in vals {
                     self.set_var(name, &v);
+                    last = self.run_list(body);
+                    if self.flow != Flow::None && !self.loop_flow() {
+                        break;
+                    }
+                }
+                self.loops -= 1;
+                self.status = last;
+                last
+            }
+            Compound::Select(name, items, body) => {
+                let vals = match items {
+                    None => self.params.get(1..).unwrap_or(&[]).to_vec(),
+                    Some(ws) => {
+                        let mut v = vec![];
+                        for w in ws {
+                            match self.expand(w, Mode::Fields) {
+                                Ok(x) => v.extend(x),
+                                Err(e) => {
+                                    eprintln!("{}: {}", shell_name(), e);
+                                    return 1;
+                                }
+                            }
+                        }
+                        v
+                    }
+                };
+                let menu = |vals: &[String]| {
+                    for (k, v) in vals.iter().enumerate() {
+                        eprintln!("{}) {}", k + 1, v);
+                    }
+                };
+                let mut last;
+                let mut show = true;
+                self.loops += 1;
+                loop {
+                    if show {
+                        menu(&vals);
+                    }
+                    eprint!("{}", self.get_var("PS3").unwrap_or_else(|| "#? ".into()));
+                    flush();
+                    // 1 行 (1 バイトずつ読む。あとのコマンドの分を読みすぎない)
+                    let mut line = vec![];
+                    let mut got = false;
+                    let mut b = [0u8; 1];
+                    while unsafe { libc::read(0, b.as_mut_ptr() as *mut libc::c_void, 1) } == 1 {
+                        got = true;
+                        if b[0] == b'\n' {
+                            break;
+                        }
+                        line.push(b[0]);
+                    }
+                    if !got {
+                        // 終わり (EOF) は 1。改行は標準出力に (bash と同じ)
+                        println!();
+                        last = 1;
+                        break;
+                    }
+                    let reply = String::from_utf8_lossy(&line).trim().to_string();
+                    // 空なら、メニューをもう一度
+                    show = reply.is_empty();
+                    if show {
+                        continue;
+                    }
+                    let pick = reply.parse::<usize>().ok().filter(|&n| n >= 1 && n <= vals.len()).map(|n| vals[n - 1].clone());
+                    self.set_var("REPLY", &reply);
+                    self.set_var(name, &pick.unwrap_or_default());
                     last = self.run_list(body);
                     if self.flow != Flow::None && !self.loop_flow() {
                         break;
@@ -1975,26 +2040,38 @@ impl Shell {
                 (last == 0) as i32
             }
             // printf -v VAR FORMAT ARGS...: printf のコマンドの出力を変数に
+            // printf [-v VAR] FORMAT [ARG...] (printf.rs)
             "printf" => {
-                let (Some(var), Some(_)) = (a.get(1), a.get(2)) else {
-                    eprintln!("printf: usage: printf -v var format [arguments]");
+                let mut a = a;
+                let mut var = None;
+                if a.first().is_some_and(|x| x == "-v") {
+                    var = a.get(1).cloned();
+                    a = a.get(2..).unwrap_or(&[]);
+                }
+                if a.first().is_some_and(|x| x == "--") {
+                    a = &a[1..];
+                }
+                let Some(fmt) = a.first() else {
+                    eprintln!("printf: usage: printf [-v var] format [arguments]");
                     return 2;
                 };
-                let Some(prog) = self.find("printf") else {
-                    eprintln!("printf: command not found");
-                    return 127;
-                };
-                match std::process::Command::new(prog).args(&a[2..]).stderr(std::process::Stdio::inherit()).output() {
-                    Ok(o) => {
-                        let v = String::from_utf8_lossy(&o.stdout).into_owned();
-                        let _ = self.assign(var, &v);
-                        o.status.code().unwrap_or(1)
+                let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) - self.started.elapsed().as_secs() as i64;
+                let (out, st) = printf::format(fmt, &a[1..], started);
+                match var {
+                    Some(v) => {
+                        if let Err(e) = self.assign(&v, &out) {
+                            eprintln!("printf: {}", e);
+                            return 1;
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("printf: {}", e);
-                        1
+                    None => {
+                        let mut so = io::stdout().lock();
+                        if so.write_all(out.as_bytes()).and_then(|_| so.flush()).is_err() {
+                            return 1;
+                        }
                     }
                 }
+                st
             }
             // mapfile / readarray [-t] [-d C] [-n N] [-s N] [NAME]: 標準入力の行を配列に (既定は MAPFILE)
             "mapfile" | "readarray" => {
