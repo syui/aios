@@ -22,6 +22,7 @@
 // 選ぶのは clock: AF (アクセスフラグ) を落としておき、次に見たときにまだ落ちていれば追い出す。
 // AF が落ちたページに触れるとアクセスフラグのフォールトになり、fault_page が立てなおす。
 use crate::kalloc;
+use crate::spinlock::SpinLock;
 use crate::swap;
 use crate::memlayout::{p2v, v2p, PGSIZE};
 use crate::vfs::InodeRef;
@@ -97,57 +98,72 @@ fn write_back(key: &FileKey, c: &Cached) {
 // MAP_PRIVATE のファイル (プログラムやライブラリ) のページは、読むだけのあいだはここの 1 枚をみんなで写す
 // (書きこみ禁止で写し、書いたときに fault_page のコピーオンライトで自分のものに)。同じプログラムを何度
 // 動かしても、ファイルを読みなおさない。ファイルが変わったら (更新時刻か大きさ) 読みなおす。
-// 表も 1 つ参照を持つ。PRIV_MAX をこえたら、だれも写していないもの (参照が表だけ) から捨てる
+// 表も 1 つ参照を持つ。PRIV_MAX をこえたら、だれも写していないもの (参照が表だけ) から捨てる。
+// 大きなロックなしのページフォルト (fast_fault) も読むので、表はスピンロックで守る。そちらはファイルに
+// さわれないので、領域を写したときの版 (Backing::File の ver) と同じ版のページだけを使う
 
 struct PrivPage {
     page: *mut u8,
-    mtime: u64,
-    size: u64,
+    ver: (u64, u64),
 }
+
+// ページはカーネルのもの (どの CPU からでも)
+unsafe impl Send for PrivPage {}
 
 const PRIV_MAX: usize = 16384; // 64 MiB
 
-static mut PRIV: BTreeMap<FileKey, PrivPage> = BTreeMap::new();
-
-fn priv_cache() -> &'static mut BTreeMap<FileKey, PrivPage> {
-    unsafe { &mut *(&raw mut PRIV) }
-}
+static PRIV: SpinLock<BTreeMap<FileKey, PrivPage>> = SpinLock::new(BTreeMap::new());
 
 /// ページキャッシュのページの数 (/proc/meminfo の Cached)
 pub fn cached_pages() -> usize {
-    priv_cache().len()
+    PRIV.lock().len()
 }
 
 /// だれも写していないページを捨てる (n 枚まで)。捨てた数
 pub fn shrink_cache(n: usize) -> usize {
-    let victims: Vec<FileKey> = priv_cache().iter().filter(|(_, c)| kalloc::refs(c.page) <= 1).map(|(k, _)| *k).take(n).collect();
-    for k in &victims {
-        if let Some(c) = priv_cache().remove(k) {
-            kalloc::put(c.page);
+    let mut freed = Vec::new();
+    {
+        let mut c = PRIV.lock();
+        let victims: Vec<FileKey> = c.iter().filter(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k).take(n).collect();
+        for k in &victims {
+            if let Some(p) = c.remove(k) {
+                freed.push(p.page);
+            }
         }
     }
-    victims.len()
+    for &p in &freed {
+        kalloc::put(p);
+    }
+    freed.len()
 }
 
-/// ino の foff (ページの境目) からの 1 ページ (ファイルの終わりのあとは 0)。ページの境目でなければ None
+/// 表にある、版が ver のページ (参照をひとつ足して)。ロックなしでも呼べる
+fn cached_page(key: &FileKey, ver: (u64, u64)) -> Option<*mut u8> {
+    let c = PRIV.lock();
+    let p = c.get(key).filter(|p| p.ver == ver)?;
+    kalloc::get(p.page);
+    Some(p.page)
+}
+
+/// ファイルの版 (更新時刻と大きさ)
+pub fn file_ver(ino: &InodeRef) -> (u64, u64) {
+    let m = ino.meta();
+    (m.mtime, m.size)
+}
+
+/// ino の foff (ページの境目) からの 1 ページ (ファイルの終わりのあとは 0)、参照をひとつ足して。
+/// ページの境目でなければ None
 fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     if foff % PGSIZE != 0 {
         return None;
     }
-    let m = ino.meta();
+    let ver = file_ver(ino);
     let key = file_key(ino, foff);
-    if let Some(c) = priv_cache().get(&key) {
-        if c.mtime == m.mtime && c.size == m.size {
-            return Some(c.page);
-        }
-        let c = priv_cache().remove(&key).unwrap();
-        kalloc::put(c.page);
-    }
-    if priv_cache().len() >= PRIV_MAX {
-        shrink_cache(PRIV_MAX / 8);
+    if let Some(p) = cached_page(&key, ver) {
+        return Some(p);
     }
     let page = kalloc::alloc()?;
-    let size = m.size as usize;
+    let size = ver.1 as usize;
     if foff < size {
         let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
         if ino.read_at(foff, buf).is_err() {
@@ -157,7 +173,15 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     }
     // コードかもしれないので命令キャッシュも (読みこんだときに一度だけ)
     sync_icache(page as usize, PGSIZE);
-    priv_cache().insert(key, PrivPage { page, mtime: m.mtime, size: m.size });
+    if PRIV.lock().len() >= PRIV_MAX {
+        shrink_cache(PRIV_MAX / 8);
+    }
+    kalloc::get(page);
+    // 古い版は外す (読んでいるあいだにほかが入れたものも)。写しているところは自分の参照を持っている
+    let old = PRIV.lock().insert(key, PrivPage { page, ver });
+    if let Some(o) = old {
+        kalloc::put(o.page);
+    }
     Some(page)
 }
 
@@ -192,7 +216,8 @@ fn release_shared(keys: &[FileKey]) {
 pub enum Backing {
     Anon,
     /// 領域の先頭がファイルの off。va が fend 以上のところは 0 (ELF の .bss の始まりなど)
-    File { ino: InodeRef, off: usize, fend: usize },
+    /// ver は写したときのファイルの版 (file_ver。ロックなしのページフォルトがページキャッシュをくらべる)
+    File { ino: InodeRef, off: usize, fend: usize, ver: (u64, u64) },
     /// カーネルが持っているページをそのまま見せる (/dev/fb0 のフレームバッファ)。off はバイト
     Pages { pages: alloc::rc::Rc<Vec<*mut u8>>, off: usize },
 }
@@ -853,16 +878,15 @@ impl PageTable {
                 sync_icache(page as usize, PGSIZE);
             }
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
-        } else if let (false, false, false, Backing::File { ino, off, fend }) = (has_page(e), write, force, &back)
+        } else if let (false, false, false, Backing::File { ino, off, fend, .. }) = (has_page(e), write, force, &back)
             && fend.saturating_sub(page_va) >= PGSIZE
             && let Some(page) = file_page(ino, off + (page_va - start))
         {
             // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
-            kalloc::get(page);
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false) };
         } else if !has_page(e) {
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
-            if let Backing::File { ino, off, fend } = &back {
+            if let Backing::File { ino, off, fend, .. } = &back {
                 let n = PGSIZE.min(fend.saturating_sub(page_va));
                 if n > 0 {
                     let buf = unsafe { core::slice::from_raw_parts_mut(page, n) };
@@ -1038,13 +1062,13 @@ impl PageTable {
     /// それ以外 (ファイル、スワップ、共有、テーブルがない、だれかが表を変えている途中) は false で、
     /// 呼んだほうが大きなロックを取ってふつうの道 (fault) へ。
     /// 同じ表のほかのスレッドと同時に走ってよい: PTE は compare-exchange で、負けたら false (やりなおし)
-    pub fn fast_fault(&self, va: usize, write: bool) -> bool {
+    pub fn fast_fault(&self, va: usize, write: bool, exec: bool) -> bool {
         if va >= MAXVA {
             return false;
         }
         self.fast_users.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        let (ok, put) = if self.mutators.load(Ordering::SeqCst) == 0 { self.fast_fault_inner(va, write) } else { (false, None) };
+        let (ok, put) = if self.mutators.load(Ordering::SeqCst) == 0 { self.fast_fault_inner(va, write, exec) } else { (false, None) };
         self.fast_users.fetch_sub(1, Ordering::SeqCst);
         if let Some(old) = put {
             // 写しとった元のページを手放す。ロックなしで元のページを読んでいる CPU がいなくなってから
@@ -1055,14 +1079,15 @@ impl PageTable {
     }
 
     /// (片づいたか, あとで手放すページ)
-    fn fast_fault_inner(&self, va: usize, write: bool) -> (bool, Option<*mut u8>) {
+    fn fast_fault_inner(&self, va: usize, write: bool, exec: bool) -> (bool, Option<*mut u8>) {
         use core::sync::atomic::AtomicU64;
-        let Some((_, v)) = self.find(va) else { return (false, None) };
-        if v.shared || !matches!(v.back, Backing::Anon) {
+        let Some((start, v)) = self.find(va) else { return (false, None) };
+        // 無名と、MAP_PRIVATE のファイル (まだないページはページキャッシュにあるときだけ)
+        if v.shared || !matches!(v.back, Backing::Anon | Backing::File { .. }) {
             return (false, None);
         }
         let prot = v.prot;
-        if (write && prot & PROT_WRITE == 0) || prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+        if (write && prot & PROT_WRITE == 0) || (exec && prot & PROT_EXEC == 0) || prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
             return (false, None);
         }
         let page_va = pg_down(va);
@@ -1072,7 +1097,29 @@ impl PageTable {
         if is_swap(e) {
             return (false, None);
         }
-        let (new, fresh, put) = if !has_page(e) {
+        let (new, fresh, put) = if let (false, Backing::File { ino, off, fend, ver }) = (has_page(e), &v.back) {
+            // 読むだけで、ページキャッシュに同じ版があるとき (ないか書くなら大きなロックを持って読みこむ)
+            let foff = off + (page_va - start);
+            if fend.saturating_sub(page_va) < PGSIZE || foff % PGSIZE != 0 {
+                return (false, None);
+            }
+            let Some(page) = cached_page(&file_key(ino, foff), *ver) else { return (false, None) };
+            if write {
+                // 書く (.data など): はじめから自分のものに写す
+                let Some(mine) = kalloc::alloc() else {
+                    kalloc::put(page);
+                    return (false, None);
+                };
+                unsafe { core::ptr::copy_nonoverlapping(page, mine, PGSIZE) };
+                kalloc::put(page);
+                if prot & PROT_EXEC != 0 {
+                    sync_icache(mine as usize, PGSIZE);
+                }
+                (make_pte(v2p(mine as usize) as u64, prot, false), Some(mine), None)
+            } else {
+                (make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false), Some(page), None)
+            }
+        } else if !has_page(e) {
             let Some(page) = kalloc::alloc() else { return (false, None) };
             (make_pte(v2p(page as usize) as u64, prot, false), Some(page), None)
         } else if write {
@@ -1097,7 +1144,8 @@ impl PageTable {
         if slot.compare_exchange(e, new, Ordering::AcqRel, Ordering::Acquire).is_err() {
             // ほかの CPU (同じ表のスレッド) が先に変えた。もらったページは返して、やりなおし
             if let Some(page) = fresh {
-                kalloc::free(page);
+                // ページキャッシュのページなら参照を返すだけ (新しいページはこれで 0 になって空く)
+                kalloc::put(page);
             }
             return (false, None);
         }

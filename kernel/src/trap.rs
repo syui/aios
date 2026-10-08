@@ -156,10 +156,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         if ec == EC_SVC64 && syscall::fast(tf) {
             return;
         }
-        // データのフォルト (変換、アクセスフラグ、権限)。WnR は、キャッシュを整える命令 (CM) なら読んだことに (handle と同じ)
-        if ec == EC_DABT_LOW && (4..=15).contains(&(esr & 0x3f)) {
-            let write = esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
-            if proc::current().pt().fast_fault(far as usize, write) {
+        // データと命令のフォルト (変換、アクセスフラグ、権限)。WnR は、キャッシュを整える命令 (CM) なら読んだことに (handle と同じ)
+        if (ec == EC_DABT_LOW || ec == EC_IABT_LOW) && (4..=15).contains(&(esr & 0x3f)) {
+            let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
+            if proc::current().pt().fast_fault(far as usize, write, ec == EC_IABT_LOW) {
                 crate::smp::FAST_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
