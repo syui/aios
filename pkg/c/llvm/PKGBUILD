@@ -5,7 +5,7 @@
 #   入るもの: libLLVM.so、ヘッダー、llvm-config (aios で動かすか、qemu-aarch64 で動かす)
 #   ビルドには cmake、ninja、clang-20 が要る。4 コアで 1 時間ほど
 pkgname=llvm
-pkgver=20.1.8
+pkgver=23.1.3
 pkgrel=1
 pkgdesc='Compiler infrastructure: libLLVM.so for the AArch64 target (for aios)'
 arch=('aarch64')
@@ -14,7 +14,7 @@ license=('Apache-2.0 WITH LLVM-exception')
 depends=('musl')
 makedepends=('cmake' 'ninja' 'clang')
 source=("https://github.com/llvm/llvm-project/releases/download/llvmorg-$pkgver/llvm-project-$pkgver.src.tar.xz")
-sha256sums=('6898f963c8e938981e6c4a302e83ec5beb4630147c7311183cf61069af16333d')
+sha256sums=('c44186a7762ed28954be72e5ff6df9808e0779d4f1bf014ecc4e7e211d31ee34')
 
 # ビルドするマシンの clang (llvm-tblgen などを作る)
 _host_llvm=${HOST_LLVM:-20}
@@ -22,7 +22,8 @@ _host_llvm=${HOST_LLVM:-20}
 prepare() {
   rm -rf "llvm-project-$pkgver.src"
   tar -xf "${source[0]##*/}" "llvm-project-$pkgver.src/llvm" "llvm-project-$pkgver.src/cmake" \
-    "llvm-project-$pkgver.src/third-party"
+    "llvm-project-$pkgver.src/third-party" \
+    "llvm-project-$pkgver.src/libc"
 }
 
 build() {
@@ -61,7 +62,7 @@ SH
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DCMAKE_SHARED_LINKER_FLAGS=-s \
     -DCMAKE_EXE_LINKER_FLAGS=-s \
-    -DCROSS_TOOLCHAIN_FLAGS_NATIVE="-DCMAKE_C_COMPILER=clang-$_host_llvm;-DCMAKE_CXX_COMPILER=clang++-$_host_llvm" \
+    -DCROSS_TOOLCHAIN_FLAGS_NATIVE="-DCMAKE_C_COMPILER=clang-$_host_llvm;-DCMAKE_CXX_COMPILER=clang++-$_host_llvm;-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
     -DLLVM_HOST_TRIPLE=aarch64-unknown-linux-musl \
     -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-unknown-linux-musl \
     -DLLVM_TARGETS_TO_BUILD=AArch64 \

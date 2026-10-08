@@ -6,7 +6,7 @@
 #   (aios 用の llvm-config を動かす)、このマシンの cc と expat (wayland-scanner をこのマシン用に作る) が要る
 pkgname=mesa
 pkgver=26.2.4
-pkgrel=1
+pkgrel=2
 pkgdesc='Open-source OpenGL, GLES, EGL and Vulkan on the CPU: llvmpipe and lavapipe (for aios)'
 arch=('aarch64')
 url='https://www.mesa3d.org/'

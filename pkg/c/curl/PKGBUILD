@@ -2,7 +2,7 @@
 # TLS は mbedtls、圧縮は zlib。静的な curl と libcurl.a を /opt/c に入れる
 pkgname=curl
 pkgver=8.22.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Command line tool and library for transferring data with URLs (mbedTLS, static)'
 arch=('aarch64')
 url='https://curl.se'
