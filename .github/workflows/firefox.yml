@@ -1,0 +1,132 @@
+# firefox: aios の Firefox (pkg/c/firefox) をここで作り、GitHub のリリース firefox-VER-REL に置く。
+# ai/repo へ入れるのはこのリリースから取ってきて (bin/fetchpkg.sh ではなく gh / curl で)、手元で
+# aish-pkg test → push (ai/repo の署名の鍵を GitHub に置かないため)。
+#   動くとき: 1 日 1 回 (配布元に新しい版が出て、そのリリースがまだなければ作る)、pkg/c/firefox を変えた push、手で
+#   作るもの: firefox-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD (版を上げたときの sha256 もそこに)
+name: firefox
+
+on:
+  schedule:
+  - cron: '17 3 * * *'
+  push:
+    branches:
+    - unix
+    paths:
+    - 'pkg/c/firefox/**'
+    - '.github/workflows/firefox.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firefox
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      ver: ${{ steps.v.outputs.ver }}
+      rel: ${{ steps.v.outputs.rel }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: pkg/c/firefox
+
+      - name: Version
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          now=$(sed -n 's/^pkgver=//p' pkg/c/firefox/PKGBUILD)
+          rel=$(sed -n 's/^pkgrel=//p' pkg/c/firefox/PKGBUILD)
+          ver=$now
+          # 1 日 1 回のときは配布元の最新の版 (product-details は Mozilla の版の一覧)
+          if [ "${{ github.event_name }}" = schedule ]; then
+            latest=$(curl -fsSL --retry 3 https://product-details.mozilla.org/1.0/firefox_versions.json | jq -r .LATEST_FIREFOX_VERSION)
+            case $latest in [0-9]*) ;; *) echo "bad version: $latest"; exit 1 ;; esac
+            if [ "$latest" != "$now" ]; then
+              ver=$latest
+              rel=1
+            fi
+          fi
+          tag=firefox-$ver-$rel
+          build=true
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+          fi
+          echo "PKGBUILD $now-$(sed -n 's/^pkgrel=//p' pkg/c/firefox/PKGBUILD), target $ver-$rel, build $build"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "rel=$rel" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    env:
+      VER: ${{ needs.check.outputs.ver }}
+      REL: ${{ needs.check.outputs.rel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free disk
+        run: |
+          df -h /
+          # ビルドに 15GB ほど。使わない大きなもの (あれば) を消す
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Tools
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          bin/setup-build.sh --firefox
+
+      - name: Version
+        run: |
+          # 配布元の版が PKGBUILD より新しければ、pkgver と sha256 (Mozilla の SHA256SUMS から) を書きかえる
+          p=pkg/c/firefox/PKGBUILD
+          if [ "$VER" != "$(sed -n 's/^pkgver=//p' $p)" ]; then
+            sum=$(curl -fsSL --retry 3 "https://archive.mozilla.org/pub/firefox/releases/$VER/SHA256SUMS" | awk -v f="source/firefox-$VER.source.tar.xz" '$2 == f { print $1 }')
+            [ -n "$sum" ] || { echo "no sha256 for $VER"; exit 1; }
+            old=$(sed -n "s/^sha256sums=('\([0-9a-f]*\)'.*/\1/p" $p)
+            sed -i "s/^pkgver=.*/pkgver=$VER/; s/^pkgrel=.*/pkgrel=$REL/; s/$old/$sum/" $p
+          fi
+          grep -E '^(pkgver|pkgrel|sha256sums)=' $p
+
+      - name: Dependencies
+        run: |
+          # c_deps のパッケージは ai/repo から (ソースから作らない)
+          bin/fetchpkg.sh c $(sed -n 's/^ *c_deps //p' pkg/c/firefox/PKGBUILD)
+
+      - name: Build
+        run: |
+          git config user.name ai
+          git config user.email ai@syui.ai
+          bin/mkpkg.sh pkg/c/firefox
+          ls -la repo/aarch64/c/firefox-*
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=firefox-$VER-$REL
+          mkdir release
+          cp repo/aarch64/c/firefox-$VER-$REL-aarch64.pkg.tar.zst release/
+          cp pkg/c/firefox/PKGBUILD release/PKGBUILD
+          sha256sum release/* > release/SHA256SUMS
+          printf 'aios の Firefox %s-%s (aarch64、Wayland)。ai/repo にはまだ入っていない (手元で aish-pkg test のあと push)\n' "$VER" "$REL" > notes.md
+          gh release create "$tag" release/* --title "$tag" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
