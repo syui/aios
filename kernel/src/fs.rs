@@ -11,18 +11,18 @@ pub fn init() {
             Ok(fs) => {
                 println!("fs: root is {} on {}", fs.kind(), crate::block::name());
                 let kind = fs.kind();
-                vfs::set_root(fs.root());
+                vfs::set_root(fs.root(), &crate::block::name(), kind);
                 // /dev と /tmp はメモリ上に
                 for d in ["dev", "tmp", "run"] {
                     if vfs::mkdir_p(d, 0o755).is_ok() {
-                        let _ = vfs::mount(d, tmpfs::new_root());
+                        let _ = vfs::mount(d, tmpfs::new_root(), "tmpfs", "tmpfs");
                     }
                 }
                 let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\n", crate::block::name(), kind);
                 // FAT の boot の区画 (ESP / ラズパイの boot) を /boot に
                 if let Some(p) = crate::block::boot() {
                     match crate::vfat::FatFs::mount(p) {
-                        Ok(b) if vfs::mkdir_p("boot", 0o755).is_ok() && vfs::mount("boot", b.root()).is_ok() => {
+                        Ok(b) if vfs::mkdir_p("boot", 0o755).is_ok() && vfs::mount("boot", b.root(), &crate::block::part_name(&p), "vfat").is_ok() => {
                             println!("fs: /boot is {} on {}", b.kind(), crate::block::part_name(&p));
                             mtab.push_str(&alloc::format!("{} /boot vfat rw 0 0\n", crate::block::part_name(&p)));
                         }
@@ -38,7 +38,7 @@ pub fn init() {
     }
     println!("fs: root is tmpfs from initramfs");
     let root = tmpfs::new_root();
-    vfs::set_root(root);
+    vfs::set_root(root, "rootfs", "tmpfs");
     for e in initrd::entries() {
         let (dir, name) = e.name.rsplit_once('/').unwrap_or(("", e.name));
         let Ok(parent) = vfs::resolve("", dir, true) else { continue };
@@ -117,10 +117,10 @@ fn setup_dirs(mtab: &str) {
         let _ = vfs::mkdir_p(d, 0o755);
     }
     if vfs::mkdir_p("proc", 0o555).is_ok() {
-        let _ = vfs::mount("proc", crate::procfs::new_root());
+        let _ = vfs::mount("proc", crate::procfs::new_root(), "proc", "proc");
     }
     if vfs::mkdir_p("sys", 0o555).is_ok() {
-        let _ = vfs::mount("sys", crate::sysfs::new_root());
+        let _ = vfs::mount("sys", crate::sysfs::new_root(), "sysfs", "sysfs");
     }
     // df などが読むマウント表 (起動のたびに書きなおす)
     if let Ok(etc) = vfs::resolve("", "etc", true) {

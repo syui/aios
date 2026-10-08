@@ -1,10 +1,12 @@
 // aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
-//   aibox [-w PATH]... [-n PORT]... [--no-net] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
+//   aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
 //   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
 //   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
 //   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。プロセスの番号も分ける (PID の namespace:
 //   CMD は中の 1 番で、外のプロセスは見えず kill もできない。aibox は外で待って、CMD の終わりかたで終わる)。
+//   --tmp で /tmp を自分だけのもの (空の tmpfs) にする (マウントの namespace。外の /tmp は見えず、中で作ったものは
+//   終わると消える)。マウントの表はいつも分ける
 //   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
 //   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
@@ -19,7 +21,7 @@ mod seccomp;
 use std::os::unix::process::CommandExt;
 
 fn usage() -> ! {
-    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
+    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
     std::process::exit(2);
 }
 
@@ -28,6 +30,7 @@ fn main() {
     let mut write = landlock::default_write();
     let mut ports: Option<Vec<u16>> = None;
     let mut verbose = false;
+    let mut private_tmp = false;
     let mut deny: Vec<u32> = seccomp::DEFAULT_DENY.iter().filter_map(|n| seccomp::number(n)).collect();
     let mut kill: Vec<u32> = vec![];
     let mut i = 0;
@@ -51,6 +54,7 @@ fn main() {
             "--no-net" => {
                 ports.get_or_insert_with(Vec::new);
             }
+            "--tmp" => private_tmp = true,
             "--deny" | "--kill" => {
                 let opt = args[i].clone();
                 i += 1;
@@ -74,6 +78,19 @@ fn main() {
         i += 1;
     }
     let cmd: Vec<String> = if i < args.len() { args[i..].to_vec() } else { vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())] };
+    // マウントの表を分けて、--tmp なら /tmp に空の tmpfs を (landlock の前に: 砂場の中からはマウントできない)
+    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        eprintln!("aibox: unshare: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    if private_tmp {
+        let r = unsafe { libc::mount(c"tmpfs".as_ptr(), c"/tmp".as_ptr(), c"tmpfs".as_ptr(), 0, std::ptr::null()) };
+        if r != 0 {
+            eprintln!("aibox: mount /tmp: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+    }
     match landlock::restrict(&write, ports.as_deref()) {
         Ok(missing) => {
             for m in &missing {

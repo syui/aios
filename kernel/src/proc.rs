@@ -444,6 +444,11 @@ pub fn current_cwd() -> String {
     }
 }
 
+/// いまのプロセスのマウントの namespace (はじめのものなら None。起動中も)
+pub fn current_mnt() -> Option<Rc<crate::vfs::MountNs>> {
+    cur().and_then(|i| procs()[i].cred.ns.mnt.clone())
+}
+
 /// chroot のルート。current がないときは本当のルート
 pub fn current_root() -> String {
     match cur() {

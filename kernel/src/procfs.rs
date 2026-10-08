@@ -79,6 +79,8 @@ enum Node {
     /// /proc/PID/ns と、その中のリンク (NS_KINDS の番号)
     NsDir(u32),
     NsLink(u32, u8),
+    /// /proc/PID/mounts (そのプロセスのマウントの namespace の表)
+    PidMounts(u32),
 }
 
 pub struct ProcInode {
@@ -156,13 +158,14 @@ impl ProcInode {
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
             Node::NsDir(p) => (p as u64) << 16 | 14,
+            Node::PidMounts(p) => (p as u64) << 16 | 15,
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
         }
     }
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) => Some(p),
             _ => None,
         }
     }
@@ -170,12 +173,7 @@ impl ProcInode {
     /// ファイルの中身
     fn content(&self) -> Result<String, i64> {
         Ok(match self.node {
-            Node::Mounts => {
-                let etc = resolve("", "etc/mtab", true)?;
-                let mut b = alloc::vec![0u8; etc.meta().size as usize];
-                let n = etc.read_at(0, &mut b)?;
-                String::from_utf8_lossy(&b[..n]).into_owned()
-            }
+            Node::Mounts => crate::vfs::mounts_text(),
             Node::KernelCmdline => format!("{}\n", crate::dtb::bootargs().unwrap_or("")),
             Node::CpuInfo => {
                 let midr: u64;
@@ -347,6 +345,7 @@ impl ProcInode {
             }
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
+            Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
             _ => return Err(-EISDIR),
         })
     }
@@ -457,10 +456,11 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 4] = ["net", "pid", "pid_for_children", "uts"];
+const NS_KINDS: [&str; 5] = ["mnt", "net", "pid", "pid_for_children", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
+        "mnt" => c.ns.mnt_id(),
         "net" => c.ns.net_id(),
         "pid_for_children" => c.ns.pid_children_id(),
         _ => c.ns.uts_id(),
@@ -632,6 +632,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "environ") => Node::Environ(p),
             (Node::Pid(p), "statm") => Node::Statm(p),
             (Node::Pid(p), "comm") => Node::Comm(p),
+            (Node::Pid(p), "mounts") => Node::PidMounts(p),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
             (Node::Pid(p), "root") => Node::RootLink(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
@@ -708,6 +709,7 @@ impl Inode for ProcInode {
                 add("environ".into(), Node::Environ(p));
                 add("statm".into(), Node::Statm(p));
                 add("comm".into(), Node::Comm(p));
+                add("mounts".into(), Node::PidMounts(p));
                 add("cwd".into(), Node::Cwd(p));
                 add("root".into(), Node::RootLink(p));
                 add("exe".into(), Node::Exe(p));
