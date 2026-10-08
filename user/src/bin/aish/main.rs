@@ -126,12 +126,17 @@ pub struct Shell {
     pub readonly: std::collections::HashSet<String>,
     /// 呼ばれている関数の名前 (新しいものが後ろ。$FUNCNAME はこれを逆にしたもの)
     pub funcstack: Vec<String>,
+    /// declare -l (小文字に) と -u (大文字に) の変数
+    pub case_vars: HashMap<String, char>,
+    /// declare -n / local -n: 名前 → 指す先の変数の名前
+    pub namerefs: HashMap<String, String>,
 }
 
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "readonly", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
     "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool", "hash",
     "let", "mapfile", "readarray", "getopts", "pushd", "popd", "dirs", "shopt", "compgen",
+    "builtin", "ulimit",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -205,6 +210,8 @@ impl Shell {
             started: std::time::Instant::now(),
             readonly: Default::default(),
             funcstack: vec![],
+            case_vars: HashMap::new(),
+            namerefs: HashMap::new(),
             dirstack: vec![],
         }
         // zsh と bash の $OSTYPE (.zshrc の case $OSTYPE in linux*) で分けられるように)
@@ -219,7 +226,20 @@ impl Shell {
     }
 
     /// 配列 (なければ None)。path は $PATH を : で分けたもの
+    /// nameref をたどった先の名前 (nameref でなければそのまま)
+    pub fn deref<'a>(&'a self, k: &'a str) -> &'a str {
+        let mut k = k;
+        for _ in 0..8 {
+            match self.namerefs.get(k) {
+                Some(t) => k = t.as_str(),
+                None => break,
+            }
+        }
+        k
+    }
+
     pub fn array(&self, k: &str) -> Option<Vec<String>> {
+        let k = self.deref(k);
         if k == "path" {
             return Some(self.get_var("PATH").unwrap_or_default().split(':').filter(|x| !x.is_empty()).map(String::from).collect());
         }
@@ -227,6 +247,7 @@ impl Shell {
     }
 
     pub fn set_array(&mut self, k: &str, v: Vec<String>) {
+        let k = &self.deref(k).to_string();
         if k == "path" {
             let p = v.join(":");
             return self.set_var("PATH", &p);
@@ -244,6 +265,7 @@ impl Shell {
 
     /// a=(x y) と a+=(x): 要素が [k]=v の形なら、連想配列のキーか、配列の番号 (bash の a=([0]=x [3]=y))
     pub fn set_items(&mut self, name: &str, items: Vec<String>, add: bool) -> Result<(), String> {
+        let name = &self.deref(name).to_string();
         let keyed = !items.is_empty() && items.iter().all(|x| x.starts_with('[') && x.contains("]="));
         if self.assoc.contains_key(name) || (keyed && self.assoc.contains_key(name)) {
             if !add {
@@ -274,6 +296,11 @@ impl Shell {
     /// 代入: NAME=v、NAME+=v (配列なら要素を足す、ほかは文字をつなぐ)、NAME[i]=v (配列の i 番。負は終わりから。
     /// 連想配列ならキー i)、NAME[i]+=v
     pub fn assign(&mut self, key: &str, v: &str) -> Result<(), String> {
+        let key = match key.find(['[', '+']) {
+            Some(i) => format!("{}{}", self.deref(&key[..i]), &key[i..]),
+            None => self.deref(key).to_string(),
+        };
+        let key = key.as_str();
         let (key, add) = match key.strip_suffix('+') {
             Some(k) => (k, true),
             None => (key, false),
@@ -282,6 +309,18 @@ impl Shell {
         if self.readonly.contains(base) {
             return Err(format!("{}: readonly variable", base));
         }
+        let cased;
+        let v = match self.case_vars.get(base) {
+            Some('l') => {
+                cased = v.to_lowercase();
+                cased.as_str()
+            }
+            Some(_) => {
+                cased = v.to_uppercase();
+                cased.as_str()
+            }
+            None => v,
+        };
         let Some((name, sub)) = key.split_once('[').map(|(n, r)| (n, &r[..r.len() - 1])) else {
             if add {
                 if let Some(mut a) = self.array(key) {
@@ -338,10 +377,12 @@ impl Shell {
     // ---- 変数 ----
 
     pub fn get_var(&self, k: &str) -> Option<String> {
+        let k = self.deref(k);
         self.vars.get(k).cloned().or_else(|| std::env::var(k).ok())
     }
 
     pub fn set_var(&mut self, k: &str, v: &str) {
+        let k = &self.deref(k).to_string();
         self.arrays.remove(k);
         self.assoc.remove(k);
         if std::env::var_os(k).is_some() {
@@ -515,10 +556,16 @@ impl Shell {
         }
         let start = p.time.then(|| (std::time::Instant::now(), cpu_times()));
         let mut st = if p.cmds.len() == 1 {
-            self.run_cmd(&p.cmds[0])
+            let st = self.run_cmd(&p.cmds[0]);
+            self.arrays.insert("PIPESTATUS".into(), vec![st.to_string()]);
+            st
         } else {
             let text = self.text.clone();
-            self.spawn(p.cmds.iter().cloned().map(Part::Ast).collect(), false, &text)
+            let st = self.spawn(p.cmds.iter().cloned().map(Part::Ast).collect(), false, &text);
+            let ps = jobs::pipestatus();
+            let ps = if ps.len() == p.cmds.len() { ps } else { vec![st] };
+            self.arrays.insert("PIPESTATUS".into(), ps.iter().map(|s| s.to_string()).collect());
+            st
         };
         if !last || p.neg {
             self.cond -= 1;
@@ -563,6 +610,23 @@ impl Shell {
     }
 
     /// 単純なコマンドの語、代入、つけかえを展開する
+    /// 代入を入れる (readonly への代入は、スクリプトならそこで止まる)
+    fn apply_assigns(&mut self, avals: &[(String, String)], arrays: &[(String, bool, Vec<String>)]) -> Result<(), String> {
+        for (k, v) in avals {
+            if let Err(e) = self.assign(k, v) {
+                if e.ends_with("readonly variable") && !interactive() {
+                    eprintln!("{}: {}", shell_name(), e);
+                    exit_shell(1);
+                }
+                return Err(e);
+            }
+        }
+        for (k, add, vals) in arrays {
+            self.set_items(k, vals.clone(), *add)?;
+        }
+        Ok(())
+    }
+
     fn prepare(&mut self, assigns: &[(String, String)], words: &[String], redirs: &[Redir]) -> Result<Ready, String> {
         self.subst_status = None;
         let words = self.expand_alias(words);
@@ -580,7 +644,12 @@ impl Shell {
         }
         let mut avals = vec![];
         let mut arrays = vec![];
+        // 代入だけのとき (IFS=, a=($x)) は、前から 1 つずつ展開して入れる (前の代入が後ろの展開に効く。bash と同じ)
+        let direct = words.is_empty() && assigns.len() > 1;
         for (k, w) in assigns {
+            if direct && (!avals.is_empty() || !arrays.is_empty()) {
+                self.apply_assigns(&std::mem::take(&mut avals), &std::mem::take(&mut arrays))?;
+            }
             if let Some(items) = w.strip_prefix(parse::ARRAY) {
                 let mut vals = vec![];
                 for x in items.split(parse::SEP).filter(|x| !x.is_empty()) {
@@ -909,6 +978,11 @@ impl Shell {
         self.funcstack.push(args[0].clone());
         self.set_array("FUNCNAME", self.funcstack.iter().rev().cloned().collect());
         let mut st = self.run_compound(body);
+        if self.flow == Flow::Return {
+            self.flow = Flow::None;
+            st = self.status;
+        }
+        trap::run_return();
         self.funcstack.pop();
         match self.funcstack.is_empty() {
             true => {
@@ -916,11 +990,8 @@ impl Shell {
             }
             false => self.set_array("FUNCNAME", self.funcstack.iter().rev().cloned().collect()),
         }
-        if self.flow == Flow::Return {
-            self.flow = Flow::None;
-            st = self.status;
-        }
         for (k, old, exported) in self.locals.pop().unwrap().into_iter().rev() {
+            self.namerefs.remove(&k);
             self.vars.remove(&k);
             self.arrays.remove(&k);
             self.assoc.remove(&k);
@@ -1367,6 +1438,99 @@ impl Shell {
                 }
             }
             "trap" => trap::builtin(a),
+            // builtin NAME ARGS...: 関数を飛ばして組み込みを
+            "builtin" => {
+                let Some(x) = a.first() else { return 0 };
+                if !is_builtin(a) {
+                    eprintln!("builtin: {}: not a shell builtin", x);
+                    return 1;
+                }
+                self.builtin(a)
+            }
+            // ulimit [-H|-S] [-a | -n -c -s -f -v -u -l -m -t [N|unlimited]]: 資源の上限 (既定は -f)
+            "ulimit" => {
+                const RES: &[(char, i32, &str, u64)] = &[
+                    ('c', libc::RLIMIT_CORE as i32, "core file size (blocks)", 512),
+                    ('d', libc::RLIMIT_DATA as i32, "data seg size (kbytes)", 1024),
+                    ('f', libc::RLIMIT_FSIZE as i32, "file size (blocks)", 512),
+                    ('l', libc::RLIMIT_MEMLOCK as i32, "max locked memory (kbytes)", 1024),
+                    ('m', libc::RLIMIT_RSS as i32, "max memory size (kbytes)", 1024),
+                    ('n', libc::RLIMIT_NOFILE as i32, "open files", 1),
+                    ('s', libc::RLIMIT_STACK as i32, "stack size (kbytes)", 1024),
+                    ('t', libc::RLIMIT_CPU as i32, "cpu time (seconds)", 1),
+                    ('u', libc::RLIMIT_NPROC as i32, "max user processes", 1),
+                    ('v', libc::RLIMIT_AS as i32, "virtual memory (kbytes)", 1024),
+                ];
+                let (mut hard, mut soft, mut all, mut which, mut val) = (false, false, false, vec![], None);
+                for x in a {
+                    if let Some(f) = x.strip_prefix('-').filter(|f| !f.is_empty()) {
+                        for c in f.chars() {
+                            match c {
+                                'H' => hard = true,
+                                'S' => soft = true,
+                                'a' => all = true,
+                                c => match RES.iter().find(|r| r.0 == c) {
+                                    Some(r) => which.push(*r),
+                                    None => {
+                                        eprintln!("ulimit: -{}: invalid option", c);
+                                        return 2;
+                                    }
+                                },
+                            }
+                        }
+                    } else {
+                        val = Some(x.clone());
+                    }
+                }
+                if all {
+                    which = RES.to_vec();
+                } else if which.is_empty() {
+                    which.push(RES[2]);
+                }
+                let get = |r: i32| {
+                    let mut l: libc::rlimit = unsafe { std::mem::zeroed() };
+                    unsafe { libc::getrlimit(r as _, &mut l) };
+                    l
+                };
+                let show = |v: libc::rlim_t, unit: u64| if v == libc::RLIM_INFINITY { "unlimited".to_string() } else { (v / unit).to_string() };
+                match val {
+                    None => {
+                        for (c, r, desc, unit) in &which {
+                            let l = get(*r);
+                            let v = show(if hard { l.rlim_max } else { l.rlim_cur }, *unit);
+                            if which.len() > 1 { println!("{:<32}(-{}) {}", desc, c, v) } else { println!("{}", v) }
+                        }
+                        0
+                    }
+                    Some(v) => {
+                        let (_, r, _, unit) = which[0];
+                        let n = match v.as_str() {
+                            "unlimited" => libc::RLIM_INFINITY,
+                            "hard" => get(r).rlim_max,
+                            "soft" => get(r).rlim_cur,
+                            v => match v.parse::<u64>() {
+                                Ok(n) => n.saturating_mul(unit) as libc::rlim_t,
+                                Err(_) => {
+                                    eprintln!("ulimit: {}: invalid number", v);
+                                    return 1;
+                                }
+                            },
+                        };
+                        let mut l = get(r);
+                        if hard || !soft {
+                            l.rlim_max = if hard { n } else { l.rlim_max };
+                        }
+                        if soft || !hard {
+                            l.rlim_cur = n;
+                        }
+                        if unsafe { libc::setrlimit(r as _, &l) } != 0 {
+                            eprintln!("ulimit: {}: {}", v, last_err());
+                            return 1;
+                        }
+                        0
+                    }
+                }
+            }
             "umask" => {
                 match a.first() {
                     None => {
@@ -1473,6 +1637,29 @@ impl Shell {
                 }
                 let flags: String = a.iter().filter(|x| (x.starts_with('-') || x.starts_with('+')) && x.len() > 1).flat_map(|x| x.chars().skip(1)).collect();
                 let names: Vec<String> = a.iter().filter(|x| !((x.starts_with('-') || x.starts_with('+')) && x.len() > 1)).cloned().collect();
+                // declare -F [NAME...] 関数の名前、declare -f [NAME...] 関数の中身 (なければ 1)
+                if flags.contains('f') || flags.contains('F') {
+                    let list: Vec<String> = if names.is_empty() {
+                        let mut v: Vec<String> = self.funcs.keys().cloned().collect();
+                        v.sort();
+                        v
+                    } else {
+                        names.clone()
+                    };
+                    let mut st = 0;
+                    for f in &list {
+                        let Some(body) = self.funcs.get(f) else {
+                            st = 1;
+                            continue;
+                        };
+                        if flags.contains('F') {
+                            if names.is_empty() { println!("declare -f {}", f) } else { println!("{}", f) }
+                        } else {
+                            println!("{}", func_text(f, body));
+                        }
+                    }
+                    return st;
+                }
                 if names.is_empty() && flags.contains('p') {
                     return 0;
                 }
@@ -1502,8 +1689,25 @@ impl Shell {
                             self.locals[frame].push((k.clone(), old, exported));
                         }
                     }
+                    if flags.contains('n') {
+                        // nameref: 値は指す先の名前
+                        match v.as_deref() {
+                            Some(t) if parse::valid_name(t) && t != k => {
+                                self.namerefs.insert(k.clone(), t.to_string());
+                            }
+                            Some(t) => {
+                                eprintln!("{}: {}: invalid variable name for name reference", name, t);
+                                return 1;
+                            }
+                            None => {}
+                        }
+                        continue;
+                    }
                     if flags.contains('i') {
                         self.int_vars.insert(k.clone());
+                    }
+                    if let Some(c) = flags.chars().rev().find(|c| matches!(c, 'l' | 'u')) {
+                        self.case_vars.insert(k.clone(), c);
                     }
                     if flags.contains('A') && !self.assoc.contains_key(&k) {
                         self.vars.remove(&k);
@@ -2394,6 +2598,21 @@ fn apply_redir(fd: i32, t: &RT) -> bool {
     true
 }
 
+/// declare -f の形: 中身はコマンドごとに 1 行 (ソースの字のまま)
+fn func_text(name: &str, body: &Compound) -> String {
+    let mut out = format!("{} () \n{{ \n", name);
+    match body {
+        Compound::Brace(list) => {
+            for it in list {
+                out.push_str(&format!("    {}{}\n", it.text, if it.bg { " &" } else { "" }));
+            }
+        }
+        _ => out.push_str("    ...\n"),
+    }
+    out.push('}');
+    out
+}
+
 fn echo(a: &[String]) -> i32 {
     let mut newline = true;
     let mut escapes = false;
@@ -2430,6 +2649,20 @@ fn echo(a: &[String]) -> i32 {
                 Some('c') => {
                     newline = false;
                     break;
+                }
+                Some('x') if cs.peek().is_some_and(|d| d.is_ascii_hexdigit()) => {
+                    // \xHH (1 か 2 けた)
+                    let mut v = 0u32;
+                    for _ in 0..2 {
+                        match cs.peek() {
+                            Some(d) if d.is_ascii_hexdigit() => {
+                                v = v * 16 + d.to_digit(16).unwrap();
+                                cs.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    s.push(char::from_u32(v).unwrap_or('?'));
                 }
                 Some('0') => {
                     let mut v = 0u32;

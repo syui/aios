@@ -18,6 +18,8 @@ const SIGS: &[(&str, i32)] = &[
     ("EXIT", 0),
     // bash: コマンドが失敗したとき (set -e で止まるのと同じところ)
     ("ERR", -1),
+    // bash: 関数 (と . のファイル) が終わったとき
+    ("RETURN", -2),
     ("HUP", 1),
     ("INT", 2),
     ("QUIT", 3),
@@ -142,13 +144,22 @@ pub fn take_pending() -> Vec<String> {
     (1..64).filter(|s| p & (1 << s) != 0).filter_map(|s| traps().get(&s).filter(|c| !c.is_empty()).cloned()).collect()
 }
 
-/// 失敗したコマンドのあと: ERR の trap (なければ None。trap の中の失敗では動かさない)
-pub fn take_err() -> Option<String> {
+/// 失敗したコマンドのあと: ERR の trap (trap の中の失敗では動かさない)
+pub fn take_err() {
+    run_pseudo(-1);
+}
+
+/// 関数が終わったとき: RETURN の trap
+pub fn run_return() {
+    run_pseudo(-2);
+}
+
+fn run_pseudo(sig: i32) -> Option<()> {
     static IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !mine() || IN.load(Ordering::Relaxed) {
         return None;
     }
-    let cmd = traps().get(&-1).filter(|c| !c.is_empty()).cloned()?;
+    let cmd = traps().get(&sig).filter(|c| !c.is_empty()).cloned()?;
     IN.store(true, Ordering::Relaxed);
     let sh = unsafe { SHELL };
     if !sh.is_null() {
@@ -158,7 +169,7 @@ pub fn take_err() -> Option<String> {
         sh.status = st;
     }
     IN.store(false, Ordering::Relaxed);
-    Some(cmd)
+    Some(())
 }
 
 /// シェルが終わるとき: EXIT の trap を 1 回だけ動かす

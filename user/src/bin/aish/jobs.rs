@@ -43,6 +43,12 @@ pub fn exit_code(st: i32) -> i32 {
 /// waitpid で分かったことをジョブに書く
 /// set -o pipefail
 pub static mut PIPEFAIL: bool = false;
+/// 前に前で待ったパイプラインの、コマンドごとのステータス ($PIPESTATUS)
+pub static mut PIPESTATUS: Vec<i32> = Vec::new();
+
+pub fn pipestatus() -> Vec<i32> {
+    unsafe { (*(&raw const PIPESTATUS)).clone() }
+}
 
 pub fn record(pid: i32, st: i32) {
     for j in jobs().iter_mut() {
@@ -78,6 +84,8 @@ pub fn foreground(idx: usize) -> i32 {
         let j = &mut jobs()[idx];
         match j.state {
             JobState::Done(s) => {
+                let all: Vec<i32> = j.pids.iter().map(|(_, s)| s.unwrap_or(0)).collect();
+                unsafe { *(&raw mut PIPESTATUS) = all };
                 jobs().remove(idx);
                 break s;
             }

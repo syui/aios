@@ -236,6 +236,29 @@ impl Parser {
                         continue;
                     }
                 }
+                // extglob: ?(a|b) *(..) +(..) @(..) !(..) は語のつづき (中の | も)
+                if c == '(' && w.ends_with(['?', '*', '+', '@', '!']) {
+                    let mut depth = 0;
+                    let mut k = self.pos;
+                    while let Some(&x) = self.src.get(k) {
+                        if x == '(' {
+                            depth += 1;
+                        } else if x == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else if x == '\n' {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if self.src.get(k) == Some(&')') {
+                        w.extend(&self.src[self.pos..=k]);
+                        self.pos = k + 1;
+                        continue;
+                    }
+                }
                 break;
             }
             match c {
