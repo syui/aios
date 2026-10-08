@@ -1,5 +1,5 @@
 // フォントの字を点にする (ab_glyph)。使う字だけをそのときに読む
-//   fontdue は読むときに全部の字を下ごしらえする。aifont (1 万 2 千字) と aifont-ja (1 万 5 千字) では
+//   fontdue は読むときに全部の字を下ごしらえする。aifont (2 万 5 千字) では
 //   それだけで aiwm と aiterm の起動が数秒かかっていた。形 (Metrics) は fontdue と同じ意味にしてある
 #![allow(dead_code)]
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};

@@ -19,9 +19,8 @@ use std::process::exit;
 use term::Term;
 use wl::{Arg, Conn};
 
+/// aifont (英字・日本語・Nerd Fonts のアイコンが 1 つに入っている)
 const FONT: &str = "/usr/share/fonts/aifont/aifont.ttf";
-/// aifont にない字 (日本語など) を描くフォント (aifont-ja パッケージ。なくてもよい)
-const FONT_JA: &str = "/usr/share/fonts/aifont/aifont-ja.ttf";
 const SIZE: f32 = 16.0;
 const PAD: usize = 4;
 const CURSOR: u32 = 0xf5c518;
@@ -66,9 +65,6 @@ struct App {
     focused: bool,
     // 文字
     font: glyph::Font,
-    /// aifont にない字のためのフォント
-    /// aifont-ja は、aifont にない字がはじめて出たときに読む。None はまだ読んでいない
-    font_ja: Option<Option<glyph::Font>>,
     glyphs: HashMap<(char, bool), Glyph>,
     cell_w: usize,
     cell_h: usize,
@@ -139,7 +135,6 @@ fn main() {
         waiting_frame: None,
         focused: false,
         font,
-        font_ja: None,
         glyphs: HashMap::new(),
         cell_w: cell_w.max(1),
         cell_h: cell_h.max(1),
@@ -598,14 +593,7 @@ impl App {
     }
 
     fn glyph(&mut self, c: char, bold: bool) -> &Glyph {
-        // aifont になければ aifont-ja (日本語)
-        if !self.glyphs.contains_key(&(c, bold)) && !self.font.has(c) && self.font_ja.is_none() {
-            self.font_ja = Some(std::fs::read(FONT_JA).ok().and_then(|d| glyph::Font::from_bytes(d).ok()));
-        }
-        let font = match &self.font_ja {
-            Some(Some(ja)) if !self.font.has(c) && ja.has(c) => ja,
-            _ => &self.font,
-        };
+        let font = &self.font;
         self.glyphs.entry((c, bold)).or_insert_with(|| {
             let (m, alpha) = font.rasterize(c, SIZE);
             let alpha = if bold {

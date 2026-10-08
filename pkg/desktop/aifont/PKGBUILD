@@ -1,21 +1,22 @@
-# aifont: aios のフォント (JetBrains Mono + Nerd Fonts + syui の字) とアイコン。git.syui.ai/ai/font をコミットで固定
+# aifont: aios のフォント (UDEV Gothic 35NF = JetBrains Mono + BIZ UDゴシック + Nerd Fonts に syui の字) とアイコン。
+#   git.syui.ai/ai/font をコミットで固定 (フォントは ai/font の Rust のプログラムで作る)
 #   /usr/share/fonts/aifont/aifont.ttf (デスクトップのプログラムが使う)
 #   /usr/share/icons/ai/ (ai.png ai.svg など。aisplash が使う。前は ai-icons パッケージ)
 pkgname=aifont
-# 自作のパッケージは版を 0.0.1 にそろえる (フォントそのものの版は 2.304)。
+# 自作のパッケージは版を 0.0.1 にそろえる (もとの UDEV Gothic は v2.1.0)。
 # 前の 2.304 より新しくするため epoch=1 (aipkg -Syu で上がる)
 pkgver=0.0.1
-pkgrel=2
+pkgrel=3
 epoch=1
-pkgdesc='aifont: JetBrains Mono with Nerd Fonts and custom glyphs, and the ai icons'
+pkgdesc='aifont: UDEV Gothic 35NF (JetBrains Mono, BIZ UDGothic, Nerd Fonts) with custom glyphs, and the ai icons'
 arch=('any')
 url='https://git.syui.ai/ai/font'
 license=('OFL-1.1' 'MIT')
-# アイコンは ai/font にまとめた。aipkg -Syu で ai-icons を外してこれを入れる
-replaces=('ai-icons')
-provides=('ai-icons')
-conflicts=('ai-icons')
-source=("git+https://git.syui.ai/ai/font#commit=aebde5e9326be920843345c216897ca584527221")
+# アイコンと日本語 (前の aifont-ja) は ai/font にまとめた。aipkg -Syu で ai-icons と aifont-ja を外してこれを入れる
+replaces=('ai-icons' 'aifont-ja')
+provides=('ai-icons' 'aifont-ja')
+conflicts=('ai-icons' 'aifont-ja')
+source=("git+https://git.syui.ai/ai/font#commit=0494e083d401cab50f2c3832d960bb0b5d4c87d2")
 sha256sums=('SKIP')
 
 package() {

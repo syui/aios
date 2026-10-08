@@ -45,7 +45,7 @@
       "rust":    { "aiboot": "0.0.1", "aikernel": "0.0.1", "base": "0.0.1", "aigpt": "0.0.1", "ailog": "0.0.1", "aimg": "0.0.1" },
       "c":       { "base-devel": "0.0.1", "claude": "0.0.1" },
       "shell":   { "aish-powerline": "0.0.1" },
-      "desktop": { "aifont": "0.0.1", "aifont-ja": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
+      "desktop": { "aifont": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
     },
 
     "linux": {
