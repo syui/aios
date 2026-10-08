@@ -182,6 +182,13 @@ fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
 /// 一度に運ぶ大きさ
 const CHUNK: usize = 64 * 1024;
 
+/// 中身を 0 にしない n バイト (すぐ全部書きこむか、書いた分だけ使うところ用)
+fn uninit(n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n);
+    unsafe { v.set_len(n) };
+    v
+}
+
 /// 待つことのないもの (ふつうのファイル、/dev/zero など、ディスク): 頼まれた分を最後まで運ぶ (Linux と同じ)。
 /// パイプや端末やソケットは、1 回分 (届いている分) だけ
 fn whole(f: &FileRef) -> bool {
@@ -191,9 +198,12 @@ fn whole(f: &FileRef) -> bool {
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
     let whole = whole(&f);
+    // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。0 で埋めておかなくてよい
+    let inode = matches!(f.borrow().kind, Kind::Inode(..));
     let mut done = 0;
     loop {
-        let mut tmp = vec![0u8; (len - done).min(CHUNK)];
+        let want = (len - done).min(CHUNK);
+        let mut tmp = if inode { uninit(want) } else { vec![0u8; want] };
         let n = match file::read(&f, &mut tmp) {
             Ok(n) => n,
             Err(e) if done == 0 => return Err(e),
@@ -213,7 +223,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let whole = whole(&f);
     let mut done = 0;
     loop {
-        let mut tmp = vec![0u8; (len - done).min(CHUNK)];
+        let mut tmp = uninit((len - done).min(CHUNK));
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = file::write(&f, &tmp);
         if r == Err(-file::EPIPE) {
@@ -236,7 +246,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?; // ESPIPE
-    let mut tmp = vec![0u8; len.min(64 * 1024)];
+    let mut tmp = uninit(len.min(64 * 1024));
     let n = ino.read_at(off.max(0) as usize, &mut tmp)?;
     out(buf, &tmp[..n])?;
     Ok(n as i64)
@@ -244,7 +254,7 @@ pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
 
 pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?;
-    let mut tmp = vec![0u8; len.min(64 * 1024)];
+    let mut tmp = uninit(len.min(64 * 1024));
     proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
     vfs::write_sealed(&ino, off.max(0) as usize, tmp.len())?;
     let n = ino.write_at(off.max(0) as usize, &tmp)?;

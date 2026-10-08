@@ -1220,27 +1220,43 @@ impl ExtFs {
 
     /// lb の物理ブロック (無い・未初期化なら 0)
     fn ext_find(&self, r: &Raw, lb: u64) -> Result<u64, i64> {
-        let mut node = r.0[40..100].to_vec();
-        for _ in 0..8 {
-            if u16_at(&node, 0) != EXT_MAGIC {
+        self.ext_run(r, lb).map(|(p, _)| p)
+    }
+
+    /// lb の物理ブロックと、そこから同じ extent でつづくブロックの数 (lb を含む)。
+    /// 無い・未初期化なら (0, 1)。木の節はブロックキャッシュの中でそのまま読む (写さない)
+    fn ext_run(&self, r: &Raw, lb: u64) -> Result<(u64, u64), i64> {
+        enum Step {
+            Found(u64, u64),
+            Child(u64),
+        }
+        fn step(node: &[u8], lb: u64) -> Result<Step, i64> {
+            if u16_at(node, 0) != EXT_MAGIC {
                 return Err(-EIO);
             }
-            let n = u16_at(&node, 2) as usize;
-            if u16_at(&node, 6) == 0 {
+            let n = (u16_at(node, 2) as usize).min((node.len() - 12) / 12);
+            if u16_at(node, 6) == 0 {
                 for i in 0..n {
                     let e = &node[12 + i * 12..24 + i * 12];
                     let (b, len) = (u32_at(e, 0) as u64, u16_at(e, 4) as u32);
                     let (len, uninit) = if len > EXT_INIT_MAX_LEN { (len - EXT_INIT_MAX_LEN, true) } else { (len, false) };
                     if lb >= b && lb < b + len as u64 {
-                        return Ok(if uninit { 0 } else { ExtFs::ext_leaf_start(e) + (lb - b) });
+                        let rest = b + len as u64 - lb;
+                        return Ok(if uninit { Step::Found(0, 1) } else { Step::Found(ExtFs::ext_leaf_start(e) + (lb - b), rest) });
                     }
                 }
-                return Ok(0);
+                return Ok(Step::Found(0, 1));
             }
-            let pick = (0..n).rev().find(|&i| u32_at(&node, 12 + i * 12) as u64 <= lb);
-            let Some(i) = pick else { return Ok(0) };
-            let child = ExtFs::ext_index_child(&node[12 + i * 12..24 + i * 12]);
-            node = self.read_block(child)?;
+            let pick = (0..n).rev().find(|&i| u32_at(node, 12 + i * 12) as u64 <= lb);
+            let Some(i) = pick else { return Ok(Step::Found(0, 1)) };
+            Ok(Step::Child(ExtFs::ext_index_child(&node[12 + i * 12..24 + i * 12])))
+        }
+        let mut next = step(&r.0[40..100], lb)?;
+        for _ in 0..8 {
+            match next {
+                Step::Found(p, n) => return Ok((p, n)),
+                Step::Child(c) => next = self.with_block(c, |d| step(d, lb))??,
+            }
         }
         Err(-EIO)
     }
@@ -1451,18 +1467,33 @@ impl ExtFs {
     // ---- 中身の読み書き ----
 
     fn read_data(&self, ino: u32, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
-        let mut r = self.read_inode(ino)?;
+        self.read_data_raw(ino, self.read_inode(ino)?, off, buf)
+    }
+
+    /// 読んである inode (r) で
+    fn read_data_raw(&self, ino: u32, mut r: Raw, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
         if r.flags() & INLINE_DATA_FL != 0 {
             return Err(-EIO);
         }
         let size = r.size() as usize;
         let len = buf.len().min(size.saturating_sub(off));
         let mut done = 0;
+        let extents = r.flags() & EXTENTS_FL != 0;
+        // いまの extent (ファイルのブロック fb から n 個が、ディスクの pb から並んでいる)。ブロックごとに木を引かない
+        let mut run: (u64, u64, u64) = (0, 0, 0);
         while done < len {
             let pos = off + done;
             let (fb, bo) = ((pos / self.bsize) as u64, pos % self.bsize);
             let n = (self.bsize - bo).min(len - done);
-            let b = self.map(ino, &mut r, fb, false)?;
+            if !(fb >= run.0 && fb < run.0 + run.2) {
+                run = if extents {
+                    let (p, k) = self.ext_run(&r, fb)?;
+                    (fb, p, if p == 0 { 1 } else { k })
+                } else {
+                    (fb, self.map(ino, &mut r, fb, false)?, 1)
+                };
+            }
+            let b = if run.1 == 0 { 0 } else { run.1 + (fb - run.0) };
             if b == 0 {
                 buf[done..done + n].fill(0);
             } else {
@@ -2059,8 +2090,9 @@ impl Inode for ExtInode {
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
-        match self.raw()?.mode() & S_IFMT {
-            S_IFREG => self.fs.read_data(self.ino, off, buf),
+        let r = self.raw()?;
+        match r.mode() & S_IFMT {
+            S_IFREG => self.fs.read_data_raw(self.ino, r, off, buf),
             S_IFDIR => Err(-EISDIR),
             _ => Err(-EINVAL),
         }
