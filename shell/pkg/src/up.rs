@@ -496,6 +496,124 @@ pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
     }
     text.push_str("]\n");
     let _ = fs::write(&file, text);
+    if let Some(root) = pkg.parent() {
+        let _ = aios_sync(root);
+    }
+}
+
+/// .aios.json の pkg を pkg/*/NAME/PKGBUILD にそろえる (形はそのまま、文字を書きかえる):
+/// 新しいパッケージを足し (自作のもの = upstream.json の skip が aios なら "aios"、ほかは "linux" の下の種類に)、
+/// 版がちがえば直し、PKGBUILD がなくなったものは消す。npm と uv の下は人が書くので見ない。変えた名前を返す
+pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
+    let path = root.join(".aios.json");
+    let Ok(mut text) = fs::read_to_string(&path) else { return Ok(vec![]) };
+    let json: Value = serde_json::from_str(&text).map_err(|e| format!(".aios.json: {}", e))?;
+    let pkg = root.join("pkg");
+    let own: Vec<String> = fs::read_to_string(pkg.join(FILE)).ok().and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok()).unwrap_or_default().iter().filter(|r| r["skip"] == "aios").filter_map(|r| r["name"].as_str().map(String::from)).collect();
+    const KINDS: [&str; 4] = ["rust", "c", "shell", "desktop"];
+    let mut changed = vec![];
+    // いまあるもの: (グループ, 種類, 名前) → 版
+    let mut have: Vec<(String, String, String, String)> = vec![];
+    for g in ["aios", "linux"] {
+        for k in KINDS {
+            if let Some(m) = json["pkg"][g][k].as_object() {
+                for (n, v) in m {
+                    have.push((g.into(), k.into(), n.clone(), v.as_str().unwrap_or("").into()));
+                }
+            }
+        }
+    }
+    let builds = pkgbuilds(&pkg);
+    for (name, p) in &builds {
+        let dir = p.parent().unwrap_or(Path::new("."));
+        let kind = dir.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        if !KINDS.contains(&kind.as_str()) {
+            continue;
+        }
+        let t = fs::read_to_string(p).unwrap_or_default();
+        let ver = scalar(&t, "pkgver").unwrap_or_default();
+        let ver = if ver.contains('$') { expand_var(dir, &t, "pkgver") } else { ver };
+        match have.iter().find(|h| h.2 == *name) {
+            Some(h) if h.3 == ver => {}
+            Some(_) => {
+                if aios_json(&path, name, &ver)? {
+                    text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    changed.push(name.clone());
+                }
+            }
+            None => {
+                let group = if own.contains(name) { "aios" } else { "linux" };
+                if let Some(t) = json_insert(&text, group, &kind, name, &ver) {
+                    text = t;
+                    changed.push(name.clone());
+                }
+            }
+        }
+    }
+    for (g, k, n, _) in &have {
+        if !builds.iter().any(|(b, _)| b == n)
+            && let Some(t) = json_remove(&text, g, k, n)
+        {
+            text = t;
+            changed.push(n.clone());
+        }
+    }
+    if !changed.is_empty() {
+        serde_json::from_str::<Value>(&text).map_err(|e| format!(".aios.json: would break: {}", e))?;
+        let up = regex::Regex::new(r#""updated":(\s*)"[^"]*""#).map_err(|e| e.to_string())?;
+        text = up.replace(&text, format!("\"updated\":${{1}}\"{}\"", today())).into_owned();
+        fs::write(&path, text).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
+/// "pkg" の中の "GROUP": { ... "KIND": { ... } } の { と } の位置
+fn json_object(text: &str, group: &str, kind: &str) -> Option<(usize, usize)> {
+    let pkg = text.find("\"pkg\"")?;
+    let g = pkg + text[pkg..].find(&format!("\"{}\"", group))?;
+    let k = g + text[g..].find(&format!("\"{}\"", kind))?;
+    let open = k + text[k..].find('{')?;
+    let mut depth = 0;
+    for (i, c) in text[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, open + i));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// KIND の { } の終わりに "NAME": "VER" を足す (いちばん後ろの値のすぐあと)
+fn json_insert(text: &str, group: &str, kind: &str, name: &str, ver: &str) -> Option<String> {
+    let (open, close) = json_object(text, group, kind)?;
+    let item = format!("\"{}\": \"{}\"", name, ver);
+    Some(match text[open..close].rfind('"') {
+        Some(q) => format!("{}, {}{}", &text[..open + q + 1], item, &text[open + q + 1..]),
+        None => format!("{} {} {}", &text[..open + 1], item, &text[close..]),
+    })
+}
+
+/// KIND の { } から "NAME": "..." を消す (前か後ろの , もいっしょに)
+fn json_remove(text: &str, group: &str, kind: &str, name: &str) -> Option<String> {
+    let (open, close) = json_object(text, group, kind)?;
+    let re = regex::Regex::new(&format!(r#""{}":\s*"[^"]*""#, regex::escape(name))).ok()?;
+    let m = re.find(&text[open..close])?;
+    let (mut a, mut b) = (open + m.start(), open + m.end());
+    let after = &text[b..close];
+    let comma_after = after.trim_start().starts_with(',');
+    if comma_after {
+        b += after.find(',').unwrap() + 1;
+        b += text[b..close].len() - text[b..close].trim_start_matches(' ').len();
+    } else if let Some(c) = text[open..a].rfind(',') {
+        a = open + c;
+    }
+    Some(format!("{}{}", &text[..a], &text[b..]))
 }
 
 /// PKGBUILD の版 ([epoch:]pkgver-pkgrel)。pkgver() でビルドのときに決めるものは "" (くらべない)
@@ -702,4 +820,73 @@ fn today() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     format!("{:04}-{:02}-{:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const J: &str = r#"{
+  "updated": "2000-01-01",
+  "pkg": {
+    "aios": {
+      "rust": { "base": "0.0.1" }
+    },
+    "linux": {
+      "rust": {
+        "awk": "1", "fd": "2",
+        "sed": "3"
+      },
+      "c": { "zlib": "1.3" },
+      "npm": { "pnpm": "1" }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn insert_and_remove() {
+        let t = json_insert(J, "linux", "rust", "new", "9").unwrap();
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["pkg"]["linux"]["rust"]["new"], "9");
+        assert!(t.contains(r#""sed": "3", "new": "9""#));
+        let t = json_insert(&t, "linux", "c", "xz", "5").unwrap();
+        assert!(t.contains(r#"{ "zlib": "1.3", "xz": "5" }"#));
+        for n in ["awk", "fd", "sed", "new"] {
+            let r = json_remove(&t, "linux", "rust", n).unwrap();
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert!(v["pkg"]["linux"]["rust"][n].is_null(), "{}", n);
+            assert_eq!(v["pkg"]["linux"]["rust"].as_object().unwrap().len(), 3);
+        }
+        // aios の rust と linux の rust をまちがえない
+        let r = json_remove(J, "aios", "rust", "base").unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert!(v["pkg"]["aios"]["rust"].as_object().unwrap().is_empty());
+        assert_eq!(v["pkg"]["linux"]["rust"]["awk"], "1");
+        assert!(json_remove(J, "linux", "rust", "nope").is_none());
+    }
+
+    #[test]
+    fn sync_dir() {
+        let root = std::env::temp_dir().join(format!("aios-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (k, n, v) in [("rust", "base", "0.0.1"), ("rust", "fd", "2"), ("rust", "sed", "4"), ("c", "xz", "5.8")] {
+            let d = root.join("pkg").join(k).join(n);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("PKGBUILD"), format!("pkgname={}\npkgver={}\npkgrel=1\n", n, v)).unwrap();
+        }
+        fs::write(root.join("pkg").join(FILE), "[\n  {\"name\":\"base\",\"skip\":\"aios\"}\n]\n").unwrap();
+        fs::write(root.join(".aios.json"), J).unwrap();
+        let mut ch = aios_sync(&root).unwrap();
+        ch.sort();
+        // awk と zlib は PKGBUILD がないので消え、sed は 4 に、xz は足される
+        assert_eq!(ch, ["awk", "sed", "xz", "zlib"]);
+        let v: Value = serde_json::from_str(&fs::read_to_string(root.join(".aios.json")).unwrap()).unwrap();
+        assert_eq!(v["pkg"]["linux"]["rust"], serde_json::json!({"fd": "2", "sed": "4"}));
+        assert_eq!(v["pkg"]["linux"]["c"], serde_json::json!({"xz": "5.8"}));
+        assert_eq!(v["pkg"]["linux"]["npm"]["pnpm"], "1");
+        assert_ne!(v["updated"], "2000-01-01");
+        assert!(aios_sync(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
 }
