@@ -321,7 +321,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
         }
         if pt.find(start).is_none() && pt.find(seg_end - 1).is_none() {
             // ふつう: ページはファイルから、触れたときに読む (filesz の先は 0)
-            let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz };
+            let back = Backing::File { ino: ino.clone(), off: off - (va - start), fend: va + filesz, ver: crate::vm::file_ver(ino) };
             pt.map(start, seg_end, prot, false, back).ok_or(-ENOMEM)?;
             pt.set_name(start, path);
         } else {

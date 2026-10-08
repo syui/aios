@@ -849,7 +849,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             // fend はここではまだ「off から先のファイルの長さ」。場所が決まってから va にする
             crate::file::Kind::Inode(ino, p) if !ino.meta().is_dir() => {
                 path = Some(p.clone());
-                Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off) }
+                Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off), ver: crate::vm::file_ver(ino) }
             }
             // 画面 (/dev/fb0): フレームバッファのページをそのまま
             crate::file::Kind::Fb => {
@@ -883,7 +883,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     };
     let back = match back {
         // ファイルの終わりの va (その先は 0)
-        Backing::File { ino, off, fend } => Backing::File { ino, off, fend: va.saturating_add(fend) },
+        Backing::File { ino, off, fend, ver } => Backing::File { ino, off, fend: va.saturating_add(fend), ver },
         b => b,
     };
     let shared = flags & MAP_SHARED != 0;
