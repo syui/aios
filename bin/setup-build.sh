@@ -6,7 +6,7 @@
 #
 # 入れるもの:
 #   apt:    clang-20 llvm-20 lld (llvm のビルドの途中の道具、ffmpeg の nm と strip)、cmake ninja-build pkg-config、
-#           flex bison glslang-tools libexpat1-dev (mesa と wayland-scanner)、qemu-user-static (PKGBUILD は qemu-aarch64 で
+#           flex bison glslang-tools libexpat1-dev (mesa と wayland-scanner)、libwayland-bin (gtk3 の wayland-scanner)、qemu-user-static (PKGBUILD は qemu-aarch64 で
 #           aios のプログラムを動かす)、qemu-system-arm (bin/run.sh)、mtools dosfstools fdisk e2fsprogs (bin/mkdisk.sh)、
 #           gcc-aarch64-linux-gnu、xz-utils zstd unzip libarchive-tools、git gnupg
 #   pip:    meson、mako、pyyaml (mesa)
@@ -46,6 +46,7 @@ want pkg-config pkg-config
 want flex flex
 want bison bison
 want glslangValidator glslang-tools
+want wayland-scanner libwayland-bin
 want qemu-aarch64-static qemu-user-static
 want qemu-system-aarch64 qemu-system-arm
 want mcopy mtools
