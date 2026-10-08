@@ -133,7 +133,32 @@ pub fn intr() {
             crate::proc::wakeup(&TX as *const _ as usize);
         }
     }
+    rx();
+}
+
+/// 受信を止めている (端末の入力がいっぱい)
+static RX_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 端末が読まれて場所が空いたら (tty::read から): 止めていた受信を再開して、たまっていたものを読む
+pub fn rx_resume() {
+    if unsafe { BASE } == 0 || !RX_STOPPED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let im = mmio::r32(reg(IMSC));
+    mmio::w32(reg(IMSC), im | INT_RX | INT_RT);
+    rx();
+}
+
+/// FIFO から読んで端末へ。端末がいっぱいなら、読まずに受信の割り込みを止める (流れの制御: 文字は QEMU に残り、
+/// 送り手 (端末に打つ人や test/vm.py) が待たされる。捨てない)
+fn rx() {
     while mmio::r32(reg(FR)) & FR_RXFE == 0 {
+        if !crate::tty::console_room() {
+            let im = mmio::r32(reg(IMSC));
+            mmio::w32(reg(IMSC), im & !(INT_RX | INT_RT));
+            RX_STOPPED.store(true, Ordering::Release);
+            return;
+        }
         let c = mmio::r32(reg(DR)) as u8;
         // Ctrl-] : 固まって見えるときのために、すべてのスレッドの状態をじかに出す
         // (シェルが動かなくても、カーネルが生きていれば出る。Linux の SysRq のかわり)
