@@ -326,8 +326,8 @@ impl Proc {
         tf.spsr = 0; // EL0t, 割り込み許可
     }
 
-    /// 同じスレッドグループの他の Proc
-    fn siblings(&self) -> impl Iterator<Item = &'static mut Proc> {
+    /// 同じスレッドグループの他の Proc (リーダーも)
+    pub fn siblings(&self) -> impl Iterator<Item = &'static mut Proc> {
         let (tgid, pid) = (self.tgid, self.pid);
         procs().iter_mut().filter(move |p| p.state != State::Unused && p.tgid == tgid && p.pid != pid)
     }

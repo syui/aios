@@ -20,6 +20,7 @@ pub const SIGCONT: i32 = 18;
 pub const SIGSTOP: i32 = 19;
 pub const SIGURG: i32 = 23;
 pub const SIGWINCH: i32 = 28;
+pub const SIGSYS: i32 = 31;
 
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
@@ -207,6 +208,17 @@ pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
     }
 }
 
+/// seccomp の TRAP: 自分のスレッドに SIGSYS を送る。ブロックか無視していたら受け取れないので終わる (Linux と同じ)
+pub fn force_sigsys(nr: u64, pc: u64, errno: u16) {
+    let p = proc::current();
+    if p.sig_mask & bit(SIGSYS) != 0 || ignored(p, SIGSYS) {
+        proc::die(SIGSYS);
+    }
+    // SYS_SECCOMP (1)
+    let info = SigInfo { code: 1, addr: pc, status: nr as i32, timerid: errno as i32, ..SigInfo::from(1) };
+    send_thread(p, SIGSYS, info);
+}
+
 /// プロセス (スレッドグループ) に送る。受け取れるスレッドを選ぶ
 pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
     let b = bit(sig);
@@ -330,6 +342,13 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
     put(&mut b, 8, &i.code.to_le_bytes());
     match sig {
         SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => put(&mut b, 16, &i.addr.to_le_bytes()),
+        // seccomp の TRAP: si_errno、si_call_addr、si_syscall、si_arch
+        SIGSYS => {
+            put(&mut b, 4, &i.timerid.to_le_bytes());
+            put(&mut b, 16, &i.addr.to_le_bytes());
+            put(&mut b, 24, &i.status.to_le_bytes());
+            put(&mut b, 28, &crate::seccomp::AUDIT_ARCH_AARCH64.to_le_bytes());
+        }
         SIGCHLD => {
             put(&mut b, 16, &i.pid.to_le_bytes());
             put(&mut b, 20, &i.uid.to_le_bytes());

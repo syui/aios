@@ -33,6 +33,7 @@ mod proc;
 mod sd;
 mod smp;
 mod procfs;
+mod seccomp;
 mod sysfs;
 mod rand;
 mod signal;

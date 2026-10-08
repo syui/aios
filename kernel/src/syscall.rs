@@ -229,6 +229,7 @@ nrs! {
     PIDFD_SEND_SIGNAL = 424,
     PIDFD_OPEN = 434,
     LANDLOCK_CREATE_RULESET = 444,
+    SECCOMP = 277,
     LANDLOCK_ADD_RULE = 445,
     LANDLOCK_RESTRICT_SELF = 446,
     PRLIMIT64 = 261,
@@ -261,6 +262,27 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     proc::current().orig_x0 = tf.x[0];
     proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
     count(nr);
+    // seccomp: かかっていれば、フィルタの答えにしたがう
+    if let Some(s) = proc::current().cred.seccomp.clone() {
+        let args = [a[0], a[1], a[2], a[3], a[4], a[5]];
+        match crate::seccomp::check(&s, nr, &args, tf.elr) {
+            crate::seccomp::Verdict::Allow => {}
+            crate::seccomp::Verdict::Errno(e) => {
+                tf.x[0] = e as u64;
+                strace(nr, &a, Err(e));
+                return None;
+            }
+            crate::seccomp::Verdict::Trap(errno) => {
+                signal::force_sigsys(nr, tf.elr, errno);
+                tf.x[0] = (-ENOSYS) as u64;
+                return None;
+            }
+            crate::seccomp::Verdict::Kill => {
+                println!("seccomp: pid {} killed at syscall {}", proc::current().pid, nr);
+                proc::die(signal::SIGSYS);
+            }
+        }
+    }
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -373,6 +395,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
         PIDFD_OPEN => sys_pidfd_open(int(a[0]), a[1]),
         LANDLOCK_CREATE_RULESET => crate::landlock::create_ruleset(a[0] as usize, a[1] as usize, a[2]),
+        SECCOMP => crate::seccomp::sys_seccomp(a[0], a[1], a[2] as usize),
         LANDLOCK_ADD_RULE => crate::landlock::add_rule(a[0], a[1], a[2] as usize, a[3]),
         LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
@@ -430,7 +453,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),
         RT_SIGPROCMASK => signal::rt_sigprocmask(a[0], a[1] as usize, a[2] as usize),
         RT_SIGACTION => signal::rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
-        PRCTL => sys_prctl(a[0], a[1] as usize),
+        PRCTL => sys_prctl(a[0], a[1] as usize, a[2] as usize),
         SCHED_YIELD => {
             proc::yield_voluntary();
             Ok(0)
@@ -603,6 +626,10 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
     let a = tf.x;
     let p = proc::current();
+    // seccomp がかかっていれば、フィルタを通すためにふつうの道へ
+    if p.cred.seccomp.is_some() {
+        return false;
+    }
     if let Some(c) = FAST.get(a[8] as usize) {
         c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -1402,8 +1429,10 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     }
 }
 
-/// prctl: 名前の設定と取得 (PR_SET_NAME / PR_GET_NAME) のほかは何もしない
-fn sys_prctl(op: u64, arg: usize) -> R {
+/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp。ほかは何もしない
+fn sys_prctl(op: u64, arg: usize, arg3: usize) -> R {
+    const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_SECCOMP: u64 = 22;
     const PR_SET_NAME: u64 = 15;
     const PR_GET_NAME: u64 = 16;
     const PR_SET_NO_NEW_PRIVS: u64 = 38;
@@ -1418,6 +1447,8 @@ fn sys_prctl(op: u64, arg: usize) -> R {
             p.cred.no_new_privs = true;
         }
         PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
+        PR_GET_SECCOMP => return Ok(crate::seccomp::mode(&p.cred).0 as i64),
+        PR_SET_SECCOMP => return crate::seccomp::prctl_set(arg as u64, arg3),
         PR_SET_NAME => {
             let mut b = [0u8; 16];
             p.pt().copy_in(&mut b[..15], arg).ok_or(-14)?;

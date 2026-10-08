@@ -1,18 +1,22 @@
-// aibox: コマンドを砂場 (landlock) の中で動かす
-//   aibox [-w PATH]... [-n PORT]... [--no-net] [-v] [--] CMD [ARG]...
+// aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
+//   aibox [-w PATH]... [-n PORT]... [--no-net] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
 //   --no-net で TCP はどこへもつなげない。-n PORT でその口だけつなげる (--no-net がなくても、-n があればそれだけ)。
+//   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
+//   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
 //   CMD がなければ $SHELL (なければ /bin/sh)。-w の ~ はホーム
 //   /etc/claude-code/managed-mcp.json は aish --mcp をこれで起こす (Claude が動かすものはみな砂場の中)。
 //   root のする操作は aios do (aiosd が wheel の人かを見てする) を通す
 #[path = "../lib/landlock.rs"]
 mod landlock;
+#[path = "../lib/seccomp.rs"]
+mod seccomp;
 
 use std::os::unix::process::CommandExt;
 
 fn usage() -> ! {
-    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [-v] [--] CMD [ARG]...");
+    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
     std::process::exit(2);
 }
 
@@ -21,6 +25,8 @@ fn main() {
     let mut write = landlock::default_write();
     let mut ports: Option<Vec<u16>> = None;
     let mut verbose = false;
+    let mut deny: Vec<u32> = seccomp::DEFAULT_DENY.iter().filter_map(|n| seccomp::number(n)).collect();
+    let mut kill: Vec<u32> = vec![];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -41,6 +47,17 @@ fn main() {
             }
             "--no-net" => {
                 ports.get_or_insert_with(Vec::new);
+            }
+            "--deny" | "--kill" => {
+                let opt = args[i].clone();
+                i += 1;
+                for n in args.get(i).unwrap_or_else(|| usage()).split(',').filter(|n| !n.is_empty()) {
+                    let Some(v) = seccomp::number(n) else {
+                        eprintln!("aibox: {}: unknown system call", n);
+                        std::process::exit(2);
+                    };
+                    if opt == "--deny" { deny.push(v) } else { kill.push(v) }
+                }
             }
             "-v" => verbose = true,
             "-h" | "--help" => usage(),
@@ -72,6 +89,14 @@ fn main() {
             eprintln!("aibox: {}", e);
             std::process::exit(1);
         }
+    }
+    // システムコールをしぼる (landlock が no_new_privs をつけたあとで)
+    if let Err(e) = seccomp::restrict(&deny, &kill) {
+        eprintln!("aibox: {}", e);
+        std::process::exit(1);
+    }
+    if verbose {
+        eprintln!("aibox: seccomp deny {} kill {}", deny.len(), kill.len());
     }
     // 中のプログラムが「どこに書けるか」を知れるように (aish --mcp が Permission denied のときに教える)
     let writable: Vec<String> = write.iter().filter(|w| std::path::Path::new(w).exists()).cloned().collect();
