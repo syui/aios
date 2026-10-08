@@ -94,7 +94,9 @@ pub fn build(root: &Path, name: &str) -> Result<Value, String> {
         let _ = fs::remove_file(kdir.join(f));
     }
     sh(Command::new("bin/mkrepo.sh").arg(kdir.strip_prefix(root).unwrap_or(&kdir)).current_dir(root))?;
-    Ok(json!({ "name": name, "kind": kind, "file": file, "removed": removed }))
+    // .aios.json に新しいパッケージを足す (版がちがえば直す)
+    let aios_json = crate::up::aios_sync(root).unwrap_or_default();
+    Ok(json!({ "name": name, "kind": kind, "file": file, "removed": removed, "aios_json": aios_json }))
 }
 
 /// push: ai/repo とくらべて、bin/gitea.sh repo で送る
