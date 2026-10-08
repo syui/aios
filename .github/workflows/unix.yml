@@ -105,6 +105,8 @@ jobs:
           fi
           st=0
           python3 test/vm.py put test/vm-check.sh /tmp/vm-check.sh && python3 test/vm.py run 'sh /tmp/vm-check.sh' -t 600 || st=$?
+          # 失敗したら、シリアルの終わりを見せる (中で何が起きたか)
+          [ "$st" = 0 ] || python3 test/vm.py log 60
           python3 test/vm.py stop || true
           exit $st
 
