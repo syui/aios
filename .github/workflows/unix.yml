@@ -7,8 +7,15 @@ on:
   push:
     branches:
     - unix
+    # イメージ (base, aikernel, aiboot をこのソースから、ほかは ai/repo から) が変わらないものでは動かさない
     paths-ignore:
     - '**.md'
+    - '.claude/**'
+    - 'pkg/c/**'
+    - 'pkg/desktop/**'
+    - 'pkg/pkg.json'
+    - 'pkg/upstream.json'
+    - 'desktop/**'
   workflow_dispatch:
 
 permissions:
@@ -65,8 +72,8 @@ jobs:
       - name: Boot test
         run: |
           # UEFI → aiboot → カーネル → init → swap.service まで来るか。
-          # GICv2 と、Mac の HVF と同じ GICv3 (仮想タイマ) の両方で
-          for gic in "" 3; do
+          # Mac の HVF と同じ GICv3 (仮想タイマ) で。GICv2 は次の VM test で起こす
+          for gic in 3; do
             AIOS_GIC=$gic bin/run.sh < /dev/null > boot.log 2>&1 &
             ok=
             for i in $(seq 1 150); do
@@ -83,6 +90,22 @@ jobs:
             cat boot.log
             [ -n "$ok" ] || exit 1
           done
+
+      - name: VM test
+        run: |
+          # GICv2 で起こしてプロンプトまで待ち、中で短いたしかめ (test/vm-check.sh: /sys と /proc、
+          # イメージのコマンド、sh の名前の aish、sudo)。シリアルの端末を test/vm.py が持つ
+          start=$(python3 test/vm.py start)
+          echo "$start"
+          if ! echo "$start" | grep -q '"ready": true'; then
+            python3 test/vm.py log 80
+            python3 test/vm.py stop || true
+            exit 1
+          fi
+          st=0
+          python3 test/vm.py put test/vm-check.sh /tmp/vm-check.sh && python3 test/vm.py run 'sh /tmp/vm-check.sh' -t 600 || st=$?
+          python3 test/vm.py stop || true
+          exit $st
 
       - name: Assets
         run: |

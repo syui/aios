@@ -84,9 +84,20 @@ class Serve:
                 os.write(self.m, b'\x1b[24;1R')
             with self.cv:
                 self.buf += d
+                self.last = time.time()
                 self.cv.notify_all()
 
     dead = False
+    last = 0.0
+
+    def wait_quiet(self, quiet, timeout):
+        # 出力が quiet 秒とだえるまで待つ (aish が行を描き終わり、打ったコマンドが動きだした)
+        end = time.time() + timeout
+        while time.time() < end:
+            if time.time() - self.last >= quiet:
+                return True
+            time.sleep(0.1)
+        return False
 
     def wait_for(self, pat, timeout):
         end = time.time() + timeout
@@ -131,13 +142,10 @@ class Serve:
         with self.cv:
             self.buf = b''
         os.write(self.m, ('base64 -d > %s; echo %s $?\r' % (shlex.quote(path), tag)).encode())
-        # 行が打ち終わって base64 が動きだす (こだまの行の終わりに改行が出る) まで待つ。
-        # 決まった時間だけ待つと、重いときに中身が行の編集のほうへ入ってしまう
-        if self.wait_for(re.compile(re.escape(('%s $?' % tag).encode()) + rb'\r*\n'), 120)[0] is None:
-            os.write(self.m, b'\x03')
-            self.wait_for(PROMPT, 5)
-            return {'timeout': True}
-        time.sleep(0.2)
+        # 行を描き終わって base64 が動きだす (出力がしずかになる) まで待つ。決まった時間だけ待つと、
+        # 重いときに中身が行の編集のほうへ入ってしまう (長い行は画面の幅で切って描くので、こだまの文字では待てない)
+        time.sleep(0.3)
+        self.wait_quiet(1.0, 120)
         for i in range(0, len(b64), 4096):
             os.write(self.m, b64[i:i + 4096].replace('\n', '\r').encode())
         os.write(self.m, b'\x04')
