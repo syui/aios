@@ -12,6 +12,7 @@
 //   /proc/stat (CPU の時間、btime、processes ...), /proc/loadavg, /proc/version (ps や top、psutil が読む)
 //   /proc/vmstat, /proc/diskstats (vmstat や iostat、psutil が読む)
 //   /proc/net/tcp, udp  ソケットの一覧 (ss や netstat が読む)
+//   /proc/net/dev       インターフェースごとの送り受けの数 (psutil や ifconfig が読む)
 //   /proc/net/pnp       DHCP でもらった DNS (Linux の ip=dhcp と同じ形。/etc/resolv.conf はここへのリンク)
 //   /proc/sys/...       カーネルの値 (sysctl.rs の表。root は書ける)
 use crate::proc::{self, Proc, State};
@@ -46,6 +47,8 @@ enum Node {
     NetUdp,
     NetSockstat,
     NetSnmp,
+    /// /proc/net/dev (インターフェースごとの送り受けの数。psutil や ifconfig が読む)
+    NetDev,
     /// まだ中身のない /proc/net のファイル (見出しだけ。netstat が読む): NET_STUBS の番号
     NetStub(u8),
     KernelCmdline,
@@ -131,6 +134,7 @@ impl ProcInode {
             Node::NetUdp => 17,
             Node::NetSockstat => 37,
             Node::NetSnmp => 38,
+            Node::NetDev => 39,
             Node::NetStub(i) => 18 + i as u64,
             Node::SysDir(i, d) => 0x100 + i as u64 * 8 + d as u64,
             Node::Sys(i) => 0x1000 + i as u64,
@@ -221,6 +225,14 @@ impl ProcInode {
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
+            Node::NetDev => {
+                let mut s = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+                for (name, lo) in [("lo", true), ("eth0", false)] {
+                    let c = crate::net::stats(lo);
+                    s += &format!("{:>6}: {:>8} {:>7}    0    0    0     0          0         0 {:>8} {:>7}    0    0    0     0       0          0\n", name, c[0], c[1], c[2], c[3]);
+                }
+                s
+            }
             Node::NetTcp => crate::socket::proc_net(true),
             Node::NetUdp => crate::socket::proc_net(false),
             Node::NetSockstat => crate::socket::proc_sockstat(),
@@ -578,6 +590,7 @@ impl Inode for ProcInode {
             (Node::NetDir, "udp") => Node::NetUdp,
             (Node::NetDir, "sockstat") => Node::NetSockstat,
             (Node::NetDir, "snmp") => Node::NetSnmp,
+            (Node::NetDir, "dev") => Node::NetDev,
             (Node::NetDir, n) if NET_STUBS.iter().any(|(s, _)| *s == n) => Node::NetStub(NET_STUBS.iter().position(|(s, _)| *s == n).unwrap() as u8),
             (Node::Root, "sys") => Node::SysDir(0, 0),
             (Node::SysDir(i, d), _) => match crate::sysctl::lookup(i as usize, d as usize, name).ok_or(-ENOENT)? {
@@ -646,6 +659,7 @@ impl Inode for ProcInode {
                 add("udp".into(), Node::NetUdp);
                 add("sockstat".into(), Node::NetSockstat);
                 add("snmp".into(), Node::NetSnmp);
+                add("dev".into(), Node::NetDev);
                 for (i, (n, _)) in NET_STUBS.iter().enumerate() {
                     add((*n).into(), Node::NetStub(i as u8));
                 }

@@ -18,7 +18,7 @@ pub fn init() {
                         let _ = vfs::mount(d, tmpfs::new_root());
                     }
                 }
-                let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n", crate::block::name(), kind);
+                let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\n", crate::block::name(), kind);
                 // FAT の boot の区画 (ESP / ラズパイの boot) を /boot に
                 if let Some(p) = crate::block::boot() {
                     match crate::vfat::FatFs::mount(p) {
@@ -118,6 +118,9 @@ fn setup_dirs(mtab: &str) {
     }
     if vfs::mkdir_p("proc", 0o555).is_ok() {
         let _ = vfs::mount("proc", crate::procfs::new_root());
+    }
+    if vfs::mkdir_p("sys", 0o555).is_ok() {
+        let _ = vfs::mount("sys", crate::sysfs::new_root());
     }
     // df などが読むマウント表 (起動のたびに書きなおす)
     if let Ok(etc) = vfs::resolve("", "etc", true) {

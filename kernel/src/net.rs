@@ -52,6 +52,22 @@ pub struct NetDev {
 
 /// eth0 のいまのアドレス (自分あてかを見分ける。なければ 0)
 static ETH_ADDR: AtomicU32 = AtomicU32::new(0);
+/// 送り受けの数 (eth0 と lo): 受けたバイト, 受けたフレーム, 出したバイト, 出したフレーム
+static ETH_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+static LO_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn count(lo: bool, rx: bool, len: usize) {
+    let s = if lo { &LO_STATS } else { &ETH_STATS };
+    let i = if rx { 0 } else { 2 };
+    s[i].fetch_add(len as u64, Ordering::Relaxed);
+    s[i + 1].fetch_add(1, Ordering::Relaxed);
+}
+
+/// (受けたバイト, 受けたフレーム, 出したバイト, 出したフレーム) (/sys/class/net と /proc/net/dev)
+pub fn stats(lo: bool) -> [u64; 4] {
+    let s = if lo { &LO_STATS } else { &ETH_STATS };
+    [0, 1, 2, 3].map(|i| s[i].load(Ordering::Relaxed))
+}
 
 /// 127.0.0.0/8 か eth0 のアドレス
 fn is_local(ip: &[u8]) -> bool {
@@ -76,12 +92,14 @@ impl Device for NetDev {
 
     fn receive(&mut self, _t: Instant) -> Option<(Rx, Tx<'_>)> {
         if let Some(frame) = self.lo.pop_front() {
+            count(true, true, frame.len());
             return Some((Rx(frame), Tx(self)));
         }
         if !self.virtio.can_send() {
             return None;
         }
         let frame = self.virtio.recv()?;
+        count(false, true, frame.len());
         Some((Rx(frame), Tx(self)))
     }
 
@@ -113,8 +131,10 @@ impl TxToken for Tx<'_> {
         let mut buf = alloc::vec![0u8; len];
         let r = f(&mut buf);
         if loops_back(&buf) {
+            count(true, false, len);
             self.0.lo.push_back(buf);
         } else {
+            count(false, false, len);
             self.0.virtio.send(len, |b| b.copy_from_slice(&buf));
         }
         r
