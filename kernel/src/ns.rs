@@ -17,6 +17,7 @@ use core::cell::RefCell;
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_NEWPID: u64 = 0x2000_0000;
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
 
 const EPERM: i64 = 1;
 
@@ -24,6 +25,7 @@ const EPERM: i64 = 1;
 pub const INIT_UTS: u64 = 4026531838;
 pub const INIT_NET: u64 = 4026531840;
 pub const INIT_PID: u64 = 4026531836;
+pub const INIT_MNT: u64 = 4026531841;
 const EINVAL: i64 = 22;
 
 static mut NEXT_ID: u64 = 4026532000;
@@ -66,10 +68,16 @@ pub struct Ns {
     pub uts: Option<Rc<Uts>>,
     pub net: Option<Rc<Net>>,
     pub pid: Option<Rc<Pid>>,
+    /// マウントの表 (vfs.rs)
+    pub mnt: Option<Rc<crate::vfs::MountNs>>,
 }
 
 impl Ns {
-    pub const INIT: Ns = Ns { uts: None, net: None, pid: None };
+    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None };
+
+    pub fn mnt_id(&self) -> u64 {
+        self.mnt.as_ref().map_or(INIT_MNT, |m| m.id)
+    }
 
     pub fn pid_children_id(&self) -> u64 {
         self.pid.as_ref().map_or(INIT_PID, |p| p.id)
@@ -91,7 +99,7 @@ pub fn net() -> Option<u64> {
 }
 
 /// flags の CLONE_NEW* のうち、扱えるもの
-pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID;
+pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS;
 
 /// cred の namespace を flags のぶん新しくする (clone の子と unshare)
 pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
@@ -107,6 +115,9 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     }
     if flags & CLONE_NEWNET != 0 {
         c.ns.net = Some(Rc::new(Net { id: next_id() }));
+    }
+    if flags & CLONE_NEWNS != 0 {
+        c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id()));
     }
     if flags & CLONE_NEWPID != 0 {
         // 入れ子はできない

@@ -143,8 +143,8 @@ pub fn write_sealed(ino: &InodeRef, off: usize, len: usize) -> Result<(), i64> {
 }
 
 static mut ROOT: Option<InodeRef> = None;
-/// (マウント先の id, マウントしたものの根)
-static mut MOUNTS: Vec<((usize, u64), InodeRef)> = Vec::new();
+/// ルートの (もと, 種類) (/proc/mounts の 1 行目)
+static mut ROOT_INFO: (String, String) = (String::new(), String::new());
 static mut NEXT_FS: usize = 0;
 
 pub fn new_fs_id() -> usize {
@@ -154,33 +154,114 @@ pub fn new_fs_id() -> usize {
     }
 }
 
-pub fn set_root(r: InodeRef) {
-    unsafe { *(&raw mut ROOT) = Some(r) };
+pub fn set_root(r: InodeRef, source: &str, fstype: &str) {
+    unsafe {
+        *(&raw mut ROOT) = Some(r);
+        *(&raw mut ROOT_INFO) = (source.into(), fstype.into());
+    }
 }
 
 pub fn root() -> InodeRef {
     unsafe { (*(&raw const ROOT)).clone().expect("no root filesystem") }
 }
 
-/// dir (すでにあるディレクトリ) の上に fs の根をかぶせる
-pub fn mount(path: &str, fsroot: InodeRef) -> Result<(), i64> {
-    let dir = resolve("", path, true)?;
+// ---- マウント表と、マウントの namespace ----
+// マウントは「ディレクトリ (id) の上に、ほかの根をかぶせる」こと。表は namespace ごと (CLONE_NEWNS で写す)。
+// パスをたどるとき (cross)、いまのプロセスの表を見る。プロセスがいない (起動中) ならはじめの表
+
+#[derive(Clone)]
+pub struct Mount {
+    /// マウント先のディレクトリの id
+    at: (usize, u64),
+    root: InodeRef,
+    source: String,
+    /// マウント先のパス (先頭 / なし。/proc/mounts 用)
+    target: String,
+    fstype: String,
+}
+
+pub struct MountNs {
+    pub id: u64,
+    list: core::cell::RefCell<Vec<Mount>>,
+}
+
+static mut INIT_MNT: Option<Rc<MountNs>> = None;
+/// 生きている表 (sync で全部を書き出すため)
+static mut ALL_MNT: Vec<alloc::rc::Weak<MountNs>> = Vec::new();
+
+fn init_mnt() -> Rc<MountNs> {
+    unsafe {
+        (*(&raw mut INIT_MNT))
+            .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, list: core::cell::RefCell::new(Vec::new()) }))
+            .clone()
+    }
+}
+
+/// いまのプロセスのマウント表
+fn current_mnt() -> Rc<MountNs> {
+    crate::proc::current_mnt().unwrap_or_else(init_mnt)
+}
+
+/// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)
+pub fn new_mnt_ns(id: u64) -> Rc<MountNs> {
+    let n = Rc::new(MountNs { id, list: core::cell::RefCell::new(current_mnt().list.borrow().clone()) });
+    unsafe {
+        let all = &mut *(&raw mut ALL_MNT);
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Rc::downgrade(&n));
+    }
+    n
+}
+
+/// dir (すでにあるディレクトリ) の上に fs の根をかぶせる (いまの表に)
+pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result<(), i64> {
+    let (target, dir) = lookup("", path, true)?;
     if !dir.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    unsafe { (*(&raw mut MOUNTS)).push((dir.id(), fsroot)) };
+    current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into() });
     Ok(())
+}
+
+/// path にかぶせてあるもの (いちばん上) を外す
+pub fn umount(path: &str) -> Result<(), i64> {
+    let top = resolve("", path, true)?;
+    let ns = current_mnt();
+    let mut l = ns.list.borrow_mut();
+    let i = l.iter().rposition(|m| m.root.id() == top.id()).ok_or(-EINVAL)?;
+    // その上にまだかぶせてあるものがあれば外せない
+    if l[i + 1..].iter().any(|m| m.at == top.id()) {
+        return Err(-16); // EBUSY
+    }
+    l.remove(i);
+    Ok(())
+}
+
+/// /proc/mounts (いまの表)
+pub fn mounts_text() -> String {
+    mounts_text_of(crate::proc::current_mnt())
+}
+
+/// /proc/PID/mounts (ns の表。None ははじめのもの)
+pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
+    let (src, ty) = unsafe { (*(&raw const ROOT_INFO)).clone() };
+    let mut s = alloc::format!("{} / {} rw 0 0\n", src, ty);
+    for m in ns.unwrap_or_else(init_mnt).list.borrow().iter() {
+        s.push_str(&alloc::format!("{} /{} {} rw 0 0\n", m.source, m.target, m.fstype));
+    }
+    s
 }
 
 /// マウントしているすべてのファイルシステムを書き出す (sync)
 pub fn sync_all() {
     // MAP_SHARED で書いたページを先にファイルへ
     crate::vm::sync_shared();
-    let roots: Vec<InodeRef> = unsafe {
-        let mut v: Vec<InodeRef> = (*(&raw const ROOT)).iter().cloned().collect();
-        v.extend((*(&raw const MOUNTS)).iter().map(|(_, r)| r.clone()));
-        v
-    };
+    let mut roots: Vec<InodeRef> = unsafe { (*(&raw const ROOT)).iter().cloned().collect() };
+    let mut tables = alloc::vec![init_mnt()];
+    tables.extend(unsafe { (*(&raw const ALL_MNT)).iter().filter_map(|w| w.upgrade()) });
+    for t in tables {
+        roots.extend(t.list.borrow().iter().map(|m| m.root.clone()));
+    }
     for r in roots {
         if let Err(e) = r.sync() {
             println!("sync: error {}", e);
@@ -203,12 +284,22 @@ pub fn idle_sync() {
 }
 
 /// マウント先ならかぶせたものの根に置きかえる
-fn cross(i: InodeRef) -> InodeRef {
-    let mounts = unsafe { &*(&raw const MOUNTS) };
-    match mounts.iter().rev().find(|(id, _)| *id == i.id()) {
-        Some((_, r)) => cross(r.clone()),
-        None => i,
+fn cross(mut i: InodeRef) -> InodeRef {
+    let ns = current_mnt();
+    let l = ns.list.borrow();
+    if l.is_empty() {
+        return i;
     }
+    // かぶせたものの根がまたマウント先なら、その上へ (重ねたマウント)。同じディレクトリに bind したときなどに
+    // 回りつづけないよう、1 つのマウントは 1 回だけ
+    // (表は小さいので、使った印は 64 個までビットで。それより多ければ、新しい 64 個だけを見る)
+    let base = l.len().saturating_sub(64);
+    let mut used = 0u64;
+    while let Some(k) = (base..l.len()).rev().find(|&k| used & (1 << (k - base)) == 0 && l[k].at == i.id()) {
+        used |= 1 << (k - base);
+        i = l[k].root.clone();
+    }
+    i
 }
 
 /// cwd (先頭 / なし) を基準に path を絶対化し、. と .. を畳む

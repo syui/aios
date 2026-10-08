@@ -1193,6 +1193,78 @@ pub fn chroot(pathp: usize) -> R {
     Ok(0)
 }
 
+/// マウントしてよいか: root か、自分のマウントの namespace の中で no_new_privs (外には見えないし、setuid の
+/// プログラムをだませない)。砂場 (landlock) の中からはだめ (Linux と同じ)
+fn may_mount() -> Result<(), i64> {
+    let c = cred::current();
+    if c.landlock.is_some() || !(c.euid == 0 || (c.ns.mnt.is_some() && c.no_new_privs)) {
+        return Err(-cred::EPERM);
+    }
+    Ok(())
+}
+
+/// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリ)。
+/// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。読むだけ (MS_RDONLY) と移す (MS_MOVE) はない
+pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
+    const MS_RDONLY: u64 = 1;
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 4096;
+    const MS_MOVE: u64 = 8192;
+    const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    const ENODEV: i64 = 19;
+    may_mount()?;
+    let cwd = proc::current().files().cwd.clone();
+    let target = user_str(targetp)?;
+    if flags & MS_PROPAGATION != 0 {
+        vfs::resolve(&cwd, &target, true)?;
+        return Ok(0);
+    }
+    if flags & (MS_RDONLY | MS_MOVE) != 0 {
+        return Err(-EINVAL);
+    }
+    if flags & MS_REMOUNT != 0 {
+        return Ok(0);
+    }
+    let (full, dir) = vfs::lookup(&cwd, &target, true)?;
+    if !dir.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    let (root, source, fstype) = if flags & MS_BIND != 0 {
+        let src = user_str(srcp)?;
+        let (sfull, s) = vfs::lookup(&cwd, &src, true)?;
+        if !s.meta().is_dir() {
+            return Err(-EINVAL);
+        }
+        (s, alloc::format!("/{}", sfull), String::from("none"))
+    } else {
+        let fstype = user_str(typep)?;
+        let root = match fstype.as_str() {
+            // /tmp と同じく、だれでも作れて他人のものは消せない (Linux の tmpfs の既定)
+            "tmpfs" => {
+                let r: InodeRef = crate::tmpfs::new_root();
+                r.set_mode(0o1777)?;
+                r
+            }
+            "proc" => crate::procfs::new_root(),
+            "sysfs" => crate::sysfs::new_root(),
+            _ => return Err(-ENODEV),
+        };
+        let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
+        (root, source, fstype)
+    };
+    vfs::mount(&full, root, &source, &fstype)?;
+    Ok(0)
+}
+
+/// umount2(target, flags): いちばん上にかぶせたものを外す
+pub fn umount2(targetp: usize, _flags: u64) -> R {
+    may_mount()?;
+    let cwd = proc::current().files().cwd.clone();
+    let (full, _) = vfs::lookup(&cwd, &user_str(targetp)?, true)?;
+    vfs::umount(&full)?;
+    Ok(0)
+}
+
 pub fn fchdir(fd: u64) -> R {
     let f = file_of(fd)?;
     let path = match &f.borrow().kind {
