@@ -77,6 +77,19 @@ fn inode_of(fd: u64) -> Result<InodeRef, i64> {
 }
 
 /// dirfd と path から、探索の基準にするディレクトリ (先頭 / なし)
+/// dirfd が開いているディレクトリ (inode とパス)。AT_FDCWD か絶対パスなら None
+fn base_ino(dirfd: i64, path: &str) -> Result<Option<(InodeRef, String)>, i64> {
+    if path.starts_with('/') || dirfd == AT_FDCWD {
+        return Ok(None);
+    }
+    let f = file_of(dirfd as u64)?;
+    let f = f.borrow();
+    match &f.kind {
+        Kind::Inode(i, p) if i.meta().is_dir() => Ok(Some((i.clone(), p.clone()))),
+        _ => Err(-ENOTDIR),
+    }
+}
+
 fn base_dir(dirfd: i64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd == AT_FDCWD {
         return Ok(proc::current().files().cwd.clone());
@@ -98,8 +111,12 @@ fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
         }
         return Err(-ENOENT);
     }
-    let base = base_dir(dirfd, &path)?;
-    vfs::resolve(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    match base_ino(dirfd, &path)? {
+        // 開いているディレクトリから (ルートからたどりなおさない)
+        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, &path, follow).map(|(_, i)| i),
+        None => vfs::resolve(&proc::current().files().cwd.clone(), &path, follow),
+    }
 }
 
 /// at と同じものを探し、そのパス (先頭 / なし) を返す
@@ -113,8 +130,11 @@ fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
             _ => Err(-EINVAL),
         };
     }
-    let base = base_dir(dirfd, &path)?;
-    vfs::lookup(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map(|(p, _)| p)
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    match base_ino(dirfd, &path)? {
+        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, &path, follow).map(|(p, _)| p),
+        None => vfs::lookup(&proc::current().files().cwd.clone(), &path, follow).map(|(p, _)| p),
+    }
 }
 
 fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {

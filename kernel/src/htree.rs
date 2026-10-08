@@ -336,8 +336,8 @@ impl ExtFs {
         let mut at = *at;
         loop {
             let pb = self.map(dir, &mut r, node.get(at).1 as u64, false)?;
-            if let Some(e) = self.leaf_entries(pb)?.into_iter().find(|e| e.name == name.as_bytes()) {
-                return Ok(Some((pb, e.ino)));
+            if let Some(ino) = self.block_find(pb, name.as_bytes())? {
+                return Ok(Some((pb, ino)));
             }
             // 同じハッシュが次の葉に続いているか
             if at + 1 < node.count() {

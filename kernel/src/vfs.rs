@@ -239,14 +239,28 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     if path.is_empty() {
         return Err(-ENOENT);
     }
-    let mut path = normalize(cwd, path);
+    walk(None, normalize(cwd, path), follow)
+}
+
+/// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。
+/// .. があるときは、パスの文字の上で畳むので、ふつうの lookup で
+pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
+        return lookup(dir_path, path, follow);
+    }
+    let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
+    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow)
+}
+
+/// path (start があればそこからの相対、なければルートから) をたどる
+fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool) -> Result<(String, InodeRef), i64> {
     let cred = crate::cred::current();
     'restart: for _ in 0..16 {
         let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
-        let mut cur = cross(root());
-        let mut walked = String::new();
+        let (mut cur, mut walked) = start.take().unwrap_or_else(|| (cross(root()), String::new()));
+        // いまのディレクトリの属性 (次の要素の分は、たどったときに読んだものを使う)
+        let mut m = cur.meta();
         for (i, c) in comps.iter().enumerate() {
-            let m = cur.meta();
             if !m.is_dir() {
                 return Err(-ENOTDIR);
             }
@@ -254,7 +268,8 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             cred.check(&m, crate::cred::X)?;
             let next = cross(cur.lookup(c)?);
             let last = i + 1 == comps.len();
-            if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {
+            let nm = next.meta();
+            if nm.mode & S_IFMT == S_IFLNK && (!last || follow) {
                 if let Some((p, ino)) = next.magic_link() {
                     if last {
                         return Ok((p.trim_start_matches('/').to_string(), ino));
@@ -264,6 +279,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
                         return Err(-ENOTDIR);
                     }
                     walked = p.trim_start_matches('/').to_string();
+                    m = ino.meta();
                     cur = ino;
                     continue;
                 }
@@ -281,6 +297,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             }
             walked.push_str(c);
             cur = next;
+            m = nm;
         }
         return Ok((walked, cur));
     }
