@@ -189,6 +189,9 @@ pub fn stats_reset() {
     STATS.slept.store(0, Ordering::Relaxed);
     FAST_FAULTS.store(0, Ordering::Relaxed);
     PREEMPTS.store(0, Ordering::Relaxed);
+    for c in crate::file::FAST_RW.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
 }
 
@@ -238,6 +241,8 @@ pub fn stats() -> alloc::string::String {
         s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
+    let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("パイプのロックなしの読み書き: {} (ふつうの道へ: 大きさ {} 表を分けている {} パイプでない {} ページ {} 眠っている人 {} poll {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[2], fr[3], fr[4], fr[5], fr[6], fr[7], fr[8], fr[9], fr[10], fr[11]));
     s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s

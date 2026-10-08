@@ -691,6 +691,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             _ => return false,
         },
+        // パイプの読み書きで、眠らず起こさずにすむもの (file::Pipe::fast_rw)
+        READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, a[8] == WRITE) {
+            Some(r) => r,
+            None => return false,
+        },
         _ => return false,
     };
     tf.x[0] = r as u64;

@@ -6,7 +6,7 @@
 // (分けた NET の中の抽象名前空間は、その番号をつけて分ける)。
 // inet: 分けた NET (ns.rs) の中の AF_INET の TCP もここ。名前は「#inet番号:ポート」(ユーザーの名前とまざらない)。
 // 外からは AF_INET の 127.0.0.1:ポート に見える (getsockname / getpeername / accept)
-use crate::file::{self, FileRef, Kind, Pipe};
+use crate::file::{self, FileRef, Kind, Pipe, PipeCell};
 use crate::proc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::rc::{Rc, Weak};
@@ -352,7 +352,7 @@ pub fn take_rights(control: usize, len: usize) -> Result<Vec<FileRef>, i64> {
 }
 
 /// 送るデータの始まりに fd をつける (tx はこの口が書くパイプ)
-pub fn attach(tx: &Rc<RefCell<Pipe>>, fds: Vec<FileRef>) {
+pub fn attach(tx: &Rc<PipeCell>, fds: Vec<FileRef>) {
     if !fds.is_empty() {
         let mut p = tx.borrow_mut();
         let at = p.wrote;
@@ -362,7 +362,7 @@ pub fn attach(tx: &Rc<RefCell<Pipe>>, fds: Vec<FileRef>) {
 
 /// 読んだバイト [start, end) についてきた fd を、このプロセスの fd にして付帯データに書く。
 /// 書ききれなければ MSG_CTRUNC (fd は閉じる)。戻り値は (controllen, flags)
-pub fn deliver(rx: &Rc<RefCell<Pipe>>, end: u64, control: usize, space: usize, flags: u64) -> Result<(usize, u32), i64> {
+pub fn deliver(rx: &Rc<PipeCell>, end: u64, control: usize, space: usize, flags: u64) -> Result<(usize, u32), i64> {
     let mut fds = Vec::new();
     {
         let mut p = rx.borrow_mut();

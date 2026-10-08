@@ -1237,6 +1237,17 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
             }
         }
     }
+    // 待つかもしれないなら、見ているパイプに印 (タイムアウト 0 のぞき見はつけない)
+    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::ticks())).then(|| {
+        let files = proc::current().files();
+        let fs: alloc::vec::Vec<FileRef> = (0..nfds)
+            .filter_map(|i| {
+                let fd = i32::from_le_bytes(raw[i * 8..i * 8 + 4].try_into().unwrap());
+                if fd >= 0 { files.get(fd as u64).cloned() } else { None }
+            })
+            .collect();
+        file::PollWatch::new(fs.iter())
+    });
     loop {
         let mut count = 0;
         for i in 0..nfds {
@@ -1310,6 +1321,11 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
             }
         }
     }
+    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::ticks())).then(|| {
+        let files = proc::current().files();
+        let fs: alloc::vec::Vec<FileRef> = (0..nfds).filter(|&i| bit(&want_r, i) || bit(&want_w, i)).filter_map(|i| files.get(i as u64).cloned()).collect();
+        file::PollWatch::new(fs.iter())
+    });
     loop {
         let (mut got_r, mut got_w) = (vec![0u8; bytes], vec![0u8; bytes]);
         let mut count = 0;
@@ -1343,9 +1359,9 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
 }
 
 /// FIFO の inode ごとのパイプ (誰かが開いている間だけ生きている)
-static mut FIFOS: alloc::vec::Vec<((usize, u64), alloc::rc::Weak<core::cell::RefCell<Pipe>>)> = alloc::vec::Vec::new();
+static mut FIFOS: alloc::vec::Vec<((usize, u64), alloc::rc::Weak<crate::file::PipeCell>)> = alloc::vec::Vec::new();
 
-fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<core::cell::RefCell<Pipe>> {
+fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<crate::file::PipeCell> {
     let fifos = unsafe { &mut *(&raw mut FIFOS) };
     fifos.retain(|(_, w)| w.strong_count() > 0);
     if let Some(p) = fifos.iter().find(|(id, _)| *id == ino.id()).and_then(|(_, w)| w.upgrade()) {
@@ -1356,7 +1372,7 @@ fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<core::cell::RefCell<Pipe>> {
     p
 }
 
-fn pipe_of(fd: u64) -> Option<alloc::rc::Rc<core::cell::RefCell<Pipe>>> {
+fn pipe_of(fd: u64) -> Option<alloc::rc::Rc<crate::file::PipeCell>> {
     let f = file_of(fd).ok()?;
     let f = f.borrow();
     match &f.kind {
