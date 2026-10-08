@@ -529,15 +529,28 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
 const EINTR_: i64 = 4;
 
 /// /proc/sysstat: スレッドごと (名前と番号) の、システムコールの回数 (空回りを探す調べもの用)。
-/// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える
+/// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える。
+/// 数えるのは一度読まれてから (ふだんは数えない: 表を引くのが重く、pid ごとに増えつづけるので)。
+/// 表が COUNTS_MAX をこえたら、新しいものは数えない
 static mut COUNTS: alloc::collections::BTreeMap<([u8; 16], u32, u64), u64> = alloc::collections::BTreeMap::new();
 static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
 
+static COUNTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const COUNTS_MAX: usize = 4096;
+
 fn count(nr: u64) {
+    if !COUNTING.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // スレッドの名前 (pthread_setname_np) ごと
     let p = proc::current();
     unsafe {
-        *(*(&raw mut COUNTS)).entry((p.comm, p.pid, nr)).or_insert(0) += 1;
+        let m = &mut *(&raw mut COUNTS);
+        if let Some(n) = m.get_mut(&(p.comm, p.pid, nr)) {
+            *n += 1;
+        } else if m.len() < COUNTS_MAX {
+            m.insert((p.comm, p.pid, nr), 1);
+        }
     }
 }
 
@@ -546,6 +559,9 @@ pub fn sysstat() -> alloc::string::String {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
     let m = unsafe { core::mem::take(&mut *(&raw mut COUNTS)) };
+    if !COUNTING.swap(true, Ordering::Relaxed) {
+        return "(数えはじめました。もう一度読むと、そのあいだの回数が出ます)\n".into();
+    }
     let mut v: alloc::vec::Vec<_> = m.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     let mut s = alloc::string::String::new();
