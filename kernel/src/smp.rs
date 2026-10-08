@@ -100,11 +100,91 @@ pub fn lock() {
     c.since.store(t1, Ordering::Relaxed);
 }
 
-pub fn unlock() {
+/// 空いていれば取る (待たない)
+fn try_lock() -> bool {
+    let me = id() + 1;
+    let s = SERVING.load(Ordering::Acquire);
+    if NEXT.compare_exchange(s, s + 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    BKL.store(me, Ordering::Relaxed);
+    let c = &STATS.cpu[me - 1];
+    c.locks.fetch_add(1, Ordering::Relaxed);
+    c.since.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+    true
+}
+
+fn release() {
     let c = &STATS.cpu[id()];
     c.hold.fetch_add(crate::timer::uptime_ns().saturating_sub(c.since.load(Ordering::Relaxed)), Ordering::Relaxed);
     BKL.store(0, Ordering::Relaxed);
     SERVING.fetch_add(1, Ordering::Release);
+}
+
+/// 放す。そのまえとあとに、大きなロックなしの道が頼んでいった「起こす」を片づける (defer_wake)。
+/// あとにも見るのは、放すまぎわに頼まれたもの (頼んだほうは取れなかったので、こちらに任せている) のため
+pub fn unlock() {
+    loop {
+        drain_wakes();
+        release();
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if PENDING.lock().1 == 0 || !try_lock() {
+            return;
+        }
+    }
+}
+
+// ---- 大きなロックなしの道からの「起こす」 ----
+// パイプの読み書きの速い道 (file::Pipe::fast_rw) は、眠っている人や待っている人がいても進めて、起こすのは
+// ここに頼む。大きなロックが空いていればその場で取って起こし、だれかが持っていれば、その CPU が放すときに起こす
+
+const NPENDING: usize = 64;
+static PENDING: crate::spinlock::SpinLock<([usize; NPENDING], usize)> = crate::spinlock::SpinLock::new(([0; NPENDING], 0));
+
+/// key (パイプ) で待っているものを起こしてもらう。大きなロックを持たずに呼ぶ
+pub fn defer_wake(key: usize) {
+    let queued = {
+        let mut p = PENDING.lock();
+        let n = p.1;
+        if p.0[..n].contains(&key) {
+            true
+        } else if n < NPENDING {
+            p.0[n] = key;
+            p.1 = n + 1;
+            true
+        } else {
+            false
+        }
+    };
+    if !queued {
+        // いっぱい: 待って取って、自分で
+        lock();
+        crate::file::wake_key(key);
+        unlock();
+        return;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if try_lock() {
+        unlock();
+    }
+}
+
+/// 頼まれていたものを起こす (大きなロックを持って)
+fn drain_wakes() {
+    loop {
+        let (keys, n) = {
+            let mut p = PENDING.lock();
+            let r = (p.0, p.1);
+            p.1 = 0;
+            r
+        };
+        if n == 0 {
+            return;
+        }
+        for &k in &keys[..n] {
+            crate::file::wake_key(k);
+        }
+    }
 }
 
 // ---- 大きなロックの統計 (/proc/bkl。ロックを細かくするとき、どこから分けるかを決めるため) ----
@@ -242,7 +322,7 @@ pub fn stats() -> alloc::string::String {
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("パイプのロックなしの読み書き: {} (ふつうの道へ: 大きさ {} 表を分けている {} パイプでない {} ページ {} 眠っている人 {} poll {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[2], fr[3], fr[4], fr[5], fr[6], fr[7], fr[8], fr[9], fr[10], fr[11]));
+    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を分けている {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s

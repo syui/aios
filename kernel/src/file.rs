@@ -774,16 +774,22 @@ pub struct Pipe {
     /// AF_UNIX: このパイプに書くほうのプロセス (pid, uid, gid)。読むほうの SO_PEERCRED (unix.rs)
     pub cred: Option<(u32, u32, u32)>,
     /// このパイプで眠っているもの (読む・書く・FIFO を開く) の数。大きなロックなしの read/write (fast_rw) は、
-    /// 起こす相手がいるときはふつうの道へ
+    /// 0 でなければ起こしを頼む
     sleepers: usize,
-    /// poll / select で、いま待っている (待つかもしれない) 数 (PollWatch)。0 でなければ fast_rw は使わない
+    /// poll / select で、いま待っている (待つかもしれない) 数 (PollWatch)。0 でなければ fast_rw は起こしを頼む
     watchers: usize,
-    /// epoll に登録されたことがある (いつ待たれるかわからないので、それからは fast_rw は使わない)
+    /// epoll に登録されたことがある (いつ待たれるかわからないので、fast_rw はいつも起こしを頼む)
     pub epolled: bool,
 }
 
+/// パイプ (key はその PipeCell の場所) で眠っているもの、poll / epoll で待っているものを起こす (大きなロックを持って)
+pub fn wake_key(key: usize) {
+    proc::wakeup(key);
+    proc::poll_wake(key);
+}
+
 /// poll / select が待っているあいだ、見ているパイプに印をつける (watchers)。大きなロックなしの read/write
-/// (fast_rw) は、印のあるパイプでは使わない (起こさないといけないので)。readiness を見る前につけること
+/// (fast_rw) は、印のあるパイプでは起こしを頼む。readiness を見る前につけること
 pub struct PollWatch(Vec<Rc<PipeCell>>);
 
 impl PollWatch {
@@ -934,10 +940,10 @@ impl Pipe {
         Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }))
     }
 
-    /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らず起こさずにすむときだけ。ほかは None で
-    /// ふつうの道へ: fd の表をほかのスレッドと分けている、パイプで眠っている人がいる (起こさないといけない)、
-    /// poll などで見られたことがある、読むのに中身がない、書くのに全部は入らない・読み手がいない、
-    /// ユーザーのメモリが写っていない (ページフォルトになる)
+    /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らずにすむときだけ。ほかは None で
+    /// ふつうの道へ: fd の表をほかのスレッドと分けている、読むのに中身がない、書くのに全部は入らない・
+    /// 読み手がいない、ユーザーのメモリが写っていない (ページフォルトになる)。
+    /// 眠っている人や poll / epoll で待っている人がいれば、起こすのは大きなロックを持つ CPU に頼む (smp::defer_wake)
     pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
         let r = Pipe::fast_rw_inner(me, fd, buf, len, write);
         FAST_RW[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -968,27 +974,22 @@ impl Pipe {
                 return Err(5);
             }
             let mut pp = p.borrow_mut();
-            if pp.sleepers > 0 {
-                return Err(6);
-            }
-            if pp.watchers > 0 || pp.epolled {
-                return Err(7);
-            }
             if pp.readers == 0 || pp.cap.saturating_sub(pp.data.len) < len {
                 return Err(8);
             }
             pp.data.push_all(&tmp).map_err(|_| 9usize)?;
             pp.generation += 1;
             pp.wrote += len as u64;
+            let wake = pp.sleepers > 0 || pp.watchers > 0 || pp.epolled;
+            drop(pp);
+            // 待っている人がいれば、起こすのは大きなロックを持っている CPU に頼む (入れたあとで)
+            if wake {
+                FAST_RW[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::smp::defer_wake(Rc::as_ptr(p) as usize);
+            }
             Ok(len as i64)
         } else {
             let mut pp = p.borrow_mut();
-            if pp.sleepers > 0 {
-                return Err(6);
-            }
-            if pp.watchers > 0 || pp.epolled {
-                return Err(7);
-            }
             if pp.data.len == 0 {
                 return Err(10);
             }
@@ -1000,6 +1001,12 @@ impl Pipe {
             }
             pp.data.skip(n);
             pp.taken += n as u64;
+            let wake = pp.sleepers > 0 || pp.watchers > 0 || pp.epolled;
+            drop(pp);
+            if wake {
+                FAST_RW[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::smp::defer_wake(Rc::as_ptr(p) as usize);
+            }
             Ok(n as i64)
         }
     }
@@ -1015,8 +1022,7 @@ impl Pipe {
     }
 
     fn wake(p: &Rc<PipeCell>) {
-        proc::wakeup(Rc::as_ptr(p) as usize);
-        proc::poll_wake(Rc::as_ptr(p) as usize);
+        wake_key(Rc::as_ptr(p) as usize);
     }
 
     /// 読む。peek なら取り除かない (tee 用)
