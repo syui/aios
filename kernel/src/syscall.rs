@@ -389,21 +389,21 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
         UNSHARE => proc::unshare(a[0]),
-        CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
+        CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
-        WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
+        WAIT4 => crate::ns::arg_pid(int(a[0])).map_err(|_| -10).and_then(|p| sys_wait4(p, a[1] as usize, a[2])),
         GETRUSAGE => sys_getrusage(int(a[0]), a[1] as usize),
         TIMES => sys_times(a[0] as usize),
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
-        PIDFD_OPEN => sys_pidfd_open(int(a[0]), a[1]),
+        PIDFD_OPEN => crate::ns::arg_pid(int(a[0])).and_then(|p| sys_pidfd_open(p, a[1])),
         LANDLOCK_CREATE_RULESET => crate::landlock::create_ruleset(a[0] as usize, a[1] as usize, a[2]),
         SECCOMP => crate::seccomp::sys_seccomp(a[0], a[1], a[2] as usize),
         LANDLOCK_ADD_RULE => crate::landlock::add_rule(a[0], a[1], a[2] as usize, a[3]),
         LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
-        KILL => signal::kill(int(a[0]), a[1] as i32),
-        TKILL => signal::tgkill(0, a[0] as u32, a[1] as i32),
-        TGKILL => signal::tgkill(a[0] as u32, a[1] as u32, a[2] as i32),
+        KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),
+        TKILL => crate::ns::arg_pid(int(a[0])).and_then(|t| signal::tgkill(0, t as u32, a[1] as i32)),
+        TGKILL => crate::ns::arg_pid(int(a[0])).and_then(|g| Ok((g, crate::ns::arg_pid(int(a[1]))?))).and_then(|(g, t)| signal::tgkill(g as u32, t as u32, a[2] as i32)),
         RT_SIGSUSPEND => signal::rt_sigsuspend(a[0] as usize),
         RT_SIGPENDING => signal::rt_sigpending(a[0] as usize),
         RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(a[0] as usize, a[1] as usize, a[2] as usize),
@@ -418,14 +418,15 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SET_TID_ADDRESS => {
             let p = proc::current();
             p.clear_tid = a[0] as usize;
-            Ok(p.pid as i64)
+            Ok(crate::ns::local_or_0(p.pid) as i64)
         }
         FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize),
-        GETPID => Ok(proc::current().tgid as i64),
-        GETPGID => signal::getpgid(a[0] as u32),
-        GETSID => signal::getsid(a[0] as u32),
-        GETTID => Ok(proc::current().pid as i64),
-        GETPPID => Ok(proc::current().ppid as i64),
+        // PID の namespace の中なら、中の番号 (ns.rs)
+        GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
+        GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
+        GETSID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getsid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
+        GETTID => Ok(crate::ns::local_or_0(proc::current().pid) as i64),
+        GETPPID => Ok(crate::ns::local_or_0(proc::current().ppid) as i64),
         GETUID => Ok(proc::current().cred.uid as i64),
         GETEUID => Ok(proc::current().cred.euid as i64),
         GETGID => Ok(proc::current().cred.gid as i64),
@@ -442,8 +443,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETFSGID => cred::setfsgid(a[0]),
         GETGROUPS => cred::getgroups(a[0] as usize, a[1] as usize),
         SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
-        SETPGID => signal::setpgid(a[0] as u32, a[1] as u32),
-        SETSID => signal::setsid(),
+        SETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| Ok((p, crate::ns::arg_pid(int(a[1]))?))).and_then(|(p, g)| signal::setpgid(p as u32, g as u32)),
+        SETSID => signal::setsid().map(|s| crate::ns::local_or_0(s as u32) as i64),
         UMASK => {
             let f = crate::proc::current().files();
             let old = f.umask;
@@ -628,8 +629,8 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
     let a = tf.x;
     let p = proc::current();
-    // seccomp がかかっていれば、フィルタを通すためにふつうの道へ
-    if p.cred.seccomp.is_some() {
+    // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() {
         return false;
     }
     if let Some(c) = FAST.get(a[8] as usize) {
@@ -1328,8 +1329,8 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
     }
     let pid = match idtype {
         P_ALL => -1,
-        P_PID if id > 0 => id,
-        P_PGID => if id == 0 { 0 } else { -id },
+        P_PID if id > 0 => crate::ns::arg_pid(id).map_err(|_| -10)?,
+        P_PGID => if id == 0 { 0 } else { crate::ns::arg_pid(-id).map_err(|_| -10)? },
         P_PIDFD => pidfd_pid(id)? as i64,
         _ => return Err(-EINVAL),
     };

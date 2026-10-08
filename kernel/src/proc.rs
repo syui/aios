@@ -199,6 +199,9 @@ pub struct Proc {
     pub cutime: u64,
     /// 作った tick (/proc/PID/stat の starttime)
     pub start: u64,
+    /// PID の namespace (ns.rs。None ははじめのもの) と、その中の番号
+    pub pid_ns: Option<alloc::rc::Rc<crate::ns::Pid>>,
+    pub vpid: u32,
     chan: usize,
     /// 最後に呼んだシステムコールの番号と最初の 2 つの引数 (/proc/threads で見る)
     pub last_sys: (u64, u64, u64),
@@ -254,6 +257,8 @@ impl Proc {
         cont_report: false,
         utime: 0,
         start: 0,
+        pid_ns: None,
+        vpid: 0,
         recent: 0,
         yielded: false,
         slice: 0,
@@ -850,6 +855,7 @@ pub fn exit(code: i32) -> ! {
 
 fn exit_status(status: i32) -> ! {
     let p = current();
+    crate::ns::init_exited(p);
     clear_child_tid(p);
     if p.thread {
         // 使った時間は代表スレッドに持たせる
@@ -1002,6 +1008,11 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     if !thread {
         child.altstack = parent.altstack;
     }
+    // PID の namespace: スレッドは親と同じ、プロセスは親がこれから作る子のもの (unshare / CLONE_NEWPID)
+    child.pid_ns = if thread { parent.pid_ns.clone() } else { cred.ns.pid.clone().or_else(|| parent.pid_ns.clone()) };
+    if let Some(ns) = &child.pid_ns {
+        child.vpid = ns.alloc();
+    }
     child.cred = cred;
     child.comm = parent.comm;
     child.thread = thread;
@@ -1095,6 +1106,7 @@ pub const WEXITED: u64 = 4;
 
 /// 子の終了 (と WUNTRACED なら停止、WCONTINUED なら再開) を待つ。(pid, status) を返す。
 /// pid: > 0 はその子、0 は同じプロセスグループ、-1 はどれでも、< -1 はグループ -pid
+/// 子を待つ。返す番号は、待つほうから見たもの (PID の namespace の中なら中の番号。片づける前に読む)
 pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     const ECHILD: i64 = 10;
     let me = current();
@@ -1117,7 +1129,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             have = true;
             let keep = options & WNOWAIT != 0;
             if c.state == State::Zombie && options & WEXITED != 0 {
-                let r = (c.pid, c.xstatus);
+                let r = (crate::ns::to_local(c.pid).unwrap_or(c.pid), c.xstatus);
                 if !keep {
                     let t = c.utime + c.cutime;
                     *c = Proc::UNUSED;
@@ -1132,13 +1144,13 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 if !keep {
                     c.stop_report = 0;
                 }
-                return Ok((c.pid, (sig << 8) | 0x7f));
+                return Ok((crate::ns::to_local(c.pid).unwrap_or(c.pid), (sig << 8) | 0x7f));
             }
             if options & WCONTINUED != 0 && c.cont_report {
                 if !keep {
                     c.cont_report = false;
                 }
-                return Ok((c.pid, 0xffff));
+                return Ok((crate::ns::to_local(c.pid).unwrap_or(c.pid), 0xffff));
             }
         }
         if !have {
@@ -1237,6 +1249,15 @@ pub fn kill_group(tgid: u32, sig: i32) {
 
 pub fn threads_of(tgid: u32) -> Vec<&'static mut Proc> {
     procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid).collect()
+}
+
+/// 終わったもの (ゾンビ) も
+pub fn find_any(pid: u32) -> Option<&'static mut Proc> {
+    procs().iter_mut().find(|p| p.state != State::Unused && p.pid == pid)
+}
+
+pub fn find_where(f: impl Fn(&Proc) -> bool) -> Option<&'static mut Proc> {
+    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && f(p))
 }
 
 pub fn find_thread(tid: u32) -> Option<&'static mut Proc> {

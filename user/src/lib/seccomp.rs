@@ -4,11 +4,12 @@
 //   先に prctl(PR_SET_NO_NEW_PRIVS) が要る (aibox は landlock のためにもうしている)
 #![allow(dead_code)]
 
-/// 砂場の中ではいらない、カーネルの深いところにさわるもの (ふつうのコマンドは使わない)
+/// 砂場の中ではいらない、カーネルの深いところにさわるもの (ふつうのコマンドは使わない)。
+/// sethostname は止めない (aibox はホスト名を分けるので、中で変えても外には見えない)
 pub const DEFAULT_DENY: &[&str] = &[
     "ptrace", "process_vm_readv", "process_vm_writev", "perf_event_open", "bpf", "userfaultfd", "kexec_load", "kexec_file_load", "init_module", "finit_module",
     "delete_module", "reboot", "mount", "umount2", "pivot_root", "swapon", "swapoff", "acct", "keyctl", "add_key", "request_key", "settimeofday", "clock_settime",
-    "adjtimex", "clock_adjtime", "sethostname", "setdomainname", "open_by_handle_at", "name_to_handle_at", "quotactl",
+    "adjtimex", "clock_adjtime", "open_by_handle_at", "name_to_handle_at", "quotactl",
 ];
 
 /// 名前と番号 (aarch64 の asm-generic)

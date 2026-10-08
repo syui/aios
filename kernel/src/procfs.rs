@@ -269,9 +269,9 @@ impl ProcInode {
                     "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nNoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n",
                     p.comm(),
                     state_name(p),
-                    p.tgid,
-                    p.pid,
-                    p.ppid,
+                    crate::ns::local_or_0(p.tgid),
+                    crate::ns::local_or_0(p.pid),
+                    crate::ns::local_or_0(p.ppid),
                     c.uid,
                     c.euid,
                     c.suid,
@@ -424,12 +424,12 @@ fn stat_line(p: &Proc) -> String {
     let threads = proc::threads_of(p.tgid).len();
     let mut s = format!(
         "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {}",
-        p.tgid,
+        crate::ns::local_or_0(p.tgid),
         p.comm(),
         state_char(p),
-        p.ppid,
-        p.pgid,
-        p.sid,
+        crate::ns::local_or_0(p.ppid),
+        crate::ns::local_or_0(p.pgid),
+        crate::ns::local_or_0(p.sid),
         tty_nr,
         tpgid,
         proc::group_utime(p.tgid),
@@ -457,11 +457,12 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 2] = ["net", "uts"];
+const NS_KINDS: [&str; 4] = ["net", "pid", "pid_for_children", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
         "net" => c.ns.net_id(),
+        "pid_for_children" => c.ns.pid_children_id(),
         _ => c.ns.uts_id(),
     }
 }
@@ -567,7 +568,7 @@ impl Inode for ProcInode {
 
     fn readlink(&self) -> Result<String, i64> {
         match self.node {
-            Node::SelfLink => Ok(format!("{}", proc::current().tgid)),
+            Node::SelfLink => Ok(format!("{}", crate::ns::local_or_0(proc::current().tgid))),
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),
             // chroot していれば、その場所 (pidof はこれが自分と同じものだけ探す)
             Node::RootLink(pid) => Ok(format!("/{}", leader(pid)?.files().root)),
@@ -578,8 +579,11 @@ impl Inode for ProcInode {
             }
             Node::Fd(pid, n) => fd_target(pid, n),
             Node::NsLink(pid, k) => {
-                let c = &leader(pid)?.cred;
-                Ok(format!("{}:[{}]", NS_KINDS[k as usize], ns_id(c, NS_KINDS[k as usize])))
+                let l = leader(pid)?;
+                let kind = NS_KINDS[k as usize];
+                // pid はそのプロセスのもの (cred にはこれから作る子のものがある)。pid_for_children の名前も pid:[N]
+                let id = if kind == "pid" { l.pid_ns.as_ref().map_or(crate::ns::INIT_PID, |n| n.id) } else { ns_id(&l.cred, kind) };
+                Ok(format!("{}:[{}]", if kind == "pid_for_children" { "pid" } else { kind }, id))
             }
             _ => Err(-EINVAL),
         }
@@ -620,7 +624,8 @@ impl Inode for ProcInode {
                 (j, true) => Node::Sys(j as u16),
                 (j, false) => Node::SysDir(j as u16, d + 1),
             },
-            (Node::Root, _) => Node::Pid(leader(num.ok_or(-ENOENT)?)?.tgid),
+            // PID の namespace の中なら、中の番号 (ns.rs)
+            (Node::Root, _) => Node::Pid(leader(crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
@@ -674,7 +679,9 @@ impl Inode for ProcInode {
                 add("net".into(), Node::NetDir);
                 add("sys".into(), Node::SysDir(0, 0));
                 for p in proc::all_leader_procs() {
-                    add(format!("{}", p.tgid), Node::Pid(p.tgid));
+                    if let Some(l) = crate::ns::to_local(p.tgid) {
+                        add(format!("{}", l), Node::Pid(p.tgid));
+                    }
                 }
             }
             Node::NetDir => {
