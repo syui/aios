@@ -76,6 +76,9 @@ enum Node {
     Stack(u32),
     FdDir(u32),
     Fd(u32, usize),
+    /// /proc/PID/ns と、その中のリンク (NS_KINDS の番号)
+    NsDir(u32),
+    NsLink(u32, u8),
 }
 
 pub struct ProcInode {
@@ -152,12 +155,14 @@ impl ProcInode {
             Node::Stack(p) => (p as u64) << 16 | 9,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
+            Node::NsDir(p) => (p as u64) << 16 | 14,
+            Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
         }
     }
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) => Some(p),
             _ => None,
         }
     }
@@ -451,6 +456,15 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 }
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
+/// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
+const NS_KINDS: [&str; 1] = ["uts"];
+
+fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
+    match kind {
+        _ => c.ns.uts_id(),
+    }
+}
+
 /// ファイルの名前があるもの (Kind::Inode) は magic_link でふつうに開くので、ここでは None
 pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
     let (mut dir, mut p) = (String::from(cwd), String::from(path));
@@ -497,6 +511,8 @@ impl Inode for ProcInode {
             Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) => S_IFDIR | 0o555,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
+            Node::NsDir(_) => S_IFDIR | 0o511,
+            Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
             Node::Strace | Node::Bkl => S_IFREG | 0o644,
@@ -560,6 +576,10 @@ impl Inode for ProcInode {
                 Ok(format!("/{}", p.mm().exe))
             }
             Node::Fd(pid, n) => fd_target(pid, n),
+            Node::NsLink(pid, k) => {
+                let c = &leader(pid)?.cred;
+                Ok(format!("{}:[{}]", NS_KINDS[k as usize], ns_id(c, NS_KINDS[k as usize])))
+            }
             _ => Err(-EINVAL),
         }
     }
@@ -612,6 +632,8 @@ impl Inode for ProcInode {
             (Node::Pid(p), "maps") => Node::Maps(p),
             (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
+            (Node::Pid(p), "ns") => Node::NsDir(p),
+            (Node::NsDir(p), n) => Node::NsLink(p, NS_KINDS.iter().position(|k| *k == n).ok_or(-ENOENT)? as u8),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
                 leader(p)?.files().get(n as u64).ok_or(-ENOENT)?;
@@ -684,6 +706,12 @@ impl Inode for ProcInode {
                 add("maps".into(), Node::Maps(p));
                 add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
+                add("ns".into(), Node::NsDir(p));
+            }
+            Node::NsDir(p) => {
+                for (i, k) in NS_KINDS.iter().enumerate() {
+                    add((*k).into(), Node::NsLink(p, i as u8));
+                }
             }
             Node::FdDir(p) => {
                 let fds: Vec<usize> = leader(p)?.files().fds.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| i).collect();
