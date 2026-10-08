@@ -6,7 +6,7 @@
 # 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=desktop
 pkgver=0.0.1
-pkgrel=8
+pkgrel=9
 pkgdesc='aios desktop: screen, input and sound drivers, aiwm (tiling Wayland compositor), aiterm, aifont (with the icons)'
 arch=('any')
 url='https://github.com/syui/aios'
