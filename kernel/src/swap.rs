@@ -245,8 +245,14 @@ static mut HAND: usize = 0;
 /// want 枚くらいをスワップへ追い出して空ける。ページ表のルートが exclude のものは触らない。
 /// 空けた数を返す
 pub fn reclaim(want: usize, exclude: usize) -> usize {
+    // まずだれも写していないページキャッシュから (読みなおせばよいので、スワップより安い)
+    let cached = crate::vm::shrink_cache(want);
+    if cached >= want {
+        return cached;
+    }
+    let want = want - cached;
     if !areas().iter().flatten().any(|a| !a.draining && a.used < a.size) {
-        return 0;
+        return cached;
     }
     let mut pts = Vec::new();
     crate::proc::each_pagetable(|pt| {
@@ -255,7 +261,7 @@ pub fn reclaim(want: usize, exclude: usize) -> usize {
         }
     });
     if pts.is_empty() {
-        return 0;
+        return cached;
     }
     let mut freed = 0;
     // 1 周目は AF を落とすだけのことが多いので、何周か
@@ -268,12 +274,12 @@ pub fn reclaim(want: usize, exclude: usize) -> usize {
             freed += pt.swap_out((want - freed).min(BATCH));
             if freed >= want {
                 unsafe { HAND = hand + k + 1 };
-                return freed;
+                return cached + freed;
             }
         }
         unsafe { HAND += 1 };
     }
-    freed
+    cached + freed
 }
 
 /// ユーザーへ戻る前に: 空きが少なければ回収しておく
