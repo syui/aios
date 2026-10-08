@@ -458,8 +458,26 @@ pub fn console_input(c: u8) {
     }
 }
 
+/// コンソールにもう 1 文字入る場所があるか (UART の受信を止めるか: uart::intr)。止めているあいだ、文字は
+/// QEMU (ハードウェアの FIFO) に残る。カノニカルで 1 行が入りきらないとき (改行がなく、読めるものもない) は、
+/// 止めると進まなくなるので受け取る (入りきらない分は捨てる)
+pub fn console_room() -> bool {
+    let c = console();
+    let t = c.borrow();
+    if t.canon() { t.inq.len() + t.edit.len() + 1 < INQ || t.lines == 0 } else { t.inq.len() < INQ }
+}
+
 /// 子の口 (とコンソール) から読む
 pub fn read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+    let r = read_inner(tty, dst, nonblock);
+    // コンソールなら、場所が空いたので止めていた受信を再開
+    if Rc::ptr_eq(tty, &console()) {
+        crate::uart::rx_resume();
+    }
+    r
+}
+
+fn read_inner(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     if dst.is_empty() {
         return Ok(0);
     }
