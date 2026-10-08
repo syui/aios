@@ -55,6 +55,10 @@ t aibox-deny sh -c '! aibox --deny uname -- uname'
 t aibox-pid eq "$(aibox -- sh -c 'echo $$')" 1
 t aibox-no-net sh -c '[ "$(aibox --no-net -- readlink /proc/self/ns/net)" != "$(readlink /proc/self/ns/net)" ]'
 
+# パイプ (大きなロックなしの read/write と、いっぱいのパイプに 4 つで書くとき止まらないこと。くわしくは pipe-check.sh)
+t pipe-chain eq "$(seq 1 100000 | cat | cat | sha256sum | cut -c1-16)" "$(seq 1 100000 | sha256sum | cut -c1-16)"
+t pipe-writers eq "$( (seq 1 30000 & seq 1 30000 & seq 1 30000 & seq 1 30000 & wait) | wc -l | tr -d ' ')" 120000
+
 # sudo (パスワードなしで使えるイメージの ai)
 t sudo sudo -n true
 
