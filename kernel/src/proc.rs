@@ -334,7 +334,7 @@ impl Proc {
     /// 同じスレッドグループの他の Proc (リーダーも)
     pub fn siblings(&self) -> impl Iterator<Item = &'static mut Proc> {
         let (tgid, pid) = (self.tgid, self.pid);
-        procs().iter_mut().filter(move |p| p.state != State::Unused && p.tgid == tgid && p.pid != pid)
+        live().filter(move |p| p.state != State::Unused && p.tgid == tgid && p.pid != pid)
     }
 }
 
@@ -362,6 +362,60 @@ static mut NEXT_PID: u32 = 1;
 
 fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *(&raw mut PROCS) }
+}
+
+// 使っているかもしれないスロットの印 (1 ビットが 1 つ)。見て回るところ (起こす、選ぶ、探す) が NPROC ぜんぶを
+// 見ないように。alloc_proc でつけ、free_slot で消す (つけたまま Unused のものは、見るときに state でとばす)
+const WORDS: usize = NPROC / 64;
+static mut LIVE: [u64; WORDS] = [0; WORDS];
+
+fn slot_of(p: &Proc) -> usize {
+    (p as *const Proc as usize - (&raw const PROCS) as usize) / size_of::<Proc>()
+}
+
+/// スロットを空ける
+fn free_slot(p: &mut Proc) {
+    let i = slot_of(p);
+    unsafe { LIVE[i / 64] &= !(1u64 << (i % 64)) };
+    *p = Proc::UNUSED;
+}
+
+struct Bits {
+    base: usize,
+    bits: u64,
+}
+
+impl Iterator for Bits {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.bits == 0 {
+            return None;
+        }
+        let b = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
+        Some(self.base + b)
+    }
+}
+
+/// 印のついたスロットの番号を start から順に (おしまいまで行ったら 0 から start の手前まで)
+fn live_from(start: usize) -> impl Iterator<Item = usize> {
+    let start = start % NPROC;
+    (0..=WORDS).flat_map(move |k| {
+        let w = (start / 64 + k) % WORDS;
+        let mut bits = unsafe { LIVE[w] };
+        let low = (1u64 << (start % 64)) - 1;
+        if k == 0 {
+            bits &= !low;
+        } else if k == WORDS {
+            bits &= low;
+        }
+        Bits { base: w * 64, bits }
+    })
+}
+
+/// 使っている Proc (Unused でないもの)
+fn live() -> impl Iterator<Item = &'static mut Proc> {
+    live_from(0).map(|i| &mut procs()[i]).filter(|p| p.state != State::Unused)
 }
 
 pub fn current() -> &'static mut Proc {
@@ -394,13 +448,13 @@ pub fn current_root() -> String {
 }
 
 pub fn nprocs() -> usize {
-    procs().iter().filter(|p| p.state != State::Unused).count()
+    live().filter(|p| p.state != State::Unused).count()
 }
 
 /// 使われているアドレス空間ごとに 1 回 f (スレッドで共有しているものも 1 回)
 pub fn each_pagetable(mut f: impl FnMut(&mut PageTable)) {
     let mut seen: Vec<usize> = Vec::new();
-    for p in procs().iter() {
+    for p in live() {
         let Some(mm) = p.mm.as_ref().filter(|_| p.state != State::Unused) else { continue };
         if seen.contains(&mm.id()) {
             continue;
@@ -508,6 +562,8 @@ fn alloc_proc() -> Option<&'static mut Proc> {
         return None;
     };
     *p = Proc::UNUSED;
+    let i = slot_of(p);
+    unsafe { LIVE[i / 64] |= 1u64 << (i % 64) };
     unsafe {
         p.pid = NEXT_PID;
         NEXT_PID += 1;
@@ -556,12 +612,11 @@ extern "C" fn forkret_unlock() {
 /// CPU を使い続けるもの (llvmpipe、ビルド) どうしは、recent が増えては減るので順番に回る
 fn pick(start: usize) -> Option<usize> {
     let mut best: Option<(u32, usize)> = None;
-    for k in 0..NPROC {
-        let i = (start + k) % NPROC;
+    for i in live_from(start) {
         let p = &mut procs()[i];
         if p.state == State::Zombie && (p.thread || p.autoreap) {
             // 終わったスレッドは誰も wait しないのでここで片付ける
-            *p = Proc::UNUSED;
+            free_slot(p);
             continue;
         }
         if p.state != State::Runnable {
@@ -581,7 +636,7 @@ fn pick(start: usize) -> Option<usize> {
 
 /// 1 秒ごと (cpu0 の tick) に recent を半分にする。5 秒ごとに load average を進める
 pub fn decay_recent() {
-    for p in procs().iter_mut() {
+    for p in live() {
         p.recent /= 2;
     }
     static SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -605,12 +660,12 @@ pub fn last_pid() -> u32 {
 
 /// スレッドの数 (/proc/loadavg)
 pub fn nr_threads() -> usize {
-    procs().iter().filter(|p| p.state != State::Unused).count()
+    live().filter(|p| p.state != State::Unused).count()
 }
 
 /// 走っているか、走れるスレッドの数
 pub fn nr_running() -> usize {
-    procs().iter().filter(|p| matches!(p.state, State::Running | State::Runnable)).count()
+    live().filter(|p| matches!(p.state, State::Running | State::Runnable)).count()
 }
 
 fn calc_load() {
@@ -664,7 +719,7 @@ pub fn scheduler() -> ! {
             }
             // 眠ると印をつけてから確かめる (そのあとに起こす CPU は、印を見て割り込みを送る)
             crate::smp::set_idle(true);
-            if procs().iter().any(|p| p.state == State::Runnable) {
+            if live().any(|p| p.state == State::Runnable) {
                 crate::smp::set_idle(false);
                 continue;
             }
@@ -738,7 +793,7 @@ fn wake_where(f: impl Fn(&Proc) -> bool) -> usize {
     let mut n = 0;
     let mut woken = u32::MAX;
     let mut busiest: Option<(u32, usize)> = None;
-    for p in procs().iter_mut() {
+    for p in live() {
         if p.state == State::Sleeping && f(p) {
             p.state = State::Runnable;
             woken = woken.min(p.recent);
@@ -830,7 +885,7 @@ fn kill_proc(p: &mut Proc) {
 }
 
 fn find(pid: u32) -> Option<&'static mut Proc> {
-    procs().iter_mut().find(|p| p.state != State::Unused && p.pid == pid)
+    live().find(|p| p.state != State::Unused && p.pid == pid)
 }
 
 /// clear_tid に 0 を書いて、それを待つ futex を起こす
@@ -876,7 +931,7 @@ fn exit_status(status: i32) -> ! {
     if p.tgid == 1 {
         panic!("init exited with status {}", status);
     }
-    for c in procs().iter_mut() {
+    for c in live() {
         if c.state != State::Unused && c.ppid == p.tgid && !c.thread {
             c.ppid = 1;
         }
@@ -1113,7 +1168,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     let (my_tgid, my_pgid) = (me.tgid, me.pgid);
     loop {
         let mut have = false;
-        for c in procs().iter_mut() {
+        for c in live() {
             if c.state == State::Unused || c.thread || c.ppid != my_tgid {
                 continue;
             }
@@ -1132,7 +1187,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 let r = (crate::ns::to_local(c.pid).unwrap_or(c.pid), c.xstatus);
                 if !keep {
                     let t = c.utime + c.cutime;
-                    *c = Proc::UNUSED;
+                    free_slot(c);
                     if let Some(me) = find(my_tgid) {
                         me.cutime += t;
                     }
@@ -1193,12 +1248,12 @@ pub fn yield_voluntary() {
 
 /// スレッドグループ全体の utime (tick)
 pub fn group_utime(tgid: u32) -> u64 {
-    procs().iter().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
+    live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
 }
 
 /// pidfd: そのプロセスが終わった (ゾンビか、もういない) か
 pub fn has_exited(pid: u32) -> bool {
-    !procs().iter().any(|p| p.pid == pid && !p.thread && p.state != State::Unused && p.state != State::Zombie)
+    !live().any(|p| p.pid == pid && !p.thread && p.state != State::Unused && p.state != State::Zombie)
 }
 
 /// 止められたスレッドグループの再開を待つ (SIGCONT か SIGKILL まで)。
@@ -1242,42 +1297,42 @@ pub fn kill_group(tgid: u32, sig: i32) {
     if let Some(leader) = find(tgid) {
         leader.group_exit.get_or_insert(sig & 0x7f);
     }
-    for t in procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid) {
+    for t in live().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid) {
         kill_proc(t);
     }
 }
 
 pub fn threads_of(tgid: u32) -> Vec<&'static mut Proc> {
-    procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid).collect()
+    live().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid).collect()
 }
 
 /// 終わったもの (ゾンビ) も
 pub fn find_any(pid: u32) -> Option<&'static mut Proc> {
-    procs().iter_mut().find(|p| p.state != State::Unused && p.pid == pid)
+    live().find(|p| p.state != State::Unused && p.pid == pid)
 }
 
 pub fn find_where(f: impl Fn(&Proc) -> bool) -> Option<&'static mut Proc> {
-    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && f(p))
+    live().find(|p| p.state != State::Unused && p.state != State::Zombie && f(p))
 }
 
 pub fn find_thread(tid: u32) -> Option<&'static mut Proc> {
-    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tid)
+    live().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tid)
 }
 
 pub fn find_leader(tgid: u32) -> Option<&'static mut Proc> {
-    procs().iter_mut().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tgid && !p.thread)
+    live().find(|p| p.state != State::Unused && p.state != State::Zombie && p.pid == tgid && !p.thread)
 }
 
 pub fn all_leaders() -> Vec<u32> {
-    procs().iter().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).map(|p| p.tgid).collect()
+    live().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).map(|p| p.tgid).collect()
 }
 
 pub fn all_leader_procs() -> Vec<&'static mut Proc> {
-    procs().iter_mut().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).collect()
+    live().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).collect()
 }
 
 pub fn leaders_in_pgrp(pgid: u32) -> Vec<u32> {
-    procs().iter().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread && p.pgid == pgid).map(|p| p.tgid).collect()
+    live().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread && p.pgid == pgid).map(|p| p.tgid).collect()
 }
 
 pub fn current_leader() -> &'static mut Proc {
@@ -1402,7 +1457,7 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
 
 pub fn threads_text() -> alloc::string::String {
     let mut out = alloc::format!("ticks {}\n  PID  TGID ST CHAN             SYSCALL ARG0             ARG1                 WAKE NAME\n", crate::timer::ticks());
-    for p in procs().iter() {
+    for p in live() {
         if p.state == State::Unused {
             continue;
         }
