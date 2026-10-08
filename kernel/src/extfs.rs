@@ -173,13 +173,42 @@ pub struct ExtFs {
     swapfiles: RefCell<BTreeSet<u32>>,
     /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
     /// (modify_dir_block) そのディレクトリの分を、ディレクトリの inode を空けたらその分を消す
-    names: RefCell<BTreeMap<(u32, String), u32>>,
+    names: RefCell<Names>,
     /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
     names_gen: core::cell::Cell<u64>,
 }
 
 /// 名前のキャッシュの大きさ (こえたら全部捨てて作りなおす)
-const NAMES_MAX: usize = 8192;
+const NAMES_MAX: usize = 65536; // 1 つ 100 バイトくらいで 6 MiB ほど
+
+/// 名前のキャッシュ: ディレクトリごとに 名前 → inode (引くときに文字列を作らずにすむように)
+struct Names {
+    dirs: BTreeMap<u32, BTreeMap<String, u32>>,
+    len: usize,
+}
+
+impl Names {
+    fn get(&self, dir: u32, name: &str) -> Option<u32> {
+        self.dirs.get(&dir)?.get(name).copied()
+    }
+
+    /// 入れる (いっぱいなら先に全部捨てる)
+    fn insert(&mut self, dir: u32, name: String, ino: u32) {
+        if self.len >= NAMES_MAX {
+            self.dirs.clear();
+            self.len = 0;
+        }
+        if self.dirs.entry(dir).or_default().insert(name, ino).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn forget(&mut self, dir: u32) {
+        if let Some(m) = self.dirs.remove(&dir) {
+            self.len -= m.len();
+        }
+    }
+}
 
 /// ディスク上の inode (inode_size バイトまるごと)
 #[derive(Clone)]
@@ -335,7 +364,7 @@ impl ExtFs {
             users: RefCell::new(BTreeMap::new()),
             orphans: RefCell::new(BTreeSet::new()),
             swapfiles: RefCell::new(BTreeSet::new()),
-            names: RefCell::new(BTreeMap::new()),
+            names: RefCell::new(Names { dirs: BTreeMap::new(), len: 0 }),
             names_gen: core::cell::Cell::new(0),
         });
         let gdt_len = groups as usize * desc_size;
@@ -1516,28 +1545,18 @@ impl ExtFs {
     /// dir の名前のキャッシュを捨てる
     fn forget_names(&self, dir: u32) {
         self.names_gen.set(self.names_gen.get() + 1);
-        let mut n = self.names.borrow_mut();
-        let keys: Vec<(u32, String)> = n.range((dir, String::new())..).take_while(|(k, _)| k.0 == dir).map(|(k, _)| k.clone()).collect();
-        for k in keys {
-            n.remove(&k);
-        }
+        self.names.borrow_mut().forget(dir);
     }
 
     fn find(&self, dir: u32, name: &str) -> Result<u32, i64> {
-        let key = (dir, String::from(name));
-        if let Some(&ino) = self.names.borrow().get(&key) {
+        if let Some(ino) = self.names.borrow().get(dir, name) {
             return Ok(ino);
         }
         let generation = self.names_gen.get();
         let ino = self.find_uncached(dir, name)?;
-        if self.names_gen.get() != generation {
-            return Ok(ino);
+        if self.names_gen.get() == generation {
+            self.names.borrow_mut().insert(dir, String::from(name), ino);
         }
-        let mut n = self.names.borrow_mut();
-        if n.len() >= NAMES_MAX {
-            n.clear();
-        }
-        n.insert(key, ino);
         Ok(ino)
     }
 
@@ -1550,11 +1569,34 @@ impl ExtFs {
                 Err(_) => {}
             }
         }
-        self.dir_entries(dir)?
-            .into_iter()
-            .find(|e| e.2 != 0 && e.4 == name)
-            .map(|e| e.2)
-            .ok_or(-ENOENT)
+        // 索引がない: ブロックを順に、その場でくらべる (名前の文字列は作らない)
+        let mut r = self.read_inode(dir)?;
+        let nblocks = r.size().div_ceil(self.bsize as u64);
+        for fb in 0..nblocks {
+            let b = self.map(dir, &mut r, fb, false)?;
+            if b != 0 && let Some(ino) = self.block_find(b, name.as_bytes())? {
+                return Ok(ino);
+            }
+        }
+        Err(-ENOENT)
+    }
+
+    /// ディレクトリのブロック b の中の name の inode
+    pub(super) fn block_find(&self, b: u64, name: &[u8]) -> Result<Option<u32>, i64> {
+        self.with_block(b, |d| {
+            let mut o = 0;
+            while o + 8 <= self.bsize {
+                let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+                if rl < 8 || o + rl > self.bsize {
+                    break;
+                }
+                if i != 0 && nl == name.len() && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name {
+                    return Some(i);
+                }
+                o += rl;
+            }
+            None
+        })
     }
 
     /// ディレクトリのブロックを書きかえ、チェックサムを直す
@@ -2085,8 +2127,23 @@ impl Inode for ExtInode {
 
     fn readdir(&self) -> Result<Vec<DirEntry>, i64> {
         self.dir_only()?;
+        let generation = self.fs.names_gen.get();
+        let ents = self.fs.dir_entries(self.ino)?;
+        // 一覧を読んだら、あとで名前で引かれる (find、ls -l): 名前のキャッシュにも入れておく
+        if self.fs.names_gen.get() == generation {
+            let mut n = self.fs.names.borrow_mut();
+            if ents.len() <= NAMES_MAX / 2 {
+                if n.len + ents.len() > NAMES_MAX {
+                    n.dirs.clear();
+                    n.len = 0;
+                }
+                for e in ents.iter().filter(|e| e.2 != 0) {
+                    n.insert(self.ino, e.4.clone(), e.2);
+                }
+            }
+        }
         let mut out = vec![];
-        for e in self.fs.dir_entries(self.ino)? {
+        for e in ents {
             if e.2 == 0 || e.4 == "." || e.4 == ".." {
                 continue;
             }
