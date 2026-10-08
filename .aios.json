@@ -1,7 +1,7 @@
 {
   "branch": "unix",
   "arch": "aarch64",
-  "updated": "2026-10-07",
+  "updated": "2026-10-08",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -33,9 +33,9 @@
     "boot": ["UEFI (aiboot)", "Linux arm64 Image", "DTB", "Raspberry Pi 3"],
     "cpu":  ["SMP (PSCI, spin-table)", "GICv2", "GICv3"],
     "mem":  ["swap", "memfd"],
-    "fs":   ["ext4 (jbd2, htree)", "ext2", "vfat", "tmpfs", "procfs", "initramfs", "inotify"],
+    "fs":   ["ext4 (jbd2, htree)", "ext2", "vfat", "tmpfs", "procfs (stat, net, vmstat, diskstats)", "/dev/fd", "initramfs", "inotify"],
     "dev":  ["virtio-blk", "virtio-net", "virtio-gpu", "virtio-input", "virtio-sound", "SD", "UART", "modules"],
-    "net":  ["IPv4 (TCP, UDP, DHCP)", "unix sockets (SCM_RIGHTS)"],
+    "net":  ["IPv4 (TCP, UDP, DHCP)", "ICMP (ping, raw)", "unix sockets (SCM_RIGHTS)"],
     "proc": ["signal", "futex", "epoll", "pty", "pidfd", "vDSO", "PT_INTERP", "umask", "capget"],
     "todo": ["seccomp", "namespace", "fine-grained lock (BKL)"]
   },
@@ -45,14 +45,14 @@
       "rust":    { "aiboot": "0.0.1", "aikernel": "0.0.1", "base": "0.0.1", "aigpt": "0.0.1", "ailog": "0.0.1", "aimg": "0.0.1" },
       "c":       { "base-devel": "0.0.1", "claude": "0.0.1" },
       "shell":   { "aish-powerline": "0.0.1" },
-      "desktop": { "aifont": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
+      "desktop": { "aifont": "0.0.1", "aifont-ja": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
     },
 
     "linux": {
       "rust": {
         "awk": "0.1.0.20261007", "brush": "0.4.0", "coreutils": "0.12.0", "diffutils": "0.5.0",
-        "findutils": "0.10.0", "grep": "0.2.0", "sed": "0.2.0", "sudo-rs": "0.2.15", "tar": "0.1.0.20261006",
-        "ripgrep": "15.2.0", "uv": "0.12.23"
+        "findutils": "0.10.0", "grep": "0.2.0", "sed": "0.2.0.20261006", "sudo-rs": "0.2.15", "tar": "0.1.0.20261006",
+        "ripgrep": "15.2.0", "fd": "10.5.0", "uv": "0.12.23"
       },
       "c": {
         "alsa-lib": "1.2.16.1", "alsa-utils": "1.2.16", "atk": "2.38.0",
@@ -68,7 +68,11 @@
 
         "ncurses": "6.6", "libevent": "2.1.13",
         "zsh": "5.9.2", "vim": "9.2.1169", "tmux": "3.7c", "openssh": "10.6p1", "jq": "1.8.2",
-        "libunwind": "0.16.0", "nodejs": "26.10.0", "cargo": "1.99.0"
+        "libunwind": "0.16.0", "nodejs": "26.10.0", "cargo": "1.99.0", "less": "710",
+
+        "procps-ng": "4.0.7", "gawk": "5.4.1", "libarchive": "3.8.9", "gzip": "1.15", "xz": "5.8.4",
+        "bzip2": "1.0.8", "zstd": "1.5.7", "patch": "2.8", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
+        "toybox": "0.8.15", "iproute2": "7.2.0"
       },
       "npm": { "pnpm": "12.9.1", "@anthropic-ai/claude-code": "2.1.289 (ap -S claude)" },
       "uv":  { "python": "3.14.8" }
