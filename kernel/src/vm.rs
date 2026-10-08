@@ -93,6 +93,74 @@ fn write_back(key: &FileKey, c: &Cached) {
     }
 }
 
+// ---- 読むだけのファイルのページ (ページキャッシュ) ----
+// MAP_PRIVATE のファイル (プログラムやライブラリ) のページは、読むだけのあいだはここの 1 枚をみんなで写す
+// (書きこみ禁止で写し、書いたときに fault_page のコピーオンライトで自分のものに)。同じプログラムを何度
+// 動かしても、ファイルを読みなおさない。ファイルが変わったら (更新時刻か大きさ) 読みなおす。
+// 表も 1 つ参照を持つ。PRIV_MAX をこえたら、だれも写していないもの (参照が表だけ) から捨てる
+
+struct PrivPage {
+    page: *mut u8,
+    mtime: u64,
+    size: u64,
+}
+
+const PRIV_MAX: usize = 16384; // 64 MiB
+
+static mut PRIV: BTreeMap<FileKey, PrivPage> = BTreeMap::new();
+
+fn priv_cache() -> &'static mut BTreeMap<FileKey, PrivPage> {
+    unsafe { &mut *(&raw mut PRIV) }
+}
+
+/// ページキャッシュのページの数 (/proc/meminfo の Cached)
+pub fn cached_pages() -> usize {
+    priv_cache().len()
+}
+
+/// だれも写していないページを捨てる (n 枚まで)。捨てた数
+pub fn shrink_cache(n: usize) -> usize {
+    let victims: Vec<FileKey> = priv_cache().iter().filter(|(_, c)| kalloc::refs(c.page) <= 1).map(|(k, _)| *k).take(n).collect();
+    for k in &victims {
+        if let Some(c) = priv_cache().remove(k) {
+            kalloc::put(c.page);
+        }
+    }
+    victims.len()
+}
+
+/// ino の foff (ページの境目) からの 1 ページ (ファイルの終わりのあとは 0)。ページの境目でなければ None
+fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
+    if foff % PGSIZE != 0 {
+        return None;
+    }
+    let m = ino.meta();
+    let key = file_key(ino, foff);
+    if let Some(c) = priv_cache().get(&key) {
+        if c.mtime == m.mtime && c.size == m.size {
+            return Some(c.page);
+        }
+        let c = priv_cache().remove(&key).unwrap();
+        kalloc::put(c.page);
+    }
+    if priv_cache().len() >= PRIV_MAX {
+        shrink_cache(PRIV_MAX / 8);
+    }
+    let page = kalloc::alloc()?;
+    let size = m.size as usize;
+    if foff < size {
+        let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
+        if ino.read_at(foff, buf).is_err() {
+            kalloc::free(page);
+            return None;
+        }
+    }
+    // コードかもしれないので命令キャッシュも (読みこんだときに一度だけ)
+    sync_icache(page as usize, PGSIZE);
+    priv_cache().insert(key, PrivPage { page, mtime: m.mtime, size: m.size });
+    Some(page)
+}
+
 /// MAP_SHARED で写しているファイルのページの数 (/proc/meminfo の Shmem)
 pub fn shared_pages() -> usize {
     shared_file().len()
@@ -785,6 +853,13 @@ impl PageTable {
                 sync_icache(page as usize, PGSIZE);
             }
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
+        } else if let (false, false, false, Backing::File { ino, off, fend }) = (has_page(e), write, force, &back)
+            && fend.saturating_sub(page_va) >= PGSIZE
+            && let Some(page) = file_page(ino, off + (page_va - start))
+        {
+            // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
+            kalloc::get(page);
+            unsafe { *pte = make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false) };
         } else if !has_page(e) {
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
             if let Backing::File { ino, off, fend } = &back {
