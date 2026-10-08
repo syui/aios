@@ -22,7 +22,7 @@ build() {
   cd "wayland-$pkgver"
   # 1. このマシンで動く wayland-scanner (プロトコルの XML から C を作る)
   (unset CC CFLAGS LDFLAGS
-   meson setup build --wrap-mode=nofallback-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
+   meson setup build-native --wrap-mode=nofallback -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
      -Ddtd_validation=false --prefix="$srcdir/native" --libdir=lib
    ninja -C build-native install)
   # 2. aios 用のライブラリ (Zig、aarch64-linux-musl)

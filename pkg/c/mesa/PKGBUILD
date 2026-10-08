@@ -17,11 +17,11 @@ provides=('egl-headers')
 conflicts=('egl-headers')
 makedepends=('meson' 'ninja' 'flex' 'bison' 'glslang' 'python-mako' 'python-yaml' 'wayland-protocols' 'qemu-user' 'expat')
 # Mesa は aios の libwayland と同じ版 (より新しい) の wayland-scanner を、このマシン用に欲しがる
-_wlver=1.24.0
+_wlver=1.26.0  # pkg/c/wayland と同じ版 (mesa は wayland-scanner がそれと同じ版であることを求める)
 source=("https://archive.mesa3d.org/mesa-$pkgver.tar.xz"
         "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$_wlver/downloads/wayland-$_wlver.tar.xz")
 sha256sums=('bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9'
-            '82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536')
+            '64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3')
 
 prepare() {
   rm -rf "mesa-$pkgver" "wayland-$_wlver"
@@ -33,7 +33,7 @@ build() {
   # このマシンで動く wayland-scanner
   (cd "wayland-$_wlver"
    unset CC CFLAGS LDFLAGS
-   meson setup build --wrap-mode=nofallback-native -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
+   meson setup build-native --wrap-mode=nofallback -Dlibraries=false -Dscanner=true -Ddocumentation=false -Dtests=false \
      -Ddtd_validation=false --prefix="$srcdir/native" --libdir=lib
    ninja -C build-native install)
   export PATH=$srcdir/native/bin:$PATH PKG_CONFIG_PATH_FOR_BUILD=$srcdir/native/lib/pkgconfig
@@ -58,8 +58,10 @@ exec qemu-aarch64 "$root$PREFIX/bin/llvm-config" "\$@"
 SH
   chmod 755 "$srcdir/llvm-config"
   sed -i "/^\[binaries\]/a llvm-config = '$srcdir/llvm-config'" "$srcdir/cross.ini"
+  # このマシンで動く wayland-scanner は native ファイルで教える (meson 1.12 は PKG_CONFIG_PATH_FOR_BUILD を見ない)
+  printf "[binaries]\nwayland-scanner = '%s'\n" "$srcdir/native/bin/wayland-scanner" > "$srcdir/native.ini"
   cd "mesa-$pkgver"
-  meson setup build --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+  meson setup build --cross-file "$srcdir/cross.ini" --native-file "$srcdir/native.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dplatforms=wayland \
     -Dgallium-drivers=llvmpipe \
     -Dvulkan-drivers=swrast \
