@@ -283,7 +283,15 @@ fn rules(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, Strin
 }
 
 /// 版をくらべる (pacman の vercmp と同じ考え: 数と英字のかたまりごと、数は数として)
+/// pkgver-pkgrel のときは pkgver どうし、そのあと pkgrel (157.0.1-1 > 157.0-3)
 pub fn vercmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.rsplit_once('-'), b.rsplit_once('-')) {
+        (Some((av, ar)), Some((bv, br))) => vercmp_part(av, bv).then_with(|| vercmp_part(ar, br)),
+        _ => vercmp_part(a, b),
+    }
+}
+
+fn vercmp_part(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     let seg = |s: &str| -> Vec<String> {
         let mut v: Vec<String> = Vec::new();
@@ -843,6 +851,15 @@ mod tests {
   }
 }
 "#;
+
+    #[test]
+    fn versions() {
+        use std::cmp::Ordering::*;
+        assert_eq!(vercmp("157.0.1-1", "157.0-3"), Greater);
+        assert_eq!(vercmp("157.0-3", "157.0-2"), Greater);
+        assert_eq!(vercmp("1.2", "1.2.1"), Less);
+        assert_eq!(vercmp("0.0.1.r348.g96b598c-1", "0.0.1.r347.gddb9e93-1"), Greater);
+    }
 
     #[test]
     fn insert_and_remove() {
