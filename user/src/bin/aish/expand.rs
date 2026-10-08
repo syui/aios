@@ -467,6 +467,7 @@ impl Shell {
                     j += 1;
                 }
                 let name: String = cs[i..j].iter().collect();
+                let name = self.deref(&name).to_string();
                 // 配列 ($path は $PATH ではなく path の配列): zsh と同じく、要素ごとに別の語 ("" の中ならつなぐ)
                 if name != "path" || self.arrays.contains_key("path") {
                     if let Some(a) = self.arrays.get(&name).cloned() {
@@ -536,6 +537,8 @@ impl Shell {
             // 読むたびに変わるもの (bash と zsh)。代入されていればそちら
             "RANDOM" if self.get_var("RANDOM").is_none() => (crate::rand_u32() & 0x7fff).to_string(),
             "SECONDS" if self.get_var("SECONDS").is_none() => self.started.elapsed().as_secs().to_string(),
+            // いまのプロセス ($$ はサブシェルでも親のまま、こちらは本当の pid)
+            "BASHPID" => unsafe { libc::getpid() }.to_string(),
             "EPOCHSECONDS" => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string(),
             n if n.chars().all(|c| c.is_ascii_digit()) => return n.parse::<usize>().ok().and_then(|i| self.params.get(i)).cloned(),
             n => return self.get_var(n),
@@ -567,6 +570,21 @@ impl Shell {
     }
 
     fn param_expr(&mut self, s: &str, o: &mut Out, quoted: bool) -> Result<(), String> {
+        // nameref (declare -n): 前の名前を指す先にかえる (${#r[@]} ${r[1]} ${r:-x} など)
+        let renamed;
+        let s = if self.namerefs.is_empty() {
+            s
+        } else {
+            let pre = if s.starts_with('#') && s.len() > 1 { 1 } else { 0 };
+            let end = s[pre..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(s.len(), |e| e + pre);
+            match self.namerefs.contains_key(&s[pre..end]) {
+                true => {
+                    renamed = format!("{}{}{}", &s[..pre], self.deref(&s[pre..end]), &s[end..]);
+                    renamed.as_str()
+                }
+                false => s,
+            }
+        };
         let put = |o: &mut Out, v: &str| if quoted { o.quoted(v) } else { o.unquoted(v) };
         // ${!...}: ${!a[@]} 番号 (連想配列ならキー)、${!pre*} ${!pre@} その名前で始まる変数、${!name} 間接参照
         if let Some(r) = s.strip_prefix('!')
@@ -595,7 +613,7 @@ impl Shell {
                 self.put_array(o, &names, quoted, r.ends_with('@'));
                 return Ok(());
             }
-            if parse::valid_name(r) || r.chars().all(|c| c.is_ascii_digit()) {
+            if parse::valid_name(r) || r.chars().all(|c| c.is_ascii_digit()) || r == "#" {
                 let target = self.special(r).unwrap_or_default();
                 if target.is_empty() {
                     return Ok(());
@@ -707,6 +725,11 @@ impl Shell {
                 }
                 return Ok(());
             }
+        }
+        // ${#@} ${#*}: 引数の数
+        if s == "#@" || s == "#*" {
+            put(o, &self.params.len().saturating_sub(1).to_string());
+            return Ok(());
         }
         // ${#NAME}: 長さ
         if let Some(name) = s.strip_prefix('#').filter(|n| !n.is_empty()) {
@@ -864,7 +887,7 @@ impl Shell {
         }
         // bash の ${x:OFFSET} ${x:OFFSET:LENGTH} (文字の番号。負は終わりから)
         if let Some(m) = rest.strip_prefix(':')
-            && m.starts_with(|c: char| c.is_ascii_digit() || c == ' ' || c == '(' || c == '$')
+            && m.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, ' ' | '(' | '$' | '_' | ':'))
         {
             let v: Vec<char> = val.unwrap_or_default().chars().collect();
             let (off, len) = match m.split_once(':') {
@@ -872,7 +895,7 @@ impl Shell {
                 None => (m, None),
             };
             let off = self.expand_one(off)?;
-            let off = self.arith(&off)?;
+            let off = if off.trim().is_empty() { 0 } else { self.arith(&off)? };
             let n = v.len() as i64;
             let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
             let end = match len {

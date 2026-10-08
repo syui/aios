@@ -50,3 +50,24 @@ f() { local IFS=,; echo "$*"; }; f a b c	a,b,c
 a=(x y z); echo $a ${#a}	x 1
 echo $LINENO	1
 readonly C=3; unset C 2>/dev/null; echo $C	3
+echo -e 'a\x41\0101'	aAA
+set -- a b; echo "${#@}" "${!#}"	2 b
+v=abc; echo "${v::2}" "${v:1}"	ab bc
+i=1; v=abcd; echo "${v:i:2}"	bc
+builtin echo bi	bi
+ulimit -n | grep -c '^[0-9]'	1
+declare -l lo=ABC; declare -u up=abc; echo $lo $up	abc ABC
+f() { echo hi; }; declare -f f; declare -F f	f () |{ |    echo hi|}|f
+declare -F nosuch || echo nof	nof
+f() { trap 'echo ret' RETURN; }; f; echo done	ret|done
+x="a,b,c"; IFS=, arr=($x); echo ${#arr[@]}	3
+a=(3 1 2); IFS=$'\n' sorted=($(sort <<<"${a[*]}")); echo "${sorted[*]}"	1|2|3
+true | false | true; echo "${PIPESTATUS[@]}"	0 1 0
+false; echo "${PIPESTATUS[0]}"	1
+[ $BASHPID -eq $$ ] && echo same	same
+f() { local -n r=$1; r=changed; }; v=orig; f v; echo $v	changed
+f() { local -n arr=$1; echo ${#arr[@]} ${arr[1]}; arr+=(d); }; x=(a b c); f x; echo ${x[3]}	3 b|d
+shopt -s extglob; x=aaab; echo ${x//+(a)/A}	Ab
+[[ foo.h == *.@(c|h) ]] && echo exth	exth
+[[ foo.o == !(*.c) ]] && echo notc	notc
+[[ ab == ?(a)b ]] && [[ b == ?(a)b ]] && echo opt	opt

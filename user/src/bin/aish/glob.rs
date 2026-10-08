@@ -108,8 +108,71 @@ pub fn glob_or_none(w: &str) -> Vec<String> {
     v
 }
 
+/// extglob の始まり (?( *( +( @( !( ) か
+fn ext_at(p: &[char], i: usize) -> bool {
+    matches!(p[i], GLOB_STAR | GLOB_ONE | '+' | '@' | '!') && p.get(i + 1) == Some(&'(')
+}
+
+/// extglob の ( の対になる ) と、| で分けた中身
+fn ext_group(p: &[char], open: usize) -> Option<(usize, Vec<&[char]>)> {
+    let (mut depth, mut start, mut alts) = (0, open + 1, vec![]);
+    for (i, &c) in p.iter().enumerate().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    alts.push(&p[start..i]);
+                    return Some((i, alts));
+                }
+            }
+            '|' if depth == 1 => {
+                alts.push(&p[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// extglob のあるパターン: 前から 1 つずつ、分かれ道は全部ためす
+fn ext_match(p: &[char], s: &[char]) -> bool {
+    let Some(&c) = p.first() else { return s.is_empty() };
+    if ext_at(p, 0)
+        && let Some((close, alts)) = ext_group(p, 1)
+    {
+        let rest = &p[close + 1..];
+        let one = |a: &[char], k: usize| ext_match(a, &s[..k]);
+        return match c {
+            '@' => (0..=s.len()).any(|k| alts.iter().any(|a| one(a, k)) && ext_match(rest, &s[k..])),
+            GLOB_ONE => ext_match(rest, s) || (0..=s.len()).any(|k| alts.iter().any(|a| one(a, k)) && ext_match(rest, &s[k..])),
+            // *( ) は 0 回から、+( ) は 1 回から。くり返しは同じグループを残りに当てる
+            GLOB_STAR | '+' => {
+                (c == GLOB_STAR && ext_match(rest, s))
+                    || (1..=s.len()).any(|k| alts.iter().any(|a| one(a, k)) && (ext_match(rest, &s[k..]) || ext_match(p, &s[k..])))
+            }
+            // !( ): どれにも当たらない部分
+            _ => (0..=s.len()).any(|k| !alts.iter().any(|a| one(a, k)) && ext_match(rest, &s[k..])),
+        };
+    }
+    match c {
+        GLOB_STAR => ext_match(&p[1..], s) || (!s.is_empty() && ext_match(p, &s[1..])),
+        _ if s.is_empty() => false,
+        GLOB_ONE => ext_match(&p[1..], &s[1..]),
+        GLOB_SET => match match_set(&p[1..], s[0]) {
+            Some((ok, len)) => ok && ext_match(&p[1 + len..], &s[1..]),
+            None => s[0] == '[' && ext_match(&p[1..], &s[1..]),
+        },
+        c => c == s[0] && ext_match(&p[1..], &s[1..]),
+    }
+}
+
 /// パターン (印つき) が名前全体に当たるか
 pub fn glob_match(p: &[char], s: &[char]) -> bool {
+    if (0..p.len()).any(|i| ext_at(p, i)) {
+        return ext_match(p, s);
+    }
     let (mut pi, mut si) = (0, 0);
     // 最後に見た * の場所 (そこからやり直す)
     let mut star: Option<(usize, usize)> = None;
