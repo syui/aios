@@ -189,6 +189,19 @@ pub fn active() -> bool {
     list().iter().any(|w| w.upgrade().is_some_and(|n| !n.borrow().watches.is_empty()))
 }
 
+/// ev を待っている watch があるか、と、そのうち id 以外 (親ディレクトリかもしれない) のものがあるか
+fn wanted(ev: u32, id: (usize, u64)) -> (bool, bool) {
+    let (mut any, mut others) = (false, false);
+    for w in list().iter() {
+        let Some(n) = w.upgrade() else { continue };
+        for w in n.borrow().watches.iter().filter(|w| w.mask & ev != 0) {
+            any = true;
+            others |= w.id != id;
+        }
+    }
+    (any, others)
+}
+
 /// id の inode を見張るものに、できごと (mask。IN_ISDIR はついていてよい) を届ける。name はディレクトリの中のもの
 fn deliver(id: (usize, u64), mask: u32, cookie: u32, name: Option<&str>) {
     let ev = mask & IN_ALL_EVENTS;
@@ -222,12 +235,17 @@ pub fn self_event(ino: &InodeRef, mask: u32) {
 /// 開いたファイルに起きたこと (書く、開く、閉じる、属性): その inode と、入っているディレクトリ (名前つき) に。
 /// path は開いたときのパス (先頭 / なし)
 pub fn file_event(path: &str, ino: &InodeRef, mask: u32) {
-    if !active() {
+    // 見張っている人がいても、このできごと (読むたびの IN_ACCESS など) をだれも待っていなければすぐ戻る。
+    // 親ディレクトリを探す (パスをたどる) のは、ほかのものを見張っている (ディレクトリかもしれない) ときだけ
+    let id = ino.id();
+    let (wanted, others) = wanted(mask & IN_ALL_EVENTS, id);
+    if !wanted {
         return;
     }
     let mask = if ino.meta().is_dir() { mask | IN_ISDIR } else { mask };
-    deliver(ino.id(), mask, 0, None);
-    if let Ok((dir, name)) = vfs::parent_of("", &alloc::format!("/{}", path))
+    deliver(id, mask, 0, None);
+    if others
+        && let Ok((dir, name)) = vfs::parent_of("", &alloc::format!("/{}", path))
         && !name.is_empty()
     {
         deliver(dir.id(), mask, 0, Some(&name));
