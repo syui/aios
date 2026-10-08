@@ -457,10 +457,11 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 1] = ["uts"];
+const NS_KINDS: [&str; 2] = ["net", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
+        "net" => c.ns.net_id(),
         _ => c.ns.uts_id(),
     }
 }

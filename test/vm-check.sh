@@ -1,7 +1,7 @@
 # aios の中で動かす短いたしかめ (CI の起動のテストのあと、test/vm.py run "$(cat test/vm-check.sh)" で)。
 # 外 (このマシンの aish のテスト) ではわからない、カーネルとイメージの組み合わせだけを見る:
 #   /sys と /proc (psutil などが読むところ)、イメージに入っているコマンド (tar は bsdtar、awk は gawk)、
-#   sh の名前の aish (printf と select、/dev/fd)、aibox (seccomp)、sudo
+#   sh の名前の aish (printf と select、/dev/fd)、aibox (seccomp と namespace)、sudo
 # 1 行に ok NAME か FAIL NAME。おしまいに checks: N failed (0 でなければ失敗のステータス)
 fail=0
 n=0
@@ -52,6 +52,7 @@ t sh-pipestatus eq "$(sh -c 'true | false | true; echo "${PIPESTATUS[@]}"')" '0 
 # aibox の砂場 (landlock と seccomp)
 t aibox-seccomp sh -c 'aibox -- grep -q "^Seccomp:.2" /proc/self/status'
 t aibox-deny sh -c '! aibox --deny uname -- uname'
+t aibox-no-net sh -c '[ "$(aibox --no-net -- readlink /proc/self/ns/net)" != "$(readlink /proc/self/ns/net)" ]'
 
 # sudo (パスワードなしで使えるイメージの ai)
 t sudo sudo -n true

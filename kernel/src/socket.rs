@@ -28,6 +28,8 @@ const ENOTCONN: i64 = 107;
 const ETIMEDOUT: i64 = 110;
 const ECONNREFUSED: i64 = 111;
 const EINPROGRESS: i64 = 115;
+const EADDRNOTAVAIL: i64 = 99;
+const ENETUNREACH: i64 = 101;
 
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
@@ -65,6 +67,8 @@ pub struct Socket {
     ino: usize,
     /// setsockopt IP_TTL (なければ 64)
     ttl: Option<u8>,
+    /// 分けた NET (ns.rs) の中の UDP / ICMP: どこへも送れない
+    isolated: bool,
 }
 
 /// smoltcp のソケット → (inode, 持ち主の uid)。/proc/net/tcp が読む (待っているプロセスはソケットを
@@ -229,6 +233,9 @@ impl Socket {
     }
 
     fn send(&mut self, buf: &[u8], to: Option<IpEndpoint>, dontwait: bool) -> Result<usize, i64> {
+        if self.isolated {
+            return Err(-ENETUNREACH);
+        }
         let nb = self.nonblock || dontwait;
         match self.proto {
             Proto::Tcp => {
@@ -496,6 +503,13 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     if domain != AF_INET {
         return Err(-EAFNOSUPPORT);
     }
+    // 分けた NET の中の TCP は、中どうしでだけつながる口 (unix.rs の inet)
+    let isolated = crate::ns::net().is_some();
+    if isolated && typ & 0xf == SOCK_STREAM {
+        let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
+        let fd = proc::current().files().add(file::new(crate::unix::new_inet_kind(), flags), typ & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     let proto = match typ & 0xf {
         SOCK_STREAM => Proto::Tcp,
         SOCK_DGRAM if protocol == IPPROTO_ICMP => Proto::Icmp,
@@ -510,16 +524,28 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
         _ => return Err(-EPROTONOSUPPORT),
     };
     n()?;
-    let mut s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0, ino: 0, ttl: None };
+    let mut s = Socket { proto, handle: None, local: None, peer: None, listening: false, nonblock: typ & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated };
     // raw は作ったときから受ける (traceroute は受ける口を poll で待つだけで、送らない)
-    if s.proto == Proto::Raw {
+    if s.proto == Proto::Raw && !isolated {
         s.bind_raw()?;
     }
     add_fd(s, typ & SOCK_CLOEXEC != 0)
 }
 
+/// 分けた NET の中: 127.x (か 0.0.0.0) でなければ、そのアドレスはない
+fn loopback_only(ep: &IpEndpoint, err: i64) -> Result<(), i64> {
+    let IpAddress::Ipv4(a) = ep.addr;
+    if a.octets()[0] == 127 || ep.addr.is_unspecified() { Ok(()) } else { Err(err) }
+}
+
 pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     if let Some(f) = unix_file(fd) {
+        if crate::unix::inet_port(&f).is_some() {
+            let ep = read_addr(addr, len)?;
+            loopback_only(&ep, -EADDRNOTAVAIL)?;
+            crate::landlock::check_net(ep.port, crate::landlock::BIND_TCP)?;
+            return crate::unix::inet_bind(&f, ep.port);
+        }
         return crate::unix::bind(&f, addr, len);
     }
     let s = sock_of(fd)?;
@@ -533,7 +559,7 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     // ログインの受け口など、port 0 で listen するものがある)
     let port = if ep.port == 0 && s.proto == Proto::Tcp { ephemeral() } else { ep.port };
     s.local = Some(IpListenEndpoint { addr: a, port });
-    if s.proto == Proto::Udp {
+    if s.proto == Proto::Udp && !s.isolated {
         s.bind_udp()?;
     }
     Ok(0)
@@ -541,6 +567,9 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
 
 pub fn listen(fd: u64) -> R {
     if let Some(f) = unix_file(fd) {
+        if crate::unix::inet_port(&f).is_some() {
+            return crate::unix::inet_listen(&f);
+        }
         return crate::unix::listen(&f);
     }
     let s = sock_of(fd)?;
@@ -563,7 +592,14 @@ pub fn listen(fd: u64) -> R {
 pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
     if let Some(f) = unix_file(fd) {
         let n = crate::unix::accept(&f, flags)?;
-        crate::unix::write_family(addr, lenp)?;
+        // 分けた NET の中の TCP: 相手は 127.0.0.1:そのポート
+        let peer = proc::current().files().get(n as u64).cloned().and_then(|c| crate::unix::inet_ports(&c));
+        match peer {
+            Some((_, p)) => write_addr(addr, lenp, Some(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), p)))?,
+            None => {
+                crate::unix::write_family(addr, lenp)?;
+            }
+        }
         return Ok(n);
     }
     let s = sock_of(fd)?;
@@ -582,7 +618,7 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
             tcp(nh).listen(s.local.unwrap()).map_err(|_| -EADDRINUSE)?;
             s.handle = Some(nh);
             own(nh, s.ino);
-            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None };
+            let c = Socket { proto: Proto::Tcp, handle: Some(h), local: s.local, peer, listening: false, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated: false };
             write_addr(addr, lenp, peer)?;
             return add_fd(c, flags & SOCK_CLOEXEC != 0);
         }
@@ -593,6 +629,12 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
 
 pub fn connect(fd: u64, addr: usize, len: usize) -> R {
     if let Some(f) = unix_file(fd) {
+        if crate::unix::inet_port(&f).is_some() {
+            let ep = read_addr(addr, len)?;
+            loopback_only(&ep, -ENETUNREACH)?;
+            crate::landlock::check_net(ep.port, crate::landlock::CONNECT_TCP)?;
+            return crate::unix::inet_connect(&f, ep.port);
+        }
         return crate::unix::connect(&f, addr, len);
     }
     if pair_of(fd).is_some() {
@@ -603,6 +645,9 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
     let mut s = s.borrow_mut();
     if s.proto == Proto::Tcp {
         crate::landlock::check_net(ep.port, crate::landlock::CONNECT_TCP)?;
+    }
+    if s.isolated {
+        return Err(-ENETUNREACH);
     }
     match s.proto {
         Proto::Udp => {
@@ -688,7 +733,21 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
     Ok(k as i64)
 }
 
+/// 分けた NET の中の TCP の口なら (自分のポート, 相手のポート。まだなら 0)
+fn inet_of(fd: u64) -> Option<(u16, u16)> {
+    let f = proc::current().files().get(fd).cloned()?;
+    crate::unix::inet_ports(&f).or_else(|| crate::unix::inet_port(&f).map(|p| (p, 0)))
+}
+
+fn lo(port: u16) -> Option<IpEndpoint> {
+    Some(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), port))
+}
+
 pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
+    if let Some((me, _)) = inet_of(fd) {
+        write_addr(addr, lenp, lo(me))?;
+        return Ok(0);
+    }
     if unix_file(fd).is_some() || pair_of(fd).is_some() {
         return crate::unix::write_family(addr, lenp);
     }
@@ -703,6 +762,13 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
 }
 
 pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
+    if let Some((_, peer)) = inet_of(fd) {
+        if peer == 0 {
+            return Err(-ENOTCONN);
+        }
+        write_addr(addr, lenp, lo(peer))?;
+        return Ok(0);
+    }
     if pair_of(fd).is_some() {
         return crate::unix::write_family(addr, lenp);
     }
@@ -750,7 +816,8 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
         }
         let v: i32 = match (level, opt) {
             (SOL_SOCKET, SO_TYPE) => 1,
-            (SOL_SOCKET, SO_DOMAIN) => 1, // AF_UNIX
+            // AF_UNIX (分けた NET の中の TCP なら AF_INET)
+            (SOL_SOCKET, SO_DOMAIN) => if inet_of(fd).is_some() { 2 } else { 1 },
             // 送り受けのバッファ (パイプの大きさ)
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => file::PIPE_SIZE as i32,
             _ => 0,
