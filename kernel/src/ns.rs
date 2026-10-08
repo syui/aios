@@ -1,5 +1,8 @@
 // namespace: プロセスから見える世界を分ける (Linux と同じ CLONE_NEW* と unshare)
 //   UTS  ホスト名 (uname の nodename、sethostname)
+//   NET  ネットワーク: 中から見えるのは自分の 127.0.0.1 だけ。TCP は中どうしでだけつながる (unix.rs の inet:
+//        smoltcp はひとつなので、中の TCP は unix ソケットのしくみで「namespace の番号とポート」の名前につなぐ)。
+//        UDP と ICMP はどこへも送れない (ENETUNREACH)。抽象名前空間の unix ソケット (@...) も分かれる (Linux と同じ)
 // clone(CLONE_NEW*) か unshare(CLONE_NEW*) で新しいものを作る。fork と exec で引き継ぐ (cred の中に持つ)
 // 作るには root か no_new_privs が要る (aios には user namespace がないので、Linux のように root 以外を
 // 止めるのではなく、できることが減るだけの namespace は、setuid のプログラムをだませない no_new_privs で許す)。
@@ -9,11 +12,13 @@ use alloc::rc::Rc;
 use core::cell::RefCell;
 
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
 
 const EPERM: i64 = 1;
 
 /// はじめからある namespace の番号 (Linux と同じ)
 pub const INIT_UTS: u64 = 4026531838;
+pub const INIT_NET: u64 = 4026531840;
 
 static mut NEXT_ID: u64 = 4026532000;
 
@@ -30,23 +35,38 @@ pub struct Uts {
     pub name: RefCell<([u8; 64], usize)>,
 }
 
+/// NET: 番号だけ (中のソケットは番号で分ける)
+pub struct Net {
+    pub id: u64,
+}
+
 /// プロセスの namespace (None ははじめからあるもの)
 #[derive(Clone)]
 pub struct Ns {
     pub uts: Option<Rc<Uts>>,
+    pub net: Option<Rc<Net>>,
 }
 
 impl Ns {
-    pub const INIT: Ns = Ns { uts: None };
+    pub const INIT: Ns = Ns { uts: None, net: None };
 
     /// 番号 (/proc/PID/ns と lsns)
     pub fn uts_id(&self) -> u64 {
         self.uts.as_ref().map_or(INIT_UTS, |u| u.id)
     }
+
+    pub fn net_id(&self) -> u64 {
+        self.net.as_ref().map_or(INIT_NET, |n| n.id)
+    }
+}
+
+/// いまのプロセスが分けた NET の中なら、その番号
+pub fn net() -> Option<u64> {
+    crate::proc::current().cred.ns.net.as_ref().map(|n| n.id)
 }
 
 /// flags の CLONE_NEW* のうち、扱えるもの
-pub const SUPPORTED: u64 = CLONE_NEWUTS;
+pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET;
 
 /// cred の namespace を flags のぶん新しくする (clone の子と unshare)
 pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
@@ -59,6 +79,9 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
         c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name) }));
+    }
+    if flags & CLONE_NEWNET != 0 {
+        c.ns.net = Some(Rc::new(Net { id: next_id() }));
     }
     Ok(())
 }

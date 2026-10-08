@@ -1,7 +1,9 @@
 // aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
 //   aibox [-w PATH]... [-n PORT]... [--no-net] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
-//   --no-net で TCP はどこへもつなげない。-n PORT でその口だけつなげる (--no-net がなくても、-n があればそれだけ)。
+//   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
+//   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
+//   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。
 //   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
 //   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
@@ -89,6 +91,15 @@ fn main() {
             eprintln!("aibox: {}", e);
             std::process::exit(1);
         }
+    }
+    // namespace を分ける (no_new_privs のあとで): UTS はいつも、NET は --no-net (ポートの指定なし) のとき
+    let mut ns = libc::CLONE_NEWUTS;
+    if ports.as_ref().is_some_and(|p| p.is_empty()) {
+        ns |= libc::CLONE_NEWNET;
+    }
+    if unsafe { libc::unshare(ns) } != 0 {
+        eprintln!("aibox: unshare: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
     }
     // システムコールをしぼる (landlock が no_new_privs をつけたあとで)
     if let Err(e) = seccomp::restrict(&deny, &kill) {

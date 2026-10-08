@@ -3,6 +3,9 @@
 // sendmsg / recvmsg の SCM_RIGHTS で fd を渡せる (Wayland の共有メモリやキーマップ)。
 //
 // 名前はパスの文字列で覚える (ファイルシステムには置かない)。先頭が NUL の抽象名前空間も同じ表
+// (分けた NET の中の抽象名前空間は、その番号をつけて分ける)。
+// inet: 分けた NET (ns.rs) の中の AF_INET の TCP もここ。名前は「#inet番号:ポート」(ユーザーの名前とまざらない)。
+// 外からは AF_INET の 127.0.0.1:ポート に見える (getsockname / getpeername / accept)
 use crate::file::{self, FileRef, Kind, Pipe};
 use crate::proc;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -38,6 +41,8 @@ pub struct Unix {
     owner: (u32, u32, u32),
     /// 待ち行列に来た回数 (epoll の EPOLLET。accept で空にしたあとにまた来たのを知らせる)
     pub generation: u64,
+    /// 分けた NET の中の AF_INET の TCP なら Some(bind したポート。まだなら 0)
+    pub inet: Option<u16>,
 }
 
 /// いまのプロセスの (pid, uid, gid) (SO_PEERCRED の答え)
@@ -88,7 +93,12 @@ fn key(u: &UnixRef) -> usize {
 }
 
 pub fn new_kind() -> Kind {
-    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0), generation: 0 })))
+    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0), generation: 0, inet: None })))
+}
+
+/// 分けた NET の中の AF_INET の TCP の口
+pub fn new_inet_kind() -> Kind {
+    Kind::Unix(Rc::new(RefCell::new(Unix { path: None, backlog: None, owner: (0, 0, 0), generation: 0, inet: Some(0) })))
 }
 
 /// poll 用: listen 中で待っている相手がいれば読める
@@ -109,7 +119,11 @@ fn read_name(addr: usize, len: usize) -> Result<String, i64> {
     }
     let raw = &b[2..];
     if raw[0] == 0 {
-        return Ok(alloc::format!("@{}", String::from_utf8_lossy(&raw[1..])));
+        // 抽象名前空間は NET ごと
+        return Ok(match crate::ns::net() {
+            Some(n) => alloc::format!("@{}:{}", n, String::from_utf8_lossy(&raw[1..])),
+            None => alloc::format!("@{}", String::from_utf8_lossy(&raw[1..])),
+        });
     }
     let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     let p = core::str::from_utf8(&raw[..end]).map_err(|_| -EINVAL)?;
@@ -203,6 +217,90 @@ pub fn accept(f: &FileRef, flags: u64) -> R {
         }
         proc::sleep(key(&u))?;
     }
+}
+
+// ---- 分けた NET の中の AF_INET の TCP ----
+
+fn inet_name(port: u16) -> String {
+    alloc::format!("#inet{}:{}", crate::ns::net().unwrap_or(0), port)
+}
+
+/// 空いているポート (中ではまず 32768 から)
+fn inet_free_port() -> u16 {
+    static mut NEXT: u16 = 32767;
+    for _ in 0..30000 {
+        let p = unsafe {
+            NEXT = if NEXT >= 60999 { 32768 } else { NEXT + 1 };
+            NEXT
+        };
+        if !names().get(&inet_name(p)).is_some_and(|w| w.upgrade().is_some()) {
+            return p;
+        }
+    }
+    0
+}
+
+/// AF_INET の口なら (bind したポート)
+pub fn inet_port(f: &FileRef) -> Option<u16> {
+    unix_of(f).and_then(|u| u.borrow().inet)
+}
+
+/// つながった口 (Kind::Pair) なら (自分のポート, 相手のポート)
+pub fn inet_ports(f: &FileRef) -> Option<(u16, u16)> {
+    match &f.borrow().kind {
+        Kind::Pair(rx, tx) => Some((tx.borrow().inet?, rx.borrow().inet?)),
+        _ => None,
+    }
+}
+
+pub fn inet_bind(f: &FileRef, port: u16) -> R {
+    let u = unix_of(f).ok_or(-EINVAL)?;
+    if u.borrow().path.is_some() {
+        return Err(-EINVAL);
+    }
+    let port = if port == 0 { inet_free_port() } else { port };
+    let name = inet_name(port);
+    if names().get(&name).is_some_and(|w| w.upgrade().is_some()) {
+        return Err(-EADDRINUSE);
+    }
+    names().insert(name.clone(), Rc::downgrade(&u));
+    let mut ub = u.borrow_mut();
+    ub.path = Some(name);
+    ub.inet = Some(port);
+    Ok(0)
+}
+
+pub fn inet_listen(f: &FileRef) -> R {
+    // bind していなければ、空いているポートで (Linux と同じ)
+    if unix_of(f).is_some_and(|u| u.borrow().path.is_none()) {
+        inet_bind(f, 0)?;
+    }
+    listen(f)
+}
+
+/// 中の 127.0.0.1:port につなぐ。待っているものがなければ ECONNREFUSED (TCP と同じ)
+pub fn inet_connect(f: &FileRef, port: u16) -> R {
+    let mine_port = match inet_port(f) {
+        Some(0) | None => inet_free_port(),
+        Some(p) => p,
+    };
+    let l = names().get(&inet_name(port)).and_then(|w| w.upgrade()).ok_or(-ECONNREFUSED)?;
+    let (mine, theirs) = Pipe::pair();
+    if let Kind::Pair(rx, tx) = &mine {
+        rx.borrow_mut().inet = Some(port);
+        tx.borrow_mut().inet = Some(mine_port);
+    }
+    {
+        let mut lb = l.borrow_mut();
+        set_creds(&mine, lb.owner, me());
+        let q = lb.backlog.as_mut().ok_or(-ECONNREFUSED)?;
+        q.push_back(file::new(theirs, file::O_RDWR));
+        lb.generation += 1;
+    }
+    proc::wakeup(key(&l));
+    proc::poll_wake(key(&l));
+    f.borrow_mut().kind = mine;
+    Ok(0)
 }
 
 /// getsockname / getpeername: 名前は返さず、AF_UNIX だということだけ
