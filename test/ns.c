@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <dirent.h>
 
 static int fails;
 #define CHECK(name, cond) do { if (cond) printf("ok %s\n", name); else { printf("FAIL %s (errno %d)\n", name, errno); fails++; } } while (0)
@@ -100,6 +101,57 @@ static int net_abstract(void) {
 }
 static int net_link(void) { char before[64], after[64]; link_of("/proc/self/ns/net", before); if (enter_net()) return 2; link_of("/proc/self/ns/net", after); return strcmp(before, after) && !strncmp(after, "net:[", 5) ? 0 : 3; }
 
+static int pid_noprivs(void) { return getuid() != 0 && unshare(CLONE_NEWPID) == -1 && errno == EPERM ? 0 : 1; }
+static pid_t outside;
+/* unshare のあとの最初の子が中の 1 番。親は見えない (getppid 0)。外のプロセスは kill できない (ESRCH) */
+static int pid_first(void) {
+  outside = getpid();
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  if (unshare(CLONE_NEWPID)) return 2;
+  if (getpid() != outside) return 3;           /* 自分は外のまま */
+  pid_t p = fork();
+  if (p == 0) {
+    if (getpid() != 1 || getppid() != 0) _exit(1);
+    if (kill(outside, 0) != -1 || errno != ESRCH) _exit(2);
+    /* 孫は 2 番、wait は中の番号 */
+    pid_t g = fork(); if (g == 0) _exit(getpid() == 2 ? 0 : 1);
+    int st; pid_t w = waitpid(-1, &st, 0); if (w != 2 || WEXITSTATUS(st)) _exit(3);
+    /* /proc には中のものだけ、/proc/self は 1 */
+    char l[16] = {0}; readlink("/proc/self", l, 15); if (strcmp(l, "1")) _exit(4);
+    DIR *d = opendir("/proc"); struct dirent *e; int n = 0, other = 0;
+    while ((e = readdir(d))) { if (e->d_name[0] >= '0' && e->d_name[0] <= '9') { n++; if (strcmp(e->d_name, "1")) other++; } }
+    if (n != 1 || other) _exit(5);
+    /* 入れ子は作れない */
+    if (unshare(CLONE_NEWPID) != -1 || errno != EINVAL) _exit(6);
+    _exit(0);
+  }
+  if (p <= 1) return 4;                        /* 外からは本当の番号 */
+  int st; waitpid(p, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) * 10 : 99;
+}
+static int fn_pid(void *a) { return getpid() == 1 ? 0 : 1; }
+static int pid_clone(void) {
+  static char stack[65536];
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  pid_t p = clone(fn_pid, stack + sizeof stack, CLONE_NEWPID | SIGCHLD, 0);
+  if (p < 0) return 2;
+  int st; waitpid(p, &st, 0); return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 3;
+}
+/* 中の 1 番が終わると、中の孫も終わる (孫が持っていたパイプが閉じる) */
+static int pid_init_exit(void) {
+  int fd[2]; pipe(fd);
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  if (unshare(CLONE_NEWPID)) return 2;
+  pid_t p = fork();
+  if (p == 0) {
+    if (fork() == 0) { close(fd[0]); for (;;) pause(); }
+    _exit(0);
+  }
+  close(fd[1]);
+  int st; waitpid(p, &st, 0);
+  alarm(5);
+  char b; return read(fd[0], &b, 1) == 0 ? 0 : 3;
+}
+
 int main(void) {
   CHECK("uts-needs-no-new-privs", child(uts_noprivs) == 0);
   CHECK("uts-unshare", child(uts_new) == 0);
@@ -112,6 +164,10 @@ int main(void) {
   CHECK("net-no-eth-no-udp", child(net_no_eth) == 0);
   CHECK("net-abstract-unix", child(net_abstract) == 0);
   CHECK("net-ns-link", child(net_link) == 0);
+  CHECK("pid-needs-no-new-privs", child(pid_noprivs) == 0);
+  CHECK("pid-first-child-is-1", child(pid_first) == 0);
+  CHECK("pid-clone", child(pid_clone) == 0);
+  CHECK("pid-init-exit-kills", child(pid_init_exit) == 0);
   printf("ns: %d failed\n", fails);
   return fails != 0;
 }

@@ -52,6 +52,7 @@ t sh-pipestatus eq "$(sh -c 'true | false | true; echo "${PIPESTATUS[@]}"')" '0 
 # aibox の砂場 (landlock と seccomp)
 t aibox-seccomp sh -c 'aibox -- grep -q "^Seccomp:.2" /proc/self/status'
 t aibox-deny sh -c '! aibox --deny uname -- uname'
+t aibox-pid eq "$(aibox -- sh -c 'echo $$')" 1
 t aibox-no-net sh -c '[ "$(aibox --no-net -- readlink /proc/self/ns/net)" != "$(readlink /proc/self/ns/net)" ]'
 
 # sudo (パスワードなしで使えるイメージの ai)

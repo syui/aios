@@ -350,7 +350,7 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
             put(&mut b, 28, &crate::seccomp::AUDIT_ARCH_AARCH64.to_le_bytes());
         }
         SIGCHLD => {
-            put(&mut b, 16, &i.pid.to_le_bytes());
+            put(&mut b, 16, &crate::ns::local_or_0(i.pid).to_le_bytes());
             put(&mut b, 20, &i.uid.to_le_bytes());
             put(&mut b, 24, &i.status.to_le_bytes());
         }
@@ -359,7 +359,7 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
             put(&mut b, 24, &i.value.to_le_bytes());
         }
         _ => {
-            put(&mut b, 16, &i.pid.to_le_bytes());
+            put(&mut b, 16, &crate::ns::local_or_0(i.pid).to_le_bytes());
             put(&mut b, 20, &i.uid.to_le_bytes());
             put(&mut b, 24, &i.value.to_le_bytes());
         }
@@ -749,7 +749,8 @@ pub fn kill(pid: i64, sig: i32) -> R {
     } else if pid == 0 {
         proc::leaders_in_pgrp(proc::current().pgid)
     } else if pid == -1 {
-        proc::all_leaders().into_iter().filter(|&t| t != 1 && t != proc::current().tgid).collect()
+        // PID の namespace の中からは、中のものだけ
+        proc::all_leaders().into_iter().filter(|&t| t != 1 && t != proc::current().tgid && crate::ns::to_local(t).is_some()).collect()
     } else {
         proc::leaders_in_pgrp((-pid) as u32)
     };

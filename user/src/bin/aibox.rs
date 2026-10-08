@@ -3,7 +3,8 @@
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
 //   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
 //   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
-//   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。
+//   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。プロセスの番号も分ける (PID の namespace:
+//   CMD は中の 1 番で、外のプロセスは見えず kill もできない。aibox は外で待って、CMD の終わりかたで終わる)。
 //   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
 //   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
@@ -93,7 +94,7 @@ fn main() {
         }
     }
     // namespace を分ける (no_new_privs のあとで): UTS はいつも、NET は --no-net (ポートの指定なし) のとき
-    let mut ns = libc::CLONE_NEWUTS;
+    let mut ns = libc::CLONE_NEWUTS | libc::CLONE_NEWPID;
     if ports.as_ref().is_some_and(|p| p.is_empty()) {
         ns |= libc::CLONE_NEWNET;
     }
@@ -111,7 +112,59 @@ fn main() {
     }
     // 中のプログラムが「どこに書けるか」を知れるように (aish --mcp が Permission denied のときに教える)
     let writable: Vec<String> = write.iter().filter(|w| std::path::Path::new(w).exists()).cloned().collect();
-    let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).env("AIBOX_WRITE", writable.join(":")).exec();
-    eprintln!("aibox: {}: {}", cmd[0], e);
-    std::process::exit(127);
+    // PID の namespace は、このあと作る子から: 子 (中の 1 番) が CMD になり、ここは待つ
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        eprintln!("aibox: fork: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    if child == 0 {
+        let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).env("AIBOX_WRITE", writable.join(":")).exec();
+        eprintln!("aibox: {}: {}", cmd[0], e);
+        std::process::exit(127);
+    }
+    wait_child(child)
+}
+
+static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward(sig: libc::c_int) {
+    let c = CHILD.load(std::sync::atomic::Ordering::Relaxed);
+    if c > 0 {
+        unsafe { libc::kill(c, sig) };
+    }
+}
+
+/// 子 (CMD) を待ち、同じ終わりかたで終わる。端末の Ctrl-C などは子にも届くのでここでは無視し、
+/// TERM と HUP (ここだけに来たもの) は子に渡す
+fn wait_child(child: libc::pid_t) -> ! {
+    CHILD.store(child, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, forward as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, forward as *const () as libc::sighandler_t);
+    }
+    loop {
+        let mut st = 0;
+        let r = unsafe { libc::waitpid(child, &mut st, 0) };
+        if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            std::process::exit(1);
+        }
+        if libc::WIFEXITED(st) {
+            std::process::exit(libc::WEXITSTATUS(st));
+        }
+        if libc::WIFSIGNALED(st) {
+            // 同じシグナルで終わる (呼んだシェルが「Killed」などと言えるように)
+            let sig = libc::WTERMSIG(st);
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::kill(libc::getpid(), sig);
+            }
+            std::process::exit(128 + sig);
+        }
+    }
 }
