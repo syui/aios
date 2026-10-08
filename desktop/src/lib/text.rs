@@ -2,14 +2,11 @@
 use crate::fb::Fb;
 use crate::glyph;
 
+/// aifont (英字・日本語・Nerd Fonts のアイコンが 1 つに入っている)
 pub const FONT: &str = "/usr/share/fonts/aifont/aifont.ttf";
-/// aifont にない字 (日本語など) を描くフォント (aifont-ja パッケージ。なくてもよい)
-pub const FONT_JA: &str = "/usr/share/fonts/aifont/aifont-ja.ttf";
 
 pub struct Text {
     font: glyph::Font,
-    /// aifont-ja は、aifont にない字がはじめて出たときに読む
-    ja: std::cell::OnceCell<Option<glyph::Font>>,
     /// 点にした字 ((字, 大きさ) → 形と濃さ)。バーやタブは同じ字を何度も描く
     cache: std::cell::RefCell<std::collections::HashMap<(char, u32), (glyph::Metrics, Vec<u8>)>>,
 }
@@ -18,23 +15,12 @@ impl Text {
     pub fn load(path: &str) -> Result<Text, String> {
         let data = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
         let font = glyph::Font::from_bytes(data).map_err(|e| format!("{}: {}", path, e))?;
-        Ok(Text { font, ja: std::cell::OnceCell::new(), cache: Default::default() })
-    }
-
-    /// c を描くフォント (aifont になければ aifont-ja)
-    fn font_of(&self, c: char) -> &glyph::Font {
-        if self.font.has(c) {
-            return &self.font;
-        }
-        match self.ja.get_or_init(|| std::fs::read(FONT_JA).ok().and_then(|d| glyph::Font::from_bytes(d).ok())) {
-            Some(ja) if ja.has(c) => ja,
-            _ => &self.font,
-        }
+        Ok(Text { font, cache: Default::default() })
     }
 
     /// 幅 (画素)
     pub fn width(&self, s: &str, size: f32) -> i32 {
-        s.chars().map(|c| self.font_of(c).metrics(c, size).advance_width).sum::<f32>().round() as i32
+        s.chars().map(|c| self.font.metrics(c, size).advance_width).sum::<f32>().round() as i32
     }
 
     /// (x, y) を左、ベースラインにして描く
@@ -43,7 +29,7 @@ impl Text {
         for c in s.chars() {
             let key = (c, size.to_bits());
             if !self.cache.borrow().contains_key(&key) {
-                let g = self.font_of(c).rasterize(c, size);
+                let g = self.font.rasterize(c, size);
                 self.cache.borrow_mut().insert(key, g);
             }
             let cache = self.cache.borrow();

@@ -11,7 +11,7 @@ pkgdesc='aios desktop: screen, input and sound drivers, aiwm (tiling Wayland com
 arch=('any')
 url='https://github.com/syui/aios'
 license=('MIT')
-depends=('base' 'aikernel' 'aifont' 'aifont-ja' 'aisplash' 'aiwm' 'aiterm')
+depends=('base' 'aikernel' 'aifont' 'aisplash' 'aiwm' 'aiterm')
 optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)'
             'mesa: Vulkan / OpenGL を CPU で (lavapipe、llvmpipe)。vulkan-loader と'
             'xkeyboard-config: winit などの Wayland の窓のキーボード (libxkbcommon)')

@@ -7,7 +7,6 @@ arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
 depends=('aifont')
-optdepends=('aifont-ja: 日本語の字を出す')
 makedepends=('rustup')
 
 pkgver() {

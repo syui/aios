@@ -1,7 +1,6 @@
 [
   {"name":"aiboot","pkgver":"0.0.1","skip":"aios"},
   {"name":"aifont","pkgver":"0.0.1","skip":"aios"},
-  {"name":"aifont-ja","pkgver":"0.0.1","skip":"aios"},
   {"name":"aigpt","pkgver":"0.0.1","skip":"aios"},
   {"name":"aikernel","pkgver":"0.0.1","skip":"aios"},
   {"name":"ailog","pkgver":"0.0.1","skip":"aios"},
