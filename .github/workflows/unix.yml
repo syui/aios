@@ -11,6 +11,7 @@ on:
     paths-ignore:
     - '**.md'
     - '.claude/**'
+    - '.github/workflows/firefox.yml'
     - 'pkg/c/**'
     - 'pkg/desktop/**'
     - 'pkg/pkg.json'

@@ -1,7 +1,7 @@
 #!/bin/sh
 # このマシン (Debian / Ubuntu) に、aios を作る道具をそろえる。足りないものだけ入れるので、何度動かしてもよい
 #   bin/setup-build.sh            ビルド (bin/mkpkg.sh, pkg/*/*/PKGBUILD)、ディスク (bin/mkdisk.sh)、VM (bin/run.sh) の道具
-#   bin/setup-build.sh --firefox  それに firefox を作る道具 (cbindgen、libclang) も
+#   bin/setup-build.sh --firefox  それに firefox を作る道具 (cbindgen、libclang、nodejs) も
 # クラウドの環境では、セットアップスクリプトから呼ぶ (セッションが変わると入れたものは消えるので)
 #
 # 入れるもの:
@@ -65,6 +65,7 @@ want pip3 python3-pip
 [ -f /usr/include/expat.h ] || need="$need libexpat1-dev"
 if [ -n "$firefox" ]; then
   [ -e /usr/lib/llvm-20/lib/libclang.so ] || need="$need libclang-20-dev"
+  want node nodejs
 fi
 if [ -n "$need" ]; then
   echo "setup-build: apt:$need"

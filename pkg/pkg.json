@@ -31,7 +31,7 @@
   {"name": "ffmpeg",            "type": "c",       "src": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",                                                                  "now": "9.0.2",          "latest": "9.0.2"},
   {"name": "file",              "type": "c",       "src": "https://astron.com/pub/file/file-5.48.tar.gz",                                                                     "now": "5.48",           "latest": "5.48"},
   {"name": "findutils",         "type": "rust",    "src": "git+https://github.com/uutils/findutils#tag=0.10.0",                                                               "now": "0.10.0",         "latest": "0.10.0"},
-  {"name": "firefox",           "type": "c",       "src": "https://archive.mozilla.org/pub/firefox/releases/157.0/source/firefox-157.0.source.tar.xz",                        "now": "157.0",          "latest": "157.0.1"},
+  {"name": "firefox",           "type": "c",       "src": "https://archive.mozilla.org/pub/firefox/releases/157.0.1/source/firefox-157.0.1.source.tar.xz",                    "now": "157.0.1",        "latest": "157.0.1"},
   {"name": "fontconfig",        "type": "c",       "src": "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz",   "now": "2.18.3",         "latest": "2.18.3"},
   {"name": "freetype2",         "type": "c",       "src": "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz",                                       "now": "2.14.3",         "latest": "2.14.3"},
   {"name": "fribidi",           "type": "c",       "src": "https://github.com/fribidi/fribidi/releases/download/v1.0.17/fribidi-1.0.17.tar.xz",                               "now": "1.0.17",         "latest": "1.0.17"},
