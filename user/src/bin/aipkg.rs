@@ -830,6 +830,10 @@ fn upgrade_all(repos: &[Repo], extra: &[String]) {
             targets.push(name.clone());
         }
     }
+    // 置きかえられるもの (libarchive が tar を、gawk が awk を replaces) は上げない。上げると、置きかえたあとに
+    // 古い名前をまた入れようとして conflicts で止まる
+    let replaced: BTreeSet<String> = targets.iter().filter_map(|t| sync.get(t)).flat_map(|(_, sd)| list(sd, "REPLACES")).map(|r| dep_name(&r).to_string()).collect();
+    targets.retain(|t| !replaced.contains(t));
     // まだどのリポジトリにもない名前は、更新で増えるリポジトリにあるかもしれないので後で入れる
     let (now, later): (Vec<String>, Vec<String>) = extra.iter().cloned().partition(|t| sync.contains_key(t));
     for t in &now {
