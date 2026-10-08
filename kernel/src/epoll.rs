@@ -165,6 +165,7 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
             if ep.entries.contains_key(&fd) {
                 return Err(-EEXIST);
             }
+            file::mark_epolled(&target);
             ep.entries.insert(fd, Entry { file: Rc::downgrade(&target), events, data, last: 0, last_gen: target.borrow().event_gen().wrapping_sub(1) });
         }
         EPOLL_CTL_MOD => {

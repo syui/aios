@@ -51,6 +51,11 @@ impl<T> Shared<T> {
     pub fn get(&self) -> &mut T {
         unsafe { &mut *self.0.get() }
     }
+    /// ほかに持っている人がいない (ほかのスレッドと分けていない)
+    pub fn private(&self) -> bool {
+        Rc::strong_count(&self.0) == 1
+    }
+
     fn id(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }

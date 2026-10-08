@@ -35,12 +35,12 @@ pub enum Kind {
     Random,
     /// ファイルシステムの inode と、開いたときのパス (dirfd の基準に使う)
     Inode(InodeRef, String),
-    PipeRead(Rc<RefCell<Pipe>>),
-    PipeWrite(Rc<RefCell<Pipe>>),
+    PipeRead(Rc<PipeCell>),
+    PipeWrite(Rc<PipeCell>),
     /// O_RDWR で開いた FIFO (読み書き両方の口)
-    PipeRw(Rc<RefCell<Pipe>>),
+    PipeRw(Rc<PipeCell>),
     /// socketpair の片方: rx から読み、tx へ書く
-    Pair(Rc<RefCell<Pipe>>, Rc<RefCell<Pipe>>),
+    Pair(Rc<PipeCell>, Rc<PipeCell>),
     Socket(crate::socket::SockRef),
     /// AF_UNIX のソケットで、まだつながっていないもの (bind / listen 中)。つながると Pair になる
     Unix(crate::unix::UnixRef),
@@ -636,6 +636,10 @@ impl Drop for OpenFile {
 
 /// パイプの大きさ (Linux と同じ既定値と、F_SETPIPE_SZ で広げられる上限)
 pub const PIPE_SIZE: usize = 64 * 1024;
+
+/// 大きなロックなしの read/write (Pipe::fast_rw) の数: [0] はうまくいったもの、ほかはふつうの道へ行ったわけ
+/// (2 大きさ、3 fd の表を分けている、4 パイプでない、5 6 7 ... は fast_rw_inner を見よ)。/proc/bkl に出す
+pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
 /// ページ (4KiB) をつないだ FIFO
@@ -662,6 +666,54 @@ impl PageQueue {
         }
         self.len += src.len();
         Ok(())
+    }
+
+    /// 全部入れるか、何も入れない (ページが足りなければ Err で、中身は変えない)
+    fn push_all(&mut self, src: &[u8]) -> Result<(), i64> {
+        let room = self.pages.back().map_or(0, |p| PGSIZE - p.2);
+        let need = src.len().saturating_sub(room).div_ceil(PGSIZE);
+        let mut fresh = Vec::with_capacity(need);
+        for _ in 0..need {
+            match crate::kalloc::alloc() {
+                Some(p) => fresh.push(p),
+                None => {
+                    for p in fresh {
+                        crate::kalloc::free(p);
+                    }
+                    return Err(-12); // ENOMEM
+                }
+            }
+        }
+        let mut done = 0;
+        let mut fresh = fresh.into_iter();
+        while done < src.len() {
+            if self.pages.back().is_none_or(|p| p.2 == PGSIZE) {
+                self.pages.push_back((fresh.next().unwrap(), 0, 0));
+            }
+            let last = self.pages.back_mut().unwrap();
+            let k = (PGSIZE - last.2).min(src.len() - done);
+            unsafe { core::ptr::copy_nonoverlapping(src[done..].as_ptr(), last.0.add(last.2), k) };
+            last.2 += k;
+            done += k;
+        }
+        self.len += src.len();
+        Ok(())
+    }
+
+    /// 先頭から n バイトを捨てる (pop で写したあと)
+    fn skip(&mut self, mut n: usize) {
+        n = n.min(self.len);
+        self.len -= n;
+        while n > 0 {
+            let (p, r, w) = self.pages[0];
+            let k = (w - r).min(n);
+            self.pages[0].1 += k;
+            n -= k;
+            if self.pages[0].1 == PGSIZE {
+                crate::kalloc::free(p);
+                self.pages.pop_front();
+            }
+        }
     }
 
     /// 先頭から読む。consume なら取り除く
@@ -721,12 +773,106 @@ pub struct Pipe {
     pub types: alloc::collections::BTreeMap<u32, (u32, u64)>,
     /// AF_UNIX: このパイプに書くほうのプロセス (pid, uid, gid)。読むほうの SO_PEERCRED (unix.rs)
     pub cred: Option<(u32, u32, u32)>,
+    /// このパイプで眠っているもの (読む・書く・FIFO を開く) の数。大きなロックなしの read/write (fast_rw) は、
+    /// 起こす相手がいるときはふつうの道へ
+    sleepers: usize,
+    /// poll / select で、いま待っている (待つかもしれない) 数 (PollWatch)。0 でなければ fast_rw は使わない
+    watchers: usize,
+    /// epoll に登録されたことがある (いつ待たれるかわからないので、それからは fast_rw は使わない)
+    pub epolled: bool,
+}
+
+/// poll / select が待っているあいだ、見ているパイプに印をつける (watchers)。大きなロックなしの read/write
+/// (fast_rw) は、印のあるパイプでは使わない (起こさないといけないので)。readiness を見る前につけること
+pub struct PollWatch(Vec<Rc<PipeCell>>);
+
+impl PollWatch {
+    pub fn new<'a>(files: impl Iterator<Item = &'a FileRef>) -> Self {
+        let mut v = Vec::new();
+        for f in files {
+            match &f.borrow().kind {
+                Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
+                    p.borrow_mut().watchers += 1;
+                    v.push(p.clone());
+                }
+                _ => {}
+            }
+        }
+        PollWatch(v)
+    }
+}
+
+impl Drop for PollWatch {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            p.borrow_mut().watchers -= 1;
+        }
+    }
+}
+
+/// epoll に登録した (Pipe::epolled)
+pub fn mark_epolled(f: &FileRef) {
+    if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
+        p.borrow_mut().epolled = true;
+    }
+}
+
+/// パイプの中身のロック。ふだんは大きなロックの中で使うが、大きなロックなしの read/write (Pipe::fast_rw)
+/// とも分けあう。持ったまま眠らないこと。同じ CPU が二重に取ったら (持ったまま眠ったときも) 止める
+pub struct PipeCell {
+    owner: core::sync::atomic::AtomicUsize,
+    inner: crate::spinlock::SpinLock<Pipe>,
+}
+
+pub struct PipeGuard<'a> {
+    g: crate::spinlock::Guard<'a, Pipe>,
+    owner: &'a core::sync::atomic::AtomicUsize,
+}
+
+impl PipeCell {
+    pub fn new(p: Pipe) -> Self {
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p) }
+    }
+
+    pub fn borrow_mut(&self) -> PipeGuard<'_> {
+        use core::sync::atomic::Ordering::Relaxed;
+        let me = crate::smp::id() + 1;
+        if self.owner.load(Relaxed) == me {
+            panic!("pipe: cpu{} locks a pipe twice", me - 1);
+        }
+        let g = self.inner.lock();
+        self.owner.store(me, Relaxed);
+        PipeGuard { g, owner: &self.owner }
+    }
+
+    pub fn borrow(&self) -> PipeGuard<'_> {
+        self.borrow_mut()
+    }
+}
+
+impl Drop for PipeGuard<'_> {
+    fn drop(&mut self) {
+        self.owner.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl core::ops::Deref for PipeGuard<'_> {
+    type Target = Pipe;
+    fn deref(&self) -> &Pipe {
+        &self.g
+    }
+}
+
+impl core::ops::DerefMut for PipeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Pipe {
+        &mut self.g
+    }
 }
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let p = Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None }));
+        let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -735,7 +881,7 @@ impl Pipe {
     }
 
     /// FIFO を開く。相手 (読み手なら書き手) が来るまで待つ (nonblock なら待たない)
-    pub fn open_fifo(p: &Rc<RefCell<Pipe>>, read: bool, write: bool, nonblock: bool) -> Result<Kind, i64> {
+    pub fn open_fifo(p: &Rc<PipeCell>, read: bool, write: bool, nonblock: bool) -> Result<Kind, i64> {
         const ENXIO: i64 = 6;
         // 待ち始めたときの相手の開いた回数
         let seen = {
@@ -763,13 +909,12 @@ impl Pipe {
             // 相手がいるか、待っている間に一度でも来たら進む。
             // 割り込まれたら kind が落ちて数は戻る
             loop {
-                let pp = p.borrow();
+                let pp = p.borrow_mut();
                 let (now, opened) = if read { (pp.writers, pp.w_opened) } else { (pp.readers, pp.r_opened) };
                 if now > 0 || opened != seen {
                     break;
                 }
-                drop(pp);
-                proc::sleep(Rc::as_ptr(p) as usize)?;
+                Pipe::sleep(p, pp)?;
             }
         }
         Ok(kind)
@@ -778,51 +923,130 @@ impl Pipe {
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
         let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        let mk = || Rc::new(RefCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None }));
+        let mk = || Rc::new(PipeCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
     }
 
     /// 誰も開いていない FIFO 用
-    pub fn empty() -> Rc<RefCell<Pipe>> {
+    pub fn empty() -> Rc<PipeCell> {
         let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
-        Rc::new(RefCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None }))
+        Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }))
     }
 
-    fn wake(p: &Rc<RefCell<Pipe>>) {
+    /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らず起こさずにすむときだけ。ほかは None で
+    /// ふつうの道へ: fd の表をほかのスレッドと分けている、パイプで眠っている人がいる (起こさないといけない)、
+    /// poll などで見られたことがある、読むのに中身がない、書くのに全部は入らない・読み手がいない、
+    /// ユーザーのメモリが写っていない (ページフォルトになる)
+    pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
+        let r = Pipe::fast_rw_inner(me, fd, buf, len, write);
+        FAST_RW[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        r.ok()
+    }
+
+    /// うまくいけば Ok、ふつうの道へ行くなら Err(わけ: FAST_RW の番号)
+    fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Result<i64, usize> {
+        if len == 0 || len > PIPE_SIZE {
+            return Err(2);
+        }
+        let files = me.files.as_ref().ok_or(3usize)?;
+        if !files.private() {
+            return Err(3);
+        }
+        let f = files.get().get(fd).ok_or(4usize)?;
+        // ほかのプロセス (fork で分けた) が大きなロックの中で借りているかもしれないので、借りずに見る。
+        // パイプの口の種類はあとで変わらない
+        let of = unsafe { &*f.as_ptr() };
+        let p = match (&of.kind, write) {
+            (Kind::PipeRead(p), false) | (Kind::PipeWrite(p), true) => p,
+            _ => return Err(4),
+        };
+        let mut tmp = Vec::with_capacity(len);
+        unsafe { tmp.set_len(len) };
+        if write {
+            if !me.pt().copy_in_nofault(buf, &mut tmp) {
+                return Err(5);
+            }
+            let mut pp = p.borrow_mut();
+            if pp.sleepers > 0 {
+                return Err(6);
+            }
+            if pp.watchers > 0 || pp.epolled {
+                return Err(7);
+            }
+            if pp.readers == 0 || pp.cap.saturating_sub(pp.data.len) < len {
+                return Err(8);
+            }
+            pp.data.push_all(&tmp).map_err(|_| 9usize)?;
+            pp.generation += 1;
+            pp.wrote += len as u64;
+            Ok(len as i64)
+        } else {
+            let mut pp = p.borrow_mut();
+            if pp.sleepers > 0 {
+                return Err(6);
+            }
+            if pp.watchers > 0 || pp.epolled {
+                return Err(7);
+            }
+            if pp.data.len == 0 {
+                return Err(10);
+            }
+            let n = len.min(pp.data.len);
+            pp.data.pop(&mut tmp[..n], false);
+            // 写せたときだけ取り除く (ページがなければ、何も変えずにふつうの道へ)
+            if !me.pt().copy_out_nofault(buf, &tmp[..n]) {
+                return Err(11);
+            }
+            pp.data.skip(n);
+            pp.taken += n as u64;
+            Ok(n as i64)
+        }
+    }
+
+    /// 眠る (pp を持ったまま決めたこと: 中身がない、いっぱい ... のあとで)。眠っている数を pp の中で増やしてから
+    /// 放すので、大きなロックなしの read/write (fast_rw) は、起こさずに進めてしまうことがない
+    fn sleep(p: &Rc<PipeCell>, mut pp: PipeGuard<'_>) -> Result<(), i64> {
+        pp.sleepers += 1;
+        drop(pp);
+        let r = proc::sleep(Rc::as_ptr(p) as usize);
+        p.borrow_mut().sleepers -= 1;
+        r
+    }
+
+    fn wake(p: &Rc<PipeCell>) {
         proc::wakeup(Rc::as_ptr(p) as usize);
         proc::poll_wake(Rc::as_ptr(p) as usize);
     }
 
     /// 読む。peek なら取り除かない (tee 用)
-    pub fn read_ex(p: &Rc<RefCell<Pipe>>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
+    pub fn read_ex(p: &Rc<PipeCell>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
         loop {
-            {
-                let mut pp = p.borrow_mut();
-                if pp.data.len > 0 {
-                    let n = pp.data.pop(dst, !peek);
-                    if !peek {
-                        pp.taken += n as u64;
-                    }
-                    drop(pp);
-                    Pipe::wake(p);
-                    return Ok(n);
+            let mut pp = p.borrow_mut();
+            if pp.data.len > 0 {
+                let n = pp.data.pop(dst, !peek);
+                if !peek {
+                    pp.taken += n as u64;
                 }
-                if pp.writers == 0 {
-                    return Ok(0);
-                }
+                drop(pp);
+                Pipe::wake(p);
+                return Ok(n);
+            }
+            if pp.writers == 0 {
+                return Ok(0);
             }
             if nonblock {
                 return Err(-11); // EAGAIN
             }
-            proc::sleep(Rc::as_ptr(p) as usize)?;
+            Pipe::sleep(p, pp)?;
         }
     }
 
     /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN
-    fn write(p: &Rc<RefCell<Pipe>>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+    fn write(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut done = 0;
         while done < src.len() {
+            let before = done;
             {
                 let mut pp = p.borrow_mut();
                 if pp.readers == 0 {
@@ -851,13 +1075,20 @@ impl Pipe {
                     done += k;
                 }
             }
-            Pipe::wake(p);
+            // 入れたときだけ起こす (いっぱいで入れられなかった書き手どうしが、起こしあって回りつづけないように)
+            if done > before {
+                Pipe::wake(p);
+            }
             if done < src.len() {
                 if nonblock {
                     const EAGAIN: i64 = 11;
                     return if done > 0 { Ok(done) } else { Err(-EAGAIN) };
                 }
-                if let Err(e) = proc::sleep(Rc::as_ptr(p) as usize) {
+                // いっぱいのまま (起こしたあとに読まれていなければ) 眠る
+                let pp = p.borrow_mut();
+                if pp.readers > 0 && pp.data.len >= pp.cap
+                    && let Err(e) = Pipe::sleep(p, pp)
+                {
                     return if done > 0 { Ok(done) } else { Err(e) };
                 }
             }
