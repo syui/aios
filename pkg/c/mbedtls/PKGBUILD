@@ -1,20 +1,22 @@
 # mbedtls: 小さな TLS のライブラリ (curl や git の https に使う)。暗号は自作しない方針なので、
-# よく使われているものを版とチェックサムを固定して入れる。3.6 は長く支えられる版 (LTS)
+# よく使われているものを版とチェックサムを固定して入れる。4.x は暗号の部分が TF-PSA-Crypto に分かれ、
+# CMake だけで作る (libmbedcrypto.a は TF-PSA-Crypto のものを同じ名前で入れる。curl はそのままつながる)
 # 静的なライブラリ (libmbedtls.a, libmbedx509.a, libmbedcrypto.a) とヘッダーを /opt/c に入れる
 pkgname=mbedtls
-pkgver=3.6.7
+pkgver=4.2.0
 pkgrel=1
 pkgdesc='Small TLS library (static, for aios)'
 arch=('aarch64')
 url='https://www.trustedfirmware.org/projects/mbed-tls/'
+makedepends=('cmake' 'ninja')
 license=('Apache-2.0 OR GPL-2.0-or-later')
 source=("https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$pkgver/mbedtls-$pkgver.tar.bz2")
-sha256sums=('a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6')
+sha256sums=('2bed9d713b4668f76553b097e72b8aa30bc8f112a940d7ae228d524bbde6ffea')
 
 prepare() {
   rm -rf "mbedtls-$pkgver"
   tar -xjf "mbedtls-$pkgver.tar.bz2"
-  # スレッド (pthread) を有効に (curl は複数のスレッドから使うことがある)
+  # スレッド (pthread) を有効に (curl は複数のスレッドから使うことがある)。4.x では TF-PSA-Crypto の設定
   cd "mbedtls-$pkgver"
   python3 scripts/config.py set MBEDTLS_THREADING_C
   python3 scripts/config.py set MBEDTLS_THREADING_PTHREAD
@@ -23,15 +25,22 @@ prepare() {
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  cd "mbedtls-$pkgver"
-  # ライブラリだけ (テストやプログラムは作らない)
-  make -j"$(nproc)" lib CC="$CC" AR="$AR" CFLAGS="$CFLAGS"
+  cmake_cross
+  rm -rf build
+  # ライブラリだけ (テストやプログラムは作らない)。静的なものだけ
+  cmake -S "mbedtls-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF -DMBEDTLS_FATAL_WARNINGS=OFF \
+    -DUSE_STATIC_MBEDTLS_LIBRARY=ON -DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
+    -DUSE_STATIC_TF_PSA_CRYPTO_LIBRARY=ON -DUSE_SHARED_TF_PSA_CRYPTO_LIBRARY=OFF
+  ninja -C build
 }
 
 package() {
-  cd "mbedtls-$pkgver"
-  install -d "$pkgdir/opt/c/lib" "$pkgdir/opt/c/include"
-  install -m644 library/libmbedtls.a library/libmbedx509.a library/libmbedcrypto.a "$pkgdir/opt/c/lib/"
-  cp -r include/mbedtls include/psa "$pkgdir/opt/c/include/"
+  . "$startdir/../zig.sh"
+  zig_env
+  DESTDIR="$pkgdir" cmake --install build
+  # cmake と pkg-config のファイルは /opt/c/lib に残す。ほかは要らない
+  rm -rf "$pkgdir/opt/c/share"
   find "$pkgdir/opt/c/include" -type f -exec chmod 644 {} +
 }

@@ -4,7 +4,7 @@
 #   共有ライブラリは musl の libc.so と libgcc_s.so.1 (libunwind パッケージ。Zig で作った LLVM の libunwind) だけ。
 #   npm -g で入れるもの (pnpm など) は /usr/local に (/opt/c/etc/npmrc の prefix)
 pkgname=nodejs
-pkgver=26.10.0
+pkgver=26.11.1
 pkgrel=1
 pkgdesc='JavaScript runtime built on V8, with npm (unofficial-builds linux-arm64-musl, for aios)'
 arch=('aarch64')
@@ -13,7 +13,7 @@ license=('MIT')
 depends=('musl' 'libunwind')
 backup=(opt/c/etc/npmrc)
 source=("https://unofficial-builds.nodejs.org/download/release/v$pkgver/node-v$pkgver-linux-arm64-musl.tar.xz")
-sha256sums=('f204193e885695e81f0d1368a15fa60e7acce7e9b15100bcf75e8d460a6012c8')
+sha256sums=('c82ee786c108025fab7866c9ac66b009858324d6693cf77e3cc25e870746bb67')
 
 prepare() {
   rm -rf "node-v$pkgver-linux-arm64-musl"

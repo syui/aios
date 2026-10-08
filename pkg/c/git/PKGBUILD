@@ -4,7 +4,7 @@
 # (Rust の std が使う _Unwind_* は Zig の libunwind)
 pkgname=git
 pkgver=2.56.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Distributed version control system (static, https via curl + mbedTLS)'
 arch=('aarch64')
 url='https://git-scm.com'
