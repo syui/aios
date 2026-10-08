@@ -171,7 +171,15 @@ pub struct ExtFs {
     orphans: RefCell<BTreeSet<u32>>,
     /// スワップに使っているファイル (書きかえさせない)
     swapfiles: RefCell<BTreeSet<u32>>,
+    /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
+    /// (modify_dir_block) そのディレクトリの分を、ディレクトリの inode を空けたらその分を消す
+    names: RefCell<BTreeMap<(u32, String), u32>>,
+    /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
+    names_gen: core::cell::Cell<u64>,
 }
+
+/// 名前のキャッシュの大きさ (こえたら全部捨てて作りなおす)
+const NAMES_MAX: usize = 8192;
 
 /// ディスク上の inode (inode_size バイトまるごと)
 #[derive(Clone)]
@@ -327,6 +335,8 @@ impl ExtFs {
             users: RefCell::new(BTreeMap::new()),
             orphans: RefCell::new(BTreeSet::new()),
             swapfiles: RefCell::new(BTreeSet::new()),
+            names: RefCell::new(BTreeMap::new()),
+            names_gen: core::cell::Cell::new(0),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -821,6 +831,9 @@ impl ExtFs {
     }
 
     fn free_inode(&self, ino: u32, dir: bool) -> Result<(), i64> {
+        if dir {
+            self.forget_names(ino);
+        }
         let (g, bit) = ((ino - 1) / self.ipg, ((ino - 1) % self.ipg) as usize);
         let bm = self.inode_bitmap(g);
         self.modify_block(bm, |d| d[bit / 8] &= !(1 << (bit % 8)))?;
@@ -1500,7 +1513,35 @@ impl ExtFs {
         Ok(out)
     }
 
+    /// dir の名前のキャッシュを捨てる
+    fn forget_names(&self, dir: u32) {
+        self.names_gen.set(self.names_gen.get() + 1);
+        let mut n = self.names.borrow_mut();
+        let keys: Vec<(u32, String)> = n.range((dir, String::new())..).take_while(|(k, _)| k.0 == dir).map(|(k, _)| k.clone()).collect();
+        for k in keys {
+            n.remove(&k);
+        }
+    }
+
     fn find(&self, dir: u32, name: &str) -> Result<u32, i64> {
+        let key = (dir, String::from(name));
+        if let Some(&ino) = self.names.borrow().get(&key) {
+            return Ok(ino);
+        }
+        let generation = self.names_gen.get();
+        let ino = self.find_uncached(dir, name)?;
+        if self.names_gen.get() != generation {
+            return Ok(ino);
+        }
+        let mut n = self.names.borrow_mut();
+        if n.len() >= NAMES_MAX {
+            n.clear();
+        }
+        n.insert(key, ino);
+        Ok(ino)
+    }
+
+    fn find_uncached(&self, dir: u32, name: &str) -> Result<u32, i64> {
         // 索引があれば 1 つの葉だけ (決められなければ全部)
         if self.read_inode(dir)?.flags() & INDEX_FL != 0 && name != "." && name != ".." {
             match self.dx_find(dir, name) {
@@ -1518,6 +1559,7 @@ impl ExtFs {
 
     /// ディレクトリのブロックを書きかえ、チェックサムを直す
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
+        self.forget_names(dir);
         self.modify_block(b, |d| {
             f(d);
             self.set_dir_csum(dir, generation, d);
