@@ -944,6 +944,23 @@ const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 /// fork / スレッド作成。CLONE_THREAD でない CLONE_VM (vfork) はアドレス空間をコピーする
+/// unshare: 自分のものを分ける。CLONE_NEW* (ns.rs) と CLONE_FILES (ファイルの表)。CLONE_FS、CLONE_SYSVSEM は
+/// もう分かれているので何もしない
+pub fn unshare(flags: u64) -> Result<i64, i64> {
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_SYSVSEM: u64 = 0x0004_0000;
+    if flags & !(crate::ns::SUPPORTED | CLONE_FILES | CLONE_FS | CLONE_SYSVSEM) != 0 {
+        return Err(-22);
+    }
+    let p = current();
+    crate::ns::renew(&mut p.cred, flags)?;
+    if flags & CLONE_FILES != 0 {
+        let f = Shared::new(p.files().clone());
+        p.files = Some(f);
+    }
+    Ok(0)
+}
+
 pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
     const EAGAIN: i64 = 11;
     const ENOMEM: i64 = 12;
@@ -953,6 +970,12 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         return Err(-EINVAL);
     }
     let parent = current();
+    // CLONE_NEW*: 子の namespace を新しく (ns.rs。スレッドには作れない)
+    if thread && flags & crate::ns::SUPPORTED != 0 {
+        return Err(-EINVAL);
+    }
+    let mut cred = parent.cred.clone();
+    crate::ns::renew(&mut cred, flags)?;
     let mm = if thread {
         parent.mm.clone().unwrap()
     } else {
@@ -979,7 +1002,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     if !thread {
         child.altstack = parent.altstack;
     }
-    child.cred = parent.cred.clone();
+    child.cred = cred;
     child.comm = parent.comm;
     child.thread = thread;
     if thread {

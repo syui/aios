@@ -31,10 +31,12 @@ pub struct Cred {
     pub landlock: Option<crate::landlock::Domain>,
     /// seccomp のフィルタ (かかっているもの)
     pub seccomp: Option<crate::seccomp::Seccomp>,
+    /// namespace (ns.rs)
+    pub ns: crate::ns::Ns,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)

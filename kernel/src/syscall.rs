@@ -172,6 +172,7 @@ nrs! {
     SETSID = 157,
     UNAME = 160,
     SETHOSTNAME = 161,
+    UNSHARE = 97,
     GETRLIMIT = 163,
     UMASK = 166,
     GETTIMEOFDAY = 169,
@@ -387,6 +388,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
 
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
+        UNSHARE => proc::unshare(a[0]),
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| t as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         WAIT4 => sys_wait4(int(a[0]), a[1] as usize, a[2]),
@@ -706,31 +708,21 @@ fn sys_gettimeofday(tv: usize) -> R {
 }
 
 /// uname の nodename (sethostname で変わる。init が起動のときに /etc/hostname を入れる)
-static mut HOSTNAME: ([u8; 64], usize) = {
-    let mut b = [0u8; 64];
-    b[0] = b'a';
-    b[1] = b'i';
-    b[2] = b'o';
-    b[3] = b's';
-    (b, 4)
-};
 
 fn sys_sethostname(name: usize, len: usize) -> R {
-    if crate::cred::current().euid != 0 {
-        return Err(-1); // EPERM
-    }
     if len > 64 {
         return Err(-EINVAL);
     }
     let mut b = [0u8; 64];
     proc::current().pt().copy_in(&mut b[..len], name).ok_or(-14)?;
-    set_hostname(&b[..len])?;
+    // root か、新しく作った UTS の中 (ns.rs)
+    crate::ns::set_hostname(&b[..len], true)?;
     Ok(0)
 }
 
 /// いまのホスト名 (/proc/sys/kernel/hostname)
 pub fn hostname() -> String {
-    let (hb, hl) = unsafe { *(&raw const HOSTNAME) };
+    let (hb, hl) = crate::ns::hostname();
     String::from_utf8_lossy(&hb[..hl]).into_owned()
 }
 
@@ -739,15 +731,12 @@ pub fn set_hostname(name: &[u8]) -> Result<(), i64> {
     if name.len() > 64 {
         return Err(-EINVAL);
     }
-    let mut b = [0u8; 64];
-    b[..name.len()].copy_from_slice(name);
-    unsafe { *(&raw mut HOSTNAME) = (b, name.len()) };
-    Ok(())
+    crate::ns::set_hostname(name, false)
 }
 
 fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
-    let (hb, hl) = unsafe { *(&raw const HOSTNAME) };
+    let (hb, hl) = crate::ns::hostname();
     let fields: [&[u8]; 6] = [b"aios", &hb[..hl], env!("AIOS_RELEASE").as_bytes(), b"#1 aios", b"aarch64", b""];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
