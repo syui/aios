@@ -96,7 +96,7 @@ jobs:
         run: |
           # GICv2 で起こしてプロンプトまで待ち、中で短いたしかめ (test/vm-check.sh: /sys と /proc、
           # イメージのコマンド、sh の名前の aish、sudo)。シリアルの端末を test/vm.py が持つ
-          start=$(python3 test/vm.py start)
+          start=$(python3 test/vm.py start --www test)
           echo "$start"
           if ! echo "$start" | grep -q '"ready": true'; then
             python3 test/vm.py log 80
@@ -104,7 +104,9 @@ jobs:
             exit 1
           fi
           st=0
-          python3 test/vm.py put test/vm-check.sh /tmp/vm-check.sh && python3 test/vm.py run 'sh /tmp/vm-check.sh' -t 600 || st=$?
+          # たしかめるスクリプトは test/ を http で見せて、中から取る (put は端末から流しこむので、
+          # base64 が読みはじめる前に 4 KiB をこえるとあふれる)
+          python3 test/vm.py run 'fetch http://10.0.2.2:8000/vm-check.sh > /tmp/vm-check.sh && sh /tmp/vm-check.sh' -t 600 || st=$?
           # 失敗したら、シリアルの終わりを見せる (中で何が起きたか)
           [ "$st" = 0 ] || python3 test/vm.py log 60
           python3 test/vm.py stop || true
