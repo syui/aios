@@ -112,7 +112,8 @@ primary:
     eret
 
     // x19 = RAM の先頭 (物理)。memlayout が使う
-2:  adr     x19, _start
+2:  adrp    x19, _start
+    add     x19, x19, :lo12:_start
     sub     x19, x19, #0x80000
     adrp    x0, boot_ram_base
     add     x0, x0, :lo12:boot_ram_base
@@ -124,7 +125,8 @@ primary:
     // TTBR0: 置かれた場所を含む 1 GiB を恒等写像
     adrp    x1, boot_l1_lo
     add     x1, x1, :lo12:boot_l1_lo
-    adr     x2, _start
+    adrp    x2, _start
+    add     x2, x2, :lo12:_start
     lsr     x2, x2, #30
     lsl     x3, x2, #30
     orr     x3, x3, x5

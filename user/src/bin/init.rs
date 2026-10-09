@@ -66,7 +66,8 @@ fn spawn(u: &Unit) -> Result<i32, String> {
     let exe = u.exec_start.first().and_then(|p| find_exe(p)).ok_or("ExecStart not found")?;
     let args: Vec<CString> = u.exec_start.iter().map(|a| cstr(a)).collect();
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    env.insert("PATH".into(), "/usr/bin:/bin".into());
+    // /etc/profile と同じ (/opt/c/bin は [c] のパッケージ: aiwm の exec で firefox などを名前だけで動かせるように)
+    env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin:/opt/c/bin".into());
     env.insert("HOME".into(), "/root".into());
     env.insert("USER".into(), "root".into());
     env.insert("TERM".into(), "vt100".into());
