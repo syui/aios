@@ -1,0 +1,10 @@
+[Unit]
+Description=aiwatch: watch the kernel for lost wakeups, wake storms and a busy big lock (/proc/ai, /run/aiwatch.json)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aiwatch
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

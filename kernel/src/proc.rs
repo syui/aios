@@ -1664,8 +1664,37 @@ fn wait_json(p: &mut Proc) -> alloc::string::String {
         let now = p.pt().copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
         return alloc::format!("{{\"futex\":{},\"val\":{},\"now\":{}}}", addr, val, now);
     }
+    if p.chan == poll_chan() && (p.last_sys.0 == 73 || p.last_sys.0 == 72) {
+        // ppoll: 渡された struct pollfd (fd、events) をそのまま。pselect6: 読む fd の集まり (書く方は覚えていない)。
+        // 何を待っているか (want: POLLIN 1 / POLLOUT 4 ...) がわかるので、aiwatch が「起こしが消えた」を見分けられる
+        let (a0, a1) = (p.last_sys.1 as usize, p.last_sys.2 as usize);
+        let (mut fds, mut want) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        if p.last_sys.0 == 73 && a1 <= 1024 {
+            let mut raw = alloc::vec![0u8; a1 * 8];
+            if p.pt().copy_in(&mut raw, a0).is_some() {
+                for e in raw.chunks_exact(8) {
+                    let fd = i32::from_le_bytes(e[0..4].try_into().unwrap());
+                    if fd >= 0 {
+                        fds.push(alloc::format!("{}", fd));
+                        want.push(alloc::format!("{}", i16::from_le_bytes(e[4..6].try_into().unwrap())));
+                    }
+                }
+            }
+        } else if p.last_sys.0 == 72 && a0 <= 1024 && a1 != 0 {
+            let mut set = alloc::vec![0u8; a0.div_ceil(64) * 8];
+            if p.pt().copy_in(&mut set, a1).is_some() {
+                for i in 0..a0 {
+                    if set[i / 8] & (1 << (i % 8)) != 0 {
+                        fds.push(alloc::format!("{}", i));
+                        want.push("1".into());
+                    }
+                }
+            }
+        }
+        return alloc::format!("{{\"poll\":[{}],\"want\":[{}]}}", fds.join(","), want.join(","));
+    }
     if p.chan == poll_chan() {
-        // poll / select / epoll: 印 (poll_keys) を、そのプロセスの fd に戻す
+        // epoll など: 印 (poll_keys) を、そのプロセスの fd に戻す (want はわからない。epoll は true)
         let Some(keys) = p.poll_keys.clone() else { return "{\"poll\":\"any\"}".into() };
         let mut fds = alloc::vec::Vec::new();
         if let Some(files) = p.files.as_ref() {
@@ -1677,7 +1706,7 @@ fn wait_json(p: &mut Proc) -> alloc::string::String {
                 }
             }
         }
-        return alloc::format!("{{\"poll\":[{}]}}", fds.join(","));
+        return alloc::format!("{{\"poll\":[{}],\"epoll\":{}}}", fds.join(","), p.last_sys.0 == 22);
     }
     alloc::format!("{{\"chan\":{}}}", p.chan)
 }

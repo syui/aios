@@ -22,6 +22,10 @@ name = "aiosd"
 path = "src/bin/aiosd.rs"
 
 [[bin]]
+name = "aiwatch"
+path = "src/bin/aiwatch.rs"
+
+[[bin]]
 name = "which"
 path = "src/bin/which.rs"
 
