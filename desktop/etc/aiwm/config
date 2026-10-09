@@ -11,6 +11,10 @@ set $term aiterm
 bindsym $mod+Return exec $term
 bindsym $mod+Shift+q kill
 
+# ブラウザ (ap -S firefox。入っていなければ何も起きない: ログは journalctl -u aiwm)
+set $browser firefox
+bindsym $mod+b exec $browser
+
 # 窓を移る / 窓を動かす
 bindsym $mod+h focus left
 bindsym $mod+j focus down

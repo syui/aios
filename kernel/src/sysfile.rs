@@ -1155,7 +1155,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         let nonblock = f.borrow().flags & crate::file::O_NONBLOCK != 0;
         return if pcm { crate::sound::pcm_ioctl(req, arg, nonblock) } else { crate::sound::ctl_ioctl(req, arg) };
     }
-    // FIONREAD: いま読めるバイト数 (パイプ、socketpair と AF_UNIX のソケット、ふつうのファイル)。
+    // FIONREAD: いま読めるバイト数 (パイプ、socketpair と AF_UNIX のソケット、TCP / UDP のソケット、ふつうのファイル)。
     // 端末のものは tty の ioctl で
     const FIONREAD: u64 = 0x541b;
     if req == FIONREAD {
@@ -1163,6 +1163,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         let n = match &f.kind {
             Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Some(p.borrow().len()),
             Kind::Unix(_) => Some(0),
+            Kind::Socket(s) => Some(s.borrow().available()),
             Kind::Inotify(n) => Some(inotify::pending(n)),
             Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => Some((ino.meta().size as usize).saturating_sub(f.offset)),
             _ => None,

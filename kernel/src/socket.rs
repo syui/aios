@@ -38,6 +38,7 @@ const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_PEEK: u64 = 0x2;
 
 const TCP_RX: usize = 64 * 1024;
 const TCP_TX: usize = 32 * 1024;
@@ -167,14 +168,15 @@ impl Drop for Socket {
 
 impl Socket {
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, i64> {
-        self.recv(buf, false).map(|(n, _)| n)
+        self.recv(buf, false, false).map(|(n, _)| n)
     }
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, i64> {
         self.send(buf, None, false)
     }
 
-    fn recv(&mut self, buf: &mut [u8], dontwait: bool) -> Result<(usize, Option<IpEndpoint>), i64> {
+    /// peek なら読んだものを取りださない (MSG_PEEK)
+    fn recv(&mut self, buf: &mut [u8], dontwait: bool, peek: bool) -> Result<(usize, Option<IpEndpoint>), i64> {
         let nb = self.nonblock || dontwait;
         net::poll();
         match self.proto {
@@ -183,6 +185,10 @@ impl Socket {
                 loop {
                     let s = tcp(h);
                     if s.can_recv() {
+                        if peek {
+                            let k = s.peek_slice(buf).map_err(|_| -ECONNRESET)?;
+                            return Ok((k, s.remote_endpoint()));
+                        }
                         let k = s.recv_slice(buf).map_err(|_| -ECONNRESET)?;
                         net::poll(); // 窓が開いたことを知らせる
                         return Ok((k, s.remote_endpoint()));
@@ -198,7 +204,7 @@ impl Socket {
                 loop {
                     let s = udp(h);
                     if s.can_recv() {
-                        let (k, meta) = s.recv_slice(buf).map_err(|_| -EINVAL)?;
+                        let (k, meta) = if peek { s.peek_slice(buf).map(|(k, m)| (k, *m)) } else { s.recv_slice(buf) }.map_err(|_| -EINVAL)?;
                         return Ok((k, Some(meta.endpoint)));
                     }
                     wait(nb, 0)?;
@@ -210,7 +216,7 @@ impl Socket {
                 loop {
                     let s = raw(h);
                     if s.can_recv() {
-                        let k = s.recv_slice(buf).map_err(|_| -EINVAL)?;
+                        let k = if peek { s.peek_slice(buf) } else { s.recv_slice(buf) }.map_err(|_| -EINVAL)?;
                         let from = (k >= 20).then(|| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(buf[12], buf[13], buf[14], buf[15])), 0));
                         return Ok((k, from));
                     }
@@ -365,6 +371,18 @@ impl Socket {
     }
 
     /// (読める, 書ける, 閉じた)
+    /// FIONREAD: いま読めるバイト数 (TCP は届いている分、UDP などは次のデータグラムの大きさ。Linux と同じ)
+    pub fn available(&self) -> usize {
+        net::poll();
+        let Some(h) = self.handle else { return 0 };
+        match self.proto {
+            Proto::Tcp => tcp(h).recv_queue(),
+            Proto::Udp => udp(h).peek().map_or(0, |(d, _)| d.len()),
+            Proto::Icmp => usize::from(icmp(h).can_recv()),
+            Proto::Raw => raw(h).peek().map_or(0, |d| d.len()),
+        }
+    }
+
     pub fn readiness(&self) -> (bool, bool, bool) {
         net::poll();
         let Some(h) = self.handle else { return (false, self.proto != Proto::Tcp, false) };
@@ -727,7 +745,7 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
     }
     let s = sock_of(fd)?;
     let mut data = vec![0u8; len.min(64 * 1024)];
-    let (k, from) = s.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?;
+    let (k, from) = s.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0)?;
     proc::current().pt().copy_out(buf, &data[..k]).ok_or(-EFAULT)?;
     write_addr(addr, lenp, from)?;
     Ok(k as i64)
@@ -987,7 +1005,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
             ctl = crate::unix::deliver(&rx, end, m.control, m.controllen, flags)?;
             (k, None)
         }
-        None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0)?,
+        None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0)?,
     };
     let pt = proc::current().pt();
     let mut done = 0;
@@ -1035,7 +1053,8 @@ pub fn proc_net(want_tcp: bool) -> alloc::string::String {
                     tcp::State::FinWait1 => 4,
                     tcp::State::FinWait2 => 5,
                     tcp::State::TimeWait => 6,
-                    tcp::State::Closed => continue,
+                    // まだつないでいない・閉じたものも (Linux も CLOSE の 07 で出す)
+                    tcp::State::Closed => 7,
                     tcp::State::CloseWait => 8,
                     tcp::State::LastAck => 9,
                     tcp::State::Listen => 10,
