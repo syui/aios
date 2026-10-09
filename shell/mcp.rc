@@ -6,5 +6,6 @@ plugin aish-map
 plugin aish-fix
 plugin aish-sys
 plugin aish-pkg
+plugin aish-vm
 # 配列の番号は bash と同じ 0 から (Claude の書くスクリプトは bash の書き方)
 setopt ksharrays

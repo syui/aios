@@ -5,6 +5,8 @@
 #                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
+#   test/vm.py keys ARG...         画面のキーボードで: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、
+#                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
 #   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。4 MB まで)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
@@ -168,6 +170,20 @@ class Serve:
         time.sleep(0.5)
         c.close()
 
+    def keys(self, args):
+        # @NAME は QEMU のキーの名前 (組み合わせも: alt-b)。ほかは文字として
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(MON)
+        c.settimeout(2)
+        time.sleep(0.2)
+        for a in args:
+            names = [a[1:]] if a.startswith('@') else [KEYS.get(ch) or (('shift-' + ch.lower()) if ch.isupper() else ch) for ch in a]
+            for k in names:
+                c.sendall(('sendkey %s\n' % k).encode())
+                time.sleep(0.08)
+        time.sleep(0.5)
+        c.close()
+
     def stop(self):
         try:
             os.write(self.m, b'\x03')
@@ -232,6 +248,9 @@ def serve(www):
                 r = vm.run(cmd, req.get('timeout', 600))
             elif op == 'put':
                 r = vm.put(req['path'], req['b64'])
+            elif op == 'keys':
+                vm.keys(req.get('keys', []))
+                r = {'ok': True}
             elif op == 'type':
                 vm.type(req['text'])
                 r = {}
@@ -244,8 +263,12 @@ def serve(www):
                 r = {'error': 'unknown op %s' % op}
         except Exception as e:
             r = {'error': repr(e)}
-        f.write(json.dumps(r) + '\n')
-        f.flush()
+        # 聞いた人が待ちきれずに切っていても、サーバーは止めない (止めると VM が取り残される)
+        try:
+            f.write(json.dumps(r) + '\n')
+            f.flush()
+        except OSError:
+            pass
         c.close()
         if op == 'stop':
             os.unlink(CTL)
@@ -299,6 +322,8 @@ def main():
         sys.exit(r['status'])
     elif op == 'type':
         ask({'op': 'type', 'text': a[1].replace('\\n', '\n')})
+    elif op == 'keys':
+        ask({'op': 'keys', 'keys': a[1:]})
     elif op == 'put':
         import base64
         data = open(a[1], 'rb').read()

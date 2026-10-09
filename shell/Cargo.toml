@@ -7,10 +7,11 @@
 #   wait:     プロセスが終わる、ファイルに文字が出る、ポートが開く、まで待つ (tools だけ)
 #   fix:      ビルドのエラーを番号つきの一覧に (vim の quickfix)。うしろでビルドして待てる
 #   sys:      aios の様子 (まとめ、プロセス、カーネルのメッセージ、ログ、BKL、strace)
+#   vm:       開発のマシンで aios の VM を動かす、C を中で試す、2 つのカーネルをくらべる、壊れたコミットを探す
 #   powerline: powerline のプロンプト ([shell] リポジトリの aish-powerline)
 [workspace]
 resolver = "2"
-members = ["plugin", "complete", "suggest", "highlight", "time", "pick", "edit", "wait", "map", "fix", "sys", "pkg", "claude", "powerline"]
+members = ["plugin", "complete", "suggest", "highlight", "time", "pick", "edit", "wait", "map", "fix", "sys", "pkg", "claude", "vm", "powerline"]
 
 [workspace.package]
 version = "0.0.1"
