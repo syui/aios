@@ -329,6 +329,11 @@ pub fn write(e: &EventFdRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     }
 }
 
+/// いまの数 (/proc/ai/fd)
+pub fn count(e: &EventFdRef) -> u64 {
+    e.borrow().count
+}
+
 pub fn readiness(e: &EventFdRef) -> (bool, bool, bool) {
     let ev = e.borrow();
     (ev.count > 0, ev.count < u64::MAX - 1, false)

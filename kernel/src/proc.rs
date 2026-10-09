@@ -197,6 +197,8 @@ pub struct Proc {
     pub recent: u32,
     /// 走らせた回数 (/proc/threads。調べもの用)
     pub nrun: u64,
+    /// 眠りはじめた tick (/proc/ai/threads の slept_s。どれだけ眠りつづけているか)
+    pub slept_at: u64,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
     pub yielded: bool,
     /// いま走りはじめてから来たタイマの割り込みの数。タイムスライス (sysctl kernel.sched_timeslice_ms) に
@@ -268,6 +270,7 @@ impl Proc {
         vpid: 0,
         recent: 0,
         nrun: 0,
+        slept_at: 0,
         yielded: false,
         slice: 0,
         cutime: 0,
@@ -798,6 +801,7 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     p.chan = chan;
     p.wake_at = deadline;
     p.state = State::Sleeping;
+    p.slept_at = crate::timer::ticks();
     sched();
     let p = current();
     p.chan = 0;
@@ -893,6 +897,12 @@ pub fn poll_sleep(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> 
     let r = sleep_until(poll_chan(), deadline);
     current().poll_keys = None;
     r
+}
+
+/// pidfd を poll で見張るときの印: どれかのプロセスが終わると起こす
+pub fn pidfd_key() -> usize {
+    static K: u8 = 0;
+    &raw const K as usize
 }
 
 /// key (パイプや端末など) が変わった: それを見張って poll で眠っているものだけを起こす
@@ -1014,8 +1024,8 @@ fn exit_status(status: i32) -> ! {
     if let Some(init) = find(1) {
         wakeup(init as *mut Proc as usize);
     }
-    // pidfd を poll / epoll しているもの
-    wakeup(poll_chan());
+    // pidfd を poll / epoll しているもの (印は pidfd_key。印なしで眠っているものも起きる)
+    poll_wake(pidfd_key());
     sched();
     unreachable!("zombie ran");
 }
@@ -1537,6 +1547,81 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
         }
     }
     out
+}
+
+/// /proc/ai/threads: すべてのスレッドを 1 行 1 つの JSON で (AI が読む。aish-sys の threads と hang)。
+/// 眠っていれば何を待っているか: futex (アドレス、待つ値、いまの値)、poll / select / epoll (見張っている fd)、
+/// ほか (channel)。slept_s は眠りつづけている秒
+pub fn ai_threads() -> alloc::string::String {
+    use crate::aiproc::esc;
+    let mut out = alloc::string::String::new();
+    let now = crate::timer::ticks();
+    let hz = crate::timer::HZ;
+    for p in live() {
+        if p.state == State::Unused {
+            continue;
+        }
+        let st = match p.state {
+            State::Running => "run",
+            State::Runnable => "ready",
+            State::Sleeping => "sleep",
+            State::Zombie => "zombie",
+            State::Unused => "unused",
+        };
+        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let sys = crate::syscall::name(p.last_sys.0).map_or(alloc::format!("{}", p.last_sys.0), |x| x.to_ascii_lowercase());
+        let mut line = alloc::format!(
+            "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"state\":\"{}\",\"sys\":\"{}\",\"args\":[{},{}],\"runs\":{},\"utime_s\":{:.2}",
+            p.pid,
+            p.tgid,
+            esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
+            st,
+            sys,
+            p.last_sys.1,
+            p.last_sys.2,
+            p.nrun,
+            p.utime as f64 / hz as f64
+        );
+        if p.state == State::Sleeping {
+            line.push_str(&alloc::format!(",\"slept_s\":{:.2}", now.saturating_sub(p.slept_at) as f64 / hz as f64));
+            if p.wake_at != 0 {
+                line.push_str(&alloc::format!(",\"timeout_s\":{:.2}", p.wake_at.saturating_sub(now) as f64 / hz as f64));
+            }
+            line.push_str(",\"wait\":");
+            line.push_str(&wait_json(p));
+        }
+        line.push_str("}\n");
+        out.push_str(&line);
+    }
+    out
+}
+
+/// 眠っている p が待っているもの (JSON)
+fn wait_json(p: &mut Proc) -> alloc::string::String {
+    // futex: x0 がアドレス、x2 が待つ値
+    if p.last_sys.0 == 98 && p.chan != poll_chan() {
+        let tf = p.tf_ref();
+        let (addr, val) = (tf.x[0], tf.x[2] as u32);
+        let mut w = [0u8; 4];
+        let now = p.pt().copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
+        return alloc::format!("{{\"futex\":{},\"val\":{},\"now\":{}}}", addr, val, now);
+    }
+    if p.chan == poll_chan() {
+        // poll / select / epoll: 印 (poll_keys) を、そのプロセスの fd に戻す
+        let Some(keys) = p.poll_keys.clone() else { return "{\"poll\":\"any\"}".into() };
+        let mut fds = alloc::vec::Vec::new();
+        if let Some(files) = p.files.as_ref() {
+            for (i, f) in files.get().fds.iter().enumerate() {
+                let Some(f) = f else { continue };
+                let Ok(of) = f.file.try_borrow() else { continue };
+                if of.poll_keys().is_some_and(|k| k.iter().any(|k| keys.contains(k))) {
+                    fds.push(alloc::format!("{}", i));
+                }
+            }
+        }
+        return alloc::format!("{{\"poll\":[{}]}}", fds.join(","));
+    }
+    alloc::format!("{{\"chan\":{}}}", p.chan)
 }
 
 pub fn threads_text() -> alloc::string::String {

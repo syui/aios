@@ -458,6 +458,18 @@ impl OpenFile {
         }
     }
 
+    /// 読まれずに残っているもの (/proc/ai/fd): パイプと socketpair はバイト、TCP / UDP は届いている分、
+    /// eventfd は数、inotify はバイト。ないもの (ふつうのファイルなど) は None
+    pub fn pending(&self) -> Option<u64> {
+        Some(match &self.kind {
+            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => p.borrow().len() as u64,
+            Kind::Socket(s) => s.borrow().available() as u64,
+            Kind::EventFd(e) => crate::epoll::count(e),
+            Kind::Inotify(n) => crate::inotify::pending(n) as u64,
+            _ => return None,
+        })
+    }
+
     /// poll 用: (読める, 書ける, 閉じた/エラー)
     pub fn readiness(&self) -> (bool, bool, bool) {
         match &self.kind {
@@ -505,6 +517,7 @@ impl OpenFile {
             Kind::EventFd(e) => alloc::vec![crate::epoll::chan(e)],
             Kind::Inotify(n) => alloc::vec![crate::inotify::chan(n)],
             Kind::Socket(_) => alloc::vec![crate::net::chan()],
+            Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],

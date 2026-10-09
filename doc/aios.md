@@ -131,7 +131,22 @@ sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release
 - 子にも引き継がれ、外せない。中で aibox を重ねると、もっと狭くなるだけ。`sudo` (setuid) は効かない
 - かかっているかは `/proc/self/status` の `NoNewPrivs` と `Landlock` (層の数)
 
-Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -w ~/.cache -w ~/.cargo -- aish --mcp` で起きる。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
+Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -w ~/.cache -w ~/.cargo -w /proc/ai/ctl -- aish --mcp` で起きる (`/proc/ai/ctl` は下の調べもののスイッチ)。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
+
+## カーネルの中を見る (/proc/ai)
+
+止まった・遅いプログラムを調べるための、カーネルの中の様子。AI が読むので、どれも 1 行 1 つの JSON。
+読み書きできるのは root と wheel の人だけ (aibox の中でも。`aibox --root` の中は不可)。pid はいつも本当の番号。
+
+| ファイル | 中身 |
+|---|---|
+| `/proc/ai/threads` | すべてのスレッド: 状態、最後のシステムコール、走った回数。眠っていれば `slept_s` (眠りつづけている秒) と `wait`: futex (アドレス、待つ値、いまの値) / poll (見張っている fd) / chan |
+| `/proc/ai/fd/PID` | そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの (`pending`) |
+| `/proc/ai/bkl` | 大きなロックの統計 (`/proc/bkl` と同じもの): CPU ごとの待ち・持ち、長く持ったシステムコール、デバイスとスケジューラを待った時間、ページフォルトの種類 |
+| `/proc/ai/ctl` | 書くスイッチ: `kick PID` (futex で眠っているスレッドをみな起こす。起こしが消えたのか、だれも起こしていないのかを見分ける)、`raw TID` (レジスタとスタックを kmsg に)、`pcmiss on\|off`、`strace NAME`、`bkl reset` |
+
+Claude は aish-sys の `threads` (絞りこみと fd の中身つき) と `hang` (なぜ止まっているかの見立て: 長く眠っているスレッドと待っているもの、
+残っているデータ、kick して眠りなおすか) で使う。
 
 ## 改造 (aios src / build / install)
 

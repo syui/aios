@@ -8,6 +8,9 @@
 //   log     サービスのログ (/var/log/UNIT.log。journalctl -u と同じもの)
 //   bkl     コマンドを 1 つ動かして、そのあいだの大きなロック (/proc/bkl) を測る
 //   strace  コマンドを 1 つ動かして、そのシステムコールを kmsg から取る (/proc/strace)
+//   threads スレッドの一覧 (/proc/ai/threads): 眠っていれば何を (futex / 見張っている fd とその中身) どれだけ待っているか
+//   hang    プロセスがなぜ止まっているか: 長く眠っているスレッドと待っているもの、読まれずに残っているデータ、
+//           futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)
 //   tune    sysctl の値を順に変えてコマンドの時間をくらべる (aios tune。--apply でいちばん速い値を /etc/aios.json に)
 //   M-s     まとめを画面に出す (キーを押すと消える)
 // /proc/bkl、/proc/strace を 0 からにするのは root だけなので、root でなければ sudo -n tee で書く。
@@ -27,6 +30,8 @@ const PROCS: &str = r#"{"type":"object","properties":{"sort":{"type":"string","d
 const KMSG: &str = r#"{"type":"object","properties":{"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
 const LOG: &str = r#"{"type":"object","properties":{"unit":{"type":"string","description":"サービスの名前 (sshd、aiwm.service など)。なければログのある一覧"},"grep":{"type":"string"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
 const RUN: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。なければ今の値を読むだけ (bkl)"},"timeout_ms":{"type":"integer","description":"これを過ぎたら止める (既定 50000)"}}}"#;
+const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"このプロセスのスレッドだけ"},"name":{"type":"string","description":"名前 (スレッドかプロセスの) にこれをふくむものだけ"},"state":{"type":"string","description":"sleep / run / ready / zombie"},"min_slept_s":{"type":"number","description":"これだけ眠りつづけているものだけ"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
+const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く眠っているスレッドの /proc/PID/stack (pc、lr、スタックの中のコードを指す値)"}}}"#;
 const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
 
 fn main() {
@@ -44,6 +49,8 @@ fn main() {
             Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", input: KMSG },
             Tool { name: "log", desc: "サービスのログ (/var/log/UNIT.log)。unit がなければログのある一覧", input: LOG },
             Tool { name: "bkl", desc: "cmd を動かして、そのあいだの大きなロック (BKL) の統計 (CPU ごとの待ち・持ち、長く持ったシステムコール)。cmd がなければ今の値", input: RUN },
+            Tool { name: "threads", desc: "スレッドの一覧 (/proc/ai/threads): tid pid 名前 状態 最後のシステムコール 走った回数。眠っていれば slept_s (眠りつづけている秒) と wait: futex (アドレス、待つ値、いまの値) / poll (見張っている fd と、それが何か・読めるか・残っているバイト) / chan", input: THREADS },
+            Tool { name: "hang", desc: "プロセスがなぜ止まっているかを調べる: 長く眠っているスレッドと待っているもの、読まれずに残っているデータのある fd、futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)、見立て (hints)", input: HANG },
             Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
         ],
     };
@@ -65,6 +72,8 @@ fn main() {
                 "log" => log(a),
                 "bkl" => bkl(a, pwd),
                 "strace" => strace(a, pwd),
+                "threads" => threads(a),
+                "hang" => hang(a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -490,4 +499,148 @@ fn key() -> Value {
     // 出したものを消して、始めの場所 (打ちかけの行の下の行の頭) へ戻る
     tty.write(&format!("\r\x1b[{}A\x1b[J", lines.len()));
     json!({})
+}
+
+// ---- /proc/ai: threads と hang ----
+
+/// root (と /proc/ai は wheel の人) だけが読めるもの。読めなければ sudo -n cat
+fn read_root(path: &str) -> Result<String, String> {
+    if let Ok(t) = std::fs::read_to_string(path) {
+        return Ok(t);
+    }
+    let o = Command::new("sudo").args(["-n", "cat", path]).output().map_err(|e| format!("sudo: {}", e))?;
+    if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).into_owned()) } else { Err(format!("sudo -n cat {}: {}", path, String::from_utf8_lossy(&o.stderr).trim())) }
+}
+
+/// 1 行 1 つの JSON を読む
+fn json_lines(path: &str) -> Result<Vec<Value>, String> {
+    Ok(read_root(path)?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+fn ai_threads() -> Result<Vec<Value>, String> {
+    if !Path::new("/proc/ai/threads").exists() {
+        return Err("no /proc/ai (not aios, or an older kernel)".into());
+    }
+    json_lines("/proc/ai/threads")
+}
+
+/// プロセス pid の fd (/proc/ai/fd/PID): fd 番号 → その行
+fn ai_fds(pid: u64) -> std::collections::BTreeMap<u64, Value> {
+    json_lines(&format!("/proc/ai/fd/{}", pid)).unwrap_or_default().into_iter().filter_map(|v| Some((v["fd"].as_u64()?, v))).collect()
+}
+
+/// wait の poll の fd 番号を、その fd の様子に置きかえる
+fn annotate(t: &mut Value, fds: &std::collections::BTreeMap<u64, Value>) {
+    if let Some(list) = t["wait"]["poll"].as_array() {
+        let v: Vec<Value> = list.iter().map(|n| n.as_u64().and_then(|n| fds.get(&n).cloned()).unwrap_or(n.clone())).collect();
+        t["wait"]["poll"] = json!(v);
+    }
+}
+
+fn threads(a: &Value) -> Value {
+    let ts = match ai_threads() {
+        Ok(t) => t,
+        Err(e) => return error(e),
+    };
+    // プロセスの名前 (代表スレッドの名前) も名前で絞るときに見る
+    let leaders: std::collections::BTreeMap<u64, String> = ts.iter().filter(|t| t["tid"] == t["pid"]).map(|t| (t["pid"].as_u64().unwrap_or(0), s(t, "name").to_string())).collect();
+    let name = s(a, "name");
+    let state = s(a, "state");
+    let min = a["min_slept_s"].as_f64().unwrap_or(0.0);
+    let limit = a["limit"].as_u64().unwrap_or(50) as usize;
+    let mut sel: Vec<Value> = ts
+        .into_iter()
+        .filter(|t| a["pid"].as_u64().is_none_or(|p| t["pid"].as_u64() == Some(p)))
+        .filter(|t| name.is_empty() || s(t, "name").contains(name) || leaders.get(&t["pid"].as_u64().unwrap_or(0)).is_some_and(|l| l.contains(name)))
+        .filter(|t| state.is_empty() || s(t, "state") == state)
+        .filter(|t| min <= 0.0 || t["slept_s"].as_f64().is_some_and(|x| x >= min))
+        .collect();
+    let total = sel.len();
+    sel.truncate(limit);
+    let mut cache = std::collections::BTreeMap::new();
+    for t in sel.iter_mut() {
+        if t["wait"]["poll"].is_array() {
+            let pid = t["pid"].as_u64().unwrap_or(0);
+            let fds = cache.entry(pid).or_insert_with(|| ai_fds(pid));
+            annotate(t, fds);
+        }
+    }
+    json!({ "count": total, "threads": sel })
+}
+
+fn hang(a: &Value) -> Value {
+    let ts = match ai_threads() {
+        Ok(t) => t,
+        Err(e) => return error(e),
+    };
+    let pids: Vec<u64> = match (a["pid"].as_u64(), s(a, "name")) {
+        (Some(p), _) => vec![p],
+        (None, n) if !n.is_empty() => ts.iter().filter(|t| t["tid"] == t["pid"] && s(t, "name").contains(n)).filter_map(|t| t["pid"].as_u64()).collect(),
+        _ => return error("pid か name を"),
+    };
+    if pids.is_empty() {
+        return error("no such process");
+    }
+    // 起こしてみる (futex で眠っているもの)。少し待って読みなおし、同じ futex で眠りなおしたかを見る
+    let kick = a["kick"].as_bool().unwrap_or(true);
+    let mut after: Vec<Value> = Vec::new();
+    if kick {
+        for p in &pids {
+            if ts.iter().any(|t| t["pid"].as_u64() == Some(*p) && t["wait"]["futex"].is_u64()) {
+                let cmd = format!("kick {}", p);
+                if std::fs::write("/proc/ai/ctl", &cmd).is_err() {
+                    let _ = write_root("/proc/ai/ctl", &cmd);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        after = ai_threads().unwrap_or_default();
+    }
+    let procs: Vec<Value> = pids.iter().map(|&pid| hang_one(pid, &ts, &after, kick, a["stack"].as_bool().unwrap_or(false))).collect();
+    json!({ "procs": procs })
+}
+
+fn hang_one(pid: u64, ts: &[Value], after: &[Value], kick: bool, stack: bool) -> Value {
+    let fds = ai_fds(pid);
+    let mut mine: Vec<Value> = ts.iter().filter(|t| t["pid"].as_u64() == Some(pid)).cloned().collect();
+    let name = mine.iter().find(|t| t["tid"].as_u64() == Some(pid)).map_or(String::new(), |t| s(t, "name").to_string());
+    let mut hints: Vec<String> = Vec::new();
+    // 読まれずに残っているもの (眠っている人がそれを見張っていないなら、起こしが消えたかもしれない)
+    let pending: Vec<Value> = fds.values().filter(|f| f["pending"].as_u64().is_some_and(|n| n > 0)).cloned().collect();
+    let watched: std::collections::BTreeSet<u64> = mine.iter().filter_map(|t| t["wait"]["poll"].as_array()).flatten().filter_map(|n| n.as_u64()).collect();
+    for f in &pending {
+        let n = f["fd"].as_u64().unwrap_or(0);
+        if watched.contains(&n) {
+            hints.push(format!("fd {} ({}) に読まれていないデータがあるのに、それを見張って眠っているスレッドがいる: 起こしが消えたかも", n, s(f, "what")));
+        }
+    }
+    // 長く眠っているものから
+    mine.sort_by(|x, y| y["slept_s"].as_f64().unwrap_or(-1.0).partial_cmp(&x["slept_s"].as_f64().unwrap_or(-1.0)).unwrap_or(std::cmp::Ordering::Equal));
+    for t in mine.iter_mut() {
+        annotate(t, &fds);
+        let tid = t["tid"].as_u64().unwrap_or(0);
+        if let Some(addr) = t["wait"]["futex"].as_u64() {
+            let unchanged = t["wait"]["val"] == t["wait"]["now"];
+            if kick {
+                let again = after.iter().find(|x| x["tid"].as_u64() == Some(tid));
+                let same = again.is_some_and(|x| x["wait"]["futex"].as_u64() == Some(addr) && x["state"] == "sleep");
+                t["kick"] = json!(if same { "眠りなおした (同じ futex)" } else { "起きて進んだ" });
+                if !same && t["slept_s"].as_f64().is_some_and(|x| x > 1.0) {
+                    hints.push(format!("tid {} ({}) は起こすと進んだ: futex の起こしが消えていたかも", tid, s(t, "name")));
+                }
+            }
+            if unchanged && t["slept_s"].as_f64().is_some_and(|x| x > 5.0) && tid == pid {
+                hints.push(format!("代表スレッド {} が futex {:#x} で {:.0} 秒眠っていて、値は変わっていない: だれも知らせていない (ほかのスレッドかプロセスの返事を待っている。stack: true でどこで待っているか)", tid, addr, t["slept_s"].as_f64().unwrap_or(0.0)));
+            }
+        }
+    }
+    let busy: Vec<String> = mine.iter().filter(|t| t["state"] == "run" || t["state"] == "ready").map(|t| format!("{} {}", t["tid"], s(t, "name"))).collect();
+    if !busy.is_empty() && mine.iter().any(|t| t["slept_s"].as_f64().is_some_and(|x| x > 5.0)) {
+        hints.push(format!("走っているもの: {}。CPU が足りないか、大きなロックが混んでいるかもしれない (bkl で)", busy.join(", ")));
+    }
+    let mut r = json!({ "pid": pid, "name": name, "threads": mine, "pending_fds": pending, "hints": hints });
+    if stack {
+        r["stack"] = json!(read_root(&format!("/proc/{}/stack", pid)).unwrap_or_default().lines().filter(|l| !l.starts_with("fd ") && !l.starts_with("    ")).take(400).collect::<Vec<_>>().join("\n"));
+    }
+    r
 }
