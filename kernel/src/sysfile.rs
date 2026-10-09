@@ -145,7 +145,23 @@ fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {
 fn parent_full(dirfd: i64, pathp: usize) -> Result<(InodeRef, String, String), i64> {
     let path = user_str(pathp)?;
     let base = base_dir(dirfd, &path)?;
-    vfs::parent_path(&base, &path)
+    let r = vfs::parent_path(&base, &path)?;
+    // 作る・消す・名前を変えるところ: 読むだけのマウントの下なら EROFS
+    vfs::check_writable(&r.2)?;
+    Ok(r)
+}
+
+/// dirfd + path が読むだけのマウントの下なら EROFS (chmod、chown、utimensat、truncate)
+fn writable_at(dirfd: i64, pathp: usize, flags: u64) -> Result<(), i64> {
+    vfs::check_writable(&old_path(dirfd, pathp, flags)?)
+}
+
+/// fd の開いているファイルが読むだけのマウントの下なら EROFS
+fn writable_fd(fd: u64) -> Result<(), i64> {
+    match &file_of(fd)?.borrow().kind {
+        Kind::Inode(_, p) => vfs::check_writable(p.trim_start_matches('/')),
+        _ => Ok(()),
+    }
 }
 
 /// 親ディレクトリのパス (先頭 / なし)
@@ -367,6 +383,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         }
         Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
             let (parent, name, full) = vfs::parent_path(&base, &path)?;
+            vfs::check_writable(&full)?;
             crate::landlock::check_parent(&full, crate::landlock::MAKE_REG)?;
             if flags as u32 & file::O_ACCMODE != file::O_RDONLY {
                 crate::landlock::check_fs(&full, crate::landlock::WRITE_FILE)?;
@@ -429,6 +446,10 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
         vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
+            // ふつうのファイルを書くために開く: 読むだけのマウントの下なら EROFS (デバイスはかまわない)
+            if accmode != file::O_RDONLY {
+                vfs::check_writable(&full)?;
+            }
             if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
                 ino.truncate(0)?;
                 inotify::file_event(&full, &ino, inotify::IN_MODIFY);
@@ -774,6 +795,7 @@ pub fn memfd_create(name: usize, flags: u64) -> R {
 }
 
 pub fn ftruncate(fd: u64, len: i64) -> R {
+    writable_fd(fd)?;
     if len < 0 {
         return Err(-EINVAL);
     }
@@ -792,6 +814,7 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
 /// fallocate: mode 0 (場所を確保する) だけ。足りなければファイルを伸ばす (中身は 0、ページは使うときに)。
 /// KEEP_SIZE (1) は何もしない。穴をあけるもの (PUNCH_HOLE など) はまだできない
 pub fn fallocate(fd: u64, mode: u64, off: i64, len: i64) -> R {
+    writable_fd(fd)?;
     const EOPNOTSUPP: i64 = 95;
     const FALLOC_FL_KEEP_SIZE: u64 = 1;
     if off < 0 || len <= 0 {
@@ -821,6 +844,7 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     }
     let path = user_str(pathp)?;
     let (full, ino) = vfs::lookup(&proc::current().files().cwd.clone(), &path, true)?;
+    vfs::check_writable(&full)?;
     crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
     cred::current().check(&ino.meta(), PW)?;
     ino.truncate(len as usize)?;
@@ -844,12 +868,14 @@ fn chmod(ino: &InodeRef, mode: u64) -> R {
 }
 
 pub fn fchmod(fd: u64, mode: u64) -> R {
+    writable_fd(fd)?;
     chmod(&inode_of(fd)?, mode)?;
     attrib_fd(fd);
     Ok(0)
 }
 
 pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
+    writable_at(dirfd, pathp, 0)?;
     chmod(&at(dirfd, pathp, 0)?, mode)?;
     attrib_at(dirfd, pathp);
     Ok(0)
@@ -908,12 +934,14 @@ fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
 }
 
 pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
+    writable_fd(fd)?;
     chown(&inode_of(fd)?, uid, gid)?;
     attrib_fd(fd);
     Ok(0)
 }
 
 pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
+    writable_at(dirfd, pathp, flags)?;
     chown(&at(dirfd, pathp, flags)?, uid, gid)?;
     attrib_at(dirfd, pathp);
     Ok(0)
@@ -922,6 +950,7 @@ pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
     const UTIME_NOW: u64 = (1 << 30) - 1;
     const UTIME_OMIT: u64 = (1 << 30) - 2;
+    if pathp == 0 { writable_fd(dirfd as u64)? } else { writable_at(dirfd, pathp, flags)? }
     let ino = if pathp == 0 { inode_of(dirfd as u64)? } else { at(dirfd, pathp, flags)? };
     let c = cred::current();
     let m = ino.meta();
@@ -1209,7 +1238,8 @@ fn may_mount() -> Result<(), i64> {
 }
 
 /// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリ)。
-/// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。読むだけ (MS_RDONLY) と移す (MS_MOVE) はない
+/// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。MS_RDONLY で読むだけ
+/// (MS_REMOUNT で付けなおせる)。移す (MS_MOVE) はない
 pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
     const MS_RDONLY: u64 = 1;
     const MS_REMOUNT: u64 = 32;
@@ -1224,10 +1254,13 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
         vfs::resolve(&cwd, &target, true)?;
         return Ok(0);
     }
-    if flags & (MS_RDONLY | MS_MOVE) != 0 {
+    if flags & MS_MOVE != 0 {
         return Err(-EINVAL);
     }
+    // 付けなおし (mount -o remount,ro): いちばん上のマウントを読むだけに / 書けるように
     if flags & MS_REMOUNT != 0 {
+        let (full, _) = vfs::lookup(&cwd, &target, true)?;
+        vfs::remount(&full, flags & MS_RDONLY != 0)?;
         return Ok(0);
     }
     let (full, dir) = vfs::lookup(&cwd, &target, true)?;
@@ -1257,7 +1290,7 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
         (root, source, fstype)
     };
-    vfs::mount(&full, root, &source, &fstype)?;
+    vfs::mount_ro(&full, root, &source, &fstype, flags & MS_RDONLY != 0)?;
     Ok(0)
 }
 

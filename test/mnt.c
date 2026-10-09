@@ -69,6 +69,34 @@ static int bind_stack(void) {
   if (mount("none", "/", 0, MS_REC | MS_PRIVATE, 0)) return 14;
   return 0;
 }
+/* 読むだけ: 作る・書く・消す・chmod は EROFS、読むのはよい。付けなおしで戻る。その下に重ねた rw のマウントは書ける */
+static int readonly(void) {
+  if (enter()) return 2;
+  char f[96], sub[96], g[96];
+  snprintf(f, sizeof f, "%s/f", dir); snprintf(sub, sizeof sub, "%s/sub", dir); snprintf(g, sizeof g, "%s/sub/g", dir);
+  if (mount("tmpfs", dir, "tmpfs", 0, 0)) return 3;
+  int fd = open(f, O_CREAT | O_WRONLY, 0644); if (fd < 0) return 4; write(fd, "hi", 2); close(fd);
+  if (mkdir(sub, 0755)) return 5;
+  if (mount("none", dir, 0, MS_REMOUNT | MS_RDONLY, 0)) return 6;
+  if (!has_line("/proc/self/mounts", " tmpfs ro ")) return 7;
+  if (open(f, O_WRONLY) != -1 || errno != EROFS) return 8;
+  if (open(g, O_CREAT | O_WRONLY, 0644) != -1 || errno != EROFS) return 9;
+  if (unlink(f) != -1 || errno != EROFS) return 10;
+  if (mkdir(g, 0755) != -1 || errno != EROFS) return 11;
+  if (chmod(f, 0600) != -1 || errno != EROFS) return 12;
+  if (truncate(f, 0) != -1 || errno != EROFS) return 13;
+  char b[4]; fd = open(f, O_RDONLY); if (fd < 0 || read(fd, b, 2) != 2) return 14; close(fd);
+  if (mount("tmpfs", sub, "tmpfs", 0, 0)) return 15;
+  fd = open(g, O_CREAT | O_WRONLY, 0644); if (fd < 0) return 16; close(fd);
+  umount(sub);
+  if (mount("none", dir, 0, MS_REMOUNT, 0)) return 17;
+  fd = open(f, O_WRONLY); if (fd < 0) return 18; close(fd);
+  if (unlink(f)) return 19;
+  /* はじめから読むだけでマウント */
+  if (mount("tmpfs", sub, "tmpfs", MS_RDONLY, 0)) return 20;
+  if (open(g, O_CREAT | O_WRONLY, 0644) != -1 || errno != EROFS) return 21;
+  return 0;
+}
 static int bad(void) {
   if (enter()) return 2;
   if (!(mount("x", dir, "nosuchfs", 0, 0) == -1 && errno == ENODEV)) return 3;
@@ -87,6 +115,7 @@ int main(void) {
   CHECK("tmpfs-inside", child(tmpfs_inside) == 0);
   CHECK("not-seen-outside", !exists(inside) && !has_line("/proc/mounts", dir));
   CHECK("bind-stack", child(bind_stack) == 0);
+  CHECK("readonly", child(readonly) == 0);
   CHECK("bad", child(bad) == 0);
   rmdir(dir);
   printf("mnt: %d failed\n", fails);
