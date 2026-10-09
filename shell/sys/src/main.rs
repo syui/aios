@@ -12,6 +12,7 @@
 //   hang    プロセスがなぜ止まっているか: 長く眠っているスレッドと待っているもの、読まれずに残っているデータ、
 //           futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)
 //   stack   スレッドの呼び出しの並び (/proc/ai/stack と、写しているファイルの .eh_frame。unwind.rs)
+//   watch   aiwatch (カーネルの見張り) がいま見つけているものと、最近の記録 (/run/aiwatch.json、/var/log/aiwatch.service.log)
 //   tune    sysctl の値を順に変えてコマンドの時間をくらべる (aios tune。--apply でいちばん速い値を /etc/aios.json に)
 //   M-s     まとめを画面に出す (キーを押すと消える)
 // /proc/bkl、/proc/strace を 0 からにするのは root だけなので、root でなければ sudo -n tee で書く。
@@ -35,7 +36,8 @@ const LOG: &str = r#"{"type":"object","properties":{"unit":{"type":"string","des
 const RUN: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。なければ今の値を読むだけ (bkl)"},"timeout_ms":{"type":"integer","description":"これを過ぎたら止める (既定 50000)"}}}"#;
 const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"このプロセスのスレッドだけ"},"name":{"type":"string","description":"名前 (スレッドかプロセスの) にこれをふくむものだけ"},"state":{"type":"string","description":"sleep / run / ready / zombie"},"min_slept_s":{"type":"number","description":"これだけ眠りつづけているものだけ"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
 const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"}}}"#;
-const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
+const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"file":{"type":"string","description":"tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
+const WATCH: &str = r#"{"type":"object","properties":{"lines":{"type":"integer","description":"記録の終わりから何行 (既定 20)"}}}"#;
 const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
 
 fn main() {
@@ -56,6 +58,7 @@ fn main() {
             Tool { name: "threads", desc: "スレッドの一覧 (/proc/ai/threads): tid pid 名前 状態 最後のシステムコール 走った回数。眠っていれば slept_s (眠りつづけている秒) と wait: futex (アドレス、待つ値、いまの値) / poll (見張っている fd と、それが何か・読めるか・残っているバイト) / chan", input: THREADS },
             Tool { name: "hang", desc: "プロセスがなぜ止まっているかを調べる: 長く眠っているスレッドと待っているもの、読まれずに残っているデータのある fd、futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)、見立て (hints)", input: HANG },
             Tool { name: "stack", desc: "スレッドの呼び出しの並び (いちばん上から)。ファイルの .eh_frame でたどり、CFI のないところ (musl の libc) はスタックから戻り先を探す (how: pc / cfi / lr / scan)。名前は .symtab か .dynsym、名前のないもの (strip した libxul など) は、その関数のあたりで使っている文字列 (strings_near) を手がかりに", input: STACK },
+            Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", input: WATCH },
             Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
         ],
     };
@@ -80,6 +83,7 @@ fn main() {
                 "threads" => threads(a),
                 "hang" => hang(a),
                 "stack" => stack(a),
+                "watch" => watch(a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -664,6 +668,14 @@ fn thread_frames(tid: u64, max: usize) -> Value {
 
 fn stack(a: &Value) -> Value {
     let max = a["max"].as_u64().unwrap_or(40) as usize;
+    if let Some(f) = a["file"].as_str().filter(|f| !f.is_empty()) {
+        // 残しておいたもの: 写していたファイルが同じなら、プロセスが終わっていてもたどれる
+        return match std::fs::read_to_string(f).map(|t| serde_json::from_str::<Value>(t.trim())) {
+            Ok(Ok(st)) => json!({ "tid": st["tid"], "name": st["name"], "frames": unwind::frames(&st, max) }),
+            Ok(Err(e)) => error(format!("{}: {}", f, e)),
+            Err(e) => error(format!("{}: {}", f, e)),
+        };
+    }
     if let Some(t) = a["tid"].as_u64() {
         return json!({ "tid": t, "frames": thread_frames(t, max) });
     }
@@ -677,4 +689,16 @@ fn stack(a: &Value) -> Value {
     let limit = a["limit"].as_u64().unwrap_or(8) as usize;
     let out: Vec<Value> = mine.iter().take(limit).map(|t| json!({ "tid": t["tid"], "name": t["name"], "state": t["state"], "wait": t["wait"], "frames": thread_frames(t["tid"].as_u64().unwrap_or(0), max) })).collect();
     json!({ "pid": pid, "threads": out })
+}
+
+fn watch(a: &Value) -> Value {
+    let n = a["lines"].as_u64().unwrap_or(20) as usize;
+    let state: Value = read("/run/aiwatch.json").and_then(|t| serde_json::from_str(t.trim()).ok()).unwrap_or(Value::Null);
+    if state.is_null() {
+        return error("no /run/aiwatch.json (aiwatch is not running: systemctl start aiwatch)");
+    }
+    let log = read("/var/log/aiwatch.service.log").unwrap_or_default();
+    let all: Vec<Value> = log.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let recent: Vec<Value> = all.iter().skip(all.len().saturating_sub(n)).cloned().collect();
+    json!({ "active": state["active"], "checked_at": state["t"], "interval_s": state["interval_s"], "log": recent })
 }
