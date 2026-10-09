@@ -431,10 +431,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         GETSID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getsid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
         GETTID => Ok(crate::ns::local_or_0(proc::current().pid) as i64),
         GETPPID => Ok(crate::ns::local_or_0(proc::current().ppid) as i64),
-        GETUID => Ok(proc::current().cred.uid as i64),
-        GETEUID => Ok(proc::current().cred.euid as i64),
-        GETGID => Ok(proc::current().cred.gid as i64),
-        GETEGID => Ok(proc::current().cred.egid as i64),
+        GETUID => Ok(crate::ns::show_uid(proc::current().cred.uid) as i64),
+        GETEUID => Ok(crate::ns::show_uid(proc::current().cred.euid) as i64),
+        GETGID => Ok(crate::ns::show_gid(proc::current().cred.gid) as i64),
+        GETEGID => Ok(crate::ns::show_gid(proc::current().cred.egid) as i64),
         SETUID => cred::setuid(a[0]),
         SETGID => cred::setgid(a[0]),
         SETREUID => cred::setreuid(a[0], a[1]),
@@ -650,7 +650,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     let a = tf.x;
     let p = proc::current();
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
-    if p.cred.seccomp.is_some() || p.pid_ns.is_some() {
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() {
         return false;
     }
     if let Some(c) = FAST.get(a[8] as usize) {

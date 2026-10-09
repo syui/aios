@@ -81,6 +81,8 @@ enum Node {
     NsLink(u32, u8),
     /// /proc/PID/mounts (そのプロセスのマウントの namespace の表)
     PidMounts(u32),
+    /// /proc/PID/uid_map、gid_map、setgroups (ユーザーの namespace の地図。0 uid、1 gid、2 setgroups)
+    IdMap(u32, u8),
 }
 
 pub struct ProcInode {
@@ -159,13 +161,14 @@ impl ProcInode {
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
             Node::NsDir(p) => (p as u64) << 16 | 14,
             Node::PidMounts(p) => (p as u64) << 16 | 15,
+            Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
         }
     }
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) => Some(p),
             _ => None,
         }
     }
@@ -270,14 +273,14 @@ impl ProcInode {
                     crate::ns::local_or_0(p.tgid),
                     crate::ns::local_or_0(p.pid),
                     crate::ns::local_or_0(p.ppid),
-                    c.uid,
-                    c.euid,
-                    c.suid,
-                    c.euid,
-                    c.gid,
-                    c.egid,
-                    c.sgid,
-                    c.egid,
+                    crate::ns::show_uid(c.uid),
+                    crate::ns::show_uid(c.euid),
+                    crate::ns::show_uid(c.suid),
+                    crate::ns::show_uid(c.euid),
+                    crate::ns::show_gid(c.gid),
+                    crate::ns::show_gid(c.egid),
+                    crate::ns::show_gid(c.sgid),
+                    crate::ns::show_gid(c.egid),
                     vsize / 1024,
                     rss * 4,
                     threads,
@@ -346,6 +349,8 @@ impl ProcInode {
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
             Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
+            Node::IdMap(pid, 2) => crate::ns::setgroups_text(&leader(pid)?.cred.ns.user).into(),
+            Node::IdMap(pid, k) => crate::ns::map_text(&leader(pid)?.cred.ns.user, k == 1),
             _ => return Err(-EISDIR),
         })
     }
@@ -456,11 +461,12 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 5] = ["mnt", "net", "pid", "pid_for_children", "uts"];
+const NS_KINDS: [&str; 6] = ["mnt", "net", "pid", "pid_for_children", "user", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
         "mnt" => c.ns.mnt_id(),
+        "user" => c.ns.user_id(),
         "net" => c.ns.net_id(),
         "pid_for_children" => c.ns.pid_children_id(),
         _ => c.ns.uts_id(),
@@ -517,7 +523,7 @@ impl Inode for ProcInode {
             Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
-            Node::Strace | Node::Bkl => S_IFREG | 0o644,
+            Node::Strace | Node::Bkl | Node::IdMap(..) => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
         };
         let now = crate::timer::epoch_ns();
@@ -536,6 +542,15 @@ impl Inode for ProcInode {
     }
 
     fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/PID/uid_map など: ユーザーの namespace の地図 (書けるかは ns.rs が決める)
+        if let Node::IdMap(pid, k) = self.node {
+            let u = leader(pid)?.cred.ns.user.clone();
+            match k {
+                2 => crate::ns::write_setgroups(&u, b)?,
+                _ => crate::ns::write_map(&u, k == 1, b)?,
+            }
+            return Ok(b.len());
+        }
         // /proc/sys/...: root が値を書く
         if let Node::Sys(i) = self.node
             && crate::sysctl::TABLE[i as usize].writable()
@@ -633,6 +648,9 @@ impl Inode for ProcInode {
             (Node::Pid(p), "statm") => Node::Statm(p),
             (Node::Pid(p), "comm") => Node::Comm(p),
             (Node::Pid(p), "mounts") => Node::PidMounts(p),
+            (Node::Pid(p), "uid_map") => Node::IdMap(p, 0),
+            (Node::Pid(p), "gid_map") => Node::IdMap(p, 1),
+            (Node::Pid(p), "setgroups") => Node::IdMap(p, 2),
             (Node::Pid(p), "cwd") => Node::Cwd(p),
             (Node::Pid(p), "root") => Node::RootLink(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
@@ -710,6 +728,9 @@ impl Inode for ProcInode {
                 add("statm".into(), Node::Statm(p));
                 add("comm".into(), Node::Comm(p));
                 add("mounts".into(), Node::PidMounts(p));
+                add("uid_map".into(), Node::IdMap(p, 0));
+                add("gid_map".into(), Node::IdMap(p, 1));
+                add("setgroups".into(), Node::IdMap(p, 2));
                 add("cwd".into(), Node::Cwd(p));
                 add("root".into(), Node::RootLink(p));
                 add("exe".into(), Node::Exe(p));

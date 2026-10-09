@@ -221,8 +221,9 @@ impl Stat {
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());
         b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
-        b[24..28].copy_from_slice(&self.uid.to_le_bytes());
-        b[28..32].copy_from_slice(&self.gid.to_le_bytes());
+        // ユーザーの namespace の中なら、中の番号で見せる
+        b[24..28].copy_from_slice(&crate::ns::show_uid(self.uid).to_le_bytes());
+        b[28..32].copy_from_slice(&crate::ns::show_gid(self.gid).to_le_bytes());
         b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize
@@ -241,8 +242,8 @@ impl Stat {
         b[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // stx_mask = STATX_BASIC_STATS
         b[4..8].copy_from_slice(&4096u32.to_le_bytes());
         b[16..20].copy_from_slice(&self.nlink.to_le_bytes());
-        b[20..24].copy_from_slice(&self.uid.to_le_bytes());
-        b[24..28].copy_from_slice(&self.gid.to_le_bytes());
+        b[20..24].copy_from_slice(&crate::ns::show_uid(self.uid).to_le_bytes());
+        b[24..28].copy_from_slice(&crate::ns::show_gid(self.gid).to_le_bytes());
         b[28..30].copy_from_slice(&(self.mode as u16).to_le_bytes());
         b[32..40].copy_from_slice(&self.ino.to_le_bytes());
         b[40..48].copy_from_slice(&self.size.to_le_bytes());
