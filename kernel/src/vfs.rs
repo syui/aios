@@ -404,7 +404,14 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool) -
                     continue;
                 }
                 let t = next.readlink()?;
-                let mut np = normalize(&walked, &t);
+                // 相対で .. のないリンク (bin/true -> coreutils など) は、いまのディレクトリから続ける
+                // (ルートからたどりなおさない)。ほかはパスの文字の上で畳んでルートから
+                let mut np = if !t.starts_with('/') && !t.split('/').any(|c| c == "..") {
+                    start = Some((cur.clone(), walked.clone()));
+                    t.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/")
+                } else {
+                    normalize(&walked, &t)
+                };
                 for rest in &comps[i + 1..] {
                     np.push('/');
                     np.push_str(rest);

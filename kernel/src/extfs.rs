@@ -2099,6 +2099,8 @@ impl Inode for ExtInode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         self.not_swapfile()?;
         self.write_op(|| {
             let mut r = self.raw()?;
@@ -2114,6 +2116,8 @@ impl Inode for ExtInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         self.not_swapfile()?;
         self.write_op(|| {
             let mut r = self.raw()?;

@@ -302,6 +302,8 @@ impl Inode for TmpInode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         match &mut *self.node.borrow_mut() {
             Node::File(d) => d.owned()?.write(off, buf)?,
             Node::Dir(_) => return Err(-EISDIR),
@@ -312,6 +314,8 @@ impl Inode for TmpInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         if let Some(s) = self.seals.get() {
             let size = self.meta().size as usize;
             if (len < size && s & F_SEAL_SHRINK != 0) || (len > size && s & F_SEAL_GROW != 0) {
