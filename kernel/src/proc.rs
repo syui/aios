@@ -195,6 +195,8 @@ pub struct Proc {
     pub utime: u64,
     /// 最近走った tick (走るたびに 1 足し、1 秒ごとに半分にする)。少ないものから走らせる
     pub recent: u32,
+    /// 走らせた回数 (/proc/threads。調べもの用)
+    pub nrun: u64,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
     pub yielded: bool,
     /// いま走りはじめてから来たタイマの割り込みの数。タイムスライス (sysctl kernel.sched_timeslice_ms) に
@@ -265,6 +267,7 @@ impl Proc {
         pid_ns: None,
         vpid: 0,
         recent: 0,
+        nrun: 0,
         yielded: false,
         slice: 0,
         cutime: 0,
@@ -710,10 +713,12 @@ pub fn scheduler() -> ! {
     use core::sync::atomic::Ordering::Relaxed;
     loop {
         let mut ran = false;
+        let t0 = crate::timer::uptime_ns();
         if let Some(i) = pick(NEXT.load(Relaxed)) {
             NEXT.store((i + 1) % NPROC, Relaxed);
             let p = &mut procs()[i];
             p.state = State::Running;
+            p.nrun += 1;
             p.yielded = false;
             p.slice = 0;
             // 前の印は、選びなおしたので要らない
@@ -724,6 +729,7 @@ pub fn scheduler() -> ! {
                 p.pt().activate();
                 fp_load(&p.fp);
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
+                crate::smp::dev_wait(2, t0);
                 swtch(sched_ctx(), &p.context);
                 set_cur(None);
                 // 終わったプロセスのページ表はほかの CPU が片付けるかもしれないので、外しておく
@@ -764,11 +770,13 @@ fn sched() {
     debug_assert!(crate::smp::holding(), "sched without the big kernel lock");
     crate::smp::SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let p = current();
+    let seg = crate::smp::seg_pause();
     unsafe {
         fp_save(&mut p.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) p.tpidr);
         swtch(&mut p.context, sched_ctx());
     }
+    crate::smp::seg_resume(seg);
 }
 
 pub fn yield_now() {
@@ -891,6 +899,37 @@ pub fn poll_sleep(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> 
 pub fn poll_wake(key: usize) {
     let chan = poll_chan();
     wake_where(|p| p.chan == chan && p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)));
+}
+
+/// 調べもの用 (/proc/strace に "kick PID"): tgid の futex で眠っているスレッドをみな起こす。
+/// futex はわけもなく起きてよい (待つ側が値を見なおす) ので、起こしが消えて眠りつづけているのかを確かめられる
+pub fn futex_kick(tgid: u32) -> usize {
+    wake_where(|p| p.tgid == tgid && p.last_sys.0 == 98 && p.chan != poll_chan())
+}
+
+/// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
+/// 外で .eh_frame を使って呼び出しの並びをたどるため (フレームポインタのないプログラム)
+pub fn raw_dump(tid: u32) {
+    let Some(p) = find(tid) else { return };
+    let tf = p.tf_ref();
+    crate::println!("raw regs pc {:x} sp {:x}", tf.elr, tf.sp_el0);
+    for i in 0..31 {
+        crate::println!("raw x{} {:x}", i, tf.x[i]);
+    }
+    let pt = p.pt();
+    let sp = tf.sp_el0 as usize;
+    let mut b = [0u8; 64];
+    for off in (0..32 * 1024).step_by(64) {
+        if pt.copy_in(&mut b, sp + off).is_none() {
+            break;
+        }
+        let mut line = alloc::string::String::with_capacity(140);
+        for x in b {
+            line.push_str(&alloc::format!("{:02x}", x));
+        }
+        crate::println!("raw m {:x} {}", sp + off, line);
+    }
+    crate::println!("raw end");
 }
 
 /// タイマから: 期限の来た Proc を起こす
@@ -1446,6 +1485,32 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
             }
             got += chunk;
         }
+        // フレームの記録 ([前の fp, 戻り先]) をスタックの中から探してたどる (fp を使わない libc の中で
+        // 眠っていても、その上の呼び出しの並びがわかる)。いちばん下から、4 つ以上つながるもの
+        let word = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let (lo, hi) = (sp, sp + got as u64);
+        let rec = |pt: &mut crate::vm::PageTable, off: usize| -> Option<(usize, u64)> {
+            let next = word(off);
+            let ret = word(off + 8);
+            (next > lo + off as u64 && next < hi && next & 7 == 0 && name(pt, ret).is_some()).then(|| ((next - lo) as usize, ret))
+        };
+        let mut off = 0;
+        while off + 16 <= got {
+            let mut chain = alloc::vec::Vec::new();
+            let mut o = off;
+            while o + 16 <= got && chain.len() < 64 {
+                let Some((next, ret)) = rec(pt, o) else { break };
+                chain.push(ret);
+                o = next;
+            }
+            if chain.len() >= 4 {
+                for ret in chain {
+                    let _ = writeln!(out, "  chain {:#x} {}", ret, name(pt, ret).unwrap_or_default());
+                }
+                break;
+            }
+            off += 8;
+        }
         let mut shown = 0;
         for w in buf[..got].chunks_exact(8) {
             let va = u64::from_le_bytes(w.try_into().unwrap());
@@ -1475,7 +1540,7 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
 }
 
 pub fn threads_text() -> alloc::string::String {
-    let mut out = alloc::format!("ticks {}\n  PID  TGID ST CHAN             SYSCALL ARG0             ARG1                 WAKE NAME\n", crate::timer::ticks());
+    let mut out = alloc::format!("ticks {}\n  PID  TGID ST CHAN             SYSCALL ARG0             ARG1                 WAKE     RUNS NAME\n", crate::timer::ticks());
     for p in live() {
         if p.state == State::Unused {
             continue;
@@ -1488,7 +1553,7 @@ pub fn threads_text() -> alloc::string::String {
         };
         let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
         out.push_str(&alloc::format!(
-            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {:8} {}\n",
+            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {:8} {:8} {}\n",
             p.pid,
             p.tgid,
             st,
@@ -1497,6 +1562,7 @@ pub fn threads_text() -> alloc::string::String {
             p.last_sys.1,
             p.last_sys.2,
             p.wake_at,
+            p.nrun,
             core::str::from_utf8(&p.comm[..n]).unwrap_or("?")
         ));
         // poll / select で眠っているなら、見張っている印 (パイプは pipe:[N] の N と同じ)。* は何でも

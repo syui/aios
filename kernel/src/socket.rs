@@ -27,6 +27,7 @@ const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
 const ETIMEDOUT: i64 = 110;
 const ECONNREFUSED: i64 = 111;
+const EALREADY: i64 = 114;
 const EINPROGRESS: i64 = 115;
 const EADDRNOTAVAIL: i64 = 99;
 const ENETUNREACH: i64 = 101;
@@ -385,7 +386,8 @@ impl Socket {
 
     pub fn readiness(&self) -> (bool, bool, bool) {
         net::poll();
-        let Some(h) = self.handle else { return (false, self.proto != Proto::Tcp, false) };
+        // つながっていない TCP (connect の前、断られたあと) は Linux と同じく書ける + 閉じた (POLLOUT | POLLHUP)
+        let Some(h) = self.handle else { return (false, true, self.proto == Proto::Tcp && !self.listening) };
         match self.proto {
             Proto::Tcp => {
                 let s = tcp(h);
@@ -440,6 +442,14 @@ fn write_addr(va: usize, lenp: usize, ep: Option<IpEndpoint>) -> Result<(), i64>
 // ---- システムコール ----
 
 type R = Result<i64, i64>;
+
+/// 0 で埋めない受け渡しの場所 (読んだ・写した分だけを使う)。64 KiB を毎回 0 で埋めると、IPC の
+/// 小さなメッセージの recvmsg がそれだけで重い (Firefox が 1 秒に何百回も読む)
+fn uninit(n: usize) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(n);
+    unsafe { v.set_len(n) };
+    v
+}
 
 fn sock_of(fd: u64) -> Result<SockRef, i64> {
     let f = proc::current().files().get(fd).cloned().ok_or(-file::EBADF)?;
@@ -684,8 +694,19 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
             Ok(0)
         }
         Proto::Tcp => {
-            if s.handle.is_some() {
-                return Err(-EISCONN);
+            // もう connect したもの: 進みぐあいを答える (非同期 connect のあとに、終わったかをもう一度 connect で
+            // たしかめるもの。NSPR の PR_ConnectContinue など)。つながる途中は EALREADY、断られたら ECONNREFUSED
+            if let Some(h) = s.handle {
+                return match tcp(h).state() {
+                    tcp::State::SynSent | tcp::State::SynReceived => Err(-EALREADY),
+                    tcp::State::Closed => {
+                        s.handle = None;
+                        owners().remove(&h);
+                        n()?.sockets.remove(h);
+                        Err(-ECONNREFUSED)
+                    }
+                    _ => Err(-EISCONN),
+                };
             }
             let h = tcp_new()?;
             let port = s.local.map(|l| l.port).filter(|&p| p != 0).unwrap_or_else(ephemeral);
@@ -712,6 +733,7 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
                     tcp::State::Established => return Ok(0),
                     tcp::State::Closed => {
                         s.handle = None;
+                        owners().remove(&h);
                         n()?.sockets.remove(h);
                         return Err(-ECONNREFUSED);
                     }
@@ -724,13 +746,13 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
 
 pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: usize) -> R {
     if let Some(f) = pair_of(fd) {
-        let mut data = vec![0u8; len.min(64 * 1024)];
+        let mut data = uninit(len.min(64 * 1024));
         proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
         return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
     }
     let s = sock_of(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
-    let mut data = vec![0u8; len.min(64 * 1024)];
+    let mut data = uninit(len.min(64 * 1024));
     proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
     let n = s.borrow_mut().send(&data, to, flags & MSG_DONTWAIT != 0)?;
     Ok(n as i64)
@@ -738,13 +760,13 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
 
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
     if let Some(f) = pair_of(fd) {
-        let mut data = vec![0u8; len.min(64 * 1024)];
+        let mut data = uninit(len.min(64 * 1024));
         let n = file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?;
         proc::current().pt().copy_out(buf, &data[..n]).ok_or(-EFAULT)?;
         return Ok(n as i64);
     }
     let s = sock_of(fd)?;
-    let mut data = vec![0u8; len.min(64 * 1024)];
+    let mut data = uninit(len.min(64 * 1024));
     let (k, from) = s.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0)?;
     proc::current().pt().copy_out(buf, &data[..k]).ok_or(-EFAULT)?;
     write_addr(addr, lenp, from)?;
@@ -991,7 +1013,7 @@ pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool) -> R {
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let m = read_msghdr(msg)?;
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
-    let mut data = vec![0u8; total.min(64 * 1024)];
+    let mut data = uninit(total.min(64 * 1024));
     let mut ctl = (0, 0);
     let (k, from) = match pair_of(fd) {
         Some(f) => {

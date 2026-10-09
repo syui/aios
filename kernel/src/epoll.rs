@@ -53,6 +53,18 @@ pub struct Epoll {
 
 pub type EpollRef = Rc<RefCell<Epoll>>;
 
+impl Epoll {
+    /// 見張っているものの poll の印をまとめて (me はこの epoll の場所)。わからないものがあれば None
+    fn keys(&self, me: usize) -> Option<alloc::vec::Vec<usize>> {
+        let mut v = alloc::vec![me];
+        for e in self.entries.values() {
+            let Some(f) = e.file.upgrade() else { continue };
+            v.extend(f.borrow().poll_keys()?);
+        }
+        Some(v)
+    }
+}
+
 /// 今の状態を epoll のビットで
 fn mask_of(f: &FileRef) -> u32 {
     let (r, w, hup) = f.borrow().readiness();
@@ -142,6 +154,7 @@ pub fn create1(flags: u64) -> Result<i64, i64> {
 
 pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
     let ep = epoll_of(epfd)?;
+    let key = Rc::as_ptr(&ep) as usize;
     let target = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
     if matches!(target.borrow().kind, Kind::Epoll(ref e) if Rc::ptr_eq(e, &ep)) {
         return Err(-ELOOP);
@@ -181,7 +194,8 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
         _ => return Err(-EINVAL),
     }
     let _ = EPOLLPRI;
-    proc::wakeup(proc::poll_chan());
+    // この epoll で眠っているものを起こしなおす (見張るものが変わった。印はこの epoll の場所)
+    proc::poll_wake(key);
     Ok(0)
 }
 
@@ -203,13 +217,15 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ticks: Option<u64>) -> 
             proc::current().pt().copy_out(events, &buf).ok_or(-EFAULT)?;
             return Ok(got.len() as i64);
         }
-        match deadline {
-            Some(d) if crate::timer::ticks() >= d => return Ok(0),
-            Some(d) => {
-                proc::sleep_until(proc::poll_chan(), d)?;
-            }
-            None => proc::sleep(proc::poll_chan())?,
+        if deadline.is_some_and(|d| crate::timer::ticks() >= d) {
+            return Ok(0);
         }
+        // 見張っているものの印 (と、epoll_ctl で起こしなおすためのこの epoll の場所) で眠る。
+        // 印のわからないものがあれば、何でも起こしてもらう。印がないと、どこかのパイプに書くたびに
+        // 起こされる (Firefox の AudioIPC のスレッドが 1 秒に何百回も起きていた)
+        // (借りたまま眠らないように、印は先に)
+        let keys = ep.borrow().keys(Rc::as_ptr(&ep) as usize);
+        proc::poll_sleep(keys, deadline.unwrap_or(0))?;
     }
 }
 
@@ -259,7 +275,8 @@ pub fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     Ok(fd as i64)
 }
 
-fn chan(e: &EventFdRef) -> usize {
+/// eventfd で眠るものの channel。poll で見張るときの印 (poll_keys) にも
+pub fn chan(e: &EventFdRef) -> usize {
     Rc::as_ptr(e) as usize
 }
 
@@ -275,7 +292,7 @@ pub fn read(e: &EventFdRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64
                 ev.count -= v;
                 dst[..8].copy_from_slice(&v.to_le_bytes());
                 proc::wakeup(chan(e));
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(chan(e));
                 return Ok(8);
             }
         }
@@ -301,7 +318,7 @@ pub fn write(e: &EventFdRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
                 ev.count += v;
                 ev.generation += 1;
                 proc::wakeup(chan(e));
-                proc::wakeup(proc::poll_chan());
+                proc::poll_wake(chan(e));
                 return Ok(8);
             }
         }

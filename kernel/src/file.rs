@@ -500,6 +500,11 @@ impl OpenFile {
             Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
             Kind::Unix(u) => alloc::vec![Rc::as_ptr(u) as usize],
             Kind::TimerFd(t) => alloc::vec![crate::timerfd::chan(t)],
+            // eventfd、inotify、TCP / UDP のソケット (ネットワークで何か変わると net::poll が net::chan() を起こす)。
+            // 印がないと、どこかのパイプに書くたびに起こされる (Firefox の gmain が 1 秒に何百回も起きていた)
+            Kind::EventFd(e) => alloc::vec![crate::epoll::chan(e)],
+            Kind::Inotify(n) => alloc::vec![crate::inotify::chan(n)],
+            Kind::Socket(_) => alloc::vec![crate::net::chan()],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],

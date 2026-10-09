@@ -214,8 +214,9 @@ fn whole(f: &FileRef) -> bool {
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
     let whole = whole(&f);
-    // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。0 で埋めておかなくてよい
-    let inode = matches!(f.borrow().kind, Kind::Inode(..));
+    // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。パイプと socketpair も取りだした分だけ。
+    // これらは 0 で埋めておかなくてよい (IPC の小さな read のたびに 64 KiB を埋めると重い)
+    let inode = matches!(f.borrow().kind, Kind::Inode(..) | Kind::PipeRead(_) | Kind::PipeRw(_) | Kind::Pair(..));
     let mut done = 0;
     loop {
         let want = (len - done).min(CHUNK);

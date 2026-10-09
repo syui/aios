@@ -63,9 +63,11 @@ fn rw(sector: u64, buf: *mut u8, len: usize, write: bool) -> Result<(), i64> {
     d.q.push(0);
     d.q.notify(&d.mmio);
     // 終わるまで待つ
+    let t0 = crate::timer::uptime_ns();
     while d.q.pop_used().is_none() {
         core::hint::spin_loop();
     }
+    crate::smp::dev_wait(0, t0);
     d.mmio.ack();
     if unsafe { core::ptr::read_volatile(&status) } != 0 {
         return Err(-EIO);

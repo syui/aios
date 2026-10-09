@@ -325,7 +325,8 @@ pub fn poll() {
     if changed {
         GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         proc::wakeup(chan());
-        proc::wakeup(proc::poll_chan());
+        // poll で見張っているもののうち、ソケット (印は chan()) か何でも (印なし) を見ているものだけ
+        proc::poll_wake(chan());
     }
 }
 

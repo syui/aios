@@ -78,7 +78,8 @@ fn list() -> &'static mut Vec<Weak<RefCell<Inotify>>> {
     unsafe { &mut *(&raw mut LIST) }
 }
 
-fn chan(n: &InotifyRef) -> usize {
+/// poll で見張るときの印 (poll_keys) にも
+pub fn chan(n: &InotifyRef) -> usize {
     Rc::as_ptr(n) as usize
 }
 
@@ -187,7 +188,7 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
         b.generation += 1;
     }
     proc::wakeup(chan(n));
-    proc::wakeup(proc::poll_chan());
+    proc::poll_wake(chan(n));
 }
 
 /// 見張っている inotify があるか (なければ知らせるところは何もしない)

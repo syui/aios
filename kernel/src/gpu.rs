@@ -41,6 +41,21 @@ pub struct Gpu {
 
 static mut GPU: Option<Gpu> = None;
 
+/// 画面へ送る (TRANSFER と FLUSH) あいだのロック。デバイスが終わるまで回って待つので、大きなロックは放して
+/// これだけを持つ (システムコールの中は割り込みが止まっているので、途中で放しても横取りされない)
+static SEND: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
+
+/// 大きなロックを放して、SEND を持って f (画面へ送る)。終わったら大きなロックを取りなおす
+fn unlocked<R>(f: impl FnOnce() -> R) -> R {
+    crate::smp::unlock();
+    let r = {
+        let _s = SEND.lock();
+        f()
+    };
+    crate::smp::lock();
+    r
+}
+
 pub fn get() -> Option<&'static mut Gpu> {
     unsafe { (*(&raw mut GPU)).as_mut() }
 }
@@ -75,9 +90,11 @@ impl Gpu {
         self.q.desc(i).next = (i + 1) as u16;
         self.q.push(0);
         self.q.notify(&self.mmio);
+        let t0 = crate::timer::uptime_ns();
         while self.q.pop_used().is_none() {
             core::hint::spin_loop();
         }
+        crate::smp::dev_wait(1, t0);
         self.mmio.ack();
         unsafe { u32::from_le_bytes(core::slice::from_raw_parts(self.resp, 4).try_into().unwrap()) }
     }
@@ -276,7 +293,7 @@ pub fn ioctl(req: u64, arg: usize) -> Result<i64, i64> {
         }
         FBIOPAN_DISPLAY => {
             // 描き終わった: 画面へ
-            g.flush_all();
+            unlocked(|| g.flush_all());
             Ok(0)
         }
         FBIO_DAMAGE => {
@@ -285,7 +302,7 @@ pub fn ioctl(req: u64, arg: usize) -> Result<i64, i64> {
             let v = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
             let (x, y) = (v(0).min(g.width), v(1).min(g.height));
             let (w, h) = (v(2).min(g.width - x), v(3).min(g.height - y));
-            g.flush(x, y, w, h);
+            unlocked(|| g.flush(x, y, w, h));
             Ok(0)
         }
         FBIOBLANK | FBIO_WAITFORVSYNC => Ok(0),
