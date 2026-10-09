@@ -115,6 +115,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-vm"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "aish-wait"
 version = "0.0.1"
 dependencies = [
