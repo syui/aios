@@ -1596,6 +1596,64 @@ pub fn ai_threads() -> alloc::string::String {
     out
 }
 
+/// /proc/ai/stack/TID: スレッドの EL0 のレジスタ、スタック (sp から 64 KiB まで、写っているところ)、
+/// 写しているファイルの地図を 1 行の JSON で。aish-sys がファイルの .eh_frame で呼び出しの並びをたどる
+/// (フレームポインタのないプログラムや、CFI のない libc の中で眠っていても)。走っているスレッドの値は、
+/// 最後に例外が来たときのもの
+pub fn ai_stack(tid: u32) -> Option<alloc::string::String> {
+    use crate::aiproc::esc;
+    let p = find(tid)?;
+    if p.state == State::Unused || p.state == State::Zombie {
+        return None;
+    }
+    let tf = p.tf_ref();
+    let (pc, sp) = (tf.elr, tf.sp_el0);
+    let x: alloc::vec::Vec<alloc::string::String> = (0..31).map(|i| alloc::format!("{}", tf.x[i])).collect();
+    let pt = p.pt();
+    let mut hex = alloc::string::String::new();
+    let mut page = [0u8; 4096];
+    let mut va = sp as usize;
+    // ページの境目までずつ (スタックの終わりで写っていなくなったらやめる)
+    while va < sp as usize + 64 * 1024 {
+        let n = 4096 - (va & 4095);
+        if pt.copy_in(&mut page[..n], va).is_none() {
+            break;
+        }
+        for b in &page[..n] {
+            hex.push_str(&alloc::format!("{:02x}", b));
+        }
+        va += n;
+    }
+    let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+    let maps: alloc::vec::Vec<alloc::string::String> = pt
+        .maps_text()
+        .lines()
+        .filter_map(|l| {
+            // 開始-終わり 権限 オフセット 00:00 0 パス (ファイルを写しているものだけ)
+            let f: alloc::vec::Vec<&str> = l.split_whitespace().collect();
+            let path = f.get(5)?;
+            let (lo, hi) = f[0].split_once('-')?;
+            Some(alloc::format!("[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]", lo, hi, f[2], f[1], esc(path)))
+        })
+        .collect();
+    Some(alloc::format!(
+        "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"pc\":{},\"sp\":{},\"x\":[{}],\"stack\":\"{}\",\"maps\":[{}]}}\n",
+        p.pid,
+        p.tgid,
+        esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
+        pc,
+        sp,
+        x.join(","),
+        hex,
+        maps.join(",")
+    ))
+}
+
+/// /proc/ai/stack の中のスレッド (すべて)
+pub fn all_tids() -> alloc::vec::Vec<u32> {
+    live().filter(|p| p.state != State::Unused && p.state != State::Zombie).map(|p| p.pid).collect()
+}
+
 /// 眠っている p が待っているもの (JSON)
 fn wait_json(p: &mut Proc) -> alloc::string::String {
     // futex: x0 がアドレス、x2 が待つ値

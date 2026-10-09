@@ -94,6 +94,9 @@ enum Node {
     AiCtl,
     AiFdDir,
     AiFd(u32),
+    /// /proc/ai/stack と stack/TID (スレッドの番号)
+    AiStackDir,
+    AiStack(u32),
 }
 
 pub struct ProcInode {
@@ -188,6 +191,8 @@ impl ProcInode {
             Node::AiCtl => 43,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
+            Node::AiStackDir => 45,
+            Node::AiStack(t) => (t as u64) << 16 | 31,
         }
     }
 
@@ -250,7 +255,8 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
-            Node::AiThreads | Node::AiBkl | Node::AiCtl | Node::AiFd(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads | Node::AiBkl | Node::AiCtl | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => proc::ai_threads(),
             Node::AiBkl => crate::smp::stats_json(),
             Node::AiCtl => crate::aiproc::CTL_HELP.into(),
@@ -565,7 +571,7 @@ impl Inode for ProcInode {
     fn meta(&self) -> Meta {
         let (uid, gid) = self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid));
         let mode = match self.node {
-            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir => S_IFDIR | 0o555,
+            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir | Node::AiStackDir => S_IFDIR | 0o555,
             Node::AiCtl => S_IFREG | 0o644,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
@@ -707,6 +713,14 @@ impl Inode for ProcInode {
             (Node::AiDir, "bkl") => Node::AiBkl,
             (Node::AiDir, "ctl") => Node::AiCtl,
             (Node::AiDir, "fd") => Node::AiFdDir,
+            (Node::AiDir, "stack") => Node::AiStackDir,
+            (Node::AiStackDir, _) => {
+                let t = num.ok_or(-ENOENT)?;
+                if !proc::all_tids().contains(&t) {
+                    return Err(-ENOENT);
+                }
+                Node::AiStack(t)
+            }
             (Node::AiFdDir, _) => Node::AiFd(leader(num.ok_or(-ENOENT)?)?.tgid),
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::NetDir, "route") => Node::Route,
@@ -800,8 +814,14 @@ impl Inode for ProcInode {
                 add("bkl".into(), Node::AiBkl);
                 add("ctl".into(), Node::AiCtl);
                 add("fd".into(), Node::AiFdDir);
+                add("stack".into(), Node::AiStackDir);
             }
-            Node::AiFdDir if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiFdDir | Node::AiStackDir if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiStackDir => {
+                for t in proc::all_tids() {
+                    add(format!("{}", t), Node::AiStack(t));
+                }
+            }
             Node::AiFdDir => {
                 for p in proc::all_leader_procs() {
                     add(format!("{}", p.tgid), Node::AiFd(p.tgid));

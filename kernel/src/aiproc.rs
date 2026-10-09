@@ -4,6 +4,8 @@
 //             どれだけ (slept_s) 待っているか (proc::ai_threads)
 //   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
+//   stack/TID スレッドのレジスタ、スタック (sp から 64 KiB まで、16 進)、ファイルを写している地図 (proc::ai_stack)。
+//             aish-sys がファイルの .eh_frame でたどる
 //   ctl       調べもののスイッチ (書く。読むと書けるものの一覧):
 //               kick PID      その PID の futex で眠っているスレッドをみな起こす (起こしが消えたのかを確かめる。
 //                             futex はわけもなく起きてよいので、こわれない)
