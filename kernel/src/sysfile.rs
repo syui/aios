@@ -888,6 +888,9 @@ fn id_arg(v: u64) -> Option<u32> {
 fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
     let c = cred::current();
     let m = ino.meta();
+    // ユーザーの namespace の中なら、中の番号を外の番号に (地図になければ EINVAL)
+    let uid = crate::ns::take_uid(uid as u32)? as u64;
+    let gid = crate::ns::take_gid(gid as u32)? as u64;
     let (uid, gid) = (id_arg(uid), id_arg(gid));
     if c.euid != 0 {
         let uid_ok = uid.is_none_or(|u| u == m.uid);
@@ -1193,11 +1196,13 @@ pub fn chroot(pathp: usize) -> R {
     Ok(0)
 }
 
-/// マウントしてよいか: root か、自分のマウントの namespace の中で no_new_privs (外には見えないし、setuid の
-/// プログラムをだませない)。砂場 (landlock) の中からはだめ (Linux と同じ)
+/// マウントしてよいか: (外の) root か、自分のマウントの namespace の中で、no_new_privs か、そのマウントの
+/// namespace を作ったユーザーの namespace の中 (外には見えないし、setuid のプログラムをだませない)。
+/// 砂場 (landlock) の中からはだめ (Linux と同じ)
 fn may_mount() -> Result<(), i64> {
     let c = cred::current();
-    if c.landlock.is_some() || !(c.euid == 0 || (c.ns.mnt.is_some() && c.no_new_privs)) {
+    let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id()));
+    if c.landlock.is_some() || !((c.euid == 0 && c.ns.user.is_none()) || own) {
         return Err(-cred::EPERM);
     }
     Ok(())

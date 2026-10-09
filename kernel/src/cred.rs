@@ -92,7 +92,7 @@ fn arg(v: u64) -> Option<u32> {
 }
 
 pub fn setuid(uid: u64) -> Res {
-    let u = uid as u32;
+    let u = crate::ns::take_uid(uid as u32)?;
     set(|c| {
         if c.euid == 0 {
             (c.uid, c.euid, c.suid) = (u, u, u);
@@ -106,7 +106,7 @@ pub fn setuid(uid: u64) -> Res {
 }
 
 pub fn setgid(gid: u64) -> Res {
-    let g = gid as u32;
+    let g = crate::ns::take_gid(gid as u32)?;
     set(|c| {
         if c.euid == 0 {
             (c.gid, c.egid, c.sgid) = (g, g, g);
@@ -119,7 +119,25 @@ pub fn setgid(gid: u64) -> Res {
     })
 }
 
+/// ユーザーの namespace の中の番号を外の番号に (-1 はそのまま)
+fn take_u(v: u64) -> Result<u64, i64> {
+    Ok(if v as u32 == u32::MAX { v } else { crate::ns::take_uid(v as u32)? as u64 })
+}
+
+fn take_g(v: u64) -> Result<u64, i64> {
+    Ok(if v as u32 == u32::MAX { v } else { crate::ns::take_gid(v as u32)? as u64 })
+}
+
 pub fn setresuid(r: u64, e: u64, s: u64) -> Res {
+    setresuid_out(take_u(r)?, take_u(e)?, take_u(s)?)
+}
+
+pub fn setresgid(r: u64, e: u64, s: u64) -> Res {
+    setresgid_out(take_g(r)?, take_g(e)?, take_g(s)?)
+}
+
+/// 外の番号で
+fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
     set(|c| {
         let ok = |v: u32| c.euid == 0 || v == c.uid || v == c.euid || v == c.suid;
         let (r, e, s) = (arg(r), arg(e), arg(s));
@@ -139,7 +157,7 @@ pub fn setresuid(r: u64, e: u64, s: u64) -> Res {
     })
 }
 
-pub fn setresgid(r: u64, e: u64, s: u64) -> Res {
+fn setresgid_out(r: u64, e: u64, s: u64) -> Res {
     set(|c| {
         let ok = |v: u32| c.euid == 0 || v == c.gid || v == c.egid || v == c.sgid;
         let (r, e, s) = (arg(r), arg(e), arg(s));
@@ -161,8 +179,9 @@ pub fn setresgid(r: u64, e: u64, s: u64) -> Res {
 
 /// setreuid(r, e): 実 uid を変えたとき (または e が実 uid と違うとき) は suid = 新しい euid
 pub fn setreuid(r: u64, e: u64) -> Res {
+    let (r, e) = (take_u(r)?, take_u(e)?);
     let old = proc::current().cred.clone();
-    setresuid(r, e, u64::MAX)?;
+    setresuid_out(r, e, u64::MAX)?;
     let c = &mut proc::current().cred;
     if arg(r).is_some() || arg(e).is_some_and(|v| v != old.uid) {
         c.suid = c.euid;
@@ -171,8 +190,9 @@ pub fn setreuid(r: u64, e: u64) -> Res {
 }
 
 pub fn setregid(r: u64, e: u64) -> Res {
+    let (r, e) = (take_g(r)?, take_g(e)?);
     let old = proc::current().cred.clone();
-    setresgid(r, e, u64::MAX)?;
+    setresgid_out(r, e, u64::MAX)?;
     let c = &mut proc::current().cred;
     if arg(r).is_some() || arg(e).is_some_and(|v| v != old.gid) {
         c.sgid = c.egid;
@@ -186,17 +206,19 @@ fn out(va: usize, b: &[u8]) -> Result<(), i64> {
 
 pub fn getresuid(r: usize, e: usize, s: usize) -> Res {
     let c = proc::current().cred.clone();
-    out(r, &c.uid.to_le_bytes())?;
-    out(e, &c.euid.to_le_bytes())?;
-    out(s, &c.suid.to_le_bytes())?;
+    let show = crate::ns::show_uid;
+    out(r, &show(c.uid).to_le_bytes())?;
+    out(e, &show(c.euid).to_le_bytes())?;
+    out(s, &show(c.suid).to_le_bytes())?;
     Ok(0)
 }
 
 pub fn getresgid(r: usize, e: usize, s: usize) -> Res {
     let c = proc::current().cred.clone();
-    out(r, &c.gid.to_le_bytes())?;
-    out(e, &c.egid.to_le_bytes())?;
-    out(s, &c.sgid.to_le_bytes())?;
+    let show = crate::ns::show_gid;
+    out(r, &show(c.gid).to_le_bytes())?;
+    out(e, &show(c.egid).to_le_bytes())?;
+    out(s, &show(c.sgid).to_le_bytes())?;
     Ok(0)
 }
 
@@ -209,13 +231,13 @@ pub fn getgroups(size: usize, list: usize) -> Res {
         return Err(-EINVAL);
     }
     for (i, v) in g.iter().enumerate() {
-        out(list + i * 4, &v.to_le_bytes())?;
+        out(list + i * 4, &crate::ns::show_gid(*v).to_le_bytes())?;
     }
     Ok(g.len() as i64)
 }
 
 pub fn setgroups(size: usize, list: usize) -> Res {
-    if proc::current().cred.euid != 0 {
+    if proc::current().cred.euid != 0 || proc::current().cred.ns.user.is_some() {
         return Err(-EPERM);
     }
     if size > 65536 {

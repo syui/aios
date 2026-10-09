@@ -12,12 +12,14 @@
 // 新しい UTS の中ではホスト名を変えられる (外には見えないので、root でなくても)
 // /proc/PID/ns/uts は「uts:[番号]」へのリンク (同じものか見分けるため)
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_NEWPID: u64 = 0x2000_0000;
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 
 const EPERM: i64 = 1;
 
@@ -26,6 +28,7 @@ pub const INIT_UTS: u64 = 4026531838;
 pub const INIT_NET: u64 = 4026531840;
 pub const INIT_PID: u64 = 4026531836;
 pub const INIT_MNT: u64 = 4026531841;
+pub const INIT_USER: u64 = 4026531837;
 const EINVAL: i64 = 22;
 
 static mut NEXT_ID: u64 = 4026532000;
@@ -70,10 +73,16 @@ pub struct Ns {
     pub pid: Option<Rc<Pid>>,
     /// マウントの表 (vfs.rs)
     pub mnt: Option<Rc<crate::vfs::MountNs>>,
+    /// ユーザー (下の「ユーザーの namespace」)
+    pub user: Option<Rc<User>>,
 }
 
 impl Ns {
-    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None };
+    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None, user: None };
+
+    pub fn user_id(&self) -> u64 {
+        self.user.as_ref().map_or(INIT_USER, |u| u.id)
+    }
 
     pub fn mnt_id(&self) -> u64 {
         self.mnt.as_ref().map_or(INIT_MNT, |m| m.id)
@@ -99,14 +108,24 @@ pub fn net() -> Option<u64> {
 }
 
 /// flags の CLONE_NEW* のうち、扱えるもの
-pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS;
+pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER;
 
 /// cred の namespace を flags のぶん新しくする (clone の子と unshare)
 pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     if flags & SUPPORTED == 0 {
         return Ok(());
     }
-    if c.euid != 0 && !c.no_new_privs {
+    // ユーザーの namespace はだれでも作れる (先に作る。中ではほかの namespace も作れる)。入れ子と chroot の中はだめ
+    if flags & CLONE_NEWUSER != 0 {
+        if c.ns.user.is_some() {
+            return Err(-EINVAL);
+        }
+        if !crate::proc::current_root().is_empty() {
+            return Err(-EPERM);
+        }
+        c.ns.user = Some(Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) }));
+    }
+    if flags & !CLONE_NEWUSER & SUPPORTED != 0 && c.euid != 0 && !c.no_new_privs && c.ns.user.is_none() {
         return Err(-EPERM);
     }
     if flags & CLONE_NEWUTS != 0 {
@@ -117,7 +136,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         c.ns.net = Some(Rc::new(Net { id: next_id() }));
     }
     if flags & CLONE_NEWNS != 0 {
-        c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id()));
+        c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));
     }
     if flags & CLONE_NEWPID != 0 {
         // 入れ子はできない
@@ -217,4 +236,141 @@ pub fn init_exited(p: &crate::proc::Proc) {
             crate::proc::kill_group(tgid, 9);
         }
     }
+}
+
+// ---- ユーザーの namespace ----
+// 中では、外の uid / gid を地図 (uid_map / gid_map) で読みかえて見せる (地図にない番号は 65534)。
+// カーネルの中の資格情報 (cred) はいつも外の本当の番号のままなので、ファイルのパーミッションは外の番号で
+// 判定する: 中の root (地図で 0 に見える人) でも、外の自分にできないことはできない。中の root にできるのは、
+// その中だけのこと: ほかの namespace を作る (no_new_privs なしで)、その中で作ったマウントの namespace でのマウント。
+// setuid / setgid のプログラムは、中では効かない (no_new_privs と同じ)。
+// 地図は /proc/PID/uid_map と gid_map に一度だけ書く。root でない人は、作った人の uid (gid) 1 つだけを、
+// gid_map は先に /proc/PID/setgroups に deny を書いてから (Linux と同じ)。入れ子はない
+
+/// 地図にない番号 (Linux の overflowuid)
+pub const OVERFLOW: u32 = 65534;
+
+pub struct User {
+    pub id: u64,
+    /// 作った人 (外の euid / egid)
+    pub owner: u32,
+    pub owner_gid: u32,
+    pub maps: RefCell<Maps>,
+}
+
+/// (中の番号, 外の番号, いくつ) の並び。None はまだ書いていない
+#[derive(Default)]
+pub struct Maps {
+    pub uid: Option<Vec<(u32, u32, u32)>>,
+    pub gid: Option<Vec<(u32, u32, u32)>>,
+    pub setgroups_deny: bool,
+}
+
+fn inside(map: &Option<Vec<(u32, u32, u32)>>, out: u32) -> u32 {
+    map.iter().flatten().find(|&&(_, o, n)| out >= o && out - o < n).map_or(OVERFLOW, |&(i, o, _)| i + (out - o))
+}
+
+fn outside(map: &Option<Vec<(u32, u32, u32)>>, ins: u32) -> Option<u32> {
+    map.iter().flatten().find(|&&(i, _, n)| ins >= i && ins - i < n).map(|&(i, o, _)| o + (ins - i))
+}
+
+/// いまのプロセスから見た uid (外の番号 u を中の番号に)
+pub fn show_uid(u: u32) -> u32 {
+    match &crate::proc::current_cred_ref().ns.user {
+        Some(n) => inside(&n.maps.borrow().uid, u),
+        None => u,
+    }
+}
+
+pub fn show_gid(g: u32) -> u32 {
+    match &crate::proc::current_cred_ref().ns.user {
+        Some(n) => inside(&n.maps.borrow().gid, g),
+        None => g,
+    }
+}
+
+/// システムコールの引数の uid (中の番号) を外の番号に。-1 (変えない) はそのまま、地図になければ EINVAL
+pub fn take_uid(u: u32) -> Result<u32, i64> {
+    match &crate::proc::current_cred_ref().ns.user {
+        Some(n) if u != u32::MAX => outside(&n.maps.borrow().uid, u).ok_or(-EINVAL),
+        _ => Ok(u),
+    }
+}
+
+pub fn take_gid(g: u32) -> Result<u32, i64> {
+    match &crate::proc::current_cred_ref().ns.user {
+        Some(n) if g != u32::MAX => outside(&n.maps.borrow().gid, g).ok_or(-EINVAL),
+        _ => Ok(g),
+    }
+}
+
+/// /proc/PID/uid_map と gid_map の中身 (はじめの namespace は 0 0 4294967295)
+pub fn map_text(u: &Option<Rc<User>>, gid: bool) -> alloc::string::String {
+    let Some(u) = u else { return "         0          0 4294967295\n".into() };
+    let m = u.maps.borrow();
+    let map = if gid { &m.gid } else { &m.uid };
+    map.iter().flatten().map(|(i, o, n)| alloc::format!("{:>10} {:>10} {:>10}\n", i, o, n)).collect()
+}
+
+/// /proc/PID/uid_map (gid_map) に書く。u は書かれるプロセスの namespace
+pub fn write_map(u: &Option<Rc<User>>, gid: bool, text: &[u8]) -> Result<(), i64> {
+    let u = u.as_ref().ok_or(-EPERM)?;
+    let me = crate::proc::current_cred_ref();
+    // 書けるのは、作った人 (外にいるか、同じ namespace の中) か、外の root
+    let root = me.euid == 0 && me.ns.user.is_none();
+    if !root && (me.euid != u.owner || me.ns.user.as_ref().is_some_and(|n| !Rc::ptr_eq(n, u))) {
+        return Err(-EPERM);
+    }
+    let text = core::str::from_utf8(text).map_err(|_| -EINVAL)?;
+    let mut lines = Vec::new();
+    for l in text.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<u32> = l.split_whitespace().map(|x| x.parse().map_err(|_| -EINVAL)).collect::<Result<_, i64>>()?;
+        if f.len() != 3 || f[2] == 0 || f[0].checked_add(f[2]).is_none() || f[1].checked_add(f[2]).is_none() {
+            return Err(-EINVAL);
+        }
+        lines.push((f[0], f[1], f[2]));
+    }
+    if lines.is_empty() || lines.len() > 5 {
+        return Err(-EINVAL);
+    }
+    let mut m = u.maps.borrow_mut();
+    if !root {
+        // root でない人は、自分の番号 1 つだけ
+        let own = if gid { u.owner_gid } else { u.owner };
+        if lines.len() != 1 || lines[0].1 != own || lines[0].2 != 1 || (gid && !m.setgroups_deny) {
+            return Err(-EPERM);
+        }
+    }
+    let slot = if gid { &mut m.gid } else { &mut m.uid };
+    if slot.is_some() {
+        return Err(-EPERM);
+    }
+    *slot = Some(lines);
+    Ok(())
+}
+
+/// /proc/PID/setgroups: "allow" か "deny" (gid_map を書く前だけ変えられる)
+pub fn setgroups_text(u: &Option<Rc<User>>) -> &'static str {
+    match u {
+        Some(u) if u.maps.borrow().setgroups_deny => "deny\n",
+        _ => "allow\n",
+    }
+}
+
+pub fn write_setgroups(u: &Option<Rc<User>>, text: &[u8]) -> Result<(), i64> {
+    let u = u.as_ref().ok_or(-EPERM)?;
+    let me = crate::proc::current_cred_ref();
+    if !(me.euid == 0 && me.ns.user.is_none()) && me.euid != u.owner {
+        return Err(-EPERM);
+    }
+    let mut m = u.maps.borrow_mut();
+    if m.gid.is_some() {
+        return Err(-EPERM);
+    }
+    match core::str::from_utf8(text).map(|t| t.trim()) {
+        Ok("deny") => m.setgroups_deny = true,
+        Ok("allow") if !m.setgroups_deny => {}
+        _ => return Err(-EINVAL),
+    }
+    Ok(())
 }

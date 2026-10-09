@@ -429,6 +429,15 @@ pub fn current() -> &'static mut Proc {
 }
 
 /// いまのプロセスの資格情報。まだプロセスがなければ root
+/// いまのプロセスの資格情報を写さずに (起動中でまだプロセスがなければ root)
+pub fn current_cred_ref() -> &'static crate::cred::Cred {
+    static mut ROOT: crate::cred::Cred = crate::cred::Cred::ROOT;
+    match cur() {
+        Some(i) => &procs()[i].cred,
+        None => unsafe { &*(&raw const ROOT) },
+    }
+}
+
 pub fn current_cred() -> crate::cred::Cred {
     match cur() {
         Some(i) => procs()[i].cred.clone(),
@@ -1121,10 +1130,10 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
     let p = current();
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
     // (砂場の中から sudo で外へ出られないように)
-    if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs) {
+    if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
         p.cred.euid = u;
     }
-    if let Some(g) = img.setgid.filter(|_| !p.cred.no_new_privs) {
+    if let Some(g) = img.setgid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
         p.cred.egid = g;
     }
     p.cred.suid = p.cred.euid;

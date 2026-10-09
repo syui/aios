@@ -182,6 +182,8 @@ pub struct Mount {
 
 pub struct MountNs {
     pub id: u64,
+    /// 作ったときのユーザーの namespace (その中の root がマウントしてよい)
+    pub owner: u64,
     list: core::cell::RefCell<Vec<Mount>>,
 }
 
@@ -192,7 +194,7 @@ static mut ALL_MNT: Vec<alloc::rc::Weak<MountNs>> = Vec::new();
 fn init_mnt() -> Rc<MountNs> {
     unsafe {
         (*(&raw mut INIT_MNT))
-            .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, list: core::cell::RefCell::new(Vec::new()) }))
+            .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, list: core::cell::RefCell::new(Vec::new()) }))
             .clone()
     }
 }
@@ -203,8 +205,8 @@ fn current_mnt() -> Rc<MountNs> {
 }
 
 /// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)
-pub fn new_mnt_ns(id: u64) -> Rc<MountNs> {
-    let n = Rc::new(MountNs { id, list: core::cell::RefCell::new(current_mnt().list.borrow().clone()) });
+pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
+    let n = Rc::new(MountNs { id, owner, list: core::cell::RefCell::new(current_mnt().list.borrow().clone()) });
     unsafe {
         let all = &mut *(&raw mut ALL_MNT);
         all.retain(|w| w.strong_count() > 0);
