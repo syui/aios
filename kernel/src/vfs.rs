@@ -178,6 +178,8 @@ pub struct Mount {
     /// マウント先のパス (先頭 / なし。/proc/mounts 用)
     target: String,
     fstype: String,
+    /// 読むだけ (MS_RDONLY): この下では作る・消す・書くは EROFS
+    ro: bool,
 }
 
 pub struct MountNs {
@@ -217,12 +219,37 @@ pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
 
 /// dir (すでにあるディレクトリ) の上に fs の根をかぶせる (いまの表に)
 pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result<(), i64> {
+    mount_ro(path, fsroot, source, fstype, false)
+}
+
+pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
     let (target, dir) = lookup("", path, true)?;
     if !dir.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into() });
+    current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into(), ro });
     Ok(())
+}
+
+/// path にかぶせてあるもの (いちばん上) を、読むだけに / 書けるように (mount -o remount,ro)
+pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
+    let top = resolve("", path, true)?;
+    let ns = current_mnt();
+    let mut l = ns.list.borrow_mut();
+    let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or(-EINVAL)?;
+    m.ro = ro;
+    Ok(())
+}
+
+/// path (先頭 / なし、たどったあとのもの) に書いてよいか: いちばん深いマウント (path がその下にあるもの) が
+/// 読むだけなら EROFS
+pub fn check_writable(path: &str) -> Result<(), i64> {
+    const EROFS: i64 = 30;
+    let ns = current_mnt();
+    let l = ns.list.borrow();
+    let under = |t: &str| path == t || (path.len() > t.len() && path.starts_with(t) && path.as_bytes()[t.len()] == b'/');
+    let deepest = l.iter().filter(|m| under(&m.target)).max_by_key(|m| m.target.len());
+    if deepest.is_some_and(|m| m.ro) { Err(-EROFS) } else { Ok(()) }
 }
 
 /// path にかぶせてあるもの (いちばん上) を外す
@@ -249,7 +276,7 @@ pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
     let (src, ty) = unsafe { (*(&raw const ROOT_INFO)).clone() };
     let mut s = alloc::format!("{} / {} rw 0 0\n", src, ty);
     for m in ns.unwrap_or_else(init_mnt).list.borrow().iter() {
-        s.push_str(&alloc::format!("{} /{} {} rw 0 0\n", m.source, m.target, m.fstype));
+        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", m.source, m.target, m.fstype, if m.ro { "ro" } else { "rw" }));
     }
     s
 }
