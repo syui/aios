@@ -1,12 +1,14 @@
 // aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
-//   aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
+//   aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
 //   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
 //   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
 //   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。プロセスの番号も分ける (PID の namespace:
 //   CMD は中の 1 番で、外のプロセスは見えず kill もできない。aibox は外で待って、CMD の終わりかたで終わる)。
 //   --tmp で /tmp を自分だけのもの (空の tmpfs) にする (マウントの namespace。外の /tmp は見えず、中で作ったものは
-//   終わると消える)。マウントの表はいつも分ける
+//   終わると消える)。マウントの表はいつも分ける。
+//   --root で中では root (uid 0 / gid 0) に見せる (ユーザーの namespace: 本当は外の自分のままなので、できることは
+//   ふえない。root でないと動かないと言うインストーラなどを砂場で動かすため)
 //   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
 //   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
@@ -20,8 +22,20 @@ mod seccomp;
 
 use std::os::unix::process::CommandExt;
 
+/// ユーザーの namespace に入り、外の自分を中の root に見せる (gid_map の前に setgroups を deny: Linux と同じ決まり)
+fn enter_userns() -> std::io::Result<()> {
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))?;
+    std::fs::write("/proc/self/setgroups", "deny")?;
+    std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid))?;
+    Ok(())
+}
+
 fn usage() -> ! {
-    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
+    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
     std::process::exit(2);
 }
 
@@ -31,6 +45,7 @@ fn main() {
     let mut ports: Option<Vec<u16>> = None;
     let mut verbose = false;
     let mut private_tmp = false;
+    let mut as_root = false;
     let mut deny: Vec<u32> = seccomp::DEFAULT_DENY.iter().filter_map(|n| seccomp::number(n)).collect();
     let mut kill: Vec<u32> = vec![];
     let mut i = 0;
@@ -55,6 +70,7 @@ fn main() {
                 ports.get_or_insert_with(Vec::new);
             }
             "--tmp" => private_tmp = true,
+            "--root" => as_root = true,
             "--deny" | "--kill" => {
                 let opt = args[i].clone();
                 i += 1;
@@ -78,6 +94,11 @@ fn main() {
         i += 1;
     }
     let cmd: Vec<String> = if i < args.len() { args[i..].to_vec() } else { vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())] };
+    // --root: ユーザーの namespace を作って、自分の uid / gid を中の 0 に (ほかの namespace より先に)
+    if as_root && let Err(e) = enter_userns() {
+        eprintln!("aibox: user namespace: {}", e);
+        std::process::exit(1);
+    }
     // マウントの表を分けて、--tmp なら /tmp に空の tmpfs を (landlock の前に: 砂場の中からはマウントできない)
     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {

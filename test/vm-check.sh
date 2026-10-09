@@ -54,6 +54,7 @@ t aibox-seccomp sh -c 'aibox -- grep -q "^Seccomp:.2" /proc/self/status'
 t aibox-deny sh -c '! aibox --deny uname -- uname'
 t aibox-pid eq "$(aibox -- sh -c 'echo $$')" 1
 t aibox-tmp sh -c 'echo x > /tmp/vc-out && aibox --tmp -- sh -c "! test -e /tmp/vc-out"'
+t aibox-root eq "$(aibox --root -- id -u)" 0
 t aibox-no-net sh -c '[ "$(aibox --no-net -- readlink /proc/self/ns/net)" != "$(readlink /proc/self/ns/net)" ]'
 
 # パイプ (大きなロックなしの read/write と、いっぱいのパイプに 4 つで書くとき止まらないこと。くわしくは pipe-check.sh)

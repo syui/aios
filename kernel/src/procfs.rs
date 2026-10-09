@@ -578,6 +578,10 @@ impl Inode for ProcInode {
         if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 {
             return Ok(());
         }
+        // uid_map など (書けるかは書くときに決める)
+        if matches!(self.node, Node::IdMap(..)) {
+            return Ok(());
+        }
         Err(-EACCES)
     }
 
