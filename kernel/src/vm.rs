@@ -160,6 +160,61 @@ pub fn file_changed(id: (usize, u64)) {
     }
 }
 
+/// ページキャッシュを通して読む (大きなロックを持って。ino は page_cacheable なもの)。ふつうのファイルでなければ
+/// そのまま read_at。読んだページは表に残るので、次からは read_fast (ロックなし) で読める
+pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    let m = ino.meta();
+    if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG {
+        return ino.read_at(off, buf);
+    }
+    let size = m.size as usize;
+    if off >= size {
+        return Ok(0);
+    }
+    let n = buf.len().min(size - off);
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let po = pos % PGSIZE;
+        let k = (PGSIZE - po).min(n - done);
+        match file_page(ino, pos - po) {
+            Some(page) => {
+                unsafe { core::ptr::copy_nonoverlapping(page.add(po), buf[done..].as_mut_ptr(), k) };
+                kalloc::put(page);
+                done += k;
+            }
+            // ページがとれない (メモリが足りない): 残りはじかに
+            None => return Ok(done + ino.read_at(pos, &mut buf[done..n])?),
+        }
+    }
+    Ok(n)
+}
+
+/// 大きなロックなしで、ページキャッシュから読む (syscall::fast の read)。ファイル id の off から len バイトの
+/// ページが全部表にあり、ユーザーのページも写っているときだけ Some(読んだ数)。表にあるページはいまの中身で
+/// (書くとかならず捨てる: file_changed)、記録した大きさもいまの大きさ
+pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: usize) -> Option<usize> {
+    let c = PRIV.lock();
+    let size = c.get(&(id.0, id.1, off / PGSIZE))?.ver.1 as usize;
+    if off >= size {
+        return Some(0);
+    }
+    let n = len.min(size - off);
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let po = pos % PGSIZE;
+        let k = (PGSIZE - po).min(n - done);
+        let p = c.get(&(id.0, id.1, pos / PGSIZE))?;
+        let src = unsafe { core::slice::from_raw_parts(p.page.add(po), k) };
+        if !pt.copy_out_nofault(va + done, src) {
+            return None;
+        }
+        done += k;
+    }
+    Some(n)
+}
+
 /// 表にある、版が ver のページ (参照をひとつ足して)。ロックなしでも呼べる
 fn cached_page(key: &FileKey, ver: (u64, u64)) -> Option<*mut u8> {
     let c = PRIV.lock();

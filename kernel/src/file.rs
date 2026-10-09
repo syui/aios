@@ -291,7 +291,8 @@ impl OpenFile {
                 Ok(dst.len())
             }
             Kind::Inode(ino, path) => {
-                let n = ino.read_at(self.offset, dst)?;
+                // ext4 のふつうのファイルはページキャッシュを通す (次からロックなしで読めるように)
+                let n = if ino.page_cacheable() { crate::vm::read_cached(ino, self.offset, dst)? } else { ino.read_at(self.offset, dst)? };
                 self.offset += n;
                 if n > 0 {
                     crate::inotify::file_event(path, ino, crate::inotify::IN_ACCESS);
@@ -781,6 +782,36 @@ pub struct Pipe {
     watchers: usize,
     /// epoll に登録されたことがある (いつ待たれるかわからないので、fast_rw はいつも起こしを頼む)
     pub epolled: bool,
+}
+
+/// 大きなロックなしの read (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部あるとき。
+/// fd の表をほかのスレッドと、開いたファイル (オフセット) をほかの fd やプロセスと分けていない、
+/// IN_ACCESS を待つ inotify の見張りがない、ときだけ。ほかは None でふつうの道へ
+pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
+    const MAX: usize = 256 * 1024;
+    if len == 0 || len > MAX || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    if !files.private() {
+        return None;
+    }
+    let f = files.get().get(fd)?;
+    if Rc::strong_count(f) != 1 {
+        return None;
+    }
+    // この fd の開いたファイルは、このスレッドのほかにだれも持っていない (借りずに見て、オフセットを進める)
+    let of = unsafe { &mut *f.as_ptr() };
+    if of.flags & O_ACCMODE == O_WRONLY {
+        return None;
+    }
+    let Kind::Inode(ino, _) = &of.kind else { return None };
+    if !ino.page_cacheable() {
+        return None;
+    }
+    let n = crate::vm::read_fast(me.pt(), ino.id(), of.offset, va, len)?;
+    of.offset += n;
+    Some(n as i64)
 }
 
 /// パイプ (key はその PipeCell の場所) で眠っているもの、poll / epoll で待っているものを起こす (大きなロックを持って)

@@ -67,6 +67,9 @@ pub struct Inotify {
 
 pub type InotifyRef = Rc<RefCell<Inotify>>;
 
+/// IN_ACCESS を待つ見張りが置かれたことがある (それからは、大きなロックなしの read はしない: file::fast_read_file)
+pub static ACCESS_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// 生きている inotify (見張りがあるかを速く知るため)
 static mut LIST: Vec<Weak<RefCell<Inotify>>> = Vec::new();
 static mut COOKIE: u32 = 0;
@@ -130,6 +133,9 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     }
     let wd = n.next_wd;
     n.next_wd += 1;
+    if keep & IN_ACCESS != 0 {
+        ACCESS_WATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     n.watches.push(Watch { wd, id, mask: keep });
     Ok(wd as i64)
 }
