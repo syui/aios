@@ -100,6 +100,11 @@ fn u64_at(b: &[u8], o: usize) -> usize {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) as usize
 }
 
+/// ファイルを読む (ext4 ならページキャッシュを通す: 何度も動かすプログラムのヘッダを読みなおさない)
+fn read_file(ino: &crate::vfs::InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    if ino.page_cacheable() { crate::vm::read_cached(ino, off, buf) } else { ino.read_at(off, buf) }
+}
+
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
     exec_depth(path, argv, envp, 0)
 }
@@ -114,7 +119,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     }
     // #! で始まるスクリプトは、書かれたインタプリタにスクリプトのパスを渡して動かす
     let mut head = [0u8; 256];
-    let n = ino.read_at(0, &mut head)?;
+    let n = read_file(&ino, 0, &mut head)?;
     if n >= 2 && &head[..2] == b"#!" {
         const ELOOP: i64 = 40;
         if depth >= 4 {
@@ -248,7 +253,7 @@ struct Loaded {
 /// ino の ELF の PT_LOAD を pt に置く。ET_DYN なら base をずらして (いちばん低いところが base に来る)
 fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: usize, path: &str) -> Result<Loaded, i64> {
     let mut ehdr = [0u8; 64];
-    if ino.read_at(0, &mut ehdr)? < 64 {
+    if read_file(&ino, 0, &mut ehdr)? < 64 {
         return Err(-ENOEXEC);
     }
     let elf = &ehdr[..];
@@ -263,7 +268,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
         return Err(-ENOEXEC);
     }
     let mut phdrs = alloc::vec![0u8; phentsize * phnum];
-    ino.read_at(phoff, &mut phdrs)?;
+    read_file(&ino, phoff, &mut phdrs)?;
     let ph = |i: usize| &phdrs[i * phentsize..(i + 1) * phentsize];
     // ずらす量: ET_DYN なら、いちばん低い PT_LOAD を base に
     let bias = if etype == ET_DYN {
@@ -284,7 +289,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
                     return Err(-ENOEXEC);
                 }
                 let mut b = alloc::vec![0u8; n];
-                ino.read_at(off, &mut b)?;
+                read_file(&ino, off, &mut b)?;
                 let p = core::str::from_utf8(&b).map_err(|_| -ENOEXEC)?.trim_end_matches('\0');
                 interp = Some(String::from(p));
                 continue;
@@ -327,7 +332,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
             let mut done = 0;
             while done < filesz {
                 let n = buf.len().min(filesz - done);
-                if ino.read_at(off + done, &mut buf[..n])? != n {
+                if read_file(&ino, off + done, &mut buf[..n])? != n {
                     return Err(-ENOEXEC);
                 }
                 pt.copy_out_force(va + done, &buf[..n]).ok_or(-ENOEXEC)?;
