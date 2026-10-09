@@ -1499,6 +1499,16 @@ pub fn threads_text() -> alloc::string::String {
             p.wake_at,
             core::str::from_utf8(&p.comm[..n]).unwrap_or("?")
         ));
+        // poll / select で眠っているなら、見張っている印 (パイプは pipe:[N] の N と同じ)。* は何でも
+        if p.state == State::Sleeping && p.chan == poll_chan() {
+            match &p.poll_keys {
+                None => out.push_str("      poll *\n"),
+                Some(k) => {
+                    let ks: Vec<alloc::string::String> = k.iter().take(16).map(|k| alloc::format!("{}", k & 0xffffff)).collect();
+                    out.push_str(&alloc::format!("      poll {}\n", ks.join(" ")));
+                }
+            }
+        }
     }
     out
 }
