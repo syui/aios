@@ -83,6 +83,10 @@ enum Node {
     PidMounts(u32),
     /// /proc/PID/uid_map、gid_map、setgroups (ユーザーの namespace の地図。0 uid、1 gid、2 setgroups)
     IdMap(u32, u8),
+    /// /proc/PID/task (スレッドの一覧)、task/TID、その中の stat / status / comm (0 1 2)。番号は本当のもの
+    TaskDir(u32),
+    Task(u32, u32),
+    TaskFile(u32, u32, u8),
 }
 
 pub struct ProcInode {
@@ -103,6 +107,11 @@ const NET_STUBS: [(&str, &str); 6] = [
     ("raw6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
     ("unix", "Num       RefCount Protocol Flags    Type St Inode Path\n"),
 ];
+
+/// プロセス pid のスレッド tid (終わったものはなし)
+fn thread(pid: u32, tid: u32) -> Result<&'static mut Proc, i64> {
+    proc::threads_of(pid).into_iter().find(|t| t.pid == tid).ok_or(-ENOENT)
+}
 
 fn leader(pid: u32) -> Result<&'static mut Proc, i64> {
     proc::find_leader(pid).filter(|p| p.state != State::Zombie).ok_or(-ENOENT)
@@ -162,13 +171,16 @@ impl ProcInode {
             Node::NsDir(p) => (p as u64) << 16 | 14,
             Node::PidMounts(p) => (p as u64) << 16 | 15,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
+            Node::TaskDir(p) => (p as u64) << 16 | 20,
+            Node::Task(_, t) => (t as u64) << 16 | 21,
+            Node::TaskFile(_, t, k) => (t as u64) << 16 | (22 + k as u64),
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
         }
     }
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) => Some(p),
             _ => None,
         }
     }
@@ -349,6 +361,25 @@ impl ProcInode {
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
             Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
+            Node::TaskFile(pid, tid, k) => {
+                let t = thread(pid, tid)?;
+                match k {
+                    // 1 つ目の欄はスレッドの番号
+                    0 => {
+                        let line = stat_line(t);
+                        format!("{}{}", crate::ns::local_or_0(tid), &line[line.find(' ').unwrap_or(0)..])
+                    }
+                    1 => format!(
+                        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n",
+                        t.comm(),
+                        state_name(t),
+                        crate::ns::local_or_0(t.tgid),
+                        crate::ns::local_or_0(tid),
+                        crate::ns::local_or_0(t.ppid)
+                    ),
+                    _ => format!("{}\n", t.comm()),
+                }
+            }
             Node::IdMap(pid, 2) => crate::ns::setgroups_text(&leader(pid)?.cred.ns.user).into(),
             Node::IdMap(pid, k) => crate::ns::map_text(&leader(pid)?.cred.ns.user, k == 1),
             _ => return Err(-EISDIR),
@@ -520,6 +551,7 @@ impl Inode for ProcInode {
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::NsDir(_) => S_IFDIR | 0o511,
+            Node::TaskDir(_) | Node::Task(..) => S_IFDIR | 0o555,
             Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
@@ -662,6 +694,15 @@ impl Inode for ProcInode {
             (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::Pid(p), "ns") => Node::NsDir(p),
+            (Node::Pid(p), "task") => Node::TaskDir(p),
+            (Node::TaskDir(p), _) => {
+                let tid = crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?;
+                thread(p, tid)?;
+                Node::Task(p, tid)
+            }
+            (Node::Task(p, t), "stat") => Node::TaskFile(p, t, 0),
+            (Node::Task(p, t), "status") => Node::TaskFile(p, t, 1),
+            (Node::Task(p, t), "comm") => Node::TaskFile(p, t, 2),
             (Node::NsDir(p), n) => Node::NsLink(p, NS_KINDS.iter().position(|k| *k == n).ok_or(-ENOENT)? as u8),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
@@ -732,6 +773,7 @@ impl Inode for ProcInode {
                 add("statm".into(), Node::Statm(p));
                 add("comm".into(), Node::Comm(p));
                 add("mounts".into(), Node::PidMounts(p));
+                add("task".into(), Node::TaskDir(p));
                 add("uid_map".into(), Node::IdMap(p, 0));
                 add("gid_map".into(), Node::IdMap(p, 1));
                 add("setgroups".into(), Node::IdMap(p, 2));
@@ -742,6 +784,17 @@ impl Inode for ProcInode {
                 add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
                 add("ns".into(), Node::NsDir(p));
+            }
+            Node::TaskDir(p) => {
+                leader(p)?;
+                for t in proc::threads_of(p).iter().map(|t| t.pid).collect::<Vec<_>>() {
+                    add(format!("{}", crate::ns::local_or_0(t)), Node::Task(p, t));
+                }
+            }
+            Node::Task(p, t) => {
+                for (i, n) in ["stat", "status", "comm"].iter().enumerate() {
+                    add((*n).into(), Node::TaskFile(p, t, i as u8));
+                }
             }
             Node::NsDir(p) => {
                 for (i, k) in NS_KINDS.iter().enumerate() {

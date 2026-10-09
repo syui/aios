@@ -90,7 +90,9 @@ efi_entry:
     // x0 = ImageHandle, x1 = SystemTable
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
-    adr     x2, _start
+    // adr は ±1 MiB までなので、カーネルが大きくなっても届く adrp + add で
+    adrp    x2, _start
+    add     x2, x2, :lo12:_start
     bl      efi_main
     ldp     x29, x30, [sp], #16
     ret
