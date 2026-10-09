@@ -98,7 +98,7 @@ fn write_back(key: &FileKey, c: &Cached) {
 // MAP_PRIVATE のファイル (プログラムやライブラリ) のページは、読むだけのあいだはここの 1 枚をみんなで写す
 // (書きこみ禁止で写し、書いたときに fault_page のコピーオンライトで自分のものに)。同じプログラムを何度
 // 動かしても、ファイルを読みなおさない。ファイルが変わったら (更新時刻か大きさ) 読みなおす。
-// 表も 1 つ参照を持つ。PRIV_MAX をこえたら、だれも写していないもの (参照が表だけ) から捨てる。
+// 表も 1 つ参照を持つ。priv_max をこえたら、だれも写していないもの (参照が表だけ) から捨てる。
 // 大きなロックなしのページフォルト (fast_fault) も読むので、表はスピンロックで守る。そちらはファイルに
 // さわれないので、領域を写したときの版 (Backing::File の ver) と同じ版のページだけを使う
 
@@ -110,7 +110,16 @@ struct PrivPage {
 // ページはカーネルのもの (どの CPU からでも)
 unsafe impl Send for PrivPage {}
 
-const PRIV_MAX: usize = 16384; // 64 MiB
+/// 表の大きさの目安: メモリの 1/4 (少なくとも 64 MiB)。Firefox の libxul (170 MB) のように、写されたままで
+/// 捨てられないページが多くても、読みなおしを繰りかえさないように。メモリが足りなくなったら、
+/// こことは別にスワップの側から捨てる (swap.rs)
+fn priv_max() -> usize {
+    (crate::memlayout::ram_size() / PGSIZE / 4).max(16384)
+}
+
+/// 次に捨てる (表をなめる) のは、表がこの数をこえたとき。捨てても減らなければ (みな写されている)、
+/// しばらく (priv_max / 8 枚ふえるまで) なめない: 読みこむたびに表をなめると、それだけで重い
+static NEXT_SHRINK: AtomicUsize = AtomicUsize::new(0);
 
 static PRIV: SpinLock<BTreeMap<FileKey, PrivPage>> = SpinLock::new(BTreeMap::new());
 
@@ -231,6 +240,9 @@ pub fn file_ver(ino: &InodeRef) -> (u64, u64) {
 
 /// ino の foff (ページの境目) からの 1 ページ (ファイルの終わりのあとは 0)、参照をひとつ足して。
 /// ページの境目でなければ None
+/// 調べもの用: ページキャッシュに無かったものをシリアルに出す (/proc/strace に "pcmiss")
+pub static MISS_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     if foff % PGSIZE != 0 {
         return None;
@@ -239,6 +251,22 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     let key = file_key(ino, foff);
     if let Some(p) = cached_page(&key, ver) {
         return Some(p);
+    }
+    let t0 = crate::timer::uptime_ns();
+    struct Miss(u64);
+    impl Drop for Miss {
+        fn drop(&mut self) {
+            FAULT_KIND[9].0.fetch_add(1, Ordering::Relaxed);
+            FAULT_KIND[9].1.fetch_add(crate::timer::uptime_ns().saturating_sub(self.0), Ordering::Relaxed);
+        }
+    }
+    let _miss = Miss(t0);
+    if MISS_LOG.load(Ordering::Relaxed) {
+        let c = PRIV.lock();
+        let have = c.get(&key).map(|p| p.ver);
+        let n = c.len();
+        drop(c);
+        crate::println!("pcmiss ino {:?} off {:#x} ver {:?} had {:?} n {}", ino.id(), foff, ver, have, n);
     }
     let changes = CHANGES.load(Ordering::SeqCst);
     let page = kalloc::alloc()?;
@@ -252,8 +280,10 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     }
     // コードかもしれないので命令キャッシュも (読みこんだときに一度だけ)
     sync_icache(page as usize, PGSIZE);
-    if PRIV.lock().len() >= PRIV_MAX {
-        shrink_cache(PRIV_MAX / 8);
+    let max = priv_max();
+    if PRIV.lock().len() >= max.max(NEXT_SHRINK.load(Ordering::Relaxed)) {
+        shrink_cache(max / 8);
+        NEXT_SHRINK.store(PRIV.lock().len() + max / 8, Ordering::Relaxed);
     }
     // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う
     if CHANGES.load(Ordering::SeqCst) != changes {
@@ -422,6 +452,12 @@ fn remake_pte(e: u64, prot: u8, shared_vma: bool) -> u64 {
     let cow = !shared_vma && kalloc::refs(page_of(e)) > 1;
     make_pte(pa, prot, cow)
 }
+
+/// 調べもの用: ページフォルトの種類ごとの (回数, ns)。/proc/bkl に出す。
+/// 1 その他 (権限だけ) 2 共有ファイル 3 カーネルのページ 4 スワップ 5 ページキャッシュ 6 無名の新しいページ
+/// 7 ファイルから読む新しいページ 8 コピーオンライトで写す 9 (5 のうち) ページキャッシュになくて読んだもの
+pub static FAULT_KIND: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 10] =
+    [const { (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)) }; 10];
 
 // TLB はすべての CPU に (inner shareable) 消す: 同じアドレス空間のスレッドがほかの CPU で動いているかも
 fn flush_va(va: usize) {
@@ -896,7 +932,17 @@ impl PageTable {
     /// va のページを用意する。write なら自分だけのものにして書けるように。
     /// force はカーネルが書く (exec で読み取り専用の領域に読み込む): 権限は変えずに自分だけのものに
     fn fault_page(&mut self, va: usize, write: bool, force: bool) -> Result<(), FaultErr> {
+        let t0 = crate::timer::uptime_ns();
+        let mut kind = 0usize;
+        let r = self.fault_page_inner(va, write, force, &mut kind);
+        FAULT_KIND[kind].0.fetch_add(1, Ordering::Relaxed);
+        FAULT_KIND[kind].1.fetch_add(crate::timer::uptime_ns().saturating_sub(t0), Ordering::Relaxed);
+        r
+    }
+
+    fn fault_page_inner(&mut self, va: usize, write: bool, force: bool, kind: &mut usize) -> Result<(), FaultErr> {
         let _m = self.mutating();
+        *kind = 1;
         let (start, v) = self.find(va).ok_or(FaultErr::NoMap)?;
         let (prot, shared, back) = (v.prot, v.shared, v.back.clone());
         let page_va = pg_down(va);
@@ -904,6 +950,7 @@ impl PageTable {
         let e = unsafe { *pte };
         if let (true, Backing::File { ino, off, .. }) = (shared, &back) {
             // MAP_SHARED のファイル: みんなで 1 枚のページ。書くときに印をつける
+            *kind = 2;
             let key = file_key(ino, off + (page_va - start));
             let wr = write || force;
             let page = if has_page(e) {
@@ -943,6 +990,7 @@ impl PageTable {
         }
         if let (false, Backing::Pages { pages, off }) = (has_page(e), &back) {
             // カーネルのページ (フレームバッファ) をそのまま。共有で、外すときに参照を返す
+            *kind = 3;
             let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::NoMap)?;
             kalloc::get(page);
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
@@ -951,6 +999,7 @@ impl PageTable {
         }
         if is_swap(e) {
             // スワップから読み戻す。スロットはほかのアドレス空間 (fork) とまだ共有しているかもしれない
+            *kind = 4;
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
             if swap::read(slot_of(e), page).is_err() {
                 kalloc::free(page);
@@ -966,10 +1015,13 @@ impl PageTable {
             && let Some(page) = file_page(ino, off + (page_va - start))
         {
             // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
+            *kind = 5;
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false) };
         } else if !has_page(e) {
+            *kind = 6;
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
             if let Backing::File { ino, off, fend, .. } = &back {
+                *kind = 7;
                 let n = PGSIZE.min(fend.saturating_sub(page_va));
                 if n > 0 {
                     let buf = unsafe { core::slice::from_raw_parts_mut(page, n) };
@@ -987,6 +1039,7 @@ impl PageTable {
             let old = page_of(e);
             if !shared && kalloc::refs(old) > 1 {
                 // 共有しているので写す
+                *kind = 8;
                 let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
                 unsafe { core::ptr::copy_nonoverlapping(old, page, PGSIZE) };
                 if prot & PROT_EXEC != 0 {

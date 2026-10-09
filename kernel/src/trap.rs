@@ -183,6 +183,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         EL0_SYNC => crate::smp::Cause::Fault,
         _ => crate::smp::Cause::Irq,
     };
+    crate::smp::seg_begin(&cause);
     let (t0, sw) = (crate::timer::uptime_ns(), crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed));
     handle(tf, kind, claimed);
     let slept = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed) != sw;

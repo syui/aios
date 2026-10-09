@@ -89,8 +89,10 @@ pub fn lock() {
     debug_assert!(BKL.load(Ordering::Relaxed) != me, "BKL: cpu{} locks twice", me - 1);
     let t0 = crate::timer::uptime_ns();
     let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+    // 順番が来るまで wfe で休む (放す側が sev で起こす)。回りつづけると、QEMU (TCG) では待っている CPU が
+    // 本当の CPU を取りあって、ロックを持っている CPU まで遅くなる
     while SERVING.load(Ordering::Acquire) != ticket {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
     BKL.store(me, Ordering::Relaxed);
     let t1 = crate::timer::uptime_ns();
@@ -119,6 +121,8 @@ fn release() {
     c.hold.fetch_add(crate::timer::uptime_ns().saturating_sub(c.since.load(Ordering::Relaxed)), Ordering::Relaxed);
     BKL.store(0, Ordering::Relaxed);
     SERVING.fetch_add(1, Ordering::Release);
+    // wfe で待っている CPU を起こす
+    unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
 }
 
 /// 放す。そのまえとあとに、大きなロックなしの道が頼んでいった「起こす」を片づける (defer_wake)。
@@ -203,7 +207,7 @@ struct CpuStat {
 
 struct Stats {
     cpu: [CpuStat; MAXCPU],
-    /// システムコールの番号ごとの (回数, ロックを持っていた時間)。途中で眠ったもの (wait4 など) はのぞく
+    /// システムコールの番号ごとの (回数, ロックを持っていた時間)。途中で眠ったものは、眠るまでと起きてからの分
     sys: [(AtomicU64, AtomicU64); NSYS],
     fault: (AtomicU64, AtomicU64),
     irq: (AtomicU64, AtomicU64),
@@ -240,23 +244,83 @@ pub enum Cause {
     Irq,
 }
 
+fn slot_of(idx: u64) -> Option<&'static (AtomicU64, AtomicU64)> {
+    match idx as usize {
+        n if n < NSYS => Some(&STATS.sys[n]),
+        n if n == NSYS => Some(&STATS.fault),
+        n if n == NSYS + 1 => Some(&STATS.irq),
+        _ => None,
+    }
+}
+
+fn index_of(cause: &Cause) -> u64 {
+    match *cause {
+        Cause::Sys(n) if (n as usize) < NSYS => n,
+        Cause::Sys(_) => u64::MAX,
+        Cause::Fault => NSYS as u64,
+        Cause::Irq => NSYS as u64 + 1,
+    }
+}
+
+/// CPU ごとの、いまロックを持って動いている区間 (始まった時刻, 原因の番号)。途中で眠るシステムコールも、
+/// 眠るまでと起きてからの分を数えるため (sched が区切る)
+static SEG: [(AtomicU64, AtomicU64); MAXCPU] = [const { (AtomicU64::new(0), AtomicU64::new(u64::MAX)) }; MAXCPU];
+
+/// 例外の始まり (ロックを取ったあと)
+pub fn seg_begin(cause: &Cause) {
+    let s = &SEG[id()];
+    s.0.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+    s.1.store(index_of(cause), Ordering::Relaxed);
+}
+
+/// 眠る (ほかへ切りかえる) まえ: ここまでの分を足す。返すのは原因の番号 (起きたら seg_resume に)
+pub fn seg_pause() -> u64 {
+    let s = &SEG[id()];
+    let idx = s.1.swap(u64::MAX, Ordering::Relaxed);
+    if let Some(slot) = slot_of(idx) {
+        slot.1.fetch_add(crate::timer::uptime_ns().saturating_sub(s.0.load(Ordering::Relaxed)), Ordering::Relaxed);
+    }
+    idx
+}
+
+/// 起きた (切りかえから戻った): 続きの区間を始める
+pub fn seg_resume(idx: u64) {
+    let s = &SEG[id()];
+    s.0.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+    s.1.store(idx, Ordering::Relaxed);
+}
+
 pub fn account(cause: Cause, ns: u64, slept: bool) {
+    let Some(slot) = slot_of(index_of(&cause)) else { return };
+    slot.0.fetch_add(1, Ordering::Relaxed);
     if slept {
+        // 眠るまでの分は seg_pause が足した。起きてからの分を
         STATS.slept.fetch_add(1, Ordering::Relaxed);
+        let s = &SEG[id()];
+        slot.1.fetch_add(crate::timer::uptime_ns().saturating_sub(s.0.load(Ordering::Relaxed)), Ordering::Relaxed);
+        s.1.store(u64::MAX, Ordering::Relaxed);
         return;
     }
-    let slot = match cause {
-        Cause::Sys(n) if (n as usize) < NSYS => &STATS.sys[n as usize],
-        Cause::Sys(_) => return,
-        Cause::Fault => &STATS.fault,
-        Cause::Irq => &STATS.irq,
-    };
-    slot.0.fetch_add(1, Ordering::Relaxed);
     slot.1.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// デバイスの終わりを回って待った回数と時間 (ns): 0 はディスク (virtio-blk)、1 は画面 (virtio-gpu)。
+/// 2 はスケジューラが次を選んでページ表を載せるまで (ロックを持ったまま)。
+/// 大きなロックを持ったまま待つものがどれだけあるかを /proc/bkl で見るため
+pub static DEV_WAIT: [(AtomicU64, AtomicU64); 3] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 3];
+
+/// DEV_WAIT に 1 回分を足す
+pub fn dev_wait(i: usize, t0: u64) {
+    DEV_WAIT[i].0.fetch_add(1, Ordering::Relaxed);
+    DEV_WAIT[i].1.fetch_add(crate::timer::uptime_ns().saturating_sub(t0), Ordering::Relaxed);
 }
 
 /// 数えなおす (/proc/bkl に書く)
 pub fn stats_reset() {
+    for (n, t) in DEV_WAIT.iter().chain(crate::vm::FAULT_KIND.iter()) {
+        n.store(0, Ordering::Relaxed);
+        t.store(0, Ordering::Relaxed);
+    }
     for c in &STATS.cpu {
         c.wait.store(0, Ordering::Relaxed);
         c.hold.store(0, Ordering::Relaxed);
@@ -299,7 +363,7 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("all  {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%   (1 CPU = 100%)
 
 ", ms(tw), pct(tw), ms(th), pct(th)));
-    // 持っていた時間の長いもの (眠らなかったものだけ)
+    // 持っていた時間の長いもの (途中で眠ったものは、眠るまでと起きてからの分)
     let mut rows: Vec<(String, u64, u64)> = Vec::new();
     for (i, (n, t)) in STATS.sys.iter().enumerate() {
         let n = n.load(Ordering::Relaxed);
@@ -321,9 +385,18 @@ pub fn stats() -> alloc::string::String {
         s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
+    for (i, name) in ["ディスク", "画面", "スケジューラ"].iter().enumerate() {
+        let (n, t) = (DEV_WAIT[i].0.load(Ordering::Relaxed), DEV_WAIT[i].1.load(Ordering::Relaxed));
+        s.push_str(&format!("デバイスを待った ({}): {} 回 {:.1} ms\n", name, n, ms(t)));
+    }
+    s.push_str("ページフォルトの種類 (回数 / ms):");
+    for (i, (n, t)) in crate::vm::FAULT_KIND.iter().enumerate().skip(1) {
+        s.push_str(&format!(" {}:{}/{:.1}", i, n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed))));
+    }
+    s.push('\n');
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を分けている {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
-    s.push_str(&format!("(途中で眠ったので数えなかったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
+    s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s
 }

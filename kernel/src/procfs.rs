@@ -593,6 +593,22 @@ impl Inode for ProcInode {
         }
         // /proc/strace: root が名前を書くと、その名前のプロセスの失敗したシステムコールを出す (空で止める)
         if self.node == Node::Strace && crate::cred::current().euid == 0 {
+            // "kick PID": その PID の futex で眠っているスレッドを起こす (調べもの用。proc::futex_kick)
+            if let Some(pid) = b.strip_prefix(b"kick ").and_then(|r| core::str::from_utf8(r).ok()).and_then(|r| r.trim().parse::<u32>().ok()) {
+                let n = crate::proc::futex_kick(pid);
+                crate::println!("futex kick {}: woke {}", pid, n);
+                return Ok(b.len());
+            }
+            if b.starts_with(b"pcmiss") {
+                let on = !crate::vm::MISS_LOG.load(core::sync::atomic::Ordering::Relaxed);
+                crate::vm::MISS_LOG.store(on, core::sync::atomic::Ordering::Relaxed);
+                return Ok(b.len());
+            }
+            // "raw TID": そのスレッドのレジスタとスタックをシリアルに (proc::raw_dump)
+            if let Some(tid) = b.strip_prefix(b"raw ").and_then(|r| core::str::from_utf8(r).ok()).and_then(|r| r.trim().parse::<u32>().ok()) {
+                crate::proc::raw_dump(tid);
+                return Ok(b.len());
+            }
             crate::syscall::strace_set(b);
             return Ok(b.len());
         }
