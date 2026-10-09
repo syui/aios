@@ -161,45 +161,37 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     pt.map(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, PROT_RW, false, Backing::Anon).ok_or(-ENOMEM)?;
 
     // 文字列は Linux と同じ並び: 天辺の 8 バイトは 0 のまま空け、その下に argv[0] argv[1] ... envp ... execfn を
-    // 低いほうから続けて置く (setproctitle などは argv と envp の文字列が続いて並ぶものとして、その終わりを数える)
+    // 低いほうから続けて置く (setproctitle などは argv と envp の文字列が続いて並ぶものとして、その終わりを数える)。
+    // その下に AT_RANDOM の 16 バイト、さらに下に (argc, argv, envp, auxv) の並び。
+    // 全部をカーネルの中で組んでから、1 回で写す (8 バイトずつ写すと、そのたびにページ表を引くので)
     let total: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1;
     if total + 8 > ARG_MAX {
         return Err(-E2BIG);
     }
     let base = USER_STACK_TOP - 8 - total;
-    let mut at = base;
-    let mut put_str = |pt: &mut PageTable, b: &[u8]| -> Result<usize, i64> {
-        let start = at;
-        pt.copy_out(at, b).ok_or(-ENOMEM)?;
-        pt.copy_out(at + b.len(), &[0]).ok_or(-ENOMEM)?;
-        at += b.len() + 1;
-        Ok(start)
-    };
     let (argc, envc) = (argv.len(), envp.len());
-    let mut ptrs = Vec::with_capacity(argc + envc);
-    for s in argv.iter().chain(envp.iter()) {
-        ptrs.push(put_str(&mut pt, s)?);
+    let random = base - 16;
+    let nauxv = 17;
+    let words = 1 + argc + 1 + envc + 1 + nauxv * 2;
+    let sp = (random - words * 8) & !15;
+    if sp < USER_STACK_TOP - ARG_MAX {
+        return Err(-E2BIG);
     }
+    // img[i] は va = sp + i
+    let mut img = alloc::vec![0u8; USER_STACK_TOP - sp];
+    let mut at = base;
+    let mut ptrs = Vec::with_capacity(argc + envc + 1);
+    for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&path.as_bytes().to_vec())) {
+        ptrs.push(at);
+        img[at - sp..at - sp + s.len()].copy_from_slice(s);
+        at += s.len() + 1;
+    }
+    let execfn = ptrs[argc + envc];
     let env_start = base + argv.iter().map(|s| s.len() + 1).sum::<usize>();
     let args = (base, env_start, env_start + envp.iter().map(|s| s.len() + 1).sum::<usize>());
-    let execfn = put_str(&mut pt, path.as_bytes())?;
-    // AT_RANDOM の 16 バイトは文字列の下に
-    let mut sp = base;
-    let mut push_bytes = |pt: &mut PageTable, b: &[u8], nul: bool| -> Result<usize, i64> {
-        let n = b.len() + nul as usize;
-        if sp - n < USER_STACK_TOP - ARG_MAX {
-            return Err(-E2BIG);
-        }
-        sp -= n;
-        pt.copy_out(sp, b).ok_or(-ENOMEM)?;
-        if nul {
-            pt.copy_out(sp + b.len(), &[0]).ok_or(-ENOMEM)?;
-        }
-        Ok(sp)
-    };
-    let random = push_bytes(&mut pt, &crate::rand::bytes16(), false)?;
+    img[random - sp..random - sp + 16].copy_from_slice(&crate::rand::bytes16());
 
-    let auxv = [
+    let auxv: [(u64, u64); 17] = [
         (AT_PHDR, phdr_va as u64),
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
@@ -218,27 +210,25 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64),
         (AT_NULL, 0),
     ];
-    let words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
-    let sp = (sp - words * 8) & !15;
-    let mut w = sp;
-    let mut put = |v: u64| -> Result<(), i64> {
-        pt.copy_out(w, &v.to_le_bytes()).ok_or(-ENOMEM)?;
+    let mut w = 0;
+    let mut put = |v: u64| {
+        img[w..w + 8].copy_from_slice(&v.to_le_bytes());
         w += 8;
-        Ok(())
     };
-    put(argc as u64)?;
+    put(argc as u64);
     for p in &ptrs[..argc] {
-        put(*p as u64)?;
+        put(*p as u64);
     }
-    put(0)?;
+    put(0);
     for p in &ptrs[argc..argc + envc] {
-        put(*p as u64)?;
+        put(*p as u64);
     }
-    put(0)?;
+    put(0);
     for (k, v) in auxv {
-        put(k)?;
-        put(v)?;
+        put(k);
+        put(v);
     }
+    pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
     Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, args })
 }

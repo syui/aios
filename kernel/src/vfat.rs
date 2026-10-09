@@ -688,6 +688,8 @@ impl Inode for FatNode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         let mut e = self.entry()?.ok_or(-EISDIR)?;
         if e[11] & ATTR_DIR != 0 {
             return Err(-EISDIR);
@@ -724,6 +726,8 @@ impl Inode for FatNode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        crate::vm::file_changed(self.id());
         let mut e = self.entry()?.ok_or(-EISDIR)?;
         if e[11] & ATTR_DIR != 0 {
             return Err(-EISDIR);

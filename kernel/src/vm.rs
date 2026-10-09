@@ -137,6 +137,29 @@ pub fn shrink_cache(n: usize) -> usize {
     freed.len()
 }
 
+/// file_changed の数 (読みこんでいるあいだに変わったら、表に入れない)
+static CHANGES: AtomicUsize = AtomicUsize::new(0);
+
+/// ファイル (id) の中身が変わる (書く、切りつめる): 表にあるそのファイルのページを捨てる。
+/// 写しているところは自分の参照を持っているのでそのまま (MAP_PRIVATE で、写したあとの変更が見えるかは決まっていない)。
+/// 更新時刻は秒までなので、版 (ver) だけでは同じ秒の同じ大きさの書きかえを見分けられない
+pub fn file_changed(id: (usize, u64)) {
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+    let mut freed = Vec::new();
+    {
+        let mut c = PRIV.lock();
+        let keys: Vec<FileKey> = c.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(p) = c.remove(&k) {
+                freed.push(p.page);
+            }
+        }
+    }
+    for p in freed {
+        kalloc::put(p);
+    }
+}
+
 /// 表にある、版が ver のページ (参照をひとつ足して)。ロックなしでも呼べる
 fn cached_page(key: &FileKey, ver: (u64, u64)) -> Option<*mut u8> {
     let c = PRIV.lock();
@@ -162,6 +185,7 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     if let Some(p) = cached_page(&key, ver) {
         return Some(p);
     }
+    let changes = CHANGES.load(Ordering::SeqCst);
     let page = kalloc::alloc()?;
     let size = ver.1 as usize;
     if foff < size {
@@ -175,6 +199,10 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     sync_icache(page as usize, PGSIZE);
     if PRIV.lock().len() >= PRIV_MAX {
         shrink_cache(PRIV_MAX / 8);
+    }
+    // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う
+    if CHANGES.load(Ordering::SeqCst) != changes {
+        return Some(page);
     }
     kalloc::get(page);
     // 古い版は外す (読んでいるあいだにほかが入れたものも)。写しているところは自分の参照を持っている
