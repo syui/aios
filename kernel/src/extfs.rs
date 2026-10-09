@@ -2098,11 +2098,14 @@ impl Inode for ExtInode {
         }
     }
 
+    fn page_cacheable(&self) -> bool {
+        true
+    }
+
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
-        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を、書く前と後に捨てる (書いているあいだに読まれたものも)
         crate::vm::file_changed(self.id());
-        self.not_swapfile()?;
-        self.write_op(|| {
+        let r = self.not_swapfile().and_then(|_| self.write_op(|| {
             let mut r = self.raw()?;
             match r.mode() & S_IFMT {
                 S_IFREG => {}
@@ -2112,12 +2115,15 @@ impl Inode for ExtInode {
             let res = self.fs.write_data(self.ino, &mut r, off, buf);
             self.fs.write_inode(self.ino, &r)?;
             res
-        })
+        }));
+        crate::vm::file_changed(self.id());
+        r
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
-        // 中身が変わる: ページキャッシュ (vm.rs) にある分を捨てる
+        // 中身が変わる: ページキャッシュ (vm.rs) にある分を、前と後に捨てる
         crate::vm::file_changed(self.id());
+        let r = (|| -> Result<(), i64> {
         self.not_swapfile()?;
         self.write_op(|| {
             let mut r = self.raw()?;
@@ -2139,7 +2145,11 @@ impl Inode for ExtInode {
             r.touch();
             self.fs.write_inode(self.ino, &r)
         })
+            })();
+        crate::vm::file_changed(self.id());
+        r
     }
+
 
     fn readlink(&self) -> Result<String, i64> {
         let r = self.raw()?;

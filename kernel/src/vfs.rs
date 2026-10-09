@@ -90,6 +90,11 @@ pub trait Inode {
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64>;
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64>;
+    /// read をページキャッシュ (vm.rs) を通してよいか: 中身が変わるときにかならず vm::file_changed を呼ぶ
+    /// ファイルシステム (ext4) のもの。procfs のように読むたびに作るものは false
+    fn page_cacheable(&self) -> bool {
+        false
+    }
     fn truncate(&self, len: usize) -> Result<(), i64>;
     fn readlink(&self) -> Result<String, i64>;
 
