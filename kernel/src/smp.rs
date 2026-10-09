@@ -339,6 +339,57 @@ pub fn stats_reset() {
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
 }
 
+/// /proc/ai/bkl: /proc/bkl と同じものを 1 行の JSON で (AI が読む)
+pub fn stats_json() -> alloc::string::String {
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let span = crate::timer::uptime_ns().saturating_sub(STATS.start.load(Ordering::Relaxed)).max(1);
+    let pct = |ns: u64| ns as f64 * 100.0 / span as f64;
+    let (mut tw, mut th) = (0, 0);
+    let mut cpus = Vec::new();
+    for c in STATS.cpu.iter().take(online()) {
+        let (w, h) = (c.wait.load(Ordering::Relaxed), c.hold.load(Ordering::Relaxed));
+        tw += w;
+        th += h;
+        cpus.push(format!("{{\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"locks\":{}}}", pct(w), pct(h), c.locks.load(Ordering::Relaxed)));
+    }
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
+    for (i, (n, t)) in STATS.sys.iter().enumerate() {
+        let n = n.load(Ordering::Relaxed);
+        if n > 0 {
+            rows.push((crate::syscall::name(i as u64).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase()), n, t.load(Ordering::Relaxed)));
+        }
+    }
+    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
+        let n = slot.0.load(Ordering::Relaxed);
+        if n > 0 {
+            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
+        }
+    }
+    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
+    let top: Vec<String> = rows.iter().take(25).map(|(name, n, t)| format!("{{\"name\":\"{}\",\"n\":{},\"ms\":{:.1},\"avg_us\":{:.1}}}", name, n, ms(*t), *t as f64 / 1e3 / *n as f64)).collect();
+    let dev: Vec<String> = ["disk", "gpu", "sched"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
+    let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss"];
+    let faults: Vec<String> = crate::vm::FAULT_KIND.iter().enumerate().skip(1).map(|(i, (n, t))| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", kinds[i], n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed)))).collect();
+    let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "{{\"span_s\":{:.2},\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"cpus\":[{}],\"top\":[{}],\"dev\":{{{}}},\"faults\":{{{}}},\"fast_pipe\":{{\"ok\":{},\"shared_table\":{}}},\"fast_faults\":{},\"slept\":{}}}\n",
+        span as f64 / 1e9,
+        pct(tw),
+        pct(th),
+        cpus.join(","),
+        top.join(","),
+        dev.join(","),
+        faults.join(","),
+        fr[0],
+        fr[3],
+        FAST_FAULTS.load(Ordering::Relaxed),
+        STATS.slept.load(Ordering::Relaxed)
+    )
+}
+
 /// /proc/bkl
 pub fn stats() -> alloc::string::String {
     use alloc::format;

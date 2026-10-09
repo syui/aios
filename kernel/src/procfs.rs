@@ -87,6 +87,13 @@ enum Node {
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
+    /// /proc/ai (aiproc.rs): ディレクトリ、threads、bkl、ctl、fd/ と fd/PID
+    AiDir,
+    AiThreads,
+    AiBkl,
+    AiCtl,
+    AiFdDir,
+    AiFd(u32),
 }
 
 pub struct ProcInode {
@@ -175,6 +182,12 @@ impl ProcInode {
             Node::Task(_, t) => (t as u64) << 16 | 21,
             Node::TaskFile(_, t, k) => (t as u64) << 16 | (22 + k as u64),
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
+            Node::AiDir => 40,
+            Node::AiThreads => 41,
+            Node::AiBkl => 42,
+            Node::AiCtl => 43,
+            Node::AiFdDir => 44,
+            Node::AiFd(p) => (p as u64) << 16 | 30,
         }
     }
 
@@ -237,6 +250,11 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
+            Node::AiThreads | Node::AiBkl | Node::AiCtl | Node::AiFd(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads => proc::ai_threads(),
+            Node::AiBkl => crate::smp::stats_json(),
+            Node::AiCtl => crate::aiproc::CTL_HELP.into(),
+            Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
             Node::Kmsg => crate::kmsg::text(),
@@ -547,7 +565,8 @@ impl Inode for ProcInode {
     fn meta(&self) -> Meta {
         let (uid, gid) = self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid));
         let mode = match self.node {
-            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) => S_IFDIR | 0o555,
+            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir => S_IFDIR | 0o555,
+            Node::AiCtl => S_IFREG | 0o644,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::NsDir(_) => S_IFDIR | 0o511,
@@ -612,6 +631,11 @@ impl Inode for ProcInode {
             crate::syscall::strace_set(b);
             return Ok(b.len());
         }
+        // /proc/ai/ctl: 調べもののスイッチ (root。aiproc::ctl)
+        if self.node == Node::AiCtl && crate::aiproc::allowed() {
+            crate::aiproc::ctl(b)?;
+            return Ok(b.len());
+        }
         // /proc/bkl: 書くと (root) 大きなロックの統計を 0 から数えなおす
         if self.node == Node::Bkl && crate::cred::current().euid == 0 {
             crate::smp::stats_reset();
@@ -623,7 +647,7 @@ impl Inode for ProcInode {
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // > /proc/strace (O_TRUNC) は受けつける
         let sys = matches!(self.node, Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable());
-        if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 {
+        if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 || (self.node == Node::AiCtl && crate::aiproc::allowed()) {
             return Ok(());
         }
         // uid_map など (書けるかは書くときに決める)
@@ -678,6 +702,12 @@ impl Inode for ProcInode {
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
+            (Node::Root, "ai") => Node::AiDir,
+            (Node::AiDir, "threads") => Node::AiThreads,
+            (Node::AiDir, "bkl") => Node::AiBkl,
+            (Node::AiDir, "ctl") => Node::AiCtl,
+            (Node::AiDir, "fd") => Node::AiFdDir,
+            (Node::AiFdDir, _) => Node::AiFd(leader(num.ok_or(-ENOENT)?)?.tgid),
             (Node::NetDir, "pnp") => Node::Pnp,
             (Node::NetDir, "route") => Node::Route,
             (Node::NetDir, "tcp") => Node::NetTcp,
@@ -757,11 +787,24 @@ impl Inode for ProcInode {
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
+                add("ai".into(), Node::AiDir);
                 add("sys".into(), Node::SysDir(0, 0));
                 for p in proc::all_leader_procs() {
                     if let Some(l) = crate::ns::to_local(p.tgid) {
                         add(format!("{}", l), Node::Pid(p.tgid));
                     }
+                }
+            }
+            Node::AiDir => {
+                add("threads".into(), Node::AiThreads);
+                add("bkl".into(), Node::AiBkl);
+                add("ctl".into(), Node::AiCtl);
+                add("fd".into(), Node::AiFdDir);
+            }
+            Node::AiFdDir if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiFdDir => {
+                for p in proc::all_leader_procs() {
+                    add(format!("{}", p.tgid), Node::AiFd(p.tgid));
                 }
             }
             Node::NetDir => {

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod aiproc;
 mod boot;
 mod mmio;
 #[macro_use]

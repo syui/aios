@@ -2,7 +2,7 @@
   "mcpServers": {
     "aish": {
       "command": "aibox",
-      "args": ["-w", "~/.cache", "-w", "~/.cargo", "--", "aish", "--mcp"]
+      "args": ["-w", "~/.cache", "-w", "~/.cargo", "-w", "/proc/ai/ctl", "--", "aish", "--mcp"]
     }
   }
 }
