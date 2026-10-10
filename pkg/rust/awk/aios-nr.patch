@@ -1,0 +1,51 @@
+diff --git a/interpreter/src/vm/io.rs b/interpreter/src/vm/io.rs
+index 29022ef..d8322f8 100644
+--- a/interpreter/src/vm/io.rs
++++ b/interpreter/src/vm/io.rs
+@@ -72,11 +72,16 @@ impl Interpreter<'_> {
+     // directly dispatch to the correct functions and avoid extra writes to RT.
+     // TODO: on Windows, we must strip `\r` depending on BINMODE.
+     pub fn read_record(&mut self, reader: impl BufRead) -> Result<bool> {
+-        // Update vars
+-        // TODO: optimize and make more ergonomic
+-        self.symbols.nr = &self.symbols.fnr + &Value::new_int(1);
+-        self.symbols.fnr = &self.symbols.fnr + &Value::new_int(1);
++        let got = self.read_record_inner(reader)?;
++        // Count the record only when one was read (not at EOF), and NR across files (aios)
++        if got {
++            self.symbols.nr = &self.symbols.nr + &Value::new_int(1);
++            self.symbols.fnr = &self.symbols.fnr + &Value::new_int(1);
++        }
++        Ok(got)
++    }
+ 
++    fn read_record_inner(&mut self, reader: impl BufRead) -> Result<bool> {
+         let rs = self.symbols.rs.clone();
+         let rs_bytes = &*rs.to_bytes();
+         let first = first_char(rs_bytes);
+diff --git a/src/event.rs b/src/event.rs
+index 6801847..04ced5b 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -106,7 +106,10 @@ impl<'a> AwkRt<'a> {
+ 
+     pub fn rule_event_loop(&mut self) -> Result<()> {
+         let range = self.bc.rules_code();
+-        if range.is_empty() {
++        // Read the input when there are rules, or END / BEGINFILE / ENDFILE (END { print NR }
++        // counts the lines); a program with only BEGIN does not read it (aios)
++        let ends = !self.bc.end_code().is_empty() || !self.bc.begin_file_code().is_empty() || !self.bc.end_file_code().is_empty();
++        if range.is_empty() && !ends {
+             return Ok(());
+         }
+ 
+@@ -134,6 +137,9 @@ impl<'a> AwkRt<'a> {
+ 
+             // File event loop: read record, wrap rule event loop, endfile.
+             while self.intrp.read_record(&mut reader)? {
++                if range.is_empty() {
++                    continue;
++                }
+                 match self.drive(range.clone())? {
+                     CtrlSig::End | CtrlSig::Next => {} // read next record & run rules
+                     CtrlSig::NextFile => break,        // clean-up & read next file

@@ -1,16 +1,25 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/awk)
 # uutils/awk はまだリリースがないので、コミットを決めて日付を版にする (まだ作りかけ: -F や split() など)
 pkgname=awk
-pkgver=0.1.0.20261007
+pkgver=0.1.0.20261010
 pkgrel=1
-_commit=5e3a13c917fb470893c6fed71dc9413e30e3b146
+_commit=58c3a2f79eef07eb3e59a6dd5f17ebcaef037f95
 pkgdesc='Rust implementation of AWK, work in progress (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/awk'
 license=('MIT' 'Apache-2.0')
 makedepends=('git' 'rustup')
-source=("git+https://github.com/uutils/awk#commit=$_commit")
-sha256sums=('SKIP')
+# aios-nr.patch: NR / FNR を読めたときだけ数える (END の NR が 1 多かった)、NR はファイルをまたいで数える、
+# END (BEGINFILE / ENDFILE) だけのときも入力を読む (END { print NR } が 0 だった)
+source=("git+https://github.com/uutils/awk#commit=$_commit"
+        aios-nr.patch)
+sha256sums=('SKIP'
+            '569fbe1aac1be686ce0970e5371a1689232993ad7fd13dee5e39ea79daf9656e')
+
+prepare() {
+  cd awk
+  patch -Np1 -i ../aios-nr.patch
+}
 
 build() {
   . "$startdir/../cross.sh"
