@@ -188,8 +188,9 @@ fn main() {
         i += 1;
     }
     if !std::path::Path::new("/proc/ai/threads").exists() {
+        // 2: 起きなおしても同じなので、aiwatch.service は起きなおさない (RestartPreventExitStatus=2)
         eprintln!("aiwatch: no /proc/ai (an older kernel?)");
-        std::process::exit(1);
+        std::process::exit(2);
     }
     // いま続いているもの: key → (はじめて見えた時刻, 中身)
     let mut active: BTreeMap<String, (u64, Value)> = BTreeMap::new();

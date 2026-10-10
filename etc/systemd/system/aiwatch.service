@@ -1,10 +1,16 @@
 [Unit]
 Description=aiwatch: watch the kernel for lost wakeups, wake storms and a busy big lock (/proc/ai, /run/aiwatch.json)
 
+# /proc/ai のない (古い) カーネルでは起こさない
+ConditionPathExists=/proc/ai/threads
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/aiwatch
 Restart=always
+RestartSec=5
+# それでも /proc/ai がなければ aiwatch は exit 2。起きなおしても同じなので起きなおさない
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=multi-user.target
