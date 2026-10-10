@@ -105,12 +105,15 @@ pub struct OpenFile {
     /// ディレクトリ: 最初の getdents (offset 0) で読んだ一覧。続きはここから返す
     /// (読みながら消しても番号がずれず、読み飛ばさない。rewinddir で offset が 0 に戻れば読みなおす)
     dirents: Option<Rc<Vec<(u64, String, u32)>>>,
+    /// ふつうのファイルを読んでいる途中 (read_inode_file。ディスクを眠って待つことがある)。同じ開いたファイルを
+    /// 読むほかの人は、終わるまで待つ (オフセットを同時に進めない)
+    reading: bool,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false }))
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
@@ -135,8 +138,68 @@ pub fn read_opt(f: &FileRef, dst: &mut [u8], dontwait: bool) -> Result<usize, i6
     match stream {
         Some((Kind::PipeWrite(_), _)) => Err(-EBADF),
         Some((k, nonblock)) => read_stream(&k, dst, nonblock || dontwait),
-        None => f.borrow_mut().read(dst),
+        None => {
+            // ページキャッシュを通すふつうのファイル (ext4): 借りたままディスクを待たない (眠ることがある)
+            let inode = {
+                let b = f.borrow();
+                match &b.kind {
+                    Kind::Inode(ino, path) if ino.page_cacheable() => Some((ino.clone(), path.clone())),
+                    _ => None,
+                }
+            };
+            match inode {
+                Some((ino, path)) => read_inode_file(f, &ino, &path, dst),
+                None => f.borrow_mut().read(dst),
+            }
+        }
     }
+}
+
+/// ふつうのファイルを、開いたファイル f のオフセットから読む。ディスクを待つあいだ眠ることがある
+/// (そのあいだ大きなロックはほかの CPU が使える)。同じ開いたファイルを読むほかの人とは順番に
+fn read_inode_file(f: &FileRef, ino: &InodeRef, path: &str, dst: &mut [u8]) -> Result<usize, i64> {
+    let chan = Rc::as_ptr(f) as *const u8 as usize;
+    while f.borrow().reading {
+        proc::sleep(chan)?;
+    }
+    let off = {
+        let mut b = f.borrow_mut();
+        b.reading = true;
+        b.offset
+    };
+    let r = read_sleepable(ino, off, dst);
+    {
+        let mut b = f.borrow_mut();
+        b.reading = false;
+        if let Ok(n) = r {
+            b.offset = off + n;
+        }
+    }
+    proc::wakeup(chan);
+    if let Ok(n) = r
+        && n > 0
+    {
+        crate::inotify::file_event(path, ino, crate::inotify::IN_ACCESS);
+    }
+    r
+}
+
+/// ページキャッシュを通して読む。キャッシュにないところはディスクを眠って待つ (proc::io_sleepable)。
+/// 眠っているあいだにファイルシステムが書きかえられたら (vfs::ERETRY) 頭から読みなおし、何度もなら眠らずに
+/// やりなおした数 (/proc/bkl)
+pub static IO_RETRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn read_sleepable(ino: &InodeRef, off: usize, dst: &mut [u8]) -> Result<usize, i64> {
+    for _ in 0..8 {
+        match proc::io_sleepable(|| crate::vm::read_cached(ino, off, dst)) {
+            Err(e) if e == -crate::vfs::ERETRY => {
+                IO_RETRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            r => return r,
+        }
+    }
+    crate::vm::read_cached(ino, off, dst)
 }
 
 pub fn write_opt(f: &FileRef, src: &[u8], dontwait: bool) -> Result<usize, i64> {
@@ -675,7 +738,8 @@ impl PageQueue {
         while done < src.len() {
             let need_new = self.pages.back().is_none_or(|p| p.2 == PGSIZE);
             if need_new {
-                let p = crate::kalloc::alloc().ok_or(-12i64)?; // ENOMEM
+                // 書いたところ (p.2 まで) しか読まないので、0 にしなくてよい
+                let p = crate::kalloc::alloc_dirty().ok_or(-12i64)?; // ENOMEM
                 self.pages.push_back((p, 0, 0));
             }
             let last = self.pages.back_mut().unwrap();
@@ -694,7 +758,7 @@ impl PageQueue {
         let need = src.len().saturating_sub(room).div_ceil(PGSIZE);
         let mut fresh = Vec::with_capacity(need);
         for _ in 0..need {
-            match crate::kalloc::alloc() {
+            match crate::kalloc::alloc_dirty() {
                 Some(p) => fresh.push(p),
                 None => {
                     for p in fresh {

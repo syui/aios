@@ -97,6 +97,8 @@ pub fn tick() {
         crate::proc::decay_recent();
     }
     crate::timerfd::tick();
+    // ディスクの要求が終わっているのに割り込みが来ていなければ (眠って待つ人を起こす)
+    crate::virtio_blk::poll();
     crate::signal::tick(now);
     // TCP の再送などのため、ときどき (5 tick ごと) 回す
     if now / 5 != prev / 5 {

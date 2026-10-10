@@ -301,6 +301,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
                 id if Some(id) == crate::net::irq() => crate::net::intr(),
                 id if crate::input::intr(id) => {}
                 id if crate::sound::intr(id) => {}
+                id if crate::virtio_blk::intr(id) => {}
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);

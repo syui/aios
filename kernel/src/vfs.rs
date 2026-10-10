@@ -135,6 +135,10 @@ pub trait Inode {
     }
 }
 
+/// カーネルの中だけの戻り値: ディスクを眠って待つあいだにファイルシステムが書きかえられたので、読みを
+/// 頭からやりなおす (extfs の with_block → file::read_sleepable がやりなおす。ユーザーには返さない)
+pub const ERETRY: i64 = 512;
+
 /// write / pwrite / sendfile で off から len 書いてよいか (memfd の封)。
 /// 共有の写像の書き戻しはここを通らない (Linux でも F_SEAL_FUTURE_WRITE の前の写像は書ける)
 pub fn write_sealed(ino: &InodeRef, off: usize, len: usize) -> Result<(), i64> {

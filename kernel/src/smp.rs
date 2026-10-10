@@ -458,6 +458,7 @@ pub fn stats() -> alloc::string::String {
     }
     s.push('\n');
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("ディスクを眠って待った読み: {} 回 (大きなロックを放して)、書かれたのでやりなおした読み: {} 回\n", crate::virtio_blk::SLEPT.load(Ordering::Relaxed), crate::file::IO_RETRIES.load(Ordering::Relaxed)));
     s.push_str(&format!("パスの覚え: {} 個、覚えから答えた {} 回\n", crate::vfs::paths_len(), crate::vfs::PATHS_HIT.load(Ordering::Relaxed)));
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
