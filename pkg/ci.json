@@ -1,5 +1,6 @@
 [
 {"name": "firefox", "path": "pkg/c/firefox", "setup": "--firefox", "free_disk": true, "timeout": 350, "notice": "Mozilla の公式のビルドではない (Firefox のソースから、公式でないブランド Nightly で作ったもの。Not an official Mozilla build; unofficial branding)", "why": "数時間かかる (Gecko、Rust、15 GB)"},
 {"name": "llvm", "path": "pkg/c/llvm", "setup": "", "free_disk": true, "timeout": 240, "why": "1 時間ほど、ディスクを多く使う"},
-{"name": "uv", "path": "pkg/rust/uv", "setup": "", "free_disk": false, "timeout": 120, "why": "fat LTO のリンクにメモリを多く使う (手元で止められた)。配布元のバイナリは aios-platform.patch がないので使えない"}
+{"name": "uv", "path": "pkg/rust/uv", "setup": "", "free_disk": false, "timeout": 120, "why": "fat LTO のリンクにメモリを多く使う (手元で止められた)。配布元のバイナリは aios-platform.patch がないので使えない"},
+{"name": "ffmpeg", "path": "pkg/c/ffmpeg", "setup": "", "free_disk": false, "timeout": 120, "why": "手元の 4 コアで 21 分 (mesa は 6 分、gtk3 は 2 分半なので手元のまま)"}
 ]
