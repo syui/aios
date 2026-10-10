@@ -487,6 +487,56 @@ fn flush_pages(vas: &[usize]) {
     }
 }
 
+// ---- この CPU だけの TLB ----
+// aios は ASID を使わず、ページ表を載せるたび (activate) と外すたび (deactivate) にこの CPU の TLB をみな消す。
+// なので、あるページ表の古い中身が TLB に残っているのは、いまそれを載せている CPU だけ。ほかの CPU が載せて
+// いなければ、すべての CPU に消させる (…is: QEMU の TCG では全部の CPU を止めて合わせるので重い。Firefox の
+// munmap の半分がこれだった) かわりに、この CPU の分だけ消せばよい。載せる・外すは大きなロックの中なので、
+// 大きなロックを持って PTE を変えるところ (local_ok) からはずれない (ロックなしの fast_fault はいままでどおり)
+
+/// CPU ごとの、いま TTBR0 に載せているページ表 (物理アドレス。0 は何も)
+static ACTIVE_ROOT: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+/// root を載せているのがこの CPU だけ (かどこにもない) か。大きなロックを持って呼ぶこと
+fn local_ok(root: usize) -> bool {
+    let me = crate::smp::id();
+    (0..crate::smp::online()).all(|c| c == me || ACTIVE_ROOT[c].load(Ordering::Relaxed) != root)
+}
+
+fn flush_va_in(root: usize, va: usize) {
+    if local_ok(root) {
+        unsafe { core::arch::asm!("dsb nshst", "tlbi vaae1, {}", "dsb nsh", "isb", in(reg) (va >> 12) as u64) };
+    } else {
+        flush_va(va);
+    }
+}
+
+fn flush_pages_in(root: usize, vas: &[usize]) {
+    if vas.is_empty() {
+        return;
+    }
+    if !local_ok(root) {
+        return flush_pages(vas);
+    }
+    if vas.len() <= 64 {
+        unsafe { core::arch::asm!("dsb nshst") };
+        for &va in vas {
+            unsafe { core::arch::asm!("tlbi vaae1, {}", in(reg) (va >> 12) as u64) };
+        }
+        unsafe { core::arch::asm!("dsb nsh", "isb") };
+    } else {
+        unsafe { core::arch::asm!("dsb nshst", "tlbi vmalle1", "dsb nsh", "isb") };
+    }
+}
+
+fn flush_all_in(root: usize) {
+    if local_ok(root) {
+        unsafe { core::arch::asm!("dsb nshst", "tlbi vmalle1", "dsb nsh", "isb") };
+    } else {
+        flush_all();
+    }
+}
+
 /// 何も写していない L1 (スケジューラの中で TTBR0 に載せる)
 #[repr(C, align(4096))]
 struct Empty([u64; 512]);
@@ -494,6 +544,7 @@ static EMPTY_L1: Empty = Empty([0; 512]);
 
 /// この CPU の TTBR0 からプロセスのページ表を外す
 pub fn deactivate() {
+    ACTIVE_ROOT[crate::smp::id()].store(0, Ordering::Relaxed);
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {}",
@@ -543,35 +594,40 @@ impl PageTable {
 
     /// [start, end) のページを持っている PTE ごとに f (途中のテーブルがないところは飛ばす)
     fn each_pte(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
-        let mut va = pg_down(start);
-        while va < end {
-            match self.walk(va, false) {
-                Some(pte) => {
-                    if has_page(unsafe { *pte }) {
-                        f(va, pte);
-                    }
-                    va += PGSIZE;
-                }
-                // L3 のテーブルがない: 次の 2 MiB へ
-                None => va = (va | 0x1f_ffff) + 1,
+        self.each_slot(start, end, |va, pte| {
+            if has_page(unsafe { *pte }) {
+                f(va, pte);
             }
-        }
+        });
     }
 
     /// each_pte と同じだが、スワップへ追い出したページの PTE も
     fn each_entry(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
+        self.each_slot(start, end, |va, pte| {
+            let e = unsafe { *pte };
+            if has_page(e) || is_swap(e) {
+                f(va, pte);
+            }
+        });
+    }
+
+    /// [start, end) の L3 の PTE の場所をみな (空のものも)。L3 のテーブル (2 MiB ぶん、512 個) は 1 度だけたどって、
+    /// その中は並びのまま見る (ページごとに上から 4 段たどると、Firefox の大きな munmap が 1 回 0.5 ms かかった)。
+    /// テーブルのないところは飛ばす
+    fn each_slot(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
         let mut va = pg_down(start);
         while va < end {
-            match self.walk(va, false) {
-                Some(pte) => {
-                    let e = unsafe { *pte };
-                    if has_page(e) || is_swap(e) {
-                        f(va, pte);
-                    }
-                    va += PGSIZE;
+            let chunk = va & !0x1f_ffff;
+            let next = chunk + 0x20_0000;
+            if let Some(first) = self.walk(chunk, false) {
+                let stop = end.min(next);
+                let mut i = (va - chunk) / PGSIZE;
+                while chunk + i * PGSIZE < stop {
+                    f(chunk + i * PGSIZE, unsafe { first.add(i) });
+                    i += 1;
                 }
-                None => va = (va | 0x1f_ffff) + 1,
             }
+            va = next;
         }
     }
 
@@ -694,7 +750,7 @@ impl PageTable {
             }
             *pte = 0;
         });
-        flush_pages(&vas);
+        flush_pages_in(self.root_pa(), &vas);
         if !vas.is_empty() {
             self.quiesce();
         }
@@ -729,7 +785,7 @@ impl PageTable {
                 *pte = 0;
             }
         });
-        flush_pages(&vas);
+        flush_pages_in(self.root_pa(), &vas);
         if !vas.is_empty() {
             self.quiesce();
         }
@@ -767,7 +823,7 @@ impl PageTable {
                 }
             }
         }
-        flush_all();
+        flush_all_in(self.root_pa());
         self.quiesce();
         Ok(())
     }
@@ -985,7 +1041,7 @@ impl PageTable {
             }
             let p = if c.dirty { prot } else { prot & !PROT_WRITE };
             unsafe { *pte = make_pte(v2p(page as usize) as u64, p, false) };
-            flush_va(page_va);
+            flush_va_in(self.root_pa(), page_va);
             return Ok(());
         }
         if let (false, Backing::Pages { pages, off }) = (has_page(e), &back) {
@@ -994,7 +1050,7 @@ impl PageTable {
             let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::NoMap)?;
             kalloc::get(page);
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
-            flush_va(page_va);
+            flush_va_in(self.root_pa(), page_va);
             return Ok(());
         }
         if is_swap(e) {
@@ -1046,7 +1102,7 @@ impl PageTable {
                     sync_icache(page as usize, PGSIZE);
                 }
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
-                flush_va(page_va);
+                flush_va_in(self.root_pa(), page_va);
                 self.quiesce();
                 kalloc::put(old);
             } else {
@@ -1055,7 +1111,7 @@ impl PageTable {
         } else {
             unsafe { *pte = remake_pte(e, prot, shared) };
         }
-        flush_va(page_va);
+        flush_va_in(self.root_pa(), page_va);
         Ok(())
     }
 
@@ -1355,16 +1411,17 @@ impl PageTable {
                 }
             });
             if fail {
-                flush_all();
+                flush_all_in(self.root_pa());
                 return None;
             }
         }
-        flush_all();
+        flush_all_in(self.root_pa());
         self.quiesce();
         Some(new)
     }
 
     pub fn activate(&self) {
+        ACTIVE_ROOT[crate::smp::id()].store(self.root_pa(), Ordering::Relaxed);
         unsafe {
             core::arch::asm!(
                 "msr ttbr0_el1, {}",
