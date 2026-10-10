@@ -165,6 +165,18 @@ jobs:
           bin/mkpkg.sh "$DIR"
           ls -la repo/aarch64/*/"$NAME"-[0-9]*
 
+      - name: Why
+        if: failure()
+        continue-on-error: true
+        run: |
+          # しくじったとき: 落ちたもの (core) と、ninja のビルドならそこだけ 1 つずつやりなおした様子
+          sudo dmesg | tail -20 || true
+          coredumpctl info --no-pager 2>/dev/null | head -80 || true
+          b=build/makepkg/$NAME/src/build
+          if [ -f "$b/build.ninja" ]; then
+            ninja -C "$b" -j1 -v 2>&1 | head -40
+          fi
+
       - name: Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
