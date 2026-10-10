@@ -8,7 +8,7 @@
 #   test/vm.py keys ARG...         画面のキーボードで: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
-#   test/vm.py put LOCAL REMOTE    ファイルを中へ (シリアルで base64 に。4 MB まで)
+#   test/vm.py put LOCAL REMOTE    ファイルを中へ (256 KB までは gzip と base64 でシリアルから、大きいものは http と fetch で)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
 #   test/vm.py log [N]             シリアルの終わりの N 行 (既定 40)
 #   test/vm.py status / stop
@@ -58,6 +58,9 @@ class Serve:
         self.cv = threading.Condition()
         self.log = open(LOG, 'wb')
         self.http = subprocess.Popen([sys.executable, '-m', 'http.server', '8000', '-d', www], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if www else None
+        # put の大きなファイル: DIR/xfer を http://10.0.2.2:8001/ に出して、中の fetch で取る (シリアルより速い)
+        os.makedirs(DIR + '/xfer', exist_ok=True)
+        self.xfer = subprocess.Popen([sys.executable, '-m', 'http.server', '8001', '--bind', '127.0.0.1', '-d', DIR + '/xfer'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         m, s = pty.openpty()
         env = dict(os.environ)
         env.setdefault('AIOS_SSH', '0')
@@ -136,14 +139,16 @@ class Serve:
             text = text[text.find('\n', i) + 1:] if '\n' in text[i:] else ''
         return {'status': int(mm.group(1)), 'out': clean(text)}
 
-    def put(self, path, b64, timeout=600):
+    def put(self, path, b64, timeout=600, gz=False):
         # プロンプトで長い行を打つと、aish が 1 文字ごとに描きなおして遅いので、base64 -d を先に起こして、
         # その標準入力 (端末のふつうの行の入力) へ流しこむ。終わりは Ctrl-D
         import shlex
         tag = 'VMEND%d' % int(time.time() * 1000)
         with self.cv:
             self.buf = b''
-        os.write(self.m, ('base64 -d > %s; echo %s $?\r' % (shlex.quote(path), tag)).encode())
+        # gz: 縮めて送ったもの (シリアルは 1 秒に数十 KB なので)。gzip がなければ toybox の zcat で
+        dec = 'base64 -d | { gzip -dc 2>/dev/null || toybox zcat; }' if gz else 'base64 -d'
+        os.write(self.m, ('%s > %s; echo %s $?\r' % (dec, shlex.quote(path), tag)).encode())
         # 行を描き終わって base64 が動きだす (出力がしずかになる) まで待つ。決まった時間だけ待つと、
         # 重いときに中身が行の編集のほうへ入ってしまう (長い行は画面の幅で切って描くので、こだまの文字では待てない)
         time.sleep(0.3)
@@ -203,6 +208,7 @@ class Serve:
             time.sleep(2)
         if self.http:
             self.http.kill()
+        self.xfer.kill()
 
 
 def clean(t):
@@ -247,7 +253,11 @@ def serve(www):
                     cmd = '. /tmp/.vm-run.sh' if r.get('status') == 0 else cmd
                 r = vm.run(cmd, req.get('timeout', 600))
             elif op == 'put':
-                r = vm.put(req['path'], req['b64'])
+                r = vm.put(req['path'], req['b64'], gz=req.get('gz', False))
+            elif op == 'fetch':
+                # DIR/xfer/NAME (put が置いた大きなファイル) を中の fetch で取る
+                import shlex
+                r = vm.run('fetch http://10.0.2.2:8001/%s -o %s >/dev/null' % (req['name'], shlex.quote(req['path'])), 300)
             elif op == 'keys':
                 vm.keys(req.get('keys', []))
                 r = {'ok': True}
@@ -327,9 +337,20 @@ def main():
     elif op == 'put':
         import base64
         data = open(a[1], 'rb').read()
-        if len(data) > 4 << 20:
-            sys.exit('vm: put is for small files (4 MB)')
-        r = ask({'op': 'put', 'path': a[2], 'b64': base64.encodebytes(data).decode()})
+        if len(data) > 256 << 20:
+            sys.exit('vm: put is for files up to 256 MB')
+        import gzip
+        if len(data) > 256 << 10:
+            # 大きいもの: シリアルでは 1 秒に数十 KB なので、http で (DIR/xfer に置いて中の fetch で取る)
+            name = 'put-%d-%s' % (os.getpid(), os.path.basename(a[1]))
+            tmp = os.path.join(DIR, 'xfer', name)
+            open(tmp, 'wb').write(data)
+            try:
+                r = ask({'op': 'fetch', 'path': a[2], 'name': name})
+            finally:
+                os.unlink(tmp)
+        else:
+            r = ask({'op': 'put', 'path': a[2], 'b64': base64.encodebytes(gzip.compress(data, 6)).decode(), 'gz': True})
         if r.get('status') != 0:
             sys.exit('vm: put: %s' % json.dumps(r))
     elif op == 'mon':
