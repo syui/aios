@@ -60,10 +60,12 @@ jobs:
             if [ -z "$BEFORE" ] || [ -n "${BEFORE##*[!0]*}" ]; then
               names=  # ブランチを作った push (くらべるものがない)
             else
+              # ディレクトリを変えたものと、pkg/ci.json に新しく足したもの (ほかのもの、たとえば作っている途中の
+              # firefox をもう一度作らないように)。pkg.yml だけを変えたときは作らない (手で動かす)
               files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --paginate --jq '.files[].filename')
-              ci=$(printf '%s\n' "$files" | grep -qx 'pkg/ci.json\|.github/workflows/pkg.yml' && echo 1 || true)
+              old=$(gh api "repos/$GITHUB_REPOSITORY/contents/pkg/ci.json?ref=$BEFORE" --jq .content 2>/dev/null | base64 -d 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
               names=$(jq -r '.[] | "\(.name) \(.path)"' pkg/ci.json | while read -r n p; do
-                if [ -n "$ci" ] || printf '%s\n' "$files" | grep -q "^$p/"; then echo "$n"; fi
+                if printf '%s\n' "$files" | grep -q "^$p/" || ! printf '%s\n' "$old" | grep -qx "$n"; then echo "$n"; fi
               done)
             fi
             ;;
@@ -154,8 +156,9 @@ jobs:
 
       - name: Dependencies
         run: |
-          # c_deps のパッケージは ai/repo から (ソースから作らない)
-          deps=$(sed -n 's/^ *c_deps //p' "$DIR/PKGBUILD")
+          # c_deps のパッケージは ai/repo から (ソースから作らない)。meson_cross と cmake_cross は
+          # c_deps musl DEP... を呼ぶ (pkg/c/zig.sh)
+          deps=$(sed -n 's/^ *c_deps //p; s/^ *\(meson\|cmake\)_cross \(.*\)/musl \2/p' "$DIR/PKGBUILD" | tr ' ' '\n' | sort -u)
           [ -z "$deps" ] || bin/fetchpkg.sh c $deps
 
       - name: Build
