@@ -46,15 +46,27 @@ pub fn set_idle(on: bool) {
 
 /// 眠っている CPU を起こす (動けるプロセスができた)。sev ではなく割り込みで:
 /// Mac の Hypervisor.framework (HVF) では wfe が眠らず sev も届かないので、ひまな CPU は wfi で眠っている
-/// 眠っている CPU を起こす。起こしたものがあれば true
+/// 眠っている CPU を 1 つ起こす。起こしたものがあれば true
 pub fn wake_idle() -> bool {
+    wake_idle_n(1)
+}
+
+/// 眠っている CPU を n まで起こす (動けるようになったものの数だけ)。起こしたものがあれば true。
+/// みな起こすと、起きた CPU がいっせいに大きなロックを取りあい、1 つずつ表を見て「仕事がない」と眠りなおす
+/// あいだ、起こしたものが待たされる (QEMU の TCG で、起こしてから走るまでが 2.4 ms だった)
+pub fn wake_idle_n(n: usize) -> bool {
     let idle = IDLE.load(Ordering::Acquire) & !(1 << id());
+    let mut sent = 0;
     for cpu in 0..online() {
+        if sent >= n {
+            break;
+        }
         if idle & (1 << cpu) != 0 {
             crate::irq::send_ipi(unsafe { TARGET[cpu] });
+            sent += 1;
         }
     }
-    idle != 0
+    sent > 0
 }
 
 /// ほかの CPU に、EL0 から戻ってくるように知らせる (殺された、シグナルが来た)
@@ -305,9 +317,9 @@ pub fn account(cause: Cause, ns: u64, slept: bool) {
 }
 
 /// デバイスの終わりを回って待った回数と時間 (ns): 0 はディスク (virtio-blk)、1 は画面 (virtio-gpu)。
-/// 2 はスケジューラが次を選んでページ表を載せるまで (ロックを持ったまま)。
+/// 2 はスケジューラが次を選んでページ表を載せるまで (ロックを持ったまま)。3 は起こされてから走りだすまで (待ち時間)。
 /// 大きなロックを持ったまま待つものがどれだけあるかを /proc/bkl で見るため
-pub static DEV_WAIT: [(AtomicU64, AtomicU64); 3] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 3];
+pub static DEV_WAIT: [(AtomicU64, AtomicU64); 4] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 4];
 
 /// DEV_WAIT に 1 回分を足す
 pub fn dev_wait(i: usize, t0: u64) {
@@ -370,12 +382,12 @@ pub fn stats_json() -> alloc::string::String {
     }
     rows.sort_by_key(|r| core::cmp::Reverse(r.2));
     let top: Vec<String> = rows.iter().take(25).map(|(name, n, t)| format!("{{\"name\":\"{}\",\"n\":{},\"ms\":{:.1},\"avg_us\":{:.1}}}", name, n, ms(*t), *t as f64 / 1e3 / *n as f64)).collect();
-    let dev: Vec<String> = ["disk", "gpu", "sched"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
+    let dev: Vec<String> = ["disk", "gpu", "sched", "wake_to_run"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
     let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss"];
     let faults: Vec<String> = crate::vm::FAULT_KIND.iter().enumerate().skip(1).map(|(i, (n, t))| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", kinds[i], n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed)))).collect();
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "{{\"span_s\":{:.2},\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"cpus\":[{}],\"top\":[{}],\"dev\":{{{}}},\"faults\":{{{}}},\"fast_pipe\":{{\"ok\":{},\"shared_table\":{}}},\"fast_faults\":{},\"slept\":{}}}\n",
+        "{{\"span_s\":{:.2},\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"cpus\":[{}],\"top\":[{}],\"dev\":{{{}}},\"faults\":{{{}}},\"fast_pipe\":{{\"ok\":{},\"table_busy\":{}}},\"fast_faults\":{},\"slept\":{}}}\n",
         span as f64 / 1e9,
         pct(tw),
         pct(th),
@@ -436,7 +448,7 @@ pub fn stats() -> alloc::string::String {
         s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
 ", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
     }
-    for (i, name) in ["ディスク", "画面", "スケジューラ"].iter().enumerate() {
+    for (i, name) in ["ディスク", "画面", "スケジューラ", "起こされてから走るまで"].iter().enumerate() {
         let (n, t) = (DEV_WAIT[i].0.load(Ordering::Relaxed), DEV_WAIT[i].1.load(Ordering::Relaxed));
         s.push_str(&format!("デバイスを待った ({}): {} 回 {:.1} ms\n", name, n, ms(t)));
     }
@@ -446,7 +458,7 @@ pub fn stats() -> alloc::string::String {
     }
     s.push('\n');
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を分けている {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
+    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s
