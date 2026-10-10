@@ -26,7 +26,7 @@ const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","de
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "test" | "push")) {
+    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push")) {
         std::process::exit(cli(&args));
     }
     let spec = Spec {
@@ -36,6 +36,7 @@ fn main() {
         tools: &[
             Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ", input: BUILD },
+            Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。大きな tarball は時間がかかるので run の bg で aish-pkg edit NAME", input: EDIT },
@@ -61,6 +62,13 @@ fn main() {
                         return error("give name");
                     }
                     job(&mut jobs, &root, &format!("build-{}", n), &["build", n], a)
+                }
+                "pkg_fetch" => {
+                    let n = s(a, "name");
+                    if n.is_empty() || n.contains('/') {
+                        return error("give name");
+                    }
+                    job(&mut jobs, &root, &format!("fetch-{}", n), &["fetch", n], a)
                 }
                 "pkg_test" => {
                     let n = s(a, "name");
@@ -188,10 +196,23 @@ fn cli(args: &[String]) -> i32 {
     let root = root(None, "");
     let rest: Vec<String> = args[1..].iter().filter(|a| !a.starts_with("--")).cloned().collect();
     let r = match args[0].as_str() {
+        "check" if args.iter().any(|a| a == "--json") => {
+            // CI (.github/workflows/pkg.yml) が読む: 1 行の JSON {versions: [{name, now, latest, new}]}
+            let r = match up::check(&root.join("pkg"), &rest, false) {
+                Ok(rs) => json!({ "versions": rs.iter().map(|r| json!({ "name": r["name"], "now": r["pkgver"], "latest": r["latest"], "new": r["new"] == true, "error": r["error"] })).collect::<Vec<_>>() }),
+                Err(e) => error(e),
+            };
+            println!("{}", r);
+            return if r.get("error").is_some() { 1 } else { 0 };
+        }
         "check" => check(&root, &rest, args.iter().any(|a| a == "--all"), args.iter().any(|a| a == "--refresh")),
         "build" => match rest.first() {
             Some(n) => repo::build(&root, n).unwrap_or_else(error),
             None => error("aish-pkg build NAME"),
+        },
+        "fetch" => match rest.first() {
+            Some(n) => repo::fetch(&root, n).unwrap_or_else(error),
+            None => error("aish-pkg fetch NAME"),
         },
         "test" => match rest.first() {
             Some(n) => test::test(&root, n).unwrap_or_else(error),
@@ -203,7 +224,7 @@ fn cli(args: &[String]) -> i32 {
             None => error("aish-pkg edit NAME [VER]"),
         },
     };
-    if matches!(args[0].as_str(), "build" | "test" | "push") {
+    if matches!(args[0].as_str(), "build" | "fetch" | "test" | "push") {
         // うしろで動かしたとき (pkg_build / pkg_push)、最後の行を答えにする
         println!("{}", r);
     } else if let Some(t) = r["text"].as_str() {
