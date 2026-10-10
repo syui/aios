@@ -1,7 +1,7 @@
 # tmux: 端末をいくつにも分けて、つなぎなおせるようにする。静的なバイナリ 1 つ
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=tmux
-pkgver=3.7c
+pkgver=3.8
 pkgrel=1
 pkgdesc='Terminal multiplexer (static, for aios)'
 arch=('aarch64')
@@ -9,7 +9,7 @@ url='https://github.com/tmux/tmux'
 license=('ISC')
 depends=('ncurses')
 source=("https://github.com/tmux/tmux/releases/download/$pkgver/tmux-$pkgver.tar.gz")
-sha256sums=('7c60cae9a0e25288e2e24750aafc9e8800fc7fd4555e447e1b29ee4201cfb3bf')
+sha256sums=('e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e')
 
 prepare() {
   rm -rf "tmux-$pkgver"
