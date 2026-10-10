@@ -1,7 +1,7 @@
-diff --git a/crates/uv-python/python/get_interpreter_info.py b/crates/uv-python/python/get_interpreter_info.py
+diff --git a/crates/uv-python-interpreter/python/get_interpreter_info.py b/crates/uv-python-interpreter/python/get_interpreter_info.py
 index f45580b..bd01ac5 100644
---- a/crates/uv-python/python/get_interpreter_info.py
-+++ b/crates/uv-python/python/get_interpreter_info.py
+--- a/crates/uv-python-interpreter/python/get_interpreter_info.py
++++ b/crates/uv-python-interpreter/python/get_interpreter_info.py
 @@ -444,6 +444,11 @@ def get_operating_system_and_architecture():
          version = None
          architecture = version_arch

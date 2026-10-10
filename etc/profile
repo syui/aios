@@ -1,7 +1,8 @@
 # /etc/profile: ログインシェル (aish、sh、予備の bash = brush) が最初に読む
 # /opt/c/bin は C の拡張 ([c] のパッケージ、firefox など)。ログインのあとで aipkg -S で入れても
-# すぐ使えるように、まだなくても入れておく
-export PATH=/usr/local/bin:/usr/bin:/opt/c/bin
+# すぐ使えるように、まだなくても入れておく。~/.local/bin は uv (uv python install の python3.15、
+# uv tool install のもの) や pip --user が置くところ (XDG。Arch などの多くのディストリと同じく、先に)
+export PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/opt/c/bin
 umask 022
 # プロンプト (bash = brush 用。aish は /etc/aishrc の powerline のプロンプトにする)。[ユーザー@ホスト ディレクトリ]$
 PS1='[\u@\h \W]\$ '
