@@ -1497,11 +1497,20 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     if pipe_of(fd_in).is_none() && pipe_of(fd_out).is_none() {
         return Err(-EINVAL);
     }
-    let mut tmp = vec![0u8; len.min(64 * 1024)];
-    // パイプからは読み減らさずに見て、書けた分だけ取る (書けなければパイプに残す。Linux と同じ)
     let pin = pipe_of(fd_in);
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    // パイプ → /dev/null: 写さずに捨てるだけ (cat FILE > /dev/null は、ファイル → パイプ → /dev/null の 2 回)
+    if let Some(p) = &pin
+        && off_out == 0
+        && matches!(file_of(fd_out)?.borrow().kind, Kind::Null)
+    {
+        return Ok(Pipe::discard(p, len.min(64 * 1024), nonblock)? as i64);
+    }
+    // 中身を 0 にしない (読んだ分だけ使う)。ロックを持ったまま 64 KB を 0 で埋めるのは高い
+    let mut tmp = uninit(len.min(64 * 1024));
+    // パイプからは読み減らさずに見て、書けた分だけ取る (書けなければパイプに残す。Linux と同じ)
     let n = match (pin.clone(), off_in) {
-        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, true, flags & SPLICE_F_NONBLOCK != 0)?,
+        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, true, nonblock)?,
         (None, 0) => file::read(&file_of(fd_in)?, &mut tmp)?,
         (None, at) => {
             let off = read_off(at)?;
@@ -1533,8 +1542,9 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
         }
         done
     };
+    // 書けた分を読み減らす (もう見たので、写さずに捨てる)
     if let Some(p) = pin {
-        let _ = Pipe::read_ex(&p, &mut tmp[..done], false, true);
+        let _ = Pipe::discard(&p, done, true);
     }
     Ok(done as i64)
 }
@@ -1552,7 +1562,7 @@ pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
         let o = pout.borrow();
         o.cap.saturating_sub(o.len())
     };
-    let mut tmp = vec![0u8; len.min(room).min(64 * 1024)];
+    let mut tmp = uninit(len.min(room).min(64 * 1024));
     if tmp.is_empty() {
         return Err(-11); // EAGAIN
     }

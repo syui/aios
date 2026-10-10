@@ -1098,6 +1098,28 @@ impl Pipe {
         }
     }
 
+    /// read_ex と同じく待つが、写さずに n バイトまで捨てる (splice の読み減らしと、/dev/null へ)
+    pub fn discard(p: &Rc<PipeCell>, n: usize, nonblock: bool) -> Result<usize, i64> {
+        loop {
+            let mut pp = p.borrow_mut();
+            if pp.data.len > 0 {
+                let k = n.min(pp.data.len);
+                pp.data.skip(k);
+                pp.taken += k as u64;
+                drop(pp);
+                Pipe::wake(p);
+                return Ok(k);
+            }
+            if pp.writers == 0 {
+                return Ok(0);
+            }
+            if nonblock {
+                return Err(-11); // EAGAIN
+            }
+            Pipe::sleep(p, pp)?;
+        }
+    }
+
     /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN
     fn write(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut done = 0;

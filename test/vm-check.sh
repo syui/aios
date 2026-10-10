@@ -21,7 +21,8 @@ eq() {
 }
 
 # /sys: ディスク (大きさは /proc/partitions と同じか)、ネットワーク、CPU
-disk=$(ls /sys/block | head -1)
+# ls は使わない (/etc/aishrc の alias ls='ls -a' で . と .. も出る)
+for d in /sys/block/*; do disk=${d##*/}; break; done
 t sys-block-size test "$(cat /sys/block/$disk/size)" -gt 0
 t sys-block-part test -n "$(ls /sys/block/$disk | grep "^$disk")"
 t sys-block-stat test "$(wc -w < /sys/block/$disk/stat)" -eq 11

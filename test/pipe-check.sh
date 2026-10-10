@@ -4,6 +4,10 @@ f=0; c() { if eval "$1" >/dev/null 2>&1; then echo "ok $2"; else echo "FAIL $2";
 a=$(seq 1 200000 | sha256sum | cut -c1-16)
 c '[ "$(seq 1 200000 | cat | cat | cat | sha256sum | cut -c1-16)" = "$a" ]' chain
 c '[ "$(seq 1 200000 | dd bs=7 2>/dev/null | dd bs=65536 2>/dev/null | sha256sum | cut -c1-16)" = "$a" ]' dd-sizes
+# splice (uutils の cat): パイプ → /dev/null は写さずに捨てる、ファイル → パイプ → /dev/null、パイプ → パイプの数
+c '[ "$(seq 1 200000 | cat > /dev/null; echo $?)" = 0 ]' splice-null
+c 'seq 1 200000 > /tmp/.pc; cat /tmp/.pc > /dev/null && [ "$(cat /tmp/.pc | sha256sum | cut -c1-16)" = "$a" ]' splice-file
+c '[ "$(seq 1 200000 | cat | wc -c)" = "$(seq 1 200000 | wc -c)" ]' splice-count
 b=$(seq 1 200000 | wc -c)
 c '[ "$( (seq 1 50000 & seq 50001 100000 & seq 100001 150000 & seq 150001 200000 & wait) | wc -lc | tr -s " ")" = "$(echo " 200000 $b")" ]' four-writers
 c '[ "$(head -c 3000000 /dev/zero | wc -c)" = 3000000 ]' big
