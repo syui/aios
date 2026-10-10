@@ -658,7 +658,7 @@ impl Drop for OpenFile {
 pub const PIPE_SIZE: usize = 64 * 1024;
 
 /// 大きなロックなしの read/write (Pipe::fast_rw) の数: [0] はうまくいったもの、ほかはふつうの道へ行ったわけ
-/// (2 大きさ、3 fd の表を分けている、4 パイプでない、5 6 7 ... は fast_rw_inner を見よ)。/proc/bkl に出す
+/// (2 大きさ、3 fd の表をほかのスレッドが変えている途中、4 パイプでない、5 6 7 ... は fast_rw_inner を見よ)。/proc/bkl に出す
 pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
@@ -991,7 +991,7 @@ impl Pipe {
     }
 
     /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らずにすむときだけ。ほかは None で
-    /// ふつうの道へ: fd の表をほかのスレッドと分けている、読むのに中身がない、書くのに全部は入らない・
+    /// ふつうの道へ: fd の表をほかのスレッドが変えている途中、読むのに中身がない、書くのに全部は入らない・
     /// 読み手がいない、ユーザーのメモリが写っていない (ページフォルトになる)。
     /// 眠っている人や poll / epoll で待っている人がいれば、起こすのは大きなロックを持つ CPU に頼む (smp::defer_wake)
     pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
@@ -1006,9 +1006,9 @@ impl Pipe {
             return Err(2);
         }
         let files = me.files.as_ref().ok_or(3usize)?;
-        if !files.private() {
-            return Err(3);
-        }
+        // ほかのスレッドと分けている表なら、門 (proc::Gate) を通って見る: 見ているあいだは、ほかの CPU が
+        // fd を閉じたり表を伸ばしたりしない (変える側が待つ)。だれかが変えている途中ならふつうの道へ
+        let _gate = if files.private() { None } else { Some(files.get().gate.read().ok_or(3usize)?) };
         let f = files.get().get(fd).ok_or(4usize)?;
         // ほかのプロセス (fork で分けた) が大きなロックの中で借りているかもしれないので、借りずに見る。
         // パイプの口の種類はあとで変わらない

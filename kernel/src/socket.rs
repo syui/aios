@@ -502,7 +502,7 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
     let files = proc::current().files();
     let fa = files.add(file::new(a, flags), cloexec, 0).ok_or(-EMFILE)?;
     let Some(fb) = files.add(file::new(b, flags), cloexec, 0) else {
-        files.fds[fa] = None;
+        files.set(fa, None);
         return Err(-EMFILE);
     };
     let mut v = [0u8; 8];
@@ -510,8 +510,8 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
     v[4..].copy_from_slice(&(fb as i32).to_le_bytes());
     if proc::current().pt().copy_out(sv, &v).is_none() {
         let files = proc::current().files();
-        files.fds[fa] = None;
-        files.fds[fb] = None;
+        files.set(fa, None);
+        files.set(fb, None);
         return Err(-EFAULT);
     }
     Ok(0)

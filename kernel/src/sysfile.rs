@@ -469,13 +469,13 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
 
 pub fn close(fd: u64) -> R {
     let p = proc::current().files();
-    match p.fds.get_mut(fd as usize) {
-        Some(f @ Some(_)) => {
-            *f = None;
-            Ok(0)
-        }
-        _ => Err(-EBADF),
+    if p.get(fd).is_none() {
+        return Err(-EBADF);
     }
+    // 閉じたもの (最後の参照なら OpenFile も) は、表を変え終わってから落とす
+    let old = p.set(fd as usize, None);
+    drop(old);
+    Ok(0)
 }
 
 pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
@@ -1015,10 +1015,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
     if new >= p.nofile {
         return Err(-EBADF);
     }
-    if p.fds.len() <= new {
-        p.fds.resize(new + 1, None);
-    }
-    p.fds[new] = Some(Fd { file: f, cloexec: flags & O_CLOEXEC != 0 });
+    p.set(new, Some(Fd { file: f, cloexec: flags & O_CLOEXEC != 0 }));
     Ok(new as i64)
 }
 
@@ -1096,15 +1093,15 @@ pub fn pipe2(fds: usize, flags: u64) -> R {
     let p = proc::current().files();
     let rfd = p.add(file::new(r, file::O_RDONLY | nb), cloexec, 0).ok_or(-EMFILE)?;
     let Some(wfd) = p.add(file::new(w, file::O_WRONLY | nb), cloexec, 0) else {
-        p.fds[rfd] = None;
+        p.set(rfd, None);
         return Err(-EMFILE);
     };
     let mut b = [0u8; 8];
     b[..4].copy_from_slice(&(rfd as i32).to_le_bytes());
     b[4..].copy_from_slice(&(wfd as i32).to_le_bytes());
     if let Err(e) = out(fds, &b) {
-        p.fds[rfd] = None;
-        p.fds[wfd] = None;
+        p.set(rfd, None);
+        p.set(wfd, None);
         return Err(e);
     }
     Ok(0)
@@ -1635,7 +1632,7 @@ pub fn close_range(first: u64, last: u64, flags: u64) -> R {
                 f.cloexec = true;
             }
         } else {
-            files.fds[i] = None;
+            files.set(i, None);
         }
     }
     Ok(0)

@@ -98,9 +98,83 @@ pub struct Files {
     pub nofile: usize,
     /// 作るファイルの mode から外すもの (umask。fork で受けつぐ。Linux の fs_struct と同じくスレッドで共有)
     pub umask: u32,
+    /// 大きなロックなしの read / write (file::Pipe::fast_rw) が、ほかのスレッドと分けている表を見るための門
+    pub gate: Gate,
+}
+
+/// 表を大きなロックなしで見ている数 (users) と、変えている数 (mutators)。見る側は users を増やしてから
+/// mutators を見て、0 でなければやめる。変える側 (大きなロックの中) は mutators を増やしてから users が 0 に
+/// なるのを待つ。どちらかがかならず相手に気づくので、見ているあいだに fd が閉じられて OpenFile が消えたり、
+/// 表が伸びて場所が変わったりしない (vm.rs の fast_fault と同じ形)
+#[derive(Default)]
+pub struct Gate {
+    users: core::sync::atomic::AtomicUsize,
+    mutators: core::sync::atomic::AtomicUsize,
+}
+
+impl Clone for Gate {
+    // 写した表は別の表なので、数は 0 から
+    fn clone(&self) -> Self {
+        Gate::default()
+    }
+}
+
+/// 変えているあいだ (落とすと mutators を戻す)
+pub struct GateWrite(*const Gate);
+
+impl Drop for GateWrite {
+    fn drop(&mut self) {
+        unsafe { (*self.0).mutators.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) };
+    }
+}
+
+/// 大きなロックなしで見ているあいだ (落とすと users を戻す)
+pub struct GateRead<'a>(&'a Gate);
+
+impl Drop for GateRead<'_> {
+    fn drop(&mut self) {
+        self.0.users.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Gate {
+    /// 変える (大きなロックの中で)。見ている人がいなくなるまで待つ
+    fn write(&self) -> GateWrite {
+        use core::sync::atomic::{Ordering::SeqCst, fence};
+        self.mutators.fetch_add(1, SeqCst);
+        fence(SeqCst);
+        while self.users.load(SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        GateWrite(self)
+    }
+
+    /// 大きなロックなしで見る。だれかが変えている途中なら None (ふつうの道へ)
+    pub fn read(&self) -> Option<GateRead<'_>> {
+        use core::sync::atomic::{Ordering::SeqCst, fence};
+        self.users.fetch_add(1, SeqCst);
+        fence(SeqCst);
+        if self.mutators.load(SeqCst) != 0 {
+            self.users.fetch_sub(1, SeqCst);
+            return None;
+        }
+        Some(GateRead(self))
+    }
 }
 
 impl Files {
+    /// fd i を v にする (表を伸ばすことも)。もとのものを返す。表を変えるのはこれと add だけ (gate のため)
+    pub fn set(&mut self, i: usize, v: Option<Fd>) -> Option<Fd> {
+        let _w = self.gate.write();
+        if self.fds.len() <= i {
+            if v.is_none() {
+                return None;
+            }
+            self.fds.resize(i + 1, None);
+        }
+        core::mem::replace(&mut self.fds[i], v)
+    }
+
     pub fn get(&self, fd: u64) -> Option<&FileRef> {
         self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
     }
@@ -108,10 +182,7 @@ impl Files {
     /// minfd 以上で空いている一番小さい fd に置く
     pub fn add(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
         let i = (minfd..self.nofile).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
-        if self.fds.len() <= i {
-            self.fds.resize(i + 1, None);
-        }
-        self.fds[i] = Some(Fd { file, cloexec });
+        self.set(i, Some(Fd { file, cloexec }));
         Some(i)
     }
 }
@@ -199,6 +270,8 @@ pub struct Proc {
     pub nrun: u64,
     /// 眠りはじめた tick (/proc/ai/threads の slept_s。どれだけ眠りつづけているか)
     pub slept_at: u64,
+    /// 起こされた時刻 (ns、走りだしたら 0)。起こされてから走るまで (/proc/bkl の「起こされてから走るまで」)
+    woken_ns: u64,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
     pub yielded: bool,
     /// いま走りはじめてから来たタイマの割り込みの数。タイムスライス (sysctl kernel.sched_timeslice_ms) に
@@ -271,6 +344,7 @@ impl Proc {
         recent: 0,
         nrun: 0,
         slept_at: 0,
+        woken_ns: 0,
         yielded: false,
         slice: 0,
         cutime: 0,
@@ -614,7 +688,7 @@ pub fn user_init() {
     }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
-    let mut files = Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022 };
+    let mut files = Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default() };
     let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);
@@ -722,6 +796,10 @@ pub fn scheduler() -> ! {
             let p = &mut procs()[i];
             p.state = State::Running;
             p.nrun += 1;
+            if p.woken_ns != 0 {
+                crate::smp::dev_wait(3, p.woken_ns);
+                p.woken_ns = 0;
+            }
             p.yielded = false;
             p.slice = 0;
             // 前の印は、選びなおしたので要らない
@@ -827,13 +905,14 @@ fn wake_where(f: impl Fn(&Proc) -> bool) -> usize {
     for p in live() {
         if p.state == State::Sleeping && f(p) {
             p.state = State::Runnable;
+            p.woken_ns = crate::timer::uptime_ns();
             woken = woken.min(p.recent);
             n += 1;
         } else if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
             busiest = Some((p.recent, p.cpu));
         }
     }
-    if n > 0 && !crate::smp::wake_idle() {
+    if n > 0 && !crate::smp::wake_idle_n(n) {
         if let Some((r, cpu)) = busiest {
             preempt(woken, r, cpu);
         }
