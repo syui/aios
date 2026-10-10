@@ -695,6 +695,15 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             _ => return false,
         },
+        // ページキャッシュから読む pread64、ファイル → パイプ・パイプ → /dev/null の splice (眠らないもの)
+        PREAD64 => match crate::file::fast_pread(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
+            Some(r) => r,
+            None => return false,
+        },
+        SPLICE => match crate::file::fast_splice(p, a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize) {
+            Some(r) => r,
+            None => return false,
+        },
         // パイプの読み書きで、眠らず起こさずにすむもの (file::Pipe::fast_rw)
         READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, a[8] == WRITE)
             .or_else(|| if a[8] == READ { crate::file::fast_read_file(p, a[0], a[1] as usize, a[2] as usize) } else { None })

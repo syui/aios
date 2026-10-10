@@ -224,6 +224,29 @@ pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: u
     Some(n)
 }
 
+/// 大きなロックなしで、ページキャッシュの off から len バイト (ファイルの終わりまで) を f に渡す
+/// (syscall::fast の splice: ファイル → パイプ)。ページが全部表にあるときだけ、表のロックを持ったまま
+/// f(ページの切れはしの並び) を呼ぶ。f が false なら None。ファイルの終わりより先なら Some(0)
+pub fn with_cached(id: (usize, u64), off: usize, len: usize, f: impl FnOnce(&[&[u8]]) -> bool) -> Option<usize> {
+    let c = PRIV.lock();
+    let size = c.get(&(id.0, id.1, off / PGSIZE))?.ver.1 as usize;
+    if off >= size {
+        return Some(0);
+    }
+    let n = len.min(size - off);
+    let mut parts: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(n / PGSIZE + 2);
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let po = pos % PGSIZE;
+        let k = (PGSIZE - po).min(n - done);
+        let p = c.get(&(id.0, id.1, pos / PGSIZE))?;
+        parts.push(unsafe { core::slice::from_raw_parts(p.page.add(po), k) });
+        done += k;
+    }
+    if f(&parts) { Some(n) } else { None }
+}
+
 /// 表にある、版が ver のページ (参照をひとつ足して)。ロックなしでも呼べる
 fn cached_page(key: &FileKey, ver: (u64, u64)) -> Option<*mut u8> {
     let c = PRIV.lock();
