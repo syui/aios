@@ -1,0 +1,177 @@
+# pkg: 手元で作るには重いパッケージ (一覧は pkg/ci.json) をここで作り、GitHub のリリース NAME-VER-REL に置く。
+# ai/repo へ入れるのは手元で aish-pkg fetch NAME → test → push (ai/repo の署名の鍵を GitHub に置かないため)。
+#   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
+#   どれも、そのリリースがもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
+#   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分)
+name: pkg
+
+on:
+  schedule:
+  - cron: '17 3 * * *'
+  push:
+    branches:
+    - unix
+    paths:
+    - 'pkg/ci.json'
+    - 'pkg/c/**'
+    - 'pkg/rust/**'
+    - 'pkg/desktop/**'
+    - '.github/workflows/pkg.yml'
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'パッケージ (空なら pkg/ci.json の全部)'
+        required: false
+        default: ''
+      latest:
+        description: '配布元の最新の版にする (しなければ PKGBUILD の版)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.v.outputs.matrix }}
+      any: ${{ steps.v.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Versions
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          NAME: ${{ inputs.name }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          # どれを作るか: push は変えたファイルのあるもの、schedule は全部 (最新の版で)、手では name (空なら全部)
+          names=$(jq -r '.[].name' pkg/ci.json)
+          bump=false
+          case $EVENT in
+          push)
+            if [ -z "$BEFORE" ] || [ -n "${BEFORE##*[!0]*}" ]; then
+              names=  # ブランチを作った push (くらべるものがない)
+            else
+              files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --paginate --jq '.files[].filename')
+              ci=$(printf '%s\n' "$files" | grep -qx 'pkg/ci.json\|.github/workflows/pkg.yml' && echo 1 || true)
+              names=$(jq -r '.[] | "\(.name) \(.path)"' pkg/ci.json | while read -r n p; do
+                if [ -n "$ci" ] || printf '%s\n' "$files" | grep -q "^$p/"; then echo "$n"; fi
+              done)
+            fi
+            ;;
+          schedule) bump=true ;;
+          *) [ -n "$NAME" ] && names=$NAME; [ "$LATEST" = true ] && bump=true ;;
+          esac
+          latest='{"versions":[]}'
+          if [ "$bump" = true ] && [ -n "$names" ]; then
+            # aish-pkg はこのマシンのもの (shell/.cargo/config.toml の既定は aios の aarch64 musl)
+            host=$(rustc -vV | sed -n 's/^host: //p')
+            (cd shell && cargo build -q --release -p aish-pkg --target "$host")
+            latest=$(shell/target/$host/release/aish-pkg check --json $names)
+          fi
+          echo "names: $(echo $names), latest: $latest"
+          m='[]'
+          for n in $names; do
+            e=$(jq -c --arg n "$n" '.[] | select(.name == $n)' pkg/ci.json)
+            [ -n "$e" ] || { echo "$n is not in pkg/ci.json"; exit 1; }
+            p=$(echo "$e" | jq -r .path)/PKGBUILD
+            ver=$(sed -n 's/^pkgver=//p' "$p")
+            rel=$(sed -n 's/^pkgrel=//p' "$p")
+            new=$(echo "$latest" | jq -r --arg n "$n" '.versions[] | select(.name == $n and .new) | .latest')
+            edit=false
+            if [ -n "$new" ]; then
+              case $new in [0-9]*) ;; *) echo "$n: bad version $new"; exit 1 ;; esac
+              ver=$new rel=1 edit=true
+            fi
+            tag=$n-$ver-$rel
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$tag: already released"
+              continue
+            fi
+            echo "$tag: build"
+            m=$(echo "$m" | jq -c --argjson e "$e" --arg ver "$ver" --arg rel "$rel" --argjson edit $edit '. + [$e + {ver: $ver, rel: $rel, edit: $edit}]')
+          done
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "any=$([ "$m" = '[]' ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.any == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    concurrency:
+      group: pkg-${{ matrix.name }}
+      cancel-in-progress: false
+    env:
+      NAME: ${{ matrix.name }}
+      DIR: ${{ matrix.path }}
+      VER: ${{ matrix.ver }}
+      REL: ${{ matrix.rel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free disk
+        if: matrix.free_disk
+        run: |
+          df -h /
+          # 使わない大きなもの (あれば) を消す
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Tools
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          bin/setup-build.sh ${{ matrix.setup }}
+
+      - name: Version
+        if: matrix.edit
+        run: |
+          # 配布元の新しい版: aish-pkg edit で pkgver、pkgrel、sha256sums を書きかえる
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          (cd shell && cargo build -q --release -p aish-pkg --target "$host")
+          shell/target/$host/release/aish-pkg edit "$NAME" "$VER"
+          grep -E '^(pkgver|pkgrel|sha256sums)=' "$DIR/PKGBUILD"
+
+      - name: Dependencies
+        run: |
+          # c_deps のパッケージは ai/repo から (ソースから作らない)
+          deps=$(sed -n 's/^ *c_deps //p' "$DIR/PKGBUILD")
+          [ -z "$deps" ] || bin/fetchpkg.sh c $deps
+
+      - name: Build
+        run: |
+          git config user.name ai
+          git config user.email ai@syui.ai
+          bin/mkpkg.sh "$DIR"
+          ls -la repo/aarch64/*/"$NAME"-[0-9]*
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$NAME-$VER-$REL
+          mkdir release
+          cp repo/aarch64/$(basename "$(dirname "$DIR")")/$tag-aarch64.pkg.tar.zst release/
+          cp "$DIR/PKGBUILD" release/PKGBUILD
+          sha256sum release/* > release/SHA256SUMS
+          printf 'aios の %s (aarch64)。ai/repo にはまだ入っていない (手元で aish-pkg fetch %s → test → push)\n' "$tag" "$NAME" > notes.md
+          gh release create "$tag" release/* --title "$tag" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
