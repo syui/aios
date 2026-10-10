@@ -51,6 +51,8 @@ SH
   printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$tc/ranlib"
   chmod 755 "$tc/ar" "$tc/ranlib"
   unset CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS CPPFLAGS
+  # CMAKE_LINK_DEPENDS_USE_LINKER=OFF: 新しい cmake (3.31 など) はリンクに -Xlinker --dependency-file=... を付けるが、
+  # zig 0.16.0 はそれで落ちる (Segmentation fault。llvm-min-tblgen のリンク)
   cmake -S "llvm-project-$pkgver.src/llvm" -B build -G Ninja \
     -DCMAKE_SYSTEM_NAME=Linux \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
@@ -62,6 +64,7 @@ SH
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DCMAKE_SHARED_LINKER_FLAGS=-s \
     -DCMAKE_EXE_LINKER_FLAGS=-s \
+    -DCMAKE_LINK_DEPENDS_USE_LINKER=OFF \
     -DCROSS_TOOLCHAIN_FLAGS_NATIVE="-DCMAKE_C_COMPILER=clang-$_host_llvm;-DCMAKE_CXX_COMPILER=clang++-$_host_llvm;-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
     -DLLVM_HOST_TRIPLE=aarch64-unknown-linux-musl \
     -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-unknown-linux-musl \
