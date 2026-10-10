@@ -57,6 +57,23 @@ int main(void) {
     chmod(c, 0755);
     CHECK("perm-again", st(cf, 0) == 0);
   }
+  // 2 段上が変わる: base/d1/d2/f を覚えてから d1 の名前を変える、d1 の x を外す
+  {
+    char d1[128], d2[128], df[128], e1[128], ef[128];
+    snprintf(d1, sizeof d1, "%s/d1", base); snprintf(d2, sizeof d2, "%s/d1/d2", base); snprintf(df, sizeof df, "%s/d1/d2/f", base);
+    snprintf(e1, sizeof e1, "%s/e1", base); snprintf(ef, sizeof ef, "%s/e1/d2/f", base);
+    mkdir(d1, 0755); mkdir(d2, 0755); touch(df);
+    CHECK("deep-cached", st(df, 0) == 0);
+    rename(d1, e1);
+    CHECK("deep-rename-gone", st(df, 0) == -ENOENT);
+    CHECK("deep-rename-there", st(ef, 0) == 0);
+    if (getuid() != 0) {
+      chmod(e1, 0644);
+      CHECK("deep-perm-denied", st(ef, 0) == -EACCES);
+      chmod(e1, 0755);
+    }
+    unlink(ef); snprintf(d2, sizeof d2, "%s/e1/d2", base); rmdir(d2); rmdir(e1);
+  }
   // 開いたまま消したものは、消したあと名前では引けない
   int fd = open(f1, O_RDONLY);
   st(f1, 0);

@@ -832,6 +832,120 @@ pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option
     Some(n as i64)
 }
 
+/// 大きなロックなしの pread64 (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部
+/// あるとき。オフセットを動かさないので、fd の表をほかのスレッドと分けていても (門を通って) 読める
+pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
+    const MAX: usize = 256 * 1024;
+    if len == 0 || len > MAX || off < 0 || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let f = files.get().get(fd)?;
+    // ほかのプロセス (fork で分けた) が大きなロックの中で借りているかもしれないので、借りずに見る。
+    // 開いたファイルの種類と口 (flags の読み書き) はあとで変わらない
+    let of = unsafe { &*f.as_ptr() };
+    if of.flags & O_ACCMODE == O_WRONLY {
+        return None;
+    }
+    let Kind::Inode(ino, _) = &of.kind else { return None };
+    if !ino.page_cacheable() {
+        return None;
+    }
+    crate::vm::read_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)
+}
+
+/// 大きなロックなしの splice (syscall::fast)。uutils の cat は、ファイル → (自分で作った) パイプ → 出力 と
+/// 2 回 splice する。眠らずにすむものだけ:
+///   パイプ → /dev/null: パイプのロックだけで捨てる (中身があるとき)
+///   ext4 のファイル → パイプ: 読むところがページキャッシュに全部あり、パイプに全部入るとき (半分だけ
+///   入れることはしない)。オフセットは off_in (ユーザーのメモリ) か、だれとも分けていない開いたファイルの
+/// ほかは None でふつうの道へ
+pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize) -> Option<i64> {
+    if len == 0 || off_out != 0 {
+        return None;
+    }
+    let len = len.min(64 * 1024);
+    let files = me.files.as_ref()?;
+    let private = files.private();
+    let _gate = if private { None } else { Some(files.get().gate.read()?) };
+    let fi = files.get().get(fd_in)?;
+    let fo = files.get().get(fd_out)?;
+    let (ofi, ofo) = unsafe { (&mut *fi.as_ptr(), &*fo.as_ptr()) };
+    let wake = |p: &Rc<PipeCell>| {
+        FAST_RW[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::smp::defer_wake(Rc::as_ptr(p) as usize);
+    };
+    match (&ofi.kind, &ofo.kind) {
+        (Kind::PipeRead(p), Kind::Null) if off_in == 0 => {
+            let mut pp = p.borrow_mut();
+            if pp.data.len == 0 {
+                return None;
+            }
+            let k = len.min(pp.data.len);
+            pp.data.skip(k);
+            pp.taken += k as u64;
+            let w = pp.sleepers > 0 || pp.watchers > 0 || pp.epolled;
+            drop(pp);
+            if w {
+                wake(p);
+            }
+            Some(k as i64)
+        }
+        (Kind::Inode(ino, _), Kind::PipeWrite(p)) => {
+            if ofi.flags & O_ACCMODE == O_WRONLY || !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)
+            let off = if off_in != 0 {
+                let mut b = [0u8; 8];
+                if !me.pt().copy_in_nofault(off_in, &mut b) {
+                    return None;
+                }
+                let o = i64::from_le_bytes(b);
+                if o < 0 {
+                    return None;
+                }
+                o as usize
+            } else {
+                if !private || Rc::strong_count(fi) != 1 {
+                    return None;
+                }
+                ofi.offset
+            };
+            let mut woke = false;
+            let n = crate::vm::with_cached(ino.id(), off, len, |parts| {
+                let total: usize = parts.iter().map(|x| x.len()).sum();
+                let mut pp = p.borrow_mut();
+                if pp.readers == 0 || pp.cap.saturating_sub(pp.data.len) < total {
+                    return false;
+                }
+                if off_in != 0 && !me.pt().copy_out_nofault(off_in, &((off + total) as i64).to_le_bytes()) {
+                    return false;
+                }
+                for x in parts {
+                    if pp.data.push_all(x).is_err() {
+                        // ページがとれなかった: 入れた分はそのまま (大きなロックの道でも同じく途中までになる)
+                        break;
+                    }
+                }
+                pp.generation += 1;
+                pp.wrote += total as u64;
+                woke = pp.sleepers > 0 || pp.watchers > 0 || pp.epolled;
+                true
+            })?;
+            if off_in == 0 {
+                ofi.offset = off + n;
+            }
+            if woke {
+                wake(p);
+            }
+            Some(n as i64)
+        }
+        _ => None,
+    }
+}
+
 /// パイプ (key はその PipeCell の場所) で眠っているもの、poll / epoll で待っているものを起こす (大きなロックを持って)
 pub fn wake_key(key: usize) {
     proc::wakeup(key);

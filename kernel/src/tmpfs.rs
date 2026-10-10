@@ -372,7 +372,7 @@ impl Inode for TmpInode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
         let mode = node.type_bits() | (mode & 0o7777);
         let node = match node {
             NewNode::File => Node::File(Data::Owned(Pages::new())),
@@ -388,7 +388,7 @@ impl Inode for TmpInode {
     }
 
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
         let t = TmpInode::downcast(target, self.fs)?;
         if matches!(*t.node.borrow(), Node::Dir(_)) {
             return Err(-EPERM);
@@ -399,7 +399,7 @@ impl Inode for TmpInode {
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
         let child = self.with_dir(|m| m.get(name).cloned().ok_or(-ENOENT))?;
         let is_dir = match &*child.node.borrow() {
             Node::Dir(m) if rmdir && !m.is_empty() => return Err(-ENOTEMPTY),
@@ -422,7 +422,8 @@ impl Inode for TmpInode {
     }
 
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
+        crate::vfs::dir_changed(newdir.id());
         let nd = TmpInode::downcast(newdir, self.fs)?;
         let child = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
         let is_dir = matches!(*child.node.borrow(), Node::Dir(_));
@@ -445,7 +446,7 @@ impl Inode for TmpInode {
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
         let mut a = self.attr.borrow_mut();
         a.mode = (a.mode & S_IFMT) | (mode & 0o7777);
         a.ctime = now();
@@ -453,7 +454,7 @@ impl Inode for TmpInode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
-        crate::vfs::names_changed();
+        crate::vfs::dir_changed(self.id());
         let mut a = self.attr.borrow_mut();
         if let Some(u) = uid {
             a.uid = u;
