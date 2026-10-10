@@ -2098,6 +2098,10 @@ impl Inode for ExtInode {
         }
     }
 
+    fn path_cacheable(&self) -> bool {
+        true
+    }
+
     fn page_cacheable(&self) -> bool {
         true
     }
@@ -2208,10 +2212,12 @@ impl Inode for ExtInode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
+        crate::vfs::names_changed();
         self.write_op(|| self.create_node(name, mode, node))
     }
 
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
+        crate::vfs::names_changed();
         self.write_op(|| {
             self.dir_only()?;
             let t = self.other(target)?;
@@ -2229,14 +2235,17 @@ impl Inode for ExtInode {
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
+        crate::vfs::names_changed();
         self.write_op(|| self.unlink_node(name, rmdir))
     }
 
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        crate::vfs::names_changed();
         self.write_op(|| self.rename_node(old, newdir, new))
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {
+        crate::vfs::names_changed();
         self.write_op(|| {
             self.update(|r| {
                 let m = (r.mode() & S_IFMT) | (mode & 0o7777);
@@ -2247,6 +2256,7 @@ impl Inode for ExtInode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        crate::vfs::names_changed();
         self.write_op(|| {
             self.update(|r| {
                 if let Some(u) = uid {

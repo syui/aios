@@ -95,6 +95,10 @@ pub trait Inode {
     fn page_cacheable(&self) -> bool {
         false
     }
+    /// パスの答えを覚えてよいか (名前が勝手に変わらないもの: ext4、tmpfs)。変えるときは names_changed() を呼ぶこと
+    fn path_cacheable(&self) -> bool {
+        false
+    }
     fn truncate(&self, len: usize) -> Result<(), i64>;
     fn readlink(&self) -> Result<String, i64>;
 
@@ -160,6 +164,7 @@ pub fn new_fs_id() -> usize {
 }
 
 pub fn set_root(r: InodeRef, source: &str, fstype: &str) {
+    names_changed();
     unsafe {
         *(&raw mut ROOT) = Some(r);
         *(&raw mut ROOT_INFO) = (source.into(), fstype.into());
@@ -233,6 +238,7 @@ pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bo
         return Err(-ENOTDIR);
     }
     current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into(), ro });
+    names_changed();
     Ok(())
 }
 
@@ -268,6 +274,7 @@ pub fn umount(path: &str) -> Result<(), i64> {
         return Err(-16); // EBUSY
     }
     l.remove(i);
+    names_changed();
     Ok(())
 }
 
@@ -364,7 +371,47 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     if path.is_empty() {
         return Err(-ENOENT);
     }
-    walk(None, normalize(cwd, path), follow)
+    let key = (current_mnt().id, normalize(cwd, path), follow);
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    if PATHS_STALE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        // ここで捨てる (inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
+        let old = core::mem::take(cache);
+        drop(old);
+    }
+    if let Some((walked, ino)) = cache.get(&key) {
+        PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return Ok((walked.clone(), ino.clone()));
+    }
+    let mut ok = true;
+    let r = walk(None, key.1.clone(), follow, &mut ok)?;
+    if ok && !PATHS_STALE.load(core::sync::atomic::Ordering::Relaxed) {
+        if cache.len() >= PATHS_MAX {
+            cache.clear();
+        }
+        cache.insert(key, (r.0.clone(), r.1.clone()));
+    }
+    Ok(r)
+}
+
+/// パスの答えの覚え (dentry のキャッシュ): (マウントの namespace, 正規化したパス, 最後のリンクをたどるか) →
+/// (たどったパス, inode)。stat や open のたびに 1 つずつ名前を引いて inode を作るのは高い
+/// (QEMU の TCG で、要素ごとに 20 us)。覚えるのは、たどったものがみな path_cacheable で、
+/// 魔法のリンクがなく、通ったディレクトリがみな u・g・o とも x のとき (だれが引いても、権限の確かめが同じに通る) だけ。
+/// 名前や属性やマウントが変わったら names_changed() で全部捨てる
+static mut PATHS: alloc::collections::BTreeMap<(u64, String, bool), (String, InodeRef)> = alloc::collections::BTreeMap::new();
+static PATHS_STALE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 覚えから答えた数 (/proc/bkl)
+pub static PATHS_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const PATHS_MAX: usize = 2048;
+
+/// 名前、属性、マウントのどれかが変わった: パスの覚えを捨てる (次に引くときに)
+pub fn names_changed() {
+    PATHS_STALE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// いま覚えている数 (/proc/bkl)
+pub fn paths_len() -> usize {
+    unsafe { (*(&raw const PATHS)).len() }
 }
 
 /// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。
@@ -374,28 +421,35 @@ pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Re
         return lookup(dir_path, path, follow);
     }
     let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
-    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow)
+    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut false)
 }
 
 /// path (start があればそこからの相対、なければルートから) をたどる
-fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool) -> Result<(String, InodeRef), i64> {
+/// ok: 答えを覚えてよいか (lookup の PATHS)。だめなら false にする
+fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, ok: &mut bool) -> Result<(String, InodeRef), i64> {
     let cred = crate::cred::current();
     'restart: for _ in 0..16 {
         let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
         let (mut cur, mut walked) = start.take().unwrap_or_else(|| (cross(root()), String::new()));
         // いまのディレクトリの属性 (次の要素の分は、たどったときに読んだものを使う)
         let mut m = cur.meta();
+        *ok &= cur.path_cacheable();
         for (i, c) in comps.iter().enumerate() {
             if !m.is_dir() {
                 return Err(-ENOTDIR);
             }
             // ディレクトリを通るには x が要る
             cred.check(&m, crate::cred::X)?;
+            *ok &= m.mode & 0o111 == 0o111;
             let next = cross(cur.lookup(c)?);
+            *ok &= next.path_cacheable();
             let last = i + 1 == comps.len();
             let nm = next.meta();
             if nm.mode & S_IFMT == S_IFLNK && (!last || follow) {
+                // リンクの中身が変わるのは消して作りなおすとき (names_changed) なので、たどった答えも覚えてよい。
+                // 魔法のリンク (/proc/self/fd/N) は覚えない
                 if let Some((p, ino)) = next.magic_link() {
+                    *ok = false;
                     if last {
                         return Ok((p.trim_start_matches('/').to_string(), ino));
                     }
