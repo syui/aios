@@ -211,7 +211,13 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             }
             any |= st == Some(0);
             seen_ver |= !short.is_empty() && first.contains(&short);
-            runs.push(json!({ "bin": b.display().to_string(), "status": st, "out": first }));
+            let mut r = json!({ "bin": b.display().to_string(), "status": st, "out": first });
+            // qemu-user ではそのプログラムが exec する aarch64 のプログラム (uvx → uv など) は動かない
+            // (binfmt がないので)。aios の中なら動くので、そう書いておく
+            if !native && st != Some(0) && first.contains("Exec format error") {
+                r["note"] = json!("qemu-user only: it execs another aarch64 program (works in aios)");
+            }
+            runs.push(r);
         }
         ok &= any;
         checks.push(json!({ "check": "run", "ok": any, "version_seen": seen_ver, "bins": runs }));
@@ -231,7 +237,7 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             Some("files") => c["with"].as_array().filter(|w| !w.is_empty()).map_or(" no clash with other packages".to_string(), |w| format!(" {} files also in other packages: {}", c["clashes"], w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))),
             Some("aarch64") => format!(" {} ELF{}", c["elf"], c["wrong"].as_array().filter(|w| !w.is_empty()).map_or(String::new(), |w| format!(", not aarch64: {}", w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")))),
             Some("run") => c["note"].as_str().map(|n| format!(" ({})", n)).unwrap_or_else(|| {
-                c["bins"].as_array().map_or(String::new(), |bs| bs.iter().map(|b| format!("\n       {} → {} {}", b["bin"].as_str().unwrap_or(""), b["status"], b["out"].as_str().unwrap_or(""))).collect())
+                c["bins"].as_array().map_or(String::new(), |bs| bs.iter().map(|b| format!("\n       {} → {} {}{}", b["bin"].as_str().unwrap_or(""), b["status"], b["out"].as_str().unwrap_or(""), b["note"].as_str().map_or(String::new(), |n| format!(" ({})", n)))).collect())
             }),
             _ => String::new(),
         }))
