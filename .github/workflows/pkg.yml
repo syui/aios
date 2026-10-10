@@ -3,7 +3,7 @@
 #   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
 #   どれも、そのリリースがもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
 #   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分、
-#   runs_on = マシン (既定 ubuntu-24.04-arm))
+#   runs_on = マシン (既定 ubuntu-24.04-arm)、notice = リリースのノートに足す 1 行)
 name: pkg
 
 on:
@@ -180,11 +180,24 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTICE: ${{ matrix.notice }}
         run: |
+          # ライセンス: パッケージの usr/share/licenses のほかに、ノートにライセンスと元のソースを書き、
+          # この版の PKGBUILD とパッチ (aios で変えたところ) を NAME-VER-REL-pkgbuild.tar.gz として一緒に置く
+          # (MPL-2.0 などは、バイナリを配るときにソースの手に入れかたを示すことを求める)
           tag=$NAME-$VER-$REL
           mkdir release
           cp repo/aarch64/$(basename "$(dirname "$DIR")")/$tag-aarch64.pkg.tar.zst release/
           cp "$DIR/PKGBUILD" release/PKGBUILD
+          tar -czf "release/$tag-pkgbuild.tar.gz" -C "$(dirname "$DIR")" "$NAME"
           sha256sum release/* > release/SHA256SUMS
-          printf 'aios の %s (aarch64)。ai/repo にはまだ入っていない (手元で aish-pkg fetch %s → test → push)\n' "$tag" "$NAME" > notes.md
+          info=$(cd "$DIR" && bash -c '. ./PKGBUILD >/dev/null 2>&1; printf "%s\n%s\n" "${license[*]}" "${source[0]}"')
+          {
+            printf 'aios の %s (aarch64)。ai/repo にはまだ入っていない (手元で aish-pkg fetch %s → test → push)\n\n' "$tag" "$NAME"
+            printf -- '- License: %s (パッケージの usr/share/licenses/%s/ にも)\n' "$(echo "$info" | sed -n 1p)" "$NAME"
+            printf -- '- Source: %s\n' "$(echo "$info" | sed -n 2p)"
+            printf -- '- aios で変えたところ: %s-pkgbuild.tar.gz (PKGBUILD とパッチ)、%s/tree/%s/%s\n' "$tag" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA" "$DIR"
+            [ -z "$NOTICE" ] || printf -- '- %s\n' "$NOTICE"
+          } > notes.md
+          cat notes.md
           gh release create "$tag" release/* --title "$tag" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
