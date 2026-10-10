@@ -75,7 +75,7 @@
   {"name": "tmux",              "type": "c",       "src": "https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz",                                             "now": "3.7c",           "latest": "3.7c"},
   {"name": "toybox",            "type": "c",       "src": "https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz",                                                        "now": "0.8.15",         "latest": "0.8.15"},
   {"name": "tree",              "type": "c",       "src": "https://oldmanprogrammer.net/tar/tree/tree-2.3.2.tgz",                                                             "now": "2.3.2",          "latest": "2.3.2"},
-  {"name": "uv",                "type": "rust",    "src": "git+https://github.com/astral-sh/uv#tag=0.12.23",                                                                  "now": "0.12.23",        "latest": "0.12.23"},
+  {"name": "uv",                "type": "rust",    "src": "git+https://github.com/astral-sh/uv#tag=0.13.0",                                                                   "now": "0.13.0",         "latest": "0.13.0"},
   {"name": "vim",               "type": "c",       "src": "git+https://github.com/vim/vim#tag=v9.2.1172",                                                                     "now": "9.2.1172",       "latest": "9.2.1172"},
   {"name": "vulkan-headers",    "type": "c",       "src": "git+https://github.com/KhronosGroup/Vulkan-Headers.git#tag=v1.4.365",                                              "now": "1.4.365",        "latest": "1.4.365"},
   {"name": "vulkan-loader",     "type": "c",       "src": "git+https://github.com/KhronosGroup/Vulkan-Loader.git#tag=v1.4.365",                                               "now": "1.4.365",        "latest": "1.4.365"},

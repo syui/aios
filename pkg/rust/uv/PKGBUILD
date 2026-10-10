@@ -1,9 +1,9 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/uv)
-# uv: Python のパッケージと Python そのものを入れる (uv python install 3.14 で
+# uv: Python のパッケージと Python そのものを入れる (uv python install で 3.15 (0.13 からの既定) など
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
-pkgver=0.12.23
-pkgrel=2
+pkgver=0.13.0
+pkgrel=1
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
 url='https://github.com/astral-sh/uv'
