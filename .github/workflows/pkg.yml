@@ -180,9 +180,8 @@ jobs:
             ninja -C "$b" -j1 -v 2>&1 | head -40
           fi
 
-      - name: Release
+      - name: Package
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTICE: ${{ matrix.notice }}
         run: |
           # ライセンス: パッケージの usr/share/licenses のほかに、ノートにライセンスと元のソースを書き、
@@ -201,6 +200,41 @@ jobs:
             printf -- '- Source: %s\n' "$(echo "$info" | sed -n 2p)"
             printf -- '- aios で変えたところ: %s-pkgbuild.tar.gz (PKGBUILD とパッチ)、%s/tree/%s/%s\n' "$tag" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA" "$DIR"
             [ -z "$NOTICE" ] || printf -- '- %s\n' "$NOTICE"
-          } > notes.md
-          cat notes.md
-          gh release create "$tag" release/* --title "$tag" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          } > release/notes.md
+          cat release/notes.md
+
+      # リリースは別のジョブで作る: ジョブの GITHUB_TOKEN は長いビルド (firefox は 1 時間あまり) のあとでは
+      # リリースを作れなかった (HTTP 403 Resource not accessible by integration)
+      - name: Keep
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release/
+          retention-days: 7
+
+  release:
+    name: release ${{ matrix.name }}
+    needs: [check, build]
+    if: ${{ !cancelled() && needs.check.outputs.any == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    steps:
+      - name: Fetch
+        id: get
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release
+
+      - name: Release
+        if: steps.get.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.name }}-${{ matrix.ver }}-${{ matrix.rel }}
+        run: |
+          mv release/notes.md notes.md
+          gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
