@@ -251,6 +251,7 @@ impl Init {
             (_, false) => St::Failed,
         };
         let again = !s.stopping
+            && !s.unit.restart_prevent.contains(&code)
             && match s.unit.restart {
                 Restart::Always => true,
                 Restart::OnFailure => !ok,

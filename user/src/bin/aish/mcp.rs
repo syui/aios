@@ -272,6 +272,13 @@ impl Shell {
             let warn = RELOAD_WARN.lock().map(|w| w.clone()).unwrap_or_default();
             o.insert("reloaded".into(), json!(format!("aish restarted with the new build (shell variables were reset; the directory is kept){}", warn)));
         }
+        // aiwatch (カーネルの見張り) が新しく見つけたもの: どのツールの答えにも 1 度だけ添える
+        // (AI が aios を触っているあいだに、カーネルで起きていることに気づけるように)
+        if let Some(news) = aiwatch_news()
+            && let Some(o) = r.as_object_mut()
+        {
+            o.insert("aiwatch".into(), json!(news));
+        }
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
         // ふだんは読む形の text だけ (Claude Code は structuredContent があるとそちらを Claude に見せるので)。
         // aish --mcp --json なら、いままでどおり JSON (ほかのプログラムがつなぐとき)
@@ -694,6 +701,21 @@ fn cut(s: String, id: Option<u64>) -> String {
 /// where と outline の items も 1 行に 1 つ
 pub fn render(r: &Value) -> String {
     let Some(o) = r.as_object() else { return r.to_string() };
+    // aiwatch のお知らせ (mcp_call が添える) は、答えのあとに [aiwatch] の行で
+    let Some(notes) = o.get("aiwatch").and_then(|v| v.as_array()) else { return render_body(r, o) };
+    let mut rest = o.clone();
+    rest.remove("aiwatch");
+    let mut s = render_body(&Value::Object(rest.clone()), &rest);
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    for n in notes {
+        s.push_str(&format!("[aiwatch] {}\n", n.as_str().unwrap_or("")));
+    }
+    s
+}
+
+fn render_body(r: &Value, o: &serde_json::Map<String, Value>) -> String {
     let mut s = String::new();
     let mut meta = serde_json::Map::new();
     for (k, v) in o {
@@ -808,6 +830,34 @@ static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// 入れかわったあとの最初の答えに、そう書く
 static RELOADED: AtomicBool = AtomicBool::new(false);
+
+/// aiwatch がいま見つけているもの (/run/aiwatch.json の active) のうち、まだ知らせていないもの。
+/// 1 つに 1 行: "kind: msg (pid N, tid N) — aish-sys の watch ツールで"
+fn aiwatch_news() -> Option<Vec<String>> {
+    static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let text = std::fs::read_to_string("/run/aiwatch.json").ok()?;
+    let state: Value = serde_json::from_str(text.trim()).ok()?;
+    let mut told = TOLD.lock().ok()?;
+    let mut news = Vec::new();
+    for v in state["active"].as_array()? {
+        let id = format!("{}:{}:{}:{}", v["kind"].as_str().unwrap_or(""), v["pid"], v["tid"], v["t"]);
+        if told.contains(&id) {
+            continue;
+        }
+        told.push(id);
+        let who = match (v["pid"].as_u64(), v["tid"].as_u64()) {
+            (Some(p), Some(t)) => format!(" (pid {}, tid {})", p, t),
+            (Some(p), None) => format!(" (pid {})", p),
+            _ => String::new(),
+        };
+        news.push(format!("{}: {}{} — see the watch tool", v["kind"].as_str().unwrap_or("?"), v["msg"].as_str().unwrap_or(""), who));
+    }
+    if told.len() > 256 {
+        let n = told.len() - 256;
+        told.drain(..n);
+    }
+    if news.is_empty() { None } else { Some(news) }
+}
 
 /// 同じ引数で自分を exec しなおす。プロトコルの fd を 0 と 1 に戻し、読みかけのもの (pending) は環境変数でわたす。
 /// プラグインは閉じた標準入力で終わり、新しいほうがまた起こす。しくじったら、そのまま古いほうで続ける

@@ -33,6 +33,8 @@ pub struct Unit {
     pub ignore_failure: bool,
     pub restart: Restart,
     pub restart_sec: f64,
+    /// RestartPreventExitStatus: この終わりの番号では起きなおさない
+    pub restart_prevent: Vec<i32>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
     pub tty: bool,
@@ -131,6 +133,7 @@ pub fn parse(name: &str, path: &str, text: &str) -> Unit {
             _ => Restart::No,
         },
         restart_sec: kv.get("Service.RestartSec").map_or(0.1, |v| parse_secs(v.last().unwrap())),
+        restart_prevent: many("Service.RestartPreventExitStatus").iter().filter_map(|c| c.parse().ok()).collect(),
         env,
         workdir: kv.get("Service.WorkingDirectory").and_then(|v| v.last().cloned()),
         tty: matches!(one("Service.StandardInput").as_str(), "tty" | "tty-force"),
