@@ -2,7 +2,8 @@
 # ai/repo へ入れるのは手元で aish-pkg fetch NAME → test → push (ai/repo の署名の鍵を GitHub に置かないため)。
 #   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
 #   どれも、そのリリースがもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
-#   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分)
+#   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分、
+#   runs_on = マシン (既定 ubuntu-24.04-arm))
 name: pkg
 
 on:
@@ -105,7 +106,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: check
     if: needs.check.outputs.any == 'true'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on || 'ubuntu-24.04-arm' }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
