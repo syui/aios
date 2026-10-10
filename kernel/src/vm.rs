@@ -438,13 +438,34 @@ fn slot_of(e: u64) -> swap::Slot {
 pub fn sync_icache(kva: usize, len: usize) {
     let ctr: u64;
     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr) };
-    let line = 4usize << ((ctr >> 16) & 0xf);
-    let mut a = kva & !(line - 1);
-    while a < kva + len {
-        unsafe { core::arch::asm!("dc cvau, {}", in(reg) a) };
-        a += line;
+    // CTR_EL0: IDC (bit 28) ならデータキャッシュを PoU まで書き出さなくてよい、DIC (bit 29) なら命令キャッシュを
+    // 消さなくてよい (Apple の CPU など)。L1Ip (bit 15:14) が PIPT (0b11) なら、そのアドレスの分だけ消せば
+    // (ic ivau) ほかの写しにも効く。それ以外 (VIPT など) は、いままでどおり全部 (ic ialluis)。
+    // ic ialluis は QEMU の TCG ではすべての CPU の訳した命令を捨てるので、ページごとにすると重い
+    // (キャッシュにないファイルを読むと 1 ページに 1 回)
+    if ctr & (1 << 28) == 0 {
+        let line = 4usize << ((ctr >> 16) & 0xf);
+        let mut a = kva & !(line - 1);
+        while a < kva + len {
+            unsafe { core::arch::asm!("dc cvau, {}", in(reg) a) };
+            a += line;
+        }
     }
-    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };
+    unsafe { core::arch::asm!("dsb ish") };
+    if ctr & (1 << 29) == 0 {
+        if (ctr >> 14) & 3 == 3 {
+            let line = 4usize << (ctr & 0xf);
+            let mut a = kva & !(line - 1);
+            while a < kva + len {
+                unsafe { core::arch::asm!("ic ivau, {}", in(reg) a) };
+                a += line;
+            }
+            unsafe { core::arch::asm!("dsb ish") };
+        } else {
+            unsafe { core::arch::asm!("ic ialluis", "dsb ish") };
+        }
+    }
+    unsafe { core::arch::asm!("isb") };
 }
 
 fn page_of(e: u64) -> *mut u8 {

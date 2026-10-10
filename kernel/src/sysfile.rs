@@ -264,7 +264,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_of(fd).map_err(|_| -29)?; // ESPIPE
     let mut tmp = uninit(len.min(64 * 1024));
-    let n = if ino.page_cacheable() { crate::vm::read_cached(&ino, off.max(0) as usize, &mut tmp)? } else { ino.read_at(off.max(0) as usize, &mut tmp)? };
+    let n = if ino.page_cacheable() { file::read_sleepable(&ino, off.max(0) as usize, &mut tmp)? } else { ino.read_at(off.max(0) as usize, &mut tmp)? };
     out(buf, &tmp[..n])?;
     Ok(n as i64)
 }

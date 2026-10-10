@@ -57,6 +57,33 @@ pub fn free(page: *mut u8) {
 
 /// 0 埋めしたページを 1 枚。なければ None
 pub fn alloc() -> Option<*mut u8> {
+    let page = alloc_dirty()?;
+    zero_page(page);
+    Some(page)
+}
+
+/// ページを 0 にする。DC ZVA (1 命令で 64 バイトなど) が使えればそれで: QEMU の TCG ではホストの
+/// memset 1 回になり、8 バイトずつ書くより何十倍も速い (本物の CPU でも速い。Linux の clear_page と同じ)
+pub fn zero_page(page: *mut u8) {
+    let dczid: u64;
+    unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid) };
+    // DZP (bit 4) が立っていれば使えない。ブロックの大きさは 4 << BS (bit 3:0) バイト
+    if dczid & (1 << 4) == 0 {
+        let bs = 4usize << (dczid & 0xf);
+        let mut a = page as usize;
+        let end = a + PGSIZE;
+        while a < end {
+            unsafe { core::arch::asm!("dc zva, {}", in(reg) a) };
+            a += bs;
+        }
+    } else {
+        unsafe { ptr::write_bytes(page, 0, PGSIZE) };
+    }
+}
+
+/// 中身を 0 にしないページ (すぐに全部書きこむところ用: ディスクのブロックのキャッシュ、パイプの中身。
+/// 前に使った人のデータが残っているので、書いていないところをユーザーに見せないこと)
+pub fn alloc_dirty() -> Option<*mut u8> {
     let mut k = KMEM.lock();
     let page = if !k.head.is_null() {
         let r = k.head;
@@ -71,7 +98,6 @@ pub fn alloc() -> Option<*mut u8> {
         return None;
     };
     drop(k);
-    unsafe { ptr::write_bytes(page, 0, PGSIZE) };
     ref_slot(page).store(1, Ordering::Relaxed);
     Some(page)
 }

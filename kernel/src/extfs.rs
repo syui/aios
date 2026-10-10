@@ -174,6 +174,12 @@ pub struct ExtFs {
     /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
     /// (modify_dir_block) そのディレクトリの分を、ディレクトリの inode を空けたらその分を消す
     names: RefCell<Names>,
+    /// 書く操作 (write_op、消したファイルの片づけ) のたびに増える。ディスクを眠って待った読み (with_block) は、
+    /// 起きたときにこれが変わっていたら、読んだものを捨てて vfs::ERETRY (読みを頭からやりなおす)。
+    /// 眠っているあいだに書かれたら、持っている inode やエクステントの写しはもう古いかもしれない
+    wgen: core::cell::Cell<u64>,
+    /// いま書く操作の中 (その中の読みは眠らない)
+    writing: core::cell::Cell<usize>,
     /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
     names_gen: core::cell::Cell<u64>,
 }
@@ -365,6 +371,8 @@ impl ExtFs {
             orphans: RefCell::new(BTreeSet::new()),
             swapfiles: RefCell::new(BTreeSet::new()),
             names: RefCell::new(Names { dirs: BTreeMap::new(), len: 0 }),
+            wgen: core::cell::Cell::new(0),
+            writing: core::cell::Cell::new(0),
             names_gen: core::cell::Cell::new(0),
         });
         let gdt_len = groups as usize * desc_size;
@@ -421,20 +429,64 @@ impl ExtFs {
         let mut c = self.cache.borrow_mut();
         let page = match c.map.get(&b) {
             Some(&p) => p,
+            // 読むだけの道 (proc::io_sleepable) で、書く操作の中でなければ、ディスクを眠って待つ
+            None if self.writing.get() == 0 && crate::proc::io_sleep_ok() => {
+                drop(c);
+                return self.with_block_sleep(b, f);
+            }
             None => {
                 if c.map.len() >= cache_limit(self.bsize) {
                     c.evict_one();
                 }
-                // ページがなければ、書き終わったブロックを捨てて作る
-                let p = match kalloc::alloc() {
+                // ページがなければ、書き終わったブロックを捨てて作る (ディスクから全部読むので 0 にしない)
+                let p = match kalloc::alloc_dirty() {
                     Some(p) => p,
-                    None if c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
+                    None if c.evict_one() => kalloc::alloc_dirty().ok_or(-ENOSPC)?,
                     None => return Err(-ENOSPC),
                 };
                 let buf = unsafe { core::slice::from_raw_parts_mut(p, self.bsize) };
                 if crate::block::read(b * (self.bsize / crate::block::SECTOR) as u64, buf).is_err() {
                     kalloc::free(p);
                     return Err(-EIO);
+                }
+                c.map.insert(b, p);
+                c.order.push_back(b);
+                p
+            }
+        };
+        drop(c);
+        Ok(f(unsafe { core::slice::from_raw_parts_mut(page, self.bsize) }))
+    }
+
+    /// with_block の、ディスクを眠って待つ道 (キャッシュになかった)。眠るあいだはキャッシュを借りない。
+    /// 起きたら: 書く操作があった (wgen が変わった) なら捨てて ERETRY、ほかの人が先に入れていればそちらを使う
+    fn with_block_sleep<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let g0 = self.wgen.get();
+        let p = match kalloc::alloc_dirty() {
+            Some(p) => p,
+            None => {
+                self.cache.borrow_mut().evict_one();
+                kalloc::alloc_dirty().ok_or(-ENOSPC)?
+            }
+        };
+        let buf = unsafe { core::slice::from_raw_parts_mut(p, self.bsize) };
+        if crate::block::read_wait(b * (self.bsize / crate::block::SECTOR) as u64, buf).is_err() {
+            kalloc::free(p);
+            return Err(-EIO);
+        }
+        if self.wgen.get() != g0 {
+            kalloc::free(p);
+            return Err(-crate::vfs::ERETRY);
+        }
+        let mut c = self.cache.borrow_mut();
+        let page = match c.map.get(&b) {
+            Some(&q) => {
+                kalloc::free(p);
+                q
+            }
+            None => {
+                if c.map.len() >= cache_limit(self.bsize) {
+                    c.evict_one();
                 }
                 c.map.insert(b, p);
                 c.order.push_back(b);
@@ -473,8 +525,19 @@ impl ExtFs {
     /// 先読み: ディスクの b から n ブロックを 1 回で読み、キャッシュにないものを覚える
     fn read_ahead(&self, b: u64, n: usize) -> Result<(), i64> {
         let spb = (self.bsize / crate::block::SECTOR) as u64;
-        let mut buf = vec![0u8; n * self.bsize];
-        crate::block::read(b * spb, &mut buf)?;
+        // ディスクから全部読む (0 にしない)
+        let mut buf: Vec<u8> = Vec::with_capacity(n * self.bsize);
+        unsafe { buf.set_len(n * self.bsize) };
+        // 読むだけの道なら眠って待つ (with_block_sleep と同じ: そのあいだに書かれたら捨ててやりなおす)
+        if self.writing.get() == 0 && crate::proc::io_sleep_ok() {
+            let g0 = self.wgen.get();
+            crate::block::read_wait(b * spb, &mut buf)?;
+            if self.wgen.get() != g0 {
+                return Err(-crate::vfs::ERETRY);
+            }
+        } else {
+            crate::block::read(b * spb, &mut buf)?;
+        }
         let mut c = self.cache.borrow_mut();
         for k in 0..n {
             let blk = b + k as u64;
@@ -484,7 +547,7 @@ impl ExtFs {
             if c.map.len() >= cache_limit(self.bsize) && !c.evict_one() {
                 break;
             }
-            let Some(p) = kalloc::alloc() else { break };
+            let Some(p) = kalloc::alloc_dirty() else { break };
             unsafe { core::ptr::copy_nonoverlapping(buf[k * self.bsize..].as_ptr(), p, self.bsize) };
             c.map.insert(blk, p);
             c.order.push_back(blk);
@@ -1751,6 +1814,8 @@ impl ExtFs {
 
     /// リンクが 0 になった inode を片付ける
     fn release(&self, ino: u32, r: &mut Raw) -> Result<(), i64> {
+        // ブロックを放す: 眠って待っている読みはやりなおす
+        self.wgen.set(self.wgen.get() + 1);
         let dir = r.mode() & S_IFMT == S_IFDIR;
         if !is_fast_symlink(r) && r.mode() & S_IFMT != S_IFCHR {
             self.trunc_blocks(ino, r, 0)?;
@@ -1919,8 +1984,14 @@ impl ExtInode {
     /// 書きかえる操作: 終わったらディスクへ書き出す
     fn write_op<T>(&self, f: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
         self.fs.check_rw()?;
+        let fs = &self.fs;
+        // 眠ってディスクを待っている読みに、書いたことを知らせる (起きたらやりなおす)。この中の読みは眠らない
+        fs.wgen.set(fs.wgen.get() + 1);
+        fs.writing.set(fs.writing.get() + 1);
         let r = f();
-        let fl = self.fs.maybe_flush();
+        let fl = fs.maybe_flush();
+        fs.writing.set(fs.writing.get() - 1);
+        fs.wgen.set(fs.wgen.get() + 1);
         r.and_then(|v| fl.map(|_| v))
     }
 

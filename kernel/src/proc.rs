@@ -270,6 +270,9 @@ pub struct Proc {
     pub nrun: u64,
     /// 眠りはじめた tick (/proc/ai/threads の slept_s。どれだけ眠りつづけているか)
     pub slept_at: u64,
+    /// 0 でなければ、いまは「ディスクを待つあいだ眠ってよい」読むだけの道の中 (file::read の ext4 のファイル、
+    /// pread)。extfs の with_block がキャッシュにないブロックを読むとき、回らずに眠る (io_sleepable)
+    pub io_sleep: u32,
     /// 起こされた時刻 (ns、走りだしたら 0)。起こされてから走るまで (/proc/bkl の「起こされてから走るまで」)
     woken_ns: u64,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
@@ -344,6 +347,7 @@ impl Proc {
         recent: 0,
         nrun: 0,
         slept_at: 0,
+        io_sleep: 0,
         woken_ns: 0,
         yielded: false,
         slice: 0,
@@ -1828,4 +1832,17 @@ pub fn threads_text() -> alloc::string::String {
         }
     }
     out
+}
+
+/// いまのプロセスが io_sleepable の中か (プロセスがなければ false)
+pub fn io_sleep_ok() -> bool {
+    cur().is_some_and(|i| procs()[i].io_sleep > 0)
+}
+
+/// f のあいだ、ディスクを待つときに眠ってよい (読むだけの道で、RefCell を借りたまま呼ばないところ)
+pub fn io_sleepable<R>(f: impl FnOnce() -> R) -> R {
+    current().io_sleep += 1;
+    let r = f();
+    current().io_sleep -= 1;
+    r
 }

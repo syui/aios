@@ -62,6 +62,14 @@ fn raw_read(d: Dev, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
     }
 }
 
+/// 眠って待つ読み (virtio。SD はいままでどおり回って待つ)
+fn raw_read_wait(d: Dev, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
+    match d {
+        Dev::Virtio => virtio_blk::read_wait(sector, buf),
+        Dev::Sd => sd::read(sector, buf),
+    }
+}
+
 fn raw_write(d: Dev, sector: u64, buf: &[u8]) -> Result<(), i64> {
     match d {
         Dev::Virtio => virtio_blk::write(sector, buf),
@@ -144,6 +152,18 @@ pub fn proc_diskstats() -> String {
 /// root の区画から読む (extfs)
 pub fn read(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
     read_part(&root(), sector, buf)
+}
+
+/// root の区画から、眠って待って読む (extfs の読むだけの道。大きなロックはほかの CPU が使う)
+pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
+    let p = root();
+    if sector + (buf.len() / SECTOR) as u64 > p.len {
+        return Err(-5);
+    }
+    let t0 = crate::timer::uptime_ns();
+    let r = raw_read_wait(dev()?, p.start + sector, buf);
+    count(&p, false, (buf.len() / SECTOR) as u64, t0);
+    r
 }
 
 pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
