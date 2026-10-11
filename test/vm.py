@@ -132,7 +132,11 @@ class Serve:
             self.wait_for(PROMPT, 5)
             t = clean(self.buf.decode('utf-8', 'replace'))
             i = t.rfind(tag + ' $?')
-            return {'timeout': True, 'out': (t[t.find('\n', i) + 1:] if i >= 0 and '\n' in t[i:] else t)[-4000:]}
+            if i < 0:
+                # 打った行のこだまが終わっていない: VM がいそがしく、行を描きなおしているあいだに時間切れ。
+                # Ctrl-C でその行は消えたので、コマンドは動いていない (描きなおしのくりかえしは返さない)
+                return {'timeout': True, 'out': '', 'not_run': 'the VM was too busy to take the command line; it did not run (try again, or a longer timeout)'}
+            return {'timeout': True, 'out': (t[t.find('\n', i) + 1:] if '\n' in t[i:] else '')[-4000:]}
         # 色 (aish-highlight) を消してから、打った行のこだま (... echo TAG $?) のあとを。
         # aish は 1 文字ごとに行を描きなおすので、いちばん終わりのもの
         text = clean(out[:mm.start()].decode('utf-8', 'replace'))
