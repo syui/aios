@@ -306,6 +306,15 @@ fn src_init() -> Result<String, String> {
     }
     // setgid: 中に作るものも wheel のグループになる
     std::fs::set_permissions(SRC, std::fs::Permissions::from_mode(0o2775)).map_err(|e| format!("chmod {}: {}", SRC, e))?;
+    // 持ち主 (root) と git を動かす人 (wheel の人) がちがうので、git は「dubious ownership」で止まる。
+    // git のシステムの設定 (git のパッケージの backup なので、上げても残る) に、ここは安全と書く
+    const GITCONFIG: &str = "/etc/gitconfig";
+    if let Ok(g) = std::fs::read_to_string(GITCONFIG)
+        && !g.lines().any(|l| l.trim() == format!("directory = {}", SRC))
+    {
+        let add = format!("{}[safe]\n\tdirectory = {}\n", if g.is_empty() || g.ends_with('\n') { "" } else { "\n" }, SRC);
+        std::fs::write(GITCONFIG, g + &add).map_err(|e| format!("{}: {}", GITCONFIG, e))?;
+    }
     Ok(format!("{} (root:wheel 2775)\n", SRC))
 }
 

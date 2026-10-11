@@ -177,6 +177,7 @@ aish の MCP (`aish --mcp`) は、新しく見つかったものをどのツー�
 
 ```sh
 aios src                       # /usr/src/aios に aios のソース (なければ git clone、あれば git pull)。wheel の人が書ける
+                               # (git が要る: sudo ap -S git。aiosd が /etc/gitconfig の safe.directory に足す)
 aios build kernel              # AIOS_INITRD=none でビルドし、target/Image (起動できる形) を作る (objcopy の代わりも aios がする)
 aios install kernel            # /boot/Image を入れかえる (aiosd)。前のものは /boot/Image.prev
 aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れかえる

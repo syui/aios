@@ -373,18 +373,23 @@ fn sh(cmd: &mut std::process::Command) -> bool {
 /// aios src: なければ git clone (場所は aiosd に作ってもらう)、あれば git pull
 fn src() {
     let dir = src_dir();
+    if !sh(std::process::Command::new("git").arg("--version").stdout(std::process::Stdio::null())) {
+        eprintln!("aios src: git がない (sudo ap -S git)");
+        std::process::exit(1);
+    }
+    // /usr/src/aios は aiosd に用意してもらう (root:wheel 2775 と、git の safe.directory。前からあるものも)
+    if dir == SRC {
+        let (_, r) = ask(&serde_json::json!({ "op": "src" }));
+        if r["ok"] != true {
+            eprintln!("aios src: {}", r["err"].as_str().unwrap_or("aiosd failed"));
+            std::process::exit(1);
+        }
+    }
     if std::path::Path::new(&dir).join(".git").exists() {
         if !sh(std::process::Command::new("git").args(["-C", &dir, "pull", "--ff-only"])) {
             std::process::exit(1);
         }
     } else {
-        if dir == SRC && !std::path::Path::new(SRC).exists() {
-            let (_, r) = ask(&serde_json::json!({ "op": "src" }));
-            if r["ok"] != true {
-                eprintln!("aios src: {}", r["err"].as_str().unwrap_or("aiosd failed"));
-                std::process::exit(1);
-            }
-        }
         if !sh(std::process::Command::new("git").args(["clone", "-b", "unix", REPO, &dir])) {
             std::process::exit(1);
         }
