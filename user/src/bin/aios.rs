@@ -401,7 +401,15 @@ fn src() {
 fn build_kernel() {
     let dir = src_dir();
     let rev = std::process::Command::new("git").args(["-C", &dir, "rev-parse", "--short", "HEAD"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let ok = sh(std::process::Command::new("cargo")
+    let mut cargo = std::process::Command::new("cargo");
+    // ビルドスクリプト (build.rs) は aarch64-unknown-linux-musl のプログラムで、リンカが要る。cargo を入れたあと
+    // ログインしなおしていないシェルでは /etc/profile.d/cargo.sh が読まれていないので、同じ決め方で
+    // (base-devel の cc があれば cc、なければ rust-lld)
+    const LINKER: &str = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER";
+    if std::env::var_os(LINKER).is_none() {
+        cargo.env(LINKER, if std::path::Path::new("/opt/c/bin/cc").exists() { "/opt/c/bin/cc" } else { "rust-lld" });
+    }
+    let ok = sh(cargo
         .args(["build", "--release", "-p", "aios"])
         .current_dir(format!("{}/kernel", dir))
         .env("AIOS_INITRD", "none")
