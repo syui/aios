@@ -584,7 +584,7 @@ pub fn sysstat() -> alloc::string::String {
     s
 }
 
-/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを出す (調べもの用)。
+/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを kmsg に出す (調べもの用。dmesg と aish-sys の strace で読む)。
 /// 名前の頭に + をつけると、うまくいったものも出す。名前は , で区切っていくつも書ける
 static mut STRACE: [u8; 16] = [0; 16];
 
@@ -625,7 +625,41 @@ fn strace(nr: u64, a: &[u64], r: R) {
     }
     let p = proc::current_leader();
     let n = name(nr).map_or(alloc::format!("{}", nr), |n| n.to_ascii_lowercase());
-    println!("strace [{} {}] t={} {}({:#x}, {:#x}, {:#x}) = {}", p.pid, proc::current().pid, crate::timer::ticks(), n, a[0], a[1], a[2], e);
+    // パスをとる引数は名前で (番地では何を開いたかわからない)
+    let path_arg = match n.as_str() {
+        // execve がうまくいったあとは、もう新しいプログラムのメモリなので読まない
+        "execve" if r.is_err() => Some(0),
+        "chdir" | "truncate" | "statfs" | "acct" | "swapon" => Some(0),
+        "openat" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
+        _ => None,
+    };
+    let arg = |i: usize| match path_arg {
+        Some(k) if k == i => alloc::format!("{:?}", user_str(a[i] as usize, 96)),
+        _ => alloc::format!("{:#x}", a[i]),
+    };
+    // 大きな値 (mmap の番地など) は 16 進で
+    let ret = if e >= 0x10000 { alloc::format!("{:#x}", e) } else { alloc::format!("{}", e) };
+    let line = alloc::format!("strace [{} {}] t={} {}({}, {}, {}) = {}\n", p.pid, proc::current().pid, crate::timer::ticks(), n, arg(0), arg(1), arg(2), ret);
+    // kmsg にだけ (シリアルの端末にまざらないように。aish-sys の strace と dmesg が読む)
+    let _g = crate::uart::LOCK.lock();
+    crate::kmsg::push(&line);
+}
+
+/// strace で見せるためのユーザーの文字列 (NUL まで、max バイトまで。読めなければ "?")
+fn user_str(va: usize, max: usize) -> alloc::string::String {
+    let pt = proc::current().pt();
+    let mut b = Vec::new();
+    for i in 0..max {
+        let mut c = [0u8];
+        if va == 0 || pt.copy_in(&mut c, va + i).is_none() {
+            return if b.is_empty() { "?".into() } else { alloc::string::String::from_utf8_lossy(&b).into_owned() };
+        }
+        if c[0] == 0 {
+            break;
+        }
+        b.push(c[0]);
+    }
+    alloc::string::String::from_utf8_lossy(&b).into_owned()
 }
 
 type R = Result<i64, i64>;
