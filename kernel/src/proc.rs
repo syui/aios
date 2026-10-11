@@ -257,6 +257,8 @@ pub struct Proc {
     thread: bool,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
     pub clear_tid: usize,
+    /// CLONE_VFORK で作られた子: exec か終わりまで待っている親の pid (なければ 0)
+    pub vfork_parent: u32,
     /// ジョブ制御 (代表スレッドだけが使う): 止められているか、
     /// wait (WUNTRACED / WCONTINUED) にまだ知らせていない停止のシグナル / 再開
     pub stopped: bool,
@@ -337,6 +339,7 @@ impl Proc {
         comm: [0; 16],
         thread: false,
         clear_tid: 0,
+        vfork_parent: 0,
         stopped: false,
         stop_report: 0,
         cont_report: false,
@@ -1063,6 +1066,7 @@ fn exit_status(status: i32) -> ! {
     let p = current();
     crate::ns::init_exited(p);
     clear_child_tid(p);
+    vfork_done(p);
     if p.thread {
         // 使った時間は代表スレッドに持たせる
         let t = core::mem::take(&mut p.utime);
@@ -1148,6 +1152,7 @@ pub fn check_killed() {
 
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_VFORK: u64 = 0x0000_4000;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
@@ -1188,14 +1193,16 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     let mut cred = parent.cred.clone();
     crate::ns::renew(&mut cred, flags)?;
-    let mm = if thread {
+    // CLONE_VM: スレッドでなくても同じアドレス空間 (vfork と glibc の posix_spawn は、子が exec するまで親のメモリで
+    // 動き、exec できなかったわけをそこに書いて知らせる)。子が exec すれば新しいものに切りかわる
+    let mm = if flags & CLONE_VM != 0 {
         parent.mm.clone().unwrap()
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
         Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), args: m.args })
     };
-    let files = if flags & CLONE_FILES != 0 && thread {
+    let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
     } else {
         Shared::new(parent.files().clone())
@@ -1252,9 +1259,37 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_tid = ctid;
     }
+    // CLONE_VFORK: 子が exec するか終わるまで親は待つ (子は親のスタックの上で動くので、先に親が動くと壊れる)
+    let vfork = flags & CLONE_VFORK != 0;
+    if vfork {
+        child.vfork_parent = parent.pid;
+    }
+    let chan = vfork_chan(child);
     child.state = State::Runnable;
     crate::smp::wake_idle();
+    if vfork {
+        // シグナルではやめない (止められたときだけ)。届いているシグナルがあると眠れないので、そのあいだはゆずりながら
+        let me = current().pid;
+        while find(tid).is_some_and(|c| c.vfork_parent == me) && !current().killed {
+            if sleep(chan).is_err() {
+                yield_now();
+            }
+        }
+    }
     Ok(tid)
+}
+
+/// vfork の親が眠る channel (子の Proc の番地から。wait のもの (Proc の番地) とも futex (奇数) ともちがう)
+fn vfork_chan(child: &Proc) -> usize {
+    child as *const Proc as usize + 2
+}
+
+/// vfork の子が exec したか終わった: 待っている親を起こす
+fn vfork_done(p: &mut Proc) {
+    if p.vfork_parent != 0 {
+        p.vfork_parent = 0;
+        wakeup(vfork_chan(p));
+    }
 }
 
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
@@ -1291,6 +1326,8 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
     p.load_image(img);
     p.pt().activate();
     drop(old);
+    // vfork の子: 親のメモリを離れたので、親は動ける
+    vfork_done(p);
     // files を他と共有していたなら切り離す
     let files = p.files().clone();
     p.files = Some(Shared::new(files));
