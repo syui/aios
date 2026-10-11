@@ -1,7 +1,7 @@
 #!/bin/sh
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
-#   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ
+#   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ (unix ブランチにいなければ GitHub の unix を)
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する)
 #   bin/gitea.sh release ディスクのイメージ (aios-unix-aarch64.img.zst) を作り、ai/os のリリース unix-latest に置きかえる
@@ -68,7 +68,15 @@ case "$1" in
     use_identity .
     ;;
   os)
-    git -c "$(auth)" push "$host/ai/os.git" unix:unix
+    # unix ブランチにいればそれを、ほかのブランチ (Claude の作業ブランチなど) にいれば GitHub の unix (先に
+    # git push origin HEAD:unix したもの) を送る。手元の古い unix ブランチを送らないように
+    if [ "$(git rev-parse --abbrev-ref HEAD)" = unix ]; then
+      ref=unix
+    else
+      git fetch -q origin unix
+      ref=origin/unix
+    fi
+    git -c "$(auth)" push "$host/ai/os.git" "$ref:refs/heads/unix"
     ;;
   repo)
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
