@@ -27,7 +27,9 @@ CTL, MON, LOG = DIR + '/ctl', DIR + '/mon', DIR + '/serial.log'
 PROMPT = re.compile(rb'aios[^\n]*\][$#] ')
 # 起動のとちゅうでカーネルが止まった (それより待ってもプロンプトは来ない)
 PANIC = re.compile(rb'(^|\n)panic: ')
-ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\r')
+# エスケープ: CSI (色、カーソル)、OSC (ESC ] ... BEL か ESC \\。zig の進みぐあい ESC ]9;4 など)、ESC と 1 文字 (ESC M など)
+ESC = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][0-9A-Za-z]|\x1b[@-Z\\-_78=>]')
+ANSI = re.compile(ESC.pattern + r'|\r')
 KEYS = {'\\': 'backslash', ' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash', '\n': 'ret', '=': 'equal', ';': 'semicolon', ',': 'comma',
         "'": 'apostrophe', '`': 'grave_accent', '[': 'bracket_left', ']': 'bracket_right', '\t': 'tab',
         '_': 'shift-minus', '>': 'shift-dot', '<': 'shift-comma', '|': 'shift-backslash', '&': 'shift-7', '$': 'shift-4', '"': 'shift-apostrophe',
@@ -137,20 +139,20 @@ class Serve:
             # 止める (Ctrl-C) と、プロンプトに戻るのを少し待つ
             os.write(self.m, b'\x03')
             self.wait_for(PROMPT, 5)
-            t = clean(self.buf.decode('utf-8', 'replace'))
+            t = ESC.sub('', self.buf.decode('utf-8', 'replace'))
             i = t.rfind(tag + ' $?')
             if i < 0:
                 # 打った行のこだまが終わっていない: VM がいそがしく、行を描きなおしているあいだに時間切れ。
                 # Ctrl-C でその行は消えたので、コマンドは動いていない (描きなおしのくりかえしは返さない)
                 return {'timeout': True, 'out': '', 'not_run': 'the VM was too busy to take the command line; it did not run (try again, or a longer timeout)'}
-            return {'timeout': True, 'out': (t[t.find('\n', i) + 1:] if '\n' in t[i:] else '')[-4000:]}
+            return {'timeout': True, 'out': tidy(t[t.find('\n', i) + 1:] if '\n' in t[i:] else '')[-4000:]}
         # 色 (aish-highlight) を消してから、打った行のこだま (... echo TAG $?) のあとを。
         # aish は 1 文字ごとに行を描きなおすので、いちばん終わりのもの
-        text = clean(out[:mm.start()].decode('utf-8', 'replace'))
+        text = ESC.sub('', out[:mm.start()].decode('utf-8', 'replace'))
         i = text.rfind(tag + ' $?')
         if i >= 0:
             text = text[text.find('\n', i) + 1:] if '\n' in text[i:] else ''
-        return {'status': int(mm.group(1)), 'out': clean(text)}
+        return {'status': int(mm.group(1)), 'out': tidy(text)}
 
     def put(self, path, b64, timeout=600, gz=False):
         # プロンプトで長い行を打つと、aish が 1 文字ごとに描きなおして遅いので、base64 -d を先に起こして、
@@ -282,6 +284,32 @@ def screen(t):
     for line in t.split('\n'):
         segs = [ANSI.sub('', s) for s in line.split('\r')]
         out.append(next((s for s in reversed(segs) if s.strip()), ''))
+    return '\n'.join(out).strip('\n')
+
+
+def tidy(t):
+    # コマンドの出力を見えるとおりに: 行ごとに \r で描きなおした最後のもの。進みぐあいの表示 (zig cc など) が
+    # カーソルを上げて同じ何行かを描きなおしつづけたものは、くり返しを 1 つにまとめる
+    lines = []
+    for line in ESC.sub('', t).split('\n'):
+        lines.append(next((s for s in reversed(line.split('\r')) if s.strip()), ''))
+    out, i = [], 0
+    while i < len(lines):
+        for k in range(1, 9):
+            blk = out[-k:]
+            if len(blk) < k or not any(x.strip() for x in blk):
+                continue
+            n = 0
+            while lines[i + n * k:i + (n + 1) * k] == blk:
+                n += 1
+            # 1 回だけ同じなのはふつうの出力にもあるので、2 回から
+            if n >= 2:
+                out.append('... (the %d line%s above repeated %d more times)' % (k, 's' if k > 1 else '', n))
+                i += n * k
+                break
+        else:
+            out.append(lines[i])
+            i += 1
     return '\n'.join(out).strip('\n')
 
 
