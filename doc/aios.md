@@ -25,7 +25,7 @@
 
 | PATH | 中身 |
 |---|---|
-| `host` | 名前、OS (base の版) |
+| `host` | 名前、OS (/etc/os-release の NAME と VARIANT と base の版: `aios (aikernel) 0.0.1.r…`。VARIANT の aikernel は、カーネルから作った aios を Arch Linux から作った aios と見分ける) |
 | `kernel` | 版、コマンドライン、起きてからの秒、CPU の数、モジュール、BKL (`/proc/bkl`)、メッセージの終わり (`/proc/kmsg`)、`sysctl` (`/proc/sys`) |
 | `mem` | メモリとスワップ (KiB) |
 | `disk` | マウントごとの使った量と大きさ |

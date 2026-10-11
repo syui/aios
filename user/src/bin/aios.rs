@@ -519,7 +519,7 @@ fn info() {
             info.push((k.to_string(), v));
         }
     };
-    add("OS", Some(format!("aios (unix) {}", pkg_version("base").unwrap_or_default()).trim().to_string()));
+    add("OS", Some(state::os_name(&pkg_version("base").unwrap_or_default())));
     add("Kernel", Some(uname().0));
     add("Uptime", uptime());
     add("Packages", packages());

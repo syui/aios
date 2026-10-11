@@ -1,6 +1,8 @@
 NAME="aios"
 PRETTY_NAME="aios"
 ID=aios
+VARIANT="aikernel"
+VARIANT_ID=aikernel
 BUILD_ID=rolling
 ANSI_COLOR="1;33"
 HOME_URL="https://git.syui.ai/ai/os"

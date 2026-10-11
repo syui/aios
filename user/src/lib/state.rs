@@ -129,7 +129,17 @@ fn host() -> Value {
     let (_, node, machine) = uname();
     let name = read("/etc/hostname").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or(node);
     let base = installed().get("base").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-    json!({ "name": name, "os": format!("aios (unix) {}", base).trim(), "arch": machine })
+    json!({ "name": name, "os": os_name(&base), "arch": machine })
+}
+
+/// OS の名前: /etc/os-release の NAME と VARIANT (「aios (aikernel)」) と base の版。
+/// VARIANT は Arch Linux から作った aios (main ブランチ) と、カーネルから作った aios を見分ける
+pub fn os_name(version: &str) -> String {
+    let rel = read("/etc/os-release").unwrap_or_default();
+    let field = |k: &str| rel.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(|v| v.trim().trim_matches('"').to_string())).filter(|v| !v.is_empty());
+    let name = field("NAME").unwrap_or_else(|| "aios".into());
+    let variant = field("VARIANT").map_or(String::new(), |v| format!(" ({})", v));
+    format!("{}{} {}", name, variant, version).trim().to_string()
 }
 
 // ---- kernel ----
