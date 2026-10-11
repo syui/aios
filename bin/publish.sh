@@ -6,7 +6,7 @@
 #   2. base / aikernel / aiboot のうち、ai/repo にある版 (0.0.1.rN.gSHA) のあとでソースが変わったものを作って確かめ、
 #      ai/repo に送る (aish-pkg build / test / push)。CI はこの 3 つをディスクに入れるだけで ai/repo には送らないので、
 #      これをしないと、入っている aios の ap -Syu に来ない。ドキュメントだけの変更では送らない
-#   bin/publish.sh [-n]   -n: 何をするかを出すだけ
+#   bin/publish.sh [-n]   -n: 何をするかを出すだけ (CI も待たず、いまの様子を)
 # CI がしくじったら、2 はしない (ディスクの起動を確かめていないものは配らない)
 set -e
 cd "$(dirname "$0")/.."
@@ -31,18 +31,25 @@ else
   while :; do
     st=$(curl -fsS "$api/actions/runs/$run" | json 'd["status"] + " " + str(d["conclusion"])')
     case "$st" in completed*) break ;; esac
+    [ -n "$dry" ] && break
     sleep 15
   done
   echo "ci: $st (https://github.com/syui/aios/actions/runs/$run)"
-  [ "$st" = "completed success" ] || { echo "publish: CI did not pass; not publishing" >&2; exit 1; }
-  # リリースは CI のおしまいに作りなおされる
-  for i in $(seq 1 20); do
-    t=$(curl -fsS "$api/releases/tags/unix-latest" | json 'd["target_commitish"]' 2>/dev/null) || t=
-    [ "$t" = "$sha" ] && break
-    sleep 6
-  done
-  [ "$t" = "$sha" ] || { echo "publish: the release unix-latest is not $sha" >&2; exit 1; }
-  if [ -n "$dry" ]; then echo "would: bin/gitea.sh mirror"; else sh bin/gitea.sh mirror; fi
+  if [ "$st" = "completed success" ]; then
+    # リリースは CI のおしまいに作りなおされる
+    for i in $(seq 1 20); do
+      t=$(curl -fsS "$api/releases/tags/unix-latest" | json 'd["target_commitish"]' 2>/dev/null) || t=
+      [ "$t" = "$sha" ] && break
+      sleep 6
+    done
+    [ "$t" = "$sha" ] || { echo "publish: the release unix-latest is not $sha" >&2; exit 1; }
+    if [ -n "$dry" ]; then echo "would: bin/gitea.sh mirror"; else sh bin/gitea.sh mirror; fi
+  elif [ -n "$dry" ]; then
+    case "$st" in completed*) echo "would: stop (CI did not pass)" ;; *) echo "would: wait for CI, then bin/gitea.sh mirror" ;; esac
+  else
+    echo "publish: CI did not pass; not publishing" >&2
+    exit 1
+  fi
 fi
 
 # 2. パッケージ: ai/repo の版の gSHA から、そのパッケージのソースが変わったか
