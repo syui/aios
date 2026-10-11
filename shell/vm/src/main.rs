@@ -191,7 +191,7 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
         "run" => {
             let t = secs(a, "timeout", 50.0, 50.0);
             let (st, out, err, ms, to) = vmpy(root, &["run", s(a, "cmd"), "-t", &format!("{}", t)], &[], Duration::from_secs_f64(t + 5.0));
-            res((st, cut(root, out), err, ms, to))
+            res((st, cut(root, symbolize(root, out)), err, ms, to))
         }
         "put" => {
             let local = s(a, "local");
@@ -219,7 +219,7 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
             // grep するなら多めに読んでから絞る
             let (st, out, err, ms, to) = vmpy(root, &["log", &format!("{}", if g.is_empty() { n } else { 20000 })], &[], short);
             let text = if g.is_empty() { out } else { out.lines().filter(|l| l.contains(g)).collect::<Vec<_>>().iter().rev().take(n as usize).rev().cloned().collect::<Vec<_>>().join("\n") };
-            res((st, text, err, ms, to))
+            res((st, symbolize(root, text), err, ms, to))
         }
         "mon" => res(vmpy(root, &["mon", s(a, "cmd")], &[], short)),
         "reboot" => {
@@ -428,6 +428,24 @@ fn kernel_for(root: &Path, spec: &str) -> Result<PathBuf, String> {
     Ok(dst)
 }
 
+/// いま動いている VM のカーネルの ELF (boot で書く)
+fn booted(root: &Path) -> PathBuf {
+    root.join("build/aish-vm/booted-kernel")
+}
+
+/// カーネルの panic のバックトレース (backtrace: 0x... の行) があれば、addr2line で関数の名前にして足す
+fn symbolize(root: &Path, text: String) -> String {
+    let Some(line) = text.lines().find_map(|l| l.trim_start().strip_prefix("backtrace: 0x").map(|_| l.trim_start())) else { return text };
+    let Ok(k) = std::fs::read_to_string(booted(root)) else { return text };
+    let addrs: Vec<&str> = line["backtrace:".len()..].split_whitespace().collect();
+    let Ok(o) = Command::new("addr2line").arg("-e").arg(k.trim()).args(["-f", "-C", "-p"]).args(&addrs).output() else { return text };
+    let names: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(|l| format!("  {}", if l.ends_with(":?") { l.rsplit_once(" at ").map_or(l, |x| x.0) } else { l })).collect();
+    if names.is_empty() {
+        return text;
+    }
+    format!("{}\nbacktrace (addr2line):\n{}", text, names.join("\n"))
+}
+
 /// VM を止めて、kernel で起こす (snapshot ならディスクに書き残さない)。起動に失敗したら Err
 fn boot(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str) -> Result<Value, String> {
     vmpy(root, &["stop"], &[], Duration::from_secs(90));
@@ -435,6 +453,11 @@ fn boot(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str) -> Result
     if let Some(k) = kernel {
         env.push(("AIOS_KERNEL", k.display().to_string()));
     }
+    // panic のバックトレースを関数の名前にするため (symbolize)。disk.img のカーネルなら無い
+    let _ = match kernel {
+        Some(k) => std::fs::write(booted(root), k.display().to_string()),
+        None => std::fs::remove_file(booted(root)),
+    };
     if snapshot {
         env.push(("AIOS_QEMU_ARGS", "-snapshot".into()));
     }
