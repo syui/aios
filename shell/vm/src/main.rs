@@ -7,7 +7,7 @@
 //   bisect  test が通る (good) コミットと通らない (bad) コミットのあいだを git bisect で探す。
 //           コミットごとにカーネルを作って VM で test を動かす (変わるのはカーネルだけ。ディスクはいまのもの)
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
-//   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target に作り、
+//   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
 // start、ab、bisect は長いので、うしろで動かす (自分を aish-vm start / ab / bisect で起こす)。もういちど呼ぶと様子か結果。
 // ab と bisect は、動いている VM を止めてから、-snapshot (ディスクに書き残さない) で起こしなおす。2 つの VM が同じ
@@ -371,7 +371,10 @@ fn note(v: Value) {
 
 /// dir (ワークスペース) のカーネルを作る。できたもののパス
 fn build_kernel(root: &Path, dir: &Path) -> Result<PathBuf, String> {
-    let target = root.join("build/aish-vm/target");
+    // 作業中のソースと、コミットの作業場所 (wt) は置き場を分ける。同じ置き場だと、wt で作ったあとに作業中の
+    // ソースを作ると、cargo はソースが変わっていないので作りなおさず、置き場の aios (wt のもの) がそのまま残る
+    // (ab で a と b が同じカーネルになっていた)
+    let target = root.join(if dir == root { "build/aish-vm/target" } else { "build/aish-vm/target-wt" });
     let env = [("AIOS_INITRD", "none".to_string()), ("CARGO_TARGET_DIR", target.display().to_string())];
     let (st, _, err, _, _) = sh(dir, "cargo", &["build", "--release", "-p", "aios"], &env, Duration::from_secs(1800));
     if st != 0 {
