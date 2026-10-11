@@ -1107,11 +1107,23 @@ impl ExtFs {
             while j < dirty.len() && j - i < RUN && dirty[j] == dirty[j - 1] + 1 {
                 j += 1;
             }
-            let mut buf = vec![0u8; (j - i) * self.bsize];
-            for (k, &b) in dirty[i..j].iter().enumerate() {
-                self.with_block(b, |d| buf[k * self.bsize..(k + 1) * self.bsize].copy_from_slice(d))?;
+            // ひとまとめに書くバッファ。ヒープに大きなかたまりが無ければ (混んでいる、割れている)、1 ブロックずつ
+            // キャッシュのページから直接書く (前は取れずに panic した: memory allocation of 880640 bytes failed)
+            let mut buf = Vec::new();
+            if j - i > 1 && buf.try_reserve_exact((j - i) * self.bsize).is_ok() {
+                buf.resize((j - i) * self.bsize, 0);
+                for (k, &b) in dirty[i..j].iter().enumerate() {
+                    self.with_block(b, |d| buf[k * self.bsize..(k + 1) * self.bsize].copy_from_slice(d))?;
+                }
+                crate::block::write(dirty[i] * spb, &buf)?;
+            } else {
+                // キャッシュを借りたままディスクを待たない (眠るあいだにほかが同じキャッシュを使う)
+                let mut one = vec![0u8; self.bsize];
+                for &b in &dirty[i..j] {
+                    self.with_block(b, |d| one.copy_from_slice(d))?;
+                    crate::block::write(b * spb, &one)?;
+                }
             }
-            crate::block::write(dirty[i] * spb, &buf)?;
             i = j;
         }
         Ok(())

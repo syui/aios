@@ -2,6 +2,7 @@
 // 読み書きできるのは root と wheel の人だけ (allowed)。
 //   threads   すべてのスレッド: 状態、最後のシステムコール、眠っていれば何を (futex / 見張っている fd / channel)、
 //             どれだけ (slept_s) 待っているか (proc::ai_threads)
+//   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
 //   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
 //   stack/TID スレッドのレジスタ、スタック (sp から 64 KiB まで、16 進)、ファイルを写している地図 (proc::ai_stack)。

@@ -114,7 +114,17 @@ unsafe impl Send for PrivPage {}
 /// 捨てられないページが多くても、読みなおしを繰りかえさないように。メモリが足りなくなったら、
 /// こことは別にスワップの側から捨てる (swap.rs)
 fn priv_max() -> usize {
-    (crate::memlayout::ram_size() / PGSIZE / 4).max(16384)
+    // 表は 1 枚につきヒープを 100 バイトほど使う (BTreeMap)。ヒープは決まった大きさなので、その 1/4 まで
+    // (メモリの多いマシンでも、表がヒープを使いきらないように: 2 GiB で 340 MB ほど)
+    (crate::memlayout::ram_size() / PGSIZE / 4).max(16384).min(crate::heap::SIZE / 4 / PRIV_ENTRY_BYTES)
+}
+
+/// 表の 1 枚がヒープを使うおおよそのバイト (はかったもの)
+const PRIV_ENTRY_BYTES: usize = 96;
+
+/// ヒープがこれより混んでいたら、表に入れない (読んだページはそのまま使う)
+fn heap_crowded() -> bool {
+    crate::heap::used() > crate::heap::SIZE / 4 * 3
 }
 
 /// 次に捨てる (表をなめる) のは、表がこの数をこえたとき。捨てても減らなければ (みな写されている)、
@@ -308,8 +318,12 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
         shrink_cache(max / 8);
         NEXT_SHRINK.store(PRIV.lock().len() + max / 8, Ordering::Relaxed);
     }
+    // ヒープが混んでいたら、写されていないものを捨てる。それでも混んでいれば表に入れない
+    if heap_crowded() {
+        shrink_cache(max / 8);
+    }
     // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う
-    if CHANGES.load(Ordering::SeqCst) != changes {
+    if CHANGES.load(Ordering::SeqCst) != changes || heap_crowded() {
         return Some(page);
     }
     kalloc::get(page);

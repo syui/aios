@@ -91,6 +91,7 @@ enum Node {
     AiDir,
     AiThreads,
     AiBkl,
+    AiHeap,
     AiCtl,
     AiFdDir,
     AiFd(u32),
@@ -188,6 +189,7 @@ impl ProcInode {
             Node::AiDir => 40,
             Node::AiThreads => 41,
             Node::AiBkl => 42,
+            Node::AiHeap => 46,
             Node::AiCtl => 43,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
@@ -255,10 +257,11 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
-            Node::AiThreads | Node::AiBkl | Node::AiCtl | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiCtl | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => proc::ai_threads(),
             Node::AiBkl => crate::smp::stats_json(),
+            Node::AiHeap => crate::heap::stats_json(),
             Node::AiCtl => crate::aiproc::CTL_HELP.into(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
@@ -711,6 +714,7 @@ impl Inode for ProcInode {
             (Node::Root, "ai") => Node::AiDir,
             (Node::AiDir, "threads") => Node::AiThreads,
             (Node::AiDir, "bkl") => Node::AiBkl,
+            (Node::AiDir, "heap") => Node::AiHeap,
             (Node::AiDir, "ctl") => Node::AiCtl,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "stack") => Node::AiStackDir,
@@ -812,6 +816,7 @@ impl Inode for ProcInode {
             Node::AiDir => {
                 add("threads".into(), Node::AiThreads);
                 add("bkl".into(), Node::AiBkl);
+                add("heap".into(), Node::AiHeap);
                 add("ctl".into(), Node::AiCtl);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);

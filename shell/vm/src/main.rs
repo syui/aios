@@ -319,10 +319,17 @@ struct Job {
     child: std::process::Child,
     log: PathBuf,
     t0: Instant,
+    /// 最後に様子を見たとき
+    polled: Instant,
 }
 
 /// key のものがなければ起こし、wait_ms まで待つ。終わったら最後の行の JSON (と途中の行)
 fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Value {
+    // running と答えたまま見に来なかったもの (5 分より前) が終わっていたら、続きではなく新しく始める
+    // (前の start の結果を、あとの start に返してしまわないように)
+    if jobs.get_mut(key).is_some_and(|j| j.polled.elapsed() > Duration::from_secs(300) && matches!(j.child.try_wait(), Ok(Some(_)))) {
+        jobs.remove(key);
+    }
     if !jobs.contains_key(key) {
         let dir = root.join("build/aish-vm");
         let _ = std::fs::create_dir_all(&dir);
@@ -330,13 +337,14 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Va
         let (Ok(out), Ok(exe)) = (std::fs::File::create(&log), std::env::current_exe()) else { return error(format!("{}: cannot start", log.display())) };
         let Ok(err) = out.try_clone() else { return error("cannot start") };
         match Command::new(exe).args([key, &a.to_string()]).current_dir(root).env("AIOS_SRC", root).stdin(Stdio::null()).stdout(out).stderr(err).spawn() {
-            Ok(c) => jobs.insert(key.to_string(), Job { child: c, log, t0: Instant::now() }),
+            Ok(c) => jobs.insert(key.to_string(), Job { child: c, log, t0: Instant::now(), polled: Instant::now() }),
             Err(e) => return error(e),
         };
     }
     let wait = Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(30_000).min(50_000));
     let end = Instant::now() + wait;
     let j = jobs.get_mut(key).unwrap();
+    j.polled = Instant::now();
     let status = loop {
         match j.child.try_wait() {
             Ok(Some(st)) => break Some(st),
