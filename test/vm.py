@@ -16,7 +16,7 @@
 # 起こしたものは、うしろの小さなサーバー (serve) が持つ。シリアルはいつも読みつづけるので、カーネルの
 # 出力でつまらない。--www DIR で DIR を http://10.0.2.2:8000/ に出す (aios の中から fetch で取れる)。
 # 置き場は $AIOS_VM_DIR (既定 /tmp/aios-vm-UID): ctl (サーバーの口)、mon (QEMU のモニタ)、serial.log
-import json, os, pty, re, select, signal, socket, subprocess, sys, threading, time
+import json, os, pty, re, select, shutil, signal, socket, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.environ.get('AIOS_VM_DIR') or '/tmp/aios-vm-%d' % os.getuid()
@@ -216,6 +216,19 @@ class Serve:
         self.xfer.kill()
 
 
+def add_ca(vm):
+    # クラウドのセッションでは、外への https を途中で開けて見るものがあり、aios の知らない CA で署名しなおす
+    # (ap -Sy が invalid peer certificate: UnknownIssuer)。ホストの CA の束を中の ca-certificates.crt のうしろに足す
+    # (aios のものは消さない。一度だけ)。AIOS_VM_CA=FILE でどの束か、AIOS_VM_CA=none でしない
+    ca = os.environ.get('AIOS_VM_CA') or ('/root/.ccr/ca-bundle.crt' if os.path.exists('/root/.ccr/ca-bundle.crt') else '')
+    if not ca or ca == 'none' or not os.path.exists(ca):
+        return
+    shutil.copy(ca, DIR + '/xfer/host-ca.crt')
+    dst = '/etc/ssl/certs/ca-certificates.crt'
+    vm.run("fetch http://10.0.2.2:8001/host-ca.crt -o /tmp/.host-ca.crt >/dev/null && "
+           "sudo -n sh -c 'grep -q \"aios-vm: host CA\" %s || { echo \"# aios-vm: host CA\"; cat /tmp/.host-ca.crt; } >> %s'" % (dst, dst), 30)
+
+
 def clean(t):
     return ANSI.sub('', t).strip('\n')
 
@@ -247,6 +260,7 @@ def serve(www):
         # /etc/aishrc の「cd のあとの ls」(chpwd) は人のため。run の出力にまざらないように外す
         # (aish --mcp で外しているのと同じ)
         vm.run('unset -f chpwd 2>/dev/null', 10)
+        add_ca(vm)
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(CTL)
     srv.listen(4)
@@ -361,8 +375,9 @@ def main():
         if len(data) > 256 << 20:
             sys.exit('vm: put is for files up to 256 MB')
         import gzip
-        if len(data) > 256 << 10:
-            # 大きいもの: シリアルでは 1 秒に数十 KB なので、http で (DIR/xfer に置いて中の fetch で取る)
+        if len(data) > 16 << 10:
+            # 大きいもの: シリアルは 1 秒に 15 KB ほど (197 KB で 14 秒) なので、http で (DIR/xfer に置いて中の fetch で取る。
+            # 1 MB でも 1 秒ほど)
             name = 'put-%d-%s' % (os.getpid(), os.path.basename(a[1]))
             tmp = os.path.join(DIR, 'xfer', name)
             open(tmp, 'wb').write(data)
