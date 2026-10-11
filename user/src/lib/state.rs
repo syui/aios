@@ -390,7 +390,14 @@ fn boot() -> Value {
     let cmdline = read("/proc/cmdline").unwrap_or_default();
     // boot counting (doc/aios.md): try は新しいカーネルを試す残りの回数 (なければ試していない)、
     // fallback は前のカーネルに戻して起動したか。last は aiosd が残した最後の起動の結果
-    let last = aiosd_log().into_iter().rev().find(|r| r["req"]["op"] == "boot").map(|r| json!({ "t": r["t"], "result": r["req"]["result"], "status": r["status"] }));
+    let last = aiosd_log().into_iter().rev().find(|r| r["req"]["op"] == "boot").map(|r| {
+        let mut l = json!({ "t": r["t"], "result": r["req"]["result"], "status": r["status"] });
+        // 前のカーネルに戻したわけ (aiboot の aios.fallback_why: unfinished / load / chosen)
+        if !r["req"]["why"].is_null() {
+            l["why"] = r["req"]["why"].clone();
+        }
+        l
+    });
     json!({
         "esp": "/boot",
         "kernels": kernels,

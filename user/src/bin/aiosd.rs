@@ -327,22 +327,34 @@ fn boot_check() {
         return;
     }
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    // aiboot が前のものに戻したわけ (aios.fallback_why=): unfinished / load / chosen (古い aiboot にはない)
+    let why = cmdline.split_whitespace().find_map(|w| w.strip_prefix("aios.fallback_why=")).unwrap_or("").to_string();
     let (msg, status) = if cmdline.split_whitespace().any(|w| w == "aios.fallback=1") {
+        let what = match why.as_str() {
+            "unfinished" => "the new kernel did not finish booting (it stopped before aiosd started; reset went back)",
+            "load" => "the new kernel could not be loaded (the firmware's LoadImage failed: not a bootable Image)",
+            "chosen" => "the previous kernel was chosen in the boot menu",
+            _ => "the new kernel did not boot",
+        };
         // 前のカーネルで起動している。/boot/Image を前のもの (いま動いているもの) にする
         match kernel("revert", "") {
-            Ok(_) => ("the new kernel did not boot; /boot/Image is the previous one again (the new one is /boot/Image.prev)", 1),
+            Ok(_) => (format!("{}; /boot/Image is the previous one again (the new one is /boot/Image.prev)", what), 1),
             Err(e) => {
                 eprintln!("aiosd: {}", e);
                 let _ = std::fs::remove_file(TRY);
-                ("the new kernel did not boot, and going back failed", 2)
+                (format!("{}, and going back failed", what), 2)
             }
         }
     } else {
         let _ = std::fs::remove_file(TRY);
-        ("the new kernel booted", 0)
+        ("the new kernel booted".to_string(), 0)
     };
     println!("aiosd: {}", msg);
-    record(0, std::process::id() as i32, &json!({ "op": "boot", "result": msg }), status);
+    let mut req = json!({ "op": "boot", "result": msg });
+    if !why.is_empty() {
+        req["why"] = json!(why);
+    }
+    record(0, std::process::id() as i32, &req, status);
 }
 
 /// /boot/Image を入れかえる / 戻す。前のものは /boot/Image.prev と、起動の一覧の entry に残す

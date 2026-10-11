@@ -401,11 +401,15 @@ extern "efiapi" fn efi_main(image: usize, st: usize) -> Status {
     // 無いファイルを開くとファームウェア (edk2 の FAT) が例外で止まることがあるので、先に一覧で確かめる
     let has_try = root.open("/loader").is_some_and(|d| d.list().iter().any(|n| n.eq_ignore_ascii_case("try")));
     let trying = if has_try { read_text(&root, "/loader/try").map(|t| t.trim().parse::<u32>().unwrap_or(0)) } else { None };
+    // 前のカーネルに戻すわけ (aios.fallback_why=。aiosd が /var/log/aiosd.log と aios get boot.last に残す):
+    //   unfinished 前の起動が aiosd まで来なかった / load 新しいものが読めない / chosen 一覧で選んだ
+    let mut why = "";
     if let Some(left) = trying {
         if left == 0 {
             if let Some(i) = entries.iter().position(|e| e.id == PREV_ENTRY) {
                 say("aiboot: the new kernel did not finish booting; booting the previous kernel\n");
                 def = i;
+                why = "unfinished";
             }
         } else {
             // 数字の桁は変わらないように (9 → 8 など、1 桁で使う)
@@ -414,17 +418,25 @@ extern "efiapi" fn efi_main(image: usize, st: usize) -> Status {
         }
     }
     let mut pick = if timeout == Some(0) { def } else { menu(&entries, def, timeout) };
+    if why.is_empty() && pick != def {
+        why = "chosen";
+    }
     // 起動できなければ、ほかの項目を順に
     for _ in 0..entries.len() {
         let e = &entries[pick];
         if trying.is_some() && e.id == PREV_ENTRY {
             // 新しいカーネルを試しているのに前のもので起動する (自動で、一覧で選んだ、新しいものが読めなかった):
             // aiosd が /boot/Image を前のものに戻す
-            let options = if e.options.is_empty() { "aios.fallback=1".into() } else { alloc::format!("{} aios.fallback=1", e.options) };
-            boot(image, &root, &e.linux, &options);
+            let mut options = alloc::format!("{} aios.fallback=1", e.options);
+            if !why.is_empty() {
+                options = alloc::format!("{} aios.fallback_why={}", options, why);
+            }
+            boot(image, &root, &e.linux, options.trim_start());
         } else {
             boot(image, &root, &e.linux, &e.options);
         }
+        // ここに来たら、いまの項目は読めなかった (boot はうまくいけば戻らない)
+        why = "load";
         pick = (pick + 1) % entries.len();
     }
     LOAD_ERROR
