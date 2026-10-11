@@ -6,6 +6,8 @@
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する)
 #   bin/gitea.sh release ディスクのイメージ (aios-unix-aarch64.img.zst) を作り、ai/os のリリース unix-latest に置きかえる
 #                        (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
+#   bin/gitea.sh mirror  GitHub のリリース unix-latest (CI が作って起動をたしかめたもの) をそのまま ai/os の unix-latest に
+#                        (作らないので速い。版とコミットも GitHub のもの)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -21,7 +23,7 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -100,22 +102,33 @@ case "$1" in
     git -c "$(auth)" push -q --force origin new:main
     echo "ai/repo: pushed $(git rev-parse --short HEAD) (history squashed)"
     ;;
-  release)
+  release | mirror)
     # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース unix-latest に
-    # 置きかえる。rootfs はこのリポジトリと repo/aarch64 のパッケージから作る (AIOS_SERVER から取るなら -r)
+    # 置きかえる。rootfs はこのリポジトリと repo/aarch64 のパッケージから作る (AIOS_SERVER から取るなら -r)。
+    # mirror は作らずに GitHub の unix-latest をそのまま
     api=$host/api/v1/repos/ai/os
     hdr=
     [ -n "$GITEA_TOKEN" ] && hdr="Authorization: token $GITEA_TOKEN"
     call() { curl -fsS ${hdr:+-H "$hdr"} "$@"; }
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    bin/mkrootfs.sh ${AIOS_RELEASE_REMOTE:+-r} all > "$tmp/rootfs.log" 2>&1 || { tail "$tmp/rootfs.log" >&2; exit 1; }
-    # 8G (空きはゼロなので .zst は小さいまま。zstd -d は sparse に書くので、ホストのディスクは使ったぶんだけ)。
-    # スワップ 1G は cargo のビルドのため
-    SWAP=${AIOS_RELEASE_SWAP:-1G} bin/mkdisk.sh "${AIOS_RELEASE_SIZE:-8G}"
-    zstd -q -19 -T0 -f disk.img -o "$tmp/aios-unix-aarch64.img.zst"
-    ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
-    sha=$(git rev-parse HEAD)
+    if [ "$1" = mirror ]; then
+      gh=https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst
+      info=$(curl -fsS https://api.github.com/repos/syui/aios/releases/tags/unix-latest)
+      # 名前は "unix-latest (VER)"
+      ver=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"].split("(",1)[-1].rstrip(")"))')
+      sha=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_commitish"])')
+      curl -fsSL -o "$tmp/aios-unix-aarch64.img.zst" "$gh"
+      zstd -t -q "$tmp/aios-unix-aarch64.img.zst"
+    else
+      bin/mkrootfs.sh ${AIOS_RELEASE_REMOTE:+-r} all > "$tmp/rootfs.log" 2>&1 || { tail "$tmp/rootfs.log" >&2; exit 1; }
+      # 8G (空きはゼロなので .zst は小さいまま。zstd -d は sparse に書くので、ホストのディスクは使ったぶんだけ)。
+      # スワップ 1G は cargo のビルドのため
+      SWAP=${AIOS_RELEASE_SWAP:-1G} bin/mkdisk.sh "${AIOS_RELEASE_SIZE:-8G}"
+      zstd -q -19 -T0 -f disk.img -o "$tmp/aios-unix-aarch64.img.zst"
+      ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
+      sha=$(git rev-parse HEAD)
+    fi
     # 前の unix-latest (リリースとタグ) を消す
     old=$(call "$api/releases/tags/unix-latest" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
     [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
