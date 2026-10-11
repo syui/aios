@@ -723,6 +723,10 @@ pub const PIPE_SIZE: usize = 64 * 1024;
 /// 大きなロックなしの read/write (Pipe::fast_rw) の数: [0] はうまくいったもの、ほかはふつうの道へ行ったわけ
 /// (2 大きさ、3 fd の表をほかのスレッドが変えている途中、4 パイプでない、5 6 7 ... は fast_rw_inner を見よ)。/proc/bkl に出す
 pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
+/// 大きなロックなしのファイルの read (fast_read_file) の数: [0] うまくいったもの、ほかはふつうの道へ行ったわけ
+/// (1 大きさ、2 IN_ACCESS の見張り、3 fd の表を分けている、4 開いたファイルを分けている、5 ext4 のファイルでない、
+/// 6 ページキャッシュにない)。/proc/bkl に出す
+pub static FAST_READ: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
 /// ページ (4KiB) をつないだ FIFO
@@ -870,30 +874,77 @@ pub struct Pipe {
 /// fd の表をほかのスレッドと、開いたファイル (オフセット) をほかの fd やプロセスと分けていない、
 /// IN_ACCESS を待つ inotify の見張りがない、ときだけ。ほかは None でふつうの道へ
 pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
-    const MAX: usize = 256 * 1024;
-    if len == 0 || len > MAX || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
+    let r = fast_read_file_inner(me, fd, va, len);
+    FAST_READ[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    r.ok()
+}
+
+/// 大きなロックなしの /dev/null・/dev/zero・/dev/urandom の read / write (syscall::fast)。書くものは捨てるだけ
+/// (ユーザーのメモリも読まない。Linux と同じ)、/dev/null は読むと 0、/dev/zero は 0 で埋める (/dev/urandom の
+/// 読みはふつうの道)。開いたファイルの種類と読み書きの口はあとで変わらないので、借りずに見る
+pub fn fast_dev(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) -> Option<i64> {
     let files = me.files.as_ref()?;
-    if !files.private() {
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let f = files.get().get(fd)?;
+    let of = unsafe { &*f.as_ptr() };
+    if !matches!(of.kind, Kind::Null | Kind::Zero | Kind::Random) {
         return None;
     }
-    let f = files.get().get(fd)?;
-    if Rc::strong_count(f) != 1 {
+    if write {
+        // 書けない口なら EBADF をふつうの道で
+        return of.writable().then_some(len as i64);
+    }
+    if !of.readable() {
         return None;
+    }
+    match of.kind {
+        Kind::Null => Some(0),
+        Kind::Zero if len <= 64 * 1024 => {
+            const Z: [u8; 4096] = [0; 4096];
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(Z.len());
+                // 写っていないページがあれば、ふつうの道でやりなおす (そこまで書いた 0 はそのままでよい)
+                if !me.pt().copy_out_nofault(va + done, &Z[..n]) {
+                    return None;
+                }
+                done += n;
+            }
+            Some(len as i64)
+        }
+        _ => None,
+    }
+}
+
+/// fast_read_file の中身。Err はふつうの道へ行ったわけ (FAST_READ の番号)
+fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Result<i64, usize> {
+    const MAX: usize = 256 * 1024;
+    if len == 0 || len > MAX {
+        return Err(1);
+    }
+    if crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return Err(2);
+    }
+    let files = me.files.as_ref().ok_or(3usize)?;
+    if !files.private() {
+        return Err(3);
+    }
+    let f = files.get().get(fd).ok_or(5usize)?;
+    if Rc::strong_count(f) != 1 {
+        return Err(4);
     }
     // この fd の開いたファイルは、このスレッドのほかにだれも持っていない (借りずに見て、オフセットを進める)
     let of = unsafe { &mut *f.as_ptr() };
     if of.flags & O_ACCMODE == O_WRONLY {
-        return None;
+        return Err(5);
     }
-    let Kind::Inode(ino, _) = &of.kind else { return None };
+    let Kind::Inode(ino, _) = &of.kind else { return Err(5) };
     if !ino.page_cacheable() {
-        return None;
+        return Err(5);
     }
-    let n = crate::vm::read_fast(me.pt(), ino.id(), of.offset, va, len)?;
+    let n = crate::vm::read_fast(me.pt(), ino.id(), of.offset, va, len).ok_or(6usize)?;
     of.offset += n;
-    Some(n as i64)
+    Ok(n as i64)
 }
 
 /// 大きなロックなしの pread64 (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部
