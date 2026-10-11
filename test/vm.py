@@ -424,5 +424,10 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ConnectionRefusedError, FileNotFoundError):
+    except ConnectionRefusedError:
+        sys.exit('vm: not started (test/vm.py start)')
+    except FileNotFoundError as e:
+        # ctl のソケットがない (connect には名前がつかない) のと、put で送るファイルがないのを分ける
+        if e.filename and e.filename != CTL:
+            sys.exit('vm: %s: no such file' % e.filename)
         sys.exit('vm: not started (test/vm.py start)')
