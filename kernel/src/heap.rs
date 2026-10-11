@@ -23,6 +23,107 @@ fn free_blocks(h: &Heap) -> (usize, usize) {
     (n, big)
 }
 
+// ---- どこで取ったか (調べもの用。/proc/ai/ctl に heap trace on) ----
+// 取ったところの呼び出し (フレームポインタで 6 段) ごとに、いま持っているバイトと数を数える。
+// どの場所のものかは、ブロックのヘッダの 2 語目 (ふだんは空き) に番号 + 1 を書いておき、返すときに引く
+
+const SITES: usize = 512;
+const DEPTH: usize = 6;
+
+#[derive(Clone, Copy)]
+struct Site {
+    at: [usize; DEPTH],
+    bytes: usize,
+    count: usize,
+}
+
+static mut SITE: [Site; SITES] = [Site { at: [0; DEPTH], bytes: 0, count: 0 }; SITES];
+pub static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 呼び出し (alloc 自身の 2 段は飛ばす)
+fn callers() -> [usize; DEPTH] {
+    let mut at = [0; DEPTH];
+    let mut fp: usize;
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut i = 0;
+    let mut skip = 2;
+    while i < DEPTH && fp != 0 && fp % 16 == 0 && fp >= crate::memlayout::KBASE {
+        let (next, lr) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+        if lr == 0 {
+            break;
+        }
+        if skip > 0 {
+            skip -= 1;
+        } else {
+            at[i] = lr;
+            i += 1;
+        }
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    at
+}
+
+/// HEAP のロックを持って呼ぶ。番号 + 1 (いっぱいなら 0)
+fn site_add(bytes: usize) -> usize {
+    let at = callers();
+    let t = unsafe { &mut *(&raw mut SITE) };
+    let mut free = None;
+    for (i, s) in t.iter_mut().enumerate() {
+        if s.count > 0 && s.at == at {
+            s.bytes += bytes;
+            s.count += 1;
+            return i + 1;
+        }
+        if s.count == 0 && free.is_none() {
+            free = Some(i);
+        }
+    }
+    let Some(i) = free else { return 0 };
+    t[i] = Site { at, bytes, count: 1 };
+    i + 1
+}
+
+fn site_sub(id: usize, bytes: usize) {
+    if id == 0 || id > SITES {
+        return;
+    }
+    let s = unsafe { &mut (*(&raw mut SITE))[id - 1] };
+    s.bytes = s.bytes.saturating_sub(bytes);
+    s.count = s.count.saturating_sub(1);
+}
+
+/// heap trace on|off|reset
+pub fn trace(on: bool) {
+    let _h = HEAP.lock();
+    TRACE.store(on, Relaxed);
+}
+
+/// /proc/ai/heap に足す: いま持っているバイトの多い場所 20 (1 行 1 つ)
+fn sites_json(out: &mut alloc::string::String) {
+    let mut top: [(usize, usize, [usize; DEPTH]); 20] = [(0, 0, [0; DEPTH]); 20];
+    {
+        let _h = HEAP.lock();
+        for s in unsafe { (*(&raw const SITE)).iter() } {
+            if s.count == 0 {
+                continue;
+            }
+            if let Some(m) = (0..top.len()).min_by_key(|&k| top[k].0) {
+                if s.bytes > top[m].0 {
+                    top[m] = (s.bytes, s.count, s.at);
+                }
+            }
+        }
+    }
+    top.sort_by(|a, b| b.0.cmp(&a.0));
+    for (bytes, count, at) in top.iter().filter(|t| t.0 > 0) {
+        let at: alloc::vec::Vec<alloc::string::String> = at.iter().filter(|&&a| a != 0).map(|a| alloc::format!("\"{:#x}\"", a)).collect();
+        out.push_str(&alloc::format!("{{\"bytes\":{},\"count\":{},\"at\":[{}]}}\n", bytes, count, at.join(",")));
+    }
+}
+
 /// ヒープの大きさと、いま使っているバイト (ほかが混みぐあいを見て減らすため: ページキャッシュの表など)
 pub const SIZE: usize = HEAP_SIZE;
 pub fn used() -> usize {
@@ -32,7 +133,7 @@ pub fn used() -> usize {
 /// /proc/ai/heap: 1 行の JSON
 pub fn stats_json() -> alloc::string::String {
     let (n, big) = free_blocks(&HEAP.lock());
-    alloc::format!(
+    let mut s = alloc::format!(
         "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{}}}\n",
         HEAP_SIZE,
         USED.load(Relaxed),
@@ -40,7 +141,11 @@ pub fn stats_json() -> alloc::string::String {
         n,
         big,
         FAILS.load(Relaxed)
-    )
+    );
+    if TRACE.load(Relaxed) {
+        sites_json(&mut s);
+    }
+    s
 }
 
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
@@ -104,6 +209,8 @@ unsafe impl GlobalAlloc for Kernel {
                     }
                     let used = USED.fetch_add(*(cur as *mut usize), Relaxed) + *(cur as *mut usize);
                     PEAK.fetch_max(used, Relaxed);
+                    // ヘッダの 2 語目: どこで取ったか (調べているときだけ。ほかは 0)
+                    *(cur as *mut usize).add(1) = if TRACE.load(Relaxed) { site_add(*(cur as *mut usize)) } else { 0 };
                     return (cur as *mut u8).add(HDR);
                 }
                 prev = &mut (*cur).next;
@@ -130,6 +237,7 @@ unsafe impl GlobalAlloc for Kernel {
             let size = *(blk as *mut usize);
             USED.fetch_sub(size, Relaxed);
             let mut h = HEAP.lock();
+            site_sub(*(blk as *mut usize).add(1), size);
             // アドレス順の位置を探して挿入し、前後と結合する
             let mut prev: *mut Free = ptr::null_mut();
             let mut cur = h.head;

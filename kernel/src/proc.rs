@@ -1318,7 +1318,10 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
             for t in p.siblings() {
                 kill_proc(t);
             }
-            exit(0);
+            // このスレッドはシステムコールから戻るところ (check_killed) で終わる。ここで exit すると、呼んだ側
+            // (sys_execve) がコピーした引数と環境 (zig cc は 1000 を超える) が片づけられずに残る
+            p.killed = true;
+            return Ok(());
         }
     }
     finish_exec(p, img, path);

@@ -686,6 +686,8 @@ pub fn rt_sigreturn(tf: &mut TrapFrame) -> R {
     let sp = tf.sp_el0 as usize;
     let mut f = alloc::vec![0u8; FRAME - 16];
     if p.pt().copy_in(&mut f, sp).is_none() {
+        // die は戻らないので、先に片づける (残すともれる)
+        drop(f);
         proc::die(SIGSEGV);
     }
     let uc = FRAME_INFO;

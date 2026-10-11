@@ -14,6 +14,7 @@
 //               pcmiss on|off ページキャッシュに無かったものを kmsg に
 //               strace NAME   /proc/strace と同じ (+NAME でうまくいったものも、空で止める)
 //               bkl reset     /proc/bkl を 0 から
+//               heap trace on|off  /proc/ai/heap に、ヒープをいま多く持っている場所 (呼び出しの番地) も出す
 //               panic [TEXT]  カーネルを panic させる (root だけ。panic の出力とバックトレースを確かめる。Linux の
 //                             sysrq-trigger の c と同じ)
 use alloc::format;
@@ -67,7 +68,7 @@ pub fn fds_json(tgid: u32) -> Result<String, i64> {
     Ok(out)
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -84,6 +85,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "pcmiss" => crate::vm::MISS_LOG.store(arg != "off", core::sync::atomic::Ordering::Relaxed),
         "strace" => crate::syscall::strace_set(arg.as_bytes()),
         "bkl" if arg == "reset" => crate::smp::stats_reset(),
+        "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),
         "panic" => {
             const EPERM: i64 = 1;
             if crate::proc::current().cred.euid != 0 {
