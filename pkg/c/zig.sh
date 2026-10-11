@@ -16,6 +16,23 @@ zig_sha256() {
   esac
 }
 
+# zig_fix_libc LIBDIR: Zig 0.17 の libc (lib/c/malloc.zig) の realloc は大きさ 0 なら NULL を返すが、
+#   realloc(NULL, 0) は malloc(0) と同じでなければならず (C の決まり)、musl は realloc(p, 0) にも NULL でないものを返す。
+#   gnulib は musl ならそうだと思って xnmalloc(0, ...) などを NULL で「memory exhausted」にする (GNU sed の s/a/b/ が動かない)。
+#   大きさ 0 の分かれ道を消して、musl と同じく 0 バイトの場所を返す (2 度あててもよい)
+zig_fix_libc() {
+  local f=$1/c/malloc.zig
+  [ -f "$f" ] || return 0
+  grep -q 'aios: realloc(p, 0)' "$f" && return 0
+  awk '
+    /^fn realloc\(/ { inr = 1 }
+    inr && /^    if \(n == 0\) \{$/ { skip = 1; print "    // aios: realloc(p, 0) returns a 0-byte block, as musl does (no NULL for size 0)"; next }
+    skip { if (/^    \}$/) { skip = 0; inr = 0 } next }
+    { print }
+  ' "$f" > "$f.new" && mv "$f.new" "$f"
+  grep -q 'aios: realloc(p, 0)' "$f" || { echo "zig.sh: could not fix $f" >&2; return 1; }
+}
+
 zig_env() {
   local m os host dir top tarball want
   m=$(uname -m)
@@ -36,6 +53,7 @@ zig_env() {
     fi
     tar -C "$top/build/zig" -xf "$tarball"
   fi
+  zig_fix_libc "$dir/lib"
   export PATH=$dir:$PATH
   export CC="zig cc -target aarch64-linux-musl"
   export CXX="zig c++ -target aarch64-linux-musl"

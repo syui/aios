@@ -3,7 +3,7 @@
 #   探す場所は /opt/c (aios の C のライブラリ) と /usr
 pkgname=pkgconf
 pkgver=3.0.8
-pkgrel=1
+pkgrel=2
 pkgdesc='pkg-config compatible tool to find C libraries (static, for aios)'
 arch=('aarch64')
 url='http://pkgconf.org/'

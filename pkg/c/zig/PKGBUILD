@@ -5,7 +5,7 @@
 # 版とチェックサムは pkg/c/zig.sh (ビルドする側の Zig) と同じにしておく
 pkgname=zig
 pkgver=0.17.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Zig compiler and toolchain (also a C/C++ compiler: zig cc)'
 arch=('aarch64')
 url='https://ziglang.org'
@@ -21,6 +21,9 @@ prepare() {
 package() {
   install -d "$pkgdir/opt/zig" "$pkgdir/opt/c/bin"
   cp -R "zig-aarch64-linux-$pkgver/." "$pkgdir/opt/zig/"
+  # realloc(p, 0) を musl と同じに (zig.sh の zig_fix_libc。0.17 の libc は NULL を返し、GNU sed などが動かない)
+  . "$startdir/../zig.sh"
+  zig_fix_libc "$pkgdir/opt/zig/lib"
   # aarch64-linux-musl に要らない libc
   local libc=$pkgdir/opt/zig/lib/libc d
   rm -rf "$libc"/{mingw,glibc,wasi,darwin,freebsd,netbsd,openbsd}

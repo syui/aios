@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=tmux
 pkgver=3.8
-pkgrel=1
+pkgrel=2
 pkgdesc='Terminal multiplexer (static, for aios)'
 arch=('aarch64')
 url='https://github.com/tmux/tmux'

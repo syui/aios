@@ -1,0 +1,37 @@
+# sed: GNU sed。静的なバイナリ
+#   前は uutils の sed (Rust) だったが、autoconf の config.status が使う書き方 (s&...&...& と & で区切る、
+#   [^...[ ...] のように [ の中の [) を読めず、configure を使う C のプログラム (jemalloc など) の make が
+#   みな止まったので GNU にかえた。名前は同じで版が上がるので ap -Syu で入れかわる
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。/usr/bin/sed を書いたスクリプトのため /usr/bin にも置く
+pkgname=sed
+pkgver=4.10
+pkgrel=1
+pkgdesc='GNU stream editor (static, for aios)'
+arch=('aarch64')
+url='https://www.gnu.org/software/sed/'
+license=('GPL-3.0-or-later')
+source=("https://ftp.gnu.org/gnu/sed/sed-$pkgver.tar.xz")
+sha256sums=('b8e72182b2ec96a3574e2998c47b7aaa64cc20ce000d8e9ac313cc07cecf28c7')
+
+prepare() {
+  rm -rf "sed-$pkgver"
+  tar -xJf "sed-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "sed-$pkgver"
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-nls --disable-acl --without-selinux
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "sed-$pkgver"
+  install -Dm755 sed/sed "$pkgdir$PREFIX/bin/sed"
+  install -d "$pkgdir/usr/bin"
+  ln -s "$PREFIX/bin/sed" "$pkgdir/usr/bin/sed"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
