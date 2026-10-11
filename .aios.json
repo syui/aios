@@ -1,7 +1,7 @@
 {
   "branch": "unix",
   "arch": "aarch64",
-  "updated": "2026-10-10",
+  "updated": "2026-10-11",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -50,7 +50,7 @@
 
     "linux": {
       "rust": {
-        "awk": "0.1.0.20261010", "brush": "0.4.0", "coreutils": "0.12.0", "diffutils": "0.5.0",
+        "awk": "0.1.0.20261010", "brush": "0.4.0", "coreutils": "0.12.0", "diffutils": "3.12",
         "findutils": "0.10.0", "grep": "0.2.0", "sed": "0.2.0.20261006", "sudo-rs": "0.2.15", "tar": "0.1.0.20261010",
         "ripgrep": "15.2.0", "fd": "10.5.0", "uv": "0.13.0"
       },

@@ -29,8 +29,7 @@ q rg -n root /etc/passwd /etc/group
 q fd conf /etc
 q jq -n '[1,2,3] | add'
 q diff /etc/passwd /etc/passwd
-# uutils の diffutils には -r (ディレクトリをまるごと) がまだない
-q diff -r /usr/share "$w/etc"
+q diff -ru /usr/share "$w/etc"
 q patch --version
 q less -F /etc/hostname
 q vim -es -c 'qa!' /etc/hostname

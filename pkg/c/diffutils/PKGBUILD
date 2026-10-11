@@ -1,0 +1,38 @@
+# diffutils: GNU diffutils (diff, cmp, diff3, sdiff)。静的なバイナリ
+#   前は uutils の diffutils (Rust) だったが、diff -r (ディレクトリをまるごと) などがまだないので GNU にかえた
+#   (Linux で書かれた diff の使いかた、AI の書く diff -ru がそのまま動く)。名前は同じで版が上がるので ap -Syu で入れかわる
+#   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
+pkgname=diffutils
+pkgver=3.12
+pkgrel=1
+pkgdesc='Utility programs used for creating patch files: diff, cmp, diff3, sdiff (GNU, static, for aios)'
+arch=('aarch64')
+url='https://www.gnu.org/software/diffutils/'
+license=('GPL-3.0-or-later')
+source=("https://ftp.gnu.org/gnu/diffutils/diffutils-$pkgver.tar.xz")
+sha256sums=('7c8b7f9fc8609141fdea9cece85249d308624391ff61dedaf528fcb337727dfd')
+
+prepare() {
+  rm -rf "diffutils-$pkgver"
+  tar -xJf "diffutils-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "diffutils-$pkgver"
+  # クロスビルドでは動かして確かめられないもの (musl ではちゃんと動く)
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-nls gl_cv_func_strcasecmp_works=yes
+  make
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "diffutils-$pkgver"
+  # diff3 と sdiff は $PREFIX/bin/diff を呼ぶ
+  for b in diff cmp diff3 sdiff; do
+    install -Dm755 "src/$b" "$pkgdir$PREFIX/bin/$b"
+  done
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
