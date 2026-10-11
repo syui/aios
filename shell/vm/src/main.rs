@@ -50,7 +50,7 @@ fn main() {
         keys: &[],
         tools: &[
             Tool { name: "vm", desc: "開発のマシンで aios の VM を動かす (test/vm.py): start (kernel: パス / . / git のコミット) stop status run (シリアルの端末でコマンド) put (ファイルを中へ) shot (画面を png に。Read で見る) keys (画面のキーボード: @alt-b @ctrl-l @ret、ほかは文字) log (シリアルの終わり、grep) mon (QEMU のモニタ)", input: VM },
-            Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
+            Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
         ],
@@ -240,11 +240,21 @@ fn zig(root: &Path) -> Option<String> {
     std::fs::read_dir(&d).ok()?.filter_map(|e| e.ok()).map(|e| e.path().join("zig")).find(|p| p.is_file()).map(|p| p.display().to_string())
 }
 
+/// C を aarch64 の静的なプログラムにするもの: zig cc (musl) か、なければ aarch64-linux-gnu-gcc (glibc。クラウドの
+/// セッションはこちらだけを入れる)。(プログラム, 頭につける引数)
+fn compiler(root: &Path, cxx: bool) -> Option<(String, Vec<String>)> {
+    if let Some(z) = zig(root) {
+        return Some((z, vec![if cxx { "c++" } else { "cc" }.into(), "-target".into(), "aarch64-linux-musl".into()]));
+    }
+    let gcc = if cxx { "aarch64-linux-gnu-g++" } else { "aarch64-linux-gnu-gcc" };
+    (sh(root, gcc, &["--version"], &[], Duration::from_secs(10)).0 == 0).then(|| (gcc.to_string(), vec!["-pthread".into()]))
+}
+
 fn try_(root: &Path, a: &Value) -> Value {
-    let Some(z) = zig(root) else { return error("no zig (PATH, $ZIG or build/zig/*/zig)") };
+    let cxx = s(a, "lang") == "c++";
+    let Some((cc, head)) = compiler(root, cxx) else { return error("no compiler: zig (PATH, $ZIG or build/zig/*/zig) or aarch64-linux-gnu-gcc") };
     let dir = root.join("build/aish-vm/try");
     let _ = std::fs::create_dir_all(&dir);
-    let cxx = s(a, "lang") == "c++";
     let src = match a["file"].as_str().filter(|f| !f.is_empty()) {
         Some(f) => PathBuf::from(f),
         None => {
@@ -257,12 +267,13 @@ fn try_(root: &Path, a: &Value) -> Value {
     };
     let bin = dir.join("try");
     let (srcs, bins) = (src.display().to_string(), bin.display().to_string());
-    let mut args: Vec<String> = vec![if cxx { "c++" } else { "cc" }.into(), "-target".into(), "aarch64-linux-musl".into(), "-O2".into(), "-static".into(), "-s".into(), "-o".into(), bins.clone(), srcs];
+    let mut args: Vec<String> = head;
+    args.extend(["-O2".into(), "-static".into(), "-s".into(), "-o".into(), bins.clone(), srcs]);
     if let Some(f) = a["cflags"].as_array() {
         args.extend(f.iter().filter_map(|x| x.as_str().map(String::from)));
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (st, _, cerr, cms, _) = sh(root, &z, &argv, &[], Duration::from_secs(120));
+    let (st, _, cerr, cms, _) = sh(root, &cc, &argv, &[], Duration::from_secs(120));
     if st != 0 {
         return json!({ "error": "compile failed", "compile": cerr.trim(), "compile_ms": cms });
     }
