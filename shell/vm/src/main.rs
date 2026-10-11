@@ -126,6 +126,36 @@ fn sh(root: &Path, prog: &str, args: &[&str], env: &[(&str, String)], timeout: D
     (st, to.join().unwrap_or_default(), te.join().unwrap_or_default(), t0.elapsed().as_millis() as u64, timed_out)
 }
 
+/// run の答えに入れる出力の大きさ (aish --mcp の run と同じ)
+const MAX_OUT: usize = 12_000;
+
+/// 長ければ頭 (1/3) と終わり (2/3) だけにし、全部は build/aish-vm/out.txt に (read や grep で読めるように)。
+/// aish の run と同じ形で、行の切れ目で切る
+fn cut(root: &Path, s: String) -> String {
+    if s.len() <= MAX_OUT {
+        return s;
+    }
+    let file = root.join("build/aish-vm/out.txt");
+    let saved = std::fs::write(&file, &s).is_ok();
+    let mut head = MAX_OUT / 3;
+    while !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    if let Some(k) = s[..head].rfind('\n') {
+        head = k + 1;
+    }
+    let mut tail = s.len() - MAX_OUT * 2 / 3;
+    while !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    if let Some(k) = s[tail..].find('\n') {
+        tail += k + 1;
+    }
+    let lines = s[head..tail].matches('\n').count();
+    let how = if saved { format!(". all of it is in {} (read / grep it)", file.display()) } else { String::new() };
+    format!("{}... ({} lines, {} bytes cut{}) ...\n{}", &s[..head], lines, tail - head, how, &s[tail..])
+}
+
 /// test/vm.py を動かす
 fn vmpy(root: &Path, args: &[&str], env: &[(&str, String)], timeout: Duration) -> (i32, String, String, u64, bool) {
     let mut a = vec!["test/vm.py"];
@@ -160,7 +190,8 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
         "stop" | "status" => res(vmpy(root, &[op], &[], short)),
         "run" => {
             let t = secs(a, "timeout", 50.0, 50.0);
-            res(vmpy(root, &["run", s(a, "cmd"), "-t", &format!("{}", t)], &[], Duration::from_secs_f64(t + 5.0)))
+            let (st, out, err, ms, to) = vmpy(root, &["run", s(a, "cmd"), "-t", &format!("{}", t)], &[], Duration::from_secs_f64(t + 5.0));
+            res((st, cut(root, out), err, ms, to))
         }
         "put" => {
             let local = s(a, "local");
