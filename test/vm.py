@@ -127,7 +127,11 @@ class Serve:
         tag = 'VMEND%d' % int(time.time() * 1000)
         with self.cv:
             self.buf = b''
-        os.write(self.m, (cmd + '; echo ' + tag + ' $?\r').encode())
+        # "cmd &; echo" and "cmd;; echo" are syntax errors: a line that ends
+        # with & (into the background) or ; is followed by the echo as it is
+        cmd = cmd.rstrip()
+        sep = ' ' if cmd.endswith(';') or (cmd.endswith('&') and not cmd.endswith('&&')) else '; '
+        os.write(self.m, (cmd + sep + 'echo ' + tag + ' $?\r').encode())
         out, mm = self.wait_for(re.compile((tag + r' (\d+)\r*\n').encode()), timeout)
         if out is None:
             # 止める (Ctrl-C) と、プロンプトに戻るのを少し待つ
