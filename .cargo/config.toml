@@ -2,5 +2,7 @@
 target = "aarch64-unknown-none-softfloat"
 
 [target.aarch64-unknown-none-softfloat]
+# panic でフレームポインタをたどってバックトレースを出すため (kernel/src/main.rs の backtrace)
+rustflags = ["-C", "force-frame-pointers=yes"]
 # どこで cargo run しても、リポジトリの bin/run.sh を使う (CARGO_MANIFEST_DIR は kernel/)
 runner = ["sh", "-c", 'exec sh "$CARGO_MANIFEST_DIR/../bin/run.sh" "$@"', "run"]

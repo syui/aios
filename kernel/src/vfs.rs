@@ -105,6 +105,12 @@ pub trait Inode {
     fn lookup(&self, name: &str) -> Result<InodeRef, i64>;
     /// . と .. は含めない
     fn readdir(&self) -> Result<Vec<DirEntry>, i64>;
+    /// 名前の順に並ぶファイルシステム (tmpfs) だけ: 名前が after より後ろの項目を順に f へ (名前, ino, mode)。
+    /// f が false を返したら止める。ぜんぶをコピーしないので、大きなディレクトリでもヒープを使わない。
+    /// 読みながら消したり足したりしても、名前で続きを探すので飛ばさない。None なら使えない (readdir を使う)
+    fn readdir_after(&self, _after: Option<&str>, _f: &mut dyn FnMut(&str, u64, u32) -> bool) -> Option<Result<(), i64>> {
+        None
+    }
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64>;
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64>;
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64>;

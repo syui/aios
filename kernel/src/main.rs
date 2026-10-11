@@ -126,5 +126,32 @@ fn halt() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("panic: {}", info);
+    backtrace();
     halt()
+}
+
+/// フレームポインタ (x29) をたどって、呼んだところの番地を出す (.cargo/config.toml の force-frame-pointers)。
+/// addr2line -e カーネルの ELF -f -C 番地 ... で関数と行になる
+fn backtrace() {
+    let mut fp: usize;
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp) };
+    let lo = memlayout::p2v(memlayout::ram_base());
+    let hi = lo + memlayout::ram_size();
+    // ヒープを使わない (ヒープが足りなくて panic したときにも出せるように)
+    print!("backtrace:");
+    for _ in 0..32 {
+        if fp % 16 != 0 || fp < lo || fp + 16 > hi {
+            break;
+        }
+        let (next, lr) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+        if lr == 0 {
+            break;
+        }
+        print!(" {:#x}", lr);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    println!();
 }

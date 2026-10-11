@@ -105,6 +105,8 @@ pub struct OpenFile {
     /// ディレクトリ: 最初の getdents (offset 0) で読んだ一覧。続きはここから返す
     /// (読みながら消しても番号がずれず、読み飛ばさない。rewinddir で offset が 0 に戻れば読みなおす)
     dirents: Option<Rc<Vec<(u64, String, u32)>>>,
+    /// readdir_after で読むディレクトリ (tmpfs): (offset, そこまでに返した最後の名前)
+    dir_cursor: Option<(usize, String)>,
     /// ふつうのファイルを読んでいる途中 (read_inode_file。ディスクを眠って待つことがある)。同じ開いたファイルを
     /// 読むほかの人は、終わるまで待つ (オフセットを同時に進めない)
     reading: bool,
@@ -113,7 +115,7 @@ pub struct OpenFile {
 pub type FileRef = Rc<RefCell<OpenFile>>;
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, dir_cursor: None, reading: false }))
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
@@ -625,6 +627,12 @@ impl OpenFile {
         if !dir.meta().is_dir() {
             return Err(-ENOTDIR);
         }
+        // 名前の順に読めるもの (tmpfs): 全部をコピーせずに、名前のカーソルで続きから (offset は 1 が .、2 が ..、あとは項目の数)
+        let (d, p) = (dir.clone(), path.clone());
+        if let Some(r) = self.getdents_stream(d, p, out, max) {
+            return r;
+        }
+        let Kind::Inode(dir, path) = &self.kind else { return Err(-ENOTDIR) };
         let list = match &self.dirents {
             Some(l) if self.offset != 0 => l.clone(),
             _ => {
@@ -659,6 +667,85 @@ impl OpenFile {
             self.offset = i + 1;
         }
         Ok(())
+    }
+}
+
+impl OpenFile {
+    fn getdents_stream(&mut self, dir: InodeRef, path: String, out: &mut Vec<u8>, max: usize) -> Option<Result<(), i64>> {
+        // 使えるか (空の f で 0 個読んでみる)
+        dir.readdir_after(Some("\u{10ffff}"), &mut |_, _, _| false)?.ok()?;
+        // lseek で動かされていたら (seekdir など)、はじめから数えなおしてカーソルを作る
+        let mut cursor: Option<String> = match self.dir_cursor.take() {
+            Some((off, name)) if off == self.offset => Some(name),
+            _ if self.offset <= 2 => None,
+            _ => {
+                let (mut n, mut last) = (2usize, None);
+                let want = self.offset;
+                let r = dir.readdir_after(None, &mut |name, _, _| {
+                    n += 1;
+                    last = Some(String::from(name));
+                    n < want
+                });
+                if let Some(Err(e)) = r {
+                    return Some(Err(e));
+                }
+                last
+            }
+        };
+        let put = |out: &mut Vec<u8>, ino: u64, name: &str, mode: u32, off: usize| -> bool {
+            let reclen = (19 + name.len() + 1 + 7) & !7;
+            if out.len() + reclen > max {
+                return false;
+            }
+            let start = out.len();
+            out.extend_from_slice(&ino.to_le_bytes());
+            out.extend_from_slice(&(off as i64).to_le_bytes());
+            out.extend_from_slice(&(reclen as u16).to_le_bytes());
+            out.push(dtype(mode));
+            out.extend_from_slice(name.as_bytes());
+            out.resize(start + reclen, 0);
+            true
+        };
+        if self.offset < 1 {
+            if !put(out, dir.meta().ino, ".", vfs::S_IFDIR, 1) {
+                return Some(Err(-EINVAL));
+            }
+            self.offset = 1;
+        }
+        if self.offset < 2 {
+            let parent = vfs::resolve("", &vfs::normalize(&path, ".."), true).unwrap_or_else(|_| dir.clone());
+            if !put(out, parent.meta().ino, "..", vfs::S_IFDIR, 2) {
+                return Some(if out.is_empty() { Err(-EINVAL) } else { Ok(()) });
+            }
+            self.offset = 2;
+        }
+        let mut off = self.offset;
+        let after = cursor.clone();
+        let r = dir.readdir_after(after.as_deref(), &mut |name, ino, mode| {
+            if !put(out, ino, name, mode, off + 1) {
+                return false;
+            }
+            off += 1;
+            cursor = Some(String::from(name));
+            true
+        })?;
+        if let Err(e) = r {
+            return Some(Err(e));
+        }
+        if out.is_empty() {
+            // 1 つも入らなかった: 次の項目がバッファより大きい (終わりまで読んだときは out は空で Ok)
+            let mut more = false;
+            dir.readdir_after(after.as_deref(), &mut |_, _, _| {
+                more = true;
+                false
+            });
+            if more {
+                return Some(Err(-EINVAL));
+            }
+        }
+        self.offset = off;
+        self.dir_cursor = cursor.map(|c| (off, c));
+        Some(Ok(()))
     }
 }
 

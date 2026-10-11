@@ -371,6 +371,19 @@ impl Inode for TmpInode {
         })
     }
 
+    fn readdir_after(&self, after: Option<&str>, f: &mut dyn FnMut(&str, u64, u32) -> bool) -> Option<Result<(), i64>> {
+        use core::ops::Bound;
+        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+        Some(self.with_dir(|m| {
+            for (name, c) in m.range::<str, _>((from, Bound::Unbounded)) {
+                if !f(name, c.ino, c.attr.borrow().mode) {
+                    break;
+                }
+            }
+            Ok(())
+        }))
+    }
+
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
         crate::vfs::dir_changed(self.id());
         let mode = node.type_bits() | (mode & 0o7777);
