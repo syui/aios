@@ -435,6 +435,8 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     // 他のスレッドがグループを止めたなら、ここで止まる
     proc::stop_while_stopped();
     let p = proc::current();
+    // 他のスレッドの execve を引きついだばかり: 割り込まれたのは前のプログラムのシステムコールなので、やり直さない
+    let interrupted = if core::mem::take(&mut p.no_restart) { None } else { interrupted };
     let mut handled = false;
     loop {
         let ready = p.sig_pending & !p.sig_mask;

@@ -381,5 +381,7 @@ fn hwcap() -> u64 {
     if f(isar0, 20) >= 2 {
         h |= 1 << 8; // ATOMICS (LSE)
     }
+    // CPUID: EL0 の MRS で ID レジスタを読める (trap.rs の emulate_mrs)
+    h |= 1 << 11;
     h
 }

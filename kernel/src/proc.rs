@@ -259,6 +259,11 @@ pub struct Proc {
     pub clear_tid: usize,
     /// CLONE_VFORK で作られた子: exec か終わりまで待っている親の pid (なければ 0)
     pub vfork_parent: u32,
+    /// 代表でないスレッドが execve した (代表スレッドに置く): 読みこんだプログラムとパス。
+    /// 代表スレッドが check_killed でそれになって続ける (Linux と同じく PID はそのまま、親から見て終わらない)
+    exec_takeover: Option<(Image, String)>,
+    /// execve を引きついだばかり: 割り込まれた前のシステムコールをやり直さない (signal::deliver が見る)
+    pub no_restart: bool,
     /// ジョブ制御 (代表スレッドだけが使う): 止められているか、
     /// wait (WUNTRACED / WCONTINUED) にまだ知らせていない停止のシグナル / 再開
     pub stopped: bool,
@@ -340,6 +345,8 @@ impl Proc {
         thread: false,
         clear_tid: 0,
         vfork_parent: 0,
+        exec_takeover: None,
+        no_restart: false,
         stopped: false,
         stop_report: 0,
         cont_report: false,
@@ -1145,6 +1152,13 @@ fn group_exit_status(status: i32) -> ! {
 pub fn check_killed() {
     let p = current();
     if p.killed {
+        // 他のスレッドが execve した: このスレッド (代表) がそのプログラムになって続ける (SIGKILL が来ていなければ)
+        if let Some((img, path)) = p.exec_takeover.take().filter(|_| p.group_exit.is_none()) {
+            p.killed = false;
+            finish_exec(p, img, &path);
+            p.no_restart = true;
+            return;
+        }
         let status = if p.thread { 0 } else { p.group_exit.unwrap_or(SIGKILL) };
         exit_status(status);
     }
@@ -1295,6 +1309,24 @@ fn vfork_done(p: &mut Proc) {
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
     let img = exec::exec(path, argv, envp)?;
     let p = current();
+    // 代表でないスレッドが execve した (zig cc -MM は働き手のスレッドから clang に execve する):
+    // Linux では他のスレッドが消えて、このスレッドが代表の PID で新しいプログラムになる。ここでは読みこんだものを
+    // 代表スレッドにわたして、代表スレッドがそれになる (親から見て、プロセスは終わらずに execve したように見える)
+    if p.thread {
+        if let Some(l) = find(p.tgid).filter(|l| l.state != State::Zombie && !l.killed) {
+            l.exec_takeover = Some((img, String::from(path)));
+            for t in p.siblings() {
+                kill_proc(t);
+            }
+            exit(0);
+        }
+    }
+    finish_exec(p, img, path);
+    Ok(())
+}
+
+/// execve の続き: 読みこんだプログラムに p を入れかえる (他のスレッドは消える)
+fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
     // (砂場の中から sudo で外へ出られないように)
     if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
@@ -1336,7 +1368,6 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
             *f = None;
         }
     }
-    Ok(())
 }
 
 const WNOHANG: u64 = 1;

@@ -103,6 +103,8 @@ const EL1H_IRQ: u64 = 5;
 const EL0_SYNC: u64 = 8;
 const EL0_IRQ: u64 = 9;
 
+const EC_UNKNOWN: u64 = 0x00;
+const EC_SYS64: u64 = 0x18;
 const EC_SVC64: u64 = 0x15;
 const EC_IABT_LOW: u64 = 0x20;
 const EC_DABT_LOW: u64 = 0x24;
@@ -191,6 +193,53 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     crate::smp::unlock();
 }
 
+/// EL0 の MRS で ID レジスタ (op0 = 3, op1 = 0, CRn = 0) を読んだものに、Linux と同じく答える
+/// (Linux はいつも答えるので AT_HWCAP の CPUID を見ずに読むものがある: zig の CPU しらべ)。
+/// MIDR はそのまま、MPIDR は Linux と同じ 1 << 31、ほかの ID レジスタはカーネルが使わせているところだけ (SVE、SME、MTE、
+/// ポインタ認証などは 0)、名前のないものは 0。答えたら次の命令へ
+fn emulate_mrs(tf: &mut TrapFrame) -> bool {
+    let mut w = [0u8; 4];
+    if proc::current().pt().copy_in(&mut w, tf.elr as usize).is_none() {
+        return false;
+    }
+    let insn = u32::from_le_bytes(w);
+    // MRS (L = 1)、op0 = 3
+    if insn & 0xfff8_0000 != 0xd538_0000 {
+        return false;
+    }
+    let (op1, crn, crm, op2, rt) = ((insn >> 16) & 7, (insn >> 12) & 0xf, (insn >> 8) & 0xf, (insn >> 5) & 7, (insn & 0x1f) as usize);
+    if op1 != 0 || crn != 0 {
+        return false;
+    }
+    macro_rules! rd {
+        ($r:literal) => {{
+            let v: u64;
+            unsafe { core::arch::asm!(concat!("mrs {}, ", $r), out(reg) v) };
+            v
+        }};
+    }
+    // 4 ビットの欄のうち、shift のものだけ残す
+    let keep = |v: u64, shifts: &[u32]| shifts.iter().fold(0, |a, &s| a | (v & (0xf << s)));
+    let v = match (crm, op2) {
+        (0, 0) => rd!("midr_el1"),
+        (0, 5) => 1 << 31,
+        // ID_AA64PFR0: EL0 から EL3、FP、AdvSIMD
+        (4, 0) => keep(rd!("id_aa64pfr0_el1"), &[0, 4, 8, 12, 16, 20]),
+        (6, 0) => rd!("id_aa64isar0_el1"),
+        // ID_AA64ISAR1: ポインタ認証 (APA API GPA GPI) を外す
+        (6, 1) => rd!("id_aa64isar1_el1") & !(0xff << 4 | 0xff << 24),
+        (7, 0) => rd!("id_aa64mmfr0_el1"),
+        (7, 1) => rd!("id_aa64mmfr1_el1"),
+        (7, 2) => rd!("id_aa64mmfr2_el1"),
+        _ => 0,
+    };
+    if rt != 31 {
+        tf.x[rt] = v;
+    }
+    tf.elr += 4;
+    true
+}
+
 fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
     match kind {
         EL1H_SYNC => {
@@ -245,6 +294,12 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
                             }
                             Err(e) => fault = Some(e),
                         }
+                    }
+                    // EL0 から ID レジスタを読んだ (MRS): Linux と同じく見せてよい値で答える (zig cc は CPU を調べるのに読む)
+                    if (ec == EC_UNKNOWN || ec == EC_SYS64) && emulate_mrs(tf) {
+                        proc::check_killed();
+                        signal::deliver(tf, None);
+                        return;
                     }
                     // 例外はシグナルにして、今のスレッドに必ず届ける
                     let (sig, code, addr) = match ec {
