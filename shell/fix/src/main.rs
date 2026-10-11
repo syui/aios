@@ -221,6 +221,11 @@ impl Build {
         }
         // cargo test: 落ちたテスト (---- NAME stdout ---- のかたまり) と、まとめの行
         test_failures(&out, &self.dir, &mut diags);
+        // しくじったのにエラーを拾えなかった: 場所のない「error: ...」の行 (cargo そのもののエラー:
+        // パッケージがない、Cargo.toml がこわれている、など) をエラーに。errors: 0 で済んだと思わないように
+        if self.status != Some(0) && !diags.iter().any(|d| d.error) {
+            bare_errors(&err, &mut diags);
+        }
         self.tests = out.lines().filter(|l| l.starts_with("test result:")).map(String::from).collect();
         // 同じもの (いくつものターゲットで同じエラー) は 1 つに
         let mut seen = std::collections::HashSet::new();
@@ -271,8 +276,8 @@ impl Build {
         if !self.tests.is_empty() {
             r["tests"] = json!(self.tests);
         }
-        // しくじったのにエラーを拾えなかった (cargo そのもののエラーなど): 標準エラーの終わりを見せる
-        if self.status != Some(0) && errors == 0 {
+        // しくじったのに場所のあるエラーを拾えなかった (cargo そのもののエラーなど): 標準エラーの終わりも見せる
+        if self.status != Some(0) && !self.diags.iter().any(|d| d.error && !d.path.is_empty()) {
             let e = String::from_utf8_lossy(&self.err.lock().unwrap()).into_owned();
             let mut cut = e.len().saturating_sub(TAIL);
             while !e.is_char_boundary(cut) {
@@ -439,6 +444,28 @@ fn text_line(line: &str, dir: &Path, diags: &mut Vec<Diag>) {
         let head = format!("{}: {}", if error { "error" } else { "warning" }, msg.trim());
         diags.push(Diag { error, path: show(dir, f.as_deref(), p), file: f, line: ln, rendered: line.clone(), head, suggestions: vec![] });
         return;
+    }
+}
+
+/// 場所のない「error: msg」の行 (cargo、make などそのもののエラー)。続く字下げの行と空でない行は全文に
+fn bare_errors(err: &str, diags: &mut Vec<Diag>) {
+    let lines: Vec<String> = err.lines().map(strip_ansi).collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i].trim_start();
+        let Some(msg) = l.strip_prefix("error:").or_else(|| l.strip_prefix("fatal:")) else {
+            i += 1;
+            continue;
+        };
+        let head = format!("error: {}", msg.trim());
+        let mut rendered = lines[i].clone();
+        i += 1;
+        while i < lines.len() && !lines[i].trim().is_empty() && !lines[i].trim_start().starts_with("error:") && (lines[i].starts_with(' ') || lines[i].starts_with('\t') || lines[i].starts_with("Caused by") || lines[i].starts_with("help:") || lines[i].starts_with("note:")) {
+            rendered.push('\n');
+            rendered.push_str(&lines[i]);
+            i += 1;
+        }
+        diags.push(Diag { error: true, head, path: String::new(), file: None, line: 0, rendered, suggestions: vec![] });
     }
 }
 
