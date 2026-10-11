@@ -2,7 +2,7 @@
 # クラウドのセッションが始まるときに: aios のビルドと aish-pkg に要るものを入れ、aish を先にビルドしておく
 #   zstd (bin/mkpkg.sh)、qemu-user-static (pkg_test と meson の exe_wrapper)、meson (gtk などの C のパッケージ)、
 #   libwayland-bin (gtk3 の wayland-scanner)、gcc-aarch64-linux-gnu (musl の libc.so)、
-#   rustup の target (カーネルと aios のコマンド)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)
+#   rustup の target (カーネルと aios のコマンドと aiboot)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)
 # そのあと、うしろで bin/setup-build.sh (clang-20、glslang、mtools など、残りのビルドの道具。/tmp/setup-build.log)
 # と、disk.img がなければリリース unix-latest のディスク (CI が unix への push ごとに作って起動をたしかめたもの) を
 # 取ってきて展開する (/tmp/disk-img.log)。aish の vm (kernel: "." でも) がすぐ使えるように
@@ -20,7 +20,7 @@ if [ ${#need[@]} -gt 0 ]; then
   apt-get install -y -q "${need[@]}" >/dev/null 2>&1 || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q "${need[@]}" >/dev/null; }
 fi
 command -v meson >/dev/null || pip install -q --break-system-packages meson >/dev/null 2>&1
-rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarch64-unknown-uefi >/dev/null 2>&1 || true
 # 浅いクローンだと pkgver() (git rev-list --count) が小さくなり、パッケージが古い版に見える
 [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ] && git fetch -q --unshallow origin || true
 bin/aish-mcp.sh --build
