@@ -147,6 +147,16 @@ impl Shell {
                 RELOAD_WARN.lock().map(|mut w| *w = format!("; only {} of {} plugins started again (check)", now, before)).ok();
             }
             unsafe { std::env::remove_var("AISH_MCP_NPLUG") };
+            // 前のプラグイン (標準入力が閉じて終わるところ) を待つ。その pid だけなので、ほかの子の終わりはとらない
+            let old: Vec<i32> = std::env::var("AISH_MCP_REAP").unwrap_or_default().split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            unsafe { std::env::remove_var("AISH_MCP_REAP") };
+            if !old.is_empty() {
+                std::thread::spawn(move || {
+                    for pid in old {
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    }
+                });
+            }
             send(&mut out, &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }));
         }
         let mut reader = std::io::BufReader::new(inp);
@@ -182,8 +192,15 @@ impl Shell {
                 }
                 rest.push_str(&String::from_utf8_lossy(reader.buffer()));
                 unsafe { std::env::set_var("AISH_MCP_NPLUG", self.plugins.check().len().to_string()) };
+                // 古いプラグインは閉じた標準入力で終わる。親 (exec したあとの自分) が待たないとゾンビで残るので、
+                // pid をわたして新しいほうが待つ
+                let pids: Vec<String> = self.plugins.pids().iter().map(|p| p.to_string()).collect();
+                unsafe { std::env::set_var("AISH_MCP_REAP", pids.join(" ")) };
                 reload(&rest, &mut reader, &out);
-                unsafe { std::env::remove_var("AISH_MCP_NPLUG") };
+                unsafe {
+                    std::env::remove_var("AISH_MCP_NPLUG");
+                    std::env::remove_var("AISH_MCP_REAP");
+                }
             }
             let reply = match req["method"].as_str().unwrap_or("") {
                 "initialize" => Ok(json!({
