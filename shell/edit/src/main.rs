@@ -14,7 +14,7 @@
 use aish_plugin::{Spec, Tool, Value, error, json, s};
 use std::path::{Path, PathBuf};
 
-const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}},"required":["path"]}"#;
+const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"ファイル (ディレクトリなら中の名前の一覧)"},"paths":{"type":"array","items":{"type":"string"},"description":"いくつものファイルをまとめて (path のかわりに)。\"a.rs\" \"b.rs:10-40\" \"c.rs:100-\" のように行の範囲も。{files: [...]}"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}}}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない"}},"required":["path"]}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
 const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
@@ -57,7 +57,7 @@ fn main() {
         hooks: &[],
         keys: &[],
         tools: &[
-            Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}", input: READ },
+            Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}。paths でいくつもまとめて ({files: [...]}、\"a.rs:10-40\" で行の範囲)。ディレクトリなら {dir: true, entries}", input: READ },
             Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。undo で戻せる", input: EDIT },
             Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", input: WRITE },
             Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}", input: GREP },
@@ -81,7 +81,7 @@ fn main() {
             let a = &v["args"];
             let path = resolve(s(v, "pwd"), s(a, "path"));
             match s(v, "name") {
-                "read" => read(&path, a),
+                "read" => read(s(v, "pwd"), &path, a),
                 "edit" => edit(&path, a, &mut snaps),
                 "write" => write(&path, s(a, "content").as_bytes(), &mut snaps),
                 "grep" => grep(s(v, "pwd"), a, &home, &mut hits),
@@ -431,7 +431,49 @@ fn lines(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
     }
 }
 
-fn read(path: &Path, a: &Value) -> Value {
+/// read: path をひとつ。paths なら ["a.rs", "b.rs:10-40"] をまとめて (行の範囲は :N / :N-M / :N-)。
+/// ディレクトリなら中の名前の一覧 (ディレクトリは / をつける)
+fn read(pwd: &str, path: &Path, a: &Value) -> Value {
+    let Some(list) = a["paths"].as_array() else { return read_one(path, a) };
+    let files: Vec<Value> = list
+        .iter()
+        .map(|p| {
+            let p = p.as_str().unwrap_or("");
+            let (file, range) = match p.rsplit_once(':') {
+                Some((f, r)) if !r.is_empty() && r.chars().all(|c| c.is_ascii_digit() || c == '-') => (f, Some(r)),
+                _ => (p, None),
+            };
+            let mut a = a.clone();
+            if let Some(r) = range {
+                let (from, to) = r.split_once('-').unwrap_or((r, r));
+                let from: u64 = from.parse().unwrap_or(1).max(1);
+                a["offset"] = json!(from);
+                if let Ok(to) = to.parse::<u64>() {
+                    a["limit"] = json!(to.saturating_sub(from) + 1);
+                }
+            }
+            let v = read_one(&resolve(pwd, file), &a);
+            if v["error"].is_null() { v } else { json!({ "path": p, "error": v["error"] }) }
+        })
+        .collect();
+    json!({ "files": files })
+}
+
+fn read_one(path: &Path, a: &Value) -> Value {
+    if path.is_dir() {
+        let mut names: Vec<String> = match std::fs::read_dir(path) {
+            Ok(d) => d
+                .flatten()
+                .map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if e.path().is_dir() { n + "/" } else { n }
+                })
+                .collect(),
+            Err(e) => return error(format!("{}: {}", path.display(), e)),
+        };
+        names.sort();
+        return json!({ "path": path.display().to_string(), "dir": true, "entries": names });
+    }
     let text = match std::fs::read(path) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(e) => return error(format!("{}: {}", path.display(), e)),
@@ -545,7 +587,7 @@ fn hit(a: &Value, hits: &[Hit]) -> Value {
     let Some(h) = n.checked_sub(1).and_then(|i| hits.get(i)) else { return error(format!("no hit {} (grep found {})", n, hits.len())) };
     let c = a["context"].as_u64().unwrap_or(5) as usize;
     let from = h.line.saturating_sub(c).max(1);
-    let mut r = read(&h.path, &json!({ "offset": from, "limit": c * 2 + 1 }));
+    let mut r = read_one(&h.path, &json!({ "offset": from, "limit": c * 2 + 1 }));
     r["n"] = json!(n);
     r["line"] = json!(h.line);
     r
