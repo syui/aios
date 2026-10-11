@@ -22,6 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.environ.get('AIOS_VM_DIR') or '/tmp/aios-vm-%d' % os.getuid()
 CTL, MON, LOG = DIR + '/ctl', DIR + '/mon', DIR + '/serial.log'
 PROMPT = re.compile(rb'aios[^\n]*\][$#] ')
+# 起動のとちゅうでカーネルが止まった (それより待ってもプロンプトは来ない)
+PANIC = re.compile(rb'(^|\n)panic: ')
 ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\r')
 KEYS = {'\\': 'backslash', ' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash', '\n': 'ret', '=': 'equal', ';': 'semicolon', ',': 'comma',
         "'": 'apostrophe', '`': 'grave_accent', '[': 'bracket_left', ']': 'bracket_right', '\t': 'tab',
@@ -226,8 +228,15 @@ def serve(www):
     # 答えなくなったときに stop が止められるように
     open(DIR + '/pids', 'w').write('%d %d\n' % (os.getpid(), vm.q.pid))
     t0 = time.time()
-    ok, _ = vm.wait_for(PROMPT, 900)
+    ok, mm = vm.wait_for(re.compile(PROMPT.pattern + b'|' + PANIC.pattern), 900)
+    panicked = mm is not None and not PROMPT.search(mm.group(0))
+    if panicked:
+        # panic のあとの行 (わけ) もログに入るまで
+        vm.wait_quiet(1, 5)
+        ok = None
     ready = {'ready': ok is not None, 'boot_s': round(time.time() - t0, 1)}
+    if panicked:
+        ready['panic'] = True
     if ok is None:
         ready['out'] = clean(open(LOG, 'rb').read()[-3000:].decode('utf-8', 'replace'))
     time.sleep(2)
@@ -243,7 +252,7 @@ def serve(www):
             if op == 'status':
                 r = dict(ready, running=vm.q.poll() is None)
             elif not ready['ready'] and op != 'stop':
-                r = dict(ready, error='aios did not reach the prompt (see log)')
+                r = dict(ready, error='the kernel panicked while booting (see out)' if ready.get('panic') else 'aios did not reach the prompt (see log)')
             elif op == 'run':
                 cmd = req['cmd']
                 # 何行もあるもの: プロンプトに流すと続きを待って止まるので、ファイルにして . で読む (cd や変数は残る)
@@ -310,12 +319,16 @@ def main():
                 os.unlink(CTL)
         www = a[a.index('--www') + 1] if '--www' in a else ''
         os.makedirs(DIR, exist_ok=True)
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), 'serve'] + ([os.path.abspath(www)] if www else []),
-                         stdin=subprocess.DEVNULL, stdout=open(DIR + '/serve.log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)
-        # ctl ができる (= プロンプトまで来たか、あきらめた) まで待つ
+        srv = subprocess.Popen([sys.executable, os.path.abspath(__file__), 'serve'] + ([os.path.abspath(www)] if www else []),
+                               stdin=subprocess.DEVNULL, stdout=open(DIR + '/serve.log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)
+        # ctl ができる (= プロンプトまで来たか、あきらめた) まで待つ。serve が終わった (stop された、落ちた) らやめる
         end = time.time() + 960
-        while not os.path.exists(CTL) and time.time() < end:
+        while not os.path.exists(CTL) and time.time() < end and srv.poll() is None:
             time.sleep(1)
+        if not os.path.exists(CTL):
+            print(json.dumps({'ready': False, 'error': 'the VM stopped before it was ready (stop, or see serve.log)'}))
+            print(clean(open(DIR + '/serve.log', 'rb').read()[-2000:].decode('utf-8', 'replace')), file=sys.stderr)
+            sys.exit(1)
         r = ask({'op': 'status'}, 10)
         print(json.dumps(r))
         if not r.get('ready'):
