@@ -289,21 +289,29 @@ impl Shell {
         }
     }
 
-    /// 入れかわるか: aish かプラグインのバイナリが起きたときと変わっていて、書き終わっている (2 秒たった) こと。
-    /// ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているときは入れかわらない
+    /// 入れかわるか: aish かプラグインのバイナリが起きたときと変わっていること。書いてから 2 秒たっていなければ、
+    /// たつまで待ってから入れかわる。ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているときは入れかわらない
     fn should_reload(&mut self) -> bool {
         let Some((_, exe, file)) = STARTED.get().cloned() else { return false };
-        let settled = |f: &FileId| f.mtime.elapsed().is_ok_and(|d| d.as_secs() >= 2);
-        let me = FileId::of(&exe).filter(|d| Some(*d) != file && settled(d)).is_some();
-        let plugins = self.plugins.check().iter().any(|p| p["rebuilt"] == true && p["prog"].as_str().and_then(FileId::of).is_some_and(|f| settled(&f)));
-        if !me && !plugins {
+        // 変わったバイナリ (aish と、ビルドしなおしたプラグイン)
+        let mut changed: Vec<FileId> = FileId::of(&exe).filter(|d| Some(*d) != file).into_iter().collect();
+        changed.extend(self.plugins.check().iter().filter(|p| p["rebuilt"] == true).filter_map(|p| p["prog"].as_str().and_then(FileId::of)));
+        if changed.is_empty() {
             return false;
         }
         if JOBS.lock().is_ok_and(|j| j.iter().any(|x| x.done.is_none())) {
             return false;
         }
         let src = self.get_var("AISH_SRC").filter(|s| !s.is_empty());
-        src.as_deref().map(building).unwrap_or_default().is_empty()
+        if !src.as_deref().map(building).unwrap_or_default().is_empty() {
+            return false;
+        }
+        // 書いてから 2 秒たつまで待つ (ビルドのすぐあとに呼ばれても、古いもので動かさないように)
+        let young = changed.iter().filter_map(|f| f.mtime.elapsed().ok()).filter(|d| *d < std::time::Duration::from_secs(2)).min();
+        if let Some(age) = young {
+            std::thread::sleep(std::time::Duration::from_secs(2) - age + std::time::Duration::from_millis(100));
+        }
+        true
     }
 
     /// check: aish とプラグインの様子と、直すこと (problems)。
