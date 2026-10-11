@@ -2,6 +2,7 @@
 //   AIOS_INITRD=none   initramfs を空にする (パッケージのカーネル。ルートはディスク)
 //   AIOS_INITRD=DIR    DIR を initramfs にする
 //   AIOS_RELEASE=VER   uname -r に出す版 (なければ Cargo の版)
+//   AIOS_TEST_HANG=1   起動のはじめで止まるカーネル (test/vm-boot.sh が、起動しない新しいカーネルとして使う)
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -16,6 +17,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AIOS_RELEASE");
     let release = std::env::var("AIOS_RELEASE").unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
     println!("cargo:rustc-env=AIOS_RELEASE={}", release);
+    println!("cargo:rerun-if-env-changed=AIOS_TEST_HANG");
+    if std::env::var("AIOS_TEST_HANG").is_ok_and(|v| !v.is_empty()) {
+        println!("cargo:rustc-cfg=aios_test_hang");
+    }
+    println!("cargo::rustc-check-cfg=cfg(aios_test_hang)");
     // RTC のない機械 (ラズパイ) の時計の始まり
     let epoch = std::env::var("SOURCE_DATE_EPOCH").ok().unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string()

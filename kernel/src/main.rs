@@ -70,6 +70,8 @@ fn current_el() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+// AIOS_TEST_HANG のものは途中で止まるので、そのあとはたどりつかない
+#[cfg_attr(aios_test_hang, allow(unreachable_code, unused_variables))]
 pub extern "C" fn kmain() -> ! {
     // CPU の番号 (smp::id) は 0
     unsafe { core::arch::asm!("msr tpidr_el1, xzr") };
@@ -79,6 +81,14 @@ pub extern "C" fn kmain() -> ! {
     println!();
     println!("aios {} (aarch64)", env!("AIOS_RELEASE"));
     println!("hello from EL{}", current_el());
+    // AIOS_TEST_HANG=1 でビルドしたもの (test/vm-boot.sh) だけ: aiosd まで来ない新しいカーネルのふりをする
+    #[cfg(aios_test_hang)]
+    {
+        println!("AIOS_TEST_HANG: stopping here on purpose");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 
     trap::init();
     if has_dtb {

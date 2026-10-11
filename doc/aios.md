@@ -190,10 +190,16 @@ aios install pkg FILE...       # 作ったパッケージを入れる (aiosd が
 - 起動しなかったら自動で前のものに戻す (systemd-boot の boot counting を小さくしたもの):
   1. `aios install kernel` で aiosd が `/boot/loader/try` に試す回数 (1) を書く
   2. aiboot は try があれば 1 減らして新しいカーネルを起動する。もう 0 なら (前の起動が aiosd まで来なかった)、
-     前のカーネルを `aios.fallback=1` をつけて起動する (一覧で前のものを選んだときも同じ)
+     前のカーネルを `aios.fallback=1` をつけて起動する (一覧で前のものを選んだときも同じ)。わけは
+     `aios.fallback_why=`: `unfinished` (前の起動が aiosd まで来なかった)、`load` (新しいものを UEFI の LoadImage が
+     読めなかった。その場で前のものへ)、`chosen` (一覧で選んだ)
   3. 起動して aiosd が動くと try を消す (起動できた)。`aios.fallback=1` で起きたときは `/boot/Image` を前のもの
-     (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残る
+     (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残り、`aios get boot.last`
+     の `result` と `why` で読める
   新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る
+- `test/vm-boot.sh [--new]` (開発のマシン) は、これを disk.img の VM (-snapshot) で確かめる: 起動するもの、読めないもの、
+  止まるもの (`AIOS_TEST_HANG=1` でビルドしたカーネル) を入れて再起動し (`test/vm.py reboot --reset-after`)、
+  前のものに戻ったか、わけ (why) を見る。`--new` はこのソースの aiboot、aiosd、aios を入れてから
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる
 - `aios build pkg` は bin/mkpkg.sh と同じものを aios の中で作る (user/src/lib/mkpkg.rs)。PKGBUILD の関数
   (pkgver prepare build package) は bash (brush) で動かし、ソース (git+、http(s) は fetch、横のファイル)、sha256、
