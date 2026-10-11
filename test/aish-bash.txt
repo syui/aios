@@ -82,3 +82,9 @@ printf '%s %s\n' a b c	a b|c
 printf 'あ\x41\101\n'	あAA
 select x in a b c; do echo "[$x][$REPLY]"; [ "$REPLY" = 3 ] && break; done <<< $'2\n9\n3' 2>/dev/null	[b][2]|[][9]|[c][3]
 select x in a; do true; done <<< 1 2>/dev/null; echo "st $?"	|st 1
+# sh のオプションはまとめてもよい (configure の sh -eu FILE、make の sh -ec CMD)
+$0 -ec 'false; echo no'; echo "st $?"	st 1
+$0 -o pipefail -c 'false | true'; echo "st $?"	st 1
+$0 -e -c 'echo "$0 $1"' n one	n one
+echo 'echo "in $1"' | $0 -s A	in A
+f=$(mktemp); printf 'echo "x $1"; echo $NOPE; echo no\n' > $f; $0 -eu $f a 2>/dev/null; echo "st $?"; rm $f	x a|st 1

@@ -2977,34 +2977,68 @@ fn main() {
     // 呼ばれた名前: sh (と -sh) なら POSIX の sh として
     let base = args.first().map_or("aish", |a| a.rsplit('/').next().unwrap_or(a).trim_start_matches('-'));
     let _ = NAME.set(if base == "sh" { "sh" } else { "aish" });
+    // aish --mcp [--json] [RC...]: MCP のサーバー (mcp.rs)
+    if args.get(1).is_some_and(|a| a == "--mcp") {
+        Shell::new(vec![args[0].clone()]).mcp(&args[2..]);
+    }
+    // sh [-+euxfvC...] [-o NAME] [-c CMD [NAME ARGS...] | -s [ARGS...] | FILE [ARGS...]] (POSIX)。
+    // オプションはまとめてもよい (sh -eu FILE、sh -ec CMD: configure や make がこう呼ぶ)。c s i l のほかは set へ
+    let (mut cmd_mode, mut stdin_mode) = (false, false);
+    let mut sets: Vec<String> = Vec::new();
+    let mut i = 1;
+    while let Some(a) = args.get(i) {
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() < 2 || !(a.starts_with('-') || a.starts_with('+')) || a.starts_with("--") {
+            break;
+        }
+        let mut flags = String::new();
+        for c in a[1..].chars() {
+            match c {
+                'c' => cmd_mode = true,
+                's' => stdin_mode = true,
+                'i' | 'l' => {}
+                'o' => {
+                    i += 1;
+                    sets.push(format!("{}o", &a[..1]));
+                    sets.push(args.get(i).cloned().unwrap_or_default());
+                }
+                c => flags.push(c),
+            }
+        }
+        if !flags.is_empty() {
+            sets.push(format!("{}{}", &a[..1], flags));
+        }
+        i += 1;
+    }
     // sh -c CMD [NAME ARGS...]: NAME が $0
-    if args.get(1).is_some_and(|a| a == "-c") {
-        let cmd = args.get(2).cloned().unwrap_or_default();
-        let mut ps: Vec<String> = args.get(3..).unwrap_or(&[]).to_vec();
+    if cmd_mode {
+        let cmd = args.get(i).cloned().unwrap_or_default();
+        let mut ps: Vec<String> = args.get(i + 1..).unwrap_or(&[]).to_vec();
         if ps.is_empty() {
             ps.push(args[0].clone());
         }
         let mut sh = Shell::new(ps);
         trap::set_shell(&mut sh);
         bash_like(&mut sh, base);
+        if !sets.is_empty() && sh.set(&sets) != 0 {
+            std::process::exit(2);
+        }
         let st = sh.run_source(&cmd, shell_name());
         exit_shell(st);
     }
-    // aish --mcp [--json] [RC...]: MCP のサーバー (mcp.rs)
-    if args.get(1).is_some_and(|a| a == "--mcp") {
-        Shell::new(vec![args[0].clone()]).mcp(&args[2..]);
-    }
-    // sh [-e] [-x] FILE ARGS...
     let mut sh = Shell::new(vec![args[0].clone()]);
     trap::set_shell(&mut sh);
     bash_like(&mut sh, base);
-    let mut i = 1;
-    while let Some(a) = args.get(i).filter(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "exs".contains(c))) {
-        sh.errexit |= a.contains('e');
-        sh.xtrace |= a.contains('x');
-        i += 1;
+    if !sets.is_empty() && sh.set(&sets) != 0 {
+        std::process::exit(2);
     }
-    if let Some(file) = args.get(i) {
+    // sh -s ARGS...: スクリプトは標準入力から、ARGS は $1...
+    if stdin_mode {
+        sh.params.extend_from_slice(args.get(i..).unwrap_or(&[]));
+    } else if let Some(file) = args.get(i) {
         sh.params = args[i..].to_vec();
         let text = match std::fs::read_to_string(file) {
             Ok(t) => t,
