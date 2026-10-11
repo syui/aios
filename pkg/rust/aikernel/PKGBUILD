@@ -15,10 +15,6 @@ license=('MIT')
 optdepends=('aiboot: UEFI で起動するとき (systemd-boot でもよい)')
 makedepends=('rustup' 'llvm')
 backup=(boot/loader/entries/aios.conf)
-# 前の名前は unix。aipkg -Syu で unix を外して aikernel を入れる (unix に依存するものも動くように provides)
-replaces=('unix')
-provides=('unix')
-conflicts=('unix')
 
 pkgver() {
   cd "$startdir/../../.."
