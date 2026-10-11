@@ -462,9 +462,18 @@ impl Shell {
         let pwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
         self.plugins.tell("preexec", json!({ "line": cmd.trim_end_matches('\n'), "pwd": pwd }));
         let t0 = std::time::Instant::now();
+        profile_new(true);
         let mut status = self.run_source(cmd, "run");
         if self.flow != Flow::None {
             self.flow = Flow::None;
+        }
+        // この run で入ったパッケージの /etc/profile.d/*.sh (cargo のリンカなど) を読む。このシェルはログイン
+        // しなおさないので、人がログインしなおしたときと同じになるように
+        let sourced = profile_new(false);
+        for f in &sourced {
+            let st = status;
+            self.run_source(&format!(". {}", f), "profile");
+            status = st;
         }
         flush();
         let _ = done.send(());
@@ -484,6 +493,9 @@ impl Shell {
         let mut r = json!({ "status": status, "out": out, "err": err, "ms": ms, "pwd": pwd });
         if let Some(id) = id {
             r["out_id"] = json!(id);
+        }
+        if !sourced.is_empty() {
+            r["profile"] = json!(format!("read the new {} (as a new login would)", sourced.join(" ")));
         }
         if fired.load(Ordering::Relaxed) {
             // timeout(1) と同じ 124
@@ -700,6 +712,27 @@ fn read_all(fd: i32) -> String {
         b.extend_from_slice(&buf[..n as usize]);
     }
     String::from_utf8_lossy(&b).into_owned()
+}
+
+/// 見たことのある /etc/profile.d/*.sh (はじめて呼ばれたときにあるものは、もう読んだものとする: Claude Code を
+/// 起こしたログインシェルの環境に入っている)
+static PROFILE_SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> = std::sync::Mutex::new(None);
+
+/// 前に見たときから新しくできた /etc/profile.d/*.sh。first ならはじめてのときだけいまあるものを覚える (空を返す)
+fn profile_new(first: bool) -> Vec<String> {
+    let now: std::collections::BTreeSet<String> = std::fs::read_dir("/etc/profile.d")
+        .map(|d| d.flatten().map(|e| e.path().display().to_string()).filter(|p| p.ends_with(".sh")).collect())
+        .unwrap_or_default();
+    let Ok(mut seen) = PROFILE_SEEN.lock() else { return vec![] };
+    if first && seen.is_some() {
+        return vec![];
+    }
+    let new = match seen.as_ref() {
+        Some(s) => now.difference(s).cloned().collect(),
+        None => vec![],
+    };
+    *seen = Some(now);
+    new
 }
 
 /// 長ければ頭 (1/3) と終わり (2/3) だけ。行の切れ目で切り、切った行の数と、out で読むための番号を書く
