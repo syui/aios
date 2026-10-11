@@ -15,7 +15,7 @@ use aish_plugin::{Spec, Tool, Value, error, json, s};
 use std::path::{Path, PathBuf};
 
 const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"ファイル (ディレクトリなら中の名前の一覧)"},"paths":{"type":"array","items":{"type":"string"},"description":"いくつものファイルをまとめて (path のかわりに)。\"a.rs\" \"b.rs:10-40\" \"c.rs:100-\" のように行の範囲も。{files: [...]}"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}}}"#;
-const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない"}},"required":["path"]}"#;
+const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"},"path":{"type":"string","description":"このファイルに (既定: 外の path)"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない。path でいくつものファイルをいっしょに (これもぜんぶか、なにもしないか)"}}}"#;
 const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#;
 const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
 const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
@@ -58,7 +58,7 @@ fn main() {
         keys: &[],
         tools: &[
             Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}。paths でいくつもまとめて ({files: [...]}、\"a.rs:10-40\" で行の範囲)。ディレクトリなら {dir: true, entries}", input: READ },
-            Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。undo で戻せる", input: EDIT },
+            Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。edits に path をつけるといくつものファイルを 1 回で ({files: [...]})。undo で戻せる (1 回でみな)", input: EDIT },
             Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", input: WRITE },
             Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}", input: GREP },
             Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", input: SED },
@@ -82,7 +82,7 @@ fn main() {
             let path = resolve(s(v, "pwd"), s(a, "path"));
             match s(v, "name") {
                 "read" => read(s(v, "pwd"), &path, a),
-                "edit" => edit(&path, a, &mut snaps),
+                "edit" => edit(s(v, "pwd"), &path, a, &mut snaps),
                 "write" => write(&path, s(a, "content").as_bytes(), &mut snaps),
                 "grep" => grep(s(v, "pwd"), a, &home, &mut hits),
                 "hit" => hit(a, &hits),
@@ -488,9 +488,10 @@ fn read_one(path: &Path, a: &Value) -> Value {
     json!({ "path": path.display().to_string(), "lines": lines.len(), "text": out })
 }
 
-/// edit: old → new。edits: [{old, new, all?}, ...] なら順に (前のものを変えたあとの中身に) あてて、
-/// どれかがしくじれば何も書かない (ぜんぶか、なにもしないか)
-fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
+/// edit: old → new。edits: [{old, new, all?, path?}, ...] なら順に (前のものを変えたあとの中身に) あてて、
+/// どれかがしくじれば何も書かない (ぜんぶか、なにもしないか)。path のある edits は、そのファイルに
+/// (いくつものファイルでも、ぜんぶか、なにもしないか。undo 1 回でみな戻る)
+fn edit(pwd: &str, path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
     let list: Vec<Value> = match a["edits"].as_array() {
         Some(v) => v.clone(),
         None => vec![a.clone()],
@@ -498,26 +499,58 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
     if list.is_empty() {
         return error("edits is empty");
     }
-    let mut text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => return error(format!("{}: {}", path.display(), e)),
-    };
+    // ファイルごとに (出てきた順)。edits の番号も覚えておく
+    let mut files: Vec<(PathBuf, Vec<(usize, &Value)>)> = Vec::new();
+    for (i, e) in list.iter().enumerate() {
+        let p = if s(e, "path").is_empty() { path.to_path_buf() } else { resolve(pwd, s(e, "path")) };
+        match files.iter_mut().find(|(q, _)| *q == p) {
+            Some((_, v)) => v.push((i, e)),
+            None => files.push((p, vec![(i, e)])),
+        }
+    }
+    // 先にぜんぶ確かめてから書く
+    let mut done = Vec::new();
+    for (p, es) in &files {
+        match edit_text(p, es, list.len() > 1) {
+            Ok(r) => done.push((p, r)),
+            Err(e) => return e,
+        }
+    }
+    let mut out = Vec::new();
+    for (p, (text, replaced, spans)) in done {
+        if let r = write(p, text.as_bytes(), snaps)
+            && r.get("error").is_some()
+        {
+            return r;
+        }
+        let (lines, shown) = around(&text, &spans);
+        out.push(json!({ "path": p.display().to_string(), "replaced": replaced, "lines": lines, "text": shown }));
+    }
+    if out.len() == 1 { out.remove(0) } else { json!({ "files": out }) }
+}
+
+/// edits をあてた中身と、置きかえた数と、変えたところ (バイトの場所と長さ)
+type Edited = (String, usize, Vec<(usize, usize)>);
+
+/// 1 つのファイルに edits ([(edits の番号, edit)]) をあてる
+fn edit_text(path: &Path, list: &[(usize, &Value)], many: bool) -> Result<Edited, Value> {
+    let mut text = std::fs::read_to_string(path).map_err(|e| error(format!("{}: {}", path.display(), e)))?;
     let mut replaced = 0;
     let mut spans: Vec<(usize, usize)> = vec![];
-    for (i, e) in list.iter().enumerate() {
+    for &(i, e) in list {
         // いくつもあるときは、どれでしくじったか (edits の何番目か) を言う
-        let at = if list.len() > 1 { format!(" (edits[{}])", i) } else { String::new() };
+        let at = if many { format!(" (edits[{}])", i) } else { String::new() };
         let (old, new) = (s(e, "old"), s(e, "new"));
         if old.is_empty() {
-            return error(format!("old is empty{}", at));
+            return Err(error(format!("old is empty{}", at)));
         }
         let n = text.matches(old).count();
         let all = e["all"].as_bool().unwrap_or(false);
         if n == 0 {
-            return error(format!("{}: old not found{}", path.display(), at));
+            return Err(error(format!("{}: old not found{}", path.display(), at)));
         }
         if n > 1 && !all {
-            return error(format!("{}: old found {} times (make it longer, or all: true){}", path.display(), n, at));
+            return Err(error(format!("{}: old found {} times (make it longer, or all: true){}", path.display(), n, at)));
         }
         // うしろから置きかえ、変えたところ (バイトの場所と長さ) を覚えておく。前のものの場所はずらす
         let idxs: Vec<usize> = if all { text.match_indices(old).map(|(i, _)| i).collect() } else { text.find(old).into_iter().collect() };
@@ -533,13 +566,7 @@ fn edit(path: &Path, a: &Value, snaps: &mut Vec<Snap>) -> Value {
         }
         replaced += idxs.len();
     }
-    match write(path, text.as_bytes(), snaps) {
-        r if r.get("error").is_some() => r,
-        _ => {
-            let (lines, shown) = around(&text, &spans);
-            json!({ "path": path.display().to_string(), "replaced": replaced, "lines": lines, "text": shown })
-        }
-    }
+    Ok((text, replaced, spans))
 }
 
 /// 変えたところ (spans) の行と、前後 2 行を read と同じ形で (40 行まで)。答えの lines は変えた行の番号
