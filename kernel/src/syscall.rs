@@ -209,6 +209,7 @@ nrs! {
     MUNMAP = 215,
     MREMAP = 216,
     CLONE = 220,
+    CLONE3 = 435,
     EXECVE = 221,
     MMAP = 222,
     FADVISE64 = 223,
@@ -394,6 +395,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
         UNSHARE => proc::unshare(a[0]),
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
+        CLONE3 => sys_clone3(a[0] as usize, a[1] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         WAIT4 => crate::ns::arg_pid(int(a[0])).map_err(|_| -10).and_then(|p| sys_wait4(p, a[1] as usize, a[2])),
         GETRUSAGE => sys_getrusage(int(a[0]), a[1] as usize),
@@ -1232,6 +1234,39 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
 /// 引数 (と環境) の合計と 1 つの長さの上限 (Linux の ARG_MAX の既定と MAX_ARG_STRLEN)
 const ARGS_TOTAL: usize = 2 * 1024 * 1024;
 const MAXSTR: usize = 128 * 1024;
+
+/// clone3(args, size): struct clone_args (u64 の並び: flags pidfd child_tid parent_tid exit_signal stack stack_size tls
+/// set_tid set_tid_size cgroup) を読んで clone と同じことを。glibc は pthread_create で先にこれを試す。
+/// stack はいちばん下の番地で、子の sp は stack + stack_size。pidfd、set_tid、cgroup はないので EINVAL
+fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
+    const EINVAL: i64 = 22;
+    const E2BIG: i64 = 7;
+    const CLONE_PIDFD: u64 = 0x1000;
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    // 版 0 は 64 バイト (tls まで)。知らない後ろのものは 0 でなければならない (Linux と同じ)
+    if size < 64 {
+        return Err(-EINVAL);
+    }
+    if size > 4096 {
+        return Err(-E2BIG);
+    }
+    let mut b = alloc::vec![0u8; size];
+    proc::current().pt().copy_in(&mut b, uargs).ok_or(-EFAULT)?;
+    let f = |i: usize| b.get(i * 8..i * 8 + 8).map_or(0, |w| u64::from_le_bytes(w.try_into().unwrap()));
+    if b[64..].iter().any(|&x| x != 0) {
+        // set_tid / set_tid_size / cgroup と、その先
+        return Err(if size > 88 && b[88..].iter().any(|&x| x != 0) { -E2BIG } else { -EINVAL });
+    }
+    let (flags, exit_signal, stack, stack_size, tls) = (f(0), f(4), f(5) as usize, f(6) as usize, f(7));
+    if flags & (CLONE_PIDFD | CLONE_INTO_CGROUP) != 0 || flags & 0xff != 0 || exit_signal > 64 {
+        return Err(-EINVAL);
+    }
+    if (stack == 0) != (stack_size == 0) {
+        return Err(-EINVAL);
+    }
+    let sp = if stack != 0 { stack + stack_size } else { 0 };
+    proc::clone(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize)
+}
 
 /// NULL 終端のポインタ配列が指す文字列たち
 fn copy_in_strv(mut va: usize) -> Result<Vec<Vec<u8>>, i64> {
