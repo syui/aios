@@ -150,7 +150,10 @@ class Serve:
             self.buf = b''
         # gz: 縮めて送ったもの (シリアルは 1 秒に数十 KB なので)。gzip がなければ toybox の zcat で
         dec = 'base64 -d | { gzip -dc 2>/dev/null || toybox zcat; }' if gz else 'base64 -d'
-        os.write(self.m, ('%s > %s; echo %s $?\r' % (dec, shlex.quote(path), tag)).encode())
+        # 置き場のディレクトリがなければ作る (aish の write と同じ)。&& にしない: mkdir がしくじると base64 が
+        # 起きず、流しこむ中身がプロンプトに打たれてしまう
+        q = shlex.quote(path)
+        os.write(self.m, ('mkdir -p "$(dirname %s)" 2>/dev/null; %s > %s; echo %s $?\r' % (q, dec, q, tag)).encode())
         # 行を描き終わって base64 が動きだす (出力がしずかになる) まで待つ。決まった時間だけ待つと、
         # 重いときに中身が行の編集のほうへ入ってしまう (長い行は画面の幅で切って描くので、こだまの文字では待てない)
         time.sleep(0.3)
@@ -270,7 +273,8 @@ def serve(www):
             elif op == 'fetch':
                 # DIR/xfer/NAME (put が置いた大きなファイル) を中の fetch で取る
                 import shlex
-                r = vm.run('fetch http://10.0.2.2:8001/%s -o %s >/dev/null' % (req['name'], shlex.quote(req['path'])), 300)
+                q = shlex.quote(req['path'])
+                r = vm.run('mkdir -p "$(dirname %s)" && fetch http://10.0.2.2:8001/%s -o %s >/dev/null' % (q, req['name'], q), 300)
             elif op == 'keys':
                 vm.keys(req.get('keys', []))
                 r = {'ok': True}
