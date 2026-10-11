@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / put / shot / keys / log / mon"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ disk.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)"},"dir":{"type":"string"}},"required":["op"]}"#;
+const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / put / shot / keys / log / mon / reboot"},"reset_after":{"type":"number","description":"reboot: この秒でプロンプトが来なければ QEMU をリセット (止まった新しいカーネルの電源を入れなおす)"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ disk.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)"},"dir":{"type":"string"}},"required":["op"]}"#;
 const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","description":"C のソース (main のあるもの)"},"file":{"type":"string","description":"code のかわりにソースのファイル"},"lang":{"type":"string","description":"c (既定) か c++"},"cflags":{"type":"array","items":{"type":"string"},"description":"zig cc に足すもの (-lpthread、-DX=1 など)"},"args":{"type":"string","description":"中で動かすときの引数 (シェルの書き方で)"},"timeout":{"type":"number","description":"秒 (既定 30、50 まで)"},"dir":{"type":"string"}}}"#;
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
@@ -49,7 +49,7 @@ fn main() {
         hooks: &[],
         keys: &[],
         tools: &[
-            Tool { name: "vm", desc: "開発のマシンで aios の VM を動かす (test/vm.py): start (kernel: パス / . / git のコミット) stop status run (シリアルの端末でコマンド) put (ファイルを中へ) shot (画面を png に。Read で見る) keys (画面のキーボード: @alt-b @ctrl-l @ret、ほかは文字) log (シリアルの終わり、grep) mon (QEMU のモニタ)", input: VM },
+            Tool { name: "vm", desc: "開発のマシンで aios の VM を動かす (test/vm.py): start (kernel: パス / . / git のコミット) stop status run (シリアルの端末でコマンド) put (ファイルを中へ) shot (画面を png に。Read で見る) keys (画面のキーボード: @alt-b @ctrl-l @ret、ほかは文字) log (シリアルの終わり、grep) mon (QEMU のモニタ) reboot (中で sudo reboot してプロンプトまで待つ。reset_after 秒で来なければリセット)", input: VM },
             Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
@@ -222,7 +222,18 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
             res((st, text, err, ms, to))
         }
         "mon" => res(vmpy(root, &["mon", s(a, "cmd")], &[], short)),
-        _ => error("op: start stop status run put shot keys log mon"),
+        "reboot" => {
+            // 中で sudo reboot してプロンプトまで待つ (Claude Code は 60 秒しか待たないので 50 秒まで)。
+            // reset_after: その秒で来なければリセット (止まった新しいカーネルから、aiboot が前のもので起こしなおす)
+            let t = secs(a, "timeout", 50.0, 50.0);
+            let mut args = vec!["reboot".to_string(), "-t".into(), format!("{}", t)];
+            if let Some(r) = a["reset_after"].as_f64() {
+                args.extend(["--reset-after".into(), format!("{}", r)]);
+            }
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            res(vmpy(root, &argv, &[], Duration::from_secs_f64(t + 5.0)))
+        }
+        _ => error("op: start stop status run put shot keys log mon reboot"),
     }
 }
 

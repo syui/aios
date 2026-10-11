@@ -8,7 +8,10 @@
 #   test/vm.py keys ARG...         画面のキーボードで: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
-#   test/vm.py put LOCAL REMOTE    ファイルを中へ (256 KB までは gzip と base64 でシリアルから、大きいものは http と fetch で)
+#   test/vm.py put LOCAL REMOTE    ファイルを中へ (16 KB までは gzip と base64 でシリアルから、大きいものは http と fetch で)
+#   test/vm.py reboot [-t SEC] [--reset-after SEC]
+#                                  中で sudo reboot して、またプロンプトまで待つ。--reset-after の秒で来なければ
+#                                  QEMU をリセットする (止まった新しいカーネルの電源を入れなおすかわり)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
 #   test/vm.py log [N]             シリアルの終わりの N 行 (既定 40)
 #   test/vm.py status / stop
@@ -172,6 +175,37 @@ class Serve:
             return {'timeout': True}
         return {'status': int(mm.group(1))}
 
+    def reboot(self, timeout, reset_after=None):
+        # 中で sudo reboot して、またプロンプトまで待つ。reset_after 秒で来なければ QEMU をリセットする (新しいカーネルが
+        # 止まったとき、人が電源を入れなおすかわり。aiboot は前のカーネルで起こしなおす)
+        t0 = time.time()
+        with self.cv:
+            self.buf = b''
+        os.write(self.m, b'sudo reboot\r')
+        # 打った行のこだまもプロンプトに見えるので、まず init が止めにかかるのを待つ
+        if self.wait_for(re.compile(rb'aios: (restart|stopping services)'), 60)[0] is None:
+            return {'ready': False, 'error': 'the VM did not start to reboot (sudo reboot)'}
+        pat = re.compile(PROMPT.pattern + b'|' + PANIC.pattern)
+        reset = False
+        while True:
+            left = timeout - (time.time() - t0)
+            if left <= 0:
+                return {'ready': False, 'reset': reset, 'boot_s': round(time.time() - t0, 1), 'error': 'no prompt after the reboot (see log)'}
+            wait = min(left, reset_after - (time.time() - t0)) if reset_after and not reset else left
+            ok, mm = self.wait_for(pat, max(wait, 0.1))
+            if mm is not None:
+                if not PROMPT.search(mm.group(0)):
+                    self.wait_quiet(1, 5)
+                    return {'ready': False, 'panic': True, 'reset': reset, 'boot_s': round(time.time() - t0, 1)}
+                break
+            if reset_after and not reset and time.time() - t0 >= reset_after:
+                monitor('system_reset')
+                reset = True
+        time.sleep(1)
+        self.run('unset -f chpwd 2>/dev/null', 10)
+        add_ca(self)
+        return {'ready': True, 'reset': reset, 'boot_s': round(time.time() - t0, 1)}
+
     def type(self, text):
         c = socket.socket(socket.AF_UNIX)
         c.connect(MON)
@@ -311,6 +345,8 @@ def serve(www):
                 r = {}
             elif op == 'mon':
                 r = {'out': monitor(req['cmd'], req.get('wait', 0.5))}
+            elif op == 'reboot':
+                r = vm.reboot(req.get('timeout', 180), req.get('reset_after'))
             elif op == 'stop':
                 vm.stop()
                 r = {'stopped': True}
@@ -405,6 +441,14 @@ def main():
             sys.exit('vm: put: %s' % json.dumps(r))
     elif op == 'mon':
         print(ask({'op': 'mon', 'cmd': a[1]})['out'])
+    elif op == 'reboot':
+        # test/vm.py reboot [-t SECS] [--reset-after SECS]
+        req = {'op': 'reboot', 'timeout': float(a[a.index('-t') + 1]) if '-t' in a else 180}
+        if '--reset-after' in a:
+            req['reset_after'] = float(a[a.index('--reset-after') + 1])
+        r = ask(req)
+        print(json.dumps(r))
+        sys.exit(0 if r.get('ready') else 1)
     elif op == 'shot':
         out = os.path.abspath(a[1] if len(a) > 1 else 'shot.png')
         ppm = out.rsplit('.', 1)[0] + '.ppm'
