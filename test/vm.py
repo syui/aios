@@ -237,6 +237,16 @@ def clean(t):
     return ANSI.sub('', t).strip('\n')
 
 
+def screen(t):
+    # 画面に見えるように: aish は 1 文字ごとに \r で行の頭に戻って描きなおすので、行ごとに最後に描いたものだけ
+    # (clean だけだと \r を消して描きなおしがみな 1 行につながる)
+    out = []
+    for line in t.split('\n'):
+        segs = [ANSI.sub('', s) for s in line.split('\r')]
+        out.append(next((s for s in reversed(segs) if s.strip()), ''))
+    return '\n'.join(out).strip('\n')
+
+
 def serve(www):
     os.makedirs(DIR, exist_ok=True)
     for f in (CTL, MON):
@@ -406,7 +416,7 @@ def main():
             print(ppm)
     elif op == 'log':
         n = int(a[1]) if len(a) > 1 else 40
-        t = clean(open(LOG, 'rb').read()[-200000:].decode('utf-8', 'replace'))
+        t = screen(open(LOG, 'rb').read()[-200000:].decode('utf-8', 'replace'))
         print('\n'.join(t.split('\n')[-n:]))
     elif op == 'status':
         if not os.path.exists(CTL):
