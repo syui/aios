@@ -168,6 +168,11 @@ fn find(root: &Path, pwd: &str, name: &str, kind: &str, limit: usize, home: &str
     if name.is_empty() {
         return Err(error("name is empty"));
     }
+    // path がファイルなら、そのディレクトリでそのファイルだけを (rg はファイルの中では起こせない)
+    let (root, target) = match (root.is_file(), root.parent(), root.file_name()) {
+        (true, Some(d), Some(f)) => (d, f.to_string_lossy().into_owned()),
+        _ => (root, ".".to_string()),
+    };
     let q = regex::escape(name);
     let word = format!(r"\w*{}\w*", q);
     // rg には名前のない形で (同じ名前のグループがいくつもあると rg の正規表現にならない)
@@ -182,7 +187,7 @@ fn find(root: &Path, pwd: &str, name: &str, kind: &str, limit: usize, home: &str
             args.push(def_re(p, &word).replace("(?P<name>", "(").replace("(?P<kind>", "("));
         }
     }
-    args.push(".".into());
+    args.push(target);
     let r = aish_plugin::rg_json(&root.display().to_string(), &args, 5000).ok_or_else(|| error("where needs rg (ripgrep: sudo ap -S ripgrep)"))?;
     if r.status == 2 && r.items.is_empty() {
         return Err(error(format!("rg: {}", r.err.trim())));
