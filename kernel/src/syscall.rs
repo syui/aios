@@ -521,7 +521,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         // io_uring はない (libuv などは ENOSYS を見て、ふつうのシステムコールで動く)
         IO_URING_SETUP | IO_URING_ENTER | IO_URING_REGISTER => Err(-ENOSYS),
         n => {
-            println!("syscall: unknown {} (pid {})", n, proc::current().pid);
+            // 番号ごとに起動して最初の 1 回だけ (glibc の pthread_create の clone3 のように、毎回呼ぶものがある)
+            if unknown_first(n) {
+                let p = proc::current();
+                println!("syscall: unknown {} by {} (pid {}; ENOSYS, shown once per number)", n, p.comm(), p.pid);
+            }
             Err(-ENOSYS)
         }
     };
@@ -1268,6 +1272,17 @@ fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
 /// 引数 (と環境) の合計と 1 つの長さの上限 (Linux の ARG_MAX の既定と MAX_ARG_STRLEN)
 const ARGS_TOTAL: usize = 2 * 1024 * 1024;
 const MAXSTR: usize = 128 * 1024;
+
+/// 知らないシステムコールの番号を、はじめて見たか (見たものは覚える。大きなロックの中で呼ぶ)
+fn unknown_first(n: u64) -> bool {
+    static mut SEEN: [u64; 8] = [0; 8];
+    let seen = unsafe { &mut *(&raw mut SEEN) };
+    let Some(w) = seen.get_mut(n as usize / 64) else { return true };
+    let bit = 1u64 << (n % 64);
+    let first = *w & bit == 0;
+    *w |= bit;
+    first
+}
 
 /// clone3(args, size): struct clone_args (u64 の並び: flags pidfd child_tid parent_tid exit_signal stack stack_size tls
 /// set_tid set_tid_size cgroup) を読んで clone と同じことを。glibc は pthread_create で先にこれを試す。
