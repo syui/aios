@@ -240,6 +240,10 @@ def serve(www):
     if ok is None:
         ready['out'] = clean(open(LOG, 'rb').read()[-3000:].decode('utf-8', 'replace'))
     time.sleep(2)
+    if ok is not None:
+        # /etc/aishrc の「cd のあとの ls」(chpwd) は人のため。run の出力にまざらないように外す
+        # (aish --mcp で外しているのと同じ)
+        vm.run('unset -f chpwd 2>/dev/null', 10)
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(CTL)
     srv.listen(4)
