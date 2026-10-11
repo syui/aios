@@ -4,6 +4,8 @@
 #   libwayland-bin (gtk3 の wayland-scanner)、gcc-aarch64-linux-gnu (musl の libc.so)、
 #   rustup の target (カーネルと aios のコマンド)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)
 # そのあと、うしろで bin/setup-build.sh (clang-20、glslang、mtools など、残りのビルドの道具。/tmp/setup-build.log)
+# と、disk.img がなければリリース unix-latest のディスク (CI が unix への push ごとに作って起動をたしかめたもの) を
+# 取ってきて展開する (/tmp/disk-img.log)。aish の vm (kernel: "." でも) がすぐ使えるように
 # 入っているものはとばす
 set -euo pipefail
 [ "${CLAUDE_CODE_REMOTE:-}" = true ] || exit 0
@@ -24,3 +26,11 @@ rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl >/de
 bin/aish-mcp.sh --build
 # 残りの道具 (大きいのでうしろで。終わりは /tmp/setup-build.log の setup-build: ok)
 nohup bin/setup-build.sh > /tmp/setup-build.log 2>&1 &
+# とちゅうのものを disk.img と思わないように、.part に展開してから名前を変える。GitHub が新しいので先に
+if [ ! -f disk.img ]; then
+  nohup sh -c 'for u in https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst \
+      https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst; do
+    curl -fsSL "$u" | zstd -d -q -f --sparse -o disk.img.part && mv disk.img.part disk.img && echo "disk.img: ok ($u)" && exit 0
+    rm -f disk.img.part
+  done; echo "disk.img: failed"; exit 1' > /tmp/disk-img.log 2>&1 &
+fi
