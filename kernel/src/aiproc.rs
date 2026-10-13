@@ -2,6 +2,7 @@
 // 読み書きできるのは root と wheel の人だけ (allowed)。
 //   threads   すべてのスレッド: 状態、最後のシステムコール、眠っていれば何を (futex / 見張っている fd / channel)、
 //             どれだけ (slept_s) 待っているか (proc::ai_threads)
+//   prof      区間ごとの回数と時間 (prof.rs。ctl に prof on で数える)
 //   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
 //   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
@@ -15,6 +16,7 @@
 //               strace NAME   /proc/strace と同じ (+NAME でうまくいったものも、空で止める)
 //               bkl reset     /proc/bkl を 0 から
 //               heap trace on|off  /proc/ai/heap に、ヒープをいま多く持っている場所 (呼び出しの番地) も出す
+//               prof on|off   カーネルの中の区間 (prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
 //               panic [TEXT]  カーネルを panic させる (root だけ。panic の出力とバックトレースを確かめる。Linux の
 //                             sysrq-trigger の c と同じ)
 use alloc::format;
@@ -68,7 +70,7 @@ pub fn fds_json(tgid: u32) -> Result<String, i64> {
     Ok(out)
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nprof on|off\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -86,6 +88,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "strace" => crate::syscall::strace_set(arg.as_bytes()),
         "bkl" if arg == "reset" => crate::smp::stats_reset(),
         "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),
+        "prof" if arg == "on" || arg == "off" => crate::prof::set(arg == "on"),
         "panic" => {
             const EPERM: i64 = 1;
             if crate::proc::current().cred.euid != 0 {

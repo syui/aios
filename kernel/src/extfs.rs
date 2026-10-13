@@ -182,7 +182,13 @@ pub struct ExtFs {
     writing: core::cell::Cell<usize>,
     /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
     names_gen: core::cell::Cell<u64>,
+    /// meta() の答え (inode → Meta)。stat や open の 1 回で、たどるディレクトリとファイルの meta が何度も
+    /// 引かれ、そのたびに inode を読んで解くのは高い (TCG で 1 回 7 us)。inode を書く (write_inode) ときに捨てる
+    metas: RefCell<BTreeMap<u32, Meta>>,
 }
+
+/// meta() の答えの覚えの大きさ (こえたら全部捨てる)
+const METAS_MAX: usize = 8192;
 
 /// 名前のキャッシュの大きさ (こえたら全部捨てて作りなおす)
 const NAMES_MAX: usize = 65536; // 1 つ 100 バイトくらいで 6 MiB ほど
@@ -374,6 +380,7 @@ impl ExtFs {
             wgen: core::cell::Cell::new(0),
             writing: core::cell::Cell::new(0),
             names_gen: core::cell::Cell::new(0),
+            metas: RefCell::new(BTreeMap::new()),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -1144,6 +1151,8 @@ impl ExtFs {
     }
 
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
+        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)
+        self.metas.borrow_mut().remove(&ino);
         let mut r = r.clone();
         self.set_inode_csum(ino, &mut r);
         let (b, off) = self.inode_loc(ino);
@@ -1980,7 +1989,10 @@ impl ExtInode {
     }
 
     fn dir_only(&self) -> Result<(), i64> {
-        if self.raw()?.mode() & S_IFMT != S_IFDIR {
+        // meta の覚えから (inode を読みなおさない)。読めなければ raw で EIO などを返す
+        let m = self.meta();
+        let mode = if m.mode != 0 { m.mode } else { self.raw()?.mode() };
+        if mode & S_IFMT != S_IFDIR {
             return Err(-ENOTDIR);
         }
         Ok(())
@@ -2146,6 +2158,9 @@ impl Inode for ExtInode {
     }
 
     fn meta(&self) -> Meta {
+        if let Some(m) = self.fs.metas.borrow().get(&self.ino) {
+            return *m;
+        }
         let Ok(r) = self.raw() else {
             return Meta { ino: self.ino as u64, mode: 0, nlink: 0, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
         };
@@ -2158,7 +2173,7 @@ impl Inode for ExtInode {
         } else {
             0
         };
-        Meta {
+        let m = Meta {
             ino: self.ino as u64,
             mode: r.mode(),
             nlink: r.links() as u32,
@@ -2169,7 +2184,13 @@ impl Inode for ExtInode {
             blocks: r.blocks512(self.fs.bsize),
             mtime: u32_at(b, 16) as u64 * 1_000_000_000,
             ctime: u32_at(b, 12) as u64 * 1_000_000_000,
+        };
+        let mut c = self.fs.metas.borrow_mut();
+        if c.len() >= METAS_MAX {
+            c.clear();
         }
+        c.insert(self.ino, m);
+        m
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {

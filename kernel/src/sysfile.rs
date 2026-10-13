@@ -105,6 +105,11 @@ fn base_dir(dirfd: i64, path: &str) -> Result<String, i64> {
 /// dirfd + path の inode。path が空で AT_EMPTY_PATH なら dirfd 自身
 fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
     let path = user_str(pathp)?;
+    at_path(dirfd, &path, flags)
+}
+
+/// at と同じ (パスはもうユーザーから写したもの: newfstatat などが 2 度写さないように)
+fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
     if path.is_empty() {
         if flags & AT_EMPTY_PATH != 0 {
             return inode_of(dirfd as u64);
@@ -112,10 +117,10 @@ fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
         return Err(-ENOENT);
     }
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    match base_ino(dirfd, &path)? {
+    match base_ino(dirfd, path)? {
         // 開いているディレクトリから (ルートからたどりなおさない)
-        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, &path, follow).map(|(_, i)| i),
-        None => vfs::resolve(&proc::current().files().cwd.clone(), &path, follow),
+        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow).map(|(_, i)| i),
+        None => vfs::resolve(&proc::current().files().cwd.clone(), path, follow),
     }
 }
 
@@ -502,6 +507,7 @@ pub fn fstat(fd: u64, st: usize) -> R {
 }
 
 pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
+    let _p = crate::prof::span("newfstatat");
     let path = user_str(pathp)?;
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         return fstat(dirfd as u64, st);
@@ -510,7 +516,7 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
         out(st, &f.borrow().stat().to_bytes())?;
         return Ok(0);
     }
-    let ino = at(dirfd, pathp, flags)?;
+    let ino = at_path(dirfd, &path, flags)?;
     out(st, &Stat::of_inode(&ino).to_bytes())?;
     Ok(0)
 }
@@ -525,7 +531,7 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, buf: usize) -> R {
     {
         f.borrow().stat()
     } else {
-        Stat::of_inode(&at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?)
+        Stat::of_inode(&at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW)?)
     };
     out(buf, &s.to_statx())?;
     Ok(0)

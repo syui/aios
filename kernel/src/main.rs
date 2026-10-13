@@ -28,6 +28,7 @@ mod heap;
 mod initrd;
 mod kalloc;
 mod memlayout;
+mod prof;
 mod net;
 mod netif;
 mod proc;

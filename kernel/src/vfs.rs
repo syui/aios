@@ -29,6 +29,7 @@ pub const S_IFLNK: u32 = 0o120000;
 pub type InodeRef = Rc<dyn Inode>;
 
 /// stat に必要なもの
+#[derive(Clone, Copy)]
 pub struct Meta {
     pub ino: u64,
     pub mode: u32,
