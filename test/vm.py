@@ -197,7 +197,8 @@ class Serve:
             ok, mm = self.wait_for(re.compile(rb'boot \d+ in \d+ s'), min(timeout, 120))
             if mm is None:
                 return {'ready': False, 'error': 'no aiboot menu (is there a timeout in /boot/loader/loader.conf?)'}
-            menu = ANSI.sub('', self.buf.decode('utf-8', 'replace'))
+            # 一覧は wait_for が返した出力の中 (self.buf からは、見つけたところまでが消えている)
+            menu = ANSI.sub('', ok.decode('utf-8', 'replace'))
             for m in re.finditer(r'^\s*\*?\s*(\d)\. (.*)$', menu, re.M):
                 if choose in m.group(2):
                     chose = m.group(2).strip()
