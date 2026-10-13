@@ -677,3 +677,21 @@ fn key(pwd: &str, cur: &mut Option<Build>) -> Value {
     let l = format!("{} +{} {}", editor, line, aish_plugin::escape(path));
     json!({ "line": l, "pos": l.chars().count() })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 場所のない「error:」の行 (cargo そのもののエラー) をエラーとして数える。続く字下げや Caused by は全文に
+    #[test]
+    fn bare_errors_counts_cargo_errors() {
+        let err = "    Updating crates.io index\nerror: failed to select a version for `nosuch`.\n    required by package `x v0.1.0`\nCaused by:\n  no matching package\n\nwarning: unused\nfatal: not a git repository\n";
+        let mut d = Vec::new();
+        bare_errors(err, &mut d);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].head, "error: failed to select a version for `nosuch`.");
+        assert!(d[0].rendered.contains("required by package") && d[0].rendered.contains("no matching package"));
+        assert!(d[0].error && d[0].path.is_empty());
+        assert_eq!(d[1].head, "error: not a git repository");
+    }
+}
