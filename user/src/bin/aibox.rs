@@ -1,5 +1,5 @@
 // aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
-//   aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
+//   aibox [-w PATH]... [-W PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
 //   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
 //   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
@@ -12,7 +12,8 @@
 //   システムコール: ptrace、mount、モジュールの読みこみ、reboot など、カーネルの深いところにさわるもの
 //   (seccomp.rs の DEFAULT_DENY) は EPERM。--deny で足し (名前か番号)、--kill のものは呼んだら止める
 //   砂場は子にも引き継がれ、外せない。sudo (setuid) も効かなくなる
-//   CMD がなければ $SHELL (なければ /bin/sh)。-w の ~ はホーム
+//   -W PATH は -w と同じだが、なければだまって飛ばす (~/.cargo のように、入れたら使うもの。-w はなければ知らせる)
+//   CMD がなければ $SHELL (なければ /bin/sh)。-w と -W の ~ はホーム
 //   /etc/claude-code/managed-mcp.json は aish --mcp をこれで起こす (Claude が動かすものはみな砂場の中)。
 //   root のする操作は aios do (aiosd が wheel の人かを見てする) を通す
 #[path = "../lib/landlock.rs"]
@@ -35,7 +36,7 @@ fn enter_userns() -> std::io::Result<()> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: aibox [-w PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
+    eprintln!("usage: aibox [-w PATH]... [-W PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
     std::process::exit(2);
 }
 
@@ -48,10 +49,13 @@ fn main() {
     let mut as_root = false;
     let mut deny: Vec<u32> = seccomp::DEFAULT_DENY.iter().filter_map(|n| seccomp::number(n)).collect();
     let mut kill: Vec<u32> = vec![];
+    // -W のもの (なくても知らせない)
+    let mut quiet: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-w" => {
+            o @ ("-w" | "-W") => {
+                let quietly = o == "-W";
                 i += 1;
                 let w = args.get(i).cloned().unwrap_or_else(|| usage());
                 // ~ はホーム (JSON の設定から呼ばれても、シェルが広げないので)
@@ -59,6 +63,9 @@ fn main() {
                     (Some(rest), Ok(h)) if rest.is_empty() || rest.starts_with('/') => format!("{}{}", h, rest),
                     _ => w,
                 };
+                if quietly {
+                    quiet.push(w.clone());
+                }
                 write.push(w);
             }
             "-n" => {
@@ -114,7 +121,7 @@ fn main() {
     }
     match landlock::restrict(&write, ports.as_deref()) {
         Ok(missing) => {
-            for m in &missing {
+            for m in missing.iter().filter(|m| !quiet.contains(m)) {
                 eprintln!("aibox: {}: not found (not writable)", m);
             }
             if verbose {
