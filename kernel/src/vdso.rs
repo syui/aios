@@ -49,6 +49,12 @@ vdso_code_start:
 9:  mov     x8, #113            // clock_gettime
     svc     #0
     ret
+// __kernel_rt_sigreturn: シグナルのハンドラから戻るところ。SA_RESTORER を渡さないもの (aarch64 の glibc) は
+// ハンドラの戻り先 (x30) がここになる (Linux の arm64 の sigtramp と同じ)
+.global vdso_sigtramp
+vdso_sigtramp:
+    mov     x8, #139            // rt_sigreturn
+    svc     #0
 .balign 8
 vdso_vvar:
     .quad   0, 0
@@ -61,6 +67,16 @@ unsafe extern "C" {
     static vdso_code_start: u8;
     static vdso_code_end: u8;
     static vdso_vvar: u8;
+    static vdso_sigtramp: u8;
+}
+
+/// シグナルのハンドラの戻り先 (SA_RESTORER がないとき): vDSO の __kernel_rt_sigreturn (vDSO がなければ None)
+pub fn sigtramp() -> Option<u64> {
+    if unsafe { PAGE }.is_null() {
+        return None;
+    }
+    let off = (&raw const vdso_sigtramp) as usize - (&raw const vdso_code_start) as usize;
+    Some((VDSO_VA + TEXT + off) as u64)
 }
 
 /// ELF の中の場所

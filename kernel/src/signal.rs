@@ -413,7 +413,9 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
     tf.x[1] = sp;
     tf.x[2] = sp + uc as u64;
     tf.x[29] = sp + rec as u64;
-    tf.x[30] = if a.flags & SA_RESTORER != 0 { a.restorer } else { 0 };
+    // 戻り先: SA_RESTORER のもの (musl)、なければ vDSO の __kernel_rt_sigreturn (aarch64 の glibc。前は 0 で、
+    // ハンドラから戻ると番地 0 で SIGSEGV になった)
+    tf.x[30] = if a.flags & SA_RESTORER != 0 { a.restorer } else { crate::vdso::sigtramp().unwrap_or(0) };
     tf.sp_el0 = sp;
     tf.elr = a.handler;
     let mut m = p.sig_mask | a.mask;
