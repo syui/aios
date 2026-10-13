@@ -560,11 +560,12 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name, full) = parent_full(dirfd, pathp)?;
-    crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
-    // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
+    // Linux と同じく、あれば書けなくても (砂場の landlock でも) EEXIST (mkdir -p や create_dir_all がそれで
+    // 「ある」とわかる。前は landlock が先で EACCES: aibox の中の aish の write が、書けるディレクトリに書けなかった)
     if parent.lookup(&name).is_ok() {
         return Err(-EEXIST);
     }
+    crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::Dir)?;
@@ -608,6 +609,10 @@ pub fn swapoff(pathp: usize) -> R {
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     let (parent, name, full) = parent_full(dirfd, pathp)?;
     let mode = mode as u32;
+    // あれば landlock より先に EEXIST (Linux と同じ)
+    if parent.lookup(&name).is_ok() {
+        return Err(-EEXIST);
+    }
     crate::landlock::check_parent(&full, crate::landlock::make_right(mode))?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
@@ -676,11 +681,11 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
     let (parent, name, full) = parent_full(dirfd, pathp)?;
-    crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
-    // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
+    // Linux と同じく、あれば書けなくても (landlock でも) EEXIST
     if parent.lookup(&name).is_ok() {
         return Err(-EEXIST);
     }
+    crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
