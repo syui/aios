@@ -715,16 +715,18 @@ fn missing_deps() -> Vec<String> {
 }
 
 fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<String> {
-    fn visit(n: &str, sync: &BTreeMap<String, (usize, Desc)>, local: &BTreeSet<String>, seen: &mut BTreeSet<String>, out: &mut Vec<String>, top: bool) {
-        if !seen.insert(n.to_string()) {
+    // 依存が入っていれば飛ばす。ただし上げるもの (targets) なら、依存しているものより先に上げる
+    // (前は base の依存として「入っている」と見て印をつけ、あとの sed や diffutils の更新を飛ばした: -Syu が 2 回いった)
+    fn visit(n: &str, sync: &BTreeMap<String, (usize, Desc)>, local: &BTreeSet<String>, targets: &BTreeSet<&str>, seen: &mut BTreeSet<String>, out: &mut Vec<String>) {
+        if !targets.contains(n) && local.contains(n) {
             return;
         }
-        if !top && local.contains(n) {
+        if !seen.insert(n.to_string()) {
             return;
         }
         let Some((_, d)) = sync.get(n) else { die(format!("target not found: {}", n)) };
         for dep in list(d, "DEPENDS") {
-            visit(dep_name(dep), sync, local, seen, out, false);
+            visit(dep_name(dep), sync, local, targets, seen, out);
         }
         out.push(n.to_string());
     }
@@ -736,8 +738,9 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
     }
     let mut seen = BTreeSet::new();
     let mut out = vec![];
+    let tset: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
     for t in targets {
-        visit(t, sync, &local, &mut seen, &mut out, true);
+        visit(t, sync, &local, &tset, &mut seen, &mut out);
     }
     out
 }
