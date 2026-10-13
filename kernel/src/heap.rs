@@ -124,8 +124,12 @@ fn sites_json(out: &mut alloc::string::String) {
     }
 }
 
-/// ヒープの大きさと、いま使っているバイト (ほかが混みぐあいを見て減らすため: ページキャッシュの表など)
-pub const SIZE: usize = HEAP_SIZE;
+/// ヒープの大きさ (起動のときに RAM に合わせて決まる) と、いま使っているバイト
+/// (ほかが混みぐあいを見て減らすため: ページキャッシュの表など)
+static TOTAL: AtomicUsize = AtomicUsize::new(HEAP_SIZE);
+pub fn size() -> usize {
+    TOTAL.load(Relaxed)
+}
 pub fn used() -> usize {
     USED.load(Relaxed)
 }
@@ -135,7 +139,7 @@ pub fn stats_json() -> alloc::string::String {
     let (n, big) = free_blocks(&HEAP.lock());
     let mut s = alloc::format!(
         "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{}}}\n",
-        HEAP_SIZE,
+        size(),
         USED.load(Relaxed),
         PEAK.load(Relaxed),
         n,
@@ -170,10 +174,38 @@ unsafe impl Send for Heap {}
 
 static HEAP: SpinLock<Heap> = SpinLock::new(Heap { head: ptr::null_mut() });
 
+/// ヒープの大きさの上限 (メモリの多いマシンでも)
+const MAX_TOTAL: usize = 512 * 1024 * 1024;
+
+/// bss の 32 MiB に、メモリが多ければ (1/32 が 32 MiB をこえる分) まだ使っていないページの続いたかたまりを足す
+/// (ページキャッシュの表、tmpfs、プロセスの地図などがメモリに比例してふえるので、決まった大きさでは
+/// 大きなビルドで足りなくなった。2 GiB で 64 MiB、16 GiB で 512 MiB。kalloc::init のあとで)
 pub fn init() {
     let base = (&raw mut AREA) as *mut Free;
     unsafe { base.write(Free { size: HEAP_SIZE, next: ptr::null_mut() }) };
     HEAP.lock().head = base;
+    let want = (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, MAX_TOTAL);
+    let extra = want - HEAP_SIZE;
+    if extra == 0 {
+        return;
+    }
+    let Some(p) = crate::kalloc::take_contiguous(extra) else { return };
+    // フリーリストはアドレスの順: 足すものは bss (カーネルの中) より後ろにあるので、おしまいにつなぐ
+    let blk = p as *mut Free;
+    let h = HEAP.lock();
+    unsafe {
+        blk.write(Free { size: extra, next: ptr::null_mut() });
+        let mut cur = h.head;
+        while !(*cur).next.is_null() {
+            cur = (*cur).next;
+        }
+        if (cur as usize) < blk as usize {
+            (*cur).next = blk;
+        } else {
+            return;
+        }
+    }
+    TOTAL.store(want, Relaxed);
 }
 
 fn round(n: usize) -> usize {
@@ -223,7 +255,7 @@ unsafe impl GlobalAlloc for Kernel {
             "heap: no {} bytes (used {} of {}, peak {}, {} free blocks, the largest {})",
             need,
             USED.load(Relaxed),
-            HEAP_SIZE,
+            size(),
             PEAK.load(Relaxed),
             n,
             big

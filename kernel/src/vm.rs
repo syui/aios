@@ -116,7 +116,7 @@ unsafe impl Send for PrivPage {}
 fn priv_max() -> usize {
     // 表は 1 枚につきヒープを 100 バイトほど使う (BTreeMap)。ヒープは決まった大きさなので、その 1/4 まで
     // (メモリの多いマシンでも、表がヒープを使いきらないように: 2 GiB で 340 MB ほど)
-    (crate::memlayout::ram_size() / PGSIZE / 4).max(16384).min(crate::heap::SIZE / 4 / PRIV_ENTRY_BYTES)
+    (crate::memlayout::ram_size() / PGSIZE / 4).max(16384).min(crate::heap::size() / 4 / PRIV_ENTRY_BYTES)
 }
 
 /// 表の 1 枚がヒープを使うおおよそのバイト (はかったもの)
@@ -124,7 +124,7 @@ const PRIV_ENTRY_BYTES: usize = 96;
 
 /// ヒープがこれより混んでいたら、表に入れない (読んだページはそのまま使う)
 fn heap_crowded() -> bool {
-    crate::heap::used() > crate::heap::SIZE / 4 * 3
+    crate::heap::used() > crate::heap::size() / 4 * 3
 }
 
 /// 次に捨てる (表をなめる) のは、表がこの数をこえたとき。捨てても減らなければ (みな写されている)、

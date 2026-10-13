@@ -45,6 +45,19 @@ pub fn init() {
     k.end = p2v(phystop());
 }
 
+/// 起動のとき (まだだれもページを取っていないうちに): 続いた bytes を、まだ使っていない領域の頭から切り出す
+/// (カーネルのヒープを足すため。ページの参照の数は持たず、返さない)
+pub fn take_contiguous(bytes: usize) -> Option<*mut u8> {
+    let mut k = KMEM.lock();
+    let n = pg_round_up(bytes);
+    if k.fresh + n > k.end {
+        return None;
+    }
+    let p = k.fresh as *mut u8;
+    k.fresh += n;
+    Some(p)
+}
+
 /// 仮想アドレス (KBASE 側) のページを返す
 pub fn free(page: *mut u8) {
     ref_slot(page).store(0, Ordering::Relaxed);
