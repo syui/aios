@@ -70,7 +70,10 @@ jobs:
 
       - name: aish tests
         # base を作ったときの aish とプラグイン (aarch64 の musl。この arm64 の Linux でそのまま動く)
-        run: sh test/aish.sh user/target/aarch64-unknown-linux-musl/release/aish shell/target/aarch64-unknown-linux-musl/release
+        run: |
+          sh test/aish.sh user/target/aarch64-unknown-linux-musl/release/aish shell/target/aarch64-unknown-linux-musl/release
+          # プラグインのユニットテスト (aish-fix のエラーの数えかた、aish-pkg の版くらべなど)
+          (cd shell && cargo test --release -p aish-fix -p aish-pkg)
 
       - name: Boot test
         run: |
@@ -94,6 +97,10 @@ jobs:
             [ -n "$ok" ] || exit 1
           done
 
+      - name: Build C tests
+        # カーネルの C のテスト (test/*.c) を静的なプログラムに (arm64 の Ubuntu の gcc)。VM test で中から取って動かす
+        run: sh test/vm-ctests.sh build gcc
+
       - name: VM test
         run: |
           # GICv2 で起こしてプロンプトまで待ち、中で短いたしかめ (test/vm-check.sh: /sys と /proc、
@@ -109,6 +116,8 @@ jobs:
           # たしかめるスクリプトは test/ を http で見せて、中から取る (put は端末から流しこむので、
           # base64 が読みはじめる前に 4 KiB をこえるとあふれる)
           python3 test/vm.py run 'fetch http://10.0.2.2:8000/vm-check.sh > /tmp/vm-check.sh && sh /tmp/vm-check.sh' -t 600 || st=$?
+          # カーネルの C のテスト (test/vm-ctests.sh。clone3、execve、getdents、landlock、seccomp、namespace など)
+          python3 test/vm.py run 'fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/vm-ctests.sh && sh /tmp/vm-ctests.sh run' -t 1200 || st=$?
           # 失敗したら、シリアルの終わりを見せる (中で何が起きたか)
           [ "$st" = 0 ] || python3 test/vm.py log 60
           python3 test/vm.py stop || true
