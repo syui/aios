@@ -5,7 +5,7 @@
 # 版とチェックサムは pkg/c/zig.sh (ビルドする側の Zig) と同じにしておく
 pkgname=zig
 pkgver=0.17.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Zig compiler and toolchain (also a C/C++ compiler: zig cc)'
 arch=('aarch64')
 url='https://ziglang.org'
@@ -33,6 +33,7 @@ package() {
       *) rm -rf "$d" ;;
     esac
   done
-  # Zig は /proc/self/exe から lib/ を探すので、リンクでよい
-  ln -s ../../zig/zig "$pkgdir/opt/c/bin/zig"
+  # /opt/c/bin/zig は小さな包み (zig-wrapper.sh): -target がなければ aarch64-linux-musl に (aios のマシンの ABI を
+  # zig が決められないので)。Zig は /proc/self/exe から lib/ を探すので、/opt/zig/zig をそのまま呼べばよい
+  install -Dm755 "$startdir/zig-wrapper.sh" "$pkgdir/opt/c/bin/zig"
 }
