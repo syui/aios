@@ -12,10 +12,10 @@ license=('MIT')
 # ca-certificates は /etc/ssl/certs/ca-certificates.crt (curl、git、ssh の C のもの、pip などが TLS で使う。
 # aios の Rust のものは持っているが、なければ C のものが https につなげない)
 # tar は libarchive (bsdtar)、awk は gawk、ps は procps-ng (uutils の tar / awk / ps はまだ足りないものが多い)
-depends=('coreutils' 'grep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'brush' 'ca-certificates')
+# ripgrep (rg) は aish の where ツール (定義を探す) が使う。grep ツールと C-f / C-g も、あればそれを使う
+# (.gitignore を読む、速い)。grep は uutils の grep で、rg とは別のもの
+depends=('coreutils' 'grep' 'ripgrep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'brush' 'ca-certificates')
 makedepends=('rustup')
-# aish の grep ツールと C-f / C-g は、ripgrep があればそれを使う (.gitignore を読む、速い)
-optdepends=('ripgrep: faster grep tool and C-f / C-g in aish')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf
         etc/hostname etc/hosts etc/motd etc/profile etc/shells etc/fstab etc/aishrc
