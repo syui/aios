@@ -69,7 +69,7 @@
   {"from":"arch:pkgconf","name":"pkgconf","nvchecker":{"git":"https://github.com/pkgconf/pkgconf","include_regex":"pkgconf-(\\d+\\.)*([1-8]\\d*)?\\d","prefix":"pkgconf-","source":"git"},"pkgver":"3.0.7"},
   {"from":"arch:procps-ng","name":"procps-ng","nvchecker":{"exclude_regex":".*rc.*","git":"https://gitlab.com/procps-ng/procps.git","prefix":"v","source":"git"},"pkgver":"4.0.7"},
   {"from":"pkgbuild","git":"https://github.com/BurntSushi/ripgrep","name":"ripgrep","pkgver":"15.2.0","tag":"^([0-9][0-9A-Za-z.]*)$"},
-  {"commit":"e6829c3d1673aae6615708ce0b22d9e7e7266d37","from":"commit","git":"https://github.com/uutils/sed","name":"sed","pkgver":"0.2.0.20261006"},
+  {"from":"arch:sed","name":"sed","nvchecker":{"git":"https://git.savannah.gnu.org/git/sed.git","prefix":"v","source":"git"},"pkgver":"4.10"},
   {"from":"pkgbuild","git":"https://github.com/trifectatechfoundation/sudo-rs","name":"sudo-rs","pkgver":"0.2.15","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"commit":"f7858a00e944d3f9500e67814a8dc99581e4d277","from":"commit","git":"https://github.com/uutils/tar","name":"tar","pkgver":"0.1.0.20261005"},
   {"from":"pkgbuild","git":"https://github.com/tmux/tmux.git","name":"tmux","pkgver":"3.7c","tag":"^([0-9][0-9A-Za-z.]*)$"},
