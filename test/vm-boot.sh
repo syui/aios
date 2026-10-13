@@ -7,6 +7,7 @@
 #         戻る (why=load)
 #   hang  AIOS_TEST_HANG=1 のもの (aiosd の前で止まる) → --reset-after でリセットし、前のもの (good) に戻る
 #         (why=unfinished)
+#   chosen hang をもう一度入れ、起動の一覧 (timeout 5) で前のもの (good) を選ぶ (why=chosen)
 # どれのあとも /boot/Image は前のもの (good) に戻り、try は消える
 #   test/vm-boot.sh          ディスクの aiboot、aiosd、aios で
 #   test/vm-boot.sh --new    このソースの aiboot、aiosd、aios をディスクに入れてから (それらを変えたとき)
@@ -73,6 +74,17 @@ r=$(try Image-boot-hang 30)
 check hang "$r" "boot-good | the new kernel did not finish booting"
 check hang-why "$r" "| unfinished |"
 check hang-try "$r" "try=null"
+# chosen: 起動の一覧で前のものを選ぶ (loader.conf に timeout 5 を足し、一覧が出たらシリアルから番号を押す)。
+# 新しいものは hang なので、選べなければ止まって unfinished になる
+vm run "sudo cp /boot/loader/loader.conf $dir/loader.conf.orig 2>/dev/null; { grep -v '^timeout' $dir/loader.conf.orig 2>/dev/null; echo 'timeout 5'; } > $dir/loader.conf && sudo install -m644 $dir/loader.conf /boot/loader/loader.conf" >/dev/null
+vm run "aios install kernel $dir/Image-boot-hang" -t 50 >/dev/null
+c=$(vm reboot -t 180 --reset-after 90 --choose previous)
+check chosen-menu "$c" '"chose": "aios (previous kernel)"'
+r=$(vm run 'echo "$(uname -r) | $(aios get boot.last.result) | $(aios get boot.last.why 2>/dev/null) | try=$(aios get boot.try)"' -t 30)
+check chosen "$r" "boot-good | the previous kernel was chosen"
+check chosen-why "$r" "| chosen |"
+check chosen-try "$r" "try=null"
+vm run "if [ -f $dir/loader.conf.orig ]; then sudo install -m644 $dir/loader.conf.orig /boot/loader/loader.conf; else sudo rm -f /boot/loader/loader.conf; fi" >/dev/null
 r=$(vm run "cmp /boot/Image $dir/Image-boot-good && echo same")
 check image-back "$r" same
 

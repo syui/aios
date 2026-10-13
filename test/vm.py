@@ -9,7 +9,7 @@
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
 #   test/vm.py put LOCAL REMOTE    ファイルを中へ (16 KB までは gzip と base64 でシリアルから、大きいものは http と fetch で)
-#   test/vm.py reboot [-t SEC] [--reset-after SEC]
+#   test/vm.py reboot [-t SEC] [--reset-after SEC] [--choose TEXT]
 #                                  中で sudo reboot して、またプロンプトまで待つ。--reset-after の秒で来なければ
 #                                  QEMU をリセットする (止まった新しいカーネルの電源を入れなおすかわり)
 #   test/vm.py mon 'CMD'           QEMU のモニタへ
@@ -181,7 +181,7 @@ class Serve:
             return {'timeout': True}
         return {'status': int(mm.group(1))}
 
-    def reboot(self, timeout, reset_after=None):
+    def reboot(self, timeout, reset_after=None, choose=None):
         # 中で sudo reboot して、またプロンプトまで待つ。reset_after 秒で来なければ QEMU をリセットする (新しいカーネルが
         # 止まったとき、人が電源を入れなおすかわり。aiboot は前のカーネルで起こしなおす)
         t0 = time.time()
@@ -191,6 +191,20 @@ class Serve:
         # 打った行のこだまもプロンプトに見えるので、まず init が止めにかかるのを待つ
         if self.wait_for(re.compile(rb'aios: (restart|stopping services)'), 60)[0] is None:
             return {'ready': False, 'error': 'the VM did not start to reboot (sudo reboot)'}
+        # choose: aiboot の一覧 (loader.conf に timeout があるとき) で、題にこの文字のある項目の番号をシリアルから押す
+        chose = None
+        if choose:
+            ok, mm = self.wait_for(re.compile(rb'boot \d+ in \d+ s'), min(timeout, 120))
+            if mm is None:
+                return {'ready': False, 'error': 'no aiboot menu (is there a timeout in /boot/loader/loader.conf?)'}
+            menu = ANSI.sub('', self.buf.decode('utf-8', 'replace'))
+            for m in re.finditer(r'^\s*\*?\s*(\d)\. (.*)$', menu, re.M):
+                if choose in m.group(2):
+                    chose = m.group(2).strip()
+                    os.write(self.m, m.group(1).encode())
+                    break
+            else:
+                return {'ready': False, 'error': 'no menu entry with %r' % choose, 'menu': menu[-800:]}
         pat = re.compile(PROMPT.pattern + b'|' + PANIC.pattern)
         reset = False
         while True:
@@ -210,7 +224,10 @@ class Serve:
         time.sleep(1)
         self.run('unset -f chpwd 2>/dev/null', 10)
         add_ca(self)
-        return {'ready': True, 'reset': reset, 'boot_s': round(time.time() - t0, 1)}
+        r = {'ready': True, 'reset': reset, 'boot_s': round(time.time() - t0, 1)}
+        if chose:
+            r['chose'] = chose
+        return r
 
     def type(self, text):
         c = socket.socket(socket.AF_UNIX)
@@ -378,7 +395,7 @@ def serve(www):
             elif op == 'mon':
                 r = {'out': monitor(req['cmd'], req.get('wait', 0.5))}
             elif op == 'reboot':
-                r = vm.reboot(req.get('timeout', 180), req.get('reset_after'))
+                r = vm.reboot(req.get('timeout', 180), req.get('reset_after'), req.get('choose'))
             elif op == 'stop':
                 vm.stop()
                 r = {'stopped': True}
@@ -478,6 +495,8 @@ def main():
         req = {'op': 'reboot', 'timeout': float(a[a.index('-t') + 1]) if '-t' in a else 180}
         if '--reset-after' in a:
             req['reset_after'] = float(a[a.index('--reset-after') + 1])
+        if '--choose' in a:
+            req['choose'] = a[a.index('--choose') + 1]
         r = ask(req)
         print(json.dumps(r))
         sys.exit(0 if r.get('ready') else 1)
