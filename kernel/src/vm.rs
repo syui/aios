@@ -980,7 +980,8 @@ impl PageTable {
         }
     }
 
-    /// /proc/PID/maps (Linux と同じ形)
+    /// /proc/PID/maps (Linux と同じ形)。パスは / から (中では先頭の / なしで持っている。
+    /// VLC などは自分の行の最初の / から先を自分のディレクトリと見る)
     pub fn maps_text(&self) -> alloc::string::String {
         let mut out = alloc::string::String::new();
         for (&s, v) in self.vmas.iter() {
@@ -992,7 +993,8 @@ impl PageTable {
             let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
             let x = if v.prot & PROT_EXEC != 0 { 'x' } else { '-' };
             let p = if v.shared { 's' } else { 'p' };
-            out.push_str(&alloc::format!("{:08x}-{:08x} {}{}{}{} {:08x} 00:00 0 {}\n", s, v.end, r, w, x, p, off, v.name.as_deref().unwrap_or("")));
+            let name = v.name.as_deref().map_or(alloc::string::String::new(), |n| alloc::format!("/{}", n.trim_start_matches('/')));
+            out.push_str(&alloc::format!("{:08x}-{:08x} {}{}{}{} {:08x} 00:00 0 {}\n", s, v.end, r, w, x, p, off, name));
         }
         out
     }
