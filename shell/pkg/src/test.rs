@@ -189,22 +189,38 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
         let mut runs = Vec::new();
         let mut any = false;
         let mut seen_ver = false;
+        // root で動かなかったものは nobody (65534) でもう一度 (VLC のように root では動かないものがある)
+        let root_user = Command::new("id").arg("-u").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
         for b in &bins {
             let path = dir.join(b);
             // --version がなければ -version (ffmpeg)、-V (tmux)、version (zig)、それもなければ --help
             let (mut st, mut first) = (None, String::new());
+            let mut nobody = false;
             for flag in ["--version", "-version", "-V", "version", "--help"] {
-                let mut cmd = if native {
-                    let mut c = Command::new(&path);
-                    c.env("LD_LIBRARY_PATH", format!("{}/usr/lib:{}/opt/c/lib", dir.display(), dir.display()));
-                    c
-                } else {
-                    let mut c = Command::new(qemu.unwrap_or_default());
-                    c.arg("-L").arg(&dir).arg(&path);
+                let cmd = |as_nobody: bool| {
+                    let mut c = if native {
+                        let mut c = Command::new(&path);
+                        c.env("LD_LIBRARY_PATH", format!("{}/usr/lib:{}/opt/c/lib", dir.display(), dir.display()));
+                        c
+                    } else {
+                        let mut c = Command::new(qemu.unwrap_or_default());
+                        c.arg("-L").arg(&dir).arg(&path);
+                        c
+                    };
+                    c.arg(flag);
+                    if as_nobody {
+                        use std::os::unix::process::CommandExt;
+                        c.uid(65534).gid(65534);
+                    }
                     c
                 };
-                cmd.arg(flag);
-                (st, first) = run(cmd, Duration::from_secs(15));
+                (st, first) = run(cmd(false), Duration::from_secs(15));
+                if st != Some(0) && root_user {
+                    let (s, f) = run(cmd(true), Duration::from_secs(15));
+                    if s == Some(0) {
+                        (st, first, nobody) = (s, f, true);
+                    }
+                }
                 if st == Some(0) {
                     break;
                 }
@@ -212,6 +228,9 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             any |= st == Some(0);
             seen_ver |= !short.is_empty() && first.contains(&short);
             let mut r = json!({ "bin": b.display().to_string(), "status": st, "out": first });
+            if nobody {
+                r["note"] = json!("as nobody (it does not run as root)");
+            }
             // qemu-user ではそのプログラムが exec する aarch64 のプログラム (uvx → uv など) は動かない
             // (binfmt がないので)。aios の中なら動くので、そう書いておく
             if !native && st != Some(0) && first.contains("Exec format error") {
