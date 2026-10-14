@@ -714,6 +714,19 @@ fn missing_deps() -> Vec<String> {
     out
 }
 
+/// n という名前のパッケージがどのリポジトリにもなければ、n を provides で持つただ 1 つのパッケージ
+/// (desktop → aiwm のような名前の変更。pacman の -S と同じ)。ないか、2 つ以上あれば n のまま
+fn provider(sync: &BTreeMap<String, (usize, Desc)>, n: &str) -> String {
+    if sync.contains_key(n) {
+        return n.to_string();
+    }
+    let mut found = sync.iter().filter(|(_, (_, d))| list(d, "PROVIDES").iter().any(|p| dep_name(p) == n)).map(|(name, _)| name);
+    match (found.next(), found.next()) {
+        (Some(p), None) => p.clone(),
+        _ => n.to_string(),
+    }
+}
+
 fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<String> {
     // 依存が入っていれば飛ばす。ただし上げるもの (targets) なら、依存しているものより先に上げる
     // (前は base の依存として「入っている」と見て印をつけ、あとの sed や diffutils の更新を飛ばした: -Syu が 2 回いった)
@@ -721,14 +734,15 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
         if !targets.contains(n) && local.contains(n) {
             return;
         }
-        if !seen.insert(n.to_string()) {
+        let n = provider(sync, n);
+        if !seen.insert(n.clone()) {
             return;
         }
-        let Some((_, d)) = sync.get(n) else { die(format!("target not found: {}", n)) };
+        let Some((_, d)) = sync.get(&n) else { die(format!("target not found: {}", n)) };
         for dep in list(d, "DEPENDS") {
             visit(dep_name(dep), sync, local, targets, seen, out);
         }
-        out.push(n.to_string());
+        out.push(n);
     }
     // 入っているものと、それが provides で持つ名前 (unix を置きかえた aikernel など)
     let mut local = BTreeSet::new();
@@ -747,6 +761,20 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
 
 fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
     let sync = sync_all(repos);
+    // 名前がなければ、それを provides で持つもの (ap -S desktop → aiwm)
+    let named = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|t| {
+                let p = provider(&sync, t);
+                if p != *t {
+                    println!(":: {} is provided by {}", t, p);
+                }
+                p
+            })
+            .collect()
+    };
+    let (targets, explicit) = (named(targets), named(explicit));
+    let (targets, explicit) = (&targets[..], &explicit[..]);
     // まだデータベースを取ってきていないリポジトリがあれば、-Sy をすすめる
     if let Some(t) = targets.iter().find(|t| !sync.contains_key(*t)) {
         let missing: Vec<&str> =
@@ -927,9 +955,10 @@ fn main() {
         } else if flags.contains(&'u') {
             upgrade_all(&repos, &targets);
         } else if !targets.is_empty() {
-            // --needed: もう同じ版が入っているものは入れなおさない (pacman と同じ)
+            // --needed: もう同じ版が入っているものは入れなおさない (pacman と同じ。名前は provides でも)
             let targets: Vec<String> = if args.iter().any(|a| a == "--needed") {
                 let (sync, db) = (sync_all(&repos), installed());
+                let targets: Vec<String> = targets.iter().map(|t| provider(&sync, t)).collect();
                 let (skip, keep): (Vec<String>, Vec<String>) = targets.iter().cloned().partition(|t| {
                     matches!((sync.get(t), db.get(t)), (Some((_, sd)), Some((d, _))) if get(sd, "VERSION") == get(d, "VERSION"))
                 });
@@ -1009,5 +1038,33 @@ fn main() {
         }
     } else {
         die(format!("invalid option '{}'", op));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkg(provides: &[&str]) -> (usize, Desc) {
+        let mut d = Desc::new();
+        d.insert("PROVIDES".into(), provides.iter().map(|p| p.to_string()).collect());
+        (0, d)
+    }
+
+    #[test]
+    fn provider_by_provides() {
+        let mut sync = BTreeMap::new();
+        sync.insert("aiwm".to_string(), pkg(&["desktop"]));
+        sync.insert("gawk".to_string(), pkg(&["awk"]));
+        sync.insert("awk".to_string(), pkg(&[]));
+        sync.insert("a".to_string(), pkg(&["two=1"]));
+        sync.insert("b".to_string(), pkg(&["two"]));
+        // 名前がなければ provides で持つもの
+        assert_eq!(provider(&sync, "desktop"), "aiwm");
+        // 名前があればそれ (gawk が awk を provides していても)
+        assert_eq!(provider(&sync, "awk"), "awk");
+        // 持つものが 2 つ (版つきでも) なら選ばない。どこにもなければそのまま
+        assert_eq!(provider(&sync, "two"), "two");
+        assert_eq!(provider(&sync, "nope"), "nope");
     }
 }
