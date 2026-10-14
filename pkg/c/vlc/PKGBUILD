@@ -2,7 +2,8 @@
 #   画面: Qt はまだないので、端末の vlc -I ncurses と cvlc (画面なし)。動画は Wayland の窓に、音は ALSA に出す
 #   VLC 3.0 の Wayland の窓 (xdg-shell) は古い xdg_shell (unstable v5) しか話さず、aiwm は安定版の xdg_wm_base
 #   だけなので、xdg-wm-base.patch で安定版にする (modules/Makefile.in の xml も。Makefile.am は変えない:
-#   変えると automake を動かしなおそうとする)
+#   変えると automake を動かしなおそうとする)。窓の大きさは、aiwm が configure で決めたもの (タイル、全画面) を
+#   守る (VLC は動画の大きさを自分の窓の大きさにしていて、大きな動画は aiwm の窓に一部しか見えなかった)
 #   wl-shm-release.patch: Wayland の絵 (wl_shm) は、返ってきたバッファの印 (user data) を消すのがデバッグ版だけで、
 #   リリース版では片づけのときに絵をもう一度 release して 2 度 free していた (musl の malloc で落ちる)
 #   読む・解く: FFmpeg (avcodec、avformat、swscale)。字幕と OSD: freetype、fribidi、harfbuzz、fontconfig
@@ -10,7 +11,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=vlc
 pkgver=3.0.24
-pkgrel=1
+pkgrel=2
 pkgdesc='Multi-platform media player: libvlc and plugins, ncurses interface, Wayland video, ALSA audio (shared, for aios)'
 arch=('aarch64')
 url='https://www.videolan.org/vlc/'
@@ -22,7 +23,7 @@ source=("https://download.videolan.org/pub/videolan/vlc/$pkgver/vlc-$pkgver.tar.
         'xdg-wm-base.patch'
         'wl-shm-release.patch')
 sha256sums=('e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf'
-            '5ab37c646b06933e9cd385b9ff2e492408d3f036943b5e05b073bff96680bc95'
+            'd909acc4a2f57c45fd374b9094cb4273ef0010f0e9a42bc3f782cd728124d1a3'
             'e337d904d36e00f82912727330862669aec19548576c493671adf36365a89d1e')
 
 prepare() {

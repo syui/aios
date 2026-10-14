@@ -1,6 +1,6 @@
---- a/modules/video_output/wayland/xdg-shell.c	2026-10-14 07:40:55.406825041 +0000
-+++ b/modules/video_output/wayland/xdg-shell.c	2026-10-14 07:41:35.633960992 +0000
-@@ -38,13 +38,15 @@
+--- a/modules/video_output/wayland/xdg-shell.c
++++ b/modules/video_output/wayland/xdg-shell.c
+@@ -38,16 +38,25 @@
  #include <vlc_plugin.h>
  #include <vlc_vout_window.h>
  
@@ -18,7 +18,32 @@
      struct org_kde_kwin_server_decoration_manager *deco_manager;
      struct org_kde_kwin_server_decoration *deco;
  
-@@ -124,9 +126,9 @@
++    /* The size from the last configure event, or 0x0 if it is ours to
++     * choose. A tiled, maximized or fullscreen window keeps that size:
++     * a bigger picture would only be shown in part. */
++    vlc_mutex_t lock;
++    unsigned width;
++    unsigned height;
++
+     vlc_thread_t thread;
+ };
+ 
+@@ -114,6 +123,14 @@
+              * server. With Wayland, it is arbitrated in the client windowing
+              * code. In this case, it is arbitrated by the window core code.
+              */
++            vlc_mutex_lock(&sys->lock);
++            if (sys->width != 0 && sys->height != 0)
++            {
++                width = sys->width;
++                height = sys->height;
++            }
++            vlc_mutex_unlock(&sys->lock);
++
+             vout_window_ReportSize(wnd, width, height);
+             xdg_surface_set_window_geometry(sys->surface, 0, 0, width, height);
+             break;
+@@ -124,9 +141,9 @@
              bool fs = va_arg(ap, int);
  
              if (fs)
@@ -30,7 +55,7 @@
              break;
          }
  
-@@ -139,16 +141,15 @@
+@@ -139,54 +156,83 @@
      return VLC_SUCCESS;
  }
  
@@ -44,6 +69,7 @@
 +                                      struct wl_array *states)
  {
      vout_window_t *wnd = data;
++    vout_window_sys_t *sys = wnd->sys;
      const uint32_t *state;
  
 -    msg_Dbg(wnd, "new configuration: %"PRId32"x%"PRId32" (serial: %"PRIu32")",
@@ -52,8 +78,26 @@
      wl_array_for_each(state, states)
      {
          msg_Dbg(wnd, " - state 0x%04"PRIX32, *state);
-@@ -160,33 +161,49 @@
+     }
+ 
++    if (width <= 0 || height <= 0)
++        width = height = 0;
++
++    vlc_mutex_lock(&sys->lock);
++    sys->width = width;
++    sys->height = height;
++    vlc_mutex_unlock(&sys->lock);
++
+     /* Zero width or zero height means client (we) should choose.
+-     * DO NOT REPORT those values to video output... */
++     * DO NOT REPORT those values to video output...
++     * The window geometry follows, or the compositor would still show only
++     * the old size (e.g. a tile's width when going fullscreen). */
+     if (width != 0 && height != 0)
++    {
++        xdg_surface_set_window_geometry(sys->surface, 0, 0, width, height);
          vout_window_ReportSize(wnd,  width, height);
++    }
  
      /* TODO: report fullscreen state, not implemented in VLC */
 -    xdg_surface_ack_configure(surface, serial);
@@ -112,7 +156,7 @@
  };
  
  static void registry_global_cb(void *data, struct wl_registry *registry,
-@@ -202,8 +219,8 @@
+@@ -202,8 +248,8 @@
                                             &wl_compositor_interface,
                                             (vers < 2) ? vers : 2);
      else
@@ -123,15 +167,28 @@
      else
      if (!strcmp(iface, "org_kde_kwin_server_decoration_manager"))
          sys->deco_manager = wl_registry_bind(registry, name,
-@@ -241,6 +258,7 @@
+@@ -241,8 +287,12 @@
      sys->compositor = NULL;
      sys->shell = NULL;
      sys->surface = NULL;
 +    sys->toplevel = NULL;
      sys->deco_manager = NULL;
      sys->deco = NULL;
++    vlc_mutex_init(&sys->lock);
++    sys->width = 0;
++    sys->height = 0;
      wnd->sys = sys;
-@@ -269,8 +287,7 @@
+ 
+     /* Connect to the display server */
+@@ -253,6 +303,7 @@
+ 
+     if (display == NULL)
+     {
++        vlc_mutex_destroy(&sys->lock);
+         free(sys);
+         return VLC_EGENERIC;
+     }
+@@ -269,8 +320,7 @@
      if (sys->compositor == NULL || sys->shell == NULL)
          goto error;
  
@@ -141,7 +198,7 @@
  
      /* Create a surface */
      struct wl_surface *surface = wl_compositor_create_surface(sys->compositor);
-@@ -278,7 +295,7 @@
+@@ -278,7 +328,7 @@
          goto error;
  
      struct xdg_surface *xdg_surface =
@@ -150,7 +207,7 @@
      if (xdg_surface == NULL)
          goto error;
  
-@@ -286,15 +303,23 @@
+@@ -286,15 +336,23 @@
  
      xdg_surface_add_listener(xdg_surface, &xdg_surface_cbs, wnd);
  
@@ -177,7 +234,7 @@
          free(app_id);
      }
  
-@@ -318,6 +343,11 @@
+@@ -318,6 +376,11 @@
      //if (var_InheritBool (wnd, "keyboard-events"))
      //    do_something();
  
@@ -189,7 +246,7 @@
      wl_display_flush(display);
  
      wnd->type = VOUT_WINDOW_TYPE_WAYLAND;
-@@ -337,10 +367,12 @@
+@@ -337,13 +400,16 @@
          org_kde_kwin_server_decoration_destroy(sys->deco);
      if (sys->deco_manager != NULL)
          org_kde_kwin_server_decoration_manager_destroy(sys->deco_manager);
@@ -203,7 +260,11 @@
      if (sys->compositor != NULL)
          wl_compositor_destroy(sys->compositor);
      wl_display_disconnect(display);
-@@ -362,9 +394,10 @@
++    vlc_mutex_destroy(&sys->lock);
+     free(sys);
+     return VLC_EGENERIC;
+ }
+@@ -362,11 +428,13 @@
          org_kde_kwin_server_decoration_destroy(sys->deco);
      if (sys->deco_manager != NULL)
          org_kde_kwin_server_decoration_manager_destroy(sys->deco_manager);
@@ -214,4 +275,7 @@
 +    xdg_wm_base_destroy(sys->shell);
      wl_compositor_destroy(sys->compositor);
      wl_display_disconnect(wnd->display.wl);
++    vlc_mutex_destroy(&sys->lock);
      free(sys);
+ }
+ 
