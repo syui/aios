@@ -66,7 +66,7 @@ bindsym $mod+f fullscreen
 #   ほかに浮かせたいものは for_window [app_id="..."] floating enable (app_id で)
 floating_modifier $mod
 bindsym $mod+Shift+space floating toggle
-# for_window [app_id="aisplash"] floating enable
+# for_window [app_id="aiterm"] floating enable
 
 # aiwm を終わる
 bindsym $mod+Shift+e exit

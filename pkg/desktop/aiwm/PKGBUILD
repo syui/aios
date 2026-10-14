@@ -1,16 +1,28 @@
-# aiwm: aios のタイル型 Wayland コンポジタ (sway の小さな親戚)。このリポジトリの desktop/ から
-#   設定は /etc/aiwm/config (~/.config/aiwm/config があればそちら)。aiwm で始め、$mod+Shift+e で終わる
+# aiwm: aios のデスクトップ。タイル型の Wayland コンポジタ (sway の小さな親戚) と、それに要るもの (aiterm、aifont)
+#   このリポジトリの desktop/ から。前のまとめのパッケージ desktop と aisplash は、これにまとめた (replaces で
+#   ap -Syu のときに入れかわる。provides=desktop なので ap -S desktop でもこれが入る)
+#   aipkg -S aiwm して再起動すると、画面 (virtio_gpu) とキーボードやマウス (virtio_input)、音 (virtio_snd) の
+#   モジュールが起きる (/etc/modules-load.d/aiwm.conf)。窓は AIOS_DISPLAY=1 ./bin/run.sh
+#   設定は /etc/aiwm/config (~/.config/aiwm/config があればそちら)。aiwm で始め、$mod+Return で端末、$mod+Shift+e で終わる
 #   起動のときに画面に出すには sudo systemctl enable aiwm (aiwm.service、User=ai)
+#   音を鳴らす道具は ap -S alsa-utils (aplay、speaker-test)
+# 入れなければ、aios は文字の画面だけの最小構成のまま
 pkgname=aiwm
 pkgver=0.0.1
 pkgrel=1
-pkgdesc='Tiling Wayland compositor for aios (sway-like config)'
+pkgdesc='aios desktop: aiwm (tiling Wayland compositor, sway-like config), aiterm, aifont, and the screen, input and sound drivers'
 arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
-depends=('aifont' 'aiterm')
+depends=('base' 'aikernel' 'aifont' 'aiterm')
+optdepends=('alsa-utils: 音を鳴らす (aplay、speaker-test)'
+            'mesa: Vulkan / OpenGL を CPU で (lavapipe、llvmpipe)。vulkan-loader と'
+            'xkeyboard-config: winit などの Wayland の窓のキーボード (libxkbcommon)')
 makedepends=('rustup')
-backup=(etc/aiwm/config)
+provides=('desktop')
+conflicts=('desktop' 'aisplash')
+replaces=('desktop' 'aisplash')
+backup=(etc/aiwm/config etc/modules-load.d/aiwm.conf)
 
 pkgver() {
   cd "$startdir/../../.."
@@ -27,4 +39,12 @@ package() {
   install -Dm755 "$srcdir/target/aarch64-unknown-linux-musl/release/aiwm" "$pkgdir/usr/bin/aiwm"
   install -Dm644 "$startdir/../../../desktop/etc/aiwm/config" "$pkgdir/etc/aiwm/config"
   install -Dm644 "$startdir/../../../desktop/etc/systemd/aiwm.service" "$pkgdir/usr/lib/systemd/system/aiwm.service"
+  install -d "$pkgdir/etc/modules-load.d"
+  cat > "$pkgdir/etc/modules-load.d/aiwm.conf" <<'CONF'
+# aiwm: 起動のときに起こすモジュール (modprobe -l で一覧、lsmod で起きているもの)
+virtio_gpu
+virtio_input
+virtio_snd
+CONF
+  chmod 644 "$pkgdir/etc/modules-load.d/aiwm.conf"
 }

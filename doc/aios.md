@@ -81,7 +81,7 @@ aios rollback                           # ひとつ前の apply の設定に戻�
 ```json
 {
   "host":    { "name": "aios" },
-  "pkg":     ["openssh", "cargo", "base-devel", "git", "desktop", "mesa"],
+  "pkg":     ["openssh", "cargo", "base-devel", "git", "aiwm", "mesa"],
   "service": { "sshd": "enabled", "aiwm": "disabled" },
   "kernel":  { "modules": ["virtio_gpu", "virtio_input", "virtio_snd"] },
   "user":    { "ai": { "shell": "/bin/aish", "groups": ["wheel"] } },

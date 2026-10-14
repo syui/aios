@@ -20,7 +20,7 @@
 
   "graphics": {
     "vulkan": "lavapipe (mesa, on the CPU)", "gl": "llvmpipe (mesa, EGL / GLES)", "wsi": "Wayland (aiwm)",
-    "pkg":    "ap -S desktop mesa vulkan-loader xkeyboard-config alsa-lib libxkbcommon",
+    "pkg":    "ap -S aiwm mesa vulkan-loader xkeyboard-config alsa-lib libxkbcommon",
     "tested": ["vkcube", "ai/engine (ash + winit + cpal)"]
   },
 
@@ -46,7 +46,7 @@
       "rust":    { "aiboot": "0.0.1", "aikernel": "0.0.1", "base": "0.0.1", "aigpt": "0.0.1", "ailog": "0.0.1", "aimg": "0.0.1" },
       "c":       { "base-devel": "0.0.1", "claude": "0.0.1" },
       "shell":   { "aish-powerline": "0.0.1" },
-      "desktop": { "aifont": "0.0.1", "aisplash": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1", "desktop": "0.0.1" }
+      "desktop": { "aifont": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1" }
     },
 
     "linux": {
