@@ -1,0 +1,89 @@
+# vlc: VLC media player 3.0 (shared, for aios): vlc / cvlc、libvlc、libvlccore、プラグイン (/opt/c/lib/vlc/plugins)
+#   画面: Qt はまだないので、端末の vlc -I ncurses と cvlc (画面なし)。動画は Wayland の窓に、音は ALSA に出す
+#   VLC 3.0 の Wayland の窓 (xdg-shell) は古い xdg_shell (unstable v5) しか話さず、aiwm は安定版の xdg_wm_base
+#   だけなので、xdg-wm-base.patch で安定版にする (modules/Makefile.in の xml も。Makefile.am は変えない:
+#   変えると automake を動かしなおそうとする)
+#   読む・解く: FFmpeg (avcodec、avformat、swscale)。字幕と OSD: freetype、fribidi、harfbuzz、fontconfig
+#   Lua (rc / http の画面、playlist のスクリプト) はまだ入れない
+#   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
+pkgname=vlc
+pkgver=3.0.24
+pkgrel=1
+pkgdesc='Multi-platform media player: libvlc and plugins, ncurses interface, Wayland video, ALSA audio (shared, for aios)'
+arch=('aarch64')
+url='https://www.videolan.org/vlc/'
+license=('GPL-2.0-or-later' 'LGPL-2.1-or-later')
+depends=('musl' 'zlib' 'ffmpeg' 'alsa-lib' 'wayland' 'freetype2' 'fribidi' 'harfbuzz' 'fontconfig' 'libpng')
+# 入れたあとにプラグインの一覧 (plugins.dat) を作る
+install=vlc.install
+source=("https://download.videolan.org/pub/videolan/vlc/$pkgver/vlc-$pkgver.tar.xz"
+        'xdg-wm-base.patch')
+sha256sums=('e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf'
+            '5ab37c646b06933e9cd385b9ff2e492408d3f036943b5e05b073bff96680bc95')
+
+prepare() {
+  rm -rf "vlc-$pkgver"
+  tar -xf "vlc-$pkgver.tar.xz"
+  cd "vlc-$pkgver"
+  patch -p1 < "$srcdir/xdg-wm-base.patch"
+  sed -i 's|unstable/xdg-shell/xdg-shell-unstable-v5\.xml|stable/xdg-shell/xdg-shell.xml|' modules/Makefile.in
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  # ncurses は静的 (PIC) で、ncurses のプラグインの中に入る
+  c_deps zlib ffmpeg alsa-lib libffi pcre2 glib2 wayland wayland-protocols freetype2 fribidi harfbuzz fontconfig libpng expat ncurses
+  shared_env
+  # zig は __DATE__ と __TIME__ をエラーにする (-Wdate-time。VLC は vlc --version に作った日を出す)
+  # -fPIC: プログラム (vlc、vlc-cache-gen) も。PIC でないと stderr や __stack_chk_guard を COPY の再配置で
+  #   プログラムの中に写すが、zig の musl の libc.so (リンクするときの見本) はデータの名前をみな同じ番地に置くので、
+  #   lld がそれらを別名と見て __environ、optind、stdin なども同じ 8 バイトに置き、setenv で落ちる。
+  #   PIC ならデータは GOT から読むので COPY はできない (ffmpeg は --enable-pic で同じ)
+  export CFLAGS="$CFLAGS -Wno-date-time -fPIC" CXXFLAGS="$CXXFLAGS -Wno-date-time -fPIC"
+  # vlc --version の revision は tarball の src/revision.txt から (ここは aios の git の中なので、git が aios の
+  #   コミットを答えないように、上をさがさせない)
+  export GIT_CEILING_DIRECTORIES="$srcdir"
+  # wayland-protocols の .pc は share/ に。wayland-scanner はこのマシンのものを使う (configure は .pc があるかだけ見る)
+  mkdir -p "$srcdir/hostpc"
+  printf 'wayland_scanner=wayland-scanner\nName: wayland-scanner\nDescription: host wayland-scanner\nVersion: %s\n' \
+    "$(wayland-scanner --version 2>&1 | sed 's/.* //')" > "$srcdir/hostpc/wayland-scanner.pc"
+  export PKG_CONFIG_LIBDIR="$PKG_CONFIG_LIBDIR:$SYSROOT/share/pkgconfig:$srcdir/hostpc"
+  cd "vlc-$pkgver"
+  # BUILDCC: 作るときに動かす道具 (このマシン用)
+  # NCURSES_LIBS: ncursesw.pc の Libs には -static -s があり、libtool がそれを見て ncurses のプラグインを
+  #   静的な .a にしてしまう (読めない)。-static をのぞいて渡す (libncursesw.a は PIC で、プラグインの中に入る)
+  BUILDCC=cc NCURSES_LIBS="-L$SYSROOT/lib -lncursesw" ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+    --enable-shared --disable-static --disable-nls --disable-rpath \
+    --disable-lua --disable-qt --disable-skins2 --disable-xcb --disable-dbus \
+    --disable-mad --disable-a52 --disable-libgcrypt --disable-gnutls \
+    --enable-avcodec --enable-avformat --enable-swscale --disable-postproc \
+    --enable-alsa --disable-pulse --disable-jack \
+    --enable-wayland --disable-gles2 --disable-vdpau --disable-libva \
+    --enable-freetype --enable-fribidi --enable-harfbuzz --enable-fontconfig --enable-ncurses \
+    --disable-v4l2 --disable-vcd --disable-dc1394 --disable-dv1394 --disable-linsys --disable-decklink \
+    --disable-update-check --disable-chromecast
+  # libtool の C++ (zig c++) のリンクを直す:
+  #  - 外に出す名前を -retain-symbols-file でしぼるが、zig のリンカにはない (C のほうは version script で通る)。
+  #    C++ はしぼらずに作る (VLC はプラグインを dlopen の RTLD_LOCAL で読むので、プラグインどうしでぶつからない)
+  #  - -nostdlib をつけて C++ のライブラリを自分で足すが、zig c++ -v の出力からそれを読めず (postdeps="-L/")、
+  #    operator new などがなくなる。-nostdlib を外して zig c++ に足させる (libc++ は静的に、プラグインごとに入る。
+  #    プラグインと VLC は C の形でしか話さない)
+  sed -i 's/ \\\$wl-retain-symbols-file \\\$wl\\\$export_symbols//; s/ -shared -nostdlib / -shared /' libtool
+  # MSGFMT=false: msgfmt がないと : (なにもしない) になり、appdata.xml を写す || cp が動かない
+  make MSGFMT=false WAYLAND_SCANNER=wayland-scanner WAYLAND_PROTOCOLS="$SYSROOT/share/wayland-protocols"
+}
+
+package() {
+  # make install は zig ranlib を使う (libcompat.a)
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "vlc-$pkgver"
+  make DESTDIR="$pkgdir" install
+  find "$pkgdir" -name '*.la' -delete
+  rm -rf "$pkgdir/opt/c/share/doc" "$pkgdir/opt/c/share/man"
+  # vlc-wrapper は setuid root にしてリアルタイムの優先度をとるための道具 (aios では使わない)
+  rm -f "$pkgdir/opt/c/bin/vlc-wrapper"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  install -Dm644 COPYING.LIB "$pkgdir/usr/share/licenses/$pkgname/COPYING.LIB"
+}

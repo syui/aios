@@ -73,7 +73,7 @@
 
         "procps-ng": "4.0.7", "gawk": "5.4.1", "libarchive": "3.8.9", "gzip": "1.15", "xz": "5.8.4",
         "bzip2": "1.0.8", "zstd": "1.5.7", "patch": "2.8", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
-        "toybox": "0.8.15", "iproute2": "7.2.0", "diffutils": "3.12", "sed": "4.10"
+        "toybox": "0.8.15", "iproute2": "7.2.0", "diffutils": "3.12", "sed": "4.10", "vlc": "3.0.24"
       },
       "npm": { "pnpm": "12.9.1", "@anthropic-ai/claude-code": "2.1.289 (ap -S claude)" },
       "uv":  { "python": "3.14.8" }

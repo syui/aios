@@ -1,0 +1,13 @@
+# VLC のプラグインの一覧 (plugins.dat) を作る。ないと VLC は起動のたびにプラグインをみな開いて調べる
+# (クロスビルドなので make install では作れない)
+post_install() {
+  /opt/c/lib/vlc/vlc-cache-gen /opt/c/lib/vlc/plugins
+}
+
+post_upgrade() {
+  post_install
+}
+
+pre_remove() {
+  rm -f /opt/c/lib/vlc/plugins/plugins.dat
+}

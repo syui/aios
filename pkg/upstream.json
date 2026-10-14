@@ -75,6 +75,7 @@
   {"from":"pkgbuild","name":"tree","nvchecker":{"join":true,"regex":"tree-([0-9.]+)\\.tgz","source":"regex","url":"https://oldmanprogrammer.net/tar/tree/"},"pkgver":"2.3.2"},
   {"from":"pkgbuild","git":"https://github.com/astral-sh/uv","name":"uv","pkgver":"0.12.23","tag":"^([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/vim/vim","name":"vim","pkgver":"9.2.1164","tag":"^v([0-9][0-9A-Za-z.]*)$"},
+  {"from":"arch:vlc","name":"vlc","nvchecker":{"exclude_regex":".*(alpha|beta|dev|pre|rc).*","from_pattern":"-","git":"https://code.videolan.org/videolan/vlc/","source":"git","to_pattern":"_"},"pkgver":"3.0.24"},
   {"from":"pkgbuild","git":"https://github.com/KhronosGroup/Vulkan-Headers.git","name":"vulkan-headers","pkgver":"1.4.365","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/KhronosGroup/Vulkan-Loader.git","name":"vulkan-loader","pkgver":"1.4.365","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/KhronosGroup/Vulkan-Tools.git","name":"vulkan-tools","pkgver":"1.4.365","tag":"^v([0-9][0-9A-Za-z.]*)$"},
