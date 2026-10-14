@@ -5,7 +5,7 @@
 #   ほかの端末は /opt/c/share/terminfo か /usr/share/terminfo に置けば読む
 pkgname=ncurses
 pkgver=6.6
-pkgrel=1
+pkgrel=2
 pkgdesc='System V Release 4.0 curses emulation library (static, with built-in terminal entries, for aios)'
 arch=('aarch64')
 url='https://invisible-island.net/ncurses/'
@@ -26,7 +26,8 @@ build() {
   zig_env
   cd "ncurses-$pkgver"
   # 入れる端末の C は、このマシンの tic / infocmp で作る (BUILD_CC はこのマシンのコンパイラ)
-  BUILD_CC=cc ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
+  # -fPIC: 共有ライブラリの中にも入れられるように (VLC の ncurses のプラグイン。静的なプログラムにもそのまま使える)
+  CFLAGS="$CFLAGS -fPIC" BUILD_CC=cc ./configure --host=aarch64-linux-musl --prefix="$PREFIX" \
     --with-build-cc=cc --without-cxx --without-cxx-binding --without-ada --without-manpages \
     --without-tests --without-debug --without-shared --with-normal --enable-widec --enable-overwrite \
     --enable-pc-files --with-pkg-config-libdir="$PREFIX/lib/pkgconfig" \
