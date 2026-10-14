@@ -22,7 +22,12 @@ fn ask(cmd: &str, arg: &str) -> (i32, String) {
             exit(1);
         }
     }
-    let sent = fs::OpenOptions::new().write(true).open(unit::CTL).and_then(|mut f| writeln!(f, "{} {} {}", cmd, arg, reply));
+    // O_NONBLOCK: init (いつも読むために開いている) がいなければ、待たずに ENXIO で終わる (chroot の中で
+    // aipkg が daemon-reload を頼んだときなど)。頼みは 1 行で短いので、そのまま書ける
+    let sent = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(unit::CTL).and_then(|mut f| writeln!(f, "{} {} {}", cmd, arg, reply))
+    };
     if let Err(e) = sent {
         let _ = fs::remove_file(&reply);
         eprintln!("systemctl: init is not reachable ({}): {}", unit::CTL, e);

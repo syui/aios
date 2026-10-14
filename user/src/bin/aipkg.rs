@@ -36,6 +36,35 @@ const ARCH: &str = "aarch64";
 
 type Desc = BTreeMap<String, Vec<String>>;
 
+/// 入れた・消したパッケージに systemd のユニットがあった (おしまいに init に読みなおさせる)
+static UNITS_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// init がユニットを読むところ (unit.rs の UNIT_DIRS。aiwm.service.d/ のような drop-in も) のファイルか
+fn is_unit(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+    (p.starts_with("usr/lib/systemd/system/") || p.starts_with("etc/systemd/system/")) && !p.ends_with('/')
+}
+
+/// ユニットを入れた・消したら、init に読みなおさせる (systemctl daemon-reload。pacman の systemd のフックと同じ。
+/// 前は入れたばかりの aiwm.service を systemctl start が見つけられなかった)。init のいないところ (chroot など) では
+/// systemctl がすぐにしくじるだけ
+fn reload_units() {
+    if !UNITS_CHANGED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    println!(":: reloading systemd units");
+    let ok = std::process::Command::new("/usr/bin/systemctl")
+        .arg("daemon-reload")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        println!(" init is not running here; the units are read at the next boot");
+    }
+}
+
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("error: {}", msg);
     exit(1)
@@ -551,6 +580,10 @@ fn install(path: &str, explicit: bool) {
     let dir = local_dir(&name, &ver);
     fs::create_dir_all(&dir).unwrap_or_else(|e| die(format!("{}: {}", dir, e)));
     fs::write(format!("{}/desc", dir), write_desc(&desc)).unwrap_or_else(|e| die(e));
+    // ユニットが増えた・変わった・(古い版だけにあって) なくなった
+    if files.iter().any(|f| is_unit(f)) || old.is_some_and(|(_, of)| of.iter().any(|f| is_unit(f))) {
+        UNITS_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut fd = Desc::new();
     fd.insert("FILES".into(), files);
     fs::write(format!("{}/files", dir), write_desc(&fd)).unwrap_or_else(|e| die(e));
@@ -666,6 +699,9 @@ fn remove_with(names: &[String], check_deps: bool) {
         // 消すまえに pre_remove。post_remove は local を消すまえに、とっておいた中身で
         let saved = fs::read_to_string(&script).ok();
         run_script(&script, "pre_remove", &[ver]);
+        if files.iter().any(|f| is_unit(f)) {
+            UNITS_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         remove_files(files.iter());
         let _ = fs::remove_dir_all(local_dir(name, ver));
         if let Some(text) = saved {
@@ -1039,6 +1075,7 @@ fn main() {
     } else {
         die(format!("invalid option '{}'", op));
     }
+    reload_units();
 }
 
 #[cfg(test)]
@@ -1049,6 +1086,15 @@ mod tests {
         let mut d = Desc::new();
         d.insert("PROVIDES".into(), provides.iter().map(|p| p.to_string()).collect());
         (0, d)
+    }
+
+    #[test]
+    fn unit_paths() {
+        assert!(is_unit("usr/lib/systemd/system/aiwm.service"));
+        assert!(is_unit("/etc/systemd/system/aiwm.service.d/override.conf"));
+        assert!(!is_unit("usr/lib/systemd/system/"));
+        assert!(!is_unit("usr/lib/systemd/user/foo.service"));
+        assert!(!is_unit("usr/bin/aiwm"));
     }
 
     #[test]
