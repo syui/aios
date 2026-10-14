@@ -1,7 +1,7 @@
 {
   "branch": "unix",
   "arch": "aarch64",
-  "updated": "2026-10-11",
+  "updated": "2026-10-14",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -36,8 +36,9 @@
     "fs":   ["ext4 (jbd2, htree)", "ext2", "vfat", "tmpfs", "procfs (stat, net, vmstat, diskstats)", "/dev/fd", "initramfs", "inotify"],
     "dev":  ["virtio-blk", "virtio-net", "virtio-gpu", "virtio-input", "virtio-sound", "SD", "UART", "modules"],
     "net":  ["IPv4 (TCP, UDP, DHCP)", "ICMP (ping, raw)", "unix sockets (SCM_RIGHTS)"],
-    "proc": ["signal", "futex", "epoll", "pty", "pidfd", "vDSO", "PT_INTERP", "umask", "capget"],
-    "todo": ["seccomp", "namespace", "fine-grained lock (BKL)"]
+    "proc": ["signal", "futex", "epoll", "pty", "pidfd", "vDSO", "PT_INTERP", "umask", "capget",
+             "seccomp (BPF)", "landlock (fs, net)", "namespace (UTS, NET, PID, mount, user)"],
+    "todo": ["fine-grained lock (BKL)"]
   },
 
   "pkg": {
@@ -50,8 +51,8 @@
 
     "linux": {
       "rust": {
-        "awk": "0.1.0.20261010", "brush": "0.4.0", "coreutils": "0.12.0", "diffutils": "3.12",
-        "findutils": "0.10.0", "grep": "0.2.0", "sed": "4.10", "sudo-rs": "0.2.15", "tar": "0.1.0.20261010",
+        "awk": "0.1.0.20261010", "brush": "0.4.0", "coreutils": "0.12.0",
+        "findutils": "0.10.0", "grep": "0.2.0", "sudo-rs": "0.2.15", "tar": "0.1.0.20261010",
         "ripgrep": "15.2.0", "fd": "10.5.0", "uv": "0.13.0"
       },
       "c": {
@@ -72,7 +73,7 @@
 
         "procps-ng": "4.0.7", "gawk": "5.4.1", "libarchive": "3.8.9", "gzip": "1.15", "xz": "5.8.4",
         "bzip2": "1.0.8", "zstd": "1.5.7", "patch": "2.8", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
-        "toybox": "0.8.15", "iproute2": "7.2.0"
+        "toybox": "0.8.15", "iproute2": "7.2.0", "diffutils": "3.12", "sed": "4.10"
       },
       "npm": { "pnpm": "12.9.1", "@anthropic-ai/claude-code": "2.1.289 (ap -S claude)" },
       "uv":  { "python": "3.14.8" }

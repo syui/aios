@@ -541,21 +541,20 @@ pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
         let t = fs::read_to_string(p).unwrap_or_default();
         let ver = scalar(&t, "pkgver").unwrap_or_default();
         let ver = if ver.contains('$') { expand_var(dir, &t, "pkgver") } else { ver };
-        match have.iter().find(|h| h.2 == *name) {
-            Some(h) if h.3 == ver => {}
-            Some(_) => {
-                if aios_json(&path, name, &ver)? {
-                    text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                    changed.push(name.clone());
-                }
-            }
-            None => {
-                let group = if own.contains(name) { "aios" } else { "linux" };
-                if let Some(t) = json_insert(&text, group, &kind, name, &ver) {
-                    text = t;
-                    changed.push(name.clone());
-                }
-            }
+        // どれも text の上で書きかえて、おしまいに 1 度だけ書く
+        let next = match have.iter().find(|h| h.2 == *name) {
+            // 種類が変わった (pkg/rust/sed から pkg/c/sed へ、など): 前の種類から消して、いまの種類に入れる
+            // (その種類がこのグループになくて入れられなければ、版だけ直す)
+            Some(h) if h.1 != kind => json_remove(&text, &h.0, &h.1, name)
+                .and_then(|t| json_insert(&t, &h.0, &kind, name, &ver))
+                .or_else(|| if h.3 != ver { json_set(&text, name, &ver) } else { None }),
+            Some(h) if h.3 == ver => None,
+            Some(_) => json_set(&text, name, &ver),
+            None => json_insert(&text, if own.contains(name) { "aios" } else { "linux" }, &kind, name, &ver),
+        };
+        if let Some(t) = next {
+            text = t;
+            changed.push(name.clone());
         }
     }
     for (g, k, n, _) in &have {
@@ -568,9 +567,7 @@ pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
     }
     if !changed.is_empty() {
         serde_json::from_str::<Value>(&text).map_err(|e| format!(".aios.json: would break: {}", e))?;
-        let up = regex::Regex::new(r#""updated":(\s*)"[^"]*""#).map_err(|e| e.to_string())?;
-        text = up.replace(&text, format!("\"updated\":${{1}}\"{}\"", today())).into_owned();
-        fs::write(&path, text).map_err(|e| e.to_string())?;
+        fs::write(&path, touch(&text)?).map_err(|e| e.to_string())?;
     }
     Ok(changed)
 }
@@ -618,6 +615,14 @@ fn json_remove(text: &str, group: &str, kind: &str, name: &str) -> Option<String
     if comma_after {
         b += after.find(',').unwrap() + 1;
         b += text[b..close].len() - text[b..close].trim_start_matches(' ').len();
+        // 行の終わりのものなら、前の空白も消す (行の終わりに空白を残さない)。1 行にそれだけなら、その行ごと
+        if text[b..close].starts_with('\n') {
+            let before = text[open..a].trim_end_matches(' ');
+            a = open + before.len();
+            if before.ends_with('\n') {
+                b += 1;
+            }
+        }
     } else if let Some(c) = text[open..a].rfind(',') {
         a = open + c;
     }
@@ -804,15 +809,24 @@ fn sha256_url(url: &str) -> Result<String, String> {
 /// .aios.json の pkg の下の "NAME": "版" と "updated" を書きかえる (形はそのまま)。NAME がなければ false
 fn aios_json(path: &Path, name: &str, ver: &str) -> Result<bool, String> {
     let Ok(text) = fs::read_to_string(path) else { return Ok(false) };
-    let start = text.find("\"pkg\"").unwrap_or(0);
-    let re = regex::Regex::new(&format!(r#""{}":(\s*)"[^"]*""#, regex::escape(name))).map_err(|e| e.to_string())?;
-    let Some(m) = re.captures_at(&text, start) else { return Ok(false) };
-    let whole = m.get(0).unwrap();
-    let mut out = format!("{}\"{}\":{}\"{}\"{}", &text[..whole.start()], name, &m[1], ver, &text[whole.end()..]);
-    let up = regex::Regex::new(r#""updated":(\s*)"[^"]*""#).map_err(|e| e.to_string())?;
-    out = up.replace(&out, format!("\"updated\":${{1}}\"{}\"", today())).into_owned();
-    fs::write(path, out).map_err(|e| e.to_string())?;
+    let Some(out) = json_set(&text, name, ver) else { return Ok(false) };
+    fs::write(path, touch(&out)?).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// "pkg" の下の "NAME": "..." の版を ver に (形はそのまま)。NAME がなければ None
+fn json_set(text: &str, name: &str, ver: &str) -> Option<String> {
+    let start = text.find("\"pkg\"").unwrap_or(0);
+    let re = regex::Regex::new(&format!(r#""{}":(\s*)"[^"]*""#, regex::escape(name))).ok()?;
+    let m = re.captures_at(text, start)?;
+    let whole = m.get(0)?;
+    Some(format!("{}\"{}\":{}\"{}\"{}", &text[..whole.start()], name, &m[1], ver, &text[whole.end()..]))
+}
+
+/// "updated" をきょうの日付に
+fn touch(text: &str) -> Result<String, String> {
+    let up = regex::Regex::new(r#""updated":(\s*)"[^"]*""#).map_err(|e| e.to_string())?;
+    Ok(up.replace(text, format!("\"updated\":${{1}}\"{}\"", today())).into_owned())
 }
 
 /// きょうの日付 (UTC、YYYY-MM-DD)
@@ -905,5 +919,56 @@ mod tests {
         assert_ne!(v["updated"], "2000-01-01");
         assert!(aios_sync(&root).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_moves_kind() {
+        // diffutils と sed は pkg/rust から pkg/c へ (uutils から GNU に)。fd は版だけ。
+        // diffutils を動かした (text の上) あとで fd の版を直しても、動かしたものが消えない
+        const K: &str = r#"{
+  "updated": "2000-01-01",
+  "pkg": {
+    "aios": {
+      "rust": { "base": "0.0.1" }
+    },
+    "linux": {
+      "rust": {
+        "awk": "1", "diffutils": "0.5.0",
+        "fd": "2", "sed": "3"
+      },
+      "c": { "zlib": "1.3" }
+    }
+  }
+}
+"#;
+        let root = std::env::temp_dir().join(format!("aios-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (k, n, v) in [("rust", "base", "0.0.1"), ("rust", "awk", "1"), ("c", "diffutils", "3.12"), ("rust", "fd", "3"), ("c", "sed", "4.10"), ("c", "zlib", "1.3")] {
+            let d = root.join("pkg").join(k).join(n);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("PKGBUILD"), format!("pkgname={}\npkgver={}\npkgrel=1\n", n, v)).unwrap();
+        }
+        fs::write(root.join("pkg").join(FILE), "[\n  {\"name\":\"base\",\"skip\":\"aios\"}\n]\n").unwrap();
+        fs::write(root.join(".aios.json"), K).unwrap();
+        assert_eq!(aios_sync(&root).unwrap(), ["diffutils", "fd", "sed"]);
+        let t = fs::read_to_string(root.join(".aios.json")).unwrap();
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["pkg"]["linux"]["rust"], serde_json::json!({"awk": "1", "fd": "3"}));
+        assert_eq!(v["pkg"]["linux"]["c"], serde_json::json!({"zlib": "1.3", "diffutils": "3.12", "sed": "4.10"}));
+        assert_eq!(v["pkg"]["aios"]["rust"], serde_json::json!({"base": "0.0.1"}));
+        assert!(t.contains("        \"awk\": \"1\",\n        \"fd\": \"3\"\n"), "{}", t);
+        assert!(!t.contains(" \n"), "trailing space: {}", t);
+        assert!(aios_sync(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_whole_line() {
+        // 1 行にそれだけのものは、その行ごと消える (空いた行を残さない)
+        let t = "{\n  \"pkg\": {\n    \"linux\": {\n      \"c\": {\n        \"a\": \"1\",\n        \"b\": \"2\",\n        \"c2\": \"3\"\n      }\n    }\n  }\n}\n";
+        let r = json_remove(t, "linux", "c", "b").unwrap();
+        assert_eq!(r, "{\n  \"pkg\": {\n    \"linux\": {\n      \"c\": {\n        \"a\": \"1\",\n        \"c2\": \"3\"\n      }\n    }\n  }\n}\n");
+        let r = json_remove(&r, "linux", "c", "c2").unwrap();
+        assert_eq!(r, "{\n  \"pkg\": {\n    \"linux\": {\n      \"c\": {\n        \"a\": \"1\"\n      }\n    }\n  }\n}\n");
     }
 }
