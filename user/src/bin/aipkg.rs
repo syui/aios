@@ -761,19 +761,19 @@ fn resolve(targets: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<St
 
 fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
     let sync = sync_all(repos);
-    // 名前がなければ、それを provides で持つもの (ap -S desktop → aiwm)
-    let named = |v: &[String]| -> Vec<String> {
+    // 名前がなければ、それを provides で持つもの (ap -S desktop → aiwm)。知らせるのは targets のときだけ
+    let named = |v: &[String], say: bool| -> Vec<String> {
         v.iter()
             .map(|t| {
                 let p = provider(&sync, t);
-                if p != *t {
+                if say && p != *t {
                     println!(":: {} is provided by {}", t, p);
                 }
                 p
             })
             .collect()
     };
-    let (targets, explicit) = (named(targets), named(explicit));
+    let (targets, explicit) = (named(targets, true), named(explicit, false));
     let (targets, explicit) = (&targets[..], &explicit[..]);
     // まだデータベースを取ってきていないリポジトリがあれば、-Sy をすすめる
     if let Some(t) = targets.iter().find(|t| !sync.contains_key(*t)) {
