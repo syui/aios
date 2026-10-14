@@ -16,12 +16,24 @@ zig_sha256() {
   esac
 }
 
-# zig_fix_libc LIBDIR: Zig 0.17 の libc (lib/c/malloc.zig) の realloc は大きさ 0 なら NULL を返すが、
-#   realloc(NULL, 0) は malloc(0) と同じでなければならず (C の決まり)、musl は realloc(p, 0) にも NULL でないものを返す。
-#   gnulib は musl ならそうだと思って xnmalloc(0, ...) などを NULL で「memory exhausted」にする (GNU sed の s/a/b/ が動かない)。
-#   大きさ 0 の分かれ道を消して、musl と同じく 0 バイトの場所を返す (2 度あててもよい)
+# zig_fix_libc LIBDIR: Zig 0.17 の libc を musl と同じに直す (2 度あててもよい)。Zig は AI で書いた報告を
+# 受けとらないので上流には出していない。ZIG_VERSION を上げたら、まだ要るか見る
+#  - realloc (lib/c/malloc.zig): 大きさ 0 なら NULL を返すが、realloc(NULL, 0) は malloc(0) と同じでなければならず
+#    (C の決まり)、musl は realloc(p, 0) にも NULL でないものを返す。gnulib は musl ならそうだと思って xnmalloc(0, ...)
+#    などを NULL で「memory exhausted」にする (GNU sed の s/a/b/ が動かない)。
+#    大きさ 0 の分かれ道を消して、musl と同じく 0 バイトの場所を返す
+#  - libc.so の見本 (lib/libc/musl/libc.S。動的にリンクするとき、Zig はこれから名前だけの libc.so を作ってリンクする):
+#    データ (__environ、__stack_chk_guard、optind、stdin、stdout、stderr など) がみな同じ番地にある。PIC でない
+#    プログラムが __stack_chk_guard や stderr を使うと、lld はそれを COPY の再配置でプログラムの中に写し、同じ番地の
+#    名前を別名と見て、みな同じ場所に置く。すると musl の __environ が __stack_chk_guard を読んで setenv で落ち (VLC)、
+#    stdout も stderr を指す。データごとに場所をとり、musl のほんとうの別名 (src の weak_alias(__environ, environ)
+#    など。こちらは同じ番地でないと、プログラムと musl が別の場所を見る) だけを .set で同じ番地にする
 zig_fix_libc() {
-  local f=$1/c/malloc.zig
+  zig_fix_realloc "$1/c/malloc.zig" && zig_fix_stub "$1/libc/musl/libc.S" "$1/libc/musl/src"
+}
+
+zig_fix_realloc() {
+  local f=$1
   [ -f "$f" ] || return 0
   grep -q 'aios: realloc(p, 0)' "$f" && return 0
   awk '
@@ -31,6 +43,34 @@ zig_fix_libc() {
     { print }
   ' "$f" > "$f.new" && mv "$f.new" "$f"
   grep -q 'aios: realloc(p, 0)' "$f" || { echo "zig.sh: could not fix $f" >&2; return 1; }
+}
+
+# zig_fix_stub LIBC.S MUSL_SRC
+zig_fix_stub() {
+  local s=$1 src=$2
+  [ -f "$s" ] || return 0
+  grep -q 'aios: data objects' "$s" && return 0
+  # 別名の一覧 (別名 もと)。#define weak_alias(old, new) の行もまざるが、そういう名前のデータはない
+  grep -rhoE 'weak_alias\( *[A-Za-z0-9_]+ *, *[A-Za-z0-9_]+ *\)' "$src" |
+    sed -E 's/weak_alias\( *([A-Za-z0-9_]+) *, *([A-Za-z0-9_]+) *\)/\2 \1/' > "$s.alias"
+  # 1 回目に見本のデータの名前を集め、2 回目に書く。.type NAME, %object; / .size NAME, SIZE / NAME: のならび
+  awk '
+    pass == 0 { to[$1] = $2; next }
+    pass == 1 { if ($1 == ".type" && $3 == "%object;") { n = $2; sub(/,$/, "", n); obj[n] = 1 } next }
+    FNR == 1 { print "/* aios: data objects get their own storage; only the aliases in musl share an address */" }
+    $1 == ".type" && $3 == "%object;" { cur = $2; sub(/,$/, "", cur) }
+    $1 == ".size" { size = $3 }
+    cur != "" && $0 == cur ":" {
+      if ((cur in to) && (to[cur] in obj)) print ".set " cur ", " to[cur]
+      else { print ".balign 16"; print cur ": .skip " size }
+      cur = ""
+      next
+    }
+    { print }
+  ' "$s.alias" pass=1 "$s" pass=2 "$s" > "$s.new" && mv "$s.new" "$s"
+  rm -f "$s.alias"
+  grep -q 'aios: data objects' "$s" && grep -q '^\.set environ, __environ$' "$s" ||
+    { echo "zig.sh: could not fix $s" >&2; return 1; }
 }
 
 zig_env() {
