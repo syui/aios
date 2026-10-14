@@ -1,0 +1,18 @@
+--- a2/modules/video_output/wayland/shm.c	2026-10-14 09:09:03.410163114 +0000
++++ b2/modules/video_output/wayland/shm.c	2026-10-14 09:09:03.424239338 +0000
+@@ -74,12 +74,11 @@
+ {
+     picture_t *pic = data;
+ 
+-#ifndef NDEBUG
++    /* Mark the buffer as released in release builds too: PictureDetach()
++     * releases the picture again if the user data is still set, which freed
++     * every picture twice when the pool was reset or the display closed. */
+     assert(pic != NULL);
+     wl_buffer_set_user_data(buffer, NULL);
+-#else
+-    (void) buffer;
+-#endif
+     picture_Release(pic);
+ }
+ 

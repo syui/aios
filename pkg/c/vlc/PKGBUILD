@@ -3,6 +3,8 @@
 #   VLC 3.0 の Wayland の窓 (xdg-shell) は古い xdg_shell (unstable v5) しか話さず、aiwm は安定版の xdg_wm_base
 #   だけなので、xdg-wm-base.patch で安定版にする (modules/Makefile.in の xml も。Makefile.am は変えない:
 #   変えると automake を動かしなおそうとする)
+#   wl-shm-release.patch: Wayland の絵 (wl_shm) は、返ってきたバッファの印 (user data) を消すのがデバッグ版だけで、
+#   リリース版では片づけのときに絵をもう一度 release して 2 度 free していた (musl の malloc で落ちる)
 #   読む・解く: FFmpeg (avcodec、avformat、swscale)。字幕と OSD: freetype、fribidi、harfbuzz、fontconfig
 #   Lua (rc / http の画面、playlist のスクリプト) はまだ入れない
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
@@ -17,15 +19,18 @@ depends=('musl' 'zlib' 'ffmpeg' 'alsa-lib' 'wayland' 'freetype2' 'fribidi' 'harf
 # 入れたあとにプラグインの一覧 (plugins.dat) を作る
 install=vlc.install
 source=("https://download.videolan.org/pub/videolan/vlc/$pkgver/vlc-$pkgver.tar.xz"
-        'xdg-wm-base.patch')
+        'xdg-wm-base.patch'
+        'wl-shm-release.patch')
 sha256sums=('e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf'
-            '5ab37c646b06933e9cd385b9ff2e492408d3f036943b5e05b073bff96680bc95')
+            '5ab37c646b06933e9cd385b9ff2e492408d3f036943b5e05b073bff96680bc95'
+            'e337d904d36e00f82912727330862669aec19548576c493671adf36365a89d1e')
 
 prepare() {
   rm -rf "vlc-$pkgver"
   tar -xf "vlc-$pkgver.tar.xz"
   cd "vlc-$pkgver"
   patch -p1 < "$srcdir/xdg-wm-base.patch"
+  patch -p1 < "$srcdir/wl-shm-release.patch"
   sed -i 's|unstable/xdg-shell/xdg-shell-unstable-v5\.xml|stable/xdg-shell/xdg-shell.xml|' modules/Makefile.in
 }
 
@@ -78,6 +83,8 @@ package() {
   # make install は zig ranlib を使う (libcompat.a)
   . "$startdir/../zig.sh"
   zig_env
+  # make install も revision を作りなおす (いつも動く stamp-revision)。build() と同じく aios の git を見させない
+  export GIT_CEILING_DIRECTORIES="$srcdir"
   cd "vlc-$pkgver"
   make DESTDIR="$pkgdir" install
   find "$pkgdir" -name '*.la' -delete
