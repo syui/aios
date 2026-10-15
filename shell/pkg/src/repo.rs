@@ -272,6 +272,9 @@ pub fn push(root: &Path, force: bool) -> Result<Value, String> {
         return Err(format!("ai/repo is newer: {} (bring them into repo/aarch64, or force)", conflicts.join("; ")));
     }
     sh(Command::new("bin/gitea.sh").arg("repo").current_dir(root))?;
+    // 写し (build/airepo) も送ったものに。送る前に取ってきたままだと、pkg_rebuild が送ったばかりの版をまだ ai/repo に
+    // ないと見て、pkgrel を上げずに同じ版を作ってしまう (pkg_push も ap -Syu も変わったと見ない)。取れなくても送れてはいる
+    let _ = sync_cache(root);
     let head = String::from_utf8_lossy(&Command::new("git").args(["ls-remote", AIREPO, "refs/heads/main"]).output().map_err(|e| e.to_string())?.stdout).split_whitespace().next().unwrap_or("").to_string();
     r["head"] = json!(head);
     r["text"] = json!(format!("{}\nai/repo: {}\n", changes.iter().chain(conflicts.iter()).cloned().collect::<Vec<_>>().join("\n"), &head[..head.len().min(7)]));

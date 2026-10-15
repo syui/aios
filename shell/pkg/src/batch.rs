@@ -148,6 +148,13 @@ fn child(root: &Path, args: &[&str], log: &Path) -> Value {
     r
 }
 
+/// ログの終わりの、答えの JSON でない行 (make や mkpkg.sh がさいごに言ったこと。しくじったわけ)
+fn last_words(log: &Path) -> String {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let l = text.lines().rev().map(str::trim).find(|l| !l.is_empty() && aish_plugin::parse(l).is_none()).unwrap_or("");
+    l.chars().take(200).collect()
+}
+
 /// 秒か分で
 fn took(t: Instant) -> String {
     let s = t.elapsed().as_secs();
@@ -221,7 +228,11 @@ pub fn rebuild(root: &Path, o: &Opts) -> Value {
         let blog = logs.join(format!("build-{}.log", s.name));
         let b = child(root, &["build", &s.name], &blog);
         if let Some(e) = b["error"].as_str() {
-            fail("build", e.to_string(), Some(blog));
+            // 答えの error は動かしたコマンドと終わりの番号なので、ログの終わりの行 (ほんとうのわけ) を前に
+            // cd "..." && "bin/mkpkg.sh" "pkg/c/NAME": exit status: 1 → exit status: 1
+            let st = e.rsplit_once("\": ").map_or(e, |(_, s)| s);
+            let why = last_words(&blog);
+            fail("build", if why.is_empty() { e.to_string() } else { format!("{} ({})", why, st) }, Some(blog));
             if o.fail_fast {
                 break;
             }
@@ -264,10 +275,12 @@ pub fn rebuild(root: &Path, o: &Opts) -> Value {
     if !skip.is_empty() {
         text.push_str(&format!("skipped {}: {}\n", skip.len(), skip.iter().map(|(n, w)| format!("{} ({})", n, w)).collect::<Vec<_>>().join(", ")));
     }
-    let next = match (&pushed, rebuilt.is_empty()) {
-        (_, true) => String::new(),
-        (Value::Null, _) => "next: pkg_push, then commit the PKGBUILDs and push unix\n".to_string(),
-        (p, _) if p.get("error").is_some() => "next: see why pkg_push stopped, then commit the PKGBUILDs and push unix\n".to_string(),
+    let next = match (&pushed, rebuilt.is_empty(), failed.is_empty()) {
+        (_, true, true) => String::new(),
+        // しくじったものがあれば pkg_push は確かめていないもので止まるので、先にそちらを
+        (_, _, false) => format!("next: fix what failed (see its log) and run pkg_rebuild again{}\n", if o.push { "; nothing was pushed" } else { "" }),
+        (Value::Null, _, _) => "next: pkg_push, then commit the PKGBUILDs and push unix\n".to_string(),
+        (p, _, _) if p.get("error").is_some() => "next: see why pkg_push stopped, then commit the PKGBUILDs and push unix\n".to_string(),
         _ => "next: commit the PKGBUILDs and push unix\n".to_string(),
     };
     text.push_str(&next);
