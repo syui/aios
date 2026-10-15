@@ -35,7 +35,7 @@ pub fn pkgbuilds(pkg: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// PKGBUILD の 1 つの変数 (NAME=値)。引用符はとる。展開はしない ($pkgver はタグの形として残したい)
-fn scalar(text: &str, key: &str) -> Option<String> {
+pub fn scalar(text: &str, key: &str) -> Option<String> {
     let l = text.lines().find_map(|l| l.strip_prefix(&format!("{}=", key)))?;
     Some(l.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
 }

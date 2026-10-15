@@ -7,13 +7,16 @@
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
 //   pkg_test   作ったものを確かめる (ELF が aarch64 か、COPY のデータの重なり、NEEDED、版、bin/ を qemu か aarch64 で --version)
 //   pkg_scan   repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies と needs で
+//   pkg_rebuild いくつものパッケージを順に edit rebuild → build → test (と push)。えらび方と順は batch.rs
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // edit と build と push は長いので、うしろで動かす (自分を aish-pkg edit / build / push で起こす)。もういちど呼ぶと様子か結果
 // コマンドとしても動く (大きな tarball の edit は時間がかかるので、run の bg で):
 //   aish-pkg check [NAME...] [--all] [--refresh]   aish-pkg edit NAME [VER] [--rebuild]   aish-pkg build NAME   aish-pkg test NAME   aish-pkg push [--force]
 //   aish-pkg scan [NAME...]   repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies で (古い Zig で作ったものを探す)
+//   aish-pkg rebuild [NAME...] [--unrecorded] [--force] [--fail-fast] [--push] [--dry]
 // リポジトリは dir か、いまのディレクトリから上にたどって pkg/ があるところ、なければ $AIOS_SRC か /usr/src/aios
+mod batch;
 mod elf;
 mod embed;
 mod repo;
@@ -29,11 +32,12 @@ const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","i
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const PUSH: &str = r#"{"type":"object","properties":{"force":{"type":"boolean","description":"ai/repo のほうが新しいもの (ほかで送ったもの) を消す・下げることになっても送る"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
 const SCAN: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ repo/aarch64 のみな)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
+const REBUILD: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"作りなおすパッケージ (なければ pkg_check の rebuild のもの)"},"unrecorded":{"type":"boolean","description":"Zig を書きとめる前に作ったもの (pkg_check の unrecorded) も"},"force":{"type":"boolean","description":"もう作りなおしたもの (いまの PKGBUILD の版で、古いライブラリもちがう Zig もない) も作る"},"fail_fast":{"type":"boolean","description":"しくじったら止める (既定: 飛ばして続け、さいごにまとめて出す)"},"push":{"type":"boolean","description":"みな通ったら pkg_push で ai/repo に送る"},"dry":{"type":"boolean","description":"作らずに、何をどの順に作るかだけ (すぐ答える)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (いま作っているものの make や zig まで)"},"dir":{"type":"string"}}}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"ver":{"type":"string","description":"版 (なければ配布元の最新)"},"rebuild":{"type":"boolean","description":"版はそのまま pkgrel を 1 つ上げるだけ (pkg_check の rebuild: 中に入れたライブラリが新しくなったとき。同じ版では pkg_push も ap -Syu も変わったと見ない)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push" | "scan")) {
+    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push" | "scan" | "rebuild")) {
         std::process::exit(cli(&args));
     }
     let spec = Spec {
@@ -46,6 +50,7 @@ fn main() {
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
             Tool { name: "pkg_scan", desc: "repo/aarch64 のパッケージみな (names があればそれだけ) を、動かさずに pkg_test の copies と needs で確かめる: COPY で写したライブラリのデータが 1 つの場所に重なったプログラム (古い Zig の libc.so でリンクしたもの。affected を rebuild に) と、depends にない NEEDED (unresolved。それのあるパッケージも)。Zig を上げたときなどに。うしろで動く (みなで 1 分ほど)", input: SCAN },
+            Tool { name: "pkg_rebuild", desc: "いくつものパッケージを順に作りなおす: pkgrel を上げ (pkg_edit rebuild)、pkg_build、pkg_test。names がなければ pkg_check の rebuild のもの (unrecorded なら Zig を書きとめる前に作ったものも)。c_deps で使うものを先に。pkgrel はいまの版がもう ai/repo にあるときだけ上げ、もう作りなおしたもの (pkg_test を通っているか送ってあり、古いライブラリもちがう Zig もない) は飛ばす (もういちど動かしても 2 つ上がらない。pkg_test でしくじったものは同じ版で作りなおす)。CI が作るもの (pkg/ci.json) は飛ばす。しくじったものは飛ばして続け (fail_fast で止める)、push ならみな通ったら pkg_push。dry で順だけ。うしろで動く (進みぐあいは log、くわしくは build-NAME.log / test-NAME.log)。あとで PKGBUILD をコミットして unix に", input: REBUILD },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。うしろで動くので、終わっていなければ running (大きな tarball や遅い配布元でも。もういちど呼ぶと続きを待つ)", input: EDIT },
         ],
@@ -101,6 +106,21 @@ fn main() {
                     let names: Vec<&str> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str()).filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('-')).collect()).unwrap_or_default();
                     let argv: Vec<&str> = std::iter::once("scan").chain(names).collect();
                     job(&mut jobs, &root, "scan", &argv, a)
+                }
+                "pkg_rebuild" => {
+                    let names: Vec<&str> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str()).filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('-')).collect()).unwrap_or_default();
+                    let flag = |k: &str| a[k] == true;
+                    if flag("dry") {
+                        let o = batch::Opts { names: names.iter().map(|s| s.to_string()).collect(), unrecorded: flag("unrecorded"), force: flag("force"), ..Default::default() };
+                        return batch::dry(&root, &o);
+                    }
+                    let mut argv: Vec<&str> = std::iter::once("rebuild").chain(names).collect();
+                    for (k, f) in [("unrecorded", "--unrecorded"), ("force", "--force"), ("fail_fast", "--fail-fast"), ("push", "--push")] {
+                        if flag(k) {
+                            argv.push(f);
+                        }
+                    }
+                    job(&mut jobs, &root, "rebuild", &argv, a)
                 }
                 "pkg_push" => {
                     let argv: &[&str] = if a["force"] == true { &["push", "--force"] } else { &["push"] };
@@ -202,7 +222,7 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
     if !jobs.contains_key(key) {
         let _ = std::fs::create_dir_all(&dir);
         let log = dir.join(format!("{}.log", key));
-        let (Ok(out), Ok(exe)) = (std::fs::File::create(&log), std::env::current_exe()) else { return error(format!("{}: cannot start", log.display())) };
+        let (Ok(out), Ok(exe)) = (std::fs::File::create(&log), exe()) else { return error(format!("{}: cannot start", log.display())) };
         let err = match out.try_clone() {
             Ok(e) => e,
             Err(e) => return error(e),
@@ -258,6 +278,16 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
         r["tail"] = json!(tail);
     }
     r
+}
+
+/// このプログラム (子の aish-pkg build などを起こす)。ビルドしなおして置きかわると /proc/self/exe は "... (deleted)" になるので、
+/// そのときは同じところの新しいものを (pkg_rebuild のように長く動くあいだに aish をビルドしなおしても)
+fn exe() -> std::io::Result<PathBuf> {
+    let p = std::env::current_exe()?;
+    Ok(match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    })
 }
 
 /// aios のリポジトリ
@@ -357,6 +387,20 @@ fn cli(args: &[String]) -> i32 {
             None => error("aish-pkg test NAME"),
         },
         "push" => repo::push(&root, args.iter().any(|a| a == "--force")).unwrap_or_else(error),
+        "rebuild" => {
+            let has = |f: &str| args.iter().any(|a| a == f);
+            let o = batch::Opts { names: rest.clone(), unrecorded: has("--unrecorded"), force: has("--force"), fail_fast: has("--fail-fast"), push: has("--push") };
+            if has("--dry") {
+                let r = batch::dry(&root, &o);
+                print!("{}", r["text"].as_str().unwrap_or(""));
+                return if r.get("error").is_some() { 1 } else { 0 };
+            }
+            // 進みぐあいは動きながら出しているので、さいごに答えの JSON を (しくじったものは failed に。終わりの番号は 0)
+            let r = batch::rebuild(&root, &o);
+            eprint!("{}", r["text"].as_str().unwrap_or(""));
+            println!("{}", r);
+            return if r.get("error").is_some() { 1 } else { 0 };
+        }
         "scan" => {
             // 人には文を (標準エラーに)、pkg_scan には最後の行の JSON を。見つけたものは JSON の affected と unresolved に
             // (終わりの番号を 0 でなくすると、pkg_scan がしくじったと読む)

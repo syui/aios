@@ -42,6 +42,12 @@ pub fn parse(file: &str) -> Option<(String, String)> {
     Some((p[0].to_string(), format!("{}-{}", p[1], p[2])))
 }
 
+/// ai/repo に送ってあるもの: 名前 → VER-REL。写し (build/airepo。pkg_push のたびに新しくなる) を読むだけで、
+/// 取ってはこない。写しがなければ空
+pub fn published(root: &Path) -> BTreeMap<String, String> {
+    packages(&root.join("build/airepo/aarch64")).into_iter().map(|((_, n), (v, _))| (n, v)).collect()
+}
+
 /// DIR の下の種類ごとのパッケージ: (種類, 名前) → (版, ファイル名)
 fn packages(dir: &Path) -> BTreeMap<(String, String), (String, String)> {
     let mut m = BTreeMap::new();
