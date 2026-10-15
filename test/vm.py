@@ -221,13 +221,15 @@ class Serve:
         mark = '@@VMJOB@@'
         end = time.time() + wait
         while True:
-            # 終わりの番号 (なければ空)、pid がいるか、ログの大きさ、まだ見せていないところ
-            r = self.run(('cat {f}.rc 2>/dev/null; echo {m}; p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && [ -d /proc/$p ] && echo alive; echo {m}; '
+            # pid がいるか、終わりの番号 (なければ空)、ログの大きさ、まだ見せていないところ。pid を先に見る: 番号を先に読むと、
+            # そのあいだに終わったものが「番号のないまま終わった」に見えた (ap -Sy ncurses が exit ? になった。.rc は 0)。
+            # 子は .rc を書いてから終わるので、いないと見たあとに読めば番号はある
+            r = self.run(('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && [ -d /proc/$p ] && echo alive; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
                           'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit), 30)
             parts = r.get('out', '').split(mark)
             if len(parts) < 4:
                 return {'error': 'could not read the job', 'out': r.get('out', '')}
-            rc, alive, size, new = parts[0].strip(), 'alive' in parts[1], parts[2].strip(), parts[3]
+            alive, rc, size, new = 'alive' in parts[0], parts[1].strip(), parts[2].strip(), parts[3]
             done = rc != '' or not alive
             if done or time.time() >= end:
                 break
