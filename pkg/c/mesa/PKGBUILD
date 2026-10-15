@@ -5,8 +5,8 @@
 #   ビルドには meson、ninja、flex、bison、glslangValidator、python の mako と pyyaml、qemu-aarch64
 #   (aios 用の llvm-config を動かす)、このマシンの cc と expat (wayland-scanner をこのマシン用に作る) が要る
 pkgname=mesa
-pkgver=26.2.4
-pkgrel=2
+pkgver=26.2.5
+pkgrel=1
 pkgdesc='Open-source OpenGL, GLES, EGL and Vulkan on the CPU: llvmpipe and lavapipe (for aios)'
 arch=('aarch64')
 url='https://www.mesa3d.org/'
@@ -20,7 +20,7 @@ makedepends=('meson' 'ninja' 'flex' 'bison' 'glslang' 'python-mako' 'python-yaml
 _wlver=1.26.0  # pkg/c/wayland と同じ版 (mesa は wayland-scanner がそれと同じ版であることを求める)
 source=("https://archive.mesa3d.org/mesa-$pkgver.tar.xz"
         "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$_wlver/downloads/wayland-$_wlver.tar.xz")
-sha256sums=('bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9'
+sha256sums=('794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5'
             '64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3')
 
 prepare() {
