@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。補完の関数 (compinit) も入れる
 pkgname=zsh
 pkgver=5.9.2
-pkgrel=1
+pkgrel=2
 pkgdesc='A very advanced and programmable command interpreter (shell) (static, for aios)'
 arch=('aarch64')
 url='https://www.zsh.org/'

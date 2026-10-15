@@ -157,11 +157,12 @@ fn tags(git: &str) -> Result<Vec<String>, String> {
     Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_once("refs/tags/").map(|(_, t)| t.to_string())).collect())
 }
 
-/// 1 つのパッケージをどこで見るか ({name, pkgver, ...})。見ないものは skip に理由
+/// 1 つのパッケージをどこで見るか ({name, ...})。見ないものは skip に理由。いまの版は入れない
+/// (pkg_edit で上げると古くなる。くらべるときは PKGBUILD を読む)
 fn rule(name: &str, path: &Path) -> Value {
     let text = fs::read_to_string(path).unwrap_or_default();
     let pkgver = scalar(&text, "pkgver").unwrap_or_default();
-    let mut r = json!({ "name": name, "pkgver": pkgver });
+    let mut r = json!({ "name": name });
     // 自作のもの: 版がちょうど 0.0.1 (pkgver() でビルドのときに決めるものも)、ソースがない、git.syui.ai のもの。
     // egl-headers (0.0.1.r${_commit}) のように、よそのものをコミットで決めているものは見る
     let src = first_source(&text).unwrap_or_default();
@@ -259,14 +260,24 @@ pub fn upstream(pkg: &Path, only: &[String]) -> Result<Vec<Value>, String> {
     let new = par(todo, |(n, p)| rule(&n, &p));
     old.retain(|o| !new.iter().any(|n| n["name"] == o["name"]) && pkgbuilds(pkg).iter().any(|(n, _)| o["name"] == n.as_str()));
     old.extend(new.iter().cloned());
-    old.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    write_rules(&file, old)?;
+    Ok(new)
+}
+
+/// upstream.json を書く (名前の順に 1 行ずつ)。前に入れていた pkgver (いまの版。上げると古くなる) は落とす
+fn write_rules(file: &Path, mut rules: Vec<Value>) -> Result<(), String> {
+    for r in rules.iter_mut() {
+        if let Some(m) = r.as_object_mut() {
+            m.remove("pkgver");
+        }
+    }
+    rules.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     let mut text = String::from("[\n");
-    for (i, r) in old.iter().enumerate() {
-        text.push_str(&format!("  {}{}\n", r, if i + 1 < old.len() { "," } else { "" }));
+    for (i, r) in rules.iter().enumerate() {
+        text.push_str(&format!("  {}{}\n", r, if i + 1 < rules.len() { "," } else { "" }));
     }
     text.push_str("]\n");
-    fs::write(&file, text).map_err(|e| format!("{}: {}", file.display(), e))?;
-    Ok(new)
+    fs::write(file, text).map_err(|e| format!("{}: {}", file.display(), e))
 }
 
 /// upstream.json を読む。まだないもの (と refresh なら only か全部) は作ってから
@@ -278,6 +289,9 @@ fn rules(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, Strin
         upstream(pkg, only)?;
     } else if !missing.is_empty() {
         upstream(pkg, &missing)?;
+    } else if have.iter().any(|r| r.get("pkgver").is_some()) {
+        // 前の形 (pkgver つき) なら、それを落として書きなおす (ネットは見ない)
+        write_rules(&pkg.join(FILE), have)?;
     }
     Ok(read())
 }
@@ -438,7 +452,6 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
                 (n, v)
             })
             .collect();
-    let skips: Vec<(String, String)> = rules.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["skip"].as_str()?.to_string()))).collect();
     let todo: Vec<Value> = rules.into_iter().filter(|r| r.get("skip").is_none() && (only.is_empty() || only.iter().any(|o| r["name"] == o.as_str()))).collect();
     let rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
@@ -454,11 +467,7 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
         }
     });
     // しくじったもの (配布元が切れたなど) は、一覧の前の値を残す
-    let mut seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
-    for (n, why) in skips {
-        let short = if why == "aios" { "aios" } else if why.contains("pkgver") { "follows another version" } else if why.contains("by hand") { "manual" } else { "no upstream" };
-        seen.insert(n, format!("({})", short));
-    }
+    let seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
     overview(pkg, &seen);
     Ok(rs)
 }
@@ -466,19 +475,21 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
 /// 一覧に作るファイル: 1 つのパッケージに 1 行で name type src now latest
 pub const OVERVIEW: &str = "pkg.json";
 
-/// pkg/pkg.json を作りなおす。latest は seen (いま見たもの) か、前のファイルのもの
+/// pkg/pkg.json を作りなおす。latest は seen (いま見たもの) か、前のファイルのもの (known_latest)
 pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
     let file = pkg.join(OVERVIEW);
     let old: Vec<Value> = fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let rules: Vec<Value> = fs::read_to_string(pkg.join(FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let items = pkgbuilds(pkg);
     let rows: Vec<Vec<(&str, String)>> = par(items, |(name, path)| {
         let text = fs::read_to_string(&path).unwrap_or_default();
         let dir = path.parent().unwrap_or(Path::new("."));
         let ty = dir.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
         let src = if first_source(&text).is_some() { expand_source(dir, &text).unwrap_or_default() } else { String::new() };
-        let latest = seen.get(&name).cloned().or_else(|| old.iter().find(|o| o["name"] == name.as_str()).and_then(|o| o["latest"].as_str().map(String::from))).unwrap_or_default();
+        let prev = seen.get(&name).cloned().or_else(|| old.iter().find(|o| o["name"] == name.as_str()).and_then(|o| o["latest"].as_str().map(String::from))).unwrap_or_default();
         let now = scalar(&text, "pkgver").unwrap_or_default();
         let now = if now.contains('$') { expand_var(dir, &text, "pkgver") } else { now };
+        let latest = known_latest(rules.iter().find(|r| r["name"] == name.as_str()), prev, &now);
         vec![("name", name), ("type", ty), ("src", src), ("now", now), ("latest", latest)]
     });
     // 列をそろえる: "key": "value", のかたまりを、列ごとにいちばん長いものの幅に
@@ -507,6 +518,22 @@ pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
     if let Some(root) = pkg.parent() {
         let _ = aios_sync(root);
     }
+}
+
+/// 一覧の latest: 見ないもの (upstream.json の skip) は (aios) などの印。コミットで決めているものは見たときのまま。
+/// ほかは見たときの最新か、PKGBUILD の版のほうが新しければその版 (配布元のいちばん新しいものは、少なくとも
+/// パッケージにした版。手や pkg_edit で上げたあとも、足したばかりでまだ見ていないものも、latest < now や空にならない)
+fn known_latest(rule: Option<&Value>, prev: String, now: &str) -> String {
+    if let Some(why) = rule.and_then(|r| r["skip"].as_str()) {
+        let short = if why == "aios" { "aios" } else if why.contains("pkgver") { "follows another version" } else if why.contains("by hand") { "manual" } else { "no upstream" };
+        return format!("({})", short);
+    }
+    if rule.is_some_and(|r| r["from"] == "commit") || now.is_empty() {
+        return prev;
+    }
+    // 前の印 ((aios) など) は、いまは見るものなら捨てる
+    let prev = if prev.starts_with('(') { String::new() } else { prev };
+    if prev.is_empty() || vercmp(now, &prev).is_gt() { now.to_string() } else { prev }
 }
 
 /// .aios.json の pkg を pkg/*/NAME/PKGBUILD にそろえる (形はそのまま、文字を書きかえる):
@@ -663,6 +690,8 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     if rule["from"] == "commit" {
         return edit_commit(root, name, &path, &old_text, &rule, ver);
     }
+    // 配布元を見てきたときは、それを一覧の latest にも
+    let looked = ver.is_none();
     let ver = match ver {
         Some(v) => v.to_string(),
         None => {
@@ -680,9 +709,6 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
         r["same"] = json!(true);
         return Ok(r);
     }
-    let set = |text: &str, key: &str, val: &str| -> String {
-        text.lines().map(|l| if l.starts_with(&format!("{}=", key)) { format!("{}={}", key, val) } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n"
-    };
     let mut text = set(&set(&old_text, "pkgver", &ver), "pkgrel", "1");
     // sha256sums の 1 つめが SKIP でなければ、新しい source を取ってきて計りなおす
     if let Some(sum) = first_sum(&text).filter(|s| s != "SKIP") {
@@ -702,7 +728,8 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
         files.push(json!(".aios.json"));
     }
     files.push(json!("pkg/pkg.json"));
-    overview(&pkg, &std::collections::HashMap::new());
+    let seen: std::collections::HashMap<String, String> = if looked { [(name.to_string(), ver.clone())].into() } else { Default::default() };
+    overview(&pkg, &seen);
     r["files"] = json!(files);
     Ok(r)
 }
@@ -737,9 +764,6 @@ fn edit_commit(root: &Path, name: &str, path: &Path, old_text: &str, rule: &Valu
     if date.len() != 8 {
         return Err(format!("{}: could not fetch commit {} from {}", name, new, git));
     }
-    let set = |text: &str, key: &str, val: &str| -> String {
-        text.lines().map(|l| if l.starts_with(&format!("{}=", key)) { format!("{}={}", key, val) } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n"
-    };
     let mut text = set(&set(old_text, "_commit", &new), "pkgrel", "1");
     let raw = scalar(old_text, "pkgver").unwrap_or_default();
     if let Some(m) = regex::Regex::new(r"^(.*\.)([0-9]{8})$").ok().and_then(|re| re.captures(&raw).map(|c| c[1].to_string())) {
@@ -752,11 +776,30 @@ fn edit_commit(root: &Path, name: &str, path: &Path, old_text: &str, rule: &Valu
         files.push(json!(".aios.json"));
     }
     files.push(json!("pkg/pkg.json"));
-    overview(&root.join("pkg"), &std::collections::HashMap::new());
+    // HEAD にしたときは、それが一覧の latest
+    let seen: std::collections::HashMap<String, String> = if ver.is_none() { [(name.to_string(), format!("commit {}", &new[..7]))].into() } else { Default::default() };
+    overview(&root.join("pkg"), &seen);
     r["to"] = json!(to);
     r["date"] = json!(date);
     r["files"] = json!(files);
     Ok(r)
+}
+
+/// PKGBUILD の KEY= の行を KEY=val に
+fn set(text: &str, key: &str, val: &str) -> String {
+    text.lines().map(|l| if l.starts_with(&format!("{}=", key)) { format!("{}={}", key, val) } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n"
+}
+
+/// rebuild: pkgrel を 1 つ上げる (版はそのまま)。中に入れたライブラリが新しくなって作りなおすとき (pkg_check の rebuild)。
+/// 同じ版のまま作りなおしても、pkg_push も入っている aios の ap -Syu も、変わったとは見ない
+pub fn bump_rel(root: &Path, name: &str) -> Result<Value, String> {
+    let (_, path) = pkgbuilds(&root.join("pkg")).into_iter().find(|(n, _)| n == name).ok_or_else(|| format!("{}: no PKGBUILD", name))?;
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let rel = scalar(&text, "pkgrel").unwrap_or_default();
+    let next = rel.parse::<u32>().map_err(|_| format!("{}: pkgrel {:?} is not a number", name, rel))? + 1;
+    fs::write(&path, set(&text, "pkgrel", &next.to_string())).map_err(|e| e.to_string())?;
+    let ver = expand_var(path.parent().unwrap_or(Path::new(".")), &text, "pkgver");
+    Ok(json!({ "name": name, "from": format!("{}-{}", ver, rel), "to": format!("{}-{}", ver, next), "files": [path.strip_prefix(root).unwrap_or(&path).display().to_string()] }))
 }
 
 /// sha256sums=( の 1 つめ
@@ -960,6 +1003,22 @@ mod tests {
         assert!(!t.contains(" \n"), "trailing space: {}", t);
         assert!(aios_sync(&root).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_in_the_list() {
+        let up = json!({ "name": "pkgconf", "from": "arch:pkgconf" });
+        // pkg_edit で上げたあと: 前に見た latest より PKGBUILD のほうが新しい
+        assert_eq!(known_latest(Some(&up), "3.0.7".into(), "3.0.8"), "3.0.8");
+        assert_eq!(known_latest(Some(&up), "3.7c".into(), "3.8"), "3.8");
+        // 配布元のほうが新しいときはそのまま。足したばかりでまだ見ていないものは PKGBUILD の版
+        assert_eq!(known_latest(Some(&up), "3.0.9".into(), "3.0.8"), "3.0.9");
+        assert_eq!(known_latest(Some(&up), String::new(), "3.0.24"), "3.0.24");
+        assert_eq!(known_latest(Some(&up), "(aios)".into(), "1.2"), "1.2");
+        // 見ないものは印、コミットで決めているものは見たときのまま
+        assert_eq!(known_latest(Some(&json!({ "name": "aiwm", "skip": "aios" })), "0.0.1".into(), "0.0.1"), "(aios)");
+        assert_eq!(known_latest(Some(&json!({ "name": "x", "skip": "the source tag $_llvm does not use pkgver" })), String::new(), "1"), "(follows another version)");
+        assert_eq!(known_latest(Some(&json!({ "name": "awk", "from": "commit" })), "commit 5e3a13c".into(), "0.1.0.20261010"), "commit 5e3a13c");
     }
 
     #[test]

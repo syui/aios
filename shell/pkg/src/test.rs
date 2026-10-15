@@ -20,7 +20,7 @@ pub fn stamp(root: &Path, file: &str) -> PathBuf {
 }
 
 /// repo/aarch64 の中の NAME のパッケージ (いちばん新しいもの)
-fn find(root: &Path, name: &str) -> Option<PathBuf> {
+pub fn find(root: &Path, name: &str) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for k in KINDS {
         for e in fs::read_dir(root.join("repo/aarch64").join(k)).into_iter().flatten().flatten() {

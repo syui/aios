@@ -9,3 +9,4 @@ aish-plugin.workspace = true
 serde_json.workspace = true
 regex = "1"
 sha2 = { version = "0.10", default-features = false }
+libc = "0.2"

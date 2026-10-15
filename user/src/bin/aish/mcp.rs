@@ -349,7 +349,7 @@ impl Shell {
             (bin.is_some_and(|b| t > b)).then(|| p.strip_prefix(src.as_deref().unwrap_or("")).unwrap_or(&p).trim_start_matches('/').to_string())
         };
         if let Some(src) = &src
-            && let Some(p) = stale(&[format!("{}/user/src", src)], disk.map(|f| f.secs()))
+            && let Some(p) = stale(&aish_sources(src), disk.map(|f| f.secs()))
         {
             problems.push(format!("aish: {} changed after the build; build it (bin/aish-mcp.sh --build) and aish restarts itself", p));
         }
@@ -953,8 +953,27 @@ fn dur(s: u64) -> String {
     }
 }
 
-/// ディレクトリの下でいちばん新しく変えたファイル (1970 からの秒, パス)
+/// aish のソース: user/src/bin/aish/ と、そこから #[path = "..."] で入れるもの。user/src のほかのプログラム
+/// (aipkg.rs など) は aish に入らないので見ない (前は user/src を全部見て、aipkg を直すと aish が古いと言っていた)
+fn aish_sources(src: &str) -> Vec<String> {
+    let dir = format!("{}/user/src/bin/aish", src);
+    let mut v = vec![dir.clone()];
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        for l in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+            if let Some(p) = l.trim().strip_prefix("#[path = \"").and_then(|r| r.split('"').next()) {
+                v.push(format!("{}/{}", dir, p));
+            }
+        }
+    }
+    v
+}
+
+/// ディレクトリの下でいちばん新しく変えたファイル (1970 からの秒, パス)。ファイルならそれの
 fn newest(dir: &std::path::Path) -> Option<(u64, String)> {
+    let m = std::fs::metadata(dir).ok()?;
+    if !m.is_dir() {
+        return m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs(), dir.display().to_string()));
+    }
     let mut best: Option<(u64, String)> = None;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let Ok(m) = e.metadata() else { continue };

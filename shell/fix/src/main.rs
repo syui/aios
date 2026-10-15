@@ -129,8 +129,9 @@ fn resolve(pwd: &str, p: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { Path::new(pwd).join(p) }
 }
 
-/// cargo の build check test clippy run なら --message-format=json を足す (もう書いてあればそのまま)
-fn with_json(cmd: &str) -> (String, bool) {
+/// cargo の build check test clippy run なら --message-format=json を足す (もう書いてあればそのまま)。
+/// test run bench は作ったものをこのマシンで動かすので、動かせない target (host_target) なら --target も
+fn with_json(cmd: &str, dir: &Path) -> (String, bool) {
     let words: Vec<&str> = cmd.split_whitespace().collect();
     let Some(i) = words.iter().position(|w| *w == "cargo" || w.ends_with("/cargo")) else { return (cmd.to_string(), false) };
     if cmd.contains("--message-format") || cmd.contains(['|', ';', '&', '>']) {
@@ -145,7 +146,51 @@ fn with_json(cmd: &str) -> (String, bool) {
     }
     let mut w: Vec<String> = words.iter().map(|w| w.to_string()).collect();
     w.insert(j + 1, "--message-format=json".into());
+    if matches!(words[j], "test" | "t" | "run" | "r" | "bench")
+        && !cmd.contains("--target")
+        && let Some(h) = host_target(dir)
+    {
+        w.insert(j + 2, "--target".into());
+        w.insert(j + 3, h);
+    }
     (w.join(" "), true)
+}
+
+/// .cargo/config.toml (近いものから) の [section] の key の値 (文字だけ)
+fn cargo_config(dir: &Path, section: &str, key: &str) -> Option<String> {
+    for d in dir.ancestors() {
+        for name in ["config.toml", "config"] {
+            let Ok(text) = std::fs::read_to_string(d.join(".cargo").join(name)) else { continue };
+            let mut cur = String::new();
+            for l in text.lines().map(str::trim) {
+                if l.starts_with('[') {
+                    cur = l.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+                } else if cur == section
+                    && let Some((k, v)) = l.split_once('=')
+                    && k.trim() == key
+                {
+                    // "..." なら引用符の中だけ (後ろの # コメントは外す)。runner = [...] などはそのまま
+                    let v = v.trim();
+                    return Some(v.strip_prefix('"').and_then(|s| s.split('"').next()).unwrap_or(v).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// .cargo/config.toml の [build] target がこのマシンで動かせない CPU のもので runner もなければ、このマシンの target。
+/// aish のワークスペースは aios の aarch64 musl が既定なので、x86_64 の上で cargo test すると exec format error になっていた
+/// (同じ CPU なら musl の静的なものも動くのでそのまま)
+fn host_target(dir: &Path) -> Option<String> {
+    let target = std::env::var("CARGO_BUILD_TARGET").ok().or_else(|| cargo_config(dir, "build", "target"))?;
+    let out = Command::new("rustc").arg("-vV").output().ok()?;
+    let host = String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("host: ")).map(str::to_string)?;
+    let arch = |t: &str| t.split('-').next().unwrap_or("").to_string();
+    if arch(&target) == arch(&host) || cargo_config(dir, &format!("target.{}", target), "runner").is_some() {
+        return None;
+    }
+    Some(host)
 }
 
 fn reader(mut r: impl Read + Send + 'static, buf: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
@@ -163,7 +208,7 @@ fn reader(mut r: impl Read + Send + 'static, buf: Arc<Mutex<Vec<u8>>>) -> JoinHa
 impl Build {
     fn start(cmd: &str, dir: &Path) -> std::io::Result<Build> {
         use std::os::unix::process::CommandExt;
-        let (full, _) = with_json(cmd);
+        let (full, _) = with_json(cmd, dir);
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&full)
@@ -681,6 +726,27 @@ fn key(pwd: &str, cur: &mut Option<Build>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [build] target がこのマシンで動かせない CPU なら、test と run にこのマシンの --target を足す (build はそのまま)
+    #[test]
+    fn test_on_the_host() {
+        let dir = std::env::temp_dir().join(format!("aish-fix-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        let sub = dir.join("crate/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // riscv64 はこのマシン (x86_64 か aarch64) では動かない
+        std::fs::write(dir.join(".cargo/config.toml"), "[build]\ntarget = \"riscv64gc-unknown-linux-gnu\" # aios\n\n[target.riscv64gc-unknown-linux-gnu]\nlinker = \"rust-lld\"\n").unwrap();
+        assert_eq!(cargo_config(&sub, "build", "target").as_deref(), Some("riscv64gc-unknown-linux-gnu"));
+        let host = String::from_utf8_lossy(&Command::new("rustc").arg("-vV").output().unwrap().stdout).lines().find_map(|l| l.strip_prefix("host: ")).unwrap().to_string();
+        assert_eq!(with_json("cargo test -p x", &sub).0, format!("cargo test --message-format=json --target {} -p x", host));
+        assert_eq!(with_json("cargo build -p x", &sub).0, "cargo build --message-format=json -p x");
+        // 自分で --target を書いたとき、runner があるときはそのまま
+        assert_eq!(with_json("cargo test --target a-b-c", &sub).0, "cargo test --message-format=json --target a-b-c");
+        std::fs::write(dir.join(".cargo/config.toml"), "[build]\ntarget = \"riscv64gc-unknown-linux-gnu\"\n[target.riscv64gc-unknown-linux-gnu]\nrunner = \"qemu-riscv64\"\n").unwrap();
+        assert_eq!(with_json("cargo test", &sub).0, "cargo test --message-format=json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // 場所のない「error:」の行 (cargo そのもののエラー) をエラーとして数える。続く字下げや Caused by は全文に
     #[test]

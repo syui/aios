@@ -73,7 +73,7 @@ jobs:
         run: |
           sh test/aish.sh user/target/aarch64-unknown-linux-musl/release/aish shell/target/aarch64-unknown-linux-musl/release
           # プラグインのユニットテスト (aish-fix のエラーの数えかた、aish-pkg の版くらべなど)
-          (cd shell && cargo test --release -p aish-fix -p aish-pkg)
+          (cd shell && cargo test --release -p aish-edit -p aish-fix -p aish-pkg)
 
       - name: Boot test
         run: |

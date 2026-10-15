@@ -169,11 +169,28 @@ fn clip_line(l: &str) -> String {
 
 fn grep(pwd: &str, a: &Value, home: &str, hits: &mut Vec<Hit>) -> Value {
     let mut r = grep_raw(pwd, a);
+    // 文字として何もなく、pattern が正規表現の形なら、正規表現として探しなおす (regex: true を忘れたとき。
+    // a|b や with_json\( を文字として探すと、何もないとしか答えなかった)
+    if r["count"] == 0 && !a["regex"].as_bool().unwrap_or(false) && looks_like_regex(s(a, "pattern")) {
+        let mut b = a.clone();
+        b["regex"] = json!(true);
+        let again = grep_raw(pwd, &b);
+        if again["count"].as_u64().unwrap_or(0) > 0 {
+            r = again;
+            r["as_regex"] = json!("no plain-text match, so the pattern was read as a regex");
+        }
+    }
     if r.get("error").is_none() {
         let ms = r["matches"].as_array().cloned().unwrap_or_default();
         r["matches"] = json!(number(ms, pwd, home, hits));
     }
     r
+}
+
+/// 正規表現でよく使う形があるか: a|b、\. \( \b などの \、.* .+、^ で始まる、$ で終わる
+/// ([...] は a["name"] のようなコードにもあるので見ない)
+fn looks_like_regex(p: &str) -> bool {
+    p.contains('|') || p.contains('\\') || p.contains(".*") || p.contains(".+") || p.starts_with('^') || (p.ends_with('$') && p.len() > 1)
 }
 
 /// 見つけたものを、よく使うファイルが先になるように並べ (ファイルの中の順はそのまま)、
@@ -726,4 +743,20 @@ fn undo(path: &Path, latest: bool, snaps: &mut Vec<Snap>) -> Value {
         done.push(json!({ "path": snap.path.display().to_string(), "removed": snap.before.is_none() }));
     }
     if done.len() == 1 { done.remove(0) } else { json!({ "undone": done }) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 文字として何もないとき、正規表現として探しなおす形
+    #[test]
+    fn regex_looking_patterns() {
+        for p in ["upstream\\.json|pkg\\.json", "with_json\\(", "fn .*build", "^use ", "end$"] {
+            assert!(looks_like_regex(p), "{}", p);
+        }
+        for p in ["with_json(", "a[\"name\"]", "fn main", "$", "price: 5$x"] {
+            assert!(!looks_like_regex(p), "{}", p);
+        }
+    }
 }

@@ -110,10 +110,18 @@ fn settle(root: &Path, kind: &str, name: &str, file: &str) -> Result<Value, Stri
     for f in &removed {
         let _ = fs::remove_file(kdir.join(f));
     }
+    // 同じ名前で作りなおしたもの (同じ版) の pkg_test の印は前のもの。もう一度確かめるまで pkg_push は送らない
+    let _ = fs::remove_file(crate::test::stamp(root, file));
     sh(Command::new("bin/mkrepo.sh").arg(kdir.strip_prefix(root).unwrap_or(&kdir)).current_dir(root))?;
     // .aios.json に新しいパッケージを足す (版がちがえば直す)
     let aios_json = crate::up::aios_sync(root).unwrap_or_default();
-    Ok(json!({ "name": name, "kind": kind, "file": file, "removed": removed, "aios_json": aios_json }))
+    let mut r = json!({ "name": name, "kind": kind, "file": file, "removed": removed, "aios_json": aios_json });
+    // これを中に入れている (静的リンク) パッケージは、作りなおすまで前のものが入ったまま
+    let rebuild: Vec<String> = crate::embed::stale(root).into_iter().filter(|(_, libs)| libs.iter().any(|(l, _, _)| l == name)).map(|(n, _)| n).collect();
+    if !rebuild.is_empty() {
+        r["rebuild"] = json!(rebuild);
+    }
+    Ok(r)
 }
 
 /// GitHub の aios (CI が重いパッケージを作って置くところ。.github/workflows/pkg.yml)

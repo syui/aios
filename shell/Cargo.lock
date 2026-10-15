@@ -69,6 +69,7 @@ name = "aish-pkg"
 version = "0.0.1"
 dependencies = [
  "aish-plugin",
+ "libc",
  "regex",
  "serde_json",
  "sha2",

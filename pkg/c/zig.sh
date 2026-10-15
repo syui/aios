@@ -107,12 +107,15 @@ zig_env() {
 # c_deps NAME...: ほかの C のパッケージ (repo/aarch64/c/NAME-*.pkg.tar.zst、なければ作る) を
 # $srcdir/sysroot に広げ、そこの include と lib を CPPFLAGS / LDFLAGS / PKG_CONFIG に足す
 # (makepkg の makedepends の代わり。ビルドするマシンの /opt/c は触らない)
+# 広げた版は $srcdir/.c_deps に NAME=VER-REL で書きとめる。mkpkg.sh が .PKGINFO の makedepend にし、aish の pkg_check が
+# それより新しいライブラリがあれば rebuild に出す (静的にリンクしたものは、作りなおすまで古いままなので)
 c_deps() {
   local top root n f
   top=$(cd "$startdir/../../.." && pwd)
   root=$srcdir/sysroot
   rm -rf "$root"
   mkdir -p "$root"
+  : > "$srcdir/.c_deps"
   for n in "$@"; do
     f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
     if [ -z "$f" ]; then
@@ -120,6 +123,10 @@ c_deps() {
       f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
     fi
     zstd -dcq "$f" | tar -xf - -C "$root" --exclude=.PKGINFO
+    # NAME-VER-REL-ARCH.pkg.tar.zst → NAME=VER-REL
+    f=${f##*/}
+    f=${f%-*.pkg.tar.zst}
+    echo "$n=${f#"$n"-}" >> "$srcdir/.c_deps"
   done
   SYSROOT=$root$PREFIX
   export CPPFLAGS="-I$SYSROOT/include" LDFLAGS="$LDFLAGS -L$SYSROOT/lib"
