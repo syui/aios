@@ -3,7 +3,8 @@
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
 #   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ (unix ブランチにいなければ GitHub の unix を)
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
-#                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する)
+#                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する。ai/repo の写し
+#                        build/airepo から: 変わったものだけ取ってきて、変わったものだけ送る)
 #   bin/gitea.sh release ディスクのイメージ (aios-unix-aarch64.img.zst) を作り、ai/os のリリース unix-latest に置きかえる
 #                        (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
 #   bin/gitea.sh mirror  GitHub のリリース unix-latest (CI が作って起動をたしかめたもの) をそのまま ai/os の unix-latest に
@@ -23,7 +24,7 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -54,12 +55,17 @@ find_key() {
   fi
 }
 
-# 引数のリポジトリのコミットを、その鍵の持ち主の名前と署名にする
-use_identity() {
+# その鍵の持ち主: name と mail (と find_key の fpr)
+identity() {
   find_key
   name=${uid% <*}
   mail=${uid##*<}
   mail=${mail%>}
+}
+
+# 引数のリポジトリのコミットを、その鍵の持ち主の名前と署名にする
+use_identity() {
+  identity
   git -C "$1" config user.name "$name"
   git -C "$1" config user.email "$mail"
   # この環境の git は SSH の鍵で署名する設定 (gpg.format=ssh) なので、GPG に戻す
@@ -86,35 +92,47 @@ case "$1" in
     ;;
   repo)
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
-    find_key
+    identity
+    echo "commits by $name <$mail>, signed with $fpr" >&2
+    # ai/repo の写し (build/airepo。aish-pkg の push が ai/repo とくらべるのにも使う) から送る。あれば変わったところだけを
+    # 取る (前は送るたびに ai/repo をまるごと (いま 540 MB) clone していて何分もかかり、プロキシに切られることもあった)。
+    # 送るのも、写しにないもの (作りなおしたパッケージ) だけ
+    dir=$PWD/build/airepo
+    if [ -d "$dir/.git" ]; then
+      git -C "$dir" -c "$(auth)" fetch -q --depth 1 "$host/ai/repo.git" main
+      base=$(git -C "$dir" rev-parse FETCH_HEAD)
+    else
+      mkdir -p build
+      git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$dir"
+      base=$(git -C "$dir" rev-parse HEAD)
+    fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    git -c "$(auth)" clone -q --depth 1 -b main "$host/ai/repo.git" "$tmp/repo"
-    use_identity "$tmp/repo"
-    # aarch64/ をこのリポジトリの repo/aarch64 (rust/ c/ shell/ desktop/) と同じにする
-    rm -rf "$tmp/repo/aarch64"
+    # 写しのファイルにはさわらず、別の index で: ai/repo の木 (x86_64/ や aios.gpg もそのまま) の aarch64/ を、この
+    # リポジトリの repo/aarch64 (rust/ c/ shell/ desktop/) にする。前の置き場所 aarch64-c/ は消す
+    g() { GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" git "$@"; }
+    g read-tree "$(g ls-tree "$base" | awk -F '\t' '$2 != "aarch64" && $2 != "aarch64-c"' | g mktree)"
     for d in rust c shell desktop; do
       [ -f "repo/aarch64/$d/aios.db" ] || continue
-      mkdir -p "$tmp/repo/aarch64/$d"
-      cp repo/aarch64/$d/*.pkg.tar.zst repo/aarch64/$d/aios.db repo/aarch64/$d/aios.db.tar.gz "$tmp/repo/aarch64/$d/"
+      (cd repo && GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" GIT_WORK_TREE=. git add -f -- aarch64/$d/*.pkg.tar.zst "aarch64/$d/aios.db" "aarch64/$d/aios.db.tar.gz")
     done
-    # 前の置き場所 (aarch64-c/) は消す
-    rm -rf "$tmp/repo/aarch64-c"
-    cd "$tmp/repo"
-    git add -A .
+    tree=$(g write-tree)
     # 中身が同じでも、前の歴史が残っていれば (親のあるコミット) まとめる
-    if git diff --cached --quiet && ! git cat-file -p HEAD | grep -q '^parent '; then
+    if [ "$tree" = "$(g rev-parse "$base^{tree}")" ] && ! g cat-file -p "$base" | grep -q '^parent '; then
       echo "ai/repo: no change"
       exit 0
     fi
-    changes=$(git diff --cached --name-status | sed 's/^/  /')
-    # 歴史は残さない: いまのファイル (x86_64/ や aios.gpg もそのまま) だけの 1 コミットで main を置きかえる。
-    # パッケージは圧縮したバイナリで差分がとれず、作りなおすたびに積もるので
-    # (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
-    git checkout -q --orphan new
-    git commit -q -m "aarch64: update packages" -m "$changes"
-    git_push -q --force origin new:main
-    echo "ai/repo: pushed $(git rev-parse --short HEAD) (history squashed)"
+    changes=$(g diff-index --cached --name-status "$base" | sed 's/^/  /')
+    # 歴史は残さない: いまのファイルだけの 1 コミット (親なし) で main を置きかえる。パッケージは圧縮したバイナリで
+    # 差分がとれず、作りなおすたびに積もるので (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
+    new=$(g -c gpg.format=openpgp -c user.name="$name" -c user.email="$mail" commit-tree -S"$fpr" -m "aarch64: update packages" -m "$changes" "$tree")
+    (cd "$dir" && git_push -q --force "$host/ai/repo.git" "$new:refs/heads/main")
+    # 写しも送ったものに (書きかわるのは変わったファイルだけ)。前のコミットのものは、ふくらまないように捨てる
+    # (ばらばらのものだけ。clone したときの pack はそのまま。gc で詰めなおすと、このディスクでは何分もかかる)
+    git -C "$dir" reset -q --hard "$new"
+    git -C "$dir" reflog expire --expire=now --all
+    git -C "$dir" prune --expire=now
+    echo "ai/repo: pushed $(git -C "$dir" rev-parse --short "$new") (history squashed)"
     ;;
   release | mirror)
     # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース unix-latest に
