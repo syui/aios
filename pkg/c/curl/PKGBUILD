@@ -1,15 +1,15 @@
 # curl: URL でデータをやりとりする道具とライブラリ (git の https に使う)
 # TLS は mbedtls、圧縮は zlib。静的な curl と libcurl.a を /opt/c に入れる
 pkgname=curl
-pkgver=8.22.0
-pkgrel=3
+pkgver=8.23.0
+pkgrel=1
 pkgdesc='Command line tool and library for transferring data with URLs (mbedTLS, static)'
 arch=('aarch64')
 url='https://curl.se'
 license=('curl')
 depends=('ca-certificates')
 source=("https://curl.se/download/curl-$pkgver.tar.xz")
-sha256sums=('f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7')
+sha256sums=('8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5')
 
 prepare() {
   rm -rf "curl-$pkgver"
