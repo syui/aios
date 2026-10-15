@@ -24,6 +24,8 @@ pub struct Opts {
     pub force: bool,
     pub fail_fast: bool,
     pub push: bool,
+    /// pkg_test を aios の VM の中でも (vm)
+    pub vm: bool,
 }
 
 /// 作りなおす 1 つ
@@ -239,7 +241,7 @@ pub fn rebuild(root: &Path, o: &Opts) -> Value {
             continue;
         }
         let tlog = logs.join(format!("test-{}.log", s.name));
-        let r = child(root, &["test", &s.name], &tlog);
+        let r = child(root, &if o.vm { vec!["test", &s.name, "--vm"] } else { vec!["test", &s.name] }, &tlog);
         if r["ok"] != true {
             // 通らなかった確かめ (FAIL の行)
             let why = r["error"].as_str().map(String::from).unwrap_or_else(|| r["text"].as_str().unwrap_or("").lines().filter(|l| l.starts_with("FAIL")).collect::<Vec<_>>().join("; "));

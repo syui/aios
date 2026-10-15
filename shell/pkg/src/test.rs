@@ -194,7 +194,8 @@ fn run(mut cmd: Command, timeout: Duration) -> (Option<i32>, String) {
     (st, out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect())
 }
 
-pub fn test(root: &Path, name: &str) -> Result<Value, String> {
+/// vm なら aios の VM の中でも (vmtest.rs)
+pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
     let file = find(root, name).ok_or_else(|| format!("{}: not built (pkg_build)", name))?;
     let fname = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let info = pkginfo(&file);
@@ -260,9 +261,12 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
     checks.push(json!({ "check": "files", "ok": clashes.is_empty(), "clashes": clashes.len(), "with": clashes.iter().take(5).cloned().collect::<Vec<_>>() }));
     // 動かす: bin/ の ELF を --version で
     let native = std::env::consts::ARCH == "aarch64";
-    let qemu = ["qemu-aarch64-static", "qemu-aarch64"].into_iter().find(|q| Command::new(q).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok());
+    // qemu はこのマシンの PATH で探しておく (動かすときは PATH を広げたところだけにするので、Command はその PATH で探してしまう)
+    let qemu = ["qemu-aarch64-static", "qemu-aarch64"].into_iter().find_map(|q| std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(|d| d.join(q)).find(|p| p.is_file()));
     let bins: Vec<PathBuf> = elves.iter().filter(|e| e.1 && e.2 && e.0.parent().is_some_and(|d| d.ends_with("bin"))).map(|e| e.0.strip_prefix(&pkgdir).unwrap_or(&e.0).to_path_buf()).collect();
     let short = want.split(':').next_back().unwrap_or("").split('-').next().unwrap_or("").to_string();
+    // このマシンで動かしたもの (vm で aios の中のものとくらべる)
+    let mut host_runs: Vec<Value> = Vec::new();
     if bins.is_empty() {
         checks.push(json!({ "check": "run", "ok": true, "note": "no programs in bin/ (a library)" }));
     } else if !native && qemu.is_none() {
@@ -285,11 +289,18 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
                         c.env("LD_LIBRARY_PATH", format!("{}/usr/lib:{}/opt/c/lib", dir.display(), dir.display()));
                         c
                     } else {
-                        let mut c = Command::new(qemu.unwrap_or_default());
+                        let mut c = Command::new(qemu.clone().unwrap_or_default());
                         c.arg("-L").arg(&dir).arg(&path);
                         c
                     };
                     c.arg(flag);
+                    // データ (GSettings の schema、アイコンなど) は広げたところからだけ (aiwm がつけるものと同じ並び)。qemu-user は
+                    // 広げたところにないファイルをこのマシンのもので代わりにするので、既定の /usr/share のままだと Ubuntu の
+                    // schema で gsettings が動いた (aios では No schemas installed)
+                    c.env("XDG_DATA_DIRS", format!("{d}/opt/c/share:{d}/usr/local/share:{d}/usr/share", d = dir.display()));
+                    // 呼ぶプログラムも広げたところからだけ (git-upload-pack --help は man を動かす。このマシンの man で動いて、
+                    // man のない aios では 128 だった)
+                    c.env("PATH", format!("{d}/opt/c/bin:{d}/usr/local/bin:{d}/usr/bin:{d}/bin", d = dir.display()));
                     if as_nobody {
                         use std::os::unix::process::CommandExt;
                         c.uid(65534).gid(65534);
@@ -321,7 +332,14 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             runs.push(r);
         }
         ok &= any;
+        host_runs = runs.clone();
         checks.push(json!({ "check": "run", "ok": any, "version_seen": seen_ver, "bins": runs }));
+    }
+    // aios の VM の中で (ap -S で入れて、bin/ のものを aios のカーネルの上で)
+    if vm {
+        let c = crate::vmtest::check(root, name, &bins, &host_runs);
+        ok &= c["ok"] == true;
+        checks.push(c);
     }
     let _ = fs::remove_dir_all(&pkgdir);
     let _ = fs::remove_dir_all(&dir);
@@ -338,6 +356,7 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             Some("files") => c["with"].as_array().filter(|w| !w.is_empty()).map_or(" no clash with other packages".to_string(), |w| format!(" {} files also in other packages: {}", c["clashes"], w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))),
             Some("aarch64") => format!(" {} ELF{}", c["elf"], c["wrong"].as_array().filter(|w| !w.is_empty()).map_or(String::new(), |w| format!(", not aarch64: {}", w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")))),
             Some("copies") => describe_copies(c),
+            Some("vm") => crate::vmtest::describe(c),
             Some("needs") => match (c["missing"].as_array().filter(|m| !m.is_empty()), c["needs"].as_array().map_or(0, Vec::len)) {
                 (Some(m), _) => format!(" not in the package or its depends: {} (add the package that has it to depends)", m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")),
                 (None, 0) => " uses no library from another package".to_string(),

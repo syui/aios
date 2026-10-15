@@ -413,7 +413,8 @@ def serve(www):
         # panic のあとの行 (わけ) もログに入るまで
         vm.wait_quiet(1, 5)
         ok = None
-    ready = {'ready': ok is not None, 'boot_s': round(time.time() - t0, 1)}
+    # snapshot と www も答える (aish-pkg の pkg_test vm が、動いている VM をそのまま使ってよいか見る)
+    ready = {'ready': ok is not None, 'boot_s': round(time.time() - t0, 1), 'snapshot': '-snapshot' in os.environ.get('AIOS_QEMU_ARGS', ''), 'www': www}
     if panicked:
         ready['panic'] = True
     if ok is None:
