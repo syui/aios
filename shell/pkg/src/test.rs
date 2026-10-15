@@ -281,7 +281,7 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
             let path = dir.join(b);
             // --version がなければ -version (ffmpeg)、-V (tmux)、version (zig)、それもなければ --help
             let (mut st, mut first) = (None, String::new());
-            let (mut nobody, mut printed) = (false, false);
+            let (mut nobody, mut printed, mut usage) = (false, false, false);
             for flag in ["--version", "-version", "-V", "version", "--help"] {
                 let cmd = |as_nobody: bool| {
                     let mut c = if native {
@@ -318,11 +318,14 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
                 // 版を出して 0 でない番号で終わるものも動いたとみる (musl の ldd は、動かすプログラムがなければ
                 // Version 1.2.6 と使い方を出して 1 で終わる)。シグナルで落ちたもの (番号がない) はそうみない
                 printed = st.is_some_and(|s| s != 0) && short.len() >= 3 && all.contains(&short);
+                // 版を出す引数がなく、使い方を出して 1 か 2 で終わるもの (vulkaninfo、vkcube) も main まで来ている。
+                // ライブラリが読めないときは Error loading shared library と 127 なので、それとは分かれる
+                usage |= matches!(st, Some(1 | 2)) && all.to_ascii_lowercase().contains("usage");
                 if st == Some(0) || printed {
                     break;
                 }
             }
-            any |= st == Some(0) || printed;
+            any |= st == Some(0) || printed || usage;
             seen_ver |= !short.is_empty() && (printed || first.contains(&short));
             let mut r = json!({ "bin": b.display().to_string(), "status": st, "out": first });
             if nobody {
@@ -330,6 +333,8 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
             }
             if printed {
                 r["note"] = json!(format!("printed its version {} and exits {}", short, st.unwrap_or(0)));
+            } else if usage && st != Some(0) {
+                r["note"] = json!(format!("printed its usage and exits {} (no version flag)", st.unwrap_or(0)));
             }
             // qemu-user ではそのプログラムが exec する aarch64 のプログラム (uvx → uv など) は動かない
             // (binfmt がないので)。aios の中なら動くので、そう書いておく
