@@ -380,15 +380,111 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
-    let (full, ino) = match vfs::lookup(&base, &path, follow) {
+    let found = match vfs::lookup(&base, &path, follow) {
+        Ok(found) => Ok(found),
+        Err(e) if e == -ENOENT && flags & O_CREAT != 0 => Err(vfs::parent_path(&base, &path)?),
+        Err(e) => return Err(e),
+    };
+    open_found(found, flags, mode)
+}
+
+// openat2 の open_how.flags に使えるもの (arm64 の値: O_ACCMODE と O_CREAT から __O_TMPFILE まで)。知らないものは EINVAL
+// (openat は知らないものを見ない)
+const VALID_OPEN_FLAGS: u64 = 0o37777703;
+const O_PATH: u64 = 0o10000000;
+const O_TMPFILE: u64 = 0o20000000;
+
+/// openat2(dirfd, path, how, size): struct open_how { u64 flags; u64 mode; u64 resolve; } (版 0 は 24 バイト。後ろに増えた
+/// ところは 0 でなければ E2BIG)。openat とちがい、知らない flags、O_CREAT (か O_TMPFILE) なしの mode、O_PATH と
+/// いっしょに使えない flags は EINVAL。resolve (RESOLVE_*) があれば vfs::lookup_resolve でたどる (cap-std (uv など) は
+/// RESOLVE_BENEATH で、ディレクトリの外に出ない open に使う)。RESOLVE_CACHED はいつも EAGAIN: 覚えだけで答えるとは
+/// 約束しないので、呼んだほうが RESOLVE_CACHED なしでやりなおす (Linux でも覚えになければそう答える)
+pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
+    const E2BIG: i64 = 7;
+    const EAGAIN: i64 = 11;
+    const ENAMETOOLONG: i64 = 36;
+    const VER0: usize = 24;
+    if size < VER0 {
+        return Err(-EINVAL);
+    }
+    if size > 4096 {
+        return Err(-E2BIG);
+    }
+    let mut b = vec![0u8; size];
+    proc::current().pt().copy_in(&mut b, howp).ok_or(-EFAULT)?;
+    if b[VER0..].iter().any(|&x| x != 0) {
+        return Err(-E2BIG);
+    }
+    let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let (flags, mode, resolve) = (word(0), word(1), word(2));
+    if flags & !VALID_OPEN_FLAGS != 0 || mode & !0o7777 != 0 || resolve & !vfs::RESOLVE_ALL != 0 {
+        return Err(-EINVAL);
+    }
+    if mode != 0 && flags & (O_CREAT | O_TMPFILE) == 0 {
+        return Err(-EINVAL);
+    }
+    if flags & O_PATH != 0 && flags & !(O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) != 0 {
+        return Err(-EINVAL);
+    }
+    if resolve & vfs::RESOLVE_BENEATH != 0 && resolve & vfs::RESOLVE_IN_ROOT != 0 {
+        return Err(-EINVAL);
+    }
+    if resolve & vfs::RESOLVE_CACHED != 0 {
+        return Err(-EAGAIN);
+    }
+    if resolve == 0 {
+        return openat(dirfd, pathp, flags, mode);
+    }
+    let path = user_str(pathp)?;
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    // 絶対パスでも dirfd は使う (IN_ROOT のルート)
+    let start = start_dir(dirfd)?;
+    // O_CREAT と O_EXCL なら、最後のリンクはたどらない (リンクがあれば EEXIST。Linux と同じ)
+    let follow = flags & O_NOFOLLOW == 0 && !(flags & O_CREAT != 0 && flags & O_EXCL != 0);
+    let found = match vfs::lookup_resolve(start, &path, follow, resolve)? {
+        vfs::Resolved::Found(full, ino) => Ok((full, ino)),
+        vfs::Resolved::Missing(parent, dir, name) if flags & O_CREAT != 0 => {
+            // name/ は作れない
+            if path.ends_with('/') {
+                return Err(-EISDIR);
+            }
+            if name.len() > 255 {
+                return Err(-ENAMETOOLONG);
+            }
+            let full = if dir.is_empty() { name.clone() } else { alloc::format!("{}/{}", dir, name) };
+            Err((parent, name, full))
+        }
+        vfs::Resolved::Missing(..) => return Err(-ENOENT),
+    };
+    open_found(found, flags, mode)
+}
+
+/// dirfd のディレクトリ (inode, パス)。AT_FDCWD ならいまのディレクトリ
+fn start_dir(dirfd: i64) -> Result<(InodeRef, String), i64> {
+    if dirfd == AT_FDCWD {
+        let cwd = proc::current().files().cwd.clone();
+        return Ok((vfs::resolve("", &cwd, true)?, cwd));
+    }
+    let f = file_of(dirfd as u64)?;
+    let f = f.borrow();
+    match &f.kind {
+        Kind::Inode(i, p) if i.meta().is_dir() => Ok((i.clone(), p.clone())),
+        _ => Err(-ENOTDIR),
+    }
+}
+
+/// openat と openat2 の残り: あったもの (パス, inode) を開くか、なかったもの (親, 名前, パス) を O_CREAT で作って開く
+fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, flags: u64, mode: u64) -> R {
+    let (full, ino) = match found {
         Ok(found) => {
             if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
                 return Err(-EEXIST);
             }
             found
         }
-        Err(e) if e == -ENOENT && flags & O_CREAT != 0 => {
-            let (parent, name, full) = vfs::parent_path(&base, &path)?;
+        Err((parent, name, full)) => {
             vfs::check_writable(&full)?;
             crate::landlock::check_parent(&full, crate::landlock::MAKE_REG)?;
             if flags as u32 & file::O_ACCMODE != file::O_RDONLY {
@@ -405,7 +501,6 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
             return Ok(fd as i64);
         }
-        Err(e) => return Err(e),
     };
     let accmode = flags as u32 & file::O_ACCMODE;
     let want = match accmode {

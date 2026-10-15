@@ -568,6 +568,194 @@ pub fn parent_path(cwd: &str, path: &str) -> Result<(InodeRef, String, String), 
     Ok((parent, name, full))
 }
 
+// ---- openat2 の resolve (RESOLVE_*) ----
+
+pub const RESOLVE_NO_XDEV: u64 = 0x01;
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+pub const RESOLVE_BENEATH: u64 = 0x08;
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
+pub const RESOLVE_CACHED: u64 = 0x20;
+pub const RESOLVE_ALL: u64 = 0x3f;
+
+/// lookup_resolve の答え: あったもの (パス, inode) か、最後の名前だけがないもの (作るところ: 親, そのパス, 名前)
+pub enum Resolved {
+    Found(String, InodeRef),
+    Missing(InodeRef, String, String),
+}
+
+/// たどっているところ: (パス (先頭 / なし), inode, マウントをまたいで入ったか (マウントの根))
+type Step = (String, InodeRef, bool);
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.is_empty() { name.to_string() } else { alloc::format!("{}/{}", dir, name) }
+}
+
+/// プロセスのルート (chroot。なければ名前空間のルート)
+fn proc_root() -> Result<Step, i64> {
+    let r = crate::proc::current_root();
+    if r.is_empty() {
+        return Ok((String::new(), cross(root()), false));
+    }
+    let (p, i) = lookup("", &r, true)?;
+    Ok((p, i, false))
+}
+
+/// ディレクトリのパス (たどったあとのもの) と、その上のディレクトリをみな。いちばん上はプロセスのルート (パスが
+/// ルートの外なら (chroot の前に開いたもの)、名前空間のルート。normalize と同じく、そこからは .. で上に出る)
+fn chain(path: &str) -> Result<Vec<Step>, i64> {
+    let r = proc_root()?;
+    let inside = r.0.is_empty() || path == r.0 || path.starts_with(&alloc::format!("{}/", r.0));
+    let (rest, mut out) = if inside { (&path[r.0.len()..], alloc::vec![r]) } else { (path, alloc::vec![(String::new(), cross(root()), false)]) };
+    for c in rest.split('/').filter(|c| !c.is_empty()) {
+        let (w, cur) = out.last().map(|s| (s.0.clone(), s.1.clone())).unwrap();
+        let raw = cur.lookup(c)?;
+        let next = cross(raw.clone());
+        let crossed = next.id() != raw.id();
+        out.push((join(&w, c), next, crossed));
+    }
+    Ok(out)
+}
+
+/// openat2 の resolve のきまりで、start (dirfd のディレクトリ (inode, パス)) から path をたどる。lookup とちがい、.. と
+/// リンクは 1 つずつ (lookup のようにパスの文字の上で先に畳まない) なので、どこから外に出ようとしたかがわかる:
+///   BENEATH: start の外に出るもの (start の .. 、絶対パス、絶対のリンク、魔法のリンク) は EXDEV
+///   IN_ROOT: start をルートに (絶対パスと絶対のリンクは start から、start の .. は start)。魔法のリンクは EXDEV
+///   NO_SYMLINKS: リンクは ELOOP (魔法のリンクも)。NO_MAGICLINKS: 魔法のリンク (/proc/self/fd/N) は ELOOP
+///   NO_XDEV: マウントをまたぐもの (入るのも、.. で出るのも、ほかのマウントへのリンクも) は EXDEV
+/// 最後の名前だけがなければ Missing (O_CREAT が作るところ)。答えは覚えない (lookup の PATHS は使わない)
+pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resolve: u64) -> Result<Resolved, i64> {
+    let beneath = resolve & RESOLVE_BENEATH != 0;
+    let in_root = resolve & RESOLVE_IN_ROOT != 0;
+    let no_xdev = resolve & RESOLVE_NO_XDEV != 0;
+    let no_symlinks = resolve & RESOLVE_NO_SYMLINKS != 0;
+    let no_magic = no_symlinks || resolve & RESOLVE_NO_MAGICLINKS != 0;
+    let cred = crate::cred::current();
+    let start: Step = (start.1.trim_matches('/').to_string(), start.0, false);
+    // name/ はディレクトリでなければならない (リンクならたどる)
+    let must_dir = path.ends_with('/');
+    let follow = follow || must_dir;
+    // stack[0] がいちばん下: BENEATH と IN_ROOT なら start (その下には出ない)。ほかは、はじめは start で、.. で上に
+    // 行くときにルートからの並び (chain) にかえる (at_root: いちばん下がもうルート)
+    let mut at_root = false;
+    let mut stack: Vec<Step> = if path.starts_with('/') {
+        if beneath {
+            return Err(-EXDEV);
+        }
+        if in_root {
+            alloc::vec![start]
+        } else {
+            at_root = true;
+            alloc::vec![proc_root()?]
+        }
+    } else {
+        alloc::vec![start]
+    };
+    let mut todo: alloc::collections::VecDeque<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
+    let mut links = 0;
+    while let Some(c) = todo.pop_front() {
+        let (w, cur) = stack.last().map(|s| (s.0.clone(), s.1.clone())).unwrap();
+        let m = cur.meta();
+        if !m.is_dir() {
+            return Err(-ENOTDIR);
+        }
+        // ディレクトリを通るには x が要る (. と .. も。Linux と同じ)
+        cred.check(&m, crate::cred::X)?;
+        if c == "." {
+            continue;
+        }
+        if c == ".." {
+            if stack.len() == 1 {
+                if beneath {
+                    return Err(-EXDEV);
+                }
+                if in_root || at_root {
+                    continue;
+                }
+                stack = chain(&stack[0].0)?;
+                at_root = true;
+                if stack.len() == 1 {
+                    continue;
+                }
+            }
+            let (_, _, crossed) = stack.pop().unwrap();
+            if crossed && no_xdev {
+                return Err(-EXDEV);
+            }
+            continue;
+        }
+        let last = todo.is_empty();
+        let raw = match cur.lookup(&c) {
+            Ok(r) => r,
+            Err(e) if e == -ENOENT && last => return Ok(Resolved::Missing(cur, w, c)),
+            Err(e) => return Err(e),
+        };
+        let next = cross(raw.clone());
+        let crossed = next.id() != raw.id();
+        if crossed && no_xdev {
+            return Err(-EXDEV);
+        }
+        if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {
+            if no_symlinks {
+                return Err(-ELOOP);
+            }
+            links += 1;
+            if links > 40 {
+                return Err(-ELOOP);
+            }
+            if let Some((p, ino)) = next.magic_link() {
+                if no_magic {
+                    return Err(-ELOOP);
+                }
+                if beneath || in_root || (no_xdev && ino.id().0 != cur.id().0) {
+                    return Err(-EXDEV);
+                }
+                let p = p.trim_start_matches('/').to_string();
+                if todo.is_empty() {
+                    if must_dir && !ino.meta().is_dir() {
+                        return Err(-ENOTDIR);
+                    }
+                    return Ok(Resolved::Found(p, ino));
+                }
+                // /proc/self/fd/N/... : 開いているディレクトリから先を (その .. は、そのディレクトリの上)
+                stack = alloc::vec![(p, ino, false)];
+                at_root = false;
+                continue;
+            }
+            let t = next.readlink()?;
+            if t.is_empty() {
+                return Err(-ENOENT);
+            }
+            if t.starts_with('/') {
+                if beneath {
+                    return Err(-EXDEV);
+                }
+                let r = if in_root { stack[0].clone() } else { proc_root()? };
+                if no_xdev && r.1.id().0 != cur.id().0 {
+                    return Err(-EXDEV);
+                }
+                if in_root {
+                    stack.truncate(1);
+                } else {
+                    stack = alloc::vec![r];
+                    at_root = true;
+                }
+            }
+            // リンクの中身を、残りの前に
+            for x in t.split('/').filter(|x| !x.is_empty()).rev() {
+                todo.push_front(String::from(x));
+            }
+            continue;
+        }
+        stack.push((join(&w, &c), next, crossed));
+    }
+    let (w, i, _) = stack.pop().unwrap();
+    if must_dir && !i.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    Ok(Resolved::Found(w, i))
+}
+
 /// なければディレクトリを作りながら path をたどる (起動時用)
 pub fn mkdir_p(path: &str, mode: u32) -> Result<InodeRef, i64> {
     let mut cur = cross(root());

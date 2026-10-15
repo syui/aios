@@ -250,6 +250,7 @@ nrs! {
     MEMBARRIER = 283,
     RSEQ = 293,
     CLOSE_RANGE = 436,
+    OPENAT2 = 437,
     FACCESSAT2 = 439,
 }
 
@@ -311,6 +312,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
+        OPENAT2 => sysfile::openat2(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
         MKNODAT => sysfile::mknodat(int(a[0]), a[1] as usize, a[2], a[3]),
         SWAPON => sysfile::swapon(a[0] as usize),
         SWAPOFF => sysfile::swapoff(a[0] as usize),
@@ -634,7 +636,7 @@ fn strace(nr: u64, a: &[u64], r: R) {
         // execve がうまくいったあとは、もう新しいプログラムのメモリなので読まない
         "execve" if r.is_err() => Some(0),
         "chdir" | "truncate" | "statfs" | "acct" | "swapon" => Some(0),
-        "openat" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
+        "openat" | "openat2" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
         _ => None,
     };
     let arg = |i: usize| match path_arg {
