@@ -92,7 +92,8 @@ make_one() (
       *://*)
         [ -n "$name" ] || name=${src##*/}
         if [ ! -f "$srcdir/$name" ]; then
-          curl -fL -o "$srcdir/$name.part" "$src"
+          # 配布元やプロキシーが途中で切ることがある (Connection reset by peer で gawk、iproute2、libdrm の 3 つが落ちた)
+          curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 -o "$srcdir/$name.part" "$src"
           mv "$srcdir/$name.part" "$srcdir/$name"
         fi
         if [ "$want" != SKIP ] && [ "$(sha256 "$srcdir/$name")" != "$want" ]; then
