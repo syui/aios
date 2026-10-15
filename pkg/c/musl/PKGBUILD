@@ -3,22 +3,33 @@
 #   共有ライブラリを探すところは /etc/ld-musl-aarch64.path (/usr/lib と /opt/c/lib)
 # aios の本体 (Rust) は静的リンクのままなので、これがなくても aios は動く。
 # 動的リンクのプログラムを作るのは base-devel の cc -dynamic (ヘッダーは Zig のもの)
+# パッチ (上流のコミット。Alpine の 1.2.6-r1 と -r2 と同じ):
+#   CVE-2026-6042.patch: iconv の gb18030 が 1 字に 1 秒より長くかかり、まちがえる (CVE-2026-6042)
+#   CVE-2026-40200.patch: qsort のスタックの配列があふれる (CVE-2026-40200)
+# 静的にリンクしたものは Zig の中の libc を使う (qsort は Zig のものなのであてはまらず、iconv は zig.sh で直す)
 pkgname=musl
 pkgver=1.2.6
-pkgrel=1
+pkgrel=2
 pkgdesc='Lightweight implementation of the C standard library: shared libc.so and the dynamic linker'
 arch=('aarch64')
 url='https://musl.libc.org/'
 license=('MIT')
 backup=(etc/ld-musl-aarch64.path)
 makedepends=('aarch64-linux-gnu-gcc')
-source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz")
-sha256sums=('d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a')
+source=("https://musl.libc.org/releases/musl-$pkgver.tar.gz"
+        'CVE-2026-6042.patch'
+        'CVE-2026-40200.patch')
+sha256sums=('d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a'
+            '1d0be2e72b9d5bd16546b923aa8af861d271322f01644716a81823bec4065c99'
+            '1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb')
 
 prepare() {
   rm -rf "musl-$pkgver"
   tar -xzf "musl-$pkgver.tar.gz"
   # CVE-2025-26519 (iconv) のパッチは 1.2.6 に入った
+  cd "musl-$pkgver"
+  patch -p1 < "$srcdir/CVE-2026-6042.patch"
+  patch -p1 < "$srcdir/CVE-2026-40200.patch"
 }
 
 build() {
