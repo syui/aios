@@ -115,13 +115,26 @@ pub fn check(root: &Path, name: &str, bins: &[PathBuf], host: &[Value]) -> Value
         let (b, st, first) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
         runs.push(json!({ "bin": b.trim_start_matches('/'), "status": st.parse::<i64>().ok(), "out": first }));
     }
-    // このマシンで動いたのに aios で動かないもの
-    let ran = |rs: &[Value], b: &str| rs.iter().any(|r| r["bin"] == b && r["status"] == 0);
-    let differ: Vec<Value> = runs.iter().filter(|r| r["status"] != 0 && ran(host, r["bin"].as_str().unwrap_or(""))).cloned().collect();
-    // このマシンで動かせなかったとき (qemu がない) は、aios で 1 つでも動けばよい
-    let any = runs.iter().any(|r| r["status"] == 0);
-    let ok = runs.len() == bins.len() && differ.is_empty() && (any || !host.iter().any(|r| r["status"] == 0));
+    let (runs, differ, ok) = compare(runs, host, bins.len());
     json!({ "check": "vm", "ok": ok, "how": how, "bins": runs, "differ": differ })
+}
+
+/// aios で動かしたもの (runs) を、このマシンで動かしたもの (host) とくらべる: (ran をつけた runs, このマシンで動いたのに
+/// aios で動かないもの, ok)。動いたか: 0 で終わったもの。このマシンで版か使い方を出して 0 でない番号で終わったもの
+/// (musl の ldd、vulkaninfo。test.rs の run の note) は、aios でも同じ番号なら動いたとみる (前は「0 of 3 programs ran ...
+/// the others fail here too」と出た)
+fn compare(mut runs: Vec<Value>, host: &[Value], nbins: usize) -> (Vec<Value>, Vec<Value>, bool) {
+    let host_ran = |h: &Value| h["status"] == 0 || h["note"].as_str().is_some_and(|n| n.starts_with("printed its"));
+    for r in runs.iter_mut() {
+        let h = host.iter().find(|h| h["bin"] == r["bin"]);
+        let same = h.is_some_and(|h| h["status"] != 0 && host_ran(h) && h["status"] == r["status"]);
+        r["ran"] = json!(r["status"] == 0 || same);
+    }
+    let differ: Vec<Value> = runs.iter().filter(|r| r["ran"] != true && host.iter().any(|h| h["bin"] == r["bin"] && host_ran(h))).cloned().collect();
+    // このマシンで動かせなかったとき (qemu がない) は、aios で 1 つでも動けばよい
+    let any = runs.iter().any(|r| r["ran"] == true);
+    let ok = runs.len() == nbins && differ.is_empty() && (any || !host.iter().any(host_ran));
+    (runs, differ, ok)
 }
 
 /// pkg_test の答えの vm の行
@@ -131,7 +144,8 @@ pub fn describe(c: &Value) -> String {
     }
     let how = c["how"].as_str().unwrap_or("");
     let bins = c["bins"].as_array().map_or(0, Vec::len);
-    let ran = c["bins"].as_array().map_or(0, |b| b.iter().filter(|r| r["status"] == 0).count());
+    // ran がなければ (前の答え) 0 で終わったもの
+    let ran = c["bins"].as_array().map_or(0, |b| b.iter().filter(|r| r.get("ran").map_or(r["status"] == 0, |x| *x == true)).count());
     match c["differ"].as_array().filter(|d| !d.is_empty()) {
         Some(d) => format!(
             " ran here but not in aios ({}): {}",
@@ -155,5 +169,25 @@ mod tests {
         assert!(s.starts_with("export XDG_DATA_DIRS=/opt/c/share:"));
         assert!(s.contains("--version -version -V version --help"));
         assert!(s.contains("printf '@@ %s\\t%s\\t%s\\n'"));
+    }
+
+    #[test]
+    fn compare_runs() {
+        let host = vec![
+            json!({ "bin": "usr/bin/ldd", "status": 1, "note": "printed its version 1.2.6 and exits 1" }),
+            json!({ "bin": "opt/c/bin/tput", "status": 0 }),
+            json!({ "bin": "opt/c/bin/broken", "status": 127 }),
+        ];
+        let vm = |ldd: i64, tput: i64| vec![json!({ "bin": "usr/bin/ldd", "status": ldd }), json!({ "bin": "opt/c/bin/tput", "status": tput }), json!({ "bin": "opt/c/bin/broken", "status": 127 })];
+        // ldd は同じ 1 なので動いた。broken はこのマシンでも動かないので、ちがいではない
+        let (runs, differ, ok) = compare(vm(1, 0), &host, 3);
+        assert!(ok && differ.is_empty());
+        assert_eq!(runs.iter().filter(|r| r["ran"] == true).count(), 2);
+        assert_eq!(describe(&json!({ "how": "x", "bins": runs, "differ": differ })), " installed in aios with ap -S; 2 of 3 programs ran on the aios kernel, the others fail here too (x)");
+        // aios で ldd が 127 (ライブラリが読めない) ならちがい
+        let (_, differ, ok) = compare(vm(127, 0), &host, 3);
+        assert!(!ok && differ.len() == 1 && differ[0]["bin"] == "usr/bin/ldd");
+        // tput が aios で落ちればちがい
+        assert!(!compare(vm(1, 139), &host, 3).2);
     }
 }

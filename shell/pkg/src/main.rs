@@ -256,7 +256,7 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
     };
     let text = std::fs::read_to_string(&j.log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
-    let tail = lines[lines.len().saturating_sub(15)..].join("\n");
+    let tail = lines[lines.len().saturating_sub(15)..].iter().map(|l| short_line(l)).collect::<Vec<_>>().join("\n");
     let ms = j.t0.elapsed().as_millis() as u64;
     let adopted = j.child.is_none();
     let Some(st) = status else {
@@ -283,6 +283,16 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
         r["tail"] = json!(tail);
     }
     r
+}
+
+/// ログの 1 行を見せる形に: \r で描きなおした進みぐあい (curl など) は最後のものだけ、長いもの (gcc のコマンドの行は
+/// 1 行で千字ほどあり、15 行で 15 KB になっていた) は頭の 200 字と … だけ
+fn short_line(l: &str) -> String {
+    let l = l.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or("");
+    match l.char_indices().nth(200) {
+        Some((i, _)) => format!("{}…", &l[..i]),
+        None => l.to_string(),
+    }
 }
 
 /// このプログラム (子の aish-pkg build などを起こす)。ビルドしなおして置きかわると /proc/self/exe は "... (deleted)" になるので、
@@ -473,6 +483,16 @@ fn key(root: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_lines() {
+        assert_eq!(short_line("[6/215] Compiling C object"), "[6/215] Compiling C object");
+        // curl の進みぐあいは最後のものだけ
+        assert_eq!(short_line("  0  100k\r 50  100k\r100  100k done\r"), "100  100k done");
+        let gcc = format!("aarch64-linux-gnu-gcc {}", "-Wall ".repeat(300));
+        assert_eq!(short_line(&gcc).chars().count(), 201);
+        assert!(short_line(&"字".repeat(300)).ends_with("字…"));
+    }
 
     #[test]
     fn adopt_only_our_jobs() {
