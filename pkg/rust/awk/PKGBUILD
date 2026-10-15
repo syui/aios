@@ -1,9 +1,9 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/awk)
 # uutils/awk はまだリリースがないので、コミットを決めて日付を版にする (まだ作りかけ: -F や split() など)
 pkgname=awk
-pkgver=0.1.0.20261010
+pkgver=0.1.0.20261011
 pkgrel=1
-_commit=58c3a2f79eef07eb3e59a6dd5f17ebcaef037f95
+_commit=91b6c10c489d9b5afd60d96c58346bf7e815520a
 pkgdesc='Rust implementation of AWK, work in progress (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/awk'
