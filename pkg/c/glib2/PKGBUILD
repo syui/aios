@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=glib2
 pkgver=2.90.1
-pkgrel=1
+pkgrel=2
 pkgdesc='Low level core library (GLib, GObject, GIO; shared, for aios)'
 arch=('aarch64')
 license=('LGPL-2.1-or-later')

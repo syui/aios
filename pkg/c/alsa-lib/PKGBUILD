@@ -3,7 +3,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=alsa-lib
 pkgver=1.2.16.1
-pkgrel=1
+pkgrel=2
 pkgdesc='An alternative implementation of Linux sound support: libasound (shared, for aios)'
 arch=('aarch64')
 url='https://www.alsa-project.org/'
