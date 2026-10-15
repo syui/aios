@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
+const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで。みなを見ると 1 分ほど)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const TEST: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"vm":{"type":"boolean","description":"aios の VM (-snapshot で repo/ を出したもの。動いていなければ起こし、終わっても止めない) にも ap -S で入れて、bin/ のものを aios のカーネルの上で動かす (このマシンの qemu-user で動いたものが aios で動かなければしくじり)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
 const PUSH: &str = r#"{"type":"object","properties":{"force":{"type":"boolean","description":"ai/repo のほうが新しいもの (ほかで送ったもの) を消す・下げることになっても送る"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
@@ -50,7 +50,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-p", "check")],
         tools: &[
-            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)。直っていない CVE は vulns に (Alpine の secdb の「この版で直した」とくらべる。pkg/c のものなど。firefox は Mozilla の advisories と): fixed in VER なら pkg_edit でそれから上に、patched by Alpine (同じ版にパッチ) なら aports のパッチを足して PKGBUILD に CVE の番号を書く (あてはまらないものも番号を書けば出なくなる)。Rust の crate も (aios の Cargo.lock と pkg/rust の配布元の Cargo.lock を cargo audit と同じ RustSec の advisories と。PKGBUILD の cargo_update で上げたものは上げた版で): crate の fixed in VER なら pkg/rust は build() に cargo_update CRATE@VER (cross.sh) を足して pkg_edit rebuild、aios の Cargo.lock は cargo update -p CRATE。npm も (.aios.json の pkg.linux.npm の版を npm audit と同じ advisories と)", input: CHECK },
+            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)。直っていない CVE は vulns に (Alpine の secdb の「この版で直した」とくらべる。pkg/c のものなど。firefox は Mozilla の advisories と): fixed in VER なら pkg_edit でそれから上に、patched by Alpine (同じ版にパッチ) なら aports のパッチを足して PKGBUILD に CVE の番号を書く (あてはまらないものも番号を書けば出なくなる)。Rust の crate も (aios の Cargo.lock と pkg/rust の配布元の Cargo.lock を cargo audit と同じ RustSec の advisories と。PKGBUILD の cargo_update で上げたものは上げた版で): crate の fixed in VER なら pkg/rust は build() に cargo_update CRATE@VER (cross.sh) を足して pkg_edit rebuild、aios の Cargo.lock は cargo update -p CRATE。npm も (.aios.json の pkg.linux.npm の版を npm audit と同じ advisories と)。うしろで動くので、終わっていなければ running (配布元をみな見ると 1 分ほど。もういちど呼ぶと続きを待つ)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。vm なら aios の VM にも ap -S で入れて、aios のカーネルの上で動かす。通ったものだけ pkg_push で送れる。うしろで動く", input: TEST },
@@ -67,8 +67,16 @@ fn main() {
             let root = root(a["dir"].as_str(), s(v, "pwd"));
             match s(v, "name") {
                 "pkg_check" => {
-                    let names: Vec<String> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
-                    check(&root, &names, a["all"] == true, a["refresh"] == true)
+                    // 配布元をみな見ると 1 分ほどかかり、ツールが 60 秒で切れるので、build と同じくうしろで
+                    let names: Vec<&str> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str()).filter(|n| !n.is_empty() && !n.starts_with('-')).collect()).unwrap_or_default();
+                    let mut argv = vec!["check", "--answer"];
+                    for (k, f) in [("all", "--all"), ("refresh", "--refresh")] {
+                        if a[k] == true {
+                            argv.push(f);
+                        }
+                    }
+                    argv.extend(names);
+                    job(&mut jobs, &root, "check", &argv, a)
                 }
                 "pkg_edit" => {
                     let n = s(a, "name");
@@ -403,6 +411,12 @@ fn cli(args: &[String]) -> i32 {
                 Ok(rs) => json!({ "versions": rs.iter().map(|r| json!({ "name": r["name"], "now": r["pkgver"], "latest": r["latest"], "new": r["new"] == true, "error": r["error"] })).collect::<Vec<_>>() }),
                 Err(e) => error(e),
             };
+            println!("{}", r);
+            return if r.get("error").is_some() { 1 } else { 0 };
+        }
+        "check" if args.iter().any(|a| a == "--answer") => {
+            // うしろで動かしたとき (pkg_check): 答えをそのまま 1 行の JSON で
+            let r = check(&root, &rest, args.iter().any(|a| a == "--all"), args.iter().any(|a| a == "--refresh"));
             println!("{}", r);
             return if r.get("error").is_some() { 1 } else { 0 };
         }
