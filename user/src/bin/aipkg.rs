@@ -839,6 +839,22 @@ fn sync_install(repos: &[Repo], targets: &[String], explicit: &[String]) {
         println!(" there is nothing to do");
         return;
     }
+    // conflicts: いっしょに入れられないものがあれば、取ってくる前に止める (pacman と同じく、どれも入れない。install でも
+    // 見るが、そこで止まると前のものだけ入って、あとのものが入らない)。replaces で外すものは見ず、このときに上げるものは
+    // 新しい版の conflicts で見る
+    let db = installed();
+    for n in &order {
+        let d = &sync[n].1;
+        let replaced = |c: &str| list(d, "REPLACES").iter().any(|r| dep_name(r) == c);
+        let stays = |c: &str| c != n && db.contains_key(c) && !replaced(c);
+        if let Some(c) = list(d, "CONFLICTS").iter().map(|c| dep_name(c)).find(|c| stays(c)) {
+            die(format!("{}: conflicts with {} (installed). remove it first, or keep {}", n, c, c));
+        }
+        let conflicts = |o: &String, od: &Desc| list(if order.contains(o) { &sync[o].1 } else { od }, "CONFLICTS").iter().any(|x| dep_name(x) == n);
+        if let Some((c, _)) = db.iter().find(|(o, (od, _))| stays(o) && conflicts(o, od)) {
+            die(format!("{}: {} (installed) conflicts with it", n, c));
+        }
+    }
     let mut line = String::from("Packages:");
     for n in &order {
         line.push_str(&format!(" {}-{}", n, get(&sync[n].1, "VERSION")));
