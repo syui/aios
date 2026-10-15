@@ -1,17 +1,21 @@
 # vulkan-tools: vulkaninfo (Vulkan のドライバと GPU のことを見る) と vkcube (回る立方体) (for aios)
 #   Wayland だけ (X11 はなし)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする
-#   ビルドには cmake、ninja、このマシンの wayland-scanner が要る。/opt/c に入る
+#   ビルドには cmake、ninja、このマシンの wayland-scanner (Debian / Ubuntu: libwayland-bin) が要る。/opt/c に入る
 pkgname=vulkan-tools
 pkgver=1.4.365
-pkgrel=1
+pkgrel=2
 pkgdesc='Vulkan utilities: vulkaninfo and vkcube (Wayland, for aios)'
 arch=('aarch64')
 url='https://github.com/KhronosGroup/Vulkan-Tools'
 license=('Apache-2.0')
 depends=('musl' 'vulkan-loader' 'wayland')
 makedepends=('cmake' 'ninja' 'vulkan-headers' 'wayland-protocols')
-source=("Vulkan-Tools::git+https://github.com/KhronosGroup/Vulkan-Tools.git#tag=v$pkgver")
-sha256sums=('SKIP')
+# wayland.xml (コアのプロトコル) は wayland のソースから (pkg/c/wayland と同じ版)
+_wayland=1.26.0
+source=("Vulkan-Tools::git+https://github.com/KhronosGroup/Vulkan-Tools.git#tag=v$pkgver"
+        "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$_wayland/downloads/wayland-$_wayland.tar.xz")
+sha256sums=('SKIP'
+            '64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3')
 
 build() {
   . "$startdir/../zig.sh"
@@ -24,10 +28,10 @@ build() {
   ln -sf "$(command -v wayland-scanner)" "$root/usr/bin/wayland-scanner"
   printf 'wayland_scanner=/usr/bin/wayland-scanner\nName: wayland-scanner\nDescription: host wayland-scanner\nVersion: %s\n' \
     "$(wayland-scanner --version 2>&1 | awk '{print $2}')" > "$root$PREFIX/share/pkgconfig/wayland-scanner.pc"
-  # wayland.xml (コアのプロトコル) も。aios の wayland のパッケージには入れていないので、このマシンのもの
+  # wayland.xml (コアのプロトコル) も。aios の wayland のパッケージには入れていないので、wayland のソースから
+  # (前はこのマシンの /usr/share/wayland/wayland.xml を写していて、libwayland-dev のないマシンでは作れなかった)
   mkdir -p "$root$PREFIX/share/wayland"
-  [ -f "$root$PREFIX/share/wayland/wayland.xml" ] ||
-    cp "$(pkg-config --variable=pkgdatadir wayland-scanner)/wayland.xml" "$root$PREFIX/share/wayland/"
+  tar -xJOf "$srcdir/wayland-$_wayland.tar.xz" "wayland-$_wayland/protocol/wayland.xml" > "$root$PREFIX/share/wayland/wayland.xml"
   rm -rf build
   cmake -S Vulkan-Tools -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
