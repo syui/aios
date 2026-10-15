@@ -246,7 +246,7 @@ fn rule(name: &str, path: &Path) -> Value {
 }
 
 /// 名前ごとに f を JOBS 本ずつ並べて動かす (順番はそのまま)
-fn par<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     let items: std::sync::Mutex<Vec<(usize, T)>> = std::sync::Mutex::new(items.into_iter().enumerate().collect());
     let out = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|s| {
@@ -833,7 +833,7 @@ fn first_sum(text: &str) -> Option<String> {
 }
 
 /// source の 1 つめを bash で展開する (${pkgver%.*} なども)。name:: はとる
-fn expand_source(dir: &Path, text: &str) -> Result<String, String> {
+pub(crate) fn expand_source(dir: &Path, text: &str) -> Result<String, String> {
     let out = Command::new("bash")
         .args(["-c", "eval \"$1\"; printf %s \"${source[0]}\"", "-", text])
         .current_dir(dir)
