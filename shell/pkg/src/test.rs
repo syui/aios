@@ -167,9 +167,9 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// cmd を timeout まで動かす: (終わりの番号, 出力の最初の行)
-fn run(mut cmd: Command, timeout: Duration) -> (Option<i32>, String) {
-    let Ok(mut c) = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else { return (None, "cannot start".into()) };
+/// cmd を timeout まで動かす: (終わりの番号, 出力の最初の行, 出力)
+fn run(mut cmd: Command, timeout: Duration) -> (Option<i32>, String, String) {
+    let Ok(mut c) = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else { return (None, "cannot start".into(), String::new()) };
     let t0 = Instant::now();
     let st = loop {
         match c.try_wait() {
@@ -178,7 +178,7 @@ fn run(mut cmd: Command, timeout: Duration) -> (Option<i32>, String) {
             _ => {
                 let _ = c.kill();
                 let _ = c.wait();
-                return (None, "timeout".into());
+                return (None, "timeout".into(), String::new());
             }
         }
     };
@@ -191,7 +191,7 @@ fn run(mut cmd: Command, timeout: Duration) -> (Option<i32>, String) {
     {
         let _ = e.read_to_string(&mut out);
     }
-    (st, out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect())
+    (st, out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect(), out)
 }
 
 /// vm なら aios の VM の中でも (vmtest.rs)
@@ -281,7 +281,7 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
             let path = dir.join(b);
             // --version がなければ -version (ffmpeg)、-V (tmux)、version (zig)、それもなければ --help
             let (mut st, mut first) = (None, String::new());
-            let mut nobody = false;
+            let (mut nobody, mut printed) = (false, false);
             for flag in ["--version", "-version", "-V", "version", "--help"] {
                 let cmd = |as_nobody: bool| {
                     let mut c = if native {
@@ -307,22 +307,29 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
                     }
                     c
                 };
-                (st, first) = run(cmd(false), Duration::from_secs(15));
+                let all;
+                (st, first, all) = run(cmd(false), Duration::from_secs(15));
                 if st != Some(0) && root_user {
-                    let (s, f) = run(cmd(true), Duration::from_secs(15));
+                    let (s, f, _) = run(cmd(true), Duration::from_secs(15));
                     if s == Some(0) {
                         (st, first, nobody) = (s, f, true);
                     }
                 }
-                if st == Some(0) {
+                // 版を出して 0 でない番号で終わるものも動いたとみる (musl の ldd は、動かすプログラムがなければ
+                // Version 1.2.6 と使い方を出して 1 で終わる)。シグナルで落ちたもの (番号がない) はそうみない
+                printed = st.is_some_and(|s| s != 0) && short.len() >= 3 && all.contains(&short);
+                if st == Some(0) || printed {
                     break;
                 }
             }
-            any |= st == Some(0);
-            seen_ver |= !short.is_empty() && first.contains(&short);
+            any |= st == Some(0) || printed;
+            seen_ver |= !short.is_empty() && (printed || first.contains(&short));
             let mut r = json!({ "bin": b.display().to_string(), "status": st, "out": first });
             if nobody {
                 r["note"] = json!("as nobody (it does not run as root)");
+            }
+            if printed {
+                r["note"] = json!(format!("printed its version {} and exits {}", short, st.unwrap_or(0)));
             }
             // qemu-user ではそのプログラムが exec する aarch64 のプログラム (uvx → uv など) は動かない
             // (binfmt がないので)。aios の中なら動くので、そう書いておく
