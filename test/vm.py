@@ -4,6 +4,9 @@
 #   test/vm.py start [--www DIR]   起こして、プロンプトが出るまで待つ (bin/run.sh。画面は AIOS_DISPLAY=none。
 #                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
+#   test/vm.py bg 'CMD'            中でうしろで動かしてすぐ答える ({"job": ID})。長いもの (ap -S firefox など) のあいだも run が使える
+#   test/vm.py job [ID] [-w SEC] [--kill]
+#                                  うしろのものの様子と、前に見せたところから先の出力 (-w 秒まで終わるのを待つ。ID がなければ一覧)
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
 #   test/vm.py keys ARG...         画面のキーボードで: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
@@ -61,8 +64,13 @@ def monitor(cmd, wait=0.5):
 
 
 class Serve:
+    # bg のものの置き場 (中)
+    JOBS = '/tmp/.vmjob'
+
     def __init__(self, www):
         self.buf = b''
+        # bg で起こしたもの: ID → {cmd, t0, shown (ログのうち見せたバイト数)}
+        self.jobs = {}
         self.cv = threading.Condition()
         self.log = open(LOG, 'wb')
         self.http = subprocess.Popen([sys.executable, '-m', 'http.server', '8000', '-d', www], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if www else None
@@ -181,6 +189,62 @@ class Serve:
             self.wait_for(PROMPT, 5)
             return {'timeout': True}
         return {'status': int(mm.group(1))}
+
+    def bg(self, cmd):
+        # うしろで動かす: 中の JOBS/ID.sh にして、サブシェルで . で読む (aish の書き方のまま)。出力は ID.log、
+        # 終わりの番号は ID.rc (止められたらできない)、pid は ID.pid。aish はうしろのものを自分のグループに入れるので、
+        # 止めるときは -pid に送れば孫まで止まる
+        import base64
+        jid = len(self.jobs) + 1
+        f = '%s/%d' % (self.JOBS, jid)
+        r = self.put(f + '.sh', base64.encodebytes(cmd.encode()).decode())
+        if r.get('status') != 0:
+            return {'error': 'could not write %s.sh in the VM' % f, 'put': r}
+        # . で読むものはもう 1 つ内側のサブシェルで (その中の exit 3 が rc を書くところまで終わらせないように)
+        r = self.run('rm -f {f}.rc {f}.log; ( ( . {f}.sh ); echo $? > {f}.rc ) > {f}.log 2>&1 < /dev/null & echo $! > {f}.pid'.format(f=f), 30)
+        if r.get('status') != 0:
+            return {'error': 'could not start it', 'out': r.get('out', '')}
+        self.jobs[jid] = {'cmd': cmd, 't0': time.time(), 'shown': 0}
+        return {'job': jid}
+
+    def job(self, jid=None, wait=0, kill=False, limit=60000):
+        # bg のものの様子: 終わったか (ID.rc があるか、pid がもういない)、前に見せたところから先の出力 (limit バイトまで)。
+        # wait 秒まで終わるのを待つ。jid がなければ一覧
+        if jid is None:
+            return {'jobs': [{'id': i, 'cmd': j['cmd'][:120], 's': round(time.time() - j['t0'])} for i, j in self.jobs.items()]}
+        j = self.jobs.get(jid)
+        if j is None:
+            return {'error': 'no job %s (vm job without an id lists them)' % jid}
+        f = '%s/%d' % (self.JOBS, jid)
+        if kill:
+            self.run('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && {{ kill -TERM -$p 2>/dev/null || kill -TERM $p; }}'.format(f=f), 20)
+        mark = '@@VMJOB@@'
+        end = time.time() + wait
+        while True:
+            # 終わりの番号 (なければ空)、pid がいるか、ログの大きさ、まだ見せていないところ
+            r = self.run(('cat {f}.rc 2>/dev/null; echo {m}; p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && [ -d /proc/$p ] && echo alive; echo {m}; '
+                          'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit), 30)
+            parts = r.get('out', '').split(mark)
+            if len(parts) < 4:
+                return {'error': 'could not read the job', 'out': r.get('out', '')}
+            rc, alive, size, new = parts[0].strip(), 'alive' in parts[1], parts[2].strip(), parts[3]
+            done = rc != '' or not alive
+            if done or time.time() >= end:
+                break
+            time.sleep(1)
+        size = int(size) if size.isdigit() else j['shown']
+        got = min(size, j['shown'] + limit)
+        res = {'id': jid, 'done': done, 'ms': int((time.time() - j['t0']) * 1000), 'out': new.strip('\n'), 'shown_before': j['shown']}
+        j['shown'] = got
+        if done:
+            if rc.lstrip('-').isdigit():
+                res['status'] = int(rc)
+            else:
+                res['status'] = None
+                res['note'] = 'stopped before it ended (no exit status)'
+        if got < size:
+            res['more'] = size - got
+        return res
 
     def reboot(self, timeout, reset_after=None, choose=None):
         # 中で sudo reboot して、またプロンプトまで待つ。reset_after 秒で来なければ QEMU をリセットする (新しいカーネルが
@@ -383,6 +447,10 @@ def serve(www):
                 r = vm.run(cmd, req.get('timeout', 600))
             elif op == 'put':
                 r = vm.put(req['path'], req['b64'], gz=req.get('gz', False))
+            elif op == 'bg':
+                r = vm.bg(req['cmd'])
+            elif op == 'job':
+                r = vm.job(req.get('id'), req.get('wait', 0), req.get('kill', False))
             elif op == 'fetch':
                 # DIR/xfer/NAME (put が置いた大きなファイル) を中の fetch で取る
                 import shlex
@@ -466,6 +534,18 @@ def main():
             print(json.dumps({k: v for k, v in r.items() if k != 'out'}), file=sys.stderr)
             sys.exit(124 if r.get('timeout') else 1)
         sys.exit(r['status'])
+    elif op == 'bg':
+        r = ask({'op': 'bg', 'cmd': a[1]})
+        print(json.dumps(r))
+        sys.exit(1 if 'error' in r else 0)
+    elif op == 'job':
+        # test/vm.py job [ID] [-w SEC] [--kill]
+        req = {'op': 'job', 'wait': float(a[a.index('-w') + 1]) if '-w' in a else 0, 'kill': '--kill' in a}
+        if len(a) > 1 and a[1].isdigit():
+            req['id'] = int(a[1])
+        r = ask(req)
+        print(json.dumps(r))
+        sys.exit(1 if 'error' in r else 0)
     elif op == 'type':
         ask({'op': 'type', 'text': a[1].replace('\\n', '\n')})
     elif op == 'keys':
