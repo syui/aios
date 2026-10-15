@@ -37,8 +37,17 @@ fetch_git() {
     '') ref=HEAD ;;
     *) echo "mkpkg: unknown fragment #$frag" >&2; return 1 ;;
   esac
-  [ -d "$dir/.git" ] || git init -q "$dir"
-  git -C "$dir" fetch -q --depth 1 "$url" "$ref"
+  case $ref in
+    HEAD|refs/heads/*)
+      # pkgver() が git rev-list --count で版を作る (0.0.1.r32.gf9cc881) ので、履歴はみな取る (ファイルの中身は
+      # 使うものだけ)。--depth 1 では数がいつも 1 で、版のくらべがハッシュの字の順になっていた
+      [ -f "$dir/.git/shallow" ] && rm -rf "$dir"
+      [ -d "$dir/.git" ] || git init -q "$dir"
+      git -C "$dir" fetch -q --filter=blob:none "$url" "$ref" ;;
+    *)
+      [ -d "$dir/.git" ] || git init -q "$dir"
+      git -C "$dir" fetch -q --depth 1 "$url" "$ref" ;;
+  esac
   # prepare() の変更は毎回やりなおす
   git -C "$dir" checkout -q --force FETCH_HEAD
 }
