@@ -9,6 +9,7 @@
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
 #   test/vm.py shot FILE.png       画面を撮る (png は ImageMagick の convert があれば。なければ .ppm)
 #   test/vm.py put LOCAL REMOTE    ファイルを中へ (16 KB までは gzip と base64 でシリアルから、大きいものは http と fetch で)
+#   test/vm.py get REMOTE LOCAL    中のファイルを外へ (gzip と base64 を 1 行にしてシリアルで。sha256 を中と外でくらべる。16 MB まで)
 #   test/vm.py reboot [-t SEC] [--reset-after SEC] [--choose TEXT]
 #                                  中で sudo reboot して、またプロンプトまで待つ。--reset-after の秒で来なければ
 #                                  QEMU をリセットする (止まった新しいカーネルの電源を入れなおすかわり)
@@ -489,6 +490,31 @@ def main():
             r = ask({'op': 'put', 'path': a[2], 'b64': base64.encodebytes(gzip.compress(data, 6)).decode(), 'gz': True})
         if r.get('status') != 0:
             sys.exit('vm: put: %s' % json.dumps(r))
+    elif op == 'get':
+        # 中の fetch は取ってくるだけで送れないので、シリアルで。base64 を何行にもすると、run の答えをそろえる tidy が
+        # 同じ行のくり返し (0 の並びなど) をまとめてこわすので 1 行に (base64 -w 0)
+        import base64, gzip, hashlib, shlex
+        q = shlex.quote(a[1])
+        r = ask({'op': 'run', 'cmd': 'sha256sum %s && stat -c %%s %s' % (q, q), 'timeout': 60})
+        words = r.get('out', '').split()
+        if r.get('status') != 0 or len(words) < 3 or not words[-1].isdigit():
+            sys.exit('vm: get: %s: %s' % (a[1], r.get('out', '').strip() or json.dumps(r)))
+        want, size = words[0], int(words[-1])
+        if size > 16 << 20:
+            sys.exit('vm: get is for files up to 16 MB (it comes over the serial line)')
+        r = ask({'op': 'run', 'cmd': '{ gzip -c %s 2>/dev/null || toybox gzip -c %s; } | base64 -w 0; echo' % (q, q), 'timeout': 600})
+        try:
+            data = gzip.decompress(base64.b64decode(''.join(r.get('out', '').split())))
+        except Exception as e:
+            sys.exit('vm: get: %s: could not read what came (%s)' % (a[1], e))
+        got = hashlib.sha256(data).hexdigest()
+        if got != want:
+            sys.exit('vm: get: %s: sha256 %s here but %s inside' % (a[1], got, want))
+        out = os.path.abspath(a[2])
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'wb') as f:
+            f.write(data)
+        print(json.dumps({'local': out, 'bytes': len(data), 'sha256': got}))
     elif op == 'mon':
         print(ask({'op': 'mon', 'cmd': a[1]})['out'])
     elif op == 'reboot':
