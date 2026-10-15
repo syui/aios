@@ -31,7 +31,7 @@
   {"name": "findutils",         "type": "rust",    "src": "git+https://github.com/uutils/findutils#tag=0.10.0",                                                               "now": "0.10.0",         "latest": "0.10.0"},
   {"name": "firefox",           "type": "c",       "src": "https://archive.mozilla.org/pub/firefox/releases/158.0/source/firefox-158.0.source.tar.xz",                        "now": "158.0",          "latest": "158.0"},
   {"name": "fontconfig",        "type": "c",       "src": "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz",   "now": "2.18.3",         "latest": "2.18.3"},
-  {"name": "freetype2",         "type": "c",       "src": "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz",                                       "now": "2.14.3",         "latest": "2.15.0"},
+  {"name": "freetype2",         "type": "c",       "src": "https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz",                                       "now": "2.15.0",         "latest": "2.15.0"},
   {"name": "fribidi",           "type": "c",       "src": "https://github.com/fribidi/fribidi/releases/download/v1.0.17/fribidi-1.0.17.tar.xz",                               "now": "1.0.17",         "latest": "1.0.17"},
   {"name": "gawk",              "type": "c",       "src": "https://ftp.gnu.org/gnu/gawk/gawk-5.4.1.tar.xz",                                                                   "now": "5.4.1",          "latest": "5.4.1"},
   {"name": "gdk-pixbuf2",       "type": "c",       "src": "https://download.gnome.org/sources/gdk-pixbuf/2.44/gdk-pixbuf-2.44.8.tar.xz",                                      "now": "2.44.8",         "latest": "2.44.8"},
