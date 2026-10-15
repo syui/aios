@@ -13,6 +13,7 @@
 //     タグかコミットのもの。PKGBUILD の cargo_update CRATE@VER (pkg/rust/cross.sh) で上げたものは、上げた版で)。
 //     informational (unmaintained や unsound) と withdrawn のもの、Linux や aarch64 にあてはまらないものは出さない
 //   npm (.aios.json の pkg.linux.npm に人が書いた版): npm audit と同じ registry.npmjs.org の advisories
+//   uv で入れる Python (.aios.json の pkg.linux.uv の python。uv python install の CPython): Alpine の python3 の secfixes と
 //     range: その advisory があてはまる版の範囲
 // PKGBUILD かそのとなりのファイル (パッチなど) に番号 (CVE-、RUSTSEC-、GHSA-) を書いておけば、直した (かあてはまらない) と
 // みて出さない (aios の Cargo.lock は、となりの Cargo.toml などに)。
@@ -36,6 +37,9 @@ const ALSO: [&str; 1] = ["sudo-rs"];
 const MOZILLA: [(&str, &str); 1] = [("firefox", "Firefox")];
 const MFSA: &str = "https://github.com/mozilla/foundation-security-advisories.git";
 const RUSTSEC: &str = "https://github.com/rustsec/advisory-db.git";
+/// uv で入れるもの (.aios.json の pkg.linux.uv) と Alpine の名前。python は uv python install の CPython
+/// (python-build-standalone) で、版は Alpine の python3 と同じ CPython のもの
+const UV_ALPINE: [(&str, &str); 1] = [("python", "python3")];
 /// npm audit がたずねるところ: {名前: [版]} を POST すると {名前: [advisory]}
 const NPM_AUDIT: &str = "https://registry.npmjs.org/-/npm/v1/security/advisories/bulk";
 
@@ -563,10 +567,11 @@ fn rust_locks(root: &Path, names: &[String], notes: &mut Vec<String>) -> Vec<Loc
 
 // ---- npm ----
 
-/// .aios.json の pkg.linux.npm (人が書く: "pnpm": "12.9.1"、"@anthropic-ai/claude-code": "2.1.289 (ap -S claude)")
-fn npm_list(root: &Path) -> Vec<(String, String)> {
+/// .aios.json の pkg.linux.KIND (人が書く。npm は "pnpm": "12.9.1"、"@anthropic-ai/claude-code": "2.1.289 (ap -S claude)"、
+/// uv は "python": "3.14.8")
+fn hand_list(root: &Path, kind: &str) -> Vec<(String, String)> {
     let v: Value = fs::read_to_string(root.join(".aios.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    v["pkg"]["linux"]["npm"].as_object().into_iter().flatten().filter_map(|(n, ver)| Some((n.clone(), ver.as_str()?.split_whitespace().next()?.to_string()))).collect()
+    v["pkg"]["linux"][kind].as_object().into_iter().flatten().filter_map(|(n, ver)| Some((n.clone(), ver.as_str()?.split_whitespace().next()?.to_string()))).collect()
 }
 
 /// url に JSON を POST した答え (curl)
@@ -672,6 +677,19 @@ pub fn check(root: &Path, names: &[String]) -> Result<(Vec<Vuln>, String), Strin
             out.push(Vuln { name, now: now.to_string(), fixes });
         }
     }
+    // uv で入れるもの (python): Alpine の同じもの。直した (かあてはまらない) と書くのは uv の PKGBUILD のとなり
+    for (name, ver) in hand_list(root, "uv") {
+        let Some((_, alpine)) = UV_ALPINE.iter().find(|(n, _)| *n == name) else { continue };
+        if !(names.is_empty() || names.contains(&name)) {
+            continue;
+        }
+        if let Some(s) = db.get(*alpine) {
+            let fixes = open(&ver, s, &done_in(&root.join("pkg/rust/uv")));
+            if !fixes.is_empty() {
+                out.push(Vuln { name, now: ver, fixes });
+            }
+        }
+    }
     let locks = rust_locks(root, names, &mut notes);
     if !locks.is_empty() {
         match rustsec(root) {
@@ -687,7 +705,7 @@ pub fn check(root: &Path, names: &[String]) -> Result<(Vec<Vuln>, String), Strin
             Err(e) => notes.push(e),
         }
     }
-    let npm: Vec<(String, String)> = npm_list(root).into_iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
+    let npm: Vec<(String, String)> = hand_list(root, "npm").into_iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
     if !npm.is_empty() {
         match npm_audit(root, &npm) {
             Ok((ans, n)) => {
@@ -728,8 +746,12 @@ pub fn describe(v: &Vuln) -> String {
 
 /// vulns があるときの、どうするかの行 (出たものの種類ごと)
 pub fn hints(vs: &[Vuln]) -> Vec<&'static str> {
-    let has = |h: &[&str]| vs.iter().any(|v| v.fixes.iter().any(|f| h.contains(&f.how)));
+    let uv = |v: &Vuln| UV_ALPINE.iter().any(|(n, _)| *n == v.name);
+    let has = |h: &[&str]| vs.iter().filter(|v| !uv(v)).any(|v| v.fixes.iter().any(|f| h.contains(&f.how)));
     let mut out = Vec::new();
+    if vs.iter().any(uv) {
+        out.push("vulns: python (uv) → uv python install VER (uv python list --only-downloads shows what uv can install; a newer uv may be needed), then write it in .aios.json (pkg.linux.uv); a CVE that does not apply → name it in pkg/rust/uv/PKGBUILD");
+    }
     if has(&["newer", "patch"]) {
         out.push("vulns: fixed in VER → pkg_edit to VER or newer; patched by Alpine → add the patch from aports (main/NAME or community/NAME) and name the CVE in the PKGBUILD (name it there too when it does not apply to aios)");
     }
@@ -866,6 +888,16 @@ mod tests {
         // 出る前の版は、その版として
         assert!(open_rust(&[("crossbeam-epoch".into(), "0.10.2-rc.1".into())], &db, &BTreeSet::new()).is_empty());
         assert!(!open_rust(&[("crossbeam-epoch".into(), "0.10.0".into())], &db, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn python_hint() {
+        let py = Vuln { name: "python".into(), now: "3.14.8".into(), fixes: vec![fix("newer", "3.14.9", "alpine", &["CVE-a"])] };
+        let h = hints(&[py]);
+        assert_eq!(h.len(), 1);
+        assert!(h[0].contains("uv python install"));
+        let c = Vuln { name: "musl".into(), now: "1.2.6".into(), fixes: vec![fix("patch", "1.2.6-r3", "alpine", &["CVE-b"])] };
+        assert!(hints(&[c])[0].contains("pkg_edit"));
     }
 
     #[test]
