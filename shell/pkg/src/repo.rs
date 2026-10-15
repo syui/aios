@@ -68,6 +68,8 @@ pub fn build(root: &Path, name: &str) -> Result<Value, String> {
         sh(Command::new("git").arg("-C").arg(root).args(["fetch", "-q", "--unshallow", "origin"]))?;
     }
     let local = local_repo(root)?;
+    // 前のもの (mkpkg.sh が外す) のライブラリの名前。新しいものでなくなったものを使うパッケージを settle で出す
+    let before = crate::test::find(root, name).map(|f| crate::embed::provides(root, &f));
     sh(Command::new("bin/mkpkg.sh").arg(dir.strip_prefix(root).unwrap_or(dir)).current_dir(root))?;
     // できたもの: いちばん新しい NAME-*.pkg.tar.zst
     let kdir = local.join(&kind);
@@ -84,7 +86,7 @@ pub fn build(root: &Path, name: &str) -> Result<Value, String> {
         .collect();
     mine.sort();
     let (_, file) = mine.pop().ok_or("no package was made")?;
-    settle(root, &kind, name, &file)
+    settle(root, &kind, name, &file, before)
 }
 
 /// repo/aarch64 (なければ ai/repo の aarch64/ をそろえる。送るときに、ほかのパッケージが消えないように)
@@ -98,8 +100,24 @@ fn local_repo(root: &Path) -> Result<PathBuf, String> {
     Ok(local)
 }
 
-/// repo/aarch64/KIND/FILE を NAME のものとして残し、ほかの版を外して aios.db と .aios.json を作りなおす
-fn settle(root: &Path, kind: &str, name: &str, file: &str) -> Result<Value, String> {
+/// repo/aarch64 を書きかえるあいだの錠 (pkg_build をいくつもいっしょに動かしても、aios.db と .aios.json がこわれないように)。
+/// 閉じれば (drop) 外れる。repo/aarch64 は ai/repo にそのまま送るので、錠のファイルは build/aish-pkg/ に置く
+fn lock(root: &Path) -> Result<fs::File, String> {
+    use std::os::unix::io::AsRawFd;
+    let p = root.join("build/aish-pkg/repo.lock");
+    let _ = fs::create_dir_all(p.parent().unwrap_or(root));
+    let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!("{}: {}", p.display(), std::io::Error::last_os_error()));
+    }
+    Ok(f)
+}
+
+/// repo/aarch64/KIND/FILE を NAME のものとして残し、ほかの版を外して aios.db と .aios.json を作りなおす。
+/// before は前のもののライブラリの名前 (embed::provides): 新しいものでなくなったもの (SONAME が変わったもの) を
+/// NEEDED に書いたパッケージは、作りなおすまで動かないので soname に出す
+fn settle(root: &Path, kind: &str, name: &str, file: &str, before: Option<Vec<String>>) -> Result<Value, String> {
+    let _lock = lock(root)?;
     let kdir = root.join("repo/aarch64").join(kind);
     let removed: Vec<String> = fs::read_dir(&kdir)
         .map_err(|e| format!("{}: {}", kdir.display(), e))?
@@ -120,6 +138,19 @@ fn settle(root: &Path, kind: &str, name: &str, file: &str) -> Result<Value, Stri
     let rebuild: Vec<String> = crate::embed::stale(root).into_iter().filter(|(_, libs)| libs.iter().any(|(l, _, _)| l == name)).map(|(n, _)| n).collect();
     if !rebuild.is_empty() {
         r["rebuild"] = json!(rebuild);
+    }
+    if let Some(b) = before
+        && let Some(g) = crate::embed::gone(root, name, &b, &kdir.join(file))
+    {
+        r["text"] = json!(format!(
+            "{}: {} no longer in {} (SONAME now {}); rebuild what uses it: {}\n",
+            name,
+            g["gone"].as_object().map_or(String::new(), |m| m.keys().cloned().collect::<Vec<_>>().join(" ")),
+            file,
+            g["sonames"].as_array().map_or(String::new(), |s| s.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")),
+            g["rebuild"].as_array().map_or(String::new(), |s| s.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+        ));
+        r["soname"] = g;
     }
     Ok(r)
 }
@@ -174,16 +205,19 @@ pub fn fetch(root: &Path, name: &str) -> Result<Value, String> {
     let local = local_repo(root)?;
     let kdir = local.join(&kind);
     let _ = fs::create_dir_all(&kdir);
+    let before = crate::test::find(root, name).map(|f| crate::embed::provides(root, &f));
     fs::copy(tmp.join(&file), kdir.join(&file)).map_err(|e| e.to_string())?;
     let changed = fs::read(&path).ok() != fs::read(tmp.join("PKGBUILD")).ok();
     if changed {
         fs::copy(tmp.join("PKGBUILD"), &path).map_err(|e| e.to_string())?;
     }
     let _ = fs::remove_dir_all(&tmp);
-    let mut r = settle(root, &kind, name, &file)?;
+    let mut r = settle(root, &kind, name, &file, before)?;
     r["release"] = json!(tag);
     r["pkgbuild"] = json!(if changed { path.strip_prefix(root).unwrap_or(&path).display().to_string() } else { String::new() });
-    r["text"] = json!(format!("{} → repo/aarch64/{}/{}{}\n", tag, kind, file, if changed { " (PKGBUILD updated)" } else { "" }));
+    // settle の text (SONAME が変わったとき) はうしろに
+    let more = r["text"].as_str().unwrap_or("").to_string();
+    r["text"] = json!(format!("{} → repo/aarch64/{}/{}{}\n{}", tag, kind, file, if changed { " (PKGBUILD updated)" } else { "" }, more));
     Ok(r)
 }
 

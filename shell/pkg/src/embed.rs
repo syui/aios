@@ -72,6 +72,7 @@ fn key(file: &Path) -> String {
 
 /// パッケージについて覚えておくもの
 struct Cache {
+    root: PathBuf,
     file: PathBuf,
     old: Map<String, Value>,
     new: Map<String, Value>,
@@ -81,15 +82,33 @@ impl Cache {
     fn load(root: &Path) -> Cache {
         let file = root.join(CACHE);
         let old = fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default();
-        Cache { file, old, new: Map::new() }
+        Cache { root: root.to_path_buf(), file, old, new: Map::new() }
     }
 
-    /// 今回使ったものだけ書く (古いパッケージのものは消える)
+    /// 今回使ったものと、前のもののうちまだ repo/aarch64 にそのまま (同じ大きさと時刻で) あるものを書く
+    /// (作りなおしたものや外したものは消える)。前は今回使ったものだけを書いたので、1 つだけ見る embedders のあとは
+    /// 1 つしか残らず、次はみな読みなおした
     fn save(&self) {
-        if self.new != self.old {
-            let _ = fs::create_dir_all(self.file.parent().unwrap_or(Path::new(".")));
-            let _ = fs::write(&self.file, Value::Object(self.new.clone()).to_string());
+        let mut out = self.new.clone();
+        for (k, v) in &self.old {
+            if !out.contains_key(k) && self.current(k) {
+                out.insert(k.clone(), v.clone());
+            }
         }
+        if out != self.old {
+            // 書いてから入れかえる (pkg_build がいくつも同時に書いても、こわれたものを読まないように)
+            let _ = fs::create_dir_all(self.file.parent().unwrap_or(Path::new(".")));
+            let tmp = self.file.with_extension(format!("json.{}", std::process::id()));
+            if fs::write(&tmp, Value::Object(out).to_string()).is_ok() {
+                let _ = fs::rename(&tmp, &self.file);
+            }
+        }
+    }
+
+    /// k (名前|大きさ|時刻) のファイルが、いまも repo/aarch64 にそのままあるか
+    fn current(&self, k: &str) -> bool {
+        let name = k.split('|').next().unwrap_or("");
+        !name.is_empty() && crate::test::KINDS.iter().map(|kind| self.root.join("repo/aarch64").join(kind).join(name)).any(|p| p.is_file() && key(&p) == k)
     }
 
     fn get(&mut self, file: &Path) -> &mut Map<String, Value> {
@@ -127,6 +146,75 @@ impl Cache {
         }
         (e["a"] == true, e["so"] == true)
     }
+
+    /// パッケージのライブラリと使うライブラリ (elf::Dynamic)。中を広げて ELF を読むので、覚えておく
+    fn dynamic(&mut self, file: &Path) -> crate::elf::Dynamic {
+        let root = self.root.clone();
+        let e = self.get(file);
+        if !e.contains_key("needs")
+            && let Some(d) = unpack_dynamic(&root, file)
+        {
+            e.insert("sonames".into(), json!(d.sonames));
+            e.insert("provides".into(), json!(d.provides));
+            e.insert("needs".into(), json!(d.needs));
+        }
+        let list = |k: &str| e.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        crate::elf::Dynamic { sonames: list("sonames"), provides: list("provides"), needs: list("needs") }
+    }
+}
+
+/// パッケージを build/aish-pkg/elf.PID/ に広げて elf::dynamic (広げられなければ None。覚えない)
+fn unpack_dynamic(root: &Path, file: &Path) -> Option<crate::elf::Dynamic> {
+    let dir = root.join(format!("build/aish-pkg/elf.{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let d = (fs::create_dir_all(&dir).is_ok() && crate::test::untar(file, &dir).is_ok()).then(|| crate::elf::dynamic(&dir, &crate::test::files(file)));
+    let _ = fs::remove_dir_all(&dir);
+    d
+}
+
+/// パッケージ file のライブラリの名前 (elf::Dynamic の provides)。pkg_build が作る前に見ておく (前のものは mkpkg.sh が外す)
+pub fn provides(root: &Path, file: &Path) -> Vec<String> {
+    let mut cache = Cache::load(root);
+    let d = cache.dynamic(file);
+    cache.save();
+    d.provides
+}
+
+/// pkg_build / pkg_fetch のあと: 前のもの (その provides が before) にあって新しいもの new にないライブラリを、NEEDED に
+/// 書いたほかのパッケージ (作りなおすまで動かない)。{gone: {LIB: [NAME...]}, rebuild: [NAME...], sonames: [いまの SONAME]}。
+/// なくなったものを使うものがなければ None
+pub fn gone(root: &Path, name: &str, before: &[String], new: &Path) -> Option<Value> {
+    let mut cache = Cache::load(root);
+    let now = cache.dynamic(new);
+    let lost: Vec<&String> = before.iter().filter(|s| !now.provides.contains(s)).collect();
+    let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if !lost.is_empty() {
+        for (n, f) in crate::test::latest(root) {
+            if n == name {
+                continue;
+            }
+            let d = cache.dynamic(&f);
+            for l in &lost {
+                if d.needs.contains(l) {
+                    users.entry((*l).clone()).or_default().push(n.clone());
+                }
+            }
+        }
+    }
+    cache.save();
+    if users.is_empty() {
+        return None;
+    }
+    let rebuild: std::collections::BTreeSet<&String> = users.values().flatten().collect();
+    Some(json!({ "gone": users, "rebuild": rebuild, "sonames": now.sonames }))
+}
+
+/// repo/aarch64 のパッケージみなの elf::Dynamic (aish-pkg scan の needs)
+pub fn dynamics(root: &Path) -> Vec<(String, crate::elf::Dynamic)> {
+    let mut cache = Cache::load(root);
+    let v = crate::test::latest(root).into_iter().map(|(n, f)| (n, cache.dynamic(&f))).collect();
+    cache.save();
+    v
 }
 
 /// 古いライブラリが入ったままのパッケージ: NAME → [(ライブラリ, 作ったときの版 (わからなければ ""), いまの版)]

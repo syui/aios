@@ -70,6 +70,7 @@ version = "0.0.1"
 dependencies = [
  "aish-plugin",
  "libc",
+ "object",
  "regex",
  "serde_json",
  "sha2",

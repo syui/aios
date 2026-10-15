@@ -1,18 +1,22 @@
 // 作ったパッケージを確かめる (pkg_test)
 //   1. パッケージと、それが使うもの (.PKGINFO の depend をたどる) と musl を build/aish-pkg/test/NAME/ に広げる
-//   2. 中の ELF がみな aarch64 か
+//   2. 中の ELF がみな aarch64 か。PIC でないプログラムが COPY で写したライブラリのデータを、別のものなのに 1 つの場所に
+//      まとめていないか (copies。Zig の古い libc.so の見本でリンクしたものは stdin stdout stderr が 1 つ。elf.rs)
+//      NEEDED のライブラリが、パッケージと depends (と musl) の中にみなあるか (needs。なければ aios で動かない)
 //   3. .PKGINFO の版が PKGBUILD (pkgver-pkgrel) と同じか。repo/aarch64 のほかのパッケージとファイルがぶつかっていないか
 //   4. bin/ のプログラムを --version (なければ -version、-V、version、--help) で動かす (aarch64 の上ならそのまま、ほかでは qemu-aarch64 -L 広げたところ)。
 //      1 つでも動けばよい。出力に pkgver があるかも見る
 // 通ったら build/aish-pkg/test/FILE.ok を置く。pkg_push は、変わるもののうち .ok のないものがあると止まる
+// scan は、repo/aarch64 のパッケージみなを動かさずに確かめる (copies と、どのパッケージにもない NEEDED。aish-pkg scan [NAME...])
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const KINDS: [&str; 4] = ["rust", "c", "shell", "desktop"];
+pub const KINDS: [&str; 4] = ["rust", "c", "shell", "desktop"];
 
 /// 確かめた印
 pub fn stamp(root: &Path, file: &str) -> PathBuf {
@@ -36,7 +40,24 @@ pub fn find(root: &Path, name: &str) -> Option<PathBuf> {
     best.map(|b| b.1)
 }
 
-fn untar(file: &Path, dir: &Path) -> Result<(), String> {
+/// repo/aarch64 のパッケージみな (名前ごとにいちばん新しいもの。名前の順)
+pub fn latest(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut pkgs: Vec<(String, PathBuf)> = Vec::new();
+    for k in KINDS {
+        for e in fs::read_dir(root.join("repo/aarch64").join(k)).into_iter().flatten().flatten() {
+            let Some((n, _)) = crate::repo::parse(&e.file_name().to_string_lossy()) else { continue };
+            if !pkgs.iter().any(|(m, _)| *m == n)
+                && let Some(f) = find(root, &n)
+            {
+                pkgs.push((n, f));
+            }
+        }
+    }
+    pkgs.sort();
+    pkgs
+}
+
+pub fn untar(file: &Path, dir: &Path) -> Result<(), String> {
     let st = Command::new("tar").arg("-I").arg("zstd").arg("-xf").arg(file).arg("-C").arg(dir).arg("--exclude=.PKGINFO").arg("--exclude=.INSTALL").stdout(Stdio::null()).status().map_err(|e| e.to_string())?;
     if st.success() { Ok(()) } else { Err(format!("tar {}: {}", file.display(), st)) }
 }
@@ -47,6 +68,78 @@ fn pkginfo(file: &Path) -> String {
 
 fn field<'a>(info: &'a str, key: &str) -> Vec<&'a str> {
     info.lines().filter_map(|l| l.strip_prefix(&format!("{} = ", key))).collect()
+}
+
+/// 依存の書き方 (name>=1.0 など) から名前だけ
+fn dep(d: &str) -> String {
+    d.split(['<', '>', '=']).next().unwrap_or("").to_string()
+}
+
+/// パッケージ (file、.PKGINFO が info) と、depend をたどったものと musl を dir に広げる。広げた depend の名前
+fn unpack(root: &Path, name: &str, file: &Path, info: &str, dir: &Path) -> Result<Vec<String>, String> {
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    untar(file, dir)?;
+    let mut seen: Vec<String> = vec![name.to_string()];
+    let mut todo: Vec<String> = field(info, "depend").iter().map(|d| dep(d)).collect();
+    todo.push("musl".into());
+    let mut deps = Vec::new();
+    while let Some(d) = todo.pop() {
+        if d.is_empty() || seen.contains(&d) {
+            continue;
+        }
+        seen.push(d.clone());
+        if let Some(f) = find(root, &d) {
+            untar(&f, dir)?;
+            todo.extend(field(&pkginfo(&f), "depend").iter().map(|x| dep(x)));
+            deps.push(d);
+        }
+    }
+    // /lib は /usr/lib (base と同じ)
+    if !dir.join("lib").exists() {
+        let _ = std::os::unix::fs::symlink("usr/lib", dir.join("lib"));
+    }
+    Ok(deps)
+}
+
+/// パッケージのファイル (rels。広げたところ dir の下) の COPY: (ライブラリのデータを写すプログラムの数,
+/// 別のものなのに 1 つの場所にまとめたもの)
+fn copies(dir: &Path, rels: &[PathBuf]) -> (usize, Vec<Value>) {
+    let mut libs = crate::elf::Libs::new(vec![dir.to_path_buf()]);
+    let (mut n, mut bad) = (0, Vec::new());
+    for r in rels {
+        let p = dir.join(r);
+        // リンクはたどらない (/ で始まるリンク先はこのマシンのもの。リンク先がパッケージにあれば、そちらを見る)
+        if !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let Some(info) = crate::elf::read(&p).filter(|i| i.copies()) else { continue };
+        n += 1;
+        for s in libs.shared(&p, &info) {
+            bad.push(json!({ "bin": r.display().to_string(), "lib": s.lib, "names": s.sets, "text": crate::elf::describe(&s, 6) }));
+        }
+    }
+    (n, bad)
+}
+
+/// dir の下の *.so* の名前 (ファイルもリンクも。ディレクトリへのリンクはたどらない)
+fn so_names(dir: &Path, out: &mut BTreeSet<String>) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => so_names(&e.path(), out),
+            Ok(_) if n.contains(".so") => {
+                out.insert(n);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// パッケージの中のファイル (ディレクトリと .PKGINFO などをのぞく)
+pub fn files(file: &Path) -> Vec<PathBuf> {
+    let list = Command::new("tar").arg("-I").arg("zstd").arg("-tf").arg(file).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    list.lines().filter(|l| !l.ends_with('/') && !l.starts_with('.')).map(PathBuf::from).collect()
 }
 
 /// ELF なら (aarch64 か, 動かせるものか)
@@ -115,28 +208,7 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
     checks.push(json!({ "check": "version", "ok": same, "pkginfo": have, "pkgbuild": want }));
     // 広げる: パッケージ、depend をたどったもの、musl
     let dir = root.join("build/aish-pkg/test").join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    untar(&file, &dir)?;
-    let mut seen: Vec<String> = vec![name.to_string()];
-    let mut todo: Vec<String> = field(&info, "depend").iter().map(|d| d.split(['<', '>', '=']).next().unwrap_or("").to_string()).collect();
-    todo.push("musl".into());
-    let mut deps = Vec::new();
-    while let Some(d) = todo.pop() {
-        if d.is_empty() || seen.contains(&d) {
-            continue;
-        }
-        seen.push(d.clone());
-        if let Some(f) = find(root, &d) {
-            untar(&f, &dir)?;
-            todo.extend(field(&pkginfo(&f), "depend").iter().map(|x| x.split(['<', '>', '=']).next().unwrap_or("").to_string()));
-            deps.push(d);
-        }
-    }
-    // /lib は /usr/lib (base と同じ)
-    if !dir.join("lib").exists() {
-        let _ = std::os::unix::fs::symlink("usr/lib", dir.join("lib"));
-    }
+    let deps = unpack(root, name, &file, &info, &dir)?;
     // ELF: このパッケージのものがみな aarch64 か
     let mut mine = Vec::new();
     let pkgdir = root.join("build/aish-pkg/test").join(format!("{}.files", name));
@@ -148,12 +220,22 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
     let wrong: Vec<String> = elves.iter().filter(|e| !e.1).map(|e| e.0.strip_prefix(&pkgdir).unwrap_or(&e.0).display().to_string()).collect();
     ok &= wrong.is_empty();
     checks.push(json!({ "check": "aarch64", "ok": wrong.is_empty(), "elf": elves.len(), "wrong": wrong }));
+    // COPY: ライブラリの別のデータを 1 つの場所にまとめていないか (広げたほうで。ライブラリもそこにある)
+    let rels: Vec<PathBuf> = elves.iter().filter_map(|e| e.0.strip_prefix(&pkgdir).ok().map(Path::to_path_buf)).collect();
+    let (progs, shared) = copies(&dir, &rels);
+    ok &= shared.is_empty();
+    checks.push(json!({ "check": "copies", "ok": shared.is_empty(), "programs": progs, "shared": shared }));
+    // NEEDED: パッケージの中にないものが、広げた depends (と musl) にあるか (ld.so はファイルの名前で探す)
+    let needs = crate::elf::dynamic(&pkgdir, &files(&file)).needs;
+    let mut have = BTreeSet::new();
+    so_names(&dir, &mut have);
+    let missing: Vec<&String> = needs.iter().filter(|n| !have.contains(*n)).collect();
+    ok &= missing.is_empty();
+    checks.push(json!({ "check": "needs", "ok": missing.is_empty(), "needs": needs, "missing": missing }));
     // ほかのパッケージとファイルがぶつかっていないか (pango 1.58 が glib を抱えこんで glib2 とぶつかった)
     let mine_rel: std::collections::HashSet<String> = mine.iter().filter_map(|p| p.strip_prefix(&pkgdir).ok()).map(|p| p.display().to_string()).collect();
     let mut clashes: Vec<String> = Vec::new();
     let mine_info: &str = &info;
-    // 依存の書き方 (name>=1.0 など) から名前だけ
-    let dep = |d: &str| d.split(['<', '>', '=']).next().unwrap_or("").to_string();
     for k in KINDS {
         for e in fs::read_dir(root.join("repo/aarch64").join(k)).into_iter().flatten().flatten() {
             let f = e.file_name().to_string_lossy().into_owned();
@@ -255,6 +337,13 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
             Some("version") => format!(" {} (PKGBUILD {})", c["pkginfo"].as_str().unwrap_or(""), c["pkgbuild"].as_str().unwrap_or("")),
             Some("files") => c["with"].as_array().filter(|w| !w.is_empty()).map_or(" no clash with other packages".to_string(), |w| format!(" {} files also in other packages: {}", c["clashes"], w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))),
             Some("aarch64") => format!(" {} ELF{}", c["elf"], c["wrong"].as_array().filter(|w| !w.is_empty()).map_or(String::new(), |w| format!(", not aarch64: {}", w.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")))),
+            Some("copies") => describe_copies(c),
+            Some("needs") => match (c["missing"].as_array().filter(|m| !m.is_empty()), c["needs"].as_array().map_or(0, Vec::len)) {
+                (Some(m), _) => format!(" not in the package or its depends: {} (add the package that has it to depends)", m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")),
+                (None, 0) => " uses no library from another package".to_string(),
+                (None, 1) => " 1 library from another package, in the depends".to_string(),
+                (None, n) => format!(" {} libraries from other packages, all in the depends", n),
+            },
             Some("run") => c["note"].as_str().map(|n| format!(" ({})", n)).unwrap_or_else(|| {
                 c["bins"].as_array().map_or(String::new(), |bs| bs.iter().map(|b| format!("\n       {} → {} {}{}", b["bin"].as_str().unwrap_or(""), b["status"], b["out"].as_str().unwrap_or(""), b["note"].as_str().map_or(String::new(), |n| format!(" ({})", n)))).collect())
             }),
@@ -263,4 +352,66 @@ pub fn test(root: &Path, name: &str) -> Result<Value, String> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(json!({ "name": name, "file": fname, "ok": ok, "deps": deps, "checks": checks, "text": format!("{}\n{}\n", fname, text) }))
+}
+
+/// copies の行 (まとめたものがあれば、プログラムごとに 1 行)
+fn describe_copies(c: &Value) -> String {
+    match c["shared"].as_array().filter(|s| !s.is_empty()) {
+        None => match c["programs"].as_u64().unwrap_or(0) {
+            0 => " no program copies library data".to_string(),
+            1 => " 1 program copies library data: each object has its own place".to_string(),
+            n => format!(" {} programs copy library data: each object has its own place", n),
+        },
+        Some(s) => format!(
+            " separate library data copied to one place (linked with Zig's libc.so stub before zig.sh fixed it? rebuild){}",
+            s.iter().map(|x| format!("\n       {}: {}", x["bin"].as_str().unwrap_or(""), x["text"].as_str().unwrap_or(""))).collect::<String>()
+        ),
+    }
+}
+
+/// repo/aarch64 のパッケージ (names がなければみな) を、動かさずに確かめる:
+///   copies: 1 つずつ depend と musl といっしょに build/aish-pkg/scan/ に広げて
+///   needs: NEEDED のうち、どのパッケージにもないもの (ld.so はファイルの名前で探す。中身は embed.json に覚えておく)
+pub fn scan(root: &Path, names: &[String]) -> Value {
+    let all = latest(root);
+    let pkgs: Vec<&(String, PathBuf)> = all.iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
+    let dir = root.join("build/aish-pkg/scan");
+    let (mut text, mut affected, mut programs) = (String::new(), Vec::new(), 0);
+    for (n, f) in &pkgs {
+        let fname = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if let Err(e) = unpack(root, n, f, &pkginfo(f), &dir) {
+            text.push_str(&format!("{}: {}\n", fname, e));
+            continue;
+        }
+        let (p, shared) = copies(&dir, &files(f));
+        programs += p;
+        if !shared.is_empty() {
+            text.push_str(&format!("{}\n", fname));
+            for s in &shared {
+                text.push_str(&format!("  {}: {}\n", s["bin"].as_str().unwrap_or(""), s["text"].as_str().unwrap_or("")));
+            }
+            affected.push(json!({ "name": n, "file": fname, "shared": shared }));
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    let dy = crate::embed::dynamics(root);
+    let have: BTreeSet<&String> = dy.iter().flat_map(|(_, d)| d.provides.iter()).collect();
+    let mut unresolved = Vec::new();
+    for (n, d) in dy.iter().filter(|(n, _)| names.is_empty() || names.contains(n)) {
+        let miss: Vec<&str> = d.needs.iter().filter(|x| !have.contains(x)).map(String::as_str).collect();
+        if !miss.is_empty() {
+            text.push_str(&format!("{}: needs {}, which no package has\n", n, miss.join(" ")));
+            unresolved.push(json!({ "name": n, "missing": miss }));
+        }
+    }
+    let bad: Vec<&str> = affected.iter().filter_map(|a| a["name"].as_str()).collect();
+    text.push_str(&format!(
+        "{} packages: {} programs copy library data; {} packages copy separate data to one place{}; {} packages need a library no package has\n",
+        pkgs.len(),
+        programs,
+        bad.len(),
+        if bad.is_empty() { String::new() } else { format!(" (rebuild: {})", bad.join(" ")) },
+        unresolved.len()
+    ));
+    json!({ "text": text, "packages": pkgs.len(), "programs": programs, "affected": affected, "unresolved": unresolved })
 }

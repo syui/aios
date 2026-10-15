@@ -5,13 +5,15 @@
 //   pkg_edit   PKGBUILD (pkgver、pkgrel、sha256sums) と .aios.json を、配布元の最新か ver に書きかえる。
 //              rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild を作りなおすとき)
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
-//   pkg_test   作ったものを確かめる (ELF が aarch64 か、版、bin/ を qemu か aarch64 で --version)
+//   pkg_test   作ったものを確かめる (ELF が aarch64 か、COPY のデータの重なり、NEEDED、版、bin/ を qemu か aarch64 で --version)
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // edit と build と push は長いので、うしろで動かす (自分を aish-pkg edit / build / push で起こす)。もういちど呼ぶと様子か結果
 // コマンドとしても動く (大きな tarball の edit は時間がかかるので、run の bg で):
 //   aish-pkg check [NAME...] [--all] [--refresh]   aish-pkg edit NAME [VER] [--rebuild]   aish-pkg build NAME   aish-pkg test NAME   aish-pkg push [--force]
+//   aish-pkg scan [NAME...]   repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies で (古い Zig で作ったものを探す)
 // リポジトリは dir か、いまのディレクトリから上にたどって pkg/ があるところ、なければ $AIOS_SRC か /usr/src/aios
+mod elf;
 mod embed;
 mod repo;
 mod test;
@@ -29,7 +31,7 @@ const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","de
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push")) {
+    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push" | "scan")) {
         std::process::exit(cli(&args));
     }
     let spec = Spec {
@@ -38,9 +40,9 @@ fn main() {
         keys: &[("M-p", "check")],
         tools: &[
             Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) のパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push", input: CHECK },
-            Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める)。このライブラリを中に入れているパッケージは rebuild に", input: BUILD },
+            Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
-            Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
+            Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。うしろで動くので、終わっていなければ running (大きな tarball や遅い配布元でも。もういちど呼ぶと続きを待つ)", input: EDIT },
         ],
@@ -104,41 +106,92 @@ fn main() {
     });
 }
 
-/// うしろで動いているもの (自分を aish-pkg build / push で起こしたもの)。出力は build/aish-pkg/KEY.log
+/// うしろで動いているもの (自分を aish-pkg build / push で起こしたもの)。出力は build/aish-pkg/KEY.log、pid は KEY.pid。
+/// aish やこのプラグインが入れかわっても (aish-mcp.sh --build のたびに入れかわる)、次に呼ばれたときに KEY.pid から
+/// 引きついで続きを待つ (前は忘れてしまい、もういちど呼ぶと同じビルドをもう 1 つ起こした)
 struct Job {
-    child: std::process::Child,
+    /// 自分で起こした子。入れかわる前に起こしたもの (pid だけわかる) は None
+    child: Option<std::process::Child>,
+    pid: i32,
     log: PathBuf,
     t0: Instant,
+}
+
+impl Job {
+    /// 終わったら Some(終わりの番号。引きついだものは None (わからない))
+    fn done(&mut self) -> Option<Option<std::process::ExitStatus>> {
+        match &mut self.child {
+            Some(c) => match c.try_wait() {
+                Ok(None) => None,
+                Ok(st) => Some(st),
+                Err(_) => Some(None),
+            },
+            None => (!alive(self.pid)).then_some(None),
+        }
+    }
+}
+
+/// pid が動いているか (終わって親に拾われていないもの (ゾンビ) は、終わったとみる)
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid)).is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')))
+}
+
+/// 前のプラグインが起こした key のもの。動いていれば、同じ引数の aish-pkg のときだけ (pid が別のものに使われていないか)。
+/// 終わっていても KEY.pid が残っていれば、答えをまだ渡していないので引きつぐ (答えは log の終わりの JSON)
+fn adopt(dir: &Path, key: &str, argv: &[&str]) -> Option<Job> {
+    let pidf = dir.join(format!("{}.pid", key));
+    let pid: i32 = std::fs::read_to_string(&pidf).ok()?.trim().parse().ok().filter(|p| *p > 1)?;
+    if alive(pid) {
+        let cmd = std::fs::read(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
+        let mut words = cmd.split(|&b| b == 0).map(|w| String::from_utf8_lossy(w).into_owned());
+        let same = words.next().is_some_and(|exe| exe.ends_with("aish-pkg")) && words.take(argv.len()).eq(argv.iter().map(|s| s.to_string()));
+        if !same {
+            let _ = std::fs::remove_file(&pidf);
+            return None;
+        }
+    }
+    let started = std::fs::metadata(&pidf).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    let t0 = started.and_then(|e| Instant::now().checked_sub(e)).unwrap_or_else(Instant::now);
+    Some(Job { child: None, pid, log: dir.join(format!("{}.log", key)), t0 })
 }
 
 /// key のものがなければ起こし、wait_ms まで待つ。終わったら最後の行の JSON (と log の終わり)。
 /// stop なら、動いているものをグループごと (mkpkg.sh や make や zig まで) 止める
 fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a: &Value) -> Value {
+    let dir = root.join("build/aish-pkg");
+    let pidf = dir.join(format!("{}.pid", key));
+    if !jobs.contains_key(key)
+        && let Some(j) = adopt(&dir, key, argv)
+    {
+        jobs.insert(key.to_string(), j);
+    }
     if a["stop"] == true {
         let Some(mut j) = jobs.remove(key) else { return error(format!("{}: not running", key)) };
+        let _ = std::fs::remove_file(&pidf);
         // グループ (spawn の process_group(0) で、番号は子の pid) に送る。kill のコマンドは使わない:
         // procps の kill は -PID を -- なしではシグナルと読み、何も止めずに 0 で終わる (wait がいつまでも返らなかった)。
-        // 0 や 1 (自分のグループやみんな) にはぜったい送らない
-        let pid = j.child.id() as i32;
-        if pid > 1 {
+        // 0 や 1 (自分のグループやみんな) にはぜったい送らない。終わったもの (pid がもう別のものかもしれない) にも送らない
+        let pid = j.pid;
+        if pid > 1 && j.done().is_none() {
             unsafe { libc::kill(-pid, libc::SIGTERM) };
             let t = Instant::now();
-            while matches!(j.child.try_wait(), Ok(None)) && t.elapsed() < Duration::from_secs(5) {
+            while j.done().is_none() && t.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if matches!(j.child.try_wait(), Ok(None)) {
+            if j.done().is_none() {
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
         }
         // グループがなくても (前の aish-pkg が起こしたものなど)、子は止めて wait が返るように
-        if matches!(j.child.try_wait(), Ok(None)) {
-            let _ = j.child.kill();
+        if let Some(c) = &mut j.child {
+            if matches!(c.try_wait(), Ok(None)) {
+                let _ = c.kill();
+            }
+            let _ = c.wait();
         }
-        let _ = j.child.wait();
         return json!({ "stopped": key, "ms": j.t0.elapsed().as_millis() as u64, "log": j.log.display().to_string() });
     }
     if !jobs.contains_key(key) {
-        let dir = root.join("build/aish-pkg");
         let _ = std::fs::create_dir_all(&dir);
         let log = dir.join(format!("{}.log", key));
         let (Ok(out), Ok(exe)) = (std::fs::File::create(&log), std::env::current_exe()) else { return error(format!("{}: cannot start", log.display())) };
@@ -150,7 +203,11 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
         use std::os::unix::process::CommandExt;
         let child = std::process::Command::new(exe).args(argv).current_dir(root).env("AIOS_SRC", root).stdin(std::process::Stdio::null()).stdout(out).stderr(err).process_group(0).spawn();
         match child {
-            Ok(c) => jobs.insert(key.to_string(), Job { child: c, log, t0: Instant::now() }),
+            Ok(c) => {
+                let pid = c.id() as i32;
+                let _ = std::fs::write(&pidf, format!("{}\n", pid));
+                jobs.insert(key.to_string(), Job { child: Some(c), pid, log, t0: Instant::now() })
+            }
             Err(e) => return error(e),
         };
     }
@@ -158,25 +215,34 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, argv: &[&str], a
     let end = Instant::now() + wait;
     let j = jobs.get_mut(key).unwrap();
     let status = loop {
-        match j.child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(200)),
-            _ => break None,
+        match j.done() {
+            Some(st) => break Some(st),
+            None if Instant::now() < end => std::thread::sleep(Duration::from_millis(200)),
+            None => break None,
         }
     };
     let text = std::fs::read_to_string(&j.log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(15)..].join("\n");
     let ms = j.t0.elapsed().as_millis() as u64;
+    let adopted = j.child.is_none();
     let Some(st) = status else {
-        return json!({ "running": true, "ms": ms, "log": tail, "hint": "call again to wait more" });
+        let mut r = json!({ "running": true, "ms": ms, "log": tail, "hint": "call again to wait more" });
+        if adopted {
+            r["adopted"] = json!(format!("started before aish-pkg was restarted (pid {})", j.pid));
+        }
+        return r;
     };
     let log = j.log.display().to_string();
     jobs.remove(key);
+    let _ = std::fs::remove_file(&pidf);
     // 最後の JSON の行が答え
     let mut r = lines.iter().rev().find_map(|l| aish_plugin::parse(l)).unwrap_or_else(|| json!({}));
-    if !st.success() && r.get("error").is_none() {
-        r["error"] = json!(format!("exit {}", st));
+    match st {
+        Some(st) if !st.success() && r.get("error").is_none() => r["error"] = json!(format!("exit {}", st)),
+        // 引きついだもの: 終わりの番号はわからないので、答えの行がなければしくじったとみる
+        None if r.as_object().is_none_or(|o| o.is_empty()) => r["error"] = json!("ended without an answer (stopped, or the machine restarted)"),
+        _ => {}
     }
     r["ms"] = json!(ms);
     r["log"] = json!(log);
@@ -273,6 +339,11 @@ fn cli(args: &[String]) -> i32 {
             None => error("aish-pkg test NAME"),
         },
         "push" => repo::push(&root, args.iter().any(|a| a == "--force")).unwrap_or_else(error),
+        "scan" => {
+            let r = test::scan(&root, &rest);
+            print!("{}", r["text"].as_str().unwrap_or(""));
+            return if r["affected"].as_array().is_some_and(|a| !a.is_empty()) { 1 } else { 0 };
+        }
         _ => match rest.first() {
             Some(n) if args.iter().any(|a| a == "--rebuild") => up::bump_rel(&root, n).unwrap_or_else(error),
             Some(n) => up::edit(&root, n, rest.get(1).map(String::as_str)).unwrap_or_else(error),
@@ -310,4 +381,39 @@ fn key(root: &Path) -> Value {
     let _ = tty.key();
     tty.write(&format!("\r\x1b[{}A\x1b[J", lines.len()));
     json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adopt_only_our_jobs() {
+        let dir = std::env::temp_dir().join(format!("aish-pkg-adopt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 動いているが aish-pkg build x ではないもの (このテスト): 引きつがず、KEY.pid を消す
+        std::fs::write(dir.join("build-x.pid"), format!("{}\n", std::process::id())).unwrap();
+        assert!(adopt(&dir, "build-x", &["build", "x"]).is_none());
+        assert!(!dir.join("build-x.pid").exists());
+        // 終わったもの: 答え (log の終わりの JSON) を渡すために引きつぐ
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id() as i32;
+        c.wait().unwrap();
+        std::fs::write(dir.join("build-y.pid"), format!("{}\n", pid)).unwrap();
+        let mut j = adopt(&dir, "build-y", &["build", "y"]).unwrap();
+        assert!(j.child.is_none() && j.pid == pid);
+        assert_eq!(j.done(), Some(None));
+        // pid のないもの
+        assert!(adopt(&dir, "build-z", &["build", "z"]).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alive_or_not() {
+        assert!(alive(std::process::id() as i32));
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id() as i32;
+        c.wait().unwrap();
+        assert!(!alive(pid));
+    }
 }
