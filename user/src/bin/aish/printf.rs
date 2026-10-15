@@ -352,7 +352,9 @@ fn strftime(fmt: &str, t: i64) -> String {
     let fmt = if fmt.is_empty() { "%X" } else { fmt };
     let Ok(cf) = CString::new(fmt) else { return String::new() };
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let tt = t as libc::time_t;
+    // libc::time_t の名前は musl のものが deprecated (32 ビットのものが 64 ビットになる知らせ。libc #1848) で、ビルドの
+    // たびに警告が出るので、型は localtime_r にきめてもらう (aarch64 ではどちらも i64)
+    let tt = t as _;
     unsafe { libc::localtime_r(&tt, &mut tm) };
     let mut buf = vec![0u8; 256 + fmt.len() * 8];
     let n = unsafe { libc::strftime(buf.as_mut_ptr() as *mut libc::c_char, buf.len(), cf.as_ptr(), &tm) };
