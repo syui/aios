@@ -291,6 +291,12 @@ impl Plugins {
         self.list.iter().filter(|p| p.alive).flat_map(|p| p.tools.iter().map(move |t| (p.name.clone(), t.clone()))).collect()
     }
 
+    /// fork した子 (aish --mcp の run bg) で: プラグインとの口を閉じて忘れる (プラグインは止めない。親が使う)
+    pub fn forget(&mut self) {
+        self.list.clear();
+        self.binds.clear();
+    }
+
     /// プラグインのプロセス (aish --mcp が時間切れで子を止めるとき、これは残す)
     pub fn pids(&self) -> Vec<i32> {
         self.list.iter().filter(|p| p.alive).map(|p| p.child.id() as i32).collect()

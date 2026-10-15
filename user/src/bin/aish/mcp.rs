@@ -30,6 +30,34 @@ pub fn stopped() -> bool {
 /// 既定の時間切れ (ms)
 /// (Claude Code は MCP のツールの答えを 60 秒しか待たない。それより前に止めて、bg を使うように言う)
 const TIMEOUT_MS: u64 = 50_000;
+/// timeout_ms はこれまで (AISH_MCP_MAX_MS で変えられる)。Claude Code が 60 秒であきらめたあとも run が続くと、
+/// あとから来た要求もみな待たされて時間切れになる (120000 を渡した find / で、3 つ続けて答えられなかった)。
+/// 止めてから答えるまでにも数秒かかることがある (ディスクを読んでいる find は SIGKILL ですぐには終わらない) ので、
+/// 60 秒より 10 秒前に
+const MAX_RUN_MS: u64 = 50_000;
+
+/// プロトコルの fd (読む, 書く) と、もとの標準エラー。run のあいだは 2 が memfd なので、知らせ (パニックや
+/// 終わるわけ) はこちらに書く。fork した bg の子は、プロトコルの fd を閉じる (子が持っていると、サーバーが
+/// 終わってもつなぎ先は閉じたと気づかず、どのツールも 60 秒待って時間切れになった)
+static PROTO: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
+static ERR_FD: AtomicI32 = AtomicI32::new(2);
+
+/// サーバーの知らせ: もとの標準エラー (loud なら) と ~/.cache/aish/mcp.log に 1 行
+fn note(msg: &str, loud: bool) {
+    let line = format!("aish --mcp (pid {}): {}\n", unsafe { libc::getpid() }, msg);
+    if loud {
+        let fd = ERR_FD.load(Ordering::Relaxed);
+        unsafe { libc::write(fd, line.as_ptr() as *const _, line.len()) };
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = std::path::Path::new(&home).join(".cache/aish");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("mcp.log")) {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let _ = write!(f, "{} {}", t, line);
+        }
+    }
+}
 /// 出力をそのまま返す長さ。これより長ければ頭と終わりだけ (行の切れ目で)。切ったものはメモリーに残して out で読む
 const MAX_OUT: usize = 12_000;
 /// 切った出力を残しておく数 (古いものから捨てる)
@@ -52,7 +80,7 @@ const PROTOCOL: &str = "2025-06-18";
 
 const RUN_INPUT: &str = r#"{"type":"object","properties":{
 "cmd":{"type":"string","description":"動かすシェルの行 (いくつもの行、パイプ、ヒアドキュメントもよい)"},
-"timeout_ms":{"type":"integer","description":"これを過ぎたら子を止める (既定 50000。長くかかるものは bg で)"},
+"timeout_ms":{"type":"integer","description":"これを過ぎたら子を止める (既定 50000。これより長くはできない: Claude Code はツールを 60 秒しか待たない。長くかかるものは bg で)"},
 "stdin":{"type":"string","description":"標準入力に渡すもの (なければ /dev/null)"},
 "bg":{"type":"boolean","description":"うしろで動かしてすぐ答える ({job, pid})。出力と終わりは job で見る (重いビルドなどのあいだも、ほかのツールを使える)"}},
 "required":["cmd"]}"#;
@@ -114,12 +142,26 @@ impl Shell {
         let (inp, out) = unsafe {
             let inp = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 10);
             let out = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 10);
+            let err = libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 10);
             let null = libc::open(cstr("/dev/null").as_ptr(), libc::O_RDWR);
             libc::dup2(null, 0);
             libc::close(null);
             libc::dup2(2, 1);
+            PROTO[0].store(inp, Ordering::Relaxed);
+            PROTO[1].store(out, Ordering::Relaxed);
+            if err >= 0 {
+                ERR_FD.store(err, Ordering::Relaxed);
+            }
             (std::fs::File::from_raw_fd(inp), std::fs::File::from_raw_fd(out))
         };
+        // release は panic = "abort" なので、どのスレッドのパニックでもサーバーは終わる。run のあいだは標準エラーが
+        // memfd なので、ふつうの知らせは誰にも見えない。もとの標準エラーとログに書いてから終わる
+        let me = unsafe { libc::getpid() };
+        std::panic::set_hook(Box::new(move |info| {
+            if unsafe { libc::getpid() } == me {
+                note(&format!("panic: {}", info), true);
+            }
+        }));
         let home = self.get_var("HOME").unwrap_or_default();
         let file = self.get_var("HISTFILE").unwrap_or_else(|| format!("{}/.aish_history", home));
         self.histfile = (!home.is_empty() || file.starts_with('/')).then_some(file);
@@ -165,10 +207,18 @@ impl Shell {
             let line = match queue.pop_front() {
                 Some(l) => l,
                 None => {
-                    let mut l = String::new();
-                    match reader.read_line(&mut l) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => l,
+                    // バイトで読む (UTF-8 でない行も parse error で答えて続ける。read_line は Err にして、終わっていた)
+                    let mut b = Vec::new();
+                    match reader.read_until(b'\n', &mut b) {
+                        Ok(0) => {
+                            note("the client closed the connection; exiting", false);
+                            break;
+                        }
+                        Err(e) => {
+                            note(&format!("reading the connection failed ({}); exiting", e), true);
+                            break;
+                        }
+                        Ok(_) => String::from_utf8_lossy(&b).into_owned(),
                     }
                 }
             };
@@ -415,7 +465,9 @@ impl Shell {
     /// run: 同じシェルで動かし、標準出力と標準エラーを分けて受ける
     fn mcp_run(&mut self, args: &Value) -> Value {
         let cmd = args["cmd"].as_str().unwrap_or("");
-        let timeout = args["timeout_ms"].as_u64().unwrap_or(TIMEOUT_MS);
+        let max = std::env::var("AISH_MCP_MAX_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_RUN_MS);
+        let asked = args["timeout_ms"].as_u64().unwrap_or(TIMEOUT_MS);
+        let timeout = asked.min(max);
         flush();
         let (o, e) = (memfd("aish-out"), memfd("aish-err"));
         let input = args["stdin"].as_str().map(|s| {
@@ -503,7 +555,11 @@ impl Shell {
             status = 124;
             r["status"] = json!(status);
             r["timeout"] = json!(true);
-            r["hint"] = json!("took too long: run it again with bg: true, and see it with job");
+            r["hint"] = json!(if asked > max {
+                format!("took too long (timeout_ms is at most {}: Claude Code waits 60 s for a tool): run it again with bg: true, and see it with job", max)
+            } else {
+                "took too long: run it again with bg: true, and see it with job".into()
+            });
         }
         // 砂場 (aibox) の中で書けなかった: どこなら書けるかを教える (ファイルの持ち主のせいと分けられるように)
         if status != 0
@@ -532,7 +588,16 @@ impl Shell {
                 libc::setpgid(0, 0);
                 libc::dup2(o, 1);
                 libc::dup2(e, 2);
+                // プロトコルの口ともとの標準エラーは親のもの (子が持ったままだと、サーバーが終わってもつなぎ先が気づかない)
+                for f in PROTO.iter().chain([&ERR_FD]) {
+                    let fd = f.swap(-1, Ordering::Relaxed);
+                    if fd > 2 {
+                        libc::close(fd);
+                    }
+                }
             }
+            // プラグインとの口も (子が持っていると、サーバーが終わってもプラグインが終わらずに残った)
+            self.plugins.forget();
             let st = self.run_source(cmd, "run");
             super::exit_shell(st);
         }

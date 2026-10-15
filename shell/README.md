@@ -78,7 +78,8 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 
 - `run {cmd, bg: true}` はうしろで動かしてすぐ `{job, pid}` を答える (シェルを fork した子なので、`cd` などはその中だけ)。
   `job {id, wait_ms?, kill?}` で様子と出力 (`{done, status, out, err, ms}`。id がなければ一覧)。重いビルドのあいだも
-  ほかのツールが使える
+  ほかのツールが使える。子はプロトコルとプラグインとの口を閉じる (持ったままだと、サーバーが終わってもつなぎ先は
+  閉じたと気づかずに、どのツールも 60 秒待って時間切れになり、プラグインも残った)
 - 答えの `content` の text は読みやすい形: `out` と `text` (read、hit) はエスケープせずにそのまま、`err` は `[err]` のあと、
   grep はファイルごとに、パスの行のあとに 1 行に 1 つ (`n line: text`)、ほかは終わりに 1 行の JSON (なにもなければ出さない)。`aish --mcp --json` なら、いままでどおり
   JSON の text と `structuredContent` (ほかのプログラムがつなぐとき。Claude Code は structuredContent があると
@@ -88,7 +89,11 @@ claude mcp add aish -- aish --mcp     # Claude Code から
   探したり読んだりできる (メモリーに最近の 8 つだけ。ディスクには書かない)
 - `run {cmd, timeout_ms?, stdin?}` → `{status, out, err, ms, pwd}`。いつも同じシェルで動くので、
   `cd` や変数、関数は次の `run` に残る。時間切れ (既定 50 秒。Claude Code はツールの答えを 60 秒しか待たないので、長いものは `bg` で) なら子と孫を止めて `status: 124, timeout: true`。
-  `exit` はその `run` だけを終える
+  `timeout_ms` も 50 秒より長くはできない (`AISH_MCP_MAX_MS` で変えられる。客があきらめたあとも run が続くと、あとの要求も
+  みな待たされて時間切れになる)。`exit` はその `run` だけを終える
+- サーバーが終わるわけ (つなぎ先が閉じた、読めなかった) とパニックは `~/.cache/aish/mcp.log` に (パニックと読めなかったときは、
+  もとの標準エラーにも。run のあいだは標準エラーが memfd なので、ふつうの知らせは見えない。release は panic = "abort")。
+  UTF-8 でない行は parse error と答えて続ける
 - aish かプラグインをビルドしなおすと、次にツールを使ったときに、aish が同じつながりのまま新しいビルドに入れかわる
   (自分を exec しなおし、`notifications/tools/list_changed` を送る。`/mcp` でつなぎなおさなくてよい)。いまのディレクトリは残り、
   シェルの変数は空に戻る (答えに `reloaded`)。ビルドの途中 (cargo が動いている)、うしろのジョブが動いているときは待つ
