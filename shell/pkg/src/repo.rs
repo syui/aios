@@ -227,6 +227,9 @@ pub fn push(root: &Path, force: bool) -> Result<Value, String> {
     if !local.is_dir() {
         return Err("repo/aarch64: nothing built yet (pkg_build)".into());
     }
+    // bin/publish.sh も aish-pkg push で送るので、同じ錠で 1 つずつ (いっしょに ai/repo の写しを書きかえないように。
+    // 送っているあいだは pkg_build の置くところも待たせる)
+    let _lock = lock(root)?;
     let cache = sync_cache(root)?;
     let (theirs, ours) = (packages(&cache.join("aarch64")), packages(&local));
     let mut changes = Vec::new();

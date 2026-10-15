@@ -6,6 +6,7 @@
 //              rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild を作りなおすとき)
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
 //   pkg_test   作ったものを確かめる (ELF が aarch64 か、COPY のデータの重なり、NEEDED、版、bin/ を qemu か aarch64 で --version)
+//   pkg_scan   repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies と needs で
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // edit と build と push は長いので、うしろで動かす (自分を aish-pkg edit / build / push で起こす)。もういちど呼ぶと様子か結果
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const PUSH: &str = r#"{"type":"object","properties":{"force":{"type":"boolean","description":"ai/repo のほうが新しいもの (ほかで送ったもの) を消す・下げることになっても送る"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
+const SCAN: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ repo/aarch64 のみな)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
 const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"ver":{"type":"string","description":"版 (なければ配布元の最新)"},"rebuild":{"type":"boolean","description":"版はそのまま pkgrel を 1 つ上げるだけ (pkg_check の rebuild: 中に入れたライブラリが新しくなったとき。同じ版では pkg_push も ap -Syu も変わったと見ない)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
 
 fn main() {
@@ -43,6 +45,7 @@ fn main() {
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
+            Tool { name: "pkg_scan", desc: "repo/aarch64 のパッケージみな (names があればそれだけ) を、動かさずに pkg_test の copies と needs で確かめる: COPY で写したライブラリのデータが 1 つの場所に重なったプログラム (古い Zig の libc.so でリンクしたもの。affected を rebuild に) と、depends にない NEEDED (unresolved。それのあるパッケージも)。Zig を上げたときなどに。うしろで動く (みなで 1 分ほど)", input: SCAN },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。うしろで動くので、終わっていなければ running (大きな tarball や遅い配布元でも。もういちど呼ぶと続きを待つ)", input: EDIT },
         ],
@@ -93,6 +96,11 @@ fn main() {
                         return error("give name");
                     }
                     job(&mut jobs, &root, &format!("test-{}", n), &["test", n], a)
+                }
+                "pkg_scan" => {
+                    let names: Vec<&str> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str()).filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('-')).collect()).unwrap_or_default();
+                    let argv: Vec<&str> = std::iter::once("scan").chain(names).collect();
+                    job(&mut jobs, &root, "scan", &argv, a)
                 }
                 "pkg_push" => {
                     let argv: &[&str] = if a["force"] == true { &["push", "--force"] } else { &["push"] };
@@ -350,10 +358,12 @@ fn cli(args: &[String]) -> i32 {
         },
         "push" => repo::push(&root, args.iter().any(|a| a == "--force")).unwrap_or_else(error),
         "scan" => {
+            // 人には文を (標準エラーに)、pkg_scan には最後の行の JSON を。見つけたものは JSON の affected と unresolved に
+            // (終わりの番号を 0 でなくすると、pkg_scan がしくじったと読む)
             let r = test::scan(&root, &rest);
-            print!("{}", r["text"].as_str().unwrap_or(""));
-            let bad = |k: &str| r[k].as_array().is_some_and(|a| !a.is_empty());
-            return if bad("affected") || bad("unresolved") { 1 } else { 0 };
+            eprint!("{}", r["text"].as_str().unwrap_or(""));
+            println!("{}", r);
+            return 0;
         }
         _ => match rest.first() {
             Some(n) if args.iter().any(|a| a == "--rebuild") => up::bump_rel(&root, n).unwrap_or_else(error),
