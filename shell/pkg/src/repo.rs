@@ -127,8 +127,12 @@ fn settle(root: &Path, kind: &str, name: &str, file: &str) -> Result<Value, Stri
 /// GitHub の aios (CI が重いパッケージを作って置くところ。.github/workflows/pkg.yml)
 const RELEASES: &str = "https://api.github.com/repos/syui/aios/releases?per_page=100";
 
+/// 取ってくる (止まったまま何も来なければ 60 秒で切り、続きから 10 回まで取りなおす。out は毎回あたらしいところ)
 fn curl(url: &str, out: &Path) -> Result<(), String> {
-    sh(Command::new("curl").args(["-fsSL", "--retry", "3", "-o"]).arg(out).arg(url))
+    sh(Command::new("curl")
+        .args(["-fsSL", "--connect-timeout", "30", "--speed-limit", "1000", "--speed-time", "60", "--retry", "10", "--retry-delay", "5", "--retry-all-errors", "-C", "-", "-o"])
+        .arg(out)
+        .arg(url))
 }
 
 /// fetch NAME: CI が作ったリリース NAME-VER-REL のいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、

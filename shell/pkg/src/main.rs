@@ -8,7 +8,7 @@
 //   pkg_test   作ったものを確かめる (ELF が aarch64 か、版、bin/ を qemu か aarch64 で --version)
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
-// build と push は長いので、うしろで動かす (自分を aish-pkg build / push で起こす)。もういちど呼ぶと様子か結果
+// edit と build と push は長いので、うしろで動かす (自分を aish-pkg edit / build / push で起こす)。もういちど呼ぶと様子か結果
 // コマンドとしても動く (大きな tarball の edit は時間がかかるので、run の bg で):
 //   aish-pkg check [NAME...] [--all] [--refresh]   aish-pkg edit NAME [VER] [--rebuild]   aish-pkg build NAME   aish-pkg test NAME   aish-pkg push [--force]
 // リポジトリは dir か、いまのディレクトリから上にたどって pkg/ があるところ、なければ $AIOS_SRC か /usr/src/aios
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const PUSH: &str = r#"{"type":"object","properties":{"force":{"type":"boolean","description":"ai/repo のほうが新しいもの (ほかで送ったもの) を消す・下げることになっても送る"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
-const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"ver":{"type":"string","description":"版 (なければ配布元の最新)"},"rebuild":{"type":"boolean","description":"版はそのまま pkgrel を 1 つ上げるだけ (pkg_check の rebuild: 中に入れたライブラリが新しくなったとき。同じ版では pkg_push も ap -Syu も変わったと見ない)"},"dir":{"type":"string"}},"required":["name"]}"#;
+const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"ver":{"type":"string","description":"版 (なければ配布元の最新)"},"rebuild":{"type":"boolean","description":"版はそのまま pkgrel を 1 つ上げるだけ (pkg_check の rebuild: 中に入れたライブラリが新しくなったとき。同じ版では pkg_push も ap -Syu も変わったと見ない)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -42,7 +42,7 @@ fn main() {
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
-            Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。大きな tarball は時間がかかるので run の bg で aish-pkg edit NAME", input: EDIT },
+            Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。うしろで動くので、終わっていなければ running (大きな tarball や遅い配布元でも。もういちど呼ぶと続きを待つ)", input: EDIT },
         ],
     };
     let mut jobs: HashMap<String, Job> = HashMap::new();
@@ -55,10 +55,22 @@ fn main() {
                     let names: Vec<String> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
                     check(&root, &names, a["all"] == true, a["refresh"] == true)
                 }
-                "pkg_edit" => match if a["rebuild"] == true { up::bump_rel(&root, s(a, "name")) } else { up::edit(&root, s(a, "name"), a["ver"].as_str()) } {
-                    Ok(r) => r,
-                    Err(e) => error(e),
-                },
+                "pkg_edit" => {
+                    let n = s(a, "name");
+                    if n.is_empty() || n.contains('/') {
+                        return error("give name");
+                    }
+                    if a["rebuild"] == true {
+                        return up::bump_rel(&root, n).unwrap_or_else(error);
+                    }
+                    // tarball を取ってきて sha256 を計るので、build と同じくうしろで (大きなものや遅い配布元でも
+                    // ツールが 60 秒で切れないように)
+                    let mut argv = vec!["edit", n];
+                    if let Some(v) = a["ver"].as_str() {
+                        argv.push(v);
+                    }
+                    job(&mut jobs, &root, &format!("edit-{}", n), &argv, a)
+                }
                 "pkg_build" => {
                     let n = s(a, "name");
                     if n.is_empty() || n.contains('/') {

@@ -183,7 +183,6 @@ fn rule(name: &str, path: &Path) -> Value {
             let url = src.trim_start_matches("git+").split('#').next().unwrap_or("").to_string();
             r["from"] = json!("commit");
             r["git"] = json!(url);
-            r["commit"] = json!(scalar(&text, "_commit").unwrap_or_default());
             return r;
         }
         Some(Err(e)) => {
@@ -264,11 +263,16 @@ pub fn upstream(pkg: &Path, only: &[String]) -> Result<Vec<Value>, String> {
     Ok(new)
 }
 
-/// upstream.json を書く (名前の順に 1 行ずつ)。前に入れていた pkgver (いまの版。上げると古くなる) は落とす
+/// 前に入れていた、いまの PKGBUILD の値の写し (pkg_edit で上げると古くなる。くらべるときは PKGBUILD を読む)
+const STALE_KEYS: [&str; 2] = ["pkgver", "commit"];
+
+/// upstream.json を書く (名前の順に 1 行ずつ)。STALE_KEYS は落とす
 fn write_rules(file: &Path, mut rules: Vec<Value>) -> Result<(), String> {
     for r in rules.iter_mut() {
         if let Some(m) = r.as_object_mut() {
-            m.remove("pkgver");
+            for k in STALE_KEYS {
+                m.remove(k);
+            }
         }
     }
     rules.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -289,8 +293,8 @@ fn rules(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, Strin
         upstream(pkg, only)?;
     } else if !missing.is_empty() {
         upstream(pkg, &missing)?;
-    } else if have.iter().any(|r| r.get("pkgver").is_some()) {
-        // 前の形 (pkgver つき) なら、それを落として書きなおす (ネットは見ない)
+    } else if have.iter().any(|r| STALE_KEYS.iter().any(|k| r.get(*k).is_some())) {
+        // 前の形 (pkgver や commit つき) なら、それを落として書きなおす (ネットは見ない)
         write_rules(&pkg.join(FILE), have)?;
     }
     Ok(read())
@@ -442,16 +446,17 @@ pub fn latest(r: &Value) -> Result<String, String> {
 /// check: upstream.json と、いまの PKGBUILD の pkgver をくらべる
 pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, String> {
     let rules = rules(pkg, if refresh { only } else { &[] }, refresh)?;
-    let now: std::collections::HashMap<String, String> =
+    // いまの PKGBUILD の pkgver と _commit (pkg_edit で上げたら、すぐにそれとくらべる)
+    let (now, pins): (std::collections::HashMap<String, String>, std::collections::HashMap<String, String>) =
         pkgbuilds(pkg)
             .into_iter()
             .map(|(n, p)| {
                 let text = fs::read_to_string(&p).unwrap_or_default();
                 let v = scalar(&text, "pkgver").unwrap_or_default();
                 let v = if v.contains('$') { expand_var(p.parent().unwrap_or(Path::new(".")), &text, "pkgver") } else { v };
-                (n, v)
+                ((n.clone(), v), (n, scalar(&text, "_commit").unwrap_or_default()))
             })
-            .collect();
+            .unzip();
     let todo: Vec<Value> = rules.into_iter().filter(|r| r.get("skip").is_none() && (only.is_empty() || only.iter().any(|o| r["name"] == o.as_str()))).collect();
     let rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
@@ -459,7 +464,7 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
         match latest(&r) {
             // コミットで決めているもの: HEAD が PKGBUILD の _commit とちがえば新しい
             Ok(h) if r["from"] == "commit" => {
-                let pinned = r["commit"].as_str().unwrap_or("");
+                let pinned = pins.get(&name).map(String::as_str).unwrap_or("");
                 json!({ "name": name, "pkgver": cur, "latest": format!("commit {}", &h[..7]), "commit": h, "new": !pinned.is_empty() && !h.starts_with(pinned) && !pinned.starts_with(&h) })
             }
             Ok(v) => json!({ "name": name, "pkgver": cur, "latest": v, "new": vercmp(&v, &cur).is_gt() }),
@@ -828,7 +833,13 @@ fn sha256_url(url: &str) -> Result<String, String> {
     let ok = if Command::new("fetch").arg("--help").output().is_ok() {
         Command::new("fetch").arg(url).arg("-o").arg(&tmp).status()
     } else {
-        Command::new("curl").args(["-fsSL", "-o"]).arg(&tmp).arg(url).status()
+        // 止まったまま (つながっても何も来ない) なら 60 秒で切り、続きから 10 回まで取りなおす
+        // (archive.mesa3d.org が切れたり止まったりして、前は pkg_edit がいつまでも返らなかった)
+        Command::new("curl")
+            .args(["-fsSL", "--connect-timeout", "30", "--speed-limit", "1000", "--speed-time", "60", "--retry", "10", "--retry-delay", "5", "--retry-all-errors", "-C", "-", "-o"])
+            .arg(&tmp)
+            .arg(url)
+            .status()
     }
     .is_ok_and(|s| s.success());
     if !ok {
