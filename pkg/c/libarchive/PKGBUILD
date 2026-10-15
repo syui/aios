@@ -4,7 +4,7 @@
 #   (provides / conflicts / replaces: ap -Syu で uutils の tar と入れかわる。tar と unzip は bsdtar と bsdunzip へのリンク)
 pkgname=libarchive
 pkgver=3.8.10
-pkgrel=1
+pkgrel=2
 pkgdesc='Multi-format archive and compression library, with bsdtar as tar (static, for aios)'
 arch=('aarch64')
 url='https://libarchive.org/'
