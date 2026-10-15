@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。コマンドは静的に
 pkgname=xz
 pkgver=5.8.4
-pkgrel=1
+pkgrel=2
 pkgdesc='Library and command line tools for XZ and LZMA compressed files (static, for aios)'
 arch=('aarch64')
 url='https://tukaani.org/xz/'

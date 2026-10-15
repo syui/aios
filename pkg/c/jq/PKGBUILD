@@ -2,7 +2,7 @@
 #   正規表現 (test / match / sub) の oniguruma は jq の中にあるものを使う。Zig でクロスビルドして /opt/c に入る
 pkgname=jq
 pkgver=1.8.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Command-line JSON processor (static, for aios)'
 arch=('aarch64')
 url='https://jqlang.org/'

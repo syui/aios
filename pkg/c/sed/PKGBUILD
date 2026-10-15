@@ -5,7 +5,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。/usr/bin/sed を書いたスクリプトのため /usr/bin にも置く
 pkgname=sed
 pkgver=4.10
-pkgrel=1
+pkgrel=2
 pkgdesc='GNU stream editor (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/sed/'

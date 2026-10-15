@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=gzip
 pkgver=1.15
-pkgrel=1
+pkgrel=2
 pkgdesc='GNU compression utility (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/gzip/'

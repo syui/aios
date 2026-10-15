@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。コマンドは静的に
 pkgname=bzip2
 pkgver=1.0.8
-pkgrel=1
+pkgrel=2
 pkgdesc='A high-quality data compression program (static, for aios)'
 arch=('aarch64')
 url='https://sourceware.org/bzip2/'

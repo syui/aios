@@ -5,7 +5,7 @@
 # 版とチェックサムは pkg/c/zig.sh (ビルドする側の Zig) と同じにしておく
 pkgname=zig
 pkgver=0.17.0
-pkgrel=4
+pkgrel=5
 pkgdesc='Zig compiler and toolchain (also a C/C++ compiler: zig cc)'
 arch=('aarch64')
 url='https://ziglang.org'
@@ -23,7 +23,7 @@ package() {
   cp -R "zig-aarch64-linux-$pkgver/." "$pkgdir/opt/zig/"
   # libc を musl と同じに (zig.sh の zig_fix_libc): realloc(p, 0) (0.17 の libc は NULL を返し、GNU sed などが
   # 動かない)、libc.so の見本のデータの番地 (cc -dynamic の PIC でないプログラムで、__environ や stdout が
-  # __stack_chk_guard や stderr と同じ場所になる)
+  # __stack_chk_guard や stderr と同じ場所になる)、iconv の gb18030 (CVE-2026-6042)
   . "$startdir/../zig.sh"
   zig_fix_libc "$pkgdir/opt/zig/lib"
   # aarch64-linux-musl に要らない libc

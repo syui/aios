@@ -3,7 +3,7 @@
 #   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
 pkgname=vulkan-loader
 pkgver=1.4.365
-pkgrel=1
+pkgrel=2
 pkgdesc='Vulkan Installable Client Driver (ICD) loader: libvulkan.so (shared, for aios)'
 arch=('aarch64')
 url='https://github.com/KhronosGroup/Vulkan-Loader'

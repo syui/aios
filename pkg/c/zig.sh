@@ -7,8 +7,8 @@ ZIG_VERSION=0.17.0
 # aios の直し (zig_fix_libc) の回。作るときの Zig は zig=ZIG_VERSION-ZIG_REL として .PKGINFO の makedepend に残り
 # (zig_env が $srcdir/.toolchain に書き、mkpkg.sh が入れる)、aish の pkg_check は、いまのものとちがう Zig で
 # 作ったパッケージを rebuild に出す。zig_fix_libc を変えて、作るものが変わるときは 1 つ上げる
-#   1: realloc(p, 0)   2: libc.so の見本のデータ
-ZIG_REL=2
+#   1: realloc(p, 0)   2: libc.so の見本のデータ   3: iconv の gb18030 (CVE-2026-6042)
+ZIG_REL=3
 PREFIX=/opt/c
 
 zig_sha256() {
@@ -33,8 +33,23 @@ zig_sha256() {
 #    名前を別名と見て、みな同じ場所に置く。すると musl の __environ が __stack_chk_guard を読んで setenv で落ち (VLC)、
 #    stdout も stderr を指す。データごとに場所をとり、musl のほんとうの別名 (src の weak_alias(__environ, environ)
 #    など。こちらは同じ番地でないと、プログラムと musl が別の場所を見る) だけを .set で同じ番地にする
+#  - iconv (lib/libc/musl/src/locale/iconv.c。静的にリンクしたものはこれを使う): gb18030 の 4 バイトの字を、1 字に
+#    1 秒より長くかけて探し、BMP の終わりと BMP の外のものをまちがえる (U+10000 が U+3404C。CVE-2026-6042)。musl の
+#    上流の直し (pkg/c/musl/CVE-2026-6042.patch。musl のパッケージと同じもの) をあてる。qsort (CVE-2026-40200) は
+#    Zig の libc では Zig のもの (lib/c/stdlib.zig) なので、あてはまらない
 zig_fix_libc() {
-  zig_fix_realloc "$1/c/malloc.zig" && zig_fix_stub "$1/libc/musl/libc.S" "$1/libc/musl/src"
+  zig_fix_realloc "$1/c/malloc.zig" && zig_fix_stub "$1/libc/musl/libc.S" "$1/libc/musl/src" &&
+    zig_fix_iconv "$1/libc/musl"
+}
+
+# zig_fix_iconv MUSL_DIR
+zig_fix_iconv() {
+  local m=$1 p
+  p=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/musl/CVE-2026-6042.patch
+  [ -f "$m/src/locale/iconv.c" ] || return 0
+  grep -q gb18030utf "$m/src/locale/iconv.c" && return 0
+  patch -s -p1 -d "$m" < "$p" && grep -q gb18030utf "$m/src/locale/iconv.c" ||
+    { echo "zig.sh: could not fix $m/src/locale/iconv.c" >&2; return 1; }
 }
 
 zig_fix_realloc() {

@@ -6,7 +6,7 @@
 #   __divtf3 など。rust-lld が使う) と、crtbegin が呼ぶ __register_frame_info / __deregister_frame_info も入れる
 pkgname=libunwind
 pkgver=0.16.0
-pkgrel=2
+pkgrel=3
 pkgdesc='LLVM libunwind and compiler-rt builtins as libgcc_s.so.1, built with Zig (for aios)'
 arch=('aarch64')
 url='https://github.com/llvm/llvm-project/tree/main/libunwind'

@@ -1,7 +1,7 @@
 # aios (aarch64) 用。bin/mkpkg.sh pkg/rust/ailog
 pkgname=ailog
 pkgver=0.0.1
-pkgrel=1
+pkgrel=2
 pkgdesc='ATProto blog CLI'
 arch=('aarch64')
 url='https://git.syui.ai/ai/log'

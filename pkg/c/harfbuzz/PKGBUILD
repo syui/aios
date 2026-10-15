@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=harfbuzz
 pkgver=14.6.0
-pkgrel=1
+pkgrel=2
 pkgdesc='OpenType text shaping engine (shared, for aios)'
 arch=('aarch64')
 license=('MIT')

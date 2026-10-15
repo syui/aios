@@ -3,7 +3,7 @@
 # ビルドには meson と ninja、このマシン用の cc と expat (wayland-scanner をこのマシン用に作る) が要る
 pkgname=wayland
 pkgver=1.26.0
-pkgrel=1
+pkgrel=2
 pkgdesc='A computer display server protocol: libwayland-client, -server, -cursor, -egl (shared, for aios)'
 arch=('aarch64')
 url='https://wayland.freedesktop.org/'

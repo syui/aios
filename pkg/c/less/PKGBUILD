@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=less
 pkgver=710
-pkgrel=2
+pkgrel=3
 pkgdesc='A terminal based program for viewing text files (static, for aios)'
 arch=('aarch64')
 url='https://www.greenwoodsoftware.com/less/'

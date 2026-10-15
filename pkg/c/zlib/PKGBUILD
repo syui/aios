@@ -3,7 +3,7 @@
 # CVE-2026-85091.patch: ノンブロッキングの gzwrite があふれる (上流の df84af2。Alpine の 1.3.2-r1 と同じ)
 pkgname=zlib
 pkgver=1.3.2
-pkgrel=3
+pkgrel=4
 pkgdesc='Compression library implementing the deflate method (static and shared, for aios)'
 arch=('aarch64')
 url='https://zlib.net'

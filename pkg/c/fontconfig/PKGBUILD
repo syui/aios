@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=fontconfig
 pkgver=2.18.3
-pkgrel=1
+pkgrel=2
 pkgdesc='Library for configuring and customizing font access (shared, for aios)'
 arch=('aarch64')
 license=('HPND AND Unicode-DFS-2016')

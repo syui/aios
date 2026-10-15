@@ -3,7 +3,7 @@
 #   kill と uptime は coreutils、free と sysctl は base にあるので入れない
 pkgname=procps-ng
 pkgver=4.0.7
-pkgrel=2
+pkgrel=3
 pkgdesc='Utilities for monitoring your system and its processes (static, for aios)'
 arch=('aarch64')
 url='https://gitlab.com/procps-ng/procps'

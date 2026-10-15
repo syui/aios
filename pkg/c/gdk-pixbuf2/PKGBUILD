@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=gdk-pixbuf2
 pkgver=2.44.8
-pkgrel=2
+pkgrel=3
 pkgdesc='Image loading library (shared, for aios; PNG built in)'
 arch=('aarch64')
 license=('LGPL-2.1-or-later')

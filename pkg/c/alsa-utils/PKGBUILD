@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。alsamixer (ncurses が要る) はなし。/opt/c に入る
 pkgname=alsa-utils
 pkgver=1.2.16
-pkgrel=1
+pkgrel=2
 pkgdesc='ALSA utilities: aplay, arecord, speaker-test, amixer (for aios)'
 arch=('aarch64')
 url='https://www.alsa-project.org/'

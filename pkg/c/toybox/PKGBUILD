@@ -4,7 +4,7 @@
 #   ping はカーネルの ping ソケット (SOCK_DGRAM + IPPROTO_ICMP) を使う (root でなくてよい)
 pkgname=toybox
 pkgver=0.8.15
-pkgrel=2
+pkgrel=3
 pkgdesc='Small tools from toybox: nc, ping, netstat, host, traceroute, lsof, bc, rev, getconf, iconv (static, for aios)'
 arch=('aarch64')
 url='https://landley.net/toybox/'
