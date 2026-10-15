@@ -369,21 +369,29 @@ fn describe_copies(c: &Value) -> String {
     }
 }
 
-/// repo/aarch64 のパッケージ (names がなければみな) を、動かさずに確かめる:
-///   copies: 1 つずつ depend と musl といっしょに build/aish-pkg/scan/ に広げて
-///   needs: NEEDED のうち、どのパッケージにもないもの (ld.so はファイルの名前で探す。中身は embed.json に覚えておく)
+/// repo/aarch64 のパッケージ (names がなければみな) を、動かさずに確かめる。1 つずつ depend と musl といっしょに
+/// build/aish-pkg/scan/ に広げて、pkg_test と同じ copies と needs (NEEDED のうち、広げたところにないもの。
+/// ほかのパッケージにあれば、それを depends に足す。どこにもなければ、そう言う)
 pub fn scan(root: &Path, names: &[String]) -> Value {
     let all = latest(root);
     let pkgs: Vec<&(String, PathBuf)> = all.iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
+    // ライブラリの名前 → それのあるパッケージ (中身は embed.json に覚えておく)
+    let mut who: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (n, d) in crate::embed::dynamics(root) {
+        for p in d.provides {
+            who.entry(p).or_default().push(n.clone());
+        }
+    }
     let dir = root.join("build/aish-pkg/scan");
-    let (mut text, mut affected, mut programs) = (String::new(), Vec::new(), 0);
+    let (mut text, mut affected, mut unresolved, mut programs) = (String::new(), Vec::new(), Vec::new(), 0);
     for (n, f) in &pkgs {
         let fname = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if let Err(e) = unpack(root, n, f, &pkginfo(f), &dir) {
             text.push_str(&format!("{}: {}\n", fname, e));
             continue;
         }
-        let (p, shared) = copies(&dir, &files(f));
+        let mine = files(f);
+        let (p, shared) = copies(&dir, &mine);
         programs += p;
         if !shared.is_empty() {
             text.push_str(&format!("{}\n", fname));
@@ -392,21 +400,22 @@ pub fn scan(root: &Path, names: &[String]) -> Value {
             }
             affected.push(json!({ "name": n, "file": fname, "shared": shared }));
         }
-    }
-    let _ = fs::remove_dir_all(&dir);
-    let dy = crate::embed::dynamics(root);
-    let have: BTreeSet<&String> = dy.iter().flat_map(|(_, d)| d.provides.iter()).collect();
-    let mut unresolved = Vec::new();
-    for (n, d) in dy.iter().filter(|(n, _)| names.is_empty() || names.contains(n)) {
-        let miss: Vec<&str> = d.needs.iter().filter(|x| !have.contains(x)).map(String::as_str).collect();
-        if !miss.is_empty() {
-            text.push_str(&format!("{}: needs {}, which no package has\n", n, miss.join(" ")));
-            unresolved.push(json!({ "name": n, "missing": miss }));
+        let mut have = BTreeSet::new();
+        so_names(&dir, &mut have);
+        let missing: Vec<String> = crate::elf::dynamic(&dir, &mine).needs.into_iter().filter(|x| !have.contains(x)).collect();
+        if !missing.is_empty() {
+            let say: Vec<String> = missing.iter().map(|m| match who.get(m) {
+                Some(ps) => format!("{} (in {}: add to depends)", m, ps.join(" ")),
+                None => format!("{} (no package has it)", m),
+            }).collect();
+            text.push_str(&format!("{}: needs {}\n", n, say.join(", ")));
+            unresolved.push(json!({ "name": n, "missing": missing }));
         }
     }
+    let _ = fs::remove_dir_all(&dir);
     let bad: Vec<&str> = affected.iter().filter_map(|a| a["name"].as_str()).collect();
     text.push_str(&format!(
-        "{} packages: {} programs copy library data; {} packages copy separate data to one place{}; {} packages need a library no package has\n",
+        "{} packages: {} programs copy library data; {} packages copy separate data to one place{}; {} packages need a library that is not in their depends\n",
         pkgs.len(),
         programs,
         bad.len(),
