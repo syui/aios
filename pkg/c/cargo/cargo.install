@@ -1,12 +1,12 @@
 # ap が動かす (pacman と同じ形)。Rust の公式のビルドを取ってきて /usr に入れる
-_v=1.99.0
+_v=1.99.1
 _t=aarch64-unknown-linux-musl
 # 名前:sha256 (static.rust-lang.org/dist/NAME.tar.gz.sha256 と同じ)
-_parts="rustc-$_v-$_t:72b20aec5f02fec76f7702749865232c12040222e1604a27fffbf16c5829f7a7
-cargo-$_v-$_t:1c107d9bcf4ab7573b7d3d9c553c543fb6f3b003c1d50fec7bf7fc31644fe7c3
-rust-std-$_v-$_t:202f95c683d30d2f65cb7e3b6b2c7853a364d268bff54dd44a1dcdbb63632374
-rust-std-$_v-aarch64-unknown-none-softfloat:80e2ed8f2d0157d0105c9be5ea4a6396ee61b6aea2e836aaa8eb7e8cafc7fc56
-rust-std-$_v-aarch64-unknown-uefi:65dffe99724de314eb0be224296a9c6d2c25ea040c9b4d1740b7f81c7017686b"
+_parts="rustc-$_v-$_t:2f2e614d586b711913a39e7423d1cc2b58ff136da5e5c2de5eeda1b14864eeca
+cargo-$_v-$_t:cd14d5ddfe977c769f0446efb825133e76b611f3af2d2f8ee084ebff5ad4f314
+rust-std-$_v-$_t:5202b22bf78e62f95304f6dfafd7e3e10ac839fb808e01cd12d66bbb99e7c1b8
+rust-std-$_v-aarch64-unknown-none-softfloat:dd08b0cb4a03f3a89b183c8210c524e61fa8d66eaecae0fe8188428dc622f731
+rust-std-$_v-aarch64-unknown-uefi:a4a8de018951569dcde8e59e19c056084c6b735ed733965ab49967ef02149668"
 _list=/usr/lib/rustlib/aios-cargo.files
 # 入れた部品 (_parts そのまま)。同じなら post_upgrade で取りなおさない
 _parts_file=/usr/lib/rustlib/aios-cargo.parts
