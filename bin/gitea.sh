@@ -37,6 +37,12 @@ auth() {
   fi
 }
 
+# push の前のやりとり (push.negotiate) はしない: この環境の git の設定 (~/.gitconfig) では true で、git.syui.ai はその
+# 答えに packfile を返すので、毎回 "fatal: expected 'acknowledgments', received 'packfile'" となり、あきらめてから送っていた
+git_push() {
+  git -c "$(auth)" -c push.negotiate=false push "$@"
+}
+
 # 鍵の束から署名に使う秘密鍵を選ぶ: fpr (指紋) と uid ("名前 <メール>")。なければ失敗
 find_key() {
   list=$(gpg --batch --with-colons --list-secret-keys ${GPG_SIGNER:+"$GPG_SIGNER"} 2>/dev/null) || true
@@ -76,7 +82,7 @@ case "$1" in
       git fetch -q origin unix
       ref=origin/unix
     fi
-    git -c "$(auth)" push "$host/ai/os.git" "$ref:refs/heads/unix"
+    git_push "$host/ai/os.git" "$ref:refs/heads/unix"
     ;;
   repo)
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
@@ -107,7 +113,7 @@ case "$1" in
     # (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
     git checkout -q --orphan new
     git commit -q -m "aarch64: update packages" -m "$changes"
-    git -c "$(auth)" push -q --force origin new:main
+    git_push -q --force origin new:main
     echo "ai/repo: pushed $(git rev-parse --short HEAD) (history squashed)"
     ;;
   release | mirror)
