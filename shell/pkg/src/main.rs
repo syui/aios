@@ -1,7 +1,7 @@
 // aish-pkg: aios のパッケージを最新にする (人は M-p、Claude は MCP のツール)
 //   pkg_check  配布元の最新の版といまの pkgver をくらべる (新しいものだけ。all で全部)。
 //              一覧は pkg/pkg.json に作る: 1 つのパッケージに 1 行で name type src (取ってくる URL) now latest
-//              中に古いライブラリ (静的リンク) が入ったままのパッケージも出す: rebuild (embed.rs)
+//              中に古いライブラリ (静的リンク) が入ったままのものと、ちがう Zig で作ったものも出す: rebuild (embed.rs)
 //   pkg_edit   PKGBUILD (pkgver、pkgrel、sha256sums) と .aios.json を、配布元の最新か ver に書きかえる。
 //              rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild を作りなおすとき)
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
@@ -39,7 +39,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-p", "check")],
         tools: &[
-            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) のパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push", input: CHECK },
+            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。通ったものだけ pkg_push で送れる。うしろで動く", input: BUILD },
@@ -304,10 +304,20 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
             text.push_str(&format!("{:w$}  rebuild: {}\n", n, embed::describe(libs)));
         }
     }
+    // 作った Zig を書きとめる前に作ったもの (作った日の zig.sh の版ごとに数だけ。名前は JSON の unrecorded)
+    let unrec = embed::unrecorded(root);
+    if !all && names.is_empty() && !unrec.is_empty() {
+        let n: usize = unrec.values().map(Vec::len).sum();
+        let by: Vec<String> = unrec.iter().map(|(v, ns)| format!("{} with zig {}", ns.len(), if v.is_empty() { "?" } else { v })).collect();
+        text.push_str(&format!("{} packages were built before the zig record ({}); pkg_edit rebuild to build them with zig {}\n", n, by.join(", "), embed::zig_now(root).unwrap_or_default()));
+    }
     let news: Vec<&Value> = rs.iter().filter(|r| r["new"] == true).map(|r| &r["name"]).collect();
     let mut r = json!({ "text": text, "new": news, "latest": same, "errors": bad, "count": new + same + bad });
     if !stale.is_empty() {
         r["rebuild"] = embed::to_json(&stale);
+    }
+    if !unrec.is_empty() {
+        r["unrecorded"] = json!(unrec);
     }
     r
 }
@@ -342,7 +352,8 @@ fn cli(args: &[String]) -> i32 {
         "scan" => {
             let r = test::scan(&root, &rest);
             print!("{}", r["text"].as_str().unwrap_or(""));
-            return if r["affected"].as_array().is_some_and(|a| !a.is_empty()) { 1 } else { 0 };
+            let bad = |k: &str| r[k].as_array().is_some_and(|a| !a.is_empty());
+            return if bad("affected") || bad("unresolved") { 1 } else { 0 };
         }
         _ => match rest.first() {
             Some(n) if args.iter().any(|a| a == "--rebuild") => up::bump_rel(&root, n).unwrap_or_else(error),

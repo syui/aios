@@ -6,6 +6,9 @@
 //   shared_env、meson_cross、cmake_cross、-dynamic なら動的) か、ライブラリに .so がないとき
 //   作ったときに入れた版は .PKGINFO の makedepend = NAME=VER-REL (zig.sh の c_deps が書きとめ、mkpkg.sh が入れる)。
 //   それのない前のパッケージは、作った日 (builddate) がライブラリのものより前なら古いとみる
+// 作った Zig も makedepend = zig=ZIG_VERSION-ZIG_REL に残る (zig.sh の zig_env)。pkg/c/zig.sh のいまのものとちがえば
+// rebuild に (古い libc.so の見本でリンクしたもののように、作りなおすまで直らない)。書きとめる前に作ったものは
+// unrecorded に、作った日の zig.sh の ZIG_VERSION (git の履歴から) ごとに
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,6 +31,32 @@ pub fn deps(text: &str) -> Vec<String> {
                     v.push(n.to_string());
                 }
             }
+        }
+    }
+    v
+}
+
+/// Zig で作るパッケージか (zig_env を呼ぶもの。rust の musl_zig も中で呼ぶ)
+fn uses_zig(text: &str) -> bool {
+    text.lines().map(|l| l.split('#').next().unwrap_or("")).any(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "zig_env" || w == "musl_zig"))
+}
+
+/// いまの Zig: pkg/c/zig.sh の ZIG_VERSION-ZIG_REL (作ったものの makedepend = zig=... とくらべる)
+pub fn zig_now(root: &Path) -> Option<String> {
+    let t = fs::read_to_string(root.join("pkg/c/zig.sh")).ok()?;
+    let get = |k: &str| t.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=')).map(|v| v.trim().to_string());
+    Some(format!("{}-{}", get("ZIG_VERSION")?, get("ZIG_REL")?))
+}
+
+/// pkg/c/zig.sh の ZIG_VERSION が変わった時刻と版 (git の履歴から。古い順)
+fn zig_history(root: &Path) -> Vec<(u64, String)> {
+    let Ok(o) = Command::new("git").arg("-C").arg(root).args(["log", "--reverse", "--format=@%ct", "-p", "--", "pkg/c/zig.sh"]).stderr(Stdio::null()).output() else { return vec![] };
+    let (mut t, mut v) = (0, Vec::new());
+    for l in String::from_utf8_lossy(&o.stdout).lines() {
+        if let Some(ts) = l.strip_prefix('@').and_then(|s| s.parse::<u64>().ok()) {
+            t = ts;
+        } else if let Some(ver) = l.strip_prefix("+ZIG_VERSION=") {
+            v.push((t, ver.trim().to_string()));
         }
     }
     v
@@ -221,14 +250,23 @@ pub fn dynamics(root: &Path) -> Vec<(String, crate::elf::Dynamic)> {
 pub fn stale(root: &Path) -> BTreeMap<String, Vec<(String, String, String)>> {
     let mut cache = Cache::load(root);
     let mut out: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+    let zig = zig_now(root);
     for (name, path) in crate::up::pkgbuilds(&root.join("pkg")) {
         let text = fs::read_to_string(&path).unwrap_or_default();
         let ds = deps(&text);
-        if ds.is_empty() {
+        let z = uses_zig(&text);
+        if ds.is_empty() && !z {
             continue;
         }
         let Some(pf) = crate::test::find(root, &name) else { continue };
         let (_, date, made) = cache.info(&pf);
+        // 作った Zig (書きとめのないものは unrecorded)
+        if z
+            && let (Some(now), Some(was)) = (&zig, made.get("zig"))
+            && was != now
+        {
+            out.entry(name.clone()).or_default().push(("zig".into(), was.clone(), now.clone()));
+        }
         let stat = links_static(&text);
         for d in ds {
             let Some(df) = crate::test::find(root, &d) else { continue };
@@ -245,6 +283,27 @@ pub fn stale(root: &Path) -> BTreeMap<String, Vec<(String, String, String)>> {
             if let Some(w) = was {
                 out.entry(name.clone()).or_default().push((d, w, now));
             }
+        }
+    }
+    cache.save();
+    out
+}
+
+/// Zig で作るのに makedepend = zig=... のないパッケージ (書きとめる前に作ったもの): 作った日の zig.sh の ZIG_VERSION
+/// (git の履歴から。わからなければ "") → 名前。作りなおせば書きとめがつく
+pub fn unrecorded(root: &Path) -> BTreeMap<String, Vec<String>> {
+    let hist = zig_history(root);
+    let mut cache = Cache::load(root);
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, path) in crate::up::pkgbuilds(&root.join("pkg")) {
+        if !uses_zig(&fs::read_to_string(&path).unwrap_or_default()) {
+            continue;
+        }
+        let Some(pf) = crate::test::find(root, &name) else { continue };
+        let (_, date, made) = cache.info(&pf);
+        if !made.contains_key("zig") {
+            let ver = hist.iter().rev().find(|(t, _)| *t <= date).map(|(_, v)| v.clone()).unwrap_or_default();
+            out.entry(ver).or_default().push(name);
         }
     }
     cache.save();
@@ -299,6 +358,14 @@ mod tests {
         assert!(!links_static("  LDFLAGS=\"-dynamic -Wl,-s\" ./configure\n"));
         // コメントの中のものは数えない
         assert!(links_static("  # shared_env はいらない (-dynamic にしない)\n  c_deps ncurses\n"));
+    }
+
+    #[test]
+    fn built_with_zig() {
+        assert!(uses_zig("build() {\n  . \"$startdir/../zig.sh\"; zig_env\n}\n"));
+        assert!(uses_zig("  musl_zig || return 1\n"));
+        assert!(!uses_zig("  # zig_env はいらない\n  cargo build\n"));
+        assert!(!uses_zig("  zig_fix_libc \"$pkgdir/opt/zig/lib\"\n"));
     }
 
     #[test]

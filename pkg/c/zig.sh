@@ -4,6 +4,11 @@
 # aios 用 (aarch64-linux-musl、静的) の CC CXX AR RANLIB を用意する。aios の中の base-devel と同じ Zig
 # 入れる場所は /opt/c (PREFIX)
 ZIG_VERSION=0.17.0
+# aios の直し (zig_fix_libc) の回。作るときの Zig は zig=ZIG_VERSION-ZIG_REL として .PKGINFO の makedepend に残り
+# (zig_env が $srcdir/.toolchain に書き、mkpkg.sh が入れる)、aish の pkg_check は、いまのものとちがう Zig で
+# 作ったパッケージを rebuild に出す。zig_fix_libc を変えて、作るものが変わるときは 1 つ上げる
+#   1: realloc(p, 0)   2: libc.so の見本のデータ
+ZIG_REL=2
 PREFIX=/opt/c
 
 zig_sha256() {
@@ -102,6 +107,10 @@ zig_env() {
   export CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static -s"
   export ZIG_GLOBAL_CACHE_DIR=$top/build/zig/cache
   unset RUSTFLAGS
+  # この Zig で作ったこと (mkpkg.sh が .PKGINFO の makedepend = zig=... にする)
+  if [ -n "$srcdir" ]; then
+    echo "zig=$ZIG_VERSION-$ZIG_REL" > "$srcdir/.toolchain"
+  fi
 }
 
 # c_deps NAME...: ほかの C のパッケージ (repo/aarch64/c/NAME-*.pkg.tar.zst、なければ作る) を
