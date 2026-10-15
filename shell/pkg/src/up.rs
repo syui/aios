@@ -131,7 +131,7 @@ fn parse_toml(text: &str) -> Option<Map<String, Value>> {
 }
 
 /// url の中身 (fetch か curl)
-fn get(url: &str) -> Result<String, String> {
+pub fn get(url: &str) -> Result<String, String> {
     let out = if Command::new("fetch").arg("--help").output().is_ok() {
         Command::new("fetch").args([url, "-o", "-"]).output()
     } else {

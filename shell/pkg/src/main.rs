@@ -2,6 +2,7 @@
 //   pkg_check  配布元の最新の版といまの pkgver をくらべる (新しいものだけ。all で全部)。
 //              一覧は pkg/pkg.json に作る: 1 つのパッケージに 1 行で name type src (取ってくる URL) now latest
 //              中に古いライブラリ (静的リンク) が入ったままのものと、ちがう Zig で作ったものも出す: rebuild (embed.rs)
+//              直っていない CVE (Alpine の secdb とくらべる) も出す: vulns (vuln.rs)
 //   pkg_edit   PKGBUILD (pkgver、pkgrel、sha256sums) と .aios.json を、配布元の最新か ver に書きかえる。
 //              rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild を作りなおすとき)
 //   pkg_build  bin/mkpkg.sh で作って repo/aarch64/KIND/ に置く (古い版を外し、aios.db を作りなおす)
@@ -23,6 +24,7 @@ mod repo;
 mod test;
 mod up;
 mod vmtest;
+mod vuln;
 
 use aish_plugin::{Spec, Tool, Tty, Value, error, json, s};
 use std::collections::HashMap;
@@ -47,7 +49,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-p", "check")],
         tools: &[
-            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)", input: CHECK },
+            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)。直っていない CVE は vulns に (Alpine の secdb の「この版で直した」とくらべる。pkg/c のものなど): fixed in VER なら pkg_edit でそれから上に、patched by Alpine (同じ版にパッチ) なら aports のパッチを足して PKGBUILD に CVE の番号を書く (あてはまらないものも番号を書けば出なくなる)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース NAME-VER-REL に置く。そのいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。vm なら aios の VM にも ap -S で入れて、aios のカーネルの上で動かす。通ったものだけ pkg_push で送れる。うしろで動く", input: TEST },
@@ -315,7 +317,9 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
     };
     // 中に古いライブラリが入ったままのもの (ネットは見ない)
     let stale = embed::stale(root);
-    let w = rs.iter().filter_map(|r| r["name"].as_str()).chain(stale.keys().map(String::as_str)).map(str::len).max().unwrap_or(0);
+    // 直っていない CVE (secdb は 1 日に 1 回取ってくる。取れなければ前のもので、そう書いた 1 行も)
+    let (vulns, vnote) = vuln::check(root, names).unwrap_or_else(|e| (Vec::new(), e));
+    let w = rs.iter().filter_map(|r| r["name"].as_str()).chain(stale.keys().map(String::as_str)).chain(vulns.iter().map(|v| v.name.as_str())).map(str::len).max().unwrap_or(0);
     let (mut new, mut same, mut bad) = (0, 0, 0);
     let mut text = String::new();
     for r in &rs {
@@ -344,6 +348,15 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
         for (n, libs) in &stale {
             text.push_str(&format!("{:w$}  rebuild: {}\n", n, embed::describe(libs)));
         }
+        for v in &vulns {
+            text.push_str(&format!("{:w$}  vulns {}\n", v.name, vuln::describe(v)));
+        }
+        if !vulns.is_empty() {
+            text.push_str("vulns: fixed in VER → pkg_edit to VER or newer; patched by Alpine → add the patch from aports (main/NAME or community/NAME) and name the CVE in the PKGBUILD (name it there too when it does not apply to aios)\n");
+        }
+        if !vnote.is_empty() {
+            text.push_str(&format!("vulns: {}\n", vnote));
+        }
     }
     // 作った Zig を書きとめる前に作ったもの (作った日の zig.sh の版ごとに数だけ。名前は JSON の unrecorded)
     let unrec = embed::unrecorded(root);
@@ -359,6 +372,12 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
     }
     if !unrec.is_empty() {
         r["unrecorded"] = json!(unrec);
+    }
+    if !vulns.is_empty() {
+        r["vulns"] = vuln::to_json(&vulns);
+    }
+    if !vnote.is_empty() {
+        r["vulns_note"] = json!(vnote);
     }
     r
 }
