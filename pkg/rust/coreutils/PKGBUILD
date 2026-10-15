@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/coreutils)
 pkgname=coreutils
 pkgver=0.12.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Cross-platform Rust rewrite of the GNU coreutils (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/coreutils'
@@ -13,6 +13,9 @@ sha256sums=('SKIP')
 build() {
   . "$startdir/../cross.sh"
   cd coreutils
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): yoke-derive (0.8.3 は yanked)。
+  # lru (RUSTSEC-2026-0253) は num-prime (factor) が 0.16 のままで、直った 0.18 に上げられない
+  cargo_update yoke-derive@0.8.4
   musl_build --no-default-features --features feat_os_unix_musl
 }
 

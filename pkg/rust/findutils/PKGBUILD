@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/findutils)
 pkgname=findutils
 pkgver=0.10.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Rust implementation of GNU findutils: find, xargs (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/findutils'
@@ -13,6 +13,8 @@ sha256sums=('SKIP')
 build() {
   . "$startdir/../cross.sh"
   cd findutils
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): chacha20 (0.10.0 は yanked)
+  cargo_update chacha20@0.10.2
   musl_build --bin find --bin xargs
 }
 

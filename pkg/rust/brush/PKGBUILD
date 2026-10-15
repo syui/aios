@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/brush)
 pkgname=brush
 pkgver=0.4.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Bash/POSIX-compatible shell implemented in Rust'
 arch=('aarch64')
 url='https://github.com/reubeno/brush'
@@ -22,6 +22,11 @@ prepare() {
 build() {
   . "$startdir/../cross.sh"
   cd brush
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): crossbeam-epoch (RUSTSEC-2026-0204)、
+  # anyhow (RUSTSEC-2026-0190)、memmap2 (RUSTSEC-2026-0186)、chacha20 (0.10.0 は yanked)。
+  # quick-xml (RUSTSEC-2026-0194 RUSTSEC-2026-0195) はテストの junit-report だけが使う (brush には入らない)。
+  # lru (RUSTSEC-2026-0253) は num-prime (factor) が 0.16 のままで、直った 0.18 に上げられない
+  cargo_update crossbeam-epoch@0.9.21 anyhow@1.0.104 memmap2@0.9.11 chacha20@0.10.2
   musl_build --bin brush
 }
 

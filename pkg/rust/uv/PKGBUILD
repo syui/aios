@@ -3,7 +3,7 @@
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
 pkgver=0.13.1
-pkgrel=1
+pkgrel=2
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
 url='https://github.com/astral-sh/uv'
@@ -30,6 +30,11 @@ build() {
   # rustls の aws-lc と jemalloc (C) を musl のヘッダーで
   musl_zig
   cd uv
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): rustls (RUSTSEC-2026-0346 RUSTSEC-2026-0347
+  # RUSTSEC-2026-0348 RUSTSEC-2026-0349)、h2 (RUSTSEC-2026-0258)、memmap2 (RUSTSEC-2026-0186)、
+  # event-listener (RUSTSEC-2026-0221)。rsa (RUSTSEC-2023-0071, Marvin) は直った版がない
+  # (reqsign が Azure と Google のストレージへの署名に使う)
+  cargo_update rustls@0.23.46 h2@0.4.20 memmap2@0.9.11 event-listener@5.4.2
   musl_build --bin uv --bin uvx
 }
 

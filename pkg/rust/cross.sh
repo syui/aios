@@ -21,6 +21,29 @@ musl_build() {
   cargo build --release --target "$TARGET" "$@"
 }
 
+# cargo_update CRATE@VER...: 配布元の Cargo.lock の CRATE が、同じ semver の中で VER より古ければ VER にする
+# (cargo update --precise)。直った版が出ているのに配布元がまだ上げていないもの (cargo audit の RUSTSEC や yanked) に。
+# 番号を PKGBUILD に書いておくと aish の vulns も直したと見る。配布元が上げていれば何もしない (なくなれば、そう言う)。
+# musl_build の前に、Cargo.lock のあるところで呼ぶ
+cargo_update() {
+  local a c want v found
+  for a; do
+    c=${a%@*} want=${a#*@} found=
+    for v in $(awk -v n="\"$c\"" '$1 == "name" && $3 == n { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock); do
+      [ "$(semver_series "$v")" = "$(semver_series "$want")" ] || continue
+      found=1
+      [ "$(printf '%s\n' "$want" "$v" | sort -V | head -1)" = "$want" ] && continue
+      cargo update -p "$c@$v" --precise "$want" || return 1
+    done
+    [ -n "$found" ] || echo "cargo_update: no $c $(semver_series "$want").* in Cargo.lock (upstream moved on: drop $a)" >&2
+  done
+}
+
+# 同じ semver の版の名前: 1.0.103 → 1、0.9.20 → 0.9
+semver_series() {
+  case $1 in 0.*) echo "${1%.*}" ;; *) echo "${1%%.*}" ;; esac
+}
+
 # musl_zig: C の依存を Zig (musl のヘッダー) で作る。glibc のクロスコンパイラは glibc 2.38 からの
 # __isoc23_strtol などを呼ぶ形にしてしまい、musl とつながらないことがある (aws-lc など)。
 # Zig は pkg/c/zig.sh と同じもの (build/zig/)。musl_build の前に呼ぶ

@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/grep)
 pkgname=grep
 pkgver=0.2.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Rust implementation of GNU grep (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/grep'
@@ -13,6 +13,9 @@ sha256sums=('SKIP')
 build() {
   . "$startdir/../cross.sh"
   cd grep
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): crossbeam-epoch (RUSTSEC-2026-0204)、
+  # anyhow (RUSTSEC-2026-0190)、chacha20 (0.10.0 は yanked)
+  cargo_update crossbeam-epoch@0.9.21 anyhow@1.0.104 chacha20@0.10.2
   musl_build
 }
 
