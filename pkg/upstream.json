@@ -24,7 +24,7 @@
   {"from":"arch:curl","name":"curl","nvchecker":{"exclude_regex":".*(tiny|beta).*","from_pattern":"_","git":"https://github.com/curl/curl.git","prefix":"curl-","source":"git","to_pattern":"."}},
   {"from":"arch:diffutils","name":"diffutils","nvchecker":{"git":"https://git.savannah.gnu.org/git/diffutils.git","prefix":"v","source":"git"}},
   {"from":"commit","git":"https://github.com/KhronosGroup/EGL-Registry","name":"egl-headers"},
-  {"name":"expat","skip":"the source tag R_${pkgver does not use pkgver"},
+  {"from":"pkgbuild","git":"https://github.com/libexpat/libexpat.git","name":"expat","tag":"^R_([0-9][0-9A-Za-z_]*)$","under":true},
   {"from":"pkgbuild","git":"https://github.com/sharkdp/fd","name":"fd","tag":"^v([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:ffmpeg","name":"ffmpeg","nvchecker":{"exclude_regex":".*v.*","git":"https://git.ffmpeg.org/ffmpeg.git","prefix":"n","source":"git"}},
   {"from":"arch:file","name":"file","nvchecker":{"from_pattern":"_","git":"https://github.com/file/file.git","prefix":"FILE","source":"git","to_pattern":"."}},

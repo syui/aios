@@ -49,6 +49,24 @@ fn first_source(text: &str) -> Option<String> {
     Some(s.rsplit_once("::").map_or(s, |(_, u)| u).to_string())
 }
 
+/// / で分ける (${pkgver//./_} の中の / では分けない。expat のタグ R_${pkgver//./_} が R_${pkgver になっていた)
+fn segs(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0usize, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
 /// source からリポジトリとタグの形。#commit= なら Err("commit")
 fn from_source(src: &str) -> Result<Option<(String, String)>, String> {
     if let Some(rest) = src.strip_prefix("git+") {
@@ -61,7 +79,7 @@ fn from_source(src: &str) -> Result<Option<(String, String)>, String> {
     }
     // https://github.com/O/R/releases/download/TAG/FILE
     if let Some(rest) = src.strip_prefix("https://github.com/") {
-        let p: Vec<&str> = rest.split('/').collect();
+        let p = segs(rest);
         if p.len() > 5 && p[2] == "releases" && p[3] == "download" {
             return Ok(Some((format!("https://github.com/{}/{}.git", p[0], p[1]), p[4].to_string())));
         }
@@ -70,7 +88,7 @@ fn from_source(src: &str) -> Result<Option<(String, String)>, String> {
     if src.starts_with("https://gitlab.")
         && let Some((proj, rest)) = src.split_once("/-/releases/")
     {
-        return Ok(rest.split('/').next().map(|t| (format!("{}.git", proj), t.to_string())));
+        return Ok(segs(rest).first().map(|t| (format!("{}.git", proj), t.to_string())));
     }
     Ok(None)
 }
@@ -927,6 +945,16 @@ mod tests {
         assert_eq!(vercmp("157.0-3", "157.0-2"), Greater);
         assert_eq!(vercmp("1.2", "1.2.1"), Less);
         assert_eq!(vercmp("0.0.1.r348.g96b598c-1", "0.0.1.r347.gddb9e93-1"), Greater);
+    }
+
+    #[test]
+    fn source_tags() {
+        let t = from_source("https://github.com/libexpat/libexpat/releases/download/R_${pkgver//./_}/expat-$pkgver.tar.xz").unwrap().unwrap();
+        assert_eq!(t, ("https://github.com/libexpat/libexpat.git".to_string(), "R_${pkgver//./_}".to_string()));
+        let (re, under) = template_regex(&t.1).unwrap();
+        assert!(under && regex::Regex::new(&re).unwrap().is_match("R_2_9_0"));
+        let t = from_source("https://gitlab.freedesktop.org/a/b/-/releases/v$pkgver/downloads/b-$pkgver.tar.xz").unwrap().unwrap();
+        assert_eq!(t, ("https://gitlab.freedesktop.org/a/b.git".to_string(), "v$pkgver".to_string()));
     }
 
     #[test]
