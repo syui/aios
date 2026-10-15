@@ -3,7 +3,7 @@
 #   uutils の tar には -C -J -j --strip-components --exclude がまだないので、tar はこちらに入れかわる
 #   (provides / conflicts / replaces: ap -Syu で uutils の tar と入れかわる。tar と unzip は bsdtar と bsdunzip へのリンク)
 pkgname=libarchive
-pkgver=3.8.9
+pkgver=3.8.10
 pkgrel=1
 pkgdesc='Multi-format archive and compression library, with bsdtar as tar (static, for aios)'
 arch=('aarch64')
@@ -13,7 +13,7 @@ provides=('tar')
 conflicts=('tar')
 replaces=('tar')
 source=("https://www.libarchive.org/downloads/libarchive-$pkgver.tar.xz")
-sha256sums=('888c934f9d95648ecb9163dc8e23ab80a476ecb81a8f1154704a227b5b676dde')
+sha256sums=('56cad765459d5ee25a3b761f90c47d99379d28297fbfb72d908880d6b875fb96')
 
 prepare() {
   rm -rf "libarchive-$pkgver"

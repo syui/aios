@@ -44,7 +44,7 @@
   {"name": "iproute2",          "type": "c",       "src": "https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-7.2.0.tar.xz",                                        "now": "7.2.0",          "latest": "7.2.0"},
   {"name": "jq",                "type": "c",       "src": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-1.8.2.tar.gz",                                          "now": "1.8.2",          "latest": "1.8.2"},
   {"name": "less",              "type": "c",       "src": "https://www.greenwoodsoftware.com/less/less-710.tar.gz",                                                           "now": "710",            "latest": "710"},
-  {"name": "libarchive",        "type": "c",       "src": "https://www.libarchive.org/downloads/libarchive-3.8.9.tar.xz",                                                     "now": "3.8.9",          "latest": "3.8.10"},
+  {"name": "libarchive",        "type": "c",       "src": "https://www.libarchive.org/downloads/libarchive-3.8.10.tar.xz",                                                    "now": "3.8.10",         "latest": "3.8.10"},
   {"name": "libdrm",            "type": "c",       "src": "https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz",                                                         "now": "2.4.134",        "latest": "2.4.134"},
   {"name": "libepoxy",          "type": "c",       "src": "https://download.gnome.org/sources/libepoxy/1.5/libepoxy-1.5.10.tar.xz",                                           "now": "1.5.10",         "latest": "1.5.10"},
   {"name": "libevent",          "type": "c",       "src": "https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz",       "now": "2.1.13",         "latest": "2.1.13"},
