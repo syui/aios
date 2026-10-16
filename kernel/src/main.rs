@@ -27,6 +27,7 @@ mod file;
 mod fs;
 mod irq;
 mod heap;
+mod tlsf;
 mod initrd;
 mod kalloc;
 mod memlayout;

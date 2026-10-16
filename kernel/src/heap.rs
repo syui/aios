@@ -1,27 +1,16 @@
-// カーネルヒープ: bss 上の固定領域を first-fit のフリーリストで切り分ける
+// カーネルヒープ: bss 上の固定領域 (と、メモリが多ければ足したもの) を切り分ける。空きの管理は TLSF (tlsf.rs:
+// 取るのも返すのも O(1))。ここはロック、使っている量の数え、どこで取ったか (heap trace)
 use crate::spinlock::SpinLock;
+use crate::tlsf::{self, Tlsf};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-/// 使っているバイト (ヘッダこみ)、いちばん多かったとき、取れなかった回数 (/proc/ai/heap)
+/// 使っているバイト (ヘッダこみ)、いちばん多かったとき、取れなかった回数 (/proc/ai/heap)。USED と PEAK を変えるのは HEAP の
+/// ロックを持っているときだけなので、読んで書くだけ (fetch_add のような読み書きの命令は TCG で重い)
 static USED: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static FAILS: AtomicUsize = AtomicUsize::new(0);
-
-/// 空きのかたまりの数と、いちばん大きなもの
-fn free_blocks(h: &Heap) -> (usize, usize) {
-    let (mut n, mut big) = (0, 0);
-    let mut cur = h.head;
-    while !cur.is_null() {
-        unsafe {
-            n += 1;
-            big = big.max((*cur).size);
-            cur = (*cur).next;
-        }
-    }
-    (n, big)
-}
 
 // ---- どこで取ったか (調べもの用。/proc/ai/ctl に heap trace on) ----
 // 取ったところの呼び出し (フレームポインタで 6 段) ごとに、いま持っているバイトと数を数える。
@@ -95,6 +84,16 @@ fn site_sub(id: usize, bytes: usize) {
     s.count = s.count.saturating_sub(1);
 }
 
+/// heap check: 空きの管理の決まり (つながり、印、リスト、ビット) を確かめて kmsg に。ブロックをみなたどるので、
+/// ロックを持ったままになる (数万のブロックで数 ms)
+pub fn check() {
+    let r = unsafe { HEAP.lock().check() };
+    match r {
+        Ok(()) => crate::println!("heap: check ok"),
+        Err(e) => crate::println!("heap: check FAILED: {}", e),
+    }
+}
+
 /// heap trace on|off|reset
 pub fn trace(on: bool) {
     let _h = HEAP.lock();
@@ -136,7 +135,7 @@ pub fn used() -> usize {
 
 /// /proc/ai/heap: 1 行の JSON
 pub fn stats_json() -> alloc::string::String {
-    let (n, big) = free_blocks(&HEAP.lock());
+    let (n, big, _) = HEAP.lock().stats();
     let mut s = alloc::format!(
         "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{}}}\n",
         size(),
@@ -160,19 +159,7 @@ struct Area([u8; HEAP_SIZE]);
 
 static mut AREA: Area = Area([0; HEAP_SIZE]);
 
-/// 空きブロックの先頭に置くヘッダ (アドレス順に並べる)
-struct Free {
-    size: usize,
-    next: *mut Free,
-}
-
-struct Heap {
-    head: *mut Free,
-}
-
-unsafe impl Send for Heap {}
-
-static HEAP: SpinLock<Heap> = SpinLock::new(Heap { head: ptr::null_mut() });
+static HEAP: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
 
 /// ヒープの大きさの上限 (メモリの多いマシンでも)
 const MAX_TOTAL: usize = 512 * 1024 * 1024;
@@ -181,30 +168,14 @@ const MAX_TOTAL: usize = 512 * 1024 * 1024;
 /// (ページキャッシュの表、tmpfs、プロセスの地図などがメモリに比例してふえるので、決まった大きさでは
 /// 大きなビルドで足りなくなった。2 GiB で 64 MiB、16 GiB で 512 MiB。kalloc::init のあとで)
 pub fn init() {
-    let base = (&raw mut AREA) as *mut Free;
-    unsafe { base.write(Free { size: HEAP_SIZE, next: ptr::null_mut() }) };
-    HEAP.lock().head = base;
+    unsafe { HEAP.lock().add_region((&raw mut AREA) as *mut u8, HEAP_SIZE) };
     let want = (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, MAX_TOTAL);
     let extra = want - HEAP_SIZE;
     if extra == 0 {
         return;
     }
     let Some(p) = crate::kalloc::take_contiguous(extra) else { return };
-    // フリーリストはアドレスの順: 足すものは bss (カーネルの中) より後ろにあるので、おしまいにつなぐ
-    let blk = p as *mut Free;
-    let h = HEAP.lock();
-    unsafe {
-        blk.write(Free { size: extra, next: ptr::null_mut() });
-        let mut cur = h.head;
-        while !(*cur).next.is_null() {
-            cur = (*cur).next;
-        }
-        if (cur as usize) < blk as usize {
-            (*cur).next = blk;
-        } else {
-            return;
-        }
-    }
+    unsafe { HEAP.lock().add_region(p as *mut u8, extra) };
     TOTAL.store(want, Relaxed);
 }
 
@@ -212,8 +183,8 @@ fn round(n: usize) -> usize {
     (n + ALIGN - 1) & !(ALIGN - 1)
 }
 
-/// 確保したブロックの直前に大きさを覚えておく
-const HDR: usize = ALIGN;
+/// 確保したブロックのヘッダ (1 語目は tlsf の大きさと印、2 語目は取ったところの番号)。中身はそのあと
+const HDR: usize = tlsf::ALIGN;
 
 struct Kernel;
 
@@ -224,33 +195,23 @@ unsafe impl GlobalAlloc for Kernel {
         }
         let need = round(layout.size().max(1)) + HDR;
         let mut h = HEAP.lock();
-        let mut prev: *mut *mut Free = &mut h.head;
         unsafe {
-            while !(*prev).is_null() {
-                let cur = *prev;
-                let size = (*cur).size;
-                if size >= need {
-                    if size - need >= size_of::<Free>() + ALIGN {
-                        let rest = (cur as *mut u8).add(need) as *mut Free;
-                        rest.write(Free { size: size - need, next: (*cur).next });
-                        *prev = rest;
-                        *(cur as *mut usize) = need;
-                    } else {
-                        *prev = (*cur).next;
-                        *(cur as *mut usize) = size;
-                    }
-                    let used = USED.fetch_add(*(cur as *mut usize), Relaxed) + *(cur as *mut usize);
-                    PEAK.fetch_max(used, Relaxed);
-                    // ヘッダの 2 語目: どこで取ったか (調べているときだけ。ほかは 0)
-                    *(cur as *mut usize).add(1) = if TRACE.load(Relaxed) { site_add(*(cur as *mut usize)) } else { 0 };
-                    return (cur as *mut u8).add(HDR);
+            let b = h.alloc(need);
+            if !b.is_null() {
+                let size = tlsf::block_size(b);
+                let used = USED.load(Relaxed) + size;
+                USED.store(used, Relaxed);
+                if used > PEAK.load(Relaxed) {
+                    PEAK.store(used, Relaxed);
                 }
-                prev = &mut (*cur).next;
+                // ヘッダの 2 語目: どこで取ったか (調べているときだけ。ほかは 0)
+                *(b as *mut usize).add(1) = if TRACE.load(Relaxed) { site_add(size) } else { 0 };
+                return b.add(HDR);
             }
         }
         // 取れなかった: どれだけ使っていて、空きがどれだけ割れているか (このあと panic になることが多い。ヒープは使わずに書く)
         FAILS.fetch_add(1, Relaxed);
-        let (n, big) = free_blocks(&h);
+        let (n, big, _) = h.stats();
         crate::println!(
             "heap: no {} bytes (used {} of {}, peak {}, {} free blocks, the largest {})",
             need,
@@ -265,31 +226,13 @@ unsafe impl GlobalAlloc for Kernel {
 
     unsafe fn dealloc(&self, p: *mut u8, _layout: Layout) {
         unsafe {
-            let blk = p.sub(HDR) as *mut Free;
-            let size = *(blk as *mut usize);
-            USED.fetch_sub(size, Relaxed);
+            let b = p.sub(HDR);
+            // 大きさはロックの中で読む (ヘッダの PREV_FREE は、前のブロックを取ったり返したりするほかの CPU が変える)
             let mut h = HEAP.lock();
-            site_sub(*(blk as *mut usize).add(1), size);
-            // アドレス順の位置を探して挿入し、前後と結合する
-            let mut prev: *mut Free = ptr::null_mut();
-            let mut cur = h.head;
-            while !cur.is_null() && cur < blk {
-                prev = cur;
-                cur = (*cur).next;
-            }
-            blk.write(Free { size, next: cur });
-            if !cur.is_null() && (blk as usize) + size == cur as usize {
-                (*blk).size += (*cur).size;
-                (*blk).next = (*cur).next;
-            }
-            if prev.is_null() {
-                h.head = blk;
-            } else if (prev as usize) + (*prev).size == blk as usize {
-                (*prev).size += (*blk).size;
-                (*prev).next = (*blk).next;
-            } else {
-                (*prev).next = blk;
-            }
+            let size = tlsf::block_size(b);
+            USED.store(USED.load(Relaxed) - size, Relaxed);
+            site_sub(*(b as *mut usize).add(1), size);
+            h.free(b);
         }
     }
 }

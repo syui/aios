@@ -70,6 +70,11 @@ jobs:
         # Python の hashlib、openssl と答え合わせ
         run: python3 test/crypto.py
 
+      - name: tlsf.rs
+        # カーネルのヒープの空きの管理 (kernel/src/tlsf.rs) をこのマシンでビルドして、でたらめに取り・返して確かめる
+        # (重なり、つながり、リストとビット、ぜんぶ返したら区画ごとに 1 つに戻るか)
+        run: python3 test/heap.py
+
       - name: Build disk.img
         run: |
           git config user.name ai

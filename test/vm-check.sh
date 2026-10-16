@@ -66,5 +66,8 @@ t pipe-writers eq "$( (seq 1 30000 & seq 1 30000 & seq 1 30000 & seq 1 30000 & w
 # sudo (パスワードなしで使えるイメージの ai)
 t sudo sudo -n true
 
+# カーネルのヒープ (tlsf.rs) の決まりが、ここまでのたしかめのあとも守られているか (heap check の答えは kmsg に)
+t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
+
 echo "checks: $n, $fail failed"
 [ "$fail" = 0 ]
