@@ -455,9 +455,13 @@ impl Inode for TmpInode {
     fn fallocate(&self, mode: u32, off: u64, len: u64, modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
         const KEEP_SIZE: u32 = 0x01;
         const PUNCH_HOLE: u32 = 0x02;
+        const ZERO_RANGE: u32 = 0x10;
         // Linux の shmem_fallocate: できるのは KEEP_SIZE と PUNCH_HOLE だけ。封を見て、うまくいったら file_modified。
-        // 場所をとるとき (mode 0) もページは作らない (Linux でも、書くまで穴として読む)
-        if mode & !(KEEP_SIZE | PUNCH_HOLE) != 0 {
+        // 場所をとるとき (mode 0) もページは作らない (Linux でも、書くまで穴として読む)。
+        // aios がえらんだちがい (zero-range-tmpfs): ZERO_RANGE もできる (ext4 と同じく 0 にして、KEEP_SIZE でなければ
+        // 大きくする)。穴をあけてから場所をとるのと同じで、封は先に両方 (書く、大きくする) を見る。Linux の tmpfs は
+        // EOPNOTSUPP で、使う人は穴をあけて場所をとりなおす。doc/aios.md の「aios がえらんだちがい」
+        if mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0 {
             return Err(-EOPNOTSUPP);
         }
         let seals = self.seals.get().unwrap_or(0);
@@ -471,8 +475,14 @@ impl Inode for TmpInode {
                 d.owned()?.punch(off as usize, end);
             }
             Node::File(d) => {
+                if mode & ZERO_RANGE != 0 && seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                    return Err(-EPERM);
+                }
                 if seals & F_SEAL_GROW != 0 && end > d.len() {
                     return Err(-EPERM);
+                }
+                if mode & ZERO_RANGE != 0 {
+                    d.owned()?.punch(off as usize, end);
                 }
                 if mode & KEEP_SIZE == 0 && end > d.len() {
                     d.owned()?.truncate(end);

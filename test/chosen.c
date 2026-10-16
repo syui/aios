@@ -1,0 +1,248 @@
+// aios がえらんだちがい (doc/aios.md の表、test/sysdiff.c の chosen) を 1 つずつ確かめる (カーネル)。
+// aios の中では、aios がえらんだとおりに動くか (vm-ctests.sh)。Linux では、Linux がまだちがうふるまいか
+// (test/linux-vm.sh exec でいちばん新しい Linux の中で: Linux が aios と同じになったら SAME と出す。表を見なおすとき)。
+//   cc -O2 -o chosen test/chosen.c (aios の中は zig cc -target aarch64-linux-musl -O2 -static)
+//   ./chosen DIR...   DIR ごとに (ext4 のホームと tmpfs の /tmp)
+// 1 行に ok NAME、SAME NAME (Linux だけ)、FAIL NAME。おしまいに chosen failed: N
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <sys/vfs.h>
+#include <unistd.h>
+
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+#ifndef FALLOC_FL_ZERO_RANGE
+#define FALLOC_FL_ZERO_RANGE 0x10
+#endif
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#define K_TMPFS_MAGIC 0x01021994
+
+static int on_aios, fails, same;
+static char dir[4096];
+
+// aios なら aios のふるまいか、Linux なら Linux のふるまいか。どちらでもなければ FAIL。Linux が aios と同じなら SAME
+static void check(const char *name, int is_aios, int is_linux, const char *got) {
+    if (on_aios ? is_aios : is_linux)
+        printf("ok %s (%s): %s\n", name, dir, got);
+    else if (!on_aios && is_aios) {
+        printf("SAME %s (%s): Linux now does what aios chose: %s\n", name, dir, got);
+        same++;
+    } else {
+        printf("FAIL %s (%s): %s\n", name, dir, got);
+        fails++;
+    }
+}
+
+static int mkfile(const char *name, const char *data, int flags) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    unlink(p);
+    int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, data, strlen(data)) != (ssize_t)strlen(data)) {
+        perror(p);
+        exit(2);
+    }
+    if (flags) {
+        close(fd);
+        fd = open(p, flags);
+    }
+    return fd;
+}
+
+static void rm(const char *name) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    unlink(p);
+}
+
+// ファイルの中身 (0 は . に)
+static const char *body(int fd, char *b, size_t n) {
+    ssize_t r = pread(fd, b, n - 1, 0);
+    if (r < 0)
+        r = 0;
+    b[r] = 0;
+    for (ssize_t i = 0; i < r; i++)
+        if (!b[i])
+            b[i] = '.';
+    return b;
+}
+
+static void pwrite_append(void) {
+    int fd = mkfile(".ch-pa", "abcd", O_RDWR | O_APPEND);
+    char b[64], got[160];
+    long r = pwrite(fd, "X", 1, 1);
+    snprintf(got, sizeof got, "pwrite = %ld, file %s", r, body(fd, b, sizeof b));
+    check("pwrite-append", r == 1 && !strcmp(b, "aXcd"), r == 1 && !strcmp(b, "abcdX"), got);
+    close(fd);
+    rm(".ch-pa");
+}
+
+static void seek_unwritten(int tmpfs) {
+    // tmpfs は Linux でもいつも穴なので、ext4 だけ
+    if (tmpfs)
+        return;
+    int fd = mkfile(".ch-su", "", 0);
+    char b[4096], got[160];
+    if (fallocate(fd, 0, 0, 8192) < 0) {
+        printf("FAIL seek-unwritten (%s): fallocate: %s\n", dir, strerror(errno));
+        fails++;
+        close(fd);
+        return;
+    }
+    // 読むと、Linux の ext4 ではページキャッシュに入り、そこはデータになる
+    long n = pread(fd, b, sizeof b, 0);
+    long d = lseek(fd, 0, SEEK_DATA);
+    int e = errno;
+    snprintf(got, sizeof got, "read %ld, SEEK_DATA = %ld%s%s", n, d, d < 0 ? " " : "", d < 0 ? strerror(e) : "");
+    check("seek-unwritten", d < 0 && e == ENXIO, d == 0, got);
+    close(fd);
+    rm(".ch-su");
+}
+
+static void utimensat_omit(void) {
+    struct timespec omit[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    char p[4200], got[200];
+    snprintf(p, sizeof p, "%s/.ch-no-such-file", dir);
+    long r1 = syscall(SYS_utimensat, AT_FDCWD, p, omit, 0);
+    int e1 = errno;
+    long r2 = syscall(SYS_utimensat, 999, NULL, omit, 0);
+    int e2 = errno;
+    // あるファイルは、どちらでも 0 で、時刻は変わらない
+    int fd = mkfile(".ch-uo", "x", 0);
+    struct timespec t[2] = {{1000000000, 0}, {1000000000, 0}};
+    futimens(fd, t);
+    struct stat a, b;
+    fstat(fd, &a);
+    snprintf(p, sizeof p, "%s/.ch-uo", dir);
+    long r3 = syscall(SYS_utimensat, AT_FDCWD, p, omit, 0);
+    fstat(fd, &b);
+    int kept = a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec && a.st_ctim.tv_sec == b.st_ctim.tv_sec &&
+               a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
+    snprintf(got, sizeof got, "no file = %ld%s%s, closed fd = %ld%s%s, file = %ld%s", r1, r1 < 0 ? " " : "", r1 < 0 ? strerror(e1) : "", r2,
+             r2 < 0 ? " " : "", r2 < 0 ? strerror(e2) : "", r3, kept ? " (times kept)" : " (times changed)");
+    check("utimensat-omit", r1 < 0 && e1 == ENOENT && r2 < 0 && e2 == EBADF && r3 == 0 && kept, r1 == 0 && r2 == 0 && r3 == 0 && kept, got);
+    close(fd);
+    rm(".ch-uo");
+}
+
+static void copy_append(void) {
+    int in = mkfile(".ch-ca-in", "hello", 0);
+    int out = mkfile(".ch-ca-out", "xy", O_WRONLY | O_APPEND);
+    lseek(in, 0, SEEK_SET);
+    char b[64], got[300];
+    // 位置なし: 終わりに足して、書くほうの位置は終わり
+    long r1 = syscall(SYS_copy_file_range, in, NULL, out, NULL, 5, 0);
+    int e1 = errno;
+    long at = lseek(out, 0, SEEK_CUR);
+    // 位置あり: そこへ (pwrite-append と同じ)
+    long long i0 = 0, o1 = 1;
+    long r2 = syscall(SYS_copy_file_range, in, &i0, out, &o1, 2, 0);
+    int e2 = errno;
+    // sendfile: 終わりに足す
+    lseek(in, 0, SEEK_SET);
+    long r3 = sendfile(out, in, NULL, 5);
+    int e3 = errno;
+    char p[4200];
+    snprintf(p, sizeof p, "%s/.ch-ca-out", dir);
+    int rd = open(p, O_RDONLY);
+    body(rd, b, sizeof b);
+    close(rd);
+    snprintf(got, sizeof got, "copy_file_range = %ld%s%s (pos %ld), at 1 = %ld%s%s, sendfile = %ld%s%s, file %s", r1, r1 < 0 ? " " : "",
+             r1 < 0 ? strerror(e1) : "", at, r2, r2 < 0 ? " " : "", r2 < 0 ? strerror(e2) : "", r3, r3 < 0 ? " " : "", r3 < 0 ? strerror(e3) : "",
+             b);
+    check("copy-append", r1 == 5 && at == 7 && r2 == 2 && o1 == 3 && r3 == 5 && !strcmp(b, "xheellohello"),
+          r1 < 0 && e1 == EBADF && r2 < 0 && e2 == EBADF && r3 < 0 && e3 == EINVAL && !strcmp(b, "xy"), got);
+    close(in);
+    close(out);
+    rm(".ch-ca-in");
+    rm(".ch-ca-out");
+}
+
+static void sendfile_self(void) {
+    char got[200];
+    // 重なる: 0 からの 8 バイトを 4 へ。aios は EINVAL (copy_file_range と同じ)、Linux は写す
+    int fd = mkfile(".ch-ss", "abcdefgh", 0);
+    lseek(fd, 4, SEEK_SET);
+    off_t at = 0;
+    long r1 = sendfile(fd, fd, &at, 8);
+    int e1 = errno;
+    close(fd);
+    // 重ならない: 終わりの先 (1000) へ 20 バイトたのむと、aios は読みはじめたときの終わりまで (8 バイト)。Linux は
+    // 書いてのびたところ (穴) も読む
+    fd = mkfile(".ch-ss", "abcdefgh", 0);
+    lseek(fd, 1000, SEEK_SET);
+    at = 0;
+    long r2 = sendfile(fd, fd, &at, 20);
+    struct stat st;
+    fstat(fd, &st);
+    snprintf(got, sizeof got, "overlapping = %ld%s%s, past the end = %ld, size %lld", r1, r1 < 0 ? " " : "", r1 < 0 ? strerror(e1) : "", r2,
+             (long long)st.st_size);
+    check("sendfile-self", r1 < 0 && e1 == EINVAL && r2 == 8 && st.st_size == 1008, r1 == 8 && r2 == 20 && st.st_size == 1020, got);
+    close(fd);
+    rm(".ch-ss");
+}
+
+static void zero_range(int tmpfs) {
+    char data[8193], b[9100], got[200];
+    for (int i = 0; i < 8192; i++)
+        data[i] = 'a' + i % 26;
+    data[8192] = 0;
+    int fd = mkfile(".ch-zr", data, 0);
+    // まん中を 0 に、終わりをこえて (大きくなる)、KEEP_SIZE で終わりの先 (大きさは変わらない)
+    long r1 = fallocate(fd, FALLOC_FL_ZERO_RANGE, 100, 5000);
+    int e1 = errno;
+    long r2 = fallocate(fd, FALLOC_FL_ZERO_RANGE, 8000, 1000);
+    long r3 = fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, 8500, 4096);
+    struct stat st;
+    fstat(fd, &st);
+    long n = pread(fd, b, sizeof b, 0);
+    int ok = n == 9000;
+    for (long i = 0; ok && i < n; i++)
+        ok = b[i] == ((i >= 100 && i < 5100) || i >= 8000 ? 0 : data[i]);
+    snprintf(got, sizeof got, "ZERO_RANGE = %ld%s%s, past the end = %ld, KEEP_SIZE = %ld, size %lld, %s", r1, r1 < 0 ? " " : "",
+             r1 < 0 ? strerror(e1) : "", r2, r3, (long long)st.st_size, ok ? "zeros right" : "contents wrong");
+    // ext4 はどちらでもできる。tmpfs は aios だけ
+    int works = r1 == 0 && r2 == 0 && r3 == 0 && st.st_size == 9000 && ok;
+    if (tmpfs)
+        check("zero-range-tmpfs", works, r1 < 0 && e1 == EOPNOTSUPP && st.st_size == 8192, got);
+    else if (works)
+        printf("ok zero-range (ext4, the same on Linux) (%s): %s\n", dir, got);
+    else {
+        printf("FAIL zero-range (%s): %s\n", dir, got);
+        fails++;
+    }
+    close(fd);
+    rm(".ch-zr");
+}
+
+int main(int argc, char **argv) {
+    struct utsname u;
+    on_aios = uname(&u) == 0 && !strcmp(u.sysname, "aios");
+    printf("chosen: on %s %s\n", u.sysname, u.release);
+    for (int i = 1; i < argc; i++) {
+        snprintf(dir, sizeof dir, "%s", argv[i]);
+        struct statfs sf;
+        int tmpfs = statfs(dir, &sf) == 0 && sf.f_type == K_TMPFS_MAGIC;
+        pwrite_append();
+        seek_unwritten(tmpfs);
+        utimensat_omit();
+        copy_append();
+        zero_range(tmpfs);
+        sendfile_self();
+    }
+    if (!on_aios)
+        printf("chosen: Linux does %d of them like aios now\n", same);
+    printf("chosen failed: %d\n", fails);
+    return fails != 0;
+}

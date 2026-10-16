@@ -1729,9 +1729,8 @@ pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
-    // Linux の utimensat の順: 時刻を写し、どちらも OMIT ならパスも見ずに 0。fd (パスが NULL) ならフラグは 0 だけ、
-    // パスなら AT_SYMLINK_NOFOLLOW と AT_EMPTY_PATH だけ (EINVAL)。たどってから ns のまちがい (EINVAL。vfs_utimes)、
-    // 読むだけのマウント (EROFS)、許可
+    // Linux の utimensat の順: 時刻を写し、fd (パスが NULL) ならフラグは 0 だけ、パスなら AT_SYMLINK_NOFOLLOW と
+    // AT_EMPTY_PATH だけ (EINVAL)。たどってから ns のまちがい (EINVAL。vfs_utimes)、読むだけのマウント (EROFS)、許可
     let t = if times == 0 {
         None
     } else {
@@ -1740,9 +1739,10 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         let w = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
         Some([(w(0), w(1)), (w(2), w(3))])
     };
-    if t.is_some_and(|t| t[0].1 == UTIME_OMIT && t[1].1 == UTIME_OMIT) {
-        return Ok(0);
-    }
+    // aios がえらんだちがい (utimensat-omit): どちらも OMIT でも、フラグと fd とパスはほかのときと同じにしらべる
+    // (ないファイルは ENOENT、閉じた fd は EBADF。POSIX)。変えるものはないので、たどれたら許可や読むだけのマウントは
+    // 見ずに 0。Linux はパスも見ずに 0 を返す (ないファイルでも)。doc/aios.md の「aios がえらんだちがい」
+    let omit = t.is_some_and(|t| t[0].1 == UTIME_OMIT && t[1].1 == UTIME_OMIT);
     let null_fd = pathp == 0 && dirfd != AT_FDCWD;
     if null_fd && flags != 0 {
         return Err(-EINVAL);
@@ -1757,6 +1757,9 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         let f = file_of(dirfd as u64)?;
         if null_fd && f.borrow().flags & file::O_PATH != 0 {
             return Err(-EBADF);
+        }
+        if omit {
+            return Ok(0);
         }
         // パイプ (pipefs の inode): 持ち主と許可は fstat に見せるもの
         if let Some(p) = pipe_of(dirfd as u64) {
@@ -1792,7 +1795,11 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         }
     } else {
         let full = old_path(dirfd, pathp, flags)?;
-        (at_path(dirfd, &path, flags)?, full)
+        let ino = at_path(dirfd, &path, flags)?;
+        if omit {
+            return Ok(0);
+        }
+        (ino, full)
     };
     let ns_ok = |ns: i64| ns == UTIME_NOW || ns == UTIME_OMIT || (0..1_000_000_000).contains(&ns);
     if t.is_some_and(|t| !ns_ok(t[0].1) || !ns_ok(t[1].1)) {
@@ -2499,7 +2506,7 @@ fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeC
 /// ファイル in の pos から len バイトを、ファイル out の opos へ写す (Linux の do_splice_direct で、
 /// copy_file_range と sendfile が使う)。splice_direct_to_actor と同じく、16 ページの内側のパイプに入る分
 /// (位置がページの途中なら、そのぶん少ない) ずつ、読めなくなる (ファイルの終わり) か、書くのが短くなるまで。
-/// 同じファイルなら、書いた分もまた読む。写せたバイト数
+/// 同じファイルのときは、呼ぶほうが重ならない範囲にしている (copy_file_range と sendfile-self)。写せたバイト数
 fn copy_inode_range(src: &InodeRef, pos: i64, dst: &InodeRef, opos: i64, len: usize) -> Result<usize, i64> {
     const PG: usize = crate::memlayout::PGSIZE;
     let mut done = 0;
@@ -2538,7 +2545,7 @@ fn copy_inode_range(src: &InodeRef, pos: i64, dst: &InodeRef, opos: i64, len: us
 pub fn copy_file_range(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> R {
     const EOVERFLOW: i64 = 75;
     // Linux の順: 両方の fd (O_PATH も EBADF)、位置を写し (EFAULT)、flags (EINVAL)、generic_file_rw_checks
-    // (ディレクトリは EISDIR、ふつうのファイルでなければ EINVAL、読めない・書けない・O_APPEND なら EBADF)、
+    // (ディレクトリは EISDIR、ふつうのファイルでなければ EINVAL、読めない・書けないなら EBADF)、
     // ファイルシステムがちがえば EXDEV、位置 + 長さがあふれたら EOVERFLOW、長さを読むほうの終わりまでに縮め、
     // 同じファイルで重なれば EINVAL、位置のしらべ (EINVAL)、長さ 0 なら 0
     let fi = file_of(fd_in)?;
@@ -2558,12 +2565,18 @@ pub fn copy_file_range(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, l
     if mi != vfs::S_IFREG || mo != vfs::S_IFREG {
         return Err(-EINVAL);
     }
-    if !fi.borrow().readable() || !fo.borrow().writable() || fo.borrow().flags & file::O_APPEND != 0 {
+    if !fi.borrow().readable() || !fo.borrow().writable() {
         return Err(-EBADF);
     }
     let (Some((ii, pin)), Some((io, pout))) = (inode_path(&fi), inode_path(&fo)) else { return Err(-EINVAL) };
     if ii.id().0 != io.id().0 {
         return Err(-vfs::EXDEV);
+    }
+    // aios がえらんだちがい (copy-append): O_APPEND で開いたものへも写せる。位置をわたされたらそこへ (pwrite-append と
+    // 同じ)、わたされなければ write と同じく終わりへ足す。Linux は EBADF (sendfile は EINVAL) で、写す人は read と
+    // write でやりなおす。doc/aios.md の「aios がえらんだちがい」
+    if fo.borrow().flags & file::O_APPEND != 0 && off_out == 0 {
+        pos_out = io.meta().size as i64;
     }
     let count = len as u64;
     if (pos_in as u64).checked_add(count).is_none() || (pos_out as u64).checked_add(count).is_none() {
@@ -2618,8 +2631,8 @@ pub fn sendfile(out_fd: u64, in_fd: u64, offp: usize, count: usize) -> R {
 
 /// Linux の do_sendfile の順: 読むほうの fd (読めなければ EBADF)、位置 (わたされたのに位置のないものなら ESPIPE)、
 /// 位置のしらべ (EINVAL)、書くほうの fd (書けなければ EBADF)。書くほうがパイプならそこへ splice
-/// (splice_file_to_pipe)、ほかは位置のしらべ、O_APPEND なら EINVAL、読むほうに位置がなければ EINVAL
-/// (do_splice_direct)、それから写す
+/// (splice_file_to_pipe)、ほかは位置のしらべ、読むほうに位置がなければ EINVAL (do_splice_direct)、それから写す。
+/// O_APPEND なら終わりに足す (aios がえらんだちがい copy-append。Linux は EINVAL)
 fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) -> R {
     let fi = file_of(in_fd)?;
     if !fi.borrow().readable() {
@@ -2637,7 +2650,11 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
     if !fo.borrow().writable() {
         return Err(-EBADF);
     }
-    let out_pos = fo.borrow().offset as i64;
+    // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへは、write と同じく終わりに足す
+    let out_pos = match &fo.borrow().kind {
+        Kind::Inode(io, _) if fo.borrow().flags & file::O_APPEND != 0 => io.meta().size as i64,
+        _ => fo.borrow().offset as i64,
+    };
     // 両方のファイルの大きさの上限 (s_maxbytes) をこえるなら EOVERFLOW (読みはじめがもうこえているとき)、
     // こえる分は短く
     const EOVERFLOW: i64 = 75;
@@ -2656,8 +2673,23 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
         splice_file_to_pipe(&fi, &mut at, &p, count, nonblock)?
     } else {
         verify_pos(out_pos, count)?;
-        if fo.borrow().flags & file::O_APPEND != 0 || !seekable {
+        if !seekable {
             return Err(-EINVAL);
+        }
+        // aios がえらんだちがい (sendfile-self): 同じファイルの中なら copy_file_range と同じく、読みはじめたときの終わり
+        // までを写し、読むところと書くところが重なれば EINVAL。Linux は重なっても写し、読むのがページキャッシュのページ
+        // そのもの (写しをとらない) なので、同じ回に書いたものが読みにまざり、答えが内側のくぎり (16 ページ) やページの
+        // まとまり (folio) の大きさで変わる。doc/aios.md の「aios がえらんだちがい」
+        let mut count = count;
+        if let (Some((ii, _)), Some((io, _))) = (inode_path(&fi), inode_path(&fo))
+            && ii.id() == io.id()
+            && ii.meta().mode & S_IFMT == vfs::S_IFREG
+        {
+            let size = ii.meta().size as i64;
+            count = if pos >= size { 0 } else { count.min((size - pos) as usize) };
+            if count > 0 && out_pos < pos + count as i64 && pos < out_pos + count as i64 {
+                return Err(-EINVAL);
+            }
         }
         if count == 0 {
             0

@@ -207,7 +207,7 @@ static int run(const char *file, uint64_t seed, int ops, int fragmode) {
             // 0 にする
             int keep = (int)pick(2);
             if (fallocate(fd, FALLOC_FL_ZERO_RANGE | (keep ? FALLOC_FL_KEEP_SIZE : 0), off, len) < 0) {
-                // tmpfs にはない
+                // Linux の tmpfs にはない (aios はある: aios がえらんだちがい zero-range-tmpfs)
                 if (errno == EOPNOTSUPP)
                     break;
                 fail("zero range", off, errno);

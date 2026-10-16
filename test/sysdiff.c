@@ -40,6 +40,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -78,6 +79,7 @@
 #define FL_KEEP_SIZE 0x01
 #define FL_PUNCH_HOLE 0x02
 #define FL_ZERO_RANGE 0x10
+#define K_TMPFS_MAGIC 0x01021994
 #define K_AT_STATX_FORCE_SYNC 0x2000
 #define K_AT_STATX_DONT_SYNC 0x4000
 #define K_STATX_BASIC_STATS 0x7ffU
@@ -229,6 +231,10 @@ static const struct {
 } chosen[] = {
     {"pwrite-append", "O_APPEND で開いた fd でも pwrite64 は off に書く (POSIX)。Linux は off を見ずに終わりに書く (pwrite(2) の BUGS)"},
     {"seek-unwritten", "SEEK_DATA / SEEK_HOLE は、fallocate でとってまだ書いていないところ (未初期化の extent) をいつも穴とする。Linux の ext4 は、そこがページキャッシュにあれば (読んだあと) データとする"},
+    {"utimensat-omit", "utimensat の時刻がどちらも UTIME_OMIT でも、フラグと fd とパスはしらべる (ないファイルは ENOENT。POSIX)。Linux はパスも見ずに 0"},
+    {"copy-append", "O_APPEND で開いたファイルへも copy_file_range と sendfile で写せる (位置をわたせばそこへ、なければ終わりに足す)。Linux は EBADF と EINVAL"},
+    {"zero-range-tmpfs", "tmpfs でも fallocate の ZERO_RANGE ができる (ext4 と同じ)。Linux の tmpfs は EOPNOTSUPP"},
+    {"sendfile-self", "同じファイルの中の sendfile は copy_file_range と同じ: 読みはじめたときの終わりまでを写し、重なれば EINVAL。Linux は重なっても写し、同じ回に書いたものが読みにまざる"},
 };
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
@@ -1247,25 +1253,69 @@ static void exec(int i, const struct op *o) {
         else
             sayq(o->p1);
         say(", %s, %s)", utn[o->x], ufn[o->y]);
-        ret(syscall(SYS_utimensat, fdof(o->d1), o->y == 3 ? NULL : o->p1, utv[o->x][0] < 0 ? NULL : ts, ufv[o->y]));
+        // chosen utimensat-omit: どちらも OMIT でも、fd とパスはしらべて、変えずに 0。Linux はパスも見ずに 0 なので、
+        // Linux では同じたどりかたで答えを出す: パスは fstatat (同じフラグ)、"" と AT_EMPTY_PATH は開いている fd か、
+        // NULL (futimens) は開いている O_PATH でない fd か
+        int omit = utv[o->x][1] == UTIME_OMIT && utv[o->x][3] == UTIME_OMIT;
+        if (omit && !on_aios) {
+            long long sb[32];
+            int f = fdof(o->d1);
+            if (o->y == 3) {
+                int fl = (int)syscall(SYS_fcntl, f, F_GETFL);
+                r = fl < 0 ? -1 : (fl & O_PATH) ? (errno = EBADF, -1) : 0;
+            } else if (o->y == 2)
+                r = syscall(SYS_fcntl, f, F_GETFD) < 0 ? -1 : 0;
+            else
+                r = syscall(SYS_newfstatat, f, o->p1, sb, ufv[o->y]);
+        } else
+            r = syscall(SYS_utimensat, fdof(o->d1), o->y == 3 ? NULL : o->p1, utv[o->x][0] < 0 ? NULL : ts, ufv[o->y]);
+        ret(r);
+        if (omit)
+            say(" [chosen utimensat-omit]");
         break;
     }
     case UMASK:
         say("umask(%04o) = %04o", umv[o->x], (unsigned)syscall(SYS_umask, umv[o->x]));
         break;
-    case FALLOC:
+    case FALLOC: {
         say("fallocate(%d, %s, %lld, %lld)", fd, fmn[o->x], o->off, o->len);
-        r = syscall(SYS_fallocate, fd, fmv[o->x], (off_t)o->off, (off_t)o->len);
+        int m = fmv[o->x];
+        // chosen zero-range-tmpfs: tmpfs のファイルでも ZERO_RANGE ができる。Linux の tmpfs は EOPNOTSUPP なので、
+        // Linux ではそのとき、穴をあけて (PUNCH_HOLE|KEEP_SIZE) から場所をとる (mode 0 か KEEP_SIZE)
+        struct stat st;
+        struct statfs sf;
+        int zt = (m & FL_ZERO_RANGE) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fstatfs(fd, &sf) == 0 && sf.f_type == K_TMPFS_MAGIC;
+        r = syscall(SYS_fallocate, fd, m, (off_t)o->off, (off_t)o->len);
+        if (zt && !on_aios && r < 0 && errno == EOPNOTSUPP) {
+            r = syscall(SYS_fallocate, fd, FL_PUNCH_HOLE | FL_KEEP_SIZE, (off_t)o->off, (off_t)o->len);
+            if (r == 0)
+                r = syscall(SYS_fallocate, fd, m & FL_KEEP_SIZE, (off_t)o->off, (off_t)o->len);
+        }
         ret(r);
+        if (zt)
+            say(" [chosen zero-range-tmpfs]");
         // 穴をあけるほかは、未初期化のブロックをとる
-        if (r == 0 && !(fmv[o->x] & FL_PUNCH_HOLE))
+        if (r == 0 && !(m & FL_PUNCH_HOLE))
             fallocated = 1;
         break;
+    }
     case COPYRANGE:
     case SENDFILE: {
         long long in = o->off, out = coffs[o->y];
         // 書くほうも、作った op がしくじっていたら開いているもの (読むほうとはちがう fd)
         int to = fdref(o->d2, o->fb, fd);
+        // chosen copy-append: O_APPEND で開いたファイルへも写す (位置をわたせばそこへ、なければ終わりに足す)。Linux
+        // では O_APPEND をはずし、書く位置がなければ終わりで写して、書くほうの位置を終わり + 写した分にしてもどす
+        int fl = (int)syscall(SYS_fcntl, to, F_GETFL);
+        struct stat ost;
+        int app = fl >= 0 && (fl & O_APPEND) && fstat(to, &ost) == 0 && S_ISREG(ost.st_mode);
+        int im = app && !on_aios, e = 0;
+        // chosen sendfile-self: sendfile で、読むほうと書くほうが同じふつうのファイル
+        struct stat ist, xst;
+        int self = o->kind == SENDFILE && fstat(fd, &ist) == 0 && S_ISREG(ist.st_mode) && fstat(to, &xst) == 0 && ist.st_dev == xst.st_dev &&
+                   ist.st_ino == xst.st_ino;
+        if (im)
+            syscall(SYS_fcntl, to, F_SETFL, fl & ~O_APPEND);
         if (o->kind == COPYRANGE) {
             say("copy_file_range(%d, ", fd);
             if (o->x & 1)
@@ -1278,7 +1328,11 @@ static void exec(int i, const struct op *o) {
             else
                 say("NULL");
             say(", %lld, %u)", o->len, o->mode);
-            r = syscall(SYS_copy_file_range, fd, (o->x & 1) ? &in : NULL, to, (o->x & 2) ? &out : NULL, (size_t)o->len, o->mode);
+            long long end = im ? (long long)ost.st_size : 0;
+            r = syscall(SYS_copy_file_range, fd, (o->x & 1) ? &in : NULL, to, (o->x & 2) ? &out : im ? &end : NULL, (size_t)o->len, o->mode);
+            e = errno;
+            if (im && r > 0 && !(o->x & 2))
+                syscall(SYS_lseek, to, (off_t)end, SEEK_SET);
         } else {
             say("sendfile(%d, %d, ", to, fd);
             if (o->x & 1)
@@ -1286,13 +1340,54 @@ static void exec(int i, const struct op *o) {
             else
                 say("NULL");
             say(", %lld)", o->len);
-            r = syscall(SYS_sendfile, to, fd, (o->x & 1) ? &in : NULL, (size_t)o->len);
+            // chosen sendfile-self: 同じファイルの中は copy_file_range と同じ (読みはじめたときの終わりまでを写し、重なれば
+            // EINVAL)。Linux では、長さ 0 の sendfile でほかのしらべをしてから、長さを終わりまでに縮め、重なりを見て写す。
+            // Linux で copy-append: sendfile は書く位置をわたせないので、書くほうの位置を終わりにし、読む位置はわたして
+            // 写す (同じ開いたファイルなら位置もひとつ)。読むほうに位置がなければ (パイプ)、O_APPEND によらず EINVAL
+            int sim = im || (self && !on_aios);
+            long long p = !sim ? 0 : (o->x & 1) ? in : (long long)syscall(SYS_lseek, fd, 0, SEEK_CUR);
+            if (sim && p >= 0) {
+                long long back = syscall(SYS_lseek, to, 0, SEEK_CUR);
+                if (im)
+                    syscall(SYS_lseek, to, (off_t)ost.st_size, SEEK_SET);
+                if (self) {
+                    long long q = p;
+                    r = syscall(SYS_sendfile, to, fd, &q, (size_t)0);
+                    if (r == 0) {
+                        long long at = syscall(SYS_lseek, to, 0, SEEK_CUR), size = ist.st_size;
+                        long long n = p >= size ? 0 : o->len < size - p ? o->len : size - p;
+                        if (n > 0 && at < p + n && p < at + n) {
+                            r = -1;
+                            errno = EINVAL;
+                        } else
+                            r = syscall(SYS_sendfile, to, fd, &p, (size_t)n);
+                    }
+                } else
+                    r = syscall(SYS_sendfile, to, fd, &p, (size_t)o->len);
+                e = errno;
+                if (r <= 0)
+                    syscall(SYS_lseek, to, (off_t)back, SEEK_SET);
+                else if (o->x & 1)
+                    in = p;
+                else
+                    syscall(SYS_lseek, fd, (off_t)p, SEEK_SET);
+            } else {
+                r = syscall(SYS_sendfile, to, fd, (o->x & 1) ? &in : NULL, (size_t)o->len);
+                e = errno;
+            }
         }
+        if (im)
+            syscall(SYS_fcntl, to, F_SETFL, fl);
+        errno = e;
         ret(r);
         if (r >= 0 && (o->x & 1))
             say(" in %lld", in);
         if (r >= 0 && (o->x & 2))
             say(" out %lld", out);
+        if (app)
+            say(" [chosen copy-append]");
+        if (self)
+            say(" [chosen sendfile-self]");
         break;
     }
     case STATX: {
