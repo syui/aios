@@ -1,5 +1,6 @@
-// sysdiff: Linux と答えあわせ (test/sysdiff.c)。種から決まるシステムコールの並びを、このマシンの Linux と
-// VM の aios で動かし、case ごとに最初にちがう行をくらべる。ちがいは (op、Linux の答え、aios の答え) で
+// sysdiff: Linux と答えあわせ (test/sysdiff.c)。種から決まるシステムコールの並びを、手本の Linux と VM の aios で
+// 動かし、case ごとに最初にちがう行をくらべる。手本は既定で kernel.org の最新の安定版 (test/linux-vm.sh が arm64 で
+// 作り、QEMU で起こした中で動かす)。base: host なら、このマシンのカーネル。ちがいは (op、Linux の答え、aios の答え) で
 // まとめ (syzbot がクラッシュをまとめるように)、多いものから、op を減らしてもちがいが残るいちばん小さな並び
 // (SEED:I,J,...) にする (C-Reduce や syzkaller の minimize と同じ: 縮めたものも、同じちがいが同じ op で出ること)。
 // 縮めるのは、まとめたものをみな 1 回の Linux と 1 回の VM でためす (VM は 1 回の行き来が重いので)。
@@ -56,9 +57,56 @@ fn chosen_cases(name: &str, l: &[(String, Vec<String>)], a: &[(String, Vec<Strin
     used.len()
 }
 
-/// このマシンの Linux で動かす。root なら nobody で (aios の中は ai なので、許可のしらべが同じになるように)。
-/// home なら build/ の下 (ext4 などそのマシンのもの)、tmp なら /dev/shm (tmpfs)
-fn linux(root: &Path, bin: &Path, ops: u64, tmp: bool, cases: &Path) -> Result<String, String> {
+/// 手本の Linux: このマシンのカーネル (host) か、test/linux-vm.sh で作った版を QEMU で起こしたもの (Image のパスと版)
+enum Base {
+    Host,
+    Vm(String, String),
+}
+
+impl Base {
+    /// base の名前 (latest、X.Y.Z、host) から。版のものは、なければ作る (一度だけ。数分)
+    fn get(root: &Path, spec: &str) -> Result<Base, String> {
+        if spec == "host" {
+            return Ok(Base::Host);
+        }
+        let script = root.join("test/linux-vm.sh").display().to_string();
+        let (st, v, err, _, _) = sh(root, &script, &["version", spec], &[], Duration::from_secs(60));
+        if st != 0 {
+            return Err(format!("test/linux-vm.sh version {}: {}", spec, err.trim()));
+        }
+        let v = v.trim().to_string();
+        note(json!({ "step": "linux kernel", "version": v }));
+        let (st, out, err, _, to) = sh(root, &script, &["build", &v], &[], Duration::from_secs(3600));
+        let image = out.lines().last().unwrap_or_default().trim().to_string();
+        if st != 0 || to || image.is_empty() {
+            return Err(format!("test/linux-vm.sh build {}{}: {}", v, if to { " (timed out)" } else { "" }, err.trim()));
+        }
+        Ok(Base::Vm(image, v))
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Base::Host => "host".into(),
+            Base::Vm(_, v) => format!("Linux {} (built by test/linux-vm.sh, run in QEMU)", v),
+        }
+    }
+}
+
+/// 手本の Linux で動かす。nobody で (aios の中は ai なので、許可のしらべが同じになるように)。
+/// QEMU の Linux なら、そこの ext4 (home) か tmpfs (tmp) で、aios と同じ aarch64 の sysdiff を。
+/// このマシンなら root のとき setpriv で、home は build/ の下 (ext4 などそのマシンのもの)、tmp は /dev/shm (tmpfs)
+fn linux(root: &Path, base: &Base, bins: &(PathBuf, PathBuf), ops: u64, tmp: bool, cases: &Path) -> Result<String, String> {
+    if let Base::Vm(image, _) = base {
+        let out = root.join("build/aish-vm/sysdiff/linux.txt");
+        let (b, c, n, o) = (bins.1.display().to_string(), cases.display().to_string(), ops.to_string(), out.display().to_string());
+        let script = root.join("test/linux-vm.sh").display().to_string();
+        let (st, _, err, _, to) = sh(root, &script, &["run", image, &b, &c, &n, if tmp { "tmp" } else { "home" }, &o], &[], Duration::from_secs(1900));
+        if st != 0 || to {
+            return Err(format!("linux (QEMU): sysdiff failed (status {}{}): {}", st, if to { ", timed out" } else { "" }, err.trim()));
+        }
+        return std::fs::read_to_string(&out).map_err(|e| e.to_string());
+    }
+    let bin = &bins.0;
     let work = if tmp { PathBuf::from("/dev/shm/aish-sysdiff") } else { root.join("build/aish-vm/sysdiff/work") };
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {}", work.display(), e))?;
     let rootuser = sh(root, "id", &["-u"], &[], Duration::from_secs(10)).1.trim() == "0";
@@ -206,8 +254,9 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     let dir = root.join("build/aish-vm/sysdiff");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     note(json!({ "step": "build" }));
-    let (host, _) = build(root, &dir)?;
-    let chosen = chosen_list(root, &host);
+    let bins = build(root, &dir)?;
+    let chosen = chosen_list(root, &bins.0);
+    let base = Base::get(root, a["base"].as_str().filter(|x| !x.is_empty()).unwrap_or("latest"))?;
     let cases = dir.join("cases.txt");
     std::fs::write(&cases, format!("{}-{}\n", from, from + seeds - 1)).map_err(|e| e.to_string())?;
     // Linux の答え: ほかの Linux で作ったもの (linux) か、このマシンで
@@ -215,7 +264,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         Some(f) => std::fs::read_to_string(f).map_err(|e| format!("{}: {}", f, e))?,
         None => {
             note(json!({ "step": "linux", "seeds": seeds }));
-            linux(root, &host, ops, tmp, &cases)?
+            linux(root, &base, &bins, ops, tmp, &cases)?
         }
     };
     let spec = a["kernel"].as_str().filter(|x| !x.is_empty()).unwrap_or(".");
@@ -286,7 +335,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         note(json!({ "step": "shrink", "round": rounds, "tries": tries.len() }));
         let list: Vec<String> = tries.iter().map(|(wi, keep)| case_of(&work[*wi].seed, keep)).collect();
         std::fs::write(&cases, list.join("\n") + "\n").map_err(|e| e.to_string())?;
-        let lt = linux(root, &host, ops, tmp, &cases)?;
+        let lt = linux(root, &base, &bins, ops, tmp, &cases)?;
         let at = aios(root, ops, tmp)?;
         let (_, lc) = split(&lt);
         let (_, ac) = split(&at);
@@ -317,7 +366,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     if !work.is_empty() {
         let list: Vec<String> = work.iter().map(|w| case_of(&w.seed, &w.keep)).collect();
         std::fs::write(&cases, list.join("\n") + "\n").map_err(|e| e.to_string())?;
-        let lt = linux(root, &host, ops, tmp, &cases)?;
+        let lt = linux(root, &base, &bins, ops, tmp, &cases)?;
         let at = aios(root, ops, tmp)?;
         let (_, lc) = split(&lt);
         let (_, ac) = split(&at);
@@ -354,6 +403,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         .collect();
     let mut r = json!({
         "linux": lsys,
+        "base": base.name(),
         "aios": asys,
         "fs": if tmp { "tmpfs" } else { "home (ext4)" },
         "ops": ops,
@@ -370,7 +420,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     }
     if a["linux"].as_str().is_some_and(|x| !x.is_empty()) {
         r["linux_file"] = json!(s(a, "linux"));
-        r["note"] = json!("Linux answers come from linux_file; shrinking ran on this machine's Linux");
+        r["note"] = json!(format!("Linux answers come from linux_file; shrinking ran on {}", base.name()));
     }
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let file = dir.join(format!("{}.json", secs));
