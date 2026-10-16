@@ -266,21 +266,123 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
     Ok(done as i64)
 }
 
+/// pread64 / pwrite64 (と preadv / pwritev) の確かめ。Linux の ksys_pread64 と vfs_read と同じ順に: 位置が負なら
+/// EINVAL、fd がない (O_PATH も) なら EBADF、位置のないもの (パイプ、端末、ソケットなど) は ESPIPE、読めない
+/// (書けない) 口なら EBADF
+fn positional(fd: u64, off: i64, write: bool) -> Result<FileRef, i64> {
+    if off < 0 {
+        return Err(-EINVAL);
+    }
+    let f = file_of(fd)?;
+    {
+        let b = f.borrow();
+        if b.flags & file::O_PATH != 0 {
+            return Err(-EBADF);
+        }
+        if !matches!(b.kind, Kind::Inode(..) | Kind::Block(_) | Kind::Fb | Kind::Null | Kind::Zero | Kind::Random) {
+            return Err(-file::ESPIPE);
+        }
+        if !(if write { b.writable() } else { b.readable() }) {
+            return Err(-EBADF);
+        }
+    }
+    Ok(f)
+}
+
+/// ふつうのファイルなら、その inode と開いたときのパス (inotify)
+fn inode_path(f: &FileRef) -> Option<(InodeRef, String)> {
+    match &f.borrow().kind {
+        Kind::Inode(i, p) => Some((i.clone(), p.clone())),
+        _ => None,
+    }
+}
+
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
-    let ino = inode_of(fd).map_err(|_| -29)?; // ESPIPE
-    let mut tmp = uninit(len.min(64 * 1024));
-    let n = if ino.page_cacheable() { file::read_sleepable(&ino, off.max(0) as usize, &mut tmp)? } else { ino.read_at(off.max(0) as usize, &mut tmp)? };
-    out(buf, &tmp[..n])?;
-    Ok(n as i64)
+    let f = positional(fd, off, false)?;
+    let ino = inode_path(&f);
+    if ino.as_ref().is_some_and(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFDIR) {
+        return Err(-EISDIR);
+    }
+    // 頼まれた分を終わりまで、64 KiB ずつ (read と同じ。Linux も、ふつうのファイルでは短く返さない)。
+    // ふつうのファイルは、開いたファイルを借りずに読む (ディスクを眠って待つことがある)
+    let mut done = 0;
+    while done < len {
+        let mut tmp = uninit((len - done).min(CHUNK));
+        let pos = off as usize + done;
+        let r = match &ino {
+            Some((i, _)) if i.page_cacheable() => file::read_sleepable(i, pos, &mut tmp),
+            Some((i, _)) => i.read_at(pos, &mut tmp),
+            None => file::pread_dev(&f, pos, &mut tmp),
+        };
+        let n = match r {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        out(buf + done, &tmp[..n])?;
+        done += n;
+        if n < tmp.len() {
+            break;
+        }
+    }
+    if let Some((i, path)) = &ino
+        && done > 0
+    {
+        inotify::file_event(path, i, inotify::IN_ACCESS);
+    }
+    Ok(done as i64)
 }
 
 pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
-    let ino = inode_of(fd).map_err(|_| -29)?;
-    let mut tmp = uninit(len.min(64 * 1024));
-    proc::current().pt().copy_in(&mut tmp, buf).ok_or(-EFAULT)?;
-    vfs::write_sealed(&ino, off.max(0) as usize, tmp.len())?;
-    let n = ino.write_at(off.max(0) as usize, &tmp)?;
-    Ok(n as i64)
+    let f = positional(fd, off, true)?;
+    let ino = inode_path(&f);
+    // O_APPEND で開いたものには、いつも終わりに書く (Linux は off を見ない: pwrite(2) の BUGS。POSIX とはちがう)
+    let append = f.borrow().flags & file::O_APPEND != 0;
+    let mut done = 0;
+    while done < len {
+        let mut tmp = uninit((len - done).min(CHUNK));
+        proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
+        let r = match &ino {
+            Some((i, _)) => {
+                let pos = if append { i.meta().size as usize } else { off as usize + done };
+                vfs::write_sealed(i, pos, tmp.len()).and_then(|_| i.write_at(pos, &tmp))
+            }
+            None => file::pwrite_dev(&f, off as usize + done, &tmp),
+        };
+        let n = match r {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        done += n;
+        if n < tmp.len() {
+            break;
+        }
+    }
+    if let Some((i, path)) = &ino
+        && done > 0
+    {
+        inotify::file_event(path, i, inotify::IN_MODIFY);
+    }
+    Ok(done as i64)
+}
+
+/// fsync / fdatasync / syncfs (fs): 書き残しをみな書く (aios はファイルごとに分けない)。Linux と同じく、
+/// fd がない (O_PATH も) なら EBADF、fsync のできないもの (パイプ、端末、ソケット、/dev/null など) は EINVAL
+/// (syncfs はそのファイルシステムを書くだけなので、よい)
+pub fn fsync(fd: u64, fs: bool) -> R {
+    let f = file_of(fd)?;
+    {
+        let b = f.borrow();
+        if b.flags & file::O_PATH != 0 {
+            return Err(-EBADF);
+        }
+        if !fs && !matches!(b.kind, Kind::Inode(..) | Kind::Block(_)) {
+            return Err(-EINVAL);
+        }
+    }
+    vfs::sync_all();
+    Ok(0)
 }
 
 fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {

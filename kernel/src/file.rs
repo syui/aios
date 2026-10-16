@@ -20,6 +20,8 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
+/// 場所だけ指す fd (読み書きはできない。Linux の FMODE_PATH)
+pub const O_PATH: u32 = 0o10000000;
 const O_NOCTTY: u32 = 0o400;
 
 const S_IFIFO: u32 = 0o010000;
@@ -330,12 +332,14 @@ impl Stat {
 }
 
 impl OpenFile {
-    fn readable(&self) -> bool {
-        self.flags & O_ACCMODE != O_WRONLY
+    /// 読める口か (O_RDONLY か O_RDWR。Linux の FMODE_READ: O_PATH と、O_ACCMODE (3) で開いたもの (ioctl だけ) は読めない)
+    pub fn readable(&self) -> bool {
+        self.flags & O_PATH == 0 && matches!(self.flags & O_ACCMODE, O_RDONLY | O_RDWR)
     }
 
-    fn writable(&self) -> bool {
-        self.flags & O_ACCMODE != O_RDONLY
+    /// 書ける口か (O_WRONLY か O_RDWR)
+    pub fn writable(&self) -> bool {
+        self.flags & O_PATH == 0 && matches!(self.flags & O_ACCMODE, O_WRONLY | O_RDWR)
     }
 
     pub fn read(&mut self, dst: &mut [u8]) -> Result<usize, i64> {
@@ -1025,7 +1029,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
     }
     // この fd の開いたファイルは、このスレッドのほかにだれも持っていない (借りずに見て、オフセットを進める)
     let of = unsafe { &mut *f.as_ptr() };
-    if of.flags & O_ACCMODE == O_WRONLY {
+    if !of.readable() {
         return Err(5);
     }
     let Kind::Inode(ino, _) = &of.kind else { return Err(5) };
@@ -1050,7 +1054,7 @@ pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> 
     // ほかのプロセス (fork で分けた) が大きなロックの中で借りているかもしれないので、借りずに見る。
     // 開いたファイルの種類と口 (flags の読み書き) はあとで変わらない
     let of = unsafe { &*f.as_ptr() };
-    if of.flags & O_ACCMODE == O_WRONLY {
+    if !of.readable() {
         return None;
     }
     let Kind::Inode(ino, _) = &of.kind else { return None };
@@ -1503,6 +1507,42 @@ const BLK_CHUNK: usize = 64 * 1024;
 /// 区画のバイト数
 pub fn blk_size(p: &crate::block::Part) -> usize {
     p.len as usize * SECTOR
+}
+
+/// pread の、ふつうのファイル (sysfile が、借りずに読む) でないもの: ディスクと画面は pos から、/dev/null と
+/// /dev/zero と乱数は位置によらない。開いたファイルの位置は動かさない。位置のないものは ESPIPE
+pub fn pread_dev(f: &FileRef, pos: usize, dst: &mut [u8]) -> Result<usize, i64> {
+    match &f.borrow().kind {
+        Kind::Block(p) => blk_read(p, pos, dst),
+        Kind::Fb => Ok(crate::gpu::read(pos, dst)),
+        Kind::Null => Ok(0),
+        Kind::Zero => {
+            dst.fill(0);
+            Ok(dst.len())
+        }
+        Kind::Random => {
+            crate::rand::fill(dst);
+            Ok(dst.len())
+        }
+        _ => Err(-ESPIPE),
+    }
+}
+
+/// pwrite の、ふつうのファイルでないもの (pread_dev と同じ)
+pub fn pwrite_dev(f: &FileRef, pos: usize, src: &[u8]) -> Result<usize, i64> {
+    match &f.borrow().kind {
+        Kind::Block(p) => blk_write(p, pos, src),
+        Kind::Fb => {
+            let n = crate::gpu::write(pos, src);
+            if n == 0 && !src.is_empty() { Err(-28) } else { Ok(n) }
+        }
+        Kind::Null | Kind::Zero => Ok(src.len()),
+        Kind::Random => {
+            crate::rand::mix(src);
+            Ok(src.len())
+        }
+        _ => Err(-ESPIPE),
+    }
 }
 
 fn blk_read(p: &crate::block::Part, off: usize, dst: &mut [u8]) -> Result<usize, i64> {
