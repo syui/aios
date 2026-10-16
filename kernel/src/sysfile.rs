@@ -11,12 +11,14 @@ use alloc::vec::Vec;
 
 const ENOENT: i64 = 2;
 const EFAULT: i64 = 14;
+const EBUSY: i64 = 16;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
 const ERANGE: i64 = 34;
+const ENOTEMPTY: i64 = 39;
 
 const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -127,7 +129,11 @@ fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
 /// at と同じものを探し、そのパス (先頭 / なし) を返す
 fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
     let path = user_str(pathp)?;
-    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    // 空のパスは、AT_EMPTY_PATH でなければ dirfd を見る前に ENOENT (Linux の getname)
+    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return Err(-ENOENT);
+    }
+    if path.is_empty() {
         let f = file_of(dirfd as u64)?;
         let f = f.borrow();
         return match &f.kind {
@@ -140,6 +146,33 @@ fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
         Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, &path, follow).map(|(p, _)| p),
         None => vfs::lookup(&proc::current().files().cwd.clone(), &path, follow).map(|(p, _)| p),
     }
+}
+
+/// 作る・消す・名前を変えるところ (vfs::parent_last)。空のパスは dirfd を見る前に ENOENT (Linux の getname)
+fn last_at(dirfd: i64, path: &str) -> Result<vfs::Parent, i64> {
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    let start = base_ino(dirfd, path)?;
+    vfs::parent_last(start, &proc::current().files().cwd.clone(), path)
+}
+
+/// 作るもの (mknod、symlink、link の新しい名前) の最後の名前: . と .. と / はもうあるもの (EEXIST)。name/ は
+/// ディレクトリでないものには使えない (Linux の filename_create: あれば EEXIST、なければ ENOENT)。あれば EEXIST
+/// (書けなくても、砂場でも: mkdir -p や create_dir_all がそれで「ある」とわかる)
+fn new_name(p: &vfs::Parent) -> Result<(), i64> {
+    if p.last != vfs::Last::Norm {
+        return Err(-EEXIST);
+    }
+    p.name_ok()?;
+    let exists = p.dir.lookup(&p.name).is_ok();
+    if exists {
+        return Err(-EEXIST);
+    }
+    if p.slash {
+        return Err(-ENOENT);
+    }
+    Ok(())
 }
 
 fn parent_at(dirfd: i64, pathp: usize) -> Result<(InodeRef, String), i64> {
@@ -216,8 +249,25 @@ fn whole(f: &FileRef) -> bool {
     matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb)
 }
 
+/// Linux の rw_verify_area: 位置のあるもの (ファイル、ディレクトリ) の位置 + 長さが i64 をこえるなら EINVAL
+/// (ext4 のディレクトリを読み終えると位置は i64::MAX)。読み書きの口のしらべ (EBADF) のあと、中身の前に
+fn verify_area(f: &FileRef, len: usize) -> Result<(), i64> {
+    let b = f.borrow();
+    if matches!(b.kind, Kind::Inode(..)) && (b.offset as i64).checked_add(len.min(i64::MAX as usize) as i64).is_none() {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
+    if f.borrow().readable() {
+        verify_area(&f, len)?;
+    }
+    // パイプから 0 バイト: 何もないときも待たずに 0 (Linux の pipe_read)
+    if len == 0 && matches!(f.borrow().kind, Kind::PipeRead(_) | Kind::PipeRw(_)) {
+        return if f.borrow().readable() { Ok(0) } else { Err(-EBADF) };
+    }
     let whole = whole(&f);
     // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。パイプと socketpair も取りだした分だけ。
     // これらは 0 で埋めておかなくてよい (IPC の小さな read のたびに 64 KiB を埋めると重い)
@@ -242,6 +292,9 @@ pub fn read(fd: u64, buf: usize, len: usize) -> R {
 
 pub fn write(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
+    if f.borrow().writable() {
+        verify_area(&f, len)?;
+    }
     let whole = whole(&f);
     let mut done = 0;
     loop {
@@ -338,6 +391,11 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let ino = inode_path(&f);
     // O_APPEND で開いたものには、いつも終わりに書く (Linux は off を見ない: pwrite(2) の BUGS。POSIX とはちがう)
     let append = f.borrow().flags & file::O_APPEND != 0;
+    if let Some((i, _)) = &ino
+        && len > 0
+    {
+        vfs::drop_privs(i)?;
+    }
     let mut done = 0;
     while done < len {
         let mut tmp = uninit((len - done).min(CHUNK));
@@ -474,20 +532,116 @@ pub fn pwritev(fd: u64, iov: usize, cnt: usize, off: i64) -> R {
     Ok(total)
 }
 
+/// openat のフラグ (Linux の build_open_how と build_open_flags): O_PATH なら、ほかは O_DIRECTORY、O_NOFOLLOW、
+/// O_CLOEXEC だけ残す (知らないものは見ない: openat2 とちがう)。O_CREAT と O_DIRECTORY はいっしょに使えない
+/// (O_TMPFILE も O_DIRECTORY をふくむので O_CREAT とは使えない)。O_TMPFILE は O_DIRECTORY とともに、書く口で。
+/// パスも dirfd も見る前に確かめる (EINVAL が先)
+fn open_flags(flags: u64) -> Result<u64, i64> {
+    let flags = if flags & O_PATH != 0 { flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) } else { flags };
+    if flags & (O_CREAT | O_DIRECTORY) == O_CREAT | O_DIRECTORY {
+        return Err(-EINVAL);
+    }
+    if flags & O_TMPFILE != 0 && (flags & O_DIRECTORY == 0 || flags as u32 & file::O_ACCMODE == file::O_RDONLY) {
+        return Err(-EINVAL);
+    }
+    Ok(flags)
+}
+
 pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     let path = user_str(pathp)?;
-    let base = base_dir(dirfd, &path)?;
-    let follow = flags & O_NOFOLLOW == 0;
+    let flags = open_flags(flags)?;
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    // 開いているディレクトリからはそこから (ルートからたどりなおさない: 上のディレクトリが通れなくなっても、
+    // 名前が変わっても。Linux と同じ)
+    let start = base_ino(dirfd, &path)?;
+    let cwd = proc::current().files().cwd.clone();
+    let lookup = |follow: bool| match &start {
+        Some((dir, dir_path)) => vfs::lookup_at(dir, dir_path, &path, follow),
+        None => vfs::lookup(&cwd, &path, follow),
+    };
+    // O_CREAT と O_EXCL なら、最後のリンクはたどらない (リンクがあれば EEXIST。Linux と同じ)
+    let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
     if follow && let Some(f) = fd_link(&path) {
         let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
-    let found = match vfs::lookup(&base, &path, follow) {
-        Ok(found) => Ok(found),
-        Err(e) if e == -ENOENT && flags & O_CREAT != 0 => Err(vfs::parent_path(&base, &path)?),
-        Err(e) => return Err(e),
-    };
-    open_found(found, flags, mode)
+    // O_CREAT: 親までたどってから (そこまでのしくじりが先)、name/ は作らない (あってもなくても EISDIR)、
+    // . .. / はディレクトリ (EISDIR)。Linux の open_last_lookups と do_open
+    if flags & O_CREAT != 0 {
+        let p = last_at(dirfd, &path)?;
+        if p.slash {
+            return Err(-EISDIR);
+        }
+        if p.last != vfs::Last::Norm {
+            return Err(if flags & O_EXCL != 0 { -EEXIST } else { -EISDIR });
+        }
+    }
+    // O_TMPFILE: そのディレクトリに名前のないファイル
+    if flags & O_TMPFILE != 0 {
+        let (full, dir) = lookup(flags & O_NOFOLLOW == 0)?;
+        return open_tmpfile(full, dir, flags, mode);
+    }
+    // O_CREAT: 最後の名前を 1 つずつ (リンクの中身の最後の名前も)。なければ作り、リンクの中身が name/ なら EISDIR
+    if flags & O_CREAT != 0 {
+        return open_found(create_target(start, &cwd, &path, follow)?, flags, mode);
+    }
+    open_found(Ok(lookup(follow)?), flags, mode)
+}
+
+/// O_CREAT で開くもの: あるもの (パス, inode) か、作るところ (親, 名前, パス)。Linux の open_last_lookups と同じく、
+/// 最後の名前がリンクなら (follow のとき) その中身をリンクのあるディレクトリからたどり、中身の最後の名前で
+/// また同じことを (合わせて 40 まで)。中身の終わりが / なら引く前に EISDIR、. や .. ならディレクトリ (EISDIR)。
+/// 指す先のないリンクなら、その指す先に作る
+type Found = Result<(String, InodeRef), (InodeRef, String, String)>;
+
+fn create_target(start: Option<(InodeRef, String)>, cwd: &str, path: &str, follow: bool) -> Result<Found, i64> {
+    let mut p = vfs::parent_last(start, cwd, path)?;
+    for _ in 0..40 {
+        if p.last != vfs::Last::Norm {
+            return Err(-EISDIR);
+        }
+        p.name_ok()?;
+        let link = match p.dir.lookup(&p.name) {
+            Ok(c) if follow && c.meta().mode & S_IFMT == vfs::S_IFLNK => c.readlink()?,
+            Ok(c) => return Ok(Ok((p.full, c))),
+            Err(e) if e == -ENOENT => return Ok(Err((p.dir, p.name, p.full))),
+            Err(e) => return Err(e),
+        };
+        if link.is_empty() {
+            return Err(-ENOENT);
+        }
+        p = vfs::parent_last(None, &alloc::format!("/{}", dir_of(&p.full)), &link)?;
+        if p.slash {
+            return Err(-EISDIR);
+        }
+    }
+    Err(-vfs::ELOOP)
+}
+
+/// O_TMPFILE で開く (Linux の do_tmpfile と vfs_tmpfile): dir はディレクトリで、書けて通れること。
+/// mode は umask をかけて (作ったばかりなので mode に関係なく開ける)。O_EXCL がなければ、あとで linkat
+/// (AT_EMPTY_PATH か /proc/self/fd/N) で名前をつけられる
+fn open_tmpfile(full: String, dir: InodeRef, flags: u64, mode: u64) -> R {
+    if !dir.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    vfs::check_writable(&full)?;
+    let c = cred::current();
+    parent_writable(&c, &dir)?;
+    // 砂場: そのディレクトリの下にふつうのファイルを作り、読み書きする
+    {
+        use crate::landlock::*;
+        let rw = if flags as u32 & file::O_ACCMODE == file::O_WRONLY { WRITE_FILE } else { READ_FILE | WRITE_FILE };
+        check_fs(&full, MAKE_REG | rw)?;
+    }
+    let ino = dir.tmpfile(mode as u32 & 0o7777 & !umask(), flags & O_EXCL == 0)?;
+    own_new(&c, &dir, &ino)?;
+    let name = alloc::format!("{}/#{} (deleted)", full, ino.meta().ino);
+    let f = file::new(Kind::Inode(ino, name), file_flags(flags));
+    let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+    Ok(fd as i64)
 }
 
 // openat2 の open_how.flags に使えるもの (arm64 の値: O_ACCMODE と O_CREAT から __O_TMPFILE まで)。知らないものは EINVAL
@@ -528,6 +682,7 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
     if flags & O_PATH != 0 && flags & !(O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) != 0 {
         return Err(-EINVAL);
     }
+    open_flags(flags)?;
     if resolve & vfs::RESOLVE_BENEATH != 0 && resolve & vfs::RESOLVE_IN_ROOT != 0 {
         return Err(-EINVAL);
     }
@@ -545,6 +700,37 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
     let start = start_dir(dirfd)?;
     // O_CREAT と O_EXCL なら、最後のリンクはたどらない (リンクがあれば EEXIST。Linux と同じ)
     let follow = flags & O_NOFOLLOW == 0 && !(flags & O_CREAT != 0 && flags & O_EXCL != 0);
+    // O_CREAT で name/ は、親までたどって (RESOLVE_* もそこまでで)、そこを通れれば、最後の名前を見ずに EISDIR
+    // (Linux の open_last_lookups)。. .. / は open_found で (O_EXCL なら EEXIST、でなければ EISDIR)
+    if flags & O_CREAT != 0 && path.ends_with('/') {
+        let trimmed = path.trim_end_matches('/');
+        let (dpart, name) = match trimmed.rsplit_once('/') {
+            Some(("", n)) => ("/", n),
+            Some((d, n)) => (d, n),
+            None => ("", trimmed),
+        };
+        if !trimmed.is_empty() && name != "." && name != ".." {
+            let dir = if dpart.is_empty() {
+                start.0.clone()
+            } else {
+                match vfs::lookup_resolve(start.clone(), dpart, true, resolve)? {
+                    vfs::Resolved::Found(_, d) => d,
+                    vfs::Resolved::Missing(..) => return Err(-ENOENT),
+                }
+            };
+            if !dir.meta().is_dir() {
+                return Err(-ENOTDIR);
+            }
+            cred::current().check(&dir.meta(), cred::X)?;
+            return Err(-EISDIR);
+        }
+    }
+    if flags & O_TMPFILE != 0 {
+        return match vfs::lookup_resolve(start, &path, follow, resolve)? {
+            vfs::Resolved::Found(full, dir) => open_tmpfile(full, dir, flags, mode),
+            vfs::Resolved::Missing(..) => Err(-ENOENT),
+        };
+    }
     let found = match vfs::lookup_resolve(start, &path, follow, resolve)? {
         vfs::Resolved::Found(full, ino) => Ok((full, ino)),
         vfs::Resolved::Missing(parent, dir, name) if flags & O_CREAT != 0 => {
@@ -563,6 +749,13 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
     open_found(found, flags, mode)
 }
 
+/// 開いたファイルに残すフラグ (F_GETFL で見えるもの): 開くときだけのもの (O_CREAT、O_EXCL、O_NOCTTY、O_TRUNC) と
+/// fd のもの (O_CLOEXEC) は残さない (Linux の do_dentry_open)
+fn file_flags(flags: u64) -> u32 {
+    const O_NOCTTY: u64 = 0o400;
+    (flags & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) as u32
+}
+
 /// dirfd のディレクトリ (inode, パス)。AT_FDCWD ならいまのディレクトリ
 fn start_dir(dirfd: i64) -> Result<(InodeRef, String), i64> {
     if dirfd == AT_FDCWD {
@@ -578,11 +771,19 @@ fn start_dir(dirfd: i64) -> Result<(InodeRef, String), i64> {
 }
 
 /// openat と openat2 の残り: あったもの (パス, inode) を開くか、なかったもの (親, 名前, パス) を O_CREAT で作って開く
-fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, flags: u64, mode: u64) -> R {
+fn open_found(found: Found, flags: u64, mode: u64) -> R {
     let (full, ino) = match found {
         Ok(found) => {
             if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
                 return Err(-EEXIST);
+            }
+            // O_CREAT であるディレクトリを開くことはできない。O_DIRECTORY でディレクトリでないものは ENOTDIR
+            // (どちらも許可を見る前: Linux の do_open)
+            if flags & O_CREAT != 0 && found.1.meta().is_dir() {
+                return Err(-EISDIR);
+            }
+            if flags & O_DIRECTORY != 0 && !found.1.meta().is_dir() {
+                return Err(-ENOTDIR);
             }
             found
         }
@@ -599,12 +800,26 @@ fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, fla
             inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
             // 作ったばかりのものは、mode に関係なく開ける
-            let f = file::new(Kind::Inode(ino, full), flags as u32);
+            let f = file::new(Kind::Inode(ino, full), file_flags(flags));
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
             return Ok(fd as i64);
         }
     };
+    // O_PATH: 場所だけ。開く許可はいらず (たどれればよい)、デバイスや FIFO を開かず、リンクも (O_NOFOLLOW なら)
+    // そのまま
+    if flags & O_PATH != 0 {
+        if flags & O_DIRECTORY != 0 && !ino.meta().is_dir() {
+            return Err(-ENOTDIR);
+        }
+        let f = file::new(Kind::Inode(ino, full), file_flags(flags));
+        let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     let accmode = flags as u32 & file::O_ACCMODE;
+    // ディレクトリを書く口で (O_TRUNC も書くこと) 開くのは、許可を見る前に EISDIR (Linux の may_open)
+    if ino.meta().is_dir() && (accmode != file::O_RDONLY || flags & O_TRUNC != 0) {
+        return Err(-EISDIR);
+    }
     let want = match accmode {
         file::O_RDONLY => PR,
         file::O_WRONLY => PW,
@@ -617,13 +832,14 @@ fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, fla
         let a = if ino.meta().is_dir() {
             READ_DIR
         } else {
-            (if want & PR != 0 { READ_FILE } else { 0 }) | (if accmode != file::O_RDONLY { WRITE_FILE } else { 0 }) | (if flags & O_TRUNC != 0 && accmode != file::O_RDONLY { TRUNCATE } else { 0 })
+            (if want & PR != 0 { READ_FILE } else { 0 }) | (if accmode != file::O_RDONLY { WRITE_FILE } else { 0 }) | (if flags & O_TRUNC != 0 { TRUNCATE } else { 0 })
         };
         check_fs(&full, a)?;
     }
     let kind = match ino.meta().mode & S_IFMT {
+        // ディレクトリは読むだけ (O_TRUNC も書くことになる: Linux の may_open)
         vfs::S_IFDIR => {
-            if accmode != file::O_RDONLY {
+            if accmode != file::O_RDONLY || flags & O_TRUNC != 0 {
                 return Err(-EISDIR);
             }
             None
@@ -650,10 +866,12 @@ fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, fla
         vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
             // ふつうのファイルを書くために開く: 読むだけのマウントの下なら EROFS (デバイスはかまわない)
-            if accmode != file::O_RDONLY {
+            if accmode != file::O_RDONLY || flags & O_TRUNC != 0 {
                 vfs::check_writable(&full)?;
             }
-            if flags & O_TRUNC != 0 && accmode != file::O_RDONLY {
+            // O_TRUNC は O_RDONLY でも切りつめる (書く許可は上で確かめた。Linux の do_open と同じ)
+            if flags & O_TRUNC != 0 {
+                vfs::drop_privs(&ino)?;
                 ino.truncate(0)?;
                 inotify::file_event(&full, &ino, inotify::IN_MODIFY);
             }
@@ -664,7 +882,7 @@ fn open_found(found: Result<(String, InodeRef), (InodeRef, String, String)>, fla
         inotify::file_event(&full, &ino, inotify::IN_OPEN);
     }
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
-    let f = file::new(kind, flags as u32);
+    let f = file::new(kind, file_flags(flags));
     let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
@@ -682,6 +900,13 @@ pub fn close(fd: u64) -> R {
 
 pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
     let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    // whence は、位置のないもの (ESPIPE) より先に (Linux の ksys_lseek)
+    if whence > 4 {
+        return Err(-EINVAL);
+    }
     let n = f.borrow_mut().lseek(off, whence as u32)?;
     Ok(n as i64)
 }
@@ -745,7 +970,28 @@ pub fn faccessat(dirfd: i64, pathp: usize, mode: u64, flags: u64) -> R {
 }
 
 pub fn readlinkat(dirfd: i64, pathp: usize, buf: usize, len: usize) -> R {
-    let ino = at(dirfd, pathp, AT_SYMLINK_NOFOLLOW)?;
+    // 大きさは int (0 以下は、パスを見る前に EINVAL)
+    if len == 0 || len > i32::MAX as usize {
+        return Err(-EINVAL);
+    }
+    let path = user_str(pathp)?;
+    // 空のパスは dirfd そのもの (O_PATH|O_NOFOLLOW で開いたリンク)。リンクでなければ ENOENT (Linux の do_readlinkat)
+    let ino = if path.is_empty() {
+        let i = if dirfd == AT_FDCWD {
+            vfs::resolve("", &proc::current().files().cwd.clone(), true)?
+        } else {
+            match inode_of(dirfd as u64) {
+                Err(e) if e == -EINVAL => return Err(-ENOENT),
+                r => r?,
+            }
+        };
+        if i.meta().mode & S_IFMT != vfs::S_IFLNK {
+            return Err(-ENOENT);
+        }
+        i
+    } else {
+        at_path(dirfd, &path, AT_SYMLINK_NOFOLLOW)?
+    };
     let t = ino.readlink()?;
     let n = t.len().min(len);
     out(buf, &t.as_bytes()[..n])?;
@@ -754,6 +1000,9 @@ pub fn readlinkat(dirfd: i64, pathp: usize, buf: usize, len: usize) -> R {
 
 pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
     let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
     let mut v = Vec::new();
     f.borrow_mut().getdents(&mut v, len)?;
     out(buf, &v)?;
@@ -761,16 +1010,25 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
 }
 
 pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
-    let (parent, name, full) = parent_full(dirfd, pathp)?;
-    // Linux と同じく、あれば書けなくても (砂場の landlock でも) EEXIST (mkdir -p や create_dir_all がそれで
-    // 「ある」とわかる。前は landlock が先で EACCES: aibox の中の aish の write が、書けるディレクトリに書けなかった)
-    if parent.lookup(&name).is_ok() {
+    let path = user_str(pathp)?;
+    let p = last_at(dirfd, &path)?;
+    // . と .. と / はもうある。name/ はよい (ディレクトリを作る)。Linux と同じく、あれば書けなくても (砂場の
+    // landlock でも、読むだけのマウントでも) EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる。前は
+    // landlock が先で EACCES: aibox の中の aish の write が、書けるディレクトリに書けなかった)
+    if p.last != vfs::Last::Norm {
         return Err(-EEXIST);
     }
+    p.name_ok()?;
+    if p.dir.lookup(&p.name).is_ok() {
+        return Err(-EEXIST);
+    }
+    let (parent, name, full) = (p.dir, p.name, p.full);
+    vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
-    let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::Dir)?;
+    // setuid と setgid は落とす (Linux の vfs_mkdir は S_IRWXUGO と S_ISVTX だけ。setgid は親が setgid なら own_new が)
+    let ino = parent.create(&name, mode as u32 & 0o1777 & !umask(), NewNode::Dir)?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE | inotify::IN_ISDIR, 0);
     Ok(0)
@@ -809,12 +1067,13 @@ pub fn swapoff(pathp: usize) -> R {
 }
 
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
-    let (parent, name, full) = parent_full(dirfd, pathp)?;
-    let mode = mode as u32;
+    let path = user_str(pathp)?;
+    let p = last_at(dirfd, &path)?;
     // あれば landlock より先に EEXIST (Linux と同じ)
-    if parent.lookup(&name).is_ok() {
-        return Err(-EEXIST);
-    }
+    new_name(&p)?;
+    let (parent, name, full) = (p.dir, p.name, p.full);
+    vfs::check_writable(&full)?;
+    let mode = mode as u32;
     crate::landlock::check_parent(&full, crate::landlock::make_right(mode))?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
@@ -859,7 +1118,31 @@ pub fn is_sock(path: &str) -> bool {
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
-    let (parent, name, full) = parent_full(dirfd, pathp)?;
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(-EINVAL);
+    }
+    let path = user_str(pathp)?;
+    let p = last_at(dirfd, &path)?;
+    // 最後が . .. / なら (Linux の do_rmdir と do_unlinkat): rmdir は .. が ENOTEMPTY、. が EINVAL、/ が EBUSY。
+    // unlink はどれも EISDIR
+    match (p.last, flags & AT_REMOVEDIR != 0) {
+        (vfs::Last::Norm, _) => {}
+        (vfs::Last::DotDot, true) => return Err(-ENOTEMPTY),
+        (vfs::Last::Dot, true) => return Err(-EINVAL),
+        (vfs::Last::Root, true) => return Err(-EBUSY),
+        (_, false) => return Err(-EISDIR),
+    }
+    vfs::check_writable(&p.full)?;
+    p.name_ok()?;
+    // unlink の name/: なければ ENOENT、ディレクトリなら EISDIR、ほか (リンクも) は ENOTDIR (Linux の slashes)
+    if p.slash && flags & AT_REMOVEDIR == 0 {
+        return Err(match p.dir.lookup(&p.name) {
+            Err(e) => e,
+            Ok(i) if i.meta().is_dir() => -EISDIR,
+            Ok(_) => -ENOTDIR,
+        });
+    }
+    let (parent, name, full) = (p.dir, p.name, p.full);
     crate::landlock::check_parent(&full, if flags & AT_REMOVEDIR != 0 { crate::landlock::REMOVE_DIR } else { crate::landlock::REMOVE_FILE })?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
@@ -884,11 +1167,16 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
 
 pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let target = user_str(targetp)?;
-    let (parent, name, full) = parent_full(dirfd, pathp)?;
-    // Linux と同じく、あれば書けなくても (landlock でも) EEXIST
-    if parent.lookup(&name).is_ok() {
-        return Err(-EEXIST);
+    // 中身が空のリンクは作れない (Linux の getname)
+    if target.is_empty() {
+        return Err(-ENOENT);
     }
+    let path = user_str(pathp)?;
+    let p = last_at(dirfd, &path)?;
+    // Linux と同じく、あれば書けなくても (landlock でも) EEXIST
+    new_name(&p)?;
+    let (parent, name, full) = (p.dir, p.name, p.full);
+    vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
@@ -899,12 +1187,24 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
 }
 
 pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) -> R {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(-EINVAL);
+    }
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
     let ino = at(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
+    // Linux の順: 元をたどり、新しい名前の親とその名前 (あれば EEXIST)、ファイルシステムがちがえば EXDEV、
+    // ディレクトリは最後に EPERM (vfs_link)
+    let path = user_str(newp)?;
+    let p = last_at(newdir, &path)?;
+    new_name(&p)?;
+    if p.dir.id().0 != ino.id().0 {
+        return Err(-vfs::EXDEV);
+    }
     if ino.meta().is_dir() {
         return Err(-vfs::EPERM);
     }
-    let (parent, name, full) = parent_full(newdir, newp)?;
+    let (parent, name, full) = (p.dir, p.name, p.full);
+    vfs::check_writable(&full)?;
     // 砂場: 作るところの MAKE_*。ほかのディレクトリのものをつなぐなら、両方に REFER も
     {
         use crate::landlock::*;
@@ -924,14 +1224,59 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
 
 pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) -> R {
     const RENAME_NOREPLACE: u64 = 1;
-    if flags & !RENAME_NOREPLACE != 0 {
+    const RENAME_EXCHANGE: u64 = 2;
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || flags & (RENAME_NOREPLACE | RENAME_EXCHANGE) == RENAME_NOREPLACE | RENAME_EXCHANGE {
         return Err(-EINVAL);
     }
-    let (op, oname, ofull) = parent_full(olddir, oldp)?;
-    let (np, nname, nfull) = parent_full(newdir, newp)?;
-    if op.id().0 != np.id().0 {
+    // Linux の do_renameat2 と同じ順に: 両方の親、ファイルシステムがちがえば EXDEV、最後が . .. / なら EBUSY
+    // (新しいほうは NOREPLACE なら EEXIST)、読むだけのマウントなら EROFS、元がなければ ENOENT
+    let (opath, npath) = (user_str(oldp)?, user_str(newp)?);
+    let o = last_at(olddir, &opath)?;
+    let n = last_at(newdir, &npath)?;
+    if o.dir.id().0 != n.dir.id().0 {
         return Err(-vfs::EXDEV);
     }
+    if o.last != vfs::Last::Norm {
+        return Err(-EBUSY);
+    }
+    if n.last != vfs::Last::Norm {
+        return Err(if flags & RENAME_NOREPLACE != 0 { -EEXIST } else { -EBUSY });
+    }
+    vfs::check_writable(&o.full)?;
+    vfs::check_writable(&n.full)?;
+    o.name_ok()?;
+    let moving = o.dir.lookup(&o.name)?;
+    n.name_ok()?;
+    let target = n.dir.lookup(&n.name).ok();
+    if flags & RENAME_NOREPLACE != 0 && target.is_some() {
+        return Err(-EEXIST);
+    }
+    if flags & RENAME_EXCHANGE != 0 && target.is_none() {
+        return Err(-ENOENT);
+    }
+    // name/ はディレクトリのもの (EXCHANGE なら、それぞれがそれぞれの名前の)
+    if !moving.meta().is_dir() && (o.slash || (flags & RENAME_EXCHANGE == 0 && n.slash)) {
+        return Err(-ENOTDIR);
+    }
+    if flags & RENAME_EXCHANGE != 0 && n.slash && !target.as_ref().is_some_and(|t| t.meta().is_dir()) {
+        return Err(-ENOTDIR);
+    }
+    // 自分の下へは動かせない (EINVAL)。動かすものの上にあるものへは、上書きできない (ENOTEMPTY。Linux の lock_rename の trap)
+    let (odir, ndir) = (String::from(dir_of(&o.full)), String::from(dir_of(&n.full)));
+    let under = |a: &str, b: &str| b == a || b.starts_with(&alloc::format!("{}/", a));
+    if odir != ndir {
+        if moving.meta().is_dir() && under(&o.full, &ndir) {
+            return Err(-EINVAL);
+        }
+        if target.is_some() && under(&n.full, &odir) {
+            return Err(if flags & RENAME_EXCHANGE != 0 { -EINVAL } else { -ENOTEMPTY });
+        }
+    }
+    // 同じもの (同じ inode を指す 2 つの名前) なら何もしない (Linux と同じ)
+    if target.as_ref().is_some_and(|t| t.id() == moving.id()) {
+        return Ok(0);
+    }
+    let (op, oname, ofull, np, nname, nfull) = (o.dir, o.name, o.full, n.dir, n.name, n.full);
     // 砂場: 元を消して、先に作る (先にあるものは消す)。ディレクトリをまたぐなら両方に REFER も
     {
         use crate::landlock::*;
@@ -943,6 +1288,10 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         }
         if let Ok(r) = np.lookup(&nname) {
             check_parent(&nfull, kind(r.meta().mode))?;
+            // 入れかえなら、それも元のところへ作る
+            if flags & RENAME_EXCHANGE != 0 {
+                check_parent(&ofull, make_right(r.meta().mode))?;
+            }
         }
         if dir_of(&ofull) != dir_of(&nfull) {
             check_parent(&ofull, REFER)?;
@@ -952,12 +1301,43 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if flags & RENAME_NOREPLACE != 0 && np.lookup(&nname).is_ok() {
         return Err(-EEXIST);
     }
+    // Linux の vfs_rename と同じ順: 元を消せるか (親に書けて sticky も)、先に作れるか (あれば消せるか、種類が合うか)
     let c = cred::current();
     parent_writable(&c, &op)?;
-    parent_writable(&c, &np)?;
     sticky_ok(&c, &op, &oname)?;
-    if np.lookup(&nname).is_ok() {
+    parent_writable(&c, &np)?;
+    if let Some(t) = &target {
         sticky_ok(&c, &np, &nname)?;
+        if flags & RENAME_EXCHANGE == 0 {
+            match (moving.meta().is_dir(), t.meta().is_dir()) {
+                (true, false) => return Err(-ENOTDIR),
+                (false, true) => return Err(-EISDIR),
+                _ => {}
+            }
+        }
+    }
+    // ほかの親へ移るディレクトリは、その .. を書きかえるので、それ自身にも書けること (Linux の vfs_rename)
+    if odir != ndir {
+        if moving.meta().is_dir() {
+            c.check(&moving.meta(), PW)?;
+        }
+        if flags & RENAME_EXCHANGE != 0
+            && let Some(t) = &target
+            && t.meta().is_dir()
+        {
+            c.check(&t.meta(), PW)?;
+        }
+    }
+    if flags & RENAME_EXCHANGE != 0 {
+        op.exchange(&oname, &np, &nname)?;
+        let ck = inotify::cookie();
+        for (from_dir, from, to_dir, to, ino) in [(&op, &oname, &np, &nname, &moving), (&np, &nname, &op, &oname, target.as_ref().unwrap())] {
+            let isdir = if ino.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
+            inotify::dir_event(from_dir, from, inotify::IN_MOVED_FROM | isdir, ck);
+            inotify::dir_event(to_dir, to, inotify::IN_MOVED_TO | isdir, ck);
+            inotify::self_event(ino, inotify::IN_MOVE_SELF | isdir);
+        }
+        return Ok(0);
     }
     let moved = op.lookup(&oname).ok();
     let replaced = np.lookup(&nname).ok().filter(|r| moved.as_ref().is_none_or(|m| m.id() != r.id()));
@@ -1005,15 +1385,24 @@ pub fn memfd_create(name: usize, flags: u64) -> R {
 }
 
 pub fn ftruncate(fd: u64, len: i64) -> R {
-    writable_fd(fd)?;
+    // Linux の do_sys_ftruncate と同じ順: 長さが負なら EINVAL、fd がない (O_PATH も) なら EBADF、ふつうのファイルを
+    // 書く口で開いたものでなければ EINVAL
     if len < 0 {
         return Err(-EINVAL);
     }
     let f = file_of(fd)?;
-    if f.borrow().flags & file::O_ACCMODE == file::O_RDONLY {
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    let ino = match &f.borrow().kind {
+        Kind::Inode(i, _) if i.meta().mode & S_IFMT == vfs::S_IFREG => i.clone(),
+        _ => return Err(-EINVAL),
+    };
+    if !f.borrow().writable() {
         return Err(-EINVAL);
     }
-    let ino = inode_of(fd)?;
+    writable_fd(fd)?;
+    vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;
     if let Kind::Inode(_, p) = &f.borrow().kind {
         inotify::file_event(p, &ino, inotify::IN_MODIFY);
@@ -1038,6 +1427,7 @@ pub fn fallocate(fd: u64, mode: u64, off: i64, len: i64) -> R {
     match mode {
         0 => {
             let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
+            vfs::drop_privs(&ino)?;
             if (ino.meta().size as usize) < end {
                 ino.truncate(end)?;
             }
@@ -1054,9 +1444,17 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     }
     let path = user_str(pathp)?;
     let (full, ino) = vfs::lookup(&proc::current().files().cwd.clone(), &path, true)?;
+    // Linux の vfs_truncate の順: ディレクトリは EISDIR、ほかのふつうのファイルでないものは EINVAL、読むだけの
+    // マウントなら EROFS、書けなければ EACCES、それから砂場
+    match ino.meta().mode & S_IFMT {
+        vfs::S_IFDIR => return Err(-EISDIR),
+        vfs::S_IFREG => {}
+        _ => return Err(-EINVAL),
+    }
     vfs::check_writable(&full)?;
-    crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
     cred::current().check(&ino.meta(), PW)?;
+    crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
+    vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;
     inotify::self_event(&ino, inotify::IN_MODIFY);
     Ok(0)
@@ -1078,6 +1476,20 @@ fn chmod(ino: &InodeRef, mode: u64) -> R {
 }
 
 pub fn fchmod(fd: u64, mode: u64) -> R {
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    // パイプ: 持ち主か root が、fstat に見える許可を変えられる (Linux の pipefs の inode)
+    if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
+        use core::sync::atomic::Ordering::Relaxed;
+        let c = cred::current();
+        if c.euid != 0 && c.euid != p.uid.load(Relaxed) {
+            return Err(-cred::EPERM);
+        }
+        p.perm.store(mode as u32 & 0o7777, Relaxed);
+        return Ok(0);
+    }
     writable_fd(fd)?;
     chmod(&inode_of(fd)?, mode)?;
     attrib_fd(fd);
@@ -1087,6 +1499,26 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
 pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
     writable_at(dirfd, pathp, 0)?;
     chmod(&at(dirfd, pathp, 0)?, mode)?;
+    attrib_at(dirfd, pathp);
+    Ok(0)
+}
+
+/// fchmodat2 (Linux 6.6): fchmodat にフラグ。AT_SYMLINK_NOFOLLOW でリンクそのものは変えられない (EOPNOTSUPP。
+/// Linux もリンクの許可は持たない)、AT_EMPTY_PATH なら dirfd そのもの
+pub fn fchmodat2(dirfd: i64, pathp: usize, mode: u64, flags: u64) -> R {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(-EINVAL);
+    }
+    let path = user_str(pathp)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return fchmod(dirfd as u64, mode);
+    }
+    let ino = at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW)?;
+    if ino.meta().mode & S_IFMT == vfs::S_IFLNK {
+        return Err(-95); // EOPNOTSUPP
+    }
+    writable_at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
+    chmod(&ino, mode)?;
     attrib_at(dirfd, pathp);
     Ok(0)
 }
@@ -1215,22 +1647,26 @@ pub fn dup(fd: u64) -> R {
 }
 
 pub fn dup3(old: u64, new: u64, flags: u64) -> R {
-    if old == new {
+    // Linux と同じ順: フラグ (O_CLOEXEC だけ)、同じ fd、新しい fd の大きさ、それから古い fd
+    if flags & !O_CLOEXEC != 0 || old == new {
         return Err(-EINVAL);
     }
-    let f = file_of(old)?;
-    let p = proc::current().files();
     let new = new as usize;
-    if new >= p.nofile {
+    if new >= proc::current().files().nofile {
         return Err(-EBADF);
     }
-    p.set(new, Some(Fd { file: f, cloexec: flags & O_CLOEXEC != 0 }));
+    let f = file_of(old)?;
+    proc::current().files().set(new, Some(Fd { file: f, cloexec: flags & O_CLOEXEC != 0 }));
     Ok(new as i64)
 }
 
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     let p = proc::current().files();
     let entry = p.fds.get_mut(fd as usize).and_then(|f| f.as_mut()).ok_or(-EBADF)?;
+    // O_PATH の fd にできるのは、写す、FD_CLOEXEC、F_GETFL だけ (Linux の check_fcntl_cmd)
+    if entry.file.borrow().flags & file::O_PATH != 0 && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+        return Err(-EBADF);
+    }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let f = entry.file.clone();
@@ -1244,9 +1680,28 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         }
         F_GETFL => Ok(entry.file.borrow().flags as i64),
         F_SETFL => {
-            // 変えられるのは O_APPEND と O_NONBLOCK だけ
+            // 変えられるのは O_APPEND、O_NONBLOCK、O_DIRECT、O_NOATIME (Linux の SETFL_MASK)。O_NOATIME をつけるのは
+            // 持ち主か root だけ (EPERM)、O_DIRECT はふつうのファイルとパイプだけ (EINVAL。setfl)
+            const O_DIRECT: u32 = 0o200000;
+            const O_NOATIME: u32 = 0o1000000;
+            const MASK: u32 = file::O_APPEND | O_NONBLOCK | O_DIRECT | O_NOATIME;
+            let arg = arg as u32;
             let mut f = entry.file.borrow_mut();
-            f.flags = (f.flags & !(file::O_APPEND | O_NONBLOCK)) | (arg as u32 & (file::O_APPEND | O_NONBLOCK));
+            let (owner, odirect) = match &f.kind {
+                Kind::Inode(i, _) => (Some(i.meta().uid), i.meta().mode & S_IFMT == vfs::S_IFREG),
+                Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (Some(p.uid.load(core::sync::atomic::Ordering::Relaxed)), true),
+                Kind::Socket(_) | Kind::Pair(..) => (Some(cred::current().euid), false),
+                // eventfd などの名前のない inode は root のもの
+                _ => (None, false),
+            };
+            let euid = cred::current().euid;
+            if arg & O_NOATIME != 0 && f.flags & O_NOATIME == 0 && euid != 0 && owner != Some(euid) {
+                return Err(-cred::EPERM);
+            }
+            if arg & O_DIRECT != 0 && !odirect {
+                return Err(-EINVAL);
+            }
+            f.flags = (f.flags & !MASK) | (arg & MASK);
             if let Kind::Socket(s) = &f.kind {
                 s.borrow_mut().nonblock = arg as u32 & O_NONBLOCK != 0;
             }
@@ -1735,6 +2190,7 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
         let off = read_off(off_out)?;
         let dst = inode_of(fd_out)?;
         vfs::write_sealed(&dst, off as usize, n)?;
+        vfs::drop_privs(&dst)?;
         let w = dst.write_at(off as usize, &tmp[..n])?;
         out(off_out, &(off + w as i64).to_le_bytes())?;
         w

@@ -96,6 +96,23 @@ impl Pages {
         }
         self.len = len;
     }
+
+    /// SEEK_DATA / SEEK_HOLE (Linux の mapping_seek_hole_data: ページがあればデータ)。off はファイルの中
+    fn seek(&self, off: usize, hole: bool) -> Result<usize, i64> {
+        const ENXIO: i64 = 6;
+        let pi = off / PGSIZE;
+        if !hole {
+            return match self.pages.range(pi..).next() {
+                Some((&k, _)) if (k * PGSIZE).max(off) < self.len => Ok((k * PGSIZE).max(off)),
+                _ => Err(-ENXIO),
+            };
+        }
+        let mut cur = pi;
+        while self.pages.contains_key(&cur) {
+            cur += 1;
+        }
+        Ok((cur * PGSIZE).max(off).min(self.len))
+    }
 }
 
 impl Drop for Pages {
@@ -152,6 +169,59 @@ enum Node {
     Fifo,
 }
 
+/// ディレクトリの項目の読む位置と順 (Linux 6.18 の tmpfs: simple_offset の offset と、d_children の並び)。
+/// offset は名前を入れたときに 3 から順に決まり、読む順は新しく入ったものから (d_children の頭に足す)。
+/// readdir は位置 (lseek) の名前、つまり offset がそれより大きくない最後のものから、並びの順に読む
+#[derive(Default)]
+struct DirPos {
+    /// 名前 → (offset, 並びの番号: 大きいほど新しい)
+    names: BTreeMap<String, (u64, u64)>,
+    by_off: BTreeMap<u64, String>,
+    by_seq: BTreeMap<u64, String>,
+    next_off: u64,
+    next_seq: u64,
+}
+
+/// 名前につける offset の始まり (0 と 1 は . と ..、2 は「最初の名前から」)
+const DIR_OFFSET_MIN: u64 = 3;
+/// 終わりまで読んだときの位置 (Linux の DIR_OFFSET_EOD)
+pub const DIR_OFFSET_EOD: u64 = i32::MAX as u64;
+
+impl DirPos {
+    /// name を並びの先頭に入れる。off があればその offset で (上書きする rename は、上書きされた名前の offset を
+    /// 引きつぐ: simple_offset_rename)、なければ次の空いた offset (終わりまで来たら 3 から: mtree_alloc_cyclic)
+    fn add(&mut self, name: &str, off: Option<u64>) {
+        self.remove(name);
+        let off = off.unwrap_or_else(|| {
+            let wrap = |o: u64| if o + 1 >= DIR_OFFSET_EOD { DIR_OFFSET_MIN } else { o + 1 };
+            let mut o = self.next_off.max(DIR_OFFSET_MIN);
+            while self.by_off.contains_key(&o) {
+                o = wrap(o);
+            }
+            self.next_off = wrap(o);
+            o
+        });
+        self.next_seq += 1;
+        self.names.insert(name.into(), (off, self.next_seq));
+        self.by_off.insert(off, name.into());
+        self.by_seq.insert(self.next_seq, name.into());
+    }
+
+    fn remove(&mut self, name: &str) -> Option<u64> {
+        let (off, seq) = self.names.remove(name)?;
+        self.by_off.remove(&off);
+        self.by_seq.remove(&seq);
+        Some(off)
+    }
+
+    /// 名前と offset はそのままで、並びの先頭へ (RENAME_EXCHANGE: d_exchange は両方を d_children の頭に)
+    fn to_front(&mut self, name: &str) {
+        if let Some(&(off, _)) = self.names.get(name) {
+            self.add(name, Some(off));
+        }
+    }
+}
+
 struct Attr {
     mode: u32,
     uid: u32,
@@ -168,6 +238,10 @@ pub struct TmpInode {
     node: RefCell<Node>,
     /// memfd の封 (F_SEAL_*)。memfd でなければ None
     seals: core::cell::Cell<Option<u32>>,
+    /// O_TMPFILE で O_EXCL なしに作った、まだ名前のないもの (link で一度だけ名前をつけられる)
+    linkable: core::cell::Cell<bool>,
+    /// ディレクトリ: 項目の読む位置と順
+    pos: RefCell<DirPos>,
 }
 
 pub const F_SEAL_SEAL: u32 = 1;
@@ -191,7 +265,7 @@ impl TmpInode {
         };
         let nlink = if matches!(node, Node::Dir(_)) { 2 } else { 1 };
         let t = now();
-        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t }), node: RefCell::new(node), seals: core::cell::Cell::new(None) })
+        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t }), node: RefCell::new(node), seals: core::cell::Cell::new(None), linkable: core::cell::Cell::new(false), pos: RefCell::new(DirPos::default()) })
     }
 
     fn touch(&self) {
@@ -233,6 +307,15 @@ impl TmpInode {
     }
 
     fn insert(&self, name: &str, child: Rc<TmpInode>) -> Result<(), i64> {
+        self.insert_at(name, child, None)
+    }
+
+    /// off: 読む位置 (なければ新しく。上書きする rename は、上書きされた名前のものを)
+    fn insert_at(&self, name: &str, child: Rc<TmpInode>, off: Option<u64>) -> Result<(), i64> {
+        // 消したディレクトリ (開いたまま rmdir されたもの) には作れない (Linux の IS_DEADDIR)
+        if self.attr.borrow().nlink == 0 {
+            return Err(-ENOENT);
+        }
         let is_dir = matches!(*child.node.borrow(), Node::Dir(_));
         self.with_dir(|m| {
             if m.contains_key(name) {
@@ -241,6 +324,7 @@ impl TmpInode {
             m.insert(name.to_string(), child);
             Ok(())
         })?;
+        self.pos.borrow_mut().add(name, off);
         if is_dir {
             self.attr.borrow_mut().nlink += 1;
         }
@@ -372,17 +456,23 @@ impl Inode for TmpInode {
         })
     }
 
-    fn readdir_after(&self, after: Option<&str>, f: &mut dyn FnMut(&str, u64, u32) -> bool) -> Option<Result<(), i64>> {
-        use core::ops::Bound;
-        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
-        Some(self.with_dir(|m| {
-            for (name, c) in m.range::<str, _>((from, Bound::Unbounded)) {
-                if !f(name, c.ino, c.attr.borrow().mode) {
-                    break;
-                }
+    fn readdir_offsets(&self, pos: u64, f: &mut dyn FnMut(u64, &str, u64, u32) -> bool) -> Option<Result<(), i64>> {
+        let node = self.node.borrow();
+        let Node::Dir(m) = &*node else { return Some(Err(-ENOTDIR)) };
+        let p = self.pos.borrow();
+        // pos の名前 (offset が pos より大きくない最後のもの) から並びの順に。なければ (2 か、どれよりも前) 先頭から
+        let start = if pos <= 2 { None } else { p.by_off.range(..=pos).next_back().map(|(_, n)| p.names[n].1) };
+        let mut it: alloc::boxed::Box<dyn Iterator<Item = (&u64, &String)>> = match start {
+            Some(s) => alloc::boxed::Box::new(p.by_seq.range(..=s).rev()),
+            None => alloc::boxed::Box::new(p.by_seq.iter().rev()),
+        };
+        for (_, name) in &mut it {
+            let Some(c) = m.get(name) else { continue };
+            if !f(p.names[name].0, name, c.ino, c.attr.borrow().mode) {
+                break;
             }
-            Ok(())
-        }))
+        }
+        Some(Ok(()))
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
@@ -401,13 +491,35 @@ impl Inode for TmpInode {
         Ok(child)
     }
 
+    fn seek_data(&self, off: u64, hole: bool) -> Option<Result<u64, i64>> {
+        match &*self.node.borrow() {
+            Node::File(Data::Owned(p)) => Some(p.seek(off as usize, hole).map(|x| x as u64)),
+            _ => None,
+        }
+    }
+
+    fn tmpfile(&self, mode: u32, linkable: bool) -> Result<InodeRef, i64> {
+        if !matches!(*self.node.borrow(), Node::Dir(_)) {
+            return Err(-ENOTDIR);
+        }
+        let t = TmpInode::new(self.fs, S_IFREG | (mode & 0o7777), Node::File(Data::Owned(Pages::new())));
+        t.attr.borrow_mut().nlink = 0;
+        t.linkable.set(linkable);
+        Ok(t)
+    }
+
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
         crate::vfs::dir_changed(self.id());
         let t = TmpInode::downcast(target, self.fs)?;
         if matches!(*t.node.borrow(), Node::Dir(_)) {
             return Err(-EPERM);
         }
+        // リンクが 0 (消したが開いているもの) は、O_TMPFILE の linkable なものだけ (Linux の vfs_link)
+        if t.attr.borrow().nlink == 0 && !t.linkable.get() {
+            return Err(-ENOENT);
+        }
         self.insert(name, t.clone())?;
+        t.linkable.set(false);
         t.attr.borrow_mut().nlink += 1;
         Ok(())
     }
@@ -423,6 +535,7 @@ impl Inode for TmpInode {
             _ => false,
         };
         self.with_dir(|m| Ok(m.remove(name)))?;
+        self.pos.borrow_mut().remove(name);
         {
             let mut a = child.attr.borrow_mut();
             a.nlink = a.nlink.saturating_sub(if is_dir { 2 } else { 1 });
@@ -441,21 +554,56 @@ impl Inode for TmpInode {
         let nd = TmpInode::downcast(newdir, self.fs)?;
         let child = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
         let is_dir = matches!(*child.node.borrow(), Node::Dir(_));
+        if is_dir && contains(&child, nd.ino) {
+            return Err(-EINVAL);
+        }
+        // 上書きするなら、その名前の読む位置を引きつぐ (Linux の simple_offset_rename)
+        let mut keep = None;
         if let Ok(existing) = nd.with_dir(|m| m.get(new).cloned().ok_or(-ENOENT)) {
             if existing.ino == child.ino {
                 return Ok(());
             }
+            keep = nd.pos.borrow().names.get(new).map(|e| e.0);
             nd.unlink(new, is_dir)?;
         }
-        if is_dir && contains(&child, nd.ino) {
-            return Err(-EINVAL);
-        }
         self.with_dir(|m| Ok(m.remove(old)))?;
+        self.pos.borrow_mut().remove(old);
         if is_dir {
             self.attr.borrow_mut().nlink -= 1;
         }
-        nd.insert(new, child)?;
+        nd.insert_at(new, child, keep)?;
         self.touch();
+        Ok(())
+    }
+
+    fn exchange(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        crate::vfs::dir_changed(self.id());
+        crate::vfs::dir_changed(newdir.id());
+        let nd = TmpInode::downcast(newdir, self.fs)?;
+        let a = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
+        let b = nd.with_dir(|m| m.get(new).cloned().ok_or(-ENOENT))?;
+        if a.ino == b.ino {
+            return Ok(());
+        }
+        let adir = matches!(*a.node.borrow(), Node::Dir(_));
+        let bdir = matches!(*b.node.borrow(), Node::Dir(_));
+        // 自分の下のものとは入れかえられない
+        if (adir && contains(&a, nd.ino)) || (bdir && contains(&b, self.ino)) {
+            return Err(-EINVAL);
+        }
+        self.with_dir(|m| Ok(m.insert(old.to_string(), b.clone())))?;
+        nd.with_dir(|m| Ok(m.insert(new.to_string(), a.clone())))?;
+        // 名前の読む位置はそのままで、どちらも並びの先頭へ (new が先: d_exchange)
+        self.pos.borrow_mut().to_front(old);
+        nd.pos.borrow_mut().to_front(new);
+        // ディレクトリがほかの親へ移ったら、親のリンクの数 (.. の分) も
+        if self.ino != nd.ino && adir != bdir {
+            let (gain, lose) = if adir { (&nd.attr, &self.attr) } else { (&self.attr, &nd.attr) };
+            gain.borrow_mut().nlink += 1;
+            lose.borrow_mut().nlink -= 1;
+        }
+        self.touch();
+        nd.touch();
         Ok(())
     }
 

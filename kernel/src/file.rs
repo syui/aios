@@ -104,11 +104,8 @@ pub struct OpenFile {
     pub kind: Kind,
     pub offset: usize,
     pub flags: u32,
-    /// ディレクトリ: 最初の getdents (offset 0) で読んだ一覧。続きはここから返す
-    /// (読みながら消しても番号がずれず、読み飛ばさない。rewinddir で offset が 0 に戻れば読みなおす)
-    dirents: Option<Rc<Vec<(u64, String, u32)>>>,
-    /// readdir_after で読むディレクトリ (tmpfs): (offset, そこまでに返した最後の名前)
-    dir_cursor: Option<(usize, String)>,
+    /// ディレクトリ: getdents で読んだ一覧。続きはここから返す
+    dirents: Option<Rc<Dirents>>,
     /// ふつうのファイルを読んでいる途中 (read_inode_file。ディスクを眠って待つことがある)。同じ開いたファイルを
     /// 読むほかの人は、終わるまで待つ (オフセットを同時に進めない)
     reading: bool,
@@ -116,8 +113,21 @@ pub struct OpenFile {
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
 
+/// 開いたディレクトリの一覧 (getdents の続き)
+pub struct Dirents {
+    /// (読む位置, inode, 名前, mode)。位置の順
+    list: Vec<(u64, u64, String, u32)>,
+    /// ext4 (dir_index) のハッシュの位置 (Linux と同じ): 終わりは i64::MAX。ディレクトリが変わったら、いまの
+    /// 位置から先を読みなおす (位置は名前で決まるのでずれない)。でなければ位置は何番めか (0 が .、1 が ..)。
+    /// こちらは最初の getdents (offset 0) で読んだものを使い続ける (読みながら消しても番号がずれず、
+    /// 読み飛ばさない。rewinddir で 0 に戻れば読みなおす)
+    hashed: bool,
+    /// 読んだときのディレクトリの版 (vfs::dir_gen)
+    generation: u64,
+}
+
 pub fn new(kind: Kind, flags: u32) -> FileRef {
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, dir_cursor: None, reading: false }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false }))
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
@@ -402,10 +412,16 @@ impl OpenFile {
                 Ok(src.len())
             }
             Kind::Inode(ino, path) => {
+                // 0 バイトは何もしない (終わりのずっと先にいても伸ばさない。O_APPEND でも動かない: Linux の
+                // generic_write_checks)
+                if src.is_empty() {
+                    return Ok(0);
+                }
                 if self.flags & O_APPEND != 0 {
                     self.offset = ino.meta().size as usize;
                 }
                 vfs::write_sealed(ino, self.offset, src.len())?;
+                vfs::drop_privs(ino)?;
                 let n = ino.write_at(self.offset, src)?;
                 self.offset += n;
                 crate::inotify::file_event(path, ino, crate::inotify::IN_MODIFY);
@@ -453,7 +469,10 @@ impl OpenFile {
             }
             // ino はパイプごとにちがう番号 (/proc/PID/fd の pipe:[N] と同じ)。diff <(a) <(b) などは
             // dev と ino が同じなら同じファイルとみなす
-            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, ..Stat::dev(S_IFIFO | 0o600, 0) },
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
+                use core::sync::atomic::Ordering::Relaxed;
+                Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
+            }
             Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
             Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => Stat::dev(0o600, 0),
@@ -600,6 +619,43 @@ impl OpenFile {
     }
 
     pub fn lseek(&mut self, off: i64, whence: u32) -> Result<usize, i64> {
+        // ディレクトリ: ext4 は htree のハッシュの位置なので終わりは i64::MAX (ext4_dir_llseek)、ほか (tmpfs) は
+        // SEEK_SET と SEEK_CUR だけ (dcache_dir_lseek)
+        if let Kind::Inode(ino, _) = &self.kind
+            && ino.meta().is_dir()
+        {
+            const EXT4_SUPER_MAGIC: u64 = 0xef53;
+            let st = ino.statfs();
+            let ext4 = u64::from_le_bytes(st[0..8].try_into().unwrap()) == EXT4_SUPER_MAGIC;
+            // 消した (rmdir) ext4 のディレクトリは大きさ 0 のふつうのもの (ext4_rmdir が i_size を 0 にし、索引の
+            // ないディレクトリとして ext4_llseek): 終わりは 0、SEEK_DATA / SEEK_HOLE は ENXIO、位置は s_maxbytes まで
+            if ext4 && ino.meta().nlink == 0 {
+                let maxbytes = u32::MAX as i64 * i64::from_le_bytes(st[8..16].try_into().unwrap()).max(1024);
+                let new = match whence {
+                    0 => Some(off),
+                    1 if off == 0 => return Ok(self.offset),
+                    1 => (self.offset as i64).checked_add(off),
+                    2 => Some(off),
+                    3 | 4 => return Err(-6),
+                    _ => None,
+                };
+                let new = new.filter(|&n| n >= 0 && n <= maxbytes).ok_or(-EINVAL)?;
+                self.offset = new as usize;
+                return Ok(self.offset);
+            }
+            let new = match whence {
+                0 => Some(off),
+                1 => (self.offset as i64).checked_add(off),
+                2 if ext4 => i64::MAX.checked_add(off),
+                // 終わり (i64::MAX) から先と負は ENXIO (generic_file_llseek_size は u64 にしてくらべる)
+                3 if ext4 => return if off < 0 || off == i64::MAX { Err(-6) } else { self.offset = off as usize; Ok(self.offset) },
+                4 if ext4 => return if off < 0 || off == i64::MAX { Err(-6) } else { self.offset = i64::MAX as usize; Ok(self.offset) },
+                _ => None,
+            };
+            let new = new.filter(|&n| n >= 0).ok_or(-EINVAL)?;
+            self.offset = new as usize;
+            return Ok(self.offset);
+        }
         let size = match &self.kind {
             Kind::Inode(ino, _) => ino.meta().size as i64,
             Kind::Null | Kind::Zero | Kind::Random => 0,
@@ -610,6 +666,16 @@ impl OpenFile {
         const SEEK_DATA: u32 = 3;
         const SEEK_HOLE: u32 = 4;
         const ENXIO: i64 = 6;
+        // 穴を知っているもの (ext4 の extent)
+        if (whence == SEEK_DATA || whence == SEEK_HOLE)
+            && off >= 0
+            && off < size
+            && let Kind::Inode(ino, _) = &self.kind
+            && let Some(r) = ino.seek_data(off as u64, whence == SEEK_HOLE)
+        {
+            self.offset = r? as usize;
+            return Ok(self.offset);
+        }
         let base = match whence {
             0 => 0,
             1 => self.offset as i64,
@@ -628,50 +694,88 @@ impl OpenFile {
         Ok(self.offset)
     }
 
-    /// linux_dirent64 を詰める。offset は「何番目まで返したか」
+    /// linux_dirent64 を詰める。offset は次に読む位置 (Dirents)
     pub fn getdents(&mut self, out: &mut Vec<u8>, max: usize) -> Result<(), i64> {
         let Kind::Inode(dir, path) = &self.kind else { return Err(-ENOTDIR) };
         if !dir.meta().is_dir() {
             return Err(-ENOTDIR);
         }
-        // 名前の順に読めるもの (tmpfs): 全部をコピーせずに、名前のカーソルで続きから (offset は 1 が .、2 が ..、あとは項目の数)
+        // 開いたまま消された (rmdir) ディレクトリは ENOENT (Linux の iterate_dir の IS_DEADDIR)
+        if dir.meta().nlink == 0 {
+            return Err(-vfs::ENOENT);
+        }
+        // tmpfs: 全部をコピーせずに、名前の位置 (offset) から (Linux 6.18 の tmpfs と同じ位置と順)
         let (d, p) = (dir.clone(), path.clone());
         if let Some(r) = self.getdents_stream(d, p, out, max) {
             return r;
         }
         let Kind::Inode(dir, path) = &self.kind else { return Err(-ENOTDIR) };
-        let list = match &self.dirents {
-            Some(l) if self.offset != 0 => l.clone(),
-            _ => {
-                let parent = vfs::resolve("", &vfs::normalize(path, ".."), true).unwrap_or_else(|_| dir.clone());
-                let mut list = Vec::new();
-                list.push((dir.meta().ino, String::from("."), vfs::S_IFDIR));
-                list.push((parent.meta().ino, String::from(".."), vfs::S_IFDIR));
-                for e in dir.readdir()? {
-                    list.push((e.ino, e.name, e.mode));
-                }
-                let l = Rc::new(list);
-                self.dirents = Some(l.clone());
-                l
-            }
+        // ハッシュの位置なら、ディレクトリが変わったら読みなおす (Linux と同じく、まだ読んでいない位置に入った名前も
+        // 見える)。大きなものは読みなおさずに、返す名前がまだあるかだけ確かめる (rm -rf のように消しながら読むと、
+        // 毎回全部を読むことになるので)
+        const RELOAD_MAX: usize = 512;
+        let changed = |d: &Dirents| d.hashed && d.generation != vfs::dir_gen(dir.id());
+        let fresh = match &self.dirents {
+            Some(d) if self.offset != 0 => changed(d) && d.list.len() <= RELOAD_MAX,
+            _ => true,
         };
-        for (i, (ino, name, mode)) in list.iter().enumerate().skip(self.offset) {
-            let (ino, mode) = (*ino, *mode);
+        if fresh {
+            let generation = vfs::dir_gen(dir.id());
+            let d = match dir.readdir_cookies() {
+                Some(r) => Dirents { list: r?.into_iter().map(|(p, e)| (p, e.ino, e.name, e.mode)).collect(), hashed: true, generation },
+                None => {
+                    let parent = vfs::resolve("", &vfs::normalize(path, ".."), true).unwrap_or_else(|_| dir.clone());
+                    let mut list = Vec::new();
+                    list.push((0, dir.meta().ino, String::from("."), vfs::S_IFDIR));
+                    list.push((1, parent.meta().ino, String::from(".."), vfs::S_IFDIR));
+                    for (i, e) in dir.readdir()?.into_iter().enumerate() {
+                        list.push((i as u64 + 2, e.ino, e.name, e.mode));
+                    }
+                    Dirents { list, hashed: false, generation }
+                }
+            };
+            self.dirents = Some(Rc::new(d));
+        }
+        let d = self.dirents.clone().unwrap();
+        let check = changed(&d);
+        // 終わりの位置 (ハッシュなら Linux の EXT4_HTREE_EOF_64BIT)
+        let end = if d.hashed { i64::MAX as u64 } else { d.list.len() as u64 };
+        let pos = self.offset as u64;
+        if pos >= end {
+            return Ok(());
+        }
+        let first = d.list.partition_point(|e| e.0 < pos);
+        // 終わりまで返したら (残りが消えていたものだけでも) 位置は終わり
+        let mut all = true;
+        for k in first..d.list.len() {
+            let (_, ino, name, mode) = &d.list[k];
+            let (ino, mode) = match check {
+                false => (*ino, *mode),
+                true => match dir.lookup(name) {
+                    Ok(i) => (i.meta().ino, i.meta().mode),
+                    Err(_) => continue,
+                },
+            };
+            let next = d.list.get(k + 1).map_or(end, |e| e.0);
             let reclen = (19 + name.len() + 1 + 7) & !7;
             if out.len() + reclen > max {
                 if out.is_empty() {
                     return Err(-EINVAL);
                 }
+                all = false;
                 break;
             }
             let start = out.len();
             out.extend_from_slice(&ino.to_le_bytes());
-            out.extend_from_slice(&((i + 1) as i64).to_le_bytes());
+            out.extend_from_slice(&(next as i64).to_le_bytes());
             out.extend_from_slice(&(reclen as u16).to_le_bytes());
             out.push(dtype(mode));
             out.extend_from_slice(name.as_bytes());
             out.resize(start + reclen, 0);
-            self.offset = i + 1;
+            self.offset = next as usize;
+        }
+        if all {
+            self.offset = end as usize;
         }
         Ok(())
     }
@@ -679,79 +783,71 @@ impl OpenFile {
 
 impl OpenFile {
     fn getdents_stream(&mut self, dir: InodeRef, path: String, out: &mut Vec<u8>, max: usize) -> Option<Result<(), i64>> {
-        // 使えるか (空の f で 0 個読んでみる)
-        dir.readdir_after(Some("\u{10ffff}"), &mut |_, _, _| false)?.ok()?;
-        // lseek で動かされていたら (seekdir など)、はじめから数えなおしてカーソルを作る
-        let mut cursor: Option<String> = match self.dir_cursor.take() {
-            Some((off, name)) if off == self.offset => Some(name),
-            _ if self.offset <= 2 => None,
-            _ => {
-                let (mut n, mut last) = (2usize, None);
-                let want = self.offset;
-                let r = dir.readdir_after(None, &mut |name, _, _| {
-                    n += 1;
-                    last = Some(String::from(name));
-                    n < want
-                });
-                if let Some(Err(e)) = r {
-                    return Some(Err(e));
-                }
-                last
-            }
-        };
-        let put = |out: &mut Vec<u8>, ino: u64, name: &str, mode: u32, off: usize| -> bool {
+        use crate::tmpfs::DIR_OFFSET_EOD;
+        // 使えるか (空の f で読んでみる)
+        dir.readdir_offsets(DIR_OFFSET_EOD, &mut |_, _, _, _| false)?.ok()?;
+        // Linux の filldir64 と同じく、項目の d_off は次の項目の位置 (入れるときに前のものを書きかえる)、最後の
+        // ものは読み終えたときの位置
+        let mut prev: Option<usize> = None;
+        let mut put = |out: &mut Vec<u8>, ino: u64, name: &str, mode: u32, pos: u64| -> bool {
             let reclen = (19 + name.len() + 1 + 7) & !7;
             if out.len() + reclen > max {
                 return false;
             }
+            if let Some(p) = prev {
+                out[p + 8..p + 16].copy_from_slice(&(pos as i64).to_le_bytes());
+            }
             let start = out.len();
+            prev = Some(start);
             out.extend_from_slice(&ino.to_le_bytes());
-            out.extend_from_slice(&(off as i64).to_le_bytes());
+            out.extend_from_slice(&0i64.to_le_bytes());
             out.extend_from_slice(&(reclen as u16).to_le_bytes());
             out.push(dtype(mode));
             out.extend_from_slice(name.as_bytes());
             out.resize(start + reclen, 0);
             true
         };
-        if self.offset < 1 {
-            if !put(out, dir.meta().ino, ".", vfs::S_IFDIR, 1) {
-                return Some(Err(-EINVAL));
+        // . が位置 0、.. が 1 (dir_emit_dots)。名前はそれぞれの offset、読み終えたら DIR_OFFSET_EOD
+        let mut pos = self.offset as u64;
+        let mut full = false;
+        if pos == 0 {
+            full = !put(out, dir.meta().ino, ".", vfs::S_IFDIR, 0);
+            if !full {
+                pos = 1;
             }
-            self.offset = 1;
         }
-        if self.offset < 2 {
+        if pos == 1 && !full {
             let parent = vfs::resolve("", &vfs::normalize(&path, ".."), true).unwrap_or_else(|_| dir.clone());
-            if !put(out, parent.meta().ino, "..", vfs::S_IFDIR, 2) {
-                return Some(if out.is_empty() { Err(-EINVAL) } else { Ok(()) });
-            }
-            self.offset = 2;
-        }
-        let mut off = self.offset;
-        let after = cursor.clone();
-        let r = dir.readdir_after(after.as_deref(), &mut |name, ino, mode| {
-            if !put(out, ino, name, mode, off + 1) {
-                return false;
-            }
-            off += 1;
-            cursor = Some(String::from(name));
-            true
-        })?;
-        if let Err(e) = r {
-            return Some(Err(e));
-        }
-        if out.is_empty() {
-            // 1 つも入らなかった: 次の項目がバッファより大きい (終わりまで読んだときは out は空で Ok)
-            let mut more = false;
-            dir.readdir_after(after.as_deref(), &mut |_, _, _| {
-                more = true;
-                false
-            });
-            if more {
-                return Some(Err(-EINVAL));
+            full = !put(out, parent.meta().ino, "..", vfs::S_IFDIR, 1);
+            if !full {
+                pos = 2;
             }
         }
-        self.offset = off;
-        self.dir_cursor = cursor.map(|c| (off, c));
+        if !full && pos != DIR_OFFSET_EOD {
+            let r = dir.readdir_offsets(pos, &mut |off, name, ino, mode| {
+                pos = off;
+                if put(out, ino, name, mode, off) {
+                    true
+                } else {
+                    full = true;
+                    false
+                }
+            })?;
+            if let Err(e) = r {
+                return Some(Err(e));
+            }
+            if !full {
+                pos = DIR_OFFSET_EOD;
+            }
+        }
+        if let Some(p) = prev {
+            out[p + 8..p + 16].copy_from_slice(&(pos as i64).to_le_bytes());
+        }
+        self.offset = pos as usize;
+        // 1 つも入らなかった: 次の項目がバッファより大きい
+        if out.is_empty() && full {
+            return Some(Err(-EINVAL));
+        }
         Some(Ok(()))
     }
 }
@@ -1201,6 +1297,10 @@ pub fn mark_epolled(f: &FileRef) {
 pub struct PipeCell {
     owner: core::sync::atomic::AtomicUsize,
     inner: crate::spinlock::SpinLock<Pipe>,
+    /// fstat に見せる持ち主 (作った人) と許可 (fchmod で変わる)。Linux の pipefs の inode と同じ
+    pub uid: core::sync::atomic::AtomicU32,
+    pub gid: core::sync::atomic::AtomicU32,
+    pub perm: core::sync::atomic::AtomicU32,
 }
 
 pub struct PipeGuard<'a> {
@@ -1210,7 +1310,9 @@ pub struct PipeGuard<'a> {
 
 impl PipeCell {
     pub fn new(p: Pipe) -> Self {
-        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p) }
+        use core::sync::atomic::AtomicU32;
+        let c = crate::cred::current();
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600) }
     }
 
     pub fn borrow_mut(&self) -> PipeGuard<'_> {

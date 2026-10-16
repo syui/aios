@@ -187,6 +187,14 @@ aish の `sysdiff` (aish-vm) が、このマシンの Linux (root なら nobody 
 ちがいが同じ op で出るいちばん小さな並び (`SEED:I,J,...`) に縮める。ほかの Linux (たとえば aios(main)) の答えでくらべるなら、
 そこで `cc -O2 -o sysdiff test/sysdiff.c && ./sysdiff -n 30 DIR 1-300 > linux.txt` とし、`linux` にそのファイルをわたす。
 
+ホームの ext4 (`fs` の既定) と /tmp の tmpfs (`fs: tmp`) の両方で、30 op と、長い並び (`ops: 80`) の種を見る。いまの aios は
+Linux 6.18 と、ext4 で 1300 の種 (30 op) と 1500 の種 (80 op)、tmpfs で 1000 の種のどれもちがわない。ディレクトリを読む位置も
+Linux と同じ: ext4 (dir_index) は名前のハッシュの順で、位置は `(hash >> 1) << 32 | minor_hash` (終わりは i64::MAX)、tmpfs は
+Linux 6.18 の simple_offset (名前ごとに 3 からの offset、新しいものから、終わりは S32_MAX)。ちがいのうち、まちがいでもあったもの:
+消した ext4 のファイルの番号を使った新しいファイルを、大きなロックなしの read が前のファイルのページキャッシュから読めた
+(ほかの人のファイルの中身が見えた)、tmpfs のファイルの 1 TiB 先に 1 バイト書くとページの表が 4 GiB に伸びてカーネルが止まった
+(どちらもふつうの人にできた)、開いたまま rmdir したディレクトリに名前を作れた。
+
 ## カーネルの中を見る (/proc/ai)
 
 止まった・遅いプログラムを調べるための、カーネルの中の様子。AI が読むので、どれも 1 行 1 つの JSON。

@@ -245,6 +245,8 @@ pub struct ExtFs {
     users: RefCell<BTreeMap<u32, usize>>,
     /// リンクが 0 になったが、まだ使われているので残してある inode (最後の利用者がいなくなったら片付ける)
     orphans: RefCell<BTreeSet<u32>>,
+    /// O_TMPFILE で O_EXCL なしに作った、まだ名前のない inode (link で一度だけ名前をつけられる)
+    linkable: RefCell<BTreeSet<u32>>,
     /// スワップに使っているファイル (書きかえさせない)
     swapfiles: RefCell<BTreeSet<u32>>,
     /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
@@ -451,6 +453,7 @@ impl ExtFs {
             last_flush: core::cell::Cell::new(0),
             users: RefCell::new(BTreeMap::new()),
             orphans: RefCell::new(BTreeSet::new()),
+            linkable: RefCell::new(BTreeSet::new()),
             swapfiles: RefCell::new(BTreeSet::new()),
             names: RefCell::new(Names { dirs: BTreeMap::new(), len: 0 }),
             wgen: core::cell::Cell::new(0),
@@ -1426,6 +1429,40 @@ impl ExtFs {
         Err(-EIO)
     }
 
+    /// node (木の根か節) の下で、lb から先で最初にデータのある範囲 (論理ブロックの先頭, 数)。先頭は lb より前に
+    /// しない。未初期化の extent は穴 (0 として読むので)。なければ None (SEEK_DATA / SEEK_HOLE)
+    fn ext_next_data(&self, node: &[u8], lb: u64, depth: u32) -> Result<Option<(u64, u64)>, i64> {
+        if u16_at(node, 0) != EXT_MAGIC || depth > 8 {
+            return Err(-EIO);
+        }
+        let n = (u16_at(node, 2) as usize).min((node.len() - 12) / 12);
+        let e = |i: usize| &node[12 + i * 12..24 + i * 12];
+        if u16_at(node, 6) == 0 {
+            for i in 0..n {
+                let (b, len) = (u32_at(e(i), 0) as u64, u16_at(e(i), 4) as u32);
+                if len > EXT_INIT_MAX_LEN {
+                    continue;
+                }
+                let end = b + len as u64;
+                if end > lb {
+                    return Ok(Some((b.max(lb), end - b.max(lb))));
+                }
+            }
+            return Ok(None);
+        }
+        // 索引: i 番目の子は、次の子の始まりの前まで
+        for i in 0..n {
+            if i + 1 < n && u32_at(e(i + 1), 0) as u64 <= lb {
+                continue;
+            }
+            let child = self.with_block(ExtFs::ext_index_child(e(i)), |d| d.to_vec())?;
+            if let Some(x) = self.ext_next_data(&child, lb, depth + 1)? {
+                return Ok(Some(x));
+            }
+        }
+        Ok(None)
+    }
+
     fn ext_init_root(r: &mut Raw) {
         let ib = r.iblock();
         ib.fill(0);
@@ -1738,6 +1775,19 @@ impl ExtFs {
         Ok(out)
     }
 
+    /// ディレクトリの項目の種類 (ft) から mode の種類。書かれていなければ inode を読む
+    fn mode_of_ft(&self, ino: u32, ft: u8) -> u32 {
+        match ft {
+            1 => S_IFREG,
+            2 => S_IFDIR,
+            3 => S_IFCHR,
+            5 => S_IFIFO,
+            6 => S_IFSOCK,
+            7 => S_IFLNK,
+            _ => self.read_inode(ino).map_or(0, |r| r.mode()),
+        }
+    }
+
     /// dir の名前のキャッシュを捨てる
     fn forget_names(&self, dir: u32) {
         self.names_gen.set(self.names_gen.get() + 1);
@@ -1826,6 +1876,10 @@ impl ExtFs {
             return Err(-ENAMETOOLONG);
         }
         let mut r = self.dir_writable(dir)?;
+        // 消したディレクトリ (開いたまま rmdir されたもの) には作れない (Linux の IS_DEADDIR)
+        if r.links() == 0 {
+            return Err(-ENOENT);
+        }
         if r.flags() & INDEX_FL != 0 {
             self.dx_add_entry(dir, &mut r, name, ino, mode)?;
             return self.dir_changed(dir);
@@ -1869,6 +1923,19 @@ impl ExtFs {
         })?;
         r.set_size(r.size() + self.bsize as u64);
         self.write_inode(dir, &r)?;
+        self.dir_changed(dir)
+    }
+
+    /// 項目 name を、ino (種類 mode) を指すように書きかえる。名前もハッシュも変わらないので、その場で
+    /// (RENAME_EXCHANGE。set_dotdot と同じ)
+    fn set_entry(&self, dir: u32, name: &str, ino: u32, mode: u32) -> Result<(), i64> {
+        let r = self.dir_writable(dir)?;
+        let generation = r.gen_no();
+        let (b, o) = self.dir_entries(dir)?.into_iter().find(|e| e.2 != 0 && e.4 == name).map(|e| (e.0, e.1)).ok_or(-ENOENT)?;
+        self.modify_dir_block(dir, generation, b, |d| {
+            put32(d, o, ino);
+            d[o + 7] = ftype(mode);
+        })?;
         self.dir_changed(dir)
     }
 
@@ -1965,6 +2032,7 @@ impl Drop for ExtInode {
             last
         };
         if last && self.fs.orphans.borrow_mut().remove(&self.ino) {
+            self.fs.linkable.borrow_mut().remove(&self.ino);
             // 消したファイルの後片づけ (ブロックと inode を返す)。最後の参照がなくなったところ (unlinkat の中など) で動く
             let _p = crate::prof::span("extfs:release");
             let fs = &self.fs;
@@ -2105,6 +2173,10 @@ impl ExtInode {
         if fs.find(self.ino, name).is_ok() {
             return Err(-EEXIST);
         }
+        // 消したディレクトリには作れない (inode をとる前に)
+        if fs.read_inode(self.ino)?.links() == 0 {
+            return Err(-ENOENT);
+        }
         let mode = node.type_bits() | (mode & 0o7777);
         let is_dir = matches!(node, NewNode::Dir);
         let ino = fs.alloc_inode(fs.group_of(self.ino), is_dir)?;
@@ -2161,6 +2233,35 @@ impl ExtInode {
             _ => {}
         }
         fs.add_entry(self.ino, name, ino, mode)?;
+        Ok(self.at(ino))
+    }
+
+    /// O_TMPFILE: 名前のないふつうのファイル。はじめから orphan (消したが開いているもの) にしておくので、
+    /// 最後に閉じたとき (や、いきなり電源が切れたあとのマウント) に片付く
+    fn tmpfile_node(&self, mode: u32, linkable: bool) -> Result<InodeRef, i64> {
+        self.dir_only()?;
+        let fs = &self.fs;
+        let ino = fs.alloc_inode(fs.group_of(self.ino), false)?;
+        let mut r = Raw(vec![0; fs.inode_size]);
+        put16(&mut r.0, 0, (S_IFREG | (mode & 0o7777)) as u16);
+        let t = now_secs();
+        for o in [8, 12, 16] {
+            put32(&mut r.0, o, t);
+        }
+        put32(&mut r.0, 0x64, crate::rand::u64() as u32); // i_generation
+        if fs.inode_size > 128 {
+            put16(&mut r.0, 0x80, 32); // i_extra_isize
+        }
+        r.set_links(0);
+        if fs.extents {
+            ExtFs::ext_init_root(&mut r);
+        }
+        fs.orphan_add(ino, &mut r);
+        fs.write_inode(ino, &r)?;
+        fs.orphans.borrow_mut().insert(ino);
+        if linkable {
+            fs.linkable.borrow_mut().insert(ino);
+        }
         Ok(self.at(ino))
     }
 
@@ -2223,6 +2324,42 @@ impl ExtInode {
             fs.set_dotdot(child, nd)?;
             fs.add_links(self.ino, -1)?;
             fs.add_links(nd, 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl ExtInode {
+    /// old (このディレクトリ) と new (nd) の項目が指す inode を入れかえる。ディレクトリがほかの親へ移るなら、
+    /// その .. と親のリンクの数も
+    fn exchange_node(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        self.dir_only()?;
+        let nd = self.other(newdir)?;
+        let fs = &self.fs;
+        let a = fs.find(self.ino, old)?;
+        let b = fs.find(nd, new)?;
+        if a == b {
+            return Ok(());
+        }
+        let (am, bm) = (fs.read_inode(a)?.mode(), fs.read_inode(b)?.mode());
+        let (adir, bdir) = (am & S_IFMT == S_IFDIR, bm & S_IFMT == S_IFDIR);
+        if (adir && fs.is_under(nd, a)?) || (bdir && fs.is_under(self.ino, b)?) {
+            return Err(-EINVAL);
+        }
+        fs.set_entry(self.ino, old, b, bm)?;
+        fs.set_entry(nd, new, a, am)?;
+        if self.ino != nd {
+            if adir {
+                fs.set_dotdot(a, nd)?;
+            }
+            if bdir {
+                fs.set_dotdot(b, self.ino)?;
+            }
+            if adir != bdir {
+                let (gain, lose) = if adir { (nd, self.ino) } else { (self.ino, nd) };
+                fs.add_links(gain, 1)?;
+                fs.add_links(lose, -1)?;
+            }
         }
         Ok(())
     }
@@ -2291,6 +2428,41 @@ impl Inode for ExtInode {
 
     fn page_cacheable(&self) -> bool {
         true
+    }
+
+    fn seek_data(&self, off: u64, hole: bool) -> Option<Result<u64, i64>> {
+        const ENXIO: i64 = 6;
+        let r = match self.raw() {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        // extent のないもの (ext2/3 のブロックの表) は、全部がデータとして
+        if r.flags() & EXTENTS_FL == 0 || r.mode() & S_IFMT != S_IFREG {
+            return None;
+        }
+        let (size, bs) = (r.size(), self.fs.bsize as u64);
+        if off >= size {
+            return Some(Err(-ENXIO));
+        }
+        let root = &r.0[40..100];
+        let res = (|| -> Result<u64, i64> {
+            if !hole {
+                // データ: その範囲の初め (off がデータの中なら off)。ファイルの終わりより先なら ENXIO
+                return match self.fs.ext_next_data(root, off / bs, 0)? {
+                    Some((b, _)) if (b * bs).max(off) < size => Ok((b * bs).max(off)),
+                    _ => Err(-ENXIO),
+                };
+            }
+            // 穴: off が穴の中なら off、データの中なら続くデータの終わり (終わりはファイルの大きさまで)
+            let mut cur = off / bs;
+            while let Some((b, n)) = self.fs.ext_next_data(root, cur, 0)?
+                && b == cur
+            {
+                cur = b + n;
+            }
+            Ok((cur * bs).max(off).min(size))
+        })();
+        Some(res)
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
@@ -2389,18 +2561,21 @@ impl Inode for ExtInode {
             if e.2 == 0 || e.4 == "." || e.4 == ".." {
                 continue;
             }
-            let mode = match e.5 {
-                1 => S_IFREG,
-                2 => S_IFDIR,
-                3 => S_IFCHR,
-                5 => S_IFIFO,
-                6 => S_IFSOCK,
-                7 => S_IFLNK,
-                _ => self.fs.read_inode(e.2).map_or(0, |r| r.mode()),
-            };
-            out.push(DirEntry { name: e.4, ino: e.2 as u64, mode });
+            out.push(DirEntry { mode: self.fs.mode_of_ft(e.2, e.5), name: e.4, ino: e.2 as u64 });
         }
         Ok(out)
+    }
+
+    fn readdir_cookies(&self) -> Option<Result<Vec<(u64, DirEntry)>, i64>> {
+        let _p = crate::prof::span("extfs:readdir");
+        if let Err(e) = self.dir_only() {
+            return Some(Err(e));
+        }
+        match self.fs.readdir_hashed(self.ino) {
+            Ok(Some(v)) => Some(Ok(v.into_iter().map(|(p, ino, name, ft)| (p, DirEntry { mode: self.fs.mode_of_ft(ino, ft), name, ino: ino as u64 })).collect())),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
@@ -2419,13 +2594,33 @@ impl Inode for ExtInode {
             if r.mode() & S_IFMT == S_IFDIR {
                 return Err(-EPERM);
             }
+            // リンクが 0 (消したが開いているもの) は、O_TMPFILE の linkable なものだけ (Linux の vfs_link)
+            let tmp = r.links() == 0;
+            if tmp && !self.fs.linkable.borrow().contains(&t) {
+                return Err(-ENOENT);
+            }
             if self.fs.find(self.ino, name).is_ok() {
                 return Err(-EEXIST);
             }
             self.fs.add_entry(self.ino, name, t, r.mode())?;
             self.fs.add_links(t, 1)?;
+            // 名前がついた: もう orphan ではない (リストから外し、i_dtime のつなぎも消す)
+            if tmp {
+                self.fs.linkable.borrow_mut().remove(&t);
+                if self.fs.orphans.borrow_mut().remove(&t) {
+                    self.fs.orphan_del(t)?;
+                    let mut r = self.fs.read_inode(t)?;
+                    put32(&mut r.0, 20, 0);
+                    self.fs.write_inode(t, &r)?;
+                }
+            }
             Ok(())
         })
+    }
+
+    fn tmpfile(&self, mode: u32, linkable: bool) -> Result<InodeRef, i64> {
+        let _p = crate::prof::span("extfs:create");
+        self.write_op(|| self.tmpfile_node(mode, linkable))
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
@@ -2439,6 +2634,13 @@ impl Inode for ExtInode {
         crate::vfs::dir_changed(self.id());
         crate::vfs::dir_changed(newdir.id());
         self.write_op(|| self.rename_node(old, newdir, new))
+    }
+
+    fn exchange(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:rename");
+        crate::vfs::dir_changed(self.id());
+        crate::vfs::dir_changed(newdir.id());
+        self.write_op(|| self.exchange_node(old, newdir, new))
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {

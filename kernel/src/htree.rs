@@ -27,6 +27,10 @@ impl Hasher {
     fn hash(&self, n: &[u8]) -> u32 {
         dirhash(n, self.version, self.unsigned, &self.seed)
     }
+    /// (ハッシュ, 小さいハッシュ)
+    fn hash2(&self, n: &[u8]) -> (u32, u32) {
+        dirhash2(n, self.version, self.unsigned, &self.seed)
+    }
 }
 
 // ---- ハッシュ (Linux の fs/ext4/hash.c と同じ) ----
@@ -133,10 +137,15 @@ fn tea(buf: &mut [u32; 4], inp: &[u32; 8]) {
 
 /// 名前のハッシュ (下の 1 ビットは 0。索引では「同じハッシュの続き」の印に使う)
 pub fn dirhash(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> u32 {
+    dirhash2(name, version, unsigned, seed).0
+}
+
+/// (ハッシュ, 小さいハッシュ) (Linux の ext4fs_dirhash の hash と minor_hash。readdir の並びと位置に使う)
+pub fn dirhash2(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> (u32, u32) {
     let mut buf = if seed.iter().any(|&s| s != 0) { *seed } else { [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476] };
     let signed = !unsigned;
-    let hash = match version {
-        DX_HASH_LEGACY => dx_hack_hash(name, signed),
+    let (hash, minor) = match version {
+        DX_HASH_LEGACY => (dx_hack_hash(name, signed), 0),
         DX_HASH_HALF_MD4 => {
             let mut p = name;
             loop {
@@ -146,7 +155,7 @@ pub fn dirhash(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> u32
                 }
                 p = &p[32..];
             }
-            buf[1]
+            (buf[1], buf[2])
         }
         _ => {
             let mut p = name;
@@ -157,11 +166,60 @@ pub fn dirhash(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> u32
                 }
                 p = &p[16..];
             }
-            buf[0]
+            (buf[0], buf[1])
         }
     };
     let hash = hash & !1;
-    if hash == 0x7fff_ffff << 1 { (0x7fff_ffff - 1) << 1 } else { hash }
+    (if hash == 0x7fff_ffff << 1 { (0x7fff_ffff - 1) << 1 } else { hash }, minor)
+}
+
+// ---- readdir の並び (Linux の ext4_dx_readdir) ----
+// dir_index のあるファイルシステムでは、索引のあるディレクトリも 1 ブロックだけのものも、名前のハッシュの順に
+// 読む。読む位置 (telldir / d_off / lseek) は (ハッシュ >> 1) << 32 | 小さいハッシュ、終わりは i64::MAX。
+// 名前が増えたり減ったりしても位置がずれない (読みながら消してもとばさない)
+
+/// (読む位置, inode, 名前, 種類 (ft))
+type Hashed = (u64, u32, String, u8);
+
+impl ExtFs {
+    /// dir をハッシュの順に。位置の順に並べて。この読み方をしないディレクトリ (dir_index がない、索引なしで
+    /// 2 ブロック以上、知らないハッシュ) は None (ブロックの順に)
+    pub(super) fn readdir_hashed(&self, dir: u32) -> Result<Option<Vec<Hashed>>, i64> {
+        const COMPAT_DIR_INDEX: u32 = 0x20;
+        let mut r = self.read_inode(dir)?;
+        let (compat, def, seed, sflags) = {
+            let sb = self.sb.borrow();
+            (u32_at(&sb, 0x5c), sb[0xfc], [u32_at(&sb, 0xec), u32_at(&sb, 0xf0), u32_at(&sb, 0xf4), u32_at(&sb, 0xf8)], u32_at(&sb, 0x160))
+        };
+        let indexed = r.flags() & INDEX_FL != 0;
+        if compat & COMPAT_DIR_INDEX == 0 || (!indexed && r.size() != self.bsize as u64) {
+            return Ok(None);
+        }
+        // 索引があれば根に書かれたもの、なければ superblock の s_def_hash_version (3 から 5 は unsigned の版)
+        let version = if indexed { self.read_block(self.map(dir, &mut r, 0, false)?)?[0x1c] } else { def };
+        let (version, unsigned) = if version <= DX_HASH_TEA { (version, sflags & FLAGS_UNSIGNED_HASH != 0) } else { (version - 3, true) };
+        if version > DX_HASH_TEA {
+            return Ok(None);
+        }
+        let h = Hasher { version, unsigned, seed };
+        let pos = |(major, minor): (u32, u32)| (((major >> 1) as u64) << 32) | minor as u64;
+        let mut v: Vec<Hashed> = self
+            .dir_entries(dir)?
+            .into_iter()
+            .filter(|e| e.2 != 0)
+            .map(|e| {
+                // 索引のあるディレクトリの . と .. は、ハッシュ 0 と 2 (いちばん先)
+                let p = match (indexed, e.4.as_str()) {
+                    (true, ".") => 0,
+                    (true, "..") => pos((2, 0)),
+                    _ => pos(h.hash2(e.4.as_bytes())),
+                };
+                (p, e.2, e.4, e.5)
+            })
+            .collect();
+        v.sort_by_key(|e| e.0);
+        Ok(Some(v))
+    }
 }
 
 // ---- 索引のブロック ----

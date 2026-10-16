@@ -15,6 +15,7 @@ pub const ENOSPC: i64 = 28;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const EOPNOTSUPP: i64 = 95;
 pub const EIO: i64 = 5;
 
 pub const S_IFMT: u32 = 0o170000;
@@ -106,10 +107,21 @@ pub trait Inode {
     fn lookup(&self, name: &str) -> Result<InodeRef, i64>;
     /// . と .. は含めない
     fn readdir(&self) -> Result<Vec<DirEntry>, i64>;
-    /// 名前の順に並ぶファイルシステム (tmpfs) だけ: 名前が after より後ろの項目を順に f へ (名前, ino, mode)。
-    /// f が false を返したら止める。ぜんぶをコピーしないので、大きなディレクトリでもヒープを使わない。
-    /// 読みながら消したり足したりしても、名前で続きを探すので飛ばさない。None なら使えない (readdir を使う)
-    fn readdir_after(&self, _after: Option<&str>, _f: &mut dyn FnMut(&str, u64, u32) -> bool) -> Option<Result<(), i64>> {
+    /// Linux と同じ位置で読めるディレクトリ (ext4 の dir_index): (読む位置, 項目)。. と .. もふくめ、位置の順。
+    /// 終わりの位置は i64::MAX。None ならこのディレクトリは readdir で (位置は何番めか)
+    fn readdir_cookies(&self) -> Option<Result<Vec<(u64, DirEntry)>, i64>> {
+        None
+    }
+    /// lseek の SEEK_DATA (hole が false) と SEEK_HOLE: off (ファイルの中) から先の、データか穴の始まり。
+    /// None なら穴を知らないもの (全部がデータで、終わりにだけ穴)
+    fn seek_data(&self, _off: u64, _hole: bool) -> Option<Result<u64, i64>> {
+        None
+    }
+    /// Linux 6.18 の tmpfs と同じ位置で読めるもの (tmpfs) だけ: 位置 pos (. と .. のあと、2 から) から読む項目を、
+    /// 読む順に f へ (その位置 (offset), 名前, ino, mode)。f が false を返したら止める。ぜんぶをコピーしないので、
+    /// 大きなディレクトリでもヒープを使わない。読みながら消したり足したりしても、名前の位置は変わらない。
+    /// 終わりの位置は tmpfs::DIR_OFFSET_EOD。None なら使えない (readdir を使う)
+    fn readdir_offsets(&self, _pos: u64, _f: &mut dyn FnMut(u64, &str, u64, u32) -> bool) -> Option<Result<(), i64>> {
         None
     }
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64>;
@@ -117,6 +129,17 @@ pub trait Inode {
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64>;
     /// newdir は同じファイルシステムのディレクトリ
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64>;
+    /// RENAME_EXCHANGE: old (このディレクトリの名前) と new (newdir の名前) が指すものを入れかえる (どちらもあること)。
+    /// できないファイルシステムは EINVAL (Linux と同じ)
+    fn exchange(&self, _old: &str, _newdir: &InodeRef, _new: &str) -> Result<(), i64> {
+        Err(-EINVAL)
+    }
+    /// O_TMPFILE: このディレクトリのファイルシステムに、名前のない (リンクが 0 の) ふつうのファイルを作る。
+    /// 閉じたら消える。linkable なら一度だけ link で名前をつけられる (Linux の I_LINKABLE。ほかのリンクが 0 の
+    /// ファイルは link できない: ENOENT)。できないファイルシステムは EOPNOTSUPP
+    fn tmpfile(&self, _mode: u32, _linkable: bool) -> Result<InodeRef, i64> {
+        Err(-EOPNOTSUPP)
+    }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64>;
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64>;
@@ -158,6 +181,29 @@ pub fn write_sealed(ino: &InodeRef, off: usize, len: usize) -> Result<(), i64> {
     }
     if s & F_SEAL_GROW != 0 && off + len > ino.meta().size as usize {
         return Err(-EPERM);
+    }
+    Ok(())
+}
+
+/// ふつうのファイルを書く・切りつめるときに setuid と setgid を落とす (Linux の file_remove_privs と do_truncate)。
+/// root (CAP_FSETID) はそのまま。setuid はいつも、setgid はグループが実行できるか、書く人がそのグループでないとき
+/// (グループの x のない setgid は、昔の強制ロックのしるし)
+pub fn drop_privs(ino: &InodeRef) -> Result<(), i64> {
+    use crate::cred::{S_ISGID, S_ISUID};
+    let m = ino.meta();
+    if m.mode & S_IFMT != S_IFREG || m.mode & (S_ISUID | S_ISGID) == 0 {
+        return Ok(());
+    }
+    let c = crate::cred::current();
+    if c.euid == 0 {
+        return Ok(());
+    }
+    let mut kill = m.mode & S_ISUID;
+    if m.mode & S_ISGID != 0 && (m.mode & 0o010 != 0 || !c.in_group(m.gid)) {
+        kill |= S_ISGID;
+    }
+    if kill != 0 {
+        ino.set_mode(m.mode & 0o7777 & !kill)?;
     }
     Ok(())
 }
@@ -383,6 +429,12 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     if path.is_empty() {
         return Err(-ENOENT);
     }
+    // 名前のあとの .. や、最後の / と /. のあるパスは、文字の上で畳むと Linux とちがう (c/../d は c がなくても
+    // d になり、a/ は a がファイルでも通る) ので、1 つずつたどる (覚えない)
+    if !simple(path) {
+        let start = (resolve("", cwd, true)?, cwd.to_string());
+        return found(lookup_resolve(start, path, follow, 0)?);
+    }
     let key = (current_mnt().id, normalize(cwd, path), follow);
     let cache = unsafe { &mut *(&raw mut PATHS) };
     // 変わったものを捨てる (ここで: inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
@@ -495,12 +547,25 @@ pub fn names_changed() {
 /// ディレクトリ dir の中の名前 (作る・消す・名前を変える) か、dir の属性 (chmod、chown) が変わった:
 /// dir を通ったパスの覚えを捨てる (次に引くときに)。ふつうのファイルの属性が変わったときに呼んでもよい
 pub fn dir_changed(dir: (usize, u64)) {
+    unsafe { DIR_GENS[gen_slot(dir)] += 1 };
     let p = unsafe { &mut *(&raw mut PATHS_PENDING) };
     if p.len() >= 64 {
         names_changed();
     } else if !p.contains(&dir) {
         p.push(dir);
     }
+}
+
+/// ディレクトリの中が変わった数。id で 256 の箱に分けて数える (同じ箱のほかのディレクトリで増えることもある)。
+/// 開いたディレクトリの一覧を読みなおすかどうか (file.rs の getdents)
+static mut DIR_GENS: [u64; 256] = [0; 256];
+
+fn gen_slot(dir: (usize, u64)) -> usize {
+    ((dir.1 ^ (dir.0 as u64).rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize
+}
+
+pub fn dir_gen(dir: (usize, u64)) -> u64 {
+    unsafe { (*(&raw const DIR_GENS))[gen_slot(dir)] }
 }
 
 /// いま覚えている数と、そのうちないもの (/proc/bkl)
@@ -512,11 +577,39 @@ pub fn paths_len() -> (usize, usize) {
 /// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。
 /// .. があるときは、パスの文字の上で畳むので、ふつうの lookup で
 pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    if !path.is_empty() && !simple(path) {
+        return found(lookup_resolve((dir.clone(), dir_path.trim_matches('/').to_string()), path, follow, 0)?);
+    }
     if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
         return lookup(dir_path, path, follow);
     }
     let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
     walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new() })
+}
+
+/// 文字の上で畳んでも Linux と同じ答えになるパス: 名前のあとの .. がなく (先頭の .. は基準のディレクトリを戻る
+/// だけ: 基準はたどったあとのパスなので、文字の上で戻ってよい)、最後が / や /. でない (name/ と name/. は、
+/// name がディレクトリでなければならず、リンクならたどる)。ほかは lookup_resolve で 1 つずつ
+fn simple(path: &str) -> bool {
+    let mut named = false;
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if named => return false,
+            ".." => {}
+            _ => named = true,
+        }
+    }
+    // "." だけも: そのディレクトリを通れること (Linux はどの名前の前にも may_lookup をする。. でも)
+    path != "." && !(path.len() > 1 && (path.ends_with('/') || path.ends_with("/.")))
+}
+
+/// lookup_resolve の答えを lookup の形に (最後の名前がなければ ENOENT)
+fn found(r: Resolved) -> Result<(String, InodeRef), i64> {
+    match r {
+        Resolved::Found(p, i) => Ok((p, i)),
+        Resolved::Missing(..) => Err(-ENOENT),
+    }
 }
 
 /// path (start があればそこからの相対、なければルートから) をたどる
@@ -541,6 +634,10 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                 t.gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
             }
             t.dirs.push(cur.id());
+            // 長すぎる名前は、引くところで (Linux のファイルシステムの lookup と同じ)
+            if c.len() > 255 {
+                return Err(-ENAMETOOLONG);
+            }
             let next = cross(cur.lookup(c)?);
             t.ok &= next.path_cacheable();
             let last = i + 1 == comps.len();
@@ -562,14 +659,27 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                     cur = ino;
                     continue;
                 }
-                let t = next.readlink()?;
+                let target = next.readlink()?;
+                if target.is_empty() {
+                    return Err(-ENOENT);
+                }
+                // .. のあるリンクや、/ で終わるリンク: 文字の上で畳まず、いまのディレクトリから 1 つずつ (覚えない)
+                let mut rest = target.clone();
+                for c in &comps[i + 1..] {
+                    rest.push('/');
+                    rest.push_str(c);
+                }
+                if !simple(&rest) {
+                    t.ok = false;
+                    return found(lookup_resolve((cur.clone(), walked.clone()), &rest, follow, 0)?);
+                }
                 // 相対で .. のないリンク (bin/true -> coreutils など) は、いまのディレクトリから続ける
-                // (ルートからたどりなおさない)。ほかはパスの文字の上で畳んでルートから
-                let mut np = if !t.starts_with('/') && !t.split('/').any(|c| c == "..") {
+                // (ルートからたどりなおさない)。絶対のリンクはルートから
+                let mut np = if !target.starts_with('/') {
                     start = Some((cur.clone(), walked.clone()));
-                    t.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/")
+                    target.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/")
                 } else {
-                    normalize(&walked, &t)
+                    normalize(&walked, &target)
                 };
                 for rest in &comps[i + 1..] {
                     np.push('/');
@@ -602,25 +712,84 @@ pub fn parent_of(cwd: &str, path: &str) -> Result<(InodeRef, String), i64> {
     parent_path(cwd, path).map(|(parent, name, _)| (parent, name))
 }
 
-/// 最後の要素の親ディレクトリと名前、それに作るもののパス (リンクをたどったあとの、先頭 / なし)
+/// 最後の要素の親ディレクトリと名前、それに作るもののパス (リンクをたどったあとの、先頭 / なし)。
+/// 最後が . や .. や / なら EEXIST (作るものの答え。消す・名前を変えるものは parent_last でそれぞれに)
 pub fn parent_path(cwd: &str, path: &str) -> Result<(InodeRef, String, String), i64> {
-    let full = normalize(cwd, path);
-    let (dir, name) = match full.rsplit_once('/') {
-        Some((d, n)) => (d.to_string(), n.to_string()),
-        None => (String::new(), full.clone()),
+    let p = parent_last(None, cwd, path)?;
+    if p.last != Last::Norm {
+        return Err(-EEXIST);
+    }
+    p.name_ok()?;
+    Ok((p.dir, p.name, p.full))
+}
+
+/// 最後の名前の種類 (Linux の LAST_NORM、LAST_DOT、LAST_DOTDOT、LAST_ROOT)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Last {
+    Norm,
+    Dot,
+    DotDot,
+    Root,
+}
+
+/// 作る・消す・名前を変えるところ (Linux の filename_parentat): 最後の名前の親と、その名前と種類、名前のあとに /
+/// があったか、作るもののパス (先頭 / なし)。最後の名前を引くのも、. と .. と / をどうするかもシステムコールごとに
+pub struct Parent {
+    pub dir: InodeRef,
+    pub name: String,
+    pub last: Last,
+    pub slash: bool,
+    pub full: String,
+}
+
+impl Parent {
+    /// 最後の名前を引けるか (Linux のファイルシステムの lookup と同じく、長すぎれば引くところで ENAMETOOLONG)
+    pub fn name_ok(&self) -> Result<(), i64> {
+        if self.name.len() > 255 { Err(-ENAMETOOLONG) } else { Ok(()) }
+    }
+}
+
+/// path の Parent。start (dirfd のディレクトリ (inode, パス)) か、なければ cwd から。親までは lookup と同じく
+/// (.. は 1 つずつ: その前の名前もあってディレクトリでなければならない)、親は通れる (x) こと (Linux の
+/// link_path_walk は、最後の名前の前にも may_lookup をする)
+pub fn parent_last(start: Option<(InodeRef, String)>, cwd: &str, path: &str) -> Result<Parent, i64> {
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // / そのもの
+        let (w, r, _) = proc_root()?;
+        return Ok(Parent { dir: r, name: String::new(), last: Last::Root, slash: false, full: w });
+    }
+    let slash = trimmed.len() < path.len();
+    let (dpart, name) = match trimmed.rsplit_once('/') {
+        Some(("", n)) => ("/", n),
+        Some((d, n)) => (d, n),
+        None => ("", trimmed),
     };
-    if name.is_empty() {
-        return Err(-EEXIST); // ルートそのもの
-    }
-    if name.len() > 255 {
-        return Err(-ENAMETOOLONG);
-    }
-    let (dir, parent) = if dir.is_empty() { (String::new(), cross(root())) } else { lookup("", &dir, true)? };
-    if !parent.meta().is_dir() {
+    let last = match name {
+        "." => Last::Dot,
+        ".." => Last::DotDot,
+        _ => Last::Norm,
+    };
+    let (dw, dir) = match (dpart.is_empty(), start) {
+        (true, Some((i, p))) => (p.trim_matches('/').to_string(), i),
+        (true, None) => (cwd.trim_matches('/').to_string(), resolve("", cwd, true)?),
+        (false, Some((i, p))) => lookup_at(&i, &p, dpart, true)?,
+        (false, None) => lookup(cwd, dpart, true)?,
+    };
+    let m = dir.meta();
+    if !m.is_dir() {
         return Err(-ENOTDIR);
     }
-    let full = if dir.is_empty() { name.clone() } else { alloc::format!("{}/{}", dir, name) };
-    Ok((parent, name, full))
+    crate::cred::current().check(&m, crate::cred::X)?;
+    // 消したディレクトリ (開いたまま rmdir されたもの) の中の名前は、引く前に ENOENT (Linux の IS_DEADDIR)
+    if last == Last::Norm && m.nlink == 0 {
+        return Err(-ENOENT);
+    }
+    let full = if dw.is_empty() { name.to_string() } else { alloc::format!("{}/{}", dw, name) };
+    Ok(Parent { dir, name: name.to_string(), last, slash, full })
 }
 
 // ---- openat2 の resolve (RESOLVE_*) ----
@@ -741,6 +910,9 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
             continue;
         }
         let last = todo.is_empty();
+        if c.len() > 255 {
+            return Err(-ENAMETOOLONG);
+        }
         let raw = match cur.lookup(&c) {
             Ok(r) => r,
             Err(e) if e == -ENOENT && last => return Ok(Resolved::Missing(cur, w, c)),

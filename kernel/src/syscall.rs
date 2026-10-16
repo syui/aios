@@ -252,6 +252,7 @@ nrs! {
     CLOSE_RANGE = 436,
     OPENAT2 = 437,
     FACCESSAT2 = 439,
+    FCHMODAT2 = 452,
 }
 
 /// システムコールがどの extra のものか (切れるものだけ。parts.rs)
@@ -295,7 +296,7 @@ fn file_span(nr: u64) -> Option<&'static str> {
         TRUNCATE | FTRUNCATE => "sysfile:truncate",
         FALLOCATE => "sysfile:fallocate",
         FSYNC | FDATASYNC | SYNC | SYNCFS => "sysfile:fsync",
-        FCHMODAT => "sysfile:fchmodat",
+        FCHMODAT | FCHMODAT2 => "sysfile:fchmodat",
         UTIMENSAT => "sysfile:utimensat",
         _ => return None,
     })
@@ -391,6 +392,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UMOUNT2 => sysfile::umount2(a[0] as usize, a[1]),
         FCHMOD => sysfile::fchmod(a[0], a[1]),
         FCHMODAT => sysfile::fchmodat(int(a[0]), a[1] as usize, a[2]),
+        FCHMODAT2 => sysfile::fchmodat2(int(a[0]), a[1] as usize, a[2], a[3]),
         FCHOWN => sysfile::fchown(a[0], a[1], a[2]),
         FCHOWNAT => sysfile::fchownat(int(a[0]), a[1] as usize, a[2], a[3], a[4]),
         UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
