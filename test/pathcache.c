@@ -1,15 +1,18 @@
 // パスの覚え (カーネルの dentry キャッシュ、vfs.rs の PATHS) が古い答えを出さないか: aios の中で動かす
 // (zig cc -target aarch64-linux-musl -O2 -static -o pathcache-test test/pathcache.c)。
 // 覚えさせて (同じパスを何度か stat)、名前を変える・消して作りなおす・リンクを付けかえる・権限を変える・
-// 開いたまま消す、マウントする (root のとき)、のあとで、新しい答えになるか
-// root でも root でなくても動かす (権限は root でないとき、マウントは root のとき)
+// 開いたまま消す、マウントする (root のとき)、のあとで、新しい答えになるか。だれでもは通れないディレクトリ
+// (0700 など) の下も覚えて、覚えたのがほかの人でも、通れない人には EACCES になるか (root のとき、uid 1000 と 1001 の子で)
+// root でも root でなくても動かす (権限は root でないとき、マウントとほかの人は root のとき。vm-ctests.sh は両方)
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fails;
@@ -17,6 +20,32 @@ static int fails;
 
 static int st(const char *p, struct stat *s) { struct stat x; for (int i = 0; i < 3; i++) if (stat(p, &x) != 0) return -errno; if (s) *s = x; return 0; }
 static void touch(const char *p) { int fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0644); write(fd, "x", 1); close(fd); }
+
+// uid と gid (ほかのグループは sup だけ。-1 ならなし) になった子で st (root のとき)
+static int st_as(uid_t uid, gid_t gid, int sup, const char *p) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    gid_t g = sup;
+    if (setgroups(sup < 0 ? 0 : 1, &g) != 0 || setgid(gid) != 0 || setuid(uid) != 0) _exit(255);
+    _exit(-st(p, 0));
+  }
+  int ws;
+  if (pid < 0 || waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws) || WEXITSTATUS(ws) == 255) return -9999;
+  return -WEXITSTATUS(ws);
+}
+
+// パスの覚えから答えた数 (aios の /proc/bkl。なければ -1)
+static long hits(void) {
+  FILE *f = fopen("/proc/bkl", "r");
+  char line[512];
+  long n = -1;
+  while (f && fgets(line, sizeof line, f)) {
+    char *s = strstr(line, "覚えから答えた ");
+    if (s) n = atol(s + strlen("覚えから答えた "));
+  }
+  if (f) fclose(f);
+  return n;
+}
 
 int main(void) {
   char base[64];
@@ -56,6 +85,16 @@ int main(void) {
     CHECK("perm-denied", st(cf, 0) == -EACCES);
     chmod(c, 0755);
     CHECK("perm-again", st(cf, 0) == 0);
+    // 持ち主だけが通れる (0700。ホームなど) 下も覚えて、x を外したら通れない
+    chmod(c, 0700);
+    long h0 = hits();
+    CHECK("owner-only", st(cf, 0) == 0);
+    if (h0 >= 0) CHECK("owner-only-cached", hits() - h0 >= 2);
+    chmod(c, 0600);
+    CHECK("owner-only-denied", st(cf, 0) == -EACCES);
+    chmod(c, 0700);
+    CHECK("owner-only-again", st(cf, 0) == 0);
+    chmod(c, 0755);
   }
   // 2 段上が変わる: base/d1/d2/f を覚えてから d1 の名前を変える、d1 の x を外す
   {
@@ -73,6 +112,29 @@ int main(void) {
       chmod(e1, 0755);
     }
     unlink(ef); snprintf(d2, sizeof d2, "%s/e1/d2", base); rmdir(d2); rmdir(e1);
+  }
+  // だれでもは通れないディレクトリ (root のとき): 覚えたのがだれでも、引く人が通れなければ EACCES
+  // (覚えはだれが引いても同じものを返すので、通れるかは引くたびに確かめる)
+  if (getuid() == 0) {
+    char p[128], pf[128];
+    snprintf(p, sizeof p, "%s/p", base); snprintf(pf, sizeof pf, "%s/p/f", base);
+    mkdir(p, 0700); touch(pf);
+    CHECK("gate-chown", chown(p, 1000, 1000) == 0);
+    CHECK("gate-root", st(pf, 0) == 0);
+    CHECK("gate-other", st_as(1001, 1001, -1, pf) == -EACCES);
+    CHECK("gate-owner", st_as(1000, 1000, -1, pf) == 0);
+    CHECK("gate-other-again", st_as(1001, 1001, -1, pf) == -EACCES);
+    // グループ: 0750 ならグループの人 (ほかのグループとしても) は通れる
+    chmod(p, 0750);
+    CHECK("gate-group", st_as(1001, 1000, -1, pf) == 0);
+    CHECK("gate-group-other", st_as(1001, 1001, -1, pf) == -EACCES);
+    CHECK("gate-group-sup", st_as(1001, 1001, 1000, pf) == 0);
+    // 0701: ほかの人は通れても、グループの人はグループのビットで通れない
+    chmod(p, 0701);
+    CHECK("gate-others", st_as(1001, 1001, -1, pf) == 0);
+    CHECK("gate-group-denied", st_as(1001, 1000, -1, pf) == -EACCES);
+    CHECK("gate-group-sup-denied", st_as(1001, 1001, 1000, pf) == -EACCES);
+    unlink(pf); rmdir(p);
   }
   // 開いたまま消したものは、消したあと名前では引けない
   int fd = open(f1, O_RDONLY);

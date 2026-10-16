@@ -29,7 +29,7 @@ pub const S_IFLNK: u32 = 0o120000;
 pub type InodeRef = Rc<dyn Inode>;
 
 /// stat に必要なもの
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Meta {
     pub ino: u64,
     pub mode: u32,
@@ -397,36 +397,55 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     }
     if let Some(e) = cache.get(&key) {
         PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // 覚えたのはほかの人かもしれない: だれでもは通れないディレクトリを、引く人が通れるか (たどるときと同じ順に)
+        if !e.gates.is_empty() {
+            let cred = crate::proc::current_cred_ref();
+            for g in &e.gates {
+                cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X)?;
+            }
+        }
         return Ok((e.walked.clone(), e.ino.clone()));
     }
-    let mut t = Trace { ok: true, dirs: Vec::new() };
+    let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new() };
     let r = walk(None, key.1.clone(), follow, &mut t)?;
     // たどっているあいだに変わったものがあれば覚えない (念のため)
     if t.ok && pending.is_empty() && !PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         if cache.len() >= PATHS_MAX {
             cache.clear();
         }
-        cache.insert(key, PathEntry { walked: r.0.clone(), ino: r.1.clone(), dirs: t.dirs });
+        cache.insert(key, PathEntry { walked: r.0.clone(), ino: r.1.clone(), dirs: t.dirs, gates: t.gates });
     }
     Ok(r)
 }
 
 /// パスの答えの覚え (dentry のキャッシュ): (マウントの namespace, 正規化したパス, 最後のリンクをたどるか) →
 /// (たどったパス, inode, 通ったディレクトリ)。stat や open のたびに 1 つずつ名前を引いて inode を作るのは高い
-/// (QEMU の TCG で、要素ごとに 20 us)。覚えるのは、たどったものがみな path_cacheable で、
-/// 魔法のリンクがなく、通ったディレクトリがみな u・g・o とも x のとき (だれが引いても、権限の確かめが同じに通る) だけ。
-/// ディレクトリの中の名前や、ディレクトリの属性が変わったら dir_changed で、そこを通ったものだけを捨てる
-/// (/run の rename が 5 秒ごとにあっても、ほかのものは残る)。マウントが変わったら names_changed で全部
+/// (QEMU の TCG で、要素ごとに 20 us)。覚えるのは、たどったものがみな path_cacheable で、魔法のリンクがないときだけ。
+/// 覚えはだれが引いても同じものを返すので、通ったディレクトリのうち u・g・o のどれかに x がないもの (/home/ai の
+/// 0700 など) は属性も覚えておき、覚えから答えるたびに、引く人がそこを通れるかを確かめなおす (通れなければ、
+/// たどったときと同じ EACCES)。ディレクトリの中の名前や、ディレクトリの属性 (chmod、chown) が変わったら
+/// dir_changed で、そこを通ったものだけを捨てる (/run の rename が 5 秒ごとにあっても、ほかのものは残る)。
+/// マウントが変わったら names_changed で全部
 struct PathEntry {
     walked: String,
     ino: InodeRef,
     dirs: Vec<(usize, u64)>,
+    /// 通ったディレクトリのうち、だれでもは通れないもの (通った順)
+    gates: Vec<Gate>,
 }
 
-/// walk が集めるもの: 覚えてよいか、通ったディレクトリ
+/// だれでもは通れないディレクトリの、通れるかを決める属性 (Meta まるごとでは大きいので)
+struct Gate {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+/// walk が集めるもの: 覚えてよいか、通ったディレクトリ、そのうちだれでもは通れないもの
 struct Trace {
     ok: bool,
     dirs: Vec<(usize, u64)>,
+    gates: Vec<Gate>,
 }
 
 static mut PATHS: alloc::collections::BTreeMap<(u64, String, bool), PathEntry> = alloc::collections::BTreeMap::new();
@@ -466,11 +485,11 @@ pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Re
         return lookup(dir_path, path, follow);
     }
     let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
-    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new() })
+    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new() })
 }
 
 /// path (start があればそこからの相対、なければルートから) をたどる
-/// t: 答えを覚えてよいか (だめなら ok を false に) と、通ったディレクトリ (lookup の PATHS)
+/// t: 答えを覚えてよいか (だめなら ok を false に) と、通ったディレクトリ (lookup の PATHS)、そのうちだれでもは通れないもの
 fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t: &mut Trace) -> Result<(String, InodeRef), i64> {
     // 覚え (PATHS) になかったもの。vfs:lookup との回数の差が、覚えから答えた数
     let _p = crate::prof::span("vfs:walk");
@@ -487,7 +506,9 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
             }
             // ディレクトリを通るには x が要る
             cred.check(&m, crate::cred::X)?;
-            t.ok &= m.mode & 0o111 == 0o111;
+            if m.mode & 0o111 != 0o111 {
+                t.gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
+            }
             t.dirs.push(cur.id());
             let next = cross(cur.lookup(c)?);
             t.ok &= next.path_cacheable();

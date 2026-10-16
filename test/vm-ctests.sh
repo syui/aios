@@ -30,7 +30,10 @@ run)
     landlock-eexist) cmd="aibox -- ./$t" ;;
     *) cmd="./$t" ;;
     esac
-    if timeout 300 $cmd > "$t.out" 2>&1; then
+    # pathcache は root でも (マウントと、ほかの人から引いたとき)
+    root=
+    [ "$t" = pathcache ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t"
+    if timeout 300 $cmd > "$t.out" 2>&1 && { [ -z "$root" ] || timeout 300 $root >> "$t.out" 2>&1; }; then
       echo "ok $t"
     else
       echo "FAIL $t (status $?):"
