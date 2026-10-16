@@ -66,6 +66,10 @@ t pipe-writers eq "$( (seq 1 30000 & seq 1 30000 & seq 1 30000 & seq 1 30000 & w
 # sudo (パスワードなしで使えるイメージの ai)
 t sudo sudo -n true
 
+# ロック (spinlock.rs、smp.rs): lockbench が大きなロックを 10 万回放して取りなおすあいだも、ほかの CPU のパイプ
+# (大きなロックなしで読み書きし、起こすのは持っている CPU に頼む) が止まらずに終わること
+t lockbench sh -c 'seq 1 300000 | cat | wc -l > /tmp/lockbench.n & echo lockbench > /proc/ai/ctl; wait; [ "$(tr -d " " < /tmp/lockbench.n)" = 300000 ] && grep -q "lockbench: SpinLock" /proc/kmsg'
+
 # カーネルのヒープ (tlsf.rs) の決まりが、ここまでのたしかめのあとも守られているか (heap check の答えは kmsg に)
 t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
 

@@ -96,22 +96,32 @@ static BKL: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static SERVING: AtomicUsize = AtomicUsize::new(0);
 
-pub fn lock() {
+/// 取る。取った時刻 (ns) を返す (trap.rs が、持っていた時間を数えるのに時計を読みなおさないため)。
+/// 時計を読むのは、すぐ取れたら 1 回だけ (QEMU の TCG では cntvct を読むのが 150〜240 ns と、ロックのほかのものより重い)
+pub fn lock() -> u64 {
     let me = id() + 1;
     debug_assert!(BKL.load(Ordering::Relaxed) != me, "BKL: cpu{} locks twice", me - 1);
-    let t0 = crate::timer::uptime_ns();
     let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
-    // 順番が来るまで wfe で休む (放す側が sev で起こす)。回りつづけると、QEMU (TCG) では待っている CPU が
-    // 本当の CPU を取りあって、ロックを持っている CPU まで遅くなる
-    while SERVING.load(Ordering::Acquire) != ticket {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    let t0 = if SERVING.load(Ordering::Acquire) == ticket {
+        None
+    } else {
+        let t0 = crate::timer::uptime_ns();
+        // 順番が来るまで wfe で休む (放す側が sev で起こす)。回りつづけると、QEMU (TCG) では待っている CPU が
+        // 本当の CPU を取りあって、ロックを持っている CPU まで遅くなる
+        while SERVING.load(Ordering::Acquire) != ticket {
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+        }
+        Some(t0)
+    };
     BKL.store(me, Ordering::Relaxed);
-    let t1 = crate::timer::uptime_ns();
+    let now = crate::timer::uptime_ns();
     let c = &STATS.cpu[me - 1];
-    c.wait.fetch_add(t1 - t0, Ordering::Relaxed);
-    c.locks.fetch_add(1, Ordering::Relaxed);
-    c.since.store(t1, Ordering::Relaxed);
+    if let Some(t0) = t0 {
+        add(&c.wait, now - t0);
+    }
+    add(&c.locks, 1);
+    c.since.store(now, Ordering::Relaxed);
+    now
 }
 
 /// 空いていれば取る (待たない)
@@ -123,16 +133,18 @@ fn try_lock() -> bool {
     }
     BKL.store(me, Ordering::Relaxed);
     let c = &STATS.cpu[me - 1];
-    c.locks.fetch_add(1, Ordering::Relaxed);
+    add(&c.locks, 1);
     c.since.store(crate::timer::uptime_ns(), Ordering::Relaxed);
     true
 }
 
-fn release() {
+/// now (いまの時刻) までを持っていた時間に足して放す
+fn release(now: u64) {
     let c = &STATS.cpu[id()];
-    c.hold.fetch_add(crate::timer::uptime_ns().saturating_sub(c.since.load(Ordering::Relaxed)), Ordering::Relaxed);
+    add(&c.hold, now.saturating_sub(c.since.load(Ordering::Relaxed)));
     BKL.store(0, Ordering::Relaxed);
-    SERVING.fetch_add(1, Ordering::Release);
+    // SERVING を書くのは持っているものだけなので、読んで書くだけでいい
+    SERVING.store(SERVING.load(Ordering::Relaxed) + 1, Ordering::Release);
     // wfe で待っている CPU を起こす
     unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
 }
@@ -140,11 +152,22 @@ fn release() {
 /// 放す。そのまえとあとに、大きなロックなしの道が頼んでいった「起こす」を片づける (defer_wake)。
 /// あとにも見るのは、放すまぎわに頼まれたもの (頼んだほうは取れなかったので、こちらに任せている) のため
 pub fn unlock() {
+    unlock_at(crate::timer::uptime_ns());
+}
+
+/// unlock と同じ。now は読んだばかりの時刻 (trap.rs: 時計をもう一度読まない)
+pub fn unlock_at(now: u64) {
+    let mut now = Some(now);
     loop {
-        drain_wakes();
-        release();
+        let woke = drain_wakes();
+        let t = match now.take() {
+            Some(t) if !woke => t,
+            _ => crate::timer::uptime_ns(),
+        };
+        release(t);
+        // defer_wake と組 (あちらは PENDING_N を書いてから、こちらは放してから SeqCst の fence。どちらかが相手のものを見る)
         core::sync::atomic::fence(Ordering::SeqCst);
-        if PENDING.lock().1 == 0 || !try_lock() {
+        if PENDING_N.load(Ordering::Relaxed) == 0 || !try_lock() {
             return;
         }
     }
@@ -156,6 +179,8 @@ pub fn unlock() {
 
 const NPENDING: usize = 64;
 static PENDING: crate::spinlock::SpinLock<([usize; NPENDING], usize)> = crate::spinlock::SpinLock::new(([0; NPENDING], 0));
+/// PENDING の数 (PENDING を持って書く)。放すたびに見るので、PENDING を取らずに読めるように
+static PENDING_N: AtomicUsize = AtomicUsize::new(0);
 
 /// key (パイプ) で待っているものを起こしてもらう。大きなロックを持たずに呼ぶ
 pub fn defer_wake(key: usize) {
@@ -167,6 +192,7 @@ pub fn defer_wake(key: usize) {
         } else if n < NPENDING {
             p.0[n] = key;
             p.1 = n + 1;
+            PENDING_N.store(n + 1, Ordering::Relaxed);
             true
         } else {
             false
@@ -185,22 +211,24 @@ pub fn defer_wake(key: usize) {
     }
 }
 
-/// 頼まれていたものを起こす (大きなロックを持って)
-fn drain_wakes() {
-    loop {
+/// 頼まれていたものを起こす (大きなロックを持って)。起こしたら true
+fn drain_wakes() -> bool {
+    let mut woke = false;
+    // 見おとしても、放したあとに unlock_at が見なおす
+    while PENDING_N.load(Ordering::Relaxed) != 0 {
         let (keys, n) = {
             let mut p = PENDING.lock();
-            let r = (p.0, p.1);
+            let n = p.1;
             p.1 = 0;
-            r
+            PENDING_N.store(0, Ordering::Relaxed);
+            (p.0, n)
         };
-        if n == 0 {
-            return;
-        }
         for &k in &keys[..n] {
             crate::file::wake_key(k);
         }
+        woke |= n > 0;
     }
+    woke
 }
 
 // ---- 大きなロックの統計 (/proc/bkl。ロックを細かくするとき、どこから分けるかを決めるため) ----
@@ -230,6 +258,12 @@ struct Stats {
 }
 
 const Z: AtomicU64 = AtomicU64::new(0);
+/// STATS の数に足す。書くのは大きなロックを持っているものだけ (stats_reset も) なので、読んで書くだけでいい
+/// (fetch_add の ldxr/stxr の輪より軽い)
+fn add(a: &AtomicU64, v: u64) {
+    a.store(a.load(Ordering::Relaxed) + v, Ordering::Relaxed);
+}
+
 static STATS: Stats = Stats {
     cpu: [const { CpuStat { wait: Z, hold: Z, locks: Z, since: Z } }; MAXCPU],
     sys: [const { (Z, Z) }; NSYS],
@@ -278,10 +312,10 @@ fn index_of(cause: &Cause) -> u64 {
 /// 眠るまでと起きてからの分を数えるため (sched が区切る)
 static SEG: [(AtomicU64, AtomicU64); MAXCPU] = [const { (AtomicU64::new(0), AtomicU64::new(u64::MAX)) }; MAXCPU];
 
-/// 例外の始まり (ロックを取ったあと)
-pub fn seg_begin(cause: &Cause) {
+/// 例外の始まり (ロックを取ったあと。t0 は取った時刻)
+pub fn seg_begin(cause: &Cause, t0: u64) {
     let s = &SEG[id()];
-    s.0.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+    s.0.store(t0, Ordering::Relaxed);
     s.1.store(index_of(cause), Ordering::Relaxed);
 }
 
@@ -290,7 +324,7 @@ pub fn seg_pause() -> u64 {
     let s = &SEG[id()];
     let idx = s.1.swap(u64::MAX, Ordering::Relaxed);
     if let Some(slot) = slot_of(idx) {
-        slot.1.fetch_add(crate::timer::uptime_ns().saturating_sub(s.0.load(Ordering::Relaxed)), Ordering::Relaxed);
+        add(&slot.1, crate::timer::uptime_ns().saturating_sub(s.0.load(Ordering::Relaxed)));
     }
     idx
 }
@@ -302,18 +336,19 @@ pub fn seg_resume(idx: u64) {
     s.1.store(idx, Ordering::Relaxed);
 }
 
-pub fn account(cause: Cause, ns: u64, slept: bool) {
+/// 例外 1 つぶんを数える (trap.rs)。ns はロックを取ってからの時間、now はいまの時刻
+pub fn account(cause: Cause, ns: u64, slept: bool, now: u64) {
     let Some(slot) = slot_of(index_of(&cause)) else { return };
-    slot.0.fetch_add(1, Ordering::Relaxed);
+    add(&slot.0, 1);
     if slept {
         // 眠るまでの分は seg_pause が足した。起きてからの分を
-        STATS.slept.fetch_add(1, Ordering::Relaxed);
+        add(&STATS.slept, 1);
         let s = &SEG[id()];
-        slot.1.fetch_add(crate::timer::uptime_ns().saturating_sub(s.0.load(Ordering::Relaxed)), Ordering::Relaxed);
+        add(&slot.1, now.saturating_sub(s.0.load(Ordering::Relaxed)));
         s.1.store(u64::MAX, Ordering::Relaxed);
         return;
     }
-    slot.1.fetch_add(ns, Ordering::Relaxed);
+    add(&slot.1, ns);
 }
 
 /// デバイスの終わりを回って待った回数と時間 (ns): 0 はディスク (virtio-blk)、1 は画面 (virtio-gpu)。
@@ -467,6 +502,22 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
     s
+}
+
+/// lockbench (spinlock::bench): 放して取りなおす 1 回の時間 (ns、10 万回の平均)。持って呼ぶ
+pub fn bench_bkl() -> f64 {
+    let n = 100_000u64;
+    let cnt = || {
+        let c: u64;
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c) };
+        c
+    };
+    let t0 = cnt();
+    for _ in 0..n {
+        unlock();
+        lock();
+    }
+    (cnt() - t0) as f64 * 1e9 / crate::timer::freq() as f64 / n as f64
 }
 
 /// この CPU がロックを持っているか

@@ -1,4 +1,6 @@
-// 割り込みを止めて取るスピンロック
+// 割り込みを止めて取るスピンロック。aios のカーネルはふつう割り込みを止めたまま走る (開けるのは、スケジューラが
+// 割り込みを待つときだけ: proc.rs) ので、止めるのも戻すのも、開いていたときだけ。DAIF に書くと QEMU の TCG では
+// そこで訳した命令のかたまりが終わるので重く (msr daif で 70〜130 ns)、取って放す 160〜270 ns の 8 割がこれだった
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -64,15 +66,54 @@ impl<T> Drop for Guard<'_, T> {
     }
 }
 
+/// DAIF の I (IRQ を止めている印)
+const DAIF_I: u64 = 1 << 7;
+
+/// IRQ を止める (もう止まっていれば何もしない)。前の DAIF を返す
 fn intr_save() -> u64 {
     let daif: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif);
-        core::arch::asm!("msr daifset, #2");
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
+    if daif & DAIF_I == 0 {
+        unsafe { core::arch::asm!("msr daifset, #2") };
     }
     daif
 }
 
+/// intr_save の前に戻す: 開いていたときだけ開ける (ロックの中で DAIF は変えないこと)
 fn intr_restore(daif: u64) {
-    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif) };
+    if daif & DAIF_I == 0 {
+        unsafe { core::arch::asm!("msr daifclr, #2") };
+    }
+}
+
+/// lockbench (/proc/ai/ctl): ロックの部品ごとの 1 回の時間を kmsg に (どれも 10 万回の平均)。
+/// 大きなロックを持って呼ぶ (それを放して取りなおすものも測る)
+pub fn bench() {
+    use core::hint::black_box;
+    let n = 100_000u64;
+    let cnt = || {
+        let c: u64;
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c) };
+        c
+    };
+    let ns = |t: u64| t as f64 * 1e9 / crate::timer::freq() as f64 / n as f64;
+    let l = SpinLock::new(0u64);
+    let t0 = cnt();
+    for _ in 0..n {
+        let g = l.lock();
+        black_box(&*g);
+    }
+    let lock = ns(cnt() - t0);
+    let t0 = cnt();
+    for i in 0..n {
+        black_box(alloc::boxed::Box::new(i));
+    }
+    let heap = ns(cnt() - t0);
+    let t0 = cnt();
+    for _ in 0..n {
+        black_box(crate::timer::uptime_ns());
+    }
+    let clock = ns(cnt() - t0);
+    let bkl = crate::smp::bench_bkl();
+    crate::println!("lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns", lock, heap, bkl, clock);
 }

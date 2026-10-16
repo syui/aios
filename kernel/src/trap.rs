@@ -178,19 +178,21 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         }
         claimed = Some(raw);
     }
-    crate::smp::lock();
-    // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に
+    let t0 = crate::smp::lock();
+    // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に。
+    // 時計を読むのは、取ったときと終わりの 2 回だけ (取った時刻と放す時刻にも使う)
     let cause = match kind {
         EL0_SYNC if esr_far().0 >> 26 == EC_SVC64 => crate::smp::Cause::Sys(tf.x[8]),
         EL0_SYNC => crate::smp::Cause::Fault,
         _ => crate::smp::Cause::Irq,
     };
-    crate::smp::seg_begin(&cause);
-    let (t0, sw) = (crate::timer::uptime_ns(), crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed));
+    crate::smp::seg_begin(&cause, t0);
+    let sw = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed);
     handle(tf, kind, claimed);
     let slept = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed) != sw;
-    crate::smp::account(cause, crate::timer::uptime_ns() - t0, slept);
-    crate::smp::unlock();
+    let t1 = crate::timer::uptime_ns();
+    crate::smp::account(cause, t1 - t0, slept, t1);
+    crate::smp::unlock_at(t1);
 }
 
 /// EL0 の MRS で ID レジスタ (op0 = 3, op1 = 0, CRn = 0) を読んだものに、Linux と同じく答える

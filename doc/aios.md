@@ -162,12 +162,14 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 
 ### 速さを測る (bench と /proc/ai/prof)
 
-`bench` のあるもの (いまは vfs と extfs) は、その速さを測るものがある。test/fsbench.c は、ファイルのよくある操作 (create、stat、
+`bench` のあるもの (いまは vfs、extfs と spinlock、heap、smp) は、その速さを測るものがある。test/fsbench.c は、ファイルのよくある操作 (create、stat、
 ないものの stat、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync) をそれぞれくりかえして、
 1 回あたりの µs (大きなファイルは MB/s) を出す (Linux でも動く)。aish の `bench` (aish-vm) が VM (`-snapshot`) で n 回動かして op ごとの
 まんなかをとり、`prof on` にした 1 回で /proc/ai/prof の part ごとの割合 (どこがボトルネックか) と、時間の多い区間を出す。
 `against` で 2 つのカーネル (たとえば HEAD と作業中のもの) を op ごとにくらべる。結果は build/aish-vm/bench/ にも残る (速くするループ:
 測る → いちばん遅いところを見つける → 直す → くらべる)。区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。
+spinlock、heap、smp は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから
+取って返す、大きなロックを放して取りなおす、時計を読む (uptime_ns) の 1 回の ns (10 万回の平均) を kmsg に出す。
 
 ## カーネルの中を見る (/proc/ai)
 
@@ -182,7 +184,7 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 | `/proc/ai/bkl` | 大きなロックの統計 (`/proc/bkl` と同じもの): CPU ごとの待ち・持ち、長く持ったシステムコール、デバイスとスケジューラを待った時間、ページフォルトの種類 |
 | `/proc/ai/kernel` | カーネルの地図 (kernel/kernel.json そのもの。だれでも読める) |
 | `/proc/ai/prof` | カーネルの中の区間 (`part:what`。part は kernel.json の名前) ごとの回数と時間 (ctl に `prof on` から `prof off` まで): まず part ごとの `self_us` (中の区間をのぞいた、そこだけの時間) と割合 (`pct`。いちばん多いものがボトルネック)、つぎに区間ごとの `count` `total_us` `self_us` `avg_us`。いまはファイルまわり (sysfile、vfs、extfs、vm、block、jbd2) |
-| `/proc/ai/ctl` | 書くスイッチ (root:wheel の 0664): `kick PID` (futex で眠っているスレッドをみな起こす。起こしが消えたのか、だれも起こしていないのかを見分ける)、`raw TID` (レジスタとスタックを kmsg に)、`pcmiss on\|off`、`strace NAME`、`bkl reset`、`prof on\|off` |
+| `/proc/ai/ctl` | 書くスイッチ (root:wheel の 0664): `kick PID` (futex で眠っているスレッドをみな起こす。起こしが消えたのか、だれも起こしていないのかを見分ける)、`raw TID` (レジスタとスタックを kmsg に)、`pcmiss on\|off`、`strace NAME`、`bkl reset`、`heap trace on\|off`、`heap check` (ヒープの決まりを確かめて kmsg に)、`prof on\|off`、`lockbench` (ロックなどの 1 回の時間を kmsg に) |
 
 Claude は aish-sys の `threads` (絞りこみと fd の中身つき)、`hang` (なぜ止まっているかの見立て: 長く眠っているスレッドと待っているもの、
 残っているデータ、kick して眠りなおすか。pid がなければ、みなを起こさずに見てあやしいものだけ)、`stack` (呼び出しの並び) で使う。`stack` は `.eh_frame` (DWARF の CFI) でたどり、
