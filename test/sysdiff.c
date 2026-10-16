@@ -629,9 +629,10 @@ static void sayfl(int f) {
         {O_CLOEXEC, "O_CLOEXEC"}, {O_CREAT, "O_CREAT"}, {O_EXCL, "O_EXCL"}, {O_TRUNC, "O_TRUNC"}, {O_NOCTTY, "O_NOCTTY"},
         {O_TMPFILE & ~O_DIRECTORY, "__O_TMPFILE"},
     };
+    // 読み書きの口は下の 2 ビット (musl の O_ACCMODE は O_PATH もふくむので使わない)
     f &= ~K_LARGEFILE;
-    say(" %s", accn[f & O_ACCMODE]);
-    f &= ~O_ACCMODE;
+    say(" %s", accn[f & 3]);
+    f &= ~3;
     for (size_t i = 0; i < sizeof fl / sizeof *fl; i++)
         if ((f & fl[i].v) == fl[i].v) {
             say("|%s", fl[i].n);
