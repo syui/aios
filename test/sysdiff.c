@@ -18,7 +18,7 @@
 // [chosen NAME] をつける (どちらでも同じ条件で)。aish の sysdiff は、それをまちがいのちがいと分けて数える
 //
 // 出力はアーキテクチャによらない: フラグは名前で、stat は種類、許可、リンクの数、大きさ (ファイルとリンク
-// だけ)、自分のものか。ino や時刻は出さない
+// だけ)、自分のものか。ino や時刻は出さない (utimensat が入れる決まった時刻だけ、t で出す)
 //   sys SYSNAME RELEASE MACHINE      (はじめに 1 度。くらべない)
 //   case CASE
 //   I NAME(ARGS) = 答え [くわしく]
@@ -61,6 +61,45 @@
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE 2
 #endif
+#ifndef SYS_statx
+#if defined(__x86_64__)
+#define SYS_statx 332
+#else
+#define SYS_statx 291
+#endif
+#endif
+#ifndef SYS_copy_file_range
+#if defined(__x86_64__)
+#define SYS_copy_file_range 326
+#else
+#define SYS_copy_file_range 285
+#endif
+#endif
+#define FL_KEEP_SIZE 0x01
+#define FL_PUNCH_HOLE 0x02
+#define FL_ZERO_RANGE 0x10
+#define K_AT_STATX_FORCE_SYNC 0x2000
+#define K_AT_STATX_DONT_SYNC 0x4000
+#define K_STATX_BASIC_STATS 0x7ffU
+#define K_STATX__RESERVED 0x80000000U
+// struct statx (libc によってはないので、カーネルの形を自分で)
+struct kstatx {
+    uint32_t mask, blksize;
+    uint64_t attributes;
+    uint32_t nlink, uid, gid;
+    uint16_t mode, pad1;
+    uint64_t ino, size, blocks, attributes_mask;
+    struct {
+        int64_t sec;
+        uint32_t nsec;
+        int32_t pad;
+    } atime, btime, ctime, mtime;
+    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+    uint64_t spare[14];
+};
+// utimensat が入れる時刻 (stat はこれだけ t で出す。ほかの時刻はくらべない)
+#define T1 1000000000LL
+#define T2 1500000000LL
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
 #endif
@@ -189,7 +228,11 @@ static const struct {
     const char *name, *why;
 } chosen[] = {
     {"pwrite-append", "O_APPEND で開いた fd でも pwrite64 は off に書く (POSIX)。Linux は off を見ずに終わりに書く (pwrite(2) の BUGS)"},
+    {"seek-unwritten", "SEEK_DATA / SEEK_HOLE は、fallocate でとってまだ書いていないところ (未初期化の extent) をいつも穴とする。Linux の ext4 は、そこがページキャッシュにあれば (読んだあと) データとする"},
 };
+
+// seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
+static int fallocated;
 
 // aios の中で動いているか (uname の sysname)。でなければ chosen のふるまいをまねる
 static int on_aios;
@@ -215,15 +258,36 @@ static void sayst(const struct stat *st) {
     if (S_ISREG(m) || S_ISLNK(m))
         say(" s%lld", (long long)st->st_size);
     say(st->st_uid == geteuid() && st->st_gid == getegid() ? " me" : " other");
+    if (st->st_mtime == T1 || st->st_mtime == T2)
+        say(" t%lld", (long long)st->st_mtime);
+}
+
+// statx の答え: sayst と同じ形に、基本の印 (STATX_BASIC_STATS がみなあるか)
+static void saystx(const struct kstatx *x) {
+    struct stat st;
+    memset(&st, 0, sizeof st);
+    st.st_mode = x->mode;
+    st.st_nlink = x->nlink;
+    st.st_size = (off_t)x->size;
+    st.st_uid = x->uid;
+    st.st_gid = x->gid;
+    st.st_mtime = (time_t)x->mtime.sec;
+    sayst(&st);
+    if ((x->mask & K_STATX_BASIC_STATS) == K_STATX_BASIC_STATS)
+        say(" basic");
+    else
+        say(" mask%x", x->mask & K_STATX_BASIC_STATS);
 }
 
 // ---- 選ぶもの (どれも、値ではなく何番めかを選んで、名前で出す) ----
 
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
-    RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC, NKIND
+    RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, NKIND
 };
-static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 2, 1};
+static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 2, 1,
+                                       3, 2, 4, 1, 3, 3, 2, 3};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -260,6 +324,46 @@ static const unsigned rnw[] = {60, 23, 15, 2};
 enum { C_GETFL, C_SETFL, C_GETFD, C_SETFD, C_DUPFD, C_DUPFD_CLOEXEC };
 static const char *cmdn[] = {"F_GETFL", "F_SETFL", "F_GETFD", "F_SETFD", "F_DUPFD", "F_DUPFD_CLOEXEC"};
 static const int dupmin[] = {0, 3, 5, 10, 100};
+// fchownat / fchown: uid と gid を -1、自分、root (0) から
+static const char *idn[] = {"-1", "me", "0"};
+
+static long idval(int k, int gid) {
+    return k == 0 ? -1 : k == 1 ? (long)(gid ? getegid() : geteuid()) : 0;
+}
+// utimensat の時刻 (atime, mtime)。ns が UTIME_NOW / UTIME_OMIT でなければ秒。BADNS は ns がまちがったもの
+#define BADNS 1000000000L
+static const long long utv[][4] = {
+    {-1, 0, 0, 0},                          // NULL (いま)
+    {0, UTIME_NOW, 0, UTIME_NOW},           // {NOW, NOW}
+    {0, UTIME_OMIT, 0, UTIME_OMIT},         // {OMIT, OMIT} (Linux はパスも見ずに 0)
+    {0, UTIME_OMIT, T1, 0},                 // {OMIT, T1}
+    {T2, 0, 0, UTIME_NOW},                  // {T2, NOW}
+    {T1, 0, T2, 0},                         // {T1, T2}
+    {0, UTIME_NOW, 0, UTIME_OMIT},          // {NOW, OMIT}
+    {T1, BADNS, T1, 0},                     // ns がまちがい (EINVAL)
+};
+static const char *utn[] = {"NULL", "{NOW, NOW}", "{OMIT, OMIT}", "{OMIT, 1000000000}", "{1500000000, NOW}", "{1000000000, 1500000000}", "{NOW, OMIT}", "{1000000000.1000000000, 1000000000}"};
+static const unsigned utw[] = {18, 14, 10, 14, 14, 14, 10, 6};
+static const int umv[] = {022, 077, 0, 027, 0777};
+// fallocate の mode
+static const int fmv[] = {0, FL_KEEP_SIZE, FL_PUNCH_HOLE | FL_KEEP_SIZE, FL_PUNCH_HOLE, FL_ZERO_RANGE, FL_ZERO_RANGE | FL_KEEP_SIZE, 0x40000000};
+static const char *fmn[] = {"0", "KEEP_SIZE", "PUNCH_HOLE|KEEP_SIZE", "PUNCH_HOLE", "ZERO_RANGE", "ZERO_RANGE|KEEP_SIZE", "0x40000000"};
+static const unsigned fmw[] = {25, 15, 25, 5, 15, 10, 5};
+static const long long foffs[] = {0, 1, 4096, 5000, -1};
+static const long long flens[] = {0, 1, 100, 4096, 10000, 1 << 20};
+// copy_file_range と sendfile の位置と長さ
+static const long long coffs[] = {0, 3, 4096, 100000, -1};
+static const long long clens[] = {0, 1, 7, 100, 5000, 1 << 20};
+// statx の flags と mask
+static const int sxf[] = {0, AT_SYMLINK_NOFOLLOW, K_AT_STATX_FORCE_SYNC, K_AT_STATX_DONT_SYNC, K_AT_STATX_FORCE_SYNC | K_AT_STATX_DONT_SYNC, 0x8000};
+static const char *sxfn[] = {"0", "AT_SYMLINK_NOFOLLOW", "AT_STATX_FORCE_SYNC", "AT_STATX_DONT_SYNC", "AT_STATX_FORCE_SYNC|AT_STATX_DONT_SYNC", "0x8000"};
+static const unsigned sxfw[] = {50, 20, 10, 10, 5, 5};
+static const unsigned sxm[] = {K_STATX_BASIC_STATS, 3, 0, K_STATX__RESERVED};
+static const char *sxmn[] = {"STATX_BASIC_STATS", "STATX_TYPE|STATX_MODE", "0", "STATX__RESERVED"};
+static const unsigned sxmw[] = {60, 20, 15, 5};
+// getdents64 のバッファ (小さいものは何度も読んで、続きから読めるか)
+static const long long dbufs[] = {8192, 64, 32, 24};
+static const unsigned dbufw[] = {70, 12, 12, 6};
 
 static unsigned pickw(const unsigned *w, int n) {
     unsigned t = 0;
@@ -405,6 +509,7 @@ static void gen(uint64_t seed, int n) {
     rs = seed;
     nref = 0;
     nknown = 0;
+    fallocated = 0;
     know("a", 'f');
     know("b", 'd');
     know("b/c", 'f');
@@ -418,7 +523,8 @@ static void gen(uint64_t seed, int n) {
         o->fb = chance(80);
         // fd がまだないうちに fd の op を選んだら、開ける op に
         if (nref == 0 && o->kind != OPENAT2 && o->kind != TRUNCATE && o->kind != STAT && o->kind != MKDIR && o->kind != UNLINK && o->kind != RMDIR &&
-            o->kind != RENAME && o->kind != LINK && o->kind != SYMLINK && o->kind != READLINK && o->kind != CHMOD && o->kind != ACCESS)
+            o->kind != RENAME && o->kind != LINK && o->kind != SYMLINK && o->kind != READLINK && o->kind != CHMOD && o->kind != ACCESS &&
+            o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX)
             o->kind = chance(80) ? OPEN : PIPE;
         o->d1 = o->d2 = REF_CWD;
         o->fd = REF_BAD;
@@ -449,8 +555,11 @@ static void gen(uint64_t seed, int n) {
         }
         case CLOSE:
         case FSTAT:
+            o->fd = genfd(&pipe);
+            break;
         case GETDENTS:
             o->fd = genfd(&pipe);
+            o->len = dbufs[pickw(dbufw, 4)];
             break;
         case FSYNC:
             o->fd = genfd(&pipe);
@@ -508,11 +617,17 @@ static void gen(uint64_t seed, int n) {
             break;
         case RENAME:
         case LINK:
-            o->d1 = gendir();
-            genpath(o->p1, 0);
+            // linkat の AT_EMPTY_PATH: fd そのもの (O_TMPFILE のファイルに名前をつける)
+            if (o->kind == LINK && chance(15)) {
+                o->d1 = genfd(&pipe);
+                o->x = 2;
+            } else {
+                o->d1 = gendir();
+                genpath(o->p1, 0);
+                o->x = o->kind == RENAME ? (int)pickw(rnw, 4) : chance(20);
+            }
             o->d2 = gendir();
             genpath(o->p2, 0);
-            o->x = o->kind == RENAME ? (int)pickw(rnw, 4) : chance(20);
             know(o->p2, o->kind == RENAME ? kindof(o->p1) : 'f');
             break;
         case SYMLINK:
@@ -575,6 +690,65 @@ static void gen(uint64_t seed, int n) {
             addref(2 * i, 1, 1);
             addref(2 * i + 1, 1, 1);
             break;
+        case CHOWN:
+            // AT_EMPTY_PATH なら fd そのもの
+            if (chance(8)) {
+                o->d1 = genfd(&pipe);
+                o->y = 2;
+            } else {
+                o->d1 = gendir();
+                genpath(o->p1, 0);
+                o->y = chance(20);
+            }
+            o->x = (int)pick(3) | (int)pick(3) << 2;
+            break;
+        case FCHOWN:
+            o->fd = genfd(&pipe);
+            o->x = (int)pick(3) | (int)pick(3) << 2;
+            break;
+        case UTIMENS:
+            // y: 0 パス、1 パスで AT_SYMLINK_NOFOLLOW、2 fd と "" で AT_EMPTY_PATH、3 fd と NULL (futimens)
+            if (chance(12)) {
+                o->d1 = genfd(&pipe);
+                o->y = chance(50) ? 3 : 2;
+            } else {
+                o->d1 = gendir();
+                genpath(o->p1, 0);
+                o->y = chance(20);
+            }
+            o->x = (int)pickw(utw, 8);
+            break;
+        case UMASK:
+            o->x = (int)pick(5);
+            break;
+        case FALLOC:
+            o->fd = genfd(&pipe);
+            o->x = (int)pickw(fmw, 7);
+            o->off = foffs[pick(5)];
+            o->len = flens[pick(6)];
+            break;
+        case COPYRANGE:
+        case SENDFILE:
+            // fd が読むほう、d2 が書くほう。x: 1 読む位置をわたす、2 書く位置をわたす (sendfile は 1 だけ)
+            o->fd = genfd(&pipe);
+            o->d2 = genfd(&pipe);
+            o->x = (int)pick(o->kind == SENDFILE ? 2 : 4);
+            o->off = coffs[pick(5)];
+            o->y = (int)pick(5);
+            o->len = clens[pick(6)];
+            o->mode = o->kind == COPYRANGE && chance(5);
+            break;
+        case STATX:
+            if (chance(8)) {
+                o->d1 = genfd(&pipe);
+                o->y = -1;
+            } else {
+                o->d1 = gendir();
+                genpath(o->p1, 0);
+                o->y = (int)pickw(sxfw, 6);
+            }
+            o->x = (int)pickw(sxmw, 4);
+            break;
         }
     }
 }
@@ -599,17 +773,22 @@ static int fdof(int ref) {
     return res[ref / 2][ref % 2];
 }
 
-static int fdarg(const struct op *o) {
-    int fd = fdof(o->fd);
-    if (fd < 0 && o->fd >= 0 && o->fb) {
+// ref の fd。fb なら、それを作った op がしくじっていたとき、いま開いているいちばん新しい fd (avoid でないもの)
+static int fdref(int ref, int fb, int avoid) {
+    int fd = fdof(ref);
+    if (fd < 0 && ref >= 0 && fb) {
         int best = 0;
         for (int f = 0; f < 1024; f++)
-            if (alive[f] > best) {
+            if (alive[f] > best && f != avoid) {
                 best = alive[f];
                 fd = f;
             }
     }
     return fd;
+}
+
+static int fdarg(const struct op *o) {
+    return fdref(o->fd, o->fb, -1);
 }
 
 static void saydir(int ref) {
@@ -676,13 +855,13 @@ static int cmpstr(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-// getdents64 を終わりまで。名前は並べなおす (並びはファイルシステムしだい)
-static void saydents(int fd) {
+// getdents64 を終わりまで (バッファは size バイト)。名前は並べなおす (並びはファイルシステムしだい)
+static void saydents(int fd, long long size) {
     static char buf[8192];
     char *v[256];
     int n = 0;
     long r;
-    while ((r = syscall(SYS_getdents64, fd, buf, sizeof buf)) > 0) {
+    while ((r = syscall(SYS_getdents64, fd, buf, (size_t)size)) > 0) {
         for (long o = 0; o < r;) {
             unsigned short reclen;
             memcpy(&reclen, buf + o + 16, sizeof reclen);
@@ -810,10 +989,18 @@ static void exec(int i, const struct op *o) {
         if (r > 0)
             say(" h%08x", fnv(rbuf, r));
         break;
-    case LSEEK:
+    case LSEEK: {
         say("lseek(%d, %lld, %s)", fd, o->off, whn[o->x]);
+        // chosen seek-unwritten: fallocate でとってまだ書いていないところは、いつも穴。Linux の ext4 は、そこが
+        // ページキャッシュにあれば (読んだあと) データとするので、Linux ではキャッシュから追い出してから見る
+        int sk = fallocated && (whv[o->x] == SEEK_DATA || whv[o->x] == SEEK_HOLE);
+        if (sk && !on_aios)
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         ret(syscall(SYS_lseek, fd, (off_t)o->off, whv[o->x]));
+        if (sk)
+            say(" [chosen seek-unwritten]");
         break;
+    }
     case FTRUNCATE:
         say("ftruncate(%d, %lld)", fd, o->len);
         ret(syscall(SYS_ftruncate, fd, (off_t)o->len));
@@ -876,8 +1063,10 @@ static void exec(int i, const struct op *o) {
             say(", %s)", rnn[o->x]);
             r = syscall(SYS_renameat2, fdof(o->d1), o->p1, fdof(o->d2), o->p2, rnv[o->x]);
         } else {
-            say(", %s)", o->x ? "AT_SYMLINK_FOLLOW" : "0");
-            r = syscall(SYS_linkat, fdof(o->d1), o->p1, fdof(o->d2), o->p2, o->x ? AT_SYMLINK_FOLLOW : 0);
+            static const int lfv[] = {0, AT_SYMLINK_FOLLOW, AT_EMPTY_PATH};
+            static const char *lfn[] = {"0", "AT_SYMLINK_FOLLOW", "AT_EMPTY_PATH"};
+            say(", %s)", lfn[o->x]);
+            r = syscall(SYS_linkat, fdof(o->d1), o->p1, fdof(o->d2), o->p2, lfv[o->x]);
         }
         ret(r);
         break;
@@ -939,8 +1128,11 @@ static void exec(int i, const struct op *o) {
         ret(r);
         break;
     case GETDENTS:
-        say("getdents64(%d)", fd);
-        saydents(fd);
+        if (o->len == 8192)
+            say("getdents64(%d)", fd);
+        else
+            say("getdents64(%d, %lld)", fd, o->len);
+        saydents(fd, o->len);
         break;
     case DUP:
         say("dup(%d)", fd);
@@ -1026,6 +1218,96 @@ static void exec(int i, const struct op *o) {
             born(i, p[1]);
             say(" [%d,%d]", p[0], p[1]);
         }
+        break;
+    }
+    case CHOWN: {
+        static const int cfv[] = {0, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH};
+        static const char *cfn[] = {"0", "AT_SYMLINK_NOFOLLOW", "AT_EMPTY_PATH"};
+        say("fchownat(");
+        saydir(o->d1);
+        say(", ");
+        sayq(o->p1);
+        say(", %s, %s, %s)", idn[o->x & 3], idn[o->x >> 2], cfn[o->y]);
+        ret(syscall(SYS_fchownat, fdof(o->d1), o->p1, idval(o->x & 3, 0), idval(o->x >> 2, 1), cfv[o->y]));
+        break;
+    }
+    case FCHOWN:
+        say("fchown(%d, %s, %s)", fd, idn[o->x & 3], idn[o->x >> 2]);
+        ret(syscall(SYS_fchown, fd, idval(o->x & 3, 0), idval(o->x >> 2, 1)));
+        break;
+    case UTIMENS: {
+        static const int ufv[] = {0, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, 0};
+        static const char *ufn[] = {"0", "AT_SYMLINK_NOFOLLOW", "AT_EMPTY_PATH", "0"};
+        struct timespec ts[2] = {{(time_t)utv[o->x][0], (long)utv[o->x][1]}, {(time_t)utv[o->x][2], (long)utv[o->x][3]}};
+        say("utimensat(");
+        saydir(o->d1);
+        say(", ");
+        if (o->y == 3)
+            say("NULL");
+        else
+            sayq(o->p1);
+        say(", %s, %s)", utn[o->x], ufn[o->y]);
+        ret(syscall(SYS_utimensat, fdof(o->d1), o->y == 3 ? NULL : o->p1, utv[o->x][0] < 0 ? NULL : ts, ufv[o->y]));
+        break;
+    }
+    case UMASK:
+        say("umask(%04o) = %04o", umv[o->x], (unsigned)syscall(SYS_umask, umv[o->x]));
+        break;
+    case FALLOC:
+        say("fallocate(%d, %s, %lld, %lld)", fd, fmn[o->x], o->off, o->len);
+        r = syscall(SYS_fallocate, fd, fmv[o->x], (off_t)o->off, (off_t)o->len);
+        ret(r);
+        // 穴をあけるほかは、未初期化のブロックをとる
+        if (r == 0 && !(fmv[o->x] & FL_PUNCH_HOLE))
+            fallocated = 1;
+        break;
+    case COPYRANGE:
+    case SENDFILE: {
+        long long in = o->off, out = coffs[o->y];
+        // 書くほうも、作った op がしくじっていたら開いているもの (読むほうとはちがう fd)
+        int to = fdref(o->d2, o->fb, fd);
+        if (o->kind == COPYRANGE) {
+            say("copy_file_range(%d, ", fd);
+            if (o->x & 1)
+                say("%lld", in);
+            else
+                say("NULL");
+            say(", %d, ", to);
+            if (o->x & 2)
+                say("%lld", out);
+            else
+                say("NULL");
+            say(", %lld, %u)", o->len, o->mode);
+            r = syscall(SYS_copy_file_range, fd, (o->x & 1) ? &in : NULL, to, (o->x & 2) ? &out : NULL, (size_t)o->len, o->mode);
+        } else {
+            say("sendfile(%d, %d, ", to, fd);
+            if (o->x & 1)
+                say("%lld", in);
+            else
+                say("NULL");
+            say(", %lld)", o->len);
+            r = syscall(SYS_sendfile, to, fd, (o->x & 1) ? &in : NULL, (size_t)o->len);
+        }
+        ret(r);
+        if (r >= 0 && (o->x & 1))
+            say(" in %lld", in);
+        if (r >= 0 && (o->x & 2))
+            say(" out %lld", out);
+        break;
+    }
+    case STATX: {
+        struct kstatx x;
+        memset(&x, 0, sizeof x);
+        int fl = o->y < 0 ? AT_EMPTY_PATH : sxf[o->y];
+        say("statx(");
+        saydir(o->d1);
+        say(", ");
+        sayq(o->p1);
+        say(", %s, %s)", o->y < 0 ? "AT_EMPTY_PATH" : sxfn[o->y], sxmn[o->x]);
+        r = syscall(SYS_statx, fdof(o->d1), o->p1, fl, sxm[o->x], &x);
+        ret(r);
+        if (r == 0)
+            saystx(&x);
         break;
     }
     case FSYNC:
