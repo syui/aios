@@ -7,7 +7,9 @@
 #      ai/repo に送る (aish-pkg build / test / push)。CI はこの 3 つをディスクに入れるだけで ai/repo には送らないので、
 #      これをしないと、入っている aios の ap -Syu に来ない。ドキュメントだけの変更では送らない
 #   bin/publish.sh [-n]   -n: 何をするかを出すだけ (CI も待たず、いまの様子を)
-# CI がしくじったら、2 はしない (ディスクの起動を確かめていないものは配らない)
+# CI がしくじったら、2 はしない (ディスクの起動を確かめていないものは配らない)。
+# 3 つの PKGBUILD は作業場所から作るので、そのソースにコミットしていない変更があれば (作る前も、作ったあとも)
+# 送らずに止まる (待っているあいだに編集しても、それが HEAD の版として配られないように)
 set -e
 cd "$(dirname "$0")/.."
 dry=
@@ -81,8 +83,18 @@ done
 host=$(rustc -vV | sed -n 's/^host: //p')
 pkg=shell/target/$host/release/aish-pkg
 [ -x "$pkg" ] || (cd shell && cargo build -q --release --target "$host" -p aish-pkg)
+# そのパッケージのソースが HEAD のままか (コミットしていない変更、追いかけていないファイルがないか)
+clean() {
+  # shellcheck disable=SC2046
+  dirty=$(git status --porcelain -- $(paths "$1"))
+  [ -z "$dirty" ] && return
+  echo "publish: $1 would not be $(git rev-parse --short HEAD): uncommitted changes in its sources ($(echo "$dirty" | awk '{print $2}' | head -5 | tr '\n' ' ')); commit or stash them and run bin/publish.sh again" >&2
+  exit 1
+}
 for p in $todo; do
+  clean "$p"
   "$pkg" build "$p" >/dev/null || { echo "publish: aish-pkg build $p failed (build/aish-pkg/build-$p.log)" >&2; exit 1; }
+  clean "$p"
   "$pkg" test "$p" | sed -n '2,5p'
 done
 "$pkg" push
