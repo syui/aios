@@ -172,6 +172,21 @@ spinlock、heap、smp は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/sr
 取って返す、大きなロックを放して取りなおす、時計を読む (uptime_ns) の 1 回の ns (10 万回の平均) を kmsg に出す。aish の `bench` は
 これも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
 
+### Linux と答えあわせ (sysdiff)
+
+test/sysdiff.c は、種 (seed) から決まるシステムコールの並び (open、openat2、read、write、pread、lseek、truncate、stat、mkdir、
+unlink、rename (RENAME_NOREPLACE / EXCHANGE)、link、symlink、readlink、chmod、access、getdents、dup、fcntl、pipe、fsync) を、
+はじめの木 (a、b/、b/c、d -> b) の上で動かし、答えを 1 行ずつ出す。並びは種だけで決まる (動かした答えによらない) ので、同じ
+種なら Linux でも aios でも同じシステムコールが同じ順に動き、2 つの出力の最初にちがう行がふるまいのちがいになる。答えは
+アーキテクチャによらない形 (フラグは名前、stat は種類と許可とリンクの数と大きさ、ino や時刻は出さない) で、x86_64 の Linux と
+aarch64 の aios でもくらべられる。手本は syzkaller (並びの作りかた。fd は前の op が開けたものを使う)、gVisor の syscall テスト
+(本物の Linux で動かしたものを答えにする)、Csmith と C-Reduce (答えくらべと、ちがいを小さくする)。
+
+aish の `sysdiff` (aish-vm) が、このマシンの Linux (root なら nobody で。aios の中は ai なので、許可のしらべが同じになるように)
+と VM (`-snapshot`) の aios で動かし、ちがいを (op、Linux の答え、aios の答え) でまとめ、多いものから、op を減らしても同じ
+ちがいが同じ op で出るいちばん小さな並び (`SEED:I,J,...`) に縮める。ほかの Linux (たとえば aios(main)) の答えでくらべるなら、
+そこで `cc -O2 -o sysdiff test/sysdiff.c && ./sysdiff -n 30 DIR 1-300 > linux.txt` とし、`linux` にそのファイルをわたす。
+
 ## カーネルの中を見る (/proc/ai)
 
 止まった・遅いプログラムを調べるための、カーネルの中の様子。AI が読むので、どれも 1 行 1 つの JSON。

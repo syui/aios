@@ -11,6 +11,8 @@
 //   bench   ファイルまわりの速さ (test/fsbench.c) を VM で n 回測り、op ごとのまんなかと、/proc/ai/prof の part
 //           (kernel.json の名前) ごとの時間の割合、lockbench (ロックなどの 1 回の時間) のまんなか。against で 2 つの
 //           カーネルをくらべる。結果は build/aish-vm/bench/ にも
+//   sysdiff Linux と答えあわせ (test/sysdiff.c): 種から決まるシステムコールの並びを、このマシンの Linux と VM の
+//           aios で動かしてくらべ、ちがいをまとめて小さくする (sysdiff.rs)
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
 //   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
@@ -18,6 +20,8 @@
 // ab と bisect は、動いている VM を止めてから、-snapshot (ディスクに書き残さない) で起こしなおす。2 つの VM が同じ
 // disk.img を使うと壊れるので、同時には動かさない
 // リポジトリは dir か、いまのディレクトリから上にたどって test/vm.py があるところ、なければ $AIOS_SRC
+mod sysdiff;
+
 use aish_plugin::{Spec, Tool, Value, error, json, s};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +33,7 @@ const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","des
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
 const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の extra や quirk のうち off のあるもの。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BENCH: &str = r#"{"type":"object","properties":{"kernel":{"type":"string","description":"測るカーネル (パス / . / git のコミット。既定 .)"},"against":{"type":"string","description":"くらべるカーネル (あれば。たとえば HEAD)。op ごとに、kernel の時間が against の何倍か"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 3。まんなかを使う)"},"scale":{"type":"integer","description":"fsbench の量 (既定 1)"},"off":{"type":"array","items":{"type":"string"},"description":"切って測る extra や quirk (起動の引数 aios.off=)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const SYSDIFF: &str = r#"{"type":"object","properties":{"seeds":{"type":"integer","description":"いくつの種 (既定 300)"},"from":{"type":"integer","description":"はじめの種 (既定 1)"},"ops":{"type":"integer","description":"種ごとの op の数 (既定 30、200 まで)"},"kernel":{"type":"string","description":"aios のカーネル (パス / . / git のコミット。既定 .)"},"fs":{"type":"string","description":"動かすところ: home (ホームの ext4。既定) か tmp (tmpfs)。Linux も同じ種類のところで"},"linux":{"type":"string","description":"Linux の答えのファイル (ほかの Linux、たとえば aios(main) で cc -O2 -o sysdiff test/sysdiff.c して sysdiff -n OPS DIR FROM-TO > FILE としたもの)。なければこのマシンの Linux で動かす (縮めるのはいつもこのマシンの Linux で)"},"shrink":{"type":"integer","description":"縮めるちがいの数 (多いものから。既定 12、0 で縮めない)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
 
 fn main() {
@@ -42,6 +47,7 @@ fn main() {
             "bisect" => job_bisect(&root, &a),
             "box" => job_box(&root, &a),
             "bench" => job_bench(&root, &a),
+            "sysdiff" => sysdiff::job(&root, &a),
             _ => Err(format!("{}: unknown", cmd)),
         };
         match r {
@@ -63,6 +69,7 @@ fn main() {
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
             Tool { name: "bench", desc: "ファイルまわりの速さを測る (test/fsbench.c: create、stat、ないものの stat (2 度目も)、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync)。VM (-snapshot) で n 回動かして op ごとの µs (大きなファイルは MB/s) のまんなかと、prof をつけた 1 回で part (kernel.json の名前: sysfile、vfs、extfs、vm、block、jbd2) ごとの時間の割合 (どこがボトルネックか) と、時間の多い区間。lock は lockbench (/proc/ai/ctl: スピンロック、ヒープ、大きなロック、時計の 1 回の ns) の 5 回のまんなか。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
+            Tool { name: "sysdiff", desc: "Linux と答えあわせ (test/sysdiff.c): 種から決まるシステムコールの並び (open、read、write、stat、mkdir、rename、link、symlink、chmod、access、getdents、dup、fcntl、pipe など。fd は前の op が開けたもの) を、このマシンの Linux (root なら nobody で) と VM (-snapshot) の aios で動かし、case ごとに最初にちがう行をくらべる。ちがいは (op、Linux の答え、aios の答え) でまとめ、多いものから、op を減らしても同じちがいが同じ op で出るいちばん小さな並び (SEED:I,J,...) に縮める。答えはアーキテクチャによらない形 (フラグは名前、stat は種類と許可と数)。結果は build/aish-vm/sysdiff/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: SYSDIFF },
             Tool { name: "box", desc: "カーネルの砂場: kernel.json の extra や quirk (off のあるもの) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
@@ -78,6 +85,7 @@ fn main() {
                 "bisect" => job(&mut jobs, &root, "bisect", a),
                 "box" => job(&mut jobs, &root, "box", a),
                 "bench" => job(&mut jobs, &root, "bench", a),
+                "sysdiff" => job(&mut jobs, &root, "sysdiff", a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
