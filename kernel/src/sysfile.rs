@@ -389,8 +389,8 @@ pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
 pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
     let f = positional(fd, off, true)?;
     let ino = inode_path(&f);
-    // O_APPEND で開いたものには、いつも終わりに書く (Linux は off を見ない: pwrite(2) の BUGS。POSIX とはちがう)
-    let append = f.borrow().flags & file::O_APPEND != 0;
+    // aios がえらんだちがい (pwrite-append): O_APPEND で開いたものにも off に書く (POSIX)。Linux は O_APPEND なら
+    // off を見ずに終わりに書く (pwrite(2) の BUGS が POSIX とちがうと書いている)。doc/aios.md の「aios がえらんだちがい」
     if let Some((i, _)) = &ino
         && len > 0
     {
@@ -402,7 +402,7 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = match &ino {
             Some((i, _)) => {
-                let pos = if append { i.meta().size as usize } else { off as usize + done };
+                let pos = off as usize + done;
                 vfs::write_sealed(i, pos, tmp.len()).and_then(|_| i.write_at(pos, &tmp))
             }
             None => file::pwrite_dev(&f, off as usize + done, &tmp),
