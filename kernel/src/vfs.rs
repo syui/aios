@@ -445,7 +445,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     // d になり、a/ は a がファイルでも通る) ので、1 つずつたどる (覚えない)
     if !simple(path) {
         let start = (resolve("", cwd, true)?, cwd.to_string());
-        return found(lookup_resolve(start, path, follow, 0)?);
+        return found(lookup_resolve(start, path, follow, 0, false)?);
     }
     let key = (current_mnt().id, normalize(cwd, path), follow);
     let cache = unsafe { &mut *(&raw mut PATHS) };
@@ -590,7 +590,7 @@ pub fn paths_len() -> (usize, usize) {
 /// .. があるときは、パスの文字の上で畳むので、ふつうの lookup で
 pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
     if !path.is_empty() && !simple(path) {
-        return found(lookup_resolve((dir.clone(), dir_path.trim_matches('/').to_string()), path, follow, 0)?);
+        return found(lookup_resolve((dir.clone(), dir_path.trim_matches('/').to_string()), path, follow, 0, false)?);
     }
     if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
         return lookup(dir_path, path, follow);
@@ -683,7 +683,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                 }
                 if !simple(&rest) {
                     t.ok = false;
-                    return found(lookup_resolve((cur.clone(), walked.clone()), &rest, follow, 0)?);
+                    return found(lookup_resolve((cur.clone(), walked.clone()), &rest, follow, 0, false)?);
                 }
                 // 相対で .. のないリンク (bin/true -> coreutils など) は、いまのディレクトリから続ける
                 // (ルートからたどりなおさない)。絶対のリンクはルートから
@@ -731,6 +731,7 @@ pub fn parent_path(cwd: &str, path: &str) -> Result<(InodeRef, String, String), 
     if p.last != Last::Norm {
         return Err(-EEXIST);
     }
+    p.alive()?;
     p.name_ok()?;
     Ok((p.dir, p.name, p.full))
 }
@@ -752,9 +753,17 @@ pub struct Parent {
     pub last: Last,
     pub slash: bool,
     pub full: String,
+    /// 親が消したディレクトリ (開いたまま rmdir されたもの) で、名前を引けば ENOENT (Linux の IS_DEADDIR)。
+    /// 名前を引くところで alive を見る (rename は . .. / の EBUSY と EXDEV をそれより先に見る)
+    pub dead: bool,
 }
 
 impl Parent {
+    /// 親が消したディレクトリなら ENOENT (Linux の __lookup_slow: ファイルシステムの lookup より先)
+    pub fn alive(&self) -> Result<(), i64> {
+        if self.dead { Err(-ENOENT) } else { Ok(()) }
+    }
+
     /// 最後の名前を引けるか (Linux のファイルシステムの lookup と同じく、長すぎれば引くところで ENAMETOOLONG)
     pub fn name_ok(&self) -> Result<(), i64> {
         if self.name.len() > 255 { Err(-ENAMETOOLONG) } else { Ok(()) }
@@ -772,7 +781,7 @@ pub fn parent_last(start: Option<(InodeRef, String)>, cwd: &str, path: &str) -> 
     if trimmed.is_empty() {
         // / そのもの
         let (w, r, _) = proc_root()?;
-        return Ok(Parent { dir: r, name: String::new(), last: Last::Root, slash: false, full: w });
+        return Ok(Parent { dir: r, name: String::new(), last: Last::Root, slash: false, full: w, dead: false });
     }
     let slash = trimmed.len() < path.len();
     let (dpart, name) = match trimmed.rsplit_once('/') {
@@ -796,12 +805,10 @@ pub fn parent_last(start: Option<(InodeRef, String)>, cwd: &str, path: &str) -> 
         return Err(-ENOTDIR);
     }
     crate::cred::current().check(&m, crate::cred::X)?;
-    // 消したディレクトリ (開いたまま rmdir されたもの) の中の名前は、引く前に ENOENT (Linux の IS_DEADDIR)
-    if last == Last::Norm && m.nlink == 0 {
-        return Err(-ENOENT);
-    }
+    // 消したディレクトリ (開いたまま rmdir されたもの) の中の名前は、引くところで ENOENT (Linux の IS_DEADDIR。alive)
+    let dead = last == Last::Norm && m.nlink == 0;
     let full = if dw.is_empty() { name.to_string() } else { alloc::format!("{}/{}", dw, name) };
-    Ok(Parent { dir, name: name.to_string(), last, slash, full })
+    Ok(Parent { dir, name: name.to_string(), last, slash, full, dead })
 }
 
 // ---- openat2 の resolve (RESOLVE_*) ----
@@ -860,7 +867,7 @@ fn chain(path: &str) -> Result<Vec<Step>, i64> {
 ///   NO_SYMLINKS: リンクは ELOOP (魔法のリンクも)。NO_MAGICLINKS: 魔法のリンク (/proc/self/fd/N) は ELOOP
 ///   NO_XDEV: マウントをまたぐもの (入るのも、.. で出るのも、ほかのマウントへのリンクも) は EXDEV
 /// 最後の名前だけがなければ Missing (O_CREAT が作るところ)。答えは覚えない (lookup の PATHS は使わない)
-pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resolve: u64) -> Result<Resolved, i64> {
+pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resolve: u64, creat: bool) -> Result<Resolved, i64> {
     let _p = crate::prof::span("vfs:resolve");
     let beneath = resolve & RESOLVE_BENEATH != 0;
     let in_root = resolve & RESOLVE_IN_ROOT != 0;
@@ -922,6 +929,11 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
             continue;
         }
         let last = todo.is_empty();
+        // O_CREAT で、たどったリンクの中身の終わりが / なら、最後の名前を引く前に EISDIR (あってもなくても。Linux の
+        // open_last_lookups)
+        if last && must_dir && creat {
+            return Err(-EISDIR);
+        }
         if c.len() > 255 {
             return Err(-ENAMETOOLONG);
         }

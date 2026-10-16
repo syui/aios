@@ -11,11 +11,14 @@
 //     DIR   case ごとの場所をここに作り、終わったら消す (書けるところ。ext4 なら ext4 とくらべる)
 //
 //   sysdiff -l   aios がえらんだちがい (chosen) の一覧: chosen NAME わけ
+//                と、手本の Linux のまちがい (linux_bugs) の一覧: linuxbug NAME わけ
 //
 // aios がえらんだちがい: Linux に合わせるのは最初の手本で、Linux よりよい道をえらんだところは chosen に名前と
 // わけを書く (doc/aios.md の「aios がえらんだちがい」)。Linux で動かすときは、そこだけ aios のふるまいをまねて
 // 答えにする (手本は、Linux の答えに aios がえらんだものを足したもの)。それを通った op の行の終わりには
-// [chosen NAME] をつける (どちらでも同じ条件で)。aish の sysdiff は、それをまちがいのちがいと分けて数える
+// [chosen NAME] をつける (どちらでも同じ条件で)。aish の sysdiff は、それをまちがいのちがいと分けて数える。
+// 手本の Linux のまちがい (linux_bugs) も同じしくみ: Linux の側でただして答えにし、[linuxbug NAME] をつける
+// (Linux が直ったら消す。doc/aios.md の「手本の Linux のまちがい」)
 //
 // 出力はアーキテクチャによらない: フラグは名前で、stat は種類、許可、リンクの数、大きさ (ファイルとリンク
 // だけ)、自分のものか。ino や時刻は出さない (utimensat が入れる決まった時刻だけ、t で出す)
@@ -235,6 +238,14 @@ static const struct {
     {"copy-append", "O_APPEND で開いたファイルへも copy_file_range と sendfile で写せる (位置をわたせばそこへ、なければ終わりに足す)。Linux は EBADF と EINVAL"},
     {"zero-range-tmpfs", "tmpfs でも fallocate の ZERO_RANGE ができる (ext4 と同じ)。Linux の tmpfs は EOPNOTSUPP"},
     {"sendfile-self", "同じファイルの中の sendfile は copy_file_range と同じ: 読みはじめたときの終わりまでを写し、重なれば EINVAL。Linux は重なっても写し、同じ回に書いたものが読みにまざる"},
+    {"splice-snapshot", "ファイルからパイプへの splice / sendfile は、そのときの中身をパイプに写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない。Linux はページキャッシュのページそのものを入れるので、読む前に変わればそれが読める"},
+};
+
+// 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)
+static const struct {
+    const char *name, *why;
+} linux_bugs[] = {
+    {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
 };
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
@@ -290,10 +301,10 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, NKIND
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, NKIND
 };
-static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 2, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3};
+static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -360,6 +371,12 @@ static const long long flens[] = {0, 1, 100, 4096, 10000, 1 << 20};
 // copy_file_range と sendfile の位置と長さ
 static const long long coffs[] = {0, 3, 4096, 100000, -1};
 static const long long clens[] = {0, 1, 7, 100, 5000, 1 << 20};
+// splice の長さと flags (SPLICE_F_ALL のほかのビットは EINVAL)
+static const long long splens[] = {0, 1, 7, 100, 4096, 5000, 65536, 1 << 20};
+static const unsigned splw[] = {3, 10, 10, 15, 12, 15, 15, 20};
+static const unsigned spfv[] = {0, SPLICE_F_NONBLOCK, SPLICE_F_MOVE | SPLICE_F_MORE, 0x10};
+static const char *spfn[] = {"0", "SPLICE_F_NONBLOCK", "SPLICE_F_MOVE|SPLICE_F_MORE", "0x10"};
+static const unsigned spfw[] = {40, 30, 25, 5};
 // statx の flags と mask
 static const int sxf[] = {0, AT_SYMLINK_NOFOLLOW, K_AT_STATX_FORCE_SYNC, K_AT_STATX_DONT_SYNC, K_AT_STATX_FORCE_SYNC | K_AT_STATX_DONT_SYNC, 0x8000};
 static const char *sxfn[] = {"0", "AT_SYMLINK_NOFOLLOW", "AT_STATX_FORCE_SYNC", "AT_STATX_DONT_SYNC", "AT_STATX_FORCE_SYNC|AT_STATX_DONT_SYNC", "0x8000"};
@@ -395,19 +412,23 @@ struct op {
 static struct op ops[MAXOPS];
 static int res[MAXOPS][2];
 
-// 作った fd の引数のもと (op の番号 * 2 + 端)、パイプか (F_SETFL でも O_NONBLOCK を消さない: 読み書きで止まらない
-// ように)、開けられそうか (あるはずのパスを、ふつうのフラグで。そういうものを多く使う)
-static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS];
+// 作った fd の引数のもと (op の番号 * 2 + 端)、パイプか (1 読む口、2 書く口。F_SETFL でも O_NONBLOCK を消さない:
+// 読み書きで止まらないように)、開けられそうか (あるはずのパスを、ふつうのフラグで。そういうものを多く使う)、
+// 何で開いたか (1 読む、2 書く。O_PATH は 0)
+static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS], refacc[2 * MAXOPS];
+// genfd2 が選んだものの refacc (dup はそれを引きつぐ)
+static int lastacc;
 
-static void addref(int r, int pipe, int likely) {
+static void addref(int r, int pipe, int likely, int acc) {
     refs[nref] = r;
     refpipe[nref] = pipe;
     reflikely[nref] = likely;
+    refacc[nref] = acc;
     nref++;
 }
 
 static int genfd2(int *pipe, int *likely) {
-    *pipe = *likely = 0;
+    *pipe = *likely = lastacc = 0;
     if (nref == 0 || chance(4))
         return chance(50) ? REF_BAD : REF_BIG;
     int cand[2 * MAXOPS], n = 0;
@@ -423,12 +444,40 @@ static int genfd2(int *pipe, int *likely) {
     int i = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
     *pipe = refpipe[i];
     *likely = reflikely[i];
+    lastacc = refacc[i];
     return refs[i];
 }
 
 static int genfd(int *pipe) {
     int likely;
     return genfd2(pipe, &likely);
+}
+
+// パイプの end の口 (1 読む、2 書く) の fd。なければ (と 1 割は) ほかの fd。avoid (ほかの口の ref) と同じ pipe2 の
+// ものでないほうがあれば、たいていそちら (同じパイプどうしの splice / tee は EINVAL)
+static int genpipe2(int end, int avoid) {
+    int cand[2 * MAXOPS], n = 0, pipe;
+    for (int i = 0; i < nref; i++)
+        if (refpipe[i] == end && (avoid < 0 || refs[i] / 2 != avoid / 2 || chance(15)))
+            cand[n++] = i;
+    if (n == 0 || chance(10))
+        return genfd(&pipe);
+    return refs[cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)]];
+}
+
+static int genpipe(int end) {
+    return genpipe2(end, -1);
+}
+
+// パイプでない、開けられそうなものを want (1 読む、2 書く) で開いた fd。なければ (と 1 割は) ほかの fd
+static int genfile(int want) {
+    int cand[2 * MAXOPS], n = 0, pipe;
+    for (int i = 0; i < nref; i++)
+        if (!refpipe[i] && reflikely[i] && (refacc[i] & want))
+            cand[n++] = i;
+    if (n == 0 || chance(10))
+        return genfd(&pipe);
+    return refs[cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)]];
 }
 
 static int gendir(void) {
@@ -532,6 +581,14 @@ static void gen(uint64_t seed, int n) {
             o->kind != RENAME && o->kind != LINK && o->kind != SYMLINK && o->kind != READLINK && o->kind != CHMOD && o->kind != ACCESS &&
             o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX)
             o->kind = chance(80) ? OPEN : PIPE;
+        // splice と tee はパイプがないとたいてい EINVAL なので、まだなければたいていパイプを作る
+        if ((o->kind == SPLICE || o->kind == TEE) && chance(70)) {
+            int any = 0;
+            for (int k = 0; k < nref; k++)
+                any |= refpipe[k];
+            if (!any)
+                o->kind = PIPE;
+        }
         o->d1 = o->d2 = REF_CWD;
         o->fd = REF_BAD;
         switch (o->kind) {
@@ -556,7 +613,9 @@ static void gen(uint64_t seed, int n) {
             if ((o->of & B_CREAT) && !k)
                 know(o->p1, 'f');
             int odd = (1 << 1) | (1 << 4) | (1 << 8) | B_TMPFILE;
-            addref(2 * i, 0, o->d1 == REF_CWD && o->acc != 3 && !(o->of & odd) && (k || ((o->of & B_CREAT) && o->p1[0] && o->p1[0] != 'x')));
+            static const int accbits[] = {1, 2, 3, 0};
+            addref(2 * i, 0, o->d1 == REF_CWD && o->acc != 3 && !(o->of & odd) && (k || ((o->of & B_CREAT) && o->p1[0] && o->p1[0] != 'x')),
+                   (o->of & (1u << 8)) ? 0 : accbits[o->acc]);
             break;
         }
         case CLOSE:
@@ -666,7 +725,7 @@ static void gen(uint64_t seed, int n) {
         case DUP: {
             int likely;
             o->fd = genfd2(&pipe, &likely);
-            addref(2 * i, pipe, likely);
+            addref(2 * i, pipe, likely, lastacc);
             break;
         }
         case DUP3: {
@@ -674,27 +733,29 @@ static void gen(uint64_t seed, int n) {
             o->fd = genfd2(&pipe, &likely);
             o->x = 3 + (int)pick(10);
             o->y = chance(60) ? 0 : chance(88) ? 1 : 2;
-            addref(2 * i, pipe, likely && o->y != 2);
+            addref(2 * i, pipe, likely && o->y != 2, lastacc);
             break;
         }
         case FCNTL: {
             int likely;
             o->fd = genfd2(&pipe, &likely);
             o->x = (int)pick(6);
+            // O_NONBLOCK はいつも残す: fd の番号は使いまわされるので、ファイルだと思った fd がパイプのこともあり、
+            // 待つパイプ (read、splice、tee) は終わらない
             if (o->x == C_SETFL)
-                o->y = (chance(40) ? 1 : 0) | (pipe || chance(40) ? 2 : 0) | (chance(5) ? 4 : 0);
+                o->y = (chance(40) ? 1 : 0) | 2 | (chance(5) ? 4 : 0);
             else if (o->x == C_SETFD)
                 o->y = chance(60);
             else if (o->x == C_DUPFD || o->x == C_DUPFD_CLOEXEC) {
                 o->y = dupmin[pick(5)];
-                addref(2 * i, pipe, likely);
+                addref(2 * i, pipe, likely, lastacc);
             }
             break;
         }
         case PIPE:
             o->x = chance(30);
-            addref(2 * i, 1, 1);
-            addref(2 * i + 1, 1, 1);
+            addref(2 * i, 1, 1, 1);
+            addref(2 * i + 1, 2, 1, 2);
             break;
         case CHOWN:
             // AT_EMPTY_PATH なら fd そのもの
@@ -744,6 +805,40 @@ static void gen(uint64_t seed, int n) {
             o->len = clens[pick(6)];
             o->mode = o->kind == COPYRANGE && chance(5);
             break;
+        case SPLICE: {
+            // fd が読むほう、d2 が書くほう: パイプ → ファイル、ファイル → パイプ、パイプ → パイプ、なんでも。
+            // x: 1 読む位置をわたす、2 書く位置をわたす (ふつうはパイプでない側だけ。パイプの側は ESPIPE)
+            int k = (int)pick(10);
+            if (k < 4) {
+                o->fd = genpipe(1);
+                o->d2 = genfile(2);
+                o->x = (chance(50) ? 2 : 0) | (chance(8) ? 1 : 0);
+            } else if (k < 7) {
+                o->fd = genfile(1);
+                o->d2 = genpipe(2);
+                o->x = (chance(50) ? 1 : 0) | (chance(8) ? 2 : 0);
+            } else if (k < 9) {
+                o->fd = genpipe(1);
+                o->d2 = genpipe2(2, o->fd);
+                o->x = chance(8) ? (int)pick(4) : 0;
+            } else {
+                o->fd = genfd(&pipe);
+                o->d2 = genfd(&pipe);
+                o->x = (int)pick(4);
+            }
+            o->off = coffs[pick(5)];
+            o->y = (int)pick(5);
+            o->len = splens[pickw(splw, 8)];
+            o->mode = pickw(spfw, 4);
+            break;
+        }
+        case TEE:
+            // fd (読む口) から d2 (書く口) へ、読み減らさずに。たいていパイプどうし
+            o->fd = chance(85) ? genpipe(1) : genfd(&pipe);
+            o->d2 = chance(85) ? genpipe2(2, o->fd) : genfd(&pipe);
+            o->len = splens[pickw(splw, 8)];
+            o->mode = pickw(spfw, 4);
+            break;
         case STATX:
             if (chance(8)) {
                 o->d1 = genfd(&pipe);
@@ -767,6 +862,66 @@ static int alive[1024];
 static void born(int i, long fd) {
     if (fd >= 0 && fd < 1024)
         alive[fd] = i + 1;
+}
+
+// chosen splice-snapshot: Linux の splice / sendfile は、ファイルからパイプへページキャッシュのページそのものを入れる
+// ので、読む前にファイルが変わればパイプの中身も変わる。aios はそのときの中身を写す。Linux では、そのときの中身の写し
+// (名前のないファイル。case の場所 (w の上) に作るので world には出ない) から入れてまねる。写しは穴をとばして作る
+// (SEEK_DATA / SEEK_HOLE。fd の位置はもどす)。写しの fd か、作れなければ -1
+static int snapshot(int fd) {
+    static unsigned char sbuf[65536];
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return -1;
+    int s = open("../..", O_TMPFILE | O_RDWR, 0600);
+    if (s < 0) {
+        char p[64];
+        snprintf(p, sizeof p, "../../.snap%d", (int)getpid());
+        s = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (s < 0)
+            return -1;
+        unlink(p);
+    }
+    long long save = syscall(SYS_lseek, fd, 0, SEEK_CUR), size = st.st_size;
+    for (long long off = 0; off < size;) {
+        long long d = syscall(SYS_lseek, fd, (off_t)off, SEEK_DATA);
+        if (d < 0)
+            break;
+        long long h = syscall(SYS_lseek, fd, (off_t)d, SEEK_HOLE);
+        if (h < 0 || h > size)
+            h = size;
+        for (long long at = d; at < h;) {
+            long n = pread(fd, sbuf, (size_t)(h - at < (long long)sizeof sbuf ? h - at : (long long)sizeof sbuf), at);
+            if (n <= 0)
+                break;
+            if (pwrite(s, sbuf, n, at) != n) {
+                close(s);
+                return -1;
+            }
+            at += n;
+        }
+        off = h;
+    }
+    if (ftruncate(s, size) != 0) {
+        close(s);
+        return -1;
+    }
+    if (save >= 0)
+        syscall(SYS_lseek, fd, (off_t)save, SEEK_SET);
+    return s;
+}
+
+// splice-snapshot: ふつうのファイル (読める口) からパイプへ、長さ 0 でなく、flags がまちがっていないとき。fd と to の
+// 種類は両方で同じに見る (印も同じ条件で)
+static int file_to_pipe(int fd, int to, long long len, unsigned flags) {
+    struct stat ist, xst;
+    return len > 0 && !(flags & ~0x0fu) && fstat(fd, &ist) == 0 && S_ISREG(ist.st_mode) && fstat(to, &xst) == 0 && S_ISFIFO(xst.st_mode);
+}
+
+// Linux で、読める口 (O_PATH でない) か。写しから入れるのは、そのときだけ (でなければ本物が EBADF)
+static int readable_fd(int fd) {
+    int fl = (int)syscall(SYS_fcntl, fd, F_GETFL);
+    return fl >= 0 && !(fl & O_PATH) && !(fl & 1);
 }
 
 static int fdof(int ref) {
@@ -1284,16 +1439,24 @@ static void exec(int i, const struct op *o) {
         // Linux ではそのとき、穴をあけて (PUNCH_HOLE|KEEP_SIZE) から場所をとる (mode 0 か KEEP_SIZE)
         struct stat st;
         struct statfs sf;
-        int zt = (m & FL_ZERO_RANGE) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fstatfs(fd, &sf) == 0 && sf.f_type == K_TMPFS_MAGIC;
+        int reg = fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+        int zt = (m & FL_ZERO_RANGE) && reg && fstatfs(fd, &sf) == 0 && sf.f_type == K_TMPFS_MAGIC;
+        // linuxbug zero-range-eof: ext4 の ZERO_RANGE が終わりをこえると、終わりのブロックの中が 0 にならないことがある。
+        // Linux ではそのあと、ファイルの終わりまでを穴にして 0 にする
+        int zb = (m & FL_ZERO_RANGE) && !(m & FL_KEEP_SIZE) && reg && !zt && o->off >= 0 && o->off < st.st_size && o->off + o->len > st.st_size;
         r = syscall(SYS_fallocate, fd, m, (off_t)o->off, (off_t)o->len);
         if (zt && !on_aios && r < 0 && errno == EOPNOTSUPP) {
             r = syscall(SYS_fallocate, fd, FL_PUNCH_HOLE | FL_KEEP_SIZE, (off_t)o->off, (off_t)o->len);
             if (r == 0)
                 r = syscall(SYS_fallocate, fd, m & FL_KEEP_SIZE, (off_t)o->off, (off_t)o->len);
         }
+        if (zb && !on_aios && r == 0)
+            syscall(SYS_fallocate, fd, FL_PUNCH_HOLE | FL_KEEP_SIZE, (off_t)o->off, (off_t)(st.st_size - o->off));
         ret(r);
         if (zt)
             say(" [chosen zero-range-tmpfs]");
+        if (zb)
+            say(" [linuxbug zero-range-eof]");
         // 穴をあけるほかは、未初期化のブロックをとる
         if (r == 0 && !(m & FL_PUNCH_HOLE))
             fallocated = 1;
@@ -1314,6 +1477,8 @@ static void exec(int i, const struct op *o) {
         struct stat ist, xst;
         int self = o->kind == SENDFILE && fstat(fd, &ist) == 0 && S_ISREG(ist.st_mode) && fstat(to, &xst) == 0 && ist.st_dev == xst.st_dev &&
                    ist.st_ino == xst.st_ino;
+        // chosen splice-snapshot: sendfile で、ふつうのファイルからパイプへ
+        int f2p = o->kind == SENDFILE && file_to_pipe(fd, to, o->len, 0), snap = -1;
         if (im)
             syscall(SYS_fcntl, to, F_SETFL, fl & ~O_APPEND);
         if (o->kind == COPYRANGE) {
@@ -1371,6 +1536,16 @@ static void exec(int i, const struct op *o) {
                     in = p;
                 else
                     syscall(SYS_lseek, fd, (off_t)p, SEEK_SET);
+            } else if (f2p && !on_aios && readable_fd(fd) && (snap = snapshot(fd)) >= 0) {
+                // chosen splice-snapshot: Linux では、そのときの写しから入れる (位置は fd のものを使い、もどす)
+                long long pos = (o->x & 1) ? in : (long long)syscall(SYS_lseek, fd, 0, SEEK_CUR);
+                r = syscall(SYS_sendfile, to, snap, &pos, (size_t)o->len);
+                e = errno;
+                if (r >= 0 && (o->x & 1))
+                    in = pos;
+                else if (r >= 0)
+                    syscall(SYS_lseek, fd, (off_t)pos, SEEK_SET);
+                close(snap);
             } else {
                 r = syscall(SYS_sendfile, to, fd, (o->x & 1) ? &in : NULL, (size_t)o->len);
                 e = errno;
@@ -1388,6 +1563,68 @@ static void exec(int i, const struct op *o) {
             say(" [chosen copy-append]");
         if (self)
             say(" [chosen sendfile-self]");
+        if (f2p && r > 0)
+            say(" [chosen splice-snapshot]");
+        break;
+    }
+    case SPLICE: {
+        long long in = o->off, out = coffs[o->y];
+        int to = fdref(o->d2, o->fb, fd);
+        say("splice(%d, ", fd);
+        if (o->x & 1)
+            say("%lld", in);
+        else
+            say("NULL");
+        say(", %d, ", to);
+        if (o->x & 2)
+            say("%lld", out);
+        else
+            say("NULL");
+        say(", %lld, %s)", o->len, spfn[o->mode]);
+        // chosen copy-append: O_APPEND で開いたファイルへも書く (位置をわたせばそこへ、なければ終わりに足す)。Linux
+        // では O_APPEND をはずし、書く位置がなければ終わりをわたして書いて、書くほうの位置を終わり + 書いた分にしてもどす
+        int fl = (int)syscall(SYS_fcntl, to, F_GETFL);
+        struct stat ost;
+        int app = fl >= 0 && (fl & O_APPEND) && fstat(to, &ost) == 0 && S_ISREG(ost.st_mode);
+        int im = app && !on_aios;
+        long long end = im ? (long long)ost.st_size : 0;
+        if (im)
+            syscall(SYS_fcntl, to, F_SETFL, fl & ~O_APPEND);
+        // chosen splice-snapshot: ふつうのファイル → パイプ (書く位置なし) は、Linux ではそのときの写しから入れる
+        int f2p = !(o->x & 2) && file_to_pipe(fd, to, o->len, spfv[o->mode]), snap = -1, e;
+        if (f2p && !on_aios && readable_fd(fd) && (snap = snapshot(fd)) >= 0) {
+            long long pos = (o->x & 1) ? in : (long long)syscall(SYS_lseek, fd, 0, SEEK_CUR);
+            r = syscall(SYS_splice, snap, &pos, to, NULL, (size_t)o->len, spfv[o->mode]);
+            e = errno;
+            if (r >= 0 && (o->x & 1))
+                in = pos;
+            else if (r >= 0)
+                syscall(SYS_lseek, fd, (off_t)pos, SEEK_SET);
+            close(snap);
+        } else {
+            r = syscall(SYS_splice, fd, (o->x & 1) ? &in : NULL, to, (o->x & 2) ? &out : im ? &end : NULL, (size_t)o->len, spfv[o->mode]);
+            e = errno;
+        }
+        if (im && r > 0 && !(o->x & 2))
+            syscall(SYS_lseek, to, (off_t)end, SEEK_SET);
+        if (im)
+            syscall(SYS_fcntl, to, F_SETFL, fl);
+        errno = e;
+        ret(r);
+        if (r >= 0 && (o->x & 1))
+            say(" in %lld", in);
+        if (r >= 0 && (o->x & 2))
+            say(" out %lld", out);
+        if (app)
+            say(" [chosen copy-append]");
+        if (f2p && r > 0)
+            say(" [chosen splice-snapshot]");
+        break;
+    }
+    case TEE: {
+        int to = fdref(o->d2, o->fb, fd);
+        say("tee(%d, %d, %lld, %s)", fd, to, o->len, spfn[o->mode]);
+        ret(syscall(SYS_tee, fd, to, (size_t)o->len, spfv[o->mode]));
         break;
     }
     case STATX: {
@@ -1632,6 +1869,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "-l")) {
         for (size_t i = 0; i < sizeof chosen / sizeof *chosen; i++)
             printf("chosen %s %s\n", chosen[i].name, chosen[i].why);
+        for (size_t i = 0; i < sizeof linux_bugs / sizeof *linux_bugs; i++)
+            printf("linuxbug %s %s\n", linux_bugs[i].name, linux_bugs[i].why);
         return 0;
     }
     if (a + 1 < argc && !strcmp(argv[a], "-n")) {

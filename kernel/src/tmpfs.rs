@@ -443,12 +443,20 @@ impl Inode for TmpInode {
                 return Err(-EPERM);
             }
         }
-        match &mut *self.node.borrow_mut() {
-            Node::File(d) => d.owned()?.truncate(len),
+        let same = match &mut *self.node.borrow_mut() {
+            Node::File(d) => {
+                let same = d.len() == len;
+                d.owned()?.truncate(len);
+                same
+            }
             Node::Dir(_) => return Err(-EISDIR),
             _ => return Err(-EINVAL),
+        };
+        // 大きさが変わらなければ時刻も変えない (Linux の shmem_setattr。truncate(2) はそれだけ。ftruncate(2) は
+        // ATTR_MTIME | ATTR_CTIME も渡すので、sysfile::ftruncate が変える)
+        if !same {
+            self.touch();
         }
-        self.touch();
         Ok(())
     }
 

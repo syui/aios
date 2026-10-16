@@ -124,14 +124,20 @@ for t in ("core", "extra", "quirk"):
 # aios がえらんだちがい: ロボット (test/sysdiff.c の chosen)、doc/aios.md の表、カーネルのソースの印がそろっているか
 top = os.path.join(root, "..")
 with open(os.path.join(top, "test", "sysdiff.c"), encoding="utf-8") as f:
-    m = re.search(r"\} chosen\[\] = \{(.*?)\n\};", f.read(), re.S)
+    robot = f.read()
+m = re.search(r"\} chosen\[\] = \{(.*?)\n\};", robot, re.S)
 chosen = re.findall(r'\{"([a-z0-9-]+)", "', m.group(1)) if m else []
 if not chosen:
     err("test/sysdiff.c: no chosen list")
+m = re.search(r"\} linux_bugs\[\] = \{(.*?)\n\};", robot, re.S)
+linux_bugs = re.findall(r'\{"([a-z0-9-]+)", "', m.group(1)) if m else []
 with open(os.path.join(top, "doc", "aios.md"), encoding="utf-8") as f:
     doc = f.read()
-table = doc.split("#### aios がえらんだちがい", 1)[-1].split("\n## ", 1)[0]
-in_doc = set(re.findall(r"^\| ([a-z0-9-]+) \|", table, re.M))
+# 見出しからつぎの見出しまでの表の名前
+def names(heading):
+    table = doc.split(heading, 1)[-1].split("\n#", 1)[0]
+    return set(re.findall(r"^\| ([a-z0-9-]+) \|", table, re.M))
+in_doc = names("#### aios がえらんだちがい")
 marked = {n for s in text.values() for n in re.findall(r"aios がえらんだちがい \(([a-z0-9-]+)\)", s)}
 for n in chosen:
     if n not in in_doc:
@@ -140,6 +146,13 @@ for n in chosen:
         err("chosen %s (test/sysdiff.c) has no 「aios がえらんだちがい (%s)」 in kernel/src" % (n, n))
 for n in sorted((in_doc | marked) - set(chosen)):
     err("chosen %s is in doc/aios.md or kernel/src but not in test/sysdiff.c (the robot would not check it)" % n)
+# 手本の Linux のまちがい (test/sysdiff.c の linux_bugs) も、doc/aios.md の表とそろっているか
+bugs_doc = names("#### 手本の Linux のまちがい")
+for n in linux_bugs:
+    if n not in bugs_doc:
+        err("linux bug %s (test/sysdiff.c) is not in the table of doc/aios.md (手本の Linux のまちがい)" % n)
+for n in sorted(bugs_doc - set(linux_bugs)):
+    err("linux bug %s is in doc/aios.md but not in test/sysdiff.c (the robot would not correct it)" % n)
 
 # 数と、core が extra を使っているところ (crate::NAME)
 lines = {t: sum(text[s].count("\n") for s, (_, k) in files.items() if k == t) for t in ("core", "extra")}
@@ -156,5 +169,6 @@ print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
 print("chosen (aios がえらんだちがい) %d: %s" % (len(chosen), " ".join(chosen)))
+print("linux bugs (手本の Linux のまちがい) %d: %s" % (len(linux_bugs), " ".join(linux_bugs)))
 print("kernel-json: %d failed" % len(errors))
 sys.exit(min(len(errors), 125))

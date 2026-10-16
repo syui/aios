@@ -803,7 +803,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             Some(r) => r,
             None => return false,
         },
-        SPLICE => match crate::file::fast_splice(p, a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize) {
+        SPLICE => match crate::file::fast_splice(p, a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]) {
             Some(r) => r,
             None => return false,
         },

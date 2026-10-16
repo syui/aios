@@ -1205,9 +1205,10 @@ pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> 
 ///   パイプ → /dev/null: パイプのロックだけで捨てる (中身があるとき)
 ///   ext4 のファイル → パイプ: 読むところがページキャッシュに全部あり、パイプに全部入るとき (半分だけ
 ///   入れることはしない)。オフセットは off_in (ユーザーのメモリ) か、だれとも分けていない開いたファイルの
-/// ほかは None でふつうの道へ
-pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize) -> Option<i64> {
-    if len == 0 || off_out != 0 {
+/// ほかは None でふつうの道へ (flags のまちがい、O_PATH、読めない口・書けない口、ふつうのファイルでないものも、
+/// ふつうの道が Linux の順でエラーにする)
+pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> Option<i64> {
+    if len == 0 || off_out != 0 || flags & !0x0f != 0 {
         return None;
     }
     let len = len.min(64 * 1024);
@@ -1217,6 +1218,9 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
     let fi = files.get().get(fd_in)?;
     let fo = files.get().get(fd_out)?;
     let (ofi, ofo) = unsafe { (&mut *fi.as_ptr(), &*fo.as_ptr()) };
+    if (ofi.flags | ofo.flags) & O_PATH != 0 || !ofi.readable() || !ofo.writable() {
+        return None;
+    }
     let wake = |p: &Rc<PipeCell>| {
         FAST_RW[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::smp::defer_wake(Rc::as_ptr(p) as usize);
@@ -1238,7 +1242,7 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
             Some(k as i64)
         }
         (Kind::Inode(ino, _), Kind::PipeWrite(p)) => {
-            if ofi.flags & O_ACCMODE == O_WRONLY || !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+            if !ino.page_cacheable() || ino.meta().mode & S_IFMT != vfs::S_IFREG || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)
@@ -1258,11 +1262,20 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
                 }
                 ofi.offset
             };
+            // 読み手がいない (EPIPE と SIGPIPE) か箱がない (待つか EAGAIN) なら、ファイルの終わりでもふつうの道
+            // (Linux の wait_for_space は読む前)
+            {
+                let pp = p.borrow();
+                if pp.readers == 0 || pp.full() {
+                    return None;
+                }
+            }
             let mut woke = false;
             let n = crate::vm::with_cached(ino.id(), off, len, |parts| {
                 let total: usize = parts.iter().map(|x| x.len()).sum();
                 let mut pp = p.borrow_mut();
-                // ファイルのページのかけらごとに箱ひとつ (Linux の splice と同じ)。全部入るときだけ
+                // ファイルのページのかけらごとに箱ひとつ (Linux の splice と同じ)。全部入るときだけ。箱にはそのときの
+                // 中身を写す (aios がえらんだちがい (splice-snapshot): sysfile::splice_file_to_pipe と同じ)
                 if pp.readers == 0 || pp.splice_room(off as u64, total) < total {
                     return false;
                 }
@@ -1685,6 +1698,211 @@ impl Pipe {
             }
             Pipe::sleep(p, pp)?;
         }
+    }
+
+    /// splice でパイプから書くとき (Linux の splice_from_pipe_next と iter_file_splice_write): 中身が来るまで待ち
+    /// (書き手がいなければ空。nonblock は EAGAIN)、先頭から max バイトまでを読み減らさずに写す。書けた分は、あとで
+    /// discard で読み減らす
+    pub fn peek_wait(p: &Rc<PipeCell>, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
+        loop {
+            let mut pp = p.borrow_mut();
+            if pp.data.len > 0 {
+                let n = max.min(pp.data.len);
+                // pop が n バイトみな写す (0 で埋めない)
+                let mut v = Vec::with_capacity(n);
+                unsafe { v.set_len(n) };
+                pp.data.pop(&mut v, false);
+                return Ok(v);
+            }
+            if pp.writers == 0 {
+                return Ok(Vec::new());
+            }
+            if nonblock {
+                return Err(-11); // EAGAIN
+            }
+            Pipe::sleep(p, pp)?;
+        }
+    }
+
+    /// パイプ a からパイプ b へ len バイトまで (Linux の splice_pipe_to_pipe): 箱ごとそのまま動かす (足してよいかの
+    /// 印もそのまま)。len が箱より短ければ、その分だけを足さない新しい箱に写し、a の箱は残りを持つ。はじめに、a が空なら
+    /// 待ち (書き手がいなければそのまま。nonblock は EAGAIN)、b がいっぱいなら待つ (読み手がいなければ EPIPE。nonblock
+    /// は EAGAIN)。b の読み手がいなければ EPIPE (SIGPIPE は呼ぶほうで)、a が空で書き手がいなければ 0
+    pub fn splice_pipe(a: &Rc<PipeCell>, b: &Rc<PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+        const EAGAIN: i64 = 11;
+        'retry: loop {
+            // ipipe_prep
+            loop {
+                let pa = a.borrow_mut();
+                if pa.data.len > 0 || pa.writers == 0 {
+                    break;
+                }
+                if nonblock {
+                    return Err(-EAGAIN);
+                }
+                Pipe::sleep(a, pa)?;
+            }
+            // opipe_prep
+            loop {
+                let pb = b.borrow_mut();
+                if !pb.full() {
+                    break;
+                }
+                if pb.readers == 0 {
+                    return Err(-EPIPE);
+                }
+                if nonblock {
+                    return Err(-EAGAIN);
+                }
+                Pipe::sleep(b, pb)?;
+            }
+            // 2 つのロックは場所の順に (Linux の pipe_double_lock)
+            let (mut pa, mut pb) = if (Rc::as_ptr(a) as usize) < (Rc::as_ptr(b) as usize) {
+                let x = a.borrow_mut();
+                (x, b.borrow_mut())
+            } else {
+                let y = b.borrow_mut();
+                (a.borrow_mut(), y)
+            };
+            let (mut done, mut left, mut freed) = (0, len, false);
+            loop {
+                if pb.readers == 0 {
+                    if done == 0 {
+                        return Err(-EPIPE);
+                    }
+                    break;
+                }
+                if pa.data.len == 0 && pa.writers == 0 {
+                    break;
+                }
+                if pa.data.len == 0 || pb.full() {
+                    if done > 0 {
+                        break;
+                    }
+                    if nonblock {
+                        return Err(-EAGAIN);
+                    }
+                    drop(pa);
+                    drop(pb);
+                    continue 'retry;
+                }
+                let (pg, r, w, merge) = pa.data.pages[0];
+                let k = w - r;
+                if left >= k {
+                    pa.data.pages.pop_front();
+                    pa.data.len -= k;
+                    pb.data.pages.push_back((pg, r, w, merge));
+                    pb.data.len += k;
+                    freed = true;
+                    done += k;
+                    left -= k;
+                } else {
+                    let Some(np) = pb.data.page() else {
+                        if done == 0 {
+                            return Err(-12); // ENOMEM
+                        }
+                        break;
+                    };
+                    unsafe { core::ptr::copy_nonoverlapping(pg.add(r), np, left) };
+                    pb.data.pages.push_back((np, 0, left, false));
+                    pb.data.len += left;
+                    pa.data.pages[0].1 += left;
+                    pa.data.len -= left;
+                    done += left;
+                    left = 0;
+                }
+                if left == 0 {
+                    break;
+                }
+            }
+            if done > 0 {
+                pa.taken += done as u64;
+                pb.wrote += done as u64;
+                pb.generation += 1;
+            }
+            drop(pa);
+            drop(pb);
+            if done > 0 {
+                Pipe::wake(b);
+            }
+            if freed {
+                Pipe::wake(a);
+            }
+            return Ok(done);
+        }
+    }
+
+    /// tee: パイプ a の中身を読み減らさずに、パイプ b へ len バイトまで写す (Linux の link_pipe): a の箱ごとに、
+    /// 足さない箱を b に作って写す (len で切れる箱は、その分だけ)。はじめに a が空なら待ち (書き手がいなければそのまま
+    /// 0。nonblock は EAGAIN)、b がいっぱいなら待つ (読み手がいなければ EPIPE。nonblock は EAGAIN)。写せたバイト数
+    pub fn tee_pipe(a: &Rc<PipeCell>, b: &Rc<PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+        const EAGAIN: i64 = 11;
+        loop {
+            let pa = a.borrow_mut();
+            if pa.data.len > 0 || pa.writers == 0 {
+                break;
+            }
+            if nonblock {
+                return Err(-EAGAIN);
+            }
+            Pipe::sleep(a, pa)?;
+        }
+        loop {
+            let pb = b.borrow_mut();
+            if !pb.full() {
+                break;
+            }
+            if pb.readers == 0 {
+                return Err(-EPIPE);
+            }
+            if nonblock {
+                return Err(-EAGAIN);
+            }
+            Pipe::sleep(b, pb)?;
+        }
+        let (pa, mut pb) = if (Rc::as_ptr(a) as usize) < (Rc::as_ptr(b) as usize) {
+            let x = a.borrow_mut();
+            (x, b.borrow_mut())
+        } else {
+            let y = b.borrow_mut();
+            (a.borrow_mut(), y)
+        };
+        let (mut done, mut left, mut i) = (0, len, 0);
+        while left > 0 {
+            if pb.readers == 0 {
+                if done == 0 {
+                    return Err(-EPIPE);
+                }
+                break;
+            }
+            if i >= pa.data.pages.len() || pb.full() {
+                break;
+            }
+            let (pg, r, w, _) = pa.data.pages[i];
+            let k = (w - r).min(left);
+            let Some(np) = pb.data.page() else {
+                if done == 0 {
+                    return Err(-12); // ENOMEM
+                }
+                break;
+            };
+            unsafe { core::ptr::copy_nonoverlapping(pg.add(r), np, k) };
+            pb.data.pages.push_back((np, 0, k, false));
+            pb.data.len += k;
+            done += k;
+            left -= k;
+            i += 1;
+        }
+        if done > 0 {
+            pb.wrote += done as u64;
+            pb.generation += 1;
+        }
+        drop(pa);
+        drop(pb);
+        if done > 0 {
+            Pipe::wake(b);
+        }
+        Ok(done)
     }
 
     /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN。入れ方は Linux の anon_pipe_write

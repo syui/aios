@@ -157,6 +157,14 @@ fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
 
 /// 作る・消す・名前を変えるところ (vfs::parent_last)。空のパスは dirfd を見る前に ENOENT (Linux の getname)
 fn last_at(dirfd: i64, path: &str) -> Result<vfs::Parent, i64> {
+    let p = last_at_dead(dirfd, path)?;
+    p.alive()?;
+    Ok(p)
+}
+
+/// last_at と同じだが、親が消したディレクトリでも (dead) 答える: rename は . .. / の EBUSY と EXDEV を、名前を引く
+/// (ENOENT) より先に見る
+fn last_at_dead(dirfd: i64, path: &str) -> Result<vfs::Parent, i64> {
     if path.is_empty() {
         return Err(-ENOENT);
     }
@@ -610,6 +618,12 @@ fn create_target(start: Option<(InodeRef, String)>, cwd: &str, path: &str, follo
         if p.last != vfs::Last::Norm {
             return Err(-EISDIR);
         }
+        // name/ には作れない (あってもなくても EISDIR): たどったリンクの中身の終わりの / も (Linux の
+        // open_last_lookups は、引く前に nd->last のあとの / を見る)
+        if p.slash {
+            return Err(-EISDIR);
+        }
+        p.alive()?;
         p.name_ok()?;
         let link = match p.dir.lookup(&p.name) {
             Ok(c) if follow && c.meta().mode & S_IFMT == vfs::S_IFLNK => c.readlink()?,
@@ -721,7 +735,7 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
             let dir = if dpart.is_empty() {
                 start.0.clone()
             } else {
-                match vfs::lookup_resolve(start.clone(), dpart, true, resolve)? {
+                match vfs::lookup_resolve(start.clone(), dpart, true, resolve, false)? {
                     vfs::Resolved::Found(_, d) => d,
                     vfs::Resolved::Missing(..) => return Err(-ENOENT),
                 }
@@ -734,12 +748,12 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
         }
     }
     if flags & O_TMPFILE != 0 {
-        return match vfs::lookup_resolve(start, &path, follow, resolve)? {
+        return match vfs::lookup_resolve(start, &path, follow, resolve, false)? {
             vfs::Resolved::Found(full, dir) => open_tmpfile(full, dir, flags, mode),
             vfs::Resolved::Missing(..) => Err(-ENOENT),
         };
     }
-    let found = match vfs::lookup_resolve(start, &path, follow, resolve)? {
+    let found = match vfs::lookup_resolve(start, &path, follow, resolve, flags & O_CREAT != 0)? {
         vfs::Resolved::Found(full, ino) => Ok((full, ino)),
         vfs::Resolved::Missing(parent, dir, name) if flags & O_CREAT != 0 => {
             // name/ は作れない
@@ -1273,11 +1287,12 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || flags & (RENAME_NOREPLACE | RENAME_EXCHANGE) == RENAME_NOREPLACE | RENAME_EXCHANGE {
         return Err(-EINVAL);
     }
-    // Linux の do_renameat2 と同じ順に: 両方の親、ファイルシステムがちがえば EXDEV、最後が . .. / なら EBUSY
-    // (新しいほうは NOREPLACE なら EEXIST)、読むだけのマウントなら EROFS、元がなければ ENOENT
+    // Linux の do_renameat2 と同じ順に: 両方の親 (消したディレクトリでもまだよい)、ファイルシステムがちがえば EXDEV、
+    // 最後が . .. / なら EBUSY (新しいほうは NOREPLACE なら EEXIST)、読むだけのマウントなら EROFS、それから名前を
+    // 引く (消したディレクトリの中は ENOENT、元がなければ ENOENT)
     let (opath, npath) = (user_str(oldp)?, user_str(newp)?);
-    let o = last_at(olddir, &opath)?;
-    let n = last_at(newdir, &npath)?;
+    let o = last_at_dead(olddir, &opath)?;
+    let n = last_at_dead(newdir, &npath)?;
     if o.dir.id().0 != n.dir.id().0 {
         return Err(-vfs::EXDEV);
     }
@@ -1289,8 +1304,10 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     }
     vfs::check_writable(&o.full)?;
     vfs::check_writable(&n.full)?;
+    o.alive()?;
     o.name_ok()?;
     let moving = o.dir.lookup(&o.name)?;
+    n.alive()?;
     n.name_ok()?;
     let target = n.dir.lookup(&n.name).ok();
     if flags & RENAME_NOREPLACE != 0 && target.is_some() {
@@ -1449,7 +1466,13 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     }
     writable_fd(fd)?;
     vfs::drop_privs(&ino)?;
+    // ftruncate(2) は大きさが変わらなくても時刻を変える (Linux の do_truncate が ATTR_MTIME | ATTR_CTIME を渡す。
+    // truncate(2) は渡さないので、tmpfs は大きさが変わらなければ変えない: tmpfs::truncate)
+    let before = ino.meta().mtime;
     ino.truncate(len as usize)?;
+    if ino.meta().mtime == before {
+        ino.set_mtime(crate::timer::epoch_ns())?;
+    }
     if let Kind::Inode(_, p) = &f.borrow().kind {
         inotify::file_event(p, &ino, inotify::IN_MODIFY);
     }
@@ -2370,81 +2393,165 @@ fn pipe_of(fd: u64) -> Option<alloc::rc::Rc<crate::file::PipeCell>> {
 }
 
 const SPLICE_F_NONBLOCK: u64 = 2;
+/// SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT
+const SPLICE_F_ALL: u64 = 0x0f;
 
-/// splice: in から out へ len まで移す (中身はいったんカーネルでコピーする)
+/// splice(2) (Linux の splice、__do_splice、do_splice の順): 長さ 0 なら 0、flags (SPLICE_F_ALL のほかは EINVAL)、
+/// 両方の fd (O_PATH も EBADF)、パイプの側にわたされた位置 (ESPIPE)、位置を写し (EFAULT)、読める口と書ける口か
+/// (EBADF)。それから:
+///   パイプ → パイプ: 同じパイプは EINVAL。箱ごとに動かす (Pipe::splice_pipe)
+///   パイプ → ほか: わたされた位置 (位置のないものは EINVAL) かファイルの位置、位置のしらべ (EINVAL)、中身を待って
+///     (書き手がいなければ 0、nonblock は EAGAIN) そこに書き、書けた分を読み減らす (splice_pipe_to)
+///   ほか → パイプ: わたされた位置かファイルの位置、位置のしらべ、splice_file_to_pipe (sendfile と同じ)
+///   どちらもパイプでなければ EINVAL
+/// nonblock は SPLICE_F_NONBLOCK か、パイプの側の O_NONBLOCK。O_APPEND のファイルへは、Linux は EINVAL だが、aios は
+/// 書く (aios がえらんだちがい copy-append)
 pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> R {
-    if pipe_of(fd_in).is_none() && pipe_of(fd_out).is_none() {
-        return Err(-EINVAL);
-    }
-    let pin = pipe_of(fd_in);
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    // パイプ → /dev/null: 写さずに捨てるだけ (cat FILE > /dev/null は、ファイル → パイプ → /dev/null の 2 回)
-    if let Some(p) = &pin
-        && off_out == 0
-        && matches!(file_of(fd_out)?.borrow().kind, Kind::Null)
-    {
-        return Ok(Pipe::discard(p, len.min(64 * 1024), nonblock)? as i64);
-    }
-    // ふつうのファイル → パイプ: Linux と同じく、ファイルのページのかけらごとの箱に (splice_file_to_pipe)
-    if pin.is_none()
-        && let Some(p) = pipe_of(fd_out)
-        && off_out == 0
-    {
-        let f = file_of(fd_in)?;
-        if matches!(&f.borrow().kind, Kind::Inode(i, _) if i.meta().mode & S_IFMT == vfs::S_IFREG) && f.borrow().readable() {
-            let mut pos = if off_in != 0 { read_off(off_in)? } else { f.borrow().offset as i64 };
-            let nonblock = nonblock || file_of(fd_out)?.borrow().flags & file::O_NONBLOCK != 0;
-            let n = splice_file_to_pipe(&f, &mut pos, &p, len, nonblock)?;
-            if off_in != 0 {
-                out(off_in, &pos.to_le_bytes())?;
-            } else {
-                f.borrow_mut().offset = pos as usize;
-            }
-            return Ok(n as i64);
-        }
-    }
-    // 中身を 0 にしない (読んだ分だけ使う)。ロックを持ったまま 64 KB を 0 で埋めるのは高い
-    let mut tmp = uninit(len.min(64 * 1024));
-    // パイプからは読み減らさずに見て、書けた分だけ取る (書けなければパイプに残す。Linux と同じ)
-    let n = match (pin.clone(), off_in) {
-        (Some(p), _) => Pipe::read_ex(&p, &mut tmp, true, nonblock)?,
-        (None, 0) => file::read(&file_of(fd_in)?, &mut tmp)?,
-        (None, at) => {
-            let off = read_off(at)?;
-            let n = inode_of(fd_in)?.read_at(off as usize, &mut tmp)?;
-            out(at, &(off + n as i64).to_le_bytes())?;
-            n
-        }
-    };
-    if n == 0 {
+    if len == 0 {
         return Ok(0);
     }
-    let done = if off_out != 0 {
-        let off = read_off(off_out)?;
-        let dst = inode_of(fd_out)?;
-        vfs::write_sealed(&dst, off as usize, n)?;
-        vfs::drop_privs(&dst)?;
-        let w = dst.write_at(off as usize, &tmp[..n])?;
-        out(off_out, &(off + w as i64).to_le_bytes())?;
-        w
-    } else {
-        let f = file_of(fd_out)?;
-        let mut done = 0;
-        while done < n {
-            match file::write(&f, &tmp[done..n]) {
-                Ok(0) => break,
-                Ok(w) => done += w,
-                Err(e) if done == 0 => return Err(e),
-                Err(_) => break,
-            }
-        }
-        done
-    };
-    // 書けた分を読み減らす (もう見たので、写さずに捨てる)
-    if let Some(p) = pin {
-        let _ = Pipe::discard(&p, done, true);
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(-EINVAL);
     }
-    Ok(done as i64)
+    let fi = file_of(fd_in)?;
+    let fo = file_of(fd_out)?;
+    if fi.borrow().flags & file::O_PATH != 0 || fo.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    let (pin, pout) = (pipe_of(fd_in), pipe_of(fd_out));
+    if (pin.is_some() && off_in != 0) || (pout.is_some() && off_out != 0) {
+        return Err(-file::ESPIPE);
+    }
+    let at_out = if off_out != 0 { Some(read_off(off_out)?) } else { None };
+    let at_in = if off_in != 0 { Some(read_off(off_in)?) } else { None };
+    if !fi.borrow().readable() || !fo.borrow().writable() {
+        return Err(-EBADF);
+    }
+    let nb = |f: &FileRef| flags & SPLICE_F_NONBLOCK != 0 || f.borrow().flags & file::O_NONBLOCK != 0;
+    // 位置をわたせるのは、位置のあるものだけ (Linux の FMODE_PREAD / FMODE_PWRITE)
+    let positional = |f: &FileRef| matches!(f.borrow().kind, Kind::Inode(..) | Kind::Block(_));
+    match (pin, pout) {
+        (Some(a), Some(b)) => {
+            if alloc::rc::Rc::ptr_eq(&a, &b) {
+                return Err(-EINVAL);
+            }
+            let r = Pipe::splice_pipe(&a, &b, len, nb(&fi) || nb(&fo));
+            if r == Err(-file::EPIPE) {
+                sigpipe();
+            }
+            Ok(r? as i64)
+        }
+        (Some(a), None) => {
+            if at_out.is_some() && !positional(&fo) {
+                return Err(-EINVAL);
+            }
+            let mut pos = at_out.unwrap_or(fo.borrow().offset as i64);
+            // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへも書く。位置がなければ write と同じく
+            // 終わりに足す
+            if at_out.is_none()
+                && fo.borrow().flags & file::O_APPEND != 0
+                && let Some((io, _)) = inode_path(&fo)
+            {
+                pos = io.meta().size as i64;
+            }
+            verify_pos(pos, len)?;
+            let n = splice_pipe_to(&a, &fo, pos, len, nb(&fi))?;
+            if n > 0 {
+                pos += n as i64;
+                match at_out {
+                    Some(_) => out(off_out, &pos.to_le_bytes())?,
+                    None => fo.borrow_mut().offset = pos as usize,
+                }
+            }
+            Ok(n as i64)
+        }
+        (None, Some(b)) => {
+            if at_in.is_some() && !positional(&fi) {
+                return Err(-EINVAL);
+            }
+            let mut pos = at_in.unwrap_or(fi.borrow().offset as i64);
+            verify_pos(pos, len)?;
+            let n = if matches!(fi.borrow().kind, Kind::Inode(..)) {
+                splice_file_to_pipe(&fi, &mut pos, &b, len, nb(&fo))?
+            } else {
+                splice_stream_to_pipe(&fi, &b, len, nb(&fo))?
+            };
+            match at_in {
+                Some(_) => out(off_in, &pos.to_le_bytes())?,
+                None => fi.borrow_mut().offset = pos as usize,
+            }
+            Ok(n as i64)
+        }
+        (None, None) => Err(-EINVAL),
+    }
+}
+
+/// パイプ a の中身を fo の pos へ len バイトまで書く (Linux の iter_file_splice_write): 中身が来るまで待ち (書き手が
+/// いなければ 0、nonblock は EAGAIN)、パイプにあるだけ (len まで) 書いて、書けた分を読み減らす。ふつうのファイルは
+/// 大きさの上限 (EFBIG) を見てから setuid / setgid を落として書く。/dev/null は捨てるだけ、位置のないもの (端末、
+/// ソケット) はふつうに書く
+fn splice_pipe_to(a: &alloc::rc::Rc<file::PipeCell>, fo: &FileRef, pos: i64, len: usize, nonblock: bool) -> Result<usize, i64> {
+    if matches!(fo.borrow().kind, Kind::Null) {
+        return Pipe::discard(a, len, nonblock);
+    }
+    let data = Pipe::peek_wait(a, len, nonblock)?;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let w = match inode_path(fo) {
+        Some((io, path)) => {
+            const EFBIG: i64 = 27;
+            let max = io.max_bytes() as i64;
+            if pos >= max {
+                return Err(-EFBIG);
+            }
+            let n = data.len().min((max - pos) as usize);
+            vfs::write_sealed(&io, pos as usize, n)?;
+            vfs::drop_privs(&io)?;
+            let w = io.write_at(pos as usize, &data[..n])?;
+            if w > 0 {
+                inotify::file_event(&path, &io, inotify::IN_MODIFY);
+            }
+            w
+        }
+        None => {
+            let mut done = 0;
+            while done < data.len() {
+                match file::write(fo, &data[done..]) {
+                    Ok(0) => break,
+                    Ok(w) => done += w,
+                    Err(e) if done == 0 => {
+                        if e == -file::EPIPE {
+                            sigpipe();
+                        }
+                        return Err(e);
+                    }
+                    Err(_) => break,
+                }
+            }
+            done
+        }
+    };
+    let _ = Pipe::discard(a, w, true);
+    Ok(w)
+}
+
+/// 位置のないもの (端末、ソケットなど) からパイプへ (Linux の copy_splice_read): 箱があくのを待ち (読み手が
+/// いなければ SIGPIPE と EPIPE、nonblock は EAGAIN)、あいた箱 × 4KiB まで読んで、4KiB ずつの足さない箱に入れる
+fn splice_stream_to_pipe(f: &FileRef, p: &alloc::rc::Rc<file::PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+    if let Err(e) = Pipe::wait_space(p, nonblock) {
+        if e == -file::EPIPE {
+            sigpipe();
+        }
+        return Err(e);
+    }
+    let free = {
+        let pp = p.borrow();
+        pp.slots().saturating_sub(pp.used_slots())
+    };
+    let mut tmp = uninit(len.min(free * crate::memlayout::PGSIZE));
+    let n = file::read(f, &mut tmp)?;
+    Ok(Pipe::splice_in(p, 0, &tmp[..n]))
 }
 
 fn read_off(va: usize) -> Result<i64, i64> {
@@ -2478,7 +2585,10 @@ fn read_inode_at(ino: &InodeRef, pos: usize, buf: &mut [u8]) -> Result<usize, i6
 /// ふつうのファイル f の *pos から、パイプ p へ len バイトまで (Linux の splice_file_to_pipe と
 /// filemap_splice_read / shmem_file_splice_read): 箱があくのを待ち (読み手がいなければ SIGPIPE と EPIPE、
 /// nonblock なら EAGAIN)、あいた箱 × 4KiB まで読んで、ファイルの 1 ページの中のかけらごとの箱に入れる。
-/// ファイルの終わりより先は 0。*pos を入れた分すすめる
+/// ファイルの終わりより先は 0。*pos を入れた分すすめる。
+/// aios がえらんだちがい (splice-snapshot): 中身はそのときのものを箱に写す。あとでファイルを書いたり切りつめたり
+/// しても、パイプの中身は変わらない。Linux はページキャッシュのページそのものを箱に入れるので、読む前にファイルが
+/// 変わればパイプからもそれが読め、切りつめると端のページの残りは 0 になる。doc/aios.md の「aios がえらんだちがい」
 fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
     if let Err(e) = Pipe::wait_space(p, nonblock) {
         if e == -file::EPIPE {
@@ -2751,18 +2861,34 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
     Ok(n as i64)
 }
 
-/// tee: パイプの中身を読み減らさずに、別のパイプへ写す
+/// tee(2) (Linux の順): flags (SPLICE_F_ALL のほかは EINVAL)、長さ 0 なら 0、両方の fd (O_PATH も EBADF)、読める口と
+/// 書ける口か (EBADF)、両方がパイプで同じでなければ EINVAL。それから Pipe::tee_pipe (読み減らさずに箱を写す)。
+/// nonblock は SPLICE_F_NONBLOCK かどちらかの O_NONBLOCK
 pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
-    let (Some(pin), Some(pout)) = (pipe_of(fd_in), pipe_of(fd_out)) else { return Err(-EINVAL) };
-    let room = pout.borrow().write_room(len.min(64 * 1024));
-    let mut tmp = uninit(len.min(room).min(64 * 1024));
-    if tmp.is_empty() {
-        return Err(-11); // EAGAIN
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(-EINVAL);
     }
-    let n = Pipe::read_ex(&pin, &mut tmp, true, flags & SPLICE_F_NONBLOCK != 0)?;
-    let f = file_of(fd_out)?;
-    let w = file::write(&f, &tmp[..n])?;
-    Ok(w as i64)
+    if len == 0 {
+        return Ok(0);
+    }
+    let fi = file_of(fd_in)?;
+    let fo = file_of(fd_out)?;
+    if fi.borrow().flags & file::O_PATH != 0 || fo.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    if !fi.borrow().readable() || !fo.borrow().writable() {
+        return Err(-EBADF);
+    }
+    let (Some(a), Some(b)) = (pipe_of(fd_in), pipe_of(fd_out)) else { return Err(-EINVAL) };
+    if alloc::rc::Rc::ptr_eq(&a, &b) {
+        return Err(-EINVAL);
+    }
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || (fi.borrow().flags | fo.borrow().flags) & file::O_NONBLOCK != 0;
+    let r = Pipe::tee_pipe(&a, &b, len, nonblock);
+    if r == Err(-file::EPIPE) {
+        sigpipe();
+    }
+    Ok(r? as i64)
 }
 
 /// flock のロック表: inode ごとに (開いたファイル, 専有か)

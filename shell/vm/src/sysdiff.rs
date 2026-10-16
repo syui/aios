@@ -41,18 +41,21 @@ fn build(root: &Path, dir: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((host, aios))
 }
 
-/// aios がえらんだちがい (sysdiff -l の「chosen NAME わけ」の行): (名前, わけ)
-fn chosen_list(root: &Path, host: &Path) -> Vec<(String, String)> {
+/// aios がえらんだちがい (kind "chosen") か手本の Linux のまちがい (kind "linuxbug") の一覧 (sysdiff -l の
+/// 「KIND NAME わけ」の行): (名前, わけ)
+fn marked_list(root: &Path, host: &Path, kind: &str) -> Vec<(String, String)> {
     let (st, out, _, _, _) = sh(root, &host.display().to_string(), &["-l"], &[], Duration::from_secs(10));
     if st != 0 {
         return Vec::new();
     }
-    out.lines().filter_map(|l| l.strip_prefix("chosen ")?.split_once(' ')).map(|(n, w)| (n.to_string(), w.to_string())).collect()
+    let prefix = format!("{} ", kind);
+    out.lines().filter_map(|l| l.strip_prefix(prefix.as_str())?.split_once(' ')).map(|(n, w)| (n.to_string(), w.to_string())).collect()
 }
 
-/// えらんだちがい name を通った case の数 (どちらかの出力に [chosen NAME] で終わる行があるもの)
-fn chosen_cases(name: &str, l: &[(String, Vec<String>)], a: &[(String, Vec<String>)]) -> usize {
-    let mark = format!("[chosen {}]", name);
+/// えらんだちがい (kind "chosen") や Linux のまちがい (kind "linuxbug") の name を通った case の数 (どちらかの
+/// 出力に [KIND NAME] で終わる行があるもの)
+fn marked_cases(kind: &str, name: &str, l: &[(String, Vec<String>)], a: &[(String, Vec<String>)]) -> usize {
+    let mark = format!("[{} {}]", kind, name);
     let used: std::collections::BTreeSet<&str> = l.iter().chain(a).filter(|(_, v)| v.iter().any(|x| x.ends_with(&mark))).map(|(c, _)| c.as_str()).collect();
     used.len()
 }
@@ -255,7 +258,8 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     note(json!({ "step": "build" }));
     let bins = build(root, &dir)?;
-    let chosen = chosen_list(root, &bins.0);
+    let chosen = marked_list(root, &bins.0, "chosen");
+    let bugs = marked_list(root, &bins.0, "linuxbug");
     let base = Base::get(root, a["base"].as_str().filter(|x| !x.is_empty()).unwrap_or("latest"))?;
     let cases = dir.join("cases.txt");
     std::fs::write(&cases, format!("{}-{}\n", from, from + seeds - 1)).map_err(|e| e.to_string())?;
@@ -412,8 +416,9 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         "differ": lcases.len() - same - missing,
         "kinds": groups.len(),
         "groups": out_groups,
-        "chosen": chosen.iter().map(|(n, w)| json!({ "name": n, "why": w, "cases": chosen_cases(n, &lcases, &acases) })).collect::<Vec<_>>(),
-        "note": "groups are sorted by how many cases show them. small is the shrunk case SEED:I,J,... (only those ops); its linux and aios traces end with the first difference. Run one again with test/sysdiff.c: sysdiff -n OPS DIR CASE on Linux and in the VM. chosen: differences aios chose over Linux (test/sysdiff.c, doc/aios.md); the Linux run imitates them, so they are not in differ; cases is how many cases went through each",
+        "chosen": chosen.iter().map(|(n, w)| json!({ "name": n, "why": w, "cases": marked_cases("chosen", n, &lcases, &acases) })).collect::<Vec<_>>(),
+        "linux_bugs": bugs.iter().map(|(n, w)| json!({ "name": n, "why": w, "cases": marked_cases("linuxbug", n, &lcases, &acases) })).collect::<Vec<_>>(),
+        "note": "groups are sorted by how many cases show them. small is the shrunk case SEED:I,J,... (only those ops); its linux and aios traces end with the first difference. Run one again with test/sysdiff.c: sysdiff -n OPS DIR CASE on Linux and in the VM. chosen: differences aios chose over Linux (test/sysdiff.c, doc/aios.md); the Linux run imitates them, so they are not in differ; cases is how many cases went through each. linux_bugs: bugs of the Linux used as the answer key (test/sysdiff.c linux_bugs); the Linux run corrects them the same way",
     });
     if missing > 0 {
         r["missing"] = json!(missing);
@@ -465,7 +470,8 @@ mod tests {
         let c = |n: &str, l: &[&str]| (n.to_string(), l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         let l = vec![c("1", &["3 pwrite64(3, 7, 0) = 7 [chosen pwrite-append]"]), c("2", &["3 pwrite64(3, 7, 0) = 7"])];
         let a = vec![c("1", &["3 pwrite64(3, 7, 0) = 7 [chosen pwrite-append]"]), c("3", &["0 pwrite64(4, 1, 3) = 1 [chosen pwrite-append]"])];
-        assert_eq!(chosen_cases("pwrite-append", &l, &a), 2);
-        assert_eq!(chosen_cases("pwrite", &l, &a), 0);
+        assert_eq!(marked_cases("chosen", "pwrite-append", &l, &a), 2);
+        assert_eq!(marked_cases("chosen", "pwrite", &l, &a), 0);
+        assert_eq!(marked_cases("linuxbug", "pwrite-append", &l, &a), 0);
     }
 }

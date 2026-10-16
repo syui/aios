@@ -193,6 +193,38 @@ static void sendfile_self(void) {
     rm(".ch-ss");
 }
 
+static void splice_snapshot(void) {
+    // 5000 バイトの z をパイプへ splice してから、ファイルの頭を Y にし、5 バイトに切りつめる。パイプから読むと、
+    // aios は入れたときのまま (z が 5000)。Linux はページそのものを入れているので、Y が見え、切りつめた端のページの
+    // 残り (5 から 4096) は 0
+    char data[5001], b[5001], got[200];
+    memset(data, 'z', 5000);
+    data[5000] = 0;
+    int fd = mkfile(".ch-ss2", data, 0);
+    int p[2];
+    if (pipe2(p, O_NONBLOCK) != 0) {
+        printf("FAIL splice-snapshot (%s): pipe2\n", dir);
+        fails++;
+        return;
+    }
+    long long at = 0;
+    long r1 = syscall(SYS_splice, fd, &at, p[1], NULL, 5000, 0);
+    int e1 = errno;
+    pwrite(fd, "Y", 1, 0);
+    ftruncate(fd, 5);
+    long n = read(p[0], b, 5000);
+    long zeros = 0;
+    for (long i = 0; i < n; i++)
+        zeros += b[i] == 0;
+    snprintf(got, sizeof got, "splice = %ld%s%s, read %ld: first %c, %ld zero", r1, r1 < 0 ? " " : "", r1 < 0 ? strerror(e1) : "", n,
+             n > 0 ? (b[0] ? b[0] : '0') : '-', zeros);
+    check("splice-snapshot", r1 == 5000 && n == 5000 && b[0] == 'z' && zeros == 0, r1 == 5000 && n == 5000 && b[0] == 'Y' && zeros > 0, got);
+    close(p[0]);
+    close(p[1]);
+    close(fd);
+    rm(".ch-ss2");
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -240,6 +272,7 @@ int main(int argc, char **argv) {
         copy_append();
         zero_range(tmpfs);
         sendfile_self();
+        splice_snapshot();
     }
     if (!on_aios)
         printf("chosen: Linux does %d of them like aios now\n", same);
