@@ -379,6 +379,7 @@ pub fn normalize(cwd: &str, path: &str) -> String {
 /// path をたどって (正規化済みパス, inode) を返す。
 /// 途中のリンクは常に、最後のリンクは follow のときだけたどる
 pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    let _p = crate::prof::span("vfs:lookup");
     if path.is_empty() {
         return Err(-ENOENT);
     }
@@ -471,6 +472,8 @@ pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Re
 /// path (start があればそこからの相対、なければルートから) をたどる
 /// t: 答えを覚えてよいか (だめなら ok を false に) と、通ったディレクトリ (lookup の PATHS)
 fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t: &mut Trace) -> Result<(String, InodeRef), i64> {
+    // 覚え (PATHS) になかったもの。vfs:lookup との回数の差が、覚えから答えた数
+    let _p = crate::prof::span("vfs:walk");
     let cred = crate::cred::current();
     'restart: for _ in 0..16 {
         let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
@@ -625,6 +628,7 @@ fn chain(path: &str) -> Result<Vec<Step>, i64> {
 ///   NO_XDEV: マウントをまたぐもの (入るのも、.. で出るのも、ほかのマウントへのリンクも) は EXDEV
 /// 最後の名前だけがなければ Missing (O_CREAT が作るところ)。答えは覚えない (lookup の PATHS は使わない)
 pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resolve: u64) -> Result<Resolved, i64> {
+    let _p = crate::prof::span("vfs:resolve");
     let beneath = resolve & RESOLVE_BENEATH != 0;
     let in_root = resolve & RESOLVE_IN_ROOT != 0;
     let no_xdev = resolve & RESOLVE_NO_XDEV != 0;

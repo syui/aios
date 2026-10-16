@@ -6,7 +6,8 @@
 # core と extra は 1 つのファイルに 1 行で、kernel/src の .rs がみなちょうど 1 度ずつ。quirk は 1 つの手当てに 1 行で、
 # src のファイルには札 [quirk NAME] があり、ソースの札はみな一覧の quirk の src のファイルにある。.aios.json の kernel の
 # core / extra / quirk は、kernel.json の名前をその順に並べたもの。off (起動の引数 aios.off= で切れるものと、切るとどうなるか) の
-# あるものは src/parts.rs の NAMES (と enum Part の順) と同じ
+# あるものは src/parts.rs の NAMES (と enum Part の順) と同じ。bench (速さを測るもの) はあるファイルで、prof の区間の名前は
+# part:what (part は kernel.json の名前。/proc/ai/prof が part ごとに足す)
 # 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく)
 import json
 import os
@@ -86,6 +87,27 @@ for e in entries:
     if "off" in e and not e["off"]:
         err("%s: off is empty" % e.get("name"))
 
+# bench (速さを測るもの) のファイルがあるか。prof の区間 (prof::span("part:what")) の part が kernel.json の名前か
+repo = os.path.join(root, "..")
+for e in entries:
+    b = e.get("bench")
+    if b is not None and not os.path.isfile(os.path.join(repo, b.split()[0])):
+        err("%s: bench %s is not a file" % (e.get("name"), b.split()[0]))
+spans = set()
+for s in sources:
+    # 注釈 (// から) はのぞく。syscall.rs の file_span は、システムコールの番号ごとの区間の名前の表
+    code = "\n".join(l.split("//")[0] for l in text[s].split("\n"))
+    spans.update(re.findall(r'prof::span\("([^"]+)"\)', code))
+    m = re.search(r"fn file_span\(.*?\n\}\n", code, re.S)
+    if m:
+        spans.update(re.findall(r'=> "([^"]+)"', m.group(0)))
+for sp in sorted(spans):
+    part = sp.split(":")[0]
+    if ":" not in sp:
+        err("prof span %r has no part (name it part:what, part a kernel.json name)" % sp)
+    elif part not in names:
+        err("prof span %r: %s is not a name in kernel.json" % (sp, part))
+
 # .aios.json の kernel (名前だけの一覧) が kernel.json とそろっているか
 with open(os.path.join(root, "..", ".aios.json"), encoding="utf-8") as f:
     summary = json.load(f).get("kernel", {})
@@ -110,5 +132,6 @@ for s, (n, k) in sorted(files.items()):
 print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %d" % (count["core"], lines["core"], count["extra"], lines["extra"], len(quirks)))
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
+print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
 print("kernel-json: %d failed" % len(errors))
 sys.exit(min(len(errors), 125))

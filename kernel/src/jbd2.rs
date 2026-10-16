@@ -318,6 +318,7 @@ impl ExtFs {
     /// meta のブロックを 1 つのトランザクションとしてジャーナルに書く。
     /// 入りきらなければ Ok(false) (呼ぶ側がジャーナルなしで書く)
     pub(super) fn journal_commit(&self, j: &mut Journal, meta: &[u64]) -> Result<bool, i64> {
+        let _p = crate::prof::span("jbd2:commit");
         let tb = j.tag_bytes();
         let tail = if j.v3 { 4 } else { 0 };
         // 記述ブロック 1 つに入るタグの数 (先頭のタグの後ろには UUID が付く)

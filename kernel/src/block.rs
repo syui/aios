@@ -105,6 +105,7 @@ pub fn io_stats(num: usize) -> [u64; 6] {
 
 /// 区画 p の中の sector から読む
 pub fn read_part(p: &Part, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
+    let _p = crate::prof::span("block:read");
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);
     }
@@ -115,6 +116,7 @@ pub fn read_part(p: &Part, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
 }
 
 pub fn write_part(p: &Part, sector: u64, buf: &[u8]) -> Result<(), i64> {
+    let _p = crate::prof::span("block:write");
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);
     }
@@ -156,6 +158,7 @@ pub fn read(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
 
 /// root の区画から、眠って待って読む (extfs の読むだけの道。大きなロックはほかの CPU が使う)
 pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
+    let _p = crate::prof::span("block:read");
     let p = root();
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);

@@ -143,8 +143,8 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 | type | 中身 | 1 行 |
 |---|---|---|
-| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what |
-| `extra` | Linux の口 (syscall、/proc、ioctl、ファイルシステム)、aios の機能、ドライバ。なくてもカーネルは動く | 1 つのファイル: name、src、what (切れるものは off) |
+| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what (測れるものは bench) |
+| `extra` | Linux の口 (syscall、/proc、ioctl、ファイルシステム)、aios の機能、ドライバ。なくてもカーネルは動く | 1 つのファイル: name、src、what (切れるものは off、測れるものは bench) |
 | `quirk` | ある機械やプログラムのつごうで入れた手当て (Linux の quirk と同じ考え)。外せる条件 (`until`) がある | 1 つの手当て: name、src (いくつものファイル)、cause、what、until、test、off |
 
 quirk のところには、ソースに札 `[quirk NAME]` をつける。`python3 test/kernel-json.py` (CI でも) が、kernel/src の .rs が
@@ -160,6 +160,15 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 確かめるのは aish の `box` (aish-vm): 切って VM (`-snapshot`) を起こし、CI と同じテスト (vm-check と vm-ctests) を動かして、
 何も切らないときにはない FAIL を出す (`each` で 1 つずつ全部: どのテストがどれを要るか)。手では `vm` の start に `off`。
 
+### 速さを測る (bench と /proc/ai/prof)
+
+`bench` のあるもの (いまは vfs と extfs) は、その速さを測るものがある。test/fsbench.c は、ファイルのよくある操作 (create、stat、
+ないものの stat、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync) をそれぞれくりかえして、
+1 回あたりの µs (大きなファイルは MB/s) を出す (Linux でも動く)。aish の `bench` (aish-vm) が VM (`-snapshot`) で n 回動かして op ごとの
+まんなかをとり、`prof on` にした 1 回で /proc/ai/prof の part ごとの割合 (どこがボトルネックか) と、時間の多い区間を出す。
+`against` で 2 つのカーネル (たとえば HEAD と作業中のもの) を op ごとにくらべる。結果は build/aish-vm/bench/ にも残る (速くするループ:
+測る → いちばん遅いところを見つける → 直す → くらべる)。区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。
+
 ## カーネルの中を見る (/proc/ai)
 
 止まった・遅いプログラムを調べるための、カーネルの中の様子。AI が読むので、どれも 1 行 1 つの JSON。
@@ -172,7 +181,8 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 | `/proc/ai/stack/TID` | スレッドのレジスタ、スタック (sp から 64 KiB まで)、ファイルを写している地図。aish-sys の `stack` がファイルの `.eh_frame` で呼び出しの並びをたどる |
 | `/proc/ai/bkl` | 大きなロックの統計 (`/proc/bkl` と同じもの): CPU ごとの待ち・持ち、長く持ったシステムコール、デバイスとスケジューラを待った時間、ページフォルトの種類 |
 | `/proc/ai/kernel` | カーネルの地図 (kernel/kernel.json そのもの。だれでも読める) |
-| `/proc/ai/ctl` | 書くスイッチ: `kick PID` (futex で眠っているスレッドをみな起こす。起こしが消えたのか、だれも起こしていないのかを見分ける)、`raw TID` (レジスタとスタックを kmsg に)、`pcmiss on\|off`、`strace NAME`、`bkl reset` |
+| `/proc/ai/prof` | カーネルの中の区間 (`part:what`。part は kernel.json の名前) ごとの回数と時間 (ctl に `prof on` から `prof off` まで): まず part ごとの `self_us` (中の区間をのぞいた、そこだけの時間) と割合 (`pct`。いちばん多いものがボトルネック)、つぎに区間ごとの `count` `total_us` `self_us` `avg_us`。いまはファイルまわり (sysfile、vfs、extfs、vm、block、jbd2) |
+| `/proc/ai/ctl` | 書くスイッチ (root:wheel の 0664): `kick PID` (futex で眠っているスレッドをみな起こす。起こしが消えたのか、だれも起こしていないのかを見分ける)、`raw TID` (レジスタとスタックを kmsg に)、`pcmiss on\|off`、`strace NAME`、`bkl reset`、`prof on\|off` |
 
 Claude は aish-sys の `threads` (絞りこみと fd の中身つき)、`hang` (なぜ止まっているかの見立て: 長く眠っているスレッドと待っているもの、
 残っているデータ、kick して眠りなおすか。pid がなければ、みなを起こさずに見てあやしいものだけ)、`stack` (呼び出しの並び) で使う。`stack` は `.eh_frame` (DWARF の CFI) でたどり、

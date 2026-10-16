@@ -2,7 +2,7 @@
 // 読み書きできるのは root と wheel の人だけ (allowed)。
 //   threads   すべてのスレッド: 状態、最後のシステムコール、眠っていれば何を (futex / 見張っている fd / channel)、
 //             どれだけ (slept_s) 待っているか (proc::ai_threads)
-//   prof      区間ごとの回数と時間 (prof.rs。ctl に prof on で数える)
+//   prof      区間 (part:what) ごとの回数と時間と、part (kernel.json の名前) ごとの割合 (prof.rs。ctl に prof on で数える)
 //   kernel    kernel/kernel.json: ファイルごとの core (起動して /init が動くのに要るもの) と extra、quirk (ある機械や
 //             プログラムのつごうで入れた手当て。cause と until つき) の一覧。だれでも読める
 //   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
@@ -24,8 +24,8 @@
 use alloc::format;
 use alloc::string::String;
 
-/// wheel (sudo できる人。aiosd と同じ)
-const WHEEL: u32 = 10;
+/// wheel (sudo できる人。aiosd と同じ)。/proc/ai/ctl は root:wheel の 0664
+pub const WHEEL: u32 = 10;
 
 /// /proc/ai を読み書きしてよいか: root か wheel の人で、user の namespace の中 (aibox --root) でないこと。
 /// すべてのプロセスの中身 (待っているアドレス、fd、レジスタ) が見えるので。wheel の人はもともと sudo で見られる。

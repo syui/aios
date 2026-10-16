@@ -8,6 +8,8 @@
 //           コミットごとにカーネルを作って VM で test を動かす (変わるのはカーネルだけ。ディスクはいまのもの)
 //   box     カーネルの砂場: kernel.json の extra や quirk を切って (起動の引数 aios.off=。kernel/src/parts.rs) 起こし、
 //           テスト (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときとくらべる。each で 1 つずつ全部
+//   bench   ファイルまわりの速さ (test/fsbench.c) を VM で n 回測り、op ごとのまんなかと、/proc/ai/prof の part
+//           (kernel.json の名前) ごとの時間の割合。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
 //   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
@@ -25,6 +27,7 @@ const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","descri
 const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","description":"C のソース (main のあるもの)"},"file":{"type":"string","description":"code のかわりにソースのファイル"},"lang":{"type":"string","description":"c (既定) か c++"},"cflags":{"type":"array","items":{"type":"string"},"description":"zig cc に足すもの (-lpthread、-DX=1 など)"},"args":{"type":"string","description":"中で動かすときの引数 (シェルの書き方で)"},"timeout":{"type":"number","description":"秒 (既定 30、50 まで)"},"dir":{"type":"string"}}}"#;
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
 const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の extra や quirk のうち off のあるもの。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const BENCH: &str = r#"{"type":"object","properties":{"kernel":{"type":"string","description":"測るカーネル (パス / . / git のコミット。既定 .)"},"against":{"type":"string","description":"くらべるカーネル (あれば。たとえば HEAD)。op ごとに、kernel の時間が against の何倍か"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 3。まんなかを使う)"},"scale":{"type":"integer","description":"fsbench の量 (既定 1)"},"off":{"type":"array","items":{"type":"string"},"description":"切って測る extra や quirk (起動の引数 aios.off=)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
 
 fn main() {
@@ -37,6 +40,7 @@ fn main() {
             "ab" => job_ab(&root, &a),
             "bisect" => job_bisect(&root, &a),
             "box" => job_box(&root, &a),
+            "bench" => job_bench(&root, &a),
             _ => Err(format!("{}: unknown", cmd)),
         };
         match r {
@@ -57,6 +61,7 @@ fn main() {
             Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
+            Tool { name: "bench", desc: "ファイルまわりの速さを測る (test/fsbench.c: create、stat、ないものの stat、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync)。VM (-snapshot) で n 回動かして op ごとの µs (大きなファイルは MB/s) のまんなかと、prof をつけた 1 回で part (kernel.json の名前: sysfile、vfs、extfs、vm、block、jbd2) ごとの時間の割合 (どこがボトルネックか) と、時間の多い区間。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
             Tool { name: "box", desc: "カーネルの砂場: kernel.json の extra や quirk (off のあるもの) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
@@ -71,6 +76,7 @@ fn main() {
                 "ab" => job(&mut jobs, &root, "ab", a),
                 "bisect" => job(&mut jobs, &root, "bisect", a),
                 "box" => job(&mut jobs, &root, "box", a),
+                "bench" => job(&mut jobs, &root, "bench", a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -808,3 +814,146 @@ fn job_box(root: &Path, a: &Value) -> Result<Value, String> {
     }
     Ok(out)
 }
+
+// ---- 速さを測る ----
+
+/// test/fsbench.c を中で動かす静的なプログラムに (build/aish-vm/bench/fsbench。ソースが新しいときだけ作りなおす)
+fn build_fsbench(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("build/aish-vm/bench");
+    let _ = std::fs::create_dir_all(&dir);
+    let (src, out) = (root.join("test/fsbench.c"), dir.join("fsbench"));
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if let (Some(o), Some(s)) = (mtime(&out), mtime(&src)) && o >= s {
+        return Ok(out);
+    }
+    let Some((cc, head)) = compiler(root, false) else { return Err("no compiler: zig or aarch64-linux-gnu-gcc".into()) };
+    let mut args = head;
+    args.extend(["-O2".into(), "-static".into(), "-s".into(), "-o".into(), out.display().to_string(), src.display().to_string()]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (st, _, err, _, _) = sh(root, &cc, &argv, &[], Duration::from_secs(120));
+    if st != 0 {
+        return Err(format!("fsbench: {}", err.trim()));
+    }
+    Ok(out)
+}
+
+/// まんなか、いちばん小さい、大きい
+fn spread(v: &[f64]) -> (f64, f64, f64) {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    (s.get(s.len() / 2).copied().unwrap_or(0.0), s.first().copied().unwrap_or(0.0), s.last().copied().unwrap_or(0.0))
+}
+
+fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
+    let n = a["n"].as_u64().unwrap_or(3).clamp(1, 20) as usize;
+    let scale = a["scale"].as_u64().unwrap_or(1).clamp(1, 100);
+    let off = strings(&a["off"]);
+    if !off.is_empty() {
+        let names = switchable(root)?;
+        if let Some(x) = off.iter().find(|x| !names.contains(x)) {
+            return Err(format!("off: {} cannot be turned off (kernel.json: {})", x, names.join(" ")));
+        }
+    }
+    note(json!({ "step": "fsbench" }));
+    let bin = build_fsbench(root)?;
+    let www = bin.parent().unwrap_or(root).display().to_string();
+    let t = Duration::from_secs(600);
+    // ext4 の上 (ホーム) で動かす。/tmp は tmpfs のこともある
+    let run_cmd = format!("cd ~ && /tmp/fsbench . {}", scale);
+    let measure = |spec: &str| -> Result<Value, String> {
+        note(json!({ "step": "kernel", "spec": spec }));
+        let k = kernel_for(root, spec)?;
+        note(json!({ "step": "boot", "spec": spec }));
+        boot(root, Some(&k), true, &www, &off)?;
+        let (st, out, _, _, _) = vmpy(root, &["run", "fetch http://10.0.2.2:8000/fsbench -o /tmp/fsbench >/dev/null && chmod +x /tmp/fsbench && echo fetched", "-t", "60"], &[], Duration::from_secs(70));
+        if st != 0 || !out.contains("fetched") {
+            return Err(format!("{}: cannot fetch fsbench into the VM: {}", spec, out.trim()));
+        }
+        // 1 回目は捨てる (起動したばかりのキャッシュ)
+        vmpy(root, &["run", &sub(&format!("{} > /dev/null", run_cmd)), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+        // op → 回ごとの値 (µs か MB/s)
+        let mut vals: Vec<(String, &'static str, Vec<f64>)> = Vec::new();
+        let mut totals = Vec::new();
+        for i in 0..n {
+            let (st, out, _, ms, to) = vmpy(root, &["run", &sub(&run_cmd), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+            if st != 0 || to {
+                return Err(format!("{}: fsbench failed (status {}): {}", spec, st, out.lines().rev().take(3).collect::<Vec<_>>().join(" / ")));
+            }
+            for v in out.lines().filter_map(aish_plugin::parse) {
+                if let Some(t) = v["total_ms"].as_f64() {
+                    totals.push(t);
+                }
+                let Some(op) = v["op"].as_str() else { continue };
+                let (unit, x) = match (v["us"].as_f64(), v["mb_s"].as_f64()) {
+                    (Some(us), _) => ("us", us),
+                    (None, Some(mb)) => ("mb_s", mb),
+                    _ => continue,
+                };
+                match vals.iter_mut().find(|e| e.0 == op) {
+                    Some(e) => e.2.push(x),
+                    None => vals.push((op.to_string(), unit, vec![x])),
+                }
+            }
+            note(json!({ "step": "run", "spec": spec, "i": i, "ms": ms }));
+        }
+        // prof をつけて 1 回 (数えるぶん少し遅くなるので、時間は上の回のものを使う)
+        let prof_cmd = format!("echo prof on > /proc/ai/ctl && ({} > /dev/null); echo prof off > /proc/ai/ctl; cat /proc/ai/prof", run_cmd);
+        let (_, pout, _, _, _) = vmpy(root, &["run", &sub(&prof_cmd), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+        let prof: Vec<Value> = pout.lines().filter_map(aish_plugin::parse).collect();
+        let parts: Vec<Value> = prof.iter().filter(|v| v.get("part").is_some()).cloned().collect();
+        let spans: Vec<Value> = prof.iter().filter(|v| v.get("name").is_some()).take(20).cloned().collect();
+        let mut ops = json!({});
+        for (op, unit, v) in &vals {
+            let (med, lo, hi) = spread(v);
+            ops[op.as_str()] = json!({ unit.to_string(): (med * 100.0).round() / 100.0, "min": lo, "max": hi });
+        }
+        let (tmed, _, _) = spread(&totals);
+        let mut r = json!({ "kernel": spec, "path": k.display().to_string(), "total_ms": tmed, "ops": ops, "parts": parts, "spans": spans });
+        if parts.is_empty() {
+            // 数えられなかった (/proc/ai/ctl に書けない、aiproc を切った、など)
+            r["prof_error"] = json!(pout.lines().filter(|l| !l.trim().is_empty()).take(3).collect::<Vec<_>>().join(" / "));
+        }
+        Ok(r)
+    };
+    let spec = a["kernel"].as_str().filter(|x| !x.is_empty()).unwrap_or(".");
+    let against = a["against"].as_str().filter(|x| !x.is_empty());
+    let base = against.map(&measure).transpose()?;
+    let mine = measure(spec)?;
+    vmpy(root, &["stop"], &[], Duration::from_secs(90));
+    let mut out = json!({ "bench": "fs", "n": n, "scale": scale, "result": mine.clone(), "note": "us: microseconds per operation (smaller is faster); mb_s: megabytes per second (bigger is faster). Each kernel ran on a fresh -snapshot VM; the first run is thrown away; parts come from one more run with prof on" });
+    if !off.is_empty() {
+        out["off"] = json!(off);
+    }
+    if let Some(b) = base {
+        // op ごとに、kernel の時間が against の何倍か (1 より小さければ速い)。範囲が重ならなければ clear
+        let mut cmp = Vec::new();
+        if let Some(ops) = mine["ops"].as_object() {
+            for (op, m) in ops {
+                let o = &b["ops"][op];
+                let (unit, mv, ov) = if let Some(us) = m["us"].as_f64() { ("us", us, o["us"].as_f64().unwrap_or(0.0)) } else { ("mb_s", m["mb_s"].as_f64().unwrap_or(0.0), o["mb_s"].as_f64().unwrap_or(0.0)) };
+                if mv <= 0.0 || ov <= 0.0 {
+                    continue;
+                }
+                let time_ratio = if unit == "us" { mv / ov } else { ov / mv };
+                let (mlo, mhi, olo, ohi) = (m["min"].as_f64().unwrap_or(0.0), m["max"].as_f64().unwrap_or(0.0), o["min"].as_f64().unwrap_or(0.0), o["max"].as_f64().unwrap_or(0.0));
+                let clear = mhi < olo || ohi < mlo;
+                let verdict = match (clear, time_ratio < 1.0) {
+                    (false, _) => "no clear difference",
+                    (true, true) => "faster",
+                    (true, false) => "slower",
+                };
+                cmp.push(format!("{}: {:.2}x the time of {} ({})", op, time_ratio, against.unwrap_or(""), verdict));
+            }
+        }
+        out["against"] = b;
+        out["compare"] = json!(cmp);
+    }
+    // 残す: build/aish-vm/bench/UNIX秒.json
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let file = root.join("build/aish-vm/bench").join(format!("{}.json", secs));
+    if std::fs::write(&file, format!("{}\n", out)).is_ok() {
+        out["saved"] = json!(file.display().to_string());
+    }
+    Ok(out)
+}
+

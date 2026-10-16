@@ -270,6 +270,37 @@ fn part_of(nr: u64) -> Option<crate::parts::Part> {
     })
 }
 
+/// 調べもの (prof): ファイルのシステムコールの区間の名前 (kernel.json の sysfile)
+fn file_span(nr: u64) -> Option<&'static str> {
+    use nr::*;
+    Some(match nr {
+        OPENAT => "sysfile:openat",
+        CLOSE => "sysfile:close",
+        READ => "sysfile:read",
+        WRITE => "sysfile:write",
+        PREAD64 => "sysfile:pread64",
+        PWRITE64 => "sysfile:pwrite64",
+        LSEEK => "sysfile:lseek",
+        NEWFSTATAT => "sysfile:newfstatat",
+        FSTAT => "sysfile:fstat",
+        STATX => "sysfile:statx",
+        FACCESSAT | FACCESSAT2 => "sysfile:faccessat",
+        READLINKAT => "sysfile:readlinkat",
+        GETDENTS64 => "sysfile:getdents64",
+        MKDIRAT => "sysfile:mkdirat",
+        UNLINKAT => "sysfile:unlinkat",
+        RENAMEAT | RENAMEAT2 => "sysfile:renameat",
+        SYMLINKAT => "sysfile:symlinkat",
+        LINKAT => "sysfile:linkat",
+        TRUNCATE | FTRUNCATE => "sysfile:truncate",
+        FALLOCATE => "sysfile:fallocate",
+        FSYNC | FDATASYNC | SYNC | SYNCFS => "sysfile:fsync",
+        FCHMODAT => "sysfile:fchmodat",
+        UTIMENSAT => "sysfile:utimensat",
+        _ => return None,
+    })
+}
+
 /// C の int 引数: 下位 32bit を符号拡張する
 fn int(v: u64) -> i64 {
     v as i32 as i64
@@ -312,6 +343,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         strace(nr, &a, Err(-ENOSYS));
         return None;
     }
+    // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
+    let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { file_span(nr).and_then(crate::prof::span) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),

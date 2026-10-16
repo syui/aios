@@ -1025,6 +1025,8 @@ impl ExtFs {
     }
 
     pub fn flush(&self) -> Result<(), i64> {
+        // 書きかえたものをまとめて書き出す (中の block:write と jbd2:commit は引かれる)
+        let _p = crate::prof::span("extfs:flush");
         self.last_flush.set(crate::timer::ticks());
         let (bb, ib) = {
             let mut c = self.cache.borrow_mut();
@@ -1884,6 +1886,8 @@ impl Drop for ExtInode {
             last
         };
         if last && self.fs.orphans.borrow_mut().remove(&self.ino) {
+            // 消したファイルの後片づけ (ブロックと inode を返す)。最後の参照がなくなったところ (unlinkat の中など) で動く
+            let _p = crate::prof::span("extfs:release");
             let fs = &self.fs;
             let res = fs.orphan_del(self.ino).and_then(|_| fs.read_inode(self.ino)).and_then(|mut r| if r.links() == 0 { fs.release(self.ino, &mut r) } else { Ok(()) });
             if res.is_err() || fs.maybe_flush().is_err() {
@@ -2161,6 +2165,8 @@ impl Inode for ExtInode {
         if let Some(m) = self.fs.metas.borrow().get(&self.ino) {
             return *m;
         }
+        // 覚え (metas) になかったものだけ (あれば BTreeMap を 1 度引くだけ)
+        let _p = crate::prof::span("extfs:meta");
         let Ok(r) = self.raw() else {
             return Meta { ino: self.ino as u64, mode: 0, nlink: 0, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
         };
@@ -2194,6 +2200,7 @@ impl Inode for ExtInode {
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+        let _p = crate::prof::span("extfs:read");
         let r = self.raw()?;
         match r.mode() & S_IFMT {
             S_IFREG => self.fs.read_data_raw(self.ino, r, off, buf),
@@ -2211,6 +2218,7 @@ impl Inode for ExtInode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
+        let _p = crate::prof::span("extfs:write");
         // 中身が変わる: ページキャッシュ (vm.rs) にある分を、書く前と後に捨てる (書いているあいだに読まれたものも)
         crate::vm::file_changed(self.id());
         let r = self.not_swapfile().and_then(|_| self.write_op(|| {
@@ -2229,6 +2237,7 @@ impl Inode for ExtInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:truncate");
         // 中身が変わる: ページキャッシュ (vm.rs) にある分を、前と後に捨てる
         crate::vm::file_changed(self.id());
         let r = (|| -> Result<(), i64> {
@@ -2260,6 +2269,7 @@ impl Inode for ExtInode {
 
 
     fn readlink(&self) -> Result<String, i64> {
+        let _p = crate::prof::span("extfs:readlink");
         let r = self.raw()?;
         if r.mode() & S_IFMT != S_IFLNK {
             return Err(-EINVAL);
@@ -2275,11 +2285,13 @@ impl Inode for ExtInode {
     }
 
     fn lookup(&self, name: &str) -> Result<InodeRef, i64> {
+        let _p = crate::prof::span("extfs:lookup");
         self.dir_only()?;
         Ok(self.at(self.fs.find(self.ino, name)?))
     }
 
     fn readdir(&self) -> Result<Vec<DirEntry>, i64> {
+        let _p = crate::prof::span("extfs:readdir");
         self.dir_only()?;
         let generation = self.fs.names_gen.get();
         let ents = self.fs.dir_entries(self.ino)?;
@@ -2316,11 +2328,13 @@ impl Inode for ExtInode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
+        let _p = crate::prof::span("extfs:create");
         crate::vfs::dir_changed(self.id());
         self.write_op(|| self.create_node(name, mode, node))
     }
 
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:link");
         crate::vfs::dir_changed(self.id());
         self.write_op(|| {
             self.dir_only()?;
@@ -2339,17 +2353,20 @@ impl Inode for ExtInode {
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:unlink");
         crate::vfs::dir_changed(self.id());
         self.write_op(|| self.unlink_node(name, rmdir))
     }
 
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:rename");
         crate::vfs::dir_changed(self.id());
         crate::vfs::dir_changed(newdir.id());
         self.write_op(|| self.rename_node(old, newdir, new))
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:setattr");
         crate::vfs::dir_changed(self.id());
         self.write_op(|| {
             self.update(|r| {
@@ -2361,6 +2378,7 @@ impl Inode for ExtInode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:setattr");
         crate::vfs::dir_changed(self.id());
         self.write_op(|| {
             self.update(|r| {
@@ -2378,6 +2396,7 @@ impl Inode for ExtInode {
     }
 
     fn set_mtime(&self, ns: u64) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:setattr");
         self.write_op(|| self.update(|r| put32(&mut r.0, 16, (ns / 1_000_000_000) as u32)))
     }
 

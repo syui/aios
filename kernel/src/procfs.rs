@@ -580,10 +580,14 @@ impl Inode for ProcInode {
     }
 
     fn meta(&self) -> Meta {
-        let (uid, gid) = self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid));
+        let (uid, gid) = match self.node {
+            // root と wheel の人が書ける (aiproc::allowed。書くときにも確かめる)。aibox の中の aish (sudo が効かない) も -w で
+            Node::AiCtl => (0, crate::aiproc::WHEEL),
+            _ => self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid)),
+        };
         let mode = match self.node {
             Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir | Node::AiStackDir => S_IFDIR | 0o555,
-            Node::AiCtl => S_IFREG | 0o644,
+            Node::AiCtl => S_IFREG | 0o664,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::NsDir(_) => S_IFDIR | 0o511,

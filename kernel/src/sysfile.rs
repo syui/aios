@@ -602,7 +602,6 @@ pub fn fstat(fd: u64, st: usize) -> R {
 }
 
 pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
-    let _p = crate::prof::span("newfstatat");
     let path = user_str(pathp)?;
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         return fstat(dirfd as u64, st);

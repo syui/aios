@@ -450,6 +450,11 @@ fn cur() -> Option<usize> {
     unsafe { CURRENT[crate::smp::id()] }
 }
 
+/// いまのスレッドの表の番号 (0..NPROC。起動のときやアイドルなら None。prof.rs がスレッドごとに数えるのに)
+pub fn cur_index() -> Option<usize> {
+    cur()
+}
+
 fn set_cur(v: Option<usize>) {
     unsafe { CURRENT[crate::smp::id()] = v };
 }

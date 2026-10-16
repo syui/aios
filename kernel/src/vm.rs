@@ -182,6 +182,7 @@ pub fn file_changed(id: (usize, u64)) {
 /// ページキャッシュを通して読む (大きなロックを持って。ino は page_cacheable なもの)。ふつうのファイルでなければ
 /// そのまま read_at。読んだページは表に残るので、次からは read_fast (ロックなし) で読める
 pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    let _p = crate::prof::span("vm:read_cached");
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG {
         return ino.read_at(off, buf);
