@@ -1,7 +1,7 @@
 {
   "branch": "unix",
   "arch": "aarch64",
-  "updated": "2026-10-15",
+  "updated": "2026-10-16",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -30,15 +30,14 @@
   },
 
   "kernel": {
-    "boot": ["UEFI (aiboot)", "Linux arm64 Image", "DTB", "Raspberry Pi 3"],
-    "cpu":  ["SMP (PSCI, spin-table)", "GICv2", "GICv3"],
-    "mem":  ["swap", "memfd"],
-    "fs":   ["ext4 (jbd2, htree)", "ext2", "vfat", "tmpfs", "procfs (stat, net, vmstat, diskstats)", "/dev/fd", "initramfs", "inotify"],
-    "dev":  ["virtio-blk", "virtio-net", "virtio-gpu", "virtio-input", "virtio-sound", "SD", "UART", "modules"],
-    "net":  ["IPv4 (TCP, UDP, DHCP)", "ICMP (ping, raw)", "unix sockets (SCM_RIGHTS)"],
-    "proc": ["signal", "futex", "epoll", "pty", "pidfd", "vDSO", "PT_INTERP", "umask", "capget",
-             "seccomp (BPF)", "landlock (fs, net)", "namespace (UTS, NET, PID, mount, user)"],
-    "todo": ["fine-grained lock (BKL)"]
+    "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "kalloc", "heap", "vm", "trap", "irq", "timer", "smp", "dtb",
+              "uart", "console", "kmsg", "tty", "proc", "signal", "syscall", "exec", "file", "sysfile", "vfs", "fs", "tmpfs",
+              "initrd", "cred", "rand"],
+    "extra": ["aiproc", "block", "efi", "epoll", "extfs", "gpu", "htree", "inotify", "input", "jbd2", "landlock", "module",
+              "net", "netif", "ns", "procfs", "prof", "sd", "seccomp", "socket", "sound", "swap", "sysctl", "sysfs", "timerfd",
+              "unix", "vdso", "vfat", "virtio", "virtio_blk", "virtio_net"],
+    "quirk": ["weak-random", "tty-root-fdlink", "sound-min-period", "qemu-uart-burst"],
+    "todo":  ["fine-grained lock (BKL)"]
   },
 
   "pkg": {

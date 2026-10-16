@@ -147,7 +147,8 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 quirk のところには、ソースに札 `[quirk NAME]` をつける。`python3 test/kernel-json.py` (CI でも) が、kernel/src の .rs が
 みなちょうど 1 度ずつ core か extra にあるか、quirk の札と一覧がそろっているかを見て、数 (core と extra の行) と、core が
-extra を使っているところを出す (core を小さくするときの目じるし)。
+extra を使っているところを出す (core を小さくするときの目じるし)。リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
+type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 
 ## カーネルの中を見る (/proc/ai)
 

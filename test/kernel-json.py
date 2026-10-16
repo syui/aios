@@ -4,7 +4,8 @@
 #   extra  Linux の口 (syscall、/proc、ioctl、ファイルシステム)、aios の機能、ドライバ。なくてもカーネルは動く
 #   quirk  ある機械やプログラムのつごうで入れた手当て (Linux の quirk と同じ考え)。原因 (cause) と、外せる条件 (until)
 # core と extra は 1 つのファイルに 1 行で、kernel/src の .rs がみなちょうど 1 度ずつ。quirk は 1 つの手当てに 1 行で、
-# src のファイルには札 [quirk NAME] があり、ソースの札はみな一覧の quirk の src のファイルにある
+# src のファイルには札 [quirk NAME] があり、ソースの札はみな一覧の quirk の src のファイルにある。.aios.json の kernel の
+# core / extra / quirk は、kernel.json の名前をその順に並べたもの
 # 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく)
 import json
 import os
@@ -67,6 +68,17 @@ for s in sources:
             err("%s: [quirk %s] is not in kernel.json" % (s, q))
         elif s not in quirks[q]:
             err("%s: [quirk %s], but %s is not in its src" % (s, q, s))
+
+# .aios.json の kernel (名前だけの一覧) が kernel.json とそろっているか
+with open(os.path.join(root, "..", ".aios.json"), encoding="utf-8") as f:
+    summary = json.load(f).get("kernel", {})
+for t in ("core", "extra", "quirk"):
+    want = [e.get("name") for e in entries if e.get("type") == t]
+    got = summary.get(t)
+    if got != want:
+        got = got if isinstance(got, list) else []
+        lost, more = [n for n in want if n not in got], [n for n in got if n not in want]
+        err(".aios.json kernel.%s is not the %s names of kernel.json in order (missing %s, not in kernel.json %s)" % (t, t, lost, more))
 
 # 数と、core が extra を使っているところ (crate::NAME)
 lines = {t: sum(text[s].count("\n") for s, (_, k) in files.items() if k == t) for t in ("core", "extra")}
