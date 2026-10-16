@@ -509,7 +509,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MINCORE => sys_mincore(a[0] as usize, a[1] as usize, a[2] as usize),
         MSYNC => sys_msync(a[0] as usize, a[1] as usize),
         MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
-        GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize),
+        GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize, a[2] as u32),
         CAPGET => sys_capget(a[0] as usize, a[1] as usize),
         CAPSET => Err(-crate::cred::EPERM),
         // OpenBLAS (numpy) などが呼ぶ。get_mempolicy は MPOL_DEFAULT (0) を返す
@@ -1122,16 +1122,45 @@ fn sys_capget(hdr: usize, data: usize) -> R {
     Ok(0)
 }
 
-/// getrandom: いまは rand の xorshift (暗号には使えない) [quirk weak-random]
-fn sys_getrandom(buf: usize, len: usize) -> R {
+/// getrandom (rand の ChaCha20)。flags は GRND_NONBLOCK (1)、GRND_RANDOM (2)、GRND_INSECURE (4)。
+/// rand がまだ ready でなければ GRND_NONBLOCK は EAGAIN、ほかは待たずに出す (rand.rs)。
+/// Linux と同じく 1 度に 0x7ffff000 バイトまで、ページごとにシグナルを見て (来ていたらそこまでの数を)、
+/// 書けないページに来たらそこまでの数を (はじめからなら EFAULT。写すのはページをまたがない分ずつ)
+fn sys_getrandom(buf: usize, len: usize, flags: u32) -> R {
+    const GRND_NONBLOCK: u32 = 1;
+    const GRND_RANDOM: u32 = 2;
+    const GRND_INSECURE: u32 = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE {
+        return Err(-EINVAL);
+    }
+    if flags & (GRND_NONBLOCK | GRND_INSECURE) == GRND_NONBLOCK && !crate::rand::ready() {
+        return Err(-EAGAIN);
+    }
+    let len = len.min(0x7fff_f000);
+    let mut s = crate::rand::stream();
+    let mut b = [0u8; 256];
     let mut done = 0;
     while done < len {
-        let b = crate::rand::bytes16();
-        let n = b.len().min(len - done);
-        out(buf + done, &b[..n])?;
+        let page = PGSIZE - (buf + done) % PGSIZE;
+        if done > 0 && page == PGSIZE {
+            let p = proc::current();
+            if p.killed || crate::signal::deliverable(p) {
+                break;
+            }
+        }
+        let n = b.len().min(len - done).min(page);
+        s.fill(&mut b[..n]);
+        if let Err(e) = out(buf + done, &b[..n]) {
+            if done == 0 {
+                crate::crypto::wipe(&mut b);
+                return Err(e);
+            }
+            break;
+        }
         done += n;
     }
-    Ok(len as i64)
+    crate::crypto::wipe(&mut b);
+    Ok(done as i64)
 }
 
 fn read_timespec(va: usize) -> Result<u64, i64> {

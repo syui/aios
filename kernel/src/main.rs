@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod aiproc;
+mod bcm2835_rng;
 mod boot;
 mod mmio;
 #[macro_use]
@@ -15,6 +16,7 @@ mod console;
 mod tty;
 mod block;
 mod cred;
+mod crypto;
 mod dtb;
 mod efi;
 mod epoll;
@@ -59,6 +61,7 @@ mod sound;
 mod module;
 mod virtio_blk;
 mod virtio_net;
+mod virtio_rng;
 mod vdso;
 mod vm;
 
@@ -108,6 +111,14 @@ pub extern "C" fn kmain() -> ! {
     timer::init();
     vdso::init();
     uart::init();
+    // 乱数: 起動のときのもと (UEFI がくれたもの、DTB の rng-seed、CPU の RNDR) と、乱数の装置 (virtio-rng かラズパイのもの)。
+    // 使う人 (ネット、exec) より前に
+    efi::take_seed(|b| rand::seed("efi-rng", b));
+    rand::init();
+    if !virtio_rng::init() {
+        bcm2835_rng::init();
+    }
+    rand::summary();
     fs::init();
     net::init();
 

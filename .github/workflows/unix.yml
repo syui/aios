@@ -65,6 +65,11 @@ jobs:
           rustup default stable
           rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarch64-unknown-uefi
 
+      - name: crypto.rs
+        # カーネルの乱数の部品 (kernel/src/crypto.rs の ChaCha20 と BLAKE2s) をこのマシンでビルドして、RFC の例、
+        # Python の hashlib、openssl と答え合わせ
+        run: python3 test/crypto.py
+
       - name: Build disk.img
         run: |
           git config user.name ai

@@ -159,7 +159,7 @@ pub fn init() {
     let mac = EthernetAddress(virtio.mac);
     let mut dev = NetDev { virtio, lo: VecDeque::new() };
     let mut cfg = Config::new(mac.into());
-    cfg.random_seed = crate::rand::next();
+    cfg.random_seed = crate::rand::u64();
     let mut iface = Interface::new(cfg, &mut dev, now());
     set_addrs(&mut iface, None);
     let mut sockets = SocketSet::new(Vec::new());

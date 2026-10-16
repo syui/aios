@@ -4,6 +4,8 @@
 //   /proc/sys/kernel/ostype, osrelease       読むだけ
 //   /proc/sys/kernel/sched_timeslice_ms      ほかに順番をゆずるまで走る長さ (tick の倍数に切り上げ)
 //   /proc/sys/kernel/sched_wakeup_preempt    1 なら、起こされたものが CPU を使い続けているものに割りこむ
+//   /proc/sys/kernel/random/entropy_avail    乱数のもとのビット (256 なら ready。rand.rs)。poolsize は 256
+//   /proc/sys/kernel/random/boot_id, uuid    この起動の UUID (はじめて読んだときに決める) と、読むたびに新しい UUID
 //   /proc/sys/fs/inotify/max_queued_events   inotify にためておくできごとの数
 //   /proc/sys/fs/inotify/max_user_watches    1 つの inotify の watch の数
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
@@ -14,6 +16,7 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::spinlock::SpinLock;
 
 const EINVAL: i64 = 22;
 
@@ -54,6 +57,32 @@ impl Entry {
     }
 }
 
+/// 乱数の UUID (版 4。Linux の /proc/sys/kernel/random/uuid と同じ形)
+fn uuid(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+fn random_uuid() -> String {
+    let mut b = [0u8; 16];
+    crate::rand::fill(&mut b);
+    uuid(b)
+}
+
+/// この起動の boot_id (はじめて読んだときに決める)
+static BOOT_ID: SpinLock<Option<[u8; 16]>> = SpinLock::new(None);
+
+fn boot_id() -> String {
+    let mut g = BOOT_ID.lock();
+    uuid(*g.get_or_insert_with(|| {
+        let mut b = [0u8; 16];
+        crate::rand::fill(&mut b);
+        b
+    }))
+}
+
 /// 数を lo..=hi の中で受ける
 fn num(s: &str, lo: usize, hi: usize) -> Result<usize, i64> {
     s.trim().parse::<usize>().ok().filter(|n| (lo..=hi).contains(n)).ok_or(-EINVAL)
@@ -74,6 +103,10 @@ pub static TABLE: &[Entry] = &[
         }),
     },
     Entry { path: "kernel/sched_wakeup_preempt", get: || format!("{}", SCHED_WAKEUP_PREEMPT.load(Ordering::Relaxed)), set: Some(|s| Ok(SCHED_WAKEUP_PREEMPT.store(num(s, 0, 1)?, Ordering::Relaxed))) },
+    Entry { path: "kernel/random/entropy_avail", get: || format!("{}", crate::rand::entropy()), set: None },
+    Entry { path: "kernel/random/poolsize", get: || "256".to_string(), set: None },
+    Entry { path: "kernel/random/boot_id", get: boot_id, set: None },
+    Entry { path: "kernel/random/uuid", get: random_uuid, set: None },
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/nr_open", get: || format!("{}", crate::proc::NOFILE), set: None },

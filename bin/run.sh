@@ -16,7 +16,7 @@
 #   AIOS_EFI_CODE=FILE  UEFI のファームウェア (既定はよくある場所から探す)。変数は build/efivars.fd
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
-# ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする
+# ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする。乱数のもとに virtio-rng も
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
 # AIOS_MEM=SIZE でメモリ (既定 2G。Claude Code (Bun) は 512M では足りない)
 # AIOS_DISPLAY=1 で画面の窓を出す (virtio-gpu と virtio のキーボード・タブレット。Mac は cocoa、
@@ -133,6 +133,8 @@ if [ -f disk.img ]; then
     -drive file=disk.img,if=none,format=raw,id=hd0 \
     -device virtio-blk-device,drive=hd0
 fi
+# 乱数のもと (ホストの乱数。カーネルの rand が 60 秒ごとに取りにくる。UEFI の EFI_RNG_PROTOCOL にもなる)
+set -- "$@" -device virtio-rng-device
 # 画面: あれば窓とシリアル、なければシリアルだけ (-nographic)。
 # virtio の装置はディスクのあとに足す (前に足すとディスクの場所が変わり、UEFI が起動の項目を見失う)
 out=-nographic

@@ -348,12 +348,9 @@ impl OpenFile {
                 dst.fill(0);
                 Ok(dst.len())
             }
-            // /dev/urandom: いまは rand の xorshift (暗号には使えない) [quirk weak-random]
+            // /dev/random と /dev/urandom: rand の ChaCha20 (どちらも待たない)
             Kind::Random => {
-                for c in dst.chunks_mut(16) {
-                    let b = crate::rand::bytes16();
-                    c.copy_from_slice(&b[..c.len()]);
-                }
+                crate::rand::fill(dst);
                 Ok(dst.len())
             }
             Kind::Inode(ino, path) => {
@@ -394,7 +391,12 @@ impl OpenFile {
             return Err(-EBADF);
         }
         match &self.kind {
-            Kind::Null | Kind::Zero | Kind::Random => Ok(src.len()),
+            Kind::Null | Kind::Zero => Ok(src.len()),
+            // 池にまぜる (だれが書いてもよい。数えはしない: Linux と同じ)
+            Kind::Random => {
+                crate::rand::mix(src);
+                Ok(src.len())
+            }
             Kind::Inode(ino, path) => {
                 if self.flags & O_APPEND != 0 {
                     self.offset = ino.meta().size as usize;

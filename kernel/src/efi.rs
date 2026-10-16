@@ -3,7 +3,7 @@
 // UEFI はこの Image を好きな場所に読み込み、恒等写像の MMU を入れたまま efi_entry を呼ぶ。
 // カーネルは RAM の先頭 + 0x80000 で動く作りなので (boot.rs)、
 //   1. 設定テーブルから DTB を探し、LoadOptions (systemd-boot の options や UEFI シェルの引数) を
-//      カーネルのコマンドラインとして覚える
+//      カーネルのコマンドラインとして覚える。EFI_RNG_PROTOCOL があれば乱数を 32 バイトもらっておく (rand のもと)
 //   2. メモリマップから RAM の先頭を探し、RAM の先頭 + 0x80000 を AllocatePages で押さえる
 //   3. ExitBootServices
 //   4. そこへ自分を写し、キャッシュを掃き出し、MMU とキャッシュを切って primary へ (x0 = DTB)
@@ -25,6 +25,7 @@ const BS_GET_MEMORY_MAP: usize = 0x38;
 const BS_ALLOCATE_POOL: usize = 0x40;
 const BS_HANDLE_PROTOCOL: usize = 0x98;
 const BS_EXIT_BOOT_SERVICES: usize = 0xe8;
+const BS_LOCATE_PROTOCOL: usize = 0x140;
 const ALLOCATE_ADDRESS: usize = 2;
 const LOADER_DATA: usize = 2;
 
@@ -81,6 +82,41 @@ unsafe fn save_options(image: usize, bs: usize, st: usize) {
 }
 
 const DTB_GUID: [u8; 16] = [0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0];
+
+/// EFI_RNG_PROTOCOL (3152bca5-eade-433d-862e-c01cdc291f44)。GetRNG は 2 つめ (+8)
+const RNG_GUID: [u8; 16] = [0xa5, 0xbc, 0x52, 0x31, 0xde, 0xea, 0x3d, 0x43, 0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44];
+
+/// UEFI からもらった乱数: 頭の 1 バイトが長さ。bss は primary で消されるので .data に置く
+#[unsafe(link_section = ".data")]
+static mut SEED: [u8; 33] = [0; 33];
+
+/// EFI_RNG_PROTOCOL があれば 32 バイトを SEED へ (ExitBootServices のあとは使えないので、いま)
+unsafe fn save_seed(bs: usize, st: usize) {
+    unsafe {
+        let locate: extern "efiapi" fn(usize, usize, usize) -> Status = core::mem::transmute(rd64(bs + BS_LOCATE_PROTOCOL));
+        let mut rng = 0usize;
+        if locate(RNG_GUID.as_ptr() as usize, 0, &mut rng as *mut usize as usize) != EFI_SUCCESS || rng == 0 {
+            return;
+        }
+        // GetRNG(This, RNGAlgorithm (NULL: ファームウェアのふつうのもの), RNGValueLength, RNGValue)
+        let get: Fn4 = core::mem::transmute(rd64(rng + 8));
+        let buf = (&raw mut SEED) as *mut u8;
+        if get(rng, 0, 32, buf.add(1) as usize) == EFI_SUCCESS {
+            core::ptr::write_volatile(buf, 32);
+            say(st, b"aios: 32 random bytes from EFI_RNG_PROTOCOL\n");
+        }
+    }
+}
+
+/// UEFI からもらった乱数を f に渡して消す (rand の池へ。なければ呼ばない)
+pub fn take_seed(f: impl FnOnce(&[u8])) {
+    let s = unsafe { &mut *(&raw mut SEED) };
+    let n = (s[0] as usize).min(32);
+    if n > 0 {
+        f(&s[1..1 + n]);
+    }
+    crate::crypto::wipe(s);
+}
 
 core::arch::global_asm!(
     r#"
@@ -223,6 +259,7 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
         }
         let dtb_size = u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize;
         save_options(image, bs, st);
+        save_seed(bs, st);
 
         // 2. メモリマップ (RAM の先頭を探すのと、ExitBootServices の key に使う)
         let get_map: Fn5 = core::mem::transmute(rd64(bs + BS_GET_MEMORY_MAP));

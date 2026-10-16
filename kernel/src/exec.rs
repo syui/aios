@@ -194,7 +194,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let execfn = ptrs[argc + envc];
     let env_start = base + argv.iter().map(|s| s.len() + 1).sum::<usize>();
     let args = (base, env_start, env_start + envp.iter().map(|s| s.len() + 1).sum::<usize>());
-    img[random - sp..random - sp + 16].copy_from_slice(&crate::rand::bytes16());
+    crate::rand::fill(&mut img[random - sp..random - sp + 16]);
 
     let auxv: [(u64, u64); 17] = [
         (AT_PHDR, phdr_va as u64),

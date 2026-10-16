@@ -2034,7 +2034,7 @@ impl ExtInode {
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
         }
-        put32(&mut r.0, 0x64, crate::rand::next() as u32); // i_generation
+        put32(&mut r.0, 0x64, crate::rand::u64() as u32); // i_generation
         if fs.inode_size > 128 {
             put16(&mut r.0, 0x80, 32); // i_extra_isize
         }
