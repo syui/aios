@@ -169,7 +169,8 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 `against` で 2 つのカーネル (たとえば HEAD と作業中のもの) を op ごとにくらべる。結果は build/aish-vm/bench/ にも残る (速くするループ:
 測る → いちばん遅いところを見つける → 直す → くらべる)。区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。
 spinlock、heap、smp は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから
-取って返す、大きなロックを放して取りなおす、時計を読む (uptime_ns) の 1 回の ns (10 万回の平均) を kmsg に出す。
+取って返す、大きなロックを放して取りなおす、時計を読む (uptime_ns) の 1 回の ns (10 万回の平均) を kmsg に出す。aish の `bench` は
+これも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
 
 ## カーネルの中を見る (/proc/ai)
 

@@ -9,7 +9,8 @@
 //   box     カーネルの砂場: kernel.json の extra や quirk を切って (起動の引数 aios.off=。kernel/src/parts.rs) 起こし、
 //           テスト (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときとくらべる。each で 1 つずつ全部
 //   bench   ファイルまわりの速さ (test/fsbench.c) を VM で n 回測り、op ごとのまんなかと、/proc/ai/prof の part
-//           (kernel.json の名前) ごとの時間の割合。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも
+//           (kernel.json の名前) ごとの時間の割合、lockbench (ロックなどの 1 回の時間) のまんなか。against で 2 つの
+//           カーネルをくらべる。結果は build/aish-vm/bench/ にも
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
 //   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
@@ -61,7 +62,7 @@ fn main() {
             Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
-            Tool { name: "bench", desc: "ファイルまわりの速さを測る (test/fsbench.c: create、stat、ないものの stat (2 度目も)、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync)。VM (-snapshot) で n 回動かして op ごとの µs (大きなファイルは MB/s) のまんなかと、prof をつけた 1 回で part (kernel.json の名前: sysfile、vfs、extfs、vm、block、jbd2) ごとの時間の割合 (どこがボトルネックか) と、時間の多い区間。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
+            Tool { name: "bench", desc: "ファイルまわりの速さを測る (test/fsbench.c: create、stat、ないものの stat (2 度目も)、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync)。VM (-snapshot) で n 回動かして op ごとの µs (大きなファイルは MB/s) のまんなかと、prof をつけた 1 回で part (kernel.json の名前: sysfile、vfs、extfs、vm、block、jbd2) ごとの時間の割合 (どこがボトルネックか) と、時間の多い区間。lock は lockbench (/proc/ai/ctl: スピンロック、ヒープ、大きなロック、時計の 1 回の ns) の 5 回のまんなか。against で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
             Tool { name: "box", desc: "カーネルの砂場: kernel.json の extra や quirk (off のあるもの) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
@@ -837,6 +838,29 @@ fn build_fsbench(root: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// lockbench の答え (kmsg の「lockbench: NAME 49.2 ns, NAME 260.7 ns, ...」に LB をつけた行) を、NAME ごとの
+/// まんなか、いちばん小さい、大きい (ns) に。lockbench のないカーネルなら空
+fn lockbench(out: &str) -> Value {
+    let mut vals: Vec<(String, Vec<f64>)> = Vec::new();
+    for l in out.lines().filter_map(|l| l.trim_start().strip_prefix("LB ")) {
+        let Some((_, rest)) = l.split_once("lockbench: ") else { continue };
+        for piece in rest.split(", ") {
+            let Some((name, x)) = piece.trim().strip_suffix(" ns").and_then(|p| p.rsplit_once(' ')) else { continue };
+            let Ok(x) = x.parse::<f64>() else { continue };
+            match vals.iter_mut().find(|e| e.0 == name) {
+                Some(e) => e.1.push(x),
+                None => vals.push((name.to_string(), vec![x])),
+            }
+        }
+    }
+    let mut r = json!({});
+    for (name, v) in &vals {
+        let (med, lo, hi) = spread(v);
+        r[name.as_str()] = json!({ "ns": med, "min": lo, "max": hi });
+    }
+    r
+}
+
 /// まんなか、いちばん小さい、大きい
 fn spread(v: &[f64]) -> (f64, f64, f64) {
     let mut s = v.to_vec();
@@ -896,6 +920,10 @@ fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
             }
             note(json!({ "step": "run", "spec": spec, "i": i, "ms": ms }));
         }
+        // ロックなどの 1 回の時間 (lockbench を 5 回。kmsg の答えに LB をつけて、シリアルに出たカーネルの行と分ける)
+        let lb = "for i in 1 2 3 4 5; do echo lockbench > /proc/ai/ctl; done 2>/dev/null; grep 'lockbench:' /proc/kmsg | tail -5 | sed 's/^/LB /'";
+        let (_, lout, _, _, _) = vmpy(root, &["run", &sub(lb), "-t", "60"], &[], Duration::from_secs(70));
+        let lock = lockbench(&lout);
         // prof をつけて 1 回 (数えるぶん少し遅くなるので、時間は上の回のものを使う)
         let prof_cmd = format!("echo prof on > /proc/ai/ctl && ({} > /dev/null); echo prof off > /proc/ai/ctl; cat /proc/ai/prof", run_cmd);
         let (_, pout, _, _, _) = vmpy(root, &["run", &sub(&prof_cmd), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
@@ -909,6 +937,10 @@ fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
         }
         let (tmed, _, _) = spread(&totals);
         let mut r = json!({ "kernel": spec, "path": k.display().to_string(), "total_ms": tmed, "ops": ops, "parts": parts, "spans": spans });
+        // lockbench のないカーネル (古いもの) なら出さない
+        if lock.as_object().is_some_and(|o| !o.is_empty()) {
+            r["lock"] = lock;
+        }
         if parts.is_empty() {
             // 数えられなかった (/proc/ai/ctl に書けない、aiproc を切った、など)
             r["prof_error"] = json!(pout.lines().filter(|l| !l.trim().is_empty()).take(3).collect::<Vec<_>>().join(" / "));
@@ -920,13 +952,21 @@ fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
     let base = against.map(&measure).transpose()?;
     let mine = measure(spec)?;
     vmpy(root, &["stop"], &[], Duration::from_secs(90));
-    let mut out = json!({ "bench": "fs", "n": n, "scale": scale, "result": mine.clone(), "note": "us: microseconds per operation (smaller is faster); mb_s: megabytes per second (bigger is faster). Each kernel ran on a fresh -snapshot VM; the first run is thrown away; parts come from one more run with prof on" });
+    let mut out = json!({ "bench": "fs", "n": n, "scale": scale, "result": mine.clone(), "note": "us: microseconds per operation (smaller is faster); mb_s: megabytes per second (bigger is faster). Each kernel ran on a fresh -snapshot VM; the first run is thrown away; parts come from one more run with prof on; lock: nanoseconds per lockbench step (median of 5)" });
     if !off.is_empty() {
         out["off"] = json!(off);
     }
     if let Some(b) = base {
         // op ごとに、kernel の時間が against の何倍か (1 より小さければ速い)。範囲が重ならなければ clear
         let mut cmp = Vec::new();
+        let verdict = |m: &Value, o: &Value, faster: bool| {
+            let (mlo, mhi, olo, ohi) = (m["min"].as_f64().unwrap_or(0.0), m["max"].as_f64().unwrap_or(0.0), o["min"].as_f64().unwrap_or(0.0), o["max"].as_f64().unwrap_or(0.0));
+            match (mhi < olo || ohi < mlo, faster) {
+                (false, _) => "no clear difference",
+                (true, true) => "faster",
+                (true, false) => "slower",
+            }
+        };
         if let Some(ops) = mine["ops"].as_object() {
             for (op, m) in ops {
                 let o = &b["ops"][op];
@@ -935,14 +975,17 @@ fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
                     continue;
                 }
                 let time_ratio = if unit == "us" { mv / ov } else { ov / mv };
-                let (mlo, mhi, olo, ohi) = (m["min"].as_f64().unwrap_or(0.0), m["max"].as_f64().unwrap_or(0.0), o["min"].as_f64().unwrap_or(0.0), o["max"].as_f64().unwrap_or(0.0));
-                let clear = mhi < olo || ohi < mlo;
-                let verdict = match (clear, time_ratio < 1.0) {
-                    (false, _) => "no clear difference",
-                    (true, true) => "faster",
-                    (true, false) => "slower",
-                };
-                cmp.push(format!("{}: {:.2}x the time of {} ({})", op, time_ratio, against.unwrap_or(""), verdict));
+                cmp.push(format!("{}: {:.2}x the time of {} ({})", op, time_ratio, against.unwrap_or(""), verdict(m, o, time_ratio < 1.0)));
+            }
+        }
+        // lockbench (どちらのカーネルにもあるもの)
+        if let Some(lk) = mine["lock"].as_object() {
+            for (name, m) in lk {
+                let o = &b["lock"][name];
+                let (Some(mv), Some(ov)) = (m["ns"].as_f64(), o["ns"].as_f64()) else { continue };
+                if mv > 0.0 && ov > 0.0 {
+                    cmp.push(format!("lockbench {}: {:.2}x the time of {} ({})", name, mv / ov, against.unwrap_or(""), verdict(m, o, mv < ov)));
+                }
             }
         }
         out["against"] = b;
@@ -957,3 +1000,25 @@ fn job_bench(root: &Path, a: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lockbench_lines() {
+        // シリアルに出たカーネルの行 (LB がない) は数えない
+        let out = "lockbench: SpinLock lock+unlock 999.0 ns\n\
+                   LB [    9.754366] lockbench: SpinLock lock+unlock 49.2 ns, heap alloc+free 260.7 ns, BKL unlock+lock 661.0 ns, uptime_ns 175.4 ns\n\
+                   LB [   10.009001] lockbench: SpinLock lock+unlock 53.1 ns, heap alloc+free 507.1 ns, BKL unlock+lock 442.7 ns, uptime_ns 204.4 ns\n\
+                   LB [   10.349281] lockbench: SpinLock lock+unlock 46.1 ns, heap alloc+free 251.7 ns, BKL unlock+lock 438.7 ns, uptime_ns 163.7 ns\n";
+        let r = lockbench(out);
+        assert_eq!(r.as_object().map(|o| o.len()), Some(4));
+        assert_eq!(r["SpinLock lock+unlock"]["ns"].as_f64(), Some(49.2));
+        assert_eq!(r["SpinLock lock+unlock"]["max"].as_f64(), Some(53.1));
+        assert_eq!(r["BKL unlock+lock"]["min"].as_f64(), Some(438.7));
+        assert_eq!(r["uptime_ns"]["ns"].as_f64(), Some(175.4));
+        // lockbench のないカーネル
+        assert!(lockbench("sh: write error: Invalid argument\n").as_object().is_some_and(|o| o.is_empty()));
+    }
+}
