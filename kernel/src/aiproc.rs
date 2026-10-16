@@ -3,6 +3,8 @@
 //   threads   すべてのスレッド: 状態、最後のシステムコール、眠っていれば何を (futex / 見張っている fd / channel)、
 //             どれだけ (slept_s) 待っているか (proc::ai_threads)
 //   prof      区間ごとの回数と時間 (prof.rs。ctl に prof on で数える)
+//   kernel    kernel/kernel.json: ファイルごとの core (起動して /init が動くのに要るもの) と extra、quirk (ある機械や
+//             プログラムのつごうで入れた手当て。cause と until つき) の一覧。だれでも読める
 //   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
 //   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの

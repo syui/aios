@@ -1,4 +1,4 @@
-// 乱数もどき (xorshift, カウンタで種まき)。暗号用途には使えない
+// 乱数もどき (xorshift, カウンタで種まき)。暗号用途には使えない [quirk weak-random]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static STATE: AtomicU64 = AtomicU64::new(0);

@@ -40,6 +40,10 @@ jobs:
           # パッケージの版 (0.0.1.rN) にコミットの数を使う
           fetch-depth: 0
 
+      - name: kernel.json
+        # カーネルの地図 (kernel/kernel.json: ファイルごとの core と extra、quirk の一覧) とソースがそろっているか
+        run: python3 test/kernel-json.py
+
       - name: Install tools
         run: |
           sudo apt-get update

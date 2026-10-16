@@ -94,6 +94,8 @@ enum Node {
     AiHeap,
     AiProf,
     AiCtl,
+    /// /proc/ai/kernel: kernel/kernel.json (ファイルごとの core と extra、quirk の一覧)
+    AiKernel,
     AiFdDir,
     AiFd(u32),
     /// /proc/ai/stack と stack/TID (スレッドの番号)
@@ -193,6 +195,7 @@ impl ProcInode {
             Node::AiHeap => 46,
             Node::AiProf => 47,
             Node::AiCtl => 43,
+            Node::AiKernel => 48,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
             Node::AiStackDir => 45,
@@ -266,6 +269,7 @@ impl ProcInode {
             Node::AiHeap => crate::heap::stats_json(),
             Node::AiProf => crate::prof::json(),
             Node::AiCtl => crate::aiproc::CTL_HELP.into(),
+            Node::AiKernel => include_str!("../kernel.json").into(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
@@ -534,7 +538,8 @@ fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     }
 }
 
-/// ファイルの名前があるもの (Kind::Inode) は magic_link でふつうに開くので、ここでは None
+/// /dev/stdin や /proc/self/fd/N の名前のないもの (パイプ、ソケット、端末) は、開きなおさずにそのもの
+/// [quirk tty-root-fdlink]。ファイルの名前があるもの (Kind::Inode) は magic_link でふつうに開くので、ここでは None
 pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
     let (mut dir, mut p) = (String::from(cwd), String::from(path));
     for _ in 0..8 {
@@ -720,6 +725,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "heap") => Node::AiHeap,
             (Node::AiDir, "prof") => Node::AiProf,
             (Node::AiDir, "ctl") => Node::AiCtl,
+            (Node::AiDir, "kernel") => Node::AiKernel,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
@@ -823,6 +829,7 @@ impl Inode for ProcInode {
                 add("heap".into(), Node::AiHeap);
                 add("prof".into(), Node::AiProf);
                 add("ctl".into(), Node::AiCtl);
+                add("kernel".into(), Node::AiKernel);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
             }

@@ -584,7 +584,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
     Ok(n as i64)
 }
 
-/// /dev/stdin や /proc/self/fd/N で、開いているものが名前のないもの (パイプ、ソケット、端末): そのもの。
+/// /dev/stdin や /proc/self/fd/N で、開いているものが名前のないもの (パイプ、ソケット、端末): そのもの [quirk tty-root-fdlink]。
 /// 開くと stat はそれを分ける (Linux はパイプを開きなおし、端末はログインした人のもの。aios の端末は
 /// root のものなので、開きなおすと書けない)。ほかの場所では探さない (ふつうの open を遅くしない)
 fn fd_link(path: &str) -> Option<file::FileRef> {

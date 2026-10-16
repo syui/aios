@@ -1122,6 +1122,7 @@ fn sys_capget(hdr: usize, data: usize) -> R {
     Ok(0)
 }
 
+/// getrandom: いまは rand の xorshift (暗号には使えない) [quirk weak-random]
 fn sys_getrandom(buf: usize, len: usize) -> R {
     let mut done = 0;
     while done < len {

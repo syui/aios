@@ -86,7 +86,7 @@ const INFO_PAUSE: u32 = 0x80000;
 const MAX_BUFFER: u32 = 512 * 1024;
 /// デバイスへ一度に渡す大きさ (1 ページ)
 const CHUNK: usize = PGSIZE;
-/// 周期の最短 (µs)。カーネルの tick も QEMU が音を取りにくる間隔も 10 ms なので、それより短い周期は
+/// 周期の最短 (µs) [quirk sound-min-period]。カーネルの tick も QEMU が音を取りにくる間隔も 10 ms なので、それより短い周期は
 /// 間に合わない。cpal は alsa-lib の選ぶ周期 (短いほう) の 2 倍をバッファにするので、ここで止めないと
 /// 5 ms の周期と 10 ms のバッファになり、10 ms ごとにアンダーランする
 const MIN_PERIOD_US: u64 = 20_000;

@@ -35,7 +35,7 @@ impl Ring {
     fn len(&self) -> usize {
         self.head - self.tail
     }
-    /// FIFO にはいるだけ出す (QEMU の FIFO はいっぱいにならないので、1 回 32 文字まで。残りは割り込みで)。
+    /// FIFO にはいるだけ出す (QEMU の FIFO はいっぱいにならないので、1 回 32 文字まで。残りは割り込みで) [quirk qemu-uart-burst]。
     /// 空になったら送信の割り込みを止める
     fn drain(&mut self) {
         let upto = self.tail + 32;

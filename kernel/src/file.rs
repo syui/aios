@@ -348,6 +348,7 @@ impl OpenFile {
                 dst.fill(0);
                 Ok(dst.len())
             }
+            // /dev/urandom: いまは rand の xorshift (暗号には使えない) [quirk weak-random]
             Kind::Random => {
                 for c in dst.chunks_mut(16) {
                     let b = crate::rand::bytes16();
