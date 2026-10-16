@@ -31,15 +31,17 @@ fn put_page(p: *mut u8) {
     unsafe { USED -= 1 };
 }
 
-/// ファイルの中身をページ (4KiB) の並びで持つ。書いていないところ (None) は 0
+/// ファイルの中身をページ (4KiB) で持つ。書いたページだけを番号で引く表に入れ、ないところ (穴) は 0 として読む
+/// (Linux の tmpfs の xarray と同じく、1 TiB 先に 1 バイト書いても表は 1 つ。前は番号の並び (Vec) を
+/// そこまで伸ばしたので、ヒープを使いきって止まった)
 pub struct Pages {
-    pages: Vec<Option<*mut u8>>,
+    pages: BTreeMap<usize, *mut u8>,
     len: usize,
 }
 
 impl Pages {
     const fn new() -> Self {
-        Pages { pages: Vec::new(), len: 0 }
+        Pages { pages: BTreeMap::new(), len: 0 }
     }
 
     fn read(&self, off: usize, buf: &mut [u8]) -> usize {
@@ -49,8 +51,8 @@ impl Pages {
             let pos = off + done;
             let (pi, po) = (pos / PGSIZE, pos % PGSIZE);
             let k = (PGSIZE - po).min(n - done);
-            match self.pages.get(pi).copied().flatten() {
-                Some(p) => unsafe { core::ptr::copy_nonoverlapping(p.add(po), buf[done..].as_mut_ptr(), k) },
+            match self.pages.get(&pi) {
+                Some(&p) => unsafe { core::ptr::copy_nonoverlapping(p.add(po), buf[done..].as_mut_ptr(), k) },
                 None => buf[done..done + k].fill(0),
             }
             done += k;
@@ -64,14 +66,11 @@ impl Pages {
             let pos = off + done;
             let (pi, po) = (pos / PGSIZE, pos % PGSIZE);
             let k = (PGSIZE - po).min(buf.len() - done);
-            if self.pages.len() <= pi {
-                self.pages.resize(pi + 1, None);
-            }
-            let p = match self.pages[pi] {
-                Some(p) => p,
+            let p = match self.pages.get(&pi) {
+                Some(&p) => p,
                 None => {
                     let p = take_page()?;
-                    self.pages[pi] = Some(p);
+                    self.pages.insert(pi, p);
                     p
                 }
             };
@@ -85,14 +84,14 @@ impl Pages {
     fn truncate(&mut self, len: usize) {
         if len < self.len {
             let keep = len.div_ceil(PGSIZE);
-            for p in self.pages.drain(keep.min(self.pages.len())..).flatten() {
+            for (_, p) in self.pages.split_off(&keep) {
                 put_page(p);
             }
             // 残ったページの後ろを 0 に
-            if len % PGSIZE != 0 {
-                if let Some(Some(p)) = self.pages.get(len / PGSIZE) {
-                    unsafe { core::ptr::write_bytes(p.add(len % PGSIZE), 0, PGSIZE - len % PGSIZE) };
-                }
+            if len % PGSIZE != 0
+                && let Some(&p) = self.pages.get(&(len / PGSIZE))
+            {
+                unsafe { core::ptr::write_bytes(p.add(len % PGSIZE), 0, PGSIZE - len % PGSIZE) };
             }
         }
         self.len = len;
@@ -101,7 +100,7 @@ impl Pages {
 
 impl Drop for Pages {
     fn drop(&mut self) {
-        for p in self.pages.drain(..).flatten() {
+        for (_, p) in core::mem::take(&mut self.pages) {
             put_page(p);
         }
     }
