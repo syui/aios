@@ -762,7 +762,9 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     let c = cred::current();
     parent_writable(&c, &parent)?;
     sticky_ok(&c, &parent, &name)?;
-    let victim = parent.lookup(&name).ok();
+    // 消えたものへの inotify のため。見張っている人がいるときだけ持っておく (持っていると ext4 は、
+    // 消したファイルをまだ使われているものとして orphan のリストに入れ、手を放したときに片づけることになる)
+    let victim = if inotify::active() { parent.lookup(&name).ok() } else { None };
     parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
     let dir = flags & AT_REMOVEDIR != 0;
     // Linux と同じ順: 消えたもの (リンクの数が変わった IN_ATTRIB、なくなれば DELETE_SELF と IGNORED)、それから親に DELETE

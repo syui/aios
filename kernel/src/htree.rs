@@ -418,7 +418,8 @@ impl ExtFs {
 
         // 葉を分ける: ハッシュの順に並べて、後ろ半分を新しいブロックへ
         let mut ents = self.leaf_entries(leaf_pb)?;
-        ents.sort_by_key(|e| hash_of(&e.name));
+        // ハッシュは 1 つに 1 度だけ (sort_by_key はくらべるたびに計算する)
+        ents.sort_by_cached_key(|e| hash_of(&e.name));
         let hashes: Vec<u32> = ents.iter().map(|e| hash_of(&e.name)).collect();
         let mut split = ents.len() / 2;
         // 同じハッシュは同じ側に (ずらせなければ「続き」の印をつける)

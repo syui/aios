@@ -107,23 +107,99 @@ const fn crc_table() -> [u32; 256] {
 
 static CRC_TABLE: [u32; 256] = crc_table();
 
-fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
+/// CRC32C (ext4 と jbd2 のチェックサム。はじめと終わりで反転はしない)。CPU に CRC32 の命令があれば
+/// (ARMv8.1 からは必ず。ラズパイ 3/4 の A53/A72、QEMU、Apple の CPU にもある) 8 バイトずつ、なければ表で 1 バイトずつ
+/// (表では 1 バイトに命令が 5 つほど: QEMU の TCG で 4 KiB のブロックに 100 us ほど)
+fn crc32c(crc: u32, data: &[u8]) -> u32 {
+    if hw_crc() {
+        unsafe { crc32c_hw(crc, data) }
+    } else {
+        crc32c_table(crc, data)
+    }
+}
+
+fn crc32c_table(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc = CRC_TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
     }
     crc
 }
 
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_hw(mut crc: u32, data: &[u8]) -> u32 {
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
+    // 8 バイトにそろったところは u64 で (リトルエンディアンなので、バイトの順に読むのと同じ)
+    let (head, body, tail) = unsafe { data.align_to::<u64>() };
+    for &b in head {
+        crc = __crc32cb(crc, b);
+    }
+    for &w in body {
+        crc = __crc32cd(crc, w);
+    }
+    for &b in tail {
+        crc = __crc32cb(crc, b);
+    }
+    crc
+}
+
+/// CRC32 の命令を使うか (0: まだ見ていない、1: 使わない、2: 使う)。ID_AA64ISAR0_EL1 の CRC32 (19:16) を見て、
+/// 表と同じ答えになるかも 1 度だけ確かめる (ずれたら ext4 のチェックサムがみなこわれるので)
+static HW_CRC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn hw_crc() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    match HW_CRC.load(Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let isar0: u64;
+            unsafe { core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack, preserves_flags)) };
+            // そろっていないところ、u64、のこりのどれも通るように、長さ 61 でずらして
+            let probe: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+            let has = (isar0 >> 16) & 0xf != 0;
+            let ok = has && unsafe { crc32c_hw(!0, &probe[1..62]) } == crc32c_table(!0, &probe[1..62]);
+            HW_CRC.store(if ok { 2 } else { 1 }, Relaxed);
+            match (has, ok) {
+                (true, true) => println!("extfs: crc32c with the CPU's CRC32 instructions"),
+                (true, false) => println!("extfs: crc32c by table (the CPU's CRC32 instructions gave a different answer)"),
+                _ => println!("extfs: crc32c by table (no CRC32 instructions)"),
+            }
+            ok
+        }
+    }
+}
+
 /// ブロックの読み書き。1 ブロックを 1 ページに入れて覚えておく
 impl Cache {
-    /// 書いていないもの (メタデータもファイルの中身も) でない、いちばん古いブロックを 1 つ捨てる
+    /// 書いていないもの (メタデータもファイルの中身も) でない、いちばん古いブロックを 1 つ捨てる。
+    /// order には forget したものも残っているので、map にないものはとばす (頭にあれば捨てる)
     fn evict_one(&mut self) -> bool {
-        let victim = self.order.iter().position(|x| !self.dirty.contains(x) && !self.data.contains(x));
+        while let Some(x) = self.order.front() {
+            if self.map.contains_key(x) {
+                break;
+            }
+            self.order.pop_front();
+        }
+        let victim = self.order.iter().position(|x| self.map.contains_key(x) && !self.dirty.contains(x) && !self.data.contains(x));
         let Some(old) = victim.and_then(|i| self.order.remove(i)) else { return false };
         if let Some(p) = self.map.remove(&old) {
             kalloc::free(p);
         }
         true
+    }
+
+    /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
+    /// みな (16384 まで) なので、外すたびになめると大きなファイルを消すのがブロックの数 × 16384 になる
+    /// (16 MiB で 6700 万回)。残ったものが覚えている数をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
+    fn forget(&mut self, b: u64) {
+        let Some(p) = self.map.remove(&b) else { return };
+        kalloc::free(p);
+        if self.order.len() > 2 * self.map.len() + 64 {
+            // 外したあとにまた入ったものは 2 度ある: 古いほうを残す
+            let mut seen = BTreeSet::new();
+            let map = &self.map;
+            self.order.retain(|x| map.contains_key(x) && seen.insert(*x));
+        }
     }
 }
 
@@ -893,10 +969,7 @@ impl ExtFs {
         // 捨てたブロックは書き出さない (data に残すと、flush がディスクの古い中身を読んで書き戻す)
         c.dirty.remove(&b);
         c.data.remove(&b);
-        if let Some(p) = c.map.remove(&b) {
-            kalloc::free(p);
-            c.order.retain(|&x| x != b);
-        }
+        c.forget(b);
         Ok(())
     }
 
@@ -1973,10 +2046,7 @@ impl ExtInode {
                 if c.dirty.contains(&b) || c.data.contains(&b) {
                     continue;
                 }
-                if let Some(p) = c.map.remove(&b) {
-                    kalloc::free(p);
-                    c.order.retain(|&x| x != b);
-                }
+                c.forget(b);
             }
         }
         Ok(out)
