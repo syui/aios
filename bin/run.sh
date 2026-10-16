@@ -24,6 +24,7 @@
 #   音 (virtio-sound、QEMU 8.2 から) もつける: Mac は coreaudio、ほかは pipewire / pa / alsa のあるもの。
 #   AIOS_SOUND=coreaudio / pipewire / pa / alsa / none (鳴らさない) で選べる。AIOS_SOUND=0 で音の装置なし
 # AIOS_QEMU_ARGS で QEMU に引数を足せる
+# AIOS_DISK=FILE で disk.img のかわりに FILE から起こす (コピーで動かして、あとで外から e2fsck するなど)
 # AIOS_SSH=PORT でホストの 127.0.0.1:PORT を aios の 22 (sshd) につなぐ (既定 2222、0 でつながない)
 #   ssh -p 2222 ai@127.0.0.1 で入れる (aios で sudo ssh-keygen -A && sudo /opt/c/sbin/sshd)
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
@@ -31,6 +32,7 @@
 #   AIOS_GIC=3 で TCG でも GICv3 に
 # AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
+disk=${AIOS_DISK:-disk.img}
 k=$1
 case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
 # 渡されたカーネルがなければ止まる (zsh で「bin/run.sh  # コメント」と打つと # からが引数になる)
@@ -41,13 +43,13 @@ fi
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-if [ -z "$k" ] && [ ! -f disk.img ] && [ -f aios-unix-aarch64.img.zst ]; then
+if [ -z "$k" ] && [ ! -f "$disk" ] && [ -f aios-unix-aarch64.img.zst ]; then
   echo "disk.img: aios-unix-aarch64.img.zst を展開します" >&2
-  zstd -d -q aios-unix-aarch64.img.zst -o disk.img || exit 1
+  zstd -d -q aios-unix-aarch64.img.zst -o "$disk" || exit 1
 fi
 uefi=
 gpt=
-[ -f disk.img ] && [ "$(dd if=disk.img bs=1 skip=512 count=8 2>/dev/null)" = "EFI PART" ] && gpt=1
+[ -f "$disk" ] && [ "$(dd if="$disk" bs=1 skip=512 count=8 2>/dev/null)" = "EFI PART" ] && gpt=1
 if [ -z "$k" ] && [ -n "$gpt" ]; then
   if [ -z "$AIOS_CMDLINE" ]; then
     for f in "$AIOS_EFI_CODE" /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd /usr/share/AAVMF/AAVMF_CODE.fd \
@@ -58,16 +60,16 @@ if [ -z "$k" ] && [ -n "$gpt" ]; then
   fi
   if [ -z "$uefi" ] && command -v mcopy >/dev/null; then
     # 区画 1 (ESP) の始まり: GPT の区画表 (LBA 2) の最初の項目の +32
-    start=$(od -An -tu8 -j $((1024 + 32)) -N 8 disk.img | tr -d ' ')
-    if mcopy -n -i "disk.img@@$((start * 512))" ::/Image "$tmp/boot" 2>/dev/null && [ -s "$tmp/boot" ]; then
+    start=$(od -An -tu8 -j $((1024 + 32)) -N 8 "$disk" | tr -d ' ')
+    if mcopy -n -i "$disk@@$((start * 512))" ::/Image "$tmp/boot" 2>/dev/null && [ -s "$tmp/boot" ]; then
       echo "boot: /boot/Image from the ESP of disk.img" >&2
       k=$tmp/boot
     fi
   fi
 fi
-if [ -z "$k" ] && [ -z "$uefi" ] && [ -z "$gpt" ] && [ -f disk.img ] && command -v debugfs >/dev/null; then
+if [ -z "$k" ] && [ -z "$uefi" ] && [ -z "$gpt" ] && [ -f "$disk" ] && command -v debugfs >/dev/null; then
   for f in /boot/Image /boot/aios; do
-    if debugfs -R "dump $f $tmp/boot" disk.img >/dev/null 2>&1 && [ -s "$tmp/boot" ]; then
+    if debugfs -R "dump $f $tmp/boot" "$disk" >/dev/null 2>&1 && [ -s "$tmp/boot" ]; then
       echo "boot: $f from disk.img" >&2
       k=$tmp/boot
       break
@@ -128,9 +130,9 @@ if [ "$ssh_port" != 0 ]; then
   fi
 fi
 set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
-if [ -f disk.img ]; then
+if [ -f "$disk" ]; then
   set -- "$@" \
-    -drive file=disk.img,if=none,format=raw,id=hd0 \
+    -drive file="$disk",if=none,format=raw,id=hd0 \
     -device virtio-blk-device,drive=hd0
 fi
 # 乱数のもと (ホストの乱数。カーネルの rand が 60 秒ごとに取りにくる。UEFI の EFI_RNG_PROTOCOL にもなる)

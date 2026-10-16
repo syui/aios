@@ -113,10 +113,14 @@ fn at(dirfd: i64, pathp: usize, flags: u64) -> Result<InodeRef, i64> {
 /// at と同じ (パスはもうユーザーから写したもの: newfstatat などが 2 度写さないように)
 fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
     if path.is_empty() {
-        if flags & AT_EMPTY_PATH != 0 {
-            return inode_of(dirfd as u64);
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(-ENOENT);
         }
-        return Err(-ENOENT);
+        // AT_FDCWD なら、いまのディレクトリ
+        if dirfd == AT_FDCWD {
+            return vfs::resolve("", &proc::current().files().cwd.clone(), true);
+        }
+        return inode_of(dirfd as u64);
     }
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     match base_ino(dirfd, path)? {
@@ -134,6 +138,9 @@ fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
         return Err(-ENOENT);
     }
     if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            return Ok(proc::current().files().cwd.trim_start_matches('/').into());
+        }
         let f = file_of(dirfd as u64)?;
         let f = f.borrow();
         return match &f.kind {
@@ -567,15 +574,16 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
-    // O_CREAT: 親までたどってから (そこまでのしくじりが先)、name/ は作らない (あってもなくても EISDIR)、
-    // . .. / はディレクトリ (EISDIR)。Linux の open_last_lookups と do_open
+    // O_CREAT: 親までたどってから (そこまでのしくじりが先)、. .. / はもうあるディレクトリ (O_EXCL なら EEXIST、
+    // でなければ EISDIR。あとに / があっても)、name/ は作らない (あってもなくても EISDIR)。Linux の
+    // open_last_lookups (. と .. を先に見る) と do_open
     if flags & O_CREAT != 0 {
         let p = last_at(dirfd, &path)?;
-        if p.slash {
-            return Err(-EISDIR);
-        }
         if p.last != vfs::Last::Norm {
             return Err(if flags & O_EXCL != 0 { -EEXIST } else { -EISDIR });
+        }
+        if p.slash {
+            return Err(-EISDIR);
         }
     }
     // O_TMPFILE: そのディレクトリに名前のないファイル
@@ -930,7 +938,7 @@ pub fn fstat(fd: u64, st: usize) -> R {
 
 pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
     let path = user_str(pathp)?;
-    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         return fstat(dirfd as u64, st);
     }
     if flags & AT_SYMLINK_NOFOLLOW == 0 && let Some(f) = fd_link(&path) {
@@ -943,18 +951,52 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
 }
 
 /// statx(2): newfstatat と同じものを struct statx で
-pub fn statx(dirfd: i64, pathp: usize, flags: u64, buf: usize) -> R {
-    let path = user_str(pathp)?;
-    let s = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        file_of(dirfd as u64)?.borrow().stat()
+/// Linux の multigrain の時刻のファイルシステム (ext4 と tmpfs)
+fn mgtime(ino: &InodeRef) -> bool {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    matches!(u64::from_le_bytes(ino.statfs()[0..8].try_into().unwrap()), EXT4_SUPER_MAGIC | TMPFS_MAGIC)
+}
+
+pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+    const STATX__RESERVED: u32 = 0x8000_0000;
+    // Linux の statx の順: mask の予約のビットと、SYNC の 2 つともと、知らないフラグ (EINVAL)。パスのまちがい
+    // (空なのに AT_EMPTY_PATH がない ENOENT、読めない EFAULT) は、getname が持ってきてそのあと。それからたどる。
+    // AT_EMPTY_PATH なら NULL でもよい
+    let path = if pathp == 0 && flags & AT_EMPTY_PATH != 0 { Ok(String::new()) } else { user_str(pathp) };
+    if mask & STATX__RESERVED != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+        return Err(-EINVAL);
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
+        return Err(-EINVAL);
+    }
+    let path = path?;
+    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return Err(-ENOENT);
+    }
+    let of_file = |f: &FileRef| {
+        let b = f.borrow();
+        let mg = matches!(&b.kind, Kind::Inode(i, _) if mgtime(i));
+        (b.stat(), mg)
+    };
+    let (s, mg) = if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            let i = vfs::resolve("", &proc::current().files().cwd.clone(), true)?;
+            (Stat::of_inode(&i), mgtime(&i))
+        } else {
+            of_file(&file_of(dirfd as u64)?)
+        }
     } else if flags & AT_SYMLINK_NOFOLLOW == 0
         && let Some(f) = fd_link(&path)
     {
-        f.borrow().stat()
+        of_file(&f)
     } else {
-        Stat::of_inode(&at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW)?)
+        let i = at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW)?;
+        (Stat::of_inode(&i), mgtime(&i))
     };
-    out(buf, &s.to_statx())?;
+    out(buf, &s.to_statx(mask, mg))?;
     Ok(0)
 }
 
@@ -1191,12 +1233,15 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
         return Err(-EINVAL);
     }
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
-    let ino = at(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
+    // AT_EMPTY_PATH で fd が inode でないもの (パイプなど) は、Linux では別のマウント (pipefs) のもの: None
+    let other = flags & AT_EMPTY_PATH != 0 && olddir != AT_FDCWD && user_str(oldp)?.is_empty() && !matches!(file_of(olddir as u64)?.borrow().kind, Kind::Inode(..));
+    let ino = if other { None } else { Some(at(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?) };
     // Linux の順: 元をたどり、新しい名前の親とその名前 (あれば EEXIST)、ファイルシステムがちがえば EXDEV、
     // ディレクトリは最後に EPERM (vfs_link)
     let path = user_str(newp)?;
     let p = last_at(newdir, &path)?;
     new_name(&p)?;
+    let Some(ino) = ino else { return Err(-vfs::EXDEV) };
     if p.dir.id().0 != ino.id().0 {
         return Err(-vfs::EXDEV);
     }
@@ -1413,29 +1458,58 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
 /// fallocate: mode 0 (場所を確保する) だけ。足りなければファイルを伸ばす (中身は 0、ページは使うときに)。
 /// KEEP_SIZE (1) は何もしない。穴をあけるもの (PUNCH_HOLE など) はまだできない
 pub fn fallocate(fd: u64, mode: u64, off: i64, len: i64) -> R {
-    writable_fd(fd)?;
     const EOPNOTSUPP: i64 = 95;
-    const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    const ENODEV: i64 = 19;
+    const EFBIG: i64 = 27;
+    const KEEP_SIZE: u32 = 0x01;
+    const PUNCH_HOLE: u32 = 0x02;
+    const COLLAPSE_RANGE: u32 = 0x08;
+    const ZERO_RANGE: u32 = 0x10;
+    const INSERT_RANGE: u32 = 0x20;
+    const UNSHARE_RANGE: u32 = 0x40;
+    const WRITE_ZEROES: u32 = 0x80;
+    const MODE_MASK: u32 = PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE | WRITE_ZEROES;
+    // Linux の順 (ksys_fallocate と vfs_fallocate): fd (O_PATH も EBADF)、範囲 (EINVAL)、mode の組 (EOPNOTSUPP。
+    // PUNCH_HOLE は KEEP_SIZE といっしょだけ、COLLAPSE / INSERT / WRITE_ZEROES は KEEP_SIZE なしだけ)、書ける口か
+    // (EBADF)、種類 (パイプは ESPIPE、ディレクトリは EISDIR、ほかのふつうのファイルでないものは ENODEV)、
+    // 大きすぎ (EFBIG)、それからファイルシステム
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
     if off < 0 || len <= 0 {
         return Err(-EINVAL);
     }
-    let f = file_of(fd)?;
-    if f.borrow().flags & file::O_ACCMODE == file::O_RDONLY {
+    let mode = mode as u32;
+    if mode & !(MODE_MASK | KEEP_SIZE) != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    let ok = match mode & MODE_MASK {
+        0 | UNSHARE_RANGE | ZERO_RANGE => true,
+        PUNCH_HOLE => mode & KEEP_SIZE != 0,
+        COLLAPSE_RANGE | INSERT_RANGE | WRITE_ZEROES => mode & KEEP_SIZE == 0,
+        _ => false,
+    };
+    if !ok {
+        return Err(-EOPNOTSUPP);
+    }
+    if !f.borrow().writable() {
         return Err(-EBADF);
     }
-    let ino = inode_of(fd)?;
-    match mode {
-        0 => {
-            let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
-            vfs::drop_privs(&ino)?;
-            if (ino.meta().size as usize) < end {
-                ino.truncate(end)?;
-            }
-            Ok(0)
-        }
-        FALLOC_FL_KEEP_SIZE => Ok(0),
-        _ => Err(-EOPNOTSUPP),
+    match f.borrow().stat().mode & S_IFMT {
+        vfs::S_IFIFO => return Err(-file::ESPIPE),
+        vfs::S_IFDIR => return Err(-EISDIR),
+        vfs::S_IFREG => {}
+        _ => return Err(-ENODEV),
     }
+    let end = off.checked_add(len).ok_or(-EFBIG)?;
+    let ino = inode_of(fd)?;
+    if end as u64 > ino.max_bytes() {
+        return Err(-EFBIG);
+    }
+    writable_fd(fd)?;
+    ino.fallocate(mode, off as u64, len as u64, &|| vfs::drop_privs(&ino))?;
+    Ok(0)
 }
 
 pub fn truncate(pathp: usize, len: i64) -> R {
@@ -1552,37 +1626,99 @@ fn id_arg(v: u64) -> Option<u32> {
     (v as u32 != u32::MAX).then_some(v as u32)
 }
 
-/// root は何でも。持ち主は、自分が入っているグループへ変えることだけできる
-fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
-    let c = cred::current();
-    let m = ino.meta();
-    // ユーザーの namespace の中なら、中の番号を外の番号に (地図になければ EINVAL)
-    let uid = crate::ns::take_uid(uid as u32)? as u64;
-    let gid = crate::ns::take_gid(gid as u32)? as u64;
-    let (uid, gid) = (id_arg(uid), id_arg(gid));
+/// chown で変えたあとの mode (Linux の chown_common と setattr_prepare): root でなければ、uid は持ち主が自分のままに
+/// するだけ、gid は持ち主が自分の入っているグループへだけ (EPERM)。ディレクトリでなければ、だれが変えても (変えなくても)
+/// setuid を落とし、setgid はグループが実行できるか、変える人がそのグループでも root でもなければ落とす。落とすのも
+/// mode を変えることなので、持ち主か root だけ (EPERM)
+fn chown_mode(c: &Cred, (cur_uid, cur_gid, mode): (u32, u32, u32), uid: Option<u32>, gid: Option<u32>) -> Result<u32, i64> {
     if c.euid != 0 {
-        let uid_ok = uid.is_none_or(|u| u == m.uid);
-        let gid_ok = gid.is_none_or(|g| g == m.gid || c.in_group(g));
-        if c.euid != m.uid || !uid_ok || !gid_ok {
+        if uid.is_some_and(|u| c.euid != cur_uid || u != cur_uid) {
+            return Err(-cred::EPERM);
+        }
+        if gid.is_some_and(|g| c.euid != cur_uid || (g != cur_gid && !c.in_group(g))) {
             return Err(-cred::EPERM);
         }
     }
-    ino.set_owner(uid, gid)?;
-    // 持ち主が変わった実行ファイルの setuid/setgid は落とす
-    if m.mode & vfs::S_IFMT == vfs::S_IFREG && m.mode & (cred::S_ISUID | cred::S_ISGID) != 0 && (uid.is_some() || gid.is_some()) {
-        ino.set_mode(m.mode & !(cred::S_ISUID | cred::S_ISGID))?;
+    if mode & S_IFMT == vfs::S_IFDIR {
+        return Ok(mode);
+    }
+    let mut kill = cred::S_ISUID;
+    if mode & cred::S_ISGID != 0 && (mode & 0o010 != 0 || !(c.euid == 0 || c.in_group(cur_gid))) {
+        kill |= cred::S_ISGID;
+    }
+    if mode & kill != 0 && c.euid != 0 && c.euid != cur_uid {
+        return Err(-cred::EPERM);
+    }
+    Ok(mode & !kill)
+}
+
+/// ユーザーの namespace の中なら、中の番号を外の番号に (地図になければ EINVAL)。-1 は None
+fn chown_ids(uid: u64, gid: u64) -> Result<(Option<u32>, Option<u32>), i64> {
+    let uid = id_arg(uid).map(crate::ns::take_uid).transpose()?;
+    let gid = id_arg(gid).map(crate::ns::take_gid).transpose()?;
+    Ok((uid, gid))
+}
+
+fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
+    let c = cred::current();
+    let m = ino.meta();
+    let (uid, gid) = chown_ids(uid, gid)?;
+    let mode = chown_mode(&c, (m.uid, m.gid, m.mode), uid, gid)?;
+    if uid.is_some() || gid.is_some() {
+        ino.set_owner(uid, gid)?;
+    }
+    if mode != m.mode {
+        ino.set_mode(mode & 0o7777)?;
     }
     Ok(0)
 }
 
-pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
+/// fd のもの (ファイルとパイプ。パイプは pipefs の inode の持ち主を変える)。O_PATH の fd は、fchown では EBADF、
+/// fchownat の AT_EMPTY_PATH (パスでたどる) ではよい
+fn chown_fd(fd: u64, uid: u64, gid: u64, opath_ok: bool) -> R {
+    use core::sync::atomic::Ordering::Relaxed;
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 && !opath_ok {
+        return Err(-EBADF);
+    }
+    if let Some(p) = pipe_of(fd) {
+        let (uid, gid) = chown_ids(uid, gid)?;
+        let cur = (p.uid.load(Relaxed), p.gid.load(Relaxed), vfs::S_IFIFO | p.perm.load(Relaxed));
+        let mode = chown_mode(&cred::current(), cur, uid, gid)?;
+        if let Some(u) = uid {
+            p.uid.store(u, Relaxed);
+        }
+        if let Some(g) = gid {
+            p.gid.store(g, Relaxed);
+        }
+        p.perm.store(mode & 0o7777, Relaxed);
+        p.ctime.store(crate::timer::epoch_ns(), Relaxed);
+        return Ok(0);
+    }
     writable_fd(fd)?;
-    chown(&inode_of(fd)?, uid, gid)?;
+    let ino = inode_of(fd)?;
+    chown(&ino, uid, gid)?;
     attrib_fd(fd);
     Ok(0)
 }
 
+pub fn fchown(fd: u64, uid: u64, gid: u64) -> R {
+    chown_fd(fd, uid, gid, false)
+}
+
 pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(-EINVAL);
+    }
+    let path = user_str(pathp)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd != AT_FDCWD {
+            return chown_fd(dirfd as u64, uid, gid, true);
+        }
+        let cwd = proc::current().files().cwd.clone();
+        vfs::check_writable(cwd.trim_start_matches('/'))?;
+        return chown(&vfs::resolve("", &cwd, true)?, uid, gid);
+    }
     writable_at(dirfd, pathp, flags)?;
     chown(&at(dirfd, pathp, flags)?, uid, gid)?;
     attrib_at(dirfd, pathp);
@@ -1590,33 +1726,103 @@ pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
 }
 
 pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
-    const UTIME_NOW: u64 = (1 << 30) - 1;
-    const UTIME_OMIT: u64 = (1 << 30) - 2;
-    if pathp == 0 { writable_fd(dirfd as u64)? } else { writable_at(dirfd, pathp, flags)? }
-    let ino = if pathp == 0 { inode_of(dirfd as u64)? } else { at(dirfd, pathp, flags)? };
-    let c = cred::current();
-    let m = ino.meta();
-    // 時刻を指定するのは持ち主か root。「いま」にするだけなら書ければよい
-    if !c.owns(&m) && (times != 0 || !c.may(&m, PW, false)) {
-        return Err(if times != 0 { -cred::EPERM } else { -cred::EACCES });
-    }
-    let mtime = if times == 0 {
-        Some(crate::timer::epoch_ns())
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    // Linux の utimensat の順: 時刻を写し、どちらも OMIT ならパスも見ずに 0。fd (パスが NULL) ならフラグは 0 だけ、
+    // パスなら AT_SYMLINK_NOFOLLOW と AT_EMPTY_PATH だけ (EINVAL)。たどってから ns のまちがい (EINVAL。vfs_utimes)、
+    // 読むだけのマウント (EROFS)、許可
+    let t = if times == 0 {
+        None
     } else {
         let mut b = [0u8; 32];
         proc::current().pt().copy_in(&mut b, times).ok_or(-EFAULT)?;
-        let sec = u64::from_le_bytes(b[16..24].try_into().unwrap());
-        let nsec = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        match nsec {
-            UTIME_OMIT => None,
-            UTIME_NOW => Some(crate::timer::epoch_ns()),
-            _ => Some(sec * 1_000_000_000 + nsec),
-        }
+        let w = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        Some([(w(0), w(1)), (w(2), w(3))])
     };
-    if let Some(t) = mtime {
-        ino.set_mtime(t)?;
+    if t.is_some_and(|t| t[0].1 == UTIME_OMIT && t[1].1 == UTIME_OMIT) {
+        return Ok(0);
     }
-    if pathp == 0 {
+    let null_fd = pathp == 0 && dirfd != AT_FDCWD;
+    if null_fd && flags != 0 {
+        return Err(-EINVAL);
+    }
+    if !null_fd && flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(-EINVAL);
+    }
+    let path = if null_fd { String::new() } else { user_str(pathp)? };
+    // 空のパスで AT_EMPTY_PATH なら、パスでたどる fd (O_PATH でもよい)
+    let by_fd = null_fd || (path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD);
+    let (ino, full) = if by_fd {
+        let f = file_of(dirfd as u64)?;
+        if null_fd && f.borrow().flags & file::O_PATH != 0 {
+            return Err(-EBADF);
+        }
+        // パイプ (pipefs の inode): 持ち主と許可は fstat に見せるもの
+        if let Some(p) = pipe_of(dirfd as u64) {
+            use core::sync::atomic::Ordering::Relaxed;
+            let ns_ok = |ns: i64| ns == UTIME_NOW || ns == UTIME_OMIT || (0..1_000_000_000).contains(&ns);
+            if t.is_some_and(|t| !ns_ok(t[0].1) || !ns_ok(t[1].1)) {
+                return Err(-EINVAL);
+            }
+            let c = cred::current();
+            let m = vfs::Meta { ino: 0, mode: vfs::S_IFIFO | p.perm.load(Relaxed), nlink: 1, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
+            let touch = t.is_none_or(|t| t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW);
+            if !c.owns(&m) {
+                if !touch {
+                    return Err(-cred::EPERM);
+                }
+                if !c.may(&m, PW, false) {
+                    return Err(-cred::EACCES);
+                }
+            }
+            let now = crate::timer::epoch_ns();
+            match t.map(|t| t[1]) {
+                Some((_, UTIME_OMIT)) => {}
+                None | Some((_, UTIME_NOW)) => p.mtime.store(now, Relaxed),
+                Some((sec, ns)) => p.mtime.store(sec.max(0) as u64 * 1_000_000_000 + ns as u64, Relaxed),
+            }
+            p.ctime.store(now, Relaxed);
+            return Ok(0);
+        }
+        let b = f.borrow();
+        match &b.kind {
+            Kind::Inode(i, p) => (i.clone(), String::from(p.trim_start_matches('/'))),
+            _ => return Ok(0),
+        }
+    } else {
+        let full = old_path(dirfd, pathp, flags)?;
+        (at_path(dirfd, &path, flags)?, full)
+    };
+    let ns_ok = |ns: i64| ns == UTIME_NOW || ns == UTIME_OMIT || (0..1_000_000_000).contains(&ns);
+    if t.is_some_and(|t| !ns_ok(t[0].1) || !ns_ok(t[1].1)) {
+        return Err(-EINVAL);
+    }
+    vfs::check_writable(&full)?;
+    // 許可: いまにするだけ (NULL か {NOW, NOW}) なら持ち主か書ける人 (EACCES)、ほかは持ち主か root (EPERM)
+    let c = cred::current();
+    let m = ino.meta();
+    let touch = t.is_none_or(|t| t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW);
+    if !c.owns(&m) {
+        if !touch {
+            return Err(-cred::EPERM);
+        }
+        if !c.may(&m, PW, false) {
+            return Err(-cred::EACCES);
+        }
+    }
+    let now = crate::timer::epoch_ns();
+    let mtime = match t {
+        None => Some(now),
+        Some(t) => match t[1] {
+            (_, UTIME_OMIT) => None,
+            (_, UTIME_NOW) => Some(now),
+            (sec, ns) => Some(sec.max(0) as u64 * 1_000_000_000 + ns as u64),
+        },
+    };
+    if let Some(x) = mtime {
+        ino.set_mtime(x)?;
+    }
+    if by_fd {
         attrib_fd(dirfd as u64);
     } else {
         attrib_at(dirfd, pathp);
@@ -1737,7 +1943,8 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
                     if want > file::PIPE_MAX {
                         return Err(-1); // EPERM
                     }
-                    if want < p.len() {
+                    // 使っている箱が入らなければ EBUSY (Linux の pipe_resize_ring)
+                    if want / 4096 < p.used_slots() {
                         return Err(-16); // EBUSY
                     }
                     p.cap = want;
@@ -2170,6 +2377,24 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     {
         return Ok(Pipe::discard(p, len.min(64 * 1024), nonblock)? as i64);
     }
+    // ふつうのファイル → パイプ: Linux と同じく、ファイルのページのかけらごとの箱に (splice_file_to_pipe)
+    if pin.is_none()
+        && let Some(p) = pipe_of(fd_out)
+        && off_out == 0
+    {
+        let f = file_of(fd_in)?;
+        if matches!(&f.borrow().kind, Kind::Inode(i, _) if i.meta().mode & S_IFMT == vfs::S_IFREG) && f.borrow().readable() {
+            let mut pos = if off_in != 0 { read_off(off_in)? } else { f.borrow().offset as i64 };
+            let nonblock = nonblock || file_of(fd_out)?.borrow().flags & file::O_NONBLOCK != 0;
+            let n = splice_file_to_pipe(&f, &mut pos, &p, len, nonblock)?;
+            if off_in != 0 {
+                out(off_in, &pos.to_le_bytes())?;
+            } else {
+                f.borrow_mut().offset = pos as usize;
+            }
+            return Ok(n as i64);
+        }
+    }
     // 中身を 0 にしない (読んだ分だけ使う)。ロックを持ったまま 64 KB を 0 で埋めるのは高い
     let mut tmp = uninit(len.min(64 * 1024));
     // パイプからは読み減らさずに見て、書けた分だけ取る (書けなければパイプに残す。Linux と同じ)
@@ -2220,13 +2445,283 @@ fn read_off(va: usize) -> Result<i64, i64> {
     Ok(i64::from_le_bytes(b))
 }
 
+/// Linux の MAX_RW_COUNT: 1 回の読み書きの上限 (INT_MAX をページでそろえたもの)
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+/// Linux の rw_verify_area の位置のしらべ: 長さが負 (ssize_t として) か、位置が負か、位置 + 長さがあふれたら EINVAL
+fn verify_pos(pos: i64, len: usize) -> Result<(), i64> {
+    if (len as i64) < 0 || pos < 0 || pos.checked_add(len as i64).is_none() {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+/// 読み手のいないパイプに書こうとした: SIGPIPE (sysfile::write と同じ)
+fn sigpipe() {
+    let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
+    crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
+}
+
+/// ふつうのファイルを、ページキャッシュ (ext4) か inode からそのまま読む (pread と同じ)
+fn read_inode_at(ino: &InodeRef, pos: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    if ino.page_cacheable() { file::read_sleepable(ino, pos, buf) } else { ino.read_at(pos, buf) }
+}
+
+/// ふつうのファイル f の *pos から、パイプ p へ len バイトまで (Linux の splice_file_to_pipe と
+/// filemap_splice_read / shmem_file_splice_read): 箱があくのを待ち (読み手がいなければ SIGPIPE と EPIPE、
+/// nonblock なら EAGAIN)、あいた箱 × 4KiB まで読んで、ファイルの 1 ページの中のかけらごとの箱に入れる。
+/// ファイルの終わりより先は 0。*pos を入れた分すすめる
+fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+    if let Err(e) = Pipe::wait_space(p, nonblock) {
+        if e == -file::EPIPE {
+            sigpipe();
+        }
+        return Err(e);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    // ファイルのほかは splice で読めない (ディレクトリ、パイプ: Linux も EINVAL)
+    let Some((ino, path)) = inode_path(f).filter(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFREG) else { return Err(-EINVAL) };
+    let room = p.borrow().splice_room(*pos as u64, len.min(MAX_RW_COUNT));
+    verify_pos(*pos, room)?;
+    let mut tmp = uninit(room);
+    let n = read_inode_at(&ino, *pos as usize, &mut tmp)?;
+    let done = Pipe::splice_in(p, *pos as u64, &tmp[..n]);
+    *pos += done as i64;
+    if done > 0 {
+        inotify::file_event(&path, &ino, inotify::IN_ACCESS);
+    }
+    Ok(done)
+}
+
+/// ファイル in の pos から len バイトを、ファイル out の opos へ写す (Linux の do_splice_direct で、
+/// copy_file_range と sendfile が使う)。splice_direct_to_actor と同じく、16 ページの内側のパイプに入る分
+/// (位置がページの途中なら、そのぶん少ない) ずつ、読めなくなる (ファイルの終わり) か、書くのが短くなるまで。
+/// 同じファイルなら、書いた分もまた読む。写せたバイト数
+fn copy_inode_range(src: &InodeRef, pos: i64, dst: &InodeRef, opos: i64, len: usize) -> Result<usize, i64> {
+    const PG: usize = crate::memlayout::PGSIZE;
+    let mut done = 0;
+    while done < len {
+        let at_in = pos as usize + done;
+        let mut tmp = uninit((len - done).min(16 * PG - at_in % PG));
+        let r = read_inode_at(src, at_in, &mut tmp);
+        let n = match r {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let at = opos as usize + done;
+        // 書くときに setuid / setgid を落とす (Linux の file_remove_privs)
+        if done == 0 {
+            vfs::drop_privs(dst)?;
+        }
+        let w = match vfs::write_sealed(dst, at, n).and_then(|_| dst.write_at(at, &tmp[..n])) {
+            Ok(w) => w,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        done += w;
+        if w < n {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// copy_file_range(2) (Linux の vfs_copy_file_range): ext4 も tmpfs も自分の copy_file_range を持たないので、
+/// 同じファイルシステムの中は splice で写し、ちがうファイルシステムは EXDEV
+pub fn copy_file_range(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> R {
+    const EOVERFLOW: i64 = 75;
+    // Linux の順: 両方の fd (O_PATH も EBADF)、位置を写し (EFAULT)、flags (EINVAL)、generic_file_rw_checks
+    // (ディレクトリは EISDIR、ふつうのファイルでなければ EINVAL、読めない・書けない・O_APPEND なら EBADF)、
+    // ファイルシステムがちがえば EXDEV、位置 + 長さがあふれたら EOVERFLOW、長さを読むほうの終わりまでに縮め、
+    // 同じファイルで重なれば EINVAL、位置のしらべ (EINVAL)、長さ 0 なら 0
+    let fi = file_of(fd_in)?;
+    let fo = file_of(fd_out)?;
+    if fi.borrow().flags & file::O_PATH != 0 || fo.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    let mut pos_in = if off_in != 0 { read_off(off_in)? } else { fi.borrow().offset as i64 };
+    let mut pos_out = if off_out != 0 { read_off(off_out)? } else { fo.borrow().offset as i64 };
+    if flags as u32 != 0 {
+        return Err(-EINVAL);
+    }
+    let (mi, mo) = (fi.borrow().stat().mode & S_IFMT, fo.borrow().stat().mode & S_IFMT);
+    if mi == vfs::S_IFDIR || mo == vfs::S_IFDIR {
+        return Err(-EISDIR);
+    }
+    if mi != vfs::S_IFREG || mo != vfs::S_IFREG {
+        return Err(-EINVAL);
+    }
+    if !fi.borrow().readable() || !fo.borrow().writable() || fo.borrow().flags & file::O_APPEND != 0 {
+        return Err(-EBADF);
+    }
+    let (Some((ii, pin)), Some((io, pout))) = (inode_path(&fi), inode_path(&fo)) else { return Err(-EINVAL) };
+    if ii.id().0 != io.id().0 {
+        return Err(-vfs::EXDEV);
+    }
+    let count = len as u64;
+    if (pos_in as u64).checked_add(count).is_none() || (pos_out as u64).checked_add(count).is_none() {
+        return Err(-EOVERFLOW);
+    }
+    let size = ii.meta().size;
+    let count = if pos_in >= size as i64 { 0 } else { count.min(size.wrapping_sub(pos_in as u64)) };
+    // 書くほうの大きさの上限 (generic_write_check_limits)
+    const EFBIG: i64 = 27;
+    let max = io.max_bytes() as i64;
+    if pos_out >= max {
+        return Err(-EFBIG);
+    }
+    let count = count.min(max.wrapping_sub(pos_out) as u64) as usize;
+    if ii.id() == io.id() && pos_out as u64 + count as u64 > pos_in as u64 && (pos_out as u64) < pos_in as u64 + count as u64 {
+        return Err(-EINVAL);
+    }
+    verify_pos(pos_in, count)?;
+    verify_pos(pos_out, count)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let n = copy_inode_range(&ii, pos_in, &io, pos_out, count.min(MAX_RW_COUNT))?;
+    if n > 0 {
+        pos_in += n as i64;
+        pos_out += n as i64;
+        if off_in != 0 {
+            out(off_in, &pos_in.to_le_bytes())?;
+        } else {
+            fi.borrow_mut().offset = pos_in as usize;
+        }
+        if off_out != 0 {
+            out(off_out, &pos_out.to_le_bytes())?;
+        } else {
+            fo.borrow_mut().offset = pos_out as usize;
+        }
+        inotify::file_event(&pin, &ii, inotify::IN_ACCESS);
+        inotify::file_event(&pout, &io, inotify::IN_MODIFY);
+    }
+    Ok(n as i64)
+}
+
+/// sendfile(2) (Linux の sendfile64): 位置 (offset) は先に写し、終わったら (しくじっても) 書きもどす
+pub fn sendfile(out_fd: u64, in_fd: u64, offp: usize, count: usize) -> R {
+    let mut pos = if offp != 0 { Some(read_off(offp)?) } else { None };
+    let r = do_sendfile(out_fd, in_fd, pos.as_mut(), count);
+    if let Some(p) = pos {
+        out(offp, &p.to_le_bytes())?;
+    }
+    r
+}
+
+/// Linux の do_sendfile の順: 読むほうの fd (読めなければ EBADF)、位置 (わたされたのに位置のないものなら ESPIPE)、
+/// 位置のしらべ (EINVAL)、書くほうの fd (書けなければ EBADF)。書くほうがパイプならそこへ splice
+/// (splice_file_to_pipe)、ほかは位置のしらべ、O_APPEND なら EINVAL、読むほうに位置がなければ EINVAL
+/// (do_splice_direct)、それから写す
+fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) -> R {
+    let fi = file_of(in_fd)?;
+    if !fi.borrow().readable() {
+        return Err(-EBADF);
+    }
+    let seekable = matches!(fi.borrow().kind, Kind::Inode(..) | Kind::Block(_) | Kind::Fb | Kind::Null | Kind::Zero | Kind::Random);
+    let pos = match ppos.as_deref() {
+        Some(_) if !seekable => return Err(-file::ESPIPE),
+        Some(&p) => p,
+        None => fi.borrow().offset as i64,
+    };
+    verify_pos(pos, count)?;
+    let count = count.min(MAX_RW_COUNT);
+    let fo = file_of(out_fd)?;
+    if !fo.borrow().writable() {
+        return Err(-EBADF);
+    }
+    let out_pos = fo.borrow().offset as i64;
+    // 両方のファイルの大きさの上限 (s_maxbytes) をこえるなら EOVERFLOW (読みはじめがもうこえているとき)、
+    // こえる分は短く
+    const EOVERFLOW: i64 = 75;
+    let maxb = |f: &FileRef| inode_path(f).map_or(i64::MAX, |(i, _)| i.max_bytes() as i64);
+    let max = maxb(&fi).min(maxb(&fo));
+    let mut count = count;
+    if pos.saturating_add(count as i64) > max {
+        if pos >= max {
+            return Err(-EOVERFLOW);
+        }
+        count = (max - pos) as usize;
+    }
+    let n = if let Some(p) = pipe_of(out_fd) {
+        let nonblock = fo.borrow().flags & file::O_NONBLOCK != 0;
+        let mut at = pos;
+        splice_file_to_pipe(&fi, &mut at, &p, count, nonblock)?
+    } else {
+        verify_pos(out_pos, count)?;
+        if fo.borrow().flags & file::O_APPEND != 0 || !seekable {
+            return Err(-EINVAL);
+        }
+        if count == 0 {
+            0
+        } else {
+            // 読めるのはふつうのファイルだけ (ディレクトリは Linux でも splice_read がなく EINVAL)
+            let Some((ii, ipath)) = inode_path(&fi).filter(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFREG) else { return Err(-EINVAL) };
+            let n = match inode_path(&fo) {
+                Some((io, opath)) => {
+                    let n = copy_inode_range(&ii, pos, &io, out_pos, count)?;
+                    if n > 0 {
+                        inotify::file_event(&opath, &io, inotify::IN_MODIFY);
+                    }
+                    n
+                }
+                // 端末、ソケット、/dev/null など: ふつうに書く
+                None => {
+                    let mut done = 0;
+                    while done < count {
+                        let mut tmp = uninit((count - done).min(CHUNK));
+                        let r = read_inode_at(&ii, pos as usize + done, &mut tmp);
+                        let k = match r {
+                            Ok(0) => break,
+                            Ok(k) => k,
+                            Err(e) if done == 0 => return Err(e),
+                            Err(_) => break,
+                        };
+                        let w = match file::write(&fo, &tmp[..k]) {
+                            Ok(w) => w,
+                            Err(e) if done == 0 => {
+                                if e == -file::EPIPE {
+                                    sigpipe();
+                                }
+                                return Err(e);
+                            }
+                            Err(_) => break,
+                        };
+                        done += w;
+                        if w < k {
+                            break;
+                        }
+                    }
+                    done
+                }
+            };
+            if n > 0 {
+                inotify::file_event(&ipath, &ii, inotify::IN_ACCESS);
+                fo.borrow_mut().offset = (out_pos + n as i64) as usize;
+            }
+            n
+        }
+    };
+    if n > 0 {
+        let end = pos + n as i64;
+        match ppos {
+            Some(p) => *p = end,
+            None => fi.borrow_mut().offset = end as usize,
+        }
+    }
+    Ok(n as i64)
+}
+
 /// tee: パイプの中身を読み減らさずに、別のパイプへ写す
 pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
     let (Some(pin), Some(pout)) = (pipe_of(fd_in), pipe_of(fd_out)) else { return Err(-EINVAL) };
-    let room = {
-        let o = pout.borrow();
-        o.cap.saturating_sub(o.len())
-    };
+    let room = pout.borrow().write_room(len.min(64 * 1024));
     let mut tmp = uninit(len.min(room).min(64 * 1024));
     if tmp.is_empty() {
         return Err(-11); // EAGAIN

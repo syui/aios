@@ -97,6 +97,38 @@ impl Pages {
         self.len = len;
     }
 
+    /// [from, to) を 0 に (fallocate の PUNCH_HOLE。Linux の shmem_truncate_range): まるごと入るページは捨てて穴に、
+    /// はしのページは、あれば中の分を 0 に
+    fn punch(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let zero = |pages: &BTreeMap<usize, *mut u8>, pi: usize, a: usize, b: usize| {
+            if let Some(&p) = pages.get(&pi) {
+                unsafe { core::ptr::write_bytes(p.add(a), 0, b - a) };
+            }
+        };
+        if from / PGSIZE == (to - 1) / PGSIZE && (from % PGSIZE != 0 || to % PGSIZE != 0) {
+            zero(&self.pages, from / PGSIZE, from % PGSIZE, (to - 1) % PGSIZE + 1);
+        } else {
+            if from % PGSIZE != 0 {
+                zero(&self.pages, from / PGSIZE, from % PGSIZE, PGSIZE);
+            }
+            if to % PGSIZE != 0 {
+                zero(&self.pages, to / PGSIZE, 0, to % PGSIZE);
+            }
+        }
+        let (first, last) = (from.div_ceil(PGSIZE), to / PGSIZE);
+        if first < last {
+            let mut mid = self.pages.split_off(&first);
+            let mut rest = mid.split_off(&last);
+            for (_, p) in mid {
+                put_page(p);
+            }
+            self.pages.append(&mut rest);
+        }
+    }
+
     /// SEEK_DATA / SEEK_HOLE (Linux の mapping_seek_hole_data: ページがあればデータ)。off はファイルの中
     fn seek(&self, off: usize, hole: bool) -> Result<usize, i64> {
         const ENXIO: i64 = 6;
@@ -416,6 +448,40 @@ impl Inode for TmpInode {
             Node::Dir(_) => return Err(-EISDIR),
             _ => return Err(-EINVAL),
         }
+        self.touch();
+        Ok(())
+    }
+
+    fn fallocate(&self, mode: u32, off: u64, len: u64, modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
+        const KEEP_SIZE: u32 = 0x01;
+        const PUNCH_HOLE: u32 = 0x02;
+        // Linux の shmem_fallocate: できるのは KEEP_SIZE と PUNCH_HOLE だけ。封を見て、うまくいったら file_modified。
+        // 場所をとるとき (mode 0) もページは作らない (Linux でも、書くまで穴として読む)
+        if mode & !(KEEP_SIZE | PUNCH_HOLE) != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        let seals = self.seals.get().unwrap_or(0);
+        let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
+        crate::vm::file_changed(self.id());
+        match &mut *self.node.borrow_mut() {
+            Node::File(d) if mode & PUNCH_HOLE != 0 => {
+                if seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                    return Err(-EPERM);
+                }
+                d.owned()?.punch(off as usize, end);
+            }
+            Node::File(d) => {
+                if seals & F_SEAL_GROW != 0 && end > d.len() {
+                    return Err(-EPERM);
+                }
+                if mode & KEEP_SIZE == 0 && end > d.len() {
+                    d.owned()?.truncate(end);
+                }
+            }
+            _ => return Err(-EOPNOTSUPP),
+        }
+        crate::vm::file_changed(self.id());
+        modified()?;
         self.touch();
         Ok(())
     }

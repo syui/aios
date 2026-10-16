@@ -141,11 +141,23 @@ pub trait Inode {
         Err(-EOPNOTSUPP)
     }
 
+    /// fallocate (Linux の f_op->fallocate)。mode は FALLOC_FL_*。fd、範囲、mode の組、書ける口か、種類 (ふつうの
+    /// ファイル) は sysfile が見てある。modified は file_modified の前半 (setuid と setgid を落とす): Linux のその
+    /// ファイルシステムと同じところで呼び、時刻はファイルシステムが変える。できないものは EOPNOTSUPP
+    fn fallocate(&self, _mode: u32, _off: u64, _len: u64, _modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
+        Err(-EOPNOTSUPP)
+    }
+
     fn set_mode(&self, mode: u32) -> Result<(), i64>;
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64>;
     fn set_mtime(&self, ns: u64) -> Result<(), i64>;
     /// struct statfs
     fn statfs(&self) -> [u8; 120];
+    /// ファイルの大きさの上限 (Linux の s_maxbytes。fallocate の EFBIG、sendfile の EOVERFLOW)。既定は
+    /// MAX_LFS_FILESIZE (tmpfs、パイプなど)
+    fn max_bytes(&self) -> u64 {
+        i64::MAX as u64
+    }
     /// まだディスクに書いていないものを書く (sync、fsync)
     fn sync(&self) -> Result<(), i64> {
         Ok(())
@@ -857,9 +869,9 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
     let no_magic = no_symlinks || resolve & RESOLVE_NO_MAGICLINKS != 0;
     let cred = crate::cred::current();
     let start: Step = (start.1.trim_matches('/').to_string(), start.0, false);
-    // name/ はディレクトリでなければならない (リンクならたどる)
-    let must_dir = path.ends_with('/');
-    let follow = follow || must_dir;
+    // name/ はディレクトリでなければならない (リンクならたどる)。最後のリンクの中身が / で終わるときも
+    let mut must_dir = path.ends_with('/');
+    let mut follow = follow || must_dir;
     // stack[0] がいちばん下: BENEATH と IN_ROOT なら start (その下には出ない)。ほかは、はじめは start で、.. で上に
     // 行くときにルートからの並び (chain) にかえる (at_root: いちばん下がもうルート)
     let mut at_root = false;
@@ -968,6 +980,12 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
                     stack = alloc::vec![r];
                     at_root = true;
                 }
+            }
+            // 最後の名前のリンクの中身が / で終わるなら、たどった先はディレクトリでなければならない (Linux の
+            // lookup_last の LOOKUP_DIRECTORY。その中の最後のリンクもたどる)
+            if todo.is_empty() && t.ends_with('/') {
+                must_dir = true;
+                follow = true;
             }
             // リンクの中身を、残りの前に
             for x in t.split('/').filter(|x| !x.is_empty()).rev() {

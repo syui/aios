@@ -400,13 +400,14 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PREADV | PREADV2 => sysfile::preadv(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PWRITEV | PWRITEV2 => sysfile::pwritev(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
-        STATX => sysfile::statx(int(a[0]), a[1] as usize, a[2], a[4] as usize),
+        STATX => sysfile::statx(int(a[0]), a[1] as usize, a[2], a[3] as u32, a[4] as usize),
         SYNC => {
             crate::vfs::sync_all();
             Ok(0)
         }
         FSYNC | FDATASYNC | SYNCFS => sysfile::fsync(a[0], nr == SYNCFS),
-        SENDFILE | COPY_FILE_RANGE => Err(-ENOSYS),
+        SENDFILE => sysfile::sendfile(a[0], a[1], a[2] as usize, a[3] as usize),
+        COPY_FILE_RANGE => sysfile::copy_file_range(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         CLOSE => sysfile::close(a[0]),
         PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
         GETDENTS64 => sysfile::getdents64(a[0], a[1] as usize, a[2] as usize),

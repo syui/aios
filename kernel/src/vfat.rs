@@ -729,6 +729,23 @@ impl Inode for FatNode {
         r
     }
 
+    /// FAT の大きさは 32 ビット (Linux の fat_fill_super も 0xffffffff)
+    fn max_bytes(&self) -> u64 {
+        0xffff_ffff
+    }
+
+    fn fallocate(&self, mode: u32, off: u64, len: u64, _modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
+        // Linux の fat_fallocate: KEEP_SIZE だけ (場所をとるだけで、見た目は変わらない)。mode 0 は伸ばすだけ
+        if mode & !1 != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        let end = off + len;
+        if mode == 0 && end > self.meta().size {
+            self.truncate(end as usize)?;
+        }
+        Ok(())
+    }
+
     fn truncate(&self, len: usize) -> Result<(), i64> {
         // 中身が変わる: ページキャッシュ (vm.rs) にある分を、前と後に捨てる
         crate::vm::file_changed(self.id());

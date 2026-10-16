@@ -249,7 +249,15 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     match k {
         Kind::Tty(t) => tty::write(t, src, nonblock),
         Kind::PtyMaster(t) => tty::master_write(t, src, nonblock),
-        Kind::PipeWrite(p) | Kind::PipeRw(p) | Kind::Pair(_, p) => Pipe::write(p, src, nonblock),
+        Kind::PipeWrite(p) | Kind::PipeRw(p) => {
+            let n = Pipe::write(p, src, nonblock)?;
+            // Linux の pipe_write は、書けたら時刻を変える
+            if n > 0 {
+                p.touch();
+            }
+            Ok(n)
+        }
+        Kind::Pair(_, p) => Pipe::write(p, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
         Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
         Kind::TimerFd(_) => Err(-EINVAL),
@@ -314,9 +322,15 @@ impl Stat {
     }
 
     /// struct statx (STATX_BASIC_STATS だけ)
-    pub fn to_statx(&self) -> [u8; 256] {
+    /// statx の答え。mask は頼まれたもの。mg (ext4 と tmpfs: Linux の multigrain の時刻) なら、mtime も ctime も
+    /// 頼まれていなければ、その 2 つは出さない (Linux の fill_mg_cmtime)
+    pub fn to_statx(&self, mask: u32, mg: bool) -> [u8; 256] {
+        const MTIME: u32 = 0x40;
+        const CTIME: u32 = 0x80;
+        let cm = !mg || mask & (MTIME | CTIME) != 0;
         let mut b = [0u8; 256];
-        b[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // stx_mask = STATX_BASIC_STATS
+        // stx_mask = STATX_BASIC_STATS (と、なければ mtime / ctime をのぞく)
+        b[0..4].copy_from_slice(&(if cm { 0x7ffu32 } else { 0x7ff & !(MTIME | CTIME) }).to_le_bytes());
         b[4..8].copy_from_slice(&4096u32.to_le_bytes());
         b[16..20].copy_from_slice(&self.nlink.to_le_bytes());
         b[20..24].copy_from_slice(&crate::ns::show_uid(self.uid).to_le_bytes());
@@ -326,7 +340,8 @@ impl Stat {
         b[40..48].copy_from_slice(&self.size.to_le_bytes());
         b[48..56].copy_from_slice(&self.blocks.to_le_bytes());
         // atime, (btime なし), ctime, mtime
-        for (off, ns) in [(64, self.mtime), (96, self.ctime), (112, self.mtime)] {
+        let times: &[(usize, u64)] = if cm { &[(64, self.mtime), (96, self.ctime), (112, self.mtime)] } else { &[(64, self.mtime)] };
+        for &(off, ns) in times {
             b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
             b[off + 8..off + 12].copy_from_slice(&((ns % 1_000_000_000) as u32).to_le_bytes());
         }
@@ -471,7 +486,7 @@ impl OpenFile {
             // dev と ino が同じなら同じファイルとみなす
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 use core::sync::atomic::Ordering::Relaxed;
-                Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
+                Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
             }
             Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
             // 名前のない inode (anon_inode)
@@ -572,15 +587,15 @@ impl OpenFile {
             }
             Kind::PipeWrite(p) => {
                 let p = p.borrow();
-                (false, p.len() < p.cap, p.readers == 0)
+                (false, !p.full(), p.readers == 0)
             }
             Kind::PipeRw(p) => {
                 let p = p.borrow();
-                (p.len() > 0, p.len() < p.cap, false)
+                (p.len() > 0, !p.full(), false)
             }
             Kind::Pair(rx, tx) => {
                 let (rx, tx) = (rx.borrow(), tx.borrow());
-                (rx.len() > 0 || rx.writers == 0, tx.len() < tx.cap, rx.writers == 0 && rx.len() == 0)
+                (rx.len() > 0 || rx.writers == 0, !tx.full(), rx.writers == 0 && rx.len() == 0)
             }
             Kind::Socket(s) => s.borrow().readiness(),
             Kind::Unix(u) => crate::unix::readiness(u),
@@ -919,61 +934,83 @@ pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::a
 pub static FAST_READ: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
-/// ページ (4KiB) をつないだ FIFO
+/// パイプの中身: Linux の pipe_buffer と同じく、ページ (4KiB) ひとつずつの箱の列。箱の数はパイプの大きさ / 4KiB
+/// まで (Linux の max_usage。POLLOUT は箱があいていること)。write は、書く長さの 4KiB の端数が前の箱にまるごと
+/// 入るときだけそこへ足し (merge)、ほかは新しい箱へ (anon_pipe_write)。なので 4KiB (PIPE_BUF) までの write は
+/// 分かれない。splice で入れたもの (ファイルのページのかけら) は足さない箱。読みきった箱はすぐ捨てる (pipe_read)
 struct PageQueue {
-    /// (ページ, 読むところ, 書いたところ)
-    pages: alloc::collections::VecDeque<(*mut u8, usize, usize)>,
+    /// (ページ, 読むところ, 書いたところ, 足してよいか)
+    pages: alloc::collections::VecDeque<(*mut u8, usize, usize, bool)>,
     len: usize,
+    /// 読みきった箱のページを 1 つとっておき、次の箱に使う (Linux の pipe->tmp_page。小さな write と read を
+    /// くりかえすたびに、ページをとって返さないように)
+    spare: Option<*mut u8>,
 }
 
 impl PageQueue {
-    fn push(&mut self, src: &[u8]) -> Result<(), i64> {
-        let mut done = 0;
-        while done < src.len() {
-            let need_new = self.pages.back().is_none_or(|p| p.2 == PGSIZE);
-            if need_new {
-                // 書いたところ (p.2 まで) しか読まないので、0 にしなくてよい
-                let p = crate::kalloc::alloc_dirty().ok_or(-12i64)?; // ENOMEM
-                self.pages.push_back((p, 0, 0));
-            }
-            let last = self.pages.back_mut().unwrap();
-            let k = (PGSIZE - last.2).min(src.len() - done);
-            unsafe { core::ptr::copy_nonoverlapping(src[done..].as_ptr(), last.0.add(last.2), k) };
-            last.2 += k;
-            done += k;
-        }
-        self.len += src.len();
-        Ok(())
+    const fn new() -> Self {
+        PageQueue { pages: alloc::collections::VecDeque::new(), len: 0, spare: None }
     }
 
-    /// 全部入れるか、何も入れない (ページが足りなければ Err で、中身は変えない)
-    fn push_all(&mut self, src: &[u8]) -> Result<(), i64> {
-        let room = self.pages.back().map_or(0, |p| PGSIZE - p.2);
-        let need = src.len().saturating_sub(room).div_ceil(PGSIZE);
-        let mut fresh = Vec::with_capacity(need);
-        for _ in 0..need {
-            match crate::kalloc::alloc_dirty() {
-                Some(p) => fresh.push(p),
-                None => {
-                    for p in fresh {
-                        crate::kalloc::free(p);
-                    }
+    /// 新しい箱のページ (書いたところしか読まないので、0 にしなくてよい)
+    fn page(&mut self) -> Option<*mut u8> {
+        self.spare.take().or_else(crate::kalloc::alloc_dirty)
+    }
+
+    /// 読みきった箱のページを返す
+    fn release(&mut self, p: *mut u8) {
+        if self.spare.is_none() {
+            self.spare = Some(p);
+        } else {
+            crate::kalloc::free(p);
+        }
+    }
+
+    /// 箱が slots こまでのパイプに n バイトを write したら、いま入るバイト数。merge は前の箱に足してよいか
+    /// (write の初めだけ)
+    fn write_room(&self, n: usize, slots: usize, merge: bool) -> usize {
+        let free = slots.saturating_sub(self.pages.len());
+        let chars = n % PGSIZE;
+        let merged = if merge && chars != 0 && self.pages.back().is_some_and(|b| b.3 && b.2 + chars <= PGSIZE) { chars } else { 0 };
+        merged + (n - merged).min(free * PGSIZE)
+    }
+
+    /// write の 1 回分: 入るだけ入れて (write_room と同じだけ)、入れたバイト数。ページがとれなければ、何も入れて
+    /// いなければ ENOMEM
+    fn push_write(&mut self, src: &[u8], slots: usize, merge: bool) -> Result<usize, i64> {
+        let mut done = 0;
+        let chars = src.len() % PGSIZE;
+        if merge
+            && chars != 0
+            && let Some(b) = self.pages.back_mut()
+            && b.3
+            && b.2 + chars <= PGSIZE
+        {
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), b.0.add(b.2), chars) };
+            b.2 += chars;
+            done = chars;
+        }
+        while done < src.len() && self.pages.len() < slots {
+            let Some(p) = self.page() else {
+                if done == 0 {
                     return Err(-12); // ENOMEM
                 }
-            }
-        }
-        let mut done = 0;
-        let mut fresh = fresh.into_iter();
-        while done < src.len() {
-            if self.pages.back().is_none_or(|p| p.2 == PGSIZE) {
-                self.pages.push_back((fresh.next().unwrap(), 0, 0));
-            }
-            let last = self.pages.back_mut().unwrap();
-            let k = (PGSIZE - last.2).min(src.len() - done);
-            unsafe { core::ptr::copy_nonoverlapping(src[done..].as_ptr(), last.0.add(last.2), k) };
-            last.2 += k;
+                break;
+            };
+            let k = PGSIZE.min(src.len() - done);
+            unsafe { core::ptr::copy_nonoverlapping(src[done..].as_ptr(), p, k) };
+            self.pages.push_back((p, 0, k, true));
             done += k;
         }
+        self.len += done;
+        Ok(done)
+    }
+
+    /// splice で入れるかけら (ファイルの 1 ページの中のもの。空でなく 4KiB まで) を、足さない箱ひとつに
+    fn push_piece(&mut self, src: &[u8]) -> Result<(), i64> {
+        let p = self.page().ok_or(-12i64)?; // ENOMEM
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len()) };
+        self.pages.push_back((p, 0, src.len(), false));
         self.len += src.len();
         Ok(())
     }
@@ -983,12 +1020,12 @@ impl PageQueue {
         n = n.min(self.len);
         self.len -= n;
         while n > 0 {
-            let (p, r, w) = self.pages[0];
+            let (p, r, w, _) = self.pages[0];
             let k = (w - r).min(n);
             self.pages[0].1 += k;
             n -= k;
-            if self.pages[0].1 == PGSIZE {
-                crate::kalloc::free(p);
+            if r + k == w {
+                self.release(p);
                 self.pages.pop_front();
             }
         }
@@ -999,14 +1036,14 @@ impl PageQueue {
         let mut done = 0;
         let mut i = 0;
         while done < dst.len() && i < self.pages.len() {
-            let (p, r, w) = self.pages[i];
+            let (p, r, w, _) = self.pages[i];
             let k = (w - r).min(dst.len() - done);
             unsafe { core::ptr::copy_nonoverlapping(p.add(r), dst[done..].as_mut_ptr(), k) };
             done += k;
             if consume {
                 self.pages[i].1 += k;
-                if self.pages[i].1 == PGSIZE {
-                    crate::kalloc::free(p);
+                if r + k == w {
+                    self.release(p);
                     self.pages.pop_front();
                     continue;
                 }
@@ -1022,7 +1059,10 @@ impl PageQueue {
 
 impl Drop for PageQueue {
     fn drop(&mut self) {
-        for (p, _, _) in self.pages.drain(..) {
+        for (p, _, _, _) in self.pages.drain(..) {
+            crate::kalloc::free(p);
+        }
+        if let Some(p) = self.spare.take() {
             crate::kalloc::free(p);
         }
     }
@@ -1222,16 +1262,24 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
             let n = crate::vm::with_cached(ino.id(), off, len, |parts| {
                 let total: usize = parts.iter().map(|x| x.len()).sum();
                 let mut pp = p.borrow_mut();
-                if pp.readers == 0 || pp.cap.saturating_sub(pp.data.len) < total {
+                // ファイルのページのかけらごとに箱ひとつ (Linux の splice と同じ)。全部入るときだけ
+                if pp.readers == 0 || pp.splice_room(off as u64, total) < total {
                     return false;
                 }
                 if off_in != 0 && !me.pt().copy_out_nofault(off_in, &((off + total) as i64).to_le_bytes()) {
                     return false;
                 }
+                let mut pos = off;
                 for x in parts {
-                    if pp.data.push_all(x).is_err() {
-                        // ページがとれなかった: 入れた分はそのまま (大きなロックの道でも同じく途中までになる)
-                        break;
+                    let mut i = 0;
+                    while i < x.len() {
+                        let k = (PGSIZE - pos % PGSIZE).min(x.len() - i);
+                        if pp.data.push_piece(&x[i..i + k]).is_err() {
+                            // ページがとれなかった: 入れた分はそのまま (大きなロックの道でも同じく途中までになる)
+                            break;
+                        }
+                        i += k;
+                        pos += k;
                     }
                 }
                 pp.generation += 1;
@@ -1301,6 +1349,9 @@ pub struct PipeCell {
     pub uid: core::sync::atomic::AtomicU32,
     pub gid: core::sync::atomic::AtomicU32,
     pub perm: core::sync::atomic::AtomicU32,
+    /// 時刻 (ns)。書くと変わり (Linux の pipe_write の file_update_time)、utimensat で決められる
+    pub mtime: core::sync::atomic::AtomicU64,
+    pub ctime: core::sync::atomic::AtomicU64,
 }
 
 pub struct PipeGuard<'a> {
@@ -1311,8 +1362,18 @@ pub struct PipeGuard<'a> {
 impl PipeCell {
     pub fn new(p: Pipe) -> Self {
         use core::sync::atomic::AtomicU32;
+        use core::sync::atomic::AtomicU64;
         let c = crate::cred::current();
-        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600) }
+        let t = crate::timer::epoch_ns();
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600), mtime: AtomicU64::new(t), ctime: AtomicU64::new(t) }
+    }
+
+    /// 中身が変わった: mtime と ctime をいまに
+    pub fn touch(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let t = crate::timer::epoch_ns();
+        self.mtime.store(t, Relaxed);
+        self.ctime.store(t, Relaxed);
     }
 
     pub fn borrow_mut(&self) -> PipeGuard<'_> {
@@ -1352,13 +1413,93 @@ impl core::ops::DerefMut for PipeGuard<'_> {
 
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
-        let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        let q = PageQueue::new();
         let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
     pub fn len(&self) -> usize {
         self.data.len
+    }
+
+    /// 箱の数 (Linux の max_usage: パイプの大きさ / 4KiB)
+    pub fn slots(&self) -> usize {
+        (self.cap / PGSIZE).max(1)
+    }
+
+    /// 使っている箱の数
+    pub fn used_slots(&self) -> usize {
+        self.data.pages.len()
+    }
+
+    /// 箱がみなうまっている (Linux の pipe_full。write は端数を前の箱に足せるときのほか、入らない)
+    pub fn full(&self) -> bool {
+        self.used_slots() >= self.slots()
+    }
+
+    /// n バイトの write (の初め) が、いま入るバイト数
+    pub fn write_room(&self, n: usize) -> usize {
+        self.data.write_room(n, self.slots(), true)
+    }
+
+    /// splice で、ファイルの位置 pos から len バイトまでを入れるとき (Linux の filemap_splice_read と
+    /// shmem_file_splice_read): 長さはあいた箱 × 4KiB まで、ファイルの 1 ページの中のかけらごとに箱ひとつ。
+    /// 入るバイト数
+    pub fn splice_room(&self, pos: u64, len: usize) -> usize {
+        let free = self.slots().saturating_sub(self.used_slots());
+        let mut len = len.min(free * PGSIZE);
+        let (mut done, mut pos, mut n) = (0, pos, 0);
+        while len > 0 && n < free {
+            let k = (PGSIZE - (pos % PGSIZE as u64) as usize).min(len);
+            done += k;
+            len -= k;
+            pos += k as u64;
+            n += 1;
+        }
+        done
+    }
+
+    /// splice でパイプに入れる前に、箱があくのを待つ (Linux の wait_for_space): 読み手がいなければ EPIPE
+    /// (SIGPIPE は呼ぶほうで)、いっぱいなら nonblock は EAGAIN、ほかは待つ
+    pub fn wait_space(p: &Rc<PipeCell>, nonblock: bool) -> Result<(), i64> {
+        loop {
+            let pp = p.borrow_mut();
+            if pp.readers == 0 {
+                return Err(-EPIPE);
+            }
+            if !pp.full() {
+                return Ok(());
+            }
+            if nonblock {
+                return Err(-11); // EAGAIN
+            }
+            Pipe::sleep(p, pp)?;
+        }
+    }
+
+    /// splice で入れる: ファイルの位置 pos から読んだ data を、ファイルの 1 ページの中のかけらごとに足さない箱へ
+    /// (あいている箱の分だけ)。入れたバイト数。読み手を起こす
+    pub fn splice_in(p: &Rc<PipeCell>, mut pos: u64, data: &[u8]) -> usize {
+        let mut done = 0;
+        {
+            let mut pp = p.borrow_mut();
+            while done < data.len() && !pp.full() {
+                let k = (PGSIZE - (pos % PGSIZE as u64) as usize).min(data.len() - done);
+                if pp.data.push_piece(&data[done..done + k]).is_err() {
+                    break;
+                }
+                done += k;
+                pos += k as u64;
+            }
+            if done > 0 {
+                pp.generation += 1;
+                pp.wrote += done as u64;
+            }
+        }
+        if done > 0 {
+            Pipe::wake(p);
+        }
+        done
     }
 
     /// FIFO を開く。相手 (読み手なら書き手) が来るまで待つ (nonblock なら待たない)
@@ -1403,7 +1544,7 @@ impl Pipe {
 
     /// socketpair: 向かい合わせにつないだ 2 本のパイプ
     pub fn pair() -> (Kind, Kind) {
-        let q = || PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        let q = || PageQueue::new();
         let mk = || Rc::new(PipeCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
         let (a, b) = (mk(), mk());
         (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
@@ -1411,7 +1552,7 @@ impl Pipe {
 
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<PipeCell> {
-        let q = PageQueue { pages: alloc::collections::VecDeque::new(), len: 0 };
+        let q = PageQueue::new();
         Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }))
     }
 
@@ -1449,10 +1590,11 @@ impl Pipe {
                 return Err(5);
             }
             let mut pp = p.borrow_mut();
-            if pp.readers == 0 || pp.cap.saturating_sub(pp.data.len) < len {
+            if pp.readers == 0 || pp.write_room(len) < len {
                 return Err(8);
             }
-            pp.data.push_all(&tmp).map_err(|_| 9usize)?;
+            let slots = pp.slots();
+            pp.data.push_write(&tmp, slots, true).map_err(|_| 9usize)?;
             pp.generation += 1;
             pp.wrote += len as u64;
             let wake = pp.sleepers > 0 || pp.watchers > 0 || pp.epolled;
@@ -1545,9 +1687,11 @@ impl Pipe {
         }
     }
 
-    /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN
+    /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN。入れ方は Linux の anon_pipe_write
+    /// (PageQueue): 初めに端数を前の箱に足せたら足し、あとは箱があくだけ
     fn write(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut done = 0;
+        let mut first = true;
         while done < src.len() {
             let before = done;
             {
@@ -1555,8 +1699,7 @@ impl Pipe {
                 if pp.readers == 0 {
                     return if done > 0 { Ok(done) } else { Err(-EPIPE) };
                 }
-                let room = pp.cap.saturating_sub(pp.data.len);
-                let k = room.min(src.len() - done);
+                let k = pp.data.write_room(src.len() - done, pp.slots(), first);
                 if k > 0 {
                     if done == 0 && src.len() >= 20 {
                         if pp.heads.len() >= 32 {
@@ -1572,11 +1715,17 @@ impl Pipe {
                             e.1 = nth;
                         }
                     }
-                    pp.data.push(&src[done..done + k])?;
+                    let slots = pp.slots();
+                    let k = match pp.data.push_write(&src[done..], slots, first) {
+                        Ok(k) => k,
+                        Err(e) if done == 0 => return Err(e),
+                        Err(_) => return Ok(done),
+                    };
                     pp.generation += 1;
                     pp.wrote += k as u64;
                     done += k;
                 }
+                first = false;
             }
             // 入れたときだけ起こす (いっぱいで入れられなかった書き手どうしが、起こしあって回りつづけないように)
             if done > before {
@@ -1589,7 +1738,7 @@ impl Pipe {
                 }
                 // いっぱいのまま (起こしたあとに読まれていなければ) 眠る
                 let pp = p.borrow_mut();
-                if pp.readers > 0 && pp.data.len >= pp.cap
+                if pp.readers > 0 && pp.full()
                     && let Err(e) = Pipe::sleep(p, pp)
                 {
                     return if done > 0 { Ok(done) } else { Err(e) };

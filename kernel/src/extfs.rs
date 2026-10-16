@@ -232,6 +232,9 @@ pub struct ExtFs {
     csum_seed: u32,
     /// 新しいファイルを extents で作る
     extents: bool,
+    /// ファイルの大きさの上限 (Linux の ext4_max_size: extent の論理ブロックは 32 ビット。huge_file がなければ
+    /// i_blocks (512 バイト単位、32 ビット) でも決まる)
+    max_bytes: u64,
     /// 書けない (未対応の機能、回復の要るジャーナル)
     ro: bool,
     sparse_super: bool,
@@ -435,6 +438,11 @@ impl ExtFs {
             csum,
             csum_seed,
             extents: incompat & INCOMPAT_EXTENTS != 0,
+            max_bytes: {
+                let bits = bsize.trailing_zeros();
+                let res = (u32::MAX as u64) << bits;
+                if ro_compat & RO_HUGE_FILE != 0 { res } else { res.min(((u32::MAX as u64) >> (bits - 9)) << bits) }
+            },
             ro,
             sparse_super: ro_compat & RO_SPARSE_SUPER != 0 && u32_at(&sb, 92) & COMPAT_SPARSE_SUPER2 == 0,
             sb: RefCell::new(sb),
@@ -1247,10 +1255,18 @@ impl ExtFs {
         (ino - 1) / self.ipg
     }
 
-    /// ファイルの lb 番目のブロックの場所。alloc なら無いところを作る (0 は穴)
+    /// ファイルの lb 番目のブロックの場所。alloc なら無いところを作る (0 は穴)。未初期化のブロック (fallocate で
+    /// とったもの) は 0 として読むので 0、alloc なら初期化ずみにして (中身は 0) その場所
     fn map(&self, ino: u32, r: &mut Raw, lb: u64, alloc: bool) -> Result<u64, i64> {
         if r.flags() & EXTENTS_FL != 0 {
-            let p = self.ext_find(r, lb)?;
+            let (p, _, uninit) = self.ext_lookup(r, lb)?;
+            if uninit {
+                if !alloc {
+                    return Ok(0);
+                }
+                self.ext_convert(ino, r, lb, p)?;
+                return Ok(p);
+            }
             if p != 0 || !alloc {
                 return Ok(p);
             }
@@ -1391,11 +1407,26 @@ impl ExtFs {
         self.ext_run(r, lb).map(|(p, _)| p)
     }
 
-    /// lb の物理ブロックと、そこから同じ extent でつづくブロックの数 (lb を含む)。
-    /// 無い・未初期化なら (0, 1)。木の節はブロックキャッシュの中でそのまま読む (写さない)
+    /// lb の物理ブロックと、そこから同じ extent でつづくブロックの数 (lb を含む)。無い・未初期化なら (0, 1)
     fn ext_run(&self, r: &Raw, lb: u64) -> Result<(u64, u64), i64> {
+        let (p, n, uninit) = self.ext_lookup(r, lb)?;
+        Ok(if uninit { (0, 1) } else { (p, n) })
+    }
+
+    /// ファイルの lb 番目のブロックの場所 (未初期化でも)。穴なら 0 (スワップのファイル: 未初期化のブロックも、
+    /// ディスクの上の場所があればよい。Linux の iomap_swapfile_activate と同じ)
+    fn map_any(&self, ino: u32, r: &mut Raw, lb: u64) -> Result<u64, i64> {
+        if r.flags() & EXTENTS_FL != 0 {
+            return self.ext_lookup(r, lb).map(|(p, _, _)| p);
+        }
+        self.map(ino, r, lb, false)
+    }
+
+    /// lb の (物理ブロック, そこから同じ extent でつづくブロックの数 (lb を含む), 未初期化か)。無ければ (0, 1, false)。
+    /// 木の節はブロックキャッシュの中でそのまま読む (写さない)
+    fn ext_lookup(&self, r: &Raw, lb: u64) -> Result<(u64, u64, bool), i64> {
         enum Step {
-            Found(u64, u64),
+            Found(u64, u64, bool),
             Child(u64),
         }
         fn step(node: &[u8], lb: u64) -> Result<Step, i64> {
@@ -1410,19 +1441,19 @@ impl ExtFs {
                     let (len, uninit) = if len > EXT_INIT_MAX_LEN { (len - EXT_INIT_MAX_LEN, true) } else { (len, false) };
                     if lb >= b && lb < b + len as u64 {
                         let rest = b + len as u64 - lb;
-                        return Ok(if uninit { Step::Found(0, 1) } else { Step::Found(ExtFs::ext_leaf_start(e) + (lb - b), rest) });
+                        return Ok(Step::Found(ExtFs::ext_leaf_start(e) + (lb - b), rest, uninit));
                     }
                 }
-                return Ok(Step::Found(0, 1));
+                return Ok(Step::Found(0, 1, false));
             }
             let pick = (0..n).rev().find(|&i| u32_at(node, 12 + i * 12) as u64 <= lb);
-            let Some(i) = pick else { return Ok(Step::Found(0, 1)) };
+            let Some(i) = pick else { return Ok(Step::Found(0, 1, false)) };
             Ok(Step::Child(ExtFs::ext_index_child(&node[12 + i * 12..24 + i * 12])))
         }
         let mut next = step(&r.0[40..100], lb)?;
         for _ in 0..8 {
             match next {
-                Step::Found(p, n) => return Ok((p, n)),
+                Step::Found(p, n, u) => return Ok((p, n, u)),
                 Step::Child(c) => next = self.with_block(c, |d| step(d, lb))??,
             }
         }
@@ -1471,14 +1502,19 @@ impl ExtFs {
         r.set_flags(r.flags() | EXTENTS_FL);
     }
 
-    /// 葉 (node) で lb → pb をつなげられるならつなげる
-    fn leaf_merge(node: &mut [u8], lb: u32, pb: u64) -> bool {
+    /// 葉 (node) で lb → pb (raw は長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの) を、前の同じ種類の extent に
+    /// つなげられるならつなげる (長さは初期化ずみ 32768、未初期化 32767 まで)
+    fn leaf_merge(node: &mut [u8], lb: u32, pb: u64, raw: u32) -> bool {
+        let split = |raw: u32| if raw > EXT_INIT_MAX_LEN { (raw - EXT_INIT_MAX_LEN, true) } else { (raw, false) };
+        let (cnt, uninit) = split(raw);
+        let max = if uninit { EXT_INIT_MAX_LEN - 1 } else { EXT_INIT_MAX_LEN };
         let n = u16_at(node, 2) as usize;
         for i in 0..n {
             let e = 12 + i * 12;
-            let (b, len) = (u32_at(node, e), u16_at(node, e + 4) as u32);
-            if len < EXT_INIT_MAX_LEN && b + len == lb && ExtFs::ext_leaf_start(&node[e..e + 12]) + len as u64 == pb {
-                put16(node, e + 4, (len + 1) as u16);
+            let b = u32_at(node, e) as u64;
+            let (len, u) = split(u16_at(node, e + 4) as u32);
+            if u == uninit && len + cnt <= max && b + len as u64 == lb as u64 && ExtFs::ext_leaf_start(&node[e..e + 12]) + len as u64 == pb {
+                put16(node, e + 4, (len + cnt + if uninit { EXT_INIT_MAX_LEN } else { 0 }) as u16);
                 return true;
             }
         }
@@ -1499,10 +1535,11 @@ impl ExtFs {
         true
     }
 
-    fn leaf_ent(lb: u32, pb: u64) -> [u8; 12] {
+    /// raw_len は長さ (未初期化なら EXT_INIT_MAX_LEN を足したもの)
+    fn leaf_ent(lb: u32, pb: u64, raw_len: u32) -> [u8; 12] {
         let mut e = [0u8; 12];
         put32(&mut e, 0, lb);
-        put16(&mut e, 4, 1);
+        put16(&mut e, 4, raw_len as u16);
         put16(&mut e, 6, (pb >> 32) as u16);
         put32(&mut e, 8, pb as u32);
         e
@@ -1558,16 +1595,17 @@ impl ExtFs {
         Ok(Some((split, nb)))
     }
 
-    /// node (深さ depth) の下に lb → pb を入れる。node が分かれたら (キー, 新しいブロック)
-    fn insert_rec(&self, ino: u32, r: &mut Raw, node: &mut [u8], lb: u32, pb: u64) -> Result<Option<(u32, u64)>, i64> {
+    /// node (深さ depth) の下に lb → pb (raw は長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの。その範囲はまだ
+    /// どこにもないこと) を入れる。node が分かれたら (キー, 新しいブロック)
+    fn insert_rec(&self, ino: u32, r: &mut Raw, node: &mut [u8], lb: u32, pb: u64, raw: u32) -> Result<Option<(u32, u64)>, i64> {
         if u16_at(node, 0) != EXT_MAGIC {
             return Err(-EIO);
         }
         if u16_at(node, 6) == 0 {
-            if ExtFs::leaf_merge(node, lb, pb) {
+            if ExtFs::leaf_merge(node, lb, pb, raw) {
                 return Ok(None);
             }
-            return self.put_or_split(ino, r, node, &ExtFs::leaf_ent(lb, pb));
+            return self.put_or_split(ino, r, node, &ExtFs::leaf_ent(lb, pb, raw));
         }
         let n = u16_at(node, 2) as usize;
         let i = (0..n).rev().find(|&i| u32_at(node, 12 + i * 12) <= lb).unwrap_or(0);
@@ -1576,7 +1614,7 @@ impl ExtFs {
         }
         let child = ExtFs::ext_index_child(&node[12 + i * 12..24 + i * 12]);
         let mut cnode = self.read_block(child)?;
-        let split = self.insert_rec(ino, r, &mut cnode, lb, pb)?;
+        let split = self.insert_rec(ino, r, &mut cnode, lb, pb, raw)?;
         self.write_node(ino, r.gen_no(), child, &cnode)?;
         match split {
             None => Ok(None),
@@ -1584,10 +1622,16 @@ impl ExtFs {
         }
     }
 
-    /// lb → pb を extents に足す。根があふれたら中身を新しいブロックへ下ろして 1 段深くする
+    /// lb → pb を extents に足す
     fn ext_insert(&self, ino: u32, r: &mut Raw, lb: u32, pb: u64) -> Result<(), i64> {
+        self.ext_insert_run(ino, r, lb, pb, 1)
+    }
+
+    /// lb → pb から raw (長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの) を extents に足す。根があふれたら中身を
+    /// 新しいブロックへ下ろして 1 段深くする
+    fn ext_insert_run(&self, ino: u32, r: &mut Raw, lb: u32, pb: u64, raw: u32) -> Result<(), i64> {
         let mut root = r.0[40..100].to_vec();
-        let split = self.insert_rec(ino, r, &mut root, lb, pb)?;
+        let split = self.insert_rec(ino, r, &mut root, lb, pb, raw)?;
         if let Some((key, b)) = split {
             let depth = u16_at(&root, 6);
             if depth >= 4 {
@@ -1653,6 +1697,191 @@ impl ExtFs {
         }
         put16(node, 2, out as u16);
         Ok(out == 0)
+    }
+
+    /// 葉/索引のノード (node) から論理ブロック [from, to) を外す (free ならブロックも返す)。extent のまん中を外すと
+    /// 2 つに分かれる: ノードに入りきらなければ、いちばん後ろの extent を again へ (論理ブロック, 物理ブロック, raw の
+    /// 長さ) 出して、あとで入れなおす。索引のキーは子の最初に合わせる (e2fsck が見る)。空になったら true
+    #[allow(clippy::too_many_arguments)]
+    fn ext_remove_node(&self, ino: u32, generation: u32, r: &mut Raw, node: &mut [u8], from: u64, to: u64, free: bool, again: &mut Vec<(u32, u64, u32)>) -> Result<bool, i64> {
+        if u16_at(node, 0) != EXT_MAGIC {
+            return Err(-EIO);
+        }
+        let cap = (node.len() - 12) / 12;
+        let n = (u16_at(node, 2) as usize).min(cap);
+        let max = (u16_at(node, 4) as usize).min(cap);
+        let depth = u16_at(node, 6);
+        let per = (self.bsize / 512) as i64;
+        let mut out: Vec<[u8; 12]> = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let e: [u8; 12] = node[12 + i * 12..24 + i * 12].try_into().unwrap();
+            let b = u32_at(&e, 0) as u64;
+            if depth == 0 {
+                let raw = u16_at(&e, 4) as u32;
+                let (len, uninit) = if raw > EXT_INIT_MAX_LEN { (raw - EXT_INIT_MAX_LEN, true) } else { (raw, false) };
+                let end = b + len as u64;
+                if end <= from || b >= to {
+                    out.push(e);
+                    continue;
+                }
+                let start = ExtFs::ext_leaf_start(&e);
+                let (cs, ce) = (b.max(from), end.min(to));
+                if free {
+                    for k in cs..ce {
+                        self.free_block(start + (k - b))?;
+                        r.add_blocks512(-per, self.bsize);
+                    }
+                }
+                let piece = |lb: u64, len: u64| {
+                    let raw = len as u32 + if uninit { EXT_INIT_MAX_LEN } else { 0 };
+                    ExtFs::leaf_ent(lb as u32, start + (lb - b), raw)
+                };
+                if cs > b {
+                    out.push(piece(b, cs - b));
+                }
+                if ce < end {
+                    out.push(piece(ce, end - ce));
+                }
+            } else {
+                // i 番目の子は、次の子の始まりの前まで
+                let next = if i + 1 < n { u32_at(node, 24 + i * 12) as u64 } else { u64::MAX };
+                if next <= from || b >= to {
+                    out.push(e);
+                    continue;
+                }
+                let child = ExtFs::ext_index_child(&e);
+                let mut cnode = self.read_block(child)?;
+                if self.ext_remove_node(ino, generation, r, &mut cnode, from, to, free, again)? {
+                    self.free_block(child)?;
+                    r.add_blocks512(-per, self.bsize);
+                } else {
+                    self.write_node(ino, generation, child, &cnode)?;
+                    let mut e = e;
+                    put32(&mut e, 0, u32_at(&cnode, 12));
+                    out.push(e);
+                }
+            }
+        }
+        while out.len() > max {
+            let x = out.pop().unwrap();
+            again.push((u32_at(&x, 0), ExtFs::ext_leaf_start(&x), u16_at(&x, 4) as u32));
+        }
+        node[12..12 + n.max(out.len()) * 12].fill(0);
+        for (i, x) in out.iter().enumerate() {
+            node[12 + i * 12..24 + i * 12].copy_from_slice(x);
+        }
+        put16(node, 2, out.len() as u16);
+        Ok(out.is_empty())
+    }
+
+    /// 論理ブロック [from, to) を extent の木から外す (free ならブロックも返す)
+    fn ext_remove(&self, ino: u32, r: &mut Raw, from: u64, to: u64, free: bool) -> Result<(), i64> {
+        let generation = r.gen_no();
+        let mut root = r.0[40..100].to_vec();
+        let mut again = vec![];
+        let empty = self.ext_remove_node(ino, generation, r, &mut root, from, to, free, &mut again)?;
+        r.0[40..100].copy_from_slice(&root);
+        if empty {
+            ExtFs::ext_init_root(r);
+        }
+        for (lb, pb, raw) in again {
+            self.ext_insert_run(ino, r, lb, pb, raw)?;
+        }
+        Ok(())
+    }
+
+    /// 未初期化のブロック lb (場所 pb) を初期化ずみにする (中身は 0): そこへ書くとき。Linux の
+    /// ext4_ext_convert_to_initialized と同じく、未初期化の extent は前・このブロック・後ろに分かれる
+    fn ext_convert(&self, ino: u32, r: &mut Raw, lb: u64, pb: u64) -> Result<(), i64> {
+        self.ext_remove(ino, r, lb, lb + 1, false)?;
+        if let Err(e) = self.ext_insert_run(ino, r, lb as u32, pb, 1) {
+            // 入れられなかった (ノードのブロックがとれない): このブロックは穴にもどす
+            self.free_block(pb)?;
+            r.add_blocks512(-((self.bsize / 512) as i64), self.bsize);
+            return Err(e);
+        }
+        // ディスクの上の中身は古いもの: 0 にしてから書く
+        self.modify_data_block_as(pb, true, |d| d.fill(0))
+    }
+
+    /// 論理ブロック [from, to) の穴に、未初期化のブロックをとる (fallocate。Linux の EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT:
+    /// 0 として読み、SEEK_DATA では穴。書くときに初期化ずみになる)。もうあるものはそのまま。とれなくなったら
+    /// ENOSPC (とった分は残す。Linux と同じ)
+    fn ext_prealloc(&self, ino: u32, r: &mut Raw, from: u64, to: u64) -> Result<(), i64> {
+        let per = (self.bsize / 512) as i64;
+        // まだ木に入れていない、つながったもの (論理, 物理, 数)
+        let mut run: Option<(u64, u64, u32)> = None;
+        let flush = |r: &mut Raw, run: &mut Option<(u64, u64, u32)>| -> Result<(), i64> {
+            match run.take() {
+                Some((l, b, k)) => self.ext_insert_run(ino, r, l as u32, b, k + EXT_INIT_MAX_LEN),
+                None => Ok(()),
+            }
+        };
+        let mut lb = from;
+        while lb < to {
+            let (p, n, _) = self.ext_lookup(r, lb)?;
+            if p != 0 {
+                flush(r, &mut run)?;
+                lb += n;
+                continue;
+            }
+            // つづけてとると、ディスクの上でもつながりやすい
+            let goal = match run {
+                Some((_, b, k)) => b + k as u64,
+                None => match lb.checked_sub(1).map(|l| self.ext_lookup(r, l)) {
+                    Some(Ok((p, _, _))) if p != 0 => p + 1,
+                    _ => self.group_start(self.group_of(ino)),
+                },
+            };
+            let b = match self.alloc_block(goal) {
+                Ok(b) => b,
+                Err(e) => {
+                    flush(r, &mut run)?;
+                    return Err(e);
+                }
+            };
+            r.add_blocks512(per, self.bsize);
+            match &mut run {
+                Some((_, rb, k)) if *rb + *k as u64 == b && *k < EXT_INIT_MAX_LEN - 1 => *k += 1,
+                _ => {
+                    flush(r, &mut run)?;
+                    run = Some((lb, b, 1));
+                }
+            }
+            lb += 1;
+        }
+        flush(r, &mut run)
+    }
+
+    /// ファイル (extent のもの) の [from, to) バイトを 0 にする (fallocate の PUNCH_HOLE と ZERO_RANGE): まるごと入る
+    /// ブロックは外して穴に、はしのブロックは、あれば中の分を 0 に (Linux の ext4_zero_partial_blocks)
+    fn punch(&self, ino: u32, r: &mut Raw, from: u64, to: u64) -> Result<(), i64> {
+        if from >= to {
+            return Ok(());
+        }
+        let bs = self.bsize as u64;
+        let zero = |r: &mut Raw, lb: u64, a: u64, b: u64| -> Result<(), i64> {
+            let p = self.map(ino, r, lb, false)?;
+            if p != 0 {
+                self.modify_data_block(p, |d| d[a as usize..b as usize].fill(0))?;
+            }
+            Ok(())
+        };
+        if from / bs == (to - 1) / bs && (from % bs != 0 || to % bs != 0) {
+            zero(r, from / bs, from % bs, (to - 1) % bs + 1)?;
+        } else {
+            if from % bs != 0 {
+                zero(r, from / bs, from % bs, bs)?;
+            }
+            if to % bs != 0 {
+                zero(r, to / bs, 0, to % bs)?;
+            }
+        }
+        let (first, last) = (from.div_ceil(bs), to / bs);
+        if first < last {
+            self.ext_remove(ino, r, first, last, true)?;
+        }
+        Ok(())
     }
 
     fn ext_truncate(&self, ino: u32, r: &mut Raw, keep: u64) -> Result<(), i64> {
@@ -2098,12 +2327,12 @@ impl ExtInode {
         let mut out: Vec<(u64, u64, u64)> = Vec::new();
         let mut blocks = Vec::new();
         for pg in 0..pages {
-            let first = fs.map(self.ino, &mut r, pg * per as u64, false)?;
+            let first = fs.map_any(self.ino, &mut r, pg * per as u64)?;
             if first == 0 {
                 return Err(-EINVAL);
             }
             for k in 1..per as u64 {
-                if fs.map(self.ino, &mut r, pg * per as u64 + k, false)? != first + k {
+                if fs.map_any(self.ino, &mut r, pg * per as u64 + k)? != first + k {
                     return Err(-EINVAL);
                 }
             }
@@ -2484,6 +2713,49 @@ impl Inode for ExtInode {
         r
     }
 
+    fn fallocate(&self, mode: u32, off: u64, len: u64, modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
+        let _p = crate::prof::span("extfs:fallocate");
+        const KEEP_SIZE: u32 = 0x01;
+        const PUNCH_HOLE: u32 = 0x02;
+        const ZERO_RANGE: u32 = 0x10;
+        // Linux の ext4_fallocate の順: できない mode (COLLAPSE_RANGE と INSERT_RANGE はまだ) は EOPNOTSUPP、
+        // file_modified (setuid と setgid を落とし、時刻をいまに)、それから mode ごと。場所をとるとき (mode 0) と
+        // ZERO_RANGE は、Linux と同じく未初期化のブロックをとる (0 として読み、SEEK_DATA では穴、書くと初期化ずみ)
+        if mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        self.not_swapfile()?;
+        modified()?;
+        crate::vm::file_changed(self.id());
+        let res = self.write_op(|| {
+            let mut r = self.raw()?;
+            if r.mode() & S_IFMT != S_IFREG {
+                return Err(-EOPNOTSUPP);
+            }
+            r.touch();
+            let (size, end, bs) = (r.size(), off + len, self.fs.bsize as u64);
+            let extents = r.flags() & EXTENTS_FL != 0;
+            let res = match mode & !KEEP_SIZE {
+                // extent のないファイル (ブロックの表) は、どれもできない
+                _ if !extents => Err(-EOPNOTSUPP),
+                PUNCH_HOLE => {
+                    // 大きさより先は見ない。終わりは大きさのあるページの終わりまで (ext4_punch_hole)
+                    if off < size { self.fs.punch(self.ino, &mut r, off, end.min(size.next_multiple_of(PGSIZE as u64))) } else { Ok(()) }
+                }
+                // 0 にして (まるごとのブロックは外し、はしは中を 0 に)、穴になったところに未初期化のブロック
+                ZERO_RANGE => self.fs.punch(self.ino, &mut r, off, end).and_then(|_| self.fs.ext_prealloc(self.ino, &mut r, off / bs, end.div_ceil(bs))),
+                _ => self.fs.ext_prealloc(self.ino, &mut r, off / bs, end.div_ceil(bs)),
+            };
+            if res.is_ok() && mode & (KEEP_SIZE | PUNCH_HOLE) == 0 && end > size {
+                r.set_size(end);
+            }
+            self.fs.write_inode(self.ino, &r)?;
+            res
+        });
+        crate::vm::file_changed(self.id());
+        res
+    }
+
     fn truncate(&self, len: usize) -> Result<(), i64> {
         let _p = crate::prof::span("extfs:truncate");
         // 中身が変わる: ページキャッシュ (vm.rs) にある分を、前と後に捨てる
@@ -2680,6 +2952,10 @@ impl Inode for ExtInode {
 
     fn sync(&self) -> Result<(), i64> {
         self.fs.flush()
+    }
+
+    fn max_bytes(&self) -> u64 {
+        self.fs.max_bytes
     }
 
     fn statfs(&self) -> [u8; 120] {
