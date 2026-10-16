@@ -395,8 +395,9 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         let dirs = core::mem::take(pending);
         cache.retain(|_, e| !e.dirs.iter().any(|d| dirs.contains(d)));
     }
-    if let Some(e) = cache.get(&key) {
+    if let Some(e) = cache.get_mut(&key) {
         PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        e.used = true;
         // 覚えたのはほかの人かもしれない: だれでもは通れないディレクトリを、引く人が通れるか (たどるときと同じ順に)
         if !e.gates.is_empty() {
             let cred = crate::proc::current_cred_ref();
@@ -404,31 +405,50 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
                 cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X)?;
             }
         }
-        return Ok((e.walked.clone(), e.ino.clone()));
+        return match &e.found {
+            Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
+            None => Err(-ENOENT),
+        };
     }
     let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new() };
-    let r = walk(None, key.1.clone(), follow, &mut t)?;
-    // たどっているあいだに変わったものがあれば覚えない (念のため)
-    if t.ok && pending.is_empty() && !PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
-        if cache.len() >= PATHS_MAX {
-            cache.clear();
+    let r = walk(None, key.1.clone(), follow, &mut t);
+    // あったものと、ない (ENOENT) ものを覚える。たどっているあいだに変わったものがあれば覚えない (念のため)
+    let keep = match &r {
+        Ok(_) => true,
+        Err(e) => *e == -ENOENT,
+    };
+    if keep && t.ok && pending.is_empty() && !PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) && !heap_crowded() {
+        let max = paths_max();
+        if cache.len() >= max {
+            // 前にいっぱいになったときから引かれなかったものを捨てる (引かれたものは印を消して残す)。
+            // あまり減らなければ全部
+            cache.retain(|_, e| core::mem::take(&mut e.used));
+            if cache.len() >= max / 4 * 3 {
+                cache.clear();
+            }
         }
-        cache.insert(key, PathEntry { walked: r.0.clone(), ino: r.1.clone(), dirs: t.dirs, gates: t.gates });
+        cache.insert(key, PathEntry { found: r.as_ref().ok().cloned(), used: false, dirs: t.dirs, gates: t.gates });
     }
-    Ok(r)
+    r
 }
 
 /// パスの答えの覚え (dentry のキャッシュ): (マウントの namespace, 正規化したパス, 最後のリンクをたどるか) →
-/// (たどったパス, inode, 通ったディレクトリ)。stat や open のたびに 1 つずつ名前を引いて inode を作るのは高い
-/// (QEMU の TCG で、要素ごとに 20 us)。覚えるのは、たどったものがみな path_cacheable で、魔法のリンクがないときだけ。
+/// (たどったパスと inode か、ない (ENOENT)、通ったディレクトリ)。stat や open のたびに 1 つずつ名前を引いて
+/// inode を作るのは高い (QEMU の TCG で、要素ごとに 20 us)。ないものも覚える (PATH やライブラリ、#include を
+/// 探すときは、同じないものを何度も引く。ext4 は、ないものを引くたびにディレクトリのブロックをみな読む)。
+/// 覚えるのは、たどったものがみな path_cacheable で、魔法のリンクがないときだけ。
 /// 覚えはだれが引いても同じものを返すので、通ったディレクトリのうち u・g・o のどれかに x がないもの (/home/ai の
 /// 0700 など) は属性も覚えておき、覚えから答えるたびに、引く人がそこを通れるかを確かめなおす (通れなければ、
 /// たどったときと同じ EACCES)。ディレクトリの中の名前や、ディレクトリの属性 (chmod、chown) が変わったら
-/// dir_changed で、そこを通ったものだけを捨てる (/run の rename が 5 秒ごとにあっても、ほかのものは残る)。
-/// マウントが変わったら names_changed で全部
+/// dir_changed で、そこを通ったものだけを捨てる (ないものも、その名前を探したディレクトリを通ったものに
+/// 入れてあるので、作れば捨てられる。/run の rename が 5 秒ごとにあっても、ほかのものは残る)。
+/// マウントが変わったら names_changed で全部。いっぱいになったら (paths_max)、前にいっぱいになったときから
+/// 引かれなかったものを捨てる
 struct PathEntry {
-    walked: String,
-    ino: InodeRef,
+    /// たどったパスと inode。None はない (ENOENT)
+    found: Option<(String, InodeRef)>,
+    /// 前にいっぱいになったときから引かれたか
+    used: bool,
     dirs: Vec<(usize, u64)>,
     /// 通ったディレクトリのうち、だれでもは通れないもの (通った順)
     gates: Vec<Gate>,
@@ -455,7 +475,17 @@ static mut PATHS_PENDING: Vec<(usize, u64)> = Vec::new();
 static PATHS_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// 覚えから答えた数 (/proc/bkl)
 pub static PATHS_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-const PATHS_MAX: usize = 2048;
+
+/// 覚えるのは (ヒープの大きさ / 16 KiB) こまで: 1 つ 700 バイトほどなので、ヒープの 4% ほど
+/// (32 MiB で 2048、64 MiB で 4096、16384 まで)
+fn paths_max() -> usize {
+    (crate::heap::size() / 16384).clamp(2048, 16384)
+}
+
+/// ヒープがこれより混んでいたら覚えない (vm.rs のページの表と同じ)
+fn heap_crowded() -> bool {
+    crate::heap::used() > crate::heap::size() / 4 * 3
+}
 
 /// マウントやルートが変わった: パスの覚えを全部捨てる (次に引くときに)
 pub fn names_changed() {
@@ -473,9 +503,10 @@ pub fn dir_changed(dir: (usize, u64)) {
     }
 }
 
-/// いま覚えている数 (/proc/bkl)
-pub fn paths_len() -> usize {
-    unsafe { (*(&raw const PATHS)).len() }
+/// いま覚えている数と、そのうちないもの (/proc/bkl)
+pub fn paths_len() -> (usize, usize) {
+    let cache = unsafe { &*(&raw const PATHS) };
+    (cache.len(), cache.values().filter(|e| e.found.is_none()).count())
 }
 
 /// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。

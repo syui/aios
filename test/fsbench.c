@@ -76,6 +76,11 @@ int main(int argc, char **argv) {
   for (i = 0; i < n; i++)
     if (stat(p("missing%ld", i), &st) == 0) bad("stat-missing", p("missing%ld", i));
   report("stat-missing", n, now_ms() - t);
+  // 同じないものをもう一度 (PATH やライブラリ、#include を探すときのように)
+  t = now_ms();
+  for (i = 0; i < n; i++)
+    if (stat(p("missing%ld", i), &st) == 0) bad("stat-missing-again", p("missing%ld", i));
+  report("stat-missing-again", n, now_ms() - t);
   t = now_ms();
   for (i = 0; i < n; i++) {
     int fd = open(p("f%ld", i), O_RDONLY);

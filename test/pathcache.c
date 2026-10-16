@@ -2,8 +2,11 @@
 // (zig cc -target aarch64-linux-musl -O2 -static -o pathcache-test test/pathcache.c)。
 // 覚えさせて (同じパスを何度か stat)、名前を変える・消して作りなおす・リンクを付けかえる・権限を変える・
 // 開いたまま消す、マウントする (root のとき)、のあとで、新しい答えになるか。だれでもは通れないディレクトリ
-// (0700 など) の下も覚えて、覚えたのがほかの人でも、通れない人には EACCES になるか (root のとき、uid 1000 と 1001 の子で)
-// root でも root でなくても動かす (権限は root でないとき、マウントとほかの人は root のとき。vm-ctests.sh は両方)
+// (0700 など) の下も覚えて、覚えたのがほかの人でも、通れない人には EACCES になるか (root のとき、uid 1000 と 1001 の子で)。
+// ないという答えも覚えるので、作る・名前を変えて入れる・リンクを張る・途中のディレクトリを作る・リンクの先を作る・
+// マウントする、のあとで見えるか
+// root でも root でなくても動かす (権限は root でないとき、マウントとほかの人は root のとき。vm-ctests.sh は両方)。
+//   pathcache [DIR...]   DIR (既定 /tmp) ごとに、その下に pc-PID を作ってぜんぶを (tmpfs と ext4 の両方で見るため)
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -20,6 +23,8 @@ static int fails;
 
 static int st(const char *p, struct stat *s) { struct stat x; for (int i = 0; i < 3; i++) if (stat(p, &x) != 0) return -errno; if (s) *s = x; return 0; }
 static void touch(const char *p) { int fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0644); write(fd, "x", 1); close(fd); }
+// 3 度引いて 3 度とも ENOENT か (2 度目からは覚えから)
+static int miss3(const char *p) { struct stat x; for (int i = 0; i < 3; i++) if (stat(p, &x) == 0 || errno != ENOENT) return 0; return 1; }
 
 // uid と gid (ほかのグループは sup だけ。-1 ならなし) になった子で st (root のとき)
 static int st_as(uid_t uid, gid_t gid, int sup, const char *p) {
@@ -47,10 +52,11 @@ static long hits(void) {
   return n;
 }
 
-int main(void) {
-  char base[64];
-  snprintf(base, sizeof base, "/tmp/pc-%d", getpid());
-  char a[128], f[128], c[128], cf[128], l[128], g[128];
+static void run(const char *dir) {
+  printf("pathcache: %s\n", dir);
+  char base[256];
+  snprintf(base, sizeof base, "%s/pc-%d", dir, getpid());
+  char a[512], f[512], c[512], cf[512], l[512], g[512];
   snprintf(a, sizeof a, "%s/a", base); snprintf(f, sizeof f, "%s/a/f", base);
   snprintf(c, sizeof c, "%s/c", base); snprintf(cf, sizeof cf, "%s/c/f", base);
   snprintf(l, sizeof l, "%s/l", base); snprintf(g, sizeof g, "%s/g", base);
@@ -69,7 +75,7 @@ int main(void) {
   CHECK("recreated", st(cf, &s2) == 0);
   // リンクを付けかえる
   touch(f); // a はもうないので作れない: c の中に
-  char f1[128], f2[128];
+  char f1[512], f2[512];
   snprintf(f1, sizeof f1, "%s/f1", base); snprintf(f2, sizeof f2, "%s/f2", base);
   touch(f1); touch(f2);
   struct stat t1, t2, sl;
@@ -78,6 +84,34 @@ int main(void) {
   CHECK("link-first", st(l, &sl) == 0 && sl.st_ino == t1.st_ino);
   unlink(l); symlink("f2", l);
   CHECK("link-retargeted", st(l, &sl) == 0 && sl.st_ino == t2.st_ino);
+  // ないもの: ないという答えも覚えるので、入れたあとで見えるか
+  {
+    char n1[512], n2[512], n3[512], n4[512], nd[512], ndf[512], nl[512], nt[512];
+    snprintf(n1, sizeof n1, "%s/n1", base); snprintf(n2, sizeof n2, "%s/n2", base); snprintf(n3, sizeof n3, "%s/n3", base);
+    snprintf(n4, sizeof n4, "%s/n4", base); snprintf(nd, sizeof nd, "%s/nd", base); snprintf(ndf, sizeof ndf, "%s/nd/f", base);
+    snprintf(nl, sizeof nl, "%s/nl", base); snprintf(nt, sizeof nt, "%s/nt", base);
+    long h0 = hits();
+    CHECK("missing", miss3(n1));
+    if (h0 >= 0) CHECK("missing-cached", hits() - h0 >= 2);
+    touch(n1);
+    CHECK("missing-created", st(n1, 0) == 0);
+    CHECK("missing-rename", miss3(n2));
+    touch(n3); rename(n3, n2);
+    CHECK("missing-renamed-in", st(n2, 0) == 0);
+    CHECK("missing-link", miss3(n4));
+    link(n1, n4);
+    CHECK("missing-linked-in", st(n4, 0) == 0);
+    // 途中のディレクトリがない
+    CHECK("missing-dir", miss3(ndf));
+    mkdir(nd, 0755); touch(ndf);
+    CHECK("missing-dir-made", st(ndf, 0) == 0);
+    // 先のないリンク: 先を作れば見える
+    symlink("nt", nl);
+    CHECK("missing-target", miss3(nl));
+    touch(nt);
+    CHECK("missing-target-made", st(nl, 0) == 0);
+    unlink(n1); unlink(n2); unlink(n4); unlink(ndf); rmdir(nd); unlink(nl); unlink(nt);
+  }
   // 権限を変える: 持ち主でも x がなければ通れない (root なら通れるので、root のときはとばす)
   if (getuid() != 0) {
     CHECK("perm-before", st(cf, 0) == 0);
@@ -98,7 +132,7 @@ int main(void) {
   }
   // 2 段上が変わる: base/d1/d2/f を覚えてから d1 の名前を変える、d1 の x を外す
   {
-    char d1[128], d2[128], df[128], e1[128], ef[128];
+    char d1[512], d2[512], df[512], e1[512], ef[512];
     snprintf(d1, sizeof d1, "%s/d1", base); snprintf(d2, sizeof d2, "%s/d1/d2", base); snprintf(df, sizeof df, "%s/d1/d2/f", base);
     snprintf(e1, sizeof e1, "%s/e1", base); snprintf(ef, sizeof ef, "%s/e1/d2/f", base);
     mkdir(d1, 0755); mkdir(d2, 0755); touch(df);
@@ -116,11 +150,15 @@ int main(void) {
   // だれでもは通れないディレクトリ (root のとき): 覚えたのがだれでも、引く人が通れなければ EACCES
   // (覚えはだれが引いても同じものを返すので、通れるかは引くたびに確かめる)
   if (getuid() == 0) {
-    char p[128], pf[128];
-    snprintf(p, sizeof p, "%s/p", base); snprintf(pf, sizeof pf, "%s/p/f", base);
+    char p[512], pf[512], pn[512];
+    snprintf(p, sizeof p, "%s/p", base); snprintf(pf, sizeof pf, "%s/p/f", base); snprintf(pn, sizeof pn, "%s/p/none", base);
     mkdir(p, 0700); touch(pf);
     CHECK("gate-chown", chown(p, 1000, 1000) == 0);
     CHECK("gate-root", st(pf, 0) == 0);
+    // ないという答えも、通れない人には EACCES (ないかどうかも見せない)
+    CHECK("gate-missing-root", miss3(pn));
+    CHECK("gate-missing-other", st_as(1001, 1001, -1, pn) == -EACCES);
+    CHECK("gate-missing-owner", st_as(1000, 1000, -1, pn) == -ENOENT);
     CHECK("gate-other", st_as(1001, 1001, -1, pf) == -EACCES);
     CHECK("gate-owner", st_as(1000, 1000, -1, pf) == 0);
     CHECK("gate-other-again", st_as(1001, 1001, -1, pf) == -EACCES);
@@ -146,10 +184,11 @@ int main(void) {
   close(fd);
   // マウント (root のとき): かぶせると下のものは見えず、外すとまた見える
   if (getuid() == 0) {
-    char m[128], mx[128], my[128];
+    char m[512], mx[512], my[512];
     snprintf(m, sizeof m, "%s/m", base); snprintf(mx, sizeof mx, "%s/m/x", base); snprintf(my, sizeof my, "%s/m/y", base);
     mkdir(m, 0755); touch(mx);
     CHECK("mount-before", st(mx, 0) == 0);
+    CHECK("mount-missing-before", miss3(my));
     CHECK("mount", mount("none", m, "tmpfs", 0, 0) == 0);
     CHECK("mount-hides", st(mx, 0) == -ENOENT);
     touch(my);
@@ -162,6 +201,11 @@ int main(void) {
   // 片づけ
   unlink(cf); unlink(f2); unlink(l); rmdir(c); rmdir(base);
   CHECK("cleanup", st(base, 0) == -ENOENT);
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) run("/tmp");
+  for (int i = 1; i < argc; i++) run(argv[i]);
   printf("pathcache: %d failed\n", fails);
   return fails;
 }

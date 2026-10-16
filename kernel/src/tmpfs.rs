@@ -228,6 +228,8 @@ impl TmpInode {
         };
         let child = TmpInode::new(self.fs, mode, node);
         child.attr.borrow_mut().mtime = mtime;
+        // ほかのものと同じく (パスの覚えは、ないという答えも覚えている)
+        crate::vfs::dir_changed(self.id());
         self.insert(name, child)
     }
 

@@ -26,13 +26,15 @@ run)
       continue
     fi
     # landlock-eexist は砂場の中で (書けない / と /home に、もうあるものを作ろうとする)
+    # pathcache は tmpfs (/tmp) と ext4 (ホーム) で
     case $t in
     landlock-eexist) cmd="aibox -- ./$t" ;;
+    pathcache) cmd="./$t /tmp $HOME" ;;
     *) cmd="./$t" ;;
     esac
-    # pathcache は root でも (マウントと、ほかの人から引いたとき)
+    # pathcache は root でも (マウントと、ほかの人から引いたとき。ext4 はほかの人も通れる /var/tmp で)
     root=
-    [ "$t" = pathcache ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t"
+    [ "$t" = pathcache ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t /tmp /var/tmp"
     if timeout 300 $cmd > "$t.out" 2>&1 && { [ -z "$root" ] || timeout 300 $root >> "$t.out" 2>&1; }; then
       echo "ok $t"
     else
