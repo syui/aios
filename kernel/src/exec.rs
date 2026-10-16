@@ -33,6 +33,7 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 const AT_NULL: u64 = 0;
+const AT_IGNORE: u64 = 1;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
@@ -162,7 +163,11 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         return Err(-E2BIG);
     }
     let args_area = pg_up(strs + ptrs_size + 64);
-    crate::vdso::map(&mut pt).ok_or(-ENOMEM)?;
+    // vDSO を切っていれば (aios.off=vdso) 写さず、auxv にも書かない (libc はシステムコールで clock_gettime する)
+    let vdso = !crate::parts::off(crate::parts::Part::Vdso);
+    if vdso {
+        crate::vdso::map(&mut pt).ok_or(-ENOMEM)?;
+    }
     pt.map(USER_STACK_TOP - USER_STACK_SIZE - args_area, USER_STACK_TOP, PROT_RW, false, Backing::Anon).ok_or(-ENOMEM)?;
 
     // 文字列は Linux と同じ並び: 天辺の 8 バイトは 0 のまま空け、その下に argv[0] argv[1] ... envp ... execfn を
@@ -212,7 +217,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_SECURE, 0),
         (AT_RANDOM, random as u64),
         (AT_EXECFN, execfn as u64),
-        (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64),
+        if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
         (AT_NULL, 0),
     ];
     let mut w = 0;

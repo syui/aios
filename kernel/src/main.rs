@@ -33,6 +33,7 @@ mod memlayout;
 mod prof;
 mod net;
 mod netif;
+mod parts;
 mod proc;
 mod sd;
 mod smp;
@@ -105,6 +106,8 @@ pub extern "C" fn kmain() -> ! {
     println!("kalloc: {} pages free", kalloc::nfree());
     println!("initrd: {} entries", initrd::count());
     dtb::summary();
+    // 実験のために切ったところ (aios.off=)
+    parts::init();
 
     irq::init();
     irq::enable_ipi();
@@ -115,12 +118,16 @@ pub extern "C" fn kmain() -> ! {
     // 使う人 (ネット、exec) より前に
     efi::take_seed(|b| rand::seed("efi-rng", b));
     rand::init();
-    if !virtio_rng::init() {
-        bcm2835_rng::init();
+    if parts::off(parts::Part::VirtioRng) || !virtio_rng::init() {
+        if !parts::off(parts::Part::Bcm2835Rng) {
+            bcm2835_rng::init();
+        }
     }
     rand::summary();
     fs::init();
-    net::init();
+    if !parts::off(parts::Part::Net) {
+        net::init();
+    }
 
     // ここからは大きなロックを持って (smp.rs)
     smp::lock();

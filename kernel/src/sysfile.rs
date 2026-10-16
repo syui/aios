@@ -588,7 +588,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> R {
 /// 開くと stat はそれを分ける (Linux はパイプを開きなおし、端末はログインした人のもの。aios の端末は
 /// root のものなので、開きなおすと書けない)。ほかの場所では探さない (ふつうの open を遅くしない)
 fn fd_link(path: &str) -> Option<file::FileRef> {
-    if !(path.starts_with("/dev/") || path.starts_with("/proc/")) {
+    if !(path.starts_with("/dev/") || path.starts_with("/proc/")) || crate::parts::off(crate::parts::Part::TtyRootFdlink) {
         return None;
     }
     crate::procfs::fd_link_file("", path)

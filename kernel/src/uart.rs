@@ -38,7 +38,7 @@ impl Ring {
     /// FIFO にはいるだけ出す (QEMU の FIFO はいっぱいにならないので、1 回 32 文字まで。残りは割り込みで) [quirk qemu-uart-burst]。
     /// 空になったら送信の割り込みを止める
     fn drain(&mut self) {
-        let upto = self.tail + 32;
+        let upto = if crate::parts::off(crate::parts::Part::QemuUartBurst) { usize::MAX } else { self.tail + 32 };
         while self.tail != self.head && self.tail != upto && mmio::r32(reg(FR)) & FR_TXFF == 0 {
             mmio::w32(reg(DR), self.buf[self.tail % TXQ] as u32);
             self.tail += 1;

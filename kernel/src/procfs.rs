@@ -719,7 +719,7 @@ impl Inode for ProcInode {
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
-            (Node::Root, "ai") => Node::AiDir,
+            (Node::Root, "ai") if !crate::parts::off(crate::parts::Part::Aiproc) => Node::AiDir,
             (Node::AiDir, "threads") => Node::AiThreads,
             (Node::AiDir, "bkl") => Node::AiBkl,
             (Node::AiDir, "heap") => Node::AiHeap,
@@ -815,7 +815,9 @@ impl Inode for ProcInode {
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
-                add("ai".into(), Node::AiDir);
+                if !crate::parts::off(crate::parts::Part::Aiproc) {
+                    add("ai".into(), Node::AiDir);
+                }
                 add("sys".into(), Node::SysDir(0, 0));
                 for p in proc::all_leader_procs() {
                     if let Some(l) = crate::ns::to_local(p.tgid) {

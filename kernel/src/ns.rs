@@ -115,6 +115,10 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     if flags & SUPPORTED == 0 {
         return Ok(());
     }
+    // namespace を切っていれば (aios.off=ns)、入れずに作った Linux と同じ EINVAL
+    if crate::parts::off(crate::parts::Part::Ns) {
+        return Err(-EINVAL);
+    }
     // ユーザーの namespace はだれでも作れる (先に作る。中ではほかの namespace も作れる)。入れ子と chroot の中はだめ
     if flags & CLONE_NEWUSER != 0 {
         if c.ns.user.is_some() {

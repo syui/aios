@@ -32,7 +32,7 @@
   "kernel": {
     "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "kalloc", "heap", "vm", "trap", "irq", "timer", "smp", "dtb",
               "uart", "console", "kmsg", "tty", "proc", "signal", "syscall", "exec", "file", "sysfile", "vfs", "fs", "tmpfs",
-              "initrd", "cred", "crypto", "rand"],
+              "initrd", "cred", "crypto", "rand", "parts"],
     "extra": ["aiproc", "bcm2835_rng", "block", "efi", "epoll", "extfs", "gpu", "htree", "inotify", "input", "jbd2", "landlock",
               "module", "net", "netif", "ns", "procfs", "prof", "sd", "seccomp", "socket", "sound", "swap", "sysctl", "sysfs",
               "timerfd", "unix", "vdso", "vfat", "virtio", "virtio_blk", "virtio_net", "virtio_rng"],

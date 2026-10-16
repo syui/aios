@@ -5,7 +5,8 @@
 #   quirk  ある機械やプログラムのつごうで入れた手当て (Linux の quirk と同じ考え)。原因 (cause) と、外せる条件 (until)
 # core と extra は 1 つのファイルに 1 行で、kernel/src の .rs がみなちょうど 1 度ずつ。quirk は 1 つの手当てに 1 行で、
 # src のファイルには札 [quirk NAME] があり、ソースの札はみな一覧の quirk の src のファイルにある。.aios.json の kernel の
-# core / extra / quirk は、kernel.json の名前をその順に並べたもの
+# core / extra / quirk は、kernel.json の名前をその順に並べたもの。off (起動の引数 aios.off= で切れるものと、切るとどうなるか) の
+# あるものは src/parts.rs の NAMES (と enum Part の順) と同じ
 # 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく)
 import json
 import os
@@ -69,6 +70,22 @@ for s in sources:
         elif s not in quirks[q]:
             err("%s: [quirk %s], but %s is not in its src" % (s, q, s))
 
+# 切れるもの (起動の引数 aios.off=): src/parts.rs の NAMES が kernel.json の off のあるものと同じで、Part がその順か
+parts_rs = text.get("src/parts.rs", "")
+m = re.search(r"const NAMES: \[&str; \d+\] = \[(.*?)\];", parts_rs, re.S)
+switch = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+m = re.search(r"pub enum Part \{(.*?)\}", parts_rs, re.S)
+variants = re.findall(r"(\w+),", m.group(1)) if m else []
+camel = ["".join(w[:1].upper() + w[1:] for w in re.split(r"[-_]", n)) for n in switch]
+if variants != camel:
+    err("src/parts.rs: enum Part should be NAMES in the same order (%s)" % ", ".join(camel))
+with_off = [e["name"] for e in entries if "off" in e]
+if sorted(switch) != sorted(with_off):
+    err("src/parts.rs NAMES and kernel.json off differ: only in parts.rs %s, only in kernel.json %s" % (sorted(set(switch) - set(with_off)), sorted(set(with_off) - set(switch))))
+for e in entries:
+    if "off" in e and not e["off"]:
+        err("%s: off is empty" % e.get("name"))
+
 # .aios.json の kernel (名前だけの一覧) が kernel.json とそろっているか
 with open(os.path.join(root, "..", ".aios.json"), encoding="utf-8") as f:
     summary = json.load(f).get("kernel", {})
@@ -92,5 +109,6 @@ for s, (n, k) in sorted(files.items()):
             uses[n] = used
 print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %d" % (count["core"], lines["core"], count["extra"], lines["extra"], len(quirks)))
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
+print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("kernel-json: %d failed" % len(errors))
 sys.exit(min(len(errors), 125))

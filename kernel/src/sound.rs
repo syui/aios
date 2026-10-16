@@ -438,7 +438,9 @@ fn refine(s: &Snd, h: &mut Hw) -> Result<(), i64> {
     // 周期は 3 つから: 起こされてから書くまでの余裕を 2 周期 (40 ms) にする。2 つだと 1 周期 (20 ms) しかなく、
     // ビルドなどで CPU がふさがっているとアンダーランする (cpal はバッファを周期の 2 倍に頼むので、3 倍になる)
     h.narrow(P_PERIODS, Iv::of(3, 1024));
-    h.narrow(P_PERIOD_TIME, Iv::of(MIN_PERIOD_US, u32::MAX as u64));
+    if !crate::parts::off(crate::parts::Part::SoundMinPeriod) {
+        h.narrow(P_PERIOD_TIME, Iv::of(MIN_PERIOD_US, u32::MAX as u64));
+    }
     // 周期の数 (PERIODS) は整数でなくてよい (バッファが周期の整数倍でなくてもよい。Linux と同じ)
     for p in [P_SAMPLE_BITS, P_FRAME_BITS, P_CHANNELS, P_PERIOD_SIZE, P_PERIOD_BYTES, P_BUFFER_SIZE, P_BUFFER_BYTES] {
         let mut v = h.iv(p);

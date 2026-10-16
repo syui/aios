@@ -6,6 +6,8 @@
 //   ab      2 つのカーネルで同じコマンドを n 回ずつ動かし、時間と大きなロックの使われ方をくらべる
 //   bisect  test が通る (good) コミットと通らない (bad) コミットのあいだを git bisect で探す。
 //           コミットごとにカーネルを作って VM で test を動かす (変わるのはカーネルだけ。ディスクはいまのもの)
+//   box     カーネルの砂場: kernel.json の extra や quirk を切って (起動の引数 aios.off=。kernel/src/parts.rs) 起こし、
+//           テスト (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときとくらべる。each で 1 つずつ全部
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
 //   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
@@ -19,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / job / put / get / shot / keys / log / mon / reboot"},"bg":{"type":"boolean","description":"run: 中でうしろで動かしてすぐ答える ({job: ID})。50 秒より長いもの (ap -S firefox など) に。そのあいだも run が使える"},"id":{"type":"integer","description":"job: どれ (なければ一覧)。様子と、前に見せたところから先の出力"},"kill":{"type":"boolean","description":"job: 止める (孫まで)"},"reset_after":{"type":"number","description":"reboot: この秒でプロンプトが来なければ QEMU をリセット (止まった新しいカーネルの電源を入れなおす)"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ disk.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル。get: 外の置き場 (既定 build/aish-vm/get/ファイル名)"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)。get: 取り出す中のファイル"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)。job: 終わるまで待つ長さ (既定 0、40000 まで)"},"dir":{"type":"string"}},"required":["op"]}"#;
+const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / job / put / get / shot / keys / log / mon / reboot"},"bg":{"type":"boolean","description":"run: 中でうしろで動かしてすぐ答える ({job: ID})。50 秒より長いもの (ap -S firefox など) に。そのあいだも run が使える"},"id":{"type":"integer","description":"job: どれ (なければ一覧)。様子と、前に見せたところから先の出力"},"kill":{"type":"boolean","description":"job: 止める (孫まで)"},"reset_after":{"type":"number","description":"reboot: この秒でプロンプトが来なければ QEMU をリセット (止まった新しいカーネルの電源を入れなおす)"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ disk.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"off":{"type":"array","items":{"type":"string"},"description":"start: 切って起こす extra や quirk (kernel.json の off のあるもの。起動の引数 aios.off=。カーネルを直に起こすので kernel といっしょに)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル。get: 外の置き場 (既定 build/aish-vm/get/ファイル名)"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)。get: 取り出す中のファイル"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)。job: 終わるまで待つ長さ (既定 0、40000 まで)"},"dir":{"type":"string"}},"required":["op"]}"#;
 const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","description":"C のソース (main のあるもの)"},"file":{"type":"string","description":"code のかわりにソースのファイル"},"lang":{"type":"string","description":"c (既定) か c++"},"cflags":{"type":"array","items":{"type":"string"},"description":"zig cc に足すもの (-lpthread、-DX=1 など)"},"args":{"type":"string","description":"中で動かすときの引数 (シェルの書き方で)"},"timeout":{"type":"number","description":"秒 (既定 30、50 まで)"},"dir":{"type":"string"}}}"#;
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
+const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の extra や quirk のうち off のあるもの。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
 
 fn main() {
@@ -33,6 +36,7 @@ fn main() {
             "start" => job_start(&root, &a),
             "ab" => job_ab(&root, &a),
             "bisect" => job_bisect(&root, &a),
+            "box" => job_box(&root, &a),
             _ => Err(format!("{}: unknown", cmd)),
         };
         match r {
@@ -53,6 +57,7 @@ fn main() {
             Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
+            Tool { name: "box", desc: "カーネルの砂場: kernel.json の extra や quirk (off のあるもの) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
     let mut jobs: HashMap<String, Job> = HashMap::new();
@@ -65,6 +70,7 @@ fn main() {
                 "try" => try_(&root, a),
                 "ab" => job(&mut jobs, &root, "ab", a),
                 "bisect" => job(&mut jobs, &root, "bisect", a),
+                "box" => job(&mut jobs, &root, "box", a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -427,6 +433,12 @@ fn note(v: Value) {
     println!("{}", v);
 }
 
+/// テストや測るコマンドはサブシェルで (exit 125 などで、中のシリアルの端末のシェルごと終わらないように。
+/// 終わると vm.py は終わりの印を見られず、時間切れまで待つ)
+fn sub(cmd: &str) -> String {
+    format!("(\n{}\n)", cmd)
+}
+
 // ---- カーネルを選ぶ ----
 
 /// dir (ワークスペース) のカーネルを作る。できたもののパス
@@ -506,12 +518,16 @@ fn symbolize(root: &Path, text: String) -> String {
     format!("{}\nbacktrace (addr2line):\n{}", text, names.join("\n"))
 }
 
-/// VM を止めて、kernel で起こす (snapshot ならディスクに書き残さない)。起動に失敗したら Err
-fn boot(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str) -> Result<Value, String> {
+/// VM を止めて、kernel で起こす (snapshot ならディスクに書き残さない、off は切って)。起動に失敗したら Err
+fn boot(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str, off: &[String]) -> Result<Value, String> {
     vmpy(root, &["stop"], &[], Duration::from_secs(90));
     let mut env: Vec<(&str, String)> = Vec::new();
     if let Some(k) = kernel {
         env.push(("AIOS_KERNEL", k.display().to_string()));
+    }
+    // カーネルのコマンドライン (bin/run.sh の AIOS_CMDLINE は、カーネルを直に起こすときの -append)
+    if !off.is_empty() {
+        env.push(("AIOS_CMDLINE", format!("aios.off={}", off.join(","))));
     }
     // panic のバックトレースを関数の名前にするため (symbolize)。disk.img のカーネルなら無い
     let _ = match kernel {
@@ -542,8 +558,19 @@ fn job_start(root: &Path, a: &Value) -> Result<Value, String> {
         None => None,
     };
     let www = a["www"].as_str().unwrap_or("");
-    let r = boot(root, k.as_deref(), a["snapshot"] == true, www)?;
-    Ok(json!({ "ready": true, "boot_s": r["boot_s"], "kernel": k.map(|p| p.display().to_string()) }))
+    let off = strings(&a["off"]);
+    if !off.is_empty() {
+        let names = switchable(root)?;
+        if let Some(n) = off.iter().find(|n| !names.contains(n)) {
+            return Err(format!("off: {} cannot be turned off (kernel.json: {})", n, names.join(" ")));
+        }
+    }
+    let r = boot(root, k.as_deref(), a["snapshot"] == true, www, &off)?;
+    let mut v = json!({ "ready": true, "boot_s": r["boot_s"], "kernel": k.map(|p| p.display().to_string()) });
+    if !off.is_empty() {
+        v["off"] = json!(off);
+    }
+    Ok(v)
 }
 
 // ---- くらべる ----
@@ -576,15 +603,16 @@ fn job_ab(root: &Path, a: &Value) -> Result<Value, String> {
         note(json!({ "step": "kernel", "spec": spec }));
         let k = kernel_for(root, spec)?;
         note(json!({ "step": "boot", "spec": spec }));
-        boot(root, Some(&k), true, a["www"].as_str().unwrap_or(""))?;
+        boot(root, Some(&k), true, a["www"].as_str().unwrap_or(""), &[])?;
         let setup = s(a, "setup");
         if !setup.is_empty() {
+            // setup は cd などを残すためのものなので、そのままのシェルで
             vmpy(root, &["run", setup, "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
         }
         vmpy(root, &["run", "sudo sh -c 'echo > /proc/bkl'", "-t", "20"], &[], Duration::from_secs(30));
         let (mut ms, mut fails) = (Vec::new(), 0);
         for i in 0..n {
-            let (st, _, _, m, to) = vmpy(root, &["run", cmd, "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+            let (st, _, _, m, to) = vmpy(root, &["run", &sub(cmd), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
             if st != 0 || to {
                 fails += 1;
             }
@@ -636,10 +664,10 @@ fn job_bisect(root: &Path, a: &Value) -> Result<Value, String> {
         // カーネルを作る (作れなければ skip)、起こす (起きなければ bad)、test (0 good、125 skip、ほか bad)
         let verdict = match kernel_for(root, &sha) {
             Err(e) => ("skip", e),
-            Ok(k) => match boot(root, Some(&k), true, "") {
+            Ok(k) => match boot(root, Some(&k), true, "", &[]) {
                 Err(e) => ("bad", e),
                 Ok(_) => {
-                    let (st, o, _, _, to) = vmpy(root, &["run", test, "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+                    let (st, o, _, _, to) = vmpy(root, &["run", &sub(test), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
                     let last = o.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" / ");
                     match (st, to) {
                         (_, true) => ("bad", format!("timeout: {}", last)),
@@ -665,4 +693,118 @@ fn job_bisect(root: &Path, a: &Value) -> Result<Value, String> {
     r["steps"] = json!(steps);
     r["note"] = json!("only the kernel changes between steps; the disk (userland) is the current disk.img");
     Ok(r)
+}
+
+// ---- カーネルの砂場 ----
+
+/// 文字列の並び (JSON の配列から)
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).filter(|x| !x.is_empty()).collect()).unwrap_or_default()
+}
+
+/// 切れるもの: kernel/kernel.json の off のある名前 (kernel/src/parts.rs と同じ。test/kernel-json.py が確かめる)
+fn switchable(root: &Path) -> Result<Vec<String>, String> {
+    let t = std::fs::read_to_string(root.join("kernel/kernel.json")).map_err(|e| format!("kernel/kernel.json: {}", e))?;
+    let v = aish_plugin::parse(&t).ok_or("kernel/kernel.json: not JSON")?;
+    Ok(v.as_array().map(|a| a.iter().filter(|e| e.get("off").is_some()).filter_map(|e| e["name"].as_str().map(String::from)).collect()).unwrap_or_default())
+}
+
+/// CI と同じテスト (test/vm-check.sh と test/vm-ctests.sh)。C のテストは中で動かす静的なプログラムに作っておく
+const DEFAULT_TEST: &str = "fetch http://10.0.2.2:8000/vm-check.sh > /tmp/vm-check.sh && sh /tmp/vm-check.sh; a=$?; \
+fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/vm-ctests.sh && sh /tmp/vm-ctests.sh run; b=$?; exit $((a + b))";
+
+fn build_ctests(root: &Path) -> Result<(), String> {
+    let cc = ["aarch64-linux-gnu-gcc", "gcc"].into_iter().find(|c| {
+        let (st, out, _, _, _) = sh(root, c, &["-dumpmachine"], &[], Duration::from_secs(10));
+        st == 0 && out.starts_with("aarch64")
+    });
+    let Some(cc) = cc else { return Err("no aarch64 C compiler for the C tests (aarch64-linux-gnu-gcc)".into()) };
+    let (st, _, err, _, _) = sh(root, "sh", &["test/vm-ctests.sh", "build", cc], &[], Duration::from_secs(600));
+    if st != 0 {
+        return Err(format!("test/vm-ctests.sh build: {}", err.lines().last().unwrap_or("")));
+    }
+    Ok(())
+}
+
+fn job_box(root: &Path, a: &Value) -> Result<Value, String> {
+    let names = switchable(root)?;
+    let sets: Vec<Vec<String>> = if a["each"] == true { names.iter().map(|n| vec![n.clone()]).collect() } else { vec![strings(&a["off"])] };
+    if sets.iter().all(|s| s.is_empty()) {
+        return Err(format!("give off (or each): {}", names.join(" ")));
+    }
+    if let Some(n) = sets.iter().flatten().find(|n| !names.contains(n)) {
+        return Err(format!("{} cannot be turned off (kernel.json: {})", n, names.join(" ")));
+    }
+    let custom = s(a, "test");
+    let test = if custom.is_empty() { DEFAULT_TEST } else { custom };
+    let www = match a["www"].as_str().filter(|w| !w.is_empty()) {
+        Some(w) => w.to_string(),
+        None if custom.is_empty() => "test".to_string(),
+        None => String::new(),
+    };
+    if custom.is_empty() {
+        note(json!({ "step": "ctests" }));
+        build_ctests(root)?;
+    }
+    let spec = a["kernel"].as_str().filter(|x| !x.is_empty()).unwrap_or(".");
+    note(json!({ "step": "kernel", "spec": spec }));
+    let k = kernel_for(root, spec)?;
+    let t = Duration::from_secs_f64(secs(a, "timeout", 1200.0, 3600.0));
+    // 1 つの組: 起こして (起きなければそれが答え)、切れているかを確かめ、test を動かして FAIL の行を集める
+    let run = |off: &[String]| -> Value {
+        note(json!({ "step": "boot", "off": off }));
+        let t0 = Instant::now();
+        if let Err(e) = boot(root, Some(&k), true, &www, off) {
+            return json!({ "off": off, "boot": false, "error": e });
+        }
+        let (_, kmsg, _, _, _) = vmpy(root, &["run", "grep -a 'parts:' /proc/kmsg", "-t", "20"], &[], Duration::from_secs(30));
+        let parts = kmsg.lines().find(|l| l.contains("parts: off")).map(|l| l.trim().to_string());
+        if !off.is_empty() && parts.is_none() {
+            return json!({ "off": off, "boot": true, "error": "the kernel did not say parts: off (aios.off= did not reach it)" });
+        }
+        let (st, out, _, ms, to) = vmpy(root, &["run", &sub(test), "-t", &format!("{}", t.as_secs())], &[], t + Duration::from_secs(10));
+        // FAIL の行 (字下げしたものは、その中の様子なので数えない)
+        let fails: Vec<String> = out.lines().filter(|l| l.starts_with("FAIL")).map(|l| l.trim_end().trim_end_matches(':').to_string()).collect();
+        let last: Vec<&str> = out.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+        note(json!({ "step": "test", "off": off, "status": st, "fails": fails.len(), "ms": ms }));
+        json!({ "off": off, "boot": true, "parts": parts, "status": st, "timeout": to, "fails": fails, "last": last.join(" / "), "ms": t0.elapsed().as_millis() as u64 })
+    };
+    let base = (a["baseline"] != false).then(|| run(&[]));
+    let base_fails: Vec<String> = base.as_ref().map(|b| strings(&b["fails"])).unwrap_or_default();
+    let base_status = base.as_ref().and_then(|b| b["status"].as_i64()).unwrap_or(0);
+    let mut runs = Vec::new();
+    let mut table = Vec::new();
+    for set in &sets {
+        let mut r = run(set);
+        let fails = strings(&r["fails"]);
+        let new: Vec<&String> = fails.iter().filter(|f| !base_fails.contains(f)).collect();
+        let gone: Vec<&String> = base_fails.iter().filter(|f| !fails.contains(f)).collect();
+        let line = if r["boot"] == false || r.get("error").is_some() {
+            format!("{}: {}", set.join(","), r["error"].as_str().unwrap_or("did not come up"))
+        } else if r["timeout"] == true {
+            format!("{}: the test timed out", set.join(","))
+        } else if new.is_empty() && r["status"].as_i64().unwrap_or(0) != base_status {
+            // FAIL の行はないが、終わりの番号がちがう (テストが始められなかったなど)
+            format!("{}: the test exited {} (with nothing off {}) without a new FAIL line: {}", set.join(","), r["status"], base_status, r["last"].as_str().unwrap_or(""))
+        } else if new.is_empty() && (base.is_some() || fails.is_empty()) {
+            format!("{}: nothing new fails", set.join(","))
+        } else {
+            format!("{}: {} new: {}", set.join(","), new.len(), new.iter().map(|f| f.as_str()).collect::<Vec<_>>().join("; "))
+        };
+        r["new_fails"] = json!(new);
+        if !gone.is_empty() {
+            r["passes_only_off"] = json!(gone);
+        }
+        table.push(line);
+        runs.push(r);
+    }
+    vmpy(root, &["stop"], &[], Duration::from_secs(90));
+    let mut out = json!({ "kernel": spec, "path": k.display().to_string(), "results": table, "runs": runs, "note": "each ran on a fresh -snapshot VM; new means a FAIL line the run with nothing off does not have" });
+    if let Some(b) = base {
+        out["baseline"] = b;
+    }
+    if custom.is_empty() && sets.iter().any(|s| s.iter().any(|n| n == "net")) {
+        out["hint"] = json!("the default test fetches its scripts over the network, so with net off it cannot start; give a test that needs no network");
+    }
+    Ok(out)
 }

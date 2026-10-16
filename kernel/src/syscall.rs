@@ -254,6 +254,22 @@ nrs! {
     FACCESSAT2 = 439,
 }
 
+/// システムコールがどの extra のものか (切れるものだけ。parts.rs)
+fn part_of(nr: u64) -> Option<crate::parts::Part> {
+    use crate::parts::Part;
+    use nr::*;
+    Some(match nr {
+        EPOLL_CREATE1 | EPOLL_CTL | EPOLL_PWAIT | EPOLL_PWAIT2 | EVENTFD2 => Part::Epoll,
+        INOTIFY_INIT1 | INOTIFY_ADD_WATCH | INOTIFY_RM_WATCH => Part::Inotify,
+        LANDLOCK_CREATE_RULESET | LANDLOCK_ADD_RULE | LANDLOCK_RESTRICT_SELF => Part::Landlock,
+        INIT_MODULE | FINIT_MODULE | DELETE_MODULE => Part::Module,
+        SECCOMP => Part::Seccomp,
+        SWAPON | SWAPOFF => Part::Swap,
+        TIMERFD_CREATE | TIMERFD_SETTIME | TIMERFD_GETTIME => Part::Timerfd,
+        _ => return None,
+    })
+}
+
 /// C の int 引数: 下位 32bit を符号拡張する
 fn int(v: u64) -> i64 {
     v as i32 as i64
@@ -287,6 +303,14 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 proc::die(signal::SIGSYS);
             }
         }
+    }
+    // 切ったところ (aios.off=。parts.rs) のシステムコールは、それを入れずに作った Linux と同じ ENOSYS
+    if let Some(p) = part_of(nr)
+        && crate::parts::off(p)
+    {
+        tf.x[0] = (-ENOSYS) as u64;
+        strace(nr, &a, Err(-ENOSYS));
+        return None;
     }
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
@@ -1591,6 +1615,8 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize) -> R {
         }
         PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
         PR_GET_SECCOMP => return Ok(crate::seccomp::mode(&p.cred).0 as i64),
+        // seccomp を切っていれば (aios.off=seccomp)、入れずに作った Linux と同じ EINVAL
+        PR_SET_SECCOMP if crate::parts::off(crate::parts::Part::Seccomp) => return Err(-EINVAL),
         PR_SET_SECCOMP => return crate::seccomp::prctl_set(arg as u64, arg3),
         PR_SET_NAME => {
             let mut b = [0u8; 16];
