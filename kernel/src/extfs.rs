@@ -997,7 +997,11 @@ impl ExtFs {
             }
             self.sb_add_free_inodes(-1);
             self.cache.borrow_mut().ib_dirty.insert(g);
-            return Ok(g * self.ipg + bit + 1);
+            let ino = g * self.ipg + bit + 1;
+            // 前にこの番号だったファイルのページがページキャッシュに残っていたら捨てる (大きなロックなしの read は、
+            // 表にあるページと大きさをいまのものとして読む)
+            crate::vm::file_changed((self.fs, ino as u64));
+            return Ok(ino);
         }
         Err(-ENOSPC)
     }
@@ -1006,6 +1010,8 @@ impl ExtFs {
         if dir {
             self.forget_names(ino);
         }
+        // ページキャッシュの中身も (番号はまた使われる)
+        crate::vm::file_changed((self.fs, ino as u64));
         let (g, bit) = ((ino - 1) / self.ipg, ((ino - 1) % self.ipg) as usize);
         let bm = self.inode_bitmap(g);
         self.modify_block(bm, |d| d[bit / 8] &= !(1 << (bit % 8)))?;
