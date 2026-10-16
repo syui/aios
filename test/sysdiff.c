@@ -10,6 +10,13 @@
 //           か @FILE (FILE に書いた CASE をみな。空白か改行で分ける。シリアルの端末に長い行を打たないため)
 //     DIR   case ごとの場所をここに作り、終わったら消す (書けるところ。ext4 なら ext4 とくらべる)
 //
+//   sysdiff -l   aios がえらんだちがい (chosen) の一覧: chosen NAME わけ
+//
+// aios がえらんだちがい: Linux に合わせるのは最初の手本で、Linux よりよい道をえらんだところは chosen に名前と
+// わけを書く (doc/aios.md の「aios がえらんだちがい」)。Linux で動かすときは、そこだけ aios のふるまいをまねて
+// 答えにする (手本は、Linux の答えに aios がえらんだものを足したもの)。それを通った op の行の終わりには
+// [chosen NAME] をつける (どちらでも同じ条件で)。aish の sysdiff は、それをまちがいのちがいと分けて数える
+//
 // 出力はアーキテクチャによらない: フラグは名前で、stat は種類、許可、リンクの数、大きさ (ファイルとリンク
 // だけ)、自分のものか。ino や時刻は出さない
 //   sys SYSNAME RELEASE MACHINE      (はじめに 1 度。くらべない)
@@ -176,6 +183,16 @@ static const char *ename(int e) {
     snprintf(b, sizeof b, "E%d", e);
     return b;
 }
+
+// aios がえらんだちがい (上の説明と doc/aios.md)。ここに足したら、exec で Linux のときにまねて [chosen NAME] をつける
+static const struct {
+    const char *name, *why;
+} chosen[] = {
+    {"pwrite-append", "O_APPEND で開いた fd でも pwrite64 は off に書く (POSIX)。Linux は off を見ずに終わりに書く (pwrite(2) の BUGS)"},
+};
+
+// aios の中で動いているか (uname の sysname)。でなければ chosen のふるまいをまねる
+static int on_aios;
 
 static void ret(long r) {
     if (r < 0)
@@ -763,7 +780,20 @@ static void exec(int i, const struct op *o) {
             r = syscall(SYS_write, fd, wbuf, (size_t)o->len);
         } else {
             say("pwrite64(%d, %lld, %lld)", fd, o->len, o->off);
+            // chosen pwrite-append: O_APPEND の fd でも off に書く。Linux では O_APPEND をはずして書き、もどす
+            int fl = (int)syscall(SYS_fcntl, fd, F_GETFL);
+            int app = fl >= 0 && (fl & O_APPEND);
+            if (app && !on_aios)
+                syscall(SYS_fcntl, fd, F_SETFL, fl & ~O_APPEND);
             r = syscall(SYS_pwrite64, fd, wbuf, (size_t)o->len, (off_t)o->off);
+            int e = errno;
+            if (app && !on_aios)
+                syscall(SYS_fcntl, fd, F_SETFL, fl);
+            errno = e;
+            ret(r);
+            if (app && r > 0)
+                say(" [chosen pwrite-append]");
+            break;
         }
         ret(r);
         break;
@@ -1222,12 +1252,17 @@ static int runarg(const char *base, int *c, const char *arg, int n) {
 
 int main(int argc, char **argv) {
     int n = 30, a = 1;
+    if (argc == 2 && !strcmp(argv[1], "-l")) {
+        for (size_t i = 0; i < sizeof chosen / sizeof *chosen; i++)
+            printf("chosen %s %s\n", chosen[i].name, chosen[i].why);
+        return 0;
+    }
     if (a + 1 < argc && !strcmp(argv[a], "-n")) {
         n = atoi(argv[a + 1]);
         a += 2;
     }
     if (n < 1 || n > MAXOPS || argc - a < 2) {
-        fprintf(stderr, "usage: sysdiff [-n OPS] DIR SEED[:I,J,...]|FROM-TO...\n");
+        fprintf(stderr, "usage: sysdiff [-n OPS] DIR SEED[:I,J,...]|FROM-TO|@FILE...\n       sysdiff -l\n");
         return 2;
     }
     char base[4096];
@@ -1238,6 +1273,7 @@ int main(int argc, char **argv) {
     a++;
     struct utsname u;
     if (uname(&u) == 0) {
+        on_aios = !strcmp(u.sysname, "aios");
         say("sys %s %s %s", u.sysname, u.release, u.machine);
         flush();
     }

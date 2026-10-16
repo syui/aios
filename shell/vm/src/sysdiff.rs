@@ -2,7 +2,9 @@
 // VM の aios で動かし、case ごとに最初にちがう行をくらべる。ちがいは (op、Linux の答え、aios の答え) で
 // まとめ (syzbot がクラッシュをまとめるように)、多いものから、op を減らしてもちがいが残るいちばん小さな並び
 // (SEED:I,J,...) にする (C-Reduce や syzkaller の minimize と同じ: 縮めたものも、同じちがいが同じ op で出ること)。
-// 縮めるのは、まとめたものをみな 1 回の Linux と 1 回の VM でためす (VM は 1 回の行き来が重いので)
+// 縮めるのは、まとめたものをみな 1 回の Linux と 1 回の VM でためす (VM は 1 回の行き来が重いので)。
+// aios がえらんだちがい (sysdiff -l の chosen) は、Linux でもそのふるまいをまねて答えにするので、ちがいには
+// ならない。それを通った op の行には [chosen NAME] がつくので、いくつの case で使ったかを chosen に出す
 use super::{boot, compiler, kernel_for, note, sh, sub, vmpy};
 use aish_plugin::{Value, json, s};
 use std::path::{Path, PathBuf};
@@ -36,6 +38,22 @@ fn build(root: &Path, dir: &Path) -> Result<(PathBuf, PathBuf), String> {
         }
     }
     Ok((host, aios))
+}
+
+/// aios がえらんだちがい (sysdiff -l の「chosen NAME わけ」の行): (名前, わけ)
+fn chosen_list(root: &Path, host: &Path) -> Vec<(String, String)> {
+    let (st, out, _, _, _) = sh(root, &host.display().to_string(), &["-l"], &[], Duration::from_secs(10));
+    if st != 0 {
+        return Vec::new();
+    }
+    out.lines().filter_map(|l| l.strip_prefix("chosen ")?.split_once(' ')).map(|(n, w)| (n.to_string(), w.to_string())).collect()
+}
+
+/// えらんだちがい name を通った case の数 (どちらかの出力に [chosen NAME] で終わる行があるもの)
+fn chosen_cases(name: &str, l: &[(String, Vec<String>)], a: &[(String, Vec<String>)]) -> usize {
+    let mark = format!("[chosen {}]", name);
+    let used: std::collections::BTreeSet<&str> = l.iter().chain(a).filter(|(_, v)| v.iter().any(|x| x.ends_with(&mark))).map(|(c, _)| c.as_str()).collect();
+    used.len()
 }
 
 /// このマシンの Linux で動かす。root なら nobody で (aios の中は ai なので、許可のしらべが同じになるように)。
@@ -120,6 +138,10 @@ fn op_line(l: &str) -> Option<(usize, &str, &str)> {
 
 /// ことばの形: 数字は # に (3 と 4 の fd のちがいより、成功と EISDIR のちがいでまとめる)
 fn shape(t: &str) -> String {
+    // 中身のハッシュ (h と 16 進の 8 けた) も、数と同じく 1 つの印に (でないと、ハッシュごとにちがう印になる)
+    if t.len() == 9 && t.starts_with('h') && t[1..].bytes().all(|b| b.is_ascii_hexdigit()) {
+        return "h#".into();
+    }
     let mut out = String::new();
     for c in t.chars() {
         if c.is_ascii_digit() {
@@ -185,6 +207,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     note(json!({ "step": "build" }));
     let (host, _) = build(root, &dir)?;
+    let chosen = chosen_list(root, &host);
     let cases = dir.join("cases.txt");
     std::fs::write(&cases, format!("{}-{}\n", from, from + seeds - 1)).map_err(|e| e.to_string())?;
     // Linux の答え: ほかの Linux で作ったもの (linux) か、このマシンで
@@ -339,7 +362,8 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         "differ": lcases.len() - same - missing,
         "kinds": groups.len(),
         "groups": out_groups,
-        "note": "groups are sorted by how many cases show them. small is the shrunk case SEED:I,J,... (only those ops); its linux and aios traces end with the first difference. Run one again with test/sysdiff.c: sysdiff -n OPS DIR CASE on Linux and in the VM",
+        "chosen": chosen.iter().map(|(n, w)| json!({ "name": n, "why": w, "cases": chosen_cases(n, &lcases, &acases) })).collect::<Vec<_>>(),
+        "note": "groups are sorted by how many cases show them. small is the shrunk case SEED:I,J,... (only those ops); its linux and aios traces end with the first difference. Run one again with test/sysdiff.c: sysdiff -n OPS DIR CASE on Linux and in the VM. chosen: differences aios chose over Linux (test/sysdiff.c, doc/aios.md); the Linux run imitates them, so they are not in differ; cases is how many cases went through each",
     });
     if missing > 0 {
         r["missing"] = json!(missing);
@@ -367,6 +391,8 @@ mod tests {
         assert_eq!(signature("7 fstat(4) = 0 fifo 0600 n1 me", "7 fstat(4) = 0 fifo 0600 n1 other"), "fstat: me vs other");
         assert_eq!(signature("7 newfstatat(cwd, \"d/c\", 0) = 0 reg 0600 n1 s5001 me", "7 newfstatat(cwd, \"d/c\", 0) = 0 reg 0600 n1 s100001 me"), "newfstatat: s# differs");
         assert_eq!(signature("  \"r/a\" reg 0644 n1 s6 me h1", "  \"r/a\" reg 0644 n2 s6 me h1"), "world: n# differs");
+        assert_eq!(signature("  \"r/a\" reg 0644 n1 s1 me hed0c3757", "  \"r/a\" reg 0644 n1 s1 me hab0bcf71"), "world: h# differs");
+        assert_eq!(signature("17 read(4, 16384) = 100 h60ddf891", "17 read(4, 16384) = 100 hEACCES"), "read: h# vs hEACCES");
         assert_eq!(signature("end exit 0", "end signal 14"), "end: exit vs signal");
         assert_eq!(op_line("12 read(3, 0) = 0"), Some((12, "read", "0")));
     }
@@ -382,5 +408,14 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].0, "2:0");
         assert_eq!(case_of("7", &[0, 3, 9]), "7:0,3,9");
+    }
+
+    #[test]
+    fn chosen() {
+        let c = |n: &str, l: &[&str]| (n.to_string(), l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let l = vec![c("1", &["3 pwrite64(3, 7, 0) = 7 [chosen pwrite-append]"]), c("2", &["3 pwrite64(3, 7, 0) = 7"])];
+        let a = vec![c("1", &["3 pwrite64(3, 7, 0) = 7 [chosen pwrite-append]"]), c("3", &["0 pwrite64(4, 1, 3) = 1 [chosen pwrite-append]"])];
+        assert_eq!(chosen_cases("pwrite-append", &l, &a), 2);
+        assert_eq!(chosen_cases("pwrite", &l, &a), 0);
     }
 }
