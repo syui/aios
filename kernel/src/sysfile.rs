@@ -1299,14 +1299,8 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     if flags & RENAME_EXCHANGE != 0 && target.is_none() {
         return Err(-ENOENT);
     }
-    // name/ はディレクトリのもの (EXCHANGE なら、それぞれがそれぞれの名前の)
-    if !moving.meta().is_dir() && (o.slash || (flags & RENAME_EXCHANGE == 0 && n.slash)) {
-        return Err(-ENOTDIR);
-    }
-    if flags & RENAME_EXCHANGE != 0 && n.slash && !target.as_ref().is_some_and(|t| t.meta().is_dir()) {
-        return Err(-ENOTDIR);
-    }
-    // 自分の下へは動かせない (EINVAL)。動かすものの上にあるものへは、上書きできない (ENOTEMPTY。Linux の lock_rename の trap)
+    // 自分の下へは動かせない (EINVAL)。動かすものの上にあるものへは、上書きできない (ENOTEMPTY。Linux の lock_rename の
+    // trap)。Linux 7 からは、名前を引いたすぐあと (__start_renaming) で、下の name/ のしらべより先
     let (odir, ndir) = (String::from(dir_of(&o.full)), String::from(dir_of(&n.full)));
     let under = |a: &str, b: &str| b == a || b.starts_with(&alloc::format!("{}/", a));
     if odir != ndir {
@@ -1316,6 +1310,13 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         if target.is_some() && under(&n.full, &odir) {
             return Err(if flags & RENAME_EXCHANGE != 0 { -EINVAL } else { -ENOTEMPTY });
         }
+    }
+    // name/ はディレクトリのもの (EXCHANGE なら、それぞれがそれぞれの名前の)
+    if flags & RENAME_EXCHANGE != 0 && n.slash && !target.as_ref().is_some_and(|t| t.meta().is_dir()) {
+        return Err(-ENOTDIR);
+    }
+    if !moving.meta().is_dir() && (o.slash || (flags & RENAME_EXCHANGE == 0 && n.slash)) {
+        return Err(-ENOTDIR);
     }
     // 同じもの (同じ inode を指す 2 つの名前) なら何もしない (Linux と同じ)
     if target.as_ref().is_some_and(|t| t.id() == moving.id()) {

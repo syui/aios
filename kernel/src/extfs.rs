@@ -2659,6 +2659,9 @@ impl Inode for ExtInode {
         true
     }
 
+    /// aios がえらんだちがい (seek-unwritten): fallocate でとってまだ書いていないところ (未初期化の extent) は、いつも
+    /// 穴 (ext_next_data が飛ばす)。Linux の ext4 は、そこのページがキャッシュにあれば (読んだあと) データとするので、
+    /// 答えがキャッシュのぐあいで変わる。doc/aios.md の「aios がえらんだちがい」
     fn seek_data(&self, off: u64, hole: bool) -> Option<Result<u64, i64>> {
         const ENXIO: i64 = 6;
         let r = match self.raw() {
