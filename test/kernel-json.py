@@ -8,6 +8,8 @@
 # core / extra / quirk は、kernel.json の名前をその順に並べたもの。off (起動の引数 aios.off= で切れるものと、切るとどうなるか) の
 # あるものは src/parts.rs の NAMES (と enum Part の順) と同じ。bench (速さを測るもの) はあるファイルで、prof の区間の名前は
 # part:what (part は kernel.json の名前。/proc/ai/prof が part ごとに足す)
+# aios がえらんだちがい (Linux とちがうふるまいを、えらんでとったもの): test/sysdiff.c の chosen の名前は、doc/aios.md の
+# 表と、カーネルのソースの「aios がえらんだちがい (名前)」にもあること (Linux に合わせようとして消さないように)
 # 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく)
 import json
 import os
@@ -119,6 +121,26 @@ for t in ("core", "extra", "quirk"):
         lost, more = [n for n in want if n not in got], [n for n in got if n not in want]
         err(".aios.json kernel.%s is not the %s names of kernel.json in order (missing %s, not in kernel.json %s)" % (t, t, lost, more))
 
+# aios がえらんだちがい: ロボット (test/sysdiff.c の chosen)、doc/aios.md の表、カーネルのソースの印がそろっているか
+top = os.path.join(root, "..")
+with open(os.path.join(top, "test", "sysdiff.c"), encoding="utf-8") as f:
+    m = re.search(r"\} chosen\[\] = \{(.*?)\n\};", f.read(), re.S)
+chosen = re.findall(r'\{"([a-z0-9-]+)", "', m.group(1)) if m else []
+if not chosen:
+    err("test/sysdiff.c: no chosen list")
+with open(os.path.join(top, "doc", "aios.md"), encoding="utf-8") as f:
+    doc = f.read()
+table = doc.split("#### aios がえらんだちがい", 1)[-1].split("\n## ", 1)[0]
+in_doc = set(re.findall(r"^\| ([a-z0-9-]+) \|", table, re.M))
+marked = {n for s in text.values() for n in re.findall(r"aios がえらんだちがい \(([a-z0-9-]+)\)", s)}
+for n in chosen:
+    if n not in in_doc:
+        err("chosen %s (test/sysdiff.c) is not in the table of doc/aios.md (aios がえらんだちがい)" % n)
+    if n not in marked:
+        err("chosen %s (test/sysdiff.c) has no 「aios がえらんだちがい (%s)」 in kernel/src" % (n, n))
+for n in sorted((in_doc | marked) - set(chosen)):
+    err("chosen %s is in doc/aios.md or kernel/src but not in test/sysdiff.c (the robot would not check it)" % n)
+
 # 数と、core が extra を使っているところ (crate::NAME)
 lines = {t: sum(text[s].count("\n") for s, (_, k) in files.items() if k == t) for t in ("core", "extra")}
 count = {t: sum(1 for _, k in files.values() if k == t) for t in ("core", "extra")}
@@ -133,5 +155,6 @@ print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
+print("chosen (aios がえらんだちがい) %d: %s" % (len(chosen), " ".join(chosen)))
 print("kernel-json: %d failed" % len(errors))
 sys.exit(min(len(errors), 125))
