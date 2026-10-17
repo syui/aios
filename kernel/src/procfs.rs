@@ -99,6 +99,7 @@ enum Node {
     AiMem,
     AiFs,
     AiTrace,
+    AiParts,
     AiFdDir,
     AiFd(u32),
     /// /proc/ai/stack と stack/TID (スレッドの番号)
@@ -202,6 +203,7 @@ impl ProcInode {
             Node::AiMem => 49,
             Node::AiFs => 50,
             Node::AiTrace => 51,
+            Node::AiParts => 52,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
             Node::AiStackDir => 45,
@@ -279,6 +281,7 @@ impl ProcInode {
             Node::AiMem => crate::aiproc::mem_json(),
             Node::AiFs => crate::aiproc::fs_json(),
             Node::AiTrace => crate::trace::json(),
+            Node::AiParts => crate::parts::json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
@@ -749,6 +752,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "mem") => Node::AiMem,
             (Node::AiDir, "fs") => Node::AiFs,
             (Node::AiDir, "trace") => Node::AiTrace,
+            (Node::AiDir, "parts") => Node::AiParts,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
@@ -858,6 +862,7 @@ impl Inode for ProcInode {
                 add("mem".into(), Node::AiMem);
                 add("fs".into(), Node::AiFs);
                 add("trace".into(), Node::AiTrace);
+                add("parts".into(), Node::AiParts);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
             }

@@ -11,6 +11,7 @@
 //             ページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス (mem_json)
 //   fs        ファイルシステムの中: マウントごとの様子 (ext4 のブロックキャッシュ、ジャーナル、inode の覚え。tmpfs の
 //             ページ)、パスの覚え、開いているファイルの数、区画ごとのディスクの読み書き (fs_json)
+//   parts     切れるところ (parts.rs) のいまの様子: 切ってあるか、動かしたまま変えられるか。だれでも読める
 //   trace     カーネルの中の出来事の記録 (trace.rs): システムコールの入りと出、スレッドの切りかえ、眠りと起こし、
 //             割り込み、ディスクの読み書き、ページフォルト、exec と exit。ctl の trace on で始める。aish の trace
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
@@ -27,6 +28,8 @@
 //               heap check    ヒープの空きの管理 (tlsf) の決まりを確かめて kmsg に (heap: check ok / FAILED)
 //               prof on|off   カーネルの中の区間 (prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
 //               lockbench     スピンロック、ヒープ、大きなロック、時計の 1 回の時間を kmsg に (spinlock::bench)
+//               part NAME off|on  切れるところ (kernel.json の off) を、動かしたまま切る・入れる (使うたびに見るもの
+//                             だけ: システムコールと quirk。装置と aiproc はできない)。/proc/ai/parts で見る
 //               trace on [NAME]|off|clear  出来事の記録を始める (NAME があれば、その名前で始まるプロセスのシステム
 //                             コールとフォルトだけ)、止める、空にする (/proc/ai/trace)
 //               panic [TEXT]  カーネルを panic させる (root だけ。panic の出力とバックトレースを確かめる。Linux の
@@ -179,7 +182,7 @@ pub fn fs_json() -> String {
     )
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -201,6 +204,15 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "prof" if arg == "on" || arg == "off" => crate::prof::set(arg == "on"),
         "lockbench" => crate::spinlock::bench(),
         "trace" => crate::trace::ctl(arg)?,
+        "part" => {
+            let (name, how) = arg.split_once(' ').ok_or(-EINVAL)?;
+            let on = match how.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(-EINVAL),
+            };
+            crate::parts::set(name.trim(), on)?;
+        }
         "panic" => {
             const EPERM: i64 = 1;
             if crate::proc::current().cred.euid != 0 {

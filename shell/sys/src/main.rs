@@ -18,6 +18,7 @@
 //           メモリを多く使っているプロセス
 //   fs      ファイルシステムの中 (/proc/ai/fs): マウントごと (ext4 のブロックキャッシュ、ジャーナル、inode の覚え)、
 //           パスの覚え、開いているファイル、ディスクの読み書き
+//   part    カーネルの切れるところ (/proc/ai/parts): いま切ってあるか。off / on で、動かしたまま切る・入れる (ctl の part)
 //   trace   カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだのシステムコールの入りと出、切りかえ、眠りと
 //           起こし、割り込み、ディスク、フォルトを記録して、スレッドごと・システムコールごと・遅かったものにまとめる
 //   M-s     まとめを画面に出す (キーを押すと消える)
@@ -44,6 +45,7 @@ const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer",
 const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス (pid も name もなければ、みなからあやしいものを探す)"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"}}}"#;
 const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"file":{"type":"string","description":"tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
 const WATCH: &str = r#"{"type":"object","properties":{"lines":{"type":"integer","description":"記録の終わりから何行 (既定 20)"}}}"#;
+const PART: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"切れるところの名前 (kernel.json の off のあるもの: epoll inotify landlock module ns seccomp swap timerfd vdso tty-root-fdlink sound-min-period qemu-uart-burst。装置 (net、virtio_rng、bcm2835_rng) と aiproc は起動のときだけ: box で)"},"off":{"type":"boolean","description":"true で切る、false で入れる。なければ見るだけ"}}}"#;
 const TRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。記録を空にして始め、終わったら止めて読む。なければ、いま記録にあるものを読むだけ"},"name":{"type":"string","description":"この名前で始まるプロセスのシステムコールとフォルトだけ (既定: cmd の最初の語。切りかえ・眠り・起こし・割り込み・ディスクはみな)"},"all":{"type":"boolean","description":"名前で絞らない (みなのシステムコールも)"},"limit":{"type":"integer","description":"events に返す出来事の数 (終わりから。既定 200)"},"timeout_ms":{"type":"integer","description":"cmd をこれで止める (既定 50000)"}}}"#;
 const MEM: &str = r#"{"type":"object","properties":{"files":{"type":"integer","description":"ページキャッシュを多く使っているファイルをいくつまで (既定 10)"},"procs":{"type":"integer","description":"メモリを多く使っているプロセスをいくつまで (既定 8)"}}}"#;
 const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
@@ -69,6 +71,7 @@ fn main() {
             Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", input: WATCH },
             Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
             Tool { name: "mem", desc: "メモリの中 (/proc/ai/mem): RAM の空き、カーネルのヒープ (使っている、いちばん多かった、空きのかたまり、取れなかった回数)、ページキャッシュ (ページの数、ファイルごと、読みそこねた数、捨てた数)、MAP_SHARED のページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス。text はまとめ、ほかはそのままの数 (ページは 4 KiB)。root か wheel の人だけ", input: MEM },
+            Tool { name: "part", desc: "カーネルの切れるところ (kernel.json の extra と quirk で off のあるもの) のいまの様子 (/proc/ai/parts: 切ってあるか、動かしたまま変えられるか)。name と off で、動かしたまま切る (システムコールは ENOSYS、quirk は手当てをしない) か入れる: 入れずに作った Linux のようにしてプログラムを動かし、戻せる。装置と aiproc は起動のときだけ (vm start の off か box)。root か wheel の人だけ", input: PART },
             Tool { name: "trace", desc: "カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだの、システムコールの入りと出 (かかった時間)、スレッドの切りかえ、眠りと起こし (待った時間、起こされてから走るまで)、割り込み、ディスクの読み書き、ページフォルトを記録して、スレッドごと、システムコールごと (回数、合計、最大)、遅かった順、ディスク、割り込みにまとめる (text)。events は終わりの limit こ (t は起動からの ns、c は CPU、p は tid、k は sys/ret/switch/sleep/wake/irq/blk/blkdone/fault/exec/exit)。cmd がなければ、いま記録にあるもの (ctl の trace on で始めたもの)。root か wheel の人だけ", input: TRACE },
             Tool { name: "fs", desc: "ファイルシステムの中 (/proc/ai/fs): マウントごとの様子 (ext4 はブロックキャッシュの数と当たり・外れ・捨てた数、まだ書いていないブロック、書き出した回数、ジャーナル、inode と名前の覚え、空き。tmpfs はページ)、パスの覚え (数、当たり・外れ、捨てた回数)、開いているファイルの数、区画ごとのディスクの読み書き。text はまとめ、ほかはそのままの数。root か wheel の人だけ", input: NONE },
         ],
@@ -94,6 +97,7 @@ fn main() {
                 "mem" => mem(a),
                 "fs" => fs(),
                 "trace" => trace(a, pwd),
+                "part" => part(a),
                 "threads" => threads(a),
                 "hang" => hang(a),
                 "stack" => stack(a),
@@ -431,6 +435,35 @@ fn fs_text(f: &Value) -> String {
         }
     }
     t
+}
+
+// ---- part: 切れるところを動かしたまま切る・入れる (/proc/ai/parts、ctl の part) ----
+
+fn part(a: &Value) -> Value {
+    if !Path::new("/proc/ai/parts").exists() {
+        return error("no /proc/ai/parts (not aios, or an older kernel)");
+    }
+    let name = s(a, "name");
+    let mut changed = Value::Null;
+    if let Some(off) = a["off"].as_bool() {
+        if name.is_empty() {
+            return error("name is needed with off");
+        }
+        if let Err(e) = write_root("/proc/ai/ctl", &format!("part {} {}", name, if off { "off" } else { "on" })) {
+            return error(format!("{} (a device or aiproc cannot be changed while running; see /proc/kmsg)", e));
+        }
+        changed = json!({ "name": name, "off": off });
+    }
+    let p = match read("/proc/ai/parts").ok_or_else(|| "cannot read /proc/ai/parts".to_string()).and_then(|t| serde_json::from_str::<Value>(t.trim()).map_err(|e| e.to_string())) {
+        Ok(p) => p,
+        Err(e) => return error(e),
+    };
+    let list: Vec<&Value> = p["parts"].as_array().map(|v| v.iter().filter(|x| name.is_empty() || s(x, "name") == name).collect()).unwrap_or_default();
+    let mut t = String::new();
+    for x in &list {
+        t.push_str(&format!("{:<18} {}{}\n", s(x, "name"), if x["off"].as_bool().unwrap_or(false) { "off" } else { "on " }, if x["runtime"].as_bool().unwrap_or(false) { "" } else { "  (boot only)" }));
+    }
+    json!({ "text": t, "parts": list, "changed": changed })
 }
 
 // ---- trace: カーネルの中の出来事 (/proc/ai/trace) ----

@@ -76,6 +76,8 @@ t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc
 t ai-mem sh -c 'm=$(sudo -n cat /proc/ai/mem) && echo "$m" | grep -q "\"page_cache\":{\"pages\":[0-9]" && echo "$m" | grep -q "\"heap\":{\"size\":[0-9]" && echo "$m" | grep -q "\"procs\":\[{\"pid\":"'
 # /proc/ai/trace: 記録を空にして始め、ls を動かして止めると、その getdents64 が入っている (aish の trace)
 t ai-trace sh -c 'echo "trace clear" > /proc/ai/ctl && echo "trace on ls" > /proc/ai/ctl && ls /tmp > /dev/null && echo "trace off" > /proc/ai/ctl && sudo -n cat /proc/ai/trace > /tmp/trace.txt && head -1 /tmp/trace.txt | grep -q "\"on\":false,\"filter\":\"ls\",\"events\":[1-9]" && grep -q "\"k\":\"sys\",\"n\":\"getdents64\"" /tmp/trace.txt && grep -q "\"k\":\"switch\"" /tmp/trace.txt'
+# /proc/ai/parts と ctl の part: timerfd を動かしたまま切って入れる。装置 (net) は切れない
+t ai-part sh -c 'echo "part timerfd off" > /proc/ai/ctl && grep -q "\"name\":\"timerfd\",\"off\":true,\"runtime\":true" /proc/ai/parts && echo "part timerfd on" > /proc/ai/ctl && grep -q "\"name\":\"timerfd\",\"off\":false" /proc/ai/parts && ! sh -c "echo part net off > /proc/ai/ctl" 2>/dev/null'
 t ai-fs sh -c 'f=$(sudo -n cat /proc/ai/fs) && echo "$f" | grep -q "\"target\":\"/\",\"source\":\"/dev/vda[0-9]*\",\"type\":\"ext4\"" && echo "$f" | grep -q "\"cache\":{\"blocks\":[0-9]" && echo "$f" | grep -q "\"paths\":{\"entries\":[0-9]"'
 
 echo "checks: $n, $fail failed"
