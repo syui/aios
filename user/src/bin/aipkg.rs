@@ -546,6 +546,11 @@ fn install(path: &str, explicit: bool) {
         if e.header().entry_type().is_hard_link() && fs::symlink_metadata(&dest).is_ok_and(|m| !m.is_dir()) {
             let _ = fs::remove_file(&dest);
         }
+        // ふつうのファイルも先に外して新しい inode に: 上書きすると、動いているプログラム (のコードのページ: ファイルの
+        // ページは 1 枚) が変わる (カーネルは ETXTBSY にする)。外せば、動いているものは古い inode を使いつづける
+        if e.header().entry_type().is_file() && fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file()) {
+            let _ = fs::remove_file(&dest);
+        }
         if let Err(err) = e.unpack_in(ROOT) {
             let msg = format!("{}: /{}: {}", r.name, epath, err);
             fail(&created, msg);

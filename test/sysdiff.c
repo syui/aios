@@ -34,6 +34,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <limits.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -260,6 +262,7 @@ static const struct {
 } linux_bugs[] = {
     {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
     {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。7.2.11 と 6.18: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
+    {"tmpfs-extend", "tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (7.2.11: shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする)。POSIX は、伸ばしたところは 0 と読めると決めている"},
 };
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
@@ -315,9 +318,9 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, NKIND};
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3};
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -353,6 +356,19 @@ static const struct {
 };
 #define NRWF 14
 static const unsigned rwfw[NRWF] = {8, 2, 3, 2, 8, 6, 4, 2, 4, 2, 2, 2, 2, 2};
+// mmap: 長さ、ファイルの位置 (3 はそろっていない: EINVAL)、prot、msync の flags。mread / mwrite の写しの中の位置
+// (-1 はいちばん終わりのバイト) と長さ (写しの終わりで切る)
+static const long long mlens[] = {0, 1, 4096, 8192, 12000, 100000};
+static const unsigned mlensw[6] = {1, 2, 4, 4, 3, 3};
+static const long long moffs[] = {0, 4096, 8192, 3};
+static const unsigned moffsw[4] = {7, 2, 1, 1};
+static const int mprotv[] = {PROT_READ, PROT_READ | PROT_WRITE, PROT_NONE, PROT_WRITE};
+static const char *const mprotn[] = {"PROT_READ", "PROT_READ|PROT_WRITE", "PROT_NONE", "PROT_WRITE"};
+static const unsigned mprotw[4] = {5, 6, 1, 2};
+static const int msv[] = {MS_ASYNC, MS_SYNC, MS_INVALIDATE, MS_SYNC | MS_ASYNC, 0};
+static const char *const msn[] = {"MS_ASYNC", "MS_SYNC", "MS_INVALIDATE", "MS_SYNC|MS_ASYNC", "0"};
+static const long long maoffs[] = {0, 3, 4096, 4097, 8191, -1};
+static const long long malens[] = {1, 10, 100, 4096};
 static const long long soffs[] = {0, 1, 5, 100, 4096, 10000, -1, -4097, 1LL << 40};
 static const long long tlens[] = {0, 1, 5, 4096, 5000, 100000, -1};
 static const int whv[] = {SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE, 7};
@@ -445,20 +461,41 @@ static int res[MAXOPS][2];
 // 作った fd の引数のもと (op の番号 * 2 + 端)、パイプか (1 読む口、2 書く口。F_SETFL でも O_NONBLOCK を消さない:
 // 読み書きで止まらないように)、開けられそうか (あるはずのパスを、ふつうのフラグで。そういうものを多く使う)、
 // 何で開いたか (1 読む、2 書く。O_PATH は 0)
-static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS], refacc[2 * MAXOPS];
-// genfd2 が選んだものの refacc (dup はそれを引きつぐ)
-static int lastacc;
+static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS], refacc[2 * MAXOPS], refdir[2 * MAXOPS];
+// genfd2 が選んだものの refacc と refdir (ディレクトリを開いたもの。dup はそれを引きつぐ)。lastfile は genfile が
+// ファイルらしいものを選べたか
+static int lastacc, lastdir, lastfile;
+// 写した領域 (mmap の op の番号) と、できていそうか (fd が読めるふつうのファイルで、長さと位置がよい)。
+// exec では mres / mlen にその場所と長さ (外したら NULL)
+static int nmref, mrefs[MAXOPS], mlikely[MAXOPS];
+
+// 写しの ref。なければ -1 (できていそうなものを多めに、近いものほど選ばれやすく)
+static int genmap(void) {
+    if (nmref == 0)
+        return -1;
+    int cand[MAXOPS], n = 0;
+    for (int i = 0; i < nmref; i++)
+        if (mlikely[i])
+            cand[n++] = mrefs[i];
+    if (n == 0 || chance(15)) {
+        n = 0;
+        for (int i = 0; i < nmref; i++)
+            cand[n++] = mrefs[i];
+    }
+    return cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+}
 
 static void addref(int r, int pipe, int likely, int acc) {
     refs[nref] = r;
     refpipe[nref] = pipe;
     reflikely[nref] = likely;
     refacc[nref] = acc;
+    refdir[nref] = lastdir;
     nref++;
 }
 
 static int genfd2(int *pipe, int *likely) {
-    *pipe = *likely = lastacc = 0;
+    *pipe = *likely = lastacc = lastdir = 0;
     if (nref == 0 || chance(4))
         return chance(50) ? REF_BAD : REF_BIG;
     int cand[2 * MAXOPS], n = 0;
@@ -475,6 +512,7 @@ static int genfd2(int *pipe, int *likely) {
     *pipe = refpipe[i];
     *likely = reflikely[i];
     lastacc = refacc[i];
+    lastdir = refdir[i];
     return refs[i];
 }
 
@@ -505,9 +543,14 @@ static int genfile(int want) {
     for (int i = 0; i < nref; i++)
         if (!refpipe[i] && reflikely[i] && (refacc[i] & want))
             cand[n++] = i;
+    lastfile = 0;
     if (n == 0 || chance(10))
         return genfd(&pipe);
-    return refs[cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)]];
+    int j = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+    lastacc = refacc[j];
+    lastdir = refdir[j];
+    lastfile = !lastdir;
+    return refs[j];
 }
 
 static int gendir(void) {
@@ -593,6 +636,7 @@ static char genpath(char *p, int target) {
 static void gen(uint64_t seed, int n) {
     rs = seed;
     nref = 0;
+    nmref = 0;
     nknown = 0;
     fallocated = 0;
     know("a", 'f');
@@ -619,6 +663,9 @@ static void gen(uint64_t seed, int n) {
             if (!any)
                 o->kind = PIPE;
         }
+        // 写しを使う op は、まだ写しがなければたいてい mmap に
+        if ((o->kind == MUNMAP || o->kind == MSYNC || o->kind == MREAD || o->kind == MWRITE) && nmref == 0 && chance(80))
+            o->kind = MMAP;
         o->d1 = o->d2 = REF_CWD;
         o->fd = REF_BAD;
         switch (o->kind) {
@@ -644,6 +691,7 @@ static void gen(uint64_t seed, int n) {
                 know(o->p1, 'f');
             int odd = (1 << 1) | (1 << 4) | (1 << 8) | B_TMPFILE;
             static const int accbits[] = {1, 2, 3, 0};
+            lastdir = k == 'd';
             addref(2 * i, 0, o->d1 == REF_CWD && o->acc != 3 && !(o->of & odd) && (k || ((o->of & B_CREAT) && o->p1[0] && o->p1[0] != 'x')),
                    (o->of & (1u << 8)) ? 0 : accbits[o->acc]);
             break;
@@ -784,6 +832,7 @@ static void gen(uint64_t seed, int n) {
         }
         case PIPE:
             o->x = chance(30);
+            lastdir = 0;
             addref(2 * i, 1, 1, 1);
             addref(2 * i + 1, 2, 1, 2);
             break;
@@ -868,6 +917,35 @@ static void gen(uint64_t seed, int n) {
             o->d2 = chance(85) ? genpipe2(2, o->fd) : genfd(&pipe);
             o->len = splens[pickw(splw, 8)];
             o->mode = pickw(spfw, 4);
+            break;
+        case MMAP: {
+            // fd のファイルを写す (たいてい読めるふつうのファイル。len と off は表から。prot と MAP_SHARED / MAP_PRIVATE)。
+            // できたら写しの ref
+            int file = chance(85);
+            o->fd = file ? genfile(1) : genfd(&pipe);
+            o->len = mlens[pickw(mlensw, 6)];
+            o->off = moffs[pickw(moffsw, 4)];
+            o->x = (int)pickw(mprotw, 4);
+            o->y = chance(50);
+            mlikely[nmref] = file && lastfile && o->len > 0 && o->off % 4096 == 0;
+            mrefs[nmref++] = i;
+            break;
+        }
+        case MUNMAP:
+            o->d1 = genmap();
+            o->x = chance(30);
+            break;
+        case MSYNC:
+            o->d1 = genmap();
+            o->x = (int)pick(5);
+            break;
+        case MREAD:
+        case MWRITE:
+            // 写しの中の位置から len バイトを読む / 書く (さわれなければ SIGSEGV、ファイルの終わりの先のページなら SIGBUS)
+            o->d1 = genmap();
+            o->off = maoffs[pick(6)];
+            o->len = malens[pick(4)];
+            o->x = (int)pick(256);
             break;
         case READV:
         case WRITEV:
@@ -1110,6 +1188,22 @@ static void saydents(int fd, long long size) {
 
 static unsigned char wbuf[16384], rbuf[16384];
 
+// mmap の写し (op の番号ごと): 場所と長さ (外したら NULL)。mread / mwrite のシグナルは sigsetjmp で受けて答えにする
+static void *mres[MAXOPS];
+static size_t mlen[MAXOPS];
+static sigjmp_buf jb;
+static volatile sig_atomic_t jsig, injmp;
+
+static void onsig(int s) {
+    if (!injmp) {
+        signal(s, SIG_DFL);
+        raise(s);
+        return;
+    }
+    jsig = s;
+    siglongjmp(jb, 1);
+}
+
 // readv などの iovec: 全部で len バイトを形 (shapes) に分けて buf に並べる (bad の 2 つめはさわれないページ badpage)
 static void *badpage;
 static int mkiov(struct iovec *iov, int shape, unsigned char *buf, long long len) {
@@ -1187,11 +1281,48 @@ static void mark_spliced(int fd) {
     nspliced++;
 }
 
+// linuxbug tmpfs-extend: この op がファイル (fd) に書きはじめる位置 (書かないものは LLONG_MAX)。chosen の pwrite-append と
+// copy-append で、Linux もアイオスと同じ位置に書く
+static long long wstart_of(const struct op *o, int fd, long long size) {
+    int fl = (int)syscall(SYS_fcntl, fd, F_GETFL);
+    int app = fl >= 0 && (fl & O_APPEND);
+    long long cur = app ? size : (long long)lseek(fd, 0, SEEK_CUR);
+    switch (o->kind) {
+    case WRITE:
+    case WRITEV:
+        return cur;
+    case PWRITE:
+        return o->off;
+    case PWRITEV2:
+        if (o->off < 0)
+            return cur;
+        return (rwfs[o->rwf].v & 0x10) ? size : o->off;
+    case SENDFILE:
+    case COPYRANGE:
+    case SPLICE:
+        return coffs[o->y] >= 0 ? coffs[o->y] : cur;
+    default:
+        return LLONG_MAX;
+    }
+}
+
 static void exec(int i, const struct op *o) {
     long r = 0;
     struct stat st;
     int fd = fdarg(o);
     say("%d ", i);
+    // linuxbug tmpfs-extend: Linux の tmpfs は、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、
+    // ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (ext4 は 0 にする)。
+    // Linux では、伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までを 0 にする。
+    // 印は両方で (tmpfs のふつうのファイルが伸び、前の終わりがページの途中で、そこに op が書いていなければ)
+    // (truncate はパスなので、書けるように開いて見る: 伸ばせたなら書ける。パイプは O_NONBLOCK で ENXIO)
+    int xfd = (o->kind == SENDFILE || o->kind == COPYRANGE || o->kind == SPLICE) ? fdref(o->d2, o->fb, fd)
+              : o->kind == TRUNCATE                                                ? open(o->p1, O_WRONLY | O_NONBLOCK)
+                                                                                   : fd;
+    struct stat xs0;
+    struct statfs xsf;
+    int xt = xfd >= 0 && fstat(xfd, &xs0) == 0 && S_ISREG(xs0.st_mode) && fstatfs(xfd, &xsf) == 0 && xsf.f_type == K_TMPFS_MAGIC;
+    long long wstart = xt ? wstart_of(o, xfd, (long long)xs0.st_size) : 0;
     switch (o->kind) {
     case OPEN:
         say("openat(");
@@ -1892,6 +2023,81 @@ static void exec(int i, const struct op *o) {
         }
         break;
     }
+    case MMAP: {
+        say("mmap(%d, %lld, %s, %s, %lld)", fd, o->len, mprotn[o->x], o->y ? "MAP_SHARED" : "MAP_PRIVATE", o->off);
+        void *p = mmap(NULL, (size_t)o->len, mprotv[o->x], o->y ? MAP_SHARED : MAP_PRIVATE, fd, (off_t)o->off);
+        if (p == MAP_FAILED) {
+            ret(-1);
+        } else {
+            say(" = m%d", i);
+            mres[i] = p;
+            mlen[i] = (size_t)o->len;
+        }
+        break;
+    }
+    case MUNMAP: {
+        int m = o->d1;
+        say("munmap(m%d%s)", m, o->x ? ", first page" : "");
+        if (m < 0 || !mres[m]) {
+            say(" = (no mapping)");
+            break;
+        }
+        size_t n = o->x && mlen[m] > 4096 ? 4096 : mlen[m];
+        r = munmap(mres[m], n);
+        ret(r);
+        if (r == 0) {
+            if (n == mlen[m]) {
+                mres[m] = NULL;
+            } else {
+                mres[m] = (char *)mres[m] + n;
+                mlen[m] -= n;
+            }
+        }
+        break;
+    }
+    case MSYNC: {
+        int m = o->d1;
+        say("msync(m%d, %s)", m, msn[o->x]);
+        if (m < 0 || !mres[m]) {
+            say(" = (no mapping)");
+            break;
+        }
+        ret(msync(mres[m], mlen[m], msv[o->x]));
+        break;
+    }
+    case MREAD:
+    case MWRITE: {
+        int m = o->d1, wr = o->kind == MWRITE;
+        say("%s(m%d, %lld, %lld)", wr ? "mwrite" : "mread", m, o->off, o->len);
+        if (m < 0 || !mres[m]) {
+            say(" = (no mapping)");
+            break;
+        }
+        long long n = (long long)mlen[m], off = o->off < 0 ? (n > 0 ? n - 1 : 0) : o->off;
+        if (off >= n) {
+            say(" = (beyond the mapping)");
+            break;
+        }
+        long long len = o->len < n - off ? o->len : n - off;
+        volatile unsigned char *p = (volatile unsigned char *)mres[m] + off;
+        injmp = 1;
+        if (sigsetjmp(jb, 1) == 0) {
+            if (wr)
+                for (long long k = 0; k < len; k++)
+                    p[k] = (unsigned char)(o->x + k * 7);
+            else
+                for (long long k = 0; k < len; k++)
+                    rbuf[k] = p[k];
+            injmp = 0;
+            say(" = %lld", len);
+            if (!wr)
+                say(" h%08x", fnv(rbuf, len));
+        } else {
+            injmp = 0;
+            say(" = %s", jsig == SIGBUS ? "SIGBUS" : jsig == SIGSEGV ? "SIGSEGV" : "signal");
+        }
+        break;
+    }
     case STATX: {
         struct kstatx x;
         memset(&x, 0, sizeof x);
@@ -1912,6 +2118,31 @@ static void exec(int i, const struct op *o) {
         ret(syscall(o->x ? SYS_fdatasync : SYS_fsync, fd));
         break;
     }
+    if (xt) {
+        struct stat xs1;
+        long long end0 = (long long)xs0.st_size, pe = (end0 / 4096 + 1) * 4096;
+        if (fstat(xfd, &xs1) == 0 && (long long)xs1.st_size > end0 && end0 % 4096 != 0) {
+            long long gend = (long long)xs1.st_size < pe ? (long long)xs1.st_size : pe;
+            if (wstart < gend)
+                gend = wstart;
+            if (gend > end0) {
+                say(" [linuxbug tmpfs-extend]");
+                if (!on_aios) {
+                    static const unsigned char zeros[4096];
+                    // 伸ばせた fd は書ける (O_APPEND は外して書き、もどす)
+                    int fl = (int)syscall(SYS_fcntl, xfd, F_GETFL);
+                    if (fl >= 0 && (fl & O_APPEND))
+                        syscall(SYS_fcntl, xfd, F_SETFL, fl & ~O_APPEND);
+                    if (pwrite(xfd, zeros, (size_t)(gend - end0), (off_t)end0) < 0)
+                        say(" (zeroing failed: %s)", ename(errno));
+                    if (fl >= 0 && (fl & O_APPEND))
+                        syscall(SYS_fcntl, xfd, F_SETFL, fl);
+                }
+            }
+        }
+    }
+    if (o->kind == TRUNCATE && xfd >= 0)
+        close(xfd);
     flush();
 }
 
@@ -2050,6 +2281,8 @@ static void setup(void) {
 
 static void child(const char *w, int n, const unsigned char *keep) {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGBUS, onsig);
+    signal(SIGSEGV, onsig);
     umask(022);
     // 受けついだ fd を閉じる (どちらも 3 から使う)
     if (syscall(SYS_close_range, 3, ~0U, 0) != 0)

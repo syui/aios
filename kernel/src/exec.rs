@@ -61,6 +61,9 @@ pub struct Image {
     pub brk: usize,
     /// 動かしているプログラムの絶対パス (/proc/PID/exe。先頭 / なし)
     pub exe: String,
+    /// 動かしているプログラム (ELF) の inode。書くために開くと ETXTBSY (proc::executing: ファイルのページは 1 枚なので、
+    /// 書けば動いているプログラムのコードが変わる。Linux と同じ)
+    pub exe_id: (usize, u64),
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)。/proc/PID/cmdline と environ はここを読む
     pub args: (usize, usize, usize),
 }
@@ -240,7 +243,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, args })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args })
 }
 
 

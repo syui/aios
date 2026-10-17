@@ -29,6 +29,7 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
+const ETXTBSY: i64 = 26;
 // arm64 の値 (x86 とは違う)
 const O_DIRECTORY: u64 = 0o40000;
 const O_NOFOLLOW: u64 = 0o100000;
@@ -1204,9 +1205,13 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
         vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
-            // ふつうのファイルを書くために開く: 読むだけのマウントの下なら EROFS (デバイスはかまわない)
+            // ふつうのファイルを書くために開く: 読むだけのマウントの下なら EROFS (デバイスはかまわない)。
+            // 動かしているプログラムなら ETXTBSY (Linux の get_write_access)
             if accmode != file::O_RDONLY || flags & O_TRUNC != 0 {
                 vfs::check_writable(&full)?;
+                if proc::executing(ino.id()) {
+                    return Err(-ETXTBSY);
+                }
             }
             // O_TRUNC は O_RDONLY でも切りつめる (書く許可は上で確かめた。Linux の do_open と同じ)
             if flags & O_TRUNC != 0 {
@@ -1868,6 +1873,10 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     }
     vfs::check_writable(&full)?;
     cred::current().check(&ino.meta(), PW)?;
+    // 動かしているプログラムは切りつめられない (Linux の vfs_truncate の get_write_access)
+    if proc::executing(ino.id()) {
+        return Err(-ETXTBSY);
+    }
     crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
     vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;

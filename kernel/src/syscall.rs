@@ -590,7 +590,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MPROTECT => sys_mprotect(a[0] as usize, a[1] as usize, a[2]),
         MADVISE => sys_madvise(a[0] as usize, a[1] as usize, a[2]),
         MINCORE => sys_mincore(a[0] as usize, a[1] as usize, a[2] as usize),
-        MSYNC => sys_msync(a[0] as usize, a[1] as usize),
+        MSYNC => sys_msync(a[0] as usize, a[1] as usize, a[2]),
         MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize, a[2] as u32),
         CAPGET => sys_capget(a[0] as usize, a[1] as usize),
@@ -996,7 +996,8 @@ const PROT_WRITE: u64 = 0x2;
 fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize) -> R {
     const EACCES: i64 = 13;
     const EEXIST: i64 = 17;
-    if len == 0 || off % 4096 != 0 {
+    // Linux の順: 位置のそろい (sys_mmap)、fd (ksys_mmap_pgoff: O_PATH は EBADF)、長さ 0 (do_mmap)、許可、写せる種類
+    if off % 4096 != 0 {
         return Err(-EINVAL);
     }
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
@@ -1004,16 +1005,26 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     let back = if flags & MAP_ANONYMOUS == 0 {
         let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
         let f = f.borrow();
+        if f.flags & crate::file::O_PATH != 0 {
+            return Err(-EBADF);
+        }
+        if len == 0 {
+            return Err(-EINVAL);
+        }
         let mode = f.flags & crate::file::O_ACCMODE;
-        // 読めること。共有で書くなら書けることも
-        if mode == crate::file::O_WRONLY || (flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && mode != crate::file::O_RDWR) {
+        // 共有で書くなら書けること。それから読めること (O_WRONLY と O_ACCMODE (3) は読めない)
+        if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && mode != crate::file::O_RDWR && mode != crate::file::O_WRONLY {
+            return Err(-EACCES);
+        }
+        if mode != crate::file::O_RDONLY && mode != crate::file::O_RDWR {
             return Err(-EACCES);
         }
         match &f.kind {
-            // fend はここではまだ「off から先のファイルの長さ」。場所が決まってから va にする
-            crate::file::Kind::Inode(ino, p) if !ino.meta().is_dir() => {
+            // ふつうのファイルだけ (ディレクトリやパイプは ENODEV: Linux に mmap がない)。fend は MAX: ファイルの終わりは
+            // 触れたときの大きさで見る (その先のページは SIGBUS。vm.rs)
+            crate::file::Kind::Inode(ino, p) if ino.meta().mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG => {
                 path = Some(p.clone());
-                Backing::File { ino: ino.clone(), off, fend: (ino.meta().size as usize).saturating_sub(off), ver: crate::vm::file_ver(ino) }
+                Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
             // 画面 (/dev/fb0): フレームバッファのページをそのまま
             crate::file::Kind::Fb => {
@@ -1028,6 +1039,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             _ => return Err(-ENODEV),
         }
     } else {
+        if len == 0 {
+            return Err(-EINVAL);
+        }
         Backing::Anon
     };
     let m = proc::current().mm();
@@ -1063,7 +1077,7 @@ fn prot_bits(prot: u64) -> u8 {
 }
 
 fn sys_munmap(addr: usize, len: usize) -> R {
-    if addr & 0xfff != 0 {
+    if addr & 0xfff != 0 || len == 0 {
         return Err(-EINVAL);
     }
     proc::current().pt().unmap(addr, addr + pg_up(len));
@@ -1135,13 +1149,21 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     Ok(dst as i64)
 }
 
-/// msync: MAP_SHARED のファイルで書いたページを書き戻す (MS_ASYNC でもすぐに)
-fn sys_msync(addr: usize, len: usize) -> R {
-    if addr & 0xfff != 0 {
+/// msync: MAP_SHARED のファイルで書いたページを書き戻す (MS_ASYNC でもすぐに印をつけ、MS_SYNC ならディスクへ)。
+/// Linux と同じく: 知らないフラグ、そろっていない addr、MS_ASYNC と MS_SYNC の両方は EINVAL。範囲に領域のないところが
+/// あれば ENOMEM (あるところはしてから)
+fn sys_msync(addr: usize, len: usize, flags: u64) -> R {
+    const MS_ASYNC: u64 = 1;
+    const MS_INVALIDATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || addr & 0xfff != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
         return Err(-EINVAL);
     }
-    proc::current().pt().msync(addr, addr + len);
-    Ok(0)
+    let end = len.checked_next_multiple_of(4096).and_then(|l| addr.checked_add(l)).ok_or(-ENOMEM)?;
+    if end == addr {
+        return Ok(0);
+    }
+    proc::current().pt().msync(addr, end, flags & MS_SYNC != 0).map(|_| 0).map_err(|_| -ENOMEM)
 }
 
 fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {

@@ -12,6 +12,7 @@ pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
+pub const ENODEV: i64 = 19;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
@@ -97,6 +98,20 @@ pub trait Inode {
     /// posix_fadvise の DONTNEED: off から len バイト (0 なら終わりまで) の、まだ書いていないキャッシュを外す
     /// (ファイルシステムの側: ページキャッシュは vm::uncache)
     fn uncache(&self, _off: u64, _len: u64) {}
+    /// ふつうのファイルの foff (ページの境目) のページそのもの (ファイルシステムが持っている 1 枚: ext4 ならブロックの
+    /// キャッシュのページ、tmpfs ならファイルのページ。参照をひとつ足して返す。使い終えたら kalloc::put)。
+    /// read / write / 写し (mmap) がみな同じ 1 枚を見るので、どれで書いてもほかにすぐ映る (vm.rs の「ファイルのページは 1 枚」)。
+    /// Ok(None) は穴 (ブロックがない: vm.rs が 0 のページを持ち、ブロックをとるとき adopt_hole でそのページを使ってもらう)。
+    /// alloc なら、ブロックをとって (穴の 0 のページを引きとって) 書けるようにする (写しに書くとき: Linux の page_mkwrite)。
+    /// ファイルの終わりの先 (同じページの中) は 0 にしてある。ページで持たないもの (procfs、ブロックがページでないもの) は ENODEV
+    fn page_frame(&self, _foff: usize, _alloc: bool) -> Result<Option<*mut u8>, i64> {
+        Err(-ENODEV)
+    }
+    /// 写し (MAP_SHARED) で foff のページに書いた (書いていた): ディスクに書き出す印をつけ、touch なら更新時刻をいまに
+    /// (はじめて書いたとき。Linux の page_mkwrite の file_update_time)
+    fn page_written(&self, _foff: usize, _touch: bool) -> Result<(), i64> {
+        Ok(())
+    }
     fn page_cacheable(&self) -> bool {
         false
     }

@@ -27,7 +27,8 @@ fn take_page() -> Result<*mut u8, i64> {
 }
 
 fn put_page(p: *mut u8) {
-    crate::kalloc::free(p);
+    // ページは参照で持つ (写しているところがまだ見ているかもしれない)
+    crate::kalloc::put(p);
     unsafe { USED -= 1 };
 }
 
@@ -65,8 +66,23 @@ impl Pages {
         n
     }
 
+    /// [from, upto) のうち、ページ pi の中を 0 に (ページがあれば)
+    fn zero_in(&self, pi: usize, from: usize, upto: usize) {
+        if let Some(&p) = self.pages.get(&pi) {
+            let (a, b) = (from.max(pi * PGSIZE) - pi * PGSIZE, upto.min((pi + 1) * PGSIZE) - pi * PGSIZE);
+            if a < b {
+                unsafe { core::ptr::write_bytes(p.add(a), 0, b - a) };
+            }
+        }
+    }
+
     fn write(&mut self, off: usize, buf: &[u8]) -> Result<(), i64> {
         let mut done = 0;
+        // 終わりの先から書く: 終わりとのあいだ (終わりのページの中) を 0 に (写しで終わりの先に書いたものは残らない:
+        // ext4 と同じ。Linux の tmpfs は残す)
+        if off > self.len && !buf.is_empty() {
+            self.zero_in(self.len / PGSIZE, self.len, off);
+        }
         while done < buf.len() {
             let pos = off + done;
             let (pi, po) = (pos / PGSIZE, pos % PGSIZE);
@@ -87,6 +103,10 @@ impl Pages {
     }
 
     fn truncate(&mut self, len: usize) {
+        if len > self.len {
+            // 伸ばす: 終わりのページの、終わりの先を 0 に (写しで書いたものがあれば消える)
+            self.zero_in(self.len / PGSIZE, self.len, len);
+        }
         if len < self.len {
             let keep = len.div_ceil(PGSIZE);
             for (_, p) in self.pages.split_off(&keep) {
@@ -429,6 +449,12 @@ impl Inode for TmpInode {
 
     fn meta(&self) -> Meta {
         let a = self.attr.borrow();
+        // blocks は持っているページの数 (Linux の tmpfs と同じ。穴は数えない)
+        let pages = match &*self.node.borrow() {
+            Node::File(Data::Owned(p)) => p.pages.len() as u64,
+            Node::File(Data::Static(b)) => b.len().div_ceil(PGSIZE) as u64,
+            _ => 0,
+        };
         let (size, rdev) = match &*self.node.borrow() {
             Node::File(d) => (d.len() as u64, 0),
             Node::Symlink(t) => (t.len() as u64, 0),
@@ -436,7 +462,7 @@ impl Inode for TmpInode {
             Node::Dev(ma, mi) => (0, ((*ma as u64) << 8) | *mi as u64),
             Node::Fifo => (0, 0),
         };
-        Meta { ino: self.ino, mode: a.mode, nlink: a.nlink, uid: a.uid, gid: a.gid, size, rdev, blocks: size.div_ceil(512), mtime: a.mtime, ctime: a.ctime }
+        Meta { ino: self.ino, mode: a.mode, nlink: a.nlink, uid: a.uid, gid: a.gid, size, rdev, blocks: pages * 8, mtime: a.mtime, ctime: a.ctime }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
@@ -445,6 +471,39 @@ impl Inode for TmpInode {
             Node::Dir(_) => Err(-EISDIR),
             _ => Err(-EINVAL),
         }
+    }
+
+    /// ファイルの foff のページそのもの (参照をひとつ足して)。Linux の tmpfs (shmem_fault) と同じく、読むだけでも
+    /// ページをとる (穴は 0 のページに。とれなければ ENOSPC: SIGBUS)
+    fn page_frame(&self, foff: usize, _alloc: bool) -> Result<Option<*mut u8>, i64> {
+        if foff % PGSIZE != 0 {
+            return Err(-EINVAL);
+        }
+        match &mut *self.node.borrow_mut() {
+            Node::File(d) => {
+                let p = d.owned()?;
+                let pi = foff / PGSIZE;
+                let frame = match p.pages.get(&pi) {
+                    Some(&f) => f,
+                    None => {
+                        let f = take_page()?;
+                        p.pages.insert(pi, f);
+                        f
+                    }
+                };
+                crate::kalloc::get(frame);
+                Ok(Some(frame))
+            }
+            _ => Err(-ENODEV),
+        }
+    }
+
+    /// 写しで書いた: 中身はもうページにある。はじめてなら更新時刻をいまに
+    fn page_written(&self, _foff: usize, touch: bool) -> Result<(), i64> {
+        if touch {
+            self.touch();
+        }
+        Ok(())
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
@@ -471,6 +530,10 @@ impl Inode for TmpInode {
         let same = match &mut *self.node.borrow_mut() {
             Node::File(d) => {
                 let same = d.len() == len;
+                if len < d.len() {
+                    // 写しているところから、なくなるページを外す (vm.rs)
+                    crate::vm::drop_file_pages(self.id(), len.div_ceil(PGSIZE), usize::MAX);
+                }
                 d.owned()?.truncate(len);
                 same
             }
@@ -500,11 +563,19 @@ impl Inode for TmpInode {
         let seals = self.seals.get().unwrap_or(0);
         let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
         crate::vm::file_changed(self.id());
+        // 穴をあける (0 にする) ところのまるごとのページは、写しているところから外す (Linux の unmap_mapping_range)
+        let drop_pages = |from: usize, to: usize| {
+            let (first, last) = (from.div_ceil(PGSIZE), to / PGSIZE);
+            if from < to && first < last {
+                crate::vm::drop_file_pages(self.id(), first, last - 1);
+            }
+        };
         match &mut *self.node.borrow_mut() {
             Node::File(d) if mode & PUNCH_HOLE != 0 => {
                 if seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
                     return Err(-EPERM);
                 }
+                drop_pages(off as usize, end);
                 d.owned()?.punch(off as usize, end);
             }
             Node::File(d) => {
@@ -515,6 +586,7 @@ impl Inode for TmpInode {
                     return Err(-EPERM);
                 }
                 if mode & ZERO_RANGE != 0 {
+                    drop_pages(off as usize, end);
                     d.owned()?.punch(off as usize, end);
                 }
                 if mode & KEEP_SIZE == 0 && end > d.len() {

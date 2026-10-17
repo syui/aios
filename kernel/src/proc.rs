@@ -82,6 +82,8 @@ pub struct Mm {
     pub mmap_next: usize,
     /// /proc/PID/exe
     pub exe: String,
+    /// 動かしているプログラム (ELF) の inode (書くために開くと ETXTBSY: executing)
+    pub exe_id: (usize, u64),
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
     pub args: (usize, usize, usize),
 }
@@ -437,7 +439,7 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
-        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, args: img.args }));
+        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -628,6 +630,12 @@ pub fn current_root() -> String {
 
 pub fn nprocs() -> usize {
     live().filter(|p| p.state != State::Unused).count()
+}
+
+/// ファイル id をプログラムとして動かしているプロセスがあるか (書くために開く、切りつめるのは ETXTBSY: Linux の
+/// deny_write_access。ファイルのページは 1 枚なので、書けば動いているコードが変わる)
+pub fn executing(id: (usize, u64)) -> bool {
+    live().any(|p| p.state != State::Unused && p.state != State::Zombie && p.mm.as_ref().is_some_and(|m| m.get().exe_id == id))
 }
 
 /// 使われているアドレス空間ごとに 1 回 f (スレッドで共有しているものも 1 回)
@@ -1284,7 +1292,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
-        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), args: m.args })
+        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()

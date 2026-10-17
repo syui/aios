@@ -173,22 +173,29 @@ fn hw_crc() -> bool {
 
 /// ブロックの読み書き。1 ブロックを 1 ページに入れて覚えておく
 impl Cache {
-    /// 書いていないもの (メタデータもファイルの中身も) でない、いちばん古いブロックを 1 つ捨てる。
-    /// order には forget したものも残っているので、map にないものはとばす (頭にあれば捨てる)
+    /// 書いていないもの (メタデータもファイルの中身も) でなく、だれも写していない (参照がこの表だけ: ページキャッシュや
+    /// mmap の写しが見ているページは、捨てると別のページを読みこんで食いちがう) いちばん古いブロックを 1 つ捨てる。
+    /// 捨てられないものは後ろへ回す (また古くなったら見る)。64 こ見て捨てられなければあきらめる (表は上限をこえて
+    /// ふくらむ: 写されているページはページキャッシュ (vm.rs) のもので、そちらが手放せば捨てられる)。
+    /// order には forget したものも残っているので、map にないものはとばす
     fn evict_one(&mut self) -> bool {
-        while let Some(x) = self.order.front() {
-            if self.map.contains_key(x) {
-                break;
+        let mut tries = 0;
+        while let Some(x) = self.order.pop_front() {
+            let Some(&p) = self.map.get(&x) else { continue };
+            if kalloc::refs(p) > 1 || self.dirty.contains(&x) || self.data.contains(&x) {
+                self.order.push_back(x);
+                tries += 1;
+                if tries >= 64 {
+                    return false;
+                }
+                continue;
             }
-            self.order.pop_front();
+            self.map.remove(&x);
+            kalloc::put(p);
+            self.evictions += 1;
+            return true;
         }
-        let victim = self.order.iter().position(|x| self.map.contains_key(x) && !self.dirty.contains(x) && !self.data.contains(x));
-        let Some(old) = victim.and_then(|i| self.order.remove(i)) else { return false };
-        if let Some(p) = self.map.remove(&old) {
-            kalloc::free(p);
-        }
-        self.evictions += 1;
-        true
+        false
     }
 
     /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
@@ -196,7 +203,8 @@ impl Cache {
     /// (16 MiB で 6700 万回)。残ったものが覚えている数をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
     fn forget(&mut self, b: u64) {
         let Some(p) = self.map.remove(&b) else { return };
-        kalloc::free(p);
+        // ページは参照で持つ (写しているところがまだ見ているかもしれない)
+        kalloc::put(p);
         if self.order.len() > 2 * self.map.len() + 64 {
             // 外したあとにまた入ったものは 2 度ある: 古いほうを残す
             let mut seen = BTreeSet::new();
@@ -663,10 +671,29 @@ impl ExtFs {
     /// ディスクから読まずに、b のページを用意する (中身はゼロ。すでにキャッシュにあればそのまま)。
     /// 新しく作ったブロックや、ブロックまるごと書きかえるときに (読んでもすぐ上書きするので)
     fn with_block_new<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        self.with_block_new_adopt(b, None, f)
+    }
+
+    /// with_block_new で、ファイル ino のブロック lb としてとるとき (adopt): そこを写しているところが穴の 0 のページを
+    /// 持っていれば (vm::adopt_hole)、そのページをこのブロックのページにする (写している人にそのまま映る)
+    fn with_block_new_adopt<T>(&self, b: u64, adopt: Option<(u32, u64)>, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let adopted = match adopt {
+            Some((ino, lb)) if self.bsize == PGSIZE => crate::vm::adopt_hole((self.fs, ino as u64), lb as usize),
+            _ => None,
+        };
         let mut c = self.cache.borrow_mut();
-        let page = match c.map.get(&b) {
-            Some(&p) => p,
-            None => {
+        let have = c.map.get(&b).copied();
+        let page = match (have, adopted) {
+            (have, Some(p)) => {
+                c.map.insert(b, p);
+                match have {
+                    Some(old) => kalloc::put(old),
+                    None => c.order.push_back(b),
+                }
+                p
+            }
+            (Some(p), None) => p,
+            (None, None) => {
                 if c.map.len() >= cache_limit(self.bsize) {
                     c.evict_one();
                 }
@@ -683,6 +710,31 @@ impl ExtFs {
         };
         drop(c);
         Ok(f(unsafe { core::slice::from_raw_parts_mut(page, self.bsize) }))
+    }
+
+    /// ブロック b のページそのもの (参照をひとつ足して。使い終えたら kalloc::put)。なければディスクから読む
+    fn frame(&self, b: u64) -> Result<*mut u8, i64> {
+        let p = self.with_block(b, |d| d.as_mut_ptr())?;
+        kalloc::get(p);
+        Ok(p)
+    }
+
+    /// ファイル ino を size から upto まで伸ばす: 終わりのブロックの、size からそのブロックの終わり (upto まで) を 0 に
+    /// (キャッシュにあるときだけ: 写しで終わりの先に書いたものを消す。Linux の pagecache_isize_extended。キャッシュに
+    /// なければ、ディスクの上はもう 0: 切りつめと書き出しが 0 にしている)
+    fn zero_gap(&self, ino: u32, r: &mut Raw, size: usize, upto: usize) {
+        let bs = self.bsize;
+        if size % bs == 0 || upto <= size {
+            return;
+        }
+        let Ok(b) = self.map(ino, r, (size / bs) as u64, false) else { return };
+        if b == 0 {
+            return;
+        }
+        let end = upto.min((size / bs + 1) * bs) - (size / bs) * bs;
+        if let Some(&p) = self.cache.borrow().map.get(&b) {
+            unsafe { core::ptr::write_bytes(p.add(size % bs), 0, end - size % bs) };
+        }
     }
 
     /// 先読み: ディスクの b から n ブロックを 1 回で読み、キャッシュにないものを覚える
@@ -707,8 +759,9 @@ impl ExtFs {
             if c.map.contains_key(&blk) {
                 continue;
             }
-            if c.map.len() >= cache_limit(self.bsize) && !c.evict_one() {
-                break;
+            // 上限をこえていたら 1 つ捨てる (捨てられなくても先読みは続ける: 写されているページで上限をこえているとき)
+            if c.map.len() >= cache_limit(self.bsize) {
+                c.evict_one();
             }
             let Some(p) = kalloc::alloc_dirty() else { break };
             unsafe { core::ptr::copy_nonoverlapping(buf[k * self.bsize..].as_ptr(), p, self.bsize) };
@@ -743,7 +796,12 @@ impl ExtFs {
     }
 
     fn modify_data_block_as<T>(&self, b: u64, fresh: bool, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
-        let r = if fresh { self.with_block_new(b, f)? } else { self.with_block(b, f)? };
+        self.modify_data_block_adopt(b, fresh, None, f)
+    }
+
+    /// modify_data_block_as で、fresh なら ino のブロック lb として (写しの穴のページを引きとる: with_block_new_adopt)
+    fn modify_data_block_adopt<T>(&self, b: u64, fresh: bool, adopt: Option<(u32, u64)>, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        let r = if fresh { self.with_block_new_adopt(b, adopt, f)? } else { self.with_block(b, f)? };
         let mut c = self.cache.borrow_mut();
         c.dirty.remove(&b);
         c.data.insert(b);
@@ -754,7 +812,7 @@ impl ExtFs {
     fn drop_cache(&self) {
         let mut c = self.cache.borrow_mut();
         for (_, p) in core::mem::take(&mut c.map) {
-            kalloc::free(p);
+            kalloc::put(p);
         }
         c.order.clear();
     }
@@ -1189,6 +1247,8 @@ impl ExtFs {
         let _p = crate::prof::span("extfs:flush");
         self.last_flush.set(crate::timer::ticks());
         self.cache.borrow_mut().flushes += 1;
+        // 写し (MAP_SHARED) で書いているページに、書き出す印をつけなおす (写しは書けるままなので、前に書き出したあとも書かれる)
+        crate::vm::sync_shared();
         let (bb, ib) = {
             let mut c = self.cache.borrow_mut();
             (core::mem::take(&mut c.bb_dirty), core::mem::take(&mut c.ib_dirty))
@@ -1874,8 +1934,8 @@ impl ExtFs {
             r.add_blocks512(-((self.bsize / 512) as i64), self.bsize);
             return Err(e);
         }
-        // ディスクの上の中身は古いもの: 0 にしてから書く
-        self.modify_data_block_as(pb, true, |d| d.fill(0))
+        // ディスクの上の中身は古いもの: 0 にしてから書く (写しの穴のページがあればそれをこのブロックのページに)
+        self.modify_data_block_adopt(pb, true, Some((ino, lb)), |d| d.fill(0))
     }
 
     /// 論理ブロック [from, to) の穴に、未初期化のブロックをとる (fallocate。Linux の EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT:
@@ -2031,7 +2091,7 @@ impl ExtFs {
                 if dontcache && fresh > 0 {
                     let mut c = self.cache.borrow_mut();
                     for j in 0..fresh {
-                        if !c.data.contains(&(b + j)) && !c.dirty.contains(&(b + j)) {
+                        if !c.data.contains(&(b + j)) && !c.dirty.contains(&(b + j)) && c.map.get(&(b + j)).is_some_and(|&p| kalloc::refs(p) <= 1) {
                             c.forget(b + j);
                         }
                     }
@@ -2044,6 +2104,10 @@ impl ExtFs {
 
     fn write_data(&self, ino: u32, r: &mut Raw, off: usize, buf: &[u8]) -> Result<usize, i64> {
         let mut done = 0;
+        // 終わりの先から書く: 終わりとのあいだ (終わりのブロックの中) を 0 に (写しで書いたものがあれば消える)
+        if off > r.size() as usize && !buf.is_empty() {
+            self.zero_gap(ino, r, r.size() as usize, off);
+        }
         while done < buf.len() {
             let pos = off + done;
             let (fb, bo) = ((pos / self.bsize) as u64, pos % self.bsize);
@@ -2058,7 +2122,7 @@ impl ExtFs {
                 }
                 Err(e) => return Err(e),
             };
-            self.modify_data_block_as(b, fresh, |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
+            self.modify_data_block_adopt(b, fresh, Some((ino, fb)), |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
             done += n;
         }
         if (off + done) as u64 > r.size() {
@@ -2754,6 +2818,69 @@ impl Inode for ExtInode {
         true
     }
 
+    /// ファイルの foff のページそのもの: ブロックのキャッシュのページ (ブロックが 1 ページのとき。参照をひとつ足して)。
+    /// 穴 (と未初期化のブロック) は None。alloc なら、ブロックをとって (写しの穴のページを引きとって: adopt_hole)
+    /// 書き出す印をつけ、更新時刻をいまに (写しに書くとき: Linux の page_mkwrite)。終わりの先 (同じページの中) は 0 に
+    fn page_frame(&self, foff: usize, alloc: bool) -> Result<Option<*mut u8>, i64> {
+        if self.fs.bsize != PGSIZE || foff % PGSIZE != 0 {
+            return Err(-ENODEV);
+        }
+        let lb = (foff / PGSIZE) as u64;
+        if !alloc {
+            let mut r = self.raw()?;
+            if r.mode() & S_IFMT != S_IFREG || r.flags() & INLINE_DATA_FL != 0 {
+                return Err(-ENODEV);
+            }
+            let b = self.fs.map(self.ino, &mut r, lb, false)?;
+            if b == 0 {
+                return Ok(None);
+            }
+            let p = self.fs.frame(b)?;
+            let size = r.size() as usize;
+            if foff < size && size - foff < PGSIZE {
+                unsafe { core::ptr::write_bytes(p.add(size - foff), 0, PGSIZE - (size - foff)) };
+            }
+            return Ok(Some(p));
+        }
+        self.not_swapfile()?;
+        self.write_op(|| {
+            let mut r = self.raw()?;
+            if r.mode() & S_IFMT != S_IFREG || r.flags() & INLINE_DATA_FL != 0 {
+                return Err(-ENODEV);
+            }
+            let fresh = self.fs.map(self.ino, &mut r, lb, false)? == 0;
+            let b = self.fs.map(self.ino, &mut r, lb, true)?;
+            let p = self.fs.modify_data_block_adopt(b, fresh, Some((self.ino, lb)), |d| d.as_mut_ptr())?;
+            kalloc::get(p);
+            r.touch();
+            self.fs.write_inode(self.ino, &r)?;
+            Ok(Some(p))
+        })
+    }
+
+    /// 写しで foff のページに書いた: そのブロックに書き出す印 (ディスクへは flush で直接)。touch なら更新時刻もいまに。
+    /// flush の中 (vm::sync_shared) からも呼ばれるので、ここでは flush しない
+    fn page_written(&self, foff: usize, touch: bool) -> Result<(), i64> {
+        self.fs.check_rw()?;
+        let mut r = self.raw()?;
+        if r.mode() & S_IFMT != S_IFREG {
+            return Err(-ENODEV);
+        }
+        let b = self.fs.map(self.ino, &mut r, (foff / self.fs.bsize) as u64, false)?;
+        if b != 0 {
+            let mut c = self.fs.cache.borrow_mut();
+            if c.map.contains_key(&b) {
+                c.dirty.remove(&b);
+                c.data.insert(b);
+            }
+        }
+        if touch {
+            r.touch();
+            self.fs.write_inode(self.ino, &r)?;
+        }
+        Ok(())
+    }
+
     /// posix_fadvise の DONTNEED: off から len バイト (0 なら終わりまで) のブロックを、まだ書いていなければキャッシュから
     /// 外す (そのあとの RWF_NOWAIT は EAGAIN: Linux と同じ)
     fn uncache(&self, off: u64, len: u64) {
@@ -2773,7 +2900,8 @@ impl Inode for ExtInode {
             let Ok(b) = self.fs.map(self.ino, &mut r, fb, false) else { break };
             if b != 0 {
                 let mut c = self.fs.cache.borrow_mut();
-                if !c.data.contains(&b) && !c.dirty.contains(&b) {
+                // 写しているもの (参照が表だけでない) は外さない
+                if !c.data.contains(&b) && !c.dirty.contains(&b) && c.map.get(&b).is_some_and(|&p| kalloc::refs(p) <= 1) {
                     c.forget(b);
                 }
             }
@@ -2860,18 +2988,38 @@ impl Inode for ExtInode {
             r.touch();
             let (size, end, bs) = (r.size(), off + len, self.fs.bsize as u64);
             let extents = r.flags() & EXTENTS_FL != 0;
+            // 穴をあける (0 にする) ところのまるごとのページは、写しているところから外す (Linux の truncate_pagecache_range)
+            let drop_pages = |from: u64, to: u64| {
+                if from < to {
+                    let (first, last) = ((from as usize).div_ceil(PGSIZE), (to as usize) / PGSIZE);
+                    if first < last {
+                        crate::vm::drop_file_pages(self.id(), first, last - 1);
+                    }
+                }
+            };
             let res = match mode & !KEEP_SIZE {
                 // extent のないファイル (ブロックの表) は、どれもできない
                 _ if !extents => Err(-EOPNOTSUPP),
                 PUNCH_HOLE => {
                     // 大きさより先は見ない。終わりは大きさのあるページの終わりまで (ext4_punch_hole)
-                    if off < size { self.fs.punch(self.ino, &mut r, off, end.min(size.next_multiple_of(PGSIZE as u64))) } else { Ok(()) }
+                    if off < size {
+                        let to = end.min(size.next_multiple_of(PGSIZE as u64));
+                        drop_pages(off, to);
+                        self.fs.punch(self.ino, &mut r, off, to)
+                    } else {
+                        Ok(())
+                    }
                 }
                 // 0 にして (まるごとのブロックは外し、はしは中を 0 に)、穴になったところに未初期化のブロック
-                ZERO_RANGE => self.fs.punch(self.ino, &mut r, off, end).and_then(|_| self.fs.ext_prealloc(self.ino, &mut r, off / bs, end.div_ceil(bs))),
+                ZERO_RANGE => {
+                    drop_pages(off, end);
+                    self.fs.punch(self.ino, &mut r, off, end).and_then(|_| self.fs.ext_prealloc(self.ino, &mut r, off / bs, end.div_ceil(bs)))
+                }
                 _ => self.fs.ext_prealloc(self.ino, &mut r, off / bs, end.div_ceil(bs)),
             };
             if res.is_ok() && mode & (KEEP_SIZE | PUNCH_HOLE) == 0 && end > size {
+                // 伸ばす: 終わりのブロックの、終わりの先を 0 に (写しで書いたものがあれば消える)
+                self.fs.zero_gap(self.ino, &mut r, size as usize, end as usize);
                 r.set_size(end);
             }
             self.fs.write_inode(self.ino, &r)?;
@@ -2893,7 +3041,10 @@ impl Inode for ExtInode {
                 return Err(if r.mode() & S_IFMT == S_IFDIR { -EISDIR } else { -EINVAL });
             }
             let bs = self.fs.bsize;
-            if (len as u64) < r.size() {
+            let size = r.size() as usize;
+            if len < size {
+                // 写しているところから、なくなるページを外す (vm.rs。残るページの終わりの先は下で 0 に: 写しにも映る)
+                crate::vm::drop_file_pages(self.id(), len.div_ceil(PGSIZE), usize::MAX);
                 self.fs.trunc_blocks(self.ino, &mut r, len.div_ceil(bs) as u64)?;
                 // 残ったブロックの末尾を 0 にしておく (あとで伸ばしたとき用)
                 if len % bs != 0 {
@@ -2902,6 +3053,9 @@ impl Inode for ExtInode {
                         self.fs.modify_data_block(b, |d| d[len % bs..].fill(0))?;
                     }
                 }
+            } else if len > size {
+                // 伸ばす: 終わりのブロックの、終わりの先を 0 に (写しで書いたものがあれば消える)
+                self.fs.zero_gap(self.ino, &mut r, size, len);
             }
             r.set_size(len as u64);
             r.touch();

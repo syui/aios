@@ -311,6 +311,8 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>) {
                                 (signal::SIGKILL, 0, far)
                             }
                             Some(crate::vm::FaultErr::Access) => (signal::SIGSEGV, signal::SEGV_ACCERR, far),
+                            // 写したファイルの終わりより先 (BUS_ADRERR)
+                            Some(crate::vm::FaultErr::Bus) => (signal::SIGBUS, 2, far),
                             _ => (signal::SIGSEGV, signal::SEGV_MAPERR, far),
                         },
                         EC_PC_ALIGN | EC_SP_ALIGN => (signal::SIGBUS, 1, far),

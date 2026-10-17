@@ -8,10 +8,17 @@
 // 書こうとしたときに、まだ共有されていれば写し、自分だけなら書けるように戻す (コピーオンライト)。
 // ページの共有の数は kalloc が持つ。
 //
-// MAP_SHARED のファイルは、(ファイルシステム, inode, ページ番号) ごとに 1 枚のページを共有する
-// (SHARED_FILE)。最初は読み取り専用で写し、書かれたら「書いた」印をつけて書けるようにする。
-// 書いたページは msync、munmap、プロセスの終わり、sync でファイルに書き戻す (ファイルの終わりの先は捨てる)。
-// read()/write() とは別なので、写している間に write() で書いたものは写しには映らない。
+// ファイルのページは 1 枚: ファイルの (ファイルシステム, inode, ページ番号) のページは、ファイルシステムが持っている
+// その 1 枚 (ext4 ならブロックのキャッシュのページ、tmpfs ならファイルのページそのもの: Inode::page_frame) を、
+// read()/write() も、MAP_SHARED の写しも、MAP_PRIVATE の読むだけの写しも、ページキャッシュ (PRIV) も、みなそのまま見る
+// (Linux のページキャッシュと同じ)。だから write() で書いたものは写しにすぐ映り、写しに書いたものは read() にすぐ見える。
+// 写しているファイルのページの表 (SHARED_FILE) は、MAP_SHARED で写しているページと、書いたか (dirty) を覚える: 最初は
+// 読み取り専用で写し、書かれたら印をつけて書けるようにし (そのときブロックをとり、更新時刻をいまに: Linux の page_mkwrite)、
+// msync、munmap、プロセスの終わり、sync、ファイルシステムの書き出しで、ディスクに書き出す印をつけなおす (page_written。
+// ファイルの終わりの先に書いたものはそのとき 0 にする: Linux の書き出しと同じ)。穴 (ブロックのないところ) の写しは表が
+// 0 のページを持ち (MAP_PRIVATE でも)、ブロックをとるときにファイルシステムがそのページをそのまま使う (adopt_hole)。
+// mmap で写したファイルの終わりより先のページに触れると SIGBUS (伸びればまた写せる)、切りつめたところは写しからみな外す
+// (drop_file_pages。Linux の unmap_mapping_range)。ページで持たないファイルシステムのものは、前のように写しを読む (own)
 //
 // PTE のうち、ハードウェアが見ないビットを使う:
 //   COW       (55) 書けるはずだが共有しているので読み取り専用にしてあるページ
@@ -67,10 +74,14 @@ type FileKey = (usize, u64, usize);
 struct Cached {
     page: *mut u8,
     dirty: bool,
+    /// 穴の 0 のページ (ブロックがない)。表だけが持ち、ファイルシステムがブロックをとるときにそのまま使う (adopt_hole)
+    hole: bool,
+    /// ファイルシステムのページでなく、読んだ写し (ページで持たないもの)。書き戻しは write_at で
+    own: bool,
     ino: InodeRef,
 }
 
-/// 表も 1 つ参照を持つ。だれも写さなくなったら (参照が表だけになったら) 書き戻して捨てる
+/// 表も 1 つ参照を持つ。だれも写さなくなったら (参照が表とファイルシステムとページキャッシュだけになったら) 書き戻して捨てる
 static mut SHARED_FILE: BTreeMap<FileKey, Cached> = BTreeMap::new();
 
 fn shared_file() -> &'static mut BTreeMap<FileKey, Cached> {
@@ -82,14 +93,57 @@ fn file_key(ino: &InodeRef, off: usize) -> FileKey {
     (fs, i, off / PGSIZE)
 }
 
+/// 写しで書いたページをファイルへ。ファイルシステムのページそのものなら中身はもうある: 終わりの先 (同じページの中) を
+/// 0 にして (Linux の書き出しと同じ: 写しで終わりの先に書いたものはファイルに残らない)、ディスクに書き出す印をつけなおす。
+/// 読んだ写し (own) なら write_at で書く
 fn write_back(key: &FileKey, c: &Cached) {
+    if c.hole {
+        return;
+    }
     let size = c.ino.meta().size as usize;
     let off = key.2 * PGSIZE;
-    if off < size {
-        let n = (size - off).min(PGSIZE);
+    if off >= size {
+        return;
+    }
+    let n = (size - off).min(PGSIZE);
+    let r = if c.own {
         let data = unsafe { core::slice::from_raw_parts(c.page, n) };
-        if c.ino.write_at(off, data).is_err() {
-            println!("vm: write back of a shared mapping failed");
+        c.ino.write_at(off, data).map(|_| ())
+    } else {
+        if n < PGSIZE {
+            unsafe { core::ptr::write_bytes(c.page.add(n), 0, PGSIZE - n) };
+        }
+        c.ino.page_written(off, false)
+    };
+    if r.is_err() {
+        println!("vm: write back of a shared mapping failed");
+    }
+}
+
+/// ファイルシステムが id のページ index のブロックをとる: 写しの表が穴の 0 のページを持っていれば、それをそのまま
+/// ブロックのページにしてもらう (参照をひとつ足して返す。写している人のページがそのままブロックになるので、書いたものが映る)
+pub fn adopt_hole(id: (usize, u64), index: usize) -> Option<*mut u8> {
+    let c = shared_file().get_mut(&(id.0, id.1, index))?;
+    if !c.hole {
+        return None;
+    }
+    c.hole = false;
+    kalloc::get(c.page);
+    Some(c.page)
+}
+
+/// ファイル id のページ [first, last] がなくなる (切りつめ、穴あけ。ファイルシステムが、ブロックを外す前に呼ぶ): 写している
+/// ところからみな外し (private の写しに書いたものも: Linux の unmap_mapping_range。次に触れたら SIGBUS か作りなおし)、
+/// 表のページも捨てる (書いたものも: 切りつめたところは消える)
+pub fn drop_file_pages(id: (usize, u64), first: usize, last: usize) {
+    if first > last {
+        return;
+    }
+    crate::proc::each_pagetable(|pt| pt.drop_file_range(id, first, last));
+    let keys: Vec<FileKey> = shared_file().range((id.0, id.1, first)..=(id.0, id.1, last)).map(|(k, _)| *k).collect();
+    for k in keys {
+        if let Some(c) = shared_file().remove(&k) {
+            kalloc::put(c.page);
         }
     }
 }
@@ -105,6 +159,15 @@ fn write_back(key: &FileKey, c: &Cached) {
 struct PrivPage {
     page: *mut u8,
     ver: (u64, u64),
+    /// ファイルシステムのページそのもの (ファイルシステムも 1 つ参照を持つ)。でなければ読んだ写し
+    owned: bool,
+}
+
+impl PrivPage {
+    /// だれも写していない (参照が表 (とファイルシステム) だけ)
+    fn idle(&self) -> bool {
+        kalloc::refs(self.page) <= 1 + self.owned as u16
+    }
 }
 
 // ページはカーネルのもの (どの CPU からでも)
@@ -188,7 +251,7 @@ pub fn uncache(ino: &InodeRef, off: usize, len: usize) {
         return;
     }
     let mut c = PRIV.lock();
-    let keys: Vec<FileKey> = c.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k).collect();
+    let keys: Vec<FileKey> = c.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| p.idle()).map(|(k, _)| *k).collect();
     for k in keys {
         if let Some(p) = c.remove(&k) {
             kalloc::put(p.page);
@@ -201,7 +264,7 @@ pub fn shrink_cache(n: usize) -> usize {
     let mut freed = Vec::new();
     {
         let mut c = PRIV.lock();
-        let victims: Vec<FileKey> = c.iter().filter(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k).take(n).collect();
+        let victims: Vec<FileKey> = c.iter().filter(|(_, p)| p.idle()).map(|(k, _)| *k).take(n).collect();
         for k in &victims {
             if let Some(p) = c.remove(k) {
                 freed.push(p.page);
@@ -223,8 +286,8 @@ pub fn shrink_cache_try(n: usize) -> usize {
     let mut from: Option<FileKey> = None;
     while freed < n {
         let next = match from {
-            None => c.iter().find(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k),
-            Some(k) => c.range(k..).find(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k),
+            None => c.iter().find(|(_, p)| p.idle()).map(|(k, _)| *k),
+            Some(k) => c.range(k..).find(|(_, p)| p.idle()).map(|(k, _)| *k),
         };
         let Some(k) = next else { break };
         if let Some(p) = c.remove(&k) {
@@ -391,16 +454,26 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
         crate::println!("pcmiss ino {:?} off {:#x} ver {:?} had {:?} n {}", ino.id(), foff, ver, have, n);
     }
     let changes = CHANGES.load(Ordering::SeqCst);
-    let page = kalloc::alloc()?;
-    let size = ver.1 as usize;
-    if foff < size {
-        let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
-        if ino.read_at(foff, buf).is_err() {
-            kalloc::free(page);
-            return None;
+    // ファイルのページそのもの (ファイルシステムが持っている 1 枚)。穴なら、写しの表が持つ 0 のページ (表には入れない)。
+    // ページで持たないものなら読んだ写し
+    let (page, owned) = match ino.page_frame(foff, false) {
+        Ok(Some(p)) => (p, true),
+        Ok(None) => return hole_page(ino, foff),
+        Err(e) if e == -crate::vfs::ENODEV => {
+            let page = kalloc::alloc()?;
+            let size = ver.1 as usize;
+            if foff < size {
+                let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
+                if ino.read_at(foff, buf).is_err() {
+                    kalloc::free(page);
+                    return None;
+                }
+            }
+            (page, false)
         }
-    }
-    // コードかもしれないので命令キャッシュも (読みこんだときに一度だけ)
+        Err(_) => return None,
+    };
+    // コードかもしれないので命令キャッシュも (表に入れるときに一度)
     sync_icache(page as usize, PGSIZE);
     let max = priv_max();
     if PRIV.lock().len() >= max.max(NEXT_SHRINK.load(Ordering::Relaxed)) {
@@ -418,11 +491,59 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     }
     kalloc::get(page);
     // 古い版は外す (読んでいるあいだにほかが入れたものも)。写しているところは自分の参照を持っている
-    let old = PRIV.lock().insert(key, PrivPage { page, ver });
+    let old = PRIV.lock().insert(key, PrivPage { page, ver, owned });
     if let Some(o) = old {
         kalloc::put(o.page);
     }
     Some(page)
+}
+
+/// 穴 (ブロックのないところ) の写しの 0 のページ: 写しの表が持つ (なければ作る)。参照をひとつ足して。
+/// ファイルシステムがそこにブロックをとるとき、このページをそのまま使う (adopt_hole) ので、書いたものが写しに映る
+fn hole_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
+    let key = file_key(ino, foff);
+    let page = match shared_file().get(&key) {
+        Some(c) => c.page,
+        None => {
+            let page = kalloc::alloc()?;
+            shared_file().insert(key, Cached { page, dirty: false, hole: true, own: false, ino: ino.clone() });
+            page
+        }
+    };
+    kalloc::get(page);
+    Some(page)
+}
+
+/// 写しているファイルのページ (参照をひとつ足して): 表にあればそれ。なければファイルシステムのページそのもの
+/// (穴なら 0 のページ、ページで持たないものなら読んだ写し) を表に入れて
+fn shared_page(ino: &InodeRef, key: &FileKey, foff: usize, exec: bool) -> Result<*mut u8, FaultErr> {
+    if let Some(c) = shared_file().get(key) {
+        kalloc::get(c.page);
+        return Ok(c.page);
+    }
+    let (page, hole, own) = match ino.page_frame(foff, false) {
+        Ok(Some(p)) => (p, false, false),
+        Ok(None) => (kalloc::alloc().ok_or(FaultErr::NoMem)?, true, false),
+        Err(e) if e == -crate::vfs::ENODEV => {
+            let page = kalloc::alloc().ok_or(FaultErr::NoMem)?;
+            let size = ino.meta().size as usize;
+            if foff < size {
+                let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
+                if ino.read_at(foff, buf).is_err() {
+                    kalloc::free(page);
+                    return Err(FaultErr::Bus);
+                }
+            }
+            (page, false, true)
+        }
+        Err(_) => return Err(FaultErr::Bus),
+    };
+    if exec {
+        sync_icache(page as usize, PGSIZE);
+    }
+    kalloc::get(page);
+    shared_file().insert(*key, Cached { page, dirty: false, hole, own, ino: ino.clone() });
+    Ok(page)
 }
 
 /// MAP_SHARED で写しているファイルのページの数 (/proc/meminfo の Shmem)
@@ -450,7 +571,15 @@ fn release_shared(keys: &[FileKey]) {
         if c.dirty {
             write_back(k, c);
         }
-        if kalloc::refs(c.page) <= 1 {
+        // 表のほかに持っているのは、ファイルシステム (そのページそのものなら) と、ページキャッシュ (同じページを入れていれば)
+        let mut others = 1u16;
+        if !c.hole && !c.own {
+            others += 1;
+        }
+        if PRIV.lock().get(k).is_some_and(|p| p.page == c.page) {
+            others += 1;
+        }
+        if kalloc::refs(c.page) <= others {
             let c = shared_file().remove(k).unwrap();
             kalloc::put(c.page);
         }
@@ -461,7 +590,8 @@ fn release_shared(keys: &[FileKey]) {
 #[derive(Clone)]
 pub enum Backing {
     Anon,
-    /// 領域の先頭がファイルの off。va が fend 以上のところは 0 (ELF の .bss の始まりなど)
+    /// 領域の先頭がファイルの off。va が fend 以上のところは 0 (ELF の .bss の始まりなど)。fend が MAX なら mmap で
+    /// 写したもの: ファイルの終わりは触れたときの大きさで見る (その先のページは SIGBUS、伸びればまた写せる)
     /// ver は写したときのファイルの版 (file_ver。ロックなしのページフォルトがページキャッシュをくらべる)
     File { ino: InodeRef, off: usize, fend: usize, ver: (u64, u64) },
     /// カーネルが持っているページをそのまま見せる (/dev/fb0 のフレームバッファ)。off はバイト
@@ -486,6 +616,8 @@ pub enum FaultErr {
     /// 権限がない (SEGV_ACCERR)
     Access,
     NoMem,
+    /// 写したファイルの終わりより先、またはそのページがとれない (SIGBUS)
+    Bus,
 }
 
 /// ルートは kalloc したページ (カーネル仮想アドレス)
@@ -580,6 +712,13 @@ pub fn sync_icache(kva: usize, len: usize) {
 
 fn page_of(e: u64) -> *mut u8 {
     table_at(e) as *mut u8
+}
+
+/// prot の、書けないほう (まだ書いていない共有のファイルのページ、ページキャッシュのページ、COW の前)。
+/// PROT_WRITE だけの領域も読める (arm64 の Linux と同じ: 書けるページは読める) ので、READ を足してから WRITE を外す
+/// (外すだけだと PROT_NONE になり、読むたびにフォルトして止まらない)
+fn ro(prot: u8) -> u8 {
+    (if prot & PROT_WRITE != 0 { prot | PROT_READ } else { prot }) & !PROT_WRITE
 }
 
 /// pa のページを prot で。cow なら書けるはずでも読み取り専用にして印をつける
@@ -816,14 +955,21 @@ impl PageTable {
         self.vmas.insert(addr, hi);
     }
 
-    /// [start, end) にある MAP_SHARED のファイルのページの鍵
+    /// [start, end) にある、写しの表に入りうるファイルのページの鍵 (MAP_SHARED のもの。MAP_PRIVATE のものは、
+    /// そのファイルのページ (穴の 0 のページ) を表が持っているときだけ)
     fn shared_keys(&self, start: usize, end: usize) -> Vec<FileKey> {
         let mut keys = Vec::new();
         for (&s, v) in self.vmas.range(..end) {
-            if v.end <= start || !v.shared {
+            if v.end <= start {
                 continue;
             }
             if let Backing::File { ino, off, .. } = &v.back {
+                if !v.shared {
+                    let id = ino.id();
+                    if shared_file().range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_none() {
+                        continue;
+                    }
+                }
                 let mut va = s.max(start);
                 while va < v.end.min(end) {
                     keys.push(file_key(ino, off + (va - s)));
@@ -834,12 +980,90 @@ impl PageTable {
         keys
     }
 
-    /// msync: 範囲の書いたページをファイルへ
-    pub fn msync(&self, start: usize, end: usize) {
-        for k in self.shared_keys(pg_down(start), pg_up(end)) {
-            if let Some(c) = shared_file().get(&k).filter(|c| c.dirty) {
-                write_back(&k, c);
+    /// msync: 範囲の書いたページをファイルへ (書き出す印をつけなおす)。sync なら MS_SYNC: そのファイルをディスクへ。
+    /// 領域のないところがまじっていれば Err (ENOMEM。写っているところはしてから: Linux と同じ)
+    pub fn msync(&self, start: usize, end: usize, sync: bool) -> Result<(), ()> {
+        let mut gap = false;
+        let mut inos: Vec<InodeRef> = Vec::new();
+        let mut va = start;
+        while va < end {
+            let Some((s, v)) = self.find(va) else {
+                gap = true;
+                match self.vmas.range(va..end).next() {
+                    Some((&n, _)) => {
+                        va = n;
+                        continue;
+                    }
+                    None => break,
+                }
+            };
+            if v.shared && let Backing::File { ino, off, .. } = &v.back {
+                let mut p = va;
+                while p < v.end.min(end) {
+                    let k = file_key(ino, off + (p - s));
+                    if let Some(c) = shared_file().get(&k).filter(|c| c.dirty) {
+                        write_back(&k, c);
+                    }
+                    p += PGSIZE;
+                }
+                if sync && !inos.iter().any(|i| i.id() == ino.id()) {
+                    inos.push(ino.clone());
+                }
             }
+            va = v.end;
+        }
+        for i in inos {
+            let _ = i.sync();
+        }
+        if gap { Err(()) } else { Ok(()) }
+    }
+
+    /// ファイル id のページ [first, last] を写しているところを外す (領域は残す。次に触れたら作りなおすか SIGBUS)。
+    /// drop_file_pages から、すべてのアドレス空間に
+    fn drop_file_range(&mut self, id: (usize, u64), first: usize, last: usize) {
+        let _m = self.mutating();
+        let mut ranges = Vec::new();
+        for (&s, v) in &self.vmas {
+            if let Backing::File { ino, off, .. } = &v.back
+                && ino.id() == id
+            {
+                // 領域の中で、ファイルのページ first..=last にあたるところ
+                let lo = s + (first * PGSIZE).saturating_sub(*off);
+                let hi = match last.checked_add(1).and_then(|l| l.checked_mul(PGSIZE)) {
+                    Some(e) if e > *off => s.saturating_add(e - off),
+                    Some(_) => s,
+                    None => v.end,
+                };
+                let (lo, hi) = (lo.max(s), hi.min(v.end));
+                if lo < hi {
+                    ranges.push((lo, hi));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        let mut pages = Vec::new();
+        let mut vas = Vec::new();
+        for (lo, hi) in ranges {
+            self.each_entry(lo, hi, |va, pte| unsafe {
+                if is_swap(*pte) {
+                    swap::free(slot_of(*pte));
+                } else {
+                    pages.push(page_of(*pte));
+                    if *pte & PTE_VALID != 0 {
+                        vas.push(va);
+                    }
+                }
+                *pte = 0;
+            });
+        }
+        flush_pages_in(self.root_pa(), &vas);
+        if !vas.is_empty() {
+            self.quiesce();
+        }
+        for p in pages {
+            kalloc::put(p);
         }
     }
 
@@ -969,12 +1193,32 @@ impl PageTable {
         for (s, e, shared) in shared_at {
             self.each_pte(s, e, |_, pte| unsafe { *pte = remake_pte(*pte, prot, shared) });
         }
-        // 共有のファイルのページが書けるようになった: もう書いたものとして扱う
+        // 共有のファイルのページが書けるようになった: 写っているものはもう書いたものとして扱う (書き出す印と更新時刻)。
+        // 穴の 0 のページは書けないままに (書いたときにブロックをとる: fault_page)
         if prot & PROT_WRITE != 0 {
-            for k in self.shared_keys(start, end) {
-                if let Some(c) = shared_file().get_mut(&k) {
-                    c.dirty = true;
-                }
+            let areas: Vec<(usize, usize, InodeRef, usize)> = self
+                .vmas
+                .range(start..end)
+                .filter(|(_, v)| v.shared)
+                .filter_map(|(&s, v)| match &v.back {
+                    Backing::File { ino, off, .. } => Some((s, v.end, ino.clone(), *off)),
+                    _ => None,
+                })
+                .collect();
+            for (s, e, ino, off) in areas {
+                self.each_pte(s, e, |va, pte| {
+                    let foff = off + (va - s);
+                    if let Some(c) = shared_file().get_mut(&file_key(&ino, foff)) {
+                        if c.hole {
+                            unsafe { *pte = make_pte(*pte & PTE_ADDR, ro(prot), false) };
+                        } else if !c.dirty {
+                            c.dirty = true;
+                            if !c.own {
+                                let _ = ino.page_written(foff, true);
+                            }
+                        }
+                    }
+                });
             }
         }
         flush_all_in(self.root_pa());
@@ -1161,45 +1405,59 @@ impl PageTable {
         let page_va = pg_down(va);
         let pte = self.walk(page_va, true).ok_or(FaultErr::NoMem)?;
         let e = unsafe { *pte };
-        if let (true, Backing::File { ino, off, .. }) = (shared, &back) {
-            // MAP_SHARED のファイル: みんなで 1 枚のページ。書くときに印をつける
+        if let (true, Backing::File { ino, off, fend, .. }) = (shared, &back) {
+            // MAP_SHARED のファイル: ファイルのページそのもの (1 枚) をみんなで。書くときに印をつける
             *kind = 2;
-            let key = file_key(ino, off + (page_va - start));
+            let foff = off + (page_va - start);
+            let key = file_key(ino, foff);
             let wr = write || force;
             let page = if has_page(e) {
                 page_of(e)
             } else {
-                let page = match shared_file().get(&key) {
-                    Some(c) => c.page,
-                    None => {
-                        let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
-                        let size = ino.meta().size as usize;
-                        let foff = key.2 * PGSIZE;
-                        if foff < size {
-                            let buf = unsafe { core::slice::from_raw_parts_mut(page, (size - foff).min(PGSIZE)) };
-                            if ino.read_at(foff, buf).is_err() {
-                                kalloc::free(page);
-                                return Err(FaultErr::NoMem);
+                // mmap で写したもの (fend が MAX) は、ファイルの終わりより先のページなら SIGBUS (伸びればまた写せる)
+                if *fend == usize::MAX && foff >= pg_up(ino.meta().size as usize) {
+                    return Err(FaultErr::Bus);
+                }
+                shared_page(ino, &key, foff, prot & PROT_EXEC != 0)?
+            };
+            if wr {
+                let (hole, dirty, own) = shared_file().get(&key).map_or((false, false, false), |c| (c.hole, c.dirty, c.own));
+                if hole {
+                    // 穴に書く: ブロックをとる。表の 0 のページがそのままブロックのページになる (adopt_hole)。とれなければ SIGBUS
+                    match ino.page_frame(foff, true) {
+                        Ok(Some(p)) => {
+                            kalloc::put(p);
+                            if p != page {
+                                println!("vm: the block for a hole did not take the mapped page");
+                            }
+                            if let Some(c) = shared_file().get_mut(&key) {
+                                c.hole = false;
                             }
                         }
-                        shared_file().insert(key, Cached { page, dirty: false, ino: ino.clone() });
-                        if prot & PROT_EXEC != 0 {
-                            sync_icache(page as usize, PGSIZE);
-                        }
-                        page
+                        _ => return Err(FaultErr::Bus),
                     }
-                };
-                kalloc::get(page);
-                page
-            };
+                } else if !dirty && !own && ino.page_written(foff, true).is_err() {
+                    // はじめて書く: 書き出す印と更新時刻 (Linux の page_mkwrite)
+                    return Err(FaultErr::Bus);
+                }
+            }
             let c = shared_file().get_mut(&key).ok_or(FaultErr::NoMem)?;
             if wr {
                 c.dirty = true;
             }
-            let p = if c.dirty { prot } else { prot & !PROT_WRITE };
+            let p = if c.dirty { prot } else { ro(prot) };
             unsafe { *pte = make_pte(v2p(page as usize) as u64, p, false) };
             flush_va_in(self.root_pa(), page_va);
             return Ok(());
+        }
+        if let (false, Backing::File { ino, off, fend, .. }) = (shared, &back)
+            && *fend == usize::MAX
+            && !has_page(e)
+            && !is_swap(e)
+            && off + (page_va - start) >= pg_up(ino.meta().size as usize)
+        {
+            // mmap で写したファイル (MAP_PRIVATE) の、終わりより先のページ: SIGBUS
+            return Err(FaultErr::Bus);
         }
         if let (false, Backing::Pages { pages, off }) = (has_page(e), &back) {
             // カーネルのページ (フレームバッファ) をそのまま。共有で、外すときに参照を返す
@@ -1229,7 +1487,7 @@ impl PageTable {
         {
             // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
             *kind = 5;
-            unsafe { *pte = make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false) };
+            unsafe { *pte = make_pte(v2p(page as usize) as u64, ro(prot), false) };
         } else if !has_page(e) {
             *kind = 6;
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
@@ -1466,7 +1724,7 @@ impl PageTable {
                 }
                 (make_pte(v2p(mine as usize) as u64, prot, false), Some(mine), None)
             } else {
-                (make_pte(v2p(page as usize) as u64, prot & !PROT_WRITE, false), Some(page), None)
+                (make_pte(v2p(page as usize) as u64, ro(prot), false), Some(page), None)
             }
         } else if !has_page(e) {
             let Some(page) = kalloc::alloc() else { return (false, None) };
