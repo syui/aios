@@ -14,6 +14,10 @@
 //   stack   スレッドの呼び出しの並び (/proc/ai/stack と、写しているファイルの .eh_frame。unwind.rs)
 //   watch   aiwatch (カーネルの見張り) がいま見つけているものと、最近の記録 (/run/aiwatch.json、/var/log/aiwatch.service.log)
 //   tune    sysctl の値を順に変えてコマンドの時間をくらべる (aios tune。--apply でいちばん速い値を /etc/aios.json に)
+//   mem     メモリの中 (/proc/ai/mem): RAM、カーネルのヒープ、ページキャッシュ (ファイルごと)、tmpfs、スワップ、
+//           メモリを多く使っているプロセス
+//   fs      ファイルシステムの中 (/proc/ai/fs): マウントごと (ext4 のブロックキャッシュ、ジャーナル、inode の覚え)、
+//           パスの覚え、開いているファイル、ディスクの読み書き
 //   M-s     まとめを画面に出す (キーを押すと消える)
 // /proc/bkl、/proc/strace を 0 からにするのは root だけなので、root でなければ sudo -n tee で書く。
 // 開発の Linux でも動く (aios にしかないものは「ない」と答える)
@@ -38,6 +42,7 @@ const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer",
 const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス (pid も name もなければ、みなからあやしいものを探す)"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"}}}"#;
 const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"file":{"type":"string","description":"tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
 const WATCH: &str = r#"{"type":"object","properties":{"lines":{"type":"integer","description":"記録の終わりから何行 (既定 20)"}}}"#;
+const MEM: &str = r#"{"type":"object","properties":{"files":{"type":"integer","description":"ページキャッシュを多く使っているファイルをいくつまで (既定 10)"},"procs":{"type":"integer","description":"メモリを多く使っているプロセスをいくつまで (既定 8)"}}}"#;
 const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
 
 fn main() {
@@ -60,6 +65,8 @@ fn main() {
             Tool { name: "stack", desc: "スレッドの呼び出しの並び (いちばん上から)。ファイルの .eh_frame でたどり、CFI のないところ (musl の libc) はスタックから戻り先を探す (how: pc / cfi / lr / scan)。名前は .symtab か .dynsym、名前のないもの (strip した libxul など) は、その関数のあたりで使っている文字列 (strings_near) を手がかりに", input: STACK },
             Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", input: WATCH },
             Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
+            Tool { name: "mem", desc: "メモリの中 (/proc/ai/mem): RAM の空き、カーネルのヒープ (使っている、いちばん多かった、空きのかたまり、取れなかった回数)、ページキャッシュ (ページの数、ファイルごと、読みそこねた数、捨てた数)、MAP_SHARED のページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス。text はまとめ、ほかはそのままの数 (ページは 4 KiB)。root か wheel の人だけ", input: MEM },
+            Tool { name: "fs", desc: "ファイルシステムの中 (/proc/ai/fs): マウントごとの様子 (ext4 はブロックキャッシュの数と当たり・外れ・捨てた数、まだ書いていないブロック、書き出した回数、ジャーナル、inode と名前の覚え、空き。tmpfs はページ)、パスの覚え (数、当たり・外れ、捨てた回数)、開いているファイルの数、区画ごとのディスクの読み書き。text はまとめ、ほかはそのままの数。root か wheel の人だけ", input: NONE },
         ],
     };
     aish_plugin::run(spec, |ev, v| match ev {
@@ -80,6 +87,8 @@ fn main() {
                 "log" => log(a),
                 "bkl" => bkl(a, pwd),
                 "strace" => strace(a, pwd),
+                "mem" => mem(a),
+                "fs" => fs(),
                 "threads" => threads(a),
                 "hang" => hang(a),
                 "stack" => stack(a),
@@ -256,6 +265,27 @@ fn summary() -> Value {
     {
         t.push_str(&format!("bkl      {}\n", all.trim_start_matches("all").trim()));
     }
+    // カーネルの中のメモリ (root か wheel なら): ページキャッシュ、ヒープ、パスの覚え (くわしくは mem と fs)
+    if let Ok(m) = ai_json("/proc/ai/mem") {
+        let pg = m["page"].as_u64().unwrap_or(4096);
+        let h = &m["kernel"]["heap"];
+        t.push_str(&format!(
+            "cache    page cache {} ({} pages), tmpfs {}, shared {}; heap {} / {} (peak {}, fails {})\n",
+            mib(m["page_cache"]["pages"].as_u64().unwrap_or(0) * pg),
+            m["page_cache"]["pages"].as_u64().unwrap_or(0),
+            mib(m["tmpfs"]["pages"].as_u64().unwrap_or(0) * pg),
+            mib(m["shared"]["pages"].as_u64().unwrap_or(0) * pg),
+            mib(h["used"].as_u64().unwrap_or(0)),
+            mib(h["size"].as_u64().unwrap_or(0)),
+            mib(h["peak"].as_u64().unwrap_or(0)),
+            h["fails"].as_u64().unwrap_or(0)
+        ));
+    }
+    if let Ok(f) = ai_json("/proc/ai/fs") {
+        let p = &f["paths"];
+        let (hit, miss) = (p["hits"].as_u64().unwrap_or(0), p["misses"].as_u64().unwrap_or(0));
+        t.push_str(&format!("paths    {} cached ({} negative), hit {}%, {} open files\n", p["entries"], p["negative"], hit * 100 / (hit + miss).max(1), f["files"]["open"]));
+    }
     if let Some(k) = kmsg_text() {
         t.push_str("kmsg (終わりの 5 行)\n");
         for l in tail(&k, "", 5).lines() {
@@ -263,6 +293,170 @@ fn summary() -> Value {
         }
     }
     json!({ "text": t })
+}
+
+/// バイトを MiB (小数 1 けた) か KiB で
+fn mib(b: u64) -> String {
+    if b >= 1 << 20 { format!("{:.1} MiB", b as f64 / (1u64 << 20) as f64) } else { format!("{} KiB", b / 1024) }
+}
+
+/// /proc/ai の 1 行の JSON (root か wheel で読む)
+fn ai_json(path: &str) -> Result<Value, String> {
+    if !Path::new(path).exists() {
+        return Err(format!("no {} (not aios, or an older kernel)", path));
+    }
+    let text = read_root(path)?;
+    serde_json::from_str(text.trim()).map_err(|e| format!("{}: {}", path, e))
+}
+
+fn pct(a: u64, b: u64) -> u64 {
+    a * 100 / (a + b).max(1)
+}
+
+/// mem: /proc/ai/mem のまとめ
+fn mem(a: &Value) -> Value {
+    let mut m = match ai_json("/proc/ai/mem") {
+        Ok(m) => m,
+        Err(e) => return error(e),
+    };
+    let nfiles = a["files"].as_u64().unwrap_or(10) as usize;
+    let nprocs = a["procs"].as_u64().unwrap_or(8) as usize;
+    let t = mem_text(&m, nfiles, nprocs);
+    if let Some(files) = m["page_cache"]["files"].as_array_mut() {
+        files.truncate(nfiles);
+    }
+    if let Some(ps) = m["procs"].as_array_mut() {
+        ps.truncate(nprocs);
+    }
+    m["text"] = json!(t);
+    m
+}
+
+/// /proc/ai/mem の JSON を、人 (と AI) が読む形に
+fn mem_text(m: &Value, nfiles: usize, nprocs: usize) -> String {
+    let pg = m["page"].as_u64().unwrap_or(4096);
+    let u = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut t = String::new();
+    let r = &m["ram"];
+    t.push_str(&format!("ram        {} total, {} free (reclaim below {})\n", mib(u(&r["total"]) * pg), mib(u(&r["free"]) * pg), mib(u(&r["min_free"]) * pg)));
+    let h = &m["kernel"]["heap"];
+    t.push_str(&format!(
+        "kernel     heap {} / {} used (peak {}, free {} in {} blocks, largest {}, fails {}), stacks {}\n",
+        mib(u(&h["used"])), mib(u(&h["size"])), mib(u(&h["peak"])), mib(u(&h["free"])), u(&h["free_blocks"]), mib(u(&h["largest_free"])), u(&h["fails"]), mib(u(&m["kernel"]["stacks"]))
+    ));
+    let c = &m["page_cache"];
+    t.push_str(&format!(
+        "page cache {} ({} pages, max {}), misses {} ({} ms), shrunk {}, changed {}\n",
+        mib(u(&c["pages"]) * pg), u(&c["pages"]), u(&c["max"]), u(&c["misses"]), u(&c["miss_ns"]) / 1_000_000, u(&c["shrunk"]), u(&c["changes"])
+    ));
+    if let Some(files) = c["files"].as_array() {
+        for f in files.iter().take(nfiles) {
+            let name = f["name"].as_str().map_or_else(|| format!("fs{}:ino{}", u(&f["fs"]), u(&f["ino"])), |n| n.to_string());
+            t.push_str(&format!("  {:>9} {:>10}  {}\n", mib(u(&f["pages"]) * pg), mib(u(&f["size"])), name));
+        }
+    }
+    t.push_str(&format!("shared     {} ({} dirty)\n", mib(u(&m["shared"]["pages"]) * pg), u(&m["shared"]["dirty"])));
+    t.push_str(&format!("tmpfs      {} / {} limit\n", mib(u(&m["tmpfs"]["pages"]) * pg), mib(u(&m["tmpfs"]["limit"]) * pg)));
+    let sw = &m["swap"];
+    t.push_str(&format!("swap       {} / {} used (in {} out {} pages)\n", mib(u(&sw["used"]) * pg), mib(u(&sw["total"]) * pg), u(&sw["in"]), u(&sw["out"])));
+    t.push_str(&format!("faults     {} ({} without the big lock)\n", u(&m["faults"]["all"]), u(&m["faults"]["fast"])));
+    if let Some(ps) = m["procs"].as_array() {
+        t.push_str("procs      rss / vsize\n");
+        for p in ps.iter().take(nprocs) {
+            t.push_str(&format!("  {:>6} {:>10} {:>10}  {}\n", u(&p["pid"]), mib(u(&p["rss"]) * pg), mib(u(&p["vsize"])), s(p, "name")));
+        }
+    }
+    t
+}
+
+/// fs: /proc/ai/fs のまとめ
+fn fs() -> Value {
+    let mut f = match ai_json("/proc/ai/fs") {
+        Ok(f) => f,
+        Err(e) => return error(e),
+    };
+    f["text"] = json!(fs_text(&f));
+    f
+}
+
+/// /proc/ai/fs の JSON を、人 (と AI) が読む形に
+fn fs_text(f: &Value) -> String {
+    let u = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut t = String::from("mounts\n");
+    if let Some(ms) = f["mounts"].as_array() {
+        for m in ms {
+            t.push_str(&format!("  {:<12} {:<6} {:<12} {}", s(m, "target"), s(m, "type"), s(m, "source"), if m["ro"].as_bool().unwrap_or(false) { "ro" } else { "rw" }));
+            let st = &m["stats"];
+            if st.is_object() {
+                if s(m, "type") == "tmpfs" {
+                    t.push_str(&format!("  {} pages / {} limit", u(&st["pages"]), u(&st["limit"])));
+                } else {
+                    let c = &st["cache"];
+                    let bs = u(&st["block_size"]).max(1);
+                    t.push_str(&format!(
+                        "\n    cache {} / {} blocks, dirty meta {} data {}, hit {}% ({} / {}), readahead {}, evicted {}, flushed {} (meta {} data {} blocks, last {} s ago), commits {}",
+                        u(&c["blocks"]), u(&c["limit"]), u(&c["dirty_meta"]), u(&c["dirty_data"]), pct(u(&c["hits"]), u(&c["misses"])), u(&c["hits"]), u(&c["misses"]),
+                        u(&c["readahead"]), u(&c["evictions"]), u(&c["flushes"]), u(&c["written_meta"]), u(&c["written_data"]), u(&c["last_flush_s"]), u(&c["commits"])
+                    ));
+                    if st["journal"].is_object() {
+                        t.push_str(&format!("\n    journal {} blocks, next transaction {}", u(&st["journal"]["capacity"]), u(&st["journal"]["seq"])));
+                    }
+                    t.push_str(&format!(
+                        "\n    inode cache {} / {}, name cache {} / {}, inodes in use {}, orphans {}; free {} of {} ({} inodes free)",
+                        u(&st["metas"]["entries"]), u(&st["metas"]["max"]), u(&st["names"]["entries"]), u(&st["names"]["max"]), u(&st["inodes_in_use"]), u(&st["orphans"]),
+                        mib(u(&st["blocks"]["free"]) * bs), mib(u(&st["blocks"]["total"]) * bs), u(&st["inodes"]["free"])
+                    ));
+                }
+            }
+            t.push('\n');
+        }
+    }
+    let p = &f["paths"];
+    t.push_str(&format!(
+        "paths      {} cached ({} negative, max {}), hit {}% ({} / {}), swept {} times, invalidated {}\n",
+        u(&p["entries"]), u(&p["negative"]), u(&p["max"]), pct(u(&p["hits"]), u(&p["misses"])), u(&p["hits"]), u(&p["misses"]), u(&p["sweeps"]), u(&p["invalidations"])
+    ));
+    t.push_str(&format!("files      {} open in {} processes\n", u(&f["files"]["open"]), u(&f["files"]["procs"])));
+    if let Some(ds) = f["disk"].as_array() {
+        for d in ds {
+            t.push_str(&format!(
+                "disk       {:<12} {} reads ({}, {} ms), {} writes ({}, {} ms)\n",
+                s(d, "part"), u(&d["reads"]), mib(u(&d["read_sectors"]) * 512), u(&d["read_ms"]), u(&d["writes"]), mib(u(&d["write_sectors"]) * 512), u(&d["write_ms"])
+            ));
+        }
+    }
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // testdata/*.json は aios の VM で読んだ /proc/ai/mem と /proc/ai/fs そのもの
+    #[test]
+    fn mem_summary() {
+        let m: Value = serde_json::from_str(include_str!("../testdata/mem.json")).unwrap();
+        let t = mem_text(&m, 3, 2);
+        assert!(t.contains("ram        2048.0 MiB total"), "{}", t);
+        assert!(t.contains("kernel     heap 3.5 MiB / 64.0 MiB used"), "{}", t);
+        assert!(t.contains("page cache 7.2 MiB (1844 pages, max 131072)"), "{}", t);
+        assert!(t.contains("/usr/bin/aish"), "{}", t);
+        assert_eq!(t.matches("/usr/").count(), 3, "{}", t);
+        assert!(t.contains("procs      rss / vsize\n       7"), "{}", t);
+        assert_eq!(t.lines().count(), 13, "{}", t);
+    }
+
+    #[test]
+    fn fs_summary() {
+        let f: Value = serde_json::from_str(include_str!("../testdata/fs.json")).unwrap();
+        let t = fs_text(&f);
+        assert!(t.contains("  /            ext4   /dev/vda2    rw\n    cache 4774 / 16384 blocks"), "{}", t);
+        assert!(t.contains("journal 16383 blocks"), "{}", t);
+        assert!(t.contains("  /tmp         tmpfs  tmpfs        rw  49 pages / 262144 limit"), "{}", t);
+        assert!(t.contains("paths      447 cached (349 negative, max 4096), hit 45%"), "{}", t);
+        assert!(t.contains("files      62 open in 17 processes"), "{}", t);
+        assert!(t.contains("disk       /dev/vda2"), "{}", t);
+    }
 }
 
 // ---- プロセス ----

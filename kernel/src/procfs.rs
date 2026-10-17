@@ -96,6 +96,8 @@ enum Node {
     AiCtl,
     /// /proc/ai/kernel: kernel/kernel.json (ファイルごとの core と extra、quirk の一覧)
     AiKernel,
+    AiMem,
+    AiFs,
     AiFdDir,
     AiFd(u32),
     /// /proc/ai/stack と stack/TID (スレッドの番号)
@@ -196,6 +198,8 @@ impl ProcInode {
             Node::AiProf => 47,
             Node::AiCtl => 43,
             Node::AiKernel => 48,
+            Node::AiMem => 49,
+            Node::AiFs => 50,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
             Node::AiStackDir => 45,
@@ -262,7 +266,7 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
-            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => proc::ai_threads(),
             Node::AiBkl => crate::smp::stats_json(),
@@ -270,6 +274,8 @@ impl ProcInode {
             Node::AiProf => crate::prof::json(),
             Node::AiCtl => crate::aiproc::CTL_HELP.into(),
             Node::AiKernel => include_str!("../kernel.json").into(),
+            Node::AiMem => crate::aiproc::mem_json(),
+            Node::AiFs => crate::aiproc::fs_json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
@@ -730,6 +736,8 @@ impl Inode for ProcInode {
             (Node::AiDir, "prof") => Node::AiProf,
             (Node::AiDir, "ctl") => Node::AiCtl,
             (Node::AiDir, "kernel") => Node::AiKernel,
+            (Node::AiDir, "mem") => Node::AiMem,
+            (Node::AiDir, "fs") => Node::AiFs,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
@@ -836,6 +844,8 @@ impl Inode for ProcInode {
                 add("prof".into(), Node::AiProf);
                 add("ctl".into(), Node::AiCtl);
                 add("kernel".into(), Node::AiKernel);
+                add("mem".into(), Node::AiMem);
+                add("fs".into(), Node::AiFs);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
             }

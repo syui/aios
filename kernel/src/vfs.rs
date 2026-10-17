@@ -153,6 +153,10 @@ pub trait Inode {
     fn set_mtime(&self, ns: u64) -> Result<(), i64>;
     /// struct statfs
     fn statfs(&self) -> [u8; 120];
+    /// /proc/ai/fs に出す、このファイルシステムの中の様子 (JSON のオブジェクト 1 つ)。ないものは None
+    fn fs_stats(&self) -> Option<String> {
+        None
+    }
     /// ファイルの大きさの上限 (Linux の s_maxbytes。fallocate の EFBIG、sendfile の EOVERFLOW)。既定は
     /// MAX_LFS_FILESIZE (tmpfs、パイプなど)
     fn max_bytes(&self) -> u64 {
@@ -474,6 +478,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             None => Err(-ENOENT),
         };
     }
+    PATHS_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new() };
     let r = walk(None, key.1.clone(), follow, &mut t);
     // あったものと、ない (ENOENT) ものを覚える。たどっているあいだに変わったものがあれば覚えない (念のため)
@@ -486,6 +491,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         if cache.len() >= max {
             // 前にいっぱいになったときから引かれなかったものを捨てる (引かれたものは印を消して残す)。
             // あまり減らなければ全部
+            PATHS_SWEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             cache.retain(|_, e| core::mem::take(&mut e.used));
             if cache.len() >= max / 4 * 3 {
                 cache.clear();
@@ -539,6 +545,10 @@ static mut PATHS_PENDING: Vec<(usize, u64)> = Vec::new();
 static PATHS_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// 覚えから答えた数 (/proc/bkl)
 pub static PATHS_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 覚えになくてたどった数、いっぱいになって捨てた回数、変わったディレクトリを知らせた数 (/proc/ai/fs)
+pub static PATHS_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PATHS_SWEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PATHS_INVAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// 覚えるのは (ヒープの大きさ / 16 KiB) こまで: 1 つ 700 バイトほどなので、ヒープの 4% ほど
 /// (32 MiB で 2048、64 MiB で 4096、16384 まで)
@@ -559,6 +569,7 @@ pub fn names_changed() {
 /// ディレクトリ dir の中の名前 (作る・消す・名前を変える) か、dir の属性 (chmod、chown) が変わった:
 /// dir を通ったパスの覚えを捨てる (次に引くときに)。ふつうのファイルの属性が変わったときに呼んでもよい
 pub fn dir_changed(dir: (usize, u64)) {
+    PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { DIR_GENS[gen_slot(dir)] += 1 };
     let p = unsafe { &mut *(&raw mut PATHS_PENDING) };
     if p.len() >= 64 {
@@ -584,6 +595,48 @@ pub fn dir_gen(dir: (usize, u64)) -> u64 {
 pub fn paths_len() -> (usize, usize) {
     let cache = unsafe { &*(&raw const PATHS) };
     (cache.len(), cache.values().filter(|e| e.found.is_none()).count())
+}
+
+/// /proc/ai/fs の paths: 数、ないもの、上限、当たり、外れ、捨てた回数、変わったディレクトリの数
+pub fn paths_json() -> String {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (n, neg) = paths_len();
+    alloc::format!(
+        "{{\"entries\":{},\"negative\":{},\"max\":{},\"hits\":{},\"misses\":{},\"sweeps\":{},\"invalidations\":{}}}",
+        n,
+        neg,
+        paths_max(),
+        PATHS_HIT.load(Relaxed),
+        PATHS_MISS.load(Relaxed),
+        PATHS_SWEEPS.load(Relaxed),
+        PATHS_INVAL.load(Relaxed)
+    )
+}
+
+/// id の inode の名前 (パスの覚えにあれば。/proc/ai/mem のページキャッシュのファイルの名前)
+pub fn path_of_id(id: (usize, u64)) -> Option<String> {
+    let cache = unsafe { &*(&raw const PATHS) };
+    cache.values().filter_map(|e| e.found.as_ref()).find(|(_, i)| i.id() == id).map(|(w, _)| alloc::format!("/{}", w))
+}
+
+/// /proc/ai/fs の mounts: はじめの namespace のマウント (ルートも) と、それぞれのファイルシステムの中の様子 (fs_stats)
+pub fn mounts_json() -> String {
+    let esc = crate::aiproc::esc;
+    let stats = |i: Option<&InodeRef>| i.and_then(|i| i.fs_stats()).unwrap_or_else(|| String::from("null"));
+    let (src, ty) = unsafe { (*(&raw const ROOT_INFO)).clone() };
+    let root = unsafe { (*(&raw const ROOT)).clone() };
+    let mut v = alloc::vec![alloc::format!("{{\"target\":\"/\",\"source\":\"{}\",\"type\":\"{}\",\"ro\":false,\"stats\":{}}}", esc(&src), esc(&ty), stats(root.as_ref()))];
+    for m in init_mnt().list.borrow().iter() {
+        v.push(alloc::format!(
+            "{{\"target\":\"/{}\",\"source\":\"{}\",\"type\":\"{}\",\"ro\":{},\"stats\":{}}}",
+            esc(&m.target),
+            esc(&m.source),
+            esc(&m.fstype),
+            m.ro,
+            stats(Some(&m.root))
+        ));
+    }
+    alloc::format!("[{}]", v.join(","))
 }
 
 /// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。

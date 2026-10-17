@@ -7,6 +7,10 @@
 //             プログラムのつごうで入れた手当て。cause と until つき) の一覧。だれでも読める
 //   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
 //   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
+//   mem       メモリの中: RAM の空き、カーネルのヒープとスタック、ページキャッシュ (ファイルごとも)、MAP_SHARED の
+//             ページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス (mem_json)
+//   fs        ファイルシステムの中: マウントごとの様子 (ext4 のブロックキャッシュ、ジャーナル、inode の覚え。tmpfs の
+//             ページ)、パスの覚え、開いているファイルの数、区画ごとのディスクの読み書き (fs_json)
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
 //   stack/TID スレッドのレジスタ、スタック (sp から 64 KiB まで、16 進)、ファイルを写している地図 (proc::ai_stack)。
 //             aish-sys がファイルの .eh_frame でたどる
@@ -72,6 +76,103 @@ pub fn fds_json(tgid: u32) -> Result<String, i64> {
         out.push_str("}\n");
     }
     Ok(out)
+}
+
+/// /proc/ai/mem: 1 行の JSON。数はページ (page = 4096 バイト) か、バイト (ヒープ、vsize、ファイルの大きさ)
+pub fn mem_json() -> String {
+    use core::sync::atomic::Ordering::Relaxed;
+    let pg = crate::memlayout::PGSIZE;
+    let (hsize, hused, hpeak, hblocks, hbig, hfree, hfails) = crate::heap::stats();
+    let (swt, swf) = crate::swap::totals();
+    let (tmp, tmp_limit) = crate::tmpfs::stats();
+    let (shp, shd) = crate::vm::shared_stats();
+    // メモリを多く使っているプロセス (rss の多い順に 10。アドレス空間を分けているスレッドは 1 つ)
+    let mut procs: alloc::vec::Vec<(u32, String, usize, usize)> = alloc::vec::Vec::new();
+    let mut seen: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for p in crate::proc::all_leader_procs() {
+        let Some(mm) = p.mm.as_ref() else { continue };
+        if seen.contains(&mm.id()) {
+            continue;
+        }
+        seen.push(mm.id());
+        let m = mm.get();
+        let name = core::str::from_utf8(&p.comm).unwrap_or("").trim_end_matches('\0').into();
+        procs.push((p.tgid, name, m.pt.resident(), m.pt.vsize()));
+    }
+    procs.sort_by_key(|x| core::cmp::Reverse(x.2));
+    procs.truncate(10);
+    let procs: alloc::vec::Vec<String> = procs.iter().map(|(pid, name, rss, vs)| format!("{{\"pid\":{},\"name\":\"{}\",\"rss\":{},\"vsize\":{}}}", pid, esc(name), rss, vs)).collect();
+    format!(
+        "{{\"page\":{},\"ram\":{{\"total\":{},\"free\":{},\"min_free\":{}}},\"kernel\":{{\"heap\":{{\"size\":{},\"used\":{},\"peak\":{},\"free\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{}}},\"stacks\":{}}},\"page_cache\":{},\"shared\":{{\"pages\":{},\"dirty\":{}}},\"tmpfs\":{{\"pages\":{},\"limit\":{}}},\"swap\":{{\"total\":{},\"used\":{},\"in\":{},\"out\":{}}},\"faults\":{{\"all\":{},\"fast\":{}}},\"procs\":[{}]}}\n",
+        pg,
+        crate::memlayout::ram_size() / pg,
+        crate::kalloc::nfree(),
+        crate::sysctl::MIN_FREE_PAGES.load(Relaxed),
+        hsize,
+        hused,
+        hpeak,
+        hfree,
+        hblocks,
+        hbig,
+        hfails,
+        crate::proc::kstack_bytes(),
+        crate::vm::page_cache_json(),
+        shp,
+        shd,
+        tmp,
+        tmp_limit,
+        swt,
+        swt - swf,
+        crate::swap::PSWPIN.load(Relaxed),
+        crate::swap::PSWPOUT.load(Relaxed),
+        crate::smp::FAULTS.load(Relaxed),
+        crate::smp::FAST_FAULTS.load(Relaxed),
+        procs.join(",")
+    )
+}
+
+/// /proc/ai/fs: 1 行の JSON
+pub fn fs_json() -> String {
+    // 開いているファイル (fork や dup で分けているものは 1 つ) と、fd の表を持つプロセスの数
+    let mut seen: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+    let mut nprocs = 0;
+    for p in crate::proc::all_leader_procs() {
+        let Some(files) = p.files.as_ref() else { continue };
+        nprocs += 1;
+        for f in files.get().fds.iter().flatten() {
+            seen.insert(alloc::rc::Rc::as_ptr(&f.file) as *const u8 as usize);
+        }
+    }
+    // 区画ごとの読み書き (0 はディスク全体。何もしていない区画は出さない)
+    let mut disk = alloc::vec::Vec::new();
+    let mut parts = crate::block::parts();
+    if !parts.iter().any(|p| p.num == 0) {
+        parts.insert(0, crate::block::Part { start: 0, len: 0, num: 0 });
+    }
+    for p in parts {
+        let io = crate::block::io_stats(p.num);
+        if p.num != 0 && io.iter().all(|&x| x == 0) {
+            continue;
+        }
+        disk.push(format!(
+            "{{\"part\":\"{}\",\"reads\":{},\"read_sectors\":{},\"read_ms\":{},\"writes\":{},\"write_sectors\":{},\"write_ms\":{}}}",
+            esc(&crate::block::part_name(&p)),
+            io[0],
+            io[1],
+            io[2],
+            io[3],
+            io[4],
+            io[5]
+        ));
+    }
+    format!(
+        "{{\"mounts\":{},\"paths\":{},\"files\":{{\"open\":{},\"procs\":{}}},\"disk\":[{}]}}\n",
+        crate::vfs::mounts_json(),
+        crate::vfs::paths_json(),
+        seen.len(),
+        nprocs,
+        disk.join(",")
+    )
 }
 
 pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nprof on|off\nlockbench\npanic [TEXT]\n";

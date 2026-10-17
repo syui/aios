@@ -133,6 +133,13 @@ pub fn used() -> usize {
     USED.load(Relaxed)
 }
 
+/// (大きさ, 使っている, いちばん多かった, 空きのかたまりの数, 空きのいちばん大きなかたまり, 空きの全部, 取れなかった回数)。
+/// どれもバイト (数のほかは)。/proc/ai/mem
+pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
+    let (n, big, free) = HEAP.lock().stats();
+    (size(), USED.load(Relaxed), PEAK.load(Relaxed), n, big, free, FAILS.load(Relaxed))
+}
+
 /// /proc/ai/heap: 1 行の JSON
 pub fn stats_json() -> alloc::string::String {
     let (n, big, _) = HEAP.lock().stats();

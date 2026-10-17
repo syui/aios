@@ -20,6 +20,11 @@ pub const NOFILE: usize = 65536;
 /// はじめのソフトの上限 (Linux と同じ 1024。setrlimit で NOFILE まで上げられる)
 pub const NOFILE_SOFT: usize = 1024;
 const KSTACK_SIZE: usize = 16 * 1024;
+
+/// カーネルのスタックの全部のバイト (/proc/ai/mem)
+pub fn kstack_bytes() -> usize {
+    NPROC * KSTACK_SIZE
+}
 pub const MMAP_BASE: usize = 0x10_0000_0000;
 
 pub const EINTR: i64 = 4;
@@ -56,7 +61,7 @@ impl<T> Shared<T> {
         Rc::strong_count(&self.0) == 1
     }
 
-    fn id(&self) -> usize {
+    pub fn id(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }
 }

@@ -138,6 +138,46 @@ pub fn cached_pages() -> usize {
     PRIV.lock().len()
 }
 
+/// shrink_cache で捨てたページの数
+static SHRUNK: AtomicUsize = AtomicUsize::new(0);
+
+/// /proc/ai/mem の page_cache: ページの数と上限、変わった数、読みそこね (ページキャッシュになかった) の数と時間、
+/// 捨てた数、ファイルごとのページの数 (多い順に 20 まで。大きさと、名前はパスの覚えにあれば)
+pub fn page_cache_json() -> alloc::string::String {
+    use alloc::format;
+    let mut files: Vec<((usize, u64), usize)> = Vec::new();
+    let total = {
+        let c = PRIV.lock();
+        // 鍵は (fs, ino, ページ) の順なので、同じファイルは並ぶ
+        for (k, _) in c.iter() {
+            match files.last_mut() {
+                Some((id, n)) if *id == (k.0, k.1) => *n += 1,
+                _ => files.push(((k.0, k.1), 1)),
+            }
+        }
+        c.len()
+    };
+    files.sort_by_key(|(_, n)| core::cmp::Reverse(*n));
+    files.truncate(20);
+    let mut list = Vec::new();
+    for ((fs, ino), n) in files {
+        let size = PRIV.lock().range((fs, ino, 0)..=(fs, ino, usize::MAX)).next().map_or(0, |(_, p)| p.ver.1);
+        let name = crate::vfs::path_of_id((fs, ino)).map_or(alloc::string::String::new(), |p| format!(",\"name\":\"{}\"", crate::aiproc::esc(&p)));
+        list.push(format!("{{\"fs\":{},\"ino\":{},\"pages\":{},\"size\":{}{}}}", fs, ino, n, size, name));
+    }
+    let (miss, ns) = (FAULT_KIND[9].0.load(Ordering::Relaxed), FAULT_KIND[9].1.load(Ordering::Relaxed));
+    format!(
+        "{{\"pages\":{},\"max\":{},\"changes\":{},\"misses\":{},\"miss_ns\":{},\"shrunk\":{},\"files\":[{}]}}",
+        total,
+        priv_max(),
+        CHANGES.load(Ordering::Relaxed),
+        miss,
+        ns,
+        SHRUNK.load(Ordering::Relaxed),
+        list.join(",")
+    )
+}
+
 /// だれも写していないページを捨てる (n 枚まで)。捨てた数
 pub fn shrink_cache(n: usize) -> usize {
     let mut freed = Vec::new();
@@ -153,6 +193,7 @@ pub fn shrink_cache(n: usize) -> usize {
     for &p in &freed {
         kalloc::put(p);
     }
+    SHRUNK.fetch_add(freed.len(), Ordering::Relaxed);
     freed.len()
 }
 
@@ -339,6 +380,12 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
 /// MAP_SHARED で写しているファイルのページの数 (/proc/meminfo の Shmem)
 pub fn shared_pages() -> usize {
     shared_file().len()
+}
+
+/// (MAP_SHARED のページの数, そのうち書いてまだファイルに書き戻していないもの)。/proc/ai/mem
+pub fn shared_stats() -> (usize, usize) {
+    let m = shared_file();
+    (m.len(), m.values().filter(|c| c.dirty).count())
 }
 
 /// 書いたページをファイルに書き戻す (sync)。印はそのまま (まだ書けるように写っているかもしれない)

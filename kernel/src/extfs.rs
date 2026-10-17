@@ -185,6 +185,7 @@ impl Cache {
         if let Some(p) = self.map.remove(&old) {
             kalloc::free(p);
         }
+        self.evictions += 1;
         true
     }
 
@@ -216,6 +217,16 @@ struct Cache {
     /// ビットマップを書きかえたグループ (チェックサムを直す)
     bb_dirty: BTreeSet<u32>,
     ib_dirty: BTreeSet<u32>,
+    /// /proc/ai/fs の数: 引いたときにあった、なかった (ディスクから読んだ)、まとめて読んだ、捨てた、書き出した回数、
+    /// 書いたブロック (メタデータ、中身)、ジャーナルのトランザクション
+    hits: u64,
+    misses: u64,
+    readahead: u64,
+    evictions: u64,
+    flushes: u64,
+    written_meta: u64,
+    written_data: u64,
+    commits: u64,
 }
 
 pub struct ExtFs {
@@ -456,6 +467,14 @@ impl ExtFs {
                 gd_dirty: BTreeSet::new(),
                 bb_dirty: BTreeSet::new(),
                 ib_dirty: BTreeSet::new(),
+                hits: 0,
+                misses: 0,
+                readahead: 0,
+                evictions: 0,
+                flushes: 0,
+                written_meta: 0,
+                written_data: 0,
+                commits: 0,
             }),
             journal: RefCell::new(None),
             last_flush: core::cell::Cell::new(0),
@@ -509,6 +528,47 @@ impl ExtFs {
         ExtInode::make(self, ROOT_INO)
     }
 
+    /// /proc/ai/fs の、このファイルシステムの中の様子 (1 つの JSON のオブジェクト)
+    pub fn stats_json(&self) -> alloc::string::String {
+        let c = self.cache.borrow();
+        let j = self.journal.borrow();
+        let journal = match j.as_ref() {
+            Some(j) => alloc::format!("{{\"capacity\":{},\"seq\":{}}}", j.capacity(), j.seq()),
+            None => alloc::string::String::from("null"),
+        };
+        let sb = self.sb.borrow();
+        let since = crate::timer::ticks().saturating_sub(self.last_flush.get()) / crate::timer::HZ;
+        alloc::format!(
+            "{{\"block_size\":{},\"ro\":{},\"cache\":{{\"blocks\":{},\"limit\":{},\"dirty_meta\":{},\"dirty_data\":{},\"hits\":{},\"misses\":{},\"readahead\":{},\"evictions\":{},\"flushes\":{},\"written_meta\":{},\"written_data\":{},\"commits\":{},\"last_flush_s\":{}}},\"journal\":{},\"metas\":{{\"entries\":{},\"max\":{}}},\"names\":{{\"entries\":{},\"max\":{}}},\"inodes_in_use\":{},\"orphans\":{},\"blocks\":{{\"total\":{},\"free\":{}}},\"inodes\":{{\"total\":{},\"free\":{}}}}}",
+            self.bsize,
+            self.ro,
+            c.map.len(),
+            cache_limit(self.bsize),
+            c.dirty.len(),
+            c.data.len(),
+            c.hits,
+            c.misses,
+            c.readahead,
+            c.evictions,
+            c.flushes,
+            c.written_meta,
+            c.written_data,
+            c.commits,
+            since,
+            journal,
+            self.metas.borrow().len(),
+            METAS_MAX,
+            self.names.borrow().len,
+            NAMES_MAX,
+            self.users.borrow().len(),
+            self.orphans.borrow().len(),
+            self.blocks_count(),
+            self.sb_u64(12, 0x158),
+            u32_at(&sb, 0),
+            u32_at(&sb, 16)
+        )
+    }
+
     pub fn kind(&self) -> &'static str {
         if self.extents { "ext4" } else { "ext2" }
     }
@@ -521,14 +581,18 @@ impl ExtFs {
 
     fn with_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         let mut c = self.cache.borrow_mut();
-        let page = match c.map.get(&b) {
-            Some(&p) => p,
+        let page = match c.map.get(&b).copied() {
+            Some(p) => {
+                c.hits += 1;
+                p
+            }
             // 読むだけの道 (proc::io_sleepable) で、書く操作の中でなければ、ディスクを眠って待つ
             None if self.writing.get() == 0 && crate::proc::io_sleep_ok() => {
                 drop(c);
                 return self.with_block_sleep(b, f);
             }
             None => {
+                c.misses += 1;
                 if c.map.len() >= cache_limit(self.bsize) {
                     c.evict_one();
                 }
@@ -555,6 +619,7 @@ impl ExtFs {
     /// with_block の、ディスクを眠って待つ道 (キャッシュになかった)。眠るあいだはキャッシュを借りない。
     /// 起きたら: 書く操作があった (wgen が変わった) なら捨てて ERETRY、ほかの人が先に入れていればそちらを使う
     fn with_block_sleep<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        self.cache.borrow_mut().misses += 1;
         let g0 = self.wgen.get();
         let p = match kalloc::alloc_dirty() {
             Some(p) => p,
@@ -645,6 +710,7 @@ impl ExtFs {
             unsafe { core::ptr::copy_nonoverlapping(buf[k * self.bsize..].as_ptr(), p, self.bsize) };
             c.map.insert(blk, p);
             c.order.push_back(blk);
+            c.readahead += 1;
         }
         Ok(())
     }
@@ -1118,6 +1184,7 @@ impl ExtFs {
         // 書きかえたものをまとめて書き出す (中の block:write と jbd2:commit は引かれる)
         let _p = crate::prof::span("extfs:flush");
         self.last_flush.set(crate::timer::ticks());
+        self.cache.borrow_mut().flushes += 1;
         let (bb, ib) = {
             let mut c = self.cache.borrow_mut();
             (core::mem::take(&mut c.bb_dirty), core::mem::take(&mut c.ib_dirty))
@@ -1170,6 +1237,7 @@ impl ExtFs {
             for b in &data {
                 c.data.remove(b);
             }
+            c.written_data += data.len() as u64;
         }
         let meta: Vec<u64> = self.cache.borrow().dirty.iter().copied().collect();
         if meta.is_empty() {
@@ -1180,6 +1248,7 @@ impl ExtFs {
         for b in &meta {
             c.dirty.remove(b);
         }
+        c.written_meta += meta.len() as u64;
         Ok(())
     }
 
@@ -1187,6 +1256,7 @@ impl ExtFs {
         let mut j = self.journal.borrow_mut();
         if let Some(jr) = j.as_mut() {
             if self.journal_commit(jr, meta)? {
+                self.cache.borrow_mut().commits += 1;
                 self.write_blocks(meta)?;
                 return self.journal_done(jr);
             }
@@ -2959,6 +3029,10 @@ impl Inode for ExtInode {
 
     fn max_bytes(&self) -> u64 {
         self.fs.max_bytes
+    }
+
+    fn fs_stats(&self) -> Option<String> {
+        Some(self.fs.stats_json())
     }
 
     fn statfs(&self) -> [u8; 120] {

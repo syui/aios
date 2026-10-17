@@ -72,6 +72,9 @@ t lockbench sh -c 'seq 1 300000 | cat | wc -l > /tmp/lockbench.n & echo lockbenc
 
 # カーネルのヒープ (tlsf.rs) の決まりが、ここまでのたしかめのあとも守られているか (heap check の答えは kmsg に)
 t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
+# /proc/ai/mem と /proc/ai/fs: 1 行の JSON で、ページキャッシュとヒープ、マウントとパスの覚えがある (aish の mem と fs)
+t ai-mem sh -c 'm=$(sudo -n cat /proc/ai/mem) && echo "$m" | grep -q "\"page_cache\":{\"pages\":[0-9]" && echo "$m" | grep -q "\"heap\":{\"size\":[0-9]" && echo "$m" | grep -q "\"procs\":\[{\"pid\":"'
+t ai-fs sh -c 'f=$(sudo -n cat /proc/ai/fs) && echo "$f" | grep -q "\"target\":\"/\",\"source\":\"/dev/vda[0-9]*\",\"type\":\"ext4\"" && echo "$f" | grep -q "\"cache\":{\"blocks\":[0-9]" && echo "$f" | grep -q "\"paths\":{\"entries\":[0-9]"'
 
 echo "checks: $n, $fail failed"
 [ "$fail" = 0 ]

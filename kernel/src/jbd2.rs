@@ -53,6 +53,11 @@ pub struct Journal {
 
 impl Journal {
     /// 1 つのトランザクションに使えるブロックの数
+    /// 次のトランザクションの番号 (/proc/ai/fs)
+    pub fn seq(&self) -> u32 {
+        self.seq
+    }
+
     pub fn capacity(&self) -> usize {
         (self.maxlen - self.first) as usize
     }

@@ -31,6 +31,11 @@ fn put_page(p: *mut u8) {
     unsafe { USED -= 1 };
 }
 
+/// (いま使っているページ, 上限)。ぜんぶの tmpfs と memfd で。/proc/ai/mem と /proc/ai/fs
+pub fn stats() -> (usize, usize) {
+    (unsafe { USED }, limit())
+}
+
 /// ファイルの中身をページ (4KiB) で持つ。書いたページだけを番号で引く表に入れ、ないところ (穴) は 0 として読む
 /// (Linux の tmpfs の xarray と同じく、1 TiB 先に 1 バイト書いても表は 1 つ。前は番号の並び (Vec) を
 /// そこまで伸ばしたので、ヒープを使いきって止まった)
@@ -715,6 +720,11 @@ impl Inode for TmpInode {
     fn set_mtime(&self, ns: u64) -> Result<(), i64> {
         self.attr.borrow_mut().mtime = ns;
         Ok(())
+    }
+
+    fn fs_stats(&self) -> Option<String> {
+        let (used, limit) = stats();
+        Some(alloc::format!("{{\"pages\":{},\"limit\":{}}}", used, limit))
     }
 
     fn statfs(&self) -> [u8; 120] {
