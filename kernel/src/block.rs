@@ -110,7 +110,9 @@ pub fn read_part(p: &Part, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
         return Err(-5);
     }
     let t0 = crate::timer::uptime_ns();
+    crate::trace::blk(false, p.start + sector, (buf.len() / SECTOR) as u64);
     let r = raw_read(dev()?, p.start + sector, buf);
+    crate::trace::blk_done(t0);
     count(p, false, (buf.len() / SECTOR) as u64, t0);
     r
 }
@@ -121,7 +123,9 @@ pub fn write_part(p: &Part, sector: u64, buf: &[u8]) -> Result<(), i64> {
         return Err(-5);
     }
     let t0 = crate::timer::uptime_ns();
+    crate::trace::blk(true, p.start + sector, (buf.len() / SECTOR) as u64);
     let r = raw_write(dev()?, p.start + sector, buf);
+    crate::trace::blk_done(t0);
     count(p, true, (buf.len() / SECTOR) as u64, t0);
     r
 }
@@ -164,7 +168,9 @@ pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
         return Err(-5);
     }
     let t0 = crate::timer::uptime_ns();
+    crate::trace::blk(false, p.start + sector, (buf.len() / SECTOR) as u64);
     let r = raw_read_wait(dev()?, p.start + sector, buf);
+    crate::trace::blk_done(t0);
     count(&p, false, (buf.len() / SECTOR) as u64, t0);
     r
 }

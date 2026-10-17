@@ -74,6 +74,8 @@ t lockbench sh -c 'seq 1 300000 | cat | wc -l > /tmp/lockbench.n & echo lockbenc
 t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
 # /proc/ai/mem と /proc/ai/fs: 1 行の JSON で、ページキャッシュとヒープ、マウントとパスの覚えがある (aish の mem と fs)
 t ai-mem sh -c 'm=$(sudo -n cat /proc/ai/mem) && echo "$m" | grep -q "\"page_cache\":{\"pages\":[0-9]" && echo "$m" | grep -q "\"heap\":{\"size\":[0-9]" && echo "$m" | grep -q "\"procs\":\[{\"pid\":"'
+# /proc/ai/trace: 記録を空にして始め、ls を動かして止めると、その getdents64 が入っている (aish の trace)
+t ai-trace sh -c 'echo "trace clear" > /proc/ai/ctl && echo "trace on ls" > /proc/ai/ctl && ls /tmp > /dev/null && echo "trace off" > /proc/ai/ctl && sudo -n cat /proc/ai/trace > /tmp/trace.txt && head -1 /tmp/trace.txt | grep -q "\"on\":false,\"filter\":\"ls\",\"events\":[1-9]" && grep -q "\"k\":\"sys\",\"n\":\"getdents64\"" /tmp/trace.txt && grep -q "\"k\":\"switch\"" /tmp/trace.txt'
 t ai-fs sh -c 'f=$(sudo -n cat /proc/ai/fs) && echo "$f" | grep -q "\"target\":\"/\",\"source\":\"/dev/vda[0-9]*\",\"type\":\"ext4\"" && echo "$f" | grep -q "\"cache\":{\"blocks\":[0-9]" && echo "$f" | grep -q "\"paths\":{\"entries\":[0-9]"'
 
 echo "checks: $n, $fail failed"

@@ -1079,6 +1079,7 @@ impl PageTable {
 
     /// ユーザーが va で write / exec しようとして止まった
     pub fn fault(&mut self, va: usize, write: bool, exec: bool) -> Result<(), FaultErr> {
+        crate::trace::fault(va, write);
         let (_, v) = self.find(va).ok_or(FaultErr::NoMap)?;
         let ok = if write {
             v.prot & PROT_WRITE != 0

@@ -312,6 +312,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
     let a = tf.x;
     let nr = tf.x[8];
+    crate::trace::sys_enter(nr, a[0]);
     proc::current().orig_x0 = tf.x[0];
     proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
     count(nr);
@@ -593,6 +594,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
+    crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
     strace(nr, &a, r);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
@@ -818,6 +820,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         _ => return false,
     };
     tf.x[0] = r as u64;
+    crate::trace::sys_fast(a[8], a[0], r);
     true
 }
 

@@ -415,6 +415,7 @@ impl Proc {
         let n = name.iter().position(|&c| c == 0).unwrap_or(name.len()).min(15);
         self.comm = [0; 16];
         self.comm[..n].copy_from_slice(&name[..n]);
+        crate::trace::name(self.pid, &self.comm);
     }
 
     pub fn comm(&self) -> &str {
@@ -458,6 +459,11 @@ fn cur() -> Option<usize> {
 /// いまのスレッドの表の番号 (0..NPROC。起動のときやアイドルなら None。prof.rs がスレッドごとに数えるのに)
 pub fn cur_index() -> Option<usize> {
     cur()
+}
+
+/// いまのスレッドの番号 (起動のときやアイドルなら 0。割り込みの中からも呼べる: trace.rs)
+pub fn current_pid_or_zero() -> u32 {
+    cur().map_or(0, |i| procs()[i].pid)
 }
 
 fn set_cur(v: Option<usize>) {
@@ -820,6 +826,7 @@ pub fn scheduler() -> ! {
             let p = &mut procs()[i];
             p.state = State::Running;
             p.nrun += 1;
+            crate::trace::switch(p.pid, &p.comm);
             if p.woken_ns != 0 {
                 crate::smp::dev_wait(3, p.woken_ns);
                 p.woken_ns = 0;
@@ -904,6 +911,7 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     p.wake_at = deadline;
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
+    crate::trace::sleep(chan);
     sched();
     let p = current();
     p.chan = 0;
@@ -930,6 +938,7 @@ fn wake_where(f: impl Fn(&Proc) -> bool) -> usize {
         if p.state == State::Sleeping && f(p) {
             p.state = State::Runnable;
             p.woken_ns = crate::timer::uptime_ns();
+            crate::trace::wake(p.pid, p.chan);
             woken = woken.min(p.recent);
             n += 1;
         } else if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
@@ -1081,6 +1090,7 @@ pub fn exit(code: i32) -> ! {
 
 fn exit_status(status: i32) -> ! {
     let p = current();
+    crate::trace::exit(p.pid, status as i64);
     crate::ns::init_exited(p);
     clear_child_tid(p);
     vfork_done(p);
