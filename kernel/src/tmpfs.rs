@@ -290,12 +290,32 @@ pub const F_SEAL_EXEC: u32 = 0x20;
 
 static mut NEXT_INO: u64 = 1;
 
+/// inode の数と上限 (ヒープを使いきらないように: 1 つ 300 バイトほどで、作りつづけるとヒープが足りなくなる。
+/// 上限で ENOSPC。Linux の nr_inodes と同じ考え。ヒープの大きさに合わせて: 64 MiB で 65536)
+static mut INODES: usize = 0;
+
+fn inode_limit() -> usize {
+    (crate::heap::size() / 1024).max(65536)
+}
+
+/// (いまの inode の数, 上限)。/proc/ai/mem の tmpfs
+pub fn inodes() -> (usize, usize) {
+    (unsafe { INODES }, inode_limit())
+}
+
+impl Drop for TmpInode {
+    fn drop(&mut self) {
+        unsafe { INODES -= 1 };
+    }
+}
+
 fn now() -> u64 {
     crate::timer::epoch_ns()
 }
 
 impl TmpInode {
     fn new(fs: usize, mode: u32, node: Node) -> Rc<TmpInode> {
+        unsafe { INODES += 1 };
         let ino = unsafe {
             NEXT_INO += 1;
             NEXT_INO
@@ -565,6 +585,9 @@ impl Inode for TmpInode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
+        if unsafe { INODES } >= inode_limit() {
+            return Err(-ENOSPC);
+        }
         crate::vfs::dir_changed(self.id());
         let mode = node.type_bits() | (mode & 0o7777);
         let node = match node {
@@ -590,6 +613,9 @@ impl Inode for TmpInode {
     fn tmpfile(&self, mode: u32, linkable: bool) -> Result<InodeRef, i64> {
         if !matches!(*self.node.borrow(), Node::Dir(_)) {
             return Err(-ENOTDIR);
+        }
+        if unsafe { INODES } >= inode_limit() {
+            return Err(-ENOSPC);
         }
         let t = TmpInode::new(self.fs, S_IFREG | (mode & 0o7777), Node::File(Data::Owned(Pages::new())));
         t.attr.borrow_mut().nlink = 0;

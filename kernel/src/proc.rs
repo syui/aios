@@ -260,6 +260,8 @@ pub struct Proc {
     pub comm: [u8; 16],
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
     thread: bool,
+    /// 取れなくても耐える区間 (heap::fallible) の深さ: この中でヒープが取れなければ null (ENOMEM)。予備は使わない
+    pub fallible: u32,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
     pub clear_tid: usize,
     /// CLONE_VFORK で作られた子: exec か終わりまで待っている親の pid (なければ 0)
@@ -348,6 +350,7 @@ impl Proc {
         cred: crate::cred::Cred::ROOT,
         comm: [0; 16],
         thread: false,
+        fallible: 0,
         clear_tid: 0,
         vfork_parent: 0,
         exec_takeover: None,
@@ -478,6 +481,33 @@ pub fn current_comm_starts_with(prefix: &[u8]) -> bool {
         let leader = if p.thread { find_leader(p.tgid) } else { None };
         leader.map_or(&p.comm[..], |l| &l.comm[..]).starts_with(prefix)
     })
+}
+
+/// いまのスレッドは、取れなくても耐える区間 (heap::fallible) の中か (起動のときやアイドルなら、耐えない)
+pub fn in_fallible() -> bool {
+    cur().is_some_and(|i| procs()[i].fallible > 0)
+}
+
+pub fn fallible_enter() {
+    if let Some(i) = cur() {
+        procs()[i].fallible += 1;
+    }
+}
+
+pub fn fallible_leave() {
+    if let Some(i) = cur() {
+        let p = &mut procs()[i];
+        p.fallible = p.fallible.saturating_sub(1);
+    }
+}
+
+/// 生きているプロセス (代表スレッド) をみな (Vec を使わない: oom.rs は取れないときに呼ばれる)
+pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
+    for p in live() {
+        if p.state != State::Unused && p.state != State::Zombie && !p.thread {
+            f(p);
+        }
+    }
 }
 
 fn set_cur(v: Option<usize>) {

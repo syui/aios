@@ -321,6 +321,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     proc::current().orig_x0 = tf.x[0];
     proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
     count(nr);
+    // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
+    crate::oom::check();
     // seccomp: かかっていれば、フィルタの答えにしたがう
     if let Some(s) = proc::current().cred.seccomp.clone() {
         let args = [a[0], a[1], a[2], a[3], a[4], a[5]];

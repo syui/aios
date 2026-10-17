@@ -49,7 +49,7 @@ const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer",
 const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス (pid も name もなければ、みなからあやしいものを探す)"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"}}}"#;
 const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"file":{"type":"string","description":"tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
 const WATCH: &str = r#"{"type":"object","properties":{"lines":{"type":"integer","description":"記録の終わりから何行 (既定 20)"}}}"#;
-const FAIL: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。決まりをかけて動かし、終わったらやめる。なければ決まりをかけるだけ (off: true でやめる)"},"name":{"type":"string","description":"相手: この名前で始まるプロセス (既定: cmd の最初の語)"},"pid":{"type":"integer","description":"name のかわりに、このプロセス"},"what":{"type":"string","description":"sys (システムコールを -errno に。既定) / page (物理ページを取れないことに: プロセスが殺される) / heap (カーネルのヒープを取れないことに: いまはカーネルが panic する。-snapshot の VM で)"},"syscall":{"type":"string","description":"sys のとき: 名前 (openat、read ...) か番号か all (既定 all)"},"errno":{"type":"string","description":"sys のとき: ENOMEM、EIO、EAGAIN ... か番号 (既定 ENOMEM)"},"times":{"type":"integer","description":"何回しくじらせるか (既定 1)"},"off":{"type":"boolean","description":"決まりをやめる"},"timeout_ms":{"type":"integer"}}}"#;
+const FAIL: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。決まりをかけて動かし、終わったらやめる。なければ決まりをかけるだけ (off: true でやめる)"},"name":{"type":"string","description":"相手: この名前で始まるプロセス (既定: cmd の最初の語)"},"pid":{"type":"integer","description":"name のかわりに、このプロセス"},"what":{"type":"string","description":"sys (システムコールを -errno に。既定) / page (物理ページを取れないことに: プロセスが out of memory で殺される) / heap (カーネルのヒープを、耐えるところで取れないことに: そのシステムコールが ENOMEM) / oom (耐えないところで: 予備から渡り、次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で)"},"syscall":{"type":"string","description":"sys のとき: 名前 (openat、read ...) か番号か all (既定 all)"},"errno":{"type":"string","description":"sys のとき: ENOMEM、EIO、EAGAIN ... か番号 (既定 ENOMEM)"},"times":{"type":"integer","description":"何回しくじらせるか (既定 1)"},"off":{"type":"boolean","description":"決まりをやめる"},"timeout_ms":{"type":"integer"}}}"#;
 const DELTA: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
 const PART: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"切れるところの名前 (kernel.json の off のあるもの: epoll inotify landlock module ns seccomp swap timerfd vdso tty-root-fdlink sound-min-period qemu-uart-burst。装置 (net、virtio_rng、bcm2835_rng) と aiproc は起動のときだけ: box で)"},"off":{"type":"boolean","description":"true で切る、false で入れる。なければ見るだけ"}}}"#;
 const TRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。記録を空にして始め、終わったら止めて読む。なければ、いま記録にあるものを読むだけ"},"name":{"type":"string","description":"この名前で始まるプロセスのシステムコールとフォルトだけ (既定: cmd の最初の語。切りかえ・眠り・起こし・割り込み・ディスクはみな)"},"all":{"type":"boolean","description":"名前で絞らない (みなのシステムコールも)"},"limit":{"type":"integer","description":"events に返す出来事の数 (終わりから。既定 200)"},"timeout_ms":{"type":"integer","description":"cmd をこれで止める (既定 50000)"}}}"#;
@@ -77,7 +77,7 @@ fn main() {
             Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", input: WATCH },
             Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
             Tool { name: "mem", desc: "メモリの中 (/proc/ai/mem): RAM の空き、カーネルのヒープ (使っている、いちばん多かった、空きのかたまり、取れなかった回数)、ページキャッシュ (ページの数、ファイルごと、読みそこねた数、捨てた数)、MAP_SHARED のページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス。text はまとめ、ほかはそのままの数 (ページは 4 KiB)。root か wheel の人だけ", input: MEM },
-            Tool { name: "fail", desc: "わざとしくじらせる (フォルト注入。/proc/ai/ctl の fail): cmd のプロセス (name か pid) のシステムコール (syscall か all) を、動かさずに -errno (ENOMEM など) にする、またはカーネルの物理ページ (page: そのプロセスが out of memory で殺される) やヒープ (heap: いまのカーネルはそこで panic するので、-snapshot の VM の中だけで) を取れないことにして、プログラムとカーネルがどう耐えるかを見る。times 回しくじらせたら効かなくなる。hits は効いた数。root か wheel の人だけ", input: FAIL },
+            Tool { name: "fail", desc: "わざとしくじらせる (フォルト注入。/proc/ai/ctl の fail): cmd のプロセス (name か pid) のシステムコール (syscall か all) を、動かさずに -errno (ENOMEM など) にする、またはカーネルの物理ページ (page: そのプロセスが out of memory で殺される) やヒープ (heap: 耐えるところで、そのシステムコールが ENOMEM。oom: 耐えないところで、予備から渡って次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で) を取れないことにして、プログラムとカーネルがどう耐えるかを見る。times 回しくじらせたら効かなくなる。hits は効いた数。root か wheel の人だけ", input: FAIL },
             Tool { name: "delta", desc: "cmd を動かした前と後の、カーネルの中の数のちがい (/proc/ai/mem、/proc/ai/fs、/proc/bkl): ページキャッシュ (ページ、読みそこね、捨てた)、ヒープ (使っている、いちばん多かった、取れなかった)、tmpfs、スワップ、ページフォルト、ext4 のブロックキャッシュ (当たり、外れ、まとめ読み、捨てた、書き出し)、パスの覚え (当たり、外れ)、開いているファイル、区画ごとのディスクの読み書き、大きなロック。そのコマンドがカーネルに何をさせたかがわかる。root か wheel の人だけ", input: DELTA },
             Tool { name: "part", desc: "カーネルの切れるところ (kernel.json の extra と quirk で off のあるもの) のいまの様子 (/proc/ai/parts: 切ってあるか、動かしたまま変えられるか)。name と off で、動かしたまま切る (システムコールは ENOSYS、quirk は手当てをしない) か入れる: 入れずに作った Linux のようにしてプログラムを動かし、戻せる。装置と aiproc は起動のときだけ (vm start の off か box)。root か wheel の人だけ", input: PART },
             Tool { name: "trace", desc: "カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだの、システムコールの入りと出 (かかった時間)、スレッドの切りかえ、眠りと起こし (待った時間、起こされてから走るまで)、割り込み、ディスクの読み書き、ページフォルトを記録して、スレッドごと、システムコールごと (回数、合計、最大)、遅かった順、ディスク、割り込みにまとめる (text)。events は終わりの limit こ (t は起動からの ns、c は CPU、p は tid、k は sys/ret/switch/sleep/wake/irq/blk/blkdone/fault/exec/exit)。cmd がなければ、いま記録にあるもの (ctl の trace on で始めたもの)。root か wheel の人だけ", input: TRACE },
@@ -363,6 +363,13 @@ fn mem_text(m: &Value, nfiles: usize, nprocs: usize) -> String {
         "kernel     heap {} / {} used (peak {}, free {} in {} blocks, largest {}, fails {}), stacks {}\n",
         mib(u(&h["used"])), mib(u(&h["size"])), mib(u(&h["peak"])), mib(u(&h["free"])), u(&h["free_blocks"]), mib(u(&h["largest_free"])), u(&h["fails"]), mib(u(&m["kernel"]["stacks"]))
     ));
+    // 足りなくなったことがあれば (足した、遅い道、予備、oom で殺した)
+    if u(&h["grown"]) + u(&h["reclaims"]) + u(&h["emergencies"]) + u(&h["oom_kills"]) > 0 {
+        t.push_str(&format!(
+            "           heap grew {} while running, {} slow paths, reserve used {} times ({} bytes in use now), oom killed {}\n",
+            mib(u(&h["grown"])), u(&h["reclaims"]), u(&h["emergencies"]), u(&h["reserve_used"]), u(&h["oom_kills"])
+        ));
+    }
     let c = &m["page_cache"];
     t.push_str(&format!(
         "page cache {} ({} pages, max {}), misses {} ({} ms), shrunk {}, changed {}\n",
@@ -489,8 +496,8 @@ fn fail(a: &Value, pwd: &str) -> Value {
             let Some(e) = errno_of(if s(a, "errno").is_empty() { "ENOMEM" } else { s(a, "errno") }) else { return error("errno: a name (ENOMEM, EIO ...) or a number") };
             format!("fail {} sys {} {} {}", target, sc, e, times)
         }
-        "heap" | "page" => format!("fail {} {} {}", target, what, times),
-        w => return error(format!("what: sys / heap / page, not {}", w)),
+        "heap" | "oom" | "page" => format!("fail {} {} {}", target, what, times),
+        w => return error(format!("what: sys / heap / oom / page, not {}", w)),
     };
     if let Err(e) = write_root("/proc/ai/ctl", &rule) {
         return error(format!("{} ({})", e, rule));
@@ -550,6 +557,11 @@ fn delta_text(m0: &Value, f0: &Value, m1: &Value, f1: &Value) -> String {
         ("heap used", vec!["kernel", "heap", "used"]),
         ("heap peak", vec!["kernel", "heap", "peak"]),
         ("heap fails", vec!["kernel", "heap", "fails"]),
+        ("heap grown", vec!["kernel", "heap", "grown"]),
+        ("heap slow paths", vec!["kernel", "heap", "reclaims"]),
+        ("heap emergencies", vec!["kernel", "heap", "emergencies"]),
+        ("oom kills", vec!["kernel", "heap", "oom_kills"]),
+        ("tmpfs inodes", vec!["tmpfs", "inodes"]),
         ("tmpfs pages", vec!["tmpfs", "pages"]),
         ("shared dirty", vec!["shared", "dirty"]),
         ("swap used", vec!["swap", "used"]),

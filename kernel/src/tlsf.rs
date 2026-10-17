@@ -35,7 +35,8 @@ pub struct Tlsf {
     /// クラスごとの空きのリストの頭
     heads: [*mut u8; CLASSES],
     /// 足した区画 (check のため)
-    regions: [(usize, usize); 4],
+    /// 区画 (check が見る)。起動のときの 2 つと、足りなくなって足したもの (heap.rs の grow)
+    regions: [(usize, usize); 64],
     nregions: usize,
 }
 
@@ -100,7 +101,7 @@ fn class_for(need: usize) -> usize {
 
 impl Tlsf {
     pub const fn new() -> Self {
-        Tlsf { bits: [0; WORDS], heads: [ptr::null_mut(); CLASSES], regions: [(0, 0); 4], nregions: 0 }
+        Tlsf { bits: [0; WORDS], heads: [ptr::null_mut(); CLASSES], regions: [(0, 0); 64], nregions: 0 }
     }
 
     /// c から上で、空きのあるいちばん小さいクラス

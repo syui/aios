@@ -80,6 +80,15 @@ t ai-trace sh -c 'echo "trace clear" > /proc/ai/ctl && echo "trace on ls" > /pro
 t ai-part sh -c 'echo "part timerfd off" > /proc/ai/ctl && grep -q "\"name\":\"timerfd\",\"off\":true,\"runtime\":true" /proc/ai/parts && echo "part timerfd on" > /proc/ai/ctl && grep -q "\"name\":\"timerfd\",\"off\":false" /proc/ai/parts && ! sh -c "echo part net off > /proc/ai/ctl" 2>/dev/null'
 # /proc/ai/ctl の fail: ls の getdents64 を 1 回 EIO にすると ls がしくじる (hits 1)。やめれば通る
 t ai-fail sh -c 'echo "fail name ls sys getdents64 5 1" > /proc/ai/ctl && ! ls /usr/bin > /dev/null 2>&1 && grep -q "\"hits\":1" /proc/ai/fail && echo "fail off" > /proc/ai/ctl && ls /usr/bin > /dev/null && grep -q "\"rule\":null" /proc/ai/fail'
+# ヒープが取れないとき (fail ... heap: 耐えるところだけ): read の入れ物が取れず、dd は ENOMEM で止まる (cat や head は
+# splice がしくじると read に切りかえて続く)。カーネルは続く
+t ai-heap-enomem sh -c 'echo "fail name dd heap 1" > /proc/ai/ctl; dd if=/etc/hostname of=/dev/null bs=4096 count=1 > /dev/null 2> /tmp/enomem; s=$?; grep -q "\"hits\":1" /proc/ai/fail; h=$?; echo "fail off" > /proc/ai/ctl; [ "$s" != 0 ] && [ "$h" = 0 ] && grep -qi "error\|memory" /tmp/enomem'
+# ヒープが足りなくなると足す (grow): 64 MiB のヒープに 70 MiB を取ると、まだ使っていないページから区画を足す (grown)。
+# 足したあとも空きの管理は正しく (heap check ok)、返せば戻る
+t ai-heap-grow sh -c 'echo "heap hog 70" > /proc/ai/ctl && sudo -n cat /proc/ai/mem | grep -q "\"grown\":[1-9]" && echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q ok && echo "heap hog 0" > /proc/ai/ctl && echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q ok'
+# どこでも取れないとき (fail ... oom: 耐えないところ): 予備から渡り、次のシステムコールで oom が、いちばんメモリを持つ
+# プロセス (40 MiB の変数を持つこの子) を殺す。カーネルは続き、空きが戻れば back to normal
+t ai-oom sh -c 'sh -c "x=\$(head -c 40000000 /dev/zero | tr \"\\0\" a); echo \"fail pid \$\$ oom 1\" > /proc/ai/ctl; ls /tmp > /dev/null; ls /tmp > /dev/null; echo survived" > /tmp/oom.out 2>&1; s=$?; echo "fail off" > /proc/ai/ctl; grep -q "oom: killed pid" /proc/kmsg && ! grep -q survived /tmp/oom.out && [ "$s" = 137 ]'
 t ai-fs sh -c 'f=$(sudo -n cat /proc/ai/fs) && echo "$f" | grep -q "\"target\":\"/\",\"source\":\"/dev/vda[0-9]*\",\"type\":\"ext4\"" && echo "$f" | grep -q "\"cache\":{\"blocks\":[0-9]" && echo "$f" | grep -q "\"paths\":{\"entries\":[0-9]"'
 
 echo "checks: $n, $fail failed"

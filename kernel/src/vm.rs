@@ -197,6 +197,28 @@ pub fn shrink_cache(n: usize) -> usize {
     freed.len()
 }
 
+/// ヒープの遅い道 (heap::reclaim) から: 表のロックが取れれば、だれも写していないページを n 枚まで捨てる。
+/// ヒープを使わない (使うと、またそこへ来る)。捨てた数
+pub fn shrink_cache_try(n: usize) -> usize {
+    let Some(mut c) = PRIV.try_lock() else { return 0 };
+    let mut freed = 0;
+    let mut from: Option<FileKey> = None;
+    while freed < n {
+        let next = match from {
+            None => c.iter().find(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k),
+            Some(k) => c.range(k..).find(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k),
+        };
+        let Some(k) = next else { break };
+        if let Some(p) = c.remove(&k) {
+            kalloc::put(p.page);
+            freed += 1;
+        }
+        from = Some(k);
+    }
+    SHRUNK.fetch_add(freed, Ordering::Relaxed);
+    freed
+}
+
 /// file_changed の数 (読みこんでいるあいだに変わったら、表に入れない)
 static CHANGES: AtomicUsize = AtomicUsize::new(0);
 

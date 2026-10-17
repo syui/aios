@@ -2,13 +2,15 @@
 // しくじり (ENOMEM、EIO、EAGAIN ...) にどう耐えるかを、カーネルの側から確かめる。決まり (RULE) は 1 つ:
 //   fail pid N|name NAME sys NR|all ERRNO [TIMES]   そのプロセスのシステムコール (NR か、みな) を、動かさずに -ERRNO に
 //   fail pid N|name NAME heap [TIMES]                そのプロセスが走っているあいだのカーネルのヒープの alloc を、取れないことに
+//                                                    (耐えるところ (heap::fallible) だけ: そのシステムコールが ENOMEM になる)
+//   fail pid N|name NAME oom [TIMES]                 同じく、耐えないところだけ: 予備から渡り、次のシステムコールで oom.rs が
+//                                                    いちばん大きなプロセスを殺す (-snapshot の VM で)
 //   fail pid N|name NAME page [TIMES]                同じく物理ページ (kalloc) を
 //   fail off                                        やめる
 // TIMES (既定 1) 回しくじらせたら、決まりはそのまま残って効かなくなる (hits で何回効いたかがわかる)。
-// heap と page は、カーネルの中の「取れなかった」道を確かめるもの。page (kalloc) は Option で返るので、そのプロセスが
-// out of memory で殺されてカーネルは続く。heap は FAILS に数えてから、ふつうの道と同じく null を返すが、いまのカーネルは
-// Vec や Box の alloc が取れないと Rust の既定どおり panic する (try_reserve で備えているのは extfs のまとめ読みだけ):
-// fail ... heap は、それがどこで起きるか (panic のバックトレース) を見せるもの。-snapshot の VM で
+// heap、oom、page は、カーネルの中の「取れなかった」道を確かめるもの。page (kalloc) は Option で返るので、そのプロセスが
+// out of memory で殺されてカーネルは続く。heap は、耐えるところ (read の入れ物など) が ENOMEM を返して続くのを、
+// oom は、耐えないところ (Vec::push など) が予備から渡されて oom.rs が空けるのを確かめる (heap.rs の「足りないとき」)
 use crate::spinlock::SpinLock;
 use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
@@ -19,6 +21,7 @@ pub static ON: AtomicBool = AtomicBool::new(false);
 enum What {
     Sys,
     Heap,
+    Oom,
     Page,
 }
 
@@ -87,9 +90,13 @@ pub fn syscall(nr: u64) -> Option<i64> {
     take(What::Sys).map(|r| r.errno)
 }
 
-/// カーネルのヒープの alloc をしくじらせるか
-pub fn heap() -> bool {
-    ON.load(Relaxed) && take(What::Heap).is_some()
+/// カーネルのヒープの alloc を、ふつうの道も遅い道もなしに取れなかったことにするか。heap は耐える区間 (fallible) の
+/// alloc だけ、oom は耐えない alloc だけ (heap.rs の alloc がそのあとを分ける)
+pub fn heap(fallible: bool) -> bool {
+    if !ON.load(Relaxed) {
+        return false;
+    }
+    take(if fallible { What::Heap } else { What::Oom }).is_some()
 }
 
 /// 物理ページの alloc をしくじらせるか
@@ -119,6 +126,7 @@ pub fn ctl(arg: &str) -> Result<(), i64> {
     let what = match w.next() {
         Some("sys") => What::Sys,
         Some("heap") => What::Heap,
+        Some("oom") => What::Oom,
         Some("page") => What::Page,
         _ => return Err(-EINVAL),
     };
@@ -156,6 +164,7 @@ pub fn json() -> alloc::string::String {
             r.errno
         ),
         What::Heap => alloc::string::String::from("\"what\":\"heap\""),
+        What::Oom => alloc::string::String::from("\"what\":\"oom\""),
         What::Page => alloc::string::String::from("\"what\":\"page\""),
     };
     format!("{{\"rule\":{{{},{},\"left\":{},\"hits\":{}}}}}\n", target, what, r.left, r.hits)

@@ -188,7 +188,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         return Err(-E2BIG);
     }
     // img[i] は va = sp + i
-    let mut img = alloc::vec![0u8; USER_STACK_TOP - sp];
+    let mut img = crate::heap::try_vec(USER_STACK_TOP - sp, true)?;
     let mut at = base;
     let mut ptrs = Vec::with_capacity(argc + envc + 1);
     for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&path.as_bytes().to_vec())) {
@@ -333,7 +333,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
             if s < seg_end {
                 pt.map(s, seg_end, prot, false, Backing::Anon).ok_or(-ENOMEM)?;
             }
-            let mut buf = alloc::vec![0u8; 64 * 1024];
+            let mut buf = crate::heap::try_vec(64 * 1024, true)?;
             let mut done = 0;
             while done < filesz {
                 let n = buf.len().min(filesz - done);

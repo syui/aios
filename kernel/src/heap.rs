@@ -1,10 +1,11 @@
-// カーネルヒープ: bss 上の固定領域 (と、メモリが多ければ足したもの) を切り分ける。空きの管理は TLSF (tlsf.rs:
-// 取るのも返すのも O(1))。ここはロック、使っている量の数え、どこで取ったか (heap trace)
+// カーネルヒープ: bss 上の固定領域 (と、メモリに合わせて足したもの) を切り分ける。空きの管理は TLSF (tlsf.rs:
+// 取るのも返すのも O(1))。ここはロック、使っている量の数え、どこで取ったか (heap trace)、それから足りないとき
+// (足す、捨てる、耐えるところには null、予備と oom.rs: 下の「足りないとき」)
 use crate::spinlock::SpinLock;
 use crate::tlsf::{self, Tlsf};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 /// 使っているバイト (ヘッダこみ)、いちばん多かったとき、取れなかった回数 (/proc/ai/heap)。USED と PEAK を変えるのは HEAP の
 /// ロックを持っているときだけなので、読んで書くだけ (fetch_add のような読み書きの命令は TCG で重い)
@@ -144,13 +145,18 @@ pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
 pub fn stats_json() -> alloc::string::String {
     let (n, big, _) = HEAP.lock().stats();
     let mut s = alloc::format!(
-        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{}}}\n",
+        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{}}}\n",
         size(),
         USED.load(Relaxed),
         PEAK.load(Relaxed),
         n,
         big,
-        FAILS.load(Relaxed)
+        FAILS.load(Relaxed),
+        GROWN.load(Relaxed),
+        RECLAIMS.load(Relaxed),
+        RESERVE_USED.load(Relaxed),
+        EMERGENCIES.load(Relaxed),
+        crate::oom::kills()
     );
     if TRACE.load(Relaxed) {
         sites_json(&mut s);
@@ -168,15 +174,58 @@ static mut AREA: Area = Area([0; HEAP_SIZE]);
 
 static HEAP: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
 
-/// ヒープの大きさの上限 (メモリの多いマシンでも)
-const MAX_TOTAL: usize = 512 * 1024 * 1024;
+// ---- 足りないとき ----
+// ふつうの道 (HEAP の TLSF) で取れなければ、順に:
+//   1. 足す (grow): まだだれも使っていない続いたページ (kalloc::take_contiguous) を区画として足す (GROW_CHUNK ずつ。
+//      上限は RAM の 1/4: max_total)。たいていはこれで足りる。前は起動のときに決めた大きさ (RAM の 1/32) で、
+//      それを使いきると panic だった
+//   2. 捨てる (shrink): だれも写していないページキャッシュのページを捨てる (表の分がヒープに戻り、ページは kalloc へ)
+//   3. それでもなければ、耐えるところ (heap::fallible の区間の中: read/write の入れ物など、取れなければ ENOMEM を
+//      返せるところ) には null (Vec::try_reserve が Err になる)
+//   4. 耐えないところ (Vec::push など。Rust の既定は null で panic) には予備 (RESERVE) から渡して EMERGENCY を立てる。
+//      次のシステムコールの入り口で oom.rs が、いちばんメモリを持っているプロセスを終わらせて空ける (alloc の中では
+//      殺せない: カーネルの表を変えている途中かもしれない)。予備もなければ null で、そこで panic する
+// 遅い道の中で取ろうとしたもの (捨てるときなど) は CPU ごとの RECLAIMING で見分けて、遅い道をくりかえさない。
+// /proc/ai/ctl の fail ... heap は 3 を、fail ... oom は 4 を、わざと起こす (fail.rs)
+
+/// 足すときのひとかたまり (足りなければ、要る分まで半分ずつ小さくして)
+const GROW_CHUNK: usize = 8 * 1024 * 1024;
+/// 予備: 耐えないところへの最後の分。ここに手をつけたら oom.rs
+const RESERVE_SIZE: usize = 2 * 1024 * 1024;
+
+#[repr(C, align(16))]
+struct ReserveArea([u8; RESERVE_SIZE]);
+
+static mut RESERVE_AREA: ReserveArea = ReserveArea([0; RESERVE_SIZE]);
+static RESERVE: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
+
+/// 動かしたまま足したバイト、遅い道に来た回数、予備のいま使っているバイト、予備に手をつけた回数
+static GROWN: AtomicUsize = AtomicUsize::new(0);
+static RECLAIMS: AtomicUsize = AtomicUsize::new(0);
+static RESERVE_USED: AtomicUsize = AtomicUsize::new(0);
+static EMERGENCIES: AtomicUsize = AtomicUsize::new(0);
+/// 予備に手をつけている (oom::check が次のシステムコールの入り口で見て、空いたら下ろす)
+pub static EMERGENCY: AtomicBool = AtomicBool::new(false);
+/// わざと (fail ... oom) 予備に手をつけた: ふつうの道に空きがあっても、oom::check は 1 度は殺す (その道を確かめるため)
+pub static FORCED: AtomicBool = AtomicBool::new(false);
+/// この CPU は遅い道の中 (その中で取ろうとしても、また遅い道へは行かない)
+static RECLAIMING: [AtomicBool; crate::smp::MAXCPU] = [const { AtomicBool::new(false) }; crate::smp::MAXCPU];
+
+/// ヒープの大きさの上限 (起動のときの分も、動かしたまま足す分も): RAM の 1/4
+fn max_total() -> usize {
+    (crate::memlayout::ram_size() / 4).max(HEAP_SIZE)
+}
 
 /// bss の 32 MiB に、メモリが多ければ (1/32 が 32 MiB をこえる分) まだ使っていないページの続いたかたまりを足す
 /// (ページキャッシュの表、tmpfs、プロセスの地図などがメモリに比例してふえるので、決まった大きさでは
-/// 大きなビルドで足りなくなった。2 GiB で 64 MiB、16 GiB で 512 MiB。kalloc::init のあとで)
+/// 大きなビルドで足りなくなった。2 GiB で 64 MiB、16 GiB で 512 MiB。足りなくなれば動かしたまま足す: grow)。
+/// 予備 (RESERVE) もここで。kalloc::init のあとで
 pub fn init() {
-    unsafe { HEAP.lock().add_region((&raw mut AREA) as *mut u8, HEAP_SIZE) };
-    let want = (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, MAX_TOTAL);
+    unsafe {
+        HEAP.lock().add_region((&raw mut AREA) as *mut u8, HEAP_SIZE);
+        RESERVE.lock().add_region((&raw mut RESERVE_AREA) as *mut u8, RESERVE_SIZE);
+    }
+    let want = (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, 512 * 1024 * 1024);
     let extra = want - HEAP_SIZE;
     if extra == 0 {
         return;
@@ -193,6 +242,158 @@ fn round(n: usize) -> usize {
 /// 確保したブロックのヘッダ (1 語目は tlsf の大きさと印、2 語目は取ったところの番号)。中身はそのあと
 const HDR: usize = tlsf::ALIGN;
 
+/// HEAP から need バイト (ヘッダこみ) のブロックを 1 つ。中身の頭 (なければ null)
+unsafe fn take(need: usize) -> *mut u8 {
+    let mut h = HEAP.lock();
+    unsafe {
+        let b = h.alloc(need);
+        if b.is_null() {
+            return b;
+        }
+        let size = tlsf::block_size(b);
+        let used = USED.load(Relaxed) + size;
+        USED.store(used, Relaxed);
+        if used > PEAK.load(Relaxed) {
+            PEAK.store(used, Relaxed);
+        }
+        // ヘッダの 2 語目: どこで取ったか (調べているときだけ。ほかは 0)
+        *(b as *mut usize).add(1) = if TRACE.load(Relaxed) { site_add(size) } else { 0 };
+        b.add(HDR)
+    }
+}
+
+/// 予備から (HEAP のロックも持つ: USED はその中でだけ変える)
+unsafe fn take_reserve(need: usize) -> *mut u8 {
+    let _h = HEAP.lock();
+    let mut r = RESERVE.lock();
+    unsafe {
+        let b = r.alloc(need);
+        if b.is_null() {
+            return b;
+        }
+        let size = tlsf::block_size(b);
+        let used = USED.load(Relaxed) + size;
+        USED.store(used, Relaxed);
+        if used > PEAK.load(Relaxed) {
+            PEAK.store(used, Relaxed);
+        }
+        RESERVE_USED.store(RESERVE_USED.load(Relaxed) + size, Relaxed);
+        *(b as *mut usize).add(1) = 0;
+        b.add(HDR)
+    }
+}
+
+fn in_reserve(b: *mut u8) -> bool {
+    let start = (&raw const RESERVE_AREA) as usize;
+    (start..start + RESERVE_SIZE).contains(&(b as usize))
+}
+
+/// 遅い道: 足すか捨てるかできたら true (そのあと take をやりなおす)
+fn reclaim(need: usize) -> bool {
+    let cpu = crate::smp::id();
+    if RECLAIMING[cpu].swap(true, Relaxed) {
+        return false;
+    }
+    RECLAIMS.fetch_add(1, Relaxed);
+    let ok = grow(need) || crate::vm::shrink_cache_try(1024) > 0;
+    RECLAIMING[cpu].store(false, Relaxed);
+    ok
+}
+
+/// 区画を足す: GROW_CHUNK (足りなければ need の分まで半分ずつ) の続いたページ。上限 max_total まで
+fn grow(need: usize) -> bool {
+    let total = TOTAL.load(Relaxed);
+    let cap = max_total();
+    if total >= cap {
+        return false;
+    }
+    let page = crate::memlayout::PGSIZE;
+    // ブロックと、区画の番兵とヘッダの分
+    let least = (need + 4 * ALIGN).div_ceil(page) * page;
+    let mut chunk = GROW_CHUNK.max(least).min(cap - total);
+    if chunk < least {
+        return false;
+    }
+    loop {
+        if let Some(p) = crate::kalloc::take_contiguous(chunk) {
+            unsafe { HEAP.lock().add_region(p, chunk) };
+            TOTAL.store(total + chunk, Relaxed);
+            GROWN.fetch_add(chunk, Relaxed);
+            crate::println!("heap: grew by {} KiB to {} MiB (for {} bytes; {} KiB in use)", chunk / 1024, (total + chunk) >> 20, need, USED.load(Relaxed) / 1024);
+            return true;
+        }
+        if chunk <= least {
+            return false;
+        }
+        chunk = (chunk / 2).max(least);
+    }
+}
+
+/// 空きが戻ったか (oom::check が EMERGENCY を下ろすために): ふつうの道に、予備くらいの続いた空きがある
+pub fn recovered() -> bool {
+    let (_, big, _) = HEAP.lock().stats();
+    big >= RESERVE_SIZE
+}
+
+/// (動かしたまま足したバイト, 遅い道に来た回数, 予備のいま使っているバイト, 予備に手をつけた回数)。/proc/ai/mem
+pub fn stats_more() -> (usize, usize, usize, usize) {
+    (GROWN.load(Relaxed), RECLAIMS.load(Relaxed), RESERVE_USED.load(Relaxed), EMERGENCIES.load(Relaxed))
+}
+
+/// heap hog N (/proc/ai/ctl): N MiB をわざと取って持っておく (足す・捨てる・ENOMEM の道を試すため。0 で返す)。取れた MiB
+static HOG: SpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> = SpinLock::new(alloc::vec::Vec::new());
+
+pub fn hog(mib: usize) -> usize {
+    let mut old = core::mem::take(&mut *HOG.lock());
+    old.clear();
+    let mut v = old;
+    while v.len() < mib {
+        // 1 MiB ずつ (耐えるところとして: 足して捨ててもなければ ENOMEM で止まる。予備は使わない)
+        match try_vec(1 << 20, true) {
+            Ok(b) => v.push(b),
+            Err(_) => break,
+        }
+    }
+    let got = v.len();
+    *HOG.lock() = v;
+    crate::println!("heap: hog {} MiB (used {} of {})", got, USED.load(Relaxed), size());
+    got
+}
+
+// ---- 耐えるところ ----
+
+/// 取れなくても耐える区間: この中で取れなければ null (Vec::try_reserve が Err) で、予備は使わない。区間は取るところ
+/// だけに短く (その中のほかの alloc も null になる)。深さはスレッドごと (proc の fallible)
+pub struct Fallible(());
+
+pub fn fallible() -> Fallible {
+    crate::proc::fallible_enter();
+    Fallible(())
+}
+
+impl Drop for Fallible {
+    fn drop(&mut self) {
+        crate::proc::fallible_leave();
+    }
+}
+
+/// n バイトの Vec。取れなければ Err(-ENOMEM) (panic しない)。zero なら 0 で埋め、でなければ中身は決まっていない
+/// (すぐ全部書くところ用)
+pub fn try_vec(n: usize, zero: bool) -> Result<alloc::vec::Vec<u8>, i64> {
+    const ENOMEM: i64 = 12;
+    let mut v = alloc::vec::Vec::new();
+    {
+        let _f = fallible();
+        v.try_reserve_exact(n).map_err(|_| -ENOMEM)?;
+    }
+    if zero {
+        v.resize(n, 0);
+    } else {
+        unsafe { v.set_len(n) };
+    }
+    Ok(v)
+}
+
 struct Kernel;
 
 unsafe impl GlobalAlloc for Kernel {
@@ -201,31 +402,45 @@ unsafe impl GlobalAlloc for Kernel {
             return ptr::null_mut();
         }
         let need = round(layout.size().max(1)) + HDR;
-        // わざと取れないことに (/proc/ai/ctl の fail ... heap。fail.rs): 取れなかったときと同じく数えて null
-        if crate::fail::heap() {
-            FAILS.fetch_add(1, Relaxed);
-            return ptr::null_mut();
-        }
-        let mut h = HEAP.lock();
-        unsafe {
-            let b = h.alloc(need);
-            if !b.is_null() {
-                let size = tlsf::block_size(b);
-                let used = USED.load(Relaxed) + size;
-                USED.store(used, Relaxed);
-                if used > PEAK.load(Relaxed) {
-                    PEAK.store(used, Relaxed);
+        let fallible = crate::proc::in_fallible();
+        // わざと取れなかったことに (/proc/ai/ctl の fail ... heap|oom。fail.rs): ふつうの道も遅い道もなしで下へ
+        let struck = crate::fail::heap(fallible);
+        if !struck {
+            let p = unsafe { take(need) };
+            if !p.is_null() {
+                return p;
+            }
+            if reclaim(need) {
+                let p = unsafe { take(need) };
+                if !p.is_null() {
+                    return p;
                 }
-                // ヘッダの 2 語目: どこで取ったか (調べているときだけ。ほかは 0)
-                *(b as *mut usize).add(1) = if TRACE.load(Relaxed) { site_add(size) } else { 0 };
-                return b.add(HDR);
             }
         }
-        // 取れなかった: どれだけ使っていて、空きがどれだけ割れているか (このあと panic になることが多い。ヒープは使わずに書く)
         FAILS.fetch_add(1, Relaxed);
-        let (n, big, _) = h.stats();
+        if fallible {
+            return ptr::null_mut();
+        }
+        let p = unsafe { take_reserve(need) };
+        if !p.is_null() {
+            if struck {
+                FORCED.store(true, Relaxed);
+            }
+            if !EMERGENCY.swap(true, Relaxed) {
+                EMERGENCIES.fetch_add(1, Relaxed);
+                crate::println!(
+                    "heap: out of memory for {} bytes (used {} of {}): using the reserve; the biggest process goes at the next syscall",
+                    need,
+                    USED.load(Relaxed),
+                    size()
+                );
+            }
+            return p;
+        }
+        // 予備もない: どれだけ使っていて、空きがどれだけ割れているか (このあと panic になる。ヒープは使わずに書く)
+        let (n, big, _) = HEAP.lock().stats();
         crate::println!(
-            "heap: no {} bytes (used {} of {}, peak {}, {} free blocks, the largest {})",
+            "heap: no {} bytes, not even in the reserve (used {} of {}, peak {}, {} free blocks, the largest {})",
             need,
             USED.load(Relaxed),
             size(),
@@ -244,7 +459,12 @@ unsafe impl GlobalAlloc for Kernel {
             let size = tlsf::block_size(b);
             USED.store(USED.load(Relaxed) - size, Relaxed);
             site_sub(*(b as *mut usize).add(1), size);
-            h.free(b);
+            if in_reserve(b) {
+                RESERVE_USED.store(RESERVE_USED.load(Relaxed) - size, Relaxed);
+                RESERVE.lock().free(b);
+            } else {
+                h.free(b);
+            }
         }
     }
 }

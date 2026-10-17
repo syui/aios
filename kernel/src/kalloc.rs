@@ -45,8 +45,9 @@ pub fn init() {
     k.end = p2v(phystop());
 }
 
-/// 起動のとき (まだだれもページを取っていないうちに): 続いた bytes を、まだ使っていない領域の頭から切り出す
-/// (カーネルのヒープを足すため。ページの参照の数は持たず、返さない)
+/// 続いた bytes を、まだ使っていない領域 [fresh, end) の頭から切り出す (カーネルのヒープを足すため: 起動のときと、
+/// 足りなくなったとき (heap.rs の grow)。ページの参照の数は持たず、返さない)。まだ使っていない領域がなければ None
+/// (返されたページはばらばらなので、続いたものは作れない)
 pub fn take_contiguous(bytes: usize) -> Option<*mut u8> {
     let mut k = KMEM.lock();
     let n = pg_round_up(bytes);
