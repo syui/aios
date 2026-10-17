@@ -97,6 +97,10 @@ pub fn zero_page(page: *mut u8) {
 /// 中身を 0 にしないページ (すぐに全部書きこむところ用: ディスクのブロックのキャッシュ、パイプの中身。
 /// 前に使った人のデータが残っているので、書いていないところをユーザーに見せないこと)
 pub fn alloc_dirty() -> Option<*mut u8> {
+    // わざと取れないことに (/proc/ai/ctl の fail ... page。fail.rs)
+    if crate::fail::page() {
+        return None;
+    }
     let mut k = KMEM.lock();
     let page = if !k.head.is_null() {
         let r = k.head;

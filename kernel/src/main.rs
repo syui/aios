@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod aiproc;
 mod trace;
+mod fail;
 mod bcm2835_rng;
 mod boot;
 mod mmio;

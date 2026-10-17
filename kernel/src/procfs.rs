@@ -100,6 +100,7 @@ enum Node {
     AiFs,
     AiTrace,
     AiParts,
+    AiFail,
     AiFdDir,
     AiFd(u32),
     /// /proc/ai/stack と stack/TID (スレッドの番号)
@@ -204,6 +205,7 @@ impl ProcInode {
             Node::AiFs => 50,
             Node::AiTrace => 51,
             Node::AiParts => 52,
+            Node::AiFail => 53,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
             Node::AiStackDir => 45,
@@ -270,7 +272,7 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
-            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFail | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => proc::ai_threads(),
             Node::AiBkl => crate::smp::stats_json(),
@@ -282,6 +284,7 @@ impl ProcInode {
             Node::AiFs => crate::aiproc::fs_json(),
             Node::AiTrace => crate::trace::json(),
             Node::AiParts => crate::parts::json(),
+            Node::AiFail => crate::fail::json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
@@ -753,6 +756,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "fs") => Node::AiFs,
             (Node::AiDir, "trace") => Node::AiTrace,
             (Node::AiDir, "parts") => Node::AiParts,
+            (Node::AiDir, "fail") => Node::AiFail,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
@@ -863,6 +867,7 @@ impl Inode for ProcInode {
                 add("fs".into(), Node::AiFs);
                 add("trace".into(), Node::AiTrace);
                 add("parts".into(), Node::AiParts);
+                add("fail".into(), Node::AiFail);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
             }

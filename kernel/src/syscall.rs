@@ -39,6 +39,11 @@ macro_rules! nrs {
                 _ => None,
             }
         }
+        /// 名前 (大文字でも小文字でも) から番号 (fail.rs の ctl)
+        pub fn number(name: &str) -> Option<u64> {
+            $(if name.eq_ignore_ascii_case(stringify!($name)) { return Some($n); })*
+            None
+        }
     };
 }
 
@@ -323,12 +328,14 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             crate::seccomp::Verdict::Allow => {}
             crate::seccomp::Verdict::Errno(e) => {
                 tf.x[0] = e as u64;
+                crate::trace::sys_exit(nr, e);
                 strace(nr, &a, Err(e));
                 return None;
             }
             crate::seccomp::Verdict::Trap(errno) => {
                 signal::force_sigsys(nr, tf.elr, errno);
                 tf.x[0] = (-ENOSYS) as u64;
+                crate::trace::sys_exit(nr, -ENOSYS);
                 return None;
             }
             crate::seccomp::Verdict::Kill => {
@@ -342,7 +349,15 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         && crate::parts::off(p)
     {
         tf.x[0] = (-ENOSYS) as u64;
+        crate::trace::sys_exit(nr, -ENOSYS);
         strace(nr, &a, Err(-ENOSYS));
+        return None;
+    }
+    // わざとしくじらせる (/proc/ai/ctl の fail。fail.rs): 決まりに合えば、動かさずにその errno
+    if let Some(e) = crate::fail::syscall(nr) {
+        tf.x[0] = (-e) as u64;
+        crate::trace::sys_exit(nr, -e);
+        strace(nr, &a, Err(-e));
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)

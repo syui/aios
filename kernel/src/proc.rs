@@ -466,6 +466,20 @@ pub fn current_pid_or_zero() -> u32 {
     cur().map_or(0, |i| procs()[i].pid)
 }
 
+/// いまのプロセスの番号 (tgid。起動のときやアイドルなら 0: fail.rs)
+pub fn current_tgid_or_zero() -> u32 {
+    cur().map_or(0, |i| procs()[i].tgid)
+}
+
+/// いまのプロセス (代表スレッド) の名前が prefix で始まるか (起動のときやアイドルなら false: fail.rs)
+pub fn current_comm_starts_with(prefix: &[u8]) -> bool {
+    cur().is_some_and(|i| {
+        let p = &procs()[i];
+        let leader = if p.thread { find_leader(p.tgid) } else { None };
+        leader.map_or(&p.comm[..], |l| &l.comm[..]).starts_with(prefix)
+    })
+}
+
 fn set_cur(v: Option<usize>) {
     unsafe { CURRENT[crate::smp::id()] = v };
 }

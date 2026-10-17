@@ -49,6 +49,7 @@
   {"name": "ns", "type": "extra", "src": "src/ns.rs", "what": "namespace: プロセスから見える世界を分ける (Linux と同じ CLONE_NEW* と unshare)", "off": "clone と unshare の CLONE_NEW* が EINVAL"},
   {"name": "procfs", "type": "extra", "src": "src/procfs.rs", "what": "/proc: プロセスの様子を見せる小さなファイルシステム"},
   {"name": "prof", "type": "extra", "src": "src/prof.rs", "what": "調べもの用: カーネルの中の区間ごとの回数と時間 (/proc/ai/ctl の prof on、/proc/ai/prof)"},
+  {"name": "fail", "type": "extra", "src": "src/fail.rs", "what": "調べもの用: わざとしくじらせる (フォルト注入): あるプロセスのシステムコールを -ERRNO に、カーネルのヒープや物理ページを取れないことに (/proc/ai/ctl の fail、/proc/ai/fail。aish の fail)"},
   {"name": "trace", "type": "extra", "src": "src/trace.rs", "what": "調べもの用: カーネルの中の出来事 (システムコールの入りと出、スレッドの切りかえ、眠りと起こし、割り込み、ディスクの読み書き、ページフォルト、exec と exit) の記録 (/proc/ai/ctl の trace on、/proc/ai/trace。aish の trace)"},
   {"name": "sd", "type": "extra", "src": "src/sd.rs", "what": "SD カード (SDHCI, PIO で待つだけの簡単なもの)"},
   {"name": "seccomp", "type": "extra", "src": "src/seccomp.rs", "what": "seccomp: プロセスが使えるシステムコールをしぼる (Linux と同じ番号と形)", "off": "seccomp が ENOSYS、prctl(PR_SET_SECCOMP) が EINVAL"},

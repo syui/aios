@@ -201,6 +201,11 @@ unsafe impl GlobalAlloc for Kernel {
             return ptr::null_mut();
         }
         let need = round(layout.size().max(1)) + HDR;
+        // わざと取れないことに (/proc/ai/ctl の fail ... heap。fail.rs): 取れなかったときと同じく数えて null
+        if crate::fail::heap() {
+            FAILS.fetch_add(1, Relaxed);
+            return ptr::null_mut();
+        }
         let mut h = HEAP.lock();
         unsafe {
             let b = h.alloc(need);
