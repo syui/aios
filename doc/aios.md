@@ -201,7 +201,10 @@ splice (パイプとファイル、パイプどうし)、tee、readv / writev / 
 1025 こ、さわれないもの。RWF_HIPRI / DSYNC / SYNC / NOWAIT / APPEND / NOAPPEND / ATOMIC / DONTCACHE / NOSIGNAL と知らないビット。
 NOWAIT で読むときは cold (まず fadvise DONTNEED で外して EAGAIN を見る) か warm (まず読んでおく))、mmap / munmap /
 msync と、その写しの中の読み書き (mread / mwrite: MAP_SHARED と MAP_PRIVATE、PROT_*、長さと位置は表から、終わりの先も。
-SIGBUS / SIGSEGV は受けて答えにする)) を、
+SIGBUS / SIGSEGV は受けて答えにする)、flock (LOCK_SH / LOCK_EX / LOCK_UN。いつも LOCK_NB) と fcntl のレコードロック
+(F_SETLK / F_GETLK / F_OFD_SETLK / F_OFD_GETLK: 種類、whence、始まりと長さ (負の長さも)、l_pid。同じファイルを別に開いた
+fd を多めに選び、なければそのファイルをもう一度開く op にして、取り合いが起きるように。F_GETLK の答えのうち pid は
+self / other / -1 で)) を、
 はじめの木 (a、b/、b/c、d -> b) の上で動かし、答えを 1 行ずつ出す。並びは種だけで決まる (動かした答えによらない) ので、同じ
 種なら Linux でも aios でも同じシステムコールが同じ順に動き、2 つの出力の最初にちがう行がふるまいのちがいになる。答えは
 アーキテクチャによらない形 (フラグは名前、stat は種類と許可とリンクの数と大きさ、ino や時刻は出さない) で、x86_64 の Linux と
@@ -267,6 +270,24 @@ pagecache_isize_extended と同じ。tmpfs でも: Linux の tmpfs はそのま�
 動かしているプログラムは、ページが 1 枚になったので書けば動いているコードが変わる: 書くために開く、切りつめるのは
 ETXTBSY (Linux と同じ。aipkg はふつうのファイルも先に外してから入れるので、動いているものは古い inode を使いつづける)。
 test/mmapcoh.c が、これを ext4 と tmpfs でじかに確かめる (Linux でも通る。tmpfs の「伸ばしたら 0」だけは Linux がちがう)。
+
+ロック (flock と fcntl のレコードロック) を覚えさせたとき (ext4 300 × 30 と 200 × 80、tmpfs 300 × 30 でどれもちがわない): aios の
+レコードロックはそれまで仮のもの (かけるのはいつも成功、聞かれたら「だれもかけていない」) だったので、本物にした
+(kernel/src/locks.rs。Linux の fs/locks.c と同じ決まり): POSIX のロックの持ち主はプロセス (ファイルの表: スレッドは同じ)、
+OFD のロックの持ち主は開いたファイル (dup と fork は同じ持ち主)。同じ持ち主どうしはぶつからず、重なるか隣りあう同じ種類は
+1 つにまとめ、種類がちがえば切り分ける。POSIX と OFD は持ち主がちがうので、同じプロセスの中でもぶつかる (F_SETLK は EAGAIN、
+F_GETLK はぶつかるロックの種類と場所と pid (OFD は -1) を答える)。そのファイルの fd をプロセスがどれか 1 つ閉じると
+(dup2 で上書きしても) POSIX のロックはみな外れ、OFD と flock は最後の参照が閉じたら外れる。F_SETLKW と LOCK_NB なしの
+flock は、ほかの持ち主が外すまで眠り、POSIX どうしの行きどまりは EDEADLK。しらべる順も Linux と同じ (F_GETLK は種類が
+F_RDLCK / F_WRLCK でなければ先に EINVAL、F_OFD_GETLK は範囲のあとで種類 (F_UNLCK も聞ける) と l_pid、F_SETLK は範囲、
+口 (読めない fd に F_RDLCK は EBADF)、OFD の l_pid。flock はだめな op の EINVAL が fd の EBADF より先、O_PATH の fd は
+EBADF)。flock はパイプやソケットにもかけられる (パイプは両方の口で 1 つ)。test/rlock.c が、同じプロセスの中と、fork した
+子との取り合い (待つ、EDEADLK、子の終わりで外れる) を ext4 と tmpfs でじかに確かめる (Linux でも同じ答え)。/proc/ai/fs の
+locks に、かかっているロックと待っている人の数が出る。長い並びで出たもう 1 つのちがいは NOWAIT の読みの先読み:
+aios は NOWAIT で読めなかったとき 1 ページしか読んでおかず、ディスクでつながっていない次のページが 2 回めにも読めなかった
+(Linux の先読みは読もうとした範囲をみな読む)。読もうとした範囲 (128 KiB まで) のページをみな読んでおくようにした。
+ロボットの側も、Linux の 2 回めの読みは先読みのディスクが終わるまで (EAGAIN のあいだ 1 秒まで) 待つようにした
+(RWF_DONTCACHE のときは、終わるまで EAGAIN のまま)。
 
 #### aios がえらんだちがい
 

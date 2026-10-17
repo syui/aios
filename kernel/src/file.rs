@@ -887,8 +887,8 @@ fn dtype(mode: u32) -> u8 {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        // flock のロックは OpenFile ごと (その場所で見分ける)
-        crate::sysfile::release_locks(self as *const OpenFile as usize);
+        // flock のロックと OFD ロックは OpenFile ごと (その場所で見分ける): 最後の参照が閉じたら外す
+        crate::locks::release_file(self as *const OpenFile as usize);
         match &self.kind {
             Kind::SndPcm => crate::sound::close_pcm(),
             Kind::Inode(ino, path) => {

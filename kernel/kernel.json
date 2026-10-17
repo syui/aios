@@ -23,6 +23,7 @@
   {"name": "syscall", "type": "core", "src": "src/syscall.rs", "what": "aarch64 Linux 互換のシステムコール"},
   {"name": "exec", "type": "core", "src": "src/exec.rs", "what": "ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る"},
   {"name": "file", "type": "core", "src": "src/file.rs", "what": "開いたファイル (fd の向こう側)"},
+  {"name": "locks", "type": "core", "src": "src/locks.rs", "what": "ファイルのロック: flock (開いたファイルごと、ファイルまるごと) と fcntl のレコードロック (POSIX はプロセスごと、OFD は開いたファイルごと。範囲、まとめ、切り分け、閉じたら外れる、待つ、EDEADLK)。Linux の fs/locks.c と同じ決まり"},
   {"name": "sysfile", "type": "core", "src": "src/sysfile.rs", "what": "ファイルまわりのシステムコール"},
   {"name": "vfs", "type": "core", "src": "src/vfs.rs", "what": "VFS: ファイルシステムの共通の形と、パスの探索、マウント", "bench": "test/fsbench.c (aish の bench。/proc/ai/prof の vfs:*)"},
   {"name": "fs", "type": "core", "src": "src/fs.rs", "what": "起動時にルートファイルシステムを組み立てる"},

@@ -423,8 +423,17 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool) -> R 
                 let pos = f.borrow().offset;
                 let r = read_wrapped(flags, || file::read_opt(&f, &mut tmp, nowait));
                 if flags & RWF_NOWAIT != 0 && r == Err(-EAGAIN) {
+                    // Linux の先読みのかわり: 読もうとしたところ (128 KiB まで) のページをみな読んでおく (次の NOWAIT で
+                    // 読める。ディスクでつながっていないページも)
                     let mut one = [0u8; 1];
-                    let _ = file::read_sleepable(ino, pos, &mut one);
+                    let end = pos.saturating_add(len.min(128 * 1024));
+                    let mut p = pos;
+                    while p < end {
+                        if !matches!(file::read_sleepable(ino, p, &mut one), Ok(1)) {
+                            break;
+                        }
+                        p = (p / 4096 + 1) * 4096;
+                    }
                 }
                 r
             }
@@ -2283,15 +2292,12 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             ino.add_seals(arg as u32)?;
             Ok(0)
         }
-        // POSIX のレコードロック (F_GETLK / F_SETLK / F_SETLKW) と OFD ロック (36〜38)。
-        // まだ本当には錠をかけない: かけるのはいつも成功し、聞かれたら「だれもかけていない」と答える
-        // (SQLite などが使う。ほかのプロセスとの取り合いはまだ守らない)
-        5 | 36 => {
-            const F_UNLCK: i16 = 2;
-            proc::current().pt().copy_out(arg as usize, &F_UNLCK.to_le_bytes()).ok_or(-EFAULT)?;
-            Ok(0)
+        // POSIX のレコードロック (F_GETLK / F_SETLK / F_SETLKW) と OFD ロック (36〜38): locks.rs
+        5..=7 | 36..=38 => {
+            let f = entry.file.clone();
+            let files = p as *const proc::Files as usize;
+            crate::locks::fcntl(&f, files, cmd, arg as usize)
         }
-        6 | 7 | 37 | 38 => Ok(0),
         F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let mut p = p.borrow_mut();
@@ -3217,60 +3223,9 @@ pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
     Ok(r? as i64)
 }
 
-/// flock のロック表: inode ごとに (開いたファイル, 専有か)
-static mut LOCKS: alloc::vec::Vec<((usize, u64), usize, bool)> = alloc::vec::Vec::new();
-
-fn locks() -> &'static mut alloc::vec::Vec<((usize, u64), usize, bool)> {
-    unsafe { &mut *(&raw mut LOCKS) }
-}
-
-fn locks_chan() -> usize {
-    (&raw const LOCKS) as usize
-}
-
-/// OpenFile が閉じられたら、その持っていたロックを外す
-pub fn release_locks(file: usize) {
-    let l = locks();
-    let before = l.len();
-    l.retain(|(_, f, _)| *f != file);
-    if l.len() != before {
-        proc::wakeup(locks_chan());
-    }
-}
-
-/// flock(fd, op): LOCK_SH / LOCK_EX / LOCK_UN (| LOCK_NB)
+/// flock(fd, op): locks.rs
 pub fn flock(fd: u64, op: u64) -> R {
-    const LOCK_SH: u64 = 1;
-    const LOCK_EX: u64 = 2;
-    const LOCK_NB: u64 = 4;
-    const LOCK_UN: u64 = 8;
-    const EWOULDBLOCK: i64 = 11;
-    let f = file_of(fd)?;
-    let id = match &f.borrow().kind {
-        Kind::Inode(i, _) => i.id(),
-        _ => return Err(-EINVAL),
-    };
-    let me = &*f.borrow() as *const file::OpenFile as usize;
-    // すでに持っているロックは外してから取りなおす (変換)
-    locks().retain(|(i, fl, _)| !(*i == id && *fl == me));
-    proc::wakeup(locks_chan());
-    let excl = match op & !LOCK_NB {
-        LOCK_UN => return Ok(0),
-        LOCK_SH => false,
-        LOCK_EX => true,
-        _ => return Err(-EINVAL),
-    };
-    loop {
-        let busy = locks().iter().any(|(i, _, e)| *i == id && (excl || *e));
-        if !busy {
-            locks().push((id, me, excl));
-            return Ok(0);
-        }
-        if op & LOCK_NB != 0 {
-            return Err(-EWOULDBLOCK);
-        }
-        proc::sleep(locks_chan())?;
-    }
+    crate::locks::flock(fd, op)
 }
 
 /// close_range(first, last, flags): まとめて閉じる (CLOSE_RANGE_CLOEXEC なら印をつけるだけ)

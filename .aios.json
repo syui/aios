@@ -31,7 +31,7 @@
 
   "kernel": {
     "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "kalloc", "heap", "oom", "tlsf", "vm", "trap", "irq", "timer", "smp", "dtb",
-              "uart", "console", "kmsg", "tty", "proc", "signal", "syscall", "exec", "file", "sysfile", "vfs", "fs", "tmpfs",
+              "uart", "console", "kmsg", "tty", "proc", "signal", "syscall", "exec", "file", "locks", "sysfile", "vfs", "fs", "tmpfs",
               "initrd", "cred", "crypto", "rand", "parts"],
     "extra": ["aiproc", "bcm2835_rng", "block", "efi", "epoll", "extfs", "gpu", "htree", "inotify", "input", "jbd2", "landlock",
               "module", "net", "netif", "ns", "procfs", "prof", "fail", "trace", "sd", "seccomp", "socket", "sound", "swap", "sysctl", "sysfs",

@@ -43,6 +43,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -318,9 +319,9 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, NKIND};
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4};
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -384,6 +385,27 @@ static const char *rnn[] = {"0", "RENAME_NOREPLACE", "RENAME_EXCHANGE", "RENAME_
 static const unsigned rnw[] = {60, 23, 15, 2};
 enum { C_GETFL, C_SETFL, C_GETFD, C_SETFD, C_DUPFD, C_DUPFD_CLOEXEC };
 static const char *cmdn[] = {"F_GETFL", "F_SETFL", "F_GETFD", "F_SETFD", "F_DUPFD", "F_DUPFD_CLOEXEC"};
+// flock(2): LOCK_SH / LOCK_EX / LOCK_UN (いつも LOCK_NB: 1 つのプロセスの中では、待つと止まる) と、だめな op
+static const int flockv[] = {LOCK_SH, LOCK_EX, LOCK_UN, LOCK_SH | LOCK_EX, 0};
+static const char *const flockn[] = {"LOCK_SH|LOCK_NB", "LOCK_EX|LOCK_NB", "LOCK_UN|LOCK_NB", "LOCK_SH|LOCK_EX|LOCK_NB", "LOCK_NB"};
+static const unsigned flockw[5] = {5, 5, 3, 1, 1};
+// fcntl のレコードロック (POSIX と OFD。待つ F_SETLKW は 1 つのプロセスの中では止まるので使わない): cmd、種類、
+// whence、始まりと長さ (負の長さは始まりの手前)、l_pid (OFD では 0 でなければ EINVAL)
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK 36
+#define F_OFD_SETLK 37
+#endif
+static const int rlcmdv[] = {F_SETLK, F_GETLK, F_OFD_SETLK, F_OFD_GETLK};
+static const char *const rlcmdn[] = {"F_SETLK", "F_GETLK", "F_OFD_SETLK", "F_OFD_GETLK"};
+static const unsigned rlcmdw[4] = {5, 3, 5, 3};
+static const int rltv[] = {F_RDLCK, F_WRLCK, F_UNLCK, 3};
+static const char *const rltn[] = {"F_RDLCK", "F_WRLCK", "F_UNLCK", "3"};
+static const unsigned rltw[4] = {5, 5, 3, 1};
+static const int rlwv[] = {SEEK_SET, SEEK_CUR, SEEK_END, 7};
+static const char *const rlwn[] = {"SEEK_SET", "SEEK_CUR", "SEEK_END", "7"};
+static const unsigned rlww[4] = {8, 2, 2, 1};
+static const long long rlstarts[] = {0, 0, 0, 0, 1, 5, 100, 4096, 10000, -1};
+static const long long rllens[] = {0, 0, 0, 1, 10, 100, 4096, -1, -10};
 static const int dupmin[] = {0, 3, 5, 10, 100};
 // fchownat / fchown: uid と gid を -1、自分、root (0) から
 static const char *idn[] = {"-1", "me", "0"};
@@ -461,10 +483,15 @@ static int res[MAXOPS][2];
 // 作った fd の引数のもと (op の番号 * 2 + 端)、パイプか (1 読む口、2 書く口。F_SETFL でも O_NONBLOCK を消さない:
 // 読み書きで止まらないように)、開けられそうか (あるはずのパスを、ふつうのフラグで。そういうものを多く使う)、
 // 何で開いたか (1 読む、2 書く。O_PATH は 0)
-static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS], refacc[2 * MAXOPS], refdir[2 * MAXOPS];
+static int nref, refs[2 * MAXOPS], refpipe[2 * MAXOPS], reflikely[2 * MAXOPS], refacc[2 * MAXOPS], refdir[2 * MAXOPS], reforig[2 * MAXOPS];
 // genfd2 が選んだものの refacc と refdir (ディレクトリを開いたもの。dup はそれを引きつぐ)。lastfile は genfile が
 // ファイルらしいものを選べたか
 static int lastacc, lastdir, lastfile;
+// genfd2 が選んだものを開いた op の番号 (dup はそれを引きつぐ。パイプは -1): 同じファイルを別に開いたもの (ロックの取り合い) を探すのに
+static int lastorig;
+// gensame が、同じファイルを別に開いたものを選べたか。lastlock は前のロックの op が使った fd を開いた op (取り合いになるよう、
+// 次はちがう open のものを多めに)
+static int lastsame, lastlock = -1;
 // 写した領域 (mmap の op の番号) と、できていそうか (fd が読めるふつうのファイルで、長さと位置がよい)。
 // exec では mres / mlen にその場所と長さ (外したら NULL)
 static int nmref, mrefs[MAXOPS], mlikely[MAXOPS];
@@ -491,11 +518,13 @@ static void addref(int r, int pipe, int likely, int acc) {
     reflikely[nref] = likely;
     refacc[nref] = acc;
     refdir[nref] = lastdir;
+    reforig[nref] = lastorig;
     nref++;
 }
 
 static int genfd2(int *pipe, int *likely) {
     *pipe = *likely = lastacc = lastdir = 0;
+    lastorig = -1;
     if (nref == 0 || chance(4))
         return chance(50) ? REF_BAD : REF_BIG;
     int cand[2 * MAXOPS], n = 0;
@@ -513,6 +542,7 @@ static int genfd2(int *pipe, int *likely) {
     *likely = reflikely[i];
     lastacc = refacc[i];
     lastdir = refdir[i];
+    lastorig = reforig[i];
     return refs[i];
 }
 
@@ -549,8 +579,68 @@ static int genfile(int want) {
     int j = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
     lastacc = refacc[j];
     lastdir = refdir[j];
+    lastorig = reforig[j];
     lastfile = !lastdir;
     return refs[j];
+}
+
+// 同じファイル (同じパスを開いた、別の open) がほかにもある fd (ロックの取り合いが起きるところ)。want (1 読む、2 書く) で
+// 開いたものを多めに。なければ genfile
+static int gensame(int want) {
+    int cand[2 * MAXOPS], n = 0;
+    lastsame = 0;
+    for (int i = 0; i < nref; i++) {
+        if (refpipe[i] || !reflikely[i] || reforig[i] < 0 || refdir[i])
+            continue;
+        const struct op *a = &ops[reforig[i]];
+        int other = 0;
+        for (int j = 0; j < nref && !other; j++)
+            if (j != i && !refpipe[j] && reflikely[j] && reforig[j] >= 0 && reforig[j] != reforig[i] && strcmp(ops[reforig[j]].p1, a->p1) == 0)
+                other = 1;
+        if (other && ((refacc[i] & want) || chance(20)))
+            cand[n++] = i;
+    }
+    if (n == 0 || chance(10))
+        return genfile(want);
+    // 前のロックとちがう open のものを多めに
+    int alt[2 * MAXOPS], na = 0;
+    for (int k = 0; k < n; k++)
+        if (reforig[cand[k]] != lastlock)
+            alt[na++] = cand[k];
+    if (na > 0 && chance(75)) {
+        memcpy(cand, alt, na * sizeof alt[0]);
+        n = na;
+    }
+    int j = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+    lastacc = refacc[j];
+    lastdir = refdir[j];
+    lastorig = reforig[j];
+    lastfile = 1;
+    lastsame = 1;
+    return refs[j];
+}
+
+// 同じファイルを別に開いたものがまだなければ、ロックの op のかわりに、開いているファイルをもう一度開く op にする
+// (取り合いが起きるように)。開いているファイルがなければ 0
+static int reopen_same(struct op *o, int i) {
+    int cand[2 * MAXOPS], n = 0;
+    for (int k = 0; k < nref; k++)
+        if (!refpipe[k] && reflikely[k] && reforig[k] >= 0 && !refdir[k])
+            cand[n++] = k;
+    if (n == 0)
+        return 0;
+    int k = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+    memset(o, 0, sizeof *o);
+    o->kind = OPEN;
+    o->d1 = o->d2 = REF_CWD;
+    o->fd = REF_BAD;
+    strcpy(o->p1, ops[reforig[k]].p1);
+    o->acc = chance(50) ? 2 : chance(50) ? 0 : 1;
+    static const int accbits[] = {1, 2, 3, 0};
+    lastdir = 0;
+    lastorig = i;
+    addref(2 * i, 0, 1, accbits[o->acc]);
+    return 1;
 }
 
 static int gendir(void) {
@@ -637,6 +727,7 @@ static void gen(uint64_t seed, int n) {
     rs = seed;
     nref = 0;
     nmref = 0;
+    lastlock = -1;
     nknown = 0;
     fallocated = 0;
     know("a", 'f');
@@ -692,6 +783,7 @@ static void gen(uint64_t seed, int n) {
             int odd = (1 << 1) | (1 << 4) | (1 << 8) | B_TMPFILE;
             static const int accbits[] = {1, 2, 3, 0};
             lastdir = k == 'd';
+            lastorig = i;
             addref(2 * i, 0, o->d1 == REF_CWD && o->acc != 3 && !(o->of & odd) && (k || ((o->of & B_CREAT) && o->p1[0] && o->p1[0] != 'x')),
                    (o->of & (1u << 8)) ? 0 : accbits[o->acc]);
             break;
@@ -833,6 +925,7 @@ static void gen(uint64_t seed, int n) {
         case PIPE:
             o->x = chance(30);
             lastdir = 0;
+            lastorig = -1;
             addref(2 * i, 1, 1, 1);
             addref(2 * i + 1, 2, 1, 2);
             break;
@@ -917,6 +1010,33 @@ static void gen(uint64_t seed, int n) {
             o->d2 = chance(85) ? genpipe2(2, o->fd) : genfd(&pipe);
             o->len = splens[pickw(splw, 8)];
             o->mode = pickw(spfw, 4);
+            break;
+        case FLOCK:
+            // たいてい、同じファイルをほかにも開いているもの (取り合い)。なければ、そのファイルをもう一度開く op に
+            o->x = (int)pickw(flockw, 5);
+            if (chance(70)) {
+                o->fd = gensame(3);
+                if (!lastsame && chance(60) && reopen_same(o, i))
+                    break;
+            } else
+                o->fd = genfd(&pipe);
+            lastlock = lastorig;
+            break;
+        case RLOCK:
+            o->x = (int)pickw(rlcmdw, 4);
+            o->y = (int)pickw(rltw, 4);
+            // 種類に合った口 (F_RDLCK は読める fd、F_WRLCK は書ける fd) で、たいてい同じファイルをほかにも開いているもの
+            if (chance(75)) {
+                o->fd = gensame(o->y == 1 ? 2 : 1);
+                if (!lastsame && chance(60) && reopen_same(o, i))
+                    break;
+            } else
+                o->fd = genfd(&pipe);
+            lastlock = lastorig;
+            o->acc = pickw(rlww, 4);
+            o->off = rlstarts[pick(10)];
+            o->len = rllens[pick(9)];
+            o->rwf = chance(5);
             break;
         case MMAP: {
             // fd のファイルを写す (たいてい読めるふつうのファイル。len と off は表から。prot と MAP_SHARED / MAP_PRIVATE)。
@@ -2013,13 +2133,44 @@ static void exec(int i, const struct op *o) {
         if (rd && r > 0)
             say(" h%08x", fnv(rbuf, r));
         if (cold) {
-            if (!on_aios)
-                usleep(10000);
+            // Linux では先読みのディスクが終わるのを待つ (10 ms ずつ、EAGAIN のあいだ 1 秒まで: DONTCACHE のときなどは
+            // 終わるまで EAGAIN のまま)。aios は 1 回めに読んでおくので、2 回めはいつも読める
             long r2 = syscall(SYS_preadv2, fd, iov, cnt, (long)o->off, 0L, fl);
+            for (int k = 0; !on_aios && r2 < 0 && errno == EAGAIN && k < 100; k++) {
+                usleep(10000);
+                r2 = syscall(SYS_preadv2, fd, iov, cnt, (long)o->off, 0L, fl);
+            }
             say(" then");
             ret(r2);
             if (r2 > 0)
                 say(" h%08x", fnv(rbuf, r2));
+        }
+        break;
+    }
+    case FLOCK:
+        say("flock(%d, %s)", fd, flockn[o->x]);
+        ret(syscall(SYS_flock, fd, flockv[o->x] | LOCK_NB));
+        break;
+    case RLOCK: {
+        struct flock l;
+        memset(&l, 0, sizeof l);
+        l.l_type = (short)rltv[o->y];
+        l.l_whence = (short)rlwv[o->acc];
+        l.l_start = (off_t)o->off;
+        l.l_len = (off_t)o->len;
+        l.l_pid = o->rwf ? 1234 : 0;
+        say("fcntl(%d, %s, {%s, %s, %lld, %lld, pid %d})", fd, rlcmdn[o->x], rltn[o->y], rlwn[o->acc], o->off, o->len, (int)l.l_pid);
+        r = syscall(SYS_fcntl, fd, rlcmdv[o->x], &l);
+        ret(r);
+        // GETLK の答え: ぶつかるロックがなければ F_UNLCK だけ、あればその種類と場所と持ち主 (自分のプロセスなら self、
+        // OFD のロックは -1。ほかのプロセスは other: pid は Linux と aios でちがう)
+        if (r == 0 && (o->x == 1 || o->x == 3)) {
+            const char *t = l.l_type == F_RDLCK ? "F_RDLCK" : l.l_type == F_WRLCK ? "F_WRLCK" : l.l_type == F_UNLCK ? "F_UNLCK" : "?";
+            if (l.l_type == F_UNLCK)
+                say(" {F_UNLCK}");
+            else
+                say(" {%s, %s, %lld, %lld, %s}", t, l.l_whence == SEEK_SET ? "SEEK_SET" : l.l_whence == SEEK_CUR ? "SEEK_CUR" : l.l_whence == SEEK_END ? "SEEK_END" : "?", (long long)l.l_start, (long long)l.l_len,
+                    l.l_pid == -1 ? "-1" : l.l_pid == getpid() ? "self" : "other");
         }
         break;
     }

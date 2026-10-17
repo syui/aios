@@ -188,11 +188,13 @@ pub fn fs_json() -> String {
         ));
     }
     format!(
-        "{{\"mounts\":{},\"paths\":{},\"files\":{{\"open\":{},\"procs\":{}}},\"disk\":[{}]}}\n",
+        "{{\"mounts\":{},\"paths\":{},\"files\":{{\"open\":{},\"procs\":{}}},\"locks\":{{\"held\":{},\"waiting\":{}}},\"disk\":[{}]}}\n",
         crate::vfs::mounts_json(),
         crate::vfs::paths_json(),
         seen.len(),
         nprocs,
+        crate::locks::stats().0,
+        crate::locks::stats().1,
         disk.join(",")
     )
 }

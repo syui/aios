@@ -27,6 +27,7 @@ mod inotify;
 mod exec;
 mod extfs;
 mod file;
+mod locks;
 mod fs;
 mod irq;
 mod heap;

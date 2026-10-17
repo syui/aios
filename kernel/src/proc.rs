@@ -109,6 +109,13 @@ pub struct Files {
     pub gate: Gate,
 }
 
+impl Drop for Files {
+    fn drop(&mut self) {
+        // プロセス (スレッドの組) の終わり: その POSIX のレコードロックをみな外す
+        crate::locks::release_owner(self as *const Files as usize);
+    }
+}
+
 /// 表を大きなロックなしで見ている数 (users) と、変えている数 (mutators)。見る側は users を増やしてから
 /// mutators を見て、0 でなければやめる。変える側 (大きなロックの中) は mutators を増やしてから users が 0 に
 /// なるのを待つ。どちらかがかならず相手に気づくので、見ているあいだに fd が閉じられて OpenFile が消えたり、
@@ -172,14 +179,23 @@ impl Gate {
 impl Files {
     /// fd i を v にする (表を伸ばすことも)。もとのものを返す。表を変えるのはこれと add だけ (gate のため)
     pub fn set(&mut self, i: usize, v: Option<Fd>) -> Option<Fd> {
-        let _w = self.gate.write();
-        if self.fds.len() <= i {
-            if v.is_none() {
-                return None;
+        let old = {
+            let _w = self.gate.write();
+            if self.fds.len() <= i {
+                if v.is_none() {
+                    return None;
+                }
+                self.fds.resize(i + 1, None);
             }
-            self.fds.resize(i + 1, None);
+            core::mem::replace(&mut self.fds[i], v)
+        };
+        // fd を閉じた (上書きも): そのファイルの、このプロセスの POSIX のレコードロックはみな外れる (locks.rs)
+        if let Some(fd) = &old
+            && let Some(k) = crate::locks::key(&fd.file.borrow())
+        {
+            crate::locks::release_posix(self as *const Files as usize, k);
         }
-        core::mem::replace(&mut self.fds[i], v)
+        old
     }
 
     pub fn get(&self, fd: u64) -> Option<&FileRef> {
