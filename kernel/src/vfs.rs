@@ -94,6 +94,9 @@ pub trait Inode {
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64>;
     /// read をページキャッシュ (vm.rs) を通してよいか: 中身が変わるときにかならず vm::file_changed を呼ぶ
     /// ファイルシステム (ext4) のもの。procfs のように読むたびに作るものは false
+    /// posix_fadvise の DONTNEED: off から len バイト (0 なら終わりまで) の、まだ書いていないキャッシュを外す
+    /// (ファイルシステムの側: ページキャッシュは vm::uncache)
+    fn uncache(&self, _off: u64, _len: u64) {}
     fn page_cacheable(&self) -> bool {
         false
     }

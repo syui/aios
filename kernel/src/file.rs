@@ -217,6 +217,12 @@ pub fn read_sleepable(ino: &InodeRef, off: usize, dst: &mut [u8]) -> Result<usiz
 }
 
 pub fn write_opt(f: &FileRef, src: &[u8], dontwait: bool) -> Result<usize, i64> {
+    write_opt2(f, src, dontwait, None)
+}
+
+/// append: Some(true) なら終わりに (pwritev2 の RWF_APPEND)、Some(false) なら O_APPEND でも位置に (RWF_NOAPPEND)、
+/// None なら開いたときの O_APPEND のとおり
+pub fn write_opt2(f: &FileRef, src: &[u8], dontwait: bool, append: Option<bool>) -> Result<usize, i64> {
     let stream = {
         let b = f.borrow();
         if !b.writable() {
@@ -227,7 +233,7 @@ pub fn write_opt(f: &FileRef, src: &[u8], dontwait: bool) -> Result<usize, i64> 
     match stream {
         Some((Kind::PipeRead(_), _)) => Err(-EBADF),
         Some((k, nonblock)) => write_stream(&k, src, nonblock || dontwait),
-        None => f.borrow_mut().write(src),
+        None => f.borrow_mut().write_append(src, append),
     }
 }
 
@@ -415,7 +421,8 @@ impl OpenFile {
         Some((k, self.flags & O_NONBLOCK != 0))
     }
 
-    pub fn write(&mut self, src: &[u8]) -> Result<usize, i64> {
+    /// append: write_opt2 と同じ (None なら開いたときの O_APPEND のとおり)
+    pub fn write_append(&mut self, src: &[u8], append: Option<bool>) -> Result<usize, i64> {
         if !self.writable() {
             return Err(-EBADF);
         }
@@ -432,7 +439,7 @@ impl OpenFile {
                 if src.is_empty() {
                     return Ok(0);
                 }
-                if self.flags & O_APPEND != 0 {
+                if append.unwrap_or(self.flags & O_APPEND != 0) {
                     self.offset = ino.meta().size as usize;
                 }
                 vfs::write_sealed(ino, self.offset, src.len())?;
@@ -1433,6 +1440,11 @@ impl Pipe {
 
     pub fn len(&self) -> usize {
         self.data.len
+    }
+
+    /// 読む口の数 (sysfile の write_flags: 入れ物を写す前に EPIPE を見るため)
+    pub fn readers(&self) -> usize {
+        self.readers
     }
 
     /// 箱の数 (Linux の max_usage: パイプの大きさ / 4KiB)

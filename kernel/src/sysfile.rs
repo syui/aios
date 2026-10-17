@@ -274,6 +274,121 @@ fn verify_area(f: &FileRef, len: usize) -> Result<(), i64> {
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
+    read_flags(fd, buf, len, 0, false)
+}
+
+// preadv2 / pwritev2 の flags (RWF_*)。Linux 7.2 の kiocb_set_rw_flags と同じ決まり (rwf_check)
+pub const RWF_HIPRI: u32 = 0x01;
+pub const RWF_DSYNC: u32 = 0x02;
+pub const RWF_SYNC: u32 = 0x04;
+pub const RWF_NOWAIT: u32 = 0x08;
+pub const RWF_APPEND: u32 = 0x10;
+pub const RWF_NOAPPEND: u32 = 0x20;
+pub const RWF_ATOMIC: u32 = 0x40;
+pub const RWF_DONTCACHE: u32 = 0x80;
+pub const RWF_NOSIGNAL: u32 = 0x100;
+const RWF_SUPPORTED: u32 = 0x1ff;
+
+/// flags のしらべ (Linux の kiocb_set_rw_flags の順。ディレクトリなど read_iter のないものは do_loop_readv_writev)。
+/// aios がえらんだちがい (pipe-nowait): パイプの NOWAIT は、splice や tee に使ったあとも効く (Linux は splice に使った
+/// パイプの FMODE_NOWAIT を消し、それからは EOPNOTSUPP。aios のパイプは splice でも写しを入れるので、待つことがない)。
+/// doc/aios.md の「aios がえらんだちがい」
+/// 知らないものは EOPNOTSUPP、APPEND と NOAPPEND はいっしょに使えない (EINVAL)、NOWAIT は待たないでできるもの
+/// (Linux の FMODE_NOWAIT: ext4 のファイル、パイプ、/dev/null /dev/zero /dev/random、ブロックデバイス、ソケット。
+/// tmpfs や端末はちがう) だけ、ATOMIC は書くだけで、いまはできない、DONTCACHE は ext4 だけ (FOP_DONTCACHE)。
+/// ext4 のバッファ書きは NOWAIT ではできない (ext4_buffered_write_iter)
+fn rwf_check(f: &FileRef, flags: u32, write: bool) -> Result<(), i64> {
+    const EOPNOTSUPP: i64 = 95;
+    if flags == 0 {
+        return Ok(());
+    }
+    let b = f.borrow();
+    let (reg, dir, cached) = match &b.kind {
+        Kind::Inode(i, _) => {
+            let m = i.meta().mode & S_IFMT;
+            (m == vfs::S_IFREG, m == vfs::S_IFDIR, i.page_cacheable())
+        }
+        _ => (false, false, false),
+    };
+    if dir && flags & !RWF_HIPRI != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    if flags & !RWF_SUPPORTED != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+        return Err(-EINVAL);
+    }
+    if flags & RWF_NOWAIT != 0 {
+        let ok = match &b.kind {
+            Kind::Inode(..) => reg && cached,
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
+            _ => false,
+        };
+        if !ok {
+            return Err(-EOPNOTSUPP);
+        }
+    }
+    if flags & RWF_ATOMIC != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    if flags & RWF_DONTCACHE != 0 && !(reg && cached) {
+        return Err(-EOPNOTSUPP);
+    }
+    if write && flags & RWF_NOWAIT != 0 && reg {
+        return Err(-EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// パイプや socketpair にいま中身があるか (ほかの流れ (端末など) は、あるものとして)
+fn stream_has_data(f: &FileRef) -> bool {
+    match &f.borrow().kind {
+        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => p.borrow().len() > 0,
+        _ => true,
+    }
+}
+
+/// ユーザーの va から len バイトに書けるか (読んで同じものを書きもどす)
+fn probe_writable(va: usize, len: usize) -> bool {
+    let pt = proc::current().pt();
+    let mut page = [0u8; 256];
+    let mut at = va;
+    let end = va.saturating_add(len);
+    while at < end {
+        let n = (end - at).min(page.len()).min(crate::memlayout::PGSIZE - at % crate::memlayout::PGSIZE);
+        if pt.copy_in(&mut page[..n], at).is_none() || pt.copy_out(at, &page[..n]).is_none() {
+            return false;
+        }
+        // ページの残りは同じ答え: 次のページへ
+        at = (at + n).max((at / crate::memlayout::PGSIZE + 1) * crate::memlayout::PGSIZE).min(end.max(at + n));
+    }
+    true
+}
+
+/// NOWAIT (noio) と DONTCACHE の区間で f を
+fn read_wrapped<T>(flags: u32, f: impl FnOnce() -> T) -> T {
+    match (flags & RWF_NOWAIT != 0, flags & RWF_DONTCACHE != 0) {
+        (true, true) => proc::noio(|| proc::dontcache(f)),
+        (true, false) => proc::noio(f),
+        (false, true) => proc::dontcache(f),
+        (false, false) => f(),
+    }
+}
+
+/// ページキャッシュを通すふつうのファイルなら、その inode
+fn cached_inode(f: &FileRef) -> Option<InodeRef> {
+    match &f.borrow().kind {
+        Kind::Inode(i, _) if i.page_cacheable() && i.meta().mode & S_IFMT == vfs::S_IFREG => Some(i.clone()),
+        _ => None,
+    }
+}
+
+/// read の中身。flags は preadv2 の RWF_* (NOWAIT: ふつうのファイルはキャッシュになければ EAGAIN。そのときそのページを
+/// 読んでおく (Linux は先読みを出す) ので、次は読める。DONTCACHE: 新しく読んだものを残さない)。dontwait は readv の
+/// 2 つめからの入れ物 (パイプなら、1 つめに入った分で返る: Linux の pipe_read)
+fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool) -> R {
+    const EAGAIN: i64 = 11;
     let f = file_of(fd)?;
     if f.borrow().readable() {
         verify_area(&f, len)?;
@@ -286,16 +401,49 @@ pub fn read(fd: u64, buf: usize, len: usize) -> R {
     // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。パイプと socketpair も取りだした分だけ。
     // これらは 0 で埋めておかなくてよい (IPC の小さな read のたびに 64 KiB を埋めると重い)
     let inode = matches!(f.borrow().kind, Kind::Inode(..) | Kind::PipeRead(_) | Kind::PipeRw(_) | Kind::Pair(..));
+    let nowait = flags & RWF_NOWAIT != 0 || dontwait;
+    let file = if flags & (RWF_NOWAIT | RWF_DONTCACHE) != 0 { cached_inode(&f) } else { None };
+    // パイプなどから取り出したものは戻せないので、中身があるなら、入れ物にさわれるかを先に確かめる (さわれなければ
+    // EFAULT で、中身はそのまま。空なら read のとおり EAGAIN か待つ)。aios がえらんだちがい (pipe-fault): さわれる分は
+    // みな取り出してその数を返す。Linux はパイプの箱ごとに写し、途中でさわれなくなった箱は写した分も数えず残す
+    let stream = !matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb);
     let mut done = 0;
     loop {
         let want = (len - done).min(CHUNK);
         let mut tmp = crate::heap::try_vec(want, !inode)?;
-        let n = match file::read(&f, &mut tmp) {
+        if stream && stream_has_data(&f) && !probe_writable(buf + done, want) {
+            if done == 0 {
+                return Err(-EFAULT);
+            }
+            break;
+        }
+        let r = match &file {
+            Some(ino) => {
+                let pos = f.borrow().offset;
+                let r = read_wrapped(flags, || file::read_opt(&f, &mut tmp, nowait));
+                if flags & RWF_NOWAIT != 0 && r == Err(-EAGAIN) {
+                    let mut one = [0u8; 1];
+                    let _ = file::read_sleepable(ino, pos, &mut one);
+                }
+                r
+            }
+            None => file::read_opt(&f, &mut tmp, nowait),
+        };
+        let n = match r {
             Ok(n) => n,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         };
-        out(buf + done, &tmp[..n])?;
+        if let Err(e) = out(buf + done, &tmp[..n]) {
+            // 入れ物に書けない (EFAULT): ふつうのファイルなら読んだことにしない (Linux はさわれる分だけ進む)
+            if matches!(f.borrow().kind, Kind::Inode(..)) {
+                f.borrow_mut().offset -= n;
+            }
+            if done == 0 {
+                return Err(e);
+            }
+            break;
+        }
         done += n;
         if !whole || n < tmp.len() || done >= len {
             break;
@@ -305,17 +453,37 @@ pub fn read(fd: u64, buf: usize, len: usize) -> R {
 }
 
 pub fn write(fd: u64, buf: usize, len: usize) -> R {
+    write_flags(fd, buf, len, 0, None)
+}
+
+/// write の中身。append: Some(true) で終わりに (RWF_APPEND)、Some(false) で O_APPEND でも位置に (RWF_NOAPPEND)。
+/// RWF_NOSIGNAL: 読み手のいないパイプでも SIGPIPE を送らない。RWF_DSYNC / SYNC: 書けたらディスクに書く。
+/// RWF_NOWAIT: パイプなら待たない (ふつうのファイルは rwf_check で EOPNOTSUPP)
+fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>) -> R {
     let f = file_of(fd)?;
     if f.borrow().writable() {
         verify_area(&f, len)?;
     }
     let whole = whole(&f);
+    // 読み手のいないパイプは、入れ物を写す前に EPIPE (Linux の pipe_write: さわれない入れ物でも EPIPE が先。0 バイトは 0)
+    let dead_pipe = len > 0
+        && match &f.borrow().kind {
+            Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().readers() == 0,
+            _ => false,
+        };
+    if dead_pipe {
+        if flags & RWF_NOSIGNAL == 0 {
+            let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
+            crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
+        }
+        return Err(-file::EPIPE);
+    }
     let mut done = 0;
     loop {
         let mut tmp = uninit((len - done).min(CHUNK))?;
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
-        let r = file::write(&f, &tmp);
-        if r == Err(-file::EPIPE) {
+        let r = file::write_opt2(&f, &tmp, flags & RWF_NOWAIT != 0, append);
+        if r == Err(-file::EPIPE) && flags & RWF_NOSIGNAL == 0 {
             // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
             let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
             crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
@@ -329,6 +497,9 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
         if !whole || n < tmp.len() || done >= len {
             break;
         }
+    }
+    if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        vfs::sync_all();
     }
     Ok(done as i64)
 }
@@ -365,6 +536,12 @@ fn inode_path(f: &FileRef) -> Option<(InodeRef, String)> {
 }
 
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
+    pread_flags(fd, buf, len, off, 0)
+}
+
+/// pread の中身 (flags は read_flags と同じ)
+fn pread_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
+    const EAGAIN: i64 = 11;
     let f = positional(fd, off, false)?;
     let ino = inode_path(&f);
     if ino.as_ref().is_some_and(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFDIR) {
@@ -377,7 +554,15 @@ pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
         let mut tmp = uninit((len - done).min(CHUNK))?;
         let pos = off as usize + done;
         let r = match &ino {
-            Some((i, _)) if i.page_cacheable() => file::read_sleepable(i, pos, &mut tmp),
+            Some((i, _)) if i.page_cacheable() => {
+                let r = read_wrapped(flags, || file::read_sleepable(i, pos, &mut tmp));
+                // NOWAIT でキャッシュになかった: そのページを読んでおいて (Linux の先読みのかわり)、EAGAIN
+                if flags & RWF_NOWAIT != 0 && r == Err(-EAGAIN) {
+                    let mut one = [0u8; 1];
+                    let _ = file::read_sleepable(i, pos, &mut one);
+                }
+                r
+            }
             Some((i, _)) => i.read_at(pos, &mut tmp),
             None => file::pread_dev(&f, pos, &mut tmp),
         };
@@ -386,7 +571,12 @@ pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         };
-        out(buf + done, &tmp[..n])?;
+        if out(buf + done, &tmp[..n]).is_err() {
+            if done == 0 {
+                return Err(-EFAULT);
+            }
+            break;
+        }
         done += n;
         if n < tmp.len() {
             break;
@@ -401,6 +591,11 @@ pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
 }
 
 pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
+    pwrite_flags(fd, buf, len, off, 0)
+}
+
+/// pwrite の中身 (RWF_DSYNC / SYNC: 書けたらディスクに書く)
+fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
     let f = positional(fd, off, true)?;
     let ino = inode_path(&f);
     // aios がえらんだちがい (pwrite-append): O_APPEND で開いたものにも off に書く (POSIX)。Linux は O_APPEND なら
@@ -435,6 +630,9 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
         && done > 0
     {
         inotify::file_event(path, i, inotify::IN_MODIFY);
+    }
+    if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        vfs::sync_all();
     }
     Ok(done as i64)
 }
@@ -473,77 +671,197 @@ fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
     Ok(v)
 }
 
-pub fn writev(fd: u64, iov: usize, cnt: usize) -> R {
-    let mut total = 0;
-    for (base, len) in iovecs(iov, cnt)? {
-        let n = write(fd, base, len)?;
-        total += n;
-        if (n as usize) < len {
-            break;
+/// iovec の長さの和 (1 つが i64 をこえれば EINVAL: Linux の iovec_from_user)
+fn iov_total(v: &[(usize, usize)]) -> Result<usize, i64> {
+    let mut t: usize = 0;
+    for &(_, l) in v {
+        if l > i64::MAX as usize {
+            return Err(-EINVAL);
         }
+        t = t.saturating_add(l);
     }
-    Ok(total)
+    Ok(t)
+}
+
+pub fn writev(fd: u64, iov: usize, cnt: usize) -> R {
+    writev2(fd, iov, cnt, 0)
 }
 
 pub fn readv(fd: u64, iov: usize, cnt: usize) -> R {
-    let mut total = 0;
-    for (base, len) in iovecs(iov, cnt)? {
+    readv2(fd, iov, cnt, 0)
+}
+
+/// readv (preadv2 の off が -1 のときも): Linux の do_readv → vfs_readv の順 (EBADF、iovec の EINVAL / EFAULT、長さ 0 なら
+/// flags も見ずに 0、位置のしらべ、flags、読む)。入れ物ごとに読み、2 つめからは待たない (パイプは 1 つめに入った分で)。
+/// しくじっても、それまでに読めた分があればそれ (さわれない入れ物の EFAULT など)
+fn readv2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
+    let f = file_of(fd)?;
+    if !f.borrow().readable() {
+        return Err(-EBADF);
+    }
+    let v = iovecs(iov, cnt)?;
+    let total = iov_total(&v)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    verify_area(&f, total)?;
+    rwf_check(&f, flags, false)?;
+    let mut done: usize = 0;
+    for (base, len) in v {
         if len == 0 {
             continue;
         }
-        let n = read(fd, base, len)?;
-        total += n;
-        if (n as usize) < len {
-            break;
+        match read_flags(fd, base, len, flags, done > 0) {
+            Ok(n) => {
+                done += n as usize;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
         }
     }
-    Ok(total)
+    Ok(done as i64)
 }
 
-/// preadv / pwritev: off から順に、iovec ごとに pread / pwrite。
-/// preadv2 / pwritev2 で off が -1 なら、いまの位置で readv / writev
-pub fn preadv(fd: u64, iov: usize, cnt: usize, off: i64) -> R {
-    if off == -1 {
-        return readv(fd, iov, cnt);
+/// writev (pwritev2 の off が -1 のときも): RWF_APPEND なら終わりに、RWF_NOAPPEND なら O_APPEND でも位置に。
+/// aios がえらんだちがい (pipe-fault): 途中の入れ物にさわれなければ、そこまでの分をみな書いてその数を返す (なにも
+/// 書けなければ EFAULT)。Linux のパイプは 4 KiB のページごとに写し、足りないページは捨てる (7 バイトなら EFAULT、
+/// 12000 バイトなら 4096)。読むほうは read_flags。doc/aios.md の「aios がえらんだちがい」
+fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
+    let f = file_of(fd)?;
+    if !f.borrow().writable() {
+        return Err(-EBADF);
     }
-    if off < 0 {
-        return Err(-EINVAL);
+    let v = iovecs(iov, cnt)?;
+    let total = iov_total(&v)?;
+    if total == 0 {
+        return Ok(0);
     }
-    let mut total = 0;
-    for (base, len) in iovecs(iov, cnt)? {
-        let mut done = 0;
-        while done < len {
-            let n = pread(fd, base + done, len - done, off + total + done as i64)?;
-            if n == 0 {
-                return Ok(total + done as i64);
-            }
-            done += n as usize;
+    verify_area(&f, total)?;
+    rwf_check(&f, flags, true)?;
+    let append = if flags & RWF_APPEND != 0 {
+        Some(true)
+    } else if flags & RWF_NOAPPEND != 0 {
+        Some(false)
+    } else {
+        None
+    };
+    let mut done: usize = 0;
+    for (base, len) in v {
+        if len == 0 {
+            continue;
         }
-        total += len as i64;
+        match write_flags(fd, base, len, flags & !(RWF_DSYNC | RWF_SYNC), append) {
+            Ok(n) => {
+                done += n as usize;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
     }
-    Ok(total)
+    if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        vfs::sync_all();
+    }
+    Ok(done as i64)
 }
 
-pub fn pwritev(fd: u64, iov: usize, cnt: usize, off: i64) -> R {
+/// preadv / preadv2: off から順に、iovec ごとに pread。off が -1 なら、いまの位置で readv (Linux の do_preadv:
+/// off < 0 は EINVAL、位置のないもの (パイプ) は ESPIPE、が先)
+pub fn preadv2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     if off == -1 {
-        return writev(fd, iov, cnt);
+        return readv2(fd, iov, cnt, flags);
     }
-    if off < 0 {
+    let f = positional(fd, off, false)?;
+    let v = iovecs(iov, cnt)?;
+    let total = iov_total(&v)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    verify_pos(off, total)?;
+    rwf_check(&f, flags, false)?;
+    let mut done: usize = 0;
+    for (base, len) in v {
+        if len == 0 {
+            continue;
+        }
+        match pread_flags(fd, base, len, off + done as i64, flags) {
+            Ok(n) => {
+                done += n as usize;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done as i64)
+}
+
+/// pwritev / pwritev2。RWF_APPEND なら off は見ずに終わりに (Linux の generic_write_checks)。O_APPEND の fd でも off に
+/// 書くのは pwrite と同じ (aios がえらんだちがい pwrite-append。Linux は RWF_NOAPPEND のときだけ)
+pub fn pwritev2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
+    if off == -1 {
+        return writev2(fd, iov, cnt, flags);
+    }
+    let f = positional(fd, off, true)?;
+    let v = iovecs(iov, cnt)?;
+    let total = iov_total(&v)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    verify_pos(off, total)?;
+    rwf_check(&f, flags, true)?;
+    let off = match inode_path(&f) {
+        Some((i, _)) if flags & RWF_APPEND != 0 => i.meta().size as i64,
+        _ => off,
+    };
+    let mut done: usize = 0;
+    for (base, len) in v {
+        if len == 0 {
+            continue;
+        }
+        match pwrite_flags(fd, base, len, off + done as i64, flags & !(RWF_DSYNC | RWF_SYNC)) {
+            Ok(n) => {
+                done += n as usize;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        vfs::sync_all();
+    }
+    Ok(done as i64)
+}
+
+/// posix_fadvise (fadvise64): DONTNEED だけ本当にする (ページキャッシュと ext4 のブロックのキャッシュから、だれも写して
+/// いない・まだ書いていないものを外す: そのあとの RWF_NOWAIT は EAGAIN)。ほかは Linux と同じく受けるだけ。
+/// パイプには ESPIPE、知らない advice と負の off / len は EINVAL
+pub fn fadvise(fd: u64, off: i64, len: i64, advice: u64) -> R {
+    const POSIX_FADV_DONTNEED: u64 = 4;
+    let f = file_of(fd)?;
+    if matches!(f.borrow().kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_)) {
+        return Err(-file::ESPIPE);
+    }
+    if off < 0 || len < 0 || advice > 5 {
         return Err(-EINVAL);
     }
-    let mut total = 0;
-    for (base, len) in iovecs(iov, cnt)? {
-        let mut done = 0;
-        while done < len {
-            let n = pwrite(fd, base + done, len - done, off + total + done as i64)?;
-            if n == 0 {
-                return Ok(total + done as i64);
-            }
-            done += n as usize;
-        }
-        total += len as i64;
+    if advice == POSIX_FADV_DONTNEED
+        && let Some((i, _)) = inode_path(&f)
+    {
+        crate::vm::uncache(&i, off as usize, len as usize);
+        i.uncache(off as u64, len as u64);
     }
-    Ok(total)
+    Ok(0)
 }
 
 /// openat のフラグ (Linux の build_open_how と build_open_flags): O_PATH なら、ほかは O_DIRECTORY、O_NOFOLLOW、

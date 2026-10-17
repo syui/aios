@@ -178,6 +178,24 @@ pub fn page_cache_json() -> alloc::string::String {
     )
 }
 
+/// posix_fadvise の DONTNEED: ino の off から len バイト (0 なら終わりまで) にまるごと入るページを、だれも写していなければ
+/// 表から外す (かかっているだけのページは外さない: Linux と同じ)
+pub fn uncache(ino: &InodeRef, off: usize, len: usize) {
+    let id = ino.id();
+    let first = off.div_ceil(PGSIZE);
+    let last = if len == 0 { usize::MAX } else { ((off + len) / PGSIZE).saturating_sub(1) };
+    if last < first {
+        return;
+    }
+    let mut c = PRIV.lock();
+    let keys: Vec<FileKey> = c.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| kalloc::refs(p.page) <= 1).map(|(k, _)| *k).collect();
+    for k in keys {
+        if let Some(p) = c.remove(&k) {
+            kalloc::put(p.page);
+        }
+    }
+}
+
 /// だれも写していないページを捨てる (n 枚まで)。捨てた数
 pub fn shrink_cache(n: usize) -> usize {
     let mut freed = Vec::new();
@@ -266,8 +284,15 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
                 kalloc::put(page);
                 done += k;
             }
-            // ページがとれない (メモリが足りない): 残りはじかに
-            None => return Ok(done + ino.read_at(pos, &mut buf[done..n])?),
+            // ページがとれない (メモリが足りない、または noio でキャッシュになかった): 残りはじかに
+            // (noio なら EAGAIN か、ここまでの分)
+            None => {
+                return match ino.read_at(pos, &mut buf[done..n]) {
+                    Ok(k) => Ok(done + k),
+                    Err(_) if done > 0 => Ok(done),
+                    Err(e) => Err(e),
+                };
+            }
         }
     }
     Ok(n)
@@ -386,8 +411,9 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     if heap_crowded() {
         shrink_cache(max / 8);
     }
-    // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う
-    if CHANGES.load(Ordering::SeqCst) != changes || heap_crowded() {
+    // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う。
+    // RWF_DONTCACHE (proc::dontcache) も、新しく読んだものは入れない
+    if CHANGES.load(Ordering::SeqCst) != changes || heap_crowded() || crate::proc::dontcache_on() {
         return Some(page);
     }
     kalloc::get(page);

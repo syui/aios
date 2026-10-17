@@ -287,6 +287,10 @@ pub struct Proc {
     /// 0 でなければ、いまは「ディスクを待つあいだ眠ってよい」読むだけの道の中 (file::read の ext4 のファイル、
     /// pread)。extfs の with_block がキャッシュにないブロックを読むとき、回らずに眠る (io_sleepable)
     pub io_sleep: u32,
+    /// ディスクを読まない区間 (preadv2 の RWF_NOWAIT): キャッシュになければ EAGAIN (extfs の with_block)
+    pub noio: u32,
+    /// 新しく読んだものをキャッシュに残さない区間 (RWF_DONTCACHE)
+    pub dontcache: u32,
     /// 起こされた時刻 (ns、走りだしたら 0)。起こされてから走るまで (/proc/bkl の「起こされてから走るまで」)
     woken_ns: u64,
     /// sched_yield で順番をゆずった (次の pick で後ろに回す。選ばれたら戻す)
@@ -366,6 +370,8 @@ impl Proc {
         nrun: 0,
         slept_at: 0,
         io_sleep: 0,
+        noio: 0,
+        dontcache: 0,
         woken_ns: 0,
         yielded: false,
         slice: 0,
@@ -1979,5 +1985,29 @@ pub fn io_sleepable<R>(f: impl FnOnce() -> R) -> R {
     current().io_sleep += 1;
     let r = f();
     current().io_sleep -= 1;
+    r
+}
+
+/// いまのプロセスは noio の中か: ディスクを読まない (キャッシュになければ EAGAIN。preadv2 の RWF_NOWAIT)
+pub fn noio_on() -> bool {
+    cur().is_some_and(|i| procs()[i].noio > 0)
+}
+
+pub fn noio<R>(f: impl FnOnce() -> R) -> R {
+    current().noio += 1;
+    let r = f();
+    current().noio -= 1;
+    r
+}
+
+/// 同じく dontcache の中か: 新しく読んだものをキャッシュに残さない (RWF_DONTCACHE。前からあったものは残る)
+pub fn dontcache_on() -> bool {
+    cur().is_some_and(|i| procs()[i].dontcache > 0)
+}
+
+pub fn dontcache<R>(f: impl FnOnce() -> R) -> R {
+    current().dontcache += 1;
+    let r = f();
+    current().dontcache -= 1;
     r
 }

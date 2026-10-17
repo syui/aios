@@ -416,8 +416,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         PREAD64 => sysfile::pread(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
-        PREADV | PREADV2 => sysfile::preadv(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
-        PWRITEV | PWRITEV2 => sysfile::pwritev(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
+        PREADV => sysfile::preadv2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
+        PWRITEV => sysfile::pwritev2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
+        // (fd, iov, vlen, pos_l, pos_h, flags): 64 ビットでは pos は pos_l (-1 ならいまの位置)
+        PREADV2 => sysfile::preadv2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, a[5] as u32),
+        PWRITEV2 => sysfile::pwritev2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, a[5] as u32),
         STATX => sysfile::statx(int(a[0]), a[1] as usize, a[2], a[3] as u32, a[4] as usize),
         SYNC => {
             crate::vfs::sync_all();
@@ -467,7 +470,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SPLICE => sysfile::splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
-        FADVISE64 | READAHEAD => Ok(0),
+        FADVISE64 => sysfile::fadvise(a[0], a[1] as i64, a[2] as i64, a[3]),
+        READAHEAD => Ok(0),
         // 優先度 (nice) はまだ持たない: いつも 0 (システムコールの返り値は Linux と同じく 20 - nice)、変えるのは受けつけるだけ
         GETPRIORITY => Ok(20),
         SETPRIORITY => Ok(0),

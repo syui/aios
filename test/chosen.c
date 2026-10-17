@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/uio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -225,6 +227,58 @@ static void splice_snapshot(void) {
     rm(".ch-ss2");
 }
 
+#ifndef SYS_preadv2
+#if defined(__x86_64__)
+#define SYS_preadv2 327
+#else
+#define SYS_preadv2 286
+#endif
+#endif
+
+static void pipe_fault(void) {
+    // パイプへ writev [3 バイト][さわれない 4 バイト]: aios はさわれる 3 を書く。Linux はページごとに写して足りないページを
+    // 捨てるので、なにも書けず EFAULT
+    int p[2];
+    void *bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pipe2(p, O_NONBLOCK) != 0 || bad == MAP_FAILED) {
+        printf("FAIL pipe-fault (%s): pipe2 / mmap\n", dir);
+        fails++;
+        return;
+    }
+    struct iovec iov[2] = {{"abc", 3}, {bad, 4}};
+    long r = writev(p[1], iov, 2);
+    int e = errno;
+    char b[8], got[160];
+    long n = read(p[0], b, sizeof b);
+    snprintf(got, sizeof got, "writev = %ld%s%s, then read %ld", r, r < 0 ? " " : "", r < 0 ? strerror(e) : "", n);
+    check("pipe-fault", r == 3 && n == 3, r < 0 && e == EFAULT && n < 0, got);
+    close(p[0]);
+    close(p[1]);
+    munmap(bad, 4096);
+}
+
+static void pipe_nowait(void) {
+    // パイプの両端で splice (EINVAL) をしたあとの preadv2 RWF_NOWAIT: aios は EAGAIN (空なので)。Linux は splice に使った
+    // パイプの FMODE_NOWAIT を消すので EOPNOTSUPP
+    int p[2];
+    if (pipe2(p, O_NONBLOCK) != 0) {
+        printf("FAIL pipe-nowait (%s): pipe2\n", dir);
+        fails++;
+        return;
+    }
+    long s = syscall(SYS_splice, p[0], NULL, p[1], NULL, 1, 0);
+    int es = errno;
+    char b[8], got[160];
+    struct iovec iov = {b, sizeof b};
+    long r = syscall(SYS_preadv2, p[0], &iov, 1, -1L, 0L, 8);
+    int e = errno;
+    snprintf(got, sizeof got, "splice = %ld%s%s, preadv2 NOWAIT = %ld%s%s", s, s < 0 ? " " : "", s < 0 ? strerror(es) : "", r, r < 0 ? " " : "",
+             r < 0 ? strerror(e) : "");
+    check("pipe-nowait", s < 0 && es == EINVAL && r < 0 && e == EAGAIN, s < 0 && es == EINVAL && r < 0 && e == EOPNOTSUPP, got);
+    close(p[0]);
+    close(p[1]);
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -273,6 +327,8 @@ int main(int argc, char **argv) {
         zero_range(tmpfs);
         sendfile_self();
         splice_snapshot();
+        pipe_fault();
+        pipe_nowait();
     }
     if (!on_aios)
         printf("chosen: Linux does %d of them like aios now\n", same);

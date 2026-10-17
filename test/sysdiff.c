@@ -41,7 +41,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
@@ -77,6 +79,15 @@
 #define SYS_copy_file_range 326
 #else
 #define SYS_copy_file_range 285
+#endif
+#endif
+#ifndef SYS_preadv2
+#if defined(__x86_64__)
+#define SYS_preadv2 327
+#define SYS_pwritev2 328
+#else
+#define SYS_preadv2 286
+#define SYS_pwritev2 287
 #endif
 #endif
 #define FL_KEEP_SIZE 0x01
@@ -239,6 +250,8 @@ static const struct {
     {"zero-range-tmpfs", "tmpfs でも fallocate の ZERO_RANGE ができる (ext4 と同じ)。Linux の tmpfs は EOPNOTSUPP"},
     {"sendfile-self", "同じファイルの中の sendfile は copy_file_range と同じ: 読みはじめたときの終わりまでを写し、重なれば EINVAL。Linux は重なっても写し、同じ回に書いたものが読みにまざる"},
     {"splice-snapshot", "ファイルからパイプへの splice / sendfile は、そのときの中身をパイプに写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない。Linux はページキャッシュのページそのものを入れるので、読む前に変わればそれが読める"},
+    {"pipe-fault", "パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT)。Linux はパイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す)"},
+    {"pipe-nowait", "パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く (待たない)。Linux は splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP"},
 };
 
 // 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)
@@ -246,6 +259,7 @@ static const struct {
     const char *name, *why;
 } linux_bugs[] = {
     {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
+    {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。7.2.11 と 6.18: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
 };
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
@@ -301,10 +315,9 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, NKIND
-};
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2};
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -325,6 +338,21 @@ static const unsigned modes[] = {0644, 0600, 0755, 0444, 0000, 0700, 0777, 04755
 static const long long lens[] = {0, 1, 7, 100, 4096, 5000, 12000};
 static const long long rlens[] = {0, 1, 10, 4096, 16384};
 static const long long offs[] = {0, 3, 4096, 4097, 100000, -1};
+// readv / writev / preadv2 / pwritev2 の iovec の形 (y): 全部で len バイトを、1 つ、2 つ、3 つ (まん中は長さ 0)、4 つ
+// (はじめが長さ 0)、0 こ、1025 こ (EINVAL)、2 つめがさわれない (bad: EFAULT。1 つめの分だけ)
+static const char *const shapes[] = {"1", "2", "3z", "z4", "0", "big", "bad"};
+#define NSHAPE 7
+static const unsigned shapew[NSHAPE] = {6, 5, 3, 2, 1, 1, 2};
+// preadv2 / pwritev2 の flags (RWF_*。bad は知らないビット)
+static const struct {
+    unsigned v;
+    const char *n;
+} rwfs[] = {
+    {0, "0"}, {1, "HIPRI"}, {2, "DSYNC"}, {4, "SYNC"}, {8, "NOWAIT"}, {0x10, "APPEND"}, {0x20, "NOAPPEND"}, {0x40, "ATOMIC"},
+    {0x80, "DONTCACHE"}, {0x100, "NOSIGNAL"}, {0x200, "bad"}, {0x30, "APPEND|NOAPPEND"}, {0x0a, "DSYNC|NOWAIT"}, {0x88, "NOWAIT|DONTCACHE"},
+};
+#define NRWF 14
+static const unsigned rwfw[NRWF] = {8, 2, 3, 2, 8, 6, 4, 2, 4, 2, 2, 2, 2, 2};
 static const long long soffs[] = {0, 1, 5, 100, 4096, 10000, -1, -4097, 1LL << 40};
 static const long long tlens[] = {0, 1, 5, 4096, 5000, 100000, -1};
 static const int whv[] = {SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE, 7};
@@ -405,6 +433,8 @@ struct op {
     // fb: fd の引数を作った op がしくじっていたら、いま開いているいちばん新しい fd を使う (EBADF ばかりにならないように)
     int d1, d2, fd, fb;
     unsigned acc, of, mode;
+    // preadv2 / pwritev2: rwfs の番号
+    unsigned rwf;
     long long off, len;
     int x, y;
 };
@@ -839,6 +869,28 @@ static void gen(uint64_t seed, int n) {
             o->len = splens[pickw(splw, 8)];
             o->mode = pickw(spfw, 4);
             break;
+        case READV:
+        case WRITEV:
+        case PREADV2:
+        case PWRITEV2: {
+            // iovec の形 (y) と全部の長さ。p*v2 は位置 (-1 ならいまの位置) と flags。NOWAIT で読むときは
+            // cold (mode 1: キャッシュから外してから。EAGAIN) か warm (まず読んでおいてから。読める)
+            int rd = o->kind == READV || o->kind == PREADV2;
+            o->fd = genfd(&pipe);
+            o->len = rd ? rlens[pick(5)] : lens[pick(7)];
+            o->x = (int)pick(256);
+            o->y = (int)pickw(shapew, NSHAPE);
+            if (o->kind == PREADV2 || o->kind == PWRITEV2) {
+                o->off = chance(25) ? -1 : offs[pick(6)];
+                unsigned k = pickw(rwfw, NRWF);
+                // 書くときの DONTCACHE は、書き出しが終わってから捨てる (いつかは Linux の中の時間しだい) ので使わない
+                while (o->kind == PWRITEV2 && (rwfs[k].v & 0x80))
+                    k = pickw(rwfw, NRWF);
+                o->rwf = k;
+                o->mode = rd && (rwfs[k].v & 8) && chance(50);
+            }
+            break;
+        }
         case STATX:
             if (chance(8)) {
                 o->d1 = genfd(&pipe);
@@ -1057,6 +1109,83 @@ static void saydents(int fd, long long size) {
 }
 
 static unsigned char wbuf[16384], rbuf[16384];
+
+// readv などの iovec: 全部で len バイトを形 (shapes) に分けて buf に並べる (bad の 2 つめはさわれないページ badpage)
+static void *badpage;
+static int mkiov(struct iovec *iov, int shape, unsigned char *buf, long long len) {
+    long long a = len / 2, b = len - a, t = len / 3;
+    switch (shape) {
+    case 1:
+        iov[0] = (struct iovec){buf, (size_t)a};
+        iov[1] = (struct iovec){buf + a, (size_t)b};
+        return 2;
+    case 2:
+        iov[0] = (struct iovec){buf, (size_t)a};
+        iov[1] = (struct iovec){buf + a, 0};
+        iov[2] = (struct iovec){buf + a, (size_t)b};
+        return 3;
+    case 3:
+        iov[0] = (struct iovec){buf, 0};
+        iov[1] = (struct iovec){buf, (size_t)t};
+        iov[2] = (struct iovec){buf + t, (size_t)t};
+        iov[3] = (struct iovec){buf + 2 * t, (size_t)(len - 2 * t)};
+        return 4;
+    case 4:
+        return 0;
+    case 5:
+        for (int i = 0; i < 1025; i++)
+            iov[i] = (struct iovec){buf, 0};
+        iov[0].iov_len = (size_t)len;
+        return 1025;
+    case 6:
+        iov[0] = (struct iovec){buf, (size_t)a};
+        iov[1] = (struct iovec){badpage, (size_t)(b ? b : 1)};
+        return 2;
+    default:
+        iov[0] = (struct iovec){buf, (size_t)len};
+        return 1;
+    }
+}
+
+// chosen pipe-nowait: Linux は splice に使ったパイプの口 (fd が両方あれば、しくじっても) の FMODE_NOWAIT を消す。
+// その口 (パイプの inode と、読む口か書く口か: dup でも同じ口) を両方の側で覚えて、そこへの NOWAIT には印をつけ、
+// Linux では NOWAIT なしで呼ぶ (このロボットのパイプは O_NONBLOCK なので、答えは同じ)
+static struct {
+    ino_t ino;
+    int mode;
+} spliced[2 * MAXOPS];
+static int nspliced;
+
+static int pipe_key(int fd, ino_t *ino, int *mode) {
+    struct stat st;
+    int fl = (int)syscall(SYS_fcntl, fd, F_GETFL);
+    if (fl < 0 || fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode))
+        return 0;
+    *ino = st.st_ino;
+    *mode = fl & O_ACCMODE;
+    return 1;
+}
+
+static int is_spliced(int fd) {
+    ino_t ino;
+    int mode;
+    if (!pipe_key(fd, &ino, &mode))
+        return 0;
+    for (int i = 0; i < nspliced; i++)
+        if (spliced[i].ino == ino && spliced[i].mode == mode)
+            return 1;
+    return 0;
+}
+
+static void mark_spliced(int fd) {
+    ino_t ino;
+    int mode;
+    if (is_spliced(fd) || !pipe_key(fd, &ino, &mode) || nspliced >= 2 * MAXOPS)
+        return;
+    spliced[nspliced].ino = ino;
+    spliced[nspliced].mode = mode;
+    nspliced++;
+}
 
 static void exec(int i, const struct op *o) {
     long r = 0;
@@ -1581,6 +1710,25 @@ static void exec(int i, const struct op *o) {
         else
             say("NULL");
         say(", %lld, %s)", o->len, spfn[o->mode]);
+        // chosen pipe-nowait: Linux の __do_splice の順で、パイプの口を覚える (fd が両方あって、読む口に位置があれば
+        // そこで ESPIPE、なければ消して、書く口も同じ)
+        {
+            int fi = (int)syscall(SYS_fcntl, fd, F_GETFL), fo = (int)syscall(SYS_fcntl, to, F_GETFL);
+            if (fi >= 0 && !(fi & O_PATH) && fo >= 0 && !(fo & O_PATH)) {
+                ino_t k;
+                int m, stop = 0;
+                if (pipe_key(fd, &k, &m)) {
+                    if (o->x & 1)
+                        stop = 1;
+                    else
+                        mark_spliced(fd);
+                }
+                if (!stop && pipe_key(to, &k, &m)) {
+                    if (!(o->x & 2))
+                        mark_spliced(to);
+                }
+            }
+        }
         // chosen copy-append: O_APPEND で開いたファイルへも書く (位置をわたせばそこへ、なければ終わりに足す)。Linux
         // では O_APPEND をはずし、書く位置がなければ終わりをわたして書いて、書くほうの位置を終わり + 書いた分にしてもどす
         int fl = (int)syscall(SYS_fcntl, to, F_GETFL);
@@ -1625,6 +1773,123 @@ static void exec(int i, const struct op *o) {
         int to = fdref(o->d2, o->fb, fd);
         say("tee(%d, %d, %lld, %s)", fd, to, o->len, spfn[o->mode]);
         ret(syscall(SYS_tee, fd, to, (size_t)o->len, spfv[o->mode]));
+        break;
+    }
+    case READV:
+    case WRITEV:
+    case PREADV2:
+    case PWRITEV2: {
+        static struct iovec iov[1025];
+        int rd = o->kind == READV || o->kind == PREADV2;
+        int v2 = o->kind == PREADV2 || o->kind == PWRITEV2;
+        unsigned fl = v2 ? rwfs[o->rwf].v : 0;
+        if (!rd)
+            for (long long k = 0; k < o->len; k++)
+                wbuf[k] = (unsigned char)(o->x + k * 7);
+        int cnt = mkiov(iov, o->y, rd ? rbuf : wbuf, o->len);
+        say("%s(%d, %lld [%s]", rd ? (v2 ? "preadv2" : "readv") : (v2 ? "pwritev2" : "writev"), fd, o->len, shapes[o->y]);
+        if (v2)
+            say(", %lld, %s%s", o->off, rwfs[o->rwf].n, o->mode ? " cold" : "");
+        say(")");
+        // NOWAIT で読む: cold なら、まず書き残しをディスクへ (fsync。DONTNEED は書いていないページを外さない)、読むところの
+        // ページをまるごとキャッシュから外して (fadvise DONTNEED。aios も本当に外す)、EAGAIN を見る。warm なら、まずふつうに
+        // 読んでおいて (どちらもキャッシュにある) 読めるのを見る。Linux は EAGAIN のときに先読みを出すので、前のがまだなら
+        // 終わるのを待ってから外す
+        long long at = -1;
+        int cold = 0;
+        if (rd && v2 && (fl & 8)) {
+            at = o->off >= 0 ? o->off : (long long)lseek(fd, 0, SEEK_CUR);
+            if (at >= 0) {
+                if (o->mode) {
+                    long long from = at & ~4095LL, to = (at + (o->len ? o->len : 1) + 4095) & ~4095LL;
+                    syscall(SYS_fsync, fd);
+                    if (!on_aios)
+                        usleep(10000);
+                    posix_fadvise(fd, (off_t)from, (off_t)(to - from), POSIX_FADV_DONTNEED);
+                    cold = 1;
+                } else {
+                    syscall(SYS_pread64, fd, rbuf, (size_t)o->len, (off_t)at);
+                }
+            }
+        }
+        // chosen pipe-fault: パイプの bad (2 つめがさわれない) は、さわれる 1 つめの分をみな読み書きする。Linux は箱ごとに
+        // 写して途中でさわれなくなった箱を捨てる (数えない) ので、Linux では 1 つめだけを渡す
+        int wf = 0;
+        if (o->y == 6 && iov[0].iov_len > 0) {
+            struct stat st;
+            wf = fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode);
+            if (wf && !on_aios)
+                cnt = 1;
+        }
+        // chosen pipe-nowait: splice に使ったパイプの口への NOWAIT は、Linux では NOWAIT なしで (上の spliced)
+        int pn = v2 && (fl & 8) && is_spliced(fd);
+        if (pn && !on_aios)
+            fl &= ~8u;
+        // chosen pwrite-append (pwritev2 も): O_APPEND の fd でも off に書く。Linux では O_APPEND をはずして書き、もどす
+        // (RWF_APPEND / RWF_NOAPPEND があれば、どちらも同じ答えなのでそのまま)
+        int fl0 = -1, app = 0;
+        if (o->kind == PWRITEV2 && o->off >= 0 && !(fl & 0x30)) {
+            fl0 = (int)syscall(SYS_fcntl, fd, F_GETFL);
+            app = fl0 >= 0 && (fl0 & O_APPEND);
+            if (app && !on_aios)
+                syscall(SYS_fcntl, fd, F_SETFL, fl0 & ~O_APPEND);
+        }
+        // linuxbug efault-extend: さわれない入れ物の書きこみ (EFAULT) で Linux はファイルを位置まで伸ばす (終わりより先に
+        // 書くとき)。Linux では伸びたぶんを切りもどす。印は両方で (書く位置が終わりより先で EFAULT なら)
+        struct stat st0;
+        int ef = !rd && o->y == 6 && fstat(fd, &st0) == 0 && S_ISREG(st0.st_mode);
+        long long wpos = -1;
+        if (ef) {
+            int wfl = (int)syscall(SYS_fcntl, fd, F_GETFL);
+            wpos = o->off >= 0 ? o->off : (wfl >= 0 && (wfl & O_APPEND)) ? (long long)st0.st_size : (long long)lseek(fd, 0, SEEK_CUR);
+        }
+        if (o->kind == READV)
+            r = syscall(SYS_readv, fd, iov, cnt);
+        else if (o->kind == WRITEV)
+            r = syscall(SYS_writev, fd, iov, cnt);
+        else if (o->kind == PREADV2)
+            r = syscall(SYS_preadv2, fd, iov, cnt, (long)o->off, 0L, fl);
+        else
+            r = syscall(SYS_pwritev2, fd, iov, cnt, (long)o->off, 0L, fl);
+        int e = errno;
+        if (app && !on_aios)
+            syscall(SYS_fcntl, fd, F_SETFL, fl0);
+        int fixed = ef && r < 0 && e == EFAULT && wpos > (long long)st0.st_size;
+        if (fixed && !on_aios) {
+            struct stat st1;
+            if (fstat(fd, &st1) == 0 && st1.st_size > st0.st_size)
+                syscall(SYS_ftruncate, fd, (off_t)st0.st_size);
+        }
+        // cold: Linux の 1 回めの答えは、先読みが間に合えば中身、でなければ EAGAIN (時間しだい) なので、EAGAIN にそろえる
+        // (読んでしまった位置ももどす)。aios は EAGAIN と決まっている (そのときそのページを読んでおく)。
+        // そのあと 2 回めを読む: どちらも読める (then)
+        if (cold && !on_aios && r > 0) {
+            r = -1;
+            e = EAGAIN;
+            if (o->off < 0)
+                lseek(fd, (off_t)at, SEEK_SET);
+        }
+        errno = e;
+        ret(r);
+        if (fixed)
+            say(" [linuxbug efault-extend]");
+        if (pn)
+            say(" [chosen pipe-nowait]");
+        if (app && r > 0)
+            say(" [chosen pwrite-append]");
+        if (wf && r > 0)
+            say(" [chosen pipe-fault]");
+        if (rd && r > 0)
+            say(" h%08x", fnv(rbuf, r));
+        if (cold) {
+            if (!on_aios)
+                usleep(10000);
+            long r2 = syscall(SYS_preadv2, fd, iov, cnt, (long)o->off, 0L, fl);
+            say(" then");
+            ret(r2);
+            if (r2 > 0)
+                say(" h%08x", fnv(rbuf, r2));
+        }
         break;
     }
     case STATX: {
@@ -1760,6 +2025,10 @@ static void rmrf(const char *p) {
 
 // はじめの木 (どの case も同じ): a (6 バイト)、b/、b/c (5000 バイト、0600)、d -> b
 static void setup(void) {
+    // さわれないページ (iovec の bad)
+    badpage = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (badpage == MAP_FAILED)
+        badpage = (void *)16;
     int fd = open("a", O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd >= 0) {
         if (write(fd, "hello\n", 6) != 6)

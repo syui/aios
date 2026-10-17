@@ -28,6 +28,8 @@ const ROOT_INO: u32 = 2;
 const CACHE_BLOCKS: usize = 16384;
 /// ファイルを読むとき、まとめて読むブロックの数 (128 KiB)
 const READ_AHEAD: usize = 32;
+/// noio (RWF_NOWAIT) でキャッシュになかったときの答え
+const NOIO_EAGAIN: i64 = 11;
 
 fn cache_limit(bsize: usize) -> usize {
     CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
@@ -586,6 +588,8 @@ impl ExtFs {
                 c.hits += 1;
                 p
             }
+            // ディスクを読まない区間 (proc::noio: preadv2 の RWF_NOWAIT): キャッシュになければ EAGAIN
+            None if crate::proc::noio_on() => return Err(-NOIO_EAGAIN),
             // 読むだけの道 (proc::io_sleepable) で、書く操作の中でなければ、ディスクを眠って待つ
             None if self.writing.get() == 0 && crate::proc::io_sleep_ok() => {
                 drop(c);
@@ -1980,6 +1984,7 @@ impl ExtFs {
         let len = buf.len().min(size.saturating_sub(off));
         let mut done = 0;
         let extents = r.flags() & EXTENTS_FL != 0;
+        let dontcache = crate::proc::dontcache_on();
         // いまの extent (ファイルのブロック fb から n 個が、ディスクの pb から並んでいる)。ブロックごとに木を引かない
         let mut run: (u64, u64, u64) = (0, 0, 0);
         while done < len {
@@ -1987,18 +1992,28 @@ impl ExtFs {
             let (fb, bo) = ((pos / self.bsize) as u64, pos % self.bsize);
             let n = (self.bsize - bo).min(len - done);
             if !(fb >= run.0 && fb < run.0 + run.2) {
-                run = if extents {
-                    let (p, k) = self.ext_run(&r, fb)?;
-                    (fb, p, if p == 0 { 1 } else { k })
+                let next = if extents {
+                    self.ext_run(&r, fb).map(|(p, k)| (fb, p, if p == 0 { 1 } else { k }))
                 } else {
-                    (fb, self.map(ino, &mut r, fb, false)?, 1)
+                    self.map(ino, &mut r, fb, false).map(|p| (fb, p, 1))
+                };
+                run = match next {
+                    Ok(x) => x,
+                    // noio でメタデータがキャッシュになかった: ここまでの分 (なければ EAGAIN)
+                    Err(e) if e == -NOIO_EAGAIN && done > 0 => return Ok(done),
+                    Err(e) => return Err(e),
                 };
             }
             let b = if run.1 == 0 { 0 } else { run.1 + (fb - run.0) };
             if b == 0 {
                 buf[done..done + n].fill(0);
             } else {
+                let mut fresh = 0;
                 if !self.cached(b) {
+                    // ディスクを読まない区間 (RWF_NOWAIT): ここまでの分 (なければ EAGAIN)
+                    if crate::proc::noio_on() {
+                        return if done > 0 { Ok(done) } else { Err(-NOIO_EAGAIN) };
+                    }
                     // ディスクの上でつながっている後ろのブロックも 1 回で読む (最大 READ_AHEAD)
                     let last = (size.div_ceil(self.bsize) as u64).saturating_sub(fb);
                     let mut k = 1;
@@ -2009,8 +2024,18 @@ impl ExtFs {
                         k += 1;
                     }
                     self.read_ahead(b, k)?;
+                    fresh = k as u64;
                 }
                 self.with_block(b, |d| buf[done..done + n].copy_from_slice(&d[bo..bo + n]))?;
+                // RWF_DONTCACHE: いま読んだブロックはキャッシュに残さない (前からあったものは残る: Linux の dropbehind)
+                if dontcache && fresh > 0 {
+                    let mut c = self.cache.borrow_mut();
+                    for j in 0..fresh {
+                        if !c.data.contains(&(b + j)) && !c.dirty.contains(&(b + j)) {
+                            c.forget(b + j);
+                        }
+                    }
+                }
             }
             done += n;
         }
@@ -2727,6 +2752,33 @@ impl Inode for ExtInode {
 
     fn page_cacheable(&self) -> bool {
         true
+    }
+
+    /// posix_fadvise の DONTNEED: off から len バイト (0 なら終わりまで) のブロックを、まだ書いていなければキャッシュから
+    /// 外す (そのあとの RWF_NOWAIT は EAGAIN: Linux と同じ)
+    fn uncache(&self, off: u64, len: u64) {
+        let Ok(mut r) = self.raw() else { return };
+        if r.mode() & S_IFMT != S_IFREG || r.flags() & INLINE_DATA_FL != 0 {
+            return;
+        }
+        let bs = self.fs.bsize as u64;
+        let size = r.size();
+        let end = if len == 0 { u64::MAX } else { off.saturating_add(len) };
+        // まるごと入るブロックだけ (かかっているだけのものは外さない: Linux と同じ)。終わりのブロックは、ファイルの終わりまで
+        let (mut fb, last) = (off.div_ceil(bs), (end.min(size.next_multiple_of(bs)) / bs).saturating_sub(1));
+        if size == 0 || last < fb || fb * bs >= size {
+            return;
+        }
+        while fb <= last {
+            let Ok(b) = self.fs.map(self.ino, &mut r, fb, false) else { break };
+            if b != 0 {
+                let mut c = self.fs.cache.borrow_mut();
+                if !c.data.contains(&b) && !c.dirty.contains(&b) {
+                    c.forget(b);
+                }
+            }
+            fb += 1;
+        }
     }
 
     /// aios がえらんだちがい (seek-unwritten): fallocate でとってまだ書いていないところ (未初期化の extent) は、いつも
