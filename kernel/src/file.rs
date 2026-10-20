@@ -1687,6 +1687,7 @@ impl Pipe {
 
     /// 読む。peek なら取り除かない (tee 用)
     pub fn read_ex(p: &Rc<PipeCell>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
+        let _p = crate::prof::span("file:pipe_read");
         loop {
             let mut pp = p.borrow_mut();
             if pp.data.len > 0 {
@@ -1938,6 +1939,7 @@ impl Pipe {
     /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN。入れ方は Linux の anon_pipe_write
     /// (PageQueue): 初めに端数を前の箱に足せたら足し、あとは箱があくだけ
     fn write(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+        let _p = crate::prof::span("file:pipe_write");
         let mut done = 0;
         let mut first = true;
         while done < src.len() {

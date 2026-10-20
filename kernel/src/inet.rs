@@ -341,6 +341,7 @@ fn after(a: u32, b: u32) -> bool {
 
 /// 状態が変わった: epoll の数を進め、待っている人 (読む、書く、つなぐ、poll) を起こす
 fn notify(u: &InetRef) {
+    let _p = crate::prof::span("inet:wake");
     u.borrow_mut().generation += 1;
     proc::wakeup(key(u));
     proc::poll_wake(key(u));
@@ -862,6 +863,7 @@ fn adv_mss(user_mss: i32) -> i32 {
 /// SYN を送る (connect とやりなおし): 自分につないだもの、listen しているものの行列 (あふれていれば落とされる:
 /// SYN_SENT のまま、やりなおしの時刻を決める)、いなければ RST (ECONNREFUSED)
 fn syn(u: &InetRef) {
+    let _p = crate::prof::span("inet:syn");
     let (netns, saddr, sport, daddr, dport, my_mss, my_ttl) = {
         let s = u.borrow();
         (s.net, s.saddr, s.num, s.daddr, s.dport, s.user_mss, if s.uc_ttl < 0 { 64 } else { s.uc_ttl })
@@ -1120,6 +1122,7 @@ fn connect_failed(u: &InetRef) {
 
 /// accept (Linux の inet_csk_accept): listen していなければ EINVAL、なければ待つ (SO_RCVTIMEO まで) か EAGAIN
 pub fn accept(f: &FileRef, u: &InetRef) -> Result<InetRef, i64> {
+    let _p = crate::prof::span("inet:accept");
     let nonblock = f.borrow().flags & file::O_NONBLOCK != 0;
     if !u.borrow().tcp {
         return Err(-EOPNOTSUPP);
@@ -1505,6 +1508,7 @@ fn rcvlowat(s: &Inet, waitall: bool, len: usize) -> usize {
 /// TCP の recvmsg (Linux の tcp_recvmsg_locked): 読めるだけ (urgent のバイトの手前で止まる。SO_OOBINLINE でなければ
 /// とばす)。読めるものがなければ FIN (0)、エラー、shutdown (0)、つながっていない (ENOTCONN)、EAGAIN か待つ
 fn tcp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv, i64> {
+    let _p = crate::prof::span("inet:tcp_recv");
     if flags & MSG_ERRQUEUE != 0 {
         return recv_error(u, len);
     }
@@ -1768,6 +1772,7 @@ fn room(u: &InetRef) -> Option<usize> {
 /// 相手が FIN を送ったあと (FIN_WAIT1 / FIN_WAIT2) で RCV も shutdown していれば、相手はこわれて (ECONNRESET) RST が返る
 /// (Linux の tcp_rcv_state_process: RFC 1122 の MUST)
 fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
+    let _p = crate::prof::span("inet:deliver");
     let Some(p) = upgrade(&u.borrow().peer) else { return };
     let (gone, abort) = {
         let s = p.borrow();
@@ -1796,6 +1801,7 @@ fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
 /// TCP の sendmsg (Linux の tcp_sendmsg_locked): つながるのを待つ (つながっていなければ EPIPE)、付帯データの
 /// エラー、自分のエラーか SEND の shutdown で EPIPE、相手の行列があくまで待つ
 fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock: bool) -> R {
+    let _p = crate::prof::span("inet:tcp_send");
     let ctl_err = sock_cmsg_check(ctl, true).err();
     let nb = nonblock || flags & MSG_DONTWAIT != 0;
     loop {
@@ -2102,6 +2108,7 @@ fn udp_disconnect(u: &InetRef) {
 /// UDP の sendmsg (Linux の udp_sendmsg): 長さ、MSG_OOB、ためているもの (MSG_MORE) につなげる、あて先 (なければ
 /// connect したもの: なければ EDESTADDRREQ)、付帯データ、みち、たまっているエラーと SEND の shutdown (EPIPE)
 fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
+    let _p = crate::prof::span("inet:udp_send");
     if len > 0xffff {
         return Err(-EMSGSIZE);
     }
@@ -2275,6 +2282,7 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
 /// UDP の recvmsg (Linux の udp_recvmsg と __skb_recv_udp): たまっているエラーが先、はじめのデータグラム (MSG_PEEK
 /// と SO_PEEK_OFF)、入れ物より大きければ MSG_TRUNC (返す数は、MSG_TRUNC を渡せばデータグラムの長さ)
 fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv, i64> {
+    let _p = crate::prof::span("inet:udp_recv");
     if flags & MSG_ERRQUEUE != 0 {
         return recv_error(u, len);
     }
@@ -3039,6 +3047,7 @@ pub fn release(u: &InetRef) {
 /// Linux の __tcp_close: listen していれば子を切る。読んでいないものがあれば RST、SO_LINGER 0 なら切る、
 /// ほかは FIN。FIN_WAIT2 で残る (60 秒か TCP_LINGER2。そのあいだに相手が送ったら RST、FIN なら TIME_WAIT)
 fn tcp_close(u: &InetRef) {
+    let _p = crate::prof::span("inet:close");
     let st = {
         let mut s = u.borrow_mut();
         s.shutdown = BOTH;

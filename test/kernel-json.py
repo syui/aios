@@ -97,10 +97,10 @@ for e in entries:
         err("%s: bench %s is not a file" % (e.get("name"), b.split()[0]))
 spans = set()
 for s in sources:
-    # 注釈 (// から) はのぞく。syscall.rs の file_span は、システムコールの番号ごとの区間の名前の表
+    # 注釈 (// から) はのぞく。syscall.rs の sys_span は、システムコールの番号ごとの区間の名前の表
     code = "\n".join(l.split("//")[0] for l in text[s].split("\n"))
     spans.update(re.findall(r'prof::span\("([^"]+)"\)', code))
-    m = re.search(r"fn file_span\(.*?\n\}\n", code, re.S)
+    m = re.search(r"fn sys_span\(.*?\n\}\n", code, re.S)
     if m:
         spans.update(re.findall(r'=> "([^"]+)"', m.group(0)))
 for sp in sorted(spans):

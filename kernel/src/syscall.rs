@@ -276,8 +276,8 @@ fn part_of(nr: u64) -> Option<crate::parts::Part> {
     })
 }
 
-/// 調べもの (prof): ファイルのシステムコールの区間の名前 (kernel.json の sysfile)
-fn file_span(nr: u64) -> Option<&'static str> {
+/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll)
+fn sys_span(nr: u64) -> Option<&'static str> {
     use nr::*;
     Some(match nr {
         OPENAT => "sysfile:openat",
@@ -303,6 +303,21 @@ fn file_span(nr: u64) -> Option<&'static str> {
         FSYNC | FDATASYNC | SYNC | SYNCFS => "sysfile:fsync",
         FCHMODAT | FCHMODAT2 => "sysfile:fchmodat",
         UTIMENSAT => "sysfile:utimensat",
+        PPOLL | PSELECT6 => "sysfile:poll",
+        SOCKET => "socket:socket",
+        SOCKETPAIR => "socket:socketpair",
+        BIND => "socket:bind",
+        LISTEN => "socket:listen",
+        ACCEPT | ACCEPT4 => "socket:accept",
+        CONNECT => "socket:connect",
+        SENDTO => "socket:sendto",
+        RECVFROM => "socket:recvfrom",
+        SENDMSG => "socket:sendmsg",
+        RECVMSG => "socket:recvmsg",
+        SHUTDOWN => "socket:shutdown",
+        SETSOCKOPT | GETSOCKOPT => "socket:sockopt",
+        EPOLL_CTL => "epoll:ctl",
+        EPOLL_PWAIT | EPOLL_PWAIT2 => "epoll:wait",
         _ => return None,
     })
 }
@@ -363,7 +378,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
-    let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { file_span(nr).and_then(crate::prof::span) } else { None };
+    let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::prof::span) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),

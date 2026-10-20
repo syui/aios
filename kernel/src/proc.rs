@@ -776,6 +776,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
     };
     *p = Proc::UNUSED;
     let i = slot_of(p);
+    crate::prof::thread_start(i);
     unsafe { LIVE[i / 64] |= 1u64 << (i % 64) };
     unsafe {
         p.pid = NEXT_PID;
@@ -967,11 +968,13 @@ fn sched() {
     crate::smp::SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let p = current();
     let seg = crate::smp::seg_pause();
+    let off = crate::prof::off_cpu();
     unsafe {
         fp_save(&mut p.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) p.tpidr);
         swtch(&mut p.context, sched_ctx());
     }
+    crate::prof::on_cpu(off);
     crate::smp::seg_resume(seg);
 }
 
@@ -1009,6 +1012,7 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
 
 /// chan で眠っている Proc を起こし、起こした数を返す
 pub fn wakeup(chan: usize) -> usize {
+    let _p = crate::prof::span("proc:wakeup");
     wake_where(|p| p.chan == chan)
 }
 

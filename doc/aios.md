@@ -196,15 +196,35 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
 
 ### 速さを測る (bench と /proc/ai/prof)
 
-`bench` のあるもの (いまは vfs、extfs と spinlock、heap、smp) は、その速さを測るものがある。test/fsbench.c は、ファイルのよくある操作 (create、stat、
-ないものの stat、open、4 KiB の書き読み、readdir、深いパス、rename、unlink、mkdir、16 MiB の書き読み、fsync) をそれぞれくりかえして、
-1 回あたりの µs (大きなファイルは MB/s) を出す (Linux でも動く)。aish の `bench` (aish-vm) が VM (`-snapshot`) で n 回動かして op ごとの
-まんなかをとり、`prof on` にした 1 回で /proc/ai/prof の part ごとの割合 (どこがボトルネックか) と、時間の多い区間を出す。
-`against` で 2 つのカーネル (たとえば HEAD と作業中のもの) を op ごとにくらべる。結果は build/aish-vm/bench/ にも残る (速くするループ:
-測る → いちばん遅いところを見つける → 直す → くらべる)。区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。
-spinlock、heap、smp は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから
-取って返す、大きなロックを放して取りなおす、時計を読む (uptime_ns)、物理ページを 1 枚取って返す・1024 枚取ってから返す (kalloc) の 1 回の ns (10 万回の平均) を kmsg に出す。aish の `bench` は
-これも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
+速さは **測る → 記録する → くらべる → いちばん遅いところを見つけて直す → また測る** のくりかえしで上げる。そのための道具:
+
+- **測るプログラム** (aios でも Linux でも動く。1 行 1 つの JSON で op ごとの 1 回の µs か MB/s)
+  - test/fsbench.c: ファイルのよくある操作 (create、stat、ないものの stat、open、4 KiB の書き読み、readdir、深いパス、rename、
+    unlink、mkdir、16 MiB の書き読み、fsync)
+  - test/netbench.c: ループバック。パイプ、AF_UNIX、TCP、UDP の 1 バイトの往復を 2 つのプロセスで (`*_rr`) と 1 つのプロセスで
+    (`*_local`: 切りかえなしの、ソケットの道だけ)、epoll で待つ往復、64 KiB と 4 KiB の流しこみ、connect から閉じるまで。
+    パイプの往復はくらべるための土台 (プロセスの切りかえと起こしだけ)。`-r RUNS` でくりかえし、`-o OP,...` で選ぶ
+- **aish の `bench`** (aish-vm。bench.rs): `kind` (fs か net) のプログラムを VM (`-snapshot`、`smp` 個の CPU、既定 1) で n 回
+  動かして op ごとのまんなかをとり、`prof on` にした回で /proc/ai/prof の part ごとの CPU の時間の割合と、時間の多い区間を出す
+  (net は op ごとに)。`against` で 2 つの aios のカーネルを、`linux` で同じプログラム (同じ libc の静的なもの) を手本の Linux
+  (test/linux-vm.sh の latest) の VM で動かして op ごとにくらべる。VM はどちらも QEMU の cortex-a72、同じ CPU の数、2 GiB
+  (`LINUX_CPU` と `LINUX_SMP`)。TCG (x86 の上で aarch64 をまねる) なので、本物の機械とは比がちがうことがある
+- **記録** (`record`): bench/KIND.jsonl に 1 回 1 行 (いつ、コミット (作業中なら dirty)、VM とホスト、aios と Linux の op ごとの値、
+  時間の比、op ごとの part と CPU を使った区間の 1 回あたりの µs) を足し、bench/KIND.md (表) を作りなおす。表には、いちばん
+  新しい記録の aios と Linux と比、前の記録 (同じ VM と量のもの) からの比、part、CPU を使っている区間、「直すところの候補」
+  (Linux より遅いもの、前の記録より 1 割より遅くなったもの)、これまでの値の並びが出る。記録はリポジトリに入れる
+  (コミットしてから測って記録し、記録をコミットする)。`bench` はいつも前の記録からの変わりかたを `since_last` に出し、
+  `show` で測らずに記録を見る
+- **/proc/ai/prof**: 区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。self_us は CPU を
+  使った時間で、眠っていた時間 (相手やディスクを待った: proc.rs の sched で CPU を手放してから戻るまで) は、いちばん内側の
+  区間の `wait_us` に分ける (往復の bench で、相手を待つ時間が read の時間に見えないように)。システムコールの区間は
+  syscall.rs の sys_span (sysfile、socket、epoll)、中は inet:* (tcp_send、tcp_recv、deliver、wake、syn、accept、close、udp_*)、
+  unix:* (send、recv、deliver)、file:pipe_*、proc:wakeup、それと vfs / extfs / vm / block / jbd2
+
+kernel.json の `bench` のあるもの (vfs、extfs、inet、socket、unix と spinlock、heap、smp) は、その速さを測るものがある。spinlock、heap、
+smp は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから取って返す、
+大きなロックを放して取りなおす、時計を読む (uptime_ns)、物理ページを 1 枚取って返す・1024 枚取ってから返す (kalloc) の 1 回の ns
+(10 万回の平均) を kmsg に出す。aish の `bench` はこれも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
 
 ### Linux と答えあわせ (sysdiff)
 

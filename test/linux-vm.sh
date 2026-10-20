@@ -9,6 +9,8 @@
 #   test/linux-vm.sh exec [latest|X.Y.Z] PROG [ARG...]
 #                                                 テストのプログラム (aarch64 の静的なもの) を nobody で動かして出力を出す。
 #                                                 /work は ext4、/tmp は tmpfs (たとえば pipeslots /work/.ps)
+# QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
+# cortex-a72 にする
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
 # 作るのに要るもの: aarch64-linux-gnu-gcc、make、flex、bison、bc、curl、xz。動かすのに qemu-system-aarch64、mkfs.ext4、debugfs
 set -e
@@ -134,7 +136,7 @@ boot() {
   # ext4 は aios のディスクと同じく 4 KiB のブロックで (小さなものの既定は 1 KiB)
   truncate -s 1G "$tmp/work.img"
   mkfs.ext4 -q -F -b 4096 -E root_owner=0:0 "$tmp/work.img"
-  timeout 1800 qemu-system-aarch64 -M virt -cpu max -m 2G -smp 1 -nographic -no-reboot \
+  timeout 1800 qemu-system-aarch64 -M virt -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot \
     -kernel "$image" -initrd "$tmp/initrd" -append "console=ttyAMA0 rdinit=/init quiet" \
     -drive file="$tmp/work.img",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
     > "$tmp/serial" 2>&1 || true

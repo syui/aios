@@ -885,6 +885,7 @@ fn add_creds(cred: Option<Cred>, u: &UnixRef, other: &UnixRef) -> Option<Cred> {
 /// MSG_DONTWAIT
 /// ctl は付帯データのバイト (読むのは sendmsg のはじめ: Linux の scm_send。SOCK_SEQPACKET はつながっているかを見てから)
 pub fn send(u: &UnixRef, src: Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64, nonblock: bool) -> R {
+    let _p = crate::prof::span("unix:send");
     let to = to.filter(|t| !t.is_empty());
     let mut it = Iter { src, at: 0 };
     let typ = u.borrow().typ;
@@ -973,6 +974,7 @@ fn stream_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: S
 
 /// 相手 (other) の行列にメッセージを入れる (stream)。相手が閉じたか読むのをやめていれば EPIPE、fd を受けないなら EPERM
 fn deliver(u: &UnixRef, other: &UnixRef, data: Vec<u8>, fds: Vec<FileRef>, cred: Option<Cred>, truesize: usize, oob: bool) -> Result<(), i64> {
+    let _p = crate::prof::span("unix:deliver");
     let bad = {
         let o = other.borrow();
         if o.dead || o.shutdown & RCV != 0 {
@@ -1155,6 +1157,7 @@ pub fn passcred(u: &UnixRef) -> bool {
 
 /// 受ける (recvfrom、recvmsg、read)。max は入れ物の大きさ
 pub fn recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Recv, i64> {
+    let _p = crate::prof::span("unix:recv");
     let typ = u.borrow().typ;
     match typ {
         SOCK_STREAM => stream_recv(u, max, flags, nonblock),
