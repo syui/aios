@@ -357,7 +357,12 @@ fn mem_text(m: &Value, nfiles: usize, nprocs: usize) -> String {
     let u = |v: &Value| v.as_u64().unwrap_or(0);
     let mut t = String::new();
     let r = &m["ram"];
-    t.push_str(&format!("ram        {} total, {} free (reclaim below {})\n", mib(u(&r["total"]) * pg), mib(u(&r["free"]) * pg), mib(u(&r["min_free"]) * pg)));
+    t.push_str(&format!("ram        {} total, {} free (reclaim below {})", mib(u(&r["total"]) * pg), mib(u(&r["free"]) * pg), mib(u(&r["min_free"]) * pg)));
+    // 空きの、いちばん大きな続いたかたまり (buddy の大きさごとの数から。カーネルのヒープはこれで足す)
+    if let Some((k, n)) = r["blocks"].as_array().and_then(|b| b.iter().enumerate().rev().find(|(_, n)| u(n) > 0)) {
+        t.push_str(&format!(", largest free run {} x {}", mib((pg << k) as u64), u(n)));
+    }
+    t.push('\n');
     let h = &m["kernel"]["heap"];
     t.push_str(&format!(
         "kernel     heap {} / {} used (peak {}, free {} in {} blocks, largest {}, fails {}), stacks {}\n",
@@ -859,6 +864,14 @@ mod tests {
         assert_eq!(t.matches("/usr/").count(), 3, "{}", t);
         assert!(t.contains("procs      rss / vsize\n       7"), "{}", t);
         assert_eq!(t.lines().count(), 13, "{}", t);
+        assert!(!t.contains("largest free run"), "{}", t);
+        // buddy (kalloc) のかたまりの数があるカーネル: いちばん大きなものとその数
+        let mut m = m;
+        m["ram"]["blocks"] = json!([1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 487]);
+        let t = mem_text(&m, 3, 2);
+        assert!(t.contains("(reclaim below 4.0 MiB), largest free run 4.0 MiB x 487\n"), "{}", t);
+        m["ram"]["blocks"] = json!([3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(mem_text(&m, 3, 2).contains("largest free run 8 KiB x 2\n"));
     }
 
     #[test]

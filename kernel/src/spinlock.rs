@@ -114,6 +114,35 @@ pub fn bench() {
         black_box(crate::timer::uptime_ns());
     }
     let clock = ns(cnt() - t0);
+    // 物理ページ (kalloc): 1 枚取ってすぐ返す (すぐまた取るもの)、1024 枚取ってから返す (大きなかたまりを分けて、
+    // まとめなおす)。どちらも 1 枚あたり
+    let t0 = cnt();
+    for _ in 0..n {
+        if let Some(p) = crate::kalloc::alloc_dirty() {
+            crate::kalloc::free(black_box(p));
+        }
+    }
+    let page = ns(cnt() - t0);
+    let t0 = cnt();
+    let mut got = 0;
+    for _ in 0..n / 1024 {
+        let mut head: *mut usize = core::ptr::null_mut();
+        for _ in 0..1024 {
+            let Some(p) = crate::kalloc::alloc_dirty() else { break };
+            unsafe { *(p as *mut usize) = head as usize };
+            head = p as *mut usize;
+            got += 1;
+        }
+        while !head.is_null() {
+            let next = unsafe { *head } as *mut usize;
+            crate::kalloc::free(head as *mut u8);
+            head = next;
+        }
+    }
+    let pages = (cnt() - t0) as f64 * 1e9 / crate::timer::freq() as f64 / got.max(1) as f64;
     let bkl = crate::smp::bench_bkl();
-    crate::println!("lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns", lock, heap, bkl, clock);
+    crate::println!(
+        "lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns, page alloc+free {:.1} ns, page 1024 alloc+free {:.1} ns",
+        lock, heap, bkl, clock, page, pages
+    );
 }

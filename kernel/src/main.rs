@@ -106,8 +106,8 @@ pub extern "C" fn kmain() -> ! {
             memlayout::set_ram(base as usize, size as usize);
         }
     }
-    kalloc::init();
-    heap::init();
+    let early = kalloc::init(heap::boot_extra());
+    heap::init(early);
     println!("kalloc: {} pages free", kalloc::nfree());
     println!("initrd: {} entries", initrd::count());
     dtb::summary();

@@ -28,8 +28,10 @@
 //               heap trace on|off  /proc/ai/heap に、ヒープをいま多く持っている場所 (呼び出しの番地) も出す
 //               heap check    ヒープの空きの管理 (tlsf) の決まりを確かめて kmsg に (heap: check ok / FAILED)
 //               heap hog N    N MiB をわざと取って持っておく (足りなくなったときの道: 足す、捨てる、ENOMEM。0 で返す)
+//               page cycle    空いている物理ページを (少し残して) みな取ってから返す (RAM をひととおり使ったあとの様子)
+//               page check    物理ページの空き (buddy: kalloc.rs) の決まりを確かめて kmsg に (page: check ok / FAILED)
 //               prof on|off   カーネルの中の区間 (prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
-//               lockbench     スピンロック、ヒープ、大きなロック、時計の 1 回の時間を kmsg に (spinlock::bench)
+//               lockbench     スピンロック、ヒープ、大きなロック、時計、物理ページの 1 回の時間を kmsg に (spinlock::bench)
 //               fail pid N|name NAME sys NR|all ERRNO [TIMES]  そのプロセスのシステムコール (番号か名前か、みな) を、
 //                             動かさずに -ERRNO に (TIMES 回。既定 1)。fail ... heap [TIMES] はカーネルのヒープの alloc を
 //                             耐えるところで (ENOMEM)、fail ... oom [TIMES] は耐えないところで (予備と oom.rs)、
@@ -116,13 +118,17 @@ pub fn mem_json() -> String {
     }
     procs.sort_by_key(|x| core::cmp::Reverse(x.2));
     procs.truncate(10);
+    // 空きページの、大きさ (2^k ページ) ごとのかたまりの数 (buddy: kalloc.rs) と、まだまとめていない 1 枚ずつのもの
+    let (blocks, hot) = crate::kalloc::orders();
     let procs: alloc::vec::Vec<String> = procs.iter().map(|(pid, name, rss, vs)| format!("{{\"pid\":{},\"name\":\"{}\",\"rss\":{},\"vsize\":{}}}", pid, esc(name), rss, vs)).collect();
     format!(
-        "{{\"page\":{},\"ram\":{{\"total\":{},\"free\":{},\"min_free\":{}}},\"kernel\":{{\"heap\":{{\"size\":{},\"used\":{},\"peak\":{},\"free\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{}}},\"stacks\":{}}},\"page_cache\":{},\"shared\":{{\"pages\":{},\"dirty\":{}}},\"tmpfs\":{{\"pages\":{},\"limit\":{},\"inodes\":{},\"inodes_limit\":{}}},\"swap\":{{\"total\":{},\"used\":{},\"in\":{},\"out\":{}}},\"faults\":{{\"all\":{},\"fast\":{}}},\"procs\":[{}]}}\n",
+        "{{\"page\":{},\"ram\":{{\"total\":{},\"free\":{},\"min_free\":{},\"blocks\":[{}],\"hot\":{}}},\"kernel\":{{\"heap\":{{\"size\":{},\"used\":{},\"peak\":{},\"free\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{}}},\"stacks\":{}}},\"page_cache\":{},\"shared\":{{\"pages\":{},\"dirty\":{}}},\"tmpfs\":{{\"pages\":{},\"limit\":{},\"inodes\":{},\"inodes_limit\":{}}},\"swap\":{{\"total\":{},\"used\":{},\"in\":{},\"out\":{}}},\"faults\":{{\"all\":{},\"fast\":{}}},\"procs\":[{}]}}\n",
         pg,
         crate::memlayout::ram_size() / pg,
         crate::kalloc::nfree(),
         crate::sysctl::MIN_FREE_PAGES.load(Relaxed),
+        blocks.iter().map(|n| format!("{}", n)).collect::<alloc::vec::Vec<_>>().join(","),
+        hot,
         hsize,
         hused,
         hpeak,
@@ -199,7 +205,7 @@ pub fn fs_json() -> String {
     )
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nheap hog N\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nheap hog N\npage cycle\npage check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -221,6 +227,11 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
             crate::heap::hog(arg[4..].trim().parse::<usize>().map_err(|_| -EINVAL)?);
         }
         "heap" if arg == "check" => crate::heap::check(),
+        "page" if arg == "cycle" => {
+            let n = crate::kalloc::cycle();
+            crate::println!("page cycle: {} pages taken and given back ({} free)", n, crate::kalloc::nfree());
+        }
+        "page" if arg == "check" => crate::kalloc::check(),
         "prof" if arg == "on" || arg == "off" => crate::prof::set(arg == "on"),
         "lockbench" => crate::spinlock::bench(),
         "trace" => crate::trace::ctl(arg)?,

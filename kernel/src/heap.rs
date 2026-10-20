@@ -176,10 +176,11 @@ static HEAP: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
 
 // ---- 足りないとき ----
 // ふつうの道 (HEAP の TLSF) で取れなければ、順に:
-//   1. 足す (grow): まだだれも使っていない続いたページ (kalloc::take_contiguous) を区画として足す (GROW_CHUNK ずつ。
-//      上限は RAM の 1/4: max_total)。たいていはこれで足りる。前は起動のときに決めた大きさ (RAM の 1/32) で、
-//      それを使いきると panic だった
-//   2. 捨てる (shrink): だれも写していないページキャッシュのページを捨てる (表の分がヒープに戻り、ページは kalloc へ)
+//   1. 足す (grow): 続いた空きページ (kalloc::take_contiguous。buddy なので、返ってきたページもまとめなおしてある)
+//      を区画として足す (GROW_CHUNK ずつ。上限は RAM の 1/4: max_total)。たいていはこれで足りる。前は起動のときに
+//      決めた大きさ (RAM の 1/32) で、それを使いきると panic だった
+//   2. 捨てる (shrink): だれも写していないページキャッシュのページを捨てる (表の分がヒープに戻り、ページは kalloc へ。
+//      そこでまとまって続いた空きができるかもしれないので、もう一度足しにいく)
 //   3. それでもなければ、耐えるところ (heap::fallible の区間の中: read/write の入れ物など、取れなければ ENOMEM を
 //      返せるところ) には null (Vec::try_reserve が Err になる)
 //   4. 耐えないところ (Vec::push など。Rust の既定は null で panic) には予備 (RESERVE) から渡して EMERGENCY を立てる。
@@ -219,20 +220,21 @@ fn max_total() -> usize {
 /// bss の 32 MiB に、メモリが多ければ (1/32 が 32 MiB をこえる分) まだ使っていないページの続いたかたまりを足す
 /// (ページキャッシュの表、tmpfs、プロセスの地図などがメモリに比例してふえるので、決まった大きさでは
 /// 大きなビルドで足りなくなった。2 GiB で 64 MiB、16 GiB で 512 MiB。足りなくなれば動かしたまま足す: grow)。
-/// 予備 (RESERVE) もここで。kalloc::init のあとで
-pub fn init() {
+/// 予備 (RESERVE) もここで。足す分 (boot_extra) は kalloc::init がカーネルのすぐうしろから切り出したもの (p)
+pub fn init(p: Option<*mut u8>) {
     unsafe {
         HEAP.lock().add_region((&raw mut AREA) as *mut u8, HEAP_SIZE);
         RESERVE.lock().add_region((&raw mut RESERVE_AREA) as *mut u8, RESERVE_SIZE);
     }
-    let want = (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, 512 * 1024 * 1024);
-    let extra = want - HEAP_SIZE;
-    if extra == 0 {
-        return;
-    }
-    let Some(p) = crate::kalloc::take_contiguous(extra) else { return };
-    unsafe { HEAP.lock().add_region(p as *mut u8, extra) };
-    TOTAL.store(want, Relaxed);
+    let extra = boot_extra();
+    let Some(p) = p.filter(|_| extra > 0) else { return };
+    unsafe { HEAP.lock().add_region(p, extra) };
+    TOTAL.store(HEAP_SIZE + extra, Relaxed);
+}
+
+/// 起動のときに bss の分に足すバイト (RAM の 1/32 が 32 MiB をこえる分。512 MiB まで)
+pub fn boot_extra() -> usize {
+    (crate::memlayout::ram_size() / 32).clamp(HEAP_SIZE, 512 * 1024 * 1024) - HEAP_SIZE
 }
 
 fn round(n: usize) -> usize {
@@ -295,7 +297,15 @@ fn reclaim(need: usize) -> bool {
         return false;
     }
     RECLAIMS.fetch_add(1, Relaxed);
-    let ok = grow(need) || crate::vm::shrink_cache_try(1024) > 0;
+    let ok = if grow(need) {
+        true
+    } else if crate::vm::shrink_cache_try(1024) > 0 {
+        // 捨てたページがまとまって、続いた空きができたかもしれない (できなくても、表の分はヒープに戻った)
+        grow(need);
+        true
+    } else {
+        false
+    };
     RECLAIMING[cpu].store(false, Relaxed);
     ok
 }

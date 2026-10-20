@@ -57,6 +57,8 @@ enum Node {
     Loadavg,
     Version,
     Vmstat,
+    /// /proc/buddyinfo (物理ページの空きの、大きさごとのかたまりの数: kalloc.rs)
+    Buddyinfo,
     Diskstats,
     /// /proc/sys の下のディレクトリ: sysctl の表の番号と、そのパスのはじめのいくつか
     SysDir(u16, u8),
@@ -159,6 +161,7 @@ impl ProcInode {
             Node::CpuInfo => 9,
             Node::StatAll => 13,
             Node::Vmstat => 30,
+            Node::Buddyinfo => 24,
             Node::Diskstats => 36,
             Node::Loadavg => 14,
             Node::Version => 15,
@@ -381,6 +384,7 @@ impl ProcInode {
             }
             Node::StatAll => stat_all(),
             Node::Diskstats => crate::block::proc_diskstats(),
+            Node::Buddyinfo => crate::kalloc::buddyinfo(),
             Node::Vmstat => {
                 use core::sync::atomic::Ordering::Relaxed;
                 // ページ (4 KiB) の数と、Linux の vmstat が読む数え (ないものは 0)
@@ -738,6 +742,7 @@ impl Inode for ProcInode {
             (Node::Root, "loadavg") => Node::Loadavg,
             (Node::Root, "version") => Node::Version,
             (Node::Root, "vmstat") => Node::Vmstat,
+            (Node::Root, "buddyinfo") => Node::Buddyinfo,
             (Node::Root, "diskstats") => Node::Diskstats,
             (Node::Root, "cmdline") => Node::KernelCmdline,
             (Node::Root, "cpuinfo") => Node::CpuInfo,
@@ -839,6 +844,7 @@ impl Inode for ProcInode {
                 add("loadavg".into(), Node::Loadavg);
                 add("version".into(), Node::Version);
                 add("vmstat".into(), Node::Vmstat);
+                add("buddyinfo".into(), Node::Buddyinfo);
                 add("diskstats".into(), Node::Diskstats);
                 add("cmdline".into(), Node::KernelCmdline);
                 add("cpuinfo".into(), Node::CpuInfo);
