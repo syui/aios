@@ -493,6 +493,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
         KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),
+        // tkill / tgkill: 番号が 0 以下なら EINVAL (Linux)
+        TKILL if int(a[0]) <= 0 => Err(-EINVAL),
+        TGKILL if int(a[0]) <= 0 || int(a[1]) <= 0 => Err(-EINVAL),
         TKILL => crate::ns::arg_pid(int(a[0])).and_then(|t| signal::tgkill(0, t as u32, a[1] as i32)),
         TGKILL => crate::ns::arg_pid(int(a[0])).and_then(|g| Ok((g, crate::ns::arg_pid(int(a[1]))?))).and_then(|(g, t)| signal::tgkill(g as u32, t as u32, a[2] as i32)),
         RT_SIGSUSPEND => signal::rt_sigsuspend(a[0] as usize),
@@ -534,6 +537,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETFSGID => cred::setfsgid(a[0]),
         GETGROUPS => cred::getgroups(a[0] as usize, a[1] as usize),
         SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
+        // 負の pgid は、番号をしらべる前に EINVAL (Linux の setpgid)
+        SETPGID if int(a[1]) < 0 => Err(-EINVAL),
         SETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| Ok((p, crate::ns::arg_pid(int(a[1]))?))).and_then(|(p, g)| signal::setpgid(p as u32, g as u32)),
         SETSID => signal::setsid().map(|s| crate::ns::local_or_0(s as u32) as i64),
         UMASK => {
@@ -1492,7 +1497,12 @@ fn sys_execve(path: usize, argv: usize, envp: usize) -> R {
 }
 
 fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
-    let (pid, xstatus) = proc::wait(pid, options | proc::WEXITED)?;
+    // Linux の kernel_wait4: 知らない options は EINVAL (WNOHANG、WUNTRACED、WCONTINUED、__WNOTHREAD、__WCLONE、__WALL だけ)
+    const ALLOWED: u64 = 1 | 2 | 8 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    if options & !ALLOWED != 0 {
+        return Err(-EINVAL);
+    }
+    let (pid, xstatus) = proc::wait(pid, (options & (1 | 2 | 8)) | proc::WEXITED)?;
     if status != 0 && pid != 0 {
         out(status, &xstatus.to_le_bytes())?;
     }
@@ -1584,12 +1594,18 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
     const WSTOPPED: u64 = 2;
     const WEXITED: u64 = 4;
     const WCONTINUED: u64 = 8;
+    // Linux の kernel_waitid の順: 知らない options、WEXITED / WSTOPPED / WCONTINUED のどれもない、idtype と id
+    const ALLOWED: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | proc::WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    if options & !ALLOWED != 0 {
+        return Err(-EINVAL);
+    }
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
         return Err(-EINVAL);
     }
     let pid = match idtype {
         P_ALL => -1,
         P_PID if id > 0 => crate::ns::arg_pid(id).map_err(|_| -10)?,
+        P_PGID if id < 0 => return Err(-EINVAL),
         P_PGID => if id == 0 { 0 } else { crate::ns::arg_pid(-id).map_err(|_| -10)? },
         P_PIDFD => pidfd_pid(id)? as i64,
         _ => return Err(-EINVAL),

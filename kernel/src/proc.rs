@@ -294,6 +294,8 @@ pub struct Proc {
     pub stopped: bool,
     pub stop_report: i32,
     pub cont_report: bool,
+    /// fork してから exec した (Linux の PF_FORKNOEXEC が消えた): 親はもう setpgid で動かせない (EACCES)
+    pub execed: bool,
     /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
     pub utime: u64,
     /// 最近走った tick (走るたびに 1 足し、1 秒ごとに半分にする)。少ないものから走らせる
@@ -380,6 +382,7 @@ impl Proc {
         stopped: false,
         stop_report: 0,
         cont_report: false,
+        execed: false,
         utime: 0,
         start: 0,
         pid_ns: None,
@@ -455,6 +458,7 @@ impl Proc {
     }
 
     fn load_image(&mut self, img: Image) {
+        self.execed = true;
         self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
@@ -1484,10 +1488,10 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     let (my_tgid, my_pgid) = (me.tgid, me.pgid);
     loop {
         let mut have = false;
-        for c in live() {
-            if c.state == State::Unused || c.thread || c.ppid != my_tgid {
-                continue;
-            }
+        // Linux と同じく古い子から (子の並びは fork した順。番号はふえるだけなので番号の順)
+        let mut kids: Vec<&'static mut Proc> = live().filter(|c| c.state != State::Unused && !c.thread && c.ppid == my_tgid).collect();
+        kids.sort_by_key(|c| c.pid);
+        for c in kids {
             let wanted = match pid {
                 p if p > 0 => c.pid as i64 == p,
                 0 => c.pgid == my_pgid,
@@ -1495,6 +1499,11 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 p => c.pgid as i64 == -p,
             };
             if !wanted {
+                continue;
+            }
+            // 終わった子 (ゾンビ) は、WEXITED で待つときだけ待つ相手 (WSTOPPED / WCONTINUED だけなら、ほかにいなければ ECHILD:
+            // Linux の wait_task_zombie)
+            if c.state == State::Zombie && options & WEXITED == 0 {
                 continue;
             }
             have = true;
@@ -1645,6 +1654,35 @@ pub fn all_leaders() -> Vec<u32> {
 
 pub fn all_leader_procs() -> Vec<&'static mut Proc> {
     live().filter(|p| p.state != State::Unused && p.state != State::Zombie && !p.thread).collect()
+}
+
+/// find_leader と同じだが、終わってまだ回収されていないもの (ゾンビ) も。Linux では回収されるまでいる (kill は 0、
+/// getpgid も答える、/proc/PID もある)
+pub fn find_leader_any(tgid: u32) -> Option<&'static mut Proc> {
+    live().find(|p| p.state != State::Unused && p.pid == tgid && !p.thread)
+}
+
+/// leaders_in_pgrp と同じだが、ゾンビも
+pub fn leaders_in_pgrp_any(pgid: u32) -> Vec<u32> {
+    live().filter(|p| p.state != State::Unused && !p.thread && p.pgid == pgid).map(|p| p.tgid).collect()
+}
+
+/// プロセスグループ pgid が孤児か (Linux の will_become_orphaned_pgrp): グループの中に、親がちがうグループで同じセッションの
+/// ものが 1 つもない。終わったもの (ゾンビ) と、親が init のものは数えない。孤児のグループには、端末からの止めるシグナル
+/// (SIGTSTP、SIGTTIN、SIGTTOU) の既定の動作をしない (だれも続けさせられないので)
+pub fn pgrp_orphaned(pgid: u32) -> bool {
+    for p in live() {
+        if p.state == State::Unused || p.state == State::Zombie || p.thread || p.pgid != pgid || p.ppid <= 1 {
+            continue;
+        }
+        if let Some(parent) = find_leader_any(p.ppid)
+            && parent.pgid != pgid
+            && parent.sid == p.sid
+        {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn leaders_in_pgrp(pgid: u32) -> Vec<u32> {

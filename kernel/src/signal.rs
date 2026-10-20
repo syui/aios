@@ -505,6 +505,10 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                     proc::die(sig)
                 }
                 Default::Stop => {
+                    // 孤児のプロセスグループでは、SIGSTOP のほかの止めるシグナルは捨てる (Linux の get_signal)
+                    if sig != SIGSTOP && proc::pgrp_orphaned(p.pgid) {
+                        continue;
+                    }
                     stop_group(p.tgid, sig);
                     proc::stop_while_stopped();
                     continue;
@@ -744,31 +748,34 @@ pub fn sigaltstack(ss: usize, old: usize) -> R {
     Ok(0)
 }
 
-/// kill(pid, sig): pid > 0 はそのプロセス、0 は自分のグループ、-1 は送れる全員、< -1 はグループ -pid
+/// kill(pid, sig): pid > 0 はそのプロセス、0 は自分のグループ、-1 は送れる全員、< -1 はグループ -pid。
+/// Linux の順: 相手がいなければ ESRCH、いればシグナルの番号 (EINVAL)、それから許可 (EPERM)
 pub fn kill(pid: i64, sig: i32) -> R {
-    if !(0..NSIG as i32).contains(&sig) {
-        return Err(-EINVAL);
-    }
+    let bad_sig = !(0..NSIG as i32).contains(&sig);
     let info = SigInfo::from(SI_USER);
+    // まだ回収されていないもの (ゾンビ) もいる: 送れて (0)、何も起きない (Linux と同じ)
     let targets: Vec<u32> = if pid > 0 {
         vec_of(pid as u32)
     } else if pid == 0 {
-        proc::leaders_in_pgrp(proc::current().pgid)
+        proc::leaders_in_pgrp_any(proc::current().pgid)
     } else if pid == -1 {
         // PID の namespace の中からは、中のものだけ
         proc::all_leaders().into_iter().filter(|&t| t != 1 && t != proc::current().tgid && crate::ns::to_local(t).is_some()).collect()
     } else {
-        proc::leaders_in_pgrp((-pid) as u32)
+        proc::leaders_in_pgrp_any((-pid) as u32)
     };
     let mut sent = 0;
     let mut denied = false;
     for tgid in targets {
-        let Some(leader) = proc::find_leader(tgid) else { continue };
+        let Some(leader) = proc::find_leader_any(tgid) else { continue };
+        if bad_sig {
+            return Err(-EINVAL);
+        }
         if !can_signal(leader) {
             denied = true;
             continue;
         }
-        if sig != 0 {
+        if sig != 0 && leader.state != proc::State::Zombie {
             send_group(tgid, sig, info)?;
         }
         sent += 1;
@@ -789,13 +796,15 @@ fn vec_of(t: u32) -> Vec<u32> {
 }
 
 /// tkill / tgkill: スレッドに送る (tgid が 0 なら確かめない)
+/// Linux の do_send_specific の順: スレッドがいなければ ESRCH、シグナルの番号 (EINVAL)、許可 (EPERM)。
+/// 番号が 0 以下なのは syscall.rs が先に EINVAL にする
 pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
-    if !(0..NSIG as i32).contains(&sig) {
-        return Err(-EINVAL);
-    }
     let t = proc::find_thread(tid).ok_or(-ESRCH)?;
     if tgid != 0 && t.tgid != tgid {
         return Err(-ESRCH);
+    }
+    if !(0..NSIG as i32).contains(&sig) {
+        return Err(-EINVAL);
     }
     if !can_signal(t) {
         return Err(-EPERM);
@@ -979,30 +988,50 @@ pub fn tick(now: u64) {
 
 // ---- プロセスグループとセッション ----
 
+/// setpgid(pid, pgid): Linux の順で (負の pgid は呼ぶ前に EINVAL: syscall.rs)。自分か自分の子 (まだ回収していないものも)
+/// でなければ ESRCH、子がちがうセッションなら EPERM、exec したあとの子は EACCES、セッションリーダーは EPERM、
+/// pgid が自分の番号でなければ、同じセッションにそのグループがなければ EPERM
 pub fn setpgid(pid: u32, pgid: u32) -> R {
-    let me = proc::current();
-    let target = if pid == 0 { me.tgid } else { pid };
+    const EACCES: i64 = 13;
+    let me = proc::current_leader();
+    let (my_tgid, my_sid) = (me.tgid, me.sid);
+    let target = if pid == 0 { my_tgid } else { pid };
     let pgid = if pgid == 0 { target } else { pgid };
-    let t = proc::find_leader(target).ok_or(-ESRCH)?;
-    if t.tgid != proc::current().tgid && t.ppid != proc::current().tgid {
-        return Err(-ESRCH);
+    let t = proc::find_leader_any(target).ok_or(-ESRCH)?;
+    if t.tgid != my_tgid {
+        if t.ppid != my_tgid {
+            return Err(-ESRCH);
+        }
+        if t.sid != my_sid {
+            return Err(-EPERM);
+        }
+        if t.execed {
+            return Err(-EACCES);
+        }
     }
     if t.sid == t.tgid {
         return Err(-EPERM); // セッションリーダーは動かせない
     }
+    if pgid != target && !proc::leaders_in_pgrp_any(pgid).into_iter().any(|g| proc::find_leader_any(g).is_some_and(|l| l.sid == my_sid)) {
+        return Err(-EPERM);
+    }
     for th in proc::threads_of(target) {
         th.pgid = pgid;
+    }
+    if let Some(l) = proc::find_leader_any(target) {
+        l.pgid = pgid;
     }
     Ok(0)
 }
 
+/// getpgid / getsid: まだ回収されていないもの (ゾンビ) も答える
 pub fn getpgid(pid: u32) -> R {
-    let t = if pid == 0 { proc::current_leader() } else { proc::find_leader(pid).ok_or(-ESRCH)? };
+    let t = if pid == 0 { proc::current_leader() } else { proc::find_leader_any(pid).ok_or(-ESRCH)? };
     Ok(t.pgid as i64)
 }
 
 pub fn getsid(pid: u32) -> R {
-    let t = if pid == 0 { proc::current_leader() } else { proc::find_leader(pid).ok_or(-ESRCH)? };
+    let t = if pid == 0 { proc::current_leader() } else { proc::find_leader_any(pid).ok_or(-ESRCH)? };
     Ok(t.sid as i64)
 }
 

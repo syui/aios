@@ -458,7 +458,8 @@ impl Inode for TmpInode {
         let (size, rdev) = match &*self.node.borrow() {
             Node::File(d) => (d.len() as u64, 0),
             Node::Symlink(t) => (t.len() as u64, 0),
-            Node::Dir(m) => (m.len() as u64, 0),
+            // ディレクトリの大きさは Linux の tmpfs と同じ: . と .. で 40、名前ごとに 20 (BOGO_DIRENT_SIZE)
+            Node::Dir(m) => (40 + 20 * m.len() as u64, 0),
             Node::Dev(ma, mi) => (0, ((*ma as u64) << 8) | *mi as u64),
             Node::Fifo => (0, 0),
         };

@@ -18,7 +18,7 @@
   {"name": "console", "type": "core", "src": "src/console.rs", "what": "コンソール (PL011) の入力。行編集は tty の行規律がする"},
   {"name": "kmsg", "type": "core", "src": "src/kmsg.rs", "what": "カーネルのメッセージを覚えておく (Linux の dmesg と同じ。/proc/kmsg)"},
   {"name": "tty", "type": "core", "src": "src/tty.rs", "what": "端末 (tty) と行規律 (termios)。コンソールと疑似端末 (pty) で同じものを使う"},
-  {"name": "proc", "type": "core", "src": "src/proc.rs", "what": "プロセス・スレッドとスケジューラ"},
+  {"name": "proc", "type": "core", "src": "src/proc.rs", "what": "プロセス・スレッドとスケジューラ。wait (古い子から、ゾンビは WEXITED のときだけ待つ相手)、孤児のプロセスグループ、ゾンビは回収されるまでいる (kill は 0、/proc/PID は Z)"},
   {"name": "signal", "type": "core", "src": "src/signal.rs", "what": "シグナル: 送る、ためる、EL0 へ戻るときにハンドラを呼ぶ (Linux arm64 と同じ rt_sigframe)"},
   {"name": "syscall", "type": "core", "src": "src/syscall.rs", "what": "aarch64 Linux 互換のシステムコール"},
   {"name": "exec", "type": "core", "src": "src/exec.rs", "what": "ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る"},

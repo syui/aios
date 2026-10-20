@@ -44,7 +44,10 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/file.h>
+#include <poll.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
@@ -205,7 +208,9 @@ static const char *ename(int e) {
     switch (e) {
     case EPERM: return "EPERM";
     case ENOENT: return "ENOENT";
+    case ESRCH: return "ESRCH";
     case EINTR: return "EINTR";
+    case ECHILD: return "ECHILD";
     case EIO: return "EIO";
     case ENXIO: return "ENXIO";
     case EBADF: return "EBADF";
@@ -261,9 +266,9 @@ static const struct {
 static const struct {
     const char *name, *why;
 } linux_bugs[] = {
-    {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
-    {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。7.2.11 と 6.18: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
-    {"tmpfs-extend", "tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (7.2.11: shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする)。POSIX は、伸ばしたところは 0 と読めると決めている"},
+    {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11 と 7.3: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
+    {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。6.18、7.2.11、7.3: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
+    {"tmpfs-extend", "tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (7.2.11 と 7.3: shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする)。POSIX は、伸ばしたところは 0 と読めると決めている"},
 };
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
@@ -271,6 +276,8 @@ static int fallocated;
 
 // aios の中で動いているか (uname の sysname)。でなければ chosen のふるまいをまねる
 static int on_aios;
+// -r: 手本の Linux のまちがいをたださない (Linux がもう直ったかを見る: -r ありとなしの答えをくらべる)
+static int raw;
 
 static void ret(long r) {
     if (r < 0)
@@ -319,9 +326,9 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, NKIND};
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, FORK, KILL, WAIT, CHLDACT, SETPGID, GETPGID, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8};
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8, 4, 5, 5, 1, 2, 2};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -404,6 +411,26 @@ static const unsigned rltw[4] = {5, 5, 3, 1};
 static const int rlwv[] = {SEEK_SET, SEEK_CUR, SEEK_END, 7};
 static const char *const rlwn[] = {"SEEK_SET", "SEEK_CUR", "SEEK_END", "7"};
 static const unsigned rlww[4] = {8, 2, 2, 1};
+// プロセス: 子のふるまい (すぐ終わる、自分にシグナルを送って死ぬ、止まる、待つ)、終わりの番号、送るシグナル、
+// 待つときのシグナルの扱い (既定、無視、ハンドラ、ブロック)、グループ (そのまま、setpgid(0, 0)、setsid())
+static const char *const kbehn[] = {"exit", "raise", "stop", "pause"};
+static const unsigned kbehw[4] = {2, 2, 2, 5};
+static const int kcodes[] = {0, 1, 3, 255};
+static const int ksigs[] = {0, SIGTERM, SIGKILL, SIGSTOP, SIGCONT, SIGUSR1, SIGINT, SIGTSTP, SIGCHLD, SIGHUP, SIGABRT, 65};
+static const unsigned ksigw[12] = {2, 5, 3, 5, 7, 4, 3, 4, 1, 2, 1, 1};
+// 待つ子が扱いを決めるシグナル (2 ビットずつ: 0 既定、1 無視、2 ハンドラ、3 ブロック)
+static const int kdisp[] = {SIGTERM, SIGUSR1, SIGINT, SIGTSTP};
+static const char *const kdispn[] = {"default", "ignore", "handle", "block"};
+static const char *const kgrpn[] = {"", ", setpgid", ", setsid"};
+// wait4 の options (いつも WNOHANG) と waitid の options (いつも WNOHANG)
+static const int w4opts[] = {0, WUNTRACED, WCONTINUED, WUNTRACED | WCONTINUED, 0x10, __WALL};
+static const char *const w4optn[] = {"WNOHANG", "WNOHANG|WUNTRACED", "WNOHANG|WCONTINUED", "WNOHANG|WUNTRACED|WCONTINUED", "WNOHANG|0x10", "WNOHANG|__WALL"};
+static const unsigned w4optw[6] = {3, 4, 4, 5, 1, 1};
+static const int wiopts[] = {WEXITED, WSTOPPED, WCONTINUED, WEXITED | WSTOPPED | WCONTINUED, WEXITED | WNOWAIT, WSTOPPED | WCONTINUED | WNOWAIT, 0};
+static const char *const wioptn[] = {"WNOHANG|WEXITED", "WNOHANG|WSTOPPED", "WNOHANG|WCONTINUED", "WNOHANG|WEXITED|WSTOPPED|WCONTINUED", "WNOHANG|WEXITED|WNOWAIT", "WNOHANG|WSTOPPED|WCONTINUED|WNOWAIT", "WNOHANG"};
+static const unsigned wioptw[7] = {4, 3, 4, 5, 2, 3, 1};
+// 待つ相手: その子、だれでも (-1 / P_ALL)、自分のグループ (0 / P_PGID 0)、その子のグループ、いない番号、waitid のだめな idtype
+static const unsigned wtgtw[6] = {8, 4, 2, 2, 1, 1};
 static const long long rlstarts[] = {0, 0, 0, 0, 1, 5, 100, 4096, 10000, -1};
 static const long long rllens[] = {0, 0, 0, 1, 10, 100, 4096, -1, -10};
 static const int dupmin[] = {0, 3, 5, 10, 100};
@@ -492,6 +519,16 @@ static int lastorig;
 // gensame が、同じファイルを別に開いたものを選べたか。lastlock は前のロックの op が使った fd を開いた op (取り合いになるよう、
 // 次はちがう open のものを多めに)
 static int lastsame, lastlock = -1;
+// fork した子 (FORK の op の番号) と、その子が自分のグループを作るか (1 setpgid、2 setsid)
+static int nkref, krefs[MAXOPS], kgrp[MAXOPS];
+
+// 子の ref (FORK の op の番号)。なければ -1 (いない番号で)。近いものほど選ばれやすく
+static int genkid(void) {
+    if (nkref == 0 || chance(5))
+        return -1;
+    return krefs[chance(60) ? nkref - 1 - (int)pick(nkref < 3 ? nkref : 3) : (int)pick(nkref)];
+}
+
 // 写した領域 (mmap の op の番号) と、できていそうか (fd が読めるふつうのファイルで、長さと位置がよい)。
 // exec では mres / mlen にその場所と長さ (外したら NULL)
 static int nmref, mrefs[MAXOPS], mlikely[MAXOPS];
@@ -727,6 +764,7 @@ static void gen(uint64_t seed, int n) {
     rs = seed;
     nref = 0;
     nmref = 0;
+    nkref = 0;
     lastlock = -1;
     nknown = 0;
     fallocated = 0;
@@ -754,6 +792,9 @@ static void gen(uint64_t seed, int n) {
             if (!any)
                 o->kind = PIPE;
         }
+        // 子を使う op は、まだ子がいなければたいてい fork に
+        if ((o->kind == KILL || o->kind == WAIT || o->kind == SETPGID || o->kind == GETPGID) && nkref == 0 && chance(80))
+            o->kind = FORK;
         // 写しを使う op は、まだ写しがなければたいてい mmap に
         if ((o->kind == MUNMAP || o->kind == MSYNC || o->kind == MREAD || o->kind == MWRITE) && nmref == 0 && chance(80))
             o->kind = MMAP;
@@ -1010,6 +1051,57 @@ static void gen(uint64_t seed, int n) {
             o->d2 = chance(85) ? genpipe2(2, o->fd) : genfd(&pipe);
             o->len = splens[pickw(splw, 8)];
             o->mode = pickw(spfw, 4);
+            break;
+        case FORK:
+            // 子のふるまい (x)、終わりの番号か自分に送るシグナル (y)、待つ子のシグナルの扱い (mode)、グループ (acc)
+            o->x = (int)pickw(kbehw, 4);
+            o->y = o->x == 0 ? (int)pick(4) : (int)(1 + pick(3));
+            for (int b = 0; b < 4; b++)
+                o->mode |= (unsigned)(chance(40) ? 0 : 1 + pick(3)) << (2 * b);
+            o->acc = o->x >= 2 && chance(45) ? (chance(50) ? 1u : 2u) : 0u;
+            kgrp[i] = (int)o->acc;
+            krefs[nkref++] = i;
+            break;
+        case KILL:
+            // その子 (x 0) か、その子のグループ (x 1: 自分のグループを作った子だけ) に、シグナル y。止まる子には
+            // SIGCONT を、待つ子には止めるシグナルを多めに (止まって、動いて、の知らせが出るように)
+            o->d1 = genkid();
+            o->x = o->d1 >= 0 && kgrp[o->d1] && chance(40);
+            o->y = (int)pickw(ksigw, 12);
+            if (o->d1 >= 0 && ops[o->d1].x == 2 && chance(45))
+                o->y = 4;
+            else if (o->d1 >= 0 && ops[o->d1].x == 3 && chance(25))
+                o->y = chance(50) ? 3 : 7;
+            break;
+        case WAIT:
+            // wait4 (x 0) か waitid (x 1)。相手 (y) と options (mode)
+            o->x = chance(50);
+            o->d1 = genkid();
+            o->y = (int)pickw(wtgtw, 6);
+            if (o->y == 3 && (o->d1 < 0 || !kgrp[o->d1]))
+                o->y = 0;
+            if (o->y == 5 && !o->x)
+                o->y = 4;
+            o->mode = o->x ? pickw(wioptw, 7) : pickw(w4optw, 6);
+            // 止まる子と待つ子は、止まった・動いたの知らせも見る
+            if (o->d1 >= 0 && ops[o->d1].x >= 2 && chance(40))
+                o->mode = o->x ? (chance(50) ? 3u : 5u) : 3u;
+            break;
+        case CHLDACT:
+            // 自分の SIGCHLD の扱い: x 0 既定、1 無視、2 ハンドラ。y: SA_NOCLDSTOP (1) と SA_NOCLDWAIT (2)
+            o->x = (int)pick(3);
+            o->y = chance(50) ? 0 : (int)(1 + pick(3));
+            break;
+        case SETPGID:
+            // setpgid(子か自分 (d1 -2), pgid): x 0 は 0、1 はその子の番号、2 はほかの子 (d2) の番号、3 は自分のグループ、4 は -1
+            o->d1 = chance(12) ? -2 : genkid();
+            o->x = (int)pick(5);
+            o->d2 = genkid();
+            break;
+        case GETPGID:
+            // getpgid (x 0) か getsid (x 1) を、子か自分 (d1 -2) に
+            o->d1 = chance(15) ? -2 : genkid();
+            o->x = chance(40);
             break;
         case FLOCK:
             // たいてい、同じファイルをほかにも開いているもの (取り合い)。なければ、そのファイルをもう一度開く op に
@@ -1324,6 +1416,186 @@ static void onsig(int s) {
     siglongjmp(jb, 1);
 }
 
+// プロセス: FORK の op ごとの子の番号 (fork できなければ 0)、同期のパイプの読む口 (800 から)、回収したか。
+// me は case のプロセス (op を動かすもの)、sess は case のセッションのリーダー (その親)
+static pid_t kpid[MAXOPS], me_pid, sess_pid;
+static int ksync[MAXOPS], kgone[MAXOPS];
+// 子の中で: ハンドラが書く同期のパイプの書く口
+static volatile int kfd = -1;
+
+static void khandler(int s) {
+    unsigned char c = (unsigned char)s;
+    ssize_t r = write(kfd, &c, 1);
+    (void)r;
+}
+
+static void chldhandler(int s) {
+    (void)s;
+}
+
+static const char *signame(int s) {
+    static char b[16];
+    static const char *const n[] = {"0", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU"};
+    if (s >= 0 && s < (int)(sizeof n / sizeof *n))
+        return n[s];
+    snprintf(b, sizeof b, "%d", s);
+    return b;
+}
+
+// 番号の名前: 子なら kN、case のプロセスなら me、そのセッションのリーダーなら sess、0 は 0、ほかは other
+static const char *pidname(long v) {
+    static char b[16];
+    if (v == 0)
+        return "0";
+    if (v == me_pid)
+        return "me";
+    if (v == sess_pid)
+        return "sess";
+    for (int i = 0; i < MAXOPS; i++)
+        if (kpid[i] && kpid[i] == v) {
+            snprintf(b, sizeof b, "k%d", i);
+            return b;
+        }
+    return "other";
+}
+
+// 子 (ref) の番号。いない (fork しなかった、できなかった) ならいない番号 (Linux の pid_max より大きい)
+static pid_t kidpid(int ref) {
+    return ref >= 0 && kpid[ref] ? kpid[ref] : 4000000;
+}
+
+// /proc/PID/stat の状態 (R、S、T、Z ...)。なければ X
+static char kstate(pid_t pid) {
+    char p[64], b[512];
+    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 'X';
+    ssize_t n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0)
+        return 'X';
+    b[n] = 0;
+    char *q = strrchr(b, ')');
+    return q && q[1] == ' ' ? q[2] : '?';
+}
+
+// 子が落ちつくまで (眠っている、止まっている、ゾンビ、もういない が 3 ms あけて 3 回つづく。3 秒まで) 待つ。その状態
+static char settle(pid_t pid) {
+    char last = 0;
+    int same = 0;
+    for (int k = 0; k < 1000; k++) {
+        char st = kstate(pid);
+        if (st == 'S' || st == 'T' || st == 't' || st == 'Z' || st == 'X') {
+            same = st == last ? same + 1 : 0;
+            if (same >= 2)
+                return st;
+        } else
+            same = 0;
+        last = st;
+        usleep(3000);
+    }
+    return last;
+}
+
+// 状態の名前と、子のハンドラが受けとったシグナル (同期のパイプにたまったもの)
+static void saykid(int ref, char st) {
+    say(" (%s", st == 'S' ? "sleeping" : st == 'T' || st == 't' ? "stopped" : st == 'Z' ? "zombie" : st == 'X' ? "gone" : "?");
+    if (ref >= 0 && ksync[ref] >= 0) {
+        unsigned char c[64];
+        ssize_t n = read(ksync[ref], c, sizeof c);
+        for (ssize_t k = 0; k < n; k++)
+            if (c[k] != 'r')
+                say("%s%s", k ? "," : ", handled ", signame(c[k]));
+    }
+    say(")");
+}
+
+// 子の中: ふるまいのとおりにして、終わらない (待つ子と止まる子はシグナルを待ちつづける)
+static void kidmain(const struct op *o, int wfd) {
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    int nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) {
+        dup2(nul, 1);
+        dup2(nul, 2);
+        if (nul > 2)
+            close(nul);
+    }
+    kfd = wfd;
+    if (o->acc == 1)
+        setpgid(0, 0);
+    else if (o->acc == 2)
+        setsid();
+    switch (o->x) {
+    case 0:
+        _exit(kcodes[o->y]);
+    case 1: {
+        static const int rs[] = {0, SIGTERM, SIGKILL, SIGABRT};
+        signal(rs[o->y], SIG_DFL);
+        raise(rs[o->y]);
+        _exit(99);
+    }
+    case 2:
+        raise(SIGSTOP);
+        for (;;)
+            pause();
+    default: {
+        sigset_t blk;
+        sigemptyset(&blk);
+        for (int b = 0; b < 4; b++) {
+            unsigned d = (o->mode >> (2 * b)) & 3;
+            if (d == 1)
+                signal(kdisp[b], SIG_IGN);
+            else if (d == 2) {
+                struct sigaction sa;
+                memset(&sa, 0, sizeof sa);
+                sa.sa_handler = khandler;
+                sigaction(kdisp[b], &sa, NULL);
+            } else if (d == 3)
+                sigaddset(&blk, kdisp[b]);
+        }
+        sigprocmask(SIG_BLOCK, &blk, NULL);
+        unsigned char r = 'r';
+        if (write(wfd, &r, 1) != 1)
+            _exit(98);
+        for (;;)
+            pause();
+    }
+    }
+}
+
+// case の終わり: のこっている子をみな SIGKILL で終わらせて回収する
+static void reapkids(void) {
+    signal(SIGCHLD, SIG_DFL);
+    for (int i = 0; i < MAXOPS; i++)
+        if (kpid[i] && !kgone[i]) {
+            kill(kpid[i], SIGKILL);
+            waitpid(kpid[i], NULL, 0);
+            kgone[i] = 1;
+        }
+}
+
+// wait4 の status
+static void saywst(int st) {
+    if (WIFEXITED(st))
+        say(" exit %d", WEXITSTATUS(st));
+    else if (WIFSIGNALED(st))
+        say(" signal %s%s", signame(WTERMSIG(st)), WCOREDUMP(st) ? " core" : "");
+    else if (WIFSTOPPED(st))
+        say(" stopped %s", signame(WSTOPSIG(st)));
+    else if (WIFCONTINUED(st))
+        say(" continued");
+    else
+        say(" status %#x", st);
+}
+
+// 回収した (終わった子を待って、WNOWAIT でなかった) 子に印
+static void markgone(pid_t pid) {
+    for (int i = 0; i < MAXOPS; i++)
+        if (kpid[i] == pid)
+            kgone[i] = 1;
+}
+
 // readv などの iovec: 全部で len バイトを形 (shapes) に分けて buf に並べる (bad の 2 つめはさわれないページ badpage)
 static void *badpage;
 static int mkiov(struct iovec *iov, int shape, unsigned char *buf, long long len) {
@@ -1417,10 +1689,12 @@ static long long wstart_of(const struct op *o, int fd, long long size) {
         if (o->off < 0)
             return cur;
         return (rwfs[o->rwf].v & 0x10) ? size : o->off;
+    // sendfile は書く口の位置に (O_APPEND なら終わりに)、copy_file_range と splice は位置をわたせばそこに
     case SENDFILE:
+        return cur;
     case COPYRANGE:
     case SPLICE:
-        return coffs[o->y] >= 0 ? coffs[o->y] : cur;
+        return (o->x & 2) && coffs[o->y] >= 0 ? coffs[o->y] : cur;
     default:
         return LLONG_MAX;
     }
@@ -1830,7 +2104,7 @@ static void exec(int i, const struct op *o) {
             if (r == 0)
                 r = syscall(SYS_fallocate, fd, m & FL_KEEP_SIZE, (off_t)o->off, (off_t)o->len);
         }
-        if (zb && !on_aios && r == 0)
+        if (zb && !on_aios && !raw && r == 0)
             syscall(SYS_fallocate, fd, FL_PUNCH_HOLE | FL_KEEP_SIZE, (off_t)o->off, (off_t)(st.st_size - o->off));
         ret(r);
         if (zt)
@@ -2106,7 +2380,7 @@ static void exec(int i, const struct op *o) {
         if (app && !on_aios)
             syscall(SYS_fcntl, fd, F_SETFL, fl0);
         int fixed = ef && r < 0 && e == EFAULT && wpos > (long long)st0.st_size;
-        if (fixed && !on_aios) {
+        if (fixed && !on_aios && !raw) {
             struct stat st1;
             if (fstat(fd, &st1) == 0 && st1.st_size > st0.st_size)
                 syscall(SYS_ftruncate, fd, (off_t)st0.st_size);
@@ -2145,6 +2419,144 @@ static void exec(int i, const struct op *o) {
             if (r2 > 0)
                 say(" h%08x", fnv(rbuf, r2));
         }
+        break;
+    }
+    case FORK: {
+        say("fork(%s", kbehn[o->x]);
+        if (o->x == 0)
+            say(" %d", kcodes[o->y]);
+        else if (o->x == 1) {
+            static const int rs[] = {0, SIGTERM, SIGKILL, SIGABRT};
+            say(" %s", signame(rs[o->y]));
+        } else if (o->x == 3)
+            for (int b = 0; b < 4; b++)
+                say("%s%s:%s", b ? " " : " ", signame(kdisp[b]) + 3, kdispn[(o->mode >> (2 * b)) & 3]);
+        say("%s)", kgrpn[o->acc]);
+        // 同期のパイプ (子のハンドラが受けとったシグナルを書く)。fd は 800 から (op の fd の番号を変えない)
+        int sp[2], rd = -1, wr = -1;
+        if (pipe2(sp, O_CLOEXEC) == 0) {
+            rd = (int)syscall(SYS_fcntl, sp[0], F_DUPFD_CLOEXEC, 800);
+            wr = (int)syscall(SYS_fcntl, sp[1], F_DUPFD_CLOEXEC, 800);
+            close(sp[0]);
+            close(sp[1]);
+        }
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (rd >= 0)
+                close(rd);
+            kidmain(o, wr);
+        }
+        if (wr >= 0)
+            close(wr);
+        if (pid < 0) {
+            ret(-1);
+            if (rd >= 0)
+                close(rd);
+            break;
+        }
+        kpid[i] = pid;
+        ksync[i] = rd;
+        say(" = k%d", i);
+        // 待つ子は、扱いを決めおえた印 (r) を待つ
+        if (o->x == 3 && rd >= 0) {
+            struct pollfd pf = {rd, POLLIN, 0};
+            if (poll(&pf, 1, 3000) == 1) {
+                unsigned char c;
+                if (read(rd, &c, 1) != 1)
+                    say(" (no ready)");
+            }
+        }
+        if (rd >= 0)
+            fcntl(rd, F_SETFL, O_NONBLOCK);
+        saykid(i, settle(pid));
+        break;
+    }
+    case KILL: {
+        pid_t pid = kidpid(o->d1);
+        int sig = ksigs[o->y];
+        say("kill(%s%s, %s)", o->x ? "-" : "", o->d1 >= 0 && kpid[o->d1] ? pidname(pid) : "none", signame(sig));
+        ret(syscall(SYS_kill, o->x ? -(long)pid : (long)pid, sig));
+        if (o->d1 >= 0 && kpid[o->d1] && !kgone[o->d1])
+            saykid(o->d1, settle(pid));
+        break;
+    }
+    case WAIT: {
+        pid_t kp = kidpid(o->d1);
+        long id = o->y == 0 ? kp : o->y == 1 ? -1 : o->y == 2 ? 0 : o->y == 3 ? -(long)kp : 4000000;
+        const char *idn = o->y == 0 ? (o->d1 >= 0 && kpid[o->d1] ? pidname(kp) : "none") : o->y == 1 ? "-1" : o->y == 2 ? "0" : o->y == 3 ? pidname(kp) : "bad";
+        if (!o->x) {
+            int st = 0x5a5a5a5a;
+            say("wait4(%s%s, %s)", o->y == 3 ? "-" : "", idn, w4optn[o->mode]);
+            r = syscall(SYS_wait4, id, &st, WNOHANG | w4opts[o->mode], NULL);
+            if (r < 0)
+                ret(r);
+            else if (r == 0)
+                say(" = 0");
+            else {
+                say(" = %s", pidname(r));
+                saywst(st);
+                if (WIFEXITED(st) || WIFSIGNALED(st))
+                    markgone((pid_t)r);
+            }
+        } else {
+            // waitid: P_PID、P_ALL、P_PGID (0 は自分のグループ)、P_PGID その子のグループ、P_PID いない番号、だめな idtype 7
+            int idtype = o->y == 0 || o->y == 4 ? P_PID : o->y == 1 ? P_ALL : o->y == 5 ? 7 : P_PGID;
+            long wid = o->y == 0 || o->y == 4 ? id : o->y == 1 ? 0 : o->y == 2 ? 0 : o->y == 3 ? kp : 0;
+            siginfo_t si;
+            memset(&si, 0x55, sizeof si);
+            say("waitid(%s, %s%s, %s)", idtype == P_PID ? "P_PID" : idtype == P_ALL ? "P_ALL" : idtype == P_PGID ? "P_PGID" : "7", o->y == 3 ? "" : "", o->y == 1 || o->y == 5 ? "0" : idn, wioptn[o->mode]);
+            r = syscall(SYS_waitid, idtype, wid, &si, WNOHANG | wiopts[o->mode], NULL);
+            ret(r);
+            if (r == 0) {
+                if (si.si_pid == 0)
+                    say(" {signo %d, code %d, status %d}", si.si_signo, si.si_code, si.si_status);
+                else {
+                    const char *cn = si.si_code == CLD_EXITED ? "CLD_EXITED" : si.si_code == CLD_KILLED ? "CLD_KILLED" : si.si_code == CLD_DUMPED ? "CLD_DUMPED" : si.si_code == CLD_STOPPED ? "CLD_STOPPED" : si.si_code == CLD_CONTINUED ? "CLD_CONTINUED" : "?";
+                    say(" {%s, %s, %s, ", signame(si.si_signo), cn, pidname(si.si_pid));
+                    say("uid %s, ", si.si_uid == getuid() ? "me" : "other");
+                    if (si.si_code == CLD_EXITED)
+                        say("status %d}", si.si_status);
+                    else
+                        say("status %s}", signame(si.si_status));
+                    if ((si.si_code == CLD_EXITED || si.si_code == CLD_KILLED || si.si_code == CLD_DUMPED) && !(wiopts[o->mode] & WNOWAIT))
+                        markgone(si.si_pid);
+                }
+            }
+        }
+        break;
+    }
+    case CHLDACT: {
+        static const char *const an[] = {"SIG_DFL", "SIG_IGN", "handler"};
+        static const char *const fn[] = {"0", "SA_NOCLDSTOP", "SA_NOCLDWAIT", "SA_NOCLDSTOP|SA_NOCLDWAIT"};
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = o->x == 0 ? SIG_DFL : o->x == 1 ? SIG_IGN : chldhandler;
+        sa.sa_flags = SA_RESTART | ((o->y & 1) ? SA_NOCLDSTOP : 0) | ((o->y & 2) ? SA_NOCLDWAIT : 0);
+        say("sigaction(SIGCHLD, %s, %s)", an[o->x], fn[o->y]);
+        ret(sigaction(SIGCHLD, &sa, NULL));
+        break;
+    }
+    case SETPGID: {
+        pid_t who = o->d1 == -2 ? 0 : kidpid(o->d1);
+        long pg = o->x == 0 ? 0 : o->x == 1 ? (long)who : o->x == 2 ? (long)kidpid(o->d2) : o->x == 3 ? (long)getpgrp() : -1;
+        if (o->x == 1 && o->d1 == -2)
+            pg = me_pid;
+        say("setpgid(%s, ", o->d1 == -2 ? "0" : o->d1 >= 0 && kpid[o->d1] ? pidname(who) : "none");
+        if (o->x == 2 && !(o->d2 >= 0 && kpid[o->d2]))
+            say("none)");
+        else
+            say("%s)", o->x == 4 ? "-1" : o->x == 3 ? (pg == me_pid ? "me" : "mygroup") : pidname(pg));
+        ret(syscall(SYS_setpgid, (long)who, pg));
+        break;
+    }
+    case GETPGID: {
+        pid_t who = o->d1 == -2 ? 0 : kidpid(o->d1);
+        say("%s(%s)", o->x ? "getsid" : "getpgid", o->d1 == -2 ? "0" : o->d1 >= 0 && kpid[o->d1] ? pidname(who) : "none");
+        r = syscall(o->x ? SYS_getsid : SYS_getpgid, (long)who);
+        if (r < 0)
+            ret(r);
+        else
+            say(" = %s", pidname(r));
         break;
     }
     case FLOCK:
@@ -2278,7 +2690,7 @@ static void exec(int i, const struct op *o) {
                 gend = wstart;
             if (gend > end0) {
                 say(" [linuxbug tmpfs-extend]");
-                if (!on_aios) {
+                if (!on_aios && !raw) {
                     static const unsigned char zeros[4096];
                     // 伸ばせた fd は書ける (O_APPEND は外して書き、もどす)
                     int fl = (int)syscall(SYS_fcntl, xfd, F_GETFL);
@@ -2431,6 +2843,32 @@ static void setup(void) {
 }
 
 static void child(const char *w, int n, const unsigned char *keep) {
+    // 自分のセッションを作り、op はその中の別のグループの子が動かす: 孤児のプロセスグループの決まり (止めるシグナルを
+    // 捨てるか) が、ロボットを動かすところ (端末、init) によらず同じになるように。子の終わりかたをそのまま伝える
+    setsid();
+    pid_t inner = fork();
+    if (inner > 0) {
+        int st = 0;
+        while (waitpid(inner, &st, 0) < 0 && errno == EINTR)
+            ;
+        if (WIFSIGNALED(st)) {
+            signal(WTERMSIG(st), SIG_DFL);
+            raise(WTERMSIG(st));
+        }
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 2);
+    }
+    if (inner < 0)
+        _exit(2);
+    setpgid(0, 0);
+    me_pid = getpid();
+    sess_pid = getppid();
+    memset(kpid, 0, sizeof kpid);
+    memset(kgone, 0, sizeof kgone);
+    for (int i = 0; i < MAXOPS; i++)
+        ksync[i] = -1;
+    // コアは作らない (作るかどうかで wait の status の印が変わる。作ると world に出る)
+    struct rlimit nocore = {0, 0};
+    setrlimit(RLIMIT_CORE, &nocore);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGBUS, onsig);
     signal(SIGSEGV, onsig);
@@ -2449,6 +2887,7 @@ static void child(const char *w, int n, const unsigned char *keep) {
             exec(i, &ops[i]);
     }
     alarm(0);
+    reapkids();
     if (chdir(w) != 0)
         _exit(2);
     say("world");
@@ -2526,12 +2965,16 @@ int main(int argc, char **argv) {
             printf("linuxbug %s %s\n", linux_bugs[i].name, linux_bugs[i].why);
         return 0;
     }
+    if (a < argc && !strcmp(argv[a], "-r")) {
+        raw = 1;
+        a++;
+    }
     if (a + 1 < argc && !strcmp(argv[a], "-n")) {
         n = atoi(argv[a + 1]);
         a += 2;
     }
     if (n < 1 || n > MAXOPS || argc - a < 2) {
-        fprintf(stderr, "usage: sysdiff [-n OPS] DIR SEED[:I,J,...]|FROM-TO|@FILE...\n       sysdiff -l\n");
+        fprintf(stderr, "usage: sysdiff [-r] [-n OPS] DIR SEED[:I,J,...]|FROM-TO|@FILE...\n       sysdiff -l\n");
         return 2;
     }
     char base[4096];

@@ -2066,6 +2066,11 @@ impl ExtFs {
             }
             let b = if run.1 == 0 { 0 } else { run.1 + (fb - run.0) };
             if b == 0 {
+                // 穴 (と未初期化のブロック): ディスクを読まない区間 (RWF_NOWAIT) なら、Linux と同じくキャッシュにないので
+                // ここまで (なければ EAGAIN)。写しの表の 0 のページで読めるものは、その前に vm::file_page が読んでいる
+                if crate::proc::noio_on() {
+                    return if done > 0 { Ok(done) } else { Err(-NOIO_EAGAIN) };
+                }
                 buf[done..done + n].fill(0);
             } else {
                 let mut fresh = 0;

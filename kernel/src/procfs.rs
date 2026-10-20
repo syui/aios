@@ -136,6 +136,11 @@ fn leader(pid: u32) -> Result<&'static mut Proc, i64> {
     proc::find_leader(pid).filter(|p| p.state != State::Zombie).ok_or(-ENOENT)
 }
 
+/// leader と同じだが、終わってまだ回収されていないもの (ゾンビ) も: /proc/PID と stat、status、comm はある (Linux と同じ)
+fn leader_any(pid: u32) -> Result<&'static mut Proc, i64> {
+    proc::find_leader_any(pid).ok_or(-ENOENT)
+}
+
 impl ProcInode {
     fn child(&self, node: Node) -> InodeRef {
         Rc::new(ProcInode { fs: self.fs, node })
@@ -319,11 +324,11 @@ impl ProcInode {
                 }
                 s
             }
-            Node::Stat(pid) => stat_line(leader(pid)?),
+            Node::Stat(pid) => stat_line(leader_any(pid)?),
             Node::Maps(pid) => leader(pid)?.mm().pt.maps_text(),
             Node::Stack(pid) => proc::stacks_text(leader(pid)?.tgid),
             Node::Status(pid) => {
-                let p = leader(pid)?;
+                let p = leader_any(pid)?;
                 let c = &p.cred;
                 let threads = proc::threads_of(p.tgid).len();
                 let (vsize, rss) = mem_of(p);
@@ -408,7 +413,7 @@ impl ProcInode {
                 format!("{} {} {} {}/{} {}\n", f(0), f(1), f(2), proc::nr_running(), total, proc::last_pid())
             }
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
-            Node::Comm(pid) => format!("{}\n", leader(pid)?.comm()),
+            Node::Comm(pid) => format!("{}\n", leader_any(pid)?.comm()),
             Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
             Node::TaskFile(pid, tid, k) => {
                 let t = thread(pid, tid)?;
@@ -781,7 +786,7 @@ impl Inode for ProcInode {
                 (j, false) => Node::SysDir(j as u16, d + 1),
             },
             // PID の namespace の中なら、中の番号 (ns.rs)
-            (Node::Root, _) => Node::Pid(leader(crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?)?.tgid),
+            (Node::Root, _) => Node::Pid(leader_any(crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),

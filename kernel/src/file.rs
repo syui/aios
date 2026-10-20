@@ -257,8 +257,9 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         Kind::PtyMaster(t) => tty::master_write(t, src, nonblock),
         Kind::PipeWrite(p) | Kind::PipeRw(p) => {
             let n = Pipe::write(p, src, nonblock)?;
-            // Linux の pipe_write は、書けたら時刻を変える
-            if n > 0 {
+            // 名前つきのパイプ (FIFO) は、書けたら時刻を変える (Linux の fifo_pipe_write)。pipe(2) のものは変えない
+            // (Linux 6.7 から: anon_pipe_write)
+            if n > 0 && p.fifo.load(core::sync::atomic::Ordering::Relaxed) {
                 p.touch();
             }
             Ok(n)
@@ -1369,9 +1370,11 @@ pub struct PipeCell {
     pub uid: core::sync::atomic::AtomicU32,
     pub gid: core::sync::atomic::AtomicU32,
     pub perm: core::sync::atomic::AtomicU32,
-    /// 時刻 (ns)。書くと変わり (Linux の pipe_write の file_update_time)、utimensat で決められる
+    /// 時刻 (ns)。FIFO は書くと変わり (Linux の fifo_pipe_write の file_update_time)、utimensat で決められる
     pub mtime: core::sync::atomic::AtomicU64,
     pub ctime: core::sync::atomic::AtomicU64,
+    /// 名前つきのパイプ (FIFO) のもの (sysfile::fifo_pipe)
+    pub fifo: core::sync::atomic::AtomicBool,
 }
 
 pub struct PipeGuard<'a> {
@@ -1385,7 +1388,7 @@ impl PipeCell {
         use core::sync::atomic::AtomicU64;
         let c = crate::cred::current();
         let t = crate::timer::epoch_ns();
-        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600), mtime: AtomicU64::new(t), ctime: AtomicU64::new(t) }
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600), mtime: AtomicU64::new(t), ctime: AtomicU64::new(t), fifo: core::sync::atomic::AtomicBool::new(false) }
     }
 
     /// 中身が変わった: mtime と ctime をいまに

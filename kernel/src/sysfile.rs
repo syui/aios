@@ -275,7 +275,7 @@ fn verify_area(f: &FileRef, len: usize) -> Result<(), i64> {
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
-    read_flags(fd, buf, len, 0, false)
+    read_flags(fd, buf, len, 0, false, len)
 }
 
 // preadv2 / pwritev2 の flags (RWF_*)。Linux 7.2 の kiocb_set_rw_flags と同じ決まり (rwf_check)
@@ -388,7 +388,22 @@ fn cached_inode(f: &FileRef) -> Option<InodeRef> {
 /// read の中身。flags は preadv2 の RWF_* (NOWAIT: ふつうのファイルはキャッシュになければ EAGAIN。そのときそのページを
 /// 読んでおく (Linux は先読みを出す) ので、次は読める。DONTCACHE: 新しく読んだものを残さない)。dontwait は readv の
 /// 2 つめからの入れ物 (パイプなら、1 つめに入った分で返る: Linux の pipe_read)
-fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool) -> R {
+/// RWF_NOWAIT の読みがキャッシュになくて EAGAIN になったとき (Linux の先読みのかわり): pos から len バイト (128 KiB まで)
+/// のページをみな読んでおく (次の NOWAIT で読める。ディスクでつながっていないページも)
+fn nowait_kick(ino: &InodeRef, pos: usize, len: usize) {
+    let mut one = [0u8; 1];
+    let end = pos.saturating_add(len.min(128 * 1024));
+    let mut p = pos;
+    while p < end {
+        if !matches!(file::read_sleepable(ino, p, &mut one), Ok(1)) {
+            break;
+        }
+        p = (p / 4096 + 1) * 4096;
+    }
+}
+
+/// ra: NOWAIT で読めなかったときに読んでおく長さ (readv / preadv2 は入れ物みなの長さ: Linux の先読みは頼まれた全部)
+fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: usize) -> R {
     const EAGAIN: i64 = 11;
     let f = file_of(fd)?;
     if f.borrow().readable() {
@@ -423,17 +438,7 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool) -> R 
                 let pos = f.borrow().offset;
                 let r = read_wrapped(flags, || file::read_opt(&f, &mut tmp, nowait));
                 if flags & RWF_NOWAIT != 0 && r == Err(-EAGAIN) {
-                    // Linux の先読みのかわり: 読もうとしたところ (128 KiB まで) のページをみな読んでおく (次の NOWAIT で
-                    // 読める。ディスクでつながっていないページも)
-                    let mut one = [0u8; 1];
-                    let end = pos.saturating_add(len.min(128 * 1024));
-                    let mut p = pos;
-                    while p < end {
-                        if !matches!(file::read_sleepable(ino, p, &mut one), Ok(1)) {
-                            break;
-                        }
-                        p = (p / 4096 + 1) * 4096;
-                    }
+                    nowait_kick(ino, pos, ra.max(len) - done);
                 }
                 r
             }
@@ -546,11 +551,11 @@ fn inode_path(f: &FileRef) -> Option<(InodeRef, String)> {
 }
 
 pub fn pread(fd: u64, buf: usize, len: usize, off: i64) -> R {
-    pread_flags(fd, buf, len, off, 0)
+    pread_flags(fd, buf, len, off, 0, len)
 }
 
 /// pread の中身 (flags は read_flags と同じ)
-fn pread_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
+fn pread_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32, ra: usize) -> R {
     const EAGAIN: i64 = 11;
     let f = positional(fd, off, false)?;
     let ino = inode_path(&f);
@@ -566,10 +571,9 @@ fn pread_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
         let r = match &ino {
             Some((i, _)) if i.page_cacheable() => {
                 let r = read_wrapped(flags, || file::read_sleepable(i, pos, &mut tmp));
-                // NOWAIT でキャッシュになかった: そのページを読んでおいて (Linux の先読みのかわり)、EAGAIN
+                // NOWAIT でキャッシュになかった: 読もうとしたところを読んでおいて (Linux の先読みのかわり)、EAGAIN
                 if flags & RWF_NOWAIT != 0 && r == Err(-EAGAIN) {
-                    let mut one = [0u8; 1];
-                    let _ = file::read_sleepable(i, pos, &mut one);
+                    nowait_kick(i, pos, ra.max(len) - done);
                 }
                 r
             }
@@ -721,7 +725,7 @@ fn readv2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
         if len == 0 {
             continue;
         }
-        match read_flags(fd, base, len, flags, done > 0) {
+        match read_flags(fd, base, len, flags, done > 0, total - done) {
             Ok(n) => {
                 done += n as usize;
                 if (n as usize) < len {
@@ -799,7 +803,7 @@ pub fn preadv2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
         if len == 0 {
             continue;
         }
-        match pread_flags(fd, base, len, off + done as i64, flags) {
+        match pread_flags(fd, base, len, off + done as i64, flags, total - done) {
             Ok(n) => {
                 done += n as usize;
                 if (n as usize) < len {
@@ -2711,6 +2715,7 @@ fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<crate::file::PipeCell> {
         return p;
     }
     let p = Pipe::empty();
+    p.fifo.store(true, core::sync::atomic::Ordering::Relaxed);
     fifos.push((ino.id(), alloc::rc::Rc::downgrade(&p)));
     p
 }

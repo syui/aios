@@ -204,12 +204,22 @@ msync と、その写しの中の読み書き (mread / mwrite: MAP_SHARED と MA
 SIGBUS / SIGSEGV は受けて答えにする)、flock (LOCK_SH / LOCK_EX / LOCK_UN。いつも LOCK_NB) と fcntl のレコードロック
 (F_SETLK / F_GETLK / F_OFD_SETLK / F_OFD_GETLK: 種類、whence、始まりと長さ (負の長さも)、l_pid。同じファイルを別に開いた
 fd を多めに選び、なければそのファイルをもう一度開く op にして、取り合いが起きるように。F_GETLK の答えのうち pid は
-self / other / -1 で)) を、
+self / other / -1 で)、プロセスとシグナル (fork する子は、すぐ終わる、自分にシグナルを送って死ぬ、止まる、待つ (SIGTERM、
+SIGUSR1、SIGINT、SIGTSTP をそれぞれ既定 / 無視 / ハンドラ / ブロック。自分のグループやセッションを作ることも) のどれか。
+kill (その子か、そのグループに。シグナルの番号は 0 とだめなものも)、wait4 / waitid (いつも WNOHANG。相手はその子、だれでも、
+自分のグループ、その子のグループ、いない番号。options は WUNTRACED / WSTOPPED / WCONTINUED / WNOWAIT と知らないビット)、
+自分の SIGCHLD の扱い (SIG_DFL / SIG_IGN / ハンドラと SA_NOCLDSTOP / SA_NOCLDWAIT)、setpgid / getpgid / getsid。子の番号は
+kN、自分は me と出す)) を、
 はじめの木 (a、b/、b/c、d -> b) の上で動かし、答えを 1 行ずつ出す。並びは種だけで決まる (動かした答えによらない) ので、同じ
 種なら Linux でも aios でも同じシステムコールが同じ順に動き、2 つの出力の最初にちがう行がふるまいのちがいになる。答えは
 アーキテクチャによらない形 (フラグは名前、stat は種類と許可とリンクの数と大きさ、ino や時刻は出さない) で、x86_64 の Linux と
 aarch64 の aios でもくらべられる。手本は syzkaller (並びの作りかた。fd は前の op が開けたものを使う)、gVisor の syscall テスト
 (本物の Linux で動かしたものを答えにする)、Csmith と C-Reduce (答えくらべと、ちがいを小さくする)。
+プロセスの op は、子が落ちつくまで (/proc/PID/stat の状態が 眠っている・止まっている・ゾンビ・もういない で、3 回つづけて
+同じになるまで。待つ子は、シグナルの扱いを決めおえた印を同期のパイプで送ってから) 待ってから次へ進むので、子の動く速さに
+答えがよらない。子のハンドラが受けとったシグナルも同期のパイプで知る (handled)。case はそれぞれ自分のセッションを作り、op は
+その中の別のグループのプロセスが動かすので、孤児のプロセスグループの決まり (止めるシグナルを捨てるか) が、ロボットを動かす
+ところ (端末か init か) によらない。case の終わりには、のこった子をみな SIGKILL で終わらせて回収する。
 
 aish の `sysdiff` (aish-vm) が、手本の Linux と VM (`-snapshot`) の aios で動かし (どちらもふつうの人で: Linux は nobody、
 aios の中は ai。許可のしらべが同じになるように)、ちがいを (op、Linux の答え、aios の答え) でまとめ、多いものから、op を減らしても
@@ -271,6 +281,25 @@ pagecache_isize_extended と同じ。tmpfs でも: Linux の tmpfs はそのま�
 ETXTBSY (Linux と同じ。aipkg はふつうのファイルも先に外してから入れるので、動いているものは古い inode を使いつづける)。
 test/mmapcoh.c が、これを ext4 と tmpfs でじかに確かめる (Linux でも通る。tmpfs の「伸ばしたら 0」だけは Linux がちがう)。
 
+手本が Linux 7.3 になったとき (ext4 300 × 30 と 300 × 80、tmpfs 300 × 30 でどれもちがわない) は、手本のまちがい 3 つが
+7.3 にもまだあるかを確かめた (`sysdiff -r` は Linux の側でもただしをしないので、-r ありとなしの答えをくらべれば、そのまちがいが
+出る並びかが分かる。zero-range-eof はいまの並びではめったに出ず、ブロックにそろった ZERO_RANGE の小さな試しで見た)。
+
+プロセスとシグナルを覚えさせたとき (Linux 7.3 と、ext4 300 と 1000 × 30、300 × 80、tmpfs 300 × 30 と 300 × 80 でどれも
+ちがわない): はじめは 300 の case のうち 139 がちがった。いちばん多かったのは、aios が終わってまだ回収されていない子
+(ゾンビ) を /proc に出さず、kill も ESRCH にしていたこと (Linux は回収されるまでいる: /proc/PID の stat は Z、kill は 0、
+getpgid / getsid / setpgid も見つける)。ほかに、setpgid のしらべる順 (負の pgid は先に EINVAL、ちがうセッションの子は EPERM、
+exec したあとの子は EACCES、同じセッションにないグループへは EPERM)、wait4 / waitid の知らない options は EINVAL (waitid の
+負の P_PGID も)、WSTOPPED / WCONTINUED だけで待つときはゾンビを待つ相手にしない (ほかにいなければ ECHILD)、kill はまず相手を
+さがし (いなければ ESRCH)、それからシグナルの番号 (EINVAL)、tkill / tgkill の 0 以下の番号は EINVAL、待てる子が何人もいれば
+古い子から、孤児のプロセスグループ (setsid した子のように、グループの外の同じセッションに親がいない) には SIGTSTP / SIGTTIN /
+SIGTTOU の止める既定の動作をしない (SIGSTOP は止める)。長い並びでは、ほかのところのちがいも 3 つ出た: いくつもの入れ物の
+NOWAIT の読みで読めなかったときに、aios は最初の入れ物の分しか読んでおかなかった (Linux の先読みは頼まれた全部)、未初期化の
+extent や穴も NOWAIT ではキャッシュになければ EAGAIN (Linux のページキャッシュと同じ。読んでおいた 0 のページは fadvise
+DONTNEED で外れる)、pipe(2) のパイプは書いても時刻が変わらない (Linux 6.7 から。名前つきの FIFO は変わる)、tmpfs の
+ディレクトリの大きさは Linux と同じ 40 + 名前ごとに 20。test/procwait.c が、プロセスの決まり (ゾンビ、知らせの順、止まって
+動いた知らせ、SIGCHLD の扱い、孤児のグループ、setpgid、kill の順) をじかに確かめる (Linux 7.3 でも同じ答え)。
+
 ロック (flock と fcntl のレコードロック) を覚えさせたとき (ext4 300 × 30 と 200 × 80、tmpfs 300 × 30 でどれもちがわない): aios の
 レコードロックはそれまで仮のもの (かけるのはいつも成功、聞かれたら「だれもかけていない」) だったので、本物にした
 (kernel/src/locks.rs。Linux の fs/locks.c と同じ決まり): POSIX のロックの持ち主はプロセス (ファイルの表: スレッドは同じ)、
@@ -316,14 +345,15 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 
 手本の Linux にまちがい (書いてあるとおりに動かないところ) があれば、aios はそれに合わせない。test/sysdiff.c の
 `linux_bugs` に名前とわけを書き (`sysdiff -l` の `linuxbug` の行)、Linux で動かすときはそのあとでただして答えにする
-(`[linuxbug 名前]` がつき、aish の `sysdiff` は `linux_bugs` に数える)。Linux が直ったら消す。test/kernel-json.py が、この表と
+(`[linuxbug 名前]` がつき、aish の `sysdiff` は `linux_bugs` に数える)。Linux が直ったら消す (新しい版で `sysdiff -r` (ただしを
+しない) とふつうの答えが同じになれば、そのまちがいはもうない)。test/kernel-json.py が、この表と
 そろっているかを見る。
 
 | 名前 | Linux のまちがい | ロボットは Linux で |
 |---|---|---|
-| zero-range-eof | ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。6.18 にはない (delalloc でまだディスクにないブロックなら 7.2.11 でも 0 になる) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
-| efault-extend | ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 7.2.11 と 6.18 | なにも書けなかったのだから伸びない (aios はそう) |
-| tmpfs-extend | tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする) | 7.2.11 | POSIX は伸ばしたところは 0 と読めると決めている (ftruncate(2)、write(2))。伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までに 0 を書く (aios は ext4 でも tmpfs でも 0) |
+| zero-range-eof | ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。7.3 にもある。6.18 にはない (delalloc でまだディスクにないブロックなら 0 になる。ロボットの並びではめったに起きず、ブロックにそろった ZERO_RANGE を fsync と fadvise DONTNEED のあとにすると出る) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
+| efault-extend | ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 6.18、7.2.11、7.3 | なにも書けなかったのだから伸びない (aios はそう) |
+| tmpfs-extend | tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする) | 7.2.11 と 7.3 | POSIX は伸ばしたところは 0 と読めると決めている (ftruncate(2)、write(2))。伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までに 0 を書く (aios は ext4 でも tmpfs でも 0) |
 
 ## カーネルの中を見る (/proc/ai)
 

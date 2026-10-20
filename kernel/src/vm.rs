@@ -257,6 +257,14 @@ pub fn uncache(ino: &InodeRef, off: usize, len: usize) {
             kalloc::put(p.page);
         }
     }
+    drop(c);
+    // 穴の 0 のページも、だれも写していなければ (参照が表だけ)
+    let holes: Vec<FileKey> = shared_file().range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, s)| s.hole && kalloc::refs(s.page) <= 1).map(|(k, _)| *k).collect();
+    for k in holes {
+        if let Some(s) = shared_file().remove(&k) {
+            kalloc::put(s.page);
+        }
+    }
 }
 
 /// だれも写していないページを捨てる (n 枚まで)。捨てた数
@@ -436,6 +444,14 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     let key = file_key(ino, foff);
     if let Some(p) = cached_page(&key, ver) {
         return Some(p);
+    }
+    // ディスクを読まない区間 (RWF_NOWAIT): 写しの表にある (穴の 0 のページか、写しているページ) ものだけ。なければ、
+    // ファイルシステムがキャッシュにあるブロックだけで読む (read_cached の None。穴もキャッシュになければ EAGAIN: Linux は
+    // ページキャッシュにないページを NOWAIT で読まない)
+    if crate::proc::noio_on() {
+        let c = shared_file().get(&key)?;
+        kalloc::get(c.page);
+        return Some(c.page);
     }
     let t0 = crate::timer::uptime_ns();
     struct Miss(u64);
