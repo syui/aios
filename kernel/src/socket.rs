@@ -551,9 +551,9 @@ fn writable(iov: &[(usize, usize)], need: usize) -> bool {
 fn unix_recv(u: &UnixRef, iov: &[(usize, usize)], flags: u64, nonblock: bool) -> Result<crate::unix::Recv, i64> {
     let total = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
     let stream = u.borrow().typ == crate::unix::SOCK_STREAM;
-    if stream && flags & crate::unix::MSG_OOB == 0 && total > 0 && crate::unix::has_data(u) {
+    if stream && flags & crate::unix::MSG_OOB == 0 && total > 0 {
         let need = total.min(crate::unix::pending(u) as usize);
-        if !writable(iov, need) {
+        if need > 0 && !writable(iov, need) {
             return Err(-EFAULT);
         }
     }
@@ -1147,7 +1147,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
         let space = (m.control != 0).then_some(m.controllen);
         let cloexec = flags & crate::unix::MSG_CMSG_CLOEXEC != 0;
         let out = crate::unix::scm_out(&mut r, crate::unix::passcred(&u), space, cloexec);
-        for (off, b) in &out.writes {
+        for (off, b) in out.writes.iter().flatten() {
             pt.copy_out(m.control + off, b).ok_or(-EFAULT)?;
         }
         let mflags = r.flags | out.flags | (flags & crate::unix::MSG_CMSG_CLOEXEC) as u32;

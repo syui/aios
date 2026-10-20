@@ -3030,7 +3030,7 @@ fn socket_to_pipe(f: &FileRef, u: &crate::unix::UnixRef, pos: i64, p: &alloc::rc
     let sock_nb = f.borrow().flags & O_NONBLOCK != 0;
     let r = if u.borrow().typ == crate::unix::SOCK_STREAM {
         let nb = sock_nb || nonblock;
-        let peek = crate::unix::recv(u, room, MSG_PEEK, nb)?;
+        let peek = crate::unix::recv(u, room, MSG_PEEK | crate::unix::MSG_PARTS, nb)?;
         // 箱に入る分: メッセージごとに、その長さの 4 KiB の箱
         let (mut fit, mut left) = (0, free);
         for &n in &peek.parts {
@@ -3045,9 +3045,9 @@ fn socket_to_pipe(f: &FileRef, u: &crate::unix::UnixRef, pos: i64, p: &alloc::rc
         if fit == 0 {
             return Ok(0);
         }
-        crate::unix::recv(u, fit, 0, nb)?
+        crate::unix::recv(u, fit, crate::unix::MSG_PARTS, nb)?
     } else {
-        crate::unix::recv(u, room, 0, sock_nb)?
+        crate::unix::recv(u, room, crate::unix::MSG_PARTS, sock_nb)?
     };
     let mut done = 0;
     let mut at = 0;

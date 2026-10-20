@@ -363,7 +363,9 @@ unix_dgram_poll、パイプの pipe_poll: 書く口は読み手がいなけれ�
 (SO_OOBINLINE なし)、FIONREAD の数からも引く (Linux 7.3 の manage_oob は引かず、FIONREAD が 1 多いままになる)。
 test/unixsock.c が、ロボットの見ないプロセスをまたぐところ (待つ read / accept / poll / epoll、SO_RCVTIMEO、MSG_WAITALL、
 1 MiB の stream、fd を渡す、SO_PEERCRED、閉じたあと、SEQPACKET の区切り、dgram のいっぱいの行列と POLLOUT、gc) をじかに
-確かめる (Linux 7.3 でも同じ答え)。手本の Linux の設定 (test/linux.config) には NET と UNIX (AF_UNIX_OOB も) と INET を足した
+確かめる (Linux 7.3 でも同じ答え)。速さは前 (パイプ 2 本) と同じか速い (VM の中で、1 バイトの往復と fd を渡す往復は
+同じ、poll しながらの往復は 2 割、4 KiB と 64 KiB の書きこみの流しこみは 3 割速い): 読まれたときに送り手を起こすのは、入れ物が
+いっぱいで待っていたときだけ (Linux の sk_write_space)、1 回の読み書きでヒープを使うのは中身の分だけ。手本の Linux の設定 (test/linux.config) には NET と UNIX (AF_UNIX_OOB も) と INET を足した
 (設定が変われば test/linux-vm.sh が作りなおす)。
 
 #### aios がえらんだちがい

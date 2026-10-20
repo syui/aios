@@ -63,6 +63,8 @@ pub const MSG_TRUNC: u64 = 0x20;
 pub const MSG_WAITALL: u64 = 0x100;
 pub const MSG_NOSIGNAL: u64 = 0x4000;
 pub const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+/// カーネルの中だけのフラグ: Recv の parts (メッセージごとの長さ) を作る (splice でパイプに入れるとき)
+pub const MSG_PARTS: u64 = 1 << 62;
 
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
@@ -1121,7 +1123,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
 /// 読まれた・捨てたメッセージ: 送った口の wmem を返す。そちらが入れ物を待っていた (wmem が sndbuf をこえていた) か
 /// 書けなかった (POLLOUT なし) ときだけ起こす (Linux の sock_wfree と sk_write_space。返事を待って眠っている送り手を、
 /// 読まれるたびに起こさない)。fd はここで落ちる
-fn free(msgs: Vec<Msg>) {
+fn free(msgs: impl IntoIterator<Item = Msg>) {
     for mut m in msgs {
         if let Some(s) = m.sender.take() {
             let was_full = {
@@ -1154,7 +1156,8 @@ pub struct Recv {
     pub cred: Option<Cred>,
     /// msg_flags (MSG_TRUNC、MSG_OOB)
     pub flags: u32,
-    /// data のうちメッセージごとの長さ (splice でパイプに入れるとき、メッセージごとに箱を分ける: Linux の skb_splice_bits)
+    /// data のうちメッセージごとの長さ (MSG_PARTS のときだけ。splice でパイプに入れるとき、メッセージごとに箱を分ける:
+    /// Linux の skb_splice_bits)
     pub parts: Vec<usize>,
 }
 
@@ -1177,11 +1180,6 @@ fn sender_name(m: &Msg, me: &Unix, u: &UnixRef) -> Option<Vec<u8>> {
     let s = m.sender.as_ref()?;
     let a = if Rc::ptr_eq(s, u) { me.addr.clone() } else { s.borrow().addr.clone() };
     a.map(|a| (*a).clone())
-}
-
-/// いま読めるものがあるか (読む前に入れ物にさわれるかを見るため: stream はさわれなければ読まずに EFAULT)
-pub fn has_data(u: &UnixRef) -> bool {
-    u.borrow().q.iter().any(|m| m.len() > 0)
 }
 
 /// SO_PASSCRED か (付帯データに資格情報を入れる)
@@ -1260,7 +1258,9 @@ fn dgram_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Rec
         let size = max.min(len - skip);
         let mut out = Recv::new();
         out.data = m.data[m.used + skip..m.used + skip + size].to_vec();
-        out.parts.push(size);
+        if flags & MSG_PARTS != 0 {
+            out.parts.push(size);
+        }
         if size < len - skip {
             out.flags |= MSG_TRUNC as u32;
         }
@@ -1287,7 +1287,7 @@ fn dgram_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Rec
             s.peek_off = (s.peek_off - len as i32).max(0);
         }
         drop(s);
-        free(alloc::vec![m]);
+        free([m]);
         if was_full {
             notify(u);
         }
@@ -1295,8 +1295,37 @@ fn dgram_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Rec
     }
 }
 
+/// 読みおえて行列から外したメッセージ (借りるのをやめてから free する)。ふつうは 1 つなので、1 つめはヒープを使わない
+#[derive(Default)]
+struct Freed {
+    one: Option<Msg>,
+    more: Vec<Msg>,
+}
+
+impl Freed {
+    fn push(&mut self, m: Msg) {
+        if self.one.is_none() {
+            self.one = Some(m);
+        } else {
+            self.more.push(m);
+        }
+    }
+
+    fn take(&mut self) -> Freed {
+        core::mem::take(self)
+    }
+}
+
+impl IntoIterator for Freed {
+    type Item = Msg;
+    type IntoIter = core::iter::Chain<core::option::IntoIter<Msg>, alloc::vec::IntoIter<Msg>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.one.into_iter().chain(self.more)
+    }
+}
+
 /// MSG_OOB の印と、読みおえた長さ 0 のもの (Linux の manage_oob)。i は行列の頭。読むもの (なければ None)
-fn manage_oob(s: &mut Unix, mut i: usize, peek: bool, copied: bool, dropped: &mut Vec<Msg>) -> Option<usize> {
+fn manage_oob(s: &mut Unix, mut i: usize, peek: bool, copied: bool, dropped: &mut Freed) -> Option<usize> {
     let is_oob = |s: &Unix, i: usize| Some(s.q[i].id) == s.oob;
     if s.q[i].len() > 0 && !is_oob(s, i) {
         return Some(i);
@@ -1356,7 +1385,7 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
     let mut err = 0i64;
     // SO_PASSCRED なら、はじめのメッセージの資格情報を見せ、ちがう人のものはつなげない
     let mut creds: Option<Option<Cred>> = None;
-    let mut dropped: Vec<Msg> = Vec::new();
+    let mut dropped = Freed::default();
     'redo: loop {
         let mut skip = if peek { u.borrow().peek_off.max(0) as usize } else { 0 };
         loop {
@@ -1388,7 +1417,7 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                     }
                     let timeo = s.rcvtimeo;
                     drop(s);
-                    free(core::mem::take(&mut dropped));
+                    free(dropped.take());
                     if let Err(e) = wait(key(u), timeo) {
                         err = -e;
                         break 'redo;
@@ -1420,7 +1449,9 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                 let chunk = (m.len() - skip).min(size);
                 let from = m.used + skip;
                 out.data.extend_from_slice(&m.data[from..from + chunk]);
-                out.parts.push(chunk);
+                if flags & MSG_PARTS != 0 {
+                    out.parts.push(chunk);
+                }
                 size -= chunk;
                 if !peek {
                     if s.peek_off >= 0 {
@@ -1481,7 +1512,7 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
 /// 名前も付帯データもない。入れ物がなければ、読んだうえで EFAULT
 fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
     let peek = flags & MSG_PEEK != 0;
-    let mut dropped = Vec::new();
+    let mut dropped = Freed::default();
     let byte = {
         let mut s = u.borrow_mut();
         let id = match s.oob {
@@ -2114,25 +2145,24 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
 
 // ---- 受けた fd と資格情報を付帯データに (Linux の scm_recv_unix) ----
 
-/// 付帯データ: 入れ物の中のどこに何を書くか、使った長さ (msg_controllen に返すもの)、msg_flags (MSG_CTRUNC)
+/// 付帯データ: 入れ物の中のどこに何を書くか (資格情報と fd の 2 つまで)、使った長さ (msg_controllen に返すもの)、
+/// msg_flags (MSG_CTRUNC)
 pub struct ScmOut {
-    pub writes: Vec<(usize, Vec<u8>)>,
+    pub writes: [Option<(usize, Vec<u8>)>; 2],
     pub used: usize,
     pub flags: u32,
 }
 
-fn cmsg(level: i32, typ: i32, len: usize, data: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(16 + data.len());
-    b.extend_from_slice(&(len as u64).to_le_bytes());
-    b.extend_from_slice(&level.to_le_bytes());
-    b.extend_from_slice(&typ.to_le_bytes());
-    b.extend_from_slice(data);
-    b
+/// cmsghdr の頭 (cmsg_len、cmsg_level、cmsg_type) を b の先に書く
+fn cmsg_head(b: &mut [u8], len: usize, typ: i32) {
+    b[..8].copy_from_slice(&(len as u64).to_le_bytes());
+    b[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    b[12..16].copy_from_slice(&typ.to_le_bytes());
 }
 
 /// space は入れ物の長さ (msg_control が NULL なら None)。fd はこのプロセスの fd にする (入らなかったものは閉じる)
 pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool) -> ScmOut {
-    let mut out = ScmOut { writes: Vec::new(), used: 0, flags: 0 };
+    let mut out = ScmOut { writes: [None, None], used: 0, flags: 0 };
     let fds = core::mem::take(&mut r.fds);
     if !r.scm {
         return out;
@@ -2155,11 +2185,13 @@ pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool
             if left < full {
                 out.flags |= MSG_CTRUNC;
             }
-            let mut d = Vec::with_capacity(12);
-            d.extend_from_slice(&pid.to_le_bytes());
-            d.extend_from_slice(&uid.to_le_bytes());
-            d.extend_from_slice(&gid.to_le_bytes());
-            out.writes.push((out.used, cmsg(SOL_SOCKET, SCM_CREDENTIALS, cmlen, &d[..cmlen - 16])));
+            let mut b = alloc::vec![0u8; full];
+            cmsg_head(&mut b, cmlen, SCM_CREDENTIALS);
+            b[16..20].copy_from_slice(&pid.to_le_bytes());
+            b[20..24].copy_from_slice(&uid.to_le_bytes());
+            b[24..28].copy_from_slice(&gid.to_le_bytes());
+            b.truncate(cmlen);
+            out.writes[0] = Some((out.used, b));
             let step = 32.min(left);
             out.used += step;
             left -= step;
@@ -2168,24 +2200,23 @@ pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool
     // SCM_RIGHTS (Linux の scm_detach_fds: 入るだけ、fd の表がいっぱいならそこまで)
     if !fds.is_empty() {
         let fdmax = if left <= 16 { 0 } else { (left - 16) / 4 };
-        let mut nums = Vec::new();
+        let mut b = Vec::with_capacity(16 + 4 * fdmax.min(fds.len()));
+        b.resize(16, 0);
         let files = proc::current().files();
         for f in fds.iter().take(fdmax) {
             match files.add(f.clone(), cloexec, 0) {
-                Some(fd) => nums.push(fd as i32),
+                Some(fd) => b.extend_from_slice(&(fd as i32).to_le_bytes()),
                 None => break,
             }
         }
-        if !nums.is_empty() {
-            let mut d = Vec::with_capacity(nums.len() * 4);
-            for n in &nums {
-                d.extend_from_slice(&n.to_le_bytes());
-            }
-            out.writes.push((out.used, cmsg(SOL_SOCKET, SCM_RIGHTS, 16 + d.len(), &d)));
-            let step = ((16 + d.len() + 7) & !7).min(left);
-            out.used += step;
+        let n = (b.len() - 16) / 4;
+        if n > 0 {
+            let cmlen = b.len();
+            cmsg_head(&mut b, cmlen, SCM_RIGHTS);
+            out.writes[1] = Some((out.used, b));
+            out.used += ((cmlen + 7) & !7).min(left);
         }
-        if nums.len() < fds.len() || fdmax == 0 {
+        if n < fds.len() || fdmax == 0 {
             out.flags |= MSG_CTRUNC;
         }
     }
