@@ -29,6 +29,30 @@ const NET_OPS: &[(&str, &str)] = &[
     ("tcp_connect", "connect、accept、両方を閉じる (1 つのつながり)"),
 ];
 
+/// fs の op と、表に書く中身 (n は 1000、ディレクトリは ext4 の上)
+const FS_OPS: &[(&str, &str)] = &[
+    ("create", "空のファイルを O_CREAT|O_EXCL で作って閉じる"),
+    ("stat", "作ったばかりのファイルを名前で stat"),
+    ("stat-missing", "ないファイルを stat (ENOENT)"),
+    ("stat-missing-again", "同じないものをもう一度 (PATH や #include を探すときのように)"),
+    ("open-close", "あるファイルを開いて閉じる"),
+    ("write-4k", "小さなファイルに 4 KiB 書く"),
+    ("read-4k", "4 KiB 読む (ページキャッシュにある)"),
+    ("readdir", "1000 こ入ったディレクトリを読む"),
+    ("deep-stat", "10 段の深いパスの先を stat"),
+    ("rename", "名前を変える"),
+    ("unlink", "消す"),
+    ("mkdir-rmdir", "ディレクトリを作って消す"),
+    ("write-seq", "16 MiB を 64 KiB ずつ書いて fsync"),
+    ("read-seq", "16 MiB を 64 KiB ずつ読む (ページキャッシュにある)"),
+    ("write-fsync", "4 KiB 書いて fsync (ジャーナルの commit) を 50 回"),
+];
+
+/// op の中身 (表に書く)
+fn what(op: &str) -> &'static str {
+    NET_OPS.iter().chain(FS_OPS).find(|o| o.0 == op).map_or("", |o| o.1)
+}
+
 const BYTES: &str = "us: microseconds per operation (smaller is faster); mb_s: megabytes per second (bigger is faster)";
 
 pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
@@ -394,13 +418,15 @@ fn record_of(root: &Path, cfg: &Cfg, spec: &str, mine: &Value, linux: Option<&Va
     let mut hot = json!({});
     if let Some(p) = mine["prof"].as_object() {
         for (op, v) in p {
-            let top: Vec<Value> = v["parts"].as_array().map(|a| a.iter().take(3).map(|x| json!({ "part": x["part"], "pct": x["pct"] })).collect()).unwrap_or_default();
+            // fs は全部を 1 回 (all) なので多めに
+            let k = if op == "all" { 8 } else { 3 };
+            let top: Vec<Value> = v["parts"].as_array().map(|a| a.iter().take(k).map(|x| json!({ "part": x["part"], "pct": x["pct"] })).collect()).unwrap_or_default();
             parts[op.as_str()] = json!(top);
             let spans: Vec<Value> = v["spans"]
                 .as_array()
                 .map(|a| {
                     a.iter()
-                        .take(3)
+                        .take(k)
                         .map(|x| {
                             let c = x["count"].as_f64().unwrap_or(0.0).max(1.0);
                             json!({ "name": x["name"], "us": (x["self_us"].as_f64().unwrap_or(0.0) / c * 100.0).round() / 100.0, "count": x["count"] })
@@ -468,7 +494,7 @@ fn render_md(kind: &str, all: &[Value]) -> String {
     ));
     md.push_str(&format!("| op | aios | Linux {} | aios / Linux | 前の記録から | part (aios) | 中身 |\n|---|---|---|---|---|---|---|\n", if lv.is_empty() { "-" } else { lv }));
     let ops: Vec<String> = last["aios"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-    let mut order: Vec<String> = NET_OPS.iter().map(|o| o.0.to_string()).filter(|o| ops.contains(o)).collect();
+    let mut order: Vec<String> = NET_OPS.iter().chain(FS_OPS).map(|o| o.0.to_string()).filter(|o| ops.contains(o)).collect();
     order.extend(ops.iter().filter(|o| !order.contains(o)).cloned().collect::<Vec<_>>());
     for op in &order {
         let a = &last["aios"][op];
@@ -476,22 +502,25 @@ fn render_md(kind: &str, all: &[Value]) -> String {
         let ratio = last["ratio_linux"][op].as_f64().map_or("-".into(), |r| format!("{:.2}", r));
         let since = prev.map(|p| compare(&json!({ op.clone(): a.clone() }), &json!({ op.clone(): p["aios"][op].clone() }), "").1).and_then(|r| r[op.as_str()].as_f64()).map_or("-".into(), |r| format!("{:.2}", r));
         let parts = last["parts"][op].as_array().map(|v| v.iter().map(|x| format!("{} {}%", s(x, "part"), x["pct"].as_f64().unwrap_or(0.0).round())).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        let what = NET_OPS.iter().find(|o| o.0 == op).map_or("", |o| o.1);
-        md.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} |\n", op, cell(a), cell(l), ratio, since, parts, what));
+        md.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} |\n", op, cell(a), cell(l), ratio, since, parts, what(op)));
     }
-    // どこで CPU を使っているか (aios の区間の 1 回あたり)
-    if last["hot"].as_object().is_some_and(|h| !h.is_empty()) {
+    // どこで CPU を使っているか (aios の区間の 1 回あたり)。fs は全部を 1 回 (all)
+    let spans_of = |h: &Value| -> String { h.as_array().map(|h| h.iter().map(|x| format!("`{}` {:.1} µs × {}", s(x, "name"), x["us"].as_f64().unwrap_or(0.0), x["count"])).collect::<Vec<_>>().join("、")).unwrap_or_default() };
+    if last["hot"]["all"].is_array() {
+        let parts = last["parts"]["all"].as_array().map(|v| v.iter().map(|x| format!("{} {}%", s(x, "part"), x["pct"].as_f64().unwrap_or(0.0).round())).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        md.push_str(&format!("\n## part と CPU を使っている区間 (aios、全部の op を 1 回、1 回あたり)\n\n- part: {}\n- 区間: {}\n", parts, spans_of(&last["hot"]["all"])));
+    } else if last["hot"].as_object().is_some_and(|h| !h.is_empty()) {
         md.push_str("\n## CPU を使っている区間 (aios、op ごとに多いもの 3 つ、1 回あたり)\n\n");
         for op in &order {
-            let Some(h) = last["hot"][op].as_array().filter(|h| !h.is_empty()) else { continue };
-            let list: Vec<String> = h.iter().map(|x| format!("`{}` {:.1} µs × {}", s(x, "name"), x["us"].as_f64().unwrap_or(0.0), x["count"])).collect();
-            md.push_str(&format!("- {}: {}\n", op, list.join("、")));
+            if last["hot"][op].as_array().is_some_and(|h| !h.is_empty()) {
+                md.push_str(&format!("- {}: {}\n", op, spans_of(&last["hot"][op])));
+            }
         }
     }
-    // 直すところの候補: Linux より遅いもの、前の記録より 1 割より遅くなったもの
+    // 直すところの候補: Linux より 1 割より遅いもの、前の記録より 1 割より遅くなったもの
     let mut todo = Vec::new();
     for op in &order {
-        if let Some(r) = last["ratio_linux"][op].as_f64().filter(|r| *r > 1.0) {
+        if let Some(r) = last["ratio_linux"][op].as_f64().filter(|r| *r > 1.1) {
             todo.push(format!("- {}: Linux の {:.2} 倍の時間", op, r));
         }
         if let Some(p) = prev {
@@ -526,11 +555,12 @@ fn render_md(kind: &str, all: &[Value]) -> String {
     md
 }
 
-/// 測らずに、いちばん新しい記録と、その前 (同じ VM) からの変わりかた
+/// 測らずに、いちばん新しい記録と、その前 (同じ VM) からの変わりかた (bench/KIND.md も記録から作りなおす)
 fn show(root: &Path, kind: &str) -> Result<Value, String> {
     let file = root.join("bench").join(format!("{}.jsonl", kind));
     let all = read_records(&file);
     let Some(last) = all.last() else { return Err(format!("{}: no records yet (bench with record: true)", file.display())) };
+    let _ = std::fs::write(root.join("bench").join(format!("{}.md", kind)), render_md(kind, &all));
     let mut out = json!({ "records": all.len(), "file": file.display().to_string(), "last": last });
     if let Some(prev) = all[..all.len() - 1].iter().rev().find(|r| same_setup(r, last)) {
         out["since_previous"] = json!(compare(&last["aios"], &prev["aios"], &format!("{} {}", s(prev, "date"), s(prev, "commit"))).0);
