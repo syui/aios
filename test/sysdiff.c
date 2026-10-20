@@ -48,6 +48,10 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
@@ -242,6 +246,26 @@ static const char *ename(int e) {
     case ELOOP: return "ELOOP";
     case EOPNOTSUPP: return "EOPNOTSUPP";
     case EOVERFLOW: return "EOVERFLOW";
+    case ENOTSOCK: return "ENOTSOCK";
+    case EDESTADDRREQ: return "EDESTADDRREQ";
+    case EMSGSIZE: return "EMSGSIZE";
+    case EPROTOTYPE: return "EPROTOTYPE";
+    case ENOPROTOOPT: return "ENOPROTOOPT";
+    case EPROTONOSUPPORT: return "EPROTONOSUPPORT";
+    case ESOCKTNOSUPPORT: return "ESOCKTNOSUPPORT";
+    case EAFNOSUPPORT: return "EAFNOSUPPORT";
+    case EADDRINUSE: return "EADDRINUSE";
+    case EADDRNOTAVAIL: return "EADDRNOTAVAIL";
+    case ECONNABORTED: return "ECONNABORTED";
+    case ECONNRESET: return "ECONNRESET";
+    case ENOBUFS: return "ENOBUFS";
+    case EISCONN: return "EISCONN";
+    case ENOTCONN: return "ENOTCONN";
+    case ESHUTDOWN: return "ESHUTDOWN";
+    case ETOOMANYREFS: return "ETOOMANYREFS";
+    case ECONNREFUSED: return "ECONNREFUSED";
+    case EALREADY: return "EALREADY";
+    case EINPROGRESS: return "EINPROGRESS";
     }
     snprintf(b, sizeof b, "E%d", e);
     return b;
@@ -300,7 +324,8 @@ static void sayst(const struct stat *st) {
     if (S_ISREG(m) || S_ISLNK(m))
         say(" s%lld", (long long)st->st_size);
     say(st->st_uid == geteuid() && st->st_gid == getegid() ? " me" : " other");
-    if (st->st_mtime == T1 || st->st_mtime == T2)
+    // ソケットは出さない (Linux の sockfs は fd の inode の時刻を入れない: 前に使われたものがのこる)
+    if ((st->st_mtime == T1 || st->st_mtime == T2) && !S_ISSOCK(m))
         say(" t%lld", (long long)st->st_mtime);
 }
 
@@ -326,9 +351,13 @@ static void saystx(const struct kstatx *x) {
 enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
-    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, FORK, KILL, WAIT, CHLDACT, SETPGID, GETPGID, NKIND};
+    CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, FORK, KILL, WAIT, CHLDACT, SETPGID, GETPGID,
+    SOCKET, SOCKPAIR, BIND, LISTEN, CONNECT, ACCEPT, SEND, RECV, SHUTDOWN, SOCKOPT, SOCKNAME, POLL, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
-                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8, 4, 5, 5, 1, 2, 2};
+                                       3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8, 4, 5, 5, 1, 2, 2,
+                                       2, 3, 2, 1, 2, 1, 4, 4, 1, 2, 1, 2};
+// ソケットの case (case の 4 割): ソケットの op をこれだけ多く (つないで、送って、受けるところまで届くように)
+#define SOCKFOCUS 6
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -431,6 +460,49 @@ static const char *const wioptn[] = {"WNOHANG|WEXITED", "WNOHANG|WSTOPPED", "WNO
 static const unsigned wioptw[7] = {4, 3, 4, 5, 2, 3, 1};
 // 待つ相手: その子、だれでも (-1 / P_ALL)、自分のグループ (0 / P_PGID 0)、その子のグループ、いない番号、waitid のだめな idtype
 static const unsigned wtgtw[6] = {8, 4, 2, 2, 1, 1};
+// ソケット (AF_UNIX): 型、名前 (bind / connect / sendto の相手)、listen の backlog、send と recv の flags と長さ、shutdown の how、
+// getsockopt / setsockopt の名前。ソケットはいつも SOCK_NONBLOCK で作る (1 つのプロセスの中では、待つと止まる。fd の番号は
+// 使いまわされるので、ほかの op が読み書きしても止まらないように。accept4 も)
+static const int stypev[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_RAW, 9};
+static const char *const stypen[] = {"SOCK_STREAM", "SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_RAW", "9"};
+static const unsigned stypew[5] = {8, 6, 5, 1, 1};
+// 名前: パス s / t / b/s (ディレクトリの中) / d/s (リンク d の先) / a (ふつうのファイル) / b (ディレクトリ) / x/s (ない
+// ディレクトリ)、抽象名前空間の @s / @t、"" (autobind: 長さが sun_family だけ)、@ (抽象で長さ 0)、108 文字 (NUL なし)、
+// AF_INET (ちがう family)、長さ 1、AF_UNSPEC (connect で相手を外す)
+#define NUADDR 15
+enum { UA_S, UA_T, UA_BS, UA_DS, UA_A, UA_B, UA_XS, UA_AS, UA_AT, UA_AUTO, UA_AEMPTY, UA_LONG, UA_INET, UA_SHORT, UA_UNSPEC };
+static const char *const uaddrn[NUADDR] = {"s", "t", "b/s", "d/s", "a", "b", "x/s", "@s", "@t", "", "@", "long", "inet", "short", "unspec"};
+static const unsigned uaddrw[NUADDR] = {12, 8, 3, 2, 2, 1, 1, 8, 5, 3, 1, 1, 1, 1, 1};
+// パスの名前の長さ: NUL まで (strlen + 1)、NUL なし、sizeof (sockaddr_un)
+static const char *const ulenn[] = {"", ", nonul", ", full"};
+static const int backlogs[] = {0, 1, 5, -1, 4096};
+static const int sflv[] = {MSG_NOSIGNAL, MSG_NOSIGNAL | MSG_DONTWAIT, 0, MSG_NOSIGNAL | MSG_OOB, MSG_NOSIGNAL | MSG_EOR, MSG_NOSIGNAL | MSG_MORE, MSG_NOSIGNAL | MSG_CONFIRM, MSG_NOSIGNAL | MSG_PEEK};
+static const char *const sfln[] = {"MSG_NOSIGNAL", "MSG_NOSIGNAL|MSG_DONTWAIT", "0", "MSG_NOSIGNAL|MSG_OOB", "MSG_NOSIGNAL|MSG_EOR", "MSG_NOSIGNAL|MSG_MORE", "MSG_NOSIGNAL|MSG_CONFIRM", "MSG_NOSIGNAL|MSG_PEEK"};
+static const unsigned sflw[8] = {10, 4, 3, 2, 2, 2, 1, 1};
+static const int rflv[] = {0, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_DONTWAIT, MSG_OOB, MSG_PEEK | MSG_TRUNC, MSG_CMSG_CLOEXEC, MSG_ERRQUEUE, MSG_PEEK | MSG_OOB};
+static const char *const rfln[] = {"0", "MSG_PEEK", "MSG_TRUNC", "MSG_WAITALL", "MSG_DONTWAIT", "MSG_OOB", "MSG_PEEK|MSG_TRUNC", "MSG_CMSG_CLOEXEC", "MSG_ERRQUEUE", "MSG_PEEK|MSG_OOB"};
+static const unsigned rflw[10] = {10, 4, 3, 2, 2, 2, 2, 1, 1, 1};
+// 送る長さ (どれもソケットの入れ物 (212992 バイト) よりずっと小さい: そこを数える決まりは Linux の skb の大きさしだい)、受ける長さ
+static const long long slens[] = {0, 1, 7, 100, 4096, 20000};
+static const unsigned slensw[6] = {1, 4, 4, 4, 3, 1};
+static const long long rclens[] = {0, 1, 10, 4096, 100000};
+static const unsigned rclensw[5] = {1, 3, 3, 4, 3};
+static const int shutv[] = {SHUT_RD, SHUT_WR, SHUT_RDWR, 3};
+static const char *const shutn[] = {"SHUT_RD", "SHUT_WR", "SHUT_RDWR", "3"};
+static const struct {
+    int opt;
+    const char *n;
+} sopts[] = {
+    {SO_TYPE, "SO_TYPE"}, {SO_ERROR, "SO_ERROR"}, {SO_DOMAIN, "SO_DOMAIN"}, {SO_PROTOCOL, "SO_PROTOCOL"}, {SO_ACCEPTCONN, "SO_ACCEPTCONN"},
+    {SO_PASSCRED, "SO_PASSCRED"}, {SO_PEERCRED, "SO_PEERCRED"}, {SO_RCVBUF, "SO_RCVBUF"}, {SO_SNDBUF, "SO_SNDBUF"}, {SO_REUSEADDR, "SO_REUSEADDR"},
+    {SO_KEEPALIVE, "SO_KEEPALIVE"}, {SO_LINGER, "SO_LINGER"}, {SO_RCVLOWAT, "SO_RCVLOWAT"}, {SO_PEEK_OFF, "SO_PEEK_OFF"}, {SO_BROADCAST, "SO_BROADCAST"},
+    {9999, "9999"},
+};
+#define NSOPT 16
+static const unsigned soptw[NSOPT] = {3, 3, 2, 2, 3, 3, 4, 3, 3, 1, 1, 1, 1, 2, 1, 1};
+// setsockopt の値 (入れ物の大きさは大きなものだけ: 小さくすると、どこで入らなくなるかが skb の大きさしだい)
+static const int soptval[] = {0, 1, 2, -1};
+static const int sbufval[] = {65536, 1 << 20, 212992};
 static const long long rlstarts[] = {0, 0, 0, 0, 1, 5, 100, 4096, 10000, -1};
 static const long long rllens[] = {0, 0, 0, 1, 10, 100, 4096, -1, -10};
 static const int dupmin[] = {0, 3, 5, 10, 100};
@@ -519,6 +591,24 @@ static int lastorig;
 // gensame が、同じファイルを別に開いたものを選べたか。lastlock は前のロックの op が使った fd を開いた op (取り合いになるよう、
 // 次はちがう open のものを多めに)
 static int lastsame, lastlock = -1;
+// ソケットの ref の印 (0 はソケットでない): 型 (stypev の番号 + 1) と、つながっていそう (SK_CONN)、listen した (SK_LISTEN)、
+// socket で作った (SK_FRESH: connect と bind に)。bnames は bind した名前 (connect と sendto の相手に多めに)
+#define SK_CONN 16
+#define SK_LISTEN 32
+#define SK_FRESH 64
+#define SK_BOUND 128
+static int refsock[2 * MAXOPS], lastsock;
+static int nbname, bnames[MAXOPS], bnref[MAXOPS], bnlisten[MAXOPS], sfocus, stfocus;
+// ソケットの case の予定 (つなぐまでの op の並び: listen したら socket、connect、accept4 など)。7 割はそのとおりに
+static int plan[16], nplan;
+
+static void planop(int k) {
+    for (int j = 0; j < nplan; j++)
+        if (plan[j] == k)
+            return;
+    if (nplan < 16)
+        plan[nplan++] = k;
+}
 // fork した子 (FORK の op の番号) と、その子が自分のグループを作るか (1 setpgid、2 setsid)
 static int nkref, krefs[MAXOPS], kgrp[MAXOPS];
 
@@ -550,6 +640,8 @@ static int genmap(void) {
 }
 
 static void addref(int r, int pipe, int likely, int acc) {
+    refsock[nref] = lastsock;
+    lastsock = 0;
     refs[nref] = r;
     refpipe[nref] = pipe;
     reflikely[nref] = likely;
@@ -560,7 +652,7 @@ static void addref(int r, int pipe, int likely, int acc) {
 }
 
 static int genfd2(int *pipe, int *likely) {
-    *pipe = *likely = lastacc = lastdir = 0;
+    *pipe = *likely = lastacc = lastdir = lastsock = 0;
     lastorig = -1;
     if (nref == 0 || chance(4))
         return chance(50) ? REF_BAD : REF_BIG;
@@ -580,6 +672,7 @@ static int genfd2(int *pipe, int *likely) {
     lastacc = refacc[i];
     lastdir = refdir[i];
     lastorig = reforig[i];
+    lastsock = refsock[i];
     return refs[i];
 }
 
@@ -608,7 +701,7 @@ static int genpipe(int end) {
 static int genfile(int want) {
     int cand[2 * MAXOPS], n = 0, pipe;
     for (int i = 0; i < nref; i++)
-        if (!refpipe[i] && reflikely[i] && (refacc[i] & want))
+        if (!refpipe[i] && !refsock[i] && reflikely[i] && (refacc[i] & want))
             cand[n++] = i;
     lastfile = 0;
     if (n == 0 || chance(10))
@@ -627,7 +720,7 @@ static int gensame(int want) {
     int cand[2 * MAXOPS], n = 0;
     lastsame = 0;
     for (int i = 0; i < nref; i++) {
-        if (refpipe[i] || !reflikely[i] || reforig[i] < 0 || refdir[i])
+        if (refpipe[i] || refsock[i] || !reflikely[i] || reforig[i] < 0 || refdir[i])
             continue;
         const struct op *a = &ops[reforig[i]];
         int other = 0;
@@ -662,7 +755,7 @@ static int gensame(int want) {
 static int reopen_same(struct op *o, int i) {
     int cand[2 * MAXOPS], n = 0;
     for (int k = 0; k < nref; k++)
-        if (!refpipe[k] && reflikely[k] && reforig[k] >= 0 && !refdir[k])
+        if (!refpipe[k] && !refsock[k] && reflikely[k] && reforig[k] >= 0 && !refdir[k])
             cand[n++] = k;
     if (n == 0)
         return 0;
@@ -676,6 +769,7 @@ static int reopen_same(struct op *o, int i) {
     static const int accbits[] = {1, 2, 3, 0};
     lastdir = 0;
     lastorig = i;
+    lastsock = 0;
     addref(2 * i, 0, 1, accbits[o->acc]);
     return 1;
 }
@@ -683,6 +777,72 @@ static int reopen_same(struct op *o, int i) {
 static int gendir(void) {
     int pipe;
     return chance(88) ? REF_CWD : genfd(&pipe);
+}
+
+// ソケットの fd (want の印があり avoid の印がないものを多めに)。なければ (と 1 割は) ほかの fd。lastsock にその印
+static int gensock2(int want, int avoid) {
+    int cand[2 * MAXOPS], n = 0, pipe;
+    for (int i = 0; i < nref; i++)
+        if (refsock[i] && (!want || (refsock[i] & want)) && !(refsock[i] & avoid))
+            cand[n++] = i;
+    if (n == 0 && avoid)
+        for (int i = 0; i < nref; i++)
+            if (refsock[i] && (!want || (refsock[i] & want)))
+                cand[n++] = i;
+    if (n == 0 && want)
+        for (int i = 0; i < nref; i++)
+            if (refsock[i])
+                cand[n++] = i;
+    lastsock = 0;
+    if (n == 0 || chance(10)) {
+        int r = genfd(&pipe);
+        for (int i = 0; i < nref; i++)
+            if (refs[i] == r)
+                lastsock = refsock[i];
+        return r;
+    }
+    int j = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+    lastsock = refsock[j];
+    return refs[j];
+}
+
+static int anysock(void) {
+    for (int i = 0; i < nref; i++)
+        if (refsock[i])
+            return 1;
+    return 0;
+}
+
+static int gensock(int want) {
+    return gensock2(want, 0);
+}
+
+// 印 want があり avoid がないソケットがあるか
+static int hassock(int want, int avoid) {
+    for (int i = 0; i < nref; i++)
+        if (refsock[i] && (refsock[i] & want) == want && !(refsock[i] & avoid))
+            return 1;
+    return 0;
+}
+
+// ソケットの ref の印を足す
+static void marksock(int r, int bits) {
+    for (int i = 0; i < nref; i++)
+        if (refs[i] == r && refsock[i])
+            refsock[i] |= bits;
+}
+
+// connect と sendto の相手: たいてい bind した名前 (listen したものの名前を多めに)
+static int genpeer(void) {
+    int cand[MAXOPS], n = 0;
+    for (int k = 0; k < nbname; k++)
+        if (bnlisten[k])
+            cand[n++] = bnames[k];
+    if (n && chance(70))
+        return cand[pick(n)];
+    if (nbname && chance(75))
+        return bnames[pick(nbname)];
+    return (int)pickw(uaddrw, NUADDR);
 }
 
 // あるはずのパス (はじめの木と、前の op が作ったもの。作れたかは動かすまでわからないが、
@@ -762,6 +922,15 @@ static char genpath(char *p, int target) {
 
 static void gen(uint64_t seed, int n) {
     rs = seed;
+    nbname = 0;
+    lastsock = 0;
+    sfocus = chance(40);
+    nplan = 0;
+    // ソケットの case の型 (たいていこれで作る: つないで送れるように)
+    stfocus = chance(45) ? 0 : chance(55) ? 2 : 1;
+    unsigned w[NKIND];
+    for (int k = 0; k < NKIND; k++)
+        w[k] = weight[k] * (sfocus && k >= SOCKET && k < POLL ? SOCKFOCUS : 1);
     nref = 0;
     nmref = 0;
     nkref = 0;
@@ -777,13 +946,17 @@ static void gen(uint64_t seed, int n) {
         struct op *o = &ops[i];
         int pipe = 0;
         memset(o, 0, sizeof *o);
-        o->kind = (int)pickw(weight, NKIND);
+        o->kind = (int)pickw(w, NKIND);
+        if (nplan && chance(70)) {
+            o->kind = plan[0];
+            memmove(plan, plan + 1, (size_t)--nplan * sizeof *plan);
+        }
         o->fb = chance(80);
         // fd がまだないうちに fd の op を選んだら、開ける op に
         if (nref == 0 && o->kind != OPENAT2 && o->kind != TRUNCATE && o->kind != STAT && o->kind != MKDIR && o->kind != UNLINK && o->kind != RMDIR &&
             o->kind != RENAME && o->kind != LINK && o->kind != SYMLINK && o->kind != READLINK && o->kind != CHMOD && o->kind != ACCESS &&
-            o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX)
-            o->kind = chance(80) ? OPEN : PIPE;
+            o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX && o->kind != SOCKET && o->kind != SOCKPAIR)
+            o->kind = o->kind >= SOCKET && o->kind < POLL ? (chance(60) ? SOCKPAIR : SOCKET) : chance(80) ? OPEN : PIPE;
         // splice と tee はパイプがないとたいてい EINVAL なので、まだなければたいていパイプを作る
         if ((o->kind == SPLICE || o->kind == TEE) && chance(70)) {
             int any = 0;
@@ -795,6 +968,23 @@ static void gen(uint64_t seed, int n) {
         // 子を使う op は、まだ子がいなければたいてい fork に
         if ((o->kind == KILL || o->kind == WAIT || o->kind == SETPGID || o->kind == GETPGID) && nkref == 0 && chance(80))
             o->kind = FORK;
+        // ソケットを使う op は、まだソケットがなければたいてい作る。connect は bind した名前がなければ bind に、accept は
+        // listen したものがなければ listen に
+        if (o->kind >= BIND && o->kind <= SOCKNAME && !anysock() && chance(80))
+            o->kind = chance(50) ? SOCKPAIR : SOCKET;
+        if (o->kind == CONNECT && nbname == 0 && chance(70))
+            o->kind = BIND;
+        else if (o->kind == CONNECT && !hassock(SK_FRESH, SK_BOUND | SK_LISTEN | SK_CONN) && chance(70))
+            o->kind = SOCKET;
+        if (o->kind == LISTEN && !hassock(SK_BOUND, SK_LISTEN) && chance(60))
+            o->kind = hassock(SK_FRESH, SK_BOUND) ? BIND : SOCKET;
+        if (o->kind == ACCEPT && chance(70)) {
+            int any = 0;
+            for (int k = 0; k < nref; k++)
+                any |= refsock[k] & SK_LISTEN;
+            if (!any)
+                o->kind = hassock(SK_BOUND, SK_LISTEN) ? LISTEN : hassock(SK_FRESH, SK_BOUND) ? BIND : SOCKET;
+        }
         // 写しを使う op は、まだ写しがなければたいてい mmap に
         if ((o->kind == MUNMAP || o->kind == MSYNC || o->kind == MREAD || o->kind == MWRITE) && nmref == 0 && chance(80))
             o->kind = MMAP;
@@ -825,6 +1015,7 @@ static void gen(uint64_t seed, int n) {
             static const int accbits[] = {1, 2, 3, 0};
             lastdir = k == 'd';
             lastorig = i;
+            lastsock = 0;
             addref(2 * i, 0, o->d1 == REF_CWD && o->acc != 3 && !(o->of & odd) && (k || ((o->of & B_CREAT) && o->p1[0] && o->p1[0] != 'x')),
                    (o->of & (1u << 8)) ? 0 : accbits[o->acc]);
             break;
@@ -967,6 +1158,7 @@ static void gen(uint64_t seed, int n) {
             o->x = chance(30);
             lastdir = 0;
             lastorig = -1;
+            lastsock = 0;
             addref(2 * i, 1, 1, 1);
             addref(2 * i + 1, 2, 1, 2);
             break;
@@ -1129,6 +1321,122 @@ static void gen(uint64_t seed, int n) {
             o->off = rlstarts[pick(10)];
             o->len = rllens[pick(9)];
             o->rwf = chance(5);
+            break;
+        case SOCKET:
+        case SOCKPAIR:
+            // x: 型 (stypev)。y: family (0 AF_UNIX、1 AF_INET (socketpair だけ: EOPNOTSUPP)、2 知らない 99)。mode: protocol
+            // (0、PF_UNIX、2)。acc: SOCK_CLOEXEC (1) と知らないビット (2)
+            o->x = sfocus && chance(75) ? stfocus : (int)pickw(stypew, 5);
+            o->y = chance(92) ? 0 : o->kind == SOCKPAIR && chance(50) ? 1 : 2;
+            o->mode = chance(90) ? 0u : chance(50) ? 1u : 2u;
+            o->acc = (chance(30) ? 1u : 0u) | (chance(3) ? 2u : 0u);
+            lastdir = 0;
+            lastorig = -1;
+            lastsock = (o->x + 1) | (o->kind == SOCKPAIR ? SK_CONN : SK_FRESH);
+            addref(2 * i, 0, 1, 3);
+            if (o->kind == SOCKPAIR) {
+                lastsock = (o->x + 1) | SK_CONN;
+                addref(2 * i + 1, 0, 1, 3);
+            } else if (sfocus && chance(50))
+                planop(BIND);
+            break;
+        case BIND:
+            // x: 名前、y: 名前の長さの形 (ulenn)。まだ bind していない、socket で作ったものを多めに
+            o->fd = gensock2(SK_FRESH, SK_BOUND);
+            marksock(o->fd, SK_BOUND);
+            o->x = (int)pickw(uaddrw, NUADDR);
+            o->y = chance(80) ? 0 : (int)(1 + pick(2));
+            if (o->x <= UA_AT && nbname < MAXOPS) {
+                bnref[nbname] = o->fd;
+                bnlisten[nbname] = 0;
+                bnames[nbname++] = o->x;
+            }
+            if (sfocus && chance(50))
+                planop((lastsock & 15) == 2 ? SOCKET : LISTEN);
+            break;
+        case LISTEN:
+            o->fd = gensock2(SK_BOUND, SK_LISTEN);
+            o->x = (int)pick(5);
+            for (int k = 0; k < nbname; k++)
+                if (bnref[k] == o->fd)
+                    bnlisten[k] = 1;
+            if (sfocus) {
+                planop(SOCKET);
+                planop(CONNECT);
+                planop(ACCEPT);
+            }
+            marksock(o->fd, SK_LISTEN);
+            break;
+        case CONNECT:
+            // つなぐのは、bind も listen もしていない、socket で作ったもの
+            o->fd = gensock2(SK_FRESH, SK_BOUND | SK_LISTEN | SK_CONN);
+            o->x = genpeer();
+            o->y = chance(85) ? 0 : (int)(1 + pick(2));
+            marksock(o->fd, SK_CONN);
+            break;
+        case ACCEPT: {
+            // x: 相手の名前の入れ物 (0 sockaddr_un、1 長さ 4、2 NULL)。y: flags (いつも SOCK_NONBLOCK。1 SOCK_CLOEXEC、2 知らないビット)
+            o->fd = gensock(SK_LISTEN);
+            o->x = chance(60) ? 0 : (int)(1 + pick(2));
+            o->y = chance(70) ? 0 : chance(85) ? 1 : 2;
+            int t = lastsock & 15;
+            lastdir = 0;
+            lastorig = -1;
+            lastsock = (t ? t : 1) | SK_CONN;
+            addref(2 * i, 0, 1, 3);
+            break;
+        }
+        case SEND:
+            // x: 0 send、1 sendto (相手 d1)、2 sendmsg (2 つの iovec。d1 が 0 以上なら相手も。cmsg は mode)。y: flags。len。
+            // 中身は x の値から (op ごとにちがう)。mode: 0 なし、1 SCM_RIGHTS (fd d2)、2 SCM_RIGHTS (fd d2 と自分)、
+            // 3 SCM_CREDENTIALS (自分)、4 SCM_CREDENTIALS (pid 1)、5 知らない cmsg
+            o->fd = gensock(SK_CONN);
+            o->acc = (unsigned)pick(256);
+            o->x = chance(55) ? 0 : chance(45) ? 1 : 2;
+            o->d1 = o->x == 1 || (o->x == 2 && chance(30)) ? genpeer() : -1;
+            o->y = (int)pickw(sflw, 8);
+            o->len = slens[pickw(slensw, 6)];
+            o->mode = o->x == 2 && chance(55) ? (chance(60) ? 1u : 2u + (unsigned)pick(4)) : 0u;
+            if (o->mode == 1 || o->mode == 2)
+                o->d2 = genfd(&pipe);
+            break;
+        case RECV:
+            // x: 0 recv、1 recvfrom (相手の名前も)、2 recvmsg (名前と cmsg。cmsg の入れ物は mode: 0 大きい、1 小さい (16)、2 なし)。
+            // y: flags。len。受けとった fd (SCM_RIGHTS) は ref に
+            o->fd = gensock(SK_CONN);
+            o->x = chance(45) ? 0 : chance(40) ? 1 : 2;
+            o->y = (int)pickw(rflw, 10);
+            o->len = rclens[pickw(rclensw, 5)];
+            o->mode = o->x == 2 ? (chance(75) ? 0u : chance(50) ? 1u : 2u) : 0u;
+            lastdir = 0;
+            lastorig = -1;
+            lastsock = 0;
+            if (o->x == 2)
+                addref(2 * i, 0, 1, 3);
+            break;
+        case SHUTDOWN:
+            o->fd = gensock(SK_CONN);
+            o->x = chance(95) ? (int)pick(3) : 3;
+            break;
+        case SOCKOPT:
+            // x: 0 getsockopt、1 setsockopt。y: 名前 (sopts)。mode: 1 なら level がまちがい (SOL_SOCKET でない 99)。acc: 値の番号
+            // (get は 1 なら長さが 1)
+            o->fd = gensock(0);
+            o->x = chance(35);
+            o->y = (int)pickw(soptw, NSOPT);
+            o->mode = chance(5);
+            o->acc = (unsigned)pick(4);
+            break;
+        case SOCKNAME:
+            // x: 0 getsockname、1 getpeername。y: 入れ物の長さ (0 sockaddr_un、1 4、2 0)
+            o->fd = gensock(0);
+            o->x = chance(50);
+            o->y = chance(80) ? 0 : (int)(1 + pick(2));
+            break;
+        case POLL:
+            // x: 0 poll (POLLIN|POLLOUT|POLLPRI|POLLRDHUP。待たない)、1 ioctl FIONREAD
+            o->fd = anysock() && chance(sfocus ? 80 : 40) ? gensock(0) : genfd(&pipe);
+            o->x = chance(35);
             break;
         case MMAP: {
             // fd のファイルを写す (たいてい読めるふつうのファイル。len と off は表から。prot と MAP_SHARED / MAP_PRIVATE)。
@@ -1700,6 +2008,377 @@ static long long wstart_of(const struct op *o, int fd, long long size) {
     }
 }
 
+// ---- ソケット ----
+
+// 名前 k の sockaddr_un とその長さ (形 lk: 0 は NUL まで、1 は NUL なし、2 は sizeof (sockaddr_un))。抽象名前空間の名前は
+// "\0s" と "\0t"
+static socklen_t mkaddr(int k, int lk, struct sockaddr_un *a) {
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    socklen_t base = (socklen_t)offsetof(struct sockaddr_un, sun_path);
+    switch (k) {
+    case UA_AS:
+    case UA_AT:
+        a->sun_path[1] = k == UA_AS ? 's' : 't';
+        return lk == 2 ? (socklen_t)sizeof *a : base + 2;
+    case UA_AUTO:
+        return base;
+    case UA_AEMPTY:
+        return base + 1;
+    case UA_LONG:
+        memset(a->sun_path, 'x', sizeof a->sun_path);
+        return (socklen_t)sizeof *a;
+    case UA_INET:
+        a->sun_family = AF_INET;
+        return 16;
+    case UA_SHORT:
+        return 1;
+    case UA_UNSPEC:
+        a->sun_family = AF_UNSPEC;
+        return base;
+    }
+    strcpy(a->sun_path, uaddrn[k]);
+    return lk == 2 ? (socklen_t)sizeof *a : base + (socklen_t)strlen(uaddrn[k]) + (lk == 0);
+}
+
+static void sayuaddr(int k, int lk) {
+    if (k >= UA_AS)
+        say("%s", uaddrn[k]);
+    else
+        sayq(uaddrn[k]);
+    if (k <= UA_AT)
+        say("%s", ulenn[lk]);
+}
+
+// 答えの名前 (len は返された長さ、room は入れ物の大きさ)。autobind の名前 (抽象名前空間の 5 けたの 16 進) は @auto
+static void sayaddr(const struct sockaddr_un *a, socklen_t len, socklen_t room) {
+    say(" len%u", (unsigned)len);
+    socklen_t n = len < room ? len : room;
+    if (n < sizeof(sa_family_t))
+        return;
+    if (a->sun_family != AF_UNIX) {
+        say(" family%d", a->sun_family);
+        return;
+    }
+    if (len == sizeof(sa_family_t)) {
+        say(" unnamed");
+        return;
+    }
+    size_t m = n - sizeof(sa_family_t);
+    char b[sizeof a->sun_path + 1];
+    if (m == 0)
+        return;
+    if (a->sun_path[0] == 0) {
+        // autobind の名前は長さ 6 (NUL と 5 けた)。入れ物が小さくて切れていても、見えたところが 16 進なら
+        if (len == offsetof(struct sockaddr_un, sun_path) + 6 && strspn(a->sun_path + 1, "0123456789abcdef") >= m - 1) {
+            say(" @auto");
+            return;
+        }
+        memcpy(b, a->sun_path + 1, m - 1);
+        b[m - 1] = 0;
+        say(" @");
+        sayq(b);
+        return;
+    }
+    memcpy(b, a->sun_path, m);
+    b[m] = 0;
+    say(" ");
+    sayq(b);
+}
+
+// recvmsg の msg_flags
+static void saymflags(int f) {
+    static const struct {
+        int v;
+        const char *n;
+    } mf[] = {{MSG_OOB, "MSG_OOB"}, {MSG_TRUNC, "MSG_TRUNC"}, {MSG_CTRUNC, "MSG_CTRUNC"}, {MSG_EOR, "MSG_EOR"}, {MSG_ERRQUEUE, "MSG_ERRQUEUE"}, {MSG_CMSG_CLOEXEC, "MSG_CMSG_CLOEXEC"}};
+    say(" flags ");
+    if (!f) {
+        say("0");
+        return;
+    }
+    for (size_t i = 0, first = 1; i < sizeof mf / sizeof *mf; i++)
+        if (f & mf[i].v) {
+            say("%s%s", first ? "" : "|", mf[i].n);
+            f &= ~mf[i].v;
+            first = 0;
+        }
+    if (f)
+        say("|0x%x", f);
+}
+
+static void sayrevents(short r) {
+    static const struct {
+        short v;
+        const char *n;
+    } pe[] = {{POLLIN, "POLLIN"}, {POLLPRI, "POLLPRI"}, {POLLOUT, "POLLOUT"}, {POLLERR, "POLLERR"}, {POLLHUP, "POLLHUP"}, {POLLNVAL, "POLLNVAL"},
+              {POLLRDNORM, "POLLRDNORM"}, {POLLRDBAND, "POLLRDBAND"}, {POLLWRNORM, "POLLWRNORM"}, {POLLWRBAND, "POLLWRBAND"}, {POLLRDHUP, "POLLRDHUP"}};
+    say(" ");
+    if (!r) {
+        say("0");
+        return;
+    }
+    for (size_t i = 0, first = 1; i < sizeof pe / sizeof *pe; i++)
+        if (r & pe[i].v) {
+            say("%s%s", first ? "" : "|", pe[i].n);
+            r &= (short)~pe[i].v;
+            first = 0;
+        }
+    if (r)
+        say("|0x%x", (unsigned short)r);
+}
+
+static void saycred(const struct ucred *c) {
+    say(" pid %s uid %s gid %s", pidname(c->pid), c->uid == geteuid() ? "me" : c->uid == 0 ? "0" : "other", c->gid == getegid() ? "me" : c->gid == 0 ? "0" : "other");
+}
+
+// 送る中身と受ける入れ物 (ソケットの長さは wbuf / rbuf より大きい)
+static unsigned char sbuf[131072], rbig[131072];
+
+static void sockexec(int i, const struct op *o, int fd) {
+    static const char *const domn[] = {"AF_UNIX", "AF_INET", "99"};
+    static const int domv[] = {AF_UNIX, AF_INET, 99};
+    long r;
+    struct sockaddr_un a;
+    switch (o->kind) {
+    case SOCKET:
+    case SOCKPAIR: {
+        int t = stypev[o->x] | SOCK_NONBLOCK | ((o->acc & 1) ? SOCK_CLOEXEC : 0) | ((o->acc & 2) ? 0x100 : 0);
+        say("%s(%s, %s|SOCK_NONBLOCK%s%s, %d)", o->kind == SOCKET ? "socket" : "socketpair", domn[o->y], stypen[o->x], (o->acc & 1) ? "|SOCK_CLOEXEC" : "", (o->acc & 2) ? "|0x100" : "",
+            (int)o->mode);
+        if (o->kind == SOCKET) {
+            r = syscall(SYS_socket, domv[o->y], t, (int)o->mode);
+            ret(r);
+            if (r >= 0)
+                res[i][0] = (int)r;
+            born(i, r);
+        } else {
+            int sv[2];
+            r = syscall(SYS_socketpair, domv[o->y], t, (int)o->mode, sv);
+            ret(r);
+            if (r == 0) {
+                res[i][0] = sv[0];
+                res[i][1] = sv[1];
+                born(i, sv[0]);
+                born(i, sv[1]);
+                say(" [%d,%d]", sv[0], sv[1]);
+            }
+        }
+        break;
+    }
+    case BIND:
+    case CONNECT: {
+        socklen_t l = mkaddr(o->x, o->y, &a);
+        say("%s(%d, ", o->kind == BIND ? "bind" : "connect", fd);
+        sayuaddr(o->x, o->y);
+        say(")");
+        ret(syscall(o->kind == BIND ? SYS_bind : SYS_connect, fd, &a, l));
+        break;
+    }
+    case LISTEN:
+        say("listen(%d, %d)", fd, backlogs[o->x]);
+        ret(syscall(SYS_listen, fd, backlogs[o->x]));
+        break;
+    case ACCEPT: {
+        socklen_t al = o->x == 0 ? (socklen_t)sizeof a : 4, room = al;
+        memset(&a, 0, sizeof a);
+        int fl = SOCK_NONBLOCK | (o->y == 1 ? SOCK_CLOEXEC : 0) | (o->y == 2 ? 0x100 : 0);
+        say("accept4(%d, %s, SOCK_NONBLOCK%s)", fd, o->x == 0 ? "sockaddr_un" : o->x == 1 ? "4" : "NULL", o->y == 1 ? "|SOCK_CLOEXEC" : o->y == 2 ? "|0x100" : "");
+        r = syscall(SYS_accept4, fd, o->x == 2 ? NULL : &a, o->x == 2 ? NULL : &al, fl);
+        ret(r);
+        if (r >= 0) {
+            res[i][0] = (int)r;
+            if (o->x != 2)
+                sayaddr(&a, al, room);
+        }
+        born(i, r);
+        break;
+    }
+    case SEND: {
+        for (long long k = 0; k < o->len; k++)
+            sbuf[k] = (unsigned char)(o->acc + k * 7);
+        int fl = sflv[o->y];
+        socklen_t l = o->d1 >= 0 ? mkaddr(o->d1, 0, &a) : 0;
+        if (o->x == 0) {
+            say("send(%d, %lld, %s)", fd, o->len, sfln[o->y]);
+            r = syscall(SYS_sendto, fd, sbuf, (size_t)o->len, fl, NULL, 0);
+        } else if (o->x == 1) {
+            say("sendto(%d, %lld, %s, ", fd, o->len, sfln[o->y]);
+            sayuaddr(o->d1, 0);
+            say(")");
+            r = syscall(SYS_sendto, fd, sbuf, (size_t)o->len, fl, &a, l);
+        } else {
+            struct iovec iov[2] = {{sbuf, (size_t)(o->len / 2)}, {sbuf + o->len / 2, (size_t)(o->len - o->len / 2)}};
+            union {
+                char b[CMSG_SPACE(2 * sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
+                struct cmsghdr align;
+            } cb;
+            memset(&cb, 0, sizeof cb);
+            struct msghdr m = {.msg_name = o->d1 >= 0 ? &a : NULL, .msg_namelen = l, .msg_iov = iov, .msg_iovlen = 2};
+            struct cmsghdr *c = (struct cmsghdr *)cb.b;
+            static const char *const cmn[] = {"", ", rights", ", rights2", ", creds", ", creds1", ", cmsg99"};
+            if (o->mode == 1 || o->mode == 2) {
+                int fds[2] = {fdref(o->d2, o->fb, -1), fd};
+                int nf = o->mode == 1 ? 1 : 2;
+                c->cmsg_level = SOL_SOCKET;
+                c->cmsg_type = SCM_RIGHTS;
+                c->cmsg_len = CMSG_LEN(nf * sizeof(int));
+                memcpy(CMSG_DATA(c), fds, nf * sizeof(int));
+                m.msg_control = cb.b;
+                m.msg_controllen = CMSG_SPACE(nf * sizeof(int));
+            } else if (o->mode == 3 || o->mode == 4) {
+                struct ucred cr = {o->mode == 3 ? getpid() : 1, geteuid(), getegid()};
+                c->cmsg_level = SOL_SOCKET;
+                c->cmsg_type = SCM_CREDENTIALS;
+                c->cmsg_len = CMSG_LEN(sizeof cr);
+                memcpy(CMSG_DATA(c), &cr, sizeof cr);
+                m.msg_control = cb.b;
+                m.msg_controllen = CMSG_SPACE(sizeof cr);
+            } else if (o->mode == 5) {
+                c->cmsg_level = SOL_SOCKET;
+                c->cmsg_type = 99;
+                c->cmsg_len = CMSG_LEN(sizeof(int));
+                m.msg_control = cb.b;
+                m.msg_controllen = CMSG_SPACE(sizeof(int));
+            }
+            say("sendmsg(%d, %lld, %s", fd, o->len, sfln[o->y]);
+            if (o->d1 >= 0) {
+                say(", to ");
+                sayuaddr(o->d1, 0);
+            }
+            say("%s", cmn[o->mode]);
+            if (o->mode == 1 || o->mode == 2)
+                say(" %d", fdref(o->d2, o->fb, -1));
+            say(")");
+            r = syscall(SYS_sendmsg, fd, &m, fl);
+        }
+        ret(r);
+        break;
+    }
+    case RECV: {
+        int fl = rflv[o->y];
+        socklen_t al = sizeof a;
+        memset(&a, 0, sizeof a);
+        memset(rbig, 0, (size_t)(o->len < (long long)sizeof rbig ? o->len : (long long)sizeof rbig));
+        if (o->x == 0) {
+            say("recv(%d, %lld, %s)", fd, o->len, rfln[o->y]);
+            r = syscall(SYS_recvfrom, fd, rbig, (size_t)o->len, fl, NULL, NULL);
+            ret(r);
+        } else if (o->x == 1) {
+            say("recvfrom(%d, %lld, %s)", fd, o->len, rfln[o->y]);
+            r = syscall(SYS_recvfrom, fd, rbig, (size_t)o->len, fl, &a, &al);
+            ret(r);
+            if (r >= 0)
+                sayaddr(&a, al, sizeof a);
+        } else {
+            union {
+                char b[CMSG_SPACE(8 * sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
+                struct cmsghdr align;
+            } cb;
+            memset(&cb, 0, sizeof cb);
+            struct iovec iov = {rbig, (size_t)o->len};
+            size_t room = o->mode == 0 ? sizeof cb.b : o->mode == 1 ? 16 : 0;
+            struct msghdr m = {.msg_name = &a, .msg_namelen = sizeof a, .msg_iov = &iov, .msg_iovlen = 1, .msg_control = room ? cb.b : NULL, .msg_controllen = room};
+            say("recvmsg(%d, %lld, %s, cmsg %zu)", fd, o->len, rfln[o->y], room);
+            r = syscall(SYS_recvmsg, fd, &m, fl);
+            ret(r);
+            if (r >= 0) {
+                sayaddr(&a, m.msg_namelen, sizeof a);
+                saymflags(m.msg_flags);
+                for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+                    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                        int nf = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int)), fds[8];
+                        if (nf > 8)
+                            nf = 8;
+                        memcpy(fds, CMSG_DATA(c), nf * sizeof(int));
+                        say(" rights");
+                        for (int k = 0; k < nf; k++) {
+                            int cl = (int)syscall(SYS_fcntl, fds[k], F_GETFD);
+                            say(" %d%s", fds[k], cl > 0 && (cl & FD_CLOEXEC) ? "(cloexec)" : "");
+                            born(i, fds[k]);
+                        }
+                        if (nf > 0)
+                            res[i][0] = fds[0];
+                    } else if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS && c->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
+                        struct ucred cr;
+                        memcpy(&cr, CMSG_DATA(c), sizeof cr);
+                        say(" creds");
+                        saycred(&cr);
+                    } else
+                        say(" cmsg %d/%d len%zu", c->cmsg_level, c->cmsg_type, (size_t)c->cmsg_len);
+                }
+            }
+        }
+        if (r > 0)
+            say(" h%08x", fnv(rbig, r < o->len ? r : o->len));
+        break;
+    }
+    case SHUTDOWN:
+        say("shutdown(%d, %s)", fd, shutn[o->x]);
+        ret(syscall(SYS_shutdown, fd, shutv[o->x]));
+        break;
+    case SOCKOPT: {
+        int opt = sopts[o->y].opt, level = o->mode ? 99 : SOL_SOCKET;
+        const char *ln = o->mode ? "99" : "SOL_SOCKET";
+        if (o->x == 0) {
+            union {
+                int v[4];
+                struct ucred cr;
+                struct linger lg;
+            } u;
+            memset(&u, 0, sizeof u);
+            socklen_t l = o->acc == 1 ? 1 : (socklen_t)sizeof u;
+            say("getsockopt(%d, %s, %s, %u)", fd, ln, sopts[o->y].n, (unsigned)l);
+            r = syscall(SYS_getsockopt, fd, level, opt, &u, &l);
+            ret(r);
+            if (r == 0) {
+                say(" len%u", (unsigned)l);
+                if (opt == SO_PEERCRED && l >= sizeof u.cr)
+                    saycred(&u.cr);
+                else if (opt == SO_LINGER && l >= sizeof u.lg)
+                    say(" {%d, %d}", u.lg.l_onoff, u.lg.l_linger);
+                else if (l >= sizeof(int))
+                    say(" %d", u.v[0]);
+                else if (l > 0 && opt != SO_PEERCRED)
+                    say(" b%d", *(unsigned char *)&u);
+            }
+        } else {
+            int v = opt == SO_RCVBUF || opt == SO_SNDBUF ? sbufval[o->acc % 3] : soptval[o->acc];
+            say("setsockopt(%d, %s, %s, %d)", fd, ln, sopts[o->y].n, v);
+            ret(syscall(SYS_setsockopt, fd, level, opt, &v, sizeof v));
+        }
+        break;
+    }
+    case SOCKNAME: {
+        socklen_t al = o->y == 0 ? (socklen_t)sizeof a : o->y == 1 ? 4 : 0, room = al;
+        memset(&a, 0, sizeof a);
+        say("%s(%d, %u)", o->x ? "getpeername" : "getsockname", fd, (unsigned)al);
+        r = syscall(o->x ? SYS_getpeername : SYS_getsockname, fd, &a, &al);
+        ret(r);
+        if (r == 0)
+            sayaddr(&a, al, room);
+        break;
+    }
+    case POLL:
+        if (o->x == 0) {
+            struct pollfd p = {fd, POLLIN | POLLOUT | POLLPRI | POLLRDHUP, 0};
+            say("poll(%d, POLLIN|POLLOUT|POLLPRI|POLLRDHUP)", fd);
+            r = syscall(SYS_ppoll, &p, 1, &(struct timespec){0, 0}, NULL, 0);
+            ret(r);
+            if (r >= 0)
+                sayrevents(p.revents);
+        } else {
+            int n = -7;
+            say("ioctl(%d, FIONREAD)", fd);
+            r = syscall(SYS_ioctl, fd, FIONREAD, &n);
+            ret(r);
+            if (r == 0)
+                say(" n%d", n);
+        }
+        break;
+    }
+}
+
 static void exec(int i, const struct op *o) {
     long r = 0;
     struct stat st;
@@ -1718,6 +2397,20 @@ static void exec(int i, const struct op *o) {
     int xt = xfd >= 0 && fstat(xfd, &xs0) == 0 && S_ISREG(xs0.st_mode) && fstatfs(xfd, &xsf) == 0 && xsf.f_type == K_TMPFS_MAGIC;
     long long wstart = xt ? wstart_of(o, xfd, (long long)xs0.st_size) : 0;
     switch (o->kind) {
+    case SOCKET:
+    case SOCKPAIR:
+    case BIND:
+    case LISTEN:
+    case CONNECT:
+    case ACCEPT:
+    case SEND:
+    case RECV:
+    case SHUTDOWN:
+    case SOCKOPT:
+    case SOCKNAME:
+    case POLL:
+        sockexec(i, o, fd);
+        break;
     case OPEN:
         say("openat(");
         saydir(o->d1);

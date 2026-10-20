@@ -84,7 +84,6 @@ pub fn key(f: &OpenFile) -> Option<Key> {
     Some(match &f.kind {
         Kind::Inode(i, _) => i.id(),
         Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (usize::MAX, Rc::as_ptr(p) as usize as u64),
-        Kind::Pair(p, _) => (usize::MAX, Rc::as_ptr(p) as usize as u64),
         Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => return None,
         _ => (usize::MAX - 1, f as *const OpenFile as usize as u64),
     })

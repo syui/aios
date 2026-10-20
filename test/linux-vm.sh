@@ -35,7 +35,9 @@ version() {
 build() {
   v=$(version "$1")
   out=$dir/$v
-  if [ -s "$out/Image" ]; then
+  # 設定 (test/linux.config) が同じなら、作ってあるものをそのまま
+  sum=$(sha256sum "$top/test/linux.config" | cut -d' ' -f1)
+  if [ -s "$out/Image" ] && [ "$(cat "$out/config.sha256" 2>/dev/null)" = "$sum" ]; then
     echo "$out/Image"
     return
   fi
@@ -69,6 +71,7 @@ build() {
   mk -j"$(nproc)" Image
   cp "$obj/arch/arm64/boot/Image" "$out/Image"
   cp "$obj/.config" "$out/config"
+  echo "$sum" > "$out/config.sha256"
   rm -rf "$src" "$obj" "$tar"
   echo "$out/Image"
 }

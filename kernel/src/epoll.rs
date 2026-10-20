@@ -67,6 +67,9 @@ impl Epoll {
 
 /// 今の状態を epoll のビットで
 fn mask_of(f: &FileRef) -> u32 {
+    if let Some(m) = f.borrow().poll_mask() {
+        return m;
+    }
     let (r, w, hup) = f.borrow().readiness();
     let mut m = 0;
     if r {

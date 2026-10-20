@@ -61,7 +61,7 @@
   {"name": "sysctl", "type": "extra", "src": "src/sysctl.rs", "what": "/proc/sys: カーネルの値を読み書きする (Linux の sysctl と同じ場所と形)"},
   {"name": "sysfs", "type": "extra", "src": "src/sysfs.rs", "what": "/sys: デバイスの様子 (Linux の sysfs の、プログラムがよく読むところだけ)"},
   {"name": "timerfd", "type": "extra", "src": "src/timerfd.rs", "what": "timerfd: 決めた時刻に読めるようになる fd", "off": "timerfd_create、timerfd_settime、timerfd_gettime が ENOSYS"},
-  {"name": "unix", "type": "extra", "src": "src/unix.rs", "what": "AF_UNIX のソケット (SOCK_STREAM)。パスに bind して listen し、connect / accept でつなぐ"},
+  {"name": "unix", "type": "extra", "src": "src/unix.rs", "what": "AF_UNIX のソケット (SOCK_STREAM / DGRAM / SEQPACKET と socketpair。Linux の af_unix.c と同じ考え: 受ける行列、truesize の数え、パスと抽象名前空間の名前、SCM_RIGHTS / SCM_CREDENTIALS、MSG_OOB、送られている途中の輪の gc。分けた NET の中の TCP も)"},
   {"name": "vdso", "type": "extra", "src": "src/vdso.rs", "what": "vDSO: clock_gettime をカーネルに入らずに済ませる", "off": "vDSO を写さず、auxv に AT_SYSINFO_EHDR を書かない (時刻はシステムコールで。SA_RESTORER のないシグナルは戻れない)"},
   {"name": "vfat", "type": "extra", "src": "src/vfat.rs", "what": "FAT16 / FAT32 (vfat)。ESP やラズパイの boot の区画を /boot に"},
   {"name": "virtio", "type": "extra", "src": "src/virtio.rs", "what": "virtio-mmio (version 2) の共通部分: デバイス探し、初期化、virtqueue"},

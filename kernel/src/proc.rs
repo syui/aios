@@ -195,6 +195,12 @@ impl Files {
         {
             crate::locks::release_posix(self as *const Files as usize, k);
         }
+        // ソケットなら、送られている途中の輪が残ったかもしれない (unix.rs の gc。システムコールの終わりに)
+        if let Some(fd) = &old
+            && matches!(fd.file.borrow().kind, crate::file::Kind::Unix(_))
+        {
+            crate::unix::closed();
+        }
         old
     }
 
@@ -1197,6 +1203,7 @@ fn exit_status(status: i32) -> ! {
         }
     }
     p.files = None;
+    crate::unix::gc_check(true);
     p.timers.clear();
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;

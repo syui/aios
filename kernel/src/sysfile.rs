@@ -323,7 +323,7 @@ fn rwf_check(f: &FileRef, flags: u32, write: bool) -> Result<(), i64> {
     if flags & RWF_NOWAIT != 0 {
         let ok = match &b.kind {
             Kind::Inode(..) => reg && cached,
-            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
             _ => false,
         };
         if !ok {
@@ -342,10 +342,19 @@ fn rwf_check(f: &FileRef, flags: u32, write: bool) -> Result<(), i64> {
     Ok(())
 }
 
+/// AF_UNIX のソケットなら、その中身
+fn unix_of(f: &FileRef) -> Option<crate::unix::UnixRef> {
+    match &f.borrow().kind {
+        Kind::Unix(u) => Some(u.clone()),
+        _ => None,
+    }
+}
+
 /// パイプや socketpair にいま中身があるか (ほかの流れ (端末など) は、あるものとして)
 fn stream_has_data(f: &FileRef) -> bool {
     match &f.borrow().kind {
-        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => p.borrow().len() > 0,
+        Kind::PipeRead(p) | Kind::PipeRw(p) => p.borrow().len() > 0,
+        Kind::Unix(u) => crate::unix::pending(u) > 0,
         _ => true,
     }
 }
@@ -409,6 +418,9 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: u
     if f.borrow().readable() {
         verify_area(&f, len)?;
     }
+    if let Some(u) = unix_of(&f) {
+        return crate::socket::unix_readv(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0 || dontwait);
+    }
     // パイプから 0 バイト: 何もないときも待たずに 0 (Linux の pipe_read)
     if len == 0 && matches!(f.borrow().kind, Kind::PipeRead(_) | Kind::PipeRw(_)) {
         return if f.borrow().readable() { Ok(0) } else { Err(-EBADF) };
@@ -416,7 +428,7 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: u
     let whole = whole(&f);
     // ふつうのファイルは、読んだ分 (n) をかならず埋める (穴も 0 で)。パイプと socketpair も取りだした分だけ。
     // これらは 0 で埋めておかなくてよい (IPC の小さな read のたびに 64 KiB を埋めると重い)
-    let inode = matches!(f.borrow().kind, Kind::Inode(..) | Kind::PipeRead(_) | Kind::PipeRw(_) | Kind::Pair(..));
+    let inode = matches!(f.borrow().kind, Kind::Inode(..) | Kind::PipeRead(_) | Kind::PipeRw(_) | Kind::Unix(_));
     let nowait = flags & RWF_NOWAIT != 0 || dontwait;
     let file = if flags & (RWF_NOWAIT | RWF_DONTCACHE) != 0 { cached_inode(&f) } else { None };
     // パイプなどから取り出したものは戻せないので、中身があるなら、入れ物にさわれるかを先に確かめる (さわれなければ
@@ -479,6 +491,9 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
     if f.borrow().writable() {
         verify_area(&f, len)?;
     }
+    if let Some(u) = unix_of(&f) {
+        return crate::socket::unix_writev(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
+    }
     let whole = whole(&f);
     // 読み手のいないパイプは、入れ物を写す前に EPIPE (Linux の pipe_write: さわれない入れ物でも EPIPE が先。0 バイトは 0)
     let dead_pipe = len > 0
@@ -498,7 +513,8 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
         let mut tmp = uninit((len - done).min(CHUNK))?;
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = file::write_opt2(&f, &tmp, flags & RWF_NOWAIT != 0, append);
-        if r == Err(-file::EPIPE) && flags & RWF_NOSIGNAL == 0 {
+        // AF_UNIX のソケットは unix.rs で (SOCK_STREAM だけ: Linux の unix_stream_sendmsg)
+        if r == Err(-file::EPIPE) && flags & RWF_NOSIGNAL == 0 && !matches!(f.borrow().kind, Kind::Unix(_)) {
             // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
             let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
             crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
@@ -720,6 +736,10 @@ fn readv2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     }
     verify_area(&f, total)?;
     rwf_check(&f, flags, false)?;
+    // AF_UNIX のソケットは、入れ物みなで 1 回受ける (dgram の 1 つのメッセージ)
+    if let Some(u) = unix_of(&f) {
+        return crate::socket::unix_readv(&f, &u, &v, flags & RWF_NOWAIT != 0);
+    }
     let mut done: usize = 0;
     for (base, len) in v {
         if len == 0 {
@@ -755,6 +775,10 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     }
     verify_area(&f, total)?;
     rwf_check(&f, flags, true)?;
+    // AF_UNIX のソケットは、入れ物みなを 1 回で送る (dgram の 1 つのメッセージ)
+    if let Some(u) = unix_of(&f) {
+        return crate::socket::unix_writev(&f, &u, &v, flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
+    }
     let append = if flags & RWF_APPEND != 0 {
         Some(true)
     } else if flags & RWF_NOAPPEND != 0 {
@@ -1488,24 +1512,38 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     Ok(0)
 }
 
-/// unix ソケットの bind: 名前のファイル (S_IFSOCK) を作る。あれば EADDRINUSE (Linux と同じく、
-/// 前のものが残っていれば、使う側が unlink してから bind する)
-pub fn make_sock(path: &str) -> Result<(), i64> {
-    let (parent, name, _) = vfs::parent_path(&proc::current_cwd(), path)?;
-    if parent.lookup(&name).is_ok() {
-        return Err(-98); // EADDRINUSE
-    }
+/// unix ソケットの bind (Linux の unix_bind_bsd): mknod と同じく最後の名前を作る (S_IFSOCK。許可はソケットの許可
+/// (fchmod で変わる。はじめは 0777) から umask を引いたもの)。あれば EADDRINUSE (Linux と同じく、前のものが残って
+/// いれば、使う側が unlink してから bind する)。作った inode (ソケットが持っておく: 名前を消されても、つなぐ相手は
+/// この inode で見つける) と、その親と名前 (unbind_sock 用)
+pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String), i64> {
+    const EADDRINUSE: i64 = 98;
+    let p = last_at(AT_FDCWD, path)?;
+    new_name(&p).map_err(|e| if e == -EEXIST { -EADDRINUSE } else { e })?;
+    let (parent, name, full) = (p.dir, p.name, p.full);
+    vfs::check_writable(&full)?;
+    crate::landlock::check_parent(&full, crate::landlock::MAKE_SOCK)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
-    let ino = parent.create(&name, 0o777 & !umask(), NewNode::Sock)?;
+    let ino = parent.create(&name, mode & 0o7777 & !umask(), NewNode::Sock)?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
-    Ok(())
+    Ok((ino, parent, name))
 }
 
-/// path が unix ソケットのファイルか
-pub fn is_sock(path: &str) -> bool {
-    vfs::resolve(&proc::current_cwd(), path, true).is_ok_and(|i| i.meta().mode & S_IFMT == vfs::S_IFSOCK)
+/// bind_sock で作った名前を消す (もう名前のあるソケットだった: Linux の unix_bind_bsd の vfs_unlink。許可は見ない)
+pub fn unbind_sock(parent: &InodeRef, name: &str) {
+    if parent.unlink(name, false).is_ok() {
+        inotify::dir_event(parent, name, inotify::IN_DELETE, 0);
+    }
+}
+
+/// unix ソケットの connect / sendto の相手 (Linux の unix_find_bsd): パスをたどり (リンクも)、書ける (W) ものか。
+/// ソケットのファイルでなくても、ここでは inode を返す (ECONNREFUSED は呼ぶほうで)
+pub fn find_sock(path: &str) -> Result<InodeRef, i64> {
+    let (_, i) = vfs::lookup(&proc::current().files().cwd.clone(), path, true)?;
+    proc::current_cred_ref().check(&i.meta(), PW)?;
+    Ok(i)
 }
 
 pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
@@ -1917,6 +1955,10 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
     if f.borrow().flags & file::O_PATH != 0 {
         return Err(-EBADF);
     }
+    // ソケット: 持ち主か root (Linux の sockfs の inode。bind で作るファイルの許可にもなる)
+    if let Kind::Unix(u) = &f.borrow().kind {
+        return crate::unix::chmod(u, mode as u32);
+    }
     // パイプ: 持ち主か root が、fstat に見える許可を変えられる (Linux の pipefs の inode)
     if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
         use core::sync::atomic::Ordering::Relaxed;
@@ -2044,6 +2086,17 @@ fn chown_fd(fd: u64, uid: u64, gid: u64, opath_ok: bool) -> R {
     if f.borrow().flags & file::O_PATH != 0 && !opath_ok {
         return Err(-EBADF);
     }
+    let sock = match &f.borrow().kind {
+        Kind::Unix(u) => Some(u.clone()),
+        _ => None,
+    };
+    if let Some(u) = sock {
+        let (uid, gid) = chown_ids(uid, gid)?;
+        let (cu, cg, cm) = crate::unix::owner_mode(&u);
+        let mode = chown_mode(&cred::current(), (cu, cg, vfs::S_IFSOCK | cm), uid, gid)?;
+        crate::unix::set_owner_mode(&u, uid, gid, mode);
+        return Ok(0);
+    }
     if let Some(p) = pipe_of(fd) {
         let (uid, gid) = chown_ids(uid, gid)?;
         let cur = (p.uid.load(Relaxed), p.gid.load(Relaxed), vfs::S_IFIFO | p.perm.load(Relaxed));
@@ -2123,15 +2176,26 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         if omit {
             return Ok(0);
         }
-        // パイプ (pipefs の inode): 持ち主と許可は fstat に見せるもの
-        if let Some(p) = pipe_of(dirfd as u64) {
+        // パイプとソケット (pipefs と sockfs の inode): 持ち主と許可は fstat に見せるもの
+        let pipe = pipe_of(dirfd as u64);
+        let sock = unix_of(&f);
+        let owner = if let Some(p) = &pipe {
+            use core::sync::atomic::Ordering::Relaxed;
+            Some((vfs::S_IFIFO | p.perm.load(Relaxed), p.uid.load(Relaxed), p.gid.load(Relaxed)))
+        } else {
+            sock.as_ref().map(|u| {
+                let (uid, gid, mode) = crate::unix::owner_mode(u);
+                (vfs::S_IFSOCK | mode, uid, gid)
+            })
+        };
+        if let Some((mode, uid, gid)) = owner {
             use core::sync::atomic::Ordering::Relaxed;
             let ns_ok = |ns: i64| ns == UTIME_NOW || ns == UTIME_OMIT || (0..1_000_000_000).contains(&ns);
             if t.is_some_and(|t| !ns_ok(t[0].1) || !ns_ok(t[1].1)) {
                 return Err(-EINVAL);
             }
             let c = cred::current();
-            let m = vfs::Meta { ino: 0, mode: vfs::S_IFIFO | p.perm.load(Relaxed), nlink: 1, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
+            let m = vfs::Meta { ino: 0, mode, nlink: 1, uid, gid, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
             let touch = t.is_none_or(|t| t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW);
             if !c.owns(&m) {
                 if !touch {
@@ -2142,12 +2206,19 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
                 }
             }
             let now = crate::timer::epoch_ns();
-            match t.map(|t| t[1]) {
-                Some((_, UTIME_OMIT)) => {}
-                None | Some((_, UTIME_NOW)) => p.mtime.store(now, Relaxed),
-                Some((sec, ns)) => p.mtime.store(sec.max(0) as u64 * 1_000_000_000 + ns as u64, Relaxed),
+            let mtime = match t.map(|t| t[1]) {
+                Some((_, UTIME_OMIT)) => None,
+                None | Some((_, UTIME_NOW)) => Some(now),
+                Some((sec, ns)) => Some(sec.max(0) as u64 * 1_000_000_000 + ns as u64),
+            };
+            if let Some(p) = &pipe {
+                if let Some(m) = mtime {
+                    p.mtime.store(m, Relaxed);
+                }
+                p.ctime.store(now, Relaxed);
+            } else if let Some(u) = &sock {
+                crate::unix::touch(u, mtime);
             }
-            p.ctime.store(now, Relaxed);
             return Ok(0);
         }
         let b = f.borrow();
@@ -2266,7 +2337,8 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             let (owner, odirect) = match &f.kind {
                 Kind::Inode(i, _) => (Some(i.meta().uid), i.meta().mode & S_IFMT == vfs::S_IFREG),
                 Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (Some(p.uid.load(core::sync::atomic::Ordering::Relaxed)), true),
-                Kind::Socket(_) | Kind::Pair(..) => (Some(cred::current().euid), false),
+                Kind::Socket(_) => (Some(cred::current().euid), false),
+                Kind::Unix(u) => (Some(crate::unix::owner(u)), false),
                 // eventfd などの名前のない inode は root のもの
                 _ => (None, false),
             };
@@ -2347,6 +2419,10 @@ pub fn pipe2(fds: usize, flags: u64) -> R {
 
 pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     let f = file_of(fd)?;
+    // O_PATH の fd は ioctl に使えない (Linux の fdget)
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
     if req == FIONBIO {
         let mut v = [0u8; 4];
         proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
@@ -2391,17 +2467,32 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         let nonblock = f.borrow().flags & crate::file::O_NONBLOCK != 0;
         return if pcm { crate::sound::pcm_ioctl(req, arg, nonblock) } else { crate::sound::ctl_ioctl(req, arg) };
     }
-    // FIONREAD: いま読めるバイト数 (パイプ、socketpair と AF_UNIX のソケット、TCP / UDP のソケット、ふつうのファイル)。
-    // 端末のものは tty の ioctl で
+    // AF_UNIX のソケット (Linux の unix_ioctl): SIOCOUTQ は送って読まれていない大きさ、SIOCATMARK は MSG_OOB の印か
+    const SIOCOUTQ: u64 = 0x5411;
+    const SIOCATMARK: u64 = 0x8905;
+    let sock = match &f.borrow().kind {
+        Kind::Unix(u) => Some(u.clone()),
+        _ => None,
+    };
+    if let Some(u) = sock.filter(|_| req == SIOCOUTQ || req == SIOCATMARK) {
+        let v = if req == SIOCOUTQ { crate::unix::outq(&u) as i32 } else { crate::unix::atmark(&u)? as i32 };
+        return out(arg, &v.to_le_bytes()).map(|_| 0);
+    }
+    // FIONREAD: いま読めるバイト数 (パイプ、AF_UNIX のソケット (listen しているものは EINVAL)、TCP / UDP のソケット、
+    // ふつうのファイル)。端末のものは tty の ioctl で
     const FIONREAD: u64 = 0x541b;
     if req == FIONREAD {
         let f = f.borrow();
         let n = match &f.kind {
-            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Some(p.borrow().len()),
-            Kind::Unix(_) => Some(0),
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Some(p.borrow().len()),
+            Kind::Unix(u) => Some(crate::unix::inq(u)?),
             Kind::Socket(s) => Some(s.borrow().available()),
             Kind::Inotify(n) => Some(inotify::pending(n)),
-            Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => Some((ino.meta().size as usize).saturating_sub(f.offset)),
+            // ふつうのファイルは大きさ - 位置 (終わりより先なら負: Linux の do_vfs_ioctl)
+            Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => {
+                let n = ino.meta().size as i64 - f.offset as i64;
+                return out(arg, &(n as i32).to_le_bytes()).map(|_| 0);
+            }
             _ => None,
         };
         if let Some(n) = n {
@@ -2606,6 +2697,15 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
                 match proc::current().files().get(fd as u64) {
                     None => rev = POLLNVAL,
                     Some(f) => {
+                        // Linux と同じビットがわかるものは、そのうち頼まれたもの (と、いつも POLLERR と POLLHUP)
+                        if let Some(m) = f.borrow().poll_mask() {
+                            rev = (m & (events as u16 as u32 | 0x18)) as u16 as i16;
+                            e[6..8].copy_from_slice(&rev.to_le_bytes());
+                            if rev != 0 {
+                                count += 1;
+                            }
+                            continue;
+                        }
                         let (r, w, hup) = f.borrow().readiness();
                         if r {
                             rev |= events & POLLIN;
@@ -2648,7 +2748,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
         }
         Ok(b)
     };
-    let (want_r, want_w) = (load(rd)?, load(wr)?);
+    let (want_r, want_w, want_e) = (load(rd)?, load(wr)?, load(ex)?);
     let bit = |b: &[u8], i: usize| b[i / 8] & (1 << (i % 8)) != 0;
     let deadline = if tmo == 0 {
         None
@@ -2660,7 +2760,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
     };
     let mut keys = Some(alloc::vec::Vec::new());
     for i in 0..nfds {
-        if bit(&want_r, i) || bit(&want_w, i) {
+        if bit(&want_r, i) || bit(&want_w, i) || bit(&want_e, i) {
             match proc::current().files().get(i as u64).map(|f| f.borrow().poll_keys()) {
                 Some(Some(k)) => keys.as_mut().map_or((), |v: &mut alloc::vec::Vec<usize>| v.extend(k)),
                 Some(None) => keys = None,
@@ -2670,18 +2770,33 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
     }
     let _watch = (!deadline.is_some_and(|d| d <= crate::timer::ticks())).then(|| {
         let files = proc::current().files();
-        let fs: alloc::vec::Vec<FileRef> = (0..nfds).filter(|&i| bit(&want_r, i) || bit(&want_w, i)).filter_map(|i| files.get(i as u64).cloned()).collect();
+        let fs: alloc::vec::Vec<FileRef> = (0..nfds).filter(|&i| bit(&want_r, i) || bit(&want_w, i) || bit(&want_e, i)).filter_map(|i| files.get(i as u64).cloned()).collect();
         file::PollWatch::new(fs.iter())
     });
     loop {
-        let (mut got_r, mut got_w) = (vec![0u8; bytes], vec![0u8; bytes]);
+        let (mut got_r, mut got_w, mut got_e) = (vec![0u8; bytes], vec![0u8; bytes], vec![0u8; bytes]);
         let mut count = 0;
         for i in 0..nfds {
-            let (r_, w_) = (bit(&want_r, i), bit(&want_w, i));
-            if !r_ && !w_ {
+            let (r_, w_, e_) = (bit(&want_r, i), bit(&want_w, i), bit(&want_e, i));
+            if !r_ && !w_ && !e_ {
                 continue;
             }
             let f = proc::current().files().get(i as u64).cloned().ok_or(-EBADF)?;
+            // Linux と同じビットがわかるもの: 読める = POLLIN_SET (IN、RDNORM、RDBAND、HUP、ERR)、書ける = POLLOUT_SET
+            // (OUT、WRNORM、WRBAND、ERR)、例外 = POLLPRI
+            let mask = f.borrow().poll_mask();
+            if let Some(m) = mask {
+                for (want, set, got) in [(r_, 0x1 | 0x40 | 0x80 | 0x10 | 0x8, &mut got_r), (w_, 0x4 | 0x100 | 0x200 | 0x8, &mut got_w), (e_, 0x2, &mut got_e)] {
+                    if want && m & set != 0 {
+                        got[i / 8] |= 1 << (i % 8);
+                        count += 1;
+                    }
+                }
+                continue;
+            }
+            if !r_ && !w_ {
+                continue;
+            }
             let (r, w, hup) = f.borrow().readiness();
             if r_ && (r || hup) {
                 got_r[i / 8] |= 1 << (i % 8);
@@ -2694,7 +2809,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
         }
         let expired = deadline.is_some_and(|d| crate::timer::ticks() >= d);
         if count > 0 || expired {
-            for (va, b) in [(rd, &got_r), (wr, &got_w), (ex, &vec![0u8; bytes])] {
+            for (va, b) in [(rd, &got_r), (wr, &got_w), (ex, &got_e)] {
                 if va != 0 {
                     out(va, b)?;
                 }
@@ -2882,6 +2997,9 @@ fn splice_stream_to_pipe(f: &FileRef, p: &alloc::rc::Rc<file::PipeCell>, len: us
         }
         return Err(e);
     }
+    if let Some(u) = unix_of(f) {
+        return socket_to_pipe(f, &u, 0, p, len, nonblock);
+    }
     let free = {
         let pp = p.borrow();
         pp.slots().saturating_sub(pp.used_slots())
@@ -2889,6 +3007,55 @@ fn splice_stream_to_pipe(f: &FileRef, p: &alloc::rc::Rc<file::PipeCell>, len: us
     let mut tmp = uninit(len.min(free * crate::memlayout::PGSIZE))?;
     let n = file::read(f, &mut tmp)?;
     Ok(Pipe::splice_in(p, 0, &tmp[..n]))
+}
+
+/// AF_UNIX のソケットからパイプへ (Linux の sock_splice_read)。位置は 0 でなければ ESPIPE。stream は
+/// unix_stream_splice_read: ソケットか splice の NONBLOCK なら待たず、メッセージごとにパイプの箱を分けて、あいた箱に
+/// 入る分だけ (先に MSG_PEEK で見て数える)。dgram と seqpacket は copy_splice_read (sock_read_iter): ソケットの
+/// O_NONBLOCK だけを見て、メッセージ 1 つを、あいた箱 × 4 KiB に入る分だけ (のこりは捨てる)。届いた fd は閉じる
+fn socket_to_pipe(f: &FileRef, u: &crate::unix::UnixRef, pos: i64, p: &alloc::rc::Rc<file::PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+    const PG: usize = crate::memlayout::PGSIZE;
+    const MSG_PEEK: u64 = 0x2;
+    if pos != 0 {
+        return Err(-file::ESPIPE);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let free = {
+        let pp = p.borrow();
+        pp.slots().saturating_sub(pp.used_slots())
+    };
+    let room = len.min(free * PG).min(MAX_RW_COUNT);
+    let sock_nb = f.borrow().flags & O_NONBLOCK != 0;
+    let r = if u.borrow().typ == crate::unix::SOCK_STREAM {
+        let nb = sock_nb || nonblock;
+        let peek = crate::unix::recv(u, room, MSG_PEEK, nb)?;
+        // 箱に入る分: メッセージごとに、その長さの 4 KiB の箱
+        let (mut fit, mut left) = (0, free);
+        for &n in &peek.parts {
+            let need = n.div_ceil(PG);
+            if need > left {
+                fit += left * PG;
+                break;
+            }
+            fit += n;
+            left -= need;
+        }
+        if fit == 0 {
+            return Ok(0);
+        }
+        crate::unix::recv(u, fit, 0, nb)?
+    } else {
+        crate::unix::recv(u, room, 0, sock_nb)?
+    };
+    let mut done = 0;
+    let mut at = 0;
+    for &n in &r.parts {
+        done += Pipe::splice_in(p, 0, &r.data[at..at + n]);
+        at += n;
+    }
+    Ok(done)
 }
 
 fn read_off(va: usize) -> Result<i64, i64> {
@@ -2935,6 +3102,9 @@ fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeC
     }
     if len == 0 {
         return Ok(0);
+    }
+    if let Some(u) = unix_of(f) {
+        return socket_to_pipe(f, &u, *pos, p, len, nonblock);
     }
     // ファイルのほかは splice で読めない (ディレクトリ、パイプ: Linux も EINVAL)
     let Some((ino, path)) = inode_path(f).filter(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFREG) else { return Err(-EINVAL) };

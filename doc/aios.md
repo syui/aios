@@ -223,7 +223,13 @@ SIGUSR1、SIGINT、SIGTSTP をそれぞれ既定 / 無視 / ハンドラ / ブ�
 kill (その子か、そのグループに。シグナルの番号は 0 とだめなものも)、wait4 / waitid (いつも WNOHANG。相手はその子、だれでも、
 自分のグループ、その子のグループ、いない番号。options は WUNTRACED / WSTOPPED / WCONTINUED / WNOWAIT と知らないビット)、
 自分の SIGCHLD の扱い (SIG_DFL / SIG_IGN / ハンドラと SA_NOCLDSTOP / SA_NOCLDWAIT)、setpgid / getpgid / getsid。子の番号は
-kN、自分は me と出す)) を、
+kN、自分は me と出す)、AF_UNIX のソケット (socket / socketpair: SOCK_STREAM / DGRAM / SEQPACKET / RAW と知らない型、
+protocol、知らないフラグ、AF_INET と知らない family。bind / connect の名前: パス、ディレクトリの中、リンクの先、ふつうの
+ファイル、ないディレクトリ、抽象名前空間、autobind、長さ 0 の抽象、108 文字、AF_INET、長さ 1、AF_UNSPEC。listen の backlog、
+accept4、send / sendto / sendmsg (MSG_OOB / DONTWAIT / NOSIGNAL / EOR / MORE / CONFIRM / PEEK、SCM_RIGHTS、SCM_CREDENTIALS
+(自分と、ほかの pid)、知らない cmsg)、recv / recvfrom / recvmsg (MSG_PEEK / TRUNC / WAITALL / DONTWAIT / OOB / CMSG_CLOEXEC /
+ERRQUEUE、付帯データの入れ物の大きさ)、shutdown、getsockopt / setsockopt、getsockname / getpeername、poll と FIONREAD。
+いつも SOCK_NONBLOCK で作る)) を、
 はじめの木 (a、b/、b/c、d -> b) の上で動かし、答えを 1 行ずつ出す。並びは種だけで決まる (動かした答えによらない) ので、同じ
 種なら Linux でも aios でも同じシステムコールが同じ順に動き、2 つの出力の最初にちがう行がふるまいのちがいになる。答えは
 アーキテクチャによらない形 (フラグは名前、stat は種類と許可とリンクの数と大きさ、ino や時刻は出さない) で、x86_64 の Linux と
@@ -331,6 +337,34 @@ aios は NOWAIT で読めなかったとき 1 ページしか読んでおかず�
 (Linux の先読みは読もうとした範囲をみな読む)。読もうとした範囲 (128 KiB まで) のページをみな読んでおくようにした。
 ロボットの側も、Linux の 2 回めの読みは先読みのディスクが終わるまで (EAGAIN のあいだ 1 秒まで) 待つようにした
 (RWF_DONTCACHE のときは、終わるまで EAGAIN のまま)。
+
+ソケット (AF_UNIX) を覚えさせたとき (Linux 7.3 と、ext4 1500 × 30 と 400 × 80、tmpfs 500 × 30 でどれもちがわない): はじめは
+300 の case のうち 259 がちがった (61 種類)。aios の AF_UNIX は SOCK_STREAM だけで、つながるとパイプ 2 本にしていたので、作り
+なおした (kernel/src/unix.rs。Linux の net/unix/af_unix.c と同じ考え): どのソケットも受ける行列 (Linux の skb の並び) を持ち、
+SOCK_DGRAM (SOCK_RAW もこれ) と SOCK_SEQPACKET はメッセージの区切りを、SOCK_STREAM は MSG_OOB の 1 バイトと、ちがう人の
+資格情報をつなげない決まりを保つ。送った大きさは Linux と同じ skb の truesize (中身と kmalloc の箱とページの分。Linux 7.3 で
+測った) で送った側に数え、sndbuf をこえたら EAGAIN、4 分の 1 をこえたら POLLOUT なし。dgram は相手の行列が max_dgram_qlen (10)
+をこえたら待つ。名前は、パスなら bind でソケットのファイルを作り (許可はソケットの許可 (fchmod で変わる) から umask を引いたもの)、
+つなぐ相手はその inode で見つける。抽象名前空間は型ごと (Linux の unix_abstract_hash は型をまぜる)。connect はつながる前の口
+(embryo) を listen しているものの行列に入れ、accept の名前はつないできたほう。閉じたあとは Linux と同じ (読まれていないものが
+あれば相手に ECONNRESET、listen しているものが accept せずに閉じれば、つないだほうにも)。SCM_RIGHTS と SCM_CREDENTIALS
+(自分の pid と uid / gid のどれかだけ。SO_PASSCRED のない送り手の資格情報は pid 0 と overflowuid) は Linux の __scm_send と
+scm_recv の順と長さで (MSG_CTRUNC も)、MSG_PEEK と SO_PEEK_OFF、MSG_TRUNC、MSG_WAITALL、SO_RCVLOWAT、SO_RCVTIMEO /
+SO_SNDTIMEO、SO_LINGER、SO_PEERCRED (listen と connect と socketpair のときのプロセス)、SIOCINQ / SIOCOUTQ / SIOCATMARK も。
+read / readv / write / writev は 1 回の sendmsg / recvmsg (dgram の 1 つのメッセージ)、0 バイトの read は何もせずに 0。
+poll / select / epoll は、ソケットとパイプとふつうのファイルについて Linux の f_op->poll と同じビットを見る (unix_poll と
+unix_dgram_poll、パイプの pipe_poll: 書く口は読み手がいなければ POLLERR だけ。aios は POLLHUP も出していた)。ほかにも直した
+もの: ソケットのシステムコールは O_PATH の fd を EBADF に (ioctl も)、パイプの書く口の FIONREAD、ふつうのファイルの FIONREAD は
+終わりより先なら負、getdents のソケットの型 (DT_SOCK)、ソケットの fd への utimensat (pipefs と同じく、ns のしらべと持ち主)、
+ソケットからパイプへの splice / sendfile (Linux の sock_splice_read: stream はメッセージごとにパイプの箱を分ける)。
+送られている途中のソケットの輪 (自分の fd を自分の行列に入れたものや、たがいの fd を持ちあうもの) は、どの fd の表からもたどれ
+なければ片づける (Linux の unix_gc と同じ考え)。aios は、ソケットの fd を閉じたシステムコールの終わりにすぐ見る (Linux は
+ほかのソケットが閉じたときに、うしろで)。Linux とちがうところがもう 1 つ: MSG_OOB の 1 バイトを読みとばしたとき
+(SO_OOBINLINE なし)、FIONREAD の数からも引く (Linux 7.3 の manage_oob は引かず、FIONREAD が 1 多いままになる)。
+test/unixsock.c が、ロボットの見ないプロセスをまたぐところ (待つ read / accept / poll / epoll、SO_RCVTIMEO、MSG_WAITALL、
+1 MiB の stream、fd を渡す、SO_PEERCRED、閉じたあと、SEQPACKET の区切り、dgram のいっぱいの行列と POLLOUT、gc) をじかに
+確かめる (Linux 7.3 でも同じ答え)。手本の Linux の設定 (test/linux.config) には NET と UNIX (AF_UNIX_OOB も) と INET を足した
+(設定が変われば test/linux-vm.sh が作りなおす)。
 
 #### aios がえらんだちがい
 

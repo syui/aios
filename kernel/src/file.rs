@@ -41,10 +41,8 @@ pub enum Kind {
     PipeWrite(Rc<PipeCell>),
     /// O_RDWR で開いた FIFO (読み書き両方の口)
     PipeRw(Rc<PipeCell>),
-    /// socketpair の片方: rx から読み、tx へ書く
-    Pair(Rc<PipeCell>, Rc<PipeCell>),
     Socket(crate::socket::SockRef),
-    /// AF_UNIX のソケットで、まだつながっていないもの (bind / listen 中)。つながると Pair になる
+    /// AF_UNIX のソケット (socketpair も。分けた NET の中の AF_INET の TCP も: unix.rs)
     Unix(crate::unix::UnixRef),
     Epoll(crate::epoll::EpollRef),
     EventFd(crate::epoll::EventFdRef),
@@ -241,7 +239,8 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     match k {
         Kind::Tty(t) => tty::read(t, dst, nonblock),
         Kind::PtyMaster(t) => tty::master_read(t, dst, nonblock),
-        Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => Pipe::read_ex(p, dst, false, nonblock),
+        Kind::PipeRead(p) | Kind::PipeRw(p) => Pipe::read_ex(p, dst, false, nonblock),
+        Kind::Unix(u) => crate::unix::read(u, dst, nonblock),
         Kind::Socket(s) => s.borrow_mut().read(dst),
         Kind::EventFd(e) => crate::epoll::read(e, dst, nonblock),
         Kind::TimerFd(t) => crate::timerfd::read(t, dst, nonblock),
@@ -264,7 +263,7 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
             }
             Ok(n)
         }
-        Kind::Pair(_, p) => Pipe::write(p, src, nonblock),
+        Kind::Unix(u) => crate::unix::write(u, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
         Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
         Kind::TimerFd(_) => Err(-EINVAL),
@@ -303,7 +302,7 @@ impl Stat {
         }
     }
 
-    fn dev(mode: u32, rdev: u64) -> Stat {
+    pub fn dev(mode: u32, rdev: u64) -> Stat {
         Stat { ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, mtime: 0, ctime: 0 }
     }
 
@@ -416,7 +415,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Pair(..) | Kind::Socket(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Input(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Socket(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Input(_) => self.kind.clone(),
             _ => return None,
         };
         Some((k, self.flags & O_NONBLOCK != 0))
@@ -496,7 +495,8 @@ impl OpenFile {
                 use core::sync::atomic::Ordering::Relaxed;
                 Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
             }
-            Kind::Socket(_) | Kind::Pair(..) | Kind::Unix(_) => Stat::dev(0o140000 | 0o777, 0),
+            Kind::Socket(_) => Stat::dev(0o140000 | 0o777, 0),
+            Kind::Unix(u) => crate::unix::stat(u),
             // 名前のない inode (anon_inode)
             Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => Stat::dev(0o600, 0),
         }
@@ -506,7 +506,6 @@ impl OpenFile {
     pub fn event_gen(&self) -> u64 {
         match &self.kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().generation,
-            Kind::Pair(rx, tx) => rx.borrow().generation.wrapping_add(tx.borrow().generation),
             Kind::EventFd(e) => crate::epoll::generation(e),
             Kind::TimerFd(t) => crate::timerfd::generation(t),
             Kind::Inotify(n) => crate::inotify::generation(n),
@@ -531,9 +530,8 @@ impl OpenFile {
             Kind::SndPcm => "/dev/snd/pcmC0D0p".into(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
-            Kind::Pair(p, _) => alloc::format!("socket:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
-            Kind::Unix(u) => alloc::format!("socket:[{}]", Rc::as_ptr(u) as usize & 0xffffff),
+            Kind::Unix(u) => crate::unix::describe(u),
             Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
             Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
             Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
@@ -549,20 +547,7 @@ impl OpenFile {
         let (r, w, h) = self.readiness();
         let rw = alloc::format!("r{}w{}h{}", r as u8, w as u8, h as u8);
         match &self.kind {
-            Kind::Pair(rx, tx) => {
-                let (rx, tx) = (rx.borrow(), tx.borrow());
-                let types = |p: &Pipe| p.types.iter().map(|(t, (n, at))| alloc::format!("{}:{}@{}", t, n, at)).collect::<Vec<_>>().join(" ");
-                let heads = |p: &Pipe| {
-                    p.heads.iter().map(|h| {
-                        let u = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-                        alloc::format!("{:x}/{}/{}", u(8), u(0), u(4) as i32)
-                    }).collect::<Vec<_>>().join(" ")
-                };
-                alloc::format!(
-                    "{} {} rx={} (writers {}, gen {}, bytes {}) tx={} (readers {}, gen {}, bytes {})\n    in: {}\n    out: {}\n    intypes: {}\n    outtypes: {}",
-                    self.describe(), rw, rx.len(), rx.writers, rx.generation, rx.wrote, tx.len(), tx.readers, tx.generation, tx.wrote, heads(&rx), heads(&tx), types(&rx), types(&tx)
-                )
-            }
+            Kind::Unix(u) => alloc::format!("{} {} {}", self.describe(), rw, crate::unix::debug(u)),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let p = p.borrow();
                 alloc::format!("{} {} len={} r={} w={}", self.describe(), rw, p.len(), p.readers, p.writers)
@@ -576,7 +561,8 @@ impl OpenFile {
     /// eventfd は数、inotify はバイト。ないもの (ふつうのファイルなど) は None
     pub fn pending(&self) -> Option<u64> {
         Some(match &self.kind {
-            Kind::PipeRead(p) | Kind::PipeRw(p) | Kind::Pair(p, _) => p.borrow().len() as u64,
+            Kind::PipeRead(p) | Kind::PipeRw(p) => p.borrow().len() as u64,
+            Kind::Unix(u) => crate::unix::pending(u),
             Kind::Socket(s) => s.borrow().available() as u64,
             Kind::EventFd(e) => crate::epoll::count(e),
             Kind::Inotify(n) => crate::inotify::pending(n) as u64,
@@ -601,12 +587,12 @@ impl OpenFile {
                 let p = p.borrow();
                 (p.len() > 0, !p.full(), false)
             }
-            Kind::Pair(rx, tx) => {
-                let (rx, tx) = (rx.borrow(), tx.borrow());
-                (rx.len() > 0 || rx.writers == 0, !tx.full(), rx.writers == 0 && rx.len() == 0)
-            }
             Kind::Socket(s) => s.borrow().readiness(),
-            Kind::Unix(u) => crate::unix::readiness(u),
+            Kind::Unix(u) => {
+                use crate::unix::*;
+                let m = poll_mask(u);
+                (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
+            }
             Kind::EventFd(e) => crate::epoll::readiness(e),
             Kind::TimerFd(t) => crate::timerfd::readiness(t),
             Kind::Inotify(n) => crate::inotify::readiness(n),
@@ -618,13 +604,47 @@ impl OpenFile {
         }
     }
 
+    /// poll のビット (Linux の f_op->poll と同じもの: POLLIN、POLLOUT、POLLERR、POLLHUP、POLLPRI、POLLRDHUP ...)。
+    /// AF_UNIX のソケット、パイプ、いつでも読み書きできるもの (Linux の DEFAULT_POLLMASK) だけ。ほかは None
+    /// (readiness の 3 つで)
+    pub fn poll_mask(&self) -> Option<u32> {
+        use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
+        Some(match &self.kind {
+            Kind::Unix(u) => crate::unix::poll_mask(u),
+            // Linux の pipe_poll: 読む口は中身があれば IN、書く口がなければ HUP。書く口は箱があれば OUT、読む口が
+            // なければ ERR
+            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
+                let p = p.borrow();
+                let mut m = 0;
+                if self.readable() {
+                    if p.len() > 0 {
+                        m |= POLLIN | POLLRDNORM;
+                    }
+                    if p.writers == 0 {
+                        m |= POLLHUP;
+                    }
+                }
+                if self.writable() {
+                    if !p.full() {
+                        m |= POLLOUT | POLLWRNORM;
+                    }
+                    if p.readers == 0 {
+                        m |= POLLERR;
+                    }
+                }
+                m
+            }
+            Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM,
+            _ => return None,
+        })
+    }
+
     /// poll で待つときの印 (変わったときに poll_wake されるもの)。None はわからない (何かあれば起こす)
     pub fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
         Some(match &self.kind {
             Kind::Tty(t) | Kind::PtyMaster(t) => alloc::vec![t.borrow().poll_key()],
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
-            Kind::Pair(rx, tx) => alloc::vec![Rc::as_ptr(rx) as usize, Rc::as_ptr(tx) as usize],
-            Kind::Unix(u) => alloc::vec![Rc::as_ptr(u) as usize],
+            Kind::Unix(u) => crate::unix::poll_keys(u),
             Kind::TimerFd(t) => alloc::vec![crate::timerfd::chan(t)],
             // eventfd、inotify、TCP / UDP のソケット (ネットワークで何か変わると net::poll が net::chan() を起こす)。
             // 印がないと、どこかのパイプに書くたびに起こされる (Firefox の gmain が 1 秒に何百回も起きていた)
@@ -880,8 +900,10 @@ fn dtype(mode: u32) -> u8 {
         0o010000 => 1,  // DT_FIFO
         0o020000 => 2,  // DT_CHR
         0o040000 => 4,  // DT_DIR
+        0o060000 => 6,  // DT_BLK
         0o100000 => 8,  // DT_REG
         0o120000 => 10, // DT_LNK
+        0o140000 => 12, // DT_SOCK
         _ => 0,
     }
 }
@@ -915,14 +937,7 @@ impl Drop for OpenFile {
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::poll_wake(Rc::as_ptr(p) as usize);
             }
-            Kind::Pair(rx, tx) => {
-                { let mut pp = rx.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
-                { let mut pp = tx.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
-                proc::wakeup(Rc::as_ptr(rx) as usize);
-                proc::wakeup(Rc::as_ptr(tx) as usize);
-                proc::poll_wake(Rc::as_ptr(rx) as usize);
-                proc::poll_wake(Rc::as_ptr(tx) as usize);
-            }
+            Kind::Unix(u) => crate::unix::release(u),
             Kind::Tty(t) if matches!(t.borrow().dev, tty::Dev::Pty(_)) => tty::close_slave(t),
             Kind::PtyMaster(t) => tty::close_master(t),
             _ => {}
@@ -1089,16 +1104,6 @@ pub struct Pipe {
     /// これまでに書かれた / 読まれたバイト数 (SCM_RIGHTS の fd がどのバイトについてきたか)
     pub wrote: u64,
     pub taken: u64,
-    /// 分けた NET の中の TCP (unix.rs の inet): このパイプに書く口のポート (getsockname / getpeername)
-    pub inet: Option<u16>,
-    /// sendmsg の SCM_RIGHTS で送られた fd (wrote のどこから始まるデータについてきたか)
-    pub rights: alloc::collections::VecDeque<(u64, Vec<FileRef>)>,
-    /// 調べるための記録: 最近の書きこみの頭 20 バイト (IPC のメッセージの見出し)
-    pub heads: alloc::collections::VecDeque<[u8; 20]>,
-    /// 調べるための記録: 書きこみの頭の IPC のメッセージの型ごとの (回数, 最後に書いたのは何回目の書きこみか)
-    pub types: alloc::collections::BTreeMap<u32, (u32, u64)>,
-    /// AF_UNIX: このパイプに書くほうのプロセス (pid, uid, gid)。読むほうの SO_PEERCRED (unix.rs)
-    pub cred: Option<(u32, u32, u32)>,
     /// このパイプで眠っているもの (読む・書く・FIFO を開く) の数。大きなロックなしの read/write (fast_rw) は、
     /// 0 でなければ起こしを頼む
     sleepers: usize,
@@ -1437,7 +1442,7 @@ impl core::ops::DerefMut for PipeGuard<'_> {
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue::new();
-        let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
+        let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -1570,18 +1575,10 @@ impl Pipe {
         Ok(kind)
     }
 
-    /// socketpair: 向かい合わせにつないだ 2 本のパイプ
-    pub fn pair() -> (Kind, Kind) {
-        let q = || PageQueue::new();
-        let mk = || Rc::new(PipeCell::new(Pipe { data: q(), cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }));
-        let (a, b) = (mk(), mk());
-        (Kind::Pair(a.clone(), b.clone()), Kind::Pair(b, a))
-    }
-
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<PipeCell> {
         let q = PageQueue::new();
-        Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, rights: alloc::collections::VecDeque::new(), heads: alloc::collections::VecDeque::new(), types: alloc::collections::BTreeMap::new(), cred: None, inet: None, sleepers: 0, watchers: 0, epolled: false }))
+        Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false }))
     }
 
     /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らずにすむときだけ。ほかは None で
@@ -1934,20 +1931,6 @@ impl Pipe {
                 }
                 let k = pp.data.write_room(src.len() - done, pp.slots(), first);
                 if k > 0 {
-                    if done == 0 && src.len() >= 20 {
-                        if pp.heads.len() >= 32 {
-                            pp.heads.pop_front();
-                        }
-                        pp.heads.push_back(src[..20].try_into().unwrap());
-                        // IPC でないもの (ふつうのパイプ) では型がばらばらなので、128 種類まで
-                        let t = u32::from_le_bytes(src[4..8].try_into().unwrap());
-                        let nth = pp.generation;
-                        if pp.types.len() < 128 || pp.types.contains_key(&t) {
-                            let e = pp.types.entry(t).or_insert((0, 0));
-                            e.0 += 1;
-                            e.1 = nth;
-                        }
-                    }
                     let slots = pp.slots();
                     let k = match pp.data.push_write(&src[done..], slots, first) {
                         Ok(k) => k,

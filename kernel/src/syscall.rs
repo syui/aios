@@ -443,9 +443,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PPOLL => signal::wait_mask(a[3] as usize).and_then(|_| sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize)),
         PSELECT6 => signal::pselect_mask(a[5] as usize).and_then(signal::wait_mask).and_then(|_| sysfile::pselect6(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
         SOCKET => socket::socket(a[0], a[1], a[2]),
-        SOCKETPAIR => socket::socketpair(a[0], a[1], a[3] as usize),
+        SOCKETPAIR => socket::socketpair(a[0], a[1], a[2], a[3] as usize),
         BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),
-        LISTEN => socket::listen(a[0]),
+        LISTEN => socket::listen(a[0], a[1]),
         ACCEPT => socket::accept(a[0], a[1] as usize, a[2] as usize, 0),
         ACCEPT4 => socket::accept(a[0], a[1] as usize, a[2] as usize, a[3]),
         CONNECT => socket::connect(a[0], a[1] as usize, a[2] as usize),
@@ -622,6 +622,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
     strace(nr, &a, r);
+    // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
+    crate::unix::gc_check(false);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
     (r == Err(-EINTR_)).then_some(Restart { restartable })

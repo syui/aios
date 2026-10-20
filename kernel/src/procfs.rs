@@ -47,6 +47,8 @@ enum Node {
     NetUdp,
     NetSockstat,
     NetSnmp,
+    /// /proc/net/unix (AF_UNIX のソケット: unix.rs)
+    NetUnix,
     /// /proc/net/dev (インターフェースごとの送り受けの数。psutil や ifconfig が読む)
     NetDev,
     /// まだ中身のない /proc/net のファイル (見出しだけ。netstat が読む): NET_STUBS の番号
@@ -119,14 +121,13 @@ pub fn new_root() -> InodeRef {
     Rc::new(ProcInode { fs: new_fs_id(), node: Node::Root })
 }
 
-/// IPv6、raw、unix のソケットの一覧は見出しだけ (IPv6 と raw はない。netstat がないと言って止まる)
-const NET_STUBS: [(&str, &str); 6] = [
+/// IPv6 と raw のソケットの一覧は見出しだけ (IPv6 と raw はない。netstat がないと言って止まる)
+const NET_STUBS: [(&str, &str); 5] = [
     ("sockstat6", "TCP6: inuse 0\nUDP6: inuse 0\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n"),
     ("tcp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"),
     ("udp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
     ("raw", "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
     ("raw6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
-    ("unix", "Num       RefCount Protocol Flags    Type St Inode Path\n"),
 ];
 
 /// プロセス pid のスレッド tid (終わったものはなし)
@@ -177,6 +178,7 @@ impl ProcInode {
             Node::NetUdp => 17,
             Node::NetSockstat => 37,
             Node::NetSnmp => 38,
+            Node::NetUnix => 23,
             Node::NetDev => 39,
             Node::NetStub(i) => 18 + i as u64,
             Node::SysDir(i, d) => 0x100 + i as u64 * 8 + d as u64,
@@ -312,6 +314,7 @@ impl ProcInode {
             Node::NetUdp => crate::socket::proc_net(false),
             Node::NetSockstat => crate::socket::proc_sockstat(),
             Node::NetSnmp => crate::socket::proc_snmp(),
+            Node::NetUnix => crate::unix::proc_net(),
             Node::NetStub(i) => NET_STUBS[i as usize].1.into(),
             Node::Sys(i) => crate::sysctl::TABLE[i as usize].read(),
             Node::Pnp => {
@@ -783,6 +786,7 @@ impl Inode for ProcInode {
             (Node::NetDir, "udp") => Node::NetUdp,
             (Node::NetDir, "sockstat") => Node::NetSockstat,
             (Node::NetDir, "snmp") => Node::NetSnmp,
+            (Node::NetDir, "unix") => Node::NetUnix,
             (Node::NetDir, "dev") => Node::NetDev,
             (Node::NetDir, n) if NET_STUBS.iter().any(|(s, _)| *s == n) => Node::NetStub(NET_STUBS.iter().position(|(s, _)| *s == n).unwrap() as u8),
             (Node::Root, "sys") => Node::SysDir(0, 0),
@@ -900,6 +904,7 @@ impl Inode for ProcInode {
                 add("udp".into(), Node::NetUdp);
                 add("sockstat".into(), Node::NetSockstat);
                 add("snmp".into(), Node::NetSnmp);
+                add("unix".into(), Node::NetUnix);
                 add("dev".into(), Node::NetDev);
                 for (i, (n, _)) in NET_STUBS.iter().enumerate() {
                     add((*n).into(), Node::NetStub(i as u8));

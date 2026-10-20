@@ -1,5 +1,6 @@
 // BSD ソケット (AF_INET の TCP と UDP)。中身は smoltcp のソケット
 use crate::file::{self, FileRef, Kind};
+use crate::unix::UnixRef;
 use crate::net;
 use crate::proc;
 use alloc::rc::Rc;
@@ -15,7 +16,11 @@ const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EPIPE: i64 = 32;
 const EPERM: i64 = 1;
+const EACCES: i64 = 13;
 const ENOTSOCK: i64 = 88;
+const ESOCKTNOSUPPORT: i64 = 94;
+const ECONNABORTED: i64 = 103;
+const ENOBUFS: i64 = 105;
 const EPROTONOSUPPORT: i64 = 93;
 const EOPNOTSUPP: i64 = 95;
 const EAFNOSUPPORT: i64 = 97;
@@ -40,6 +45,8 @@ const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_PEEK: u64 = 0x2;
+/// 1 回に読み書きできる長さ (Linux の MAX_RW_COUNT)
+const MAX_RW: usize = 0x7fff_f000;
 
 const TCP_RX: usize = 64 * 1024;
 const TCP_TX: usize = 32 * 1024;
@@ -451,8 +458,17 @@ fn uninit(n: usize) -> alloc::vec::Vec<u8> {
     v
 }
 
-fn sock_of(fd: u64) -> Result<SockRef, i64> {
+/// ソケットのシステムコールの fd (Linux の fdget: ない fd と O_PATH のものは EBADF)
+fn fd_file(fd: u64) -> Result<FileRef, i64> {
     let f = proc::current().files().get(fd).cloned().ok_or(-file::EBADF)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-file::EBADF);
+    }
+    Ok(f)
+}
+
+fn sock_of(fd: u64) -> Result<SockRef, i64> {
+    let f = fd_file(fd)?;
     let f = f.borrow();
     match &f.kind {
         Kind::Socket(s) => Ok(s.clone()),
@@ -460,18 +476,153 @@ fn sock_of(fd: u64) -> Result<SockRef, i64> {
     }
 }
 
-/// socketpair の口なら、その OpenFile (send/recv はただの write/read)
-fn pair_of(fd: u64) -> Option<FileRef> {
-    let f = proc::current().files().get(fd).cloned()?;
-    let is_pair = matches!(f.borrow().kind, Kind::Pair(..));
-    is_pair.then_some(f)
+/// AF_UNIX のソケット (unix.rs。分けた NET の中の TCP も) なら、その OpenFile と中身。fd がなければ EBADF
+/// (ソケットでなければ None: ほかは sock_of で ENOTSOCK)
+fn unix_sock(fd: u64) -> Result<Option<(FileRef, UnixRef)>, i64> {
+    let f = fd_file(fd)?;
+    let u = match &f.borrow().kind {
+        Kind::Unix(u) => u.clone(),
+        _ => return Ok(None),
+    };
+    Ok(Some((f, u)))
 }
 
-/// AF_UNIX のまだつながっていない口なら、その OpenFile
-fn unix_file(fd: u64) -> Option<FileRef> {
-    let f = proc::current().files().get(fd).cloned()?;
-    let is_unix = matches!(f.borrow().kind, Kind::Unix(_));
-    is_unix.then_some(f)
+/// ユーザーの名前 (Linux の move_addr_to_kernel: 長さは 0 から sockaddr_storage (128) まで)
+fn addr_in(va: usize, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
+    let len = len as u32 as i32;
+    if !(0..=128).contains(&len) {
+        return Err(-EINVAL);
+    }
+    let mut b = vec![0u8; len as usize];
+    if len > 0 {
+        proc::current().pt().copy_in(&mut b, va).ok_or(-EFAULT)?;
+    }
+    Ok(b)
+}
+
+/// 名前を返す (Linux の move_addr_to_user): *lenp までを写し、*lenp には本当の長さ
+fn addr_out(va: usize, lenp: usize, name: &[u8]) -> Result<(), i64> {
+    let pt = proc::current().pt();
+    let mut l = [0u8; 4];
+    pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
+    let len = i32::from_le_bytes(l).min(name.len() as i32);
+    if len < 0 {
+        return Err(-EINVAL);
+    }
+    if len > 0 {
+        pt.copy_out(va, &name[..len as usize]).ok_or(-EFAULT)?;
+    }
+    pt.copy_out(lenp, &(name.len() as u32).to_le_bytes()).ok_or(-EFAULT)?;
+    Ok(())
+}
+
+fn nonblock_of(f: &FileRef, flags: u64) -> bool {
+    flags & MSG_DONTWAIT != 0 || f.borrow().flags & file::O_NONBLOCK != 0
+}
+
+/// 入れ物 (iovec) の先頭 need バイトに書けるか (ページごとに 1 バイトを読んで書きもどす)
+fn writable(iov: &[(usize, usize)], need: usize) -> bool {
+    let pt = proc::current().pt();
+    let mut left = need;
+    for &(base, len) in iov {
+        if left == 0 {
+            break;
+        }
+        let n = len.min(left);
+        let mut at = base;
+        while at < base + n {
+            let mut b = [0u8; 1];
+            if pt.copy_in(&mut b, at).is_none() || pt.copy_out(at, &b).is_none() {
+                return false;
+            }
+            at = (at / crate::memlayout::PGSIZE + 1) * crate::memlayout::PGSIZE;
+        }
+        if pt.copy_in(&mut [0u8; 1], base + n - 1).is_none() {
+            return false;
+        }
+        left -= n;
+    }
+    true
+}
+
+/// AF_UNIX から入れ物 (iovec) へ受ける。stream は、読めるものがあるのに入れ物にさわれなければ、読まずに EFAULT
+/// (Linux の unix_stream_read_actor は写せなければその skb を残す)。dgram は受けてから写す (写せなければ、その
+/// メッセージはなくなって EFAULT: Linux の __unix_dgram_recvmsg)
+fn unix_recv(u: &UnixRef, iov: &[(usize, usize)], flags: u64, nonblock: bool) -> Result<crate::unix::Recv, i64> {
+    let total = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
+    let stream = u.borrow().typ == crate::unix::SOCK_STREAM;
+    if stream && flags & crate::unix::MSG_OOB == 0 && total > 0 && crate::unix::has_data(u) {
+        let need = total.min(crate::unix::pending(u) as usize);
+        if !writable(iov, need) {
+            return Err(-EFAULT);
+        }
+    }
+    let r = crate::unix::recv(u, total, flags, nonblock)?;
+    let pt = proc::current().pt();
+    let mut done = 0;
+    for &(base, len) in iov {
+        if done == r.data.len() {
+            break;
+        }
+        let n = len.min(r.data.len() - done);
+        pt.copy_out(base, &r.data[done..done + n]).ok_or(-EFAULT)?;
+        done += n;
+    }
+    Ok(r)
+}
+
+/// read / readv / preadv2 (位置 -1) で AF_UNIX のソケットから (Linux の sock_read_iter: 長さ 0 なら何もせずに 0。
+/// 届いた fd は閉じる)
+pub fn unix_readv(f: &FileRef, u: &UnixRef, iov: &[(usize, usize)], nowait: bool) -> R {
+    if iov.iter().all(|x| x.1 == 0) {
+        return Ok(0);
+    }
+    let r = unix_recv(u, iov, 0, nowait || nonblock_of(f, 0))?;
+    Ok(r.ret as i64)
+}
+
+/// write / writev / pwritev2 (位置 -1) で AF_UNIX のソケットへ (Linux の sock_write_iter: 長さ 0 でも送る。
+/// SOCK_STREAM の EPIPE は SIGPIPE、RWF_NOSIGNAL なら送らない)
+pub fn unix_writev(f: &FileRef, u: &UnixRef, iov: &[(usize, usize)], nowait: bool, nosignal: bool) -> R {
+    let total = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
+    let flags = if nosignal { crate::unix::MSG_NOSIGNAL } else { 0 };
+    crate::unix::send(u, crate::unix::Src::User(iov), total, None, &[], flags, nowait || nonblock_of(f, 0))
+}
+
+/// AF_INET の型と protocol (Linux の inet_create: 型ごとの表にあるか (なければ ESOCKTNOSUPPORT、protocol がちがえば
+/// EPROTONOSUPPORT)、raw は CAP_NET_RAW、ping は net.ipv4.ping_group_range (既定の 1 0 はだれも入らない))
+fn inet_check(t: u64, protocol: u64) -> Result<(), i64> {
+    let p = protocol as u32 as i32;
+    if !(0..263).contains(&p) {
+        return Err(-EINVAL);
+    }
+    match t {
+        SOCK_STREAM if p == 0 || p == 6 => Ok(()),
+        SOCK_DGRAM if p == 0 || p == 17 => Ok(()),
+        SOCK_DGRAM if p == 1 => Err(-EACCES),
+        SOCK_RAW if p != 0 => {
+            if crate::cred::current().euid == 0 { Ok(()) } else { Err(-EPERM) }
+        }
+        SOCK_STREAM | SOCK_DGRAM | SOCK_RAW => Err(-EPROTONOSUPPORT),
+        _ => Err(-ESOCKTNOSUPPORT),
+    }
+}
+
+/// socket と socketpair の型のフラグと範囲 (Linux の __sys_socket と __sock_create: 知らないフラグは EINVAL、family は
+/// EAFNOSUPPORT、型は EINVAL の順)。(family, 型, フラグ)
+fn sock_args(domain: u64, typ: u64) -> Result<(u64, u64, u64), i64> {
+    let typ = typ as u32 as u64;
+    if typ & !0xf & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return Err(-EINVAL);
+    }
+    let d = domain as u32 as i32;
+    if !(0..46).contains(&d) {
+        return Err(-EAFNOSUPPORT);
+    }
+    if typ & 0xf >= 11 {
+        return Err(-EINVAL);
+    }
+    Ok((d as u64, typ & 0xf, typ & !0xf))
 }
 
 fn add_fd(s: Socket, cloexec: bool) -> R {
@@ -488,20 +639,24 @@ fn add_fd(s: Socket, cloexec: bool) -> R {
     Ok(fd as i64)
 }
 
-/// AF_UNIX の socketpair だけ (中身はパイプ 2 本)
-pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
+/// socketpair: AF_UNIX だけ (AF_INET は作れるものなら EOPNOTSUPP)
+pub fn socketpair(domain: u64, typ: u64, protocol: u64, sv: usize) -> R {
     const AF_UNIX: u64 = 1;
+    let (domain, t, flags) = sock_args(domain, typ)?;
+    if domain == AF_INET {
+        inet_check(t, protocol)?;
+        return Err(-EOPNOTSUPP);
+    }
     if domain != AF_UNIX {
         return Err(-EAFNOSUPPORT);
     }
-    let (a, b) = file::Pipe::pair();
-    // どちらの相手も自分 (SO_PEERCRED)
-    crate::unix::set_creds(&a, crate::unix::me(), crate::unix::me());
-    let cloexec = typ & SOCK_CLOEXEC != 0;
-    let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
+    let a = crate::unix::create(t, protocol as u32 as u64)?;
+    let b = crate::unix::create(t, protocol as u32 as u64)?;
+    crate::unix::pair(&a, &b);
+    let cloexec = flags & SOCK_CLOEXEC != 0;
     let files = proc::current().files();
-    let fa = files.add(file::new(a, flags), cloexec, 0).ok_or(-EMFILE)?;
-    let Some(fb) = files.add(file::new(b, flags), cloexec, 0) else {
+    let fa = files.add(crate::unix::file_of(a, flags), cloexec, 0).ok_or(-EMFILE)?;
+    let Some(fb) = files.add(crate::unix::file_of(b, flags), cloexec, 0) else {
         files.set(fa, None);
         return Err(-EMFILE);
     };
@@ -520,12 +675,11 @@ pub fn socketpair(domain: u64, typ: u64, sv: usize) -> R {
 pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     const IPPROTO_ICMP: u64 = 1;
     const AF_UNIX: u64 = 1;
+    let (domain, t, flags) = sock_args(domain, typ)?;
+    let typ = t | flags;
     if domain == AF_UNIX {
-        if typ & 0xf != SOCK_STREAM {
-            return Err(-EPROTONOSUPPORT);
-        }
-        let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
-        let fd = proc::current().files().add(file::new(crate::unix::new_kind(), flags), typ & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        let u = crate::unix::create(t, protocol as u32 as u64)?;
+        let fd = proc::current().files().add(crate::unix::file_of(u, flags), flags & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
     if domain != AF_INET {
@@ -533,9 +687,9 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     }
     // 分けた NET の中の TCP は、中どうしでだけつながる口 (unix.rs の inet)
     let isolated = crate::ns::net().is_some();
-    if isolated && typ & 0xf == SOCK_STREAM {
-        let flags = file::O_RDWR | if typ & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
-        let fd = proc::current().files().add(file::new(crate::unix::new_inet_kind(), flags), typ & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+    if isolated && t == SOCK_STREAM {
+        let f = crate::unix::file_of(crate::unix::inet_socket(), flags);
+        let fd = proc::current().files().add(f, flags & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
     let proto = match typ & 0xf {
@@ -567,14 +721,15 @@ fn loopback_only(ep: &IpEndpoint, err: i64) -> Result<(), i64> {
 }
 
 pub fn bind(fd: u64, addr: usize, len: usize) -> R {
-    if let Some(f) = unix_file(fd) {
+    if let Some((f, u)) = unix_sock(fd)? {
         if crate::unix::inet_port(&f).is_some() {
             let ep = read_addr(addr, len)?;
             loopback_only(&ep, -EADDRNOTAVAIL)?;
             crate::landlock::check_net(ep.port, crate::landlock::BIND_TCP)?;
             return crate::unix::inet_bind(&f, ep.port);
         }
-        return crate::unix::bind(&f, addr, len);
+        let a = addr_in(addr, len)?;
+        return crate::unix::bind(&u, &a);
     }
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
@@ -593,12 +748,13 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     Ok(0)
 }
 
-pub fn listen(fd: u64) -> R {
-    if let Some(f) = unix_file(fd) {
+/// listen: backlog は (unsigned で) somaxconn まで
+pub fn listen(fd: u64, backlog: u64) -> R {
+    if let Some((f, u)) = unix_sock(fd)? {
         if crate::unix::inet_port(&f).is_some() {
             return crate::unix::inet_listen(&f);
         }
-        return crate::unix::listen(&f);
+        return crate::unix::listen(&u, (backlog as u32).min(crate::unix::SOMAXCONN));
     }
     let s = sock_of(fd)?;
     let mut s = s.borrow_mut();
@@ -617,18 +773,23 @@ pub fn listen(fd: u64) -> R {
     Ok(0)
 }
 
+/// accept4 (Linux の __sys_accept4_file: EBADF、知らないフラグの EINVAL、ENOTSOCK の順)。名前は相手 (つないできた口)
+/// のもの (分けた NET の中の TCP は 127.0.0.1:そのポート)。名前を返せなければ、受けた口は閉じる
 pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
-    if let Some(f) = unix_file(fd) {
-        let n = crate::unix::accept(&f, flags)?;
-        // 分けた NET の中の TCP: 相手は 127.0.0.1:そのポート
-        let peer = proc::current().files().get(n as u64).cloned().and_then(|c| crate::unix::inet_ports(&c));
-        match peer {
-            Some((_, p)) => write_addr(addr, lenp, Some(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), p)))?,
-            None => {
-                crate::unix::write_family(addr, lenp)?;
-            }
+    fd_file(fd)?;
+    let flags = flags as u32 as u64;
+    if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return Err(-EINVAL);
+    }
+    if let Some((f, u)) = unix_sock(fd)? {
+        let n = crate::unix::accept(&f, &u)?;
+        let name = crate::unix::name(&n, true).map_err(|_| -ECONNABORTED)?;
+        let nf = crate::unix::file_of(n, flags);
+        if addr != 0 {
+            addr_out(addr, lenp, &name)?;
         }
-        return Ok(n);
+        let fd = proc::current().files().add(nf, flags & SOCK_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
     }
     let s = sock_of(fd)?;
     let mut s = s.borrow_mut();
@@ -656,17 +817,15 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
 }
 
 pub fn connect(fd: u64, addr: usize, len: usize) -> R {
-    if let Some(f) = unix_file(fd) {
+    if let Some((f, u)) = unix_sock(fd)? {
         if crate::unix::inet_port(&f).is_some() {
             let ep = read_addr(addr, len)?;
             loopback_only(&ep, -ENETUNREACH)?;
             crate::landlock::check_net(ep.port, crate::landlock::CONNECT_TCP)?;
             return crate::unix::inet_connect(&f, ep.port);
         }
-        return crate::unix::connect(&f, addr, len);
-    }
-    if pair_of(fd).is_some() {
-        return Err(-EISCONN);
+        let a = addr_in(addr, len)?;
+        return crate::unix::connect(&f, &u, &a);
     }
     let s = sock_of(fd)?;
     let ep = read_addr(addr, len)?;
@@ -745,10 +904,12 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
 }
 
 pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: usize) -> R {
-    if let Some(f) = pair_of(fd) {
-        let mut data = uninit(len.min(64 * 1024));
-        proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
-        return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
+    if let Some((f, u)) = unix_sock(fd)? {
+        let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
+        let len = len.min(MAX_RW);
+        let iov = [(buf, len)];
+        let nb = nonblock_of(&f, flags);
+        return crate::unix::send(&u, crate::unix::Src::User(&iov), len, to.as_deref(), &[], flags, nb);
     }
     let s = sock_of(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
@@ -759,11 +920,13 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
 }
 
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
-    if let Some(f) = pair_of(fd) {
-        let mut data = uninit(len.min(64 * 1024));
-        let n = file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?;
-        proc::current().pt().copy_out(buf, &data[..n]).ok_or(-EFAULT)?;
-        return Ok(n as i64);
+    if let Some((f, u)) = unix_sock(fd)? {
+        let iov = [(buf, len.min(MAX_RW))];
+        let r = unix_recv(&u, &iov, flags, nonblock_of(&f, flags))?;
+        if addr != 0 {
+            addr_out(addr, lenp, r.from.as_deref().unwrap_or(&[]))?;
+        }
+        return Ok(r.ret as i64);
     }
     let s = sock_of(fd)?;
     let mut data = uninit(len.min(64 * 1024));
@@ -773,23 +936,10 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
     Ok(k as i64)
 }
 
-/// 分けた NET の中の TCP の口なら (自分のポート, 相手のポート。まだなら 0)
-fn inet_of(fd: u64) -> Option<(u16, u16)> {
-    let f = proc::current().files().get(fd).cloned()?;
-    crate::unix::inet_ports(&f).or_else(|| crate::unix::inet_port(&f).map(|p| (p, 0)))
-}
-
-fn lo(port: u16) -> Option<IpEndpoint> {
-    Some(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), port))
-}
-
 pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
-    if let Some((me, _)) = inet_of(fd) {
-        write_addr(addr, lenp, lo(me))?;
+    if let Some((_, u)) = unix_sock(fd)? {
+        addr_out(addr, lenp, &crate::unix::name(&u, false)?)?;
         return Ok(0);
-    }
-    if unix_file(fd).is_some() || pair_of(fd).is_some() {
-        return crate::unix::write_family(addr, lenp);
     }
     let s = sock_of(fd)?;
     let s = s.borrow();
@@ -802,18 +952,9 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
 }
 
 pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
-    if let Some((_, peer)) = inet_of(fd) {
-        if peer == 0 {
-            return Err(-ENOTCONN);
-        }
-        write_addr(addr, lenp, lo(peer))?;
+    if let Some((_, u)) = unix_sock(fd)? {
+        addr_out(addr, lenp, &crate::unix::name(&u, true)?)?;
         return Ok(0);
-    }
-    if pair_of(fd).is_some() {
-        return crate::unix::write_family(addr, lenp);
-    }
-    if unix_file(fd).is_some() {
-        return Err(-ENOTCONN);
     }
     let s = sock_of(fd)?;
     let s = s.borrow();
@@ -832,42 +973,15 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SOL_SOCKET: u64 = 1;
     const SO_ERROR: u64 = 4;
     const SO_TYPE: u64 = 3;
-    if unix_file(fd).is_some() || pair_of(fd).is_some() {
-        const SO_SNDBUF: u64 = 7;
-        const SO_RCVBUF: u64 = 8;
-        const SO_PEERCRED: u64 = 17;
-        const SO_DOMAIN: u64 = 39;
+    if let Some((_, u)) = unix_sock(fd)? {
         let pt = proc::current().pt();
-        if (level, opt) == (SOL_SOCKET, SO_PEERCRED) {
-            // 相手の pid / uid / gid (struct ucred)。connect / socketpair / listen のときのプロセス (unix.rs)。
-            // まだつながっていない口は自分
-            let (pid, uid, gid) = pair_of(fd).and_then(|f| crate::unix::peer_cred(&f)).unwrap_or_else(crate::unix::me);
-            let mut b = [0u8; 12];
-            b[..4].copy_from_slice(&pid.to_le_bytes());
-            b[4..8].copy_from_slice(&uid.to_le_bytes());
-            b[8..].copy_from_slice(&gid.to_le_bytes());
-            if val != 0 {
-                pt.copy_out(val, &b).ok_or(-EFAULT)?;
-            }
-            if lenp != 0 {
-                pt.copy_out(lenp, &12u32.to_le_bytes()).ok_or(-EFAULT)?;
-            }
-            return Ok(0);
+        let mut l = [0u8; 4];
+        pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
+        let v = crate::unix::getsockopt(&u, level as i32, opt as i32, i32::from_le_bytes(l))?;
+        if !v.is_empty() {
+            pt.copy_out(val, &v).ok_or(-EFAULT)?;
         }
-        let v: i32 = match (level, opt) {
-            (SOL_SOCKET, SO_TYPE) => 1,
-            // AF_UNIX (分けた NET の中の TCP なら AF_INET)
-            (SOL_SOCKET, SO_DOMAIN) => if inet_of(fd).is_some() { 2 } else { 1 },
-            // 送り受けのバッファ (パイプの大きさ)
-            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => file::PIPE_SIZE as i32,
-            _ => 0,
-        };
-        if val != 0 {
-            pt.copy_out(val, &v.to_le_bytes()).ok_or(-EFAULT)?;
-            if lenp != 0 {
-                pt.copy_out(lenp, &4u32.to_le_bytes()).ok_or(-EFAULT)?;
-            }
-        }
+        pt.copy_out(lenp, &(v.len() as u32).to_le_bytes()).ok_or(-EFAULT)?;
         return Ok(0);
     }
     let s = sock_of(fd)?;
@@ -904,8 +1018,8 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
 
 pub fn shutdown(fd: u64, how: u64) -> R {
     const SHUT_RD: u64 = 0;
-    if unix_file(fd).is_some() || pair_of(fd).is_some() {
-        return Ok(0);
+    if let Some((_, u)) = unix_sock(fd)? {
+        return crate::unix::shutdown(&u, how as u32 as u64);
     }
     let s = sock_of(fd)?;
     let s = s.borrow();
@@ -948,25 +1062,29 @@ fn read_msghdr(va: usize) -> Result<MsgHdr, i64> {
 }
 
 pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
-    let m = read_msghdr(msg)?;
-    if let Some(f) = pair_of(fd) {
-        // 付帯データの SCM_RIGHTS は、このデータの始まりにつけて送る
-        let fds = crate::unix::take_rights(m.control, m.controllen)?;
-        let mut data = alloc::vec::Vec::new();
-        for (base, len) in &m.iov {
-            let start = data.len();
-            data.resize(start + len, 0);
-            proc::current().pt().copy_in(&mut data[start..], *base).ok_or(-EFAULT)?;
+    if let Some((f, u)) = unix_sock(fd)? {
+        // Linux の ___sys_sendmsg: msghdr、名前 (長さ < 0 は EINVAL、128 まで)、iovec、付帯データ (INT_MAX まで) を写し、
+        // 付帯データを読むのは unix の sendmsg のはじめ
+        let m = read_msghdr(msg)?;
+        let pt = proc::current().pt();
+        let mut l = [0u8; 4];
+        pt.copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
+        let namelen = i32::from_le_bytes(l);
+        if namelen < 0 {
+            return Err(-EINVAL);
         }
-        if !fds.is_empty() {
-            let tx = match &f.borrow().kind {
-                Kind::Pair(_, tx) => tx.clone(),
-                _ => unreachable!(),
-            };
-            crate::unix::attach(&tx, fds);
+        let to = if m.name != 0 && namelen > 0 { Some(addr_in(m.name, (namelen as usize).min(128))?) } else { None };
+        if m.controllen > i32::MAX as usize {
+            return Err(-ENOBUFS);
         }
-        return file::write_opt(&f, &data, flags & MSG_DONTWAIT != 0).map(|n| n as i64);
+        let mut ctl = vec![0u8; if m.control != 0 { m.controllen } else { 0 }];
+        if !ctl.is_empty() {
+            pt.copy_in(&mut ctl, m.control).ok_or(-EFAULT)?;
+        }
+        let total = m.iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
+        return crate::unix::send(&u, crate::unix::Src::User(&m.iov), total, to.as_deref(), &ctl, flags, nonblock_of(&f, flags));
     }
+    let m = read_msghdr(msg)?;
     let s = sock_of(fd)?;
     let to = if m.name != 0 {
         let mut l = [0u8; 4];
@@ -1011,24 +1129,37 @@ pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool) -> R {
 }
 
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
+    if let Some((f, u)) = unix_sock(fd)? {
+        let m = read_msghdr(msg)?;
+        let pt = proc::current().pt();
+        let mut l = [0u8; 4];
+        pt.copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
+        let namelen = i32::from_le_bytes(l);
+        if namelen < 0 {
+            return Err(-EINVAL);
+        }
+        let mut r = unix_recv(&u, &m.iov, flags, nonblock_of(&f, flags))?;
+        // 名前: 入れ物の長さが 0 なら、名前の長さも 0 (Linux は msg_name を NULL にして受ける)
+        if m.name != 0 {
+            let from = if namelen > 0 { r.from.clone().unwrap_or_default() } else { alloc::vec::Vec::new() };
+            addr_out(m.name, m.namelen_at, &from)?;
+        }
+        let space = (m.control != 0).then_some(m.controllen);
+        let cloexec = flags & crate::unix::MSG_CMSG_CLOEXEC != 0;
+        let out = crate::unix::scm_out(&mut r, crate::unix::passcred(&u), space, cloexec);
+        for (off, b) in &out.writes {
+            pt.copy_out(m.control + off, b).ok_or(-EFAULT)?;
+        }
+        let mflags = r.flags | out.flags | (flags & crate::unix::MSG_CMSG_CLOEXEC) as u32;
+        pt.copy_out(m.flags_at, &mflags.to_le_bytes()).ok_or(-EFAULT)?;
+        pt.copy_out(m.controllen_at, &(out.used as u64).to_le_bytes()).ok_or(-EFAULT)?;
+        return Ok(r.ret as i64);
+    }
     let m = read_msghdr(msg)?;
     let total: usize = m.iov.iter().map(|(_, l)| l).sum();
     let mut data = uninit(total.min(64 * 1024));
-    let mut ctl = (0, 0);
-    let (k, from) = match pair_of(fd) {
-        Some(f) => {
-            let rx = match &f.borrow().kind {
-                Kind::Pair(rx, _) => rx.clone(),
-                _ => unreachable!(),
-            };
-            let k = file::read_opt(&f, &mut data, flags & MSG_DONTWAIT != 0)?;
-            // 読んだところまでについてきた fd
-            let end = rx.borrow().taken;
-            ctl = crate::unix::deliver(&rx, end, m.control, m.controllen, flags)?;
-            (k, None)
-        }
-        None => sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0)?,
-    };
+    let ctl: (usize, u32) = (0, 0);
+    let (k, from) = sock_of(fd)?.borrow_mut().recv(&mut data, flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0)?;
     let pt = proc::current().pt();
     let mut done = 0;
     for (base, len) in &m.iov {
@@ -1114,9 +1245,25 @@ pub fn proc_net(want_tcp: bool) -> alloc::string::String {
 pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     const IPPROTO_IP: u64 = 0;
     const IP_TTL: u64 = 2;
-    if (level, opt) == (IPPROTO_IP, IP_TTL)
-        && let Ok(s) = sock_of(fd)
-    {
+    if let Some((_, u)) = unix_sock(fd)? {
+        // Linux の do_sock_setsockopt と sk_setsockopt: 長さ < 0 は EINVAL、SOL_SOCKET でなければ EOPNOTSUPP、
+        // 4 バイトより短ければ EINVAL、写してから
+        let len = len as u32 as i32;
+        if len < 0 {
+            return Err(-EINVAL);
+        }
+        if level as i32 != 1 {
+            return Err(-EOPNOTSUPP);
+        }
+        if len < 4 {
+            return Err(-EINVAL);
+        }
+        let mut b = vec![0u8; (len as usize).min(16)];
+        proc::current().pt().copy_in(&mut b, val).ok_or(-EFAULT)?;
+        return crate::unix::setsockopt(&u, level as i32, opt as i32, &b);
+    }
+    let s = sock_of(fd)?;
+    if (level, opt) == (IPPROTO_IP, IP_TTL) {
         let mut b = [0u8; 4];
         proc::current().pt().copy_in(&mut b[..len.min(4)], val).ok_or(-EFAULT)?;
         let v = i32::from_le_bytes(b);
