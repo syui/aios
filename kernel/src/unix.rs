@@ -233,6 +233,11 @@ static mut GC_WANTED: bool = false;
 static mut ALL: Vec<Weak<RefCell<Unix>>> = Vec::new();
 static mut ALL_LIVE: usize = 0;
 
+/// いま生きている AF_UNIX のソケットの数 (/proc/net/sockstat の sockets: used)
+pub fn live() -> usize {
+    unsafe { &*(&raw const ALL) }.iter().filter(|w| w.strong_count() > 0).count()
+}
+
 fn abstract_names() -> &'static mut BTreeMap<(u64, u8, Vec<u8>), Weak<RefCell<Unix>>> {
     unsafe { &mut *(&raw mut ABSTRACT) }
 }

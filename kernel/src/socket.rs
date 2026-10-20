@@ -1069,21 +1069,24 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
 
 /// /proc/net/sockstat (ss -s が読む): 使っているソケットの数
 pub fn proc_sockstat() -> alloc::string::String {
-    let (tcp, _, udp) = crate::inet::counts();
+    let c = crate::inet::counts();
     let raw = net::get().map_or(0, |n| n.sockets.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Icmp(_))).count());
+    // sockets: used は Linux の sock_inuse_get: どの family のソケットも (AF_UNIX も。TIME_WAIT の tw はのぞく)
     alloc::format!(
-        "sockets: used {}\nTCP: inuse {} orphan 0 tw 0 alloc {} mem 0\nUDP: inuse {} mem 0\nUDPLITE: inuse 0\nRAW: inuse {}\nFRAG: inuse 0 memory 0\n",
-        tcp + udp + raw,
-        tcp,
-        tcp,
-        udp,
+        "sockets: used {}\nTCP: inuse {} orphan {} tw {} alloc {} mem 0\nUDP: inuse {} mem 0\nUDPLITE: inuse 0\nRAW: inuse {}\nFRAG: inuse 0 memory 0\n",
+        c.alloc + c.udp_all + raw + crate::unix::live(),
+        c.inuse,
+        c.orphan,
+        c.tw,
+        c.alloc,
+        c.udp,
         raw
     )
 }
 
 /// /proc/net/snmp (ss -s と netstat -s が読む): TCP のつながっている数のほかは 0
 pub fn proc_snmp() -> alloc::string::String {
-    let (_, estab, _) = crate::inet::counts();
+    let estab = crate::inet::counts().estab;
     alloc::format!(
         "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates OutTransmits\n\
 Ip: 2 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\

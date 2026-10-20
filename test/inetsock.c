@@ -340,6 +340,23 @@ static int in_proc(int port, const char *st) {
     return found;
 }
 
+// /proc/net/sockstat の TCP の行の数 (inuse、orphan、tw、alloc) の 1 つ
+static int sockstat(const char *key) {
+    FILE *f = fopen("/proc/net/sockstat", "r");
+    if (!f)
+        return -1;
+    char line[256], want[32];
+    snprintf(want, sizeof want, " %s ", key);
+    int v = -1;
+    while (fgets(line, sizeof line, f)) {
+        char *p = strstr(line, want);
+        if (!strncmp(line, "TCP:", 4) && p)
+            v = atoi(p + strlen(want));
+    }
+    fclose(f);
+    return v;
+}
+
 static void time_wait(void) {
     int port = 0, l = listener(1, 1, &port);
     check("LISTEN in /proc/net/tcp", in_proc(port, "0A"), 1);
@@ -351,6 +368,7 @@ static void time_wait(void) {
     check("the client reads EOF", read(c, &b, 1), 0);
     close(c);
     check("TIME_WAIT in /proc/net/tcp", in_proc(port, "06"), 1);
+    check("tw in /proc/net/sockstat", sockstat("tw") >= 1, 1);
     int x = socket(AF_INET, SOCK_STREAM, 0), one = 1;
     struct sockaddr_in a = lo(port);
     errno = 0;

@@ -400,9 +400,12 @@ test/unixsock.c が、ロボットの見ないプロセスをまたぐところ 
 inet_connection_sock.c と同じ考え)。Linux とちがうところが大事なところ: ループバック (127/8、自分のアドレス、0.0.0.0) は
 パケットを作らない。つなぐ (SYN、SYN-ACK、ACK)、送る、FIN、RST は、相手のソケットをじかに呼ぶ (送ったものは相手の受ける
 行列にそのまま入る)。だから Linux の遅らせた ACK や Nagle で待つことはなく、loopback の往復は関数を呼ぶだけ。smoltcp は外
-(eth0) の相手にだけ使う。見えるふるまいは Linux に合わせた: ポートの表と bind の決まり (SO_REUSEADDR / SO_REUSEPORT、
+(eth0) の相手にだけ使う。表も端から探さない: ポートの表 (ポートごとに bind した順の番号で)、listen しているものだけの表、
+時刻の表 (SYN のやりなおしと TIME_WAIT の終わりを時刻の順に。tick は時刻の来たものだけを見る)、fd のないものの表。だから
+TIME_WAIT やつながりがいくつあっても、socket、connect、accept、close の手間は変わらない。見えるふるまいは Linux に合わせた: ポートの表と bind の決まり (SO_REUSEADDR / SO_REUSEPORT、
 Linux の inet_bind_conflict と udp_lib_lport_inuse)、空いたポート 32768〜60999、1024 より下は root だけ、TIME_WAIT と
-閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る)。listen の行列があふれたら SYN を落とし (syncookies なし)、
+閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る。/proc/net/sockstat では Linux と同じく tw に数え、閉じて終わって
+いないものは orphan)。listen の行列があふれたら SYN を落とし (syncookies なし)、
 つなぐほうは SYN_SENT のまま 1、2、4 ... 秒でやりなおす (TCP_SYNCNT の 6 回で ETIMEDOUT)。自分につなぐ、urgent (MSG_OOB と
 SIOCATMARK と SO_OOBINLINE)、FIN と RST の状態の移りかた (閉じた相手に送ると RST、shutdown(SHUT_RD) のあとに来たデータでも
 RST: RFC 1122)、SO_LINGER 0 の RST、MSG_MORE と TCP_CORK、入れ物の大きさ (Linux 7.3 で測った: つながると SO_SNDBUF は

@@ -204,8 +204,11 @@ pub struct Inet {
     lock_port: bool,
     lock_sndbuf: bool,
     lock_rcvbuf: bool,
-    /// ポートの表にいる
+    /// ポートの表にいる。pseq はそこでの番号 (bind した順)
     hashed: bool,
+    pseq: u64,
+    /// 時刻の表にいるときの時刻 (0 ならいない)
+    tkey: u64,
     // SOL_SOCKET
     reuse: bool,
     reuseport: bool,
@@ -298,20 +301,33 @@ type R = Result<i64, i64>;
 
 // ---- 表 ----
 
-/// ポートの表: (NET, TCP か, ポート) → そこにいるもの (bind した順)
-static mut PORTS: BTreeMap<(u64, bool, u16), Vec<W>> = BTreeMap::new();
-/// fd がなくなっても残っているもの (FIN_WAIT2、TIME_WAIT、LAST_ACK)
-static mut ORPHANS: Vec<InetRef> = Vec::new();
-/// すべて (/proc/net/tcp と udp)。消えたものは new_sock で掃く
-static mut ALL: Vec<W> = Vec::new();
-/// 時刻でやることがあるもの (SYN のやりなおし、FIN_WAIT2 / TIME_WAIT の終わり)
-static mut TIMED: Vec<W> = Vec::new();
+// どれも端から探さない: つながりや TIME_WAIT がいくつあっても、socket、connect、accept、close の手間は変わらない
+// (Linux の bhash、listening_hash、tw の timer にあたる)
 
-fn ports() -> &'static mut BTreeMap<(u64, bool, u16), Vec<W>> {
+/// ポートの表: (NET, TCP か, ポート) → そこにいるもの (pseq の順 = bind した順。accept を待つ子や TIME_WAIT も
+/// listen しているもののポートにいる: Linux の inet_inherit_port)
+static mut PORTS: BTreeMap<(u64, bool, u16), BTreeMap<u64, W>> = BTreeMap::new();
+static mut PSEQ: u64 = 0;
+/// listen しているものだけ: (NET, ポート) → pseq の順。listen をやめたものは lookup_listener で掃く
+static mut LISTENERS: BTreeMap<(u64, u16), BTreeMap<u64, W>> = BTreeMap::new();
+/// fd がなくなっても残っているもの (FIN_WAIT2、TIME_WAIT、LAST_ACK)
+static mut ORPHANS: BTreeMap<usize, InetRef> = BTreeMap::new();
+/// すべて (/proc/net/tcp と udp)。消えたものは new_sock で掃く (数が SWEEP をこえたときだけ: 均せば 1 つに O(1))
+static mut ALL: Vec<W> = Vec::new();
+static mut SWEEP: usize = 64;
+/// 時刻でやることがあるもの: (その時刻, key) の順 (SYN のやりなおし、FIN_WAIT2 / TIME_WAIT の終わり)。tick は
+/// 時刻の来たものだけを見る
+static mut TIMED: BTreeMap<(u64, usize), W> = BTreeMap::new();
+
+fn ports() -> &'static mut BTreeMap<(u64, bool, u16), BTreeMap<u64, W>> {
     unsafe { &mut *(&raw mut PORTS) }
 }
 
-fn orphans() -> &'static mut Vec<InetRef> {
+fn listeners() -> &'static mut BTreeMap<(u64, u16), BTreeMap<u64, W>> {
+    unsafe { &mut *(&raw mut LISTENERS) }
+}
+
+fn orphans() -> &'static mut BTreeMap<usize, InetRef> {
     unsafe { &mut *(&raw mut ORPHANS) }
 }
 
@@ -319,7 +335,7 @@ fn all() -> &'static mut Vec<W> {
     unsafe { &mut *(&raw mut ALL) }
 }
 
-fn timed() -> &'static mut Vec<W> {
+fn timed() -> &'static mut BTreeMap<(u64, usize), W> {
     unsafe { &mut *(&raw mut TIMED) }
 }
 
@@ -390,6 +406,8 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         lock_sndbuf: false,
         lock_rcvbuf: false,
         hashed: false,
+        pseq: 0,
+        tkey: 0,
         reuse: false,
         reuseport: false,
         keepalive: false,
@@ -460,8 +478,10 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         generation: 0,
     }));
     let a = all();
-    if a.len() >= 64 && a.iter().filter(|w| w.strong_count() > 0).count() * 2 <= a.len() {
+    let sweep = unsafe { &mut *(&raw mut SWEEP) };
+    if a.len() >= *sweep {
         a.retain(|w| w.strong_count() > 0);
+        *sweep = (a.len() * 2).max(64);
     }
     a.push(Rc::downgrade(&u));
     u
@@ -550,23 +570,39 @@ fn ipv4(a: u32) -> Ipv4Address {
 fn owners(netns: u64, tcp: bool, port: u16) -> Vec<InetRef> {
     let k = (netns, tcp, port);
     let Some(v) = ports().get_mut(&k) else { return Vec::new() };
-    v.retain(|w| w.strong_count() > 0);
-    let out: Vec<InetRef> = v.iter().filter_map(|w| w.upgrade()).collect();
+    v.retain(|_, w| w.strong_count() > 0);
+    let out: Vec<InetRef> = v.values().filter_map(|w| w.upgrade()).collect();
     if v.is_empty() {
         ports().remove(&k);
     }
     out
 }
 
+/// そのポートにだれもいないか (空いているポートを探すとき: 中身は写さない)
+fn port_free(netns: u64, tcp: bool, port: u16) -> bool {
+    let k = (netns, tcp, port);
+    let Some(v) = ports().get_mut(&k) else { return true };
+    if v.values().any(|w| w.strong_count() > 0) {
+        return false;
+    }
+    ports().remove(&k);
+    true
+}
+
 fn hash_port(u: &InetRef, port: u16) {
-    let k = {
+    let (k, q) = {
         let mut s = u.borrow_mut();
+        let q = unsafe {
+            PSEQ += 1;
+            PSEQ
+        };
         s.num = port;
         s.sport = port;
         s.hashed = true;
-        (s.net, s.tcp, port)
+        s.pseq = q;
+        ((s.net, s.tcp, port), q)
     };
-    ports().entry(k).or_default().push(Rc::downgrade(u));
+    ports().entry(k).or_default().insert(q, Rc::downgrade(u));
 }
 
 /// 表から出す (inet_num は 0 に。名前に見せるポートは TCP ではそのまま: Linux の inet_put_port)
@@ -577,14 +613,15 @@ fn put_port(u: &InetRef) {
             return;
         }
         s.hashed = false;
-        let k = (s.net, s.tcp, s.num);
+        let k = ((s.net, s.tcp, s.num), s.pseq);
         s.num = 0;
+        s.pseq = 0;
         k
     };
-    if let Some(v) = ports().get_mut(&k) {
-        v.retain(|w| w.strong_count() > 0 && !core::ptr::eq(w.as_ptr(), Rc::as_ptr(u)));
+    if let Some(v) = ports().get_mut(&k.0) {
+        v.remove(&k.1);
         if v.is_empty() {
-            ports().remove(&k);
+            ports().remove(&k.0);
         }
     }
 }
@@ -654,7 +691,7 @@ fn get_port(u: &InetRef, snum: u16) -> Result<(), i64> {
     let start = u32::from_le_bytes(r) % range;
     for i in 0..range {
         let p = PORT_LO + ((start + i) % range) as u16;
-        if owners(me.net, me.tcp, p).is_empty() {
+        if port_free(me.net, me.tcp, p) {
             hash_port(u, p);
             return Ok(());
         }
@@ -751,10 +788,12 @@ pub fn listen(u: &InetRef, backlog: u64) -> R {
         u.borrow_mut().state = St::Close;
         return Err(e);
     }
-    {
+    let (k, q) = {
         let mut s = u.borrow_mut();
         s.sport = s.num;
-    }
+        ((s.net, s.num), s.pseq)
+    };
+    listeners().entry(k).or_default().insert(q, Rc::downgrade(u));
     ext_listen(u);
     notify(u);
     Ok(0)
@@ -762,24 +801,42 @@ pub fn listen(u: &InetRef, backlog: u64) -> R {
 
 // ---- TCP: つなぐ ----
 
-/// 時刻でやることがあるものとして覚える (tick が見る)
+/// 時刻でやることがあるものとして覚える (tick が見る): いまの状態の時刻 (SYN_SENT ならやりなおし、fd のない
+/// FIN_WAIT2 / TIME_WAIT なら終わり) で表に入れなおす。どれでもなければ表から出す
 fn arm(u: &InetRef) {
-    let t = timed();
-    if !t.iter().any(|w| core::ptr::eq(w.as_ptr(), Rc::as_ptr(u))) {
-        t.push(Rc::downgrade(u));
+    let mut s = u.borrow_mut();
+    let at = match s.state {
+        St::SynSent => s.syn_next,
+        St::TimeWait | St::FinWait2 if s.dead => s.expires,
+        _ => 0,
+    };
+    if s.tkey == at {
+        return;
+    }
+    if s.tkey != 0 {
+        timed().remove(&(s.tkey, key(u)));
+    }
+    s.tkey = at;
+    if at != 0 {
+        timed().insert((at, key(u)), Rc::downgrade(u));
+    }
+}
+
+fn disarm(u: &InetRef) {
+    let mut s = u.borrow_mut();
+    if s.tkey != 0 {
+        timed().remove(&(s.tkey, key(u)));
+        s.tkey = 0;
     }
 }
 
 /// fd がなくなっても残すもの
 fn keep_orphan(u: &InetRef) {
-    let o = orphans();
-    if !o.iter().any(|x| Rc::ptr_eq(x, u)) {
-        o.push(u.clone());
-    }
+    orphans().insert(key(u), u.clone());
 }
 
 fn drop_orphan(u: &InetRef) {
-    orphans().retain(|x| !Rc::ptr_eq(x, u));
+    orphans().remove(&key(u));
 }
 
 /// 4 つ組 (自分のアドレスとポート、相手のアドレスとポート) がもう使われているか (Linux の __inet_check_established:
@@ -813,16 +870,20 @@ fn tuple_used(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16) -> bo
 /// listen しているもの (Linux の __inet_lookup_listener: そのアドレスのものを先に、なければ 0.0.0.0 のもの。
 /// 同じなら新しいもの)
 fn lookup_listener(netns: u64, daddr: u32, dport: u16) -> Option<InetRef> {
-    let list = owners(netns, true, dport);
-    let pick = |exact: bool| {
-        list.iter()
-            .rev()
-            .find(|o| {
-                let o = o.borrow();
-                o.state == St::Listen && if exact { o.rcv_saddr == daddr } else { o.rcv_saddr == 0 }
-            })
-            .cloned()
-    };
+    let k = (netns, dport);
+    let v = listeners().get_mut(&k)?;
+    // listen をやめたもの、ポートを持ちなおしたものは掃く
+    v.retain(|&q, w| {
+        w.upgrade().is_some_and(|o| {
+            let o = o.borrow();
+            o.state == St::Listen && o.hashed && o.pseq == q && o.num == dport
+        })
+    });
+    let list: Vec<InetRef> = v.values().filter_map(|w| w.upgrade()).collect();
+    if v.is_empty() {
+        listeners().remove(&k);
+    }
+    let pick = |exact: bool| list.iter().rev().find(|o| if exact { o.borrow().rcv_saddr == daddr } else { o.borrow().rcv_saddr == 0 }).cloned();
     pick(true).or_else(|| pick(false))
 }
 
@@ -1284,6 +1345,7 @@ fn tcp_done(u: &InetRef) {
 /// 消す (表とのこりものから出す)
 fn destroy(u: &InetRef) {
     put_port(u);
+    disarm(u);
     {
         let mut s = u.borrow_mut();
         s.rq.clear();
@@ -2006,7 +2068,7 @@ fn udp_truesize(len: usize) -> usize {
 /// 届け先 (Linux の __udp4_lib_lookup: そのアドレスに bind したものを先に、なければ 0.0.0.0 のもの。connect した
 /// ものは相手が同じときだけ。点の多いもの、同じなら新しいもの)
 fn udp_lookup(netns: u64, saddr: u32, sport: u16, daddr: u32, dport: u16) -> Option<InetRef> {
-    let list = owners(netns, false, dport);
+    let v = ports().get(&(netns, false, dport))?;
     let score = |o: &Inet, want: u32| -> i32 {
         if o.rcv_saddr != want {
             return -1;
@@ -2028,10 +2090,10 @@ fn udp_lookup(netns: u64, saddr: u32, sport: u16, daddr: u32, dport: u16) -> Opt
     };
     for want in [daddr, 0] {
         let mut best: Option<(i32, InetRef)> = None;
-        for o in list.iter().rev() {
+        for o in v.values().rev().filter_map(|w| w.upgrade()) {
             let sc = score(&o.borrow(), want);
             if sc > 0 && best.as_ref().is_none_or(|(b, _)| sc > *b) {
-                best = Some((sc, o.clone()));
+                best = Some((sc, o));
             }
         }
         if let Some((_, o)) = best {
@@ -3124,51 +3186,39 @@ fn tcp_close(u: &InetRef) {
 
 /// SYN のやりなおし (1、2、4 … 秒。TCP_SYNCNT 回やりなおしてだめなら ETIMEDOUT) と、FIN_WAIT2 / TIME_WAIT の終わり
 pub fn tick() {
-    if timed().is_empty() {
-        return;
-    }
     let now = ticks();
-    let list: Vec<InetRef> = timed().iter().filter_map(|w| w.upgrade()).collect();
-    timed().retain(|w| w.strong_count() > 0);
-    for u in list {
+    loop {
+        let Some((&(at, k), _)) = timed().first_key_value() else { return };
+        if at > now {
+            return;
+        }
+        let w = timed().remove(&(at, k));
+        let Some(u) = w.and_then(|w| w.upgrade()) else { continue };
         let (st, dead, next, exp, tries, syncnt) = {
-            let s = u.borrow();
+            let mut s = u.borrow_mut();
+            s.tkey = 0;
             (s.state, s.dead, s.syn_next, s.expires, s.syn_tries, if s.syncnt != 0 { s.syncnt } else { SYN_RETRIES })
         };
-        let mut pending = false;
         match st {
-            St::SynSent if next != 0 => {
-                if now >= next {
-                    if tries >= syncnt {
-                        u.borrow_mut().err = -ETIMEDOUT;
-                        tcp_done(&u);
-                    } else {
-                        {
-                            let mut s = u.borrow_mut();
-                            s.syn_tries += 1;
-                            s.syn_next = 0;
-                        }
-                        syn(&u);
-                        notify(&u);
+            St::SynSent if next != 0 && now >= next => {
+                if tries >= syncnt {
+                    u.borrow_mut().err = -ETIMEDOUT;
+                    tcp_done(&u);
+                } else {
+                    {
+                        let mut s = u.borrow_mut();
+                        s.syn_tries += 1;
+                        s.syn_next = 0;
                     }
-                    let s = u.borrow();
-                    pending = s.state == St::SynSent && s.syn_next != 0;
-                } else {
-                    pending = true;
+                    syn(&u);
+                    notify(&u);
                 }
             }
-            St::TimeWait | St::FinWait2 if dead && exp != 0 => {
-                if now >= exp {
-                    kill(&u);
-                } else {
-                    pending = true;
-                }
-            }
+            St::TimeWait | St::FinWait2 if dead && exp != 0 && now >= exp => kill(&u),
             _ => {}
         }
-        if !pending {
-            timed().retain(|w| !core::ptr::eq(w.as_ptr(), Rc::as_ptr(&u)));
-        }
+        // まだ先の時刻があれば入れなおす (時刻が動いたもの、やりなおしの SYN がまた落とされたもの)
+        arm(&u);
     }
 }
 
@@ -3263,6 +3313,8 @@ pub fn proc_net(want_tcp: bool) -> String {
         }
         let local = if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr };
         let inode = if s.has_file { s.ino } else { 0 };
+        // Linux の tw (TIME_WAIT と fd のない FIN_WAIT2) は持ち主を覚えていない
+        let uid = if is_tw(&s) { 0 } else { s.uid };
         let line = if want_tcp {
             let rx = if s.state == St::Listen { s.acceptq.len() as u32 } else { s.rcv_nxt.wrapping_sub(s.copied_seq) };
             alloc::format!(
@@ -3275,7 +3327,7 @@ pub fn proc_net(want_tcp: bool) -> String {
                 s.state as u8,
                 0,
                 rx,
-                s.uid,
+                uid,
                 inode
             )
         } else {
@@ -3298,24 +3350,59 @@ pub fn proc_net(want_tcp: bool) -> String {
     out
 }
 
-/// (TCP のつかっている数, つながっている数, UDP の数) (/proc/net/sockstat と snmp)
-pub fn counts() -> (usize, usize, usize) {
-    let (mut t, mut e, mut d) = (0, 0, 0);
+/// /proc/net/sockstat と snmp の数 (Linux の数えかた)
+#[derive(Default)]
+pub struct Counts {
+    /// TCP: 表にいるもの (listen、つないでいる、つながった。bind しただけと TIME_WAIT はのぞく: sock_prot_inuse)
+    pub inuse: usize,
+    /// fd がなくなって、まだ終わっていないもの (FIN_WAIT1、CLOSING、LAST_ACK: tcp_orphan_count)
+    pub orphan: usize,
+    /// TIME_WAIT と、fd のない FIN_WAIT2 (Linux はどちらも小さな tw になる: tcp_time_wait)
+    pub tw: usize,
+    /// tw でない TCP のソケットすべて (tcp_sockets_allocated)
+    pub alloc: usize,
+    pub estab: usize,
+    /// UDP: bind したもの
+    pub udp: usize,
+    /// UDP のソケットすべて (sockets: used に)
+    pub udp_all: usize,
+}
+
+/// Linux なら小さな tw になっているもの: TIME_WAIT と、fd のない FIN_WAIT2 (aios ではどちらもふつうのソケット。
+/// FIN_WAIT2 ののこる時間が TIME_WAIT より長いものは、Linux でもふつうのソケットのまま: tcp_close)
+fn is_tw(s: &Inet) -> bool {
+    s.state == St::TimeWait || (s.state == St::FinWait2 && s.dead && s.linger2 <= FIN_TIMEOUT as i32)
+}
+
+/// 数える
+pub fn counts() -> Counts {
+    let mut c = Counts::default();
     for w in all().iter() {
         let Some(u) = w.upgrade() else { continue };
         let s = u.borrow();
-        if s.tcp {
-            if s.state != St::Close {
-                t += 1;
+        if !s.tcp {
+            c.udp_all += 1;
+            if s.hashed {
+                c.udp += 1;
             }
-            if matches!(s.state, St::Established | St::CloseWait) {
-                e += 1;
+            continue;
+        }
+        if is_tw(&s) {
+            c.tw += 1;
+            continue;
+        }
+        c.alloc += 1;
+        if s.state != St::Close {
+            c.inuse += 1;
+            if s.dead {
+                c.orphan += 1;
             }
-        } else if s.hashed {
-            d += 1;
+        }
+        if matches!(s.state, St::Established | St::CloseWait) {
+            c.estab += 1;
         }
     }
-    (t, e, d)
+    c
 }
 
 // ---- 外 (smoltcp) ----
