@@ -229,7 +229,13 @@ protocol、知らないフラグ、AF_INET と知らない family。bind / conne
 accept4、send / sendto / sendmsg (MSG_OOB / DONTWAIT / NOSIGNAL / EOR / MORE / CONFIRM / PEEK、SCM_RIGHTS、SCM_CREDENTIALS
 (自分と、ほかの pid)、知らない cmsg)、recv / recvfrom / recvmsg (MSG_PEEK / TRUNC / WAITALL / DONTWAIT / OOB / CMSG_CLOEXEC /
 ERRQUEUE、付帯データの入れ物の大きさ)、shutdown、getsockopt / setsockopt、getsockname / getpeername、poll と FIONREAD。
-いつも SOCK_NONBLOCK で作る)) を、
+いつも SOCK_NONBLOCK で作る)、AF_INET のソケット (ループバックの TCP と UDP。名前は 127.0.0.1 / 0.0.0.0 / 127.0.0.2 と、
+ポート 0、だれもいない 1、root だけの 80、前の op のソケットのポート、ないアドレス (bind だけ)、長さ 4、family のまちがい。
+ポートは名前で出す: #j は op j のソケットのポート、ほかは出てきた順に P1、P2 ...。inetpair はロボットの op で、つながった
+TCP か UDP の 2 つを作る (socketpair の AF_INET 版: 送る・受ける・閉じるの奥まで届くように)。IPPROTO_TCP と IPPROTO_IP の
+sockopt、IP_RECVERR と MSG_ERRQUEUE、MSG_OOB も。TCP はいつも TCP_NODELAY で、1 回に送るのは 4096 バイトまで、MSG_MORE
+なし (Linux の Nagle とためたものは、相手の ACK が来たときに出る: 遅らせた ACK の時間しだい)。つながったあとの TCP_MAXSEG
+は 32741 からは wnd と出す (相手の窓の半分までで、Linux の受ける窓は受けた skb の truesize の比で育つ: ページのつくりしだい)) を、
 はじめの木 (a、b/、b/c、d -> b) の上で動かし、答えを 1 行ずつ出す。並びは種だけで決まる (動かした答えによらない) ので、同じ
 種なら Linux でも aios でも同じシステムコールが同じ順に動き、2 つの出力の最初にちがう行がふるまいのちがいになる。答えは
 アーキテクチャによらない形 (フラグは名前、stat は種類と許可とリンクの数と大きさ、ino や時刻は出さない) で、x86_64 の Linux と
@@ -367,6 +373,30 @@ test/unixsock.c が、ロボットの見ないプロセスをまたぐところ 
 同じ、poll しながらの往復は 2 割、4 KiB と 64 KiB の書きこみの流しこみは 3 割速い): 読まれたときに送り手を起こすのは、入れ物が
 いっぱいで待っていたときだけ (Linux の sk_write_space)、1 回の読み書きでヒープを使うのは中身の分だけ。手本の Linux の設定 (test/linux.config) には NET と UNIX (AF_UNIX_OOB も) と INET を足した
 (設定が変われば test/linux-vm.sh が作りなおす)。
+
+ソケット (AF_INET) を覚えさせたとき (Linux 7.3 と、ext4 1000 × 30、400 × 80、600 × 80、tmpfs 500 × 80 でどれもちがわない):
+はじめは 300 の case のうち 90 がちがった。aios の TCP と UDP は smoltcp (外とつなぐ小さな TCP/IP) のソケットで、ループバックも
+パケットにして smoltcp に通していたので、作りなおした (kernel/src/inet.rs。Linux の net/ipv4/ の tcp*.c、udp.c、
+inet_connection_sock.c と同じ考え)。Linux とちがうところが大事なところ: ループバック (127/8、自分のアドレス、0.0.0.0) は
+パケットを作らない。つなぐ (SYN、SYN-ACK、ACK)、送る、FIN、RST は、相手のソケットをじかに呼ぶ (送ったものは相手の受ける
+行列にそのまま入る)。だから Linux の遅らせた ACK や Nagle で待つことはなく、loopback の往復は関数を呼ぶだけ。smoltcp は外
+(eth0) の相手にだけ使う。見えるふるまいは Linux に合わせた: ポートの表と bind の決まり (SO_REUSEADDR / SO_REUSEPORT、
+Linux の inet_bind_conflict と udp_lib_lport_inuse)、空いたポート 32768〜60999、1024 より下は root だけ、TIME_WAIT と
+閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る)。listen の行列があふれたら SYN を落とし (syncookies なし)、
+つなぐほうは SYN_SENT のまま 1、2、4 ... 秒でやりなおす (TCP_SYNCNT の 6 回で ETIMEDOUT)。自分につなぐ、urgent (MSG_OOB と
+SIOCATMARK と SO_OOBINLINE)、FIN と RST の状態の移りかた (閉じた相手に送ると RST、shutdown(SHUT_RD) のあとに来たデータでも
+RST: RFC 1122)、SO_LINGER 0 の RST、MSG_MORE と TCP_CORK、入れ物の大きさ (Linux 7.3 で測った: つながると SO_SNDBUF は
+2626560、TCP_MAXSEG はつないだほうが 32741 で相手から ACK が来ると 32768、SYN を送ったときは 524、IP_MTU は 65535)、accept した
+口の IP_MULTICAST_TTL は相手の TTL。UDP は Linux の点数での相手さがし、ICMP の port unreachable (つないだ相手か IP_RECVERR
+なら ECONNREFUSED、エラーの行列と MSG_ERRQUEUE)、MSG_MORE、送った大きさの truesize (SO_RCVBUF をこえたら落とす)、
+SO_PEEK_OFF、IP_PKTINFO / IP_RECVTOS / IP_RECVTTL の付帯データ。ほかに直したもの: TCP のソケットの mmap (Linux の tcp_mmap:
+書く・実行するは EPERM、ページはなく SIGBUS。写しはソケットを持つので、fd を閉じても写しがあるあいだは閉じない)、写したところの
+msync(MS_SYNC) は fsync のないもの (ソケット、/dev/fb0、音) なら EINVAL、ソケットからパイプへの sendfile、O_PATH の fd の
+poll は POLLNVAL で select は EBADF、AF_UNIX の SO_REUSEPORT。ping のソケット (SOCK_DGRAM の ICMP) は、だれでも使える
+(Linux は ping_group_range で決める。aios は gid を見ない): ロボットはこれを使わない。test/inetsock.c が、ロボットの見ない
+プロセスをまたぐところ (待つ accept / read / poll / epoll、SO_RCVTIMEO、4 MiB の stream、listen の行列があふれたときの 1 秒後の
+やりなおし、ECONNREFUSED、RST、SIGPIPE、TIME_WAIT とポート、/proc/net/tcp、fd を渡した TCP、UDP の待つ recvfrom) をじかに
+確かめる (Linux 7.3 でも同じ答え)。手本の Linux の VM は lo を上げる (test/linux-init.c)。
 
 #### aios がえらんだちがい
 

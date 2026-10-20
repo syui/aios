@@ -45,6 +45,8 @@
 #include <sys/syscall.h>
 #include <sys/file.h>
 #include <poll.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -473,6 +475,16 @@ static const unsigned stypew[5] = {8, 6, 5, 1, 1};
 enum { UA_S, UA_T, UA_BS, UA_DS, UA_A, UA_B, UA_XS, UA_AS, UA_AT, UA_AUTO, UA_AEMPTY, UA_LONG, UA_INET, UA_SHORT, UA_UNSPEC };
 static const char *const uaddrn[NUADDR] = {"s", "t", "b/s", "d/s", "a", "b", "x/s", "@s", "@t", "", "@", "long", "inet", "short", "unspec"};
 static const unsigned uaddrw[NUADDR] = {12, 8, 3, 2, 2, 1, 1, 8, 5, 3, 1, 1, 1, 1, 1};
+// AF_INET (ループバックの TCP と UDP) の名前: アドレスとポート。ポートは名前で出す (Linux のポートはえらぶたびにちがう):
+// 0、1 (だれもいない)、80 (root だけ)、#j (op j のあとにそのソケットが持っていたポート)、ほかは出てきた順に P1、P2 ...。
+// lo は 127.0.0.1、any は 0.0.0.0、lo2 は 127.0.0.2、far は 1.2.3.4 (ないアドレス: bind だけ。connect と sendto は、
+// 外へ出られるか (aios は eth0、Linux の VM は lo だけ) でちがう)。inet-short は長さ 4、inet-unix は family が AF_UNIX、
+// inet-unspec は AF_UNSPEC の 0.0.0.0:0。名前の番号は IADDR(形, j)
+enum { IA_LO0, IA_ANY0, IA_LO, IA_ANY, IA_LO2, IA_LO20, IA_CLOSED, IA_PRIV, IA_FAR, IA_SHORT, IA_UNIX, IA_UNSPEC, NIADDR };
+static const char *const iaddrn[NIADDR] = {"lo:0", "any:0", "lo:#", "any:#", "lo2:#", "lo2:0", "lo:1", "lo:80", "far:0", "inet-short", "inet-unix", "inet-unspec"};
+static const unsigned iabindw[NIADDR] = {10, 6, 3, 2, 0, 1, 0, 1, 1, 1, 1, 1};
+static const unsigned iapeerw[NIADDR] = {1, 0, 12, 2, 1, 0, 2, 1, 0, 1, 1, 2};
+#define IADDR(k, j) (100 + (k) + 16 * (j))
 // パスの名前の長さ: NUL まで (strlen + 1)、NUL なし、sizeof (sockaddr_un)
 static const char *const ulenn[] = {"", ", nonul", ", full"};
 static const int backlogs[] = {0, 1, 5, -1, 4096};
@@ -496,10 +508,24 @@ static const struct {
     {SO_TYPE, "SO_TYPE"}, {SO_ERROR, "SO_ERROR"}, {SO_DOMAIN, "SO_DOMAIN"}, {SO_PROTOCOL, "SO_PROTOCOL"}, {SO_ACCEPTCONN, "SO_ACCEPTCONN"},
     {SO_PASSCRED, "SO_PASSCRED"}, {SO_PEERCRED, "SO_PEERCRED"}, {SO_RCVBUF, "SO_RCVBUF"}, {SO_SNDBUF, "SO_SNDBUF"}, {SO_REUSEADDR, "SO_REUSEADDR"},
     {SO_KEEPALIVE, "SO_KEEPALIVE"}, {SO_LINGER, "SO_LINGER"}, {SO_RCVLOWAT, "SO_RCVLOWAT"}, {SO_PEEK_OFF, "SO_PEEK_OFF"}, {SO_BROADCAST, "SO_BROADCAST"},
-    {9999, "9999"},
+    {SO_REUSEPORT, "SO_REUSEPORT"}, {SO_OOBINLINE, "SO_OOBINLINE"}, {9999, "9999"},
 };
-#define NSOPT 16
-static const unsigned soptw[NSOPT] = {3, 3, 2, 2, 3, 3, 4, 3, 3, 1, 1, 1, 1, 2, 1, 1};
+#define NSOPT 18
+static const unsigned soptw[NSOPT] = {3, 3, 2, 2, 3, 3, 4, 3, 3, 1, 1, 1, 1, 2, 1, 1, 1, 1};
+// AF_INET の IPPROTO_TCP と IPPROTO_IP の名前 (時間で変わるもの (TCP_QUICKACK)、つなぎかたを変えるもの (TCP_CORK、
+// TCP_DEFER_ACCEPT、TCP_WINDOW_CLAMP) はのぞく)
+static const struct {
+    int level, opt;
+    const char *n;
+} iopts[] = {
+    {IPPROTO_TCP, TCP_NODELAY, "TCP_NODELAY"}, {IPPROTO_TCP, TCP_MAXSEG, "TCP_MAXSEG"}, {IPPROTO_TCP, TCP_KEEPIDLE, "TCP_KEEPIDLE"},
+    {IPPROTO_TCP, TCP_KEEPINTVL, "TCP_KEEPINTVL"}, {IPPROTO_TCP, TCP_KEEPCNT, "TCP_KEEPCNT"}, {IPPROTO_TCP, TCP_SYNCNT, "TCP_SYNCNT"},
+    {IPPROTO_TCP, TCP_LINGER2, "TCP_LINGER2"}, {IPPROTO_TCP, TCP_USER_TIMEOUT, "TCP_USER_TIMEOUT"}, {IPPROTO_TCP, TCP_NOTSENT_LOWAT, "TCP_NOTSENT_LOWAT"},
+    {IPPROTO_IP, IP_TOS, "IP_TOS"}, {IPPROTO_IP, IP_TTL, "IP_TTL"}, {IPPROTO_IP, IP_RECVERR, "IP_RECVERR"}, {IPPROTO_IP, IP_MTU_DISCOVER, "IP_MTU_DISCOVER"},
+    {IPPROTO_IP, IP_MTU, "IP_MTU"}, {IPPROTO_IP, IP_PKTINFO, "IP_PKTINFO"}, {IPPROTO_IP, IP_FREEBIND, "IP_FREEBIND"},
+    {IPPROTO_IP, IP_MULTICAST_TTL, "IP_MULTICAST_TTL"}, {IPPROTO_IP, IP_MULTICAST_LOOP, "IP_MULTICAST_LOOP"}, {IPPROTO_IP, IP_RECVTOS, "IP_RECVTOS"},
+};
+#define NIOPT 19
 // setsockopt の値 (入れ物の大きさは大きなものだけ: 小さくすると、どこで入らなくなるかが skb の大きさしだい)
 static const int soptval[] = {0, 1, 2, -1};
 static const int sbufval[] = {65536, 1 << 20, 212992};
@@ -592,15 +618,29 @@ static int lastorig;
 // 次はちがう open のものを多めに)
 static int lastsame, lastlock = -1;
 // ソケットの ref の印 (0 はソケットでない): 型 (stypev の番号 + 1) と、つながっていそう (SK_CONN)、listen した (SK_LISTEN)、
-// socket で作った (SK_FRESH: connect と bind に)。bnames は bind した名前 (connect と sendto の相手に多めに)
+// socket で作った (SK_FRESH: connect と bind に)、AF_INET (SK_INET)、listen したもので connect が来ていそう (SK_PEND: accept4 に)、
+// 受けるものがありそう (SK_DATA: 受ける op に)。bnames は bind した名前 (connect と sendto の相手に
+// 多めに)。inames は AF_INET で名前を持った op (bind か listen。相手はそのポート)、その型とそのソケット。sinet はソケットの
+// case が AF_INET のもの
 #define SK_CONN 16
 #define SK_LISTEN 32
 #define SK_FRESH 64
 #define SK_BOUND 128
+#define SK_INET 256
+#define SK_PEND 512
+#define SK_DATA 1024
 static int refsock[2 * MAXOPS], lastsock;
-static int nbname, bnames[MAXOPS], bnref[MAXOPS], bnlisten[MAXOPS], sfocus, stfocus;
+static int nbname, bnames[MAXOPS], bnref[MAXOPS], bnlisten[MAXOPS], sfocus, stfocus, sinet;
+static int niname, inames[MAXOPS], inref[MAXOPS], inlisten[MAXOPS], intype[MAXOPS];
 // ソケットの case の予定 (つなぐまでの op の並び: listen したら socket、connect、accept4 など)。7 割はそのとおりに
 static int plan[16], nplan;
+// つながりの相手 (ref で: socketpair の 2 つ、connect と accept4 の 2 つ、UDP は connect した先)。-1 はわからない。spend は listen の
+// ref に来ていそうな connect の ref (いちばん新しいもの)
+static int speer[2 * MAXOPS], spend[2 * MAXOPS];
+
+static int isref(int r) {
+    return r >= 0 && r < 2 * MAXOPS;
+}
 
 static void planop(int k) {
     for (int j = 0; j < nplan; j++)
@@ -779,15 +819,15 @@ static int gendir(void) {
     return chance(88) ? REF_CWD : genfd(&pipe);
 }
 
-// ソケットの fd (want の印があり avoid の印がないものを多めに)。なければ (と 1 割は) ほかの fd。lastsock にその印
+// ソケットの fd (want の印がみなあり avoid の印がないものを多めに)。なければ (と 1 割は) ほかの fd。lastsock にその印
 static int gensock2(int want, int avoid) {
     int cand[2 * MAXOPS], n = 0, pipe;
     for (int i = 0; i < nref; i++)
-        if (refsock[i] && (!want || (refsock[i] & want)) && !(refsock[i] & avoid))
+        if (refsock[i] && (refsock[i] & want) == want && !(refsock[i] & avoid))
             cand[n++] = i;
     if (n == 0 && avoid)
         for (int i = 0; i < nref; i++)
-            if (refsock[i] && (!want || (refsock[i] & want)))
+            if (refsock[i] && (refsock[i] & want) == want)
                 cand[n++] = i;
     if (n == 0 && want)
         for (int i = 0; i < nref; i++)
@@ -825,15 +865,78 @@ static int hassock(int want, int avoid) {
     return 0;
 }
 
-// ソケットの ref の印を足す
+// ソケットの ref の印を足す (bits が負なら、その印を消す)
 static void marksock(int r, int bits) {
     for (int i = 0; i < nref; i++)
         if (refs[i] == r && refsock[i])
-            refsock[i] |= bits;
+            refsock[i] = bits < 0 ? refsock[i] & ~-bits : refsock[i] | bits;
 }
 
-// connect と sendto の相手: たいてい bind した名前 (listen したものの名前を多めに)
+// connect の相手 (genpeer の名前) が、型 t で listen したソケットなら、その ref。ほかは -1
+static int listener(int x, int t) {
+    if (x >= 100) {
+        int k = (x - 100) % 16, j = (x - 100) / 16;
+        if (k != IA_LO && k != IA_ANY && k != IA_LO2)
+            return -1;
+        for (int m = 0; m < niname; m++)
+            if (inames[m] == j && (inlisten[m] || t == 2) && intype[m] == t)
+                return inref[m];
+        return -1;
+    }
+    for (int k = 0; k < nbname; k++)
+        if (bnames[k] == x && (bnlisten[k] || t == 2))
+            return bnref[k];
+    return -1;
+}
+
+// AF_INET の型 t のソケット (近いものほど選ばれやすく)。なければ -1
+static int geninet(int t) {
+    int cand[2 * MAXOPS], n = 0;
+    for (int i = 0; i < nref; i++)
+        if ((refsock[i] & SK_INET) && (refsock[i] & 15) == t)
+            cand[n++] = i;
+    if (n == 0)
+        return -1;
+    int j = cand[chance(60) ? n - 1 - (int)pick(n < 3 ? n : 3) : (int)pick(n)];
+    lastsock = refsock[j];
+    return refs[j];
+}
+
+// AF_INET でポートを持つ op を名前に (connect と、送ってポートをもらった UDP: 相手がそこへ送りかえせるように)
+static void addiname(int fd, int i, int t) {
+    for (int m = 0; m < niname; m++)
+        if (inref[m] == fd)
+            return;
+    if (niname < MAXOPS) {
+        inref[niname] = fd;
+        inlisten[niname] = 0;
+        intype[niname] = t;
+        inames[niname++] = i;
+    }
+}
+
+// AF_INET の名前 (w は形の重み): 形が #j なら、名前を持った op から (t の型で listen したものを多めに)。なければ bind は
+// lo:0、ほかは lo:1
+static int geninaddr(const unsigned *w, int t) {
+    int k = (int)pickw(w, NIADDR);
+    if (k != IA_LO && k != IA_ANY && k != IA_LO2)
+        return IADDR(k, 0);
+    int cand[MAXOPS], n = 0;
+    for (int j = 0; j < niname; j++)
+        if (intype[j] == t && (inlisten[j] || t == 2))
+            cand[n++] = inames[j];
+    if (n && chance(85))
+        return IADDR(k, cand[chance(50) ? n - 1 : (int)pick(n)]);
+    if (niname)
+        return IADDR(k, inames[pick(niname)]);
+    return IADDR(w == iabindw ? IA_LO0 : IA_CLOSED, 0);
+}
+
+// connect と sendto の相手: たいてい bind した名前 (listen したものの名前を多めに)。AF_INET のソケット (lastsock) には
+// たいてい AF_INET の名前
 static int genpeer(void) {
+    if ((lastsock & SK_INET) && chance(95))
+        return geninaddr(iapeerw, lastsock & 15);
     int cand[MAXOPS], n = 0;
     for (int k = 0; k < nbname; k++)
         if (bnlisten[k])
@@ -923,11 +1026,15 @@ static char genpath(char *p, int target) {
 static void gen(uint64_t seed, int n) {
     rs = seed;
     nbname = 0;
+    niname = 0;
     lastsock = 0;
     sfocus = chance(40);
     nplan = 0;
-    // ソケットの case の型 (たいていこれで作る: つないで送れるように)
-    stfocus = chance(45) ? 0 : chance(55) ? 2 : 1;
+    memset(speer, -1, sizeof speer);
+    memset(spend, -1, sizeof spend);
+    // ソケットの case の型 (たいていこれで作る: つないで送れるように)。AF_INET の case は TCP か UDP
+    sinet = sfocus && chance(40);
+    stfocus = sinet ? (chance(55) ? 0 : 1) : chance(45) ? 0 : chance(55) ? 2 : 1;
     unsigned w[NKIND];
     for (int k = 0; k < NKIND; k++)
         w[k] = weight[k] * (sfocus && k >= SOCKET && k < POLL ? SOCKFOCUS : 1);
@@ -1324,19 +1431,53 @@ static void gen(uint64_t seed, int n) {
             break;
         case SOCKET:
         case SOCKPAIR:
-            // x: 型 (stypev)。y: family (0 AF_UNIX、1 AF_INET (socketpair だけ: EOPNOTSUPP)、2 知らない 99)。mode: protocol
-            // (0、PF_UNIX、2)。acc: SOCK_CLOEXEC (1) と知らないビット (2)
-            o->x = sfocus && chance(75) ? stfocus : (int)pickw(stypew, 5);
-            o->y = chance(92) ? 0 : o->kind == SOCKPAIR && chance(50) ? 1 : 2;
-            o->mode = chance(90) ? 0u : chance(50) ? 1u : 2u;
+            // x: 型 (stypev)。y: family (0 AF_UNIX、1 AF_INET (socketpair は EOPNOTSUPP)、2 知らない 99)。mode: protocol
+            // (0、PF_UNIX (AF_INET では ICMP)、2、AF_INET では TCP と UDP も)。acc: SOCK_CLOEXEC (1) と知らないビット (2)
+            o->x = sfocus && chance(sinet ? 85 : 75) ? stfocus : (int)pickw(stypew, 5);
+            if (o->kind == SOCKET && (sinet ? chance(88) : chance(4)))
+                o->y = 1;
+            else
+                o->y = chance(92) ? 0 : chance(50) ? 1 : 2;
+            // (AF_INET の ICMP (1) は使わない: aios の ping はだれでも使える (Linux の ping_group_range を広げたもの))
+            if (o->y == 1 && !chance(92)) {
+                static const unsigned iprot[] = {6, 17, 2, 132};
+                o->mode = iprot[pick(4)];
+            } else
+                o->mode = chance(90) || o->y == 1 ? 0u : chance(50) ? 1u : 2u;
             o->acc = (chance(30) ? 1u : 0u) | (chance(3) ? 2u : 0u);
+            // AF_INET の case は、つながった 2 つ (inetpair: d1 が 1) を多めに (送って受けるところまで届くように)
+            if (sinet && (o->kind == SOCKPAIR ? chance(85) : chance(20))) {
+                o->kind = SOCKPAIR;
+                o->d1 = 1;
+                o->x = stfocus;
+                o->y = 1;
+                o->mode = 0;
+                o->acc &= 1;
+            }
             lastdir = 0;
             lastorig = -1;
-            lastsock = (o->x + 1) | (o->kind == SOCKPAIR ? SK_CONN : SK_FRESH);
-            addref(2 * i, 0, 1, 3);
+            // できそうか (できないものはソケットとして覚えない: その fd に送る op がむだにならないように)
+            {
+                int ok = !(o->acc & 2);
+                if (o->y == 0)
+                    ok = ok && o->x <= 2 && o->mode <= 1;
+                else if (o->y == 1)
+                    ok = ok && (o->kind == SOCKET || o->d1 == 1) && ((o->x == 0 && (o->mode == 0 || o->mode == 6)) || (o->x == 1 && (o->mode == 0 || o->mode == 17)));
+                else
+                    ok = 0;
+                int in = o->y == 1 ? SK_INET : 0;
+                lastsock = ok ? (o->x + 1) | (o->kind == SOCKPAIR ? SK_CONN : SK_FRESH) | in : 0;
+                addref(2 * i, 0, ok, 3);
+                if (o->kind == SOCKPAIR) {
+                    lastsock = ok ? (o->x + 1) | SK_CONN | in : 0;
+                    addref(2 * i + 1, 0, ok, 3);
+                }
+                if (o->d1 == 1)
+                    addiname(2 * i, i, o->x + 1);
+            }
             if (o->kind == SOCKPAIR) {
-                lastsock = (o->x + 1) | SK_CONN;
-                addref(2 * i + 1, 0, 1, 3);
+                speer[2 * i] = 2 * i + 1;
+                speer[2 * i + 1] = 2 * i;
             } else if (sfocus && chance(50))
                 planop(BIND);
             break;
@@ -1344,7 +1485,17 @@ static void gen(uint64_t seed, int n) {
             // x: 名前、y: 名前の長さの形 (ulenn)。まだ bind していない、socket で作ったものを多めに
             o->fd = gensock2(SK_FRESH, SK_BOUND);
             marksock(o->fd, SK_BOUND);
-            o->x = (int)pickw(uaddrw, NUADDR);
+            if ((lastsock & SK_INET) ? chance(94) : chance(2)) {
+                o->x = geninaddr(iabindw, lastsock & 15);
+                int k = (o->x - 100) % 16;
+                if (k <= IA_LO20 && niname < MAXOPS) {
+                    inref[niname] = o->fd;
+                    inlisten[niname] = 0;
+                    intype[niname] = lastsock & 15;
+                    inames[niname++] = i;
+                }
+            } else
+                o->x = (int)pickw(uaddrw, NUADDR);
             o->y = chance(80) ? 0 : (int)(1 + pick(2));
             if (o->x <= UA_AT && nbname < MAXOPS) {
                 bnref[nbname] = o->fd;
@@ -1360,6 +1511,21 @@ static void gen(uint64_t seed, int n) {
             for (int k = 0; k < nbname; k++)
                 if (bnref[k] == o->fd)
                     bnlisten[k] = 1;
+            // AF_INET は bind していなくても listen でポートを持つ
+            if (lastsock & SK_INET) {
+                int found = 0;
+                for (int k = 0; k < niname; k++)
+                    if (inref[k] == o->fd) {
+                        inlisten[k] = 1;
+                        found = 1;
+                    }
+                if (!found && niname < MAXOPS) {
+                    inref[niname] = o->fd;
+                    inlisten[niname] = 1;
+                    intype[niname] = lastsock & 15;
+                    inames[niname++] = i;
+                }
+            }
             if (sfocus) {
                 planop(SOCKET);
                 planop(CONNECT);
@@ -1368,42 +1534,100 @@ static void gen(uint64_t seed, int n) {
             marksock(o->fd, SK_LISTEN);
             break;
         case CONNECT:
-            // つなぐのは、bind も listen もしていない、socket で作ったもの
-            o->fd = gensock2(SK_FRESH, SK_BOUND | SK_LISTEN | SK_CONN);
+            // つなぐのは、listen していない、socket で作ったもの (AF_UNIX は bind もしていないもの)
+            o->fd = sinet && chance(70) ? gensock2(SK_FRESH | SK_INET, SK_LISTEN | SK_CONN) : gensock2(SK_FRESH, SK_BOUND | SK_LISTEN | SK_CONN);
             o->x = genpeer();
             o->y = chance(85) ? 0 : (int)(1 + pick(2));
             marksock(o->fd, SK_CONN);
+            if (lastsock & SK_INET)
+                addiname(o->fd, i, lastsock & 15);
+            // listen したものにつないだら、その accept4 と、送って受けるのを多めに。UDP はその先が相手 (AF_INET の名前は
+            // 長さの形 y を使わない)
+            int l = o->y == 0 || o->x >= 100 ? listener(o->x, lastsock & 15) : -1;
+            if (l >= 0 && (lastsock & 15) == 2 && isref(o->fd))
+                speer[o->fd] = l;
+            else if (l >= 0) {
+                marksock(l, SK_PEND);
+                if (isref(l))
+                    spend[l] = o->fd;
+                if (sfocus) {
+                    planop(ACCEPT);
+                    planop(SEND);
+                    planop(RECV);
+                }
+            }
             break;
         case ACCEPT: {
             // x: 相手の名前の入れ物 (0 sockaddr_un、1 長さ 4、2 NULL)。y: flags (いつも SOCK_NONBLOCK。1 SOCK_CLOEXEC、2 知らないビット)
-            o->fd = gensock(SK_LISTEN);
+            // connect が来ていそうな listen を多めに
+            o->fd = gensock(hassock(SK_LISTEN | SK_PEND, 0) && chance(85) ? SK_LISTEN | SK_PEND : SK_LISTEN);
+            int pend = (lastsock & (SK_LISTEN | SK_PEND)) == (SK_LISTEN | SK_PEND);
+            marksock(o->fd, -SK_PEND);
+            if (isref(o->fd) && spend[o->fd] >= 0) {
+                speer[2 * i] = spend[o->fd];
+                if (isref(spend[o->fd]))
+                    speer[spend[o->fd]] = 2 * i;
+                spend[o->fd] = -1;
+            }
             o->x = chance(60) ? 0 : (int)(1 + pick(2));
             o->y = chance(70) ? 0 : chance(85) ? 1 : 2;
             int t = lastsock & 15;
             lastdir = 0;
             lastorig = -1;
-            lastsock = (t ? t : 1) | SK_CONN;
-            addref(2 * i, 0, 1, 3);
+            // connect が来ていなければ、たいていできない (ソケットとして覚えない)
+            lastsock = pend ? (t ? t : 1) | SK_CONN | (lastsock & SK_INET) : 0;
+            addref(2 * i, 0, pend, 3);
+            if (sfocus && chance(60)) {
+                planop(SEND);
+                planop(RECV);
+            }
             break;
         }
         case SEND:
             // x: 0 send、1 sendto (相手 d1)、2 sendmsg (2 つの iovec。d1 が 0 以上なら相手も。cmsg は mode)。y: flags。len。
             // 中身は x の値から (op ごとにちがう)。mode: 0 なし、1 SCM_RIGHTS (fd d2)、2 SCM_RIGHTS (fd d2 と自分)、
             // 3 SCM_CREDENTIALS (自分)、4 SCM_CREDENTIALS (pid 1)、5 知らない cmsg
-            o->fd = gensock(SK_CONN);
+            // AF_INET の UDP の case は UDP のソケットから多めに (sendto で)
+            int u = sinet && stfocus == 1 && chance(70) ? geninet(2) : -1;
+            o->fd = u >= 0 ? u : gensock(SK_CONN);
+            int st = lastsock;
             o->acc = (unsigned)pick(256);
             o->x = chance(55) ? 0 : chance(45) ? 1 : 2;
+            if ((st & SK_INET) && (st & 15) == 2 && !(st & SK_CONN) && chance(80))
+                o->x = 1;
             o->d1 = o->x == 1 || (o->x == 2 && chance(30)) ? genpeer() : -1;
+            lastsock = st;
+            // 受けるものがありそうな印を相手に。UDP の送り手はポートをもらうので名前に
+            {
+                int to = -1;
+                if (o->d1 >= 0 && (st & 15) == 2)
+                    to = listener(o->d1, 2);
+                else if (isref(o->fd))
+                    to = speer[o->fd];
+                if (to >= 0)
+                    marksock(to, SK_DATA);
+                if ((st & SK_INET) && (st & 15) == 2)
+                    addiname(o->fd, i, 2);
+            }
             o->y = (int)pickw(sflw, 8);
             o->len = slens[pickw(slensw, 6)];
+            // TCP は 4096 まで (受ける窓 (64 KiB ほど) がうまらないように: 窓の大きさは Linux の skb の大きさしだい)。
+            // MSG_MORE は使わない (Linux はためたものを、相手から ACK が来たときにも出す: 遅らせた ACK の時間しだい)
+            if ((lastsock & SK_INET) && (lastsock & 15) == 1) {
+                if (o->len > 4096)
+                    o->len = 4096;
+                if (sflv[o->y] & MSG_MORE)
+                    o->y = 0;
+            }
             o->mode = o->x == 2 && chance(55) ? (chance(60) ? 1u : 2u + (unsigned)pick(4)) : 0u;
             if (o->mode == 1 || o->mode == 2)
                 o->d2 = genfd(&pipe);
             break;
         case RECV:
             // x: 0 recv、1 recvfrom (相手の名前も)、2 recvmsg (名前と cmsg。cmsg の入れ物は mode: 0 大きい、1 小さい (16)、2 なし)。
-            // y: flags。len。受けとった fd (SCM_RIGHTS) は ref に
-            o->fd = gensock(SK_CONN);
+            // y: flags。len。受けとった fd (SCM_RIGHTS) は ref に。受けるものがありそうなものを多めに
+            o->fd = gensock(hassock(SK_DATA, 0) && chance(80) ? SK_DATA : SK_CONN);
+            marksock(o->fd, -SK_DATA);
             o->x = chance(45) ? 0 : chance(40) ? 1 : 2;
             o->y = (int)pickw(rflw, 10);
             o->len = rclens[pickw(rclensw, 5)];
@@ -1419,12 +1643,19 @@ static void gen(uint64_t seed, int n) {
             o->x = chance(95) ? (int)pick(3) : 3;
             break;
         case SOCKOPT:
-            // x: 0 getsockopt、1 setsockopt。y: 名前 (sopts)。mode: 1 なら level がまちがい (SOL_SOCKET でない 99)。acc: 値の番号
-            // (get は 1 なら長さが 1)
+            // x: 0 getsockopt、1 setsockopt。y: 名前 (sopts)。mode: 1 なら level がまちがい (SOL_SOCKET でない 99)、2 なら
+            // IPPROTO_TCP か IPPROTO_IP の名前 (iopts の y。AF_INET のソケットに多めに)。acc: 値の番号 (get は 1 なら長さが 1)
             o->fd = gensock(0);
             o->x = chance(35);
-            o->y = (int)pickw(soptw, NSOPT);
             o->mode = chance(5);
+            if (!o->mode && ((lastsock & SK_INET) ? chance(55) : chance(3))) {
+                o->mode = 2;
+                o->y = (int)pick(NIOPT);
+                // TCP_NODELAY は見るだけ (ロボットの TCP はいつも TCP_NODELAY: Nagle は遅らせた ACK の時間しだい)
+                if (o->x && iopts[o->y].opt == TCP_NODELAY && iopts[o->y].level == IPPROTO_TCP)
+                    o->x = 0;
+            } else
+                o->y = (int)pickw(soptw, NSOPT);
             o->acc = (unsigned)pick(4);
             break;
         case SOCKNAME:
@@ -2010,10 +2241,81 @@ static long long wstart_of(const struct op *o, int fd, long long size) {
 
 // ---- ソケット ----
 
+// AF_INET のポート: oport[j] は op j のあとにそのソケットが持っていたポート (なければ 0)。eports はほかに出てきたもの (P1 ...)
+static unsigned short oport[MAXOPS], eports[64];
+static int neport;
+
+static const char *portname(unsigned p) {
+    static char b[4][16];
+    static int nb;
+    char *s = b[nb++ & 3];
+    if (p == 0 || p == 1 || p == 80) {
+        snprintf(s, 16, "%u", p);
+        return s;
+    }
+    for (int j = 0; j < MAXOPS; j++)
+        if (oport[j] == p) {
+            snprintf(s, 16, "#%d", j);
+            return s;
+        }
+    int k = 0;
+    while (k < neport && eports[k] != p)
+        k++;
+    if (k == neport && neport < 64)
+        eports[neport++] = (unsigned short)p;
+    snprintf(s, 16, "P%d", k + 1);
+    return s;
+}
+
+// ロボットの TCP はいつも TCP_NODELAY (Linux の Nagle は、まだ ACK の来ないものがあると小さな書きこみをためる: ACK を
+// 遅らせるか (相手がすぐに答えたか) は時間しだい)。TCP でなければ何もしない
+static void nodelay(long fd) {
+    int t = 0, one = 1;
+    socklen_t l = sizeof t;
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    if (fd >= 0 && getsockopt((int)fd, SOL_SOCKET, SO_TYPE, &t, &l) == 0 && t == SOCK_STREAM && getsockname((int)fd, (struct sockaddr *)&a, &al) == 0 &&
+        a.sin_family == AF_INET)
+        setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+
+// op i のあと、fd が AF_INET のソケットなら、そのポートを覚える
+static void noteport(int i, int fd) {
+    struct sockaddr_in a;
+    socklen_t l = sizeof a;
+    memset(&a, 0, sizeof a);
+    if (fd >= 0 && i < MAXOPS && getsockname(fd, (struct sockaddr *)&a, &l) == 0 && l >= sizeof a && a.sin_family == AF_INET && a.sin_port)
+        oport[i] = ntohs(a.sin_port);
+}
+
+// AF_INET の名前 IADDR(k, j) を a に (長さを返す)
+static socklen_t mkinaddr(int code, struct sockaddr_un *a) {
+    int k = (code - 100) % 16, j = (code - 100) / 16;
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof in);
+    in.sin_family = AF_INET;
+    static const uint32_t addrs[NIADDR] = {0x7f000001, 0, 0x7f000001, 0, 0x7f000002, 0x7f000002, 0x7f000001, 0x7f000001, 0x01020304, 0x7f000001, 0x7f000001, 0};
+    in.sin_addr.s_addr = htonl(addrs[k]);
+    if (k == IA_LO || k == IA_ANY || k == IA_LO2)
+        in.sin_port = htons(j < MAXOPS ? oport[j] : 0);
+    else if (k == IA_CLOSED)
+        in.sin_port = htons(1);
+    else if (k == IA_PRIV)
+        in.sin_port = htons(80);
+    if (k == IA_UNIX)
+        in.sin_family = AF_UNIX;
+    if (k == IA_UNSPEC)
+        in.sin_family = AF_UNSPEC;
+    memcpy(a, &in, sizeof in);
+    return k == IA_SHORT ? 4 : (socklen_t)sizeof in;
+}
+
 // 名前 k の sockaddr_un とその長さ (形 lk: 0 は NUL まで、1 は NUL なし、2 は sizeof (sockaddr_un))。抽象名前空間の名前は
-// "\0s" と "\0t"
+// "\0s" と "\0t"。100 からは AF_INET の名前 (mkinaddr)
 static socklen_t mkaddr(int k, int lk, struct sockaddr_un *a) {
     memset(a, 0, sizeof *a);
+    if (k >= 100)
+        return mkinaddr(k, a);
     a->sun_family = AF_UNIX;
     socklen_t base = (socklen_t)offsetof(struct sockaddr_un, sun_path);
     switch (k) {
@@ -2042,6 +2344,14 @@ static socklen_t mkaddr(int k, int lk, struct sockaddr_un *a) {
 }
 
 static void sayuaddr(int k, int lk) {
+    if (k >= 100) {
+        int ik = (k - 100) % 16;
+        if (ik == IA_LO || ik == IA_ANY || ik == IA_LO2)
+            say("%s%d", iaddrn[ik], (k - 100) / 16);
+        else
+            say("%s", iaddrn[ik]);
+        return;
+    }
     if (k >= UA_AS)
         say("%s", uaddrn[k]);
     else
@@ -2056,6 +2366,20 @@ static void sayaddr(const struct sockaddr_un *a, socklen_t len, socklen_t room) 
     socklen_t n = len < room ? len : room;
     if (n < sizeof(sa_family_t))
         return;
+    // AF_INET: 入れ物に入った分だけ (ポートは 4 バイトから、アドレスは 8 バイトから)
+    if (a->sun_family == AF_INET) {
+        struct sockaddr_in in;
+        memset(&in, 0, sizeof in);
+        memcpy(&in, a, n < sizeof in ? n : sizeof in);
+        uint32_t ad = ntohl(in.sin_addr.s_addr);
+        if (n >= 8)
+            say(" %u.%u.%u.%u:%s", ad >> 24, (ad >> 16) & 255, (ad >> 8) & 255, ad & 255, portname(ntohs(in.sin_port)));
+        else if (n >= 4)
+            say(" inet:%s", portname(ntohs(in.sin_port)));
+        else
+            say(" inet");
+        return;
+    }
     if (a->sun_family != AF_UNIX) {
         say(" family%d", a->sun_family);
         return;
@@ -2129,11 +2453,58 @@ static void sayrevents(short r) {
 }
 
 static void saycred(const struct ucred *c) {
-    say(" pid %s uid %s gid %s", pidname(c->pid), c->uid == geteuid() ? "me" : c->uid == 0 ? "0" : "other", c->gid == getegid() ? "me" : c->gid == 0 ? "0" : "other");
+    // 資格情報のないメッセージは pid 0 と overflowuid / overflowgid (65534)。手本の Linux は nobody (65534) で、aios は ai で
+    // 動くので、自分かどうかより先に (pid が 0 のときだけ: 本当の資格情報は pid がある)
+    int none = c->pid == 0;
+    say(" pid %s uid %s gid %s", pidname(c->pid), none && c->uid == 65534 ? "overflow" : c->uid == geteuid() ? "me" : c->uid == 0 ? "0" : "other",
+        none && c->gid == 65534 ? "overflow" : c->gid == getegid() ? "me" : c->gid == 0 ? "0" : "other");
 }
 
 // 送る中身と受ける入れ物 (ソケットの長さは wbuf / rbuf より大きい)
 static unsigned char sbuf[131072], rbig[131072];
+
+// inetpair (ロボットの op。socketpair の AF_INET 版): ループバックでつながった 2 つ。TCP は lo:0 で listen して connect と
+// accept4 (listen は閉じる)、UDP は 2 つとも lo:0 に bind して、たがいに connect。できなければ -1 (errno)
+static int inetpair(int t, int sv[2]) {
+    struct sockaddr_in a, b;
+    socklen_t l = sizeof a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    b = a;
+    int x = socket(AF_INET, t, 0), y = -1, e;
+    if (x < 0)
+        return -1;
+    if (bind(x, (struct sockaddr *)&a, sizeof a) || getsockname(x, (struct sockaddr *)&a, &l))
+        goto fail;
+    if ((t & 15) == SOCK_STREAM) {
+        if (listen(x, 1) || (y = socket(AF_INET, t, 0)) < 0)
+            goto fail;
+        if (connect(y, (struct sockaddr *)&a, sizeof a) && errno != EINPROGRESS)
+            goto fail;
+        int c = accept4(x, NULL, NULL, t & (SOCK_NONBLOCK | SOCK_CLOEXEC));
+        if (c < 0)
+            goto fail;
+        close(x);
+        sv[0] = y;
+        sv[1] = c;
+        return 0;
+    }
+    l = sizeof b;
+    if ((y = socket(AF_INET, t, 0)) < 0 || bind(y, (struct sockaddr *)&b, sizeof b) || getsockname(y, (struct sockaddr *)&b, &l) ||
+        connect(x, (struct sockaddr *)&b, sizeof b) || connect(y, (struct sockaddr *)&a, sizeof a))
+        goto fail;
+    sv[0] = x;
+    sv[1] = y;
+    return 0;
+fail:
+    e = errno;
+    close(x);
+    if (y >= 0)
+        close(y);
+    errno = e;
+    return -1;
+}
 
 static void sockexec(int i, const struct op *o, int fd) {
     static const char *const domn[] = {"AF_UNIX", "AF_INET", "99"};
@@ -2144,6 +2515,23 @@ static void sockexec(int i, const struct op *o, int fd) {
     case SOCKET:
     case SOCKPAIR: {
         int t = stypev[o->x] | SOCK_NONBLOCK | ((o->acc & 1) ? SOCK_CLOEXEC : 0) | ((o->acc & 2) ? 0x100 : 0);
+        if (o->kind == SOCKPAIR && o->d1 == 1) {
+            int sv[2];
+            say("inetpair(%s|SOCK_NONBLOCK%s)", stypen[o->x], (o->acc & 1) ? "|SOCK_CLOEXEC" : "");
+            r = inetpair(t, sv);
+            ret(r);
+            if (r == 0) {
+                res[i][0] = sv[0];
+                res[i][1] = sv[1];
+                born(i, sv[0]);
+                born(i, sv[1]);
+                nodelay(sv[0]);
+                nodelay(sv[1]);
+                noteport(i, sv[0]);
+                say(" [%d,%d]", sv[0], sv[1]);
+            }
+            break;
+        }
         say("%s(%s, %s|SOCK_NONBLOCK%s%s, %d)", o->kind == SOCKET ? "socket" : "socketpair", domn[o->y], stypen[o->x], (o->acc & 1) ? "|SOCK_CLOEXEC" : "", (o->acc & 2) ? "|0x100" : "",
             (int)o->mode);
         if (o->kind == SOCKET) {
@@ -2152,6 +2540,7 @@ static void sockexec(int i, const struct op *o, int fd) {
             if (r >= 0)
                 res[i][0] = (int)r;
             born(i, r);
+            nodelay(r);
         } else {
             int sv[2];
             r = syscall(SYS_socketpair, domv[o->y], t, (int)o->mode, sv);
@@ -2186,6 +2575,7 @@ static void sockexec(int i, const struct op *o, int fd) {
         say("accept4(%d, %s, SOCK_NONBLOCK%s)", fd, o->x == 0 ? "sockaddr_un" : o->x == 1 ? "4" : "NULL", o->y == 1 ? "|SOCK_CLOEXEC" : o->y == 2 ? "|0x100" : "");
         r = syscall(SYS_accept4, fd, o->x == 2 ? NULL : &a, o->x == 2 ? NULL : &al, fl);
         ret(r);
+        nodelay(r);
         if (r >= 0) {
             res[i][0] = (int)r;
             if (o->x != 2)
@@ -2318,8 +2708,9 @@ static void sockexec(int i, const struct op *o, int fd) {
         ret(syscall(SYS_shutdown, fd, shutv[o->x]));
         break;
     case SOCKOPT: {
-        int opt = sopts[o->y].opt, level = o->mode ? 99 : SOL_SOCKET;
-        const char *ln = o->mode ? "99" : "SOL_SOCKET";
+        int opt = o->mode == 2 ? iopts[o->y].opt : sopts[o->y].opt, level = o->mode == 2 ? iopts[o->y].level : o->mode ? 99 : SOL_SOCKET;
+        const char *ln = o->mode == 2 ? (level == IPPROTO_TCP ? "IPPROTO_TCP" : "IPPROTO_IP") : o->mode ? "99" : "SOL_SOCKET";
+        const char *on = o->mode == 2 ? iopts[o->y].n : sopts[o->y].n;
         if (o->x == 0) {
             union {
                 int v[4];
@@ -2328,12 +2719,24 @@ static void sockexec(int i, const struct op *o, int fd) {
             } u;
             memset(&u, 0, sizeof u);
             socklen_t l = o->acc == 1 ? 1 : (socklen_t)sizeof u;
-            say("getsockopt(%d, %s, %s, %u)", fd, ln, sopts[o->y].n, (unsigned)l);
+            say("getsockopt(%d, %s, %s, %u)", fd, ln, on, (unsigned)l);
             r = syscall(SYS_getsockopt, fd, level, opt, &u, &l);
             ret(r);
             if (r == 0) {
                 say(" len%u", (unsigned)l);
-                if (opt == SO_PEERCRED && l >= sizeof u.cr)
+                // TCP_MAXSEG は、つながったあとは相手の窓の半分まで。Linux の受ける窓は、受けた skb の中身と truesize の比
+                // (scaling_ratio) と rcv_ssthresh で育つ (skb のページのつくりしだい) ので、32741 からは wnd と出す
+                int wnd = 0;
+                if (o->mode == 2 && level == IPPROTO_TCP && opt == TCP_MAXSEG) {
+                    int v = 0;
+                    socklen_t vl = sizeof v;
+                    wnd = getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &v, &vl) == 0 && v >= 32741;
+                }
+                if (o->mode == 2)
+                    opt = -1;
+                if (wnd)
+                    say(" wnd");
+                else if (opt == SO_PEERCRED && l >= sizeof u.cr)
                     saycred(&u.cr);
                 else if (opt == SO_LINGER && l >= sizeof u.lg)
                     say(" {%d, %d}", u.lg.l_onoff, u.lg.l_linger);
@@ -2343,8 +2746,9 @@ static void sockexec(int i, const struct op *o, int fd) {
                     say(" b%d", *(unsigned char *)&u);
             }
         } else {
-            int v = opt == SO_RCVBUF || opt == SO_SNDBUF ? sbufval[o->acc % 3] : soptval[o->acc];
-            say("setsockopt(%d, %s, %s, %d)", fd, ln, sopts[o->y].n, v);
+            static const int ioptval[] = {0, 1, -1, 1000};
+            int v = o->mode == 2 ? ioptval[o->acc] : opt == SO_RCVBUF || opt == SO_SNDBUF ? sbufval[o->acc % 3] : soptval[o->acc];
+            say("setsockopt(%d, %s, %s, %d)", fd, ln, on, v);
             ret(syscall(SYS_setsockopt, fd, level, opt, &v, sizeof v));
         }
         break;
@@ -2410,6 +2814,8 @@ static void exec(int i, const struct op *o) {
     case SOCKNAME:
     case POLL:
         sockexec(i, o, fd);
+        if (o->kind == BIND || o->kind == LISTEN || o->kind == CONNECT || o->kind == SEND)
+            noteport(i, fd);
         break;
     case OPEN:
         say("openat(");

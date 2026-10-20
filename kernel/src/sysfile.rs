@@ -323,7 +323,7 @@ fn rwf_check(f: &FileRef, flags: u32, write: bool) -> Result<(), i64> {
     if flags & RWF_NOWAIT != 0 {
         let ok = match &b.kind {
             Kind::Inode(..) => reg && cached,
-            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
             _ => false,
         };
         if !ok {
@@ -350,11 +350,57 @@ fn unix_of(f: &FileRef) -> Option<crate::unix::UnixRef> {
     }
 }
 
+/// AF_INET の TCP / UDP のソケットなら、その中身
+fn inet_of(f: &FileRef) -> Option<crate::inet::InetRef> {
+    match &f.borrow().kind {
+        Kind::Inet(u) => Some(u.clone()),
+        _ => None,
+    }
+}
+
+/// ソケット (sockfs の inode) の持ち主と許可 (fstat、fchmod、fchown、utimensat)
+enum SockFs {
+    Unix(crate::unix::UnixRef),
+    Inet(crate::inet::InetRef),
+}
+
+impl SockFs {
+    fn of(f: &FileRef) -> Option<SockFs> {
+        match &f.borrow().kind {
+            Kind::Unix(u) => Some(SockFs::Unix(u.clone())),
+            Kind::Inet(u) => Some(SockFs::Inet(u.clone())),
+            _ => None,
+        }
+    }
+
+    fn owner_mode(&self) -> (u32, u32, u32) {
+        match self {
+            SockFs::Unix(u) => crate::unix::owner_mode(u),
+            SockFs::Inet(u) => crate::inet::owner_mode(u),
+        }
+    }
+
+    fn set_owner_mode(&self, uid: Option<u32>, gid: Option<u32>, mode: u32) {
+        match self {
+            SockFs::Unix(u) => crate::unix::set_owner_mode(u, uid, gid, mode),
+            SockFs::Inet(u) => crate::inet::set_owner_mode(u, uid, gid, mode),
+        }
+    }
+
+    fn touch(&self, mtime: Option<u64>) {
+        match self {
+            SockFs::Unix(u) => crate::unix::touch(u, mtime),
+            SockFs::Inet(u) => crate::inet::touch(u, mtime),
+        }
+    }
+}
+
 /// パイプや socketpair にいま中身があるか (ほかの流れ (端末など) は、あるものとして)
 fn stream_has_data(f: &FileRef) -> bool {
     match &f.borrow().kind {
         Kind::PipeRead(p) | Kind::PipeRw(p) => p.borrow().len() > 0,
         Kind::Unix(u) => crate::unix::pending(u) > 0,
+        Kind::Inet(u) => crate::inet::pending(u) > 0,
         _ => true,
     }
 }
@@ -420,6 +466,9 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: u
     }
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_readv(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0 || dontwait);
+    }
+    if let Some(u) = inet_of(&f) {
+        return crate::socket::inet_readv(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0 || dontwait);
     }
     // パイプから 0 バイト: 何もないときも待たずに 0 (Linux の pipe_read)
     if len == 0 && matches!(f.borrow().kind, Kind::PipeRead(_) | Kind::PipeRw(_)) {
@@ -494,6 +543,9 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_writev(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
     }
+    if let Some(u) = inet_of(&f) {
+        return crate::socket::inet_writev(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
+    }
     let whole = whole(&f);
     // 読み手のいないパイプは、入れ物を写す前に EPIPE (Linux の pipe_write: さわれない入れ物でも EPIPE が先。0 バイトは 0)
     let dead_pipe = len > 0
@@ -514,7 +566,7 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = file::write_opt2(&f, &tmp, flags & RWF_NOWAIT != 0, append);
         // AF_UNIX のソケットは unix.rs で (SOCK_STREAM だけ: Linux の unix_stream_sendmsg)
-        if r == Err(-file::EPIPE) && flags & RWF_NOSIGNAL == 0 && !matches!(f.borrow().kind, Kind::Unix(_)) {
+        if r == Err(-file::EPIPE) && flags & RWF_NOSIGNAL == 0 && !matches!(f.borrow().kind, Kind::Unix(_) | Kind::Inet(_)) {
             // 読み手のいないパイプ: SIGPIPE (既定なら EL0 へ戻るときに終わる)
             let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
             crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
@@ -740,6 +792,9 @@ fn readv2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_readv(&f, &u, &v, flags & RWF_NOWAIT != 0);
     }
+    if let Some(u) = inet_of(&f) {
+        return crate::socket::inet_readv(&f, &u, &v, flags & RWF_NOWAIT != 0);
+    }
     let mut done: usize = 0;
     for (base, len) in v {
         if len == 0 {
@@ -778,6 +833,9 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     // AF_UNIX のソケットは、入れ物みなを 1 回で送る (dgram の 1 つのメッセージ)
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_writev(&f, &u, &v, flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
+    }
+    if let Some(u) = inet_of(&f) {
+        return crate::socket::inet_writev(&f, &u, &v, flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
     }
     let append = if flags & RWF_APPEND != 0 {
         Some(true)
@@ -1959,6 +2017,9 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
     if let Kind::Unix(u) = &f.borrow().kind {
         return crate::unix::chmod(u, mode as u32);
     }
+    if let Kind::Inet(u) = &f.borrow().kind {
+        return crate::inet::chmod(u, mode as u32);
+    }
     // パイプ: 持ち主か root が、fstat に見える許可を変えられる (Linux の pipefs の inode)
     if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
         use core::sync::atomic::Ordering::Relaxed;
@@ -2086,15 +2147,11 @@ fn chown_fd(fd: u64, uid: u64, gid: u64, opath_ok: bool) -> R {
     if f.borrow().flags & file::O_PATH != 0 && !opath_ok {
         return Err(-EBADF);
     }
-    let sock = match &f.borrow().kind {
-        Kind::Unix(u) => Some(u.clone()),
-        _ => None,
-    };
-    if let Some(u) = sock {
+    if let Some(u) = SockFs::of(&f) {
         let (uid, gid) = chown_ids(uid, gid)?;
-        let (cu, cg, cm) = crate::unix::owner_mode(&u);
+        let (cu, cg, cm) = u.owner_mode();
         let mode = chown_mode(&cred::current(), (cu, cg, vfs::S_IFSOCK | cm), uid, gid)?;
-        crate::unix::set_owner_mode(&u, uid, gid, mode);
+        u.set_owner_mode(uid, gid, mode);
         return Ok(0);
     }
     if let Some(p) = pipe_of(fd) {
@@ -2178,13 +2235,13 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         }
         // パイプとソケット (pipefs と sockfs の inode): 持ち主と許可は fstat に見せるもの
         let pipe = pipe_of(dirfd as u64);
-        let sock = unix_of(&f);
+        let sock = SockFs::of(&f);
         let owner = if let Some(p) = &pipe {
             use core::sync::atomic::Ordering::Relaxed;
             Some((vfs::S_IFIFO | p.perm.load(Relaxed), p.uid.load(Relaxed), p.gid.load(Relaxed)))
         } else {
             sock.as_ref().map(|u| {
-                let (uid, gid, mode) = crate::unix::owner_mode(u);
+                let (uid, gid, mode) = u.owner_mode();
                 (vfs::S_IFSOCK | mode, uid, gid)
             })
         };
@@ -2217,7 +2274,7 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
                 }
                 p.ctime.store(now, Relaxed);
             } else if let Some(u) = &sock {
-                crate::unix::touch(u, mtime);
+                u.touch(mtime);
             }
             return Ok(0);
         }
@@ -2339,6 +2396,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
                 Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (Some(p.uid.load(core::sync::atomic::Ordering::Relaxed)), true),
                 Kind::Socket(_) => (Some(cred::current().euid), false),
                 Kind::Unix(u) => (Some(crate::unix::owner(u)), false),
+                Kind::Inet(u) => (Some(crate::inet::owner(u)), false),
                 // eventfd などの名前のない inode は root のもの
                 _ => (None, false),
             };
@@ -2435,7 +2493,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         return Ok(0);
     }
     // ネットワークのインターフェース (ip、networkd): ソケットの fd に
-    if matches!(f.borrow().kind, Kind::Socket(_)) && crate::netif::handles(req) {
+    if matches!(f.borrow().kind, Kind::Socket(_) | Kind::Inet(_) | Kind::Unix(_)) && crate::netif::handles(req) {
         return crate::netif::ioctl(req, arg);
     }
     if let Kind::Block(p) = &f.borrow().kind {
@@ -2476,6 +2534,15 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     };
     if let Some(u) = sock.filter(|_| req == SIOCOUTQ || req == SIOCATMARK) {
         let v = if req == SIOCOUTQ { crate::unix::outq(&u) as i32 } else { crate::unix::atmark(&u)? as i32 };
+        return out(arg, &v.to_le_bytes()).map(|_| 0);
+    }
+    // TCP / UDP (Linux の tcp_ioctl と udp_ioctl)
+    if let Some(u) = inet_of(&f).filter(|_| req == SIOCOUTQ || req == SIOCATMARK || req == 0x541b) {
+        let v = match req {
+            SIOCOUTQ => crate::inet::outq(&u)?,
+            SIOCATMARK => crate::inet::atmark(&u)?,
+            _ => crate::inet::inq(&u)?,
+        };
         return out(arg, &v.to_le_bytes()).map(|_| 0);
     }
     // FIONREAD: いま読めるバイト数 (パイプ、AF_UNIX のソケット (listen しているものは EINVAL)、TCP / UDP のソケット、
@@ -2696,6 +2763,8 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
             if fd >= 0 {
                 match proc::current().files().get(fd as u64) {
                     None => rev = POLLNVAL,
+                    // O_PATH の fd は poll に使えない (Linux の fdget)
+                    Some(f) if f.borrow().flags & file::O_PATH != 0 => rev = POLLNVAL,
                     Some(f) => {
                         // Linux と同じビットがわかるものは、そのうち頼まれたもの (と、いつも POLLERR と POLLHUP)
                         if let Some(m) = f.borrow().poll_mask() {
@@ -2782,6 +2851,9 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
                 continue;
             }
             let f = proc::current().files().get(i as u64).cloned().ok_or(-EBADF)?;
+            if f.borrow().flags & file::O_PATH != 0 {
+                return Err(-EBADF);
+            }
             // Linux と同じビットがわかるもの: 読める = POLLIN_SET (IN、RDNORM、RDBAND、HUP、ERR)、書ける = POLLOUT_SET
             // (OUT、WRNORM、WRBAND、ERR)、例外 = POLLPRI
             let mask = f.borrow().poll_mask();
@@ -3105,6 +3177,11 @@ fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeC
     }
     if let Some(u) = unix_of(f) {
         return socket_to_pipe(f, &u, *pos, p, len, nonblock);
+    }
+    // AF_INET のソケットは位置のないものとして (Linux の tcp_splice_read と copy_splice_read: ソケットの O_NONBLOCK で
+    // 待つか決め、TCP は来ているだけ、UDP はメッセージ 1 つ)
+    if inet_of(f).is_some() {
+        return splice_stream_to_pipe(f, p, len, nonblock);
     }
     // ファイルのほかは splice で読めない (ディレクトリ、パイプ: Linux も EINVAL)
     let Some((ino, path)) = inode_path(f).filter(|(i, _)| i.meta().mode & S_IFMT == vfs::S_IFREG) else { return Err(-EINVAL) };

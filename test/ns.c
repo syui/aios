@@ -79,16 +79,33 @@ static int net_inside(void) {
   char b[8] = {0}; read(a, b, 4); if (strcmp(b, "ping")) return 7; write(a, "pong", 4);
   int st; waitpid(p, &st, 0); return WEXITSTATUS(st) ? 8 : 0;
 }
+/* 中には eth0 がない: 外へは TCP も UDP も ENETUNREACH、eth0 のアドレスには bind できない */
 static int net_no_eth(void) {
   if (enter_net()) return 2;
   if (tcp_connect("10.0.2.2", 80) != -ENETUNREACH) return 3;
   int u = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in d = in4("10.0.2.3", 53);
   if (sendto(u, "x", 1, 0, (void *)&d, sizeof d) != -1 || errno != ENETUNREACH) return 4;
-  struct sockaddr_in l = in4("127.0.0.1", 53);
-  if (sendto(u, "x", 1, 0, (void *)&l, sizeof l) != -1 || errno != ENETUNREACH) return 5;
   int s = socket(AF_INET, SOCK_STREAM, 0); struct sockaddr_in e = in4("10.0.2.15", 7303);
   if (bind(s, (void *)&e, sizeof e) != -1 || errno != EADDRNOTAVAIL) return 6;
   return 0;
+}
+/* UDP も中どうしは届く (ループバック)。外で bind したポートは中からは見えない (つないで送れば ICMP で ECONNREFUSED) */
+static int net_inside_udp(void) {
+  int out = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in o = in4("127.0.0.1", 7304);
+  if (bind(out, (void *)&o, sizeof o)) return 2;
+  if (enter_net()) return 3;
+  int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in in = in4("127.0.0.1", 7304);
+  if (bind(a, (void *)&in, sizeof in)) return 4;
+  if (sendto(b, "ping", 4, 0, (void *)&in, sizeof in) != 4) return 5;
+  char buf[8] = {0}; struct sockaddr_in from; socklen_t fl = sizeof from;
+  if (recvfrom(a, buf, sizeof buf, MSG_DONTWAIT, (void *)&from, &fl) != 4 || strcmp(buf, "ping")) return 6;
+  if (from.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || ntohs(from.sin_port) == 0) return 7;
+  char x; if (recv(out, &x, 1, MSG_DONTWAIT) != -1 || errno != EAGAIN) return 8;
+  close(a);
+  int c = socket(AF_INET, SOCK_DGRAM, 0);
+  if (connect(c, (void *)&in, sizeof in) || send(c, "x", 1, 0) != 1) return 9;
+  return recv(c, &x, 1, MSG_DONTWAIT) == -1 && errno == ECONNREFUSED ? 0 : 10;
 }
 /* 抽象名前空間の unix ソケットも分かれる */
 static int net_abstract(void) {
@@ -161,7 +178,8 @@ int main(void) {
   CHECK("net-needs-no-new-privs", child(net_noprivs) == 0);
   CHECK("net-no-outside-loopback", child(net_no_outside_lo) == 0);
   CHECK("net-inside-tcp", child(net_inside) == 0);
-  CHECK("net-no-eth-no-udp", child(net_no_eth) == 0);
+  CHECK("net-no-eth", child(net_no_eth) == 0);
+  CHECK("net-inside-udp", child(net_inside_udp) == 0);
   CHECK("net-abstract-unix", child(net_abstract) == 0);
   CHECK("net-ns-link", child(net_link) == 0);
   CHECK("pid-needs-no-new-privs", child(pid_noprivs) == 0);

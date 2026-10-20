@@ -1010,8 +1010,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
     let mut path: Option<alloc::string::String> = None;
     let back = if flags & MAP_ANONYMOUS == 0 {
-        let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
-        let f = f.borrow();
+        let fr = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
+        let f = fr.borrow();
         if f.flags & crate::file::O_PATH != 0 {
             return Err(-EBADF);
         }
@@ -1039,10 +1039,20 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                 if off + len > pg_up(g.size()) {
                     return Err(-EINVAL);
                 }
-                Backing::Pages { pages: g.pages.clone(), off }
+                Backing::Pages { pages: g.pages.clone(), off, hold: None }
             }
             // 音の再生の口: リングバッファのページ
-            crate::file::Kind::SndPcm => Backing::Pages { pages: crate::sound::mmap_pages(off, len)?, off },
+            crate::file::Kind::SndPcm => Backing::Pages { pages: crate::sound::mmap_pages(off, len)?, off, hold: None },
+            // TCP のソケット (Linux の tcp_mmap: 書くもの、実行するものは EPERM。ページはなく、さわると SIGBUS。
+            // Linux は getsockopt の TCP_ZEROCOPY_RECEIVE で受けたものをここに入れる)
+            crate::file::Kind::Inet(u) if u.borrow().tcp => {
+                const PROT_EXEC: u64 = 4;
+                const EPERM: i64 = 1;
+                if prot & (PROT_WRITE | PROT_EXEC) != 0 {
+                    return Err(-EPERM);
+                }
+                Backing::Pages { pages: alloc::rc::Rc::new(alloc::vec::Vec::new()), off, hold: Some(fr.clone()) }
+            }
             _ => return Err(-ENODEV),
         }
     } else {
@@ -1170,7 +1180,7 @@ fn sys_msync(addr: usize, len: usize, flags: u64) -> R {
     if end == addr {
         return Ok(0);
     }
-    proc::current().pt().msync(addr, end, flags & MS_SYNC != 0).map(|_| 0).map_err(|_| -ENOMEM)
+    proc::current().pt().msync(addr, end, flags & MS_SYNC != 0).map(|_| 0)
 }
 
 fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {

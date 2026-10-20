@@ -610,8 +610,14 @@ pub enum Backing {
     /// 写したもの: ファイルの終わりは触れたときの大きさで見る (その先のページは SIGBUS、伸びればまた写せる)
     /// ver は写したときのファイルの版 (file_ver。ロックなしのページフォルトがページキャッシュをくらべる)
     File { ino: InodeRef, off: usize, fend: usize, ver: (u64, u64) },
-    /// カーネルが持っているページをそのまま見せる (/dev/fb0 のフレームバッファ)。off はバイト
-    Pages { pages: alloc::rc::Rc<Vec<*mut u8>>, off: usize },
+    /// カーネルが持っているページをそのまま見せる (/dev/fb0 のフレームバッファ)。off はバイト。hold は写しが持つ
+    /// 開いたファイル (TCP のソケット: Linux の vma の vm_file と同じく、fd を閉じても写しがあるあいだは閉じない)
+    Pages {
+        pages: alloc::rc::Rc<Vec<*mut u8>>,
+        off: usize,
+        #[allow(dead_code)]
+        hold: Option<crate::file::FileRef>,
+    },
 }
 
 #[derive(Clone)]
@@ -998,8 +1004,11 @@ impl PageTable {
 
     /// msync: 範囲の書いたページをファイルへ (書き出す印をつけなおす)。sync なら MS_SYNC: そのファイルをディスクへ。
     /// 領域のないところがまじっていれば Err (ENOMEM。写っているところはしてから: Linux と同じ)
-    pub fn msync(&self, start: usize, end: usize, sync: bool) -> Result<(), ()> {
+    /// 写したファイルを書き出す (sync なら MS_SYNC: ファイルも)。すきまがあれば ENOMEM、MS_SYNC で共有のカーネルのページ
+    /// (フレームバッファ、音、TCP: Linux では fsync のないファイル) にあたれば EINVAL (Linux の vfs_fsync_range)
+    pub fn msync(&self, start: usize, end: usize, sync: bool) -> Result<(), i64> {
         let mut gap = false;
+        let mut einval = false;
         let mut inos: Vec<InodeRef> = Vec::new();
         let mut va = start;
         while va < end {
@@ -1013,6 +1022,10 @@ impl PageTable {
                     None => break,
                 }
             };
+            if sync && v.shared && matches!(v.back, Backing::Pages { .. }) {
+                einval = true;
+                break;
+            }
             if v.shared && let Backing::File { ino, off, .. } = &v.back {
                 let mut p = va;
                 while p < v.end.min(end) {
@@ -1031,7 +1044,13 @@ impl PageTable {
         for i in inos {
             let _ = i.sync();
         }
-        if gap { Err(()) } else { Ok(()) }
+        if einval {
+            Err(-22)
+        } else if gap {
+            Err(-12)
+        } else {
+            Ok(())
+        }
     }
 
     /// ファイル id のページ [first, last] を写しているところを外す (領域は残す。次に触れたら作りなおすか SIGBUS)。
@@ -1475,10 +1494,11 @@ impl PageTable {
             // mmap で写したファイル (MAP_PRIVATE) の、終わりより先のページ: SIGBUS
             return Err(FaultErr::Bus);
         }
-        if let (false, Backing::Pages { pages, off }) = (has_page(e), &back) {
+        if let (false, Backing::Pages { pages, off, .. }) = (has_page(e), &back) {
             // カーネルのページ (フレームバッファ) をそのまま。共有で、外すときに参照を返す
             *kind = 3;
-            let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::NoMap)?;
+            // ページのないところ (TCP のソケットの写しなど) は SIGBUS
+            let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::Bus)?;
             kalloc::get(page);
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
             flush_va_in(self.root_pa(), page_va);

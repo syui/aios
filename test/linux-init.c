@@ -3,9 +3,13 @@
 //   OPS home|tmp    ロボット (/sysdiff) を、home なら /work/sd (ext4)、tmp なら /tmp/sd (tmpfs) で
 //   exec ARG...     /prog を ARG... で (テストのプログラム。/work と /tmp はだれでも書ける)
 // 出力は /work/out.txt、エラーは /work/err.txt、終わりの番号は /work/status。それから電源を切る
+// ループバック (lo、127.0.0.1) は起こしておく (ロボットの AF_INET。aios はいつも 127.0.0.1/8 を持つ)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <grp.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +29,28 @@ static void put(const char *path, const char *s) {
     }
 }
 
+// lo を起こす (起こすと 127.0.0.1/8 がつく)
+static void lo_up(void) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq r;
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "lo");
+    if (s < 0 || ioctl(s, SIOCGIFFLAGS, &r) < 0) {
+        perror("init: lo");
+        return;
+    }
+    r.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(s, SIOCSIFFLAGS, &r) < 0)
+        perror("init: lo up");
+    close(s);
+}
+
 int main(void) {
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777");
+    lo_up();
     if (mount("/dev/vda", "/work", "ext4", 0, NULL) < 0) {
         perror("mount /dev/vda");
         reboot(RB_POWER_OFF);

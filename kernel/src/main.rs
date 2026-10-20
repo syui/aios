@@ -36,6 +36,7 @@ mod initrd;
 mod kalloc;
 mod memlayout;
 mod prof;
+mod inet;
 mod net;
 mod netif;
 mod parts;

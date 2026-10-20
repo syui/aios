@@ -11,8 +11,6 @@
 //   書けない (POLLOUT なし)。大きさは Linux 7.3 (arm64) で測ったとおり
 // - SCM_RIGHTS (fd を渡す)、SCM_CREDENTIALS (SO_PASSCRED)、MSG_OOB (stream の 1 バイト)、MSG_PEEK と SO_PEEK_OFF、
 //   shutdown、閉じたときの ECONNRESET / EPIPE / ECONNREFUSED、SO_PEERCRED
-// - inet: 分けた NET (ns.rs) の中の AF_INET の TCP もここ (同じ stream のつなぎかたで、名前はポート)。外からは
-//   AF_INET の 127.0.0.1:ポート に見える (getsockname / getpeername / accept)
 //
 // Linux とちがうところ: MSG_OOB の 1 バイトを (SO_OOBINLINE なしで) 読みとばしたときは、FIONREAD の数からも引く
 // (Linux 7.3 の manage_oob は inq_len を減らさず、FIONREAD が 1 多いままになる)
@@ -215,9 +213,6 @@ pub struct Unix {
     ctime: u64,
     /// 状態が変わるたびに増える数 (epoll の EPOLLET)
     pub generation: u64,
-    /// 分けた NET の中の AF_INET の TCP なら Some(bind したポート。まだなら 0) と、つないだ相手のポート
-    pub inet: Option<u16>,
-    inet_peer: u16,
 }
 
 pub type UnixRef = Rc<RefCell<Unix>>;
@@ -228,7 +223,6 @@ type R = Result<i64, i64>;
 
 static mut ABSTRACT: BTreeMap<(u64, u8, Vec<u8>), Weak<RefCell<Unix>>> = BTreeMap::new();
 static mut BSD: BTreeMap<(usize, u64), Weak<RefCell<Unix>>> = BTreeMap::new();
-static mut INET: BTreeMap<(u64, u16), Weak<RefCell<Unix>>> = BTreeMap::new();
 static mut NEXT_ID: u64 = 1;
 static mut NEXT_INO: u64 = 1;
 /// メッセージの中にある (送られている途中の) AF_UNIX のソケットの fd の数。0 なら gc はしない
@@ -247,8 +241,12 @@ fn bsd_names() -> &'static mut BTreeMap<(usize, u64), Weak<RefCell<Unix>>> {
     unsafe { &mut *(&raw mut BSD) }
 }
 
-fn inet_names() -> &'static mut BTreeMap<(u64, u16), Weak<RefCell<Unix>>> {
-    unsafe { &mut *(&raw mut INET) }
+/// ソケットの inode の番号 (AF_UNIX と AF_INET で 1 つの並び: Linux の sockfs)
+pub fn new_ino() -> u64 {
+    unsafe {
+        NEXT_INO += 1;
+        NEXT_INO
+    }
 }
 
 fn next_id() -> u64 {
@@ -291,10 +289,7 @@ fn me_real() -> Cred {
 
 fn new_sock(typ: u8) -> UnixRef {
     let c = proc::current_cred_ref();
-    let ino = unsafe {
-        NEXT_INO += 1;
-        NEXT_INO
-    };
+    let ino = new_ino();
     let u = Rc::new(RefCell::new(Unix {
         typ,
         state: State::Close,
@@ -336,8 +331,6 @@ fn new_sock(typ: u8) -> UnixRef {
         mtime: crate::timer::epoch_ns(),
         ctime: crate::timer::epoch_ns(),
         generation: 0,
-        inet: None,
-        inet_peer: 0,
     }));
     let all = unsafe { &mut *(&raw mut ALL) };
     if all.len() >= 64 && all.len() >= 2 * unsafe { ALL_LIVE } {
@@ -346,13 +339,6 @@ fn new_sock(typ: u8) -> UnixRef {
     }
     all.push(Rc::downgrade(&u));
     u
-}
-
-pub fn unix_of(f: &FileRef) -> Option<UnixRef> {
-    match &f.borrow().kind {
-        Kind::Unix(u) => Some(u.clone()),
-        _ => None,
-    }
 }
 
 // ---- skb の大きさ (Linux 7.3 arm64 で測ったもの) ----
@@ -617,17 +603,12 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
         es.passrights = o.passrights;
         es.has_file = false;
         es.net = o.net;
-        es.inet = o.inet;
     }
     {
         let mut s = u.borrow_mut();
         s.peercred = other.borrow().peercred;
         s.state = State::Established;
         s.peer = Some(e.clone());
-        if s.inet.is_some() {
-            s.inet_peer = other.borrow().inet.unwrap_or(0);
-            e.borrow_mut().inet_peer = s.inet.unwrap_or(0);
-        }
     }
     other.borrow_mut().embryos.push_back(e);
     notify(other);
@@ -733,21 +714,6 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
 /// 相手が閉じたあとも (Linux の unix_peer_get)
 pub fn name(u: &UnixRef, peer: bool) -> Result<Vec<u8>, i64> {
     let s = u.borrow();
-    if let Some(me) = s.inet {
-        let port = if peer {
-            if s.peer.is_none() {
-                return Err(-ENOTCONN);
-            }
-            s.inet_peer
-        } else {
-            me
-        };
-        let mut b = alloc::vec![0u8; 16];
-        b[..2].copy_from_slice(&2u16.to_le_bytes());
-        b[2..4].copy_from_slice(&port.to_be_bytes());
-        b[4..8].copy_from_slice(&[127, 0, 0, 1]);
-        return Ok(b);
-    }
     let addr = if peer {
         let p = s.peer.as_ref().ok_or(-ENOTCONN)?;
         p.borrow().addr.clone()
@@ -1736,12 +1702,6 @@ fn release_sock(u: &UnixRef, embryo: bool) {
                 bsd_names().remove(&id);
             }
         }
-        if let Some(p) = s.inet {
-            let k = (s.net, p);
-            if inet_names().get(&k).is_some_and(|w| is(w, u)) {
-                inet_names().remove(&k);
-            }
-        }
         s.dead = true;
         s.shutdown = BOTH;
         let was = s.state;
@@ -1960,7 +1920,7 @@ pub fn proc_net() -> String {
     for w in all {
         let Some(u) = w.upgrade() else { continue };
         let s = u.borrow();
-        if s.dead || s.inet.is_some() {
+        if s.dead {
             continue;
         }
         let flags = if s.state == State::Listen { 0x10000 } else { 0 };
@@ -1989,6 +1949,7 @@ const SO_KEEPALIVE: i32 = 9;
 const SO_OOBINLINE: i32 = 10;
 const SO_PRIORITY: i32 = 12;
 const SO_LINGER: i32 = 13;
+const SO_REUSEPORT: i32 = 15;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
 const SO_RCVLOWAT: i32 = 18;
@@ -2024,6 +1985,7 @@ pub fn getsockopt(u: &UnixRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
         SO_DEBUG => int(0),
         SO_BROADCAST => int(s.broadcast as i64),
         SO_REUSEADDR => int(s.reuse as i64),
+        SO_REUSEPORT => int(0),
         SO_KEEPALIVE => int(s.keepalive as i64),
         SO_OOBINLINE => int(s.oobinline as i64),
         SO_DONTROUTE => int(s.dontroute as i64),
@@ -2031,7 +1993,7 @@ pub fn getsockopt(u: &UnixRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
         SO_RCVBUF => int(s.rcvbuf as i64),
         SO_TYPE => int(s.typ as i64),
         SO_PROTOCOL => int(0),
-        SO_DOMAIN => int(if s.inet.is_some() { 2 } else { 1 }),
+        SO_DOMAIN => int(1),
         SO_ERROR => {
             let e = s.err;
             s.err = 0;
@@ -2110,6 +2072,12 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
                 }
             }
             SO_REUSEADDR => s.reuse = b,
+            // SO_REUSEPORT は AF_INET だけ (0 はよい: Linux の sk_setsockopt)
+            SO_REUSEPORT => {
+                if b {
+                    return Err(-EOPNOTSUPP);
+                }
+            }
             SO_DONTROUTE => s.dontroute = b,
             SO_BROADCAST => s.broadcast = b,
             SO_SNDBUF => {
@@ -2221,78 +2189,4 @@ pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool
         }
     }
     out
-}
-
-// ---- 分けた NET の中の AF_INET の TCP ----
-
-/// 分けた NET の中の TCP の口 (stream のつなぎかたで)
-pub fn inet_socket() -> UnixRef {
-    let u = new_sock(SOCK_STREAM);
-    u.borrow_mut().inet = Some(0);
-    u
-}
-
-/// 空いているポート (中ではまず 32768 から)
-fn inet_free_port(net: u64) -> u16 {
-    static mut NEXT: u16 = 32767;
-    for _ in 0..30000 {
-        let p = unsafe {
-            NEXT = if NEXT >= 60999 { 32768 } else { NEXT + 1 };
-            NEXT
-        };
-        if !inet_names().get(&(net, p)).is_some_and(|w| w.upgrade().is_some()) {
-            return p;
-        }
-    }
-    0
-}
-
-/// AF_INET の口なら (bind したポート)
-pub fn inet_port(f: &FileRef) -> Option<u16> {
-    unix_of(f).and_then(|u| u.borrow().inet)
-}
-
-pub fn inet_bind(f: &FileRef, port: u16) -> R {
-    let u = unix_of(f).ok_or(-EINVAL)?;
-    let net = u.borrow().net;
-    if u.borrow().inet != Some(0) {
-        return Err(-EINVAL);
-    }
-    let port = if port == 0 { inet_free_port(net) } else { port };
-    if inet_names().get(&(net, port)).is_some_and(|w| w.upgrade().is_some()) {
-        return Err(-EADDRINUSE);
-    }
-    inet_names().insert((net, port), Rc::downgrade(&u));
-    let mut s = u.borrow_mut();
-    s.inet = Some(port);
-    s.addr = Some(Rc::new(alloc::vec![2, 0]));
-    Ok(0)
-}
-
-pub fn inet_listen(f: &FileRef) -> R {
-    // bind していなければ、空いているポートで (Linux と同じ)
-    if inet_port(f) == Some(0) {
-        inet_bind(f, 0)?;
-    }
-    let u = unix_of(f).ok_or(-EINVAL)?;
-    listen(&u, SOMAXCONN)
-}
-
-/// 中の 127.0.0.1:port につなぐ。待っているものがなければ ECONNREFUSED (TCP と同じ)
-pub fn inet_connect(f: &FileRef, port: u16) -> R {
-    let u = unix_of(f).ok_or(-EINVAL)?;
-    let net = u.borrow().net;
-    if u.borrow().peer.is_some() {
-        return Err(-EISCONN);
-    }
-    let l = inet_names().get(&(net, port)).and_then(|w| w.upgrade()).ok_or(-ECONNREFUSED)?;
-    if l.borrow().state != State::Listen {
-        return Err(-ECONNREFUSED);
-    }
-    if inet_port(f) == Some(0) {
-        let p = inet_free_port(net);
-        u.borrow_mut().inet = Some(p);
-    }
-    join(&u, &l, SOCK_STREAM);
-    Ok(0)
 }

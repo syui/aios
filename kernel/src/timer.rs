@@ -103,6 +103,8 @@ pub fn tick() {
     // TCP の再送などのため、ときどき (5 tick ごと) 回す
     if now / 5 != prev / 5 {
         crate::net::poll();
+        // TCP の SYN のやりなおし、FIN_WAIT2 / TIME_WAIT の終わり
+        crate::inet::tick();
     }
     rearm();
 }
