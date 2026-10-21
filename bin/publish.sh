@@ -20,6 +20,21 @@ sha=$(git rev-parse HEAD)
 api=https://api.github.com/repos/syui/aios
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
+# いまのリリース (unix-latest) のコミットから、CI が見るファイル (unix.yml の paths-ignore の外) が変わっていれば
+# 1 つ出す (変わっていなければ、またはリリースのコミットがここになければ何も出さない)
+ci_changed() {
+  git cat-file -e "$1^{commit}" 2>/dev/null || return 0
+  git diff --name-only "$1" HEAD | python3 -c '
+import fnmatch, re, sys
+y = open(".github/workflows/unix.yml").read()
+m = re.search(r"paths-ignore:\n((?:\s+(?:#.*|- .*)\n)+)", y)
+pats = re.findall(r"- \x27([^\x27]+)\x27", m.group(1)) if m else []
+for f in sys.stdin.read().split():
+    if not any(fnmatch.fnmatch(f, p) for p in pats):
+        print(f)
+        break'
+}
+
 # 1. CI とリリース
 run=
 for i in $(seq 1 12); do
@@ -28,7 +43,16 @@ for i in $(seq 1 12); do
   sleep 5
 done
 if [ -z "$run" ]; then
-  echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); the release stays"
+  # paths-ignore で動かないのか、GitHub が動かさなかっただけか (push で動かないことがある)。CI が見るものが変わって
+  # いるのに run がなければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
+  rel=$(curl -fsS "$api/releases/tags/unix-latest" | json 'd["target_commitish"]' 2>/dev/null) || rel=
+  changed=$(ci_changed "$rel")
+  if [ -n "$changed" ]; then
+    echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the release (${changed}, ...): GitHub did not start it. Run unix.yml by hand (Actions: unix, Run workflow on unix; or workflow_dispatch), then bin/publish.sh again" >&2
+    [ -n "$dry" ] || exit 1
+  else
+    echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); the release stays"
+  fi
 else
   while :; do
     st=$(curl -fsS "$api/actions/runs/$run" | json 'd["status"] + " " + str(d["conclusion"])')
