@@ -20,10 +20,10 @@ sha=$(git rev-parse HEAD)
 api=https://api.github.com/repos/syui/aios
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
-# いまのリリース (unix-latest) のコミットから、CI が見るファイル (unix.yml の paths-ignore の外) が変わっていれば
-# 1 つ出す (変わっていなければ、またはリリースのコミットがここになければ何も出さない)
+# CI が最後に通ったコミット ($1) から、CI が見るファイル (unix.yml の paths-ignore の外) が変わっていれば 1 つ出す
+# (変わっていなければ何も出さない。$1 がここになくて分からなければ "?")
 ci_changed() {
-  git cat-file -e "$1^{commit}" 2>/dev/null || return 0
+  git cat-file -e "$1^{commit}" 2>/dev/null || { echo "?"; return 0; }
   git diff --name-only "$1" HEAD | python3 -c '
 import fnmatch, re, sys
 y = open(".github/workflows/unix.yml").read()
@@ -43,12 +43,12 @@ for i in $(seq 1 12); do
   sleep 5
 done
 if [ -z "$run" ]; then
-  # paths-ignore で動かないのか、GitHub が動かさなかっただけか (push で動かないことがある)。CI が見るものが変わって
-  # いるのに run がなければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
-  rel=$(curl -fsS "$api/releases/tags/unix-latest" | json 'd["target_commitish"]' 2>/dev/null) || rel=
-  changed=$(ci_changed "$rel")
+  # paths-ignore で動かないのか、GitHub が動かさなかった (遅れている) だけか。CI が最後に通ったコミットから CI が見る
+  # ものが変わっているのに run がなければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
+  last=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=unix&status=success&per_page=1" | json 'd["workflow_runs"][0]["head_sha"] if d["workflow_runs"] else ""' 2>/dev/null) || last=
+  changed=$(ci_changed "$last")
   if [ -n "$changed" ]; then
-    echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the release (${changed}, ...): GitHub did not start it. Run unix.yml by hand (Actions: unix, Run workflow on unix; or workflow_dispatch), then bin/publish.sh again" >&2
+    echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the last passing run (${last:-?}: ${changed}): GitHub did not start it (yet). Run unix.yml by hand (Actions: unix, Run workflow on unix; or workflow_dispatch) or wait, then bin/publish.sh again" >&2
     [ -n "$dry" ] || exit 1
   else
     echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); the release stays"
