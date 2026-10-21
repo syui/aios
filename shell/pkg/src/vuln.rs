@@ -8,6 +8,7 @@
 //   2023 年からほとんど動いていない (firefox は 2019 年の 67.0.4 まで) ので、配布元のもの):
 //   github.com/mozilla/foundation-security-advisories の announce/YEAR/mfsaYEAR-N.yml の fixed_in の「Firefox VER」と
 //   その advisories の CVE。git で浅く、ことしと去年のところだけ取る (2026 年だけで 110 ほど、CVE は 2600 ほど)
+//   (Android だけのもの (title が「Firefox for Android VER」) は fixed_in も「Firefox VER」だが、デスクトップには出ない版なので見ない)
 //   Rust の crate (cargo audit と同じ RustSec の advisory-db: github.com/rustsec/advisory-db の crates/NAME/RUSTSEC-*.md):
 //     crate: aios の Cargo.lock (カーネル、user、shell など) と、pkg/rust のものの配布元の Cargo.lock (source の git の
 //     タグかコミットのもの。PKGBUILD の cargo_update CRATE@VER (pkg/rust/cross.sh) で上げたものは、上げた版で)。
@@ -275,11 +276,18 @@ fn mfsa(root: &Path) -> Result<(Vec<(String, String)>, String), String> {
 }
 
 /// 1 つの advisory (mfsaYEAR-N.yml): fixed_in の product の版 ("- Firefox 158.0.1"。"- Firefox ESR 140.17" は別のもの) と、
-/// advisories のキーの CVE ("  CVE-2026-109704:")
+/// advisories のキーの CVE ("  CVE-2026-109704:")。Android だけのもの (title が "... fixed in Firefox for Android 158.0.2")
+/// も fixed_in は "- Firefox 158.0.2" と書くが、その版はデスクトップには出ないので、版はなしに
 fn mfsa_file(text: &str, product: &str) -> (Vec<String>, Vec<String>) {
     let (mut fixed, mut cves, mut list) = (Vec::new(), Vec::new(), false);
     let item = format!("- {} ", product);
+    let android = format!(" {} for Android ", product);
     for l in text.lines() {
+        if l.strip_prefix("title:").is_some_and(|t| t.contains(&android)) {
+            fixed.clear();
+            list = false;
+            continue;
+        }
         if l.starts_with("fixed_in:") {
             list = true;
             continue;
@@ -820,6 +828,10 @@ mod tests {
         assert!(open_mfsa("158.0.1", "Firefox", &advs, &BTreeSet::new()).is_empty());
         // ESR だけの advisory は Firefox のものではない
         assert!(mfsa_file("fixed_in:\n- Firefox ESR 140.17\nadvisories:\n  CVE-2026-3001:\n", "Firefox").0.is_empty());
+        // Android だけのもの (mfsa2026-116) も: fixed_in は "Firefox 158.0.2" でも、デスクトップの 158.0.2 はない
+        let android = "fixed_in:\n- Firefox 158.0.2\ntitle: Security Vulnerabilities fixed in Firefox for Android 158.0.2\nadvisories:\n  CVE-2026-113470:\n";
+        assert!(mfsa_file(android, "Firefox").0.is_empty());
+        assert!(open_mfsa("158.0.1", "Firefox", &[("mfsa2026-116".to_string(), android.to_string())], &BTreeSet::new()).is_empty());
     }
 
     #[test]

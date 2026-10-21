@@ -14,7 +14,9 @@ build() {
   . "$startdir/../cross.sh"
   cd coreutils
   # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): yoke-derive (0.8.3 は yanked)。
-  # lru (RUSTSEC-2026-0253) は num-prime (factor) が 0.16 のままで、直った 0.18 に上げられない
+  # lru (RUSTSEC-2026-0253) は num-prime (factor) が 0.16 のままで、直った 0.18 に上げられない。
+  # zip 8.6.0 (RUSTSEC-2026-0367 RUSTSEC-2026-0368 RUSTSEC-2026-0369、zip をほどくときの穴。直ったのは 9.0.0) は
+  # uudoc (説明書を作るもの) だけが使い、ここで作るものには入らない
   cargo_update yoke-derive@0.8.4
   musl_build --no-default-features --features feat_os_unix_musl
 }
