@@ -169,4 +169,5 @@ pub fn bench() {
         "lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns, page alloc+free {:.1} ns, page 1024 alloc+free {:.1} ns, memcpy 64KiB {:.1} ns, memcpy 64KiB src+1 {:.1} ns, memset0 4KiB {:.1} ns",
         lock, heap, bkl, clock, page, pages, copy, copy_odd, zero
     );
+    crate::trap::bench();
 }

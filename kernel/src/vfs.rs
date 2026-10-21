@@ -442,18 +442,25 @@ pub fn normalize(cwd: &str, path: &str) -> String {
 /// normalize の中身。simple なら、path が simple (下の) でなければ None。1 つの String に足していき (.. はうしろの
 /// 要素を切る)、要素はバイトで分ける (stat や open のたびに通るので、Vec と join も、str の split もしない)
 fn normal(cwd: &str, path: &str, simple: bool) -> Option<String> {
+    let mut out = String::new();
+    normal_into(&mut out, cwd, path, simple).then_some(out)
+}
+
+/// normal と同じものを out に (out は空にしてから。覚えを引くだけのときに、使いまわしの入れものに作る: cached_at_by)
+fn normal_into(out: &mut String, cwd: &str, path: &str, simple: bool) -> bool {
+    out.clear();
     // 名前のあとの .. や、最後の / と /. のあるパスは、文字の上で畳むと Linux とちがう (c/../d は c がなくても
     // d になり、a/ は a がファイルでも通る)。"." だけも: そのディレクトリを通れること (Linux はどの名前の前にも
     // may_lookup をする。. でも)
     if simple && (path == "." || (path.len() > 1 && (path.ends_with('/') || path.ends_with("/.")))) {
-        return None;
+        return false;
     }
     // chroot: / はプロセスのルートから始まり、.. はルートより上に出ない
     let root = crate::proc::current_root();
     let base = if path.starts_with('/') { root.as_str() } else { cwd };
     let inside = !root.is_empty() && (base == root || base.starts_with(&(root.clone() + "/")));
     let floor = if inside { root.split('/').filter(|c| !c.is_empty()).count() } else { 0 };
-    let mut out = String::with_capacity(base.len() + path.len() + 1);
+    out.reserve(base.len() + path.len() + 1);
     let mut depth = 0;
     for (k, part) in [base, path].into_iter().enumerate() {
         let mut named = false;
@@ -462,7 +469,7 @@ fn normal(cwd: &str, path: &str, simple: bool) -> Option<String> {
                 b"" | b"." => {}
                 b".." => {
                     if simple && k == 1 && named {
-                        return None;
+                        return false;
                     }
                     if depth > floor {
                         out.truncate(out.rfind('/').unwrap_or(0));
@@ -481,7 +488,7 @@ fn normal(cwd: &str, path: &str, simple: bool) -> Option<String> {
             }
         }
     }
-    Some(out)
+    true
 }
 
 /// path をたどって (正規化済みパス, inode) を返す。
@@ -496,21 +503,24 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     if path.is_empty() {
         return Err(-ENOENT);
     }
-    // 文字の上で畳むと Linux とちがうパス (normal) は、1 つずつたどる (覚えない)
-    let Some(norm) = normal(cwd, path, true) else {
-        let start = (resolve("", cwd, true)?, cwd.to_string());
-        let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
-        return Ok(f(&w, &i));
-    };
-    let key = PathKey::new(current_mnt().id, norm, follow);
+    // 文字の上で畳むと Linux とちがうパス (normal) は、1 つずつたどる (覚えない)。畳んだパスは使いまわしの
+    // 入れもの (NORM) に作り、覚えにあれば鍵を作らずに答える (なかったときだけ、写して鍵にする)
+    // (覚えを捨てるのは先に: inode を捨てると ext4 の後片づけが動くので、NORM を作ってから使うまでのあいだには何もしない)
     let cache = unsafe { &mut *(&raw mut PATHS) };
     if PATHS_ALL.swap(false, core::sync::atomic::Ordering::Relaxed) {
         let old = core::mem::take(cache);
         drop(old);
     }
+    let norm = unsafe { &mut *(&raw mut NORM) };
+    if !normal_into(norm, cwd, path, true) {
+        let start = (resolve("", cwd, true)?, cwd.to_string());
+        let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
+        return Ok(f(&w, &i));
+    }
+    let mnt = current_mnt().id;
     // 通ったところの名前やディレクトリが変わっていれば (版がちがえば)、古い答え: 捨てて引きなおす
     // (捨てるのはここで: inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
-    let stale = match cache.get_mut(&key).map(|e| (e.fresh(), e)) {
+    let stale = match cache.get_mut(PathKeyRef::new(mnt, norm, follow).key()).map(|e| (e.fresh(), e)) {
         Some((true, e)) => {
             PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             e.used = true;
@@ -529,6 +539,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
         Some((false, _)) => true,
         None => false,
     };
+    let key = PathKey::new(mnt, norm.clone(), follow);
     if stale {
         cache.remove(&key);
     }
@@ -539,7 +550,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     let mut start = None;
     let mut rest = key.path.clone();
     if let Some(cut) = key.path.rfind('/') {
-        if let Some(e) = cache.get_mut(&PathKey::new(key.mnt, key.path[..cut].to_string(), true))
+        if let Some(e) = cache.get_mut(PathKeyRef::new(key.mnt, &key.path[..cut], true).key())
             && e.fresh()
         {
             let cred = crate::proc::current_cred_ref();
@@ -678,20 +689,78 @@ struct PathKey {
 
 impl PathKey {
     fn new(mnt: u64, path: String, follow: bool) -> PathKey {
-        // 8 バイトずつ (FxHash と同じまぜかた)
-        let b = path.as_bytes();
-        let mut h = mnt.wrapping_mul(0x51_7cc1_b727_220a_95) ^ follow as u64;
-        let mut i = 0;
-        while i + 8 <= b.len() {
-            let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-            h = (h.rotate_left(5) ^ w).wrapping_mul(0x51_7cc1_b727_220a_95);
-            i += 8;
-        }
-        let mut last = [0u8; 8];
-        last[..b.len() - i].copy_from_slice(&b[i..]);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(last) ^ b.len() as u64).wrapping_mul(0x51_7cc1_b727_220a_95);
-        PathKey { hash: h, mnt, path, follow }
+        PathKey { hash: path_hash(mnt, &path, follow), mnt, path, follow }
     }
+}
+
+/// PathKey を、パスを写さずに引くための形 (BTreeMap の Borrow)。並びは PathKey の derive と同じ (hash, mnt, path, follow)
+trait KeyParts {
+    fn parts(&self) -> (u64, u64, &str, bool);
+}
+
+impl KeyParts for PathKey {
+    fn parts(&self) -> (u64, u64, &str, bool) {
+        (self.hash, self.mnt, &self.path, self.follow)
+    }
+}
+
+struct PathKeyRef<'a>(u64, u64, &'a str, bool);
+
+impl<'a> PathKeyRef<'a> {
+    fn new(mnt: u64, path: &'a str, follow: bool) -> Self {
+        PathKeyRef(path_hash(mnt, path, follow), mnt, path, follow)
+    }
+
+    fn key(&self) -> &(dyn KeyParts + 'a) {
+        self
+    }
+}
+
+impl KeyParts for PathKeyRef<'_> {
+    fn parts(&self) -> (u64, u64, &str, bool) {
+        (self.0, self.1, self.2, self.3)
+    }
+}
+
+impl<'a> core::borrow::Borrow<dyn KeyParts + 'a> for PathKey {
+    fn borrow(&self) -> &(dyn KeyParts + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn KeyParts + '_ {
+    fn eq(&self, o: &Self) -> bool {
+        self.parts() == o.parts()
+    }
+}
+
+impl Eq for dyn KeyParts + '_ {}
+
+impl PartialOrd for dyn KeyParts + '_ {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for dyn KeyParts + '_ {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        self.parts().cmp(&o.parts())
+    }
+}
+
+/// 覚えの鍵のハッシュ: 8 バイトずつ (FxHash と同じまぜかた)
+fn path_hash(mnt: u64, path: &str, follow: bool) -> u64 {
+    let b = path.as_bytes();
+    let mut h = mnt.wrapping_mul(0x51_7cc1_b727_220a_95) ^ follow as u64;
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        h = (h.rotate_left(5) ^ w).wrapping_mul(0x51_7cc1_b727_220a_95);
+        i += 8;
+    }
+    let mut last = [0u8; 8];
+    last[..b.len() - i].copy_from_slice(&b[i..]);
+    (h.rotate_left(5) ^ u64::from_le_bytes(last) ^ b.len() as u64).wrapping_mul(0x51_7cc1_b727_220a_95)
 }
 
 static mut PATHS: alloc::collections::BTreeMap<PathKey, PathEntry> = alloc::collections::BTreeMap::new();
@@ -1077,42 +1146,64 @@ pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<InodeRef, i64> {
 /// 開いているディレクトリの上は見ない: 上が通れなくなっても引ける)。覚えになければ、上も通れる人なら、ふつうの
 /// lookup で引いて覚える (同じ答えになる)。どれでもなければ None (dir から 1 つずつたどる)
 fn cached_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Option<Result<(String, InodeRef), i64>> {
+    cached_at_by(dir, dir_path, path, follow, true, |w, i| (w.to_string(), i.clone()))
+}
+
+/// cached_at と同じだが、覚えになければたどらずに None (開いたファイルを借りたまま引く: sysfile の at_path)。
+/// 答えはパスを写さずに inode だけ
+pub fn cached_ino_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Option<Result<InodeRef, i64>> {
+    cached_at_by(dir, dir_path, path, follow, false, |_, i| i.clone())
+}
+
+/// 覚えを引くだけのときに、畳んだパスを作る入れもの (大きなロックの中で使い、毎回 String を作らない)
+static mut NORM: String = String::new();
+
+/// cached_at の中身。見つかったものは f(たどったパス, inode) に。walk なら、覚えになくて dir の上を通れるとき
+/// dir のパスからたどる (lookup_by)。引くだけのときは、パスの入れものも鍵も作らない (NORM と PathKeyRef)
+fn cached_at_by<T>(dir: &InodeRef, dir_path: &str, path: &str, follow: bool, walk: bool, f: impl Fn(&str, &InodeRef) -> T) -> Option<Result<T, i64>> {
     if path.is_empty() || path.starts_with('/') || !dir.path_cacheable() || PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let base = dir_path.trim_matches('/');
-    let norm = normal(base, path, true)?;
+    let norm = unsafe { &mut *(&raw mut NORM) };
+    if !normal_into(norm, base, path, true) {
+        return None;
+    }
     // .. で dir の外に出るものはしない (dir の上を見ない、とは言えない)
     if !norm.starts_with(base) || (!base.is_empty() && norm.len() > base.len() && norm.as_bytes()[base.len()] != b'/') {
         return None;
     }
     let mnt = current_mnt().id;
     let cache = unsafe { &mut *(&raw mut PATHS) };
-    let e0 = cache.get_mut(&PathKey::new(mnt, base.to_string(), true))?;
+    let e0 = cache.get_mut(PathKeyRef::new(mnt, base, true).key())?;
     if !e0.fresh() || !e0.found.as_ref().is_some_and(|(_, i)| i.id() == dir.id()) {
         return None;
     }
     let g0 = e0.gates.len();
     let cred = crate::proc::current_cred_ref();
-    let above = e0.gates.iter().all(|g| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X).is_ok());
-    let key = PathKey::new(mnt, norm, follow);
-    if let Some(e) = cache.get_mut(&key)
+    let gate_ok = |g: &Gate| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X);
+    if let Some(e) = cache.get_mut(PathKeyRef::new(mnt, norm, follow).key())
         && e.fresh()
         && e.gates.len() >= g0
     {
         PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         e.used = true;
         for g in &e.gates[g0..] {
-            if let Err(err) = cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X) {
+            if let Err(err) = gate_ok(g) {
                 return Some(Err(err));
             }
         }
         return Some(match &e.found {
-            Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
+            Some((walked, ino)) => Ok(f(walked, ino)),
             None => Err(-ENOENT),
         });
     }
-    if above { Some(lookup(base, path, follow)) } else { None }
+    // 覚えになかった: dir の上 (dir の覚えのゲート) をこの人が通れるなら、dir のパスからたどる
+    if !walk {
+        return None;
+    }
+    let above = cache.get(PathKeyRef::new(mnt, base, true).key()).is_some_and(|e0| e0.gates.iter().all(|g| gate_ok(g).is_ok()));
+    if above { Some(lookup_by(base, path, follow, f)) } else { None }
 }
 
 /// 最後の要素の親ディレクトリと名前

@@ -282,7 +282,7 @@ fn stop_group(tgid: u32, sig: i32) {
     if l.stopped {
         return;
     }
-    l.stopped = true;
+    proc::set_stopped(l, true);
     l.stop_report = sig;
     l.cont_report = false;
     // 他のスレッドも、ユーザーに戻る前に止まるよう起こす
@@ -304,7 +304,7 @@ fn continue_group(tgid: u32) {
     if !l.stopped {
         return;
     }
-    l.stopped = false;
+    proc::set_stopped(l, false);
     l.stop_report = 0;
     l.cont_report = true;
     proc::wakeup(proc::stop_chan(l));
@@ -435,7 +435,18 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
 
 /// EL0 へ戻る前に: たまっているシグナルを処理する。
 /// interrupted はシステムコールが待ちを割り込まれて EINTR を返したところ
+/// ユーザーへ戻るたびに通る。届けるものも、やり直すものも、戻すマスクもなければ (ふだん) 見るだけ
+#[inline]
 pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
+    let p = proc::current();
+    if p.sig_pending & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() {
+        return;
+    }
+    deliver_now(tf, interrupted);
+}
+
+#[cold]
+fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     // 他のスレッドがグループを止めたなら、ここで止まる
     proc::stop_while_stopped();
     let p = proc::current();

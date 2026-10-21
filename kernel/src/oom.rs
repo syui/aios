@@ -15,10 +15,15 @@ pub fn kills() -> usize {
 }
 
 /// システムコールの入り口で。heap::EMERGENCY が立っていなければすぐ戻る (ヒープは使わない: 足りないときに呼ばれる)
+#[inline]
 pub fn check() {
-    if !crate::heap::EMERGENCY.load(Relaxed) {
-        return;
+    if crate::heap::EMERGENCY.load(Relaxed) {
+        emergency();
     }
+}
+
+#[cold]
+fn emergency() {
     // わざと (fail ... oom) のときは、空きがあっても 1 度は殺す (この道を確かめるため)
     if !crate::heap::FORCED.swap(false, Relaxed) && crate::heap::recovered() {
         crate::heap::EMERGENCY.store(false, Relaxed);

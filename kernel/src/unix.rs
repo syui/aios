@@ -1593,6 +1593,7 @@ pub fn closed() {
 
 /// システムコールの終わり (と、プロセスが終わって fd の表を落としたとき: force) に: 送られている途中のソケットが
 /// あれば gc
+#[inline]
 pub fn gc_check(force: bool) {
     unsafe {
         if !(GC_WANTED || force) {

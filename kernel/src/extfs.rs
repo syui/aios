@@ -15,7 +15,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 #[path = "htree.rs"]
 mod htree;
@@ -287,6 +287,8 @@ pub struct ExtFs {
     /// meta() の答え (inode → Meta)。stat や open の 1 回で、たどるディレクトリとファイルの meta が何度も
     /// 引かれ、そのたびに inode を読んで解くのは高い (TCG で 1 回 7 us)。inode を書く (write_inode) ときに捨てる
     metas: RefCell<BTreeMap<u32, Meta>>,
+    /// metas のどれかを捨てるたび (write_inode) に進む。ExtInode が自分の meta を覚えているのは、これが同じあいだ
+    meta_ver: Cell<u64>,
 }
 
 /// meta() の答えの覚えの大きさ (こえたら全部捨てる)
@@ -497,6 +499,7 @@ impl ExtFs {
             writing: core::cell::Cell::new(0),
             names_gen: core::cell::Cell::new(0),
             metas: RefCell::new(BTreeMap::new()),
+            meta_ver: Cell::new(0),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -1377,8 +1380,9 @@ impl ExtFs {
     }
 
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
-        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)
+        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)。ExtInode の覚えも
         self.metas.borrow_mut().remove(&ino);
+        self.meta_ver.set(self.meta_ver.get() + 1);
         let mut r = r.clone();
         self.set_inode_csum(ino, &mut r);
         let (b, off) = self.inode_loc(ino);
@@ -2419,6 +2423,9 @@ impl ExtFs {
 pub struct ExtInode {
     fs: Rc<ExtFs>,
     ino: u32,
+    /// meta() の覚え (ExtFs の meta_ver が同じあいだ)。開いたファイルの fstat、lseek が metas の木を引かないように
+    /// (Linux は struct inode に i_size などを持っていて、fstat はそれを読むだけ)
+    meta: Cell<Option<(u64, Meta)>>,
 }
 
 impl Drop for ExtInode {
@@ -2454,7 +2461,7 @@ impl ExtInode {
 
     fn counted(fs: &Rc<ExtFs>, ino: u32) -> ExtInode {
         *fs.users.borrow_mut().entry(ino).or_insert(0) += 1;
-        ExtInode { fs: fs.clone(), ino }
+        ExtInode { fs: fs.clone(), ino, meta: Cell::new(None) }
     }
 
     fn at(&self, ino: u32) -> InodeRef {
@@ -2777,7 +2784,14 @@ impl Inode for ExtInode {
     }
 
     fn meta(&self) -> Meta {
+        let ver = self.fs.meta_ver.get();
+        if let Some((v, m)) = self.meta.get()
+            && v == ver
+        {
+            return m;
+        }
         if let Some(m) = self.fs.metas.borrow().get(&self.ino) {
+            self.meta.set(Some((ver, *m)));
             return *m;
         }
         // 覚え (metas) になかったものだけ (あれば BTreeMap を 1 度引くだけ)
@@ -2811,6 +2825,7 @@ impl Inode for ExtInode {
             c.clear();
         }
         c.insert(self.ino, m);
+        self.meta.set(Some((ver, m)));
         m
     }
 

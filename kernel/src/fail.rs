@@ -79,10 +79,16 @@ fn take(what: What) -> Option<Rule> {
 }
 
 /// システムコール nr をしくじらせるなら、その errno (正の数)
+#[inline]
 pub fn syscall(nr: u64) -> Option<i64> {
     if !ON.load(Relaxed) {
         return None;
     }
+    syscall_on(nr)
+}
+
+#[cold]
+fn syscall_on(nr: u64) -> Option<i64> {
     // 番号が合わなければ使わない (take は番号を見ない)
     if !RULE.lock().is_some_and(|r| r.what == What::Sys && (r.nr == u64::MAX || r.nr == nr)) {
         return None;

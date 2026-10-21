@@ -425,6 +425,11 @@ impl Proc {
         &mut self.mm().pt
     }
 
+    /// スレッドグループの代表 (スレッドでない) か
+    pub fn is_leader(&self) -> bool {
+        !self.thread && self.pid == self.tgid
+    }
+
     pub fn files(&self) -> &mut Files {
         self.files.as_ref().expect("proc without files").get()
     }
@@ -568,6 +573,7 @@ fn slot_of(p: &Proc) -> usize {
 
 /// スロットを空ける
 fn free_slot(p: &mut Proc) {
+    set_stopped(p, false);
     let i = slot_of(p);
     unsafe { LIVE[i / 64] &= !(1u64 << (i % 64)) };
     *p = Proc::UNUSED;
@@ -1266,19 +1272,26 @@ fn group_exit_status(status: i32) -> ! {
 }
 
 /// EL0 へ戻る前に: 終わるように言われていたら終わる
+/// ユーザーへ戻るたびに通る。殺されていなければ (ふだん) 見るだけ
+#[inline]
 pub fn check_killed() {
-    let p = current();
-    if p.killed {
-        // 他のスレッドが execve した: このスレッド (代表) がそのプログラムになって続ける (SIGKILL が来ていなければ)
-        if let Some((img, path)) = p.exec_takeover.take().filter(|_| p.group_exit.is_none()) {
-            p.killed = false;
-            finish_exec(p, img, &path);
-            p.no_restart = true;
-            return;
-        }
-        let status = if p.thread { 0 } else { p.group_exit.unwrap_or(SIGKILL) };
-        exit_status(status);
+    if current().killed {
+        killed_now();
     }
+}
+
+#[cold]
+fn killed_now() {
+    let p = current();
+    // 他のスレッドが execve した: このスレッド (代表) がそのプログラムになって続ける (SIGKILL が来ていなければ)
+    if let Some((img, path)) = p.exec_takeover.take().filter(|_| p.group_exit.is_none()) {
+        p.killed = false;
+        finish_exec(p, img, &path);
+        p.no_restart = true;
+        return;
+    }
+    let status = if p.thread { 0 } else { p.group_exit.unwrap_or(SIGKILL) };
+    exit_status(status);
 }
 
 const CLONE_VM: u64 = 0x0000_0100;
@@ -1602,8 +1615,34 @@ pub fn has_exited(pid: u32) -> bool {
 
 /// 止められたスレッドグループの再開を待つ (SIGCONT か SIGKILL まで)。
 /// 止まっている間に来た他のシグナルは、再開してから届ける
+/// 止まっているスレッドグループの数 (set_stopped が変える。大きなロックの中で)。0 なら、ユーザーへ戻るたびに
+/// グループの代表を表から探さない (Linux もスレッドごとの印 JOBCTL_STOP_PENDING を見るだけで、探さない)
+static STOPPED_GROUPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// グループの代表の stopped を変える (止まっているグループの数も)
+pub fn set_stopped(l: &mut Proc, on: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if l.stopped != on {
+        l.stopped = on;
+        if on {
+            STOPPED_GROUPS.fetch_add(1, Relaxed);
+        } else {
+            STOPPED_GROUPS.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
+/// 止まっているスレッドグループがあるか (なければ stop_while_stopped は何もしない)
+#[inline]
+pub fn any_stopped() -> bool {
+    STOPPED_GROUPS.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 pub fn stop_while_stopped() {
     loop {
+        if !any_stopped() {
+            return;
+        }
         let p = current();
         if p.killed {
             return;
@@ -1709,7 +1748,12 @@ pub fn leaders_in_pgrp(pgid: u32) -> Vec<u32> {
 }
 
 pub fn current_leader() -> &'static mut Proc {
-    let tgid = current().tgid;
+    let p = current();
+    // 自分が代表なら、表を探さない
+    if p.is_leader() {
+        return p;
+    }
+    let tgid = p.tgid;
     find_leader(tgid).unwrap_or_else(current)
 }
 

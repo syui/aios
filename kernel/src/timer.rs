@@ -39,11 +39,22 @@ pub fn init() {
     rearm();
 }
 
-/// 起動してからの時間 (ns)
+/// カウンタの 1 刻みの ns (周波数が 1 秒を割りきるとき: QEMU の virt は 62.5 MHz で 16)。0 はまだ、MAX は割りきれない
+static NS_PER_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// 起動してからの時間 (ns)。割りきれる周波数なら掛け算 1 つ (答えは割り算と同じ): 大きなロックの数えで、システムコールの
+/// たびに 2 度読む (TCG では cntfrq の読みと 3 つの割り算が重い)
 pub fn uptime_ns() -> u64 {
     let cnt: u64;
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+    let k = NS_PER_TICK.load(Ordering::Relaxed);
+    if k != 0 && k != u64::MAX {
+        return cnt * k;
+    }
     let f = freq();
+    if k == 0 {
+        NS_PER_TICK.store(if 1_000_000_000 % f == 0 { 1_000_000_000 / f } else { u64::MAX }, Ordering::Relaxed);
+    }
     (cnt / f) * 1_000_000_000 + (cnt % f) * 1_000_000_000 / f
 }
 

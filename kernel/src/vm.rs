@@ -489,6 +489,11 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
     Ok(n)
 }
 
+/// ページキャッシュが記録しているファイル id の大きさ (大きなロックなしの lseek の SEEK_END。read_fast と同じもの)
+pub fn cached_size(id: (usize, u64)) -> Option<u64> {
+    PRIV.lock().vers.get(&id).map(|v| v.1)
+}
+
 /// 大きなロックなしで、ページキャッシュから読む (syscall::fast の read)。ファイル id の off から len バイトの
 /// ページが全部表にあり、ユーザーのページも写っているときだけ Some(読んだ数)。表にあるページはいまの中身で
 /// (書けばその場で書きかわる (file_written) か捨てる (file_changed))、記録した大きさもいまの大きさ

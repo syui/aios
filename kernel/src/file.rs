@@ -1140,6 +1140,40 @@ pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option
     r.ok()
 }
 
+/// 大きなロックなしの lseek (syscall::fast): ページキャッシュを通るファイル (ext4、tmpfs) の SEEK_SET、SEEK_CUR と、
+/// 大きさをページキャッシュが知っているときの SEEK_END。fd の表と開いたファイルをだれとも分けていないときだけ
+/// (fast_read_file と同じ。Linux も分けていなければ f_pos_lock を取らない)。位置だけを変えるので、ディレクトリでも同じ
+/// (消した ext4 のディレクトリは s_maxbytes までなので、4 TiB より先はふつうの道で)。ほかは None でふつうの道へ
+pub fn fast_lseek(me: &proc::Proc, fd: u64, off: i64, whence: u64) -> Option<i64> {
+    let files = me.files.as_ref()?;
+    if !files.private() {
+        return None;
+    }
+    let f = files.get().get(fd)?;
+    if Rc::strong_count(f) != 1 {
+        return None;
+    }
+    let of = unsafe { &mut *f.as_ptr() };
+    let Kind::Inode(ino, _) = &of.kind else { return None };
+    if of.flags & O_PATH != 0 || !ino.page_cacheable() {
+        return None;
+    }
+    let base = match whence {
+        0 => 0,
+        1 => of.offset as i64,
+        2 => crate::vm::cached_size(ino.id())? as i64,
+        _ => return None,
+    };
+    let new = base.checked_add(off).filter(|&n| (0..1 << 42).contains(&n))?;
+    of.offset = new as usize;
+    Some(new)
+}
+
+/// 開いていない fd の close (EBADF) を大きなロックなしで: fd の表をだれとも分けていないときだけ見る
+pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {
+    me.files.as_ref().is_some_and(|files| files.private() && files.get().get(fd).is_none())
+}
+
 /// 大きなロックなしの /dev/null・/dev/zero・/dev/urandom の read / write (syscall::fast)。書くものは捨てるだけ
 /// (ユーザーのメモリも読まない。Linux と同じ)、/dev/null は読むと 0、/dev/zero は 0 で埋める (/dev/urandom の
 /// 読みはふつうの道)。開いたファイルの種類と読み書きの口はあとで変わらないので、借りずに見る

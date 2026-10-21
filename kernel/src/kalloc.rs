@@ -260,6 +260,7 @@ pub fn init(early: usize) -> Option<*mut u8> {
     k.lo = lo;
     k.hi = top;
     k.give_range(lo, top);
+    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
     got
 }
 
@@ -270,7 +271,9 @@ pub fn take_contiguous(bytes: usize) -> Option<*mut u8> {
     let mut k = KMEM.lock();
     let nhot = k.nhot;
     k.drain(nhot);
-    k.take_run(n).map(page_of)
+    let got = k.take_run(n).map(page_of);
+    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+    got
 }
 
 /// 仮想アドレス (KBASE 側) のページを返す
@@ -284,6 +287,7 @@ pub fn free(page: *mut u8) {
     let n = k.nhot;
     k.hot[n] = i as u32;
     k.nhot += 1;
+    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
 }
 
 /// 0 埋めしたページを 1 枚。なければ None
@@ -326,6 +330,7 @@ pub fn alloc_dirty() -> Option<*mut u8> {
     } else {
         k.take(0)?
     };
+    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
     drop(k);
     let page = page_of(i);
     ref_slot(page).store(1, Ordering::Relaxed);
@@ -370,9 +375,11 @@ pub fn cycle() -> usize {
     n
 }
 
+/// 空いているページの数 (KMEM を変えたあとに書く: システムコールのたびに swap::balance が読むので、ロックを取らずに)
+static NFREE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 pub fn nfree() -> usize {
-    let k = KMEM.lock();
-    k.nbuddy + k.nhot
+    NFREE.load(Ordering::Relaxed)
 }
 
 /// 大きさ (2^k ページ) ごとの空いているかたまりの数 (HOT のものは入れない: Linux の per-cpu のものと同じ) と HOT の枚数

@@ -70,8 +70,9 @@ impl Cred {
 }
 
 /// いまのプロセスの資格情報 (起動中でまだプロセスがなければ root)
-pub fn current() -> Cred {
-    proc::current_cred()
+/// いまのスレッドの資格情報 (写さずに: groups や namespace を、引くたびに写さない)
+pub fn current() -> &'static Cred {
+    proc::current_cred_ref()
 }
 
 // ---- システムコール ----

@@ -91,7 +91,7 @@ impl Ruleset {
 }
 
 fn domain() -> Option<Domain> {
-    crate::cred::current().landlock
+    crate::cred::current().landlock.clone()
 }
 
 /// path (先頭 / なし、リンクをたどったあと) に access ができるか。できなければ -EACCES

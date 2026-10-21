@@ -227,6 +227,9 @@ kernel.json の `bench` のあるもの (vfs、extfs、inet、socket、unix と 
 heap、smp、mem は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから取って返す、
 大きなロックを放して取りなおす、時計を読む (uptime_ns)、物理ページを 1 枚取って返す・1024 枚取ってから返す (kalloc) の 1 回の ns
 (10 万回の平均)、64 KiB の memcpy (src が 1 バイトずれたものも) と 4 KiB を 0 にする memset (mem.S) の 1 回の ns を kmsg に出す。aish の `bench` はこれも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
+2 行めの trapbench (kernel/src/trap.rs の bench) は、システムコール 1 回のうちベクタの asm (レジスタを積んでおろす、eret) の
+ほかの重さ: 偽の TrapFrame で trap_handler をそのまま呼んで、速い道 (getppid、ロックなし)、大きなロックを取る道 (umask)、
+その中の dispatch だけ、ユーザーへ戻るまえ (resched、killed、signal) だけ、ESR を 1 回読む、CPU の番号を読む (7 回まわして速いもの)。
 
 ### Linux と答えあわせ (sysdiff)
 
@@ -353,6 +356,30 @@ file_written。ブロックのキャッシュは写されているページを�
 16.9 → 8.5 µs、stat-at (fsbench に足した) は 31.9 → 14.3 µs。測る道具 (/proc/ai/prof) も直した: 区間の名前の表を頭から
 1 つずつ見ていたので、あとから入った名前ほど区間のたびに重く、表 (64) より名前が多い (いまは 85) と、あふれた区間は
 数えられなかった (256 にして、名前の場所のハッシュで引く)。
+
+自分のことを読むだけのシステムコールも、Linux より 1〜2 µs 遅かった (umask 3.0 / Linux 2.5 µs、getpgid 3.5 / 1.6、
+lseek 3.6 / 1.7)。trapbench で分けると、大きなロックを取る道はカーネルの中だけで 2.8 µs (速い道は 0.27) で、どれも小さな
+ものの積みかさねだった。直したもの: (1) ユーザーへ戻るたびに signal::deliver が、止められたスレッドグループがないかを
+プロセスの表を見て回って探していた (stop_while_stopped)。いまは止まっているグループの数 (STOPPED_GROUPS) が 0 なら探さず、
+届けるもの・やり直すもの・戻すマスクがなければ見るだけで戻る (Linux もスレッドごとの印を見るだけ)。(2) /proc/bkl のために
+例外ごとに時計 (cntvct) を 2 回読んでいた。QEMU の TCG では 1 回 150 ns ほどで、出入りのほかのものぜんぶにくらべて 4 割になって
+いた。いまは待たずに取れたものの 8 回に 1 回ほど (smp::SAMPLE。くじは xorshift: 決まった順だと、交互に呼ぶもの (read と
+write など) の片方だけが測られる) だけ測って 8 倍して足す。待ったものはいつも測る。Linux もプロセスの時間は出入りのたびに
+測らず、時計の割り込みで数える (tick)。(3) dispatch が TrapFrame の 31 のレジスタを写していた (引数の 6 つだけに)、trace・
+strace・oom・fail・unix の gc の「なにもしない」の確かめが関数を呼んでいた (確かめだけを呼ぶ側に入れる)、ESR / FAR を
+1 回の例外で 6 回読んでいた (TCG では読むたびに HCR_EL2 を確かめる関数を呼ぶ。ESR を 1 度、FAR はフォルトのときだけ)。
+速い道 (syscall::fast) も、まだ速い道かわからないうちに 31 のレジスタを写し、番号ごとの数を atomic で足していた (数えるのは
+/proc/sysstat を読みはじめてから、速い道で終わったものだけ)。(4) 自分が代表なのに、代表を表から探していた
+(current_leader。getpgid(0) など)。getpgid(0) と getsid(0) は getppid と同じく速い道で答える (Linux も rcu_read_lock だけ)。
+lseek の SEEK_SET / SEEK_CUR (と、ページキャッシュが大きさを知っている SEEK_END) と、開いていない fd の close (EBADF) も、
+fd の表と開いたファイルをだれとも分けていなければ速い道で (pread と同じ。Linux も分けていなければ f_pos_lock を取らない)。
+(5) ext4 の inode の meta (stat、lseek の大きさ) を、使うたびに metas の木 (BTreeMap) から引いていた。いまは ExtInode が
+自分の meta を覚え、どれかの inode を書く (write_inode) たびに進む版 (meta_ver) が同じあいだはそれを使う (Linux の struct inode
+の i_size などと同じに、開いたファイルの fstat は読むだけ)。(6) 開いているディレクトリからの fstatat が、当たっていても String を
+4 つ作って捨てていた (ディレクトリのパスの写し、畳んだパス、鍵、たどったパスの写し)。いまは畳んだパスは使いまわしの入れもの
+(vfs.rs の NORM) に作り、覚えは鍵を作らずに引き (PathKeyRef と Borrow)、開いたファイルを借りたまま引いて、答えは inode だけ。
+ふつうの stat (lookup_by) も、当たれば鍵を作らない。大きなロックの道はカーネルの中で 2.8 → 0.7 µs、速い道は 0.27 → 0.10 µs。
+umask 1.7 µs、getpgid 1.0、close(-1) 1.1、lseek 1.1、fstat 2.3、fstatat の dirfd 6.8〜7.4 (Linux 7.3 は 2.5、1.6、1.6、1.7、2.4、6.8)。
 
 手本が Linux 7.3 になったとき (ext4 300 × 30 と 300 × 80、tmpfs 300 × 30 でどれもちがわない) は、手本のまちがい 3 つが
 7.3 にもまだあるかを確かめた (`sysdiff -r` は Linux の側でもただしをしないので、-r ありとなしの答えをくらべれば、そのまちがいが

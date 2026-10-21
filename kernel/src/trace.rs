@@ -104,21 +104,39 @@ fn wanted() -> bool {
 
 // ---- それぞれの場所から (ON でなければすぐ戻る) ----
 
+// システムコールごとに通るものは、ON を見るところだけ呼ぶ側に入れる (関数を呼ぶのも、システムコールの重さのうち)
+#[inline]
 pub fn sys_enter(nr: u64, a0: u64) {
-    if ON.load(Relaxed) && wanted() {
-        put(Kind::Sys, crate::proc::current().pid, a0, nr as u16);
+    if ON.load(Relaxed) {
+        sys_on(Kind::Sys, nr, a0);
     }
 }
 
+#[inline]
 pub fn sys_exit(nr: u64, r: i64) {
-    if ON.load(Relaxed) && wanted() {
-        put(Kind::Ret, crate::proc::current().pid, r as u64, nr as u16);
+    if ON.load(Relaxed) {
+        sys_on(Kind::Ret, nr, r as u64);
+    }
+}
+
+#[cold]
+fn sys_on(kind: Kind, nr: u64, v: u64) {
+    if wanted() {
+        put(kind, crate::proc::current().pid, v, nr as u16);
     }
 }
 
 /// 大きなロックなしの道 (syscall::fast) で終わったもの: 入りと出をいっしょに
+#[inline]
 pub fn sys_fast(nr: u64, a0: u64, r: i64) {
-    if ON.load(Relaxed) && wanted() {
+    if ON.load(Relaxed) {
+        sys_fast_on(nr, a0, r);
+    }
+}
+
+#[cold]
+fn sys_fast_on(nr: u64, a0: u64, r: i64) {
+    if wanted() {
         let tid = crate::proc::current().pid;
         put(Kind::Sys, tid, a0, nr as u16);
         put(Kind::Ret, tid, r as u64, nr as u16);

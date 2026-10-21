@@ -124,6 +124,18 @@ fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
         return inode_of(dirfd as u64);
     }
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    // 開いているディレクトリからで、パスの覚えにあるもの: 開いたファイルを借りたまま引く (ディレクトリのパスを写さない。
+    // 覚えになければ、たどるのは借りを返してから)。まちがい (EBADF、ENOTDIR) の順は base_ino と同じ
+    if !path.starts_with('/') && dirfd != AT_FDCWD {
+        let f = file_of(dirfd as u64)?;
+        let hit = match &f.borrow().kind {
+            Kind::Inode(i, p) if i.meta().is_dir() => vfs::cached_ino_at(i, p, path, follow),
+            _ => return Err(-ENOTDIR),
+        };
+        if let Some(r) = hit {
+            return r;
+        }
+    }
     match base_ino(dirfd, path)? {
         // 開いているディレクトリから (ルートからたどりなおさない)
         Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow).map(|(_, i)| i),

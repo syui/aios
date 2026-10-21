@@ -332,16 +332,18 @@ fn int(v: u64) -> i64 {
 /// システムコールを動かす。待ちが割り込まれて EINTR になったら、その情報を返す
 pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
-    let a = tf.x;
+    // 引数は 6 つ (x0〜x5)。tf.x を 31 ぜんぶ写すと、それだけでシステムコールごとに 248 バイト
+    let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
     let nr = tf.x[8];
     crate::trace::sys_enter(nr, a[0]);
-    proc::current().orig_x0 = tf.x[0];
-    proc::current().last_sys = (nr, tf.x[0], tf.x[1]);
+    let p = proc::current();
+    p.orig_x0 = a[0];
+    p.last_sys = (nr, a[0], a[1]);
     count(nr);
     // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
     crate::oom::check();
     // seccomp: かかっていれば、フィルタの答えにしたがう
-    if let Some(s) = proc::current().cred.seccomp.clone() {
+    if let Some(s) = p.cred.seccomp.clone() {
         let args = [a[0], a[1], a[2], a[3], a[4], a[5]];
         match crate::seccomp::check(&s, nr, &args, tf.elr) {
             crate::seccomp::Verdict::Allow => {}
@@ -734,7 +736,16 @@ fn strace_on() -> Option<bool> {
     name.split(|&c| c == b',').any(|n| !n.is_empty() && p.comm.starts_with(n)).then_some(all)
 }
 
+/// 名前が書かれていなければ (ふだん) なにもしない。それを見るところだけ呼ぶ側に
+#[inline]
 fn strace(nr: u64, a: &[u64], r: R) {
+    if unsafe { (*(&raw const STRACE))[0] } != 0 {
+        strace_named(nr, a, r);
+    }
+}
+
+#[cold]
+fn strace_named(nr: u64, a: &[u64], r: R) {
     let Some(all) = strace_on() else { return };
     let e = r.unwrap_or_else(|e| e);
     // EAGAIN / EINTR / ETIMEDOUT はよくあるので出さない
@@ -803,19 +814,21 @@ const CLOCK_REALTIME_COARSE: u64 = 5;
 /// ロックを持って書いていれば "already borrowed" で止まる (前の fast_splice。test/vm-check.sh の fast-smp)
 pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
-    let a = tf.x;
+    // すべてのシステムコールがまずここを通るので、写すのは引数 (x0〜x5) と番号だけ
+    let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
+    let nr = tf.x[8];
     let p = proc::current();
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
     if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() {
         return false;
     }
-    if let Some(c) = FAST.get(a[8] as usize) {
-        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-    let r = match a[8] {
+    let r = match nr {
         GETPID => p.tgid as i64,
         GETTID => p.pid as i64,
         GETPPID => p.ppid as i64,
+        // 自分 (代表) のグループとセッション。Linux も大きなロックなしに読む (rcu_read_lock だけ)。
+        // スレッドは代表を表から探すので、ふつうの道へ
+        GETPGID | GETSID if a[0] == 0 && p.is_leader() => if nr == GETPGID { p.pgid as i64 } else { p.sid as i64 },
         GETUID => p.cred.uid as i64,
         GETEUID => p.cred.euid as i64,
         GETGID => p.cred.gid as i64,
@@ -853,6 +866,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             _ => return false,
         },
+        LSEEK => match crate::file::fast_lseek(p, a[0], a[1] as i64, a[2]) {
+            Some(r) => r,
+            None => return false,
+        },
+        CLOSE if crate::file::fast_close_badf(p, a[0]) => -EBADF,
         // ページキャッシュから読む pread64、ファイル → パイプ・パイプ → /dev/null の splice (眠らないもの)
         PREAD64 => match crate::file::fast_pread(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
             Some(r) => r,
@@ -863,9 +881,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             None => return false,
         },
         // パイプの読み書きで、眠らず起こさずにすむもの (file::Pipe::fast_rw)
-        READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, a[8] == WRITE)
-            .or_else(|| if a[8] == READ { crate::file::fast_read_file(p, a[0], a[1] as usize, a[2] as usize) } else { None })
-            .or_else(|| crate::file::fast_dev(p, a[0], a[1] as usize, a[2] as usize, a[8] == WRITE))
+        READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE)
+            .or_else(|| if nr == READ { crate::file::fast_read_file(p, a[0], a[1] as usize, a[2] as usize) } else { None })
+            .or_else(|| crate::file::fast_dev(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
         {
             Some(r) => r,
             None => return false,
@@ -873,7 +891,13 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         _ => return false,
     };
     tf.x[0] = r as u64;
-    crate::trace::sys_fast(a[8], a[0], r);
+    // /proc/sysstat を読みはじめてから、速い道で終わったものだけ数える
+    if COUNTING.load(core::sync::atomic::Ordering::Relaxed)
+        && let Some(c) = FAST.get(nr as usize)
+    {
+        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    crate::trace::sys_fast(nr, a[0], r);
     true
 }
 
