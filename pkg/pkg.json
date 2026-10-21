@@ -58,7 +58,7 @@
   {"name": "mesa",              "type": "c",       "src": "https://archive.mesa3d.org/mesa-26.2.5.tar.xz",                                                                    "now": "26.2.5",         "latest": "26.2.5"},
   {"name": "musl",              "type": "c",       "src": "https://musl.libc.org/releases/musl-1.2.6.tar.gz",                                                                 "now": "1.2.6",          "latest": "1.2.6"},
   {"name": "ncurses",           "type": "c",       "src": "https://ftp.gnu.org/gnu/ncurses/ncurses-6.6.tar.gz",                                                               "now": "6.6",            "latest": "6.6"},
-  {"name": "nodejs",            "type": "c",       "src": "https://unofficial-builds.nodejs.org/download/release/v26.12.0/node-v26.12.0-linux-arm64-musl.tar.xz",             "now": "26.12.0",        "latest": "26.12.0"},
+  {"name": "nodejs",            "type": "c",       "src": "https://unofficial-builds.nodejs.org/download/release/v26.12.1/node-v26.12.1-linux-arm64-musl.tar.xz",             "now": "26.12.1",        "latest": "26.12.1"},
   {"name": "openssh",           "type": "c",       "src": "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p1.tar.gz",                                       "now": "10.6p1",         "latest": "10.6p1"},
   {"name": "pango",             "type": "c",       "src": "https://download.gnome.org/sources/pango/1.58/pango-1.58.2.tar.xz",                                                "now": "1.58.2",         "latest": "1.58.2"},
   {"name": "patch",             "type": "c",       "src": "https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz",                                                                   "now": "2.8",            "latest": "2.8"},
