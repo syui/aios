@@ -7,12 +7,16 @@
 //   *_local   同じ往復を 1 つのプロセスで (切りかえなし: ソケットの道だけ)
 //   *_stream  64 KiB (4k は 4 KiB) ずつ書いて、別のプロセスが 64 KiB ずつ読む (MB/s)
 //   tcp_connect  listen しているものへ connect して accept し、両方を閉じる (1 つのつながりの µs。TIME_WAIT も残る)
+//   futex_rr  2 つのスレッドが futex (PRIVATE) で交互に起こしあう往復 (スレッドの切りかえと futex の起こしだけ。
+//             pthread のミューテックスや条件変数の土台)
 // aios でも Linux でも動く。aish の bench (kind net) が aios と Linux の VM で同じように動かす
 //   netbench [-r RUNS] [-o OP,OP...] [SCALE]   RUNS 回くりかえす (run は 0 から)。SCALE (既定 1) で回数を何倍にも
 // gcc -O2 -static -o netbench test/netbench.c
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/futex.h>
+#include <pthread.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -21,6 +25,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -276,6 +281,47 @@ static void tcp_connect(long n) {
     report("tcp_connect", n, ms);
 }
 
+// futex_rr: 語が 1 なら返す側の番、0 なら送る側の番。待つのは語が変わるまで、書いたら 1 つ起こす
+static int fword;
+static long fx_n;
+
+static void fwait(int *w, int v) {
+  while (__atomic_load_n(w, __ATOMIC_ACQUIRE) == v)
+    syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, v, NULL, NULL, 0);
+}
+
+static void fset(int *w, int v) {
+  __atomic_store_n(w, v, __ATOMIC_RELEASE);
+  syscall(SYS_futex, w, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+
+static void *fpong(void *a) {
+  (void)a;
+  for (long i = 0; i < fx_n; i++) {
+    fwait(&fword, 0);
+    fset(&fword, 0);
+  }
+  return NULL;
+}
+
+static void futex_rr(long n) {
+  fword = 0;
+  fx_n = n;
+  pthread_t t;
+  if (pthread_create(&t, NULL, fpong, NULL)) {
+    bad("futex_rr", "pthread_create");
+    return;
+  }
+  double t0 = now_ms();
+  for (long i = 0; i < n; i++) {
+    fset(&fword, 1);
+    fwait(&fword, 1);
+  }
+  double ms = now_ms() - t0;
+  pthread_join(t, NULL);
+  report("futex_rr", n, ms);
+}
+
 int main(int argc, char **argv) {
   int runs = 1;
   long scale = 1;
@@ -296,6 +342,8 @@ int main(int argc, char **argv) {
   for (run = 0; run < runs; run++) {
     if (want("pipe_rr"))
       pipe_rr(nrr);
+    if (want("futex_rr"))
+      futex_rr(nrr);
     if (want("unix_rr"))
       sock_rr("unix_rr", "unix", nrr, 0);
     if (want("tcp_rr"))

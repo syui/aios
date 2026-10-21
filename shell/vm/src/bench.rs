@@ -16,6 +16,7 @@ use std::time::Duration;
 /// net の op と、表に書く中身
 const NET_OPS: &[(&str, &str)] = &[
     ("pipe_rr", "パイプで 1 バイトの往復 (2 つのプロセス。くらべるための土台: プロセスの切りかえと起こし)"),
+    ("futex_rr", "2 つのスレッドが futex で交互に起こしあう往復 (スレッドの切りかえと futex の起こしだけ)"),
     ("unix_rr", "AF_UNIX の stream で 1 バイトの往復 (2 つのプロセス)"),
     ("tcp_rr", "TCP (127.0.0.1、TCP_NODELAY) で 1 バイトの往復 (2 つのプロセス)"),
     ("udp_rr", "UDP (つないだもの) で 1 バイトの往復 (2 つのプロセス)"),

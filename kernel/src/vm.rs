@@ -1881,6 +1881,15 @@ impl PageTable {
         Some(new)
     }
 
+    /// この CPU に載っていなければ載せる。同じアドレス空間のスレッドへの切りかえでは、TTBR0 も TLB もそのまま
+    /// (Linux も同じ mm なら switch_mm しない)。載っている印は、ページ表を捨てるときに消す (Drop) ので、同じ場所に
+    /// 作りなおされた別のページ表をまちがえない
+    pub fn activate_lazy(&self) {
+        if ACTIVE_ROOT[crate::smp::id()].load(Ordering::Relaxed) != self.root_pa() {
+            self.activate();
+        }
+    }
+
     pub fn activate(&self) {
         ACTIVE_ROOT[crate::smp::id()].store(self.root_pa(), Ordering::Relaxed);
         unsafe {
@@ -2015,6 +2024,11 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
+        // どの CPU にも「載っている」と思わせない (activate_lazy が、同じ場所に作りなおされたものを載せなおすように)
+        let root = self.root_pa();
+        for a in ACTIVE_ROOT.iter() {
+            let _ = a.compare_exchange(root, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
         let _m = self.mutating();
         let file_keys = self.shared_keys(0, MAXVA);
         fn free_level(table: *mut u64, level: usize) {

@@ -276,7 +276,7 @@ fn part_of(nr: u64) -> Option<crate::parts::Part> {
     })
 }
 
-/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll)
+/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll、futex)
 fn sys_span(nr: u64) -> Option<&'static str> {
     use nr::*;
     Some(match nr {
@@ -318,6 +318,8 @@ fn sys_span(nr: u64) -> Option<&'static str> {
         SETSOCKOPT | GETSOCKOPT => "socket:sockopt",
         EPOLL_CTL => "epoll:ctl",
         EPOLL_PWAIT | EPOLL_PWAIT2 => "epoll:wait",
+        FUTEX => "futex:futex",
+        FUTEX_WAITV => "futex:waitv",
         _ => return None,
     })
 }
@@ -796,7 +798,9 @@ const CLOCK_REALTIME_COARSE: u64 = 5;
 
 /// 大きなロックなしで済むシステムコール: 自分のことを読むだけのもの (smp.rs)。済ませたら true。
 /// ユーザーのメモリに書くのは、もう写っていて書けるページだけ (なければ false でふつうの道へ)。
-/// シグナルや kill はほかの CPU から割り込み (IPI) で来るので、ここでは見なくてよい
+/// シグナルや kill はほかの CPU から割り込み (IPI) で来るので、ここでは見なくてよい。
+/// 大きなロックで守られているもの (ファイルシステムの RefCell: ext4 の inode の覚えなど) は借りないこと: ほかの CPU が
+/// ロックを持って書いていれば "already borrowed" で止まる (前の fast_splice。test/vm-check.sh の fast-smp)
 pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
     let a = tf.x;

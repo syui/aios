@@ -923,14 +923,18 @@ pub fn scheduler() -> ! {
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
-                p.pt().activate();
+                p.pt().activate_lazy();
                 fp_load(&p.fp);
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
                 crate::smp::dev_wait(2, t0);
                 swtch(sched_ctx(), &p.context);
                 set_cur(None);
-                // 終わったプロセスのページ表はほかの CPU が片付けるかもしれないので、外しておく
-                crate::vm::deactivate();
+                // 終わったスレッドのページ表はほかの CPU が片付けるかもしれないので、外しておく。生きているものは
+                // 載せたまま (次に同じアドレス空間のスレッドを選べば、載せなおさない。ページ表は、それを使う
+                // スレッドがみな終わるまで捨てられず、捨てるのは大きなロックの中: このループのあいだはない)
+                if matches!(procs()[i].state, State::Zombie | State::Unused) {
+                    crate::vm::deactivate();
+                }
             }
             ran = true;
         }
@@ -945,6 +949,8 @@ pub fn scheduler() -> ! {
                 crate::smp::set_idle(false);
                 continue;
             }
+            // 眠るあいだに、ほかの CPU が (大きなロックを取って) いま載せているページ表を捨てるかもしれない
+            crate::vm::deactivate();
             crate::smp::unlock();
             crate::timer::idle(true);
             // 割り込みを止めたまま wfi で眠る (止めていても、来ている割り込みがあれば起きる)。

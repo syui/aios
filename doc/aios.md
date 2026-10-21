@@ -203,7 +203,9 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
     unlink、mkdir、16 MiB の書き読み、fsync)
   - test/netbench.c: ループバック。パイプ、AF_UNIX、TCP、UDP の 1 バイトの往復を 2 つのプロセスで (`*_rr`) と 1 つのプロセスで
     (`*_local`: 切りかえなしの、ソケットの道だけ)、epoll で待つ往復、64 KiB と 4 KiB の流しこみ、connect から閉じるまで。
-    パイプの往復はくらべるための土台 (プロセスの切りかえと起こしだけ)。`-r RUNS` でくりかえし、`-o OP,...` で選ぶ
+    パイプの往復はくらべるための土台 (プロセスの切りかえと起こしだけ)。`futex_rr` は 2 つのスレッドが futex で交互に起こし
+    あう往復 (スレッドの切りかえと futex の起こしだけ: pthread のミューテックスや条件変数の土台)。`-r RUNS` でくりかえし、
+    `-o OP,...` で選ぶ
 - **aish の `bench`** (aish-vm。bench.rs): `kind` (fs か net) のプログラムを VM (`-snapshot`、`smp` 個の CPU、既定 1) で n 回
   動かして op ごとのまんなかをとり、`prof on` にした回で /proc/ai/prof の part ごとの CPU の時間の割合と、時間の多い区間を出す
   (net は op ごとに)。`against` で 2 つの aios のカーネルを、`linux` で同じプログラム (同じ libc の静的なもの) を手本の Linux
@@ -218,7 +220,7 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
 - **/proc/ai/prof**: 区間の名前は `part:what` (part は kernel.json の名前。test/kernel-json.py が確かめる)。self_us は CPU を
   使った時間で、眠っていた時間 (相手やディスクを待った: proc.rs の sched で CPU を手放してから戻るまで) は、いちばん内側の
   区間の `wait_us` に分ける (往復の bench で、相手を待つ時間が read の時間に見えないように)。システムコールの区間は
-  syscall.rs の sys_span (sysfile、socket、epoll)、中は inet:* (tcp_send、tcp_recv、deliver、wake、syn、accept、close、udp_*)、
+  syscall.rs の sys_span (sysfile、socket、epoll、futex)、中は inet:* (tcp_send、tcp_recv、deliver、wake、syn、accept、close、udp_*)、
   unix:* (send、recv、deliver)、file:pipe_*、proc:wakeup、それと vfs / extfs / vm / block / jbd2
 
 kernel.json の `bench` のあるもの (vfs、extfs、inet、socket、unix と spinlock、heap、smp) は、その速さを測るものがある。spinlock、heap、

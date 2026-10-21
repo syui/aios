@@ -210,7 +210,10 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ticks: Option<u64>) -> 
     let ep = epoll_of(epfd)?;
     let deadline = timeout_ticks.map(|t| crate::timer::ticks() + t);
     loop {
-        let got = ep.borrow_mut().collect(max as usize, true);
+        let got = {
+            let _p = crate::prof::span("epoll:collect");
+            ep.borrow_mut().collect(max as usize, true)
+        };
         if !got.is_empty() {
             let mut buf = alloc::vec![0u8; got.len() * EVENT_SIZE];
             for (i, (ev, data)) in got.iter().enumerate() {
@@ -227,6 +230,7 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ticks: Option<u64>) -> 
         // 印のわからないものがあれば、何でも起こしてもらう。印がないと、どこかのパイプに書くたびに
         // 起こされる (Firefox の AudioIPC のスレッドが 1 秒に何百回も起きていた)
         // (借りたまま眠らないように、印は先に)
+        let _p = crate::prof::span("epoll:sleep");
         let keys = ep.borrow().keys(Rc::as_ptr(&ep) as usize);
         proc::poll_sleep(keys, deadline.unwrap_or(0))?;
     }
