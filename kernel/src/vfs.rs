@@ -497,8 +497,26 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         };
     }
     PATHS_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new() };
-    let r = walk(None, key.1.clone(), follow, &mut t);
+    let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() };
+    // 親のディレクトリを覚えていれば、そこから最後の名前だけを引く (Linux の dcache も名前ごと: 作ったばかりの
+    // ファイルの stat で、ディレクトリまでを引きなおさない)。通ったディレクトリと通れるかは親の覚えから
+    let mut start = None;
+    let mut rest = key.1.clone();
+    if let Some(cut) = key.1.rfind('/') {
+        if let Some(e) = cache.get_mut(&(key.0, key.1[..cut].to_string(), true)) {
+            let cred = crate::proc::current_cred_ref();
+            if let Some((walked, ino)) = &e.found {
+                if e.gates.iter().all(|g| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X).is_ok()) {
+                    e.used = true;
+                    start = Some((ino.clone(), walked.clone()));
+                    rest = key.1[cut + 1..].to_string();
+                    t.dirs = e.dirs.clone();
+                    t.gates = e.gates.clone();
+                }
+            }
+        }
+    }
+    let r = walk(start, rest, follow, &mut t);
     // あったものと、ない (ENOENT) ものを覚える。たどっているあいだに変わったものがあれば覚えない (念のため)
     let keep = match &r {
         Ok(_) => true,
@@ -514,6 +532,11 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
             if cache.len() >= max / 4 * 3 {
                 cache.clear();
             }
+        }
+        // 途中のディレクトリも (次にその中の名前を引くときは、そこから)
+        for (walked, ino, d, g) in core::mem::take(&mut t.prefixes) {
+            let (dirs, gates) = (t.dirs[..d].to_vec(), t.gates[..g].to_vec());
+            cache.entry((key.0, walked.clone(), true)).or_insert_with(|| PathEntry { found: Some((walked, ino)), used: false, dirs, gates });
         }
         cache.insert(key, PathEntry { found: r.as_ref().ok().cloned(), used: false, dirs: t.dirs, gates: t.gates });
     }
@@ -531,7 +554,9 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
 /// dir_changed で、そこを通ったものだけを捨てる (ないものも、その名前を探したディレクトリを通ったものに
 /// 入れてあるので、作れば捨てられる。/run の rename が 5 秒ごとにあっても、ほかのものは残る)。
 /// マウントが変わったら names_changed で全部。いっぱいになったら (paths_max)、前にいっぱいになったときから
-/// 引かれなかったものを捨てる
+/// 引かれなかったものを捨てる。たどった途中のディレクトリも (ルートからリンクをたどらずに来たもの) 覚え、覚えに
+/// ないパスは、親のディレクトリを覚えていればそこから最後の名前だけを引く (Linux の dcache が名前ごとに覚えるのと
+/// 同じ: 作ったばかりのファイルの stat も、ディレクトリまでは引きなおさない)
 struct PathEntry {
     /// たどったパスと inode。None はない (ENOENT)
     found: Option<(String, InodeRef)>,
@@ -543,17 +568,20 @@ struct PathEntry {
 }
 
 /// だれでもは通れないディレクトリの、通れるかを決める属性 (Meta まるごとでは大きいので)
+#[derive(Clone)]
 struct Gate {
     mode: u32,
     uid: u32,
     gid: u32,
 }
 
-/// walk が集めるもの: 覚えてよいか、通ったディレクトリ、そのうちだれでもは通れないもの
+/// walk が集めるもの: 覚えてよいか、通ったディレクトリ、そのうちだれでもは通れないもの、それと途中のディレクトリ
+/// (ルートからリンクをたどらずに来たもの: たどったパス、inode、そこまでの dirs と gates の数。lookup がそれも覚える)
 struct Trace {
     ok: bool,
     dirs: Vec<(usize, u64)>,
     gates: Vec<Gate>,
+    prefixes: Vec<(String, InodeRef, usize, usize)>,
 }
 
 static mut PATHS: alloc::collections::BTreeMap<(u64, String, bool), PathEntry> = alloc::collections::BTreeMap::new();
@@ -667,7 +695,7 @@ pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Re
         return lookup(dir_path, path, follow);
     }
     let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
-    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new() })
+    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() })
 }
 
 /// 文字の上で畳んでも Linux と同じ答えになるパス: 名前のあとの .. がなく (先頭の .. は基準のディレクトリを戻る
@@ -701,6 +729,8 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
     // 覚え (PATHS) になかったもの。vfs:lookup との回数の差が、覚えから答えた数
     let _p = crate::prof::span("vfs:walk");
     let cred = crate::cred::current();
+    // ルートからリンクをたどらずに来たあいだだけ、途中のディレクトリを t.prefixes に (覚えてよいもの)
+    let mut direct = start.is_none();
     'restart: for _ in 0..16 {
         let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
         let (mut cur, mut walked) = start.take().unwrap_or_else(|| (cross(root()), String::new()));
@@ -769,12 +799,16 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                     np.push_str(rest);
                 }
                 path = np;
+                direct = false;
                 continue 'restart;
             }
             if !walked.is_empty() {
                 walked.push('/');
             }
             walked.push_str(c);
+            if direct && t.ok && !last && nm.is_dir() {
+                t.prefixes.push((walked.clone(), next.clone(), t.dirs.len(), t.gates.len()));
+            }
             cur = next;
             m = nm;
         }

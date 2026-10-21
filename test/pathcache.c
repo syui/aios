@@ -172,7 +172,37 @@ static void run(const char *dir) {
     CHECK("gate-others", st_as(1001, 1001, -1, pf) == 0);
     CHECK("gate-group-denied", st_as(1001, 1000, -1, pf) == -EACCES);
     CHECK("gate-group-sup-denied", st_as(1001, 1001, 1000, pf) == -EACCES);
+    // 覚えた親のディレクトリから先だけを引くときも: root が p/s/a を引いて p と p/s を覚えたあと、p を通れない人は
+    // p/s のまだ引いていない名前でも EACCES、通れる人には ENOENT とあるもの
+    char s_[512], sa[512], sb[512];
+    snprintf(s_, sizeof s_, "%s/p/s", base); snprintf(sa, sizeof sa, "%s/p/s/a", base); snprintf(sb, sizeof sb, "%s/p/s/b", base);
+    chmod(p, 0700); mkdir(s_, 0755); touch(sa);
+    CHECK("gate-parent-root", st(sa, 0) == 0);
+    CHECK("gate-parent-other", st_as(1001, 1001, -1, sb) == -EACCES);
+    CHECK("gate-parent-owner-missing", st_as(1000, 1000, -1, sb) == -ENOENT);
+    touch(sb);
+    CHECK("gate-parent-other-new", st_as(1001, 1001, -1, sb) == -EACCES);
+    CHECK("gate-parent-owner-new", st_as(1000, 1000, -1, sb) == 0);
+    unlink(sa); unlink(sb); rmdir(s_);
     unlink(pf); rmdir(p);
+  }
+  // リンクのディレクトリを覚えたあとの、その中の名前 (リンクの先を親として、そこから引く)
+  {
+    char ld[512], ll[512], lx[512], ly[512], le[512];
+    snprintf(ld, sizeof ld, "%s/ld", base); snprintf(ll, sizeof ll, "%s/ll", base); snprintf(lx, sizeof lx, "%s/ll/x", base);
+    snprintf(ly, sizeof ly, "%s/ll/y", base); snprintf(le, sizeof le, "%s/le", base);
+    mkdir(ld, 0755); symlink("ld", ll);
+    char ldx[600]; snprintf(ldx, sizeof ldx, "%s/x", ld); touch(ldx);
+    CHECK("link-dir", st(ll, 0) == 0);
+    CHECK("link-parent", st(lx, 0) == 0);
+    CHECK("link-parent-missing", miss3(ly));
+    char ldy[600]; snprintf(ldy, sizeof ldy, "%s/y", ld); touch(ldy);
+    CHECK("link-parent-new", st(ly, 0) == 0);
+    rename(ld, le);
+    CHECK("link-parent-renamed", st(lx, 0) == -ENOENT);
+    rename(le, ld);
+    CHECK("link-parent-back", st(lx, 0) == 0);
+    unlink(ldx); unlink(ldy); unlink(ll); rmdir(ld);
   }
   // 開いたまま消したものは、消したあと名前では引けない
   int fd = open(f1, O_RDONLY);
