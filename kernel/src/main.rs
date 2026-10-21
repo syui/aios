@@ -33,6 +33,7 @@ mod futex;
 mod irq;
 mod heap;
 mod tlsf;
+mod mem;
 mod initrd;
 mod kalloc;
 mod memlayout;

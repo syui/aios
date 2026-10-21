@@ -86,7 +86,7 @@ fn intr_restore(daif: u64) {
     }
 }
 
-/// lockbench (/proc/ai/ctl): ロックの部品ごとの 1 回の時間を kmsg に (どれも 10 万回の平均)。
+/// lockbench (/proc/ai/ctl): ロックの部品ごとの 1 回の時間を kmsg に (どれも 10 万回の平均。memcpy と memset は 1000 回と 1 万回)。
 /// 大きなロックを持って呼ぶ (それを放して取りなおすものも測る)
 pub fn bench() {
     use core::hint::black_box;
@@ -140,9 +140,33 @@ pub fn bench() {
         }
     }
     let pages = (cnt() - t0) as f64 * 1e9 / crate::timer::freq() as f64 / got.max(1) as f64;
+    // memcpy と memset (mem.S): 64 KiB を写す (ソケットやパイプの 1 回の書き読みの大きさ。src が 1 バイトずれたものも)、
+    // 4 KiB を 0 にする (ページを 0 にする)。1 回あたり
+    let per = |t: u64, k: u64| t as f64 * 1e9 / crate::timer::freq() as f64 / k as f64;
+    let mut src = alloc::vec![1u8; 64 * 1024 + 64];
+    let mut dst = alloc::vec![0u8; 64 * 1024 + 64];
+    let k = 1000;
+    let t0 = cnt();
+    for _ in 0..k {
+        dst[..64 * 1024].copy_from_slice(black_box(&src[..64 * 1024]));
+        black_box(&mut dst);
+    }
+    let copy = per(cnt() - t0, k);
+    let t0 = cnt();
+    for _ in 0..k {
+        dst[..64 * 1024].copy_from_slice(black_box(&src[1..64 * 1024 + 1]));
+        black_box(&mut dst);
+    }
+    let copy_odd = per(cnt() - t0, k);
+    let k = 10_000;
+    let t0 = cnt();
+    for _ in 0..k {
+        black_box(&mut src)[..4096].fill(0);
+    }
+    let zero = per(cnt() - t0, k);
     let bkl = crate::smp::bench_bkl();
     crate::println!(
-        "lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns, page alloc+free {:.1} ns, page 1024 alloc+free {:.1} ns",
-        lock, heap, bkl, clock, page, pages
+        "lockbench: SpinLock lock+unlock {:.1} ns, heap alloc+free {:.1} ns, BKL unlock+lock {:.1} ns, uptime_ns {:.1} ns, page alloc+free {:.1} ns, page 1024 alloc+free {:.1} ns, memcpy 64KiB {:.1} ns, memcpy 64KiB src+1 {:.1} ns, memset0 4KiB {:.1} ns",
+        lock, heap, bkl, clock, page, pages, copy, copy_odd, zero
     );
 }

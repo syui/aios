@@ -115,6 +115,10 @@ jobs:
         # カーネルの C のテスト (test/*.c) を静的なプログラムに (arm64 の Ubuntu の gcc)。VM test で中から取って動かす
         run: sh test/vm-ctests.sh build gcc
 
+      - name: mem.S test
+        # カーネルの memcpy / memmove / memset (kernel/src/mem.S) を、長さとずれと重なりのすべてで libc のものとくらべる
+        run: sh test/mem.sh gcc
+
       - name: VM test
         run: |
           # GICv2 で起こしてプロンプトまで待ち、中で短いたしかめ (test/vm-check.sh: /sys と /proc、

@@ -8,6 +8,7 @@
   {"name": "heap", "type": "core", "src": "src/heap.rs", "what": "カーネルヒープ: bss 上の固定領域 (とメモリに合わせて足したもの) を切り分ける。ロック、使っている量、どこで取ったか (heap trace)", "bench": "kernel/src/spinlock.rs (lockbench の heap alloc+free)。足りないときは、まだ使っていないページを足し、ページキャッシュを捨て、耐えるところ (heap::fallible: read/write の入れ物など) には null で ENOMEM、耐えないところには予備 (2 MiB) から渡して oom.rs に空けてもらう (前は panic だった)"},
   {"name": "oom", "type": "core", "src": "src/oom.rs", "what": "メモリが足りないとき: ヒープが予備にまで手をつけたら、次のシステムコールの入り口で、いちばんメモリ (rss) を持っているプロセスを SIGKILL で終わらせて空ける (Linux の OOM killer と同じ考え)。init は殺さない。空きが戻れば戻る"},
   {"name": "tlsf", "type": "core", "src": "src/tlsf.rs", "what": "ヒープの空きの管理 (TLSF): 大きさのクラスごとのリストとビット、となりとつなげる境界の印。取るのも返すのも O(1)。test/heap.py が確かめる"},
+  {"name": "mem", "type": "core", "src": "src/mem.rs", "what": "memcpy / memmove / memset (mem.S): Linux の arch/arm64/lib と同じく ldp / stp で 64 バイトずつ、はしは前と後ろから重ねて、0 で埋める長いものは DC ZVA。test/mem.sh が libc のものとくらべる", "bench": "kernel/src/spinlock.rs (lockbench の memcpy 64KiB、memcpy 64KiB src+1、memset0 4KiB)"},
   {"name": "vm", "type": "core", "src": "src/vm.rs", "what": "ユーザー空間 (TTBR0, 4KiB granule, 39bit VA, L1-L3) とデマンドページング。ファイルのページは 1 枚: ファイルシステムが持つページ (Inode::page_frame) を read / write / mmap (MAP_SHARED も MAP_PRIVATE も) がみな見る (Linux のページキャッシュと同じ)。写しの終わりの先は SIGBUS、切りつめたところは写しから外す"},
   {"name": "trap", "type": "core", "src": "src/trap.rs", "what": "例外ベクタ (VBAR_EL1) とトラップ処理"},
   {"name": "irq", "type": "core", "src": "src/irq.rs", "what": "割り込みコントローラ (GICv2、GICv3、BCM2836)。DTB を見て選ぶ"},
