@@ -70,6 +70,11 @@ t sudo sudo -n true
 # (大きなロックなしで読み書きし、起こすのは持っている CPU に頼む) が止まらずに終わること
 t lockbench sh -c 'seq 1 300000 | cat | wc -l > /tmp/lockbench.n & echo lockbench > /proc/ai/ctl; wait; [ "$(tr -d " " < /tmp/lockbench.n)" = 300000 ] && grep -q "lockbench: SpinLock" /proc/kmsg'
 
+# 大きなロックなしの速い道 (syscall::fast の splice と read) が、ほかの CPU で大きなロックを持って動くもの (ls、stat) と
+# ぶつからないこと。前は uutils の cat の splice (ファイル → パイプ) が ext4 の inode の覚えをロックなしで借りて、
+# 4 つの CPU で "already borrowed" のパニックになった (カーネルが止まれば、このスクリプトはおしまいまで来ない)
+t fast-smp sh -c 'for j in 1 2 3; do for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do (ls -l /usr/bin > /dev/null; cat /etc/os-release /usr/bin/ls > /dev/null; stat /etc/passwd > /dev/null) & done; wait; done'
+
 # カーネルのヒープ (tlsf.rs) の決まりが、ここまでのたしかめのあとも守られているか (heap check の答えは kmsg に)
 t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
 # /proc/ai/mem と /proc/ai/fs: 1 行の JSON で、ページキャッシュとヒープ、マウントとパスの覚えがある (aish の mem と fs)

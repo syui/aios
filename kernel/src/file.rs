@@ -1273,7 +1273,10 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
             Some(k as i64)
         }
         (Kind::Inode(ino, _), Kind::PipeWrite(p)) => {
-            if !ino.page_cacheable() || ino.meta().mode & S_IFMT != vfs::S_IFREG || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+            // ino.meta() は見ない: inode の中身は大きなロックで守られている (ほかの CPU が書いているかもしれない)。
+            // ページキャッシュにはふつうのファイルのページしか入らない (vm::read_cached と mmap) ので、ディレクトリなどは
+            // with_cached が None でふつうの道へ (fast_pread と同じ)
+            if !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)
