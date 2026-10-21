@@ -432,6 +432,11 @@ fn read_wrapped<T>(flags: u32, f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// 書く: DONTCACHE の区間で f を (書いたページをページキャッシュに残さない: vm::file_written。Linux は書き出したあとに捨てる)
+fn write_wrapped<T>(flags: u32, f: impl FnOnce() -> T) -> T {
+    if flags & RWF_DONTCACHE != 0 { proc::dontcache(f) } else { f() }
+}
+
 /// ページキャッシュを通すふつうのファイルなら、その inode
 fn cached_inode(f: &FileRef) -> Option<InodeRef> {
     match &f.borrow().kind {
@@ -844,22 +849,25 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     } else {
         None
     };
-    let mut done: usize = 0;
-    for (base, len) in v {
-        if len == 0 {
-            continue;
-        }
-        match write_flags(fd, base, len, flags & !(RWF_DSYNC | RWF_SYNC), append) {
-            Ok(n) => {
-                done += n as usize;
-                if (n as usize) < len {
-                    break;
-                }
+    let done = write_wrapped(flags, || {
+        let mut done: usize = 0;
+        for (base, len) in v {
+            if len == 0 {
+                continue;
             }
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
+            match write_flags(fd, base, len, flags & !(RWF_DSYNC | RWF_SYNC), append) {
+                Ok(n) => {
+                    done += n as usize;
+                    if (n as usize) < len {
+                        break;
+                    }
+                }
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
         }
-    }
+        Ok(done)
+    })?;
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
         vfs::sync_all();
     }
@@ -917,22 +925,25 @@ pub fn pwritev2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
         Some((i, _)) if flags & RWF_APPEND != 0 => i.meta().size as i64,
         _ => off,
     };
-    let mut done: usize = 0;
-    for (base, len) in v {
-        if len == 0 {
-            continue;
-        }
-        match pwrite_flags(fd, base, len, off + done as i64, flags & !(RWF_DSYNC | RWF_SYNC)) {
-            Ok(n) => {
-                done += n as usize;
-                if (n as usize) < len {
-                    break;
-                }
+    let done = write_wrapped(flags, || {
+        let mut done: usize = 0;
+        for (base, len) in v {
+            if len == 0 {
+                continue;
             }
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
+            match pwrite_flags(fd, base, len, off + done as i64, flags & !(RWF_DSYNC | RWF_SYNC)) {
+                Ok(n) => {
+                    done += n as usize;
+                    if (n as usize) < len {
+                        break;
+                    }
+                }
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
         }
-    }
+        Ok(done)
+    })?;
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
         vfs::sync_all();
     }

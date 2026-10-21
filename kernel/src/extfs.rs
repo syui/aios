@@ -2107,7 +2107,9 @@ impl ExtFs {
         Ok(len)
     }
 
-    fn write_data(&self, ino: u32, r: &mut Raw, off: usize, buf: &[u8]) -> Result<usize, i64> {
+    /// pages があれば、書いたブロックの (ファイルのブロックの番号, ブロック, ページ) を入れる (参照をひとつ足して:
+    /// ページキャッシュに入れる。vm::file_written)
+    fn write_data(&self, ino: u32, r: &mut Raw, off: usize, buf: &[u8], mut pages: Option<&mut Vec<(u64, u64, *mut u8)>>) -> Result<usize, i64> {
         let mut done = 0;
         // 終わりの先から書く: 終わりとのあいだ (終わりのブロックの中) を 0 に (写しで書いたものがあれば消える)
         if off > r.size() as usize && !buf.is_empty() {
@@ -2127,7 +2129,14 @@ impl ExtFs {
                 }
                 Err(e) => return Err(e),
             };
-            self.modify_data_block_adopt(b, fresh, Some((ino, fb)), |d| d[bo..bo + n].copy_from_slice(&buf[done..done + n]))?;
+            let p = self.modify_data_block_adopt(b, fresh, Some((ino, fb)), |d| {
+                d[bo..bo + n].copy_from_slice(&buf[done..done + n]);
+                d.as_mut_ptr()
+            })?;
+            if let Some(v) = pages.as_deref_mut() {
+                kalloc::get(p);
+                v.push((fb, b, p));
+            }
             done += n;
         }
         if (off + done) as u64 > r.size() {
@@ -2620,7 +2629,7 @@ impl ExtInode {
                 fs.add_links(self.ino, 1)?;
             }
             NewNode::Symlink(t) if long_link => {
-                fs.write_data(ino, &mut r, 0, t.as_bytes())?;
+                fs.write_data(ino, &mut r, 0, t.as_bytes(), None)?;
                 fs.write_inode(ino, &r)?;
             }
             _ => {}
@@ -2954,8 +2963,18 @@ impl Inode for ExtInode {
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
         let _p = crate::prof::span("extfs:write");
-        // 中身が変わる: ページキャッシュ (vm.rs) にある分を、書く前と後に捨てる (書いているあいだに読まれたものも)
-        crate::vm::file_changed(self.id());
+        // 中身が変わる。ブロックが 1 ページなら、ページキャッシュ (vm.rs) のページはブロックのキャッシュのページそのもので、
+        // その場で書きかわる: そのまま版をあたらしくし、書いたページも入れる (Linux と同じく、書いたものはページキャッシュに
+        // ある)。でなければ (読んだ写し)、書く前と後に捨てる (書いているあいだに読まれたものも)
+        let id = self.id();
+        let in_place = self.fs.bsize == PGSIZE;
+        if in_place {
+            crate::vm::file_writing(id);
+        } else {
+            crate::vm::file_changed(id);
+        }
+        let mut pages = Vec::new();
+        let mut size0 = 0;
         let r = self.not_swapfile().and_then(|_| self.write_op(|| {
             let mut r = self.raw()?;
             match r.mode() & S_IFMT {
@@ -2963,11 +2982,33 @@ impl Inode for ExtInode {
                 S_IFDIR => return Err(-EISDIR),
                 _ => return Err(-EINVAL),
             }
-            let res = self.fs.write_data(self.ino, &mut r, off, buf);
+            size0 = r.size() as usize;
+            let res = self.fs.write_data(self.ino, &mut r, off, buf, in_place.then_some(&mut pages));
             self.fs.write_inode(self.ino, &r)?;
             res
         }));
-        crate::vm::file_changed(self.id());
+        if in_place {
+            // まだブロックのキャッシュのページそのものか (書いたあとの flush のあいだに捨てられていないか)
+            let pages: Vec<(usize, *mut u8)> = {
+                let c = self.fs.cache.borrow();
+                pages
+                    .into_iter()
+                    .filter_map(|(lb, b, p)| {
+                        if c.map.get(&b) == Some(&p) {
+                            Some((lb as usize, p))
+                        } else {
+                            kalloc::put(p);
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            // 書きかわったところ: 終わりの先から書いたなら、もとの終わりから (zero_gap が 0 にする)
+            let (first, end) = (off.min(size0) / PGSIZE, (off + buf.len()).div_ceil(PGSIZE));
+            crate::vm::file_written(id, crate::vm::meta_ver(&self.meta()), first, end.saturating_sub(1), pages);
+        } else {
+            crate::vm::file_changed(id);
+        }
         r
     }
 

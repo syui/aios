@@ -154,13 +154,50 @@ pub fn drop_file_pages(id: (usize, u64), first: usize, last: usize) {
 // 動かしても、ファイルを読みなおさない。ファイルが変わったら (更新時刻か大きさ) 読みなおす。
 // 表も 1 つ参照を持つ。priv_max をこえたら、だれも写していないもの (参照が表だけ) から捨てる。
 // 大きなロックなしのページフォルト (fast_fault) も読むので、表はスピンロックで守る。そちらはファイルに
-// さわれないので、領域を写したときの版 (Backing::File の ver) と同じ版のページだけを使う
+// さわれないので、領域を写したときの版 (Backing::File の ver) と同じ版のファイルのページだけを使う。
+// 版はファイルに 1 つ (Linux の i_size と同じ: 書いて伸びても、ページごとに書きなおさない)
 
 struct PrivPage {
     page: *mut u8,
-    ver: (u64, u64),
     /// ファイルシステムのページそのもの (ファイルシステムも 1 つ参照を持つ)。でなければ読んだ写し
     owned: bool,
+    /// 命令キャッシュをあわせた (sync_icache)。実行できるように写すときに一度 (Linux の PG_dcache_clean)。
+    /// 読むだけのページ (read のページキャッシュ) はしない
+    synced: bool,
+}
+
+struct PageCache {
+    pages: BTreeMap<FileKey, PrivPage>,
+    /// ファイルごとの版 (更新時刻と大きさ)。表にあるそのファイルのページは、みなこの版のいまの中身
+    vers: BTreeMap<(usize, u64), (u64, u64)>,
+}
+
+impl PageCache {
+    /// key のページ (ファイルの版が ver のとき)
+    fn get_mut(&mut self, key: &FileKey, ver: (u64, u64)) -> Option<&mut PrivPage> {
+        if self.vers.get(&(key.0, key.1)) != Some(&ver) {
+            return None;
+        }
+        self.pages.get_mut(key)
+    }
+
+    /// ページを外したあとに: ファイルのページがもうなければ、版も
+    fn forget_if_empty(&mut self, id: (usize, u64)) {
+        if self.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_none() {
+            self.vers.remove(&id);
+        }
+    }
+
+    /// ファイル id のページをみな外す (参照は呼んだほうが返す)
+    fn remove_file(&mut self, id: (usize, u64), freed: &mut Vec<*mut u8>) {
+        let keys: Vec<FileKey> = self.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(p) = self.pages.remove(&k) {
+                freed.push(p.page);
+            }
+        }
+        self.vers.remove(&id);
+    }
 }
 
 impl PrivPage {
@@ -194,11 +231,11 @@ fn heap_crowded() -> bool {
 /// しばらく (priv_max / 8 枚ふえるまで) なめない: 読みこむたびに表をなめると、それだけで重い
 static NEXT_SHRINK: AtomicUsize = AtomicUsize::new(0);
 
-static PRIV: SpinLock<BTreeMap<FileKey, PrivPage>> = SpinLock::new(BTreeMap::new());
+static PRIV: SpinLock<PageCache> = SpinLock::new(PageCache { pages: BTreeMap::new(), vers: BTreeMap::new() });
 
 /// ページキャッシュのページの数 (/proc/meminfo の Cached)
 pub fn cached_pages() -> usize {
-    PRIV.lock().len()
+    PRIV.lock().pages.len()
 }
 
 /// shrink_cache で捨てたページの数
@@ -212,19 +249,19 @@ pub fn page_cache_json() -> alloc::string::String {
     let total = {
         let c = PRIV.lock();
         // 鍵は (fs, ino, ページ) の順なので、同じファイルは並ぶ
-        for (k, _) in c.iter() {
+        for (k, _) in c.pages.iter() {
             match files.last_mut() {
                 Some((id, n)) if *id == (k.0, k.1) => *n += 1,
                 _ => files.push(((k.0, k.1), 1)),
             }
         }
-        c.len()
+        c.pages.len()
     };
     files.sort_by_key(|(_, n)| core::cmp::Reverse(*n));
     files.truncate(20);
     let mut list = Vec::new();
     for ((fs, ino), n) in files {
-        let size = PRIV.lock().range((fs, ino, 0)..=(fs, ino, usize::MAX)).next().map_or(0, |(_, p)| p.ver.1);
+        let size = PRIV.lock().vers.get(&(fs, ino)).map_or(0, |v| v.1);
         let name = crate::vfs::path_of_id((fs, ino)).map_or(alloc::string::String::new(), |p| format!(",\"name\":\"{}\"", crate::aiproc::esc(&p)));
         list.push(format!("{{\"fs\":{},\"ino\":{},\"pages\":{},\"size\":{}{}}}", fs, ino, n, size, name));
     }
@@ -251,12 +288,13 @@ pub fn uncache(ino: &InodeRef, off: usize, len: usize) {
         return;
     }
     let mut c = PRIV.lock();
-    let keys: Vec<FileKey> = c.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| p.idle()).map(|(k, _)| *k).collect();
+    let keys: Vec<FileKey> = c.pages.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| p.idle()).map(|(k, _)| *k).collect();
     for k in keys {
-        if let Some(p) = c.remove(&k) {
+        if let Some(p) = c.pages.remove(&k) {
             kalloc::put(p.page);
         }
     }
+    c.forget_if_empty(id);
     drop(c);
     // 穴の 0 のページも、だれも写していなければ (参照が表だけ)
     let holes: Vec<FileKey> = shared_file().range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, s)| s.hole && kalloc::refs(s.page) <= 1).map(|(k, _)| *k).collect();
@@ -272,10 +310,16 @@ pub fn shrink_cache(n: usize) -> usize {
     let mut freed = Vec::new();
     {
         let mut c = PRIV.lock();
-        let victims: Vec<FileKey> = c.iter().filter(|(_, p)| p.idle()).map(|(k, _)| *k).take(n).collect();
+        let victims: Vec<FileKey> = c.pages.iter().filter(|(_, p)| p.idle()).map(|(k, _)| *k).take(n).collect();
         for k in &victims {
-            if let Some(p) = c.remove(k) {
+            if let Some(p) = c.pages.remove(k) {
                 freed.push(p.page);
+            }
+        }
+        // 鍵の順なので、同じファイルは並ぶ
+        for (i, k) in victims.iter().enumerate() {
+            if victims.get(i + 1).is_none_or(|n| (n.0, n.1) != (k.0, k.1)) {
+                c.forget_if_empty((k.0, k.1));
             }
         }
     }
@@ -294,14 +338,15 @@ pub fn shrink_cache_try(n: usize) -> usize {
     let mut from: Option<FileKey> = None;
     while freed < n {
         let next = match from {
-            None => c.iter().find(|(_, p)| p.idle()).map(|(k, _)| *k),
-            Some(k) => c.range(k..).find(|(_, p)| p.idle()).map(|(k, _)| *k),
+            None => c.pages.iter().find(|(_, p)| p.idle()).map(|(k, _)| *k),
+            Some(k) => c.pages.range(k..).find(|(_, p)| p.idle()).map(|(k, _)| *k),
         };
         let Some(k) = next else { break };
-        if let Some(p) = c.remove(&k) {
+        if let Some(p) = c.pages.remove(&k) {
             kalloc::put(p.page);
             freed += 1;
         }
+        c.forget_if_empty((k.0, k.1));
         from = Some(k);
     }
     SHRUNK.fetch_add(freed, Ordering::Relaxed);
@@ -317,18 +362,93 @@ static CHANGES: AtomicUsize = AtomicUsize::new(0);
 pub fn file_changed(id: (usize, u64)) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
     let mut freed = Vec::new();
+    PRIV.lock().remove_file(id, &mut freed);
+    for p in freed {
+        kalloc::put(p);
+    }
+}
+
+/// ファイルシステムが id に書く前に (file_written とくみで。表にあるそのファイルのページが、みなファイルシステムの
+/// ページそのもの (owned) で、その場で書きかえるとき: ext4)。いま読みこんでいるものは表に入れない
+pub fn file_writing(_id: (usize, u64)) {
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// ファイルシステムが id のページ [first, last] に書いた (file_writing のあと): 表にあるそのファイルのページはそのまま
+/// (その場で書きかわった)、版を ver (書いたあとの更新時刻と大きさ) に。pages (書いたページの (番号, ファイルシステムの
+/// ページ)。参照をひとつずつ持ったもの) も表に入れる: Linux と同じく、書いたものはページキャッシュにある (書いて
+/// すぐ読むとき、ファイルシステムを引きなおさない)。表がいっぱいか、RWF_DONTCACHE なら入れない
+pub fn file_written(id: (usize, u64), ver: (u64, u64), first: usize, last: usize, pages: Vec<(usize, *mut u8)>) {
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+    let room = !pages.is_empty() && !crate::proc::dontcache_on() && make_room();
+    let max = priv_max();
+    let mut freed = Vec::new();
     {
         let mut c = PRIV.lock();
-        let keys: Vec<FileKey> = c.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).map(|(k, _)| *k).collect();
-        for k in keys {
-            if let Some(p) = c.remove(&k) {
-                freed.push(p.page);
+        // 書きかわったページは、実行するときに命令キャッシュをあわせなおす
+        if first <= last {
+            for (_, p) in c.pages.range_mut((id.0, id.1, first)..=(id.0, id.1, last)) {
+                p.synced = false;
             }
+        }
+        let have = c.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_some();
+        if have || room {
+            c.vers.insert(id, ver);
+        }
+        for (index, page) in pages {
+            let key = (id.0, id.1, index);
+            if !room || c.pages.len() >= max || heap_crowded() {
+                if !c.pages.get(&key).is_some_and(|p| p.page == page) {
+                    // 表に入れられない。前の版のページが残っていたら (ないはず) それも
+                    if let Some(o) = c.pages.remove(&key) {
+                        freed.push(o.page);
+                    }
+                }
+                freed.push(page);
+                continue;
+            }
+            if let Some(o) = c.pages.insert(key, PrivPage { page, owned: true, synced: false }) {
+                freed.push(o.page);
+            }
+        }
+        if !have {
+            c.forget_if_empty(id);
         }
     }
     for p in freed {
         kalloc::put(p);
     }
+    // RWF_DONTCACHE: 書いたところのページは、だれも写していなければ外す (Linux は書き出したあとに捨てる。pages の参照を
+    // 返したあとで: 返す前はだれかが持っているように見える)
+    if crate::proc::dontcache_on() && first <= last {
+        let mut c = PRIV.lock();
+        let keys: Vec<FileKey> = c.pages.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| p.idle()).map(|(k, _)| *k).collect();
+        let mut gone = Vec::new();
+        for k in keys {
+            if let Some(p) = c.pages.remove(&k) {
+                gone.push(p.page);
+            }
+        }
+        c.forget_if_empty(id);
+        drop(c);
+        for p in gone {
+            kalloc::put(p);
+        }
+    }
+}
+
+/// 表に入れる前に: 上限をこえていたら、だれも写していないものを捨てる。ヒープが混んでいて入れられなければ false
+fn make_room() -> bool {
+    let max = priv_max();
+    if PRIV.lock().pages.len() >= max.max(NEXT_SHRINK.load(Ordering::Relaxed)) {
+        shrink_cache(max / 8);
+        NEXT_SHRINK.store(PRIV.lock().pages.len() + max / 8, Ordering::Relaxed);
+    }
+    // ヒープが混んでいたら、写されていないものを捨てる。それでも混んでいれば表に入れない
+    if heap_crowded() {
+        shrink_cache(max / 8);
+    }
+    !heap_crowded()
 }
 
 /// ページキャッシュを通して読む (大きなロックを持って。ino は page_cacheable なもの)。ふつうのファイルでなければ
@@ -349,7 +469,7 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
         let pos = off + done;
         let po = pos % PGSIZE;
         let k = (PGSIZE - po).min(n - done);
-        match file_page(ino, pos - po) {
+        match file_page(ino, pos - po, false) {
             Some(page) => {
                 unsafe { core::ptr::copy_nonoverlapping(page.add(po), buf[done..].as_mut_ptr(), k) };
                 kalloc::put(page);
@@ -371,10 +491,10 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
 
 /// 大きなロックなしで、ページキャッシュから読む (syscall::fast の read)。ファイル id の off から len バイトの
 /// ページが全部表にあり、ユーザーのページも写っているときだけ Some(読んだ数)。表にあるページはいまの中身で
-/// (書くとかならず捨てる: file_changed)、記録した大きさもいまの大きさ
+/// (書けばその場で書きかわる (file_written) か捨てる (file_changed))、記録した大きさもいまの大きさ
 pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: usize) -> Option<usize> {
     let c = PRIV.lock();
-    let size = c.get(&(id.0, id.1, off / PGSIZE))?.ver.1 as usize;
+    let size = c.vers.get(&id)?.1 as usize;
     if off >= size {
         return Some(0);
     }
@@ -384,7 +504,7 @@ pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: u
         let pos = off + done;
         let po = pos % PGSIZE;
         let k = (PGSIZE - po).min(n - done);
-        let p = c.get(&(id.0, id.1, pos / PGSIZE))?;
+        let p = c.pages.get(&(id.0, id.1, pos / PGSIZE))?;
         let src = unsafe { core::slice::from_raw_parts(p.page.add(po), k) };
         if !pt.copy_out_nofault(va + done, src) {
             return None;
@@ -399,7 +519,7 @@ pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: u
 /// f(ページの切れはしの並び) を呼ぶ。f が false なら None。ファイルの終わりより先なら Some(0)
 pub fn with_cached(id: (usize, u64), off: usize, len: usize, f: impl FnOnce(&[&[u8]]) -> bool) -> Option<usize> {
     let c = PRIV.lock();
-    let size = c.get(&(id.0, id.1, off / PGSIZE))?.ver.1 as usize;
+    let size = c.vers.get(&id)?.1 as usize;
     if off >= size {
         return Some(0);
     }
@@ -410,24 +530,32 @@ pub fn with_cached(id: (usize, u64), off: usize, len: usize, f: impl FnOnce(&[&[
         let pos = off + done;
         let po = pos % PGSIZE;
         let k = (PGSIZE - po).min(n - done);
-        let p = c.get(&(id.0, id.1, pos / PGSIZE))?;
+        let p = c.pages.get(&(id.0, id.1, pos / PGSIZE))?;
         parts.push(unsafe { core::slice::from_raw_parts(p.page.add(po), k) });
         done += k;
     }
     if f(&parts) { Some(n) } else { None }
 }
 
-/// 表にある、版が ver のページ (参照をひとつ足して)。ロックなしでも呼べる
-fn cached_page(key: &FileKey, ver: (u64, u64)) -> Option<*mut u8> {
-    let c = PRIV.lock();
-    let p = c.get(key).filter(|p| p.ver == ver)?;
+/// 表にある、版が ver のページ (参照をひとつ足して)。exec (実行できるように写す) なら命令キャッシュもあわせて。
+/// ロックなしでも呼べる
+fn cached_page(key: &FileKey, ver: (u64, u64), exec: bool) -> Option<*mut u8> {
+    let mut c = PRIV.lock();
+    let p = c.get_mut(key, ver)?;
+    if exec && !p.synced {
+        sync_icache(p.page as usize, PGSIZE);
+        p.synced = true;
+    }
     kalloc::get(p.page);
     Some(p.page)
 }
 
 /// ファイルの版 (更新時刻と大きさ)
 pub fn file_ver(ino: &InodeRef) -> (u64, u64) {
-    let m = ino.meta();
+    meta_ver(&ino.meta())
+}
+
+pub fn meta_ver(m: &crate::vfs::Meta) -> (u64, u64) {
     (m.mtime, m.size)
 }
 
@@ -436,13 +564,14 @@ pub fn file_ver(ino: &InodeRef) -> (u64, u64) {
 /// 調べもの用: ページキャッシュに無かったものをシリアルに出す (/proc/strace に "pcmiss")
 pub static MISS_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
+/// exec なら、実行できるように写すページ (命令キャッシュもあわせる)
+fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     if foff % PGSIZE != 0 {
         return None;
     }
     let ver = file_ver(ino);
     let key = file_key(ino, foff);
-    if let Some(p) = cached_page(&key, ver) {
+    if let Some(p) = cached_page(&key, ver, exec) {
         return Some(p);
     }
     // ディスクを読まない区間 (RWF_NOWAIT): 写しの表にある (穴の 0 のページか、写しているページ) ものだけ。なければ、
@@ -464,8 +593,8 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     let _miss = Miss(t0);
     if MISS_LOG.load(Ordering::Relaxed) {
         let c = PRIV.lock();
-        let have = c.get(&key).map(|p| p.ver);
-        let n = c.len();
+        let have = c.pages.get(&key).and(c.vers.get(&ino.id()).copied());
+        let n = c.pages.len();
         drop(c);
         crate::println!("pcmiss ino {:?} off {:#x} ver {:?} had {:?} n {}", ino.id(), foff, ver, have, n);
     }
@@ -474,7 +603,7 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
     // ページで持たないものなら読んだ写し
     let (page, owned) = match ino.page_frame(foff, false) {
         Ok(Some(p)) => (p, true),
-        Ok(None) => return hole_page(ino, foff),
+        Ok(None) => return hole_page(ino, foff, exec),
         Err(e) if e == -crate::vfs::ENODEV => {
             let page = kalloc::alloc()?;
             let size = ver.1 as usize;
@@ -489,34 +618,41 @@ fn file_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
         }
         Err(_) => return None,
     };
-    // コードかもしれないので命令キャッシュも (表に入れるときに一度)
-    sync_icache(page as usize, PGSIZE);
-    let max = priv_max();
-    if PRIV.lock().len() >= max.max(NEXT_SHRINK.load(Ordering::Relaxed)) {
-        shrink_cache(max / 8);
-        NEXT_SHRINK.store(PRIV.lock().len() + max / 8, Ordering::Relaxed);
+    // 実行するなら命令キャッシュも (表に入れるものは、その印をつけて一度だけ)
+    if exec {
+        sync_icache(page as usize, PGSIZE);
     }
-    // ヒープが混んでいたら、写されていないものを捨てる。それでも混んでいれば表に入れない
-    if heap_crowded() {
-        shrink_cache(max / 8);
-    }
+    let room = make_room();
     // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う。
     // RWF_DONTCACHE (proc::dontcache) も、新しく読んだものは入れない
-    if CHANGES.load(Ordering::SeqCst) != changes || heap_crowded() || crate::proc::dontcache_on() {
+    if CHANGES.load(Ordering::SeqCst) != changes || !room || crate::proc::dontcache_on() {
         return Some(page);
     }
     kalloc::get(page);
-    // 古い版は外す (読んでいるあいだにほかが入れたものも)。写しているところは自分の参照を持っている
-    let old = PRIV.lock().insert(key, PrivPage { page, ver, owned });
-    if let Some(o) = old {
-        kalloc::put(o.page);
+    let mut freed = Vec::new();
+    {
+        let mut c = PRIV.lock();
+        // ファイルの版がちがう (file_changed なしで更新時刻か大きさが変わった: utimensat など): そのファイルのページは
+        // みな外して、この版で
+        let id = (key.0, key.1);
+        if c.vers.get(&id).is_some_and(|v| *v != ver) {
+            c.remove_file(id, &mut freed);
+        }
+        c.vers.insert(id, ver);
+        // ほかが先に入れたものは外す。写しているところは自分の参照を持っている
+        if let Some(o) = c.pages.insert(key, PrivPage { page, owned, synced: exec }) {
+            freed.push(o.page);
+        }
+    }
+    for p in freed {
+        kalloc::put(p);
     }
     Some(page)
 }
 
 /// 穴 (ブロックのないところ) の写しの 0 のページ: 写しの表が持つ (なければ作る)。参照をひとつ足して。
 /// ファイルシステムがそこにブロックをとるとき、このページをそのまま使う (adopt_hole) ので、書いたものが写しに映る
-fn hole_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
+fn hole_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     let key = file_key(ino, foff);
     let page = match shared_file().get(&key) {
         Some(c) => c.page,
@@ -526,6 +662,10 @@ fn hole_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
             page
         }
     };
+    // 0 のページでも、写しで書いたものかもしれない (MAP_SHARED の穴は書けないので、ないはず)
+    if exec {
+        sync_icache(page as usize, PGSIZE);
+    }
     kalloc::get(page);
     Some(page)
 }
@@ -534,6 +674,10 @@ fn hole_page(ino: &InodeRef, foff: usize) -> Option<*mut u8> {
 /// (穴なら 0 のページ、ページで持たないものなら読んだ写し) を表に入れて
 fn shared_page(ino: &InodeRef, key: &FileKey, foff: usize, exec: bool) -> Result<*mut u8, FaultErr> {
     if let Some(c) = shared_file().get(key) {
+        // ほかが実行しないで写したものかもしれない
+        if exec {
+            sync_icache(c.page as usize, PGSIZE);
+        }
         kalloc::get(c.page);
         return Ok(c.page);
     }
@@ -592,7 +736,7 @@ fn release_shared(keys: &[FileKey]) {
         if !c.hole && !c.own {
             others += 1;
         }
-        if PRIV.lock().get(k).is_some_and(|p| p.page == c.page) {
+        if PRIV.lock().pages.get(k).is_some_and(|p| p.page == c.page) {
             others += 1;
         }
         if kalloc::refs(c.page) <= others {
@@ -1222,11 +1366,19 @@ impl PageTable {
         self.split(end);
         let mut shared_at = Vec::new();
         for (&s, v) in self.vmas.range_mut(start..end) {
+            // ファイルを写したところが実行できるようになる: 写っているページの命令キャッシュをあわせる (ページキャッシュの
+            // ページは、実行できるように写すときにだけあわせている: file_page)
+            let exec_now = prot & PROT_EXEC != 0 && v.prot & PROT_EXEC == 0 && matches!(v.back, Backing::File { .. });
             v.prot = prot;
-            shared_at.push((s, v.end, v.shared));
+            shared_at.push((s, v.end, v.shared, exec_now));
         }
-        for (s, e, shared) in shared_at {
-            self.each_pte(s, e, |_, pte| unsafe { *pte = remake_pte(*pte, prot, shared) });
+        for (s, e, shared, exec_now) in shared_at {
+            self.each_pte(s, e, |_, pte| unsafe {
+                if exec_now {
+                    sync_icache(page_of(*pte) as usize, PGSIZE);
+                }
+                *pte = remake_pte(*pte, prot, shared)
+            });
         }
         // 共有のファイルのページが書けるようになった: 写っているものはもう書いたものとして扱う (書き出す印と更新時刻)。
         // 穴の 0 のページは書けないままに (書いたときにブロックをとる: fault_page)
@@ -1519,7 +1671,7 @@ impl PageTable {
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
         } else if let (false, false, false, Backing::File { ino, off, fend, .. }) = (has_page(e), write, force, &back)
             && fend.saturating_sub(page_va) >= PGSIZE
-            && let Some(page) = file_page(ino, off + (page_va - start))
+            && let Some(page) = file_page(ino, off + (page_va - start), prot & PROT_EXEC != 0)
         {
             // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
             *kind = 5;
@@ -1756,7 +1908,7 @@ impl PageTable {
             if fend.saturating_sub(page_va) < PGSIZE || foff % PGSIZE != 0 {
                 return (false, None);
             }
-            let Some(page) = cached_page(&file_key(ino, foff), *ver) else { return (false, None) };
+            let Some(page) = cached_page(&file_key(ino, foff), *ver, !write && prot & PROT_EXEC != 0) else { return (false, None) };
             if write {
                 // 書く (.data など): はじめから自分のものに写す
                 let Some(mine) = kalloc::alloc() else {

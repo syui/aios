@@ -326,6 +326,8 @@ pub fn inodes() -> (usize, usize) {
 impl Drop for TmpInode {
     fn drop(&mut self) {
         unsafe { INODES -= 1 };
+        // 写したページ (MAP_PRIVATE) がページキャッシュに残っていれば捨てる (番号はまた使わないが、残ったままになる)
+        crate::vm::file_changed((self.fs, self.ino));
     }
 }
 

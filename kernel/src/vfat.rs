@@ -433,6 +433,12 @@ impl FatFs {
         }
     }
 
+    /// dir の idx のエントリ (ファイルの番号: FatNode::id) が、なくなるか別のファイルになる: ページキャッシュ (vm.rs) に
+    /// 残っている、前のファイルのページを捨てる (同じ場所に作ったファイルが、前の中身を見ないように)
+    fn slot_changed(&self, dir: u32, idx: usize) {
+        crate::vm::file_changed((self.id, ((dir as u64) << 20) | (idx as u64 + 2)));
+    }
+
     /// dir に name のエントリ (LFN + 短い名前) を作る。短い名前のエントリの位置を返す
     fn add_entry(&self, dir: u32, name: &str, attr: u8, cluster: u32, size: u32) -> Result<usize, i64> {
         if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
@@ -833,6 +839,7 @@ impl Inode for FatNode {
             }
             _ => return Err(-EPERM), // リンクやデバイスは作れない
         };
+        self.fs.slot_changed(dir, idx);
         self.fs.flush()?;
         Ok(self.node(Some(Loc { dir, idx })))
     }
@@ -851,6 +858,7 @@ impl Inode for FatNode {
         if is_dir && !self.fs.list(cluster_of(&e))?.is_empty() {
             return Err(-ENOTEMPTY);
         }
+        self.fs.slot_changed(dir, idx);
         self.fs.remove_entries(dir, first, idx)?;
         self.fs.free_chain(cluster_of(&e))?;
         self.fs.flush()
@@ -877,12 +885,15 @@ impl Inode for FatNode {
                         return Err(-ENOTEMPTY);
                     }
                 }
+                self.fs.slot_changed(ndir, i2);
                 self.fs.remove_entries(ndir, f2, i2)?;
                 self.fs.free_chain(cluster_of(&e2))?;
             }
         }
+        self.fs.slot_changed(dir, idx);
         self.fs.remove_entries(dir, first, idx)?;
         let ni = self.fs.add_entry(ndir, new, e[11], cluster_of(&e), u32_at(&e, 28))?;
+        self.fs.slot_changed(ndir, ni);
         // 日時はそのまま
         let mut ne = self.fs.read_entry(ndir, ni)?.ok_or(-EIO)?;
         ne[13..26].copy_from_slice(&e[13..26]);
