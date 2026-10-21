@@ -1422,7 +1422,12 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                 out.from = sender_name(m, &s, u);
                 let chunk = (m.len() - skip).min(size);
                 let from = m.used + skip;
-                out.data.extend_from_slice(&m.data[from..from + chunk]);
+                // まだ何も受けていなくて、メッセージをまるごと読むなら、写さずにその入れ物を渡す (64 KiB ずつの stream の
+                // read は、送った人の入れ物 → ユーザーの 2 回だけ写す。Linux の skb → ユーザーと同じ数)。OOB のものは残す
+                let whole = !peek && out.data.is_empty() && from == 0 && chunk == m.data.len() && s.oob != Some(m.id);
+                if !whole {
+                    out.data.extend_from_slice(&m.data[from..from + chunk]);
+                }
                 if flags & MSG_PARTS != 0 {
                     out.parts.push(chunk);
                 }
@@ -1433,7 +1438,11 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                     }
                     s.inq -= chunk;
                     let m = &mut s.q[i];
-                    m.used += chunk;
+                    if whole {
+                        out.data = core::mem::take(&mut m.data);
+                    } else {
+                        m.used += chunk;
+                    }
                     let got = !m.fds.is_empty();
                     if got {
                         out.fds = m.take_fds();
