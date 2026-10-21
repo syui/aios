@@ -12,7 +12,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 pub static ON: AtomicBool = AtomicBool::new(false);
 
-const N: usize = 64;
+/// 区間の名前の数の上限 (システムコールの区間もあるので多めに。2 のべき)
+const N: usize = 256;
 
 struct Slot {
     /// 名前 (&'static str) の場所と長さ。0 は空き
@@ -111,10 +112,13 @@ impl Drop for Span {
     }
 }
 
-/// 名前の場所で表を引く (なければ空きに入れる。いっぱいなら None)
+/// 名前の場所で表を引く (なければ空きに入れる。いっぱいなら None)。場所のハッシュから順に見る (開番地法):
+/// 前は表の頭から 1 つずつ見ていたので、あとから入った名前ほど区間のたびに重く、測るものの時間がふえた
 fn slot_of(name: &'static str) -> Option<usize> {
     let p = name.as_ptr() as usize;
-    for (i, s) in SLOTS.iter().enumerate() {
+    let mut i = ((p as u64 >> 3).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - N.trailing_zeros())) as usize;
+    for _ in 0..N {
+        let s = &SLOTS[i];
         let q = s.name.load(Relaxed);
         if q == p {
             return Some(i);
@@ -122,11 +126,16 @@ fn slot_of(name: &'static str) -> Option<usize> {
         if q == 0 {
             s.len.store(name.len(), Relaxed);
             match s.name.compare_exchange(0, p, Relaxed, Relaxed) {
-                Ok(_) => return Some(i),
+                Ok(_) => {
+                    // 同時に入れようとしたほかの名前が長さを書いていても、自分のものに
+                    s.len.store(name.len(), Relaxed);
+                    return Some(i);
+                }
                 Err(q) if q == p => return Some(i),
                 Err(_) => {}
             }
         }
+        i = (i + 1) % N;
     }
     None
 }
