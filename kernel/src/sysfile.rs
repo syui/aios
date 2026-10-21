@@ -565,6 +565,15 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
         }
         return Err(-file::EPIPE);
     }
+    // ふつうのファイルは、入れ物を写す前に setuid / setgid を落とす (Linux の file_modified は generic_perform_write の
+    // 前: さわれない入れ物で EFAULT になっても落ちている。pwrite も同じ)
+    let ino = match &f.borrow().kind {
+        Kind::Inode(i, _) if len > 0 && f.borrow().writable() => Some(i.clone()),
+        _ => None,
+    };
+    if let Some(i) = ino {
+        vfs::drop_privs(&i)?;
+    }
     let mut done = 0;
     loop {
         let mut tmp = uninit((len - done).min(CHUNK))?;

@@ -3713,7 +3713,8 @@ static void exec(int i, const struct op *o) {
         long long wpos = -1;
         if (ef) {
             int wfl = (int)syscall(SYS_fcntl, fd, F_GETFL);
-            wpos = o->off >= 0 ? o->off : (wfl >= 0 && (wfl & O_APPEND)) ? (long long)st0.st_size : (long long)lseek(fd, 0, SEEK_CUR);
+            // writev は位置をとらない (o->off は pwritev2 だけのもの)
+            wpos = v2 && o->off >= 0 ? o->off : (wfl >= 0 && (wfl & O_APPEND)) ? (long long)st0.st_size : (long long)lseek(fd, 0, SEEK_CUR);
         }
         if (o->kind == READV)
             r = syscall(SYS_readv, fd, iov, cnt);
