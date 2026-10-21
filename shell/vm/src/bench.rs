@@ -41,6 +41,7 @@ const FS_OPS: &[(&str, &str)] = &[
     ("read-4k", "4 KiB 読む (ページキャッシュにある)"),
     ("readdir", "1000 こ入ったディレクトリを読む"),
     ("deep-stat", "10 段の深いパスの先を stat"),
+    ("stat-at", "開いているディレクトリから名前で stat (fstatat の dirfd。find や rm -r、ls -l)"),
     ("rename", "名前を変える"),
     ("unlink", "消す"),
     ("mkdir-rmdir", "ディレクトリを作って消す"),

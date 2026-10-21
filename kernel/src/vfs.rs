@@ -436,40 +436,73 @@ fn cross(mut i: InodeRef) -> InodeRef {
 
 /// cwd (先頭 / なし) を基準に path を絶対化し、. と .. を畳む
 pub fn normalize(cwd: &str, path: &str) -> String {
+    normal(cwd, path, false).unwrap_or_default()
+}
+
+/// normalize の中身。simple なら、path が simple (下の) でなければ None。1 つの String に足していき (.. はうしろの
+/// 要素を切る)、要素はバイトで分ける (stat や open のたびに通るので、Vec と join も、str の split もしない)
+fn normal(cwd: &str, path: &str, simple: bool) -> Option<String> {
+    // 名前のあとの .. や、最後の / と /. のあるパスは、文字の上で畳むと Linux とちがう (c/../d は c がなくても
+    // d になり、a/ は a がファイルでも通る)。"." だけも: そのディレクトリを通れること (Linux はどの名前の前にも
+    // may_lookup をする。. でも)
+    if simple && (path == "." || (path.len() > 1 && (path.ends_with('/') || path.ends_with("/.")))) {
+        return None;
+    }
     // chroot: / はプロセスのルートから始まり、.. はルートより上に出ない
     let root = crate::proc::current_root();
-    let mut parts: Vec<&str> = Vec::new();
     let base = if path.starts_with('/') { root.as_str() } else { cwd };
     let inside = !root.is_empty() && (base == root || base.starts_with(&(root.clone() + "/")));
     let floor = if inside { root.split('/').filter(|c| !c.is_empty()).count() } else { 0 };
-    for c in base.split('/').chain(path.split('/')) {
-        match c {
-            "" | "." => {}
-            ".." => {
-                if parts.len() > floor {
-                    parts.pop();
+    let mut out = String::with_capacity(base.len() + path.len() + 1);
+    let mut depth = 0;
+    for (k, part) in [base, path].into_iter().enumerate() {
+        let mut named = false;
+        for c in part.as_bytes().split(|&b| b == b'/') {
+            match c {
+                b"" | b"." => {}
+                b".." => {
+                    if simple && k == 1 && named {
+                        return None;
+                    }
+                    if depth > floor {
+                        out.truncate(out.rfind('/').unwrap_or(0));
+                        depth -= 1;
+                    }
+                }
+                c => {
+                    if !out.is_empty() {
+                        out.push('/');
+                    }
+                    // '/' で分けたところは文字の境目
+                    out.push_str(unsafe { core::str::from_utf8_unchecked(c) });
+                    depth += 1;
+                    named = true;
                 }
             }
-            c => parts.push(c),
         }
     }
-    parts.join("/")
+    Some(out)
 }
 
 /// path をたどって (正規化済みパス, inode) を返す。
 /// 途中のリンクは常に、最後のリンクは follow のときだけたどる
 pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    lookup_by(cwd, path, follow, |w, i| (w.to_string(), i.clone()))
+}
+
+/// lookup の答えを f (たどったパス, inode) で。パスのいらないもの (resolve) は、覚えのパスを写さない
+fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef) -> T) -> Result<T, i64> {
     let _p = crate::prof::span("vfs:lookup");
     if path.is_empty() {
         return Err(-ENOENT);
     }
-    // 名前のあとの .. や、最後の / と /. のあるパスは、文字の上で畳むと Linux とちがう (c/../d は c がなくても
-    // d になり、a/ は a がファイルでも通る) ので、1 つずつたどる (覚えない)
-    if !simple(path) {
+    // 文字の上で畳むと Linux とちがうパス (normal) は、1 つずつたどる (覚えない)
+    let Some(norm) = normal(cwd, path, true) else {
         let start = (resolve("", cwd, true)?, cwd.to_string());
-        return found(lookup_resolve(start, path, follow, 0, false)?);
-    }
-    let key = (current_mnt().id, normalize(cwd, path), follow);
+        let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
+        return Ok(f(&w, &i));
+    };
+    let key = PathKey::new(current_mnt().id, norm, follow);
     let cache = unsafe { &mut *(&raw mut PATHS) };
     if PATHS_ALL.swap(false, core::sync::atomic::Ordering::Relaxed) {
         let old = core::mem::take(cache);
@@ -489,7 +522,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
                 }
             }
             return match &e.found {
-                Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
+                Some((walked, ino)) => Ok(f(walked, ino)),
                 None => Err(-ENOENT),
             };
         }
@@ -504,9 +537,9 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     // 親のディレクトリを覚えていれば、そこから最後の名前だけを引く (Linux の dcache も名前ごと: 作ったばかりの
     // ファイルの stat で、ディレクトリまでを引きなおさない)。通ったディレクトリと通れるかは親の覚えから
     let mut start = None;
-    let mut rest = key.1.clone();
-    if let Some(cut) = key.1.rfind('/') {
-        if let Some(e) = cache.get_mut(&(key.0, key.1[..cut].to_string(), true))
+    let mut rest = key.path.clone();
+    if let Some(cut) = key.path.rfind('/') {
+        if let Some(e) = cache.get_mut(&PathKey::new(key.mnt, key.path[..cut].to_string(), true))
             && e.fresh()
         {
             let cred = crate::proc::current_cred_ref();
@@ -514,7 +547,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
                 if e.gates.iter().all(|g| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X).is_ok()) {
                     e.used = true;
                     start = Some((ino.clone(), walked.clone()));
-                    rest = key.1[cut + 1..].to_string();
+                    rest = key.path[cut + 1..].to_string();
                     t.dirs = e.dirs.clone();
                     t.gates = e.gates.clone();
                 }
@@ -541,11 +574,11 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         // 途中のディレクトリも (次にその中の名前を引くときは、そこから)
         for (walked, ino, d, g) in core::mem::take(&mut t.prefixes) {
             let (dirs, gates) = (t.dirs[..d].to_vec(), t.gates[..g].to_vec());
-            cache.entry((key.0, walked.clone(), true)).or_insert_with(|| PathEntry::new(Some((walked, ino)), dirs, gates));
+            cache.entry(PathKey::new(key.mnt, walked.clone(), true)).or_insert_with(|| PathEntry::new(Some((walked, ino)), dirs, gates));
         }
         cache.insert(key, PathEntry::new(r.as_ref().ok().cloned(), t.dirs, t.gates));
     }
-    r
+    r.map(|(w, i)| f(&w, &i))
 }
 
 /// パスの答えの覚え (dentry のキャッシュ): (マウントの namespace, 正規化したパス, 最後のリンクをたどるか) →
@@ -633,7 +666,35 @@ struct Trace {
     prefixes: Vec<(String, InodeRef, usize, usize)>,
 }
 
-static mut PATHS: alloc::collections::BTreeMap<(u64, String, bool), PathEntry> = alloc::collections::BTreeMap::new();
+/// 覚えの鍵: (マウントの namespace, 正規化したパス, 最後のリンクをたどるか)。並びはパスのハッシュが先 (BTreeMap が引くたびに
+/// 長いパス (前の部分が同じ) を何度もくらべないように。くらべるのは、ハッシュが同じもの 1 つだけ)
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct PathKey {
+    hash: u64,
+    mnt: u64,
+    path: String,
+    follow: bool,
+}
+
+impl PathKey {
+    fn new(mnt: u64, path: String, follow: bool) -> PathKey {
+        // 8 バイトずつ (FxHash と同じまぜかた)
+        let b = path.as_bytes();
+        let mut h = mnt.wrapping_mul(0x51_7cc1_b727_220a_95) ^ follow as u64;
+        let mut i = 0;
+        while i + 8 <= b.len() {
+            let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+            h = (h.rotate_left(5) ^ w).wrapping_mul(0x51_7cc1_b727_220a_95);
+            i += 8;
+        }
+        let mut last = [0u8; 8];
+        last[..b.len() - i].copy_from_slice(&b[i..]);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(last) ^ b.len() as u64).wrapping_mul(0x51_7cc1_b727_220a_95);
+        PathKey { hash: h, mnt, path, follow }
+    }
+}
+
+static mut PATHS: alloc::collections::BTreeMap<PathKey, PathEntry> = alloc::collections::BTreeMap::new();
 /// 版の表: (ディレクトリ, 名前の印) ごとに、その名前が変わる (作る・消す・名前を変える) たびに増やす数。印 ATTR は
 /// ディレクトリの属性 (chmod、chown) の版。覚えは、通ったところの版を持っていて、引くときにちがえば古い (Linux の
 /// dcache の d_seq のように、変わったときに覚えをみな見なおさない)。表は開番地法のハッシュ表 (キーはそのまま
@@ -770,7 +831,7 @@ pub fn forget(full: &str) {
     let mnt = current_mnt().id;
     let mut held = None;
     for follow in [true, false] {
-        if let Some(e) = cache.remove(&(mnt, full.to_string(), follow)) {
+        if let Some(e) = cache.remove(&PathKey::new(mnt, full.to_string(), follow)) {
             held = held.or(e.found.as_ref().map(|(_, i)| (i.id(), i.meta().nlink)));
         }
     }
@@ -794,7 +855,7 @@ pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
     let Some(cut) = full.rfind('/') else { return };
     let mnt = current_mnt().id;
     let full_len = cache.len();
-    let Some(pe) = cache.get_mut(&(mnt, full[..cut].to_string(), true)) else { return };
+    let Some(pe) = cache.get_mut(&PathKey::new(mnt, full[..cut].to_string(), true)) else { return };
     if !pe.found.as_ref().is_some_and(|(_, p)| p.id() == parent.id()) || !pe.fresh() || full_len >= paths_max() {
         return;
     }
@@ -806,7 +867,7 @@ pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
     if m.mode & 0o111 != 0o111 {
         gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
     }
-    cache.insert((mnt, full.to_string(), true), PathEntry::new(Some((full.to_string(), ino.clone())), dirs, gates));
+    cache.insert(PathKey::new(mnt, full.to_string(), true), PathEntry::new(Some((full.to_string(), ino.clone())), dirs, gates));
 }
 
 /// ディレクトリの中が変わった数。id で 256 の箱に分けて数える (同じ箱のほかのディレクトリで増えることもある)。
@@ -872,6 +933,9 @@ pub fn mounts_json() -> String {
 /// 開いているディレクトリ dir (パスは dir_path) から、相対の path を (openat などの dirfd)。
 /// .. があるときは、パスの文字の上で畳むので、ふつうの lookup で
 pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    if let Some(r) = cached_at(dir, dir_path, path, follow) {
+        return r;
+    }
     if !path.is_empty() && !simple(path) {
         return found(lookup_resolve((dir.clone(), dir_path.trim_matches('/').to_string()), path, follow, 0, false)?);
     }
@@ -1005,7 +1069,50 @@ pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<InodeRef, i64> {
     if path.is_empty() {
         return Ok(cross(root()));
     }
-    lookup(cwd, path, follow).map(|(_, i)| i)
+    lookup_by(cwd, path, follow, |_, i| i.clone())
+}
+
+/// lookup_at をパスの覚えから: 開いているディレクトリのパス (dir_path) の覚えが、いまもそのディレクトリ (dir) なら
+/// (名前を変えられていなければ)、dir_path/path の覚えで答える。通れるかは dir から先のディレクトリだけ (Linux も、
+/// 開いているディレクトリの上は見ない: 上が通れなくなっても引ける)。覚えになければ、上も通れる人なら、ふつうの
+/// lookup で引いて覚える (同じ答えになる)。どれでもなければ None (dir から 1 つずつたどる)
+fn cached_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Option<Result<(String, InodeRef), i64>> {
+    if path.is_empty() || path.starts_with('/') || !dir.path_cacheable() || PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let base = dir_path.trim_matches('/');
+    let norm = normal(base, path, true)?;
+    // .. で dir の外に出るものはしない (dir の上を見ない、とは言えない)
+    if !norm.starts_with(base) || (!base.is_empty() && norm.len() > base.len() && norm.as_bytes()[base.len()] != b'/') {
+        return None;
+    }
+    let mnt = current_mnt().id;
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let e0 = cache.get_mut(&PathKey::new(mnt, base.to_string(), true))?;
+    if !e0.fresh() || !e0.found.as_ref().is_some_and(|(_, i)| i.id() == dir.id()) {
+        return None;
+    }
+    let g0 = e0.gates.len();
+    let cred = crate::proc::current_cred_ref();
+    let above = e0.gates.iter().all(|g| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X).is_ok());
+    let key = PathKey::new(mnt, norm, follow);
+    if let Some(e) = cache.get_mut(&key)
+        && e.fresh()
+        && e.gates.len() >= g0
+    {
+        PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        e.used = true;
+        for g in &e.gates[g0..] {
+            if let Err(err) = cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X) {
+                return Some(Err(err));
+            }
+        }
+        return Some(match &e.found {
+            Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
+            None => Err(-ENOENT),
+        });
+    }
+    if above { Some(lookup(base, path, follow)) } else { None }
 }
 
 /// 最後の要素の親ディレクトリと名前

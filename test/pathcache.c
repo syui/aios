@@ -40,6 +40,33 @@ static int st_as(uid_t uid, gid_t gid, int sup, const char *p) {
   return -WEXITSTATUS(ws);
 }
 
+// st_as と同じく、ほかの人になった子で、開いているディレクトリ dfd から fstatat (dfd は root のうちに開いておく)
+static int at_as(uid_t uid, gid_t gid, int dfd, const char *name) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    struct stat x;
+    if (setgroups(0, 0) != 0 || setgid(gid) != 0 || setuid(uid) != 0) _exit(255);
+    for (int i = 0; i < 3; i++) if (fstatat(dfd, name, &x, 0) != 0) _exit(errno);
+    _exit(0);
+  }
+  int ws;
+  if (pid < 0 || waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws) || WEXITSTATUS(ws) == 255) return -9999;
+  return -WEXITSTATUS(ws);
+}
+
+// 3 度 fstatat して、3 度とも同じ答え (0 か -errno)。s があれば最後の答え
+static int at3(int dfd, const char *name, struct stat *s) {
+  struct stat x;
+  int r = 0;
+  for (int i = 0; i < 3; i++) {
+    int q = fstatat(dfd, name, &x, 0) == 0 ? 0 : -errno;
+    if (i > 0 && q != r) return -9999;
+    r = q;
+  }
+  if (s) *s = x;
+  return r;
+}
+
 // パスの覚えから答えた数 (aios の /proc/bkl。なければ -1)
 static long hits(void) {
   FILE *f = fopen("/proc/bkl", "r");
@@ -256,6 +283,65 @@ static void run(const char *dir) {
     rename(le, ld);
     CHECK("link-parent-back", st(lx, 0) == 0);
     unlink(ldx); unlink(ldy); unlink(ll); rmdir(ld);
+  }
+  // 開いているディレクトリから引く (fstatat の dirfd)。覚えから答えても、そのディレクトリの inode から引いたのと同じ:
+  // 名前を変えられたら (同じ名前の別のディレクトリができても) 開いているもの、中で消して作りなおしたもの、上の
+  // ディレクトリが通れない人でも引ける (Linux も開いているところより上は見ない)、自分が通れなければ EACCES
+  {
+    char fa[512], fb[512], faf[600], fbf[600], fan[600], fbn[600];
+    snprintf(fa, sizeof fa, "%s/fa", base); snprintf(fb, sizeof fb, "%s/fb", base);
+    snprintf(faf, sizeof faf, "%s/f", fa); snprintf(fbf, sizeof fbf, "%s/f", fb);
+    snprintf(fan, sizeof fan, "%s/n", fa); snprintf(fbn, sizeof fbn, "%s/n", fb);
+    mkdir(fa, 0755); touch(faf);
+    struct stat a1, a2;
+    st(fa, 0); st(faf, 0);
+    int dfd = open(fa, O_RDONLY | O_DIRECTORY);
+    CHECK("dirfd", at3(dfd, "f", &a1) == 0);
+    CHECK("dirfd-missing", at3(dfd, "n", 0) == -ENOENT);
+    touch(fan);
+    CHECK("dirfd-missing-made", at3(dfd, "n", 0) == 0);
+    unlink(fan);
+    CHECK("dirfd-unlinked", at3(dfd, "n", 0) == -ENOENT);
+    CHECK("dirfd-dot", at3(dfd, ".", &a2) == 0 && S_ISDIR(a2.st_mode));
+    CHECK("dirfd-dotdot", at3(dfd, "../fa/f", &a2) == 0 && a2.st_ino == a1.st_ino);
+    if (getuid() != 0) {
+      // 上 (base) の x を外しても、開いているところからは引ける。パスからは EACCES。自分の x を外すと EACCES
+      chmod(base, 0600);
+      CHECK("dirfd-above-shut", at3(dfd, "f", 0) == 0 && st(faf, 0) == -EACCES);
+      chmod(base, 0755);
+      chmod(fa, 0600);
+      CHECK("dirfd-self-shut", at3(dfd, "f", 0) == -EACCES);
+      chmod(fa, 0755);
+      CHECK("dirfd-self-open", at3(dfd, "f", 0) == 0);
+    }
+    // 名前を変えて、同じ名前で別のディレクトリと別の f を作る
+    rename(fa, fb);
+    mkdir(fa, 0755); touch(faf);
+    CHECK("dirfd-renamed", at3(dfd, "f", &a2) == 0 && a2.st_ino == a1.st_ino);
+    CHECK("dirfd-renamed-path", st(faf, &a2) == 0 && a2.st_ino != a1.st_ino);
+    unlink(fbf);
+    CHECK("dirfd-renamed-unlinked", at3(dfd, "f", 0) == -ENOENT);
+    touch(fbf);
+    CHECK("dirfd-renamed-made", at3(dfd, "f", 0) == 0);
+    close(dfd);
+    unlink(fbf); rmdir(fb); unlink(faf); rmdir(fa);
+    // 覚えたのは root で、引くのは上を通れない人 (root のとき): base/p (1000 の 0700) の下の d (0755) と e (1000 の 0700)
+    if (getuid() == 0) {
+      char pp[512], pd[600], pe[600], pdf[700], pef[700];
+      snprintf(pp, sizeof pp, "%s/p", base); snprintf(pd, sizeof pd, "%s/d", pp); snprintf(pe, sizeof pe, "%s/e", pp);
+      snprintf(pdf, sizeof pdf, "%s/f", pd); snprintf(pef, sizeof pef, "%s/f", pe);
+      mkdir(pp, 0700); mkdir(pd, 0755); mkdir(pe, 0700); touch(pdf); touch(pef);
+      chown(pp, 1000, 1000); chown(pe, 1000, 1000);
+      st(pd, 0); st(pdf, 0); st(pe, 0); st(pef, 0);
+      int dd = open(pd, O_RDONLY | O_DIRECTORY), de = open(pe, O_RDONLY | O_DIRECTORY);
+      CHECK("dirfd-other-path", st_as(1001, 1001, -1, pdf) == -EACCES);
+      CHECK("dirfd-other-below", at_as(1001, 1001, dd, "f") == 0);
+      CHECK("dirfd-other-missing", at_as(1001, 1001, dd, "n") == -ENOENT);
+      CHECK("dirfd-other-self", at_as(1001, 1001, de, "f") == -EACCES);
+      CHECK("dirfd-owner-self", at_as(1000, 1000, de, "f") == 0);
+      close(dd); close(de);
+      unlink(pdf); unlink(pef); rmdir(pd); rmdir(pe); rmdir(pp);
+    }
   }
   // 開いたまま消したものは、消したあと名前では引けない
   int fd = open(f1, O_RDONLY);

@@ -132,6 +132,16 @@ int main(int argc, char **argv) {
   for (i = 0; i < 2 * n; i++)
     if (stat(deep, &st) < 0) bad("deep-stat", deep);
   report("deep-stat", 2 * n, now_ms() - t);
+  // 開いているディレクトリから名前を引く (fstatat の dirfd。find、rm -r、ls -l、fts がこう引く)
+  int dfd = open(base, O_RDONLY | O_DIRECTORY);
+  t = now_ms();
+  for (i = 0; i < n; i++) {
+    char name[64];
+    snprintf(name, sizeof name, "f%ld", i);
+    if (fstatat(dfd, name, &st, 0) < 0) bad("stat-at", name);
+  }
+  report("stat-at", n, now_ms() - t);
+  if (dfd >= 0) close(dfd);
 
   // 名前を変える、消す、ディレクトリを作って消す
   t = now_ms();
