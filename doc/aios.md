@@ -179,6 +179,14 @@ tmpfs の inode は上限 (ヒープの大きさ / 1 KiB、64 MiB で 65536) で
 (vm-check の ai-heap-enomem と ai-oom)。`ctl` の `heap hog N` は N MiB をわざと取って持っておく (足す道を試す: ai-heap-grow。
 `heap hog 0` で返す)。
 
+小さいもの (ヘッダこみ 512 バイトまで) は、CPU ごとの置き場 (heap.rs の PCPU: Linux の slab の CPU ごとの freelist と
+同じ考え) から取って返す: 返されたブロックを CPU ごと・16 バイトきざみの大きさごとに 16 こまで持っておき、同じ大きさを
+取るときはヒープのロックも TLSF も通らない (lockbench の heap alloc+free は 310 → 144 ns。パスを写すたびなどに使う)。
+カーネルの中は IRQ を止めて走り (開けるのはアイドルで割り込みを待つあいだだけ)、alloc の中でほかへ切りかわらないので、
+CPU ごとのものはロックなしで触れる。大きさの組は取るときと返すときの Layout から同じに決まる。置き場にあるあいだも TLSF
+からは使っているもの (`/proc/ai/heap` の `cached`、ふつう数十 KiB)。heap trace と `fail` のあいだ、予備のブロックは通らず、
+足りなくなれば (遅い道) その CPU の分を TLSF に返してから足しにいく。
+
 足すのに要る続いたページは、物理ページのアロケータ (kernel/src/kalloc.rs) が buddy (Linux の mm/page_alloc.c と同じ考え)
 なので作れる: 空きは 2^k ページ (4 KiB から 4 MiB) のかたまりで持ち、返ってきたかたまりは、となりの同じ大きさのかたまり
 (buddy) も空いていればまとめなおす。かたまりの印 (頭のしるし、リストの次と前、大きさ) は空いているページの中ではなく、RAM の

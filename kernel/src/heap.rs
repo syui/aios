@@ -97,6 +97,8 @@ pub fn check() {
 
 /// heap trace on|off|reset
 pub fn trace(on: bool) {
+    // 置き場のブロックは取ったところの番号を持たないので、この CPU の分は返しておく (ほかの CPU の分は、使われるまで残る)
+    pcpu_drain();
     let _h = HEAP.lock();
     TRACE.store(on, Relaxed);
 }
@@ -145,7 +147,7 @@ pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
 pub fn stats_json() -> alloc::string::String {
     let (n, big, _) = HEAP.lock().stats();
     let mut s = alloc::format!(
-        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{}}}\n",
+        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{},\"cached\":{}}}\n",
         size(),
         USED.load(Relaxed),
         PEAK.load(Relaxed),
@@ -156,7 +158,8 @@ pub fn stats_json() -> alloc::string::String {
         RECLAIMS.load(Relaxed),
         RESERVE_USED.load(Relaxed),
         EMERGENCIES.load(Relaxed),
-        crate::oom::kills()
+        crate::oom::kills(),
+        cached()
     );
     if TRACE.load(Relaxed) {
         sites_json(&mut s);
@@ -244,6 +247,101 @@ fn round(n: usize) -> usize {
 /// 確保したブロックのヘッダ (1 語目は tlsf の大きさと印、2 語目は取ったところの番号)。中身はそのあと
 const HDR: usize = tlsf::ALIGN;
 
+// ---- CPU ごとの置き場 (Linux の slab の CPU ごとの freelist のように) ----
+// 小さいブロック (ヘッダこみ PCPU_MAX バイトまで) は、返されたものを CPU ごと・大きさ (16 バイトきざみ) ごとに
+// PCPU_DEPTH こまで持っておき、同じ大きさを取るときは HEAP のロックも TLSF も通らずに渡す (QEMU の TCG では取って返す
+// のが 300〜400 ns で、そのうちロック 2 回が 100 ns ほど)。カーネルの中は IRQ を止めて走り (開けるのはアイドルで
+// 割り込みを待つあいだだけ: そこで割り込まれても alloc の途中ではない)、alloc の中でほかへ切りかわることもないので、
+// CPU ごとのものはロックなしで触れる。置き場にあるあいだも TLSF からは使っている (USED にも数えたまま。/proc/ai/heap
+// の cached がその分)。大きさの組は、取るときと返すときの Layout から同じに決まる (返すときにヘッダを読まない)。
+// heap trace (TRACE) と、わざとしくじらせる (fail.rs) あいだ、予備のブロック、取ったところの番号のあるものは通らない。
+// 足りなくなったら (reclaim) 自分の CPU の分を TLSF に返す
+const PCPU_MAX: usize = 512;
+const PCPU_CLASSES: usize = PCPU_MAX / ALIGN + 1;
+const PCPU_DEPTH: usize = 16;
+
+struct Pcpu {
+    n: [u8; PCPU_CLASSES],
+    blocks: [[*mut u8; PCPU_DEPTH]; PCPU_CLASSES],
+    /// 持っているバイト (ヘッダこみの need の合計。/proc/ai/heap の cached)
+    bytes: usize,
+}
+
+static mut PCPU: [Pcpu; crate::smp::MAXCPU] =
+    [const { Pcpu { n: [0; PCPU_CLASSES], blocks: [[ptr::null_mut(); PCPU_DEPTH]; PCPU_CLASSES], bytes: 0 } }; crate::smp::MAXCPU];
+
+/// この CPU の置き場 (IRQ を止めて、とちゅうで切りかわらないところから: alloc と dealloc)
+fn pcpu() -> Option<&'static mut Pcpu> {
+    let cpu = crate::smp::id();
+    debug_assert!(irqs_masked(), "heap: per-CPU cache with IRQs open");
+    if cpu >= crate::smp::MAXCPU {
+        return None;
+    }
+    Some(unsafe { &mut (*(&raw mut PCPU))[cpu] })
+}
+
+fn irqs_masked() -> bool {
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
+    daif & (1 << 7) != 0
+}
+
+/// 置き場から need バイトのブロック (中身の頭)
+#[inline]
+fn pcpu_take(need: usize) -> Option<*mut u8> {
+    let c = need / ALIGN;
+    if c >= PCPU_CLASSES {
+        return None;
+    }
+    let pc = pcpu()?;
+    let n = pc.n[c] as usize;
+    if n == 0 {
+        return None;
+    }
+    pc.n[c] = (n - 1) as u8;
+    pc.bytes -= need;
+    Some(unsafe { pc.blocks[c][n - 1].add(HDR) })
+}
+
+/// 返された need バイトのブロック (ヘッダの頭) を置き場に。いっぱいなら false (TLSF に返す)
+#[inline]
+fn pcpu_put(b: *mut u8, need: usize) -> bool {
+    let c = need / ALIGN;
+    if c >= PCPU_CLASSES {
+        return false;
+    }
+    let Some(pc) = pcpu() else { return false };
+    let n = pc.n[c] as usize;
+    if n == PCPU_DEPTH {
+        return false;
+    }
+    pc.blocks[c][n] = b;
+    pc.n[c] = (n + 1) as u8;
+    pc.bytes += need;
+    true
+}
+
+/// この CPU の置き場をみな TLSF に返す (足りないとき: reclaim。heap trace を始めるとき)
+fn pcpu_drain() {
+    let Some(pc) = pcpu() else { return };
+    let mut h = HEAP.lock();
+    for c in 0..PCPU_CLASSES {
+        for &b in &pc.blocks[c][..pc.n[c] as usize] {
+            unsafe {
+                USED.store(USED.load(Relaxed) - tlsf::block_size(b), Relaxed);
+                h.free(b);
+            }
+        }
+        pc.n[c] = 0;
+    }
+    pc.bytes = 0;
+}
+
+/// 置き場が持っているバイト (CPU ぜんぶ。ほかの CPU の分は、読むあいだにも変わる)
+pub fn cached() -> usize {
+    (0..crate::smp::MAXCPU).map(|i| unsafe { (*(&raw const PCPU))[i].bytes }).sum()
+}
+
 /// HEAP から need バイト (ヘッダこみ) のブロックを 1 つ。中身の頭 (なければ null)
 unsafe fn take(need: usize) -> *mut u8 {
     let mut h = HEAP.lock();
@@ -297,6 +395,8 @@ fn reclaim(need: usize) -> bool {
         return false;
     }
     RECLAIMS.fetch_add(1, Relaxed);
+    // まず自分の CPU の置き場を返す (そろった空きになるかもしれない)
+    pcpu_drain();
     let ok = if grow(need) {
         true
     } else if crate::vm::shrink_cache_try(1024) > 0 {
@@ -412,6 +512,13 @@ unsafe impl GlobalAlloc for Kernel {
             return ptr::null_mut();
         }
         let need = round(layout.size().max(1)) + HDR;
+        // CPU ごとの置き場から (heap trace と、わざとしくじらせるあいだは通らない)
+        if !TRACE.load(Relaxed)
+            && !crate::fail::armed()
+            && let Some(p) = pcpu_take(need)
+        {
+            return p;
+        }
         let fallible = crate::proc::in_fallible();
         // わざと取れなかったことに (/proc/ai/ctl の fail ... heap|oom。fail.rs): ふつうの道も遅い道もなしで下へ
         let struck = crate::fail::heap(fallible);
@@ -461,9 +568,13 @@ unsafe impl GlobalAlloc for Kernel {
         ptr::null_mut()
     }
 
-    unsafe fn dealloc(&self, p: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         unsafe {
             let b = p.sub(HDR);
+            // 小さいものは CPU ごとの置き場へ (予備のもの、取ったところの番号のあるもの (heap trace) はロックの道で)
+            if !TRACE.load(Relaxed) && !in_reserve(b) && *(b as *const usize).add(1) == 0 && pcpu_put(b, round(layout.size().max(1)) + HDR) {
+                return;
+            }
             // 大きさはロックの中で読む (ヘッダの PREV_FREE は、前のブロックを取ったり返したりするほかの CPU が変える)
             let mut h = HEAP.lock();
             let size = tlsf::block_size(b);

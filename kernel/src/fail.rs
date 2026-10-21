@@ -78,6 +78,12 @@ fn take(what: What) -> Option<Rule> {
     Some(*r)
 }
 
+/// わざとしくじらせる決まりがあるか (ヒープの CPU ごとの置き場は、あるあいだ通らない: heap.rs)
+#[inline]
+pub fn armed() -> bool {
+    ON.load(Relaxed)
+}
+
 /// システムコール nr をしくじらせるなら、その errno (正の数)
 #[inline]
 pub fn syscall(nr: u64) -> Option<i64> {
