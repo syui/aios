@@ -421,6 +421,35 @@ poll は POLLNVAL で select は EBADF、AF_UNIX の SO_REUSEPORT。ping のソ�
 やりなおし、ECONNREFUSED、RST、SIGPIPE、TIME_WAIT とポート、/proc/net/tcp、fd を渡した TCP、UDP の待つ recvfrom) をじかに
 確かめる (Linux 7.3 でも同じ答え)。手本の Linux の VM は lo を上げる (test/linux-init.c)。
 
+スレッドと futex を覚えさせたとき (Linux 7.3 と、ext4 300 × 30、400 × 40、600 × 60、600 × 80、tmpfs 400 × 60 でどれも
+ちがわない): ロボットは case
+の中でスレッドを作り (fthread: FUTEX_WAIT、WAIT_BITSET、LOCK_PI、futex_waitv のどれかで待たせる)、case のスレッドから
+futex の op (WAKE、WAKE_BITSET、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT と WAIT_BITSET の時間切れ、LOCK_PI、TRYLOCK_PI、
+UNLOCK_PI、語に書く store、まちがった op) をかけ、そのたびに終わったスレッドの答えと 4 つの語の値 (スレッドの番号は me や
+tN、PI の印は |WAITERS) を出す (スレッドが眠るか終わるまで待ってから)。はじめは 300 の case のうち 40 がちがった。aios の
+futex は、起こすときは数えずに全員起こし (起きすぎても待つ側が確かめなおす)、bitset を見ず、REQUEUE も全員起こし、WAKE_OP
+と PI と futex_waitv はなかった (ENOSYS)。作りなおした (kernel/src/futex.rs。Linux の kernel/futex/ と同じ決まり): 待ち
+合わせの場所 (key) ごとに来た順の行列を持ち、起こす数はそのとおり (0 や負でも 1 つ)、bitset の重なるものだけ。key は Linux と
+同じく 3 つで、PRIVATE はアドレス空間とアドレス、共有の op は自分だけの領域ならアドレス空間とアドレス (PRIVATE のものとは
+会わない)、MAP_SHARED の領域ならページの物理アドレス (プロセスをまたぐ)。REQUEUE / CMP_REQUEUE は nr_wake まで起こして
+のこりを移し (うしろに並ぶ)、答えは起こした数と移した数の合計 (負の数は EINVAL)。WAKE_OP は語を原子的に変えて (SET ADD OR
+ANDN XOR と OPARG_SHIFT)、前の値をくらべた答えで 2 つめの語も起こす。PI のロックは、語が 0 なら自分の番号を入れて取り、自分の
+ものなら EDEADLK、ほかのものなら WAITERS の印を立てて持ち主につながり (持ち主がいなければ ESRCH)、UNLOCK_PI は待っている
+いちばん前のものにゆずる (語は WAITERS | その番号)。TRYLOCK と時間切れでも印はのこる (Linux と同じ)。futex_waitv はいくつもの
+語でまとめて待ち、起こされたものの番号を返す。スレッドが終わるときの CLONE_CHILD_CLEARTID の起こしは共有の op (Linux の
+mm_release) で、持っていた PI のロックは待っているものにゆずる。CLOCK_REALTIME の印は WAIT_BITSET と LOCK_PI2 だけ
+(Linux 7.3 は FUTEX_WAIT にも ENOSYS)。シグナルで割り込まれたら、時間のない WAIT は SA_RESTART でやり直し、時間のある WAIT
+はハンドラが動けば EINTR、LOCK_PI はいつもやり直す (Linux の ERESTARTSYS、ERESTART_RESTARTBLOCK、ERESTARTNOINTR)。待つ
+スレッドはみな同じ場所で眠り、起こす側が行列から出したスレッドだけを起こす。ロックなしの速い道 (PRIVATE の WAKE で待つもの
+がいない、WAIT で値がちがう) はそのまま (時間、そろっていないアドレス、bitset 0 のときは答えがちがうので、ふつうの道へ)。
+長い並びで出たほかのちがいは 2 つ: listen する前に shutdown(SHUT_WR) した口から生まれた子は、印を受けついでつながったところで
+FIN を送る (Linux の sk_clone_lock と TCP_SYN_RECV)。もう 1 つは AF_UNIX の、自分の fd を自分の行列に送って閉じたソケット:
+aios は閉じたときに片づけ (相手はすぐ EOF)、Linux 7.3 はほかの AF_UNIX のソケットが閉じるまで片づけない (相手はつながった
+まま)。aios のほうを、えらんだちがい unix-gc-now にした (下の表)。ロボットの側では、自分もいるプロセスグループに止めるシグナルを送ると case が
+止まったまま (アラームも効かない) になるので、送らないようにした。test/futex.c が、ロボットの見ないところ (来た順、PRIVATE と
+共有の key、fork をまたぐ MAP_SHARED の futex、相対と時刻の時間切れ、シグナルとやり直し、PI のゆずりあい、REQUEUE で移った
+ものを起こす、futex_waitv、pthread_join) をじかに確かめる (Linux 7.3 でも同じ答え)。
+
 #### aios がえらんだちがい
 
 Linux に合わせるのは最初の手本で、Linux よりよい道があれば、そちらをえらぶ。えらんだところは test/sysdiff.c の `chosen` に
@@ -443,6 +472,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | splice-snapshot | ファイルからパイプへの splice / sendfile は、そのときの中身をパイプの箱に写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない | ページキャッシュのページそのものを箱に入れる (写さない)。読む前にファイルが変われば、パイプからもそれが読める。切りつめると、端のページの残りが 0 で読める | パイプに入れたものは、入れたときのもの (cat や cp が、書きかえ中のファイルのまぜこぜを送らない)。aios はもとから写しているので、そのぶん速くもならない。ロボットは Linux で、そのときの中身の写し (名前のないファイル) から入れてまねる |
 | pipe-fault | パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT) | パイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す) | どこまでできたかがそのまま分かる。ふつうのファイルでは Linux もバイトごとなので、パイプだけ箱ごとなのは中の作りが見えているだけ |
 | pipe-nowait | パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く | splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP | aios のパイプは splice でも写しを入れる (splice-snapshot) ので、読むときに待つことがない。フラグが黙って効かなくなるのは分かりにくい |
+| unix-gc-now | 送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じた、たがいの fd を持ちあって閉じた) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF や ECONNRESET) | ほかの AF_UNIX のソケットが閉じたとき (か、送られている途中のものが多すぎるとき) に、うしろ (kworker) で片づける。それまで輪の中のソケットは生きていて、相手からはつながったまま (読めば EAGAIN、待てばいつまでも) | 答えが、ほかのソケットが閉じたかや、うしろの仕事がいつ走ったかで変わらない。もうだれも使えないソケットに相手が待ちつづけない。ロボットは Linux で、ほかの AF_UNIX のソケットを作って閉じて片づけを起こし、終わるのを待ってまねる |
 
 #### 手本の Linux のまちがい
 

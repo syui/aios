@@ -23,7 +23,6 @@ const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 const ENODATA: i64 = 61;
 const EOPNOTSUPP: i64 = 95;
-const ETIMEDOUT: i64 = 110;
 
 // システムコールの番号 (nr::READ など) と名前 (name。/proc/bkl と strace で見せる)
 macro_rules! nrs {
@@ -124,6 +123,7 @@ nrs! {
     SET_TID_ADDRESS = 96,
     FUTEX = 98,
     SET_ROBUST_LIST = 99,
+    FUTEX_WAITV = 449,
     NANOSLEEP = 101,
     GETITIMER = 102,
     SETITIMER = 103,
@@ -529,7 +529,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             p.clear_tid = a[0] as usize;
             Ok(crate::ns::local_or_0(p.pid) as i64)
         }
-        FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize),
+        FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32),
+        FUTEX_WAITV => crate::futex::waitv(a[0] as usize, a[1] as u32, a[2] as u32, a[3] as usize, a[4] as u32),
         // PID の namespace の中なら、中の番号 (ns.rs)
         GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
         GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
@@ -640,8 +641,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
     crate::unix::gc_check(false);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
-    let restartable = matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT);
-    (r == Err(-EINTR_)).then_some(Restart { restartable })
+    let (restartable, always) = match nr {
+        FUTEX => crate::futex::restart_kind(a[1], a[3] as usize),
+        _ => (matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX_WAITV | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT), false),
+    };
+    (r == Err(-EINTR_)).then_some(Restart { restartable, always })
 }
 
 const EINTR_: i64 = 4;
@@ -822,9 +826,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             0
         }
-        // 自分のアドレス空間だけの futex (PRIVATE) で、眠らない・起こさないもの (sys_futex も見よ)
-        FUTEX if a[1] & FUTEX_PRIVATE_FLAG != 0 => match a[1] & 0x7f {
-            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+        // 自分のアドレス空間だけの futex (PRIVATE) で、眠らない・起こさないもの (futex.rs も見よ)。時間のあるもの、
+        // そろっていないもの、bitset が 0 のもの、CLOCK_REALTIME の印のあるものは、答えのちがう (EINVAL など) ことが
+        // あるので、ふつうの道へ
+        FUTEX if a[1] & !(FUTEX_PRIVATE_FLAG | 0x7f) == 0 && a[1] & FUTEX_PRIVATE_FLAG != 0 && a[0] % 4 == 0 && a[0] < crate::vm::MAXVA as u64 => match a[1] & 0x7f {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET if a[3] == 0 && (a[1] & 0x7f == FUTEX_WAIT || a[5] as u32 != 0) => {
                 // 値がもう val でなければ EAGAIN (Linux と同じ)。同じなら、ロックを取って眠る道へ
                 let mut cur = [0u8; 4];
                 if !p.pt().copy_in_nofault(a[0] as usize, &mut cur) || u32::from_le_bytes(cur) == a[2] as u32 {
@@ -832,11 +838,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
                 }
                 -EAGAIN
             }
-            FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-                // 起こす側はユーザーが値を書いたあとに来る。眠る側は数を増やしてから値を読む (sys_futex) ので、
+            FUTEX_WAKE | FUTEX_WAKE_BITSET if a[1] & 0x7f == FUTEX_WAKE || a[5] as u32 != 0 => {
+                // 起こす側はユーザーが値を書いたあとに来る。眠る側は数を増やしてから値を読む (futex.rs) ので、
                 // ここで 0 なら、眠っている (これから眠る) スレッドはいない: だれも起こさずに 0
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                if futex_sleepers(proc::futex_chan(p, a[0] as usize)).load(core::sync::atomic::Ordering::SeqCst) != 0 {
+                if crate::futex::sleepers(p.mm_id(), a[0] as usize).load(core::sync::atomic::Ordering::SeqCst) != 0 {
                     return false;
                 }
                 0
@@ -1371,73 +1377,16 @@ pub fn futex_wakes(tgid: u32) -> alloc::vec::Vec<(u32, usize, u64, usize)> {
 
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 
-/// futex で眠っている (眠ろうとしている) スレッドの数を、待ち合わせの場所 (chan) のハッシュごとに。
-/// 起こす側が大きなロックなしに「ここにはだれもいない」と知るため (fast)。眠る側は増やしてから値を読む。
-/// ハッシュがぶつかれば、起こす側がロックを取ってふつうに探すだけ
-static FUTEX_SLEEPERS: [core::sync::atomic::AtomicUsize; 1024] = [const { core::sync::atomic::AtomicUsize::new(0) }; 1024];
-
-fn futex_sleepers(chan: usize) -> &'static core::sync::atomic::AtomicUsize {
-    &FUTEX_SLEEPERS[(chan.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize]
-}
-
-/// futex で眠ろうとしている数を 1 つ増やし、落とすと戻す (起こす側の速い道が見る)
-struct FutexSleeper(&'static core::sync::atomic::AtomicUsize);
-
-impl Drop for FutexSleeper {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize) -> R {
-    let p = proc::current();
-    // ふつうはアドレス空間とアドレスで待ち合わせる。PRIVATE でなく、共有の領域 (プロセスをまたぐ
-    // pthread のミューテックスやセマフォ) なら、ページの物理アドレスで (どのプロセスからも同じ)
-    let shared = if op & FUTEX_PRIVATE_FLAG == 0 { p.pt().shared_pa(uaddr) } else { None };
-    let chan = match shared {
-        Some(pa) => (pa << 1) ^ 1 ^ (1 << 63),
-        None => proc::futex_chan(p, uaddr),
-    };
-    match op & 0x7f {
-        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // 数を増やしてから値を読む: 起こす側 (fast) は値を書いてから数を読むので、
-            // どちらかが必ず相手に気づく (値が変わったのを見て EAGAIN か、数を見てふつうに起こす)
-            let sleepers = futex_sleepers(chan);
-            sleepers.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            let _sleeper = FutexSleeper(sleepers);
-            let mut cur = [0u8; 4];
-            p.pt().copy_in(&mut cur, uaddr).ok_or(-EFAULT)?;
-            if u32::from_le_bytes(cur) != val {
-                return Err(-EAGAIN);
-            }
-            let deadline = if timeout == 0 {
-                0
-            } else {
-                let ns = read_timespec(timeout)?;
-                // WAIT は相対時間、WAIT_BITSET は絶対時間
-                let rel = if op & 0x7f == FUTEX_WAIT_BITSET {
-                    let now = if op & 256 != 0 { timer::epoch_ns() } else { timer::uptime_ns() };
-                    ns.saturating_sub(now)
-                } else {
-                    ns
-                };
-                timer::ticks() + ns_to_ticks(rel)
-            };
-            if proc::sleep_until(chan, deadline)? {
-                Ok(0)
-            } else {
-                Err(-ETIMEDOUT)
-            }
+/// futex(2) は futex.rs。起こしたものは記録する (/proc/PID/stack)
+fn sys_futex(uaddr: usize, op: u64, val: u32, timeout: usize, uaddr2: usize, val3: u32) -> R {
+    let r = crate::futex::futex(uaddr, op, val, timeout, uaddr2, val3);
+    if let Ok(n) = r {
+        if matches!(op & 0x7f, FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | crate::futex::WAKE_OP) {
+            let p = proc::current();
+            futex_log(p.tgid, p.pid, uaddr, op, n as usize);
         }
-        FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-            // 数は数えずに全員起こす (起きすぎても待つ側が確かめなおす)
-            let n = proc::wakeup(chan);
-            futex_log(p.tgid, p.pid, uaddr, op, n);
-            Ok(n.min(val as usize) as i64)
-        }
-        _ => Err(-ENOSYS),
     }
+    r
 }
 
 

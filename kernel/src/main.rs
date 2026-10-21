@@ -29,6 +29,7 @@ mod extfs;
 mod file;
 mod locks;
 mod fs;
+mod futex;
 mod irq;
 mod heap;
 mod tlsf;

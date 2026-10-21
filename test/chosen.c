@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -279,6 +280,34 @@ static void pipe_nowait(void) {
     close(p[1]);
 }
 
+static void unix_gc_now(void) {
+    // socketpair の片方の fd を、もう片方からそれ自身の行列へ送って閉じる (メッセージの中にしかない輪)。aios は閉じた
+    // ときに片づけるので、のこった口の read はすぐ 0 (EOF)。Linux はほかの AF_UNIX のソケットが閉じるまで片づけず、EAGAIN
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) != 0) {
+        printf("FAIL unix-gc-now (%s): socketpair\n", dir);
+        fails++;
+        return;
+    }
+    char c = 'x', cb[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {&c, 1};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb};
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &sv[1], sizeof(int));
+    long s = sendmsg(sv[0], &m, 0);
+    close(sv[1]);
+    usleep(20000);
+    char b[8], got[120];
+    long r = read(sv[0], b, sizeof b);
+    int e = errno;
+    snprintf(got, sizeof got, "sendmsg = %ld, read after close = %ld%s%s", s, r, r < 0 ? " " : "", r < 0 ? strerror(e) : "");
+    check("unix-gc-now", s == 1 && r == 0, s == 1 && r < 0 && e == EAGAIN, got);
+    close(sv[0]);
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -329,6 +358,7 @@ int main(int argc, char **argv) {
         splice_snapshot();
         pipe_fault();
         pipe_nowait();
+        unix_gc_now();
     }
     if (!on_aios)
         printf("chosen: Linux does %d of them like aios now\n", same);

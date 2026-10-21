@@ -1012,6 +1012,8 @@ fn syn(u: &InetRef) {
             x.dport = sport;
             x.ss = Ss::Connected;
             established(&mut x, adv_mss(my_mss), HALF_WND_SERVER);
+            // listen する前の shutdown の印も写る (Linux の sk_clone_lock は sk_shutdown もそのまま写す)
+            x.shutdown = l.shutdown;
             x.peer = Some(Rc::downgrade(u));
         }
         c
@@ -1024,6 +1026,13 @@ fn syn(u: &InetRef) {
         established(&mut s, theirs, HALF_WND_CLIENT);
         s.peer = Some(Rc::downgrade(&c));
         s.syn_tries = 0;
+    }
+    // 写った SEND の shutdown は、つながったところで FIN を送る (Linux の tcp_rcv_state_process の TCP_SYN_RECV)
+    if c.borrow().shutdown & SEND != 0 {
+        let fin = close_state(&mut c.borrow_mut());
+        if fin {
+            send_fin(&c);
+        }
     }
     l.borrow_mut().acceptq.push_back(c);
     notify(&l);

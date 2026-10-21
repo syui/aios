@@ -45,6 +45,8 @@
 #include <sys/syscall.h>
 #include <sys/file.h>
 #include <poll.h>
+#include <pthread.h>
+#include <linux/futex.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/mman.h>
@@ -236,6 +238,10 @@ static const char *ename(int e) {
     case ENOTTY: return "ENOTTY";
     case ETXTBSY: return "ETXTBSY";
     case EFBIG: return "EFBIG";
+    case ETIMEDOUT: return "ETIMEDOUT";
+    case EDEADLK: return "EDEADLK";
+    case EOWNERDEAD: return "EOWNERDEAD";
+    case ENOTRECOVERABLE: return "ENOTRECOVERABLE";
     case ENOSPC: return "ENOSPC";
     case ESPIPE: return "ESPIPE";
     case EROFS: return "EROFS";
@@ -286,6 +292,7 @@ static const struct {
     {"splice-snapshot", "ファイルからパイプへの splice / sendfile は、そのときの中身をパイプに写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない。Linux はページキャッシュのページそのものを入れるので、読む前に変わればそれが読める"},
     {"pipe-fault", "パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT)。Linux はパイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す)"},
     {"pipe-nowait", "パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く (待たない)。Linux は splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP"},
+    {"unix-gc-now", "送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じたものなど) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF)。Linux はほかの AF_UNIX のソケットが閉じたときに、うしろ (kworker) で片づけるので、それまで相手からはつながったまま"},
 };
 
 // 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)
@@ -354,12 +361,23 @@ enum {
     OPEN, OPENAT2, CLOSE, WRITE, PWRITE, READ, PREAD, LSEEK, FTRUNCATE, TRUNCATE, FSTAT, STAT, MKDIR, UNLINK, RMDIR,
     RENAME, LINK, SYMLINK, READLINK, CHMOD, FCHMOD, ACCESS, GETDENTS, DUP, DUP3, FCNTL, PIPE, FSYNC,
     CHOWN, FCHOWN, UTIMENS, UMASK, FALLOC, COPYRANGE, SENDFILE, STATX, SPLICE, TEE, READV, WRITEV, PREADV2, PWRITEV2, MMAP, MUNMAP, MSYNC, MREAD, MWRITE, FLOCK, RLOCK, FORK, KILL, WAIT, CHLDACT, SETPGID, GETPGID,
-    SOCKET, SOCKPAIR, BIND, LISTEN, CONNECT, ACCEPT, SEND, RECV, SHUTDOWN, SOCKOPT, SOCKNAME, POLL, NKIND};
+    FTHREAD, FUTEX, SOCKET, SOCKPAIR, BIND, LISTEN, CONNECT, ACCEPT, SEND, RECV, SHUTDOWN, SOCKOPT, SOCKNAME, POLL, NKIND};
 static const unsigned weight[NKIND] = {14, 2, 5, 8, 4, 6, 3, 4, 3, 2, 4, 7, 6, 4, 3, 7, 4, 5, 3, 3, 2, 3, 4, 2, 2, 4, 4, 1,
                                        3, 2, 4, 1, 3, 3, 2, 3, 4, 2, 3, 3, 3, 3, 4, 1, 2, 4, 4, 5, 8, 4, 5, 5, 1, 2, 2,
-                                       2, 3, 2, 1, 2, 1, 4, 4, 1, 2, 1, 2};
+                                       1, 1, 2, 3, 2, 1, 2, 1, 4, 4, 1, 2, 1, 2};
 // ソケットの case (case の 4 割): ソケットの op をこれだけ多く (つないで、送って、受けるところまで届くように)
 #define SOCKFOCUS 6
+// futex の case (のこりの 2 割): スレッドと futex の op をこれだけ多く
+#define TFOCUS 14
+// futex: スレッドの待ちかた (FTHREAD の x: FUTEX_WAIT、FUTEX_WAIT_BITSET、FUTEX_LOCK_PI、futex_waitv)、futex の op (FUTEX
+// の x: FUTEX_WAKE、WAKE_BITSET、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT、WAIT_BITSET、store、LOCK_PI、TRYLOCK_PI、UNLOCK_PI、
+// まちがい) の重み、bitset の mask、起こす数
+static const unsigned fthw[4] = {6, 3, 2, 2};
+static const unsigned futw[12] = {8, 3, 3, 3, 3, 2, 1, 4, 2, 2, 3, 1};
+static const unsigned fmasks[] = {1, 2, 3, 0xffffffffu, 0};
+static const unsigned fmaskw[5] = {3, 3, 2, 3, 1};
+static const int fnums[] = {0, 1, 2, INT_MAX, -1};
+static const unsigned fnumw[5] = {1, 6, 3, 3, 1};
 
 static const char *names[] = {"a", "b", "c", "d"};
 
@@ -651,6 +669,12 @@ static void planop(int k) {
 }
 // fork した子 (FORK の op の番号) と、その子が自分のグループを作るか (1 setpgid、2 setsid)
 static int nkref, krefs[MAXOPS], kgrp[MAXOPS];
+// futex: 作ったスレッドの数、語 (w0〜w2) の値がわかっているか (store で書いたもの。WAKE_OP は変えるのでわからなくなる)。
+// tfocus は futex の case
+static int ntref, wvalid[3], tfocus, fpipriv;
+// 語ごとの、眠っているらしいスレッドの数 (起こす op がだれかのいる語をねらうため。だいたいでよい)
+static int wsl[3];
+static unsigned wknown[3];
 
 // 子の ref (FORK の op の番号)。なければ -1 (いない番号で)。近いものほど選ばれやすく
 static int genkid(void) {
@@ -1029,6 +1053,16 @@ static void gen(uint64_t seed, int n) {
     niname = 0;
     lastsock = 0;
     sfocus = chance(40);
+    tfocus = !sfocus && chance(20);
+    // PI の語 (w3) の op は、case の中でみな PRIVATE か、みな共有か (ふつうのプログラムはまぜない)
+    fpipriv = chance(65);
+    ntref = 0;
+    memset(wsl, 0, sizeof wsl);
+    memset(wvalid, 0, sizeof wvalid);
+    for (int k = 0; k < 3; k++) {
+        wvalid[k] = 1;
+        wknown[k] = 0;
+    }
     nplan = 0;
     memset(speer, -1, sizeof speer);
     memset(spend, -1, sizeof spend);
@@ -1037,7 +1071,7 @@ static void gen(uint64_t seed, int n) {
     stfocus = sinet ? (chance(55) ? 0 : 1) : chance(45) ? 0 : chance(55) ? 2 : 1;
     unsigned w[NKIND];
     for (int k = 0; k < NKIND; k++)
-        w[k] = weight[k] * (sfocus && k >= SOCKET && k < POLL ? SOCKFOCUS : 1);
+        w[k] = weight[k] * (sfocus && k >= SOCKET && k < POLL ? SOCKFOCUS : 1) * (tfocus && (k == FTHREAD || k == FUTEX) ? TFOCUS : 1);
     nref = 0;
     nmref = 0;
     nkref = 0;
@@ -1062,7 +1096,8 @@ static void gen(uint64_t seed, int n) {
         // fd がまだないうちに fd の op を選んだら、開ける op に
         if (nref == 0 && o->kind != OPENAT2 && o->kind != TRUNCATE && o->kind != STAT && o->kind != MKDIR && o->kind != UNLINK && o->kind != RMDIR &&
             o->kind != RENAME && o->kind != LINK && o->kind != SYMLINK && o->kind != READLINK && o->kind != CHMOD && o->kind != ACCESS &&
-            o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX && o->kind != SOCKET && o->kind != SOCKPAIR)
+            o->kind != CHOWN && o->kind != UTIMENS && o->kind != UMASK && o->kind != STATX && o->kind != SOCKET && o->kind != SOCKPAIR &&
+            o->kind != FTHREAD && o->kind != FUTEX)
             o->kind = o->kind >= SOCKET && o->kind < POLL ? (chance(60) ? SOCKPAIR : SOCKET) : chance(80) ? OPEN : PIPE;
         // splice と tee はパイプがないとたいてい EINVAL なので、まだなければたいていパイプを作る
         if ((o->kind == SPLICE || o->kind == TEE) && chance(70)) {
@@ -1072,6 +1107,9 @@ static void gen(uint64_t seed, int n) {
             if (!any)
                 o->kind = PIPE;
         }
+        // 起こす op は、まだ待つスレッドがいなければたいていスレッドを作る op に
+        if (o->kind == FUTEX && ntref == 0 && chance(70))
+            o->kind = FTHREAD;
         // 子を使う op は、まだ子がいなければたいてい fork に
         if ((o->kind == KILL || o->kind == WAIT || o->kind == SETPGID || o->kind == GETPGID) && nkref == 0 && chance(80))
             o->kind = FORK;
@@ -1401,6 +1439,80 @@ static void gen(uint64_t seed, int n) {
             // getpgid (x 0) か getsid (x 1) を、子か自分 (d1 -2) に
             o->d1 = chance(15) ? -2 : genkid();
             o->x = chance(40);
+            break;
+        case FTHREAD:
+            // スレッドを作って futex で待たせる。x: 待ちかた (fthn: LOCK_PI は w3 で、とれたら UNLOCK_PI)。y と d1: 語
+            // (w0〜w2。waitv は 2 つ)。len と off: 待つ値 (たいてい今の値: 眠る)。mode: bitset の mask。acc: 1 なら PRIVATE
+            o->x = (int)pickw(fthw, 4);
+            o->y = (int)pick(3);
+            o->d1 = (int)pick(3);
+            o->len = wvalid[o->y] && chance(85) ? wknown[o->y] : (long long)pick(3);
+            o->off = wvalid[o->d1] && chance(85) ? wknown[o->d1] : (long long)pick(3);
+            o->mode = fmasks[pickw(fmaskw, 5)];
+            o->acc = o->x == 2 ? (unsigned)fpipriv : chance(65);
+            if (o->x <= 1 && wvalid[o->y] && (unsigned)o->len == wknown[o->y] && o->mode)
+                wsl[o->y]++;
+            if (o->x == 3 && wvalid[o->y] && (unsigned)o->len == wknown[o->y] && wvalid[o->d1] && (unsigned)o->off == wknown[o->d1])
+                wsl[o->y]++;
+            ntref++;
+            break;
+        case FUTEX:
+            // futex の op (futn: store は語に書くだけ、bad はまちがい: mode 0 知らない op、1 そろっていない、2 NULL、3 WAKE に
+            // CLOCK_REALTIME)。y と d1: 語。len: 起こす数 (fnums)。off: 2 つめの数か、CMP_REQUEUE の val3、store の値。
+            // mode: bitset の mask か WAKE_OP の式。acc: 1 PRIVATE、2 CLOCK_REALTIME (待つもの)
+            o->x = (int)pickw(futw, 12);
+            o->y = (int)pick(3);
+            // 起こす op は、たいていだれかの眠っている語に
+            if (o->x <= 4 && chance(75)) {
+                int any = wsl[0] + wsl[1] + wsl[2];
+                if (any) {
+                    int r = (int)pick((unsigned)any);
+                    o->y = r < wsl[0] ? 0 : r < wsl[0] + wsl[1] ? 1 : 2;
+                }
+            }
+            o->d1 = chance(75) ? (o->y + 1 + (int)pick(2)) % 3 : o->y;
+            o->len = fnums[pickw(fnumw, 5)];
+            o->acc = (chance(65) ? 1u : 0u) | (chance(10) ? 2u : 0u);
+            if (o->x == 1 || o->x == 6)
+                o->mode = fmasks[pickw(fmaskw, 5)];
+            if (o->x == 0 || o->x == 1)
+                o->acc &= 1;
+            if (o->x == 2 || o->x == 4)
+                o->off = fnums[pickw(fnumw, 5)];
+            if (o->x == 3) {
+                o->off = fnums[pickw(fnumw, 5)];
+                // val3: たいてい今の値 (でなければ EAGAIN)。値は mode に
+                o->mode = wvalid[o->y] && chance(80) ? wknown[o->y] : (unsigned)pick(3);
+            }
+            if (o->x == 4) {
+                // WAKE_OP の式: op (SET ADD OR ANDN XOR と OPARG_SHIFT)、cmp (EQ NE LT LE GT GE)、oparg、cmparg
+                unsigned op = (unsigned)pick(5) | (chance(10) ? 8u : 0u);
+                o->mode = op << 28 | (unsigned)pick(6) << 24 | (unsigned)pick(4) << 12 | (unsigned)pick(4);
+                wvalid[o->d1] = 0;
+            }
+            if (o->x == 5)
+                o->off = wvalid[o->y] && chance(70) ? wknown[o->y] : (long long)pick(3);
+            if (o->x == 6)
+                o->off = wvalid[o->y] && chance(70) ? wknown[o->y] : (long long)pick(3);
+            if (o->x == 7) {
+                o->off = (long long)pick(4);
+                wknown[o->y] = (unsigned)o->off;
+                wvalid[o->y] = 1;
+            }
+            if (o->x == 11)
+                o->mode = (unsigned)pick(4);
+            // 起こしたらしい数を引く (REQUEUE は移ったものを足す)
+            if (o->x <= 4 && wsl[o->y] > 0) {
+                int n = o->len <= 0 ? 1 : o->len > wsl[o->y] ? wsl[o->y] : (int)o->len;
+                wsl[o->y] -= n;
+                if ((o->x == 2 || o->x == 3) && o->off > 0) {
+                    int m = o->off > wsl[o->y] ? wsl[o->y] : (int)o->off;
+                    wsl[o->y] -= m;
+                    wsl[o->d1] += m;
+                }
+            }
+            if (o->x >= 8 && o->x <= 10)
+                o->acc = (o->acc & ~1u) | (unsigned)fpipriv;
             break;
         case FLOCK:
             // たいてい、同じファイルをほかにも開いているもの (取り合い)。なければ、そのファイルをもう一度開く op に
@@ -1958,6 +2070,8 @@ static void onsig(int s) {
 // プロセス: FORK の op ごとの子の番号 (fork できなければ 0)、同期のパイプの読む口 (800 から)、回収したか。
 // me は case のプロセス (op を動かすもの)、sess は case のセッションのリーダー (その親)
 static pid_t kpid[MAXOPS], me_pid, sess_pid;
+// この case で SCM_RIGHTS を送ったか (ソケットを閉じたら Linux の unix_gc を待つ)
+static int rights_sent;
 static int ksync[MAXOPS], kgone[MAXOPS];
 // 子の中で: ハンドラが書く同期のパイプの書く口
 static volatile int kfd = -1;
@@ -2003,10 +2117,9 @@ static pid_t kidpid(int ref) {
     return ref >= 0 && kpid[ref] ? kpid[ref] : 4000000;
 }
 
-// /proc/PID/stat の状態 (R、S、T、Z ...)。なければ X
-static char kstate(pid_t pid) {
-    char p[64], b[512];
-    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+// stat のファイル (/proc/PID/stat など) の状態 (R、S、T、Z ...)。なければ X
+static char pstate(const char *p) {
+    char b[512];
     int fd = open(p, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return 'X';
@@ -2017,6 +2130,125 @@ static char kstate(pid_t pid) {
     b[n] = 0;
     char *q = strrchr(b, ')');
     return q && q[1] == ' ' ? q[2] : '?';
+}
+
+static char kstate(pid_t pid) {
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+    return pstate(p);
+}
+
+// ---- futex とスレッド ----
+
+// 語: w0〜w2 はふつうの futex、w3 は PI の futex (持ち主のスレッドの番号が入る)。同じページに
+static uint32_t fw[4] __attribute__((aligned(64)));
+// スレッド (FTHREAD の op ごと): 作ったか、番号 (走りはじめに書く)、終わったか、futex の答え (負は -errno)、PI の unlock の
+// 答え、もう出したか
+static struct {
+    int made, shown;
+    volatile int tid, done;
+    long r, r2;
+} th[MAXOPS];
+
+static long fx(void *uaddr, int op, uint32_t val, const void *t, void *uaddr2, uint32_t val3) {
+    long r = syscall(SYS_futex, uaddr, op, val, t, uaddr2, val3);
+    return r < 0 ? -errno : r;
+}
+
+// futex_waitv の 1 つ (Linux の struct futex_waitv)
+struct fwaitv {
+    uint64_t val, uaddr;
+    uint32_t flags, reserved;
+};
+
+// スレッドの中: シグナルはみな止め (case のシグナルの op にかかわらない)、op のとおりに futex で待って、答えを書く
+static void *tmain(void *arg) {
+    int i = (int)(long)arg;
+    const struct op *o = &ops[i];
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    int priv = o->acc & 1 ? FUTEX_PRIVATE_FLAG : 0;
+    long r = 0, r2 = 0;
+    th[i].tid = (int)syscall(SYS_gettid);
+    if (o->x == 0)
+        r = fx(&fw[o->y], FUTEX_WAIT | priv, (uint32_t)o->len, NULL, NULL, 0);
+    else if (o->x == 1)
+        r = fx(&fw[o->y], FUTEX_WAIT_BITSET | priv, (uint32_t)o->len, NULL, NULL, o->mode);
+    else if (o->x == 2) {
+        r = fx(&fw[3], FUTEX_LOCK_PI | priv, 0, NULL, NULL, 0);
+        if (r == 0)
+            r2 = fx(&fw[3], FUTEX_UNLOCK_PI | priv, 0, NULL, NULL, 0);
+    } else {
+        uint32_t f = 2 | (priv ? FUTEX_PRIVATE_FLAG : 0);
+        struct fwaitv w[2] = {{(uint32_t)o->len, (uintptr_t)&fw[o->y], f, 0}, {(uint32_t)o->off, (uintptr_t)&fw[o->d1], f, 0}};
+        r = syscall(449, w, 2, 0, NULL, 1);
+        if (r < 0)
+            r = -errno;
+    }
+    th[i].r = r;
+    th[i].r2 = r2;
+    __atomic_store_n(&th[i].done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+// 語の値: スレッドの番号は me (case のスレッド) か tN、印は |WAITERS と |OWNER_DIED、ほかは数
+static const char *wval(uint32_t v) {
+    static char b[4][48];
+    static int nb;
+    char *s = b[nb++ & 3];
+    uint32_t t = v & FUTEX_TID_MASK;
+    char who[16] = "";
+    if (t && (pid_t)t == me_pid)
+        strcpy(who, "me");
+    for (int j = 0; j < MAXOPS && !who[0]; j++)
+        if (th[j].made && th[j].tid == (int)t && t)
+            snprintf(who, sizeof who, "t%d", j);
+    if (!who[0])
+        snprintf(who, sizeof who, "%u", t);
+    snprintf(s, 48, "%s%s%s", who, v & FUTEX_WAITERS ? "|WAITERS" : "", v & FUTEX_OWNER_DIED ? "|OWNER_DIED" : "");
+    return s;
+}
+
+// 待っているスレッドが落ちつくまで (どれも終わったか、眠っているのが 3 ms あけて 3 回つづく。3 秒まで)
+static void tsettle(void) {
+    int stable = 0;
+    for (int k = 0; k < 1000 && stable < 3; k++) {
+        int ok = 1;
+        for (int j = 0; j < MAXOPS && ok; j++) {
+            if (!th[j].made || th[j].done)
+                continue;
+            char p[64];
+            snprintf(p, sizeof p, "/proc/self/task/%d/stat", th[j].tid);
+            ok = th[j].tid && pstate(p) == 'S';
+        }
+        stable = ok ? stable + 1 : 0;
+        if (stable < 3)
+            usleep(3000);
+    }
+}
+
+// スレッドの答え
+static void tres(int j) {
+    long r = th[j].r;
+    if (r < 0)
+        say(" = %s", ename((int)-r));
+    else
+        say(" = %ld", r);
+    if (ops[j].x == 2 && r == 0)
+        say(" unlock %s", th[j].r2 < 0 ? ename((int)-th[j].r2) : "0");
+}
+
+// 終わったスレッド (まだ出していないもの、番号の順) と、語の値
+static void tshow(void) {
+    for (int j = 0; j < MAXOPS; j++)
+        if (th[j].made && th[j].done && !th[j].shown) {
+            say(" [t%d", j);
+            tres(j);
+            say("]");
+            th[j].shown = 1;
+        }
+    say(" w %s %s %s %s", wval(fw[0]), wval(fw[1]), wval(fw[2]), wval(fw[3]));
 }
 
 // 子が落ちつくまで (眠っている、止まっている、ゾンビ、もういない が 3 ms あけて 3 回つづく。3 秒まで) 待つ。その状態
@@ -2641,6 +2873,8 @@ static void sockexec(int i, const struct op *o, int fd) {
                 say(" %d", fdref(o->d2, o->fb, -1));
             say(")");
             r = syscall(SYS_sendmsg, fd, &m, fl);
+            if (r >= 0 && (o->mode == 1 || o->mode == 2))
+                rights_sent = 1;
         }
         ret(r);
         break;
@@ -2857,13 +3091,27 @@ static void exec(int i, const struct op *o) {
         born(i, r);
         break;
     }
-    case CLOSE:
+    case CLOSE: {
+        struct stat cst;
+        int sock = fstat(fd, &cst) == 0 && S_ISSOCK(cst.st_mode);
         say("close(%d)", fd);
         r = syscall(SYS_close, fd);
         ret(r);
         if (r == 0 && fd >= 0 && fd < 1024)
             alive[fd] = 0;
+        // chosen unix-gc-now: 送られている途中の fd があるソケットを閉じたら、aios はそのときに輪を片づける。Linux では
+        // ほかの AF_UNIX のソケットを閉じて片づけ (unix_gc。kworker で) を起こし、終わるのを少し待ってまねる
+        if (r == 0 && sock && rights_sent) {
+            if (!on_aios) {
+                int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+                if (d >= 0)
+                    close(d);
+            }
+            usleep(2000);
+            say(" [chosen unix-gc-now]");
+        }
         break;
+    }
     case WRITE:
     case PWRITE:
         for (long long k = 0; k < o->len; k++)
@@ -3574,6 +3822,12 @@ static void exec(int i, const struct op *o) {
         pid_t pid = kidpid(o->d1);
         int sig = ksigs[o->y];
         say("kill(%s%s, %s)", o->x ? "-" : "", o->d1 >= 0 && kpid[o->d1] ? pidname(pid) : "none", signame(sig));
+        // 自分もいるグループ (setpgid でその子のグループに入った) を止めると、case が止まったまま (アラームも
+        // 効かない) になるので送らない
+        if (o->x && (sig == SIGSTOP || sig == SIGTSTP) && getpgrp() == pid) {
+            say(" = skipped (my group)");
+            break;
+        }
         ret(syscall(SYS_kill, o->x ? -(long)pid : (long)pid, sig));
         if (o->d1 >= 0 && kpid[o->d1] && !kgone[o->d1])
             saykid(o->d1, settle(pid));
@@ -3656,6 +3910,119 @@ static void exec(int i, const struct op *o) {
             ret(r);
         else
             say(" = %s", pidname(r));
+        break;
+    }
+    case FTHREAD: {
+        const char *pn = o->acc & 1 ? "|PRIVATE" : "";
+        if (o->x == 3)
+            say("futex_waitv(w%d %u, w%d %u%s)", o->y, (unsigned)o->len, o->d1, (unsigned)o->off, o->acc & 1 ? ", PRIVATE" : "");
+        else if (o->x == 2)
+            say("fthread(FUTEX_LOCK_PI%s, w3)", pn);
+        else if (o->x == 1)
+            say("fthread(FUTEX_WAIT_BITSET%s, w%d, %u, %#x)", pn, o->y, (unsigned)o->len, o->mode);
+        else
+            say("fthread(FUTEX_WAIT%s, w%d, %u)", pn, o->y, (unsigned)o->len);
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&at, 65536);
+        th[i].made = 1;
+        pthread_t pt;
+        int e = pthread_create(&pt, &at, tmain, (void *)(long)i);
+        pthread_attr_destroy(&at);
+        if (e) {
+            th[i].made = 0;
+            say(" = %s", ename(e));
+            break;
+        }
+        for (int k = 0; k < 3000 && !th[i].tid; k++)
+            usleep(1000);
+        say(" = t%d", i);
+        tsettle();
+        if (th[i].done) {
+            say(" (done");
+            tres(i);
+            say(")");
+            th[i].shown = 1;
+        } else
+            say(" (sleeping)");
+        tshow();
+        break;
+    }
+    case FUTEX: {
+        int priv = o->acc & 1 ? FUTEX_PRIVATE_FLAG : 0, rt = o->acc & 2 ? FUTEX_CLOCK_REALTIME : 0;
+        const char *pn = priv ? "|PRIVATE" : "", *rn = rt ? "|CLOCK_REALTIME" : "";
+        uint32_t *u = &fw[o->y], *u2 = &fw[o->d1];
+        struct timespec zero = {0, 0};
+        void *v2 = (void *)(long)(int)o->off;
+        long fr = 0;
+        switch (o->x) {
+        case 0:
+            say("futex(w%d, FUTEX_WAKE%s, %d)", o->y, pn, (int)o->len);
+            fr = fx(u, FUTEX_WAKE | priv, (uint32_t)o->len, NULL, NULL, 0);
+            break;
+        case 1:
+            say("futex(w%d, FUTEX_WAKE_BITSET%s, %d, %#x)", o->y, pn, (int)o->len, o->mode);
+            fr = fx(u, FUTEX_WAKE_BITSET | priv, (uint32_t)o->len, NULL, NULL, o->mode);
+            break;
+        case 2:
+            say("futex(w%d, FUTEX_REQUEUE%s, %d, %d, w%d)", o->y, pn, (int)o->len, (int)o->off, o->d1);
+            fr = fx(u, FUTEX_REQUEUE | priv, (uint32_t)o->len, v2, u2, 0);
+            break;
+        case 3:
+            say("futex(w%d, FUTEX_CMP_REQUEUE%s, %d, %d, w%d, %u)", o->y, pn, (int)o->len, (int)o->off, o->d1, o->mode);
+            fr = fx(u, FUTEX_CMP_REQUEUE | priv, (uint32_t)o->len, v2, u2, o->mode);
+            break;
+        case 4:
+            say("futex(w%d, FUTEX_WAKE_OP%s, %d, %d, w%d, %#x)", o->y, pn, (int)o->len, (int)o->off, o->d1, o->mode);
+            fr = fx(u, FUTEX_WAKE_OP | priv, (uint32_t)o->len, v2, u2, o->mode);
+            break;
+        case 5:
+            say("futex(w%d, FUTEX_WAIT%s%s, %u, 0s)", o->y, pn, rn, (unsigned)o->off);
+            fr = fx(u, FUTEX_WAIT | priv | rt, (uint32_t)o->off, &zero, NULL, 0);
+            break;
+        case 6:
+            say("futex(w%d, FUTEX_WAIT_BITSET%s%s, %u, at 0, %#x)", o->y, pn, rn, (unsigned)o->off, o->mode);
+            fr = fx(u, FUTEX_WAIT_BITSET | priv | rt, (uint32_t)o->off, &zero, NULL, o->mode);
+            break;
+        case 7:
+            say("store(w%d, %u)", o->y, (unsigned)o->off);
+            __atomic_store_n(u, (uint32_t)o->off, __ATOMIC_SEQ_CST);
+            break;
+        case 8:
+            // case のスレッドは眠らない: 待つ時間は過ぎた時刻 (取られていれば ETIMEDOUT)
+            say("futex(w3, FUTEX_LOCK_PI%s, at 0)", pn);
+            fr = fx(&fw[3], FUTEX_LOCK_PI | priv, 0, &zero, NULL, 0);
+            break;
+        case 9:
+            say("futex(w3, FUTEX_TRYLOCK_PI%s)", pn);
+            fr = fx(&fw[3], FUTEX_TRYLOCK_PI | priv, 0, NULL, NULL, 0);
+            break;
+        case 10:
+            say("futex(w3, FUTEX_UNLOCK_PI%s)", pn);
+            fr = fx(&fw[3], FUTEX_UNLOCK_PI | priv, 0, NULL, NULL, 0);
+            break;
+        default: {
+            static const char *const badn[] = {"op 99", "unaligned FUTEX_WAKE", "NULL FUTEX_WAKE", "FUTEX_WAKE|CLOCK_REALTIME"};
+            say("futex(w%d, %s%s)", o->y, badn[o->mode & 3], pn);
+            if ((o->mode & 3) == 0)
+                fr = fx(u, 99 | priv, 0, NULL, NULL, 0);
+            else if ((o->mode & 3) == 1)
+                fr = fx((char *)u + 1, FUTEX_WAKE | priv, 1, NULL, NULL, 0);
+            else if ((o->mode & 3) == 2)
+                fr = fx(NULL, FUTEX_WAKE | priv, 1, NULL, NULL, 0);
+            else
+                fr = fx(u, FUTEX_WAKE | FUTEX_CLOCK_REALTIME | priv, 1, NULL, NULL, 0);
+        }
+        }
+        if (o->x != 7) {
+            if (fr < 0)
+                say(" = %s", ename((int)-fr));
+            else
+                say(" = %ld", fr);
+        }
+        tsettle();
+        tshow();
         break;
     }
     case FLOCK:
@@ -3963,6 +4330,9 @@ static void child(const char *w, int n, const unsigned char *keep) {
     sess_pid = getppid();
     memset(kpid, 0, sizeof kpid);
     memset(kgone, 0, sizeof kgone);
+    memset(th, 0, sizeof th);
+    memset(fw, 0, sizeof fw);
+    rights_sent = 0;
     for (int i = 0; i < MAXOPS; i++)
         ksync[i] = -1;
     // コアは作らない (作るかどうかで wait の status の印が変わる。作ると world に出る)

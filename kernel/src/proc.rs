@@ -1114,7 +1114,12 @@ pub fn poll_wake(key: usize) {
 /// 調べもの用 (/proc/strace に "kick PID"): tgid の futex で眠っているスレッドをみな起こす。
 /// futex はわけもなく起きてよい (待つ側が値を見なおす) ので、起こしが消えて眠りつづけているのかを確かめられる
 pub fn futex_kick(tgid: u32) -> usize {
-    wake_where(|p| p.tgid == tgid && p.last_sys.0 == 98 && p.chan != poll_chan())
+    crate::futex::kick(tgid)
+}
+
+/// tid のスレッドが chan で眠っていれば起こす (futex: 待つものはみな同じ chan で眠り、起こすものを選ぶ)
+pub fn wake_tid(tid: u32, chan: usize) -> bool {
+    wake_where(|p| p.pid == tid && p.chan == chan) > 0
 }
 
 /// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
@@ -1162,13 +1167,9 @@ fn clear_child_tid(p: &mut Proc) {
         let addr = p.clear_tid;
         p.clear_tid = 0;
         if p.pt().copy_out(addr, &0u32.to_le_bytes()).is_some() {
-            wakeup(futex_chan(p, addr));
+            crate::futex::wake_exit(addr);
         }
     }
-}
-
-pub fn futex_chan(p: &Proc, uaddr: usize) -> usize {
-    p.mm_id() ^ (uaddr << 1) ^ 1
 }
 
 /// いまのスレッドだけを終える。代表スレッドならプロセスの終了になる
@@ -1181,6 +1182,7 @@ fn exit_status(status: i32) -> ! {
     crate::trace::exit(p.pid, status as i64);
     crate::ns::init_exited(p);
     clear_child_tid(p);
+    crate::futex::exit(p.pid);
     vfork_done(p);
     if p.thread {
         // 使った時間は代表スレッドに持たせる

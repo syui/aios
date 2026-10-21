@@ -319,9 +319,11 @@ pub fn parent_reaps_automatically(parent: &Proc) -> bool {
 
 // ---- 届ける ----
 
-/// 待ちが割り込まれたシステムコールを、戻る前にやり直させる印
+/// 待ちが割り込まれたシステムコールを、戻る前にやり直させる印。restartable は Linux の ERESTARTSYS (ハンドラが
+/// 動くなら SA_RESTART のときだけ)、always は ERESTARTNOINTR (ハンドラが動いてもいつも。futex の LOCK_PI)
 pub struct Restart {
     pub restartable: bool,
+    pub always: bool,
 }
 
 const FRAME_INFO: usize = 128;
@@ -516,7 +518,7 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             },
             _ => {
                 if let Some(r) = &interrupted {
-                    if r.restartable && a.flags & SA_RESTART != 0 {
+                    if r.always || (r.restartable && a.flags & SA_RESTART != 0) {
                         restart(p, tf);
                     }
                 }

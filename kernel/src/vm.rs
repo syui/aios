@@ -1595,6 +1595,16 @@ impl PageTable {
         self.user_pa(va, false, false)
     }
 
+    /// ユーザーの 32 ビットの語 (futex) を、カーネルから原子的にさわれるところ。写して (write なら書けるように:
+    /// 共有のページは写しなおす)、そろっていなければ None
+    pub fn user_u32(&mut self, va: usize, write: bool) -> Option<&'static core::sync::atomic::AtomicU32> {
+        if va % 4 != 0 {
+            return None;
+        }
+        let pa = self.user_pa(va, write, false)?;
+        Some(unsafe { &*(p2v(pa) as *const core::sync::atomic::AtomicU32) })
+    }
+
     /// ユーザー空間 src から dst へコピー
     pub fn copy_in(&mut self, dst: &mut [u8], src: usize) -> Option<()> {
         self.each_chunk(src, dst.len(), false, false, |pa, off, n| unsafe {
