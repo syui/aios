@@ -2655,7 +2655,13 @@ pub fn atmark(u: &InetRef) -> Result<i32, i64> {
 /// /proc/ai/fd などの、読まれずに残っているもの
 pub fn pending(u: &InetRef) -> u64 {
     let s = u.borrow();
-    if s.tcp { s.rcv_nxt.wrapping_sub(s.copied_seq) as u64 } else { s.dq.iter().map(|d| d.data.len() as u64).sum() }
+    if !s.tcp {
+        return s.dq.iter().map(|d| d.data.len() as u64).sum();
+    }
+    // FIN の分 (rcv_nxt に 1 つ入っている) は読めるバイトではない (Linux の tcp_inq と同じ。相手が閉じたあとの
+    // 読みは、入れ物にさわれなくても 0)
+    let n = s.rcv_nxt.wrapping_sub(s.copied_seq) as u64;
+    if n != 0 && s.done { n - 1 } else { n }
 }
 
 // ---- 名前 ----
