@@ -2728,7 +2728,7 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
         let mut ts = [0u8; 16];
         proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
-        Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
+        Some(crate::timer::ticks_after(ns))
     };
     // 見張るものの印 (どれかわからないものがあれば、何でも起こしてもらう)
     let mut keys = Some(alloc::vec::Vec::new());
@@ -2825,7 +2825,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
         let mut ts = [0u8; 16];
         proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
-        Some(crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000))
+        Some(crate::timer::ticks_after(ns))
     };
     let mut keys = Some(alloc::vec::Vec::new());
     for i in 0..nfds {

@@ -369,7 +369,7 @@ fn upgrade(w: &Option<W>) -> Option<InetRef> {
 
 /// 眠る (SO_RCVTIMEO / SO_SNDTIMEO があればそこまで: 時間切れは EAGAIN)。until は時刻でやることの時刻 (0 は無し)
 fn wait(chan: usize, timeo: u64, until: u64) -> Result<(), i64> {
-    let deadline = if timeo == 0 { 0 } else { ticks() + timeo.div_ceil(1_000_000_000 / HZ).max(1) };
+    let deadline = if timeo == 0 { 0 } else { crate::timer::ticks_after(timeo) };
     let d = match (deadline, until) {
         (0, x) | (x, 0) => x,
         (a, b) => a.min(b),

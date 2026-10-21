@@ -397,7 +397,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         INOTIFY_RM_WATCH => crate::inotify::rm_watch(a[0], a[1] as i32),
         EPOLL_CREATE1 => crate::epoll::create1(a[0]),
         EPOLL_CTL => crate::epoll::ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
-        EPOLL_PWAIT => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ticks(int(a[3])))),
+        EPOLL_PWAIT => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ns(int(a[3])))),
         EPOLL_PWAIT2 => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize)),
         // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
@@ -1320,18 +1320,13 @@ fn read_timespec(va: usize) -> Result<u64, i64> {
     Ok(sec.saturating_mul(1_000_000_000).saturating_add(nsec))
 }
 
-fn ns_to_ticks(ns: u64) -> u64 {
-    (ns / 1000).saturating_mul(timer::HZ).div_ceil(1_000_000).max(1)
-}
-
 /// nanosleep / clock_nanosleep。シグナルで起こされたら残りを rem に書いて EINTR
 fn sys_nanosleep(clock: u64, flags: u64, req: usize, rem: usize) -> R {
     const TIMER_ABSTIME: u64 = 1;
     let want = read_timespec(req)?;
     let now_ns = || if clock == CLOCK_REALTIME { timer::epoch_ns() } else { timer::uptime_ns() };
     let rel = if flags & TIMER_ABSTIME != 0 { want.saturating_sub(now_ns()) } else { want };
-    let start = timer::ticks();
-    let until = start + ns_to_ticks(rel);
+    let until = timer::ticks_after(rel);
     while timer::ticks() < until {
         // chan 0 は誰も起こさないので、期限まで眠る
         if let Err(e) = proc::sleep_until(0, until) {

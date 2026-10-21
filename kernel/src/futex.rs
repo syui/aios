@@ -286,7 +286,7 @@ fn deadline(cmd: u64, op: u64, ts: usize) -> Result<Option<u64>, i64> {
     if rel == 0 {
         return Ok(Some(0));
     }
-    Ok(Some(crate::timer::ticks() + (rel / 1000).saturating_mul(crate::timer::HZ).div_ceil(1_000_000).max(1)))
+    Ok(Some(crate::timer::ticks_after(rel)))
 }
 
 // ---- システムコール ----

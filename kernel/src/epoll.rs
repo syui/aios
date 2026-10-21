@@ -203,12 +203,12 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
 }
 
 /// epoll_pwait (timeout はミリ秒、-1 で無限) / epoll_pwait2 (timespec)
-pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ticks: Option<u64>) -> Result<i64, i64> {
+pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ns: Option<u64>) -> Result<i64, i64> {
     if max <= 0 {
         return Err(-EINVAL);
     }
     let ep = epoll_of(epfd)?;
-    let deadline = timeout_ticks.map(|t| crate::timer::ticks() + t);
+    let deadline = timeout_ns.map(crate::timer::ticks_after);
     loop {
         let got = {
             let _p = crate::prof::span("epoll:collect");
@@ -244,14 +244,14 @@ pub fn pwait2(epfd: i64, events: usize, max: i64, ts: usize) -> Result<i64, i64>
         let mut b = [0u8; 16];
         proc::current().pt().copy_in(&mut b, ts).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(b[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[8..].try_into().unwrap());
-        Some((ns * crate::timer::HZ).div_ceil(1_000_000_000))
+        Some(ns)
     };
     pwait(epfd, events, max, t)
 }
 
-/// ミリ秒 (負なら無限) を tick に
-pub fn ms_to_ticks(ms: i64) -> Option<u64> {
-    (ms >= 0).then(|| (ms as u64 * crate::timer::HZ).div_ceil(1000))
+/// ミリ秒 (負なら無限) を ns に
+pub fn ms_to_ns(ms: i64) -> Option<u64> {
+    (ms >= 0).then(|| ms as u64 * 1_000_000)
 }
 
 // ---- eventfd ----

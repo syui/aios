@@ -62,6 +62,16 @@ pub fn ticks() -> u64 {
     uptime_ns() / (1_000_000_000 / HZ)
 }
 
+/// いまから ns たったときの期限 (tick)。その tick になれば、かならず ns たっている: 早く起きない (Linux の hrtimer と
+/// 同じきまり。aios は tick の境め (10 ms ごと) で起きるので、そこまで遅れる)。前の ticks() + 切り上げた tick の数は、
+/// tick の途中から待つと 1 tick 近く早く起きた。0 はいま (待たない)
+pub fn ticks_after(ns: u64) -> u64 {
+    if ns == 0 {
+        return ticks();
+    }
+    uptime_ns().saturating_add(ns).div_ceil(1_000_000_000 / HZ)
+}
+
 /// 仕事がなくて眠る CPU (cpu0 以外) はタイマを止める (起こすのは IPI。時刻や期限は cpu0 が見る)。
 /// 眠っている CPU が 1 秒に 100 回起きると、QEMU (TCG / HVF) の中で取りあいになって遅くなる
 pub fn idle(on: bool) {

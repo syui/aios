@@ -552,7 +552,7 @@ fn wait(chan: usize, timeo: u64) -> Result<(), i64> {
     if timeo == 0 {
         return proc::sleep(chan);
     }
-    let deadline = crate::timer::ticks() + timeo.div_ceil(1_000_000_000 / crate::timer::HZ).max(1);
+    let deadline = crate::timer::ticks_after(timeo);
     if proc::sleep_until(chan, deadline)? { Ok(()) } else { Err(-EAGAIN) }
 }
 

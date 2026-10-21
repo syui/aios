@@ -665,7 +665,7 @@ pub fn rt_sigtimedwait(set: usize, info: usize, timeout: usize) -> R {
         let mut b = [0u8; 16];
         proc::current().pt().copy_in(&mut b, timeout).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(b[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[8..].try_into().unwrap());
-        crate::timer::ticks() + (ns * crate::timer::HZ).div_ceil(1_000_000_000).max(if ns == 0 { 0 } else { 1 })
+        crate::timer::ticks_after(ns)
     };
     loop {
         let p = proc::current();
@@ -845,7 +845,6 @@ pub fn setitimer(which: u64, new: usize, old: usize) -> R {
     if which != 0 {
         return Err(-EINVAL); // ITIMER_VIRTUAL/PROF はない
     }
-    let now = crate::timer::ticks();
     let leader = proc::current_leader();
     if old != 0 {
         getitimer(which, old)?;
@@ -855,8 +854,8 @@ pub fn setitimer(which: u64, new: usize, old: usize) -> R {
         let mut b = [0u8; 32];
         proc::current().pt().copy_in(&mut b, new).ok_or(-EFAULT)?;
         let tv = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap()) * 1000;
-        let (interval, value) = (ns_to_ticks(tv(0)), ns_to_ticks(tv(16)));
-        leader.itimer = if value == 0 { (0, 0) } else { (now + value, interval) };
+        let (interval, value) = (ns_to_ticks(tv(0)), tv(16));
+        leader.itimer = if value == 0 { (0, 0) } else { (crate::timer::ticks_after(value), interval) };
     }
     Ok(0)
 }
@@ -920,15 +919,14 @@ pub fn timer_settime(id: i32, flags: u64, new: usize, old: usize) -> R {
     let interval = read_timespec(new)?;
     let value = read_timespec(new + 16)?;
     let t = timer_of(id)?;
-    let now = crate::timer::ticks();
     t.interval = ns_to_ticks(interval);
     t.deadline = if value == 0 {
         0
     } else if flags & TIMER_ABSTIME != 0 {
         let cur = if t.realtime { crate::timer::epoch_ns() } else { crate::timer::uptime_ns() };
-        now + ns_to_ticks(value.saturating_sub(cur)).max(1)
+        crate::timer::ticks_after(value.saturating_sub(cur).max(1))
     } else {
-        now + ns_to_ticks(value).max(1)
+        crate::timer::ticks_after(value)
     };
     t.overrun = 0;
     Ok(0)

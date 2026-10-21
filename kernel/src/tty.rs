@@ -543,7 +543,7 @@ fn read_inner(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64
                 }
                 // VTIME は 0.1 秒単位 (tick は 10ms)。VMIN > 0 なら 1 文字来てからの時間
                 if vtime > 0 && deadline == 0 && (vmin == 0 || have > 0) {
-                    deadline = crate::timer::ticks() + vtime * 10;
+                    deadline = crate::timer::ticks_after(vtime * 100_000_000);
                 }
             }
             if t.hung_up() {
