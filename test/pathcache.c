@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -185,6 +186,58 @@ static void run(const char *dir) {
     CHECK("gate-parent-owner-new", st_as(1000, 1000, -1, sb) == 0);
     unlink(sa); unlink(sb); rmdir(s_);
     unlink(pf); rmdir(p);
+  }
+  // 作ったものはその場で覚える (Linux の d_instantiate) ので、そのあとの消す・名前を変える・上書きする rename が
+  // 見えるか。名前ごとに捨てるので、となりの名前の覚えは残り、上書きされた名前は新しいものになる
+  {
+    char na[512], nb[512], nd[512], ndf[600];
+    snprintf(na, sizeof na, "%s/na", base); snprintf(nb, sizeof nb, "%s/nb", base); snprintf(nd, sizeof nd, "%s/nd", base);
+    snprintf(ndf, sizeof ndf, "%s/nd/f", base);
+    touch(na);
+    struct stat a1, b1, a2;
+    CHECK("new-file", st(na, &a1) == 0);
+    touch(nb);
+    CHECK("new-sibling", st(nb, &b1) == 0 && st(na, &a2) == 0 && a2.st_ino == a1.st_ino);
+    CHECK("new-rename-over", rename(nb, na) == 0);
+    CHECK("new-rename-over-new", st(na, &a2) == 0 && a2.st_ino == b1.st_ino);
+    CHECK("new-rename-over-gone", st(nb, 0) == -ENOENT);
+    unlink(na);
+    CHECK("new-unlinked", st(na, 0) == -ENOENT);
+    CHECK("new-dir", mkdir(nd, 0755) == 0 && st(nd, &a1) == 0 && S_ISDIR(a1.st_mode));
+    touch(ndf);
+    CHECK("new-dir-file", st(ndf, 0) == 0);
+    unlink(ndf);
+    CHECK("new-dir-file-gone", st(ndf, 0) == -ENOENT);
+    rmdir(nd);
+    CHECK("new-dir-gone", st(nd, 0) == -ENOENT && st(ndf, 0) == -ENOENT);
+    touch(nd);
+    CHECK("new-dir-now-file", st(nd, &a1) == 0 && S_ISREG(a1.st_mode) && st(ndf, 0) == -ENOTDIR);
+    unlink(nd);
+  }
+  // 覚えたファイルを消すと、場所がすぐ戻る (覚えが inode を持ったままにしない)。リンクのディレクトリを通った
+  // パスで覚えていても
+  {
+    char bd[512], bl[512], bf[600], blf[600];
+    snprintf(bd, sizeof bd, "%s/bd", base); snprintf(bl, sizeof bl, "%s/bl", base);
+    snprintf(bf, sizeof bf, "%s/big", bd); snprintf(blf, sizeof blf, "%s/big", bl);
+    mkdir(bd, 0755); symlink("bd", bl);
+    for (int round = 0; round < 2; round++) {
+      struct statvfs v0, v1, v2;
+      sync(); statvfs(bd, &v0);
+      int fd = open(bf, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+      static char chunk[1 << 16];
+      memset(chunk, 'z', sizeof chunk);
+      for (int i = 0; i < 128; i++) if (write(fd, chunk, sizeof chunk) != (ssize_t)sizeof chunk) break;
+      fsync(fd); close(fd);
+      st(bf, 0);
+      if (round == 1) st(blf, 0);
+      statvfs(bd, &v1);
+      unlink(bf);
+      sync(); statvfs(bd, &v2);
+      double used = (double)(v0.f_bfree - v1.f_bfree) * v0.f_frsize, back = (double)(v2.f_bfree - v1.f_bfree) * v0.f_frsize;
+      CHECK(round ? "unlink-frees-via-link" : "unlink-frees", used >= 4e6 && back >= used * 0.9);
+    }
+    unlink(bl); rmdir(bd);
   }
   // リンクのディレクトリを覚えたあとの、その中の名前 (リンクの先を親として、そこから引く)
   {

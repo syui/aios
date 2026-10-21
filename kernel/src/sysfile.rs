@@ -1232,6 +1232,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
+            vfs::remember_new(&full, &parent, &name, &ino);
             inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
             // 作ったばかりのものは、mode に関係なく開ける
@@ -1503,6 +1504,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     // setuid と setgid は落とす (Linux の vfs_mkdir は S_IRWXUGO と S_ISVTX だけ。setgid は親が setgid なら own_new が)
     let ino = parent.create(&name, mode as u32 & 0o1777 & !umask(), NewNode::Dir)?;
     own_new(&c, &parent, &ino)?;
+    vfs::remember_new(&full, &parent, &name, &ino);
     inotify::dir_event(&parent, &name, inotify::IN_CREATE | inotify::IN_ISDIR, 0);
     Ok(0)
 }
@@ -1638,6 +1640,7 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     // 消したファイルをまだ使われているものとして orphan のリストに入れ、手を放したときに片づけることになる)
     let victim = if inotify::active() { parent.lookup(&name).ok() } else { None };
     parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
+    vfs::forget(&full);
     let dir = flags & AT_REMOVEDIR != 0;
     // Linux と同じ順: 消えたもの (リンクの数が変わった IN_ATTRIB、なくなれば DELETE_SELF と IGNORED)、それから親に DELETE
     if let Some(v) = victim {
@@ -1836,6 +1839,8 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     let moved = op.lookup(&oname).ok();
     let replaced = np.lookup(&nname).ok().filter(|r| moved.as_ref().is_none_or(|m| m.id() != r.id()));
     op.rename(&oname, &np, &nname)?;
+    vfs::forget(&ofull);
+    vfs::forget(&nfull);
     if let Some(m) = moved {
         let isdir = if m.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
         let ck = inotify::cookie();

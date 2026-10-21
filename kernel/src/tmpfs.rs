@@ -379,7 +379,7 @@ impl TmpInode {
         let child = TmpInode::new(self.fs, mode, node);
         child.attr.borrow_mut().mtime = mtime;
         // ほかのものと同じく (パスの覚えは、ないという答えも覚えている)
-        crate::vfs::dir_changed(self.id());
+        crate::vfs::name_changed(self.id(), name);
         self.insert(name, child)
     }
 
@@ -661,7 +661,7 @@ impl Inode for TmpInode {
         if unsafe { INODES } >= inode_limit() {
             return Err(-ENOSPC);
         }
-        crate::vfs::dir_changed(self.id());
+        crate::vfs::name_changed(self.id(), name);
         let mode = node.type_bits() | (mode & 0o7777);
         let node = match node {
             NewNode::File => Node::File(Data::Owned(Pages::new())),
@@ -697,7 +697,7 @@ impl Inode for TmpInode {
     }
 
     fn link(&self, name: &str, target: &InodeRef) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
+        crate::vfs::name_changed(self.id(), name);
         let t = TmpInode::downcast(target, self.fs)?;
         if matches!(*t.node.borrow(), Node::Dir(_)) {
             return Err(-EPERM);
@@ -713,7 +713,7 @@ impl Inode for TmpInode {
     }
 
     fn unlink(&self, name: &str, rmdir: bool) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
+        crate::vfs::name_changed(self.id(), name);
         let child = self.with_dir(|m| m.get(name).cloned().ok_or(-ENOENT))?;
         let is_dir = match &*child.node.borrow() {
             Node::Dir(m) if rmdir && !m.is_empty() => return Err(-ENOTEMPTY),
@@ -737,8 +737,8 @@ impl Inode for TmpInode {
     }
 
     fn rename(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
-        crate::vfs::dir_changed(newdir.id());
+        crate::vfs::name_changed(self.id(), old);
+        crate::vfs::name_changed(newdir.id(), new);
         let nd = TmpInode::downcast(newdir, self.fs)?;
         let child = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
         let is_dir = matches!(*child.node.borrow(), Node::Dir(_));
@@ -765,8 +765,8 @@ impl Inode for TmpInode {
     }
 
     fn exchange(&self, old: &str, newdir: &InodeRef, new: &str) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
-        crate::vfs::dir_changed(newdir.id());
+        crate::vfs::name_changed(self.id(), old);
+        crate::vfs::name_changed(newdir.id(), new);
         let nd = TmpInode::downcast(newdir, self.fs)?;
         let a = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
         let b = nd.with_dir(|m| m.get(new).cloned().ok_or(-ENOENT))?;
@@ -796,7 +796,9 @@ impl Inode for TmpInode {
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
+        if self.attr.borrow().mode & S_IFMT == S_IFDIR {
+            crate::vfs::dir_changed(self.id());
+        }
         let mut a = self.attr.borrow_mut();
         a.mode = (a.mode & S_IFMT) | (mode & 0o7777);
         a.ctime = now();
@@ -804,7 +806,9 @@ impl Inode for TmpInode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
-        crate::vfs::dir_changed(self.id());
+        if self.attr.borrow().mode & S_IFMT == S_IFDIR {
+            crate::vfs::dir_changed(self.id());
+        }
         let mut a = self.attr.borrow_mut();
         if let Some(u) = uid {
             a.uid = u;

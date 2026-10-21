@@ -471,30 +471,33 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     }
     let key = (current_mnt().id, normalize(cwd, path), follow);
     let cache = unsafe { &mut *(&raw mut PATHS) };
-    // 変わったものを捨てる (ここで: inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
-    let pending = unsafe { &mut *(&raw mut PATHS_PENDING) };
     if PATHS_ALL.swap(false, core::sync::atomic::Ordering::Relaxed) {
-        pending.clear();
         let old = core::mem::take(cache);
         drop(old);
-    } else if !pending.is_empty() {
-        let dirs = core::mem::take(pending);
-        cache.retain(|_, e| !e.dirs.iter().any(|d| dirs.contains(d)));
     }
-    if let Some(e) = cache.get_mut(&key) {
-        PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        e.used = true;
-        // 覚えたのはほかの人かもしれない: だれでもは通れないディレクトリを、引く人が通れるか (たどるときと同じ順に)
-        if !e.gates.is_empty() {
-            let cred = crate::proc::current_cred_ref();
-            for g in &e.gates {
-                cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X)?;
+    // 通ったところの名前やディレクトリが変わっていれば (版がちがえば)、古い答え: 捨てて引きなおす
+    // (捨てるのはここで: inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
+    let stale = match cache.get_mut(&key).map(|e| (e.fresh(), e)) {
+        Some((true, e)) => {
+            PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            e.used = true;
+            // 覚えたのはほかの人かもしれない: だれでもは通れないディレクトリを、引く人が通れるか (たどるときと同じ順に)
+            if !e.gates.is_empty() {
+                let cred = crate::proc::current_cred_ref();
+                for g in &e.gates {
+                    cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X)?;
+                }
             }
+            return match &e.found {
+                Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
+                None => Err(-ENOENT),
+            };
         }
-        return match &e.found {
-            Some((walked, ino)) => Ok((walked.clone(), ino.clone())),
-            None => Err(-ENOENT),
-        };
+        Some((false, _)) => true,
+        None => false,
+    };
+    if stale {
+        cache.remove(&key);
     }
     PATHS_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() };
@@ -503,7 +506,9 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     let mut start = None;
     let mut rest = key.1.clone();
     if let Some(cut) = key.1.rfind('/') {
-        if let Some(e) = cache.get_mut(&(key.0, key.1[..cut].to_string(), true)) {
+        if let Some(e) = cache.get_mut(&(key.0, key.1[..cut].to_string(), true))
+            && e.fresh()
+        {
             let cred = crate::proc::current_cred_ref();
             if let Some((walked, ino)) = &e.found {
                 if e.gates.iter().all(|g| cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X).is_ok()) {
@@ -517,18 +522,18 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         }
     }
     let r = walk(start, rest, follow, &mut t);
-    // あったものと、ない (ENOENT) ものを覚える。たどっているあいだに変わったものがあれば覚えない (念のため)
+    // あったものと、ない (ENOENT) ものを覚える。たどっているあいだに変わったものがあれば (版がちがえば) 覚えない
     let keep = match &r {
         Ok(_) => true,
         Err(e) => *e == -ENOENT,
     };
-    if keep && t.ok && pending.is_empty() && !PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) && !heap_crowded() {
+    if keep && t.ok && t.dirs.iter().all(Pass::valid) && !PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) && !heap_crowded() {
         let max = paths_max();
         if cache.len() >= max {
-            // 前にいっぱいになったときから引かれなかったものを捨てる (引かれたものは印を消して残す)。
+            // 古いものと、前にいっぱいになったときから引かれなかったものを捨てる (引かれたものは印を消して残す)。
             // あまり減らなければ全部
             PATHS_SWEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            cache.retain(|_, e| core::mem::take(&mut e.used));
+            cache.retain(|_, e| core::mem::take(&mut e.used) && e.fresh());
             if cache.len() >= max / 4 * 3 {
                 cache.clear();
             }
@@ -536,9 +541,9 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
         // 途中のディレクトリも (次にその中の名前を引くときは、そこから)
         for (walked, ino, d, g) in core::mem::take(&mut t.prefixes) {
             let (dirs, gates) = (t.dirs[..d].to_vec(), t.gates[..g].to_vec());
-            cache.entry((key.0, walked.clone(), true)).or_insert_with(|| PathEntry { found: Some((walked, ino)), used: false, dirs, gates });
+            cache.entry((key.0, walked.clone(), true)).or_insert_with(|| PathEntry::new(Some((walked, ino)), dirs, gates));
         }
-        cache.insert(key, PathEntry { found: r.as_ref().ok().cloned(), used: false, dirs: t.dirs, gates: t.gates });
+        cache.insert(key, PathEntry::new(r.as_ref().ok().cloned(), t.dirs, t.gates));
     }
     r
 }
@@ -550,9 +555,11 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
 /// 覚えるのは、たどったものがみな path_cacheable で、魔法のリンクがないときだけ。
 /// 覚えはだれが引いても同じものを返すので、通ったディレクトリのうち u・g・o のどれかに x がないもの (/home/ai の
 /// 0700 など) は属性も覚えておき、覚えから答えるたびに、引く人がそこを通れるかを確かめなおす (通れなければ、
-/// たどったときと同じ EACCES)。ディレクトリの中の名前や、ディレクトリの属性 (chmod、chown) が変わったら
-/// dir_changed で、そこを通ったものだけを捨てる (ないものも、その名前を探したディレクトリを通ったものに
-/// 入れてあるので、作れば捨てられる。/run の rename が 5 秒ごとにあっても、ほかのものは残る)。
+/// たどったときと同じ EACCES)。覚えは通ったところ (ディレクトリと、そこで引いた名前) の版 (Pass、GENS) を持ち、
+/// 名前が変わる (name_changed: 作る・消す・名前を変える) か、ディレクトリの属性が変わる (dir_changed: chmod、
+/// chown) と版が進むので、そこを通ったものだけが古くなり、次に引いたときに捨てる (ないものも、その名前を探した
+/// ところを持っているので、作れば古くなる。ほかの名前の覚えは残る: Linux の dcache と同じく名前ごと)。消した
+/// ものの覚えは forget ですぐ捨てる (inode を持ったままにしない)。
 /// マウントが変わったら names_changed で全部。いっぱいになったら (paths_max)、前にいっぱいになったときから
 /// 引かれなかったものを捨てる。たどった途中のディレクトリも (ルートからリンクをたどらずに来たもの) 覚え、覚えに
 /// ないパスは、親のディレクトリを覚えていればそこから最後の名前だけを引く (Linux の dcache が名前ごとに覚えるのと
@@ -562,10 +569,52 @@ struct PathEntry {
     found: Option<(String, InodeRef)>,
     /// 前にいっぱいになったときから引かれたか
     used: bool,
-    dirs: Vec<(usize, u64)>,
+    /// 通ったところ (ディレクトリと、そこで引いた名前の版)
+    dirs: Vec<Pass>,
     /// 通ったディレクトリのうち、だれでもは通れないもの (通った順)
     gates: Vec<Gate>,
+    /// 前にたしかめた (作った) ときの CHANGES
+    checked: u64,
 }
+
+impl PathEntry {
+    fn new(found: Option<(String, InodeRef)>, dirs: Vec<Pass>, gates: Vec<Gate>) -> PathEntry {
+        if let Some((_, i)) = &found {
+            *unsafe { &mut *(&raw mut HOLDS) }.entry(i.id()).or_insert(0) += 1;
+        }
+        PathEntry { found, used: false, dirs, gates, checked: unsafe { CHANGES } }
+    }
+
+    /// 通ったところがどれも変わっていないか。前にたしかめてから版の表がまったく変わっていなければ、見なくてよい
+    fn fresh(&mut self) -> bool {
+        let now = unsafe { CHANGES };
+        if self.checked == now {
+            return true;
+        }
+        let ok = self.dirs.iter().all(Pass::valid);
+        if ok {
+            self.checked = now;
+        }
+        ok
+    }
+}
+
+impl Drop for PathEntry {
+    fn drop(&mut self) {
+        if let Some((_, i)) = &self.found {
+            let h = unsafe { &mut *(&raw mut HOLDS) };
+            if let Some(n) = h.get_mut(&i.id()) {
+                *n -= 1;
+                if *n == 0 {
+                    h.remove(&i.id());
+                }
+            }
+        }
+    }
+}
+
+/// inode (id) ごとの、それを持っている覚えの数 (ext4 は引くたびに別の InodeRef を作るので、Rc の数ではわからない)
+static mut HOLDS: alloc::collections::BTreeMap<(usize, u64), u32> = alloc::collections::BTreeMap::new();
 
 /// だれでもは通れないディレクトリの、通れるかを決める属性 (Meta まるごとでは大きいので)
 #[derive(Clone)]
@@ -579,14 +628,99 @@ struct Gate {
 /// (ルートからリンクをたどらずに来たもの: たどったパス、inode、そこまでの dirs と gates の数。lookup がそれも覚える)
 struct Trace {
     ok: bool,
-    dirs: Vec<(usize, u64)>,
+    dirs: Vec<Pass>,
     gates: Vec<Gate>,
     prefixes: Vec<(String, InodeRef, usize, usize)>,
 }
 
 static mut PATHS: alloc::collections::BTreeMap<(u64, String, bool), PathEntry> = alloc::collections::BTreeMap::new();
-/// 変わったディレクトリ (次の lookup で、そこを通ったものを捨てる)
-static mut PATHS_PENDING: Vec<(usize, u64)> = Vec::new();
+/// 版の表: (ディレクトリ, 名前の印) ごとに、その名前が変わる (作る・消す・名前を変える) たびに増やす数。印 ATTR は
+/// ディレクトリの属性 (chmod、chown) の版。覚えは、通ったところの版を持っていて、引くときにちがえば古い (Linux の
+/// dcache の d_seq のように、変わったときに覚えをみな見なおさない)。表は開番地法のハッシュ表 (キーはそのまま
+/// くらべる)。半分まで埋まったら空にして EPOCH を進める (覚えはみな古くなる。ないものを探すのが長くならないように)
+const GEN_SLOTS: usize = 16384;
+const ATTR: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct GenSlot {
+    used: bool,
+    dir: (usize, u64),
+    name: u64,
+    ver: u32,
+}
+
+/// 0 ばかりなので bss に置かれる
+const EMPTY: GenSlot = GenSlot { used: false, dir: (0, 0), name: 0, ver: 0 };
+static mut GENS: [GenSlot; GEN_SLOTS] = [EMPTY; GEN_SLOTS];
+static mut GENS_USED: usize = 0;
+static mut EPOCH: u32 = 0;
+/// 版の表が変わった回数 (PathEntry::fresh)
+static mut CHANGES: u64 = 0;
+
+fn gens() -> &'static mut [GenSlot; GEN_SLOTS] {
+    unsafe { &mut *(&raw mut GENS) }
+}
+
+/// (dir, name) の場所: あればそこ、なければ入れるところ
+fn gen_find(dir: (usize, u64), name: u64) -> usize {
+    let g = gens();
+    let mut i = (((dir.1 ^ (dir.0 as u64).rotate_left(32)) ^ name.rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 50) as usize;
+    while g[i].used && (g[i].dir != dir || g[i].name != name) {
+        i = (i + 1) % GEN_SLOTS;
+    }
+    i
+}
+
+fn gen_of(dir: (usize, u64), name: u64) -> u32 {
+    gens()[gen_find(dir, name)].ver
+}
+
+fn gen_bump(dir: (usize, u64), name: u64) {
+    unsafe { CHANGES += 1 };
+    let i = gen_find(dir, name);
+    let g = gens();
+    if !g[i].used {
+        unsafe {
+            if GENS_USED >= GEN_SLOTS / 2 {
+                *g = [EMPTY; GEN_SLOTS];
+                GENS_USED = 0;
+                EPOCH = EPOCH.wrapping_add(1);
+                return;
+            }
+            GENS_USED += 1;
+        }
+        g[i] = GenSlot { used: true, dir, name, ver: 0 };
+    }
+    g[i].ver = g[i].ver.wrapping_add(1);
+}
+
+/// 名前の印 (FNV-1a)
+fn name_hash(name: &str) -> u64 {
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    if h == ATTR { 0 } else { h }
+}
+
+/// 覚えが通ったところ: ディレクトリ dir で名前 (の印 name) を引いたときの、名前の版とディレクトリの属性の版
+#[derive(Clone, Copy)]
+struct Pass {
+    dir: (usize, u64),
+    name: u64,
+    ngen: u32,
+    agen: u32,
+    epoch: u32,
+}
+
+impl Pass {
+    /// いまの版で (名前を引く前に作る: 引いているあいだに変わったものは、あとで古いとわかる)
+    fn new(dir: (usize, u64), name: &str) -> Pass {
+        let name = name_hash(name);
+        Pass { dir, name, ngen: gen_of(dir, name), agen: gen_of(dir, ATTR), epoch: unsafe { EPOCH } }
+    }
+
+    fn valid(&self) -> bool {
+        self.epoch == unsafe { EPOCH } && gen_of(self.dir, self.name) == self.ngen && gen_of(self.dir, ATTR) == self.agen
+    }
+}
 /// 全部捨てる
 static PATHS_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// 覚えから答えた数 (/proc/bkl)
@@ -612,17 +746,67 @@ pub fn names_changed() {
     PATHS_ALL.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// ディレクトリ dir の中の名前 (作る・消す・名前を変える) か、dir の属性 (chmod、chown) が変わった:
-/// dir を通ったパスの覚えを捨てる (次に引くときに)。ふつうのファイルの属性が変わったときに呼んでもよい
+/// ディレクトリ dir の属性 (chmod、chown) が変わった: dir を通ったパスの覚えはみな古い (次に引くときに捨てる)。
+/// ディレクトリのときだけ呼ぶ (ふつうのファイルの属性は、覚えが答える inode からいつも読む)
 pub fn dir_changed(dir: (usize, u64)) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { DIR_GENS[gen_slot(dir)] += 1 };
-    let p = unsafe { &mut *(&raw mut PATHS_PENDING) };
-    if p.len() >= 64 {
-        names_changed();
-    } else if !p.contains(&dir) {
-        p.push(dir);
+    gen_bump(dir, ATTR);
+}
+
+/// ディレクトリ dir の中の名前 name が変わった (作る・消す・名前を変える・リンク): dir で name を引いたパスの覚え
+/// (その下のものも) だけが古い。ほかの名前の覚えは残る (Linux の dcache も名前ごと)
+pub fn name_changed(dir: (usize, u64), name: &str) {
+    PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    unsafe { DIR_GENS[gen_slot(dir)] += 1 };
+    gen_bump(dir, name_hash(name));
+}
+
+/// 消したもの、名前を変えたものの覚えをすぐ捨てる (パス full: リンクをたどったあとの、先頭 / なし)。古い覚えは
+/// 次に引くまで残るので、消したファイルの inode を持ったままにしない (持っていると ext4 は片づけずに orphan として
+/// 残す。Linux の d_delete)
+pub fn forget(full: &str) {
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let mnt = current_mnt().id;
+    let mut held = None;
+    for follow in [true, false] {
+        if let Some(e) = cache.remove(&(mnt, full.to_string(), follow)) {
+            held = held.or(e.found.as_ref().map(|(_, i)| (i.id(), i.meta().nlink)));
+        }
     }
+    // ほかの書きかた (リンクやバインドマウントを通ったパス) の覚えも、消えたもの (リンクが 0) を持っていれば捨てる。
+    // まだ持っている覚えがあるときだけ全部を見る (rm -r のように 1 つずつ消すときは、ふつう見ない)
+    if let Some((id, 0)) = held
+        && unsafe { (*(&raw const HOLDS)).contains_key(&id) }
+    {
+        cache.retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
+    }
+}
+
+/// 作ったばかりのもの (親 parent の中の name、パス full: リンクをたどったあとの、先頭 / なし) を覚える (Linux の
+/// d_instantiate: 作ったあとの stat や open は、引かずに答える)。親を覚えているときだけ (通ったディレクトリと
+/// 通れるかは親の覚えから)。リンクは作らないもの (ふつうのファイルとディレクトリ) だけ。follow ありの答え (stat、open)
+pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
+    if !ino.path_cacheable() || heap_crowded() || PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let Some(cut) = full.rfind('/') else { return };
+    let mnt = current_mnt().id;
+    let full_len = cache.len();
+    let Some(pe) = cache.get_mut(&(mnt, full[..cut].to_string(), true)) else { return };
+    if !pe.found.as_ref().is_some_and(|(_, p)| p.id() == parent.id()) || !pe.fresh() || full_len >= paths_max() {
+        return;
+    }
+    let m = parent.meta();
+    let mut dirs = pe.dirs.clone();
+    // 作ったあとの版で (作ったときに name_changed が増やしている)
+    dirs.push(Pass::new(parent.id(), name));
+    let mut gates = pe.gates.clone();
+    if m.mode & 0o111 != 0o111 {
+        gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
+    }
+    cache.insert((mnt, full.to_string(), true), PathEntry::new(Some((full.to_string(), ino.clone())), dirs, gates));
 }
 
 /// ディレクトリの中が変わった数。id で 256 の箱に分けて数える (同じ箱のほかのディレクトリで増えることもある)。
@@ -746,7 +930,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
             if m.mode & 0o111 != 0o111 {
                 t.gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
             }
-            t.dirs.push(cur.id());
+            t.dirs.push(Pass::new(cur.id(), c));
             // 長すぎる名前は、引くところで (Linux のファイルシステムの lookup と同じ)
             if c.len() > 255 {
                 return Err(-ENAMETOOLONG);
