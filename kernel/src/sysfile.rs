@@ -1410,7 +1410,12 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
         return Ok(0);
     }
     let ino = at_path(dirfd, &path, flags)?;
-    out(st, &Stat::of_inode(&ino).to_bytes())?;
+    let bytes = Stat::of_inode(&ino).to_bytes();
+    out(st, &bytes)?;
+    // 大きなロックなしの stat の覚えに (statc.rs。開いているディレクトリからのものは覚えない)
+    if (dirfd == AT_FDCWD || path.starts_with('/')) && flags & !(AT_SYMLINK_NOFOLLOW | 0x800) == 0 {
+        crate::statc::learn(&path, flags & AT_SYMLINK_NOFOLLOW == 0, &ino, &bytes);
+    }
     Ok(0)
 }
 

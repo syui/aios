@@ -116,6 +116,11 @@ pub trait Inode {
         false
     }
     /// パスの答えを覚えてよいか (名前が勝手に変わらないもの: ext4、tmpfs)。名前や属性を変えるときは dir_changed を呼ぶこと
+    /// 中身 (meta) が変わるたびに statc::ino_bump を呼ぶので、大きなロックなしの stat (statc.rs) が答えてよい
+    fn fast_stat(&self) -> bool {
+        false
+    }
+
     fn path_cacheable(&self) -> bool {
         false
     }
@@ -820,6 +825,7 @@ fn gen_bump(dir: (usize, u64), name: u64) {
                 *g = [EMPTY; GEN_SLOTS];
                 GENS_USED = 0;
                 EPOCH = EPOCH.wrapping_add(1);
+                crate::statc::epoch_bump();
                 return;
             }
             GENS_USED += 1;
@@ -879,6 +885,7 @@ fn heap_crowded() -> bool {
 /// マウントやルートが変わった: パスの覚えを全部捨てる (次に引くときに)
 pub fn names_changed() {
     PATHS_ALL.store(true, core::sync::atomic::Ordering::Relaxed);
+    crate::statc::epoch_bump();
 }
 
 /// ディレクトリ dir の属性 (chmod、chown) が変わった: dir を通ったパスの覚えはみな古い (次に引くときに捨てる)。
@@ -887,6 +894,7 @@ pub fn dir_changed(dir: (usize, u64)) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { DIR_GENS[gen_slot(dir)] += 1 };
     gen_bump(dir, ATTR);
+    crate::statc::dir_bump(dir);
 }
 
 /// ディレクトリ dir の中の名前 name が変わった (作る・消す・名前を変える・リンク): dir で name を引いたパスの覚え
@@ -895,6 +903,7 @@ pub fn name_changed(dir: (usize, u64), name: &str) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { DIR_GENS[gen_slot(dir)] += 1 };
     gen_bump(dir, name_hash(name));
+    crate::statc::dir_bump(dir);
 }
 
 /// 消したもの、名前を変えたものの覚えをすぐ捨てる (パス full: リンクをたどったあとの、先頭 / なし)。古い覚えは
@@ -954,6 +963,20 @@ fn gen_slot(dir: (usize, u64)) -> usize {
 
 pub fn dir_gen(dir: (usize, u64)) -> u64 {
     unsafe { (*(&raw const DIR_GENS))[gen_slot(dir)] }
+}
+
+/// 大きなロックなしの stat (statc.rs) が覚えるもの: パスの覚えに norm (先頭 / なし、畳んだもの) があって、いまも正しく、
+/// 答えが ino なら、通ったディレクトリと、だれでもは通れないディレクトリの (mode, uid, gid)
+pub fn fast_stat_trail(norm: &str, follow: bool, ino: &InodeRef) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
+    if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let e = cache.get_mut(PathKeyRef::new(current_mnt().id, norm, follow).key())?;
+    if !e.fresh() || !e.found.as_ref().is_some_and(|(_, i)| i.id() == ino.id()) {
+        return None;
+    }
+    Some((e.dirs.iter().map(|p| p.dir).collect(), e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect()))
 }
 
 /// いま覚えている数と、そのうちないもの (/proc/bkl)

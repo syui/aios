@@ -1380,9 +1380,11 @@ impl ExtFs {
     }
 
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
-        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)。ExtInode の覚えも
+        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)。ExtInode の覚えも、大きなロックなしの
+        // stat の覚え (statc.rs) も
         self.metas.borrow_mut().remove(&ino);
         self.meta_ver.set(self.meta_ver.get() + 1);
+        crate::statc::ino_bump((self.fs, ino as u64));
         let mut r = r.clone();
         self.set_inode_csum(ino, &mut r);
         let (b, off) = self.inode_loc(ino);
@@ -2837,6 +2839,10 @@ impl Inode for ExtInode {
             S_IFDIR => Err(-EISDIR),
             _ => Err(-EINVAL),
         }
+    }
+
+    fn fast_stat(&self) -> bool {
+        true
     }
 
     fn path_cacheable(&self) -> bool {

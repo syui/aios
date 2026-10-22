@@ -892,6 +892,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             _ => return false,
         },
+        // パスの覚え (statc.rs) にある stat
+        NEWFSTATAT => match crate::statc::lookup(p, a[0] as i32 as i64, a[1] as usize, a[2] as usize, a[3]) {
+            Some(r) => r,
+            None => return false,
+        },
         LSEEK => match crate::file::fast_lseek(p, a[0], a[1] as i64, a[2]) {
             Some(r) => r,
             None => return false,

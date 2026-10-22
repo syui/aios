@@ -68,14 +68,18 @@ static int at3(int dfd, const char *name, struct stat *s) {
 }
 
 // パスの覚えから答えた数 (aios の /proc/bkl。なければ -1)
+// 覚えから答えた数: パスの覚えと、その答えを写した大きなロックなしの stat (statc.rs。stat の 2 度目からはこちらが答える)
 static long hits(void) {
   FILE *f = fopen("/proc/bkl", "r");
   char line[512];
-  long n = -1;
+  long n = -1, fast = 0;
   while (f && fgets(line, sizeof line, f)) {
     char *s = strstr(line, "覚えから答えた ");
     if (s) n = atol(s + strlen("覚えから答えた "));
+    s = strstr(line, "ロックなしの stat (statc.rs): ");
+    if (s) fast = atol(s + strlen("ロックなしの stat (statc.rs): "));
   }
+  if (n >= 0) n += fast;
   if (f) fclose(f);
   return n;
 }

@@ -28,6 +28,7 @@
   {"name": "futex", "type": "core", "src": "src/futex.rs", "what": "futex: 待ち合わせの場所 (PRIVATE、共有の op の自分の領域、MAP_SHARED のページ) ごとの来た順の行列。起こす数、bitset、REQUEUE / CMP_REQUEUE、WAKE_OP、PI のロック (持ち主と WAITERS の印、来た順にゆずる)、futex_waitv。Linux の kernel/futex/ と同じ決まり (test/sysdiff.c のスレッドと futex の op で答えあわせ)"},
   {"name": "sysfile", "type": "core", "src": "src/sysfile.rs", "what": "ファイルまわりのシステムコール"},
   {"name": "vfs", "type": "core", "src": "src/vfs.rs", "what": "VFS: ファイルシステムの共通の形と、パスの探索、マウント", "bench": "test/fsbench.c (aish の bench。/proc/ai/prof の vfs:*)"},
+  {"name": "statc", "type": "core", "src": "src/statc.rs", "what": "大きなロックなしの stat (Linux の RCU-walk と seqcount の考え): ふつうの道の newfstatat が答えたら、その答えと、それが正しいあいだの印 (通ったディレクトリの版、inode の版、だれでもは通れないディレクトリの許し) を seqlock の表に書き、次からはロックを取らずにそこから答える。ext4 のファイル、はじめのマウントの namespace、chroot なし、fd の表を自分だけで使うプロセスだけ。test/statc.c が、ほかの CPU で変えたすぐあとを確かめる", "bench": "test/smpbench.c (aish の bench smp の stat-x4。/proc/bkl のロックなしの stat)"},
   {"name": "fs", "type": "core", "src": "src/fs.rs", "what": "起動時にルートファイルシステムを組み立てる"},
   {"name": "tmpfs", "type": "core", "src": "src/tmpfs.rs", "what": "tmpfs: メモリ上のファイルシステム"},
   {"name": "initrd", "type": "core", "src": "src/initrd.rs", "what": "ビルド時に埋め込んだ initramfs (cpio newc)。起動時に fs が tmpfs へ展開する"},

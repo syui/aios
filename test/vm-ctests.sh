@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="chosen clone3 cpuid dev dirents epoll exec-thread fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt ns openat2 pagecache pathcache pipeslots procmaps procwait random rlock seccomp sigtramp sleeps splice statcache unixsock userns"
+TESTS="chosen clone3 cpuid dev dirents epoll exec-thread fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt ns openat2 pagecache pathcache pipeslots procmaps procwait random rlock seccomp sigtramp sleeps splice statc statcache unixsock userns"
 
 case $1 in
 build)
@@ -36,11 +36,14 @@ run)
     fsx) cmd="./$t --suite $HOME /tmp" ;;
     # chosen (aios がえらんだちがい)、mmapcoh (ファイルのページは 1 枚)、rlock (ファイルのロック) も ext4 と tmpfs で
     chosen | mmapcoh | rlock) cmd="./$t $HOME /tmp" ;;
+    # statc (大きなロックなしの stat) は ext4 (ホーム) と tmpfs (/tmp) で。root でも (見る人をほかの人にして)
+    statc) cmd="./$t $HOME /tmp" ;;
     *) cmd="./$t" ;;
     esac
     # pathcache は root でも (マウントと、ほかの人から引いたとき。ext4 はほかの人も通れる /var/tmp で)
     root=
     [ "$t" = pathcache ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t /tmp /var/tmp"
+    [ "$t" = statc ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t /var/tmp /tmp"
     if timeout 300 $cmd > "$t.out" 2>&1 && { [ -z "$root" ] || timeout 300 $root >> "$t.out" 2>&1; }; then
       echo "ok $t"
     else

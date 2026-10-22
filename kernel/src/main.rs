@@ -53,6 +53,7 @@ mod rand;
 mod signal;
 mod socket;
 mod spinlock;
+mod statc;
 mod swap;
 mod syscall;
 mod sysctl;
