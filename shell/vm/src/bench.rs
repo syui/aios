@@ -1,5 +1,8 @@
 // bench: 速さを測って、記録し、くらべる (aish-vm の bench)
 //   kind fs   ファイルまわり (test/fsbench.c)。kind net  ループバックの TCP / UDP / AF_UNIX とパイプ (test/netbench.c)
+//   kind smp  いくつもの CPU でいっしょに動いたとき (test/smpbench.c): op ごとに 1 つのプロセスと、CPU の数だけのプロセス
+//             (OP-xP)。伸び (1 つのときの何倍まわせたか) を Linux とくらべ、prof の代わりに op ごとの /proc/ai/bkl
+//             (大きなロックを待った割合と、長く持ったシステムコール。どこからロックを分けるか)
 //   どれも VM (-snapshot) で n 回動かして op ごとのまんなかをとり、prof をつけた回で /proc/ai/prof の part (kernel.json の
 //   名前) ごとの CPU の時間の割合 (どこがボトルネックか) と、時間の多い区間を出す (net は op ごとに)。lock は lockbench
 //   against  2 つの aios のカーネルを op ごとにくらべる
@@ -50,24 +53,75 @@ const FS_OPS: &[(&str, &str)] = &[
     ("write-fsync", "4 KiB 書いて fsync (ジャーナルの commit) を 50 回"),
 ];
 
+/// smp の op と、表に書く中身。プロセスはそれぞれ自分のファイル、パイプ、ソケットを使う (取りあわないので、Linux なら
+/// CPU の数だけ伸びるもの)
+const SMP_OPS: &[(&str, &str)] = &[
+    ("getppid", "getppid (aios もロックなしで答える。くらべるための土台)"),
+    ("umask", "umask (aios では大きなロックを通る、いちばん軽いもの)"),
+    ("futex-wake", "だれも待っていない futex を起こす"),
+    ("stat", "自分のファイルを名前で stat"),
+    ("open-close", "自分のファイルを開いて閉じる"),
+    ("read-4k", "自分のファイルから 4 KiB を pread (ページキャッシュにある)"),
+    ("write-4k", "自分のファイルに 4 KiB を pwrite"),
+    ("create-unlink", "自分のディレクトリにファイルを作って消す (ext4 のジャーナル)"),
+    ("pipe", "自分のパイプに 1 バイト書いて読む"),
+    ("unix", "自分の AF_UNIX の socketpair に 1 バイト書いて読む"),
+    ("mmap", "64 KiB の無名の領域を mmap して 2 ページさわって munmap"),
+    ("fork", "fork して子は _exit、waitpid"),
+];
+
+/// smp の OP-xP の OP と P (ちがえば None)
+fn par_op(op: &str) -> Option<(&str, u64)> {
+    let (b, n) = op.rsplit_once("-x")?;
+    n.parse().ok().map(|n| (b, n))
+}
+
 /// op の中身 (表に書く)
 fn what(op: &str) -> &'static str {
-    NET_OPS.iter().chain(FS_OPS).find(|o| o.0 == op).map_or("", |o| o.1)
+    let op = par_op(op).map_or(op, |(b, _)| b);
+    NET_OPS.iter().chain(FS_OPS).chain(SMP_OPS).find(|o| o.0 == op).map_or("", |o| o.1)
 }
 
 const BYTES: &str = "us: microseconds per operation (smaller is faster); mb_s: megabytes per second (bigger is faster)";
+const SMP_NOTE: &str = ". smp: OP is one process, OP-xP is P processes at once (us per operation for all of them together); speedup is how many times more work P processes did than one (P is ideal, 1 means they ran one at a time); prof: /proc/ai/bkl while OP-xP ran (wait_pct: time spent waiting for the big lock, 100 = one CPU)";
+
+/// kind のプログラム (test/NAME.c)
+fn prog_of(kind: &str) -> &'static str {
+    match kind {
+        "fs" => "fsbench",
+        "net" => "netbench",
+        _ => "smpbench",
+    }
+}
+
+/// smp: op ごとの伸び (1 つのときの µs / P のときの µs)
+fn speedups(ops: &Value, p: u64) -> Value {
+    let mut v = json!({});
+    for (op, _) in SMP_OPS {
+        let (one, par) = (ops[*op]["us"].as_f64(), ops[format!("{}-x{}", op, p).as_str()]["us"].as_f64());
+        if let (Some(a), Some(b)) = (one, par)
+            && b > 0.0
+        {
+            v[*op] = json!((a / b * 100.0).round() / 100.0);
+        }
+    }
+    v
+}
 
 pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     let kind = a["kind"].as_str().filter(|k| !k.is_empty()).unwrap_or("fs");
-    if kind != "fs" && kind != "net" {
-        return Err(format!("kind: {} (fs or net)", kind));
+    if !["fs", "net", "smp"].contains(&kind) {
+        return Err(format!("kind: {} (fs, net or smp)", kind));
     }
     if a["show"].as_bool() == Some(true) {
         return show(root, kind);
     }
     let n = a["n"].as_u64().unwrap_or(3).clamp(1, 20) as usize;
     let scale = a["scale"].as_u64().unwrap_or(1).clamp(1, 100);
-    let smp = a["smp"].as_u64().unwrap_or(1).clamp(1, 8);
+    let smp = a["smp"].as_u64().unwrap_or(if kind == "smp" { 4 } else { 1 }).clamp(1, 8);
+    if kind == "smp" && smp < 2 {
+        return Err("smp: kind smp needs 2 or more CPUs".into());
+    }
     let only = strings(&a["ops"]);
     let off = strings(&a["off"]);
     if !off.is_empty() {
@@ -81,7 +135,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     if want_linux && accel != "tcg" {
         return Err(format!("linux: the Linux VM runs on TCG only, but AIOS_ACCEL is {} (the times would not compare)", accel));
     }
-    let prog = if kind == "fs" { "fsbench" } else { "netbench" };
+    let prog = prog_of(kind);
     note(json!({ "step": prog }));
     let bin = build_prog(root, prog)?;
     let cfg = Cfg { kind: kind.to_string(), bin: bin.clone(), n, scale, smp, only: only.clone(), off: off.clone() };
@@ -92,7 +146,13 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     vmpy(root, &["stop"], &[], Duration::from_secs(90));
     let linux = if want_linux { Some(measure_linux(root, &cfg)?) } else { None };
     let vm = json!({ "cpu": "cortex-a72", "smp": smp, "mem": "2G", "accel": accel });
-    let mut out = json!({ "bench": kind, "n": n, "scale": scale, "vm": vm, "result": mine.clone(), "note": format!("{}. Each kernel ran on a fresh -snapshot VM; the first run is thrown away; parts come from runs with prof on (CPU time only: time asleep is wait_us); lock: nanoseconds per lockbench step (median of 5)", BYTES) });
+    let mut out = json!({ "bench": kind, "n": n, "scale": scale, "vm": vm, "result": mine.clone(), "note": format!("{}. Each kernel ran on a fresh -snapshot VM; the first run is thrown away; parts come from runs with prof on (CPU time only: time asleep is wait_us); lock: nanoseconds per lockbench step (median of 5){}", BYTES, if kind == "smp" { SMP_NOTE } else { "" }) });
+    if kind == "smp" {
+        out["speedup"] = json!(speedups(&mine["ops"], smp));
+        if let Some(l) = &linux {
+            out["speedup_linux"] = json!(speedups(&l["ops"], smp));
+        }
+    }
     if !off.is_empty() {
         out["off"] = json!(off);
     }
@@ -165,12 +225,27 @@ impl Cfg {
         v
     }
 
-    /// prof をつけて動かす op (net は 1 つずつ。fs は全部を 1 回)
+    /// smpbench の引数 (runs 回くりかえす。-o は ops があれば、-a は P のほうだけ。DIR と 1 つの op の ms)
+    fn smp_args(&self, runs: usize, ops: Option<&str>, all_only: bool, dir: &str) -> Vec<String> {
+        let mut v = vec!["-r".to_string(), runs.to_string()];
+        let o = ops.map(str::to_string).or_else(|| (!self.only.is_empty()).then(|| self.only.join(",")));
+        if let Some(o) = o {
+            v.extend(["-o".to_string(), o]);
+        }
+        if all_only {
+            v.push("-a".into());
+        }
+        v.extend([dir.to_string(), (200 * self.scale).to_string()]);
+        v
+    }
+
+    /// prof をつけて動かす op (net と smp は 1 つずつ。fs は全部を 1 回)
     fn prof_ops(&self) -> Vec<Option<String>> {
         if self.kind == "fs" {
             return vec![None];
         }
-        NET_OPS.iter().map(|o| o.0).filter(|o| self.only.is_empty() || self.only.iter().any(|x| x == o)).map(|o| Some(o.to_string())).collect()
+        let ops = if self.kind == "smp" { SMP_OPS } else { NET_OPS };
+        ops.iter().map(|o| o.0).filter(|o| self.only.is_empty() || self.only.iter().any(|x| x == o)).map(|o| Some(o.to_string())).collect()
     }
 }
 
@@ -251,12 +326,16 @@ fn measure_aios(root: &Path, cfg: &Cfg, spec: &str) -> Result<Value, String> {
     let mut vals = Vec::new();
     let mut errors = Vec::new();
     let mut total = 0.0;
-    if cfg.kind == "net" {
-        // 1 回で n + 1 回くりかえし、はじめの回を捨てる
-        let cmd = format!("cd /tmp && /tmp/netbench {}", cfg.net_args(cfg.n + 1, None).join(" "));
+    if cfg.kind == "net" || cfg.kind == "smp" {
+        // 1 回で n + 1 回くりかえし、はじめの回を捨てる。smp は ext4 の上 (ホーム) で
+        let cmd = if cfg.kind == "net" {
+            format!("cd /tmp && /tmp/netbench {}", cfg.net_args(cfg.n + 1, None).join(" "))
+        } else {
+            format!("cd ~ && /tmp/smpbench {}", cfg.smp_args(cfg.n + 1, None, false, ".").join(" "))
+        };
         let (st, out, _, ms, to) = vmpy(root, &["run", &sub(&cmd), "-t", &t.as_secs().to_string()], &[], t + Duration::from_secs(10));
         if to || out.trim().is_empty() {
-            return Err(format!("{}: netbench did not finish (status {}): {}", spec, st, out.lines().rev().take(3).collect::<Vec<_>>().join(" / ")));
+            return Err(format!("{}: {} did not finish (status {}): {}", spec, prog, st, out.lines().rev().take(3).collect::<Vec<_>>().join(" / ")));
         }
         collect(&out, true, &mut vals, &mut errors);
         total = ms as f64;
@@ -289,6 +368,19 @@ fn measure_aios(root: &Path, cfg: &Cfg, spec: &str) -> Result<Value, String> {
     let mut parts = json!({});
     let mut prof_error = None;
     for op in cfg.prof_ops() {
+        if cfg.kind == "smp" {
+            // P こ がいっしょに動いているあいだの、大きなロックの統計
+            let o = op.as_deref().unwrap_or("");
+            let cmd = format!("echo bkl reset > /proc/ai/ctl && (cd ~ && /tmp/smpbench {} > /dev/null); cat /proc/ai/bkl", cfg.smp_args(1, Some(o), true, ".").join(" "));
+            let (_, bout, _, _, _) = vmpy(root, &["run", &sub(&cmd), "-t", &t.as_secs().to_string()], &[], t + Duration::from_secs(10));
+            let Some(b) = bout.lines().filter_map(aish_plugin::parse).find(|v| v.get("wait_pct").is_some()) else {
+                prof_error = Some(bout.lines().filter(|l| !l.trim().is_empty()).take(3).collect::<Vec<_>>().join(" / "));
+                break;
+            };
+            let top: Vec<Value> = b["top"].as_array().map(|a| a.iter().take(3).cloned().collect()).unwrap_or_default();
+            parts[o] = json!({ "bkl": { "wait_pct": b["wait_pct"], "hold_pct": b["hold_pct"], "top": top } });
+            continue;
+        }
         let body = match (&op, cfg.kind.as_str()) {
             (Some(o), _) => format!("cd /tmp && /tmp/netbench {}", cfg.net_args(1, Some(o)).join(" ")),
             (None, _) => format!("cd ~ && /tmp/fsbench . {}", cfg.scale),
@@ -345,6 +437,8 @@ fn measure_linux(root: &Path, cfg: &Cfg) -> Result<Value, String> {
     let mut errors = Vec::new();
     if cfg.kind == "net" {
         collect(&run(cfg.net_args(cfg.n + 1, None))?, true, &mut vals, &mut errors);
+    } else if cfg.kind == "smp" {
+        collect(&run(cfg.smp_args(cfg.n + 1, None, false, "/work"))?, true, &mut vals, &mut errors);
     } else {
         // 1 回ずつ起こす (はじめの 1 回は捨てる)。/work は ext4 (4 KiB のブロック)
         for i in 0..=cfg.n {
@@ -410,7 +504,7 @@ fn compare_lock(mine: &Value, other: &Value, label: &str) -> Vec<String> {
 fn record_of(root: &Path, cfg: &Cfg, spec: &str, mine: &Value, linux: Option<&Value>, vm: &Value) -> Value {
     let commit = git(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     let rev = git(root, &["rev-list", "--count", "HEAD"]).unwrap_or_default();
-    let dirty = spec == "." && !git(root, &["status", "--porcelain", "--", "kernel", "test/netbench.c", "test/fsbench.c"]).unwrap_or_default().is_empty();
+    let dirty = spec == "." && !git(root, &["status", "--porcelain", "--", "kernel", "test/netbench.c", "test/fsbench.c", "test/smpbench.c"]).unwrap_or_default().is_empty();
     let date = sh(root, "date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"], &[], Duration::from_secs(10)).1.trim().to_string();
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let model = cpuinfo.lines().find_map(|l| l.strip_prefix("model name").map(|r| r.trim_start_matches([' ', '\t', ':']).to_string())).unwrap_or_default();
@@ -418,8 +512,13 @@ fn record_of(root: &Path, cfg: &Cfg, spec: &str, mine: &Value, linux: Option<&Va
     // part (CPU の時間の多いもの 3 つ) と、CPU の時間の多い区間 3 つの 1 回あたりの µs (どこを直すか)
     let mut parts = json!({});
     let mut hot = json!({});
+    let mut bkl = json!({});
     if let Some(p) = mine["prof"].as_object() {
         for (op, v) in p {
+            if v.get("bkl").is_some() {
+                bkl[op.as_str()] = v["bkl"].clone();
+                continue;
+            }
             // fs は全部を 1 回 (all) なので多めに
             let k = if op == "all" { 8 } else { 3 };
             let top: Vec<Value> = v["parts"].as_array().map(|a| a.iter().take(k).map(|x| json!({ "part": x["part"], "pct": x["pct"] })).collect()).unwrap_or_default();
@@ -443,6 +542,13 @@ fn record_of(root: &Path, cfg: &Cfg, spec: &str, mine: &Value, linux: Option<&Va
     if let Some(l) = linux {
         r["linux"] = json!({ "version": l["version"], "ops": l["ops"] });
         r["ratio_linux"] = compare(&mine["ops"], &l["ops"], "").1;
+    }
+    if cfg.kind == "smp" {
+        r["bkl"] = bkl;
+        r["speedup"] = speedups(&mine["ops"], cfg.smp);
+        if let Some(l) = linux {
+            r["speedup_linux"] = speedups(&l["ops"], cfg.smp);
+        }
     }
     r
 }
@@ -468,6 +574,9 @@ fn cell(v: &Value) -> String {
 
 /// bench/KIND.md: いちばん新しい記録の表 (aios、Linux、比、前の記録から、part) と、これまでの比の並び
 fn render_md(kind: &str, all: &[Value]) -> String {
+    if kind == "smp" {
+        return render_smp(all);
+    }
     let title = if kind == "net" { "ループバックの速さ (TCP、UDP、AF_UNIX、パイプ)" } else { "ファイルまわりの速さ" };
     let mut md = format!("# {}\n\n", title);
     md.push_str(&format!(
@@ -476,7 +585,7 @@ fn render_md(kind: &str, all: &[Value]) -> String {
          /proc/ai/prof で CPU を使った時間の多いもの (眠って待った時間はのぞく)。VM は QEMU の TCG (x86 の上で aarch64 をまねる)\n\
          なので、本物の機械とは比がちがうことがある\n\n",
         k = kind,
-        p = if kind == "net" { "netbench" } else { "fsbench" }
+        p = prog_of(kind)
     ));
     let Some(last) = all.last() else { return md };
     let prev = all[..all.len() - 1].iter().rev().find(|r| same_setup(r, last));
@@ -557,6 +666,101 @@ fn render_md(kind: &str, all: &[Value]) -> String {
     md
 }
 
+/// bench/smp.md: いちばん新しい記録の、op ごとの 1 つと P この µs、伸び (aios と Linux)、P の時間の比、大きなロックを
+/// 待った割合と長く持ったシステムコール。それから、これまでの伸びの並び
+fn render_smp(all: &[Value]) -> String {
+    let mut md = String::from("# いくつもの CPU でいっしょに動いたときの速さ\n\n");
+    md.push_str(
+        "aish の `bench` (kind smp、linux、record) が作る。もとは bench/smp.jsonl (1 行 1 回の記録)。測るのは test/smpbench.c で、aios と\n\
+         Linux の VM で同じプログラム (同じ libc) を動かす。op ごとに、1 つのプロセスでまわしたものと、CPU の数 (P) だけのプロセスが\n\
+         いっしょにまわしたもの (それぞれ自分のファイル、パイプ、ソケットを使う)。伸びは 1 つのときの何倍まわせたか (P なら CPU の数だけ\n\
+         伸びた、1 なら 1 つずつしか動けていない)。時間の比は P のときの aios / Linux (1 より小さければ aios が速い)。BKL は P のときの\n\
+         /proc/ai/bkl: 大きなロックを待った時間 (100% は CPU 1 つぶん) と、長く持ったシステムコール (どこからロックを分けるか)。\n\
+         VM は QEMU の TCG (x86 の上で aarch64 をまねる) で、CPU はホストのスレッドなので、ホストがいそがしいと伸びが小さくなる\n\n",
+    );
+    let Some(last) = all.last() else { return md };
+    let p = last["vm"]["smp"].as_u64().unwrap_or(1);
+    let prev = all[..all.len() - 1].iter().rev().find(|r| same_setup(r, last));
+    let lv = s(&last["linux"], "version");
+    md.push_str(&format!(
+        "いちばん新しい記録: {} の {}{} (r{})。VM: {} × {}、{}、{} (ホスト: {} × {})\n\n",
+        s(last, "date"),
+        s(last, "commit"),
+        if last["dirty"] == true { " (作業中)" } else { "" },
+        s(last, "rev"),
+        s(&last["vm"], "cpu"),
+        p,
+        s(&last["vm"], "mem"),
+        s(&last["vm"], "accel"),
+        s(&last["host"], "cpu"),
+        last["host"]["cpus"]
+    ));
+    let lname = if lv.is_empty() { "Linux".to_string() } else { format!("Linux {}", lv) };
+    md.push_str(&format!("| op | aios 1 | aios ×{p} | aios の伸び | {l} 1 | {l} ×{p} | {l} の伸び | ×{p} の aios / Linux | BKL を待った | 長く持ったもの | 中身 |\n|---|---|---|---|---|---|---|---|---|---|---|\n", p = p, l = lname));
+    let fx = |v: &Value| v.as_f64().map_or("-".into(), |x| format!("{:.2}", x));
+    let mut todo = Vec::new();
+    for (op, what) in SMP_OPS {
+        let par = format!("{}-x{}", op, p);
+        if last["aios"][*op].is_null() && last["aios"][par.as_str()].is_null() {
+            continue;
+        }
+        let b = &last["bkl"][*op];
+        let wait = b["wait_pct"].as_f64().map_or("-".into(), |w| format!("{:.0}%", w));
+        let top = b["top"].as_array().map(|a| a.iter().map(|x| format!("{} {:.1} µs", s(x, "name"), x["avg_us"].as_f64().unwrap_or(0.0))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            op,
+            cell(&last["aios"][*op]),
+            cell(&last["aios"][par.as_str()]),
+            fx(&last["speedup"][*op]),
+            cell(&last["linux"]["ops"][*op]),
+            cell(&last["linux"]["ops"][par.as_str()]),
+            fx(&last["speedup_linux"][*op]),
+            fx(&last["ratio_linux"][par.as_str()]),
+            wait,
+            top,
+            what
+        ));
+        // 直すところ: Linux より伸びないもの、P のとき Linux より 1 割より遅いもの、前の記録より伸びなくなったもの
+        if let (Some(a), Some(l)) = (last["speedup"][*op].as_f64(), last["speedup_linux"][*op].as_f64())
+            && a < l * 0.8
+        {
+            todo.push(format!("- {}: {} つで {:.2} 倍 (Linux は {:.2} 倍)", op, p, a, l));
+        } else if let Some(r) = last["ratio_linux"][par.as_str()].as_f64().filter(|r| *r > 1.1) {
+            todo.push(format!("- {}: {} つのとき Linux の {:.2} 倍の時間", op, p, r));
+        }
+        if let Some(pr) = prev
+            && let (Some(a), Some(b)) = (last["speedup"][*op].as_f64(), pr["speedup"][*op].as_f64())
+            && a < b * 0.9
+        {
+            todo.push(format!("- {}: 伸びが前の記録 ({}) の {:.2} 倍から {:.2} 倍に", op, s(pr, "commit"), b, a));
+        }
+    }
+    if !todo.is_empty() {
+        md.push_str(&format!("\n## 直すところの候補\n\n{}\n", todo.join("\n")));
+    }
+    let same: Vec<&Value> = all.iter().filter(|r| same_setup(r, last)).collect();
+    if same.len() > 1 {
+        md.push_str(&format!("\n## これまで (同じ VM の記録。aios の伸び、かっこは Linux の伸び。{} つで)\n\n| 記録 |", p));
+        let ops: Vec<&str> = SMP_OPS.iter().map(|o| o.0).filter(|o| !last["speedup"][*o].is_null()).collect();
+        for op in &ops {
+            md.push_str(&format!(" {} |", op));
+        }
+        md.push_str("\n|---|");
+        md.push_str(&"---|".repeat(ops.len()));
+        md.push('\n');
+        for r in same.iter().rev().take(20) {
+            md.push_str(&format!("| {} {}{} |", s(r, "date").get(..10).unwrap_or(""), s(r, "commit"), if r["dirty"] == true { "+" } else { "" }));
+            for op in &ops {
+                let l = r["speedup_linux"][*op].as_f64().map_or(String::new(), |x| format!(" ({:.2})", x));
+                md.push_str(&format!(" {}{} |", fx(&r["speedup"][*op]), l));
+            }
+            md.push('\n');
+        }
+    }
+    md
+}
+
 /// 測らずに、いちばん新しい記録と、その前 (同じ VM) からの変わりかた (bench/KIND.md も記録から作りなおす)
 fn show(root: &Path, kind: &str) -> Result<Value, String> {
     let file = root.join("bench").join(format!("{}.jsonl", kind));
@@ -571,4 +775,26 @@ fn show(root: &Path, kind: &str) -> Result<Value, String> {
         out["vs_linux"] = json!(compare(&last["aios"], &last["linux"]["ops"], &format!("Linux {}", s(&last["linux"], "version"))).0);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smp_ops() {
+        assert_eq!(par_op("stat-x4"), Some(("stat", 4)));
+        assert_eq!(par_op("futex-wake"), None);
+        assert_eq!(what("create-unlink-x4"), what("create-unlink"));
+        assert!(!what("fork-x8").is_empty());
+        let ops = json!({ "stat": { "us": 20.0 }, "stat-x4": { "us": 5.0 }, "fork": { "us": 80.0 } });
+        let sp = speedups(&ops, 4);
+        assert_eq!(sp["stat"], json!(4.0));
+        // P のほうがなければ出さない
+        assert!(sp["fork"].is_null());
+        let rec = json!({ "date": "2026-10-21T00:00:00Z", "commit": "abc", "kind": "smp", "vm": { "smp": 4 }, "scale": 1, "aios": ops, "speedup": sp, "speedup_linux": { "stat": 3.9 }, "linux": { "version": "7.3", "ops": { "stat": { "us": 10.0 }, "stat-x4": { "us": 2.6 } } }, "ratio_linux": { "stat-x4": 1.92 }, "bkl": { "stat": { "wait_pct": 250.0, "top": [{ "name": "newfstatat", "avg_us": 3.2 }] } } });
+        let md = render_smp(&[rec]);
+        assert!(md.contains("| stat | 20.0 µs | 5.0 µs | 4.00 | 10.0 µs | 2.6 µs | 3.90 | 1.92 | 250% | newfstatat 3.2 µs |"), "{}", md);
+        assert!(md.contains("- stat: 4 つのとき Linux の 1.92 倍の時間"), "{}", md);
+    }
 }
