@@ -1427,8 +1427,8 @@ impl PageTable {
         self.vmas.insert(addr, hi);
     }
 
-    /// [start, end) にある、写しの表に入りうるファイルのページの鍵 (MAP_SHARED のもの。MAP_PRIVATE のものは、
-    /// そのファイルのページ (穴の 0 のページ) を表が持っているときだけ)
+    /// [start, end) に写しているファイルのページのうち、写しの表にあるものの鍵 (MAP_SHARED のもの。MAP_PRIVATE のものは
+    /// 穴の 0 のページ)
     fn shared_keys(&self, start: usize, end: usize) -> Vec<FileKey> {
         let mut keys = Vec::new();
         for (&s, v) in self.vmas.range(..end) {
@@ -1436,17 +1436,12 @@ impl PageTable {
                 continue;
             }
             if let Backing::File { ino, off, .. } = &v.back {
-                if !v.shared {
-                    let id = ino.id();
-                    if shared_file().range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_none() {
-                        continue;
-                    }
-                }
-                let mut va = s.max(start);
-                while va < v.end.min(end) {
-                    keys.push(file_key(ino, off + (va - s)));
-                    va += PGSIZE;
-                }
+                // 表を range で引く (領域のページをみな数えると、大きな MAP_SHARED があれば、munmap と exec (fork した
+                // 写しを捨てる) のたびに何万もの鍵を作って 1 つずつ表を引く)
+                let (fs, id) = ino.id();
+                let first = (off + (s.max(start) - s)) / PGSIZE;
+                let last = (off + (v.end.min(end) - PGSIZE - s)) / PGSIZE + 1;
+                keys.extend(shared_file().range((fs, id, first)..(fs, id, last)).map(|(k, _)| *k));
             }
         }
         keys

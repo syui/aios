@@ -78,10 +78,13 @@ static void bad(const char *what) {
 
 static long futex(int *a, int op, int v) { return syscall(SYS_futex, a, op, v, NULL, NULL, 0); }
 
+// map-file で写すファイルの大きさ (プログラムがライブラリを写してさわるように)
+#define MAPLEN (1 << 20)
+
 // プロセス 1 つが使うもの (はじめに作る)
 struct own {
-  char dir[4200], file[4300], tmp[4300];
-  int fd, pipe[2], sock[2];
+  char dir[4200], file[4300], tmp[4300], map[4300];
+  int fd, mfd, pipe[2], sock[2];
   int word;
 };
 
@@ -89,6 +92,7 @@ static void setup(struct own *o, int id) {
   snprintf(o->dir, sizeof o->dir, "%s/w%d", base, id);
   snprintf(o->file, sizeof o->file, "%s/f", o->dir);
   snprintf(o->tmp, sizeof o->tmp, "%s/t", o->dir);
+  snprintf(o->map, sizeof o->map, "%s/m", o->dir);
   if (mkdir(o->dir, 0755) < 0 && errno != EEXIST)
     bad("mkdir");
   static char page[4096];
@@ -96,6 +100,12 @@ static void setup(struct own *o, int id) {
   o->fd = open(o->file, O_CREAT | O_RDWR, 0644);
   if (o->fd < 0 || pwrite(o->fd, page, sizeof page, 0) != sizeof page)
     bad("file");
+  o->mfd = open(o->map, O_CREAT | O_RDWR, 0644);
+  for (int off = 0; o->mfd >= 0 && off < MAPLEN; off += sizeof page)
+    if (pwrite(o->mfd, page, sizeof page, off) != sizeof page) {
+      bad("map file");
+      break;
+    }
   if (pipe(o->pipe) < 0)
     bad("pipe");
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, o->sock) < 0)
@@ -105,6 +115,7 @@ static void setup(struct own *o, int id) {
 
 static void teardown(struct own *o) {
   close(o->fd);
+  close(o->mfd);
   close(o->pipe[0]);
   close(o->pipe[1]);
   close(o->sock[0]);
@@ -160,6 +171,16 @@ static void step(const char *op, struct own *o) {
     p[0] = 1;
     p[32768] = 1;
     munmap(p, 65536);
+  } else if (!strcmp(op, "map-file")) {
+    // 自分のファイル (1 MiB、ページキャッシュにある) を読むだけで写して、ページをみなさわって外す
+    volatile char *p = mmap(NULL, MAPLEN, PROT_READ, MAP_PRIVATE, o->mfd, 0);
+    if (p == MAP_FAILED) {
+      bad("mmap file");
+      return;
+    }
+    for (int off = 0; off < MAPLEN; off += 4096)
+      c += p[off];
+    munmap((void *)p, MAPLEN);
   } else if (!strcmp(op, "fork")) {
     pid_t pid = fork();
     if (pid == 0)
@@ -218,7 +239,7 @@ static double measure(const char *op, int k, double ms, long *total) {
   return rate > 0 ? 1e3 / rate : 0;
 }
 
-static const char *OPS[] = {"getppid", "umask", "futex-wake", "stat", "open-close", "read-4k", "write-4k", "create-unlink", "pipe", "unix", "mmap", "fork"};
+static const char *OPS[] = {"getppid", "umask", "futex-wake", "stat", "open-close", "read-4k", "write-4k", "create-unlink", "pipe", "unix", "mmap", "map-file", "fork"};
 
 int main(int argc, char **argv) {
   int runs = 1, all_only = 0, i = 1;
@@ -278,6 +299,8 @@ int main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/w%d/f", base, w);
     unlink(p);
     snprintf(p, sizeof p, "%s/w%d/t", base, w);
+    unlink(p);
+    snprintf(p, sizeof p, "%s/w%d/m", base, w);
     unlink(p);
     snprintf(p, sizeof p, "%s/w%d", base, w);
     rmdir(p);
