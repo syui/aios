@@ -12,7 +12,7 @@
   {"name": "vm", "type": "core", "src": "src/vm.rs", "what": "ユーザー空間 (TTBR0, 4KiB granule, 39bit VA, L1-L3) とデマンドページング。ファイルのページは 1 枚: ファイルシステムが持つページ (Inode::page_frame) を read / write / mmap (MAP_SHARED も MAP_PRIVATE も) がみな見る (Linux のページキャッシュと同じ)。写しの終わりの先は SIGBUS、切りつめたところは写しから外す。ページキャッシュにある ext4 のページを、大きさを変えずに inode の変わらない秒のうちに書きかえるだけの pwrite64 は、大きなロックなしで写し (write_fast。ext4 が書いたあとに出す許しで)、書き出しは ext4 の flush が列から受けとる。test/pwfast.c が確かめる", "bench": "test/smpbench.c (aish の bench smp の write-4k-x4。/proc/bkl のロックなしの pwrite)"},
   {"name": "trap", "type": "core", "src": "src/trap.rs", "what": "例外ベクタ (VBAR_EL1) とトラップ処理"},
   {"name": "irq", "type": "core", "src": "src/irq.rs", "what": "割り込みコントローラ (GICv2、GICv3、BCM2836)。DTB を見て選ぶ"},
-  {"name": "timer", "type": "core", "src": "src/timer.rs", "what": "ARM generic timer (EL1 の仮想タイマ)。時刻は割り込みの数ではなくカウンタから"},
+  {"name": "timer", "type": "core", "src": "src/timer.rs", "what": "ARM generic timer (EL1 の仮想タイマ)。時刻は割り込みの数ではなくカウンタから。ファイルの時刻は粗い時計 (tick のときに覚えた時刻、Linux の current_time): 細かい時計でつけた時刻を床にして、それより前にはならない"},
   {"name": "smp", "type": "core", "src": "src/smp.rs", "what": "複数 CPU", "bench": "kernel/src/spinlock.rs (lockbench の BKL unlock+lock。smp::bench_bkl)"},
   {"name": "dtb", "type": "core", "src": "src/dtb.rs", "what": "デバイスツリー (Flattened Device Tree, DTB) を読む"},
   {"name": "uart", "type": "core", "src": "src/uart.rs", "what": "PL011 UART。場所と割り込みは DTB から"},

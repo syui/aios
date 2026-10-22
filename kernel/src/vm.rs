@@ -1084,7 +1084,7 @@ fn remake_pte(e: u64, prot: u8, shared_vma: bool) -> u64 {
     make_pte(pa, prot, cow)
 }
 
-/// 調べもの用: ページフォルトの種類ごとの (回数, ns)。/proc/bkl に出す。
+/// 調べもの用: ページフォルトの種類ごとの (回数, ns。ns は SAMPLE 回に 1 回測った見つもり)。/proc/bkl に出す。
 /// 1 その他 (権限だけ) 2 共有ファイル 3 カーネルのページ 4 スワップ 5 ページキャッシュ 6 無名の新しいページ
 /// 7 ファイルから読む新しいページ 8 コピーオンライトで写す 9 (5 のうち) ページキャッシュになくて読んだもの
 pub static FAULT_KIND: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 10] =
@@ -1748,11 +1748,16 @@ impl PageTable {
     /// va のページを用意する。write なら自分だけのものにして書けるように。
     /// force はカーネルが書く (exec で読み取り専用の領域に読み込む): 権限は変えずに自分だけのものに
     fn fault_page(&mut self, va: usize, write: bool, force: bool) -> Result<(), FaultErr> {
-        let t0 = crate::timer::uptime_ns();
+        // 時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックの統計と同じ。TCG では時計を読むのが重く、
+        // いくつもの CPU が同時に読むと 1 つずつになる: timer の粗い時計)
+        let timed = crate::smp::draw_here();
+        let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
         let mut kind = 0usize;
         let r = self.fault_page_inner(va, write, force, &mut kind);
         FAULT_KIND[kind].0.fetch_add(1, Ordering::Relaxed);
-        FAULT_KIND[kind].1.fetch_add(crate::timer::uptime_ns().saturating_sub(t0), Ordering::Relaxed);
+        if timed {
+            FAULT_KIND[kind].1.fetch_add(crate::timer::uptime_ns().saturating_sub(t0) * crate::smp::SAMPLE, Ordering::Relaxed);
+        }
         r
     }
 

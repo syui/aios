@@ -331,8 +331,9 @@ impl Drop for TmpInode {
     }
 }
 
+/// tmpfs の時刻は細かい時計で (床に覚える: timer の粗い時計)
 fn now() -> u64 {
-    crate::timer::epoch_ns()
+    crate::timer::stamp_ns()
 }
 
 impl TmpInode {

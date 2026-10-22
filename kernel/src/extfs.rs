@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 static FS_OWNER: AtomicUsize = AtomicUsize::new(0);
 /// 重ねて取った数 (持ち主だけが書く)
 static FS_DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// 待った回数と時間 (ns) (/proc/bkl)
+/// 待った回数と時間 (ns。SAMPLE 回に 1 回測った見つもり) (/proc/bkl)
 pub static FS_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 fn fs_me() -> usize {
@@ -55,7 +55,10 @@ fn fs_acquire(me: usize) {
     if FS_OWNER.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         return;
     }
-    let t0 = crate::timer::uptime_ns();
+    // 待った回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
+    // 時計を読むのが重く、ロックを持つ時間が伸びる)
+    let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % crate::smp::SAMPLE == 0;
+    let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
     loop {
         // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
@@ -63,8 +66,9 @@ fn fs_acquire(me: usize) {
             break;
         }
     }
-    FS_WAIT[0].fetch_add(1, Ordering::Relaxed);
-    FS_WAIT[1].fetch_add(crate::timer::uptime_ns() - t0, Ordering::Relaxed);
+    if timed {
+        FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * crate::smp::SAMPLE, Ordering::Relaxed);
+    }
 }
 
 fn fs_release() {
@@ -184,7 +188,7 @@ fn put32(b: &mut [u8], o: usize, v: u32) {
 }
 
 fn now_secs() -> u32 {
-    (crate::timer::epoch_ns() / 1_000_000_000) as u32
+    (crate::timer::coarse_epoch_ns() / 1_000_000_000) as u32
 }
 
 // ---- crc32c (Castagnoli)。Linux の crc32c と同じく、最後の反転はしない ----
@@ -721,7 +725,7 @@ impl ExtFs {
             None => alloc::string::String::from("null"),
         };
         let sb = self.sb.borrow();
-        let since = crate::timer::ticks().saturating_sub(self.last_flush.get()) / crate::timer::HZ;
+        let since = crate::timer::coarse_ticks().saturating_sub(self.last_flush.get()) / crate::timer::HZ;
         alloc::format!(
             "{{\"block_size\":{},\"ro\":{},\"cache\":{{\"blocks\":{},\"limit\":{},\"dirty_meta\":{},\"dirty_data\":{},\"hits\":{},\"misses\":{},\"readahead\":{},\"evictions\":{},\"flushes\":{},\"written_meta\":{},\"written_data\":{},\"commits\":{},\"last_flush_s\":{}}},\"journal\":{},\"metas\":{{\"entries\":{},\"max\":{}}},\"names\":{{\"entries\":{},\"max\":{}}},\"inodes_in_use\":{},\"orphans\":{},\"blocks\":{{\"total\":{},\"free\":{}}},\"inodes\":{{\"total\":{},\"free\":{}}}}}",
             self.bsize,
@@ -1451,7 +1455,7 @@ impl ExtFs {
             let c = self.cache.borrow();
             (c.dirty.len(), c.data.len())
         };
-        if meta >= limit || data >= data_limit || crate::timer::ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
+        if meta >= limit || data >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
             return self.flush();
         }
         Ok(())
@@ -1479,7 +1483,7 @@ impl ExtFs {
         // 書きかえたものをまとめて書き出す (中の block:write と jbd2:commit は引かれる)
         let _p = crate::prof::span("extfs:flush");
         self.take_fast_writes();
-        self.last_flush.set(crate::timer::ticks());
+        self.last_flush.set(crate::timer::coarse_ticks());
         self.cache.borrow_mut().flushes += 1;
         // 写し (MAP_SHARED) で書いているページに、書き出す印をつけなおす (写しは書けるままなので、前に書き出したあとも書かれる)
         crate::vm::sync_shared();
@@ -2743,7 +2747,7 @@ impl ExtFs {
         };
         let data_limit = (cache_limit(self.bsize) / 4).max(512);
         let c = self.cache.borrow();
-        c.dirty.len() + 16 >= limit || c.data.len() >= data_limit || crate::timer::ticks() >= self.last_flush.get() + 5 * crate::timer::HZ
+        c.dirty.len() + 16 >= limit || c.data.len() >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ
     }
 
     /// 大きなロックなしの書きかえ (fast_create、fast_unlink) の中: write_op と同じく、眠って待っている読みに知らせ、

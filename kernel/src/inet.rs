@@ -382,7 +382,7 @@ fn wait(chan: usize, timeo: u64, until: u64) -> Result<(), i64> {
 
 /// 新しいソケット (持ち主と NET を決めて: タイマから作るもの (受ける口、TIME_WAIT) は、いまのプロセスのものでない)
 fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetRef {
-    let now = crate::timer::epoch_ns();
+    let now = crate::timer::coarse_epoch_ns();
     let u = Rc::new(RefCell::new(Inet {
         tcp,
         protocol,
@@ -3248,7 +3248,7 @@ pub fn touch(u: &InetRef, mtime: Option<u64>) {
     if let Some(t) = mtime {
         s.mtime = t;
     }
-    s.ctime = crate::timer::epoch_ns();
+    s.ctime = crate::timer::stamp_ns();
 }
 
 pub fn owner(u: &InetRef) -> u32 {

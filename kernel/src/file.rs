@@ -1769,14 +1769,14 @@ impl PipeCell {
         use core::sync::atomic::AtomicU32;
         use core::sync::atomic::AtomicU64;
         let c = crate::cred::current();
-        let t = crate::timer::epoch_ns();
+        let t = crate::timer::coarse_epoch_ns();
         Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(p), uid: AtomicU32::new(c.euid), gid: AtomicU32::new(c.egid), perm: AtomicU32::new(0o600), mtime: AtomicU64::new(t), ctime: AtomicU64::new(t), fifo: core::sync::atomic::AtomicBool::new(false) }
     }
 
-    /// 中身が変わった: mtime と ctime をいまに
+    /// 中身が変わった: mtime と ctime をいまに (Linux の pipefs と同じく粗い時計で: 読み書きのたびに時計を読まない)
     pub fn touch(&self) {
         use core::sync::atomic::Ordering::Relaxed;
-        let t = crate::timer::epoch_ns();
+        let t = crate::timer::coarse_epoch_ns();
         self.mtime.store(t, Relaxed);
         self.ctime.store(t, Relaxed);
     }

@@ -97,15 +97,17 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 static SERVING: AtomicUsize = AtomicUsize::new(0);
 
 /// 取る。取った時刻 (ns) を返す (trap.rs が、持っていた時間を数えるのに時計を読みなおさないため)。測らない回は 0。
-/// すぐ取れたら、時計を読むのはくじにあたったときだけ (SAMPLE)
+/// 時計を読むのはくじにあたったときだけ (SAMPLE。待ったものも)
 pub fn lock() -> u64 {
     let me = id() + 1;
     debug_assert!(BKL.load(Ordering::Relaxed) != me, "BKL: cpu{} locks twice", me - 1);
+    let c = &STATS.cpu[me - 1];
+    let timed = draw(c);
     let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
     let t0 = if SERVING.load(Ordering::Acquire) == ticket {
         None
     } else {
-        let t0 = crate::timer::uptime_ns();
+        let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
         // 順番が来るまで wfe で休む (放す側が sev で起こす)。回りつづけると、QEMU (TCG) では待っている CPU が
         // 本当の CPU を取りあって、ロックを持っている CPU まで遅くなる
         while SERVING.load(Ordering::Acquire) != ticket {
@@ -114,17 +116,18 @@ pub fn lock() -> u64 {
         Some(t0)
     };
     BKL.store(me, Ordering::Relaxed);
-    let c = &STATS.cpu[me - 1];
     add(&c.locks, 1);
-    // 待ったものはいつも測る (重み 1)。待たなかったものは、くじにあたったものだけ測って SAMPLE 倍
+    // くじにあたったものだけ、待った時間と持っていた時間を測って SAMPLE 倍。待ったものをいつも測ると、TCG では
+    // 取ったあとに時計を読むのが重く (いくつもの CPU が同時に読むと 1 回 1 µs ほど: timer の粗い時計)、ロックを持つ
+    // 時間が測るために伸びていた
     let (now, w) = match t0 {
+        _ if !timed => (0, 0),
         Some(t0) => {
             let now = crate::timer::uptime_ns();
-            add(&c.wait, now - t0);
-            (now, 1)
+            add(&c.wait, (now - t0) * SAMPLE);
+            (now, SAMPLE)
         }
-        None if draw(c) => (crate::timer::uptime_ns(), SAMPLE),
-        None => (0, 0),
+        None => (crate::timer::uptime_ns(), SAMPLE),
     };
     c.since.store(now, Ordering::Relaxed);
     c.weight.store(w, Ordering::Relaxed);
@@ -257,8 +260,7 @@ fn drain_wakes() -> bool {
 
 const NSYS: usize = 512;
 
-/// ロックを持っていた時間は、待たずに取れたものの SAMPLE 回に 1 回ほどだけ時計で測り、SAMPLE 倍して足す (待ったものは
-/// いつも測る)。QEMU の TCG では時計 (cntvct) を読むのが 150〜240 ns と、システムコールのほかのところぜんぶ (1 µs ほど)
+/// ロックを待った時間と持っていた時間は、SAMPLE 回に 1 回ほどだけ時計で測り、SAMPLE 倍して足す。QEMU の TCG では時計 (cntvct) を読むのが 150〜240 ns と、システムコールのほかのところぜんぶ (1 µs ほど)
 /// にくらべて重く、出入りで 2 回読むと 4 割になっていた。Linux もプロセスの時間を出入りのたびには測らず、時計の割り込みの
 /// たびに見る (tick で数える)。どれを測るかはくじ (xorshift) で選ぶ: 決まった順だと、交互に呼ぶもの (read と write など)
 /// の片方だけが測られる
@@ -279,6 +281,11 @@ struct CpuStat {
 }
 
 /// くじを引く: SAMPLE 回に 1 回ほどあたる (上の 3 ビットが 0)
+/// この CPU のくじ (SAMPLE 回に 1 回ほど true): ほかの統計も、時計を読む回をこれで選ぶ
+pub fn draw_here() -> bool {
+    draw(&STATS.cpu[id()])
+}
+
 fn draw(c: &CpuStat) -> bool {
     let mut x = c.dice.load(Ordering::Relaxed);
     x ^= x << 13;

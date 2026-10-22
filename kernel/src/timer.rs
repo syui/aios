@@ -34,6 +34,7 @@ pub fn init() {
         None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),
     };
     BOOT_EPOCH.store(epoch.saturating_sub(uptime_ns() / 1_000_000_000), Ordering::Relaxed);
+    COARSE.fetch_max(uptime_ns(), Ordering::Relaxed);
     crate::irq::enable(IRQ);
     crate::vdso::allow_counter();
     rearm();
@@ -56,6 +57,41 @@ pub fn uptime_ns() -> u64 {
         NS_PER_TICK.store(if 1_000_000_000 % f == 0 { 1_000_000_000 / f } else { u64::MAX }, Ordering::Relaxed);
     }
     (cnt / f) * 1_000_000_000 + (cnt % f) * 1_000_000_000 / f
+}
+
+// ---- 粗い時計 (Linux の ktime_get_coarse と current_time) ----
+// ファイルの時刻 (ext4 の秒、パイプ) と、ext4 の「そろそろ書き出すか」は、時計 (cntvct) を読まずに、tick (割り込み) の
+// ときに覚えた時刻を使う。QEMU の TCG では cntvct を読むたびに QEMU の大きなロック (BQL) を取るので、いくつもの CPU が
+// 同時に読むと 1 回が 110 ns から 1.1 µs (4 つ) になり、読むところで 1 つずつになる (ext4 の作る・消すは 1 回に 7 度
+// 読んでいた)。本当の機械でも、読むたびに isb と 20〜40 サイクル。Linux もファイルの時刻は tick の時刻 (current_time)。
+// 細かい時計でつけた時刻 (utimensat の NOW、tmpfs) は床 (FLOOR) に覚え、粗い時刻はそれより前にならない (Linux の
+// multigrain の floor と同じ: ちがうファイル、ちがう道でつけた時刻が逆になってはいけない)
+
+/// いちばん新しい tick の時刻 (起動からの ns。どの CPU の tick でも、大きいほうに)
+static COARSE: AtomicU64 = AtomicU64::new(0);
+/// 細かい時計で inode につけた、いちばん新しい時刻 (UNIX ns)
+static FLOOR: AtomicU64 = AtomicU64::new(0);
+
+/// tick の時刻 (起動からの ns)。時計を読まない。tick 1 つ (10 ms) ほど遅れる
+pub fn coarse_uptime_ns() -> u64 {
+    COARSE.load(Ordering::Relaxed)
+}
+
+/// 粗い時計の UNIX ns: ファイルの時刻に (細かい時計でつけたものより前にはならない)
+pub fn coarse_epoch_ns() -> u64 {
+    (BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + coarse_uptime_ns()).max(FLOOR.load(Ordering::Relaxed))
+}
+
+/// 粗い時計の tick (ticks() と同じ数え方。時計を読まない)
+pub fn coarse_ticks() -> u64 {
+    coarse_uptime_ns() / (1_000_000_000 / HZ)
+}
+
+/// 細かい時計で inode につける時刻 (UNIX ns): 床に覚えて、あとの粗い時刻がこれより前にならないように
+pub fn stamp_ns() -> u64 {
+    let t = epoch_ns();
+    FLOOR.fetch_max(t, Ordering::Relaxed);
+    t
 }
 
 /// 起動したときの UNIX 秒 (vDSO の vvar に入れる)
@@ -106,6 +142,8 @@ pub fn init_cpu() {
 /// タイマの割り込み (CPU ごと)。時刻を進めるなどは cpu0 だけ
 pub fn tick() {
     crate::proc::account_tick();
+    // 粗い時計 (どの CPU でも: cpu0 が長く割り込みを止めていても進む)
+    COARSE.fetch_max(uptime_ns(), Ordering::Relaxed);
     if crate::smp::id() != 0 {
         rearm();
         return;

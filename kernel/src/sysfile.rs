@@ -2011,7 +2011,7 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     let before = ino.meta().mtime;
     ino.truncate(len as usize)?;
     if ino.meta().mtime == before {
-        ino.set_mtime(crate::timer::epoch_ns())?;
+        ino.set_mtime(crate::timer::stamp_ns())?;
     }
     if let Kind::Inode(_, p) = &f.borrow().kind {
         inotify::file_event(p, &ino, inotify::IN_MODIFY);
@@ -2274,7 +2274,7 @@ fn chown_fd(fd: u64, uid: u64, gid: u64, opath_ok: bool) -> R {
             p.gid.store(g, Relaxed);
         }
         p.perm.store(mode & 0o7777, Relaxed);
-        p.ctime.store(crate::timer::epoch_ns(), Relaxed);
+        p.ctime.store(crate::timer::stamp_ns(), Relaxed);
         return Ok(0);
     }
     writable_fd(fd)?;
@@ -2371,7 +2371,7 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
                     return Err(-cred::EACCES);
                 }
             }
-            let now = crate::timer::epoch_ns();
+            let now = crate::timer::stamp_ns();
             let mtime = match t.map(|t| t[1]) {
                 Some((_, UTIME_OMIT)) => None,
                 None | Some((_, UTIME_NOW)) => Some(now),
@@ -2417,7 +2417,7 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
             return Err(-cred::EACCES);
         }
     }
-    let now = crate::timer::epoch_ns();
+    let now = crate::timer::stamp_ns();
     let mtime = match t {
         None => Some(now),
         Some(t) => match t[1] {

@@ -399,8 +399,8 @@ fn new_sock(typ: u8) -> UnixRef {
         uid: c.euid,
         gid: c.egid,
         mode: 0o777,
-        mtime: crate::timer::epoch_ns(),
-        ctime: crate::timer::epoch_ns(),
+        mtime: crate::timer::coarse_epoch_ns(),
+        ctime: crate::timer::coarse_epoch_ns(),
         generation: 0,
         sleepers: 0,
         watchers: 0,
@@ -2103,7 +2103,7 @@ pub fn touch(u: &UnixRef, mtime: Option<u64>) {
     if let Some(t) = mtime {
         s.mtime = t;
     }
-    s.ctime = crate::timer::epoch_ns();
+    s.ctime = crate::timer::stamp_ns();
 }
 
 /// fcntl の O_NOATIME などで見る持ち主
