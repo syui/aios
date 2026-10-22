@@ -250,13 +250,17 @@ fn sticky_ok(c: &Cred, parent: &InodeRef, name: &str) -> Result<(), i64> {
     if child.meta().uid == c.euid { Ok(()) } else { Err(-cred::EPERM) }
 }
 
-/// 作ったものの持ち主を決める (setgid のディレクトリの下ならそのグループ)
+/// 作ったものの持ち主を決める (setgid のディレクトリの下ならそのグループ)。ext4 は作るときに決めている
+/// (Linux の inode_init_owner) ので、もう同じなら inode を書きなおさない
 fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
     let pm = parent.meta();
     let gid = if pm.mode & cred::S_ISGID != 0 { pm.gid } else { c.egid };
-    ino.set_owner(Some(c.euid), Some(gid))?;
-    if pm.mode & cred::S_ISGID != 0 && ino.meta().is_dir() {
-        ino.set_mode(ino.meta().mode | cred::S_ISGID)?;
+    let m = ino.meta();
+    if m.uid != c.euid || m.gid != gid {
+        ino.set_owner(Some(c.euid), Some(gid))?;
+    }
+    if pm.mode & cred::S_ISGID != 0 && m.is_dir() && m.mode & cred::S_ISGID == 0 {
+        ino.set_mode(m.mode | cred::S_ISGID)?;
     }
     Ok(())
 }
@@ -1035,23 +1039,23 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     // O_CREAT: 親までたどってから (そこまでのしくじりが先)、. .. / はもうあるディレクトリ (O_EXCL なら EEXIST、
     // でなければ EISDIR。あとに / があっても)、name/ は作らない (あってもなくても EISDIR)。Linux の
     // open_last_lookups (. と .. を先に見る) と do_open
+    // そのあと最後の名前を 1 つずつ (リンクの中身の最後の名前も)。なければ作り、リンクの中身が name/ なら EISDIR
+    // (O_CREAT と O_TMPFILE はいっしょに使えない: open_flags)
     if flags & O_CREAT != 0 {
-        let p = last_at(dirfd, &path)?;
+        let p = vfs::parent_last(start, &cwd, &path)?;
+        p.alive()?;
         if p.last != vfs::Last::Norm {
             return Err(if flags & O_EXCL != 0 { -EEXIST } else { -EISDIR });
         }
         if p.slash {
             return Err(-EISDIR);
         }
+        return open_found(create_target(p, follow)?, flags, mode);
     }
     // O_TMPFILE: そのディレクトリに名前のないファイル
     if flags & O_TMPFILE != 0 {
         let (full, dir) = lookup(flags & O_NOFOLLOW == 0)?;
         return open_tmpfile(full, dir, flags, mode);
-    }
-    // O_CREAT: 最後の名前を 1 つずつ (リンクの中身の最後の名前も)。なければ作り、リンクの中身が name/ なら EISDIR
-    if flags & O_CREAT != 0 {
-        return open_found(create_target(start, &cwd, &path, follow)?, flags, mode);
     }
     // 大きなロックなしの open (file::fast_open) が引けるように、読むだけで開くものの答えを statc に覚えさせる
     // (newfstatat と同じく、開いているディレクトリからのものは覚えない。「ない」も)
@@ -1078,8 +1082,7 @@ const SIMPLE_OPEN: u64 = 0o400000 | O_CLOEXEC | 0o400;
 /// 指す先のないリンクなら、その指す先に作る
 type Found = Result<(String, InodeRef), (InodeRef, String, String)>;
 
-fn create_target(start: Option<(InodeRef, String)>, cwd: &str, path: &str, follow: bool) -> Result<Found, i64> {
-    let mut p = vfs::parent_last(start, cwd, path)?;
+fn create_target(mut p: vfs::Parent, follow: bool) -> Result<Found, i64> {
     for _ in 0..40 {
         if p.last != vfs::Last::Norm {
             return Err(-EISDIR);
@@ -1379,8 +1382,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
     let f = file::new(kind, file_flags(flags));
     if reuse {
-        f.borrow_mut().reuse = true;
-        file::REUSABLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        file::reuse_on(&f);
     }
     let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
@@ -1728,8 +1730,11 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     // 消えたものへの inotify のため。見張っている人がいるときだけ持っておく (持っていると ext4 は、
     // 消したファイルをまだ使われているものとして orphan のリストに入れ、手を放したときに片づけることになる)
     let victim = if inotify::active() { parent.lookup(&name).ok() } else { None };
+    let held = vfs::forget_path(&full);
     parent.unlink(&name, flags & AT_REMOVEDIR != 0)?;
-    vfs::forget(&full);
+    if let Some(id) = held {
+        vfs::forget_gone(id);
+    }
     let dir = flags & AT_REMOVEDIR != 0;
     // Linux と同じ順: 消えたもの (リンクの数が変わった IN_ATTRIB、なくなれば DELETE_SELF と IGNORED)、それから親に DELETE
     if let Some(v) = victim {

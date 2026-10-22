@@ -913,21 +913,40 @@ pub fn name_changed(dir: (usize, u64), name: &str) {
 /// 次に引くまで残るので、消したファイルの inode を持ったままにしない (持っていると ext4 は片づけずに orphan として
 /// 残す。Linux の d_delete)
 pub fn forget(full: &str) {
+    if let Some(id) = forget_path(full) {
+        forget_gone(id);
+    }
+}
+
+/// full の覚え (たどるもの、たどらないもの) を捨てる。答えていた inode の id を返す (forget_gone へ)。unlinkat は
+/// 消す前に呼ぶ: 覚えが inode を持ったままだと、ext4 は消したファイルをまだ使われているものとして orphan のリストに
+/// 入れ、覚えを捨てたときに片づける (inode とスーパーブロックを 2 度ずつ書く)。Linux の d_delete も、dentry を
+/// 使っているのが自分だけなら、その場で inode を手放す。消せなかったときは、次に引いたときに覚えなおす
+pub fn forget_path(full: &str) -> Option<(usize, u64)> {
     let cache = unsafe { &mut *(&raw mut PATHS) };
     let mnt = current_mnt().id;
     let mut held = None;
     for follow in [true, false] {
-        if let Some(e) = cache.remove(&PathKey::new(mnt, full.to_string(), follow)) {
-            held = held.or(e.found.as_ref().map(|(_, i)| (i.id(), i.meta().nlink)));
+        if let Some(e) = cache.remove(PathKeyRef::new(mnt, full, follow).key()) {
+            held = held.or(e.found.as_ref().map(|(_, i)| i.id()));
         }
     }
-    // ほかの書きかた (リンクやバインドマウントを通ったパス) の覚えも、消えたもの (リンクが 0) を持っていれば捨てる。
-    // まだ持っている覚えがあるときだけ全部を見る (rm -r のように 1 つずつ消すときは、ふつう見ない)
-    if let Some((id, 0)) = held
-        && unsafe { (*(&raw const HOLDS)).contains_key(&id) }
-    {
-        cache.retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
+    held
+}
+
+/// ほかの書きかた (リンクやバインドマウントを通ったパス) の覚えも、消えたもの (リンクが 0) を持っていれば捨てる。
+/// まだ持っている覚えがあるときだけ全部を見る (rm -r のように 1 つずつ消すときは、ふつう見ない)
+pub fn forget_gone(id: (usize, u64)) {
+    if !unsafe { (*(&raw const HOLDS)).contains_key(&id) } {
+        return;
     }
+    // リンクの数は表をなめる外で見る (inode を読むと、ディスクを待って眠るかもしれない)
+    let holder = unsafe { (*(&raw const PATHS)).values().find_map(|e| e.found.as_ref().filter(|(_, x)| x.id() == id).map(|(_, x)| x.clone())) };
+    if holder.is_none_or(|x| x.meta().nlink != 0) {
+        return;
+    }
+    let cache = unsafe { &mut *(&raw mut PATHS) };
+    cache.retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
 }
 
 /// 作ったばかりのもの (親 parent の中の name、パス full: リンクをたどったあとの、先頭 / なし) を覚える (Linux の
@@ -941,7 +960,7 @@ pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
     let Some(cut) = full.rfind('/') else { return };
     let mnt = current_mnt().id;
     let full_len = cache.len();
-    let Some(pe) = cache.get_mut(&PathKey::new(mnt, full[..cut].to_string(), true)) else { return };
+    let Some(pe) = cache.get_mut(PathKeyRef::new(mnt, &full[..cut], true).key()) else { return };
     if !pe.found.as_ref().is_some_and(|(_, p)| p.id() == parent.id()) || !pe.fresh() || full_len >= paths_max() {
         return;
     }

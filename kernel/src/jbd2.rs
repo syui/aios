@@ -342,6 +342,7 @@ impl ExtFs {
             let mut datas = Vec::with_capacity(chunk.len());
             let mut o = 12;
             for (i, &blk) in chunk.iter().enumerate() {
+                self.settle_csum(blk)?;
                 let mut d = self.read_block(blk)?;
                 let mut flags = 0;
                 if be32(&d, 0) == MAGIC {

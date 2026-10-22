@@ -41,7 +41,7 @@
   {"name": "block", "type": "extra", "src": "src/block.rs", "what": "ディスク: virtio-blk か SD カード。パーティション表を読んで、どれを root にするかを決める"},
   {"name": "efi", "type": "extra", "src": "src/efi.rs", "what": "EFI スタブ: UEFI (や systemd-boot、GRUB) からアプリとして起動されたとき"},
   {"name": "epoll", "type": "extra", "src": "src/epoll.rs", "what": "epoll と eventfd (tokio / mio がこれで待つ)", "off": "epoll_create1、epoll_ctl、epoll_pwait、epoll_pwait2、eventfd2 が ENOSYS"},
-  {"name": "extfs", "type": "extra", "src": "src/extfs.rs", "what": "ext2 / ext4。書きかえたブロックは印をつけておき、操作の終わりにまとめて書き出す", "bench": "test/fsbench.c (aish の bench。/proc/ai/prof の extfs:*)"},
+  {"name": "extfs", "type": "extra", "src": "src/extfs.rs", "what": "ext2 / ext4。書きかえたブロックは印をつけておき、操作の終わりにまとめて書き出す。ディレクトリのブロックのチェックサム (metadata_csum) は、ジャーナルやディスクへ写す直前に 1 回だけ計算する", "bench": "test/fsbench.c (aish の bench。/proc/ai/prof の extfs:*)"},
   {"name": "gpu", "type": "extra", "src": "src/gpu.rs", "what": "virtio-gpu (2D): 画面をひとつ用意して、/dev/fb0 (Linux の fbdev と同じ形) にする"},
   {"name": "htree", "type": "extra", "src": "src/htree.rs", "what": "ext4 の htree (dir_index): ディレクトリの名前のハッシュで、どの葉のブロックに入れるかを引く索引"},
   {"name": "inet", "type": "extra", "src": "src/inet.rs", "what": "AF_INET の TCP と UDP (Linux の net/ipv4 と同じ考え: ポートの表と bind の決まり、TCP の状態の移りかた、listen の行列と SYN のやりなおし、TIME_WAIT、urgent、MSG_MORE / TCP_CORK、UDP の相手さがしと ICMP のエラー)。ループバック (127/8、自分のアドレス) はパケットを作らず、相手の受ける行列にじかに入れる。外 (eth0) の相手は smoltcp のソケットで", "bench": "test/netbench.c (aish の bench の kind net。/proc/ai/prof の socket:*、inet:*、unix:*。記録は bench/net.md)"},

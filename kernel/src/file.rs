@@ -182,6 +182,46 @@ static SHELVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// reuse の印のついた OpenFile の数 (表にあるものも棚にあるものも。0 なら、ファイルを消すときに表をなめない)
 pub static REUSABLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// REUSABLE を、inode の id のハッシュで 256 の箱に分けたもの。ファイルを消すとき (shelf_forget)、その inode の箱が 0 なら
+/// 表も棚もなめない (ほかのファイルが棚にあっても: 消すたびにみなのプロセスの fd をなめていた)
+static REUSE_IDS: [core::sync::atomic::AtomicUsize; 256] = [const { core::sync::atomic::AtomicUsize::new(0) }; 256];
+
+fn reuse_box(of: &OpenFile) -> Option<&'static core::sync::atomic::AtomicUsize> {
+    match &of.kind {
+        Kind::Inode(ino, _) => Some(id_box(ino.id())),
+        _ => None,
+    }
+}
+
+fn id_box(id: (usize, u64)) -> &'static core::sync::atomic::AtomicUsize {
+    &REUSE_IDS[((id.1 ^ (id.0 as u64).rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize]
+}
+
+/// 大きなロックの中で: 閉じたら棚にしまってよい印をつける (sysfile の open_found)
+pub fn reuse_on(f: &FileRef) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut b = f.borrow_mut();
+    if !b.reuse {
+        b.reuse = true;
+        REUSABLE.fetch_add(1, Relaxed);
+        if let Some(c) = reuse_box(&b) {
+            c.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// reuse の印を落とす (数も)
+fn reuse_off(of: &mut OpenFile) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if of.reuse {
+        of.reuse = false;
+        REUSABLE.fetch_sub(1, Relaxed);
+        if let Some(c) = reuse_box(of) {
+            c.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
 /// IN_OPEN か IN_CLOSE を待つ見張りが置かれたことがある (大きなロックなしの open / close はできごとを出さないので、
 /// それからはふつうの道で)
 pub static OPEN_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -312,8 +352,7 @@ fn shelf_drop(open_too: bool, mut which: impl FnMut(&OpenFile) -> bool) {
                 // 借りずに (持ち主が大きなロックなしで見ているかもしれない。こちらは印を落とすだけ)
                 let of = unsafe { &mut *fd.file.as_ptr() };
                 if of.reuse && which(of) {
-                    of.reuse = false;
-                    REUSABLE.fetch_sub(1, Relaxed);
+                    reuse_off(of);
                 }
             }
         }
@@ -333,16 +372,15 @@ fn shelf_drop(open_too: bool, mut which: impl FnMut(&OpenFile) -> bool) {
 
 /// 大きなロックの中で: f を閉じても棚にはしまわない (epoll に入れたものなど、落ちることを見ている人がいる)
 pub fn no_reuse(f: &FileRef) {
-    let mut b = f.borrow_mut();
-    if b.reuse {
-        b.reuse = false;
-        REUSABLE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    }
+    reuse_off(&mut f.borrow_mut());
 }
 
 /// inode id のリンクが 0 になる (消した、上書きした): 棚のものを捨てる (ほかに開いている人がいなければ、そこで片づく)。
 /// いま開いているもの (消したあとも読める) も、閉じたら棚にはしまわない (しまうと、消したファイルの場所が返らない)
 pub fn shelf_forget(id: (usize, u64)) {
+    if id_box(id).load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
     shelf_drop(true, |of| matches!(&of.kind, Kind::Inode(ino, _) if ino.id() == id));
 }
 
@@ -1168,9 +1206,7 @@ fn dtype(mode: u32) -> u8 {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        if self.reuse {
-            REUSABLE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        }
+        reuse_off(self);
         // flock のロックと OFD ロックは OpenFile ごと (その場所で見分ける): 最後の参照が閉じたら外す
         crate::locks::release_file(self as *const OpenFile as usize);
         match &self.kind {

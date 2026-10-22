@@ -229,6 +229,10 @@ struct Cache {
     /// ビットマップを書きかえたグループ (チェックサムを直す)
     bb_dirty: BTreeSet<u32>,
     ib_dirty: BTreeSet<u32>,
+    /// チェックサムをまだ計算していないディレクトリのブロック → (ディレクトリの inode, generation)。
+    /// 書きかえるたびに 4 KiB の crc32c を計算せず、ジャーナルやディスクへ写す直前 (settle_csum) に 1 回だけ。
+    /// Linux はブロックを書きかえるたびに計算する (ext4_handle_dirty_dirblock)
+    dir_csum: BTreeMap<u64, (u32, u32)>,
     /// /proc/ai/fs の数: 引いたときにあった、なかった (ディスクから読んだ)、まとめて読んだ、捨てた、書き出した回数、
     /// 書いたブロック (メタデータ、中身)、ジャーナルのトランザクション
     hits: u64,
@@ -328,6 +332,11 @@ impl Names {
     }
 }
 
+/// ディレクトリの項目を足すすき間: (ブロック, 位置, rec_len, そこの項目が使っている長さ)
+type Slot = (u64, usize, usize, usize);
+/// ディレクトリの項目の場所: (ブロック, 位置, rec_len, 同じブロックの前の項目 (位置, rec_len))
+type Entry = (u64, usize, usize, Option<(usize, usize)>);
+
 /// ディスク上の inode (inode_size バイトまるごと)
 #[derive(Clone)]
 struct Raw(Vec<u8>);
@@ -383,11 +392,51 @@ impl Raw {
     fn gen_no(&self) -> u32 {
         u32_at(&self.0, 0x64)
     }
+    fn gid(&self) -> u32 {
+        u16_at(&self.0, 24) as u32 | (u16_at(&self.0, 122) as u32) << 16
+    }
+    /// 作ったものの持ち主 (Linux の inode_init_owner): 作るプロセスの euid と egid。setgid のディレクトリの下なら
+    /// そのグループで、ディレクトリなら setgid も受けつぐ。sysfile の own_new は、もう同じなら書きなおさない
+    fn init_owner(&mut self, parent: &Raw) {
+        let c = crate::cred::current();
+        let sgid = parent.mode() & crate::cred::S_ISGID != 0;
+        let (uid, gid) = (c.euid, if sgid { parent.gid() } else { c.egid });
+        put16(&mut self.0, 2, uid as u16);
+        put16(&mut self.0, 120, (uid >> 16) as u16);
+        put16(&mut self.0, 24, gid as u16);
+        put16(&mut self.0, 122, (gid >> 16) as u16);
+        let mode = self.mode();
+        if sgid && mode & S_IFMT == S_IFDIR {
+            put16(&mut self.0, 0, (mode | crate::cred::S_ISGID) as u16);
+        }
+    }
     fn touch(&mut self) {
         let t = now_secs();
         put32(&mut self.0, 12, t); // ctime
         put32(&mut self.0, 16, t); // mtime
     }
+}
+
+/// ビットマップ d の start..n で最初の 0 のビット。64 ビットずつ見る (Linux の find_next_zero_bit。1 ビットずつだと、
+/// 使っている inode が多いグループで作るたびに何千回もまわる)
+fn first_zero(d: &[u8], start: u32, n: u32) -> Option<u32> {
+    let mut bit = start;
+    while bit < n {
+        if bit % 64 == 0 && bit + 64 <= n {
+            let i = (bit / 8) as usize;
+            let w = u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
+            if w == u64::MAX {
+                bit += 64;
+                continue;
+            }
+            return Some(bit + (!w).trailing_zeros());
+        }
+        if d[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
+            return Some(bit);
+        }
+        bit += 1;
+    }
+    None
 }
 
 fn ftype(mode: u32) -> u8 {
@@ -481,6 +530,7 @@ impl ExtFs {
                 gd_dirty: BTreeSet::new(),
                 bb_dirty: BTreeSet::new(),
                 ib_dirty: BTreeSet::new(),
+                dir_csum: BTreeMap::new(),
                 hits: 0,
                 misses: 0,
                 readahead: 0,
@@ -791,7 +841,23 @@ impl ExtFs {
         let mut c = self.cache.borrow_mut();
         c.data.remove(&b);
         c.dirty.insert(b);
+        // ディレクトリのブロックでなくなった (htree の索引になったなど): あとで計算しない
+        if !c.dir_csum.is_empty() {
+            c.dir_csum.remove(&b);
+        }
         Ok(r)
+    }
+
+    /// ブロック b のディレクトリのチェックサムがまだなら、いま計算する (ジャーナルやディスクへ写す前に)
+    pub(super) fn settle_csum(&self, b: u64) -> Result<(), i64> {
+        let e = {
+            let mut c = self.cache.borrow_mut();
+            if c.dir_csum.is_empty() { None } else { c.dir_csum.remove(&b) }
+        };
+        if let Some((dir, generation)) = e {
+            self.with_block(b, |d| self.set_dir_csum(dir, generation, d))?;
+        }
+        Ok(())
     }
 
     /// ファイルの中身のブロックを書きかえる (flush で、ジャーナルより先に直接)。
@@ -1055,14 +1121,9 @@ impl ExtFs {
     /// ビットマップ bm の中で、start から n 個のうち空いているビットを 1 つ取る
     fn take_in(&self, bm: u64, start: u32, n: u32) -> Result<Option<u32>, i64> {
         self.modify_block(bm, |d| {
-            for bit in start..n {
-                let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
-                if d[byte] & mask == 0 {
-                    d[byte] |= mask;
-                    return Some(bit);
-                }
-            }
-            None
+            let bit = first_zero(d, start, n)?;
+            d[(bit / 8) as usize] |= 1 << (bit % 8);
+            Some(bit)
         })
     }
 
@@ -1113,6 +1174,7 @@ impl ExtFs {
         // 捨てたブロックは書き出さない (data に残すと、flush がディスクの古い中身を読んで書き戻す)
         c.dirty.remove(&b);
         c.data.remove(&b);
+        c.dir_csum.remove(&b);
         c.forget(b);
         Ok(())
     }
@@ -1371,6 +1433,7 @@ impl ExtFs {
             if j - i > 1 && buf.try_reserve_exact((j - i) * self.bsize).is_ok() {
                 buf.resize((j - i) * self.bsize, 0);
                 for (k, &b) in dirty[i..j].iter().enumerate() {
+                    self.settle_csum(b)?;
                     self.with_block(b, |d| buf[k * self.bsize..(k + 1) * self.bsize].copy_from_slice(d))?;
                 }
                 crate::block::write(dirty[i] * spb, &buf)?;
@@ -1378,6 +1441,7 @@ impl ExtFs {
                 // キャッシュを借りたままディスクを待たない (眠るあいだにほかが同じキャッシュを使う)
                 let mut one = vec![0u8; self.bsize];
                 for &b in &dirty[i..j] {
+                    self.settle_csum(b)?;
                     self.with_block(b, |d| one.copy_from_slice(d))?;
                     crate::block::write(b * spb, &one)?;
                 }
@@ -2205,6 +2269,38 @@ impl ExtFs {
         Ok(out)
     }
 
+    /// dir (その inode r) の項目を順に (末尾の偽エントリは除く) f(ブロック番号, ブロック, 位置, 同じブロックの前の項目の
+    /// 位置) に。f が Some を返したらそこで終わる。dir_entries とちがい、名前の文字列を作らない (作る・消すたびに引く)
+    fn scan_dir<T>(&self, ino: u32, mut r: Raw, mut f: impl FnMut(u64, &[u8], usize, Option<usize>) -> Option<T>) -> Result<Option<T>, i64> {
+        let nblocks = r.size().div_ceil(self.bsize as u64);
+        for fb in 0..nblocks {
+            let b = self.map(ino, &mut r, fb, false)?;
+            if b == 0 {
+                continue;
+            }
+            let hit = self.with_block(b, |d| {
+                let (mut o, mut prev) = (0, None);
+                while o + 8 <= self.bsize {
+                    let (i, rl, nl, ft) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize, d[o + 7]);
+                    if rl < 8 || o + rl > self.bsize {
+                        break;
+                    }
+                    let tail = i == 0 && rl == DIR_TAIL && nl == 0 && ft == DIR_TAIL_FT && o + rl == self.bsize;
+                    if !tail && let Some(t) = f(b, d, o, prev) {
+                        return Some(t);
+                    }
+                    prev = Some(o);
+                    o += rl;
+                }
+                None
+            })?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        Ok(None)
+    }
+
     /// ディレクトリの項目の種類 (ft) から mode の種類。書かれていなければ inode を読む
     fn mode_of_ft(&self, ino: u32, ft: u8) -> u32 {
         match ft {
@@ -2238,7 +2334,8 @@ impl ExtFs {
 
     fn find_uncached(&self, dir: u32, name: &str) -> Result<u32, i64> {
         // 索引があれば 1 つの葉だけ (決められなければ全部)
-        if self.read_inode(dir)?.flags() & INDEX_FL != 0 && name != "." && name != ".." {
+        let mut r = self.read_inode(dir)?;
+        if r.flags() & INDEX_FL != 0 && name != "." && name != ".." {
             match self.dx_find(dir, name) {
                 Ok(Some(ino)) => return Ok(ino),
                 Ok(None) => return Err(-ENOENT),
@@ -2246,7 +2343,6 @@ impl ExtFs {
             }
         }
         // 索引がない: ブロックを順に、その場でくらべる (名前の文字列は作らない)
-        let mut r = self.read_inode(dir)?;
         let nblocks = r.size().div_ceil(self.bsize as u64);
         for fb in 0..nblocks {
             let b = self.map(dir, &mut r, fb, false)?;
@@ -2275,13 +2371,14 @@ impl ExtFs {
         })
     }
 
-    /// ディレクトリのブロックを書きかえ、チェックサムを直す
+    /// ディレクトリのブロックを書きかえる。チェックサムは写すときに (settle_csum)
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
         self.forget_names(dir);
-        self.modify_block(b, |d| {
-            f(d);
-            self.set_dir_csum(dir, generation, d);
-        })
+        self.modify_block(b, f)?;
+        if self.csum {
+            self.cache.borrow_mut().dir_csum.insert(b, (dir, generation));
+        }
+        Ok(())
     }
 
     fn dir_writable(&self, dir: u32) -> Result<Raw, i64> {
@@ -2305,10 +2402,41 @@ impl ExtFs {
         if name.len() > 255 {
             return Err(-ENAMETOOLONG);
         }
-        let mut r = self.dir_writable(dir)?;
+        let r = self.dir_writable(dir)?;
         // 消したディレクトリ (開いたまま rmdir されたもの) には作れない (Linux の IS_DEADDIR)
         if r.links() == 0 {
             return Err(-ENOENT);
+        }
+        self.add_entry_in(dir, r, name, ino, mode, None)
+    }
+
+    /// 作るところ (create_node) が、名前を足す前に 1 度だけなめる (Linux の ext4_add_entry がすき間を探すのと同じ 1 回):
+    /// name がもうあれば EEXIST、なければ入るすき間 (ブロック, 位置, rec_len, 使っている長さ)。入るところがなければ None
+    /// (add_entry_in がブロックを足す)。索引つきなら dx_find で確かめるだけ (すき間は dx_add_entry が葉で探す)
+    fn new_slot(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<Slot>, i64> {
+        if r.flags() & INDEX_FL != 0 {
+            return if self.find(dir, name).is_ok() { Err(-EEXIST) } else { Ok(None) };
+        }
+        let need = rec_len_for(name.len());
+        let mut fit = None;
+        let dup = self.scan_dir(dir, r.clone(), |b, d, o, _| {
+            let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+            if i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes() {
+                return Some(());
+            }
+            let used = if i == 0 { 0 } else { rec_len_for(nl.min(rl - 8)) };
+            if fit.is_none() && rl >= used + need {
+                fit = Some((b, o, rl, used));
+            }
+            None
+        })?;
+        if dup.is_some() { Err(-EEXIST) } else { Ok(fit) }
+    }
+
+    /// dir (inode r) に name を足す。slot は new_slot で見つけたすき間 (Some(None) はすき間がない)。None ならここで探す
+    fn add_entry_in(&self, dir: u32, mut r: Raw, name: &str, ino: u32, mode: u32, slot: Option<Option<Slot>>) -> Result<(), i64> {
+        if name.len() > 255 {
+            return Err(-ENAMETOOLONG);
         }
         if r.flags() & INDEX_FL != 0 {
             self.dx_add_entry(dir, &mut r, name, ino, mode)?;
@@ -2324,19 +2452,25 @@ impl ExtFs {
             d[o + 8..o + 8 + name.len()].copy_from_slice(name.as_bytes());
         };
         // 既存のすき間を探す
-        for (b, o, i, rl, ename, _) in self.dir_entries(dir)? {
-            let used = if i == 0 { 0 } else { rec_len_for(ename.len()) };
-            if rl - used >= need {
-                self.modify_dir_block(dir, generation, b, |d| {
-                    if used == 0 {
-                        write_entry(d, o, rl);
-                    } else {
-                        put16(d, o + 4, used as u16);
-                        write_entry(d, o + used, rl - used);
-                    }
-                })?;
-                return self.dir_changed(dir);
-            }
+        let fit = match slot {
+            Some(s) => s,
+            None => self.scan_dir(dir, r.clone(), |b, d, o, _| {
+                let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+                let used = if i == 0 { 0 } else { rec_len_for(nl.min(rl - 8)) };
+                (rl >= used + need).then_some((b, o, rl, used))
+            })?,
+        };
+        if let Some((b, o, rl, used)) = fit {
+            self.modify_dir_block(dir, generation, b, |d| {
+                if used == 0 {
+                    write_entry(d, o, rl);
+                } else {
+                    put16(d, o + 4, used as u16);
+                    write_entry(d, o + used, rl - used);
+                }
+            })?;
+            r.touch();
+            return self.write_inode(dir, &r);
         }
         // 1 ブロックに入りきらなくなったら索引つきに
         if self.make_indexed(dir, &mut r)? {
@@ -2352,8 +2486,8 @@ impl ExtFs {
             write_entry(d, 0, end);
         })?;
         r.set_size(r.size() + self.bsize as u64);
-        self.write_inode(dir, &r)?;
-        self.dir_changed(dir)
+        r.touch();
+        self.write_inode(dir, &r)
     }
 
     /// 項目 name を、ino (種類 mode) を指すように書きかえる。名前もハッシュも変わらないので、その場で
@@ -2377,16 +2511,28 @@ impl ExtFs {
                 res => return res.and_then(|_| self.dir_changed(dir)),
             }
         }
-        let ents = self.dir_entries(dir)?;
-        let pos = ents.iter().position(|e| e.2 != 0 && e.4 == name).ok_or(-ENOENT)?;
-        let (b, o, _, rl, _, _) = ents[pos];
-        let prev = pos.checked_sub(1).map(|p| &ents[p]).filter(|p| p.0 == b);
+        let (_, at) = self.entry_at(dir, &r, name)?.ok_or(-ENOENT)?;
+        self.remove_at(dir, r, at)
+    }
+
+    /// 索引のないディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node) は、これで引いて
+    /// remove_at で消す (前は引くのと消すので 2 度なめていた)
+    fn entry_at(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u32, Entry)>, i64> {
+        self.scan_dir(dir, r.clone(), |b, d, o, prev| {
+            let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+            (i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes()).then(|| (i, (b, o, rl, prev.map(|p| (p, u16_at(d, p + 4) as usize)))))
+        })
+    }
+
+    /// entry_at で見つけた項目を消す (前のものがあれば吸収させる)
+    fn remove_at(&self, dir: u32, mut r: Raw, (b, o, rl, prev): Entry) -> Result<(), i64> {
         self.modify_dir_block(dir, r.gen_no(), b, |d| match prev {
             // 前のものに吸収させる
-            Some(p) => put16(d, p.1 + 4, (p.3 + rl) as u16),
+            Some((p, prl)) => put16(d, p + 4, (prl + rl) as u16),
             None => put32(d, o, 0),
         })?;
-        self.dir_changed(dir)
+        r.touch();
+        self.write_inode(dir, &r)
     }
 
     /// 中身が変わったので時刻を進める
@@ -2608,11 +2754,11 @@ impl ExtInode {
     fn create_node(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
         self.dir_only()?;
         let fs = &self.fs;
-        if fs.find(self.ino, name).is_ok() {
-            return Err(-EEXIST);
-        }
+        // あれば EEXIST。なければ名前を入れるすき間も (なめるのは 1 度)
+        let pr = fs.read_inode(self.ino)?;
+        let slot = fs.new_slot(self.ino, &pr, name)?;
         // 消したディレクトリには作れない (inode をとる前に)
-        if fs.read_inode(self.ino)?.links() == 0 {
+        if pr.links() == 0 {
             return Err(-ENOENT);
         }
         let mode = node.type_bits() | (mode & 0o7777);
@@ -2620,6 +2766,7 @@ impl ExtInode {
         let ino = fs.alloc_inode(fs.group_of(self.ino), is_dir)?;
         let mut r = Raw(vec![0; fs.inode_size]);
         put16(&mut r.0, 0, mode as u16);
+        r.init_owner(&pr);
         let t = now_secs();
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
@@ -2670,7 +2817,9 @@ impl ExtInode {
             }
             _ => {}
         }
-        fs.add_entry(self.ino, name, ino, mode)?;
+        // ディレクトリを作ったなら、親のリンクの数を書きかえている (読みなおす)
+        let pr = if is_dir { fs.dir_writable(self.ino)? } else { pr };
+        fs.add_entry_in(self.ino, pr, name, ino, mode, Some(slot))?;
         Ok(self.at(ino))
     }
 
@@ -2679,9 +2828,11 @@ impl ExtInode {
     fn tmpfile_node(&self, mode: u32, linkable: bool) -> Result<InodeRef, i64> {
         self.dir_only()?;
         let fs = &self.fs;
+        let pr = fs.read_inode(self.ino)?;
         let ino = fs.alloc_inode(fs.group_of(self.ino), false)?;
         let mut r = Raw(vec![0; fs.inode_size]);
         put16(&mut r.0, 0, (S_IFREG | (mode & 0o7777)) as u16);
+        r.init_owner(&pr);
         let t = now_secs();
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
@@ -2709,7 +2860,12 @@ impl ExtInode {
             return Err(crate::why::inval());
         }
         let fs = &self.fs;
-        let child = fs.find(self.ino, name)?;
+        // 索引のないディレクトリは、引いた場所をそのまま消す (なめるのは 1 度)
+        let dr = fs.dir_writable(self.ino)?;
+        let (child, at) = match dr.flags() & INDEX_FL {
+            0 => fs.entry_at(self.ino, &dr, name)?.map(|(i, e)| (i, Some(e))).ok_or(-ENOENT)?,
+            _ => (fs.find(self.ino, name)?, None),
+        };
         let mut r = fs.read_inode(child)?;
         let is_dir = r.mode() & S_IFMT == S_IFDIR;
         match (is_dir, rmdir) {
@@ -2718,7 +2874,10 @@ impl ExtInode {
             (true, true) if !fs.is_empty_dir(child)? => return Err(-ENOTEMPTY),
             _ => {}
         }
-        fs.remove_entry(self.ino, name)?;
+        match at {
+            Some(e) => fs.remove_at(self.ino, dr, e)?,
+            None => fs.remove_entry(self.ino, name)?,
+        }
         if is_dir {
             fs.add_links(self.ino, -1)?;
             r.set_links(0);
