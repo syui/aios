@@ -69,6 +69,10 @@ pub type InotifyRef = Rc<RefCell<Inotify>>;
 /// IN_ACCESS を待つ見張りが置かれたことがある (それからは、大きなロックなしの read はしない: file::fast_read_file)
 pub static ACCESS_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// 作る・消すのできごと (IN_CREATE、IN_DELETE、IN_ATTRIB、IN_DELETE_SELF) を待つ見張りが置かれたことがある (それからは、
+/// 大きなロックなしの作る・消す (fastdir.rs) はしない: できごとはふつうの道が出す)
+pub static NAME_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// 生きている inotify (見張りがあるかを速く知るため)
 static mut LIST: Vec<Weak<RefCell<Inotify>>> = Vec::new();
 static mut COOKIE: u32 = 0;
@@ -128,12 +132,18 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     if keep & IN_MODIFY != 0 {
         crate::vm::write_permits_revoke();
     }
+    if keep & (IN_CREATE | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF) != 0 {
+        NAME_WATCHED.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
     // 大きなロックなしの open / close (file の棚) は IN_OPEN と IN_CLOSE を出さない: これからはふつうの道で。
     // 棚にしまってあるものは、ここで閉じる (見張りが置かれる前なので、できごとはない)
     if keep & (IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) != 0 {
         crate::file::OPEN_WATCHED.store(true, core::sync::atomic::Ordering::SeqCst);
         crate::file::shelf_flush_all();
     }
+    // いま大きなロックなしで作っている・消しているもの (fastdir.rs) が終わるのを待つ (ext4 のロック): あとから来るものは、
+    // ロックを取ってから印を見るので、ふつうの道へ行く
+    drop(crate::extfs::fs_lock());
     let mut n = n.borrow_mut();
     if let Some(w) = n.watches.iter_mut().find(|w| w.id == id) {
         if mask & IN_MASK_CREATE != 0 {

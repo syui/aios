@@ -328,7 +328,15 @@ pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result
     mount_ro(path, fsroot, source, fstype, false)
 }
 
+/// 読むだけのマウントが置かれたことがある (大きなロックなしの作る・消す (fastdir.rs) は、それからはふつうの道で:
+/// EROFS を決める check_writable はマウントの表を見る)
+pub static RO_MOUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+    if ro {
+        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
+        drop(crate::extfs::fs_lock());
+    }
     let (target, dir) = lookup("", path, true)?;
     if !dir.meta().is_dir() {
         return Err(-ENOTDIR);
@@ -344,6 +352,10 @@ pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
     let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
+    if ro {
+        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
+        drop(crate::extfs::fs_lock());
+    }
     m.ro = ro;
     Ok(())
 }
@@ -639,12 +651,12 @@ impl PathEntry {
         if let Some((_, i)) = &found {
             *unsafe { &mut *(&raw mut HOLDS) }.entry(i.id()).or_insert(0) += 1;
         }
-        PathEntry { found, used: false, dirs, gates, checked: unsafe { CHANGES } }
+        PathEntry { found, used: false, dirs, gates, checked: CHANGES.load(core::sync::atomic::Ordering::Acquire) }
     }
 
     /// 通ったところがどれも変わっていないか。前にたしかめてから版の表がまったく変わっていなければ、見なくてよい
     fn fresh(&mut self) -> bool {
-        let now = unsafe { CHANGES };
+        let now = CHANGES.load(core::sync::atomic::Ordering::Acquire);
         if self.checked == now {
             return true;
         }
@@ -780,7 +792,8 @@ static mut PATHS: alloc::collections::BTreeMap<PathKey, PathEntry> = alloc::coll
 /// 版の表: (ディレクトリ, 名前の印) ごとに、その名前が変わる (作る・消す・名前を変える) たびに増やす数。印 ATTR は
 /// ディレクトリの属性 (chmod、chown) の版。覚えは、通ったところの版を持っていて、引くときにちがえば古い (Linux の
 /// dcache の d_seq のように、変わったときに覚えをみな見なおさない)。表は開番地法のハッシュ表 (キーはそのまま
-/// くらべる)。半分まで埋まったら空にして EPOCH を進める (覚えはみな古くなる。ないものを探すのが長くならないように)
+/// くらべる)。半分まで埋まったら空にして EPOCH を進める (覚えはみな古くなる。ないものを探すのが長くならないように)。
+/// 表と EPOCH は GENS_LOCK の中で読み書きする: 大きなロックなしの作る・消す (fastdir.rs) も版を進める
 const GEN_SLOTS: usize = 16384;
 const ATTR: u64 = u64::MAX;
 
@@ -797,9 +810,11 @@ const EMPTY: GenSlot = GenSlot { used: false, dir: (0, 0), name: 0, ver: 0 };
 static mut GENS: [GenSlot; GEN_SLOTS] = [EMPTY; GEN_SLOTS];
 static mut GENS_USED: usize = 0;
 static mut EPOCH: u32 = 0;
-/// 版の表が変わった回数 (PathEntry::fresh)
-static mut CHANGES: u64 = 0;
+static GENS_LOCK: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
+/// 版の表が変わった回数 (PathEntry::fresh。GENS_LOCK の中で増やす)
+static CHANGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// GENS_LOCK を持って
 fn gens() -> &'static mut [GenSlot; GEN_SLOTS] {
     unsafe { &mut *(&raw mut GENS) }
 }
@@ -819,7 +834,8 @@ fn gen_of(dir: (usize, u64), name: u64) -> u32 {
 }
 
 fn gen_bump(dir: (usize, u64), name: u64) {
-    unsafe { CHANGES += 1 };
+    let _g = GENS_LOCK.lock();
+    CHANGES.fetch_add(1, core::sync::atomic::Ordering::Release);
     let i = gen_find(dir, name);
     let g = gens();
     if !g[i].used {
@@ -858,10 +874,12 @@ impl Pass {
     /// いまの版で (名前を引く前に作る: 引いているあいだに変わったものは、あとで古いとわかる)
     fn new(dir: (usize, u64), name: &str) -> Pass {
         let name = name_hash(name);
+        let _g = GENS_LOCK.lock();
         Pass { dir, name, ngen: gen_of(dir, name), agen: gen_of(dir, ATTR), epoch: unsafe { EPOCH } }
     }
 
     fn valid(&self) -> bool {
+        let _g = GENS_LOCK.lock();
         self.epoch == unsafe { EPOCH } && gen_of(self.dir, self.name) == self.ngen && gen_of(self.dir, ATTR) == self.agen
     }
 }
@@ -895,7 +913,7 @@ pub fn names_changed() {
 /// ディレクトリのときだけ呼ぶ (ふつうのファイルの属性は、覚えが答える inode からいつも読む)
 pub fn dir_changed(dir: (usize, u64)) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    unsafe { DIR_GENS[gen_slot(dir)] += 1 };
+    DIR_GENS[gen_slot(dir)].fetch_add(1, core::sync::atomic::Ordering::Release);
     gen_bump(dir, ATTR);
     crate::statc::dir_bump(dir);
 }
@@ -904,7 +922,7 @@ pub fn dir_changed(dir: (usize, u64)) {
 /// (その下のものも) だけが古い。ほかの名前の覚えは残る (Linux の dcache も名前ごと)
 pub fn name_changed(dir: (usize, u64), name: &str) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    unsafe { DIR_GENS[gen_slot(dir)] += 1 };
+    DIR_GENS[gen_slot(dir)].fetch_add(1, core::sync::atomic::Ordering::Release);
     gen_bump(dir, name_hash(name));
     crate::statc::dir_bump(dir);
 }
@@ -977,19 +995,22 @@ pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
 
 /// ディレクトリの中が変わった数。id で 256 の箱に分けて数える (同じ箱のほかのディレクトリで増えることもある)。
 /// 開いたディレクトリの一覧を読みなおすかどうか (file.rs の getdents)
-static mut DIR_GENS: [u64; 256] = [0; 256];
+static DIR_GENS: [core::sync::atomic::AtomicU64; 256] = [const { core::sync::atomic::AtomicU64::new(0) }; 256];
 
 fn gen_slot(dir: (usize, u64)) -> usize {
     ((dir.1 ^ (dir.0 as u64).rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize
 }
 
 pub fn dir_gen(dir: (usize, u64)) -> u64 {
-    unsafe { (*(&raw const DIR_GENS))[gen_slot(dir)] }
+    DIR_GENS[gen_slot(dir)].load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// 大きなロックなしの stat (statc.rs) が覚えるもの: パスの覚えに norm (先頭 / なし、畳んだもの) があって、いまも正しく、
-/// 答えが ino (None なら「ない」) なら、通ったディレクトリと、だれでもは通れないディレクトリの (mode, uid, gid)
-pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
+/// 答えが ino (None なら「ない」) なら、通ったディレクトリ (と、その statc の版) と、だれでもは通れないディレクトリの
+/// (mode, uid, gid)。statc の版は、覚えがいまも正しいかを確かめる前に読む: 大きなロックなしの作る・消す (fastdir.rs) は、
+/// 書きかえてから vfs の版を進め、それから statc の版を進めるので、確かめたあとに変わったものは、読んだ版が古い
+#[allow(clippy::type_complexity)]
+pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<((usize, u64), u64)>, Vec<(u32, u32, u32)>)> {
     if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -1000,10 +1021,14 @@ pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Opti
         (None, None) => true,
         _ => false,
     };
-    if !same || !e.fresh() {
+    if !same {
         return None;
     }
-    Some((e.dirs.iter().map(|p| p.dir).collect(), e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect()))
+    let dirs = e.dirs.iter().map(|p| (p.dir, crate::statc::dir_ver(p.dir))).collect();
+    if !e.fresh() {
+        return None;
+    }
+    Some((dirs, e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect()))
 }
 
 /// いま覚えている数と、そのうちないもの (/proc/bkl)

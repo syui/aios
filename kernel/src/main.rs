@@ -26,6 +26,7 @@ mod epoll;
 mod inotify;
 mod exec;
 mod extfs;
+mod fastdir;
 mod file;
 mod locks;
 mod fs;

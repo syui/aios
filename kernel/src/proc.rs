@@ -1005,11 +1005,14 @@ fn sched() {
     let p = current();
     let seg = crate::smp::seg_pause();
     let off = crate::prof::off_cpu();
+    // ext4 のロックは眠るあいだ手放す (大きなロックと同じく、ほかがそのあいだに ext4 に入れるように)
+    let fs = crate::extfs::fs_unlock_for_sleep();
     unsafe {
         fp_save(&mut p.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) p.tpidr);
         swtch(&mut p.context, sched_ctx());
     }
+    crate::extfs::fs_relock_after_sleep(fs);
     crate::prof::on_cpu(off);
     crate::smp::seg_resume(seg);
 }

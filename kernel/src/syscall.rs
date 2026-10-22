@@ -913,7 +913,12 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             Some(r) => r,
             None => return false,
         },
-        OPENAT => match crate::file::fast_open(p, a[0] as i32 as i64, a[1] as usize, a[2]) {
+        OPENAT => match crate::file::fast_open(p, a[0] as i32 as i64, a[1] as usize, a[2]).or_else(|| crate::fastdir::fast_create(p, a[0] as i32 as i64, a[1] as usize, a[2], a[3])) {
+            Some(r) => r,
+            None => return false,
+        },
+        // ext4 のふつうのファイルを作る・消す (fastdir.rs: ext4 の中は ext4 のロックで 1 つずつ)
+        UNLINKAT => match crate::fastdir::fast_unlink(p, a[0] as i32 as i64, a[1] as usize, a[2]) {
             Some(r) => r,
             None => return false,
         },

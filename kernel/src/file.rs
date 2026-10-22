@@ -304,6 +304,13 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     Some(fd as i64)
 }
 
+/// 大きなロックなしの作る道 (fastdir.rs) が作ったファイルを、空いている fd に置く (表ごとのスピンロックの中で: 大きなロックの
+/// 中の shelf_forget が、表と棚をいっしょに見る)
+pub fn fast_install(t: &mut proc::Files, fd: usize, file: FileRef, cloexec: bool) {
+    let _shelf = t.shelf.0.lock();
+    t.fds[fd] = Some(proc::Fd { file, cloexec });
+}
+
 /// 大きなロックなしの close (syscall::fast): 閉じる fd が、自分だけが持っている棚にしまってよいファイル (OpenFile::reuse) で、
 /// ロック (flock / OFD、この表の POSIX のロック) も IN_OPEN / IN_CLOSE の見張りもなければ、表から外して棚に。
 /// OpenFile は落とさないので、落とすときの後片づけ (ロックを外す、IN_CLOSE) はいらない。ほかは None (ふつうの道へ)

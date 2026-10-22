@@ -161,6 +161,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if kind == EL0_SYNC {
         let ec = esr >> 26;
         if ec == EC_SVC64 && syscall::fast(tf) {
+            crate::extfs::fs_check_released();
             return;
         }
         // データと命令のフォルト (変換、アクセスフラグ、権限)。WnR は、キャッシュを整える命令 (CM) なら読んだことに (handle と同じ)
@@ -194,6 +195,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     crate::smp::seg_begin(&cause, t0);
     let sw = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed);
     handle(tf, kind, claimed, esr);
+    crate::extfs::fs_check_released();
     let slept = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed) != sw;
     let t1 = crate::smp::timed_now();
     crate::smp::account(cause, t1.saturating_sub(t0), slept, t1);

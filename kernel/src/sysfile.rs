@@ -185,6 +185,12 @@ fn last_at_dead(dirfd: i64, path: &str) -> Result<vfs::Parent, i64> {
     vfs::parent_last(start, &proc::current().files().cwd.clone(), path)
 }
 
+/// 作る・消すところの親のディレクトリを statc の表に覚えさせる: 次からは、大きなロックなしの作る・消す (fastdir.rs) が
+/// それで親を引く
+fn learn_parent(p: &vfs::Parent) {
+    crate::statc::learn_dir(&alloc::format!("/{}", dir_of(&p.full)), &p.dir, mgtime(&p.dir));
+}
+
 /// 作るもの (mknod、symlink、link の新しい名前) の最後の名前: . と .. と / はもうあるもの (EEXIST)。name/ は
 /// ディレクトリでないものには使えない (Linux の filename_create: あれば EEXIST、なければ ENOENT)。あれば EEXIST
 /// (書けなくても、砂場でも: mkdir -p や create_dir_all がそれで「ある」とわかる)
@@ -1050,6 +1056,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         if p.slash {
             return Err(-EISDIR);
         }
+        learn_parent(&p);
         return open_found(create_target(p, follow)?, flags, mode);
     }
     // O_TMPFILE: そのディレクトリに名前のないファイル
@@ -1068,7 +1075,7 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         r => r?,
     };
     if learn && found.1.fast_stat() {
-        crate::statc::learn(&path, true, &found.1, &Stat::of_inode(&found.1), mgtime(&found.1));
+        crate::statc::learn(&path, true, &found.1, mgtime(&found.1));
     }
     open_found(Ok(found), flags, mode)
 }
@@ -1242,7 +1249,7 @@ pub fn openat2(dirfd: i64, pathp: usize, howp: usize, size: usize) -> R {
 
 /// 開いたファイルに残すフラグ (F_GETFL で見えるもの): 開くときだけのもの (O_CREAT、O_EXCL、O_NOCTTY、O_TRUNC) と
 /// fd のもの (O_CLOEXEC) は残さない (Linux の do_dentry_open)
-fn file_flags(flags: u64) -> u32 {
+pub(crate) fn file_flags(flags: u64) -> u32 {
     const O_NOCTTY: u64 = 0o400;
     (flags & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) as u32
 }
@@ -1453,7 +1460,7 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
     let s = Stat::of_inode(&ino);
     out(st, &s.to_bytes())?;
     if learn && ino.fast_stat() {
-        crate::statc::learn(&path, follow, &ino, &s, mgtime(&ino));
+        crate::statc::learn(&path, follow, &ino, mgtime(&ino));
     }
     Ok(0)
 }
@@ -1513,7 +1520,7 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
         let (s, mg) = (Stat::of_inode(&i), mgtime(&i));
         out(buf, &s.to_statx(mask, mg))?;
         if learn && i.fast_stat() {
-            crate::statc::learn(&path, follow, &i, &s, mg);
+            crate::statc::learn(&path, follow, &i, mg);
         }
         return Ok(0);
     };
@@ -1703,6 +1710,9 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     }
     let path = user_str(pathp)?;
     let p = last_at(dirfd, &path)?;
+    if p.last == vfs::Last::Norm && !p.slash {
+        learn_parent(&p);
+    }
     // 最後が . .. / なら (Linux の do_rmdir と do_unlinkat): rmdir は .. が ENOTEMPTY、. が EINVAL、/ が EBUSY。
     // unlink はどれも EISDIR
     match (p.last, flags & AT_REMOVEDIR != 0) {

@@ -433,7 +433,7 @@ pub fn stats_reset() {
     STATS.slept.store(0, Ordering::Relaxed);
     FAST_FAULTS.store(0, Ordering::Relaxed);
     PREEMPTS.store(0, Ordering::Relaxed);
-    for c in crate::file::FAST_RW.iter() {
+    for c in crate::file::FAST_RW.iter().chain(crate::fastdir::FAST_NS.iter()).chain(crate::extfs::FS_WAIT.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
@@ -556,6 +556,9 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     let fo: Vec<u64> = crate::file::FAST_OPEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ロックなしの open / close (file の棚): 棚から開いた {} ない (ENOENT) と答えた {} 棚にしまった {} (ふつうの道へ: statc にない {} 棚にない {} 開けない形 {} しまえない {})\n", fo[0], fo[1], fo[2], fo[3], fo[4], fo[5], fo[6]));
+    let ns: Vec<u64> = crate::fastdir::FAST_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let fw = [crate::extfs::FS_WAIT[0].load(Ordering::Relaxed), crate::extfs::FS_WAIT[1].load(Ordering::Relaxed)];
+    s.push_str(&format!("ロックなしの作る・消す (fastdir、ext4 のロックで): 作った {} 消した {} (ふつうの道へ: 形 {} 親が statc にない {} ext4 が断った {})。ext4 のロックを待った {} 回 {:.1} ms\n", ns[0], ns[1], ns[2], ns[3], ns[4], fw[0], fw[1] as f64 / 1e6));
     let wf: Vec<u64> = crate::vm::WRITE_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));
     let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
