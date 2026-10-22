@@ -482,7 +482,9 @@ umount、IN_OPEN / IN_CLOSE の見張りを置くとき (それからはふつ�
 ふつうの close (いちばん古いものを)。test/opencache.c が、開きなおしの位置と fd と O_CLOEXEC、棚にあるファイルを
 消したらディスクの空きが戻ること、rename での上書き、chmod 000、inotify のできごとの数、flock と POSIX のロックが閉じると
 外れること、dup、fork、ないパス、/proc/self/fd、4 つのプロセスが読むあいだに rename で入れかえつづけること (読んだ版が
-古くならない) を確かめる (Linux でも同じに通る)。/proc/bkl の「ロックなしの open / close」に数。
+古くならない) を確かめる (Linux でも同じに通る)。open-close は 1 つで 11.7 → 7.2 µs、4 つで 14.2 → 7.9 µs、記録
+(bench/smp.md) では 4 つで Linux 7.3 の 0.75 倍 (前は 1.86 倍)、大きなロックを待った時間は 174% → 5%。
+/proc/bkl の「ロックなしの open / close」に数。
 /proc/bkl の「ロックなしの stat」に、答えた数とふつうの道へ行った数。
 
 手本が Linux 7.3 になったとき (ext4 300 × 30 と 300 × 80、tmpfs 300 × 30 でどれもちがわない) は、手本のまちがい 3 つが
