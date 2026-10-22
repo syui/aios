@@ -122,6 +122,9 @@ blacklist decnet
 blacklist appletalk
 EOF
 
+cp cfg/aios-modprobe-hardening.conf $ROOTFS/etc/modprobe.d/aios-hardening.conf
+cp cfg/aios-sysctl-hardening.conf $ROOTFS/etc/sysctl.d/50-aios-hardening.conf
+
 cp cfg/aios-firewall.sh $ROOTFS/usr/local/bin/aios-firewall.sh
 cp cfg/aios-firewall.service $ROOTFS/etc/systemd/system/aios-firewall.service
 arch-chroot $ROOTFS /bin/sh -c '
