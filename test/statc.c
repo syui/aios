@@ -2,7 +2,7 @@
 // (zig cc -target aarch64-linux-musl -O2 -static -o statc test/statc.c)。statcache.c と pathcache.c は 1 つのプロセスで
 // 見るので、こちらは変える人と見る人を別の CPU に:
 //   1. 順に: 変える人 (親) が 1 つ変えて round を出す。見る人 (子。CPU の数より 1 つ少なく、2 つ以上) はみな、それを見て
-//      から何度も stat して (絶対のパスと cwd からのパスで)、その round の答えと同じかをたしかめ、済んだと返す。親はみなが
+//      から何度も stat と statx をして (絶対のパスと cwd からのパスで)、その round の答えと同じかをたしかめ、済んだと返す。親はみなが
 //      済むのを待って次へ。答えは親が開いた fd の fstat (stat の道を通らない)。変えるのは: chmod、時刻、大きさ、リンクの数、
 //      名前を変えてもどす、消して作りなおす、シンボリックリンクを付けかえる、途中のディレクトリを取りかえる、だれでもは
 //      通れないディレクトリの許し (親が先に stat して覚えさせてから)
@@ -64,6 +64,18 @@ static struct ans stat_of(const char *p) {
   return of(&s);
 }
 
+// statx で (Rust の std::fs::metadata はこちら。カーネルの statc.rs は両方に答える)
+static struct ans statx_of(const char *p) {
+  struct statx x;
+  struct ans a = {0};
+  if (statx(AT_FDCWD, p, 0, STATX_BASIC_STATS, &x) != 0) {
+    a.err = -errno;
+    return a;
+  }
+  struct ans r = {0, (long)x.stx_ino, (long)(x.stx_mode & 07777), (long)x.stx_nlink, (long)x.stx_size, (long)x.stx_mtime.tv_sec};
+  return r;
+}
+
 static int same(struct ans a, struct ans b) {
   if (a.err || b.err) return a.err == b.err;
   return a.ino == b.ino && a.mode == b.mode && a.nlink == b.nlink && a.size == b.size && a.mtime == b.mtime;
@@ -78,7 +90,7 @@ static void note(const char *fmt, const char *what, const char *path, struct ans
 
 #define BAD "%s: %s: got err %ld ino %ld mode %lo mtime %ld, want err %ld ino %ld mode %lo mtime %ld"
 
-// 見る人: round を待って、その問いを 60 回 (偶数は絶対のパス、奇数は cwd からのパス)。始められなければ、しくじりを
+// 見る人: round を待って、その問いを 60 回 (偶数は絶対のパス、奇数は cwd からのパス。3 回に 1 回は statx)。始められなければ、しくじりを
 // 残して返事だけする (親が待ちつづけないように)
 static void reader(int id) {
   int broken = 0;
@@ -106,7 +118,7 @@ static void reader(int id) {
     struct ans want = sh->want;
     for (int i = 0; i < 60 && !broken; i++) {
       const char *p = (i + id) % 2 ? rel : abs;
-      struct ans got = stat_of(p);
+      struct ans got = i % 3 == 2 ? statx_of(p) : stat_of(p);
       if (!same(got, want)) {
         note(BAD, sh->what, p, got, want);
         break;
@@ -121,7 +133,7 @@ static void reader(int id) {
   while (!__atomic_load_n(&sh->stop, __ATOMIC_ACQUIRE)) {
     long k = __atomic_load_n(&sh->k, __ATOMIC_ACQUIRE);
     if (k < 0) break;
-    struct ans got = stat_of(f);
+    struct ans got = k % 2 ? statx_of(f) : stat_of(f);
     if (got.err || got.mtime < 1000 + k) {
       struct ans want = {0, 0, 0, 0, 0, 1000 + k};
       note(BAD, "running-mtime", f, got, want);
@@ -137,7 +149,7 @@ static void reader(int id) {
     snprintf(old, sizeof old, "%s/run/n%ld", base, k - 1);
     stat_of(cur);
     if (k > 0) {
-      struct ans got = stat_of(old);
+      struct ans got = k % 2 ? statx_of(old) : stat_of(old);
       if (got.err != -ENOENT) {
         struct ans want = {-ENOENT};
         note(BAD, "running-rename", old, got, want);

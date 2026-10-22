@@ -1,11 +1,12 @@
-// 大きなロックなしの stat (Linux の RCU-walk と seqcount の考え)。ふつうの道の newfstatat は大きなロック (smp.rs) の中で
+// 大きなロックなしの stat と statx (Linux の RCU-walk と seqcount の考え)。ふつうの道の newfstatat は大きなロック (smp.rs) の中で
 // パスをたどるので、いくつもの CPU で stat を呼ぶと 1 つずつしか動かない (bench/smp.md: 4 つで 1 つのときの 0.81 倍、
 // Linux は 2.11 倍)。Linux は RCU-walk で、ロックを取らずにパスをたどり、とちゅうで変わっていれば (d_seq) ロックを取って
 // たどりなおす。ここも同じ考えで、答えを覚えておく:
-//   ふつうの道 (大きなロックの中) の newfstatat が答えたら learn が、その答え (struct stat) と、それが正しいあいだの印
+//   ふつうの道 (大きなロックの中) の newfstatat か statx が答えたら learn が、その答え (file::Stat) と、それが正しいあいだの印
 //   (通ったディレクトリの版、inode の中身の版、だれでもは通れないディレクトリの許し (gates)、全体の版) を、ロックの外から
-//   読める表 (TABLE) に書く。syscall::fast の newfstatat は lookup で、表にあって印がみないまと同じで、呼んだ人が gates を
-//   通れれば、ロックを取らずにそれを返す。ちがえば (と、表にないもの、書いている途中のもの) ふつうの道へ。
+//   読める表 (TABLE) に書く。syscall::fast の newfstatat と statx は lookup で、表にあって印がみないまと同じで、呼んだ人が
+//   gates を通れれば、ロックを取らずにそれを struct stat か struct statx にして返す (C の stat は newfstatat、Rust の
+//   std::fs::metadata は statx)。ちがえば (と、表にないもの、書いている途中のもの) ふつうの道へ。
 // 版の箱 (DIRS、INOS) は id のハッシュで分けた AtomicU64: vfs が名前やディレクトリの属性を変えるたびに DIRS を、ext4 が
 // inode を書くたびに INOS を増やす (箱が同じほかのものが変わっても、古いとみなすだけで、まちがった答えは出さない)。
 // マウントやルート、vfs の版の表を空にしたときは EPOCH (みな古い)。
@@ -14,10 +15,11 @@
 // どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していなくて、fd の表 (cwd) を自分だけで
 // 使っているもの (スレッドがいれば、ほかのスレッドが chdir するかもしれない)。ext4 のファイルだけ (tmpfs や /proc は、
 // 中身が変わっても印が変わらない)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
+use crate::file::Stat;
 use crate::proc::Proc;
 use core::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 
-/// 表の数 (1 つ 512 バイト: 512 KiB)
+/// 表の数 (1 つ 512 バイト: 512 KiB。使うのは 1 つ 54 語)
 const N: usize = 1024;
 /// 版の箱の数
 const BOXES: usize = 4096;
@@ -29,7 +31,7 @@ const GATES_MAX: usize = 4;
 
 // 1 つの並び (AtomicU64 の番号)
 const SEQ: usize = 0;
-/// パスの長さ | follow << 16 | ディレクトリの数 << 24 | gates の数 << 32
+/// パスの長さ | follow << 16 | ディレクトリの数 << 24 | gates の数 << 32 | mg << 40 (statx の時刻の出しかた。sysfile の mgtime)
 const SHAPE: usize = 1;
 const EPOCH_W: usize = 2;
 /// inode の箱の番号と、その版
@@ -41,8 +43,9 @@ const DIR0: usize = 5;
 const GATE0: usize = DIR0 + DIRS_MAX;
 const GATE_MODES: usize = GATE0 + GATES_MAX;
 const PATH0: usize = GATE_MODES + 1;
+/// file::Stat: ino、mode | nlink << 32、uid | gid << 32、rdev、size、blocks、mtime、ctime
 const STAT0: usize = PATH0 + PATH / 8;
-const WORDS: usize = STAT0 + 16;
+const WORDS: usize = STAT0 + 8;
 
 #[repr(align(64))]
 struct Slot([AtomicU64; 64]);
@@ -138,8 +141,8 @@ fn usable(p: &Proc) -> Option<&str> {
     Some(f.cwd.as_str())
 }
 
-/// ふつうの道の newfstatat が答えた (大きなロックの中): 表に書く。flags は AT_SYMLINK_NOFOLLOW のほかなし
-pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, stat: &[u8; 128]) {
+/// ふつうの道の newfstatat か statx が答えた (大きなロックの中): 表に書く。mg は sysfile の mgtime
+pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, st: &Stat, mg: bool) {
     if !ino.fast_stat() {
         return;
     }
@@ -157,7 +160,7 @@ pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, stat: &[u8; 1
     let seq = s[SEQ].load(Relaxed);
     s[SEQ].store(seq | 1, Relaxed);
     core::sync::atomic::fence(Release);
-    s[SHAPE].store(len as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32, Relaxed);
+    s[SHAPE].store(len as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40, Relaxed);
     s[EPOCH_W].store(EPOCH.load(Acquire), Relaxed);
     let ib = box_of(ino.id());
     s[INO_BOX].store(ib as u64, Relaxed);
@@ -175,8 +178,9 @@ pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, stat: &[u8; 1
     for (i, w) in words(key).enumerate() {
         s[PATH0 + i].store(w, Relaxed);
     }
-    for (i, w) in words(stat).enumerate() {
-        s[STAT0 + i].store(w, Relaxed);
+    let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
+    for (i, w) in w.iter().enumerate() {
+        s[STAT0 + i].store(*w, Relaxed);
     }
     s[SEQ].store((seq | 1) + 1, Release);
 }
@@ -205,17 +209,37 @@ const AT_NO_AUTOMOUNT: u64 = 0x800;
 
 /// syscall::fast の newfstatat: 表にあって、いまも正しければ答える (0)。でなければ None (ふつうの道へ)
 pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Option<i64> {
-    let r = lookup_inner(p, dirfd, pathp, st, flags);
+    let r = if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
+        None
+    } else {
+        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0).and_then(|(s, _)| if p.pt().copy_out_nofault(st, &s.to_bytes()) { Some(0) } else { None })
+    };
+    count(r)
+}
+
+/// syscall::fast の statx。ふつうの道 (sysfile::statx) が EINVAL にするもの (mask の予約のビット、SYNC の 2 つとも、
+/// 知らないフラグ) と AT_EMPTY_PATH、NULL のパスは、ふつうの道へ
+pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> Option<i64> {
+    const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+    let r = if mask & 0x8000_0000 != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE || flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 || pathp == 0 {
+        None
+    } else {
+        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0).and_then(|(s, mg)| if p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)) { Some(0) } else { None })
+    };
+    count(r)
+}
+
+fn count(r: Option<i64>) -> Option<i64> {
     if r.is_some() { &HITS } else { &MISSES }.fetch_add(1, Relaxed);
     r
 }
 
-fn lookup_inner(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Option<i64> {
+/// 表から答えを探す: (答え, mg)。ないか、古いか、通れないかもしれなければ None
+fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool) -> Option<(Stat, bool)> {
     // しくじらせる決まり (fail.rs) があれば、それを通すためにふつうの道へ
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 || crate::fail::ON.load(Relaxed) {
+    if crate::fail::ON.load(Relaxed) {
         return None;
     }
-    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let mut raw = [0u8; 256];
     let rlen = user_path(p, pathp, &mut raw)?;
     let path = &raw[..rlen];
@@ -266,17 +290,15 @@ fn lookup_inner(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Op
             return None;
         }
     }
-    let mut out = [0u8; 128];
-    for i in 0..16 {
-        out[i * 8..i * 8 + 8].copy_from_slice(&s[STAT0 + i].load(Relaxed).to_le_bytes());
+    let mut w = [0u64; 8];
+    for (i, w) in w.iter_mut().enumerate() {
+        *w = s[STAT0 + i].load(Relaxed);
     }
     // 読んでいるあいだに書かれていなければ、正しい
     core::sync::atomic::fence(Acquire);
     if s[SEQ].load(Relaxed) != seq {
         return None;
     }
-    if !p.pt().copy_out_nofault(st, &out) {
-        return None;
-    }
-    Some(0)
+    let st = Stat { ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: w[3], size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] };
+    Some((st, shape >> 40 & 1 != 0))
 }

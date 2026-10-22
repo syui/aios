@@ -892,8 +892,12 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             _ => return false,
         },
-        // パスの覚え (statc.rs) にある stat
+        // パスの覚え (statc.rs) にある stat と statx
         NEWFSTATAT => match crate::statc::lookup(p, a[0] as i32 as i64, a[1] as usize, a[2] as usize, a[3]) {
+            Some(r) => r,
+            None => return false,
+        },
+        STATX => match crate::statc::lookup_statx(p, a[0] as i32 as i64, a[1] as usize, a[2], a[3] as u32, a[4] as usize) {
             Some(r) => r,
             None => return false,
         },

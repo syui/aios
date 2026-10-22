@@ -1410,11 +1410,11 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
         return Ok(0);
     }
     let ino = at_path(dirfd, &path, flags)?;
-    let bytes = Stat::of_inode(&ino).to_bytes();
-    out(st, &bytes)?;
+    let s = Stat::of_inode(&ino);
+    out(st, &s.to_bytes())?;
     // 大きなロックなしの stat の覚えに (statc.rs。開いているディレクトリからのものは覚えない)
-    if (dirfd == AT_FDCWD || path.starts_with('/')) && flags & !(AT_SYMLINK_NOFOLLOW | 0x800) == 0 {
-        crate::statc::learn(&path, flags & AT_SYMLINK_NOFOLLOW == 0, &ino, &bytes);
+    if (dirfd == AT_FDCWD || path.starts_with('/')) && flags & !(AT_SYMLINK_NOFOLLOW | 0x800) == 0 && ino.fast_stat() {
+        crate::statc::learn(&path, flags & AT_SYMLINK_NOFOLLOW == 0, &ino, &s, mgtime(&ino));
     }
     Ok(0)
 }
@@ -1463,7 +1463,13 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
         of_file(&f)
     } else {
         let i = at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW)?;
-        (Stat::of_inode(&i), mgtime(&i))
+        let (s, mg) = (Stat::of_inode(&i), mgtime(&i));
+        out(buf, &s.to_statx(mask, mg))?;
+        // 大きなロックなしの statx の覚えに (statc.rs。newfstatat と同じ)
+        if dirfd == AT_FDCWD || path.starts_with('/') {
+            crate::statc::learn(&path, flags & AT_SYMLINK_NOFOLLOW == 0, &i, &s, mg);
+        }
+        return Ok(0);
     };
     out(buf, &s.to_statx(mask, mg))?;
     Ok(0)

@@ -400,14 +400,15 @@ umask 1.7 µs、getpgid 1.0、close(-1) 1.1、lseek 1.1、fstat 2.3、fstatat �
 取ってたどりなおす。aios はパスの覚え (vfs.rs の PATHS) の答えを、ロックの外から読める表に写して、同じ考えで答える (statc.rs):
 ふつうの道の newfstatat が答えたら、その答えと、それが正しいあいだの印 (通ったディレクトリの版、inode の中身の版、だれでもは
 通れないディレクトリの許し、全体の版) を seqlock の表 (AtomicU64 の並び。Rc にも RefCell にもヒープにもさわらない) に書き、
-次の newfstatat は速い道 (syscall::fast) で、表にあって印がみないまと同じで、呼んだ人がその許しで通れれば、そのまま返す。
+次の newfstatat と statx は速い道 (syscall::fast) で、表にあって印がみないまと同じで、呼んだ人がその許しで通れれば、それを
+struct stat か struct statx にして返す (C の stat は newfstatat、aish や coreutils など Rust の std::fs::metadata は statx)。
 版は、vfs が名前やディレクトリの属性を変えるたびと、ext4 が inode を書くたび (write_inode。meta の覚えを捨てるところと同じ) に
 進み、マウントでみな古くなる。使うのは ext4 のファイル (tmpfs や /proc は中身が変わっても印が変わらない)、はじめのマウントの
 namespace、chroot なし、fd の表 (cwd) を自分だけで使うプロセス (スレッドがいれば、ほかのスレッドが chdir するかもしれない)、
 ユーザーの namespace の外 (uid が読みかわる) だけで、/dev と /proc のパス、..、開いているディレクトリからのもの、`fail` の
 決まりがあるときはふつうの道へ。test/statc.c が、変える人と見る人を別の CPU にして (chmod、時刻、大きさ、リンクの数、名前を
 変えてもどす、消して作りなおす、リンクの付けかえ、途中のディレクトリの取りかえ、だれでもは通れないディレクトリを root が
-覚えてから uid 65534 が引く、止めずに変えつづけるあいだ、chdir、ユーザーの namespace の中と外) 古い答えが出ないかを確かめる
+覚えてから uid 65534 が引く、止めずに変えつづけるあいだ、chdir、ユーザーの namespace の中と外。stat と statx の両方で) 古い答えが出ないかを確かめる
 (Linux でも同じに通る)。stat は 1 つで 4.9 → 2.6 µs、4 つで 6.0 → 2.5 µs (Linux 7.3 は 8.0 と 4.0)、待った時間は 158% → 7%。
 /proc/bkl の「ロックなしの stat」に、答えた数とふつうの道へ行った数。
 
