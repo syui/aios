@@ -88,7 +88,7 @@ struct own {
   int word;
 };
 
-static void setup(struct own *o, int id) {
+static void setup(struct own *o, int id, const char *op) {
   snprintf(o->dir, sizeof o->dir, "%s/w%d", base, id);
   snprintf(o->file, sizeof o->file, "%s/f", o->dir);
   snprintf(o->tmp, sizeof o->tmp, "%s/t", o->dir);
@@ -100,7 +100,8 @@ static void setup(struct own *o, int id) {
   o->fd = open(o->file, O_CREAT | O_RDWR, 0644);
   if (o->fd < 0 || pwrite(o->fd, page, sizeof page, 0) != sizeof page)
     bad("file");
-  o->mfd = open(o->map, O_CREAT | O_RDWR, 0644);
+  // map-file のときだけ (ほかの op の /proc/bkl に書きこみがまざらないように)
+  o->mfd = strcmp(op, "map-file") ? -1 : open(o->map, O_CREAT | O_RDWR, 0644);
   for (int off = 0; o->mfd >= 0 && off < MAPLEN; off += sizeof page)
     if (pwrite(o->mfd, page, sizeof page, off) != sizeof page) {
       bad("map file");
@@ -115,7 +116,8 @@ static void setup(struct own *o, int id) {
 
 static void teardown(struct own *o) {
   close(o->fd);
-  close(o->mfd);
+  if (o->mfd >= 0)
+    close(o->mfd);
   close(o->pipe[0]);
   close(o->pipe[1]);
   close(o->sock[0]);
@@ -205,7 +207,7 @@ static double measure(const char *op, int k, double ms, long *total) {
     }
     if (pids[i] == 0) {
       struct own o;
-      setup(&o, i);
+      setup(&o, i, op);
       __atomic_add_fetch(&sh->ready, 1, __ATOMIC_SEQ_CST);
       while (!__atomic_load_n(&sh->go, __ATOMIC_ACQUIRE))
         futex(&sh->go, FUTEX_WAIT, 0);
