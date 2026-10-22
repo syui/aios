@@ -1208,13 +1208,32 @@ fn flush_all() {
     unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
 
+/// すべての CPU に 1 ページずつ消させるのは、これより多くのページまで (TLBI_BATCH。calibrate_tlbi が決める)
+static TLBI_BATCH: AtomicUsize = AtomicUsize::new(64);
+
+/// すべての CPU で動いてから 1 度: すべての CPU に 1 ページ消させる (tlbi vaae1is) のにかかる時間を測る。本物の CPU では
+/// 1 µs もかからないので、いままでどおり 64 ページまでは 1 ページずつ (全部消すと、ASID を使わない aios では、すべての
+/// CPU のすべてのプロセスの TLB を捨てる)。QEMU の TCG では 1 回ごとに全部の CPU を止めて合わせるので 40〜60 µs かかり、
+/// 全部消す 1 回 (100 µs ほど) のほうが 2 ページから安い (スレッドのあるプロセスの 64 ページの munmap が 2.8 ms だった)
+pub fn calibrate_tlbi() {
+    const N: u64 = 8;
+    let t0 = crate::timer::uptime_ns();
+    for _ in 0..N {
+        unsafe { core::arch::asm!("dsb ishst", "tlbi vaae1is, xzr", "dsb ish") };
+    }
+    let each = crate::timer::uptime_ns().saturating_sub(t0) / N;
+    let batch = if each > 5_000 { 1 } else { 64 };
+    TLBI_BATCH.store(batch, Ordering::Relaxed);
+    println!("vm: a TLB invalidation on every CPU takes {} ns: more than {} {} at once flush the whole TLB", each, batch, if batch == 1 { "page" } else { "pages" });
+}
+
 /// 消した (無効にした) ページの TLB を消す: 少なければ 1 つずつ、多ければ全部。
 /// 全部消す (vmalle1is) はすべての CPU のすべてのプロセスの TLB を捨てるので、小さな munmap のたびにはしない
 fn flush_pages(vas: &[usize]) {
     if vas.is_empty() {
         return;
     }
-    if vas.len() <= 64 {
+    if vas.len() <= TLBI_BATCH.load(Ordering::Relaxed) {
         unsafe { core::arch::asm!("dsb ishst") };
         for &va in vas {
             unsafe { core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12) as u64) };

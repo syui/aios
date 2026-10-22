@@ -807,4 +807,5 @@ pub fn start() {
     }
     lock();
     println!("smp: {} cpus", online());
+    crate::vm::calibrate_tlbi();
 }
