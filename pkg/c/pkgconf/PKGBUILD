@@ -2,15 +2,15 @@
 #   cargo の *-sys crate (alsa-sys など) や meson / configure が使う。base-devel が入れる
 #   探す場所は /opt/c (aios の C のライブラリ) と /usr
 pkgname=pkgconf
-pkgver=3.0.8
-pkgrel=4
+pkgver=3.0.10
+pkgrel=1
 pkgdesc='pkg-config compatible tool to find C libraries (static, for aios)'
 arch=('aarch64')
 url='http://pkgconf.org/'
 license=('ISC')
 provides=('pkg-config')
 source=("https://distfiles.ariadne.space/pkgconf/pkgconf-$pkgver.tar.xz")
-sha256sums=('943f0bc88bcaeceb630b00262e2a8ad5ea4fac3fba72a4267d8b9ec6b35d1194')
+sha256sums=('9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de')
 
 prepare() {
   rm -rf "pkgconf-$pkgver"

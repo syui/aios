@@ -2,14 +2,14 @@
 #   aios には netlink の sock_diag がないので、ss は /proc/net/tcp と udp を読む (iproute2 の ss がそうする)
 #   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る
 pkgname=iproute2
-pkgver=7.2.0
-pkgrel=3
+pkgver=7.3.0
+pkgrel=1
 pkgdesc='ss from iproute2, to list sockets (static, for aios)'
 arch=('aarch64')
 url='https://git.kernel.org/pub/scm/network/iproute2/iproute2.git'
 license=('GPL-2.0-or-later')
 source=("https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-$pkgver.tar.xz")
-sha256sums=('4c2fa124c2cf0afd7ca34d1eeacba6ba048a56f6374e2aab93dafbdbd4eea9c0')
+sha256sums=('5c1789d290bba048a6135ed1ab81b0402dd0fb528d1f1421765c42b1fc3d6289')
 
 prepare() {
   rm -rf "iproute2-$pkgver"
