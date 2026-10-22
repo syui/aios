@@ -402,14 +402,18 @@ umask 1.7 µs、getpgid 1.0、close(-1) 1.1、lseek 1.1、fstat 2.3、fstatat �
 通れないディレクトリの許し、全体の版) を seqlock の表 (AtomicU64 の並び。Rc にも RefCell にもヒープにもさわらない) に書き、
 次の newfstatat と statx は速い道 (syscall::fast) で、表にあって印がみないまと同じで、呼んだ人がその許しで通れれば、それを
 struct stat か struct statx にして返す (C の stat は newfstatat、aish や coreutils など Rust の std::fs::metadata は statx)。
+「ない」(ENOENT) も覚える (シェルの PATH さがし、ライブラリや locale のファイルさがしで、いちばん多い stat。答えるときは
+ふつうの道と同じわけ `missing_cached` を /proc/ai/why に残す)。
 版は、vfs が名前やディレクトリの属性を変えるたびと、ext4 が inode を書くたび (write_inode。meta の覚えを捨てるところと同じ) に
-進み、マウントでみな古くなる。使うのは ext4 のファイル (tmpfs や /proc は中身が変わっても印が変わらない)、はじめのマウントの
+進み、マウントでみな古くなる。ある答えは ext4 のファイルだけ (tmpfs や /proc は中身が変わっても印が変わらない。「ない」は
+パスの覚えにあれば、どのファイルシステムでも)、はじめのマウントの
 namespace、chroot なし、fd の表 (cwd) を自分だけで使うプロセス (スレッドがいれば、ほかのスレッドが chdir するかもしれない)、
 ユーザーの namespace の外 (uid が読みかわる) だけで、/dev と /proc のパス、..、開いているディレクトリからのもの、`fail` の
 決まりがあるときはふつうの道へ。test/statc.c が、変える人と見る人を別の CPU にして (chmod、時刻、大きさ、リンクの数、名前を
 変えてもどす、消して作りなおす、リンクの付けかえ、途中のディレクトリの取りかえ、だれでもは通れないディレクトリを root が
 覚えてから uid 65534 が引く、止めずに変えつづけるあいだ、chdir、ユーザーの namespace の中と外。stat と statx の両方で) 古い答えが出ないかを確かめる
 (Linux でも同じに通る)。stat は 1 つで 4.9 → 2.6 µs、4 つで 6.0 → 2.5 µs (Linux 7.3 は 8.0 と 4.0)、待った時間は 158% → 7%。
+VM の中の 1 回: /etc/passwd の stat 9.6 → 2.5 µs、statx 9.3 → 2.3、ないものの stat 7.0 → 2.6。
 /proc/bkl の「ロックなしの stat」に、答えた数とふつうの道へ行った数。
 
 手本が Linux 7.3 になったとき (ext4 300 × 30 と 300 × 80、tmpfs 300 × 30 でどれもちがわない) は、手本のまちがい 3 つが

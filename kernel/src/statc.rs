@@ -7,14 +7,17 @@
 //   読める表 (TABLE) に書く。syscall::fast の newfstatat と statx は lookup で、表にあって印がみないまと同じで、呼んだ人が
 //   gates を通れれば、ロックを取らずにそれを struct stat か struct statx にして返す (C の stat は newfstatat、Rust の
 //   std::fs::metadata は statx)。ちがえば (と、表にないもの、書いている途中のもの) ふつうの道へ。
+//   「ない」(ENOENT) も覚える (シェルの PATH さがし、ライブラリや locale のファイルさがし: いちばん多い stat)。答えるときは
+//   ふつうの道と同じわけ (missing_cached) を /proc/ai/why に残す (why::fast_missing。取るのは輪のロックだけ)。
 // 版の箱 (DIRS、INOS) は id のハッシュで分けた AtomicU64: vfs が名前やディレクトリの属性を変えるたびに DIRS を、ext4 が
 // inode を書くたびに INOS を増やす (箱が同じほかのものが変わっても、古いとみなすだけで、まちがった答えは出さない)。
 // マウントやルート、vfs の版の表を空にしたときは EPOCH (みな古い)。
 // 表の 1 つは AtomicU64 の並び (seqlock: 書く側は大きなロックを持って、seq を奇数にしてから書いて偶数に。読む側は前後で
 // seq を見て、ちがえばふつうの道へ)。Rc にも RefCell にもヒープにもさわらない。
 // どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していなくて、fd の表 (cwd) を自分だけで
-// 使っているもの (スレッドがいれば、ほかのスレッドが chdir するかもしれない)。ext4 のファイルだけ (tmpfs や /proc は、
-// 中身が変わっても印が変わらない)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
+// 使っているもの (スレッドがいれば、ほかのスレッドが chdir するかもしれない)。ある答えは ext4 のファイルだけ (tmpfs や /proc
+// は、中身が変わっても印が変わらない)。「ない」はパスの覚えにあるもの (名前が変われば、どのファイルシステムでも vfs が
+// ディレクトリの版を進める)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
 use crate::file::Stat;
 use crate::proc::Proc;
 use core::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
@@ -32,6 +35,7 @@ const GATES_MAX: usize = 4;
 // 1 つの並び (AtomicU64 の番号)
 const SEQ: usize = 0;
 /// パスの長さ | follow << 16 | ディレクトリの数 << 24 | gates の数 << 32 | mg << 40 (statx の時刻の出しかた。sysfile の mgtime)
+/// | missing << 41 (答えは ENOENT。inode の版と STAT は見ない)
 const SHAPE: usize = 1;
 const EPOCH_W: usize = 2;
 /// inode の箱の番号と、その版
@@ -143,28 +147,39 @@ fn usable(p: &Proc) -> Option<&str> {
 
 /// ふつうの道の newfstatat か statx が答えた (大きなロックの中): 表に書く。mg は sysfile の mgtime
 pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, st: &Stat, mg: bool) {
-    if !ino.fast_stat() {
-        return;
+    if ino.fast_stat() {
+        write(path, follow, Some((ino, st, mg)));
     }
+}
+
+/// ふつうの道の newfstatat か statx が ENOENT と答えた (大きなロックの中)
+pub fn learn_missing(path: &str, follow: bool) {
+    write(path, follow, None);
+}
+
+fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, &Stat, bool)>) {
     let p = crate::proc::current();
     let Some(cwd) = usable(p) else { return };
     let mut norm = [0u8; PATH];
     let Some(len) = normalize(cwd.as_bytes(), path.as_bytes(), &mut norm) else { return };
     let key = &norm[..len];
-    // 通ったところと gates は、パスの覚え (vfs の PATHS) から。いま正しいものだけ
-    let Some((dirs, gates)) = crate::vfs::fast_stat_trail(core::str::from_utf8(key).ok().unwrap_or(""), follow, ino) else { return };
+    // 通ったところと gates は、パスの覚え (vfs の PATHS) から。いま正しくて、同じ答え (同じ inode か、ない) のものだけ
+    let Some((dirs, gates)) = crate::vfs::fast_stat_trail(core::str::from_utf8(key).ok().unwrap_or(""), follow, found.map(|f| f.0)) else { return };
     if dirs.len() > DIRS_MAX || gates.len() > GATES_MAX {
         return;
     }
+    let mg = found.is_some_and(|f| f.2);
     let s = &TABLE[hash(key, follow)].0;
     let seq = s[SEQ].load(Relaxed);
     s[SEQ].store(seq | 1, Relaxed);
     core::sync::atomic::fence(Release);
-    s[SHAPE].store(len as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40, Relaxed);
+    s[SHAPE].store(len as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40 | (found.is_none() as u64) << 41, Relaxed);
     s[EPOCH_W].store(EPOCH.load(Acquire), Relaxed);
-    let ib = box_of(ino.id());
-    s[INO_BOX].store(ib as u64, Relaxed);
-    s[INO_GEN].store(INOS[ib].load(Acquire), Relaxed);
+    if let Some((ino, _, _)) = found {
+        let ib = box_of(ino.id());
+        s[INO_BOX].store(ib as u64, Relaxed);
+        s[INO_GEN].store(INOS[ib].load(Acquire), Relaxed);
+    }
     for (i, d) in dirs.iter().enumerate() {
         let b = box_of(*d);
         s[DIR0 + i].store((b as u64) << 48 | (DIRS[b].load(Acquire) & 0xffff_ffff_ffff), Relaxed);
@@ -178,9 +193,11 @@ pub fn learn(path: &str, follow: bool, ino: &crate::vfs::InodeRef, st: &Stat, mg
     for (i, w) in words(key).enumerate() {
         s[PATH0 + i].store(w, Relaxed);
     }
-    let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
-    for (i, w) in w.iter().enumerate() {
-        s[STAT0 + i].store(*w, Relaxed);
+    if let Some((_, st, _)) = found {
+        let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
+        for (i, w) in w.iter().enumerate() {
+            s[STAT0 + i].store(*w, Relaxed);
+        }
     }
     s[SEQ].store((seq | 1) + 1, Release);
 }
@@ -207,14 +224,34 @@ const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_NO_AUTOMOUNT: u64 = 0x800;
 
-/// syscall::fast の newfstatat: 表にあって、いまも正しければ答える (0)。でなければ None (ふつうの道へ)
+/// 表の答え: あるもの (と mg) か、ない
+enum Answer {
+    Found(Stat, bool),
+    Missing,
+}
+
+const NEWFSTATAT: u64 = 79;
+const STATX: u64 = 291;
+const ENOENT: i64 = 2;
+
+/// syscall::fast の newfstatat: 表にあって、いまも正しければ答える (0 か -ENOENT)。でなければ None (ふつうの道へ)
 pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Option<i64> {
+    let mut norm = [0u8; PATH];
     let r = if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
         None
     } else {
-        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0).and_then(|(s, _)| if p.pt().copy_out_nofault(st, &s.to_bytes()) { Some(0) } else { None })
+        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0, &mut norm).and_then(|(a, len)| match a {
+            Answer::Found(s, _) => p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0),
+            Answer::Missing => Some(missing(p, NEWFSTATAT, &norm[..len])),
+        })
     };
     count(r)
+}
+
+/// 「ない」と答える: ふつうの道と同じわけを /proc/ai/why に
+fn missing(p: &Proc, nr: u64, key: &[u8]) -> i64 {
+    crate::why::fast_missing(p, nr, core::str::from_utf8(key).unwrap_or("?"));
+    -ENOENT
 }
 
 /// syscall::fast の statx。ふつうの道 (sysfile::statx) が EINVAL にするもの (mask の予約のビット、SYNC の 2 つとも、
@@ -224,7 +261,11 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
     let r = if mask & 0x8000_0000 != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE || flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 || pathp == 0 {
         None
     } else {
-        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0).and_then(|(s, mg)| if p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)) { Some(0) } else { None })
+        let mut norm = [0u8; PATH];
+        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0, &mut norm).and_then(|(a, len)| match a {
+            Answer::Found(s, mg) => p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)).then_some(0),
+            Answer::Missing => Some(missing(p, STATX, &norm[..len])),
+        })
     };
     count(r)
 }
@@ -234,8 +275,8 @@ fn count(r: Option<i64>) -> Option<i64> {
     r
 }
 
-/// 表から答えを探す: (答え, mg)。ないか、古いか、通れないかもしれなければ None
-fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool) -> Option<(Stat, bool)> {
+/// 表から答えを探す: (答え, norm に畳んだパスの長さ)。表にないか、古いか、通れないかもしれなければ None
+fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize)> {
     // しくじらせる決まり (fail.rs) があれば、それを通すためにふつうの道へ
     if crate::fail::ON.load(Relaxed) {
         return None;
@@ -252,8 +293,7 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool) -> Option<(Stat, bool)
         return None;
     }
     let cwd = usable(p)?;
-    let mut norm = [0u8; PATH];
-    let len = normalize(cwd.as_bytes(), path, &mut norm)?;
+    let len = normalize(cwd.as_bytes(), path, norm)?;
     let key = &norm[..len];
     let s = &TABLE[hash(key, follow)].0;
     let seq = s[SEQ].load(Acquire);
@@ -268,8 +308,9 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool) -> Option<(Stat, bool)
     if s[EPOCH_W].load(Relaxed) != EPOCH.load(Acquire) {
         return None;
     }
+    let is_missing = shape >> 41 & 1 != 0;
     let ib = s[INO_BOX].load(Relaxed) as usize % BOXES;
-    if s[INO_GEN].load(Relaxed) != INOS[ib].load(Acquire) {
+    if !is_missing && s[INO_GEN].load(Relaxed) != INOS[ib].load(Acquire) {
         return None;
     }
     for i in 0..ndirs {
@@ -299,6 +340,9 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool) -> Option<(Stat, bool)
     if s[SEQ].load(Relaxed) != seq {
         return None;
     }
+    if is_missing {
+        return Some((Answer::Missing, len));
+    }
     let st = Stat { ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: w[3], size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] };
-    Some((st, shape >> 40 & 1 != 0))
+    Some((Answer::Found(st, shape >> 40 & 1 != 0), len))
 }

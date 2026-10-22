@@ -243,7 +243,24 @@ fn done_slow(nr: u64, e: i64, a: &[u64]) {
         }
     }
     let ent = Ent { ns: crate::timer::uptime_ns(), tgid: p.tgid as u32, tid: p.pid as u32, uid: p.cred.uid, nr: nr as u16, errno: (-e) as u16, comm: p.comm, note };
-    let mut r = if probe(nr, e) { PROBE.lock() } else { MAIN.lock() };
+    push(probe(nr, e), ent);
+}
+
+/// 大きなロックなしの stat (statc.rs) が「ない」と答えた: ふつうの道の missing_cached と同じわけを残す (取るのは輪のロック
+/// だけ)。path は畳んだパス (先頭 / なし)
+#[cold]
+pub fn fast_missing(p: &crate::proc::Proc, nr: u64, path: &str) {
+    if crate::parts::off(crate::parts::Part::Aiproc) {
+        return;
+    }
+    let mut note = Note { code: Code::MissingCached, errno: 2, ..NONE };
+    note.plen = copy(&mut note.path, path);
+    let ent = Ent { ns: crate::timer::uptime_ns(), tgid: p.tgid as u32, tid: p.pid as u32, uid: p.cred.uid, nr: nr as u16, errno: 2, comm: p.comm, note };
+    push(probe(nr, -2), ent);
+}
+
+fn push(probe: bool, ent: Ent) {
+    let mut r = if probe { PROBE.lock() } else { MAIN.lock() };
     let h = r.head;
     r.ev[h] = ent;
     r.head = (h + 1) % N;

@@ -966,14 +966,19 @@ pub fn dir_gen(dir: (usize, u64)) -> u64 {
 }
 
 /// 大きなロックなしの stat (statc.rs) が覚えるもの: パスの覚えに norm (先頭 / なし、畳んだもの) があって、いまも正しく、
-/// 答えが ino なら、通ったディレクトリと、だれでもは通れないディレクトリの (mode, uid, gid)
-pub fn fast_stat_trail(norm: &str, follow: bool, ino: &InodeRef) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
+/// 答えが ino (None なら「ない」) なら、通ったディレクトリと、だれでもは通れないディレクトリの (mode, uid, gid)
+pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
     if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let cache = unsafe { &mut *(&raw mut PATHS) };
     let e = cache.get_mut(PathKeyRef::new(current_mnt().id, norm, follow).key())?;
-    if !e.fresh() || !e.found.as_ref().is_some_and(|(_, i)| i.id() == ino.id()) {
+    let same = match (&e.found, ino) {
+        (Some((_, i)), Some(ino)) => i.id() == ino.id(),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same || !e.fresh() {
         return None;
     }
     Some((e.dirs.iter().map(|p| p.dir).collect(), e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect()))
