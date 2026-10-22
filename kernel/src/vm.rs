@@ -35,7 +35,7 @@ use crate::memlayout::{p2v, v2p, PGSIZE};
 use crate::vfs::InodeRef;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{fence, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
 const PTE_VALID: u64 = 1 << 0;
 const PTE_TABLE: u64 = 1 << 1; // L1/L2 ではテーブル、L3 ではページ
@@ -164,13 +164,38 @@ struct PrivPage {
     /// 命令キャッシュをあわせた (sync_icache)。実行できるように写すときに一度 (Linux の PG_dcache_clean)。
     /// 読むだけのページ (read のページキャッシュ) はしない
     synced: bool,
+    /// 大きなロックなしの pwrite (write_fast) が書いて、ファイルシステムにまだ渡していない (PageCache の written にある)
+    written: bool,
+}
+
+/// 大きなロックなしの pwrite (write_fast) を許すしるし。ファイルシステムが大きなロックの中で書いたあと (ext4 の write_at)、
+/// この秒 (sec) のうちに、いまの大きさの中の、表にあるファイルシステムのページそのもの (owned) を書きかえるだけなら、
+/// inode は 1 バイトも変わらない (ext4 の時刻は秒まで。setuid / setgid もない) と知らせたもの。inode が書きかわった
+/// (statc の箱の版 ino)、IN_MODIFY の見張りが置かれた (WRITE_EPOCH)、ファイルシステムが書きはじめた (file_writing) か
+/// 変わった (file_changed) ら使わない
+#[derive(Clone, Copy)]
+struct WritePermit {
+    sec: u64,
+    ino: u64,
+    epoch: u64,
 }
 
 struct PageCache {
     pages: BTreeMap<FileKey, PrivPage>,
     /// ファイルごとの版 (更新時刻と大きさ)。表にあるそのファイルのページは、みなこの版のいまの中身
     vers: BTreeMap<(usize, u64), (u64, u64)>,
+    permits: BTreeMap<(usize, u64), WritePermit>,
+    /// write_fast が書いたページ (参照をひとつ持つ)。ファイルシステムが書き出す前に受けとって (take_written)、
+    /// 中身のブロックに書き出す印をつける。since は列が空でなくなったときの ticks
+    written: Vec<Written>,
+    written_since: u64,
 }
+
+/// written の列の 1 つ: (鍵, ページ)
+struct Written(FileKey, *mut u8);
+
+// ページはカーネルのもの (どの CPU からでも)
+unsafe impl Send for Written {}
 
 impl PageCache {
     /// key のページ (ファイルの版が ver のとき)
@@ -185,6 +210,7 @@ impl PageCache {
     fn forget_if_empty(&mut self, id: (usize, u64)) {
         if self.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_none() {
             self.vers.remove(&id);
+            self.permits.remove(&id);
         }
     }
 
@@ -197,6 +223,7 @@ impl PageCache {
             }
         }
         self.vers.remove(&id);
+        self.permits.remove(&id);
     }
 }
 
@@ -231,7 +258,7 @@ fn heap_crowded() -> bool {
 /// しばらく (priv_max / 8 枚ふえるまで) なめない: 読みこむたびに表をなめると、それだけで重い
 static NEXT_SHRINK: AtomicUsize = AtomicUsize::new(0);
 
-static PRIV: SpinLock<PageCache> = SpinLock::new(PageCache { pages: BTreeMap::new(), vers: BTreeMap::new() });
+static PRIV: SpinLock<PageCache> = SpinLock::new(PageCache { pages: BTreeMap::new(), vers: BTreeMap::new(), permits: BTreeMap::new(), written: Vec::new(), written_since: 0 });
 
 /// ページキャッシュのページの数 (/proc/meminfo の Cached)
 pub fn cached_pages() -> usize {
@@ -370,8 +397,131 @@ pub fn file_changed(id: (usize, u64)) {
 
 /// ファイルシステムが id に書く前に (file_written とくみで。表にあるそのファイルのページが、みなファイルシステムの
 /// ページそのもの (owned) で、その場で書きかえるとき: ext4)。いま読みこんでいるものは表に入れない
-pub fn file_writing(_id: (usize, u64)) {
+pub fn file_writing(id: (usize, u64)) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
+    // 大きなロックなしの pwrite は、書きおわる (write_permit) まで待たせる: 同じところへの書きこみが、まざらないように
+    // (Linux も i_rwsem で 1 つずつ)。いま書いているもの (表のロックの中) は、ロックを取ったときには終わっている
+    write_permit_drop(id);
+}
+
+/// write_fast の数: [0] 書いた、ふつうの道へ行ったわけ: [1] 許しがない・古い、[2] 大きさの外かページが表にない、
+/// [3] ユーザーのページが写っていない、[4] 書いたページの列が長いか古い (ファイルシステムに書き出させる)。/proc/bkl に出す
+pub static WRITE_FAST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// IN_MODIFY の見張りが置かれるたびに増える: それより前の write_fast の許しは使わない
+static WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// write_fast が書いたページの列の長さと、古さ (ticks) の上限。こえたらふつうの道へ (そこでファイルシステムが書き出す)
+const WRITTEN_MAX: usize = 4096;
+const WRITTEN_AGE: u64 = 5 * crate::timer::HZ;
+
+/// ファイルシステムが id に書いた (大きなロックの中で): 秒 sec のうちは、write_fast で書いてよい (WritePermit)
+pub fn write_permit(id: (usize, u64), sec: u64) {
+    let p = WritePermit { sec, ino: crate::statc::ino_ver(id), epoch: WRITE_EPOCH.load(Ordering::SeqCst) };
+    let mut c = PRIV.lock();
+    if c.vers.contains_key(&id) {
+        c.permits.insert(id, p);
+    }
+}
+
+pub fn write_permit_drop(id: (usize, u64)) {
+    let mut c = PRIV.lock();
+    if !c.permits.is_empty() {
+        c.permits.remove(&id);
+    }
+}
+
+/// IN_MODIFY の見張りが置かれた: write_fast の許しをみな古くする (inotify のできごとはふつうの道が出す)
+pub fn write_permits_revoke() {
+    WRITE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    // いま write_fast の中にいるもの (表のロックを持っている) が終わるのを待つ
+    drop(PRIV.lock());
+}
+
+/// 大きなロックなしの pwrite64 (file::fast_pwrite): ファイル id の off から len バイトを、ユーザーの va から、表にある
+/// ファイルシステムのページそのもの (ext4 のブロックのキャッシュのページ) へ写す。許し (WritePermit) がいまの秒で新しく、
+/// 大きさの中で、ページがみな表にあるときだけ。書いたページは written の列に入れ、ファイルシステムが書き出す前に
+/// 受けとる (take_written)。Linux の generic_perform_write と同じく、ページキャッシュに書くだけ (書き出しはあとで)。
+/// ほかは None でふつうの道へ (書きかけでやめたら、そこまでのページも列に入れてから: ふつうの道がもう一度書く)
+pub fn write_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: usize) -> Option<usize> {
+    let end = off.checked_add(len)?;
+    // ユーザーのところが写っていなければ、ページにさわる前にふつうの道へ (フォルトで写す)
+    if !pt.readable_nofault(va, len) {
+        WRITE_FAST[3].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let sec = crate::timer::epoch_ns() / 1_000_000_000;
+    let ino = crate::statc::ino_ver(id);
+    let mut g = PRIV.lock();
+    let c = &mut *g;
+    let ok = c.permits.get(&id).is_some_and(|w| w.sec == sec && w.ino == ino && w.epoch == WRITE_EPOCH.load(Ordering::SeqCst));
+    if !ok {
+        WRITE_FAST[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let now = crate::timer::ticks();
+    if !c.written.is_empty() && (c.written.len() >= WRITTEN_MAX || now >= c.written_since + WRITTEN_AGE) {
+        WRITE_FAST[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let (first, last) = (off / PGSIZE, (end - 1) / PGSIZE);
+    let have = c.pages.range((id.0, id.1, first)..=(id.0, id.1, last)).filter(|(_, p)| p.owned).count();
+    if c.vers.get(&id).is_none_or(|v| (v.1 as usize) < end) || have != last - first + 1 {
+        WRITE_FAST[2].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let PageCache { pages, written, written_since, .. } = c;
+    for (k, p) in pages.range_mut((id.0, id.1, first)..=(id.0, id.1, last)) {
+        let pos = k.2 * PGSIZE;
+        let (from, to) = (off.max(pos), end.min(pos + PGSIZE));
+        let dst = unsafe { core::slice::from_raw_parts_mut(p.page.add(from - pos), to - from) };
+        let copied = pt.copy_in_nofault(va + (from - off), dst);
+        // 書きかわったページは、実行するときに命令キャッシュをあわせなおす
+        p.synced = false;
+        if !p.written {
+            p.written = true;
+            kalloc::get(p.page);
+            if written.is_empty() {
+                *written_since = now;
+            }
+            written.push(Written(*k, p.page));
+        }
+        if !copied {
+            WRITE_FAST[3].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    WRITE_FAST[0].fetch_add(1, Ordering::Relaxed);
+    Some(len)
+}
+
+/// ファイルシステム fs が書き出す前に (大きなロックの中で): write_fast が書いたページ (ino, ページの番号, ページ)。
+/// ページの参照をひとつずつ持ったもの (呼んだほうが、書き出す印をつけてから返す)
+pub fn take_written(fs: usize) -> Vec<(u64, usize, *mut u8)> {
+    let mut g = PRIV.lock();
+    let c = &mut *g;
+    if c.written.is_empty() {
+        return Vec::new();
+    }
+    let PageCache { pages, written, written_since, .. } = c;
+    let mut out = Vec::new();
+    written.retain(|Written(k, page)| {
+        if k.0 != fs {
+            return true;
+        }
+        // 印を落とすのは書き出す前: このあと write_fast がまた書いたら、また列に入る (次に書き出す)
+        if let Some(p) = pages.get_mut(k)
+            && p.page == *page
+        {
+            p.written = false;
+        }
+        out.push((k.1, k.2, *page));
+        false
+    });
+    if !written.is_empty() && !out.is_empty() {
+        *written_since = crate::timer::ticks();
+    }
+    out
 }
 
 /// ファイルシステムが id のページ [first, last] に書いた (file_writing のあと): 表にあるそのファイルのページはそのまま
@@ -424,7 +574,7 @@ pub fn file_written(id: (usize, u64), ver: (u64, u64), first: usize, last: usize
                 freed.push(page);
                 continue;
             }
-            if let Some(o) = c.pages.insert(key, PrivPage { page, owned: true, synced: false }) {
+            if let Some(o) = c.pages.insert(key, PrivPage { page, owned: true, synced: false, written: false }) {
                 freed.push(o.page);
             }
         }
@@ -662,7 +812,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
         }
         c.vers.insert(id, ver);
         // ほかが先に入れたものは外す。写しているところは自分の参照を持っている
-        if let Some(o) = c.pages.insert(key, PrivPage { page, owned, synced: exec }) {
+        if let Some(o) = c.pages.insert(key, PrivPage { page, owned, synced: exec, written: false }) {
             freed.push(o.page);
         }
     }
@@ -1997,6 +2147,22 @@ impl PageTable {
             unsafe { core::ptr::copy_nonoverlapping(p2v(pa) as *const u8, dst[done..].as_mut_ptr(), len) };
             done += len;
             va += len;
+        }
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        ok
+    }
+
+    /// 大きなロックなしで、va から len バイトがみな写っているか (読める) だけを見る (write_fast が、ページを書きかえる前に)
+    pub fn readable_nofault(&self, va: usize, len: usize) -> bool {
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let end = va.saturating_add(len);
+        let mut ok = end <= MAXVA;
+        let mut v = va & !(PGSIZE - 1);
+        while ok && v < end {
+            let e = self.walk(v, false).map_or(0, |p| unsafe { core::ptr::read_volatile(p) });
+            ok = e & PTE_VALID != 0 && e & PTE_USER != 0;
+            v += PGSIZE;
         }
         self.fast_users.fetch_sub(1, Ordering::SeqCst);
         ok

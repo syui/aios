@@ -918,6 +918,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             None => return false,
         },
+        // ページキャッシュに書くだけの pwrite64 (vm::write_fast)
+        PWRITE64 => match crate::file::fast_pwrite(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
+            Some(r) => r,
+            None => return false,
+        },
         // ページキャッシュから読む pread64、ファイル → パイプ・パイプ → /dev/null の splice (眠らないもの)
         PREAD64 => match crate::file::fast_pread(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
             Some(r) => r,

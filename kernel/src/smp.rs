@@ -554,6 +554,8 @@ pub fn stats() -> alloc::string::String {
     let uf: Vec<u64> = crate::unix::FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("AF_UNIX のロックなしの読み書き: 読んだ {} 書いた {} (ふつうの道へ {})\n", uf[0], uf[1], uf[2]));
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
+    let wf: Vec<u64> = crate::vm::WRITE_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));
     let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさ {} IN_ACCESS の見張り {} fd の表を分けている {} 開いたファイルを分けている {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})

@@ -1265,6 +1265,31 @@ pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> 
     crate::vm::read_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)
 }
 
+/// 大きなロックなしの pwrite64 (syscall::fast): ext4 のファイルの、ページキャッシュにある (ブロックのキャッシュのページ
+/// そのもの) ところを、大きさを変えずに、inode の変わらない秒のうちに書きかえるだけのもの (vm::write_fast)。
+/// O_DSYNC / O_SYNC / O_DIRECT で開いたもの、ほかはふつうの道へ (Linux と同じ順でエラーにする)
+pub fn fast_pwrite(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
+    const MAX: usize = 256 * 1024;
+    const O_DSYNC: u32 = 0o10000;
+    const O_DIRECT: u32 = 0o200000;
+    if len == 0 || len > MAX || off < 0 || crate::fail::ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let f = files.get().get(fd)?;
+    // fast_pread と同じく借りずに見る (開いたファイルの種類と口はあとで変わらない)
+    let of = unsafe { &*f.as_ptr() };
+    if !of.writable() || of.flags & (O_DSYNC | O_DIRECT) != 0 {
+        return None;
+    }
+    let Kind::Inode(ino, _) = &of.kind else { return None };
+    if !ino.page_cacheable() {
+        return None;
+    }
+    crate::vm::write_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)
+}
+
 /// 大きなロックなしの splice (syscall::fast)。uutils の cat は、ファイル → (自分で作った) パイプ → 出力 と
 /// 2 回 splice する。眠らずにすむものだけ:
 ///   パイプ → /dev/null: パイプのロックだけで捨てる (中身があるとき)

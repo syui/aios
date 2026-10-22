@@ -79,6 +79,11 @@ pub fn ino_bump(id: (usize, u64)) {
     INOS[box_of(id)].fetch_add(1, Release);
 }
 
+/// id の inode の箱の版 (inode を書くたびに増える: ino_bump)。vm::write_fast の許しがまだ新しいか
+pub fn ino_ver(id: (usize, u64)) -> u64 {
+    INOS[box_of(id)].load(Acquire)
+}
+
 /// 覚えをみな古くする (マウント、ルート、vfs の版の表を空にしたとき)
 pub fn epoch_bump() {
     EPOCH.fetch_add(1, Release);

@@ -61,6 +61,8 @@ const INDEX_FL: u32 = 0x1000;
 const HUGE_FILE_FL: u32 = 0x40000;
 const EXTENTS_FL: u32 = 0x80000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
+const IMMUTABLE_FL: u32 = 0x10;
+const APPEND_FL: u32 = 0x20;
 
 // グループの印
 const BG_INODE_UNINIT: u16 = 0x1;
@@ -1230,6 +1232,7 @@ impl ExtFs {
     /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
     /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身はキャッシュの 1/4 までためる
     fn maybe_flush(&self) -> Result<(), i64> {
+        self.take_fast_writes();
         let limit = match self.journal.borrow().as_ref() {
             Some(j) => (j.capacity() / 4).min(512),
             None => 512,
@@ -1245,9 +1248,28 @@ impl ExtFs {
         Ok(())
     }
 
+    /// 大きなロックなしの pwrite (vm::write_fast) が書いたページに、中身のブロックとして書き出す印 (data) をつける。
+    /// いまもそのブロックのキャッシュのページそのものであるものだけ (そのあと切りつめた、捨てたものは、もうファイルのもの
+    /// ではない)。Linux の、書いたページにつける PG_dirty にあたる
+    fn take_fast_writes(&self) {
+        for (ino, index, page) in crate::vm::take_written(self.fs) {
+            if let Ok(mut r) = self.read_inode(ino as u32)
+                && let Ok(b) = self.map(ino as u32, &mut r, index as u64, false)
+                && b != 0
+            {
+                let mut c = self.cache.borrow_mut();
+                if c.map.get(&b) == Some(&page) && !c.dirty.contains(&b) {
+                    c.data.insert(b);
+                }
+            }
+            kalloc::put(page);
+        }
+    }
+
     pub fn flush(&self) -> Result<(), i64> {
         // 書きかえたものをまとめて書き出す (中の block:write と jbd2:commit は引かれる)
         let _p = crate::prof::span("extfs:flush");
+        self.take_fast_writes();
         self.last_flush.set(crate::timer::ticks());
         self.cache.borrow_mut().flushes += 1;
         // 写し (MAP_SHARED) で書いているページに、書き出す印をつけなおす (写しは書けるままなので、前に書き出したあとも書かれる)
@@ -2539,6 +2561,8 @@ impl ExtInode {
 
     /// スワップに使っている印 (swapon で true、swapoff で false)
     pub fn set_swapfile(&self, on: bool) {
+        // スワップファイルには書けない (ETXTBSY): 大きなロックなしの pwrite の許しも捨てる
+        crate::vm::write_permit_drop(self.id());
         let mut s = self.fs.swapfiles.borrow_mut();
         if on {
             s.insert(self.ino);
@@ -2567,6 +2591,9 @@ impl ExtInode {
     /// 書きかえる操作: 終わったらディスクへ書き出す
     fn write_op<T>(&self, f: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
         self.fs.check_rw()?;
+        // このファイルを変えるあいだは、大きなロックなしの pwrite (vm::write_fast) をさせない (許しは書いたあとに
+        // write_at がまた出す)。ロックなしで書いているものは、ここで終わるのを待つ
+        crate::vm::write_permit_drop(self.id());
         let fs = &self.fs;
         // 眠ってディスクを待っている読みに、書いたことを知らせる (起きたらやりなおす)。この中の読みは眠らない
         fs.wgen.set(fs.wgen.get() + 1);
@@ -2996,6 +3023,8 @@ impl Inode for ExtInode {
         }
         let mut pages = Vec::new();
         let mut size0 = 0;
+        // 書いたあとの inode が、この秒のうちの書きかえで変わらないもの (時刻は秒まで、setuid / setgid なし) なら、その秒
+        let mut quiet = None;
         let r = self.not_swapfile().and_then(|_| self.write_op(|| {
             let mut r = self.raw()?;
             match r.mode() & S_IFMT {
@@ -3011,6 +3040,10 @@ impl Inode for ExtInode {
             // Linux も時刻が変わったときだけ inode を書く (file_update_time、inode_needs_update_time)
             if r.0 != before.0 {
                 self.fs.write_inode(self.ino, &r)?;
+            }
+            let (ctime, mtime) = (u32_at(&r.0, 12), u32_at(&r.0, 16));
+            if res.is_ok() && r.mode() & 0o6000 == 0 && r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) == 0 && ctime == mtime {
+                quiet = Some(mtime as u64);
             }
             res
         }));
@@ -3033,6 +3066,14 @@ impl Inode for ExtInode {
             // 書きかわったところ: 終わりの先から書いたなら、もとの終わりから (zero_gap が 0 にする)
             let (first, end) = (off.min(size0) / PGSIZE, (off + buf.len()).div_ceil(PGSIZE));
             crate::vm::file_written(id, crate::vm::meta_ver(&self.meta()), first, end.saturating_sub(1), pages);
+            // この秒のうちに、いまの大きさの中を書きかえるだけなら、大きなロックなしで書いてよい (vm::write_fast)。
+            // IN_MODIFY を見張っているもの (ふつうの道ができごとを出す) や RWF_DONTCACHE があるときはしない
+            if let (Ok(_), Some(sec)) = (&r, quiet)
+                && !crate::proc::dontcache_on()
+                && !crate::inotify::modify_watched()
+            {
+                crate::vm::write_permit(id, sec);
+            }
         } else {
             crate::vm::file_changed(id);
         }

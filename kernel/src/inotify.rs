@@ -120,6 +120,14 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     crate::cred::current().check(&ino.meta(), crate::cred::R)?;
     let id = ino.id();
     let keep = mask & (IN_ALL_EVENTS | IN_ONESHOT | IN_EXCL_UNLINK);
+    // 大きなロックなしの read は IN_ACCESS を、pwrite は IN_MODIFY を出さない: これからはふつうの道で
+    // (いまある watch に足すときも)
+    if keep & IN_ACCESS != 0 {
+        ACCESS_WATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if keep & IN_MODIFY != 0 {
+        crate::vm::write_permits_revoke();
+    }
     let mut n = n.borrow_mut();
     if let Some(w) = n.watches.iter_mut().find(|w| w.id == id) {
         if mask & IN_MASK_CREATE != 0 {
@@ -133,9 +141,6 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     }
     let wd = n.next_wd;
     n.next_wd += 1;
-    if keep & IN_ACCESS != 0 {
-        ACCESS_WATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
-    }
     n.watches.push(Watch { wd, id, mask: keep });
     Ok(wd as i64)
 }
@@ -193,6 +198,11 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
 /// 見張っている inotify があるか (なければ知らせるところは何もしない)
 pub fn active() -> bool {
     list().iter().any(|w| w.upgrade().is_some_and(|n| !n.borrow().watches.is_empty()))
+}
+
+/// IN_MODIFY を待っている watch があるか (ext4 が大きなロックなしの pwrite を許すまえに: vm::write_permit)
+pub fn modify_watched() -> bool {
+    wanted(IN_MODIFY, (0, 0)).0
 }
 
 /// ev を待っている watch があるか、と、そのうち id 以外 (親ディレクトリかもしれない) のものがあるか
