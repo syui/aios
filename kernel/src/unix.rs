@@ -15,16 +15,18 @@
 // Linux とちがうところ: MSG_OOB の 1 バイトを (SO_OOBINLINE なしで) 読みとばしたときは、FIONREAD の数からも引く
 // (Linux 7.3 の manage_oob は inq_len を減らさず、FIONREAD が 1 多いままになる)
 //
-// 大きなロックの中で動く (Rc と RefCell)。借りたまま眠らない、借りたまま fd (FileRef) を落とさない (落とすと、
+// ソケットはそれぞれ自分のロック (UnixCell: パイプの PipeCell と同じ) を持ち、Arc で分ける (送ったメッセージは送った口を
+// 持つ: 大きなロックなしで動くところも数を変えられるように)。ふだんは大きなロックの中で動く。借りたまま眠らない、
+// 同じソケットを二重に借りない (止まる)、借りたまま fd (FileRef) を落とさない (落とすと、
 // それが最後ならそのソケットを閉じる: release)
 use crate::file::{self, FileRef, Kind, Stat};
 use crate::proc;
 use crate::vfs::InodeRef;
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::rc::{Rc, Weak};
+use alloc::rc::Rc;
+use alloc::sync::{Arc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
@@ -215,14 +217,66 @@ pub struct Unix {
     pub generation: u64,
 }
 
-pub type UnixRef = Rc<RefCell<Unix>>;
+pub type UnixRef = Arc<UnixCell>;
+
+/// ソケットの中身のロック (file.rs の PipeCell と同じ)。借りるのはいつも 1 人 (borrow も borrow_mut も)。持ったまま眠らないこと。
+/// 同じ CPU が二重に取ったら止める
+pub struct UnixCell {
+    owner: core::sync::atomic::AtomicUsize,
+    inner: crate::spinlock::SpinLock<Unix>,
+}
+
+pub struct UnixGuard<'a> {
+    g: crate::spinlock::Guard<'a, Unix>,
+    owner: &'a core::sync::atomic::AtomicUsize,
+}
+
+impl UnixCell {
+    fn new(u: Unix) -> Self {
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(u) }
+    }
+
+    pub fn borrow_mut(&self) -> UnixGuard<'_> {
+        use core::sync::atomic::Ordering::Relaxed;
+        let me = crate::smp::id() + 1;
+        if self.owner.load(Relaxed) == me {
+            panic!("unix: cpu{} locks a socket twice", me - 1);
+        }
+        let g = self.inner.lock();
+        self.owner.store(me, Relaxed);
+        UnixGuard { g, owner: &self.owner }
+    }
+
+    pub fn borrow(&self) -> UnixGuard<'_> {
+        self.borrow_mut()
+    }
+}
+
+impl Drop for UnixGuard<'_> {
+    fn drop(&mut self) {
+        self.owner.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl core::ops::Deref for UnixGuard<'_> {
+    type Target = Unix;
+    fn deref(&self) -> &Unix {
+        &self.g
+    }
+}
+
+impl core::ops::DerefMut for UnixGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Unix {
+        &mut self.g
+    }
+}
 
 type R = Result<i64, i64>;
 
 // ---- 名前の表 ----
 
-static mut ABSTRACT: BTreeMap<(u64, u8, Vec<u8>), Weak<RefCell<Unix>>> = BTreeMap::new();
-static mut BSD: BTreeMap<(usize, u64), Weak<RefCell<Unix>>> = BTreeMap::new();
+static mut ABSTRACT: BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>> = BTreeMap::new();
+static mut BSD: BTreeMap<(usize, u64), Weak<UnixCell>> = BTreeMap::new();
 static mut NEXT_ID: u64 = 1;
 static mut NEXT_INO: u64 = 1;
 /// メッセージの中にある (送られている途中の) AF_UNIX のソケットの fd の数。0 なら gc はしない
@@ -230,7 +284,7 @@ static mut INFLIGHT: usize = 0;
 /// ソケットの fd が閉じた・ソケットを閉じた (システムコールの終わりに gc を見る)
 static mut GC_WANTED: bool = false;
 /// すべてのソケット (gc がメッセージの中の fd をたどる)。消えたものは gc と new_sock で掃く
-static mut ALL: Vec<Weak<RefCell<Unix>>> = Vec::new();
+static mut ALL: Vec<Weak<UnixCell>> = Vec::new();
 static mut ALL_LIVE: usize = 0;
 
 /// いま生きている AF_UNIX のソケットの数 (/proc/net/sockstat の sockets: used)
@@ -238,11 +292,11 @@ pub fn live() -> usize {
     unsafe { &*(&raw const ALL) }.iter().filter(|w| w.strong_count() > 0).count()
 }
 
-fn abstract_names() -> &'static mut BTreeMap<(u64, u8, Vec<u8>), Weak<RefCell<Unix>>> {
+fn abstract_names() -> &'static mut BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>> {
     unsafe { &mut *(&raw mut ABSTRACT) }
 }
 
-fn bsd_names() -> &'static mut BTreeMap<(usize, u64), Weak<RefCell<Unix>>> {
+fn bsd_names() -> &'static mut BTreeMap<(usize, u64), Weak<UnixCell>> {
     unsafe { &mut *(&raw mut BSD) }
 }
 
@@ -262,15 +316,15 @@ fn next_id() -> u64 {
 }
 
 fn key(u: &UnixRef) -> usize {
-    Rc::as_ptr(u) as usize
+    Arc::as_ptr(u) as usize
 }
 
-fn is(w: &Weak<RefCell<Unix>>, u: &UnixRef) -> bool {
-    core::ptr::eq(w.as_ptr(), Rc::as_ptr(u))
+fn is(w: &Weak<UnixCell>, u: &UnixRef) -> bool {
+    core::ptr::eq(w.as_ptr(), Arc::as_ptr(u))
 }
 
 fn same(a: &Option<UnixRef>, b: &UnixRef) -> bool {
-    a.as_ref().is_some_and(|x| Rc::ptr_eq(x, b))
+    a.as_ref().is_some_and(|x| Arc::ptr_eq(x, b))
 }
 
 /// 状態が変わった: epoll の数を進め、待っている人 (読む、書く、つなぐ、poll) を起こす
@@ -295,7 +349,7 @@ fn me_real() -> Cred {
 fn new_sock(typ: u8) -> UnixRef {
     let c = proc::current_cred_ref();
     let ino = new_ino();
-    let u = Rc::new(RefCell::new(Unix {
+    let u = Arc::new(UnixCell::new(Unix {
         typ,
         state: State::Close,
         dead: false,
@@ -342,7 +396,7 @@ fn new_sock(typ: u8) -> UnixRef {
         all.retain(|w| w.strong_count() > 0);
         unsafe { ALL_LIVE = all.len() };
     }
-    all.push(Rc::downgrade(&u));
+    all.push(Arc::downgrade(&u));
     u
 }
 
@@ -422,6 +476,12 @@ fn find_other(a: &[u8], typ: u8, net: u64) -> Result<UnixRef, i64> {
     abstract_names().get(&(net, typ, a.to_vec())).and_then(|w| w.upgrade()).ok_or(-ECONNREFUSED)
 }
 
+/// SO_PASSCRED で名前がない (送る前、つなぐ前に autobind する。Linux の unix_may_passcred)
+fn needs_autobind(u: &UnixRef) -> bool {
+    let s = u.borrow();
+    s.passcred && s.addr.is_none()
+}
+
 /// 名前のないもの: 抽象名前空間の "\0%05x" (Linux の unix_autobind。もう名前があれば何もしない)
 fn autobind(u: &UnixRef) -> Result<(), i64> {
     if u.borrow().addr.is_some() {
@@ -443,7 +503,7 @@ fn autobind(u: &UnixRef) -> Result<(), i64> {
         a.extend_from_slice(alloc::format!("{:05x}", n).as_bytes());
         let k = (net, typ, a.clone());
         if !abstract_names().get(&k).is_some_and(|w| w.upgrade().is_some()) {
-            abstract_names().insert(k, Rc::downgrade(u));
+            abstract_names().insert(k, Arc::downgrade(u));
             u.borrow_mut().addr = Some(Rc::new(a));
             return Ok(());
         }
@@ -503,7 +563,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
             crate::sysfile::unbind_sock(&parent, &last);
             return Err(-EINVAL);
         }
-        bsd_names().insert(ino.id(), Rc::downgrade(u));
+        bsd_names().insert(ino.id(), Arc::downgrade(u));
         let mut s = u.borrow_mut();
         s.addr = Some(Rc::new(name));
         s.inode = Some(ino);
@@ -520,7 +580,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
     if abstract_names().get(&k).is_some_and(|w| w.upgrade().is_some()) {
         return Err(-EADDRINUSE);
     }
-    abstract_names().insert(k, Rc::downgrade(u));
+    abstract_names().insert(k, Arc::downgrade(u));
     u.borrow_mut().addr = Some(Rc::new(a.to_vec()));
     Ok(0)
 }
@@ -563,7 +623,7 @@ pub fn connect(f: &FileRef, u: &UnixRef, a: &[u8]) -> R {
         return dgram_connect(u, a);
     }
     validate(a)?;
-    if u.borrow().passcred && u.borrow().addr.is_none() {
+    if needs_autobind(u) {
         autobind(u)?;
     }
     let net = u.borrow().net;
@@ -575,7 +635,11 @@ pub fn connect(f: &FileRef, u: &UnixRef, a: &[u8]) -> R {
                 return Err(-ECONNREFUSED);
             }
         }
-        if other.borrow().embryos.len() > other.borrow().backlog {
+        let full = {
+            let o = other.borrow();
+            o.embryos.len() > o.backlog
+        };
+        if full {
             if nonblock {
                 return Err(-EAGAIN);
             }
@@ -626,13 +690,13 @@ fn dgram_connect(u: &UnixRef, a: &[u8]) -> R {
     }
     let other = if family(a) != AF_UNSPEC {
         validate(a)?;
-        if u.borrow().passcred && u.borrow().addr.is_none() {
+        if needs_autobind(u) {
             autobind(u)?;
         }
         let net = u.borrow().net;
         let other = find_other(a, SOCK_DGRAM, net)?;
         // Linux の unix_may_send: 相手がほかにつないでいれば EPERM
-        if other.borrow().peer.as_ref().is_some_and(|p| !Rc::ptr_eq(p, u)) {
+        if other.borrow().peer.as_ref().is_some_and(|p| !Arc::ptr_eq(p, u)) {
             return Err(-EPERM);
         }
         u.borrow_mut().state = State::Established;
@@ -647,7 +711,7 @@ fn dgram_connect(u: &UnixRef, a: &[u8]) -> R {
         if other.is_none() {
             u.borrow_mut().state = State::Close;
         }
-        if !other.as_ref().is_some_and(|o| Rc::ptr_eq(o, &old)) {
+        if !other.as_ref().is_some_and(|o| Arc::ptr_eq(o, &old)) {
             disconnected(u, &old);
             if old.borrow().peer.is_none() {
                 old.borrow_mut().state = State::Close;
@@ -718,12 +782,12 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
 /// getsockname / getpeername の名前 (struct sockaddr のバイト)。名前のないものは family だけ (長さ 2)。相手の名前は、
 /// 相手が閉じたあとも (Linux の unix_peer_get)
 pub fn name(u: &UnixRef, peer: bool) -> Result<Vec<u8>, i64> {
-    let s = u.borrow();
+    // 相手は自分のこともある (自分につないだ dgram): 自分を放してから相手を借りる
     let addr = if peer {
-        let p = s.peer.as_ref().ok_or(-ENOTCONN)?;
+        let p = u.borrow().peer.clone().ok_or(-ENOTCONN)?;
         p.borrow().addr.clone()
     } else {
-        s.addr.clone()
+        u.borrow().addr.clone()
     };
     Ok(match addr {
         Some(a) => (*a).clone(),
@@ -879,7 +943,9 @@ fn add_creds(cred: Option<Cred>, u: &UnixRef, other: &UnixRef) -> Option<Cred> {
     if cred.is_some() {
         return cred;
     }
-    let need = u.borrow().passcred || {
+    // 相手は自分のこともある (自分に送る dgram): 1 つずつ借りる
+    let mine = u.borrow().passcred;
+    let need = mine || {
         let o = other.borrow();
         o.passcred || !o.has_file
     };
@@ -1017,7 +1083,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
     if let Some(t) = to {
         validate(t)?;
     }
-    if u.borrow().passcred && u.borrow().addr.is_none() {
+    if needs_autobind(u) {
         autobind(u)?;
     }
     if len + 32 > u.borrow().sndbuf {
@@ -1037,7 +1103,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
     let cred = add_creds(cred, u, &other);
     loop {
         // Linux の unix_may_send: 相手がほかにつないでいれば EPERM
-        if other.borrow().peer.as_ref().is_some_and(|p| !Rc::ptr_eq(p, u)) {
+        if other.borrow().peer.as_ref().is_some_and(|p| !Arc::ptr_eq(p, u)) {
             return Err(-EPERM);
         }
         if other.borrow().dead {
@@ -1071,7 +1137,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
             }
         }
         // 相手の行列がいっぱい (相手がこちらにつないでいなければ: Linux の unix_recvq_full)
-        let full = !Rc::ptr_eq(&other, u) && {
+        let full = !Arc::ptr_eq(&other, u) && {
             let o = other.borrow();
             !same(&o.peer, u) && o.q.len() > o.backlog
         };
@@ -1151,7 +1217,7 @@ fn show_cred(c: Option<Cred>) -> Cred {
 /// 送った口の名前 (me は受ける口 u の中身: 自分に送ったものは、借りているそれから)
 fn sender_name(m: &Msg, me: &Unix, u: &UnixRef) -> Option<Vec<u8>> {
     let s = m.sender.as_ref()?;
-    let a = if Rc::ptr_eq(s, u) { me.addr.clone() } else { s.borrow().addr.clone() };
+    let a = if Arc::ptr_eq(s, u) { me.addr.clone() } else { s.borrow().addr.clone() };
     a.map(|a| (*a).clone())
 }
 
@@ -1798,7 +1864,7 @@ pub fn poll_mask(u: &UnixRef) -> u32 {
     if w {
         // dgram: つないだ相手がこちらにつないでいなくて、その行列がいっぱいなら書けない
         if let Some(o) = &s.peer {
-            if !Rc::ptr_eq(o, u) {
+            if !Arc::ptr_eq(o, u) {
                 let ob = o.borrow();
                 if !same(&ob.peer, u) && ob.q.len() > ob.backlog {
                     w = false;
