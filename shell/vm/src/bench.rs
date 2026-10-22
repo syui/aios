@@ -57,7 +57,7 @@ const FS_OPS: &[(&str, &str)] = &[
 /// CPU の数だけ伸びるもの)
 const SMP_OPS: &[(&str, &str)] = &[
     ("getppid", "getppid (aios もロックなしで答える。くらべるための土台)"),
-    ("umask", "umask (aios では大きなロックを通る、いちばん軽いもの)"),
+    ("umask", "umask (自分の fd の表の値を変える。Linux はロックなしで、aios は表をだれとも分けていなければロックなしで)"),
     ("futex-wake", "だれも待っていない futex を起こす"),
     ("stat", "自分のファイルを名前で stat"),
     ("open-close", "自分のファイルを開いて閉じる"),

@@ -906,6 +906,16 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             None => return false,
         },
         CLOSE if crate::file::fast_close_badf(p, a[0]) => -EBADF,
+        // umask は fd の表 (Linux の fs_struct と同じくスレッドで分ける) のもの。だれとも分けていなければ、変えるのも自分だけ
+        UMASK => match p.files.as_ref().filter(|f| f.private()) {
+            Some(f) => {
+                let t = f.get();
+                let old = t.umask;
+                t.umask = a[0] as u32 & 0o777;
+                old as i64
+            }
+            None => return false,
+        },
         // ページキャッシュから読む pread64、ファイル → パイプ・パイプ → /dev/null の splice (眠らないもの)
         PREAD64 => match crate::file::fast_pread(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
             Some(r) => r,
