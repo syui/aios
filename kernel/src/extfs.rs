@@ -3004,8 +3004,14 @@ impl Inode for ExtInode {
                 _ => return Err(-EINVAL),
             }
             size0 = r.size() as usize;
+            let before = r.clone();
             let res = self.fs.write_data(self.ino, &mut r, off, buf, in_place.then_some(&mut pages));
-            self.fs.write_inode(self.ino, &r)?;
+            // inode が 1 バイトも変わらなければ (同じ秒の中で、大きさもブロックの場所も変わらない書きかえ) 書かない:
+            // 書くと inode のブロックをジャーナルに入れ、meta の覚え (と stat の覚え、statc.rs) を捨てて読みなおすことになる。
+            // Linux も時刻が変わったときだけ inode を書く (file_update_time、inode_needs_update_time)
+            if r.0 != before.0 {
+                self.fs.write_inode(self.ino, &r)?;
+            }
             res
         }));
         if in_place {

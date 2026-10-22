@@ -705,10 +705,14 @@ pub fn pwrite(fd: u64, buf: usize, len: usize, off: i64) -> R {
 /// pwrite の中身 (RWF_DSYNC / SYNC: 書けたらディスクに書く)
 fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
     let f = positional(fd, off, true)?;
-    let ino = inode_path(&f);
+    // 開いたときのパス (inotify のため) は写さない: 書けたあとに借りる
+    let ino = match &f.borrow().kind {
+        Kind::Inode(i, _) => Some(i.clone()),
+        _ => None,
+    };
     // aios がえらんだちがい (pwrite-append): O_APPEND で開いたものにも off に書く (POSIX)。Linux は O_APPEND なら
     // off を見ずに終わりに書く (pwrite(2) の BUGS が POSIX とちがうと書いている)。doc/aios.md の「aios がえらんだちがい」
-    if let Some((i, _)) = &ino
+    if let Some(i) = &ino
         && len > 0
     {
         vfs::drop_privs(i)?;
@@ -718,7 +722,7 @@ fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
         let mut tmp = uninit((len - done).min(CHUNK))?;
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = match &ino {
-            Some((i, _)) => {
+            Some(i) => {
                 let pos = off as usize + done;
                 vfs::write_sealed(i, pos, tmp.len()).and_then(|_| i.write_at(pos, &tmp))
             }
@@ -734,8 +738,9 @@ fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
             break;
         }
     }
-    if let Some((i, path)) = &ino
+    if let Some(i) = &ino
         && done > 0
+        && let Kind::Inode(_, path) = &f.borrow().kind
     {
         inotify::file_event(path, i, inotify::IN_MODIFY);
     }

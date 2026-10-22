@@ -380,6 +380,23 @@ pub fn file_writing(_id: (usize, u64)) {
 /// すぐ読むとき、ファイルシステムを引きなおさない)。表がいっぱいか、RWF_DONTCACHE なら入れない
 pub fn file_written(id: (usize, u64), ver: (u64, u64), first: usize, last: usize, pages: Vec<(usize, *mut u8)>) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
+    // その場で書きかえただけ (書いたページはどれも、もう表にあるファイルシステムのページそのもので、版も同じ。
+    // 上書きをくりかえすデータベースやログ): 命令キャッシュの印を落とし、書くために足した参照を返すだけ
+    if !pages.is_empty() && !crate::proc::dontcache_on() {
+        let mut c = PRIV.lock();
+        if c.vers.get(&id) == Some(&ver) && pages.iter().all(|(i, p)| c.pages.get(&(id.0, id.1, *i)).is_some_and(|e| e.owned && e.page == *p)) {
+            if first <= last {
+                for (_, p) in c.pages.range_mut((id.0, id.1, first)..=(id.0, id.1, last)) {
+                    p.synced = false;
+                }
+            }
+            drop(c);
+            for (_, p) in pages {
+                kalloc::put(p);
+            }
+            return;
+        }
+    }
     let room = !pages.is_empty() && !crate::proc::dontcache_on() && make_room();
     let max = priv_max();
     let mut freed = Vec::new();
