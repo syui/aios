@@ -1183,7 +1183,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         if addr & 0xfff != 0 {
             return Err(crate::why::inval());
         }
-        if flags & MAP_FIXED_NOREPLACE != 0 && (addr..addr + len).step_by(4096).any(|a| m.pt.find(a).is_some()) {
+        if flags & MAP_FIXED_NOREPLACE != 0 && m.pt.overlaps(addr, addr.saturating_add(len)) {
             return Err(-EEXIST);
         }
         addr

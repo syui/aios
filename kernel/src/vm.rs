@@ -862,6 +862,27 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
         }
         Err(_) => return None,
     };
+    Some(keep_page(key, ver, page, owned, exec, changes))
+}
+
+/// fault-around のまわりのページ: ページキャッシュか、ファイルシステムのキャッシュにあるものだけ (ディスクは読まない。
+/// 穴と、ページで持たないファイルのものは None)。参照をひとつ足して
+fn file_page_cached(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
+    let ver = file_ver(ino);
+    let key = file_key(ino, foff);
+    if let Some(p) = cached_page(&key, ver, exec) {
+        return Some(p);
+    }
+    let changes = CHANGES.load(Ordering::SeqCst);
+    let page = match crate::proc::noio(|| ino.page_frame(foff, false)) {
+        Ok(Some(p)) => p,
+        _ => return None,
+    };
+    Some(keep_page(key, ver, page, true, exec, changes))
+}
+
+/// ファイルシステムからもらったページ (参照をひとつ持って) を、ページキャッシュの表にも入れて返す
+fn keep_page(key: FileKey, ver: (u64, u64), page: *mut u8, owned: bool, exec: bool, changes: usize) -> *mut u8 {
     // 実行するなら命令キャッシュも (表に入れるものは、その印をつけて一度だけ)
     if exec {
         sync_icache(page as usize, PGSIZE);
@@ -870,7 +891,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     // 読んでいるあいだ (ディスクを待って眠ったとき) にどこかのファイルが変わったら、表には入れずにこのまま使う。
     // RWF_DONTCACHE (proc::dontcache) も、新しく読んだものは入れない
     if CHANGES.load(Ordering::SeqCst) != changes || !room || crate::proc::dontcache_on() {
-        return Some(page);
+        return page;
     }
     kalloc::get(page);
     let mut freed = Vec::new();
@@ -891,7 +912,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     for p in freed {
         kalloc::put(p);
     }
-    Some(page)
+    page
 }
 
 /// 穴 (ブロックのないところ) の写しの 0 のページ: 写しの表が持つ (なければ作る)。参照をひとつ足して。
@@ -1159,8 +1180,22 @@ fn remake_pte(e: u64, prot: u8, shared_vma: bool) -> u64 {
 /// 調べもの用: ページフォルトの種類ごとの (回数, ns。ns は SAMPLE 回に 1 回測った見つもり)。/proc/bkl に出す。
 /// 1 その他 (権限だけ) 2 共有ファイル 3 カーネルのページ 4 スワップ 5 ページキャッシュ 6 無名の新しいページ
 /// 7 ファイルから読む新しいページ 8 コピーオンライトで写す 9 (5 のうち) ページキャッシュになくて読んだもの
-pub static FAULT_KIND: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 10] =
-    [const { (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)) }; 10];
+/// 10 fault-around でいっしょに写したページ (フォルトではない。ns は 0)
+pub static FAULT_KIND: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 11] =
+    [const { (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)) }; 11];
+
+/// Linux の fault_around_bytes (64 KiB) のページの数: ファイルを読むフォルトで、まわりのページもキャッシュにあれば
+/// いっしょに写す (ディスクは読まない)。プログラムの起動は写したファイルをつぎつぎにさわるので、フォルトが 1/16 に
+const FAULT_AROUND: usize = 16;
+
+/// fault-around のまど: page_va をふくむ FAULT_AROUND ページの境目のまど (同じ PTE の表の中) を、領域 [start, end) と、
+/// ファイルのページがまるごと写せるところ (fend の前) に切ったもの
+fn around(start: usize, end: usize, fend: usize, page_va: usize) -> (usize, usize) {
+    let w = FAULT_AROUND * PGSIZE;
+    let lo = (page_va & !(w - 1)).max(start);
+    let hi = ((page_va & !(w - 1)) + w).min(end).min(pg_down(fend));
+    (lo, hi)
+}
 
 // TLB はすべての CPU に (inner shareable) 消す: 同じアドレス空間のスレッドがほかの CPU で動いているかも
 fn flush_va(va: usize) {
@@ -1195,12 +1230,12 @@ fn flush_pages(vas: &[usize]) {
 // なので、あるページ表の古い中身が TLB に残っているのは、いまそれを載せている CPU だけ。ほかの CPU が載せて
 // いなければ、すべての CPU に消させる (…is: QEMU の TCG では全部の CPU を止めて合わせるので重い。Firefox の
 // munmap の半分がこれだった) かわりに、この CPU の分だけ消せばよい。載せる・外すは大きなロックの中なので、
-// 大きなロックを持って PTE を変えるところ (local_ok) からはずれない (ロックなしの fast_fault はいままでどおり)
+// 大きなロックを持って PTE を変えるところ (local_ok) からはずれない (ロックなしの fast_fault は flush_va_unlocked)
 
 /// CPU ごとの、いま TTBR0 に載せているページ表 (物理アドレス。0 は何も)
 static ACTIVE_ROOT: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
-/// root を載せているのがこの CPU だけ (かどこにもない) か。大きなロックを持って呼ぶこと
+/// root を載せているのがこの CPU だけ (かどこにもない) か。大きなロックを持って呼ぶこと (持たないなら flush_va_unlocked)
 fn local_ok(root: usize) -> bool {
     let me = crate::smp::id();
     (0..crate::smp::online()).all(|c| c == me || ACTIVE_ROOT[c].load(Ordering::Relaxed) != root)
@@ -1212,6 +1247,25 @@ fn flush_va_in(root: usize, va: usize) {
     } else {
         flush_va(va);
     }
+}
+
+/// old (変える前の PTE) が TLB に入っているかもしれないときだけ消す。無効な PTE と、アクセスフラグの落ちた PTE は
+/// TLB に入らない (arm64 のきまり。Linux も新しいページで TLB を消さない): 書いたものを表を読む側に見せるだけ。
+/// TCG では …is がすべての CPU を止めるので、スレッドのあるプロセス (Firefox) でページごとに消すと重い
+fn flush_changed(root: usize, va: usize, old: u64) {
+    if old & PTE_VALID == 0 || old & PTE_AF == 0 {
+        unsafe { core::arch::asm!("dsb ishst", "isb") };
+    } else {
+        flush_va_in(root, va);
+    }
+}
+
+/// 大きなロックなしで PTE を変えたあと (fast_fault): local_ok を、PTE を書いてから見る。載せる CPU (activate) は
+/// ACTIVE_ROOT を書いてから TLB を消し (dsb) て表を読むので、ここで載せていないと見えた CPU は新しい PTE を読む。
+/// 外す CPU (deactivate) は、ACTIVE_ROOT を 0 にしてから TLB を消すまで、ユーザーのアドレスに触らない
+fn flush_va_unlocked(root: usize, va: usize) {
+    fence(Ordering::SeqCst);
+    flush_va_in(root, va);
 }
 
 fn flush_pages_in(root: usize, vas: &[usize]) {
@@ -1316,13 +1370,21 @@ impl PageTable {
 
     /// [start, end) の L3 の PTE の場所をみな (空のものも)。L3 のテーブル (2 MiB ぶん、512 個) は 1 度だけたどって、
     /// その中は並びのまま見る (ページごとに上から 4 段たどると、Firefox の大きな munmap が 1 回 0.5 ms かかった)。
-    /// テーブルのないところは飛ばす
+    /// テーブルのないところは飛ばす: L2 のテーブルがなければ 1 GiB を、L3 のがなければ 2 MiB をまとめて (JS や wasm の
+    /// 何 GiB もの予約を外すとき、2 MiB ずつたどらない)
     fn each_slot(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
         let mut va = pg_down(start);
-        while va < end {
+        while va < end && va < MAXVA {
+            let l1 = unsafe { *self.root.add(index(va, 1)) };
+            if l1 & PTE_VALID == 0 {
+                va = (va & !0x3fff_ffff) + 0x4000_0000;
+                continue;
+            }
             let chunk = va & !0x1f_ffff;
             let next = chunk + 0x20_0000;
-            if let Some(first) = self.walk(chunk, false) {
+            let l2 = unsafe { *table_at(l1).add(index(va, 2)) };
+            if l2 & PTE_VALID != 0 {
+                let first = table_at(l2);
                 let stop = end.min(next);
                 let mut i = (va - chunk) / PGSIZE;
                 while chunk + i * PGSIZE < stop {
@@ -1512,6 +1574,7 @@ impl PageTable {
 
     /// [start, end) の領域とページを外す
     pub fn unmap(&mut self, start: usize, end: usize) {
+        let _p = crate::prof::span("vm:unmap");
         let (s, e) = (pg_down(start), pg_up(end));
         if s < e {
             self.note(b'u', s, e, 0);
@@ -1781,8 +1844,24 @@ impl PageTable {
         Some(())
     }
 
-    /// 次に mmap に渡せる、hint 以上で len のすき間
+    /// 次に mmap に渡せる、hint 以上で len のすき間。上の端 (MAXVA) までになければ、MMAP_BASE からさがしなおす
+    /// (mmap と munmap をくりかえすプログラムが、外したところを使えないまま上の端に着いて ENOMEM にならないように。
+    /// Linux はいつも空いているところからさがす)。どこにもなければ MAXVA より先 (map が断る)
     pub fn free_area(&self, hint: usize, len: usize) -> usize {
+        let va = self.gap_from(hint, len);
+        if va.checked_add(len).is_some_and(|e| e <= MAXVA) || hint <= crate::proc::MMAP_BASE {
+            return va;
+        }
+        self.gap_from(crate::proc::MMAP_BASE, len)
+    }
+
+    /// [start, end) に領域がかかっているか
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start)
+    }
+
+    /// hint 以上で len の、はじめのすき間
+    fn gap_from(&self, hint: usize, len: usize) -> usize {
         let mut va = hint;
         // hint より前の領域は、hint にかかりうる最後の 1 つ (領域は重ならない) から見ればよい
         let from = self.vmas.range(..=hint).next_back().map_or(hint, |(&s, _)| s);
@@ -1817,11 +1896,88 @@ impl PageTable {
         self.fault_page(va, write, false)
     }
 
+    /// ファイルを読むフォルトで page_va を写したあと: まど (around) の、まだ何もない PTE に、キャッシュにあるページを
+    /// 書きこみ禁止で (Linux の do_fault_around。ファイルの終わりより先は写さない)。大きなロックを持って (mutating の中)
+    fn map_around(&mut self, start: usize, back: &Backing, prot: u8, page_va: usize, pte: *mut u64) {
+        let _p = crate::prof::span("vm:around");
+        let Backing::File { ino, off, fend, .. } = back else { return };
+        let end = self.find(page_va).map_or(page_va + PGSIZE, |(_, v)| v.end);
+        let (lo, hi) = around(start, end, *fend, page_va);
+        let size = pg_up(ino.meta().size as usize);
+        let mut n = 0;
+        for va in (lo..hi).step_by(PGSIZE) {
+            let foff = off + (va - start);
+            if foff >= size {
+                break;
+            }
+            // 同じ PTE の表の中 (まどは表をまたがない)
+            let p = unsafe { pte.offset((va as isize - page_va as isize) / PGSIZE as isize) };
+            if va == page_va || unsafe { *p } != 0 {
+                continue;
+            }
+            let Some(page) = file_page_cached(ino, foff, prot & PROT_EXEC != 0) else { continue };
+            unsafe { *p = make_pte(v2p(page as usize) as u64, ro(prot), false) };
+            n += 1;
+        }
+        if n > 0 {
+            FAULT_KIND[10].0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// MAP_SHARED のファイルを読むフォルトの fault-around (map_around と同じまど): 写しの表にあるか、ファイルシステムの
+    /// キャッシュにあるページだけを、写しの表に入れて (書いたものは書けるように、まだなら書きこみ禁止で)
+    fn map_around_shared(&mut self, start: usize, back: &Backing, prot: u8, page_va: usize, pte: *mut u64) {
+        let _p = crate::prof::span("vm:around");
+        let Backing::File { ino, off, fend, .. } = back else { return };
+        let end = self.find(page_va).map_or(page_va + PGSIZE, |(_, v)| v.end);
+        let (lo, hi) = around(start, end, *fend, page_va);
+        let size = pg_up(ino.meta().size as usize);
+        let exec = prot & PROT_EXEC != 0;
+        let mut n = 0;
+        for va in (lo..hi).step_by(PGSIZE) {
+            let foff = off + (va - start);
+            if foff >= size || foff % PGSIZE != 0 {
+                break;
+            }
+            let p = unsafe { pte.offset((va as isize - page_va as isize) / PGSIZE as isize) };
+            if va == page_va || unsafe { *p } != 0 {
+                continue;
+            }
+            let key = file_key(ino, foff);
+            let page = match shared_file().get(&key) {
+                Some(c) => {
+                    if exec {
+                        sync_icache(c.page as usize, PGSIZE);
+                    }
+                    kalloc::get(c.page);
+                    c.page
+                }
+                None => {
+                    // ファイルのページそのもの (キャッシュにあるときだけ。穴やページで持たないものは、フォルトで)
+                    let Ok(Some(page)) = crate::proc::noio(|| ino.page_frame(foff, false)) else { continue };
+                    if exec {
+                        sync_icache(page as usize, PGSIZE);
+                    }
+                    kalloc::get(page);
+                    shared_file().insert(key, Cached { page, dirty: false, hole: false, own: false, ino: ino.clone() });
+                    page
+                }
+            };
+            let dirty = shared_file().get(&key).is_some_and(|c| c.dirty);
+            unsafe { *p = make_pte(v2p(page as usize) as u64, if dirty { prot } else { ro(prot) }, false) };
+            n += 1;
+        }
+        if n > 0 {
+            FAULT_KIND[10].0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     /// va のページを用意する。write なら自分だけのものにして書けるように。
     /// force はカーネルが書く (exec で読み取り専用の領域に読み込む): 権限は変えずに自分だけのものに
     fn fault_page(&mut self, va: usize, write: bool, force: bool) -> Result<(), FaultErr> {
         // 時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックの統計と同じ。TCG では時計を読むのが重く、
         // いくつもの CPU が同時に読むと 1 つずつになる: timer の粗い時計)
+        let _p = crate::prof::span("vm:fault");
         let timed = crate::smp::draw_here();
         let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
         let mut kind = 0usize;
@@ -1883,7 +2039,10 @@ impl PageTable {
             }
             let p = if c.dirty { prot } else { ro(prot) };
             unsafe { *pte = make_pte(v2p(page as usize) as u64, p, false) };
-            flush_va_in(self.root_pa(), page_va);
+            flush_changed(self.root_pa(), page_va, e);
+            if !wr && !has_page(e) {
+                self.map_around_shared(start, &back, prot, page_va, pte);
+            }
             return Ok(());
         }
         if let (false, Backing::File { ino, off, fend, .. }) = (shared, &back)
@@ -1902,7 +2061,7 @@ impl PageTable {
             let page = *pages.get((off + (page_va - start)) / PGSIZE).ok_or(FaultErr::Bus)?;
             kalloc::get(page);
             unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
-            flush_va_in(self.root_pa(), page_va);
+            flush_changed(self.root_pa(), page_va, e);
             return Ok(());
         }
         if is_swap(e) {
@@ -1922,9 +2081,10 @@ impl PageTable {
             && fend.saturating_sub(page_va) >= PGSIZE
             && let Some(page) = file_page(ino, off + (page_va - start), prot & PROT_EXEC != 0)
         {
-            // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)
+            // 読むだけ: ページキャッシュの 1 枚を書きこみ禁止で (書いたらコピーオンライト)。まわりもキャッシュにあれば
             *kind = 5;
             unsafe { *pte = make_pte(v2p(page as usize) as u64, ro(prot), false) };
+            self.map_around(start, &back, prot, page_va, pte);
         } else if !has_page(e) {
             *kind = 6;
             let page = self.alloc_page().ok_or(FaultErr::NoMem)?;
@@ -1954,16 +2114,17 @@ impl PageTable {
                     sync_icache(page as usize, PGSIZE);
                 }
                 unsafe { *pte = make_pte(v2p(page as usize) as u64, prot, false) };
-                flush_va_in(self.root_pa(), page_va);
+                flush_changed(self.root_pa(), page_va, e);
                 self.quiesce();
                 kalloc::put(old);
+                return Ok(());
             } else {
                 unsafe { *pte = make_pte(e & PTE_ADDR, prot, false) };
             }
         } else {
             unsafe { *pte = remake_pte(e, prot, shared) };
         }
-        flush_va_in(self.root_pa(), page_va);
+        flush_changed(self.root_pa(), page_va, e);
         Ok(())
     }
 
@@ -2151,6 +2312,7 @@ impl PageTable {
         if is_swap(e) {
             return (false, None);
         }
+        let mut around_file = false;
         let (new, fresh, put) = if let (false, Backing::File { ino, off, fend, ver }) = (has_page(e), &v.back) {
             // 読むだけで、ページキャッシュに同じ版があるとき (ないか書くなら大きなロックを持って読みこむ)
             let foff = off + (page_va - start);
@@ -2171,6 +2333,7 @@ impl PageTable {
                 }
                 (make_pte(v2p(mine as usize) as u64, prot, false), Some(mine), None)
             } else {
+                around_file = true;
                 (make_pte(v2p(page as usize) as u64, ro(prot), false), Some(page), None)
             }
         } else if !has_page(e) {
@@ -2179,7 +2342,7 @@ impl PageTable {
         } else if write {
             if e & PTE_RDONLY == 0 && e & PTE_AF != 0 {
                 // もう書ける (ほかの CPU が先に片づけた)。TLB が古いだけ
-                flush_va(page_va);
+                flush_va_unlocked(self.root_pa(), page_va);
                 return (true, None);
             }
             let old = page_of(e);
@@ -2203,8 +2366,67 @@ impl PageTable {
             }
             return (false, None);
         }
-        flush_va(page_va);
+        // TLB に入っているかもしれない PTE を変えたときだけ消す (flush_changed。いつも …is で消していたころは、
+        // ファイルを写したところのフォルトが 1 ページ 40 µs だった)
+        if around_file {
+            self.map_around_fast(start, v, page_va, pte);
+        }
+        if e & PTE_VALID == 0 || e & PTE_AF == 0 {
+            unsafe { core::arch::asm!("dsb ishst", "isb") };
+        } else {
+            flush_va_unlocked(self.root_pa(), page_va);
+        }
         (true, put)
+    }
+
+    /// fast_fault の fault-around (map_around と同じまど): まだ何もない PTE に、ページキャッシュに同じ版があるページを
+    /// compare-exchange で (負けたら参照を返して次へ)。表のロックは 1 回で、まどのページを木の 1 回の range で引く
+    /// (ページごとに引くと、いくつものプロセスが同時に起動するとき表のロックで並ぶ)
+    fn map_around_fast(&self, start: usize, v: &Vma, page_va: usize, pte: *mut u64) {
+        use core::sync::atomic::AtomicU64;
+        let Backing::File { ino, off, fend, ver } = &v.back else { return };
+        if off % PGSIZE != 0 {
+            return;
+        }
+        let (lo, hi) = around(start, v.end, *fend, page_va);
+        // ファイルのページの番号で [first, last)。ファイルの終わりより先は写さない
+        let first = (off + (lo - start)) / PGSIZE;
+        let last = ((off + (hi - start)) / PGSIZE).min(pg_up(ver.1 as usize) / PGSIZE);
+        if first >= last {
+            return;
+        }
+        let exec = v.prot & PROT_EXEC != 0;
+        let (fs, id) = ino.id();
+        let mut n = 0;
+        let mut c = PRIV.lock();
+        if c.vers.get(&(fs, id)) != Some(ver) {
+            return;
+        }
+        for (k, p) in c.pages.range_mut((fs, id, first)..(fs, id, last)) {
+            let va = start + k.2 * PGSIZE - off;
+            if va == page_va {
+                continue;
+            }
+            // 同じ PTE の表の中 (まどは表をまたがない)
+            let slot = unsafe { AtomicU64::from_ptr(pte.offset((va as isize - page_va as isize) / PGSIZE as isize)) };
+            if slot.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            if exec && !p.synced {
+                sync_icache(p.page as usize, PGSIZE);
+                p.synced = true;
+            }
+            kalloc::get(p.page);
+            if slot.compare_exchange(0, make_pte(v2p(p.page as usize) as u64, ro(v.prot), false), Ordering::AcqRel, Ordering::Acquire).is_err() {
+                kalloc::put(p.page);
+                continue;
+            }
+            n += 1;
+        }
+        drop(c);
+        if n > 0 {
+            FAULT_KIND[10].0.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// 大きなロックなしで、もう写っているページからだけ読む (futex の速い道)。写っていなければ false

@@ -1223,6 +1223,32 @@ impl ExtFs {
         Ok(())
     }
 
+    /// 写したところのフォルトで、ファイルのブロック lb がキャッシュになかった: まわりの READ_AHEAD ブロック (128 KiB。
+    /// lb がまん中) のうちキャッシュにないものを、ディスクの上でつながっているぶんずつ 1 回で読む (Linux の mmap の
+    /// read-around。プログラムの起動はファイルのあちこちを写してさわるので、1 ページずつ読むと、おそいディスクでは
+    /// そのたびに探しにいく)。読めなくてもよい (あとで 1 つずつ)
+    fn read_around(&self, ino: u32, r: &mut Raw, lb: u64) {
+        let _p = crate::prof::span("extfs:read_around");
+        let last = (r.size() as usize).div_ceil(self.bsize) as u64;
+        let mut fb = lb.saturating_sub(READ_AHEAD as u64 / 2);
+        let end = (fb + READ_AHEAD as u64).min(last);
+        while fb < end {
+            let Ok(b) = self.map(ino, r, fb, false) else { return };
+            if b == 0 || self.cached(b) {
+                fb += 1;
+                continue;
+            }
+            let mut k = 1;
+            while fb + k < end && self.map(ino, r, fb + k, false) == Ok(b + k) && !self.cached(b + k) {
+                k += 1;
+            }
+            if self.read_ahead(b, k as usize).is_err() {
+                return;
+            }
+            fb += k;
+        }
+    }
+
     fn cached(&self, b: u64) -> bool {
         if shared_here() {
             return self.shared_lookup(b).is_some();
@@ -3717,6 +3743,7 @@ impl Inode for ExtInode {
     /// 穴 (と未初期化のブロック) は None。alloc なら、ブロックをとって (写しの穴のページを引きとって: adopt_hole)
     /// 書き出す印をつけ、更新時刻をいまに (写しに書くとき: Linux の page_mkwrite)。終わりの先 (同じページの中) は 0 に
     fn page_frame(&self, foff: usize, alloc: bool) -> Result<Option<*mut u8>, i64> {
+        let _p = crate::prof::span("extfs:page_frame");
         let _e = fs_lock();
         if self.fs.bsize != PGSIZE || foff % PGSIZE != 0 {
             return Err(-ENODEV);
@@ -3730,6 +3757,9 @@ impl Inode for ExtInode {
             let b = self.fs.map(self.ino, &mut r, lb, false)?;
             if b == 0 {
                 return Ok(None);
+            }
+            if !crate::proc::noio_on() && !self.fs.cached(b) {
+                self.fs.read_around(self.ino, &mut r, lb);
             }
             let p = self.fs.frame(b)?;
             let size = r.size() as usize;

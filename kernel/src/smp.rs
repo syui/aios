@@ -478,7 +478,7 @@ pub fn stats_json() -> alloc::string::String {
     rows.sort_by_key(|r| core::cmp::Reverse(r.2));
     let top: Vec<String> = rows.iter().take(25).map(|(name, n, t)| format!("{{\"name\":\"{}\",\"n\":{},\"ms\":{:.1},\"avg_us\":{:.1}}}", name, n, ms(*t), *t as f64 / 1e3 / *n as f64)).collect();
     let dev: Vec<String> = ["disk", "gpu", "sched", "wake_to_run"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
-    let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss"];
+    let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss", "around"];
     let faults: Vec<String> = crate::vm::FAULT_KIND.iter().enumerate().skip(1).map(|(i, (n, t))| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", kinds[i], n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed)))).collect();
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
