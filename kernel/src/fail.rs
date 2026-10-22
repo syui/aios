@@ -118,7 +118,6 @@ pub fn page() -> bool {
 
 /// /proc/ai/ctl の fail ...
 pub fn ctl(arg: &str) -> Result<(), i64> {
-    const EINVAL: i64 = 22;
     if arg == "off" {
         *RULE.lock() = None;
         ON.store(false, Relaxed);
@@ -126,33 +125,33 @@ pub fn ctl(arg: &str) -> Result<(), i64> {
     }
     let mut w = arg.split_whitespace();
     let (pid, name) = match (w.next(), w.next()) {
-        (Some("pid"), Some(n)) => (Some(n.parse::<u32>().map_err(|_| -EINVAL)?), [0u8; 16]),
+        (Some("pid"), Some(n)) => (Some(n.parse::<u32>().map_err(|_| crate::why::inval())?), [0u8; 16]),
         (Some("name"), Some(n)) if !n.is_empty() => {
             let mut c = [0u8; 16];
             let k = n.len().min(15);
             c[..k].copy_from_slice(&n.as_bytes()[..k]);
             (None, c)
         }
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     let what = match w.next() {
         Some("sys") => What::Sys,
         Some("heap") => What::Heap,
         Some("oom") => What::Oom,
         Some("page") => What::Page,
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     let (mut nr, mut errno) = (u64::MAX, 0);
     if what == What::Sys {
-        let which = w.next().ok_or(-EINVAL)?;
-        nr = if which == "all" { u64::MAX } else { which.parse::<u64>().or_else(|_| crate::syscall::number(which).ok_or(-EINVAL))? };
-        errno = w.next().ok_or(-EINVAL)?.parse::<i64>().map_err(|_| -EINVAL)?;
+        let which = w.next().ok_or_else(|| crate::why::inval())?;
+        nr = if which == "all" { u64::MAX } else { which.parse::<u64>().or_else(|_| crate::syscall::number(which).ok_or_else(|| crate::why::inval()))? };
+        errno = w.next().ok_or_else(|| crate::why::inval())?.parse::<i64>().map_err(|_| crate::why::inval())?;
         if !(1..=4095).contains(&errno) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
     }
     let times = match w.next() {
-        Some(t) => t.parse::<u32>().map_err(|_| -EINVAL)?,
+        Some(t) => t.parse::<u32>().map_err(|_| crate::why::inval())?,
         None => 1,
     };
     *RULE.lock() = Some(Rule { what, pid, name, nr, errno, left: times, hits: 0 });

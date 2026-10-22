@@ -13,7 +13,6 @@ use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
 const EBADF: i64 = 9;
 const EEXIST: i64 = 17;
@@ -86,7 +85,7 @@ pub fn chan(n: &InotifyRef) -> usize {
 /// inotify_init1(flags)
 pub fn init1(flags: u64) -> Result<i64, i64> {
     if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let n = Rc::new(RefCell::new(Inotify { watches: Vec::new(), queue: VecDeque::new(), next_wd: 1, generation: 0 }));
     let l = list();
@@ -102,7 +101,7 @@ fn of_fd(fd: u64) -> Result<InotifyRef, i64> {
     let f = f.borrow();
     match &f.kind {
         Kind::Inotify(n) => Ok(n.clone()),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
@@ -110,7 +109,7 @@ fn of_fd(fd: u64) -> Result<InotifyRef, i64> {
 pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     let n = of_fd(fd)?;
     if mask & IN_ALL_EVENTS == 0 || (mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let cwd = proc::current().files().cwd.clone();
     let (_, ino) = vfs::lookup(&cwd, path, mask & IN_DONT_FOLLOW == 0)?;
@@ -146,7 +145,7 @@ pub fn rm_watch(fd: u64, wd: i32) -> Result<i64, i64> {
     let n = of_fd(fd)?;
     let found = {
         let mut b = n.borrow_mut();
-        let i = b.watches.iter().position(|w| w.wd == wd).ok_or(-EINVAL)?;
+        let i = b.watches.iter().position(|w| w.wd == wd).ok_or_else(|| crate::why::inval())?;
         b.watches.remove(i);
         true
     };
@@ -290,7 +289,7 @@ pub fn read(n: &InotifyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64
             let mut b = n.borrow_mut();
             if let Some(first) = b.queue.front() {
                 if dst.len() < first.len() {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 let mut off = 0;
                 while let Some(ev) = b.queue.front() {

@@ -33,7 +33,6 @@ const D_OUTPUT: u8 = 0;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const ENODEV: i64 = 19;
-const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -492,7 +491,7 @@ fn refine(s: &Snd, h: &mut Hw) -> Result<(), i64> {
         }
     }
     if h.empty() {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let rmask = h.u32_at(512);
     h.put_u32(516, rmask); // cmask: 見たもの
@@ -645,7 +644,7 @@ fn start(s: &mut Snd) -> Result<(), i64> {
     p.trigger_ns = crate::timer::uptime_ns();
     s.send();
     if s.simple(R_PCM_START) != S_OK {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok(())
 }
@@ -785,7 +784,7 @@ pub fn pcm_ioctl(req: u64, arg: usize, nonblock: bool) -> Result<i64, i64> {
             let p = s.pcm.as_ref().ok_or(-EBADFD)?;
             let c = u32::from_le_bytes(b[0..4].try_into().unwrap());
             if c >= p.channels {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let bits = (p.frame_bytes * 8) as u32;
             b[8..16].fill(0);
@@ -904,14 +903,14 @@ pub fn pcm_ioctl(req: u64, arg: usize, nonblock: bool) -> Result<i64, i64> {
 fn hw_params(s: &mut Snd, h: &Hw) -> Result<(), i64> {
     release(s);
     let fm = h.mask(P_FORMAT);
-    let &(_, vformat, bits) = FORMATS.iter().find(|f| fm & 1 << f.0 != 0).ok_or(-EINVAL)?;
+    let &(_, vformat, bits) = FORMATS.iter().find(|f| fm & 1 << f.0 != 0).ok_or_else(|| crate::why::inval())?;
     let channels = h.iv(P_CHANNELS).lo() as u32;
     let rate = h.iv(P_RATE).lo() as u32;
     let period = h.iv(P_PERIOD_SIZE).lo();
     let buffer = h.iv(P_BUFFER_SIZE).lo();
     let frame_bytes = (bits / 8 * channels) as usize;
     if channels == 0 || period == 0 || buffer < period || frame_bytes == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let bytes = buffer as usize * frame_bytes;
     let mut pages = Vec::new();
@@ -925,7 +924,7 @@ fn hw_params(s: &mut Snd, h: &Hw) -> Result<(), i64> {
         pages.push(pg);
     }
     // デバイスへ: SET_PARAMS { hdr, stream_id, buffer_bytes, period_bytes, features, channels, format, rate, pad }
-    let rix = RATES.iter().position(|&r| r == rate).ok_or(-EINVAL)? as u8;
+    let rix = RATES.iter().position(|&r| r == rate).ok_or_else(|| crate::why::inval())? as u8;
     let mut q = Vec::new();
     for v in [R_PCM_SET_PARAMS, s.stream, bytes as u32, (CHUNK as u32).min(bytes as u32), 0] {
         q.extend_from_slice(&v.to_le_bytes());
@@ -935,7 +934,7 @@ fn hw_params(s: &mut Snd, h: &Hw) -> Result<(), i64> {
         for p in pages {
             kalloc::put(p);
         }
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let slots = (s.tx.size / 3) as u16;
     // boundary: バッファの大きさの 2 の累乗倍で、long に収まる大きなもの (alsa-lib と同じ考え)
@@ -981,7 +980,7 @@ fn prepare(s: &mut Snd) -> Result<i64, i64> {
     let slots = (s.tx.size / 3) as u16;
     p.free_slots = (0..slots).rev().collect();
     if s.simple(R_PCM_PREPARE) != S_OK {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     s.pcm.as_mut().unwrap().state = ST_PREPARED;
     proc::wakeup(chan());

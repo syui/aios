@@ -123,7 +123,7 @@ fn count(k: Key, up: bool) {
 /// ページがなければ EFAULT (PRIVATE はメモリを見ない)
 fn key_of(uaddr: usize, private: bool) -> Result<Key, i64> {
     if uaddr % 4 != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if uaddr >= crate::vm::MAXVA {
         return Err(-EFAULT);
@@ -271,7 +271,7 @@ fn deadline(cmd: u64, op: u64, ts: usize) -> Result<Option<u64>, i64> {
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let ns = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
     let rel = if cmd == WAIT {
@@ -320,7 +320,7 @@ pub fn futex(uaddr: usize, op: u64, val: u32, timeout: usize, uaddr2: usize, val
 /// FUTEX_WAIT / WAIT_BITSET (Linux の __futex_wait): bitset 0 は EINVAL、値がちがえば EAGAIN
 fn wait(uaddr: usize, private: bool, val: u32, dl: Option<u64>, bitset: u32) -> Result<i64, i64> {
     if bitset == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let k = key_of(uaddr, private)?;
     // 数を増やしてから値を読む: 速い道の起こす側は値を書いてから数を読むので、どちらかが相手に気づく
@@ -350,7 +350,7 @@ fn wait(uaddr: usize, private: bool, val: u32, dl: Option<u64>, bitset: u32) -> 
 /// PI で待つものに当たれば EINVAL (それまでに起こしたものは起きる)
 fn wake(uaddr: usize, private: bool, nr: i32, bitset: u32) -> Result<i64, i64> {
     if bitset == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let k = key_of(uaddr, private)?;
     wake_key(k, nr, Some(bitset))
@@ -361,7 +361,7 @@ fn wake_key(k: Key, nr: i32, bitset: Option<u32>) -> Result<i64, i64> {
     for id in queue_ids(&k) {
         let Some(e) = t().entries.get(&id) else { continue };
         if e.pi {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if bitset.is_some_and(|b| e.bitset & b == 0) {
             continue;
@@ -379,7 +379,7 @@ fn wake_key(k: Key, nr: i32, bitset: Option<u32>) -> Result<i64, i64> {
 /// 行列のうしろへ。答えは起こした数と移した数の合計。CMP は uaddr の値が cmp でなければ EAGAIN
 fn requeue_op(uaddr: usize, private: bool, uaddr2: usize, nr_wake: i32, nr_requeue: i32, cmp: Option<u32>) -> Result<i64, i64> {
     if nr_wake < 0 || nr_requeue < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let k1 = key_of(uaddr, private)?;
     let k2 = key_of(uaddr2, private)?;
@@ -395,7 +395,7 @@ fn requeue_op(uaddr: usize, private: bool, uaddr2: usize, nr_wake: i32, nr_reque
         }
         let Some(e) = t().entries.get(&id) else { continue };
         if e.pi {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         n += 1;
         if n <= nr_wake {
@@ -466,7 +466,7 @@ fn lock_pi(uaddr: usize, private: bool, dl: Option<u64>, trylock: bool) -> Resul
             let pid = uval & TID_MASK;
             let owner = t().pi.get(&k).copied().unwrap_or(0);
             if pid != 0 && pid != vtid(owner) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
         } else if uval & TID_MASK == 0 {
             if cmpxchg(uaddr, uval, (uval & OWNER_DIED) | me)? != uval {
@@ -523,7 +523,7 @@ fn unlock_pi(uaddr: usize, private: bool) -> Result<i64, i64> {
     let first = queue_ids(&k).into_iter().find(|id| t().entries.get(id).is_some_and(|e| e.pi));
     if let Some(id) = first {
         if t().pi.get(&k) != Some(&me_g) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let new = t().entries.get(&id).map_or(0, |e| e.tid);
         let cur = cmpxchg(uaddr, uval, WAITERS | vtid(new))?;
@@ -549,14 +549,14 @@ fn unlock_pi(uaddr: usize, private: bool) -> Result<i64, i64> {
 /// なら大きいもの)。どれかの値がちがえば EAGAIN。flags は 0、clockid は REALTIME か MONOTONIC (時間があるとき)
 pub fn waitv(uwaiters: usize, nr: u32, flags: u32, timeout: usize, clockid: u32) -> Result<i64, i64> {
     if flags != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if nr == 0 || nr > WAITV_MAX || uwaiters == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let dl = if timeout != 0 {
         if clockid > 1 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         deadline(WAIT_BITSET, if clockid == 0 { CLOCK_REALTIME } else { 0 }, timeout)?
     } else {
@@ -571,7 +571,7 @@ pub fn waitv(uwaiters: usize, nr: u32, flags: u32, timeout: usize, clockid: u32)
         let fl = u32::from_le_bytes(b[16..20].try_into().unwrap());
         let reserved = u32::from_le_bytes(b[20..24].try_into().unwrap());
         if fl & !(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE) != 0 || reserved != 0 || fl & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 || val >> 32 != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         ws.push((ua, val as u32, fl & FUTEX2_PRIVATE != 0));
     }

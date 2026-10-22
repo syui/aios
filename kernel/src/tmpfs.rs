@@ -472,7 +472,7 @@ impl Inode for TmpInode {
         match &*self.node.borrow() {
             Node::File(d) => Ok(d.read(off, buf)),
             Node::Dir(_) => Err(-EISDIR),
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         }
     }
 
@@ -480,7 +480,7 @@ impl Inode for TmpInode {
     /// ページをとる (穴は 0 のページに。とれなければ ENOSPC: SIGBUS)
     fn page_frame(&self, foff: usize, _alloc: bool) -> Result<Option<*mut u8>, i64> {
         if foff % PGSIZE != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         match &mut *self.node.borrow_mut() {
             Node::File(d) => {
@@ -515,7 +515,7 @@ impl Inode for TmpInode {
         match &mut *self.node.borrow_mut() {
             Node::File(d) => d.owned()?.write(off, buf)?,
             Node::Dir(_) => return Err(-EISDIR),
-            _ => return Err(-EINVAL),
+            _ => return Err(crate::why::inval()),
         }
         self.touch();
         Ok(buf.len())
@@ -541,7 +541,7 @@ impl Inode for TmpInode {
                 same
             }
             Node::Dir(_) => return Err(-EISDIR),
-            _ => return Err(-EINVAL),
+            _ => return Err(crate::why::inval()),
         };
         // 大きさが変わらなければ時刻も変えない (Linux の shmem_setattr。truncate(2) はそれだけ。ftruncate(2) は
         // ATTR_MTIME | ATTR_CTIME も渡すので、sysfile::ftruncate が変える)
@@ -564,7 +564,7 @@ impl Inode for TmpInode {
             return Err(-EOPNOTSUPP);
         }
         let seals = self.seals.get().unwrap_or(0);
-        let end = off.checked_add(len).ok_or(-EINVAL)? as usize;
+        let end = off.checked_add(len).ok_or_else(|| crate::why::inval())? as usize;
         crate::vm::file_changed(self.id());
         // 穴をあける (0 にする) ところのまるごとのページは、写しているところから外す (Linux の unmap_mapping_range)
         let drop_pages = |from: usize, to: usize| {
@@ -609,9 +609,9 @@ impl Inode for TmpInode {
     }
 
     fn add_seals(&self, s: u32) -> Result<(), i64> {
-        let cur = self.seals.get().ok_or(-EINVAL)?;
+        let cur = self.seals.get().ok_or_else(|| crate::why::inval())?;
         if s & !(F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE | F_SEAL_EXEC) != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if cur & F_SEAL_SEAL != 0 {
             return Err(-EPERM);
@@ -624,7 +624,7 @@ impl Inode for TmpInode {
     fn readlink(&self) -> Result<String, i64> {
         match &*self.node.borrow() {
             Node::Symlink(t) => Ok(t.clone()),
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         }
     }
 
@@ -745,7 +745,7 @@ impl Inode for TmpInode {
         let child = self.with_dir(|m| m.get(old).cloned().ok_or(-ENOENT))?;
         let is_dir = matches!(*child.node.borrow(), Node::Dir(_));
         if is_dir && contains(&child, nd.ino) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         // 上書きするなら、その名前の読む位置を引きつぐ (Linux の simple_offset_rename)
         let mut keep = None;
@@ -779,7 +779,7 @@ impl Inode for TmpInode {
         let bdir = matches!(*b.node.borrow(), Node::Dir(_));
         // 自分の下のものとは入れかえられない
         if (adir && contains(&a, nd.ino)) || (bdir && contains(&b, self.ino)) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         self.with_dir(|m| Ok(m.insert(old.to_string(), b.clone())))?;
         nd.with_dir(|m| Ok(m.insert(new.to_string(), a.clone())))?;

@@ -1333,15 +1333,14 @@ pub fn unshare(flags: u64) -> Result<i64, i64> {
 pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
     const EAGAIN: i64 = 11;
     const ENOMEM: i64 = 12;
-    const EINVAL: i64 = 22;
     let thread = flags & CLONE_THREAD != 0;
     if thread && flags & CLONE_VM == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let parent = current();
     // CLONE_NEW*: 子の namespace を新しく (ns.rs。スレッドには作れない)
     if thread && flags & crate::ns::SUPPORTED != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut cred = parent.cred.clone();
     crate::ns::renew(&mut cred, flags)?;

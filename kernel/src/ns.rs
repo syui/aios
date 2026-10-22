@@ -29,7 +29,6 @@ pub const INIT_NET: u64 = 4026531840;
 pub const INIT_PID: u64 = 4026531836;
 pub const INIT_MNT: u64 = 4026531841;
 pub const INIT_USER: u64 = 4026531837;
-const EINVAL: i64 = 22;
 
 static mut NEXT_ID: u64 = 4026532000;
 
@@ -117,12 +116,12 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     }
     // namespace を切っていれば (aios.off=ns)、入れずに作った Linux と同じ EINVAL
     if crate::parts::off(crate::parts::Part::Ns) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     // ユーザーの namespace はだれでも作れる (先に作る。中ではほかの namespace も作れる)。入れ子と chroot の中はだめ
     if flags & CLONE_NEWUSER != 0 {
         if c.ns.user.is_some() {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if !crate::proc::current_root().is_empty() {
             return Err(-EPERM);
@@ -145,7 +144,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     if flags & CLONE_NEWPID != 0 {
         // 入れ子はできない
         if c.ns.pid.is_some() || crate::proc::current().pid_ns.is_some() {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         c.ns.pid = Some(Rc::new(Pid { id: next_id(), next: core::cell::Cell::new(0) }));
     }
@@ -296,14 +295,14 @@ pub fn show_gid(g: u32) -> u32 {
 /// システムコールの引数の uid (中の番号) を外の番号に。-1 (変えない) はそのまま、地図になければ EINVAL
 pub fn take_uid(u: u32) -> Result<u32, i64> {
     match &crate::proc::current_cred_ref().ns.user {
-        Some(n) if u != u32::MAX => outside(&n.maps.borrow().uid, u).ok_or(-EINVAL),
+        Some(n) if u != u32::MAX => outside(&n.maps.borrow().uid, u).ok_or_else(|| crate::why::inval()),
         _ => Ok(u),
     }
 }
 
 pub fn take_gid(g: u32) -> Result<u32, i64> {
     match &crate::proc::current_cred_ref().ns.user {
-        Some(n) if g != u32::MAX => outside(&n.maps.borrow().gid, g).ok_or(-EINVAL),
+        Some(n) if g != u32::MAX => outside(&n.maps.borrow().gid, g).ok_or_else(|| crate::why::inval()),
         _ => Ok(g),
     }
 }
@@ -325,17 +324,17 @@ pub fn write_map(u: &Option<Rc<User>>, gid: bool, text: &[u8]) -> Result<(), i64
     if !root && (me.euid != u.owner || me.ns.user.as_ref().is_some_and(|n| !Rc::ptr_eq(n, u))) {
         return Err(-EPERM);
     }
-    let text = core::str::from_utf8(text).map_err(|_| -EINVAL)?;
+    let text = core::str::from_utf8(text).map_err(|_| crate::why::inval())?;
     let mut lines = Vec::new();
     for l in text.lines().filter(|l| !l.trim().is_empty()) {
-        let f: Vec<u32> = l.split_whitespace().map(|x| x.parse().map_err(|_| -EINVAL)).collect::<Result<_, i64>>()?;
+        let f: Vec<u32> = l.split_whitespace().map(|x| x.parse().map_err(|_| crate::why::inval())).collect::<Result<_, i64>>()?;
         if f.len() != 3 || f[2] == 0 || f[0].checked_add(f[2]).is_none() || f[1].checked_add(f[2]).is_none() {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         lines.push((f[0], f[1], f[2]));
     }
     if lines.is_empty() || lines.len() > 5 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut m = u.maps.borrow_mut();
     if !root {
@@ -374,7 +373,7 @@ pub fn write_setgroups(u: &Option<Rc<User>>, text: &[u8]) -> Result<(), i64> {
     match core::str::from_utf8(text).map(|t| t.trim()) {
         Ok("deny") => m.setgroups_deny = true,
         Ok("allow") if !m.setgroups_deny => {}
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     }
     Ok(())
 }

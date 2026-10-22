@@ -225,7 +225,6 @@ pub fn exit(tid: u32, code: i64) {
 
 /// trace on [NAME] / off / clear
 pub fn ctl(arg: &str) -> Result<(), i64> {
-    const EINVAL: i64 = 22;
     let (cmd, name) = arg.split_once(' ').map_or((arg, ""), |(c, n)| (c, n.trim()));
     match cmd {
         "on" => {
@@ -243,7 +242,7 @@ pub fn ctl(arg: &str) -> Result<(), i64> {
             r.len = 0;
             r.dropped = 0;
         }
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     }
     Ok(())
 }

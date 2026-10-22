@@ -12,7 +12,6 @@ use crate::proc;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-const EINVAL: i64 = 22;
 const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
 const ENOMEM: i64 = 12;
@@ -98,7 +97,7 @@ const A: u16 = 0x10;
 /// 読みこんだプログラムを確かめる (使える命令だけ、跳び先は中、読む場所は seccomp_data の中、終わりは RET)
 fn validate(p: &[Insn]) -> Result<(), i64> {
     if p.is_empty() || p.len() > MAX_INSNS {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     for (i, n) in p.iter().enumerate() {
         let left = (p.len() - 1 - i) as u32;
@@ -131,12 +130,12 @@ fn validate(p: &[Insn]) -> Result<(), i64> {
             _ => false,
         };
         if !ok {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
     }
     // 終わりまで流れ落ちないように、最後は RET
     if p[p.len() - 1].code & 0x07 != RET {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok(())
 }
@@ -284,7 +283,7 @@ fn read_prog(addr: usize) -> Result<Vec<Insn>, i64> {
     let len = u16::from_le_bytes([h[0], h[1]]) as usize;
     let ptr = u64::from_le_bytes(h[8..16].try_into().unwrap()) as usize;
     if len == 0 || len > MAX_INSNS {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut raw = alloc::vec![0u8; len * 8];
     p.pt().copy_in(&mut raw, ptr).ok_or(-EFAULT)?;
@@ -334,14 +333,14 @@ pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
     match op {
         SET_MODE_STRICT => {
             if flags != 0 || args != 0 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             install(true, None, false)
         }
         SET_MODE_FILTER => {
             if flags & !(FLAG_TSYNC | FLAG_LOG | FLAG_SPEC_ALLOW) != 0 {
                 // NEW_LISTENER (USER_NOTIF の受け手) などはない
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let prog = read_prog(args)?;
             install(false, Some(prog), flags & FLAG_TSYNC != 0)
@@ -355,7 +354,7 @@ pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
             }
         }
         GET_NOTIF_SIZES => Err(-EOPNOTSUPP),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
@@ -364,6 +363,6 @@ pub fn prctl_set(mode: u64, prog: usize) -> Result<i64, i64> {
     match mode {
         MODE_STRICT => install(true, None, false),
         MODE_FILTER => install(false, Some(read_prog(prog)?), false),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }

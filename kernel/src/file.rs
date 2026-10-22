@@ -271,7 +271,7 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         Kind::Inet(u) => crate::inet::write(u, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
         Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
-        Kind::TimerFd(_) => Err(-EINVAL),
+        Kind::TimerFd(_) => Err(crate::why::inval()),
         _ => Err(-EBADF),
     }
 }
@@ -699,7 +699,7 @@ impl OpenFile {
                     3 | 4 => return Err(-6),
                     _ => None,
                 };
-                let new = new.filter(|&n| n >= 0 && n <= maxbytes).ok_or(-EINVAL)?;
+                let new = new.filter(|&n| n >= 0 && n <= maxbytes).ok_or_else(|| crate::why::inval())?;
                 self.offset = new as usize;
                 return Ok(self.offset);
             }
@@ -712,7 +712,7 @@ impl OpenFile {
                 4 if ext4 => return if off < 0 || off == i64::MAX { Err(-6) } else { self.offset = i64::MAX as usize; Ok(self.offset) },
                 _ => None,
             };
-            let new = new.filter(|&n| n >= 0).ok_or(-EINVAL)?;
+            let new = new.filter(|&n| n >= 0).ok_or_else(|| crate::why::inval())?;
             self.offset = new as usize;
             return Ok(self.offset);
         }
@@ -747,9 +747,9 @@ impl OpenFile {
                 self.offset = size as usize;
                 self.offset
             }),
-            _ => return Err(-EINVAL),
+            _ => return Err(crate::why::inval()),
         };
-        let new = base.checked_add(off).filter(|&n| n >= 0).ok_or(-EINVAL)?;
+        let new = base.checked_add(off).filter(|&n| n >= 0).ok_or_else(|| crate::why::inval())?;
         self.offset = new as usize;
         Ok(self.offset)
     }
@@ -820,7 +820,7 @@ impl OpenFile {
             let reclen = (19 + name.len() + 1 + 7) & !7;
             if out.len() + reclen > max {
                 if out.is_empty() {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 all = false;
                 break;
@@ -906,7 +906,7 @@ impl OpenFile {
         self.offset = pos as usize;
         // 1 つも入らなかった: 次の項目がバッファより大きい
         if out.is_empty() && full {
-            return Some(Err(-EINVAL));
+            return Some(Err(crate::why::inval()));
         }
         Some(Ok(()))
     }

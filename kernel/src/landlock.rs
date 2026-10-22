@@ -15,7 +15,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-const EINVAL: i64 = 22;
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
@@ -148,14 +147,14 @@ fn ruleset_of(fd: u64) -> Result<RulesetRef, i64> {
 pub fn create_ruleset(attr: usize, size: usize, flags: u64) -> R {
     const VERSION: u64 = 1;
     if flags == VERSION {
-        return if attr == 0 && size == 0 { Ok(ABI) } else { Err(-EINVAL) };
+        return if attr == 0 && size == 0 { Ok(ABI) } else { Err(crate::why::inval()) };
     }
     if flags != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     // struct landlock_ruleset_attr { handled_access_fs, handled_access_net, scoped }: 8 バイトずつ
     if size < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut b = [0u8; 24];
     let n = size.min(24);
@@ -171,7 +170,7 @@ pub fn create_ruleset(attr: usize, size: usize, flags: u64) -> R {
     let q = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let (fs, net, scoped) = (q(0), q(8), q(16));
     if fs & !FS_ALL != 0 || net & !NET_ALL != 0 || scoped != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if fs == 0 && net == 0 {
         return Err(-ENOMSG);
@@ -187,7 +186,7 @@ pub fn add_rule(fd: u64, ty: u64, attr: usize, flags: u64) -> R {
     const PATH_BENEATH: u64 = 1;
     const NET_PORT: u64 = 2;
     if flags != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let r = ruleset_of(fd)?;
     match ty {
@@ -202,13 +201,13 @@ pub fn add_rule(fd: u64, ty: u64, attr: usize, flags: u64) -> R {
                 return Err(-ENOMSG);
             }
             if allowed & !rs.fs != 0 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let f = crate::proc::current().files().get(pfd as u64).cloned().ok_or(-EBADF)?;
             let f = f.borrow();
             let crate::file::Kind::Inode(ino, path) = &f.kind else { return Err(-EBADFD) };
             if !ino.meta().is_dir() && allowed & !FS_FILE != 0 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             rs.paths.push((path.trim_start_matches('/').into(), allowed));
             Ok(0)
@@ -227,19 +226,19 @@ pub fn add_rule(fd: u64, ty: u64, attr: usize, flags: u64) -> R {
                 return Err(-ENOMSG);
             }
             if allowed & !rs.net != 0 || port > 0xffff {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             rs.ports.push((port as u16, allowed));
             Ok(0)
         }
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
 /// landlock_restrict_self(ruleset_fd, flags): 自分に層を 1 つ足す
 pub fn restrict_self(fd: u64, flags: u64) -> R {
     if flags != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let p = crate::proc::current();
     if !p.cred.no_new_privs && p.cred.euid != 0 {

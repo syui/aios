@@ -71,14 +71,13 @@ const fn bit(p: Part) -> u64 {
 
 /// /proc/ai/ctl の part NAME off|on: 動かしたまま切る・入れる (RUNTIME のものだけ。ほかは EINVAL)
 pub fn set(name: &str, on: bool) -> Result<(), i64> {
-    const EINVAL: i64 = 22;
     let Some(i) = NAMES.iter().position(|n| *n == name) else {
         println!("parts: {}: no such part (kernel.json lists what can be turned off, as off)", name);
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     };
     if RUNTIME & (1 << i) == 0 {
         println!("parts: {}: cannot be turned {} while running (a device started at boot, or /proc/ai itself): use aios.off=", name, if on { "on" } else { "off" });
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if on {
         OFF.fetch_and(!(1 << i), Ordering::Relaxed);

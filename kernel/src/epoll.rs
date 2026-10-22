@@ -11,7 +11,6 @@ use alloc::rc::{Rc, Weak};
 use core::cell::RefCell;
 
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 const EEXIST: i64 = 17;
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
@@ -141,14 +140,14 @@ fn epoll_of(fd: i64) -> Result<EpollRef, i64> {
     let b = f.borrow();
     match &b.kind {
         Kind::Epoll(e) => Ok(e.clone()),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
 pub fn create1(flags: u64) -> Result<i64, i64> {
     const EPOLL_CLOEXEC: u64 = 0o2000000;
     if flags & !EPOLL_CLOEXEC != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let f = file::new(Kind::Epoll(Rc::new(RefCell::new(Epoll::default()))), file::O_RDWR);
     let fd = proc::current().files().add(f, flags & EPOLL_CLOEXEC != 0, 0).ok_or(-24)?;
@@ -194,7 +193,7 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
         EPOLL_CTL_DEL => {
             ep.entries.remove(&fd).ok_or(-ENOENT)?;
         }
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     }
     let _ = EPOLLPRI;
     // この epoll で眠っているものを起こしなおす (見張るものが変わった。印はこの epoll の場所)
@@ -205,7 +204,7 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
 /// epoll_pwait (timeout はミリ秒、-1 で無限) / epoll_pwait2 (timespec)
 pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ns: Option<u64>) -> Result<i64, i64> {
     if max <= 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let ep = epoll_of(epfd)?;
     let deadline = timeout_ns.map(crate::timer::ticks_after);
@@ -274,7 +273,7 @@ pub fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     const EFD_CLOEXEC: u64 = 0o2000000;
     const EFD_NONBLOCK: u64 = 0o4000;
     if flags & !(EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK) != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let e = Rc::new(RefCell::new(EventFd { count: initval & 0xffff_ffff, semaphore: flags & EFD_SEMAPHORE != 0, generation: 0 }));
     let fl = file::O_RDWR | if flags & EFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
@@ -289,7 +288,7 @@ pub fn chan(e: &EventFdRef) -> usize {
 
 pub fn read(e: &EventFdRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     if dst.len() < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     loop {
         {
@@ -312,11 +311,11 @@ pub fn read(e: &EventFdRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64
 
 pub fn write(e: &EventFdRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     if src.len() < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let v = u64::from_le_bytes(src[..8].try_into().unwrap());
     if v == u64::MAX {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     loop {
         {

@@ -22,7 +22,6 @@ use alloc::vec::Vec;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 const EDEADLK: i64 = 35;
 const EOVERFLOW: i64 = 75;
 
@@ -155,14 +154,14 @@ fn range(whence: i16, l_start: i64, l_len: i64, pos: i64, size: i64) -> Result<(
         0 => 0,
         1 => pos,
         2 => size,
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     if l_start > i64::MAX - base {
         return Err(-EOVERFLOW);
     }
     let mut start = base + l_start;
     if start < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let end = if l_len > 0 {
         if l_len - 1 > i64::MAX - start {
@@ -171,7 +170,7 @@ fn range(whence: i16, l_start: i64, l_len: i64, pos: i64, size: i64) -> Result<(
         start + (l_len - 1)
     } else if l_len < 0 {
         if start + l_len < 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let e = start - 1;
         start += l_len;
@@ -218,21 +217,21 @@ pub fn fcntl(file: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, 
             Kind::Inode(i, _) => i.meta().size as i64,
             _ => 0,
         };
-        (key(&b).ok_or(-EINVAL)?, ptr_of(&b), mode == crate::file::O_RDONLY || mode == crate::file::O_RDWR, mode == crate::file::O_WRONLY || mode == crate::file::O_RDWR, b.offset as i64, size)
+        (key(&b).ok_or_else(|| crate::why::inval())?, ptr_of(&b), mode == crate::file::O_RDONLY || mode == crate::file::O_RDWR, mode == crate::file::O_WRONLY || mode == crate::file::O_RDWR, b.offset as i64, size)
     };
     let owner = if ofd { Owner::Ofd(fptr) } else { Owner::Posix(files) };
     if getlk {
         // Linux の fcntl_getlk の順: 種類 (OFD なら F_UNLCK も)、範囲、OFD の l_pid
         if !ofd && l_type != F_RDLCK && l_type != F_WRLCK {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let (start, end) = range(l_whence, l_start, l_len, pos, size)?;
         // 種類は範囲のあとで (flock64_to_posix_lock の assign_type): OFD は F_UNLCK も聞ける (自分のロックを答える)
         if !matches!(l_type, F_RDLCK | F_WRLCK | F_UNLCK) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if ofd && l_pid != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let hit = recs().get(&key).and_then(|v| {
             v.iter().find(|r| {
@@ -257,13 +256,13 @@ pub fn fcntl(file: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, 
     // F_SETLK / F_SETLKW (Linux の fcntl_setlk の順): 範囲と種類、口 (F_RDLCK は読める fd、F_WRLCK は書ける fd)、OFD の l_pid
     let (start, end) = range(l_whence, l_start, l_len, pos, size)?;
     if !matches!(l_type, F_RDLCK | F_WRLCK | F_UNLCK) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if (l_type == F_RDLCK && !readable) || (l_type == F_WRLCK && !writable) {
         return Err(-EBADF);
     }
     if ofd && l_pid != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let pid = proc::current().tgid;
     if l_type != F_UNLCK {
@@ -355,7 +354,7 @@ pub fn flock(fd: u64, op: u64) -> Result<i64, i64> {
         LOCK_SH => (false, false),
         LOCK_EX => (true, false),
         LOCK_UN => (false, true),
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     let f = proc::current().files().get(fd).cloned().ok_or(-EBADF)?;
     let (key, me, usable) = {
@@ -364,7 +363,7 @@ pub fn flock(fd: u64, op: u64) -> Result<i64, i64> {
             return Err(-EBADF);
         }
         let mode = b.flags & crate::file::O_ACCMODE;
-        (key(&b).ok_or(-EINVAL)?, ptr_of(&b), mode != crate::file::O_ACCMODE)
+        (key(&b).ok_or_else(|| crate::why::inval())?, ptr_of(&b), mode != crate::file::O_ACCMODE)
     };
     if !un && !usable {
         return Err(-EBADF);

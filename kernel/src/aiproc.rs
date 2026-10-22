@@ -209,10 +209,9 @@ pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl r
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
-    const EINVAL: i64 = 22;
-    let s = core::str::from_utf8(b).map_err(|_| -EINVAL)?.trim();
+    let s = core::str::from_utf8(b).map_err(|_| crate::why::inval())?.trim();
     let (cmd, arg) = s.split_once(' ').map_or((s, ""), |(c, a)| (c, a.trim()));
-    let num = || arg.parse::<u32>().map_err(|_| -EINVAL);
+    let num = || arg.parse::<u32>().map_err(|_| crate::why::inval());
     match cmd {
         "kick" => {
             let n = crate::proc::futex_kick(num()?);
@@ -224,7 +223,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "bkl" if arg == "reset" => crate::smp::stats_reset(),
         "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),
         "heap" if arg.starts_with("hog ") => {
-            crate::heap::hog(arg[4..].trim().parse::<usize>().map_err(|_| -EINVAL)?);
+            crate::heap::hog(arg[4..].trim().parse::<usize>().map_err(|_| crate::why::inval())?);
         }
         "heap" if arg == "check" => crate::heap::check(),
         "page" if arg == "cycle" => {
@@ -237,11 +236,11 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "trace" => crate::trace::ctl(arg)?,
         "fail" => crate::fail::ctl(arg)?,
         "part" => {
-            let (name, how) = arg.split_once(' ').ok_or(-EINVAL)?;
+            let (name, how) = arg.split_once(' ').ok_or_else(|| crate::why::inval())?;
             let on = match how.trim() {
                 "on" => true,
                 "off" => false,
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             };
             crate::parts::set(name.trim(), on)?;
         }
@@ -252,7 +251,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
             }
             panic!("/proc/ai/ctl: {}", if arg.is_empty() { "panic" } else { arg });
         }
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     }
     Ok(())
 }

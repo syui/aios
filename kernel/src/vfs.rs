@@ -155,7 +155,7 @@ pub trait Inode {
     /// RENAME_EXCHANGE: old (このディレクトリの名前) と new (newdir の名前) が指すものを入れかえる (どちらもあること)。
     /// できないファイルシステムは EINVAL (Linux と同じ)
     fn exchange(&self, _old: &str, _newdir: &InodeRef, _new: &str) -> Result<(), i64> {
-        Err(-EINVAL)
+        Err(crate::why::inval())
     }
     /// O_TMPFILE: このディレクトリのファイルシステムに、名前のない (リンクが 0 の) ふつうのファイルを作る。
     /// 閉じたら消える。linkable なら一度だけ link で名前をつけられる (Linux の I_LINKABLE。ほかのリンクが 0 の
@@ -200,7 +200,7 @@ pub trait Inode {
     }
     /// 封を足す (F_ADD_SEALS)
     fn add_seals(&self, _seals: u32) -> Result<(), i64> {
-        Err(-EINVAL)
+        Err(crate::why::inval())
     }
 }
 
@@ -343,7 +343,7 @@ pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
     let top = resolve("", path, true)?;
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
-    let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or(-EINVAL)?;
+    let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
     m.ro = ro;
     Ok(())
 }
@@ -364,7 +364,7 @@ pub fn umount(path: &str) -> Result<(), i64> {
     let top = resolve("", path, true)?;
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
-    let i = l.iter().rposition(|m| m.root.id() == top.id()).ok_or(-EINVAL)?;
+    let i = l.iter().rposition(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
     // その上にまだかぶせてあるものがあれば外せない
     if l[i + 1..].iter().any(|m| m.at == top.id()) {
         return Err(-16); // EBUSY

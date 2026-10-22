@@ -15,7 +15,6 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersi
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EPERM: i64 = 1;
 const EACCES: i64 = 13;
@@ -149,7 +148,7 @@ impl Socket {
                 loop {
                     let s = raw_sock(h);
                     if s.can_recv() {
-                        let k = if peek { s.peek_slice(buf) } else { s.recv_slice(buf) }.map_err(|_| -EINVAL)?;
+                        let k = if peek { s.peek_slice(buf) } else { s.recv_slice(buf) }.map_err(|_| crate::why::inval())?;
                         let from = (k >= 20).then(|| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(buf[12], buf[13], buf[14], buf[15])), 0));
                         return Ok((k, from));
                     }
@@ -162,7 +161,7 @@ impl Socket {
                 loop {
                     let s = icmp_sock(h);
                     if s.can_recv() {
-                        let (k, from) = s.recv_slice(buf).map_err(|_| -EINVAL)?;
+                        let (k, from) = s.recv_slice(buf).map_err(|_| crate::why::inval())?;
                         return Ok((k, Some(IpEndpoint::new(from, 0))));
                     }
                     wait(nb)?;
@@ -183,7 +182,7 @@ impl Socket {
                 let h = self.bind_raw()?;
                 let total = 20 + buf.len();
                 if total > 65535 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 let mut pkt = alloc::vec![0u8; total];
                 pkt[0] = 0x45;
@@ -203,7 +202,7 @@ impl Socket {
             Proto::Icmp => {
                 let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
                 if buf.len() < 8 || buf[0] != 8 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 let h = self.bind_icmp()?;
                 let id = self.local.map_or(0, |l| l.port);
@@ -279,7 +278,7 @@ impl Socket {
 
 fn read_addr(va: usize, len: usize) -> Result<IpEndpoint, i64> {
     if len < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut b = [0u8; 8];
     proc::current().pt().copy_in(&mut b, va).ok_or(-EFAULT)?;
@@ -348,7 +347,7 @@ fn sock(fd: u64) -> Result<Sock, i64> {
 fn addr_in(va: usize, len: usize) -> Result<Vec<u8>, i64> {
     let len = len as u32 as i32;
     if !(0..=128).contains(&len) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut b = vec![0u8; len as usize];
     if len > 0 {
@@ -364,7 +363,7 @@ fn addr_out(va: usize, lenp: usize, name: &[u8]) -> Result<(), i64> {
     pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
     let len = i32::from_le_bytes(l).min(name.len() as i32);
     if len < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if len > 0 {
         pt.copy_out(va, &name[..len as usize]).ok_or(-EFAULT)?;
@@ -488,7 +487,7 @@ pub fn inet_writev(f: &FileRef, u: &InetRef, iov: &[(usize, usize)], nowait: boo
 fn inet_check(t: u64, protocol: u64) -> Result<(), i64> {
     let p = protocol as u32 as i32;
     if !(0..263).contains(&p) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     match t {
         SOCK_STREAM if p == 0 || p == 6 => Ok(()),
@@ -507,14 +506,14 @@ fn inet_check(t: u64, protocol: u64) -> Result<(), i64> {
 fn sock_args(domain: u64, typ: u64) -> Result<(u64, u64, u64), i64> {
     let typ = typ as u32 as u64;
     if typ & !0xf & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let d = domain as u32 as i32;
     if !(0..46).contains(&d) {
         return Err(-EAFNOSUPPORT);
     }
     if typ & 0xf >= 11 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok((d as u64, typ & 0xf, typ & !0xf))
 }
@@ -635,7 +634,7 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
     fd_file(fd)?;
     let flags = flags as u32 as u64;
     if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     match sock(fd)? {
         Sock::Unix(f, u) => {
@@ -828,7 +827,7 @@ fn read_msghdr(va: usize) -> Result<MsgHdr, i64> {
     let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) as usize;
     let (iov_at, iovlen) = (u(16), u(24));
     if iovlen > 1024 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut iov = Vec::with_capacity(iovlen);
     for i in 0..iovlen {
@@ -847,7 +846,7 @@ fn send_parts(m: &MsgHdr) -> Result<(Option<Vec<u8>>, Vec<u8>), i64> {
     pt.copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
     let namelen = i32::from_le_bytes(l);
     if namelen < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let to = if m.name != 0 && namelen > 0 { Some(addr_in(m.name, (namelen as usize).min(128))?) } else { None };
     if m.controllen > i32::MAX as usize {
@@ -959,7 +958,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
         proc::current().pt().copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
         let n = i32::from_le_bytes(l);
         if n < 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         Ok(n)
     };
@@ -1027,7 +1026,7 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     // Linux の do_sock_setsockopt: 長さ < 0 は EINVAL
     let len = len as u32 as i32;
     if len < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut b = vec![0u8; (len as usize).min(64)];
     match s {
@@ -1037,7 +1036,7 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
                 return Err(-EOPNOTSUPP);
             }
             if len < 4 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             b.truncate(16);
             proc::current().pt().copy_in(&mut b, val).ok_or(-EFAULT)?;
@@ -1058,7 +1057,7 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
                 let ttl = match v {
                     -1 => None,
                     1..=255 => Some(v as u8),
-                    _ => return Err(-EINVAL),
+                    _ => return Err(crate::why::inval()),
                 };
                 s.borrow_mut().set_ttl(ttl);
             }

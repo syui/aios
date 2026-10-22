@@ -51,9 +51,15 @@ pub enum Code {
     PartOff,
     /// aios にないシステムコール
     NoSys,
+    /// readlink したものがシンボリックリンクでない (EINVAL)。path はたのんだパス
+    NotLink,
+    /// fd (num) が開いていない (EBADF)
+    BadFd,
+    /// EINVAL を返したカーネルのソースの場所 (name はファイル、num は行。そこに断ったわけが書いてある)
+    Where,
 }
 
-const CODES: [&str; 12] = ["", "perm", "missing", "missing_cached", "not_dir", "loop", "name_too_long", "seccomp", "landlock", "injected", "part_off", "no_sys"];
+const CODES: [&str; 15] = ["", "perm", "missing", "missing_cached", "not_dir", "loop", "name_too_long", "seccomp", "landlock", "injected", "part_off", "no_sys", "not_link", "bad_fd", "where"];
 
 /// 1 つのわけ (Proc に 1 つ。輪にも)
 #[derive(Clone, Copy)]
@@ -121,6 +127,41 @@ pub fn note(code: Code, errno: i64, num: u64) {
     if let Some(n) = me() {
         *n = Note { code, errno: errno.unsigned_abs() as u16, num, ..NONE };
     }
+}
+
+/// EINVAL を返すところ (`Err(crate::why::inval())`): どこで断ったか (カーネルのソースのファイルと行) を、まだわけが
+/// なければ残す。EINVAL は Linux でもわけがいくつもあって (知らないフラグ、大きさ、そろっていない場所 ...) 番号だけでは
+/// わからないので、その行 (と、その上に書いたわけ) を見られるように。-EINVAL を返す
+#[track_caller]
+#[cold]
+pub fn inval() -> i64 {
+    let l = core::panic::Location::caller();
+    if let Some(n) = me()
+        && (n.code == Code::None || n.errno != 22)
+    {
+        *n = Note { code: Code::Where, errno: 22, num: l.line() as u64, ..NONE };
+        n.nlen = copy(&mut n.name, l.file());
+    }
+    -22
+}
+
+/// readlink したものがシンボリックリンクでない。path はたのんだパス。-EINVAL を返す
+#[cold]
+pub fn not_link(path: &str) -> i64 {
+    if let Some(n) = me() {
+        *n = Note { code: Code::NotLink, errno: 22, asked: true, ..NONE };
+        n.plen = copy(&mut n.path, path);
+    }
+    -22
+}
+
+/// fd が開いていない。-EBADF を返す
+#[cold]
+pub fn bad_fd(fd: u64) -> i64 {
+    if let Some(n) = me() {
+        *n = Note { code: Code::BadFd, errno: 9, num: fd, ..NONE };
+    }
+    -9
 }
 
 /// いまのわけに、どこで (path: そこまでたどったところ、name: 次の名前) をつける。まだついていなければ。e をそのまま返す
@@ -203,8 +244,10 @@ static PROBE: SpinLock<Ring> = SpinLock::new(Ring { ev: [EMPTY; N], head: 0, len
 
 /// さがしもの (PROBE の輪に入れるもの)
 fn probe(nr: u64, e: i64) -> bool {
-    // newfstatat statx faccessat faccessat2 readlinkat の ENOENT ENOTDIR、ioctl の ENOTTY
-    (matches!(nr, 79 | 291 | 48 | 439 | 78) && matches!(-e, 2 | 20)) || (nr == 29 && -e == 25)
+    // newfstatat statx faccessat faccessat2 readlinkat の ENOENT ENOTDIR、ioctl の ENOTTY、readlinkat の EINVAL (リンクで
+    // ない)、fcntl と close の EBADF (開いている fd をさがす: closefrom や、cp が fd を見てまわるもの)、getxattr の
+    // ENODATA (その属性がない: cp や tar がファイルごとに見る)
+    (matches!(nr, 79 | 291 | 48 | 439 | 78) && matches!(-e, 2 | 20)) || (nr == 29 && -e == 25) || (nr == 78 && -e == 22) || (matches!(nr, 25 | 57) && -e == 9) || (matches!(nr, 8..=10) && -e == 61)
 }
 
 /// システムコールの出口で errno (負の数) を返すとき (syscall::dispatch。a はその引数)
@@ -232,7 +275,7 @@ fn done_slow(nr: u64, e: i64, a: &[u64]) {
     }
     // わけを書いたところがパスを知らなければ (許可を見るところなど)、プログラムがたのんだパスを
     if note.plen == 0
-        && note.nlen == 0
+        && (note.nlen == 0 || note.code == Code::Where)
         && let Some(i) = crate::syscall::path_arg(nr)
         && let Some(&va) = a.get(i)
     {
@@ -270,11 +313,15 @@ fn push(probe: bool, ent: Ent) {
 
 /// errno の名前 (よく出るもの。ほかは数のまま)
 pub fn errno_name(e: u16) -> Option<&'static str> {
-    const T: [(u16, &str); 40] = [
+    const T: [(u16, &str); 72] = [
         (1, "EPERM"), (2, "ENOENT"), (3, "ESRCH"), (4, "EINTR"), (5, "EIO"), (6, "ENXIO"), (7, "E2BIG"), (8, "ENOEXEC"), (9, "EBADF"), (10, "ECHILD"),
-        (11, "EAGAIN"), (12, "ENOMEM"), (13, "EACCES"), (14, "EFAULT"), (16, "EBUSY"), (17, "EEXIST"), (18, "EXDEV"), (19, "ENODEV"), (20, "ENOTDIR"), (21, "EISDIR"),
-        (22, "EINVAL"), (23, "ENFILE"), (24, "EMFILE"), (25, "ENOTTY"), (26, "ETXTBSY"), (27, "EFBIG"), (28, "ENOSPC"), (29, "ESPIPE"), (30, "EROFS"), (31, "EMLINK"),
-        (32, "EPIPE"), (34, "ERANGE"), (36, "ENAMETOOLONG"), (38, "ENOSYS"), (39, "ENOTEMPTY"), (40, "ELOOP"), (95, "EOPNOTSUPP"), (98, "EADDRINUSE"), (111, "ECONNREFUSED"), (110, "ETIMEDOUT"),
+        (11, "EAGAIN"), (12, "ENOMEM"), (13, "EACCES"), (14, "EFAULT"), (15, "ENOTBLK"), (16, "EBUSY"), (17, "EEXIST"), (18, "EXDEV"), (19, "ENODEV"), (20, "ENOTDIR"),
+        (21, "EISDIR"), (22, "EINVAL"), (23, "ENFILE"), (24, "EMFILE"), (25, "ENOTTY"), (26, "ETXTBSY"), (27, "EFBIG"), (28, "ENOSPC"), (29, "ESPIPE"), (30, "EROFS"),
+        (31, "EMLINK"), (32, "EPIPE"), (33, "EDOM"), (34, "ERANGE"), (35, "EDEADLK"), (36, "ENAMETOOLONG"), (37, "ENOLCK"), (38, "ENOSYS"), (39, "ENOTEMPTY"), (40, "ELOOP"),
+        (42, "ENOMSG"), (43, "EIDRM"), (61, "ENODATA"), (62, "ETIME"), (71, "EPROTO"), (74, "EBADMSG"), (75, "EOVERFLOW"), (84, "EILSEQ"), (88, "ENOTSOCK"), (89, "EDESTADDRREQ"),
+        (90, "EMSGSIZE"), (91, "EPROTOTYPE"), (92, "ENOPROTOOPT"), (93, "EPROTONOSUPPORT"), (94, "ESOCKTNOSUPPORT"), (95, "EOPNOTSUPP"), (97, "EAFNOSUPPORT"), (98, "EADDRINUSE"), (99, "EADDRNOTAVAIL"), (101, "ENETUNREACH"),
+        (103, "ECONNABORTED"), (104, "ECONNRESET"), (105, "ENOBUFS"), (106, "EISCONN"), (107, "ENOTCONN"), (110, "ETIMEDOUT"), (111, "ECONNREFUSED"), (113, "EHOSTUNREACH"), (114, "EALREADY"), (115, "EINPROGRESS"),
+        (116, "ESTALE"), (125, "ECANCELED"),
     ];
     T.iter().find(|t| t.0 == e).map(|t| t.1)
 }
@@ -353,6 +400,10 @@ fn sentence(n: &Note, syscall: &str) -> String {
         Code::Injected => String::from("injected on purpose by the fail rule in /proc/ai/ctl"),
         Code::PartOff => format!("{} belongs to a kernel part that is turned off (aios.off= or ctl part)", syscall),
         Code::NoSys => format!("aios does not have {} (number {})", syscall, n.num),
+        Code::NotLink => format!("{} is not a symbolic link", p),
+        Code::BadFd => format!("fd {} is not open in this process", n.num),
+        Code::Where if path.is_empty() => format!("refused at {}:{} (the check there says why)", name, n.num),
+        Code::Where => format!("refused at {}:{} (the check there says why), for {}", name, n.num, p),
         Code::None => String::new(),
     }
 }
@@ -403,12 +454,19 @@ pub fn text(uid: Option<u32>) -> String {
             s.push_str(",\"probe\":true");
         }
         let n = &e.note;
+        // わけのないものも、たのんだパスがあれば (asked)
+        if n.code == Code::None && n.plen > 0 {
+            s.push_str(&format!(",\"path\":\"{}\",\"asked\":true", esc(core::str::from_utf8(&n.path[..n.plen as usize]).unwrap_or("?"))));
+        }
         if n.code != Code::None {
             s.push_str(&format!(",\"code\":\"{}\"", CODES[n.code as usize]));
             if n.plen > 0 {
                 s.push_str(&format!(",\"path\":\"{}\"", esc(core::str::from_utf8(&n.path[..n.plen as usize]).unwrap_or("?"))));
             }
-            if n.nlen > 0 {
+            if n.code == Code::Where {
+                // EINVAL を返したところ (src: カーネルのソースのファイルと行)
+                s.push_str(&format!(",\"src\":\"{}:{}\"", esc(core::str::from_utf8(&n.name[..n.nlen as usize]).unwrap_or("?")), n.num));
+            } else if n.nlen > 0 {
                 s.push_str(&format!(",\"name\":\"{}\"", esc(core::str::from_utf8(&n.name[..n.nlen as usize]).unwrap_or("?"))));
             }
             if n.asked {

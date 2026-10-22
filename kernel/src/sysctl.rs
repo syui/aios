@@ -18,7 +18,6 @@ use alloc::string::{String, ToString};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::spinlock::SpinLock;
 
-const EINVAL: i64 = 22;
 
 /// inotify にためておくできごとの数。こえたら IN_Q_OVERFLOW
 pub static INOTIFY_MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
@@ -51,8 +50,8 @@ impl Entry {
     }
 
     pub fn write(&self, b: &[u8]) -> Result<(), i64> {
-        let set = self.set.ok_or(-EINVAL)?;
-        let s = core::str::from_utf8(b).map_err(|_| -EINVAL)?;
+        let set = self.set.ok_or_else(|| crate::why::inval())?;
+        let s = core::str::from_utf8(b).map_err(|_| crate::why::inval())?;
         set(s.trim_end_matches(['\n', ' ', '\t']))
     }
 }
@@ -85,7 +84,7 @@ fn boot_id() -> String {
 
 /// 数を lo..=hi の中で受ける
 fn num(s: &str, lo: usize, hi: usize) -> Result<usize, i64> {
-    s.trim().parse::<usize>().ok().filter(|n| (lo..=hi).contains(n)).ok_or(-EINVAL)
+    s.trim().parse::<usize>().ok().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| crate::why::inval())
 }
 
 pub static TABLE: &[Entry] = &[

@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 pub const EPERM: i64 = 1;
 pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
-pub const EINVAL: i64 = 22;
 
 pub const R: u32 = 4;
 pub const W: u32 = 2;
@@ -248,7 +247,7 @@ pub fn getgroups(size: usize, list: usize) -> Res {
         return Ok(g.len() as i64);
     }
     if size < g.len() {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     for (i, v) in g.iter().enumerate() {
         out(list + i * 4, &crate::ns::show_gid(*v).to_le_bytes())?;
@@ -261,7 +260,7 @@ pub fn setgroups(size: usize, list: usize) -> Res {
         return Err(-EPERM);
     }
     if size > 65536 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut g = Vec::with_capacity(size);
     for i in 0..size {

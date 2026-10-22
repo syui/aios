@@ -34,7 +34,6 @@ const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 const EPIPE: i64 = 32;
 const EDOM: i64 = 33;
 const EDESTADDRREQ: i64 = 89;
@@ -715,7 +714,7 @@ fn autobind(u: &InetRef) -> Result<(), i64> {
 /// EADDRNOTAVAIL。IP_FREEBIND ならよい)、1024 より下は root だけ、もう bind していれば EINVAL、ポート
 pub fn bind(u: &InetRef, a: &[u8]) -> R {
     if a.len() < 16 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (fam, port, addr) = parse(a);
     if fam != AF_INET && !(fam == AF_UNSPEC && addr == 0) {
@@ -735,7 +734,7 @@ pub fn bind(u: &InetRef, a: &[u8]) -> R {
     {
         let mut s = u.borrow_mut();
         if s.state != St::Close || s.num != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         s.rcv_saddr = addr;
         s.saddr = if special { 0 } else { addr };
@@ -775,7 +774,7 @@ pub fn listen(u: &InetRef, backlog: u64) -> R {
             return Err(-EOPNOTSUPP);
         }
         if s.ss != Ss::Unconnected || !matches!(s.state, St::Close | St::Listen) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
     }
     u.borrow_mut().max_backlog = backlog;
@@ -1047,7 +1046,7 @@ pub fn connect(f: &FileRef, u: &InetRef, a: &[u8]) -> R {
         return udp_connect(u, a);
     }
     if a.len() < 2 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (fam, _, _) = parse(a);
     if fam == AF_UNSPEC {
@@ -1058,7 +1057,7 @@ pub fn connect(f: &FileRef, u: &InetRef, a: &[u8]) -> R {
     let ss = u.borrow().ss;
     let mut err = match ss {
         Ss::Connected => return Err(-EISCONN),
-        Ss::Disconnecting => return Err(-EINVAL),
+        Ss::Disconnecting => return Err(crate::why::inval()),
         Ss::Connecting => -EALREADY,
         Ss::Unconnected => {
             if u.borrow().state != St::Close {
@@ -1113,7 +1112,7 @@ fn take_err(u: &InetRef) -> i64 {
 
 fn tcp_v4_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
     if a.len() < 16 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (fam, dport, daddr) = parse(a);
     if fam != AF_INET {
@@ -1204,7 +1203,7 @@ pub fn accept(f: &FileRef, u: &InetRef) -> Result<InetRef, i64> {
             (s.state, s.acceptq.pop_front(), s.rcvtimeo)
         };
         if st != St::Listen {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if let Some(c) = c {
             {
@@ -1527,7 +1526,7 @@ impl Recv {
 /// MSG_OOB (Linux の tcp_recv_urg)
 fn tcp_recv_urg(s: &mut Inet, len: usize, flags: u64) -> Result<Recv, i64> {
     if s.oobinline || s.urg_data == 0 || s.urg_data == URG_READ {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if s.state == St::Close && !s.done {
         return Err(-ENOTCONN);
@@ -1990,7 +1989,7 @@ fn sock_cmsg_check(ctl: &[u8], tcp: bool) -> Result<(Option<u8>, Option<u8>), i6
         let level = i32::from_le_bytes(ctl[off + 8..off + 12].try_into().unwrap());
         let typ = i32::from_le_bytes(ctl[off + 12..off + 16].try_into().unwrap());
         if clen < 16 || clen > ctl.len() - off {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let data = &ctl[off + 16..off + clen];
         let int = || if data.len() >= 4 { Some(i32::from_le_bytes(data[..4].try_into().unwrap())) } else { None };
@@ -2000,7 +1999,7 @@ fn sock_cmsg_check(ctl: &[u8], tcp: bool) -> Result<(Option<u8>, Option<u8>), i6
                 // SO_PRIORITY
                 12 => {
                     if clen != 20 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     if int().unwrap_or(0) as u32 > 6 && proc::current_cred_ref().euid != 0 {
                         return Err(-EPERM);
@@ -2012,47 +2011,47 @@ fn sock_cmsg_check(ctl: &[u8], tcp: bool) -> Result<(Option<u8>, Option<u8>), i6
                         return Err(-EPERM);
                     }
                     if clen != 20 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                 }
                 // SO_TIMESTAMPING
                 37 | 65 => {
                     if clen != 20 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                 }
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             }
         } else if level == SOL_IP && !tcp {
             match typ {
                 // IP_TTL
                 2 => {
                     if clen != 20 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     let v = int().unwrap_or(0);
                     if !(1..=255).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     ttl = Some(v as u8);
                 }
                 // IP_TOS
                 1 => {
-                    let v = if clen == 20 { int().unwrap_or(0) } else if clen == 17 { data[0] as i32 } else { return Err(-EINVAL) };
+                    let v = if clen == 20 { int().unwrap_or(0) } else if clen == 17 { data[0] as i32 } else { return Err(crate::why::inval()) };
                     if !(0..=255).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     tos = Some(v as u8);
                 }
                 // IP_PKTINFO
                 8 => {
                     if clen != 28 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                 }
                 // IP_RETOPTS
                 7 => {}
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             }
         }
         off += clen.div_ceil(8) * 8;
@@ -2116,7 +2115,7 @@ fn udp_lookup(netns: u64, saddr: u32, sport: u16, daddr: u32, dport: u16) -> Opt
 /// 送り元のアドレスが決まっていなければ、みちの送り元に
 fn udp_connect(u: &InetRef, a: &[u8]) -> R {
     if a.len() < 2 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (fam, port, addr) = parse(a);
     if fam == AF_UNSPEC {
@@ -2125,7 +2124,7 @@ fn udp_connect(u: &InetRef, a: &[u8]) -> R {
     }
     autobind(u)?;
     if a.len() < 16 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if fam != AF_INET {
         return Err(-EAFNOSUPPORT);
@@ -2194,14 +2193,14 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
         let (d, p) = match to {
             Some(a) => {
                 if a.len() < 16 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 let (fam, port, addr) = parse(a);
                 if fam != AF_INET && fam != AF_UNSPEC {
                     return Err(-EAFNOSUPPORT);
                 }
                 if port == 0 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 (addr, port)
             }
@@ -2466,7 +2465,7 @@ pub fn write(u: &InetRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
 pub fn shutdown(u: &InetRef, how: u64) -> R {
     let how = (how as u32 as i32).wrapping_add(1);
     if how & !3 != 0 || how == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let how = how as u8;
     {
@@ -2621,7 +2620,7 @@ pub fn inq(u: &InetRef) -> Result<i32, i64> {
         return Ok(s.dq.front().map_or(0, |d| d.data.len() as i32));
     }
     if s.state == St::Listen {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if let Some(h) = s.ext {
         return Ok(tcp_sock(h).recv_queue() as i32);
@@ -2633,7 +2632,7 @@ pub fn inq(u: &InetRef) -> Result<i32, i64> {
 pub fn outq(u: &InetRef) -> Result<i32, i64> {
     let s = u.borrow();
     if s.tcp && s.state == St::Listen {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if let Some(h) = s.ext {
         if s.tcp {
@@ -2700,7 +2699,7 @@ const TCP_RMEM_MAX: usize = 16282880;
 /// getsockopt。len は入れ物の長さ (返すものはそこまでに切る)
 pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>, i64> {
     if len < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let int = |v: i64| (v as i32).to_le_bytes().to_vec();
     let tcp = u.borrow().tcp;
@@ -2840,7 +2839,7 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
         SOL_SOCKET => sol_socket_set(u, opt, val),
         IPPROTO_TCP if tcp => {
             if val.len() < 4 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let v = i32::from_le_bytes(val[..4].try_into().unwrap());
             let mut s = u.borrow_mut();
@@ -2854,7 +2853,7 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
                 }
                 2 => {
                     if v != 0 && !(88..=32767).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.user_mss = v;
                 }
@@ -2867,25 +2866,25 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
                 }
                 4 => {
                     if !(1..=32767).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.keepidle = v;
                 }
                 5 => {
                     if !(1..=32767).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.keepintvl = v;
                 }
                 6 => {
                     if !(1..=127).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.keepcnt = v;
                 }
                 7 => {
                     if !(1..=127).contains(&v) {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.syncnt = v;
                 }
@@ -2894,7 +2893,7 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
                 10 => {
                     if v == 0 {
                         if s.state != St::Close {
-                            return Err(-EINVAL);
+                            return Err(crate::why::inval());
                         }
                         s.window_clamp = 0;
                     } else {
@@ -2904,7 +2903,7 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
                 12 => {}
                 18 => {
                     if v < 0 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     s.user_timeout = v as u32;
                 }
@@ -2921,13 +2920,13 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
 
 fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
     if val.len() < 4 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let v = i32::from_le_bytes(val[..4].try_into().unwrap());
     let b = v != 0;
     let to_ns = |val: &[u8]| -> Result<u64, i64> {
         if val.len() < 16 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let sec = i64::from_le_bytes(val[..8].try_into().unwrap());
         let usec = i64::from_le_bytes(val[8..16].try_into().unwrap());
@@ -2972,7 +2971,7 @@ fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
             }
             13 => {
                 if val.len() < 8 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 s.linger = b;
                 if b {
@@ -3031,58 +3030,58 @@ fn ip_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
         }
         15 => {
             if val.is_empty() {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.freebind = v != 0;
         }
         3 => return Err(-ENOPROTOOPT),
         34 => {
             if val.is_empty() {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.mc_loop = v != 0;
         }
         49 => {
             if val.is_empty() || (v != 0 && v != 1) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.mc_all = v != 0;
         }
         24 => s.bind_no_port = v != 0,
         2 => {
             if val.is_empty() {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             if v != -1 && !(1..=255).contains(&v) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.uc_ttl = v;
         }
         21 => {
             if val.is_empty() {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             if !(0..=255).contains(&v) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.minttl = v as u8;
         }
         33 => {
             if s.tcp {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             if val.is_empty() {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let v = if v == -1 { 1 } else { v };
             if !(0..=255).contains(&v) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.mc_ttl = v as u8;
         }
         10 => {
             if !(0..=5).contains(&v) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             s.pmtudisc = v as u8;
         }
@@ -3450,7 +3449,7 @@ fn ext_connect(u: &InetRef) -> Result<(), i64> {
     let ep = IpEndpoint::new(IpAddress::Ipv4(ipv4(daddr)), dport);
     if n.sockets.get_mut::<tcp::Socket>(h).connect(n.iface.context(), ep, local).is_err() {
         n.sockets.remove(h);
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     {
         let mut s = u.borrow_mut();

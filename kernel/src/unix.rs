@@ -36,7 +36,6 @@ const ESRCH: i64 = 3;
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 const ENOSPC: i64 = 28;
 const EPIPE: i64 = 32;
 const EDOM: i64 = 33;
@@ -469,7 +468,7 @@ fn family(a: &[u8]) -> u16 {
 /// Linux の unix_validate_addr: 長さが sun_family より長く sockaddr_un より短く、family が AF_UNIX
 fn validate(a: &[u8]) -> Result<(), i64> {
     if a.len() <= 2 || a.len() > 110 || family(a) != AF_UNIX {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok(())
 }
@@ -577,7 +576,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
         let (ino, parent, last) = crate::sysfile::bind_sock(&path, mode)?;
         if u.borrow().addr.is_some() {
             crate::sysfile::unbind_sock(&parent, &last);
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         bsd_names().insert(ino.id(), Arc::downgrade(u));
         let mut s = u.borrow_mut();
@@ -588,7 +587,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
     let (net, typ) = {
         let s = u.borrow();
         if s.addr.is_some() {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         (s.net, s.typ)
     };
@@ -609,10 +608,10 @@ pub fn listen(u: &UnixRef, backlog: u32) -> R {
             return Err(-EOPNOTSUPP);
         }
         if s.addr.is_none() {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if s.state != State::Close && s.state != State::Listen {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         s.backlog = backlog as usize;
         s.state = State::Listen;
@@ -666,7 +665,7 @@ pub fn connect(f: &FileRef, u: &UnixRef, a: &[u8]) -> R {
         match u.borrow().state {
             State::Close => {}
             State::Established => return Err(-EISCONN),
-            State::Listen => return Err(-EINVAL),
+            State::Listen => return Err(crate::why::inval()),
         }
         join(u, &other, typ);
         return Ok(0);
@@ -702,7 +701,7 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
 
 fn dgram_connect(u: &UnixRef, a: &[u8]) -> R {
     if a.len() < 2 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let other = if family(a) != AF_UNSPEC {
         validate(a)?;
@@ -770,7 +769,7 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
                 return Err(-EOPNOTSUPP);
             }
             if s.state != State::Listen {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             if s.err != 0 {
                 let e = s.err;
@@ -787,7 +786,7 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
                 return Err(-EAGAIN);
             }
             if s.shutdown & RCV != 0 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
         }
         let timeo = u.borrow().rcvtimeo;
@@ -836,14 +835,14 @@ pub fn scm_parse(b: &[u8]) -> Result<Scm, i64> {
         let typ = i32::from_le_bytes(b[at + 12..at + 16].try_into().unwrap());
         // Linux の CMSG_OK
         if clen < 16 || clen > b.len() - at {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if level == SOL_SOCKET {
             match typ {
                 SCM_RIGHTS => {
                     let n = (clen - 16) / 4;
                     if n > MAX_FDS || scm.fds.len() + n > MAX_FDS {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     for c in b[at + 16..at + 16 + n * 4].chunks_exact(4) {
                         let fd = i32::from_le_bytes(c.try_into().unwrap());
@@ -856,14 +855,14 @@ pub fn scm_parse(b: &[u8]) -> Result<Scm, i64> {
                 }
                 SCM_CREDENTIALS => {
                     if clen != 16 + 12 {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     let w = |o: usize| u32::from_le_bytes(b[at + 16 + o..at + 20 + o].try_into().unwrap());
                     let (pid, uid, gid) = (w(0), w(4), w(8));
                     // Linux の scm_check_creds: uid と gid は見える番号、pid は自分、uid と gid は自分のもの
                     // (root はどれでも)
                     if uid == u32::MAX || gid == u32::MAX {
-                        return Err(-EINVAL);
+                        return Err(crate::why::inval());
                     }
                     let uid = crate::ns::take_uid(uid)?;
                     let gid = crate::ns::take_gid(gid)?;
@@ -878,7 +877,7 @@ pub fn scm_parse(b: &[u8]) -> Result<Scm, i64> {
                     let g = crate::ns::to_global(pid).filter(|&g| g != 0 && crate::proc::find_any(g).is_some()).ok_or(-ESRCH)?;
                     scm.cred = Some((g, uid, gid));
                 }
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             }
         }
         at += (clen + 7) & !7;
@@ -1429,7 +1428,7 @@ fn manage_oob(s: &mut Unix, mut i: usize, peek: bool, copied: bool, dropped: &mu
 /// Linux の unix_stream_read_generic
 fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Recv, i64> {
     if u.borrow().state != State::Established {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if flags & MSG_OOB != 0 {
         return recv_urg(u, max, flags);
@@ -1590,9 +1589,9 @@ fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
         let mut s = u.borrow_mut();
         let id = match s.oob {
             Some(id) if !s.oobinline => id,
-            _ => return Err(-EINVAL),
+            _ => return Err(crate::why::inval()),
         };
-        let Some(mut i) = s.q.iter().position(|m| m.id == id) else { return Err(-EINVAL) };
+        let Some(mut i) = s.q.iter().position(|m| m.id == id) else { return Err(crate::why::inval()) };
         let byte = s.q[i].data.get(s.q[i].used).copied();
         if !peek {
             s.oob = None;
@@ -1788,7 +1787,7 @@ pub fn write(u: &UnixRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
 
 pub fn shutdown(u: &UnixRef, how: u64) -> R {
     if how > 2 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mode = how as u8 + 1;
     let (peer, typ) = {
@@ -2063,7 +2062,7 @@ pub fn poll_keys(u: &UnixRef) -> Vec<usize> {
 pub fn inq(u: &UnixRef) -> Result<usize, i64> {
     let s = u.borrow();
     if s.state == State::Listen {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok(match s.typ {
         SOCK_STREAM => s.inq,
@@ -2234,7 +2233,7 @@ pub fn getsockopt(u: &UnixRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
         return Err(-EOPNOTSUPP);
     }
     if len < 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut s = u.borrow_mut();
     let int = |v: i64| (v as i32).to_le_bytes().to_vec();
@@ -2293,13 +2292,13 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
         return Err(-EOPNOTSUPP);
     }
     if val.len() < 4 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let v = i32::from_le_bytes(val[..4].try_into().unwrap());
     let b = v != 0;
     let to_ns = |val: &[u8]| -> Result<u64, i64> {
         if val.len() < 16 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let sec = i64::from_le_bytes(val[..8].try_into().unwrap());
         let usec = i64::from_le_bytes(val[8..16].try_into().unwrap());
@@ -2349,7 +2348,7 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
             SO_OOBINLINE => s.oobinline = b,
             SO_LINGER => {
                 if val.len() < 8 {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 s.linger = b;
                 if b {

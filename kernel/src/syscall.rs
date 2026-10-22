@@ -19,7 +19,6 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EBADF: i64 = 9;
-const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 const ENODATA: i64 = 61;
 const EOPNOTSUPP: i64 = 95;
@@ -48,10 +47,13 @@ macro_rules! nrs {
 
 nrs! {
     SETXATTR = 5,
+    LSETXATTR = 6,
     FSETXATTR = 7,
     GETXATTR = 8,
+    LGETXATTR = 9,
     FGETXATTR = 10,
     LISTXATTR = 11,
+    LLISTXATTR = 12,
     FLISTXATTR = 13,
     GETCWD = 17,
     FLOCK = 32,
@@ -490,9 +492,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         IOPRIO_SET => Ok(0),
         IOPRIO_GET => Ok(0),
         // xattr は持っていない
-        LISTXATTR..=FLISTXATTR => Ok(0),
-        GETXATTR..=FGETXATTR => Err(-ENODATA),
-        SETXATTR..=FSETXATTR => Err(-EOPNOTSUPP),
+        LISTXATTR | LLISTXATTR | FLISTXATTR => Ok(0),
+        GETXATTR | LGETXATTR | FGETXATTR => Err(-ENODATA),
+        SETXATTR | LSETXATTR | FSETXATTR => Err(-EOPNOTSUPP),
         SPLICE => sysfile::splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
@@ -520,8 +522,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
         KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),
         // tkill / tgkill: 番号が 0 以下なら EINVAL (Linux)
-        TKILL if int(a[0]) <= 0 => Err(-EINVAL),
-        TGKILL if int(a[0]) <= 0 || int(a[1]) <= 0 => Err(-EINVAL),
+        TKILL if int(a[0]) <= 0 => Err(crate::why::inval()),
+        TGKILL if int(a[0]) <= 0 || int(a[1]) <= 0 => Err(crate::why::inval()),
         TKILL => crate::ns::arg_pid(int(a[0])).and_then(|t| signal::tgkill(0, t as u32, a[1] as i32)),
         TGKILL => crate::ns::arg_pid(int(a[0])).and_then(|g| Ok((g, crate::ns::arg_pid(int(a[1]))?))).and_then(|(g, t)| signal::tgkill(g as u32, t as u32, a[2] as i32)),
         RT_SIGSUSPEND => signal::rt_sigsuspend(a[0] as usize),
@@ -565,7 +567,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         GETGROUPS => cred::getgroups(a[0] as usize, a[1] as usize),
         SETGROUPS => cred::setgroups(a[0] as usize, a[1] as usize),
         // 負の pgid は、番号をしらべる前に EINVAL (Linux の setpgid)
-        SETPGID if int(a[1]) < 0 => Err(-EINVAL),
+        SETPGID if int(a[1]) < 0 => Err(crate::why::inval()),
         SETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| Ok((p, crate::ns::arg_pid(int(a[1]))?))).and_then(|(p, g)| signal::setpgid(p as u32, g as u32)),
         SETSID => signal::setsid().map(|s| crate::ns::local_or_0(s as u32) as i64),
         UMASK => {
@@ -594,12 +596,12 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SCHED_SETSCHEDULER => match a[1] & 0xff {
             0 | 3 | 5 => Ok(0),
             1 | 2 => Err(-1),
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         },
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => match a[0] {
             1 | 2 => Ok(if nr == SCHED_GET_PRIORITY_MAX { 99 } else { 1 }),
             0 | 3 | 5 => Ok(0),
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         },
         NANOSLEEP => sys_nanosleep(1, 0, a[0] as usize, a[1] as usize),
         CLOCK_NANOSLEEP => sys_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
@@ -792,7 +794,7 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
 pub fn path_arg(nr: u64) -> Option<usize> {
     use nr::*;
     Some(match nr {
-        CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 => 0,
+        CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 | SETXATTR | LSETXATTR | GETXATTR | LGETXATTR | LISTXATTR | LLISTXATTR => 0,
         OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT => 1,
         SYMLINKAT => 2,
         LINKAT => 3,
@@ -978,7 +980,7 @@ fn sys_gettimeofday(tv: usize) -> R {
 
 fn sys_sethostname(name: usize, len: usize) -> R {
     if len > 64 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut b = [0u8; 64];
     proc::current().pt().copy_in(&mut b[..len], name).ok_or(-14)?;
@@ -996,7 +998,7 @@ pub fn hostname() -> String {
 /// ホスト名を変える (sethostname と /proc/sys/kernel/hostname。root かは呼ぶほうで見る)
 pub fn set_hostname(name: &[u8]) -> Result<(), i64> {
     if name.len() > 64 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     crate::ns::set_hostname(name, false)
 }
@@ -1030,7 +1032,7 @@ fn sys_sysinfo(buf: usize) -> R {
 
 fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
     if len < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     // 動いている CPU すべて
     let bits = (1u64 << crate::smp::online()) - 1;
@@ -1057,7 +1059,7 @@ fn sys_prlimit(resource: u64, new: usize, old: usize) -> R {
         let ncur = u64::from_le_bytes(b[..8].try_into().unwrap());
         let nmax = u64::from_le_bytes(b[8..].try_into().unwrap());
         if ncur > nmax {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         // ハードの上限は上げられない (RLIM_INFINITY は上限そのものとみなす)
         if nmax != INF && nmax > proc::NOFILE as u64 && nmax > max {
@@ -1100,7 +1102,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     const EEXIST: i64 = 17;
     // Linux の順: 位置のそろい (sys_mmap)、fd (ksys_mmap_pgoff: O_PATH は EBADF)、長さ 0 (do_mmap)、許可、写せる種類
     if off % 4096 != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
     let mut path: Option<alloc::string::String> = None;
@@ -1111,7 +1113,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             return Err(-EBADF);
         }
         if len == 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let mode = f.flags & crate::file::O_ACCMODE;
         // 共有で書くなら書けること。それから読めること (O_WRONLY と O_ACCMODE (3) は読めない)
@@ -1132,7 +1134,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             crate::file::Kind::Fb => {
                 let g = crate::gpu::get().ok_or(-ENODEV)?;
                 if off + len > pg_up(g.size()) {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
                 Backing::Pages { pages: g.pages.clone(), off, hold: None }
             }
@@ -1152,7 +1154,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         }
     } else {
         if len == 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         Backing::Anon
     };
@@ -1160,7 +1162,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     let len = pg_up(len);
     let va = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         if addr & 0xfff != 0 {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if flags & MAP_FIXED_NOREPLACE != 0 && (addr..addr + len).step_by(4096).any(|a| m.pt.find(a).is_some()) {
             return Err(-EEXIST);
@@ -1190,7 +1192,7 @@ fn prot_bits(prot: u64) -> u8 {
 
 fn sys_munmap(addr: usize, len: usize) -> R {
     if addr & 0xfff != 0 || len == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     proc::current().pt().unmap(addr, addr + pg_up(len));
     Ok(0)
@@ -1204,7 +1206,7 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     const MREMAP_FIXED: u64 = 2;
     const MREMAP_DONTUNMAP: u64 = 4;
     if old & 0xfff != 0 || new_size == 0 || flags & !7 != 0 || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (old_size, new_size) = (pg_up(old_size), pg_up(new_size));
     let m = proc::current().mm();
@@ -1236,7 +1238,7 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     }
     let dst = if flags & MREMAP_FIXED != 0 {
         if new_addr & 0xfff != 0 || (new_addr < old_end && old < new_addr + new_size) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         m.pt.unmap(new_addr, new_addr + new_size);
         new_addr
@@ -1269,7 +1271,7 @@ fn sys_msync(addr: usize, len: usize, flags: u64) -> R {
     const MS_INVALIDATE: u64 = 2;
     const MS_SYNC: u64 = 4;
     if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || addr & 0xfff != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let end = len.checked_next_multiple_of(4096).and_then(|l| addr.checked_add(l)).ok_or(-ENOMEM)?;
     if end == addr {
@@ -1280,7 +1282,7 @@ fn sys_msync(addr: usize, len: usize, flags: u64) -> R {
 
 fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
     if addr & 0xfff != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map(|_| 0).map_err(|_| -ENOMEM)
 }
@@ -1289,7 +1291,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
 fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
     const MADV_DONTNEED: u64 = 4;
     if addr & 0xfff != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if advice == MADV_DONTNEED {
         proc::current().pt().discard(addr, addr + pg_up(len));
@@ -1302,7 +1304,7 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
 fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {
     const ENOMEM: i64 = 12;
     if addr & 0xfff != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let n = pg_up(len) / 4096;
     let m = proc::current().mm();
@@ -1323,7 +1325,7 @@ fn sys_capget(hdr: usize, data: usize) -> R {
     let ver = u32::from_le_bytes(h[..4].try_into().unwrap());
     if ver != V3 && ver != 0x1998_0330 && ver != 0x2007_1026 {
         pt.copy_out(hdr, &V3.to_le_bytes()).ok_or(-EFAULT)?;
-        return if data == 0 { Ok(0) } else { Err(-EINVAL) };
+        return if data == 0 { Ok(0) } else { Err(crate::why::inval()) };
     }
     if data == 0 {
         return Ok(0);
@@ -1350,7 +1352,7 @@ fn sys_getrandom(buf: usize, len: usize, flags: u32) -> R {
     const GRND_RANDOM: u32 = 2;
     const GRND_INSECURE: u32 = 4;
     if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if flags & (GRND_NONBLOCK | GRND_INSECURE) == GRND_NONBLOCK && !crate::rand::ready() {
         return Err(-EAGAIN);
@@ -1484,7 +1486,7 @@ fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
     const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
     // 版 0 は 64 バイト (tls まで)。知らない後ろのものは 0 でなければならない (Linux と同じ)
     if size < 64 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if size > 4096 {
         return Err(-E2BIG);
@@ -1498,10 +1500,10 @@ fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
     }
     let (flags, exit_signal, stack, stack_size, tls) = (f(0), f(4), f(5) as usize, f(6) as usize, f(7));
     if flags & (CLONE_PIDFD | CLONE_INTO_CGROUP) != 0 || flags & 0xff != 0 || exit_signal > 64 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if (stack == 0) != (stack_size == 0) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let sp = if stack != 0 { stack + stack_size } else { 0 };
     proc::clone(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize)
@@ -1545,7 +1547,7 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
     // Linux の kernel_wait4: 知らない options は EINVAL (WNOHANG、WUNTRACED、WCONTINUED、__WNOTHREAD、__WCLONE、__WALL だけ)
     const ALLOWED: u64 = 1 | 2 | 8 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
     if options & !ALLOWED != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (pid, xstatus) = proc::wait(pid, (options & (1 | 2 | 8)) | proc::WEXITED)?;
     if status != 0 && pid != 0 {
@@ -1573,7 +1575,7 @@ fn sys_getrusage(who: i64, buf: usize) -> R {
         RUSAGE_SELF => proc::group_utime(me.tgid),
         RUSAGE_CHILDREN => proc::find_leader(me.tgid).map_or(0, |l| l.cutime),
         RUSAGE_THREAD => me.utime,
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     let mut b = [0u8; 144];
     b[..16].copy_from_slice(&tick_timeval(t));
@@ -1600,7 +1602,7 @@ fn pidfd_pid(fd: i64) -> Result<u32, i64> {
     let b = f.borrow();
     match b.kind {
         crate::file::Kind::PidFd(pid) => Ok(pid),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
@@ -1609,7 +1611,7 @@ fn sys_pidfd_open(pid: i64, flags: u64) -> R {
     const PIDFD_NONBLOCK: u64 = 0o4000;
     const ESRCH: i64 = 3;
     if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if proc::find_leader(pid as u32).is_none() {
         return Err(-ESRCH);
@@ -1642,18 +1644,18 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
     // Linux の kernel_waitid の順: 知らない options、WEXITED / WSTOPPED / WCONTINUED のどれもない、idtype と id
     const ALLOWED: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | proc::WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
     if options & !ALLOWED != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let pid = match idtype {
         P_ALL => -1,
         P_PID if id > 0 => crate::ns::arg_pid(id).map_err(|_| -10)?,
-        P_PGID if id < 0 => return Err(-EINVAL),
+        P_PGID if id < 0 => return Err(crate::why::inval()),
         P_PGID => if id == 0 { 0 } else { crate::ns::arg_pid(-id).map_err(|_| -10)? },
         P_PIDFD => pidfd_pid(id)? as i64,
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     // wait4 の WUNTRACED は WSTOPPED と同じ値
     let (cpid, st) = proc::wait(pid, options & (WNOHANG | WSTOPPED | WEXITED | WCONTINUED | proc::WNOWAIT))?;
@@ -1704,7 +1706,7 @@ fn sys_finit_module(fd: u64) -> R {
 
 fn sys_delete_module(name: usize) -> R {
     let name = proc::current().pt().copy_in_str(name, 64).ok_or(-EFAULT)?;
-    crate::module::unload(core::str::from_utf8(&name).map_err(|_| -EINVAL)?)
+    crate::module::unload(core::str::from_utf8(&name).map_err(|_| crate::why::inval())?)
 }
 
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
@@ -1719,12 +1721,12 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
     const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
     if magic1 != MAGIC1 || !MAGIC2.contains(&magic2) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let fid = match cmd {
         CMD_POWER_OFF | CMD_HALT => PSCI_SYSTEM_OFF,
         CMD_RESTART => PSCI_SYSTEM_RESET,
-        _ => return Err(-EINVAL),
+        _ => return Err(crate::why::inval()),
     };
     crate::vfs::sync_all();
     println!("aios: {}", if fid == PSCI_SYSTEM_OFF { "power off" } else { "restart" });
@@ -1760,7 +1762,7 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize) -> R {
         PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
         PR_GET_SECCOMP => return Ok(crate::seccomp::mode(&p.cred).0 as i64),
         // seccomp を切っていれば (aios.off=seccomp)、入れずに作った Linux と同じ EINVAL
-        PR_SET_SECCOMP if crate::parts::off(crate::parts::Part::Seccomp) => return Err(-EINVAL),
+        PR_SET_SECCOMP if crate::parts::off(crate::parts::Part::Seccomp) => return Err(crate::why::inval()),
         PR_SET_SECCOMP => return crate::seccomp::prctl_set(arg as u64, arg3),
         PR_SET_NAME => {
             let mut b = [0u8; 16];

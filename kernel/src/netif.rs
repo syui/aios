@@ -24,7 +24,6 @@ const SIOCGIFINDEX: u64 = 0x8933;
 const EPERM: i64 = 1;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
-const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
 const EADDRNOTAVAIL: i64 = 99;
 
@@ -118,13 +117,13 @@ pub fn ioctl(req: u64, arg: usize) -> R {
         let flags = u16::from_le_bytes([rt[56], rt[57]]);
         // デフォルトの経路 (0.0.0.0/0) だけ
         if dst != Ipv4Address::UNSPECIFIED || mask != Ipv4Address::UNSPECIFIED {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if req == SIOCDELRT {
             net::set_gateway(None);
         } else {
             if flags & RTF_GATEWAY == 0 || gw == Ipv4Address::UNSPECIFIED {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             net::set_gateway(Some(gw));
         }
@@ -171,7 +170,7 @@ pub fn ioctl(req: u64, arg: usize) -> R {
         }
         SIOCSIFNETMASK => {
             root()?;
-            let p = prefix_of(addr_of(&r[16..32])).ok_or(-EINVAL)?;
+            let p = prefix_of(addr_of(&r[16..32])).ok_or_else(|| crate::why::inval())?;
             let c = cidr.ok_or(-EADDRNOTAVAIL)?;
             net::set_addr(c.address(), Some(p));
             return Ok(0);

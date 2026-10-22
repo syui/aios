@@ -2500,7 +2500,7 @@ impl ExtInode {
         fs.check_rw()?;
         let mut r = self.raw()?;
         if r.mode() & S_IFMT != S_IFREG {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         fs.flush()?;
         let per = PGSIZE / fs.bsize;
@@ -2511,11 +2511,11 @@ impl ExtInode {
         for pg in 0..pages {
             let first = fs.map_any(self.ino, &mut r, pg * per as u64)?;
             if first == 0 {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             for k in 1..per as u64 {
                 if fs.map_any(self.ino, &mut r, pg * per as u64 + k)? != first + k {
-                    return Err(-EINVAL);
+                    return Err(crate::why::inval());
                 }
             }
             blocks.extend(first..first + per as u64);
@@ -2679,7 +2679,7 @@ impl ExtInode {
     fn unlink_node(&self, name: &str, rmdir: bool) -> Result<(), i64> {
         self.dir_only()?;
         if name == "." || name == ".." {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let fs = &self.fs;
         let child = fs.find(self.ino, name)?;
@@ -2721,7 +2721,7 @@ impl ExtInode {
         let r = fs.read_inode(child)?;
         let is_dir = r.mode() & S_IFMT == S_IFDIR;
         if is_dir && fs.is_under(nd, child)? {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if let Ok(existing) = fs.find(nd, new) {
             if existing == child {
@@ -2755,7 +2755,7 @@ impl ExtInode {
         let (am, bm) = (fs.read_inode(a)?.mode(), fs.read_inode(b)?.mode());
         let (adir, bdir) = (am & S_IFMT == S_IFDIR, bm & S_IFMT == S_IFDIR);
         if (adir && fs.is_under(nd, a)?) || (bdir && fs.is_under(self.ino, b)?) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         fs.set_entry(self.ino, old, b, bm)?;
         fs.set_entry(nd, new, a, am)?;
@@ -2837,7 +2837,7 @@ impl Inode for ExtInode {
         match r.mode() & S_IFMT {
             S_IFREG => self.fs.read_data_raw(self.ino, r, off, buf),
             S_IFDIR => Err(-EISDIR),
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         }
     }
 
@@ -3001,7 +3001,7 @@ impl Inode for ExtInode {
             match r.mode() & S_IFMT {
                 S_IFREG => {}
                 S_IFDIR => return Err(-EISDIR),
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             }
             size0 = r.size() as usize;
             let before = r.clone();
@@ -3144,7 +3144,7 @@ impl Inode for ExtInode {
         let _p = crate::prof::span("extfs:readlink");
         let r = self.raw()?;
         if r.mode() & S_IFMT != S_IFLNK {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let size = r.size() as usize;
         if is_fast_symlink(&r) {

@@ -8,7 +8,6 @@ use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
 const EBADF: i64 = 9;
@@ -74,7 +73,7 @@ fn wake(t: &TimerRef) {
 
 pub fn create(clock: u64, flags: u64) -> Result<i64, i64> {
     if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM) || flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), next: 0, interval: 0, ticks: 0, generation: 0 }));
     let fl = file::O_RDWR | if flags & TFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
@@ -87,7 +86,7 @@ fn timer_of(fd: u64) -> Result<TimerRef, i64> {
     let k = f.borrow();
     match &k.kind {
         Kind::TimerFd(t) => Ok(t.clone()),
-        _ => Err(-EINVAL),
+        _ => Err(crate::why::inval()),
     }
 }
 
@@ -96,7 +95,7 @@ fn ts_ns(b: &[u8]) -> Result<u64, i64> {
     let s = i64::from_le_bytes(b[0..8].try_into().unwrap());
     let ns = i64::from_le_bytes(b[8..16].try_into().unwrap());
     if s < 0 || !(0..1_000_000_000).contains(&ns) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     Ok((s as u64).saturating_mul(1_000_000_000).saturating_add(ns as u64))
 }
@@ -161,7 +160,7 @@ pub fn gettime(fd: u64, cur: usize) -> Result<i64, i64> {
 
 pub fn read(t: &TimerRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     if dst.len() < 8 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     loop {
         let deadline = {

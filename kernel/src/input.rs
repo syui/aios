@@ -114,9 +114,8 @@ pub fn readable(n: usize) -> bool {
 /// 溜まっているイベントを dst へ (24 バイトずつ)。なければ待つ (nonblock なら EAGAIN)
 pub fn read(n: usize, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     const EAGAIN: i64 = 11;
-    const EINVAL: i64 = 22;
     if dst.len() < 24 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     loop {
         let d = devs().get_mut(n).ok_or(-19)?;

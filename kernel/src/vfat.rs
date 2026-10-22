@@ -442,7 +442,7 @@ impl FatFs {
     /// dir に name のエントリ (LFN + 短い名前) を作る。短い名前のエントリの位置を返す
     fn add_entry(&self, dir: u32, name: &str, attr: u8, cluster: u32, size: u32) -> Result<usize, i64> {
         if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         let existing: Vec<[u8; 11]> = self.list(dir)?.iter().map(|(_, _, e, _)| e[..11].try_into().unwrap()).collect();
         let (short, case, need_lfn) = make_short(name, &existing);
@@ -788,7 +788,7 @@ impl Inode for FatNode {
     }
 
     fn readlink(&self) -> Result<String, i64> {
-        Err(-EINVAL)
+        Err(crate::why::inval())
     }
 
     fn lookup(&self, name: &str) -> Result<InodeRef, i64> {

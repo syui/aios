@@ -27,7 +27,6 @@ pub const BATCH: usize = 256;
 const EPERM: i64 = 1;
 const ENOMEM: i64 = 12;
 const EBUSY: i64 = 16;
-const EINVAL: i64 = 22;
 
 /// スロットの番号: 区画の番号 << 32 | 区画の中のページ
 pub type Slot = u64;
@@ -99,12 +98,12 @@ pub fn on(src: Source, name: String) -> Result<(), i64> {
     let (part, map, file, max) = match src {
         Source::Part(p) => (p, Vec::new(), None, p.len as usize * SECTOR / PGSIZE),
         Source::File(ino) => {
-            let ext = ino.as_any().downcast_ref::<crate::extfs::ExtInode>().ok_or(-EINVAL)?;
+            let ext = ino.as_any().downcast_ref::<crate::extfs::ExtInode>().ok_or_else(|| crate::why::inval())?;
             let map = ext.swap_map()?;
             let max = map.last().map_or(0, |&(p, _, n)| (p + n) as usize);
             // ファイルのページは、はじめから穴なくつづいている
             if map.first().is_none_or(|&(p, _, _)| p != 0) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             (block::root(), map, Some(ino), max)
         }
@@ -113,11 +112,11 @@ pub fn on(src: Source, name: String) -> Result<(), i64> {
     let mut h = vec![0u8; PGSIZE];
     block::read_part(&a.part, sector_of_page(&a, 0), &mut h)?;
     if &h[PGSIZE - 10..] != b"SWAPSPACE2" || u32_at(&h, 1024) != 1 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let pages = (u32_at(&h, 1028) as usize + 1).min(max);
     if pages < 2 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let mut refs = vec![0u16; pages];
     refs[0] = BAD;
@@ -140,7 +139,7 @@ pub fn on(src: Source, name: String) -> Result<(), i64> {
 
 /// swapoff: 追い出したページをぜんぶ読み戻してから外す
 pub fn off(src: &Source) -> Result<(), i64> {
-    let i = areas().iter().position(|a| a.as_ref().is_some_and(|a| a.key == key(src))).ok_or(-EINVAL)?;
+    let i = areas().iter().position(|a| a.as_ref().is_some_and(|a| a.key == key(src))).ok_or_else(|| crate::why::inval())?;
     areas()[i].as_mut().unwrap().draining = true;
     let mut ok = true;
     crate::proc::each_pagetable(|pt| {
@@ -226,7 +225,7 @@ pub static PSWPOUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// スロットからページ (カーネルの仮想アドレス) へ読む
 pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
     PSWPIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let a = area(slot).ok_or(-EINVAL)?;
+    let a = area(slot).ok_or_else(|| crate::why::inval())?;
     let buf = unsafe { core::slice::from_raw_parts_mut(page, PGSIZE) };
     block::read_part(&a.part, sector_of(a, slot), buf)
 }
@@ -234,7 +233,7 @@ pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
 /// ページをスロットへ書く
 pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
     PSWPOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let a = area(slot).ok_or(-EINVAL)?;
+    let a = area(slot).ok_or_else(|| crate::why::inval())?;
     let buf = unsafe { core::slice::from_raw_parts(page, PGSIZE) };
     block::write_part(&a.part, sector_of(a, slot), buf)
 }

@@ -56,7 +56,6 @@ const ESRCH: i64 = 3;
 const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 
 type R = Result<i64, i64>;
 
@@ -576,14 +575,14 @@ fn read_u64(va: usize) -> Result<u64, i64> {
 
 pub fn rt_sigaction(sig: usize, act: usize, oact: usize) -> R {
     if sig == 0 || sig >= NSIG {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let p = proc::current();
-    let table = p.sigacts.as_ref().ok_or(-EINVAL)?.get();
+    let table = p.sigacts.as_ref().ok_or_else(|| crate::why::inval())?.get();
     let old = table[sig];
     if act != 0 {
         if sig == SIGKILL as usize || sig == SIGSTOP as usize {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         // struct k_sigaction { handler, flags, restorer, mask }
         let mut b = [0u8; 32];
@@ -618,7 +617,7 @@ pub fn rt_sigprocmask(how: u64, set: usize, oset: usize) -> R {
             SIG_BLOCK => old | s,
             SIG_UNBLOCK => old & !s,
             SIG_SETMASK => s,
-            _ => return Err(-EINVAL),
+            _ => return Err(crate::why::inval()),
         } & !UNBLOCKABLE;
     }
     if oset != 0 {
@@ -782,7 +781,7 @@ pub fn kill(pid: i64, sig: i32) -> R {
     for tgid in targets {
         let Some(leader) = proc::find_leader_any(tgid) else { continue };
         if bad_sig {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
         if !can_signal(leader) {
             denied = true;
@@ -817,7 +816,7 @@ pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
         return Err(-ESRCH);
     }
     if !(0..NSIG as i32).contains(&sig) {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     if !can_signal(t) {
         return Err(-EPERM);
@@ -854,7 +853,7 @@ fn timespec(ns: u64) -> [u8; 16] {
 /// setitimer(ITIMER_REAL): 期限が来たら SIGALRM
 pub fn setitimer(which: u64, new: usize, old: usize) -> R {
     if which != 0 {
-        return Err(-EINVAL); // ITIMER_VIRTUAL/PROF はない
+        return Err(crate::why::inval()); // ITIMER_VIRTUAL/PROF はない
     }
     let leader = proc::current_leader();
     if old != 0 {
@@ -873,7 +872,7 @@ pub fn setitimer(which: u64, new: usize, old: usize) -> R {
 
 pub fn getitimer(which: u64, cur: usize) -> R {
     if which != 0 {
-        return Err(-EINVAL);
+        return Err(crate::why::inval());
     }
     let (deadline, interval) = proc::current_leader().itimer;
     let left = if deadline == 0 { 0 } else { ticks_to_ns(deadline.saturating_sub(crate::timer::ticks())) };
@@ -905,7 +904,7 @@ pub fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
         notify = i32::from_le_bytes(b[12..16].try_into().unwrap());
         tid = u32::from_le_bytes(b[16..20].try_into().unwrap());
         if !matches!(notify, SIGEV_SIGNAL | SIGEV_NONE | SIGEV_THREAD_ID) || (notify != SIGEV_NONE && !(1..NSIG as i32).contains(&signo)) {
-            return Err(-EINVAL);
+            return Err(crate::why::inval());
         }
     }
     let leader = proc::current_leader();
@@ -919,7 +918,7 @@ pub fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
 }
 
 fn timer_of(id: i32) -> Result<&'static mut PosixTimer, i64> {
-    proc::current_leader().timers.iter_mut().find(|t| t.id == id).ok_or(-EINVAL)
+    proc::current_leader().timers.iter_mut().find(|t| t.id == id).ok_or_else(|| crate::why::inval())
 }
 
 pub fn timer_settime(id: i32, flags: u64, new: usize, old: usize) -> R {
@@ -961,7 +960,7 @@ pub fn timer_delete(id: i32) -> R {
     let l = proc::current_leader();
     let before = l.timers.len();
     l.timers.retain(|t| t.id != id);
-    if l.timers.len() == before { Err(-EINVAL) } else { Ok(0) }
+    if l.timers.len() == before { Err(crate::why::inval()) } else { Ok(0) }
 }
 
 /// タイマ割り込みから: 期限の来た itimer と POSIX タイマーを鳴らす

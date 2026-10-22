@@ -17,7 +17,6 @@ const EAGAIN: i64 = 11;
 const EPERM: i64 = 1;
 const ENOTTY: i64 = 25;
 const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 
 // c_iflag
 const ISTRIP: u32 = 0o40;
@@ -878,7 +877,7 @@ pub fn ioctl(tty: &TtyRef, master: bool, req: u64, arg: usize) -> Result<i64, i6
                 0 => (true, false),
                 1 => (false, true),
                 2 => (true, true),
-                _ => return Err(-EINVAL),
+                _ => return Err(crate::why::inval()),
             };
             // 親から見ると入出力が逆
             let (inq, outq) = if master { (outq, inq) } else { (inq, outq) };
@@ -987,7 +986,7 @@ pub fn ioctl(tty: &TtyRef, master: bool, req: u64, arg: usize) -> Result<i64, i6
         TIOCSIG if master => {
             let sig = arg as i32;
             if !(1..64).contains(&sig) {
-                return Err(-EINVAL);
+                return Err(crate::why::inval());
             }
             let pg = tty.borrow().pgrp;
             send(pg, sig);

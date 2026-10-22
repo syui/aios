@@ -739,7 +739,7 @@ impl Inode for ProcInode {
                 let id = if kind == "pid" { l.pid_ns.as_ref().map_or(crate::ns::INIT_PID, |n| n.id) } else { ns_id(&l.cred, kind) };
                 Ok(format!("{}:[{}]", if kind == "pid_for_children" { "pid" } else { kind }, id))
             }
-            _ => Err(-EINVAL),
+            _ => Err(crate::why::inval()),
         }
     }
 

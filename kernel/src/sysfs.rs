@@ -212,7 +212,7 @@ impl Inode for SysInode {
     }
 
     fn readlink(&self) -> Result<String, i64> {
-        Err(-EINVAL)
+        Err(crate::why::inval())
     }
 
     fn lookup(&self, name: &str) -> Result<InodeRef, i64> {
