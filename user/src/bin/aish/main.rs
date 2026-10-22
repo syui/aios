@@ -27,6 +27,7 @@ mod trap;
 mod parse;
 mod plugin;
 mod printf;
+mod why;
 
 use expand::Mode;
 use jobs::{exit_code, interactive, jobs};
@@ -137,7 +138,7 @@ const BUILTINS: &[&str] = &[
     ":", "true", "false", "[[", "setopt", "unsetopt", "typeset", "declare", "readonly", "zmodload", "zstyle", "autoload", "compinit", "compdef", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read", "local", "eval", ".", "source", "echo", "test", "[", "return",
     "break", "continue", "exec", "command", "type", "umask", "jobs", "fg", "bg", "wait", "alias", "unalias", "plugin", "bindkey", "trap", "tool", "hash",
     "let", "mapfile", "readarray", "getopts", "pushd", "popd", "dirs", "shopt", "compgen",
-    "builtin", "ulimit", "printf",
+    "builtin", "ulimit", "printf", "why",
 ];
 
 fn is_builtin(args: &[String]) -> bool {
@@ -186,7 +187,11 @@ impl Shell {
             funcs: HashMap::new(),
             params,
             status: 0,
-            pid: std::process::id() as i32,
+            pid: {
+                let pid = std::process::id() as i32;
+                why::set_shell(pid);
+                pid
+            },
             errexit: false,
             nounset: false,
             xtrace: false,
@@ -1596,6 +1601,7 @@ impl Shell {
                     }
                 }
             }
+            "why" => why::builtin(a),
             "umask" => {
                 match a.first() {
                     None => {
@@ -2626,6 +2632,7 @@ fn apply_redir(fd: i32, t: &RT) -> bool {
                 let f = libc::open(p.as_ptr(), *flags, 0o666);
                 if f < 0 {
                     eprintln!("{}: {}: {}", shell_name(), path, last_err());
+                    crate::why::after_self(path);
                     return false;
                 }
                 if f != fd {

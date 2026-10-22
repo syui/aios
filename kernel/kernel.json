@@ -56,6 +56,7 @@
   {"name": "prof", "type": "extra", "src": "src/prof.rs", "what": "調べもの用: カーネルの中の区間ごとの回数と時間 (/proc/ai/ctl の prof on、/proc/ai/prof)"},
   {"name": "fail", "type": "extra", "src": "src/fail.rs", "what": "調べもの用: わざとしくじらせる (フォルト注入): あるプロセスのシステムコールを -ERRNO に、カーネルのヒープ (heap: 耐えるところ、oom: 耐えないところ) や物理ページを取れないことに (/proc/ai/ctl の fail、/proc/ai/fail。aish の fail)"},
   {"name": "trace", "type": "extra", "src": "src/trace.rs", "what": "調べもの用: カーネルの中の出来事 (システムコールの入りと出、スレッドの切りかえ、眠りと起こし、割り込み、ディスクの読み書き、ページフォルト、exec と exit) の記録 (/proc/ai/ctl の trace on、/proc/ai/trace。aish の trace)"},
+  {"name": "why", "type": "extra", "src": "src/why.rs", "what": "しくじったわけ: システムコールが errno を返したとき、Linux と同じ errno のほかに、なぜそうなったか (パスのどこで止まったか、どの許しが足りなかったか、seccomp や landlock、fail、ないシステムコール) を残す。errno もふるまいも変えない (/proc/ai/why。aish はコマンドがしくじったときに 1 行出し、why でみな)"},
   {"name": "sd", "type": "extra", "src": "src/sd.rs", "what": "SD カード (SDHCI, PIO で待つだけの簡単なもの)"},
   {"name": "seccomp", "type": "extra", "src": "src/seccomp.rs", "what": "seccomp: プロセスが使えるシステムコールをしぼる (Linux と同じ番号と形)", "off": "seccomp が ENOSYS、prctl(PR_SET_SECCOMP) が EINVAL"},
   {"name": "socket", "type": "extra", "src": "src/socket.rs", "what": "BSD ソケットのシステムコール: AF_UNIX (unix.rs) と AF_INET の TCP と UDP (inet.rs) に分ける。ICMP (ping) と SOCK_RAW は smoltcp のソケット", "bench": "test/netbench.c (aish の bench の kind net。/proc/ai/prof の socket:*、inet:*、unix:*。記録は bench/net.md)"},

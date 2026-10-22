@@ -334,6 +334,8 @@ pub struct Proc {
     chan: usize,
     /// 最後に呼んだシステムコールの番号と最初の 2 つの引数 (/proc/threads で見る)
     pub last_sys: (u64, u64, u64),
+    /// いまのシステムコールがしくじったわけ (why.rs。/proc/ai/why)
+    pub why: crate::why::Note,
     /// 最後の例外 (pc、アドレス、ESR の EC)。シグナルで落ちたときに出す
     pub last_fault: (u64, u64, u64),
     /// 最後に落ちたときの ESR (調べもの用: WnR、CM など)
@@ -405,6 +407,7 @@ impl Proc {
         cutime: 0,
         chan: 0,
         last_sys: (0, 0, 0),
+        why: crate::why::NONE,
         last_fault: (0, 0, 0),
         last_esr: 0,
         last_lr: 0,
@@ -620,6 +623,11 @@ fn live() -> impl Iterator<Item = &'static mut Proc> {
 pub fn current() -> &'static mut Proc {
     let i = cur().expect("no current proc");
     &mut procs()[i]
+}
+
+/// いまのスレッド (起動のときやアイドルなら None)
+pub fn try_current() -> Option<&'static mut Proc> {
+    cur().map(|i| &mut procs()[i])
 }
 
 /// いまのプロセスの資格情報。まだプロセスがなければ root

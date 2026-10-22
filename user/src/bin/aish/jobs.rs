@@ -20,6 +20,8 @@ pub struct Job {
     pub notified: bool,
     /// 止まったときの端末の設定 (fg で戻す)
     pub tmodes: Option<libc::termios>,
+    /// 始めた時刻 (why.rs: pid は使いまわされるので、これよりあとのわけだけ)
+    pub start: std::time::Instant,
 }
 
 static mut JOBS: Vec<Job> = Vec::new();
@@ -86,7 +88,9 @@ pub fn foreground(idx: usize) -> i32 {
             JobState::Done(s) => {
                 let all: Vec<i32> = j.pids.iter().map(|(_, s)| s.unwrap_or(0)).collect();
                 unsafe { *(&raw mut PIPESTATUS) = all };
+                let (pids, start, cmd): (Vec<i32>, _, String) = (j.pids.iter().map(|(p, _)| *p).collect(), j.start, j.cmd.clone());
                 jobs().remove(idx);
+                crate::why::after_job(&pids, start, s, &cmd);
                 break s;
             }
             JobState::Stopped => {
@@ -314,7 +318,7 @@ pub fn add_job(pgid: i32, pids: Vec<i32>, text: &str, bg: bool) -> i32 {
     }
     let id = jobs().iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let last_pid = *pids.last().unwrap();
-    jobs().push(Job { id, pgid, pids: pids.into_iter().map(|p| (p, None)).collect(), cmd: text.to_string(), state: JobState::Running, notified: true, tmodes: None });
+    jobs().push(Job { id, pgid, pids: pids.into_iter().map(|p| (p, None)).collect(), cmd: text.to_string(), state: JobState::Running, notified: true, tmodes: None, start: std::time::Instant::now() });
     if bg {
         unsafe { LAST_BG = last_pid };
         if interactive() {

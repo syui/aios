@@ -73,6 +73,7 @@ mod virtio_net;
 mod virtio_rng;
 mod vdso;
 mod vm;
+mod why;
 
 use core::panic::PanicInfo;
 

@@ -339,6 +339,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     let p = proc::current();
     p.orig_x0 = a[0];
     p.last_sys = (nr, a[0], a[1]);
+    p.why.clear();
     count(nr);
     // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
     crate::oom::check();
@@ -351,6 +352,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 tf.x[0] = e as u64;
                 crate::trace::sys_exit(nr, e);
                 strace(nr, &a, Err(e));
+                crate::why::note(crate::why::Code::Seccomp, e, 0);
+                crate::why::done(nr, e, &a);
                 return None;
             }
             crate::seccomp::Verdict::Trap(errno) => {
@@ -372,6 +375,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         tf.x[0] = (-ENOSYS) as u64;
         crate::trace::sys_exit(nr, -ENOSYS);
         strace(nr, &a, Err(-ENOSYS));
+        crate::why::note(crate::why::Code::PartOff, -ENOSYS, 0);
+        crate::why::done(nr, -ENOSYS, &a);
         return None;
     }
     // わざとしくじらせる (/proc/ai/ctl の fail。fail.rs): 決まりに合えば、動かさずにその errno
@@ -379,6 +384,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         tf.x[0] = (-e) as u64;
         crate::trace::sys_exit(nr, -e);
         strace(nr, &a, Err(-e));
+        crate::why::note(crate::why::Code::Injected, -e, 0);
+        crate::why::done(nr, -e, &a);
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
@@ -636,12 +643,19 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 let p = proc::current();
                 println!("syscall: unknown {} by {} (pid {}; ENOSYS, shown once per number)", n, p.comm(), p.pid);
             }
+            crate::why::note(crate::why::Code::NoSys, -ENOSYS, n);
             Err(-ENOSYS)
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
     strace(nr, &a, r);
+    // しくじったわけ (why.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
+    if let Err(e) = r
+        && nr != RSEQ
+    {
+        crate::why::done(nr, e, &a);
+    }
     // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
     crate::unix::gc_check(false);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
@@ -774,8 +788,20 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
     crate::kmsg::push(&line);
 }
 
+/// システムコールのパスの引数の番号 (why.rs: わけにパスがなければ、プログラムがたのんだパスをつける)
+pub fn path_arg(nr: u64) -> Option<usize> {
+    use nr::*;
+    Some(match nr {
+        CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 => 0,
+        OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT => 1,
+        SYMLINKAT => 2,
+        LINKAT => 3,
+        _ => return None,
+    })
+}
+
 /// strace で見せるためのユーザーの文字列 (NUL まで、max バイトまで。読めなければ "?")
-fn user_str(va: usize, max: usize) -> alloc::string::String {
+pub fn user_str(va: usize, max: usize) -> alloc::string::String {
     let pt = proc::current().pt();
     let mut b = Vec::new();
     for i in 0..max {

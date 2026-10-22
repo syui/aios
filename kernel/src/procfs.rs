@@ -107,6 +107,8 @@ enum Node {
     AiFail,
     AiFdDir,
     AiFd(u32),
+    /// /proc/ai/why: しくじったシステムコールのわけ (why.rs)
+    AiWhy,
     /// /proc/ai/stack と stack/TID (スレッドの番号)
     AiStackDir,
     AiStack(u32),
@@ -218,6 +220,7 @@ impl ProcInode {
             Node::AiFail => 53,
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
+            Node::AiWhy => 54,
             Node::AiStackDir => 45,
             Node::AiStack(t) => (t as u64) << 16 | 31,
         }
@@ -296,6 +299,7 @@ impl ProcInode {
             Node::AiParts => crate::parts::json(),
             Node::AiFail => crate::fail::json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
+            Node::AiWhy => crate::why::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
             Node::Kmsg => crate::kmsg::text(),
@@ -637,6 +641,10 @@ impl Inode for ProcInode {
             }
             return Ok(crate::trace::read_at(off, buf));
         }
+        // /proc/ai/why も大きい: 同じように
+        if self.node == Node::AiWhy {
+            return Ok(crate::why::read_at(off, buf, if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }));
+        }
         let s = self.content()?;
         let b = s.as_bytes();
         if off >= b.len() {
@@ -771,6 +779,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "parts") => Node::AiParts,
             (Node::AiDir, "fail") => Node::AiFail,
             (Node::AiDir, "fd") => Node::AiFdDir,
+            (Node::AiDir, "why") => Node::AiWhy,
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
                 let t = num.ok_or(-ENOENT)?;
@@ -885,6 +894,7 @@ impl Inode for ProcInode {
                 add("fail".into(), Node::AiFail);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
+                add("why".into(), Node::AiWhy);
             }
             Node::AiFdDir | Node::AiStackDir if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStackDir => {

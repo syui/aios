@@ -528,12 +528,17 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
             if !e.gates.is_empty() {
                 let cred = crate::proc::current_cred_ref();
                 for g in &e.gates {
-                    cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X)?;
+                    if let Err(err) = cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X) {
+                        // どのディレクトリかは覚えていないので、わけ (why.rs) のために 1 つずつたどりなおす (しくじる道だけ)
+                        let mut t = Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() };
+                        let p = norm.clone();
+                        return Err(walk(None, p, follow, &mut t).err().unwrap_or(err));
+                    }
                 }
             }
             return match &e.found {
                 Some((walked, ino)) => Ok(f(walked, ino)),
-                None => Err(-ENOENT),
+                None => Err(crate::why::missing_cached(norm)),
             };
         }
         Some((false, _)) => true,
@@ -1036,7 +1041,7 @@ fn simple(path: &str) -> bool {
 fn found(r: Resolved) -> Result<(String, InodeRef), i64> {
     match r {
         Resolved::Found(p, i) => Ok((p, i)),
-        Resolved::Missing(..) => Err(-ENOENT),
+        Resolved::Missing(_, w, c) => Err(crate::why::at(-ENOENT, &w, &c)),
     }
 }
 
@@ -1056,19 +1061,19 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
         t.ok &= cur.path_cacheable();
         for (i, c) in comps.iter().enumerate() {
             if !m.is_dir() {
-                return Err(-ENOTDIR);
+                return Err(crate::why::at(-ENOTDIR, &walked, ""));
             }
             // ディレクトリを通るには x が要る
-            cred.check(&m, crate::cred::X)?;
+            cred.check(&m, crate::cred::X).map_err(|e| crate::why::at(e, &walked, ""))?;
             if m.mode & 0o111 != 0o111 {
                 t.gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
             }
             t.dirs.push(Pass::new(cur.id(), c));
             // 長すぎる名前は、引くところで (Linux のファイルシステムの lookup と同じ)
             if c.len() > 255 {
-                return Err(-ENAMETOOLONG);
+                return Err(crate::why::at(-ENAMETOOLONG, &walked, c));
             }
-            let next = cross(cur.lookup(c)?);
+            let next = cross(cur.lookup(c).map_err(|e| crate::why::at(e, &walked, c))?);
             t.ok &= next.path_cacheable();
             let last = i + 1 == comps.len();
             let nm = next.meta();
@@ -1091,7 +1096,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                 }
                 let target = next.readlink()?;
                 if target.is_empty() {
-                    return Err(-ENOENT);
+                    return Err(crate::why::at(-ENOENT, &walked, c));
                 }
                 // .. のあるリンクや、/ で終わるリンク: 文字の上で畳まず、いまのディレクトリから 1 つずつ (覚えない)
                 let mut rest = target.clone();
@@ -1131,7 +1136,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
         }
         return Ok((walked, cur));
     }
-    Err(-ELOOP)
+    Err(crate::why::at(-ELOOP, &path, ""))
 }
 
 pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<InodeRef, i64> {
@@ -1388,10 +1393,10 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
         let (w, cur) = stack.last().map(|s| (s.0.clone(), s.1.clone())).unwrap();
         let m = cur.meta();
         if !m.is_dir() {
-            return Err(-ENOTDIR);
+            return Err(crate::why::at(-ENOTDIR, &w, ""));
         }
         // ディレクトリを通るには x が要る (. と .. も。Linux と同じ)
-        cred.check(&m, crate::cred::X)?;
+        cred.check(&m, crate::cred::X).map_err(|e| crate::why::at(e, &w, ""))?;
         if c == "." {
             continue;
         }
@@ -1422,12 +1427,12 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
             return Err(-EISDIR);
         }
         if c.len() > 255 {
-            return Err(-ENAMETOOLONG);
+            return Err(crate::why::at(-ENAMETOOLONG, &w, &c));
         }
         let raw = match cur.lookup(&c) {
             Ok(r) => r,
             Err(e) if e == -ENOENT && last => return Ok(Resolved::Missing(cur, w, c)),
-            Err(e) => return Err(e),
+            Err(e) => return Err(crate::why::at(e, &w, &c)),
         };
         let next = cross(raw.clone());
         let crossed = next.id() != raw.id();
@@ -1436,11 +1441,11 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
         }
         if next.meta().mode & S_IFMT == S_IFLNK && (!last || follow) {
             if no_symlinks {
-                return Err(-ELOOP);
+                return Err(crate::why::at(-ELOOP, &w, &c));
             }
             links += 1;
             if links > 40 {
-                return Err(-ELOOP);
+                return Err(crate::why::at(-ELOOP, &w, &c));
             }
             if let Some((p, ino)) = next.magic_link() {
                 if no_magic {

@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 const EINVAL: i64 = 22;
-const EACCES: i64 = 13;
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
@@ -97,7 +96,7 @@ fn domain() -> Option<Domain> {
 /// path (先頭 / なし、リンクをたどったあと) に access ができるか。できなければ -EACCES
 pub fn check_fs(path: &str, access: u64) -> Result<(), i64> {
     match domain() {
-        Some(d) if !d.iter().all(|r| r.allows_fs(path, access)) => Err(-EACCES),
+        Some(d) if !d.iter().all(|r| r.allows_fs(path, access)) => Err(crate::why::landlock(access, false, path)),
         _ => Ok(()),
     }
 }
@@ -123,7 +122,7 @@ pub fn make_right(mode: u32) -> u64 {
 /// TCP の口 (bind / connect) に access ができるか。できなければ -EACCES
 pub fn check_net(port: u16, access: u64) -> Result<(), i64> {
     match domain() {
-        Some(d) if !d.iter().all(|r| r.allows_net(port, access)) => Err(-EACCES),
+        Some(d) if !d.iter().all(|r| r.allows_net(port, access)) => Err(crate::why::landlock(access, true, &alloc::format!("port {}", port))),
         _ => Ok(()),
     }
 }

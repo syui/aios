@@ -1469,7 +1469,9 @@ pub fn faccessat(dirfd: i64, pathp: usize, mode: u64, flags: u64) -> R {
     const AT_EACCESS: u64 = 0x200;
     let ino = at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
     let want = (mode & 7) as u32;
-    if want != 0 && !cred::current().may(&ino.meta(), want, flags & AT_EACCESS == 0) {
+    let (c, real) = (cred::current(), flags & AT_EACCESS == 0);
+    if want != 0 && !c.may(&ino.meta(), want, real) {
+        crate::why::perm(&ino.meta(), want, c, real);
         return Err(-cred::EACCES);
     }
     Ok(0)

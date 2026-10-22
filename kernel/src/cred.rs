@@ -60,7 +60,26 @@ impl Cred {
     }
 
     pub fn check(&self, m: &Meta, want: u32) -> Result<(), i64> {
-        if self.may(m, want, false) { Ok(()) } else { Err(-EACCES) }
+        if self.may(m, want, false) {
+            Ok(())
+        } else {
+            crate::why::perm(m, want, self, false);
+            Err(-EACCES)
+        }
+    }
+
+    /// may の答えを決めた組: 0 持ち主、1 グループ、2 ほか、3 root (why.rs)
+    pub fn class(&self, m: &Meta, real: bool) -> u8 {
+        let (uid, gid) = if real { (self.uid, self.gid) } else { (self.euid, self.egid) };
+        if uid == 0 {
+            3
+        } else if m.uid == uid {
+            0
+        } else if gid == m.gid || self.groups.contains(&m.gid) {
+            1
+        } else {
+            2
+        }
     }
 
     /// 持ち主か root か
