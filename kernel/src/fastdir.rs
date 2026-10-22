@@ -2,7 +2,8 @@
 // ふつうの道は大きなロック (smp.rs) の中で、パスをたどり (vfs)、ext4 を書きかえ、fd を置く。いくつもの CPU でそれぞれの
 // ディレクトリにファイルを作って消すと、1 つずつしか動かない (bench/smp.md の create-unlink: 4 つで Linux の 1.47 倍の時間。
 // Linux はディレクトリごとの i_rwsem と、グループごとのロックで、ちがうディレクトリなら同時に動く)。
-// ここでは、ext4 の中は ext4 のロック (extfs.rs の fs_lock) で 1 つずつ、そのほかはロックなしで:
+// ここでは、ext4 の中は ext4 のロックをいっしょに持って (extfs.rs の fs_lock_shared: ちがうディレクトリなら同時に、同じ
+// ディレクトリはディレクトリごとのロックで 1 つずつ)、そのほかはロックなしで:
 //   - 親のディレクトリは statc の表で引く (ふつうの道の O_CREAT の openat と unlinkat が statc::learn_dir で覚えさせる)。
 //     通ったディレクトリの版とマウントの版が同じなら、パスはいまもその inode をさす。許し (書けて通れるか) と、
 //     いまもディレクトリかは、ext4 のロックの中で inode から読む
@@ -114,7 +115,7 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
     };
     let mode = mode as u32 & 0o7777 & !t.umask;
     let ino = {
-        let _e = crate::extfs::fs_lock();
+        let _e = crate::extfs::fs_lock_shared();
         if !watch_free() { None } else { fs.fast_create(dir as u32, name, mode, &me.cred) }
     };
     let Some(ino) = ino else {
@@ -153,11 +154,17 @@ pub fn fast_unlink(me: &Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i6
         note(3);
         return None;
     };
-    let done = {
-        let _e = crate::extfs::fs_lock();
-        watch_free() && fs.fast_unlink(dir as u32, name, &me.cred)
+    use crate::extfs::FastUnlink;
+    let mut done = {
+        let _e = crate::extfs::fs_lock_shared();
+        if watch_free() { fs.fast_unlink(dir as u32, name, &me.cred) } else { FastUnlink::No }
     };
-    if !done {
+    // リンクがいくつもあるか、中身のブロックがあるもの: ext4 のロックをひとりで持って
+    if done == FastUnlink::Alone {
+        let _e = crate::extfs::fs_lock();
+        done = if watch_free() { fs.fast_unlink(dir as u32, name, &me.cred) } else { FastUnlink::No };
+    }
+    if done != FastUnlink::Done {
         note(4);
         return None;
     }

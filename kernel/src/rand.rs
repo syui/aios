@@ -98,6 +98,39 @@ fn reseed(s: &mut State) {
     crypto::wipe(&mut next);
     crypto::wipe(&mut block);
     LAST.store(crate::timer::uptime_ns(), Ordering::Relaxed);
+    // CPU ごとにまとめて作っておいたもの (u32) は、新しい鍵で作りなおす
+    GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 鍵を作りなおした回数 (Batch はこれが変わったら捨てる)
+static GEN: AtomicU64 = AtomicU64::new(0);
+
+/// CPU ごとに、まとめて作った乱数 (Linux の get_random_u32 の batched_entropy)
+struct Batch {
+    buf: [u8; 64],
+    /// buf のまだ渡していないところの始め
+    pos: usize,
+    generation: u64,
+}
+
+static mut BATCH: [Batch; crate::smp::MAXCPU] = [const { Batch { buf: [0; 64], pos: 64, generation: 0 } }; crate::smp::MAXCPU];
+
+/// 32 ビットの乱数を、CPU ごとにまとめて作ったものから (inode の generation など、たびたび要る小さいもの)。u64() と
+/// fill() は呼ぶたびに鍵を進めて ChaCha20 のブロックを作る (TCG では重く、時計も読む) ので、64 バイトずつ作っておき、
+/// 渡したところは消す。鍵を作りなおしたら捨てる。カーネルは割り込みを止めて動き、この中で眠らないので、CPU ごとの
+/// ものを取りあうことはない
+pub fn u32() -> u32 {
+    let b = unsafe { &mut (*(&raw mut BATCH))[crate::smp::id()] };
+    let g = GEN.load(Ordering::Relaxed);
+    if b.pos + 4 > b.buf.len() || b.generation != g {
+        fill(&mut b.buf);
+        b.pos = 0;
+        b.generation = g;
+    }
+    let v = u32::from_le_bytes(b.buf[b.pos..b.pos + 4].try_into().unwrap());
+    crypto::wipe(&mut b.buf[b.pos..b.pos + 4]);
+    b.pos += 4;
+    v
 }
 
 /// 数えるもと (ブートローダー、UEFI、virtio-rng のくれた乱数) を池に入れて、鍵を作りなおす

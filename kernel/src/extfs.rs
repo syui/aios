@@ -20,16 +20,28 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // ---- ext4 のロック ----
-// 大きなロック (smp.rs) のほかに、ext4 の中 (ExtFs の RefCell、ブロックのキャッシュ、ExtInode の数と Rc<ExtFs> の数) を守る。
-// 大きなロックの中の道も、ext4 に入るところ (ExtInode の Inode の関数、ExtInode の Drop、外から呼ぶ ExtFs の関数) でいつも取る。
-// 大きなロックなしの作る・消す (fastdir.rs) はこれだけを取る: ext4 の中は 1 つずつ、そのほか (パスをたどる、fd を置く、
-// ユーザーとのやりとり) はいくつもの CPU で同時に (Linux はディレクトリごとの i_rwsem とグループごとのロック)。
-// 持ち主はスレッド (proc の番号。スケジューラの中は CPU) で、同じスレッドなら重ねて取れる。眠るとき (proc::sched) は手放し、
+// 大きなロック (smp.rs) のほかに、ext4 の中 (ExtFs の Shared と ACell、ブロックのキャッシュ、ExtInode の数と Rc<ExtFs> の数) を守る。
+// 読み書きロック: ext4 に入るところ (ExtInode の Inode の関数、ExtFs の外から呼ぶ関数) は、ひとりで持つ (fs_lock)。
+// 大きなロックなしの作る・消す (fastdir.rs) と、ExtInode を落とすところ (数を減らすだけのとき) は、いっしょに持つ
+// (fs_lock_shared): ちがうディレクトリなら同時に動く (Linux はディレクトリごとの i_rwsem と、グループごとのロック)。
+// いっしょに持つものどうしは、ディレクトリごとのロック (DIR_LOCKS)、inode とブロックを取る・返すロック (ALLOC)、
+// 帳簿のロック (BOOK、META_BOOK、NAME_BOOK: ExtFs の Shared をさわるあいだだけ) で分ける。ひとりで持とうとするものは、いっしょに持つものが
+// みな出るのを待ち、待っているあいだは新しくいっしょには入れない (ひとりで持つ道が待ちつづけないように)。
+// ひとりで持つのはスレッド (proc の番号。スケジューラの中は CPU) で、重ねて取れる。眠るとき (proc::sched) は手放し、
 // 起きたらまた取る (大きなロックと同じく、眠っているあいだにほかが ext4 を変えてよい: with_block の wgen がそれを見る)。
-// 取る順は 大きなロック → ext4 のロック → fd の表ごとのスピンロック
+// いっしょに持つのは CPU ごとに数える (カーネルは割り込みを止めて動き、いっしょに持ったまま眠らない) ので、重ねて取れる
+// (ひとりで持っているものが、いっしょにと頼めば、重ねて取ったことに)。いっしょに持ったまま、ひとりで持とうとしては
+// いけない (panic)。
+// 取る順は 大きなロック → ext4 のロック → DIR_LOCKS → ALLOC → BOOK → META_BOOK → NAME_BOOK → fd の表ごとのスピンロック
 static FS_OWNER: AtomicUsize = AtomicUsize::new(0);
 /// 重ねて取った数 (持ち主だけが書く)
 static FS_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// いっしょに持っている CPU の数
+static FS_READERS: AtomicUsize = AtomicUsize::new(0);
+/// ひとりで持とうとして待っているものの数
+static FS_WANT: AtomicUsize = AtomicUsize::new(0);
+/// CPU ごとの、いっしょに持っている重ねた数 (その CPU だけが書く)
+static FS_SHARED: [AtomicUsize; crate::smp::MAXCPU] = [const { AtomicUsize::new(0) }; crate::smp::MAXCPU];
 /// 待った回数と時間 (ns。SAMPLE 回に 1 回測った見つもり) (/proc/bkl)
 pub static FS_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -37,48 +49,126 @@ fn fs_me() -> usize {
     crate::proc::cur_index().unwrap_or(crate::proc::NPROC + crate::smp::id()) + 1
 }
 
-/// ext4 のロックを持っているしるし (落とすと放す)
-pub struct FsGuard(());
+/// ext4 のロックを持っているしるし (落とすと放す)。true はいっしょに
+pub struct FsGuard(bool);
 
+/// ひとりで持つ
 pub fn fs_lock() -> FsGuard {
     let me = fs_me();
     if FS_OWNER.load(Ordering::Relaxed) == me {
         FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-    } else {
-        fs_acquire(me);
-        FS_DEPTH.store(1, Ordering::Relaxed);
+        return FsGuard(false);
     }
-    FsGuard(())
+    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: the ext4 lock is wanted alone while this CPU holds it shared");
+    }
+    fs_acquire(me);
+    FS_DEPTH.store(1, Ordering::Relaxed);
+    FsGuard(false)
+}
+
+/// いっしょに持つ (fastdir の作る・消すと、ExtInode を落とすところ)。ひとりで持っていれば、それを重ねて
+pub fn fs_lock_shared() -> FsGuard {
+    if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
+        FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        return FsGuard(false);
+    }
+    let c = &FS_SHARED[crate::smp::id()];
+    let n = c.load(Ordering::Relaxed);
+    if n == 0 {
+        fs_acquire_shared();
+    }
+    c.store(n + 1, Ordering::Relaxed);
+    FsGuard(true)
+}
+
+/// 待ちはじめ: 回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
+/// 時計を読むのが重く、ロックを持つ時間が伸びる)
+fn wait_begin() -> u64 {
+    let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % crate::smp::SAMPLE == 0;
+    if timed { crate::timer::uptime_ns().max(1) } else { 0 }
+}
+
+fn wait_end(t0: u64) {
+    if t0 != 0 {
+        FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * crate::smp::SAMPLE, Ordering::Relaxed);
+    }
+}
+
+fn wfe() {
+    // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
+    unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+}
+
+fn sev() {
+    unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
 }
 
 fn fs_acquire(me: usize) {
-    if FS_OWNER.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        return;
-    }
-    // 待った回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
-    // 時計を読むのが重く、ロックを持つ時間が伸びる)
-    let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % crate::smp::SAMPLE == 0;
-    let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
-    loop {
-        // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-        if FS_OWNER.load(Ordering::Relaxed) == 0 && FS_OWNER.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            break;
+    let mut t0 = None;
+    if FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        t0 = Some(wait_begin());
+        FS_WANT.fetch_add(1, Ordering::SeqCst);
+        loop {
+            wfe();
+            if FS_OWNER.load(Ordering::Relaxed) == 0 && FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                break;
+            }
         }
+        FS_WANT.fetch_sub(1, Ordering::SeqCst);
     }
-    if timed {
-        FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * crate::smp::SAMPLE, Ordering::Relaxed);
+    // いっしょに持っているものが出るのを待つ (FS_OWNER を立てたので、新しくは入らない。入りかけたものは FS_OWNER を見て出る)
+    while FS_READERS.load(Ordering::SeqCst) != 0 {
+        if t0.is_none() {
+            t0 = Some(wait_begin());
+        }
+        wfe();
+    }
+    if let Some(t) = t0 {
+        wait_end(t);
+    }
+}
+
+fn fs_acquire_shared() {
+    let mut t0 = None;
+    loop {
+        if FS_OWNER.load(Ordering::SeqCst) == 0 && FS_WANT.load(Ordering::SeqCst) == 0 {
+            FS_READERS.fetch_add(1, Ordering::SeqCst);
+            if FS_OWNER.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            // ひとりで持とうとするものが先だった
+            FS_READERS.fetch_sub(1, Ordering::SeqCst);
+            sev();
+        }
+        if t0.is_none() {
+            t0 = Some(wait_begin());
+        }
+        wfe();
+    }
+    if let Some(t) = t0 {
+        wait_end(t);
     }
 }
 
 fn fs_release() {
     FS_DEPTH.store(0, Ordering::Relaxed);
     FS_OWNER.store(0, Ordering::Release);
-    unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
+    sev();
 }
 
 impl Drop for FsGuard {
     fn drop(&mut self) {
+        if self.0 {
+            let c = &FS_SHARED[crate::smp::id()];
+            let n = c.load(Ordering::Relaxed);
+            c.store(n - 1, Ordering::Relaxed);
+            if n == 1 {
+                FS_READERS.fetch_sub(1, Ordering::Release);
+                sev();
+            }
+            return;
+        }
         let d = FS_DEPTH.load(Ordering::Relaxed);
         if d > 1 {
             FS_DEPTH.store(d - 1, Ordering::Relaxed);
@@ -90,6 +180,9 @@ impl Drop for FsGuard {
 
 /// 眠る前 (proc::sched): いまのスレッドが ext4 のロックを持っていれば手放し、重ねた数を返す (0 なら持っていない)
 pub fn fs_unlock_for_sleep() -> usize {
+    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: sleeping while holding the ext4 lock shared");
+    }
     if FS_OWNER.load(Ordering::Relaxed) != fs_me() {
         return 0;
     }
@@ -111,6 +204,172 @@ pub fn fs_relock_after_sleep(d: usize) {
 pub fn fs_check_released() {
     if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
         panic!("extfs: the ext4 lock is still held on the way out (depth {})", FS_DEPTH.load(Ordering::Relaxed));
+    }
+    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: the ext4 lock is still held shared on the way out");
+    }
+}
+
+/// いっしょに持つものどうしの、ディレクトリごとのロック (dir の inode の番号で分ける。同じ箱のほかのディレクトリとは
+/// 1 つずつ): そのディレクトリのブロックと inode を、なめてから書きかえるまで
+static DIR_LOCKS: [crate::spinlock::SpinLock<()>; 64] = [const { crate::spinlock::SpinLock::new(()) }; 64];
+
+fn dir_lock(dir: u32) -> crate::spinlock::Guard<'static, ()> {
+    DIR_LOCKS[dir as usize % DIR_LOCKS.len()].lock()
+}
+
+/// いっしょに持つものどうしのロック (帳簿): ExtFs の Shared をさわるあいだと、inode とブロックを取る・返すあいだ。
+/// 持ち主は CPU で、重ねて取れる (中で眠らない)。ひとりで持っているとき (やロックの外) は取らない: いっしょに持つ
+/// ものはいない。順 (rank) の小さいものから取る (大きいものを持ったまま小さいものを取ろうとすると panic)
+struct BookLock {
+    owner: AtomicUsize,
+    depth: AtomicUsize,
+    rank: usize,
+}
+
+/// inode とブロックを取る・返すあいだ (ビットマップ、グループディスクリプタ、スーパーブロックの数と、その書き出しの印:
+/// 選んでから印をつけるまで)
+static ALLOC: BookLock = BookLock::new(1);
+/// ブロックのキャッシュの書いた印、ExtInode の数、orphan などの表、ジャーナル、Rc<ExtFs> の数
+static BOOK: BookLock = BookLock::new(2);
+/// meta() の覚え
+static META_BOOK: BookLock = BookLock::new(3);
+/// 名前の覚え
+static NAME_BOOK: BookLock = BookLock::new(4);
+
+/// CPU ごとの、いま持っている帳簿のロック (rank のビット)
+static BOOKS_HELD: [AtomicUsize; crate::smp::MAXCPU] = [const { AtomicUsize::new(0) }; crate::smp::MAXCPU];
+
+struct BookGuard(Option<&'static BookLock>);
+
+impl BookLock {
+    const fn new(rank: usize) -> Self {
+        BookLock { owner: AtomicUsize::new(0), depth: AtomicUsize::new(0), rank }
+    }
+
+    fn take(&'static self) -> BookGuard {
+        let c = crate::smp::id();
+        if FS_SHARED[c].load(Ordering::Relaxed) == 0 {
+            return BookGuard(None);
+        }
+        let me = c + 1;
+        if self.owner.load(Ordering::Relaxed) == me {
+            self.depth.store(self.depth.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            return BookGuard(Some(self));
+        }
+        let held = BOOKS_HELD[c].load(Ordering::Relaxed);
+        if held >> self.rank != 0 {
+            panic!("extfs: book lock {} taken while holding {:#x}", self.rank, held);
+        }
+        while self.owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        self.depth.store(1, Ordering::Relaxed);
+        BOOKS_HELD[c].store(held | 1 << self.rank, Ordering::Relaxed);
+        BookGuard(Some(self))
+    }
+}
+
+fn book() -> BookGuard {
+    BOOK.take()
+}
+
+impl Drop for BookGuard {
+    fn drop(&mut self) {
+        if let Some(l) = self.0 {
+            let d = l.depth.load(Ordering::Relaxed);
+            if d > 1 {
+                l.depth.store(d - 1, Ordering::Relaxed);
+            } else {
+                let c = crate::smp::id();
+                BOOKS_HELD[c].store(BOOKS_HELD[c].load(Ordering::Relaxed) & !(1 << l.rank), Ordering::Relaxed);
+                l.owner.store(0, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// この CPU が ext4 のロックをいっしょに持っている (そのあいだは、ブロックのキャッシュの表に足したり捨てたりしない:
+/// 足すのはディスクを読むとき、捨てるのはブロックを返すときで、どちらもひとりで持つときだけ)
+fn shared_here() -> bool {
+    FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0
+}
+
+
+/// ExtFs の中の、いっしょに持つものも変えるもの (RefCell と同じ使いかた): いっしょに持っているあいだは、借りている
+/// あいだ帳簿のロックを持つ
+struct Shared<T>(RefCell<T>, &'static BookLock);
+
+struct SharedRef<'a, T> {
+    r: core::cell::Ref<'a, T>,
+    _b: BookGuard,
+}
+
+struct SharedMut<'a, T> {
+    r: core::cell::RefMut<'a, T>,
+    _b: BookGuard,
+}
+
+impl<T> Shared<T> {
+    /// 帳簿 (BOOK) で守るもの
+    const fn new(v: T) -> Self {
+        Shared(RefCell::new(v), &BOOK)
+    }
+
+    /// ほかの帳簿のロックで守るもの
+    const fn with(v: T, l: &'static BookLock) -> Self {
+        Shared(RefCell::new(v), l)
+    }
+
+    fn borrow(&self) -> SharedRef<'_, T> {
+        let b = self.1.take();
+        SharedRef { r: self.0.borrow(), _b: b }
+    }
+
+    fn borrow_mut(&self) -> SharedMut<'_, T> {
+        let b = self.1.take();
+        SharedMut { r: self.0.borrow_mut(), _b: b }
+    }
+}
+
+impl<T> core::ops::Deref for SharedRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.r
+    }
+}
+
+impl<T> core::ops::Deref for SharedMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.r
+    }
+}
+
+impl<T> core::ops::DerefMut for SharedMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.r
+    }
+}
+
+/// ExtFs の中の数 (Cell と同じ使いかた。いっしょに持つものも足すので atomic)
+struct ACell(AtomicU64);
+
+impl ACell {
+    const fn new(v: u64) -> Self {
+        ACell(AtomicU64::new(v))
+    }
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn set(&self, v: u64) {
+        self.0.store(v, Ordering::Relaxed)
+    }
+    fn inc(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn dec(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -323,12 +582,6 @@ struct Cache {
     dirty: BTreeSet<u64>,
     /// まだディスクに書いていないファイルの中身のブロック (直接書く)
     data: BTreeSet<u64>,
-    sb_dirty: bool,
-    /// チェックサムを直して書き出すグループ
-    gd_dirty: BTreeSet<u32>,
-    /// ビットマップを書きかえたグループ (チェックサムを直す)
-    bb_dirty: BTreeSet<u32>,
-    ib_dirty: BTreeSet<u32>,
     /// チェックサムをまだ計算していないディレクトリのブロック → (ディレクトリの inode, generation)。
     /// 書きかえるたびに 4 KiB の crc32c を計算せず、ジャーナルやディスクへ写す直前 (settle_csum) に 1 回だけ。
     /// Linux はブロックを書きかえるたびに計算する (ext4_handle_dirty_dirblock)
@@ -343,6 +596,17 @@ struct Cache {
     written_meta: u64,
     written_data: u64,
     commits: u64,
+}
+
+/// inode とブロックを取る・返すときに書きかえたもの (書き出しで、チェックサムを直して書く)。ALLOC で守る
+struct AllocDirty {
+    /// スーパーブロック
+    sb: bool,
+    /// チェックサムを直して書き出すグループ
+    gd: BTreeSet<u32>,
+    /// ビットマップを書きかえたグループ (チェックサムを直す)
+    bb: BTreeSet<u32>,
+    ib: BTreeSet<u32>,
 }
 
 pub struct ExtFs {
@@ -365,36 +629,40 @@ pub struct ExtFs {
     /// 書けない (未対応の機能、回復の要るジャーナル)
     ro: bool,
     sparse_super: bool,
-    sb: RefCell<Vec<u8>>,
-    gdt: RefCell<Vec<u8>>,
-    cache: RefCell<Cache>,
-    journal: RefCell<Option<jbd2::Journal>>,
+    /// スーパーブロックとグループディスクリプタ (いっしょに持つときは ALLOC で: 場所の欄は gd_blk が帳簿なしで読む)
+    sb: Shared<Vec<u8>>,
+    gdt: Shared<Vec<u8>>,
+    adirty: Shared<AllocDirty>,
+    cache: Shared<Cache>,
+    journal: Shared<Option<jbd2::Journal>>,
     /// 最後に書き出した時刻 (ticks)
-    last_flush: core::cell::Cell<u64>,
+    last_flush: ACell,
     /// inode ごとの、いま生きている ExtInode の数 (開いているファイル、mmap、カレントディレクトリ ...)
-    users: RefCell<BTreeMap<u32, usize>>,
+    users: Shared<BTreeMap<u32, usize>>,
     /// リンクが 0 になったが、まだ使われているので残してある inode (最後の利用者がいなくなったら片付ける)
-    orphans: RefCell<BTreeSet<u32>>,
+    orphans: Shared<BTreeSet<u32>>,
     /// O_TMPFILE で O_EXCL なしに作った、まだ名前のない inode (link で一度だけ名前をつけられる)
-    linkable: RefCell<BTreeSet<u32>>,
+    linkable: Shared<BTreeSet<u32>>,
     /// スワップに使っているファイル (書きかえさせない)
-    swapfiles: RefCell<BTreeSet<u32>>,
+    swapfiles: Shared<BTreeSet<u32>>,
     /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
     /// (modify_dir_block) そのディレクトリの分を、ディレクトリの inode を空けたらその分を消す
-    names: RefCell<Names>,
+    names: Shared<Names>,
     /// 書く操作 (write_op、消したファイルの片づけ) のたびに増える。ディスクを眠って待った読み (with_block) は、
     /// 起きたときにこれが変わっていたら、読んだものを捨てて vfs::ERETRY (読みを頭からやりなおす)。
     /// 眠っているあいだに書かれたら、持っている inode やエクステントの写しはもう古いかもしれない
-    wgen: core::cell::Cell<u64>,
+    wgen: ACell,
     /// いま書く操作の中 (その中の読みは眠らない)
-    writing: core::cell::Cell<usize>,
+    writing: ACell,
     /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
-    names_gen: core::cell::Cell<u64>,
+    names_gen: ACell,
     /// meta() の答え (inode → Meta)。stat や open の 1 回で、たどるディレクトリとファイルの meta が何度も
     /// 引かれ、そのたびに inode を読んで解くのは高い (TCG で 1 回 7 us)。inode を書く (write_inode) ときに捨てる
-    metas: RefCell<BTreeMap<u32, Meta>>,
+    metas: Shared<BTreeMap<u32, Meta>>,
     /// metas のどれかを捨てるたび (write_inode) に進む。ExtInode が自分の meta を覚えているのは、これが同じあいだ
-    meta_ver: Cell<u64>,
+    meta_ver: ACell,
+    /// いっしょに持っているあいだに引いて、キャッシュにあった数 (Cache の hits に足して出す)
+    shared_hits: AtomicU64,
 }
 
 /// meta() の答えの覚えの大きさ (こえたら全部捨てる)
@@ -624,17 +892,14 @@ impl ExtFs {
             },
             ro,
             sparse_super: ro_compat & RO_SPARSE_SUPER != 0 && u32_at(&sb, 92) & COMPAT_SPARSE_SUPER2 == 0,
-            sb: RefCell::new(sb),
-            gdt: RefCell::new(Vec::new()),
-            cache: RefCell::new(Cache {
+            sb: Shared::with(sb, &ALLOC),
+            gdt: Shared::with(Vec::new(), &ALLOC),
+            adirty: Shared::with(AllocDirty { sb: false, gd: BTreeSet::new(), bb: BTreeSet::new(), ib: BTreeSet::new() }, &ALLOC),
+            cache: Shared::new(Cache {
                 map: BTreeMap::new(),
                 order: VecDeque::new(),
                 dirty: BTreeSet::new(),
                 data: BTreeSet::new(),
-                sb_dirty: false,
-                gd_dirty: BTreeSet::new(),
-                bb_dirty: BTreeSet::new(),
-                ib_dirty: BTreeSet::new(),
                 dir_csum: BTreeMap::new(),
                 hits: 0,
                 misses: 0,
@@ -645,18 +910,19 @@ impl ExtFs {
                 written_data: 0,
                 commits: 0,
             }),
-            journal: RefCell::new(None),
-            last_flush: core::cell::Cell::new(0),
-            users: RefCell::new(BTreeMap::new()),
-            orphans: RefCell::new(BTreeSet::new()),
-            linkable: RefCell::new(BTreeSet::new()),
-            swapfiles: RefCell::new(BTreeSet::new()),
-            names: RefCell::new(Names { dirs: BTreeMap::new(), len: 0 }),
-            wgen: core::cell::Cell::new(0),
-            writing: core::cell::Cell::new(0),
-            names_gen: core::cell::Cell::new(0),
-            metas: RefCell::new(BTreeMap::new()),
-            meta_ver: Cell::new(0),
+            journal: Shared::new(None),
+            last_flush: ACell::new(0),
+            users: Shared::new(BTreeMap::new()),
+            orphans: Shared::new(BTreeSet::new()),
+            linkable: Shared::new(BTreeSet::new()),
+            swapfiles: Shared::new(BTreeSet::new()),
+            names: Shared::with(Names { dirs: BTreeMap::new(), len: 0 }, &NAME_BOOK),
+            wgen: ACell::new(0),
+            writing: ACell::new(0),
+            names_gen: ACell::new(0),
+            metas: Shared::with(BTreeMap::new(), &META_BOOK),
+            meta_ver: ACell::new(0),
+            shared_hits: AtomicU64::new(0),
         });
         let gdt_len = groups as usize * desc_size;
         let mut gdt = vec![0u8; gdt_len.div_ceil(bsize) * bsize];
@@ -734,7 +1000,7 @@ impl ExtFs {
             cache_limit(self.bsize),
             c.dirty.len(),
             c.data.len(),
-            c.hits,
+            c.hits + self.shared_hits.load(Ordering::Relaxed),
             c.misses,
             c.readahead,
             c.evictions,
@@ -768,6 +1034,13 @@ impl ExtFs {
     // ---- ブロック ----
 
     fn with_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        if shared_here() {
+            // いっしょに持っているあいだは表が変わらないので、帳簿のロックなしで引く (なければ読まない: 作る・消すは
+            // 読むブロックがみなキャッシュにあることを確かめてから)。中身は、ディレクトリのロックと ALLOC が分ける
+            let Some(page) = self.shared_lookup(b) else { return Err(-NOIO_EAGAIN) };
+            self.shared_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(f(unsafe { core::slice::from_raw_parts_mut(page, self.bsize) }));
+        }
         let mut c = self.cache.borrow_mut();
         let page = match c.map.get(&b).copied() {
             Some(p) => {
@@ -951,7 +1224,16 @@ impl ExtFs {
     }
 
     fn cached(&self, b: u64) -> bool {
+        if shared_here() {
+            return self.shared_lookup(b).is_some();
+        }
         self.cache.borrow().map.contains_key(&b)
+    }
+
+    /// いっしょに持っているあいだの、キャッシュの表の引き (表はひとりで持つものだけが変える。ほかの CPU が帳簿の中で
+    /// 書く Cache のほかの欄にはさわらない)
+    fn shared_lookup(&self, b: u64) -> Option<*mut u8> {
+        unsafe { (*core::ptr::addr_of!((*self.cache.0.as_ptr()).map)).get(&b).copied() }
     }
 
     fn read_block(&self, b: u64) -> Result<Vec<u8>, i64> {
@@ -1043,7 +1325,7 @@ impl ExtFs {
             put32(&mut sb, 0x158, (v >> 32) as u32);
         }
         drop(sb);
-        self.cache.borrow_mut().sb_dirty = true;
+        self.adirty.borrow_mut().sb = true;
     }
 
     fn sb_add_free_inodes(&self, delta: i64) {
@@ -1051,7 +1333,7 @@ impl ExtFs {
         let v = (u32_at(&sb, 16) as i64 + delta) as u32;
         put32(&mut sb, 16, v);
         drop(sb);
-        self.cache.borrow_mut().sb_dirty = true;
+        self.adirty.borrow_mut().sb = true;
     }
 
     // ---- orphan リスト ----
@@ -1064,7 +1346,7 @@ impl ExtFs {
 
     fn set_last_orphan(&self, ino: u32) {
         put32(&mut self.sb.borrow_mut(), 0xe8, ino);
-        self.cache.borrow_mut().sb_dirty = true;
+        self.adirty.borrow_mut().sb = true;
     }
 
     /// リストの頭に足す (r は呼ぶ側が書く)
@@ -1130,9 +1412,16 @@ impl ExtFs {
 
     /// lo (と 64bit なら hi) の 32 ビットの組
     fn gd_blk(&self, g: u32, lo: usize, hi: usize) -> u64 {
-        let d = self.gdt.borrow();
-        let o = self.gd_off(g);
-        u32_at(&d, o + lo) as u64 | if self.desc_size >= 64 { (u32_at(&d, o + hi) as u64) << 32 } else { 0 }
+        let get = |d: &[u8]| {
+            let o = self.gd_off(g);
+            u32_at(d, o + lo) as u64 | if self.desc_size >= 64 { (u32_at(d, o + hi) as u64) << 32 } else { 0 }
+        };
+        if shared_here() {
+            // 場所 (ビットマップと inode 表) はマウントしてから変わらない: いっしょに持っているときは帳簿のロックなしで
+            // (ほかの CPU が ALLOC の中で書くのは、ほかのところ: 数と印)
+            return get(unsafe { &*self.gdt.0.as_ptr() });
+        }
+        get(&self.gdt.borrow())
     }
 
     /// lo (と 64bit なら hi) の 16 ビットの組
@@ -1150,7 +1439,7 @@ impl ExtFs {
             put16(&mut d, o + hi, (v >> 16) as u16);
         }
         drop(d);
-        self.cache.borrow_mut().gd_dirty.insert(g);
+        self.adirty.borrow_mut().gd.insert(g);
     }
 
     fn gd_add_cnt(&self, g: u32, lo: usize, hi: usize, delta: i32) {
@@ -1176,7 +1465,7 @@ impl ExtFs {
         let v = u16_at(&d, o) & !f;
         put16(&mut d, o, v);
         drop(d);
-        self.cache.borrow_mut().gd_dirty.insert(g);
+        self.adirty.borrow_mut().gd.insert(g);
     }
 
     fn group_start(&self, g: u32) -> u64 {
@@ -1223,7 +1512,7 @@ impl ExtFs {
             }
         })?;
         self.gd_clear_flag(g, BG_BLOCK_UNINIT);
-        self.cache.borrow_mut().bb_dirty.insert(g);
+        self.adirty.borrow_mut().bb.insert(g);
         Ok(())
     }
 
@@ -1237,7 +1526,7 @@ impl ExtFs {
             }
         })?;
         self.gd_clear_flag(g, BG_INODE_UNINIT);
-        self.cache.borrow_mut().ib_dirty.insert(g);
+        self.adirty.borrow_mut().ib.insert(g);
         Ok(())
     }
 
@@ -1271,7 +1560,7 @@ impl ExtFs {
             if let Some(bit) = found {
                 self.gd_add_cnt(g, 0xc, 0x2c, -1);
                 self.sb_add_free_blocks(-1);
-                self.cache.borrow_mut().bb_dirty.insert(g);
+                self.adirty.borrow_mut().bb.insert(g);
                 let b = self.group_start(g) + bit as u64;
                 // 新しいブロックはゼロから (ディスクの古い中身は読まない)。ファイルの中身に使うなら
                 // write_data が中身のブロックに付けかえる
@@ -1292,8 +1581,8 @@ impl ExtFs {
         self.modify_block(bm, |d| d[bit / 8] &= !(1 << (bit % 8)))?;
         self.gd_add_cnt(g, 0xc, 0x2c, 1);
         self.sb_add_free_blocks(1);
+        self.adirty.borrow_mut().bb.insert(g);
         let mut c = self.cache.borrow_mut();
-        c.bb_dirty.insert(g);
         // 捨てたブロックは書き出さない (data に残すと、flush がディスクの古い中身を読んで書き戻す)
         c.dirty.remove(&b);
         c.data.remove(&b);
@@ -1355,7 +1644,7 @@ impl ExtFs {
             self.gd_set_cnt(g, 0x1c, 0x32, self.ipg - bit - 1);
         }
         self.sb_add_free_inodes(-1);
-        self.cache.borrow_mut().ib_dirty.insert(g);
+        self.adirty.borrow_mut().ib.insert(g);
         let ino = g * self.ipg + bit + 1;
         // 前にこの番号だったファイルのページがページキャッシュに残っていたら捨てる (大きなロックなしの read は、
         // 表にあるページと大きさをいまのものとして読む)
@@ -1377,7 +1666,7 @@ impl ExtFs {
             self.gd_add_cnt(g, 0x10, 0x30, -1);
         }
         self.sb_add_free_inodes(1);
-        self.cache.borrow_mut().ib_dirty.insert(g);
+        self.adirty.borrow_mut().ib.insert(g);
         Ok(())
     }
 
@@ -1488,8 +1777,8 @@ impl ExtFs {
         // 写し (MAP_SHARED) で書いているページに、書き出す印をつけなおす (写しは書けるままなので、前に書き出したあとも書かれる)
         crate::vm::sync_shared();
         let (bb, ib) = {
-            let mut c = self.cache.borrow_mut();
-            (core::mem::take(&mut c.bb_dirty), core::mem::take(&mut c.ib_dirty))
+            let mut a = self.adirty.borrow_mut();
+            (core::mem::take(&mut a.bb), core::mem::take(&mut a.ib))
         };
         // ビットマップのチェックサムをグループディスクリプタへ
         if self.csum {
@@ -1505,8 +1794,8 @@ impl ExtFs {
             }
         }
         let (sb_dirty, gd_dirty) = {
-            let mut c = self.cache.borrow_mut();
-            (core::mem::take(&mut c.sb_dirty), core::mem::take(&mut c.gd_dirty))
+            let mut a = self.adirty.borrow_mut();
+            (core::mem::take(&mut a.sb), core::mem::take(&mut a.gd))
         };
         let mut gdt_blocks = BTreeSet::new();
         for g in gd_dirty {
@@ -1620,7 +1909,7 @@ impl ExtFs {
         // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)。ExtInode の覚えも、大きなロックなしの
         // stat の覚え (statc.rs) も
         self.metas.borrow_mut().remove(&ino);
-        self.meta_ver.set(self.meta_ver.get() + 1);
+        self.meta_ver.inc();
         crate::statc::ino_bump((self.fs, ino as u64));
         let mut r = r.clone();
         self.set_inode_csum(ino, &mut r);
@@ -2467,7 +2756,7 @@ impl ExtFs {
 
     /// dir の名前のキャッシュを捨てる
     fn forget_names(&self, dir: u32) {
-        self.names_gen.set(self.names_gen.get() + 1);
+        self.names_gen.inc();
         self.names.borrow_mut().forget(dir);
     }
 
@@ -2711,7 +3000,7 @@ impl ExtFs {
     /// リンクが 0 になった inode を片付ける
     fn release(&self, ino: u32, r: &mut Raw) -> Result<(), i64> {
         // ブロックを放す: 眠って待っている読みはやりなおす
-        self.wgen.set(self.wgen.get() + 1);
+        self.wgen.inc();
         let dir = r.mode() & S_IFMT == S_IFDIR;
         if !is_fast_symlink(r) && r.mode() & S_IFMT != S_IFCHR {
             self.trunc_blocks(ino, r, 0)?;
@@ -2731,7 +3020,7 @@ impl ExtFs {
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
         }
-        put32(&mut r.0, 0x64, crate::rand::u64() as u32); // i_generation
+        put32(&mut r.0, 0x64, crate::rand::u32()); // i_generation
         if self.inode_size > 128 {
             put16(&mut r.0, 0x80, 32); // i_extra_isize
         }
@@ -2741,23 +3030,31 @@ impl ExtFs {
     /// maybe_flush が書き出すころか。大きなロックなしの作る・消すは書き出さない (ディスクを待つのは大きなロックの中の仕事):
     /// そうなら、ふつうの道に任せる (そちらが書き出す)
     fn flush_due(&self) -> bool {
-        let limit = match self.journal.borrow().as_ref() {
-            Some(j) => (j.capacity() / 4).min(512),
-            None => 512,
-        };
         let data_limit = (cache_limit(self.bsize) / 4).max(512);
-        let c = self.cache.borrow();
-        c.dirty.len() + 16 >= limit || c.data.len() >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ
+        let due = |j: &Option<jbd2::Journal>, c: &Cache| {
+            let limit = match j.as_ref() {
+                Some(j) => (j.capacity() / 4).min(512),
+                None => 512,
+            };
+            // いくつもの CPU がいっしょに書くので、のこりに 1 つ 16 ずつ
+            c.dirty.len() + 16 * crate::smp::MAXCPU >= limit || c.data.len() >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ
+        };
+        if shared_here() {
+            // いっしょに持っているときは、帳簿のロックなしで数だけ読む (ジャーナルはひとりで持つものだけが変える。
+            // 書いた印の数はほかの CPU が帳簿の中で足していて、少し古くてもよい: のこりに余裕をとってある)
+            return unsafe { due(&*self.journal.0.as_ptr(), &*self.cache.0.as_ptr()) };
+        }
+        due(&self.journal.borrow(), &self.cache.borrow())
     }
 
     /// 大きなロックなしの書きかえ (fast_create、fast_unlink) の中: write_op と同じく、眠って待っている読みに知らせ、
     /// この中の読みは眠らせない (noio なので、キャッシュになければ EAGAIN)。書き出しはしない
     fn fast_write<T>(&self, f: impl FnOnce() -> T) -> T {
-        self.wgen.set(self.wgen.get() + 1);
-        self.writing.set(self.writing.get() + 1);
+        self.wgen.inc();
+        self.writing.inc();
         let r = f();
-        self.writing.set(self.writing.get() - 1);
-        self.wgen.set(self.wgen.get() + 1);
+        self.writing.dec();
+        self.wgen.inc();
         r
     }
 
@@ -2769,21 +3066,29 @@ impl ExtFs {
         if self.ro || name.len() > 255 || name.is_empty() || name == "." || name == ".." || self.flush_due() {
             return None;
         }
+        // ディレクトリをなめてから書きかえるまで、ほかの作る・消すを入れない (いっしょに持つものどうし: Linux の i_rwsem)
+        let _d = dir_lock(dir);
         let ino = crate::proc::noio(|| {
             let pr = self.read_inode(dir).ok()?;
             if pr.mode() & S_IFMT != S_IFDIR || pr.links() == 0 || pr.flags() & (INDEX_FL | IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&pr.perm_meta(), crate::cred::W | crate::cred::X, false) {
                 return None;
             }
             let slot = self.new_slot(dir, &pr, name).ok()??;
-            let (g, bit) = self.pick_inode(self.group_of(dir))?;
-            let ino = g * self.ipg + bit + 1;
-            if !self.cached(self.inode_loc(ino).0) {
-                return None;
-            }
-            // ここから書きかえる (読むブロックはみなキャッシュにあるので、しくじらない)
+            // inode を選んで印をつける (選んでから印をつけるまで、ほかが同じものを選ばないように)
+            let ino = {
+                let _a = ALLOC.take();
+                let (g, bit) = self.pick_inode(self.group_of(dir))?;
+                let ino = g * self.ipg + bit + 1;
+                if !self.cached(self.inode_loc(ino).0) {
+                    return None;
+                }
+                // ここから書きかえる (読むブロックはみなキャッシュにあるので、しくじらない)
+                self.fast_write(|| {
+                    self.modify_block(self.inode_bitmap(g), |d| d[(bit / 8) as usize] |= 1 << (bit % 8)).ok()?;
+                    Some(self.inode_taken(g, bit, false))
+                })?
+            };
             self.fast_write(|| {
-                self.modify_block(self.inode_bitmap(g), |d| d[(bit / 8) as usize] |= 1 << (bit % 8)).ok()?;
-                let ino = self.inode_taken(g, bit, false);
                 let mode = S_IFREG | (mode & 0o7777);
                 let mut r = self.new_raw(mode, &pr);
                 r.set_links(1);
@@ -2804,49 +3109,80 @@ impl ExtFs {
     /// 大きなロックなしの unlinkat (fastdir.rs。ext4 のロックを持って): ディレクトリ dir のふつうのファイル name を消す。
     /// ふつうの道 (unlink_node) と同じ書きかたで、同じ答えになるときだけ (fast_create と同じく、書きかえる前にみな確かめる)。
     /// だれも使っていない (開いている fd、パスの覚え、棚、mmap のどれも ExtInode を持っていない) ものだけ: 使っているものは
-    /// ふつうの道が、パスの覚えを捨ててから (forget_path) 消す。消したら true
-    pub fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> bool {
+    /// ふつうの道が、パスの覚えを捨ててから (forget_path) 消す
+    pub fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink {
         if self.ro || name.is_empty() || name == "." || name == ".." || self.flush_due() {
-            return false;
+            return FastUnlink::No;
         }
+        let alone = !shared_here();
+        let _d = dir_lock(dir);
         crate::proc::noio(|| {
-            let Ok(dr) = self.read_inode(dir) else { return false };
+            let Ok(dr) = self.read_inode(dir) else { return FastUnlink::No };
             if dr.mode() & S_IFMT != S_IFDIR || dr.flags() & (INDEX_FL | IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&dr.perm_meta(), crate::cred::W | crate::cred::X, false) {
-                return false;
+                return FastUnlink::No;
             }
-            let Ok(Some((child, at))) = self.entry_at(dir, &dr, name) else { return false };
-            let Ok(mut r) = self.read_inode(child) else { return false };
+            let Ok(Some((child, at))) = self.entry_at(dir, &dr, name) else { return FastUnlink::No };
+            let Ok(mut r) = self.read_inode(child) else { return FastUnlink::No };
             if r.mode() & S_IFMT != S_IFREG || r.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 || r.links() == 0 {
-                return false;
+                return FastUnlink::No;
+            }
+            // いっしょに持っているときは、リンクが 1 つで中身のブロックがないものだけ: ほかの名前があれば、ほかの
+            // ディレクトリで同時に消されて、リンクの数を取りあう。ブロックを返すと、キャッシュの表から捨てる (いっしょに
+            // 持っているものは、表を帳簿のロックなしで引く)。ほかはひとりで持ちなおして
+            if !alone && (r.links() != 1 || r.blocks512(self.bsize) != 0) {
+                return FastUnlink::Alone;
             }
             // sticky なディレクトリでは、持ち主 (ファイルかディレクトリ) か root だけ (sysfile の sticky_ok)
             let dm = dr.perm_meta();
             if dm.mode & crate::cred::S_ISVTX != 0 && c.euid != 0 && c.euid != dm.uid && r.perm_meta().uid != c.euid {
-                return false;
+                return FastUnlink::No;
             }
-            if self.users.borrow().get(&child).is_some_and(|&n| n > 0) || self.orphans.borrow().contains(&child) || self.linkable.borrow().contains(&child) || self.swapfiles.borrow().contains(&child) {
-                return false;
+            {
+                let _b = book();
+                if self.users.borrow().get(&child).is_some_and(|&n| n > 0) || self.orphans.borrow().contains(&child) || self.linkable.borrow().contains(&child) || self.swapfiles.borrow().contains(&child) {
+                    return FastUnlink::No;
+                }
             }
             if r.links() == 1 && !self.release_cached(child, &r) {
-                return false;
+                return FastUnlink::No;
             }
             // ここから書きかえる (ふつうの道の unlink_node と同じ)
             self.fast_write(|| {
                 if self.remove_at(dir, dr, at).is_err() {
                     println!("extfs: fast unlink of {} in {} broke off", name, dir);
-                    return false;
+                    return FastUnlink::No;
                 }
                 r.set_links(r.links() - 1);
                 put32(&mut r.0, 12, now_secs());
-                let done = if r.links() == 0 { self.release(child, &mut r) } else { self.write_inode(child, &r) };
+                let done = if r.links() == 0 {
+                    // inode とブロックを返す (ビットマップと数は ALLOC の中で)
+                    let _a = ALLOC.take();
+                    self.release(child, &mut r)
+                } else {
+                    self.write_inode(child, &r)
+                };
                 if done.is_err() {
                     println!("extfs: fast unlink of {} in {} broke off after removing the name", name, dir);
                 }
-                true
+                FastUnlink::Done
             })
         })
     }
 
+}
+
+/// ExtFs::fast_unlink の答え
+#[derive(Clone, Copy, PartialEq)]
+pub enum FastUnlink {
+    /// 消した
+    Done,
+    /// ふつうの道へ (何も変えていない)
+    No,
+    /// ext4 のロックをひとりで持ちなおせば消せる (何も変えていない)
+    Alone,
+}
+
+impl ExtFs {
     /// release (消したファイルの後片づけ) が読むブロックがみなキャッシュにあるか: inode のビットマップと、中身のブロックの
     /// ビットマップ。中身は extents の根 (inode の中) にあるものだけ (索引のある木や、ext2 の間接ブロックはふつうの道へ)
     fn release_cached(&self, ino: u32, r: &Raw) -> bool {
@@ -2897,7 +3233,7 @@ impl ExtFs {
 }
 
 pub struct ExtInode {
-    /// Rc<ExtFs> の数を変えるのは ext4 のロックの中だけ (Drop も、ロックの中で落とす)
+    /// Rc<ExtFs> の数を変えるのは ext4 のロックの中だけ (Drop も、ロックの中で落とす。いっしょに持っているときは帳簿の中で)
     fs: ManuallyDrop<Rc<ExtFs>>,
     ino: u32,
     /// meta() の覚え (ExtFs の meta_ver が同じあいだ)。開いたファイルの fstat、lseek が metas の木を引かないように
@@ -2907,6 +3243,29 @@ pub struct ExtInode {
 
 impl Drop for ExtInode {
     fn drop(&mut self) {
+        // たいていは数を減らすだけ: ext4 のロックをいっしょに持って (閉じる close と、作る・消す fastdir が同時に動く)
+        {
+            let _e = fs_lock_shared();
+            let _b = book();
+            let quick = {
+                let mut u = self.fs.users.borrow_mut();
+                let n = u.entry(self.ino).or_insert(1);
+                if *n > 1 || !self.fs.orphans.borrow().contains(&self.ino) {
+                    *n -= 1;
+                    if *n == 0 {
+                        u.remove(&self.ino);
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if quick {
+                unsafe { ManuallyDrop::drop(&mut self.fs) };
+                return;
+            }
+        }
+        // 消したが使われていたもの (orphan) の最後: 片づけはひとりで持って
         let _e = fs_lock();
         self.release_ref();
         unsafe { ManuallyDrop::drop(&mut self.fs) };
@@ -2946,6 +3305,8 @@ impl ExtInode {
     }
 
     fn counted(fs: &Rc<ExtFs>, ino: u32) -> ExtInode {
+        // Rc<ExtFs> の数も帳簿の中で (いっしょに持つものも数を変える: fast_create と ExtInode の Drop)
+        let _b = book();
         *fs.users.borrow_mut().entry(ino).or_insert(0) += 1;
         ExtInode { fs: ManuallyDrop::new(fs.clone()), ino, meta: Cell::new(None) }
     }
@@ -3060,12 +3421,12 @@ impl ExtInode {
         crate::vm::write_permit_drop(self.id());
         let fs = &self.fs;
         // 眠ってディスクを待っている読みに、書いたことを知らせる (起きたらやりなおす)。この中の読みは眠らない
-        fs.wgen.set(fs.wgen.get() + 1);
-        fs.writing.set(fs.writing.get() + 1);
+        fs.wgen.inc();
+        fs.writing.inc();
         let r = f();
         let fl = fs.maybe_flush();
-        fs.writing.set(fs.writing.get() - 1);
-        fs.wgen.set(fs.wgen.get() + 1);
+        fs.writing.dec();
+        fs.wgen.inc();
         r.and_then(|v| fl.map(|_| v))
     }
 
@@ -3145,7 +3506,7 @@ impl ExtInode {
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
         }
-        put32(&mut r.0, 0x64, crate::rand::u64() as u32); // i_generation
+        put32(&mut r.0, 0x64, crate::rand::u32()); // i_generation
         if fs.inode_size > 128 {
             put16(&mut r.0, 0x80, 32); // i_extra_isize
         }

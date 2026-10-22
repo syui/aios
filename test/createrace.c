@@ -13,6 +13,8 @@
 //             決まった大きさ) を答える (古い答えを覚えていない)
 //   race      4 つのプロセスがそれぞれのディレクトリで、4 つが同じディレクトリでちがう名前を、作って消すのをくりかえす。
 //             そのあいだ 1 つが同じディレクトリを読みつづける。終わったら空で、作った数と消した数が合う
+//   mixrace   4 つのプロセスが同時に、中身のあるファイルとハードリンクのあるファイルを作って消す。終わったら空で、
+//             空いている inode とブロックの数 (statfs) がはじめと同じ
 //   inotify   IN_CREATE と IN_DELETE の見張りを置いたディレクトリでは、作った数と消した数だけできごとが来る
 // aios なら /proc/bkl の「作った」「消した」の数が増えたか (ロックなしの道を通ったか) も見る。Linux でも同じに通る。
 // 1 行に ok NAME か FAIL NAME、おしまいに createrace: N failed
@@ -310,6 +312,62 @@ static void race(void) {
   munmap(res, 4096);
 }
 
+// 4 つのプロセスが同時に、自分のディレクトリと同じディレクトリで、中身のあるファイル (消すとブロックを返す) と、
+// ハードリンクのあるファイル (リンクが 2 つ) を作って消す。終わったら空で、空いている inode とブロックの数 (statfs) が
+// はじめと同じ (取る・返すの数を取りあうと、ここがずれる)
+static void mixrace(void) {
+  enum { W = 4, N = 400 };
+  mkdir(at(0, "mix"), 0755);
+  for (int i = 0; i < W; i++) mkdir(at(1, "mix%d", i), 0755);
+  struct statfs s0, s1;
+  int have0 = statfs(base, &s0) == 0;
+  int *res = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  memset(res, 0, 4096);
+  pid_t pids[W];
+  for (int w = 0; w < W; w++) {
+    pids[w] = fork();
+    if (pids[w] == 0) {
+      static char buf[9000];
+      memset(buf, 'a' + w, sizeof buf);
+      int bad = 0;
+      for (int i = 0; i < N; i++) {
+        const char *own = at(2, "mix%d/f", w), *lnk = at(3, "mix/l%d-%d", w, i % 5);
+        int fd = open(own, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) {
+          bad++;
+          continue;
+        }
+        ssize_t size = (i % 3) * 4500;
+        if (size && write(fd, buf, size) != size) bad++;
+        close(fd);
+        int linked = i % 2;
+        if (linked && link(own, lnk) != 0) bad++;
+        if (unlink(own) != 0) bad++;
+        if (linked) {
+          struct stat st;
+          if (stat(lnk, &st) != 0 || st.st_size != size || st.st_nlink != 1) bad++;
+          if (unlink(lnk) != 0) bad++;
+        }
+      }
+      res[w] = bad;
+      _exit(0);
+    }
+  }
+  int ok = 1;
+  for (int w = 0; w < W; w++) {
+    int st;
+    ok &= waitpid(pids[w], &st, 0) == pids[w] && WIFEXITED(st) && WEXITSTATUS(st) == 0 && res[w] == 0;
+  }
+  CHECK("mix-workers", ok);
+  int e = count_entries(at(0, "mix"), NULL);
+  for (int i = 0; i < W; i++) e += count_entries(at(1, "mix%d", i), NULL);
+  CHECK("mix-empty", e == 0);
+  CHECK("mix-counts", have0 && statfs(base, &s1) == 0 && s1.f_ffree == s0.f_ffree && s1.f_bfree == s0.f_bfree);
+  for (int i = 0; i < W; i++) rmdir(at(1, "mix%d", i));
+  rmdir(at(0, "mix"));
+  munmap(res, 4096);
+}
+
 static void inotify_case(void) {
   const char *d = at(0, "ino");
   mkdir(d, 0755);
@@ -357,6 +415,7 @@ int main(int argc, char **argv) {
     bigdir();
     stale();
     race();
+    mixrace();
     long c1 = fast_count("作った"), u1 = fast_count("消した");
     // aios の ext4 なら、ロックなしの道を通ったはず (inotify の見張りを置くと、それからはふつうの道)
     if (ext4 && c0 >= 0) CHECK("fast-path", c1 > c0 && u1 > u0);
