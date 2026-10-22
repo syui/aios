@@ -27,7 +27,7 @@ const N: usize = 1024;
 /// 版の箱の数
 const BOXES: usize = 4096;
 /// パスの長さの上限 (先頭の / なし、cwd をつけたあと)
-const PATH: usize = 192;
+pub const PATH: usize = 192;
 /// 覚える、通ったディレクトリと gates の数の上限
 const DIRS_MAX: usize = 12;
 const GATES_MAX: usize = 4;
@@ -273,6 +273,29 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
         })
     };
     count(r)
+}
+
+/// 大きなロックなしの open (file::fast_open) が引く答え: リンクをたどった stat か、ない
+pub enum Open {
+    Found(Stat),
+    Missing,
+}
+
+/// file::fast_open: path (dirfd からの、リンクをたどる) が表にあって、いまも正しく、呼んだ人が途中を通れれば、その答えと
+/// norm に畳んだパスの長さ。でなければ None (ふつうの道へ)。stat の数 (HITS / MISSES) には入れない
+pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) -> Option<(Open, usize)> {
+    find(p, dirfd, pathp, true, norm).map(|(a, len)| {
+        let a = match a {
+            Answer::Found(s, _) => Open::Found(s),
+            Answer::Missing => Open::Missing,
+        };
+        (a, len)
+    })
+}
+
+/// 全体の版 (マウントやルートが変わると増える: epoch_bump)。file の棚 (Shelf) が、しまったときの版とくらべる
+pub fn epoch() -> u64 {
+    EPOCH.load(Acquire)
 }
 
 fn count(r: Option<i64>) -> Option<i64> {

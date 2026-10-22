@@ -110,6 +110,11 @@ pub struct OpenFile {
     /// ふつうのファイルを読んでいる途中 (read_inode_file。ディスクを眠って待つことがある)。同じ開いたファイルを
     /// 読むほかの人は、終わるまで待つ (オフセットを同時に進めない)
     reading: bool,
+    /// 閉じたら棚 (Shelf) にしまってよい: ext4 のふつうのファイルを、読むだけの口で、ほかの印なしに開いたもの
+    /// (sysfile::open_found がつける)
+    pub reuse: bool,
+    /// flock か OFD ロックを置いたことがある (閉じるときに外す): 棚にはしまわない
+    pub locked: bool,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
@@ -128,7 +133,243 @@ pub struct Dirents {
 }
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false }))
+}
+
+/// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
+/// 閉じるとき、ほかにだれも持っていず (dup も fork もしていない)、ロックも IN_OPEN / IN_CLOSE の見張りもなければ、
+/// OpenFile を捨てずにここへしまう (大きなロックなしの close: fast_close)。同じパスを同じ口でまた開くとき、statc の表が、
+/// そのパスはいまも同じ inode をさし、呼んだ人が読めると答えれば、棚から出していちばん小さい空いた fd に置く
+/// (大きなロックなしの open: fast_open)。どちらも Rc の参照の数は変えない (動かすだけ)。棚のものを捨てるのは大きなロックの
+/// 中だけ: ファイルを消して inode のリンクが 0 になったとき (extfs の unlink_node: 消したファイルの場所がすぐ返るように)、
+/// umount、IN_OPEN / IN_CLOSE の見張りを置くとき、exec と exit (表といっしょに)。マウントが変わったあとのものは
+/// (statc の版がちがう) 使わない
+pub struct Shelf(crate::spinlock::SpinLock<Vec<Shelved>>);
+
+impl Default for Shelf {
+    fn default() -> Self {
+        Self(crate::spinlock::SpinLock::new(Vec::new()))
+    }
+}
+
+struct Shelved {
+    file: FileRef,
+    /// しまったときの statc の全体の版
+    epoch: u64,
+}
+
+/// fork や exec で表を写すとき、棚は空から (しまったものは、その表のもの)
+impl Clone for Shelf {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// 表が落ちる (exit、exec で前の表を手放す): しまってあったものもいっしょに落ちる
+impl Drop for Shelf {
+    fn drop(&mut self) {
+        let n = self.0.lock().len();
+        SHELVED.fetch_sub(n, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 1 つの表の棚にしまう数の上限
+const SHELF_MAX: usize = 8;
+
+/// 棚にあるものの数 (みなの表の。0 なら捨てるときに表をなめない)
+static SHELVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// reuse の印のついた OpenFile の数 (表にあるものも棚にあるものも。0 なら、ファイルを消すときに表をなめない)
+pub static REUSABLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// IN_OPEN か IN_CLOSE を待つ見張りが置かれたことがある (大きなロックなしの open / close はできごとを出さないので、
+/// それからはふつうの道で)
+pub static OPEN_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 大きなロックなしの open / close の数: [0] 棚から開いた、[1] ない (ENOENT) と答えた、[2] 棚にしまった、
+/// ふつうの道へ: [3] statc の表にない・古い、[4] 棚にない、[5] 開けない形 (フラグ、fd の表、見張り)、
+/// [6] しまえない (分けている、ロック、棚がいっぱい)。/proc/bkl に出す
+pub static FAST_OPEN: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn note(i: usize) {
+    FAST_OPEN[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 大きなロックなしの openat (syscall::fast): O_RDONLY (と O_CLOEXEC / O_LARGEFILE / O_NOCTTY) だけで、絶対のパスか
+/// いまのディレクトリからのもの。statc の表が「ない」と答えれば ENOENT (ふつうの道と同じわけを /proc/ai/why に)、
+/// ふつうのファイルで呼んだ人が読めて、同じパスと inode と口のものが棚にあれば、それを置く。ほかは None (ふつうの道へ)
+pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
+    use core::sync::atomic::Ordering::Relaxed;
+    const O_LARGEFILE: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const OPENAT: u64 = 56;
+    if flags & !(O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) {
+        note(5);
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    if !files.private() {
+        note(5);
+        return None;
+    }
+    let mut norm = [0u8; crate::statc::PATH];
+    let Some((ans, len)) = crate::statc::open_lookup(me, dirfd, pathp, &mut norm) else {
+        note(3);
+        return None;
+    };
+    let st = match ans {
+        crate::statc::Open::Missing => {
+            crate::why::fast_missing(me, OPENAT, core::str::from_utf8(&norm[..len]).unwrap_or("?"));
+            note(1);
+            return Some(-2);
+        }
+        crate::statc::Open::Found(st) => st,
+    };
+    // 読めなければ、ふつうの道が EACCES とそのわけを
+    let m = vfs::Meta { mode: st.mode, uid: st.uid, gid: st.gid, ..vfs::Meta::default() };
+    if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, crate::cred::R, false) {
+        note(5);
+        return None;
+    }
+    let t = files.get();
+    // いちばん小さい空いた fd (表を伸ばすのはふつうの道で)
+    let Some(fd) = (0..t.fds.len().min(t.nofile)).find(|&i| t.fds[i].is_none()) else {
+        note(5);
+        return None;
+    };
+    let want = (flags & O_LARGEFILE) as u32;
+    let epoch = crate::statc::epoch();
+    let key = &norm[..len];
+    // 表に置くのも棚のロックの中で (大きなロックの中の shelf_forget が、表と棚をいっしょに見る)
+    let mut shelf = t.shelf.0.lock();
+    let i = shelf.iter().position(|s| {
+        let of = unsafe { &*s.file.as_ptr() };
+        s.epoch == epoch && of.flags == want && matches!(&of.kind, Kind::Inode(ino, path) if ino.id().1 == st.ino && path.as_bytes() == key)
+    });
+    let Some(i) = i else {
+        drop(shelf);
+        note(4);
+        return None;
+    };
+    let file = shelf.swap_remove(i).file;
+    // 棚のものは自分だけのもの (しまうときに確かめ、棚にあるあいだはだれも見つけられない): 借りずに開きなおしの形に
+    let of = unsafe { &mut *file.as_ptr() };
+    of.offset = 0;
+    of.dirents = None;
+    of.reading = false;
+    t.fds[fd] = Some(proc::Fd { file, cloexec: flags & O_CLOEXEC != 0 });
+    drop(shelf);
+    SHELVED.fetch_sub(1, Relaxed);
+    note(0);
+    Some(fd as i64)
+}
+
+/// 大きなロックなしの close (syscall::fast): 閉じる fd が、自分だけが持っている棚にしまってよいファイル (OpenFile::reuse) で、
+/// ロック (flock / OFD、この表の POSIX のロック) も IN_OPEN / IN_CLOSE の見張りもなければ、表から外して棚に。
+/// OpenFile は落とさないので、落とすときの後片づけ (ロックを外す、IN_CLOSE) はいらない。ほかは None (ふつうの道へ)
+pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let files = me.files.as_ref()?;
+    if !files.private() || OPEN_WATCHED.load(Relaxed) || crate::fail::ON.load(Relaxed) {
+        return None;
+    }
+    let t = files.get();
+    let slot = t.fds.get_mut(fd as usize)?;
+    let f = &slot.as_ref()?.file;
+    let of = unsafe { &*f.as_ptr() };
+    if !of.reuse || of.locked || t.posix_locked || Rc::strong_count(f) != 1 {
+        note(6);
+        return None;
+    }
+    let mut shelf = t.shelf.0.lock();
+    // reuse は棚のロックの中でもう一度 (ファイルを消すとき、shelf_forget がこのロックの中で落とす)
+    if shelf.len() >= SHELF_MAX || !unsafe { (*slot.as_ref()?.file.as_ptr()).reuse } {
+        drop(shelf);
+        note(6);
+        return None;
+    }
+    let file = slot.take()?.file;
+    shelf.push(Shelved { file, epoch: crate::statc::epoch() });
+    drop(shelf);
+    SHELVED.fetch_add(1, Relaxed);
+    note(2);
+    Some(0)
+}
+
+/// 大きなロックの中で: 棚から、which が真のものを捨てる (みなの表の)。捨てた OpenFile はそこで落ちる。open_too なら、
+/// 表で開いているもののうち which が真のものも、もう棚にしまわない (reuse を落とす。棚のロックの中で: fast_close は
+/// しまう前にそのロックの中で reuse を見なおす)
+fn shelf_drop(open_too: bool, mut which: impl FnMut(&OpenFile) -> bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if SHELVED.load(Relaxed) == 0 && (!open_too || REUSABLE.load(Relaxed) == 0) {
+        return;
+    }
+    let mut out: Vec<FileRef> = Vec::new();
+    proc::each_files(|t| {
+        let mut shelf = t.shelf.0.lock();
+        if open_too {
+            for fd in t.fds.iter().flatten() {
+                // 借りずに (持ち主が大きなロックなしで見ているかもしれない。こちらは印を落とすだけ)
+                let of = unsafe { &mut *fd.file.as_ptr() };
+                if of.reuse && which(of) {
+                    of.reuse = false;
+                    REUSABLE.fetch_sub(1, Relaxed);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < shelf.len() {
+            if which(&shelf[i].file.borrow()) {
+                out.push(shelf.swap_remove(i).file);
+            } else {
+                i += 1;
+            }
+        }
+    });
+    SHELVED.fetch_sub(out.len(), Relaxed);
+    // 落とすのは棚のロックの外で (OpenFile と inode の後片づけは大きなロックの中の仕事)
+    drop(out);
+}
+
+/// 大きなロックの中で: f を閉じても棚にはしまわない (epoll に入れたものなど、落ちることを見ている人がいる)
+pub fn no_reuse(f: &FileRef) {
+    let mut b = f.borrow_mut();
+    if b.reuse {
+        b.reuse = false;
+        REUSABLE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// inode id のリンクが 0 になる (消した、上書きした): 棚のものを捨てる (ほかに開いている人がいなければ、そこで片づく)。
+/// いま開いているもの (消したあとも読める) も、閉じたら棚にはしまわない (しまうと、消したファイルの場所が返らない)
+pub fn shelf_forget(id: (usize, u64)) {
+    shelf_drop(true, |of| matches!(&of.kind, Kind::Inode(ino, _) if ino.id() == id));
+}
+
+/// 棚をみな空に (umount、IN_OPEN / IN_CLOSE の見張りを置くとき)
+pub fn shelf_flush_all() {
+    shelf_drop(false, |_| true);
+}
+
+/// 大きなロックの中の close から: 自分の棚の、マウントが変わる前のもの (もう使えない) を捨てる。いっぱいなら、
+/// いちばん古いものも (名前を変えたものなど、もう開かれないものが棚をふさがないように)
+pub fn shelf_prune(t: &mut proc::Files) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let epoch = crate::statc::epoch();
+    let old: Vec<FileRef> = {
+        let mut shelf = t.shelf.0.lock();
+        if shelf.len() < SHELF_MAX && shelf.iter().all(|s| s.epoch == epoch) {
+            return;
+        }
+        let (mut keep, old): (Vec<Shelved>, Vec<Shelved>) = core::mem::take(&mut *shelf).into_iter().partition(|s| s.epoch == epoch);
+        let mut old: Vec<FileRef> = old.into_iter().map(|s| s.file).collect();
+        if keep.len() >= SHELF_MAX {
+            old.push(keep.remove(0).file);
+        }
+        *shelf = keep;
+        old
+    };
+    SHELVED.fetch_sub(old.len(), Relaxed);
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない
@@ -927,6 +1168,9 @@ fn dtype(mode: u32) -> u8 {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
+        if self.reuse {
+            REUSABLE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
         // flock のロックと OFD ロックは OpenFile ごと (その場所で見分ける): 最後の参照が閉じたら外す
         crate::locks::release_file(self as *const OpenFile as usize);
         match &self.kind {

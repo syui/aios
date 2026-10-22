@@ -181,6 +181,8 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
                 return Err(-EEXIST);
             }
             file::mark_epolled(&target);
+            // epoll は開いたファイルを弱い参照で見る (閉じて落ちたら登録も消える): 棚にしまうと落ちないので、しまわない
+            file::no_reuse(&target);
             ep.entries.insert(fd, Entry { file: Rc::downgrade(&target), events, data, last: 0, last_gen: target.borrow().event_gen().wrapping_sub(1) });
         }
         EPOLL_CTL_MOD => {

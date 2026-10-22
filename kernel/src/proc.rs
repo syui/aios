@@ -107,6 +107,11 @@ pub struct Files {
     pub umask: u32,
     /// 大きなロックなしの read / write (file::Pipe::fast_rw) が、ほかのスレッドと分けている表を見るための門
     pub gate: Gate,
+    /// 閉じたふつうのファイルの棚 (file::Shelf。大きなロックなしの open / close が使う。fork と exec では受けつがない)
+    pub shelf: crate::file::Shelf,
+    /// この表 (POSIX のロックの持ち主) が fcntl のレコードロックを置いたことがある: 閉じるたびに外すものがあるかもしれない
+    /// ので、大きなロックなしの close (file::fast_close) はしない
+    pub posix_locked: bool,
 }
 
 impl Drop for Files {
@@ -543,6 +548,17 @@ pub fn fallible_leave() {
     }
 }
 
+/// 生きているプロセスとスレッドの fd の表をみな (分けているものは何度も。file の棚を捨てるときに)
+pub fn each_files(mut f: impl FnMut(&mut Files)) {
+    for p in live() {
+        if p.state != State::Unused
+            && let Some(files) = &p.files
+        {
+            f(files.get());
+        }
+    }
+}
+
 /// 生きているプロセス (代表スレッド) をみな (Vec を使わない: oom.rs は取れないときに呼ばれる)
 pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
     for p in live() {
@@ -817,7 +833,7 @@ pub fn user_init() {
     }
     let p = alloc_proc().expect("user_init: no proc slot");
     p.load_image(img);
-    let mut files = Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default() };
+    let mut files = Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false };
     let console = file::new(Kind::Tty(crate::tty::console()), 2);
     for _ in 0..3 {
         files.add(console.clone(), false, 0);

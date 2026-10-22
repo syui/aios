@@ -908,6 +908,15 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             None => return false,
         },
         CLOSE if crate::file::fast_close_badf(p, a[0]) => -EBADF,
+        // 読むだけで開いた ext4 のファイルの close と、それをまた開く openat (file::Shelf)、ない (ENOENT) ものの openat
+        CLOSE => match crate::file::fast_close(p, a[0]) {
+            Some(r) => r,
+            None => return false,
+        },
+        OPENAT => match crate::file::fast_open(p, a[0] as i32 as i64, a[1] as usize, a[2]) {
+            Some(r) => r,
+            None => return false,
+        },
         // umask は fd の表 (Linux の fs_struct と同じくスレッドで分ける) のもの。だれとも分けていなければ、変えるのも自分だけ
         UMASK => match p.files.as_ref().filter(|f| f.private()) {
             Some(f) => {

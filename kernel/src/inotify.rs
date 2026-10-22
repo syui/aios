@@ -128,6 +128,12 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     if keep & IN_MODIFY != 0 {
         crate::vm::write_permits_revoke();
     }
+    // 大きなロックなしの open / close (file の棚) は IN_OPEN と IN_CLOSE を出さない: これからはふつうの道で。
+    // 棚にしまってあるものは、ここで閉じる (見張りが置かれる前なので、できごとはない)
+    if keep & (IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) != 0 {
+        crate::file::OPEN_WATCHED.store(true, core::sync::atomic::Ordering::SeqCst);
+        crate::file::shelf_flush_all();
+    }
     let mut n = n.borrow_mut();
     if let Some(w) = n.watches.iter_mut().find(|w| w.id == id) {
         if mask & IN_MASK_CREATE != 0 {

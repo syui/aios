@@ -220,6 +220,14 @@ pub fn fcntl(file: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, 
         (key(&b).ok_or_else(|| crate::why::inval())?, ptr_of(&b), mode == crate::file::O_RDONLY || mode == crate::file::O_RDWR, mode == crate::file::O_WRONLY || mode == crate::file::O_RDWR, b.offset as i64, size)
     };
     let owner = if ofd { Owner::Ofd(fptr) } else { Owner::Posix(files) };
+    // ロックを置く (外すのも): 閉じるときに外すものがあるかもしれないので、大きなロックなしの close (棚) はもうしない
+    if !getlk {
+        if ofd {
+            file.borrow_mut().locked = true;
+        } else {
+            proc::current().files().posix_locked = true;
+        }
+    }
     if getlk {
         // Linux の fcntl_getlk の順: 種類 (OFD なら F_UNLCK も)、範囲、OFD の l_pid
         if !ofd && l_type != F_RDLCK && l_type != F_WRLCK {
@@ -368,6 +376,8 @@ pub fn flock(fd: u64, op: u64) -> Result<i64, i64> {
     if !un && !usable {
         return Err(-EBADF);
     }
+    // 閉じるときに外すものがあるかもしれない: 大きなロックなしの close (棚) はもうしない
+    f.borrow_mut().locked = true;
     loop {
         let v = flocks().entry(key).or_default();
         if let Some(i) = v.iter().position(|l| l.file == me) {

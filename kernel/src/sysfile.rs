@@ -1053,8 +1053,24 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
     if flags & O_CREAT != 0 {
         return open_found(create_target(start, &cwd, &path, follow)?, flags, mode);
     }
-    open_found(Ok(lookup(follow)?), flags, mode)
+    // 大きなロックなしの open (file::fast_open) が引けるように、読むだけで開くものの答えを statc に覚えさせる
+    // (newfstatat と同じく、開いているディレクトリからのものは覚えない。「ない」も)
+    let learn = flags & !SIMPLE_OPEN == 0 && (dirfd == AT_FDCWD || path.starts_with('/'));
+    let found = match lookup(follow) {
+        Err(e) if e == -ENOENT && learn => {
+            crate::statc::learn_missing(&path, true);
+            return Err(e);
+        }
+        r => r?,
+    };
+    if learn && found.1.fast_stat() {
+        crate::statc::learn(&path, true, &found.1, &Stat::of_inode(&found.1), mgtime(&found.1));
+    }
+    open_found(Ok(found), flags, mode)
 }
+
+/// 大きなロックなしの open が開けるフラグ (O_RDONLY と、O_LARGEFILE、O_CLOEXEC、O_NOCTTY): file::fast_open
+const SIMPLE_OPEN: u64 = 0o400000 | O_CLOEXEC | 0o400;
 
 /// O_CREAT で開くもの: あるもの (パス, inode) か、作るところ (親, 名前, パス)。Linux の open_last_lookups と同じく、
 /// 最後の名前がリンクなら (follow のとき) その中身をリンクのあるディレクトリからたどり、中身の最後の名前で
@@ -1358,8 +1374,14 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
     if kind.is_none() {
         inotify::file_event(&full, &ino, inotify::IN_OPEN);
     }
+    // 閉じたら棚にしまってよいもの (file::Shelf): ext4 のふつうのファイルを、読むだけの口でほかの印なしに
+    let reuse = kind.is_none() && flags & !SIMPLE_OPEN == 0 && ino.meta().mode & S_IFMT == vfs::S_IFREG && ino.fast_stat();
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
     let f = file::new(kind, file_flags(flags));
+    if reuse {
+        f.borrow_mut().reuse = true;
+        file::REUSABLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
@@ -1372,6 +1394,8 @@ pub fn close(fd: u64) -> R {
     // 閉じたもの (最後の参照なら OpenFile も) は、表を変え終わってから落とす
     let old = p.set(fd as usize, None);
     drop(old);
+    // 棚のもので、マウントが変わる前のもの (もう開きなおせない) を捨てる
+    file::shelf_prune(p);
     Ok(0)
 }
 

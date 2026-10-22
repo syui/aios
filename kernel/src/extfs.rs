@@ -2727,6 +2727,9 @@ impl ExtInode {
         }
         put32(&mut r.0, 12, now_secs());
         if r.links() == 0 {
+            // 閉じたファイルの棚 (file::Shelf) に残っているものは、もう開きなおせない: 捨てる (ほかに開いている人が
+            // いなければ、下で片づく)
+            crate::file::shelf_forget((fs.fs, child as u64));
             if fs.users.borrow().get(&child).is_some_and(|&n| n > 0) {
                 // まだ開かれている (実行中のプログラムなど): 最後に閉じられたときに片付ける
                 fs.orphans.borrow_mut().insert(child);

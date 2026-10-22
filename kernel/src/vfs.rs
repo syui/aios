@@ -371,6 +371,9 @@ pub fn umount(path: &str) -> Result<(), i64> {
     }
     l.remove(i);
     names_changed();
+    drop(l);
+    // 閉じたファイルの棚 (file::Shelf) に、外したものの inode が残らないように
+    crate::file::shelf_flush_all();
     Ok(())
 }
 
