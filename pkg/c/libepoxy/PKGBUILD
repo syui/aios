@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=libepoxy
 pkgver=1.5.10
-pkgrel=2
+pkgrel=3
 pkgdesc='Library handling OpenGL function pointer management (shared, for aios; EGL, no GLX)'
 arch=('aarch64')
 license=('MIT')

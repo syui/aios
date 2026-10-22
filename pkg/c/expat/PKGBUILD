@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=expat
 pkgver=2.9.0
-pkgrel=2
+pkgrel=3
 pkgdesc='XML parser library (shared, for aios)'
 arch=('aarch64')
 license=('MIT')

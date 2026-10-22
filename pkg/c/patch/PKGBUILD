@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=patch
 pkgver=2.8
-pkgrel=3
+pkgrel=4
 pkgdesc='A utility to apply patch files to original sources (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/patch/'

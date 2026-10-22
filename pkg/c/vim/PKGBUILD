@@ -3,7 +3,7 @@
 #   vi と view も vim へのリンク (aish の C-g / M-. は $EDITOR か vi で開く)
 pkgname=vim
 pkgver=9.2.1202
-pkgrel=1
+pkgrel=2
 pkgdesc='Vi Improved, a highly configurable, improved version of the vi text editor (static, terminal, for aios)'
 arch=('aarch64')
 url='https://www.vim.org'

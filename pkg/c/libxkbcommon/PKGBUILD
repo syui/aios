@@ -4,7 +4,7 @@
 # ビルドには meson と ninja と bison が要る
 pkgname=libxkbcommon
 pkgver=1.13.2
-pkgrel=2
+pkgrel=3
 pkgdesc='Keymap handling library for toolkits and window systems (shared, for aios)'
 arch=('aarch64')
 url='https://xkbcommon.org/'

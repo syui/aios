@@ -11,7 +11,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=vlc
 pkgver=3.0.24
-pkgrel=3
+pkgrel=4
 pkgdesc='Multi-platform media player: libvlc and plugins, ncurses interface, Wayland video, ALSA audio (shared, for aios)'
 arch=('aarch64')
 url='https://www.videolan.org/vlc/'

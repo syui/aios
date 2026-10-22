@@ -3,7 +3,7 @@
 #   pkg/c/zig.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 pkgname=libdrm
 pkgver=2.4.134
-pkgrel=2
+pkgrel=3
 pkgdesc='Userspace interface to kernel DRM services (shared, for aios)'
 arch=('aarch64')
 url='https://dri.freedesktop.org/'

@@ -2,7 +2,7 @@
 # ビルドは pkg/c/zig.sh の Zig (aarch64-linux-musl)。/opt/c に入れる
 pkgname=zstd
 pkgver=1.5.7
-pkgrel=2
+pkgrel=3
 pkgdesc='Zstandard compression (zstd command and libzstd, for aios)'
 arch=('aarch64')
 url='https://facebook.github.io/zstd/'

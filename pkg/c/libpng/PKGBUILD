@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=libpng
 pkgver=1.6.59
-pkgrel=2
+pkgrel=3
 pkgdesc='PNG reference library (shared, for aios)'
 arch=('aarch64')
 license=('libpng-2.0')

@@ -2,7 +2,7 @@
 #   共有ライブラリ (/opt/c/lib/libffi.so.8)。動かすには musl
 pkgname=libffi
 pkgver=3.8.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Portable foreign function interface library (shared, for aios)'
 arch=('aarch64')
 url='https://sourceware.org/libffi/'

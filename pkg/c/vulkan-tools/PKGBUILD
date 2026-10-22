@@ -3,7 +3,7 @@
 #   ビルドには cmake、ninja、このマシンの wayland-scanner (Debian / Ubuntu: libwayland-bin) が要る。/opt/c に入る
 pkgname=vulkan-tools
 pkgver=1.4.365
-pkgrel=2
+pkgrel=3
 pkgdesc='Vulkan utilities: vulkaninfo and vkcube (Wayland, for aios)'
 arch=('aarch64')
 url='https://github.com/KhronosGroup/Vulkan-Tools'

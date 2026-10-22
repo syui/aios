@@ -4,7 +4,7 @@
 #   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
 pkgname=openssh
 pkgver=10.6p1
-pkgrel=2
+pkgrel=3
 pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
 arch=('aarch64')
 url='https://www.openssh.com/portable.html'

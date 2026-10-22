@@ -3,7 +3,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る
 pkgname=iproute2
 pkgver=7.2.0
-pkgrel=2
+pkgrel=3
 pkgdesc='ss from iproute2, to list sockets (static, for aios)'
 arch=('aarch64')
 url='https://git.kernel.org/pub/scm/network/iproute2/iproute2.git'

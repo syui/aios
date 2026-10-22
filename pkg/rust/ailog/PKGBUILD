@@ -1,7 +1,7 @@
 # aios (aarch64) 用。bin/mkpkg.sh pkg/rust/ailog
 pkgname=ailog
 pkgver=0.0.1
-pkgrel=2
+pkgrel=4
 pkgdesc='ATProto blog CLI'
 arch=('aarch64')
 url='https://git.syui.ai/ai/log'
@@ -20,6 +20,9 @@ build() {
   # rustls の aws-lc (C) を musl のヘッダーで
   musl_zig
   cd log
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): rustls-webpki (RUSTSEC-2026-0382、
+  # 信頼をやめた中間の証明書を通してしまう)、webpki-root-certs (RUSTSEC-2026-0383、emSign の中間の証明書)
+  cargo_update rustls-webpki@0.103.16 webpki-root-certs@1.0.10
   musl_build --bin ailog
 }
 

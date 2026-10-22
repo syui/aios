@@ -3,7 +3,7 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=atk
 pkgver=2.38.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Accessibility toolkit (ATK, the last standalone release; shared, for aios)'
 arch=('aarch64')
 license=('LGPL-2.1-or-later')

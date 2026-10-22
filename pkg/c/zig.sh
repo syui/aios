@@ -8,7 +8,8 @@ ZIG_VERSION=0.17.0
 # (zig_env が $srcdir/.toolchain に書き、mkpkg.sh が入れる)、aish の pkg_check は、いまのものとちがう Zig で
 # 作ったパッケージを rebuild に出す。zig_fix_libc を変えて、作るものが変わるときは 1 つ上げる
 #   1: realloc(p, 0)   2: libc.so の見本のデータ   3: iconv の gb18030 (CVE-2026-6042)
-ZIG_REL=3
+#   4: regcomp の int あふれ (CVE-2026-107891)
+ZIG_REL=4
 PREFIX=/opt/c
 
 zig_sha256() {
@@ -37,9 +38,11 @@ zig_sha256() {
 #    1 秒より長くかけて探し、BMP の終わりと BMP の外のものをまちがえる (U+10000 が U+3404C。CVE-2026-6042)。musl の
 #    上流の直し (pkg/c/musl/CVE-2026-6042.patch。musl のパッケージと同じもの) をあてる。qsort (CVE-2026-40200) は
 #    Zig の libc では Zig のもの (lib/c/stdlib.zig) なので、あてはまらない
+#  - regcomp (lib/libc/musl/src/regex/regcomp.c。静的にリンクしたものはこれを使う): くりかえしの多い正規表現で、
+#    位置や遷移の数の int があふれる (CVE-2026-107891)。musl の上流の直し (pkg/c/musl/CVE-2026-107891.patch) をあてる
 zig_fix_libc() {
   zig_fix_realloc "$1/c/malloc.zig" && zig_fix_stub "$1/libc/musl/libc.S" "$1/libc/musl/src" &&
-    zig_fix_iconv "$1/libc/musl"
+    zig_fix_iconv "$1/libc/musl" && zig_fix_regcomp "$1/libc/musl"
 }
 
 # zig_fix_iconv MUSL_DIR
@@ -50,6 +53,15 @@ zig_fix_iconv() {
   grep -q gb18030utf "$m/src/locale/iconv.c" && return 0
   patch -s -p1 -d "$m" < "$p" && grep -q gb18030utf "$m/src/locale/iconv.c" ||
     { echo "zig.sh: could not fix $m/src/locale/iconv.c" >&2; return 1; }
+}
+
+zig_fix_regcomp() {
+  local m=$1 p
+  p=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/musl/CVE-2026-107891.patch
+  [ -f "$m/src/regex/regcomp.c" ] || return 0
+  grep -q check_add "$m/src/regex/regcomp.c" && return 0
+  patch -s -p1 -d "$m" < "$p" && grep -q check_add "$m/src/regex/regcomp.c" ||
+    { echo "zig.sh: could not fix $m/src/regex/regcomp.c" >&2; return 1; }
 }
 
 zig_fix_realloc() {

@@ -4,7 +4,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る (動的な拡張は使わない)
 pkgname=gawk
 pkgver=5.4.1
-pkgrel=2
+pkgrel=3
 pkgdesc='GNU version of awk, as awk (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/gawk/'

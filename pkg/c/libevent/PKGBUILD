@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=libevent
 pkgver=2.1.13
-pkgrel=2
+pkgrel=3
 pkgdesc='Event notification library (static, without OpenSSL, for aios)'
 arch=('aarch64')
 url='https://libevent.org/'
