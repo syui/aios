@@ -377,7 +377,8 @@ fn measure_aios(root: &Path, cfg: &Cfg, spec: &str) -> Result<Value, String> {
                 prof_error = Some(bout.lines().filter(|l| !l.trim().is_empty()).take(3).collect::<Vec<_>>().join(" / "));
                 break;
             };
-            let top: Vec<Value> = b["top"].as_array().map(|a| a.iter().take(3).cloned().collect()).unwrap_or_default();
+            // 準備 (fork、mkdir、exec) の分もまざるので多めに。表には回数の多いものだけ (render_smp)
+            let top: Vec<Value> = b["top"].as_array().map(|a| a.iter().take(8).cloned().collect()).unwrap_or_default();
             parts[o] = json!({ "bkl": { "wait_pct": b["wait_pct"], "hold_pct": b["hold_pct"], "top": top } });
             continue;
         }
@@ -706,7 +707,11 @@ fn render_smp(all: &[Value]) -> String {
         }
         let b = &last["bkl"][*op];
         let wait = b["wait_pct"].as_f64().map_or("-".into(), |w| format!("{:.0}%", w));
-        let top = b["top"].as_array().map(|a| a.iter().map(|x| format!("{} {:.1} µs", s(x, "name"), x["avg_us"].as_f64().unwrap_or(0.0))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        // 回数の多いもの (op がくりかえし呼ぶもの) だけ。少ないものは準備の fork、mkdir、exec など
+        let top = b["top"]
+            .as_array()
+            .map(|a| a.iter().filter(|x| x["n"].as_u64().unwrap_or(0) >= 100).take(3).map(|x| format!("{} {:.1} µs", s(x, "name"), x["avg_us"].as_f64().unwrap_or(0.0))).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             op,
@@ -721,13 +726,10 @@ fn render_smp(all: &[Value]) -> String {
             top,
             what
         ));
-        // 直すところ: Linux より伸びないもの、P のとき Linux より 1 割より遅いもの、前の記録より伸びなくなったもの
-        if let (Some(a), Some(l)) = (last["speedup"][*op].as_f64(), last["speedup_linux"][*op].as_f64())
-            && a < l * 0.8
-        {
-            todo.push(format!("- {}: {} つで {:.2} 倍 (Linux は {:.2} 倍)", op, p, a, l));
-        } else if let Some(r) = last["ratio_linux"][par.as_str()].as_f64().filter(|r| *r > 1.1) {
-            todo.push(format!("- {}: {} つのとき Linux の {:.2} 倍の時間", op, p, r));
+        // 直すところ: P のとき Linux より 1 割より遅いもの (伸びだけでは決めない: TCG ではいちばん軽いシステムコールは
+        // Linux でも伸びない)、前の記録より伸びなくなったもの
+        if let Some(r) = last["ratio_linux"][par.as_str()].as_f64().filter(|r| *r > 1.1) {
+            todo.push(format!("- {}: {} つのとき Linux の {:.2} 倍の時間 (伸び {} 倍、Linux は {} 倍)", op, p, r, fx(&last["speedup"][*op]), fx(&last["speedup_linux"][*op])));
         }
         if let Some(pr) = prev
             && let (Some(a), Some(b)) = (last["speedup"][*op].as_f64(), pr["speedup"][*op].as_f64())
@@ -792,9 +794,9 @@ mod tests {
         assert_eq!(sp["stat"], json!(4.0));
         // P のほうがなければ出さない
         assert!(sp["fork"].is_null());
-        let rec = json!({ "date": "2026-10-21T00:00:00Z", "commit": "abc", "kind": "smp", "vm": { "smp": 4 }, "scale": 1, "aios": ops, "speedup": sp, "speedup_linux": { "stat": 3.9 }, "linux": { "version": "7.3", "ops": { "stat": { "us": 10.0 }, "stat-x4": { "us": 2.6 } } }, "ratio_linux": { "stat-x4": 1.92 }, "bkl": { "stat": { "wait_pct": 250.0, "top": [{ "name": "newfstatat", "avg_us": 3.2 }] } } });
+        let rec = json!({ "date": "2026-10-21T00:00:00Z", "commit": "abc", "kind": "smp", "vm": { "smp": 4 }, "scale": 1, "aios": ops, "speedup": sp, "speedup_linux": { "stat": 3.9 }, "linux": { "version": "7.3", "ops": { "stat": { "us": 10.0 }, "stat-x4": { "us": 2.6 } } }, "ratio_linux": { "stat-x4": 1.92 }, "bkl": { "stat": { "wait_pct": 250.0, "top": [{ "name": "execve", "avg_us": 900.0, "n": 2 }, { "name": "newfstatat", "avg_us": 3.2, "n": 4000 }] } } });
         let md = render_smp(&[rec]);
         assert!(md.contains("| stat | 20.0 µs | 5.0 µs | 4.00 | 10.0 µs | 2.6 µs | 3.90 | 1.92 | 250% | newfstatat 3.2 µs |"), "{}", md);
-        assert!(md.contains("- stat: 4 つのとき Linux の 1.92 倍の時間"), "{}", md);
+        assert!(md.contains("- stat: 4 つのとき Linux の 1.92 倍の時間 (伸び 4.00 倍、Linux は 3.90 倍)"), "{}", md);
     }
 }
