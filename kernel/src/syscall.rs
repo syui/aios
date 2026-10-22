@@ -927,6 +927,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         },
         // パイプの読み書きで、眠らず起こさずにすむもの (file::Pipe::fast_rw)
         READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE)
+            .or_else(|| crate::unix::fast_rw(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
             .or_else(|| if nr == READ { crate::file::fast_read_file(p, a[0], a[1] as usize, a[2] as usize) } else { None })
             .or_else(|| crate::file::fast_dev(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
         {

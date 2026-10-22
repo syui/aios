@@ -1388,21 +1388,26 @@ pub fn wake_key(key: usize) {
 
 /// poll / select が待っているあいだ、見ているパイプに印をつける (watchers)。大きなロックなしの read/write
 /// (fast_rw) は、印のあるパイプでは起こしを頼む。readiness を見る前につけること
-pub struct PollWatch(Vec<Rc<PipeCell>>);
+/// AF_UNIX のソケットも (unix::fast_rw)
+pub struct PollWatch(Vec<Rc<PipeCell>>, Vec<crate::unix::UnixRef>);
 
 impl PollWatch {
     pub fn new<'a>(files: impl Iterator<Item = &'a FileRef>) -> Self {
-        let mut v = Vec::new();
+        let (mut v, mut us) = (Vec::new(), Vec::new());
         for f in files {
             match &f.borrow().kind {
                 Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                     p.borrow_mut().watchers += 1;
                     v.push(p.clone());
                 }
+                Kind::Unix(u) => {
+                    u.borrow_mut().watchers += 1;
+                    us.push(u.clone());
+                }
                 _ => {}
             }
         }
-        PollWatch(v)
+        PollWatch(v, us)
     }
 }
 
@@ -1411,13 +1416,18 @@ impl Drop for PollWatch {
         for p in &self.0 {
             p.borrow_mut().watchers -= 1;
         }
+        for u in &self.1 {
+            u.borrow_mut().watchers -= 1;
+        }
     }
 }
 
-/// epoll に登録した (Pipe::epolled)
+/// epoll に登録した (Pipe::epolled と、AF_UNIX のソケットの epolled)
 pub fn mark_epolled(f: &FileRef) {
-    if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
-        p.borrow_mut().epolled = true;
+    match &f.borrow().kind {
+        Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow_mut().epolled = true,
+        Kind::Unix(u) => u.borrow_mut().epolled = true,
+        _ => {}
     }
 }
 

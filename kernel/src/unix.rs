@@ -16,7 +16,10 @@
 // (Linux 7.3 の manage_oob は inq_len を減らさず、FIONREAD が 1 多いままになる)
 //
 // ソケットはそれぞれ自分のロック (UnixCell: パイプの PipeCell と同じ) を持ち、Arc で分ける (送ったメッセージは送った口を
-// 持つ: 大きなロックなしで動くところも数を変えられるように)。ふだんは大きなロックの中で動く。借りたまま眠らない、
+// 持つ: 大きなロックなしで動くところも数を変えられるように)。ふだんは大きなロックの中で動く。つないだ stream の
+// ふつうのバイトの read / write は、眠らず起こさずにすめば大きなロックなしで (fast_rw: パイプの fast_rw と同じ形)。
+// そのため、眠る人 (sleepers)、poll で見ている人 (watchers)、epoll に入れたか (epolled) をソケットのロックの中で数え、
+// 大きなロックなしで入れたり出したりしたほうは、それがあれば起こしを大きなロックを持つ CPU に頼む (smp::defer_wake)。借りたまま眠らない、
 // 同じソケットを二重に借りない (止まる)、借りたまま fd (FileRef) を落とさない (落とすと、
 // それが最後ならそのソケットを閉じる: release)
 use crate::file::{self, FileRef, Kind, Stat};
@@ -138,6 +141,11 @@ impl Msg {
         Msg { id: next_id(), data, used: 0, fds, cred, sender: Some(sender.clone()), truesize, peeked: false, unix }
     }
 
+    /// fd も資格情報もない stream のバイト (fast_rw)。INFLIGHT にさわらない
+    fn plain(data: Vec<u8>, sender: &UnixRef, truesize: usize) -> Msg {
+        Msg { id: next_id(), data, used: 0, fds: Vec::new(), cred: None, sender: Some(sender.clone()), truesize, peeked: false, unix: 0 }
+    }
+
     fn len(&self) -> usize {
         self.data.len() - self.used
     }
@@ -152,7 +160,10 @@ impl Msg {
 
 impl Drop for Msg {
     fn drop(&mut self) {
-        unsafe { INFLIGHT -= self.unix };
+        // 大きなロックなしで落とすもの (fast_rw: fd はない) は INFLIGHT にさわらない (0 を引くのも書きもどしになる)
+        if self.unix > 0 {
+            unsafe { INFLIGHT -= self.unix };
+        }
     }
 }
 
@@ -215,6 +226,11 @@ pub struct Unix {
     ctime: u64,
     /// 状態が変わるたびに増える数 (epoll の EPOLLET)
     pub generation: u64,
+    /// このソケットの印 (key) で眠っている数 (読む、書くのを待つ)。眠る前にロックの中で増やす (fast_rw が起こしを頼むか決める)
+    sleepers: u32,
+    /// poll / select で見ている数 (file::PollWatch) と、epoll に入れたか
+    pub watchers: u32,
+    pub epolled: bool,
 }
 
 pub type UnixRef = Arc<UnixCell>;
@@ -277,7 +293,7 @@ type R = Result<i64, i64>;
 
 static mut ABSTRACT: BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>> = BTreeMap::new();
 static mut BSD: BTreeMap<(usize, u64), Weak<UnixCell>> = BTreeMap::new();
-static mut NEXT_ID: u64 = 1;
+static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 static mut NEXT_INO: u64 = 1;
 /// メッセージの中にある (送られている途中の) AF_UNIX のソケットの fd の数。0 なら gc はしない
 static mut INFLIGHT: usize = 0;
@@ -309,10 +325,7 @@ pub fn new_ino() -> u64 {
 }
 
 fn next_id() -> u64 {
-    unsafe {
-        NEXT_ID += 1;
-        NEXT_ID
-    }
+    NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
 }
 
 fn key(u: &UnixRef) -> usize {
@@ -390,6 +403,9 @@ fn new_sock(typ: u8) -> UnixRef {
         mtime: crate::timer::epoch_ns(),
         ctime: crate::timer::epoch_ns(),
         generation: 0,
+        sleepers: 0,
+        watchers: 0,
+        epolled: false,
     }));
     let all = unsafe { &mut *(&raw mut ALL) };
     if all.len() >= 64 && all.len() >= 2 * unsafe { ALL_LIVE } {
@@ -915,7 +931,7 @@ impl Iter<'_> {
 /// 送るのに、入れ物 (wmem < sndbuf) があくまで待つ (Linux の sock_alloc_send_pskb)。自分のエラー、SEND の shutdown が先
 fn wait_wmem(u: &UnixRef, nonblock: bool) -> Result<(), i64> {
     loop {
-        {
+        let timeo = {
             let mut s = u.borrow_mut();
             if s.err != 0 {
                 let e = s.err;
@@ -928,12 +944,16 @@ fn wait_wmem(u: &UnixRef, nonblock: bool) -> Result<(), i64> {
             if s.wmem < s.sndbuf {
                 return Ok(());
             }
-        }
-        if nonblock {
-            return Err(-EAGAIN);
-        }
-        let timeo = u.borrow().sndtimeo;
-        wait(key(u), timeo)?;
+            if nonblock {
+                return Err(-EAGAIN);
+            }
+            // 眠る前に数える (大きなロックなしで読んだ人が、wmem を返したときに起こしを頼むように)
+            s.sleepers += 1;
+            s.sndtimeo
+        };
+        let r = wait(key(u), timeo);
+        u.borrow_mut().sleepers -= 1;
+        r?;
     }
 }
 
@@ -1456,9 +1476,13 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                         break 'redo;
                     }
                     let timeo = s.rcvtimeo;
+                    // 眠る前に数える (大きなロックなしで入れた人が起こしを頼むように)
+                    s.sleepers += 1;
                     drop(s);
                     free(dropped.take());
-                    if let Err(e) = wait(key(u), timeo) {
+                    let r = wait(key(u), timeo);
+                    u.borrow_mut().sleepers -= 1;
+                    if let Err(e) = r {
                         err = -e;
                         break 'redo;
                     }
@@ -1596,7 +1620,154 @@ fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
     Ok(out)
 }
 
-// ---- read / write (sock_read_iter / sock_write_iter) ----
+// ---- 大きなロックなしの read / write ----
+
+/// fast_rw の数 (/proc/bkl): 書いた、読んだ、ふつうの道へ
+pub static FAST: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// 大きなロックなしの read / write (syscall::fast): つないだ SOCK_STREAM の、fd も資格情報も MSG_OOB もないバイトで、
+/// 眠らずにすむときだけ。ほかは None (ふつうの道へ: 送れる余地がない、読むものが SO_RCVLOWAT より少ない、SO_PASSCRED、
+/// 相手がまだ accept されていない、閉じた、エラーがある、ユーザーのメモリが写っていない ...)。答えはふつうの道と同じ
+pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let r = fast_rw_inner(me, fd, buf, len, write);
+    FAST[if r.is_none() { 2 } else { write as usize }].fetch_add(1, Relaxed);
+    r
+}
+
+fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
+    if len == 0 || len > 3776 + 32768 || crate::fail::ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    // ほかのスレッドと分けている表なら門を通って (file::Pipe::fast_rw と同じ)
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let f = files.get().get(fd)?;
+    // ほかのプロセスが大きなロックの中で借りているかもしれないので、借りずに見る (口の種類はあとで変わらない)
+    let of = unsafe { &*f.as_ptr() };
+    let Kind::Unix(u) = &of.kind else { return None };
+    if write { fast_send(me, u, buf, len) } else { fast_recv(me, u, buf, len) }
+}
+
+/// 起こしを頼むか (眠っている人、poll の人、epoll)
+fn waited(s: &Unix) -> bool {
+    s.sleepers > 0 || s.watchers > 0 || s.epolled
+}
+
+fn fast_send(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64> {
+    // 写すのはロックの前に (ページがなければ、何も変えずにふつうの道へ)
+    let mut data = crate::heap::try_vec(len, false).ok()?;
+    if !me.pt().copy_in_nofault(buf, &mut data) {
+        return None;
+    }
+    // 自分: 送れるか (stream_send と wait_wmem と add_creds の見るもの)。送るものの大きさを先に wmem に足しておく
+    // (相手が大きなロックなしで読んで返すのが、足すより先にならないように)
+    let (peer, ts) = {
+        let mut s = u.borrow_mut();
+        if s.typ != SOCK_STREAM || s.state != State::Established || s.err != 0 || s.shutdown & SEND != 0 || s.passcred || s.wmem >= s.sndbuf || stream_chunk(s.sndbuf, len) != len {
+            return None;
+        }
+        let peer = s.peer.clone()?;
+        let ts = stream_truesize(len);
+        s.wmem += ts;
+        (peer, ts)
+    };
+    // 相手: 受けられるか (deliver と add_creds の見るもの)。こちらにつないでいる相手だけ (行列のものの送り手は相手の peer)
+    let wake = {
+        let mut o = peer.borrow_mut();
+        if o.dead || o.shutdown & RCV != 0 || o.passcred || !o.has_file || !same(&o.peer, u) {
+            None
+        } else {
+            o.q.push_back(Msg::plain(data, u, ts));
+            o.inq += len;
+            o.generation += 1;
+            Some(waited(&o))
+        }
+    };
+    let Some(wake) = wake else {
+        // 足した分をもどす。そのあいだに wmem がいっぱいに見えて眠った人がいれば起こしを頼む
+        let w = {
+            let mut s = u.borrow_mut();
+            s.wmem -= ts;
+            waited(&s)
+        };
+        if w {
+            crate::smp::defer_wake(key(u));
+        }
+        return None;
+    };
+    if wake {
+        crate::smp::defer_wake(key(&peer));
+    }
+    Some(len as i64)
+}
+
+fn fast_recv(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64> {
+    let mut tmp = crate::heap::try_vec(len, false).ok()?;
+    let (gone, n) = {
+        let mut s = u.borrow_mut();
+        if s.typ != SOCK_STREAM || s.state != State::Established || s.passcred || s.oob.is_some() {
+            return None;
+        }
+        // 読むだけあるか (stream_recv の target)。読むメッセージはどれも fd のないもので、相手が送ったもの (それを落としても
+        // 送り手の最後の参照にはならない: こちらの peer が持っている)。fd のあるものに届くなら、ふつうの道 (そこまで読む)
+        let target = (s.rcvlowat.max(0) as usize).min(len).max(1);
+        if s.inq < target {
+            return None;
+        }
+        let mut n = 0;
+        for m in &s.q {
+            if n == len {
+                break;
+            }
+            if !m.fds.is_empty() || m.len() == 0 || !m.sender.as_ref().is_some_and(|x| same(&s.peer, x)) {
+                return None;
+            }
+            let k = m.len().min(len - n);
+            tmp[n..n + k].copy_from_slice(&m.data[m.used..m.used + k]);
+            n += k;
+        }
+        if n < target || !me.pt().copy_out_nofault(buf, &tmp[..n]) {
+            return None;
+        }
+        // 写せたので、読んだところを外す
+        let mut gone = Vec::new();
+        let mut left = n;
+        while left > 0 {
+            let m = &mut s.q[0];
+            let k = m.len().min(left);
+            m.used += k;
+            left -= k;
+            if m.len() == 0 {
+                gone.push(s.q.pop_front().unwrap());
+            }
+        }
+        s.inq -= n;
+        if s.peek_off >= 0 {
+            s.peek_off = (s.peek_off - n as i32).max(0);
+        }
+        (gone, n)
+    };
+    for mut m in gone {
+        // free と同じ: 送った口の wmem を返す。待っていた (いっぱいだった) なら起こしを頼む
+        if let Some(sd) = m.sender.take() {
+            let wake = {
+                let mut b = sd.borrow_mut();
+                let before = b.wmem;
+                b.wmem = before.saturating_sub(m.truesize);
+                let full = before >= b.sndbuf || (before + 1) * 4 > b.sndbuf;
+                if full {
+                    b.generation += 1;
+                }
+                full && waited(&b)
+            };
+            if wake {
+                crate::smp::defer_wake(key(&sd));
+            }
+        }
+    }
+    Some(n as i64)
+}
 
 /// read: 0 バイトはなにもせずに 0 (Linux の「SYS5 の決まり」)
 pub fn read(u: &UnixRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
