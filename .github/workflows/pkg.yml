@@ -1,7 +1,9 @@
-# pkg: 手元で作るには重いパッケージ (一覧は pkg/ci.json) をここで作り、GitHub のリリース NAME-VER-REL に置く。
+# pkg: 手元で作るには重いパッケージ (一覧は pkg/ci.json) をここで作り、GitHub のリリース NAME (タイトル pkg-NAME) に
+# 置く。新しい版はそのリリースを置きかえる (前の版はのこさない)。ノートの 1 行目が版 (* vVER-REL)。
 # ai/repo へ入れるのは手元で aish-pkg fetch NAME → test → push (ai/repo の署名の鍵を GitHub に置かないため)。
 #   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
-#   どれも、そのリリースがもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
+#   どれも、リリースにその版がもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
+#   前の形のリリース (NAME-VER-REL、版ごと) は、手で migrate: いちばん新しいものを NAME に移して、ほかは消す
 #   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分、
 #   runs_on = マシン (既定 ubuntu-24.04-arm))
 name: pkg
@@ -28,6 +30,10 @@ on:
         description: '配布元の最新の版にする (しなければ PKGBUILD の版)'
         type: boolean
         default: false
+      migrate:
+        description: '作らずに、前の形のリリース (NAME-VER-REL) を NAME (pkg-NAME) にまとめる'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,6 +41,7 @@ permissions:
 jobs:
   check:
     name: Check
+    if: ${{ !inputs.migrate }}
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.v.outputs.matrix }}
@@ -94,7 +101,9 @@ jobs:
               ver=$new rel=1 edit=true
             fi
             tag=$n-$ver-$rel
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # リリース NAME にその版のパッケージがあるか (前の形のリリース NAME-VER-REL がのこっていれば、それも)
+            if gh release view "$n" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qxF "$tag-aarch64.pkg.tar.zst" ||
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "$tag: already released"
               continue
             fi
@@ -182,7 +191,7 @@ jobs:
 
       - name: Package
         run: |
-          # ノートはライセンスと元のソースだけ。PKGBUILD とパッチ (aios で変えたところ) は
+          # ノートは版とライセンスと元のソースだけ。PKGBUILD とパッチ (aios で変えたところ) は
           # NAME-VER-REL-pkgbuild.tar.gz として一緒に置く
           tag=$NAME-$VER-$REL
           mkdir release
@@ -190,7 +199,7 @@ jobs:
           cp "$DIR/PKGBUILD" release/PKGBUILD
           tar -czf "release/$tag-pkgbuild.tar.gz" -C "$(dirname "$DIR")" "$NAME"
           sha256sum release/* > release/SHA256SUMS
-          (cd "$DIR" && bash -c '. ./PKGBUILD >/dev/null 2>&1; printf "* License: %s\n* %s\n" "${license[*]}" "${source[0]#git+}"') > release/notes.md
+          (cd "$DIR" && bash -c '. ./PKGBUILD >/dev/null 2>&1; printf "* v%s-%s\n* License: %s\n* %s\n" "$pkgver" "$pkgrel" "${license[*]}" "${source[0]#git+}"') > release/notes.md
           cat release/notes.md
 
       # リリースは別のジョブで作る: ジョブの GITHUB_TOKEN は長いビルド (firefox は 1 時間あまり) のあとでは
@@ -224,7 +233,48 @@ jobs:
         if: steps.get.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ matrix.name }}-${{ matrix.ver }}-${{ matrix.rel }}
+          NAME: ${{ matrix.name }}
         run: |
+          # リリース NAME を置きかえる (前の版はのこさない)。前の形のリリース NAME-VER-REL も消す
           mv release/notes.md notes.md
-          gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          gh release delete "$NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$NAME" release/* --repo "$GITHUB_REPOSITORY" --title "pkg-$NAME" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          # (run は pipefail: 消すものがなくて grep が 1 を返しても止まらないように)
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' | { grep -E "^$NAME-[0-9][^-]*-[0-9]+$" || true; } | while read -r t; do
+            gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "$t: deleted"
+          done
+
+  # 前の形のリリース (NAME-VER-REL、版ごとにたまる) を、いちばん新しい版だけリリース NAME (タイトル pkg-NAME、
+  # ノートの 1 行目に * vVER-REL) に移して、ほかは消す。手で一度 (migrate)。前の形がなければ何もしない
+  migrate:
+    name: Migrate releases
+    if: ${{ inputs.migrate }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Move
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName')
+          for n in $(jq -r '.[].name' pkg/ci.json); do
+            old=$(printf '%s\n' "$tags" | grep -E "^$n-[0-9][^-]*-[0-9]+$" | sort -V || true)
+            [ -n "$old" ] || continue
+            if printf '%s\n' "$tags" | grep -qx "$n"; then
+              echo "$n: already released as $n"
+            else
+              top=$(printf '%s\n' "$old" | tail -1)
+              rm -rf dl && mkdir dl
+              gh release download "$top" --repo "$GITHUB_REPOSITORY" -D dl
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$top" --jq .object.sha 2>/dev/null || true)
+              body=$(gh release view "$top" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+              printf '* v%s\n%s\n' "${top#"$n"-}" "$body" > notes.md
+              gh release create "$n" dl/* --repo "$GITHUB_REPOSITORY" --title "pkg-$n" --notes-file notes.md --target "${sha:-$GITHUB_SHA}" --prerelease
+              echo "$top -> $n"
+            fi
+            for t in $old; do
+              gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "$t: deleted"
+            done
+          done

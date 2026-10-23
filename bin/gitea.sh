@@ -5,9 +5,9 @@
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する。ai/repo の写し
 #                        build/airepo から: 変わったものだけ取ってきて、変わったものだけ送る)
-#   bin/gitea.sh release ディスクのイメージ (aios-unix-aarch64.img.zst) を作り、ai/os のリリース unix-latest に置きかえる
-#                        (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
-#   bin/gitea.sh mirror  GitHub のリリース unix-latest (CI が作って起動をたしかめたもの) をそのまま ai/os の unix-latest に
+#   bin/gitea.sh release ディスクのイメージ (aios-aarch64.img.zst) を作り、ai/os のリリース latest (タイトル aios) に
+#                        置きかえる (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
+#   bin/gitea.sh mirror  GitHub のリリース latest (CI が作って起動をたしかめたもの) をそのまま ai/os の latest に
 #                        (作らないので速い。版とコミットも GitHub のもの)
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
@@ -135,44 +135,48 @@ case "$1" in
     echo "ai/repo: pushed $(git -C "$dir" rev-parse --short "$new") (history squashed)"
     ;;
   release | mirror)
-    # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース unix-latest に
+    # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース latest に
     # 置きかえる。rootfs はこのリポジトリと repo/aarch64 のパッケージから作る (AIOS_SERVER から取るなら -r)。
-    # mirror は作らずに GitHub の unix-latest をそのまま
+    # mirror は作らずに GitHub の latest をそのまま。ノートの 1 行目が版 ( - vVER)
     api=$host/api/v1/repos/ai/os
+    tag=latest img=aios-aarch64.img.zst
     hdr=
     [ -n "$GITEA_TOKEN" ] && hdr="Authorization: token $GITEA_TOKEN"
     call() { curl -fsS ${hdr:+-H "$hdr"} "$@"; }
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     if [ "$1" = mirror ]; then
-      gh=https://github.com/syui/aios/releases/download/unix-latest/aios-unix-aarch64.img.zst
-      info=$(curl -fsS https://api.github.com/repos/syui/aios/releases/tags/unix-latest)
-      # 名前は "unix-latest (VER)"
-      ver=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"].split("(",1)[-1].rstrip(")"))')
+      gh=https://github.com/syui/aios/releases/download/$tag/$img
+      info=$(curl -fsS https://api.github.com/repos/syui/aios/releases/tags/$tag)
+      # 版はノートの 1 行目 " - vVER"
+      ver=$(printf '%s' "$info" | python3 -c 'import json,re,sys; m=re.search(r"^\s*-\s*v(\S+)", json.load(sys.stdin)["body"], re.M); print(m.group(1) if m else "")')
+      [ -n "$ver" ] || { echo "ai/os: no version ( - vVER) in the notes of the GitHub release $tag" >&2; exit 1; }
       sha=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_commitish"])')
-      curl -fsSL -o "$tmp/aios-unix-aarch64.img.zst" "$gh"
-      zstd -t -q "$tmp/aios-unix-aarch64.img.zst"
+      curl -fsSL -o "$tmp/$img" "$gh"
+      zstd -t -q "$tmp/$img"
     else
       bin/mkrootfs.sh ${AIOS_RELEASE_REMOTE:+-r} all > "$tmp/rootfs.log" 2>&1 || { tail "$tmp/rootfs.log" >&2; exit 1; }
       # 8G (空きはゼロなので .zst は小さいまま。zstd -d は sparse に書くので、ホストのディスクは使ったぶんだけ)。
       # スワップ 1G は cargo のビルドのため
       SWAP=${AIOS_RELEASE_SWAP:-1G} bin/mkdisk.sh "${AIOS_RELEASE_SIZE:-8G}"
-      zstd -q -19 -T0 -f disk.img -o "$tmp/aios-unix-aarch64.img.zst"
+      zstd -q -19 -T0 -f disk.img -o "$tmp/$img"
       ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
       sha=$(git rev-parse HEAD)
     fi
-    # 前の unix-latest (リリースとタグ) を消す
-    old=$(call "$api/releases/tags/unix-latest" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
-    [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
-    call -X DELETE "$api/tags/unix-latest" > /dev/null 2>&1 || true
-    notes=$(printf '%s\n' '```sh' '# brew install qemu zstd' 'git clone -b unix https://git.syui.ai/ai/os aios && cd aios' \
-      'curl -fLO https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst' './bin/run.sh' '```' '' 'exit: `sudo poweroff`')
-    body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": "unix-latest", "target_commitish": sys.argv[1], "name": "unix-latest (" + sys.argv[2] + ")", "body": sys.argv[3], "prerelease": True}))' "$sha" "$ver" "$notes")
+    # 前の latest (リリースとタグ) を消す。前の名前の unix-latest がのこっていれば、それも
+    for t in $tag unix-latest; do
+      old=$(call "$api/releases/tags/$t" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
+      [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
+      call -X DELETE "$api/tags/$t" > /dev/null 2>&1 || true
+    done
+    notes=$(printf '%s\n' " - v$ver" '' '```sh' '# brew install qemu zstd' 'git clone -b unix https://git.syui.ai/ai/os aios && cd aios' \
+      "curl -fLO $host/ai/os/releases/download/$tag/$img" './bin/run.sh' '```' '' 'exit: `sudo poweroff`')
+    body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "target_commitish": sys.argv[2], "name": "aios", "body": sys.argv[3], "prerelease": True}))' "$tag" "$sha" "$notes")
     id=$(call -X POST -H 'Content-Type: application/json' -d "$body" "$api/releases" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
     [ -n "$id" ] || { echo "ai/os: could not create the release" >&2; exit 1; }
-    call -X POST -F "attachment=@$tmp/aios-unix-aarch64.img.zst" "$api/releases/$id/assets?name=aios-unix-aarch64.img.zst" > /dev/null
-    echo "ai/os: released unix-latest ($ver, $(du -h "$tmp/aios-unix-aarch64.img.zst" | cut -f1))"
-    echo "  $host/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst"
+    call -X POST -F "attachment=@$tmp/$img" "$api/releases/$id/assets?name=$img" > /dev/null
+    echo "ai/os: released $tag ($ver, $(du -h "$tmp/$img" | cut -f1))"
+    echo "  $host/ai/os/releases/download/$tag/$img"
     ;;
   *)
     usage

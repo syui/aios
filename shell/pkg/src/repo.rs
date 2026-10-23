@@ -172,8 +172,26 @@ fn curl(url: &str, out: &Path) -> Result<(), String> {
         .arg(url))
 }
 
-/// fetch NAME: CI が作ったリリース NAME-VER-REL のいちばん新しいものを取ってきて (SHA256SUMS を確かめる)、
-/// build と同じく repo/aarch64/KIND/ に置く。PKGBUILD もリリースのもの (CI が版を上げたもの) にする
+/// GitHub のリリースの一覧から、NAME のパッケージのいちばん新しい版のもの: リリース NAME (いまの形) か、前の形の
+/// NAME-VER-REL (NAME-foo-1.0-1 のような別のパッケージは、続きが数字でないので外れる)。版は入っているパッケージの
+/// ファイルの名前から
+fn newest_release<'a>(list: &'a [Value], name: &str) -> Option<&'a Value> {
+    let prefix = format!("{}-", name);
+    list.iter()
+        .filter(|r| {
+            r["tag_name"].as_str().is_some_and(|t| t == name || t.strip_prefix(&prefix).is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()) && !v[..v.rfind('-').unwrap_or(0)].contains('-')))
+        })
+        .filter_map(|r| {
+            let ver = r["assets"].as_array()?.iter().filter_map(|a| parse(a["name"].as_str()?)).find(|(n, _)| n == name)?.1;
+            Some((ver, r))
+        })
+        .max_by(|a, b| crate::up::vercmp(&a.0, &b.0))
+        .map(|(_, r)| r)
+}
+
+/// fetch NAME: CI が作ったリリース NAME (タイトル pkg-NAME。新しい版で置きかえていく) を取ってきて (SHA256SUMS を
+/// 確かめる)、build と同じく repo/aarch64/KIND/ に置く。PKGBUILD もリリースのもの (CI が版を上げたもの) にする。
+/// 前の形のリリース NAME-VER-REL (版ごと) がのこっていれば、それもくらべていちばん新しい版のもの
 pub fn fetch(root: &Path, name: &str) -> Result<Value, String> {
     use sha2::{Digest, Sha256};
     let (_, path) = crate::up::pkgbuilds(&root.join("pkg")).into_iter().find(|(n, _)| n == name).ok_or_else(|| format!("{}: no PKGBUILD", name))?;
@@ -183,15 +201,8 @@ pub fn fetch(root: &Path, name: &str) -> Result<Value, String> {
     fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     curl(RELEASES, &tmp.join("releases.json"))?;
     let list: Value = serde_json::from_str(&fs::read_to_string(tmp.join("releases.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let prefix = format!("{}-", name);
-    // NAME-VER-REL (NAME-foo-1.0-1 のような別のパッケージは、続きが数字でないので外れる)
-    let rel = list
-        .as_array()
-        .ok_or("releases: not a list")?
-        .iter()
-        .filter(|r| r["tag_name"].as_str().and_then(|t| t.strip_prefix(&prefix)).is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()) && !v[..v.rfind('-').unwrap_or(0)].contains('-')))
-        .max_by(|a, b| crate::up::vercmp(&a["tag_name"].as_str().unwrap_or("")[prefix.len()..], &b["tag_name"].as_str().unwrap_or("")[prefix.len()..]))
-        .ok_or_else(|| format!("{}: no release {}VER-REL on github.com/syui/aios", name, prefix))?;
+    let rel = newest_release(list.as_array().ok_or("releases: not a list")?, name)
+        .ok_or_else(|| format!("{}: no release {} (or {}-VER-REL) with its package on github.com/syui/aios", name, name, name))?;
     let tag = rel["tag_name"].as_str().unwrap_or("");
     let assets: BTreeMap<String, String> = rel["assets"].as_array().into_iter().flatten().filter_map(|a| Some((a["name"].as_str()?.to_string(), a["browser_download_url"].as_str()?.to_string()))).collect();
     let file = assets.keys().find(|f| parse(f).is_some_and(|(n, _)| n == name)).cloned().ok_or_else(|| format!("{}: no package in the release", tag))?;
@@ -279,4 +290,30 @@ pub fn push(root: &Path, force: bool) -> Result<Value, String> {
     r["head"] = json!(head);
     r["text"] = json!(format!("{}\nai/repo: {}\n", changes.iter().chain(conflicts.iter()).cloned().collect::<Vec<_>>().join("\n"), &head[..head.len().min(7)]));
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rel(tag: &str, files: &[&str]) -> Value {
+        json!({ "tag_name": tag, "assets": files.iter().map(|f| json!({ "name": f })).collect::<Vec<_>>() })
+    }
+
+    #[test]
+    fn newest_release_takes_both_forms() {
+        let list = vec![
+            rel("firefox-158.0-1", &["firefox-158.0-1-aarch64.pkg.tar.zst", "PKGBUILD"]),
+            rel("firefox", &["firefox-158.0.1-1-aarch64.pkg.tar.zst", "PKGBUILD"]),
+            rel("firefox-esr-140.0-1", &["firefox-esr-140.0-1-aarch64.pkg.tar.zst"]),
+            rel("latest", &["aios-aarch64.img.zst"]),
+        ];
+        assert_eq!(newest_release(&list, "firefox").unwrap()["tag_name"], "firefox");
+        // 前の形のほうが新しい版なら、そちら (まだまとめていないとき)
+        let list = vec![rel("uv", &["uv-0.13.4-2-aarch64.pkg.tar.zst"]), rel("uv-0.13.5-1", &["uv-0.13.5-1-aarch64.pkg.tar.zst"])];
+        assert_eq!(newest_release(&list, "uv").unwrap()["tag_name"], "uv-0.13.5-1");
+        // 別のパッケージ (firefox-esr) とイメージは取らない
+        assert!(newest_release(&[rel("firefox-esr-140.0-1", &["firefox-esr-140.0-1-aarch64.pkg.tar.zst"])], "firefox").is_none());
+        assert!(newest_release(&[rel("llvm", &["PKGBUILD"])], "llvm").is_none());
+    }
 }

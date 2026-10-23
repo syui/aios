@@ -1,7 +1,7 @@
 #!/bin/sh
 # unix に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
-#   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース unix-latest
-#      に置くのを待ち、git.syui.ai の ai/os の unix-latest にも同じものを置く (bin/gitea.sh mirror)。
+#   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース latest
+#      (タイトル aios) に置くのを待ち、git.syui.ai の ai/os の latest にも同じものを置く (bin/gitea.sh mirror)。
 #      CI が動かないコミット (paths-ignore: ドキュメントなど) なら、ここはとばす
 #   2. base / aikernel / aiboot のうち、ai/repo にある版 (0.0.1.rN.gSHA) のあとでソースが変わったものを作って確かめ、
 #      ai/repo に送る (aish-pkg build / test / push)。CI はこの 3 つをディスクに入れるだけで ai/repo には送らないので、
@@ -64,11 +64,11 @@ else
   if [ "$st" = "completed success" ]; then
     # リリースは CI のおしまいに作りなおされる
     for i in $(seq 1 20); do
-      t=$(curl -fsS "$api/releases/tags/unix-latest" | json 'd["target_commitish"]' 2>/dev/null) || t=
+      t=$(curl -fsS "$api/releases/tags/latest" | json 'd["target_commitish"]' 2>/dev/null) || t=
       [ "$t" = "$sha" ] && break
       sleep 6
     done
-    [ "$t" = "$sha" ] || { echo "publish: the release unix-latest is not $sha" >&2; exit 1; }
+    [ "$t" = "$sha" ] || { echo "publish: the release latest is not $sha" >&2; exit 1; }
     if [ -n "$dry" ]; then echo "would: bin/gitea.sh mirror"; else sh bin/gitea.sh mirror; fi
   elif [ -n "$dry" ]; then
     case "$st" in completed*) echo "would: stop (CI did not pass)" ;; *) echo "would: wait for CI, then bin/gitea.sh mirror" ;; esac

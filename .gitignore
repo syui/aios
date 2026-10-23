@@ -13,6 +13,7 @@
 /sd.img
 /release
 /boot.log
+/aios-aarch64.img.zst
 /aios-unix-aarch64.img.zst
 /claude.md
 /shell/target

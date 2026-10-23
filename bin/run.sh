@@ -8,10 +8,11 @@
 #                         あるときは ESP の /Image を直に (mtools が要る)
 #                         区画なしの ext4 なら /boot/Image を (debugfs が要る)
 #                       どれもなければ開発用カーネルで
-#                       disk.img がなく aios-unix-aarch64.img.zst (リリース unix-latest) があれば、展開して使う:
+#                       disk.img がなく aios-aarch64.img.zst (リリース latest) があれば、展開して使う:
 #                         git clone -b unix https://git.syui.ai/ai/os aios && cd aios
-#                         curl -fLO https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst
-#                         (GitHub の https://github.com/syui/aios/releases/download/unix-latest/ にも同じもの)
+#                         curl -fLO https://git.syui.ai/ai/os/releases/download/latest/aios-aarch64.img.zst
+#                         (GitHub の https://github.com/syui/aios/releases/download/latest/ にも同じもの。
+#                         前の名前 aios-unix-aarch64.img.zst でも)
 #                         ./bin/run.sh    (Mac: brew install qemu zstd)
 #   AIOS_EFI_CODE=FILE  UEFI のファームウェア (既定はよくある場所から探す)。変数は build/efivars.fd
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
@@ -38,15 +39,19 @@ k=$1
 case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
 # 渡されたカーネルがなければ止まる (zsh で「bin/run.sh  # コメント」と打つと # からが引数になる)
 if [ -n "$k" ] && [ ! -f "$k" ]; then
-  echo "./bin/run.sh: カーネル $1 がありません (引数なしなら disk.img か aios-unix-aarch64.img.zst から起動)" >&2
+  echo "./bin/run.sh: カーネル $1 がありません (引数なしなら disk.img か aios-aarch64.img.zst から起動)" >&2
   exit 1
 fi
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-if [ -z "$k" ] && [ ! -f "$disk" ] && [ -f aios-unix-aarch64.img.zst ]; then
-  echo "disk.img: aios-unix-aarch64.img.zst を展開します" >&2
-  zstd -d -q aios-unix-aarch64.img.zst -o "$disk" || exit 1
+if [ -z "$k" ] && [ ! -f "$disk" ]; then
+  for z in aios-aarch64.img.zst aios-unix-aarch64.img.zst; do
+    [ -f "$z" ] || continue
+    echo "disk.img: $z を展開します" >&2
+    zstd -d -q "$z" -o "$disk" || exit 1
+    break
+  done
 fi
 uefi=
 gpt=
@@ -80,7 +85,7 @@ fi
 if [ -z "$uefi" ]; then [ -n "$k" ] && [ -f "$k" ] || k=$dev; fi
 if [ -z "$uefi" ] && [ ! -f "$k" ]; then
   echo "./bin/run.sh: 起動するものがありません。どれかを:" >&2
-  echo "  curl -fLO https://git.syui.ai/ai/os/releases/download/unix-latest/aios-unix-aarch64.img.zst" >&2
+  echo "  curl -fLO https://git.syui.ai/ai/os/releases/download/latest/aios-aarch64.img.zst" >&2
   echo "  bin/mkrootfs.sh -r all && cargo run" >&2
   exit 1
 fi
