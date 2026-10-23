@@ -73,14 +73,28 @@ impl Journal {
     }
 }
 
+/// ディスクへ書く。sleep なら眠って待つ (眠って書く書き出し: extfs の flush_sleeping。buf はそのあいだ呼ぶ側のもの)
+pub(super) fn bwrite(sector: u64, buf: &[u8], sleep: bool) -> Result<(), i64> {
+    if sleep { crate::block::write_wait(sector, buf) } else { crate::block::write(sector, buf) }
+}
+
+impl Journal {
+    /// meta こ のブロックが 1 つのトランザクションに入るか (記述ブロックとコミットブロックもこみで)
+    pub(super) fn fits(&self, meta: usize, bsize: usize) -> bool {
+        let tail = if self.v3 { 4 } else { 0 };
+        let per_desc = (bsize - 12 - tail - 16) / self.tag_bytes();
+        self.first as usize + meta.div_ceil(per_desc) + meta + 1 <= self.maxlen as usize
+    }
+}
+
 impl ExtFs {
-    fn jwrite(&self, j: &Journal, lb: u32, data: &[u8]) -> Result<(), i64> {
+    fn jwrite(&self, j: &Journal, lb: u32, data: &[u8], sleep: bool) -> Result<(), i64> {
         let spb = (self.bsize / crate::block::SECTOR) as u64;
-        crate::block::write(j.blocks[lb as usize] * spb, data)
+        bwrite(j.blocks[lb as usize] * spb, data, sleep)
     }
 
     /// lb から続くブロックを書く。ディスクの上で続いているところは 1 回の要求にまとめる
-    fn jwrite_blocks(&self, j: &Journal, lb: u32, blocks: &[Vec<u8>]) -> Result<(), i64> {
+    fn jwrite_blocks(&self, j: &Journal, lb: u32, blocks: &[Vec<u8>], sleep: bool) -> Result<(), i64> {
         let spb = (self.bsize / crate::block::SECTOR) as u64;
         let mut i = 0;
         while i < blocks.len() {
@@ -90,7 +104,7 @@ impl ExtFs {
                 k += 1;
             }
             let buf: Vec<u8> = blocks[i..k].concat();
-            crate::block::write(start * spb, &buf)?;
+            bwrite(start * spb, &buf, sleep)?;
             i = k;
         }
         Ok(())
@@ -104,14 +118,14 @@ impl ExtFs {
     }
 
     /// ジャーナルのスーパーブロックを (チェックサムを直して) 書く
-    fn write_jsb(&self, j: &mut Journal) -> Result<(), i64> {
+    fn write_jsb(&self, j: &mut Journal, sleep: bool) -> Result<(), i64> {
         if j.v3 {
             put_be32(&mut j.sb, 0xfc, 0);
             let c = crc32c(!0, &j.sb[..1024]);
             put_be32(&mut j.sb, 0xfc, c);
         }
         let data = j.sb.clone();
-        self.jwrite(j, 0, &data)
+        self.jwrite(j, 0, &data, sleep)
     }
 
     /// マウントのとき: ジャーナルを開き、残っていれば再生する。
@@ -177,18 +191,32 @@ impl ExtFs {
             j.sb[0x50] = CRC32C_CHKSUM;
             j.v3 = true;
             j.bit64 = bit64;
-            self.write_jsb(&mut j).map_err(|_| "write error")?;
+            self.write_jsb(&mut j, false).map_err(|_| "write error")?;
         }
         // 回復の印が残っていれば消す
         let recover = super::u32_at(&self.sb.borrow(), 96) & INCOMPAT_RECOVER != 0;
         if recover {
-            self.set_recover(false).map_err(|_| "write error")?;
+            self.set_recover(false, false).map_err(|_| "write error")?;
         }
         Ok(Some(j))
     }
 
     /// ext4 のスーパーブロックの needs_recovery を立てる / 消す (直接ディスクへ)
-    fn set_recover(&self, on: bool) -> Result<(), i64> {
+    fn set_recover(&self, on: bool, sleep: bool) -> Result<(), i64> {
+        // 眠って書く書き出しのとちゅう (sb_disk がある): いまのスーパーブロックには、眠っているあいだにほかが変えた
+        // もの (まだジャーナルを通していない空きの数や orphan の頭) が入っている。それを直接書くと、指す先の inode が
+        // まだディスクにないまま頭だけが行く (e2fsck: corrupted orphan linked list)。ジャーナルに入れたときの写しに
+        // 印だけ立てて書く (いまのものとキャッシュは変えない: 次の書き出しが、ジャーナルを通して書く)
+        if let Some(img) = self.sb_disk.borrow_mut().as_mut() {
+            let v = super::u32_at(img, 96);
+            super::put32(img, 96, if on { v | INCOMPAT_RECOVER } else { v & !INCOMPAT_RECOVER });
+            if self.csum {
+                let c = crc32c(!0, &img[..0x3fc]);
+                super::put32(img, 0x3fc, c);
+            }
+            let data = img.clone();
+            return bwrite(2, &data, sleep);
+        }
         let data = {
             let mut sb = self.sb.borrow_mut();
             let v = super::u32_at(&sb, 96);
@@ -199,7 +227,7 @@ impl ExtFs {
             }
             sb.clone()
         };
-        crate::block::write(2, &data)?;
+        bwrite(2, &data, sleep)?;
         // キャッシュにあるスーパーブロックの入ったブロックにも映す
         self.sync_sb_cache(&data);
         Ok(())
@@ -312,7 +340,7 @@ impl ExtFs {
         put_be32(&mut j.sb, 0x1c, 0);
         put_be32(&mut j.sb, 0x18, seq);
         j.seq = seq;
-        self.write_jsb(j)?;
+        self.write_jsb(j, false)?;
         // スーパーブロックとグループディスクリプタは再生で変わったかもしれないので読みなおす
         let mut sb = vec![0u8; 1024];
         crate::block::read(2, &mut sb)?;
@@ -323,27 +351,42 @@ impl ExtFs {
     /// meta のブロックを 1 つのトランザクションとしてジャーナルに書く。
     /// 入りきらなければ Ok(false) (呼ぶ側がジャーナルなしで書く)
     pub(super) fn journal_commit(&self, j: &mut Journal, meta: &[u64]) -> Result<bool, i64> {
+        if !j.fits(meta.len(), self.bsize) {
+            return Ok(false);
+        }
+        let mut snap = Vec::with_capacity(meta.len());
+        for &blk in meta {
+            self.settle_csum(blk)?;
+            snap.push((blk, self.read_block(blk)?));
+        }
+        self.journal_commit_snap(j, &snap, false)
+    }
+
+    /// snap (ブロックの番号と、その中身の写し) を 1 つのトランザクションとしてジャーナルに書く。sleep なら眠って待つ
+    /// (眠って書く書き出しは、眠る前に写しをとる: 書いているあいだにほかが変えたものは、次のトランザクションへ)。
+    /// 入りきらなければ Ok(false)
+    pub(super) fn journal_commit_snap(&self, j: &mut Journal, snap: &[(u64, Vec<u8>)], sleep: bool) -> Result<bool, i64> {
         let _p = crate::prof::span("jbd2:commit");
         let tb = j.tag_bytes();
         let tail = if j.v3 { 4 } else { 0 };
         // 記述ブロック 1 つに入るタグの数 (先頭のタグの後ろには UUID が付く)
         let per_desc = (self.bsize - 12 - tail - 16) / tb;
-        let ndesc = meta.len().div_ceil(per_desc);
-        let total = ndesc + meta.len() + 1;
+        let ndesc = snap.len().div_ceil(per_desc);
+        let total = ndesc + snap.len() + 1;
         if j.first as usize + total > j.maxlen as usize {
             return Ok(false);
         }
         let seq = j.seq;
         let start = j.first;
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(total);
-        for chunk in meta.chunks(per_desc) {
+        for chunk in snap.chunks(per_desc) {
             let mut desc = vec![0u8; self.bsize];
             j.header(&mut desc, DESCRIPTOR, seq);
             let mut datas = Vec::with_capacity(chunk.len());
             let mut o = 12;
-            for (i, &blk) in chunk.iter().enumerate() {
-                self.settle_csum(blk)?;
-                let mut d = self.read_block(blk)?;
+            for (i, (blk, data)) in chunk.iter().enumerate() {
+                let blk = *blk;
+                let mut d = data.clone();
                 let mut flags = 0;
                 if be32(&d, 0) == MAGIC {
                     put_be32(&mut d, 0, 0);
@@ -390,26 +433,26 @@ impl ExtFs {
             put_be32(&mut commit, 16, c);
             // チェックサムで確かめられるので、コミットも一緒に書く
             out.push(commit);
-            self.jwrite_blocks(j, start, &out)?;
+            self.jwrite_blocks(j, start, &out, sleep)?;
         } else {
             // チェックサムがないので、中身を書き終えてからコミットを書く
-            self.jwrite_blocks(j, start, &out)?;
-            self.jwrite(j, start + out.len() as u32, &commit)?;
+            self.jwrite_blocks(j, start, &out, sleep)?;
+            self.jwrite(j, start + out.len() as u32, &commit, sleep)?;
         }
         // ここでトランザクションは確かになる: ジャーナルの頭を指し、回復の印を立てる
         put_be32(&mut j.sb, 0x1c, j.first);
         put_be32(&mut j.sb, 0x18, seq);
-        self.write_jsb(j)?;
-        self.set_recover(true)?;
+        self.write_jsb(j, sleep)?;
+        self.set_recover(true, sleep)?;
         Ok(true)
     }
 
     /// 本当の場所へ書き終えたら、ジャーナルを空に戻す
-    pub(super) fn journal_done(&self, j: &mut Journal) -> Result<(), i64> {
+    pub(super) fn journal_done(&self, j: &mut Journal, sleep: bool) -> Result<(), i64> {
         j.seq = j.seq.wrapping_add(1);
         put_be32(&mut j.sb, 0x1c, 0);
         put_be32(&mut j.sb, 0x18, j.seq);
-        self.write_jsb(j)?;
-        self.set_recover(false)
+        self.write_jsb(j, sleep)?;
+        self.set_recover(false, sleep)
     }
 }

@@ -618,7 +618,7 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
         }
     }
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
-        vfs::sync_all();
+        vfs::sync_all_wait();
     }
     Ok(done as i64)
 }
@@ -755,7 +755,7 @@ fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
         inotify::file_event(path, i, inotify::IN_MODIFY);
     }
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
-        vfs::sync_all();
+        vfs::sync_all_wait();
     }
     Ok(done as i64)
 }
@@ -774,7 +774,7 @@ pub fn fsync(fd: u64, fs: bool) -> R {
             return Err(crate::why::inval());
         }
     }
-    vfs::sync_all();
+    vfs::sync_all_wait();
     Ok(0)
 }
 
@@ -905,7 +905,7 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
         Ok(done)
     })?;
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
-        vfs::sync_all();
+        vfs::sync_all_wait();
     }
     Ok(done as i64)
 }
@@ -981,7 +981,7 @@ pub fn pwritev2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
         Ok(done)
     })?;
     if done > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
-        vfs::sync_all();
+        vfs::sync_all_wait();
     }
     Ok(done as i64)
 }

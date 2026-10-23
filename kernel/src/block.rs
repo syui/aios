@@ -73,6 +73,14 @@ fn raw_read_wait(d: Dev, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
     }
 }
 
+/// 眠って待つ書き (virtio。SD はいままでどおり回って待つ)
+fn raw_write_wait(d: Dev, sector: u64, buf: &[u8]) -> Result<(), i64> {
+    match d {
+        Dev::Virtio => virtio_blk::write_wait(sector, buf),
+        Dev::Sd => sd::write(sector, buf),
+    }
+}
+
 fn raw_write(d: Dev, sector: u64, buf: &[u8]) -> Result<(), i64> {
     match d {
         Dev::Virtio => virtio_blk::write(sector, buf),
@@ -180,6 +188,21 @@ pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
 
 pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
     write_part(&root(), sector, buf)
+}
+
+/// root の区画へ、眠って待って書く (extfs の眠って書く書き出し。大きなロックはほかの CPU が使う)
+pub fn write_wait(sector: u64, buf: &[u8]) -> Result<(), i64> {
+    let _p = crate::prof::span("block:write");
+    let p = root();
+    if sector + (buf.len() / SECTOR) as u64 > p.len {
+        return Err(-5);
+    }
+    let t0 = crate::timer::uptime_ns();
+    crate::trace::blk(true, p.start + sector, (buf.len() / SECTOR) as u64);
+    let r = raw_write_wait(dev()?, p.start + sector, buf);
+    crate::trace::blk_done(t0);
+    count(&p, true, (buf.len() / SECTOR) as u64, t0);
+    r
 }
 
 pub fn root() -> Part {

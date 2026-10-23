@@ -401,6 +401,11 @@ pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
 pub fn sync_all() {
     // MAP_SHARED で書いたページを先にファイルへ
     crate::vm::sync_shared();
+    sync_roots();
+}
+
+/// マウントしているファイルシステムの根に sync (書き出し) をたのむ
+fn sync_roots() {
     let mut roots: Vec<InodeRef> = ROOT.get().iter().cloned().collect();
     let mut tables = alloc::vec![init_mnt()];
     tables.extend(ALL_MNT.get().iter().filter_map(|w| w.upgrade()));
@@ -411,6 +416,18 @@ pub fn sync_all() {
         if let Err(e) = r.sync() {
             println!("sync: error {}", e);
         }
+    }
+}
+
+/// sync_all を、書き出しがディスクを眠って待つようにして (fsync、sync、syncfs、RWF_SYNC、reboot: システムコールの
+/// いちばん外から。ほかのプロセスはそのあいだも動く。前は書き終わるまで大きなロックを持って回っていた)
+pub fn sync_all_wait() {
+    // MAP_SHARED のページは、表を借りながらファイルに書くので、眠らないところで
+    crate::vm::sync_shared();
+    if crate::proc::try_current().is_some() && crate::smp::holding() {
+        crate::proc::flush_sleepable(sync_roots)
+    } else {
+        sync_roots()
     }
 }
 

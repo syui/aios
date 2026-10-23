@@ -532,6 +532,57 @@ fn hw_crc() -> bool {
     }
 }
 
+/// ブロックの番号の集まりを、続いたところ (はじめ → 終わりの次) で覚える (大きなファイルを消しても小さい)
+#[derive(Default)]
+struct Ranges(BTreeMap<u64, u64>);
+
+impl Ranges {
+    fn insert(&mut self, b: u64) {
+        self.insert_range(b, b + 1);
+    }
+
+    /// [s, e) を足す (重なるもの、となりあうものとはひとつに)
+    fn insert_range(&mut self, mut s: u64, mut e: u64) {
+        if let Some((&ps, &pe)) = self.0.range(..=s).next_back()
+            && pe >= s
+        {
+            s = ps;
+            e = e.max(pe);
+            self.0.remove(&ps);
+        }
+        while let Some((&ns, &ne)) = self.0.range(s..=e).next() {
+            e = e.max(ne);
+            self.0.remove(&ns);
+        }
+        self.0.insert(s, e);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// [lo, hi) の中のものを、はじめと終わりの次で
+    fn within(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let first = self.0.range(..=lo).next_back().map(|(&s, _)| s).unwrap_or(lo);
+        self.0.range(first..hi).filter_map(move |(&s, &e)| (e > lo).then_some((s.max(lo), e.min(hi))))
+    }
+
+    /// o のものをみなこちらへ移す
+    fn take_from(&mut self, o: &mut Ranges) {
+        if self.0.is_empty() {
+            core::mem::swap(&mut self.0, &mut o.0);
+            return;
+        }
+        for (s, e) in core::mem::take(&mut o.0) {
+            self.insert_range(s, e);
+        }
+    }
+}
+
 /// ブロックの読み書き。1 ブロックを 1 ページに入れて覚えておく
 impl Cache {
     /// 書いていないもの (メタデータもファイルの中身も) でなく、だれも写していない (参照がこの表だけ: ページキャッシュや
@@ -543,7 +594,7 @@ impl Cache {
         let mut tries = 0;
         while let Some(x) = self.order.pop_front() {
             let Some(&p) = self.map.get(&x) else { continue };
-            if kalloc::refs(p) > 1 || self.dirty.contains(&x) || self.data.contains(&x) {
+            if kalloc::refs(p) > 1 || self.busy(x) {
                 self.order.push_back(x);
                 tries += 1;
                 if tries >= 64 {
@@ -559,13 +610,27 @@ impl Cache {
         false
     }
 
+    /// 表から外したブロック b のページを返す。ページは参照で持つ (写しているところがまだ見ているかもしれない)。
+    /// 眠って書く書き出しがそのブロックを書いているとちゅうなら、書き終わるまで返さない (wb_held)
+    fn release_page(&mut self, b: u64, p: *mut u8) {
+        if self.writeback.contains(&b) {
+            self.wb_held.push(p);
+        } else {
+            kalloc::put(p);
+        }
+    }
+
+    /// まだディスクに書いていない (dirty、data) か、いま書いている (writeback) ブロック: 捨てない
+    fn busy(&self, b: u64) -> bool {
+        self.dirty.contains(&b) || self.data.contains(&b) || self.writeback.contains(&b)
+    }
+
     /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
     /// みな (16384 まで) なので、外すたびになめると大きなファイルを消すのがブロックの数 × 16384 になる
     /// (16 MiB で 6700 万回)。残ったものが覚えている数をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
     fn forget(&mut self, b: u64) {
         let Some(p) = self.map.remove(&b) else { return };
-        // ページは参照で持つ (写しているところがまだ見ているかもしれない)
-        kalloc::put(p);
+        self.release_page(b, p);
         if self.order.len() > 2 * self.map.len() + 64 {
             // 外したあとにまた入ったものは 2 度ある: 古いほうを残す
             let mut seen = BTreeSet::new();
@@ -596,6 +661,22 @@ struct Cache {
     written_meta: u64,
     written_data: u64,
     commits: u64,
+    /// 眠って書く書き出し (flush_sleeping) がいま書いているブロック (写しをとったあとの dirty と data)。書き終わるまで
+    /// 捨てない (捨ててディスクから読みなおすと、まだ書いていない古い中身が見える)
+    writeback: BTreeSet<u64>,
+    /// writeback のブロックで、書いているあいだに表から外した (放した、別のページにした) ページ。書き終わるまで返さない
+    /// (書いているのはそのページの中身)。ページの参照の数は vm.rs が「だれが写しているか」に使うので、書き出しは
+    /// 参照を足さず、表の持っていた参照をここへ移す
+    wb_held: Vec<*mut u8>,
+    /// 眠って書いた書き出しの数と、ほかの書き出しのとちゅうだったので回って書かなかった数 (/proc/ai/fs)
+    slept_flushes: u64,
+    skipped_flushes: u64,
+    /// 前の書き出しの写しのあとに放したブロック。放したことがコミットされるまで、また取らない (Linux の ext4 と同じ:
+    /// 書き出しはファイルの中身をコミットより先に書くので、放してすぐ別のファイルの中身に使うと、コミットの前に
+    /// こわれたとき、ディスクではまだそれを指している古いファイルや extent の葉に、その中身が入る)
+    freed: Ranges,
+    /// 眠って書く書き出しがいまコミットしている、その写しの前に放したブロック (書き終わったら取れる)
+    freed_wb: Ranges,
 }
 
 /// inode とブロックを取る・返すときに書きかえたもの (書き出しで、チェックサムを直して書く)。ALLOC で守る
@@ -635,6 +716,9 @@ pub struct ExtFs {
     adirty: Shared<AllocDirty>,
     cache: Shared<Cache>,
     journal: Shared<Option<jbd2::Journal>>,
+    /// 眠って書く書き出し (flush_sleeping) のとちゅう: ジャーナルに入れたときのスーパーブロック (回復の印を立てる・
+    /// 消すのは、いまのものでなくこれに: jbd2 の set_recover)
+    sb_disk: Shared<Option<Vec<u8>>>,
     /// 最後に書き出した時刻 (ticks)
     last_flush: ACell,
     /// inode ごとの、いま生きている ExtInode の数 (開いているファイル、mmap、カレントディレクトリ ...)
@@ -654,6 +738,9 @@ pub struct ExtFs {
     wgen: ACell,
     /// いま書く操作の中 (その中の読みは眠らない)
     writing: ACell,
+    /// 眠って書く書き出し (flush_sleeping) のとちゅう (1)。そのあいだ、ほかの書き出しは、眠れないところならしない
+    /// (あとの書き出しにまかせる)、眠れるところ (fsync など) なら終わるのを待ってから
+    flushing: ACell,
     /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
     names_gen: ACell,
     /// meta() の答え (inode → Meta)。stat や open の 1 回で、たどるディレクトリとファイルの meta が何度も
@@ -909,8 +996,15 @@ impl ExtFs {
                 written_meta: 0,
                 written_data: 0,
                 commits: 0,
+                writeback: BTreeSet::new(),
+                wb_held: Vec::new(),
+                slept_flushes: 0,
+                skipped_flushes: 0,
+                freed: Ranges::default(),
+                freed_wb: Ranges::default(),
             }),
             journal: Shared::new(None),
+            sb_disk: Shared::new(None),
             last_flush: ACell::new(0),
             users: Shared::new(BTreeMap::new()),
             orphans: Shared::new(BTreeSet::new()),
@@ -919,6 +1013,7 @@ impl ExtFs {
             names: Shared::with(Names { dirs: BTreeMap::new(), len: 0 }, &NAME_BOOK),
             wgen: ACell::new(0),
             writing: ACell::new(0),
+            flushing: ACell::new(0),
             names_gen: ACell::new(0),
             metas: Shared::with(BTreeMap::new(), &META_BOOK),
             meta_ver: ACell::new(0),
@@ -991,7 +1086,7 @@ impl ExtFs {
         let sb = self.sb.borrow();
         let since = crate::timer::coarse_ticks().saturating_sub(self.last_flush.get()) / crate::timer::HZ;
         alloc::format!(
-            "{{\"block_size\":{},\"ro\":{},\"cache\":{{\"blocks\":{},\"limit\":{},\"dirty_meta\":{},\"dirty_data\":{},\"hits\":{},\"misses\":{},\"readahead\":{},\"evictions\":{},\"flushes\":{},\"written_meta\":{},\"written_data\":{},\"commits\":{},\"last_flush_s\":{}}},\"journal\":{},\"metas\":{{\"entries\":{},\"max\":{}}},\"names\":{{\"entries\":{},\"max\":{}}},\"inodes_in_use\":{},\"orphans\":{},\"blocks\":{{\"total\":{},\"free\":{}}},\"inodes\":{{\"total\":{},\"free\":{}}}}}",
+            "{{\"block_size\":{},\"ro\":{},\"cache\":{{\"blocks\":{},\"limit\":{},\"dirty_meta\":{},\"dirty_data\":{},\"hits\":{},\"misses\":{},\"readahead\":{},\"evictions\":{},\"flushes\":{},\"written_meta\":{},\"written_data\":{},\"commits\":{},\"slept_flushes\":{},\"skipped_flushes\":{},\"writeback\":{},\"last_flush_s\":{}}},\"journal\":{},\"metas\":{{\"entries\":{},\"max\":{}}},\"names\":{{\"entries\":{},\"max\":{}}},\"inodes_in_use\":{},\"orphans\":{},\"blocks\":{{\"total\":{},\"free\":{}}},\"inodes\":{{\"total\":{},\"free\":{}}}}}",
             self.bsize,
             self.ro,
             c.map.len(),
@@ -1006,6 +1101,9 @@ impl ExtFs {
             c.written_meta,
             c.written_data,
             c.commits,
+            c.slept_flushes,
+            c.skipped_flushes,
+            c.writeback.len(),
             since,
             journal,
             self.metas.borrow().len(),
@@ -1136,7 +1234,7 @@ impl ExtFs {
             (have, Some(p)) => {
                 c.map.insert(b, p);
                 match have {
-                    Some(old) => kalloc::put(old),
+                    Some(old) => c.release_page(b, old),
                     None => c.order.push_back(b),
                 }
                 p
@@ -1311,8 +1409,8 @@ impl ExtFs {
     /// 覚えているブロックをぜんぶ捨てる (書いていないものはないこと)
     fn drop_cache(&self) {
         let mut c = self.cache.borrow_mut();
-        for (_, p) in core::mem::take(&mut c.map) {
-            kalloc::put(p);
+        for (b, p) in core::mem::take(&mut c.map) {
+            c.release_page(b, p);
         }
         c.order.clear();
     }
@@ -1554,21 +1652,57 @@ impl ExtFs {
         Ok(())
     }
 
-    /// ビットマップ bm の中で、start から n 個のうち空いているビットを 1 つ取る
-    fn take_in(&self, bm: u64, start: u32, n: u32) -> Result<Option<u32>, i64> {
+    /// ビットマップ bm の中で、start から n 個のうち空いているビットを 1 つ取る。held (はじめと終わりの次) のものはとばす
+    fn take_in(&self, bm: u64, start: u32, n: u32, held: &[(u32, u32)]) -> Result<Option<u32>, i64> {
         self.modify_block(bm, |d| {
-            let bit = first_zero(d, start, n)?;
-            d[(bit / 8) as usize] |= 1 << (bit % 8);
-            Some(bit)
+            let mut from = start;
+            loop {
+                let bit = first_zero(d, from, n)?;
+                // held は並んでいて重ならない: bit より前ではじまるいちばん後ろのものだけ見る
+                let i = held.partition_point(|&(s, _)| s <= bit);
+                if i > 0 && bit < held[i - 1].1 {
+                    from = held[i - 1].1;
+                    continue;
+                }
+                d[(bit / 8) as usize] |= 1 << (bit % 8);
+                return Some(bit);
+            }
         })
     }
 
-    /// goal のそば (同じグループの goal 以降、なければ他のグループ) にブロックを 1 つ取る
+    /// グループ g (はじめ gs、n ブロック) の、放したことがまだコミットされていないブロック (グループの中のビットで。
+    /// はじめの順に並べ、重なるものはまとめる)
+    fn held_in(&self, gs: u64, n: u32) -> Vec<(u32, u32)> {
+        let c = self.cache.borrow();
+        if c.freed.is_empty() && c.freed_wb.is_empty() {
+            return Vec::new();
+        }
+        let hi = gs + n as u64;
+        let mut v: Vec<(u32, u32)> = c.freed.within(gs, hi).chain(c.freed_wb.within(gs, hi)).map(|(s, e)| ((s - gs) as u32, (e - gs) as u32)).collect();
+        v.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+        for (s, e) in v {
+            match out.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    }
+
+    /// goal のそば (同じグループの goal 以降、なければ他のグループ) にブロックを 1 つ取る。
+    /// 放したことがまだコミットされていないブロック (Cache::freed) は、ほかに空きがないときだけ
     fn alloc_block(&self, goal: u64) -> Result<u64, i64> {
         let goal = goal.clamp(self.first_data_block, self.blocks_count() - 1);
         let gg = ((goal - self.first_data_block) / self.bpg as u64) as u32;
-        for k in 0..=self.groups {
-            let g = (gg + k) % self.groups;
+        let mut held_any = false;
+        for k in 0..=2 * self.groups + 1 {
+            // 2 回目のまわり: 放したばかりのものも (ディスクがいっぱい)
+            let last = k > self.groups;
+            if last && !held_any {
+                break;
+            }
+            let g = (gg + k % (self.groups + 1)) % self.groups;
             if self.gd_cnt(g, 0xc, 0x2c) == 0 {
                 continue;
             }
@@ -1576,10 +1710,12 @@ impl ExtFs {
                 self.init_block_bitmap(g)?;
             }
             let n = self.blocks_in_group(g);
+            let held = if last { Vec::new() } else { self.held_in(self.group_start(g), n) };
+            held_any |= !held.is_empty();
             let from = if k == 0 { (goal - self.group_start(g)) as u32 } else { 0 };
-            let mut found = self.take_in(self.block_bitmap(g), from, n)?;
+            let mut found = self.take_in(self.block_bitmap(g), from, n, &held)?;
             if found.is_none() && from > 0 {
-                found = self.take_in(self.block_bitmap(g), 0, from)?;
+                found = self.take_in(self.block_bitmap(g), 0, from, &held)?;
             }
             if let Some(bit) = found {
                 self.gd_add_cnt(g, 0xc, 0x2c, -1);
@@ -1612,6 +1748,8 @@ impl ExtFs {
         c.data.remove(&b);
         c.dir_csum.remove(&b);
         c.forget(b);
+        // 放したことがコミットされるまで、また取らない (alloc_block)
+        c.freed.insert(b);
         Ok(())
     }
 
@@ -1627,7 +1765,7 @@ impl ExtFs {
             }
             // 予約された inode (最初のグループの 1..first_ino) は飛ばす
             let from = if g == 0 { first_ino - 1 } else { 0 };
-            let Some(bit) = self.take_in(self.inode_bitmap(g), from, self.ipg)? else { continue };
+            let Some(bit) = self.take_in(self.inode_bitmap(g), from, self.ipg, &[])? else { continue };
             return Ok(self.inode_taken(g, bit, dir));
         }
         Err(-ENOSPC)
@@ -1793,8 +1931,27 @@ impl ExtFs {
     }
 
     pub fn flush(&self) -> Result<(), i64> {
+        // 眠って書いてよいところ (proc::flush_sleepable: fsync、sync) か。その印はここで取る: 中で呼ぶ書き出し
+        // (MAP_SHARED のページを書くときの maybe_flush など) は眠らせない
+        let saved = crate::proc::flush_sleep_take();
+        let r = self.flush_inner(saved > 0 && crate::smp::holding());
+        crate::proc::flush_sleep_restore(saved);
+        r
+    }
+
+    fn flush_inner(&self, sleep: bool) -> Result<(), i64> {
         // 書きかえたものをまとめて書き出す (中の block:write と jbd2:commit は引かれる)
         let _p = crate::prof::span("extfs:flush");
+        // ほかの書き出しが眠って書いているとちゅう: 眠れるなら終わるまで待ってから (そのあとに変わったものを書く)。
+        // 眠れないところ (書く操作の中の maybe_flush、暇なときの書き出し) ではしない: 写しをとったあとに変わったものは、
+        // あとの書き出しが書く
+        while self.flushing.get() != 0 {
+            if !sleep {
+                self.cache.borrow_mut().skipped_flushes += 1;
+                return Ok(());
+            }
+            crate::proc::sleep_nointr(self.flush_chan());
+        }
         self.take_fast_writes();
         self.last_flush.set(crate::timer::coarse_ticks());
         self.cache.borrow_mut().flushes += 1;
@@ -1842,6 +1999,9 @@ impl ExtFs {
             let (b, off) = self.sb_block();
             self.modify_block(b, |d| d[off..off + 1024].copy_from_slice(&data))?;
         }
+        if sleep && let Some(r) = self.flush_sleeping() {
+            return r;
+        }
         // ファイルの中身を先に (data=ordered)。印 (data / dirty) は書き終えてから外す: 書いているあいだに
         // キャッシュがいっぱいになると evict_one が印のないページを捨てるので、先に外すと、まだ書いていない
         // ページが捨てられて、ディスクの古い中身 (消したファイルのものなど) が書かれてしまう
@@ -1856,6 +2016,7 @@ impl ExtFs {
         }
         let meta: Vec<u64> = self.cache.borrow().dirty.iter().copied().collect();
         if meta.is_empty() {
+            self.cache.borrow_mut().freed.clear();
             return Ok(());
         }
         self.flush_meta(&meta)?;
@@ -1864,6 +2025,8 @@ impl ExtFs {
             c.dirty.remove(b);
         }
         c.written_meta += meta.len() as u64;
+        // 放したことはディスクに行った: また取ってよい
+        c.freed.clear();
         Ok(())
     }
 
@@ -1873,11 +2036,187 @@ impl ExtFs {
             if self.journal_commit(jr, meta)? {
                 self.cache.borrow_mut().commits += 1;
                 self.write_blocks(meta)?;
-                return self.journal_done(jr);
+                return self.journal_done(jr, false);
             }
         }
         // ジャーナルがない (ext2 など) か、1 つのトランザクションに入りきらない
         self.write_blocks(meta)
+    }
+
+    fn flush_chan(&self) -> usize {
+        &self.flushing as *const ACell as usize
+    }
+
+    /// 眠って書く書き出し (fsync、sync から: flush_sleepable)。前は書き終わるまで大きなロックを持って回っていたので、
+    /// おそいディスク (HDD、SD) では fsync のたびに機械ぜんぶが止まった。
+    /// 中身 (data) とメタデータ (dirty) の写しを、眠る前に同じときにとる (中身を書いているあいだに、ほかが新しい
+    /// ブロックを指す inode をメタデータに足しても、それはこのトランザクションに入らない: まだ書いていないブロック
+    /// (前に使っていたファイルの中身) をファイルが指すことはない)。印は外して writeback に移し (捨てさせない)、それから
+    /// 眠りながら (大きなロックと ext4 のロックはほかが使う) data=ordered の順に: 中身を本当の場所へ、メタデータを
+    /// ジャーナルへ (コミットと回復の印まで)、メタデータを本当の場所へ、ジャーナルを空に。
+    /// 書いているあいだにほかが書きかえたブロックには、また印がつく (次の書き出しで書く)。中身は写さずにキャッシュの
+    /// ページから書く (writeback にあるあいだは捨てず、表から外したページも書き終わるまで返さない: wb_held。書いて
+    /// いるあいだに書きかえられたら、ディスクにはまざったものが行くが、印がまたついているので次で正しくなる: Linux の
+    /// 安定ページなしと同じ)。メタデータは写しから (ジャーナルにも本当の場所にも同じものを)。
+    /// できない形 (ジャーナルがない、1 つのトランザクションに入りきらない、写しのメモリがない) なら None (呼ぶ側が
+    /// いままでどおり回って書く)
+    fn flush_sleeping(&self) -> Option<Result<(), i64>> {
+        let meta: Vec<u64> = self.cache.borrow().dirty.iter().copied().collect();
+        if !self.journal.borrow().as_ref()?.fits(meta.len(), self.bsize) {
+            return None;
+        }
+        // ディレクトリのチェックサムを先に (写しに入るように)。ここまでは何も変えていない
+        let mut snap: Vec<(u64, Vec<u8>)> = Vec::new();
+        if snap.try_reserve_exact(meta.len()).is_err() {
+            return None;
+        }
+        for &b in &meta {
+            if let Err(e) = self.settle_csum(b) {
+                return Some(Err(e));
+            }
+            match self.read_block(b) {
+                Ok(d) => snap.push((b, d)),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        let (data, pages) = {
+            let mut c = self.cache.borrow_mut();
+            let data: Vec<u64> = core::mem::take(&mut c.data).into_iter().collect();
+            for b in &meta {
+                c.dirty.remove(b);
+            }
+            // 中身のページ (writeback にあるあいだは返されない: release_page)
+            let pages: Vec<(u64, *mut u8)> = data.iter().filter_map(|&b| c.map.get(&b).map(|&p| (b, p))).collect();
+            c.writeback.extend(data.iter().copied());
+            c.writeback.extend(meta.iter().copied());
+            // ここまでに放したものは、このトランザクションのコミットのあとに取れる。眠っているあいだに放すものは freed に
+            // (次のトランザクション)
+            let mut freed = core::mem::take(&mut c.freed);
+            c.freed_wb.take_from(&mut freed);
+            c.slept_flushes += 1;
+            (data, pages)
+        };
+        let mut jr = self.journal.borrow_mut().take().expect("extfs: journal went away before a sleeping flush");
+        // いまのスーパーブロックは、写しをとったときのもの (変えたものには adirty.sb の印があり、上でキャッシュのブロックに
+        // 写してある)。眠っているあいだに変わっても、ディスクへ直接書くのはこれ
+        *self.sb_disk.borrow_mut() = Some(self.sb.borrow().clone());
+        self.flushing.set(1);
+        let r = self.flush_sleeping_io(&mut jr, &pages, &snap);
+        *self.journal.borrow_mut() = Some(jr);
+        *self.sb_disk.borrow_mut() = None;
+        self.flushing.set(0);
+        {
+            let mut c = self.cache.borrow_mut();
+            for b in data.iter().chain(meta.iter()) {
+                c.writeback.remove(b);
+            }
+            for p in core::mem::take(&mut c.wb_held) {
+                kalloc::put(p);
+            }
+            if r.is_ok() {
+                c.written_data += data.len() as u64;
+                c.written_meta += meta.len() as u64;
+                if !meta.is_empty() {
+                    c.commits += 1;
+                }
+                c.freed_wb.clear();
+            } else {
+                // コミットできなかった: 放したものは次の書き出しまで取らない
+                let mut wb = core::mem::take(&mut c.freed_wb);
+                c.freed.take_from(&mut wb);
+                // 書けなかった: 印を戻す (中身はキャッシュにある。そのあと書きかえられたものには、もう印がついている。
+                // 捨てたブロックは戻さない)
+                for &b in &data {
+                    if c.map.contains_key(&b) && !c.dirty.contains(&b) {
+                        c.data.insert(b);
+                    }
+                }
+                for &b in &meta {
+                    if c.map.contains_key(&b) {
+                        c.data.remove(&b);
+                        c.dirty.insert(b);
+                    }
+                }
+            }
+        }
+        crate::proc::wakeup(self.flush_chan());
+        Some(r)
+    }
+
+    /// flush_sleeping の、眠って書くところ (data=ordered の順に)
+    fn flush_sleeping_io(&self, jr: &mut jbd2::Journal, pages: &[(u64, *mut u8)], snap: &[(u64, Vec<u8>)]) -> Result<(), i64> {
+        const RUN: usize = 256;
+        let spb = (self.bsize / crate::block::SECTOR) as u64;
+        let run_end = |i: usize, n: usize, at: &dyn Fn(usize) -> u64| {
+            let mut j = i + 1;
+            while j < n && j - i < RUN && at(j) == at(j - 1) + 1 {
+                j += 1;
+            }
+            j
+        };
+        // 1. 中身を本当の場所へ (となりあうものは 1 回で、1 MiB まで。まとめるメモリがなければ 1 ページずつそのまま)
+        let mut i = 0;
+        while i < pages.len() {
+            let j = run_end(i, pages.len(), &|k| pages[k].0);
+            let mut buf = Vec::new();
+            if j - i > 1 && buf.try_reserve_exact((j - i) * self.bsize).is_ok() {
+                for &(_, p) in &pages[i..j] {
+                    buf.extend_from_slice(unsafe { core::slice::from_raw_parts(p, self.bsize) });
+                }
+                jbd2::bwrite(pages[i].0 * spb, &buf, true)?;
+            } else {
+                for &(b, p) in &pages[i..j] {
+                    jbd2::bwrite(b * spb, unsafe { core::slice::from_raw_parts(p, self.bsize) }, true)?;
+                }
+            }
+            i = j;
+        }
+        if snap.is_empty() {
+            return Ok(());
+        }
+        // 2. メタデータをジャーナルへ (コミットして、回復の印を立てる)。入りきることは確かめてある
+        if !self.journal_commit_snap(jr, snap, true)? {
+            return Err(-EIO);
+        }
+        // 3. メタデータを本当の場所へ (写しから)。スーパーブロックの入ったブロックは、写しのスーパーブロックのところを
+        //    回復の印を立てたもの (sb_disk) にして (印のないものを書くと、ほかを書き終える前に印が消え、こわれたときに
+        //    ジャーナルが再生されない。いまのキャッシュのものは、眠っているあいだにほかが変えたものが入っている)
+        let (sbb, sbo) = self.sb_block();
+        let with_sb = |b: u64, d: &[u8]| -> Vec<u8> {
+            let mut v = d.to_vec();
+            if b == sbb
+                && let Some(img) = self.sb_disk.borrow().as_ref()
+            {
+                v[sbo..sbo + 1024].copy_from_slice(&img[..1024]);
+            }
+            v
+        };
+        let mut i = 0;
+        while i < snap.len() {
+            let j = run_end(i, snap.len(), &|k| snap[k].0);
+            let mut buf = Vec::new();
+            if j - i > 1 && buf.try_reserve_exact((j - i) * self.bsize).is_ok() {
+                for (b, d) in &snap[i..j] {
+                    if *b == sbb {
+                        buf.extend_from_slice(&with_sb(*b, d));
+                    } else {
+                        buf.extend_from_slice(d);
+                    }
+                }
+                jbd2::bwrite(snap[i].0 * spb, &buf, true)?;
+            } else {
+                for (b, d) in &snap[i..j] {
+                    if *b == sbb {
+                        jbd2::bwrite(b * spb, &with_sb(*b, d), true)?;
+                    } else {
+                        jbd2::bwrite(b * spb, d, true)?;
+                    }
+                }
+            }
+            i = j;
+        }
+        // 4. ジャーナルを空に (回復の印も外す)
+        self.journal_done(jr, true)
     }
 
     /// ブロックをディスクの本当の場所へ。となりあうものは 1 回の要求にまとめる
@@ -2652,7 +2991,7 @@ impl ExtFs {
                 if dontcache && fresh > 0 {
                     let mut c = self.cache.borrow_mut();
                     for j in 0..fresh {
-                        if !c.data.contains(&(b + j)) && !c.dirty.contains(&(b + j)) && c.map.get(&(b + j)).is_some_and(|&p| kalloc::refs(p) <= 1) {
+                        if !c.busy(b + j) && c.map.get(&(b + j)).is_some_and(|&p| kalloc::refs(p) <= 1) {
                             c.forget(b + j);
                         }
                     }
@@ -3372,6 +3711,11 @@ impl ExtInode {
         if r.mode() & S_IFMT != S_IFREG {
             return Err(crate::why::inval());
         }
+        // 眠って書いている書き出しのとちゅうなら、flush は書かずに戻る (まだディスクにないものがある)。ここでは待てない
+        // (このあと r を使う): EBUSY
+        if fs.flushing.get() != 0 {
+            return Err(-16);
+        }
         fs.flush()?;
         let per = PGSIZE / fs.bsize;
         let spb = (fs.bsize / crate::block::SECTOR) as u64;
@@ -3398,7 +3742,7 @@ impl ExtInode {
         {
             let mut c = fs.cache.borrow_mut();
             for b in blocks {
-                if c.dirty.contains(&b) || c.data.contains(&b) {
+                if c.busy(b) {
                     continue;
                 }
                 c.forget(b);
@@ -3827,7 +4171,7 @@ impl Inode for ExtInode {
             if b != 0 {
                 let mut c = self.fs.cache.borrow_mut();
                 // 写しているもの (参照が表だけでない) は外さない
-                if !c.data.contains(&b) && !c.dirty.contains(&b) && c.map.get(&b).is_some_and(|&p| kalloc::refs(p) <= 1) {
+                if !c.busy(b) && c.map.get(&b).is_some_and(|&p| kalloc::refs(p) <= 1) {
                     c.forget(b);
                 }
             }

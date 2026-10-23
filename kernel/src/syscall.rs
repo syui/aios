@@ -452,7 +452,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PWRITEV2 => sysfile::pwritev2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, a[5] as u32),
         STATX => sysfile::statx(int(a[0]), a[1] as usize, a[2], a[3] as u32, a[4] as usize),
         SYNC => {
-            crate::vfs::sync_all();
+            crate::vfs::sync_all_wait();
             Ok(0)
         }
         FSYNC | FDATASYNC | SYNCFS => sysfile::fsync(a[0], nr == SYNCFS),
@@ -1739,6 +1739,10 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
         CMD_RESTART => PSCI_SYSTEM_RESET,
         _ => return Err(crate::why::inval()),
     };
+    // 眠って書くあいだは、ほかの CPU が動く (終わりかけのプロセスが、閉じたファイルや消したが使っていたもの (orphan) を
+    // 片づける)。その変わったものも書くように、さいごにもう一度、大きなロックを持ったまま (そのあいだはほかは動かない)。
+    // 変わったものがなければすぐ終わる
+    crate::vfs::sync_all_wait();
     crate::vfs::sync_all();
     println!("aios: {}", if fid == PSCI_SYSTEM_OFF { "power off" } else { "restart" });
     // PSCI の呼び方は DTB の /psci の method (DTB がなければ qemu virt の hvc)。無ければ止まるだけ

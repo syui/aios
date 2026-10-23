@@ -25,6 +25,7 @@
 #   AIOS_SOUND=coreaudio / pipewire / pa / alsa / none (鳴らさない) で選べる。AIOS_SOUND=0 で音の装置なし
 # AIOS_QEMU_ARGS で QEMU に引数を足せる
 # AIOS_DISK=FILE で disk.img のかわりに FILE から起こす (コピーで動かして、あとで外から e2fsck するなど)
+# AIOS_DISK_OPTS=OPTS で virtio のディスクの -drive に足す (おそいディスクのまね: throttling.iops-write=50 など)
 # AIOS_SSH=PORT でホストの 127.0.0.1:PORT を aios の 22 (sshd) につなぐ (既定 2222、0 でつながない)
 #   ssh -p 2222 ai@127.0.0.1 で入れる (aios で sudo ssh-keygen -A && sudo /opt/c/sbin/sshd)
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
@@ -132,7 +133,7 @@ fi
 set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f "$disk" ]; then
   set -- "$@" \
-    -drive file="$disk",if=none,format=raw,id=hd0 \
+    -drive file="$disk",if=none,format=raw,id=hd0${AIOS_DISK_OPTS:+,$AIOS_DISK_OPTS} \
     -device virtio-blk-device,drive=hd0
 fi
 # 乱数のもと (ホストの乱数。カーネルの rand が 60 秒ごとに取りにくる。UEFI の EFI_RNG_PROTOCOL にもなる)

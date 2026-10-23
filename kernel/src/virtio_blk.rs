@@ -1,6 +1,7 @@
 // virtio-blk。要求は 1 度に 1 つ (記述子 0..2)。終わるのを待つのは 2 通り:
 //   ふつう: 大きなロックを持ったまま、終わるまで回る (ポーリング)
-//   read_wait (眠ってよいと分かっているところ、ext4 の読むだけの道): 眠って、割り込みで起こしてもらう。
+//   read_wait / write_wait (眠ってよいと分かっているところ、ext4 の読むだけの道と眠って書く書き出し): 眠って、
+//     割り込みで起こしてもらう。
 //     眠っているあいだ、大きなロックはほかの CPU が使える (キャッシュにないファイルを読むあいだ、
 //     ほかのシステムコールが止まっていた)
 // 眠っている人の要求が終わる前に、回る人 (眠れないところ) が来たら、その人が終わりを見とどけて起こす。
@@ -161,4 +162,9 @@ pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
 
 pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
     rw(sector, buf.as_ptr() as *mut u8, buf.len(), true, false)
+}
+
+/// 眠って待つ write (ext4 の、眠って書く書き出し: fsync や sync。buf は書き終わるまで呼ぶ側のもの)
+pub fn write_wait(sector: u64, buf: &[u8]) -> Result<(), i64> {
+    rw(sector, buf.as_ptr() as *mut u8, buf.len(), true, true)
 }

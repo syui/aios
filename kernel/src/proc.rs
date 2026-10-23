@@ -319,6 +319,9 @@ pub struct Proc {
     /// 0 でなければ、いまは「ディスクを待つあいだ眠ってよい」読むだけの道の中 (file::read の ext4 のファイル、
     /// pread)。extfs の with_block がキャッシュにないブロックを読むとき、回らずに眠る (io_sleepable)
     pub io_sleep: u32,
+    /// 0 でなければ、いまは「書き出し (ext4 の flush) がディスクを眠って待ってよい」ところ (fsync、sync: システムコールの
+    /// いちばん外。何も借りていない)。flush_sleepable
+    pub flush_sleep: u32,
     /// シグナルでは起こさない眠りの中 (sleep_nointr: ディスクの要求の終わりを待つ。Linux の TASK_UNINTERRUPTIBLE、ps の D)
     pub nointr: bool,
     /// ディスクを読まない区間 (preadv2 の RWF_NOWAIT): キャッシュになければ EAGAIN (extfs の with_block)
@@ -408,6 +411,7 @@ impl Proc {
         slept_at: 0,
         io_sleep: 0,
         nointr: false,
+        flush_sleep: 0,
         noio: 0,
         dontcache: 0,
         woken_ns: 0,
@@ -2164,6 +2168,30 @@ pub fn io_sleepable<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     current().io_sleep -= 1;
     r
+}
+
+/// f のあいだ、書き出し (ext4 の flush) はディスクを眠って待つ (ほかの CPU は大きなロックと ext4 のロックを使える)。
+/// 呼ぶのは、RefCell も ext4 の中のものも持っていないところ (fsync、sync、RWF_SYNC の書きのあと、reboot)
+pub fn flush_sleepable<R>(f: impl FnOnce() -> R) -> R {
+    current().flush_sleep += 1;
+    let r = f();
+    current().flush_sleep -= 1;
+    r
+}
+
+/// 書き出しのはじめ: flush_sleepable の印を取って 0 にする (書き出しの中で呼ぶ書き出し: MAP_SHARED のページを書く
+/// ときの maybe_flush などは、借りているものがあるので眠らせない)。flush_sleep_restore で戻す
+pub fn flush_sleep_take() -> u32 {
+    match cur() {
+        Some(i) => core::mem::take(&mut procs()[i].flush_sleep),
+        None => 0,
+    }
+}
+
+pub fn flush_sleep_restore(n: u32) {
+    if let Some(i) = cur() {
+        procs()[i].flush_sleep = n;
+    }
 }
 
 /// いまのプロセスは noio の中か: ディスクを読まない (キャッシュになければ EAGAIN。preadv2 の RWF_NOWAIT)
