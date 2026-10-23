@@ -171,7 +171,7 @@ case "$1" in
     done
     notes=$(printf '%s\n' " - v$ver" '' '```sh' '# brew install qemu zstd' 'git clone https://git.syui.ai/ai/os aios && cd aios' \
       "curl -fLO $host/ai/os/releases/download/$tag/$img" './bin/run.sh' '```' '' 'exit: `sudo poweroff`')
-    body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "target_commitish": sys.argv[2], "name": "aios", "body": sys.argv[3], "prerelease": True}))' "$tag" "$sha" "$notes")
+    body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "target_commitish": sys.argv[2], "name": "aios", "body": sys.argv[3], "prerelease": False}))' "$tag" "$sha" "$notes")
     id=$(call -X POST -H 'Content-Type: application/json' -d "$body" "$api/releases" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
     [ -n "$id" ] || { echo "ai/os: could not create the release" >&2; exit 1; }
     call -X POST -F "attachment=@$tmp/$img" "$api/releases/$id/assets?name=$img" > /dev/null

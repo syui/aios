@@ -177,4 +177,5 @@ jobs:
           NOTES
           # 前の名前 (unix-latest) のリリースがのこっていれば、それも消す
           for t in latest unix-latest; do gh release delete "$t" --yes --cleanup-tag || true; done
-          gh release create latest release/* --title aios --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          # GitHub の Latest の印はこれに (linux ブランチの release linux は --latest=false で取らない)
+          gh release create latest release/* --title aios --notes-file notes.md --target "$GITHUB_SHA" --latest
