@@ -386,6 +386,26 @@ impl ExtFs {
         })
     }
 
+    /// 名前の項目の場所: (葉の物理ブロック, その中の位置)。Ok(None) はない、Err(EAGAIN) は索引では決められない
+    pub(super) fn dx_entry(&self, dir: u32, name: &str) -> Result<Option<(u64, usize)>, i64> {
+        let Some((pb, _)) = self.dx_locate(dir, name)? else { return Ok(None) };
+        let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
+        self.with_block(pb, |d| {
+            let mut o = 0;
+            while o < end {
+                let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+                if rl < 8 || o + rl > end {
+                    break;
+                }
+                if i != 0 && &d[o + 8..o + 8 + nl] == name.as_bytes() {
+                    return Some((pb, o));
+                }
+                o += rl;
+            }
+            None
+        })
+    }
+
     /// 名前の入っている葉 (物理ブロック) と inode
     fn dx_locate(&self, dir: u32, name: &str) -> Result<Option<(u64, u32)>, i64> {
         let mut r = self.read_inode(dir)?;

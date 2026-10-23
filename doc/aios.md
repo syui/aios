@@ -738,6 +738,16 @@ inode を書いたら捨てずに書いたものに入れかえる (Linux のメ
 17.3)、2 回目 13.7 → 8.2、create と unlink は HEAD と同じ (171 と 128 µs)、fsbench で deep-stat 15.4 → 5.5。smpbench
 (4 CPU) で create-unlink-x4 は 0.74 倍の時間、stat-x4 0.80 倍。test/statc.c は 0 failed。
 
+それから renameat (Firefox はファイルを保存するたびに、書いた写しを上へ rename する: 1 回 0.75〜1.1 ms)。sysfile の renameat は、
+動かすものと上書きされるものを 1 度引いたあと、砂場 (landlock) のしらべで 2 度、上書きされたものを見るところで 2 度、同じ
+名前を引きなおしていた (ext4 の lookup は 1 回 20 µs ほど)。Linux の do_renameat2 は 1 度引いた dentry をそのまま使う。引いた
+ものを使うようにした。ext4 の上書きの rename は、先の名前を消して (unlink_node)、足しなおし (すき間をさがす)、元の名前を消す
+と、ディレクトリのブロックを 3 度書いていた。Linux の ext4_rename は、先の項目の inode をその場で書きかえ (ext4_setent: 名前も
+ハッシュも変わらない)、元の項目を消してから、上書きされたもののリンクを減らす。同じにした (unlink_node を、しらべる victim と
+リンクを減らす drop_victim に分けた)。その場で書きかえる set_entry も、ディレクトリの項目をみな名前の文字列にして並べてから
+探していたので、索引つきなら葉を 1 つだけ、なければ見つけたところまでなめる (entry_loc)。st3 (300 のファイル、6 回のいちばん
+速い回、3 度): rename 325〜388 → 216〜239 µs、上書きの rename 302〜315 → 255〜310 µs。fsbench の rename 335 → 215 µs。
+
 手本が Linux 7.3 になったとき (ext4 300 × 30 と 300 × 80、tmpfs 300 × 30 でどれもちがわない) は、手本のまちがい 3 つが
 7.3 にもまだあるかを確かめた (`sysdiff -r` は Linux の側でもただしをしないので、-r ありとなしの答えをくらべれば、そのまちがいが
 出る並びかが分かる。zero-range-eof はいまの並びではめったに出ず、ブロックにそろった ZERO_RANGE の小さな試しで見た)。

@@ -1878,16 +1878,16 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         return Ok(0);
     }
     let (op, oname, ofull, np, nname, nfull) = (o.dir, o.name, o.full, n.dir, n.name, n.full);
-    // 砂場: 元を消して、先に作る (先にあるものは消す)。ディレクトリをまたぐなら両方に REFER も
+    // 砂場: 元を消して、先に作る (先にあるものは消す)。ディレクトリをまたぐなら両方に REFER も。名前は引いたもの
+    // (moving、target) を使う (Linux の do_renameat2 も 1 度引いた dentry で: 前はここと、下の上書きされたものを見る
+    // ところで、同じ名前を 4 度引きなおしていた)
     {
         use crate::landlock::*;
         let kind = |m: u32| if m & S_IFMT == vfs::S_IFDIR { REMOVE_DIR } else { REMOVE_FILE };
-        if let Ok(m) = op.lookup(&oname) {
-            let mode = m.meta().mode;
-            check_parent(&ofull, kind(mode))?;
-            check_parent(&nfull, make_right(mode))?;
-        }
-        if let Ok(r) = np.lookup(&nname) {
+        let mode = moving.meta().mode;
+        check_parent(&ofull, kind(mode))?;
+        check_parent(&nfull, make_right(mode))?;
+        if let Some(r) = &target {
             check_parent(&nfull, kind(r.meta().mode))?;
             // 入れかえなら、それも元のところへ作る
             if flags & RENAME_EXCHANGE != 0 {
@@ -1898,9 +1898,6 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
             check_parent(&ofull, REFER)?;
             check_parent(&nfull, REFER)?;
         }
-    }
-    if flags & RENAME_NOREPLACE != 0 && np.lookup(&nname).is_ok() {
-        return Err(-EEXIST);
     }
     // Linux の vfs_rename と同じ順: 元を消せるか (親に書けて sticky も)、先に作れるか (あれば消せるか、種類が合うか)
     let c = cred::current();
@@ -1944,19 +1941,18 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         }
         return Ok(0);
     }
-    let moved = op.lookup(&oname).ok();
-    let replaced = np.lookup(&nname).ok().filter(|r| moved.as_ref().is_none_or(|m| m.id() != r.id()));
+    // 上書きされるもの (同じもののときは上で返している)
+    let replaced = target;
     op.rename(&oname, &np, &nname)?;
     vfs::forget(&ofull);
     vfs::forget(&nfull);
-    if let Some(m) = moved {
-        let isdir = if m.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
+    {
+        let isdir = if moving.meta().is_dir() { inotify::IN_ISDIR } else { 0 };
         let ck = inotify::cookie();
         inotify::dir_event(&op, &oname, inotify::IN_MOVED_FROM | isdir, ck);
         inotify::dir_event(&np, &nname, inotify::IN_MOVED_TO | isdir, ck);
-        inotify::self_event(&m, inotify::IN_MOVE_SELF | isdir);
+        inotify::self_event(&moving, inotify::IN_MOVE_SELF | isdir);
     }
-    // 上書きされたもの
     if let Some(r) = replaced
         && (r.meta().is_dir() || r.meta().nlink == 0)
     {

@@ -3351,7 +3351,7 @@ impl ExtFs {
     fn set_entry(&self, dir: u32, name: &str, ino: u32, mode: u32) -> Result<(), i64> {
         let r = self.dir_writable(dir)?;
         let generation = r.gen_no();
-        let (b, o) = self.dir_entries(dir)?.into_iter().find(|e| e.2 != 0 && e.4 == name).map(|e| (e.0, e.1)).ok_or(-ENOENT)?;
+        let (b, o) = self.entry_loc(dir, &r, name)?.ok_or(-ENOENT)?;
         let done = self.modify_dir_block(dir, generation, b, |d| {
             put32(d, o, ino);
             d[o + 7] = ftype(mode);
@@ -3375,6 +3375,18 @@ impl ExtFs {
         }
         let (_, at) = self.entry_at(dir, &r, name)?.ok_or(-ENOENT)?;
         self.remove_at(dir, r, at, name)
+    }
+
+    /// dir (inode r) の name の項目の場所 (ブロック, 位置)。索引つきなら葉を 1 つだけ、なければ見つけたところまでなめる
+    /// (前の set_entry は、ディレクトリの項目をみな名前の文字列にして並べてから探していた)
+    fn entry_loc(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u64, usize)>, i64> {
+        if r.flags() & INDEX_FL != 0 && name != "." && name != ".." {
+            match self.dx_entry(dir, name) {
+                Err(e) if e == -NOIO_EAGAIN => {}
+                res => return res,
+            }
+        }
+        Ok(self.entry_at(dir, r, name)?.map(|(_, (b, o, _, _))| (b, o)))
     }
 
     /// 索引のないディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node) は、これで引いて
@@ -3975,7 +3987,19 @@ impl ExtInode {
             0 => fs.entry_at(self.ino, &dr, name)?.map(|(i, e)| (i, Some(e))).ok_or(-ENOENT)?,
             _ => (fs.find(self.ino, name)?, None),
         };
-        let mut r = fs.read_inode(child)?;
+        let r = self.victim(child, rmdir)?;
+        match at {
+            Some(e) => fs.remove_at(self.ino, dr, e, name)?,
+            None => fs.remove_entry(self.ino, name)?,
+        }
+        self.drop_victim(child, r)
+    }
+
+    /// このディレクトリの中の、消す (か rename で上書きする) もの child の inode。ディレクトリでないのに rmdir なら ENOTDIR、
+    /// ディレクトリなのに rmdir でなければ EISDIR、中身のあるディレクトリは ENOTEMPTY
+    fn victim(&self, child: u32, rmdir: bool) -> Result<Raw, i64> {
+        let fs = &self.fs;
+        let r = fs.read_inode(child)?;
         let is_dir = r.mode() & S_IFMT == S_IFDIR;
         match (is_dir, rmdir) {
             (true, false) => return Err(-EISDIR),
@@ -3983,10 +4007,14 @@ impl ExtInode {
             (true, true) if !fs.is_empty_dir(child)? => return Err(-ENOTEMPTY),
             _ => {}
         }
-        match at {
-            Some(e) => fs.remove_at(self.ino, dr, e, name)?,
-            None => fs.remove_entry(self.ino, name)?,
-        }
+        Ok(r)
+    }
+
+    /// このディレクトリの中の名前をなくした child (inode r) のリンクを減らす (ディレクトリなら、この親のものも)。0 に
+    /// なれば、使われていなければ片づけ、使われていれば orphan に
+    fn drop_victim(&self, child: u32, mut r: Raw) -> Result<(), i64> {
+        let fs = &self.fs;
+        let is_dir = r.mode() & S_IFMT == S_IFDIR;
         if is_dir {
             fs.add_links(self.ino, -1)?;
             r.set_links(0);
@@ -4023,20 +4051,33 @@ impl ExtInode {
         if is_dir && fs.is_under(nd, child)? {
             return Err(crate::why::inval());
         }
-        if let Ok(existing) = fs.find(nd, new) {
-            if existing == child {
-                return Ok(());
+        // 先にあるものは、その項目をその場で動かすものに向けかえ (Linux の ext4_rename の ext4_setent: 名前もハッシュも
+        // 変わらない)、元の項目を消してから、上書きされたもののリンクを減らす。前は先の名前を消して足しなおしていた
+        // (すき間をさがして、ディレクトリのブロックを 3 度書く)
+        let replaced = match fs.find(nd, new) {
+            Ok(existing) if existing == child => return Ok(()),
+            Ok(existing) => {
+                let target = ExtInode::counted(fs, nd);
+                let vr = target.victim(existing, is_dir)?;
+                fs.set_entry(nd, new, child, r.mode())?;
+                Some((target, existing, vr))
             }
-            ExtInode::counted(fs, nd).unlink_node(new, is_dir)?;
-        }
-        fs.add_entry(nd, new, child, r.mode())?;
+            Err(e) if e == -ENOENT => {
+                fs.add_entry(nd, new, child, r.mode())?;
+                None
+            }
+            Err(e) => return Err(e),
+        };
         fs.remove_entry(self.ino, old)?;
         if is_dir && nd != self.ino {
             fs.set_dotdot(child, nd)?;
             fs.add_links(self.ino, -1)?;
             fs.add_links(nd, 1)?;
         }
-        Ok(())
+        match replaced {
+            Some((target, existing, vr)) => target.drop_victim(existing, vr),
+            None => Ok(()),
+        }
     }
 }
 
