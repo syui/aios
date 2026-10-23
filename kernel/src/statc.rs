@@ -3,33 +3,44 @@
 // Linux は 2.11 倍)。Linux は RCU-walk で、ロックを取らずにパスをたどり、とちゅうで変わっていれば (d_seq) ロックを取って
 // たどりなおす。ここも同じ考えで、答えを覚えておく:
 //   ふつうの道 (大きなロックの中) の newfstatat か statx が答えたら learn が、その答え (file::Stat) と、それが正しいあいだの印
-//   (通ったディレクトリの版、inode の中身の版、だれでもは通れないディレクトリの許し (gates)、全体の版) を、ロックの外から
+//   (通ったところ (ディレクトリと、そこで引いた名前) の版、inode の中身の版、だれでもは通れないディレクトリの許し (gates)、
+//   全体の版) を、ロックの外から
 //   読める表 (TABLE) に書く。syscall::fast の newfstatat と statx は lookup で、表にあって印がみないまと同じで、呼んだ人が
 //   gates を通れれば、ロックを取らずにそれを struct stat か struct statx にして返す (C の stat は newfstatat、Rust の
 //   std::fs::metadata は statx)。ちがえば (と、表にないもの、書いている途中のもの) ふつうの道へ。
 //   「ない」(ENOENT) も覚える (シェルの PATH さがし、ライブラリや locale のファイルさがし: いちばん多い stat)。答えるときは
 //   ふつうの道と同じわけ (missing_cached) を /proc/ai/why に残す (why::fast_missing。取るのは輪のロックだけ)。
-// 版の箱 (DIRS、INOS) は id のハッシュで分けた AtomicU64: vfs が名前やディレクトリの属性を変えるたびに DIRS を、ext4 が
-// inode を書くたびに INOS を増やす (箱が同じほかのものが変わっても、古いとみなすだけで、まちがった答えは出さない)。
-// マウントやルート、vfs の版の表を空にしたときは EPOCH (みな古い)。
-// 表の 1 つは AtomicU64 の並び (seqlock: 書く側は大きなロックを持って、seq を奇数にしてから書いて偶数に。読む側は前後で
+//   大きなロックなしの O_CREAT (fastdir.rs) が作ったファイルは learn_new が、親の答えに 1 つ足して書く。
+// 版の箱 (NAMES、INOS) はハッシュで分けた AtomicU64: vfs が (ディレクトリ, 名前) を変える (作る・消す・名前を変える) たびに
+// その NAMES を、ext4 が inode を書くたびに INOS を増やす (箱が同じほかのものが変わっても、古いとみなすだけで、まちがった
+// 答えは出さない)。通ったところは名前ごと (Linux の dentry ごとの d_seq): ディレクトリに名前を足しても、ほかの名前の答えは
+// 古くならない。マウントやルート、vfs の版の表を空にしたとき、ディレクトリの属性 (chmod、chown) を変えたときは EPOCH (みな古い)。
+// 表の 1 つは AtomicU64 の並び (seqlock: 書く側は seq を CAS で奇数にしてから書いて偶数に (取れなければ、ほかの人が書いている
+// ので書かない: 覚えなので、なくてもよい)。読む側は前後で
 // seq を見て、ちがえばふつうの道へ)。Rc にも RefCell にもヒープにもさわらない。
 // どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していなくて、fd の表 (cwd) を自分だけで
 // 使っているもの (スレッドがいれば、ほかのスレッドが chdir するかもしれない)。ある答えは ext4 のファイルだけ (tmpfs や /proc
 // は、中身が変わっても印が変わらない)。「ない」はパスの覚えにあるもの (名前が変われば、どのファイルシステムでも vfs が
-// ディレクトリの版を進める)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
+// その名前の版を進める)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
 use crate::file::Stat;
 use crate::proc::Proc;
 use core::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 
-/// 表の数 (1 つ 512 バイト: 512 KiB。使うのは 1 つ 54 語)
-const N: usize = 1024;
-/// 版の箱の数
+/// 表の数 (1 つ 512 バイト: 2 MiB。64 語をみな使う)。WAYS こずつの組に分け、パスのハッシュで組を選び、組の中の
+/// どれにでも入れる (前は 1024 で、1 つの場所に 1 つだけ: 1000 のファイルを順に stat すると、同じ場所になったものが
+/// 追い出しあって、2 回目も 4 割しか当たらなかった。Linux の dcache は、ぶつかっても追い出さない)
+const N: usize = 4096;
+const WAYS: usize = 4;
+const SETS: usize = N / WAYS;
+/// inode の版の箱の数
 const BOXES: usize = 4096;
+/// (ディレクトリ, 名前) の版の箱の数 (番号は 16 ビット: DIR0 の語の上。512 KiB)
+const NAME_BOXES: usize = 65536;
 /// パスの長さの上限 (先頭の / なし、cwd をつけたあと)
 pub const PATH: usize = 192;
-/// 覚える、通ったディレクトリと gates の数の上限
-const DIRS_MAX: usize = 12;
+/// 覚える、通ったディレクトリと gates の数の上限。ディレクトリは 1 つの 64 語に入るだけ (12 のときは、/home/USER の下の
+/// 10 段のパス (fsbench の deep-stat) がいつも入らず、そのたびに表を引いて外れ、ふつうの道で覚えようとして断っていた)
+const DIRS_MAX: usize = 22;
 const GATES_MAX: usize = 4;
 
 // 1 つの並び (AtomicU64 の番号)
@@ -41,7 +52,7 @@ const EPOCH_W: usize = 2;
 /// inode の箱の番号と、その版
 const INO_BOX: usize = 3;
 const INO_GEN: usize = 4;
-/// ディレクトリ: 箱の番号 << 48 | 版 (48 ビット)
+/// 通ったところ ((ディレクトリ, 名前) ごと): 箱の番号 (name_box) << 48 | 版 (48 ビット)
 const DIR0: usize = 5;
 /// gates: uid << 32 | gid と、mode を 4 つ (16 ビットずつ)
 const GATE0: usize = DIR0 + DIRS_MAX;
@@ -56,7 +67,10 @@ struct Slot([AtomicU64; 64]);
 
 const Z: AtomicU64 = AtomicU64::new(0);
 static TABLE: [Slot; N] = [const { Slot([Z; 64]) }; N];
-static DIRS: [AtomicU64; BOXES] = [Z; BOXES];
+/// 組ごとの、次に追い出す番 (書く人 (大きなロックの中の learn と、ロックなしで作ったファイルの learn_new) がいっしょに
+/// 進めても、追い出すものが同じになるだけ)
+static NEXT: [core::sync::atomic::AtomicU8; SETS] = [const { core::sync::atomic::AtomicU8::new(0) }; SETS];
+static NAMES: [AtomicU64; NAME_BOXES] = [Z; NAME_BOXES];
 static INOS: [AtomicU64; BOXES] = [Z; BOXES];
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -64,15 +78,20 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 pub static HITS: AtomicU64 = AtomicU64::new(0);
 pub static MISSES: AtomicU64 = AtomicU64::new(0);
 
-const _: () = assert!(WORDS <= 64);
+const _: () = assert!(WORDS == 64);
 
 fn box_of(id: (usize, u64)) -> usize {
     ((id.1 ^ (id.0 as u64).rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize % BOXES
 }
 
-/// ディレクトリ dir の中の名前か、dir の属性が変わった (vfs::name_changed、dir_changed)
-pub fn dir_bump(dir: (usize, u64)) {
-    DIRS[box_of(dir)].fetch_add(1, Release);
+/// (dir, name) の箱 (name は vfs::name_hash)
+pub fn name_box(dir: (usize, u64), name: u64) -> usize {
+    ((dir.1 ^ (dir.0 as u64).rotate_left(40) ^ name.rotate_left(21)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize % NAME_BOXES
+}
+
+/// ディレクトリ dir の中の名前 name (vfs::name_hash) が変わった (vfs::name_changed)
+pub fn name_bump(dir: (usize, u64), name: u64) {
+    NAMES[name_box(dir, name)].fetch_add(1, Release);
 }
 
 /// inode id の中身 (大きさ、時刻、許可、リンクの数 ...) が変わった (extfs の write_inode)
@@ -85,9 +104,9 @@ pub fn ino_ver(id: (usize, u64)) -> u64 {
     INOS[box_of(id)].load(Acquire)
 }
 
-/// ディレクトリ dir の箱の版 (vfs::fast_stat_trail が、パスの覚えがいまも正しいかを確かめる前に読む)
-pub fn dir_ver(dir: (usize, u64)) -> u64 {
-    DIRS[box_of(dir)].load(Acquire)
+/// 箱 b (name_box) の版 (vfs::fast_stat_trail が、パスの覚えがいまも正しいかを確かめる前に読む)
+pub fn box_ver(b: usize) -> u64 {
+    NAMES[b % NAME_BOXES].load(Acquire)
 }
 
 /// 覚えをみな古くする (マウント、ルート、vfs の版の表を空にしたとき)
@@ -131,7 +150,29 @@ fn hash(p: &[u8], follow: bool) -> usize {
     // 終わりでよく混ぜる (FNV-1a のままビットを取ると、最後の 1 文字だけちがうパス: w0 w1 w2、file1 file2 ... がみな同じ
     // 場所になり、たがいに追い出しあっていた)
     let h = (h ^ (h >> 31)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    (h ^ (h >> 29)) as usize % N
+    (h ^ (h >> 29)) as usize % SETS
+}
+
+/// 組の中で key (と follow) のものが入っている場所 (seq で守らずに見るだけ: 答えるまえに check が確かめなおす)
+fn slot_of(set: usize, key: &[u8], follow: bool) -> Option<&'static [AtomicU64; 64]> {
+    (0..WAYS).map(|w| &TABLE[set * WAYS + w].0).find(|s| {
+        let shape = s[SHAPE].load(Relaxed);
+        s[SEQ].load(Relaxed) != 0 && (shape & 0xffff) as usize == key.len() && (shape >> 16 & 1 != 0) == follow && words(key).enumerate().all(|(i, w)| s[PATH0 + i].load(Relaxed) == w)
+    })
+}
+
+/// 書く場所: 同じ key のものがあればそこ、なければ空きか古い (全体の版がちがう) もの、なければ組の中で順に追い出す
+fn slot_for(set: usize, key: &[u8], follow: bool) -> &'static [AtomicU64; 64] {
+    if let Some(s) = slot_of(set, key, follow) {
+        return s;
+    }
+    let epoch = EPOCH.load(Relaxed);
+    if let Some(s) = (0..WAYS).map(|w| &TABLE[set * WAYS + w].0).find(|s| s[SEQ].load(Relaxed) == 0 || s[EPOCH_W].load(Relaxed) != epoch) {
+        return s;
+    }
+    let w = NEXT[set].load(Relaxed) as usize % WAYS;
+    NEXT[set].store(((w + 1) % WAYS) as u8, Relaxed);
+    &TABLE[set * WAYS + w].0
 }
 
 fn words(p: &[u8]) -> impl Iterator<Item = u64> + '_ {
@@ -183,6 +224,10 @@ fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, bool)>)
     let mut norm = [0u8; PATH];
     let Some(len) = normalize(cwd.as_bytes(), path.as_bytes(), &mut norm) else { return };
     let key = &norm[..len];
+    // 通ったディレクトリは名前の数より少なくならない (/ も入る)。入りきらないものは、パスの覚えを引く前にやめる
+    if key.iter().filter(|&&b| b == b'/').count() + 1 > DIRS_MAX {
+        return;
+    }
     // 通ったところと gates は、パスの覚え (vfs の PATHS) から。いま正しくて、同じ答え (同じ inode か、ない) のものだけ
     let Some((dirs, gates)) = crate::vfs::fast_stat_trail(core::str::from_utf8(key).ok().unwrap_or(""), follow, found.map(|f| f.0)) else { return };
     if dirs.len() > DIRS_MAX || gates.len() > GATES_MAX {
@@ -195,36 +240,118 @@ fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, bool)>)
         let ib = box_of(ino.id());
         (ib, INOS[ib].load(Acquire), Stat::of_inode(ino))
     });
-    let s = &TABLE[hash(key, follow)].0;
+    // ディレクトリの版は、パスの覚えを確かめる前に読んだもの (vfs::fast_stat_trail)
+    let mut dw = [0u64; DIRS_MAX];
+    for (i, (b, sv)) in dirs.iter().enumerate() {
+        dw[i] = (*b as u64) << 48 | (sv & 0xffff_ffff_ffff);
+    }
+    let mut gw = [0u64; GATES_MAX];
+    let mut modes = 0u64;
+    for (i, (mode, uid, gid)) in gates.iter().enumerate() {
+        gw[i] = (*uid as u64) << 32 | *gid as u64;
+        modes |= ((*mode & 0xffff) as u64) << (16 * i);
+    }
+    put(key, follow, &dw[..dirs.len()], &gw[..gates.len()], modes, epoch, mg, ino_ver.as_ref());
+}
+
+/// 表に書く: dirs は (箱 << 48 | 版)、gates は (uid << 32 | gid) で、その mode は modes に 16 ビットずつ。
+/// found は (inode の箱, その版, 答え)。None なら「ない」
+#[allow(clippy::too_many_arguments)]
+fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch: u64, mg: bool, found: Option<&(usize, u64, Stat)>) {
+    let s = slot_for(hash(key, follow), key, follow);
+    // 書く人は 1 人ずつ (ほかの人が書いていれば書かない)
     let seq = s[SEQ].load(Relaxed);
-    s[SEQ].store(seq | 1, Relaxed);
+    if seq & 1 != 0 || s[SEQ].compare_exchange(seq, seq | 1, Acquire, Relaxed).is_err() {
+        return;
+    }
     core::sync::atomic::fence(Release);
-    s[SHAPE].store(len as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40 | (found.is_none() as u64) << 41, Relaxed);
+    s[SHAPE].store(key.len() as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40 | (found.is_none() as u64) << 41, Relaxed);
     s[EPOCH_W].store(epoch, Relaxed);
-    if let Some((ib, v, _)) = &ino_ver {
+    if let Some((ib, v, _)) = found {
         s[INO_BOX].store(*ib as u64, Relaxed);
         s[INO_GEN].store(*v, Relaxed);
     }
-    // ディレクトリの版は、パスの覚えを確かめる前に読んだもの (vfs::fast_stat_trail)
-    for (i, (d, sv)) in dirs.iter().enumerate() {
-        s[DIR0 + i].store((box_of(*d) as u64) << 48 | (sv & 0xffff_ffff_ffff), Relaxed);
+    for (i, w) in dirs.iter().enumerate() {
+        s[DIR0 + i].store(*w, Relaxed);
     }
-    let mut modes = 0u64;
-    for (i, (mode, uid, gid)) in gates.iter().enumerate() {
-        s[GATE0 + i].store((*uid as u64) << 32 | *gid as u64, Relaxed);
-        modes |= ((*mode & 0xffff) as u64) << (16 * i);
+    for (i, w) in gates.iter().enumerate() {
+        s[GATE0 + i].store(*w, Relaxed);
     }
     s[GATE_MODES].store(modes, Relaxed);
     for (i, w) in words(key).enumerate() {
         s[PATH0 + i].store(w, Relaxed);
     }
-    if let Some((_, _, st)) = &ino_ver {
+    if let Some((_, _, st)) = found {
         let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
         for (i, w) in w.iter().enumerate() {
             s[STAT0 + i].store(*w, Relaxed);
         }
     }
     s[SEQ].store((seq | 1) + 1, Release);
+}
+
+/// 大きなロックなしの O_CREAT (fastdir.rs) が、表にある親のディレクトリ parent (畳んだパス) に作ったファイル name (ino) を
+/// 書く: 親の答えの印に、親で name を引いたこと ((dir, name) の箱と、作ったあとの版) を足したもの (Linux の d_instantiate:
+/// 作ったばかりのファイルの stat も、たどらずに答える。前はふつうの道で作ったものだけがパスの覚えに入り、ロックなしで
+/// 作ったものは、はじめの stat がふつうの道でたどりなおしていた)。before は作る前の (dir, name) の箱の版 (box_ver): いま
+/// ちょうど 1 つ進んでいれば (進めたのが自分の name_changed だけなら) 書く。ほかの人が同じ箱を進めていれば (そのファイルを
+/// 消したかもしれない) 書かない。id、st、ver は作ったファイルの inode と、その stat と inode の版 (ExtFs::fast_create が、
+/// まだだれも引けないあいだに取ったもの)
+pub fn learn_new(parent: &[u8], name: &str, dir: (usize, u64), before: u64, id: (usize, u64), st: Stat, ver: u64) {
+    let len = parent.len() + (!parent.is_empty()) as usize + name.len();
+    if len > PATH {
+        return;
+    }
+    let mut buf = [0u8; PATH];
+    let mut n = 0;
+    for part in [parent, if parent.is_empty() { b"" } else { b"/" }, name.as_bytes()] {
+        buf[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    let key = &buf[..len];
+    let epoch = EPOCH.load(Acquire);
+    let ino_ver = (box_of(id), ver, st);
+    let dbox = name_box(dir, crate::vfs::name_hash(name));
+    if NAMES[dbox].load(Acquire) != before.wrapping_add(1) {
+        return;
+    }
+    // 親の答え (check と同じに、seq のあいだに読む)。いまも正しいディレクトリのものだけ
+    let Some(s) = slot_of(hash(parent, true), parent, true) else { return };
+    let seq = s[SEQ].load(Acquire);
+    let shape = s[SHAPE].load(Relaxed);
+    let (ndirs, ngates) = ((shape >> 24 & 0xff) as usize, (shape >> 32 & 0xff) as usize);
+    if seq & 1 != 0 || shape >> 41 & 1 != 0 || ndirs + 1 > DIRS_MAX || ngates > GATES_MAX || s[EPOCH_W].load(Relaxed) != epoch {
+        return;
+    }
+    let mut dw = [0u64; DIRS_MAX];
+    for (i, w) in dw.iter_mut().enumerate().take(ndirs) {
+        *w = s[DIR0 + i].load(Relaxed);
+        if *w & 0xffff_ffff_ffff != NAMES[(*w >> 48) as usize].load(Acquire) & 0xffff_ffff_ffff {
+            return;
+        }
+    }
+    let mut gw = [0u64; GATES_MAX];
+    for (i, w) in gw.iter_mut().enumerate().take(ngates) {
+        *w = s[GATE0 + i].load(Relaxed);
+    }
+    let mut modes = s[GATE_MODES].load(Relaxed);
+    let (pmode, owner) = (s[STAT0 + 1].load(Relaxed) as u32, s[STAT0 + 2].load(Relaxed));
+    core::sync::atomic::fence(Acquire);
+    if s[SEQ].load(Relaxed) != seq || pmode & 0o170000 != 0o040000 {
+        return;
+    }
+    // 親もだれでもは通れなければ gates に (vfs の walk と同じ)。owner は uid | gid << 32、gates は uid << 32 | gid
+    let mut ngates = ngates;
+    if pmode & 0o111 != 0o111 {
+        if ngates == GATES_MAX {
+            return;
+        }
+        gw[ngates] = (owner & 0xffff_ffff) << 32 | owner >> 32;
+        modes |= ((pmode & 0xffff) as u64) << (16 * ngates);
+        ngates += 1;
+    }
+    dw[ndirs] = (dbox as u64) << 48 | (before.wrapping_add(1) & 0xffff_ffff_ffff);
+    put(key, true, &dw[..ndirs + 1], &gw[..ngates], modes, epoch, true, Some(&ino_ver));
 }
 
 /// ユーザーの path (NUL で終わる文字) を buf に写す (写っているページだけ。なければ None)
@@ -367,7 +494,7 @@ pub fn dir_lookup(p: &Proc, dirfd: i64, dpath: &[u8], norm: &mut [u8; PATH]) -> 
 /// key (畳んだパス) の答えが表にあって、いまも正しく、呼んだ人が途中を通れれば、その答え。ino なら inode の中身の版も見る
 fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
     let len = key.len();
-    let s = &TABLE[hash(key, follow)].0;
+    let s = slot_of(hash(key, follow), key, follow)?;
     let seq = s[SEQ].load(Acquire);
     if seq & 1 != 0 || seq == 0 {
         return None;
@@ -387,7 +514,7 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
     }
     for i in 0..ndirs {
         let w = s[DIR0 + i].load(Relaxed);
-        if w & 0xffff_ffff_ffff != DIRS[(w >> 48) as usize % BOXES].load(Acquire) & 0xffff_ffff_ffff {
+        if w & 0xffff_ffff_ffff != NAMES[(w >> 48) as usize].load(Acquire) & 0xffff_ffff_ffff {
             return None;
         }
     }

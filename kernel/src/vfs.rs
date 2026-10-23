@@ -857,7 +857,7 @@ fn gen_bump(dir: (usize, u64), name: u64) {
 }
 
 /// 名前の印 (FNV-1a)
-fn name_hash(name: &str) -> u64 {
+pub fn name_hash(name: &str) -> u64 {
     let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
     if h == ATTR { 0 } else { h }
 }
@@ -912,12 +912,13 @@ pub fn names_changed() {
 }
 
 /// ディレクトリ dir の属性 (chmod、chown) が変わった: dir を通ったパスの覚えはみな古い (次に引くときに捨てる)。
-/// ディレクトリのときだけ呼ぶ (ふつうのファイルの属性は、覚えが答える inode からいつも読む)
+/// ディレクトリのときだけ呼ぶ (ふつうのファイルの属性は、覚えが答える inode からいつも読む)。statc の表は名前ごとの版
+/// しか持たないので、みな古くする (ディレクトリの chmod や chown はまれ)
 pub fn dir_changed(dir: (usize, u64)) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     DIR_GENS[gen_slot(dir)].fetch_add(1, core::sync::atomic::Ordering::Release);
     gen_bump(dir, ATTR);
-    crate::statc::dir_bump(dir);
+    crate::statc::epoch_bump();
 }
 
 /// ディレクトリ dir の中の名前 name が変わった (作る・消す・名前を変える・リンク): dir で name を引いたパスの覚え
@@ -925,8 +926,9 @@ pub fn dir_changed(dir: (usize, u64)) {
 pub fn name_changed(dir: (usize, u64), name: &str) {
     PATHS_INVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     DIR_GENS[gen_slot(dir)].fetch_add(1, core::sync::atomic::Ordering::Release);
-    gen_bump(dir, name_hash(name));
-    crate::statc::dir_bump(dir);
+    let h = name_hash(name);
+    gen_bump(dir, h);
+    crate::statc::name_bump(dir, h);
 }
 
 /// 消したもの、名前を変えたものの覚えをすぐ捨てる (パス full: リンクをたどったあとの、先頭 / なし)。古い覚えは
@@ -1018,11 +1020,11 @@ pub fn dir_gen(dir: (usize, u64)) -> u64 {
 }
 
 /// 大きなロックなしの stat (statc.rs) が覚えるもの: パスの覚えに norm (先頭 / なし、畳んだもの) があって、いまも正しく、
-/// 答えが ino (None なら「ない」) なら、通ったディレクトリ (と、その statc の版) と、だれでもは通れないディレクトリの
+/// 答えが ino (None なら「ない」) なら、通ったところ ((ディレクトリ, 名前) の statc の箱と、その版) と、だれでもは通れないディレクトリの
 /// (mode, uid, gid)。statc の版は、覚えがいまも正しいかを確かめる前に読む: 大きなロックなしの作る・消す (fastdir.rs) は、
 /// 書きかえてから vfs の版を進め、それから statc の版を進めるので、確かめたあとに変わったものは、読んだ版が古い
 #[allow(clippy::type_complexity)]
-pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<((usize, u64), u64)>, Vec<(u32, u32, u32)>)> {
+pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
     if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -1036,7 +1038,7 @@ pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Opti
     if !same {
         return None;
     }
-    let dirs = e.dirs.iter().map(|p| (p.dir, crate::statc::dir_ver(p.dir))).collect();
+    let dirs = e.dirs.iter().map(|p| crate::statc::name_box(p.dir, p.name)).map(|b| (b, crate::statc::box_ver(b))).collect();
     if !e.fresh() {
         return None;
     }

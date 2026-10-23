@@ -114,16 +114,20 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
         return None;
     };
     let mode = mode as u32 & 0o7777 & !t.umask;
+    // 作る前の (親, 名前) の箱の版 (作ったあとに statc::learn_new で、新しい名前を表に書くかどうか)
+    let before = crate::statc::box_ver(crate::statc::name_box((fs.fs_id(), dir), crate::vfs::name_hash(name)));
     let ino = {
         let _e = crate::extfs::fs_lock_shared();
         if !watch_free() { None } else { fs.fast_create(dir as u32, name, mode, &me.cred) }
     };
-    let Some(ino) = ino else {
+    let Some((ino, st, ver)) = ino else {
         note(4);
         return None;
     };
     // 書きかえたあとに (ext4 のロックの外でよい: 版を進めるのは、書きかえたあとならいつでも)
     crate::vfs::name_changed((fs.fs_id(), dir), name);
+    // 作ったばかりのファイルの stat も、ロックなしで答えられるように (Linux の d_instantiate)
+    crate::statc::learn_new(&norm[..klen], name, (fs.fs_id(), dir), before, ino.id(), st, ver);
     // 開いたファイル (ふつうの道の open_found と同じ: パスは先頭 / なしの畳んだもの)
     let key = core::str::from_utf8(&norm[..klen]).unwrap_or("");
     let full = if key.is_empty() { alloc::string::String::from(name) } else { alloc::format!("{}/{}", key, name) };

@@ -151,6 +151,20 @@ int main(int argc, char **argv) {
     if (rename(from, p("g%ld", i)) < 0) bad("rename", from);
   }
   report("rename", n, now_ms() - t);
+  // あるファイルの上へ名前を変える (書いた写しで置きかえる: Firefox などがファイルを保存するときのやりかた)。
+  // 写し (t*) を作るのは測らない
+  for (i = 0; i < n; i++) {
+    int fd = open(p("t%ld", i), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) bad("create", p("t%ld", i));
+    else close(fd);
+  }
+  t = now_ms();
+  for (i = 0; i < n; i++) {
+    char from[8192];
+    snprintf(from, sizeof from, "%s", p("t%ld", i));
+    if (rename(from, p("g%ld", i)) < 0) bad("rename-over", from);
+  }
+  report("rename-over", n, now_ms() - t);
   t = now_ms();
   for (i = 0; i < n; i++)
     if (unlink(p("g%ld", i)) < 0) bad("unlink", p("g%ld", i));

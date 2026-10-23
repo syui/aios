@@ -46,6 +46,7 @@ const FS_OPS: &[(&str, &str)] = &[
     ("deep-stat", "10 段の深いパスの先を stat"),
     ("stat-at", "開いているディレクトリから名前で stat (fstatat の dirfd。find や rm -r、ls -l)"),
     ("rename", "名前を変える"),
+    ("rename-over", "あるファイルの上へ名前を変える (書いた写しで置きかえる。Firefox などの保存のしかた)"),
     ("unlink", "消す"),
     ("mkdir-rmdir", "ディレクトリを作って消す"),
     ("write-seq", "16 MiB を 64 KiB ずつ書いて fsync"),

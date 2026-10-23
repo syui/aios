@@ -729,8 +729,9 @@ pub struct ExtFs {
     linkable: Shared<BTreeSet<u32>>,
     /// スワップに使っているファイル (書きかえさせない)
     swapfiles: Shared<BTreeSet<u32>>,
-    /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。ディレクトリのブロックを書きかえたら
-    /// (modify_dir_block) そのディレクトリの分を、ディレクトリの inode を空けたらその分を消す
+    /// 名前のキャッシュ: (ディレクトリ, 名前) → inode (あったものだけ)。消した名前と指す inode が変わった名前はそれだけ
+    /// 消し (name_gone)、ディレクトリの inode を空けたらその分を消す。足した名前は入れない (作ったばかりのものを引くのは
+    /// パスの覚えと statc の表: 作るたびに入れると、create が 1 割から 5 割重くなった)
     names: Shared<Names>,
     /// 書く操作 (write_op、消したファイルの片づけ) のたびに増える。ディスクを眠って待った読み (with_block) は、
     /// 起きたときにこれが変わっていたら、読んだものを捨てて vfs::ERETRY (読みを頭からやりなおす)。
@@ -741,12 +742,13 @@ pub struct ExtFs {
     /// 眠って書く書き出し (flush_sleeping) のとちゅう (1)。そのあいだ、ほかの書き出しは、眠れないところならしない
     /// (あとの書き出しにまかせる)、眠れるところ (fsync など) なら終わるのを待ってから
     flushing: ACell,
-    /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない)
+    /// 名前を消すたびに増える (探しているあいだにディスクを待って眠り、そのあいだに消されたら覚えない。増やすのと
+    /// くらべるのは names を借りているあいだに)
     names_gen: ACell,
     /// meta() の答え (inode → Meta)。stat や open の 1 回で、たどるディレクトリとファイルの meta が何度も
-    /// 引かれ、そのたびに inode を読んで解くのは高い (TCG で 1 回 7 us)。inode を書く (write_inode) ときに捨てる
+    /// 引かれ、そのたびに inode を読んで解くのは高い (TCG で 1 回 7 us)。inode を書く (write_inode) ときに書いたものに入れかえる
     metas: Shared<BTreeMap<u32, Meta>>,
-    /// metas のどれかを捨てるたび (write_inode) に進む。ExtInode が自分の meta を覚えているのは、これが同じあいだ
+    /// metas のどれかを入れかえるたび (write_inode) に進む。ExtInode が自分の meta を覚えているのは、これが同じあいだ
     meta_ver: ACell,
     /// いっしょに持っているあいだに引いて、キャッシュにあった数 (Cache の hits に足して出す)
     shared_hits: AtomicU64,
@@ -757,6 +759,31 @@ const METAS_MAX: usize = 8192;
 
 /// 名前のキャッシュの大きさ (こえたら全部捨てて作りなおす)
 const NAMES_MAX: usize = 65536; // 1 つ 100 バイトくらいで 6 MiB ほど
+
+/// ディスク上の inode r (番号 ino) を meta() の答えに
+fn meta_of(ino: u32, r: &Raw, bsize: usize) -> Meta {
+    let b = &r.0;
+    let uid = u16_at(b, 2) as u32 | (u16_at(b, 120) as u32) << 16;
+    let gid = u16_at(b, 24) as u32 | (u16_at(b, 122) as u32) << 16;
+    let rdev = if matches!(r.mode() & S_IFMT, S_IFCHR | S_IFBLK) {
+        let old = r.block(0);
+        if old != 0 { old as u64 } else { let new = r.block(1); (((new >> 8) & 0xfff) << 8 | (new & 0xff)) as u64 }
+    } else {
+        0
+    };
+    Meta {
+        ino: ino as u64,
+        mode: r.mode(),
+        nlink: r.links() as u32,
+        uid,
+        gid,
+        size: r.size(),
+        rdev,
+        blocks: r.blocks512(bsize),
+        mtime: u32_at(b, 16) as u64 * 1_000_000_000,
+        ctime: u32_at(b, 12) as u64 * 1_000_000_000,
+    }
+}
 
 /// 名前のキャッシュ: ディレクトリごとに 名前 → inode (引くときに文字列を作らずにすむように)
 struct Names {
@@ -783,6 +810,14 @@ impl Names {
     fn forget(&mut self, dir: u32) {
         if let Some(m) = self.dirs.remove(&dir) {
             self.len -= m.len();
+        }
+    }
+
+    fn remove(&mut self, dir: u32, name: &str) {
+        if let Some(m) = self.dirs.get_mut(&dir)
+            && m.remove(name).is_some()
+        {
+            self.len -= 1;
         }
     }
 }
@@ -2269,9 +2304,16 @@ impl ExtFs {
     }
 
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
-        // meta() の覚えを捨てる (書いたあとに読まれたら、新しいものを覚えなおす)。ExtInode の覚えも、大きなロックなしの
-        // stat の覚え (statc.rs) も
-        self.metas.borrow_mut().remove(&ino);
+        // meta() の覚えを、書いたものに入れかえる (Linux のメモリの inode と同じく、書いたあとに読みなおして解かない: 作った
+        // ばかりのファイルの stat や fstat が、inode のブロックを引いて解いていた)。ExtInode の覚えと、大きなロックなしの
+        // stat の覚え (statc.rs) は古くする
+        {
+            let mut c = self.metas.borrow_mut();
+            if c.len() >= METAS_MAX {
+                c.clear();
+            }
+            c.insert(ino, meta_of(ino, r, self.bsize));
+        }
         self.meta_ver.inc();
         crate::statc::ino_bump((self.fs, ino as u64));
         let mut r = r.clone();
@@ -3119,8 +3161,19 @@ impl ExtFs {
 
     /// dir の名前のキャッシュを捨てる
     fn forget_names(&self, dir: u32) {
+        let mut n = self.names.borrow_mut();
         self.names_gen.inc();
-        self.names.borrow_mut().forget(dir);
+        n.forget(dir);
+    }
+
+    /// dir の name を消したか、ほかの inode を指すようにした (ブロックを書きかえたあとに。しくじっても): その名前だけ
+    /// 捨てる (前はディレクトリのブロックを書きかえるたびに、そのディレクトリの分をみな捨てていた: 作ったり消したりする
+    /// たびに、ほかの名前の引きが索引か全部のブロックをなめなおした。Linux の dcache も名前ごと)。探している途中のもの
+    /// (find) が古い答えを入れないように、版を進めるのは借りているあいだに
+    fn name_gone(&self, dir: u32, name: &str) {
+        let mut n = self.names.borrow_mut();
+        self.names_gen.inc();
+        n.remove(dir, name);
     }
 
     fn find(&self, dir: u32, name: &str) -> Result<u32, i64> {
@@ -3129,8 +3182,9 @@ impl ExtFs {
         }
         let generation = self.names_gen.get();
         let ino = self.find_uncached(dir, name)?;
+        let mut n = self.names.borrow_mut();
         if self.names_gen.get() == generation {
-            self.names.borrow_mut().insert(dir, String::from(name), ino);
+            n.insert(dir, String::from(name), ino);
         }
         Ok(ino)
     }
@@ -3176,7 +3230,6 @@ impl ExtFs {
 
     /// ディレクトリのブロックを書きかえる。チェックサムは写すときに (settle_csum)
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
-        self.forget_names(dir);
         self.modify_block(b, f)?;
         if self.csum {
             self.cache.borrow_mut().dir_csum.insert(b, (dir, generation));
@@ -3299,23 +3352,29 @@ impl ExtFs {
         let r = self.dir_writable(dir)?;
         let generation = r.gen_no();
         let (b, o) = self.dir_entries(dir)?.into_iter().find(|e| e.2 != 0 && e.4 == name).map(|e| (e.0, e.1)).ok_or(-ENOENT)?;
-        self.modify_dir_block(dir, generation, b, |d| {
+        let done = self.modify_dir_block(dir, generation, b, |d| {
             put32(d, o, ino);
             d[o + 7] = ftype(mode);
-        })?;
+        });
+        self.name_gone(dir, name);
+        done?;
         self.dir_changed(dir)
     }
 
     fn remove_entry(&self, dir: u32, name: &str) -> Result<(), i64> {
         let r = self.dir_writable(dir)?;
         if r.flags() & INDEX_FL != 0 {
-            match self.dx_remove(dir, r.gen_no(), name) {
+            let res = self.dx_remove(dir, r.gen_no(), name);
+            match res {
                 Err(e) if e == -11 => {}
-                res => return res.and_then(|_| self.dir_changed(dir)),
+                res => {
+                    self.name_gone(dir, name);
+                    return res.and_then(|_| self.dir_changed(dir));
+                }
             }
         }
         let (_, at) = self.entry_at(dir, &r, name)?.ok_or(-ENOENT)?;
-        self.remove_at(dir, r, at)
+        self.remove_at(dir, r, at, name)
     }
 
     /// 索引のないディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node) は、これで引いて
@@ -3327,13 +3386,15 @@ impl ExtFs {
         })
     }
 
-    /// entry_at で見つけた項目を消す (前のものがあれば吸収させる)
-    fn remove_at(&self, dir: u32, mut r: Raw, (b, o, rl, prev): Entry) -> Result<(), i64> {
-        self.modify_dir_block(dir, r.gen_no(), b, |d| match prev {
+    /// entry_at で見つけた項目 (name) を消す (前のものがあれば吸収させる)
+    fn remove_at(&self, dir: u32, mut r: Raw, (b, o, rl, prev): Entry, name: &str) -> Result<(), i64> {
+        let done = self.modify_dir_block(dir, r.gen_no(), b, |d| match prev {
             // 前のものに吸収させる
             Some((p, prl)) => put16(d, p + 4, (prl + rl) as u16),
             None => put32(d, o, 0),
-        })?;
+        });
+        self.name_gone(dir, name);
+        done?;
         r.touch();
         self.write_inode(dir, &r)
     }
@@ -3349,7 +3410,9 @@ impl ExtFs {
         let r = self.read_inode(dir)?;
         let ents = self.dir_entries(dir)?;
         let e = ents.iter().find(|e| e.4 == "..").ok_or(-EIO)?;
-        self.modify_dir_block(dir, r.gen_no(), e.0, |d| put32(d, e.1, parent))
+        let done = self.modify_dir_block(dir, r.gen_no(), e.0, |d| put32(d, e.1, parent));
+        self.name_gone(dir, "..");
+        done
     }
 
     fn add_links(&self, ino: u32, delta: i32) -> Result<Raw, i64> {
@@ -3424,8 +3487,10 @@ impl ExtFs {
     /// 大きなロックなしの O_CREAT の openat (fastdir.rs。ext4 のロックを持って): ディレクトリ dir に name を、mode (umask の
     /// あと) のふつうのファイルとして作る。ふつうの道 (create_node) と同じ書きかたで、同じ答えになるときだけ。書きかえる前に
     /// みな確かめ (読むブロックがみなキャッシュにある、名前がまだない、すき間がある、inode が取れる、書き出すころでない、
-    /// 呼んだ人が書けて通れる)、どれかがだめなら何も変えずに None (ふつうの道へ。しくじりのわけもそちらで)
-    pub fn fast_create(self: &Rc<Self>, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
+    /// 呼んだ人が書けて通れる)、どれかがだめなら何も変えずに None (ふつうの道へ。しくじりのわけもそちらで)。
+    /// 答えは (inode, その stat, statc の inode の版)。stat と版は、inode を書いてから名前を足す前に (まだだれも引けず、
+    /// 書けないあいだに) 取る: statc::learn_new が、ext4 のロックをひとりで取って meta を引かずにすむように
+    pub fn fast_create(self: &Rc<Self>, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(InodeRef, crate::file::Stat, u64)> {
         if self.ro || name.len() > 255 || name.is_empty() || name == "." || name == ".." || self.flush_due() {
             return None;
         }
@@ -3458,15 +3523,22 @@ impl ExtFs {
                 if self.extents {
                     ExtFs::ext_init_root(&mut r);
                 }
-                let done = self.write_inode(ino, &r).and_then(|_| self.add_entry_in(dir, pr, name, ino, mode, Some(Some(slot))));
-                if done.is_err() {
-                    println!("extfs: fast create of {} in {} broke off after taking inode {}", name, dir, ino);
-                    return None;
+                let done = self.write_inode(ino, &r).map(|_| (meta_of(ino, &r, self.bsize), crate::statc::ino_ver((self.fs, ino as u64)))).and_then(|seen| {
+                    self.add_entry_in(dir, pr, name, ino, mode, Some(Some(slot)))?;
+                    Ok(seen)
+                });
+                match done {
+                    Ok((m, v)) => Some((ino, m, v)),
+                    Err(_) => {
+                        println!("extfs: fast create of {} in {} broke off after taking inode {}", name, dir, ino);
+                        None
+                    }
                 }
-                Some(ino)
             })
         })?;
-        Some(ExtInode::make(self, ino))
+        let (ino, m, v) = ino;
+        let st = crate::file::Stat { ino: m.ino, mode: m.mode, nlink: m.nlink, uid: m.uid, gid: m.gid, rdev: m.rdev, size: m.size, blocks: m.blocks, mtime: m.mtime, ctime: m.ctime };
+        Some((ExtInode::make(self, ino), st, v))
     }
 
     /// 大きなロックなしの unlinkat (fastdir.rs。ext4 のロックを持って): ディレクトリ dir のふつうのファイル name を消す。
@@ -3511,7 +3583,7 @@ impl ExtFs {
             }
             // ここから書きかえる (ふつうの道の unlink_node と同じ)
             self.fast_write(|| {
-                if self.remove_at(dir, dr, at).is_err() {
+                if self.remove_at(dir, dr, at, name).is_err() {
                     println!("extfs: fast unlink of {} in {} broke off", name, dir);
                     return FastUnlink::No;
                 }
@@ -3912,7 +3984,7 @@ impl ExtInode {
             _ => {}
         }
         match at {
-            Some(e) => fs.remove_at(self.ino, dr, e)?,
+            Some(e) => fs.remove_at(self.ino, dr, e, name)?,
             None => fs.remove_entry(self.ino, name)?,
         }
         if is_dir {
@@ -4030,27 +4102,7 @@ impl Inode for ExtInode {
         let Ok(r) = self.raw() else {
             return Meta { ino: self.ino as u64, mode: 0, nlink: 0, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
         };
-        let b = &r.0;
-        let uid = u16_at(b, 2) as u32 | (u16_at(b, 120) as u32) << 16;
-        let gid = u16_at(b, 24) as u32 | (u16_at(b, 122) as u32) << 16;
-        let rdev = if matches!(r.mode() & S_IFMT, S_IFCHR | S_IFBLK) {
-            let old = r.block(0);
-            if old != 0 { old as u64 } else { let new = r.block(1); (((new >> 8) & 0xfff) << 8 | (new & 0xff)) as u64 }
-        } else {
-            0
-        };
-        let m = Meta {
-            ino: self.ino as u64,
-            mode: r.mode(),
-            nlink: r.links() as u32,
-            uid,
-            gid,
-            size: r.size(),
-            rdev,
-            blocks: r.blocks512(self.fs.bsize),
-            mtime: u32_at(b, 16) as u64 * 1_000_000_000,
-            ctime: u32_at(b, 12) as u64 * 1_000_000_000,
-        };
+        let m = meta_of(self.ino, &r, self.fs.bsize);
         let mut c = self.fs.metas.borrow_mut();
         if c.len() >= METAS_MAX {
             c.clear();
@@ -4426,9 +4478,9 @@ impl Inode for ExtInode {
         let generation = self.fs.names_gen.get();
         let ents = self.fs.dir_entries(self.ino)?;
         // 一覧を読んだら、あとで名前で引かれる (find、ls -l): 名前のキャッシュにも入れておく
-        if self.fs.names_gen.get() == generation {
+        {
             let mut n = self.fs.names.borrow_mut();
-            if ents.len() <= NAMES_MAX / 2 {
+            if self.fs.names_gen.get() == generation && ents.len() <= NAMES_MAX / 2 {
                 if n.len + ents.len() > NAMES_MAX {
                     n.dirs.clear();
                     n.len = 0;
