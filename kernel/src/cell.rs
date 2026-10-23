@@ -1,5 +1,10 @@
 // static mut のかわりに、だれが守っているかを型に書く入れもの。
-//   Bkl<T>  大きなロック (BKL) が守るもの。中を出すのは BKL を持っている CPU だけ
+//   Bkl<T>    大きなロック (BKL) が守るもの。中を出すのは BKL を持っている CPU だけ
+//   Once<T>   1 度だけ入れて、あとはどの CPU もロックなしで読むもの
+//   Early<T>  起動のとき (ほかの CPU を起こす前) にだけ書き、あとはロックなしで読むもの
+//   PerCpu<T> CPU ごとに 1 つずつ。自分の CPU の分だけを、割り込みを止めて触る
+//   Raw<T>    番地をほかのもの (アロケータ、アセンブリ) に渡すだけのメモリ。Rust からは中を見ない
+// ほかに、自分のロックを持つものは SpinLock<T>、数えるだけのものは atomic にする。
 //
 // static mut には Rust のコンパイラが何も言わない。BKL を外した道 (syscall::fast、vm の速いフォールト、
 // 割り込み) がうっかり触っても気づけず、2 つの CPU が同時に BTreeMap を書けば、そこでもう壊れている。
@@ -30,9 +35,107 @@ impl<T> Bkl<T> {
     #[allow(clippy::mut_from_ref)]
     pub fn get(&self) -> &mut T {
         if !crate::smp::holding() && crate::smp::online() > 1 {
-            unlocked(Location::caller());
+            unlocked(Location::caller(), "touched without the big lock");
         }
         unsafe { &mut *self.0.get() }
+    }
+}
+
+/// 起動のとき (ほかの CPU を起こす前) にだけ書き、あとは読むだけのもの: DTB の写し、機器の番地、RAM の大きさなど。
+/// 読むのにロックはいらない (もう変わらないので)。ほかの CPU が動きだしてから書けば、Bkl と同じく呼んだ場所を知らせる
+pub struct Early<T>(UnsafeCell<T>);
+
+// 書くのは CPU が 1 つのあいだだけ (get_mut が見る)。そのあとは &T を読むだけ
+unsafe impl<T> Sync for Early<T> {}
+
+impl<T> Early<T> {
+    pub const fn new(v: T) -> Self {
+        Early(UnsafeCell::new(v))
+    }
+
+    #[inline]
+    pub fn get(&self) -> &T {
+        unsafe { &*self.0.get() }
+    }
+
+    /// 書くとき (起動のときだけ)。ほかの CPU が動いていれば、呼んだ場所を知らせる
+    #[track_caller]
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut(&self) -> &mut T {
+        if crate::smp::online() > 1 {
+            unlocked(Location::caller(), "written after boot");
+        }
+        unsafe { &mut *self.0.get() }
+    }
+
+    #[track_caller]
+    pub fn set(&self, v: T) {
+        *self.get_mut() = v;
+    }
+}
+
+impl<T: Copy> Early<T> {
+    #[inline]
+    pub fn val(&self) -> T {
+        *self.get()
+    }
+}
+
+/// CPU ごとに 1 つずつ持つもの (ヒープの置き場、まとめて作った乱数、いま走らせているスレッド)。触るのは自分の CPU の分
+/// だけで、割り込みを止めたまま (カーネルはいつもそう: とちゅうでほかの CPU へ移らず、割り込みからも同時には触られない)。
+/// 眠る (スケジューラへ戻る) のをまたいで持たないこと (起きたら別の CPU かも)。
+/// 割り込みが止まっているかは、ここでは見ない: DAIF を読むのは QEMU (TCG) では重く (システムコール 1 回で 2 割)、カーネルが
+/// 割り込みを開けるのはスケジューラが眠るところ (trap::intr_on) と、開いていたものを戻す SpinLock だけ。それを
+/// test/kernel-json.py が見る (ほかで開けると落ちる)。debug のビルドでは、ここでも見る
+pub struct PerCpu<T>(UnsafeCell<[T; crate::smp::MAXCPU]>);
+
+// 中身はその CPU だけが、割り込みを止めて出す (割り込みを開けるところは kernel-json が見る)
+unsafe impl<T> Sync for PerCpu<T> {}
+
+impl<T> PerCpu<T> {
+    pub const fn new(v: [T; crate::smp::MAXCPU]) -> Self {
+        PerCpu(UnsafeCell::new(v))
+    }
+
+    /// この CPU の分
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get(&self) -> &mut T {
+        unsafe { &mut *self.ptr() }
+    }
+
+    /// この CPU の分の番地 (切りかえのアセンブリに渡すもの)
+    #[inline]
+    pub fn ptr(&self) -> *mut T {
+        #[cfg(debug_assertions)]
+        {
+            let daif: u64;
+            unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags)) };
+            debug_assert!(daif & (1 << 7) != 0, "per-CPU data with IRQs open");
+        }
+        let cpu = crate::smp::id();
+        assert!(cpu < crate::smp::MAXCPU);
+        unsafe { (self.0.get() as *mut T).add(cpu) }
+    }
+}
+
+/// 番地をほかのもの (アロケータ、アセンブリ、ページ表をたどる機械) に渡すだけのメモリ: ヒープの区画、カーネルの
+/// スタック、プロセスの表。Rust の参照は作らないので (ptr で番地だけ)、中を守るのは渡した先のきまり
+#[repr(transparent)]
+pub struct Raw<T>(UnsafeCell<T>);
+
+// 中身を読み書きするのは番地を渡した先 (そのきまりはそれぞれの場所に書く)
+unsafe impl<T> Sync for Raw<T> {}
+
+impl<T> Raw<T> {
+    pub const fn new(v: T) -> Self {
+        Raw(UnsafeCell::new(v))
+    }
+
+    #[inline]
+    pub const fn ptr(&self) -> *mut T {
+        self.0.get()
     }
 }
 
@@ -77,7 +180,7 @@ static MORE: AtomicUsize = AtomicUsize::new(0);
 
 #[cold]
 #[inline(never)]
-fn unlocked(at: &'static Location<'static>) {
+fn unlocked(at: &'static Location<'static>, what: &str) {
     let p = at as *const Location<'static> as *mut Location<'static>;
     for (s, n) in SITE.iter().zip(&HITS) {
         let cur = s.load(Ordering::Acquire);
@@ -89,7 +192,7 @@ fn unlocked(at: &'static Location<'static>) {
             match s.compare_exchange(core::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
                     n.fetch_add(1, Ordering::Relaxed);
-                    println!("bkl: {}:{} touched without the big lock (cpu{})", at.file(), at.line(), crate::smp::id());
+                    println!("bkl: {}:{} {} (cpu{})", at.file(), at.line(), what, crate::smp::id());
                     return;
                 }
                 // ほかの CPU が同じところに入れた: それが同じ場所なら数える

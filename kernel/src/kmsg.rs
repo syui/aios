@@ -1,6 +1,7 @@
 // カーネルのメッセージを覚えておく (Linux の dmesg と同じ)。println! はシリアルの画面にしか出ないので、
 // ssh や aiwm の端末、Claude からも読めるように、出したものをここにもためる。/proc/kmsg で読む。
 // 行の頭に起動してからの時間 ([    12.345678]) をつける (シリアルの画面にはつけない)
+use crate::spinlock::SpinLock;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -11,27 +12,25 @@ struct Ring {
     buf: [u8; SIZE],
     /// いままでに書いたバイトの数 (buf の位置は head % SIZE)
     head: usize,
-    /// 次に書くのが行の頭か
-    bol: bool,
+    /// 行の途中か (次に書くのが行の頭でない。はじめは頭: みな 0 なので、256 KiB が .data でなく .bss に入る)
+    mid: bool,
 }
 
-static mut RING: Ring = Ring { buf: [0; SIZE], head: 0, bol: true };
-
-fn ring() -> &'static mut Ring {
-    unsafe { &mut *(&raw mut RING) }
-}
+/// 書く (println! の uart::Uart、strace) のも読む (/proc/kmsg) のもこのロックを取って
+static RING: SpinLock<Ring> = SpinLock::new(Ring { buf: [0; SIZE], head: 0, mid: false });
 
 fn put(r: &mut Ring, b: u8) {
     r.buf[r.head % SIZE] = b;
     r.head += 1;
 }
 
-/// 出したものを足す (uart::Uart から。uart::LOCK を持って呼ぶ)
+/// 出したものを足す (uart::Uart と strace から)
 pub fn push(s: &str) {
-    let r = ring();
+    let mut g = RING.lock();
+    let r = &mut *g;
     for b in s.bytes() {
-        if r.bol {
-            r.bol = false;
+        if !r.mid {
+            r.mid = true;
             let ns = crate::timer::uptime_ns();
             let mut t = [0u8; 32];
             let n = fmt_time(&mut t, ns);
@@ -41,7 +40,7 @@ pub fn push(s: &str) {
         }
         put(r, b);
         if b == b'\n' {
-            r.bol = true;
+            r.mid = false;
         }
     }
 }
@@ -86,8 +85,7 @@ fn fmt_time(out: &mut [u8; 32], ns: u64) -> usize {
 
 /// ためてあるもの (古いものが消えて途中から始まるなら、最初の行の残りは捨てる)
 pub fn text() -> String {
-    let _g = crate::uart::LOCK.lock();
-    let r = ring();
+    let r = RING.lock();
     let bytes: Vec<u8> = if r.head <= SIZE {
         r.buf[..r.head].to_vec()
     } else {

@@ -162,13 +162,19 @@ type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプ�
 |---|---|---|
 | `Bkl<T>` | 大きなロック | 呼んだ CPU が BKL を持っているかを見る。持っていなければ、呼んだ場所 (ファイル:行) を 1 度 kmsg に出し、`/proc/bkl` に `unlocked FILE:LINE 回数` で数える (機械は止めない) |
 | `Once<T>` | 1 度だけ入れる | 入ったあとは、どの CPU もロックなしで読む (ルートの ext4 など) |
+| `Early<T>` | 起動のとき (ほかの CPU を起こす前) だけ書く | 読むのはロックなし (DTB の写し、UART・割り込みの番地、RAM の上限、ディスクの区画、vDSO のページ)。ほかの CPU が動いてから書けば、呼んだ場所を知らせる |
+| `PerCpu<T>` | CPU ごとに 1 つ | 自分の CPU の分だけを、割り込みを止めて (ヒープの置き場、まとめて作った乱数、いまのスレッド、スケジューラの文脈)。割り込みが止まっているかは触るたびには見ない (QEMU では DAIF を読むのが重く、システムコールが 2 割遅くなった)。かわりに `test/kernel-json.py` が、割り込みを開けるのはスケジューラが眠るところと SpinLock の戻しだけであることを見る |
+| `Raw<T>` | 番地を渡した先のきまり | Rust からは参照を作らず、番地だけ (ヒープの区画、カーネルのスタック、プロセスの表) |
+| `SpinLock<T>` | 自分のロック | kmsg の輪、パスの覚えの版の表、ヒープの「どこで取ったか」の表 |
 
 `test/vm-check.sh` の `bkl-unlocked` と CI の VM test (C のテストとロボットのあと) は `/proc/bkl` に unlocked があれば落ちる。
 `echo "bkl selftest" > /proc/ai/ctl` は BKL をいったん放して `Bkl` を触り、見はりが気づくかを確かめる (`bkl: selftest ok`)。
 AF_UNIX と AF_INET の表、ファイルのロック、inotify、timerfd、tty、入力、futex、vfs (マウント、パスの覚え)、ファイルの
-共有ページ、swap など 50 を `Bkl` にして、vm-check、C のテスト、ロボットの 800 case、smpbench (4 つの CPU) で 1 度も
-unlocked は出なかった。のこりの `static mut` (起動のときだけ書くもの、CPU ごとのもの、自分のロックで守るもの) は、
-`test/kernel-json.py` が数を見て (`STATIC_MUT_MAX`)、増えれば落ち、減れば数を下げさせる。
+共有ページ、swap、ドライバ (gpu、net、sound、sd、virtio-blk)、ホスト名など 59 を `Bkl` にし、のこりも上の入れものか
+atomic (ディスクの読み書きの数、tmpfs のページの数、CPU 間の割り込みの宛先) にした。vm-check、C のテスト、ロボットの
+800 case、smpbench (4 つの CPU) で 1 度も unlocked は出なかった。`static mut` は 145 から 1 つ (boot.rs のアセンブリが
+持つページ表 `boot_l1_hi`。extern の中なので型を変えられない) になり、`test/kernel-json.py` が数を見て
+(`STATIC_MUT_MAX`)、増えれば落ちる。kmsg の輪は、はじめの値をみな 0 にして .data から .bss へ (カーネルの写しが 256 KiB 小さく)。
 Linux は、どのデータをどのロックが守るかをコメントに書き、lockdep は実行時にロックの順を見るだけ。aios は型に書くので、
 守り手のない道は、動かせば分かる。
 

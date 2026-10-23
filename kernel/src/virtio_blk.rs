@@ -5,6 +5,7 @@
 //     ほかのシステムコールが止まっていた)
 // 眠っている人の要求が終わる前に、回る人 (眠れないところ) が来たら、その人が終わりを見とどけて起こす。
 // 割り込みが来なくても止まらないように、タイマ (cpu0) でも終わりを見る
+use crate::cell::Bkl;
 use crate::memlayout::v2p;
 use crate::virtio::{self, Mmio, Queue, DESC_NEXT, DESC_WRITE};
 
@@ -33,10 +34,10 @@ struct Disk {
 
 /// 眠って待つ人を起こす印 (要求が終わった、または空いた)
 fn chan() -> usize {
-    (&raw const DISK) as usize
+    &DISK as *const _ as usize
 }
 
-static mut DISK: Option<Disk> = None;
+static DISK: Bkl<Option<Disk>> = Bkl::new(None);
 
 /// 見つかったら true
 pub fn init() -> bool {
@@ -46,17 +47,18 @@ pub fn init() -> bool {
     let capacity = mmio.config64(0);
     println!("virtio-blk: {} MiB", capacity * SECTOR as u64 / (1024 * 1024));
     crate::irq::enable(mmio.irq);
-    unsafe { *(&raw mut DISK) = Some(Disk { mmio, q, capacity, busy: false, done: core::ptr::null_mut() }) };
+    *DISK.get() = Some(Disk { mmio, q, capacity, busy: false, done: core::ptr::null_mut() });
     true
 }
 
 /// ディスクのセクタ数
 pub fn capacity() -> Option<u64> {
-    unsafe { (*(&raw const DISK)).as_ref().map(|d| d.capacity) }
+    DISK.get().as_ref().map(|d| d.capacity)
 }
 
+#[track_caller]
 fn disk() -> &'static mut Disk {
-    unsafe { (*(&raw mut DISK)).as_mut().expect("no disk") }
+    DISK.get().as_mut().expect("no disk")
 }
 
 /// 眠って待った読みの数 (/proc/bkl)
@@ -78,7 +80,7 @@ fn complete(d: &mut Disk) -> bool {
 
 /// 割り込みの番号がこれなら受けて true
 pub fn intr(irq: u32) -> bool {
-    let Some(d) = (unsafe { (*(&raw mut DISK)).as_mut() }) else { return false };
+    let Some(d) = DISK.get().as_mut() else { return false };
     if d.mmio.irq != irq {
         return false;
     }
@@ -89,7 +91,7 @@ pub fn intr(irq: u32) -> bool {
 
 /// タイマから: 割り込みが来なかったときのため、終わっているものを見とどける
 pub fn poll() {
-    if let Some(d) = unsafe { (*(&raw mut DISK)).as_mut() } {
+    if let Some(d) = DISK.get().as_mut() {
         complete(d);
     }
 }

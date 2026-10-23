@@ -24,12 +24,12 @@ const STACK_SIZE: usize = 16 * 1024;
 struct Stacks([[u8; STACK_SIZE]; MAXCPU]);
 
 #[unsafe(no_mangle)]
-static mut secondary_stacks: Stacks = Stacks([[0; STACK_SIZE]; MAXCPU]);
+static secondary_stacks: crate::cell::Raw<Stacks> = crate::cell::Raw::new(Stacks([[0; STACK_SIZE]; MAXCPU]));
 
 /// 動いている CPU の数
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// CPU の番号ごとの MPIDR の Aff0 (CPU 間の割り込みの宛先)
-static mut TARGET: [usize; MAXCPU] = [0; MAXCPU];
+static TARGET: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU];
 
 /// 仕事がなくて眠っている CPU (ビット)
 static IDLE: AtomicUsize = AtomicUsize::new(0);
@@ -62,7 +62,7 @@ pub fn wake_idle_n(n: usize) -> bool {
             break;
         }
         if idle & (1 << cpu) != 0 {
-            crate::irq::send_ipi(unsafe { TARGET[cpu] });
+            crate::irq::send_ipi(TARGET[cpu].load(Ordering::Relaxed));
             sent += 1;
         }
     }
@@ -72,7 +72,7 @@ pub fn wake_idle_n(n: usize) -> bool {
 /// ほかの CPU に、EL0 から戻ってくるように知らせる (殺された、シグナルが来た)
 pub fn kick(cpu: usize) {
     if cpu != id() && cpu < online() {
-        crate::irq::send_ipi(unsafe { TARGET[cpu] });
+        crate::irq::send_ipi(TARGET[cpu].load(Ordering::Relaxed));
     }
 }
 
@@ -769,7 +769,7 @@ pub fn start() {
     let me: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) me) };
     let me = me & 0xff_00ff_ffff;
-    unsafe { TARGET[0] = (me & 0xff) as usize };
+    TARGET[0].store((me & 0xff) as usize, Ordering::Relaxed);
     let mut n = 1;
     let mut started = 0;
     crate::dtb::each_cpu(|mpidr, method, release| {
@@ -778,7 +778,7 @@ pub fn start() {
         }
         let cpu = n;
         n += 1;
-        unsafe { TARGET[cpu] = (mpidr & 0xff) as usize };
+        TARGET[cpu].store((mpidr & 0xff) as usize, Ordering::Relaxed);
         match (method, release) {
             (Some("spin-table"), Some(rel)) => {
                 spin_table_on(rel, cpu);

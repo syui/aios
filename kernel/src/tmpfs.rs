@@ -7,10 +7,12 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::memlayout::PGSIZE;
 
 /// tmpfs のファイルが持っているページの数 (ぜんぶの tmpfs で)
-static mut USED: usize = 0;
+/// (BKL を持たない速いフォールトからも足し引きするので atomic)
+static USED: AtomicUsize = AtomicUsize::new(0);
 
 /// tmpfs に使えるのは RAM の半分まで (Linux の tmpfs の既定と同じ)。
 /// それより書くと ENOSPC (メモリを使いきって止まらないように。tmpfs のページはスワップへ出せない)
@@ -19,23 +21,23 @@ fn limit() -> usize {
 }
 
 fn take_page() -> Result<*mut u8, i64> {
-    if unsafe { USED } >= limit() {
+    if USED.load(Ordering::Relaxed) >= limit() {
         return Err(-ENOSPC);
     }
     let p = crate::kalloc::alloc().ok_or(-ENOSPC)?;
-    unsafe { USED += 1 };
+    USED.fetch_add(1, Ordering::Relaxed);
     Ok(p)
 }
 
 fn put_page(p: *mut u8) {
     // ページは参照で持つ (写しているところがまだ見ているかもしれない)
     crate::kalloc::put(p);
-    unsafe { USED -= 1 };
+    USED.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// (いま使っているページ, 上限)。ぜんぶの tmpfs と memfd で。/proc/ai/mem と /proc/ai/fs
 pub fn stats() -> (usize, usize) {
-    (unsafe { USED }, limit())
+    (USED.load(Ordering::Relaxed), limit())
 }
 
 /// ファイルの中身をページ (4KiB) で持つ。書いたページだけを番号で引く表に入れ、ないところ (穴) は 0 として読む
@@ -418,13 +420,12 @@ impl TmpInode {
 /// どのディレクトリにも入っていないファイル (memfd_create)。みんな同じ見えない tmpfs のもの。
 /// 作ったプロセスのもので、封は seals から始まる
 pub fn anon_file(uid: u32, gid: u32, seals: u32) -> InodeRef {
-    static mut FS: usize = 0;
-    let fs = unsafe {
-        if FS == 0 {
-            FS = new_fs_id();
-        }
-        FS
-    };
+    static FS: Bkl<usize> = Bkl::new(0);
+    let fs = FS.get();
+    if *fs == 0 {
+        *fs = new_fs_id();
+    }
+    let fs = *fs;
     let t = TmpInode::new(fs, S_IFREG | 0o600, Node::File(Data::Owned(Pages::new())));
     {
         let mut a = t.attr.borrow_mut();
@@ -838,7 +839,7 @@ impl Inode for TmpInode {
     fn statfs(&self) -> [u8; 120] {
         // df に出る大きさは使える上限 (RAM の半分)
         let total = limit() as u64;
-        let free = (limit().saturating_sub(unsafe { USED })).min(crate::kalloc::nfree()) as u64;
+        let free = (limit().saturating_sub(USED.load(Ordering::Relaxed))).min(crate::kalloc::nfree()) as u64;
         statfs_bytes(0x0102_1994, PGSIZE as u64, total, free, 65536, 65536)
     }
 }

@@ -83,7 +83,7 @@ pub fn intr_fast() -> bool {
 
 /// 輪に足して、はいるぶんだけ出しはじめる。空きより多ければ余りは捨てる (tx_room で確かめてから)
 pub fn tx_push(b: &[u8]) {
-    if unsafe { BASE } == 0 {
+    if BASE.val() == 0 {
         return;
     }
     let mut r = TX.lock();
@@ -95,27 +95,27 @@ pub fn tx_push(b: &[u8]) {
     r.drain();
 }
 
-static mut BASE: usize = 0;
-static mut IRQ: u32 = 33;
+static BASE: crate::cell::Early<usize> = crate::cell::Early::new(0);
+static IRQ: crate::cell::Early<u32> = crate::cell::Early::new(33);
 
 fn reg(off: usize) -> usize {
-    unsafe { BASE + off }
+    BASE.val() + off
 }
 
 /// 何よりも先に (dtb::init のすぐ後): 出力の場所を決める
 pub fn early_init() {
     let pa = crate::dtb::reg_of("arm,pl011", 0).map_or(0x0900_0000, |(a, _)| a as usize);
-    unsafe { BASE = crate::memlayout::p2v(pa) };
+    BASE.set(crate::memlayout::p2v(pa));
 }
 
 pub fn irq() -> u32 {
-    unsafe { IRQ }
+    IRQ.val()
 }
 
 /// 受信の割り込みを有効にする (irq::init の後)
 pub fn init() {
     if let Some(i) = crate::irq::from_dt("arm,pl011") {
-        unsafe { IRQ = i };
+        IRQ.set(i);
     }
     mmio::w32(reg(IMSC), INT_RX | INT_RT);
     crate::irq::enable(irq());
@@ -141,7 +141,7 @@ static RX_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 
 /// 端末が読まれて場所が空いたら (tty::read から): 止めていた受信を再開して、たまっていたものを読む
 pub fn rx_resume() {
-    if unsafe { BASE } == 0 || !RX_STOPPED.swap(false, Ordering::AcqRel) {
+    if BASE.val() == 0 || !RX_STOPPED.swap(false, Ordering::AcqRel) {
         return;
     }
     let im = mmio::r32(reg(IMSC));
@@ -171,13 +171,11 @@ fn rx() {
 }
 
 pub fn putc(c: u8) {
-    unsafe {
-        if BASE == 0 {
-            return;
-        }
-        while mmio::r32(reg(FR)) & FR_TXFF != 0 {}
-        mmio::w32(reg(DR), c as u32);
+    if BASE.val() == 0 {
+        return;
     }
+    while mmio::r32(reg(FR)) & FR_TXFF != 0 {}
+    mmio::w32(reg(DR), c as u32);
 }
 
 pub struct Uart;

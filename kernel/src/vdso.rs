@@ -72,7 +72,7 @@ unsafe extern "C" {
 
 /// シグナルのハンドラの戻り先 (SA_RESTORER がないとき): vDSO の __kernel_rt_sigreturn (vDSO がなければ None)
 pub fn sigtramp() -> Option<u64> {
-    if unsafe { PAGE }.is_null() {
+    if PAGE.val().is_null() {
         return None;
     }
     let off = (&raw const vdso_sigtramp) as usize - (&raw const vdso_code_start) as usize;
@@ -87,7 +87,7 @@ const HASH: usize = 0x180;
 const DYNAMIC: usize = 0x1c0;
 const TEXT: usize = 0x400;
 
-static mut PAGE: *mut u8 = core::ptr::null_mut();
+static PAGE: crate::cell::Early<*mut u8> = crate::cell::Early::new(core::ptr::null_mut());
 
 fn put16(p: &mut [u8], o: usize, v: u16) {
     p[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -165,12 +165,12 @@ pub fn init() {
         a += 64;
     }
     unsafe { core::arch::asm!("dsb ish", "isb") };
-    unsafe { PAGE = page };
+    PAGE.set(page);
 }
 
 /// プロセスのアドレス空間に写す
 pub fn map(pt: &mut crate::vm::PageTable) -> Option<()> {
-    let page = unsafe { PAGE };
+    let page = PAGE.val();
     if page.is_null() {
         return Some(());
     }

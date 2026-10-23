@@ -169,16 +169,26 @@ print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
 # static mut (だれが守るのかを書いていない。BKL を外した道が触っても、Rust のコンパイラは何も言わない) は増やさない:
-# kernel/src/cell.rs の Bkl (大きなロック) や Once (1 度だけ入れる)、atomic、SpinLock にする。減ったら STATIC_MUT_MAX も
-# 下げる (ちがえば落ちる: 戻らないように)
-STATIC_MUT_MAX = 42
+# kernel/src/cell.rs の Bkl (大きなロック)、Once (1 度だけ入れる)、Early (起動のときだけ書く)、PerCpu (CPU ごと)、
+# Raw (番地を渡すだけ)、atomic、SpinLock にする。残りの 1 つは boot.rs のアセンブリが持つページ表 (memlayout.rs の
+# boot_l1_hi: extern の中なので型を変えられない)。減ったら STATIC_MUT_MAX も下げる (ちがえば落ちる: 戻らないように)
+STATIC_MUT_MAX = 1
 static_mut = [(s, i + 1) for s in sources for i, l in enumerate(text[s].split("\n")) if re.match(r"\s*(pub(\(\w+\))?\s+)?static mut ", l)]
 if len(static_mut) > STATIC_MUT_MAX:
     err("static mut: %d, more than %d: use cell::Bkl / cell::Once, an atomic or a SpinLock (%s)" % (len(static_mut), STATIC_MUT_MAX, " ".join("%s:%d" % x for x in static_mut)))
 elif len(static_mut) < STATIC_MUT_MAX:
     err("static mut: %d, fewer than %d: lower STATIC_MUT_MAX in test/kernel-json.py" % (len(static_mut), STATIC_MUT_MAX))
-cells = {c: sum(1 for t in text.values() for l in t.split("\n") if re.match(r"\s*(pub(\(\w+\))?\s+)?static \w+: (crate::cell::)?%s<" % c, l)) for c in ("Bkl", "Once")}
-print("static mut %d (cell::Bkl %d, cell::Once %d)" % (len(static_mut), cells["Bkl"], cells["Once"]))
+cells = {c: sum(1 for t in text.values() for l in t.split("\n") if re.match(r"\s*(pub(\(\w+\))?\s+)?static \w+: (crate::cell::)?%s<" % c, l)) for c in ("Bkl", "Once", "Early", "PerCpu", "Raw")}
+print("static mut %d (cell: %s)" % (len(static_mut), ", ".join("%s %d" % c for c in cells.items())))
+# cell::PerCpu は割り込みを止めたまま触る (それを実行のたびには見ない: DAIF を読むのは QEMU で重い)。カーネルが割り込みを
+# 開けるのは、スケジューラが眠るところ (proc.rs が trap::intr_on を 1 度) と、開いていたものを戻す SpinLock (intr_restore)
+# だけであること。ほかで開けるなら、そこで触る PerCpu を考えなおして、ここを変える
+opens = [s for s in sources for l in text[s].split("\n") if "daifclr" in l.split("//")[0]]
+if sorted(opens) != ["src/spinlock.rs", "src/trap.rs"]:
+    err("IRQs should be opened (msr daifclr) only by trap::intr_on and the SpinLock restore, once each: %s (cell::PerCpu needs IRQs off)" % " ".join(opens))
+callers = ["%s:%d" % (s, i + 1) for s in sources for i, l in enumerate(text[s].split("\n")) if "intr_on()" in l.split("//")[0] and "fn intr_on" not in l]
+if callers != [c for c in callers if c.startswith("src/proc.rs:")] or len(callers) != 1:
+    err("trap::intr_on() should be called once, by the scheduler in proc.rs (cell::PerCpu needs IRQs off): %s" % " ".join(callers))
 print("chosen (aios がえらんだちがい) %d: %s" % (len(chosen), " ".join(chosen)))
 print("linux bugs (手本の Linux のまちがい) %d: %s" % (len(linux_bugs), " ".join(linux_bugs)))
 print("kernel-json: %d failed" % len(errors))

@@ -9,6 +9,7 @@
 // 形の決め方 (HW_REFINE / HW_PARAMS) は Linux のカーネルと同じく、範囲 (interval) を互いの関係で
 // 狭めていく。デバイスが言う形のうち、S16 / S32 / FLOAT のリトルエンディアン、1 か 2 チャンネルだけ使う
 // (ほかの形やレートは alsa-lib の plug がかえる)。録音 (rxq) はまだ
+use crate::cell::Bkl;
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
 use crate::proc;
@@ -261,10 +262,11 @@ struct Snd {
     opened: bool,
 }
 
-static mut SND: Option<Snd> = None;
+static SND: Bkl<Option<Snd>> = Bkl::new(None);
 
+#[track_caller]
 fn get() -> Option<&'static mut Snd> {
-    unsafe { (*(&raw mut SND)).as_mut() }
+    SND.get().as_mut()
 }
 
 pub fn present() -> bool {
@@ -273,7 +275,7 @@ pub fn present() -> bool {
 
 /// 書く人が眠る channel (と poll の印)
 pub fn chan() -> usize {
-    (&raw const SND) as usize
+    &SND as *const _ as usize
 }
 
 impl Snd {
@@ -403,7 +405,7 @@ pub fn init() -> bool {
     let rates: Vec<u32> = (0..RATES.len()).filter(|&i| s.rates & 1 << i != 0).map(|i| RATES[i]).collect();
     println!("virtio-snd: output stream {}, {}-{} channels, {:?} Hz (/dev/snd/pcmC0D0p)", s.stream, s.channels_min, s.channels_max.min(2), rates);
     crate::irq::enable(s.mmio.irq);
-    unsafe { *(&raw mut SND) = Some(s) };
+    *SND.get() = Some(s);
     true
 }
 

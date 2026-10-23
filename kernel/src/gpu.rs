@@ -6,6 +6,7 @@
 // 知らせる。そのときにデバイスへ写して (TRANSFER_TO_HOST_2D) 画面を描きなおす (RESOURCE_FLUSH)。
 // FBIO_DAMAGE (aios だけ) は変わった四角 (x, y, w, h) だけを送る (写しなおさない。aiwm が使う)。
 // 形は XRGB8888 (メモリの並びは B, G, R, X)。要求は virtio-blk と同じく、出して終わるまで待つ
+use crate::cell::Bkl;
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
 use crate::virtio::{self, Mmio, Queue, DESC_NEXT, DESC_WRITE};
@@ -39,7 +40,7 @@ pub struct Gpu {
     resp: *mut u8,
 }
 
-static mut GPU: Option<Gpu> = None;
+static GPU: Bkl<Option<Gpu>> = Bkl::new(None);
 
 /// 画面へ送る (TRANSFER と FLUSH) あいだのロック。デバイスが終わるまで回って待つので、大きなロックは放して
 /// これだけを持つ (システムコールの中は割り込みが止まっているので、途中で放しても横取りされない)
@@ -56,8 +57,9 @@ fn unlocked<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+#[track_caller]
 pub fn get() -> Option<&'static mut Gpu> {
-    unsafe { (*(&raw mut GPU)).as_mut() }
+    GPU.get().as_mut()
 }
 
 fn hdr(typ: u32) -> [u8; 24] {
@@ -209,7 +211,7 @@ pub fn init() -> bool {
     }
     g.flush_all();
     println!("virtio-gpu: {}x{} (/dev/fb0)", w, h);
-    unsafe { *(&raw mut GPU) = Some(g) };
+    *GPU.get() = Some(g);
     true
 }
 

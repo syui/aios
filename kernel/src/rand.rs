@@ -113,14 +113,14 @@ struct Batch {
     generation: u64,
 }
 
-static mut BATCH: [Batch; crate::smp::MAXCPU] = [const { Batch { buf: [0; 64], pos: 64, generation: 0 } }; crate::smp::MAXCPU];
+static BATCH: crate::cell::PerCpu<Batch> = crate::cell::PerCpu::new([const { Batch { buf: [0; 64], pos: 64, generation: 0 } }; crate::smp::MAXCPU]);
 
 /// 32 ビットの乱数を、CPU ごとにまとめて作ったものから (inode の generation など、たびたび要る小さいもの)。u64() と
 /// fill() は呼ぶたびに鍵を進めて ChaCha20 のブロックを作る (TCG では重く、時計も読む) ので、64 バイトずつ作っておき、
 /// 渡したところは消す。鍵を作りなおしたら捨てる。カーネルは割り込みを止めて動き、この中で眠らないので、CPU ごとの
 /// ものを取りあうことはない
 pub fn u32() -> u32 {
-    let b = unsafe { &mut (*(&raw mut BATCH))[crate::smp::id()] };
+    let b = BATCH.get();
     let g = GEN.load(Ordering::Relaxed);
     if b.pos + 4 > b.buf.len() || b.generation != g {
         fill(&mut b.buf);

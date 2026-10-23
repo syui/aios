@@ -37,11 +37,11 @@ const LI_OPTIONS: usize = 0x38;
 
 /// UEFI から渡されたコマンドライン (NUL まで)。bss は primary で消されるので .data に置く
 #[unsafe(link_section = ".data")]
-static mut CMDLINE: [u8; 512] = [0; 512];
+static CMDLINE: crate::cell::Early<[u8; 512]> = crate::cell::Early::new([0; 512]);
 
 /// UEFI から起動したときのコマンドライン (DTB の bootargs より優先する)
 pub fn cmdline() -> Option<&'static str> {
-    let b = unsafe { &*(&raw const CMDLINE) };
+    let b = CMDLINE.get();
     let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     core::str::from_utf8(&b[..n]).ok().map(str::trim).filter(|s| !s.is_empty())
 }
@@ -60,7 +60,7 @@ unsafe fn save_options(image: usize, bs: usize, st: usize) {
         if opts == 0 || size < 2 {
             return;
         }
-        let buf = &mut *(&raw mut CMDLINE);
+        let buf = CMDLINE.get_mut();
         let mut n = 0;
         for i in 0..size / 2 {
             let c = read_volatile((opts + i * 2) as *const u16);
@@ -88,7 +88,7 @@ const RNG_GUID: [u8; 16] = [0xa5, 0xbc, 0x52, 0x31, 0xde, 0xea, 0x3d, 0x43, 0x86
 
 /// UEFI からもらった乱数: 頭の 1 バイトが長さ。bss は primary で消されるので .data に置く
 #[unsafe(link_section = ".data")]
-static mut SEED: [u8; 33] = [0; 33];
+static SEED: crate::cell::Early<[u8; 33]> = crate::cell::Early::new([0; 33]);
 
 /// EFI_RNG_PROTOCOL があれば 32 バイトを SEED へ (ExitBootServices のあとは使えないので、いま)
 unsafe fn save_seed(bs: usize, st: usize) {
@@ -100,7 +100,7 @@ unsafe fn save_seed(bs: usize, st: usize) {
         }
         // GetRNG(This, RNGAlgorithm (NULL: ファームウェアのふつうのもの), RNGValueLength, RNGValue)
         let get: Fn4 = core::mem::transmute(rd64(rng + 8));
-        let buf = (&raw mut SEED) as *mut u8;
+        let buf = SEED.get_mut().as_mut_ptr();
         if get(rng, 0, 32, buf.add(1) as usize) == EFI_SUCCESS {
             core::ptr::write_volatile(buf, 32);
             say(st, b"aios: 32 random bytes from EFI_RNG_PROTOCOL\n");
@@ -110,7 +110,7 @@ unsafe fn save_seed(bs: usize, st: usize) {
 
 /// UEFI からもらった乱数を f に渡して消す (rand の池へ。なければ呼ばない)
 pub fn take_seed(f: impl FnOnce(&[u8])) {
-    let s = unsafe { &mut *(&raw mut SEED) };
+    let s = SEED.get_mut();
     let n = (s[0] as usize).min(32);
     if n > 0 {
         f(&s[1..1 + n]);

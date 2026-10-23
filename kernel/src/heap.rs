@@ -1,6 +1,7 @@
 // カーネルヒープ: bss 上の固定領域 (と、メモリに合わせて足したもの) を切り分ける。空きの管理は TLSF (tlsf.rs:
 // 取るのも返すのも O(1))。ここはロック、使っている量の数え、どこで取ったか (heap trace)、それから足りないとき
 // (足す、捨てる、耐えるところには null、予備と oom.rs: 下の「足りないとき」)
+use crate::cell::{PerCpu, Raw};
 use crate::spinlock::SpinLock;
 use crate::tlsf::{self, Tlsf};
 use core::alloc::{GlobalAlloc, Layout};
@@ -27,7 +28,8 @@ struct Site {
     count: usize,
 }
 
-static mut SITE: [Site; SITES] = [Site { at: [0; DEPTH], bytes: 0, count: 0 }; SITES];
+/// HEAP のロックの中で取る (HEAP → SITE の順)
+static SITE: SpinLock<[Site; SITES]> = SpinLock::new([Site { at: [0; DEPTH], bytes: 0, count: 0 }; SITES]);
 pub static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// 呼び出し (alloc 自身の 2 段は飛ばす)
@@ -59,7 +61,7 @@ fn callers() -> [usize; DEPTH] {
 /// HEAP のロックを持って呼ぶ。番号 + 1 (いっぱいなら 0)
 fn site_add(bytes: usize) -> usize {
     let at = callers();
-    let t = unsafe { &mut *(&raw mut SITE) };
+    let mut t = SITE.lock();
     let mut free = None;
     for (i, s) in t.iter_mut().enumerate() {
         if s.count > 0 && s.at == at {
@@ -80,7 +82,8 @@ fn site_sub(id: usize, bytes: usize) {
     if id == 0 || id > SITES {
         return;
     }
-    let s = unsafe { &mut (*(&raw mut SITE))[id - 1] };
+    let mut t = SITE.lock();
+    let s = &mut t[id - 1];
     s.bytes = s.bytes.saturating_sub(bytes);
     s.count = s.count.saturating_sub(1);
 }
@@ -107,8 +110,8 @@ pub fn trace(on: bool) {
 fn sites_json(out: &mut alloc::string::String) {
     let mut top: [(usize, usize, [usize; DEPTH]); 20] = [(0, 0, [0; DEPTH]); 20];
     {
-        let _h = HEAP.lock();
-        for s in unsafe { (*(&raw const SITE)).iter() } {
+        let t = SITE.lock();
+        for s in t.iter() {
             if s.count == 0 {
                 continue;
             }
@@ -173,7 +176,8 @@ const ALIGN: usize = 16;
 #[repr(C, align(16))]
 struct Area([u8; HEAP_SIZE]);
 
-static mut AREA: Area = Area([0; HEAP_SIZE]);
+/// 起動のときの区画 (番地を TLSF に渡すだけ)
+static AREA: Raw<Area> = Raw::new(Area([0; HEAP_SIZE]));
 
 static HEAP: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
 
@@ -200,7 +204,7 @@ const RESERVE_SIZE: usize = 2 * 1024 * 1024;
 #[repr(C, align(16))]
 struct ReserveArea([u8; RESERVE_SIZE]);
 
-static mut RESERVE_AREA: ReserveArea = ReserveArea([0; RESERVE_SIZE]);
+static RESERVE_AREA: Raw<ReserveArea> = Raw::new(ReserveArea([0; RESERVE_SIZE]));
 static RESERVE: SpinLock<Tlsf> = SpinLock::new(Tlsf::new());
 
 /// 動かしたまま足したバイト、遅い道に来た回数、予備のいま使っているバイト、予備に手をつけた回数
@@ -226,8 +230,8 @@ fn max_total() -> usize {
 /// 予備 (RESERVE) もここで。足す分 (boot_extra) は kalloc::init がカーネルのすぐうしろから切り出したもの (p)
 pub fn init(p: Option<*mut u8>) {
     unsafe {
-        HEAP.lock().add_region((&raw mut AREA) as *mut u8, HEAP_SIZE);
-        RESERVE.lock().add_region((&raw mut RESERVE_AREA) as *mut u8, RESERVE_SIZE);
+        HEAP.lock().add_region(AREA.ptr() as *mut u8, HEAP_SIZE);
+        RESERVE.lock().add_region(RESERVE_AREA.ptr() as *mut u8, RESERVE_SIZE);
     }
     let extra = boot_extra();
     let Some(p) = p.filter(|_| extra > 0) else { return };
@@ -263,27 +267,18 @@ const PCPU_DEPTH: usize = 16;
 struct Pcpu {
     n: [u8; PCPU_CLASSES],
     blocks: [[*mut u8; PCPU_DEPTH]; PCPU_CLASSES],
-    /// 持っているバイト (ヘッダこみの need の合計。/proc/ai/heap の cached)
-    bytes: usize,
 }
 
-static mut PCPU: [Pcpu; crate::smp::MAXCPU] =
-    [const { Pcpu { n: [0; PCPU_CLASSES], blocks: [[ptr::null_mut(); PCPU_DEPTH]; PCPU_CLASSES], bytes: 0 } }; crate::smp::MAXCPU];
+static PCPU: PerCpu<Pcpu> = PerCpu::new([const { Pcpu { n: [0; PCPU_CLASSES], blocks: [[ptr::null_mut(); PCPU_DEPTH]; PCPU_CLASSES] } }; crate::smp::MAXCPU]);
+/// CPU ごとの置き場が持っているバイト (ヘッダこみの need の合計。/proc/ai/heap の cached。ほかの CPU からも読むので
+/// Pcpu の外に、atomic で。CPU ごとにキャッシュの行を分ける: 同じ行だと、取るたびに CPU のあいだで行を取りあう)
+#[repr(align(64))]
+struct Bytes(AtomicUsize);
+static PCPU_BYTES: [Bytes; crate::smp::MAXCPU] = [const { Bytes(AtomicUsize::new(0)) }; crate::smp::MAXCPU];
 
-/// この CPU の置き場 (IRQ を止めて、とちゅうで切りかわらないところから: alloc と dealloc)
-fn pcpu() -> Option<&'static mut Pcpu> {
-    let cpu = crate::smp::id();
-    debug_assert!(irqs_masked(), "heap: per-CPU cache with IRQs open");
-    if cpu >= crate::smp::MAXCPU {
-        return None;
-    }
-    Some(unsafe { &mut (*(&raw mut PCPU))[cpu] })
-}
-
-fn irqs_masked() -> bool {
-    let daif: u64;
-    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
-    daif & (1 << 7) != 0
+/// この CPU の置き場と、その持っているバイト (IRQ を止めて、とちゅうで切りかわらないところから: alloc と dealloc)
+fn pcpu() -> Option<(&'static mut Pcpu, &'static AtomicUsize)> {
+    Some((PCPU.get(), &PCPU_BYTES[crate::smp::id()].0))
 }
 
 /// 置き場から need バイトのブロック (中身の頭)
@@ -293,13 +288,13 @@ fn pcpu_take(need: usize) -> Option<*mut u8> {
     if c >= PCPU_CLASSES {
         return None;
     }
-    let pc = pcpu()?;
+    let (pc, bytes) = pcpu()?;
     let n = pc.n[c] as usize;
     if n == 0 {
         return None;
     }
     pc.n[c] = (n - 1) as u8;
-    pc.bytes -= need;
+    bytes.store(bytes.load(Relaxed) - need, Relaxed);
     Some(unsafe { pc.blocks[c][n - 1].add(HDR) })
 }
 
@@ -310,20 +305,20 @@ fn pcpu_put(b: *mut u8, need: usize) -> bool {
     if c >= PCPU_CLASSES {
         return false;
     }
-    let Some(pc) = pcpu() else { return false };
+    let Some((pc, bytes)) = pcpu() else { return false };
     let n = pc.n[c] as usize;
     if n == PCPU_DEPTH {
         return false;
     }
     pc.blocks[c][n] = b;
     pc.n[c] = (n + 1) as u8;
-    pc.bytes += need;
+    bytes.store(bytes.load(Relaxed) + need, Relaxed);
     true
 }
 
 /// この CPU の置き場をみな TLSF に返す (足りないとき: reclaim。heap trace を始めるとき)
 fn pcpu_drain() {
-    let Some(pc) = pcpu() else { return };
+    let Some((pc, bytes)) = pcpu() else { return };
     let mut h = HEAP.lock();
     for c in 0..PCPU_CLASSES {
         for &b in &pc.blocks[c][..pc.n[c] as usize] {
@@ -334,12 +329,12 @@ fn pcpu_drain() {
         }
         pc.n[c] = 0;
     }
-    pc.bytes = 0;
+    bytes.store(0, Relaxed);
 }
 
 /// 置き場が持っているバイト (CPU ぜんぶ。ほかの CPU の分は、読むあいだにも変わる)
 pub fn cached() -> usize {
-    (0..crate::smp::MAXCPU).map(|i| unsafe { (*(&raw const PCPU))[i].bytes }).sum()
+    PCPU_BYTES.iter().map(|b| b.0.load(Relaxed)).sum()
 }
 
 /// HEAP から need バイト (ヘッダこみ) のブロックを 1 つ。中身の頭 (なければ null)
@@ -384,7 +379,7 @@ unsafe fn take_reserve(need: usize) -> *mut u8 {
 }
 
 fn in_reserve(b: *mut u8) -> bool {
-    let start = (&raw const RESERVE_AREA) as usize;
+    let start = RESERVE_AREA.ptr() as usize;
     (start..start + RESERVE_SIZE).contains(&(b as usize))
 }
 

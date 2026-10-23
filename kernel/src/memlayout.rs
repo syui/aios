@@ -43,10 +43,10 @@ pub fn v2p(va: usize) -> usize {
 }
 
 /// RAM の終わり。DTB の /memory から決める (なければ 512 MiB)
-static mut PHYSTOP: usize = 0;
+static PHYSTOP: crate::cell::Early<usize> = crate::cell::Early::new(0);
 
 pub fn phystop() -> usize {
-    match unsafe { PHYSTOP } {
+    match PHYSTOP.val() {
         0 => ram_base() + 512 * 1024 * 1024,
         p => p,
     }
@@ -63,7 +63,7 @@ pub fn set_ram(base: usize, size: usize) {
     }
     if base == 0 {
         // ラズパイ: 写像してあるのは 1 GiB まで。0x3c00_0000 から上は GPU のメモリと周辺機器
-        unsafe { PHYSTOP = (base + size.min(GIB)).min(0x3c00_0000) };
+        PHYSTOP.set((base + size.min(GIB)).min(0x3c00_0000));
         return;
     }
     // RAM のあるところだけを通常のメモリに (1 GiB ずつ。端数のある最後のブロックも写す)
@@ -75,14 +75,14 @@ pub fn set_ram(base: usize, size: usize) {
             l1[1 + i] = if i < blocks { (base + i * GIB) as u64 | ATTR_NORMAL } else { 0 };
         }
         core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
-        PHYSTOP = base + size;
     }
+    PHYSTOP.set(base + size);
 }
 
 /// [pa, pa + len) が通常のメモリとして写像してある範囲か
 pub fn is_mapped_ram(pa: usize, len: usize) -> bool {
     // RAM の大きさがまだわからなければ、起動のときに写した分
-    let limit = if ram_base() == 0 { 0x3f00_0000 } else if unsafe { PHYSTOP } == 0 { ram_base() + MAX_RAM } else { phystop() };
+    let limit = if ram_base() == 0 { 0x3f00_0000 } else if PHYSTOP.val() == 0 { ram_base() + MAX_RAM } else { phystop() };
     pa >= ram_base() && pa.checked_add(len).is_some_and(|e| e <= limit)
 }
 

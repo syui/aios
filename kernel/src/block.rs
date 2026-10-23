@@ -6,9 +6,11 @@
 //   root=PARTUUID=<GPT の区画の GUID>        MBR なら PARTUUID=<ディスクの署名 8 桁>-<番号 2 桁>
 //   root=UUID=<ext の UUID>                  (blkid の UUID)
 // 表がなく、ディスク全体が ext なら、それが root。
+use crate::cell::Early;
 use crate::{sd, virtio_blk};
 use alloc::format;
 use alloc::string::String;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const SECTOR: usize = 512;
 
@@ -26,23 +28,24 @@ pub struct Part {
     pub num: usize,
 }
 
-static mut DEV: Option<Dev> = None;
-static mut ROOT: Part = Part { start: 0, len: u64::MAX, num: 0 };
-static mut BOOT: Option<Part> = None;
+// 起動のとき (fs::init) に見つけて、あとは読むだけ
+static DEV: Early<Option<Dev>> = Early::new(None);
+static ROOT: Early<Part> = Early::new(Part { start: 0, len: u64::MAX, num: 0 });
+static BOOT: Early<Option<Part>> = Early::new(None);
 /// 見つけた区画 (/dev の vda1 など)。番号 0 はディスク全体 (大きさがわかるときだけ)
-static mut PARTS: alloc::vec::Vec<Part> = alloc::vec::Vec::new();
+static PARTS: Early<alloc::vec::Vec<Part>> = Early::new(alloc::vec::Vec::new());
 
 /// /dev のブロックデバイスの major (Linux の virtblk と mmcblk)
 const VD_MAJOR: u32 = 254;
 const MMC_MAJOR: u32 = 179;
 
 pub fn parts() -> alloc::vec::Vec<Part> {
-    unsafe { (*(&raw const PARTS)).clone() }
+    PARTS.get().clone()
 }
 
 /// 区画の (major, minor)。minor は区画の番号
 pub fn dev_of_part(p: &Part) -> (u32, u32) {
-    let ma = if unsafe { DEV } == Some(Dev::Sd) { MMC_MAJOR } else { VD_MAJOR };
+    let ma = if DEV.val() == Some(Dev::Sd) { MMC_MAJOR } else { VD_MAJOR };
     (ma, p.num as u32)
 }
 
@@ -52,7 +55,7 @@ pub fn part_of_dev(ma: u32, mi: u32) -> Option<Part> {
 }
 
 fn dev() -> Result<Dev, i64> {
-    unsafe { DEV }.ok_or(-6)
+    DEV.val().ok_or(-6)
 }
 
 fn raw_read(d: Dev, sector: u64, buf: &mut [u8]) -> Result<(), i64> {
@@ -80,17 +83,17 @@ fn raw_write(d: Dev, sector: u64, buf: &[u8]) -> Result<(), i64> {
 /// 区画ごとの読み書きの数 (/proc/diskstats): [番号] = (読んだ回数, 読んだセクタ, 読んだ ms, 書いた回数, 書いたセクタ, 書いた ms)。
 /// 番号 0 はディスク全体 (どの区画のものも足す)
 pub const MAX_PARTS: usize = 16;
-static mut IO: [[u64; 6]; MAX_PARTS] = [[0; 6]; MAX_PARTS];
+// BKL を持たない読み書き (fsync を待つあいだなど) からも足すので atomic
+static IO: [[AtomicU64; 6]; MAX_PARTS] = [const { [const { AtomicU64::new(0) }; 6] }; MAX_PARTS];
 
 fn count(p: &Part, write: bool, sectors: u64, t0: u64) {
     let ms = (crate::timer::uptime_ns() - t0) / 1_000_000;
     let o = if write { 3 } else { 0 };
-    let io = unsafe { &mut *(&raw mut IO) };
     for n in [0, p.num] {
-        if let Some(c) = io.get_mut(n) {
-            c[o] += 1;
-            c[o + 1] += sectors;
-            c[o + 2] += ms;
+        if let Some(c) = IO.get(n) {
+            c[o].fetch_add(1, Ordering::Relaxed);
+            c[o + 1].fetch_add(sectors, Ordering::Relaxed);
+            c[o + 2].fetch_add(ms, Ordering::Relaxed);
         }
         if p.num == 0 {
             break;
@@ -100,7 +103,7 @@ fn count(p: &Part, write: bool, sectors: u64, t0: u64) {
 
 /// 区画 (番号) の読み書きの数
 pub fn io_stats(num: usize) -> [u64; 6] {
-    unsafe { (*(&raw const IO)).get(num).copied().unwrap_or([0; 6]) }
+    IO.get(num).map(|c| core::array::from_fn(|i| c[i].load(Ordering::Relaxed))).unwrap_or([0; 6])
 }
 
 /// 区画 p の中の sector から読む
@@ -180,16 +183,16 @@ pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
 }
 
 pub fn root() -> Part {
-    unsafe { ROOT }
+    ROOT.val()
 }
 
 pub fn boot() -> Option<Part> {
-    unsafe { BOOT }
+    BOOT.val()
 }
 
 /// 区画の名前 (/dev/vda2 など)
 pub fn part_name(p: &Part) -> String {
-    let d = unsafe { DEV };
+    let d = DEV.val();
     match (d, p.num) {
         (Some(Dev::Virtio), 0) => "/dev/vda".into(),
         (Some(Dev::Virtio), n) => format!("/dev/vda{}", n),
@@ -294,9 +297,9 @@ pub fn init() -> bool {
     } else {
         return false;
     };
-    unsafe { DEV = Some(d) };
+    DEV.set(Some(d));
     if let Some(n) = virtio_blk::capacity().filter(|_| d == Dev::Virtio) {
-        unsafe { (*(&raw mut PARTS)).push(Part { start: 0, len: n, num: 0 }) };
+        PARTS.get_mut().push(Part { start: 0, len: n, num: 0 });
     }
     let want = crate::dtb::arg("root").and_then(parse_root);
     let mut head = [0u8; SECTOR * 4];
@@ -315,7 +318,7 @@ pub fn init() -> bool {
     // id: GPT なら区画の GUID、MBR なら (署名, 番号) で照らし合わせる
     let sig = u32::from_le_bytes(head[440..444].try_into().unwrap());
     let mut pick = |p: Part, guid: Option<[u8; 16]>, is_root: bool, is_boot: bool| {
-        unsafe { (*(&raw mut PARTS)).push(p) };
+        PARTS.get_mut().push(p);
         let chosen = match &want {
             Some(Want::Num(n)) => *n == p.num,
             Some(Want::PartGuid(g)) => guid == Some(*g),
@@ -374,11 +377,11 @@ pub fn init() -> bool {
     }
     if let Some(r) = root {
         println!("block: root {} (sector {})", part_name(&r), r.start);
-        unsafe { ROOT = r };
+        ROOT.set(r);
     }
     if let Some(b) = boot {
         println!("block: boot {} (sector {})", part_name(&b), b.start);
-        unsafe { BOOT = Some(b) };
+        BOOT.set(Some(b));
     }
     true
 }

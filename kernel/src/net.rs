@@ -5,6 +5,7 @@
 // 0.0.0.0 にすると DHCP にもどす。インターフェースは 1 つ (eth0)
 // ループバック: 127.0.0.1/8 もいつも持ち、自分あて (127.x と自分のアドレス) のフレームは
 // virtio に出さずに受け取りの列へもどす (ARP も自分で答える)
+use crate::cell::Bkl;
 use crate::proc;
 use crate::timer;
 use crate::virtio_net::VirtioNet;
@@ -38,7 +39,7 @@ pub struct Lease {
     pub dns: Vec<Ipv4Address>,
 }
 
-static mut NET: Option<Net> = None;
+static NET: Bkl<Option<Net>> = Bkl::new(None);
 
 pub fn now() -> Instant {
     Instant::from_micros((timer::uptime_ns() / 1000) as i64)
@@ -166,7 +167,7 @@ pub fn init() {
     let dhcp = sockets.add(dhcpv4::Socket::new());
     crate::irq::enable(dev.virtio.mmio.irq);
     println!("net: {} (dhcp)", mac);
-    unsafe { *(&raw mut NET) = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None }) };
+    *NET.get() = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None });
     poll();
 }
 
@@ -285,8 +286,9 @@ fn dhcp_event(n: &mut Net) {
     }
 }
 
+#[track_caller]
 pub fn get() -> Option<&'static mut Net> {
-    unsafe { (*(&raw mut NET)).as_mut() }
+    NET.get().as_mut()
 }
 
 pub fn irq() -> Option<u32> {
@@ -295,7 +297,7 @@ pub fn irq() -> Option<u32> {
 
 /// ソケットを待っている人が眠る channel
 pub fn chan() -> usize {
-    (&raw const NET) as usize
+    &NET as *const _ as usize
 }
 
 /// パケットを出し入れし、待っている人を起こす。タイマ、割り込み、システムコールから呼ぶ

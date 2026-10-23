@@ -784,7 +784,7 @@ static PATHS: Bkl<alloc::collections::BTreeMap<PathKey, PathEntry>> = Bkl::new(a
 /// ディレクトリの属性 (chmod、chown) の版。覚えは、通ったところの版を持っていて、引くときにちがえば古い (Linux の
 /// dcache の d_seq のように、変わったときに覚えをみな見なおさない)。表は開番地法のハッシュ表 (キーはそのまま
 /// くらべる)。半分まで埋まったら空にして EPOCH を進める (覚えはみな古くなる。ないものを探すのが長くならないように)。
-/// 表と EPOCH は GENS_LOCK の中で読み書きする: 大きなロックなしの作る・消す (fastdir.rs) も版を進める
+/// 表と EPOCH は GENS のロックの中で読み書きする: 大きなロックなしの作る・消す (fastdir.rs) も版を進める
 const GEN_SLOTS: usize = 16384;
 const ATTR: u64 = u64::MAX;
 
@@ -798,21 +798,18 @@ struct GenSlot {
 
 /// 0 ばかりなので bss に置かれる
 const EMPTY: GenSlot = GenSlot { used: false, dir: (0, 0), name: 0, ver: 0 };
-static mut GENS: [GenSlot; GEN_SLOTS] = [EMPTY; GEN_SLOTS];
-static mut GENS_USED: usize = 0;
-static mut EPOCH: u32 = 0;
-static GENS_LOCK: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
-/// 版の表が変わった回数 (PathEntry::fresh。GENS_LOCK の中で増やす)
+struct Gens {
+    slots: [GenSlot; GEN_SLOTS],
+    /// 使っている slots の数
+    used: usize,
+    epoch: u32,
+}
+static GENS: crate::spinlock::SpinLock<Gens> = crate::spinlock::SpinLock::new(Gens { slots: [EMPTY; GEN_SLOTS], used: 0, epoch: 0 });
+/// 版の表が変わった回数 (PathEntry::fresh。GENS のロックの中で増やす)
 static CHANGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// GENS_LOCK を持って
-fn gens() -> &'static mut [GenSlot; GEN_SLOTS] {
-    unsafe { &mut *(&raw mut GENS) }
-}
-
 /// (dir, name) の場所: あればそこ、なければ入れるところ
-fn gen_find(dir: (usize, u64), name: u64) -> usize {
-    let g = gens();
+fn gen_find(g: &[GenSlot; GEN_SLOTS], dir: (usize, u64), name: u64) -> usize {
     let mut i = (((dir.1 ^ (dir.0 as u64).rotate_left(32)) ^ name.rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 50) as usize;
     while g[i].used && (g[i].dir != dir || g[i].name != name) {
         i = (i + 1) % GEN_SLOTS;
@@ -820,29 +817,26 @@ fn gen_find(dir: (usize, u64), name: u64) -> usize {
     i
 }
 
-fn gen_of(dir: (usize, u64), name: u64) -> u32 {
-    gens()[gen_find(dir, name)].ver
+fn gen_of(g: &[GenSlot; GEN_SLOTS], dir: (usize, u64), name: u64) -> u32 {
+    g[gen_find(g, dir, name)].ver
 }
 
 fn gen_bump(dir: (usize, u64), name: u64) {
-    let _g = GENS_LOCK.lock();
+    let mut gs = GENS.lock();
     CHANGES.fetch_add(1, core::sync::atomic::Ordering::Release);
-    let i = gen_find(dir, name);
-    let g = gens();
-    if !g[i].used {
-        unsafe {
-            if GENS_USED >= GEN_SLOTS / 2 {
-                *g = [EMPTY; GEN_SLOTS];
-                GENS_USED = 0;
-                EPOCH = EPOCH.wrapping_add(1);
-                crate::statc::epoch_bump();
-                return;
-            }
-            GENS_USED += 1;
+    let i = gen_find(&gs.slots, dir, name);
+    if !gs.slots[i].used {
+        if gs.used >= GEN_SLOTS / 2 {
+            gs.slots.fill(EMPTY);
+            gs.used = 0;
+            gs.epoch = gs.epoch.wrapping_add(1);
+            crate::statc::epoch_bump();
+            return;
         }
-        g[i] = GenSlot { used: true, dir, name, ver: 0 };
+        gs.used += 1;
+        gs.slots[i] = GenSlot { used: true, dir, name, ver: 0 };
     }
-    g[i].ver = g[i].ver.wrapping_add(1);
+    gs.slots[i].ver = gs.slots[i].ver.wrapping_add(1);
 }
 
 /// 名前の印 (FNV-1a)
@@ -865,13 +859,13 @@ impl Pass {
     /// いまの版で (名前を引く前に作る: 引いているあいだに変わったものは、あとで古いとわかる)
     fn new(dir: (usize, u64), name: &str) -> Pass {
         let name = name_hash(name);
-        let _g = GENS_LOCK.lock();
-        Pass { dir, name, ngen: gen_of(dir, name), agen: gen_of(dir, ATTR), epoch: unsafe { EPOCH } }
+        let gs = GENS.lock();
+        Pass { dir, name, ngen: gen_of(&gs.slots, dir, name), agen: gen_of(&gs.slots, dir, ATTR), epoch: gs.epoch }
     }
 
     fn valid(&self) -> bool {
-        let _g = GENS_LOCK.lock();
-        self.epoch == unsafe { EPOCH } && gen_of(self.dir, self.name) == self.ngen && gen_of(self.dir, ATTR) == self.agen
+        let gs = GENS.lock();
+        self.epoch == gs.epoch && gen_of(&gs.slots, self.dir, self.name) == self.ngen && gen_of(&gs.slots, self.dir, ATTR) == self.agen
     }
 }
 /// 全部捨てる

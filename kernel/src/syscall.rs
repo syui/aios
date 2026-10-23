@@ -783,7 +783,6 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
     let ret = if e >= 0x10000 { alloc::format!("{:#x}", e) } else { alloc::format!("{}", e) };
     let line = alloc::format!("strace [{} {}] t={} {}({}, {}, {}) = {}\n", p.pid, proc::current().pid, crate::timer::ticks(), n, arg(0), arg(1), arg(2), ret);
     // kmsg にだけ (シリアルの端末にまざらないように。aish-sys の strace と dmesg が読む)
-    let _g = crate::uart::LOCK.lock();
     crate::kmsg::push(&line);
 }
 
@@ -1480,9 +1479,8 @@ const MAXSTR: usize = 128 * 1024;
 
 /// 知らないシステムコールの番号を、はじめて見たか (見たものは覚える。大きなロックの中で呼ぶ)
 fn unknown_first(n: u64) -> bool {
-    static mut SEEN: [u64; 8] = [0; 8];
-    let seen = unsafe { &mut *(&raw mut SEEN) };
-    let Some(w) = seen.get_mut(n as usize / 64) else { return true };
+    static SEEN: crate::cell::Bkl<[u64; 8]> = crate::cell::Bkl::new([0; 8]);
+    let Some(w) = SEEN.get().get_mut(n as usize / 64) else { return true };
     let bit = 1u64 << (n % 64);
     let first = *w & bit == 0;
     *w |= bit;

@@ -61,10 +61,10 @@ enum Ctrl {
     Bcm { local: usize, arm: usize },
 }
 
-static mut CTRL: Ctrl = Ctrl::Gic { d: 0, c: 0 };
+static CTRL: crate::cell::Early<Ctrl> = crate::cell::Early::new(Ctrl::Gic { d: 0, c: 0 });
 
 fn ctrl() -> Ctrl {
-    unsafe { CTRL }
+    CTRL.val()
 }
 
 fn rd(a: usize) -> u32 {
@@ -181,7 +181,7 @@ pub fn init() {
         // DTB がなければ qemu virt
         _ => Ctrl::Gic { d: p2v(0x0800_0000), c: p2v(0x0801_0000) },
     };
-    unsafe { CTRL = c };
+    CTRL.set(c);
     match c {
         Ctrl::Gic { d, c } => {
             wr(d + GICD_CTLR, 1);

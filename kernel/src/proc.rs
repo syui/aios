@@ -4,7 +4,7 @@
 // EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。CPU ごとにスケジューラがあり、
 // 同じ Proc の表から Runnable のものを取って走らせる (次にどの CPU で走るかは決まっていない)。
 // スレッドは mm (アドレス空間) と files を共有する Proc。
-use crate::cell::Bkl;
+use crate::cell::{Bkl, PerCpu, Raw};
 use crate::exec::{self, Image};
 use crate::file::{self, FileRef, Kind};
 use crate::trap::TrapFrame;
@@ -449,11 +449,11 @@ impl Proc {
     }
 
     fn slot(&self) -> usize {
-        (self as *const Proc as usize - (&raw const PROCS) as usize) / size_of::<Proc>()
+        (self as *const Proc as usize - PROCS.ptr() as usize) / size_of::<Proc>()
     }
 
     fn kstack_top(&self) -> usize {
-        (&raw const KSTACKS) as usize + (self.slot() + 1) * KSTACK_SIZE
+        KSTACKS.ptr() as usize + (self.slot() + 1) * KSTACK_SIZE
     }
 
     fn tf_ref(&self) -> &TrapFrame {
@@ -497,14 +497,16 @@ impl Proc {
 #[repr(C, align(16))]
 struct KStacks([[u8; KSTACK_SIZE]; NPROC]);
 
-static mut KSTACKS: KStacks = KStacks([[0; KSTACK_SIZE]; NPROC]);
-static mut PROCS: [Proc; NPROC] = [const { Proc::UNUSED }; NPROC];
+/// スレッドごとのカーネルのスタック (番地を切りかえと例外の入口に渡すだけ。中はそのスレッドが使う)
+static KSTACKS: Raw<KStacks> = Raw::new(KStacks([[0; KSTACK_SIZE]; NPROC]));
+/// プロセスとスレッドの表 (procs())
+static PROCS: Raw<[Proc; NPROC]> = Raw::new([const { Proc::UNUSED }; NPROC]);
 /// CPU ごと: いま走らせている Proc の添字と、スケジューラの文脈
-static mut CURRENT: [Option<usize>; crate::smp::MAXCPU] = [None; crate::smp::MAXCPU];
-static mut SCHEDULER: [Context; crate::smp::MAXCPU] = [Context::ZERO; crate::smp::MAXCPU];
+static CURRENT: PerCpu<Option<usize>> = PerCpu::new([None; crate::smp::MAXCPU]);
+static SCHEDULER: PerCpu<Context> = PerCpu::new([Context::ZERO; crate::smp::MAXCPU]);
 
 fn cur() -> Option<usize> {
-    unsafe { CURRENT[crate::smp::id()] }
+    *CURRENT.get()
 }
 
 /// いまのスレッドの表の番号 (0..NPROC。起動のときやアイドルなら None。prof.rs がスレッドごとに数えるのに)
@@ -570,32 +572,35 @@ pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
 }
 
 fn set_cur(v: Option<usize>) {
-    unsafe { CURRENT[crate::smp::id()] = v };
+    *CURRENT.get() = v;
 }
 
 fn sched_ctx() -> *mut Context {
-    unsafe { &raw mut SCHEDULER[crate::smp::id()] }
+    SCHEDULER.ptr()
 }
 static NEXT_PID: Bkl<u32> = Bkl::new(1);
 
+/// 表は大きなロックが守る。ロックなしで触ってよいのは、いまのスレッドの Proc (current()) のうち、そのスレッドの
+/// ほかにはロックを持っても変えないところ (fd の表を持つ Rc、アドレス空間、資格情報を読むなど: syscall::fast)。
+/// Proc ごとに守り手がちがうので Bkl にはしない (Bkl にすると、速い道の current() がみな unlocked に出る)
 fn procs() -> &'static mut [Proc; NPROC] {
-    unsafe { &mut *(&raw mut PROCS) }
+    unsafe { &mut *PROCS.ptr() }
 }
 
 // 使っているかもしれないスロットの印 (1 ビットが 1 つ)。見て回るところ (起こす、選ぶ、探す) が NPROC ぜんぶを
 // 見ないように。alloc_proc でつけ、free_slot で消す (つけたまま Unused のものは、見るときに state でとばす)
 const WORDS: usize = NPROC / 64;
-static mut LIVE: [u64; WORDS] = [0; WORDS];
+static LIVE: Bkl<[u64; WORDS]> = Bkl::new([0; WORDS]);
 
 fn slot_of(p: &Proc) -> usize {
-    (p as *const Proc as usize - (&raw const PROCS) as usize) / size_of::<Proc>()
+    (p as *const Proc as usize - PROCS.ptr() as usize) / size_of::<Proc>()
 }
 
 /// スロットを空ける
 fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     let i = slot_of(p);
-    unsafe { LIVE[i / 64] &= !(1u64 << (i % 64)) };
+    LIVE.get()[i / 64] &= !(1u64 << (i % 64));
     *p = Proc::UNUSED;
 }
 
@@ -621,7 +626,7 @@ fn live_from(start: usize) -> impl Iterator<Item = usize> {
     let start = start % NPROC;
     (0..=WORDS).flat_map(move |k| {
         let w = (start / 64 + k) % WORDS;
-        let mut bits = unsafe { LIVE[w] };
+        let mut bits = LIVE.get()[w];
         let low = (1u64 << (start % 64)) - 1;
         if k == 0 {
             bits &= !low;
@@ -650,10 +655,11 @@ pub fn try_current() -> Option<&'static mut Proc> {
 /// いまのプロセスの資格情報。まだプロセスがなければ root
 /// いまのプロセスの資格情報を写さずに (起動中でまだプロセスがなければ root)
 pub fn current_cred_ref() -> &'static crate::cred::Cred {
-    static mut ROOT: crate::cred::Cred = crate::cred::Cred::ROOT;
+    // だれも書かない (Cred は Rc を持つので Sync でなく、ただの static にはできない。ROOT の Rc はみな None)
+    static ROOT: crate::cell::Early<crate::cred::Cred> = crate::cell::Early::new(crate::cred::Cred::ROOT);
     match cur() {
         Some(i) => &procs()[i].cred,
-        None => unsafe { &*(&raw const ROOT) },
+        None => ROOT.get(),
     }
 }
 
@@ -808,7 +814,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
     *p = Proc::UNUSED;
     let i = slot_of(p);
     crate::prof::thread_start(i);
-    unsafe { LIVE[i / 64] |= 1u64 << (i % 64) };
+    LIVE.get()[i / 64] |= 1u64 << (i % 64);
     p.pid = *NEXT_PID.get();
     *NEXT_PID.get() += 1;
     p.tgid = p.pid;

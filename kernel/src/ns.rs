@@ -152,19 +152,19 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
 
 // ---- ホスト名 ----
 
-static mut HOSTNAME: ([u8; 64], usize) = {
+static HOSTNAME: Bkl<([u8; 64], usize)> = Bkl::new({
     let mut b = [0u8; 64];
     b[0] = b'a';
     b[1] = b'i';
     b[2] = b'o';
     b[3] = b's';
     (b, 4)
-};
+});
 
 fn current_name(c: &crate::cred::Cred) -> ([u8; 64], usize) {
     match &c.ns.uts {
         Some(u) => *u.name.borrow(),
-        None => unsafe { *(&raw const HOSTNAME) },
+        None => *HOSTNAME.get(),
     }
 }
 
@@ -187,7 +187,7 @@ pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
             if check && c.euid != 0 {
                 return Err(-EPERM);
             }
-            unsafe { *(&raw mut HOSTNAME) = (b, name.len()) };
+            *HOSTNAME.get() = (b, name.len());
         }
     }
     Ok(())

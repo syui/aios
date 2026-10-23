@@ -17,19 +17,19 @@ const NOP: u32 = 4;
 
 /// DTB の写し (DTB は RAM のどこにあるかわからず、kalloc が上書きするかもしれないので)。中身は頭の LEN バイト
 const MAX: usize = 1024 * 1024;
-static mut COPY: [u8; MAX] = [0; MAX];
-static mut LEN: usize = 0;
+static COPY: crate::cell::Early<[u8; MAX]> = crate::cell::Early::new([0; MAX]);
+static LEN: crate::cell::Early<usize> = crate::cell::Early::new(0);
 /// /chosen の乱数 (ブートローダーや QEMU がくれる。rand のもと) の名前と、写しの中の場所 (位置、長さ)。
 /// 元の DTB からは init で、写しからは take_seed で消す (あとでだれかに読まれないように。Linux も消す)
 const SEEDS: [&str; 2] = ["rng-seed", "kaslr-seed"];
-static mut SEED_AT: [(usize, usize); 2] = [(0, 0); 2];
+static SEED_AT: crate::cell::Early<[(usize, usize); 2]> = crate::cell::Early::new([(0, 0); 2]);
 
 fn be32(b: &[u8], o: usize) -> u32 {
     u32::from_be_bytes(b[o..o + 4].try_into().unwrap())
 }
 
 fn blob() -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((&raw const COPY) as *const u8, *(&raw const LEN)) }
+    &COPY.get()[..LEN.val()]
 }
 
 /// 0 で終わる文字列 (終わりの 0 は含めない)
@@ -59,12 +59,9 @@ pub fn init() -> bool {
     if !(40..=MAX).contains(&size) || !crate::memlayout::is_mapped_ram(pa, size) {
         return false;
     }
-    unsafe {
-        let src = core::slice::from_raw_parts(p2v(pa) as *const u8, size);
-        let dst = &mut *(&raw mut COPY);
-        dst[..size].copy_from_slice(src);
-        *(&raw mut LEN) = size;
-    }
+    let src = unsafe { core::slice::from_raw_parts(p2v(pa) as *const u8, size) };
+    COPY.get_mut()[..size].copy_from_slice(src);
+    LEN.set(size);
     // 元の DTB の乱数はすぐ消す (RAM のその場所は、あとでユーザーのページにもなる)
     for (i, name) in SEEDS.iter().enumerate() {
         if let Some(v) = scan(|n| (n.depth() == 1 && n.name() == "chosen").then(|| n.prop(name)).flatten()) {
@@ -72,7 +69,7 @@ pub fn init() -> bool {
             for j in 0..v.len() {
                 unsafe { core::ptr::write_volatile((p2v(pa) + off + j) as *mut u8, 0) };
             }
-            unsafe { (*(&raw mut SEED_AT))[i] = (off, v.len()) };
+            SEED_AT.get_mut()[i] = (off, v.len());
         }
     }
     true
@@ -81,16 +78,16 @@ pub fn init() -> bool {
 /// /chosen の rng-seed か kaslr-seed を f に渡し、写しからも消す (2 度目からはない)
 pub fn take_seed(name: &str, f: impl FnOnce(&[u8])) {
     let Some(i) = SEEDS.iter().position(|n| *n == name) else { return };
-    let (off, len) = unsafe { (*(&raw const SEED_AT))[i] };
+    let (off, len) = SEED_AT.get()[i];
     if len == 0 {
         return;
     }
-    let base = (&raw mut COPY) as *mut u8;
+    let base = COPY.get_mut().as_mut_ptr();
     f(unsafe { core::slice::from_raw_parts(base.add(off), len) });
     for j in 0..len {
         unsafe { core::ptr::write_volatile(base.add(off + j), 0) };
     }
-    unsafe { (*(&raw mut SEED_AT))[i] = (0, 0) };
+    SEED_AT.get_mut()[i] = (0, 0);
 }
 
 pub fn present() -> bool {

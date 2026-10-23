@@ -3,6 +3,7 @@
 // ラズパイ 3 の Arasan SDHCI (QEMU raspi3b ではここに SD カードがつながる) と、
 // ラズパイ 4 の emmc2 はどちらも SDHCI。BCM2835 の SDHCI は 8/16 ビットの書き込みを
 // 受けつけないので、レジスタはいつも 32 ビットで読み書きする。
+use crate::cell::Bkl;
 use crate::memlayout::p2v;
 
 const ARG2: usize = 0x00;
@@ -61,7 +62,7 @@ struct Sd {
     block_addr: bool,
 }
 
-static mut SD: Option<Sd> = None;
+static SD: Bkl<Option<Sd>> = Bkl::new(None);
 
 fn rd(s: &Sd, r: usize) -> u32 {
     crate::mmio::r32(s.base + r)
@@ -126,7 +127,7 @@ pub fn init() -> bool {
     match card_init(&mut s) {
         Ok(()) => {
             println!("sd: card at {:#x}{}", pa, if s.block_addr { " (SDHC)" } else { "" });
-            unsafe { SD = Some(s) };
+            *SD.get() = Some(s);
             true
         }
         Err(_) => false,
@@ -180,7 +181,7 @@ fn card_init(s: &mut Sd) -> Result<(), i64> {
 }
 
 fn sd() -> Result<&'static Sd, i64> {
-    unsafe { (*(&raw const SD)).as_ref().ok_or(-6) }
+    SD.get().as_ref().ok_or(-6)
 }
 
 /// sector から buf (SECTOR の倍数) に読む
