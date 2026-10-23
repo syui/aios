@@ -112,8 +112,11 @@ jobs:
           done
 
       - name: Build C tests
-        # カーネルの C のテスト (test/*.c) を静的なプログラムに (arm64 の Ubuntu の gcc)。VM test で中から取って動かす
-        run: sh test/vm-ctests.sh build gcc
+        # カーネルの C のテスト (test/*.c) を静的なプログラムに (arm64 の Ubuntu の gcc)。VM test で中から取って動かす。
+        # ロボット (test/sysdiff.c) も。test/sysdiff/ の Linux の答えを作ったときの sysdiff.c でなければ止まる
+        run: |
+          sh test/vm-ctests.sh build gcc
+          sh test/sysdiff-ci.sh build gcc
 
       - name: mem.S test
         # カーネルの memcpy / memmove / memset (kernel/src/mem.S) を、長さとずれと重なりのすべてで libc のものとくらべる
@@ -136,6 +139,12 @@ jobs:
           python3 test/vm.py run 'fetch http://10.0.2.2:8000/vm-check.sh > /tmp/vm-check.sh && sh /tmp/vm-check.sh' -t 600 || st=$?
           # カーネルの C のテスト (test/vm-ctests.sh。clone3、execve、getdents、landlock、seccomp、namespace など)
           python3 test/vm.py run 'fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/vm-ctests.sh && sh /tmp/vm-ctests.sh run' -t 1200 || st=$?
+          # Linux と答えあわせ (test/sysdiff-ci.sh): ext4 と tmpfs の 800 case を動かし、test/sysdiff/ の Linux の答えとくらべる
+          if python3 test/vm.py run 'fetch http://10.0.2.2:8000/sysdiff-ci.sh > /tmp/sd.sh && sh /tmp/sd.sh run' -t 1200; then
+            sh test/sysdiff-ci.sh compare || st=1
+          else
+            st=1
+          fi
           # 失敗したら、シリアルの終わりを見せる (中で何が起きたか)
           [ "$st" = 0 ] || python3 test/vm.py log 60
           python3 test/vm.py stop || true

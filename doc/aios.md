@@ -737,6 +737,14 @@ aios は閉じたときに片づけ (相手はすぐ EOF)、Linux 7.3 はほか�
 共有の key、fork をまたぐ MAP_SHARED の futex、相対と時刻の時間切れ、シグナルとやり直し、PI のゆずりあい、REQUEUE で移った
 ものを起こす、futex_waitv、pthread_join) をじかに確かめる (Linux 7.3 でも同じ答え)。
 
+0 differ になったものが、いつの間にかくずれないように、CI (.github/workflows/unix.yml の VM test) でも push のたびに答えあわせ
+をする (test/sysdiff-ci.sh)。Linux の答えはアーキテクチャによらないので、CI で Linux を起こさず、手本の Linux で動かした
+答えを test/sysdiff/ に置いておく (`test/sysdiff-ci.sh golden 7.3` が test/linux-vm.sh の Linux で作る。ふだん確かめている
+大きさの ext4 300 × 30 op、ext4 200 × 80 op、tmpfs 300 × 30 op の 800 case で 310 KB)。CI は同じ case を aios の VM で動かし
+(2 分ほど)、case ごとに最初にちがう行を Linux と aios で並べて出す。答えは、作ったときの test/sysdiff.c の sha256 と
+いっしょに置くので、sysdiff.c を変えて答えを作りなおし忘れると、CI はくらべる前に止まる。CI の gcc (glibc) で作ったもの
+と aish の zig (musl) で作ったものの Linux の答えは、同じだった。
+
 #### aios がえらんだちがい
 
 Linux に合わせるのは最初の手本で、Linux よりよい道があれば、そちらをえらぶ。えらんだところは test/sysdiff.c の `chosen` に
