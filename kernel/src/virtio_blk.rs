@@ -104,12 +104,12 @@ fn rw(sector: u64, buf: *mut u8, len: usize, write: bool, sleep: bool) -> Result
         return Err(-EIO);
     }
     let t0 = crate::timer::uptime_ns();
-    // ほかの人の要求が出ている: 眠れるなら空くまで眠る。眠れなければ、その終わりを見とどける (回って)
+    // ほかの人の要求が出ている: 眠れるなら空くまで眠る。眠れなければ、その終わりを見とどける (回って)。
+    // 眠るのはシグナルで起きない眠り (sleep_nointr): シグナルで戻ると、大きなロックを持ったまま回り、終わりを受ける
+    // 割り込みもタイマもロックを待って止まる
     while d.busy {
         if sleep {
-            if crate::proc::sleep(chan()).is_err() {
-                // シグナルでも、ディスクの読みはやめない (空くまで待つ)
-            }
+            crate::proc::sleep_nointr(chan());
         } else if !complete(d) {
             core::hint::spin_loop();
         }
@@ -132,7 +132,7 @@ fn rw(sector: u64, buf: *mut u8, len: usize, write: bool, sleep: bool) -> Result
     // 終わるまで待つ (done は complete がつける: 割り込み、タイマ、回っているほかの人、自分)
     while !unsafe { core::ptr::read_volatile(&done) } {
         if sleep {
-            let _ = crate::proc::sleep(chan());
+            crate::proc::sleep_nointr(chan());
         } else if !complete(d) {
             core::hint::spin_loop();
         }

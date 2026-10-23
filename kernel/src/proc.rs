@@ -319,6 +319,8 @@ pub struct Proc {
     /// 0 でなければ、いまは「ディスクを待つあいだ眠ってよい」読むだけの道の中 (file::read の ext4 のファイル、
     /// pread)。extfs の with_block がキャッシュにないブロックを読むとき、回らずに眠る (io_sleepable)
     pub io_sleep: u32,
+    /// シグナルでは起こさない眠りの中 (sleep_nointr: ディスクの要求の終わりを待つ。Linux の TASK_UNINTERRUPTIBLE、ps の D)
+    pub nointr: bool,
     /// ディスクを読まない区間 (preadv2 の RWF_NOWAIT): キャッシュになければ EAGAIN (extfs の with_block)
     pub noio: u32,
     /// 新しく読んだものをキャッシュに残さない区間 (RWF_DONTCACHE)
@@ -405,6 +407,7 @@ impl Proc {
         nrun: 0,
         slept_at: 0,
         io_sleep: 0,
+        nointr: false,
         noio: 0,
         dontcache: 0,
         woken_ns: 0,
@@ -1030,6 +1033,24 @@ pub fn yield_now() {
 /// chan で起こされるまで眠る。killed なら Err(-EINTR)
 pub fn sleep(chan: usize) -> Result<(), i64> {
     sleep_until(chan, 0).map(|_| ())
+}
+
+/// chan で起こされるまで眠る。シグナルでは起きない (Linux の TASK_UNINTERRUPTIBLE)。出したディスクの要求の終わりを
+/// 待つところ (virtio_blk): シグナルで戻ると、終わりを見とどける人がいなくなる (前は sleep が EINTR ですぐ戻り、
+/// 大きなロックを持ったまま回りつづけ、終わりを受ける割り込みもタイマもロックを待って、機械ごと止まった)。
+/// 届いたシグナルは、システムコールから戻るときに受ける。起きたあとも、待っていたものがまだなら呼ぶ側がまた眠る
+pub fn sleep_nointr(chan: usize) {
+    let p = current();
+    p.chan = chan;
+    p.wake_at = 0;
+    p.nointr = true;
+    p.state = State::Sleeping;
+    p.slept_at = crate::timer::ticks();
+    crate::trace::sleep(chan);
+    sched();
+    let p = current();
+    p.chan = 0;
+    p.nointr = false;
 }
 
 /// chan で起こされるか deadline (tick, 0 なら無し) まで眠る。時間切れなら Ok(false)
@@ -1693,10 +1714,10 @@ pub fn stop_chan(leader: &Proc) -> usize {
     leader as *const Proc as usize + 1
 }
 
-/// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る)
+/// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る。sleep_nointr の中なら起こさない: 戻ってから受ける)
 pub fn interrupt(t: &mut Proc) {
     match t.state {
-        State::Sleeping => {
+        State::Sleeping if !t.nointr => {
             t.state = State::Runnable;
             crate::smp::wake_idle();
         }
@@ -2099,6 +2120,7 @@ pub fn threads_text() -> alloc::string::String {
         }
         let st = match p.state {
             State::Running | State::Runnable => 'R',
+            State::Sleeping if p.nointr => 'D',
             State::Sleeping => 'S',
             State::Zombie => 'Z',
             State::Unused => 'X',

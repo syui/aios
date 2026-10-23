@@ -75,6 +75,11 @@ t lockbench sh -c 'seq 1 300000 | cat | wc -l > /tmp/lockbench.n & echo lockbenc
 # 4 つの CPU で "already borrowed" のパニックになった (カーネルが止まれば、このスクリプトはおしまいまで来ない)
 t fast-smp sh -c 'for j in 1 2 3; do for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do (ls -l /usr/bin > /dev/null; cat /etc/os-release /usr/bin/ls > /dev/null; stat /etc/passwd > /dev/null) & done; wait; done'
 
+# ディスクを眠って待つ読みの中にシグナルが来ても止まらないこと。前は眠りが EINTR ですぐ戻り、大きなロックを持ったまま
+# 回りつづけ、要求の終わりを受ける割り込みとタイマがロックを待って、機械ごと止まった (いまは sleep_nointr、ps の D)。
+# まだ読んでいない大きなファイル (/opt/c/lib の静的ライブラリ) を読むとちゅうで止める
+t disk-read-signal sh -c 'for f in /opt/c/lib/*.a; do cat "$f" > /dev/null & p=$!; sleep 0.02; kill -TERM $p 2>/dev/null; wait $p; done; true'
+
 # カーネルのヒープ (tlsf.rs) の決まりが、ここまでのたしかめのあとも守られているか (heap check の答えは kmsg に)
 t heap-check sh -c 'echo "heap check" > /proc/ai/ctl && grep "heap: check" /proc/kmsg | tail -1 | grep -q "check ok"'
 # /proc/ai/mem と /proc/ai/fs: 1 行の JSON で、ページキャッシュとヒープ、マウントとパスの覚えがある (aish の mem と fs)

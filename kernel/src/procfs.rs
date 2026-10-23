@@ -491,6 +491,7 @@ fn state_char(p: &Proc) -> char {
     }
     match p.state {
         State::Running | State::Runnable => 'R',
+        State::Sleeping if p.nointr => 'D',
         State::Sleeping => 'S',
         State::Zombie => 'Z',
         State::Unused => 'X',
@@ -501,6 +502,7 @@ fn state_name(p: &Proc) -> &'static str {
     match state_char(p) {
         'R' => "R (running)",
         'S' => "S (sleeping)",
+        'D' => "D (disk sleep)",
         'Z' => "Z (zombie)",
         'T' => "T (stopped)",
         _ => "X (dead)",
