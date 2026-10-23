@@ -2,13 +2,13 @@
 # QEMU で aios を起動する。cargo run からも呼ばれる
 #   (人の手の代わりに外から動かす: 起こしたままコマンドを送る、画面を撮る、なら test/vm.py)
 #   bin/run.sh KERNEL   そのカーネルで (cargo run は作ったばかりの開発用カーネルを渡す)
-#   bin/run.sh          disk.img から起動する:
+#   bin/run.sh          aios.img から起動する (前の名前 disk.img しかなければそれを):
 #                         GPT (bin/mkdisk.sh の既定) なら UEFI のファームウェア (AAVMF / edk2) で
 #                         ESP の EFI/BOOT/BOOTAA64.EFI を。ファームウェアがないか AIOS_CMDLINE が
 #                         あるときは ESP の /Image を直に (mtools が要る)
 #                         区画なしの ext4 なら /boot/Image を (debugfs が要る)
 #                       どれもなければ開発用カーネルで
-#                       disk.img がなく aios-aarch64.img.zst (リリース latest) があれば、展開して使う:
+#                       aios.img がなく aios-aarch64.img.zst (リリース latest) があれば、展開して使う:
 #                         git clone https://git.syui.ai/ai/os aios && cd aios
 #                         curl -fLO https://git.syui.ai/ai/os/releases/download/latest/aios-aarch64.img.zst
 #                         (GitHub の https://github.com/syui/aios/releases/download/latest/ にも同じもの。
@@ -17,7 +17,7 @@
 #   AIOS_EFI_CODE=FILE  UEFI のファームウェア (既定はよくある場所から探す)。変数は build/efivars.fd
 # カーネルは Linux の arm64 Image として渡すので、QEMU は DTB を x0 に入れてくれる
 # (ELF なら Image に変える)。AIOS_CMDLINE はカーネルのコマンドライン (例: init=/bin/sh)
-# ネットワークは QEMU の user (DHCP)。disk.img (bin/mkdisk.sh で作る) があればルートにする。乱数のもとに virtio-rng も
+# ネットワークは QEMU の user (DHCP)。aios.img (bin/mkdisk.sh で作る) があればルートにする。乱数のもとに virtio-rng も
 # AIOS_SMP=N で CPU の数 (既定 4。ラズパイ 3B はいつも 4)
 # AIOS_MEM=SIZE でメモリ (既定 2G。Claude Code (Bun) は 512M では足りない)
 # AIOS_DISPLAY=1 で画面の窓を出す (virtio-gpu と virtio のキーボード・タブレット。Mac は cocoa、
@@ -25,7 +25,7 @@
 #   音 (virtio-sound、QEMU 8.2 から) もつける: Mac は coreaudio、ほかは pipewire / pa / alsa のあるもの。
 #   AIOS_SOUND=coreaudio / pipewire / pa / alsa / none (鳴らさない) で選べる。AIOS_SOUND=0 で音の装置なし
 # AIOS_QEMU_ARGS で QEMU に引数を足せる
-# AIOS_DISK=FILE で disk.img のかわりに FILE から起こす (コピーで動かして、あとで外から e2fsck するなど)
+# AIOS_DISK=FILE で aios.img のかわりに FILE から起こす (コピーで動かして、あとで外から e2fsck するなど)
 # AIOS_DISK_OPTS=OPTS で virtio のディスクの -drive に足す (おそいディスクのまね: throttling.iops-write=50 など)
 # AIOS_SSH=PORT でホストの 127.0.0.1:PORT を aios の 22 (sshd) につなぐ (既定 2222、0 でつながない)
 #   ssh -p 2222 ai@127.0.0.1 で入れる (aios で sudo ssh-keygen -A && sudo /opt/c/sbin/sshd)
@@ -34,21 +34,23 @@
 #   AIOS_GIC=3 で TCG でも GICv3 に
 # AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
-disk=${AIOS_DISK:-disk.img}
+disk=${AIOS_DISK:-aios.img}
 k=$1
 case "$k" in "" | /*) ;; *) k="$PWD/$k" ;; esac
 # 渡されたカーネルがなければ止まる (zsh で「bin/run.sh  # コメント」と打つと # からが引数になる)
 if [ -n "$k" ] && [ ! -f "$k" ]; then
-  echo "./bin/run.sh: カーネル $1 がありません (引数なしなら disk.img か aios-aarch64.img.zst から起動)" >&2
+  echo "./bin/run.sh: カーネル $1 がありません (引数なしなら aios.img か aios-aarch64.img.zst から起動)" >&2
   exit 1
 fi
 cd "$(dirname "$0")/.."
+# 前の名前 (disk.img) しかなければ、それを
+[ -z "$AIOS_DISK" ] && [ ! -f "$disk" ] && [ -f disk.img ] && disk=disk.img
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 if [ -z "$k" ] && [ ! -f "$disk" ]; then
   for z in aios-aarch64.img.zst aios-unix-aarch64.img.zst; do
     [ -f "$z" ] || continue
-    echo "disk.img: $z を展開します" >&2
+    echo "$disk: $z を展開します" >&2
     zstd -d -q "$z" -o "$disk" || exit 1
     break
   done
@@ -68,7 +70,7 @@ if [ -z "$k" ] && [ -n "$gpt" ]; then
     # 区画 1 (ESP) の始まり: GPT の区画表 (LBA 2) の最初の項目の +32
     start=$(od -An -tu8 -j $((1024 + 32)) -N 8 "$disk" | tr -d ' ')
     if mcopy -n -i "$disk@@$((start * 512))" ::/Image "$tmp/boot" 2>/dev/null && [ -s "$tmp/boot" ]; then
-      echo "boot: /boot/Image from the ESP of disk.img" >&2
+      echo "boot: /boot/Image from the ESP of $disk" >&2
       k=$tmp/boot
     fi
   fi
@@ -76,7 +78,7 @@ fi
 if [ -z "$k" ] && [ -z "$uefi" ] && [ -z "$gpt" ] && [ -f "$disk" ] && command -v debugfs >/dev/null; then
   for f in /boot/Image /boot/aios; do
     if debugfs -R "dump $f $tmp/boot" "$disk" >/dev/null 2>&1 && [ -s "$tmp/boot" ]; then
-      echo "boot: $f from disk.img" >&2
+      echo "boot: $f from $disk" >&2
       k=$tmp/boot
       break
     fi
@@ -183,7 +185,7 @@ if [ -n "$uefi" ]; then
       dd if=/dev/zero of="$vars" bs=1 count=0 seek="$(wc -c < "$uefi" | tr -d ' ')" 2>/dev/null
     fi
   fi
-  echo "boot: UEFI ($uefi) from disk.img" >&2
+  echo "boot: UEFI ($uefi) from $disk" >&2
   # shellcheck disable=SC2086
   qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-2G}" $out "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"

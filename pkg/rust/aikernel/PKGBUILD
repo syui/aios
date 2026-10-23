@@ -3,7 +3,7 @@
 # EFI スタブつきで、UEFI からは loader entry (/boot/loader/entries/aios.conf) を読む
 # ブートローダー (aiboot か systemd-boot) が起動する。/boot は ESP (bin/mkdisk.sh)
 # root= などは entry の options に書く (なければ最初の Linux root の区画)
-# QEMU では bin/run.sh が disk.img を UEFI (AAVMF) で、なければ /boot/Image を直に起動する
+# QEMU では bin/run.sh が aios.img を UEFI (AAVMF) で、なければ /boot/Image を直に起動する
 # initramfs は空にして作るので、ルートはディスク (bin/mkdisk.sh)
 pkgname=aikernel
 pkgver=0.0.1

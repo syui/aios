@@ -928,7 +928,7 @@ aios install pkg FILE...       # 作ったパッケージを入れる (aiosd が
      (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残り、`aios get boot.last`
      の `result` と `why` で読める
   新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る
-- `test/vm-boot.sh [--new]` (開発のマシン) は、これを disk.img の VM (-snapshot) で確かめる: 起動するもの、読めないもの、
+- `test/vm-boot.sh [--new]` (開発のマシン) は、これを aios.img の VM (-snapshot) で確かめる: 起動するもの、読めないもの、
   止まるもの (`AIOS_TEST_HANG=1` でビルドしたカーネル) を入れて再起動し (`test/vm.py reboot --reset-after`)、
   前のものに戻ったか、わけ (why) を見る。`--new` はこのソースの aiboot、aiosd、aios を入れてから
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる

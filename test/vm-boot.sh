@@ -1,6 +1,6 @@
 #!/bin/sh
 # 新しいカーネルを試して、だめなら前のものに戻る (aiboot の boot counting と aiosd。doc/aios.md の「改造」) のテスト。
-# 開発のマシンで: disk.img (bin/run.sh と同じ) を -snapshot で UEFI から起こし、3 つのカーネルを aios install kernel
+# 開発のマシンで: aios.img (bin/run.sh と同じ) を -snapshot で UEFI から起こし、3 つのカーネルを aios install kernel
 # で入れて再起動する (ディスクには何も残らない)
 #   good  AIOS_RELEASE=boot-good のもの → そのカーネルで起動し、boot.last は booted
 #   load  good の Image の頭 (64 バイト) だけで中は 0 のもの → UEFI の LoadImage がしくじり、前のもの (good) に
@@ -40,7 +40,7 @@ kernel boot-hang AIOS_TEST_HANG=1
 python3 -c 'import sys; b = open(sys.argv[1], "rb").read(); open(sys.argv[2], "wb").write(b[:64] + bytes(len(b) - 64))' "$out/Image-boot-good" "$out/Image-load"
 
 vm stop >/dev/null 2>&1
-AIOS_KERNEL= AIOS_QEMU_ARGS=-snapshot vm start >/dev/null || { echo "vm-boot: the VM did not boot from disk.img" >&2; exit 2; }
+AIOS_KERNEL= AIOS_QEMU_ARGS=-snapshot vm start >/dev/null || { echo "vm-boot: the VM did not boot from aios.img" >&2; exit 2; }
 trap 'vm stop >/dev/null 2>&1' EXIT
 # /tmp は再起動で消えるので、ホームに置く
 dir=/home/ai/.vm-boot

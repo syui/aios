@@ -18,7 +18,7 @@
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
 // start、ab、bisect は長いので、うしろで動かす (自分を aish-vm start / ab / bisect で起こす)。もういちど呼ぶと様子か結果。
 // ab と bisect は、動いている VM を止めてから、-snapshot (ディスクに書き残さない) で起こしなおす。2 つの VM が同じ
-// disk.img を使うと壊れるので、同時には動かさない
+// aios.img を使うと壊れるので、同時には動かさない
 // リポジトリは dir か、いまのディレクトリから上にたどって test/vm.py があるところ、なければ $AIOS_SRC
 mod bench;
 mod sysdiff;
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / job / put / get / shot / keys / log / mon / reboot"},"bg":{"type":"boolean","description":"run: 中でうしろで動かしてすぐ答える ({job: ID})。50 秒より長いもの (ap -S firefox など) に。そのあいだも run が使える"},"id":{"type":"integer","description":"job: どれ (なければ一覧)。様子と、前に見せたところから先の出力"},"kill":{"type":"boolean","description":"job: 止める (孫まで)"},"reset_after":{"type":"number","description":"reboot: この秒でプロンプトが来なければ QEMU をリセット (止まった新しいカーネルの電源を入れなおす)"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ disk.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"off":{"type":"array","items":{"type":"string"},"description":"start: 切って起こす extra や quirk (kernel.json の off のあるもの。起動の引数 aios.off=。カーネルを直に起こすので kernel といっしょに)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル。get: 外の置き場 (既定 build/aish-vm/get/ファイル名)"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)。get: 取り出す中のファイル"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)。job: 終わるまで待つ長さ (既定 0、40000 まで)"},"dir":{"type":"string"}},"required":["op"]}"#;
+const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"start / stop / status / run / job / put / get / shot / keys / log / mon / reboot"},"bg":{"type":"boolean","description":"run: 中でうしろで動かしてすぐ答える ({job: ID})。50 秒より長いもの (ap -S firefox など) に。そのあいだも run が使える"},"id":{"type":"integer","description":"job: どれ (なければ一覧)。様子と、前に見せたところから先の出力"},"kill":{"type":"boolean","description":"job: 止める (孫まで)"},"reset_after":{"type":"number","description":"reboot: この秒でプロンプトが来なければ QEMU をリセット (止まった新しいカーネルの電源を入れなおす)"},"kernel":{"type":"string","description":"start: カーネル (ファイルのパス / . で作業中のソースから作る / git のコミット)。なければ aios.img のもの"},"www":{"type":"string","description":"start: このディレクトリを http://10.0.2.2:8000/ に出す (中から fetch で取れる)"},"snapshot":{"type":"boolean","description":"start: ディスクに書き残さない (QEMU の -snapshot)"},"off":{"type":"array","items":{"type":"string"},"description":"start: 切って起こす extra や quirk (kernel.json の off のあるもの。起動の引数 aios.off=。カーネルを直に起こすので kernel といっしょに)"},"cmd":{"type":"string","description":"run: シリアルの端末で動かすコマンド。mon: QEMU のモニタのコマンド"},"timeout":{"type":"number","description":"run: 秒 (既定 50、50 まで)"},"local":{"type":"string","description":"put: 送るファイル。get: 外の置き場 (既定 build/aish-vm/get/ファイル名)"},"remote":{"type":"string","description":"put: 中の置き場 (既定 /tmp/ファイル名)。get: 取り出す中のファイル"},"file":{"type":"string","description":"shot: png の置き場 (既定 build/aish-vm/shot.png)"},"keys":{"type":"array","items":{"type":"string"},"description":"keys: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、ほかは文字として打つ"},"lines":{"type":"integer","description":"log: 終わりから何行 (既定 40)"},"grep":{"type":"string","description":"log: この文字をふくむ行だけ"},"wait_ms":{"type":"integer","description":"start: 待つ長さ (既定 30000、50000 まで。起動しきっていなければ running。もういちど呼ぶと続きを待つ)。job: 終わるまで待つ長さ (既定 0、40000 まで)"},"dir":{"type":"string"}},"required":["op"]}"#;
 const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","description":"C のソース (main のあるもの)"},"file":{"type":"string","description":"code のかわりにソースのファイル"},"lang":{"type":"string","description":"c (既定) か c++"},"cflags":{"type":"array","items":{"type":"string"},"description":"zig cc に足すもの (-lpthread、-DX=1 など)"},"args":{"type":"string","description":"中で動かすときの引数 (シェルの書き方で)"},"timeout":{"type":"number","description":"秒 (既定 30、50 まで)"},"dir":{"type":"string"}}}"#;
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
 const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の extra や quirk のうち off のあるもの。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
@@ -550,7 +550,7 @@ fn boot_env(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str, off: 
     if !off.is_empty() {
         env.push(("AIOS_CMDLINE", format!("aios.off={}", off.join(","))));
     }
-    // panic のバックトレースを関数の名前にするため (symbolize)。disk.img のカーネルなら無い
+    // panic のバックトレースを関数の名前にするため (symbolize)。aios.img のカーネルなら無い
     let _ = match kernel {
         Some(k) => std::fs::write(booted(root), k.display().to_string()),
         None => std::fs::remove_file(booted(root)),
@@ -712,7 +712,7 @@ fn job_bisect(root: &Path, a: &Value) -> Result<Value, String> {
     vmpy(root, &["stop"], &[], Duration::from_secs(90));
     let mut r = result?;
     r["steps"] = json!(steps);
-    r["note"] = json!("only the kernel changes between steps; the disk (userland) is the current disk.img");
+    r["note"] = json!("only the kernel changes between steps; the disk (userland) is the current aios.img");
     Ok(r)
 }
 

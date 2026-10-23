@@ -1,5 +1,5 @@
 #!/bin/sh
-# rootfs/ からディスクイメージ disk.img を作る
+# rootfs/ からディスクイメージ aios.img を作る
 #   bin/mkdisk.sh [size]            GPT (既定 1G):
 #                                     区画 1: EFI System Partition (FAT32, 128 MiB) = /boot
 #                                     区画 2: Linux root (arm64) の ext4 = /
@@ -83,13 +83,13 @@ if [ "$layout" = gpt ] || [ -n "$NOBOOT" ]; then
 fi
 
 if [ "$layout" = ext4 ]; then
-  out=${OUT:-disk.img}
+  out=${OUT:-aios.img}
   mkext "$out" "${1:-1G}"
   echo "$out (${FS:-ext4}) ready"
   exit
 fi
 
-out=disk.img
+out=aios.img
 size=${1:-1G}
 esp=262144        # 128 MiB (セクタ)
 rm -f "$out"

@@ -1,4 +1,4 @@
-# main ブランチ (前の unix。unix ブランチはそのときのまま残してある): disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
+# main ブランチ (前の unix。unix ブランチはそのときのまま残してある): aios.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
 # リリース latest (タイトル aios) に aios-aarch64.img.zst を置く (前の main の Linux のものはリリース linux)。
 # ノートの 1 行目が版 ( - vVER)。使いかたは bin/run.sh
 #   base, aikernel, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
@@ -76,7 +76,7 @@ jobs:
         # (重なり、つながり、リストとビット、ぜんぶ返したら区画ごとに 1 つに戻るか)
         run: python3 test/heap.py
 
-      - name: Build disk.img
+      - name: Build aios.img
         run: |
           git config user.name ai
           git config user.email ai@syui.ai
@@ -156,7 +156,7 @@ jobs:
       - name: Assets
         run: |
           mkdir release
-          zstd -q -19 -T0 disk.img -o release/aios-aarch64.img.zst
+          zstd -q -19 -T0 aios.img -o release/aios-aarch64.img.zst
           ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
           echo "VER=$ver" >> "$GITHUB_ENV"
 

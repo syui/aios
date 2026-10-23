@@ -159,7 +159,7 @@ case "$1" in
       # 8G (空きはゼロなので .zst は小さいまま。zstd -d は sparse に書くので、ホストのディスクは使ったぶんだけ)。
       # スワップ 1G は cargo のビルドのため
       SWAP=${AIOS_RELEASE_SWAP:-1G} bin/mkdisk.sh "${AIOS_RELEASE_SIZE:-8G}"
-      zstd -q -19 -T0 -f disk.img -o "$tmp/$img"
+      zstd -q -19 -T0 -f aios.img -o "$tmp/$img"
       ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
       sha=$(git rev-parse HEAD)
     fi

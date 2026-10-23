@@ -7,6 +7,8 @@
 /desktop/target
 /aimg/target
 /build
+/aios.img
+/aios.img.part
 /disk.img
 /disk.img.part
 /repo

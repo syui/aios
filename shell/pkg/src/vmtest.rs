@@ -4,7 +4,7 @@
 //   しくじり
 //   VM は test/vm.py (-snapshot で、repo/ を http://10.0.2.2:8000/ に出したもの)。動いていなければ起こし、終わっても
 //   止めない (次の pkg_test がすぐ使えるように。止めるのは vm の stop)。動いていても -snapshot でないか、www が repo/ で
-//   ないものは使わない (disk.img に書き残したり、パッケージを取れなかったりするので)
+//   ないものは使わない (aios.img に書き残したり、パッケージを取れなかったりするので)
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,7 +37,7 @@ fn ready(root: &Path) -> Result<String, String> {
         if st["ready"] == true && st["snapshot"] == true && www.as_ref() == Some(&repo) {
             return Ok("the running VM".into());
         }
-        return Err("a VM is running without -snapshot or without www=repo/ (installing would write to disk.img, or could not reach the packages): stop it (vm stop) and pkg_test starts its own".into());
+        return Err("a VM is running without -snapshot or without www=repo/ (installing would write to aios.img, or could not reach the packages): stop it (vm stop) and pkg_test starts its own".into());
     }
     let (code, out, err) = vmpy(root, &["start", "--www", "repo"], &[("AIOS_QEMU_ARGS", "-snapshot")]);
     let r = last_json(&out);
