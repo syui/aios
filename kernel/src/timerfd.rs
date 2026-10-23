@@ -2,6 +2,7 @@
 // read で、前に読んでから何回期限が来たか (u64) が返る。interval があればくりかえす。
 // 期限が来たかは、読むとき・poll のとき・タイマの割り込み (tick、cpu0 で 1/100 秒ごと) に見る。
 // 時刻はみな起動からの ns (CLOCK_MONOTONIC) で覚える。CLOCK_REALTIME の絶対時刻は、決めたときに直す
+use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::proc;
 use alloc::rc::{Rc, Weak};
@@ -34,10 +35,11 @@ pub struct TimerFd {
 pub type TimerRef = Rc<RefCell<TimerFd>>;
 
 /// 動いているタイマ (tick で見る)
-static mut ARMED: Vec<Weak<RefCell<TimerFd>>> = Vec::new();
+static ARMED: Bkl<Vec<Weak<RefCell<TimerFd>>>> = Bkl::new(Vec::new());
 
+#[track_caller]
 fn armed() -> &'static mut Vec<Weak<RefCell<TimerFd>>> {
-    unsafe { &mut *(&raw mut ARMED) }
+    ARMED.get()
 }
 
 pub fn chan(t: &TimerRef) -> usize {

@@ -5,6 +5,7 @@
 // read は struct inotify_event (wd, mask, cookie, len, name) を並べて返す。名前は 16 バイトにそろえる (Linux と同じ)。
 // 同じできごとが続けば 1 つにまとめる (書くたびの IN_MODIFY があふれないように)。
 // 見張っている人がいなければ、知らせるところはすぐ戻る
+use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::proc;
 use crate::vfs::{self, InodeRef};
@@ -74,11 +75,12 @@ pub static ACCESS_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::
 pub static NAME_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// 生きている inotify (見張りがあるかを速く知るため)
-static mut LIST: Vec<Weak<RefCell<Inotify>>> = Vec::new();
-static mut COOKIE: u32 = 0;
+static LIST: Bkl<Vec<Weak<RefCell<Inotify>>>> = Bkl::new(Vec::new());
+static COOKIE: Bkl<u32> = Bkl::new(0);
 
+#[track_caller]
 fn list() -> &'static mut Vec<Weak<RefCell<Inotify>>> {
-    unsafe { &mut *(&raw mut LIST) }
+    LIST.get()
 }
 
 /// poll で見張るときの印 (poll_keys) にも
@@ -303,10 +305,9 @@ pub fn gone(ino: &InodeRef) {
 
 /// rename の MOVED_FROM と MOVED_TO をつなぐ番号
 pub fn cookie() -> u32 {
-    unsafe {
-        COOKIE = COOKIE.wrapping_add(1).max(1);
-        COOKIE
-    }
+    let c = COOKIE.get();
+    *c = c.wrapping_add(1).max(1);
+    *c
 }
 
 pub fn read(n: &InotifyRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {

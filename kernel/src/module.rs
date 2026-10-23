@@ -5,6 +5,7 @@
 // 「aios-module NAME」と書いた札で、カーネルはそれを読んで NAME のドライバを起こす。
 // 起動のときに起こすものは /etc/modules-load.d/*.conf に書く (init が読む。systemd と同じ)。
 // 起こしたものは /proc/modules に出る。止める (rmmod) のはまだできない (EBUSY)
+use crate::cell::Bkl;
 use alloc::string::String;
 
 struct Module {
@@ -14,19 +15,20 @@ struct Module {
     loaded: bool,
 }
 
-static mut MODULES: [Module; 3] = [
+static MODULES: Bkl<[Module; 3]> = Bkl::new([
     Module { name: "virtio_gpu", init: crate::gpu::init, loaded: false },
     Module { name: "virtio_input", init: input_init, loaded: false },
     Module { name: "virtio_snd", init: crate::sound::init, loaded: false },
-];
+]);
 
 fn input_init() -> bool {
     crate::input::init();
     crate::input::count() > 0
 }
 
+#[track_caller]
 fn modules() -> &'static mut [Module; 3] {
-    unsafe { &mut *(&raw mut MODULES) }
+    MODULES.get()
 }
 
 const EPERM: i64 = 1;

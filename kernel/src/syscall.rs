@@ -1,5 +1,6 @@
 // aarch64 Linux 互換のシステムコール
 // 番号は x8、引数は x0..x5、戻り値は x0 (エラーは -errno)
+use crate::cell::Bkl;
 use crate::cred;
 use crate::proc;
 use crate::signal::{self, Restart};
@@ -674,7 +675,7 @@ const EINTR_: i64 = 4;
 /// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える。
 /// 数えるのは一度読まれてから (ふだんは数えない: 表を引くのが重く、pid ごとに増えつづけるので)。
 /// 表が COUNTS_MAX をこえたら、新しいものは数えない
-static mut COUNTS: alloc::collections::BTreeMap<([u8; 16], u32, u64), u64> = alloc::collections::BTreeMap::new();
+static COUNTS: Bkl<alloc::collections::BTreeMap<([u8; 16], u32, u64), u64>> = Bkl::new(alloc::collections::BTreeMap::new());
 static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
 
 static COUNTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -686,13 +687,11 @@ fn count(nr: u64) {
     }
     // スレッドの名前 (pthread_setname_np) ごと
     let p = proc::current();
-    unsafe {
-        let m = &mut *(&raw mut COUNTS);
-        if let Some(n) = m.get_mut(&(p.comm, p.pid, nr)) {
-            *n += 1;
-        } else if m.len() < COUNTS_MAX {
-            m.insert((p.comm, p.pid, nr), 1);
-        }
+    let m = COUNTS.get();
+    if let Some(n) = m.get_mut(&(p.comm, p.pid, nr)) {
+        *n += 1;
+    } else if m.len() < COUNTS_MAX {
+        m.insert((p.comm, p.pid, nr), 1);
     }
 }
 
@@ -700,7 +699,7 @@ fn count(nr: u64) {
 pub fn sysstat() -> alloc::string::String {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
-    let m = unsafe { core::mem::take(&mut *(&raw mut COUNTS)) };
+    let m = core::mem::take(COUNTS.get());
     if !COUNTING.swap(true, Ordering::Relaxed) {
         return "(数えはじめました。もう一度読むと、そのあいだの回数が出ます)\n".into();
     }
@@ -722,26 +721,24 @@ pub fn sysstat() -> alloc::string::String {
 
 /// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを kmsg に出す (調べもの用。dmesg と aish-sys の strace で読む)。
 /// 名前の頭に + をつけると、うまくいったものも出す。名前は , で区切っていくつも書ける
-static mut STRACE: [u8; 16] = [0; 16];
+static STRACE: Bkl<[u8; 16]> = Bkl::new([0; 16]);
 
 pub fn strace_set(name: &[u8]) {
     let n = name.iter().position(|&c| c == b'\n' || c == 0).unwrap_or(name.len()).min(15);
-    unsafe {
-        let s = &mut *(&raw mut STRACE);
-        s.fill(0);
-        s[..n].copy_from_slice(&name[..n]);
-    }
+    let s = STRACE.get();
+    s.fill(0);
+    s[..n].copy_from_slice(&name[..n]);
 }
 
 pub fn strace_get() -> alloc::string::String {
-    let s = unsafe { &*(&raw const STRACE) };
+    let s = &*STRACE.get();
     let n = s.iter().position(|&c| c == 0).unwrap_or(16);
     alloc::format!("{}\n", core::str::from_utf8(&s[..n]).unwrap_or(""))
 }
 
 /// いまのプロセスを strace で見ているか (見るなら、うまくいったものも出すか)
 fn strace_on() -> Option<bool> {
-    let s = unsafe { &*(&raw const STRACE) };
+    let s = &*STRACE.get();
     let n = s.iter().position(|&c| c == 0).unwrap_or(16);
     if n == 0 {
         return None;
@@ -755,7 +752,7 @@ fn strace_on() -> Option<bool> {
 /// 名前が書かれていなければ (ふだん) なにもしない。それを見るところだけ呼ぶ側に
 #[inline]
 fn strace(nr: u64, a: &[u64], r: R) {
-    if unsafe { (*(&raw const STRACE))[0] } != 0 {
+    if STRACE.get()[0] != 0 {
         strace_named(nr, a, r);
     }
 }
@@ -1439,27 +1436,24 @@ const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 
 /// 調べるための記録: 最近の futex の WAKE (tgid, tid, アドレス, op, 起こした数)。/proc/PID/stack に出す
-static mut FUTEX_LOG: [(u32, u32, usize, u64, usize); 256] = [(0, 0, 0, 0, 0); 256];
-static mut FUTEX_LOG_AT: usize = 0;
+static FUTEX_LOG: Bkl<[(u32, u32, usize, u64, usize); 256]> = Bkl::new([(0, 0, 0, 0, 0); 256]);
+static FUTEX_LOG_AT: Bkl<usize> = Bkl::new(0);
 
 fn futex_log(tgid: u32, tid: u32, uaddr: usize, op: u64, n: usize) {
-    unsafe {
-        let i = FUTEX_LOG_AT % 256;
-        (*(&raw mut FUTEX_LOG))[i] = (tgid, tid, uaddr, op, n);
-        FUTEX_LOG_AT += 1;
-    }
+    let at = FUTEX_LOG_AT.get();
+    FUTEX_LOG.get()[*at % 256] = (tgid, tid, uaddr, op, n);
+    *at += 1;
 }
 
 /// tgid の最近の futex の WAKE (古い順)
 pub fn futex_wakes(tgid: u32) -> alloc::vec::Vec<(u32, usize, u64, usize)> {
     let mut v = alloc::vec::Vec::new();
-    unsafe {
-        let at = FUTEX_LOG_AT;
-        for k in at.saturating_sub(256)..at {
-            let (t, tid, a, op, n) = (*(&raw const FUTEX_LOG))[k % 256];
-            if t == tgid {
-                v.push((tid, a, op, n));
-            }
+    let at = *FUTEX_LOG_AT.get();
+    let log = FUTEX_LOG.get();
+    for k in at.saturating_sub(256)..at {
+        let (t, tid, a, op, n) = log[k % 256];
+        if t == tgid {
+            v.push((tid, a, op, n));
         }
     }
     v

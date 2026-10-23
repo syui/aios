@@ -572,6 +572,8 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさ {} IN_ACCESS の見張り {} fd の表を分けている {} 開いたファイルを分けている {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
+    // BKL が守るもの (cell::Bkl) を、BKL を持たずに触った場所 (あってはいけない。test/vm-check.sh が見る)
+    s.push_str(&crate::cell::unlocked_text());
     s
 }
 

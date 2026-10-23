@@ -1,4 +1,5 @@
 // VFS: ファイルシステムの共通の形と、パスの探索、マウント
+use crate::cell::Bkl;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -247,28 +248,24 @@ pub fn drop_privs(ino: &InodeRef) -> Result<(), i64> {
     Ok(())
 }
 
-static mut ROOT: Option<InodeRef> = None;
+static ROOT: Bkl<Option<InodeRef>> = Bkl::new(None);
 /// ルートの (もと, 種類) (/proc/mounts の 1 行目)
-static mut ROOT_INFO: (String, String) = (String::new(), String::new());
-static mut NEXT_FS: usize = 0;
+static ROOT_INFO: Bkl<(String, String)> = Bkl::new((String::new(), String::new()));
+static NEXT_FS: Bkl<usize> = Bkl::new(0);
 
 pub fn new_fs_id() -> usize {
-    unsafe {
-        NEXT_FS += 1;
-        NEXT_FS
-    }
+    *NEXT_FS.get() += 1;
+    *NEXT_FS.get()
 }
 
 pub fn set_root(r: InodeRef, source: &str, fstype: &str) {
     names_changed();
-    unsafe {
-        *(&raw mut ROOT) = Some(r);
-        *(&raw mut ROOT_INFO) = (source.into(), fstype.into());
-    }
+    *ROOT.get() = Some(r);
+    *ROOT_INFO.get() = (source.into(), fstype.into());
 }
 
 pub fn root() -> InodeRef {
-    unsafe { (*(&raw const ROOT)).clone().expect("no root filesystem") }
+    ROOT.get().clone().expect("no root filesystem")
 }
 
 // ---- マウント表と、マウントの namespace ----
@@ -295,16 +292,14 @@ pub struct MountNs {
     list: core::cell::RefCell<Vec<Mount>>,
 }
 
-static mut INIT_MNT: Option<Rc<MountNs>> = None;
+static INIT_MNT: Bkl<Option<Rc<MountNs>>> = Bkl::new(None);
 /// 生きている表 (sync で全部を書き出すため)
-static mut ALL_MNT: Vec<alloc::rc::Weak<MountNs>> = Vec::new();
+static ALL_MNT: Bkl<Vec<alloc::rc::Weak<MountNs>>> = Bkl::new(Vec::new());
 
 fn init_mnt() -> Rc<MountNs> {
-    unsafe {
-        (*(&raw mut INIT_MNT))
-            .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, list: core::cell::RefCell::new(Vec::new()) }))
-            .clone()
-    }
+    (*INIT_MNT.get())
+        .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, list: core::cell::RefCell::new(Vec::new()) }))
+        .clone()
 }
 
 /// いまのプロセスのマウント表
@@ -315,11 +310,9 @@ fn current_mnt() -> Rc<MountNs> {
 /// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)
 pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
     let n = Rc::new(MountNs { id, owner, list: core::cell::RefCell::new(current_mnt().list.borrow().clone()) });
-    unsafe {
-        let all = &mut *(&raw mut ALL_MNT);
-        all.retain(|w| w.strong_count() > 0);
-        all.push(Rc::downgrade(&n));
-    }
+    let all = ALL_MNT.get();
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Rc::downgrade(&n));
     n
 }
 
@@ -396,7 +389,7 @@ pub fn mounts_text() -> String {
 
 /// /proc/PID/mounts (ns の表。None ははじめのもの)
 pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
-    let (src, ty) = unsafe { (*(&raw const ROOT_INFO)).clone() };
+    let (src, ty) = ROOT_INFO.get().clone();
     let mut s = alloc::format!("{} / {} rw 0 0\n", src, ty);
     for m in ns.unwrap_or_else(init_mnt).list.borrow().iter() {
         s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", m.source, m.target, m.fstype, if m.ro { "ro" } else { "rw" }));
@@ -408,9 +401,9 @@ pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
 pub fn sync_all() {
     // MAP_SHARED で書いたページを先にファイルへ
     crate::vm::sync_shared();
-    let mut roots: Vec<InodeRef> = unsafe { (*(&raw const ROOT)).iter().cloned().collect() };
+    let mut roots: Vec<InodeRef> = ROOT.get().iter().cloned().collect();
     let mut tables = alloc::vec![init_mnt()];
-    tables.extend(unsafe { (*(&raw const ALL_MNT)).iter().filter_map(|w| w.upgrade()) });
+    tables.extend(ALL_MNT.get().iter().filter_map(|w| w.upgrade()));
     for t in tables {
         roots.extend(t.list.borrow().iter().map(|m| m.root.clone()));
     }
@@ -422,16 +415,14 @@ pub fn sync_all() {
 }
 
 /// 次に暇なときに書き出す時刻 (ticks)
-static mut NEXT_IDLE_SYNC: u64 = 0;
+static NEXT_IDLE_SYNC: Bkl<u64> = Bkl::new(0);
 
 /// することがないとき (スケジューラから): 1 秒ごとに書き出す
 pub fn idle_sync() {
     let now = crate::timer::ticks();
-    unsafe {
-        if now >= NEXT_IDLE_SYNC {
-            NEXT_IDLE_SYNC = now + crate::timer::HZ;
-            sync_all();
-        }
+    if now >= *NEXT_IDLE_SYNC.get() {
+        *NEXT_IDLE_SYNC.get() = now + crate::timer::HZ;
+        sync_all();
     }
 }
 
@@ -526,12 +517,12 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     // 文字の上で畳むと Linux とちがうパス (normal) は、1 つずつたどる (覚えない)。畳んだパスは使いまわしの
     // 入れもの (NORM) に作り、覚えにあれば鍵を作らずに答える (なかったときだけ、写して鍵にする)
     // (覚えを捨てるのは先に: inode を捨てると ext4 の後片づけが動くので、NORM を作ってから使うまでのあいだには何もしない)
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     if PATHS_ALL.swap(false, core::sync::atomic::Ordering::Relaxed) {
         let old = core::mem::take(cache);
         drop(old);
     }
-    let norm = unsafe { &mut *(&raw mut NORM) };
+    let norm = NORM.get();
     if !normal_into(norm, cwd, path, true) {
         let start = (resolve("", cwd, true)?, cwd.to_string());
         let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
@@ -649,7 +640,7 @@ struct PathEntry {
 impl PathEntry {
     fn new(found: Option<(String, InodeRef)>, dirs: Vec<Pass>, gates: Vec<Gate>) -> PathEntry {
         if let Some((_, i)) = &found {
-            *unsafe { &mut *(&raw mut HOLDS) }.entry(i.id()).or_insert(0) += 1;
+            *HOLDS.get().entry(i.id()).or_insert(0) += 1;
         }
         PathEntry { found, used: false, dirs, gates, checked: CHANGES.load(core::sync::atomic::Ordering::Acquire) }
     }
@@ -671,7 +662,7 @@ impl PathEntry {
 impl Drop for PathEntry {
     fn drop(&mut self) {
         if let Some((_, i)) = &self.found {
-            let h = unsafe { &mut *(&raw mut HOLDS) };
+            let h = HOLDS.get();
             if let Some(n) = h.get_mut(&i.id()) {
                 *n -= 1;
                 if *n == 0 {
@@ -683,7 +674,7 @@ impl Drop for PathEntry {
 }
 
 /// inode (id) ごとの、それを持っている覚えの数 (ext4 は引くたびに別の InodeRef を作るので、Rc の数ではわからない)
-static mut HOLDS: alloc::collections::BTreeMap<(usize, u64), u32> = alloc::collections::BTreeMap::new();
+static HOLDS: Bkl<alloc::collections::BTreeMap<(usize, u64), u32>> = Bkl::new(alloc::collections::BTreeMap::new());
 
 /// だれでもは通れないディレクトリの、通れるかを決める属性 (Meta まるごとでは大きいので)
 #[derive(Clone)]
@@ -788,7 +779,7 @@ fn path_hash(mnt: u64, path: &str, follow: bool) -> u64 {
     (h.rotate_left(5) ^ u64::from_le_bytes(last) ^ b.len() as u64).wrapping_mul(0x51_7cc1_b727_220a_95)
 }
 
-static mut PATHS: alloc::collections::BTreeMap<PathKey, PathEntry> = alloc::collections::BTreeMap::new();
+static PATHS: Bkl<alloc::collections::BTreeMap<PathKey, PathEntry>> = Bkl::new(alloc::collections::BTreeMap::new());
 /// 版の表: (ディレクトリ, 名前の印) ごとに、その名前が変わる (作る・消す・名前を変える) たびに増やす数。印 ATTR は
 /// ディレクトリの属性 (chmod、chown) の版。覚えは、通ったところの版を持っていて、引くときにちがえば古い (Linux の
 /// dcache の d_seq のように、変わったときに覚えをみな見なおさない)。表は開番地法のハッシュ表 (キーはそのまま
@@ -941,7 +932,7 @@ pub fn forget(full: &str) {
 /// 入れ、覚えを捨てたときに片づける (inode とスーパーブロックを 2 度ずつ書く)。Linux の d_delete も、dentry を
 /// 使っているのが自分だけなら、その場で inode を手放す。消せなかったときは、次に引いたときに覚えなおす
 pub fn forget_path(full: &str) -> Option<(usize, u64)> {
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     let mnt = current_mnt().id;
     let mut held = None;
     for follow in [true, false] {
@@ -955,15 +946,15 @@ pub fn forget_path(full: &str) -> Option<(usize, u64)> {
 /// ほかの書きかた (リンクやバインドマウントを通ったパス) の覚えも、消えたもの (リンクが 0) を持っていれば捨てる。
 /// まだ持っている覚えがあるときだけ全部を見る (rm -r のように 1 つずつ消すときは、ふつう見ない)
 pub fn forget_gone(id: (usize, u64)) {
-    if !unsafe { (*(&raw const HOLDS)).contains_key(&id) } {
+    if !HOLDS.get().contains_key(&id) {
         return;
     }
     // リンクの数は表をなめる外で見る (inode を読むと、ディスクを待って眠るかもしれない)
-    let holder = unsafe { (*(&raw const PATHS)).values().find_map(|e| e.found.as_ref().filter(|(_, x)| x.id() == id).map(|(_, x)| x.clone())) };
+    let holder = PATHS.get().values().find_map(|e| e.found.as_ref().filter(|(_, x)| x.id() == id).map(|(_, x)| x.clone()));
     if holder.is_none_or(|x| x.meta().nlink != 0) {
         return;
     }
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     cache.retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
 }
 
@@ -974,7 +965,7 @@ pub fn remember_new(full: &str, parent: &InodeRef, name: &str, ino: &InodeRef) {
     if !ino.path_cacheable() || heap_crowded() || PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     let Some(cut) = full.rfind('/') else { return };
     let mnt = current_mnt().id;
     let full_len = cache.len();
@@ -1014,7 +1005,7 @@ pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Opti
     if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     let e = cache.get_mut(PathKeyRef::new(current_mnt().id, norm, follow).key())?;
     let same = match (&e.found, ino) {
         (Some((_, i)), Some(ino)) => i.id() == ino.id(),
@@ -1033,7 +1024,7 @@ pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Opti
 
 /// いま覚えている数と、そのうちないもの (/proc/bkl)
 pub fn paths_len() -> (usize, usize) {
-    let cache = unsafe { &*(&raw const PATHS) };
+    let cache = &*PATHS.get();
     (cache.len(), cache.values().filter(|e| e.found.is_none()).count())
 }
 
@@ -1055,7 +1046,7 @@ pub fn paths_json() -> String {
 
 /// id の inode の名前 (パスの覚えにあれば。/proc/ai/mem のページキャッシュのファイルの名前)
 pub fn path_of_id(id: (usize, u64)) -> Option<String> {
-    let cache = unsafe { &*(&raw const PATHS) };
+    let cache = &*PATHS.get();
     cache.values().filter_map(|e| e.found.as_ref()).find(|(_, i)| i.id() == id).map(|(w, _)| alloc::format!("/{}", w))
 }
 
@@ -1063,8 +1054,8 @@ pub fn path_of_id(id: (usize, u64)) -> Option<String> {
 pub fn mounts_json() -> String {
     let esc = crate::aiproc::esc;
     let stats = |i: Option<&InodeRef>| i.and_then(|i| i.fs_stats()).unwrap_or_else(|| String::from("null"));
-    let (src, ty) = unsafe { (*(&raw const ROOT_INFO)).clone() };
-    let root = unsafe { (*(&raw const ROOT)).clone() };
+    let (src, ty) = ROOT_INFO.get().clone();
+    let root = ROOT.get().clone();
     let mut v = alloc::vec![alloc::format!("{{\"target\":\"/\",\"source\":\"{}\",\"type\":\"{}\",\"ro\":false,\"stats\":{}}}", esc(&src), esc(&ty), stats(root.as_ref()))];
     for m in init_mnt().list.borrow().iter() {
         v.push(alloc::format!(
@@ -1236,7 +1227,7 @@ pub fn cached_ino_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -
 }
 
 /// 覚えを引くだけのときに、畳んだパスを作る入れもの (大きなロックの中で使い、毎回 String を作らない)
-static mut NORM: String = String::new();
+static NORM: Bkl<String> = Bkl::new(String::new());
 
 /// cached_at の中身。見つかったものは f(たどったパス, inode) に。walk なら、覚えになくて dir の上を通れるとき
 /// dir のパスからたどる (lookup_by)。引くだけのときは、パスの入れものも鍵も作らない (NORM と PathKeyRef)
@@ -1245,7 +1236,7 @@ fn cached_at_by<T>(dir: &InodeRef, dir_path: &str, path: &str, follow: bool, wal
         return None;
     }
     let base = dir_path.trim_matches('/');
-    let norm = unsafe { &mut *(&raw mut NORM) };
+    let norm = NORM.get();
     if !normal_into(norm, base, path, true) {
         return None;
     }
@@ -1254,7 +1245,7 @@ fn cached_at_by<T>(dir: &InodeRef, dir_path: &str, path: &str, follow: bool, wal
         return None;
     }
     let mnt = current_mnt().id;
-    let cache = unsafe { &mut *(&raw mut PATHS) };
+    let cache = PATHS.get();
     let e0 = cache.get_mut(PathKeyRef::new(mnt, base, true).key())?;
     if !e0.fresh() || !e0.found.as_ref().is_some_and(|(_, i)| i.id() == dir.id()) {
         return None;

@@ -25,6 +25,7 @@
 //               pcmiss on|off ページキャッシュに無かったものを kmsg に
 //               strace NAME   /proc/strace と同じ (+NAME でうまくいったものも、空で止める)
 //               bkl reset     /proc/bkl を 0 から
+//               bkl selftest  BKL が守るもの (cell::Bkl) の見はりが効いているか (BKL を放して触る。kmsg に bkl: selftest ok)
 //               heap trace on|off  /proc/ai/heap に、ヒープをいま多く持っている場所 (呼び出しの番地) も出す
 //               heap check    ヒープの空きの管理 (tlsf) の決まりを確かめて kmsg に (heap: check ok / FAILED)
 //               heap hog N    N MiB をわざと取って持っておく (足りなくなったときの道: 足す、捨てる、ENOMEM。0 で返す)
@@ -205,7 +206,7 @@ pub fn fs_json() -> String {
     )
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nheap trace on|off\nheap check\nheap hog N\npage cycle\npage check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nbkl selftest\nheap trace on|off\nheap check\nheap hog N\npage cycle\npage check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -221,6 +222,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "pcmiss" => crate::vm::MISS_LOG.store(arg != "off", core::sync::atomic::Ordering::Relaxed),
         "strace" => crate::syscall::strace_set(arg.as_bytes()),
         "bkl" if arg == "reset" => crate::smp::stats_reset(),
+        "bkl" if arg == "selftest" => crate::cell::selftest(),
         "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),
         "heap" if arg.starts_with("hog ") => {
             crate::heap::hog(arg[4..].trim().parse::<usize>().map_err(|_| crate::why::inval())?);

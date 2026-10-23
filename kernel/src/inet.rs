@@ -18,6 +18,7 @@
 //
 // 大きなロックの中で動く (Rc と RefCell)。借りたまま眠らない、2 つのソケットを同時に借りない (自分につないだものは
 // 相手が自分)
+use crate::cell::Bkl;
 use crate::file::{self, FileRef, Kind, Stat};
 use crate::net;
 use crate::proc;
@@ -305,37 +306,42 @@ type R = Result<i64, i64>;
 
 /// ポートの表: (NET, TCP か, ポート) → そこにいるもの (pseq の順 = bind した順。accept を待つ子や TIME_WAIT も
 /// listen しているもののポートにいる: Linux の inet_inherit_port)
-static mut PORTS: BTreeMap<(u64, bool, u16), BTreeMap<u64, W>> = BTreeMap::new();
-static mut PSEQ: u64 = 0;
+static PORTS: Bkl<BTreeMap<(u64, bool, u16), BTreeMap<u64, W>>> = Bkl::new(BTreeMap::new());
+static PSEQ: Bkl<u64> = Bkl::new(0);
 /// listen しているものだけ: (NET, ポート) → pseq の順。listen をやめたものは lookup_listener で掃く
-static mut LISTENERS: BTreeMap<(u64, u16), BTreeMap<u64, W>> = BTreeMap::new();
+static LISTENERS: Bkl<BTreeMap<(u64, u16), BTreeMap<u64, W>>> = Bkl::new(BTreeMap::new());
 /// fd がなくなっても残っているもの (FIN_WAIT2、TIME_WAIT、LAST_ACK)
-static mut ORPHANS: BTreeMap<usize, InetRef> = BTreeMap::new();
+static ORPHANS: Bkl<BTreeMap<usize, InetRef>> = Bkl::new(BTreeMap::new());
 /// すべて (/proc/net/tcp と udp)。消えたものは new_sock で掃く (数が SWEEP をこえたときだけ: 均せば 1 つに O(1))
-static mut ALL: Vec<W> = Vec::new();
-static mut SWEEP: usize = 64;
+static ALL: Bkl<Vec<W>> = Bkl::new(Vec::new());
+static SWEEP: Bkl<usize> = Bkl::new(64);
 /// 時刻でやることがあるもの: (その時刻, key) の順 (SYN のやりなおし、FIN_WAIT2 / TIME_WAIT の終わり)。tick は
 /// 時刻の来たものだけを見る
-static mut TIMED: BTreeMap<(u64, usize), W> = BTreeMap::new();
+static TIMED: Bkl<BTreeMap<(u64, usize), W>> = Bkl::new(BTreeMap::new());
 
+#[track_caller]
 fn ports() -> &'static mut BTreeMap<(u64, bool, u16), BTreeMap<u64, W>> {
-    unsafe { &mut *(&raw mut PORTS) }
+    PORTS.get()
 }
 
+#[track_caller]
 fn listeners() -> &'static mut BTreeMap<(u64, u16), BTreeMap<u64, W>> {
-    unsafe { &mut *(&raw mut LISTENERS) }
+    LISTENERS.get()
 }
 
+#[track_caller]
 fn orphans() -> &'static mut BTreeMap<usize, InetRef> {
-    unsafe { &mut *(&raw mut ORPHANS) }
+    ORPHANS.get()
 }
 
+#[track_caller]
 fn all() -> &'static mut Vec<W> {
-    unsafe { &mut *(&raw mut ALL) }
+    ALL.get()
 }
 
+#[track_caller]
 fn timed() -> &'static mut BTreeMap<(u64, usize), W> {
-    unsafe { &mut *(&raw mut TIMED) }
+    TIMED.get()
 }
 
 fn key(u: &InetRef) -> usize {
@@ -477,7 +483,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         generation: 0,
     }));
     let a = all();
-    let sweep = unsafe { &mut *(&raw mut SWEEP) };
+    let sweep = SWEEP.get();
     if a.len() >= *sweep {
         a.retain(|w| w.strong_count() > 0);
         *sweep = (a.len() * 2).max(64);
@@ -591,9 +597,10 @@ fn port_free(netns: u64, tcp: bool, port: u16) -> bool {
 fn hash_port(u: &InetRef, port: u16) {
     let (k, q) = {
         let mut s = u.borrow_mut();
-        let q = unsafe {
-            PSEQ += 1;
-            PSEQ
+        let q = {
+            let n = PSEQ.get();
+            *n += 1;
+            *n
         };
         s.num = port;
         s.sport = port;

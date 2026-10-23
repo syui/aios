@@ -3002,10 +3002,10 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
 }
 
 /// FIFO の inode ごとのパイプ (誰かが開いている間だけ生きている)
-static mut FIFOS: alloc::vec::Vec<((usize, u64), alloc::rc::Weak<crate::file::PipeCell>)> = alloc::vec::Vec::new();
+static FIFOS: crate::cell::Bkl<alloc::vec::Vec<((usize, u64), alloc::rc::Weak<crate::file::PipeCell>)>> = crate::cell::Bkl::new(alloc::vec::Vec::new());
 
 fn fifo_pipe(ino: &InodeRef) -> alloc::rc::Rc<crate::file::PipeCell> {
-    let fifos = unsafe { &mut *(&raw mut FIFOS) };
+    let fifos = FIFOS.get();
     fifos.retain(|(_, w)| w.strong_count() > 0);
     if let Some(p) = fifos.iter().find(|(id, _)| *id == ino.id()).and_then(|(_, w)| w.upgrade()) {
         return p;

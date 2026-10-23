@@ -1,4 +1,5 @@
 // tmpfs: メモリ上のファイルシステム
+use crate::cell::Bkl;
 use crate::vfs::*;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -308,11 +309,11 @@ pub const F_SEAL_WRITE: u32 = 8;
 pub const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 pub const F_SEAL_EXEC: u32 = 0x20;
 
-static mut NEXT_INO: u64 = 1;
+static NEXT_INO: Bkl<u64> = Bkl::new(1);
 
 /// inode の数と上限 (ヒープを使いきらないように: 1 つ 300 バイトほどで、作りつづけるとヒープが足りなくなる。
 /// 上限で ENOSPC。Linux の nr_inodes と同じ考え。ヒープの大きさに合わせて: 64 MiB で 65536)
-static mut INODES: usize = 0;
+static INODES: Bkl<usize> = Bkl::new(0);
 
 fn inode_limit() -> usize {
     (crate::heap::size() / 1024).max(65536)
@@ -320,12 +321,12 @@ fn inode_limit() -> usize {
 
 /// (いまの inode の数, 上限)。/proc/ai/mem の tmpfs
 pub fn inodes() -> (usize, usize) {
-    (unsafe { INODES }, inode_limit())
+    (*INODES.get(), inode_limit())
 }
 
 impl Drop for TmpInode {
     fn drop(&mut self) {
-        unsafe { INODES -= 1 };
+        *INODES.get() -= 1;
         // 写したページ (MAP_PRIVATE) がページキャッシュに残っていれば捨てる (番号はまた使わないが、残ったままになる)
         crate::vm::file_changed((self.fs, self.ino));
     }
@@ -338,10 +339,11 @@ fn now() -> u64 {
 
 impl TmpInode {
     fn new(fs: usize, mode: u32, node: Node) -> Rc<TmpInode> {
-        unsafe { INODES += 1 };
-        let ino = unsafe {
-            NEXT_INO += 1;
-            NEXT_INO
+        *INODES.get() += 1;
+        let ino = {
+            let n = NEXT_INO.get();
+            *n += 1;
+            *n
         };
         let nlink = if matches!(node, Node::Dir(_)) { 2 } else { 1 };
         let t = now();
@@ -661,7 +663,7 @@ impl Inode for TmpInode {
     }
 
     fn create(&self, name: &str, mode: u32, node: NewNode) -> Result<InodeRef, i64> {
-        if unsafe { INODES } >= inode_limit() {
+        if *INODES.get() >= inode_limit() {
             return Err(-ENOSPC);
         }
         crate::vfs::name_changed(self.id(), name);
@@ -690,7 +692,7 @@ impl Inode for TmpInode {
         if !matches!(*self.node.borrow(), Node::Dir(_)) {
             return Err(-ENOTDIR);
         }
-        if unsafe { INODES } >= inode_limit() {
+        if *INODES.get() >= inode_limit() {
             return Err(-ENOSPC);
         }
         let t = TmpInode::new(self.fs, S_IFREG | (mode & 0o7777), Node::File(Data::Owned(Pages::new())));

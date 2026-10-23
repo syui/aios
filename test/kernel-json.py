@@ -168,6 +168,17 @@ print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
+# static mut (だれが守るのかを書いていない。BKL を外した道が触っても、Rust のコンパイラは何も言わない) は増やさない:
+# kernel/src/cell.rs の Bkl (大きなロック) や Once (1 度だけ入れる)、atomic、SpinLock にする。減ったら STATIC_MUT_MAX も
+# 下げる (ちがえば落ちる: 戻らないように)
+STATIC_MUT_MAX = 42
+static_mut = [(s, i + 1) for s in sources for i, l in enumerate(text[s].split("\n")) if re.match(r"\s*(pub(\(\w+\))?\s+)?static mut ", l)]
+if len(static_mut) > STATIC_MUT_MAX:
+    err("static mut: %d, more than %d: use cell::Bkl / cell::Once, an atomic or a SpinLock (%s)" % (len(static_mut), STATIC_MUT_MAX, " ".join("%s:%d" % x for x in static_mut)))
+elif len(static_mut) < STATIC_MUT_MAX:
+    err("static mut: %d, fewer than %d: lower STATIC_MUT_MAX in test/kernel-json.py" % (len(static_mut), STATIC_MUT_MAX))
+cells = {c: sum(1 for t in text.values() for l in t.split("\n") if re.match(r"\s*(pub(\(\w+\))?\s+)?static \w+: (crate::cell::)?%s<" % c, l)) for c in ("Bkl", "Once")}
+print("static mut %d (cell::Bkl %d, cell::Once %d)" % (len(static_mut), cells["Bkl"], cells["Once"]))
 print("chosen (aios がえらんだちがい) %d: %s" % (len(chosen), " ".join(chosen)))
 print("linux bugs (手本の Linux のまちがい) %d: %s" % (len(linux_bugs), " ".join(linux_bugs)))
 print("kernel-json: %d failed" % len(errors))

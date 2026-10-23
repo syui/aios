@@ -145,6 +145,8 @@ jobs:
           else
             st=1
           fi
+          # ここまでのどれかが、大きなロック (BKL) が守るもの (kernel/src/cell.rs の Bkl) を BKL なしで触っていない
+          python3 test/vm.py run '! grep "^unlocked" /proc/bkl' -t 60 || st=1
           # 失敗したら、シリアルの終わりを見せる (中で何が起きたか)
           [ "$st" = 0 ] || python3 test/vm.py log 60
           python3 test/vm.py stop || true

@@ -13,6 +13,7 @@
 //! ほかの持ち主が外すまで眠る。POSIX どうしの行きどまり (自分を待っている人を待つ) は EDEADLK (Linux と同じく、
 //! 聞く側が OFD なら見ない)。ファイルごとの並びは Linux と同じ: 持ち主ははじめてかけた順、持ち主の中は始まりの順
 //! (F_GETLK は、ぶつかるもののうち並びで先のものを答える)
+use crate::cell::Bkl;
 use crate::file::{FileRef, Kind, OpenFile};
 use crate::proc;
 use alloc::collections::BTreeMap;
@@ -56,21 +57,24 @@ struct Flock {
 }
 
 /// ファイル (鍵) ごとのレコードロックの並び (Linux の flc_posix と同じ順)
-static mut RECS: BTreeMap<Key, Vec<Rec>> = BTreeMap::new();
-static mut FLOCKS: BTreeMap<Key, Vec<Flock>> = BTreeMap::new();
+static RECS: Bkl<BTreeMap<Key, Vec<Rec>>> = Bkl::new(BTreeMap::new());
+static FLOCKS: Bkl<BTreeMap<Key, Vec<Flock>>> = Bkl::new(BTreeMap::new());
 /// 待っている人 (持ち主) と、待たれている持ち主 (行きどまりを見る)
-static mut WAITING: Vec<(Owner, Owner)> = Vec::new();
+static WAITING: Bkl<Vec<(Owner, Owner)>> = Bkl::new(Vec::new());
 
+#[track_caller]
 fn recs() -> &'static mut BTreeMap<Key, Vec<Rec>> {
-    unsafe { &mut *(&raw mut RECS) }
+    RECS.get()
 }
 
+#[track_caller]
 fn flocks() -> &'static mut BTreeMap<Key, Vec<Flock>> {
-    unsafe { &mut *(&raw mut FLOCKS) }
+    FLOCKS.get()
 }
 
+#[track_caller]
 fn waiting() -> &'static mut Vec<(Owner, Owner)> {
-    unsafe { &mut *(&raw mut WAITING) }
+    WAITING.get()
 }
 
 /// 待っている人をみな起こす (ロックが外れた、変わった)

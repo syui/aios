@@ -12,6 +12,7 @@
 //   だれでも読めるが、wheel でない人には自分 (実 uid) のものだけ (ほかの人が開こうとしたパスは見せない)。
 //   aish はコマンドが 0 でなく終わったとき、その pid のものを出す
 // aiproc (/proc/ai) を切ったカーネルでは残さない
+use crate::cell::Bkl;
 use crate::spinlock::SpinLock;
 use alloc::format;
 use alloc::string::String;
@@ -410,11 +411,11 @@ fn sentence(n: &Note, syscall: &str) -> String {
 
 /// 読みはじめで作ったもの (だれ向けか、中身)。/proc/ai/why は大きく (512 行ほど) いくつかに分けて読まれるので、続きは
 /// これを切って返す (読むたびに作りなおすと、そのあいだに増えたものと ago_ms で行がずれる)
-static mut CACHE: Option<(Option<u32>, String)> = None;
+static CACHE: Bkl<Option<(Option<u32>, String)>> = Bkl::new(None);
 
 /// /proc/ai/why の中身 (off から)。off が 0 なら作りなおす (大きなロックを持って呼ぶ)
 pub fn read_at(off: usize, buf: &mut [u8], uid: Option<u32>) -> usize {
-    let cache = unsafe { &mut *(&raw mut CACHE) };
+    let cache = CACHE.get();
     if off == 0 || cache.as_ref().is_none_or(|c| c.0 != uid) {
         *cache = Some((uid, text(uid)));
     }

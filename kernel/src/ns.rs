@@ -11,6 +11,7 @@
 // 止めるのではなく、できることが減るだけの namespace は、setuid のプログラムをだませない no_new_privs で許す)。
 // 新しい UTS の中ではホスト名を変えられる (外には見えないので、root でなくても)
 // /proc/PID/ns/uts は「uts:[番号]」へのリンク (同じものか見分けるため)
+use crate::cell::Bkl;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -30,13 +31,11 @@ pub const INIT_PID: u64 = 4026531836;
 pub const INIT_MNT: u64 = 4026531841;
 pub const INIT_USER: u64 = 4026531837;
 
-static mut NEXT_ID: u64 = 4026532000;
+static NEXT_ID: Bkl<u64> = Bkl::new(4026532000);
 
 fn next_id() -> u64 {
-    unsafe {
-        NEXT_ID += 1;
-        NEXT_ID
-    }
+    *NEXT_ID.get() += 1;
+    *NEXT_ID.get()
 }
 
 /// UTS: ホスト名

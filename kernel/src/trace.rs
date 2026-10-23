@@ -5,6 +5,7 @@
 // trace clear で空にする。止まっているあいだは、それぞれの場所で ON を 1 回見るだけ。
 // 読むと 1 行 1 つの JSON: はじめの行が様子 (on、filter、events、dropped、names: tid → 名前)、あとは出来事 (t、c、p、k ...)。
 // 読みはじめ (位置 0) で 1 度作り、続きはそれを切って返す (読むたびに作りなおさない)
+use crate::cell::Bkl;
 use crate::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -255,11 +256,11 @@ fn filter_str() -> String {
 }
 
 /// 読みはじめで作ったものと、作ったときの位置 (続きはこれを切って返す)
-static mut CACHE: Option<String> = None;
+static CACHE: Bkl<Option<String>> = Bkl::new(None);
 
 /// /proc/ai/trace の中身 (off から)。off が 0 なら作りなおす (大きなロックを持って呼ぶ)
 pub fn read_at(off: usize, buf: &mut [u8]) -> usize {
-    let cache = unsafe { &mut *(&raw mut CACHE) };
+    let cache = CACHE.get();
     if off == 0 || cache.is_none() {
         *cache = Some(json());
     }

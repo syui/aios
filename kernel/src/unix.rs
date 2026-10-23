@@ -22,6 +22,7 @@
 // 大きなロックなしで入れたり出したりしたほうは、それがあれば起こしを大きなロックを持つ CPU に頼む (smp::defer_wake)。借りたまま眠らない、
 // 同じソケットを二重に借りない (止まる)、借りたまま fd (FileRef) を落とさない (落とすと、
 // それが最後ならそのソケットを閉じる: release)
+use crate::cell::Bkl;
 use crate::file::{self, FileRef, Kind, Stat};
 use crate::proc;
 use crate::vfs::InodeRef;
@@ -136,7 +137,7 @@ struct Msg {
 impl Msg {
     fn new(data: Vec<u8>, fds: Vec<FileRef>, cred: Option<Cred>, sender: &UnixRef, truesize: usize) -> Msg {
         let unix = fds.iter().filter(|f| matches!(f.borrow().kind, Kind::Unix(_))).count();
-        unsafe { INFLIGHT += unix };
+        *INFLIGHT.get() += unix;
         Msg { id: next_id(), data, used: 0, fds, cred, sender: Some(sender.clone()), truesize, peeked: false, unix }
     }
 
@@ -151,7 +152,7 @@ impl Msg {
 
     /// 受けた fd を取りだす (もう送られている途中ではない)
     fn take_fds(&mut self) -> Vec<FileRef> {
-        unsafe { INFLIGHT -= self.unix };
+        *INFLIGHT.get() -= self.unix;
         self.unix = 0;
         core::mem::take(&mut self.fds)
     }
@@ -161,7 +162,7 @@ impl Drop for Msg {
     fn drop(&mut self) {
         // 大きなロックなしで落とすもの (fast_rw: fd はない) は INFLIGHT にさわらない (0 を引くのも書きもどしになる)
         if self.unix > 0 {
-            unsafe { INFLIGHT -= self.unix };
+            *INFLIGHT.get() -= self.unix;
         }
     }
 }
@@ -290,37 +291,38 @@ type R = Result<i64, i64>;
 
 // ---- 名前の表 ----
 
-static mut ABSTRACT: BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>> = BTreeMap::new();
-static mut BSD: BTreeMap<(usize, u64), Weak<UnixCell>> = BTreeMap::new();
+static ABSTRACT: Bkl<BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>>> = Bkl::new(BTreeMap::new());
+static BSD: Bkl<BTreeMap<(usize, u64), Weak<UnixCell>>> = Bkl::new(BTreeMap::new());
 static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-static mut NEXT_INO: u64 = 1;
+static NEXT_INO: Bkl<u64> = Bkl::new(1);
 /// メッセージの中にある (送られている途中の) AF_UNIX のソケットの fd の数。0 なら gc はしない
-static mut INFLIGHT: usize = 0;
+static INFLIGHT: Bkl<usize> = Bkl::new(0);
 /// ソケットの fd が閉じた・ソケットを閉じた (システムコールの終わりに gc を見る)
-static mut GC_WANTED: bool = false;
+static GC_WANTED: Bkl<bool> = Bkl::new(false);
 /// すべてのソケット (gc がメッセージの中の fd をたどる)。消えたものは gc と new_sock で掃く
-static mut ALL: Vec<Weak<UnixCell>> = Vec::new();
-static mut ALL_LIVE: usize = 0;
+static ALL: Bkl<Vec<Weak<UnixCell>>> = Bkl::new(Vec::new());
+static ALL_LIVE: Bkl<usize> = Bkl::new(0);
 
 /// いま生きている AF_UNIX のソケットの数 (/proc/net/sockstat の sockets: used)
 pub fn live() -> usize {
-    unsafe { &*(&raw const ALL) }.iter().filter(|w| w.strong_count() > 0).count()
+    ALL.get().iter().filter(|w| w.strong_count() > 0).count()
 }
 
+#[track_caller]
 fn abstract_names() -> &'static mut BTreeMap<(u64, u8, Vec<u8>), Weak<UnixCell>> {
-    unsafe { &mut *(&raw mut ABSTRACT) }
+    ABSTRACT.get()
 }
 
+#[track_caller]
 fn bsd_names() -> &'static mut BTreeMap<(usize, u64), Weak<UnixCell>> {
-    unsafe { &mut *(&raw mut BSD) }
+    BSD.get()
 }
 
 /// ソケットの inode の番号 (AF_UNIX と AF_INET で 1 つの並び: Linux の sockfs)
 pub fn new_ino() -> u64 {
-    unsafe {
-        NEXT_INO += 1;
-        NEXT_INO
-    }
+    let n = NEXT_INO.get();
+    *n += 1;
+    *n
 }
 
 fn next_id() -> u64 {
@@ -406,10 +408,10 @@ fn new_sock(typ: u8) -> UnixRef {
         watchers: 0,
         epolled: false,
     }));
-    let all = unsafe { &mut *(&raw mut ALL) };
-    if all.len() >= 64 && all.len() >= 2 * unsafe { ALL_LIVE } {
+    let all = ALL.get();
+    if all.len() >= 64 && all.len() >= 2 * *ALL_LIVE.get() {
         all.retain(|w| w.strong_count() > 0);
-        unsafe { ALL_LIVE = all.len() };
+        *ALL_LIVE.get() = all.len();
     }
     all.push(Arc::downgrade(&u));
     u
@@ -1817,28 +1819,27 @@ pub fn shutdown(u: &UnixRef, how: u64) -> R {
 /// 最後の fd が閉じた: Linux の unix_release_sock
 pub fn release(u: &UnixRef) {
     release_sock(u, false);
-    unsafe { GC_WANTED = true };
+    *GC_WANTED.get() = true;
 }
 
 // ---- gc (Linux の net/unix/garbage.c) ----
 
 /// fd の表からソケットの fd が外れた (閉じた、上書きした)
 pub fn closed() {
-    unsafe { GC_WANTED = true };
+    *GC_WANTED.get() = true;
 }
 
 /// システムコールの終わり (と、プロセスが終わって fd の表を落としたとき: force) に: 送られている途中のソケットが
 /// あれば gc
 #[inline]
 pub fn gc_check(force: bool) {
-    unsafe {
-        if !(GC_WANTED || force) {
-            return;
-        }
-        GC_WANTED = false;
-        if INFLIGHT == 0 {
-            return;
-        }
+    let wanted = GC_WANTED.get();
+    if !(*wanted || force) {
+        return;
+    }
+    *wanted = false;
+    if *INFLIGHT.get() == 0 {
+        return;
     }
     gc();
 }
@@ -1850,9 +1851,9 @@ pub fn gc_check(force: bool) {
 /// 候補でないソケットの行列からも、そこからたどれる候補の行列からも持たれていないものの行列を捨てる。listen している
 /// ものの行列には、まだ accept されていない口の行列も入れる (Linux の scan_children)
 fn gc() {
-    let all = unsafe { &mut *(&raw mut ALL) };
+    let all = ALL.get();
     all.retain(|w| w.strong_count() > 0);
-    unsafe { ALL_LIVE = all.len() };
+    *ALL_LIVE.get() = all.len();
     let socks: Vec<UnixRef> = all.iter().filter_map(|w| w.upgrade()).collect();
     // ソケット s の行列 (と accept 待ちの口の行列) にある AF_UNIX の fd: (OpenFile の場所, その中のソケット)
     let held = |s: &UnixRef| -> Vec<(usize, UnixRef)> {
@@ -2172,8 +2173,8 @@ pub fn debug(u: &UnixRef) -> String {
 /// つながっている。抽象名前空間の名前は @ から (NUL は @)。accept されていない口も出す (名前は listen しているもの)
 pub fn proc_net() -> String {
     let mut out = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
-    let all = unsafe { &*(&raw const ALL) };
-    for w in all {
+    let all = ALL.get();
+    for w in all.iter() {
         let Some(u) = w.upgrade() else { continue };
         let s = u.borrow();
         if s.dead {

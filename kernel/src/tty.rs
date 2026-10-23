@@ -3,6 +3,7 @@
 // 疑似端末は /dev/ptmx を開くと 1 組でき、親 (master) の口がその fd、
 // 子 (slave) の口が /dev/pts/N になる。親に書いたものは子の入力として
 // 行規律を通り、子に書いたものは親から読める。
+use crate::cell::Bkl;
 use crate::proc;
 use crate::signal::{self, SigInfo};
 use crate::uart;
@@ -414,14 +415,11 @@ const MREAD: usize = 1; // 親が出力を待つ
 const SWRITE: usize = 2; // 子が親の読むのを待つ
 const MWRITE: usize = 3; // 親が子の読むのを待つ
 
-static mut CONSOLE: Option<TtyRef> = None;
-static mut PTYS: Vec<Option<TtyRef>> = Vec::new();
+static CONSOLE: Bkl<Option<TtyRef>> = Bkl::new(None);
+static PTYS: Bkl<Vec<Option<TtyRef>>> = Bkl::new(Vec::new());
 
 pub fn console() -> TtyRef {
-    unsafe {
-        let c = &mut *(&raw mut CONSOLE);
-        c.get_or_insert_with(|| Rc::new(RefCell::new(Tty::new(Dev::Console)))).clone()
-    }
+    CONSOLE.get().get_or_insert_with(|| Rc::new(RefCell::new(Tty::new(Dev::Console)))).clone()
 }
 
 /// コンソールがふつうの (行ごとの) モードか。1 文字ずつ読むプログラム (シェルの行の編集など) なら false
@@ -429,8 +427,9 @@ pub fn console_canonical() -> bool {
     console().borrow().canon()
 }
 
+#[track_caller]
 fn ptys() -> &'static mut Vec<Option<TtyRef>> {
-    unsafe { &mut *(&raw mut PTYS) }
+    PTYS.get()
 }
 
 /// 使える端末ぜんぶ

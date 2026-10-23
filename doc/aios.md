@@ -152,6 +152,26 @@ quirk のところには、ソースに札 `[quirk NAME]` をつける。`python
 extra を使っているところを出す (core を小さくするときの目じるし)。リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 
+### だれが守るか (kernel/src/cell.rs)
+
+カーネルは大きなロック (BKL) 1 つで守ってきたので、表の多くは `static mut` だった。`static mut` には Rust のコンパイラが
+何も言わないので、BKL を外した道 (syscall::fast、ロックなしのフォールト、ロックなしの作る・消す) がうっかり触っても気づけ
+ない (2 つの CPU が同時に BTreeMap を書けば、そこで壊れる)。そこで、だれが守るかを型に書く:
+
+| 入れもの | 守り手 | 中を出すとき |
+|---|---|---|
+| `Bkl<T>` | 大きなロック | 呼んだ CPU が BKL を持っているかを見る。持っていなければ、呼んだ場所 (ファイル:行) を 1 度 kmsg に出し、`/proc/bkl` に `unlocked FILE:LINE 回数` で数える (機械は止めない) |
+| `Once<T>` | 1 度だけ入れる | 入ったあとは、どの CPU もロックなしで読む (ルートの ext4 など) |
+
+`test/vm-check.sh` の `bkl-unlocked` と CI の VM test (C のテストとロボットのあと) は `/proc/bkl` に unlocked があれば落ちる。
+`echo "bkl selftest" > /proc/ai/ctl` は BKL をいったん放して `Bkl` を触り、見はりが気づくかを確かめる (`bkl: selftest ok`)。
+AF_UNIX と AF_INET の表、ファイルのロック、inotify、timerfd、tty、入力、futex、vfs (マウント、パスの覚え)、ファイルの
+共有ページ、swap など 50 を `Bkl` にして、vm-check、C のテスト、ロボットの 800 case、smpbench (4 つの CPU) で 1 度も
+unlocked は出なかった。のこりの `static mut` (起動のときだけ書くもの、CPU ごとのもの、自分のロックで守るもの) は、
+`test/kernel-json.py` が数を見て (`STATIC_MUT_MAX`)、増えれば落ち、減れば数を下げさせる。
+Linux は、どのデータをどのロックが守るかをコメントに書き、lockdep は実行時にロックの順を見るだけ。aios は型に書くので、
+守り手のない道は、動かせば分かる。
+
 ### カーネルの砂場 (aios.off= と aish の box)
 
 `off` のあるもの (extra と quirk) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる

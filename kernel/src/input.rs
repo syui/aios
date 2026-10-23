@@ -3,6 +3,7 @@
 //   ioctl: EVIOCGVERSION, EVIOCGID, EVIOCGNAME, EVIOCGBIT, EVIOCGABS
 // 装置は 8 バイトのイベント (type, code, value) を eventq に書いてくる。割り込みで受けて、
 // 時刻をつけて溜め、読む人と poll している人を起こす
+use crate::cell::Bkl;
 use crate::memlayout::{v2p, PGSIZE};
 use crate::proc;
 use crate::virtio::{self, Mmio, Queue, DESC_WRITE};
@@ -29,10 +30,11 @@ pub struct Input {
     events: VecDeque<[u8; 24]>,
 }
 
-static mut DEVS: Vec<Input> = Vec::new();
+static DEVS: Bkl<Vec<Input>> = Bkl::new(Vec::new());
 
+#[track_caller]
 fn devs() -> &'static mut Vec<Input> {
-    unsafe { &mut *(&raw mut DEVS) }
+    DEVS.get()
 }
 
 pub fn count() -> usize {

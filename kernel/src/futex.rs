@@ -7,6 +7,7 @@
 //! (プロセスをまたぐ)。待つスレッドはみな同じ chan で眠り、起こす側が行列から出して、そのスレッドだけを起こす。
 //! ぜんぶ大きなロックの中。ロックなしの速い道 (syscall.rs の fast) のために、PRIVATE の key ごとの待つ数を数える
 
+use crate::cell::Bkl;
 use crate::proc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
@@ -82,10 +83,11 @@ struct Table {
     pi: BTreeMap<Key, u32>,
 }
 
-static mut TABLE: Table = Table { next: 1, entries: BTreeMap::new(), queues: BTreeMap::new(), woken: BTreeMap::new(), pi: BTreeMap::new() };
+static TABLE: Bkl<Table> = Bkl::new(Table { next: 1, entries: BTreeMap::new(), queues: BTreeMap::new(), woken: BTreeMap::new(), pi: BTreeMap::new() });
 
+#[track_caller]
 fn t() -> &'static mut Table {
-    unsafe { &mut *(&raw mut TABLE) }
+    TABLE.get()
 }
 
 /// futex で待つスレッドの眠る場所 (みな同じ。起こすときはスレッドを選ぶ)

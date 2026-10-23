@@ -1,5 +1,6 @@
 // BSD ソケットのシステムコール。AF_UNIX は unix.rs、AF_INET の TCP と UDP は inet.rs、ICMP の echo (ping) と raw は
 // ここで smoltcp のソケットを使う
+use crate::cell::Bkl;
 use crate::file::{self, FileRef, Kind};
 use crate::inet::InetRef;
 use crate::net;
@@ -74,15 +75,13 @@ pub struct Socket {
 
 pub type SockRef = Rc<RefCell<Socket>>;
 
-static mut NEXT_ID: u16 = 49152;
+static NEXT_ID: Bkl<u16> = Bkl::new(49152);
 
 /// ICMP の echo の id (空いているもの)
 fn next_id() -> u16 {
-    unsafe {
-        let p = NEXT_ID;
-        NEXT_ID = if p == 65535 { 49152 } else { p + 1 };
-        p
-    }
+    let p = *NEXT_ID.get();
+    *NEXT_ID.get() = if p == 65535 { 49152 } else { p + 1 };
+    p
 }
 
 fn n() -> Result<&'static mut net::Net, i64> {

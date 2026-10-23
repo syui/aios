@@ -28,6 +28,7 @@
 // スワップ: 自分だけの領域 (MAP_SHARED でない) の、ほかと共有していないページを追い出せる。
 // 選ぶのは clock: AF (アクセスフラグ) を落としておき、次に見たときにまだ落ちていれば追い出す。
 // AF が落ちたページに触れるとアクセスフラグのフォールトになり、fault_page が立てなおす。
+use crate::cell::Bkl;
 use crate::kalloc;
 use crate::spinlock::SpinLock;
 use crate::swap;
@@ -82,10 +83,11 @@ struct Cached {
 }
 
 /// 表も 1 つ参照を持つ。だれも写さなくなったら (参照が表とファイルシステムとページキャッシュだけになったら) 書き戻して捨てる
-static mut SHARED_FILE: BTreeMap<FileKey, Cached> = BTreeMap::new();
+static SHARED_FILE: Bkl<BTreeMap<FileKey, Cached>> = Bkl::new(BTreeMap::new());
 
+#[track_caller]
 fn shared_file() -> &'static mut BTreeMap<FileKey, Cached> {
-    unsafe { &mut *(&raw mut SHARED_FILE) }
+    SHARED_FILE.get()
 }
 
 fn file_key(ino: &InodeRef, off: usize) -> FileKey {

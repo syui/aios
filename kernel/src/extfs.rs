@@ -374,7 +374,7 @@ impl ACell {
 }
 
 /// ルートの ext4 (ExtFs::root が 1 度だけ入れる。それからは変えない)
-static mut ROOT_FS: Option<Rc<ExtFs>> = None;
+static ROOT_FS: crate::cell::Once<Rc<ExtFs>> = crate::cell::Once::new();
 
 #[path = "htree.rs"]
 mod htree;
@@ -963,10 +963,8 @@ impl ExtFs {
     pub fn root(self: &Rc<Self>) -> InodeRef {
         let _e = fs_lock();
         // 大きなロックなしの作る・消す (fastdir.rs) が使う ext4 (ルートのもの。いまマウントできる ext4 はこれだけ)
-        unsafe {
-            if (*(&raw const ROOT_FS)).is_none() {
-                ROOT_FS = Some(self.clone());
-            }
+        if ROOT_FS.get().is_none() {
+            ROOT_FS.set(self.clone());
         }
         ExtInode::make(self, ROOT_INO)
     }
@@ -978,7 +976,7 @@ impl ExtFs {
 
     /// ルートの ext4 (fastdir.rs。ext4 のロックを持って使う)
     pub fn root_fs() -> Option<&'static Rc<ExtFs>> {
-        unsafe { (*(&raw const ROOT_FS)).as_ref() }
+        ROOT_FS.get()
     }
 
     /// /proc/ai/fs の、このファイルシステムの中の様子 (1 つの JSON のオブジェクト)

@@ -4,6 +4,7 @@
 // EL0 からのタイマ割り込みと、sleep/yield/exit のときだけ。CPU ごとにスケジューラがあり、
 // 同じ Proc の表から Runnable のものを取って走らせる (次にどの CPU で走るかは決まっていない)。
 // スレッドは mm (アドレス空間) と files を共有する Proc。
+use crate::cell::Bkl;
 use crate::exec::{self, Image};
 use crate::file::{self, FileRef, Kind};
 use crate::trap::TrapFrame;
@@ -575,7 +576,7 @@ fn set_cur(v: Option<usize>) {
 fn sched_ctx() -> *mut Context {
     unsafe { &raw mut SCHEDULER[crate::smp::id()] }
 }
-static mut NEXT_PID: u32 = 1;
+static NEXT_PID: Bkl<u32> = Bkl::new(1);
 
 fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *(&raw mut PROCS) }
@@ -808,10 +809,8 @@ fn alloc_proc() -> Option<&'static mut Proc> {
     let i = slot_of(p);
     crate::prof::thread_start(i);
     unsafe { LIVE[i / 64] |= 1u64 << (i % 64) };
-    unsafe {
-        p.pid = NEXT_PID;
-        NEXT_PID += 1;
-    }
+    p.pid = *NEXT_PID.get();
+    *NEXT_PID.get() += 1;
     p.tgid = p.pid;
     p.start = crate::timer::ticks();
     p.context.x19_x30[11] = forkret as *const () as u64; // x30 (lr)
@@ -899,7 +898,7 @@ pub static LOAD: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomi
 
 /// いちばん新しく渡した PID
 pub fn last_pid() -> u32 {
-    unsafe { NEXT_PID - 1 }
+    *NEXT_PID.get() - 1
 }
 
 /// スレッドの数 (/proc/loadavg)

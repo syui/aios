@@ -54,6 +54,7 @@ mod rand;
 mod signal;
 mod socket;
 mod spinlock;
+mod cell;
 mod statc;
 mod swap;
 mod syscall;

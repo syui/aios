@@ -12,6 +12,7 @@
 // ページが作れなかったときに BATCH 枚。どのページを追い出すかは各ページ表の clock (vm.rs)。
 // ディスクへの書き込みは大きなロックを持ったまま待つので、書いている間にほかの CPU が同じページに触れても、
 // フォールトしてロックを待つだけ (書き終わってからスワップから読み戻す)。
+use crate::cell::Bkl;
 use crate::block::{self, Part, SECTOR};
 use crate::memlayout::PGSIZE;
 use alloc::string::String;
@@ -58,10 +59,11 @@ struct Area {
     draining: bool,
 }
 
-static mut AREAS: [Option<Area>; MAX_AREAS] = [const { None }; MAX_AREAS];
+static AREAS: Bkl<[Option<Area>; MAX_AREAS]> = Bkl::new([const { None }; MAX_AREAS]);
 
+#[track_caller]
 fn areas() -> &'static mut [Option<Area>; MAX_AREAS] {
-    unsafe { &mut *(&raw mut AREAS) }
+    AREAS.get()
 }
 
 fn area(slot: Slot) -> Option<&'static mut Area> {
@@ -239,7 +241,7 @@ pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
 }
 
 /// 次に回収をはじめるページ表 (順番に回す)
-static mut HAND: usize = 0;
+static HAND: Bkl<usize> = Bkl::new(0);
 
 /// want 枚くらいをスワップへ追い出して空ける。ページ表のルートが exclude のものは触らない。
 /// 空けた数を返す
@@ -266,17 +268,17 @@ pub fn reclaim(want: usize, exclude: usize) -> usize {
     // 1 周目は AF を落とすだけのことが多いので、何周か
     for _ in 0..3 {
         for k in 0..pts.len() {
-            let hand = unsafe { HAND };
+            let hand = *HAND.get();
             let p: *mut crate::vm::PageTable = pts[(hand + k) % pts.len()];
             let pt = unsafe { &mut *p };
             // 1 つのアドレス空間から取りすぎないよう、少しずつ
             freed += pt.swap_out((want - freed).min(BATCH));
             if freed >= want {
-                unsafe { HAND = hand + k + 1 };
+                *HAND.get() = hand + k + 1;
                 return cached + freed;
             }
         }
-        unsafe { HAND += 1 };
+        *HAND.get() += 1;
     }
     cached + freed
 }

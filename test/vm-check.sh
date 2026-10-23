@@ -98,6 +98,11 @@ t ai-page-buddy sh -c 'g=$(sudo -n cat /proc/ai/mem | grep -o "\"grown\":[0-9]*"
 # プロセス (40 MiB の変数を持つこの子) を殺す。カーネルは続き、空きが戻れば back to normal
 t ai-oom sh -c 'sh -c "x=\$(head -c 40000000 /dev/zero | tr \"\\0\" a); echo \"fail pid \$\$ oom 1\" > /proc/ai/ctl; ls /tmp > /dev/null; ls /tmp > /dev/null; echo survived" > /tmp/oom.out 2>&1; s=$?; echo "fail off" > /proc/ai/ctl; grep -q "oom: killed pid" /proc/kmsg && ! grep -q survived /tmp/oom.out && [ "$s" = 137 ]'
 t ai-fs sh -c 'f=$(sudo -n cat /proc/ai/fs) && echo "$f" | grep -q "\"target\":\"/\",\"source\":\"/dev/vda[0-9]*\",\"type\":\"ext4\"" && echo "$f" | grep -q "\"cache\":{\"blocks\":[0-9]" && echo "$f" | grep -q "\"paths\":{\"entries\":[0-9]"'
+# 大きなロック (BKL) が守るもの (kernel/src/cell.rs の Bkl) を、BKL を持たずに触ったところがない (ここまでのたしかめの
+# あいだに。あれば /proc/bkl に unlocked FILE:LINE 回数 の行が出る)。いちばんあとに置く
+t bkl-unlocked sh -c '! grep "^unlocked" /proc/bkl'
+# その見はりが効いていること: BKL を放して Bkl を触ると、数えられる (CPU が 1 つなら skipped)
+t bkl-selftest sh -c 'echo "bkl selftest" > /proc/ai/ctl && grep "bkl: selftest" /proc/kmsg | tail -1 | grep -q "ok\|skipped"'
 
 echo "checks: $n, $fail failed"
 [ "$fail" = 0 ]

@@ -4,6 +4,7 @@
   {"name": "memlayout", "type": "core", "src": "src/memlayout.rs", "what": "物理/仮想アドレスの配置"},
   {"name": "mmio", "type": "core", "src": "src/mmio.rs", "what": "機器のレジスタ (MMIO) の読み書き"},
   {"name": "spinlock", "type": "core", "src": "src/spinlock.rs", "what": "割り込みを止めて取るスピンロック (もう止まっていれば DAIF に触らない)", "bench": "kernel/src/spinlock.rs (lockbench: echo lockbench > /proc/ai/ctl。1 回の ns を kmsg に)"},
+  {"name": "cell", "type": "core", "src": "src/cell.rs", "what": "static mut のかわりに、守り手を型に書く入れもの (Bkl<T>: 大きなロックを持たずに中を出せば、その場所を /proc/bkl と kmsg に。Once<T>: 1 度だけ入れて、あとはロックなしで読む)"},
   {"name": "kalloc", "type": "core", "src": "src/kalloc.rs", "what": "物理ページ (4KiB) アロケータ (buddy: 4 KiB から 4 MiB のかたまり、返ったものはまとめなおす)"},
   {"name": "heap", "type": "core", "src": "src/heap.rs", "what": "カーネルヒープ: bss 上の固定領域 (とメモリに合わせて足したもの) を切り分ける。ロック、使っている量、どこで取ったか (heap trace)", "bench": "kernel/src/spinlock.rs (lockbench の heap alloc+free)。足りないときは、まだ使っていないページを足し、ページキャッシュを捨て、耐えるところ (heap::fallible: read/write の入れ物など) には null で ENOMEM、耐えないところには予備 (2 MiB) から渡して oom.rs に空けてもらう (前は panic だった)"},
   {"name": "oom", "type": "core", "src": "src/oom.rs", "what": "メモリが足りないとき: ヒープが予備にまで手をつけたら、次のシステムコールの入り口で、いちばんメモリ (rss) を持っているプロセスを SIGKILL で終わらせて空ける (Linux の OOM killer と同じ考え)。init は殺さない。空きが戻れば戻る"},
