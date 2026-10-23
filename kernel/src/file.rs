@@ -294,17 +294,21 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         }
         crate::statc::Open::Found(st) => st,
     };
+    // ここからふつうの道へ渡すものは、表の答えをいま確かめたもの (ふつうの道は覚えなおさない)
+    let pass = |i: usize| {
+        note(i);
+        crate::statc::seen_set(me.pid, pathp);
+        None
+    };
     // 読めなければ、ふつうの道が EACCES とそのわけを
     let m = vfs::Meta { mode: st.mode, uid: st.uid, gid: st.gid, ..vfs::Meta::default() };
     if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, crate::cred::R, false) {
-        note(5);
-        return None;
+        return pass(5);
     }
     let t = files.get();
     // いちばん小さい空いた fd (表を伸ばすのはふつうの道で)
     let Some(fd) = (0..t.fds.len().min(t.nofile)).find(|&i| t.fds[i].is_none()) else {
-        note(5);
-        return None;
+        return pass(5);
     };
     let want = (flags & O_LARGEFILE) as u32;
     let epoch = crate::statc::epoch();
@@ -317,8 +321,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     });
     let Some(i) = i else {
         drop(shelf);
-        note(4);
-        return None;
+        return pass(4);
     };
     let file = shelf.swap_remove(i).file;
     // 棚のものは自分だけのもの (しまうときに確かめ、棚にあるあいだはだれも見つけられない): 借りずに開きなおしの形に
@@ -430,20 +433,18 @@ pub fn shelf_flush_all() {
 pub fn shelf_prune(t: &mut proc::Files) {
     use core::sync::atomic::Ordering::Relaxed;
     let epoch = crate::statc::epoch();
-    let old: Vec<FileRef> = {
+    // 棚の Vec はその場で (前は閉じるたびに Vec を 3 つ作りなおし、棚の場所も手放していた)。落とすのは棚のロックの外で
+    let (oldest, stale) = {
         let mut shelf = t.shelf.0.lock();
-        if shelf.len() < SHELF_MAX && shelf.iter().all(|s| s.epoch == epoch) {
+        let fresh = shelf.iter().all(|s| s.epoch == epoch);
+        if shelf.len() < SHELF_MAX && fresh {
             return;
         }
-        let (mut keep, old): (Vec<Shelved>, Vec<Shelved>) = core::mem::take(&mut *shelf).into_iter().partition(|s| s.epoch == epoch);
-        let mut old: Vec<FileRef> = old.into_iter().map(|s| s.file).collect();
-        if keep.len() >= SHELF_MAX {
-            old.push(keep.remove(0).file);
-        }
-        *shelf = keep;
-        old
+        let stale: Vec<FileRef> = if fresh { Vec::new() } else { shelf.extract_if(.., |s| s.epoch != epoch).map(|s| s.file).collect() };
+        let oldest = (shelf.len() >= SHELF_MAX).then(|| shelf.remove(0).file);
+        (oldest, stale)
     };
-    SHELVED.fetch_sub(old.len(), Relaxed);
+    SHELVED.fetch_sub(stale.len() + oldest.is_some() as usize, Relaxed);
 }
 
 /// fd から読む。眠るかもしれないものは OpenFile を借りたまま眠らない

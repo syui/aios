@@ -3537,6 +3537,10 @@ impl ExtFs {
                 }
                 let done = self.write_inode(ino, &r).map(|_| (meta_of(ino, &r, self.bsize), crate::statc::ino_ver((self.fs, ino as u64)))).and_then(|seen| {
                     self.add_entry_in(dir, pr, name, ino, mode, Some(Some(slot)))?;
+                    // 作った名前を名前のキャッシュに (Linux の d_instantiate)。ロックなしで作ったものはパスの覚え (vfs の
+                    // PATHS) に入らないので、はじめて開くとき (openat のふつうの道) はここで引く: 前はディレクトリの
+                    // ブロックか索引をなめなおしていた (TCG で 23 us)
+                    self.names.borrow_mut().insert(dir, String::from(name), ino);
                     Ok(seen)
                 });
                 match done {

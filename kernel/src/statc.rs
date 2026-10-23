@@ -440,6 +440,27 @@ pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) ->
     })
 }
 
+/// 大きなロックなしの open (file::fast_open) が、表の答えがいまも正しいと確かめてから、ふつうの道へ渡したもの
+/// (CPU ごとに、スレッドとパスのアドレス)。ふつうの道の openat は、これを同じ答えでもういちど覚えない: 棚にない
+/// ファイルを次々に開くと、開くたびに表を書きなおしていた (TCG で 7 us)。ほかの CPU へ移ったり、ちがうものが残って
+/// いたりしても、覚えるか覚えないかだけ (答えは変わらない)
+static SEEN: [(core::sync::atomic::AtomicUsize, core::sync::atomic::AtomicUsize); crate::smp::MAXCPU] = [const { (core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0)) }; crate::smp::MAXCPU];
+
+/// fast_open が、スレッド tid のパス pathp の答えを確かめてから、ふつうの道へ
+pub fn seen_set(tid: u32, pathp: usize) {
+    let s = &SEEN[crate::smp::id() % crate::smp::MAXCPU];
+    s.0.store(tid as usize, Relaxed);
+    s.1.store(pathp, Relaxed);
+}
+
+/// ふつうの道の openat: いまのシステムコールの前に、fast_open が同じものを確かめたか (印は消す)
+pub fn seen_take(tid: u32, pathp: usize) -> bool {
+    let s = &SEEN[crate::smp::id() % crate::smp::MAXCPU];
+    let same = pathp != 0 && s.0.load(Relaxed) == tid as usize && s.1.load(Relaxed) == pathp;
+    s.1.store(0, Relaxed);
+    same
+}
+
 /// 全体の版 (マウントやルートが変わると増える: epoch_bump)。file の棚 (Shelf) が、しまったときの版とくらべる
 pub fn epoch() -> u64 {
     EPOCH.load(Acquire)

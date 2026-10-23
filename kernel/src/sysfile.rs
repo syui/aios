@@ -1074,7 +1074,8 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         }
         r => r?,
     };
-    if learn && found.1.fast_stat() {
+    // 大きなロックなしの open が、いまの答えを表で確かめてから来たもの (棚になかった) は、覚えなおさない
+    if learn && found.1.fast_stat() && !crate::statc::seen_take(proc::current().pid, pathp) {
         crate::statc::learn(&path, true, &found.1, mgtime(&found.1));
     }
     open_found(Ok(found), flags, mode)
