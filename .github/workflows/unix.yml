@@ -94,23 +94,39 @@ jobs:
         run: |
           # UEFI → aiboot → カーネル → init → swap.service まで来るか。
           # Mac の HVF と同じ GICv3 (仮想タイマ) で。GICv2 は次の VM test で起こす
-          for gic in 3; do
-            AIOS_GIC=$gic bin/run.sh < /dev/null > boot.log 2>&1 &
+          # ファームウェアは 2 つ: Ubuntu の AAVMF と、QEMU についてくる edk2 (Mac の Homebrew の qemu が使うもの。
+          # v11.1.2 のものは edk2-stable202408)。edk2 は実行するセクションを読むだけにするので、
+          # カーネルの .data が .text と同じセクションにあると、そこに書いたところで落ちる (AAVMF では起きる)
+          mkdir -p build
+          for u in https://gitlab.com/qemu-project/qemu/-/raw/v11.1.2/pc-bios/edk2-aarch64-code.fd.bz2 \
+              https://github.com/qemu/qemu/raw/v11.1.2/pc-bios/edk2-aarch64-code.fd.bz2; do
+            curl -fsSL -o build/edk2-aarch64-code.fd.bz2 "$u" && break
+          done
+          echo "c023444108b7a132fdebf70c4765cd2dd9af2a9ff7d001a743aaabe87c20a458  build/edk2-aarch64-code.fd.bz2" | sha256sum -c
+          bunzip2 -f build/edk2-aarch64-code.fd.bz2
+          for fw in aavmf edk2; do
+            code=
+            [ $fw = edk2 ] && code=$PWD/build/edk2-aarch64-code.fd
+            # 変数はファームウェアごとに作りなおす
+            rm -f build/efivars.fd
+            AIOS_GIC=3 AIOS_EFI_CODE=$code bin/run.sh < /dev/null > boot.log 2>&1 &
             ok=
             for i in $(seq 1 150); do
               if grep -q '^aios init:' boot.log && grep -q '^swap: /dev/vda3' boot.log; then
                 ok=1
                 break
               fi
+              grep -q 'Synchronous Exception' boot.log && break
               sleep 2
             done
             sleep 5
             pkill -f '^qemu-system-aarch64' || true
             wait || true
-            echo "== gic ${gic:-2}"
+            echo "== $fw (gic 3)"
             cat boot.log
             [ -n "$ok" ] || exit 1
           done
+          rm -f build/efivars.fd
 
       - name: Build C tests
         # カーネルの C のテスト (test/*.c) を静的なプログラムに (arm64 の Ubuntu の gcc)。VM test で中から取って動かす。
