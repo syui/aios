@@ -1,14 +1,14 @@
 # patch: GNU patch (diff の結果をファイルにあてる)。静的なバイナリ
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=patch
-pkgver=2.8
-pkgrel=4
+pkgver=2.8.1
+pkgrel=1
 pkgdesc='A utility to apply patch files to original sources (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/patch/'
 license=('GPL-3.0-or-later')
 source=("https://ftp.gnu.org/gnu/patch/patch-$pkgver.tar.xz")
-sha256sums=('f87cee69eec2b4fcbf60a396b030ad6aa3415f192aa5f7ee84cad5e11f7f5ae3')
+sha256sums=('3240c7959c5347c8ed347e3c4201c0337bf4240d5cf09d68889e58eeaba30e17')
 
 prepare() {
   rm -rf "patch-$pkgver"

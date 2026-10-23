@@ -1,7 +1,7 @@
 # vulkan-headers: Vulkan のヘッダーと API の登録簿 (registry) (for aios)
 #   vulkan-loader や Vulkan を使うプログラムを作るときに要る。/opt/c に入る
 pkgname=vulkan-headers
-pkgver=1.4.365
+pkgver=1.4.366
 pkgrel=1
 pkgdesc='Vulkan header files and API registry (for aios)'
 arch=('any')
