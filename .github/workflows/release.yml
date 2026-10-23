@@ -1,12 +1,16 @@
 name: release
 
+# linux ブランチ (前の main): Arch Linux の aios (x86_64) を作り、ghcr.io/syui/aios と、リリース linux
+# (タイトル aios、aios-x86_64.tar.gz、ノートの 1 行目が版 * vYYYY.MM.DD) に置く。
+# いまの aios (aarch64 のディスク) は main ブランチのリリース latest
 on:
   push:
     branches:
-    - main
+    - linux
     paths-ignore:
     - '.gitea/**'
     - '**.md'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -46,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
-          git tag -f latest
-          git push -f origin latest
-          gh release create latest aios.tar.gz --title "latest" --notes "build $(date +%Y.%m.%d)" --target main
+          # タグ linux はブランチ linux と同じ名前なので、git でタグを押さずに gh にコミットで作らせる
+          mv aios.tar.gz aios-x86_64.tar.gz
+          gh release delete linux --yes --cleanup-tag || true
+          gh release create linux aios-x86_64.tar.gz --title aios --notes "* v$(date +%Y.%m.%d)" --target "$GITHUB_SHA"

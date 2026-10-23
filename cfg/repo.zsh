@@ -27,8 +27,8 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 
 cd "$WORK"
-# pin main: the remote's default branch is `unix` (self-made kernel), which has no pkg/
-git clone --depth 1 -b main https://git.syui.ai/ai/os.git
+# pin linux: this Arch-based aios is the branch linux (main is the self-made kernel, with its own pkg/)
+git clone --depth 1 -b linux https://git.syui.ai/ai/os.git
 
 typeset -A PKG_REPOS
 PKG_REPOS=(ailog log aigpt gpt aishell shell aifont font)
