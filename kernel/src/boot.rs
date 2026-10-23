@@ -45,15 +45,15 @@ _start:
 pe_header:
     .ascii  "PE\0\0"
     .short  0xaa64              // Machine: arm64
-    .short  1                   // NumberOfSections
+    .short  2                   // NumberOfSections
     .long   0, 0, 0             // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols
     .short  opt_end - opt_header // SizeOfOptionalHeader
     .short  0x206               // EXECUTABLE_IMAGE | LINE_NUMS_STRIPPED | DEBUG_STRIPPED
 opt_header:
     .short  0x20b               // PE32+
     .byte   0x02, 0x14          // リンカの版
-    .long   _pe_raw_size        // SizeOfCode
-    .long   0                   // SizeOfInitializedData
+    .long   _pe_text_size       // SizeOfCode
+    .long   _pe_data_raw        // SizeOfInitializedData
     .long   0                   // SizeOfUninitializedData
     .long   _efi_entry_rva      // AddressOfEntryPoint
     .long   0x1000              // BaseOfCode
@@ -72,14 +72,27 @@ opt_header:
     .long   6                   // NumberOfRvaAndSizes
     .quad   0, 0, 0, 0, 0, 0    // データディレクトリ (再配置はなく、どこに置かれてもよい)
 opt_end:
+    // セクションは Linux の arm64 Image と同じく 2 つ: .text (.text と .rodata、実行と読む) と .data (.data と .bss、
+    // 読むと書く)。新しい edk2 (QEMU についてくる edk2-stable202408 など) は読み込んだ Image をセクションの印のとおりに
+    // 守り、実行できるセクションは書けなくする: 1 つ (code | execute | read | write) だと .data も書けず、EFI スタブが
+    // EFI_RNG_PROTOCOL の乱数を SEED に書かせたところで止まった (VirtioRngDxe の Permission fault)。
+    // Image はファイルのまま読み込まれるので、ファイルの場所 (PointerToRawData) = RVA
     .ascii  ".text\0\0\0"
-    .long   _pe_virt_size       // VirtualSize (bss まで)
+    .long   _pe_text_size       // VirtualSize
     .long   0x1000              // VirtualAddress
-    .long   _pe_raw_size        // SizeOfRawData
+    .long   _pe_text_size       // SizeOfRawData
     .long   0x1000              // PointerToRawData
     .long   0, 0                // PointerToRelocations, PointerToLinenumbers
     .short  0, 0
-    .long   0xe0000020          // code | execute | read | write
+    .long   0x60000020          // code | execute | read
+    .ascii  ".data\0\0\0"
+    .long   _pe_data_virt       // VirtualSize (bss とスタックまで)
+    .long   _pe_data_rva        // VirtualAddress
+    .long   _pe_data_raw        // SizeOfRawData
+    .long   _pe_data_rva        // PointerToRawData
+    .long   0, 0
+    .short  0, 0
+    .long   0xc0000040          // initialized data | read | write
 
     .balign 4096
 primary:
