@@ -386,20 +386,22 @@ impl ExtFs {
         })
     }
 
-    /// 名前の項目の場所: (葉の物理ブロック, その中の位置)。Ok(None) はない、Err(EAGAIN) は索引では決められない
-    pub(super) fn dx_entry(&self, dir: u32, name: &str) -> Result<Option<(u64, usize)>, i64> {
+    /// 名前の項目: (inode, 場所 (葉の物理ブロック, 位置, rec_len, 前の項目)。extfs の entry_at と同じ形: remove_at が消せる)。
+    /// Ok(None) はない、Err(EAGAIN) は索引では決められない
+    pub(super) fn dx_entry_at(&self, dir: u32, name: &str) -> Result<Option<(u32, Entry)>, i64> {
         let Some((pb, _)) = self.dx_locate(dir, name)? else { return Ok(None) };
         let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
         self.with_block(pb, |d| {
-            let mut o = 0;
+            let (mut o, mut prev) = (0, None);
             while o < end {
                 let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
                 if rl < 8 || o + rl > end {
                     break;
                 }
-                if i != 0 && &d[o + 8..o + 8 + nl] == name.as_bytes() {
-                    return Some((pb, o));
+                if i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes() {
+                    return Some((i, (pb, o, rl, prev)));
                 }
+                prev = Some((o, rl));
                 o += rl;
             }
             None
@@ -426,9 +428,58 @@ impl ExtFs {
                 }
                 return Ok(None);
             }
-            // 次の dx_node に続いているかもしれない
+            // 根だけの索引の最後の葉なら、続きはない (Linux の ext4_htree_next_block も根で終わる)。dx_node が
+            // あれば、次の dx_node に続いているかもしれない
+            return if path.len() == 1 { Ok(None) } else { Err(-EAGAIN) };
+        }
+    }
+
+    /// 索引つきのディレクトリに name を足すすき間 (Linux の ext4_dx_add_entry が葉を分けずに入れるところ: ハッシュの
+    /// 入る葉の中)。もうあれば EEXIST、葉にすき間がなければ Ok(None) (分けるのは dx_add_entry)、Err(EAGAIN) は索引では
+    /// 決められない。大きなロックなしの create (fast_create) は、すき間があるときだけ 1 つのブロックを書きかえる
+    pub(super) fn dx_new_slot(&self, dir: u32, name: &str) -> Result<Option<Slot>, i64> {
+        let mut r = self.read_inode(dir)?;
+        let Ok((_, hash, path)) = self.dx_descend(dir, &mut r, name) else { return Err(-EAGAIN) };
+        let (node, first) = path.last().unwrap();
+        let first_pb = self.map(dir, &mut r, node.get(*first).1 as u64, false)?;
+        // もうないか (同じハッシュが続く葉も: dx_locate と同じ)
+        let mut at = *first;
+        loop {
+            let pb = if at == *first { first_pb } else { self.map(dir, &mut r, node.get(at).1 as u64, false)? };
+            if self.block_find(pb, name.as_bytes())?.is_some() {
+                return Err(-EEXIST);
+            }
+            if at + 1 < node.count() {
+                let h = node.get(at + 1).0;
+                if h & 1 != 0 && h & !1 == hash {
+                    at += 1;
+                    continue;
+                }
+                break;
+            }
+            if path.len() == 1 {
+                break;
+            }
             return Err(-EAGAIN);
         }
+        // すき間は leaf_insert と同じ探しかた
+        let need = rec_len_for(name.len());
+        let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
+        self.with_block(first_pb, |d| {
+            let mut o = 0;
+            while o < end {
+                let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
+                if rl < 8 || o + rl > end {
+                    break;
+                }
+                let used = if i == 0 { 0 } else { rec_len_for(nl) };
+                if rl - used >= need {
+                    return Some((first_pb, o, rl, used));
+                }
+                o += rl;
+            }
+            None
+        })
     }
 
     /// 1 ブロックのディレクトリがいっぱいになったら、索引つきに変える (Linux の make_indexed_dir と同じ)。

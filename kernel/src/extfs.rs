@@ -3270,7 +3270,12 @@ impl ExtFs {
     /// name がもうあれば EEXIST、なければ入るすき間 (ブロック, 位置, rec_len, 使っている長さ)。入るところがなければ None
     /// (add_entry_in がブロックを足す)。索引つきなら dx_find で確かめるだけ (すき間は dx_add_entry が葉で探す)
     fn new_slot(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<Slot>, i64> {
+        // 索引つきなら、ハッシュの入る葉のすき間 (なければ None: add_entry_in が葉を分ける)
         if r.flags() & INDEX_FL != 0 {
+            match self.dx_new_slot(dir, name) {
+                Err(e) if e == -NOIO_EAGAIN => {}
+                res => return res,
+            }
             return if self.find(dir, name).is_ok() { Err(-EEXIST) } else { Ok(None) };
         }
         let need = rec_len_for(name.len());
@@ -3294,7 +3299,8 @@ impl ExtFs {
         if name.len() > 255 {
             return Err(-ENAMETOOLONG);
         }
-        if r.flags() & INDEX_FL != 0 {
+        // 索引つきで、葉のすき間 (new_slot) がなければ dx_add_entry (葉を分ける)。あれば下で、索引のないものと同じに
+        if r.flags() & INDEX_FL != 0 && !matches!(slot, Some(Some(_))) {
             self.dx_add_entry(dir, &mut r, name, ino, mode)?;
             return self.dir_changed(dir);
         }
@@ -3380,18 +3386,18 @@ impl ExtFs {
     /// dir (inode r) の name の項目の場所 (ブロック, 位置)。索引つきなら葉を 1 つだけ、なければ見つけたところまでなめる
     /// (前の set_entry は、ディレクトリの項目をみな名前の文字列にして並べてから探していた)
     fn entry_loc(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u64, usize)>, i64> {
+        Ok(self.entry_at(dir, r, name)?.map(|(_, (b, o, _, _))| (b, o)))
+    }
+
+    /// ディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node、fast_unlink) は、これで引いて
+    /// remove_at で消す (前は引くのと消すので 2 度なめていた)。索引つきなら葉を 1 つだけ (決められなければ全部)
+    fn entry_at(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u32, Entry)>, i64> {
         if r.flags() & INDEX_FL != 0 && name != "." && name != ".." {
-            match self.dx_entry(dir, name) {
+            match self.dx_entry_at(dir, name) {
                 Err(e) if e == -NOIO_EAGAIN => {}
                 res => return res,
             }
         }
-        Ok(self.entry_at(dir, r, name)?.map(|(_, (b, o, _, _))| (b, o)))
-    }
-
-    /// 索引のないディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node) は、これで引いて
-    /// remove_at で消す (前は引くのと消すので 2 度なめていた)
-    fn entry_at(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u32, Entry)>, i64> {
         self.scan_dir(dir, r.clone(), |b, d, o, prev| {
             let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
             (i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes()).then(|| (i, (b, o, rl, prev.map(|p| (p, u16_at(d, p + 4) as usize)))))
@@ -3510,7 +3516,8 @@ impl ExtFs {
         let _d = dir_lock(dir);
         let ino = crate::proc::noio(|| {
             let pr = self.read_inode(dir).ok()?;
-            if pr.mode() & S_IFMT != S_IFDIR || pr.links() == 0 || pr.flags() & (INDEX_FL | IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&pr.perm_meta(), crate::cred::W | crate::cred::X, false) {
+            // 索引つきのディレクトリも、ハッシュの入る葉にすき間があれば (葉を分けるのはふつうの道で)
+            if pr.mode() & S_IFMT != S_IFDIR || pr.links() == 0 || pr.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&pr.perm_meta(), crate::cred::W | crate::cred::X, false) {
                 return None;
             }
             let slot = self.new_slot(dir, &pr, name).ok()??;
@@ -3569,7 +3576,7 @@ impl ExtFs {
         let _d = dir_lock(dir);
         crate::proc::noio(|| {
             let Ok(dr) = self.read_inode(dir) else { return FastUnlink::No };
-            if dr.mode() & S_IFMT != S_IFDIR || dr.flags() & (INDEX_FL | IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&dr.perm_meta(), crate::cred::W | crate::cred::X, false) {
+            if dr.mode() & S_IFMT != S_IFDIR || dr.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 || !c.may(&dr.perm_meta(), crate::cred::W | crate::cred::X, false) {
                 return FastUnlink::No;
             }
             let Ok(Some((child, at))) = self.entry_at(dir, &dr, name) else { return FastUnlink::No };
@@ -3985,17 +3992,11 @@ impl ExtInode {
             return Err(crate::why::inval());
         }
         let fs = &self.fs;
-        // 索引のないディレクトリは、引いた場所をそのまま消す (なめるのは 1 度)
+        // 引いた場所をそのまま消す (なめるのは 1 度。索引つきなら葉を 1 つ)
         let dr = fs.dir_writable(self.ino)?;
-        let (child, at) = match dr.flags() & INDEX_FL {
-            0 => fs.entry_at(self.ino, &dr, name)?.map(|(i, e)| (i, Some(e))).ok_or(-ENOENT)?,
-            _ => (fs.find(self.ino, name)?, None),
-        };
+        let (child, at) = fs.entry_at(self.ino, &dr, name)?.ok_or(-ENOENT)?;
         let r = self.victim(child, rmdir)?;
-        match at {
-            Some(e) => fs.remove_at(self.ino, dr, e, name)?,
-            None => fs.remove_entry(self.ino, name)?,
-        }
+        fs.remove_at(self.ino, dr, at, name)?;
         self.drop_victim(child, r)
     }
 
