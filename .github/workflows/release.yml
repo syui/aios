@@ -53,4 +53,5 @@ jobs:
           # タグ linux はブランチ linux と同じ名前なので、git でタグを押さずに gh にコミットで作らせる
           mv aios.tar.gz aios-x86_64.tar.gz
           gh release delete linux --yes --cleanup-tag || true
-          gh release create linux aios-x86_64.tar.gz --title aios --notes "* v$(date +%Y.%m.%d)" --target "$GITHUB_SHA"
+          # GitHub の Latest の印は main のリリース latest に (こちらは取らない)
+          gh release create linux aios-x86_64.tar.gz --title aios --notes "* v$(date +%Y.%m.%d)" --target "$GITHUB_SHA" --latest=false
