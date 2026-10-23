@@ -10,7 +10,7 @@ use crate::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// 覚える出来事の数 (1 つ 24 バイト: 8192 で 192 KiB)
 const N: usize = 8192;
@@ -90,17 +90,35 @@ fn put(kind: Kind, tid: u32, x: u64, flag: u16) {
     }
 }
 
-/// いまのプロセスが、名前の絞りに合うか (絞りがなければみな)
+/// 名前の絞りの版: 絞りを変えたとき (ctl trace on NAME) と、名前が変わったとき (exec、prctl の PR_SET_NAME) に進む。
+/// スレッドごとの答えの覚え (Proc::trace_mark) は、これと同じあいだ使う
+static FILTER_GEN: AtomicU64 = AtomicU64::new(1);
+
+pub fn names_changed() {
+    FILTER_GEN.fetch_add(1, Relaxed);
+}
+
+/// いまのプロセスが、名前の絞りに合うか (絞りがなければみな)。くらべるのは代表 (プロセス) の名前で、答えはスレッドごとに
+/// 覚える。代表を探して表をなめるのは大きなロックの中だけ: 前はロックなしのシステムコール (syscall::fast) からもなめて
+/// いた (ほかの CPU が表を書きかえているところを読む。Firefox のスレッドで bkl の知らせが出た)。ロックなしで、まだ
+/// 覚えていないスレッドは自分の名前で (作られたときに名前を受けつぐ)
 fn wanted() -> bool {
+    let generation = FILTER_GEN.load(Relaxed);
+    let p = crate::proc::current();
+    if p.trace_mark >> 1 == generation {
+        return p.trace_mark & 1 != 0;
+    }
     let r = RING.lock();
     let n = r.filter.iter().position(|&c| c == 0).unwrap_or(16);
-    if n == 0 {
-        return true;
-    }
     let f = r.filter;
     drop(r);
-    let p = crate::proc::current_leader();
-    f[..n].split(|&c| c == b',').any(|x| !x.is_empty() && p.comm.starts_with(x))
+    let fits = |comm: &[u8; 16]| n == 0 || f[..n].split(|&c| c == b',').any(|x| !x.is_empty() && comm.starts_with(x));
+    if !p.is_leader() && !crate::smp::holding() {
+        return fits(&p.comm);
+    }
+    let ok = fits(&crate::proc::current_leader().comm);
+    p.trace_mark = generation << 1 | ok as u64;
+    ok
 }
 
 // ---- それぞれの場所から (ON でなければすぐ戻る) ----
@@ -234,6 +252,7 @@ pub fn ctl(arg: &str) -> Result<(), i64> {
             let n = name.len().min(15);
             r.filter[..n].copy_from_slice(&name.as_bytes()[..n]);
             drop(r);
+            names_changed();
             ON.store(true, Relaxed);
         }
         "off" => ON.store(false, Relaxed),

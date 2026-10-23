@@ -288,6 +288,8 @@ pub struct Proc {
     pub cred: crate::cred::Cred,
     /// プログラムの名前 (/proc/PID/stat や ps に出る。最大 15 バイト)
     pub comm: [u8; 16],
+    /// trace の名前の絞りに合うかの覚え: (絞りの版 << 1 | 合う)。版が trace::FILTER_GEN と同じあいだ使う (trace::wanted)
+    pub trace_mark: u64,
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
     thread: bool,
     /// 取れなくても耐える区間 (heap::fallible) の深さ: この中でヒープが取れなければ null (ENOMEM)。予備は使わない
@@ -397,6 +399,7 @@ impl Proc {
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
         comm: [0; 16],
+        trace_mark: 0,
         thread: false,
         fallible: 0,
         clear_tid: 0,
@@ -481,6 +484,8 @@ impl Proc {
         self.comm = [0; 16];
         self.comm[..n].copy_from_slice(&name[..n]);
         crate::trace::name(self.pid, &self.comm);
+        // 代表の名前が変わったかもしれない: trace の絞りの覚えを古くする
+        crate::trace::names_changed();
     }
 
     pub fn comm(&self) -> &str {
