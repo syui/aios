@@ -2486,6 +2486,30 @@ impl PageTable {
         ok
     }
 
+    /// 大きなロックなしの mremap (syscall::fast): 動かさずに伸ばす (flags 0) もので、伸ばせないと表を読むだけで分かるもの。
+    /// 古い場所 [old, old_end) が 1 つの領域に入っていなければ EFAULT、領域の終わりでないか、その先 new_end までに
+    /// ほかの領域があれば ENOMEM (sys_mremap と extend と同じ答え)。伸ばせるもの (表を変える) と、だれかが表を変えている
+    /// 途中なら None (ふつうの道へ)。Firefox はページを読みこむたびに、1 ページの領域を 2 ページにできるかを何万回も
+    /// たずねる (みな ENOMEM)。表は fast_fault と同じく、変える人がいないときだけ読む
+    pub fn fast_mremap_fail(&self, old: usize, old_end: usize, new_end: usize) -> Option<i64> {
+        const EFAULT: i64 = 14;
+        const ENOMEM: i64 = 12;
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let r = if self.mutators.load(Ordering::SeqCst) != 0 {
+            None
+        } else {
+            match self.find(old) {
+                None => Some(-EFAULT),
+                Some((_, v)) if v.end < old_end => Some(-EFAULT),
+                Some((_, v)) if v.end == old_end && self.vmas.range(old_end..new_end).next().is_none() => None,
+                Some(_) => Some(-ENOMEM),
+            }
+        };
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+
     /// 大きなロックなしで、va から len バイトがみな写っているか (読める) だけを見る (write_fast が、ページを書きかえる前に)
     pub fn readable_nofault(&self, va: usize, len: usize) -> bool {
         self.fast_users.fetch_add(1, Ordering::SeqCst);

@@ -919,6 +919,19 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             Some(r) => r,
             None => return false,
         },
+        // 動かさずに伸ばす mremap (flags 0) で、伸ばせない (ENOMEM) か古い場所に領域がない (EFAULT) と表を読んで分かるもの
+        // (Firefox が 1 ページの領域で何万回も)。伸ばせるもの、縮める・動かす・知らない形は、ふつうの道 (sys_mremap) へ
+        MREMAP if a[3] == 0 && a[0] & 0xfff == 0 && a[1] != 0 && a[2] > a[1] && a[2] < crate::vm::MAXVA as u64 => {
+            let (old, old_size, new_size) = (a[0] as usize, pg_up(a[1] as usize), pg_up(a[2] as usize));
+            let (Some(old_end), Some(new_end)) = (old.checked_add(old_size), old.checked_add(new_size)) else { return false };
+            if new_size <= old_size || new_end > crate::vm::MAXVA {
+                return false;
+            }
+            match p.pt().fast_mremap_fail(old, old_end, new_end) {
+                Some(r) => r,
+                None => return false,
+            }
+        }
         LSEEK => match crate::file::fast_lseek(p, a[0], a[1] as i64, a[2]) {
             Some(r) => r,
             None => return false,
@@ -1234,7 +1247,9 @@ fn sys_munmap(addr: usize, len: usize) -> R {
 }
 
 /// mremap: 領域の大きさを変える (縮める、その場で伸ばす、MREMAP_MAYMOVE なら別の場所へ写す)。
-/// 古い場所に領域がなければ EFAULT (Firefox などは mremap でページがあるかを確かめる)
+/// 古い場所に領域がなければ EFAULT (Firefox などは mremap でページがあるかを確かめる)。Linux 6.18 と同じ順に: 大きさ 0 の
+/// 古い場所は、共有でなければ EINVAL。同じ大きさと縮めるのは、古い場所が領域をこえていても答える (縮めるなら、こえたところも
+/// 外す)。こえていて EFAULT なのは伸ばすときと動かすとき
 fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr: usize) -> R {
     const EFAULT: i64 = 14;
     const MREMAP_MAYMOVE: u64 = 1;
@@ -1245,12 +1260,12 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     }
     let (old_size, new_size) = (pg_up(old_size), pg_up(new_size));
     let m = proc::current().mm();
-    // 古い場所は 1 つの領域の中でなければならない
     let Some((vstart, v)) = m.pt.find(old).map(|(s, v)| (s, v.clone())) else { return Err(-EFAULT) };
-    let old_end = old.checked_add(old_size.max(PGSIZE)).ok_or(-EFAULT)?;
-    if old_size == 0 || v.end < old_end {
-        return Err(-EFAULT);
+    // 大きさ 0 は、共有の領域を写すとき (Linux は MAP_PRIVATE のものを断る)
+    if old_size == 0 && !v.shared {
+        return Err(crate::why::inval());
     }
+    let old_end = old.checked_add(old_size.max(PGSIZE)).ok_or(-EFAULT)?;
     if flags & MREMAP_FIXED == 0 {
         if new_size == old_size {
             return Ok(old as i64);
@@ -1259,6 +1274,12 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
             m.pt.unmap(old + new_size, old_end);
             return Ok(old as i64);
         }
+    }
+    // 伸ばす・動かす古い場所は 1 つの領域の中でなければならない
+    if old_size == 0 || v.end < old_end {
+        return Err(-EFAULT);
+    }
+    if flags & MREMAP_FIXED == 0 {
         // その場で伸ばす (領域の終わりまで使っていて、その先が空いているとき)
         if v.end == old_end && m.pt.extend(vstart, old + new_size).is_some() {
             return Ok(old as i64);
