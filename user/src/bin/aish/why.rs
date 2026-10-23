@@ -64,12 +64,30 @@ fn about(e: &serde_json::Value, words: &[&str]) -> bool {
     words.iter().map(|w| w.trim_start_matches("./").trim_start_matches('/')).filter(|w| w.len() > 1).any(|w| w.contains(path) || full.contains(w))
 }
 
-/// 出すわけを選ぶ (新しい順の v から): コマンドに書いたパスにかかわるもの、なければ、さがしもの (probe) でないもの、
-/// なければいちばん新しいもの。しくじったあとに、エラーの文を訳すために locale のファイルをさがすもの (uutils) がある
+/// コマンドの言葉のうち引数だけ: それぞれのコマンドの名前 (頭の言葉と、| && || ; のあとの言葉。前の VAR=x も) と記号は
+/// のぞく。名前を入れると、PATH をさがすもの (/usr/local/bin/grep) や grep の locale のファイル (…/locales/grep) に重なった
+fn args(cmd: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut head = true;
+    for w in cmd.split_whitespace() {
+        if w.chars().all(|c| "|&;()".contains(c)) {
+            head = true;
+        } else if head {
+            head = w.contains('=');
+        } else {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// 出すわけを選ぶ (新しい順の v から): コマンドに書いたパスにかかわるもの、なければ、さがしもの (probe) でないもの。
+/// どちらもなければ出さない: しくじったあとに、エラーの文を訳すために locale のファイルをさがすもの (uutils) があり、
+/// grep が見つけなかっただけ (1 で終わる) でも「/usr/share/locales/grep がない」と出ていた
 fn pick<'a>(v: &'a [serde_json::Value], cmd: &str) -> Option<&'a serde_json::Value> {
-    let words: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+    let words = args(cmd);
     let with: Vec<&serde_json::Value> = v.iter().filter(|e| e.get("why").is_some()).collect();
-    with.iter().find(|e| about(e, &words)).or_else(|| with.iter().find(|e| e.get("probe").is_none())).or_else(|| with.first()).copied()
+    with.iter().find(|e| about(e, &words)).or_else(|| with.iter().find(|e| e.get("probe").is_none())).copied()
 }
 
 /// コマンドが標準エラーをよそへ向けている (2>/dev/null、2>FILE、&>FILE。2>&1 はのぞく)

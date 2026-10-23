@@ -397,6 +397,20 @@ struct Job {
     polled: Instant,
 }
 
+/// 自分のバイナリ (うしろの仕事はこれを KEY 引数で起こす)。ビルドしなおされて古いものが消えていれば (/proc/self/exe が
+/// 「… (deleted)」)、同じ場所の新しいもの (aish が入れかえるまでのあいだも動けるように。なければ、わけを言う)
+fn self_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find this plugin's file: {}", e))?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    let name = exe.to_string_lossy().into_owned();
+    match name.strip_suffix(" (deleted)").map(PathBuf::from) {
+        Some(new) if new.is_file() => Ok(new),
+        _ => Err(format!("{}: this plugin's file is gone (rebuilt or removed); build it again (bin/aish-mcp.sh --build) and aish restarts it", name)),
+    }
+}
+
 /// key のものがなければ起こし、wait_ms まで待つ。終わったら最後の行の JSON (と途中の行)
 fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Value {
     // running と答えたまま見に来なかったもの (5 分より前) が終わっていたら、続きではなく新しく始める
@@ -408,7 +422,11 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Va
         let dir = root.join("build/aish-vm");
         let _ = std::fs::create_dir_all(&dir);
         let log = dir.join(format!("{}.log", key));
-        let (Ok(out), Ok(exe)) = (std::fs::File::create(&log), std::env::current_exe()) else { return error(format!("{}: cannot start", log.display())) };
+        let exe = match self_exe() {
+            Ok(e) => e,
+            Err(e) => return error(e),
+        };
+        let Ok(out) = std::fs::File::create(&log) else { return error(format!("{}: cannot start", log.display())) };
         let Ok(err) = out.try_clone() else { return error("cannot start") };
         match Command::new(exe).args([key, &a.to_string()]).current_dir(root).env("AIOS_SRC", root).stdin(Stdio::null()).stdout(out).stderr(err).spawn() {
             Ok(c) => jobs.insert(key.to_string(), Job { child: c, log, t0: Instant::now(), polled: Instant::now() }),
