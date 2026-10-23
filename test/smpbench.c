@@ -81,6 +81,9 @@ static long futex(int *a, int op, int v) { return syscall(SYS_futex, a, op, v, N
 // map-file で写すファイルの大きさ (プログラムがライブラリを写してさわるように)
 #define MAPLEN (1 << 20)
 
+// mmap-busy ではじめに置いておく、ファイルの小さな写しの数 (Firefox は領域が何千もある)
+#define BUSY 3000
+
 // プロセス 1 つが使うもの (はじめに作る)
 struct own {
   char dir[4200], file[4300], tmp[4300], map[4300];
@@ -105,6 +108,12 @@ static void setup(struct own *o, int id, const char *op) {
   for (int off = 0; o->mfd >= 0 && off < MAPLEN; off += sizeof page)
     if (pwrite(o->mfd, page, sizeof page, off) != sizeof page) {
       bad("map file");
+      break;
+    }
+  // mmap-busy のときだけ: 大きなプログラムのように、領域をたくさん持ってから (となりあわないように、同じページを写す)
+  for (int i = 0; !strcmp(op, "mmap-busy") && i < BUSY; i++)
+    if (mmap(NULL, sizeof page, PROT_READ, MAP_PRIVATE, o->fd, 0) == MAP_FAILED) {
+      bad("busy map");
       break;
     }
   if (pipe(o->pipe) < 0)
@@ -164,7 +173,7 @@ static void step(const char *op, struct own *o) {
   } else if (!strcmp(op, "unix")) {
     if (write(o->sock[0], &c, 1) != 1 || read(o->sock[1], &c, 1) != 1)
       bad("unix");
-  } else if (!strcmp(op, "mmap")) {
+  } else if (!strcmp(op, "mmap") || !strcmp(op, "mmap-busy")) {
     char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
       bad("mmap");
@@ -241,7 +250,7 @@ static double measure(const char *op, int k, double ms, long *total) {
   return rate > 0 ? 1e3 / rate : 0;
 }
 
-static const char *OPS[] = {"getppid", "umask", "futex-wake", "stat", "open-close", "read-4k", "write-4k", "create-unlink", "pipe", "unix", "mmap", "map-file", "fork"};
+static const char *OPS[] = {"getppid", "umask", "futex-wake", "stat", "open-close", "read-4k", "write-4k", "create-unlink", "pipe", "unix", "mmap", "mmap-busy", "map-file", "fork"};
 
 int main(int argc, char **argv) {
   int runs = 1, all_only = 0, i = 1;

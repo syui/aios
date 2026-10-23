@@ -1448,6 +1448,13 @@ impl PageTable {
         self.vmas.range(..=va).next_back().filter(|(_, v)| va < v.end).map(|(&s, v)| (s, v))
     }
 
+    /// [start, end) にかかる領域。領域は重ならないので、start より前に始まるものは start にかかりうる最後の 1 つだけ
+    /// (Linux の vma_find。頭から見ていたら、領域が何千もある Firefox で munmap のたびに 60 µs かかっていた)
+    fn vmas_in(&self, start: usize, end: usize) -> impl Iterator<Item = (&usize, &Vma)> {
+        let from = self.vmas.range(..=start).next_back().filter(|(_, v)| v.end > start).map_or(start, |(&s, _)| s);
+        self.vmas.range(from.min(end)..end)
+    }
+
     /// addr で領域を 2 つに分ける (addr が領域の中なら)
     fn split(&mut self, addr: usize) {
         let Some((start, v)) = self.find(addr).map(|(s, v)| (s, v.clone())) else { return };
@@ -1467,10 +1474,7 @@ impl PageTable {
     /// 穴の 0 のページ)
     fn shared_keys(&self, start: usize, end: usize) -> Vec<FileKey> {
         let mut keys = Vec::new();
-        for (&s, v) in self.vmas.range(..end) {
-            if v.end <= start {
-                continue;
-            }
+        for (&s, v) in self.vmas_in(start, end) {
             if let Backing::File { ino, off, .. } = &v.back {
                 // 表を range で引く (領域のページをみな数えると、大きな MAP_SHARED があれば、munmap と exec (fork した
                 // 写しを捨てる) のたびに何万もの鍵を作って 1 つずつ表を引く)
@@ -1659,8 +1663,8 @@ impl PageTable {
     pub fn discard(&mut self, start: usize, end: usize) {
         let _m = self.mutating();
         let mut shared = Vec::new();
-        for (&s, v) in self.vmas.range(..end) {
-            if v.end > start && v.shared {
+        for (&s, v) in self.vmas_in(start, end) {
+            if v.shared {
                 shared.push((s.max(start), v.end.min(end)));
             }
         }

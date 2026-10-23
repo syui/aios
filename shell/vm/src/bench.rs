@@ -67,6 +67,7 @@ const SMP_OPS: &[(&str, &str)] = &[
     ("pipe", "自分のパイプに 1 バイト書いて読む"),
     ("unix", "自分の AF_UNIX の socketpair に 1 バイト書いて読む"),
     ("mmap", "64 KiB の無名の領域を mmap して 2 ページさわって munmap"),
+    ("mmap-busy", "mmap と同じことを、ファイルの小さな写しを 3000 持ったプロセスで (大きなプログラムは領域が何千もある)"),
     ("map-file", "自分の 1 MiB のファイル (ページキャッシュにある) を読むだけで mmap して、256 ページをみなさわって munmap"),
     ("fork", "fork して子は _exit、waitpid"),
 ];

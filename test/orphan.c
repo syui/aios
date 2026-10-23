@@ -18,14 +18,21 @@
 //   orphan [DIR...]   DIR (既定 .) ごとに、その下に orphan-PID を作って
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+// musl (zig cc) には renameat2 がないので、じかに
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
 
 static int fails;
 static char path[512], sub[512], lnk[512];
@@ -155,7 +162,7 @@ static void moved(const char *name) {
         close(open(g, O_WRONLY | O_CREAT, 0644));
         stat(f, &st);
         stat(g, &st);
-        if (renameat2(AT_FDCWD, f, AT_FDCWD, g, RENAME_EXCHANGE) != 0)
+        if (syscall(SYS_renameat2, AT_FDCWD, f, AT_FDCWD, g, RENAME_EXCHANGE) != 0)
             perror("renameat2");
         unlink(f);
         unlink(g);
