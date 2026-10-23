@@ -133,6 +133,35 @@ pub struct PosixTimer {
     pub overrun: i32,
 }
 
+/// 落ちたプロセスの知らせ (シリアルにも出る) は 5 秒に 10 こまで (Linux の printk_ratelimit: 5 * HZ に 10)。ロボットの子のように、
+/// わざと自分に SIGABRT を送って死ぬものが続くと、シリアルが詰まって遅くなり、CI のログもそれで埋まっていた。
+/// 出さなかった数は、次に出せるときに 1 行で
+static REPORT_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SUPPRESSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const REPORT_BURST: u32 = 10;
+const REPORT_INTERVAL_NS: u64 = 5_000_000_000;
+
+fn report_allowed() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::timer::uptime_ns();
+    let start = REPORT_START.load(Relaxed);
+    if start == 0 || now.saturating_sub(start) >= REPORT_INTERVAL_NS {
+        REPORT_START.store(now.max(1), Relaxed);
+        REPORTED.store(0, Relaxed);
+        let missed = SUPPRESSED.swap(0, Relaxed);
+        if missed > 0 {
+            println!("signal: {} reports of processes killed by a signal suppressed", missed);
+        }
+    }
+    if REPORTED.fetch_add(1, Relaxed) < REPORT_BURST {
+        true
+    } else {
+        SUPPRESSED.fetch_add(1, Relaxed);
+        false
+    }
+}
+
 const fn bit(sig: i32) -> u64 {
     1 << (sig - 1)
 }
@@ -466,12 +495,16 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             SIG_DFL => match default_action(sig) {
                 Default::Ignore => continue,
                 Default::Terminate => {
-                    // 異常で落ちたもの (Linux が core を吐く種類) は知らせる (調べもの用)
-                    if matches!(sig, 4..=8 | 11 | 31) {
+                    // 異常で落ちたもの (Linux が core を吐く種類) は知らせる (調べもの用)。5 秒に 10 こまで
+                    if matches!(sig, 4..=8 | 11 | 31) && report_allowed() {
                         // SIGILL 4, SIGTRAP 5, SIGABRT 6, SIGBUS 7, SIGFPE 8, SIGSEGV 11, SIGSYS 31
                         let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
                         let (pc, addr, ec) = p.last_fault;
-                        if let Some((name, off)) = p.mm.as_ref().and_then(|_| p.mm().pt.name_at(pc as usize)) {
+                        // カーネルがフォールトで出したもの (si_code が正: SEGV_MAPERR、BUS_ADRERR、ILL_ILLOPC など) だけ、落ちた
+                        // ところをくわしく。プロセスが送ったもの (kill、tkill、abort の raise: 0 以下) には落ちたところがないので、
+                        // だれが送ったかと、abort の文 (x0 などの文字列) だけ
+                        let fault = info.code > 0;
+                        if let Some((name, off)) = p.mm.as_ref().filter(|_| fault).and_then(|_| p.mm().pt.name_at(pc as usize)) {
                             println!("pid {}: pc {:#x} is {} + {:#x}", p.pid, pc, name, off);
                         }
                         if p.mm.as_ref().is_some() {
@@ -485,10 +518,10 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                                 }
                             }
                         }
-                        if let Some((name, off)) = p.mm.as_ref().and_then(|_| p.mm().pt.name_at(p.last_lr as usize)) {
+                        if let Some((name, off)) = p.mm.as_ref().filter(|_| fault).and_then(|_| p.mm().pt.name_at(p.last_lr as usize)) {
                             println!("pid {}: lr {:#x} is {} + {:#x}", p.pid, p.last_lr, name, off);
                         }
-                        if p.mm.as_ref().is_some() {
+                        if fault && p.mm.as_ref().is_some() {
                             // 落ちたアドレスとスタックがどこか (スタックのあふれと、外を読んだのを見分ける)
                             let pt = &p.mm().pt;
                             println!("pid {}: addr {:#x} is {}", p.pid, addr, pt.region_text(addr as usize));
@@ -503,16 +536,17 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                                 println!("pid {}: addr page: {}", p.pid, l);
                             }
                         }
-                        println!(
-                            "pid {} ({}): killed by signal {} (last fault: pc {:#x} addr {:#x} ec {:#x}, last syscall {})",
-                            p.pid,
-                            core::str::from_utf8(&p.comm[..n]).unwrap_or("?"),
-                            sig,
-                            pc,
-                            addr,
-                            ec,
-                            p.last_sys.0
-                        );
+                        let comm = core::str::from_utf8(&p.comm[..n]).unwrap_or("?");
+                        if fault {
+                            println!(
+                                "pid {} ({}): killed by signal {} (fault: pc {:#x} addr {:#x} ec {:#x}, last syscall {})",
+                                p.pid, comm, sig, pc, addr, ec, p.last_sys.0
+                            );
+                        } else if info.pid == p.tgid {
+                            println!("pid {} ({}): killed by signal {} sent by itself (last syscall {})", p.pid, comm, sig, p.last_sys.0);
+                        } else {
+                            println!("pid {} ({}): killed by signal {} sent by pid {} (last syscall {})", p.pid, comm, sig, info.pid, p.last_sys.0);
+                        }
                     }
                     proc::die(sig)
                 }
