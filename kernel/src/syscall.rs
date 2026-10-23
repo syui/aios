@@ -263,6 +263,26 @@ nrs! {
     FCHMODAT2 = 452,
 }
 
+/// 1 つめの引数が fd のシステムコールで、/proc/bkl がその fd の開いたものの種類 (file::CLASSES) ごとに分けて数えるもの
+/// (read がパイプか、ソケットか、ファイルかで、ロックを分ける場所がちがう)
+pub const FD_SYS: [u64; 15] = [
+    nr::READ,
+    nr::WRITE,
+    nr::READV,
+    nr::WRITEV,
+    nr::PREAD64,
+    nr::PWRITE64,
+    nr::PREADV,
+    nr::PWRITEV,
+    nr::PREADV2,
+    nr::PWRITEV2,
+    nr::IOCTL,
+    nr::SENDTO,
+    nr::RECVFROM,
+    nr::SENDMSG,
+    nr::RECVMSG,
+];
+
 /// システムコールがどの extra のものか (切れるものだけ。parts.rs)
 fn part_of(nr: u64) -> Option<crate::parts::Part> {
     use crate::parts::Part;

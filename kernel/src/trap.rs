@@ -188,7 +188,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に。
     // 時計を読むのは、測る回 (smp::SAMPLE のくじ) の取ったときと終わりの 2 回だけ (取った時刻と放す時刻にも使う)
     let cause = match kind {
-        EL0_SYNC if esr >> 26 == EC_SVC64 => crate::smp::Cause::Sys(tf.x[8]),
+        EL0_SYNC if esr >> 26 == EC_SVC64 => crate::smp::Cause::sys(tf.x[8], tf.x[0]),
         EL0_SYNC => crate::smp::Cause::Fault,
         _ => crate::smp::Cause::Irq,
     };

@@ -358,6 +358,11 @@ pub struct Proc {
     pub last_sp: u64,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
+    /// 眠りの待ち行列のつなぎ (chan のもの、期限つきのもの)
+    wq: Link,
+    tm: Link,
+    /// 走れるものの並びのつなぎ (RUNQ)
+    rq: Link,
     /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
     poll_keys: Option<Vec<usize>>,
     context: Context,
@@ -427,6 +432,9 @@ impl Proc {
         last_regs: [0; 3],
         last_sp: 0,
         wake_at: 0,
+        wq: Link::NONE,
+        tm: Link::NONE,
+        rq: Link::NONE,
         poll_keys: None,
         context: Context::ZERO,
         tpidr: 0,
@@ -607,6 +615,8 @@ fn slot_of(p: &Proc) -> usize {
 fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     let i = slot_of(p);
+    wq_leave(i);
+    unlink(i, |p| &mut p.rq);
     LIVE.get()[i / 64] &= !(1u64 << (i % 64));
     *p = Proc::UNUSED;
 }
@@ -643,6 +653,97 @@ fn live_from(start: usize) -> impl Iterator<Item = usize> {
         Bits { base: w * 64, bits }
     })
 }
+
+// ---- 眠りの待ち行列 ----
+// Linux の wait queue のように、眠っているものだけを並べておく。前は起こすたびに、生きている Proc をみな見ていた
+// (スレッドの多い Firefox で wakeup が 1 回 50 µs、タイマの割り込みのたびにも)。眠るときに自分を入れ (wq_enter)、
+// 起きて走りだしたとき (sched から戻ったところ) に自分で出る (wq_leave)。起こす側は出さない (起こし方がいくつも
+// ある: wakeup、シグナル、期限、kill)。なので並びには、起こされてまだ走っていないものもいる (state を見てとばす)
+
+const NONE: u16 = u16::MAX;
+
+/// 並びのつなぎ (Proc の添字。NONE で終わり)。head は入っている並び (HEADS の番号。NONE なら入っていない)
+#[derive(Clone, Copy)]
+struct Link {
+    head: u16,
+    next: u16,
+    prev: u16,
+}
+
+impl Link {
+    const NONE: Link = Link { head: NONE, next: NONE, prev: NONE };
+}
+
+/// chan のハッシュごとの、そこで眠っているものの並び (Proc::wq でつなぐ)。そのあとの TIMED は期限つきで眠っている
+/// ものの並び (Proc::tm でつなぐ。タイマの wake_expired が見る)、RUNQ は走れるもの (Runnable) の並び (Proc::rq で
+/// つなぐ。pick が見る: Linux の runqueue。前は pick も、生きている Proc をみな見ていた)
+const NWQ: usize = 256;
+const TIMED: usize = NWQ;
+const RUNQ: usize = NWQ + 1;
+static HEADS: Bkl<[u16; NWQ + 2]> = Bkl::new([NONE; NWQ + 2]);
+
+fn wq_of(chan: usize) -> usize {
+    ((chan as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize
+}
+
+fn link(i: usize, head: usize, l: fn(&mut Proc) -> &mut Link) {
+    let heads = HEADS.get();
+    let first = heads[head];
+    *l(&mut procs()[i]) = Link { head: head as u16, next: first, prev: NONE };
+    if first != NONE {
+        l(&mut procs()[first as usize]).prev = i as u16;
+    }
+    heads[head] = i as u16;
+}
+
+fn unlink(i: usize, l: fn(&mut Proc) -> &mut Link) {
+    let me = *l(&mut procs()[i]);
+    if me.head == NONE {
+        return;
+    }
+    if me.prev != NONE {
+        l(&mut procs()[me.prev as usize]).next = me.next;
+    } else {
+        HEADS.get()[me.head as usize] = me.next;
+    }
+    if me.next != NONE {
+        l(&mut procs()[me.next as usize]).prev = me.prev;
+    }
+    *l(&mut procs()[i]) = Link::NONE;
+}
+
+/// いまのスレッドを、chan (と期限があれば TIMED) の並びに入れる (Sleeping にしてから、sched の前に)
+fn wq_enter() {
+    let Some(i) = cur() else { return };
+    link(i, wq_of(procs()[i].chan), |p| &mut p.wq);
+    if procs()[i].wake_at != 0 {
+        link(i, TIMED, |p| &mut p.tm);
+    }
+}
+
+/// いまのスレッドが並びから出る (起きて sched から戻ったところで)
+fn wq_exit() {
+    if let Some(i) = cur() {
+        wq_leave(i);
+    }
+}
+
+/// i を並びから出る (wq_exit と、片づけるスロット)
+fn wq_leave(i: usize) {
+    unlink(i, |p| &mut p.wq);
+    unlink(i, |p| &mut p.tm);
+}
+
+/// 走れるようにする (Runnable にして RUNQ に入れる)。Runnable にするのは、みなここから
+fn make_runnable(p: &mut Proc) {
+    p.state = State::Runnable;
+    if p.rq.head == NONE {
+        link(slot_of(p), RUNQ, |p| &mut p.rq);
+    }
+}
+
+/// CPU ごとの、いま走らせている Proc の添字 + 1 (0 は何も)。起こしたものにゆずらせる相手を、Proc をみな見ずに選ぶ
+static ON_CPU: [core::sync::atomic::AtomicUsize; crate::smp::MAXCPU] = [const { core::sync::atomic::AtomicUsize::new(0) }; crate::smp::MAXCPU];
 
 /// 使っている Proc (Unused でないもの)
 fn live() -> impl Iterator<Item = &'static mut Proc> {
@@ -855,7 +956,7 @@ pub fn user_init() {
     p.set_comm(init.rsplit('/').next().unwrap_or("init").as_bytes());
     p.pgid = p.pid;
     p.sid = p.pid;
-    p.state = State::Runnable;
+    make_runnable(p);
 }
 
 #[unsafe(no_mangle)]
@@ -866,28 +967,25 @@ extern "C" fn forkret_unlock() {
 /// 次に走らせるもの: 実行できるもののうち recent が一番少ないもの (同じなら start から順に見て先のもの)。
 /// ふだん眠っているもの (aiwm、シェル、入力を待つもの) は recent が少ないので、起きるとすぐ走る。
 /// CPU を使い続けるもの (llvmpipe、ビルド) どうしは、recent が増えては減るので順番に回る
+/// 走れるもの (RUNQ) だけを見て、選んだものは RUNQ から出す
 fn pick(start: usize) -> Option<usize> {
-    let mut best: Option<(u32, usize)> = None;
-    for i in live_from(start) {
-        let p = &mut procs()[i];
-        if p.state == State::Zombie && (p.thread || p.autoreap) {
-            // 終わったスレッドは誰も wait しないのでここで片付ける
-            free_slot(p);
-            continue;
-        }
-        if p.state != State::Runnable {
-            continue;
-        }
+    // (recent, start からの順, 添字)
+    let mut best: Option<(u32, usize, usize)> = None;
+    let mut i = HEADS.get()[RUNQ];
+    while i != NONE {
+        let k = i as usize;
+        let p = &procs()[k];
+        i = p.rq.next;
         // ゆずったものは 1 秒ぶん後ろに (スピンして待つ相手を先に走らせる)
         let key = p.recent + if p.yielded { crate::timer::HZ as u32 } else { 0 };
-        if best.is_none_or(|(r, _)| key < r) {
-            best = Some((key, i));
-            if key == 0 {
-                break;
-            }
+        let order = (k + NPROC - start) % NPROC;
+        if best.is_none_or(|(r, o, _)| (key, order) < (r, o)) {
+            best = Some((key, order, k));
         }
     }
-    best.map(|(_, i)| i)
+    let (_, _, k) = best?;
+    unlink(k, |p| &mut p.rq);
+    Some(k)
 }
 
 /// 1 秒ごと (cpu0 の tick) に recent を半分にする。5 秒ごとに load average を進める
@@ -965,17 +1063,24 @@ pub fn scheduler() -> ! {
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
+                ON_CPU[crate::smp::id()].store(i + 1, Relaxed);
                 p.pt().activate_lazy();
                 fp_load(&p.fp);
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
                 crate::smp::dev_wait(2, t0);
                 swtch(sched_ctx(), &p.context);
                 set_cur(None);
+                ON_CPU[crate::smp::id()].store(0, Relaxed);
                 // 終わったスレッドのページ表はほかの CPU が片付けるかもしれないので、外しておく。生きているものは
                 // 載せたまま (次に同じアドレス空間のスレッドを選べば、載せなおさない。ページ表は、それを使う
                 // スレッドがみな終わるまで捨てられず、捨てるのは大きなロックの中: このループのあいだはない)
                 if matches!(procs()[i].state, State::Zombie | State::Unused) {
                     crate::vm::deactivate();
+                }
+                // 終わったスレッドは誰も wait しないので、ここで片付ける (このスタックから出たあと、ページ表を外したあと)
+                let p = &mut procs()[i];
+                if p.state == State::Zombie && (p.thread || p.autoreap) {
+                    free_slot(p);
                 }
             }
             ran = true;
@@ -987,7 +1092,7 @@ pub fn scheduler() -> ! {
             }
             // 眠ると印をつけてから確かめる (そのあとに起こす CPU は、印を見て割り込みを送る)
             crate::smp::set_idle(true);
-            if live().any(|p| p.state == State::Runnable) {
+            if HEADS.get()[RUNQ] != NONE {
                 crate::smp::set_idle(false);
                 continue;
             }
@@ -1030,7 +1135,7 @@ fn sched() {
 }
 
 pub fn yield_now() {
-    current().state = State::Runnable;
+    make_runnable(current());
     sched();
 }
 
@@ -1051,7 +1156,9 @@ pub fn sleep_nointr(chan: usize) {
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
     crate::trace::sleep(chan);
+    wq_enter();
     sched();
+    wq_exit();
     let p = current();
     p.chan = 0;
     p.nointr = false;
@@ -1068,7 +1175,9 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
     crate::trace::sleep(chan);
+    wq_enter();
     sched();
+    wq_exit();
     let p = current();
     p.chan = 0;
     let timed_out = p.wake_at != 0 && crate::timer::ticks() >= p.wake_at;
@@ -1082,27 +1191,44 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
 /// chan で眠っている Proc を起こし、起こした数を返す
 pub fn wakeup(chan: usize) -> usize {
     let _p = crate::prof::span("proc:wakeup");
-    wake_where(|p| p.chan == chan)
+    wake_chan(chan, |_| true)
 }
 
-/// 眠っているもののうち f に合うものを起こす。眠っている CPU があれば起こし、なければ
+/// chan で眠っているもののうち f に合うものを起こす (chan の並びだけを見る)
+fn wake_chan(chan: usize, f: impl Fn(&Proc) -> bool) -> usize {
+    wake_list(wq_of(chan), |p| &mut p.wq, |p| p.chan == chan && f(p))
+}
+
+/// 並び head で眠っているもののうち f に合うものを起こす。眠っている CPU があれば起こし、なければ
 /// 走っているもののうち一番 CPU を使っている (recent) ものにゆずらせる (preempt)
-fn wake_where(f: impl Fn(&Proc) -> bool) -> usize {
+fn wake_list(head: usize, l: fn(&mut Proc) -> &mut Link, f: impl Fn(&Proc) -> bool) -> usize {
     let mut n = 0;
     let mut woken = u32::MAX;
-    let mut busiest: Option<(u32, usize)> = None;
-    for p in live() {
+    let mut i = HEADS.get()[head];
+    while i != NONE {
+        let p = &mut procs()[i as usize];
+        // 起こしても並びは変えない (出るのは起きたほう) ので、次はいつでも読める
+        i = l(p).next;
         if p.state == State::Sleeping && f(p) {
-            p.state = State::Runnable;
+            make_runnable(p);
             p.woken_ns = crate::timer::uptime_ns();
             crate::trace::wake(p.pid, p.chan);
             woken = woken.min(p.recent);
             n += 1;
-        } else if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
-            busiest = Some((p.recent, p.cpu));
         }
     }
     if n > 0 && !crate::smp::wake_idle_n(n) {
+        // 走っているもの (CPU ごとに 1 つ) のうち一番 CPU を使っているもの
+        let mut busiest: Option<(u32, usize)> = None;
+        for (cpu, on) in ON_CPU.iter().enumerate().take(crate::smp::online()) {
+            let k = on.load(core::sync::atomic::Ordering::Relaxed);
+            if k != 0 {
+                let p = &procs()[k - 1];
+                if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
+                    busiest = Some((p.recent, cpu));
+                }
+            }
+        }
         if let Some((r, cpu)) = busiest {
             preempt(woken, r, cpu);
         }
@@ -1177,7 +1303,7 @@ pub fn pidfd_key() -> usize {
 /// key (パイプや端末など) が変わった: それを見張って poll で眠っているものだけを起こす
 pub fn poll_wake(key: usize) {
     let chan = poll_chan();
-    wake_where(|p| p.chan == chan && p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)));
+    wake_chan(chan, |p| p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)));
 }
 
 /// 調べもの用 (/proc/strace に "kick PID"): tgid の futex で眠っているスレッドをみな起こす。
@@ -1188,7 +1314,7 @@ pub fn futex_kick(tgid: u32) -> usize {
 
 /// tid のスレッドが chan で眠っていれば起こす (futex: 待つものはみな同じ chan で眠り、起こすものを選ぶ)
 pub fn wake_tid(tid: u32, chan: usize) -> bool {
-    wake_where(|p| p.pid == tid && p.chan == chan) > 0
+    wake_chan(chan, |p| p.pid == tid) > 0
 }
 
 /// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
@@ -1218,7 +1344,7 @@ pub fn raw_dump(tid: u32) {
 
 /// タイマから: 期限の来た Proc を起こす
 pub fn wake_expired(now: u64) {
-    wake_where(|p| p.wake_at != 0 && p.wake_at <= now);
+    wake_list(TIMED, |p| &mut p.tm, |p| p.wake_at != 0 && p.wake_at <= now);
 }
 
 fn kill_proc(p: &mut Proc) {
@@ -1465,7 +1591,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.vfork_parent = parent.pid;
     }
     let chan = vfork_chan(child);
-    child.state = State::Runnable;
+    make_runnable(child);
     crate::smp::wake_idle();
     if vfork {
         // シグナルではやめない (止められたときだけ)。届いているシグナルがあると眠れないので、そのあいだはゆずりながら
@@ -1709,7 +1835,9 @@ pub fn stop_while_stopped() {
         }
         p.chan = stop_chan(l);
         p.state = State::Sleeping;
+        wq_enter();
         sched();
+        wq_exit();
         current().chan = 0;
     }
 }
@@ -1722,7 +1850,7 @@ pub fn stop_chan(leader: &Proc) -> usize {
 pub fn interrupt(t: &mut Proc) {
     match t.state {
         State::Sleeping if !t.nointr => {
-            t.state = State::Runnable;
+            make_runnable(t);
             crate::smp::wake_idle();
         }
         // ほかの CPU のユーザーモードで走っている: すぐに戻ってきてもらう

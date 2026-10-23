@@ -301,6 +301,8 @@ struct Stats {
     sys: [(AtomicU64, AtomicU64); NSYS],
     fault: (AtomicU64, AtomicU64),
     irq: (AtomicU64, AtomicU64),
+    /// syscall::FD_SYS のシステムコールの、fd の開いたものの種類 (file::CLASSES) ごとの (回数, 時間)。sys には数えない
+    fd: [[(AtomicU64, AtomicU64); NCLASS]; NFD],
     /// 途中で眠ったので数えなかったもの
     slept: AtomicU64,
     /// 数えはじめた時刻 (書くと 0 からやりなおす)
@@ -319,6 +321,7 @@ static STATS: Stats = Stats {
     sys: [const { (Z, Z) }; NSYS],
     fault: (Z, Z),
     irq: (Z, Z),
+    fd: [const { [const { (Z, Z) }; NCLASS] }; NFD],
     slept: Z,
     start: Z,
 };
@@ -336,8 +339,24 @@ pub static FAULTS: AtomicU64 = AtomicU64::new(0);
 /// 例外 1 つぶんの、ロックを持っていた時間を数える (trap.rs)。sys はシステムコールの番号
 pub enum Cause {
     Sys(u64),
+    /// syscall::FD_SYS の何番めか、fd の開いたものの種類 (file::CLASSES の番号)
+    SysFd(usize, usize),
     Fault,
     Irq,
+}
+
+const NFD: usize = crate::syscall::FD_SYS.len();
+const NCLASS: usize = crate::file::CLASSES.len();
+
+impl Cause {
+    /// システムコール nr (1 つめの引数 a0)。fd を取るもの (syscall::FD_SYS) は、その fd の開いたものの種類で分ける
+    /// (大きなロックを持って呼ぶ: fd の表を見る)
+    pub fn sys(nr: u64, a0: u64) -> Cause {
+        match crate::syscall::FD_SYS.iter().position(|&n| n == nr) {
+            Some(j) => Cause::SysFd(j, crate::file::class_of(a0)),
+            None => Cause::Sys(nr),
+        }
+    }
 }
 
 fn slot_of(idx: u64) -> Option<&'static (AtomicU64, AtomicU64)> {
@@ -345,6 +364,7 @@ fn slot_of(idx: u64) -> Option<&'static (AtomicU64, AtomicU64)> {
         n if n < NSYS => Some(&STATS.sys[n]),
         n if n == NSYS => Some(&STATS.fault),
         n if n == NSYS + 1 => Some(&STATS.irq),
+        n if n < NSYS + 2 + NFD * NCLASS => Some(&STATS.fd[(n - NSYS - 2) / NCLASS][(n - NSYS - 2) % NCLASS]),
         _ => None,
     }
 }
@@ -353,9 +373,40 @@ fn index_of(cause: &Cause) -> u64 {
     match *cause {
         Cause::Sys(n) if (n as usize) < NSYS => n,
         Cause::Sys(_) => u64::MAX,
+        Cause::SysFd(j, k) => (NSYS + 2 + j * NCLASS + k) as u64,
         Cause::Fault => NSYS as u64,
         Cause::Irq => NSYS as u64 + 1,
     }
+}
+
+/// 持っていた時間の長いもの (名前, 回数, 時間) の多い順。fd のシステムコールは「read pipe」のように種類ごと
+/// (途中で眠ったものは、眠るまでと起きてからの分)
+fn hold_rows() -> alloc::vec::Vec<(alloc::string::String, u64, u64)> {
+    use alloc::format;
+    let mut rows = alloc::vec::Vec::new();
+    let sys_name = |i: u64| crate::syscall::name(i).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase());
+    for (i, (n, t)) in STATS.sys.iter().enumerate() {
+        let n = n.load(Ordering::Relaxed);
+        if n > 0 {
+            rows.push((sys_name(i as u64), n, t.load(Ordering::Relaxed)));
+        }
+    }
+    for (j, by) in STATS.fd.iter().enumerate() {
+        for (k, (n, t)) in by.iter().enumerate() {
+            let n = n.load(Ordering::Relaxed);
+            if n > 0 {
+                rows.push((format!("{} {}", sys_name(crate::syscall::FD_SYS[j]), crate::file::CLASSES[k]), n, t.load(Ordering::Relaxed)));
+            }
+        }
+    }
+    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
+        let n = slot.0.load(Ordering::Relaxed);
+        if n > 0 {
+            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
+        }
+    }
+    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
+    rows
 }
 
 /// CPU ごとの、いまロックを持って動いている区間 (始まった時刻, 原因の番号, 重み)。途中で眠るシステムコールも、
@@ -433,7 +484,7 @@ pub fn stats_reset() {
         c.hold.store(0, Ordering::Relaxed);
         c.locks.store(0, Ordering::Relaxed);
     }
-    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq]) {
+    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq]).chain(STATS.fd.iter().flatten()) {
         n.store(0, Ordering::Relaxed);
         t.store(0, Ordering::Relaxed);
     }
@@ -462,20 +513,7 @@ pub fn stats_json() -> alloc::string::String {
         th += h;
         cpus.push(format!("{{\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"locks\":{}}}", pct(w), pct(h), c.locks.load(Ordering::Relaxed)));
     }
-    let mut rows: Vec<(String, u64, u64)> = Vec::new();
-    for (i, (n, t)) in STATS.sys.iter().enumerate() {
-        let n = n.load(Ordering::Relaxed);
-        if n > 0 {
-            rows.push((crate::syscall::name(i as u64).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase()), n, t.load(Ordering::Relaxed)));
-        }
-    }
-    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
-        let n = slot.0.load(Ordering::Relaxed);
-        if n > 0 {
-            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
-        }
-    }
-    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
+    let rows = hold_rows();
     let top: Vec<String> = rows.iter().take(25).map(|(name, n, t)| format!("{{\"name\":\"{}\",\"n\":{},\"ms\":{:.1},\"avg_us\":{:.1}}}", name, n, ms(*t), *t as f64 / 1e3 / *n as f64)).collect();
     let dev: Vec<String> = ["disk", "gpu", "sched", "wake_to_run"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
     let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss", "around"];
@@ -522,22 +560,7 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("all  {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%   (1 CPU = 100%)
 
 ", ms(tw), pct(tw), ms(th), pct(th)));
-    // 持っていた時間の長いもの (途中で眠ったものは、眠るまでと起きてからの分)
-    let mut rows: Vec<(String, u64, u64)> = Vec::new();
-    for (i, (n, t)) in STATS.sys.iter().enumerate() {
-        let n = n.load(Ordering::Relaxed);
-        if n > 0 {
-            let name = crate::syscall::name(i as u64).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase());
-            rows.push((name, n, t.load(Ordering::Relaxed)));
-        }
-    }
-    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
-        let n = slot.0.load(Ordering::Relaxed);
-        if n > 0 {
-            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
-        }
-    }
-    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
+    let rows = hold_rows();
     s.push_str("hold の長いもの            回数       合計       平均
 ");
     for (name, n, t) in rows.iter().take(25) {
@@ -560,7 +583,7 @@ pub fn stats() -> alloc::string::String {
     s.push_str(&format!("ロックなしの stat (statc.rs): {} 回 (ふつうの道へ {})\n", crate::statc::HITS.load(Ordering::Relaxed), crate::statc::MISSES.load(Ordering::Relaxed)));
     let uf: Vec<u64> = crate::unix::FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("AF_UNIX のロックなしの読み書き: 読んだ {} 書いた {} (ふつうの道へ {})\n", uf[0], uf[1], uf[2]));
-    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
+    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}、空で終わりか EAGAIN を返した {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[7], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     let fo: Vec<u64> = crate::file::FAST_OPEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ロックなしの open / close (file の棚): 棚から開いた {} ない (ENOENT) と答えた {} 棚にしまった {} (ふつうの道へ: statc にない {} 棚にない {} 開けない形 {} しまえない {})\n", fo[0], fo[1], fo[2], fo[3], fo[4], fo[5], fo[6]));
     let ns: Vec<u64> = crate::fastdir::FAST_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();

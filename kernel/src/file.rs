@@ -69,7 +69,36 @@ pub enum Kind {
     Landlock(crate::landlock::RulesetRef),
 }
 
+/// 開いたものの種類の名前 (Kind::class の番号。/proc/bkl が fd のシステムコールを分ける)
+pub const CLASSES: [&str; 10] = ["file", "proc", "pipe", "unix", "inet", "eventfd", "tty", "dev", "timerfd", "other"];
+
+/// いまのプロセスの fd の開いたものの種類 (CLASSES の番号。大きなロックを持って。fd がなければ other)
+pub fn class_of(fd: u64) -> usize {
+    let other = CLASSES.len() - 1;
+    let Some(files) = proc::current().files.as_ref() else { return other };
+    files.get().get(fd).and_then(|f| f.try_borrow().ok().map(|o| o.kind.class())).unwrap_or(other)
+}
+
 impl Kind {
+    /// CLASSES の番号
+    pub fn class(&self) -> usize {
+        match self {
+            Kind::Inode(_, p) => {
+                let p = p.trim_start_matches('/');
+                let top = p.split('/').next().unwrap_or("");
+                if top == "proc" || top == "sys" { 1 } else { 0 }
+            }
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => 2,
+            Kind::Unix(_) => 3,
+            Kind::Inet(_) | Kind::Socket(_) => 4,
+            Kind::EventFd(_) => 5,
+            Kind::Tty(_) | Kind::PtyMaster(_) => 6,
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm => 7,
+            Kind::TimerFd(_) => 8,
+            Kind::Epoll(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => 9,
+        }
+    }
+
     /// デバイスファイルを開いたときの中身
     pub fn of_dev(major: u32, minor: u32, flags: u32) -> Result<Kind, i64> {
         const ENXIO: i64 = 6;
@@ -1254,7 +1283,8 @@ impl Drop for OpenFile {
 pub const PIPE_SIZE: usize = 64 * 1024;
 
 /// 大きなロックなしの read/write (Pipe::fast_rw) の数: [0] はうまくいったもの、ほかはふつうの道へ行ったわけ
-/// (2 大きさ、3 fd の表をほかのスレッドが変えている途中、4 パイプでない、5 6 7 ... は fast_rw_inner を見よ)。/proc/bkl に出す
+/// (2 大きさ、3 fd の表をほかのスレッドが変えている途中、4 パイプでない、5 6 ... は fast_rw_inner を見よ)。7 は、うまくいった
+/// もののうち空のパイプで終わり (0) か EAGAIN を返したもの。/proc/bkl に出す
 pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
 /// 大きなロックなしのファイルの read (fast_read_file) の数: [0] うまくいったもの、ほかはふつうの道へ行ったわけ
 /// (1 大きさ、2 IN_ACCESS の見張り、3 fd の表を分けている、4 開いたファイルを分けている、5 ext4 のファイルでない、
@@ -1985,9 +2015,9 @@ impl Pipe {
             (Kind::PipeRead(p), false) | (Kind::PipeWrite(p), true) => p,
             _ => return Err(4),
         };
-        let mut tmp = Vec::with_capacity(len);
-        unsafe { tmp.set_len(len) };
         if write {
+            let mut tmp = Vec::with_capacity(len);
+            unsafe { tmp.set_len(len) };
             if !me.pt().copy_in_nofault(buf, &mut tmp) {
                 return Err(5);
             }
@@ -2010,9 +2040,18 @@ impl Pipe {
         } else {
             let mut pp = p.borrow_mut();
             if pp.data.len == 0 {
+                // 空でも、書き手がいなければ終わり (0)、O_NONBLOCK なら EAGAIN: どちらも眠らず、何も変えない (Linux の
+                // pipe_read と同じ)。イベントループは起こしの印のパイプを EAGAIN まで読むので、それがみな大きなロックを
+                // 取っていた (Firefox で 3000 回、1 回 160 µs)。待つものだけふつうの道で眠る
+                if pp.writers == 0 || unsafe { core::ptr::read_volatile(&of.flags) } & O_NONBLOCK != 0 {
+                    FAST_RW[7].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    return Ok(if pp.writers == 0 { 0 } else { -11 }); // EAGAIN
+                }
                 return Err(10);
             }
             let n = len.min(pp.data.len);
+            let mut tmp = Vec::with_capacity(n);
+            unsafe { tmp.set_len(n) };
             pp.data.pop(&mut tmp[..n], false);
             // 写せたときだけ取り除く (ページがなければ、何も変えずにふつうの道へ)
             if !me.pt().copy_out_nofault(buf, &tmp[..n]) {
