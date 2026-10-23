@@ -226,7 +226,10 @@ class Serve:
             # 子は .rc を書いてから終わるので、いないと見たあとに読めば番号はある
             r = self.run(('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && [ -d /proc/$p ] && echo alive; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
                           'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit), 30)
-            parts = r.get('out', '').split(mark)
+            # aish が、しくじったコマンドのわけ (aish: why: ...) を端末に出すことがある (.rc がまだないときの cat):
+            # 番号やログとまちがえないように捨てる
+            out = '\n'.join(l for l in r.get('out', '').split('\n') if 'aish: why:' not in l)
+            parts = out.split(mark)
             if len(parts) < 4:
                 return {'error': 'could not read the job', 'out': r.get('out', '')}
             alive, rc, size, new = 'alive' in parts[0], parts[1].strip(), parts[2].strip(), parts[3]

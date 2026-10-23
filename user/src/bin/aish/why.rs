@@ -1,6 +1,7 @@
 // しくじったわけ: aios のカーネルは、システムコールがしくじったわけを /proc/ai/why に残す (kernel/src/why.rs。errno の
 // ほかに、パスのどこで止まったか、どの許しが足りなかったか、どの決まりが止めたか)。前のコマンドが 0 でなく終わったら
-// (対話のとき。シグナルで終わったものはのぞく)、そのジョブのプロセスのいちばん新しいわけを 1 行出す:
+// (対話のとき。シグナルで終わったものと、エラーを 2>/dev/null などでよそへ向けたものはのぞく)、そのジョブのプロセスの
+// いちばん新しいわけを 1 行出す:
 //   $ cat /root/secret
 //   cat: /root/secret: Permission denied
 //   aish: why: openat EACCES: search (x) on /root is not allowed for uid 1000 gid 1000: mode 0700, owner 0:0, ...
@@ -71,13 +72,19 @@ fn pick<'a>(v: &'a [serde_json::Value], cmd: &str) -> Option<&'a serde_json::Val
     with.iter().find(|e| about(e, &words)).or_else(|| with.iter().find(|e| e.get("probe").is_none())).or_else(|| with.first()).copied()
 }
 
+/// コマンドが標準エラーをよそへ向けている (2>/dev/null、2>FILE、&>FILE。2>&1 はのぞく)
+fn quiet(cmd: &str) -> bool {
+    cmd.split_whitespace().any(|w| (w.starts_with("2>") && !w.starts_with("2>&")) || w.starts_with("&>"))
+}
+
 /// 前のジョブ (cmd) が終わった (jobs::foreground)。0 でなければ覚えて、対話ならわけを 1 つ出す
 pub fn after_job(pids: &[i32], start: Instant, status: i32, cmd: &str) {
     if status == 0 || status >= 128 {
         return;
     }
     unsafe { *(&raw mut LAST) = Some((pids.to_vec(), start)) };
-    if !crate::jobs::interactive() {
+    // エラーをよそへ向けたもの (2>/dev/null など) は、わけも出さない (why では見られる)
+    if !crate::jobs::interactive() || quiet(cmd) {
         return;
     }
     if let Some(v) = read(pids, Some(start))
