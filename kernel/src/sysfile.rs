@@ -1931,6 +1931,10 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
     }
     if flags & RENAME_EXCHANGE != 0 {
         op.exchange(&oname, &np, &nname)?;
+        // 2 つの名前の覚えも捨てる (ふつうの rename と同じ。残すと、入れかえる前の inode を持ったままになり、
+        // あとで消しても片づかない: orphan のまま残った)
+        vfs::forget(&ofull);
+        vfs::forget(&nfull);
         let ck = inotify::cookie();
         for (from_dir, from, to_dir, to, ino) in [(&op, &oname, &np, &nname, &moving), (&np, &nname, &op, &oname, target.as_ref().unwrap())] {
             let isdir = if ino.meta().is_dir() { inotify::IN_ISDIR } else { 0 };

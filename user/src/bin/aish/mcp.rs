@@ -359,6 +359,10 @@ impl Shell {
     /// 入れかわるか: aish かプラグインのバイナリが起きたときと変わっていること。書いてから 2 秒たっていなければ、
     /// たつまで待ってから入れかわる。ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているときは入れかわらない
     fn should_reload(&mut self) -> bool {
+        // 終わったうしろのジョブを先に集める (job で見るまで「動いている」ままだと、入れかわれず、ゾンビも残る)
+        if let Ok(mut j) = JOBS.lock() {
+            reap(&mut j);
+        }
         let Some((_, exe, file)) = STARTED.get().cloned() else { return false };
         // 変わったバイナリ (aish と、ビルドしなおしたプラグイン)
         let mut changed: Vec<FileId> = FileId::of(&exe).filter(|d| Some(*d) != file).into_iter().collect();

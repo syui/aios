@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="chosen clone3 cpuid createrace dev dirents epoll exec-thread flushrace fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt ns opencache openat2 pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="chosen clone3 cpuid createrace dev dirents epoll exec-thread flushrace fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt ns opencache openat2 orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
 
 case $1 in
 build)
@@ -35,8 +35,9 @@ run)
     # fsx は ext4 (ホーム) と tmpfs (/tmp) で、ふつうと frag
     fsx) cmd="./$t --suite $HOME /tmp" ;;
     # chosen (aios がえらんだちがい)、mmapcoh (ファイルのページは 1 枚)、rlock (ファイルのロック) も ext4 と tmpfs で
-    # pwfast (大きなロックなしの pwrite)、opencache (閉じたファイルの棚)、createrace (大きなロックなしの作る・消す) も
-    chosen | mmapcoh | rlock | pwfast | opencache | createrace) cmd="./$t $HOME /tmp" ;;
+    # pwfast (大きなロックなしの pwrite)、opencache (閉じたファイルの棚)、createrace (大きなロックなしの作る・消す)、
+    # orphan (消したファイルが片づくか) も
+    chosen | mmapcoh | rlock | pwfast | opencache | createrace | orphan) cmd="./$t $HOME /tmp" ;;
     # statc (大きなロックなしの stat) は ext4 (ホーム) と tmpfs (/tmp) で。root でも (見る人をほかの人にして)
     statc) cmd="./$t $HOME /tmp" ;;
     # flushrace (fsync と sync が眠って書くあいだの読み書き) は ext4 (ホーム) で 8 秒

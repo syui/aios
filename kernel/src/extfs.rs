@@ -3926,6 +3926,8 @@ impl ExtInode {
             // 閉じたファイルの棚 (file::Shelf) に残っているものは、もう開きなおせない: 捨てる (ほかに開いている人が
             // いなければ、下で片づく)
             crate::file::shelf_forget((fs.fs, child as u64));
+            // パスの覚えも (unlinkat が引けなかった書きかたのもの: 名前を変えたディレクトリの下の古いパスなど)
+            crate::vfs::forget_ino((fs.fs, child as u64));
             if fs.users.borrow().get(&child).is_some_and(|&n| n > 0) {
                 // まだ開かれている (実行中のプログラムなど): 最後に閉じられたときに片付ける
                 fs.orphans.borrow_mut().insert(child);

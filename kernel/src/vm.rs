@@ -710,10 +710,16 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
         let pos = off + done;
         let po = pos % PGSIZE;
         let k = (PGSIZE - po).min(n - done);
-        match file_page(ino, pos - po, false) {
-            Some(page) => {
+        match file_page_or_hole(ino, pos - po, false) {
+            Some(Some(page)) => {
                 unsafe { core::ptr::copy_nonoverlapping(page.add(po), buf[done..].as_mut_ptr(), k) };
                 kalloc::put(page);
+                done += k;
+            }
+            // 穴: 0 を写すだけ (写しの表の 0 のページは inode を持つので、read で作ると、だれも写していないのに
+            // 残って、消したファイルが片づかない。Linux も穴の read は 0 を写すだけで inode を持たない)
+            Some(None) => {
+                buf[done..done + k].fill(0);
                 done += k;
             }
             // ページがとれない (メモリが足りない、または noio でキャッシュになかった): 残りはじかに
@@ -812,13 +818,22 @@ pub static MISS_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 
 /// exec なら、実行できるように写すページ (命令キャッシュもあわせる)
 fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
+    match file_page_or_hole(ino, foff, exec)? {
+        Some(page) => Some(page),
+        None => hole_page(ino, foff, exec),
+    }
+}
+
+/// file_page と同じ。ただし穴 (ブロックがない) なら Some(None) で、写しの表に 0 のページを作らない
+/// (read から。0 のページは写す file_page だけが作る: 写すのをやめるときに表から外れる)
+fn file_page_or_hole(ino: &InodeRef, foff: usize, exec: bool) -> Option<Option<*mut u8>> {
     if foff % PGSIZE != 0 {
         return None;
     }
     let ver = file_ver(ino);
     let key = file_key(ino, foff);
     if let Some(p) = cached_page(&key, ver, exec) {
-        return Some(p);
+        return Some(Some(p));
     }
     // ディスクを読まない区間 (RWF_NOWAIT): 写しの表にある (穴の 0 のページか、写しているページ) ものだけ。なければ、
     // ファイルシステムがキャッシュにあるブロックだけで読む (read_cached の None。穴もキャッシュになければ EAGAIN: Linux は
@@ -826,7 +841,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     if crate::proc::noio_on() {
         let c = shared_file().get(&key)?;
         kalloc::get(c.page);
-        return Some(c.page);
+        return Some(Some(c.page));
     }
     let t0 = crate::timer::uptime_ns();
     struct Miss(u64);
@@ -849,7 +864,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
     // ページで持たないものなら読んだ写し
     let (page, owned) = match ino.page_frame(foff, false) {
         Ok(Some(p)) => (p, true),
-        Ok(None) => return hole_page(ino, foff, exec),
+        Ok(None) => return Some(None),
         Err(e) if e == -crate::vfs::ENODEV => {
             let page = kalloc::alloc()?;
             let size = ver.1 as usize;
@@ -864,7 +879,7 @@ fn file_page(ino: &InodeRef, foff: usize, exec: bool) -> Option<*mut u8> {
         }
         Err(_) => return None,
     };
-    Some(keep_page(key, ver, page, owned, exec, changes))
+    Some(Some(keep_page(key, ver, page, owned, exec, changes)))
 }
 
 /// fault-around のまわりのページ: ページキャッシュか、ファイルシステムのキャッシュにあるものだけ (ディスクは読まない。

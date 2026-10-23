@@ -409,7 +409,9 @@ MAP_SHARED の写しも、MAP_PRIVATE の読むだけの写しも、ページキ
 同じ作り。写すのに読みなおさず、同じ中身が 3 枚あることもなくなった)。写しに書いたページは、ファイルシステムに
 書き出す印をつけなおす (msync、munmap、sync、ファイルシステムの書き出し。はじめて書いたときは更新時刻もいまに: Linux の
 page_mkwrite)。穴 (ブロックのないところ) の写しは 0 のページを vm.rs が持ち、ブロックをとるときにファイルシステムがその
-ページをそのまま使う (adopt_hole) ので、穴に write() しても写しに映る。切りつめたところと穴をあけたところは、写しているところ
+ページをそのまま使う (adopt_hole) ので、穴に write() しても写しに映る。0 のページを作るのは写すときだけで、read() で穴を
+読むときは 0 を写すだけ (Linux と同じ。0 のページは inode を持ち、写すのをやめるときに表から外れるので、read() で作ると
+だれも外さず、消したファイルが orphan のまま残った: sysdiff-ci のあと 28 個。test/orphan.c)。切りつめたところと穴をあけたところは、写しているところ
 からみな外す (drop_file_pages: Linux の unmap_mapping_range。次に触れると SIGBUS、伸びればまた写せる)。ファイルの終わりの
 先 (同じページの中) に写しで書いたものは、伸ばすとき (ftruncate、fallocate、終わりより先への write) に 0 にする (ext4 の
 pagecache_isize_extended と同じ。tmpfs でも: Linux の tmpfs はそのまま中身にしてしまうので、手本のまちがい tmpfs-extend に)。
@@ -573,7 +575,9 @@ inode に書く (Linux の inode_init_owner。前は作ったあとに chown と
 1 度)、消すときは見つけた場所をそのまま消し (前は 2 度なめていた)、ディレクトリの inode は読みなおさずに 1 度だけ書く。
 unlinkat は、消すものの覚え (パスの覚え、dcache) を消す前に捨てる: 覚えが inode を持っていると、ext4 は消したファイルを
 まだ使われているものとして orphan のリストに入れ、覚えを捨てたときに片づけていた (inode とスーパーブロックを 2 度ずつ
-書く)。Linux の d_delete も、dentry を使っているのが自分だけなら、その場で inode を手放す。閉じたファイルの棚は、消す
+書く)。Linux の d_delete も、dentry を使っているのが自分だけなら、その場で inode を手放す。消すパスで引けない覚え
+(名前を変えたディレクトリの下の古いパス、RENAME_EXCHANGE で入れかえる前の名前) も、ext4 がリンクを 0 にするところで
+inode の id から捨てる (vfs::forget_ino。前は残って、消したファイルが orphan のままだった。test/orphan.c)。閉じたファイルの棚は、消す
 inode が棚にありそうなときだけなめる (inode の id のハッシュで 256 の箱に分けた数。前は消すたびに、みなのプロセスの fd を
 見ていた)。inode とブロックのビットマップは 64 ビットずつ探す (Linux の find_next_zero_bit。前は 1 ビットずつ)。
 create-unlink は 1 つで 235 → 126〜166 µs、4 つで 430 → 196〜235 µs (同じホストで、ぶれるので何回か)。記録 (bench/smp.md)

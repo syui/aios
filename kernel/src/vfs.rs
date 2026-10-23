@@ -965,8 +965,18 @@ pub fn forget_gone(id: (usize, u64)) {
     if holder.is_none_or(|x| x.meta().nlink != 0) {
         return;
     }
-    let cache = PATHS.get();
-    cache.retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
+    forget_ino(id);
+}
+
+/// inode id を答える覚えを、どの書きかたのものでもみな捨てる。ファイルシステムがリンクを 0 にするところから
+/// (ext4 の unlink_node): 名前を変えたディレクトリの下の古いパスや、入れかえる前の名前の覚えは forget_path が
+/// 引かないので、inode を持ったままだと ext4 は消したファイルを orphan として残す (Linux の d_delete は、消した
+/// dentry を負にして inode を手放す)。持っている覚えがなければ表をなめない
+pub fn forget_ino(id: (usize, u64)) {
+    if !HOLDS.get().contains_key(&id) {
+        return;
+    }
+    PATHS.get().retain(|_, e| !e.found.as_ref().is_some_and(|(_, x)| x.id() == id));
 }
 
 /// 作ったばかりのもの (親 parent の中の name、パス full: リンクをたどったあとの、先頭 / なし) を覚える (Linux の
