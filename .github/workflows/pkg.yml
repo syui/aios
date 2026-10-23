@@ -1,9 +1,9 @@
-# pkg: 手元で作るには重いパッケージ (一覧は pkg/ci.json) をここで作り、GitHub のリリース NAME (タイトル pkg-NAME) に
-# 置く。新しい版はそのリリースを置きかえる (前の版はのこさない)。ノートの 1 行目が版 (* vVER-REL)。
+# pkg: 手元で作るには重いパッケージ (一覧は pkg/ci.json) をここで作り、GitHub のリリース pkg-NAME (タグもタイトルも)
+# に置く。新しい版はそのリリースを置きかえる (前の版はのこさない)。ノートの 1 行目が版 (* vVER-REL)。
 # ai/repo へ入れるのは手元で aish-pkg fetch NAME → test → push (ai/repo の署名の鍵を GitHub に置かないため)。
 #   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
 #   どれも、リリースにその版がもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
-#   前の形のリリース (NAME-VER-REL、版ごと) は、手で migrate: いちばん新しいものを NAME に移して、ほかは消す
+#   前の形のリリース (NAME-VER-REL、版ごと) は、手で migrate: いちばん新しいものを pkg-NAME に移して、ほかは消す
 #   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分、
 #   runs_on = マシン (既定 ubuntu-24.04-arm))
 name: pkg
@@ -13,7 +13,7 @@ on:
   - cron: '17 3 * * *'
   push:
     branches:
-    - unix
+    - main
     paths:
     - 'pkg/ci.json'
     - 'pkg/c/**'
@@ -31,7 +31,7 @@ on:
         type: boolean
         default: false
       migrate:
-        description: '作らずに、前の形のリリース (NAME-VER-REL) を NAME (pkg-NAME) にまとめる'
+        description: '作らずに、前の形のリリース (NAME-VER-REL) を pkg-NAME にまとめる'
         type: boolean
         default: false
 
@@ -66,6 +66,10 @@ jobs:
           push)
             if [ -z "$BEFORE" ] || [ -n "${BEFORE##*[!0]*}" ]; then
               names=  # ブランチを作った push (くらべるものがない)
+            elif ! gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --jq .status >/dev/null 2>&1; then
+              # くらべられない (前のものと歴史がつながっていない force push: ブランチを入れかえたときなど)。
+              # pkg/ci.json もないものとくらべて、みな作ってしまわないように
+              names=
             else
               # ディレクトリを変えたものと、pkg/ci.json に新しく足したもの (ほかのもの、たとえば作っている途中の
               # firefox をもう一度作らないように)。pkg.yml だけを変えたときは作らない (手で動かす)
@@ -101,8 +105,8 @@ jobs:
               ver=$new rel=1 edit=true
             fi
             tag=$n-$ver-$rel
-            # リリース NAME にその版のパッケージがあるか (前の形のリリース NAME-VER-REL がのこっていれば、それも)
-            if gh release view "$n" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qxF "$tag-aarch64.pkg.tar.zst" ||
+            # リリース pkg-NAME にその版のパッケージがあるか (前の形のリリース NAME-VER-REL がのこっていれば、それも)
+            if gh release view "pkg-$n" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qxF "$tag-aarch64.pkg.tar.zst" ||
               gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "$tag: already released"
               continue
@@ -235,16 +239,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NAME: ${{ matrix.name }}
         run: |
-          # リリース NAME を置きかえる (前の版はのこさない)。前の形のリリース NAME-VER-REL も消す
+          # リリース pkg-NAME を置きかえる (前の版はのこさない)。前の形のリリース NAME-VER-REL も消す
           mv release/notes.md notes.md
-          gh release delete "$NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$NAME" release/* --repo "$GITHUB_REPOSITORY" --title "pkg-$NAME" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          gh release delete "pkg-$NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "pkg-$NAME" release/* --repo "$GITHUB_REPOSITORY" --title "pkg-$NAME" --notes-file notes.md --target "$GITHUB_SHA" --prerelease
           # (run は pipefail: 消すものがなくて grep が 1 を返しても止まらないように)
           gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' | { grep -E "^$NAME-[0-9][^-]*-[0-9]+$" || true; } | while read -r t; do
             gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "$t: deleted"
           done
 
-  # 前の形のリリース (NAME-VER-REL、版ごとにたまる) を、いちばん新しい版だけリリース NAME (タイトル pkg-NAME、
+  # 前の形のリリース (NAME-VER-REL、版ごとにたまる) を、いちばん新しい版だけリリース pkg-NAME (タグもタイトルも、
   # ノートの 1 行目に * vVER-REL) に移して、ほかは消す。手で一度 (migrate)。前の形がなければ何もしない
   migrate:
     name: Migrate releases
@@ -262,8 +266,8 @@ jobs:
           for n in $(jq -r '.[].name' pkg/ci.json); do
             old=$(printf '%s\n' "$tags" | grep -E "^$n-[0-9][^-]*-[0-9]+$" | sort -V || true)
             [ -n "$old" ] || continue
-            if printf '%s\n' "$tags" | grep -qx "$n"; then
-              echo "$n: already released as $n"
+            if printf '%s\n' "$tags" | grep -qx "pkg-$n"; then
+              echo "$n: already released as pkg-$n"
             else
               top=$(printf '%s\n' "$old" | tail -1)
               rm -rf dl && mkdir dl
@@ -271,8 +275,8 @@ jobs:
               sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$top" --jq .object.sha 2>/dev/null || true)
               body=$(gh release view "$top" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
               printf '* v%s\n%s\n' "${top#"$n"-}" "$body" > notes.md
-              gh release create "$n" dl/* --repo "$GITHUB_REPOSITORY" --title "pkg-$n" --notes-file notes.md --target "${sha:-$GITHUB_SHA}" --prerelease
-              echo "$top -> $n"
+              gh release create "pkg-$n" dl/* --repo "$GITHUB_REPOSITORY" --title "pkg-$n" --notes-file notes.md --target "${sha:-$GITHUB_SHA}" --prerelease
+              echo "$top -> pkg-$n"
             fi
             for t in $old; do
               gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "$t: deleted"

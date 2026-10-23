@@ -1,5 +1,5 @@
 #!/bin/sh
-# unix に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
+# main に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
 #   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース latest
 #      (タイトル aios) に置くのを待ち、git.syui.ai の ai/os の latest にも同じものを置く (bin/gitea.sh mirror)。
 #      CI が動かないコミット (paths-ignore: ドキュメントなど) なら、ここはとばす
@@ -15,8 +15,8 @@ cd "$(dirname "$0")/.."
 dry=
 [ "$1" = -n ] && dry=1
 sha=$(git rev-parse HEAD)
-[ "$(git rev-parse origin/unix 2>/dev/null)" = "$sha" ] || git fetch -q origin unix
-[ "$(git rev-parse origin/unix)" = "$sha" ] || { echo "publish: HEAD ($(git rev-parse --short HEAD)) is not origin/unix; push it first" >&2; exit 1; }
+[ "$(git rev-parse origin/main 2>/dev/null)" = "$sha" ] || git fetch -q origin main
+[ "$(git rev-parse origin/main)" = "$sha" ] || { echo "publish: HEAD ($(git rev-parse --short HEAD)) is not origin/main; push it first" >&2; exit 1; }
 api=https://api.github.com/repos/syui/aios
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
@@ -45,7 +45,7 @@ done
 if [ -z "$run" ]; then
   # paths-ignore で動かないのか、GitHub が動かさなかった (遅れている) だけか。CI が最後に通ったコミットから CI が見る
   # ものが変わっているのに run がなければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
-  last=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=unix&status=success&per_page=1" | json 'd["workflow_runs"][0]["head_sha"] if d["workflow_runs"] else ""' 2>/dev/null) || last=
+  last=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&status=success&per_page=1" | json 'd["workflow_runs"][0]["head_sha"] if d["workflow_runs"] else ""' 2>/dev/null) || last=
   changed=$(ci_changed "$last")
   if [ -n "$changed" ]; then
     echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the last passing run (${last:-?}: ${changed}): GitHub did not start it (yet). Run unix.yml by hand (Actions: unix, Run workflow on unix; or workflow_dispatch) or wait, then bin/publish.sh again" >&2

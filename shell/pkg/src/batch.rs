@@ -7,7 +7,7 @@
 //   もの (手元のものがいまの版で、pkg_test を通っているか ai/repo に同じものがあり、古いライブラリもちがう Zig もない) は
 //   飛ばす (force なら作る)。どちらも、もういちど動かしても pkgrel が 2 つ上がらないように。pkg_test でしくじったものは、
 //   次は同じ版のまま作りなおす
-//   CI が作るもの (pkg/ci.json) は飛ばす (pkgrel を上げて unix に push すると、pkg.yml が作る。そのあと pkg_fetch)
+//   CI が作るもの (pkg/ci.json) は飛ばす (pkgrel を上げて main に push すると、pkg.yml が作る。そのあと pkg_fetch)
 //   1 つずつ aish-pkg build / test を子で動かす。その出力は build-NAME.log / test-NAME.log (pkg_build と同じところ) に、
 //   ここの出力 (rebuild.log) は進みぐあいだけ。しくじったものは飛ばして続け (fail_fast なら止める)、さいごにまとめる
 use serde_json::{Value, json};

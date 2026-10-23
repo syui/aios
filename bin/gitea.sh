@@ -1,7 +1,7 @@
 #!/bin/sh
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
-#   bin/gitea.sh os      このリポジトリの unix ブランチを ai/os へ (unix ブランチにいなければ GitHub の unix を)
+#   bin/gitea.sh os      このリポジトリの main ブランチを ai/os へ (main ブランチにいなければ GitHub の main を)
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する。ai/repo の写し
 #                        build/airepo から: 変わったものだけ取ってきて、変わったものだけ送る)
@@ -80,15 +80,15 @@ case "$1" in
     use_identity .
     ;;
   os)
-    # unix ブランチにいればそれを、ほかのブランチ (Claude の作業ブランチなど) にいれば GitHub の unix (先に
-    # git push origin HEAD:unix したもの) を送る。手元の古い unix ブランチを送らないように
-    if [ "$(git rev-parse --abbrev-ref HEAD)" = unix ]; then
-      ref=unix
+    # main ブランチにいればそれを、ほかのブランチ (Claude の作業ブランチなど) にいれば GitHub の main (先に
+    # git push origin HEAD:main したもの) を送る。手元の古い main ブランチを送らないように
+    if [ "$(git rev-parse --abbrev-ref HEAD)" = main ]; then
+      ref=main
     else
-      git fetch -q origin unix
-      ref=origin/unix
+      git fetch -q origin main
+      ref=origin/main
     fi
-    git_push "$host/ai/os.git" "$ref:refs/heads/unix"
+    git_push "$host/ai/os.git" "$ref:refs/heads/main"
     ;;
   repo)
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
@@ -169,7 +169,7 @@ case "$1" in
       [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
       call -X DELETE "$api/tags/$t" > /dev/null 2>&1 || true
     done
-    notes=$(printf '%s\n' " - v$ver" '' '```sh' '# brew install qemu zstd' 'git clone -b unix https://git.syui.ai/ai/os aios && cd aios' \
+    notes=$(printf '%s\n' " - v$ver" '' '```sh' '# brew install qemu zstd' 'git clone https://git.syui.ai/ai/os aios && cd aios' \
       "curl -fLO $host/ai/os/releases/download/$tag/$img" './bin/run.sh' '```' '' 'exit: `sudo poweroff`')
     body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "target_commitish": sys.argv[2], "name": "aios", "body": sys.argv[3], "prerelease": True}))' "$tag" "$sha" "$notes")
     id=$(call -X POST -H 'Content-Type: application/json' -d "$body" "$api/releases" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')

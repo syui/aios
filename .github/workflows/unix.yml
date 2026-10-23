@@ -1,4 +1,4 @@
-# unix ブランチ: disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
+# main ブランチ (前の unix。unix ブランチはそのときのまま残してある): disk.img を作り、QEMU (UEFI → aiboot → カーネル) で起動を確かめて、
 # リリース latest (タイトル aios) に aios-aarch64.img.zst を置く (前の main の Linux のものはリリース linux)。
 # ノートの 1 行目が版 ( - vVER)。使いかたは bin/run.sh
 #   base, aikernel, aiboot はこのコミットのソースから。ほかのパッケージは ai/repo から
@@ -7,7 +7,7 @@ name: unix
 on:
   push:
     branches:
-    - unix
+    - main
     # イメージ (base, aikernel, aiboot をこのソースから、ほかは ai/repo から) が変わらないものでは動かさない
     paths-ignore:
     - '**.md'
@@ -168,7 +168,7 @@ jobs:
           cat >> notes.md <<'NOTES'
           ```sh
           # brew install qemu zstd
-          git clone -b unix https://git.syui.ai/ai/os aios && cd aios
+          git clone https://git.syui.ai/ai/os aios && cd aios
           curl -fLO https://github.com/syui/aios/releases/download/latest/aios-aarch64.img.zst
           ./bin/run.sh
           ```

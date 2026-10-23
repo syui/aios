@@ -4,7 +4,7 @@
 #   libwayland-bin (gtk3 の wayland-scanner)、gcc-aarch64-linux-gnu (musl の libc.so)、
 #   rustup の target (カーネルと aios のコマンドと aiboot)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)
 # そのあと、うしろで bin/setup-build.sh (clang-20、glslang、mtools など、残りのビルドの道具。/tmp/setup-build.log)
-# と、disk.img がなければリリース latest のディスク (CI が unix への push ごとに作って起動をたしかめたもの) を
+# と、disk.img がなければリリース latest のディスク (CI が main への push ごとに作って起動をたしかめたもの) を
 # 取ってきて展開する (/tmp/disk-img.log)。aish の vm (kernel: "." でも) がすぐ使えるように
 # 入っているものはとばす
 set -euo pipefail

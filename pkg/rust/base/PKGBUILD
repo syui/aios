@@ -1,5 +1,5 @@
 # aios (aarch64) の土台: init, aish, aipkg, systemctl, login などと /etc、ファイルシステムの並び
-# このリポジトリ (aios の unix ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/rust/base
+# このリポジトリ (aios の main ブランチ) の user/ と etc/ から作る。bin/mkpkg.sh pkg/rust/base
 pkgname=base
 pkgver=0.0.1
 pkgrel=1

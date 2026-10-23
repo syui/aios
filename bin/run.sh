@@ -9,7 +9,7 @@
 #                         区画なしの ext4 なら /boot/Image を (debugfs が要る)
 #                       どれもなければ開発用カーネルで
 #                       disk.img がなく aios-aarch64.img.zst (リリース latest) があれば、展開して使う:
-#                         git clone -b unix https://git.syui.ai/ai/os aios && cd aios
+#                         git clone https://git.syui.ai/ai/os aios && cd aios
 #                         curl -fLO https://git.syui.ai/ai/os/releases/download/latest/aios-aarch64.img.zst
 #                         (GitHub の https://github.com/syui/aios/releases/download/latest/ にも同じもの。
 #                         前の名前 aios-unix-aarch64.img.zst でも)
