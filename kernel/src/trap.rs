@@ -271,6 +271,10 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             match esr >> 26 {
                 EC_SVC64 => {
                     let intr = syscall::dispatch(tf);
+                    // 書き出しが追いつかないほど書いた: 書き出しのスレッドを待つ
+                    if proc::current().dirtied {
+                        crate::vfs::balance_dirty();
+                    }
                     // 起こしたものにゆずる (自分で起こしたとき)
                     if proc::take_resched() {
                         proc::yield_now();

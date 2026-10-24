@@ -4,8 +4,11 @@
 //   取るシステムコール (uname) をくりかえして、1 回にかかった時間を測る (見はり)。前の aios は、fsync が書き終わるまで
 //   大きなロックを持ってディスクを回って待ったので、見はりはそのあいだ止まった。おそいディスク (bin/run.sh の
 //   AIOS_DISK_OPTS=throttling.iops-write=50 など) ほど長い。Linux の fsync はほかのプロセスを止めない
-//   fsyncstall [-t SEC] [DIR]   はじめに見はりだけで SEC 秒、つぎに書き手といっしょに SEC 秒。1 行の JSON で:
+//   fsyncstall [-t SEC] [-n] [DIR]   はじめに見はりだけで SEC 秒、つぎに書き手といっしょに SEC 秒。1 行の JSON で:
 //   {"alone":{"calls":N,"max_us":U,"over_1ms":A,"over_10ms":B},"with_fsync":{...,"fsyncs":F}}
+//   -n は fsync しない (書き手は 4 KiB ずつ書き足すだけ。書き出しはカーネルにまかせる: たまったときと 5 秒ごと)。
+//   出力は "with_writes":{...,"writes":W}。前の aios は、たまったところで書いたシステムコールの中で、大きなロックを
+//   持ったまま書き出した (いまは書き出しのスレッドが眠って書く)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <signal.h>
@@ -44,9 +47,10 @@ static void watch(int secs, struct res *r) {
 }
 
 int main(int argc, char **argv) {
-  int secs = 5, c;
-  while ((c = getopt(argc, argv, "t:")) != -1) {
+  int secs = 5, nofsync = 0, c;
+  while ((c = getopt(argc, argv, "t:n")) != -1) {
     if (c == 't') secs = atoi(optarg);
+    else if (c == 'n') nofsync = 1;
     else return 2;
   }
   const char *dir = optind < argc ? argv[optind] : ".";
@@ -65,7 +69,7 @@ int main(int argc, char **argv) {
     long end = now_us() + (secs + 1) * 1000000L;
     while (now_us() < end) {
       if (write(fd, buf, sizeof buf) != sizeof buf) break;
-      fsync(fd);
+      if (!nofsync) fsync(fd);
       (*shared)++;
     }
     close(fd);
@@ -77,7 +81,8 @@ int main(int argc, char **argv) {
   waitpid(w, NULL, 0);
   with.fsyncs = *shared;
   unlink(path);
-  printf("{\"alone\":{\"calls\":%ld,\"max_us\":%ld,\"over_1ms\":%ld,\"over_10ms\":%ld},\"with_fsync\":{\"calls\":%ld,\"max_us\":%ld,\"over_1ms\":%ld,\"over_10ms\":%ld,\"fsyncs\":%ld}}\n",
-         alone.calls, alone.max_us, alone.over1, alone.over10, with.calls, with.max_us, with.over1, with.over10, with.fsyncs);
+  const char *what = nofsync ? "writes" : "fsync", *count = nofsync ? "writes" : "fsyncs";
+  printf("{\"alone\":{\"calls\":%ld,\"max_us\":%ld,\"over_1ms\":%ld,\"over_10ms\":%ld},\"with_%s\":{\"calls\":%ld,\"max_us\":%ld,\"over_1ms\":%ld,\"over_10ms\":%ld,\"%s\":%ld}}\n",
+         alone.calls, alone.max_us, alone.over1, alone.over10, what, with.calls, with.max_us, with.over1, with.over10, count, with.fsyncs);
   return 0;
 }

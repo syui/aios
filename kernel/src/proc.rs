@@ -292,6 +292,10 @@ pub struct Proc {
     pub trace_mark: u64,
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
     thread: bool,
+    /// カーネルの中だけで動くスレッド (kthread: 書き出しの flush)。ユーザー空間へ戻らず、シグナルを受けない
+    pub kthread: bool,
+    /// 書き出しのスレッドが追いつかないほど書いた: システムコールの終わりで待つ (vfs::balance_dirty)
+    pub dirtied: bool,
     /// 取れなくても耐える区間 (heap::fallible) の深さ: この中でヒープが取れなければ null (ENOMEM)。予備は使わない
     pub fallible: u32,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
@@ -401,6 +405,8 @@ impl Proc {
         comm: [0; 16],
         trace_mark: 0,
         thread: false,
+        kthread: false,
+        dirtied: false,
         fallible: 0,
         clear_tid: 0,
         vfork_parent: 0,
@@ -962,6 +968,24 @@ pub fn user_init() {
     p.pgid = p.pid;
     p.sid = p.pid;
     make_runnable(p);
+}
+
+/// カーネルの中だけで動くスレッドを作る (Linux の kthread_run)。main は swtch の ret からそのまま (forkret を通らない)、
+/// スケジューラから受けとった大きなロックを持って走り、眠るあいだは放す (眠るシステムコールと同じ)。ユーザー空間へは
+/// 戻らない。アドレス空間は空、fd はない。シグナルは受けない (signal::send_thread。Linux の kthread と同じく、送れても
+/// 何も起きない)。親はいない (ppid 0: init の wait には出てこない。Linux では kthreadd の子)
+pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
+    let pt = PageTable::new()?;
+    let p = alloc_proc()?;
+    p.kthread = true;
+    p.mm = Some(Shared::new(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0) }));
+    p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
+    p.sigacts = Some(crate::signal::new_table());
+    p.set_comm(name);
+    p.context.x19_x30[11] = main as usize as u64; // x30 (lr)
+    let pid = p.pid;
+    make_runnable(p);
+    Some(pid)
 }
 
 #[unsafe(no_mangle)]

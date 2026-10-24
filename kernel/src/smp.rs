@@ -301,6 +301,8 @@ struct Stats {
     sys: [(AtomicU64, AtomicU64); NSYS],
     fault: (AtomicU64, AtomicU64),
     irq: (AtomicU64, AtomicU64),
+    /// カーネルのスレッド (proc::kthread) が 1 回まわるあいだ
+    kthread: (AtomicU64, AtomicU64),
     /// syscall::FD_SYS のシステムコールの、fd の開いたものの種類 (file::CLASSES) ごとの (回数, 時間)。sys には数えない
     fd: [[(AtomicU64, AtomicU64); NCLASS]; NFD],
     /// 途中で眠ったので数えなかったもの
@@ -321,6 +323,7 @@ static STATS: Stats = Stats {
     sys: [const { (Z, Z) }; NSYS],
     fault: (Z, Z),
     irq: (Z, Z),
+    kthread: (Z, Z),
     fd: [const { [const { (Z, Z) }; NCLASS] }; NFD],
     slept: Z,
     start: Z,
@@ -343,6 +346,8 @@ pub enum Cause {
     SysFd(usize, usize),
     Fault,
     Irq,
+    /// カーネルのスレッドの 1 回 (vfs::flusher)
+    Kthread,
 }
 
 const NFD: usize = crate::syscall::FD_SYS.len();
@@ -365,6 +370,7 @@ fn slot_of(idx: u64) -> Option<&'static (AtomicU64, AtomicU64)> {
         n if n == NSYS => Some(&STATS.fault),
         n if n == NSYS + 1 => Some(&STATS.irq),
         n if n < NSYS + 2 + NFD * NCLASS => Some(&STATS.fd[(n - NSYS - 2) / NCLASS][(n - NSYS - 2) % NCLASS]),
+        n if n == NSYS + 2 + NFD * NCLASS => Some(&STATS.kthread),
         _ => None,
     }
 }
@@ -376,6 +382,7 @@ fn index_of(cause: &Cause) -> u64 {
         Cause::SysFd(j, k) => (NSYS + 2 + j * NCLASS + k) as u64,
         Cause::Fault => NSYS as u64,
         Cause::Irq => NSYS as u64 + 1,
+        Cause::Kthread => (NSYS + 2 + NFD * NCLASS) as u64,
     }
 }
 
@@ -399,7 +406,7 @@ fn hold_rows() -> alloc::vec::Vec<(alloc::string::String, u64, u64)> {
             }
         }
     }
-    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq)] {
+    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq), ("(kernel thread)", &STATS.kthread)] {
         let n = slot.0.load(Ordering::Relaxed);
         if n > 0 {
             rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
@@ -484,7 +491,7 @@ pub fn stats_reset() {
         c.hold.store(0, Ordering::Relaxed);
         c.locks.store(0, Ordering::Relaxed);
     }
-    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq]).chain(STATS.fd.iter().flatten()) {
+    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq, &STATS.kthread]).chain(STATS.fd.iter().flatten()) {
         n.store(0, Ordering::Relaxed);
         t.store(0, Ordering::Relaxed);
     }

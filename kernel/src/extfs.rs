@@ -1927,7 +1927,10 @@ impl ExtFs {
 
     /// 書きかえたものをディスクへ。となりあうブロックは 1 回の要求にまとめる
     /// たまっていれば (メタデータはジャーナルの 1/4 か 512 ブロック、中身はキャッシュの 1/4)、
-    /// または 5 秒たっていれば書き出す。
+    /// または 5 秒たっていれば、書き出しのスレッド (vfs::kick_flusher) に頼む: 書く人はディスクを待たず、書き出しは
+    /// 大きなロックを放して眠りながら (Linux の jbd2 の kjournald2 と同じ)。追いつかずに 2 倍までたまったら、書いた人を
+    /// システムコールの終わりで待たせる (vfs::balance_dirty。Linux の balance_dirty_pages)。ここで書くのは、スレッドが
+    /// まだいない (起動のとちゅう) ときと、それでも 3 倍までたまったとき (ジャーナルに入りきらないほどためない)。
     /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
     /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身はキャッシュの 1/4 までためる
     fn maybe_flush(&self) -> Result<(), i64> {
@@ -1942,6 +1945,12 @@ impl ExtFs {
             (c.dirty.len(), c.data.len())
         };
         if meta >= limit || data >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
+            if meta < 3 * limit && data < 3 * data_limit && crate::vfs::kick_flusher() {
+                if meta >= 2 * limit || data >= 2 * data_limit {
+                    crate::vfs::throttle_me();
+                }
+                return Ok(());
+            }
             return self.flush();
         }
         Ok(())

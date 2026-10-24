@@ -371,7 +371,9 @@ impl ProcInode {
                 let (a, e, _) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
                 match user_bytes(p, a, e) {
                     Some(b) if !b.is_empty() => String::from_utf8_lossy(&b).into_owned(),
-                    // カーネルのスレッドや、読めないとき: Linux はカーネルのスレッドなら空。comm を出す
+                    // カーネルのスレッド (proc::kthread): Linux と同じく空 (ps はこれで [flush] と出す)
+                    _ if p.kthread => String::new(),
+                    // 読めないとき: comm を出す
                     _ => format!("{}\0", p.comm()),
                 }
             }
@@ -525,7 +527,7 @@ fn stat_line(p: &Proc) -> String {
     let (tty_nr, tpgid) = crate::tty::of_session(p.sid).map_or((0, -1), |(rdev, pg)| (rdev, pg as i64));
     let threads = proc::threads_of(p.tgid).len();
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {}",
+        "{} ({}) {} {} {} {} {} {} {} 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {}",
         crate::ns::local_or_0(p.tgid),
         p.comm(),
         state_char(p),
@@ -534,6 +536,8 @@ fn stat_line(p: &Proc) -> String {
         crate::ns::local_or_0(p.sid),
         tty_nr,
         tpgid,
+        // flags: カーネルのスレッドは PF_KTHREAD (ps や top がこれで見分ける)
+        if p.kthread { 0x0020_0000 } else { 0 },
         proc::group_utime(p.tgid),
         p.cutime,
         threads,
@@ -730,7 +734,8 @@ impl Inode for ProcInode {
             Node::RootLink(pid) => Ok(format!("/{}", leader(pid)?.files().root)),
             Node::Exe(pid) => {
                 let p = leader(pid)?;
-                p.mm.as_ref().ok_or(-ENOENT)?;
+                // カーネルのスレッドにはプログラムがない (Linux も ENOENT)
+                p.mm.as_ref().filter(|_| !p.kthread).ok_or(-ENOENT)?;
                 Ok(format!("/{}", p.mm().exe))
             }
             Node::Fd(pid, n) => fd_target(pid, n),

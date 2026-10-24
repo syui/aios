@@ -39,7 +39,7 @@ fn emergency() {
     // いちばんメモリを持っているもの (init のほか)
     let mut best: Option<(u32, usize, [u8; 16])> = None;
     crate::proc::each_leader(|p| {
-        if p.pid == 1 {
+        if p.pid == 1 || p.kthread {
             return;
         }
         let Some(mm) = p.mm.as_ref() else { return };

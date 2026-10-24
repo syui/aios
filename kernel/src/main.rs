@@ -144,6 +144,7 @@ pub extern "C" fn kmain() -> ! {
     // ここからは大きなロックを持って (smp.rs)
     smp::lock();
     proc::user_init();
+    vfs::start_flusher();
     smp::start();
     proc::scheduler()
 }

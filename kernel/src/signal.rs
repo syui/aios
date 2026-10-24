@@ -209,6 +209,10 @@ pub fn deliverable(p: &Proc) -> bool {
 
 /// スレッド t に送る
 pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
+    // カーネルのスレッド (proc::kthread) は受けとらない (Linux の kthread と同じ: 送れるが何も起きない)
+    if t.kthread {
+        return;
+    }
     // init は、ハンドラを登録したシグナルしか受け取らない (SIGKILL も効かない)
     if t.tgid == 1 && action(t, sig).handler == SIG_DFL {
         return;

@@ -434,12 +434,112 @@ pub fn sync_all_wait() {
 /// 次に暇なときに書き出す時刻 (ticks)
 static NEXT_IDLE_SYNC: Bkl<u64> = Bkl::new(0);
 
-/// することがないとき (スケジューラから): 1 秒ごとに書き出す
+/// することがないとき (スケジューラから): 1 秒ごとに書き出す (書き出しのスレッドに頼む。まだいなければここで)
 pub fn idle_sync() {
     let now = crate::timer::ticks();
     if now >= *NEXT_IDLE_SYNC.get() {
         *NEXT_IDLE_SYNC.get() = now + crate::timer::HZ;
-        sync_all();
+        if !kick_flusher() {
+            sync_all();
+        }
+    }
+}
+
+/// 書き出しのスレッド (flusher) の pid。0 ならまだいない (起動のとちゅう: 書き出しは頼んだところで)
+static FLUSHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 書き出しのスレッドへの頼み (もう 1 回まわす)
+static FLUSH_WANTED: Bkl<bool> = Bkl::new(false);
+
+fn flusher_chan() -> usize {
+    &FLUSHER as *const _ as usize
+}
+
+/// 書き出しのスレッドが始めた回と、終えた回の数 (balance_dirty が待つ)
+static FLUSH_PASSES: Bkl<(u64, u64)> = Bkl::new((0, 0));
+
+fn flush_done_chan() -> usize {
+    &FLUSH_PASSES as *const _ as usize
+}
+
+/// いまのスレッドに、システムコールの終わりで書き出しを待たせる印をつける (書き出しのスレッドが追いつかないほど書いた。
+/// ext4 の maybe_flush から)。カーネルのスレッドは待たない
+pub fn throttle_me() {
+    if let Some(p) = crate::proc::try_current()
+        && !p.kthread
+    {
+        p.dirtied = true;
+    }
+}
+
+/// システムコールの終わり (trap.rs。何も借りていない) で、印 (throttle_me) のついたスレッドを、書き出しのスレッドが
+/// 次の回を終えるまで眠らせる (Linux の balance_dirty_pages: 書く速さをディスクに合わせる。待つのはたくさん書いた
+/// ものだけで、ほかは止まらない)。待たないと、スレッドが書いているあいだにたまるものに上限がない (書けないページは
+/// キャッシュから捨てられず、メモリがなくなる)。シグナルが来るか 1 秒で、待つのをやめる
+pub fn balance_dirty() {
+    let p = crate::proc::current();
+    p.dirtied = false;
+    // いま書いている回は、印をつけるまでに書いたものを入れていないかもしれない: その次の回が終わるまで
+    let target = FLUSH_PASSES.get().0 + 1;
+    if !kick_flusher() {
+        return;
+    }
+    let deadline = crate::timer::ticks() + crate::timer::HZ;
+    while FLUSH_PASSES.get().1 < target {
+        if !matches!(crate::proc::sleep_until(flush_done_chan(), deadline), Ok(true)) {
+            break;
+        }
+    }
+}
+
+/// 書き出しのスレッドを作る (init のあと: pid 2。Linux の kthreadd と同じところ)
+pub fn start_flusher() {
+    match crate::proc::kthread(b"flush", flusher) {
+        Some(pid) => FLUSHER.store(pid, core::sync::atomic::Ordering::Relaxed),
+        None => println!("vfs: no flush thread (writes go to the disk from the writers)"),
+    }
+}
+
+/// 書き出しのスレッドに頼む (大きなロックを持って)。いなければ false (呼ぶ側が自分で書く)。書き出しのスレッドの中
+/// (sync_shared がファイルに書くときの maybe_flush) からは、頼まずに true (このあとすぐ自分で書く)
+pub fn kick_flusher() -> bool {
+    let f = FLUSHER.load(core::sync::atomic::Ordering::Relaxed);
+    if f == 0 || !crate::smp::holding() {
+        return false;
+    }
+    if crate::proc::try_current().is_some_and(|p| p.pid == f) {
+        return true;
+    }
+    if !core::mem::replace(FLUSH_WANTED.get(), true) {
+        crate::proc::wakeup(flusher_chan());
+    }
+    true
+}
+
+/// 書き出しのスレッド (Linux の jbd2 の kjournald2 と、writeback の flush にあたる)。ext4 の maybe_flush (たまった、
+/// 5 秒たった) と idle_sync (暇なとき 1 秒ごと) に頼まれるか、5 秒たつと (Linux のコミットの間隔: 大きなロックなしの
+/// pwrite や MAP_SHARED で書いたものも、暇がなくても 5 秒のうちに) sync_all_wait で書き出す: ディスクを待つあいだは
+/// 眠り、大きなロックと ext4 のロックはほかが使う。前は書く人のシステムコールの中と、スケジューラの暇なときのループで、
+/// ロックを持ったままディスクを回って待っていた (書く人はそのあいだ止まり、ほかの CPU も大きなロックを待った)
+extern "C" fn flusher() -> ! {
+    use crate::smp::{Cause, SWITCHES};
+    use core::sync::atomic::Ordering::Relaxed;
+    loop {
+        *FLUSH_WANTED.get() = false;
+        FLUSH_PASSES.get().0 += 1;
+        // 1 回ぶんの、大きなロックを持っていた時間を /proc/bkl の (kernel thread) に (trap.rs の例外 1 つと同じ数え方)
+        let t0 = crate::smp::timed_now();
+        crate::smp::seg_begin(&Cause::Kthread, t0);
+        let sw = SWITCHES.load(Relaxed);
+        sync_all_wait();
+        let slept = SWITCHES.load(Relaxed) != sw;
+        let t1 = crate::smp::timed_now();
+        crate::smp::account(Cause::Kthread, t1.saturating_sub(t0), slept, t1);
+        FLUSH_PASSES.get().1 += 1;
+        crate::proc::wakeup(flush_done_chan());
+        // 書いているあいだに頼まれていれば、すぐもう 1 回
+        if !*FLUSH_WANTED.get() {
+            let _ = crate::proc::sleep_until(flusher_chan(), crate::timer::ticks() + 5 * crate::timer::HZ);
+        }
     }
 }
 

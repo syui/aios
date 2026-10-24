@@ -1004,6 +1004,10 @@ pub fn of_session(sid: u32) -> Option<(u64, u32)> {
 }
 
 fn controlling_of(sid: u32) -> Option<TtyRef> {
+    // 0 はセッションでない (カーネルのスレッド。セッションを持たない端末の session も 0)
+    if sid == 0 {
+        return None;
+    }
     all().into_iter().find(|t| t.borrow().session == sid)
 }
 
