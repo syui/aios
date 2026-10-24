@@ -3886,6 +3886,10 @@ impl ExtFs {
             if r.links() == 1 && !self.release_cached(child, &r) {
                 return FastUnlink::No;
             }
+            // statc の (ディレクトリ, 名前) の版は、inode を返す前に進める (ふつうの道の unlink と同じ順。ロックなしの stat は
+            // inode の覚えを読んだあとでこの版を見なおすので、返した inode をほかのファイルが使っても、その stat を消した名前の
+            // 答えにしない: statc::now_stat)
+            crate::statc::name_bump((self.fs, dir as u64), crate::vfs::name_hash(name));
             // ここから書きかえる (ふつうの道の unlink_node と同じ)
             self.fast_write(|| {
                 if self.remove_at(dir, dr, at, name).is_err() {
@@ -3907,6 +3911,11 @@ impl ExtFs {
                 FastUnlink::Done
             })
         })
+    }
+
+    /// ino の meta() の覚え (metas。inode を書くたびに入れかわる) があればそれ。ext4 のロックの中で (いっしょにでもよい)
+    pub fn cached_meta(&self, ino: u32) -> Option<Meta> {
+        self.metas.borrow().get(&ino).copied()
     }
 
     /// ino の Meta: meta() の覚え (metas) にあればそれ (inode を書くたびに入れかわる)、なければ inode から (覚えには入れない)

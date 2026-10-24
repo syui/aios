@@ -2,7 +2,8 @@
 // create)、別の名前に書いて rename で置きかえる (ふつうの道) を、いくつもの CPU で同時に: aios の中で動かす
 // (aarch64-linux-gnu-gcc -O2 -static -o openrace test/openrace.c)。ファイル f<i> の中身はいつも "<i> <gen>\n"。開けた
 // ものを読むと、空 (作った直後) か、同じ i のものでなければならない (消えて別のファイルに使われた inode を開くと、
-// ちがう i が読める)。開けないのは ENOENT だけ。openrace DIR [SECONDS]
+// ちがう i が読める)。大きさはいつも 100 + i なので、名前で stat したものも 0 か 100 + i (ほかのファイルに使われた inode の
+// stat を、消した名前の答えにしていない)。開けないのは ENOENT だけ。openrace DIR [SECONDS]
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -19,9 +20,11 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static void put(const char *path, int i, long gen, int excl) {
   int fd = open(path, O_CREAT | O_WRONLY | (excl ? O_EXCL : O_TRUNC), 0644);
   if (fd < 0) return;
-  char b[64];
+  char b[256];
+  memset(b, ' ', sizeof b);
   int n = snprintf(b, sizeof b, "%d %ld\n", i, gen);
-  if (write(fd, b, n) != n) perror("write");
+  b[n] = ' ';
+  if (write(fd, b, 100 + i) != 100 + i) perror("write");
   close(fd);
 }
 int main(int argc, char **argv) {
@@ -39,6 +42,14 @@ int main(int argc, char **argv) {
       while (now() < end) {
         int i = rand() % NF;
         snprintf(p, sizeof p, "%s/f%d", dir, i);
+        if (k >= 2 && (ops & 3) == 3) {
+          // ときどき名前で stat
+          struct stat st;
+          if (stat(p, &st) < 0) { if (errno != ENOENT) { bad++; fprintf(stderr, "stat %s: %s\n", p, strerror(errno)); } else gone++; }
+          else if (st.st_size != 0 && st.st_size != 100 + i) { bad++; fprintf(stderr, "stat %s: size %lld\n", p, (long long)st.st_size); }
+          ops++;
+          continue;
+        }
         if (k >= 2) {
           // 2 つは開いて読む (すぐ閉じるもの、いくつか開いたまま読むもの)
           int fd = open(p, O_RDONLY);

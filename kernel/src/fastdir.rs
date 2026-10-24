@@ -186,6 +186,14 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
     fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m))
 }
 
+/// 表の答えの stat が古いもの (inode を書いたあと) を、ext4 の inode の覚え (metas) から (覚えになければ None)。名前が
+/// いまもその inode をさすかは、呼ぶ側が読んだあとで表の版を見なおして確かめる (statc::now_stat)
+pub fn cached_stat(ino: u64) -> Option<file::Stat> {
+    let fs = crate::extfs::ExtFs::root_fs()?;
+    let _e = crate::extfs::fs_lock_shared();
+    fs.cached_meta(ino as u32).map(|m| file::Stat::of_meta(&m))
+}
+
 /// ルートの ext4 の vfs の id の 1 つめ (statc が (ディレクトリ, 名前) の箱を引くため)
 pub fn root_fs_id() -> Option<usize> {
     crate::extfs::ExtFs::root_fs().map(|fs| fs.fs_id())

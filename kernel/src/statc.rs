@@ -480,17 +480,30 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
     count(r)
 }
 
-/// 表の答えの stat が古ければ (fresh でない: inode を書いたあと)、名前がいまもその inode をさすことを ext4 が確かめて、
-/// inode の覚えからいまの stat を (fastdir::fresh_stat)。表の stat も書きなおす (読む前に取った inode の版で: そのあとに
-/// 書かれれば、次はまた古い)。base は開いているディレクトリから引いたときの (そのパスの長さ, inode の番号: dir_base)。
-/// 読めなければ None (ふつうの道へ)
+/// 表の答えの stat が古ければ (fresh でない: inode を書いたあと)、いまの stat を inode の覚えから読む (Linux の stat が
+/// dentry の先の inode から読むのと同じ)。まず ext4 の inode の覚え (metas) から、ディレクトリのロックなしで: 読んだあとで、
+/// 表の答えが書きなおされておらず、通ったところの版もいまも同じなら、名前はいまもその inode をさしている (inode を返す
+/// ものは、みな先に版を進める: ふつうの道の unlink と rename、ロックなしの unlink)。覚えになければ、名前がいまもその inode
+/// をさすことを ext4 が親のディレクトリのロックの中で確かめて読む (fastdir::fresh_stat)。どちらも表の stat を書きなおす
+/// (読む前に取った inode の版で: そのあとに書かれれば、次はまた古い)。base は開いているディレクトリから引いたときの
+/// (そのパスの長さ, inode の番号: dir_base)。読めなければ None (ふつうの道へ)
 fn now_stat(p: &Proc, key: &[u8], follow: bool, st: Stat, fresh: bool, base: Option<(usize, u64)>) -> Option<Stat> {
     if fresh {
         return Some(st);
     }
     let s = slot_of(hash(key, follow), key, follow)?;
+    let seq = s[SEQ].load(Acquire);
+    if seq & 1 != 0 || s[STAT0].load(Relaxed) != st.ino {
+        return None;
+    }
     let ib = s[INO_BOX].load(Relaxed) as usize % BOXES;
     let ver = INOS[ib].load(Acquire);
+    if let Some(now) = crate::fastdir::cached_stat(st.ino)
+        && trail_ok(s, seq)
+    {
+        refresh(key, follow, ib, ver, &now);
+        return Some(now);
+    }
     let (parent, name) = match key.iter().rposition(|&b| b == b'/') {
         Some(c) => (&key[..c], &key[c + 1..]),
         None => (&key[..0], key),
@@ -499,6 +512,19 @@ fn now_stat(p: &Proc, key: &[u8], follow: bool, st: Stat, fresh: bool, base: Opt
     let now = crate::fastdir::fresh_stat(dir, core::str::from_utf8(name).ok().filter(|n| !n.is_empty())?, st.ino)?;
     refresh(key, follow, ib, ver, &now);
     Some(now)
+}
+
+/// 表の場所 s が seq のときから書きなおされておらず、全体の版と、通ったところ ((ディレクトリ, 名前) の箱) の版が
+/// いまも同じか (now_stat が inode の覚えを読んだあとに)
+fn trail_ok(s: &[AtomicU64; 64], seq: u64) -> bool {
+    core::sync::atomic::fence(Acquire);
+    let ndirs = ((s[SHAPE].load(Relaxed) >> 24 & 0xff) as usize).min(DIRS_MAX);
+    s[EPOCH_W].load(Relaxed) == EPOCH.load(Acquire)
+        && (0..ndirs).all(|i| {
+            let w = s[DIR0 + i].load(Relaxed);
+            w & 0xffff_ffff_ffff == NAMES[(w >> 48) as usize].load(Acquire) & 0xffff_ffff_ffff
+        })
+        && s[SEQ].load(Acquire) == seq
 }
 
 /// key の答えの stat を、いまの inode のもの (st と、読む前に取った inode の箱 ib の版 ver) に書きなおす (ほかの印は
