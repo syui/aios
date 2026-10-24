@@ -627,11 +627,29 @@ impl Cache {
 
     /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
     /// みな (16384 まで) なので、外すたびになめると大きなファイルを消すのがブロックの数 × 16384 になる
-    /// (16 MiB で 6700 万回)。残ったものが覚えている数をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
+    /// (16 MiB で 6700 万回)。残ったものが覚えている数の 4 倍をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
     fn forget(&mut self, b: u64) {
         let Some(p) = self.map.remove(&b) else { return };
         self.release_page(b, p);
-        if self.order.len() > 2 * self.map.len() + 64 {
+        self.tidy_order();
+    }
+
+    /// [start, end) のブロックをみな覚えから外す (forget を 1 つずつするのと同じ。order を作りなおすのは終わりに 1 度:
+    /// 大きなファイルを消すと、1 つずつでは何度も作りなおした)
+    fn forget_range(&mut self, start: u64, end: u64) {
+        // 範囲のものを木からまとめて抜く (1 つずつ remove して木をたどりなおさない)
+        let gone: Vec<(u64, *mut u8)> = self.map.extract_if(start..end, |_, _| true).collect();
+        for (b, p) in gone {
+            self.release_page(b, p);
+        }
+        self.tidy_order();
+    }
+
+    /// order が覚えている数の 4 倍をこえたら、まとめて作りなおす (forget から。前は 2 倍で、大きなファイルを消すと
+    /// extent ごとに覚えている数が半分になって、何度も作りなおした: 64 MiB で 12 ms)。残っている古いものは evict_one が
+    /// とばす
+    fn tidy_order(&mut self) {
+        if self.order.len() > 4 * self.map.len() + 4096 {
             // 外したあとにまた入ったものは 2 度ある: 古いほうを残す
             let mut seen = BTreeSet::new();
             let map = &self.map;
@@ -909,6 +927,22 @@ impl Raw {
         let t = now_secs();
         put32(&mut self.0, 12, t); // ctime
         put32(&mut self.0, 16, t); // mtime
+    }
+}
+
+/// ビットマップ d の start から n ビットを 0 に (はしは 1 ビットずつ、まん中は 1 バイトずつ: Linux の bitmap_clear)
+fn clear_bits(d: &mut [u8], start: usize, n: usize) {
+    let (mut bit, end) = (start, start + n);
+    while bit < end && bit % 8 != 0 {
+        d[bit / 8] &= !(1 << (bit % 8));
+        bit += 1;
+    }
+    let whole = (end - bit) / 8;
+    d[bit / 8..bit / 8 + whole].fill(0);
+    bit += whole * 8;
+    while bit < end {
+        d[bit / 8] &= !(1 << (bit % 8));
+        bit += 1;
     }
 }
 
@@ -1767,6 +1801,34 @@ impl ExtFs {
             }
         }
         Err(-ENOSPC)
+    }
+
+    /// となりあう [start, start + n) を放す (free_block を n 回するのと同じこと)。ビットマップ、グループの数、スーパー
+    /// ブロックの数は、グループごとに 1 度だけ書きかえ、キャッシュは覚えているブロックだけ外す (Linux の ext4_free_blocks
+    /// も extent 1 つを 1 度に)。前は 1 ブロックごとにみな書きかえたので、64 MiB のファイルを消すと大きなロックを 0.1 秒持った
+    fn free_blocks(&self, start: u64, n: u64) -> Result<(), i64> {
+        let end = start + n;
+        let mut b = start;
+        while b < end {
+            let rel = b - self.first_data_block;
+            let (g, bit) = ((rel / self.bpg as u64) as u32, (rel % self.bpg as u64) as usize);
+            let run = (end - b).min(self.bpg as u64 - bit as u64);
+            let bm = self.block_bitmap(g);
+            self.modify_block(bm, |d| clear_bits(d, bit, run as usize))?;
+            self.gd_add_cnt(g, 0xc, 0x2c, run as i32);
+            self.sb_add_free_blocks(run as i64);
+            self.adirty.borrow_mut().bb.insert(g);
+            b += run;
+        }
+        let mut c = self.cache.borrow_mut();
+        // 捨てたブロックは書き出さない (free_block と同じ)。覚えているものだけ
+        c.dirty.extract_if(start..end, |_| true).for_each(drop);
+        c.data.extract_if(start..end, |_| true).for_each(drop);
+        c.dir_csum.extract_if(start..end, |_, _| true).for_each(drop);
+        c.forget_range(start, end);
+        // 放したことがコミットされるまで、また取らない (alloc_block)
+        c.freed.insert_range(start, end);
+        Ok(())
     }
 
     fn free_block(&self, b: u64) -> Result<(), i64> {
@@ -2748,9 +2810,9 @@ impl ExtFs {
                 let (len, uninit) = if raw_len > EXT_INIT_MAX_LEN { (raw_len - EXT_INIT_MAX_LEN, true) } else { (raw_len, false) };
                 let start = ExtFs::ext_leaf_start(&ent);
                 let new_len = keep.saturating_sub(b).min(len as u64) as u32;
-                for k in new_len..len {
-                    self.free_block(start + k as u64)?;
-                    r.add_blocks512(-per, self.bsize);
+                if new_len < len {
+                    self.free_blocks(start + new_len as u64, (len - new_len) as u64)?;
+                    r.add_blocks512(-per * (len - new_len) as i64, self.bsize);
                 }
                 if new_len == 0 {
                     keep_ent = false;
@@ -2807,10 +2869,8 @@ impl ExtFs {
                 let start = ExtFs::ext_leaf_start(&e);
                 let (cs, ce) = (b.max(from), end.min(to));
                 if free {
-                    for k in cs..ce {
-                        self.free_block(start + (k - b))?;
-                        r.add_blocks512(-per, self.bsize);
-                    }
+                    self.free_blocks(start + (cs - b), ce - cs)?;
+                    r.add_blocks512(-per * (ce - cs) as i64, self.bsize);
                 }
                 let piece = |lb: u64, len: u64| {
                     let raw = len as u32 + if uninit { EXT_INIT_MAX_LEN } else { 0 };

@@ -218,12 +218,8 @@ impl PageCache {
 
     /// ファイル id のページをみな外す (参照は呼んだほうが返す)
     fn remove_file(&mut self, id: (usize, u64), freed: &mut Vec<*mut u8>) {
-        let keys: Vec<FileKey> = self.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).map(|(k, _)| *k).collect();
-        for k in keys {
-            if let Some(p) = self.pages.remove(&k) {
-                freed.push(p.page);
-            }
-        }
+        // そのファイルのページを木からまとめて抜く (1 つずつ remove すると、大きなファイルで木を何万回もたどる)
+        freed.extend(self.pages.extract_if((id.0, id.1, 0)..=(id.0, id.1, usize::MAX), |_, _| true).map(|(_, p)| p.page));
         self.vers.remove(&id);
         self.permits.remove(&id);
     }
