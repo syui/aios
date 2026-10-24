@@ -385,6 +385,10 @@ const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
 /// 覚えておくブロックの数の上限 (RAM の 1/8 まで)
 const CACHE_BLOCKS: usize = 16384;
+/// alloc_block_run がさがす、つづいた空きの長さの上限 (ブロック。4 KiB なら 8 MiB: Linux の mballoc の上限と同じ)
+const RUN_MAX: u64 = 2048;
+/// alloc_block_run が、つづいた空きをさがして見るグループのビットマップの数
+const RUN_GROUPS: u32 = 8;
 /// ファイルを読むとき、まとめて読むブロックの数 (128 KiB)
 const READ_AHEAD: usize = 32;
 /// noio (RWF_NOWAIT) でキャッシュになかったときの答え
@@ -532,6 +536,13 @@ fn hw_crc() -> bool {
     }
 }
 
+/// あとで計算するチェックサム (Cache::lazy_csum) の種類
+#[derive(Clone, Copy)]
+enum Later {
+    Dir,
+    Extent,
+}
+
 /// ブロックの番号の集まりを、続いたところ (はじめ → 終わりの次) で覚える (大きなファイルを消しても小さい)
 #[derive(Default)]
 struct Ranges(BTreeMap<u64, u64>);
@@ -665,10 +676,10 @@ struct Cache {
     dirty: BTreeSet<u64>,
     /// まだディスクに書いていないファイルの中身のブロック (直接書く)
     data: BTreeSet<u64>,
-    /// チェックサムをまだ計算していないディレクトリのブロック → (ディレクトリの inode, generation)。
+    /// チェックサムをまだ計算していないディレクトリと extent の木のブロック → (持ち主の inode, generation, どちらか)。
     /// 書きかえるたびに 4 KiB の crc32c を計算せず、ジャーナルやディスクへ写す直前 (settle_csum) に 1 回だけ。
-    /// Linux はブロックを書きかえるたびに計算する (ext4_handle_dirty_dirblock)
-    dir_csum: BTreeMap<u64, (u32, u32)>,
+    /// Linux はブロックを書きかえるたびに計算する (ext4_handle_dirty_dirblock、ext4_extent_block_csum_set)
+    lazy_csum: BTreeMap<u64, (u32, u32, Later)>,
     /// /proc/ai/fs の数: 引いたときにあった、なかった (ディスクから読んだ)、まとめて読んだ、捨てた、書き出した回数、
     /// 書いたブロック (メタデータ、中身)、ジャーナルのトランザクション
     hits: u64,
@@ -968,6 +979,53 @@ fn first_zero(d: &[u8], start: u32, n: u32) -> Option<u32> {
     None
 }
 
+/// ビットマップ d の start..n で最初の 1 のビット (なければ n)。first_zero の逆
+fn first_one(d: &[u8], start: u32, n: u32) -> u32 {
+    let mut bit = start;
+    while bit < n {
+        if bit % 64 == 0 && bit + 64 <= n {
+            let i = (bit / 8) as usize;
+            let w = u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
+            if w == 0 {
+                bit += 64;
+                continue;
+            }
+            return (bit + w.trailing_zeros()).min(n);
+        }
+        if d[(bit / 8) as usize] & (1 << (bit % 8)) != 0 {
+            return bit;
+        }
+        bit += 1;
+    }
+    n
+}
+
+/// ビットマップ d の start..n で、空いていて held (はじめと終わりの次。並んでいて重ならない) でもないつづき:
+/// want こつづいた最初のもの (はじめ, 長さ)。なければ見つかったうちでいちばん長いもの
+fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)]) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    let mut from = start;
+    while let Some(bit) = first_zero(d, from, n) {
+        // bit より前ではじまるいちばん後ろの held だけ見る
+        let i = held.partition_point(|&(s, _)| s <= bit);
+        if i > 0 && bit < held[i - 1].1 {
+            from = held[i - 1].1;
+            continue;
+        }
+        // つづきは、次の使っているビットか、次の held のはじめまで (want こあればそこまで見ればよい)
+        let lim = held.get(i).map_or(n, |h| h.0.min(n));
+        let end = first_one(d, bit, (bit + want).min(lim));
+        if end - bit >= want {
+            return Some((bit, end - bit));
+        }
+        if best.is_none_or(|b| end - bit > b.1) {
+            best = Some((bit, end - bit));
+        }
+        from = end;
+    }
+    best
+}
+
 fn ftype(mode: u32) -> u8 {
     match mode & S_IFMT {
         S_IFREG => 1,
@@ -1056,7 +1114,7 @@ impl ExtFs {
                 order: VecDeque::new(),
                 dirty: BTreeSet::new(),
                 data: BTreeSet::new(),
-                dir_csum: BTreeMap::new(),
+                lazy_csum: BTreeMap::new(),
                 hits: 0,
                 misses: 0,
                 readahead: 0,
@@ -1313,12 +1371,12 @@ impl ExtFs {
                 if c.map.len() >= cache_limit(self.bsize) {
                     c.evict_one();
                 }
+                // kalloc::alloc が 0 にしたページ
                 let p = match kalloc::alloc() {
                     Some(p) => p,
                     None if c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
                     None => return Err(-ENOSPC),
                 };
-                unsafe { core::ptr::write_bytes(p, 0, self.bsize) };
                 c.map.insert(b, p);
                 c.order.push_back(b);
                 p
@@ -1437,21 +1495,24 @@ impl ExtFs {
         let mut c = self.cache.borrow_mut();
         c.data.remove(&b);
         c.dirty.insert(b);
-        // ディレクトリのブロックでなくなった (htree の索引になったなど): あとで計算しない
-        if !c.dir_csum.is_empty() {
-            c.dir_csum.remove(&b);
+        // ディレクトリのブロックでなくなった (htree の索引になったなど)、extent の木のノードを書きなおした (write_node が
+        // 計算する): あとで計算しない
+        if !c.lazy_csum.is_empty() {
+            c.lazy_csum.remove(&b);
         }
         Ok(r)
     }
 
-    /// ブロック b のディレクトリのチェックサムがまだなら、いま計算する (ジャーナルやディスクへ写す前に)
+    /// ブロック b のディレクトリか extent の木のチェックサムがまだなら、いま計算する (ジャーナルやディスクへ写す前に)
     pub(super) fn settle_csum(&self, b: u64) -> Result<(), i64> {
         let e = {
             let mut c = self.cache.borrow_mut();
-            if c.dir_csum.is_empty() { None } else { c.dir_csum.remove(&b) }
+            if c.lazy_csum.is_empty() { None } else { c.lazy_csum.remove(&b) }
         };
-        if let Some((dir, generation)) = e {
-            self.with_block(b, |d| self.set_dir_csum(dir, generation, d))?;
+        match e {
+            Some((dir, generation, Later::Dir)) => self.with_block(b, |d| self.set_dir_csum(dir, generation, d))?,
+            Some((ino, generation, Later::Extent)) => self.with_block(b, |d| self.set_extent_csum(ino, generation, d))?,
+            None => {}
         }
         Ok(())
     }
@@ -1762,8 +1823,63 @@ impl ExtFs {
     /// goal のそば (同じグループの goal 以降、なければ他のグループ) にブロックを 1 つ取る。
     /// 放したことがまだコミットされていないブロック (Cache::freed) は、ほかに空きがないときだけ
     fn alloc_block(&self, goal: u64) -> Result<u64, i64> {
+        self.alloc_block_run(goal, 1)
+    }
+
+    /// alloc_block で、goal が使われていれば、want こつづいて空いているところのはじめ (なければ見つかったうちで
+    /// いちばん長いところ) をとる: そのあとも goal (ひとつ前の隣) が空いていて、extent がそのまま伸びる。Linux の
+    /// mballoc がファイルの大きさにあわせた長さの空きをさがす (ext4_mb_normalize_request) のと同じ。前は goal のあとの
+    /// いちばん近い空きをとったので、すき間の 1 ブロックの穴をひろい歩いて、書き足した 16 MiB のファイルが 47 の extent に
+    /// なった。空きの数が want より少ないグループは見ない。見るビットマップは RUN_GROUPS こまで
+    fn alloc_block_run(&self, goal: u64, want: u32) -> Result<u64, i64> {
         let goal = goal.clamp(self.first_data_block, self.blocks_count() - 1);
         let gg = ((goal - self.first_data_block) / self.bpg as u64) as u32;
+        if want > 1 {
+            let gbit = (goal - self.group_start(gg)) as u32;
+            let mut best: Option<(u32, u32, u32)> = None;
+            let mut looked = 0;
+            for k in 0..self.groups {
+                let g = (gg + k) % self.groups;
+                let free = self.gd_cnt(g, 0xc, 0x2c);
+                // goal のグループは、goal そのものが空いているかも見るので、空きが 1 つでもあれば
+                if free == 0 || (k > 0 && free < want) {
+                    continue;
+                }
+                if self.gd_flags(g) & BG_BLOCK_UNINIT != 0 {
+                    self.init_block_bitmap(g)?;
+                }
+                let n = self.blocks_in_group(g);
+                let held = self.held_in(self.group_start(g), n);
+                let bm = self.block_bitmap(g);
+                let found = self.with_block(bm, |d| {
+                    if k > 0 {
+                        return free_run(d, 0, n, want, &held);
+                    }
+                    // goal そのものが空いていれば、それ (いまの extent がそのまま伸びる)
+                    if let Some(r) = free_run(d, gbit, (gbit + 1).min(n), 1, &held) {
+                        return Some((r.0, want));
+                    }
+                    let a = free_run(d, gbit, n, want, &held);
+                    if a.is_some_and(|a| a.1 >= want) || gbit == 0 {
+                        return a;
+                    }
+                    let b = free_run(d, 0, gbit, want, &held);
+                    if b.is_some_and(|b| a.is_none_or(|a| b.1 > a.1)) { b } else { a }
+                })?;
+                match found {
+                    Some((bit, len)) if len >= want => return self.take_bit(g, bit),
+                    Some((bit, len)) if best.is_none_or(|b| len > b.2) => best = Some((g, bit, len)),
+                    _ => {}
+                }
+                looked += 1;
+                if looked >= RUN_GROUPS {
+                    break;
+                }
+            }
+            if let Some((g, bit, _)) = best {
+                return self.take_bit(g, bit);
+            }
+        }
         let mut held_any = false;
         for k in 0..=2 * self.groups + 1 {
             // 2 回目のまわり: 放したばかりのものも (ディスクがいっぱい)
@@ -1787,20 +1903,33 @@ impl ExtFs {
                 found = self.take_in(self.block_bitmap(g), 0, from, &held)?;
             }
             if let Some(bit) = found {
-                self.gd_add_cnt(g, 0xc, 0x2c, -1);
-                self.sb_add_free_blocks(-1);
-                self.adirty.borrow_mut().bb.insert(g);
-                let b = self.group_start(g) + bit as u64;
-                // 新しいブロックはゼロから (ディスクの古い中身は読まない)。ファイルの中身に使うなら
-                // write_data が中身のブロックに付けかえる
-                self.with_block_new(b, |d| d.fill(0))?;
-                let mut c = self.cache.borrow_mut();
-                c.data.remove(&b);
-                c.dirty.insert(b);
-                return Ok(b);
+                return self.took(g, bit);
             }
         }
         Err(-ENOSPC)
+    }
+
+    /// グループ g のビットマップで bit を使っている印にして、とる (free_run で見つけたもの)
+    fn take_bit(&self, g: u32, bit: u32) -> Result<u64, i64> {
+        self.modify_block(self.block_bitmap(g), |d| d[(bit / 8) as usize] |= 1 << (bit % 8))?;
+        self.took(g, bit)
+    }
+
+    /// ビットマップで印をつけたグループ g の bit のブロックを、とったことにする (数とキャッシュ)
+    fn took(&self, g: u32, bit: u32) -> Result<u64, i64> {
+        self.gd_add_cnt(g, 0xc, 0x2c, -1);
+        self.sb_add_free_blocks(-1);
+        self.adirty.borrow_mut().bb.insert(g);
+        let b = self.group_start(g) + bit as u64;
+        // 新しいブロックはゼロから (ディスクの古い中身は読まない)。ファイルの中身に使うなら
+        // write_data が中身のブロックに付けかえる。先読みで覚えていた古い中身があれば捨ててから (with_block_new は
+        // 覚えていないブロックに 0 のページをとる: 0 にするのは kalloc::alloc の 1 度だけ)
+        self.cache.borrow_mut().forget(b);
+        self.with_block_new(b, |_| ())?;
+        let mut c = self.cache.borrow_mut();
+        c.data.remove(&b);
+        c.dirty.insert(b);
+        Ok(b)
     }
 
     /// となりあう [start, start + n) を放す (free_block を n 回するのと同じこと)。ビットマップ、グループの数、スーパー
@@ -1824,7 +1953,7 @@ impl ExtFs {
         // 捨てたブロックは書き出さない (free_block と同じ)。覚えているものだけ
         c.dirty.extract_if(start..end, |_| true).for_each(drop);
         c.data.extract_if(start..end, |_| true).for_each(drop);
-        c.dir_csum.extract_if(start..end, |_, _| true).for_each(drop);
+        c.lazy_csum.extract_if(start..end, |_, _| true).for_each(drop);
         c.forget_range(start, end);
         // 放したことがコミットされるまで、また取らない (alloc_block)
         c.freed.insert_range(start, end);
@@ -1843,7 +1972,7 @@ impl ExtFs {
         // 捨てたブロックは書き出さない (data に残すと、flush がディスクの古い中身を読んで書き戻す)
         c.dirty.remove(&b);
         c.data.remove(&b);
-        c.dir_csum.remove(&b);
+        c.lazy_csum.remove(&b);
         c.forget(b);
         // 放したことがコミットされるまで、また取らない (alloc_block)
         c.freed.insert(b);
@@ -2020,13 +2149,33 @@ impl ExtFs {
 
     /// 大きなロックなしの pwrite (vm::write_fast) が書いたページに、中身のブロックとして書き出す印 (data) をつける。
     /// いまもそのブロックのキャッシュのページそのものであるものだけ (そのあと切りつめた、捨てたものは、もうファイルのもの
-    /// ではない)。Linux の、書いたページにつける PG_dirty にあたる
+    /// ではない)。Linux の、書いたページにつける PG_dirty にあたる。
+    /// inode ごと、ページの順に並べて、inode は 1 度だけ読み、同じ extent の中でつづくページは木をたどりなおさない
+    /// (前はページごとに inode を読んで extent の木をたどり、列がいっぱい (4096) になったときの書き出しが 12 ms かかった)
     fn take_fast_writes(&self) {
-        for (ino, index, page) in crate::vm::take_written(self.fs) {
-            if let Ok(mut r) = self.read_inode(ino as u32)
-                && let Ok(b) = self.map(ino as u32, &mut r, index as u64, false)
-                && b != 0
-            {
+        let mut written = crate::vm::take_written(self.fs);
+        written.sort_unstable_by_key(|&(ino, index, _)| (ino, index));
+        // いまの inode と、いまの extent の (はじめの論理ブロック, 物理ブロック, 長さ)
+        let mut cur: Option<(u64, Option<Raw>)> = None;
+        let mut run = (0u64, 0u64, 0u64);
+        for (ino, index, page) in written {
+            if cur.as_ref().map(|c| c.0) != Some(ino) {
+                cur = Some((ino, self.read_inode(ino as u32).ok()));
+                run = (0, 0, 0);
+            }
+            let lb = index as u64;
+            let b = match cur.as_mut().and_then(|c| c.1.as_mut()) {
+                None => 0,
+                Some(r) if r.flags() & EXTENTS_FL != 0 => {
+                    if lb < run.0 || lb >= run.0 + run.2 {
+                        let (p, n) = self.ext_run(r, lb).unwrap_or((0, 1));
+                        run = (lb, p, n);
+                    }
+                    if run.1 == 0 { 0 } else { run.1 + (lb - run.0) }
+                }
+                Some(r) => self.map(ino as u32, r, lb, false).unwrap_or(0),
+            };
+            if b != 0 {
                 let mut c = self.cache.borrow_mut();
                 if c.map.get(&b) == Some(&page) && !c.dirty.contains(&b) {
                     c.data.insert(b);
@@ -2412,12 +2561,13 @@ impl ExtFs {
             if p != 0 || !alloc {
                 return Ok(p);
             }
-            // ひとつ前のブロックの隣を狙うとつながりやすい
+            // ひとつ前のブロックの隣を狙うとつながりやすい。そこが使われていたら、ファイルのここまでの大きさ (2 のべき)
+            // くらいつづいた空きをさがす (書き足していくファイルは、extent が 2 倍ずつ長いものになる)
             let goal = match lb.checked_sub(1).map(|l| self.ext_find(r, l)) {
                 Some(Ok(prev)) if prev != 0 => prev + 1,
                 _ => self.group_start(self.group_of(ino)),
             };
-            let b = self.alloc_block(goal)?;
+            let b = self.alloc_block_run(goal, (lb + 1).next_power_of_two().min(RUN_MAX) as u32)?;
             let per = (self.bsize / 512) as i64;
             r.add_blocks512(per, self.bsize);
             if let Err(e) = self.ext_insert(ino, r, lb as u32, b) {
@@ -2772,6 +2922,9 @@ impl ExtFs {
     /// lb → pb から raw (長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの) を extents に足す。根があふれたら中身を
     /// 新しいブロックへ下ろして 1 段深くする
     fn ext_insert_run(&self, ino: u32, r: &mut Raw, lb: u32, pb: u64, raw: u32) -> Result<(), i64> {
+        if self.ext_extend_leaf(ino, r, lb, pb, raw)? {
+            return Ok(());
+        }
         let mut root = r.0[40..100].to_vec();
         let split = self.insert_rec(ino, r, &mut root, lb, pb, raw)?;
         if let Some((key, b)) = split {
@@ -2792,6 +2945,39 @@ impl ExtFs {
         }
         r.0[40..100].copy_from_slice(&root);
         Ok(())
+    }
+
+    /// 木が 1 段より深く、lb → pb がとなりの extent をのばすだけ (書き足し) なら、その葉をキャッシュの上でその場で書き
+    /// かえて true。チェックサムは写すときに (Cache::lazy_csum)。前は insert_rec が葉の 4 KiB を写して書きもどし、
+    /// そのたびに crc32c を計算したので、葉のあるファイルの書き足しが 1 回 15 µs 長かった。索引のキーを変えるもの
+    /// (いちばん左より前) や、のばせないものは false (ふつうの道で)
+    fn ext_extend_leaf(&self, ino: u32, r: &Raw, lb: u32, pb: u64, raw: u32) -> Result<bool, i64> {
+        let root = &r.0[40..100];
+        if u16_at(root, 0) != EXT_MAGIC || u16_at(root, 6) == 0 {
+            return Ok(false);
+        }
+        // insert_rec と同じく、キーが lb 以下のいちばん後ろの子へ
+        let child = |node: &[u8]| -> Option<u64> {
+            let n = u16_at(node, 2) as usize;
+            let i = (0..n).rev().find(|&i| u32_at(node, 12 + i * 12) <= lb)?;
+            Some(ExtFs::ext_index_child(&node[12 + i * 12..24 + i * 12]))
+        };
+        let Some(mut b) = child(root) else { return Ok(false) };
+        for _ in 1..u16_at(root, 6) {
+            match self.with_block(b, |d| if u16_at(d, 0) == EXT_MAGIC && u16_at(d, 6) > 0 { child(d) } else { None })? {
+                Some(c) => b = c,
+                None => return Ok(false),
+            }
+        }
+        // leaf_merge は、のばせないときは何も変えない
+        if !self.with_block(b, |d| u16_at(d, 0) == EXT_MAGIC && u16_at(d, 6) == 0 && ExtFs::leaf_merge(d, lb, pb, raw))? {
+            return Ok(false);
+        }
+        self.modify_block(b, |_| ())?;
+        if self.csum {
+            self.cache.borrow_mut().lazy_csum.insert(b, (ino, r.gen_no(), Later::Extent));
+        }
+        Ok(true)
     }
 
     /// 葉/索引のノードを keep に合わせて切る。空になったら true
@@ -2973,7 +3159,7 @@ impl ExtFs {
                     _ => self.group_start(self.group_of(ino)),
                 },
             };
-            let b = match self.alloc_block(goal) {
+            let b = match self.alloc_block_run(goal, (to - lb).min(RUN_MAX) as u32) {
                 Ok(b) => b,
                 Err(e) => {
                     flush(r, &mut run)?;
@@ -3301,7 +3487,7 @@ impl ExtFs {
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
         self.modify_block(b, f)?;
         if self.csum {
-            self.cache.borrow_mut().dir_csum.insert(b, (dir, generation));
+            self.cache.borrow_mut().lazy_csum.insert(b, (dir, generation, Later::Dir));
         }
         Ok(())
     }
