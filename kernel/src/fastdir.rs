@@ -141,8 +141,9 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
 /// ふつうのファイル) をさし、リンクをたどらずに着くと確かめたもの。親のディレクトリを表で引き、ext4 のロック (いっしょに)
 /// の中で、名前がいまも ino をさして呼んだ人が読めれば (書く口なら書けて、動かしているプログラムでもなければ:
 /// ExtFs::fast_open)、ふつうの道の open_found と同じ OpenFile (パスは key。読むだけの口なら、閉じたら棚にしまってよい印
-/// つき) を fd に置く。Linux の open が dcache と inode だけで開くのと同じ。だめなら None (ふつうの道へ)
-pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], ino: u64, flags: u64) -> Option<i64> {
+/// つき) を fd に置く。Linux の open が dcache と inode だけで開くのと同じ。だめなら None (ふつうの道へ)。base は開いている
+/// ディレクトリから引いたときのそのディレクトリ (statc::parent_dir)
+pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], ino: u64, flags: u64, base: Option<(usize, u64)>) -> Option<i64> {
     let fs = usable(me)?;
     let perm = match flags & O_ACCMODE {
         0 => crate::cred::R,
@@ -160,7 +161,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
     };
     let name = core::str::from_utf8(name).ok().filter(|n| !n.is_empty())?;
     let path = core::str::from_utf8(key).ok()?;
-    let dir = crate::statc::dir_of(me, parent)?;
+    let dir = crate::statc::parent_dir(me, parent, base)?;
     // 開くのも fd に置くのも ext4 のロックの中で (ふつうの道の unlink は、ひとりで持つそのロックの中で、棚と表のものから
     // 印を落とす: file::shelf_forget)
     let _e = crate::extfs::fs_lock_shared();
@@ -174,6 +175,15 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
     }
     file::fast_install(t, fd, f, flags & O_CLOEXEC != 0);
     Some(fd as i64)
+}
+
+/// 大きなロックなしの stat で、表の答えの stat が古いもの (inode を書いたあと。名前と inode の番号は正しい): ディレクトリ
+/// dir の名前 name がいまも ino をさしていれば、ext4 の inode の覚えからいまの stat (Linux の stat が dentry の先の inode
+/// から読むのと同じ)。だめなら None (ふつうの道へ)
+pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
+    let fs = crate::extfs::ExtFs::root_fs()?;
+    let _e = crate::extfs::fs_lock_shared();
+    fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m))
 }
 
 /// syscall::fast の unlinkat (flags が 0 のもの)

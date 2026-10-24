@@ -265,10 +265,10 @@ fn note(i: usize) {
 }
 
 /// 大きなロックなしの openat (syscall::fast): O_RDONLY か O_WRONLY か O_RDWR (と O_CLOEXEC / O_LARGEFILE / O_NOCTTY)
-/// だけで、絶対のパスかいまのディレクトリからのもの。statc の表が「ない」と答えれば ENOENT (ふつうの道と同じわけを
-/// /proc/ai/why に)、ふつうのファイルで呼んだ人が読めて (書けて)、読むだけの口で、同じパスと inode と口のものが棚に
-/// あれば、それを置く。棚になく (書く口はいつも)、リンクをたどらずに着くものなら、ext4 の名前と inode から新しく開く
-/// (fastdir::fast_open)。ほかは None (ふつうの道へ)
+/// だけで、絶対のパスか、いまのディレクトリか開いているディレクトリ (statc の dir_base) からのもの。statc の表が
+/// 「ない」と答えれば ENOENT (ふつうの道と同じわけを /proc/ai/why に)、ふつうのファイルで呼んだ人が読めて (書けて)、
+/// 読むだけの口で、同じパスと inode と口のものが棚にあれば、それを置く。棚になく (書く口はいつも)、リンクをたどらずに
+/// 着くものなら、ext4 の名前と inode から新しく開く (fastdir::fast_open)。ほかは None (ふつうの道へ)
 pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     const O_LARGEFILE: u64 = 0o400000;
@@ -289,13 +289,13 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         note(3);
         return None;
     };
-    let (st, plain, fresh) = match ans {
+    let (st, plain, fresh, base) = match ans {
         crate::statc::Open::Missing => {
             crate::why::fast_missing(me, OPENAT, core::str::from_utf8(&norm[..len]).unwrap_or("?"));
             note(1);
             return Some(-2);
         }
-        crate::statc::Open::Found(st, plain, fresh) => (st, plain, fresh),
+        crate::statc::Open::Found(st, plain, fresh, base) => (st, plain, fresh, base),
     };
     // ここからふつうの道へ渡すものは、表の答えをいま確かめたもの (ふつうの道は覚えなおさない)
     let pass = |i: usize| {
@@ -322,7 +322,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     // 書く口は棚を見ない (棚は読むだけの口のもの)。stat が古いとき (inode を書いたあと) も: 棚から出すときの許しは、この
     // stat で確かめたもの。どちらもふつうの道は覚えなおしてよいので、seen_set はしない
     if acc != O_RDONLY as u64 || !fresh {
-        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags) {
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags, base) {
             note(7);
             return Some(fd);
         }
@@ -340,7 +340,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     let Some(i) = i else {
         drop(shelf);
         // 棚になければ、ext4 の名前と inode から新しく (Linux の open と同じく。パスは表の鍵: リンクをたどらずに着いたもの)
-        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags) {
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags, base) {
             note(7);
             return Some(fd);
         }
@@ -631,7 +631,10 @@ pub struct Stat {
 
 impl Stat {
     pub fn of_inode(i: &InodeRef) -> Stat {
-        let m = i.meta();
+        Stat::of_meta(&i.meta())
+    }
+
+    pub fn of_meta(m: &vfs::Meta) -> Stat {
         Stat {
             ino: m.ino,
             mode: m.mode,

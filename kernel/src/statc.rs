@@ -11,6 +11,10 @@
 //   「ない」(ENOENT) も覚える (シェルの PATH さがし、ライブラリや locale のファイルさがし: いちばん多い stat)。答えるときは
 //   ふつうの道と同じわけ (missing_cached) を /proc/ai/why に残す (why::fast_missing。取るのは輪のロックだけ)。
 //   大きなロックなしの O_CREAT (fastdir.rs) が作ったファイルは learn_new が、親の答えに 1 つ足して書く。
+//   答えの stat が古い (inode を書いて版が進んだ) だけなら、名前と inode の番号は正しいので、ext4 が親のディレクトリの
+//   ロックの中で名前を確かめて、inode の覚えからいまの stat を読む (now_stat。Linux の stat も、dentry の先の inode から
+//   読む)。開いているディレクトリ (dirfd) からのものは、そのディレクトリのパスがいまもその inode をさすときだけ、パスを
+//   つないで引く (dir_base)。
 // 版の箱 (NAMES、INOS) はハッシュで分けた AtomicU64: vfs が (ディレクトリ, 名前) を変える (作る・消す・名前を変える) たびに
 // その NAMES を、ext4 が inode を書くたびに INOS を増やす (箱が同じほかのものが変わっても、古いとみなすだけで、まちがった
 // 答えは出さない)。通ったところは名前ごと (Linux の dentry ごとの d_seq): ディレクトリに名前を足しても、ほかの名前の答えは
@@ -397,8 +401,9 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
     let r = if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
         None
     } else {
-        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0, true, &mut norm).and_then(|(a, len)| match a {
-            Answer::Found(s, ..) => p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0),
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
+            Answer::Found(s, _, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0)),
             Answer::Missing => Some(missing(p, NEWFSTATAT, &norm[..len])),
         })
     };
@@ -419,27 +424,80 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
         None
     } else {
         let mut norm = [0u8; PATH];
-        find(p, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW == 0, true, &mut norm).and_then(|(a, len)| match a {
-            Answer::Found(s, mg, ..) => p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)).then_some(0),
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
+            Answer::Found(s, mg, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)).then_some(0)),
             Answer::Missing => Some(missing(p, STATX, &norm[..len])),
         })
     };
     count(r)
 }
 
+/// 表の答えの stat が古ければ (fresh でない: inode を書いたあと)、名前がいまもその inode をさすことを ext4 が確かめて、
+/// inode の覚えからいまの stat を (fastdir::fresh_stat)。表の stat も書きなおす (読む前に取った inode の版で: そのあとに
+/// 書かれれば、次はまた古い)。base は開いているディレクトリから引いたときの (そのパスの長さ, inode の番号: dir_base)。
+/// 読めなければ None (ふつうの道へ)
+fn now_stat(p: &Proc, key: &[u8], follow: bool, st: Stat, fresh: bool, base: Option<(usize, u64)>) -> Option<Stat> {
+    if fresh {
+        return Some(st);
+    }
+    let s = slot_of(hash(key, follow), key, follow)?;
+    let ib = s[INO_BOX].load(Relaxed) as usize % BOXES;
+    let ver = INOS[ib].load(Acquire);
+    let (parent, name) = match key.iter().rposition(|&b| b == b'/') {
+        Some(c) => (&key[..c], &key[c + 1..]),
+        None => (&key[..0], key),
+    };
+    let dir = parent_dir(p, parent, base)?;
+    let now = crate::fastdir::fresh_stat(dir, core::str::from_utf8(name).ok().filter(|n| !n.is_empty())?, st.ino)?;
+    refresh(key, follow, ib, ver, &now);
+    Some(now)
+}
+
+/// key の答えの stat を、いまの inode のもの (st と、読む前に取った inode の箱 ib の版 ver) に書きなおす (ほかの印は
+/// そのまま)。書いている人がいれば書かない。そのあいだに場所がほかの鍵に使われていれば何もしない
+fn refresh(key: &[u8], follow: bool, ib: usize, ver: u64, st: &Stat) {
+    let Some(s) = slot_of(hash(key, follow), key, follow) else { return };
+    let seq = s[SEQ].load(Relaxed);
+    if seq & 1 != 0 || s[SEQ].compare_exchange(seq, seq | 1, Acquire, Relaxed).is_err() {
+        return;
+    }
+    core::sync::atomic::fence(Release);
+    let shape = s[SHAPE].load(Relaxed);
+    let same = (shape & 0xffff) as usize == key.len() && (shape >> 16 & 1 != 0) == follow && shape >> 41 & 1 == 0 && s[INO_BOX].load(Relaxed) as usize % BOXES == ib && s[STAT0].load(Relaxed) == st.ino && words(key).enumerate().all(|(i, w)| s[PATH0 + i].load(Relaxed) == w);
+    if same {
+        s[INO_GEN].store(ver, Relaxed);
+        let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
+        for (i, w) in w.iter().enumerate() {
+            s[STAT0 + i].store(*w, Relaxed);
+        }
+    }
+    s[SEQ].store((seq | 1) + 1, Release);
+}
+
+/// 表で引いたものの親 (畳んだパス parent) のディレクトリの inode の番号: 開いているディレクトリから引いたもので、その
+/// ディレクトリが親なら、もう確かめた番号 (base)。ほかは表で (dir_of)
+pub fn parent_dir(p: &Proc, parent: &[u8], base: Option<(usize, u64)>) -> Option<u64> {
+    match base {
+        Some((len, ino)) if len == parent.len() => Some(ino),
+        _ => dir_of(p, parent),
+    }
+}
+
 /// 大きなロックなしの open (file::fast_open) が引く答え: リンクをたどった stat と、リンクをたどらずに着いたか、stat が
-/// いまの inode のものか (書いたあとは inode の版が進んで古い。名前と inode の番号は正しい) か、ない
+/// いまの inode のものか (書いたあとは inode の版が進んで古い。名前と inode の番号は正しい)、開いているディレクトリから
+/// 引いたならそのディレクトリ (dir_base) か、ない
 pub enum Open {
-    Found(Stat, bool, bool),
+    Found(Stat, bool, bool, Option<(usize, u64)>),
     Missing,
 }
 
 /// file::fast_open: path (dirfd からの、リンクをたどる) が表にあって、通ったところがいまも同じで、呼んだ人が途中を
 /// 通れれば、その答えと norm に畳んだパスの長さ。でなければ None (ふつうの道へ)。stat の数 (HITS / MISSES) には入れない
 pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) -> Option<(Open, usize)> {
-    find(p, dirfd, pathp, true, false, norm).map(|(a, len)| {
+    find(p, dirfd, pathp, true, false, norm).map(|(a, len, base)| {
         let a = match a {
-            Answer::Found(s, _, plain, fresh) => Open::Found(s, plain, fresh),
+            Answer::Found(s, _, plain, fresh) => Open::Found(s, plain, fresh, base),
             Answer::Missing => Open::Missing,
         };
         (a, len)
@@ -477,9 +535,9 @@ fn count(r: Option<i64>) -> Option<i64> {
     r
 }
 
-/// 表から答えを探す: (答え, norm に畳んだパスの長さ)。表にないか、古いか、通れないかもしれなければ None。ino なら
-/// inode の中身の版も (でなければ、古いかは答えの fresh に)
-fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize)> {
+/// 表から答えを探す: (答え, norm に畳んだパスの長さ, 開いているディレクトリから引いたならそのディレクトリ (dir_base))。
+/// 表にないか、古いか、通れないかもしれなければ None。ino なら inode の中身の版も (でなければ、古いかは答えの fresh に)
+fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize, Option<(usize, u64)>)> {
     // しくじらせる決まり (fail.rs) があれば、それを通すためにふつうの道へ
     if crate::fail::ON.load(Relaxed) {
         return None;
@@ -487,8 +545,7 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
     let mut raw = [0u8; 256];
     let rlen = user_path(p, pathp, &mut raw)?;
     let path = &raw[..rlen];
-    // 開いているディレクトリからのものは、ふつうの道 (fd を見るのにロックがいる)。絶対のパスは dirfd を見ない
-    if path.is_empty() || (dirfd != AT_FDCWD && path[0] != b'/') {
+    if path.is_empty() {
         return None;
     }
     // /dev/stdin や /proc/self/fd/N (sysfile の fd_link) は、ふつうの道
@@ -496,8 +553,36 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
         return None;
     }
     let cwd = usable(p)?;
-    let len = normalize(cwd.as_bytes(), path, norm)?;
-    check(p, &norm[..len], follow, ino).map(|a| (a, len))
+    // 開いているディレクトリからのものは、そのディレクトリのパスから (dir_base)。絶対のパスは dirfd を見ない
+    let (len, base) = if dirfd == AT_FDCWD || path[0] == b'/' {
+        (normalize(cwd.as_bytes(), path, norm)?, None)
+    } else {
+        let mut buf = [0u8; PATH];
+        let (blen, dir) = dir_base(p, dirfd, &mut buf)?;
+        (normalize(&buf[..blen], path, norm)?, Some((blen, dir)))
+    };
+    check(p, &norm[..len], follow, ino).map(|a| (a, len, base))
+}
+
+/// 開いているディレクトリ dirfd (fstatat や openat の) の、畳んだパスを out に (その長さと inode の番号): ext4 の
+/// ディレクトリで、そのパスがいまも表でその inode をさすときだけ (開いたあとで名前を変えたり、上にかぶせたりしていれば、ふつうの道が inode からたどる)。
+/// fd の表は自分だけのもの (usable): 見ているあいだにだれも変えない。OpenFile の kind は作ったときのまま
+fn dir_base(p: &Proc, dirfd: i64, out: &mut [u8; PATH]) -> Option<(usize, u64)> {
+    let t = p.files.as_ref()?.get();
+    let fd = t.fds.get(usize::try_from(dirfd).ok()?)?.as_ref()?;
+    // 借りずに (ほかのプロセスと分けている OpenFile かもしれない: 位置などを書きかえていても、kind は読める)
+    let of = unsafe { &*fd.file.as_ptr() };
+    let crate::file::Kind::Inode(ino, path) = &of.kind else { return None };
+    let key = path.as_bytes();
+    if !ino.fast_stat() || key.len() > PATH {
+        return None;
+    }
+    match check(p, key, true, false)? {
+        Answer::Found(st, ..) if st.mode & 0o170000 == 0o040000 && st.ino == ino.id().1 => {}
+        _ => return None,
+    }
+    out[..key.len()].copy_from_slice(key);
+    Some((key.len(), ino.id().1))
 }
 
 /// 大きなロックなしの作る・消す (fastdir.rs): ディレクトリ dpath (dirfd からの、リンクをたどる。空なら cwd) が表にあって、

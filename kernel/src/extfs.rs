@@ -3915,6 +3915,31 @@ impl ExtFs {
         cached.or_else(|| self.read_inode(ino).ok().map(|r| meta_of(ino, &r, self.bsize)))
     }
 
+    /// ディレクトリ dir の名前 name が ino をさしていれば Some (名前の覚えになければ、ディレクトリのブロックから。覚えの
+    /// 帳簿のロックは、ブロックを読む前に放す)。ディレクトリのロックと noio の中で
+    fn names_ino(&self, dir: u32, name: &str, ino: u32) -> Option<()> {
+        let cached = self.names.borrow().get(dir, name);
+        let child = match cached {
+            Some(i) => i,
+            None => self.entry_at(dir, &self.read_inode(dir).ok()?, name).ok()??.0,
+        };
+        (child == ino).then_some(())
+    }
+
+    /// 大きなロックなしの stat の、表の stat が古いもの (inode を書いたあと: fastdir::fresh_stat): ディレクトリ dir の名前
+    /// name がいまも ino をさしていれば、いまの Meta (meta() が答えるものと同じ覚え)。fast_open と同じく、ディレクトリの
+    /// ロックの中で引くので、消すものとすれちがわない (消えて別のファイルに使われた inode の stat は答えない)
+    pub fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<Meta> {
+        let _d = dir_lock(dir);
+        crate::proc::noio(|| {
+            if self.meta_now(dir)?.mode & S_IFMT != S_IFDIR {
+                return None;
+            }
+            self.names_ino(dir, name, ino)?;
+            self.meta_now(ino)
+        })
+    }
+
     /// 大きなロックなしの open (fastdir::fast_open): ディレクトリ dir の名前 name がいまも ino をさす、リンクのあるふつうの
     /// ファイルで、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
     /// 読むだけのファイルシステムでも、変えられない・足すだけ (IMMUTABLE / APPEND) のものでもないこと (どれもふつうの道が
@@ -3932,15 +3957,7 @@ impl ExtFs {
             if dm.mode & S_IFMT != S_IFDIR || !c.may(&dm, crate::cred::X, false) {
                 return None;
             }
-            // 名前の覚えになければ、ディレクトリから (覚えの帳簿のロックは、ブロックを読む前に放す)
-            let cached = self.names.borrow().get(dir, name);
-            let child = match cached {
-                Some(i) => i,
-                None => self.entry_at(dir, &self.read_inode(dir).ok()?, name).ok()??.0,
-            };
-            if child != ino {
-                return None;
-            }
+            self.names_ino(dir, name, ino)?;
             let m = self.meta_now(ino)?;
             if m.mode & S_IFMT != S_IFREG || m.nlink == 0 || !c.may(&m, perm, false) {
                 return None;
