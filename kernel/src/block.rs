@@ -190,6 +190,42 @@ pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
     write_part(&root(), sector, buf)
 }
 
+/// root の区画の sector から、pages (each バイトずつ) をつづけて、眠って待って書く (extfs の眠って書く書き出しの、
+/// ファイルの中身: キャッシュのページそのものから)。virtio は写さずに 1 つの要求で (入るだけずつ)、SD は 1 つの
+/// バッファに写してから
+pub fn write_pages_wait(sector: u64, pages: &[*const u8], each: usize) -> Result<(), i64> {
+    let d = dev()?;
+    // 写さずに渡せるのは virtio でかたまりを 2 つ以上入れられるときだけ。ほかは 1 つのバッファに写して
+    let direct = d == Dev::Virtio && virtio_blk::max_segs() > 1;
+    let per = if direct { virtio_blk::max_segs() } else { pages.len().max(1) };
+    let spp = (each / SECTOR) as u64;
+    let mut at = sector;
+    for chunk in pages.chunks(per) {
+        let _p = crate::prof::span("block:write");
+        let p = root();
+        let n = chunk.len() as u64 * spp;
+        if at + n > p.len {
+            return Err(-5);
+        }
+        let t0 = crate::timer::uptime_ns();
+        crate::trace::blk(true, p.start + at, n);
+        let r = if direct {
+            virtio_blk::write_pages_wait(p.start + at, chunk, each)
+        } else {
+            let mut buf = alloc::vec::Vec::with_capacity(chunk.len() * each);
+            for &pg in chunk {
+                buf.extend_from_slice(unsafe { core::slice::from_raw_parts(pg, each) });
+            }
+            raw_write_wait(d, p.start + at, &buf)
+        };
+        crate::trace::blk_done(t0);
+        count(&p, true, n, t0);
+        r?;
+        at += n;
+    }
+    Ok(())
+}
+
 /// root の区画へ、眠って待って書く (extfs の眠って書く書き出し。大きなロックはほかの CPU が使う)
 pub fn write_wait(sector: u64, buf: &[u8]) -> Result<(), i64> {
     let _p = crate::prof::span("block:write");

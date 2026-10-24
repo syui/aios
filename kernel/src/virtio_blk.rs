@@ -1,4 +1,8 @@
-// virtio-blk。要求は 1 度に 1 つ (記述子 0..2)。終わるのを待つのは 2 通り:
+// virtio-blk。要求は 1 度に 1 つ (記述子 0 が頭、そのあとに中身のかたまり (ページなど) を 1 つ以上、最後が答え)。
+// キューは 256 (デバイスがそれより小さければ、入るだけ): 1 つの要求に 254 ページまで (デバイスの seg_max まで)、写さずに
+// そのまま渡せる (Linux の scatter-gather と同じ。前はキューが 8 で、ext4 の書き出しは 1 MiB のバッファに写してから
+// 書いた)。デバイスが seg_max を言わなければ、Linux と同じく 1 つずつ (写して書く)。
+// 終わるのを待つのは 2 通り:
 //   ふつう: 大きなロックを持ったまま、終わるまで回る (ポーリング)
 //   read_wait / write_wait (眠ってよいと分かっているところ、ext4 の読むだけの道と眠って書く書き出し): 眠って、
 //     割り込みで起こしてもらう。
@@ -13,6 +17,8 @@ use crate::virtio::{self, Mmio, Queue, DESC_NEXT, DESC_WRITE};
 const DEVICE_BLOCK: u32 = 2;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
+/// 1 つの要求のかたまりの数の上限 (設定の 12 バイトめの seg_max) を言う
+const F_SEG_MAX: u64 = 1 << 2;
 
 pub const SECTOR: usize = 512;
 
@@ -27,6 +33,8 @@ struct Disk {
     mmio: Mmio,
     q: Queue,
     capacity: u64,
+    /// 1 つの要求に入れる中身のかたまりの数の上限 (キューの大きさ - 2 と、デバイスの seg_max の小さいほう)
+    segs: usize,
     /// 出したまま終わっていない要求があるか
     busy: bool,
     /// その要求の「終わった」印 (出した人のスタックの上。終わったら true にして起こす)
@@ -42,13 +50,17 @@ static DISK: Bkl<Option<Disk>> = Bkl::new(None);
 
 /// 見つかったら true
 pub fn init() -> bool {
-    let Some((mmio, _)) = virtio::probe(DEVICE_BLOCK, 0) else { return false };
-    let Some(q) = Queue::new(&mmio, 0, 8) else { return false };
+    let Some((mmio, feats)) = virtio::probe(DEVICE_BLOCK, F_SEG_MAX) else { return false };
+    let max = Queue::max(&mmio, 0);
+    let Some(size) = [256, 128, 64, 32, 16, 8].into_iter().find(|&n| n <= max) else { return false };
+    let Some(q) = Queue::new(&mmio, 0, size) else { return false };
     virtio::ready(&mmio);
     let capacity = mmio.config64(0);
-    println!("virtio-blk: {} MiB", capacity * SECTOR as u64 / (1024 * 1024));
+    let seg_max = if feats & F_SEG_MAX != 0 { mmio.config32(12) as usize } else { 1 };
+    let segs = seg_max.clamp(1, size - 2);
+    println!("virtio-blk: {} MiB, {} segments a request", capacity * SECTOR as u64 / (1024 * 1024), segs);
     crate::irq::enable(mmio.irq);
-    *DISK.get() = Some(Disk { mmio, q, capacity, busy: false, done: core::ptr::null_mut() });
+    *DISK.get() = Some(Disk { mmio, q, capacity, segs, busy: false, done: core::ptr::null_mut() });
     true
 }
 
@@ -97,11 +109,23 @@ pub fn poll() {
     }
 }
 
+/// 1 つの要求に入れられる中身のかたまりの数 (頭と答えの記述子をのぞく)
+pub fn max_segs() -> usize {
+    DISK.get().as_ref().map_or(1, |d| d.segs)
+}
+
 /// buf (カーネルのメモリ、SECTOR の倍数) と sector から読み書きする。sleep なら眠って待つ
 fn rw(sector: u64, buf: *mut u8, len: usize, write: bool, sleep: bool) -> Result<(), i64> {
+    rw_segs(sector, &[(buf, len)], write, sleep)
+}
+
+/// segs (カーネルのメモリのかたまり (はじめ, 長さ)。あわせて SECTOR の倍数、max_segs こまで) をつづけて、sector から
+/// 読み書きする
+fn rw_segs(sector: u64, segs: &[(*mut u8, usize)], write: bool, sleep: bool) -> Result<(), i64> {
     const EIO: i64 = 5;
     let d = disk();
-    if len % SECTOR != 0 || sector + (len / SECTOR) as u64 > d.capacity {
+    let len: usize = segs.iter().map(|s| s.1).sum();
+    if segs.is_empty() || segs.len() > d.segs || len % SECTOR != 0 || sector + (len / SECTOR) as u64 > d.capacity {
         return Err(-EIO);
     }
     let t0 = crate::timer::uptime_ns();
@@ -119,13 +143,16 @@ fn rw(sector: u64, buf: *mut u8, len: usize, write: bool, sleep: bool) -> Result
     let mut status: u8 = 0xff;
     let mut done = false;
     *d.q.desc(0) = virtio::Desc { addr: v2p(&hdr as *const _ as usize) as u64, len: size_of::<ReqHeader>() as u32, flags: DESC_NEXT, next: 1 };
-    *d.q.desc(1) = virtio::Desc {
-        addr: v2p(buf as usize) as u64,
-        len: len as u32,
-        flags: DESC_NEXT | if write { 0 } else { DESC_WRITE },
-        next: 2,
-    };
-    *d.q.desc(2) = virtio::Desc { addr: v2p(&mut status as *mut u8 as usize) as u64, len: 1, flags: DESC_WRITE, next: 0 };
+    for (i, &(buf, n)) in segs.iter().enumerate() {
+        *d.q.desc(1 + i) = virtio::Desc {
+            addr: v2p(buf as usize) as u64,
+            len: n as u32,
+            flags: DESC_NEXT | if write { 0 } else { DESC_WRITE },
+            next: (2 + i) as u16,
+        };
+    }
+    let k = 1 + segs.len();
+    *d.q.desc(k) = virtio::Desc { addr: v2p(&mut status as *mut u8 as usize) as u64, len: 1, flags: DESC_WRITE, next: 0 };
     d.busy = true;
     d.done = &mut done;
     d.q.push(0);
@@ -167,4 +194,10 @@ pub fn write(sector: u64, buf: &[u8]) -> Result<(), i64> {
 /// 眠って待つ write (ext4 の、眠って書く書き出し: fsync や sync。buf は書き終わるまで呼ぶ側のもの)
 pub fn write_wait(sector: u64, buf: &[u8]) -> Result<(), i64> {
     rw(sector, buf.as_ptr() as *mut u8, buf.len(), true, true)
+}
+
+/// 眠って待つ write で、pages (each バイトずつ、max_segs こまで) をつづけて sector から (写さずに)
+pub fn write_pages_wait(sector: u64, pages: &[*const u8], each: usize) -> Result<(), i64> {
+    let segs: alloc::vec::Vec<(*mut u8, usize)> = pages.iter().map(|&p| (p as *mut u8, each)).collect();
+    rw_segs(sector, &segs, true, true)
 }

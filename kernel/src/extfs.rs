@@ -576,6 +576,27 @@ impl Ranges {
         self.0.clear();
     }
 
+    fn contains(&self, b: u64) -> bool {
+        self.0.range(..=b).next_back().is_some_and(|(_, &e)| b < e)
+    }
+
+    /// ブロックの数
+    fn blocks(&self) -> u64 {
+        self.0.iter().map(|(&s, &e)| e - s).sum()
+    }
+
+    /// 番号の順に並んだ (同じものはない) ブロックから (つづいたところを 1 つにして、木はいっぺんに作る)
+    fn from_sorted(bs: &[u64]) -> Ranges {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &b in bs {
+            match runs.last_mut() {
+                Some(r) if r.1 == b => r.1 = b + 1,
+                _ => runs.push((b, b + 1)),
+            }
+        }
+        Ranges(runs.into_iter().collect())
+    }
+
     /// [lo, hi) の中のものを、はじめと終わりの次で
     fn within(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
         let first = self.0.range(..=lo).next_back().map(|(&s, _)| s).unwrap_or(lo);
@@ -624,7 +645,7 @@ impl Cache {
     /// 表から外したブロック b のページを返す。ページは参照で持つ (写しているところがまだ見ているかもしれない)。
     /// 眠って書く書き出しがそのブロックを書いているとちゅうなら、書き終わるまで返さない (wb_held)
     fn release_page(&mut self, b: u64, p: *mut u8) {
-        if self.writeback.contains(&b) {
+        if self.writeback.contains(b) {
             self.wb_held.push(p);
         } else {
             kalloc::put(p);
@@ -633,7 +654,7 @@ impl Cache {
 
     /// まだディスクに書いていない (dirty、data) か、いま書いている (writeback) ブロック: 捨てない
     fn busy(&self, b: u64) -> bool {
-        self.dirty.contains(&b) || self.data.contains(&b) || self.writeback.contains(&b)
+        self.dirty.contains(&b) || self.data.contains(&b) || self.writeback.contains(b)
     }
 
     /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
@@ -691,8 +712,9 @@ struct Cache {
     written_data: u64,
     commits: u64,
     /// 眠って書く書き出し (flush_sleeping) がいま書いているブロック (写しをとったあとの dirty と data)。書き終わるまで
-    /// 捨てない (捨ててディスクから読みなおすと、まだ書いていない古い中身が見える)
-    writeback: BTreeSet<u64>,
+    /// 捨てない (捨ててディスクから読みなおすと、まだ書いていない古い中身が見える)。ファイルの中身はつづいているので、
+    /// つづいたところで (1 つずつの木だと、16 MiB の 4096 ブロックを入れるのに大きなロックを 1 ms 持った)
+    writeback: Ranges,
     /// writeback のブロックで、書いているあいだに表から外した (放した、別のページにした) ページ。書き終わるまで返さない
     /// (書いているのはそのページの中身)。ページの参照の数は vm.rs が「だれが写しているか」に使うので、書き出しは
     /// 参照を足さず、表の持っていた参照をここへ移す
@@ -1123,7 +1145,7 @@ impl ExtFs {
                 written_meta: 0,
                 written_data: 0,
                 commits: 0,
-                writeback: BTreeSet::new(),
+                writeback: Ranges::default(),
                 wb_held: Vec::new(),
                 slept_flushes: 0,
                 skipped_flushes: 0,
@@ -1230,7 +1252,7 @@ impl ExtFs {
             c.commits,
             c.slept_flushes,
             c.skipped_flushes,
-            c.writeback.len(),
+            c.writeback.blocks(),
             since,
             journal,
             self.metas.borrow().len(),
@@ -2340,10 +2362,23 @@ impl ExtFs {
             for b in &meta {
                 c.dirty.remove(b);
             }
-            // 中身のページ (writeback にあるあいだは返されない: release_page)
-            let pages: Vec<(u64, *mut u8)> = data.iter().filter_map(|&b| c.map.get(&b).map(|&p| (b, p))).collect();
-            c.writeback.extend(data.iter().copied());
-            c.writeback.extend(meta.iter().copied());
+            // 中身のページ (writeback にあるあいだは返されない: release_page)。data も表も番号の順なので、ならべて歩く
+            // (1 つずつ引くと、4096 ブロックで大きなロックを 1 ms こえて持った)
+            let mut pages: Vec<(u64, *mut u8)> = Vec::with_capacity(data.len());
+            if let (Some(&lo), Some(&hi)) = (data.first(), data.last()) {
+                let mut it = c.map.range(lo..=hi).peekable();
+                for &b in &data {
+                    while it.next_if(|(k, _)| **k < b).is_some() {}
+                    if let Some((_, &p)) = it.next_if(|(k, _)| **k == b) {
+                        pages.push((b, p));
+                    }
+                }
+            }
+            let mut wb = Ranges::from_sorted(&data);
+            for &b in &meta {
+                wb.insert(b);
+            }
+            c.writeback.take_from(&mut wb);
             // ここまでに放したものは、このトランザクションのコミットのあとに取れる。眠っているあいだに放すものは freed に
             // (次のトランザクション)
             let mut freed = core::mem::take(&mut c.freed);
@@ -2362,9 +2397,8 @@ impl ExtFs {
         self.flushing.set(0);
         {
             let mut c = self.cache.borrow_mut();
-            for b in data.iter().chain(meta.iter()) {
-                c.writeback.remove(b);
-            }
+            // writeback に入れるのは眠って書く書き出しだけで、1 度に 1 つ: みなこれのもの
+            c.writeback.clear();
             for p in core::mem::take(&mut c.wb_held) {
                 kalloc::put(p);
             }
@@ -2409,21 +2443,14 @@ impl ExtFs {
             }
             j
         };
-        // 1. 中身を本当の場所へ (となりあうものは 1 回で、1 MiB まで。まとめるメモリがなければ 1 ページずつそのまま)
+        // 1. 中身を本当の場所へ。となりあうものは 1 MiB まで 1 回で、キャッシュのページから写さずに (block::write_pages_wait。
+        //    前は 1 MiB のバッファをとって写してから書いたので、大きなロックを持ったまま 1 MiB ごとに 0.4 ms、はじめて
+        //    さわるメモリ (QEMU) なら 10 ms 写していた)
         let mut i = 0;
         while i < pages.len() {
             let j = run_end(i, pages.len(), &|k| pages[k].0);
-            let mut buf = Vec::new();
-            if j - i > 1 && buf.try_reserve_exact((j - i) * self.bsize).is_ok() {
-                for &(_, p) in &pages[i..j] {
-                    buf.extend_from_slice(unsafe { core::slice::from_raw_parts(p, self.bsize) });
-                }
-                jbd2::bwrite(pages[i].0 * spb, &buf, true)?;
-            } else {
-                for &(b, p) in &pages[i..j] {
-                    jbd2::bwrite(b * spb, unsafe { core::slice::from_raw_parts(p, self.bsize) }, true)?;
-                }
-            }
+            let ptrs: Vec<*const u8> = pages[i..j].iter().map(|&(_, p)| p as *const u8).collect();
+            crate::block::write_pages_wait(pages[i].0 * spb, &ptrs, self.bsize)?;
             i = j;
         }
         if snap.is_empty() {

@@ -411,8 +411,10 @@ pub static WRITE_FAST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// IN_MODIFY の見張りが置かれるたびに増える: それより前の write_fast の許しは使わない
 static WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// write_fast が書いたページの列の長さと、古さ (ticks) の上限。こえたらふつうの道へ (そこでファイルシステムが書き出す)
-const WRITTEN_MAX: usize = 4096;
+/// write_fast が書いたページの列の長さと、古さ (ticks) の上限。こえたらふつうの道へ (そこでファイルシステムが書き出す)。
+/// いっぱいになった 1 回は、列のページにみな書き出す印をつけるあいだ止まる (Linux は書くたびにページに PG_dirty を
+/// つけるので止まらない): 4096 (16 MiB) では 7 ms 止まったので 512 (2 MiB) ずつ
+const WRITTEN_MAX: usize = 512;
 const WRITTEN_AGE: u64 = 5 * crate::timer::HZ;
 
 /// 大きなロックなしの pwrite (write_fast) が写すあいだ持つ、ファイルごとのロック (id で 64 に分ける: 同じ箱のほかの

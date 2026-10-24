@@ -65,6 +65,11 @@ impl Mmio {
         crate::mmio::r8(self.base + CONFIG + off)
     }
 
+    /// 設定の領域の 32 ビット
+    pub fn config32(&self, off: usize) -> u32 {
+        crate::mmio::r32(self.base + CONFIG + off)
+    }
+
     /// 設定の領域の 64 ビット (32 ビットずつ、下から)
     pub fn config64(&self, off: usize) -> u64 {
         let a = self.base + CONFIG + off;
@@ -179,6 +184,12 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// キュー idx の入れ物の数の上限 (デバイスの言うもの)
+    pub fn max(m: &Mmio, idx: u32) -> usize {
+        m.wr(QUEUE_SEL, idx);
+        m.rd(QUEUE_NUM_MAX) as usize
+    }
+
     pub fn new(m: &Mmio, idx: u32, size: usize) -> Option<Queue> {
         m.wr(QUEUE_SEL, idx);
         if (m.rd(QUEUE_NUM_MAX) as usize) < size || size * 16 > PGSIZE {
