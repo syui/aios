@@ -305,9 +305,17 @@ fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch:
 /// 消したかもしれない) 書かない。id、st、ver は作ったファイルの inode と、その stat と inode の版 (ExtFs::fast_create が、
 /// まだだれも引けないあいだに取ったもの)
 pub fn learn_new(parent: &[u8], name: &str, dir: (usize, u64), before: u64, id: (usize, u64), st: Stat, ver: u64) {
+    learn_under(parent, name, true, dir, before.wrapping_add(1), EPOCH.load(Acquire), Some((id, st, ver)));
+}
+
+/// 表にある親のディレクトリ parent (畳んだパス) の中の name の答えを書く: 親の答えの印に、親で name を引いたこと
+/// ((dir, name) の箱と、その版 want) を足したもの。箱がいまも want で、全体の版がいまも epoch (引く前に読んだもの) の
+/// ときだけ。found は (inode, stat, inode の版)、None なら「ない」。親の答えがいまも正しければ、親がリンクを
+/// たどらずに着いたものか (書けなくても)。でなければ None
+fn learn_under(parent: &[u8], name: &str, follow: bool, dir: (usize, u64), want: u64, epoch: u64, found: Option<((usize, u64), Stat, u64)>) -> Option<bool> {
     let len = parent.len() + (!parent.is_empty()) as usize + name.len();
     if len > PATH {
-        return;
+        return None;
     }
     let mut buf = [0u8; PATH];
     let mut n = 0;
@@ -316,25 +324,21 @@ pub fn learn_new(parent: &[u8], name: &str, dir: (usize, u64), before: u64, id: 
         n += part.len();
     }
     let key = &buf[..len];
-    let epoch = EPOCH.load(Acquire);
-    let ino_ver = (box_of(id), ver, st);
+    let ino_ver = found.map(|(id, st, ver)| (box_of(id), ver, st));
     let dbox = name_box(dir, crate::vfs::name_hash(name));
-    if NAMES[dbox].load(Acquire) != before.wrapping_add(1) {
-        return;
-    }
     // 親の答え (check と同じに、seq のあいだに読む)。いまも正しいディレクトリのものだけ
-    let Some(s) = slot_of(hash(parent, true), parent, true) else { return };
+    let s = slot_of(hash(parent, true), parent, true)?;
     let seq = s[SEQ].load(Acquire);
     let shape = s[SHAPE].load(Relaxed);
     let (ndirs, ngates) = ((shape >> 24 & 0xff) as usize, (shape >> 32 & 0xff) as usize);
     if seq & 1 != 0 || shape >> 41 & 1 != 0 || ndirs + 1 > DIRS_MAX || ngates > GATES_MAX || s[EPOCH_W].load(Relaxed) != epoch {
-        return;
+        return None;
     }
     let mut dw = [0u64; DIRS_MAX];
     for (i, w) in dw.iter_mut().enumerate().take(ndirs) {
         *w = s[DIR0 + i].load(Relaxed);
         if *w & 0xffff_ffff_ffff != NAMES[(*w >> 48) as usize].load(Acquire) & 0xffff_ffff_ffff {
-            return;
+            return None;
         }
     }
     let mut gw = [0u64; GATES_MAX];
@@ -345,21 +349,57 @@ pub fn learn_new(parent: &[u8], name: &str, dir: (usize, u64), before: u64, id: 
     let (pmode, owner) = (s[STAT0 + 1].load(Relaxed) as u32, s[STAT0 + 2].load(Relaxed));
     core::sync::atomic::fence(Acquire);
     if s[SEQ].load(Relaxed) != seq || pmode & 0o170000 != 0o040000 {
-        return;
+        return None;
+    }
+    // 親がリンクをたどらずに着いたものなら、中の名前も (リンクをたどる答えは、書く前にふつうの道へ)
+    let plain = shape >> 42 & 1 != 0;
+    if NAMES[dbox].load(Acquire) != want || EPOCH.load(Acquire) != epoch {
+        return Some(plain);
     }
     // 親もだれでもは通れなければ gates に (vfs の walk と同じ)。owner は uid | gid << 32、gates は uid << 32 | gid
     let mut ngates = ngates;
     if pmode & 0o111 != 0o111 {
         if ngates == GATES_MAX {
-            return;
+            return Some(plain);
         }
         gw[ngates] = (owner & 0xffff_ffff) << 32 | owner >> 32;
         modes |= ((pmode & 0xffff) as u64) << (16 * ngates);
         ngates += 1;
     }
-    dw[ndirs] = (dbox as u64) << 48 | (before.wrapping_add(1) & 0xffff_ffff_ffff);
-    // 親がリンクをたどらずに着いたものなら、作ったファイルも
-    put(key, true, &dw[..ndirs + 1], &gw[..ngates], modes, epoch, true, shape >> 42 & 1 != 0, Some(&ino_ver));
+    dw[ndirs] = (dbox as u64) << 48 | (want & 0xffff_ffff_ffff);
+    put(key, follow, &dw[..ndirs + 1], &gw[..ngates], modes, epoch, true, plain && ino_ver.is_some(), ino_ver.as_ref());
+    Some(plain)
+}
+
+/// 表にない (か古い) key の答えを、親のディレクトリが表にあれば、ext4 で名前を 1 つ引いて出し、表にも書く (Linux の
+/// lookup_slow が、親の i_rwsem をいっしょに持って ->lookup を呼び、dentry を作るのと同じ: fastdir::lookup_name)。
+/// ないなら「ない」、あればその stat。リンクをたどるもの、マウント先 (かぶせたものの根がほんとうの答え)、
+/// 引けないもの (名前が長すぎる、読むブロックがキャッシュにない、許しがない ...) は None (ふつうの道へ)
+fn learn_lookup(p: &Proc, key: &[u8], follow: bool, base: Option<(usize, u64)>) -> Option<Answer> {
+    let (parent, name) = match key.iter().rposition(|&b| b == b'/') {
+        Some(c) => (&key[..c], &key[c + 1..]),
+        None => (&key[..0], key),
+    };
+    let name = core::str::from_utf8(name).ok().filter(|n| !n.is_empty() && n.len() <= 255)?;
+    // 全体の版 (マウント) と (dir, name) の箱の版は、引く前に読む: 引いたあとに変わったものは、書くときに落とす
+    let epoch = EPOCH.load(Acquire);
+    let dir = parent_dir(p, parent, base)?;
+    let fs = crate::fastdir::root_fs_id()?;
+    let did = (fs, dir);
+    let before = NAMES[name_box(did, crate::vfs::name_hash(name))].load(Acquire);
+    match crate::fastdir::lookup_name(p, dir, name)? {
+        None => {
+            learn_under(parent, name, follow, did, before, epoch, None);
+            Some(Answer::Missing(true))
+        }
+        Some((ino, st, ver)) => {
+            if (follow && st.mode & 0o170000 == 0o120000) || crate::vfs::is_mount_at((fs, ino)) {
+                return None;
+            }
+            let plain = learn_under(parent, name, follow, did, before, epoch, Some(((fs, ino), st, ver)));
+            Some(Answer::Found(st, true, plain.unwrap_or(false) && st.mode & 0o170000 != 0o120000, true))
+        }
+    }
 }
 
 /// ユーザーの path (NUL で終わる文字) を buf に写す (写っているページだけ。なければ None)
@@ -388,7 +428,8 @@ const AT_NO_AUTOMOUNT: u64 = 0x800;
 enum Answer {
     /// stat、mg、plain (SHAPE)、fresh (inode の中身の版がいまのもの: stat がいまの inode のもの)
     Found(Stat, bool, bool, bool),
-    Missing,
+    /// 「ない」(いまディレクトリで引いたものなら true: /proc/ai/why のわけ)
+    Missing(bool),
 }
 
 const NEWFSTATAT: u64 = 79;
@@ -404,15 +445,21 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
             Answer::Found(s, _, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0)),
-            Answer::Missing => Some(missing(p, NEWFSTATAT, &norm[..len])),
+            Answer::Missing(looked) => Some(missing(p, NEWFSTATAT, &norm[..len], looked)),
         })
     };
     count(r)
 }
 
-/// 「ない」と答える: ふつうの道と同じわけを /proc/ai/why に
-fn missing(p: &Proc, nr: u64, key: &[u8]) -> i64 {
-    crate::why::fast_missing(p, nr, core::str::from_utf8(key).unwrap_or("?"));
+/// 「ない」と答える: ふつうの道と同じわけを /proc/ai/why に (looked なら、いまディレクトリで引いたもの: ふつうの道が
+/// たどって見つけなかったときと同じ。でなければ覚えにあった「ない」)
+pub fn missing(p: &Proc, nr: u64, key: &[u8], looked: bool) -> i64 {
+    let key = core::str::from_utf8(key).unwrap_or("?");
+    match key.rfind('/') {
+        _ if !looked => crate::why::fast_missing(p, nr, key),
+        Some(c) => crate::why::fast_missing_at(p, nr, &key[..c], &key[c + 1..]),
+        None => crate::why::fast_missing_at(p, nr, "", key),
+    }
     -ENOENT
 }
 
@@ -427,7 +474,7 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
             Answer::Found(s, mg, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)).then_some(0)),
-            Answer::Missing => Some(missing(p, STATX, &norm[..len])),
+            Answer::Missing(looked) => Some(missing(p, STATX, &norm[..len], looked)),
         })
     };
     count(r)
@@ -489,7 +536,8 @@ pub fn parent_dir(p: &Proc, parent: &[u8], base: Option<(usize, u64)>) -> Option
 /// 引いたならそのディレクトリ (dir_base) か、ない
 pub enum Open {
     Found(Stat, bool, bool, Option<(usize, u64)>),
-    Missing,
+    /// 「ない」(いまディレクトリで引いたものなら true)
+    Missing(bool),
 }
 
 /// file::fast_open: path (dirfd からの、リンクをたどる) が表にあって、通ったところがいまも同じで、呼んだ人が途中を
@@ -498,7 +546,7 @@ pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) ->
     find(p, dirfd, pathp, true, false, norm).map(|(a, len, base)| {
         let a = match a {
             Answer::Found(s, _, plain, fresh) => Open::Found(s, plain, fresh, base),
-            Answer::Missing => Open::Missing,
+            Answer::Missing(looked) => Open::Missing(looked),
         };
         (a, len)
     })
@@ -561,7 +609,8 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
         let (blen, dir) = dir_base(p, dirfd, &mut buf)?;
         (normalize(&buf[..blen], path, norm)?, Some((blen, dir)))
     };
-    check(p, &norm[..len], follow, ino).map(|a| (a, len, base))
+    // 表になければ (古ければ)、親のディレクトリから名前を 1 つ引いて (learn_lookup)
+    check(p, &norm[..len], follow, ino).or_else(|| learn_lookup(p, &norm[..len], follow, base)).map(|a| (a, len, base))
 }
 
 /// 開いているディレクトリ dirfd (fstatat や openat の) の、畳んだパスを out に (その長さと inode の番号): ext4 の
@@ -665,7 +714,7 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
         return None;
     }
     if is_missing {
-        return Some(Answer::Missing);
+        return Some(Answer::Missing(false));
     }
     let st = Stat { ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: w[3], size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] };
     Some(Answer::Found(st, shape >> 40 & 1 != 0, shape >> 42 & 1 != 0, fresh))

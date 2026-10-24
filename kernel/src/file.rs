@@ -290,10 +290,9 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         return None;
     };
     let (st, plain, fresh, base) = match ans {
-        crate::statc::Open::Missing => {
-            crate::why::fast_missing(me, OPENAT, core::str::from_utf8(&norm[..len]).unwrap_or("?"));
+        crate::statc::Open::Missing(looked) => {
             note(1);
-            return Some(-2);
+            return Some(crate::statc::missing(me, OPENAT, &norm[..len], looked));
         }
         crate::statc::Open::Found(st, plain, fresh, base) => (st, plain, fresh, base),
     };
@@ -616,6 +615,7 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
 }
 
 /// Linux (asm-generic) の struct stat
+#[derive(Clone, Copy)]
 pub struct Stat {
     pub ino: u64,
     pub mode: u32,

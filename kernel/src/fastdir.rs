@@ -186,6 +186,20 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
     fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m))
 }
 
+/// ルートの ext4 の vfs の id の 1 つめ (statc が (ディレクトリ, 名前) の箱を引くため)
+pub fn root_fs_id() -> Option<usize> {
+    crate::extfs::ExtFs::root_fs().map(|fs| fs.fs_id())
+}
+
+/// 表にない名前を 1 つ引く (statc::learn_lookup: 親のディレクトリ dir は表で確かめたもの): ext4 のロック (いっしょに) と
+/// dir のロックの中で (ExtFs::fast_lookup)、ないなら Some(None)、あれば Some((inode の番号, stat, 読む前に取った inode の
+/// 版))。引けなければ None (ふつうの道へ)
+pub fn lookup_name(me: &Proc, dir: u64, name: &str) -> Option<Option<(u64, file::Stat, u64)>> {
+    let fs = crate::extfs::ExtFs::root_fs()?;
+    let _e = crate::extfs::fs_lock_shared();
+    fs.fast_lookup(dir as u32, name, &me.cred).map(|r| r.map(|(ino, m, ver)| (ino as u64, file::Stat::of_meta(&m), ver)))
+}
+
 /// syscall::fast の unlinkat (flags が 0 のもの)
 pub fn fast_unlink(me: &Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
     if flags != 0 {

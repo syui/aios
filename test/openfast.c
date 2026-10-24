@@ -9,6 +9,8 @@
 //   dirfd     開いたディレクトリからの fstatat と openat。ディレクトリの名前を変えて、前の名前に別のディレクトリを
 //             作っても、開いたほうのもの
 //   fresh     書いたあと (inode の版が進んだあと) の stat は、いまの大きさと時刻 (fstat と同じ)
+//   lookup    はじめて引く名前 (表にない): ないものは ENOENT、あるものは fstat と同じ。通れないディレクトリの下は
+//             EACCES。マウント先 (/tmp、/dev、/run、/proc、/sys) は、かぶせたものの根 (下の ext4 のディレクトリではない)
 // openfast DIR
 #include <errno.h>
 #include <fcntl.h>
@@ -162,6 +164,51 @@ int main(int argc, char **argv) {
       fstatat(dfd, "w", &c, 0);
       close(dfd);
       if (c.st_size != b.st_size) { printf("FAIL fstatat after write (%d): size %lld\n", k, (long long)c.st_size); fails++; }
+    }
+  }
+  // 7. はじめて引く名前
+  {
+    struct stat a, b;
+    for (int k = 0; k < 2; k++) expect("stat new missing", stat("never", &a) < 0 ? -errno : 0, -ENOENT);
+    int fd = open("seen", O_CREAT | O_WRONLY, 0640);
+    fstat(fd, &b);
+    close(fd);
+    for (int k = 0; k < 2; k++) {
+      int r = stat("seen", &a);
+      printf("%s stat new name (%d)\n", r == 0 && a.st_ino == b.st_ino && a.st_mode == b.st_mode ? "ok  " : "FAIL", k);
+      if (r != 0 || a.st_ino != b.st_ino || a.st_mode != b.st_mode) fails++;
+    }
+    for (int k = 0; k < 2; k++) expect("lstat new missing", lstat("never2", &a) < 0 ? -errno : 0, -ENOENT);
+    if (symlink("seen", "ln") == 0) {
+      for (int k = 0; k < 2; k++) {
+        int r = stat("ln", &a);
+        printf("%s stat through link (%d)\n", r == 0 && a.st_ino == b.st_ino ? "ok  " : "FAIL", k);
+        if (r != 0 || a.st_ino != b.st_ino) fails++;
+        r = lstat("ln", &a);
+        printf("%s lstat link (%d)\n", r == 0 && S_ISLNK(a.st_mode) ? "ok  " : "FAIL", k);
+        if (r != 0 || !S_ISLNK(a.st_mode)) fails++;
+      }
+    }
+    if (geteuid() != 0) {
+      mkdir("nx2", 0755);
+      close(open("nx2/f", O_CREAT | O_WRONLY, 0644));
+      chmod("nx2", 0644);
+      for (int k = 0; k < 2; k++) expect("stat under 0644 dir", stat("nx2/g", &a) < 0 ? -errno : 0, -EACCES);
+      for (int k = 0; k < 2; k++) expect("stat file under 0644 dir", stat("nx2/f", &a) < 0 ? -errno : 0, -EACCES);
+      chmod("nx2", 0755);
+      for (int k = 0; k < 2; k++) expect("stat under 0755 dir again", stat("nx2/f", &a) < 0 ? -errno : 0, 0);
+    }
+    const char *mp[] = {"/tmp", "/dev", "/run", "/proc", "/sys"};
+    for (int i = 0; i < 5; i++) {
+      int dfd = open(mp[i], O_RDONLY | O_DIRECTORY);
+      if (dfd < 0) continue;
+      fstat(dfd, &b);
+      close(dfd);
+      for (int k = 0; k < 2; k++) {
+        int r = stat(mp[i], &a);
+        printf("%s stat %s (%d)\n", r == 0 && a.st_ino == b.st_ino && a.st_dev == b.st_dev ? "ok  " : "FAIL", mp[i], k);
+        if (r != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev) fails++;
+      }
     }
   }
   printf("openfast: %s (%d failed)\n", fails ? "BAD" : "ok", fails);

@@ -303,6 +303,19 @@ pub fn fast_missing(p: &crate::proc::Proc, nr: u64, path: &str) {
     push(probe(nr, -2), ent);
 }
 
+/// 大きなロックなしの stat や open が、ディレクトリ dir (畳んだパス) で name を引いて、なかった: ふつうの道が
+/// たどって見つけなかったとき (at) と同じわけ
+pub fn fast_missing_at(p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
+    if crate::parts::off(crate::parts::Part::Aiproc) {
+        return;
+    }
+    let mut note = Note { code: Code::Missing, errno: 2, ..NONE };
+    note.plen = copy(&mut note.path, dir);
+    note.nlen = copy(&mut note.name, name);
+    let ent = Ent { ns: crate::timer::uptime_ns(), tgid: p.tgid as u32, tid: p.pid as u32, uid: p.cred.uid, nr: nr as u16, errno: 2, comm: p.comm, note };
+    push(probe(nr, -2), ent);
+}
+
 fn push(probe: bool, ent: Ent) {
     let mut r = if probe { PROBE.lock() } else { MAIN.lock() };
     let h = r.head;

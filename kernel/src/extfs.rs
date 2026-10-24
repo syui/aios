@@ -3940,6 +3940,28 @@ impl ExtFs {
         })
     }
 
+    /// 大きなロックなしで名前を 1 つ引く (fastdir::lookup_name): 呼んだ人がディレクトリ dir を通れれば、name がなければ
+    /// Some(None)、あれば Some((inode の番号, いまの Meta, Meta を読む前に取った statc の inode の版))。名前の覚えになければ
+    /// ディレクトリのブロックから。読むブロックがみなキャッシュにあるときだけ。ディレクトリのロックの中で引くので、作る・
+    /// 消すものとすれちがわない (ふつうの道で作る・消す・名前を変えるものは、ext4 のロックをひとりで持つ)
+    pub fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, Meta, u64)>> {
+        let _d = dir_lock(dir);
+        crate::proc::noio(|| {
+            let dm = self.meta_now(dir)?;
+            if dm.mode & S_IFMT != S_IFDIR || !c.may(&dm, crate::cred::X, false) {
+                return None;
+            }
+            let cached = self.names.borrow().get(dir, name);
+            let child = match cached {
+                Some(i) => Some(i),
+                None => self.entry_at(dir, &self.read_inode(dir).ok()?, name).ok()?.map(|(i, _)| i),
+            };
+            let Some(ino) = child else { return Some(None) };
+            let ver = crate::statc::ino_ver((self.fs, ino as u64));
+            Some(Some((ino, self.meta_now(ino)?, ver)))
+        })
+    }
+
     /// 大きなロックなしの open (fastdir::fast_open): ディレクトリ dir の名前 name がいまも ino をさす、リンクのあるふつうの
     /// ファイルで、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
     /// 読むだけのファイルシステムでも、変えられない・足すだけ (IMMUTABLE / APPEND) のものでもないこと (どれもふつうの道が

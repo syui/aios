@@ -335,8 +335,40 @@ pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bo
         return Err(-ENOTDIR);
     }
     current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into(), ro });
+    // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
+    mount_at_refresh();
     names_changed();
     Ok(())
+}
+
+/// はじめのマウントの namespace のマウント先 (かぶせてあるディレクトリ) の id (inode の番号 | fs << 48。0 は空き)。
+/// 大きなロックなしで名前を 1 つ引くもの (statc::learn_lookup) が、引いたものがマウント先なら、ふつうの道 (cross) に
+/// 任せる。入りきらなければ MOUNT_MANY (それからはみなマウント先かもしれない)
+static MOUNT_AT: [core::sync::atomic::AtomicU64; 32] = [const { core::sync::atomic::AtomicU64::new(0) }; 32];
+static MOUNT_MANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn mount_key(id: (usize, u64)) -> u64 {
+    id.1 | (id.0 as u64) << 48
+}
+
+/// マウントの表が変わった (大きなロックの中で): はじめの namespace のマウント先を MOUNT_AT に写しなおす
+fn mount_at_refresh() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let ns = init_mnt();
+    let l = ns.list.borrow();
+    if l.len() > MOUNT_AT.len() {
+        MOUNT_MANY.store(true, SeqCst);
+    }
+    for (i, slot) in MOUNT_AT.iter().enumerate() {
+        slot.store(l.get(i).map_or(0, |m| mount_key(m.at)), SeqCst);
+    }
+}
+
+/// id のディレクトリが、はじめのマウントの namespace でマウント先か (大きなロックなしで。かもしれないなら true)
+pub fn is_mount_at(id: (usize, u64)) -> bool {
+    use core::sync::atomic::Ordering::SeqCst;
+    let k = mount_key(id);
+    MOUNT_MANY.load(SeqCst) || MOUNT_AT.iter().any(|m| m.load(SeqCst) == k)
 }
 
 /// path にかぶせてあるもの (いちばん上) を、読むだけに / 書けるように (mount -o remount,ro)
@@ -375,8 +407,9 @@ pub fn umount(path: &str) -> Result<(), i64> {
         return Err(-16); // EBUSY
     }
     l.remove(i);
-    names_changed();
     drop(l);
+    mount_at_refresh();
+    names_changed();
     // 閉じたファイルの棚 (file::Shelf) に、外したものの inode が残らないように
     crate::file::shelf_flush_all();
     Ok(())
