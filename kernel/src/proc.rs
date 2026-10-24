@@ -89,6 +89,24 @@ pub struct Mm {
     pub args: (usize, usize, usize),
 }
 
+impl Mm {
+    /// 作る (exe_id の箱を数える: maybe_executing)
+    fn shared(m: Mm) -> Shared<Mm> {
+        if let Some(b) = exe_box(m.exe_id) {
+            b.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        Shared::new(m)
+    }
+}
+
+impl Drop for Mm {
+    fn drop(&mut self) {
+        if let Some(b) = exe_box(self.exe_id) {
+            b.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Fd {
     pub file: FileRef,
@@ -505,7 +523,7 @@ impl Proc {
 
     fn load_image(&mut self, img: Image) {
         self.execed = true;
-        self.mm = Some(Shared::new(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args }));
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -820,6 +838,21 @@ pub fn executing(id: (usize, u64)) -> bool {
     live().any(|p| p.state != State::Unused && p.state != State::Zombie && p.mm.as_ref().is_some_and(|m| m.get().exe_id == id))
 }
 
+/// 動かしているプログラムの inode の数を、id のハッシュで 256 の箱に分けたもの (アドレス空間 Mm を作るときに足し、
+/// 落とすときに引く。exe_id のないカーネルのスレッドは数えない)
+static EXE_BOXES: [core::sync::atomic::AtomicU32; 256] = [const { core::sync::atomic::AtomicU32::new(0) }; 256];
+
+fn exe_box(id: (usize, u64)) -> Option<&'static core::sync::atomic::AtomicU32> {
+    (id != (0, 0)).then(|| &EXE_BOXES[((id.1 ^ (id.0 as u64).rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize])
+}
+
+/// 大きなロックなしの書く open (fastdir::fast_open): id をプログラムとして動かしているかもしれないか (箱が 0 でなければ。
+/// そのときはふつうの道が executing で確かめる。Linux の i_writecount のように、プロセスをなめずに数を見るだけ)。
+/// exec が、いま見たあとで箱を足すなら、開いたあとに動かしたのと同じ (書く口が開いていても exec はできる)
+pub fn maybe_executing(id: (usize, u64)) -> bool {
+    exe_box(id).is_some_and(|b| b.load(core::sync::atomic::Ordering::Relaxed) != 0)
+}
+
 /// 使われているアドレス空間ごとに 1 回 f (スレッドで共有しているものも 1 回)
 pub fn each_pagetable(mut f: impl FnMut(&mut PageTable)) {
     let mut seen: Vec<usize> = Vec::new();
@@ -978,7 +1011,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Shared::new(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0) }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0) }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -1555,7 +1588,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     } else {
         let m = parent.mm();
         let pt = m.pt.fork().ok_or(-ENOMEM)?;
-        Shared::new(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()

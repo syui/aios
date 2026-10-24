@@ -3909,6 +3909,49 @@ impl ExtFs {
         })
     }
 
+    /// ino の Meta: meta() の覚え (metas) にあればそれ (inode を書くたびに入れかわる)、なければ inode から (覚えには入れない)
+    fn meta_now(&self, ino: u32) -> Option<Meta> {
+        let cached = self.metas.borrow().get(&ino).copied();
+        cached.or_else(|| self.read_inode(ino).ok().map(|r| meta_of(ino, &r, self.bsize)))
+    }
+
+    /// 大きなロックなしの open (fastdir::fast_open): ディレクトリ dir の名前 name がいまも ino をさす、リンクのあるふつうの
+    /// ファイルで、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
+    /// 読むだけのファイルシステムでも、変えられない・足すだけ (IMMUTABLE / APPEND) のものでもないこと (どれもふつうの道が
+    /// 答える)。読むブロックがみなキャッシュにあるときだけ。
+    /// ディレクトリのロックの中で引いて数えるので、消すものとすれちがわない (fast_unlink は同じロックの中で、だれも使って
+    /// いないことを確かめてから消す。ふつうの道の unlink と rename は、ひとりで持つ ext4 のロックの中)
+    pub fn fast_open(self: &Rc<Self>, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
+        let write = perm & crate::cred::W != 0;
+        if write && self.ro {
+            return None;
+        }
+        let _d = dir_lock(dir);
+        crate::proc::noio(|| {
+            let dm = self.meta_now(dir)?;
+            if dm.mode & S_IFMT != S_IFDIR || !c.may(&dm, crate::cred::X, false) {
+                return None;
+            }
+            // 名前の覚えになければ、ディレクトリから (覚えの帳簿のロックは、ブロックを読む前に放す)
+            let cached = self.names.borrow().get(dir, name);
+            let child = match cached {
+                Some(i) => i,
+                None => self.entry_at(dir, &self.read_inode(dir).ok()?, name).ok()??.0,
+            };
+            if child != ino {
+                return None;
+            }
+            let m = self.meta_now(ino)?;
+            if m.mode & S_IFMT != S_IFREG || m.nlink == 0 || !c.may(&m, perm, false) {
+                return None;
+            }
+            if write && self.read_inode(ino).ok()?.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 {
+                return None;
+            }
+            Some(ExtInode::make(self, ino))
+        })
+    }
+
 }
 
 /// ExtFs::fast_unlink の答え

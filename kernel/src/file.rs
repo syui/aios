@@ -256,23 +256,26 @@ fn reuse_off(of: &mut OpenFile) {
 pub static OPEN_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// 大きなロックなしの open / close の数: [0] 棚から開いた、[1] ない (ENOENT) と答えた、[2] 棚にしまった、
-/// ふつうの道へ: [3] statc の表にない・古い、[4] 棚にない、[5] 開けない形 (フラグ、fd の表、見張り)、
-/// [6] しまえない (分けている、ロック、棚がいっぱい)。/proc/bkl に出す
-pub static FAST_OPEN: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
+/// ふつうの道へ: [3] statc の表にない・古い、[4] 棚になく、新しくも開けない、[5] 開けない形 (フラグ、fd の表、見張り)、
+/// [6] しまえない (分けている、ロック、棚がいっぱい)。[7] 棚になく、ext4 の名前と inode から新しく開いた。/proc/bkl に出す
+pub static FAST_OPEN: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
 fn note(i: usize) {
     FAST_OPEN[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// 大きなロックなしの openat (syscall::fast): O_RDONLY (と O_CLOEXEC / O_LARGEFILE / O_NOCTTY) だけで、絶対のパスか
-/// いまのディレクトリからのもの。statc の表が「ない」と答えれば ENOENT (ふつうの道と同じわけを /proc/ai/why に)、
-/// ふつうのファイルで呼んだ人が読めて、同じパスと inode と口のものが棚にあれば、それを置く。ほかは None (ふつうの道へ)
+/// 大きなロックなしの openat (syscall::fast): O_RDONLY か O_WRONLY か O_RDWR (と O_CLOEXEC / O_LARGEFILE / O_NOCTTY)
+/// だけで、絶対のパスかいまのディレクトリからのもの。statc の表が「ない」と答えれば ENOENT (ふつうの道と同じわけを
+/// /proc/ai/why に)、ふつうのファイルで呼んだ人が読めて (書けて)、読むだけの口で、同じパスと inode と口のものが棚に
+/// あれば、それを置く。棚になく (書く口はいつも)、リンクをたどらずに着くものなら、ext4 の名前と inode から新しく開く
+/// (fastdir::fast_open)。ほかは None (ふつうの道へ)
 pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     const O_LARGEFILE: u64 = 0o400000;
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
-    if flags & !(O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) {
+    let acc = flags & O_ACCMODE as u64;
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) {
         note(5);
         return None;
     }
@@ -286,13 +289,13 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         note(3);
         return None;
     };
-    let st = match ans {
+    let (st, plain, fresh) = match ans {
         crate::statc::Open::Missing => {
             crate::why::fast_missing(me, OPENAT, core::str::from_utf8(&norm[..len]).unwrap_or("?"));
             note(1);
             return Some(-2);
         }
-        crate::statc::Open::Found(st) => st,
+        crate::statc::Open::Found(st, plain, fresh) => (st, plain, fresh),
     };
     // ここからふつうの道へ渡すものは、表の答えをいま確かめたもの (ふつうの道は覚えなおさない)
     let pass = |i: usize| {
@@ -300,9 +303,14 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         crate::statc::seen_set(me.pid, pathp);
         None
     };
-    // 読めなければ、ふつうの道が EACCES とそのわけを
+    // 読めなければ (書けなければ)、ふつうの道が EACCES とそのわけを (stat が古ければ、新しく開く道が ext4 の中でも)
     let m = vfs::Meta { mode: st.mode, uid: st.uid, gid: st.gid, ..vfs::Meta::default() };
-    if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, crate::cred::R, false) {
+    let perm = match acc as u32 {
+        O_RDONLY => crate::cred::R,
+        O_WRONLY => crate::cred::W,
+        _ => crate::cred::R | crate::cred::W,
+    };
+    if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, perm, false) {
         return pass(5);
     }
     let t = files.get();
@@ -310,9 +318,19 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     let Some(fd) = (0..t.fds.len().min(t.nofile)).find(|&i| t.fds[i].is_none()) else {
         return pass(5);
     };
+    let key = &norm[..len];
+    // 書く口は棚を見ない (棚は読むだけの口のもの)。stat が古いとき (inode を書いたあと) も: 棚から出すときの許しは、この
+    // stat で確かめたもの。どちらもふつうの道は覚えなおしてよいので、seen_set はしない
+    if acc != O_RDONLY as u64 || !fresh {
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags) {
+            note(7);
+            return Some(fd);
+        }
+        note(4);
+        return None;
+    }
     let want = (flags & O_LARGEFILE) as u32;
     let epoch = crate::statc::epoch();
-    let key = &norm[..len];
     // 表に置くのも棚のロックの中で (大きなロックの中の shelf_forget が、表と棚をいっしょに見る)
     let mut shelf = t.shelf.0.lock();
     let i = shelf.iter().position(|s| {
@@ -321,6 +339,11 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     });
     let Some(i) = i else {
         drop(shelf);
+        // 棚になければ、ext4 の名前と inode から新しく (Linux の open と同じく。パスは表の鍵: リンクをたどらずに着いたもの)
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags) {
+            note(7);
+            return Some(fd);
+        }
         return pass(4);
     };
     let file = shelf.swap_remove(i).file;

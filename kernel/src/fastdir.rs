@@ -137,6 +137,45 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
     Some(fd as i64)
 }
 
+/// 大きなロックなしの open の、棚にないもの (file::fast_open から): statc の表で、畳んだパス key がいまも ino (ext4 の
+/// ふつうのファイル) をさし、リンクをたどらずに着くと確かめたもの。親のディレクトリを表で引き、ext4 のロック (いっしょに)
+/// の中で、名前がいまも ino をさして呼んだ人が読めれば (書く口なら書けて、動かしているプログラムでもなければ:
+/// ExtFs::fast_open)、ふつうの道の open_found と同じ OpenFile (パスは key。読むだけの口なら、閉じたら棚にしまってよい印
+/// つき) を fd に置く。Linux の open が dcache と inode だけで開くのと同じ。だめなら None (ふつうの道へ)
+pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], ino: u64, flags: u64) -> Option<i64> {
+    let fs = usable(me)?;
+    let perm = match flags & O_ACCMODE {
+        0 => crate::cred::R,
+        1 => crate::cred::W,
+        _ => crate::cred::R | crate::cred::W,
+    };
+    let write = perm & crate::cred::W != 0;
+    // 動かしているかもしれないプログラムは、ふつうの道が ETXTBSY を
+    if write && crate::proc::maybe_executing((fs.fs_id(), ino)) {
+        return None;
+    }
+    let (parent, name) = match key.iter().rposition(|&b| b == b'/') {
+        Some(c) => (&key[..c], &key[c + 1..]),
+        None => (&key[..0], key),
+    };
+    let name = core::str::from_utf8(name).ok().filter(|n| !n.is_empty())?;
+    let path = core::str::from_utf8(key).ok()?;
+    let dir = crate::statc::dir_of(me, parent)?;
+    // 開くのも fd に置くのも ext4 のロックの中で (ふつうの道の unlink は、ひとりで持つそのロックの中で、棚と表のものから
+    // 印を落とす: file::shelf_forget)
+    let _e = crate::extfs::fs_lock_shared();
+    if !watch_free() {
+        return None;
+    }
+    let ino = fs.fast_open(dir as u32, name, ino as u32, perm, &me.cred)?;
+    let f = file::new(Kind::Inode(ino, alloc::string::String::from(path)), crate::sysfile::file_flags(flags));
+    if !write {
+        file::reuse_on(&f);
+    }
+    file::fast_install(t, fd, f, flags & O_CLOEXEC != 0);
+    Some(fd as i64)
+}
+
 /// syscall::fast の unlinkat (flags が 0 のもの)
 pub fn fast_unlink(me: &Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
     if flags != 0 {

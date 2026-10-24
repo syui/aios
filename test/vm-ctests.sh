@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="chosen clone3 cpuid createrace dev dirents epoll exec-thread flushrace fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt mremap ns opencache openat2 orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="chosen clone3 cpuid createrace dev dirents epoll exec-thread flushrace fsrace fsx futex inetsock inotify landlock-eexist mmapcoh mnt mremap ns opencache openat2 openfast openrace orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
 
 case $1 in
 build)
@@ -42,6 +42,9 @@ run)
     statc) cmd="./$t $HOME /tmp" ;;
     # flushrace (fsync と sync が眠って書くあいだの読み書き) は ext4 (ホーム) で 8 秒
     flushrace) cmd="./$t -t 8 $HOME/.flushrace" ;;
+    # openfast と openrace (棚にないファイルの大きなロックなしの open) は ext4 (ホーム) で。openrace は 5 秒
+    openfast) cmd="./$t $HOME" ;;
+    openrace) cmd="./$t $HOME 5" ;;
     *) cmd="./$t" ;;
     esac
     # pathcache は root でも (マウントと、ほかの人から引いたとき。ext4 はほかの人も通れる /var/tmp で)

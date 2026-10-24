@@ -1121,10 +1121,11 @@ pub fn dir_gen(dir: (usize, u64)) -> u64 {
 
 /// 大きなロックなしの stat (statc.rs) が覚えるもの: パスの覚えに norm (先頭 / なし、畳んだもの) があって、いまも正しく、
 /// 答えが ino (None なら「ない」) なら、通ったところ ((ディレクトリ, 名前) の statc の箱と、その版) と、だれでもは通れないディレクトリの
-/// (mode, uid, gid)。statc の版は、覚えがいまも正しいかを確かめる前に読む: 大きなロックなしの作る・消す (fastdir.rs) は、
-/// 書きかえてから vfs の版を進め、それから statc の版を進めるので、確かめたあとに変わったものは、読んだ版が古い
+/// (mode, uid, gid) と、リンクをたどらずに着いたか (たどったパスが norm のまま)。statc の版は、覚えがいまも正しいかを確かめる
+/// 前に読む: 大きなロックなしの作る・消す (fastdir.rs) は、書きかえてから vfs の版を進め、それから statc の版を進めるので、
+/// 確かめたあとに変わったものは、読んだ版が古い
 #[allow(clippy::type_complexity)]
-pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>)> {
+pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Option<(Vec<(usize, u64)>, Vec<(u32, u32, u32)>, bool)> {
     if PATHS_ALL.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -1142,7 +1143,8 @@ pub fn fast_stat_trail(norm: &str, follow: bool, ino: Option<&InodeRef>) -> Opti
     if !e.fresh() {
         return None;
     }
-    Some((dirs, e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect()))
+    let plain = e.found.as_ref().is_some_and(|(walked, _)| walked == norm);
+    Some((dirs, e.gates.iter().map(|g| (g.mode, g.uid, g.gid)).collect(), plain))
 }
 
 /// いま覚えている数と、そのうちないもの (/proc/bkl)
