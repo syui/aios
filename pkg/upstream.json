@@ -1,4 +1,5 @@
 [
+  {"name":"ai-model","skip":"aios"},
   {"name":"aiboot","skip":"aios"},
   {"name":"aifont","skip":"aios"},
   {"name":"aigpt","skip":"aios"},

@@ -1206,7 +1206,15 @@ aish の MCP (`aish --mcp`) は、新しく見つかったものをどのツー�
 ## ローカルの AI (llama.cpp)
 
 aios の中で LLM を動かす。推論エンジンは llama.cpp (pkg/c/llama.cpp。CPU だけ、静的)、モデルは GGUF、常駐するのは
-`llama-server.service`。モデルは大きいので配らない (自分で取ってきて置く)。
+`llama-server.service`。どれも aios.img には入れない (大きいので)。aios のモデルは `ai-model` パッケージ (ai/repo) で配る:
+
+```sh
+sudo ap -S ai-model curl                      # モデルと llama.cpp が入り、llama-server がそのモデルで起きる
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
+```
+
+ほかのモデルを手で置くとき (ai-model は入れない。入れると /var/lib/ai/model.gguf はそちらのものになる):
 
 ```sh
 sudo ap -S llama.cpp curl                     # /opt/c/bin/llama (と llama-server、llama-cli)。curl は API に話すのに
@@ -1231,6 +1239,11 @@ llama bench -m /var/lib/ai/model.gguf         # この機械での速さ (prompt
   LLAMA_ARG_THREADS=4` など (llama serve --help に出る LLAMA_ARG_*)。モデルを替えたら `systemctl restart llama-server`。
 - モデルは mmap で読む (ページキャッシュに入り、メモリが足りなければ捨てて読みなおす)。RAM はモデルの大きさと
   コンテキストの KV cache の分がいる。作るときに Web UI はネットから取らないので、ブラウザの画面はなく API だけ。
+- `ai-model` を作る (モデルを替える) とき: 学習させた GGUF を 1 つ `pkg/c/ai-model/` に置き (git には入らない:
+  .gitignore)、PKGBUILD の pkgver を今日の日付に上げて、aish の pkg_build ai-model → pkg_test ai-model → pkg_push。
+  GGUF を ai/repo に git で直に置かない (publish が ai/repo を 1 つのコミットにまとめて送りなおすときに消える)。
+  入れたとき・上げたときは post_install / post_upgrade が llama-server を起こしなおし、消すときは先に止める。
+  ai-model は llama.cpp に頼る (depends) ので、`ap -U` で入れても llama.cpp が先に入る。
 
 ## 改造 (aios src / build / install)
 

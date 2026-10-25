@@ -1,4 +1,5 @@
 [
+  {"name": "ai-model",          "type": "c",       "src": "",                                                                                                                 "now": "20261025",       "latest": "(aios)"},
   {"name": "aiboot",            "type": "rust",    "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aifont",            "type": "desktop", "src": "git+https://git.syui.ai/ai/font#commit=0494e083d401cab50f2c3832d960bb0b5d4c87d2",                                  "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aigpt",             "type": "rust",    "src": "git+https://git.syui.ai/ai/gpt",                                                                                   "now": "0.0.1",          "latest": "(aios)"},

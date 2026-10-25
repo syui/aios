@@ -20,3 +20,4 @@
 /claude.md
 /shell/target
 /test/bin
+/pkg/c/ai-model/*.gguf

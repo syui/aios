@@ -1,0 +1,38 @@
+# ai-model: aios のローカルの AI (llama-server.service) が使うモデル (GGUF) を 1 つ配るパッケージ。
+# aios.img には入れない (大きいので)。ai/repo に置き、使う人だけが入れる: sudo ap -S ai-model
+# (llama.cpp もいっしょに入り、入れたら llama-server が新しいモデルで起きなおす)。
+#
+# 中身は学習させて GGUF にしたもの。GGUF は git に入れない (.gitignore。GitHub は 100 MB をこえるファイルを受けとらない)。
+# ai/repo へ git で直に置くのもだめ (publish は ai/repo を 1 つのコミットにまとめて送りなおすので、そこで消える)。作りかた:
+#   1. この pkg/c/ai-model/ に MODEL.gguf を 1 つだけ置く (名前はそのまま /var/lib/ai/models/ に入る)
+#   2. pkgver を今日の日付に上げる (モデルを替えるたびに。ap -Syu で入れかわる)
+#   3. aish で pkg_build ai-model → pkg_test ai-model (vm でも) → pkg_push
+# となりに NOTICE、LICENSE、README.md があれば /usr/share/licenses/ai-model/ に入る。よそのモデルから作ったものは、
+# そのライセンスの決まりにしたがって置く (Gemma なら Gemma Terms of Use の写しと、その 3.1 の NOTICE)
+pkgname=ai-model
+pkgver=20261025
+pkgrel=1
+pkgdesc='The model (GGUF) of the local AI on aios, served by llama-server.service'
+arch=('any')
+url='https://git.syui.ai/ai/os'
+license=('custom')
+depends=('llama.cpp')
+install=ai-model.install
+
+package() {
+  local f n
+  f=$(cd "$startdir" && ls -1 -- *.gguf 2>/dev/null)
+  n=$(printf '%s' "$f" | grep -c .)
+  if [ "$n" != 1 ]; then
+    echo "ai-model: put exactly one MODEL.gguf in $startdir (found $n)" >&2
+    return 1
+  fi
+  install -Dm644 "$startdir/$f" "$pkgdir/var/lib/ai/models/$f"
+  # llama-server.service が読むのはこのリンク (ConditionPathExists もこれを見る)
+  ln -s "models/$f" "$pkgdir/var/lib/ai/model.gguf"
+  for n in NOTICE LICENSE README.md; do
+    if [ -f "$startdir/$n" ]; then
+      install -Dm644 "$startdir/$n" "$pkgdir/usr/share/licenses/ai-model/$n"
+    fi
+  done
+}
