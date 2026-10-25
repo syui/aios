@@ -1,0 +1,28 @@
+#!/bin/sh
+# llama.cpp の llama を、この CPU に合うもの (/opt/c/lib/llama.cpp の armv8.0 / armv8.2 / armv8.6) で動かす。
+#   armv8.6: i8mm と dotprod と fp16 (Apple M2 から)、armv8.2: dotprod と fp16 (cortex-a76、Apple M1)、ほかは armv8.0。
+#   LLAMA_CPU=armv8.0 などで手で選べる。llama-server は llama serve、llama-cli は llama cli と同じ
+d=/opt/c/lib/llama.cpp
+f=$(sed -n '/^Features/{s/^[^:]*://p;q;}' /proc/cpuinfo 2>/dev/null)
+has() {
+  case " $f " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+v=armv8.0
+if has asimddp && has asimdhp; then
+  v=armv8.2
+  has i8mm && v=armv8.6
+fi
+v=${LLAMA_CPU:-$v}
+case ${0##*/} in
+  llama-server) set -- serve "$@" ;;
+  llama-cli) set -- cli "$@" ;;
+  *)
+    # llama --version と --help も (1 本にまとめたものはサブコマンドだけ読む)
+    case $1 in
+      --version) shift; set -- version "$@" ;;
+      --help | -h) shift; set -- help "$@" ;;
+    esac
+    ;;
+esac
+exec "$d/$v/llama" "$@"

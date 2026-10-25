@@ -1203,6 +1203,35 @@ aish の MCP (`aish --mcp`) は、新しく見つかったものをどのツー�
 `aiwatch --rescue` は、起こしそこねた futex のスレッドを知らせたあとで起こしなおす。`aiwatch --once` は 3 回見て結果を出して終わる
 (`test/watch.c` でわざと作れる)。
 
+## ローカルの AI (llama.cpp)
+
+aios の中で LLM を動かす。推論エンジンは llama.cpp (pkg/c/llama.cpp。CPU だけ、静的)、モデルは GGUF、常駐するのは
+`llama-server.service`。モデルは大きいので配らない (自分で取ってきて置く)。
+
+```sh
+sudo ap -S llama.cpp curl                     # /opt/c/bin/llama (と llama-server、llama-cli)。curl は API に話すのに
+sudo cp MODEL.gguf /var/lib/ai/models/        # 置き場所 (パッケージが作る)
+sudo ln -sf models/MODEL.gguf /var/lib/ai/model.gguf
+sudo systemctl start llama-server             # 次の起動からはひとりでに動く
+fetch http://127.0.0.1:8080/health            # {"status":"ok"} (読むだけなら fetch でも)
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
+llama cli -m /var/lib/ai/model.gguf           # 端末で話す (llama help で、ほかのもの)
+llama bench -m /var/lib/ai/model.gguf         # この機械での速さ (prompt と生成の tokens/s)
+```
+
+- `llama` は upstream の 1 本にまとめたもの (serve、cli、completion、bench、quantize、perplexity …)。CPU の命令ごとに
+  3 本あり (armv8.0: cortex-a72 や QEMU、armv8.2 + dotprod + fp16: cortex-a76 や Apple M1、armv8.6 + i8mm: Apple M2 から)、
+  `/opt/c/bin/llama` が /proc/cpuinfo の Features (上の「CPU の印」) を見て選ぶ。`LLAMA_CPU=armv8.0` で手で選べる。
+  ggml の CPU の速さは dotprod と i8mm でほぼ決まる (Q4_0 などは、読みこむときにその CPU の形に並べかえる)。
+- `llama-server.service` は base の /etc にあって、はじめから有効。`/opt/c/bin/llama` と `/var/lib/ai/model.gguf` の両方が
+  あるときだけ起きる (ConditionPathExists)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
+  `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。
+- 設定は `/etc/systemd/system/llama-server.service.d/local.conf` に `[Service]` と `Environment=LLAMA_ARG_CTX_SIZE=8192
+  LLAMA_ARG_THREADS=4` など (llama serve --help に出る LLAMA_ARG_*)。モデルを替えたら `systemctl restart llama-server`。
+- モデルは mmap で読む (ページキャッシュに入り、メモリが足りなければ捨てて読みなおす)。RAM はモデルの大きさと
+  コンテキストの KV cache の分がいる。作るときに Web UI はネットから取らないので、ブラウザの画面はなく API だけ。
+
 ## 改造 (aios src / build / install)
 
 ```sh

@@ -52,6 +52,7 @@
   {"from":"arch:libpng","name":"libpng","nvchecker":{"exclude_regex":".*(beta|alpha|rc).*","git":"https://github.com/pnggroup/libpng.git","prefix":"v","source":"git"}},
   {"name":"libunwind","skip":"the source tag llvmorg-$_llvm does not use pkgver"},
   {"from":"pkgbuild","git":"https://github.com/xkbcommon/libxkbcommon","name":"libxkbcommon","tag":"^xkbcommon\\-([0-9][0-9A-Za-z.]*)$"},
+  {"from":"pkgbuild","git":"https://github.com/ggml-org/llama.cpp.git","name":"llama.cpp","tag":"^b([0-9][0-9A-Za-z.]*)$"},
   {"from":"pkgbuild","git":"https://github.com/llvm/llvm-project.git","name":"llvm","tag":"^llvmorg\\-([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:make","name":"make","nvchecker":{"regex":"make-([\\d\\.]+).tar","source":"regex","url":"https://ftp.gnu.org/gnu/make/"}},
   {"from":"pkgbuild","git":"https://github.com/Mbed-TLS/mbedtls.git","name":"mbedtls","tag":"^mbedtls\\-([0-9][0-9A-Za-z.]*)$"},

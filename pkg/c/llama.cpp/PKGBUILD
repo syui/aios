@@ -1,0 +1,60 @@
+# llama.cpp: GGUF のモデルを CPU で動かす推論エンジン (aios の中の AI: ローカルの LLM)。upstream の 1 本の llama
+#   (serve: OpenAI と同じ API の HTTP サーバー、cli、completion、bench、quantize、perplexity ...) を静的に作る。
+#   CPU の命令ごとに 3 本 (armv8.0: cortex-a72 や QEMU、armv8.2 + dotprod + fp16: cortex-a76 や Apple M1、
+#   armv8.6 + i8mm: Apple M2 から) を /opt/c/lib/llama.cpp に置き、/opt/c/bin/llama (llama-server、llama-cli も) が
+#   /proc/cpuinfo の Features を見て合うものを動かす (LLAMA_CPU=armv8.0 などで選べる)。ggml の CPU の速さは dotprod と
+#   i8mm でほぼ決まるので、いちばん下のものだけにはしない。upstream の GGML_CPU_ALL_VARIANTS (ggml の CPU の道を
+#   .so にして dlopen) は、Zig の c++ だと共有ライブラリごとに libc++ を持つので使わない。
+#   OpenMP なし (ggml のスレッドの輪)、OpenSSL なし (モデルは自分で置く: llama download は使わない)、Web UI は
+#   取ってこない (LLAMA_USE_PREBUILT_UI=OFF: 作るときにネットから取るので)。
+#   モデルの置き場所は /var/lib/ai/models、使うものは /var/lib/ai/model.gguf へのリンクにする。それがあれば
+#   etc/systemd/system/llama-server.service が起動のたびに 127.0.0.1:8080 で動かす (doc/aios.md の「ローカルの AI」)
+pkgname=llama.cpp
+pkgver=11887
+pkgrel=1
+pkgdesc='LLM inference in C/C++: the llama binary (server, cli, bench, quantize), static, CPU variants for aios'
+arch=('aarch64')
+url='https://github.com/ggml-org/llama.cpp'
+license=('MIT')
+makedepends=('cmake' 'ninja')
+source=("llama.cpp::git+https://github.com/ggml-org/llama.cpp.git#tag=b$pkgver"
+        llama)
+sha256sums=('SKIP'
+            'SKIP')
+
+# 名前と Zig の -mcpu (Zig の cc は -march を CPU の名前として読むので、generic に機能を足す)
+_variants='armv8.0:generic armv8.2:generic+v8_2a+dotprod+fullfp16 armv8.6:generic+v8_6a+dotprod+fullfp16+i8mm'
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  local v name cpu
+  for v in $_variants; do
+    name=${v%%:*} cpu=${v#*:}
+    rm -rf "build-$name"
+    # GGML_NATIVE=OFF で ggml は -march を足さず、-mcpu の印 (__ARM_FEATURE_DOTPROD など) で道を選ぶ。
+    # 版の番号 (llama version の build) は git の数から作るが、makepkg のチェックアウトには履歴がないので渡す
+    cmake -S llama.cpp -B "build-$name" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+      -DCMAKE_C_FLAGS="-mcpu=$cpu" -DCMAKE_CXX_FLAGS="-mcpu=$cpu" -DCMAKE_EXE_LINKER_FLAGS="-static -s" \
+      -DLLAMA_BUILD_NUMBER="$pkgver" \
+      -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+      -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=ON
+    ninja -C "build-$name" llama-app
+  done
+}
+
+package() {
+  local v name
+  for v in $_variants; do
+    name=${v%%:*}
+    install -Dm755 "build-$name/bin/llama" "$pkgdir/opt/c/lib/llama.cpp/$name/llama"
+  done
+  install -Dm755 "$startdir/llama" "$pkgdir/opt/c/bin/llama"
+  ln -s llama "$pkgdir/opt/c/bin/llama-server"
+  ln -s llama "$pkgdir/opt/c/bin/llama-cli"
+  install -d -m755 "$pkgdir/var/lib/ai/models"
+  install -Dm644 llama.cpp/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

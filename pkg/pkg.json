@@ -52,6 +52,7 @@
   {"name": "libpng",            "type": "c",       "src": "https://download.sourceforge.net/libpng/libpng-1.6.59.tar.xz",                                                     "now": "1.6.59",         "latest": "1.6.59"},
   {"name": "libunwind",         "type": "c",       "src": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/compiler-rt-20.1.8.src.tar.xz",              "now": "0.16.0",         "latest": "(follows another version)"},
   {"name": "libxkbcommon",      "type": "c",       "src": "git+https://github.com/xkbcommon/libxkbcommon#tag=xkbcommon-1.13.2",                                               "now": "1.13.2",         "latest": "1.13.2"},
+  {"name": "llama.cpp",         "type": "c",       "src": "git+https://github.com/ggml-org/llama.cpp.git#tag=b11887",                                                         "now": "11887",          "latest": "11887"},
   {"name": "llvm",              "type": "c",       "src": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/llvm-project-23.1.4.src.tar.xz",             "now": "23.1.4",         "latest": "23.1.4"},
   {"name": "make",              "type": "c",       "src": "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",                                                                   "now": "4.4.1",          "latest": "4.4.1"},
   {"name": "mbedtls",           "type": "c",       "src": "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-4.2.0/mbedtls-4.2.0.tar.bz2",                        "now": "4.2.0",          "latest": "4.2.0"},

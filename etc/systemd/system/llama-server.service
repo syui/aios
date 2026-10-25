@@ -1,0 +1,23 @@
+# llama-server: ローカルの LLM (llama.cpp の llama serve)。OpenAI と同じ API を http://127.0.0.1:8080/v1/ に出す
+# (chat/completions、completions、embeddings、models。/health で様子)。llama.cpp のパッケージ (ap -S llama.cpp) と
+# モデル /var/lib/ai/model.gguf (GGUF。/var/lib/ai/models/ に置いたものへのリンク) がそろえば、起動のたびに動く。
+# どちらかがなければ起こさない (aiwatch と同じく、はじめから有効にしておく)。
+# 変えるときは /etc/systemd/system/llama-server.service.d/local.conf に、たとえば
+#   [Service]
+#   Environment=LLAMA_ARG_CTX_SIZE=8192 LLAMA_ARG_THREADS=4
+# (llama serve --help の LLAMA_ARG_*。モデルを替えたら systemctl restart llama-server)
+[Unit]
+Description=llama.cpp server: a local LLM over HTTP (OpenAI-compatible API on 127.0.0.1:8080)
+ConditionPathExists=/opt/c/bin/llama
+ConditionPathExists=/var/lib/ai/model.gguf
+After=networkd.service
+
+[Service]
+User=nobody
+Environment=LLAMA_ARG_MODEL=/var/lib/ai/model.gguf LLAMA_ARG_HOST=127.0.0.1 LLAMA_ARG_PORT=8080
+ExecStart=/opt/c/bin/llama serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
