@@ -315,6 +315,19 @@ fn open_pkg<'a>(path: &str, progress: &'a mut dyn FnMut(u64)) -> io::Result<Box<
     Ok(tar_reader(Box::new(BufReader::with_capacity(256 * 1024, c))))
 }
 
+/// パッケージのファイルの .PKGINFO だけ (先頭にあるので、そこまでしか広げない)。-U が入れる前に依存を見る
+fn file_pkginfo(path: &str) -> Option<Desc> {
+    let mut quiet = |_: u64| {};
+    let mut ar = tar::Archive::new(open_pkg(path, &mut quiet).ok()?);
+    let mut e = ar.entries().ok()?.next()?.ok()?;
+    if e.path().ok()?.to_string_lossy() != ".PKGINFO" {
+        return None;
+    }
+    let mut s = String::new();
+    e.read_to_string(&mut s).ok()?;
+    Some(parse_pkginfo(&s))
+}
+
 /// ファイルの sha256 (少しずつ読む)
 fn sha256_file(path: &str) -> io::Result<String> {
     let mut f = fs::File::open(path)?;
@@ -1031,10 +1044,34 @@ fn main() {
             }
         }
     } else if flags.contains(&'U') {
+        // pacman と同じく、足りない依存はリポジトリから先に入れる (入れるものの post_install が、依存がそろってから動く
+        // ように。前は入れたあとで足していたので、ai-model の post_install が、llama.cpp のないうちに llama-server を
+        // 起こそうとして、Condition で起きなかった)。いっしょに -U するもの (と、その provides) は足りている
+        let infos: Vec<Desc> = targets.iter().filter_map(|t| file_pkginfo(t)).collect();
+        let mut have: BTreeSet<String> = BTreeSet::new();
+        for (n, (d, _)) in installed().iter() {
+            have.insert(n.clone());
+            have.extend(list(d, "PROVIDES").iter().map(|p| dep_name(p).to_string()));
+        }
+        for d in &infos {
+            have.insert(get(d, "NAME").to_string());
+            have.extend(list(d, "PROVIDES").iter().map(|p| dep_name(p).to_string()));
+        }
+        let mut first: Vec<String> = Vec::new();
+        for dep in infos.iter().flat_map(|d| list(d, "DEPENDS")) {
+            let n = dep_name(dep).to_string();
+            if !have.contains(&n) && !first.contains(&n) {
+                first.push(n);
+            }
+        }
+        if !first.is_empty() {
+            println!(":: installing missing dependencies: {}", first.join(" "));
+            sync_install(&repos, &first, &[]);
+        }
         for t in &targets {
             install(t, true);
         }
-        // pacman と同じく、足りない依存はリポジトリから入れる (新しい base が頼るものが増えたときなど)
+        // 入れたもの (新しい base など) の依存の依存が、まだ足りなければ
         let missing = missing_deps();
         if !missing.is_empty() {
             println!(":: installing missing dependencies: {}", missing.join(" "));
