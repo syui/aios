@@ -1,11 +1,11 @@
 [
-  {"name":"ai-model","skip":"aios"},
   {"name":"aiboot","skip":"aios"},
   {"name":"aifont","skip":"aios"},
   {"name":"aigpt","skip":"aios"},
   {"name":"aikernel","skip":"aios"},
   {"name":"ailog","skip":"aios"},
   {"name":"aimg","skip":"aios"},
+  {"name":"aimodel","skip":"aios"},
   {"name":"aish-powerline","skip":"aios"},
   {"name":"aiterm","skip":"aios"},
   {"name":"aiwm","skip":"aios"},

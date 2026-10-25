@@ -1,0 +1,23 @@
+# aimodel: aios のローカルの AI (llama-server.service) のモデル (GGUF) を取ってきて使う。sudo ap -S aimodel で、
+# llama.cpp といっしょに入り、入れたときに ai/repo の model/ai.gguf を /var/lib/ai/models/ai.gguf に取ってきて
+# (大きさと git の blob の sha を確かめる)、llama-server がそれで起きる。
+# モデルはパッケージにも aios.img にも入れない (大きいので)。モデルを替えるときは ai/repo の model/ai.gguf を push しなおす
+# (publish は ai/repo の aarch64/ だけを入れかえるので、model/ はそのまま)。aios では sudo aimodel pull (変わっていれば取る)。
+# どこから取るかは /etc/aimodel.conf (URL と API。releases などに移したら書きかえる)
+pkgname=aimodel
+pkgver=0.0.1
+pkgrel=1
+pkgdesc='Fetches the model (GGUF) of the local AI on aios from ai/repo and serves it with llama-server.service'
+arch=('any')
+url='https://git.syui.ai/ai/repo/src/branch/main/model'
+license=('MIT')
+depends=('llama.cpp')
+backup=('etc/aimodel.conf')
+install=aimodel.install
+source=(aimodel aimodel.conf)
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  install -Dm755 aimodel "$pkgdir/opt/c/bin/aimodel"
+  install -Dm644 aimodel.conf "$pkgdir/etc/aimodel.conf"
+}

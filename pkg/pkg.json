@@ -1,11 +1,11 @@
 [
-  {"name": "ai-model",          "type": "c",       "src": "",                                                                                                                 "now": "20261025",       "latest": "(aios)"},
   {"name": "aiboot",            "type": "rust",    "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aifont",            "type": "desktop", "src": "git+https://git.syui.ai/ai/font#commit=0494e083d401cab50f2c3832d960bb0b5d4c87d2",                                  "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aigpt",             "type": "rust",    "src": "git+https://git.syui.ai/ai/gpt",                                                                                   "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aikernel",          "type": "rust",    "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "ailog",             "type": "rust",    "src": "git+https://git.syui.ai/ai/log",                                                                                   "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aimg",              "type": "rust",    "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
+  {"name": "aimodel",           "type": "c",       "src": "aimodel",                                                                                                          "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aish-powerline",    "type": "shell",   "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aiterm",            "type": "desktop", "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "aiwm",              "type": "desktop", "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},

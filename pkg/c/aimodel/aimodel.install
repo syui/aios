@@ -1,0 +1,13 @@
+# aimodel を入れた・上げたら、モデルを取ってきて llama-server をそれで起こす (取れなくても入れるのはしくじらない:
+# あとで sudo aimodel pull)。消すときは llama-server を止めて、取ってきたモデルを消す
+post_install() {
+  /opt/c/bin/aimodel pull || echo "aimodel: could not fetch the model now; run: sudo aimodel pull"
+}
+
+post_upgrade() {
+  post_install
+}
+
+pre_remove() {
+  /opt/c/bin/aimodel rm
+}
