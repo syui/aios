@@ -49,6 +49,8 @@ t sh-printf-time eq "$(TZ=UTC sh -c "printf '%(%Y-%m-%d)T' 86400")" '1970-01-02'
 t sh-select eq "$(sh -c 'select x in a b; do echo $x; break; done <<< 2' 2>/dev/null)" 'b'
 t sh-dev-fd eq "$(sh -c 'cat <(echo pipe)')" 'pipe'
 t sh-pipestatus eq "$(sh -c 'true | false | true; echo "${PIPESTATUS[@]}"')" '0 1 0'
+# wait PID はその子だけを待つ (うしろの sleep 5 は待たない) / wait %% / このシェルの子でなければ 127
+t sh-wait-pid eq "$(sh -c 'sleep 5 & s=$!; (exit 7) & t=$!; wait $t; a=$?; kill -0 $s && c=alive; (exit 3) & wait %%; b=$?; kill $s; wait 1 2>/dev/null; echo $a $c $b $?')" '7 alive 3 127'
 
 # aibox の砂場 (landlock と seccomp)
 t aibox-seccomp sh -c 'aibox -- grep -q "^Seccomp:.2" /proc/self/status'

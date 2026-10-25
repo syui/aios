@@ -74,6 +74,37 @@ pub fn record(pid: i32, st: i32) {
     }
 }
 
+/// 知らせて消した (終わった) うしろのジョブの、プロセスごとのステータス。あとの wait PID が答えられるように (bash と同じく
+/// 覚えておく。新しいものから 64 まで)
+static mut FORGOTTEN: Vec<(i32, i32)> = Vec::new();
+
+fn forget(j: &Job) {
+    let f = unsafe { &mut *(&raw mut FORGOTTEN) };
+    for &(pid, s) in &j.pids {
+        f.retain(|(p, _)| *p != pid);
+        f.push((pid, s.unwrap_or(0)));
+    }
+    let n = f.len().saturating_sub(64);
+    f.drain(..n);
+}
+
+/// wait PID: その pid のジョブを待って、そのプロセスのステータス (パイプラインの途中のものでも)。もう知らせて消したもの
+/// なら覚えていたステータス、このシェルの子でなければ 127
+fn wait_pid(pid: i32) -> i32 {
+    let found = jobs().iter().enumerate().find_map(|(i, j)| j.pids.iter().position(|(p, _)| *p == pid).map(|k| (i, k)));
+    if let Some((idx, k)) = found {
+        let s = foreground_quiet(idx);
+        // 終わっていれば foreground が $PIPESTATUS にプロセスごとのステータスを置いている (止まったならジョブは残る)
+        let done = jobs().get(idx).is_none_or(|j| !j.pids.iter().any(|(p, _)| *p == pid));
+        return if done { pipestatus().get(k).copied().unwrap_or(s) } else { s };
+    }
+    if let Some(&(_, s)) = unsafe { &*(&raw const FORGOTTEN) }.iter().rev().find(|(p, _)| *p == pid) {
+        return s;
+    }
+    eprintln!("wait: pid {} is not a child of this shell", pid);
+    127
+}
+
 pub fn set_tmodes(t: &Option<libc::termios>) {
     if let Some(t) = t {
         unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
@@ -152,7 +183,11 @@ pub fn report_jobs() {
         if j.state != JobState::Running {
             eprintln!("[{}]+  {:<24}{}", j.id, state_text(j.state), j.cmd);
         }
-        !matches!(j.state, JobState::Done(_))
+        let done = matches!(j.state, JobState::Done(_));
+        if done {
+            forget(j);
+        }
+        !done
     });
 }
 
@@ -196,7 +231,13 @@ pub fn job_builtin(args: &[String]) -> Option<i32> {
                 println!("[{}]   {:<24}{}", j.id, state_text(j.state), j.cmd);
             }
             // 終わったものは一度見せたら消す
-            jobs().retain(|j| !matches!(j.state, JobState::Done(_)));
+            jobs().retain(|j| {
+                let done = matches!(j.state, JobState::Done(_));
+                if done {
+                    forget(j);
+                }
+                !done
+            });
             Ok(0)
         }
         "fg" | "bg" => find_job(args.get(1)).map(|idx| {
@@ -218,10 +259,31 @@ pub fn job_builtin(args: &[String]) -> Option<i32> {
                 0
             }
         }),
+        // wait PID... / wait %N...: それだけを待って、最後のもののステータス (POSIX。前はいつもみなを待ち、最後に終わった
+        // ジョブのステータスを返していた)。引数がなければ、うしろのジョブをみな待って 0
+        "wait" if args.len() == 1 => {
+            while let Some(idx) = jobs().iter().position(|j| j.state == JobState::Running) {
+                foreground_quiet(idx);
+            }
+            Ok(0)
+        }
         "wait" => {
             let mut s = 0;
-            while let Some(idx) = jobs().iter().position(|j| j.state == JobState::Running) {
-                s = foreground_quiet(idx);
+            for a in &args[1..] {
+                s = if a.starts_with('%') {
+                    match find_job(Some(a)) {
+                        Ok(idx) => foreground_quiet(idx),
+                        Err(e) => {
+                            eprintln!("wait: {}", e);
+                            127
+                        }
+                    }
+                } else if let Ok(pid) = a.parse::<i32>() {
+                    wait_pid(pid)
+                } else {
+                    eprintln!("wait: `{}': not a pid or valid job spec", a);
+                    2
+                };
             }
             Ok(s)
         }
