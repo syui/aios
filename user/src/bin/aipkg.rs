@@ -1003,6 +1003,15 @@ fn main() {
     };
     let flags: BTreeSet<char> = op[1..].chars().collect();
     let targets: Vec<String> = args[1..].iter().filter(|a| !a.starts_with("--")).cloned().collect();
+    // 書きかえるもの (-Sy、-Su、-S で入れる、-U、-R) は root だけ。pacman と同じく、なにかする前に止める
+    // (前は sudo を忘れると、途中で /var/lib/aipkg/sync/rust.db の Permission denied で落ちた)
+    let writes = flags.contains(&'U')
+        || flags.contains(&'R')
+        || (flags.contains(&'S') && (flags.contains(&'y') || flags.contains(&'u') || (!flags.contains(&'s') && !flags.contains(&'i'))));
+    if writes && unsafe { libc::geteuid() } != 0 {
+        eprintln!("error: you cannot perform this operation unless you are root.");
+        exit(1);
+    }
     let repos = read_conf();
 
     if flags.contains(&'S') {
