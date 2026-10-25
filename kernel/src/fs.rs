@@ -113,8 +113,13 @@ fn setup_dirs(mtab: &str) {
     }
     let tmp = vfs::mkdir_p("tmp", 0o1777).expect("mkdir /tmp");
     let _ = tmp.set_mode(0o1777);
-    for d in ["etc", "home", "root", "run", "var/tmp", "var/log"] {
+    for d in ["etc", "home", "root", "run", "var/log"] {
         let _ = vfs::mkdir_p(d, 0o755);
+    }
+    // /var/tmp も /tmp と同じく、だれでも作れて他人のは消せない (FHS。起動をまたいで残るほうの一時置き場)。前は 0755 で
+    // 作っていて、root のほかは書けなかった (/var は上で 0755 に作ってある。mkdir_p は途中のものにも mode をつける)
+    if let Ok(vtmp) = vfs::mkdir_p("var/tmp", 0o1777) {
+        let _ = vtmp.set_mode(0o1777);
     }
     if vfs::mkdir_p("proc", 0o555).is_ok() {
         let _ = vfs::mount("proc", crate::procfs::new_root(), "proc", "proc");
