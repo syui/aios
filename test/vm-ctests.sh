@@ -51,13 +51,19 @@ run)
     root=
     [ "$t" = pathcache ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t /tmp /var/tmp"
     [ "$t" = statc ] && [ "$(id -u)" != 0 ] && root="sudo -n ./$t /var/tmp /tmp"
+    # 時間切れ (300 秒) のまぎわに、まだ動いているそのテストのスレッドの様子 (/proc/ai/threads: 状態、システムコール、
+    # 待っているもの) を残す。まれにしか止まらないものも、止まったときのわけが見える
+    rm -f "$t.hang" "$t.dog"
+    ( sleep 290 & echo $! > "$t.dog"; wait $! && grep "\"name\":\"$t\"" /proc/ai/threads > "$t.hang" 2>/dev/null ) &
     if timeout 300 $cmd > "$t.out" 2>&1 && { [ -z "$root" ] || timeout 300 $root >> "$t.out" 2>&1; }; then
       echo "ok $t"
     else
       echo "FAIL $t (status $?):"
       tail -15 "$t.out" | sed 's/^/  /'
+      [ -s "$t.hang" ] && head -40 "$t.hang" | sed 's/^/  hang: /'
       fail=$((fail + 1))
     fi
+    kill "$(cat "$t.dog" 2>/dev/null)" 2>/dev/null
   done
   echo "ctests: $fail failed"
   [ "$fail" = 0 ]
