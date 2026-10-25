@@ -4,12 +4,13 @@
 //!   ゆずる、EDEADLK / EPERM / ESRCH)、futex_waitv (いくつもの語でまとめて待ち、起こされたものの番号を返す)。
 //! key は Linux と同じく 3 つ: PRIVATE はアドレス空間とアドレス、共有の op は、自分だけの領域ならアドレス空間と
 //! アドレス (PRIVATE のものとは会わない: Linux の FUT_OFF_MMSHARED)、MAP_SHARED の領域ならページの物理アドレス
-//! (プロセスをまたぐ)。待つスレッドはみな同じ chan で眠り、起こす側が行列から出して、そのスレッドだけを起こす。
+//! (プロセスをまたぐ)。待つものは key のハッシュの箱に来た順につなぎ (Linux の futex_hash_bucket と futex_q)、
+//! スレッドは自分だけの chan で眠り、起こす側が行列から出して、そのスレッドだけを起こす。
 //! ぜんぶ大きなロックの中。ロックなしの速い道 (syscall.rs の fast) のために、PRIVATE の key ごとの待つ数を数える
 
 use crate::cell::Bkl;
 use crate::proc;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -59,42 +60,69 @@ pub enum Key {
     Phys(usize),
 }
 
-/// 待っているもの 1 つ (futex_waitv はいくつも)
+/// 待っているもの 1 つ (Linux の futex_q。futex_waitv はいくつも)。表の slab に置き、同じ箱のものと前後でつなぐ
 struct Entry {
+    /// 入れたときの番号 (0 は空き)。slab の場所は使いまわすので、待つ側は場所とこの番号で自分のものと確かめる
+    id: u64,
     key: Key,
-    /// 眠っているスレッド (本当の番号)
+    /// 眠っているスレッド (本当の番号) と、その Proc の表の場所 (起こされた印と眠る chan)
     tid: u32,
+    slot: u16,
     bitset: u32,
-    /// 待つ呼び出しの番号と、その中の何番め
-    wait: u64,
+    /// futex_waitv の何番め
     idx: u32,
     /// FUTEX_LOCK_PI で待つもの
     pi: bool,
+    /// いる箱と、その行列の前とうしろ (NIL ははし)
+    bucket: u16,
+    prev: u32,
+    next: u32,
 }
+
+/// 入れたもの: slab の場所と番号 (起こされて出されたあとは、場所が別のものに使われていても番号がちがう)
+#[derive(Clone, Copy)]
+struct Ticket {
+    at: u32,
+    id: u64,
+}
+
+/// key のハッシュの箱の数 (Linux の futex_hash_bucket。前は key ごとの BTreeMap と VecDeque、入れたものの BTreeMap、
+/// 起こされたものの BTreeMap で、待つ・起こすたびに木をいくつもたどってメモリを取っていた: Firefox で 1 回 15〜17 µs)
+const NB: usize = 256;
+const NIL: u32 = u32::MAX;
 
 struct Table {
     next: u64,
-    entries: BTreeMap<u64, Entry>,
-    /// key ごとの行列 (来た順。REQUEUE で移ったものはうしろに)
-    queues: BTreeMap<Key, VecDeque<u64>>,
-    /// 起こされた呼び出し → 起こされたもののいちばん大きな番号 (futex_waitv の答え)
-    woken: BTreeMap<u64, u32>,
+    slab: Vec<Entry>,
+    /// slab の空いた場所
+    free: Vec<u32>,
+    /// 箱ごとの行列の頭と終わり (来た順。REQUEUE で移ったものはうしろに)。ちがう key のものもまざる
+    head: [u32; NB],
+    tail: [u32; NB],
+    /// Proc の表の場所ごとの、起こされたもののいちばん大きな番号 + 1 (0 はまだ。futex_waitv の答え)。待ちのはじめに 0 に
+    woken: [u32; proc::NPROC],
     /// PI の futex の持ち主 (Linux の pi_state: 待つものがいるあいだだけ)
     pi: BTreeMap<Key, u32>,
 }
 
-static TABLE: Bkl<Table> = Bkl::new(Table { next: 1, entries: BTreeMap::new(), queues: BTreeMap::new(), woken: BTreeMap::new(), pi: BTreeMap::new() });
+static TABLE: Bkl<Table> =
+    Bkl::new(Table { next: 1, slab: Vec::new(), free: Vec::new(), head: [NIL; NB], tail: [NIL; NB], woken: [0; proc::NPROC], pi: BTreeMap::new() });
 
 #[track_caller]
 fn t() -> &'static mut Table {
     TABLE.get()
 }
 
-/// futex で待つスレッドの眠る場所 (みな同じ。起こすときはスレッドを選ぶ)
-static WAIT_CHAN: u8 = 0;
+/// futex で待つスレッドの眠る場所: Proc の表の場所ごとに 1 つ。前はみな同じ chan で、眠っているものの並びの 1 つの箱に
+/// futex で待つものがみな入り、起こすたびにそれをみなたどっていた (Firefox で 1 回 36 µs)
+static WAIT_CHAN: [u8; proc::NPROC] = [0; proc::NPROC];
 
-fn chan() -> usize {
-    &raw const WAIT_CHAN as usize
+fn chan(slot: usize) -> usize {
+    &raw const WAIT_CHAN[slot] as usize
+}
+
+fn my_slot() -> usize {
+    proc::cur_index().expect("futex without a thread")
 }
 
 // ---- ロックなしの速い道のための数 ----
@@ -167,79 +195,159 @@ fn vtid(tid: u32) -> u32 {
 
 // ---- 行列 ----
 
-fn enqueue(k: Key, wait: u64, idx: u32, bitset: u32, pi: bool, counted: bool) -> u64 {
+fn bucket_of(k: &Key) -> usize {
+    let (a, b) = match *k {
+        Key::Private(mm, a) => (mm, a),
+        Key::Mm(mm, a) => (mm ^ 1, a),
+        Key::Phys(pa) => (2, pa),
+    };
+    ((((a as u64) ^ ((b as u64) << 7)).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 56) as usize % NB
+}
+
+/// k の行列 (箱の中で key が同じもの) の場所を、来た順に。行列を変えながら見るときは、次を先に読んでおく
+fn first_in(k: &Key) -> u32 {
+    next_in(k, t().head[bucket_of(k)])
+}
+
+/// at から先で、key が k のもの
+fn next_in(k: &Key, mut at: u32) -> u32 {
+    let tb = t();
+    while at != NIL && tb.slab[at as usize].key != *k {
+        at = tb.slab[at as usize].next;
+    }
+    at
+}
+
+fn after(k: &Key, at: u32) -> u32 {
+    next_in(k, t().slab[at as usize].next)
+}
+
+/// 箱 b の行列のうしろにつなぐ
+fn link(at: u32, b: usize) {
+    let tb = t();
+    let last = tb.tail[b];
+    let e = &mut tb.slab[at as usize];
+    e.bucket = b as u16;
+    e.prev = last;
+    e.next = NIL;
+    if last == NIL {
+        tb.head[b] = at;
+    } else {
+        tb.slab[last as usize].next = at;
+    }
+    tb.tail[b] = at;
+}
+
+fn unlink(at: u32) {
+    let tb = t();
+    let (b, prev, next) = {
+        let e = &tb.slab[at as usize];
+        (e.bucket as usize, e.prev, e.next)
+    };
+    if prev == NIL {
+        tb.head[b] = next;
+    } else {
+        tb.slab[prev as usize].next = next;
+    }
+    if next == NIL {
+        tb.tail[b] = prev;
+    } else {
+        tb.slab[next as usize].prev = prev;
+    }
+}
+
+fn enqueue(k: Key, idx: u32, bitset: u32, pi: bool, counted: bool) -> Ticket {
     let tb = t();
     let id = tb.next;
     tb.next += 1;
     if !counted {
         count(k, true);
     }
-    tb.entries.insert(id, Entry { key: k, tid: proc::current().pid, bitset, wait, idx, pi });
-    tb.queues.entry(k).or_default().push_back(id);
-    id
+    let e = Entry { id, key: k, tid: proc::current().pid, slot: my_slot() as u16, bitset, idx, pi, bucket: 0, prev: NIL, next: NIL };
+    let at = match tb.free.pop() {
+        Some(at) => {
+            tb.slab[at as usize] = e;
+            at
+        }
+        None => {
+            tb.slab.push(e);
+            (tb.slab.len() - 1) as u32
+        }
+    };
+    link(at, bucket_of(&k));
+    Ticket { at, id }
+}
+
+/// 行列から出して空きに (いま使われている場所 at のもの)
+fn remove(at: u32) -> (Key, u32, u16, u32) {
+    unlink(at);
+    let tb = t();
+    let e = &mut tb.slab[at as usize];
+    e.id = 0;
+    let r = (e.key, e.tid, e.slot, e.idx);
+    tb.free.push(at);
+    count(r.0, false);
+    r
 }
 
 /// 行列から出す (まだいれば)
-fn unqueue(id: u64) -> Option<Entry> {
-    let tb = t();
-    let e = tb.entries.remove(&id)?;
-    if let Some(q) = tb.queues.get_mut(&e.key) {
-        if let Some(i) = q.iter().position(|&x| x == id) {
-            q.remove(i);
-        }
-        if q.is_empty() {
-            tb.queues.remove(&e.key);
-        }
+fn unqueue(tk: Ticket) {
+    if t().slab.get(tk.at as usize).is_some_and(|e| e.id == tk.id) {
+        remove(tk.at);
     }
-    count(e.key, false);
-    Some(e)
 }
 
-/// 起こす: 行列から出し、その呼び出しが起こされたと覚えて、スレッドを起こす
-fn wake_entry(id: u64) {
-    let Some(e) = unqueue(id) else { return };
-    let w = t().woken.entry(e.wait).or_insert(e.idx);
-    *w = (*w).max(e.idx);
-    proc::wake_tid(e.tid, chan());
+/// 起こす: 行列から出し、そのスレッドの待ちが起こされたと覚えて、スレッドを起こす
+fn wake_entry(at: u32) {
+    let (_, tid, slot, idx) = remove(at);
+    let w = &mut t().woken[slot as usize];
+    *w = (*w).max(idx + 1);
+    proc::wake_tid(tid, chan(slot as usize));
 }
 
-fn queue_ids(k: &Key) -> Vec<u64> {
-    t().queues.get(k).map(|q| q.iter().copied().collect()).unwrap_or_default()
-}
-
-/// 行列の中のものを k2 のうしろへ (同じ key ならそのまま)
-fn requeue(id: u64, k2: Key) {
-    let tb = t();
-    let Some(e) = tb.entries.get_mut(&id) else { return };
-    let k1 = e.key;
+/// 行列の中のもの at を k2 のうしろへ (同じ key ならそのまま)
+fn requeue(at: u32, k2: Key) {
+    let k1 = t().slab[at as usize].key;
     if k1 == k2 {
         return;
     }
-    e.key = k2;
     count(k2, true);
     count(k1, false);
-    if let Some(q) = tb.queues.get_mut(&k1) {
-        if let Some(i) = q.iter().position(|&x| x == id) {
-            q.remove(i);
+    unlink(at);
+    t().slab[at as usize].key = k2;
+    link(at, bucket_of(&k2));
+}
+
+/// k の行列で、PI で待ついちばん前のもの
+fn first_pi(k: &Key) -> Option<u32> {
+    let mut at = first_in(k);
+    while at != NIL {
+        if t().slab[at as usize].pi {
+            return Some(at);
         }
-        if q.is_empty() {
-            tb.queues.remove(&k1);
-        }
+        at = after(k, at);
     }
-    tb.queues.entry(k2).or_default().push_back(id);
+    None
 }
 
 fn has_pi_waiter(k: &Key) -> bool {
-    t().queues.get(k).is_some_and(|q| q.iter().any(|id| t().entries.get(id).is_some_and(|e| e.pi)))
+    first_pi(k).is_some()
 }
 
-/// 待つ (呼び出し wait の ids を行列に入れたあと): 起こされたら起こされたものの番号、時間切れは ETIMEDOUT、
+/// 待ちのはじめ: 起こされた印を消す (前の呼び出しのもの)
+fn begin_wait() {
+    t().woken[my_slot()] = 0;
+}
+
+/// 待つ (呼び出しのものを行列に入れたあと): 起こされたら起こされたものの番号、時間切れは ETIMEDOUT、
 /// シグナルは EINTR。どの終わりかたでも、のこりは行列から出す。わけもなく起きたら、また眠る
-fn sleep(wait: u64, ids: &[u64], deadline: u64) -> Result<u32, i64> {
+fn sleep(ids: &[Ticket], deadline: u64) -> Result<u32, i64> {
+    let me = my_slot();
     let r = loop {
-        let r = proc::sleep_until(chan(), deadline);
-        if let Some(i) = t().woken.remove(&wait) {
-            break Ok(i);
+        let r = proc::sleep_until(chan(me), deadline);
+        let w = t().woken[me];
+        if w != 0 {
+            break Ok(w - 1);
         }
         match r {
             Err(e) => break Err(e),
@@ -247,17 +355,11 @@ fn sleep(wait: u64, ids: &[u64], deadline: u64) -> Result<u32, i64> {
             Ok(true) => {}
         }
     };
-    for &id in ids {
-        unqueue(id);
+    for &tk in ids {
+        unqueue(tk);
     }
-    t().woken.remove(&wait);
+    t().woken[me] = 0;
     r
-}
-
-fn new_wait() -> u64 {
-    let tb = t();
-    tb.next += 1;
-    tb.next
 }
 
 // ---- 時間 ----
@@ -343,9 +445,9 @@ fn wait(uaddr: usize, private: bool, val: u32, dl: Option<u64>, bitset: u32) -> 
         count(k, false);
         return Err(-ETIMEDOUT);
     }
-    let w = new_wait();
-    let id = enqueue(k, w, 0, bitset, false, true);
-    sleep(w, &[id], dl.unwrap_or(0)).map(|_| 0)
+    begin_wait();
+    let tk = enqueue(k, 0, bitset, false, true);
+    sleep(&[tk], dl.unwrap_or(0)).map(|_| 0)
 }
 
 /// FUTEX_WAKE / WAKE_BITSET (Linux の futex_wake): 来た順に bitset の重なるものを nr まで (nr が 0 以下でも 1 つ)。
@@ -360,19 +462,22 @@ fn wake(uaddr: usize, private: bool, nr: i32, bitset: u32) -> Result<i64, i64> {
 
 fn wake_key(k: Key, nr: i32, bitset: Option<u32>) -> Result<i64, i64> {
     let mut n = 0i32;
-    for id in queue_ids(&k) {
-        let Some(e) = t().entries.get(&id) else { continue };
+    let mut at = first_in(&k);
+    while at != NIL {
+        // 起こすと場所が空くので、次を先に
+        let next = after(&k, at);
+        let e = &t().slab[at as usize];
         if e.pi {
             return Err(crate::why::inval());
         }
-        if bitset.is_some_and(|b| e.bitset & b == 0) {
-            continue;
+        if bitset.is_none_or(|b| e.bitset & b != 0) {
+            wake_entry(at);
+            n += 1;
+            if n >= nr {
+                break;
+            }
         }
-        wake_entry(id);
-        n += 1;
-        if n >= nr {
-            break;
-        }
+        at = next;
     }
     Ok(n as i64)
 }
@@ -391,20 +496,23 @@ fn requeue_op(uaddr: usize, private: bool, uaddr2: usize, nr_wake: i32, nr_reque
         }
     }
     let mut n = 0i32;
-    for id in queue_ids(&k1) {
+    let mut at = first_in(&k1);
+    while at != NIL {
         if n - nr_wake >= nr_requeue {
             break;
         }
-        let Some(e) = t().entries.get(&id) else { continue };
-        if e.pi {
+        // 起こすと場所が空き、移すとつなぎが変わるので、次を先に (同じ箱へ移したものは key がちがうので、また見ない)
+        let next = after(&k1, at);
+        if t().slab[at as usize].pi {
             return Err(crate::why::inval());
         }
         n += 1;
         if n <= nr_wake {
-            wake_entry(id);
+            wake_entry(at);
         } else {
-            requeue(id, k2);
+            requeue(at, k2);
         }
+        at = next;
     }
     Ok(n as i64)
 }
@@ -501,9 +609,9 @@ fn lock_pi(uaddr: usize, private: bool, dl: Option<u64>, trylock: bool) -> Resul
             }
             return Err(-ETIMEDOUT);
         }
-        let w = new_wait();
-        let id = enqueue(k, w, 0, BITSET_ANY, true, false);
-        let r = sleep(w, &[id], dl.unwrap_or(0));
+        begin_wait();
+        let tk = enqueue(k, 0, BITSET_ANY, true, false);
+        let r = sleep(&[tk], dl.unwrap_or(0));
         if r.is_err() && !has_pi_waiter(&k) && t().pi.get(&k) != Some(&proc::current().pid) {
             t().pi.remove(&k);
         }
@@ -522,17 +630,16 @@ fn unlock_pi(uaddr: usize, private: bool) -> Result<i64, i64> {
         return Err(-EPERM);
     }
     let k = key_of(uaddr, private)?;
-    let first = queue_ids(&k).into_iter().find(|id| t().entries.get(id).is_some_and(|e| e.pi));
-    if let Some(id) = first {
+    if let Some(at) = first_pi(&k) {
         if t().pi.get(&k) != Some(&me_g) {
             return Err(crate::why::inval());
         }
-        let new = t().entries.get(&id).map_or(0, |e| e.tid);
+        let new = t().slab[at as usize].tid;
         let cur = cmpxchg(uaddr, uval, WAITERS | vtid(new))?;
         if cur != uval {
             return Err(if cur & TID_MASK == uval { -EAGAIN } else { -EINVAL });
         }
-        wake_entry(id);
+        wake_entry(at);
         if has_pi_waiter(&k) {
             t().pi.insert(k, new);
         } else {
@@ -581,7 +688,7 @@ pub fn waitv(uwaiters: usize, nr: u32, flags: u32, timeout: usize, clockid: u32)
     for &(ua, _, private) in &ws {
         keys.push(key_of(ua, private)?);
     }
-    let w = new_wait();
+    begin_wait();
     let mut ids = Vec::new();
     for (i, &(ua, val, _)) in ws.iter().enumerate() {
         count(keys[i], true);
@@ -589,20 +696,20 @@ pub fn waitv(uwaiters: usize, nr: u32, flags: u32, timeout: usize, clockid: u32)
         let r = get(ua);
         if r != Ok(val) {
             count(keys[i], false);
-            for &id in &ids {
-                unqueue(id);
+            for &tk in &ids {
+                unqueue(tk);
             }
             return Err(r.err().unwrap_or(-EAGAIN));
         }
-        ids.push(enqueue(keys[i], w, i as u32, BITSET_ANY, false, true));
+        ids.push(enqueue(keys[i], i as u32, BITSET_ANY, false, true));
     }
     if dl == Some(0) {
-        for &id in &ids {
-            unqueue(id);
+        for &tk in &ids {
+            unqueue(tk);
         }
         return Err(-ETIMEDOUT);
     }
-    sleep(w, &ids, dl.unwrap_or(0)).map(|i| i as i64)
+    sleep(&ids, dl.unwrap_or(0)).map(|i| i as i64)
 }
 
 // ---- カーネルから ----
@@ -619,33 +726,34 @@ pub fn exit(tid: u32) {
     let owned: Vec<Key> = t().pi.iter().filter(|&(_, &o)| o == tid).map(|(&k, _)| k).collect();
     for k in owned {
         t().pi.remove(&k);
-        let Some(id) = queue_ids(&k).into_iter().find(|id| t().entries.get(id).is_some_and(|e| e.pi)) else { continue };
-        let new = t().entries.get(&id).map_or(0, |e| e.tid);
-        wake_entry(id);
+        let Some(at) = first_pi(&k) else { continue };
+        let new = t().slab[at as usize].tid;
+        wake_entry(at);
         if has_pi_waiter(&k) {
             t().pi.insert(k, new);
         }
     }
     // 終わるスレッドの待ちは、もう起こされない
-    let mine: Vec<u64> = t().entries.iter().filter(|(_, e)| e.tid == tid).map(|(&id, _)| id).collect();
-    for id in mine {
-        unqueue(id);
+    for at in 0..t().slab.len() as u32 {
+        let e = &t().slab[at as usize];
+        if e.id != 0 && e.tid == tid {
+            remove(at);
+        }
     }
 }
 
 /// 調べもの用 (/proc/strace に "kick PID"): tgid の futex で待っている (PI でない) スレッドをみな起こす。futex は
 /// わけもなく起きてよい (待つ側が値を見なおす) ので、起こしが消えて眠りつづけているのかを確かめられる
 pub fn kick(tgid: u32) -> usize {
-    let ids: Vec<u64> = t()
-        .entries
-        .iter()
-        .filter(|(_, e)| !e.pi && proc::find_thread(e.tid).is_some_and(|p| p.tgid == tgid))
-        .map(|(&id, _)| id)
-        .collect();
-    for &id in &ids {
-        wake_entry(id);
+    let mut n = 0;
+    for at in 0..t().slab.len() as u32 {
+        let e = &t().slab[at as usize];
+        if e.id != 0 && !e.pi && proc::find_thread(e.tid).is_some_and(|p| p.tgid == tgid) {
+            wake_entry(at);
+            n += 1;
+        }
     }
-    ids.len()
+    n
 }
 
 /// シグナルで割り込まれたときのやり直しかた (Linux の答え): LOCK_PI はいつもやり直す (ERESTARTNOINTR)、時間の

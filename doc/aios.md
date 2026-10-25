@@ -383,6 +383,25 @@ unlink も、ディレクトリのロックの中で inode を返す前に進め
 ロックの中で名前を確かめる。書いたファイル 1000 の stat は 13〜23 µs から 8〜9 µs に、fstatat の 1 回目は 15 から 12 µs に。
 test/openrace.c は、ファイルの大きさを 100 + i にして、名前の stat がほかのファイルの大きさを答えないかも見る。
 
+### futex の待ちの行列 (key のハッシュの箱と、スレッドごとの眠る場所)
+
+Firefox を 4 つの CPU で動かすと、大きなロックをいちばん長く持っていたのは futex だった (3673 回、198 ms、1 回 54 µs)。
+1 回のうち、起こす相手をさがすのに 36 µs、行列から出すのに 17 µs、入れるのに 15 µs。futex で待つスレッドはみな同じ
+chan で眠っていたので、眠っているものの並びの 1 つの箱に futex で待つものがみな入り、起こすたびにそれをみなたどっていた。
+行列も key ごとの BTreeMap と VecDeque、入れたものの BTreeMap、起こされたものの BTreeMap で、待つ・起こすたびに木を
+いくつもたどってメモリを取っていた。
+
+Linux は、待つもの (futex_q) を key のハッシュの箱 (futex_hash_bucket) に来た順につなぎ、起こすときは行列から出した
+そのスレッドを起こす。いまは同じ形: 待つものは表の slab に置いて (空いた場所は使いまわす)、key のハッシュの 256 の箱に前後で
+つなぐ (同じ箱にちがう key もまざるので key で選ぶ。REQUEUE はつなぎかえるだけ)。スレッドは Proc の表の場所ごとの chan で
+眠り、起こされた印もその場所ごとの表に書く (futex_waitv の、起こされたものの番号)。待つ側は slab の場所と入れたときの番号を
+持っていて、まだ自分のものなら出す。
+
+Firefox (4 つの CPU) の futex は 1 回 54 µs から 37 µs に (合計 198 ms から 137 ms に)。のこりのほとんどは、眠っている CPU
+を起こす IPI (GIC への書きこみ。QEMU の TCG では重い)。新しい test/futexrace.c は、mutex の取りあい、cond で受けわたす行列
+(signal と broadcast)、時間切れで終わる待ち、生の CMP_REQUEUE を、いくつもの CPU で同時に動かす (起こしが消えれば alarm で
+失敗)。
+
 ### カーネルの砂場 (aios.off= と aish の box)
 
 `off` のあるもの (extra と quirk) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる
@@ -1065,8 +1084,8 @@ ANDN XOR と OPARG_SHIFT)、前の値をくらべた答えで 2 つめの語も�
 語でまとめて待ち、起こされたものの番号を返す。スレッドが終わるときの CLONE_CHILD_CLEARTID の起こしは共有の op (Linux の
 mm_release) で、持っていた PI のロックは待っているものにゆずる。CLOCK_REALTIME の印は WAIT_BITSET と LOCK_PI2 だけ
 (Linux 7.3 は FUTEX_WAIT にも ENOSYS)。シグナルで割り込まれたら、時間のない WAIT は SA_RESTART でやり直し、時間のある WAIT
-はハンドラが動けば EINTR、LOCK_PI はいつもやり直す (Linux の ERESTARTSYS、ERESTART_RESTARTBLOCK、ERESTARTNOINTR)。待つ
-スレッドはみな同じ場所で眠り、起こす側が行列から出したスレッドだけを起こす。ロックなしの速い道 (PRIVATE の WAKE で待つもの
+はハンドラが動けば EINTR、LOCK_PI はいつもやり直す (Linux の ERESTARTSYS、ERESTART_RESTARTBLOCK、ERESTARTNOINTR)。起こす
+側は、行列から出したスレッドだけを起こす (いまはスレッドごとの場所で眠る: 上の「futex の待ちの行列」)。ロックなしの速い道 (PRIVATE の WAKE で待つもの
 がいない、WAIT で値がちがう) はそのまま (時間、そろっていないアドレス、bitset 0 のときは答えがちがうので、ふつうの道へ)。
 長い並びで出たほかのちがいは 2 つ: listen する前に shutdown(SHUT_WR) した口から生まれた子は、印を受けついでつながったところで
 FIN を送る (Linux の sk_clone_lock と TCP_SYN_RECV)。もう 1 つは AF_UNIX の、自分の fd を自分の行列に送って閉じたソケット:
