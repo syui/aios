@@ -242,11 +242,13 @@ impl ProcInode {
                 let midr: u64;
                 unsafe { core::arch::asm!("mrs {}, midr_el1", out(reg) midr) };
                 let mut s = String::new();
+                let features = crate::exec::cpu_features();
                 for i in 0..crate::smp::online() {
                     s += &format!(
-                        "processor\t: {}\nBogoMIPS\t: {}.00\nFeatures\t: fp asimd\nCPU implementer\t: {:#04x}\nCPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
+                        "processor\t: {}\nBogoMIPS\t: {}.00\nFeatures\t: {}\nCPU implementer\t: {:#04x}\nCPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
                         i,
                         crate::timer::freq() * 2 / 1_000_000,
+                        features,
                         (midr >> 24) & 0xff,
                         (midr >> 20) & 0xf,
                         (midr >> 4) & 0xfff,

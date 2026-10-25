@@ -205,7 +205,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
 /// EL0 の MRS で ID レジスタ (op0 = 3, op1 = 0, CRn = 0) を読んだものに、Linux と同じく答える
 /// (Linux はいつも答えるので AT_HWCAP の CPUID を見ずに読むものがある: zig の CPU しらべ)。
 /// MIDR はそのまま、MPIDR は Linux と同じ 1 << 31、ほかの ID レジスタはカーネルが使わせているところだけ (SVE、SME、MTE、
-/// ポインタ認証などは 0)、名前のないものは 0。答えたら次の命令へ
+/// ポインタ認証などは 0)、名前のないものは 0。AT_HWCAP と AT_HWCAP2 (exec.rs の hwcaps) と同じものを見せる。答えたら次の命令へ
 fn emulate_mrs(tf: &mut TrapFrame) -> bool {
     let mut w = [0u8; 4];
     if proc::current().pt().copy_in(&mut w, tf.elr as usize).is_none() {
@@ -232,11 +232,14 @@ fn emulate_mrs(tf: &mut TrapFrame) -> bool {
     let v = match (crm, op2) {
         (0, 0) => rd!("midr_el1"),
         (0, 5) => 1 << 31,
-        // ID_AA64PFR0: EL0 から EL3、FP、AdvSIMD
-        (4, 0) => keep(rd!("id_aa64pfr0_el1"), &[0, 4, 8, 12, 16, 20]),
+        // ID_AA64PFR0: EL2 と EL3、FP、AdvSIMD、DIT。EL0 と EL1 は AArch64 だけ (1): aios は AArch32 のプログラムを動かさない
+        // (Linux の COMPAT のないものと同じ)
+        (4, 0) => keep(rd!("id_aa64pfr0_el1"), &[8, 12, 16, 20, 48]) | 0x11,
         (6, 0) => rd!("id_aa64isar0_el1"),
         // ID_AA64ISAR1: ポインタ認証 (APA API GPA GPI) を外す
         (6, 1) => rd!("id_aa64isar1_el1") & !(0xff << 4 | 0xff << 24),
+        // ID_AA64ISAR2: RPRES、BC、RPRFM、CSSC だけ (WFxT と MOPS とポインタ認証は外す)
+        (6, 2) => keep(rd!("s3_0_c0_c6_2"), &[4, 20, 48, 52]),
         (7, 0) => rd!("id_aa64mmfr0_el1"),
         (7, 1) => rd!("id_aa64mmfr1_el1"),
         (7, 2) => rd!("id_aa64mmfr2_el1"),

@@ -23,7 +23,7 @@
   {"name": "proc", "type": "core", "src": "src/proc.rs", "what": "プロセス・スレッドとスケジューラ。wait (古い子から、ゾンビは WEXITED のときだけ待つ相手)、孤児のプロセスグループ、ゾンビは回収されるまでいる (kill は 0、/proc/PID は Z)"},
   {"name": "signal", "type": "core", "src": "src/signal.rs", "what": "シグナル: 送る、ためる、EL0 へ戻るときにハンドラを呼ぶ (Linux arm64 と同じ rt_sigframe)"},
   {"name": "syscall", "type": "core", "src": "src/syscall.rs", "what": "aarch64 Linux 互換のシステムコール"},
-  {"name": "exec", "type": "core", "src": "src/exec.rs", "what": "ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る"},
+  {"name": "exec", "type": "core", "src": "src/exec.rs", "what": "ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る。AT_HWCAP と AT_HWCAP2 と /proc/cpuinfo の Features は ID レジスタから Linux と同じ決まりで (CAPS)"},
   {"name": "file", "type": "core", "src": "src/file.rs", "what": "開いたファイル (fd の向こう側)。閉じたふつうのファイルの棚 (Shelf): 読むだけで開いた ext4 のファイルを閉じるとき OpenFile をしまい、同じパスをまた開くとき、statc がいまも同じ inode で読めると答えれば、大きなロックなしで出す (Rc の数は変えない)。ない (ENOENT) ものの openat も大きなロックなしで答える。test/opencache.c が確かめる", "bench": "test/smpbench.c (aish の bench smp の open-close-x4。/proc/bkl のロックなしの open / close)"},
   {"name": "locks", "type": "core", "src": "src/locks.rs", "what": "ファイルのロック: flock (開いたファイルごと、ファイルまるごと) と fcntl のレコードロック (POSIX はプロセスごと、OFD は開いたファイルごと。範囲、まとめ、切り分け、閉じたら外れる、待つ、EDEADLK)。Linux の fs/locks.c と同じ決まり"},
   {"name": "futex", "type": "core", "src": "src/futex.rs", "what": "futex: 待ち合わせの場所 (PRIVATE、共有の op の自分の領域、MAP_SHARED のページ) ごとの来た順の行列 (key のハッシュの箱につなぐ: Linux の futex_hash_bucket と futex_q。スレッドは自分だけの chan で眠る)。起こす数、bitset、REQUEUE / CMP_REQUEUE、WAKE_OP、PI のロック (持ち主と WAITERS の印、来た順にゆずる)、futex_waitv。Linux の kernel/futex/ と同じ決まり (test/sysdiff.c のスレッドと futex の op で答えあわせ)"},

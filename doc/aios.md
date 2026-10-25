@@ -402,6 +402,20 @@ Firefox (4 つの CPU) の futex は 1 回 54 µs から 37 µs に (合計 198 
 (signal と broadcast)、時間切れで終わる待ち、生の CMP_REQUEUE を、いくつもの CPU で同時に動かす (起こしが消えれば alarm で
 失敗)。
 
+### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
+
+プログラムは、この CPU で使える命令を AT_HWCAP と AT_HWCAP2 (getauxval) か /proc/cpuinfo の `Features` で知る。前の aios
+は fp、asimd、aes、pmull、sha1、sha2、crc32、atomics と cpuid だけを出し (cpuinfo は `fp asimd` だけ)、AT_HWCAP2 はなかった。
+なので dotprod (asimddp)、fp16 (asimdhp)、i8mm を見て道を選ぶもの (llama.cpp の ggml、zstd、dav1d など) は、Apple M や
+cortex-a76 でも、いちばんおそい道を選んでいた。いまは Linux (arch/arm64/kernel/cpufeature.c の arm64_elf_hwcaps) と同じ
+決まりで、cpuid のほかに ID レジスタから 42 の印を出す (kernel/src/exec.rs の CAPS。cpuinfo の名前と順も Linux と同じ)。カーネルが
+使わせていないもの (SVE と SME、MTE、BTI、ポインタ認証、GCS、MOPS、WFxT) と、仕掛けのないもの (evtstrm、SSBS) は出さない。
+EL0 の MRS で読む ID レジスタ (trap.rs の emulate_mrs) も同じものを見せる: ID_AA64ISAR2 の RPRES、BC、RPRFM、CSSC を
+足し、ID_AA64PFR0 は DIT を足して、EL0 と EL1 を「AArch64 だけ」にした (aios は AArch32 のプログラムを動かさない)。
+test/cpuid.c が、MRS で読んだ ID レジスタ、AT_HWCAP / AT_HWCAP2、/proc/cpuinfo の 3 つが合うかを見る (QEMU の
+`-cpu max` で、aios も Linux 7.3 も同じ 34 の印)。TCG の VM の CPU は `AIOS_CPU=max` で変えられる (bin/run.sh。既定は
+cortex-a72)。
+
 ### カーネルの砂場 (aios.off= と aish の box)
 
 `off` のあるもの (extra と quirk) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる

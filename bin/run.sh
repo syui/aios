@@ -31,7 +31,7 @@
 #   ssh -p 2222 ai@127.0.0.1 で入れる (aios で sudo ssh-keygen -A && sudo /opt/c/sbin/sshd)
 # Mac (Apple Silicon) では Hypervisor.framework (HVF) で速く動かす (-accel hvf -cpu host、GICv3)。
 #   AIOS_ACCEL=tcg でソフトのエミュレーションに、AIOS_ACCEL=kvm で Linux (arm64) の KVM に
-#   AIOS_GIC=3 で TCG でも GICv3 に
+#   AIOS_GIC=3 で TCG でも GICv3 に。AIOS_CPU=max で TCG の CPU を cortex-a72 から変える (dotprod や i8mm のあるもの)
 # AIOS_MACHINE=raspi3b でラズパイ 3B (DTB は build/rpi/ に取ってくる。sd.img (bin/mksd.sh) があれば SD カード、ネットワークなし)
 dev=target/aarch64-unknown-none-softfloat/debug/aios
 disk=${AIOS_DISK:-aios.img}
@@ -124,7 +124,7 @@ fi
 case "$accel" in
   hvf) cpu="-accel hvf -cpu host"; machine="virt,gic-version=3,highmem=off" ;;
   kvm) cpu="-accel kvm -cpu host"; machine="virt,gic-version=host" ;;
-  *) cpu="-cpu cortex-a72"; machine="virt${AIOS_GIC:+,gic-version=$AIOS_GIC}" ;;
+  *) cpu="-cpu ${AIOS_CPU:-cortex-a72}"; machine="virt${AIOS_GIC:+,gic-version=$AIOS_GIC}" ;;
 esac
 [ -n "$accel" ] && [ "$accel" != tcg ] && echo "accel: $accel" >&2
 ssh_port=${AIOS_SSH:-2222}

@@ -38,6 +38,7 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_HWCAP: u64 = 16;
+const AT_HWCAP2: u64 = 26;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
@@ -204,11 +205,13 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let args = (base, env_start, env_start + envp.iter().map(|s| s.len() + 1).sum::<usize>());
     crate::rand::fill(&mut img[random - sp..random - sp + 16]);
 
-    let auxv: [(u64, u64); 17] = [
+    let hw = hwcaps();
+    let auxv: [(u64, u64); 18] = [
         (AT_PHDR, phdr_va as u64),
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
-        (AT_HWCAP, hwcap()),
+        (AT_HWCAP, hw.0),
+        (AT_HWCAP2, hw.1),
         (AT_PAGESZ, PGSIZE as u64),
         (AT_BASE, interp_base as u64),
         (AT_ENTRY, main.entry as u64),
@@ -355,41 +358,123 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
     Ok(Loaded { entry: u64_at(elf, 24) + bias, phdr_va, phentsize, phnum, end, interp })
 }
 
-/// AT_HWCAP: この CPU で使える命令 (Linux の arm64 と同じ印)。ID レジスタから
-fn hwcap() -> u64 {
-    let (isar0, pfr0): (u64, u64);
+/// ID レジスタ (hwcaps と trap.rs の emulate_mrs が読むもの)
+#[derive(Clone, Copy)]
+enum Id {
+    Pfr0,
+    Isar0,
+    Isar1,
+    Isar2,
+    Mmfr0,
+    Mmfr1,
+    Mmfr2,
+}
+
+/// 印 1 つ: (/proc/cpuinfo の名前, AT_HWCAP2 か, ビット, レジスタ, 欄の位置, 最小の値, 符号つきの欄か)。Linux の
+/// arch/arm64/kernel/cpufeature.c (arm64_elf_hwcaps) と同じ決まりで、ビットの順 (cpuinfo の Features もこの順)。
+/// カーネルが使わせていないもの (SVE と SME: Z と ZA のレジスタを切りかえで残さない、MTE、BTI、ポインタ認証、GCS、
+/// MOPS、WFxT) と、仕掛けのないもの (evtstrm: タイマのイベントの流れ、SSBS) は出さない
+const CAPS: &[(&str, bool, u32, Id, u32, u64, bool)] = &[
+    ("fp", false, 0, Id::Pfr0, 16, 0, true),
+    ("asimd", false, 1, Id::Pfr0, 20, 0, true),
+    ("aes", false, 3, Id::Isar0, 4, 1, false),
+    ("pmull", false, 4, Id::Isar0, 4, 2, false),
+    ("sha1", false, 5, Id::Isar0, 8, 1, false),
+    ("sha2", false, 6, Id::Isar0, 12, 1, false),
+    ("crc32", false, 7, Id::Isar0, 16, 1, false),
+    ("atomics", false, 8, Id::Isar0, 20, 2, false),
+    ("fphp", false, 9, Id::Pfr0, 16, 1, true),
+    ("asimdhp", false, 10, Id::Pfr0, 20, 1, true),
+    // cpuid (11) はいつも (EL0 の MRS で ID レジスタを読める: trap.rs の emulate_mrs)
+    ("asimdrdm", false, 12, Id::Isar0, 28, 1, false),
+    ("jscvt", false, 13, Id::Isar1, 12, 1, false),
+    ("fcma", false, 14, Id::Isar1, 16, 1, false),
+    ("lrcpc", false, 15, Id::Isar1, 20, 1, false),
+    ("dcpop", false, 16, Id::Isar1, 0, 1, false),
+    ("sha3", false, 17, Id::Isar0, 32, 1, false),
+    ("sm3", false, 18, Id::Isar0, 36, 1, false),
+    ("sm4", false, 19, Id::Isar0, 40, 1, false),
+    ("asimddp", false, 20, Id::Isar0, 44, 1, false),
+    ("sha512", false, 21, Id::Isar0, 12, 2, false),
+    ("asimdfhm", false, 23, Id::Isar0, 48, 1, false),
+    ("dit", false, 24, Id::Pfr0, 48, 1, false),
+    ("uscat", false, 25, Id::Mmfr2, 32, 1, false),
+    ("ilrcpc", false, 26, Id::Isar1, 20, 2, false),
+    ("flagm", false, 27, Id::Isar0, 52, 1, false),
+    ("sb", false, 29, Id::Isar1, 36, 1, false),
+    ("dcpodp", true, 0, Id::Isar1, 0, 2, false),
+    ("flagm2", true, 7, Id::Isar0, 52, 2, false),
+    ("frint", true, 8, Id::Isar1, 32, 1, false),
+    ("i8mm", true, 13, Id::Isar1, 52, 1, false),
+    ("bf16", true, 14, Id::Isar1, 44, 1, false),
+    ("dgh", true, 15, Id::Isar1, 48, 1, false),
+    ("rng", true, 16, Id::Isar0, 60, 1, false),
+    ("ecv", true, 19, Id::Mmfr0, 60, 1, false),
+    ("afp", true, 20, Id::Mmfr1, 44, 1, false),
+    ("rpres", true, 21, Id::Isar2, 4, 1, false),
+    ("ebf16", true, 32, Id::Isar1, 44, 2, false),
+    ("cssc", true, 34, Id::Isar2, 52, 1, false),
+    ("rprfm", true, 35, Id::Isar2, 48, 1, false),
+    ("hbc", true, 44, Id::Isar2, 20, 1, false),
+    ("lrcpc3", true, 46, Id::Isar1, 20, 3, false),
+    ("lse128", true, 47, Id::Isar0, 20, 3, false),
+];
+
+/// ID レジスタの値 (この CPU の)
+fn id_reg(r: Id) -> u64 {
+    let v: u64;
     unsafe {
-        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0);
-        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0);
+        match r {
+            Id::Pfr0 => core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) v),
+            Id::Isar0 => core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) v),
+            Id::Isar1 => core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) v),
+            // 古いアセンブラの名前のない ID_AA64ISAR2_EL1 (op0 3, op1 0, CRn 0, CRm 6, op2 2)
+            Id::Isar2 => core::arch::asm!("mrs {}, s3_0_c0_c6_2", out(reg) v),
+            Id::Mmfr0 => core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) v),
+            Id::Mmfr1 => core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) v),
+            Id::Mmfr2 => core::arch::asm!("mrs {}, id_aa64mmfr2_el1", out(reg) v),
+        }
     }
-    let f = |r: u64, shift: u32| (r >> shift) & 0xf;
-    let mut h = 0;
-    // FP と AdvSIMD (0xf は「ない」)
-    if f(pfr0, 16) != 0xf {
-        h |= 1 << 0; // FP
+    v
+}
+
+fn has(c: &(&str, bool, u32, Id, u32, u64, bool)) -> bool {
+    let v = (id_reg(c.3) >> c.4) & 0xf;
+    // 符号つきの欄 (FP と AdvSIMD) の 0xf は「ない」(-1)
+    if c.6 && v == 0xf {
+        return false;
     }
-    if f(pfr0, 20) != 0xf {
-        h |= 1 << 1; // ASIMD
+    v >= c.5
+}
+
+/// (AT_HWCAP, AT_HWCAP2): この CPU で使える命令 (Linux の arm64 と同じ印)。前は FP、ASIMD、AES、PMULL、SHA1、SHA2、
+/// CRC32、ATOMICS と CPUID だけで、dotprod (asimddp) や fp16 (asimdhp)、i8mm を見るもの (llama.cpp の ggml、zstd、dav1d)
+/// が、ある CPU でもおそい道を選んでいた
+pub fn hwcaps() -> (u64, u64) {
+    let mut h = (1u64 << 11, 0u64); // CPUID
+    for c in CAPS.iter().filter(|c| has(c)) {
+        if c.1 {
+            h.1 |= 1 << c.2;
+        } else {
+            h.0 |= 1 << c.2;
+        }
     }
-    if f(isar0, 4) >= 1 {
-        h |= 1 << 3; // AES
-    }
-    if f(isar0, 4) >= 2 {
-        h |= 1 << 4; // PMULL
-    }
-    if f(isar0, 8) >= 1 {
-        h |= 1 << 5; // SHA1
-    }
-    if f(isar0, 12) >= 1 {
-        h |= 1 << 6; // SHA2
-    }
-    if f(isar0, 16) >= 1 {
-        h |= 1 << 7; // CRC32
-    }
-    if f(isar0, 20) >= 2 {
-        h |= 1 << 8; // ATOMICS (LSE)
-    }
-    // CPUID: EL0 の MRS で ID レジスタを読める (trap.rs の emulate_mrs)
-    h |= 1 << 11;
     h
+}
+
+/// /proc/cpuinfo の Features (Linux と同じ名前と順)
+pub fn cpu_features() -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for c in CAPS.iter() {
+        if c.2 == 12 && !c.1 {
+            // cpuid は asimdhp と asimdrdm のあいだ (ビット 11)
+            s.push_str("cpuid ");
+        }
+        if has(c) {
+            s.push_str(c.0);
+            s.push(' ');
+        }
+    }
+    s.pop();
+    s
 }
