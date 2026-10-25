@@ -1211,6 +1211,7 @@ aios の中で LLM を動かす。推論エンジンは llama.cpp (pkg/c/llama.c
 
 ```sh
 sudo ap -S aimodel curl                       # llama.cpp も入り、モデルを取ってきて、llama-server がそれで起きる
+llama cli                                     # 端末で話す (/exit か Ctrl-C で終わる。/clear で最初から)
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
 aimodel status                                # 置いてあるものと配っているもの (sha と大きさ)
@@ -1227,14 +1228,17 @@ sudo systemctl start llama-server             # 次の起動からはひとり�
 fetch http://127.0.0.1:8080/health            # {"status":"ok"} (読むだけなら fetch でも)
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
-llama cli -m /var/lib/ai/model.gguf           # 端末で話す (llama help で、ほかのもの)
-llama bench -m /var/lib/ai/model.gguf         # この機械での速さ (prompt と生成の tokens/s)
+llama cli                                     # 端末で話す (llama help で、ほかのもの)
+llama bench                                   # この機械での速さ (prompt と生成の tokens/s)
 ```
 
 - `llama` は upstream の 1 本にまとめたもの (serve、cli、completion、bench、quantize、perplexity …)。CPU の命令ごとに
   3 本あり (armv8.0: cortex-a72 や QEMU、armv8.2 + dotprod + fp16: cortex-a76 や Apple M1、armv8.6 + i8mm: Apple M2 から)、
   `/opt/c/bin/llama` が /proc/cpuinfo の Features (上の「CPU の印」) を見て選ぶ。`LLAMA_CPU=armv8.0` で手で選べる。
   ggml の CPU の速さは dotprod と i8mm でほぼ決まる (Q4_0 などは、読みこむときにその CPU の形に並べかえる)。
+  `-m` (や `-hf`、`--models-dir`) も `LLAMA_ARG_MODEL` もなければ、`/var/lib/ai/model.gguf` を使う (`llama cli` だけで話せる)。
+  `llama cli` は答えを端末にじかに書くので、ファイルやパイプにつなぐときは `--simple-io` をつける
+  (`llama cli -p "こんにちは" -st --simple-io > out.txt`。`-st` は 1 回だけ答えて終わる)。
 - `llama-server.service` は base の /etc にあって、はじめから有効。`/opt/c/bin/llama` と `/var/lib/ai/model.gguf` の両方が
   あるときだけ起きる (ConditionPathExists)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
   `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。

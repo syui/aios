@@ -25,4 +25,23 @@ case ${0##*/} in
     esac
     ;;
 esac
+# モデルを言わなければ (-m なども LLAMA_ARG_MODEL もなければ)、llama-server.service と同じ /var/lib/ai/model.gguf
+# (aimodel が取ってきたもの) を使う: llama cli だけで話せる。-m を渡したときに LLAMA_ARG_MODEL があると
+# llama が warn を出すので、モデルを言う引数があれば足さない
+m=/var/lib/ai/model.gguf
+if [ -z "$LLAMA_ARG_MODEL" ] && [ -e "$m" ]; then
+  for a in "$@"; do
+    case $a in
+      -m | --model | -mu | --model-url | -dr | --docker-repo | -hf | -hfr | --hf-repo | --models-dir | --models-preset) m= ;;
+    esac
+  done
+  if [ -n "$m" ]; then
+    export LLAMA_ARG_MODEL="$m"
+    # llama bench は LLAMA_ARG_* を読まないので -m で渡す
+    if [ "$1" = bench ]; then
+      shift
+      set -- bench -m "$m" "$@"
+    fi
+  fi
+fi
 exec "$d/$v/llama" "$@"
