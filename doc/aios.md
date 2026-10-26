@@ -1240,12 +1240,13 @@ aios の中で LLM を動かす。推論エンジンは llama.cpp (pkg/c/llama.c
 `model` (`ai.gguf`。ゼロから作る `ai-origin.gguf` も) にあり、`aimodel` パッケージが取ってくる:
 
 ```sh
-sudo ap -S aimodel curl                       # llama.cpp も入り、モデルを取ってきて、llama-server がそれで起きる
-llama cli                                     # 端末で話す (/exit か Ctrl-C で終わる。/clear で最初から)
+sudo ap -S aimodel curl                       # llama.cpp も入り、モデルを取ってくる (llama-server は動かさない)
+llama cli                                     # 端末で話す (/exit か Ctrl-C で終わる。/clear で最初から。モデルはここで読みこむ)
+sudo systemctl enable --now llama-server      # API もほしいとき、いつも動かすなら (llama cli はそれにつなぐ)
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
 aimodel status                                # 置いてあるものと配っているもの (sha256)
-sudo aimodel pull                             # 配っているものが変わっていれば取りなおして、起こしなおす
+sudo aimodel pull                             # 配っているものが変わっていれば取りなおす (動いている llama-server は起こしなおす)
 sudo aimodel pull origin                      # ゼロから作った ai-origin.gguf を models/ に置く (llama-server は ai.gguf のまま)
 llama completion -m /var/lib/ai/models/ai-origin.gguf -p "Once upon a time" -n 150 -no-cnv   # 書き出しのつづき (英語のお話)
 ```
@@ -1275,11 +1276,11 @@ llama bench                                   # この機械での速さ (prompt
   モデルをもう 1 つ読みこまない)。サーバーがまだ読みこんでいるところ (起動したばかりなど) なら、読みおわるまで待つ
   (Ctrl-C でやめる。待っているあいだにサーバーが止まったら、そう言って終わる)。
 - `llama-server.service` は base の /etc にあり、`/opt/c/bin/llama` と `/var/lib/ai/model.gguf` の両方が
-  あるときだけ起きる (ConditionPathExists)。起動のたびに動かすのは、aimodel を入れたとき (post_install が
-  `systemctl enable --now`) か、手で `sudo systemctl enable --now llama-server`。モデルは起動のたびに読みこむので
-  (ai.gguf は 3.4 GB)、メモリが少なかったりディスクがおそかったりすると、起動したあとしばらくほかのものが重い。
-  使うときだけ動かすなら `sudo systemctl disable --now llama-server` で、話すときに `sudo systemctl start llama-server`
-  (動いているかは `systemctl is-active llama-server`)。有効にするリンクは base に入れない (入れていたときは、
+  あるときだけ起きる (ConditionPathExists)。はじめは有効にしない (aimodel も有効にしない): モデルは起動のたびに
+  読みこむので (ai.gguf は 3.4 GB)、メモリの少ない aios (Mac は 2-3 GB) ではほかが動けなくなる (起動したばかりの
+  aios で読みこみ、メモリが足りずにカーネルが止まったこともあった)。話すときに `sudo systemctl start llama-server`、
+  いつも動かすなら `sudo systemctl enable --now llama-server` (動いているかは `systemctl is-active llama-server`)。
+  動いていなければ `llama cli` が自分でモデルを読みこむ。有効にするリンクは base に入れない (入れていたときは、
   disable しても base を上げると戻った)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
   `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。
 - 設定は `/etc/systemd/system/llama-server.service.d/local.conf` に `[Service]` と `Environment=LLAMA_ARG_CTX_SIZE=8192
@@ -1304,9 +1305,9 @@ llama bench                                   # この機械での速さ (prompt
 - 取ってくるところは `/etc/aimodel.conf` (`URL` と `SUM`。`ai` でないものは、同じところの `ai-NAME.gguf` と
   `ai-NAME.gguf.sha256`)。`SUM` を空にして `API` に Gitea の contents API を書くと、git に置いたもの (blob の sha1 と
   大きさで確かめる) からも取れる。どちらも空なら、置いてあれば取らず、`aimodel pull -f` でいつも取る。
-- 入れたときは post_install が `aimodel pull` (取れなくても入れるのはしくじらない) と `systemctl enable --now
-  llama-server`、上げたときは `aimodel pull` (新しいモデルがあれば取り、動いている llama-server だけ起こしなおす。
-  disable してあれば、そのまま)、消すときは pre_remove が `aimodel rm` (llama-server を止めて、取ってきたモデル
+- 入れたときは post_install が `aimodel pull` (取れなくても入れるのはしくじらない。llama-server は動かさない)、
+  上げたときは `aimodel pull` (新しいモデルがあれば取り、動いている llama-server だけ起こしなおす。有効かどうかは
+  変えない)、消すときは pre_remove が `aimodel rm` (llama-server を止めて、取ってきたモデル
   (ai-origin も) とリンクを消す。手で向けかえたリンクは残す) と `systemctl disable llama-server`。
   aimodel は llama.cpp と base に頼る (depends) ので、`ap -U` で入れても llama.cpp が先に入り、`ap -Syu` では base が先に上がる。
 

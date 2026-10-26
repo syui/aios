@@ -1,22 +1,20 @@
-# aimodel を入れたら、モデルを取ってきて、llama-server を起動のたびに動くようにして (systemctl enable) 起こす
-# (取れなくても入れるのはしくじらない: あとで sudo aimodel pull)。起動のたびに動かしたくなければ
-# sudo systemctl disable llama-server (上げても戻さない)。上げたときは、新しいモデルがあれば取ってきて、動いている
-# llama-server だけ起こしなおす。消すときは llama-server を止めて、取ってきたモデル (ai-origin なども) を消す
+# aimodel を入れたら、モデルを取ってくる (取れなくても入れるのはしくじらない: あとで sudo aimodel pull)。
+# llama-server は動かさない: 起動のたびに 3.4 GB のモデルを読みこむと、メモリの少ない aios (Mac は 2-3 GB) では
+# ほかが動けなくなる (起動したばかりの aios で読みこんで、メモリが足りずにカーネルが止まったこともある)。
+# 使うときに sudo systemctl start llama-server、いつも動かすなら sudo systemctl enable --now llama-server
+# (llama cli は、llama-server が動いていなければ自分でモデルを読みこむ)。上げたときは、新しいモデルがあれば
+# 取ってきて、動いている llama-server だけ起こしなおす (有効かどうかは変えない)。消すときは llama-server を止めて、
+# 取ってきたモデル (ai-origin なども) を消す
 pull() {
   /opt/c/bin/aimodel pull || echo "aimodel: could not fetch the model now; run: sudo aimodel pull"
 }
 
 post_install() {
   pull
-  systemctl enable --now llama-server > /dev/null 2>&1
+  echo "aimodel: llama-server is not started; to serve the model: sudo systemctl enable --now llama-server"
 }
 
 post_upgrade() {
-  # 0.0.1-3 までは、base が llama-server を有効にしていた (base のパッケージにリンクがあったので、disable しても
-  # base を上げると戻った)。base から外したので、ここで一度だけ有効にする (aimodel は base に頼るので、base が先に上がる)
-  case $2 in
-    0.0.1-[123]) systemctl enable llama-server > /dev/null 2>&1 ;;
-  esac
   pull
 }
 
