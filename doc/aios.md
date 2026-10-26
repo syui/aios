@@ -1253,7 +1253,8 @@ llama bench                                   # この機械での速さ (prompt
   `llama cli` は答えを端末にじかに書くので、ファイルやパイプにつなぐときは `--simple-io` をつける
   (`llama cli -p "こんにちは" -st --simple-io > out.txt`。`-st` は 1 回だけ答えて終わる)。
   モデルを言わない `llama cli` は、llama-server.service が動いていればそれにつなぐ (`--server-base http://127.0.0.1:8080`:
-  モデルをもう 1 つ読みこまない)。サーバーがまだ読みこんでいるところなら、そう言って終わる (待つか、`-m FILE` で)。
+  モデルをもう 1 つ読みこまない)。サーバーがまだ読みこんでいるところ (起動したばかりなど) なら、読みおわるまで待つ
+  (Ctrl-C でやめる。待っているあいだにサーバーが止まったら、そう言って終わる)。
 - `llama-server.service` は base の /etc にあって、はじめから有効。`/opt/c/bin/llama` と `/var/lib/ai/model.gguf` の両方が
   あるときだけ起きる (ConditionPathExists)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
   `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。

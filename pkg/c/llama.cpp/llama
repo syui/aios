@@ -48,23 +48,29 @@ if [ -z "$LLAMA_ARG_MODEL" ] && [ -e "$m" ]; then
   fi
 fi
 # llama cli でモデルを言わず、llama-server.service が動いていれば、それにつなぐ (--server-base): 同じモデルをもう 1 つ
-# 読みこむと、2-3 GB の aios ではメモリが足りずに読みおわらない。サーバーがまだ読みこんでいるところなら、待ってもらう
+# 読みこむと、2-3 GB の aios ではメモリが足りずに読みおわらない。サーバーがまだ読みこんでいるところ (起動したばかり
+# など) なら、読みおわるまで待つ (Ctrl-C でやめる)。待っているあいだにサーバーが止まったら、そう言って終わる
 if [ "$own" = 1 ] && [ "$1" = cli ] && [ "$(systemctl is-active llama-server 2>/dev/null)" = active ]; then
   srv=http://127.0.0.1:8080
   for a in "$@"; do
     case $a in --server-base) srv= ;; esac
   done
   if [ -n "$srv" ]; then
-    case $(fetch "$srv/health" 2>/dev/null) in
-      *'"ok"'*)
-        shift
-        set -- cli --server-base "$srv" "$@"
-        ;;
-      *)
-        echo "llama: llama-server is still loading the model; wait a little (fetch $srv/health), or use -m FILE to load one here" >&2
+    said=
+    until fetch "$srv/health" 2>/dev/null | grep -q '"ok"'; do
+      if [ "$(systemctl is-active llama-server 2>/dev/null)" != active ]; then
+        echo "llama: llama-server stopped while loading the model (systemctl status llama-server); or use -m FILE to load one here" >&2
         exit 1
-        ;;
-    esac
+      fi
+      if [ -z "$said" ]; then
+        echo "llama: llama-server is still loading the model; waiting for it (Ctrl-C to stop, or -m FILE to load one here)" >&2
+        said=1
+      fi
+      sleep 2
+    done
+    [ -z "$said" ] || echo "llama: llama-server is ready" >&2
+    shift
+    set -- cli --server-base "$srv" "$@"
   fi
 fi
 exec "$d/$v/llama" "$@"
