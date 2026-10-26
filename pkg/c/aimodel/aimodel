@@ -1,14 +1,16 @@
 #!/bin/sh
 # aimodel: aios のローカルの AI のモデル (GGUF) を取ってきて、llama-server.service に使わせる
-#   aimodel pull [-f]   配っているものが置いてあるものとちがえば (-f ならいつも) 取ってきて、大きさと sha を確かめて
+#   aimodel pull [-f]   配っているものが置いてあるものとちがえば (-f ならいつも) 取ってきて、sha256 を確かめて
 #                       /var/lib/ai/models/ai.gguf に置き、/var/lib/ai/model.gguf をそれに向けて llama-server を起こしなおす
-#   aimodel status      置いてあるものと配っているもの (git の blob の sha と大きさ)
+#   aimodel status      置いてあるものと配っているもの (sha256)
 #   aimodel rm          llama-server を止めて、置いたモデルを消す
-# どこから取るかは /etc/aimodel.conf (URL と API)。モデルはパッケージに入れない (大きいので、ai/repo の model/ai.gguf から)
+# どこから取るかは /etc/aimodel.conf (URL と SUM)。モデルはパッケージに入れない (大きいので、git.syui.ai の ai/os の
+# リリース model から。bin/gitea.sh model で置く)
 conf=/etc/aimodel.conf
 dir=/var/lib/ai/models
 model=$dir/ai.gguf
-URL=https://git.syui.ai/ai/repo/raw/branch/main/model/ai.gguf
+URL=https://git.syui.ai/ai/os/releases/download/model/ai.gguf
+SUM=https://git.syui.ai/ai/os/releases/download/model/ai.gguf.sha256
 API=
 if [ -r "$conf" ]; then
   . "$conf"
@@ -19,9 +21,15 @@ die() {
   exit 1
 }
 
-# 配っているものの sha と size (API がなければ、取れなければ空)
+# 配っているものの印 (rsha) と大きさ (rsize。わかるときだけ)。SUM があれば NAME.sha256 の sha256 (読めなければ 1:
+# 確かめられないものは入れない)。なければ API (Gitea の contents API) の git の blob の sha1 と size (取れなければ空)
 remote() {
   rsha= rsize=
+  if [ -n "$SUM" ]; then
+    rsha=$(fetch "$SUM" 2>/dev/null | sed -n '1s/^\([0-9a-f]\{64\}\).*/\1/p')
+    [ -n "$rsha" ]
+    return
+  fi
   [ -n "$API" ] || return 0
   j=$(fetch "$API" 2>/dev/null) || return 0
   rsha=$(printf '%s' "$j" | sed -n 's/.*"sha":"\([0-9a-f]*\)".*/\1/p' | head -n 1)
@@ -34,6 +42,15 @@ blobsha() {
   { printf 'blob %s\000' "$n"; cat "$1"; } | sha1sum | cut -d ' ' -f 1
 }
 
+# 置いたものの印 (remote の rsha とくらべるもの)
+digest() {
+  if [ -n "$SUM" ]; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  else
+    blobsha "$1"
+  fi
+}
+
 # llama-server.service が読むリンク (ConditionPathExists もこれを見る)
 link() {
   ln -sfn models/ai.gguf /var/lib/ai/model.gguf
@@ -41,7 +58,7 @@ link() {
 
 pull() {
   [ "$(id -u)" = 0 ] || die "run as root: sudo aimodel pull"
-  remote
+  remote || die "could not read $SUM"
   if [ "$1" != -f ] && [ -f "$model" ] && [ -n "$rsha" ] && [ "$(cat "$model.sha" 2>/dev/null)" = "$rsha" ]; then
     link
     echo "aimodel: up to date ($rsha)"
@@ -57,7 +74,7 @@ pull() {
     rm -f "$new"
     die "size $size, expected $rsize"
   fi
-  sha=$(blobsha "$new")
+  sha=$(digest "$new")
   if [ -n "$rsha" ] && [ "$sha" != "$rsha" ]; then
     rm -f "$new"
     die "sha $sha, expected $rsha (changed while fetching? pull again)"
@@ -72,7 +89,7 @@ pull() {
 }
 
 status() {
-  remote
+  remote || true
   if [ -f "$model" ]; then
     echo "local:  $model $(wc -c < "$model" | tr -d ' ') bytes $(cat "$model.sha" 2>/dev/null)"
   else

@@ -1206,15 +1206,15 @@ aish の MCP (`aish --mcp`) は、新しく見つかったものをどのツー�
 ## ローカルの AI (llama.cpp)
 
 aios の中で LLM を動かす。推論エンジンは llama.cpp (pkg/c/llama.cpp。CPU だけ、静的)、モデルは GGUF、常駐するのは
-`llama-server.service`。どれも aios.img には入れない (大きいので)。aios のモデルは ai/repo の `model/ai.gguf` にあり、
-`aimodel` パッケージが取ってくる:
+`llama-server.service`。どれも aios.img には入れない (大きいので)。aios のモデルは git.syui.ai の ai/os のリリース
+`model` (`ai.gguf`。ゼロから作る `ai-origin.gguf` も) にあり、`aimodel` パッケージが取ってくる:
 
 ```sh
 sudo ap -S aimodel curl                       # llama.cpp も入り、モデルを取ってきて、llama-server がそれで起きる
 llama cli                                     # 端末で話す (/exit か Ctrl-C で終わる。/clear で最初から)
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
-aimodel status                                # 置いてあるものと配っているもの (sha と大きさ)
+aimodel status                                # 置いてあるものと配っているもの (sha256)
 sudo aimodel pull                             # 配っているものが変わっていれば取りなおして、起こしなおす
 ```
 
@@ -1246,12 +1246,15 @@ llama bench                                   # この機械での速さ (prompt
   LLAMA_ARG_THREADS=4` など (llama serve --help に出る LLAMA_ARG_*)。モデルを替えたら `systemctl restart llama-server`。
 - モデルは mmap で読む (ページキャッシュに入り、メモリが足りなければ捨てて読みなおす)。RAM はモデルの大きさと
   コンテキストの KV cache の分がいる。作るときに Web UI はネットから取らないので、ブラウザの画面はなく API だけ。
-- モデルを替えるときは、ai/repo の `model/ai.gguf` を push しなおすだけ (publish は ai/repo の `aarch64/` だけを
-  入れかえるので、`model/` はそのまま)。aios では `sudo aimodel pull`。aimodel は Gitea の contents API の sha
-  (git の blob の sha1) と大きさで、変わったかを見て、取ったものも確かめてから入れかえる。パッケージ (aimodel 0.0.1) は
+- モデルを替えるときは、リリース `model` に置きなおす: `bin/gitea.sh model ai.gguf` (`ai.gguf.sha256` もいっしょに置く。
+  同じ名前のものは置きかえる)。大きいものは Cloudflare をとおすと 502 になる (31 MB はとおり、279 MB はだめだった) ので、
+  サーバーの上で `GITEA_URL=http://127.0.0.1:3000 bin/gitea.sh model ai.gguf` のように Gitea へじかに。git (ai/repo) には
+  入れない (publish が ai/repo の写しを持つので、重くなる)。aios では `sudo aimodel pull`。aimodel は `ai.gguf.sha256` で
+  変わったかを見て、取ったものも確かめてから入れかえる (読めなければ何も変えない)。パッケージ (aimodel 0.0.1) は
   スクリプトと設定だけで、モデルは入っていない。
-- 取ってくるところは `/etc/aimodel.conf` (`URL` と `API`。大きくなって releases などに移したら書きかえる。API が空なら、
-  置いてあれば取らず、`aimodel pull -f` でいつも取る)。
+- 取ってくるところは `/etc/aimodel.conf` (`URL` と `SUM`)。`SUM` を空にして `API` に Gitea の contents API を書くと、
+  git に置いたもの (blob の sha1 と大きさで確かめる) からも取れる。どちらも空なら、置いてあれば取らず、
+  `aimodel pull -f` でいつも取る。
 - 入れたときは post_install が `aimodel pull` (取れなくても入れるのはしくじらない)、消すときは pre_remove が
   `aimodel rm` (llama-server を止めて、取ってきたモデルとリンクを消す。手で向けかえたリンクは残す)。
   aimodel は llama.cpp に頼る (depends) ので、`ap -U` で入れても llama.cpp が先に入る。

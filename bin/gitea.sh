@@ -9,6 +9,10 @@
 #                        置きかえる (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
 #   bin/gitea.sh mirror  GitHub のリリース latest (CI が作って起動をたしかめたもの) をそのまま ai/os の latest に
 #                        (作らないので速い。版とコミットも GitHub のもの)
+#   bin/gitea.sh model FILE...  モデル (GGUF。ai.gguf、ai-origin.gguf など) を ai/os のリリース model に置く
+#                        (同じ名前のものは置きかえる)。aimodel が確かめる FILE.sha256 もいっしょに。大きいものは
+#                        Cloudflare をとおると 502 になる (31 MB はとおり、279 MB はだめだった) ので、サーバーの上で
+#                        GITEA_URL=http://127.0.0.1:3000 bin/gitea.sh model ai.gguf のように Gitea へじかに
 #
 # 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
 #   gpg --batch --import <<'EOF'
@@ -19,12 +23,14 @@
 # 認証は git.syui.ai への通信に環境の API 認証情報がつくのにまかせる
 # (GITEA_TOKEN があればそれを使う。ユーザーは GITEA_USER、既定 ai.syui.ai)。トークンはディスクに書かない
 set -e
+# model の FILE は、呼んだところからのパス
+here=$(pwd)
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -177,6 +183,59 @@ case "$1" in
     call -X POST -F "attachment=@$tmp/$img" "$api/releases/$id/assets?name=$img" > /dev/null
     echo "ai/os: released $tag ($ver, $(du -h "$tmp/$img" | cut -f1))"
     echo "  $host/ai/os/releases/download/$tag/$img"
+    ;;
+  model)
+    # モデルは大きいので git (ai/repo) には入れず、ai/os のリリース model に置く (publish が作りなおすのは latest だけ)。
+    # aimodel は NAME.sha256 (sha256sum の形) で、変わったかを見て、取ったものも確かめる。新しいものは new-NAME で
+    # 上げてから前のものを消して名前を変えるので、NAME がないあいだはほとんどない (NAME.sha256 がないあいだに
+    # aimodel pull すると、しくじって何も変えない)
+    shift
+    [ $# -gt 0 ] || usage
+    for f in "$@"; do
+      case $f in /*) ;; *) f=$here/$f ;; esac
+      [ -f "$f" ] || { echo "ai/os: $f: no such file" >&2; exit 1; }
+    done
+    # GITEA_URL: Gitea へじかに (Cloudflare をとおさずに) 送るとき
+    api=${GITEA_URL:-$host}/api/v1/repos/ai/os
+    tag=model
+    hdr=
+    [ -n "$GITEA_TOKEN" ] && hdr="Authorization: token $GITEA_TOKEN"
+    call() { curl -fsS ${hdr:+-H "$hdr"} "$@"; }
+    jid() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
+    # いま置いてあるものの id (なければ空)
+    asset() {
+      call "$api/releases/$id/assets" | python3 -c 'import json,sys
+print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == sys.argv[1]), ""))' "$1"
+    }
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    id=$(call "$api/releases/tags/$tag" 2>/dev/null | jid 2>/dev/null) || id=
+    if [ -z "$id" ]; then
+      notes=$(printf '%s\n' 'aios のローカルの AI のモデル (GGUF)。aios では `sudo ap -S aimodel` で入り、`sudo aimodel pull` で新しくなる。' '' \
+        '- ai.gguf: llama-server と llama cli が使うもの' '- NAME.sha256: aimodel が確かめる sha256')
+      body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "target_commitish": "main", "name": "model", "body": sys.argv[2], "prerelease": False}))' "$tag" "$notes")
+      id=$(call -X POST -H 'Content-Type: application/json' -d "$body" "$api/releases" | jid)
+      [ -n "$id" ] || { echo "ai/os: could not create the release $tag" >&2; exit 1; }
+    fi
+    for f in "$@"; do
+      case $f in /*) ;; *) f=$here/$f ;; esac
+      name=${f##*/}
+      sum=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d ' ' -f 1)
+      printf '%s  %s\n' "$sum" "$name" > "$tmp/$name.sha256"
+      echo "ai/os: $name ($(du -h "$f" | cut -f1), sha256 $sum)"
+      old=$(asset "new-$name")
+      [ -z "$old" ] || call -X DELETE "$api/releases/$id/assets/$old" > /dev/null
+      # 大きいので、送っているようすを出す
+      curl -fS --progress-bar ${hdr:+-H "$hdr"} -X POST -F "attachment=@$f" -o "$tmp/up.json" "$api/releases/$id/assets?name=new-$name"
+      new=$(jid < "$tmp/up.json")
+      for n in "$name.sha256" "$name"; do
+        old=$(asset "$n")
+        [ -z "$old" ] || call -X DELETE "$api/releases/$id/assets/$old" > /dev/null
+      done
+      call -X PATCH -H 'Content-Type: application/json' -d "{\"name\": \"$name\"}" "$api/releases/$id/assets/$new" > /dev/null
+      call -X POST -F "attachment=@$tmp/$name.sha256" "$api/releases/$id/assets?name=$name.sha256" > /dev/null
+      echo "  $host/ai/os/releases/download/$tag/$name"
+    done
     ;;
   *)
     usage
