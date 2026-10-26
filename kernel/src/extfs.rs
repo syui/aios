@@ -330,6 +330,13 @@ impl<T> Shared<T> {
         let b = self.1.take();
         SharedMut { r: self.0.borrow_mut(), _b: b }
     }
+
+    /// borrow_mut と同じだが、だれかが借りている途中なら None (ExtFs::shrink: メモリを空けるところは、ext4 の中から
+    /// 来ているかもしれない)
+    fn try_borrow_mut(&self) -> Option<SharedMut<'_, T>> {
+        let b = self.1.take();
+        Some(SharedMut { r: self.0.try_borrow_mut().ok()?, _b: b })
+    }
 }
 
 impl<T> core::ops::Deref for SharedRef<'_, T> {
@@ -1221,6 +1228,23 @@ impl ExtFs {
     /// ルートの ext4 (fastdir.rs。ext4 のロックを持って使う)
     pub fn root_fs() -> Option<&'static Rc<ExtFs>> {
         ROOT_FS.get()
+    }
+
+    /// メモリが足りないとき (swap::reclaim): だれも写していない、書いていない古いブロックを n こまで捨てる。ふだんは
+    /// キャッシュが上限をこえたときに 1 つずつ捨てるだけなので、写しの表やページキャッシュが手放したページ (写していた
+    /// 3.4 GB のモデルの、しばらく触れていないところ) は、ここで捨てないと空かない。この CPU が ext4 のロックを
+    /// いっしょに持っているとき (ひとりで持てない) と、キャッシュをさわっている途中なら何もしない。捨てた数
+    pub fn shrink(&self, n: usize) -> usize {
+        if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 && FS_OWNER.load(Ordering::Relaxed) != fs_me() {
+            return 0;
+        }
+        let _e = fs_lock();
+        let Some(mut c) = self.cache.try_borrow_mut() else { return 0 };
+        let mut freed = 0;
+        while freed < n && c.evict_one() {
+            freed += 1;
+        }
+        freed
     }
 
     /// /proc/ai/fs の、このファイルシステムの中の様子 (1 つの JSON のオブジェクト)

@@ -303,6 +303,14 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::swap::reclaim(crate::swap::BATCH, 0) > 0 {
                             r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         }
+                        // それでもなければ、いちばん大きいものを殺して空ける (oom::on_fault)。殺したのが自分でなければ、
+                        // それが終わるのを少し待って、同じ命令からやりなおす (init も殺さずに待つ)
+                        if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::oom::on_fault() {
+                            let _ = proc::sleep_until(0, crate::timer::ticks_after(10_000_000));
+                            proc::check_killed();
+                            signal::deliver(tf, None);
+                            return;
+                        }
                         match r {
                             Ok(()) => {
                                 proc::check_killed();

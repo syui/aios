@@ -1148,6 +1148,8 @@ pub struct PageTable {
     mutators: AtomicUsize,
     /// clock の針 (次にスワップへ追い出すページを探しはじめる va)
     clock: usize,
+    /// reclaim_file の針 (次に外す、写したファイルのページを探しはじめる va)
+    fclock: usize,
     /// 最近の map / protect / unmap (操作, 始め, 終わり, prot)。落ちたときに、そのアドレスにかかわったものを出す (調べもの用)
     hist: alloc::collections::VecDeque<(u8, usize, usize, u8)>,
 }
@@ -1420,7 +1422,7 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, hist: alloc::collections::VecDeque::new() })
+        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new() })
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -2649,6 +2651,88 @@ impl PageTable {
 
     /// clock の針から、追い出せるページを want 枚までスワップへ書き出す。追い出した数を返す。
     /// 見たページの AF が立っていれば落とすだけ (次に回ってきたときまで触れられなければ追い出す)
+    /// 写しているファイルのページで、しばらく触れていないものを外す (Linux もメモリが足りなければファイルのページから
+    /// 捨てる: ディスクにあるので、書いていなければ書き出さずに捨てられる)。選ぶのは swap_out と同じ clock: AF の
+    /// 立っているものは落とすだけ、次に見てまだ落ちていれば外す。外すのは、MAP_SHARED で写しの表にあって書いていない
+    /// ページと、MAP_PRIVATE で書きこみ禁止のまま写したページキャッシュのページ (同じ鍵の同じページ) だけ。
+    /// 外したページは、ほかに写しているものがなければ表からも捨てる (写しの表は release_shared、ページキャッシュは
+    /// 続けて shrink_cache)。次に触れればフォルトで読みなおす。前は写しているあいだ捨てなかったので、3.4 GB の
+    /// モデルを写した llama-server が RAM を使いきり、init のスタックのページも取れずにカーネルが止まった。
+    /// 1 回に見る PTE は want の 64 倍まで (大きな写しの AF を落とすだけで長くかからないように。続きは針から)。外した数
+    pub fn reclaim_file(&mut self, want: usize) -> usize {
+        let _m = self.mutating();
+        let hand = self.fclock;
+        let file = |v: &Vma| matches!(v.back, Backing::File { .. });
+        // ファイルを写した領域を、針のところから一周 (領域の先頭, 見はじめ, 終わり)
+        let mut ranges = Vec::new();
+        for (&s, v) in &self.vmas {
+            if file(v) && v.end > hand {
+                ranges.push((s, s.max(hand), v.end));
+            }
+        }
+        for (&s, v) in &self.vmas {
+            if file(v) && s < hand {
+                ranges.push((s, s, v.end.min(hand)));
+            }
+        }
+        // (PTE, 外す前の PTE, 写しの表の鍵 (MAP_SHARED のとき))
+        let mut victims: Vec<(*mut u64, u64, Option<FileKey>)> = Vec::new();
+        let (mut aged, mut next, mut seen) = (false, 0, 0);
+        let budget = want * 64;
+        for (vs, s, e) in ranges {
+            let v = &self.vmas[&vs];
+            let Backing::File { ino, off, .. } = &v.back else { continue };
+            let shared = v.shared;
+            self.each_pte(s, e, |va, pte| unsafe {
+                if victims.len() >= want || seen >= budget {
+                    return;
+                }
+                seen += 1;
+                next = va + PGSIZE;
+                let ent = *pte;
+                if ent & PTE_VALID == 0 || ent & PTE_RDONLY == 0 {
+                    return;
+                }
+                let page = page_of(ent);
+                let key = file_key(ino, off + (va - vs));
+                let clean = if shared {
+                    shared_file().get(&key).is_some_and(|c| c.page == page && !c.dirty && !c.hole)
+                } else {
+                    PRIV.lock().pages.get(&key).is_some_and(|p| p.page == page)
+                };
+                if !clean {
+                    return;
+                }
+                if ent & PTE_AF != 0 {
+                    *pte = ent & !PTE_AF;
+                    aged = true;
+                } else {
+                    victims.push((pte, ent, shared.then_some(key)));
+                }
+            });
+            if victims.len() >= want || seen >= budget {
+                break;
+            }
+        }
+        // 一周したら針は先頭へ
+        self.fclock = if victims.len() >= want || seen >= budget { next } else { 0 };
+        for &(pte, _, _) in &victims {
+            unsafe { *pte = 0 };
+        }
+        // PTE を外してから (ほかの CPU のスレッドがもう触れないようにして) 参照を返す
+        if aged || !victims.is_empty() {
+            flush_all();
+            self.quiesce();
+        }
+        let mut keys = Vec::new();
+        for &(_, ent, key) in &victims {
+            kalloc::put(page_of(ent));
+            keys.extend(key);
+        }
+        release_shared(&keys);
+        victims.len()
+    }
+
     pub fn swap_out(&mut self, want: usize) -> usize {
         let _m = self.mutating();
         // 自分だけの領域を、針のところから一周

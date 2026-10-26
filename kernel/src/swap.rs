@@ -247,7 +247,13 @@ static HAND: Bkl<usize> = Bkl::new(0);
 /// 空けた数を返す
 pub fn reclaim(want: usize, exclude: usize) -> usize {
     // まずだれも写していないページキャッシュから (読みなおせばよいので、スワップより安い)
-    let cached = crate::vm::shrink_cache(want);
+    let mut cached = crate::vm::shrink_cache(want);
+    if cached >= want {
+        return cached;
+    }
+    // 次に、写しているファイルのページで、しばらく触れていないものを外して捨てる (これも読みなおせばよい。
+    // Linux もスワップより先にファイルのページを捨てる)
+    cached += reclaim_file(want - cached, exclude);
     if cached >= want {
         return cached;
     }
@@ -281,6 +287,34 @@ pub fn reclaim(want: usize, exclude: usize) -> usize {
         *HAND.get() += 1;
     }
     cached + freed
+}
+
+/// 写しているファイルのページを外して空ける (PageTable::reclaim_file を順に。AF を落とすだけのことが多いので何周か)。
+/// 空いた数 (空きのページの数のふえた分)
+fn reclaim_file(want: usize, exclude: usize) -> usize {
+    let before = crate::kalloc::nfree();
+    let mut pts = Vec::new();
+    crate::proc::each_pagetable(|pt| {
+        if pt.id() != exclude {
+            pts.push(pt as *mut crate::vm::PageTable);
+        }
+    });
+    for _ in 0..3 {
+        for &p in &pts {
+            let pt = unsafe { &mut *p };
+            pt.reclaim_file(want.min(BATCH));
+        }
+        // 外したページキャッシュのページは、だれも写していなければ捨てられる。どちらの表も手放したページは、
+        // ext4 のブロックのキャッシュがまだ持っているので、そこからも
+        crate::vm::shrink_cache(want);
+        if let Some(fs) = crate::extfs::ExtFs::root_fs() {
+            fs.shrink(want);
+        }
+        if crate::kalloc::nfree().saturating_sub(before) >= want {
+            break;
+        }
+    }
+    crate::kalloc::nfree().saturating_sub(before)
 }
 
 /// ユーザーへ戻る前に: 空きが少なければ回収しておく

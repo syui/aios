@@ -113,7 +113,18 @@ pub fn heap(fallible: bool) -> bool {
 
 /// 物理ページの alloc をしくじらせるか
 pub fn page() -> bool {
-    ON.load(Relaxed) && take(What::Page).is_some()
+    let hit = ON.load(Relaxed) && take(What::Page).is_some();
+    if hit {
+        PAGE_HIT.store(true, Relaxed);
+    }
+    hit
+}
+
+/// page がしくじらせた (oom::on_fault が見て下ろす: わざと取れなくしたのなら、メモリは足りているので殺す相手を選ばない)
+static PAGE_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn take_page_hit() -> bool {
+    PAGE_HIT.swap(false, Relaxed)
 }
 
 /// /proc/ai/ctl の fail ...

@@ -902,6 +902,25 @@ Gather で。
 test/bigunmap.c は 64 MiB の MAP_SHARED に書いて、munmap、半分ずつの munmap、写したままの exit のあとに、みなファイルに
 書き戻されたかを見る (まとめる数をなんども越える)。
 
+写しているファイルのページは、写しているあいだ捨てなかった (MAP_SHARED は写しの表が、MAP_PRIVATE で読むだけのものは
+ページキャッシュが参照を持ち、swap_out は自分だけの無名のページしか追い出さない)。そのため RAM より大きいファイルを
+写して読むと (llama-server が 3.4 GB のモデルを読みこむ)、RAM が写しのページでいっぱいになり、ページが取れなくなった
+フォルトはそのスレッドを SIGKILL にしていたので、たまたまスタックをのばした init が殺されてカーネルが止まった
+(pid 1: out of memory → init exited with status 9。1G の VM で 1.5 GB を写して読むだけで起きた)。いまは Linux と同じく:
+- スワップの前に、写しているファイルのページでしばらく触れていないものを外して捨てる (PageTable::reclaim_file。
+  swap_out と同じ clock で、AF の立っているものは落とすだけ、落ちたままのものを外す。外すのは、写しの表にあって
+  書いていないページと、書きこみ禁止のまま写したページキャッシュのページだけ。1 回に見る PTE は数をかぎる)。
+  外したページは、ほかに写しているものがなければ写しの表 (release_shared) とページキャッシュ (shrink_cache) から捨て、
+  ext4 のブロックのキャッシュもだれも持っていない古いものを捨てる (ExtFs::shrink。ふだんは上限をこえたときだけ
+  1 つずつ捨てるので、手放したページがそこに残っていた)。次に触れればフォルトで読みなおす。
+- それでもページが取れないフォルトは、いちばんメモリを持っているプロセス (init のほか) を SIGKILL で終わらせて
+  空け、困ったスレッドは少し待って同じ命令からやりなおす (oom::on_fault。Linux の pagefault_out_of_memory)。
+  init は殺さない。空きが足りているのに取れなかったとき、わざと取れなくした (`fail ... page`) なら、いままでどおり
+  困ったものだけを殺し、ほかが返したあとなら、だれも殺さずにやりなおす。
+test/bigmap.c は RAM の 1.5 倍のファイルを MAP_SHARED と MAP_PRIVATE で写して、ページごとの印を 2 回ずつ確かめる。
+test/oomfault.c は RAM とスワップより大きい無名のメモリに書く子が SIGKILL で終わり、そのあいだ書きつづける親が
+生きのこるのを見る (どちらも時間がかかるので ctests には入れない)。
+
 つぎに長く持っていた read と write を分けるため、/proc/bkl の「hold の長いもの」で、1 つめの引数が fd のシステムコール
 (read、write、readv、pread64、ioctl、sendmsg、recvmsg など。syscall::FD_SYS) を、その fd の開いたものの種類
 (file、proc、pipe、unix、inet、eventfd、tty、dev、timerfd、other: file::CLASSES) ごとに「read pipe」のように出すようにした
