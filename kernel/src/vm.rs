@@ -1026,6 +1026,76 @@ fn release_shared(keys: &[FileKey]) {
     }
 }
 
+/// release_shared を鍵の範囲 (PageTable::shared_ranges) ごとに、表から 64 ずつ取り出して。鍵をみな Vec に並べない:
+/// 3.4 GB のモデルを写したものの munmap では何十万もの鍵になり、メモリが足りないときにその 12 MB がヒープから
+/// 取れずにカーネルが止まった
+fn release_shared_ranges(ranges: &[(FileKey, FileKey)]) {
+    let mut buf = [(0usize, 0u64, 0usize); 64];
+    for &(lo, hi) in ranges {
+        let mut from = lo;
+        loop {
+            let mut n = 0;
+            for (k, _) in shared_file().range(from..hi).take(buf.len()) {
+                buf[n] = *k;
+                n += 1;
+            }
+            if n == 0 {
+                break;
+            }
+            release_shared(&buf[..n]);
+            if n < buf.len() {
+                break;
+            }
+            let last = buf[n - 1];
+            from = (last.0, last.1, last.2 + 1);
+        }
+    }
+}
+
+/// 外したページを少しずつまとめて返す (Linux の mmu_gather)。PTE を 0 にしたページを GATHER 枚ためたら、TLB を消して、
+/// ほかの CPU が使い終わるのを待ってから返す。ヒープを使わない (外すページの数だけの Vec は、何 GiB もの領域では
+/// 何 MB にもなり、メモリが足りないときに取れない)
+const GATHER: usize = 128;
+
+struct Gather {
+    root: usize,
+    pages: [*mut u8; GATHER],
+    np: usize,
+    vas: [usize; GATHER],
+    nv: usize,
+}
+
+impl Gather {
+    fn new(root: usize) -> Self {
+        Gather { root, pages: [core::ptr::null_mut(); GATHER], np: 0, vas: [0; GATHER], nv: 0 }
+    }
+
+    /// PTE を 0 にする前に。いっぱいなら先に返す
+    fn add(&mut self, pt: &PageTable, page: *mut u8, va: Option<usize>) {
+        if self.np == GATHER {
+            self.flush(pt);
+        }
+        self.pages[self.np] = page;
+        self.np += 1;
+        if let Some(va) = va {
+            self.vas[self.nv] = va;
+            self.nv += 1;
+        }
+    }
+
+    fn flush(&mut self, pt: &PageTable) {
+        flush_pages_in(self.root, &self.vas[..self.nv]);
+        if self.nv != 0 {
+            pt.quiesce();
+        }
+        for &p in &self.pages[..self.np] {
+            kalloc::put(p);
+        }
+        self.np = 0;
+        self.nv = 0;
+    }
+}
+
 /// 領域の中身のもと
 #[derive(Clone)]
 pub enum Backing {
@@ -1468,10 +1538,10 @@ impl PageTable {
         self.vmas.insert(addr, hi);
     }
 
-    /// [start, end) に写しているファイルのページのうち、写しの表にあるものの鍵 (MAP_SHARED のもの。MAP_PRIVATE のものは
-    /// 穴の 0 のページ)
-    fn shared_keys(&self, start: usize, end: usize) -> Vec<FileKey> {
-        let mut keys = Vec::new();
+    /// [start, end) に写しているファイルのページの、写しの表での鍵の範囲 (領域ごとに 1 つ。MAP_SHARED のものと、
+    /// MAP_PRIVATE の穴の 0 のページ)。release_shared_ranges で、表にあるものだけを返す
+    fn shared_ranges(&self, start: usize, end: usize) -> Vec<(FileKey, FileKey)> {
+        let mut ranges = Vec::new();
         for (&s, v) in self.vmas_in(start, end) {
             if let Backing::File { ino, off, .. } = &v.back {
                 // 表を range で引く (領域のページをみな数えると、大きな MAP_SHARED があれば、munmap と exec (fork した
@@ -1479,10 +1549,10 @@ impl PageTable {
                 let (fs, id) = ino.id();
                 let first = (off + (s.max(start) - s)) / PGSIZE;
                 let last = (off + (v.end.min(end) - PGSIZE - s)) / PGSIZE + 1;
-                keys.extend(shared_file().range((fs, id, first)..(fs, id, last)).map(|(k, _)| *k));
+                ranges.push(((fs, id, first), (fs, id, last)));
             }
         }
-        keys
+        ranges
     }
 
     /// msync: 範囲の書いたページをファイルへ (書き出す印をつけなおす)。sync なら MS_SYNC: そのファイルをディスクへ。
@@ -1561,28 +1631,18 @@ impl PageTable {
         if ranges.is_empty() {
             return;
         }
-        let mut pages = Vec::new();
-        let mut vas = Vec::new();
+        let mut g = Gather::new(self.root_pa());
         for (lo, hi) in ranges {
             self.each_entry(lo, hi, |va, pte| unsafe {
                 if is_swap(*pte) {
                     swap::free(slot_of(*pte));
                 } else {
-                    pages.push(page_of(*pte));
-                    if *pte & PTE_VALID != 0 {
-                        vas.push(va);
-                    }
+                    g.add(self, page_of(*pte), (*pte & PTE_VALID != 0).then_some(va));
                 }
                 *pte = 0;
             });
         }
-        flush_pages_in(self.root_pa(), &vas);
-        if !vas.is_empty() {
-            self.quiesce();
-        }
-        for p in pages {
-            kalloc::put(p);
-        }
+        g.flush(self);
     }
 
     /// [start, end) に領域を置く (前にあったものは外す)。中身は触れたときに作る
@@ -1628,33 +1688,23 @@ impl PageTable {
         }
         self.split(start);
         self.split(end);
-        let file_keys = self.shared_keys(start, end);
+        let files = self.shared_ranges(start, end);
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(&k, _)| k).collect();
         for k in keys {
             self.vmas.remove(&k);
         }
-        // PTE を消して TLB を消してから、ページを返す (ほかの CPU がまだ使っているかもしれない)
-        let mut pages = Vec::new();
-        let mut vas = Vec::new();
+        // PTE を消して TLB を消してから、ページを返す (ほかの CPU がまだ使っているかもしれない)。GATHER 枚ずつ
+        let mut g = Gather::new(self.root_pa());
         self.each_entry(start, end, |va, pte| unsafe {
             if is_swap(*pte) {
                 swap::free(slot_of(*pte));
             } else {
-                pages.push(page_of(*pte));
-                if *pte & PTE_VALID != 0 {
-                    vas.push(va);
-                }
+                g.add(self, page_of(*pte), (*pte & PTE_VALID != 0).then_some(va));
             }
             *pte = 0;
         });
-        flush_pages_in(self.root_pa(), &vas);
-        if !vas.is_empty() {
-            self.quiesce();
-        }
-        for p in pages {
-            kalloc::put(p);
-        }
-        release_shared(&file_keys);
+        g.flush(self);
+        release_shared_ranges(&files);
     }
 
     /// [start, end) のページを捨てる (領域は残す。次に触れたら作りなおす: MADV_DONTNEED)
@@ -1666,29 +1716,19 @@ impl PageTable {
                 shared.push((s.max(start), v.end.min(end)));
             }
         }
-        let mut pages = Vec::new();
-        let mut vas = Vec::new();
+        let mut g = Gather::new(self.root_pa());
         self.each_entry(start, end, |va, pte| unsafe {
             // 共有のメモリは捨てない (ほかのプロセスが使っている)
             if !shared.iter().any(|&(s, e)| s <= va && va < e) {
                 if is_swap(*pte) {
                     swap::free(slot_of(*pte));
                 } else {
-                    pages.push(page_of(*pte));
-                    if *pte & PTE_VALID != 0 {
-                        vas.push(va);
-                    }
+                    g.add(self, page_of(*pte), (*pte & PTE_VALID != 0).then_some(va));
                 }
                 *pte = 0;
             }
         });
-        flush_pages_in(self.root_pa(), &vas);
-        if !vas.is_empty() {
-            self.quiesce();
-        }
-        for p in pages {
-            kalloc::put(p);
-        }
+        g.flush(self);
     }
 
     /// mprotect。領域でないところが混じっていれば ENOMEM (Err)
@@ -2726,7 +2766,7 @@ impl Drop for PageTable {
             let _ = a.compare_exchange(root, 0, Ordering::Relaxed, Ordering::Relaxed);
         }
         let _m = self.mutating();
-        let file_keys = self.shared_keys(0, MAXVA);
+        let files = self.shared_ranges(0, MAXVA);
         fn free_level(table: *mut u64, level: usize) {
             for i in 0..512 {
                 let e = unsafe { *table.add(i) };
@@ -2743,6 +2783,6 @@ impl Drop for PageTable {
             kalloc::free(table as *mut u8);
         }
         free_level(self.root, 1);
-        release_shared(&file_keys);
+        release_shared_ranges(&files);
     }
 }

@@ -891,6 +891,17 @@ start より前に始まるもので start にかかりうるのは、最後の 
 129〜274 µs → 30 µs (領域のない mmap は 24 µs)。Firefox の munmap は 1 回 154〜218 → 76〜93 µs、ロックを持った合計は
 980〜1290 → 400〜470 ms になり、いちばん長く持つものではなくなった。
 
+munmap と、アドレス空間を捨てるとき (exit、exec) は、外すページと写しの表の鍵を、はじめにみな Vec に集めていた。
+3.4 GB のモデル (ai.gguf) を写した llama-server を止めると、鍵が何十万にもなり、その Vec が 12 MB をヒープにほしがる
+(2 MiB の予備にも入らない)。2 GB の aios ではモデルでメモリがいっぱいで取れず、`sudo poweroff` でカーネルが止まった
+(memory allocation of 12582912 bytes failed、sys_munmap → shared_keys)。いまは Linux の mmu_gather と同じく少しずつ返す:
+PTE を 0 にしたページを 128 枚ためたら TLB を消して返し (Gather)、写しの表は領域ごとの鍵の範囲 (shared_ranges) から
+64 ずつ取り出して返す (release_shared_ranges)。どちらもヒープを使わないので、メモリが足りないときも外せる。
+同じ形だった MADV_DONTNEED (discard) と、縮めたファイルのページをみなのアドレス空間から外すところ (drop_file_range) も
+Gather で。
+test/bigunmap.c は 64 MiB の MAP_SHARED に書いて、munmap、半分ずつの munmap、写したままの exit のあとに、みなファイルに
+書き戻されたかを見る (まとめる数をなんども越える)。
+
 つぎに長く持っていた read と write を分けるため、/proc/bkl の「hold の長いもの」で、1 つめの引数が fd のシステムコール
 (read、write、readv、pread64、ioctl、sendmsg、recvmsg など。syscall::FD_SYS) を、その fd の開いたものの種類
 (file、proc、pipe、unix、inet、eventfd、tty、dev、timerfd、other: file::CLASSES) ごとに「read pipe」のように出すようにした
