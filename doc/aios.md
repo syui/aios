@@ -1227,6 +1227,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   -d '{"messages":[{"role":"user","content":"こんにちは"}]}'
 aimodel status                                # 置いてあるものと配っているもの (sha256)
 sudo aimodel pull                             # 配っているものが変わっていれば取りなおして、起こしなおす
+sudo aimodel pull origin                      # ゼロから作った ai-origin.gguf を models/ に置く (llama-server は ai.gguf のまま)
+llama completion -m /var/lib/ai/models/ai-origin.gguf -p "Once upon a time" -n 150 -no-cnv   # 書き出しのつづき (英語のお話)
 ```
 
 ほかのモデルを手で置くとき (aimodel は入れない。入れると /var/lib/ai/model.gguf はそちらのものになる):
@@ -1271,11 +1273,14 @@ llama bench                                   # この機械での速さ (prompt
   入れない (publish が ai/repo の写しを持つので、重くなる)。aios では `sudo aimodel pull`。aimodel は `ai.gguf.sha256` で
   変わったかを見て、取ったものも確かめてから入れかえる (読めなければ何も変えない)。パッケージ (aimodel 0.0.1) は
   スクリプトと設定だけで、モデルは入っていない。
-- 取ってくるところは `/etc/aimodel.conf` (`URL` と `SUM`)。`SUM` を空にして `API` に Gitea の contents API を書くと、
-  git に置いたもの (blob の sha1 と大きさで確かめる) からも取れる。どちらも空なら、置いてあれば取らず、
-  `aimodel pull -f` でいつも取る。
+- `aimodel pull|status|rm` は NAME を取る: なければ `ai` (`ai.gguf`。`/var/lib/ai/model.gguf` をそれに向けて llama-server を
+  起こしなおす)、`origin` は `ai-origin.gguf` (置くだけ。ゼロから作った 15.7M のモデルで、会話ではなく書き出しのつづきを書く。
+  一度に見るのは 256 トークンまで)。ほかの名前は `ai-NAME.gguf`。`sudo aimodel rm origin` は ai-origin だけを消す。
+- 取ってくるところは `/etc/aimodel.conf` (`URL` と `SUM`。`ai` でないものは、同じところの `ai-NAME.gguf` と
+  `ai-NAME.gguf.sha256`)。`SUM` を空にして `API` に Gitea の contents API を書くと、git に置いたもの (blob の sha1 と
+  大きさで確かめる) からも取れる。どちらも空なら、置いてあれば取らず、`aimodel pull -f` でいつも取る。
 - 入れたときは post_install が `aimodel pull` (取れなくても入れるのはしくじらない)、消すときは pre_remove が
-  `aimodel rm` (llama-server を止めて、取ってきたモデルとリンクを消す。手で向けかえたリンクは残す)。
+  `aimodel rm` (llama-server を止めて、取ってきたモデル (ai-origin も) とリンクを消す。手で向けかえたリンクは残す)。
   aimodel は llama.cpp に頼る (depends) ので、`ap -U` で入れても llama.cpp が先に入る。
 
 ## 改造 (aios src / build / install)

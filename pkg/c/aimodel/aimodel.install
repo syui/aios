@@ -1,5 +1,5 @@
 # aimodel を入れた・上げたら、モデルを取ってきて llama-server をそれで起こす (取れなくても入れるのはしくじらない:
-# あとで sudo aimodel pull)。消すときは llama-server を止めて、取ってきたモデルを消す
+# あとで sudo aimodel pull)。消すときは llama-server を止めて、取ってきたモデル (ai-origin なども) を消す
 post_install() {
   /opt/c/bin/aimodel pull || echo "aimodel: could not fetch the model now; run: sudo aimodel pull"
 }
@@ -10,4 +10,10 @@ post_upgrade() {
 
 pre_remove() {
   /opt/c/bin/aimodel rm
+  # ai-origin など、ほかに取ってきたもの (NAME.gguf.sha があるもの)
+  for s in /var/lib/ai/models/ai-*.gguf.sha; do
+    [ -e "$s" ] || continue
+    n=${s##*/}
+    /opt/c/bin/aimodel rm "${n%.gguf.sha}"
+  done
 }

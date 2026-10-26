@@ -3,10 +3,11 @@
 # /var/lib/ai/models/ai.gguf に取ってきて (ai.gguf.sha256 で確かめる)、llama-server がそれで起きる。
 # モデルはパッケージにも aios.img にも git (ai/repo) にも入れない (大きいので)。モデルを替えるときは
 # bin/gitea.sh model ai.gguf でリリースに置きなおす。aios では sudo aimodel pull (変わっていれば取る)。
+# ゼロから作った ai-origin.gguf は sudo aimodel pull origin で、となりに置くだけ (llama-server は ai.gguf のまま)。
 # どこから取るかは /etc/aimodel.conf (URL と SUM)
 pkgname=aimodel
 pkgver=0.0.1
-pkgrel=2
+pkgrel=3
 pkgdesc='Fetches the model (GGUF) of the local AI on aios from the ai/os release model and serves it with llama-server.service'
 arch=('any')
 url='https://git.syui.ai/ai/os/releases/tag/model'

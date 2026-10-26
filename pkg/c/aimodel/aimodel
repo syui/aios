@@ -1,14 +1,16 @@
 #!/bin/sh
 # aimodel: aios のローカルの AI のモデル (GGUF) を取ってきて、llama-server.service に使わせる
-#   aimodel pull [-f]   配っているものが置いてあるものとちがえば (-f ならいつも) 取ってきて、sha256 を確かめて
-#                       /var/lib/ai/models/ai.gguf に置き、/var/lib/ai/model.gguf をそれに向けて llama-server を起こしなおす
-#   aimodel status      置いてあるものと配っているもの (sha256)
-#   aimodel rm          llama-server を止めて、置いたモデルを消す
-# どこから取るかは /etc/aimodel.conf (URL と SUM)。モデルはパッケージに入れない (大きいので、git.syui.ai の ai/os の
-# リリース model から。bin/gitea.sh model で置く)
+#   aimodel pull [NAME] [-f]   配っているものが置いてあるものとちがえば (-f ならいつも) 取ってきて、sha256 を確かめて
+#                              /var/lib/ai/models/ に置く。NAME がなければ (ai) ai.gguf: /var/lib/ai/model.gguf を
+#                              それに向けて llama-server を起こしなおす。origin なら ai-origin.gguf (ゼロから作ったもの):
+#                              置くだけで、llama-server はそのまま (llama completion -m で使う)
+#   aimodel status [NAME]      置いてあるものと配っているもの (sha256)
+#   aimodel rm [NAME]          置いたモデルを消す (ai なら llama-server を止めて)
+# NAME は ai、origin (ai-origin)、ほかの ai-NAME。どこから取るかは /etc/aimodel.conf (URL と SUM)。ai でないものは、
+# URL と SUM と同じところの ai-NAME.gguf と ai-NAME.gguf.sha256。モデルはパッケージに入れない (大きいので、
+# git.syui.ai の ai/os のリリース model から。bin/gitea.sh model で置く)
 conf=/etc/aimodel.conf
 dir=/var/lib/ai/models
-model=$dir/ai.gguf
 URL=https://git.syui.ai/ai/os/releases/download/model/ai.gguf
 SUM=https://git.syui.ai/ai/os/releases/download/model/ai.gguf.sha256
 API=
@@ -21,17 +23,40 @@ die() {
   exit 1
 }
 
-# 配っているものの印 (rsha) と大きさ (rsize。わかるときだけ)。SUM があれば NAME.sha256 の sha256 (読めなければ 1:
-# 確かめられないものは入れない)。なければ API (Gitea の contents API) の git の blob の sha1 と size (取れなければ空)
+usage() {
+  echo "usage: aimodel pull [NAME] [-f] | status [NAME] | rm [NAME]   (NAME: ai, origin)" >&2
+  exit 2
+}
+
+# NAME (ai、origin、ai-origin、ai-origin.gguf) を選ぶ: name (ai-origin)、model (置くところ)、url と sum と api (取るところ)
+pick() {
+  name=${1:-ai}
+  name=${name%.gguf}
+  case $name in
+    */* | .* | '') die "bad model name: $1" ;;
+    ai | ai-*) ;;
+    *) name=ai-$name ;;
+  esac
+  model=$dir/$name.gguf
+  url=$URL sum=$SUM api=$API
+  if [ "$name" != ai ]; then
+    url=${URL%/*}/$name.gguf
+    [ -z "$SUM" ] || sum=${SUM%/*}/$name.gguf.sha256
+    api=$(printf '%s' "$API" | sed "s|/ai\.gguf|/$name.gguf|")
+  fi
+}
+
+# 配っているものの印 (rsha) と大きさ (rsize。わかるときだけ)。sum があれば NAME.sha256 の sha256 (読めなければ 1:
+# 確かめられないものは入れない)。なければ api (Gitea の contents API) の git の blob の sha1 と size (取れなければ空)
 remote() {
   rsha= rsize=
-  if [ -n "$SUM" ]; then
-    rsha=$(fetch "$SUM" 2>/dev/null | sed -n '1s/^\([0-9a-f]\{64\}\).*/\1/p')
+  if [ -n "$sum" ]; then
+    rsha=$(fetch "$sum" 2>/dev/null | sed -n '1s/^\([0-9a-f]\{64\}\).*/\1/p')
     [ -n "$rsha" ]
     return
   fi
-  [ -n "$API" ] || return 0
-  j=$(fetch "$API" 2>/dev/null) || return 0
+  [ -n "$api" ] || return 0
+  j=$(fetch "$api" 2>/dev/null) || return 0
   rsha=$(printf '%s' "$j" | sed -n 's/.*"sha":"\([0-9a-f]*\)".*/\1/p' | head -n 1)
   rsize=$(printf '%s' "$j" | sed -n 's/.*"size":\([0-9]*\).*/\1/p' | head -n 1)
 }
@@ -44,31 +69,51 @@ blobsha() {
 
 # 置いたものの印 (remote の rsha とくらべるもの)
 digest() {
-  if [ -n "$SUM" ]; then
+  if [ -n "$sum" ]; then
     sha256sum "$1" | cut -d ' ' -f 1
   else
     blobsha "$1"
   fi
 }
 
-# llama-server.service が読むリンク (ConditionPathExists もこれを見る)
+# llama-server.service が読むリンク (ConditionPathExists もこれを見る)。ai のときだけ
 link() {
-  ln -sfn models/ai.gguf /var/lib/ai/model.gguf
+  if [ "$name" = ai ]; then
+    ln -sfn models/ai.gguf /var/lib/ai/model.gguf
+  fi
+}
+
+# 使いかた (ai でないもの)
+hint() {
+  if [ "$name" != ai ]; then
+    echo "aimodel: llama completion -m $model -p \"Once upon a time\" -n 150 -no-cnv"
+  fi
 }
 
 pull() {
-  [ "$(id -u)" = 0 ] || die "run as root: sudo aimodel pull"
-  remote || die "could not read $SUM"
-  if [ "$1" != -f ] && [ -f "$model" ] && [ -n "$rsha" ] && [ "$(cat "$model.sha" 2>/dev/null)" = "$rsha" ]; then
+  force=
+  n=
+  for a in "$@"; do
+    case $a in
+      -f) force=1 ;;
+      -*) usage ;;
+      *) [ -z "$n" ] || usage; n=$a ;;
+    esac
+  done
+  pick "$n"
+  [ "$(id -u)" = 0 ] || die "run as root: sudo aimodel pull${n:+ $n}"
+  remote || die "could not read $sum"
+  if [ -z "$force" ] && [ -f "$model" ] && [ -n "$rsha" ] && [ "$(cat "$model.sha" 2>/dev/null)" = "$rsha" ]; then
     link
-    echo "aimodel: up to date ($rsha)"
+    echo "aimodel: $name is up to date ($rsha)"
+    hint
     return 0
   fi
   mkdir -p "$dir"
-  new=$dir/.ai.gguf.new
-  echo "aimodel: fetching $URL"
+  new=$dir/.$name.gguf.new
+  echo "aimodel: fetching $url"
   # 切れたら、もういちど pull すれば続きから (fetch -o は FILE.part に書いてから入れかえる)
-  fetch "$URL" -o "$new" || die "download failed: $URL"
+  fetch "$url" -o "$new" || die "download failed: $url"
   size=$(wc -c < "$new" | tr -d ' ')
   if [ -n "$rsize" ] && [ "$size" != "$rsize" ]; then
     rm -f "$new"
@@ -82,41 +127,45 @@ pull() {
   chmod 644 "$new"
   mv -f "$new" "$model"
   echo "$sha" > "$model.sha"
-  link
-  # init のいないところ (chroot など) では systemctl がしくじるだけ
-  systemctl restart llama-server > /dev/null 2>&1
+  if [ "$name" = ai ]; then
+    link
+    # init のいないところ (chroot など) では systemctl がしくじるだけ
+    systemctl restart llama-server > /dev/null 2>&1
+  fi
   echo "aimodel: $model ($size bytes, $sha)"
+  hint
 }
 
 status() {
+  pick "$1"
   remote || true
   if [ -f "$model" ]; then
     echo "local:  $model $(wc -c < "$model" | tr -d ' ') bytes $(cat "$model.sha" 2>/dev/null)"
   else
-    echo "local:  none (sudo aimodel pull)"
+    echo "local:  none (sudo aimodel pull${1:+ $1})"
   fi
-  echo "remote: $URL ${rsize:-?} bytes ${rsha:-?}"
+  echo "remote: $url ${rsize:-?} bytes ${rsha:-?}"
   if [ -n "$rsha" ] && [ "$(cat "$model.sha" 2>/dev/null)" != "$rsha" ]; then
-    echo "a new model is there: sudo aimodel pull"
+    echo "a new model is there: sudo aimodel pull${1:+ $1}"
   fi
 }
 
 rm_model() {
-  [ "$(id -u)" = 0 ] || die "run as root: sudo aimodel rm"
-  systemctl stop llama-server > /dev/null 2>&1
-  # 手で向けかえたリンクは残す
-  if [ "$(readlink /var/lib/ai/model.gguf 2>/dev/null)" = models/ai.gguf ]; then
-    rm -f /var/lib/ai/model.gguf
+  pick "$1"
+  [ "$(id -u)" = 0 ] || die "run as root: sudo aimodel rm${1:+ $1}"
+  if [ "$name" = ai ]; then
+    systemctl stop llama-server > /dev/null 2>&1
+    # 手で向けかえたリンクは残す
+    if [ "$(readlink /var/lib/ai/model.gguf 2>/dev/null)" = models/ai.gguf ]; then
+      rm -f /var/lib/ai/model.gguf
+    fi
   fi
-  rm -f "$model" "$model.sha" "$dir/.ai.gguf.new" "$dir/.ai.gguf.new.part"
+  rm -f "$model" "$model.sha" "$dir/.$name.gguf.new" "$dir/.$name.gguf.new.part"
 }
 
 case $1 in
-  pull) pull "$2" ;;
-  status) status ;;
-  rm) rm_model ;;
-  *)
-    echo "usage: aimodel pull [-f] | status | rm" >&2
-    exit 2
-    ;;
+  pull) shift; pull "$@" ;;
+  status) [ $# -le 2 ] || usage; status "$2" ;;
+  rm) [ $# -le 2 ] || usage; rm_model "$2" ;;
+  *) usage ;;
 esac
