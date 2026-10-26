@@ -1382,7 +1382,7 @@ pub fn wake_tid(tid: u32, chan: usize) -> bool {
 /// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
 /// 外で .eh_frame を使って呼び出しの並びをたどるため (フレームポインタのないプログラム)
 pub fn raw_dump(tid: u32) {
-    let Some(p) = find(tid) else { return };
+    let Some(p) = find(tid).filter(|p| p.mm.is_some()) else { return };
     let tf = p.tf_ref();
     crate::println!("raw regs pc {:x} sp {:x}", tf.elr, tf.sp_el0);
     for i in 0..31 {
@@ -1468,6 +1468,12 @@ fn exit_status(status: i32) -> ! {
     p.files = None;
     crate::unix::gc_check(true);
     p.timers.clear();
+    // アドレス空間はここで捨てる (Linux の exit_mm と同じ)。前は親が wait するまでゾンビが持っていたので、OOM で
+    // 殺したものが終わっても、親が片付けるまでメモリが戻らず、そのあいだに次のものまで殺していた。ゾンビの
+    // /proc/PID/stat と status の大きさは 0 になる (Linux と同じ)。外してから捨てる (exec と同じ。もうユーザーの
+    // アドレスには触らない)。ほかのスレッドがまだ使っていれば、捨てるのは最後のスレッド
+    crate::vm::deactivate();
+    p.mm = None;
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
     if let Some(parent) = find(p.ppid) {

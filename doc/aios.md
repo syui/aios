@@ -917,6 +917,9 @@ test/bigunmap.c は 64 MiB の MAP_SHARED に書いて、munmap、半分ずつ�
   空け、困ったスレッドは少し待って同じ命令からやりなおす (oom::on_fault。Linux の pagefault_out_of_memory)。
   init は殺さない。空きが足りているのに取れなかったとき、わざと取れなくした (`fail ... page`) なら、いままでどおり
   困ったものだけを殺し、ほかが返したあとなら、だれも殺さずにやりなおす。
+- 終わったプロセスのアドレス空間は、終わったときに捨てる (Linux の exit_mm)。前は親が wait するまでゾンビが
+  持っていたので、殺したものが終わっても親が片付けるまでメモリが戻らず、そのすきに 2 つめ (親) まで殺していた。
+  ゾンビの /proc/PID/stat と status の大きさは 0 (Linux と同じ)。
 test/bigmap.c は RAM の 1.5 倍のファイルを MAP_SHARED と MAP_PRIVATE で写して、ページごとの印を 2 回ずつ確かめる。
 test/oomfault.c は RAM とスワップより大きい無名のメモリに書く子が SIGKILL で終わり、そのあいだ書きつづける親が
 生きのこるのを見る (どちらも時間がかかるので ctests には入れない)。
