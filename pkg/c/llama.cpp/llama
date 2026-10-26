@@ -36,12 +36,35 @@ if [ -z "$LLAMA_ARG_MODEL" ] && [ -e "$m" ]; then
     esac
   done
   if [ -n "$m" ]; then
+    own=1
     export LLAMA_ARG_MODEL="$m"
+    # llama-server.service と同じく、考えごと (thinking) なしで答える (--reasoning on で考える)
+    export LLAMA_ARG_REASONING="${LLAMA_ARG_REASONING:-off}"
     # llama bench は LLAMA_ARG_* を読まないので -m で渡す
     if [ "$1" = bench ]; then
       shift
       set -- bench -m "$m" "$@"
     fi
+  fi
+fi
+# llama cli でモデルを言わず、llama-server.service が動いていれば、それにつなぐ (--server-base): 同じモデルをもう 1 つ
+# 読みこむと、2-3 GB の aios ではメモリが足りずに読みおわらない。サーバーがまだ読みこんでいるところなら、待ってもらう
+if [ "$own" = 1 ] && [ "$1" = cli ] && [ "$(systemctl is-active llama-server 2>/dev/null)" = active ]; then
+  srv=http://127.0.0.1:8080
+  for a in "$@"; do
+    case $a in --server-base) srv= ;; esac
+  done
+  if [ -n "$srv" ]; then
+    case $(fetch "$srv/health" 2>/dev/null) in
+      *'"ok"'*)
+        shift
+        set -- cli --server-base "$srv" "$@"
+        ;;
+      *)
+        echo "llama: llama-server is still loading the model; wait a little (fetch $srv/health), or use -m FILE to load one here" >&2
+        exit 1
+        ;;
+    esac
   fi
 fi
 exec "$d/$v/llama" "$@"

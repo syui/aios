@@ -1250,13 +1250,21 @@ llama bench                                   # この機械での速さ (prompt
   `-m` (や `-hf`、`--models-dir`) も `LLAMA_ARG_MODEL` もなければ、`/var/lib/ai/model.gguf` を使う (`llama cli` だけで話せる)。
   `llama cli` は答えを端末にじかに書くので、ファイルやパイプにつなぐときは `--simple-io` をつける
   (`llama cli -p "こんにちは" -st --simple-io > out.txt`。`-st` は 1 回だけ答えて終わる)。
+  モデルを言わない `llama cli` は、llama-server.service が動いていればそれにつなぐ (`--server-base http://127.0.0.1:8080`:
+  モデルをもう 1 つ読みこまない)。サーバーがまだ読みこんでいるところなら、そう言って終わる (待つか、`-m FILE` で)。
 - `llama-server.service` は base の /etc にあって、はじめから有効。`/opt/c/bin/llama` と `/var/lib/ai/model.gguf` の両方が
   あるときだけ起きる (ConditionPathExists)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
   `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。
 - 設定は `/etc/systemd/system/llama-server.service.d/local.conf` に `[Service]` と `Environment=LLAMA_ARG_CTX_SIZE=8192
   LLAMA_ARG_THREADS=4` など (llama serve --help に出る LLAMA_ARG_*)。モデルを替えたら `systemctl restart llama-server`。
+  会話の長さはふつう 4096 (`LLAMA_ARG_CTX_SIZE`。言わなければ llama.cpp はモデルの学んだ長さ、Gemma 4 なら 131072 の
+  KV cache を取ろうとして、`failed to fit params` になる)。
+  答える前の考えごと (thinking) はしない (`LLAMA_ARG_REASONING=off`。Gemma 4 は 100-200 トークン考えてから答えるので、
+  CPU ではそのぶん待つ。考えさせたいときは local.conf で `LLAMA_ARG_REASONING=auto`、`llama cli` なら `--reasoning on`)。
 - モデルは mmap で読む (ページキャッシュに入り、メモリが足りなければ捨てて読みなおす)。RAM はモデルの大きさと
   コンテキストの KV cache の分がいる。作るときに Web UI はネットから取らないので、ブラウザの画面はなく API だけ。
+  ai.gguf (Gemma 4 E2B、3.4 GB) は、llama-server が動いて 1.8-2.7 GB ほど使う。Mac の aios はふつう 2G なので、
+  `AIOS_MEM=3G ./bin/run.sh` で (hvf は highmem=off なので 3G まで)。2G ではモデルを読みなおしつづけて重い。
 - モデルを替えるときは、リリース `model` に置きなおす: `bin/gitea.sh model ai.gguf` (`ai.gguf.sha256` もいっしょに置く。
   同じ名前のものは置きかえる)。大きいものは Cloudflare をとおすと 502 になる (31 MB はとおり、279 MB はだめだった) ので、
   サーバーの上で `GITEA_URL=http://127.0.0.1:3000 bin/gitea.sh model ai.gguf` のように Gitea へじかに。git (ai/repo) には

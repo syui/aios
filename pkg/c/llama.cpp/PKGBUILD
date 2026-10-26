@@ -3,7 +3,7 @@
 #   CPU の命令ごとに 3 本 (armv8.0: cortex-a72 や QEMU、armv8.2 + dotprod + fp16: cortex-a76 や Apple M1、
 #   armv8.6 + i8mm: Apple M2 から) を /opt/c/lib/llama.cpp に置き、/opt/c/bin/llama (llama-server、llama-cli も) が
 #   /proc/cpuinfo の Features を見て合うものを動かす (LLAMA_CPU=armv8.0 などで選べる。-m がなければ
-#   /var/lib/ai/model.gguf を使う)。ggml の CPU の速さは dotprod と
+#   /var/lib/ai/model.gguf を使い、llama cli は llama-server が動いていればそれにつなぐ)。ggml の CPU の速さは dotprod と
 #   i8mm でほぼ決まるので、いちばん下のものだけにはしない。upstream の GGML_CPU_ALL_VARIANTS (ggml の CPU の道を
 #   .so にして dlopen) は、Zig の c++ だと共有ライブラリごとに libc++ を持つので使わない。
 #   OpenMP なし (ggml のスレッドの輪)、OpenSSL なし (モデルは自分で置く: llama download は使わない)、Web UI は
@@ -12,7 +12,7 @@
 #   etc/systemd/system/llama-server.service が起動のたびに 127.0.0.1:8080 で動かす (doc/aios.md の「ローカルの AI」)
 pkgname=llama.cpp
 pkgver=11887
-pkgrel=2
+pkgrel=3
 pkgdesc='LLM inference in C/C++: the llama binary (server, cli, bench, quantize), static, CPU variants for aios'
 arch=('aarch64')
 url='https://github.com/ggml-org/llama.cpp'

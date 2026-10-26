@@ -14,7 +14,11 @@ After=networkd.service
 
 [Service]
 User=nobody
-Environment=LLAMA_ARG_MODEL=/var/lib/ai/model.gguf LLAMA_ARG_HOST=127.0.0.1 LLAMA_ARG_PORT=8080
+# LLAMA_ARG_CTX_SIZE: 言わなければ llama.cpp はモデルの学んだ長さ (Gemma 4 は 131072) の会話の入れ物 (KV cache) を取り、
+# 2-3 GB の aios では入らない (failed to fit params)。4096 なら足りる (長くしたいときは local.conf で)
+# LLAMA_ARG_REASONING=off: 答える前の考えごと (thinking) をしない。Gemma 4 はふつう 100-200 トークン考えてから答えるので、
+# CPU では答えがそれだけおそくなる (考えたいときは local.conf で auto に。API なら chat_template_kwargs の enable_thinking)
+Environment=LLAMA_ARG_MODEL=/var/lib/ai/model.gguf LLAMA_ARG_HOST=127.0.0.1 LLAMA_ARG_PORT=8080 LLAMA_ARG_CTX_SIZE=4096 LLAMA_ARG_REASONING=off
 ExecStart=/opt/c/bin/llama serve
 Restart=on-failure
 RestartSec=5
