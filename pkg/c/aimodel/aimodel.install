@@ -1,15 +1,28 @@
-# aimodel を入れた・上げたら、モデルを取ってきて llama-server をそれで起こす (取れなくても入れるのはしくじらない:
-# あとで sudo aimodel pull)。消すときは llama-server を止めて、取ってきたモデル (ai-origin なども) を消す
-post_install() {
+# aimodel を入れたら、モデルを取ってきて、llama-server を起動のたびに動くようにして (systemctl enable) 起こす
+# (取れなくても入れるのはしくじらない: あとで sudo aimodel pull)。起動のたびに動かしたくなければ
+# sudo systemctl disable llama-server (上げても戻さない)。上げたときは、新しいモデルがあれば取ってきて、動いている
+# llama-server だけ起こしなおす。消すときは llama-server を止めて、取ってきたモデル (ai-origin なども) を消す
+pull() {
   /opt/c/bin/aimodel pull || echo "aimodel: could not fetch the model now; run: sudo aimodel pull"
 }
 
+post_install() {
+  pull
+  systemctl enable --now llama-server > /dev/null 2>&1
+}
+
 post_upgrade() {
-  post_install
+  # 0.0.1-3 までは、base が llama-server を有効にしていた (base のパッケージにリンクがあったので、disable しても
+  # base を上げると戻った)。base から外したので、ここで一度だけ有効にする (aimodel は base に頼るので、base が先に上がる)
+  case $2 in
+    0.0.1-[123]) systemctl enable llama-server > /dev/null 2>&1 ;;
+  esac
+  pull
 }
 
 pre_remove() {
   /opt/c/bin/aimodel rm
+  systemctl disable llama-server > /dev/null 2>&1
   # ai-origin など、ほかに取ってきたもの (NAME.gguf.sha があるもの)
   for s in /var/lib/ai/models/ai-*.gguf.sha; do
     [ -e "$s" ] || continue

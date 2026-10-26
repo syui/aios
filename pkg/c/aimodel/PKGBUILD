@@ -7,12 +7,12 @@
 # どこから取るかは /etc/aimodel.conf (URL と SUM)
 pkgname=aimodel
 pkgver=0.0.1
-pkgrel=3
+pkgrel=4
 pkgdesc='Fetches the model (GGUF) of the local AI on aios from the ai/os release model and serves it with llama-server.service'
 arch=('any')
 url='https://git.syui.ai/ai/os/releases/tag/model'
 license=('MIT')
-depends=('llama.cpp')
+depends=('llama.cpp' 'base')
 backup=('etc/aimodel.conf')
 install=aimodel.install
 source=(aimodel aimodel.conf)

@@ -2,7 +2,7 @@
 # aimodel: aios のローカルの AI のモデル (GGUF) を取ってきて、llama-server.service に使わせる
 #   aimodel pull [NAME] [-f]   配っているものが置いてあるものとちがえば (-f ならいつも) 取ってきて、sha256 を確かめて
 #                              /var/lib/ai/models/ に置く。NAME がなければ (ai) ai.gguf: /var/lib/ai/model.gguf を
-#                              それに向けて llama-server を起こしなおす。origin なら ai-origin.gguf (ゼロから作ったもの):
+#                              それに向けて、動いている llama-server を起こしなおす。origin なら ai-origin.gguf (ゼロから作ったもの):
 #                              置くだけで、llama-server はそのまま (llama completion -m で使う)
 #   aimodel status [NAME]      置いてあるものと配っているもの (sha256)
 #   aimodel rm [NAME]          置いたモデルを消す (ai なら llama-server を止めて)
@@ -129,8 +129,10 @@ pull() {
   echo "$sha" > "$model.sha"
   if [ "$name" = ai ]; then
     link
-    # init のいないところ (chroot など) では systemctl がしくじるだけ
-    systemctl restart llama-server > /dev/null 2>&1
+    # 動いている llama-server だけ起こしなおす (止めてあるものは止めたまま。init のいないところでは何もしない)
+    if [ "$(systemctl is-active llama-server 2> /dev/null)" = active ]; then
+      systemctl restart llama-server > /dev/null 2>&1
+    fi
   fi
   echo "aimodel: $model ($size bytes, $sha)"
   hint
