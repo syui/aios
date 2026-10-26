@@ -6,7 +6,10 @@
 // プラグインの標準入力と標準出力はパイプでつなぎっぱなしにして、1 行 1 つの JSON で話す。
 // aish が { "ev": ..., ... } を送り、プラグインは 1 行の JSON で答える。最初は hello で、答えに
 // 受けとるフック (hooks) と既定のキー (keys) が入っている。そのあとはフックのあるものだけに送る。
-// 決まった時間に答えなければ (key と not_found は待ちつづける)、そのプラグインは止めて外す
+// 決まった時間に答えなければ (key と not_found は待ちつづける)、そのプラグインは止めて外す。打っているあいだのフック
+// (highlight、suggest)、prompt と知らせるだけのもの (preexec など) は少しだけ待ち、まにあわなければその答えは使わずに
+// 先へ進む (プラグインは止めない。遅れた答えは、次に送る前に読み捨てる)。マシンがいそがしくて (メモリが足りずに
+// プラグインのページを読みなおしているときなど) プラグインがすぐ答えられなくても、打つのは止まらない
 // 版 2: hello の答えに tools (端末なしで呼べる機能)。aish --mcp はそれを MCP のツールとして見せ、
 // { "ev": "tool", "name": ..., "args": {...} } で呼ぶ
 use serde_json::{Value, json};
@@ -16,6 +19,32 @@ use std::os::unix::process::CommandExt;
 
 /// 答えを待つ長さ (ms)。key と not_found は端末で人と話すので待ちつづける
 const TIMEOUT_MS: i32 = 3000;
+/// 打っているあいだのフック (1 文字ごと) と、知らせるだけのものを待つ長さ (ms)
+const TYPING_MS: i32 = 100;
+/// prompt を待つ長さ (ms)。まにあわなければ、ふつうのプロンプトで
+const PROMPT_MS: i32 = 1000;
+/// 遅れた答えを、これだけ (ms) 待っても来なければ止める
+const STUCK_MS: u128 = 30000;
+
+/// どれだけ待つか
+#[derive(Clone, Copy, PartialEq)]
+enum Wait {
+    /// 答えるまで (key、not_found、tool)
+    Forever,
+    /// TIMEOUT_MS。過ぎたら止める
+    Normal,
+    /// この ms だけ。過ぎたら、その答えはあとで読み捨てる。前の答えがまだなら、送らずに None
+    Soft(i32),
+    /// Soft と同じだが、前の答えがまだでも送る (知らせるだけのもの。落とさない)
+    Tell(i32),
+}
+
+/// 1 行を読んだ結果
+enum Read1 {
+    Line(Value),
+    Late,
+    Dead,
+}
 
 struct Plugin {
     name: String,
@@ -25,6 +54,9 @@ struct Plugin {
     r: std::process::ChildStdout,
     /// 読んだが、まだ行になっていないもの
     buf: Vec<u8>,
+    /// まだ読んでいない (待つのをやめた) 答えの数と、いちばん古いものを送ったとき
+    owed: usize,
+    owed_since: Option<std::time::Instant>,
     hooks: Vec<String>,
     /// 端末なしで呼べる機能 ({ name, description, input })
     tools: Vec<Value>,
@@ -76,10 +108,41 @@ pub struct Plugins {
 }
 
 impl Plugin {
-    /// 1 行送って 1 行の答え。答えがなければ (閉じた、時間切れ、JSON でない) None
-    fn ask(&mut self, ev: &Value, wait: bool) -> Option<Value> {
+    /// 1 行送って 1 行の答え。答えがなければ (閉じた、時間切れ、JSON でない、Soft で前の答えがまだ) None
+    fn ask(&mut self, ev: &Value, wait: Wait) -> Option<Value> {
         if !self.alive {
             return None;
+        }
+        // 前に待つのをやめた答えを読み捨てる。Soft と Tell は来ているものだけ、ほかはこれと同じだけ待つ
+        while self.owed > 0 {
+            let soft = matches!(wait, Wait::Soft(_) | Wait::Tell(_));
+            match self.read1(match wait {
+                Wait::Forever => -1,
+                Wait::Normal => TIMEOUT_MS,
+                _ => 0,
+            }) {
+                Read1::Line(_) => {
+                    self.owed -= 1;
+                    // 答えている (止まってはいない)
+                    self.owed_since = (self.owed > 0).then(std::time::Instant::now);
+                }
+                Read1::Dead => return None,
+                Read1::Late if !soft => {
+                    self.die("did not answer in time");
+                    return None;
+                }
+                Read1::Late => {
+                    if self.owed_since.is_some_and(|t| t.elapsed().as_millis() > STUCK_MS) {
+                        self.die(&format!("did not answer in {} s", STUCK_MS / 1000));
+                        return None;
+                    }
+                    if matches!(wait, Wait::Soft(_)) {
+                        // まだいそがしい: 聞くのはやめておく (たまっていかないように)
+                        return None;
+                    }
+                    break;
+                }
+            }
         }
         let mut line = ev.to_string();
         line.push('\n');
@@ -87,31 +150,59 @@ impl Plugin {
             self.die("closed");
             return None;
         }
+        let ms = match wait {
+            Wait::Forever => -1,
+            Wait::Normal => TIMEOUT_MS,
+            Wait::Soft(ms) | Wait::Tell(ms) => ms,
+        };
+        match self.read1(ms) {
+            Read1::Line(v) if self.owed == 0 => Some(v),
+            Read1::Line(_) => {
+                // Tell で、前の答えがまだあった: 読んだのはその答え (owed は 1 へって、これの分の 1 ふえる)
+                self.owed_since = Some(std::time::Instant::now());
+                None
+            }
+            Read1::Dead => None,
+            Read1::Late if wait == Wait::Normal => {
+                self.die("did not answer in time");
+                None
+            }
+            Read1::Late => {
+                self.owed += 1;
+                self.owed_since.get_or_insert_with(std::time::Instant::now);
+                None
+            }
+        }
+    }
+
+    /// 1 行の答えを ms だけ (-1 なら来るまで) 待って読む。閉じたり JSON でなければ止めて Dead
+    fn read1(&mut self, ms: i32) -> Read1 {
+        let start = std::time::Instant::now();
         loop {
             if let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
                 let l: Vec<u8> = self.buf.drain(..=i).collect();
                 return match serde_json::from_slice::<Value>(&l) {
-                    Ok(v) if v.is_object() => Some(v),
+                    Ok(v) if v.is_object() => Read1::Line(v),
                     _ => {
                         self.die("answered something that is not a JSON object");
-                        None
+                        Read1::Dead
                     }
                 };
             }
+            let left = if ms < 0 { -1 } else { (ms as i64 - start.elapsed().as_millis() as i64).max(0) as i32 };
             let mut p = libc::pollfd { fd: self.r.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            let n = unsafe { libc::poll(&mut p, 1, if wait { -1 } else { TIMEOUT_MS }) };
+            let n = unsafe { libc::poll(&mut p, 1, left) };
             if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             if n == 0 {
-                self.die("did not answer in time");
-                return None;
+                return Read1::Late;
             }
             let mut b = [0u8; 4096];
             match self.r.read(&mut b) {
                 Ok(0) | Err(_) => {
                     self.die("closed");
-                    return None;
+                    return Read1::Dead;
                 }
                 Ok(k) => self.buf.extend_from_slice(&b[..k]),
             }
@@ -195,8 +286,8 @@ impl Plugins {
         if let (Some(h), Some(e)) = (hello.as_object_mut(), extra.as_object()) {
             h.extend(e.clone());
         }
-        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file, args: args.to_vec(), hello: hello.clone() };
-        let Some(reply) = p.ask(&hello, false) else { return Err(format!("{}: no answer to hello", name)) };
+        let mut p = Plugin { name: name.to_string(), prog, child, w, r, buf: Vec::new(), owed: 0, owed_since: None, hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file, args: args.to_vec(), hello: hello.clone() };
+        let Some(reply) = p.ask(&hello, Wait::Normal) else { return Err(format!("{}: no answer to hello", name)) };
         if let Some(n) = reply["name"].as_str() {
             p.name = n.to_string();
         }
@@ -264,7 +355,12 @@ impl Plugins {
             return None;
         }
         ev["ev"] = json!(hook);
-        let wait = hook == "not_found";
+        let wait = match hook {
+            "not_found" => Wait::Forever,
+            "highlight" | "suggest" => Wait::Soft(TYPING_MS),
+            "prompt" => Wait::Soft(PROMPT_MS),
+            _ => Wait::Normal,
+        };
         for p in self.list.iter_mut().filter(|p| p.alive && p.hooks.iter().any(|h| h == hook)) {
             if let Some(r) = p.ask(&ev, wait)
                 && r.as_object().is_some_and(|o| !o.is_empty())
@@ -282,7 +378,7 @@ impl Plugins {
         }
         ev["ev"] = json!(hook);
         for p in self.list.iter_mut().filter(|p| p.alive && p.hooks.iter().any(|h| h == hook)) {
-            p.ask(&ev, false);
+            p.ask(&ev, Wait::Tell(TYPING_MS));
         }
     }
 
@@ -334,7 +430,7 @@ impl Plugins {
             return self.tool_once(name, &ev);
         }
         let p = self.list.iter_mut().find(|p| p.alive && p.tools.iter().any(|t| t["name"] == name))?;
-        p.ask(&ev, true)
+        p.ask(&ev, Wait::Forever)
     }
 
     /// fork した子 (パイプラインや $(...)) から: 親のつなぎ口は使わず、同じプラグインを一度だけ起こして聞く
@@ -342,8 +438,8 @@ impl Plugins {
         let src = self.list.iter().find(|p| p.alive && p.tools.iter().any(|t| t["name"] == name))?;
         let mut child = std::process::Command::new(&src.prog).args(&src.args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().ok()?;
         let (w, r) = (child.stdin.take()?, child.stdout.take()?);
-        let mut p = Plugin { name: src.name.clone(), prog: src.prog.clone(), child, w, r, buf: Vec::new(), hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file: None, args: Vec::new(), hello: Value::Null };
-        let r = p.ask(&src.hello, false).and_then(|_| p.ask(ev, true));
+        let mut p = Plugin { name: src.name.clone(), prog: src.prog.clone(), child, w, r, buf: Vec::new(), owed: 0, owed_since: None, hooks: Vec::new(), tools: Vec::new(), alive: true, why: None, file: None, args: Vec::new(), hello: Value::Null };
+        let r = p.ask(&src.hello, Wait::Normal).and_then(|_| p.ask(ev, Wait::Forever));
         drop(p.w);
         let _ = p.child.wait();
         r
@@ -358,6 +454,6 @@ impl Plugins {
         ev["ev"] = json!("key");
         ev["widget"] = json!(widget);
         ev["key"] = json!(self.binds[b].keys.join(" "));
-        self.list.get_mut(plugin).and_then(|p| p.ask(&ev, true))
+        self.list.get_mut(plugin).and_then(|p| p.ask(&ev, Wait::Forever))
     }
 }
