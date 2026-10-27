@@ -4,7 +4,8 @@
 //   (claude を自分のプロセスグループにして、動いているあいだだけ端末の前に出す)。
 //   claude は aish の MCP の読むだけのツール (read / grep / where など) を聞かずに使える。
 //   コマンドを動かす run や書きかえるものは使えない (AISH_CLAUDE_TOOLS で足せる。例: mcp__aish__run)
-//   claude がなければ何もしない (aish がいつもどおり "command not found")。AISH_CLAUDE=0 でも何もしない
+//   claude がなければ何もしない (aish がいつもどおり "command not found")。AISH_CLAUDE=0 でも何もしない。
+//   AISH_AI=local なら、うしろの aish-local (このマシンの AI) にゆずる
 // Claude は aish --mcp (aios では /etc/claude-code/managed-mcp.json) で同じ aios を触れる
 use aish_plugin::{Spec, Value, json, s};
 use std::os::fd::AsRawFd;
@@ -31,7 +32,7 @@ fn ask(v: &Value) -> Value {
         None => std::env::vars().collect(),
     };
     let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    if get("AISH_CLAUDE") == Some("0") {
+    if get("AISH_CLAUDE") == Some("0") || get("AISH_AI") == Some("local") {
         return json!({});
     }
     let Some(bin) = claude(get("PATH").unwrap_or("/usr/bin:/bin")) else { return json!({}) };

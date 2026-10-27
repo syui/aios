@@ -1252,6 +1252,7 @@ aimodel status                                # 置いてあるものと配っ�
 sudo aimodel pull                             # 配っているものが変わっていれば取りなおす (動いている llama-server は起こしなおす)
 sudo aimodel pull origin                      # ゼロから作った ai-origin.gguf を models/ に置く (llama-server は ai.gguf のまま)
 llama completion -m /var/lib/ai/models/ai-origin.gguf -p "Once upon a time" -n 150 -no-cnv   # 書き出しのつづき (英語のお話)
+きょうは何する                                 # aish で: 見つからないコマンドの行は、claude がなければ llama-server のアイへ (aish-local)
 ```
 
 ほかのモデルを手で置くとき (aimodel は入れない。入れると /var/lib/ai/model.gguf はそちらのものになる):
@@ -1286,6 +1287,13 @@ llama bench                                   # この機械での速さ (prompt
   動いていなければ `llama cli` が自分でモデルを読みこむ。有効にするリンクは base に入れない (入れていたときは、
   disable しても base を上げると戻った)。nobody で、127.0.0.1:8080 に OpenAI と同じ API (`/v1/chat/completions`、
   `/v1/completions`、`/v1/embeddings`、`/v1/models`) を出す。外から使うときは ssh の転送で (`ssh -L 8080:127.0.0.1:8080`)。
+- aish から: 見つからなかったコマンドの行 (打ちまちがいや、言葉で書いたこと) は、claude があれば Claude に (aish-claude)、
+  なければ llama-server に (aish-local) 渡し、答えを届いたところから出す (Ctrl-C で止まる)。`AISH_AI=local` なら claude が
+  あってもこちら。答えるだけで、コマンドは動かさない (手を動かすのは Claude と `aish --mcp`)。15 分以内の 4 つまでの
+  やりとりを `~/.cache/aish/local.json` (0600) に残して続けて話す (モデルの読める長さに入りきらなければ、やりとりなしで
+  聞きなおす)。llama-server が止まっていれば、ふつうの command not found (モデルを置いてあれば、起こし方を 1 度だけ出す)。
+  場所は `AISH_LOCAL_URL` (既定 `http://127.0.0.1:8080`。OpenAI と同じ API ならほかのものでも)、モデルへの前置きは
+  `AISH_LOCAL_SYSTEM` (空なら前置きなし。ai-origin のように 256 トークンしか読めないモデルで)、`AISH_LOCAL=0` で止める。
 - 設定は `/etc/systemd/system/llama-server.service.d/local.conf` に `[Service]` と `Environment=LLAMA_ARG_CTX_SIZE=8192
   LLAMA_ARG_THREADS=4` など (llama serve --help に出る LLAMA_ARG_*)。モデルを替えたら `systemctl restart llama-server`。
   会話の長さはふつう 4096 (`LLAMA_ARG_CTX_SIZE`。言わなければ llama.cpp はモデルの学んだ長さ、Gemma 4 なら 131072 の

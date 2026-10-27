@@ -87,8 +87,8 @@ jobs:
         # base を作ったときの aish とプラグイン (aarch64 の musl。この arm64 の Linux でそのまま動く)
         run: |
           sh test/aish.sh user/target/aarch64-unknown-linux-musl/release/aish shell/target/aarch64-unknown-linux-musl/release
-          # プラグインのユニットテスト (aish-fix のエラーの数えかた、aish-pkg の版くらべ、aish-vm の lockbench の読みかたなど)
-          (cd shell && cargo test --release -p aish-edit -p aish-fix -p aish-pkg -p aish-vm)
+          # プラグインのユニットテスト (aish-fix のエラーの数えかた、aish-pkg の版くらべ、aish-vm の lockbench の読みかた、aish-local の答えのほどきかたなど)
+          (cd shell && cargo test --release -p aish-edit -p aish-fix -p aish-pkg -p aish-vm -p aish-local)
 
       - name: Boot test
         run: |

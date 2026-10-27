@@ -50,6 +50,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-local"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "aish-map"
 version = "0.0.1"
 dependencies = [
