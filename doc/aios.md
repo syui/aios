@@ -402,6 +402,29 @@ Firefox (4 つの CPU) の futex は 1 回 54 µs から 37 µs に (合計 198 
 (signal と broadcast)、時間切れで終わる待ち、生の CMP_REQUEUE を、いくつもの CPU で同時に動かす (起こしが消えれば alarm で
 失敗)。
 
+### 自分だけの無名の mmap / munmap は大きなロックなしで
+
+smpbench を 4 つの CPU で動かすと、大きなロックを待つ時間のいちばん多いものの 1 つは、無名の領域を作って外すだけの
+mmap (待ち 88%: munmap 1 回 10 µs、mmap 4 µs) と、領域を何千も持ったプロセスの mmap-busy (226%) だった。それぞれ
+自分のアドレス空間なのに、領域の木 (PageTable の vmas) と PTE を変えるのはみな大きなロックの中だった。
+
+ロックなしにしたのは、スレッドで分けていない表 (Mm をだれとも分けていない) の、名前のない MAP_PRIVATE の無名の mmap
+(MAP_FIXED でないもの。MAP_NORESERVE、MAP_STACK はよい) と、名前のない自分だけの無名の領域だけにかかり、スワップへ出した
+ページのない munmap (vm::PageTable::fast_map、fast_unmap)。ファイルの写し、共有、名前 (Rc)、スワップのスロットは大きなロックで
+守っているので、それがまざればふつうの道へ。スレッドがほかにいなければ、同じ表をいっしょに変えうるのは、大きなロックを
+持ってほかから来るもの (メモリが足りないときの回収のスワップとファイルのページ、procfs、oom) だけ。それとはロックなしの
+ページフォールトと同じ形ですれちがう: ロックなしの側は fast_users を増やしてから mutators を見て、0 でなければふつうの道へ。
+大きなロックの側は mutators を増やしてから fast_users が 0 になるのを待つ。表を変えるメソッドはもとから中でこれをとっていたが、
+ほかのプロセスの表を読むだけのもの (/proc/PID/maps、cmdline、stat、status、/proc/ai のプロセスの一覧、oom の大きさくらべ、
+スタックや待っている futex の出力) はとっていなかったので、読むあいだ `hold` で止める。munmap は PTE を消してから、表を
+載せている CPU を見て TLB を消し (ほかに載せている CPU がなければ自分の分だけ)、ページを返す。ほかのスレッドがいないので、
+ロックなしで読む CPU を待つ (quiesce) ことはいらない (自分がそれなので、待てば止まる)。
+
+4 つの CPU で、mmap は 1 回 19.7 µs から 14.9 µs、待ち 97% から 15%。mmap-busy は 30.0 µs から 14.6 µs、伸びは 1.04 から
+1.39 に (Linux は 1.21)。新しい test/fastmap.c は、外した真ん中 (領域を分ける)、いくつもの領域と穴にかかる munmap、fork の
+あとの COW のページ、ファイルの写しをまたぐもの (ふつうの道へ)、外したところの SIGSEGV と、3 つのプロセスが 3000 回ずつ作って
+外すあいだに、親がそれぞれの /proc/PID/maps、stat、status を読みつづけるのを確かめる。のこりの大きなものは fork (clone と wait4)。
+
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
 プログラムは、この CPU で使える命令を AT_HWCAP と AT_HWCAP2 (getauxval) か /proc/cpuinfo の `Features` で知る。前の aios
