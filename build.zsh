@@ -18,7 +18,7 @@ if [[ ! -f $ROOTFS/etc/pacman.conf ]]; then
   cp /etc/pacman.conf $ROOTFS/etc/pacman.conf
 fi
 
-echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > $ROOTFS/etc/pacman.d/mirrorlist
+cp cfg/etc/pacman.d/mirrorlist $ROOTFS/etc/pacman.d/mirrorlist
 sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
@@ -75,71 +75,11 @@ arch-chroot $ROOTFS /bin/sh -c 'useradd -m -G wheel -s /bin/zsh ai'
 arch-chroot $ROOTFS /bin/sh -c 'passwd -l ai'
 echo "ai ALL=(ALL:ALL) NOPASSWD: ALL" >> $ROOTFS/etc/sudoers
 
-mkdir -p $ROOTFS/etc/systemd/system/console-getty.service.d
-cat > $ROOTFS/etc/systemd/system/console-getty.service.d/override.conf <<'EOF'
-[Service]
-ExecStart=
-ExecStart=-/usr/bin/agetty --autologin ai --noclear --keep-baud console 115200,38400,9600 $TERM
-EOF
-
 cp cfg/zshrc $ROOTFS/home/ai/.zshrc
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
-cat > $ROOTFS/etc/os-release <<EOF
-NAME=aios
-PRETTY_NAME=aios
-ID=ai
-ID_LIKE=arch
-BUILD_ID=rolling
-IMAGE_ID=aios
-IMAGE_VERSION=0.0.1
-HOME_URL=https://git.syui.ai/ai/os
-EOF
-
-echo "aios" > $ROOTFS/etc/hostname
-
-# security hardening defaults — IPv6 off, rare fs/net-proto modules blacklisted, ufw on
-# The fs.* keys live in this 99- file: systemd-sysctl applies files in name order, and
-# systemd's own 50-default.conf / 50-coredump.conf set fs.protected_* = 1 and
-# fs.suid_dumpable = 2, which would override them in 50-aios-hardening.conf.
-cat > $ROOTFS/etc/sysctl.d/99-aios-hardening.conf <<'EOF'
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-fs.protected_fifos=2
-fs.protected_regular=2
-fs.suid_dumpable=0
-EOF
-
-cat > $ROOTFS/etc/modprobe.d/aios-blacklist.conf <<'EOF'
-# Rare/legacy filesystems
-blacklist cramfs
-blacklist freevxfs
-blacklist jffs2
-blacklist hfs
-blacklist hfsplus
-blacklist udf
-
-# Rare/legacy network protocols
-blacklist dccp
-blacklist sctp
-blacklist rds
-blacklist tipc
-blacklist n-hdlc
-blacklist ax25
-blacklist netrom
-blacklist x25
-blacklist decnet
-blacklist appletalk
-EOF
-
-cp cfg/aios-modprobe-hardening.conf $ROOTFS/etc/modprobe.d/aios-hardening.conf
-cp cfg/aios-sysctl-hardening.conf $ROOTFS/etc/sysctl.d/50-aios-hardening.conf
-mkdir -p $ROOTFS/etc/systemd/coredump.conf.d $ROOTFS/etc/ssh/sshd_config.d
-cp cfg/aios-coredump.conf $ROOTFS/etc/systemd/coredump.conf.d/aios.conf
-cp cfg/aios-sshd-hardening.conf $ROOTFS/etc/ssh/sshd_config.d/00-aios-hardening.conf
-
-cp cfg/aios-firewall.sh $ROOTFS/usr/local/bin/aios-firewall.sh
-cp cfg/aios-firewall.service $ROOTFS/etc/systemd/system/aios-firewall.service
+cp -r cfg/etc/. $ROOTFS/etc/
+cp -r cfg/usr/. $ROOTFS/usr/
 arch-chroot $ROOTFS /bin/sh -c '
   chmod +x /usr/local/bin/aios-firewall.sh
   systemctl enable aios-firewall.service
