@@ -1,5 +1,6 @@
 #!/bin/sh
-# aish のテスト: 書き方 (test/aish-syntax.txt)、sh の名前での bash の書き方 (test/aish-bash.txt) と MCP (test/aish-mcp.py)
+# aish のテスト: 書き方 (test/aish-syntax.txt)、sh の名前での bash の書き方 (test/aish-bash.txt)、MCP (test/aish-mcp.py) と
+#   対話するとき (test/aish-tty.py: 端末で打って、色・補完・履歴の候補を見る)
 #   test/aish.sh [AISH [PLUGINS]]   既定はこのマシン向けにビルドしたもの (bin/aish-mcp.sh --build)
 #   CI (arm64 の Linux) は aios 向けのもの (user/target/aarch64-unknown-linux-musl/release/aish) をそのまま動かす
 cd "$(dirname "$0")/.."
@@ -44,4 +45,5 @@ done < test/aish-bash.txt
 echo "bash: $nb cases, $fb failed"
 fail=$((fail + fb))
 python3 test/aish-mcp.py "$aish" "$plugins" || fail=$((fail + 1))
+python3 test/aish-tty.py "$aish" "$plugins" || fail=$((fail + 1))
 [ "$fail" = 0 ]
