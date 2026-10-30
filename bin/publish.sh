@@ -90,6 +90,13 @@ paths() {
     aiboot) echo "boot pkg/rust/aiboot" ;;
   esac
 }
+# いまのソースでその PKGBUILD の pkgver() が出す版 (0.0.1.rN.gSHA)
+now_ver() {
+  bash -c 'startdir=$1; . "$1/PKGBUILD"; pkgver' _ "$PWD/pkg/rust/$1"
+}
+rev() {
+  echo "$1" | sed -n 's/^0\.0\.1\.r\([0-9]*\)\.g.*/\1/p'
+}
 todo=
 for p in base aikernel aiboot; do
   v=$(repo_ver "$p")
@@ -97,6 +104,10 @@ for p in base aikernel aiboot; do
   # shellcheck disable=SC2046
   if [ -n "$old" ] && git cat-file -e "$old^{commit}" 2>/dev/null && git diff --quiet "$old" HEAD -- $(paths "$p"); then
     echo "pkg: $p ${v:-?} is up to date"
+  elif [ -n "$old" ] && ! git cat-file -e "$old^{commit}" 2>/dev/null && [ "$(rev "$v")" = "$(rev "$(now_ver "$p")")" ]; then
+    # その版のコミットがこの歴史にない (署名しなおしなどで書きかえた) が、rN はいまと同じ: 同じところの書きかえとみる。
+    # 作りなおすと gSHA だけがちがう版になり、版のくらべ方しだいで ai/repo のほうが新しいとされて送れない
+    echo "pkg: $p $v is up to date (g$old is not in this history; same r$(rev "$v"), taken as rewritten)"
   else
     echo "pkg: $p ${v:-none} -> this commit"
     todo="$todo $p"
