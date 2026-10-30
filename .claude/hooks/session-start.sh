@@ -24,6 +24,9 @@ command -v meson >/dev/null || pip install -q --break-system-packages meson >/de
 rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarch64-unknown-uefi >/dev/null 2>&1 || true
 # 浅いクローンだと pkgver() (git rev-list --count) が小さくなり、パッケージが古い版に見える
 [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ] && git fetch -q --unshallow origin || true
+# コミットはアイの名前 (ai <ai@syui.ai>) と GPG の鍵で署名する。この環境の git は Claude の名前と SSH の鍵で
+# 署名する設定なので、このリポジトリだけ bin/gitea.sh id で置きかえる (鍵の束に秘密鍵がなければそのまま)
+bin/gitea.sh id || true
 bin/aish-mcp.sh --build
 # aigpt (アイの記憶の MCP) を入れ、記憶を PDS から取ってくる。git.syui.ai に届かなくても aios の残りの準備は続ける
 bin/aigpt-mcp.sh --build || echo "aigpt-mcp.sh --build: failed" >&2
