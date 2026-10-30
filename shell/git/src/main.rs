@@ -2,6 +2,7 @@
 //   git  ブランチと HEAD、変えたファイル、remote (とミラー) ごとの進み・おくれ、push していないコミットの
 //        署名 (GPG か SSH か、どの鍵か) とコミットした人。設定 (user.email、user.signingkey、gpg.format) と
 //        ちがうもの、remote のほうが進んでいるものは problems に
+//   ci   push したコミットの GitHub Actions を待つ (1 回に 50 秒まで)。落ちたらどの job のどの step か
 // クラウドの環境の git は Claude の名前と SSH の鍵で署名する設定なので、気づかずに push すると署名しなおして
 // force push することになる (2026-10-30)。push の前にこれで見る
 use aish_plugin::{Spec, Tool, Value, error, json, s};
@@ -13,22 +14,40 @@ const GIT: &str = r#"{"type":"object","properties":{
 "also":{"type":"array","items":{"type":"string"},"description":"remote のほかにくらべるところ (URL)。既定は git config aish.mirror (いくつでも)"},
 "remote":{"type":"boolean","description":"remote とくらべる (git ls-remote。既定 true。false ならネットワークを使わない)"}}}"#;
 
+const CI: &str = r#"{"type":"object","properties":{
+"sha":{"type":"string","description":"コミット (既定: HEAD)"},
+"repo":{"type":"string","description":"GitHub の owner/name (既定: origin の URL から)"},
+"dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
+"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ。0 なら待たずにいまの様子)"}}}"#;
+
 /// push していないコミットを見るのはここまで
 const MAX_COMMITS: usize = 30;
+/// 1 回に待つのはここまで (Claude Code はツールの答えを 60 秒しか待たない)
+const MAX_MS: u64 = 50_000;
+/// GitHub の API を見にいく間 (認証なしだと 1 時間に 60 回まで)
+const POLL: Duration = Duration::from_secs(15);
 
 fn main() {
     let spec = Spec {
         name: "git",
         hooks: &[],
         keys: &[],
-        tools: &[Tool {
-            name: "git",
-            desc: "git のリポジトリの様子を 1 回で: ブランチと HEAD、変えたファイル、remote (と git config aish.mirror のミラー) ごとの進み・おくれ (ls-remote なので fetch しない)、push していないコミットの署名 (gpg / ssh / none と鍵) とコミットした人。設定とちがう署名や人、remote のほうが進んでいるものは problems に。push の前に",
-            input: GIT,
-        }],
+        tools: &[
+            Tool {
+                name: "git",
+                desc: "git のリポジトリの様子を 1 回で: ブランチと HEAD、変えたファイル、remote (と git config aish.mirror のミラー) ごとの進み・おくれ (ls-remote なので fetch しない)、push していないコミットの署名 (gpg / ssh / none と鍵) とコミットした人。設定とちがう署名や人、remote のほうが進んでいるものは problems に。push の前に",
+                input: GIT,
+            },
+            Tool {
+                name: "ci",
+                desc: "push したコミット (既定 HEAD) の GitHub Actions の run を、終わるまで待つ (1 回に 50 秒まで。まだなら running: true なのでもう一度)。run ごとに結果とかかった時間、落ちたものはどの job のどの step か。{done, ok}",
+                input: CI,
+            },
+        ],
     };
     aish_plugin::run(spec, |ev, v| match ev {
         "tool" if s(v, "name") == "git" => state(v),
+        "tool" if s(v, "name") == "ci" => ci(v),
         "tool" => error(format!("{}: no such tool", s(v, "name"))),
         _ => json!({}),
     });
@@ -216,9 +235,133 @@ fn state(v: &Value) -> Value {
     r
 }
 
+/// GitHub の API (curl。プロキシや認証はそのまま curl のもの)
+fn gh(path: &str) -> Result<Value, String> {
+    let o = Command::new("curl")
+        .args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/vnd.github+json"])
+        .arg(format!("https://api.github.com/{}", path))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+    if !o.status.success() {
+        return Err(format!("curl: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    let v = aish_plugin::parse(&String::from_utf8_lossy(&o.stdout)).ok_or("GitHub: not JSON")?;
+    match v["message"].as_str() {
+        Some(m) if v.get("workflow_runs").is_none() && v.get("jobs").is_none() => Err(format!("GitHub: {}", m)),
+        _ => Ok(v),
+    }
+}
+
+/// origin の URL から GitHub の owner/name (https://github.com/o/n(.git)、git@github.com:o/n.git)
+fn github_repo(url: &str) -> Option<String> {
+    let rest = url.split_once("github.com")?.1.trim_start_matches([':', '/']);
+    let rest = rest.trim_end_matches('/').trim_end_matches(".git");
+    let mut p = rest.split('/');
+    let (o, n) = (p.next()?, p.next()?);
+    (!o.is_empty() && !n.is_empty()).then(|| format!("{}/{}", o, n))
+}
+
+/// 2026-10-30T02:32:54Z → 1970 からの秒
+fn epoch(t: &str) -> Option<i64> {
+    let n = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
+    let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    // 暗黙の暦の日の数 (days_from_civil)
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+fn dur(s: i64) -> String {
+    if s < 60 { format!("{}s", s) } else { format!("{}m {}s", s / 60, s % 60) }
+}
+
+fn ci(v: &Value) -> Value {
+    let a = &v["args"];
+    let dir = if s(a, "dir").is_empty() { s(v, "pwd").to_string() } else { s(a, "dir").to_string() };
+    let rev = if s(a, "sha").is_empty() { "HEAD" } else { s(a, "sha") };
+    let Some(sha) = git(&dir, &["rev-parse", rev]) else { return error(format!("{}: no such commit", rev)) };
+    let repo = match s(a, "repo") {
+        "" => match git(&dir, &["remote", "get-url", "origin"]).as_deref().and_then(github_repo) {
+            Some(r) => r,
+            None => return error("origin is not on GitHub; give repo (owner/name)"),
+        },
+        r => r.to_string(),
+    };
+    let wait = Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(MAX_MS).min(MAX_MS));
+    let t0 = Instant::now();
+    let runs = loop {
+        let runs = match gh(&format!("repos/{}/actions/runs?head_sha={}&per_page=30", repo, sha)) {
+            Ok(r) => r["workflow_runs"].as_array().cloned().unwrap_or_default(),
+            Err(e) => return error(e),
+        };
+        let done = !runs.is_empty() && runs.iter().all(|r| r["status"] == "completed");
+        if done || t0.elapsed() + POLL > wait {
+            break runs;
+        }
+        std::thread::sleep(POLL);
+    };
+    let short = &sha[..sha.len().min(7)];
+    if runs.is_empty() {
+        return json!({ "text": format!("{}: no workflow run on {} yet (not started, or nothing it watches changed)\n", short, repo), "done": false, "running": true });
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut text = String::new();
+    let (mut done, mut ok) = (true, true);
+    for r in &runs {
+        let (status, concl) = (s(r, "status"), s(r, "conclusion"));
+        let started = epoch(s(r, "run_started_at"));
+        // 動いているものは、始まってからいままで
+        let ended = if status == "completed" { epoch(s(r, "updated_at")) } else { Some(now) };
+        let took = match (started, ended) {
+            (Some(a), Some(b)) => dur(b - a),
+            _ => String::new(),
+        };
+        text.push_str(&format!("{}  {}  {} {}  {}  {}\n", short, s(r, "name"), status, concl, took, s(r, "html_url")));
+        if status != "completed" {
+            done = false;
+            continue;
+        }
+        if matches!(concl, "success" | "skipped" | "neutral") {
+            continue;
+        }
+        ok = false;
+        // 落ちた run: どの job のどの step か (ログは認証が要るので URL だけ)
+        let jobs = gh(&format!("repos/{}/actions/runs/{}/jobs?per_page=50", repo, r["id"])).map(|j| j["jobs"].as_array().cloned().unwrap_or_default()).unwrap_or_default();
+        for j in jobs.iter().filter(|j| !matches!(s(j, "conclusion"), "success" | "skipped" | "neutral" | "")) {
+            let steps: Vec<&str> = j["steps"].as_array().map(|st| st.iter().filter(|x| s(x, "conclusion") == "failure").map(|x| s(x, "name")).collect()).unwrap_or_default();
+            text.push_str(&format!("  job {}: {}{}  {}\n", s(j, "name"), s(j, "conclusion"), if steps.is_empty() { String::new() } else { format!(" at step \"{}\"", steps.join("\", \"")) }, s(j, "html_url")));
+        }
+    }
+    let mut res = json!({ "text": text, "done": done, "ok": done && ok });
+    if !done {
+        res["running"] = json!(true);
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repos() {
+        assert_eq!(github_repo("https://github.com/syui/aios").as_deref(), Some("syui/aios"));
+        assert_eq!(github_repo("https://github.com/syui/aios.git/").as_deref(), Some("syui/aios"));
+        assert_eq!(github_repo("git@github.com:syui/aios.git").as_deref(), Some("syui/aios"));
+        assert_eq!(github_repo("https://git.syui.ai/ai/os.git"), None);
+    }
+
+    #[test]
+    fn times() {
+        assert_eq!(epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(epoch("2026-10-30T02:32:54Z"), Some(1793327574));
+        assert_eq!(epoch("2024-02-29T12:00:00Z").zip(epoch("2024-03-01T12:00:00Z")).map(|(a, b)| b - a), Some(86_400));
+        assert_eq!(epoch("x"), None);
+    }
 
     #[test]
     fn kinds() {

@@ -6,7 +6,7 @@
 #   edit:     ファイルを読む、ぴったり置きかえる、書く、取り消す (端末なしの tools だけ。Claude が使う)
 #   wait:     プロセスが終わる、ファイルに文字が出る、ポートが開く、まで待つ (tools だけ)
 #   fetch:    HTTP で取ってきて、JSON なら道 (.a.b[0].c) で取り出す (tools だけ)
-#   git:      リポジトリの様子 (remote との進み・おくれ、push していないコミットの署名) (tools だけ)
+#   git:      リポジトリの様子 (remote との進み・おくれ、push していないコミットの署名) と GitHub Actions を待つ (tools だけ)
 #   fix:      ビルドのエラーを番号つきの一覧に (vim の quickfix)。うしろでビルドして待てる
 #   sys:      aios の様子 (まとめ、プロセス、カーネルのメッセージ、ログ、BKL、strace)
 #   claude:   見つからなかったコマンドの行を Claude に   local: claude が答えなかったら、このマシンの AI (llama-server) に
