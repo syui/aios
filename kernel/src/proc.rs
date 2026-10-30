@@ -1389,6 +1389,8 @@ pub fn raw_dump(tid: u32) {
         crate::println!("raw x{} {:x}", i, tf.x[i]);
     }
     let pt = p.pt();
+    // ほかのプロセスの表を読む (大きなロックなしの mmap / munmap とすれちがう: vm::PageTable::hold)
+    let _h = pt.hold();
     let sp = tf.sp_el0 as usize;
     let mut b = [0u8; 64];
     for off in (0..32 * 1024).step_by(64) {
@@ -2050,6 +2052,7 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
         };
         let _ = writeln!(out, "thread {} {} sys {} chan {:x} {} utime {}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan, st, p.utime);
         let pt = p.pt();
+        let _h = pt.hold();
         let name = |pt: &mut crate::vm::PageTable, va: u64| -> Option<alloc::string::String> {
             let (_, v) = pt.find(va as usize)?;
             if v.prot & 4 == 0 {
@@ -2211,6 +2214,7 @@ pub fn ai_stack(tid: u32) -> Option<alloc::string::String> {
     let (pc, sp) = (tf.elr, tf.sp_el0);
     let x: alloc::vec::Vec<alloc::string::String> = (0..31).map(|i| alloc::format!("{}", tf.x[i])).collect();
     let pt = p.pt();
+    let _h = pt.hold();
     let mut hex = alloc::string::String::new();
     let mut page = [0u8; 4096];
     let mut va = sp as usize;
@@ -2262,7 +2266,9 @@ fn wait_json(p: &mut Proc) -> alloc::string::String {
         let tf = p.tf_ref();
         let (addr, val) = (tf.x[0], tf.x[2] as u32);
         let mut w = [0u8; 4];
-        let now = p.pt().copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
+        let pt = p.pt();
+        let _h = pt.hold();
+        let now = pt.copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
         return alloc::format!("{{\"futex\":{},\"val\":{},\"now\":{}}}", addr, val, now);
     }
     if p.chan == poll_chan() && (p.last_sys.0 == 73 || p.last_sys.0 == 72) {
@@ -2270,6 +2276,7 @@ fn wait_json(p: &mut Proc) -> alloc::string::String {
         // 何を待っているか (want: POLLIN 1 / POLLOUT 4 ...) がわかるので、aiwatch が「起こしが消えた」を見分けられる
         let (a0, a1) = (p.last_sys.1 as usize, p.last_sys.2 as usize);
         let (mut fds, mut want) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        let _h = p.pt().hold();
         if p.last_sys.0 == 73 && a1 <= 1024 {
             let mut raw = alloc::vec![0u8; a1 * 8];
             if p.pt().copy_in(&mut raw, a0).is_some() {

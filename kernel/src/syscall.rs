@@ -932,6 +932,30 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
                 None => return false,
             }
         }
+        // 自分だけの無名の mmap (MAP_FIXED でないもの) と、そういう領域の munmap。スレッドで分けていない表だけ
+        // (vm::PageTable::fast_map、fast_unmap)。ファイル、共有、MAP_FIXED、スワップへ出したページのあるところ、知らない
+        // 印や prot は、ふつうの道 (sys_mmap、sys_munmap) へ
+        MMAP if a[3] & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK) == 0
+            && a[3] & (MAP_PRIVATE | MAP_ANONYMOUS) == MAP_PRIVATE | MAP_ANONYMOUS
+            && a[2] & !7 == 0
+            && a[5] % 4096 == 0
+            && a[1] != 0
+            && a[1] <= crate::vm::MAXVA as u64 =>
+        {
+            let Some(m) = p.mm.as_ref().filter(|m| m.private()) else { return false };
+            let m = m.get();
+            let len = pg_up(a[1] as usize);
+            let Some(va) = m.pt.fast_map(m.mmap_next, len, prot_bits(a[2])) else { return false };
+            m.mmap_next = va + len;
+            va as i64
+        }
+        MUNMAP if a[0] & 0xfff == 0 && a[1] != 0 && a[0] < crate::vm::MAXVA as u64 && a[1] <= crate::vm::MAXVA as u64 => {
+            let Some(m) = p.mm.as_ref().filter(|m| m.private()) else { return false };
+            match m.get().pt.fast_unmap(a[0] as usize, a[0] as usize + pg_up(a[1] as usize)) {
+                Some(()) => 0,
+                None => return false,
+            }
+        }
         LSEEK => match crate::file::fast_lseek(p, a[0], a[1] as i64, a[2]) {
             Some(r) => r,
             None => return false,
@@ -1138,8 +1162,11 @@ fn sys_brk(addr: usize) -> i64 {
 }
 
 const MAP_SHARED: u64 = 0x1;
+const MAP_PRIVATE: u64 = 0x2;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_NORESERVE: u64 = 0x4000;
+const MAP_STACK: u64 = 0x2_0000;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const PROT_WRITE: u64 = 0x2;
 

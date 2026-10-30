@@ -337,7 +337,11 @@ impl ProcInode {
                 s
             }
             Node::Stat(pid) => stat_line(leader_any(pid)?),
-            Node::Maps(pid) => leader(pid)?.mm().pt.maps_text(),
+            Node::Maps(pid) => {
+                let pt = &leader(pid)?.mm().pt;
+                let _h = pt.hold();
+                pt.maps_text()
+            }
             Node::Stack(pid) => proc::stacks_text(leader(pid)?.tgid),
             Node::Status(pid) => {
                 let p = leader_any(pid)?;
@@ -462,7 +466,9 @@ fn user_bytes(p: &mut Proc, start: usize, end: usize) -> Option<Vec<u8>> {
         return None;
     }
     let mut b = alloc::vec![0u8; (end - start).min(64 << 10)];
-    p.mm().pt.copy_in(&mut b, start)?;
+    let pt = &mut p.mm().pt;
+    let _h = pt.hold();
+    pt.copy_in(&mut b, start)?;
     Some(b)
 }
 
@@ -519,6 +525,7 @@ fn mem_of(p: &Proc) -> (usize, usize) {
     match &p.mm {
         Some(m) => {
             let m = m.get();
+            let _h = m.pt.hold();
             (m.pt.vsize(), m.pt.resident())
         }
         None => (0, 0),

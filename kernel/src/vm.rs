@@ -2337,6 +2337,13 @@ impl PageTable {
         ok
     }
 
+    /// ほかのプロセスの表を、大きなロックを持って読むとき (procfs、oom、aiproc)。そのプロセスが大きなロックなしで
+    /// 領域や PTE を変えている (fast_mmap、fast_munmap、fast_fault) のが終わるのを待ち、落とすまで止めておく。
+    /// 表を変えるメソッドは中でとる (mutating) ので、読むだけのときに
+    pub fn hold(&self) -> Mutating {
+        self.mutating()
+    }
+
     /// 領域か PTE を変えはじめる (大きなロックを持って)。fast_fault を止めて、ロックなしで触っている CPU が
     /// いなくなるのを待つ。返ったものを持っているあいだが「変えている途中」
     fn mutating(&self) -> Mutating {
@@ -2548,6 +2555,93 @@ impl PageTable {
         };
         self.fast_users.fetch_sub(1, Ordering::SeqCst);
         r
+    }
+
+    /// 大きなロックなしで表を変えはじめる (fast_map、fast_unmap): fast_users に入ってから mutators を見る (fast_fault と
+    /// 同じ: 大きなロックを持って変える側 (mutating、hold) は mutators を増やしてから fast_users が 0 になるのを待つ)。
+    /// だれかが変えている途中なら入らずに false
+    fn fast_enter(&self) -> bool {
+        self.fast_users.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        if self.mutators.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+        false
+    }
+
+    fn fast_leave(&self) {
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// 大きなロックなしの mmap (syscall::fast): 名前のない自分だけの (MAP_PRIVATE の) 無名の領域を、hint から空いている
+    /// ところに作る (sys_mmap の MAP_FIXED でないものと同じ場所と答え)。スレッドで分けていない表だけ (呼ぶほうが見る):
+    /// 同じ表をいっしょに変えうるのは、大きなロックを持ってほかから来るもの (回収のスワップ、procfs: mutating か hold)
+    /// だけで、それとは fast_enter ですれちがう。場所がない (ENOMEM) か、だれかが変えている途中なら None (ふつうの道へ)
+    pub fn fast_map(&mut self, hint: usize, len: usize, prot: u8) -> Option<usize> {
+        if !self.fast_enter() {
+            return None;
+        }
+        let va = self.free_area(hint, len);
+        let r = match va.checked_add(len) {
+            Some(end) if end <= MAXVA && len != 0 => {
+                // 空いているところなので、外すもの (unmap_inner) はない
+                self.note(b'm', va, end, prot);
+                self.vmas.insert(va, Vma { end, prot, shared: false, back: Backing::Anon, name: None });
+                Some(va)
+            }
+            _ => None,
+        };
+        self.fast_leave();
+        r
+    }
+
+    /// 大きなロックなしの munmap (syscall::fast): [start, end) にかかる領域がみな、名前のない自分だけの無名のもので、
+    /// スワップへ出したページがないとき (ファイルの写し、共有のページ、スワップのスロット、名前の Rc は大きなロックで
+    /// 守っている)。スレッドで分けていない表だけ (fast_map と同じ)。ほかのスレッドがいないので、PTE を消して TLB を
+    /// 消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce で fast_users を待つが、
+    /// ここでは自分がそれ)。できないものと、だれかが変えている途中なら None (ふつうの道へ)
+    pub fn fast_unmap(&mut self, start: usize, end: usize) -> Option<()> {
+        let (start, end) = (pg_down(start), pg_up(end));
+        if start >= end || end > MAXVA || !self.fast_enter() {
+            return None;
+        }
+        let plain = self.vmas_in(start, end).all(|(_, v)| !v.shared && matches!(v.back, Backing::Anon) && v.name.is_none());
+        let mut swapped = false;
+        if plain {
+            self.each_entry(start, end, |_, pte| swapped |= is_swap(unsafe { *pte }));
+        }
+        if !plain || swapped {
+            self.fast_leave();
+            return None;
+        }
+        self.note(b'u', start, end, 0);
+        // 範囲に領域が 1 つもなければ、ページもない (unmap_inner と同じ)
+        if self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start) {
+            self.split(start);
+            self.split(end);
+            let keys: Vec<usize> = self.vmas.range(start..end).map(|(&k, _)| k).collect();
+            for k in keys {
+                self.vmas.remove(&k);
+            }
+            let mut pages: Vec<*mut u8> = Vec::new();
+            let mut vas: Vec<usize> = Vec::new();
+            self.each_entry(start, end, |va, pte| unsafe {
+                pages.push(page_of(*pte));
+                if *pte & PTE_VALID != 0 {
+                    vas.push(va);
+                }
+                *pte = 0;
+            });
+            // PTE を消してから、どの CPU が表を載せているかを見る (flush_va_unlocked と同じ)
+            fence(Ordering::SeqCst);
+            flush_pages_in(self.root_pa(), &vas);
+            for p in pages {
+                kalloc::put(p);
+            }
+        }
+        self.fast_leave();
+        Some(())
     }
 
     /// 大きなロックなしで、va から len バイトがみな写っているか (読める) だけを見る (write_fast が、ページを書きかえる前に)

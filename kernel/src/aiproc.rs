@@ -115,6 +115,7 @@ pub fn mem_json() -> String {
         seen.push(mm.id());
         let m = mm.get();
         let name = core::str::from_utf8(&p.comm).unwrap_or("").trim_end_matches('\0').into();
+        let _h = m.pt.hold();
         procs.push((p.tgid, name, m.pt.resident(), m.pt.vsize()));
     }
     procs.sort_by_key(|x| core::cmp::Reverse(x.2));

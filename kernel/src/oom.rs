@@ -90,7 +90,9 @@ fn biggest() -> Option<(u32, usize, [u8; 16])> {
             return;
         }
         let Some(mm) = p.mm.as_ref() else { return };
-        let rss = mm.get().pt.resident();
+        let pt = &mm.get().pt;
+        let _h = pt.hold();
+        let rss = pt.resident();
         if best.is_none_or(|b| rss > b.1) {
             best = Some((p.tgid, rss, p.comm));
         }
