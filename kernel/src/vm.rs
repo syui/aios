@@ -1136,6 +1136,12 @@ pub enum FaultErr {
     Bus,
 }
 
+/// fork の前半 (PageTable::prefork): PTE を写した表 (領域はまだ空) と、写した領域
+pub struct Prefork {
+    pt: PageTable,
+    areas: Vec<(usize, usize, u8, bool)>,
+}
+
 /// ルートは kalloc したページ (カーネル仮想アドレス)
 pub struct PageTable {
     root: *mut u64,
@@ -1423,6 +1429,28 @@ pub fn deactivate() {
 impl PageTable {
     pub fn new() -> Option<Self> {
         Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new() })
+    }
+
+    /// exit で (大きなロックを持って、自分だけの表に。このあとすぐ捨てること): ページとテーブルを返すのは、この CPU が
+    /// 大きなロックを放してから (free_deferred。Linux が exit した mm を次の切りかえのあとで捨てるのと同じ)。返すのが
+    /// exit でいちばん長い (fork と exit をくりかえすと、4 つの CPU で 1 回 70 µs ほど)。表はここで外すので、もうだれにも
+    /// たどれない。領域 (ファイルの Rc) はこのあと Drop がロックの中で捨てる。この表をいま使っている人 (mutating のまま
+    /// 眠っているもの、fast_users) がいるか、写しの表にこの写しのページ (MAP_SHARED のファイル) があれば何もしない
+    /// (いつもの Drop で: 写しの表はページを返したあとに release_shared がいる)
+    pub fn release_deferred(&mut self) {
+        if self.mutators.load(Ordering::SeqCst) != 0 || self.fast_users.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        if self.shared_ranges(0, MAXVA).iter().any(|&(lo, hi)| shared_file().range(lo..hi).next().is_some()) {
+            return;
+        }
+        let root = core::mem::replace(&mut self.root, core::ptr::null_mut());
+        unload(v2p(root as usize));
+        // 前に置いたものがまだあれば (ロックを放さずに続けて exit した)、それはここで
+        let old = DEFERRED[crate::smp::id()].swap(root as usize, Ordering::Relaxed);
+        if old != 0 {
+            free_level(old as *mut u64, 1, false);
+        }
     }
 
     /// TTBR0 に載せる物理アドレス
@@ -2673,8 +2701,25 @@ impl PageTable {
         let _m = self.mutating();
         let mut new = PageTable::new()?;
         new.vmas = self.vmas.clone();
-        let areas: Vec<(usize, usize, u8, bool)> = self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect();
-        for (s, e, prot, shared) in areas {
+        let ok = self.copy_ptes(&new, &self.areas(), false);
+        flush_all_in(self.root_pa());
+        if !ok {
+            return None;
+        }
+        self.quiesce();
+        Some(new)
+    }
+
+    /// 領域ごとの (先頭, 終わり, prot, 共有か) (fork が PTE を写すときに見るもの)
+    fn areas(&self) -> Vec<(usize, usize, u8, bool)> {
+        self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
+    }
+
+    /// fork: areas の PTE を new へ写す (private の領域は両方とも COW に)。TLB は呼ぶほうが消す。unlocked (大きなロック
+    /// の外) なら、スワップへ出したページ (swap.rs は大きなロックの中) にあたったらやめる。しくじったら false (それまでに
+    /// 写したものは new を捨てれば返る)
+    fn copy_ptes(&self, new: &PageTable, areas: &[(usize, usize, u8, bool)], unlocked: bool) -> bool {
+        for &(s, e, prot, shared) in areas {
             let mut fail = false;
             self.each_entry(s, e, |va, pte| unsafe {
                 if fail {
@@ -2682,6 +2727,10 @@ impl PageTable {
                 }
                 let swapped = is_swap(*pte);
                 if swapped {
+                    if unlocked {
+                        fail = true;
+                        return;
+                    }
                     // スワップのスロットも共有する (先に読み戻した方が自分のページを作る)
                     swap::dup(slot_of(*pte));
                 } else {
@@ -2704,12 +2753,42 @@ impl PageTable {
                 }
             });
             if fail {
-                flush_all_in(self.root_pa());
-                return None;
+                return false;
             }
         }
-        flush_all_in(self.root_pa());
-        self.quiesce();
+        true
+    }
+
+    /// fork の前半を大きなロックの外で (syscall::fast から、自分だけの表に): PTE を写した新しい表 (領域はまだ空) を作る。
+    /// clone は大きなロックを取ってから、領域 (ファイルの Rc) を写して使う (fork_from)。fork で大きなロックを持つ時間の
+    /// 半分ほどが PTE を写す時間だった (4 つの CPU で 1 回 75 µs ほど)。表を変えている人 (mutators) がいる、スワップへ出した
+    /// ページがある、メモリが足りないときは None (大きなロックの中の fork で)。そのあいだに大きなロックを持ってこの表を
+    /// 変えたり読んだりするもの (スワップの追い出し、/proc) は、fast_users が 0 になるのを待つ (quiesce)
+    pub fn prefork(&mut self) -> Option<Prefork> {
+        if !self.fast_enter() {
+            return None;
+        }
+        let r = PageTable::new().and_then(|new| {
+            let areas = self.areas();
+            let ok = self.copy_ptes(&new, &areas, true);
+            // 親の PTE を書きこみ禁止にしたので、しくじっても消す
+            fence(Ordering::SeqCst);
+            flush_all_in(self.root_pa());
+            ok.then_some(Prefork { pt: new, areas })
+        });
+        self.fast_leave();
+        r
+    }
+
+    /// prefork で作っておいた表を使って fork を終える (大きなロックの中で)。そのあとに領域が変わっていれば (ないはず
+    /// だが) 捨てて、いつもの fork
+    pub fn fork_from(&mut self, pre: Prefork) -> Option<PageTable> {
+        if self.areas() != pre.areas {
+            drop(pre);
+            return self.fork();
+        }
+        let mut new = pre.pt;
+        new.vmas = self.vmas.clone();
         Some(new)
     }
 
@@ -2938,29 +3017,61 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
-        // どの CPU にも「載っている」と思わせない (activate_lazy が、同じ場所に作りなおされたものを載せなおすように)
-        let root = self.root_pa();
-        for a in ACTIVE_ROOT.iter() {
-            let _ = a.compare_exchange(root, 0, Ordering::Relaxed, Ordering::Relaxed);
+        // 表はもう外した (release_deferred)
+        if self.root.is_null() {
+            return;
         }
+        unload(self.root_pa());
         let _m = self.mutating();
         let files = self.shared_ranges(0, MAXVA);
-        fn free_level(table: *mut u64, level: usize) {
-            for i in 0..512 {
-                let e = unsafe { *table.add(i) };
-                if level < 3 {
-                    if e & PTE_VALID != 0 {
-                        free_level(table_at(e), level + 1);
-                    }
-                } else if has_page(e) {
-                    kalloc::put(page_of(e));
-                } else if is_swap(e) {
-                    swap::free(slot_of(e));
-                }
-            }
-            kalloc::free(table as *mut u8);
-        }
-        free_level(self.root, 1);
+        free_level(self.root, 1, false);
         release_shared_ranges(&files);
     }
+}
+
+/// どの CPU にも「載っている」と思わせない (activate_lazy が、同じ場所に作りなおされたものを載せなおすように)
+fn unload(root: usize) {
+    for a in ACTIVE_ROOT.iter() {
+        let _ = a.compare_exchange(root, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// CPU ごとの、exit で外してまだ返していないページ表の根 (PageTable::release_deferred。0 はなし)
+static DEFERRED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+/// この CPU が大きなロックを放したところで (ユーザーへ戻る、新しい子が走りだす、暇で眠る): exit で外した表を返す
+#[inline]
+pub fn free_deferred() {
+    let a = &DEFERRED[crate::smp::id()];
+    if a.load(Ordering::Relaxed) != 0 {
+        let root = a.swap(0, Ordering::Relaxed);
+        if root != 0 {
+            free_level(root as *mut u64, 1, true);
+        }
+    }
+}
+
+/// table (level 段目) から下を返す: 写っているページとスワップのスロットと、テーブルそのもの。unlocked なら大きなロックを
+/// 持たずに呼ばれている: ページは kalloc (スピンロックと atomic) だけで返せるが、スワップのスロット (swap.rs は大きなロックの中)
+/// を返すときだけ取る
+fn free_level(table: *mut u64, level: usize, unlocked: bool) {
+    for i in 0..512 {
+        let e = unsafe { *table.add(i) };
+        if level < 3 {
+            if e & PTE_VALID != 0 {
+                free_level(table_at(e), level + 1, unlocked);
+            }
+        } else if has_page(e) {
+            kalloc::put(page_of(e));
+        } else if is_swap(e) {
+            if unlocked {
+                crate::smp::lock();
+            }
+            swap::free(slot_of(e));
+            if unlocked {
+                crate::smp::unlock();
+            }
+        }
+    }
+    kalloc::free(table as *mut u8);
 }

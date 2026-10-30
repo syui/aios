@@ -299,7 +299,7 @@ fn part_of(nr: u64) -> Option<crate::parts::Part> {
     })
 }
 
-/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll、futex)
+/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll、futex、syscall)
 fn sys_span(nr: u64) -> Option<&'static str> {
     use nr::*;
     Some(match nr {
@@ -343,6 +343,8 @@ fn sys_span(nr: u64) -> Option<&'static str> {
         EPOLL_PWAIT | EPOLL_PWAIT2 => "epoll:wait",
         FUTEX => "futex:futex",
         FUTEX_WAITV => "futex:waitv",
+        CLONE | CLONE3 => "syscall:clone",
+        WAIT4 => "syscall:wait4",
         _ => return None,
     })
 }
@@ -955,6 +957,14 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
                 Some(()) => 0,
                 None => return false,
             }
+        }
+        // fork (CLONE_VM のない clone): 自分だけの表なら、PTE の写しだけ先にここで作っておく (vm::PageTable::prefork)。
+        // clone そのものは大きなロックの道で (proc::clone が使う)
+        CLONE => {
+            if a[0] & proc::CLONE_VM == 0 {
+                p.prefork = p.mm.as_ref().filter(|m| m.private()).and_then(|m| m.get().pt.prefork());
+            }
+            return false;
         }
         LSEEK => match crate::file::fast_lseek(p, a[0], a[1] as i64, a[2]) {
             Some(r) => r,

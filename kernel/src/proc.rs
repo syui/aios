@@ -323,6 +323,9 @@ pub struct Proc {
     /// 代表でないスレッドが execve した (代表スレッドに置く): 読みこんだプログラムとパス。
     /// 代表スレッドが check_killed でそれになって続ける (Linux と同じく PID はそのまま、親から見て終わらない)
     exec_takeover: Option<(Image, String)>,
+    /// fork の前半: 大きなロックの外 (syscall::fast) で PTE を写しておいた表。その例外の中で clone が使うか、
+    /// 使わなければ trap.rs が捨てる (drop_prefork)
+    pub prefork: Option<crate::vm::Prefork>,
     /// execve を引きついだばかり: 割り込まれた前のシステムコールをやり直さない (signal::deliver が見る)
     pub no_restart: bool,
     /// ジョブ制御 (代表スレッドだけが使う): 止められているか、
@@ -429,6 +432,7 @@ impl Proc {
         clear_tid: 0,
         vfork_parent: 0,
         exec_takeover: None,
+        prefork: None,
         no_restart: false,
         stopped: false,
         stop_report: 0,
@@ -638,6 +642,18 @@ static LIVE: Bkl<[u64; WORDS]> = Bkl::new([0; WORDS]);
 
 fn slot_of(p: &Proc) -> usize {
     (p as *const Proc as usize - PROCS.ptr() as usize) / size_of::<Proc>()
+}
+
+/// fork の前半 (syscall::fast の prefork) を、その例外の中で clone が使わなかった (clone が早くにしくじった、わざと
+/// しくじらせた): 捨てる (trap.rs。次の fork が古い写しを使わないように)
+#[inline]
+pub fn drop_prefork() {
+    if let Some(i) = cur() {
+        let p = &mut procs()[i];
+        if p.prefork.is_some() {
+            p.prefork = None;
+        }
+    }
 }
 
 /// スロットを空ける
@@ -1024,6 +1040,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
 #[unsafe(no_mangle)]
 extern "C" fn forkret_unlock() {
     crate::smp::unlock();
+    crate::vm::free_deferred();
 }
 
 /// 次に走らせるもの: 実行できるもののうち recent が一番少ないもの (同じなら start から順に見て先のもの)。
@@ -1161,6 +1178,7 @@ pub fn scheduler() -> ! {
             // 眠るあいだに、ほかの CPU が (大きなロックを取って) いま載せているページ表を捨てるかもしれない
             crate::vm::deactivate();
             crate::smp::unlock();
+            crate::vm::free_deferred();
             crate::timer::idle(true);
             // 割り込みを止めたまま wfi で眠る (止めていても、来ている割り込みがあれば起きる)。
             // 先に割り込みを開けると、そのすきに来た IPI をここで受けてしまい、そのあとの wfi で
@@ -1462,20 +1480,31 @@ fn exit_status(status: i32) -> ! {
     if p.tgid == 1 {
         panic!("init exited with status {}", status);
     }
+    let _p = crate::prof::span("proc:exit_kids");
     for c in live() {
         if c.state != State::Unused && c.ppid == p.tgid && !c.thread {
             c.ppid = 1;
         }
     }
+    drop(_p);
+    let _p = crate::prof::span("proc:exit_files");
     p.files = None;
     crate::unix::gc_check(true);
     p.timers.clear();
+    drop(_p);
     // アドレス空間はここで捨てる (Linux の exit_mm と同じ)。前は親が wait するまでゾンビが持っていたので、OOM で
     // 殺したものが終わっても、親が片付けるまでメモリが戻らず、そのあいだに次のものまで殺していた。ゾンビの
     // /proc/PID/stat と status の大きさは 0 になる (Linux と同じ)。外してから捨てる (exec と同じ。もうユーザーの
-    // アドレスには触らない)。ほかのスレッドがまだ使っていれば、捨てるのは最後のスレッド
+    // アドレスには触らない)。ほかのスレッドがまだ使っていれば、捨てるのは最後のスレッド。自分だけの表なら、ページを
+    // 返すのは、この CPU が大きなロックを放してから (vm::PageTable::release_deferred)
+    let _p = crate::prof::span("proc:exit_mm");
     crate::vm::deactivate();
+    if let Some(m) = p.mm.as_ref().filter(|m| m.private()) {
+        m.get().pt.release_deferred();
+    }
     p.mm = None;
+    drop(_p);
+    let _p = crate::prof::span("proc:exit_notify");
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
     if let Some(parent) = find(p.ppid) {
@@ -1496,6 +1525,7 @@ fn exit_status(status: i32) -> ! {
     }
     // pidfd を poll / epoll しているもの (印は pidfd_key。印なしで眠っているものも起きる)
     poll_wake(pidfd_key());
+    drop(_p);
     sched();
     unreachable!("zombie ran");
 }
@@ -1547,7 +1577,7 @@ fn killed_now() {
     exit_status(status);
 }
 
-const CLONE_VM: u64 = 0x0000_0100;
+pub const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_VFORK: u64 = 0x0000_4000;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
@@ -1594,15 +1624,23 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     let mm = if flags & CLONE_VM != 0 {
         parent.mm.clone().unwrap()
     } else {
+        let _p = crate::prof::span("proc:fork_pt");
+        let pre = parent.prefork.take();
         let m = parent.mm();
-        let pt = m.pt.fork().ok_or(-ENOMEM)?;
+        let pt = match pre {
+            Some(pre) => m.pt.fork_from(pre),
+            None => m.pt.fork(),
+        };
+        let pt = pt.ok_or(-ENOMEM)?;
         Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
     } else {
+        let _p = crate::prof::span("proc:fork_files");
         Shared::new(parent.files().clone())
     };
+    let _p = crate::prof::span("proc:fork_slot");
     let child = alloc_proc().ok_or(-EAGAIN)?;
     child.mm = Some(mm);
     child.files = Some(files);
@@ -1661,8 +1699,11 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.vfork_parent = parent.pid;
     }
     let chan = vfork_chan(child);
+    drop(_p);
+    let _p = crate::prof::span("proc:fork_run");
     make_runnable(child);
     crate::smp::wake_idle();
+    drop(_p);
     if vfork {
         // シグナルではやめない (止められたときだけ)。届いているシグナルがあると眠れないので、そのあいだはゆずりながら
         let me = current().pid;
@@ -1742,6 +1783,10 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     let old = p.mm.take();
     p.load_image(img);
     p.pt().activate();
+    // 前のアドレス空間 (fork した写し) のページを返すのも、exit と同じく大きなロックを放してから
+    if let Some(m) = old.as_ref().filter(|m| m.private()) {
+        m.get().pt.release_deferred();
+    }
     drop(old);
     // vfork の子: 親のメモリを離れたので、親は動ける
     vfork_done(p);
@@ -1772,9 +1817,11 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     let (my_tgid, my_pgid) = (me.tgid, me.pgid);
     loop {
         let mut have = false;
+        let scan = crate::prof::span("proc:wait_scan");
         // Linux と同じく古い子から (子の並びは fork した順。番号はふえるだけなので番号の順)
         let mut kids: Vec<&'static mut Proc> = live().filter(|c| c.state != State::Unused && !c.thread && c.ppid == my_tgid).collect();
         kids.sort_by_key(|c| c.pid);
+        drop(scan);
         for c in kids {
             let wanted = match pid {
                 p if p > 0 => c.pid as i64 == p,
@@ -1795,6 +1842,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             if c.state == State::Zombie && options & WEXITED != 0 {
                 let r = (crate::ns::to_local(c.pid).unwrap_or(c.pid), c.xstatus);
                 if !keep {
+                    let _p = crate::prof::span("proc:reap");
                     let t = c.utime + c.cutime;
                     free_slot(c);
                     if let Some(me) = find(my_tgid) {
