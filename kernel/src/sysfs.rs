@@ -6,6 +6,8 @@
 //   /sys/class/net/{eth0,lo}/{address,mtu,operstate,carrier,ifindex,type,flags}
 //   /sys/class/net/IF/statistics/{rx,tx}_{bytes,packets,errors,dropped}
 //   /sys/devices/system/cpu/{online,possible,present} と cpuN/online
+//   /sys/kernel/security                             securityfs をかぶせるところ (securityfs.rs)
+//   /sys/module/apparmor/parameters/enabled          Y (aios.off=apparmor なら N。libapparmor の aa_is_enabled が読む)
 // 大きさはセクタ (512 バイト)、stat は /proc/diskstats の 4 列目からの 11 列と同じ
 use crate::vfs::*;
 use alloc::format;
@@ -49,6 +51,12 @@ enum Node {
     CpuFile(u8),
     CpuN(u16),
     CpuOnline(u16),
+    Kernel,
+    Security,
+    Module,
+    ModAa,
+    ModAaParams,
+    ModAaEnabled,
 }
 
 pub struct SysInode {
@@ -96,6 +104,12 @@ impl SysInode {
             Node::Devices => 7,
             Node::System => 8,
             Node::Cpu => 9,
+            Node::Kernel => 10,
+            Node::Security => 11,
+            Node::Module => 12,
+            Node::ModAa => 13,
+            Node::ModAaParams => 14,
+            Node::ModAaEnabled => 15,
             Node::DiskFile(i) => 0x100 + i as u64,
             Node::QueueFile(i) => 0x200 + i as u64,
             Node::CpuFile(i) => 0x300 + i as u64,
@@ -111,7 +125,10 @@ impl SysInode {
     }
 
     fn is_dir(&self) -> bool {
-        matches!(self.node, Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::CpuN(_))
+        matches!(
+            self.node,
+            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams
+        )
     }
 
     fn content(&self) -> Result<String, i64> {
@@ -172,6 +189,7 @@ impl SysInode {
             }
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
+            Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
             _ => return Err(-EISDIR),
         })
     }
@@ -222,8 +240,14 @@ impl Inode for SysInode {
                 "block" => Node::Block,
                 "class" => Node::Class,
                 "devices" => Node::Devices,
+                "kernel" => Node::Kernel,
+                "module" => Node::Module,
                 _ => return Err(-ENOENT),
             },
+            Node::Kernel if name == "security" => Node::Security,
+            Node::Module if name == "apparmor" => Node::ModAa,
+            Node::ModAa if name == "parameters" => Node::ModAaParams,
+            Node::ModAaParams if name == "enabled" => Node::ModAaEnabled,
             Node::Block if name == disk_name() => Node::Disk,
             Node::Disk if name == "queue" => Node::Queue,
             Node::Disk => match DISK_FILES.iter().position(|x| *x == name) {
@@ -270,7 +294,14 @@ impl Inode for SysInode {
                 add("block".into(), Node::Block);
                 add("class".into(), Node::Class);
                 add("devices".into(), Node::Devices);
+                add("kernel".into(), Node::Kernel);
+                add("module".into(), Node::Module);
             }
+            Node::Kernel => add("security".into(), Node::Security),
+            Node::Security => {}
+            Node::Module => add("apparmor".into(), Node::ModAa),
+            Node::ModAa => add("parameters".into(), Node::ModAaParams),
+            Node::ModAaParams => add("enabled".into(), Node::ModAaEnabled),
             Node::Block => {
                 if !crate::block::parts().is_empty() {
                     add(disk_name(), Node::Disk);

@@ -125,6 +125,12 @@ pub trait Inode {
     fn path_cacheable(&self) -> bool {
         false
     }
+
+    /// write の長さを分けずに 1 回の write_at で受けとる (Linux の simple_write_to_buffer で中身をみな読むもの:
+    /// AppArmor の .load。ふつうは 64 KiB ずつ)
+    fn whole_write(&self) -> bool {
+        false
+    }
     fn truncate(&self, len: usize) -> Result<(), i64>;
     fn readlink(&self) -> Result<String, i64>;
 

@@ -273,6 +273,9 @@ fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
 
 /// 一度に運ぶ大きさ
 const CHUNK: usize = 64 * 1024;
+/// 分けずに受けとるもの (Inode::whole_write) の 1 回の上限
+const WHOLE_MAX: usize = 16 << 20;
+const ENOMEM: i64 = 12;
 
 /// 中身を 0 にしない n バイト (すぐ全部書きこむか、書いた分だけ使うところ用)。ヒープが取れなければ ENOMEM
 /// (panic しない: heap::try_vec)
@@ -596,9 +599,19 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
     if let Some(i) = ino {
         vfs::drop_privs(&i)?;
     }
+    // 分けずに 1 回で受けとるもの (AppArmor の .load。Inode::whole_write) は、16 MiB まで長さぶんをみな
+    let chunk = match &f.borrow().kind {
+        Kind::Inode(i, _) if i.whole_write() => {
+            if len > WHOLE_MAX {
+                return Err(-ENOMEM);
+            }
+            len.max(1)
+        }
+        _ => CHUNK,
+    };
     let mut done = 0;
     loop {
-        let mut tmp = uninit((len - done).min(CHUNK))?;
+        let mut tmp = uninit((len - done).min(chunk))?;
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = file::write_opt2(&f, &tmp, flags & RWF_NOWAIT != 0, append);
         // AF_UNIX のソケットは unix.rs で (SOCK_STREAM だけ: Linux の unix_stream_sendmsg)
@@ -2790,6 +2803,7 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
             }
             "proc" => crate::procfs::new_root(),
             "sysfs" => crate::sysfs::new_root(),
+            "securityfs" => crate::securityfs::new_root(),
             _ => return Err(-ENODEV),
         };
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };

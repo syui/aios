@@ -4,6 +4,8 @@
 extern crate alloc;
 
 mod aiproc;
+mod apparmor;
+mod securityfs;
 mod trace;
 mod fail;
 mod oom;

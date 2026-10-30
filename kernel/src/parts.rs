@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy)]
 pub enum Part {
     Aiproc,
+    Apparmor,
     Bcm2835Rng,
     Epoll,
     Inotify,
@@ -28,8 +29,9 @@ pub enum Part {
 }
 
 /// Part と同じ順の名前 (kernel.json の name)
-const NAMES: [&str; 16] = [
+const NAMES: [&str; 17] = [
     "aiproc",
+    "apparmor",
     "bcm2835_rng",
     "epoll",
     "inotify",
@@ -52,7 +54,8 @@ static OFF: AtomicU64 = AtomicU64::new(0);
 
 /// 動かしたまま切ったり入れたりしてよいもの (使うたびに off を見るもの)。装置 (bcm2835_rng、net、virtio_rng) は起動の
 /// ときに起こすかどうかなので、あとからは変えられない。aiproc を切ると /proc/ai/ctl 自身が消えるのでこれも
-const RUNTIME: u64 = bit(Part::Epoll)
+const RUNTIME: u64 = bit(Part::Apparmor)
+    | bit(Part::Epoll)
     | bit(Part::Inotify)
     | bit(Part::Landlock)
     | bit(Part::Module)
