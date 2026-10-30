@@ -78,6 +78,13 @@ static void hex16(const unsigned char *p, char *out) {
   for (int i = 0; i < 16; i++) sprintf(out + 2 * i, "%02x", p[i]);
 }
 
+// 16 進の 16 バイトのうち、0 のバイトの数 (乱数なら 4 つもあることはまずない)
+static int zeros16(const char *h) {
+  int z = 0;
+  for (int i = 0; i < 32; i += 2) z += h[i] == '0' && h[i + 1] == '0';
+  return z;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "at-random") == 0) {
     const unsigned char *p = (const unsigned char *)getauxval(AT_RANDOM);
@@ -147,6 +154,8 @@ int main(int argc, char **argv) {
   ok(at && child_at_random(argv[0], c1) == 0 && child_at_random(argv[0], c2) == 0, "AT_RANDOM of children");
   ok(strcmp(mine, c1) && strcmp(mine, c2) && strcmp(c1, c2) && strcmp(mine, "00000000000000000000000000000000"),
      "AT_RANDOM differs per exec");
+  // auxv のおしまい (AT_NULL) が重なって 0 にしていないか (前の aios は 16 バイトのほとんどが 0 だった)
+  ok(zeros16(mine) < 4 && zeros16(c1) < 4 && zeros16(c2) < 4, "AT_RANDOM is not zeroed");
 
   // /proc/sys/kernel/random
   char s1[64], s2[64];

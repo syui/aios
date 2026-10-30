@@ -185,8 +185,10 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     let base = USER_STACK_TOP - 8 - total;
     let (argc, envc) = (argv.len(), envp.len());
     let random = base - 16;
-    let nauxv = 17;
-    let words = 1 + argc + 1 + envc + 1 + nauxv * 2;
+    // auxv の数 (下の並びの型もこれで、ずれないように。前は AT_HWCAP2 を足して 18 になったのにここが 17 のままで、
+    // おしまいの AT_NULL が AT_RANDOM の 16 バイトに重なり、そのほとんどを 0 にしていた: glibc のスタックの番人も)
+    const NAUXV: usize = 18;
+    let words = 1 + argc + 1 + envc + 1 + NAUXV * 2;
     let sp = (random - words * 8) & !15;
     if sp < USER_STACK_TOP - ARG_MAX {
         return Err(-E2BIG);
@@ -206,7 +208,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     crate::rand::fill(&mut img[random - sp..random - sp + 16]);
 
     let hw = hwcaps();
-    let auxv: [(u64, u64); 18] = [
+    let auxv: [(u64, u64); NAUXV] = [
         (AT_PHDR, phdr_va as u64),
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
