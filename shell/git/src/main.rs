@@ -18,6 +18,7 @@ const CI: &str = r#"{"type":"object","properties":{
 "sha":{"type":"string","description":"コミット (既定: HEAD)"},
 "repo":{"type":"string","description":"GitHub の owner/name (既定: origin の URL から)"},
 "dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
+"workflow":{"type":"string","description":"この名前の run だけ (例: unix。何時間もかかるほかの run を待たないとき)"},
 "wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ。0 なら待たずにいまの様子)"}}}"#;
 
 /// push していないコミットを見るのはここまで
@@ -298,6 +299,7 @@ fn ci(v: &Value) -> Value {
             Ok(r) => r["workflow_runs"].as_array().cloned().unwrap_or_default(),
             Err(e) => return error(e),
         };
+        let runs: Vec<Value> = runs.into_iter().filter(|r| s(a, "workflow").is_empty() || s(r, "name") == s(a, "workflow")).collect();
         let done = !runs.is_empty() && runs.iter().all(|r| r["status"] == "completed");
         if done || t0.elapsed() + POLL > wait {
             break runs;
