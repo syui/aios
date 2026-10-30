@@ -395,7 +395,13 @@ impl Shell {
         let disk = FileId::of(&exe);
         let rebuilt = disk.is_some() && disk != file;
         if rebuilt {
-            problems.push("aish: rebuilt after the server started; it restarts itself with the new build at the next tool call".into());
+            // うしろのジョブが動いているあいだは入れかわらない (should_reload。入れかわるとジョブが止まる)
+            let running: Vec<String> = JOBS.lock().map(|j| j.iter().filter(|x| x.done.is_none()).map(|x| x.id.to_string()).collect()).unwrap_or_default();
+            problems.push(if running.is_empty() {
+                "aish: rebuilt after the server started; it restarts itself with the new build at the next tool call".into()
+            } else {
+                format!("aish: rebuilt after the server started; it restarts itself with the new build at the first tool call after job {} ends (or job kill)", running.join(", "))
+            });
         }
         // ソースのほうが新しい: まだビルドしていない (ディスクのバイナリとくらべる)
         let stale = |dirs: &[String], bin: Option<u64>| -> Option<String> {
@@ -845,6 +851,7 @@ pub fn render(r: &Value) -> String {
 fn render_body(r: &Value, o: &serde_json::Map<String, Value>) -> String {
     let mut s = String::new();
     let mut meta = serde_json::Map::new();
+    let mut files = false;
     for (k, v) in o {
         match (k.as_str(), v) {
             ("out" | "text", Value::String(t)) => s.push_str(t),
@@ -880,6 +887,28 @@ fn render_body(r: &Value, o: &serde_json::Map<String, Value>) -> String {
                     s.push_str(&format!("{} {}: {}\n", n, m["line"], m["text"].as_str().unwrap_or("")));
                 }
             }
+            // read の paths と edit の edits (いくつものファイル) の files: ファイルごとに path と残り (lines、error など) の
+            // 1 行、そのあと中身 (1 つのときと同じ形)。JSON の文字列のままだと改行もタブも \n \t になって読めない
+            // (aish-fix と aish-pkg の files はファイルの名前の一覧なので、そのまま JSON に)
+            ("files", Value::Array(fs)) if !fs.is_empty() && fs.iter().all(|f| f["path"].is_string()) => {
+                files = true;
+                for f in fs {
+                    let mut rest = f.as_object().cloned().unwrap_or_default();
+                    let text = rest.remove("text");
+                    s.push_str(rest.remove("path").as_ref().and_then(|p| p.as_str()).unwrap_or(""));
+                    if !rest.is_empty() {
+                        s.push(' ');
+                        s.push_str(&Value::Object(rest).to_string());
+                    }
+                    s.push('\n');
+                    if let Some(Value::String(t)) = &text {
+                        s.push_str(t);
+                        if !t.ends_with('\n') {
+                            s.push('\n');
+                        }
+                    }
+                }
+            }
             // 空の一覧 (skipped: [] など) は何も伝えないので出さない
             (_, Value::Array(a)) if a.is_empty() => {}
             // grep の engine (rg か aish か) と、切れていない truncated: false も
@@ -890,7 +919,7 @@ fn render_body(r: &Value, o: &serde_json::Map<String, Value>) -> String {
         }
     }
     // out と text のないもの (edit の答えなど) は、いままでどおり JSON だけ
-    if s.is_empty() && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") && !o.contains_key("items") && !o.contains_key("changed") {
+    if s.is_empty() && !files && !o.contains_key("out") && !o.contains_key("text") && !o.contains_key("matches") && !o.contains_key("items") && !o.contains_key("changed") {
         return r.to_string();
     }
     if !s.is_empty() && !s.ends_with('\n') {

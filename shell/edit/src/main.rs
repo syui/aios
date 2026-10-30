@@ -60,7 +60,7 @@ fn main() {
             Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}。paths でいくつもまとめて ({files: [...]}、\"a.rs:10-40\" で行の範囲)。ディレクトリなら {dir: true, entries}", input: READ },
             Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。edits に path をつけるといくつものファイルを 1 回で ({files: [...]})。undo で戻せる (1 回でみな)", input: EDIT },
             Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", input: WRITE },
-            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}", input: GREP },
+            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}。見つけた行には番号 n (行の前の 1 2 3。- は ctx の前後の行) がつき、hit でそのまわりを読める", input: GREP },
             Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", input: SED },
             Tool { name: "lines", desc: "行の番号で置きかえる / 入れる (insert) / 消す (text なし)。old でいまの中身を確かめる。undo で戻せる", input: LINES },
             Tool { name: "hit", desc: "grep の n 番のまわりを行の番号つきで読む。{n, path, line, text}", input: HIT },

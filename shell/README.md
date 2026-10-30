@@ -82,7 +82,8 @@ claude mcp add aish -- aish --mcp     # Claude Code から
   ほかのツールが使える。子はプロトコルとプラグインとの口を閉じる (持ったままだと、サーバーが終わってもつなぎ先は
   閉じたと気づかずに、どのツールも 60 秒待って時間切れになり、プラグインも残った)
 - 答えの `content` の text は読みやすい形: `out` と `text` (read、hit) はエスケープせずにそのまま、`err` は `[err]` のあと、
-  grep はファイルごとに、パスの行のあとに 1 行に 1 つ (`n line: text`)、ほかは終わりに 1 行の JSON (なにもなければ出さない)。`aish --mcp --json` なら、いままでどおり
+  grep はファイルごとに、パスの行のあとに 1 行に 1 つ (`n line: text`)、read の `paths` と edit のいくつものファイル (`files`) は
+  ファイルごとに、パスと残り (`{"lines":12}` や `{"error":...}`) の 1 行のあとに中身、ほかは終わりに 1 行の JSON (なにもなければ出さない)。`aish --mcp --json` なら、いままでどおり
   JSON の text と `structuredContent` (ほかのプログラムがつなぐとき。Claude Code は structuredContent があると
   そちらを見せるので、ふだんは付けない)
 - 出力が長い (12000 バイトより) ときは、頭と終わりだけを行の切れ目で返し、まん中は `... (N lines, M bytes cut ...) ...` になる。
