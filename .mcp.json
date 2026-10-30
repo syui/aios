@@ -3,6 +3,10 @@
     "aish": {
       "command": "bin/aish-mcp.sh",
       "args": []
+    },
+    "aigpt": {
+      "command": "bin/aigpt-mcp.sh",
+      "args": []
     }
   }
 }

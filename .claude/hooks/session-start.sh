@@ -2,7 +2,8 @@
 # クラウドのセッションが始まるときに: aios のビルドと aish-pkg に要るものを入れ、aish を先にビルドしておく
 #   zstd (bin/mkpkg.sh)、qemu-user-static (pkg_test と meson の exe_wrapper)、meson (gtk などの C のパッケージ)、
 #   libwayland-bin (gtk3 の wayland-scanner)、gcc-aarch64-linux-gnu (musl の libc.so)、
-#   rustup の target (カーネルと aios のコマンドと aiboot)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)
+#   rustup の target (カーネルと aios のコマンドと aiboot)。aish は bin/aish-mcp.sh --build (MCP が 30 秒で起きるように)、
+#   aigpt も bin/aigpt-mcp.sh --build (ビルドと、アイの記憶を PDS から)
 # そのあと、うしろで bin/setup-build.sh (clang-20、glslang、mtools など、残りのビルドの道具。/tmp/setup-build.log)
 # と、aios.img がなければリリース latest のディスク (CI が main への push ごとに作って起動をたしかめたもの) を
 # 取ってきて展開する (/tmp/aios-img.log)。aish の vm (kernel: "." でも) がすぐ使えるように
@@ -24,6 +25,8 @@ rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarc
 # 浅いクローンだと pkgver() (git rev-list --count) が小さくなり、パッケージが古い版に見える
 [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ] && git fetch -q --unshallow origin || true
 bin/aish-mcp.sh --build
+# aigpt (アイの記憶の MCP) を入れ、記憶を PDS から取ってくる。git.syui.ai に届かなくても aios の残りの準備は続ける
+bin/aigpt-mcp.sh --build || echo "aigpt-mcp.sh --build: failed" >&2
 # 残りの道具 (大きいのでうしろで。終わりは /tmp/setup-build.log の setup-build: ok)
 nohup bin/setup-build.sh > /tmp/setup-build.log 2>&1 &
 # とちゅうのものを aios.img と思わないように、.part に展開してから名前を変える。GitHub が新しいので先に

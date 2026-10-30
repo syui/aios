@@ -1,5 +1,5 @@
 {
-  "enabledMcpjsonServers": ["aish"],
+  "enabledMcpjsonServers": ["aish", "aigpt"],
   "hooks": {
     "SessionStart": [
       {
