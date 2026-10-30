@@ -382,6 +382,11 @@ impl Plugins {
         }
     }
 
+    /// 生きているプラグインのプログラムと引数 (aish --mcp が入れかわるとき、run の中で読んだものも起こしなおすため)
+    pub fn loaded(&self) -> Vec<Vec<String>> {
+        self.list.iter().filter(|p| p.alive).map(|p| std::iter::once(p.prog.clone()).chain(p.args.iter().cloned()).collect()).collect()
+    }
+
     /// 端末なしで呼べる機能の一覧: (プラグインの名前, { name, description, input })
     pub fn tools(&self) -> Vec<(String, Value)> {
         self.list.iter().filter(|p| p.alive).flat_map(|p| p.tools.iter().map(move |t| (p.name.clone(), t.clone()))).collect()

@@ -185,6 +185,13 @@ impl Shell {
         }
         if resumed {
             RELOADED.store(true, Ordering::Relaxed);
+            // 設定になく、run の中の plugin NAME で読んだものも起こしなおす (入れかわってもツールが消えないように)
+            let was: Vec<Vec<String>> = std::env::var("AISH_MCP_PLUGS").ok().and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default();
+            unsafe { std::env::remove_var("AISH_MCP_PLUGS") };
+            let have: Vec<String> = self.plugins.loaded().into_iter().filter_map(|p| p.into_iter().next()).collect();
+            for p in was.into_iter().filter(|p| p.first().is_some_and(|prog| !have.contains(prog))) {
+                self.builtin(&std::iter::once("plugin".to_string()).chain(p).collect::<Vec<_>>());
+            }
             // 前より少ないプラグインしか起きなければ、答えに書く (設定が読めなかったなど)
             let before: usize = std::env::var("AISH_MCP_NPLUG").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
             let now = self.plugins.check().len();
@@ -244,7 +251,10 @@ impl Shell {
                     rest.push('\n');
                 }
                 rest.push_str(&String::from_utf8_lossy(reader.buffer()));
-                unsafe { std::env::set_var("AISH_MCP_NPLUG", self.plugins.check().len().to_string()) };
+                unsafe {
+                    std::env::set_var("AISH_MCP_NPLUG", self.plugins.check().len().to_string());
+                    std::env::set_var("AISH_MCP_PLUGS", json!(self.plugins.loaded()).to_string());
+                }
                 // 古いプラグインは閉じた標準入力で終わる。親 (exec したあとの自分) が待たないとゾンビで残るので、
                 // pid をわたして新しいほうが待つ
                 let pids: Vec<String> = self.plugins.pids().iter().map(|p| p.to_string()).collect();
@@ -252,9 +262,14 @@ impl Shell {
                 reload(&rest, &mut reader, &out);
                 unsafe {
                     std::env::remove_var("AISH_MCP_NPLUG");
+                    std::env::remove_var("AISH_MCP_PLUGS");
                     std::env::remove_var("AISH_MCP_REAP");
                 }
             }
+            // run の中の plugin NAME (や、止まったプラグイン) でツールが変わったら、答えのあとで知らせる
+            // (Claude Code は知らせを受けて tools/list を読みなおし、新しいツールがすぐ使える)
+            let names = |sh: &Shell| -> Vec<String> { sh.plugins.tools().into_iter().map(|(_, t)| t["name"].as_str().unwrap_or("").to_string()).collect() };
+            let before = (req["method"] == "tools/call").then(|| names(self));
             let reply = match req["method"].as_str().unwrap_or("") {
                 "initialize" => Ok(json!({
                     "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or(PROTOCOL),
@@ -272,6 +287,9 @@ impl Shell {
                 Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
             };
             send(&mut out, &msg);
+            if before.is_some_and(|b| b != names(self)) {
+                send(&mut out, &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }));
+            }
         }
         super::exit_shell(self.status)
     }

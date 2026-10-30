@@ -28,6 +28,7 @@ bindkey                       # 一覧
 | `aish-claude` | base | 見つからなかったコマンドの行を `claude -p` に渡し、答えを端末に出す (claude があれば。人が打つときだけ。`AISH_CLAUDE=0` で止める。`AISH_AI=local` なら aish-local にゆずる)。aios の Claude Code は `/etc/claude-code/managed-mcp.json` で `aish --mcp` を使う |
 | `aish-local` | base | aish-claude のうしろで、claude が答えなかったとき (ない、`AISH_CLAUDE=0`、`AISH_AI=local`) に、見つからなかったコマンドの行を llama-server (このマシンの AI。`AISH_LOCAL_URL`、既定 `http://127.0.0.1:8080`) の `/v1/chat/completions` に渡し、答えを届いたところから端末に出す (Ctrl-C で止まる)。答えるだけでコマンドは動かさない。15 分以内の 4 つまでのやりとりを `~/.cache/aish/local.json` に残して続けて話す。動いていなければふつうの command not found (`/var/lib/ai/model.gguf` があれば起こし方を 1 度だけ)。前置きは `AISH_LOCAL_SYSTEM` (空なら前置きなし)、`AISH_LOCAL=0` で止める |
 | `aish-wait` | base | ツールだけ: `wait` (プロセスが終わる、ファイルに文字が出る、ポートが開く、まで)。`aish --mcp` で読む |
+| `aish-fetch` | base | ツールだけ: `fetch` (url か file を curl で。JSON なら `path` (`.a.b[0].c`、`.items[].name`、`.a[-1]`) で取り出し、`fields` (`["name","head.msg"]`) で配列の 1 つずつを `name=x  head.msg=y` の 1 行に。`method` `body` `headers` も)。`curl \| python3 -c json` のかわり。`aish --mcp` で読む |
 | `aish-vm` | (開発のマシン) | ツールだけ。aios を作るマシン (Linux) で、QEMU の VM を相手にする (`bin/aish-mcp.sh` の aish が読む): `vm` (start: カーネルを選んで起こす。パス / `.` で作業中のソースから / git のコミット。stop status run (`bg: true` で中でうしろで動かしてすぐ答え、`job` (`id`、`wait_ms`、`kill`) で様子と、前に見せたところから先の出力。50 秒より長い ap -S firefox なども。中では /tmp/.vmjob/ID.sh をサブシェルで . で読み、出力・終わりの番号・pid をとっておく。止めるときはグループごと) put get (中のファイルを外へ: gzip と base64 を 1 行にしてシリアルで。sha256 を確かめる。中で撮った png を Read で見るなど) shot keys (`@alt-b` などと文字) log (grep) mon。`test/vm.py` を呼ぶ) `try` (C / C++ を `zig cc` で aarch64 の静的なプログラムにして、VM の中で動かして出力と終了コード) `ab` (2 つのカーネルで同じコマンドを n 回ずつ: 時間のまんなか・範囲と大きなロックの割合、範囲が重ならなければ clear) `bisect` (good と bad のあいだを git bisect: コミットごとにカーネルを作って VM で test。0 good、125 skip、ほか bad) `box` (カーネルの砂場: kernel.json の extra や quirk を起動の引数 `aios.off=` で切って起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。`each` で 1 つずつ全部。`vm` の start にも `off`) `bench` (ファイルまわりの速さ: test/fsbench.c を n 回、op ごとの µs のまんなかと、prof をつけた 1 回の /proc/ai/prof の part ごとの割合。`against` で 2 つのカーネルをくらべる。結果は build/aish-vm/bench/ にも)。ab・bisect・box の test はサブシェルで (exit で中のシェルごと終わらないように)。start・ab・bisect・box・bench はうしろで動き、もういちど呼ぶと様子か結果。ab・bisect・box・bench は動いている VM を止めて `-snapshot` で起こしなおす。カーネルは `build/aish-vm/` に作ってとっておく |
 | `aish-powerline` | aish-powerline | powerline のプロンプト |
 
@@ -100,7 +101,8 @@ claude mcp add aish -- aish --mcp     # Claude Code から
 - aish かプラグインをビルドしなおすと、次にツールを使ったときに、aish が同じつながりのまま新しいビルドに入れかわる
   (自分を exec しなおし、`notifications/tools/list_changed` を送る。`/mcp` でつなぎなおさなくてよい)。いまのディレクトリは残り、
   シェルの変数は空に戻る (答えに `reloaded`)。ビルドの途中 (cargo が動いている)、うしろのジョブが動いているか、
-  終わっても job で読んでいないときは待つ (入れかわるとその出力がなくなる)
+  終わっても job で読んでいないときは待つ (入れかわるとその出力がなくなる)。設定にない、`run` の中の `plugin NAME` で読んだものも
+  起こしなおす。`run` の中の `plugin NAME` でツールが変わったときも `notifications/tools/list_changed` を送る (すぐ使える)
 - `check` はつながりの様子: aish の版と起きてからの時間、プラグインが生きているか (止まったわけ)、起きたあとに
   ビルドしなおしたもの (`/mcp` でつなぎなおすと新しくなる)。`AISH_SRC` (`bin/aish-mcp.sh` がリポジトリを入れる)
   があれば、ソースがバイナリより新しいもの (ビルドが要る) と、うしろで動いている cargo も。`problems` が空なら `ok`

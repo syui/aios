@@ -23,9 +23,9 @@ plugin aish-pkg
 [ -z "$AISH_MCP" ] && plugin aish-claude
 # claude が答えなかったら (ない、AISH_CLAUDE=0、AISH_AI=local)、このマシンの AI (llama-server のアイ) に。AISH_LOCAL=0 で止める
 [ -z "$AISH_MCP" ] && plugin aish-local
-# aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、
-# 何かが起きるまで待つ aish-wait も
-[ -n "$AISH_MCP" ] && plugin aish-edit && plugin aish-wait
+# aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit、
+# 何かが起きるまで待つ aish-wait、HTTP で取ってきて JSON を取り出す aish-fetch も
+[ -n "$AISH_MCP" ] && plugin aish-edit && plugin aish-wait && plugin aish-fetch
 
 alias ls='ls -a --color=auto'
 alias ll='ls -alh --color=auto'

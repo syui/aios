@@ -18,7 +18,7 @@ def check(name, ok, detail=''):
 # 入れかわりをためすので、aish とプラグインはコピーを使う
 os.makedirs(work + '/plug')
 shutil.copy(aish, work + '/aish')
-for p in ['aish-edit', 'aish-map', 'aish-wait']:
+for p in ['aish-edit', 'aish-map', 'aish-wait', 'aish-fetch']:
     shutil.copy(os.path.join(plugins, p), work + '/plug/' + p)
 open(work + '/my.rc', 'w').write('plugin aish-edit\nplugin aish-map\nplugin aish-wait\n')
 os.makedirs(work + '/home')
@@ -76,6 +76,17 @@ job = json.loads(t)['job']
 t1 = tool('job', {'id': job, 'wait_ms': 700})
 t2 = tool('job', {'id': job, 'wait_ms': 5000})
 check('job only new output', 's1' in t1 and 's1' not in t2 and 's3' in t2 and 'shown_before' in t2, t1 + ' / ' + t2)
+# run の中の plugin NAME でツールが増えたら tools/list_changed を知らせる (答えのあとなので、次の答えまでに notes に入る)
+n0 = notes.count('notifications/tools/list_changed')
+tool('run', {'cmd': 'plugin aish-fetch'})
+tool('check', {})
+check('plugin load notifies', notes.count('notifications/tools/list_changed') == n0 + 1, str(notes))
+# fetch: file と file:// の url。JSON の道 (path) と fields (配列の 1 つずつを 1 行に)
+open(work + '/d.json', 'w').write(json.dumps({'runs': [{'name': 'unix', 'status': 'ok'}, {'name': 'pkg', 'status': 'queued'}]}))
+t = tool('fetch', {'file': work + '/d.json', 'path': '.runs', 'fields': ['name', 'status']})
+check('fetch fields', t.startswith('name=unix  status=ok\nname=pkg  status=queued\n'), t)
+t = tool('fetch', {'url': 'file://' + work + '/d.json', 'path': '.runs[-1].name'})
+check('fetch url path', t.startswith('pkg\n'), t)
 # 終わったジョブは、job で見るまで、ほかのツールの答えに 1 度だけ jobs_done で添える
 t = tool('run', {'cmd': 'sleep 0.2; echo zz', 'bg': True})
 job = json.loads(t)['job']
@@ -128,7 +139,8 @@ t = tool('read', {'path': f, 'limit': 1})
 check('reload', 'reloaded' in t and 'only' not in t, t)
 check('reload notifies', 'notifications/tools/list_changed' in notes, str(notes))
 t = tool('check', {})
-check('reload keeps plugins', 'plugins 3/3 alive' in t, t)
+# 設定の 3 つと、run の中の plugin で読んだ aish-fetch も
+check('reload keeps plugins', 'plugins 4/4 alive' in t and 'fetch' in t, t)
 t = tool('run', {'cmd': 'pwd; a=(x y); echo ${a[0]}'})
 check('reload keeps dir and rc', t.startswith('/tmp\nx\n'), t)
 

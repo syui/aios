@@ -2,6 +2,7 @@
 plugin aish-pick
 plugin aish-edit
 plugin aish-wait
+plugin aish-fetch
 plugin aish-map
 plugin aish-fix
 plugin aish-sys
