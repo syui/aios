@@ -18,7 +18,7 @@ def check(name, ok, detail=''):
 # 入れかわりをためすので、aish とプラグインはコピーを使う
 os.makedirs(work + '/plug')
 shutil.copy(aish, work + '/aish')
-for p in ['aish-edit', 'aish-map', 'aish-wait', 'aish-fetch']:
+for p in ['aish-edit', 'aish-map', 'aish-wait', 'aish-fetch', 'aish-git']:
     shutil.copy(os.path.join(plugins, p), work + '/plug/' + p)
 open(work + '/my.rc', 'w').write('plugin aish-edit\nplugin aish-map\nplugin aish-wait\n')
 os.makedirs(work + '/home')
@@ -78,7 +78,7 @@ t2 = tool('job', {'id': job, 'wait_ms': 5000})
 check('job only new output', 's1' in t1 and 's1' not in t2 and 's3' in t2 and 'shown_before' in t2, t1 + ' / ' + t2)
 # run の中の plugin NAME でツールが増えたら tools/list_changed を知らせる (答えのあとなので、次の答えまでに notes に入る)
 n0 = notes.count('notifications/tools/list_changed')
-tool('run', {'cmd': 'plugin aish-fetch'})
+tool('run', {'cmd': 'plugin aish-fetch; plugin aish-git'})
 tool('check', {})
 check('plugin load notifies', notes.count('notifications/tools/list_changed') == n0 + 1, str(notes))
 # fetch: file と file:// の url。JSON の道 (path) と fields (配列の 1 つずつを 1 行に)
@@ -87,6 +87,13 @@ t = tool('fetch', {'file': work + '/d.json', 'path': '.runs', 'fields': ['name',
 check('fetch fields', t.startswith('name=unix  status=ok\nname=pkg  status=queued\n'), t)
 t = tool('fetch', {'url': 'file://' + work + '/d.json', 'path': '.runs[-1].name'})
 check('fetch url path', t.startswith('pkg\n'), t)
+# git: remote との進み、push していないコミットを、設定とちがう人がコミットしたら problems に (署名はしない設定で)
+subprocess.run('git init -q --bare r.git && git clone -q r.git w 2>/dev/null && cd w && git config user.name ai && git config user.email ai@x '
+               '&& git config commit.gpgsign false && git config user.signingkey "" && echo a > a && git add a && git commit -q -m one '
+               '&& git branch -q -m main && git push -q origin main 2>/dev/null && echo b > b && git add b && git -c user.email=c@x commit -q -m two',
+               shell=True, cwd=work, check=True)
+t = tool('git', {'dir': work + '/w'})
+check('git state', 'ahead 1' in t and 'not pushed (1)' in t and 'committed by ai <c@x>' in t and '"ok":false' in t, t)
 # 終わったジョブは、job で見るまで、ほかのツールの答えに 1 度だけ jobs_done で添える
 t = tool('run', {'cmd': 'sleep 0.2; echo zz', 'bg': True})
 job = json.loads(t)['job']
@@ -139,8 +146,8 @@ t = tool('read', {'path': f, 'limit': 1})
 check('reload', 'reloaded' in t and 'only' not in t, t)
 check('reload notifies', 'notifications/tools/list_changed' in notes, str(notes))
 t = tool('check', {})
-# 設定の 3 つと、run の中の plugin で読んだ aish-fetch も
-check('reload keeps plugins', 'plugins 4/4 alive' in t and 'fetch' in t, t)
+# 設定の 3 つと、run の中の plugin で読んだ aish-fetch と aish-git も
+check('reload keeps plugins', 'plugins 5/5 alive' in t and 'fetch' in t and 'git' in t, t)
 t = tool('run', {'cmd': 'pwd; a=(x y); echo ${a[0]}'})
 check('reload keeps dir and rc', t.startswith('/tmp\nx\n'), t)
 

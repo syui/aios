@@ -51,6 +51,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-git"
+version = "0.0.1"
+dependencies = [
+ "aish-plugin",
+]
+
+[[package]]
 name = "aish-highlight"
 version = "0.0.1"
 dependencies = [

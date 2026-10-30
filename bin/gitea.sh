@@ -1,6 +1,7 @@
 #!/bin/sh
 # git.syui.ai (gitea) へ push する
 #   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
+#                        (aish の git ツールがくらべるミラー aish.mirror も ai/os に)
 #   bin/gitea.sh os      このリポジトリの main ブランチを ai/os へ (main ブランチにいなければ GitHub の main を)
 #   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
 #                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する。ai/repo の写し
@@ -84,6 +85,8 @@ use_identity() {
 case "$1" in
   id)
     use_identity .
+    # aish の git ツールが、GitHub (origin) といっしょに ai/os とも進み・おくれをくらべるように
+    git config aish.mirror "$host/ai/os.git"
     ;;
   os)
     # main ブランチにいればそれを、ほかのブランチ (Claude の作業ブランチなど) にいれば GitHub の main (先に
