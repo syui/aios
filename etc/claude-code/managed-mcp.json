@@ -3,6 +3,10 @@
     "aish": {
       "command": "aibox",
       "args": ["-W", "~/.cache", "-W", "~/.cargo", "-w", "/proc/ai/ctl", "--", "aish", "--mcp"]
+    },
+    "aigpt": {
+      "command": "aibox",
+      "args": ["-W", "~/.cache", "-W", "~/.config/ai.syui.log", "--", "aigpt", "server"]
     }
   }
 }

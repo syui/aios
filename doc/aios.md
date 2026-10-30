@@ -134,7 +134,7 @@ sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release
 - 子にも引き継がれ、外せない。中で aibox を重ねると、もっと狭くなるだけ。`sudo` (setuid) は効かない
 - かかっているかは `/proc/self/status` の `NoNewPrivs` と `Landlock` (層の数)
 
-Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cache -W ~/.cargo -w /proc/ai/ctl -- aish --mcp` で起きる (`/proc/ai/ctl` は下の調べもののスイッチ)。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
+Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cache -W ~/.cargo -w /proc/ai/ctl -- aish --mcp` で起きる (`/proc/ai/ctl` は下の調べもののスイッチ)。アイの記憶 (aigpt、`ap -S aigpt`) は `aibox -W ~/.cache -W ~/.config/ai.syui.log -- aigpt server` (書くのは記憶と feed の既読だけ。managed-mcp.json があると `aigpt setup` の `claude mcp add` は効かないので、ここに置く)。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
 
 ## カーネルの地図 (kernel/kernel.json)
 
