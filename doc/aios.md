@@ -425,6 +425,45 @@ mmap (待ち 88%: munmap 1 回 10 µs、mmap 4 µs) と、領域を何千も持�
 あとの COW のページ、ファイルの写しをまたぐもの (ふつうの道へ)、外したところの SIGSEGV と、3 つのプロセスが 3000 回ずつ作って
 外すあいだに、親がそれぞれの /proc/PID/maps、stat、status を読みつづけるのを確かめる。のこりの大きなものは fork (clone と wait4)。
 
+### fork のページ表は大きなロックの前に写し、exit と exec で返すのはロックを放してから
+
+4 つの CPU の smpbench の fork (fork して子は _exit、親は waitpid) は、大きなロックを待つ時間が 257% で、clone が 1 回
+250 µs、wait4 が 84 µs ロックを持っていた。どこに使っているかを分けるため、clone、exit、wait4 の中に prof の区間を入れた
+(proc:fork_pt、fork_files、fork_slot、fork_run、exit_kids、exit_files、exit_mm、exit_notify、wait_scan、reap と、システム
+コールの syscall:clone、syscall:wait4)。1 回の fork で、clone は 150 µs (ページ表の PTE を写すのが 73、子のスロットを作るのが
+44 (そのうち 14 は子の tid を書くときの COW)、fd の表が 7)、exit は 121 µs (ページ表のページを返すのが 68、親に知らせるのが
+40)、wait4 は 60 µs ほど。半分ちかくが、そのプロセスだけのページ表を写すのと返すのだった。
+
+exit で返すほうは、はじめにページを返すあいだだけ大きなロックを放して取りなおしてみたが、取りなおすときにほかの CPU の
+うしろに並びなおすので、exit_mm の時間は 68 µs から 192 µs にのび、伸びは少ししか変わらなかった。いまは、そのプロセスだけの
+表 (Mm をだれとも分けていない) なら、ロックの中ではページ表の根を外すだけにして (vm::PageTable::release_deferred)、ページと
+テーブルを返すのは、その CPU がどのみちロックを放すところ (ユーザーへ戻る、新しい子が forkret から走りだす、暇で眠る:
+free_deferred) でする。Linux が exit した mm を次の切りかえのあとで捨てる (mmdrop) のと同じ。外すのは mm を None にするのと
+同じロックの中なので、ほかの CPU (procfs など) が半分返した表を見ることはない。ページは kalloc (スピンロックと atomic の数) で
+返せるが、スワップのスロットは大きなロックの中のものなので、そのときだけ取る。領域 (ファイルの Rc) はロックの中で捨てる。
+この表をいま使っている人がいるか (mutating のまま眠っているもの、fast_users)、MAP_SHARED の写しの表にこの写しのページが
+あれば (ページを返したあとに release_shared がいる) いつもの Drop で。fork した子が exec したときに捨てる前の表も同じ。
+
+fork で写すほうは、大きなロックを取る前の syscall::fast で PTE を写した新しい表を作っておき (prefork。自分だけの表のとき)、
+clone はロックを取ってから、領域 (ファイルの Rc は大きなロックの中) を写すだけにする (fork_from)。写すあいだはロックなしの
+mmap と同じく fast_users を増やしておくので、そのあいだに大きなロックを持ってこの表を変えたり読んだりするもの (スワップの
+追い出し、/proc/PID/maps、cmdline) は、写し終わるのを待つ。表を変えている人がいる、スワップへ出したページがある、メモリが
+足りないときは作らずに、いつもの fork へ。親の PTE を書きこみ禁止 (COW) にしたので、TLB はそこで消す。clone が使わなかった
+もの (clone が早くにしくじった、わざとしくじらせた) は、その例外のおしまいに trap.rs が捨てる (次の fork が古い写しを使わない
+ように)。
+
+4 つの CPU で、clone がロックを持つ時間は 1 回 250 µs から 81 µs、wait4 は 84 µs から 46 µs (TCG の上なのでゆれる)。fork は
+1 つのプロセスで 578 µs から 480 µs、4 つで 361 µs から 328 µs (Linux 7.3 は 2941 µs と 1156 µs)。ロックを待つ時間はまだ 200%
+あるので、のこりの子のスロット (alloc_proc と Proc を空に戻すこと)、親に知らせる (SIGCHLD と 2 つの wakeup)、wait4 の子さがしが
+つぎ。新しい test/forkcow.c は、子が fork したときの中身を見ること (親があとで書いても)、子が書いても親が変わらないこと、
+MAP_SHARED の無名とファイルの写しは親と子で同じページなこと、fork した子の exec、3 つのプロセスが 300 回ずつ fork と書きこみを
+くりかえすあいだに親がそれぞれの /proc/PID/maps、status、cmdline を読むのを確かめる。
+
+たしかめているあいだに test/random.c が一度だけ「AT_RANDOM が exec ごとにちがわない」で落ちた。見ると、AT_HWCAP2 を
+足して auxv が 18 になったのに、スタックの並びの大きさは 17 のままで、おしまいの AT_NULL (0 が 16 バイト) が AT_RANDOM の
+16 バイトに重なり、そのほとんどを 0 にしていた (ずれは環境の長さによる。glibc はここからスタックの番人をとる)。いまは数と
+並びの型を 1 つの定数にした。test/random.c は AT_RANDOM に 0 のバイトが 4 つ以上ないことも見る。
+
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
 プログラムは、この CPU で使える命令を AT_HWCAP と AT_HWCAP2 (getauxval) か /proc/cpuinfo の `Features` で知る。前の aios
