@@ -76,6 +76,14 @@ job = json.loads(t)['job']
 t1 = tool('job', {'id': job, 'wait_ms': 700})
 t2 = tool('job', {'id': job, 'wait_ms': 5000})
 check('job only new output', 's1' in t1 and 's1' not in t2 and 's3' in t2 and 'shown_before' in t2, t1 + ' / ' + t2)
+# 終わったジョブは、job で見るまで、ほかのツールの答えに 1 度だけ jobs_done で添える
+t = tool('run', {'cmd': 'sleep 0.2; echo zz', 'bg': True})
+job = json.loads(t)['job']
+time.sleep(0.6)
+t1 = tool('run', {'cmd': 'true'})
+t2 = tool('run', {'cmd': 'true'})
+t3 = tool('job', {'id': job})
+check('jobs_done once', ('job %d ended (status 0' % job) in t1 and 'jobs_done' not in t2 and 'zz' in t3, t1 + ' / ' + t2 + ' / ' + t3)
 
 f = work + '/a.txt'
 open(f, 'w').write('one\ntwo\nthree\nfour\n')
@@ -106,9 +114,16 @@ check('tool builtin', t.startswith('     1\tone\n     2\tTWO\n[     1\tone]\nst=
 
 # ビルドしなおし (新しい i-node) → 次のツールで入れかわる。cd したあとでも RC (相対パス) は読める
 tool('run', {'cmd': 'cd /tmp'})
+# 終わっても job で読んでいないジョブがあるあいだは、入れかわらない (入れかわるとその出力がなくなる)
+t = tool('run', {'cmd': 'echo kept', 'bg': True})
+held = json.loads(t)['job']
 shutil.copy(work + '/plug/aish-edit', work + '/plug/n')
 os.rename(work + '/plug/n', work + '/plug/aish-edit')
 time.sleep(2.5)
+t = tool('read', {'path': f, 'limit': 1})
+check('reload waits for an unread job', 'reloaded' not in t and 'jobs_done' in t, t)
+t = tool('job', {'id': held})
+check('unread job kept', 'kept' in t, t)
 t = tool('read', {'path': f, 'limit': 1})
 check('reload', 'reloaded' in t and 'only' not in t, t)
 check('reload notifies', 'notifications/tools/list_changed' in notes, str(notes))

@@ -103,6 +103,8 @@ struct BgJob {
     done: Option<(i32, u64)>,
     /// もう見せた出力のバイト数 (job は新しい分だけ返す)
     seen: (usize, usize),
+    /// 終わったことを、ほかのツールの答え (jobs_done) でもう知らせた
+    told: bool,
 }
 
 static JOBS: std::sync::Mutex<Vec<BgJob>> = std::sync::Mutex::new(Vec::new());
@@ -113,7 +115,8 @@ static STARTED: std::sync::OnceLock<(std::time::Instant, String, Option<FileId>)
 
 const INSTRUCTIONS: &str = "aish (aios のシェル) です。run はいつも同じシェルで動くので、cd や変数は次の run に残ります。\
 答えは JSON: run は {status, out, err, ms, pwd} (時間切れなら timeout: true。pwd は変わったとき、ms は 1 秒からだけ)。\
-重いもの (ビルドなど) は run の bg: true でうしろで動かし、job で様子と出力を見ると、そのあいだもほかのツールが使えます。\
+重いもの (ビルドなど) は run の bg: true でうしろで動かし、job で様子と出力を見ると、そのあいだもほかのツールが使えます \
+(終わると、job で読むまで、どのツールの答えにも jobs_done が 1 度つきます)。\
 ファイルの読み書きは read / edit / write / undo (aish-edit) を使うと確かです。\
 出力が長いと頭と終わりだけになり、まん中は答えの out_id を out に渡して探したり読んだりできます。\
 aish やプラグインをビルドしなおすと、次のツールで aish が自分で新しいものに入れかわります (変数は空に戻ります)。\
@@ -346,6 +349,13 @@ impl Shell {
         {
             o.insert("aiwatch".into(), json!(news));
         }
+        // 終わったうしろのジョブも、job で見るまではどのツールの答えにも 1 度だけ添える (MCP の客は知らせでは
+        // 起きないので、job を何度も呼んで待たなくても、ほかのことをしているあいだに終わったと気づけるように)
+        if let Some(done) = jobs_done()
+            && let Some(o) = r.as_object_mut()
+        {
+            o.insert("jobs_done".into(), json!(done));
+        }
         let is_err = r.get("error").is_some() || r.get("timeout").is_some();
         // ふだんは読む形の text だけ (Claude Code は structuredContent があるとそちらを Claude に見せるので)。
         // aish --mcp --json なら、いままでどおり JSON (ほかのプログラムがつなぐとき)
@@ -357,7 +367,8 @@ impl Shell {
     }
 
     /// 入れかわるか: aish かプラグインのバイナリが起きたときと変わっていること。書いてから 2 秒たっていなければ、
-    /// たつまで待ってから入れかわる。ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているときは入れかわらない
+    /// たつまで待ってから入れかわる。ビルドの途中 (cargo が動いている) と、うしろのジョブが動いているかまだ job で
+    /// 読んでいないときは入れかわらない
     fn should_reload(&mut self) -> bool {
         // 終わったうしろのジョブを先に集める (job で見るまで「動いている」ままだと、入れかわれず、ゾンビも残る)
         if let Ok(mut j) = JOBS.lock() {
@@ -370,7 +381,8 @@ impl Shell {
         if changed.is_empty() {
             return false;
         }
-        if JOBS.lock().is_ok_and(|j| j.iter().any(|x| x.done.is_none())) {
+        // うしろのジョブが動いているか、終わってもまだ job で読んでいない (入れかわるとその出力がなくなる)
+        if JOBS.lock().is_ok_and(|j| !j.is_empty()) {
             return false;
         }
         let src = self.get_var("AISH_SRC").filter(|s| !s.is_empty());
@@ -395,12 +407,13 @@ impl Shell {
         let disk = FileId::of(&exe);
         let rebuilt = disk.is_some() && disk != file;
         if rebuilt {
-            // うしろのジョブが動いているあいだは入れかわらない (should_reload。入れかわるとジョブが止まる)
-            let running: Vec<String> = JOBS.lock().map(|j| j.iter().filter(|x| x.done.is_none()).map(|x| x.id.to_string()).collect()).unwrap_or_default();
-            problems.push(if running.is_empty() {
+            // うしろのジョブが動いているか、終わっても job で読んでいないあいだは入れかわらない (should_reload。
+            // 入れかわるとジョブが止まり、出力もなくなる)
+            let held: Vec<String> = JOBS.lock().map(|j| j.iter().map(|x| x.id.to_string()).collect()).unwrap_or_default();
+            problems.push(if held.is_empty() {
                 "aish: rebuilt after the server started; it restarts itself with the new build at the next tool call".into()
             } else {
-                format!("aish: rebuilt after the server started; it restarts itself with the new build at the first tool call after job {} ends (or job kill)", running.join(", "))
+                format!("aish: rebuilt after the server started; it restarts itself with the new build once job {} has ended and been read with job (or job kill, then job)", held.join(", "))
             });
         }
         // ソースのほうが新しい: まだビルドしていない (ディスクのバイナリとくらべる)
@@ -615,10 +628,28 @@ impl Shell {
         let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
         let short: String = cmd.trim().chars().take(200).collect();
         if let Ok(mut js) = JOBS.lock() {
-            js.push(BgJob { id, pid, out: o, err: e, cmd: short, t0: std::time::Instant::now(), done: None, seen: (0, 0) });
+            js.push(BgJob { id, pid, out: o, err: e, cmd: short, t0: std::time::Instant::now(), done: None, seen: (0, 0), told: false });
         }
         json!({ "job": id, "pid": pid })
     }
+}
+
+/// 終わったのにまだ知らせていないうしろのジョブ: "job 1 ended (status 0, 6m 45s): bin/publish.sh; job ID reads its output"
+fn jobs_done() -> Option<String> {
+    let mut js = JOBS.lock().ok()?;
+    reap(&mut js);
+    let done: Vec<String> = js
+        .iter_mut()
+        .filter(|j| !j.told)
+        .filter_map(|j| {
+            let (st, ms) = j.done?;
+            j.told = true;
+            let st = if st < 0 { "status unknown".to_string() } else { format!("status {}", st) };
+            let cmd: String = j.cmd.lines().next().unwrap_or("").chars().take(60).collect();
+            Some(format!("job {} ended ({}, {}): {}", j.id, st, dur(ms / 1000), cmd))
+        })
+        .collect();
+    (!done.is_empty()).then(|| format!("{}; job ID reads its output", done.join("; ")))
 }
 
 /// 終わったうしろのジョブを集める
