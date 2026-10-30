@@ -10,9 +10,9 @@
 //   set -e (失敗で終わる)、set -x (実行するコマンドを見せる)
 //   bash と zsh から: ブレース展開 {a,b} {1..3}、[[ ... ]] (== のパターン、=~ の正規表現、&& || ! ( ) < >)、
 //   ** (下のディレクトリぜんぶ)、配列 a=(x y) a+=(z) $a ${a[@]} ${a[*]} ${a[N]} ${#a}
-//   (番号は zsh と同じ 1 から。setopt ksharrays で bash と同じ 0 から)、path=(...) は $PATH とつながる、
+//   (bash と同じ: 番号は 0 から、$a と ${a} は最初の要素、全部は ${a[@]})、path=(...) は $PATH とつながる、
 //   ${x:t} ${x:h} ${x:r} ${x:e} ${x:l} ${x:u} (zsh)、${x:OFF:LEN} (bash)、*.zsh(N) (.) (/) (@) (zsh のワイルドカードの修飾)、
-//   setopt / unsetopt (nullglob と ksharrays が効く)、typeset / declare、{ echo a } (zsh。} の前の ; はいらない)、
+//   setopt / unsetopt (nullglob が効く)、typeset / declare、{ echo a } (zsh。} の前の ; はいらない)、
 //   zmodload zstyle autoload compinit compdef と bindkey -M はなにもしない (.zshrc をそのまま読めるように)、$OSTYPE
 //   対話するときはジョブ制御: パイプラインごとにプロセスグループを作り、Ctrl-Z で止めて fg / bg で戻す
 //   対話するときは行の編集と履歴 (edit.rs)、alias
@@ -112,7 +112,7 @@ pub struct Shell {
     plugins: plugin::Plugins,
     /// 履歴のファイル (プラグインに教える)
     histfile: Option<String>,
-    /// setopt でつけたもの (zsh の名前を小文字にして _ を除いたもの。nullglob と ksharrays が効く)
+    /// setopt でつけたもの (zsh の名前を小文字にして _ を除いたもの。nullglob が効く)
     opts: std::collections::BTreeSet<String>,
     /// 配列 (a=(x y z))。path は $PATH とつながっている (zsh と同じ)
     arrays: HashMap<String, Vec<String>>,
@@ -354,7 +354,7 @@ impl Shell {
         }
         let mut a = self.array(name).unwrap_or_else(|| self.get_var(name).map(|x| vec![x]).unwrap_or_default());
         let n = self.arith(sub)?;
-        let k = if n < 0 { a.len() as i64 + n } else { n - self.array_base() };
+        let k = if n < 0 { a.len() as i64 + n } else { n };
         let Ok(k) = usize::try_from(k) else { return Err(format!("{}[{}]: bad array subscript", name, sub)) };
         if a.len() <= k {
             a.resize(k + 1, String::new());
@@ -366,11 +366,6 @@ impl Shell {
         }
         self.set_array(name, a);
         Ok(())
-    }
-
-    /// 配列の番号の始まり (zsh は 1、setopt ksharrays なら bash と同じ 0)
-    pub fn array_base(&self) -> i64 {
-        if self.opts.contains("ksharrays") { 0 } else { 1 }
     }
 
     /// 当たらないワイルドカードを消すか (setopt nullglob)
@@ -417,7 +412,7 @@ impl Shell {
                     None => match self.array(b) {
                         Some(v) => {
                             let i = self.arith(k).unwrap_or(-1);
-                            let i = if i < 0 { v.len() as i64 + i } else { i - self.array_base() };
+                            let i = if i < 0 { v.len() as i64 + i } else { i };
                             (0..v.len() as i64).contains(&i)
                         }
                         None => false,
@@ -438,9 +433,8 @@ impl Shell {
             if let Some(m) = self.assoc.get_mut(n) {
                 m.retain(|(x, _)| x != sub);
             } else if let Some(mut a) = self.arrays.get(n).cloned() {
-                let base = self.array_base();
                 if let Ok(i) = self.arith(sub) {
-                    let i = if i < 0 { a.len() as i64 + i } else { i - base };
+                    let i = if i < 0 { a.len() as i64 + i } else { i };
                     if let Ok(i) = usize::try_from(i)
                         && i < a.len()
                     {
@@ -2964,12 +2958,8 @@ fn binary_test(l: &str, op: &str, r: &str) -> Result<bool, String> {
 
 // ---- 入口 ----
 
-/// sh や bash の名前で呼ばれたら (/bin/sh は aish): 来るのは bash の書き方のスクリプトなので、配列の番号は 0 から
-/// (aish の名前のときは zsh と同じく 1 から。setopt ksharrays で変えられる)
-fn bash_like(sh: &mut Shell, base: &str) {
-    if matches!(base, "sh" | "bash") {
-        sh.opts.insert("ksharrays".into());
-    }
+/// 起きたときに POSIX のシェルと同じにそろえるもの
+fn bash_like(sh: &mut Shell) {
     // PWD は今のディレクトリ (受けついだものが違えばなおす。POSIX のシェルと同じ)
     if let Ok(cwd) = std::env::current_dir() {
         let cwd = cwd.display().to_string();
@@ -3029,7 +3019,7 @@ fn main() {
         }
         let mut sh = Shell::new(ps);
         trap::set_shell(&mut sh);
-        bash_like(&mut sh, base);
+        bash_like(&mut sh);
         if !sets.is_empty() && sh.set(&sets) != 0 {
             std::process::exit(2);
         }
@@ -3038,7 +3028,7 @@ fn main() {
     }
     let mut sh = Shell::new(vec![args[0].clone()]);
     trap::set_shell(&mut sh);
-    bash_like(&mut sh, base);
+    bash_like(&mut sh);
     if !sets.is_empty() && sh.set(&sets) != 0 {
         std::process::exit(2);
     }

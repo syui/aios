@@ -20,7 +20,7 @@ os.makedirs(work + '/plug')
 shutil.copy(aish, work + '/aish')
 for p in ['aish-edit', 'aish-map', 'aish-wait']:
     shutil.copy(os.path.join(plugins, p), work + '/plug/' + p)
-open(work + '/my.rc', 'w').write('plugin aish-edit\nplugin aish-map\nplugin aish-wait\nsetopt ksharrays\n')
+open(work + '/my.rc', 'w').write('plugin aish-edit\nplugin aish-map\nplugin aish-wait\n')
 os.makedirs(work + '/home')
 env = {'PATH': '/usr/bin:/bin', 'HOME': work + '/home', 'AISH_PLUGIN_PATH': work + '/plug'}
 p = subprocess.Popen([work + '/aish', '--mcp', 'my.rc'], cwd=work, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)

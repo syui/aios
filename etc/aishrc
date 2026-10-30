@@ -23,8 +23,6 @@ plugin aish-pkg
 [ -z "$AISH_MCP" ] && plugin aish-claude
 # claude が答えなかったら (ない、AISH_CLAUDE=0、AISH_AI=local)、このマシンの AI (llama-server のアイ) に。AISH_LOCAL=0 で止める
 [ -z "$AISH_MCP" ] && plugin aish-local
-# aish --mcp では配列の番号を bash と同じ 0 から (Claude の書くスクリプトは bash の書き方。人は zsh と同じ 1 から)
-[ -n "$AISH_MCP" ] && setopt ksharrays
 # aish --mcp (Claude が aish を使う入り口。AISH_MCP=1) では、ファイルを確かに読み書きする aish-edit と、
 # 何かが起きるまで待つ aish-wait も
 [ -n "$AISH_MCP" ] && plugin aish-edit && plugin aish-wait

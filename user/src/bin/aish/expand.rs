@@ -468,19 +468,10 @@ impl Shell {
                 }
                 let name: String = cs[i..j].iter().collect();
                 let name = self.deref(&name).to_string();
-                // 配列 ($path は $PATH ではなく path の配列): zsh と同じく、要素ごとに別の語 ("" の中ならつなぐ)
-                if name != "path" || self.arrays.contains_key("path") {
-                    if let Some(a) = self.arrays.get(&name).cloned() {
-                        // bash (ksharrays): $a は最初の要素だけ
-                        if self.opts.contains("ksharrays") {
-                            put(self, o, a.first().map_or("", |s| s.as_str()));
-                        } else {
-                            self.put_array(o, &a, quoted, false);
-                        }
-                        return Ok(j);
-                    }
-                } else if let Some(a) = self.array("path") {
-                    self.put_array(o, &a, quoted, false);
+                // 配列 ($path は $PATH ではなく path の配列): bash と同じく、$a は最初の要素だけ (全部は ${a[@]})
+                let a = if name != "path" || self.arrays.contains_key("path") { self.arrays.get(&name).cloned() } else { self.array("path") };
+                if let Some(a) = a {
+                    put(self, o, a.first().map_or("", |s| s.as_str()));
                     return Ok(j);
                 }
                 if let Some(m) = self.assoc.get(&name) {
@@ -560,12 +551,13 @@ impl Shell {
             }
             return;
         }
-        // クォートの外: zsh と同じく、要素はそれ以上分けず、ワイルドカードも広げない。空の要素は消える
-        for (k, x) in a.iter().filter(|x| !x.is_empty()).enumerate() {
+        // クォートの外: bash と同じく、要素ごとに分けたうえで、それぞれをまた IFS で分け、ワイルドカードも広げる。
+        // 空の要素は消える
+        for (k, x) in a.iter().enumerate() {
             if k > 0 {
                 o.split();
             }
-            o.quoted(x);
+            o.unquoted(x);
         }
     }
 
@@ -597,8 +589,7 @@ impl Shell {
                     Some(m) => m.iter().map(|(k, _)| k.clone()).collect(),
                     None => {
                         let len = self.array(n).map_or(usize::from(self.get_var(n).is_some()), |a| a.len());
-                        let b = self.array_base();
-                        (0..len).map(|i| (i as i64 + b).to_string()).collect()
+                        (0..len).map(|i| i.to_string()).collect()
                     }
                 };
                 self.put_array(o, &keys, quoted, r.ends_with("[@]"));
@@ -706,19 +697,17 @@ impl Shell {
             };
             if parse::valid_name(name) && (sub.is_some() || self.arrays.contains_key(name) || (name == "path" && count)) {
                 let a = self.array(name).unwrap_or_else(|| self.get_var(name).map(|v| vec![v]).unwrap_or_default());
-                let ksh = self.opts.contains("ksharrays");
                 match (count, sub) {
-                    // bash (ksharrays): ${a} は最初の要素、${#a} はその長さ
-                    (true, None) if ksh => put(o, &a.first().map_or(0, |s| s.chars().count()).to_string()),
-                    (false, None) if ksh => put(o, a.first().map_or("", |s| s.as_str())),
-                    (true, None | Some("@" | "*")) => put(o, &a.len().to_string()),
-                    (false, None) => self.put_array(o, &a, quoted, false),
+                    // bash と同じ: ${a} は最初の要素、${#a} はその長さ (数は ${#a[@]})
+                    (true, None) => put(o, &a.first().map_or(0, |s| s.chars().count()).to_string()),
+                    (false, None) => put(o, a.first().map_or("", |s| s.as_str())),
+                    (true, Some("@" | "*")) => put(o, &a.len().to_string()),
                     (false, Some("@")) => self.put_array(o, &a, quoted, true),
                     (false, Some("*")) => self.put_array(o, &a, quoted, false),
                     (c, Some(ix)) => {
                         let ix = self.expand_one(ix)?;
                         let n: i64 = self.arith(&ix)?;
-                        let k = if n < 0 { a.len() as i64 + n } else { n - self.array_base() };
+                        let k = if n < 0 { a.len() as i64 + n } else { n };
                         let v = usize::try_from(k).ok().and_then(|k| a.get(k)).cloned().unwrap_or_default();
                         put(o, &if c { v.chars().count().to_string() } else { v });
                     }
