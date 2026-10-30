@@ -4,7 +4,7 @@ set -e
 
 ROOTFS="$1"
 IMG="aios.img"
-ESP_SIZE=512  # MiB
+ESP_SIZE=512
 LOOP=""
 
 cleanup() {
@@ -21,7 +21,6 @@ if [[ -z "$ROOTFS" || ! -d "$ROOTFS" ]]; then
   exit 1
 fi
 
-# rootfs実測 +30%マージン + ESP。固定4Gは image モード(kernel+firmware上乗せ)で溢れる。
 IMG_SIZE="$(( $(du -sm "$ROOTFS" | cut -f1) * 130 / 100 + ESP_SIZE ))M"
 
 rm -f "$IMG"
@@ -39,7 +38,6 @@ LOOP=$(losetup --find --show --partscan "$IMG")
 PART_ESP="${LOOP}p1"
 PART_ROOT="${LOOP}p2"
 
-# Wait for partition devices
 udevadm settle
 sleep 1
 
@@ -72,9 +70,6 @@ timeout 3
 console-mode max
 EOF
 
-# lsm= adds apparmor to the default list (build.zsh installs and enables it in image
-# mode); the rest stops slab merging, shuffles the page allocator and drops the
-# legacy vsyscall page.
 cat > /mnt/aios/boot/loader/entries/aios.conf <<EOF
 title   aios
 linux   /vmlinuz-linux-aios

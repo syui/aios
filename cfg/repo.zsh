@@ -27,7 +27,6 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 
 cd "$WORK"
-# pin linux: this Arch-based aios is the branch linux (main is the self-made kernel, with its own pkg/)
 git clone --depth 1 -b linux https://git.syui.ai/ai/os.git
 
 typeset -A PKG_REPOS
@@ -50,8 +49,6 @@ for pkg in ailog aigpt aishell aifont; do
 
   echo "=== Building $pkg (${remote_hash}) ==="
   cp -r "$WORK/os/pkg/$pkg" "$WORK/$pkg"
-  # A single package's build failure must not block the others (nor the repo-add
-  # + push that follows) — catch it, keep the tree around for a post-mortem, move on.
   if ! (cd "$WORK/$pkg" && makepkg -sf --noconfirm --sign --key "$GPG_KEY"); then
     echo "=== FAILED: $pkg — build tree kept at $WORK/$pkg on $HOST for inspection ==="
     failed_pkgs+=("$pkg")
@@ -119,7 +116,6 @@ mkdir -p "$WORK/linux-aios"
 cp "$REPOS/archlinux/PKGBUILD" "$WORK/linux-aios/"
 cp "$REPOS/archlinux/config.x86_64" "$WORK/linux-aios/"
 
-# Apply aios-specific modifications directly (no patch round-trip).
 cd "$WORK/linux-aios"
 sed -i "1s/.*/# Maintainer: syui <syui@syui.ai>\n# Based on: Arch Linux linux package by Jan Alexander Steffens (heftig)/" PKGBUILD
 sed -i "s/^pkgbase=linux$/pkgbase=linux-aios/" PKGBUILD
@@ -138,7 +134,6 @@ head -5 PKGBUILD
 echo "--- prepare() version setting ---"
 grep -A5 "^  done$" PKGBUILD | head -8
 
-# sed はパターン不一致でも exit 0 = 黙って空振りする。適用結果を検証しドリフトを大声で落とす。
 grep -q '^pkgbase=linux-aios$' PKGBUILD || { echo "PATCH DRIFT: pkgbase=linux-aios not set"; exit 1; }
 grep -q 'localversion.20-pkgname' PKGBUILD || { echo "PATCH DRIFT: -aios localversion missing"; exit 1; }
 if grep -q 'htmldocs' PKGBUILD; then echo "PATCH DRIFT: htmldocs not removed"; exit 1; fi
@@ -175,9 +170,6 @@ function repo-kernel-transfer() {
     exit 1
   fi
 
-  # Upload alongside the existing packages first (as .new) and only swap them in
-  # once every new file has actually landed — never leaves the repo without a
-  # linux-aios package if a transfer fails partway.
   for f in "${new_files[@]}"; do
     scp "$f" "$HOST":~/ai/repo/x86_64/$(basename "$f").new
   done
@@ -198,7 +190,6 @@ REPO_DIR="${HOME}/ai/repo"
 
 cd "$REPO_DIR/x86_64"
 
-# Sign unsigned packages
 for pkg in *.pkg.tar.zst; do
   [ -f "$pkg" ] || continue
   if [ ! -f "${pkg}.sig" ]; then
@@ -222,10 +213,6 @@ rm -f *.old *.old.sig
 
 cd "$REPO_DIR"
 git add -A
-# commit only when there are staged changes (avoids a "nothing to commit" abort).
-# signing follows the repo-local config on the repo host
-# (git config user.signingkey <ai key>; git config commit.gpgsign true).
-# the old silent-drop bug was a masked commit failure via `... || true`.
 if ! git diff --cached --quiet; then
   git commit -m "update $(date +%Y.%m.%d)"
 fi

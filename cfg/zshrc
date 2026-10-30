@@ -23,13 +23,8 @@ bindkey '^[[B' history-substring-search-down
 
 function setup() {
 	ailog setup
-	# --- login ---
-	# ailog oauth $handle
-	# ailog oauth $handle_bot --bot
-	# --- login ---
 	ailog gpt core -d
 	ailog gpt memory -d
 	aigpt setup
-	# ailog bot chat
 	ailog bot start --user
 }

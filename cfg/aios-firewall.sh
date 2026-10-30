@@ -1,6 +1,4 @@
 #!/bin/bash
-# Default firewall: deny incoming, allow outgoing, allow SSH (22).
-# Runs once at boot via aios-firewall.service.
 
 set -e
 
