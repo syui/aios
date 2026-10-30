@@ -17,9 +17,11 @@ install() {
 if [ "$1" = --build ]; then
   command -v aigpt > /dev/null || install gpt aigpt >&2 || exit 1
   cfg=${XDG_CONFIG_HOME:-$HOME/.config}/ai.syui.log
+  # とちゅうで切れたものを config.json と思わないように、.part に取ってから名前を変える
   if [ ! -f "$cfg/config.json" ]; then
     mkdir -p "$cfg" &&
-      curl -fsSL https://git.syui.ai/ai/log/raw/branch/main/public/config.json -o "$cfg/config.json" || exit 1
+      curl -fsSL https://git.syui.ai/ai/log/raw/branch/main/public/config.json -o "$cfg/config.json.part" &&
+      mv "$cfg/config.json.part" "$cfg/config.json" || exit 1
   fi
   # 記憶がまだないとき (新しいコンテナ) だけ。ローカルで消して sync していないものを、PDS から戻さないように
   aigpt read-core > /dev/null 2>&1 || aigpt pull >&2 || exit 1
