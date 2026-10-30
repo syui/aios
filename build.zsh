@@ -25,8 +25,12 @@ sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
 arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs pnpm uv zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs ufw'
 
+# AppArmor only on bare metal (cfg/image.zsh adds lsm=...apparmor... to the boot entry):
+# in an nspawn container the host kernel's LSM is the host's business, and the
+# tarball stays free of the python that apparmor pulls in.
 if [[ "$BUILD_MODE" == "image" ]]; then
-  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio'
+  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio apparmor'
+  arch-chroot $ROOTFS /bin/sh -c 'systemctl enable apparmor.service'
 fi
 
 # PNPM_HOME=/usr/local/bin (not a dedicated pnpm dir): global bin shims land directly on
@@ -95,9 +99,15 @@ EOF
 echo "aios" > $ROOTFS/etc/hostname
 
 # security hardening defaults — IPv6 off, rare fs/net-proto modules blacklisted, ufw on
+# The fs.* keys live in this 99- file: systemd-sysctl applies files in name order, and
+# systemd's own 50-default.conf / 50-coredump.conf set fs.protected_* = 1 and
+# fs.suid_dumpable = 2, which would override them in 50-aios-hardening.conf.
 cat > $ROOTFS/etc/sysctl.d/99-aios-hardening.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
+fs.protected_fifos=2
+fs.protected_regular=2
+fs.suid_dumpable=0
 EOF
 
 cat > $ROOTFS/etc/modprobe.d/aios-blacklist.conf <<'EOF'
@@ -124,6 +134,9 @@ EOF
 
 cp cfg/aios-modprobe-hardening.conf $ROOTFS/etc/modprobe.d/aios-hardening.conf
 cp cfg/aios-sysctl-hardening.conf $ROOTFS/etc/sysctl.d/50-aios-hardening.conf
+mkdir -p $ROOTFS/etc/systemd/coredump.conf.d $ROOTFS/etc/ssh/sshd_config.d
+cp cfg/aios-coredump.conf $ROOTFS/etc/systemd/coredump.conf.d/aios.conf
+cp cfg/aios-sshd-hardening.conf $ROOTFS/etc/ssh/sshd_config.d/00-aios-hardening.conf
 
 cp cfg/aios-firewall.sh $ROOTFS/usr/local/bin/aios-firewall.sh
 cp cfg/aios-firewall.service $ROOTFS/etc/systemd/system/aios-firewall.service

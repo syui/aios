@@ -72,11 +72,14 @@ timeout 3
 console-mode max
 EOF
 
+# lsm= adds apparmor to the default list (build.zsh installs and enables it in image
+# mode); the rest stops slab merging, shuffles the page allocator and drops the
+# legacy vsyscall page.
 cat > /mnt/aios/boot/loader/entries/aios.conf <<EOF
 title   aios
 linux   /vmlinuz-linux-aios
 initrd  /initramfs-linux-aios.img
-options root=UUID=$ROOT_UUID rw
+options root=UUID=$ROOT_UUID rw lsm=landlock,lockdown,yama,integrity,apparmor,bpf slab_nomerge vsyscall=none page_alloc.shuffle=1
 EOF
 
 echo "--- Generating initramfs ---"
