@@ -1,7 +1,7 @@
 // AppArmor (kernel/src/apparmor.rs) のたしかめ: test/apparmor/test.profile (gen.sh が apparmor_parser で作った blob.h) を
 // /sys/kernel/security/apparmor/.replace で読み、このプログラムの写し /tmp/aatest/t (aatest がパスでつく) に、決まりの
 // 中から open、作る・消す、rename、link、chmod、truncate、flock、exec (ix px cx ux) と change_profile をためさせる。
-// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。LSM のシステムコール (lsm_get_self_attr
+// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。aanet ではソケット (network_v8)。LSM のシステムコール (lsm_get_self_attr
 // など) でも読み書きする。aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
 // プロファイルを外す (unconfined にもどる)。
 // root で動かす (でなければ sudo -n でもう一度)。AppArmor のついた Linux でも同じに通ること
@@ -12,7 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/capability.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -308,6 +313,211 @@ static void hats(void) {
 #undef L
 }
 
+// aamnt の中で (argv[1] が mnt): mount の決まり。m2 には外で tmpfs をかぶせてある
+static int mntchild(void) {
+  if (puts_("/proc/self/attr/current", "changeprofile aamnt"))
+    return 2;
+  printf("mnt-tmpfs %d\n", e(mount("none", D "/m1", "tmpfs", 0, NULL)));
+  printf("mnt-tmpfs-other %d\n", e(mount("none", D "/d", "tmpfs", 0, NULL)));
+  printf("mnt-proc %d\n", e(mount("proc", D "/m3", "proc", 0, NULL)));
+  printf("mnt-nosuid %d\n", e(mount("none", D "/m3", "tmpfs", MS_NOSUID, NULL)));
+  printf("mnt-nosuid-umount %d\n", e(umount(D "/m3")));
+  printf("mnt-rw %d\n", e(mount("none", D "/m3", "tmpfs", 0, NULL)));
+  printf("mnt-bind %d\n", e(mount(D "/d", D "/m3", NULL, MS_BIND, NULL)));
+  printf("mnt-nofs %d\n", e(mount("none", D "/m3", "nosuchfs", 0, NULL)));
+  printf("mnt-umount %d\n", e(umount(D "/m1")));
+  printf("mnt-umount-other %d\n", e(umount(D "/m2")));
+  printf("mnt-umount-notmounted %d\n", e(umount(D "/m1")));
+  fflush(stdout);
+  return 0;
+}
+
+// aanet の中で (argv[1] が net): ソケットの決まり。1 行に「名前 答え」
+static int netchild(void) {
+  if (puts_("/proc/self/attr/current", "changeprofile aanet"))
+    return 2;
+#define N(name, v) printf("%s %d\n", name, v)
+  struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  socklen_t al = sizeof a;
+  int one = 1, t;
+  // inet の stream: みな
+  int l = socket(AF_INET, SOCK_STREAM, 0);
+  N("net-tcp-create", l < 0 ? errno : 0);
+  N("net-tcp-bind", e(bind(l, (struct sockaddr *)&a, sizeof a)));
+  N("net-tcp-listen", e(listen(l, 4)));
+  N("net-tcp-name", e(getsockname(l, (struct sockaddr *)&a, &al)));
+  int c = socket(AF_INET, SOCK_STREAM, 0);
+  N("net-tcp-connect", e(connect(c, (struct sockaddr *)&a, sizeof a)));
+  int k = accept(l, NULL, NULL);
+  N("net-tcp-accept", k < 0 ? errno : 0);
+  N("net-tcp-send", e(send(c, "x", 1, 0) == 1 ? 0 : -1));
+  char b[8];
+  N("net-tcp-recv", e(recv(k, b, sizeof b, 0) == 1 ? 0 : -1));
+  // inet の dgram: 作る、bind、名前だけ
+  int u = socket(AF_INET, SOCK_DGRAM, 0);
+  N("net-udp-create", u < 0 ? errno : 0);
+  struct sockaddr_in ua = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  al = sizeof ua;
+  N("net-udp-bind", e(bind(u, (struct sockaddr *)&ua, sizeof ua)));
+  N("net-udp-name", e(getsockname(u, (struct sockaddr *)&ua, &al)));
+  N("net-udp-send", e(sendto(u, "x", 1, 0, (struct sockaddr *)&ua, sizeof ua)));
+  N("net-udp-recv", e(recv(u, b, sizeof b, MSG_DONTWAIT)));
+  N("net-udp-setopt", e(setsockopt(u, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one)));
+  al = sizeof t;
+  N("net-udp-getopt", e(getsockopt(u, SOL_SOCKET, SO_TYPE, &t, &al)));
+  N("net-udp-shutdown", e(shutdown(u, SHUT_RDWR)));
+  N("net-udp-peername", e(getpeername(u, (struct sockaddr *)&ua, &al)));
+  // 決まりのない family と型
+  int x = socket(AF_INET6, SOCK_STREAM, 0);
+  N("net-inet6", x < 0 ? errno : 0);
+  x = socket(AF_NETLINK, SOCK_RAW, 0);
+  N("net-netlink", x < 0 ? errno : 0);
+  x = socket(AF_UNIX, SOCK_STREAM, 0);
+  N("net-unix-stream", x < 0 ? errno : 0);
+  int sv[2] = {-1, -1};
+  N("net-unix-streampair", e(socketpair(AF_UNIX, SOCK_STREAM, 0, sv)));
+  // unix の dgram: みな (送るのは自分 (SEND) と相手のソケットのラベル (RECEIVE) の両方で見る)
+  N("net-unix-dgrampair", e(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)));
+  N("net-unix-dgram-send", e(write(sv[0], "x", 1) == 1 ? 0 : -1));
+  N("net-unix-dgram-recv", e(read(sv[1], b, sizeof b) == 1 ? 0 : -1));
+  fflush(stdout);
+#undef N
+  return 0;
+}
+
+// 決まりのあるプロセス (profile) が抽象名 name で作った unix の口へ、決まりのないこちらから (type が SOCK_STREAM なら
+// connect、SOCK_DGRAM なら sendto)。答えは 0 か errno。相手の側の決まりでも止まる
+static int peer_test(const char *profile, int type, const char *name) {
+  int go[2], ready[2];
+  if (pipe(go) || pipe(ready))
+    return -1;
+  struct sockaddr_un a = {.sun_family = AF_UNIX};
+  memcpy(a.sun_path + 1, name, strlen(name));
+  socklen_t al = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+  fflush(stdout);
+  pid_t k = fork();
+  if (k == 0) {
+    char x = 'f';
+    if (puts_("/proc/self/attr/current", profile) == 0) {
+      int s = socket(AF_UNIX, type, 0);
+      if (s >= 0 && bind(s, (struct sockaddr *)&a, al) == 0 && (type != SOCK_STREAM || listen(s, 4) == 0))
+        x = 'r';
+    }
+    if (write(ready[1], &x, 1) != 1 || read(go[0], &x, 1) != 1)
+      _exit(1);
+    _exit(0);
+  }
+  char x = 0;
+  int r = -1;
+  if (read(ready[0], &x, 1) == 1 && x == 'r') {
+    int c = socket(AF_UNIX, type, 0);
+    if (type == SOCK_STREAM)
+      r = e(connect(c, (struct sockaddr *)&a, al));
+    else
+      r = e(sendto(c, "x", 1, 0, (struct sockaddr *)&a, al));
+    close(c);
+  }
+  if (write(go[1], "g", 1) != 1)
+    r = -1;
+  waitpid(k, NULL, 0);
+  close(go[0]);
+  close(go[1]);
+  close(ready[0]);
+  close(ready[1]);
+  return r;
+}
+
+// path を開いて読む: 0 か errno
+static int op_read(const char *path) {
+  char b[64];
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return errno;
+  int r = read(fd, b, sizeof b) < 0 ? errno : 0;
+  close(fd);
+  return r;
+}
+
+// readlink: 0 か errno
+static int op_readlink(const char *path) {
+  char b[256];
+  return readlink(path, b, sizeof b) < 0 ? errno : 0;
+}
+
+// シグナルを待つだけの相手 (profile があればそれで)。usr1 は無視する。go から読めれば終わる
+static pid_t target(const char *profile, int go) {
+  fflush(stdout);
+  pid_t k = fork();
+  if (k == 0) {
+    char x;
+    signal(SIGUSR1, SIG_IGN);
+    if (profile && puts_("/proc/self/attr/current", profile))
+      _exit(2);
+    if (read(go, &x, 1) < 0)
+      _exit(1);
+    _exit(0);
+  }
+  return k;
+}
+
+// シグナルと ptrace: t1 は決まりなし、t2 は aanet (シグナルの決まりがない: 受けられない。ptrace でも見られない)
+static void sigptrace(char *out, size_t n) {
+  int go[2], o[2];
+  out[0] = 0;
+  if (pipe(go) || pipe(o))
+    return;
+  pid_t t1 = target(NULL, go[0]), t2 = target("changeprofile aanet", go[0]);
+  usleep(200000);
+  char p[64];
+  FILE *f = fmemopen(out, n, "w");
+  // 決まりのないこちらから: 送る側は見ないが、受ける側 (aanet) の決まりで止まる。ptrace は追う側が決まりなしなら見ない
+  fprintf(f, "sig-u-t2 %d\n", e(kill(t2, SIGUSR1)));
+  fprintf(f, "sig-u-t2-exists %d\n", e(kill(t2, 0)));
+  snprintf(p, sizeof p, "/proc/%d/environ", t2);
+  fprintf(f, "pt-u-t2-environ %d\n", op_read(p));
+  fflush(f);
+  pid_t c = fork();
+  if (c == 0) {
+    char b[1024] = "";
+    FILE *g = fmemopen(b, sizeof b, "w");
+    signal(SIGUSR1, SIG_IGN);
+    if (puts_("/proc/self/attr/current", "changeprofile aasig"))
+      _exit(2);
+    fprintf(g, "sig-t1-usr1 %d\n", e(kill(t1, SIGUSR1)));
+    fprintf(g, "sig-t1-term %d\n", e(kill(t1, SIGTERM)));
+    fprintf(g, "sig-t1-exists %d\n", e(kill(t1, 0)));
+    fprintf(g, "sig-self-usr1 %d\n", e(kill(getpid(), SIGUSR1)));
+    fprintf(g, "sig-t2-usr1 %d\n", e(kill(t2, SIGUSR1)));
+    snprintf(p, sizeof p, "/proc/%d/environ", t1);
+    fprintf(g, "pt-t1-environ %d\n", op_read(p));
+    snprintf(p, sizeof p, "/proc/%d/exe", t1);
+    fprintf(g, "pt-t1-exe %d\n", op_readlink(p));
+    snprintf(p, sizeof p, "/proc/%d/environ", t2);
+    fprintf(g, "pt-t2-environ %d\n", op_read(p));
+    snprintf(p, sizeof p, "/proc/%d/exe", t2);
+    fprintf(g, "pt-t2-exe %d\n", op_readlink(p));
+    fprintf(g, "pt-self-environ %d\n", op_read("/proc/self/environ"));
+    fclose(g);
+    if (write(o[1], b, strlen(b)) < 0)
+      _exit(1);
+    _exit(0);
+  }
+  close(o[1]);
+  char b[1024];
+  ssize_t k = read(o[0], b, sizeof b - 1);
+  b[k > 0 ? k : 0] = 0;
+  fputs(b, f);
+  fclose(f);
+  waitpid(c, NULL, 0);
+  if (write(go[1], "gg", 2) != 2)
+    kill(t1, SIGKILL);
+  waitpid(t1, NULL, 0);
+  waitpid(t2, NULL, 0);
+  close(go[0]);
+  close(go[1]);
+  close(o[0]);
+}
+
 // aatest の中で (argv[1] が child): 1 行に「名前 答え」
 static int child(void) {
 #define T(name, v) printf("%s %d\n", name, v)
@@ -379,6 +589,28 @@ static const char *want[] = {
     "lsm-set-hat 95",
 };
 
+// シグナルと ptrace (aasig: usr1 だけ送れる、unconfined だけ見られる。aanet: 受けられない、見られない)
+static const char *want_sig[] = {
+    "sig-u-t2 13", "sig-u-t2-exists 13", "pt-u-t2-environ 0", "sig-t1-usr1 0", "sig-t1-term 13", "sig-t1-exists 13",
+    "sig-self-usr1 0", "sig-t2-usr1 13", "pt-t1-environ 0", "pt-t1-exe 0", "pt-t2-environ 13", "pt-t2-exe 13",
+    "pt-self-environ 0",
+};
+
+// aamnt: m1 の tmpfs と m3 の nosuid の tmpfs だけ。外せるのは m1 だけ
+static const char *want_mnt[] = {
+    "mnt-tmpfs 0", "mnt-tmpfs-other 13", "mnt-proc 13", "mnt-nosuid 0", "mnt-nosuid-umount 13", "mnt-rw 13", "mnt-bind 13",
+    "mnt-nofs 19", "mnt-umount 0", "mnt-umount-other 13", "mnt-umount-notmounted 22",
+};
+
+// aanet: 決まりにあるソケットだけ (ほかの family、型、許しは EACCES)
+static const char *want_net[] = {
+    "net-tcp-create 0", "net-tcp-bind 0", "net-tcp-listen 0", "net-tcp-name 0", "net-tcp-connect 0", "net-tcp-accept 0",
+    "net-tcp-send 0", "net-tcp-recv 0", "net-udp-create 0", "net-udp-bind 0", "net-udp-name 0", "net-udp-send 13",
+    "net-udp-recv 13", "net-udp-setopt 13", "net-udp-getopt 13", "net-udp-shutdown 13", "net-udp-peername 107",
+    "net-inet6 13", "net-netlink 13", "net-unix-stream 13", "net-unix-streampair 13", "net-unix-dgrampair 0",
+    "net-unix-dgram-send 0", "net-unix-dgram-recv 0",
+};
+
 // aacap: chown のほかの root の力はない (capget にも chown だけ)。complain なら記録して通す
 static const char *want_cap[] = {
     "cap-eff 1", "cap-perm 1", "cap-read-other 13", "cap-write-other 13", "cap-chmod-other 1", "cap-chown 0",
@@ -411,6 +643,9 @@ static int copy(const char *from, const char *to) {
 static void setup(const char *self) {
   mkdir(D, 0755);
   mkdir(D "/d", 0755);
+  mkdir(D "/m1", 0755);
+  mkdir(D "/m2", 0755);
+  mkdir(D "/m3", 0755);
   for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
     char p[64];
     snprintf(p, sizeof p, D "/%s", files[i]);
@@ -433,6 +668,11 @@ static void cleanup(void) {
   puts_(AA ".remove", "aacomplain");
   puts_(AA ".remove", "aanomap");
   puts_(AA ".remove", "aacap");
+  puts_(AA ".remove", "aanet");
+  puts_(AA ".remove", "aanetl");
+  puts_(AA ".remove", "aanetd");
+  puts_(AA ".remove", "aasig");
+  puts_(AA ".remove", "aamnt");
   const char **lists[] = {files, bins, made};
   size_t ns[] = {sizeof files / sizeof *files, sizeof bins / sizeof *bins, sizeof made / sizeof *made};
   for (int l = 0; l < 3; l++)
@@ -442,6 +682,14 @@ static void cleanup(void) {
       unlink(p);
     }
   rmdir(D "/d/sub");
+  for (int i = 0; i < 2; i++) {
+    umount(D "/m1");
+    umount(D "/m2");
+    umount(D "/m3");
+  }
+  rmdir(D "/m1");
+  rmdir(D "/m2");
+  rmdir(D "/m3");
   rmdir(D "/d");
   rmdir(D);
 }
@@ -449,6 +697,10 @@ static void cleanup(void) {
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "child"))
     return child();
+  if (argc > 1 && !strcmp(argv[1], "net"))
+    return netchild();
+  if (argc > 1 && !strcmp(argv[1], "mnt"))
+    return mntchild();
   if (argc > 1 && (!strcmp(argv[1], "cap") || !strcmp(argv[1], "capc")))
     return capchild(argv[1][3] == 'c');
   if (argc > 1 && !strcmp(argv[1], "attr")) {
@@ -547,6 +799,46 @@ int main(int argc, char **argv) {
   close(q2[0]);
   waitpid(c, NULL, 0);
   CHECK(!strcmp(b, "aachild (enforce)"), "onexec gave \"%s\"", b);
+
+  // ネットワーク: aanet の中で。それから相手の側の決まり (listen しているもの、bind した dgram の口のラベル)
+  collect(self, "net", out, sizeof out);
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_net / sizeof *want_net; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_net[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_net[i]);
+  }
+  if (fails != bad)
+    printf("net said:\n%s", out);
+  int pr = peer_test("changeprofile aanetl", SOCK_STREAM, "aanet-l");
+  CHECK(pr == EACCES, "connect to a listener whose profile can not accept: %d", pr);
+  pr = peer_test("changeprofile aanet", SOCK_DGRAM, "aanet-d1");
+  CHECK(pr == 0, "send to a dgram socket whose profile can receive: %d", pr);
+  pr = peer_test("changeprofile aanetd", SOCK_DGRAM, "aanet-d2");
+  CHECK(pr == EACCES, "send to a dgram socket whose profile can not receive: %d", pr);
+
+  // mount (m2 は決まりのないこちらで tmpfs を)
+  CHECK(mount("none", D "/m2", "tmpfs", 0, NULL) == 0, "mount m2: %d", errno);
+  collect(self, "mnt", out, sizeof out);
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_mnt / sizeof *want_mnt; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_mnt[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_mnt[i]);
+  }
+  if (fails != bad)
+    printf("mnt said:\n%s", out);
+
+  // シグナルと ptrace
+  sigptrace(out, sizeof out);
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_sig / sizeof *want_sig; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_sig[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_sig[i]);
+  }
+  if (fails != bad)
+    printf("sig said:\n%s", out);
 
   // 決まりのないプロセスには hat がない
   CHECK(HAT("changehat 1^hat1") == EPERM, "unconfined changehat is EPERM");

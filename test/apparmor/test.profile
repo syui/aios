@@ -62,3 +62,44 @@ profile aacap {
   /tmp/aatest/** rw,
   /proc/*/attr/current r,
 }
+
+# ネットワーク (network_v8): inet の stream はみな、inet の dgram は作る・bind・名前だけ、unix は dgram だけ
+profile aanet {
+  /proc/*/attr/current r,
+  network inet stream,
+  network (create, bind, getattr) inet dgram,
+  network unix dgram,
+}
+
+# unix の stream を作って listen するだけ (受けられない: つないでくる相手もこの決まりで止まる)
+profile aanetl {
+  /proc/*/attr/current r,
+  network (create, bind, listen) unix stream,
+}
+
+# unix の dgram を作って bind するだけ (受けられない: 送ってくる相手もこの決まりで止まる)
+profile aanetd {
+  /proc/*/attr/current r,
+  network (create, bind) unix dgram,
+}
+
+# シグナルと ptrace: usr1 だけ送れる (だれにでも)、だれからでも受けられる。/proc で見られる (ptrace の read) のは
+# 決まりのないものだけ
+profile aasig {
+  /proc/*/attr/current r,
+  /proc/*/environ r,
+  /proc/*/exe r,
+  signal (send) set=(usr1),
+  signal (receive),
+  ptrace (read) peer=unconfined,
+}
+
+# mount: m1 に tmpfs、m3 に nosuid の tmpfs。外すのは m1 だけ (bind や proc はだめ)。読むだけのマウントは
+# ためさない (aios は一度でも読むだけのマウントがあると、それからロックなしの作る・消すを使わないので、あとのテストが変わる)
+profile aamnt {
+  /proc/*/attr/current r,
+  capability sys_admin,
+  mount fstype=tmpfs -> /tmp/aatest/m1/,
+  mount options=(nosuid) fstype=tmpfs -> /tmp/aatest/m3/,
+  umount /tmp/aatest/m1/,
+}

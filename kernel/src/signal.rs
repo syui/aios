@@ -263,11 +263,15 @@ pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
     Ok(())
 }
 
-/// 送り主が送ってよいか (root か、uid が合うか)
-fn can_signal(target: &Proc) -> bool {
+/// 送り主が送ってよいか (Linux の check_kill_permission: uid が合うか CAP_KILL、でなければ EPERM。それから
+/// security_task_kill: AppArmor の signal の決まりで、だめなら EACCES)
+fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     let me = proc::current();
     let (a, b) = (&me.cred, &target.cred);
-    a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)
+    if !(a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)) {
+        return Err(-EPERM);
+    }
+    crate::apparmor::may_signal(b, sig)
 }
 
 /// 例外など、今のスレッドに必ず届けるもの (ブロックや無視は外す)
@@ -815,14 +819,14 @@ pub fn kill(pid: i64, sig: i32) -> R {
         proc::leaders_in_pgrp_any((-pid) as u32)
     };
     let mut sent = 0;
-    let mut denied = false;
+    let mut denied = None;
     for tgid in targets {
         let Some(leader) = proc::find_leader_any(tgid) else { continue };
         if bad_sig {
             return Err(crate::why::inval());
         }
-        if !can_signal(leader) {
-            denied = true;
+        if let Err(e) = can_signal(leader, sig) {
+            denied = Some(e);
             continue;
         }
         if sig != 0 && leader.state != proc::State::Zombie {
@@ -832,8 +836,8 @@ pub fn kill(pid: i64, sig: i32) -> R {
     }
     if sent > 0 {
         Ok(0)
-    } else if denied {
-        Err(-EPERM)
+    } else if let Some(e) = denied {
+        Err(e)
     } else {
         Err(-ESRCH)
     }
@@ -856,9 +860,7 @@ pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
     if !(0..NSIG as i32).contains(&sig) {
         return Err(crate::why::inval());
     }
-    if !can_signal(t) {
-        return Err(-EPERM);
-    }
+    can_signal(t, sig)?;
     if sig != 0 {
         send_thread(t, sig, SigInfo::from(SI_TKILL));
     }

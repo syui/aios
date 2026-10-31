@@ -231,6 +231,11 @@ pub struct Unix {
     /// poll / select で見ている数 (file::PollWatch) と、epoll に入れたか
     pub watchers: u32,
     pub epolled: bool,
+    /// AppArmor: 作ったプロセスのラベル (受けた口は listen しているもののラベル: Linux の aa_sk_ctx)。相手の側の決まりを
+    /// 見るのに使う
+    pub label: Option<crate::apparmor::Label>,
+    /// socket(2) の protocol (0 か PF_UNIX。AppArmor の決まりの 3 つめ)
+    protocol: u8,
 }
 
 pub type UnixRef = Arc<UnixCell>;
@@ -407,6 +412,8 @@ fn new_sock(typ: u8) -> UnixRef {
         sleepers: 0,
         watchers: 0,
         epolled: false,
+        label: crate::apparmor::current_label(),
+        protocol: 0,
     }));
     let all = ALL.get();
     if all.len() >= 64 && all.len() >= 2 * *ALL_LIVE.get() {
@@ -415,6 +422,69 @@ fn new_sock(typ: u8) -> UnixRef {
     }
     all.push(Arc::downgrade(&u));
     u
+}
+
+// ---- AppArmor (af_unix.c。network_v8 なので、どれも (unix, type, protocol) の決まりで見る) ----
+
+/// 記録: 自分の名前か bind の名前 (addr=)、相手の名前 (peer_addr=: 相手のことを問うとき)。Linux 7.3 で見た形
+fn aa_audit(name: Option<&[u8]>, addr: Option<&[u8]>, request: u32, peer: Option<&[u8]>) -> crate::apparmor::NetAudit {
+    use crate::apparmor::*;
+    let mut post = unix_addr_audit("addr", addr.or(name));
+    if request & NET_PEER_MASK != 0 {
+        post.push_str(&unix_addr_audit("peer_addr", peer));
+    }
+    NetAudit { pre: String::new(), post }
+}
+
+fn aa_of(u: &UnixRef) -> (u32, u32, Option<Rc<Vec<u8>>>) {
+    let s = u.borrow();
+    (s.typ as u32, s.protocol as u32, s.addr.clone())
+}
+
+/// いまのプロセスの決まりで、このソケットへの op (bind の名前は addr。aa_unix_sock_perm、aa_unix_bind_perm など)
+pub fn aa_perm(u: &UnixRef, op: &str, request: u32, addr: Option<&[u8]>) -> Result<(), i64> {
+    let (typ, proto, name) = aa_of(u);
+    crate::apparmor::net_perm(op, request, AF_UNIX as u32, typ, proto, &|| aa_audit(name.as_deref().map(|v| &v[..]), addr, request, None))
+}
+
+/// aa_unix_peer_perm: label (None はいまのプロセス) の決まりで、sk から相手 peer への op
+fn aa_peer(label: Option<&Option<crate::apparmor::Label>>, sk: &UnixRef, peer: &UnixRef, op: &str, request: u32) -> Result<(), i64> {
+    let (typ, proto, name) = aa_of(sk);
+    let pname = peer.borrow().addr.clone();
+    let audit = || aa_audit(name.as_deref().map(|v| &v[..]), None, request, pname.as_deref().map(|v| &v[..]));
+    match label {
+        None => crate::apparmor::net_perm(op, request, AF_UNIX as u32, typ, proto, &audit),
+        Some(l) => crate::apparmor::label_net_perm(l.as_ref(), op, request, AF_UNIX as u32, typ, proto, &audit),
+    }
+}
+
+/// パスの名前で bind したもの (is_unix_fs)
+fn aa_is_fs(u: &UnixRef) -> bool {
+    u.borrow().addr.as_ref().is_some_and(|a| a.len() > 2 && a[2] != 0)
+}
+
+/// stream をつなぐ (unix_connect_perm): 自分は CONNECT SEND RECEIVE、相手がパスの名前でなければ、相手のソケットの
+/// ラベルの決まりでも ACCEPT SEND RECEIVE (後のしくじりのほうを返す)
+fn aa_connect(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
+    use crate::apparmor::*;
+    let mut r = aa_peer(None, u, other, "connect", MAY_CONNECT | MAY_SEND | MAY_RECEIVE);
+    if !aa_is_fs(other) {
+        let l = other.borrow().label.clone();
+        if let Err(e) = aa_peer(Some(&l), other, u, "connect", MAY_ACCEPT | MAY_SEND | MAY_RECEIVE) {
+            r = Err(e);
+        }
+    }
+    r
+}
+
+/// dgram を送る・つなぐ (apparmor_unix_may_send): 自分は SEND、相手のソケットのラベルの決まりで RECEIVE (両方見て、
+/// 後のしくじりのほうを返す: xcheck)
+fn aa_may_send(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
+    use crate::apparmor::*;
+    let a = aa_peer(None, u, other, "sendmsg", MAY_SEND);
+    let l = other.borrow().label.clone();
+    let b = aa_peer(Some(&l), other, u, "sendmsg", MAY_RECEIVE);
+    if b.is_err() { b } else { a }
 }
 
 // ---- skb の大きさ (Linux 7.3 arm64 で測ったもの) ----
@@ -544,7 +614,9 @@ pub fn create(typ: u64, protocol: u64) -> Result<UnixRef, i64> {
         5 => SOCK_SEQPACKET,
         _ => return Err(-ESOCKTNOSUPPORT),
     };
-    Ok(new_sock(t))
+    let u = new_sock(t);
+    u.borrow_mut().protocol = protocol as u8;
+    Ok(u)
 }
 
 pub fn file_of(u: UnixRef, flags: u64) -> FileRef {
@@ -669,6 +741,7 @@ pub fn connect(f: &FileRef, u: &UnixRef, a: &[u8]) -> R {
             State::Established => return Err(-EISCONN),
             State::Listen => return Err(crate::why::inval()),
         }
+        aa_connect(u, &other)?;
         join(u, &other, typ);
         return Ok(0);
     }
@@ -689,6 +762,7 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
         es.passrights = o.passrights;
         es.has_file = false;
         es.net = o.net;
+        es.label = o.label.clone();
     }
     {
         let mut s = u.borrow_mut();
@@ -716,6 +790,7 @@ fn dgram_connect(u: &UnixRef, a: &[u8]) -> R {
         if other.borrow().peer.as_ref().is_some_and(|p| !Arc::ptr_eq(p, u)) {
             return Err(-EPERM);
         }
+        aa_may_send(u, &other)?;
         u.borrow_mut().state = State::Established;
         other.borrow_mut().state = State::Established;
         Some(other)
@@ -1158,6 +1233,9 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
             if !fds.is_empty() && !o.passrights {
                 return Err(-EPERM);
             }
+        }
+        if typ != SOCK_SEQPACKET {
+            aa_may_send(u, &other)?;
         }
         // 相手の行列がいっぱい (相手がこちらにつないでいなければ: Linux の unix_recvq_full)
         let full = !Arc::ptr_eq(&other, u) && {

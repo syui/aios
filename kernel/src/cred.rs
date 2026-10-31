@@ -34,6 +34,7 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_MAC_ADMIN: u32 = 33;
+pub const CAP_PERFMON: u32 = 38;
 /// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)
 pub const CAP_NAMES: [&str; 41] = [
     "chown", "dac_override", "dac_read_search", "fowner", "fsetid", "kill", "setgid", "setuid", "setpcap", "linux_immutable", "net_bind_service", "net_broadcast", "net_admin", "net_raw",

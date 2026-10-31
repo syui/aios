@@ -411,6 +411,20 @@ pub const MAY_LINK: u32 = 0x4_0000;
 pub const MAY_ONEXEC: u32 = 0x2000_0000;
 pub const MAY_CHANGE_PROFILE: u32 = 0x4000_0000;
 pub const MAY_CHANGEHAT: u32 = 0x8000_0000;
+// ソケットの許し (include/net.h)
+pub const MAY_SEND: u32 = MAY_WRITE;
+pub const MAY_RECEIVE: u32 = MAY_READ;
+pub const MAY_SHUTDOWN: u32 = MAY_DELETE;
+pub const MAY_CONNECT: u32 = MAY_OPEN;
+pub const MAY_ACCEPT: u32 = 0x10_0000;
+pub const MAY_BIND: u32 = 0x20_0000;
+pub const MAY_LISTEN: u32 = 0x40_0000;
+pub const MAY_SETOPT: u32 = 0x100_0000;
+pub const MAY_GETOPT: u32 = 0x200_0000;
+const NET_PERMS_MASK: u32 = MAY_SEND | MAY_RECEIVE | MAY_CREATE | MAY_SHUTDOWN | MAY_BIND | MAY_LISTEN | MAY_CONNECT | MAY_ACCEPT | MAY_SETATTR | MAY_GETATTR | MAY_SETOPT | MAY_GETOPT;
+pub const NET_PEER_MASK: u32 = MAY_SEND | MAY_RECEIVE | MAY_CONNECT | MAY_ACCEPT;
+/// まだ先 (protocol) を見ないと決まらない (AA_CONT_MATCH)
+const CONT_MATCH: u32 = 0x800_0000;
 const LINK_SUBSET: u32 = MAY_LOCK;
 const ALL_PERMS: u32 = 0xffff_ffff;
 // exec の行き先 (xindex)
@@ -1344,11 +1358,11 @@ fn audit_status(op: &str, name: Option<&str>, info: Option<&str>, error: i64) {
 /// プロセスのラベル: プロファイルの名前。使うたびに名前で引く (入れかえれば新しいものに、外されれば unconfined に:
 /// Linux の proxy と同じ)
 #[derive(Clone, PartialEq)]
-pub struct Label(Rc<str>);
+pub struct Label(alloc::sync::Arc<str>);
 
 impl Label {
     fn of(p: &Profile) -> Label {
-        Label(Rc::from(p.name.as_str()))
+        Label(alloc::sync::Arc::from(p.name.as_str()))
     }
 
     pub fn profile(&self) -> Option<Rc<Profile>> {
@@ -1408,7 +1422,7 @@ fn fsuid() -> u32 {
 }
 
 /// パスの名前: 頭に /、ディレクトリなら終わりにも / (aa_path_name の PATH_IS_DIR)
-fn path_name(full: &str, dir: bool) -> String {
+pub fn path_name(full: &str, dir: bool) -> String {
     let full = full.trim_matches('/');
     if full.is_empty() {
         "/".into()
@@ -2156,6 +2170,548 @@ pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
     Ok(b.len())
 }
 
+// ---- ネットワーク (net.c、af_unix.c、af_inet.c の network_v8: ソケットの (family, type, protocol) を net の DFA で) ----
+
+const CLASS_NET: usize = 14;
+const CLASS_NETV9: usize = 15;
+
+/// 記録の family (include/linux/socket.h の AF_ の順。AppArmor の address_family_names)
+const AF_NAMES: [&str; 46] = [
+    "unspec", "unix", "inet", "ax25", "ipx", "appletalk", "netrom", "bridge", "atmpvc", "x25", "inet6", "rose", "", "netbeui", "security", "key", "netlink", "packet", "ash", "econet",
+    "atmsvc", "rds", "sna", "irda", "pppox", "wanpipe", "llc", "ib", "mpls", "can", "tipc", "bluetooth", "iucv", "rxrpc", "isdn", "phonet", "ieee802154", "caif", "alg", "nfc", "vsock",
+    "kcm", "qipcrtr", "smc", "xdp", "mctp",
+];
+/// features の network_v8/af_mask (AF_NAMES の名前のあるもの)
+pub const AF_MASK: &str = "unspec unix inet ax25 ipx appletalk netrom bridge atmpvc x25 inet6 rose netbeui security key netlink packet ash econet atmsvc rds sna irda pppox wanpipe llc ib mpls can tipc bluetooth iucv rxrpc isdn phonet ieee802154 caif alg nfc vsock kcm qipcrtr smc xdp mctp";
+/// 記録の sock_type (sock_type_names)
+const SOCK_TYPE_NAMES: [&str; 11] = ["", "stream", "dgram", "raw", "rdm", "seqpacket", "dccp", "", "", "", "packet"];
+/// 記録の requested / denied (net_mask_names: ビットの順)
+const NET_MASK_NAMES: [&str; 32] = [
+    "unknown", "send", "receive", "unknown", "create", "shutdown", "connect", "unknown", "setattr", "getattr", "setcred", "getcred", "chmod", "chown", "chgrp", "lock",
+    "mmap", "mprot", "unknown", "unknown", "accept", "bind", "listen", "unknown", "setopt", "getopt", "unknown", "unknown", "unknown", "unknown", "unknown", "unknown",
+];
+
+/// ソケットの記録に足すもの (aa_audit の audit_net_cb と dump_common_audit_data のうち、ソケットや番地によるもの)。
+/// pre は comm のあと (sk の番地: inet の laddr / faddr、unix の path)、post は denied のあと (unix の addr= と peer_addr=)
+#[derive(Default)]
+pub struct NetAudit {
+    pub pre: String,
+    pub post: String,
+}
+
+/// aa_check_perms: 許しと記録。log は (種類, request, denied, error) で 1 行を出す
+fn check_perms(perms: &Perms, request: u32, log: &dyn Fn(&str, u32, u32, i64)) -> Result<(), i64> {
+    let mut denied = request & (!perms.allow | perms.deny);
+    let mut req = request;
+    let error = if denied == 0 {
+        req &= perms.audit;
+        if req == 0 {
+            return Ok(());
+        }
+        0
+    } else {
+        let e = if denied == denied & perms.hide { -ENOENT } else { -EACCES };
+        denied &= !perms.quiet;
+        if denied == 0 {
+            return Err(e);
+        }
+        e
+    };
+    // aa_select_audit_type
+    let kind = if denied == 0 {
+        "AUDIT"
+    } else if denied & perms.kill != 0 {
+        "KILLED"
+    } else if denied == denied & perms.complain {
+        "ALLOWED"
+    } else {
+        "DENIED"
+    };
+    log(kind, req, denied, error);
+    if error == 0 || kind == "ALLOWED" { Ok(()) } else { Err(error) }
+}
+
+/// aa_audit_perm_mask: 名前を空白で区切って引用符で
+fn net_mask(m: u32) -> String {
+    let v: Vec<&str> = (0..32).filter(|i| m & NET_PERMS_MASK & (1 << i) != 0).map(|i| NET_MASK_NAMES[i]).collect();
+    format!("\"{}\"", v.join(" "))
+}
+
+/// プロファイルが net を見るか (RULE_MEDIATES_NET: v9 がなければ v7/v8 の種類)
+fn net_start(p: &Profile) -> u32 {
+    let v9 = p.policy.start[CLASS_NETV9];
+    if v9 != DFA_NOMATCH { v9 } else { p.policy.start[CLASS_NET] }
+}
+
+/// aa_profile_af_perm: p の net の決まりで (family, type, protocol) に request が許されるか (aa_match_to_prot と
+/// aa_do_perms)。だめなら class="net" で記録
+#[allow(clippy::too_many_arguments)]
+fn af_perm(p: &Profile, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
+    let Some(d) = &p.policy.dfa else { return Ok(()) };
+    let mut st = net_start(p);
+    if st == DFA_NOMATCH {
+        return Ok(());
+    }
+    let be = |v: u32| (v as u16).to_be_bytes();
+    let mut info = None;
+    st = d.match_len(st, &be(family));
+    if st == DFA_NOMATCH {
+        info = Some("failed af match");
+    } else {
+        st = d.match_len(st, &be(typ));
+        if st == DFA_NOMATCH {
+            info = Some("failed type match");
+        } else {
+            // early_match: type までで request がみなあるか、先がなければ protocol は見ない
+            let e = p.policy.lookup(st, true);
+            if e.allow & request != request && e.allow & CONT_MATCH != 0 {
+                st = d.match_len(st, &be(protocol));
+                if st == DFA_NOMATCH {
+                    info = Some("failed protocol match");
+                }
+            }
+        }
+    }
+    let mut perms = p.policy.lookup(st, true);
+    p.apply_modes(&mut perms);
+    check_perms(&perms, request, &|kind, req, denied, error| {
+        let x = extra();
+        let mut s = format!("{} operation=\"{}\" class=\"net\"", audit_head(kind), op);
+        if let Some(i) = info {
+            s.push_str(&format!(" info=\"{}\"", i));
+            if error != 0 {
+                s.push_str(&format!(" error={}", error));
+            }
+        }
+        s.push_str(&format!(" profile={}", untrusted(&p.name)));
+        s.push_str(&audit_tail());
+        s.push_str(&x.pre);
+        match AF_NAMES.get(family as usize).filter(|n| !n.is_empty()) {
+            Some(n) => s.push_str(&format!(" family=\"{}\"", n)),
+            None => s.push_str(&format!(" family=\"unknown({})\"", family)),
+        }
+        match SOCK_TYPE_NAMES.get(typ as usize).filter(|n| !n.is_empty()) {
+            Some(n) => s.push_str(&format!(" sock_type=\"{}\"", n)),
+            None => s.push_str(&format!(" sock_type=\"unknown({})\"", typ)),
+        }
+        s.push_str(&format!(" protocol={}", protocol as i32));
+        if req & NET_PERMS_MASK != 0 {
+            s.push_str(&format!(" requested={}", net_mask(req)));
+            if denied & NET_PERMS_MASK != 0 {
+                s.push_str(&format!(" denied={}", net_mask(denied)));
+            }
+        }
+        s.push_str(&x.post);
+        crate::println!("{}", s);
+    })
+}
+
+/// いまのプロセス (決まりがあれば) のソケットの決まり。決まりのないものは見ない
+pub fn net_perm(op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
+    match current_profile() {
+        Some(p) => af_perm(&p, op, request, family, typ, protocol, extra),
+        None => Ok(()),
+    }
+}
+
+/// label (ソケットの持ち主のラベル。None は unconfined) の決まりで (AF_UNIX の相手の側を見る: aa_unix_peer_perm)
+pub fn label_net_perm(label: Option<&Label>, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
+    match label.and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
+        Some(p) => af_perm(&p, op, request, family, typ, protocol, extra),
+        None => Ok(()),
+    }
+}
+
+/// いまのプロセスに決まりがあり、net を見るか (af_inet.c の label_mediates(label, AA_CLASS_NET): 番地の確かめもこのときだけ)
+pub fn net_mediated() -> bool {
+    current_profile().is_some_and(|p| net_start(&p) != DFA_NOMATCH)
+}
+
+/// いまのプロセスのラベル (ソケットに持たせる: apparmor_socket_post_create)。決まりがなければ None
+pub fn current_label() -> Option<Label> {
+    if off() {
+        return None;
+    }
+    crate::cred::current().apparmor.clone()
+}
+
+/// AF_UNIX の番地の記録 (audit_unix_addr): なし、パス、"@抽象名" (制御文字があれば 16 進)
+pub fn unix_addr_audit(key: &str, a: Option<&[u8]>) -> String {
+    let path = a.filter(|a| a.len() > 2).map(|a| &a[2..]);
+    match path {
+        None => format!(" {}=none", key),
+        Some(p) if p[0] != 0 => {
+            let end = p.iter().position(|&c| c == 0).unwrap_or(p.len());
+            format!(" {}={}", key, untrusted(&String::from_utf8_lossy(&p[..end])))
+        }
+        Some(p) => {
+            let name = &p[1..];
+            if name.iter().any(|&c| c == b'"' || !(0x21..=0x7e).contains(&c)) {
+                format!(" {}=\"@{}\"", key, name.iter().map(|c| format!("{:02X}", c)).collect::<String>())
+            } else {
+                format!(" {}=\"@{}\"", key, String::from_utf8_lossy(name))
+            }
+        }
+    }
+}
+
+/// AF_INET の番地の記録 (print_ipv4_addr: 0 なら出さない)。a は sockaddr_in のバイト
+pub fn inet_addr_audit(a: Option<&[u8]>, k_addr: &str, k_port: &str) -> String {
+    let Some(a) = a.filter(|a| a.len() >= 8) else { return String::new() };
+    let port = u16::from_be_bytes([a[2], a[3]]);
+    let mut s = String::new();
+    if a[4..8] != [0, 0, 0, 0] {
+        s.push_str(&format!(" {}={}.{}.{}.{}", k_addr, a[4], a[5], a[6], a[7]));
+    }
+    if port != 0 {
+        s.push_str(&format!(" {}={}", k_port, port));
+    }
+    s
+}
+
+// ---- 相手のラベル (label.c の aa_label_match。ラベルはいまはプロファイル 1 つ) ----
+
+/// aa_perms_accum
+fn perms_accum(a: &mut Perms, b: &Perms) {
+    a.deny |= b.deny;
+    a.allow &= b.allow & !a.deny;
+    a.audit |= b.audit & a.allow;
+    a.quiet &= b.quiet & !a.allow;
+    a.kill |= b.kill & !a.allow;
+    a.complain |= b.complain & !a.allow & !a.deny;
+    a.cond |= b.cond & !a.allow & !a.deny;
+    a.hide &= b.hide & !a.allow;
+    a.prompt |= b.prompt & !a.allow & !a.deny;
+    a.subtree |= b.subtree & !a.deny;
+}
+
+/// aa_label_match: state から相手のラベルの名前 peer をたどった許し (label_compound_match で足りなければ
+/// label_components_match: どちらも 1 つのプロファイルでは同じ状態)。たどれなければ何も許さない
+fn label_match(p: &Profile, state: u32, peer: &str, request: u32) -> Perms {
+    let Some(d) = &p.policy.dfa else { return Perms::default() };
+    let st = d.match_len(state, peer.as_bytes());
+    if st == DFA_NOMATCH {
+        return Perms::default();
+    }
+    let mut perms = p.policy.lookup(st, true);
+    p.apply_modes(&mut perms);
+    if perms.allow & request == request {
+        return perms;
+    }
+    let mut all = ALLPERMS;
+    perms_accum(&mut all, &perms);
+    all
+}
+
+/// ラベルの名前 (決まりのないもの、外されたものは unconfined) と、決まりのあるプロファイル
+fn label_profile(l: Option<&Label>) -> (String, Option<Rc<Profile>>) {
+    match l.and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
+        Some(p) => (p.name.clone(), Some(p)),
+        None => ("unconfined".into(), None),
+    }
+}
+
+/// xcheck: 両方見て、後のしくじりのほうを
+fn xcheck(a: Result<(), i64>, b: Result<(), i64>) -> Result<(), i64> {
+    if b.is_err() { b } else { a }
+}
+
+// ---- シグナル (ipc.c) ----
+
+const CLASS_PTRACE: usize = 9;
+const CLASS_SIGNAL: usize = 10;
+const CLASS_LABEL: usize = 16;
+/// features の signal/mask (AA_SFS_SIG_MASK)
+pub const SIG_MASK: &str = "hup int quit ill trap abrt bus fpe kill usr1 segv usr2 pipe alrm term stkflt chld cont stop stp ttin ttou urg xcpu xfsz vtalrm prof winch io pwr sys emt lost";
+/// 決まりの番号の名前 (sig_names: 番号はシグナルの番号のまま、0 は 35 の exists、リアルタイムは 128 から)
+const SIG_NAMES: [&str; 36] = [
+    "unknown", "hup", "int", "quit", "ill", "trap", "abrt", "bus", "fpe", "kill", "usr1", "segv", "usr2", "pipe", "alrm", "term", "stkflt", "chld", "cont", "stop", "stp", "ttin",
+    "ttou", "urg", "xcpu", "xfsz", "vtalrm", "prof", "winch", "io", "pwr", "sys", "emt", "lost", "unused", "exists",
+];
+
+/// map_signal_num (arm64: 1-31 はそのまま、0 は exists、32-64 は 128 から、ほかは unknown)
+fn map_signal(sig: i32) -> u32 {
+    match sig {
+        0 => 35,
+        1..=31 => sig as u32,
+        32..=64 => (sig - 32 + 128) as u32,
+        _ => 0,
+    }
+}
+
+/// profile_signal_perm: p の決まりで、相手のラベル peer へ request (送る MAY_WRITE、受ける MAY_READ)
+fn signal_perm(p: &Profile, peer: &str, request: u32, sig: i32) -> Result<(), i64> {
+    let (Some(d), st) = (&p.policy.dfa, p.policy.start[CLASS_SIGNAL]) else { return Ok(()) };
+    if st == DFA_NOMATCH {
+        return Ok(());
+    }
+    let mapped = map_signal(sig);
+    let st = d.step(st, mapped as u8);
+    let mut perms = label_match(p, st, peer, request);
+    p.apply_modes(&mut perms);
+    let mask = |m: u32| if m & MAY_READ != 0 { "receive" } else if m & MAY_WRITE != 0 { "send" } else { "" };
+    check_perms(&perms, request, &|kind, req, denied, _| {
+        let mut s = format!("{} operation=\"signal\" class=\"signal\" profile={}", audit_head(kind), untrusted(&p.name));
+        s.push_str(&audit_tail());
+        if req & (MAY_READ | MAY_WRITE) != 0 {
+            s.push_str(&format!(" requested_mask=\"{}\"", mask(req)));
+            if denied & (MAY_READ | MAY_WRITE) != 0 {
+                s.push_str(&format!(" denied_mask=\"{}\"", mask(denied)));
+            }
+        }
+        // Linux の audit_signal_cb は unknown の前に空白を入れない
+        match mapped {
+            0 => s.push_str(&format!("signal=unknown({})", sig)),
+            m if (m as usize) < SIG_NAMES.len() => s.push_str(&format!(" signal={}", SIG_NAMES[m as usize])),
+            m => s.push_str(&format!(" signal=rtmin+{}", m - 128)),
+        }
+        s.push_str(&format!(" peer={}", untrusted(peer)));
+        crate::println!("{}", s);
+    })
+}
+
+/// aa_may_signal: いまのプロセスから target (資格情報) へ sig を送れるか。送る側の決まりで相手に send、受ける側の
+/// 決まりで送る側から receive (両方見る)。だめなら EACCES
+pub fn may_signal(target: &crate::cred::Cred, sig: i32) -> Result<(), i64> {
+    if off() {
+        return Ok(());
+    }
+    let me = crate::cred::current();
+    if me.apparmor.is_none() && target.apparmor.is_none() {
+        return Ok(());
+    }
+    let (sname, sp) = label_profile(me.apparmor.as_ref());
+    let (tname, tp) = label_profile(target.apparmor.as_ref());
+    let a = sp.map_or(Ok(()), |p| signal_perm(&p, &tname, MAY_WRITE, sig));
+    let b = tp.map_or(Ok(()), |p| signal_perm(&p, &sname, MAY_READ, sig));
+    xcheck(a, b)
+}
+
+// ---- ptrace (task.c。aios に ptrace はないので、/proc/PID の「追える人だけ」のもの: ptrace_may_access) ----
+
+/// features の ptrace/mask
+pub const PTRACE_MASK: &str = "read trace";
+
+/// profile_ptrace_perm: p の決まりで相手のラベル peer へ request (aa_profile_match_label: LABEL の種類の中の PTRACE)
+fn ptrace_perm(p: &Profile, peer: &str, request: u32) -> Result<(), i64> {
+    let st = match &p.policy.dfa {
+        Some(d) => d.step(p.policy.start[CLASS_LABEL], CLASS_PTRACE as u8),
+        None => DFA_NOMATCH,
+    };
+    let mut perms = if st == DFA_NOMATCH { Perms::default() } else { label_match(p, st, peer, request) };
+    p.apply_modes(&mut perms);
+    check_perms(&perms, request, &|kind, req, denied, _| ptrace_audit(p, kind, req, denied, peer, None))
+}
+
+/// ptrace の記録 (audit_ptrace_cb: 1 つだけのビットの名前)
+fn ptrace_audit(p: &Profile, kind: &str, req: u32, denied: u32, peer: &str, error: Option<i64>) {
+    let mask = |m: u32| match m {
+        MAY_READ => "read",
+        MAY_WRITE => "trace",
+        MAY_CREATE => "readby",
+        MAY_APPEND => "tracedby",
+        _ => "",
+    };
+    let all = MAY_READ | MAY_WRITE | MAY_CREATE | MAY_APPEND;
+    let mut s = format!("{} operation=\"ptrace\" class=\"ptrace\"", audit_head(kind));
+    if let Some(e) = error {
+        s.push_str(&format!(" error={}", e));
+    }
+    s.push_str(&format!(" profile={}", untrusted(&p.name)));
+    s.push_str(&audit_tail());
+    if req & all != 0 {
+        s.push_str(&format!(" requested_mask=\"{}\"", mask(req)));
+        if denied & all != 0 {
+            s.push_str(&format!(" denied_mask=\"{}\"", mask(denied)));
+        }
+    }
+    s.push_str(&format!(" peer={}", untrusted(peer)));
+    crate::println!("{}", s);
+}
+
+/// aa_may_ptrace: いまのプロセス (追う人) が tracee (資格情報) を見る (read) か追う (trace) か。追う人の決まりで相手に
+/// read / trace、追われる人の決まりで追う人から readby / tracedby (両方見る)。ptrace の決まりのないプロファイルは
+/// ほかのラベルを CAP_SYS_PTRACE がなければ追えない (古い形)
+pub fn may_ptrace(tracee: &crate::cred::Cred, read: bool) -> Result<(), i64> {
+    if off() {
+        return Ok(());
+    }
+    let me = crate::cred::current();
+    if me.apparmor.is_none() && tracee.apparmor.is_none() {
+        return Ok(());
+    }
+    let request = if read { MAY_READ } else { MAY_WRITE };
+    let (mname, mp) = label_profile(me.apparmor.as_ref());
+    let (tname, tp) = label_profile(tracee.apparmor.as_ref());
+    let a = match &mp {
+        None => Ok(()),
+        Some(p) if p.policy.start[CLASS_PTRACE] != DFA_NOMATCH => ptrace_perm(p, &tname, request),
+        Some(_) if mname == tname => Ok(()),
+        Some(p) => {
+            if capable(me, crate::cred::CAP_SYS_PTRACE, true) {
+                Ok(())
+            } else {
+                ptrace_audit(p, if p.mode == Mode::Complain { "ALLOWED" } else { "DENIED" }, 0, 0, &tname, Some(-EPERM));
+                if p.mode == Mode::Complain { Ok(()) } else { Err(-EPERM) }
+            }
+        }
+    };
+    let b = match (&tp, &mp) {
+        (Some(t), Some(_)) if t.policy.start[CLASS_PTRACE] != DFA_NOMATCH => ptrace_perm(t, &mname, request << 2),
+        _ => Ok(()),
+    };
+    xcheck(a, b)
+}
+
+// ---- mount (mount.c: マウント先、元、fs の種類、フラグ、データの順に DFA をたどる) ----
+
+const CLASS_MOUNT: usize = 7;
+const MAY_MOUNT: u32 = 0x2;
+const MAY_UMOUNT: u32 = 0x4;
+/// フラグのあとにデータも見る (AA_MNT_CONT_MATCH)。audit なら記録にデータも (AA_AUDIT_DATA)
+const MNT_CONT_MATCH: u32 = 0x40;
+/// features の mount/mask
+pub const MOUNT_MASK: &str = "mount umount pivot_root";
+const MNT_INFO: [&str; 7] = ["match succeeded", "failed mntpnt match", "failed srcname match", "failed type match", "failed flags match", "failed data match", "failed perms check"];
+
+/// 記録の flags= (audit_mnt_flags)
+fn mnt_flags_text(f: u64) -> String {
+    const REC: u64 = 1 << 14;
+    let rec = f & REC != 0;
+    let mut v = alloc::vec![if f & 1 != 0 { "ro" } else { "rw" }];
+    let named: [(u64, &str, &str); 21] = [
+        (2, "nosuid", ""), (4, "nodev", ""), (8, "noexec", ""), (16, "sync", ""), (32, "remount", ""), (64, "mand", ""), (128, "dirsync", ""),
+        (256, "nosymfollow", ""), (1024, "noatime", ""), (2048, "nodiratime", ""), (1 << 12, "bind", "rbind"), (1 << 13, "move", ""), (1 << 15, "silent", ""),
+        (1 << 16, "acl", ""), (1 << 17, "unbindable", "runbindable"), (1 << 18, "private", "rprivate"), (1 << 19, "slave", "rslave"),
+        (1 << 20, "shared", "rshared"), (1 << 21, "relatime", ""), (1 << 23, "iversion", ""), (1 << 24, "strictatime", ""),
+    ];
+    for (bit, name, rname) in named {
+        if f & bit != 0 {
+            v.push(if rec && !rname.is_empty() { rname } else { name });
+        }
+    }
+    if f & (1 << 31) != 0 {
+        v.push("nouser");
+    }
+    v.join(", ")
+}
+
+/// mount の記録 (audit_cb)
+#[allow(clippy::too_many_arguments)]
+fn mount_audit(p: &Profile, kind: &str, op: &str, info: Option<&str>, error: i64, name: Option<&str>, fstype: Option<&str>, src: Option<&str>, flags: u64, data: Option<&str>) {
+    let mut s = format!("{} operation=\"{}\" class=\"mount\"", audit_head(kind), op);
+    if let Some(i) = info {
+        s.push_str(&format!(" info=\"{}\"", i));
+        if error != 0 {
+            s.push_str(&format!(" error={}", error));
+        }
+    }
+    s.push_str(&format!(" profile={}", untrusted(&p.name)));
+    if let Some(n) = name {
+        s.push_str(&format!(" name={}", untrusted(n)));
+    }
+    s.push_str(&audit_tail());
+    if let Some(t) = fstype {
+        s.push_str(&format!(" fstype={}", untrusted(t)));
+    }
+    if let Some(d) = src {
+        s.push_str(&format!(" srcname={}", untrusted(d)));
+    }
+    if flags != 0 {
+        s.push_str(&format!(" flags=\"{}\"", mnt_flags_text(flags)));
+    }
+    if let Some(d) = data {
+        s.push_str(&format!(" options={}", untrusted(d)));
+    }
+    crate::println!("{}", s);
+}
+
+/// do_match_mnt: (どこでしくじったか (0 は合った), 許し)
+fn match_mnt(d: &Dfa, start: u32, pdb: &Pdb, mntpnt: &str, dev: Option<&str>, fstype: Option<&str>, flags: u64, data: Option<&str>) -> (usize, Perms) {
+    let mut st = d.step(d.match_len(start, mntpnt.as_bytes()), 0);
+    if st == DFA_NOMATCH {
+        return (1, Perms::default());
+    }
+    if let Some(v) = dev {
+        st = d.match_len(st, v.as_bytes());
+    }
+    st = d.step(st, 0);
+    if st == DFA_NOMATCH {
+        return (2, Perms::default());
+    }
+    if let Some(t) = fstype {
+        st = d.match_len(st, t.as_bytes());
+    }
+    st = d.step(st, 0);
+    if st == DFA_NOMATCH {
+        return (3, Perms::default());
+    }
+    for i in 0..32 {
+        if flags & (1 << i) != 0 {
+            st = d.step(st, i as u8 + 1);
+        }
+    }
+    if st == DFA_NOMATCH {
+        return (4, Perms::default());
+    }
+    let mut perms = pdb.lookup(st, true);
+    if perms.allow & MAY_MOUNT != 0 {
+        return (0, perms);
+    }
+    if let Some(v) = data.filter(|_| perms.allow & MNT_CONT_MATCH != 0) {
+        st = d.step(st, 0);
+        if st == DFA_NOMATCH {
+            return (4, perms);
+        }
+        st = d.match_len(st, v.as_bytes());
+        if st == DFA_NOMATCH {
+            return (5, perms);
+        }
+        perms = pdb.lookup(st, true);
+        if perms.allow & MAY_MOUNT != 0 {
+            return (0, perms);
+        }
+    }
+    (6, perms)
+}
+
+/// いまのプロセスの決まりで mount (match_mnt_path_str)。mntpnt と dev はパスの名前 (ディレクトリは / で終わる) か、新しい
+/// マウントの元の文字列
+pub fn mount_perm(mntpnt: &str, dev: Option<&str>, fstype: Option<&str>, flags: u64, data: Option<&str>) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let Some(d) = &p.policy.dfa else { return Ok(()) };
+    let start = p.policy.start[CLASS_MOUNT];
+    if start == DFA_NOMATCH {
+        return Ok(());
+    }
+    let (pos, mut perms) = match_mnt(d, start, &p.policy, mntpnt, dev, fstype, flags, data);
+    let info = (pos != 0).then_some(MNT_INFO[pos]);
+    p.apply_modes(&mut perms);
+    let shown = data.filter(|_| perms.audit & MNT_CONT_MATCH != 0);
+    check_perms(&perms, MAY_MOUNT, &|kind, _, _, error| mount_audit(&p, kind, "mount", info, error, Some(mntpnt), fstype, dev, flags, shown))
+}
+
+/// mount の元を引けない (aa_audit_perm_error: 決まりのあるプロセスは DENIED を記録してそのエラー)
+pub fn mount_error(flags: u64, error: i64) -> i64 {
+    if let Some(p) = current_profile() {
+        mount_audit(&p, "DENIED", "mount", None, error, None, None, None, flags, None);
+    }
+    error
+}
+
+/// いまのプロセスの決まりで umount (profile_umount: マウントの根のパスの名前)
+pub fn umount_perm(name: &str) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let Some(d) = &p.policy.dfa else { return Ok(()) };
+    let start = p.policy.start[CLASS_MOUNT];
+    if start == DFA_NOMATCH {
+        return Ok(());
+    }
+    let mut perms = p.policy.lookup(d.match_len(start, name.as_bytes()), true);
+    p.apply_modes(&mut perms);
+    check_perms(&perms, MAY_UMOUNT, &|kind, _, _, error| mount_audit(&p, kind, "umount", None, error, Some(name), None, None, 0, None))
+}
+
 // ---- LSM のシステムコール (Linux 6.8 から: security/lsm_syscalls.c と security.c。libapparmor は /proc/self/attr より先に使う) ----
 
 const LSM_ID_CAPABILITY: u64 = 100;
@@ -2310,9 +2866,14 @@ pub const FEATURES: &[(&str, &str)] = &[
     ("domain/change_profile", "yes"),
     ("domain/version", "1.2"),
     ("file/mask", "create read write exec append mmap_exec link lock"),
+    ("network_v8/af_mask", AF_MASK),
+    ("network_v8/tcp-fast-open", "yes"),
     ("policy/set_load", "yes"),
     ("policy/versions/v5", "yes"),
     ("policy/versions/v6", "yes"),
     ("policy/versions/v7", "yes"),
+    ("mount/mask", MOUNT_MASK),
+    ("ptrace/mask", PTRACE_MASK),
+    ("signal/mask", SIG_MASK),
 ];
 

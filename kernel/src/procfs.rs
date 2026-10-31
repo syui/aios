@@ -346,11 +346,15 @@ impl ProcInode {
             }
             Node::Stat(pid) => stat_line(leader_any(pid)?),
             Node::Maps(pid) => {
+                mm_access(pid, false)?;
                 let pt = &leader(pid)?.mm().pt;
                 let _h = pt.hold();
                 pt.maps_text()
             }
-            Node::Stack(pid) => proc::stacks_text(leader(pid)?.tgid),
+            Node::Stack(pid) => {
+                aa_ptrace(pid, false)?;
+                proc::stacks_text(leader(pid)?.tgid)
+            }
             Node::Status(pid) => {
                 let p = leader_any(pid)?;
                 let c = &p.cred;
@@ -392,11 +396,8 @@ impl ProcInode {
                 }
             }
             Node::Environ(pid) => {
+                mm_access(pid, true)?;
                 let p = leader(pid)?;
-                let me = crate::cred::current();
-                if me.euid != p.cred.uid && !me.capable(crate::cred::CAP_SYS_PTRACE) {
-                    return Err(-EACCES);
-                }
                 let (_, e, end) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
                 String::from_utf8_lossy(&user_bytes(p, e, end).unwrap_or_default()).into_owned()
             }
@@ -593,6 +594,35 @@ fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     }
 }
 
+/// Linux の ptrace_may_access (proc_fd_access_allowed、mm_access、ns の口、lock_trace) のうち AppArmor の ptrace の
+/// 決まり: 自分のプロセスは見ない。read は PTRACE_MODE_READ (だめなら EACCES)、でなければ ATTACH (EPERM)
+fn aa_ptrace(pid: u32, read: bool) -> Result<(), i64> {
+    let p = leader(pid)?;
+    if p.tgid == proc::current().tgid {
+        return Ok(());
+    }
+    crate::apparmor::may_ptrace(&p.cred, read).map_err(|_| if read { -EACCES } else { -EPERM })
+}
+
+/// mm_access (environ と maps を開く: Linux の may_access_mm): 自分か、ptrace_may_access (ids なら uid が合うか
+/// CAP_SYS_PTRACE、それから AppArmor の ptrace の read) か、perfmon_capable (CAP_PERFMON か CAP_SYS_ADMIN)。
+/// だめなら EACCES。maps は (前から) uid を見ない
+fn mm_access(pid: u32, ids: bool) -> Result<(), i64> {
+    use crate::cred::{CAP_PERFMON, CAP_SYS_ADMIN, CAP_SYS_PTRACE};
+    let p = leader(pid)?;
+    if p.tgid == proc::current().tgid {
+        return Ok(());
+    }
+    let c = crate::cred::current();
+    if (!ids || c.euid == p.cred.uid || c.capable(CAP_SYS_PTRACE)) && crate::apparmor::may_ptrace(&p.cred, true).is_ok() {
+        return Ok(());
+    }
+    if c.capable(CAP_PERFMON) || c.capable(CAP_SYS_ADMIN) {
+        return Ok(());
+    }
+    Err(-EACCES)
+}
+
 /// /dev/stdin や /proc/self/fd/N の名前のないもの (パイプ、ソケット、端末) は、開きなおさずにそのもの
 /// [quirk tty-root-fdlink]。ファイルの名前があるもの (Kind::Inode) は magic_link でふつうに開くので、ここでは None
 pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
@@ -604,6 +634,7 @@ pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
         }
         if let Some(pi) = ino.as_any().downcast_ref::<ProcInode>() {
             let Node::Fd(pid, n) = pi.node else { return None };
+            aa_ptrace(pid, true).ok()?;
             let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
             let named = matches!(f.borrow().kind, crate::file::Kind::Inode(..));
             return (!named).then_some(f);
@@ -622,6 +653,8 @@ impl Inode for ProcInode {
 
     fn magic_link(&self) -> Option<(String, InodeRef)> {
         let Node::Fd(pid, n) = self.node else { return None };
+        // AppArmor で見られなければ、ふつうのリンクとして (readlink が EACCES にする)
+        aa_ptrace(pid, true).ok()?;
         let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
         let f = f.borrow();
         match &f.kind {
@@ -757,6 +790,10 @@ impl Inode for ProcInode {
     }
 
     fn readlink(&self) -> Result<String, i64> {
+        // ほかのプロセスの exe cwd root fd ns を見るのは、AppArmor の ptrace の read も (proc_fd_access_allowed)
+        if let Node::Cwd(pid) | Node::RootLink(pid) | Node::Exe(pid) | Node::Fd(pid, _) | Node::NsLink(pid, _) = self.node {
+            aa_ptrace(pid, true)?;
+        }
         match self.node {
             Node::SelfLink => Ok(format!("{}", crate::ns::local_or_0(proc::current().tgid))),
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),

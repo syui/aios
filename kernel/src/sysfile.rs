@@ -2842,18 +2842,20 @@ fn may_mount() -> Result<(), i64> {
 /// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリ)。
 /// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。MS_RDONLY で読むだけ
 /// (MS_REMOUNT で付けなおせる)。移す (MS_MOVE) はない
-pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64) -> R {
+pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize) -> R {
     const MS_RDONLY: u64 = 1;
     const MS_REMOUNT: u64 = 32;
     const MS_BIND: u64 = 4096;
     const MS_MOVE: u64 = 8192;
     const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
     const ENODEV: i64 = 19;
-    may_mount()?;
     let cwd = proc::current().files().cwd.clone();
     let target = user_str(targetp)?;
+    // Linux の do_mount と path_mount の順: マウント先をたどり (ENOENT)、AppArmor (security_sb_mount)、それから may_mount (EPERM)
+    let (tfull, tdir) = vfs::lookup(&cwd, &target, true)?;
+    aa_mount(srcp, typep, datap, flags, &tfull, tdir.meta().is_dir())?;
+    may_mount()?;
     if flags & MS_PROPAGATION != 0 {
-        vfs::resolve(&cwd, &target, true)?;
         return Ok(0);
     }
     if flags & MS_MOVE != 0 {
@@ -2902,8 +2904,66 @@ pub fn umount2(targetp: usize, _flags: u64) -> R {
     may_mount()?;
     let cwd = proc::current().files().cwd.clone();
     let (full, _) = vfs::lookup(&cwd, &user_str(targetp)?, true)?;
+    // AppArmor (security_sb_umount): マウントの根でなければ (EINVAL) のあと、外す前に
+    if crate::apparmor::confined() {
+        if !vfs::mounted(&full) {
+            return Err(crate::why::inval());
+        }
+        crate::apparmor::umount_perm(&crate::apparmor::path_name(&full, true))?;
+    }
     vfs::umount(&full)?;
     Ok(0)
+}
+
+/// AppArmor の mount (apparmor_sb_mount: 決まりのあるプロセスだけ)。remount、bind、伝わり方、move、新しいマウントの
+/// どれかで、見るものとフラグを分ける (aa_remount、aa_bind_mount、aa_mount_change_type、aa_move_mount_old、aa_new_mount)
+fn aa_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir: bool) -> Result<(), i64> {
+    use crate::apparmor as aa;
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 1 << 12;
+    const MS_MOVE: u64 = 1 << 13;
+    const MS_REC: u64 = 1 << 14;
+    const MS_SILENT: u64 = 1 << 15;
+    const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    if !aa::confined() {
+        return Ok(());
+    }
+    let mut flags = flags;
+    if flags & 0xffff_0000 == 0xc0ed_0000 {
+        flags &= !0xffff_0000;
+    }
+    // AA_MS_IGNORE_MASK (MS_KERNMOUNT MS_NOSEC MS_BORN MS_ACTIVE)
+    flags &= !((1 << 22) | (1 << 28) | (1 << 29) | (1 << 30));
+    let name = aa::path_name(full, dir);
+    let opt = |p: usize| if p != 0 { user_str(p).map(Some) } else { Ok(None) };
+    let cwd = proc::current().files().cwd.clone();
+    if flags & MS_REMOUNT != 0 {
+        let data = opt(datap)?;
+        aa::mount_perm(&name, None, None, flags, data.as_deref())
+    } else if flags & MS_BIND != 0 {
+        let src = opt(srcp)?.filter(|s| !s.is_empty()).ok_or_else(|| crate::why::inval())?;
+        let flags = flags & (MS_REC | MS_BIND);
+        match vfs::lookup(&cwd, &src, true) {
+            Ok((sfull, s)) => aa::mount_perm(&name, Some(&aa::path_name(&sfull, s.meta().is_dir())), None, flags, None),
+            Err(e) => Err(aa::mount_error(flags, e)),
+        }
+    } else if flags & MS_PROPAGATION != 0 {
+        aa::mount_perm(&name, None, None, flags & (MS_REC | MS_SILENT | MS_PROPAGATION), None)
+    } else if flags & MS_MOVE != 0 {
+        let src = opt(srcp)?.filter(|s| !s.is_empty()).ok_or_else(|| crate::why::inval())?;
+        let (sfull, s) = vfs::lookup(&cwd, &src, true)?;
+        aa::mount_perm(&name, Some(&aa::path_name(&sfull, s.meta().is_dir())), None, MS_MOVE, None)
+    } else {
+        // 知らない fs の種類は ENODEV (get_fs_type)。aios の fs にデバイスの要るもの (FS_REQUIRES_DEV) やバイナリの
+        // データのものはない
+        let fstype = opt(typep)?;
+        if fstype.as_deref().is_some_and(|t| !matches!(t, "tmpfs" | "proc" | "sysfs" | "securityfs")) {
+            return Err(-19);
+        }
+        let dev = opt(srcp)?;
+        let data = opt(datap)?;
+        aa::mount_perm(&name, dev.as_deref(), fstype.as_deref(), flags, data.as_deref())
+    }
 }
 
 pub fn fchdir(fd: u64) -> R {

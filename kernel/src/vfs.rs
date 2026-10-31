@@ -374,6 +374,12 @@ pub fn is_mount_at(id: (usize, u64)) -> bool {
     MOUNT_MANY.load(SeqCst) || MOUNT_AT.iter().any(|m| m.load(SeqCst) == k)
 }
 
+/// path がマウントの根か (umount できるか: Linux の can_umount の path_mounted)
+pub fn mounted(path: &str) -> bool {
+    let Ok(top) = resolve("", path, true) else { return false };
+    current_mnt().list.borrow().iter().any(|m| m.root.id() == top.id())
+}
+
 /// path にかぶせてあるもの (いちばん上) を、読むだけに / 書けるように (mount -o remount,ro)
 pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
     let top = resolve("", path, true)?;

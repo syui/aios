@@ -463,7 +463,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MEMFD_CREATE => sysfile::memfd_create(a[0] as usize, a[1]),
         FCHDIR => sysfile::fchdir(a[0]),
         CHROOT => sysfile::chroot(a[0] as usize),
-        MOUNT => sysfile::mount(a[0] as usize, a[1] as usize, a[2] as usize, a[3]),
+        MOUNT => sysfile::mount(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         UMOUNT2 => sysfile::umount2(a[0] as usize, a[1]),
         FCHMOD => sysfile::fchmod(a[0], a[1]),
         FCHMODAT => sysfile::fchmodat(int(a[0]), a[1] as usize, a[2]),
