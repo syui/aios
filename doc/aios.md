@@ -464,6 +464,45 @@ MAP_SHARED の無名とファイルの写しは親と子で同じページなこ
 16 バイトに重なり、そのほとんどを 0 にしていた (ずれは環境の長さによる。glibc はここからスタックの番人をとる)。いまは数と
 並びの型を 1 つの定数にした。test/random.c は AT_RANDOM に 0 のバイトが 4 つ以上ないことも見る。
 
+### AppArmor (Linux と同じプロファイル)
+
+AppArmor のプロファイル (文字で書いた決まり) は、Linux と同じく apparmor_parser がバイナリにして
+/sys/kernel/security/apparmor/.load (足す) か .replace (足すか入れかえる) に書き、.remove に名前を書くと外す
+(kernel/src/apparmor.rs、securityfs.rs)。バイナリのほどき方は Linux 7.3 の policy_unpack.c と同じ (型の印のついた値の
+並び)、ファイルの決まりは DFA (match.c。表は big endian) で、パスを通してたどりついた状態の許しを見る。apparmor_parser は
+カーネルが名のること (apparmor/features) を読んで形を選ぶので、aios は v5〜v7 の版と、ファイル (create read write exec
+append mmap_exec link lock)、change_profile と change_onexec を名のる。すると許しを DFA の accept の表にうめこんだ古い
+形で作るので、policy_compat.c と同じく読むときに許しの表へ移す (持ち主のときとほかのときの 2 つ組)。表は読むときに
+みな確かめる (状態と行き先が表の中、差分の鎖がまわっていない、許しの番号が表の中: Linux の paranoid_load と同じ)。
+.access には「このプロファイルでこの文字列は」を聞ける (libapparmor の aa_query_label)。/sys/module/apparmor/parameters/enabled
+は Y、/sys/kernel/security/lsm は capability,landlock,apparmor (securityfs は起動のときにかぶせる)。
+
+プロセスのラベル (cred の apparmor) は fork で受けつぎ、使うたびにプロファイルを名前で引く (入れかえれば新しいものに、
+外されれば unconfined に: Linux の proxy と同じ)。exec では、決まりのないプロセスならパスでつくもの (attach。いちばん
+長く文字どおりに合ったもの、同じ長さならどれにもつけない: find_attach と leftmatch)、決まりのあるものなら exec の許しの
+行き先 (ix はそのまま、px と cx は名前か子のプロファイル、ux は unconfined、見つからなければ ix か ux へ。大文字は
+AT_SECURE で、ld.so が LD_* を見ない)。#! のスクリプトは、Linux と同じくスクリプトのパスで 1 度だけ。/proc/PID/attr
+(と attr/apparmor) の current は「名前 (モード)」、exec に "exec NAME" を書くと次の exec で (onexec)、current に
+"changeprofile NAME" を書くといま移る (決まりのあるものは change_profile の許しが要る。no_new_privs ならほかへは移れない)。
+
+決まりを見るのは open (開く口の許し: 読む、書く、O_APPEND は a、O_CREAT は c)、作る (O_CREAT、mknod、mkdir、symlink、
+AF_UNIX の bind)、消す (unlink、rmdir)、rename (前は読んで消す、新しいほうは作って書く)、link (新しい名前とペアの古い
+名前に l。subset なら許しが古いものの中)、truncate、chmod、chown、stat (getattr)、実行して写す mmap (m)、ロック (k、
+書くロックは w も)。ディレクトリは名前の終わりに / をつけて見る。enforce なら EACCES と DENIED、complain なら許して ALLOWED、
+audit をつけたものは AUDIT、deny したものは complain でも止めて記録しない、kill なら SIGKILL (またはプロファイルの
+signal)。記録は Linux の dmesg と同じ形 (`audit: type=1400 audit(...): apparmor="DENIED" operation="open" class="file"
+profile=... name=... pid=... comm=... requested_mask="r" denied_mask="r" fsuid=... ouid=...`) で kmsg に。
+プロファイルのついたプロセスは、大きなロックなしの道 (syscall::fast) を通らない。
+
+Linux とちがうところ (まだないもの): complain で exec の許しがないとき、Linux は学ぶための空のプロファイルに移るが、
+aios はいまのプロファイルのまま。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
+change_hat、capability、ネットワーク、mount、ptrace、signal、rlimit の決まりはまだで、features でも名のらない
+(capability は root のたしかめを capable() にまとめてから)。mprotect と、exec のときに開いたままのファイルを見なおすこと
+もまだ。新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh がこのマシンの apparmor_parser 4.0.1 で
+blob.h に) を読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・
+truncate・flock・exec (ix px cx ux、許しのないもの)・change_profile の 39 の答えをくらべ、決まりのないプロセスから onexec、
+complain、動いているプロセスのプロファイルを外す (unconfined にもどる) のを確かめる。
+
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
 プログラムは、この CPU で使える命令を AT_HWCAP と AT_HWCAP2 (getauxval) か /proc/cpuinfo の `Features` で知る。前の aios
