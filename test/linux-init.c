@@ -2,6 +2,8 @@
 // Linux で setpriv --reuid=65534 --regid=65534 --clear-groups とするのと同じ):
 //   OPS home|tmp    ロボット (/sysdiff) を、home なら /work/sd (ext4)、tmp なら /tmp/sd (tmpfs) で
 //   exec ARG...     /prog を ARG... で (テストのプログラム。/work と /tmp はだれでも書ける)
+//   rootexec ARG... exec と同じだが root のまま (AppArmor のプロファイルを読みこむ test/apparmor.c)
+// securityfs は /sys/kernel/security に (あれば)
 // 出力は /work/out.txt、エラーは /work/err.txt、終わりの番号は /work/status。それから電源を切る
 // ループバック (lo、127.0.0.1) は起こしておく (ロボットの AF_INET。aios はいつも 127.0.0.1/8 を持つ)
 #define _GNU_SOURCE
@@ -48,6 +50,7 @@ static void lo_up(void) {
 int main(void) {
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
+    mount("securityfs", "/sys/kernel/security", "securityfs", 0, NULL);
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777");
     lo_up();
@@ -64,7 +67,8 @@ int main(void) {
     for (char *t = strtok(line, " \n"); t && argc < 63; t = strtok(NULL, " \n"))
         argv[argc++] = t;
     argv[argc] = NULL;
-    int exec_mode = argc > 0 && !strcmp(argv[0], "exec");
+    int root_mode = argc > 0 && !strcmp(argv[0], "rootexec");
+    int exec_mode = argc > 0 && (!strcmp(argv[0], "exec") || root_mode);
     const char *ops = argc > 0 ? argv[0] : "30", *fs = argc > 1 ? argv[1] : "home";
     const char *work = strcmp(fs, "tmp") ? "/work/sd" : "/tmp/sd";
     chmod("/work", 01777);
@@ -78,7 +82,7 @@ int main(void) {
     if (pid == 0) {
         dup2(out, 1);
         dup2(err, 2);
-        if (setgroups(0, NULL) < 0 || setgid(65534) < 0 || setuid(65534) < 0) {
+        if (!root_mode && (setgroups(0, NULL) < 0 || setgid(65534) < 0 || setuid(65534) < 0)) {
             perror("init: nobody");
             _exit(126);
         }

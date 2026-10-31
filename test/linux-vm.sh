@@ -9,6 +9,8 @@
 #   test/linux-vm.sh exec [latest|X.Y.Z] PROG [ARG...]
 #                                                 テストのプログラム (aarch64 の静的なもの) を nobody で動かして出力を出す。
 #                                                 /work は ext4、/tmp は tmpfs (たとえば pipeslots /work/.ps)
+#   test/linux-vm.sh rootexec [latest|X.Y.Z] PROG [ARG...]
+#                                                 exec と同じを root で (AppArmor の test/apparmor.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
 # cortex-a72 にする
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
@@ -143,12 +145,13 @@ boot() {
 }
 
 exec_prog() {
-  image=$(build "$1")
-  prog=$2
-  shift 2
+  mode=$1
+  image=$(build "$2")
+  prog=$3
+  shift 3
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
-  echo "exec $*" > "$tmp/args"
+  echo "$mode $*" > "$tmp/args"
   boot "$image" prog="$prog" args="$tmp/args"
   st=$(debugfs -R "cat /status" "$tmp/work.img" 2>/dev/null | tr -d '\n')
   debugfs -R "cat /out.txt" "$tmp/work.img" 2>/dev/null
@@ -165,6 +168,6 @@ case "$1" in
 version) version "$2" ;;
 build) build "$2" ;;
 run) shift; run "$@" ;;
-exec) shift; exec_prog "$@" ;;
-*) sed -n '2,10p' "$0" >&2; exit 2 ;;
+exec | rootexec) exec_prog "$@" ;;
+*) sed -n '2,13p' "$0" >&2; exit 2 ;;
 esac
