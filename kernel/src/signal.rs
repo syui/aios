@@ -267,7 +267,7 @@ pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
 fn can_signal(target: &Proc) -> bool {
     let me = proc::current();
     let (a, b) = (&me.cred, &target.cred);
-    a.euid == 0 || a.uid == b.uid || a.uid == b.suid || a.euid == b.uid || a.euid == b.suid
+    a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)
 }
 
 /// 例外など、今のスレッドに必ず届けるもの (ブロックや無視は外す)

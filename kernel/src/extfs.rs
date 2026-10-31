@@ -3896,9 +3896,9 @@ impl ExtFs {
             if !alone && (r.links() != 1 || r.blocks512(self.bsize) != 0) {
                 return FastUnlink::Alone;
             }
-            // sticky なディレクトリでは、持ち主 (ファイルかディレクトリ) か root だけ (sysfile の sticky_ok)
+            // sticky なディレクトリでは、持ち主 (ファイルかディレクトリ) だけ。ほかは CAP_FOWNER を見るふつうの道で (sysfile の sticky_ok)
             let dm = dr.perm_meta();
-            if dm.mode & crate::cred::S_ISVTX != 0 && c.euid != 0 && c.euid != dm.uid && r.perm_meta().uid != c.euid {
+            if dm.mode & crate::cred::S_ISVTX != 0 && c.euid != dm.uid && r.perm_meta().uid != c.euid {
                 return FastUnlink::No;
             }
             {

@@ -241,17 +241,14 @@ pub fn drop_privs(ino: &InodeRef) -> Result<(), i64> {
         return Ok(());
     }
     let c = crate::cred::current();
-    if c.euid == 0 {
-        return Ok(());
-    }
     let mut kill = m.mode & S_ISUID;
-    if m.mode & S_ISGID != 0 && (m.mode & 0o010 != 0 || !c.in_group(m.gid)) {
+    if m.mode & S_ISGID != 0 && (m.mode & 0o010 != 0 || !(c.in_group(m.gid) || c.capable(crate::cred::CAP_FSETID))) {
         kill |= S_ISGID;
     }
-    if kill != 0 {
-        ino.set_mode(m.mode & 0o7777 & !kill)?;
+    if kill == 0 || c.capable(crate::cred::CAP_FSETID) {
+        return Ok(());
     }
-    Ok(())
+    ino.set_mode(m.mode & 0o7777 & !kill)
 }
 
 static ROOT: Bkl<Option<InodeRef>> = Bkl::new(None);

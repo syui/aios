@@ -902,7 +902,7 @@ pub fn ioctl(tty: &TtyRef, master: bool, req: u64, arg: usize) -> Result<i64, i6
                 return Err(-EPERM);
             }
             let mut t = tty.borrow_mut();
-            if session_alive(t.session) && !(arg == 1 && proc::current_cred().euid == 0) {
+            if session_alive(t.session) && !(arg == 1 && proc::current_cred().capable(crate::cred::CAP_SYS_ADMIN)) {
                 return Err(-EPERM);
             }
             t.session = me.sid;

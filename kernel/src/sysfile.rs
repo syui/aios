@@ -279,14 +279,14 @@ fn parent_writable(c: &Cred, parent: &InodeRef) -> Result<(), i64> {
     c.check(&parent.meta(), PW | PX)
 }
 
-/// sticky なディレクトリでは、消す/動かすのは持ち主 (ファイルかディレクトリ) か root だけ
+/// sticky なディレクトリでは、消す/動かすのは持ち主 (ファイルかディレクトリ) か CAP_FOWNER だけ (Linux の __check_sticky)
 fn sticky_ok(c: &Cred, parent: &InodeRef, name: &str) -> Result<(), i64> {
     let pm = parent.meta();
-    if pm.mode & cred::S_ISVTX == 0 || c.euid == 0 || c.euid == pm.uid {
+    if pm.mode & cred::S_ISVTX == 0 || c.euid == pm.uid {
         return Ok(());
     }
     let child = parent.lookup(name)?;
-    if child.meta().uid == c.euid { Ok(()) } else { Err(-cred::EPERM) }
+    if child.meta().uid == c.euid || c.capable(cred::CAP_FOWNER) { Ok(()) } else { Err(-cred::EPERM) }
 }
 
 /// 作ったものの持ち主を決める (setgid のディレクトリの下ならそのグループ)。ext4 は作るときに決めている
@@ -1670,7 +1670,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
 /// swapon / swapoff の path: ブロックデバイスのノードの区画か、ふつうのファイル。と、その名前
 fn swap_source(pathp: usize) -> Result<(crate::swap::Source, String), i64> {
     use crate::swap::Source;
-    if cred::current().euid != 0 {
+    if !cred::current().capable(cred::CAP_SYS_ADMIN) {
         return Err(-cred::EPERM);
     }
     let path = user_str(pathp)?;
@@ -1717,7 +1717,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
         _ => return Err(crate::why::inval()),
     };
     let c = cred::current();
-    if matches!(node, NewNode::Dev(..) | NewNode::Blk(..)) && c.euid != 0 {
+    if matches!(node, NewNode::Dev(..) | NewNode::Blk(..)) && !c.capable(cred::CAP_MKNOD) {
         return Err(-cred::EPERM);
     }
     // Linux と同じく、あれば書けなくても EEXIST (mkdir -p や create_dir_all がそれで「ある」とわかる)
@@ -2196,7 +2196,7 @@ fn chmod(ino: &InodeRef, mode: u64) -> R {
         return Err(-cred::EPERM);
     }
     let mut mode = mode as u32;
-    if c.euid != 0 && !c.in_group(m.gid) {
+    if !c.in_group(m.gid) && !c.capable(cred::CAP_FSETID) {
         mode &= !cred::S_ISGID;
     }
     ino.set_mode(mode)?;
@@ -2219,7 +2219,7 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
     if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
         use core::sync::atomic::Ordering::Relaxed;
         let c = cred::current();
-        if c.euid != 0 && c.euid != p.uid.load(Relaxed) {
+        if c.euid != p.uid.load(Relaxed) && !c.capable(cred::CAP_FOWNER) {
             return Err(-cred::EPERM);
         }
         p.perm.store(mode as u32 & 0o7777, Relaxed);
@@ -2290,27 +2290,27 @@ fn id_arg(v: u64) -> Option<u32> {
     (v as u32 != u32::MAX).then_some(v as u32)
 }
 
-/// chown で変えたあとの mode (Linux の chown_common と setattr_prepare): root でなければ、uid は持ち主が自分のままに
-/// するだけ、gid は持ち主が自分の入っているグループへだけ (EPERM)。ディレクトリでなければ、だれが変えても (変えなくても)
-/// setuid を落とし、setgid はグループが実行できるか、変える人がそのグループでも root でもなければ落とす。落とすのも
-/// mode を変えることなので、持ち主か root だけ (EPERM)
+/// chown で変えたあとの mode (Linux の chown_common と setattr_prepare): CAP_CHOWN がなければ、uid は持ち主が自分の
+/// ままにするだけ、gid は持ち主が自分の入っているグループへだけ (EPERM)。ディレクトリでなければ、だれが変えても (変えなくても)
+/// setuid を落とし、setgid はグループが実行できるか、変える人がそのグループでも CAP_FSETID もなければ落とす。落とすのも
+/// mode を変えることなので、持ち主か CAP_FOWNER だけ (EPERM)。ケーパビリティを見る順も Linux と同じ
 fn chown_mode(c: &Cred, (cur_uid, cur_gid, mode): (u32, u32, u32), uid: Option<u32>, gid: Option<u32>) -> Result<u32, i64> {
-    if c.euid != 0 {
-        if uid.is_some_and(|u| c.euid != cur_uid || u != cur_uid) {
-            return Err(-cred::EPERM);
-        }
-        if gid.is_some_and(|g| c.euid != cur_uid || (g != cur_gid && !c.in_group(g))) {
-            return Err(-cred::EPERM);
-        }
-    }
-    if mode & S_IFMT == vfs::S_IFDIR {
-        return Ok(mode);
-    }
+    let dir = mode & S_IFMT == vfs::S_IFDIR;
     let mut kill = cred::S_ISUID;
-    if mode & cred::S_ISGID != 0 && (mode & 0o010 != 0 || !(c.euid == 0 || c.in_group(cur_gid))) {
+    if !dir && mode & cred::S_ISGID != 0 && (mode & 0o010 != 0 || !(c.in_group(cur_gid) || c.capable(cred::CAP_FSETID))) {
         kill |= cred::S_ISGID;
     }
-    if mode & kill != 0 && c.euid != 0 && c.euid != cur_uid {
+    let own = c.euid == cur_uid;
+    if uid.is_some_and(|u| !(own && u == cur_uid) && !c.capable(cred::CAP_CHOWN)) {
+        return Err(-cred::EPERM);
+    }
+    if gid.is_some_and(|g| !(own && (g == cur_gid || c.in_group(g))) && !c.capable(cred::CAP_CHOWN)) {
+        return Err(-cred::EPERM);
+    }
+    if dir {
+        return Ok(mode);
+    }
+    if mode & kill != 0 && !own && !c.capable(cred::CAP_FOWNER) {
         return Err(-cred::EPERM);
     }
     Ok(mode & !kill)
@@ -2600,8 +2600,8 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
                 // eventfd などの名前のない inode は root のもの
                 _ => (None, false),
             };
-            let euid = cred::current().euid;
-            if arg & O_NOATIME != 0 && f.flags & O_NOATIME == 0 && euid != 0 && owner != Some(euid) {
+            let c = cred::current();
+            if arg & O_NOATIME != 0 && f.flags & O_NOATIME == 0 && owner != Some(c.euid) && !c.capable(cred::CAP_FOWNER) {
                 return Err(-cred::EPERM);
             }
             if arg & O_DIRECT != 0 && !odirect {
@@ -2815,7 +2815,7 @@ pub fn chdir(pathp: usize) -> R {
 pub fn chroot(pathp: usize) -> R {
     let path = user_str(pathp)?;
     // 砂場の中からは、見える根を変えられない (Linux の landlock と同じ)
-    if cred::current().euid != 0 || cred::current().landlock.is_some() {
+    if !cred::current().capable(cred::CAP_SYS_CHROOT) || cred::current().landlock.is_some() {
         return Err(-cred::EPERM);
     }
     let files = proc::current().files();
@@ -2833,7 +2833,7 @@ pub fn chroot(pathp: usize) -> R {
 fn may_mount() -> Result<(), i64> {
     let c = cred::current();
     let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id()));
-    if c.landlock.is_some() || !((c.euid == 0 && c.ns.user.is_none()) || own) {
+    if c.landlock.is_some() || !((c.ns.user.is_none() && c.capable(cred::CAP_SYS_ADMIN)) || own) {
         return Err(-cred::EPERM);
     }
     Ok(())

@@ -870,10 +870,12 @@ pub fn scm_parse(b: &[u8]) -> Result<Scm, i64> {
                     let gid = crate::ns::take_gid(gid)?;
                     let c = proc::current_cred_ref();
                     let local = crate::ns::local_or_0(proc::current().tgid);
-                    let root = c.euid == 0;
-                    let uid_ok = uid == c.uid || uid == c.euid || uid == c.suid || root;
-                    let gid_ok = gid == c.gid || gid == c.egid || gid == c.sgid || root;
-                    if !((pid == local || root) && uid_ok && gid_ok) {
+                    // Linux の scm_check_creds: 自分の番号でなければ、pid は CAP_SYS_ADMIN、uid は CAP_SETUID、gid は CAP_SETGID
+                    use crate::cred::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN};
+                    let pid_ok = pid == local || c.capable(CAP_SYS_ADMIN);
+                    let uid_ok = || uid == c.uid || uid == c.euid || uid == c.suid || c.capable(CAP_SETUID);
+                    let gid_ok = || gid == c.gid || gid == c.egid || gid == c.sgid || c.capable(CAP_SETGID);
+                    if !(pid_ok && uid_ok() && gid_ok()) {
                         return Err(-EPERM);
                     }
                     let g = crate::ns::to_global(pid).filter(|&g| g != 0 && crate::proc::find_any(g).is_some()).ok_or(-ESRCH)?;
@@ -2116,7 +2118,7 @@ pub fn owner(u: &UnixRef) -> u32 {
 pub fn chmod(u: &UnixRef, mode: u32) -> R {
     let c = proc::current_cred_ref();
     let mut s = u.borrow_mut();
-    if c.euid != 0 && c.euid != s.uid {
+    if c.euid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
         return Err(-EPERM);
     }
     s.mode = mode & 0o7777;
@@ -2318,13 +2320,13 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
             SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => s.rcvtimeo = to_ns(val)?,
             SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => s.sndtimeo = to_ns(val)?,
             SO_PRIORITY => {
-                if v > 6 && proc::current_cred_ref().euid != 0 {
+                if v > 6 && !crate::cred::net_prio_ok(proc::current_cred_ref()) {
                     return Err(-EPERM);
                 }
                 s.priority = v as u32;
             }
             SO_DEBUG => {
-                if b && proc::current_cred_ref().euid != 0 {
+                if b && !proc::current_cred_ref().capable(crate::cred::CAP_NET_ADMIN) {
                     return Err(-EACCES);
                 }
             }

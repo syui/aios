@@ -735,7 +735,7 @@ pub fn bind(u: &InetRef, a: &[u8]) -> R {
     if !(addr == 0 || is_local(addr, netns) || special || freebind) {
         return Err(-EADDRNOTAVAIL);
     }
-    if port != 0 && port < PRIV_PORT && proc::current_cred_ref().euid != 0 {
+    if port != 0 && port < PRIV_PORT && !proc::current_cred_ref().capable(crate::cred::CAP_NET_BIND_SERVICE) {
         return Err(-EACCES);
     }
     {
@@ -2008,13 +2008,13 @@ fn sock_cmsg_check(ctl: &[u8], tcp: bool) -> Result<(Option<u8>, Option<u8>), i6
                     if clen != 20 {
                         return Err(crate::why::inval());
                     }
-                    if int().unwrap_or(0) as u32 > 6 && proc::current_cred_ref().euid != 0 {
+                    if int().unwrap_or(0) as u32 > 6 && !crate::cred::net_prio_ok(proc::current_cred_ref()) {
                         return Err(-EPERM);
                     }
                 }
                 // SO_MARK
                 36 => {
-                    if proc::current_cred_ref().euid != 0 {
+                    if !crate::cred::net_prio_ok(proc::current_cred_ref()) {
                         return Err(-EPERM);
                     }
                     if clen != 20 {
@@ -2949,7 +2949,7 @@ fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
         let mut s = u.borrow_mut();
         match opt {
             1 => {
-                if b && proc::current_cred_ref().euid != 0 {
+                if b && !proc::current_cred_ref().capable(crate::cred::CAP_NET_ADMIN) {
                     return Err(-EACCES);
                 }
             }
@@ -2971,7 +2971,7 @@ fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
             10 => s.oobinline = b,
             11 => {}
             12 => {
-                if !(0..=6).contains(&v) && proc::current_cred_ref().euid != 0 {
+                if !(0..=6).contains(&v) && !crate::cred::net_prio_ok(proc::current_cred_ref()) {
                     return Err(-EPERM);
                 }
                 s.priority = v as u32;
@@ -3265,7 +3265,7 @@ pub fn owner(u: &InetRef) -> u32 {
 pub fn chmod(u: &InetRef, mode: u32) -> R {
     let c = proc::current_cred_ref();
     let mut s = u.borrow_mut();
-    if c.euid != 0 && c.euid != s.uid {
+    if c.euid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
         return Err(-EPERM);
     }
     s.mode = mode & 0o7777;

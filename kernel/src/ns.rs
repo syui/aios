@@ -127,7 +127,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         }
         c.ns.user = Some(Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) }));
     }
-    if flags & !CLONE_NEWUSER & SUPPORTED != 0 && c.euid != 0 && !c.no_new_privs && c.ns.user.is_none() {
+    if flags & !CLONE_NEWUSER & SUPPORTED != 0 && c.ns.user.is_none() && !c.no_new_privs && !c.capable(crate::cred::CAP_SYS_ADMIN) {
         return Err(-EPERM);
     }
     if flags & CLONE_NEWUTS != 0 {
@@ -184,7 +184,7 @@ pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
     match &c.ns.uts {
         Some(u) => *u.name.borrow_mut() = (b, name.len()),
         None => {
-            if check && c.euid != 0 {
+            if check && !c.capable(crate::cred::CAP_SYS_ADMIN) {
                 return Err(-EPERM);
             }
             *HOSTNAME.get() = (b, name.len());
@@ -318,9 +318,10 @@ pub fn map_text(u: &Option<Rc<User>>, gid: bool) -> alloc::string::String {
 pub fn write_map(u: &Option<Rc<User>>, gid: bool, text: &[u8]) -> Result<(), i64> {
     let u = u.as_ref().ok_or(-EPERM)?;
     let me = crate::proc::current_cred_ref();
-    // 書けるのは、作った人 (外にいるか、同じ namespace の中) か、外の root
-    let root = me.euid == 0 && me.ns.user.is_none();
-    if !root && (me.euid != u.owner || me.ns.user.as_ref().is_some_and(|n| !Rc::ptr_eq(n, u))) {
+    // 書けるのは、作った人 (外にいるか、同じ namespace の中) か、外で CAP_SETUID (gid_map は CAP_SETGID) を持つ人
+    let own = me.euid == u.owner && !me.ns.user.as_ref().is_some_and(|n| !Rc::ptr_eq(n, u));
+    let root = || me.ns.user.is_none() && me.capable(if gid { crate::cred::CAP_SETGID } else { crate::cred::CAP_SETUID });
+    if !own && !root() {
         return Err(-EPERM);
     }
     let text = core::str::from_utf8(text).map_err(|_| crate::why::inval())?;
@@ -336,12 +337,11 @@ pub fn write_map(u: &Option<Rc<User>>, gid: bool, text: &[u8]) -> Result<(), i64
         return Err(crate::why::inval());
     }
     let mut m = u.maps.borrow_mut();
-    if !root {
-        // root でない人は、自分の番号 1 つだけ
-        let own = if gid { u.owner_gid } else { u.owner };
-        if lines.len() != 1 || lines[0].1 != own || lines[0].2 != 1 || (gid && !m.setgroups_deny) {
-            return Err(-EPERM);
-        }
+    // 自分の番号 1 つだけなら、作った人はケーパビリティなしで (Linux の new_idmap_permitted)
+    let id = if gid { u.owner_gid } else { u.owner };
+    let simple = own && lines.len() == 1 && lines[0].1 == id && lines[0].2 == 1 && (!gid || m.setgroups_deny);
+    if !simple && !root() {
+        return Err(-EPERM);
     }
     let slot = if gid { &mut m.gid } else { &mut m.uid };
     if slot.is_some() {
@@ -362,7 +362,7 @@ pub fn setgroups_text(u: &Option<Rc<User>>) -> &'static str {
 pub fn write_setgroups(u: &Option<Rc<User>>, text: &[u8]) -> Result<(), i64> {
     let u = u.as_ref().ok_or(-EPERM)?;
     let me = crate::proc::current_cred_ref();
-    if !(me.euid == 0 && me.ns.user.is_none()) && me.euid != u.owner {
+    if me.euid != u.owner && !(me.ns.user.is_none() && me.capable(crate::cred::CAP_SYS_ADMIN)) {
         return Err(-EPERM);
     }
     let mut m = u.maps.borrow_mut();

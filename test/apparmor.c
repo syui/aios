@@ -1,7 +1,8 @@
 // AppArmor (kernel/src/apparmor.rs) のたしかめ: test/apparmor/test.profile (gen.sh が apparmor_parser で作った blob.h) を
 // /sys/kernel/security/apparmor/.replace で読み、このプログラムの写し /tmp/aatest/t (aatest がパスでつく) に、決まりの
 // 中から open、作る・消す、rename、link、chmod、truncate、flock、exec (ix px cx ux) と change_profile をためさせる。
-// それから、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイルを外す (unconfined にもどる)。
+// aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
+// プロファイルを外す (unconfined にもどる)。
 // root で動かす (でなければ sudo -n でもう一度)。AppArmor のついた Linux でも同じに通ること
 #define _GNU_SOURCE
 #include <errno.h>
@@ -9,8 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/capability.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,6 +106,59 @@ static void run(const char *prog, const char *arg, char *out, size_t n) {
     snprintf(out, n, "SIG %d", WTERMSIG(st));
 }
 
+// prog を arg で動かし、出力をみな out に
+static void collect(const char *prog, const char *arg, char *out, size_t n) {
+  int p[2];
+  out[0] = 0;
+  if (pipe(p) < 0)
+    return;
+  fflush(stdout);
+  pid_t c = fork();
+  if (c == 0) {
+    dup2(p[1], 1);
+    close(p[0]);
+    execl(prog, prog, arg, (char *)NULL);
+    _exit(127);
+  }
+  close(p[1]);
+  size_t got = 0;
+  ssize_t k;
+  while ((k = read(p[0], out + got, n - 1 - got)) > 0)
+    got += k;
+  out[got] = 0;
+  close(p[0]);
+  waitpid(c, NULL, 0);
+}
+
+// capget の effective と permitted の下の 32 ビット
+static void caps(unsigned *eff, unsigned *perm) {
+  struct __user_cap_header_struct h = {_LINUX_CAPABILITY_VERSION_3, 0};
+  struct __user_cap_data_struct d[2] = {0};
+  syscall(SYS_capget, &h, d);
+  *eff = d[0].effective;
+  *perm = d[0].permitted;
+}
+
+// aacap (argv[1] が cap) か aacomplain (capc) で: 1 行に「名前 答え」。cap2 は uid 1 の 0600
+static int capchild(int complain) {
+  if (puts_("/proc/self/attr/current", complain ? "changeprofile aacomplain" : "changeprofile aacap"))
+    return 2;
+  const char *k = complain ? "capc" : "cap";
+  unsigned eff, perm;
+  caps(&eff, &perm);
+  printf("%s-eff %x\n%s-perm %x\n", k, eff, k, perm);
+  printf("%s-read-other %d\n", k, op_open(D "/cap2", O_RDONLY));
+  printf("%s-write-other %d\n", k, op_open(D "/cap2", O_WRONLY));
+  printf("%s-chmod-other %d\n", k, e(chmod(D "/cap2", 0600)));
+  printf("%s-chown %d\n", k, e(chown(D "/cap", 1, 1)));
+  printf("%s-chown-back %d\n", k, e(chown(D "/cap", 0, 0)));
+  printf("%s-mknod %d\n", k, e(mknod(D "/dev0", S_IFCHR | 0600, makedev(1, 3))));
+  unlink(D "/dev0");
+  printf("%s-setuid %d\n", k, e(setuid(1)));
+  fflush(stdout);
+  return 0;
+}
+
 // aatest の中で (argv[1] が child): 1 行に「名前 答え」
 static int child(void) {
 #define T(name, v) printf("%s %d\n", name, v)
@@ -165,12 +222,20 @@ static const char *want[] = {
     "changed aachild (enforce)",
 };
 
+// aacap: chown のほかの root の力はない (capget にも chown だけ)。complain なら記録して通す
+static const char *want_cap[] = {
+    "cap-eff 1", "cap-perm 1", "cap-read-other 13", "cap-write-other 13", "cap-chmod-other 1", "cap-chown 0",
+    "cap-chown-back 0", "cap-mknod 1", "cap-setuid 1", "capc-eff ffffffff", "capc-perm ffffffff",
+    "capc-read-other 0", "capc-write-other 0", "capc-chmod-other 0", "capc-chown 0", "capc-chown-back 0",
+    "capc-mknod 0", "capc-setuid 0",
+};
+
 // 作るものと、このプログラムの写し (t と、exec の行き先)。Linux の VM (test/linux-vm.sh の rootexec) には
 // シェルも cp もないので、自分で
-static const char *files[] = {"r", "w", "rw", "a", "deny", "x", "own", "k"};
+static const char *files[] = {"r", "w", "rw", "a", "deny", "x", "own", "k", "cap", "cap2"};
 static const char *bins[] = {"t", "ix", "px", "cx", "ux", "nox", "pnomap"};
 // テストでできるかもしれないもの
-static const char *made[] = {"ln", "ln2", "new", "out", "d/f", "d/g"};
+static const char *made[] = {"ln", "ln2", "new", "out", "d/f", "d/g", "dev0"};
 
 static int copy(const char *from, const char *to) {
   int in = open(from, O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -210,6 +275,7 @@ static void cleanup(void) {
   puts_(AA ".remove", "aachild");
   puts_(AA ".remove", "aacomplain");
   puts_(AA ".remove", "aanomap");
+  puts_(AA ".remove", "aacap");
   const char **lists[] = {files, bins, made};
   size_t ns[] = {sizeof files / sizeof *files, sizeof bins / sizeof *bins, sizeof made / sizeof *made};
   for (int l = 0; l < 3; l++)
@@ -226,6 +292,8 @@ static void cleanup(void) {
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "child"))
     return child();
+  if (argc > 1 && (!strcmp(argv[1], "cap") || !strcmp(argv[1], "capc")))
+    return capchild(argv[1][3] == 'c');
   if (argc > 1 && !strcmp(argv[1], "attr")) {
     char b[128];
     line("/proc/self/attr/current", b, sizeof b);
@@ -268,35 +336,35 @@ int main(int argc, char **argv) {
 
   // aatest の中で
   char out[8192] = "";
-  int p[2];
-  pipe(p);
-  fflush(stdout);
-  pid_t c = fork();
-  if (c == 0) {
-    dup2(p[1], 1);
-    close(p[0]);
-    execl(D "/t", D "/t", "child", (char *)NULL);
-    _exit(127);
-  }
-  close(p[1]);
-  size_t got = 0;
-  while ((k = read(p[0], out + got, sizeof out - 1 - got)) > 0)
-    got += k;
-  out[got] = 0;
-  close(p[0]);
-  int st;
-  waitpid(c, &st, 0);
+  collect(D "/t", "child", out, sizeof out);
+  int bad = fails;
   for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
     char l[128];
     snprintf(l, sizeof l, "%s\n", want[i]);
     CHECK(strstr(out, l), "want \"%s\"", want[i]);
   }
-  if (fails)
+  if (fails != bad)
     printf("child said:\n%s", out);
+
+  // capability: aacap と aacomplain の中で (cap2 は uid 1 の 0600)
+  CHECK(chown(D "/cap2", 1, 1) == 0 && chmod(D "/cap2", 0600) == 0, "cap2");
+  char cout[2048];
+  collect(self, "cap", out, sizeof out);
+  collect(self, "capc", cout, sizeof cout);
+  strncat(out, cout, sizeof out - strlen(out) - 1);
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_cap / sizeof *want_cap; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_cap[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_cap[i]);
+  }
+  if (fails != bad)
+    printf("cap said:\n%s", out);
 
   // 決まりのないプロセスから: onexec (次の exec で aachild)
   char b[128];
-  c = fork();
+  int st;
+  pid_t c = fork();
   if (c == 0) {
     if (puts_("/proc/self/attr/exec", "exec aachild"))
       _exit(2);

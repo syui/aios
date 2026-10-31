@@ -55,7 +55,7 @@ fn copy_out(va: usize, buf: &[u8]) -> Result<(), i64> {
 }
 
 fn root() -> Result<(), i64> {
-    if proc::current().cred.euid != 0 {
+    if !proc::current().cred.capable(crate::cred::CAP_NET_ADMIN) {
         return Err(-EPERM);
     }
     Ok(())

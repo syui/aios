@@ -1170,10 +1170,10 @@ pub fn remove(name: &[u8]) -> Result<usize, i64> {
     Ok(name.len())
 }
 
-/// 決まりを変えてよいか (aa_may_manage_policy: CAP_MAC_ADMIN。aios では namespace の外の root)
+/// 決まりを変えてよいか (aa_may_manage_policy: namespace の外で CAP_MAC_ADMIN)
 fn may_manage() -> Result<(), i64> {
     let c = crate::cred::current();
-    if c.euid != 0 || c.ns.user.is_some() {
+    if c.ns.user.is_some() || !c.capable(crate::cred::CAP_MAC_ADMIN) {
         audit_status("profile_manage", None, Some("not policy admin"), -EACCES);
         return Err(-EACCES);
     }
@@ -1546,6 +1546,82 @@ fn audit_file(p: &Profile, perms: &Perms, op: &str, request: u32, name: &str, ta
     }
 }
 
+// ---- capability (capability.c) ----
+
+/// 同じプロセスの同じ capability の記録は 1 秒に 1 度 (audit_caps の audit_cache): (pid, capability ごとの次に記録できる時刻)
+static CAP_CACHE: Bkl<(u32, [u64; 41])> = Bkl::new((0, [0; 41]));
+
+/// c (root) が cap を使ってよいか (aa_capable の古い形: プロファイルの caps.allow)。だめなら DENIED を記録して false
+/// (complain なら許して ALLOWED)。audit が false なら記録しない (noaudit。complain だけ "optional: no audit" で記録)
+pub fn capable(c: &crate::cred::Cred, cap: u32, audit: bool) -> bool {
+    if off() || c.apparmor.is_none() {
+        return true;
+    }
+    let Some(p) = c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined) else { return true };
+    let bit = 1u64 << cap.min(63);
+    let error = if p.caps.allow & bit != 0 { 0 } else { -EPERM };
+    let mut info = None;
+    if !audit {
+        if p.mode != Mode::Complain {
+            return error == 0;
+        }
+        info = Some("optional: no audit");
+    }
+    let kind = if error == 0 {
+        if !p.audit_all && p.caps.audit & bit == 0 {
+            return true;
+        }
+        "AUDIT"
+    } else if p.mode == Mode::Kill {
+        "KILLED"
+    } else if p.caps.quiet & bit != 0 && !p.audit_all {
+        // quiet: 記録しない (complain でも止める: Linux と同じ)
+        return false;
+    } else if p.mode == Mode::Complain {
+        "ALLOWED"
+    } else {
+        "DENIED"
+    };
+    let allowed = error == 0 || kind == "ALLOWED";
+    // 同じものを 1 秒のうちにもう一度なら記録しない
+    let pid = crate::proc::try_current().map_or(0, |p| p.pid);
+    let now = crate::timer::uptime_ns();
+    let cache = CAP_CACHE.get();
+    let i = (cap as usize).min(40);
+    if cache.0 == pid && now <= cache.1[i] {
+        return allowed;
+    }
+    if cache.0 != pid {
+        *cache = (pid, [0; 41]);
+    }
+    cache.1[i] = now + 1_000_000_000;
+    let mut s = format!("{} operation=\"capable\" class=\"cap\"", audit_head(kind));
+    if let Some(i) = info {
+        s.push_str(&format!(" info=\"{}\"", i));
+        if error != 0 {
+            s.push_str(&format!(" error={}", error));
+        }
+    }
+    s.push_str(&format!(" profile={}", untrusted(&p.name)));
+    s.push_str(&audit_tail());
+    let name = crate::cred::CAP_NAMES.get(cap as usize).copied().unwrap_or("?");
+    s.push_str(&format!(" capability={}  capname={}", cap, untrusted(name)));
+    crate::println!("{}", s);
+    if kind == "KILLED" {
+        let me = crate::proc::current();
+        crate::signal::send_thread(me, p.signal as i32, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
+    }
+    allowed
+}
+
+/// capget に見せる capability (apparmor_capget: プロファイルのある root は、その caps.allow だけ)
+pub fn caps_of(c: &crate::cred::Cred) -> u64 {
+    match c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
+        Some(p) if p.mode != Mode::Complain => p.caps.allow,
+        _ => u64::MAX,
+    }
+}
+
 // ---- exec で次のプロファイル (domain.c) ----
 
 /// exec の答え: 次のラベル (None は unconfined) と、AT_SECURE にするか (環境を消す Px など)。fatal は、新しい
@@ -1882,8 +1958,8 @@ pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
 // ---- features (apparmor_parser が読んで、それに合う形のバイナリを作る) ----
 
 /// 名のること (パス, 中身)。ディレクトリはパスの頭から。中身には改行を足して見せる
-/// (capability の決まりは、root のたしかめを capable() にまとめてから名のる)
 pub const FEATURES: &[(&str, &str)] = &[
+    ("caps/mask", "chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap linux_immutable net_bind_service net_broadcast net_admin net_raw ipc_lock ipc_owner sys_module sys_rawio sys_chroot sys_ptrace sys_pacct sys_admin sys_boot sys_nice sys_resource sys_time sys_tty_config mknod lease audit_write audit_control setfcap mac_override mac_admin syslog wake_alarm block_suspend audit_read perfmon bpf checkpoint_restore"),
     ("domain/change_onexec", "yes"),
     ("domain/change_profile", "yes"),
     ("domain/version", "1.2"),

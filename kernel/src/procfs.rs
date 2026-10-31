@@ -394,7 +394,7 @@ impl ProcInode {
             Node::Environ(pid) => {
                 let p = leader(pid)?;
                 let me = crate::cred::current();
-                if me.euid != 0 && me.euid != p.cred.uid {
+                if me.euid != p.cred.uid && !me.capable(crate::cred::CAP_SYS_PTRACE) {
                     return Err(-EACCES);
                 }
                 let (_, e, end) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);

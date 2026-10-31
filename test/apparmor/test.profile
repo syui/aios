@@ -42,3 +42,10 @@ profile aanomap {
 profile aacomplain flags=(complain) {
   /tmp/aatest/r r,
 }
+
+# capability は chown だけ (root でもほかの読む・書く・setuid・mknod・chmod はだめ)
+profile aacap {
+  capability chown,
+  /tmp/aatest/** rw,
+  /proc/*/attr/current r,
+}

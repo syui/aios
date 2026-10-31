@@ -269,7 +269,7 @@ pub fn check(s: &State, nr: u64, args: &[u64; 6], pc: u64) -> Verdict {
 // ---- かける ----
 
 fn may_set(c: &Cred) -> Result<(), i64> {
-    if !c.no_new_privs && c.euid != 0 {
+    if !c.no_new_privs && !c.capable_noaudit(crate::cred::CAP_SYS_ADMIN) {
         return Err(-EACCES);
     }
     Ok(())

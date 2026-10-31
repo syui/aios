@@ -1428,11 +1428,14 @@ fn sys_capget(hdr: usize, data: usize) -> R {
     }
     // v1 は 1 組、v2 と v3 は 2 組の {effective, permitted, inheritable}
     let n = if ver == 0x1998_0330 { 1 } else { 2 };
-    let all = if crate::cred::current().euid == 0 { u32::MAX } else { 0 };
+    // root はみな (CAP_LAST_CAP の 40 まで: 上の組は 0x1ff)。AppArmor のプロファイルがあれば、その caps.allow だけ (apparmor_capget)
+    let c = crate::cred::current();
+    let all: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::apparmor::caps_of(c) } else { 0 };
     let mut out = alloc::vec::Vec::new();
-    for _ in 0..n {
-        out.extend_from_slice(&all.to_le_bytes());
-        out.extend_from_slice(&all.to_le_bytes());
+    for i in 0..n {
+        let w = (all >> (32 * i)) as u32;
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&w.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
     }
     pt.copy_out(data, &out).ok_or(-EFAULT)?;
@@ -1802,7 +1805,7 @@ fn sys_delete_module(name: usize) -> R {
 }
 
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
-    if proc::current().cred.euid != 0 {
+    if !proc::current().cred.capable(cred::CAP_SYS_BOOT) {
         return Err(-(cred::EPERM));
     }
     const MAGIC1: u32 = 0xfee1_dead;

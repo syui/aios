@@ -47,7 +47,7 @@ fn name_of(image: &[u8]) -> Result<&str, i64> {
 
 /// 札の中身でモジュールを起こす (root だけ)
 pub fn load(image: &[u8]) -> Result<i64, i64> {
-    if crate::proc::current().cred.euid != 0 {
+    if !crate::proc::current().cred.capable(crate::cred::CAP_SYS_MODULE) {
         return Err(-EPERM);
     }
     let name = name_of(image)?;
@@ -66,7 +66,7 @@ pub fn load(image: &[u8]) -> Result<i64, i64> {
 
 /// rmmod: 止めることはまだできない
 pub fn unload(name: &str) -> Result<i64, i64> {
-    if crate::proc::current().cred.euid != 0 {
+    if !crate::proc::current().cred.capable(crate::cred::CAP_SYS_MODULE) {
         return Err(-EPERM);
     }
     match modules().iter().find(|m| m.name == name) {

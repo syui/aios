@@ -241,7 +241,7 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
         return Err(crate::why::inval());
     }
     let p = crate::proc::current();
-    if !p.cred.no_new_privs && p.cred.euid != 0 {
+    if !p.cred.no_new_privs && !p.cred.capable_noaudit(crate::cred::CAP_SYS_ADMIN) {
         return Err(-EPERM);
     }
     let r = ruleset_of(fd)?;

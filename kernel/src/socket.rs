@@ -493,7 +493,7 @@ fn inet_check(t: u64, protocol: u64) -> Result<(), i64> {
         SOCK_DGRAM if p == 0 || p == 17 => Ok(()),
         SOCK_DGRAM if p == 1 => Err(-EACCES),
         SOCK_RAW if p != 0 => {
-            if crate::cred::current().euid == 0 { Ok(()) } else { Err(-EPERM) }
+            if crate::cred::current().capable(crate::cred::CAP_NET_RAW) { Ok(()) } else { Err(-EPERM) }
         }
         SOCK_STREAM | SOCK_DGRAM | SOCK_RAW => Err(-EPROTONOSUPPORT),
         _ => Err(-ESOCKTNOSUPPORT),
@@ -571,7 +571,7 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     let isolated = crate::ns::net().is_some();
     let protocol = protocol as u32 as u64;
     // ping はだれでも (Linux の ping_group_range を広げたもの)。raw は root だけ、ICMP だけ
-    if (t == SOCK_DGRAM && protocol == IPPROTO_ICMP) || (t == SOCK_RAW && protocol == IPPROTO_ICMP && crate::cred::current().euid == 0) {
+    if (t == SOCK_DGRAM && protocol == IPPROTO_ICMP) || (t == SOCK_RAW && protocol == IPPROTO_ICMP && crate::cred::current().capable(crate::cred::CAP_NET_RAW)) {
         n()?;
         let proto = if t == SOCK_RAW { Proto::Raw } else { Proto::Icmp };
         let mut s = Socket { proto, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated };

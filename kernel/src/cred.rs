@@ -15,6 +15,32 @@ pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
 pub const S_ISVTX: u32 = 0o1000;
 
+// capability の番号 (Linux の include/uapi/linux/capability.h。aios では root がみな持つ: capable)
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+pub const CAP_FOWNER: u32 = 3;
+pub const CAP_FSETID: u32 = 4;
+pub const CAP_KILL: u32 = 5;
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_SETUID: u32 = 7;
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
+pub const CAP_NET_ADMIN: u32 = 12;
+pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_MODULE: u32 = 16;
+pub const CAP_SYS_CHROOT: u32 = 18;
+pub const CAP_SYS_PTRACE: u32 = 19;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_BOOT: u32 = 22;
+pub const CAP_MKNOD: u32 = 27;
+pub const CAP_MAC_ADMIN: u32 = 33;
+/// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)
+pub const CAP_NAMES: [&str; 41] = [
+    "chown", "dac_override", "dac_read_search", "fowner", "fsetid", "kill", "setgid", "setuid", "setpcap", "linux_immutable", "net_bind_service", "net_broadcast", "net_admin", "net_raw",
+    "ipc_lock", "ipc_owner", "sys_module", "sys_rawio", "sys_chroot", "sys_ptrace", "sys_pacct", "sys_admin", "sys_boot", "sys_nice", "sys_resource", "sys_time", "sys_tty_config",
+    "mknod", "lease", "audit_write", "audit_control", "setfcap", "mac_override", "mac_admin", "syslog", "wake_alarm", "block_suspend", "audit_read", "perfmon", "bpf", "checkpoint_restore",
+];
+
 #[derive(Clone)]
 pub struct Cred {
     pub uid: u32,
@@ -44,13 +70,22 @@ impl Cred {
         self.egid == gid || self.groups.contains(&gid)
     }
 
-    /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)
+    /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても AppArmor のプロファイルが
+    /// 許さなければ持たない (記録する: apparmor::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
+    pub fn capable(&self, cap: u32) -> bool {
+        self.euid == 0 && crate::apparmor::capable(self, cap, true)
+    }
+
+    /// capable と同じだが記録しない (ns_capable_noaudit: できなければほかのやりかたに回るもの)
+    pub fn capable_noaudit(&self, cap: u32) -> bool {
+        self.euid == 0 && crate::apparmor::capable(self, cap, false)
+    }
+
+    /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)。Linux の
+    /// generic_permission と同じ順: まず mode のビットで、足りなければ root は CAP_DAC_READ_SEARCH (読む、ディレクトリを
+    /// たどる) か CAP_DAC_OVERRIDE (実行はどこかに x がなければできない。ディレクトリは別)
     pub fn may(&self, m: &Meta, want: u32, real: bool) -> bool {
         let (uid, gid) = if real { (self.uid, self.gid) } else { (self.euid, self.egid) };
-        if uid == 0 {
-            // root でも、実行はどこかに x がなければできない (ディレクトリは別)
-            return want & X == 0 || m.mode & S_IFMT == S_IFDIR || m.mode & 0o111 != 0;
-        }
         let bits = if m.uid == uid {
             (m.mode >> 6) & 7
         } else if gid == m.gid || self.groups.contains(&m.gid) {
@@ -58,7 +93,20 @@ impl Cred {
         } else {
             m.mode & 7
         };
-        bits & want == want
+        if bits & want == want {
+            return true;
+        }
+        if uid != 0 {
+            return false;
+        }
+        let cap = |c: u32| crate::apparmor::capable(self, c, true);
+        if m.mode & S_IFMT == S_IFDIR {
+            return (want & W == 0 && cap(CAP_DAC_READ_SEARCH)) || cap(CAP_DAC_OVERRIDE);
+        }
+        if want == R && cap(CAP_DAC_READ_SEARCH) {
+            return true;
+        }
+        (want & X == 0 || m.mode & 0o111 != 0) && cap(CAP_DAC_OVERRIDE)
     }
 
     pub fn check(&self, m: &Meta, want: u32) -> Result<(), i64> {
@@ -84,10 +132,15 @@ impl Cred {
         }
     }
 
-    /// 持ち主か root か
+    /// 持ち主か CAP_FOWNER か (inode_owner_or_capable)
     pub fn owns(&self, m: &Meta) -> bool {
-        self.euid == 0 || self.euid == m.uid
+        self.euid == m.uid || self.capable(CAP_FOWNER)
     }
+}
+
+/// SO_PRIORITY を 7 より上に、SO_MARK をつける: CAP_NET_RAW か CAP_NET_ADMIN (Linux の sk_set_prio_allowed)
+pub fn net_prio_ok(c: &Cred) -> bool {
+    c.capable(CAP_NET_RAW) || c.capable(CAP_NET_ADMIN)
 }
 
 /// いまのプロセスの資格情報 (起動中でまだプロセスがなければ root)
@@ -116,7 +169,7 @@ fn arg(v: u64) -> Option<u32> {
 pub fn setuid(uid: u64) -> Res {
     let u = crate::ns::take_uid(uid as u32)?;
     set(|c| {
-        if c.euid == 0 {
+        if c.capable(CAP_SETUID) {
             (c.uid, c.euid, c.suid) = (u, u, u);
         } else if u == c.uid || u == c.suid {
             c.euid = u;
@@ -130,7 +183,7 @@ pub fn setuid(uid: u64) -> Res {
 pub fn setgid(gid: u64) -> Res {
     let g = crate::ns::take_gid(gid as u32)?;
     set(|c| {
-        if c.euid == 0 {
+        if c.capable(CAP_SETGID) {
             (c.gid, c.egid, c.sgid) = (g, g, g);
         } else if g == c.gid || g == c.sgid {
             c.egid = g;
@@ -161,9 +214,10 @@ pub fn setresgid(r: u64, e: u64, s: u64) -> Res {
 /// 外の番号で
 fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
     set(|c| {
-        let ok = |v: u32| c.euid == 0 || v == c.uid || v == c.euid || v == c.suid;
+        // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresuid)
+        let ok = |v: u32| v == c.uid || v == c.euid || v == c.suid;
         let (r, e, s) = (arg(r), arg(e), arg(s));
-        if ![r, e, s].iter().flatten().all(|&v| ok(v)) {
+        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETUID) {
             return Err(-EPERM);
         }
         if let Some(v) = r {
@@ -181,9 +235,10 @@ fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
 
 fn setresgid_out(r: u64, e: u64, s: u64) -> Res {
     set(|c| {
-        let ok = |v: u32| c.euid == 0 || v == c.gid || v == c.egid || v == c.sgid;
+        // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresgid)
+        let ok = |v: u32| v == c.gid || v == c.egid || v == c.sgid;
         let (r, e, s) = (arg(r), arg(e), arg(s));
-        if ![r, e, s].iter().flatten().all(|&v| ok(v)) {
+        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETGID) {
             return Err(-EPERM);
         }
         if let Some(v) = r {
@@ -259,7 +314,7 @@ pub fn getgroups(size: usize, list: usize) -> Res {
 }
 
 pub fn setgroups(size: usize, list: usize) -> Res {
-    if proc::current().cred.euid != 0 || proc::current().cred.ns.user.is_some() {
+    if !proc::current().cred.capable(CAP_SETGID) || proc::current().cred.ns.user.is_some() {
         return Err(-EPERM);
     }
     if size > 65536 {
