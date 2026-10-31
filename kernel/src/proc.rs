@@ -1780,6 +1780,9 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     }
     p.altstack = AltStack::NONE;
     p.timers.clear();
+    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり)
+    p.cred.apparmor = img.apparmor.label.clone();
+    p.cred.aa_onexec = None;
     let old = p.mm.take();
     p.load_image(img);
     p.pt().activate();

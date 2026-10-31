@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="bigunmap chosen clone3 cpuid createrace dev dirents epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist mmapcoh mnt mremap ns opencache openat2 openfast openrace orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="apparmor bigunmap chosen clone3 cpuid createrace dev dirents epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist mmapcoh mnt mremap ns opencache openat2 openfast openrace orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
 
 case $1 in
 build)

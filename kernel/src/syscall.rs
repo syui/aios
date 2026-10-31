@@ -865,7 +865,8 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     let nr = tf.x[8];
     let p = proc::current();
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
-    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() {
+    // AppArmor のプロファイルのついたものも (決まりを見るのはふつうの道だけ)
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.apparmor.is_some() {
         return false;
     }
     let r = match nr {
@@ -1212,6 +1213,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             // ふつうのファイルだけ (ディレクトリやパイプは ENODEV: Linux に mmap がない)。fend は MAX: ファイルの終わりは
             // 触れたときの大きさで見る (その先のページは SIGBUS。vm.rs)
             crate::file::Kind::Inode(ino, p) if ino.meta().mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG => {
+                // AppArmor: 実行して写すなら m (common_mmap)
+                crate::apparmor::mmap_perm(crate::apparmor::OP_FMMAP, p, prot, flags & MAP_SHARED == 0, ino.meta().uid)?;
                 path = Some(p.clone());
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }

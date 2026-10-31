@@ -32,10 +32,13 @@ pub struct Cred {
     pub seccomp: Option<crate::seccomp::Seccomp>,
     /// namespace (ns.rs)
     pub ns: crate::ns::Ns,
+    /// AppArmor のプロファイル (なければ unconfined) と、次の exec でつけるもの (/proc/self/attr/exec。apparmor.rs)
+    pub apparmor: Option<crate::apparmor::Label>,
+    pub aa_onexec: Option<crate::apparmor::Label>,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)

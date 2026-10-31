@@ -12,6 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
@@ -399,7 +400,6 @@ pub const MAY_APPEND: u32 = 0x8;
 pub const MAY_CREATE: u32 = 0x10;
 pub const MAY_DELETE: u32 = 0x20;
 pub const MAY_OPEN: u32 = 0x40;
-pub const MAY_RENAME: u32 = 0x80;
 pub const MAY_SETATTR: u32 = 0x100;
 pub const MAY_GETATTR: u32 = 0x200;
 pub const MAY_CHMOD: u32 = 0x1000;
@@ -801,8 +801,6 @@ pub enum Mode {
 
 const MODE_NAMES: [&str; 5] = ["enforce", "complain", "kill", "unconfined", "user"];
 
-pub const FLAG_HAT: u32 = 1;
-
 pub struct Caps {
     pub allow: u64,
     pub audit: u64,
@@ -810,6 +808,8 @@ pub struct Caps {
     pub extended: u64,
 }
 
+/// 読んだものをみな持つ (attach、disconnected、rlimits、data などは、それを効かせるところができるまで読むだけ)
+#[allow(dead_code)]
 pub struct Profile {
     /// 階層の名前 (子は "親//子")
     pub name: String,
@@ -840,7 +840,7 @@ impl Profile {
     /// 文字列 s を、この決まりの種類 (s の 1 文字め) で問う (.access の profile_query_cb)。ファイルの持ち主は uid 0 と
     /// して (Linux も cond は 0): 問う人が root なら持ち主の許し (owner の決まり) を見る
     fn query(&self, s: &[u8], perms: &mut Perms) {
-        let owner = crate::proc::current().cred.euid == 0;
+        let owner = crate::cred::current().euid == 0;
         if self.mode == Mode::Unconfined || s.is_empty() {
             return;
         }
@@ -1121,11 +1121,6 @@ pub fn find(name: &str) -> Option<Rc<Profile>> {
     NS.get().profiles.iter().find(|p| p.name == name).cloned()
 }
 
-/// 何か読みこんであるか (なければ、決まりを見るところはみなとばせる)
-pub fn any() -> bool {
-    !NS.get().profiles.is_empty()
-}
-
 /// .load (replace なし) と .replace: data のプロファイルをみな (ひとつでもしくじれば、どれも入れない)。書いた長さ
 pub fn load(data: &[u8], replace: bool) -> Result<usize, i64> {
     may_manage()?;
@@ -1177,7 +1172,7 @@ pub fn remove(name: &[u8]) -> Result<usize, i64> {
 
 /// 決まりを変えてよいか (aa_may_manage_policy: CAP_MAC_ADMIN。aios では namespace の外の root)
 fn may_manage() -> Result<(), i64> {
-    let c = &crate::proc::current().cred;
+    let c = crate::cred::current();
     if c.euid != 0 || c.ns.user.is_some() {
         audit_status("profile_manage", None, Some("not policy admin"), -EACCES);
         return Err(-EACCES);
@@ -1187,7 +1182,7 @@ fn may_manage() -> Result<(), i64> {
 
 /// /sys/kernel/security/apparmor/profiles: 1 行に「名前 (モード)」。新しく読んだものから、子は親のあと
 pub fn profiles_text() -> Result<String, i64> {
-    if crate::proc::current().cred.euid != 0 {
+    if crate::cred::current().euid != 0 {
         return Err(-EACCES);
     }
     let ns = NS.get();
@@ -1248,7 +1243,7 @@ fn audit_head(kind: &str) -> String {
 
 /// 終わりの pid と comm
 fn audit_tail() -> String {
-    let p = crate::proc::current();
+    let Some(p) = crate::proc::try_current() else { return " pid=0 comm=\"swapper\"".into() };
     let n = p.comm.iter().position(|&c| c == 0).unwrap_or(p.comm.len());
     format!(" pid={} comm={}", p.pid, untrusted(&String::from_utf8_lossy(&p.comm[..n])))
 }
@@ -1270,13 +1265,607 @@ fn audit_status(op: &str, name: Option<&str>, info: Option<&str>, error: i64) {
     crate::println!("{}", s);
 }
 
+// ---- プロセスについたプロファイル (cred の apparmor。fork で受けつぐ) ----
+
+/// プロセスのラベル: プロファイルの名前。使うたびに名前で引く (入れかえれば新しいものに、外されれば unconfined に:
+/// Linux の proxy と同じ)
+#[derive(Clone, PartialEq)]
+pub struct Label(Rc<str>);
+
+impl Label {
+    fn of(p: &Profile) -> Label {
+        Label(Rc::from(p.name.as_str()))
+    }
+
+    pub fn profile(&self) -> Option<Rc<Profile>> {
+        find(&self.0)
+    }
+}
+
+fn off() -> bool {
+    crate::parts::off(crate::parts::Part::Apparmor)
+}
+
+/// いまのプロセスの決まり (unconfined なら None。外されたプロファイルや、aios.off=apparmor も None)
+pub fn current_profile() -> Option<Rc<Profile>> {
+    if off() {
+        return None;
+    }
+    let l = crate::cred::current().apparmor.as_ref()?;
+    l.profile().filter(|p| p.mode != Mode::Unconfined)
+}
+
+/// 決まりのついたプロセスか (重いこと (inode を引くなど) をする前に。大きなロックの中で)
+#[inline]
+pub fn confined() -> bool {
+    crate::cred::current().apparmor.is_some() && current_profile().is_some()
+}
+
+/// ラベルの見せ方 (/proc/PID/attr/current、aa_getprocattr): "name (mode)\n"、unconfined は "unconfined\n"
+pub fn label_text(l: Option<&Label>) -> String {
+    match l.and_then(|l| l.profile()).filter(|_| !off()) {
+        Some(p) if p.mode != Mode::Unconfined => format!("{} ({})\n", p.name, p.mode_name()),
+        Some(p) => format!("{}\n", p.name),
+        None => "unconfined\n".into(),
+    }
+}
+
+impl Profile {
+    /// name (/ で始まるパス) のファイルの許しと、たどりついた状態 (aa_str_perms)。owner: 持ち主のファイルか
+    fn file_perms(&self, start: u32, name: &[u8], owner: bool) -> (u32, Perms) {
+        let Some(d) = &self.file.dfa else { return (DFA_NOMATCH, Perms::default()) };
+        let st = d.match_len(start, name);
+        (st, self.file.lookup(st, owner))
+    }
+
+    fn file_start(&self) -> u32 {
+        self.file.start[CLASS_FILE]
+    }
+
+    /// 子のプロファイル ("この名前//name")
+    fn child(&self, name: &str) -> Option<Rc<Profile>> {
+        find(&format!("{}//{}", self.name, name))
+    }
+}
+
+/// プロセスの fsuid (aios では euid)
+fn fsuid() -> u32 {
+    crate::cred::current().euid
+}
+
+/// パスの名前: 頭に /、ディレクトリなら終わりにも / (aa_path_name の PATH_IS_DIR)
+fn path_name(full: &str, dir: bool) -> String {
+    let full = full.trim_matches('/');
+    if full.is_empty() {
+        "/".into()
+    } else if dir {
+        format!("/{}/", full)
+    } else {
+        format!("/{}", full)
+    }
+}
+
+// 操作の名前 (audit.h の OP_*)
+pub const OP_OPEN: &str = "open";
+pub const OP_MKDIR: &str = "mkdir";
+pub const OP_MKNOD: &str = "mknod";
+pub const OP_UNLINK: &str = "unlink";
+pub const OP_RMDIR: &str = "rmdir";
+pub const OP_SYMLINK: &str = "symlink";
+pub const OP_TRUNC: &str = "truncate";
+pub const OP_CHMOD: &str = "chmod";
+pub const OP_CHOWN: &str = "chown";
+pub const OP_GETATTR: &str = "getattr";
+pub const OP_FLOCK: &str = "file_lock";
+pub const OP_FMMAP: &str = "file_mmap";
+const OP_EXEC: &str = "exec";
+const OP_LINK: &str = "link";
+const OP_CHANGE_PROFILE: &str = "change_profile";
+const OP_CHANGE_ONEXEC: &str = "change_onexec";
+
+/// ファイルの決まり (common_perm と aa_path_perm): full は頭の / のないパス、dir はディレクトリか、ouid は持ち主
+pub fn path_perm(op: &str, full: &str, request: u32, dir: bool, ouid: u32) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let name = path_name(full, dir);
+    let (_, perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
+    let e = if request & !perms.allow != 0 { -EACCES } else { 0 };
+    audit_file(&p, &perms, op, request, &name, None, ouid, None, e)
+}
+
+/// rename (apparmor_path_rename): 前の名前は読んで消せること、新しい名前は作って書けること
+pub fn rename_perm(ofull: &str, nfull: &str, dir: bool, ouid: u32) -> Result<(), i64> {
+    path_perm("rename_src", ofull, MAY_READ | MAY_GETATTR | MAY_WRITE | MAY_SETATTR | MAY_DELETE, dir, ouid)?;
+    path_perm("rename_dest", nfull, MAY_WRITE | MAY_SETATTR | MAY_CREATE, dir, ouid)
+}
+
+/// open (apparmor_file_open と aa_map_file_to_perms): 開くときの flags から要る許し
+pub fn open_perm(full: &str, flags: u32, dir: bool, ouid: u32) -> Result<(), i64> {
+    const O_ACCMODE: u32 = 3;
+    const O_CREAT: u32 = 0o100;
+    const O_TRUNC: u32 = 0o1000;
+    const O_APPEND: u32 = 0o2000;
+    let mut r = match flags & O_ACCMODE {
+        0 => MAY_READ,
+        1 => MAY_WRITE,
+        _ => MAY_READ | MAY_WRITE,
+    };
+    if flags & O_APPEND != 0 && r & MAY_WRITE != 0 {
+        r = (r & !MAY_WRITE) | MAY_APPEND;
+    }
+    if flags & O_TRUNC != 0 {
+        r |= MAY_WRITE;
+    }
+    if flags & O_CREAT != 0 {
+        r |= MAY_CREATE;
+    }
+    path_perm(OP_OPEN, full, r, dir, ouid)
+}
+
+/// mmap と mprotect の PROT_* から要る許し (common_mmap: MAP_PRIVATE の書きこみはファイルに戻らないので要らない)
+pub fn mmap_perm(op: &str, full: &str, prot: u64, private: bool, ouid: u32) -> Result<(), i64> {
+    let mut r = 0;
+    if prot & 1 != 0 {
+        r |= MAY_READ;
+    }
+    if prot & 2 != 0 && !private {
+        r |= MAY_WRITE;
+    }
+    if prot & 4 != 0 {
+        r |= EXEC_MMAP;
+    }
+    // 開いたときに許されたもの (読む・書く) のほかを頼むときだけ見なおす (aa_file_perm): 実行して写すとき
+    if r & EXEC_MMAP == 0 {
+        return Ok(());
+    }
+    path_perm(op, full, r, false, ouid)
+}
+
+/// link (profile_path_link): 新しい名前に l、ペアの古い名前にも l。subset なら、新しい名前の許しは古い名前の許しの中
+pub fn link_perm(lfull: &str, tfull: &str, ouid: u32) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let (lname, tname) = (path_name(lfull, false), path_name(tfull, false));
+    let owner = fsuid() == ouid;
+    let mut request = MAY_LINK;
+    let mut info = None;
+    let (st, mut lperms) = p.file_perms(p.file_start(), lname.as_bytes(), owner);
+    let mut error = -EACCES;
+    'audit: {
+        if lperms.allow & MAY_LINK == 0 {
+            break 'audit;
+        }
+        // 古い名前とペアにできるか (link\0target)
+        let st = p.file.dfa.as_ref().map_or(DFA_NOMATCH, |d| d.step(st, 0));
+        let (_, perms) = p.file_perms(st, tname.as_bytes(), owner);
+        lperms.audit = perms.audit;
+        lperms.quiet = perms.quiet;
+        lperms.kill = perms.kill;
+        if perms.allow & MAY_LINK == 0 {
+            info = Some("target restricted");
+            lperms = perms;
+            break 'audit;
+        }
+        if perms.allow & LINK_SUBSET != 0 {
+            let (_, perms) = p.file_perms(p.file_start(), tname.as_bytes(), owner);
+            request = lperms.allow & !MAY_LINK;
+            lperms.allow &= perms.allow | MAY_LINK;
+            request |= AUDIT_FILE_MASK & (lperms.allow & !perms.allow);
+            if request & !lperms.allow != 0 {
+                break 'audit;
+            }
+            let subset = |l: u32, t: u32| (l & !X_UNSAFE) == (t & !X_UNSAFE) && (l & X_UNSAFE == 0 || t & X_UNSAFE != 0);
+            if lperms.allow & MAY_EXEC != 0 && !subset(lperms.xindex, perms.xindex) {
+                lperms.allow &= !MAY_EXEC;
+                request |= MAY_EXEC;
+                info = Some("link not subset of target");
+                break 'audit;
+            }
+        }
+        error = 0;
+    }
+    audit_file(&p, &lperms, OP_LINK, request, &lname, Some(&tname), ouid, info, error)
+}
+
+/// 記録にのせるファイルの許し (AA_AUDIT_FILE_MASK)
+const AUDIT_FILE_MASK: u32 = MAY_READ | MAY_WRITE | MAY_EXEC | MAY_APPEND | MAY_CREATE | MAY_DELETE | MAY_GETATTR | MAY_SETATTR | MAY_CHMOD | MAY_CHOWN | MAY_LOCK | EXEC_MMAP | MAY_LINK;
+
+/// 許しの文字 (aa_file_perm_chrs と map_mask_to_chr_mask): x w r a c d ... k m . l
+fn mask_chrs(mask: u32) -> String {
+    const CHRS: &[u8] = b"xwracd         km l     ";
+    let mut m = mask & (MAY_READ | MAY_WRITE | MAY_CREATE | MAY_DELETE | MAY_LINK | MAY_LOCK | MAY_EXEC | EXEC_MMAP | MAY_APPEND);
+    if mask & MAY_GETATTR != 0 {
+        m |= MAY_READ;
+    }
+    if mask & (MAY_SETATTR | MAY_CHMOD | MAY_CHOWN) != 0 {
+        m |= MAY_WRITE;
+    }
+    CHRS.iter().enumerate().filter(|&(i, &c)| m & (1 << i) != 0 && c != b' ').map(|(_, &c)| c as char).collect()
+}
+
+/// ファイルの決まりの記録と答え (aa_audit_file と aa_audit)。complain なら許して ALLOWED、enforce なら DENIED。
+/// 明かに deny した (quiet の) ものは、complain でも止めて記録しない。kill なら profile の signal を送る
+#[allow(clippy::too_many_arguments)]
+fn audit_file(p: &Profile, perms: &Perms, op: &str, request: u32, name: &str, target: Option<&str>, ouid: u32, info: Option<&str>, error: i64) -> Result<(), i64> {
+    let mut req = request;
+    let kind = if error == 0 {
+        let mask = if p.audit_all { 0xffff } else { perms.audit };
+        req &= mask;
+        if req == 0 {
+            return Ok(());
+        }
+        "AUDIT"
+    } else {
+        req &= !perms.allow;
+        let kill = req & perms.kill != 0;
+        if req & perms.quiet != 0 && !p.audit_all {
+            req &= !perms.quiet;
+        }
+        if req == 0 {
+            return Err(error);
+        }
+        if kill || p.mode == Mode::Kill {
+            "KILLED"
+        } else if p.mode == Mode::Complain {
+            "ALLOWED"
+        } else {
+            "DENIED"
+        }
+    };
+    let denied = req & !perms.allow;
+    let mut s = format!("{} operation=\"{}\" class=\"file\"", audit_head(kind), op);
+    if let Some(i) = info {
+        s.push_str(&format!(" info=\"{}\"", i));
+        if error != 0 {
+            s.push_str(&format!(" error={}", error));
+        }
+    }
+    s.push_str(&format!(" profile={} name={}", untrusted(&p.name), untrusted(name)));
+    s.push_str(&audit_tail());
+    if req & AUDIT_FILE_MASK != 0 {
+        s.push_str(&format!(" requested_mask=\"{}\"", mask_chrs(req)));
+    }
+    if denied & AUDIT_FILE_MASK != 0 {
+        s.push_str(&format!(" denied_mask=\"{}\"", mask_chrs(denied)));
+    }
+    if req & AUDIT_FILE_MASK != 0 {
+        s.push_str(&format!(" fsuid={} ouid={}", fsuid(), ouid));
+    }
+    if let Some(t) = target {
+        s.push_str(&format!(" target={}", untrusted(t)));
+    }
+    crate::println!("{}", s);
+    match kind {
+        "KILLED" => {
+            let me = crate::proc::current();
+            crate::signal::send_thread(me, p.signal as i32, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
+            Err(error)
+        }
+        // complain: 止めない (complain_error)
+        "ALLOWED" if error == -EACCES || error == -1 => Ok(()),
+        _ if error == 0 => Ok(()),
+        _ => Err(error),
+    }
+}
+
+// ---- exec で次のプロファイル (domain.c) ----
+
+/// exec の答え: 次のラベル (None は unconfined) と、AT_SECURE にするか (環境を消す Px など)
+#[derive(Clone, Default)]
+pub struct Exec {
+    pub label: Option<Label>,
+    pub secure: bool,
+}
+
+/// is_loop: たどった状態の終わり 32 のうちに同じものがあれば、そこからは同じことのくりかえし
+struct Wb {
+    history: [u32; 32],
+    pos: usize,
+    len: usize,
+}
+
+/// aa_dfa_leftmatch: 名前をたどり、ループに入るまでの文字数 (どれだけ文字どおりに合ったか。長いほうを選ぶ)
+fn leftmatch(d: &Dfa, start: u32, name: &[u8]) -> (u32, u32) {
+    let mut wb = Wb { history: [0; 32], pos: 0, len: 0 };
+    let mut st = start;
+    let mut count: u32 = 0;
+    if st == DFA_NOMATCH {
+        return (DFA_NOMATCH, 0);
+    }
+    for (i, &c) in name.iter().enumerate() {
+        wb.history[wb.pos] = st;
+        st = d.step(st, c);
+        // is_loop
+        let mut adjust = None;
+        if wb.history[wb.pos] >= st {
+            let mut pos = wb.pos;
+            for k in 0..wb.len {
+                if wb.history[pos] == st {
+                    adjust = Some(k as u32);
+                    break;
+                }
+                pos = (pos + 31) & 31;
+            }
+        }
+        if let Some(a) = adjust {
+            st = d.match_len(st, &name[i + 1..]);
+            count = count.saturating_sub(a);
+            break;
+        }
+        wb.pos = (wb.pos + 1) & 31;
+        wb.len = (wb.len + 1).min(32);
+        count += 1;
+    }
+    if st == DFA_NOMATCH {
+        count = 0;
+    }
+    (st, count)
+}
+
+/// find_attach: name (動かすプログラムのパス) につくプロファイル。xmatch (attach) のあるものはいちばん長く文字どおりに
+/// 合ったもの (同じ長さが 2 つあればどれにもつけない)、ないものは名前がそのパスのもの。children なら parent の子から
+fn find_attach(name: &str, parent: Option<&Profile>) -> (Option<Rc<Profile>>, Option<&'static str>) {
+    let ns = NS.get();
+    let mut cand: Option<Rc<Profile>> = None;
+    let (mut cand_len, mut conflict) = (0u32, false);
+    // Linux はリストの頭に足すので、新しいものから
+    for p in ns.profiles.iter().rev() {
+        let base = match parent {
+            Some(par) => match p.name.strip_prefix(par.name.as_str()).and_then(|r| r.strip_prefix("//")) {
+                Some(b) if !b.contains("//") => b,
+                _ => continue,
+            },
+            None if p.name.contains("//") => continue,
+            None => p.name.as_str(),
+        };
+        if let Some(d) = &p.xmatch.dfa {
+            let (st, count) = leftmatch(d, p.xmatch.start[CLASS_XMATCH], name.as_bytes());
+            if p.xmatch.lookup(st, true).allow & MAY_EXEC == 0 || count < cand_len {
+                continue;
+            }
+            // xattr の条件は見られない (aios には拡張属性がない): 合わないものとする
+            if !p.xattrs.is_empty() {
+                continue;
+            }
+            // 同じ長さならどちらにもつけない (Linux と同じく、はじめのものが 0 文字でも)
+            if count == cand_len {
+                conflict = true;
+                continue;
+            }
+            cand_len = count.max(p.xmatch_len);
+            cand = Some(p.clone());
+            conflict = false;
+        } else if base == name {
+            return (Some(p.clone()), None);
+        }
+    }
+    if conflict {
+        return (None, Some("conflicting profile attachments"));
+    }
+    (cand, None)
+}
+
+/// x_to_label: exec の許しの xindex から次のプロファイル。(次, 名前, info)。None の None は unconfined
+fn x_to_label(p: &Rc<Profile>, name: &str, xindex: u32) -> (Option<Option<Label>>, Option<String>, Option<&'static str>) {
+    let mut new: Option<Option<Label>> = None;
+    let mut target = None;
+    let mut info = None;
+    match xindex & X_TYPE_MASK {
+        X_TABLE => {
+            let t = p.file.trans.get((xindex & X_INDEX_MASK) as usize).cloned().unwrap_or_default();
+            let lookup = t.strip_prefix('&').unwrap_or(&t);
+            let found = if xindex & X_CHILD != 0 { p.child(lookup) } else { find(lookup) };
+            new = found.map(|f| Some(Label::of(&f)));
+            target = Some(t);
+        }
+        X_NAME => {
+            let (f, i) = find_attach(name, (xindex & X_CHILD != 0).then_some(&**p));
+            info = i;
+            new = f.map(|f| Some(Label::of(&f)));
+            target = Some(name.into());
+        }
+        _ => {}
+    }
+    if new.is_none() {
+        if xindex & X_INHERIT != 0 {
+            info = Some(if info.is_some() { "conflicting profile attachments - ix fallback" } else { "ix fallback" });
+            new = Some(Some(Label::of(p)));
+        } else if xindex & X_UNCONFINED != 0 {
+            info = Some(if info.is_some() { "conflicting profile attachments - ux fallback" } else { "ux fallback" });
+            new = Some(None);
+        }
+    }
+    (new, target, info)
+}
+
+/// 次のラベルの名前 (記録の target)
+fn label_name(l: &Option<Label>) -> String {
+    l.as_ref().map_or("unconfined".into(), |l| String::from(&*l.0))
+}
+
+/// exec (apparmor_bprm_creds_for_exec): full (頭の / のないパス) を動かすときの次のラベル。onexec が先
+pub fn exec_transition(full: &str, ouid: u32) -> Result<Exec, i64> {
+    let c = crate::cred::current();
+    if off() {
+        return Ok(Exec { label: c.apparmor.clone(), secure: false });
+    }
+    let name = path_name(full, false);
+    let cur = c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined);
+    let mut secure = false;
+    let new = if let Some(on) = c.aa_onexec.clone() {
+        // change_onexec: 決まりがついていれば、このプログラムで onexec が許され、その組で行き先が許されること
+        if let Some(p) = &cur {
+            let (st, mut perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
+            let mut error = -EACCES;
+            let mut info = Some("change_profile onexec");
+            if perms.allow & MAY_ONEXEC == 0 {
+                info = Some("no change_onexec valid for executable");
+            } else {
+                let st = p.file.dfa.as_ref().map_or(DFA_NOMATCH, |d| d.step(st, 0));
+                match change_perms(p, st, &on.0, MAY_ONEXEC) {
+                    Ok(_) => {
+                        error = 0;
+                        if perms.xindex & X_UNSAFE == 0 {
+                            secure = true;
+                        }
+                    }
+                    Err(np) => {
+                        perms = np;
+                        perms.allow &= !MAY_ONEXEC;
+                    }
+                }
+            }
+            audit_file(p, &perms, OP_EXEC, MAY_ONEXEC, &name, Some(&on.0), ouid, info.filter(|_| error != 0), error)?;
+        }
+        Some(on)
+    } else {
+        match &cur {
+            // unconfined: パスでつくプロファイルがあればそれ
+            None => find_attach(&name, None).0.map(|p| Label::of(&p)),
+            Some(p) => {
+                let (_, mut perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
+                let mut error = 0;
+                let mut info = None;
+                let mut target = None;
+                let mut new = None;
+                if perms.allow & MAY_EXEC != 0 {
+                    let (n, t, i) = x_to_label(p, &name, perms.xindex);
+                    target = t;
+                    info = i;
+                    match n {
+                        Some(n) => {
+                            // ix fallback (同じプロファイル) は AT_SECURE にしない
+                            if !(n.as_ref() == Some(&Label::of(p)) && info.is_some()) && perms.xindex & X_UNSAFE == 0 {
+                                secure = true;
+                            }
+                            new = Some(n);
+                        }
+                        None => {
+                            info = Some("profile transition not found");
+                            perms.allow &= !MAY_EXEC;
+                            error = -EACCES;
+                        }
+                    }
+                } else {
+                    error = -EACCES;
+                }
+                // complain: Linux は学ぶための空のプロファイルに移る。ここではいまのプロファイルのまま (記録は ALLOWED)
+                // 記録の target は、次のラベルがあればその名前、なければさがした名前
+                let t = new.as_ref().map(label_name).or(target);
+                audit_file(p, &perms, OP_EXEC, MAY_EXEC, &name, t.as_deref(), ouid, info.filter(|_| error != 0), error)?;
+                new.unwrap_or_else(|| Some(Label::of(p)))
+            }
+        }
+    };
+    // no_new_privs: 決まりのついたプロセスは、同じプロファイルのほかへは移れない (Linux の subset と同じく、ほかの
+    // プロファイルは「せまくなる」とは言えない)
+    if c.no_new_privs && cur.is_some() && new.as_ref().map(|l| &*l.0) != cur.as_ref().map(|p| p.name.as_str()) {
+        if let Some(p) = &cur {
+            audit_file(p, &Perms::default(), OP_EXEC, MAY_EXEC, &name, Some(&label_name(&new)), ouid, Some("no new privs"), -EPERM)?;
+        }
+        return Err(-EPERM);
+    }
+    Ok(Exec { label: new, secure })
+}
+
+/// change_profile_perms: p のファイルの決まりで、start から target の名前をたどって request が許されるか
+fn change_perms(p: &Profile, start: u32, target: &str, request: u32) -> Result<Perms, Perms> {
+    let Some(d) = &p.file.dfa else { return Err(Perms::default()) };
+    let st = d.match_len(start, target.as_bytes());
+    if st == DFA_NOMATCH {
+        return Err(Perms::default());
+    }
+    let mut tmp = p.file.lookup(st, fsuid() == 0);
+    p.apply_modes(&mut tmp);
+    let mut perms = ALLPERMS;
+    perms.accum_raw(&tmp);
+    if perms.allow & request != request {
+        return Err(perms);
+    }
+    Ok(perms)
+}
+
+/// aa_change_profile: name のプロファイルにいま移る (onexec なら次の exec で)。/proc/self/attr/current の
+/// "changeprofile NAME" と attr/exec の "exec NAME"
+pub fn change_profile(name: &str, onexec: bool) -> Result<(), i64> {
+    let (op, request) = if onexec { (OP_CHANGE_ONEXEC, MAY_ONEXEC) } else { (OP_CHANGE_PROFILE, MAY_CHANGE_PROFILE) };
+    if name.is_empty() || name.starts_with('&') || name.starts_with(':') {
+        return Err(-EINVAL);
+    }
+    let cur = current_profile();
+    let Some(target) = find(name) else {
+        if let Some(p) = &cur {
+            audit_file(p, &Perms::default(), op, request, name, None, 0, Some("label not found"), -ENOENT)?;
+        }
+        return Err(-ENOENT);
+    };
+    if let Some(p) = &cur {
+        let r = change_perms(p, p.file_start(), &target.name, request);
+        let (perms, error) = match r {
+            Ok(perms) => (perms, 0),
+            Err(perms) => (perms, -EACCES),
+        };
+        audit_file(p, &perms, op, request, name, Some(&target.name), 0, None, error)?;
+    }
+    let c = &mut crate::proc::current().cred;
+    if onexec {
+        c.aa_onexec = Some(Label::of(&target));
+        return Ok(());
+    }
+    // no_new_privs: 決まりのついたプロセスはほかのプロファイルへは移れない (記録しない: Linux と同じ)
+    if c.no_new_privs && cur.as_ref().is_some_and(|p| p.name != target.name) {
+        return Err(-EPERM);
+    }
+    c.apparmor = Some(Label::of(&target));
+    Ok(())
+}
+
+/// /proc/PID/attr/{current,exec,prev} (と attr/apparmor/ の同じもの) を読む。ないもの (exec を決めていない、prev) は EINVAL
+pub fn attr_read(c: &crate::cred::Cred, which: &str) -> Result<String, i64> {
+    match which {
+        "current" => Ok(label_text(c.apparmor.as_ref())),
+        "exec" if c.aa_onexec.is_some() => Ok(label_text(c.aa_onexec.as_ref())),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// /proc/self/attr/{current,exec} に書く (do_setattr): "changeprofile NAME"、"permprofile NAME"、"exec NAME"
+pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
+    if b.is_empty() {
+        return Err(-EINVAL);
+    }
+    let s = String::from_utf8_lossy(b);
+    let s = s.split('\0').next().unwrap_or("").trim();
+    let (cmd, arg) = s.split_once(' ').ok_or(-EINVAL)?;
+    let arg = arg.trim_start();
+    if arg.is_empty() {
+        return Err(-EINVAL);
+    }
+    match (which, cmd) {
+        ("current", "changeprofile") => change_profile(arg, false)?,
+        ("current", "permprofile") => {
+            // ためすだけ (AA_CHANGE_TEST): 許されるかだけ見る
+            let cur = current_profile();
+            let t = find(arg).ok_or(-ENOENT)?;
+            if let Some(p) = cur {
+                change_perms(&p, p.file_start(), &t.name, MAY_CHANGE_PROFILE).map_err(|_| -EACCES)?;
+            }
+        }
+        ("exec", "exec") => change_profile(arg, true)?,
+        _ => {
+            let me = current_profile().map_or("unconfined".into(), |p| p.name.clone());
+            let mut s = format!("{} operation=\"setprocattr\" info=\"{}\" error=-22 profile={}", audit_head("DENIED"), which, untrusted(&me));
+            s.push_str(&audit_tail());
+            crate::println!("{}", s);
+            return Err(-EINVAL);
+        }
+    }
+    Ok(b.len())
+}
+
 // ---- features (apparmor_parser が読んで、それに合う形のバイナリを作る) ----
 
 /// 名のること (パス, 中身)。ディレクトリはパスの頭から。中身には改行を足して見せる
+/// (capability の決まりは、root のたしかめを capable() にまとめてから名のる)
 pub const FEATURES: &[(&str, &str)] = &[
-    ("caps/mask", "chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap linux_immutable net_bind_service net_broadcast net_admin net_raw ipc_lock ipc_owner sys_module sys_rawio sys_chroot sys_ptrace sys_pacct sys_admin sys_boot sys_nice sys_resource sys_time sys_tty_config mknod lease audit_write audit_control setfcap mac_override mac_admin syslog wake_alarm block_suspend audit_read perfmon bpf checkpoint_restore"),
-    ("domain/change_hat", "yes"),
-    ("domain/change_hatv", "yes"),
     ("domain/change_onexec", "yes"),
     ("domain/change_profile", "yes"),
     ("domain/version", "1.2"),

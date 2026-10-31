@@ -91,6 +91,9 @@ enum Node {
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
+    /// /proc/PID/attr (true なら attr/apparmor) と、その中の current exec prev (ATTRS の番号。apparmor.rs)
+    AttrDir(u32, bool),
+    Attr(u32, bool, u8),
     /// /proc/ai (aiproc.rs): ディレクトリ、threads、bkl、ctl、fd/ と fd/PID
     AiDir,
     AiThreads,
@@ -122,6 +125,9 @@ pub struct ProcInode {
 pub fn new_root() -> InodeRef {
     Rc::new(ProcInode { fs: new_fs_id(), node: Node::Root })
 }
+
+/// /proc/PID/attr の中 (LSM の属性: AppArmor が使うもの)
+const ATTRS: [&str; 3] = ["current", "exec", "prev"];
 
 /// IPv6 と raw のソケットの一覧は見出しだけ (IPv6 と raw はない。netstat がないと言って止まる)
 const NET_STUBS: [(&str, &str); 5] = [
@@ -205,6 +211,8 @@ impl ProcInode {
             Node::TaskDir(p) => (p as u64) << 16 | 20,
             Node::Task(_, t) => (t as u64) << 16 | 21,
             Node::TaskFile(_, t, k) => (t as u64) << 16 | (22 + k as u64),
+            Node::AttrDir(p, a) => (p as u64) << 16 | (0x30 + a as u64),
+            Node::Attr(p, a, k) => (p as u64) << 16 | (0x32 + 4 * a as u64 + k as u64),
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
             Node::AiDir => 40,
             Node::AiThreads => 41,
@@ -228,7 +236,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
             _ => None,
         }
     }
@@ -454,6 +462,7 @@ impl ProcInode {
                 }
             }
             Node::IdMap(pid, 2) => crate::ns::setgroups_text(&leader(pid)?.cred.ns.user).into(),
+            Node::Attr(pid, _, k) => crate::apparmor::attr_read(&leader(pid)?.cred, ATTRS[k as usize])?,
             Node::IdMap(pid, k) => crate::ns::map_text(&leader(pid)?.cred.ns.user, k == 1),
             _ => return Err(-EISDIR),
         })
@@ -637,7 +646,9 @@ impl Inode for ProcInode {
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
             Node::NsDir(_) => S_IFDIR | 0o511,
-            Node::TaskDir(_) | Node::Task(..) => S_IFDIR | 0o555,
+            Node::TaskDir(_) | Node::Task(..) | Node::AttrDir(..) => S_IFDIR | 0o555,
+            // だれでも開けるが、書けるのは自分のものだけ (write_at)。prev は読むだけ
+            Node::Attr(_, _, k) if ATTRS[k as usize] != "prev" => S_IFREG | 0o666,
             Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
@@ -671,6 +682,13 @@ impl Inode for ProcInode {
     }
 
     fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/PID/attr/current と exec: AppArmor の change_profile (自分のものだけ: Linux も current でなければ EACCES)
+        if let Node::Attr(pid, _, k) = self.node {
+            if leader(pid)?.pid != proc::current().pid {
+                return Err(-EACCES);
+            }
+            return crate::apparmor::attr_write(ATTRS[k as usize], b);
+        }
         // /proc/PID/uid_map など: ユーザーの namespace の地図 (書けるかは ns.rs が決める)
         if let Node::IdMap(pid, k) = self.node {
             let u = leader(pid)?.cred.ns.user.clone();
@@ -728,8 +746,8 @@ impl Inode for ProcInode {
         if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 || (self.node == Node::AiCtl && crate::aiproc::allowed()) {
             return Ok(());
         }
-        // uid_map など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..)) {
+        // uid_map や attr/current など (書けるかは書くときに決める)
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..)) {
             return Ok(());
         }
         Err(-EACCES)
@@ -838,6 +856,9 @@ impl Inode for ProcInode {
             (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::Pid(p), "ns") => Node::NsDir(p),
+            (Node::Pid(p), "attr") => Node::AttrDir(p, false),
+            (Node::AttrDir(p, false), "apparmor") => Node::AttrDir(p, true),
+            (Node::AttrDir(p, a), _) => Node::Attr(p, a, ATTRS.iter().position(|x| *x == name).ok_or(-ENOENT)? as u8),
             (Node::Pid(p), "task") => Node::TaskDir(p),
             (Node::TaskDir(p), _) => {
                 let tid = crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?;
@@ -960,6 +981,15 @@ impl Inode for ProcInode {
                 add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
                 add("ns".into(), Node::NsDir(p));
+                add("attr".into(), Node::AttrDir(p, false));
+            }
+            Node::AttrDir(p, a) => {
+                for (k, n) in ATTRS.iter().enumerate() {
+                    add((*n).into(), Node::Attr(p, a, k as u8));
+                }
+                if !a {
+                    add("apparmor".into(), Node::AttrDir(p, true));
+                }
             }
             Node::TaskDir(p) => {
                 leader(p)?;

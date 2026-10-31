@@ -1,0 +1,20 @@
+domain {change_onexec {yes
+}
+change_profile {yes
+}
+version {1.2
+}
+}
+file {mask {create read write exec append mmap_exec link lock
+}
+}
+policy {set_load {yes
+}
+versions {v5 {yes
+}
+v6 {yes
+}
+v7 {yes
+}
+}
+}

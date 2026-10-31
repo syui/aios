@@ -67,6 +67,8 @@ pub struct Image {
     pub exe_id: (usize, u64),
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)。/proc/PID/cmdline と environ はここを読む
     pub args: (usize, usize, usize),
+    /// AppArmor: この exec でつくプロファイル (apparmor::exec_transition)
+    pub apparmor: crate::apparmor::Exec,
 }
 
 /// "#!" の後ろの 1 行を (インタプリタ, 引数) に分ける。
@@ -111,10 +113,11 @@ fn read_file(ino: &crate::vfs::InodeRef, off: usize, buf: &mut [u8]) -> Result<u
 }
 
 pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
-    exec_depth(path, argv, envp, 0)
+    exec_depth(path, argv, envp, 0, None)
 }
 
-fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> Result<Image, i64> {
+/// aa: はじめのプログラムで決めた AppArmor の答え (#! のインタプリタへもちこむ: Linux もスクリプトのパスで 1 度だけ)
+fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: Option<crate::apparmor::Exec>) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
     let (exe, ino) = crate::vfs::lookup(&cwd, path, true)?;
     crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
@@ -122,6 +125,10 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
+    let aa = match aa {
+        Some(a) => a,
+        None => crate::apparmor::exec_transition(&exe, m.uid)?,
+    };
     // #! で始まるスクリプトは、書かれたインタプリタにスクリプトのパスを渡して動かす
     let mut head = [0u8; 256];
     let n = read_file(&ino, 0, &mut head)?;
@@ -136,7 +143,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         nargv.extend(arg);
         nargv.push(path.as_bytes().to_vec());
         nargv.extend(argv.iter().skip(1).cloned());
-        return exec_depth(interp_s, &nargv, envp, depth + 1);
+        return exec_depth(interp_s, &nargv, envp, depth + 1, Some(aa));
     }
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
@@ -222,7 +229,8 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
         (AT_GID, 0),
         (AT_EGID, 0),
         (AT_CLKTCK, crate::timer::HZ),
-        (AT_SECURE, 0),
+        // AppArmor の Px など (環境を消す移りかた) なら 1: ld.so が LD_* を見ない
+        (AT_SECURE, aa.secure as u64),
         (AT_RANDOM, random as u64),
         (AT_EXECFN, execfn as u64),
         if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
@@ -248,7 +256,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> R
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, apparmor: aa })
 }
 
 
