@@ -17,6 +17,7 @@ const ENOENT: i64 = 2;
 const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
+const ECHILD: i64 = 10;
 const EPROTO: i64 = 71;
 const EPROTONOSUPPORT: i64 = 93;
 const EOPNOTSUPP: i64 = 95;
@@ -409,6 +410,7 @@ pub const EXEC_MMAP: u32 = 0x1_0000;
 pub const MAY_LINK: u32 = 0x4_0000;
 pub const MAY_ONEXEC: u32 = 0x2000_0000;
 pub const MAY_CHANGE_PROFILE: u32 = 0x4000_0000;
+pub const MAY_CHANGEHAT: u32 = 0x8000_0000;
 const LINK_SUBSET: u32 = MAY_LOCK;
 const ALL_PERMS: u32 = 0xffff_ffff;
 // exec の行き先 (xindex)
@@ -835,6 +837,11 @@ pub struct Profile {
 impl Profile {
     pub fn mode_name(&self) -> &'static str {
         MODE_NAMES[self.mode as usize]
+    }
+
+    /// hat (プロファイルの中の ^NAME。change_hat で入る子: PACKED_FLAG_HAT)
+    pub fn is_hat(&self) -> bool {
+        self.flags & 1 != 0
     }
 
     /// 文字列 s を、この決まりの種類 (s の 1 文字め) で問う (.access の profile_query_cb)。ファイルの持ち主は uid 0 と
@@ -1362,6 +1369,7 @@ const OP_EXEC: &str = "exec";
 const OP_LINK: &str = "link";
 const OP_CHANGE_PROFILE: &str = "change_profile";
 const OP_CHANGE_ONEXEC: &str = "change_onexec";
+const OP_CHANGE_HAT: &str = "change_hat";
 
 /// ファイルの決まり (common_perm と aa_path_perm): full は頭の / のないパス、dir はディレクトリか、ouid は持ち主
 pub fn path_perm(op: &str, full: &str, request: u32, dir: bool, ouid: u32) -> Result<(), i64> {
@@ -1518,7 +1526,10 @@ fn audit_file(p: &Profile, perms: &Perms, op: &str, request: u32, name: &str, ta
             s.push_str(&format!(" error={}", error));
         }
     }
-    s.push_str(&format!(" profile={} name={}", untrusted(&p.name), untrusted(name)));
+    s.push_str(&format!(" profile={}", untrusted(&p.name)));
+    if !name.is_empty() {
+        s.push_str(&format!(" name={}", untrusted(name)));
+    }
     s.push_str(&audit_tail());
     if req & AUDIT_FILE_MASK != 0 {
         s.push_str(&format!(" requested_mask=\"{}\"", mask_chrs(req)));
@@ -1912,28 +1923,151 @@ pub fn change_profile(name: &str, onexec: bool) -> Result<(), i64> {
     Ok(())
 }
 
-/// /proc/PID/attr/{current,exec,prev} (と attr/apparmor/ の同じもの) を読む。ないもの (exec を決めていない、prev) は EINVAL
+// ---- change_hat (domain.c と task.c) ----
+
+/// p の子 (階層の名前 "p//name": aa_find_child)
+fn find_child(p: &Profile, name: &str) -> Option<Rc<Profile>> {
+    find(&format!("{}//{}", p.name, name))
+}
+
+/// p に子 (hat か子のプロファイル) があるか
+fn has_children(p: &Profile) -> bool {
+    let pre = format!("{}//", p.name);
+    NS.get().profiles.iter().any(|q| q.name.starts_with(&pre))
+}
+
+/// change_hat のしくじり: hat をいくつもためしたときか complain のときだけ記録する (ひとつだけさがすのは、あるかどうかを
+/// ためすのにも使うので: Linux と同じ)
+fn hat_fail(p: &Profile, count: usize, name: &str, info: &str, error: i64) -> Result<(), i64> {
+    if count > 1 || p.mode == Mode::Complain {
+        let _ = audit_file(p, &Perms::default(), OP_CHANGE_HAT, MAY_CHANGEHAT, name, None, 0, Some(info), error);
+    }
+    Err(error)
+}
+
+/// token がちがう: 当てずっぽうをふせぐため、記録してプロファイルの signal (SIGKILL) で止める
+fn hat_kill(p: &Profile, target: &str) -> Result<(), i64> {
+    let perms = Perms { kill: MAY_CHANGEHAT, ..Perms::default() };
+    audit_file(p, &perms, OP_CHANGE_HAT, MAY_CHANGEHAT, "", Some(target), 0, Some("failed token match"), -EACCES)
+}
+
+/// aa_change_hat: hats のはじめにあるものに入る (いまのプロファイルの子の hat。hat の中からは兄弟の hat へ)。入るときに
+/// token を覚え、hat から hat へ移るのも、hats なしで前のプロファイルに帰るのも、同じ token のときだけ。test (permhat) なら
+/// 入れるかを見るだけ
+fn change_hat(hats: &[&str], token: u64, test: bool) -> Result<(), i64> {
+    let Some(p) = current_profile() else {
+        // 決まりのないプロセスには入る hat がない (Linux も EPERM と記録)
+        let mut s = format!("{} operation=\"{}\" class=\"file\" info=\"unconfined can not change_hat\" error={} profile={}", audit_head("DENIED"), OP_CHANGE_HAT, -EPERM, untrusted("unconfined"));
+        s.push_str(&audit_tail());
+        crate::println!("{}", s);
+        return Err(-EPERM);
+    };
+    let c = &mut crate::proc::current().cred;
+    if hats.is_empty() {
+        // 帰る。前がなければ何もしない
+        let Some(prev) = c.aa_prev.clone().filter(|_| !test) else { return Ok(()) };
+        // no_new_privs: ほかのプロファイルへはもどれない (記録しない)
+        if c.no_new_privs {
+            return Err(-EPERM);
+        }
+        if c.aa_token != token {
+            return hat_kill(&p, &prev.0);
+        }
+        c.apparmor = Some(prev);
+        (c.aa_prev, c.aa_onexec, c.aa_token) = (None, None, 0);
+        return Ok(());
+    }
+    let root = if p.is_hat() { p.name.rsplit_once("//").and_then(|(up, _)| find(up)) } else { Some(p.clone()) };
+    let mut found = None;
+    for &name in hats {
+        match root.as_ref().and_then(|r| find_child(r, name)) {
+            // complain なら、ないものにも入ったことにする (下で)
+            None if p.mode != Mode::Complain => continue,
+            Some(h) if !h.is_hat() => return hat_fail(&p, hats.len(), name, "target not hat", -EPERM),
+            h => {
+                found = Some((name, h));
+                break;
+            }
+        }
+    }
+    let Some((name, hat)) = found else {
+        let (info, error) = if has_children(&p) { ("hat not found", -ENOENT) } else { ("no hats defined", -ECHILD) };
+        return hat_fail(&p, hats.len(), "", info, error);
+    };
+    // complain で hat がないとき、Linux は学ぶための空の hat を作って入る。aios は記録して ENOENT
+    let error = if hat.is_some() { 0 } else { -ENOENT };
+    audit_file(&p, &Perms::default(), OP_CHANGE_HAT, MAY_CHANGEHAT, name, hat.as_ref().map(|h| h.name.as_str()), 0, None, error)?;
+    let Some(hat) = hat else { return Err(-ENOENT) };
+    if c.no_new_privs {
+        return Err(-EPERM);
+    }
+    if test {
+        return Ok(());
+    }
+    // aa_set_current_hat: はじめて入るなら前のプロファイルと token を覚える
+    match c.aa_prev {
+        None => (c.aa_prev, c.aa_token) = (c.apparmor.clone(), token),
+        Some(_) if c.aa_token == token => {}
+        Some(_) => return hat_kill(&p, &hat.name),
+    }
+    c.apparmor = Some(Label::of(&hat));
+    c.aa_onexec = None;
+    Ok(())
+}
+
+/// "changehat TOKEN^HAT" の TOKEN^HAT (split_token_from_name と aa_setprocattr_changehat)。TOKEN は 16 進 (0x はあっても
+/// よい)。HAT のあとに \0 で区切ってほかの hat を続けられる (more: 1 つめの文字列のあとの残り。終わりの \0 は 1 つ落として
+/// ある)。HAT がなければ帰る (token が 0 なら EINVAL)
+fn set_hat(arg: &str, more: Option<&[u8]>, test: bool) -> Result<(), i64> {
+    let digits = arg.strip_prefix("0x").or_else(|| arg.strip_prefix("0X")).unwrap_or(arg);
+    let n = digits.bytes().take_while(u8::is_ascii_hexdigit).count();
+    let token = digits.bytes().take(n).fold(0u64, |t, d| t.wrapping_mul(16).wrapping_add((d as char).to_digit(16).unwrap_or(0) as u64));
+    let Some(first) = digits[n..].strip_prefix('^').filter(|_| n > 0 || digits.len() != arg.len()) else { return Err(-EINVAL) };
+    let mut hats = Vec::new();
+    if !first.is_empty() {
+        hats.push(first);
+        for h in more.into_iter().flat_map(|m| m.split(|&b| b == 0)) {
+            hats.push(core::str::from_utf8(h).unwrap_or(""));
+        }
+        hats.truncate(16);
+    }
+    if hats.is_empty() && token == 0 {
+        return Err(-EINVAL);
+    }
+    change_hat(&hats, token, test)
+}
+
+/// /proc/PID/attr/{current,exec,prev} (と attr/apparmor/ の同じもの) を読む。ないもの (exec を決めていない、hat の中で
+/// ないときの prev) は EINVAL
 pub fn attr_read(c: &crate::cred::Cred, which: &str) -> Result<String, i64> {
     match which {
         "current" => Ok(label_text(c.apparmor.as_ref())),
         "exec" if c.aa_onexec.is_some() => Ok(label_text(c.aa_onexec.as_ref())),
+        "prev" if c.aa_prev.is_some() => Ok(label_text(c.aa_prev.as_ref())),
         _ => Err(-EINVAL),
     }
 }
 
-/// /proc/self/attr/{current,exec} に書く (do_setattr): "changeprofile NAME"、"permprofile NAME"、"exec NAME"
+/// /proc/self/attr/{current,exec} に書く (do_setattr): "changehat TOKEN^HAT"、"permhat TOKEN^HAT"、"changeprofile NAME"、
+/// "permprofile NAME"、"exec NAME"
 pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
     if b.is_empty() {
         return Err(-EINVAL);
     }
-    let s = String::from_utf8_lossy(b);
-    let s = s.split('\0').next().unwrap_or("").trim();
+    // 1 つめの文字列 (\0 まで)。changehat の hat は、そのあとにも \0 で区切って続けられる
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    let s = String::from_utf8_lossy(&b[..end]);
+    let s = s.trim();
     let (cmd, arg) = s.split_once(' ').ok_or(-EINVAL)?;
     let arg = arg.trim_start();
     if arg.is_empty() {
         return Err(-EINVAL);
     }
     match (which, cmd) {
+        ("current", "changehat" | "permhat") => {
+            let more = b.get(end + 1..).filter(|r| !r.is_empty()).map(|r| r.strip_suffix(&[0]).unwrap_or(r));
+            set_hat(arg, more, cmd == "permhat")?
+        }
         ("current", "changeprofile") => change_profile(arg, false)?,
         ("current", "permprofile") => {
             // ためすだけ (AA_CHANGE_TEST): 許されるかだけ見る
@@ -1960,6 +2094,8 @@ pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
 /// 名のること (パス, 中身)。ディレクトリはパスの頭から。中身には改行を足して見せる
 pub const FEATURES: &[(&str, &str)] = &[
     ("caps/mask", "chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap linux_immutable net_bind_service net_broadcast net_admin net_raw ipc_lock ipc_owner sys_module sys_rawio sys_chroot sys_ptrace sys_pacct sys_admin sys_boot sys_nice sys_resource sys_time sys_tty_config mknod lease audit_write audit_control setfcap mac_override mac_admin syslog wake_alarm block_suspend audit_read perfmon bpf checkpoint_restore"),
+    ("domain/change_hat", "yes"),
+    ("domain/change_hatv", "yes"),
     ("domain/change_onexec", "yes"),
     ("domain/change_profile", "yes"),
     ("domain/version", "1.2"),

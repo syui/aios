@@ -471,7 +471,7 @@ AppArmor のプロファイル (文字で書いた決まり) は、Linux と同�
 (kernel/src/apparmor.rs、securityfs.rs)。バイナリのほどき方は Linux 7.3 の policy_unpack.c と同じ (型の印のついた値の
 並び)、ファイルの決まりは DFA (match.c。表は big endian) で、パスを通してたどりついた状態の許しを見る。apparmor_parser は
 カーネルが名のること (apparmor/features) を読んで形を選ぶので、aios は v5〜v7 の版と、ファイル (create read write exec
-append mmap_exec link lock)、capability (caps/mask)、change_profile と change_onexec を名のる。すると許しを DFA の accept の表にうめこんだ古い
+append mmap_exec link lock)、capability (caps/mask)、change_hat、change_profile と change_onexec を名のる。すると許しを DFA の accept の表にうめこんだ古い
 形で作るので、policy_compat.c と同じく読むときに許しの表へ移す (持ち主のときとほかのときの 2 つ組)。表は読むときに
 みな確かめる (状態と行き先が表の中、差分の鎖がまわっていない、許しの番号が表の中: Linux の paranoid_load と同じ)。
 .access には「このプロファイルでこの文字列は」を聞ける (libapparmor の aa_query_label)。/sys/module/apparmor/parameters/enabled
@@ -484,6 +484,15 @@ append mmap_exec link lock)、capability (caps/mask)、change_profile と change
 AT_SECURE で、ld.so が LD_* を見ない)。#! のスクリプトは、Linux と同じくスクリプトのパスで 1 度だけ。/proc/PID/attr
 (と attr/apparmor) の current は「名前 (モード)」、exec に "exec NAME" を書くと次の exec で (onexec)、current に
 "changeprofile NAME" を書くといま移る (決まりのあるものは change_profile の許しが要る。no_new_privs ならほかへは移れない)。
+
+change_hat: プロファイルの中に `^NAME { ... }` と書いた hat (子のプロファイル "親//NAME") には、current に
+"changehat TOKEN^NAME" (TOKEN は 16 進) を書くと許しなしで入れる。hat はいくつも \0 で区切って書け (libapparmor の
+aa_change_hatv)、はじめにあるものに入る。入るときに前のプロファイルと TOKEN を覚え (attr/prev に見える)、hat の中からは
+兄弟の hat へ移れ、"changehat TOKEN^" で前のプロファイルに帰る。どちらも同じ TOKEN のときだけで、ちがえば
+`apparmor="KILLED" operation="change_hat" info="failed token match"` と記録して SIGKILL (当てずっぽうをふせぐ。Linux と
+同じ)。ない hat は ENOENT、hat でない子は EPERM、子のないプロファイルからは ECHILD、決まりのないプロセスからは EPERM
+(記録するのは、hat をいくつもためしたときか complain のときだけ: ひとつだけさがすのは、あるかをためすのにも使うので)。
+"permhat" は入れるかを見るだけ。exec で前のプロファイルと TOKEN は消え、fork では受けつぐ。
 
 決まりを見るのは open (開く口の許し: 読む、書く、O_APPEND は a、O_CREAT は c)、作る (O_CREAT、mknod、mkdir、symlink、
 AF_UNIX の bind)、消す (unlink、rmdir)、rename (前は読んで消す、新しいほうは作って書く)、link (新しい名前とペアの古い
@@ -509,8 +518,9 @@ Linux と同じく記録しない問い。プロファイルのついた root �
 capability ではない (ファイルの持ち主と許し) のでそのまま。
 
 Linux とちがうところ (まだないもの): complain で exec の許しがないとき、Linux は学ぶための空のプロファイルに移るが、
-aios はいまのプロファイルのまま。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
-change_hat、ネットワーク、mount、ptrace、signal、rlimit の決まりはまだで、features でも名のらない。capability の
+aios はいまのプロファイルのまま (complain で、ない hat に change_hat したときも、Linux は学ぶための hat を作って入るが、
+aios は記録して ENOENT)。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
+ネットワーク、mount、ptrace、signal、rlimit の決まりはまだで、features でも名のらない。capability の
 DFA の決まり (caps/extended) も名のらない (apparmor_parser は古い 64 ビットの組で作る)。mprotect と、exec のときに開いた
 ままのファイルを見なおすこともまだ。
 
@@ -523,8 +533,9 @@ DENIED を記録して、exec のあとで SIGSEGV を送る。ふつうのプ�
 読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・truncate・flock・
 exec (ix px cx ux、許しのないもの、行き先で写せないもの)・change_profile の 40 の答えをくらべ、capability を chown
 だけ許すプロファイル (aacap) と complain で、ほかの人の 0600 のファイルを読む・書く・chmod、chown、mknod、setuid と capget
-の 18 の答えを、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイルを外す (unconfined にもどる)
-のを確かめる。答えは Linux で見たもの:
+の 18 の答えと、change_hat (hat に入る・兄弟へ・帰る、いくつも、token ちがいの SIGKILL、ない hat、hat でないもの、
+hat のないプロファイル) の 22 の答えをくらべ、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイル
+を外す (unconfined にもどる) のを確かめる。答えは Linux で見たもの:
 test/linux.config に AppArmor を入れ (プロファイルを読まなければ、どのプロセスにも決まりはない)、test/linux-vm.sh の
 rootexec で同じプログラムを root で動かすと、Linux 7.3.1 でも同じに通る (はじめは Px と Cx の 2 つだけちがい、上の
 mmap の見なおしだとわかった)。

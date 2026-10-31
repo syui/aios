@@ -61,10 +61,13 @@ pub struct Cred {
     /// AppArmor のプロファイル (なければ unconfined) と、次の exec でつけるもの (/proc/self/attr/exec。apparmor.rs)
     pub apparmor: Option<crate::apparmor::Label>,
     pub aa_onexec: Option<crate::apparmor::Label>,
+    /// change_hat で hat に入る前のプロファイルと、帰るときに合わせる token (Linux の aa_task_ctx。exec で消える)
+    pub aa_prev: Option<crate::apparmor::Label>,
+    pub aa_token: u64,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0 };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)

@@ -1780,10 +1780,10 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     }
     p.altstack = AltStack::NONE;
     p.timers.clear();
-    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり)。新しいプロファイルでプログラムを写せなければ、
+    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり、change_hat の前と token も消える)。新しいプロファイルでプログラムを写せなければ、
     // Linux と同じく戻れないところの先で SIGSEGV (apparmor::exec_map_ok)
     p.cred.apparmor = img.apparmor.label.clone();
-    p.cred.aa_onexec = None;
+    (p.cred.aa_onexec, p.cred.aa_prev, p.cred.aa_token) = (None, None, 0);
     let fatal = img.apparmor.fatal;
     let old = p.mm.take();
     p.load_image(img);

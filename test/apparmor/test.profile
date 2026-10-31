@@ -22,17 +22,30 @@ profile aatest /tmp/aatest/t {
   change_profile -> aachild,
   /proc/*/attr/current rw,
   /proc/*/attr/exec rw,
+  /proc/*/attr/prev r,
 
   profile sub {
     /tmp/aatest/cx mr,
     /proc/*/attr/current r,
+  }
+
+  # change_hat で入る hat (aatest//hat1)。中では w が読めて r は読めない
+  ^hat1 {
+    /tmp/aatest/w r,
+    /proc/*/attr/current rw,
+    /proc/*/attr/prev r,
+  }
+
+  ^hat2 {
+    /tmp/aatest/rw r,
+    /proc/*/attr/current rw,
   }
 }
 
 # 移った先は、そのプログラムを写す mr が要る (Linux は exec のあとの mmap で見なおす。なければ SIGSEGV: aanomap)
 profile aachild {
   /tmp/aatest/px mr,
-  /proc/*/attr/current r,
+  /proc/*/attr/current rw,
 }
 
 profile aanomap {

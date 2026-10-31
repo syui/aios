@@ -1,7 +1,7 @@
 // AppArmor (kernel/src/apparmor.rs) のたしかめ: test/apparmor/test.profile (gen.sh が apparmor_parser で作った blob.h) を
 // /sys/kernel/security/apparmor/.replace で読み、このプログラムの写し /tmp/aatest/t (aatest がパスでつく) に、決まりの
 // 中から open、作る・消す、rename、link、chmod、truncate、flock、exec (ix px cx ux) と change_profile をためさせる。
-// aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
+// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
 // プロファイルを外す (unconfined にもどる)。
 // root で動かす (でなければ sudo -n でもう一度)。AppArmor のついた Linux でも同じに通ること
 #define _GNU_SOURCE
@@ -159,6 +159,90 @@ static int capchild(int complain) {
   return 0;
 }
 
+// /proc/self/attr/current に n バイト書く (changehat は hat を \0 で区切って続けられる)
+static int hatw(const char *s, size_t n) { return put("/proc/self/attr/current", s, n); }
+#define HAT(s) hatw(s, strlen(s))
+
+// 子を待って、シグナルで終わったら "SIG n"、でなければ "EXIT n"
+static void ended(const char *name, pid_t k) {
+  int st;
+  waitpid(k, &st, 0);
+  if (WIFSIGNALED(st))
+    printf("%s SIG %d\n", name, WTERMSIG(st));
+  else
+    printf("%s EXIT %d\n", name, WEXITSTATUS(st));
+}
+
+// aatest の中で change_hat (どれも fork した子で。入ったり殺されたりするので)
+static void hats(void) {
+#define L(name, path)                                                                                                  \
+  do {                                                                                                                 \
+    char b_[128];                                                                                                      \
+    line(path, b_, sizeof b_);                                                                                         \
+    printf("%s %s\n", name, b_);                                                                                       \
+  } while (0)
+  pid_t k;
+  fflush(stdout);
+  if ((k = fork()) == 0) {
+    printf("hat-in %d\n", HAT("changehat 1234^hat1"));
+    L("hat-cur", "/proc/self/attr/current");
+    L("hat-prev", "/proc/self/attr/prev");
+    printf("hat-open-w %d\nhat-open-r %d\n", op_open(D "/w", O_RDONLY), op_open(D "/r", O_RDONLY));
+    printf("hat-sibling %d\n", HAT("changehat 1234^hat2"));
+    L("hat-cur2", "/proc/self/attr/current");
+    printf("hat-out %d\n", HAT("changehat 1234^"));
+    L("hat-back", "/proc/self/attr/current");
+    L("hat-prev2", "/proc/self/attr/prev");
+    fflush(stdout);
+    _exit(0);
+  }
+  waitpid(k, NULL, 0);
+  // 入れないもの、変えないもの
+  if ((k = fork()) == 0) {
+    printf("hat-none %d\n", HAT("changehat 1234^nohat"));
+    printf("hat-nothat %d\n", HAT("changehat 1234^sub"));
+    printf("hat-zero %d\n", HAT("changehat 0^"));
+    printf("hat-junk %d\n", HAT("changehat xyz^hat1"));
+    printf("hat-noprev %d\n", HAT("changehat 55^"));
+    printf("hat-perm %d\n", HAT("permhat 1234^hat1"));
+    L("hat-perm-cur", "/proc/self/attr/current");
+    fflush(stdout);
+    _exit(0);
+  }
+  waitpid(k, NULL, 0);
+  // いくつも (libapparmor の aa_change_hatv と同じ形: 名前ごとに \0、終わりにもう 1 つ)
+  if ((k = fork()) == 0) {
+    static const char v[] = "changehat 00000000000004d2^nohat\0hat1\0";
+    printf("hat-vec %d\n", hatw(v, sizeof v));
+    L("hat-vec-cur", "/proc/self/attr/current");
+    fflush(stdout);
+    _exit(0);
+  }
+  waitpid(k, NULL, 0);
+  // token がちがえば SIGKILL (帰るときも、兄弟へ移るときも)
+  if ((k = fork()) == 0) {
+    HAT("changehat 1234^hat1");
+    HAT("changehat 99^");
+    _exit(0);
+  }
+  ended("hat-badtoken", k);
+  if ((k = fork()) == 0) {
+    HAT("changehat 1234^hat1");
+    HAT("changehat 99^hat2");
+    _exit(0);
+  }
+  ended("hat-badtoken2", k);
+  // hat のないプロファイルから
+  if ((k = fork()) == 0) {
+    puts_("/proc/self/attr/current", "changeprofile aachild");
+    printf("hat-nohats %d\n", HAT("changehat 1234^x"));
+    fflush(stdout);
+    _exit(0);
+  }
+  waitpid(k, NULL, 0);
+#undef L
+}
+
 // aatest の中で (argv[1] が child): 1 行に「名前 答え」
 static int child(void) {
 #define T(name, v) printf("%s %d\n", name, v)
@@ -203,6 +287,7 @@ static int child(void) {
     run(p, "attr", b, sizeof b);
     printf("exec-%s %s\n", ex[i], b);
   }
+  hats();
   T("change-complain", puts_("/proc/self/attr/current", "changeprofile aacomplain"));
   T("change-child", puts_("/proc/self/attr/current", "changeprofile aachild"));
   line("/proc/self/attr/current", b, sizeof b);
@@ -219,7 +304,11 @@ static const char *want[] = {
     "flock-k 0", "flock-r 13", "link-ok 0", "link-bad 13", "chmod-rw 0", "chmod-r 13", "truncate-w 0",
     "truncate-r 13", "self aatest (enforce)", "exec-ix aatest (enforce)", "exec-px aachild (enforce)",
     "exec-cx aatest//sub (enforce)", "exec-ux unconfined", "exec-nox ERR 13", "exec-pnomap SIG 11", "change-complain 13", "change-child 0",
-    "changed aachild (enforce)",
+    "changed aachild (enforce)", "hat-in 0", "hat-cur aatest//hat1 (enforce)", "hat-prev aatest (enforce)",
+    "hat-open-w 0", "hat-open-r 13", "hat-sibling 0", "hat-cur2 aatest//hat2 (enforce)", "hat-out 0",
+    "hat-back aatest (enforce)", "hat-prev2 ERR 22", "hat-none 2", "hat-nothat 1", "hat-zero 22", "hat-junk 22",
+    "hat-noprev 0", "hat-perm 0", "hat-perm-cur aatest (enforce)", "hat-vec 0", "hat-vec-cur aatest//hat1 (enforce)",
+    "hat-badtoken SIG 9", "hat-badtoken2 SIG 9", "hat-nohats 10",
 };
 
 // aacap: chown のほかの root の力はない (capget にも chown だけ)。complain なら記録して通す
@@ -390,6 +479,9 @@ int main(int argc, char **argv) {
   close(q2[0]);
   waitpid(c, NULL, 0);
   CHECK(!strcmp(b, "aachild (enforce)"), "onexec gave \"%s\"", b);
+
+  // 決まりのないプロセスには hat がない
+  CHECK(HAT("changehat 1^hat1") == EPERM, "unconfined changehat is EPERM");
 
   // complain: 決まりの外も読める
   c = fork();
