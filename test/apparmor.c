@@ -95,7 +95,11 @@ static void run(const char *prog, const char *arg, char *out, size_t n) {
   out[r > 0 ? r : 0] = 0;
   out[strcspn(out, "\n")] = 0;
   close(p[0]);
-  waitpid(k, NULL, 0);
+  int st;
+  waitpid(k, &st, 0);
+  // 何も言わずにシグナルで終わった (移った先で自分を写せない: SIGSEGV)
+  if (!out[0] && WIFSIGNALED(st))
+    snprintf(out, n, "SIG %d", WTERMSIG(st));
 }
 
 // aatest の中で (argv[1] が child): 1 行に「名前 答え」
@@ -135,8 +139,8 @@ static int child(void) {
   char b[128];
   line("/proc/self/attr/current", b, sizeof b);
   printf("self %s\n", b);
-  const char *ex[] = {"ix", "px", "cx", "ux", "nox"};
-  for (int i = 0; i < 5; i++) {
+  const char *ex[] = {"ix", "px", "cx", "ux", "nox", "pnomap"};
+  for (int i = 0; i < 6; i++) {
     char p[64];
     snprintf(p, sizeof p, D "/%s", ex[i]);
     run(p, "attr", b, sizeof b);
@@ -157,29 +161,47 @@ static const char *want[] = {
     "rename-in-d 0", "rename-out 13", "unlink-d 0", "unlink-r 13", "opendir-d 0", "opendir-top 13", "open-own 0",
     "flock-k 0", "flock-r 13", "link-ok 0", "link-bad 13", "chmod-rw 0", "chmod-r 13", "truncate-w 0",
     "truncate-r 13", "self aatest (enforce)", "exec-ix aatest (enforce)", "exec-px aachild (enforce)",
-    "exec-cx aatest//sub (enforce)", "exec-ux unconfined", "exec-nox ERR 13", "change-complain 13", "change-child 0",
+    "exec-cx aatest//sub (enforce)", "exec-ux unconfined", "exec-nox ERR 13", "exec-pnomap SIG 11", "change-complain 13", "change-child 0",
     "changed aachild (enforce)",
 };
+
+// 作るものと、このプログラムの写し (t と、exec の行き先)。Linux の VM (test/linux-vm.sh の rootexec) には
+// シェルも cp もないので、自分で
+static const char *files[] = {"r", "w", "rw", "a", "deny", "x", "own", "k"};
+static const char *bins[] = {"t", "ix", "px", "cx", "ux", "nox", "pnomap"};
+// テストでできるかもしれないもの
+static const char *made[] = {"ln", "ln2", "new", "out", "d/f", "d/g"};
+
+static int copy(const char *from, const char *to) {
+  int in = open(from, O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+  char b[65536];
+  ssize_t n;
+  int ok = in >= 0 && out >= 0;
+  while (ok && (n = read(in, b, sizeof b)) > 0)
+    ok = write(out, b, n) == n;
+  if (in >= 0)
+    close(in);
+  if (out >= 0)
+    close(out);
+  return ok;
+}
 
 static void setup(const char *self) {
   mkdir(D, 0755);
   mkdir(D "/d", 0755);
-  const char *files[] = {"r", "w", "rw", "a", "deny", "x", "own", "k"};
   for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
     char p[64];
     snprintf(p, sizeof p, D "/%s", files[i]);
     int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-      write(fd, "x\n", 2);
+      CHECK(write(fd, "x\n", 2) == 2, "write %s", p);
       close(fd);
     }
   }
-  // このプログラムの写し (t と、exec の行き先)
-  const char *bins[] = {"t", "ix", "px", "cx", "ux", "nox"};
   for (size_t i = 0; i < sizeof bins / sizeof *bins; i++) {
-    char cmd[640];
-    snprintf(cmd, sizeof cmd, "cp %s " D "/%s && chmod 755 " D "/%s", self, bins[i], bins[i]);
-    CHECK(system(cmd) == 0, "copy %s", bins[i]);
+    char p[64];
+    snprintf(p, sizeof p, D "/%s", bins[i]);
+    CHECK(copy(self, p), "copy %s", bins[i]);
   }
 }
 
@@ -187,7 +209,18 @@ static void cleanup(void) {
   puts_(AA ".remove", "aatest");
   puts_(AA ".remove", "aachild");
   puts_(AA ".remove", "aacomplain");
-  system("rm -rf " D);
+  puts_(AA ".remove", "aanomap");
+  const char **lists[] = {files, bins, made};
+  size_t ns[] = {sizeof files / sizeof *files, sizeof bins / sizeof *bins, sizeof made / sizeof *made};
+  for (int l = 0; l < 3; l++)
+    for (size_t i = 0; i < ns[l]; i++) {
+      char p[64];
+      snprintf(p, sizeof p, D "/%s", lists[l][i]);
+      unlink(p);
+    }
+  rmdir(D "/d/sub");
+  rmdir(D "/d");
+  rmdir(D);
 }
 
 int main(int argc, char **argv) {

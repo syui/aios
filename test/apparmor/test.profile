@@ -16,6 +16,7 @@ profile aatest /tmp/aatest/t {
   /tmp/aatest/ix ix,
   /tmp/aatest/px Px -> aachild,
   /tmp/aatest/cx Cx -> sub,
+  /tmp/aatest/pnomap Px -> aanomap,
   /tmp/aatest/ux Ux,
   /tmp/aatest/nox r,
   change_profile -> aachild,
@@ -23,11 +24,18 @@ profile aatest /tmp/aatest/t {
   /proc/*/attr/exec rw,
 
   profile sub {
+    /tmp/aatest/cx mr,
     /proc/*/attr/current r,
   }
 }
 
+# 移った先は、そのプログラムを写す mr が要る (Linux は exec のあとの mmap で見なおす。なければ SIGSEGV: aanomap)
 profile aachild {
+  /tmp/aatest/px mr,
+  /proc/*/attr/current r,
+}
+
+profile aanomap {
   /proc/*/attr/current r,
 }
 

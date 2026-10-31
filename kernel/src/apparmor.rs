@@ -1548,11 +1548,29 @@ fn audit_file(p: &Profile, perms: &Perms, op: &str, request: u32, name: &str, ta
 
 // ---- exec で次のプロファイル (domain.c) ----
 
-/// exec の答え: 次のラベル (None は unconfined) と、AT_SECURE にするか (環境を消す Px など)
+/// exec の答え: 次のラベル (None は unconfined) と、AT_SECURE にするか (環境を消す Px など)。fatal は、新しい
+/// プロファイルでプログラムを写せない (exec_map_ok): exec のあと SIGSEGV
 #[derive(Clone, Default)]
 pub struct Exec {
     pub label: Option<Label>,
     pub secure: bool,
+    pub fatal: bool,
+}
+
+/// exec で写すプログラム (と ld.so) を、新しいプロファイルで r と m が許されるか。Linux は、開いたとき (前の
+/// ラベル) とラベルがちがえば binfmt_elf の mmap で見なおし (aa_file_perm)、だめなら戻れないところの先で SIGSEGV。
+/// 同じラベル (ix)、行き先が unconfined、前が unconfined (開いたファイルはわたされたもの: __file_is_delegated) は
+/// 見ない。だめなら記録して false
+pub fn exec_map_ok(e: &Exec, full: &str, ouid: u32) -> bool {
+    if off() || e.label == crate::cred::current().apparmor || current_profile().is_none() {
+        return true;
+    }
+    let Some(p) = e.label.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined) else { return true };
+    let name = path_name(full, false);
+    let request = MAY_READ | EXEC_MMAP;
+    let (_, perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
+    let error = if request & !perms.allow != 0 { -EACCES } else { 0 };
+    audit_file(&p, &perms, OP_FMMAP, request, &name, None, ouid, None, error).is_ok()
 }
 
 /// is_loop: たどった状態の終わり 32 のうちに同じものがあれば、そこからは同じことのくりかえし
@@ -1685,7 +1703,7 @@ fn label_name(l: &Option<Label>) -> String {
 pub fn exec_transition(full: &str, ouid: u32) -> Result<Exec, i64> {
     let c = crate::cred::current();
     if off() {
-        return Ok(Exec { label: c.apparmor.clone(), secure: false });
+        return Ok(Exec { label: c.apparmor.clone(), ..Default::default() });
     }
     let name = path_name(full, false);
     let cur = c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined);
@@ -1763,7 +1781,7 @@ pub fn exec_transition(full: &str, ouid: u32) -> Result<Exec, i64> {
         }
         return Err(-EPERM);
     }
-    Ok(Exec { label: new, secure })
+    Ok(Exec { label: new, secure, fatal: false })
 }
 
 /// change_profile_perms: p のファイルの決まりで、start から target の名前をたどって request が許されるか

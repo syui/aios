@@ -1780,11 +1780,16 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     }
     p.altstack = AltStack::NONE;
     p.timers.clear();
-    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり)
+    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり)。新しいプロファイルでプログラムを写せなければ、
+    // Linux と同じく戻れないところの先で SIGSEGV (apparmor::exec_map_ok)
     p.cred.apparmor = img.apparmor.label.clone();
     p.cred.aa_onexec = None;
+    let fatal = img.apparmor.fatal;
     let old = p.mm.take();
     p.load_image(img);
+    if fatal {
+        crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
+    }
     p.pt().activate();
     // 前のアドレス空間 (fork した写し) のページを返すのも、exit と同じく大きなロックを放してから
     if let Some(m) = old.as_ref().filter(|m| m.private()) {

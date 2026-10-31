@@ -125,7 +125,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
-    let aa = match aa {
+    let mut aa = match aa {
         Some(a) => a,
         None => crate::apparmor::exec_transition(&exe, m.uid)?,
     };
@@ -145,6 +145,8 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
         nargv.extend(argv.iter().skip(1).cloned());
         return exec_depth(interp_s, &nargv, envp, depth + 1, Some(aa));
     }
+    // AppArmor: 新しいプロファイルでこのプログラムを写せるか (だめなら exec のあと SIGSEGV: Linux と同じ)
+    aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &exe, m.uid);
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
@@ -156,6 +158,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
         Some(ip) => {
             let (ipath, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
             crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
+            aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &ipath, iino.meta().uid);
             let isize = iino.meta().size as usize;
             let i = load_elf(&mut pt, &iino, isize, INTERP_BASE, &ipath)?;
             if i.interp.is_some() {
