@@ -1455,10 +1455,15 @@ const OP_CHANGE_HAT: &str = "change_hat";
 /// ファイルの決まり (common_perm と aa_path_perm): full は頭の / のないパス、dir はディレクトリか、ouid は持ち主
 pub fn path_perm(op: &str, full: &str, request: u32, dir: bool, ouid: u32) -> Result<(), i64> {
     let Some(p) = current_profile() else { return Ok(()) };
+    path_perm_for(&p, op, full, request, dir, ouid)
+}
+
+/// path_perm を p の決まりで (AF_UNIX の相手の側のファイルの決まり)
+fn path_perm_for(p: &Profile, op: &str, full: &str, request: u32, dir: bool, ouid: u32) -> Result<(), i64> {
     let name = path_name(full, dir);
     let (_, perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
     let e = if request & !perms.allow != 0 { -EACCES } else { 0 };
-    audit_file(&p, &perms, op, request, &name, None, ouid, None, e)
+    audit_file(p, &perms, op, request, &name, None, ouid, None, e)
 }
 
 /// rename (apparmor_path_rename): 前の名前は読んで消せること、新しい名前は作って書けること
@@ -2272,6 +2277,12 @@ fn af_perm(p: &Profile, op: &str, request: u32, family: u32, typ: u32, protocol:
             }
         }
     }
+    net_check(p, st, info, op, request, family, typ, protocol, extra)
+}
+
+/// aa_do_perms: st の許しで request を見て、だめなら class="net" で記録 (audit_net_cb)
+#[allow(clippy::too_many_arguments)]
+fn net_check(p: &Profile, st: u32, info: Option<&str>, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
     let mut perms = p.policy.lookup(st, true);
     p.apply_modes(&mut perms);
     check_perms(&perms, request, &|kind, req, denied, error| {
@@ -2314,12 +2325,236 @@ pub fn net_perm(op: &str, request: u32, family: u32, typ: u32, protocol: u32, ex
     }
 }
 
-/// label (ソケットの持ち主のラベル。None は unconfined) の決まりで (AF_UNIX の相手の側を見る: aa_unix_peer_perm)
-pub fn label_net_perm(label: Option<&Label>, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
-    match label.and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
-        Some(p) => af_perm(&p, op, request, family, typ, protocol, extra),
-        None => Ok(()),
+// ---- AF_UNIX (af_unix.c。network_v9 の af_unix を名のるので、v9 の決まりなら番地、cmd、相手の番地とラベルまで見る。
+// パスの名前のソケットはファイルの決まりで (unix_fs_perm)。v9 の決まりのないプロファイルは v8 の (unix, type, protocol)) ----
+
+/// AppArmor が AF_UNIX のソケットについて見るもの
+pub struct UnixSk<'a> {
+    pub typ: u32,
+    pub protocol: u32,
+    /// 名前 (sockaddr_un のバイト: family と sun_path。なければ無名)
+    pub addr: Option<&'a [u8]>,
+    /// パスの名前で bind したもの (is_unix_fs): (パス, ファイルの持ち主)
+    pub fs: Option<(&'a str, u32)>,
+}
+
+const CMD_ADDR: u8 = 1;
+const CMD_LISTEN: u8 = 2;
+const CMD_OPT: u8 = 4;
+/// パスのソケットでファイルの決まりに渡す許し (NET_FS_PERMS)
+const NET_FS_PERMS: u32 = MAY_SEND | MAY_RECEIVE | MAY_CREATE | MAY_SHUTDOWN | MAY_CONNECT | 0x80 | MAY_SETATTR | MAY_GETATTR | MAY_CHMOD | MAY_CHOWN | 0x4000 | MAY_LOCK | 0x2_0000;
+
+/// 決まりを見るプロファイル (label が None ならいまのプロセス、Some ならそのラベル (相手のソケットのもの))
+fn subject(label: Option<&Option<Label>>) -> Option<Rc<Profile>> {
+    match label {
+        None => current_profile(),
+        Some(l) => label_profile(l.as_ref()).1,
     }
+}
+
+/// aa_match_to_prot (p なし: protocol までいつも): unix、type、protocol
+fn unix_prot(d: &Dfa, st: u32, typ: u32, protocol: u32, info: &mut Option<&'static str>) -> u32 {
+    let be = |v: u32| (v as u16).to_be_bytes();
+    let st = d.match_len(st, &be(1));
+    if st == DFA_NOMATCH {
+        *info = Some("failed af match");
+        return st;
+    }
+    let st = d.match_len(st, &be(typ));
+    if st == DFA_NOMATCH {
+        *info = Some("failed type match");
+        return st;
+    }
+    let st = d.match_len(st, &be(protocol));
+    if st == DFA_NOMATCH {
+        *info = Some("failed protocol match");
+    }
+    st
+}
+
+/// match_addr: 名前 (抽象名は頭の \0 から) か、無名なら \x01。それから区切り
+fn unix_addr(d: &Dfa, st: u32, addr: Option<&[u8]>) -> u32 {
+    let st = match addr {
+        Some(a) => d.match_len(st, a.get(2..).unwrap_or(&[])),
+        None => d.match_len(st, b"\x01"),
+    };
+    d.step(st, 0)
+}
+
+/// match_to_local: (unix, type, protocol)、自分の名前、自分のラベル (いまは区切りだけ)
+fn unix_local(d: &Dfa, st: u32, typ: u32, protocol: u32, addr: Option<&[u8]>, info: &mut Option<&'static str>) -> u32 {
+    let st = unix_prot(d, st, typ, protocol, info);
+    if st == DFA_NOMATCH {
+        return st;
+    }
+    let st = unix_addr(d, st, addr);
+    if st == DFA_NOMATCH {
+        *info = Some("failed local address match");
+        return st;
+    }
+    let st = d.step(st, 0);
+    if st == DFA_NOMATCH {
+        *info = Some("failed local label match");
+    }
+    st
+}
+
+/// match_to_cmd: 自分のところのあとに cmd (addr、listen、opt)
+fn unix_cmd(d: &Dfa, st: u32, sk: &UnixSk, cmd: u8, info: &mut Option<&'static str>) -> u32 {
+    let st = unix_local(d, st, sk.typ, sk.protocol, sk.addr, info);
+    if st == DFA_NOMATCH {
+        return st;
+    }
+    let st = d.step(st, cmd);
+    if st == DFA_NOMATCH {
+        *info = Some("failed cmd selection match");
+    }
+    st
+}
+
+/// AF_UNIX の記録: addr= (bind の名前か、ソケットの名前か、作るときは none)、相手のことなら peer_addr=、v9 の相手の
+/// ラベルの決まりなら peer=
+fn unix_audit(addr: Option<&[u8]>, request: u32, peer_addr: Option<&[u8]>, peer: Option<&str>) -> NetAudit {
+    let mut post = unix_addr_audit("addr", addr);
+    if request & NET_PEER_MASK != 0 {
+        post.push_str(&unix_addr_audit("peer_addr", peer_addr));
+    }
+    if let Some(l) = peer {
+        post.push_str(&format!(" peer={}", untrusted(l)));
+    }
+    NetAudit { pre: String::new(), post }
+}
+
+/// unix_fs_perm: パスのソケットはファイルの決まりで (NET_FS_PERMS の分だけ。ファイルの決まりのないプロファイルは見ない)
+fn unix_fs_perm(p: &Profile, op: &str, request: u32, path: &str, ouid: u32) -> Result<(), i64> {
+    if p.file.dfa.is_none() || p.file_start() == DFA_NOMATCH {
+        return Ok(());
+    }
+    path_perm_for(p, op, path, request & NET_FS_PERMS, false, ouid)
+}
+
+/// socket(AF_UNIX) を作れるか (profile_create_perm)
+pub fn unix_create(typ: u32, protocol: u32) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let none = || NetAudit { pre: String::new(), post: " addr=none".into() };
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, "create", MAY_CREATE, 1, typ, protocol, &none);
+    }
+    let mut info = None;
+    let st = unix_prot(d, v9, typ, protocol, &mut info);
+    net_check(&p, st, info, "create", MAY_CREATE, 1, typ, protocol, &none)
+}
+
+/// ソケットへの op (getsockname、getpeername、shutdown など: profile_sk_perm)。label は None ならいまのプロセス
+pub fn unix_sk_perm(label: Option<&Option<Label>>, op: &str, request: u32, sk: &UnixSk) -> Result<(), i64> {
+    let Some(p) = subject(label) else { return Ok(()) };
+    let audit = || unix_audit(sk.addr, request, None, None);
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, op, request, 1, sk.typ, sk.protocol, &audit);
+    }
+    if let Some((path, uid)) = sk.fs {
+        return unix_fs_perm(&p, op, request, path, uid);
+    }
+    let mut info = None;
+    let st = unix_local(d, v9, sk.typ, sk.protocol, sk.addr, &mut info);
+    net_check(&p, st, info, op, request, 1, sk.typ, sk.protocol, &audit)
+}
+
+/// bind (profile_bind_perm): パスの名前は mknod で見るので、ここでは抽象名と autobind
+pub fn unix_bind(sk: &UnixSk, addr: &[u8]) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let audit = || unix_audit(Some(addr), MAY_BIND, None, None);
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, "bind", MAY_BIND, 1, sk.typ, sk.protocol, &audit);
+    }
+    if addr.len() > 2 && addr[2] != 0 {
+        return Ok(());
+    }
+    let mut info = None;
+    let st = unix_local(d, v9, sk.typ, sk.protocol, Some(addr), &mut info);
+    net_check(&p, st, info, "bind", MAY_BIND, 1, sk.typ, sk.protocol, &audit)
+}
+
+/// listen (profile_listen_perm): cmd の listen のあとに backlog (16 ビット)
+pub fn unix_listen(sk: &UnixSk, backlog: u32) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let audit = || unix_audit(sk.addr, MAY_LISTEN, None, None);
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, "listen", MAY_LISTEN, 1, sk.typ, sk.protocol, &audit);
+    }
+    if let Some((path, uid)) = sk.fs {
+        return unix_fs_perm(&p, "listen", MAY_LISTEN, path, uid);
+    }
+    let mut info = None;
+    let mut st = unix_cmd(d, v9, sk, CMD_LISTEN, &mut info);
+    if st != DFA_NOMATCH {
+        st = d.match_len(st, &(backlog as u16).to_be_bytes());
+        if st == DFA_NOMATCH {
+            info = Some("failed listen backlog match");
+        }
+    }
+    net_check(&p, st, info, "listen", MAY_LISTEN, 1, sk.typ, sk.protocol, &audit)
+}
+
+/// accept (profile_accept_perm)
+pub fn unix_accept(sk: &UnixSk) -> Result<(), i64> {
+    unix_sk_perm(None, "accept", MAY_ACCEPT, sk)
+}
+
+/// getsockopt / setsockopt (profile_opt_perm): cmd の opt のあとに optname (16 ビット)
+pub fn unix_opt(op: &str, request: u32, sk: &UnixSk, optname: u32) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let audit = || unix_audit(sk.addr, request, None, None);
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, op, request, 1, sk.typ, sk.protocol, &audit);
+    }
+    if let Some((path, uid)) = sk.fs {
+        return unix_fs_perm(&p, op, request, path, uid);
+    }
+    let mut info = None;
+    let mut st = unix_cmd(d, v9, sk, CMD_OPT, &mut info);
+    if st != DFA_NOMATCH {
+        st = d.match_len(st, &(optname as u16).to_be_bytes());
+        if st == DFA_NOMATCH {
+            info = Some("failed sockopt match");
+        }
+    }
+    net_check(&p, st, info, op, request, 1, sk.typ, sk.protocol, &audit)
+}
+
+/// 相手のあること (profile_peer_perm: connect、dgram の送る・受ける)。label (None はいまのプロセス) の決まりで、sk から
+/// peer (相手のソケット、そのラベルは peer_label) への request。どちらかがパスの名前ならファイルの決まりで (相手が先)
+pub fn unix_peer(label: Option<&Option<Label>>, op: &str, request: u32, sk: &UnixSk, peer: &UnixSk, peer_label: Option<&Label>) -> Result<(), i64> {
+    let Some(p) = subject(label) else { return Ok(()) };
+    let (pname, _) = label_profile(peer_label);
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    if v9 == DFA_NOMATCH {
+        return af_perm(&p, op, request, 1, sk.typ, sk.protocol, &|| unix_audit(sk.addr, request, peer.addr, None));
+    }
+    if let Some((path, uid)) = peer.fs.or(sk.fs) {
+        return unix_fs_perm(&p, op, request, path, uid);
+    }
+    let mut info = None;
+    let mut st = unix_cmd(d, v9, sk, CMD_ADDR, &mut info);
+    if st != DFA_NOMATCH {
+        st = unix_addr(d, st, peer.addr);
+        if st == DFA_NOMATCH {
+            info = Some("failed peer address match");
+        }
+    }
+    // match_label: 相手のラベルの名前
+    if st != DFA_NOMATCH {
+        st = d.match_len(st, pname.as_bytes());
+        if st == DFA_NOMATCH {
+            info = Some("failed peer label match");
+        }
+    }
+    net_check(&p, st, info, op, request, 1, sk.typ, sk.protocol, &|| unix_audit(sk.addr, request, peer.addr, Some(&pname)))
 }
 
 /// いまのプロセスに決まりがあり、net を見るか (af_inet.c の label_mediates(label, AA_CLASS_NET): 番地の確かめもこのときだけ)
@@ -2868,6 +3103,9 @@ pub const FEATURES: &[(&str, &str)] = &[
     ("file/mask", "create read write exec append mmap_exec link lock"),
     ("network_v8/af_mask", AF_MASK),
     ("network_v8/tcp-fast-open", "yes"),
+    ("network_v9/af_mask", AF_MASK),
+    ("network_v9/af_unix", "yes"),
+    ("network_v9/tcp-fast-open", "yes"),
     ("policy/set_load", "yes"),
     ("policy/versions/v5", "yes"),
     ("policy/versions/v6", "yes"),

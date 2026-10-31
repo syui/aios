@@ -23,6 +23,13 @@ network_v8 {af_mask {unspec unix inet ax25 ipx appletalk netrom bridge atmpvc x2
 tcp-fast-open {yes
 }
 }
+network_v9 {af_mask {unspec unix inet ax25 ipx appletalk netrom bridge atmpvc x25 inet6 rose netbeui security key netlink packet ash econet atmsvc rds sna irda pppox wanpipe llc ib mpls can tipc bluetooth iucv rxrpc isdn phonet ieee802154 caif alg nfc vsock kcm qipcrtr smc xdp mctp
+}
+af_unix {yes
+}
+tcp-fast-open {yes
+}
+}
 policy {set_load {yes
 }
 versions {v5 {yes

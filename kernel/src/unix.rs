@@ -236,6 +236,8 @@ pub struct Unix {
     pub label: Option<crate::apparmor::Label>,
     /// socket(2) の protocol (0 か PF_UNIX。AppArmor の決まりの 3 つめ)
     protocol: u8,
+    /// パスの名前で bind したもののパス (AppArmor のファイルの決まり: Linux の u->path)
+    fs_path: Option<Rc<str>>,
 }
 
 pub type UnixRef = Arc<UnixCell>;
@@ -414,6 +416,7 @@ fn new_sock(typ: u8) -> UnixRef {
         epolled: false,
         label: crate::apparmor::current_label(),
         protocol: 0,
+        fs_path: None,
     }));
     let all = ALL.get();
     if all.len() >= 64 && all.len() >= 2 * *ALL_LIVE.get() {
@@ -424,53 +427,64 @@ fn new_sock(typ: u8) -> UnixRef {
     u
 }
 
-// ---- AppArmor (af_unix.c。network_v8 なので、どれも (unix, type, protocol) の決まりで見る) ----
+// ---- AppArmor (af_unix.c: apparmor.rs の unix_*。v9 の決まりなら名前と相手のラベルまで、パスの名前のソケットは
+// ファイルの決まりで) ----
 
-/// 記録: 自分の名前か bind の名前 (addr=)、相手の名前 (peer_addr=: 相手のことを問うとき)。Linux 7.3 で見た形
-fn aa_audit(name: Option<&[u8]>, addr: Option<&[u8]>, request: u32, peer: Option<&[u8]>) -> crate::apparmor::NetAudit {
-    use crate::apparmor::*;
-    let mut post = unix_addr_audit("addr", addr.or(name));
-    if request & NET_PEER_MASK != 0 {
-        post.push_str(&unix_addr_audit("peer_addr", peer));
-    }
-    NetAudit { pre: String::new(), post }
+/// AppArmor に見せるもの (型、protocol、名前、パスの名前のソケットならそのパスとファイルの持ち主)
+struct AaSk {
+    typ: u32,
+    protocol: u32,
+    addr: Option<Rc<Vec<u8>>>,
+    fs: Option<(Rc<str>, u32)>,
 }
 
-fn aa_of(u: &UnixRef) -> (u32, u32, Option<Rc<Vec<u8>>>) {
+impl AaSk {
+    fn sk(&self) -> crate::apparmor::UnixSk<'_> {
+        crate::apparmor::UnixSk { typ: self.typ, protocol: self.protocol, addr: self.addr.as_deref().map(|v| &v[..]), fs: self.fs.as_ref().map(|(p, u)| (&**p, *u)) }
+    }
+}
+
+fn aa_of(u: &UnixRef) -> AaSk {
     let s = u.borrow();
-    (s.typ as u32, s.protocol as u32, s.addr.clone())
+    let fs = s.addr.as_ref().filter(|a| a.len() > 2 && a[2] != 0).and(s.fs_path.clone()).map(|p| (p, s.inode.as_ref().map_or(0, |i| i.meta().uid)));
+    AaSk { typ: s.typ as u32, protocol: s.protocol as u32, addr: s.addr.clone(), fs }
 }
 
-/// いまのプロセスの決まりで、このソケットへの op (bind の名前は addr。aa_unix_sock_perm、aa_unix_bind_perm など)
-pub fn aa_perm(u: &UnixRef, op: &str, request: u32, addr: Option<&[u8]>) -> Result<(), i64> {
-    let (typ, proto, name) = aa_of(u);
-    crate::apparmor::net_perm(op, request, AF_UNIX as u32, typ, proto, &|| aa_audit(name.as_deref().map(|v| &v[..]), addr, request, None))
+/// いまのプロセスの決まりで、このソケットへの op (getsockname、getpeername、shutdown: aa_unix_sock_perm)
+pub fn aa_perm(u: &UnixRef, op: &str, request: u32) -> Result<(), i64> {
+    crate::apparmor::unix_sk_perm(None, op, request, &aa_of(u).sk())
 }
 
-/// aa_unix_peer_perm: label (None はいまのプロセス) の決まりで、sk から相手 peer への op
-fn aa_peer(label: Option<&Option<crate::apparmor::Label>>, sk: &UnixRef, peer: &UnixRef, op: &str, request: u32) -> Result<(), i64> {
-    let (typ, proto, name) = aa_of(sk);
-    let pname = peer.borrow().addr.clone();
-    let audit = || aa_audit(name.as_deref().map(|v| &v[..]), None, request, pname.as_deref().map(|v| &v[..]));
-    match label {
-        None => crate::apparmor::net_perm(op, request, AF_UNIX as u32, typ, proto, &audit),
-        Some(l) => crate::apparmor::label_net_perm(l.as_ref(), op, request, AF_UNIX as u32, typ, proto, &audit),
-    }
+/// bind (aa_unix_bind_perm)
+pub fn aa_bind(u: &UnixRef, addr: &[u8]) -> Result<(), i64> {
+    crate::apparmor::unix_bind(&aa_of(u).sk(), addr)
 }
 
-/// パスの名前で bind したもの (is_unix_fs)
-fn aa_is_fs(u: &UnixRef) -> bool {
-    u.borrow().addr.as_ref().is_some_and(|a| a.len() > 2 && a[2] != 0)
+/// listen (aa_unix_listen_perm。backlog は somaxconn までにしたもの)
+pub fn aa_listen(u: &UnixRef, backlog: u32) -> Result<(), i64> {
+    crate::apparmor::unix_listen(&aa_of(u).sk(), backlog)
+}
+
+/// accept (aa_unix_accept_perm)
+pub fn aa_accept(u: &UnixRef) -> Result<(), i64> {
+    crate::apparmor::unix_accept(&aa_of(u).sk())
+}
+
+/// getsockopt / setsockopt (aa_unix_opt_perm)
+pub fn aa_opt(u: &UnixRef, op: &str, request: u32, optname: u32) -> Result<(), i64> {
+    crate::apparmor::unix_opt(op, request, &aa_of(u).sk(), optname)
 }
 
 /// stream をつなぐ (unix_connect_perm): 自分は CONNECT SEND RECEIVE、相手がパスの名前でなければ、相手のソケットの
 /// ラベルの決まりでも ACCEPT SEND RECEIVE (後のしくじりのほうを返す)
 fn aa_connect(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
     use crate::apparmor::*;
-    let mut r = aa_peer(None, u, other, "connect", MAY_CONNECT | MAY_SEND | MAY_RECEIVE);
-    if !aa_is_fs(other) {
-        let l = other.borrow().label.clone();
-        if let Err(e) = aa_peer(Some(&l), other, u, "connect", MAY_ACCEPT | MAY_SEND | MAY_RECEIVE) {
+    let (a, b) = (aa_of(u), aa_of(other));
+    let ol = other.borrow().label.clone();
+    let mut r = unix_peer(None, "connect", MAY_CONNECT | MAY_SEND | MAY_RECEIVE, &a.sk(), &b.sk(), ol.as_ref());
+    if b.fs.is_none() {
+        let me = current_label();
+        if let Err(e) = unix_peer(Some(&ol), "connect", MAY_ACCEPT | MAY_SEND | MAY_RECEIVE, &b.sk(), &a.sk(), me.as_ref()) {
             r = Err(e);
         }
     }
@@ -481,10 +495,12 @@ fn aa_connect(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
 /// 後のしくじりのほうを返す: xcheck)
 fn aa_may_send(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
     use crate::apparmor::*;
-    let a = aa_peer(None, u, other, "sendmsg", MAY_SEND);
-    let l = other.borrow().label.clone();
-    let b = aa_peer(Some(&l), other, u, "sendmsg", MAY_RECEIVE);
-    if b.is_err() { b } else { a }
+    let (a, b) = (aa_of(u), aa_of(other));
+    let ol = other.borrow().label.clone();
+    let x = unix_peer(None, "sendmsg", MAY_SEND, &a.sk(), &b.sk(), ol.as_ref());
+    let me = current_label();
+    let y = unix_peer(Some(&ol), "sendmsg", MAY_RECEIVE, &b.sk(), &a.sk(), me.as_ref());
+    if y.is_err() { y } else { x }
 }
 
 // ---- skb の大きさ (Linux 7.3 arm64 で測ったもの) ----
@@ -647,7 +663,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
         // Linux の unix_bind_bsd: 名前のファイルを先に作り (あれば EADDRINUSE)、もう名前があれば消して EINVAL
         let (path, name) = bsd_name(a);
         let mode = u.borrow().mode;
-        let (ino, parent, last) = crate::sysfile::bind_sock(&path, mode)?;
+        let (ino, parent, last, full) = crate::sysfile::bind_sock(&path, mode)?;
         if u.borrow().addr.is_some() {
             crate::sysfile::unbind_sock(&parent, &last);
             return Err(crate::why::inval());
@@ -656,6 +672,7 @@ pub fn bind(u: &UnixRef, a: &[u8]) -> R {
         let mut s = u.borrow_mut();
         s.addr = Some(Rc::new(name));
         s.inode = Some(ino);
+        s.fs_path = Some(Rc::from(full.as_str()));
         return Ok(0);
     }
     let (net, typ) = {
@@ -758,6 +775,7 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
         es.peercred = Some(me());
         es.addr = o.addr.clone();
         es.inode = o.inode.clone();
+        es.fs_path = o.fs_path.clone();
         es.passcred = o.passcred;
         es.passrights = o.passrights;
         es.has_file = false;

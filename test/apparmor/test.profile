@@ -71,16 +71,17 @@ profile aanet {
   network unix dgram,
 }
 
-# unix の stream を作って listen するだけ (受けられない: つないでくる相手もこの決まりで止まる)
+# unix の stream を作って listen するだけ (受けられない: つないでくる相手もこの決まりで止まる)。
+# network unix ... と書くと、v9 のパーサは unix のすべてを許す決まりも足すので、unix の決まりで書く
 profile aanetl {
   /proc/*/attr/current r,
-  network (create, bind, listen) unix stream,
+  unix (create, bind, listen) type=stream,
 }
 
 # unix の dgram を作って bind するだけ (受けられない: 送ってくる相手もこの決まりで止まる)
 profile aanetd {
   /proc/*/attr/current r,
-  network (create, bind) unix dgram,
+  unix (create, bind) type=dgram,
 }
 
 # シグナルと ptrace: usr1 だけ送れる (だれにでも)、だれからでも受けられる。/proc で見られる (ptrace の read) のは
@@ -102,4 +103,25 @@ profile aamnt {
   mount fstype=tmpfs -> /tmp/aatest/m1/,
   mount options=(nosuid) fstype=tmpfs -> /tmp/aatest/m3/,
   umount /tmp/aatest/m1/,
+}
+
+# AF_UNIX の細かい決まり (network_v9 の af_unix): 抽象名 @aaunix-s で listen して受けられる、そこへつなげる、
+# aaunix どうしなら送り受けできる。dgram は @aaunix-d で受けられ、そこへ送れる。パスのソケットはファイルの決まりで
+profile aaunix {
+  /proc/*/attr/current r,
+  /tmp/aatest/sock rw,
+  unix (create) type=stream,
+  unix (bind, listen, accept, getattr) type=stream addr=@aaunix-s,
+  unix (connect, send, receive) type=stream peer=(addr=@aaunix-s),
+  unix (send, receive, accept) type=stream addr=@aaunix-s peer=(label=aaunix),
+  # bind は @aaunix-? ならよいが、@aaunix-x だけは deny で止める
+  unix (bind) type=stream addr=@aaunix-?,
+  deny unix (bind) type=stream addr=@aaunix-x,
+  # @aaunix-y は番地はあうがラベルがちがう (相手は決まりのないもの)
+  unix (connect, send, receive) type=stream peer=(addr=@aaunix-y, label=aaunix),
+  unix (create) type=dgram,
+  unix (bind, send, receive) type=dgram addr=@aaunix-d,
+  unix (send) type=dgram peer=(addr=@aaunix-d),
+  # 決まりのないもの (@aaunix-z) へは送れる
+  unix (send) type=dgram peer=(label=unconfined),
 }

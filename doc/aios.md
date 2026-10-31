@@ -471,7 +471,7 @@ AppArmor のプロファイル (文字で書いた決まり) は、Linux と同�
 (kernel/src/apparmor.rs、securityfs.rs)。バイナリのほどき方は Linux 7.3 の policy_unpack.c と同じ (型の印のついた値の
 並び)、ファイルの決まりは DFA (match.c。表は big endian) で、パスを通してたどりついた状態の許しを見る。apparmor_parser は
 カーネルが名のること (apparmor/features) を読んで形を選ぶので、aios は v5〜v7 の版と、ファイル (create read write exec
-append mmap_exec link lock)、capability (caps/mask)、ネットワーク (network_v8)、signal、ptrace、mount、change_hat、
+append mmap_exec link lock)、capability (caps/mask)、ネットワーク (network_v8 と network_v9 の af_unix)、signal、ptrace、mount、change_hat、
 change_profile と change_onexec を名のる。すると許しを DFA の accept の表にうめこんだ古い
 形で作るので、policy_compat.c と同じく読むときに許しの表へ移す (持ち主のときとほかのときの 2 つ組)。表は読むときに
 みな確かめる (状態と行き先が表の中、差分の鎖がまわっていない、許しの番号が表の中: Linux の paranoid_load と同じ)。
@@ -527,13 +527,22 @@ capability ではない (ファイルの持ち主と許し) のでそのまま�
 (read と write も)、getsockname と getpeername、sockopt、shutdown を、(family、type、protocol) の DFA で見る (socket(2) の
 ときは family と型の範囲のあと、その family があるかより先: aios にない AF_INET6 なども EACCES)。features で名のると
 apparmor_parser はどのプロファイルにも net の印を入れるので、ネットワークの決まりのないプロファイルはソケットをみな
-止められる (Linux と同じ)。AF_UNIX は network_v9 (相手の名前やラベルの細かい決まり) を名のらないので、Linux 7.3 と同じく
-v8 の形にもどり、stream をつなぐときは自分が connect send receive、相手 (パスの名前でなければ) のソケットのラベルの決まりで
-accept send receive、dgram を送るときは自分が send、相手のソケットのラベルで receive を見る (ソケットは作ったプロセスの
-ラベルを持ち、受けた口は listen しているもののラベル)。AF_INET の番地は、決まりのあるときだけ af_inet.c と同じに確かめて
-(短いものは EINVAL、ほかの family は EAFNOSUPPORT) 記録に出す (laddr lport faddr fport saddr src daddr dest)。記録は
-`apparmor="DENIED" operation="sendmsg" class="net" ... family="inet" sock_type="dgram" protocol=17 requested="send"
-denied="send"` (AF_UNIX は addr= と peer_addr=)。
+止められる (Linux と同じ)。stream をつなぐときは自分が connect send receive、相手 (パスの名前でなければ) のソケットの
+ラベルの決まりで accept send receive、dgram を送るときは自分が send、相手のソケットのラベルで receive を見る (ソケットは
+作ったプロセスのラベルを持ち、受けた口は listen しているもののラベル)。AF_INET の番地は、決まりのあるときだけ af_inet.c と
+同じに確かめて (短いものは EINVAL、ほかの family は EAFNOSUPPORT) 記録に出す (laddr lport faddr fport saddr src daddr dest)。
+記録は `apparmor="DENIED" operation="sendmsg" class="net" ... family="inet" sock_type="dgram" protocol=17 requested="send"
+denied="send"` (AF_UNIX は addr= と peer_addr= と peer=)。
+
+AF_UNIX (af_unix.c の network_v9): features で af_unix を名のるので、apparmor_parser 5.0 からは unix の決まり
+(`unix (bind, listen) type=stream addr=@NAME,` や `unix (send) type=dgram peer=(addr=@NAME, label=NAME),`) を v9 の形で作る。
+作るのは (family、type、protocol) まで、bind accept getattr shutdown は自分の番地 (抽象名は \0 から、名前のない
+ものは \x01) とラベルまで、listen と sockopt はそのあとの cmd (listen は backlog、sockopt は optname の 2 バイトも)、connect と
+送る受けるは cmd 1 のあとの相手の番地と、相手のラベルの名前まで DFA をたどる (しくじったところが info に)。パスの名前の
+ソケットは unix の決まりでなくファイルの決まりで見る (bind は mknod と同じ作る、connect はソケットのパスへ w と r など:
+unix_fs_perm)。v9 の印のないプロファイル (network_v9 を知らない apparmor_parser で作ったもの) は v8 の形のまま。
+apparmor_parser 5.0 は `network unix stream,` からも unix のすべてを許す決まりを作るので、AF_UNIX を細かく止めたいときは
+unix の決まりで書く (4.0 などの古いものは、反対に unix の決まりを network unix に書きおろし、deny の unix の決まりは落とす)。
 
 signal (ipc.c): kill と tgkill で、uid のたしかめ (EPERM) のあと、送る側の決まりで相手のラベルの名前へ send、受ける側の
 決まりで送る側へ receive (両方見る。だめなら EACCES)。シグナルの番号は Linux の表で (0 は exists、リアルタイムは rtmin+N)。
@@ -554,8 +563,8 @@ network、signal、ptrace、mount の記録の形は、Linux 7.3.1 で同じこ�
 Linux とちがうところ (まだないもの): complain で exec の許しがないとき、Linux は学ぶための空のプロファイルに移るが、
 aios はいまのプロファイルのまま (complain で、ない hat に change_hat したときも、Linux は学ぶための hat を作って入るが、
 aios は記録して ENOENT)。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
-rlimit、dbus、io_uring、userns、mqueue の決まりと network_v9 (AF_UNIX の細かい決まり) はまだで、features でも名のらない
-(ソケットのラベルが変わったときの見なおし (aa_sock_file_perm) もまだ)。capability の
+rlimit、dbus、io_uring、userns、mqueue の決まりと network_v9 の af_inet (AF_INET の番地の決まり) はまだで、features でも
+名のらない (ソケットのラベルが変わったときの見なおし (aa_sock_file_perm) もまだ)。capability の
 DFA の決まり (caps/extended) も名のらない (apparmor_parser は古い 64 ビットの組で作る)。mprotect と、exec のときに開いた
 ままのファイルを見なおすこともまだ。
 
@@ -564,13 +573,15 @@ binfmt_elf の mmap で r と m が要る。決まりのないプロセスが開
 ところの先で SIGSEGV。aios も同じに、exec の行き先のプロファイルで r と m を見て (exec_map_ok)、だめなら file_mmap の
 DENIED を記録して、exec のあとで SIGSEGV を送る。ふつうのプロファイルが abstractions/base で ld.so の mr を持つのはこのため。
 
-新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh がこのマシンの apparmor_parser 4.0.1 で blob.h に) を
+新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh が apparmor_parser 5.0 で、aios の features をそのまま abi に
+して blob.h に。4.0 は network_v9 の af_unix を知らない) を
 読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・truncate・flock・
 exec (ix px cx ux、許しのないもの、行き先で写せないもの)・change_profile の 40 の答えをくらべ、capability を chown
 だけ許すプロファイル (aacap) と complain で、ほかの人の 0600 のファイルを読む・書く・chmod、chown、mknod、setuid と capget
 の 18 の答えと、change_hat (hat に入る・兄弟へ・帰る、いくつも、token ちがいの SIGKILL、ない hat、hat でないもの、
 hat のないプロファイル) の 22 の答えと、LSM のシステムコールの 11 の答え、ネットワーク (aanet: 24 と、相手の側の
-決まり 3)、signal と ptrace (aasig: 13)、mount (aamnt: 11。読むだけのマウントはしない: aios はそれがあるとロックなしの作る・消すを使わなくなり、あとの
+決まり 3)、AF_UNIX (aaunix: 番地、cmd、相手の番地とラベル、deny、パスのソケットの 24)、signal と ptrace (aasig: 13)、
+mount (aamnt: 11。読むだけのマウントはしない: aios はそれがあるとロックなしの作る・消すを使わなくなり、あとの
 ctests が変わる) の答えをくらべ、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイル
 を外す (unconfined にもどる) のを確かめる。答えは Linux で見たもの:
 test/linux.config に AppArmor を入れ (プロファイルを読まなければ、どのプロセスにも決まりはない)、test/linux-vm.sh の

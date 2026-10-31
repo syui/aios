@@ -335,6 +335,9 @@ fn aa_create(domain: u64, t: u64, protocol: u64) -> Result<(), i64> {
         return Ok(());
     }
     let fam = if domain == AF_INET && t == 10 { 17 } else { domain };
+    if fam == AF_UNIX {
+        return crate::apparmor::unix_create(t as u32, protocol as u32);
+    }
     let audit = || crate::apparmor::NetAudit { pre: alloc::string::String::new(), post: if fam == AF_UNIX { " addr=none".into() } else { alloc::string::String::new() } };
     crate::apparmor::net_perm("create", crate::apparmor::MAY_CREATE, fam as u32, t as u32, protocol as u32, &audit)
 }
@@ -346,7 +349,7 @@ fn aa_sk(s: &Sock, op: &str, request: u32, remote: Option<&[u8]>) -> Result<(), 
         return Ok(());
     }
     match s {
-        Sock::Unix(_, u) => crate::unix::aa_perm(u, op, request, None),
+        Sock::Unix(_, u) => crate::unix::aa_perm(u, op, request),
         Sock::Inet(_, u) => aa_inet(u, op, request, remote),
         Sock::Smol(s) => {
             let t = if s.borrow().proto == Proto::Raw { 3 } else { 2 };
@@ -661,7 +664,7 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
                 if !(2..=110).contains(&a.len()) {
                     return Err(crate::why::inval());
                 }
-                crate::unix::aa_perm(&u, "bind", crate::apparmor::MAY_BIND, Some(&a))?;
+                crate::unix::aa_bind(&u, &a)?;
             }
             crate::unix::bind(&u, &a)
         }
@@ -707,7 +710,10 @@ fn aa_bind_addr(a: &[u8]) -> Result<(), i64> {
 /// listen: backlog は (unsigned で) somaxconn まで
 pub fn listen(fd: u64, backlog: u64) -> R {
     let s = sock(fd)?;
-    aa_sk(&s, "listen", crate::apparmor::MAY_LISTEN, None)?;
+    match &s {
+        Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_listen(u, (backlog as u32).min(crate::unix::SOMAXCONN))?,
+        _ => aa_sk(&s, "listen", crate::apparmor::MAY_LISTEN, None)?,
+    }
     match s {
         Sock::Unix(_, u) => crate::unix::listen(&u, (backlog as u32).min(crate::unix::SOMAXCONN)),
         Sock::Inet(_, u) => crate::inet::listen(&u, backlog),
@@ -725,7 +731,10 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
     }
     let s = sock(fd)?;
     // AppArmor: 受けるのを待つ前に (security_socket_accept)
-    aa_sk(&s, "accept", crate::apparmor::MAY_ACCEPT, None)?;
+    match &s {
+        Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_accept(u)?,
+        _ => aa_sk(&s, "accept", crate::apparmor::MAY_ACCEPT, None)?,
+    }
     match s {
         Sock::Unix(f, u) => {
             let n = crate::unix::accept(&f, &u)?;
@@ -887,7 +896,10 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SO_TYPE: u64 = 3;
     let s = sock(fd)?;
     // AppArmor: 長さを読む前に (do_sock_getsockopt)
-    aa_sk(&s, "getsockopt", crate::apparmor::MAY_GETOPT, None)?;
+    match &s {
+        Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_opt(u, "getsockopt", crate::apparmor::MAY_GETOPT, opt as u32)?,
+        _ => aa_sk(&s, "getsockopt", crate::apparmor::MAY_GETOPT, None)?,
+    }
     let pt = proc::current().pt();
     let mut l = [0u8; 4];
     pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
@@ -1147,7 +1159,10 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     if len < 0 {
         return Err(crate::why::inval());
     }
-    aa_sk(&s, "setsockopt", crate::apparmor::MAY_SETOPT, None)?;
+    match &s {
+        Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_opt(u, "setsockopt", crate::apparmor::MAY_SETOPT, opt as u32)?,
+        _ => aa_sk(&s, "setsockopt", crate::apparmor::MAY_SETOPT, None)?,
+    }
     let mut b = vec![0u8; (len as usize).min(64)];
     match s {
         Sock::Unix(_, u) => {

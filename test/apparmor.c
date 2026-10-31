@@ -313,6 +313,80 @@ static void hats(void) {
 #undef L
 }
 
+// 抽象名の sockaddr_un (長さは名前まで)
+static socklen_t abstract(struct sockaddr_un *a, const char *name) {
+  memset(a, 0, sizeof *a);
+  a->sun_family = AF_UNIX;
+  memcpy(a->sun_path + 1, name, strlen(name));
+  return offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+}
+
+// aaunix の中で (argv[1] が unix): AF_UNIX の細かい決まり (network_v9)。1 行に「名前 答え」
+static int unixchild(void) {
+  if (puts_("/proc/self/attr/current", "changeprofile aaunix"))
+    return 2;
+#define U(name, v) printf("%s %d\n", name, v)
+  struct sockaddr_un a, b;
+  struct sockaddr_un n;
+  socklen_t al = abstract(&a, "aaunix-s"), bl;
+  int one = 1, t;
+  socklen_t tl = sizeof t;
+  int l = socket(AF_UNIX, SOCK_STREAM, 0);
+  U("uni-create", l < 0 ? errno : 0);
+  U("uni-bind", e(bind(l, (struct sockaddr *)&a, al)));
+  int x = socket(AF_UNIX, SOCK_STREAM, 0);
+  bl = abstract(&b, "aaunix-x");
+  U("uni-bind-other", e(bind(x, (struct sockaddr *)&b, bl)));
+  int w = socket(AF_UNIX, SOCK_STREAM, 0);
+  socklen_t wl = abstract(&n, "aaunix-w");
+  U("uni-bind-w", e(bind(w, (struct sockaddr *)&n, wl)));
+  U("uni-listen", e(listen(l, 4)));
+  socklen_t nl = sizeof n;
+  U("uni-getname", e(getsockname(l, (struct sockaddr *)&n, &nl)));
+  U("uni-setopt", e(setsockopt(l, SOL_SOCKET, SO_PASSCRED, &one, sizeof one)));
+  U("uni-getopt", e(getsockopt(l, SOL_SOCKET, SO_TYPE, &t, &tl)));
+  int c = socket(AF_UNIX, SOCK_STREAM, 0);
+  U("uni-connect", e(connect(c, (struct sockaddr *)&a, al)));
+  int k = accept(l, NULL, NULL);
+  U("uni-accept", k < 0 ? errno : 0);
+  U("uni-connect-other", e(connect(x, (struct sockaddr *)&b, bl)));
+  U("uni-listen-other", e(listen(x, 4)));
+  U("uni-getname-other", e(getsockname(x, (struct sockaddr *)&n, &nl)));
+  nl = sizeof n;
+  U("uni-getname-anon", e(getsockname(c, (struct sockaddr *)&n, &nl)));
+  // 決まりのない外のもの: @aaunix-y で listen、@aaunix-z の dgram
+  int y = socket(AF_UNIX, SOCK_STREAM, 0);
+  bl = abstract(&b, "aaunix-y");
+  U("uni-connect-y", e(connect(y, (struct sockaddr *)&b, bl)));
+  int z = socket(AF_UNIX, SOCK_DGRAM, 0);
+  bl = abstract(&b, "aaunix-z");
+  U("uni-dgram-send-z", e(sendto(z, "x", 1, 0, (struct sockaddr *)&b, bl)));
+  // dgram
+  int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+  bl = abstract(&b, "aaunix-d");
+  U("uni-dgram-bind", e(bind(d, (struct sockaddr *)&b, bl)));
+  int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+  U("uni-dgram-send", e(sendto(s, "x", 1, 0, (struct sockaddr *)&b, bl)));
+  char buf[8];
+  U("uni-dgram-recv", e(recv(d, buf, sizeof buf, MSG_DONTWAIT)));
+  U("uni-dgram-send-self", e(sendto(d, "x", 1, 0, (struct sockaddr *)&b, bl)));
+  int sv[2];
+  U("uni-dgrampair", e(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)));
+  U("uni-seqpacket", socket(AF_UNIX, SOCK_SEQPACKET, 0) < 0 ? errno : 0);
+  // パスのソケット: 外で bind した /tmp/aatest/sock へ (ファイルの決まりの rw)
+  struct sockaddr_un p = {.sun_family = AF_UNIX};
+  strcpy(p.sun_path, D "/sock");
+  int f = socket(AF_UNIX, SOCK_STREAM, 0);
+  U("uni-fs-connect", e(connect(f, (struct sockaddr *)&p, sizeof p)));
+  // ファイルの決まりのない /tmp/aatest/sock2 へは (相手は決まりのないもの)
+  strcpy(p.sun_path, D "/sock2");
+  int f2 = socket(AF_UNIX, SOCK_STREAM, 0);
+  U("uni-fs-connect-other", e(connect(f2, (struct sockaddr *)&p, sizeof p)));
+  fflush(stdout);
+#undef U
+  return 0;
+}
+
 // aamnt の中で (argv[1] が mnt): mount の決まり。m2 には外で tmpfs をかぶせてある
 static int mntchild(void) {
   if (puts_("/proc/self/attr/current", "changeprofile aamnt"))
@@ -602,6 +676,16 @@ static const char *want_mnt[] = {
     "mnt-nofs 19", "mnt-umount 0", "mnt-umount-other 13", "mnt-umount-notmounted 22",
 };
 
+// aaunix: 番地 (@aaunix-s と @aaunix-d)、cmd (setopt / getopt はない)、相手の番地とラベル、deny (@aaunix-x)、パスのソケット
+// (ファイルの決まり)。Linux 7.3.1 (apparmor_parser 5.0 で作ったもの) と同じ
+static const char *want_unix[] = {
+    "uni-create 0", "uni-bind 0", "uni-bind-other 13", "uni-bind-w 0", "uni-listen 0", "uni-getname 0",
+    "uni-setopt 13", "uni-getopt 13", "uni-connect 0", "uni-accept 0", "uni-connect-other 111",
+    "uni-listen-other 13", "uni-getname-other 13", "uni-getname-anon 13", "uni-connect-y 13",
+    "uni-dgram-send-z 0", "uni-dgram-bind 0", "uni-dgram-send 0", "uni-dgram-recv 0", "uni-dgram-send-self 0",
+    "uni-dgrampair 0", "uni-seqpacket 13", "uni-fs-connect 0", "uni-fs-connect-other 13",
+};
+
 // aanet: 決まりにあるソケットだけ (ほかの family、型、許しは EACCES)
 static const char *want_net[] = {
     "net-tcp-create 0", "net-tcp-bind 0", "net-tcp-listen 0", "net-tcp-name 0", "net-tcp-connect 0", "net-tcp-accept 0",
@@ -624,7 +708,7 @@ static const char *want_cap[] = {
 static const char *files[] = {"r", "w", "rw", "a", "deny", "x", "own", "k", "cap", "cap2"};
 static const char *bins[] = {"t", "ix", "px", "cx", "ux", "nox", "pnomap"};
 // テストでできるかもしれないもの
-static const char *made[] = {"ln", "ln2", "new", "out", "d/f", "d/g", "dev0"};
+static const char *made[] = {"ln", "ln2", "new", "out", "d/f", "d/g", "dev0", "sock", "sock2"};
 
 static int copy(const char *from, const char *to) {
   int in = open(from, O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -673,6 +757,7 @@ static void cleanup(void) {
   puts_(AA ".remove", "aanetd");
   puts_(AA ".remove", "aasig");
   puts_(AA ".remove", "aamnt");
+  puts_(AA ".remove", "aaunix");
   const char **lists[] = {files, bins, made};
   size_t ns[] = {sizeof files / sizeof *files, sizeof bins / sizeof *bins, sizeof made / sizeof *made};
   for (int l = 0; l < 3; l++)
@@ -701,6 +786,8 @@ int main(int argc, char **argv) {
     return netchild();
   if (argc > 1 && !strcmp(argv[1], "mnt"))
     return mntchild();
+  if (argc > 1 && !strcmp(argv[1], "unix"))
+    return unixchild();
   if (argc > 1 && (!strcmp(argv[1], "cap") || !strcmp(argv[1], "capc")))
     return capchild(argv[1][3] == 'c');
   if (argc > 1 && !strcmp(argv[1], "attr")) {
@@ -828,6 +915,34 @@ int main(int argc, char **argv) {
   }
   if (fails != bad)
     printf("mnt said:\n%s", out);
+
+  // AF_UNIX の細かい決まり (/tmp/aatest/sock と sock2 は決まりのないこちらで listen)
+  {
+    struct sockaddr_un p = {.sun_family = AF_UNIX};
+    strcpy(p.sun_path, D "/sock");
+    int ps = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(bind(ps, (struct sockaddr *)&p, sizeof p) == 0 && listen(ps, 4) == 0, "sock listen: %d", errno);
+    strcpy(p.sun_path, D "/sock2");
+    int ps2 = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(bind(ps2, (struct sockaddr *)&p, sizeof p) == 0 && listen(ps2, 4) == 0, "sock2 listen: %d", errno);
+    struct sockaddr_un ya, za;
+    socklen_t yl = abstract(&ya, "aaunix-y"), zl = abstract(&za, "aaunix-z");
+    int ys = socket(AF_UNIX, SOCK_STREAM, 0), zs = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(bind(ys, (struct sockaddr *)&ya, yl) == 0 && listen(ys, 4) == 0 && bind(zs, (struct sockaddr *)&za, zl) == 0, "y z: %d", errno);
+    collect(self, "unix", out, sizeof out);
+    close(ps);
+    close(ps2);
+    close(ys);
+    close(zs);
+  }
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_unix / sizeof *want_unix; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_unix[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_unix[i]);
+  }
+  if (fails != bad)
+    printf("unix said:\n%s", out);
 
   // シグナルと ptrace
   sigptrace(out, sizeof out);

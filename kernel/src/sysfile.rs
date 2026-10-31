@@ -1735,7 +1735,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
 /// (fchmod で変わる。はじめは 0777) から umask を引いたもの)。あれば EADDRINUSE (Linux と同じく、前のものが残って
 /// いれば、使う側が unlink してから bind する)。作った inode (ソケットが持っておく: 名前を消されても、つなぐ相手は
 /// この inode で見つける) と、その親と名前 (unbind_sock 用)
-pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String), i64> {
+pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String, String), i64> {
     const EADDRINUSE: i64 = 98;
     let p = last_at(AT_FDCWD, path)?;
     new_name(&p).map_err(|e| if e == -EEXIST { -EADDRINUSE } else { e })?;
@@ -1749,7 +1749,7 @@ pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String), 
     let ino = parent.create(&name, mode & 0o7777 & !umask(), NewNode::Sock)?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
-    Ok((ino, parent, name))
+    Ok((ino, parent, name, full))
 }
 
 /// bind_sock で作った名前を消す (もう名前のあるソケットだった: Linux の unix_bind_bsd の vfs_unlink。許可は見ない)
