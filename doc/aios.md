@@ -498,10 +498,20 @@ Linux とちがうところ (まだないもの): complain で exec の許しが
 aios はいまのプロファイルのまま。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
 change_hat、capability、ネットワーク、mount、ptrace、signal、rlimit の決まりはまだで、features でも名のらない
 (capability は root のたしかめを capable() にまとめてから)。mprotect と、exec のときに開いたままのファイルを見なおすこと
-もまだ。新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh がこのマシンの apparmor_parser 4.0.1 で
-blob.h に) を読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・
-truncate・flock・exec (ix px cx ux、許しのないもの)・change_profile の 39 の答えをくらべ、決まりのないプロセスから onexec、
-complain、動いているプロセスのプロファイルを外す (unconfined にもどる) のを確かめる。
+もまだ。
+
+Linux は exec のあと、新しいプロファイルでプログラム (と ld.so) を写すときに見なおす (開いたときのラベルとちがえば
+binfmt_elf の mmap で r と m が要る。決まりのないプロセスが開いたものは、わたされたものとして見ない)。なければ戻れない
+ところの先で SIGSEGV。aios も同じに、exec の行き先のプロファイルで r と m を見て (exec_map_ok)、だめなら file_mmap の
+DENIED を記録して、exec のあとで SIGSEGV を送る。ふつうのプロファイルが abstractions/base で ld.so の mr を持つのはこのため。
+
+新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh がこのマシンの apparmor_parser 4.0.1 で blob.h に) を
+読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・truncate・flock・
+exec (ix px cx ux、許しのないもの、行き先で写せないもの)・change_profile の 40 の答えをくらべ、決まりのないプロセスから
+onexec、complain、動いているプロセスのプロファイルを外す (unconfined にもどる) のを確かめる。答えは Linux で見たもの:
+test/linux.config に AppArmor を入れ (プロファイルを読まなければ、どのプロセスにも決まりはない)、test/linux-vm.sh の
+rootexec で同じプログラムを root で動かすと、Linux 7.3.1 でも同じに通る (はじめは Px と Cx の 2 つだけちがい、上の
+mmap の見なおしだとわかった)。
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
