@@ -475,7 +475,12 @@ append mmap_exec link lock)、capability (caps/mask)、change_hat、change_profi
 形で作るので、policy_compat.c と同じく読むときに許しの表へ移す (持ち主のときとほかのときの 2 つ組)。表は読むときに
 みな確かめる (状態と行き先が表の中、差分の鎖がまわっていない、許しの番号が表の中: Linux の paranoid_load と同じ)。
 .access には「このプロファイルでこの文字列は」を聞ける (libapparmor の aa_query_label)。/sys/module/apparmor/parameters/enabled
-は Y、/sys/kernel/security/lsm は capability,landlock,apparmor (securityfs は起動のときにかぶせる)。
+は Y、/sys/kernel/security/lsm は capability,landlock,apparmor (securityfs は起動のときにかぶせる)。apparmor/policy/ は Linux
+の名前空間のディレクトリと同じ形で、profiles/NAME.N/ に name、mode、attach (子は その下の profiles/。N は読みこんだ順の
+番号で、入れかえても変わらない: aa-status が見る)、namespaces/ と raw_data/ (どちらも空。バイナリはとっておかない)、
+revision と .load .replace .remove がある。Linux 6.8 の LSM のシステムコール lsm_get_self_attr、lsm_set_self_attr、
+lsm_list_modules もある (libapparmor は /proc/self/attr より先にこれを使う。答えるのは AppArmor だけで、中身は
+/proc/self/attr と同じ「名前 (モード)」の改行なし。番号は capability 100、apparmor 104、landlock 110)。
 
 プロセスのラベル (cred の apparmor) は fork で受けつぎ、使うたびにプロファイルを名前で引く (入れかえれば新しいものに、
 外されれば unconfined に: Linux の proxy と同じ)。exec では、決まりのないプロセスならパスでつくもの (attach。いちばん
@@ -534,11 +539,34 @@ DENIED を記録して、exec のあとで SIGSEGV を送る。ふつうのプ�
 exec (ix px cx ux、許しのないもの、行き先で写せないもの)・change_profile の 40 の答えをくらべ、capability を chown
 だけ許すプロファイル (aacap) と complain で、ほかの人の 0600 のファイルを読む・書く・chmod、chown、mknod、setuid と capget
 の 18 の答えと、change_hat (hat に入る・兄弟へ・帰る、いくつも、token ちがいの SIGKILL、ない hat、hat でないもの、
-hat のないプロファイル) の 22 の答えをくらべ、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイル
+hat のないプロファイル) の 22 の答えと、LSM のシステムコールの 11 の答えをくらべ、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイル
 を外す (unconfined にもどる) のを確かめる。答えは Linux で見たもの:
 test/linux.config に AppArmor を入れ (プロファイルを読まなければ、どのプロセスにも決まりはない)、test/linux-vm.sh の
 rootexec で同じプログラムを root で動かすと、Linux 7.3.1 でも同じに通る (はじめは Px と Cx の 2 つだけちがい、上の
 mmap の見なおしだとわかった)。
+
+AppArmor の道具は apparmor のパッケージ (pkg/c/apparmor。AppArmor 5.0.2 の apparmor_parser、aa-status、aa-exec、
+aa-enabled、aa-features-abi、aa-load を静的に /opt/c/bin に。プロファイルを書くための /etc/apparmor.d の abi、tunables、
+abstractions も):
+
+```sh
+sudo ap -S apparmor
+sudo apparmor_parser -r /etc/apparmor.d/NAME     # 書いたプロファイルを読ませる (-R で外す)
+sudo aa-status                                   # どのプロファイルが、どのプロセスにかかっているか
+aa-exec -p NAME -- CMD                           # プロファイルをつけて動かす
+```
+
+/etc/apparmor.d に置いたプロファイルは、起動のたびに apparmor.service (パッケージが入れて有効にする) が
+`apparmor_parser --replace --write-cache -- /etc/apparmor.d` で読む (disable/ に同じ名前のリンクがあるものはとばす)。作った
+バイナリは /var/cache/apparmor に書き、プロファイルとカーネルの features が変わらなければ次からはそれを読む。Linux の
+apparmor.service と同じく Before=sysinit.target で、aios の init は Before=sysinit.target のものをほかのサービスより先に
+起こして終わるのを待つので、サービスのプロセスにもパスでつくプロファイルがかかる (init は Before=X を X の After= として
+も読む)。作るときに直したところ: libapparmor の af_protos.h は標準入力の <netinet/in.h> を $(CC) -E で見るが、Zig の cc は
+標準入力ではこのマシンの /usr/include を読む (musl にない IPPROTO_L2TP が入る) のでファイルにして先に作る、共用体の中の
+可変長の配列 (GCC だけのもの) を定数の長さに、apparmor_parser の .c は C++ なので -x c++ で、configure.ac が autoconf-archive
+から使う AX_CHECK_COMPILE_FLAG はパッケージに入れた。カーネルのほうでは /proc/PID/fd/N のリンクの大きさを Linux と同じ 64 に
+した (0 だと、libapparmor の path_from_fd が lstat の大きさから readlink を始めて足りなければ倍にするので、0 のまま回り
+つづけ、--write-cache が止まっていた)。
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 

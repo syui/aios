@@ -430,7 +430,15 @@ fn main() {
     let enabled = unit::enabled();
     println!("aios init: {} units, {} enabled", init.svcs.len(), enabled.len());
     init.pending = enabled.iter().cloned().collect();
-    for n in &enabled {
+    // Before=sysinit.target のもの (AppArmor のプロファイルを読む apparmor.service など) を先に。oneshot は終わるまで待つ
+    let (early, rest): (Vec<String>, Vec<String>) = enabled.iter().cloned().partition(|n| init.svcs.get(n).is_some_and(|s| unit::early(&s.unit)));
+    for n in &early {
+        if let Err(e) = init.start(n, 0) {
+            println!("init: {}", e);
+        }
+        init.wait_oneshot(n);
+    }
+    for n in &rest {
         if let Err(e) = init.start(n, 0) {
             println!("init: {}", e);
         }

@@ -832,6 +832,8 @@ pub struct Profile {
     pub policy: Rc<Pdb>,
     pub file: Rc<Pdb>,
     pub data: Vec<(String, Vec<u8>)>,
+    /// securityfs の policy/profiles/ のディレクトリの番号 (読みこんだときに。入れかえても同じ: Linux の ns の uniq_id)
+    pub uniq: u64,
 }
 
 impl Profile {
@@ -1034,7 +1036,7 @@ fn unpack_profile(e: &mut Ext, info: &mut &'static str) -> Result<Profile, (i64,
         *info = "failed to unpack end of profile";
         return Err(named(-EPROTO));
     }
-    let mut p = Profile { name, rename, attach, xmatch, xmatch_len, disconnected, signal, flags, mode, audit_all: audit != 0, path_flags, caps, xattrs, rlimits, policy, file, data };
+    let mut p = Profile { name, rename, attach, xmatch, xmatch_len, disconnected, signal, flags, mode, audit_all: audit != 0, path_flags, caps, xattrs, rlimits, policy, file, data, uniq: 0 };
     // verify_profile
     let ok = Rc::get_mut(&mut p.file).is_none_or(|f| f.verify()) && Rc::get_mut(&mut p.policy).is_none_or(|f| f.verify()) && p.xmatch.verify();
     if !ok {
@@ -1119,9 +1121,11 @@ struct Ns {
     /// 読みこんだ順 (Linux はリストの頭に足すので、見せるのは新しいものから)
     profiles: Vec<Rc<Profile>>,
     revision: u64,
+    /// 次のプロファイルの uniq
+    next_uniq: u64,
 }
 
-static NS: Bkl<Ns> = Bkl::new(Ns { profiles: Vec::new(), revision: 1 });
+static NS: Bkl<Ns> = Bkl::new(Ns { profiles: Vec::new(), revision: 1, next_uniq: 0 });
 
 /// 名前でプロファイルを
 pub fn find(name: &str) -> Option<Rc<Profile>> {
@@ -1144,8 +1148,15 @@ pub fn load(data: &[u8], replace: bool) -> Result<usize, i64> {
         }
     }
     ns.revision += 1;
-    for p in new {
+    for mut p in new {
         let old = ns.profiles.iter().position(|o| o.name == p.name);
+        p.uniq = match old {
+            Some(i) => ns.profiles[i].uniq,
+            None => {
+                ns.next_uniq += 1;
+                ns.next_uniq - 1
+            }
+        };
         audit_status(if old.is_some() { "profile_replace" } else { "profile_load" }, Some(&p.name), None, 0);
         let rename = p.rename.clone();
         match old {
@@ -1209,6 +1220,62 @@ pub fn profiles_text() -> Result<String, i64> {
 
 pub fn revision() -> u64 {
     NS.get().revision
+}
+
+/// 階層の名前の終わり ("親//子" の子)
+fn base_name(p: &Profile) -> &str {
+    p.name.rsplit("//").next().unwrap_or(&p.name)
+}
+
+/// policy/profiles/ の中: parent (None は頭。番号) のすぐ下のプロファイルの (ディレクトリの名前, 番号)。名前は Linux の
+/// mangle_name (頭の / と . を落とし、/ は .、空白は _、英数字と ._- のほかは消す) に ".番号"
+pub fn profile_dirs(parent: Option<u64>) -> Vec<(String, u64)> {
+    let ns = NS.get();
+    let up = match parent {
+        Some(u) => match ns.profiles.iter().find(|p| p.uniq == u) {
+            Some(p) => Some(p.name.clone()),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let mangle = |s: &str| -> String {
+        s.trim_start_matches(['/', '.'])
+            .chars()
+            .filter_map(|c| match c {
+                '/' => Some('.'),
+                c if c.is_ascii_whitespace() => Some('_'),
+                c if c.is_ascii_alphanumeric() || "._-".contains(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    };
+    ns.profiles
+        .iter()
+        .rev()
+        .filter(|p| p.name.rfind("//").map(|i| &p.name[..i]) == up.as_deref())
+        .map(|p| (format!("{}.{}", mangle(base_name(p)), p.uniq), p.uniq))
+        .collect()
+}
+
+/// policy/profiles/NAME.N/ のファイル: name (階層の名前の終わり)、mode、attach (つけるパス。DFA だけなら <unknown>、
+/// なければ名前)。プロファイルがなければ None
+pub fn profile_file(uniq: u64, file: &str) -> Option<String> {
+    let p = NS.get().profiles.iter().find(|p| p.uniq == uniq).cloned()?;
+    Some(match file {
+        "name" => format!("{}\n", base_name(&p)),
+        "mode" => format!("{}\n", p.mode_name()),
+        _ => match (&p.attach, &p.xmatch.dfa) {
+            (Some(a), _) => format!("{}\n", a),
+            (None, Some(_)) => "<unknown>\n".into(),
+            (None, None) => format!("{}\n", base_name(&p)),
+        },
+    })
+}
+
+/// 番号のプロファイルがあるか、子があるか
+pub fn profile_exists(uniq: u64) -> Option<bool> {
+    let p = NS.get().profiles.iter().find(|p| p.uniq == uniq).cloned()?;
+    Some(has_children(&p))
 }
 
 /// .access の問い (aa_write_access): "label\0NAME\0Q"、"profile\0..."、"labelall\0..."。答えは
@@ -2087,6 +2154,149 @@ pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
         }
     }
     Ok(b.len())
+}
+
+// ---- LSM のシステムコール (Linux 6.8 から: security/lsm_syscalls.c と security.c。libapparmor は /proc/self/attr より先に使う) ----
+
+const LSM_ID_CAPABILITY: u64 = 100;
+const LSM_ID_APPARMOR: u64 = 104;
+const LSM_ID_LANDLOCK: u64 = 110;
+const LSM_ATTR_CURRENT: u32 = 100;
+const LSM_ATTR_EXEC: u32 = 101;
+const LSM_ATTR_PREV: u32 = 104;
+const LSM_FLAG_SINGLE: u32 = 1;
+const E2BIG: i64 = 7;
+const EFAULT: i64 = 14;
+/// struct lsm_ctx の頭 (id、flags、len、ctx_len。どれも u64)
+const LSM_CTX: usize = 32;
+
+fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
+    crate::proc::current().pt().copy_in(b, va).ok_or(-EFAULT)
+}
+
+fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
+    crate::proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
+}
+
+fn get_u32(va: usize) -> Result<u32, i64> {
+    let mut b = [0u8; 4];
+    get_user(va, &mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+/// lsm_list_modules(ids, size, flags): 動いている LSM の番号 (/sys/kernel/security/lsm と同じ順)
+pub fn lsm_list_modules(ids: usize, size: usize, flags: u32) -> Result<i64, i64> {
+    if flags != 0 {
+        return Err(-EINVAL);
+    }
+    let have = get_u32(size)?;
+    let mut v = alloc::vec![LSM_ID_CAPABILITY];
+    if !crate::parts::off(crate::parts::Part::Landlock) {
+        v.push(LSM_ID_LANDLOCK);
+    }
+    if !off() {
+        v.push(LSM_ID_APPARMOR);
+    }
+    let total = (v.len() * 8) as u32;
+    put_user(size, &total.to_le_bytes())?;
+    if have < total {
+        return Err(-E2BIG);
+    }
+    for (i, id) in v.iter().enumerate() {
+        put_user(ids + i * 8, &id.to_le_bytes())?;
+    }
+    Ok(v.len() as i64)
+}
+
+/// lsm_get_self_attr(attr, ctx, size, flags): いまのプロセスの current / exec / prev を struct lsm_ctx で (答えるのは
+/// AppArmor だけ: 中身は /proc/self/attr と同じ「名前 (モード)」の改行なし)。ctx が 0 か size が足りなければ、要る大きさを
+/// size に書く (足りなければ E2BIG)。flags の LSM_FLAG_SINGLE なら ctx の id の LSM だけ。答えた LSM の数を返す
+pub fn lsm_get_self_attr(attr: u32, ctx: usize, size: usize, flags: u32) -> Result<i64, i64> {
+    if attr == 0 || size == 0 {
+        return Err(-EINVAL);
+    }
+    let left = get_u32(size)?;
+    let mut single = None;
+    if flags != 0 {
+        if flags != LSM_FLAG_SINGLE || ctx == 0 {
+            return Err(-EINVAL);
+        }
+        let mut b = [0u8; 8];
+        get_user(ctx, &mut b)?;
+        let id = u64::from_le_bytes(b);
+        if id == 0 {
+            return Err(-EINVAL);
+        }
+        single = Some(id);
+    }
+    let (mut total, mut count, mut toobig) = (0u32, 0i64, false);
+    if !off() && single.is_none_or(|id| id == LSM_ID_APPARMOR) {
+        let c = crate::cred::current();
+        // 決まりのないものは unconfined。exec と prev は、なければ ENOENT (apparmor_getselfattr)
+        let label = match attr {
+            LSM_ATTR_CURRENT => Some(c.apparmor.as_ref()),
+            LSM_ATTR_EXEC => Some(Some(c.aa_onexec.as_ref().ok_or(-ENOENT)?)),
+            LSM_ATTR_PREV => Some(Some(c.aa_prev.as_ref().ok_or(-ENOENT)?)),
+            _ => None,
+        };
+        if let Some(l) = label {
+            let text = label_text(l);
+            let v = text.trim_end_matches('\n').as_bytes();
+            // lsm_fill_user_ctx: 頭と中身を 8 バイトにそろえて
+            let len = (LSM_CTX + v.len()).div_ceil(8) * 8;
+            if len as u32 > left {
+                toobig = true;
+            } else {
+                if ctx != 0 {
+                    let mut b = alloc::vec![0u8; len];
+                    for (i, x) in [LSM_ID_APPARMOR, 0, len as u64, v.len() as u64].iter().enumerate() {
+                        b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+                    }
+                    b[LSM_CTX..LSM_CTX + v.len()].copy_from_slice(v);
+                    put_user(ctx, &b)?;
+                }
+                count += 1;
+            }
+            total += len as u32;
+        }
+    }
+    put_user(size, &total.to_le_bytes())?;
+    if toobig {
+        return Err(-E2BIG);
+    }
+    if count == 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    Ok(count)
+}
+
+/// lsm_set_self_attr(attr, ctx, size, flags): ctx の id の LSM に current か exec を書く (AppArmor なら
+/// /proc/self/attr に書くのと同じ "changeprofile NAME" など)
+pub fn lsm_set_self_attr(attr: u32, ctx: usize, size: u32, flags: u32) -> Result<i64, i64> {
+    if flags != 0 || (size as usize) < LSM_CTX {
+        return Err(-EINVAL);
+    }
+    if size > 4096 {
+        return Err(-E2BIG);
+    }
+    let mut b = alloc::vec![0u8; size as usize];
+    get_user(ctx, &mut b)?;
+    let field = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let (id, len, ctx_len) = (field(0), field(2), field(3));
+    let need = (LSM_CTX as u64).checked_add(ctx_len);
+    if (size as u64) < len || need.is_none_or(|n| len < n) {
+        return Err(-EINVAL);
+    }
+    if id != LSM_ID_APPARMOR || off() {
+        return Err(-EOPNOTSUPP);
+    }
+    let which = match attr {
+        LSM_ATTR_CURRENT => "current",
+        LSM_ATTR_EXEC => "exec",
+        _ => return Err(-EOPNOTSUPP),
+    };
+    attr_write(which, &b[LSM_CTX..LSM_CTX + ctx_len as usize])?;
+    Ok(0)
 }
 
 // ---- features (apparmor_parser が読んで、それに合う形のバイナリを作る) ----

@@ -6,6 +6,9 @@
 //   apparmor/profiles revision       読みこんだプロファイル (「名前 (モード)」) と、変えた回数
 //   apparmor/.ns_name .ns_level .stacked .ns_stacked
 //   apparmor/features/...            名のること (apparmor.rs の FEATURES。apparmor_parser が読んで形を選ぶ)
+//   apparmor/policy/                 Linux の名前空間のディレクトリ: profiles/NAME.N/{name,mode,attach} (子は その下の
+//                                    profiles/。aa-status が見る)、namespaces/ と raw_data/ (どちらも空)、revision と
+//                                    .load .replace .remove (上のものと同じ。root だけ)
 // apparmor を切ると (aios.off=apparmor)、apparmor/ はなくなる
 use crate::vfs::*;
 use alloc::format;
@@ -21,6 +24,10 @@ const SECURITYFS_MAGIC: u64 = 0x7365_6375;
 
 /// apparmor/ のファイル
 const AA_FILES: [&str; 10] = [".access", ".load", ".ns_level", ".ns_name", ".ns_stacked", ".remove", ".replace", ".stacked", "profiles", "revision"];
+/// apparmor/policy/ のファイル
+const POLICY_FILES: [&str; 4] = [".load", ".remove", ".replace", "revision"];
+/// apparmor/policy/profiles/NAME.N/ のファイル
+const PROF_FILES: [&str; 3] = ["attach", "mode", "name"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Node {
@@ -30,6 +37,15 @@ enum Node {
     AaFile(u8),
     /// features の下 (パス。FEATURES にあればファイル、それで始まるものがあればディレクトリ)
     Feat(&'static str),
+    Policy,
+    PolicyFile(u8),
+    /// policy/namespaces と policy/raw_data (空)
+    PolicyEmpty(bool),
+    /// profiles/ (None は policy/profiles、Some(番号) はそのプロファイルの子の profiles/)
+    Profiles(Option<u64>),
+    /// profiles/NAME.N (プロファイルの番号)
+    Prof(u64),
+    ProfFile(u64, u8),
 }
 
 pub struct SecInode {
@@ -85,12 +101,28 @@ impl SecInode {
             Node::AaFile(i) => 0x10 + i as u64,
             // パスの FNV-1a (ほかと重ならないように上のビットを立てる)
             Node::Feat(p) => (1 << 40) | (p.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) & 0xff_ffff_ffff),
+            Node::Policy => 4,
+            Node::PolicyFile(i) => 0x20 + i as u64,
+            Node::PolicyEmpty(raw) => 5 + raw as u64,
+            Node::Profiles(None) => 7,
+            Node::Profiles(Some(u)) => (2 << 40) | u << 3,
+            Node::Prof(u) => (2 << 40) | u << 3 | 1,
+            Node::ProfFile(u, i) => (2 << 40) | u << 3 | (2 + i as u64),
+        }
+    }
+
+    /// 書く口と読むだけの決まったファイルの名前 (apparmor/ と apparmor/policy/ の)
+    fn file_name(&self) -> Option<&'static str> {
+        match self.node {
+            Node::AaFile(i) => Some(AA_FILES[i as usize]),
+            Node::PolicyFile(i) => Some(POLICY_FILES[i as usize]),
+            _ => None,
         }
     }
 
     fn is_dir(&self) -> bool {
         match self.node {
-            Node::Root | Node::Aa => true,
+            Node::Root | Node::Aa | Node::Policy | Node::PolicyEmpty(_) | Node::Profiles(_) | Node::Prof(_) => true,
             Node::Feat(p) => feat_kind(p) == Some(true),
             _ => false,
         }
@@ -100,6 +132,7 @@ impl SecInode {
         match self.node {
             _ if self.is_dir() => S_IFDIR | 0o755,
             Node::AaFile(i) if matches!(AA_FILES[i as usize], ".access" | ".load" | ".replace" | ".remove") => S_IFREG | 0o666,
+            Node::PolicyFile(i) if POLICY_FILES[i as usize] != "revision" => S_IFREG | 0o640,
             _ => S_IFREG | 0o444,
         }
     }
@@ -116,7 +149,7 @@ impl SecInode {
                 }
                 s
             }
-            Node::AaFile(i) => match AA_FILES[i as usize] {
+            Node::AaFile(_) | Node::PolicyFile(_) => match self.file_name().unwrap_or("") {
                 ".ns_level" => "0\n".into(),
                 ".ns_name" => "root\n".into(),
                 ".ns_stacked" | ".stacked" => "no\n".into(),
@@ -129,6 +162,8 @@ impl SecInode {
                 Some((_, v)) => format!("{}\n", v),
                 None => return Err(-EISDIR),
             },
+            // 外されたあとに読めば ENOENT
+            Node::ProfFile(u, i) => crate::apparmor::profile_file(u, PROF_FILES[i as usize]).ok_or(-ENOENT)?,
             _ => return Err(-EISDIR),
         })
     }
@@ -171,8 +206,7 @@ impl Inode for SecInode {
     }
 
     fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
-        let Node::AaFile(i) = self.node else { return Err(crate::why::inval()) };
-        let name = AA_FILES[i as usize];
+        let Some(name) = self.file_name() else { return Err(crate::why::inval()) };
         if name == ".access" {
             let ans = crate::apparmor::query(b)?;
             *self.answer.borrow_mut() = (ans.into_bytes(), 0);
@@ -192,12 +226,12 @@ impl Inode for SecInode {
     }
 
     fn whole_write(&self) -> bool {
-        matches!(self.node, Node::AaFile(_))
+        self.file_name().is_some()
     }
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // O_TRUNC で開くのは、書く口ならかまわない (echo NAME > .remove)
-        if matches!(self.node, Node::AaFile(_)) { Ok(()) } else { Err(-EACCES) }
+        if self.file_name().is_some() { Ok(()) } else { Err(-EACCES) }
     }
 
     fn readlink(&self) -> Result<String, i64> {
@@ -209,11 +243,18 @@ impl Inode for SecInode {
             Node::Root if name == "lsm" => Node::Lsm,
             Node::Root if name == "apparmor" && aa_on() => Node::Aa,
             Node::Aa if name == "features" => Node::Feat(""),
+            Node::Aa if name == "policy" => Node::Policy,
             Node::Aa => Node::AaFile(AA_FILES.iter().position(|f| *f == name).ok_or(-ENOENT)? as u8),
             Node::Feat(p) if self.is_dir() => {
                 let full = feat_children(p).into_iter().find(|c| c.rsplit('/').next() == Some(name)).ok_or(-ENOENT)?;
                 Node::Feat(full)
             }
+            Node::Policy if name == "profiles" => Node::Profiles(None),
+            Node::Policy if name == "namespaces" || name == "raw_data" => Node::PolicyEmpty(name == "raw_data"),
+            Node::Policy => Node::PolicyFile(POLICY_FILES.iter().position(|f| *f == name).ok_or(-ENOENT)? as u8),
+            Node::Profiles(up) => Node::Prof(crate::apparmor::profile_dirs(up).into_iter().find(|(d, _)| d == name).ok_or(-ENOENT)?.1),
+            Node::Prof(u) if name == "profiles" && crate::apparmor::profile_exists(u) == Some(true) => Node::Profiles(Some(u)),
+            Node::Prof(u) if crate::apparmor::profile_exists(u).is_some() => Node::ProfFile(u, PROF_FILES.iter().position(|f| *f == name).ok_or(-ENOENT)? as u8),
             _ if !self.is_dir() => return Err(-ENOTDIR),
             _ => return Err(-ENOENT),
         };
@@ -238,10 +279,34 @@ impl Inode for SecInode {
                     add(f, Node::AaFile(i as u8));
                 }
                 add("features", Node::Feat(""));
+                add("policy", Node::Policy);
             }
             Node::Feat(p) if self.is_dir() => {
                 for c in feat_children(p) {
                     add(c.rsplit('/').next().unwrap_or(c), Node::Feat(c));
+                }
+            }
+            Node::Policy => {
+                for (i, f) in POLICY_FILES.iter().enumerate() {
+                    add(f, Node::PolicyFile(i as u8));
+                }
+                add("namespaces", Node::PolicyEmpty(false));
+                add("profiles", Node::Profiles(None));
+                add("raw_data", Node::PolicyEmpty(true));
+            }
+            Node::PolicyEmpty(_) => {}
+            Node::Profiles(up) => {
+                for (d, u) in crate::apparmor::profile_dirs(up) {
+                    add(&d, Node::Prof(u));
+                }
+            }
+            Node::Prof(u) => {
+                let Some(kids) = crate::apparmor::profile_exists(u) else { return Err(-ENOENT) };
+                for (i, f) in PROF_FILES.iter().enumerate() {
+                    add(f, Node::ProfFile(u, i as u8));
+                }
+                if kids {
+                    add("profiles", Node::Profiles(Some(u)));
                 }
             }
             _ => return Err(-ENOTDIR),

@@ -656,7 +656,10 @@ impl Inode for ProcInode {
             _ => S_IFREG | 0o444,
         };
         let now = crate::timer::epoch_ns();
-        Meta { ino: self.ino(), mode, nlink: 1, uid, gid, size: 0, rdev: 0, blocks: 0, mtime: now, ctime: now }
+        // /proc/PID/fd/N のリンクは大きさ 64 (Linux の proc_fd_instantiate。libapparmor の path_from_fd などは lstat の
+        // 大きさから readlink を始めて、足りなければ倍にする: 0 だと 0 のまま回りつづける)
+        let size = if matches!(self.node, Node::Fd(..)) { 64 } else { 0 };
+        Meta { ino: self.ino(), mode, nlink: 1, uid, gid, size, rdev: 0, blocks: 0, mtime: now, ctime: now }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {

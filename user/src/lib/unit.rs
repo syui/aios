@@ -26,6 +26,9 @@ pub struct Unit {
     pub path: String,
     pub description: String,
     pub after: Vec<String>,
+    /// Before=: 相手の After= に足す (load_all)。sysinit.target なら、起動でほかのものより先に起こして終わるのを待つ
+    /// (systemd では、ふつうのサービスはみな sysinit.target のあと: AppArmor のプロファイルを読むものなど)
+    pub before: Vec<String>,
     pub wants: Vec<String>,
     pub typ: Type,
     pub exec_start: Vec<String>,
@@ -123,6 +126,7 @@ pub fn parse(name: &str, path: &str, text: &str) -> Unit {
         path: path.to_string(),
         description: one("Unit.Description"),
         after: many("Unit.After"),
+        before: many("Unit.Before"),
         wants,
         typ: if one("Service.Type") == "oneshot" { Type::Oneshot } else { Type::Simple },
         exec_start: split_words(&exec),
@@ -189,7 +193,19 @@ pub fn load_all() -> BTreeMap<String, Unit> {
         }
         out.insert(name.clone(), parse(&name, &path, &text));
     }
+    // A の Before=B は B の After=A
+    let pairs: Vec<(String, String)> = out.values().flat_map(|u| u.before.iter().map(move |b| (b.clone(), u.name.clone()))).collect();
+    for (b, a) in pairs {
+        if let Some(u) = out.get_mut(&b).filter(|u| !u.after.contains(&a)) {
+            u.after.push(a);
+        }
+    }
     out
+}
+
+/// 起動でほかのものより先に起こすか (Before=sysinit.target)
+pub fn early(u: &Unit) -> bool {
+    u.before.iter().any(|b| b == "sysinit.target")
 }
 
 /// multi-user.target.wants にあるもの

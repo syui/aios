@@ -1,7 +1,8 @@
 // AppArmor (kernel/src/apparmor.rs) のたしかめ: test/apparmor/test.profile (gen.sh が apparmor_parser で作った blob.h) を
 // /sys/kernel/security/apparmor/.replace で読み、このプログラムの写し /tmp/aatest/t (aatest がパスでつく) に、決まりの
 // 中から open、作る・消す、rename、link、chmod、truncate、flock、exec (ix px cx ux) と change_profile をためさせる。
-// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
+// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。LSM のシステムコール (lsm_get_self_attr
+// など) でも読み書きする。aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
 // プロファイルを外す (unconfined にもどる)。
 // root で動かす (でなければ sudo -n でもう一度)。AppArmor のついた Linux でも同じに通ること
 #define _GNU_SOURCE
@@ -159,6 +160,56 @@ static int capchild(int complain) {
   return 0;
 }
 
+// LSM のシステムコール (Linux 6.8 から。aarch64 も同じ番号) と struct lsm_ctx
+#define NR_LSM_GET 459
+#define NR_LSM_SET 460
+#define NR_LSM_LIST 461
+struct lctx {
+  unsigned long long id, flags, len, ctx_len;
+  char ctx[200];
+};
+
+// lsm_get_self_attr(attr) の答え: "数 id ctx_len 中身" か "ERR errno"
+static void lsm_get(const char *name, int attr) {
+  struct lctx c = {0};
+  unsigned size = sizeof c;
+  long r = syscall(NR_LSM_GET, attr, &c, &size, 0);
+  if (r < 0)
+    printf("%s ERR %d\n", name, errno);
+  else
+    printf("%s %ld %llu %llu %.*s\n", name, r, c.id, c.ctx_len, (int)c.ctx_len, c.ctx);
+}
+
+// 大きさだけを問う (ctx なし)、足りない大きさ、ひとつの LSM だけ (flags の LSM_FLAG_SINGLE)
+static void lsm_sizes(void) {
+  unsigned size = 4096;
+  long r = syscall(NR_LSM_GET, 100, NULL, &size, 0);
+  printf("lsm-null %ld %u\n", r, size);
+  struct lctx c = {0};
+  size = 8;
+  r = syscall(NR_LSM_GET, 100, &c, &size, 0);
+  printf("lsm-small %ld %d %u\n", r, r < 0 ? errno : 0, size);
+  c.id = 100; // capability は答えない
+  size = sizeof c;
+  r = syscall(NR_LSM_GET, 100, &c, &size, 1);
+  printf("lsm-single-cap %ld %d\n", r, r < 0 ? errno : 0);
+  memset(&c, 0, sizeof c);
+  c.id = 104;
+  size = sizeof c;
+  r = syscall(NR_LSM_GET, 100, &c, &size, 1);
+  printf("lsm-single-aa %ld %.*s\n", r, (int)c.ctx_len, c.ctx);
+}
+
+// lsm_set_self_attr で AppArmor に s を書く (attr/current に書くのと同じ)
+static int lsm_set(int attr, const char *s) {
+  struct lctx c = {0};
+  c.id = 104;
+  c.ctx_len = strlen(s);
+  c.len = (32 + c.ctx_len + 7) / 8 * 8;
+  memcpy(c.ctx, s, c.ctx_len);
+  return syscall(NR_LSM_SET, attr, &c, (unsigned)c.len, 0) < 0 ? errno : 0;
+}
+
 // /proc/self/attr/current に n バイト書く (changehat は hat を \0 で区切って続けられる)
 static int hatw(const char *s, size_t n) { return put("/proc/self/attr/current", s, n); }
 #define HAT(s) hatw(s, strlen(s))
@@ -190,6 +241,7 @@ static void hats(void) {
     printf("hat-open-w %d\nhat-open-r %d\n", op_open(D "/w", O_RDONLY), op_open(D "/r", O_RDONLY));
     printf("hat-sibling %d\n", HAT("changehat 1234^hat2"));
     L("hat-cur2", "/proc/self/attr/current");
+    lsm_get("lsm-hatprev", 104);
     printf("hat-out %d\n", HAT("changehat 1234^"));
     L("hat-back", "/proc/self/attr/current");
     L("hat-prev2", "/proc/self/attr/prev");
@@ -236,6 +288,19 @@ static void hats(void) {
   if ((k = fork()) == 0) {
     puts_("/proc/self/attr/current", "changeprofile aachild");
     printf("hat-nohats %d\n", HAT("changehat 1234^x"));
+    fflush(stdout);
+    _exit(0);
+  }
+  waitpid(k, NULL, 0);
+  // LSM のシステムコール
+  lsm_get("lsm-cur", 100);
+  lsm_get("lsm-exec", 101);
+  lsm_get("lsm-prev", 104);
+  lsm_sizes();
+  if ((k = fork()) == 0) {
+    printf("lsm-set %d\n", lsm_set(100, "changeprofile aachild"));
+    L("lsm-set-cur", "/proc/self/attr/current");
+    printf("lsm-set-hat %d\n", lsm_set(102, "changehat 1^x"));
     fflush(stdout);
     _exit(0);
   }
@@ -308,7 +373,10 @@ static const char *want[] = {
     "hat-open-w 0", "hat-open-r 13", "hat-sibling 0", "hat-cur2 aatest//hat2 (enforce)", "hat-out 0",
     "hat-back aatest (enforce)", "hat-prev2 ERR 22", "hat-none 2", "hat-nothat 1", "hat-zero 22", "hat-junk 22",
     "hat-noprev 0", "hat-perm 0", "hat-perm-cur aatest (enforce)", "hat-vec 0", "hat-vec-cur aatest//hat1 (enforce)",
-    "hat-badtoken SIG 9", "hat-badtoken2 SIG 9", "hat-nohats 10",
+    "hat-badtoken SIG 9", "hat-badtoken2 SIG 9", "hat-nohats 10", "lsm-hatprev 1 104 16 aatest (enforce)",
+    "lsm-cur 1 104 16 aatest (enforce)", "lsm-exec ERR 2", "lsm-prev ERR 2", "lsm-null 1 48", "lsm-small -1 7 48",
+    "lsm-single-cap -1 95", "lsm-single-aa 1 aatest (enforce)", "lsm-set 0", "lsm-set-cur aachild (enforce)",
+    "lsm-set-hat 95",
 };
 
 // aacap: chown のほかの root の力はない (capget にも chown だけ)。complain なら記録して通す
@@ -482,6 +550,21 @@ int main(int argc, char **argv) {
 
   // 決まりのないプロセスには hat がない
   CHECK(HAT("changehat 1^hat1") == EPERM, "unconfined changehat is EPERM");
+
+  // 動いている LSM: capability がはじめ、AppArmor もある。決まりのないものは unconfined
+  unsigned long long ids[16] = {0};
+  unsigned isz = sizeof ids;
+  long nl = syscall(NR_LSM_LIST, ids, &isz, 0);
+  int has_aa = 0;
+  for (long i = 0; i < nl; i++)
+    has_aa |= ids[i] == 104;
+  CHECK(nl >= 2 && isz == nl * 8 && ids[0] == 100 && has_aa, "lsm_list_modules %ld %u %llu", nl, isz, ids[0]);
+  isz = 8;
+  CHECK(syscall(NR_LSM_LIST, ids, &isz, 0) == -1 && errno == E2BIG && isz == nl * 8, "lsm_list_modules small");
+  struct lctx uc = {0};
+  unsigned usz = sizeof uc;
+  long ur = syscall(NR_LSM_GET, 100, &uc, &usz, 0);
+  CHECK(ur == 1 && uc.id == 104 && uc.ctx_len == 10 && !memcmp(uc.ctx, "unconfined", 10) && usz == 48, "lsm_get_self_attr unconfined %ld %llu %u", ur, uc.ctx_len, usz);
 
   // complain: 決まりの外も読める
   c = fork();

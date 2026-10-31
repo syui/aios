@@ -1,0 +1,83 @@
+# apparmor: AppArmor の道具 (aios のカーネルの AppArmor: kernel/src/apparmor.rs、doc/aios.md)。静的なバイナリで /opt/c に入る
+#   apparmor_parser: 文字で書いたプロファイルをバイナリにして /sys/kernel/security/apparmor/.replace などに読ませる
+#     (カーネルが名のること (features) に合う形で。-r で入れかえ、-R で外す、ディレクトリを渡せば中のものをみな)
+#   aa-status (どのプロファイルがどのモードで、どのプロセスにかかっているか)、aa-exec (プロファイルをつけて動かす)、
+#   aa-enabled、aa-features-abi、aa-load (前に作ったバイナリを読ませる)
+#   プロファイルを書くための /etc/apparmor.d の abi、tunables、abstractions も入れる (Linux のディストリビューションの
+#   アプリのプロファイルは入れない。ここに置いたプロファイルは、起動のたびに apparmor.service (入れると有効) が読む)
+#   libapparmor は静的に (apparmor_parser と aa-* の中に)。Python / Perl / Ruby の束ねと utils (aa-genprof などの Python) はなし
+pkgname=apparmor
+pkgver=5.0.2
+pkgrel=1
+pkgdesc='AppArmor userspace: apparmor_parser, aa-status, aa-exec and the base of /etc/apparmor.d (static, for aios)'
+arch=('aarch64')
+url='https://apparmor.net/'
+license=('GPL-2.0-only' 'LGPL-2.1-or-later')
+backup=('etc/apparmor/parser.conf')
+source=("apparmor-v$pkgver.tar.gz::https://gitlab.com/apparmor/apparmor/-/archive/v$pkgver/apparmor-v$pkgver.tar.gz"
+        ax_check_compile_flag.m4
+        apparmor.service)
+sha256sums=('bef45f228c0bde2f80d9630084e56bd8020b3fc4dfa7ee48a6aca585bb5ea0ed'
+            'SKIP'
+            'SKIP')
+
+prepare() {
+  rm -rf "apparmor-v$pkgver"
+  tar -xzf "apparmor-v$pkgver.tar.gz"
+  # configure.ac が autoconf-archive から使うのはこれだけ (作るマシンに autoconf-archive がなくてもよいように。
+  # autogen.sh の aclocal は -I m4 なしなので、いつも読む acinclude.m4 に)
+  cp ax_check_compile_flag.m4 "apparmor-v$pkgver/libraries/libapparmor/acinclude.m4"
+  # 共用体の中の可変長の配列は GCC だけのもの (clang は作れない)。長さは定数 (sizeof(struct lsm_ctx) + 8) なので、そう書く
+  local k=apparmor-v$pkgver/libraries/libapparmor/src/kernel.c
+  sed -i 's/char buff\[total_size\]; \/\* force allocate trailing space \*\//char buff[sizeof(struct lsm_ctx) + 8];/' "$k"
+  grep -q 'char buff\[sizeof(struct lsm_ctx) + 8\];' "$k"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zstd
+  local top=$srcdir/apparmor-v$pkgver
+  cd "$top/libraries/libapparmor"
+  ./autogen.sh
+  ./configure --host=aarch64-linux-musl --prefix="$PREFIX" --disable-shared --enable-static --disable-man-pages \
+    --without-python --without-perl --without-ruby
+  # af_protos.h: Makefile.am は <netinet/in.h> を標準入力から $(CC) -E で見るが、Zig の cc は標準入力ではこのマシンの
+  # /usr/include を読む (musl にない IPPROTO_L2TP などが入る)。ファイルにして先に作る (あれば make は作りなおさない)
+  printf '#include <netinet/in.h>\n' > protos.c
+  $CC $CPPFLAGS -E -dD protos.c | LC_ALL=C sed -n -e '/IPPROTO_MAX/d' \
+    -e 's/^#define[ \t]\+IPPROTO_\([A-Z0-9_]\+\)\(.*\)$/AA_GEN_PROTO_ENT(\UIPPROTO_\1, "\L\1")/p' > src/af_protos.h
+  make -C src
+  # 静的に: WITH_STATIC_LINKING は -Wl,-Bdynamic -lpthread を足すので、AALIB を渡す (Zig の -static がみな中に入れる)。
+  # CFLAGS などは環境から (コマンドラインで渡すと、parser/libapparmor_re の CXXFLAGS := の -I までかわってしまう)
+  local mk=(CC="$CC" CXX="$CXX" AR="$AR" WITH_STATIC_LINKING=1 V=1)
+  # apparmor_parser の .c は C++ (g++ は .c も C++ として読むが、Zig の c++ は C として読む)。コンパイル (-c) のときだけ
+  # -x c++ をつける。reallocarray があるかは標準入力を ${CPP} で見るので (上と同じくこのマシンの /usr/include になる)、
+  # 言う (musl は 1.2.2 から持つ)
+  printf '#!/bin/sh
+for a; do [ "$a" = -c ] && exec %s -x c++ "$@"; done
+exec %s "$@"
+' "$CXX" "$CXX" > "$srcdir/cxx"
+  chmod +x "$srcdir/cxx"
+  cd "$top/parser"
+  make "${mk[@]}" CXX="$srcdir/cxx" HAVE_REALLOCARRAY=true AALIB="-lapparmor -lzstd -lpthread" apparmor_parser
+  cd "$top/binutils"
+  make "${mk[@]}" AALIB="-lapparmor -lpthread" aa-enabled aa-exec aa-features-abi aa-load aa-status
+}
+
+package() {
+  local top=$srcdir/apparmor-v$pkgver b
+  install -Dm755 "$top/parser/apparmor_parser" "$pkgdir/opt/c/bin/apparmor_parser"
+  for b in aa-enabled aa-exec aa-features-abi aa-load aa-status; do
+    install -Dm755 "$top/binutils/$b" "$pkgdir/opt/c/bin/$b"
+  done
+  install -Dm644 "$top/parser/parser.conf" "$pkgdir/etc/apparmor/parser.conf"
+  local d=$top/profiles/apparmor.d
+  install -d "$pkgdir/etc/apparmor.d"
+  cp -r "$d/abi" "$d/tunables" "$d/abstractions" "$pkgdir/etc/apparmor.d/"
+  install -d "$pkgdir/etc/apparmor.d/local" "$pkgdir/etc/apparmor.d/disable" "$pkgdir/var/cache/apparmor"
+  install -Dm644 "$startdir/apparmor.service" "$pkgdir/usr/lib/systemd/system/apparmor.service"
+  install -d "$pkgdir/etc/systemd/system/multi-user.target.wants"
+  ln -s /usr/lib/systemd/system/apparmor.service "$pkgdir/etc/systemd/system/multi-user.target.wants/apparmor.service"
+  install -Dm644 "$top/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

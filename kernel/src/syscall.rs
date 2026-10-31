@@ -261,6 +261,9 @@ nrs! {
     OPENAT2 = 437,
     FACCESSAT2 = 439,
     FCHMODAT2 = 452,
+    LSM_GET_SELF_ATTR = 459,
+    LSM_SET_SELF_ATTR = 460,
+    LSM_LIST_MODULES = 461,
 }
 
 /// 1 つめの引数が fd のシステムコールで、/proc/bkl がその fd の開いたものの種類 (file::CLASSES) ごとに分けて数えるもの
@@ -437,6 +440,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
         FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
+        LSM_GET_SELF_ATTR => crate::apparmor::lsm_get_self_attr(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as u32),
+        LSM_SET_SELF_ATTR => crate::apparmor::lsm_set_self_attr(a[0] as u32, a[1] as usize, a[2] as u32, a[3] as u32),
+        LSM_LIST_MODULES => crate::apparmor::lsm_list_modules(a[0] as usize, a[1] as usize, a[2] as u32),
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         OPENAT2 => sysfile::openat2(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),

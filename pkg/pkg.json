@@ -11,6 +11,7 @@
   {"name": "aiwm",              "type": "desktop", "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},
   {"name": "alsa-lib",          "type": "c",       "src": "https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",                                             "now": "1.2.16.1",       "latest": "1.2.16.1"},
   {"name": "alsa-utils",        "type": "c",       "src": "https://www.alsa-project.org/files/pub/utils/alsa-utils-1.2.16.tar.bz2",                                           "now": "1.2.16",         "latest": "1.2.16"},
+  {"name": "apparmor",          "type": "c",       "src": "https://gitlab.com/apparmor/apparmor/-/archive/v5.0.2/apparmor-v5.0.2.tar.gz",                                     "now": "5.0.2",          "latest": "5.0.2"},
   {"name": "atk",               "type": "c",       "src": "https://download.gnome.org/sources/atk/2.38/atk-2.38.0.tar.xz",                                                    "now": "2.38.0",         "latest": "2.38.0"},
   {"name": "awk",               "type": "rust",    "src": "git+https://github.com/uutils/awk#commit=1195b2f14dfd922ae713bb38108ebafbafec62d4",                                "now": "0.1.0.20261023", "latest": "commit 1195b2f"},
   {"name": "base",              "type": "rust",    "src": "",                                                                                                                 "now": "0.0.1",          "latest": "(aios)"},

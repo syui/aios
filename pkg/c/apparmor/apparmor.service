@@ -1,0 +1,17 @@
+# apparmor: 起動のたびに /etc/apparmor.d のプロファイルを apparmor_parser でカーネルに読ませる (apparmor のパッケージが
+# 入れて有効にする)。読むのは /etc/apparmor.d のふつうのファイル (abi/ tunables/ abstractions/ local/ などのディレクトリは
+# include されるもので、disable/ に同じ名前のリンクがあるものはとばす)。Linux の apparmor.service と同じく
+# Before=sysinit.target: aios の init はこれをほかのサービスより先に起こして終わるのを待つので、サービスのプロセスにも
+# パスでつくプロファイルがかかる。作ったバイナリは /var/cache/apparmor に書き、プロファイルとカーネルの features が
+# 変わらなければ次からはそれを読む。プロファイルを書きかえたら sudo systemctl restart apparmor (か apparmor_parser -r FILE)
+[Unit]
+Description=Load AppArmor profiles from /etc/apparmor.d
+ConditionPathExists=/sys/kernel/security/apparmor/.replace
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/c/bin/apparmor_parser --replace --write-cache -- /etc/apparmor.d
+
+[Install]
+WantedBy=multi-user.target
