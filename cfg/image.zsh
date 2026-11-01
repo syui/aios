@@ -55,9 +55,11 @@ cp -a "$ROOTFS"/. /mnt/aios/
 
 echo "--- Generating fstab ---"
 genfstab -U /mnt/aios > /mnt/aios/etc/fstab
+sed -i 's/fmask=0022,dmask=0022/fmask=0077,dmask=0077/' /mnt/aios/etc/fstab
 
 echo "--- Installing systemd-boot ---"
-arch-chroot /mnt/aios bootctl install
+arch-chroot /mnt/aios bootctl install --no-variables
+arch-chroot /mnt/aios systemctl enable systemd-boot-update.service
 
 echo "--- Creating boot entry ---"
 ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
@@ -68,6 +70,7 @@ cat > /mnt/aios/boot/loader/loader.conf <<'EOF'
 default aios.conf
 timeout 3
 console-mode max
+editor no
 EOF
 
 cat > /mnt/aios/boot/loader/entries/aios.conf <<EOF
