@@ -48,7 +48,7 @@ jobs:
       any: ${{ steps.v.outputs.any }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7.0.1
 
       - name: Versions
         id: v
@@ -137,7 +137,7 @@ jobs:
       REL: ${{ matrix.rel }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7.0.1
 
       - name: Free disk
         if: matrix.free_disk
@@ -209,7 +209,7 @@ jobs:
       # リリースは別のジョブで作る: ジョブの GITHUB_TOKEN は長いビルド (firefox は 1 時間あまり) のあとでは
       # リリースを作れなかった (HTTP 403 Resource not accessible by integration)
       - name: Keep
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.name }}
           path: release/
@@ -228,7 +228,7 @@ jobs:
       - name: Fetch
         id: get
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           name: ${{ matrix.name }}
           path: release
@@ -256,7 +256,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7.0.1
 
       - name: Move
         env:
