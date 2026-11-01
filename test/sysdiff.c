@@ -296,6 +296,7 @@ static const struct {
     {"select-ebadf", "select / pselect6 で nfds までに開いていない fd のビットがあれば、どの番号でも EBADF (POSIX)。Linux は fd の表の大きさ (はじめは 64) より先のビットを見ずにすてる (select(2) の BUGS)。ロボットは select を使わない (test/chosen.c がたしかめる)"},
     {"lock-deadlock", "fcntl のレコードロックの行きどまりを、輪の長さによらず EDEADLK にする。Linux は 11 たどるとやめるので、13 より多い持ち主の輪は見のがして、みないつまでも待つ (fcntl(2) の BUGS)。ロボットはロックを待たない (test/chosen.c がたしかめる)"},
     {"recvmmsg-timeout", "recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (時間切れで、受けたものがあればその数、なければ EAGAIN)。Linux は datagram を受けたあとにしか見ないので、vlen より少なければいつまでも待つ (recvmmsg(2) の BUGS)。ロボットは recvmmsg を使わない (test/chosen.c がたしかめる)"},
+    {"send-notconn", "一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ書くと ENOTCONN (POSIX。AF_UNIX の stream は Linux でも ENOTCONN)。Linux は EPIPE と SIGPIPE (send(2) の BUGS)"},
     {"apparmor-inet", "AppArmor の network_v9 の af_inet を名のり、ip= と port= の決まりを効かせる (Ubuntu のカーネルの読みかたで、特権の port、deny の決まり、自分の番地の条件のない peer の決まりのまちがいはなおして)。Linux 7.3 は af_inet を名のらないので、apparmor_parser が番地を落として (inet, type) の決まりに広げる。ロボットは AppArmor を見ない (test/apparmor.c がたしかめる)"},
 };
 
@@ -316,7 +317,42 @@ static int on_aios;
 // -r: 手本の Linux のまちがいをたださない (Linux がもう直ったかを見る: -r ありとなしの答えをくらべる)
 static int raw;
 
+// chosen send-notconn: 書く op (write、writev、pwritev2、send、sendfile、splice など) の書く先の fd (なければ -1)
+static int wfd = -1;
+
+// fd が一度もつないでいない TCP か: aios は dport が 0 のもの (connect していない、listen しているもの、connect に
+// しくじったもの、AF_UNSPEC で切ったもの: Linux の inet_dport と同じ)。Linux では、それと同じく 0 にもどる TCP_INFO の
+// 送った segment の数 (tcpi_segs_out。SYN も送っていない) で見る
+static int fresh_tcp(int fd) {
+    int dom = 0, typ = 0;
+    socklen_t l = sizeof dom;
+    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || dom != AF_INET)
+        return 0;
+    l = sizeof typ;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &typ, &l) != 0 || typ != SOCK_STREAM)
+        return 0;
+    if (on_aios)
+        return 1;
+    // struct tcp_info の tcpi_segs_out は 136 バイト目から (glibc の netinet/tcp.h にないことがあるので)
+    unsigned char ti[256];
+    l = sizeof ti;
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, ti, &l) != 0 || l < 140)
+        return 0;
+    uint32_t segs;
+    memcpy(&segs, ti + 136, sizeof segs);
+    return segs == 0;
+}
+
 static void ret(long r) {
+    // chosen send-notconn: 一度もつないでいない TCP へ書くと、aios は ENOTCONN。Linux は EPIPE なので ENOTCONN にしてまねる。
+    // しらべる getsockopt が errno を変えないように (書く先がソケットでなければ ENOTSOCK になる)
+    int e = errno;
+    if (r < 0 && wfd >= 0 && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd)) {
+        errno = ENOTCONN;
+        say(" = ENOTCONN [chosen send-notconn]");
+        return;
+    }
+    errno = e;
     if (r < 0)
         say(" = %s", ename(errno));
     else
@@ -3038,6 +3074,12 @@ static void exec(int i, const struct op *o) {
     struct statfs xsf;
     int xt = xfd >= 0 && fstat(xfd, &xs0) == 0 && S_ISREG(xs0.st_mode) && fstatfs(xfd, &xsf) == 0 && xsf.f_type == K_TMPFS_MAGIC;
     long long wstart = xt ? wstart_of(o, xfd, (long long)xs0.st_size) : 0;
+    // chosen send-notconn: 書く op の書く先 (ret が見る)
+    wfd = -1;
+    if (o->kind == WRITE || o->kind == WRITEV || o->kind == PWRITEV2 || o->kind == SEND)
+        wfd = fd;
+    else if (o->kind == SENDFILE || o->kind == COPYRANGE || o->kind == SPLICE)
+        wfd = fdref(o->d2, o->fb, fd);
     switch (o->kind) {
     case SOCKET:
     case SOCKPAIR:

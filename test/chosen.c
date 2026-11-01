@@ -439,6 +439,27 @@ static void recvmmsg_timeout(void) {
     check("recvmmsg-timeout", n == 2 && ms >= 150 && ms < 800 && to.tv_sec == 0 && to.tv_nsec == 0, n == 2 && ms >= 800, got);
 }
 
+static void send_notconn(void) {
+    // 一度もつないでいない TCP と、listen している TCP へ送る。aios は ENOTCONN (POSIX。AF_UNIX の stream は Linux
+    // でも ENOTCONN)、Linux は EPIPE と SIGPIPE (MSG_NOSIGNAL なので SIGPIPE は来ない)
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    long r = send(s, "x", 1, MSG_NOSIGNAL);
+    int e = errno;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    long r2 = -1;
+    int e2 = 0;
+    if (bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 1) == 0) {
+        r2 = send(l, "x", 1, MSG_NOSIGNAL);
+        e2 = errno;
+    }
+    close(s);
+    close(l);
+    char got[120];
+    snprintf(got, sizeof got, "never connected = %ld %s, listening = %ld %s", r, r < 0 ? strerror(e) : "", r2, r2 < 0 ? strerror(e2) : "");
+    check("send-notconn", r < 0 && e == ENOTCONN && r2 < 0 && e2 == ENOTCONN, r < 0 && e == EPIPE && r2 < 0 && e2 == EPIPE, got);
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -495,6 +516,7 @@ int main(int argc, char **argv) {
             select_ebadf();
             lock_deadlock();
             recvmmsg_timeout();
+            send_notconn();
         }
     }
     if (!on_aios)

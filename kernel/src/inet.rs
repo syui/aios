@@ -1916,7 +1916,9 @@ fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
 }
 
 /// TCP の sendmsg (Linux の tcp_sendmsg_locked): つながるのを待つ (つながっていなければ EPIPE)、付帯データの
-/// エラー、自分のエラーか SEND の shutdown で EPIPE、相手の行列があくまで待つ
+/// エラー、自分のエラーか SEND の shutdown で EPIPE、相手の行列があくまで待つ。aios がえらんだちがい (send-notconn):
+/// 一度もつないでいない (listen しているものも、connect にしくじったものも、AF_UNSPEC で切ったものも) なら ENOTCONN
+/// (POSIX。AF_UNIX の stream は Linux でも ENOTCONN)。Linux は EPIPE と SIGPIPE (send(2) の BUGS)
 fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock: bool) -> R {
     let _p = crate::prof::span("inet:tcp_send");
     let ctl_err = sock_cmsg_check(ctl, true).err();
@@ -1935,6 +1937,10 @@ fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock
             return Err(stream_error(u, flags, e));
         }
         if !matches!(st, St::SynSent | St::SynRecv) {
+            // 相手のポートは connect で決まり、しくじるか切ると 0 にもどる (閉じられたものは残る)
+            if u.borrow().dport == 0 {
+                return Err(-ENOTCONN);
+            }
             return Err(stream_error(u, flags, -EPIPE));
         }
         if nb {
