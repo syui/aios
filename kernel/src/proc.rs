@@ -385,6 +385,8 @@ pub struct Proc {
     pub last_sp: u64,
     /// この tick になったら起こす (0 なら無し)
     wake_at: u64,
+    /// ソケットの受けとりで眠るときの締め切り (tick、0 なら無し。recvmmsg の timeout: socket::mmsg がおく)
+    pub recv_deadline: u64,
     /// 眠りの待ち行列のつなぎ (chan のもの、期限つきのもの)
     wq: Link,
     tm: Link,
@@ -463,6 +465,7 @@ impl Proc {
         last_regs: [0; 3],
         last_sp: 0,
         wake_at: 0,
+        recv_deadline: 0,
         wq: Link::NONE,
         tm: Link::NONE,
         rq: Link::NONE,
@@ -1266,6 +1269,15 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
         return Err(-EINTR);
     }
     Ok(!timed_out)
+}
+
+/// ソケットの受けとりで眠るときの期限: d (tick、0 は無し。SO_RCVTIMEO から) と、いまのスレッドの受けとりの締め切り
+/// (recv_deadline) の早いほう
+pub fn recv_deadline(d: u64) -> u64 {
+    match (current().recv_deadline, d) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
 }
 
 /// chan で眠っている Proc を起こし、起こした数を返す

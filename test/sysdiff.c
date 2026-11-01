@@ -295,6 +295,7 @@ static const struct {
     {"unix-gc-now", "送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じたものなど) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF)。Linux はほかの AF_UNIX のソケットが閉じたときに、うしろ (kworker) で片づけるので、それまで相手からはつながったまま"},
     {"select-ebadf", "select / pselect6 で nfds までに開いていない fd のビットがあれば、どの番号でも EBADF (POSIX)。Linux は fd の表の大きさ (はじめは 64) より先のビットを見ずにすてる (select(2) の BUGS)。ロボットは select を使わない (test/chosen.c がたしかめる)"},
     {"lock-deadlock", "fcntl のレコードロックの行きどまりを、輪の長さによらず EDEADLK にする。Linux は 11 たどるとやめるので、13 より多い持ち主の輪は見のがして、みないつまでも待つ (fcntl(2) の BUGS)。ロボットはロックを待たない (test/chosen.c がたしかめる)"},
+    {"recvmmsg-timeout", "recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (時間切れで、受けたものがあればその数、なければ EAGAIN)。Linux は datagram を受けたあとにしか見ないので、vlen より少なければいつまでも待つ (recvmmsg(2) の BUGS)。ロボットは recvmmsg を使わない (test/chosen.c がたしかめる)"},
     {"apparmor-inet", "AppArmor の network_v9 の af_inet を名のり、ip= と port= の決まりを効かせる (Ubuntu のカーネルの読みかたで、特権の port、deny の決まり、自分の番地の条件のない peer の決まりのまちがいはなおして)。Linux 7.3 は af_inet を名のらないので、apparmor_parser が番地を落として (inet, type) の決まりに広げる。ロボットは AppArmor を見ない (test/apparmor.c がたしかめる)"},
 };
 

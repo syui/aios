@@ -713,12 +713,12 @@ pub fn listen(u: &UnixRef, backlog: u32) -> R {
     Ok(0)
 }
 
-/// 眠る (SO_RCVTIMEO / SO_SNDTIMEO があればそこまで: 時間切れは EAGAIN)
+/// 眠る (SO_RCVTIMEO / SO_SNDTIMEO か、recvmmsg の締め切りがあればそこまで: 時間切れは EAGAIN)
 fn wait(chan: usize, timeo: u64) -> Result<(), i64> {
-    if timeo == 0 {
+    let deadline = proc::recv_deadline(if timeo == 0 { 0 } else { crate::timer::ticks_after(timeo) });
+    if deadline == 0 {
         return proc::sleep(chan);
     }
-    let deadline = crate::timer::ticks_after(timeo);
     if proc::sleep_until(chan, deadline)? { Ok(()) } else { Err(-EAGAIN) }
 }
 

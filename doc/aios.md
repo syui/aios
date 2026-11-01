@@ -1408,6 +1408,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | unix-gc-now | 送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じた、たがいの fd を持ちあって閉じた) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF や ECONNRESET) | ほかの AF_UNIX のソケットが閉じたとき (か、送られている途中のものが多すぎるとき) に、うしろ (kworker) で片づける。それまで輪の中のソケットは生きていて、相手からはつながったまま (読めば EAGAIN、待てばいつまでも) | 答えが、ほかのソケットが閉じたかや、うしろの仕事がいつ走ったかで変わらない。もうだれも使えないソケットに相手が待ちつづけない。ロボットは Linux で、ほかの AF_UNIX のソケットを作って閉じて片づけを起こし、終わるのを待ってまねる |
 | select-ebadf | select と pselect6 で、nfds までに開いていない fd のビットがあれば、どの番号でも EBADF | fd の表の大きさ (はじめは 64、開いた数で増える) より先のビットは見ずにすてる (fd 40 は EBADF、fd 1000 は 0) | POSIX は、開いていない fd があれば EBADF と決めている。答えが fd の表の大きさ (いままでに開いた数) で変わらない。select(2) の BUGS にある。ロボットは select を使わないので test/chosen.c が確かめる |
 | lock-deadlock | fcntl のレコードロック (POSIX どうし) の行きどまりを、輪の長さによらず EDEADLK にする (待っているものの数だけたどる) | 11 たどるとやめる (MAX_DEADLK_ITERATIONS)。13 より多い持ち主の輪は見のがし、みないつまでも待つ | 行きどまりを見つけるのに、長さの決まりはいらない (待っているものは 1 つずつしか待たないので、数だけたどれば止まる)。fcntl(2) の BUGS にある。aios は前は 10 までで、Linux より 1 つ短かった。test/chosen.c が 13 のプロセスの輪で確かめる |
+| recvmmsg-timeout | recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (ソケットの SO_RCVTIMEO と早いほう)。時間切れで、受けたものがあればその数、なければ EAGAIN。待つのは Linux と同じく 1 つずつ (MSG_WAITFORONE なら 2 つ目から待たない)、残りの時間を timeout に書きもどすのも同じ | datagram を受けたあとにしか timeout を見ない。vlen より少なければシグナルが来るまで待つ (timeout 0.3 秒で 1 つも来なくても) | timeout を渡すのは、そこまでで返ってほしいから。recvmmsg(2) の BUGS にある。前の aios は timeout を見ず、2 つ目からいつも待たなかった (Linux とちがう)。test/chosen.c が 3 つのうち 2 つで確かめる |
 | apparmor-inet | AppArmor の network_v9 の af_inet を名のり、`network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の番地の決まりを効かせる (読みかたは apparmor_parser の決まりの形と Ubuntu のカーネルの af_inet.c と同じ。特権の port、deny の決まり、自分の番地の条件のない peer の決まりの 3 つは、Ubuntu の読みかたのまちがいをなおした: 上の「AF_INET」) | af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) の決まりにする (allow は広く許し、deny は広く止める)。af_inet.c は番地を記録に書くだけ | 書いた決まりのとおりに効く (書いたよりも多く許さない、多く止めない)。パーサも Ubuntu のカーネルもこの決まりを持っていて、Linux の本体にまだ入っていないだけ。ロボットは AppArmor を見ないので、test/apparmor.c が両方でたしかめる (aios は番地の答え、Linux は広がった決まりの答えと、features に af_inet がないこと) |
 
 #### 手本の Linux のまちがい
@@ -1430,11 +1431,11 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 BUGS の節 (man2 の 74、man7 の 25 のページ。多くは古い版のことで、もう直っている)、カーネルのソースの TODO と FIXME、
 AppArmor のように Linux の本体の外 (Ubuntu のカーネル、apparmor-next) にあるもの。まだ残っているものは、小さな
 プログラムで Linux 7.3.1 (test/linux-vm.sh exec) と aios の両方で動かしてたしかめる。上の表に入れたもの
-(select-ebadf、lock-deadlock、apparmor-inet、pwrite-append) のほかに、2026-11-01 にたしかめたもの:
+(select-ebadf、lock-deadlock、recvmmsg-timeout、apparmor-inet、pwrite-append) のほかに、2026-11-01 にたしかめたもの:
 
 | もの | Linux 7.3.1 | aios (いま) | どうするか |
 |---|---|---|---|
-| recvmmsg の timeout | datagram を 1 つ受けたあとにしか見ないので、vlen より少なければシグナルが来るまで待つ (recvmmsg(2) の BUGS) | 1 つめのあとは、あるものだけ受けてすぐ返す (いつも MSG_WAITFORONE のよう)。timeout を見ない | 呼び出しの締め切りとして効かせる (vlen そろうか締め切りまで待つ) |
+| recvmmsg で、受けたあとのエラー | 次の呼び出しで返すが、そのあいだの ICMP などで上書きされる (recvmmsg(2) の BUGS) | 捨てる (そこまでの数を返す) | ソケットにとっておいて、次に必ず返す |
 | つないだことのない TCP への send | EPIPE (と SIGPIPE) | Linux と同じ | POSIX の ENOTCONN (send(2) の BUGS)。SIGPIPE で落ちなくなるので、使うプログラムを見てから |
 | mmap でファイルの終わりの先 (同じページ) に書いたもの | ページキャッシュに残り、あとの写しに見える (書き出しまで。mmap(2) の BUGS) | 書き出すとき (msync、munmap、終わり、sync) に 0 にするので、munmap のあとの写しには見えない。ほかのプロセスが写しているあいだは見える | 新しく写すときにも終わりの先を 0 に (POSIX) |
 | timerfd の時計 | CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID は EINVAL (timer_create はできる。timerfd_create(2) の BUGS) | Linux と同じ | 使えるように |

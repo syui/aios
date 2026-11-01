@@ -515,8 +515,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SHUTDOWN => socket::shutdown(a[0], a[1]),
         SENDMSG => socket::sendmsg(a[0], a[1] as usize, a[2]),
         RECVMSG => socket::recvmsg(a[0], a[1] as usize, a[2]),
-        RECVMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false),
-        SENDMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true),
+        RECVMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false, a[4] as usize),
+        SENDMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true, 0),
         // I/O の優先度はない (どれも同じ)。聞かれたら IOPRIO_CLASS_NONE
         IOPRIO_SET => Ok(0),
         IOPRIO_GET => Ok(0),

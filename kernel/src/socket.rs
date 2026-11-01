@@ -109,12 +109,17 @@ fn inet_checksum(b: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// 眠って待つ。nonblock なら EAGAIN
+/// 眠って待つ (recvmmsg の締め切りがあればそこまで)。nonblock か時間切れなら EAGAIN
 fn wait(nonblock: bool) -> Result<(), i64> {
     if nonblock {
         return Err(-EAGAIN);
     }
-    proc::sleep(net::chan())?;
+    let deadline = proc::recv_deadline(0);
+    if deadline == 0 {
+        proc::sleep(net::chan())?;
+    } else if !proc::sleep_until(net::chan(), deadline)? {
+        return Err(-EAGAIN);
+    }
     net::poll();
     Ok(())
 }
@@ -1052,18 +1057,46 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
     }
 }
 
-/// recvmmsg / sendmmsg: struct mmsghdr (msghdr 56 バイト + msg_len) の並びを 1 つずつ。
-/// 2 つ目からは待たない。1 つもできなければそのエラー。recvmmsg の timeout は見ない
-pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool) -> R {
+/// recvmmsg / sendmmsg: struct mmsghdr (msghdr 56 バイト + msg_len) の並びを 1 つずつ (vlen は UIO_MAXIOV まで)。
+/// 1 つもできなければそのエラー、できたあとのエラーはそこまでの数 (Linux と同じ)。待つのも Linux と同じく 1 つずつ
+/// (MSG_WAITFORONE なら 2 つ目からは待たない)。aios がえらんだちがい (recvmmsg-timeout): recvmmsg の timeout は
+/// 呼び出しの締め切りで、受けとりで眠るのはそこまで (時間切れで、受けたものがあればその数、なければ EAGAIN)。Linux は
+/// datagram を受けたあとにしか見ないので、vlen より少なければいつまでも待つ (recvmmsg(2) の BUGS)。残りの時間は Linux
+/// と同じく timeout に書きもどす (受けたものがあるとき)
+pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool, timeout: usize) -> R {
     const MSG_WAITFORONE: u64 = 0x10000;
+    const NS: u64 = 1_000_000_000;
+    // Linux の __sys_recvmmsg: timeout を読んで確かめるのは fd より先。眠るのは tick の締め切りまで、残りの時間は
+    // ns の終わりの時刻から (tick にくり上げた分で、もとの timeout より長くならないように)
+    let end = if timeout != 0 {
+        let mut ts = [0u8; 16];
+        proc::current().pt().copy_in(&mut ts, timeout).ok_or(-EFAULT)?;
+        let sec = i64::from_le_bytes(ts[..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap());
+        if sec < 0 || !(0..NS as i64).contains(&nsec) {
+            return Err(crate::why::inval());
+        }
+        let ns = (sec as u64).saturating_mul(NS).saturating_add(nsec as u64);
+        Some((crate::timer::ticks_after(ns), crate::timer::uptime_ns().saturating_add(ns)))
+    } else {
+        None
+    };
+    let deadline = end.map(|(d, _)| d);
     let mut done = 0;
     for i in 0..vlen.min(1024) {
         let hdr = vec + i * 64;
         let mut f = flags & !MSG_WAITFORONE;
-        if i > 0 {
+        if i > 0 && flags & MSG_WAITFORONE != 0 {
             f |= MSG_DONTWAIT;
         }
-        let r = if send { sendmsg(fd, hdr, f) } else { recvmsg(fd, hdr, f) };
+        let r = if send {
+            sendmsg(fd, hdr, f)
+        } else {
+            proc::current().recv_deadline = deadline.unwrap_or(0);
+            let r = recvmsg(fd, hdr, f);
+            proc::current().recv_deadline = 0;
+            r
+        };
         match r {
             Ok(n) => {
                 proc::current().pt().copy_out(hdr + 56, &(n as u32).to_le_bytes()).ok_or(-14)?;
@@ -1072,6 +1105,18 @@ pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool) -> R {
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         }
+        if deadline.is_some_and(|d| crate::timer::ticks() >= d) {
+            break;
+        }
+    }
+    if let Some((_, end_ns)) = end
+        && done > 0
+    {
+        let left = end_ns.saturating_sub(crate::timer::uptime_ns());
+        let mut ts = [0u8; 16];
+        ts[..8].copy_from_slice(&(left / NS).to_le_bytes());
+        ts[8..].copy_from_slice(&(left % NS).to_le_bytes());
+        proc::current().pt().copy_out(timeout, &ts).ok_or(-EFAULT)?;
     }
     Ok(done)
 }

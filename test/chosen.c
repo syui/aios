@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -21,6 +22,7 @@
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef FALLOC_FL_KEEP_SIZE
@@ -396,6 +398,47 @@ static void lock_deadlock(void) {
     check("lock-deadlock", e == EDEADLK, e == EINTR, got);
 }
 
+static void recvmmsg_timeout(void) {
+    // 自分に 2 つ送って、3 つを timeout 0.2 秒で受ける (MSG_WAITFORONE なし)。aios は締め切りで 2 を返し、残りの時間
+    // (0) を書きもどす。Linux は datagram のあとにしか見ないので、3 つ目を待ちつづける (alarm の 1 秒で 2 を返す)
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    if (u < 0 || bind(u, (struct sockaddr *)&a, sizeof a) != 0 || getsockname(u, (struct sockaddr *)&a, &al) != 0) {
+        printf("FAIL recvmmsg-timeout (%s): socket %s\n", dir, strerror(errno));
+        fails++;
+        return;
+    }
+    sendto(u, "a", 1, 0, (struct sockaddr *)&a, sizeof a);
+    sendto(u, "b", 1, 0, (struct sockaddr *)&a, sizeof a);
+    char bufs[3][4];
+    struct iovec iov[3];
+    struct mmsghdr m[3];
+    memset(m, 0, sizeof m);
+    for (int i = 0; i < 3; i++) {
+        iov[i].iov_base = bufs[i];
+        iov[i].iov_len = sizeof bufs[i];
+        m[i].msg_hdr.msg_iov = &iov[i];
+        m[i].msg_hdr.msg_iovlen = 1;
+    }
+    struct sigaction sa = {.sa_handler = on_alarm};
+    sigaction(SIGALRM, &sa, NULL);
+    struct timespec to = {0, 200000000}, t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    alarm(1);
+    int n = recvmmsg(u, m, 3, 0, &to);
+    int e = errno;
+    alarm(0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    signal(SIGALRM, SIG_DFL);
+    close(u);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    char got[120];
+    snprintf(got, sizeof got, "2 of 3 with timeout 0.2 s = %d%s%s after %ld ms, timeout left %ld.%09ld", n, n < 0 ? " " : "",
+             n < 0 ? strerror(e) : "", ms, (long)to.tv_sec, to.tv_nsec);
+    check("recvmmsg-timeout", n == 2 && ms >= 150 && ms < 800 && to.tv_sec == 0 && to.tv_nsec == 0, n == 2 && ms >= 800, got);
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -451,6 +494,7 @@ int main(int argc, char **argv) {
         if (i == 1) {
             select_ebadf();
             lock_deadlock();
+            recvmmsg_timeout();
         }
     }
     if (!on_aios)
