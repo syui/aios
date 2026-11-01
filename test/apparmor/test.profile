@@ -125,3 +125,24 @@ profile aaunix {
   # 決まりのないもの (@aaunix-z) へは送れる
   unix (send) type=dgram peer=(label=unconfined),
 }
+
+# AF_INET の細かい決まり (network_v9 の af_inet: aios がえらんだちがい apparmor-inet)。127.0.0.1:7801 で listen して
+# 受けられる、そこと 80 番 (特権の port) と 7820〜7829 (7825 は deny) へつなげる、つないだソケットは名前なしで送り受け
+# できる (peer=(ip=none))。dgram は 127.0.0.1:7811 に bind して、そこへだけ送れる。Linux 7.3 は af_inet を名のらないので、
+# Linux 用の blob (gen.sh) では ip= と port= が落ちて (inet, type) の決まりに広がる
+profile aainet {
+  /proc/*/attr/current r,
+  capability net_bind_service,
+  network (create) inet stream,
+  network (bind, listen, accept, getattr, setopt) inet stream ip=127.0.0.1 port=7801,
+  # bind を許す決まりの特権の port は、parser が ADDR_LOCAL_PRIV で書く (listen や accept も)
+  network inet stream ip=127.0.0.1 port=80,
+  network (connect) inet stream peer=(ip=127.0.0.1 port=7801),
+  network (connect) inet stream peer=(ip=127.0.0.1 port=80),
+  network (connect) inet stream peer=(ip=127.0.0.1 port=7820-7829),
+  deny network (connect) inet stream peer=(port=7825),
+  network (send, receive) inet stream peer=(ip=none),
+  network (create, bind) inet dgram ip=127.0.0.1 port=7811,
+  network (send) inet dgram peer=(ip=127.0.0.1 port=7811),
+  network (receive) inet dgram peer=(ip=none),
+}

@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -18,6 +20,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef FALLOC_FL_KEEP_SIZE
@@ -308,6 +311,91 @@ static void unix_gc_now(void) {
     close(sv[0]);
 }
 
+static void select_ebadf(void) {
+    // 開いていない fd 1000 (fd の表の大きさ 64 より先) のビット: aios は EBADF (POSIX)、Linux は見ずに 0
+    fd_set r;
+    FD_ZERO(&r);
+    FD_SET(1000, &r);
+    struct timeval tv = {0, 0};
+    int n = select(1001, &r, NULL, NULL, &tv);
+    int e = errno;
+    char got[80];
+    snprintf(got, sizeof got, "select of an unopened fd 1000 = %d%s%s", n, n < 0 ? " " : "", n < 0 ? strerror(e) : "");
+    check("select-ebadf", n < 0 && e == EBADF, n == 0, got);
+}
+
+static void on_alarm(int s) { (void)s; }
+
+static void lock_deadlock(void) {
+    // 13 のプロセスが 1 バイトずつロックを持ち、i は i+1 を待つ。最後のものが 0 を待って輪を閉じる。aios はそこで
+    // EDEADLK、Linux は 11 たどるとやめるので見のがし、alarm の EINTR まで待つ
+    enum { N = 13 };
+    char p[4200];
+    snprintf(p, sizeof p, "%s/.ch-lock", dir);
+    unlink(p);
+    int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ftruncate(fd, N) != 0) {
+        printf("FAIL lock-deadlock (%s): %s\n", dir, strerror(errno));
+        fails++;
+        return;
+    }
+    close(fd);
+    int ready[2], go[2], res[2];
+    if (pipe(ready) || pipe(go) || pipe(res)) {
+        printf("FAIL lock-deadlock (%s): pipe\n", dir);
+        fails++;
+        return;
+    }
+    // SA_RESTART なしで (signal() は glibc ではやりなおすので、見のがした Linux ではいつまでも待つ)
+    struct sigaction sa = {.sa_handler = on_alarm};
+    sigaction(SIGALRM, &sa, NULL);
+    pid_t kids[N];
+    for (int i = 0; i < N; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            int f = open(p, O_RDWR);
+            struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = i, .l_len = 1};
+            fcntl(f, F_SETLK, &fl);
+            char x = 'r';
+            if (write(ready[1], &x, 1) != 1 || read(go[0], &x, 1) != 1)
+                _exit(2);
+            if (i == N - 1)
+                usleep(300000);
+            fl.l_start = (i + 1) % N;
+            // 輪を閉じるものの alarm が先に来るように (ほかがあきらめてロックを外すと、取れてしまう)
+            alarm(i == N - 1 ? 2 : 4);
+            int r = fcntl(f, F_SETLKW, &fl);
+            int e = r < 0 ? errno : 0;
+            if (i == N - 1 && write(res[1], &e, sizeof e) != sizeof e)
+                _exit(2);
+            _exit(0);
+        }
+    }
+    close(res[1]);
+    char x = 'g';
+    for (int i = 0; i < N; i++)
+        if (read(ready[0], &x, 1) != 1)
+            break;
+    for (int i = 0; i < N; i++)
+        if (write(go[1], &x, 1) != 1)
+            break;
+    int e = -1;
+    if (read(res[0], &e, sizeof e) != sizeof e)
+        e = -1;
+    for (int i = 0; i < N; i++)
+        waitpid(kids[i], NULL, 0);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+    close(res[0]);
+    unlink(p);
+    signal(SIGALRM, SIG_DFL);
+    char got[80];
+    snprintf(got, sizeof got, "F_SETLKW that closes a ring of %d = %s", N, e < 0 ? "?" : e ? strerror(e) : "0");
+    check("lock-deadlock", e == EDEADLK, e == EINTR, got);
+}
+
 static void zero_range(int tmpfs) {
     char data[8193], b[9100], got[200];
     for (int i = 0; i < 8192; i++)
@@ -359,6 +447,11 @@ int main(int argc, char **argv) {
         pipe_fault();
         pipe_nowait();
         unix_gc_now();
+        // ファイルシステムによらないもの
+        if (i == 1) {
+            select_ebadf();
+            lock_deadlock();
+        }
     }
     if (!on_aios)
         printf("chosen: Linux does %d of them like aios now\n", same);

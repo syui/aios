@@ -503,7 +503,7 @@ pub fn file_of(u: InetRef, flags: u64) -> FileRef {
     file::new(Kind::Inet(u), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
 }
 
-// ---- AppArmor (af_inet.c。network_v8 なので (inet, type, protocol) の決まりで見る。番地は記録だけ) ----
+// ---- AppArmor (af_inet.c。v9 の決まりなら番地まで見る (apparmor.rs の inet_perm)。番地は記録にも) ----
 
 /// 番地の確かめ (af_inet.c の map_addr: 名前がなければよい、AF_INET は 16 バイト、AF_INET6 は 24 バイトなければ EINVAL、
 /// ほかの family は EAFNOSUPPORT)。決まりのあるプロセスだけ
@@ -518,15 +518,20 @@ pub fn aa_map_addr(a: Option<&[u8]>) -> Result<(), i64> {
     }
 }
 
-/// いまのプロセスの決まりで、このソケットへの op。bind は自分の名前を a に (saddr= と src=)、ほかは今の名前 (つないで
-/// いれば相手の名前を remote に: daddr= と dest=)
-pub fn aa_perm(u: &InetRef, op: &str, request: u32, bind: Option<&[u8]>, remote: Option<&[u8]>) -> Result<(), i64> {
-    use crate::apparmor::inet_addr_audit;
+/// いまのプロセスの決まりで、このソケットへの op。自分の番地は今の名前 (getsockname と同じ)、bind は bind する名前
+/// (saddr= と src=)、相手のあることは相手の名前 (daddr= と dest=)
+pub fn aa_perm(u: &InetRef, op: &str, request: u32, what: crate::apparmor::InetOp) -> Result<(), i64> {
+    use crate::apparmor::{InetOp, inet_addr_audit};
     let (typ, proto, sk, local) = {
         let s = u.borrow();
         let sk = inet_addr_audit(Some(&sockaddr(s.rcv_saddr, s.sport)), "laddr", "lport") + &inet_addr_audit(Some(&sockaddr(s.daddr, s.dport)), "faddr", "fport");
         let local = sockaddr(if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr }, s.sport);
         (if s.tcp { 1 } else { 2 }, s.protocol as u32, sk, local)
+    };
+    let (bind, remote) = match &what {
+        InetOp::Bind(a) => (Some(*a), None),
+        InetOp::Remote(r) => (None, *r),
+        _ => (None, None),
     };
     let pre = || {
         let mut s = sk.clone();
@@ -534,7 +539,7 @@ pub fn aa_perm(u: &InetRef, op: &str, request: u32, bind: Option<&[u8]>, remote:
         s.push_str(&inet_addr_audit(remote, "daddr", "dest"));
         crate::apparmor::NetAudit { pre: s, post: String::new() }
     };
-    crate::apparmor::net_perm(op, request, 2, typ, proto, &pre)
+    crate::apparmor::inet_perm(op, request, typ, proto, &local, what, &pre)
 }
 
 // ---- アドレス ----

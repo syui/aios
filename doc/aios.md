@@ -470,10 +470,12 @@ AppArmor のプロファイル (文字で書いた決まり) は、Linux と同�
 /sys/kernel/security/apparmor/.load (足す) か .replace (足すか入れかえる) に書き、.remove に名前を書くと外す
 (kernel/src/apparmor.rs、securityfs.rs)。バイナリのほどき方は Linux 7.3 の policy_unpack.c と同じ (型の印のついた値の
 並び)、ファイルの決まりは DFA (match.c。表は big endian) で、パスを通してたどりついた状態の許しを見る。apparmor_parser は
-カーネルが名のること (apparmor/features) を読んで形を選ぶので、aios は v5〜v7 の版と、ファイル (create read write exec
-append mmap_exec link lock)、capability (caps/mask)、ネットワーク (network_v8 と network_v9 の af_unix)、signal、ptrace、mount、change_hat、
-change_profile と change_onexec を名のる。すると許しを DFA の accept の表にうめこんだ古い
-形で作るので、policy_compat.c と同じく読むときに許しの表へ移す (持ち主のときとほかのときの 2 つ組)。表は読むときに
+カーネルが名のること (apparmor/features) を読んで形を選ぶので、aios は v5〜v7 の版と許しの表 (permstable32 の 3。
+Linux 7.3 も名のる)、ファイル (create read write exec append mmap_exec link lock)、capability (caps/mask)、ネットワーク
+(network_v8 と、network_v9 の af_unix と af_inet)、signal、ptrace、mount、change_hat、change_profile と change_onexec を
+名のる。apparmor_parser 5.0 は許しを別の表 (perms) で作り、DFA の accept はその番号になる。許しの表を知らない古い
+apparmor_parser は許しを DFA の accept の表にうめこんだ形で作るので、policy_compat.c と同じく読むときに許しの表へ移す
+(持ち主のときとほかのときの 2 つ組)。表は読むときに
 みな確かめる (状態と行き先が表の中、差分の鎖がまわっていない、許しの番号が表の中: Linux の paranoid_load と同じ)。
 .access には「このプロファイルでこの文字列は」を聞ける (libapparmor の aa_query_label)。/sys/module/apparmor/parameters/enabled
 は Y、/sys/kernel/security/lsm は capability,landlock,apparmor (securityfs は起動のときにかぶせる)。apparmor/policy/ は Linux
@@ -544,6 +546,25 @@ unix_fs_perm)。v9 の印のないプロファイル (network_v9 を知らない
 apparmor_parser 5.0 は `network unix stream,` からも unix のすべてを許す決まりを作るので、AF_UNIX を細かく止めたいときは
 unix の決まりで書く (4.0 などの古いものは、反対に unix の決まりを network unix に書きおろし、deny の unix の決まりは落とす)。
 
+AF_INET (af_inet.c の network_v9。aios がえらんだちがい apparmor-inet、下の表): Linux 7.3 (と次の apparmor-next) の
+af_inet.c は番地を記録に書くだけで、許すかは (inet, type, protocol) で決め、features でも af_inet を名のらない。
+すると apparmor_parser は `network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の ip= と port= を
+落として (inet, type) の決まりにする: allow は書いたよりも広く許し、deny は広く止める (`deny network (connect) inet
+stream peer=(port=25),` が stream の connect をみな止める)。aios は af_inet を名のり、apparmor_parser 5.0 が作る番地の
+決まり (network.cc の gen_net_rule) を、それを読む Ubuntu のカーネルの af_inet.c と同じ順でたどる: (inet, type) で
+足りれば止め、protocol、自分の番地 (種類、port、長さ、ip。bind で特権の port は種類 1)、ラベル (いまは区切りだけ)。
+listen と sockopt はそのあとの cmd と backlog か level と optname、connect と送る受けるは相手の番地 (種類 2。名前の
+ない send と recv は「なし」で、決まりの `peer=(ip=none)`)、CMD_ADDR、自分の番地。ICMP と raw のソケットも同じ。
+aios は Ubuntu の読みかたの 3 つのまちがいもなおした: (1) parser は bind を許す決まりの特権の port をみな種類 1 で書くが、
+Ubuntu は bind のほかは種類 0 で読むので、`network inet stream port=80,` で bind できても listen や accept ができない。aios は
+自分の port が特権なら種類 0 と 1 の両方で読んで、許しを合わせる (どちらかが許し、どちらも拒まないもの)。(2) parser は
+条件のある deny の決まりで (inet, type) の「先を見る」印 (AA_CONT_MATCH) まで deny にするので、許しから印が消え、Ubuntu
+ではその型の op がみな止まる。aios は許しが足りなければ印がなくても先を読み、先がなかったときだけそこの許しにする
+(v8 の形のプロファイルは (inet, type) で止まり、Linux と同じ)。(3) parser は自分の番地の条件のない決まりの自分の
+ところを「種類と port はなんでも」で書くので、相手の番地もそこにあたり、Ubuntu は peer=(...) の決まりでもどの相手にも
+許す。aios は相手の番地のところでは止めず、CMD_ADDR と自分の番地まで見て決める。DENIED の info= には、どこでたどれ
+なくなったか (failed local addr match、failed cmd selection match など) が出る。
+
 signal (ipc.c): kill と tgkill で、uid のたしかめ (EPERM) のあと、送る側の決まりで相手のラベルの名前へ send、受ける側の
 決まりで送る側へ receive (両方見る。だめなら EACCES)。シグナルの番号は Linux の表で (0 は exists、リアルタイムは rtmin+N)。
 
@@ -563,8 +584,8 @@ network、signal、ptrace、mount の記録の形は、Linux 7.3.1 で同じこ�
 Linux とちがうところ (まだないもの): complain で exec の許しがないとき、Linux は学ぶための空のプロファイルに移るが、
 aios はいまのプロファイルのまま (complain で、ない hat に change_hat したときも、Linux は学ぶための hat を作って入るが、
 aios は記録して ENOENT)。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
-rlimit、dbus、io_uring、userns、mqueue の決まりと network_v9 の af_inet (AF_INET の番地の決まり) はまだで、features でも
-名のらない (ソケットのラベルが変わったときの見なおし (aa_sock_file_perm) もまだ)。capability の
+rlimit、dbus、io_uring、userns、mqueue の決まりはまだで、features でも名のらない (ソケットのラベルが変わったときの見なおし
+(aa_sock_file_perm) もまだ)。network_v9 の af_inet のラベルの条件 (label= と peer=(label=)) はまだ見ない (区切りだけたどる。Ubuntu も)。capability の
 DFA の決まり (caps/extended) も名のらない (apparmor_parser は古い 64 ビットの組で作る)。mprotect と、exec のときに開いた
 ままのファイルを見なおすこともまだ。
 
@@ -574,13 +595,16 @@ binfmt_elf の mmap で r と m が要る。決まりのないプロセスが開
 DENIED を記録して、exec のあとで SIGSEGV を送る。ふつうのプロファイルが abstractions/base で ld.so の mr を持つのはこのため。
 
 新しい test/apparmor.c は、test/apparmor/test.profile (gen.sh が apparmor_parser 5.0 で、aios の features をそのまま abi に
-して blob.h に。4.0 は network_v9 の af_unix を知らない) を
+して blob.h の aa_blob に。Linux では af_inet をのぞいた features で作った aa_blob_linux を読む。4.0 は network_v9 の
+af_unix を知らない) を
 読み、写したテストのプログラムにパスでついたプロファイルの中から、開く・作る・消す・rename・link・chmod・truncate・flock・
 exec (ix px cx ux、許しのないもの、行き先で写せないもの)・change_profile の 40 の答えをくらべ、capability を chown
 だけ許すプロファイル (aacap) と complain で、ほかの人の 0600 のファイルを読む・書く・chmod、chown、mknod、setuid と capget
 の 18 の答えと、change_hat (hat に入る・兄弟へ・帰る、いくつも、token ちがいの SIGKILL、ない hat、hat でないもの、
 hat のないプロファイル) の 22 の答えと、LSM のシステムコールの 11 の答え、ネットワーク (aanet: 24 と、相手の側の
-決まり 3)、AF_UNIX (aaunix: 番地、cmd、相手の番地とラベル、deny、パスのソケットの 24)、signal と ptrace (aasig: 13)、
+決まり 3)、AF_UNIX (aaunix: 番地、cmd、相手の番地とラベル、deny、パスのソケットの 24)、AF_INET (aainet: 番地、port の
+範囲、deny、特権の port、dgram の 27。うち 13 は aios と Linux で答えがちがい、Linux のものは広がった決まりの答え)、
+signal と ptrace (aasig: 13)、
 mount (aamnt: 11。読むだけのマウントはしない: aios はそれがあるとロックなしの作る・消すを使わなくなり、あとの
 ctests が変わる) の答えをくらべ、決まりのないプロセスから onexec、complain、動いているプロセスのプロファイル
 を外す (unconfined にもどる) のを確かめる。答えは Linux で見たもの:
@@ -1382,6 +1406,9 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | pipe-fault | パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT) | パイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す) | どこまでできたかがそのまま分かる。ふつうのファイルでは Linux もバイトごとなので、パイプだけ箱ごとなのは中の作りが見えているだけ |
 | pipe-nowait | パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く | splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP | aios のパイプは splice でも写しを入れる (splice-snapshot) ので、読むときに待つことがない。フラグが黙って効かなくなるのは分かりにくい |
 | unix-gc-now | 送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じた、たがいの fd を持ちあって閉じた) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF や ECONNRESET) | ほかの AF_UNIX のソケットが閉じたとき (か、送られている途中のものが多すぎるとき) に、うしろ (kworker) で片づける。それまで輪の中のソケットは生きていて、相手からはつながったまま (読めば EAGAIN、待てばいつまでも) | 答えが、ほかのソケットが閉じたかや、うしろの仕事がいつ走ったかで変わらない。もうだれも使えないソケットに相手が待ちつづけない。ロボットは Linux で、ほかの AF_UNIX のソケットを作って閉じて片づけを起こし、終わるのを待ってまねる |
+| select-ebadf | select と pselect6 で、nfds までに開いていない fd のビットがあれば、どの番号でも EBADF | fd の表の大きさ (はじめは 64、開いた数で増える) より先のビットは見ずにすてる (fd 40 は EBADF、fd 1000 は 0) | POSIX は、開いていない fd があれば EBADF と決めている。答えが fd の表の大きさ (いままでに開いた数) で変わらない。select(2) の BUGS にある。ロボットは select を使わないので test/chosen.c が確かめる |
+| lock-deadlock | fcntl のレコードロック (POSIX どうし) の行きどまりを、輪の長さによらず EDEADLK にする (待っているものの数だけたどる) | 11 たどるとやめる (MAX_DEADLK_ITERATIONS)。13 より多い持ち主の輪は見のがし、みないつまでも待つ | 行きどまりを見つけるのに、長さの決まりはいらない (待っているものは 1 つずつしか待たないので、数だけたどれば止まる)。fcntl(2) の BUGS にある。aios は前は 10 までで、Linux より 1 つ短かった。test/chosen.c が 13 のプロセスの輪で確かめる |
+| apparmor-inet | AppArmor の network_v9 の af_inet を名のり、`network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の番地の決まりを効かせる (読みかたは apparmor_parser の決まりの形と Ubuntu のカーネルの af_inet.c と同じ。特権の port、deny の決まり、自分の番地の条件のない peer の決まりの 3 つは、Ubuntu の読みかたのまちがいをなおした: 上の「AF_INET」) | af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) の決まりにする (allow は広く許し、deny は広く止める)。af_inet.c は番地を記録に書くだけ | 書いた決まりのとおりに効く (書いたよりも多く許さない、多く止めない)。パーサも Ubuntu のカーネルもこの決まりを持っていて、Linux の本体にまだ入っていないだけ。ロボットは AppArmor を見ないので、test/apparmor.c が両方でたしかめる (aios は番地の答え、Linux は広がった決まりの答えと、features に af_inet がないこと) |
 
 #### 手本の Linux のまちがい
 
@@ -1396,6 +1423,30 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | zero-range-eof | ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。7.3 にもある。6.18 にはない (delalloc でまだディスクにないブロックなら 0 になる。ロボットの並びではめったに起きず、ブロックにそろった ZERO_RANGE を fsync と fadvise DONTNEED のあとにすると出る) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
 | efault-extend | ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 6.18、7.2.11、7.3 | なにも書けなかったのだから伸びない (aios はそう) |
 | tmpfs-extend | tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする) | 7.2.11 と 7.3 | POSIX は伸ばしたところは 0 と読めると決めている (ftruncate(2)、write(2))。伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までに 0 を書く (aios は ext4 でも tmpfs でも 0) |
+
+#### Linux よりよくできそうなところ (候補)
+
+よい道のさがしかた: Linux 自身が「書いてあるとおりに動かない」とまとめているところを読む。man-pages (6.20) の
+BUGS の節 (man2 の 74、man7 の 25 のページ。多くは古い版のことで、もう直っている)、カーネルのソースの TODO と FIXME、
+AppArmor のように Linux の本体の外 (Ubuntu のカーネル、apparmor-next) にあるもの。まだ残っているものは、小さな
+プログラムで Linux 7.3.1 (test/linux-vm.sh exec) と aios の両方で動かしてたしかめる。上の表に入れたもの
+(select-ebadf、lock-deadlock、apparmor-inet、pwrite-append) のほかに、2026-11-01 にたしかめたもの:
+
+| もの | Linux 7.3.1 | aios (いま) | どうするか |
+|---|---|---|---|
+| recvmmsg の timeout | datagram を 1 つ受けたあとにしか見ないので、vlen より少なければシグナルが来るまで待つ (recvmmsg(2) の BUGS) | 1 つめのあとは、あるものだけ受けてすぐ返す (いつも MSG_WAITFORONE のよう)。timeout を見ない | 呼び出しの締め切りとして効かせる (vlen そろうか締め切りまで待つ) |
+| つないだことのない TCP への send | EPIPE (と SIGPIPE) | Linux と同じ | POSIX の ENOTCONN (send(2) の BUGS)。SIGPIPE で落ちなくなるので、使うプログラムを見てから |
+| mmap でファイルの終わりの先 (同じページ) に書いたもの | ページキャッシュに残り、あとの写しに見える (書き出しまで。mmap(2) の BUGS) | 書き出すとき (msync、munmap、終わり、sync) に 0 にするので、munmap のあとの写しには見えない。ほかのプロセスが写しているあいだは見える | 新しく写すときにも終わりの先を 0 に (POSIX) |
+| timerfd の時計 | CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID は EINVAL (timer_create はできる。timerfd_create(2) の BUGS) | Linux と同じ | 使えるように |
+| execveat(fd, "", AT_EMPTY_PATH) の #! スクリプト | fd が close-on-exec なら ENOENT なので、fd がスクリプトにもれる (execveat(2) の BUGS) | まだ見ていない | |
+| fcntl のロックと CLONE_FILES | ファイルの表を分けあうプロセスどうしで、ない行きどまりを EDEADLK にすることがある (fcntl_locking(2) の BUGS) | まだ見ていない | |
+| RLIMIT_CPU | SIGXCPU のハンドラがあると、やわらかい上限を 1 秒ずつ上げる (getrlimit(2) の BUGS) | まだ見ていない | |
+| AppArmor の AF_UNSPEC の connect | 7.3 は見ない。apparmor-next は connect の許しを見る (bind の AF_UNSPEC の長さも確かめる) | 7.3 と同じ | Linux の次の版に入ったら合わせる |
+| AppArmor の af_inet のラベル | (af_inet がない) | label= と peer=(label=) は区切りだけたどる (Ubuntu も) | ラベルの名前まで見る |
+
+そのままにするもの (Linux のふるまいに頼るプログラムがある、ABI): select が EINTR でも timeout を書きかえる、
+sched_setscheduler が前の policy でなく 0 を返す、setfsuid / setfsgid がしくじりを知らせない、nice がスレッドごと、
+waitid の infop が NULL でもよい、EPOLLWAKEUP を黙って無視する。
 
 ## カーネルの中を見る (/proc/ai)
 

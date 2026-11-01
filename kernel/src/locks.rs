@@ -10,8 +10,8 @@
 //!   最後の参照が閉じたら外れる。F_OFD_GETLK は聞くときの l_pid が 0 でないと EINVAL、答えの l_pid は -1
 //!
 //! POSIX と OFD は持ち主がちがうので、同じプロセスの中でもぶつかる。待つ (F_SETLKW、LOCK_NB なしの flock) ときは、
-//! ほかの持ち主が外すまで眠る。POSIX どうしの行きどまり (自分を待っている人を待つ) は EDEADLK (Linux と同じく、
-//! 聞く側が OFD なら見ない)。ファイルごとの並びは Linux と同じ: 持ち主ははじめてかけた順、持ち主の中は始まりの順
+//! ほかの持ち主が外すまで眠る。POSIX どうしの行きどまり (自分を待っている人を待つ) は、輪の長さによらず EDEADLK
+//! (Linux と同じく、聞く側が OFD なら見ない)。ファイルごとの並びは Linux と同じ: 持ち主ははじめてかけた順、持ち主の中は始まりの順
 //! (F_GETLK は、ぶつかるもののうち並びで先のものを答える)
 use crate::cell::Bkl;
 use crate::file::{FileRef, Kind, OpenFile};
@@ -189,9 +189,11 @@ fn overlap(r: &Rec, start: i64, end: i64) -> bool {
     r.end >= start && r.start <= end
 }
 
-/// 行きどまり: me が待とうとしている blocker (の持ち主) が、めぐって me を待っているか (Linux の posix_locks_deadlock)
+/// 行きどまり: me が待とうとしている blocker (の持ち主) が、めぐって me を待っているか (Linux の posix_locks_deadlock)。
+/// aios がえらんだちがい (lock-deadlock): 輪の長さによらず見つける (Linux は 11 たどるとやめるので、13 より多い持ち主の
+/// 輪は見のがし、みないつまでも待つ: fcntl(2) の BUGS)。待っているものの数だけたどれば、me のない輪でも止まる
 fn deadlock(me: Owner, mut blocker: Owner) -> bool {
-    for _ in 0..10 {
+    for _ in 0..=waiting().len() {
         let Some(&(_, next)) = waiting().iter().find(|(w, _)| *w == blocker) else { return false };
         if next == me {
             return true;

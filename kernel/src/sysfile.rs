@@ -3072,7 +3072,9 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
 
 /// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask): ppoll と同じ待ち方を fd_set (ビットの並び) で。
 /// 読める = データがあるか相手が閉じた、書ける = 書けるか相手が閉じた。例外 (帯域外データ) はないので空にする。
-/// sigmask は ppoll と同じく signal::wait_mask で
+/// sigmask は ppoll と同じく signal::wait_mask で。aios がえらんだちがい (select-ebadf): nfds までに開いていない fd の
+/// ビットがあれば、どの番号でも EBADF (POSIX)。Linux は fd の表の大きさ (はじめは 64) より先のビットを見ずにすてる
+/// (select(2) の BUGS)
 pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
     if nfds > proc::NOFILE {
         return Err(crate::why::inval());

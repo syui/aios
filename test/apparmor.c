@@ -1,7 +1,9 @@
 // AppArmor (kernel/src/apparmor.rs) のたしかめ: test/apparmor/test.profile (gen.sh が apparmor_parser で作った blob.h) を
 // /sys/kernel/security/apparmor/.replace で読み、このプログラムの写し /tmp/aatest/t (aatest がパスでつく) に、決まりの
 // 中から open、作る・消す、rename、link、chmod、truncate、flock、exec (ix px cx ux) と change_profile をためさせる。
-// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。aanet ではソケット (network_v8)。LSM のシステムコール (lsm_get_self_attr
+// aatest の hat に change_hat で入る・移る・帰る (token がちがえば SIGKILL)。aanet ではソケット (network_v8)、aaunix と
+// aainet では AF_UNIX と AF_INET の細かい決まり (network_v9。af_inet は aios がえらんだちがい apparmor-inet: Linux では
+// af_inet をのぞいて作った aa_blob_linux を読み、ip= と port= の効かない Linux の答えをたしかめる)。LSM のシステムコール (lsm_get_self_attr
 // など) でも読み書きする。aacap では capability (chown だけ許す)。それから、決まりのないプロセスから onexec、complain、動いているプロセスの
 // プロファイルを外す (unconfined にもどる)。
 // root で動かす (でなければ sudo -n でもう一度)。AppArmor のついた Linux でも同じに通ること
@@ -21,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,6 +32,8 @@
 #define AA "/sys/kernel/security/apparmor/"
 #define D "/tmp/aatest"
 static int fails;
+// aios の中か (uname の sysname)。Linux なら aa_blob_linux を読み、apparmor-inet の答えは Linux のもの
+static int on_aios;
 #define CHECK(c, ...)                                                                                                  \
   do {                                                                                                                 \
     if (!(c)) {                                                                                                        \
@@ -459,6 +464,82 @@ static int netchild(void) {
   return 0;
 }
 
+// aainet の中で (argv[1] が inet): AF_INET の細かい決まり (network_v9 の af_inet)。1 行に「名前 答え」
+static struct sockaddr_in lo(int port) {
+  struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  return a;
+}
+
+static int inetchild(void) {
+  if (puts_("/proc/self/attr/current", "changeprofile aainet"))
+    return 2;
+#define N(name, v) printf("%s %d\n", name, v)
+#define A(x) (struct sockaddr *)&x, sizeof x
+  struct sockaddr_in a = lo(7801), o = lo(7802), p80 = lo(80), n;
+  socklen_t nl = sizeof n;
+  int one = 1;
+  char b[8];
+  // listen する口は待たない (Linux では connect がみな止まるので、accept が来ないものを待ってしまう)
+  int l = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  N("inet-create", l < 0 ? errno : 0);
+  setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  N("inet-bind", e(bind(l, A(a))));
+  int x = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-bind-other", e(bind(x, A(o))));
+  close(x);
+  N("inet-listen", e(listen(l, 4)));
+  N("inet-getname", e(getsockname(l, (struct sockaddr *)&n, &nl)));
+  N("inet-setopt", e(setsockopt(l, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one)));
+  x = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-setopt-unbound", e(setsockopt(x, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one)));
+  close(x);
+  int c = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-connect", e(connect(c, A(a))));
+  int k = accept(l, NULL, NULL);
+  N("inet-accept", k < 0 ? errno : 0);
+  N("inet-send", e(send(c, "x", 1, MSG_NOSIGNAL) == 1 ? 0 : -1));
+  N("inet-recv", e(recv(k, b, sizeof b, 0) == 1 ? 0 : -1));
+  nl = sizeof n;
+  N("inet-getname-client", e(getsockname(c, (struct sockaddr *)&n, &nl)));
+  // 7820〜7829 は listen していない (ECONNREFUSED)。7825 は deny、7830 は決まりの外
+  struct sockaddr_in r1 = lo(7821), r5 = lo(7825), r0 = lo(7830);
+  x = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-connect-range", e(connect(x, A(r1))));
+  close(x);
+  x = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-connect-deny", e(connect(x, A(r5))));
+  close(x);
+  x = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-connect-other", e(connect(x, A(r0))));
+  close(x);
+  // 特権の port 80: bind は ADDR_LOCAL_PRIV、listen と accept も同じ決まりで (aios)
+  int pl = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  setsockopt(pl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  N("inet-priv-bind", e(bind(pl, A(p80))));
+  N("inet-priv-listen", e(listen(pl, 4)));
+  int pc = socket(AF_INET, SOCK_STREAM, 0);
+  N("inet-priv-connect", e(connect(pc, A(p80))));
+  int pk = accept(pl, NULL, NULL);
+  N("inet-priv-accept", pk < 0 ? errno : 0);
+  N("inet-priv-recv", e(send(pc, "x", 1, MSG_NOSIGNAL) == 1 && recv(pk, b, sizeof b, 0) == 1 ? 0 : -1));
+  // dgram: 127.0.0.1:7811 に bind して、そこへだけ送れる
+  struct sockaddr_in d = lo(7811), d2 = lo(7812);
+  int u = socket(AF_INET, SOCK_DGRAM, 0);
+  N("inet-udp-create", u < 0 ? errno : 0);
+  N("inet-udp-bind", e(bind(u, A(d))));
+  x = socket(AF_INET, SOCK_DGRAM, 0);
+  N("inet-udp-bind-other", e(bind(x, A(d2))));
+  close(x);
+  N("inet-udp-send", e(sendto(u, "x", 1, 0, A(d))));
+  N("inet-udp-send-other", e(sendto(u, "x", 1, 0, A(d2))));
+  N("inet-udp-recv", e(recv(u, b, sizeof b, MSG_DONTWAIT) == 1 ? 0 : -1));
+  N("inet-udp-setopt", e(setsockopt(u, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one)));
+  fflush(stdout);
+#undef A
+#undef N
+  return 0;
+}
+
 // 決まりのあるプロセス (profile) が抽象名 name で作った unix の口へ、決まりのないこちらから (type が SOCK_STREAM なら
 // connect、SOCK_DGRAM なら sendto)。答えは 0 か errno。相手の側の決まりでも止まる
 static int peer_test(const char *profile, int type, const char *name) {
@@ -686,6 +767,27 @@ static const char *want_unix[] = {
     "uni-dgrampair 0", "uni-seqpacket 13", "uni-fs-connect 0", "uni-fs-connect-other 13",
 };
 
+// aainet: どちらでも同じ答え
+static const char *want_inet[] = {
+    "inet-create 0", "inet-bind 0", "inet-listen 0", "inet-getname 0", "inet-setopt 0", "inet-connect-deny 13",
+    "inet-connect-other 13", "inet-priv-bind 0", "inet-priv-listen 0", "inet-udp-create 0", "inet-udp-bind 0",
+    "inet-udp-send 0", "inet-udp-recv 0", "inet-udp-setopt 13",
+};
+// aios は ip= と port= を見る (同じ順で want_inet_linux と組)
+static const char *want_inet_aios[] = {
+    "inet-bind-other 13", "inet-setopt-unbound 13", "inet-connect 0", "inet-accept 0", "inet-send 0", "inet-recv 0",
+    "inet-getname-client 13", "inet-connect-range 111", "inet-priv-connect 0", "inet-priv-accept 0", "inet-priv-recv 0",
+    "inet-udp-bind-other 13", "inet-udp-send-other 13",
+};
+// Linux 7.3.1 は af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) に広げた決まり:
+// allow は広がって stream はみな、dgram は作る・bind・送る・受ける。deny も広がって stream の connect はみな止まる
+// (つながらないので accept は EAGAIN、送るのは EPIPE)
+static const char *want_inet_linux[] = {
+    "inet-bind-other 0", "inet-setopt-unbound 0", "inet-connect 13", "inet-accept 11", "inet-send 32", "inet-recv 9",
+    "inet-getname-client 0", "inet-connect-range 13", "inet-priv-connect 13", "inet-priv-accept 11", "inet-priv-recv 32",
+    "inet-udp-bind-other 0", "inet-udp-send-other 0",
+};
+
 // aanet: 決まりにあるソケットだけ (ほかの family、型、許しは EACCES)
 static const char *want_net[] = {
     "net-tcp-create 0", "net-tcp-bind 0", "net-tcp-listen 0", "net-tcp-name 0", "net-tcp-connect 0", "net-tcp-accept 0",
@@ -758,6 +860,7 @@ static void cleanup(void) {
   puts_(AA ".remove", "aasig");
   puts_(AA ".remove", "aamnt");
   puts_(AA ".remove", "aaunix");
+  puts_(AA ".remove", "aainet");
   const char **lists[] = {files, bins, made};
   size_t ns[] = {sizeof files / sizeof *files, sizeof bins / sizeof *bins, sizeof made / sizeof *made};
   for (int l = 0; l < 3; l++)
@@ -788,6 +891,8 @@ int main(int argc, char **argv) {
     return mntchild();
   if (argc > 1 && !strcmp(argv[1], "unix"))
     return unixchild();
+  if (argc > 1 && !strcmp(argv[1], "inet"))
+    return inetchild();
   if (argc > 1 && (!strcmp(argv[1], "cap") || !strcmp(argv[1], "capc")))
     return capchild(argv[1][3] == 'c');
   if (argc > 1 && !strcmp(argv[1], "attr")) {
@@ -804,13 +909,17 @@ int main(int argc, char **argv) {
     printf("apparmor: needs root (sudo -n failed)\n");
     return 1;
   }
+  struct utsname un;
+  on_aios = uname(&un) == 0 && !strcmp(un.sysname, "aios");
+  const unsigned char *blob = on_aios ? aa_blob : aa_blob_linux;
+  size_t blen = on_aios ? sizeof aa_blob : sizeof aa_blob_linux;
   cleanup();
   setup(self);
 
   // 読みこむ。同じものの .load は EEXIST、.replace はよい
-  CHECK(put(AA ".replace", aa_blob, sizeof aa_blob) == 0, ".replace");
-  CHECK(put(AA ".load", aa_blob, sizeof aa_blob) == EEXIST, ".load again is EEXIST");
-  CHECK(put(AA ".replace", aa_blob, sizeof aa_blob) == 0, ".replace again");
+  CHECK(put(AA ".replace", blob, blen) == 0, ".replace");
+  CHECK(put(AA ".load", blob, blen) == EEXIST, ".load again is EEXIST");
+  CHECK(put(AA ".replace", blob, blen) == 0, ".replace again");
   CHECK(put(AA ".replace", "nonsense", 8) == EPROTONOSUPPORT, ".replace of junk");
   char prof[4096] = "";
   int fd = open(AA "profiles", O_RDONLY);
@@ -903,6 +1012,25 @@ int main(int argc, char **argv) {
   CHECK(pr == 0, "send to a dgram socket whose profile can receive: %d", pr);
   pr = peer_test("changeprofile aanetd", SOCK_DGRAM, "aanet-d2");
   CHECK(pr == EACCES, "send to a dgram socket whose profile can not receive: %d", pr);
+
+  // AF_INET の細かい決まり: aios は network_v9/af_inet を名のる (Linux 7.3.1 は名のらない。名のるようになったら
+  // apparmor-inet を見なおす)
+  CHECK(access(AA "features/network_v9/af_inet", F_OK) == (on_aios ? 0 : -1), "network_v9/af_inet %s", on_aios ? "missing on aios" : "SAME apparmor-inet: Linux now announces it");
+  collect(self, "inet", out, sizeof out);
+  bad = fails;
+  for (size_t i = 0; i < sizeof want_inet / sizeof *want_inet; i++) {
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", want_inet[i]);
+    CHECK(strstr(out, l), "want \"%s\"", want_inet[i]);
+  }
+  for (size_t i = 0; i < sizeof want_inet_aios / sizeof *want_inet_aios; i++) {
+    const char *w = on_aios ? want_inet_aios[i] : want_inet_linux[i];
+    char l[128];
+    snprintf(l, sizeof l, "%s\n", w);
+    CHECK(strstr(out, l), "want \"%s\"%s", w, on_aios ? "" : " (if it is the aios answer, Linux now does what aios chose: apparmor-inet)");
+  }
+  if (fails != bad)
+    printf("inet said:\n%s", out);
 
   // mount (m2 は決まりのないこちらで tmpfs を)
   CHECK(mount("none", D "/m2", "tmpfs", 0, NULL) == 0, "mount m2: %d", errno);

@@ -2283,7 +2283,12 @@ fn af_perm(p: &Profile, op: &str, request: u32, family: u32, typ: u32, protocol:
 /// aa_do_perms: st の許しで request を見て、だめなら class="net" で記録 (audit_net_cb)
 #[allow(clippy::too_many_arguments)]
 fn net_check(p: &Profile, st: u32, info: Option<&str>, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
-    let mut perms = p.policy.lookup(st, true);
+    net_check_perms(p, p.policy.lookup(st, true), info, op, request, family, typ, protocol, extra)
+}
+
+/// net_check の許しを渡すもの
+#[allow(clippy::too_many_arguments)]
+fn net_check_perms(p: &Profile, mut perms: Perms, info: Option<&str>, op: &str, request: u32, family: u32, typ: u32, protocol: u32, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
     p.apply_modes(&mut perms);
     check_perms(&perms, request, &|kind, req, denied, error| {
         let x = extra();
@@ -2338,9 +2343,9 @@ pub struct UnixSk<'a> {
     pub fs: Option<(&'a str, u32)>,
 }
 
-const CMD_ADDR: u8 = 1;
-const CMD_LISTEN: u8 = 2;
-const CMD_OPT: u8 = 4;
+pub const CMD_ADDR: u8 = 1;
+pub const CMD_LISTEN: u8 = 2;
+pub const CMD_OPT: u8 = 4;
 /// パスのソケットでファイルの決まりに渡す許し (NET_FS_PERMS)
 const NET_FS_PERMS: u32 = MAY_SEND | MAY_RECEIVE | MAY_CREATE | MAY_SHUTDOWN | MAY_CONNECT | 0x80 | MAY_SETATTR | MAY_GETATTR | MAY_CHMOD | MAY_CHOWN | 0x4000 | MAY_LOCK | 0x2_0000;
 
@@ -2555,6 +2560,229 @@ pub fn unix_peer(label: Option<&Option<Label>>, op: &str, request: u32, sk: &Uni
         }
     }
     net_check(&p, st, info, op, request, 1, sk.typ, sk.protocol, &|| unix_audit(sk.addr, request, peer.addr, Some(&pname)))
+}
+
+// ---- AF_INET (af_inet.c。aios は network_v9 の af_inet を名のり、v9 の決まりなら番地まで見る: aios がえらんだちがい
+// (apparmor-inet)。Linux 7.3 は af_inet を名のらず、番地は記録に書くだけなので、apparmor_parser は ip= や port= のある
+// 決まりを (inet, type) に広げる (書いたよりも多く許す)。決まりの形は parser の network.cc の gen_net_rule、読みかたは
+// それを読む Ubuntu のカーネルの af_inet.c と同じ: (inet, type) で足りれば止め、protocol、番地 (種類、port、長さ、ip)、
+// ラベル (いまは区切りだけ)。相手のあることは相手の番地、CMD_ADDR、自分の番地。listen と sockopt は自分の番地、cmd、
+// backlog か level と optname。v9 の決まりのないプロファイルは v8 の (inet, type, protocol)) ----
+
+/// 番地の種類 (enum addr_type): 自分、自分の特権の port (bind で、net_bind_service がいるもの)、相手
+const ADDR_LOCAL: u8 = 0;
+const ADDR_LOCAL_PRIV: u8 = 1;
+const ADDR_REMOTE: u8 = 2;
+/// これより下の port は特権 (inet_port_requires_bind_service: net.ipv4.ip_unprivileged_port_start)
+const PROT_SOCK: u16 = 1024;
+
+/// AF_INET のソケットへの op の形 (どの番地をどう見るか)。番地は sockaddr のバイト
+pub enum InetOp<'a> {
+    /// 自分のところだけ (accept、getsockname、shutdown など: profile_sk_perm)
+    Sk,
+    /// bind (自分の番地は bind する名前: profile_bind_perm)
+    Bind(&'a [u8]),
+    /// 相手のあること (connect、sendmsg、recvmsg: profile_remote_perm)。名前がなければ (つないだソケットへの send や
+    /// recv) 相手の番地はなし (決まりの peer=(ip=none))
+    Remote(Option<&'a [u8]>),
+    /// cmd (listen と backlog、sockopt と level と optname: profile_listen_perm、profile_opt_perm)
+    Cmd(u8, &'a [u16]),
+}
+
+/// 決まりで見る番地 (struct match_addr): port はネットワークの順、ip は 0 (なし)、4、16 バイト
+struct InetAddr<'a> {
+    port: [u8; 2],
+    ip: &'a [u8],
+}
+
+impl<'a> InetAddr<'a> {
+    /// sockaddr のバイトから (map_addr: なければ、family しかなければ、なし。bind は AF_UNSPEC (INADDR_ANY だけ) も
+    /// AF_INET として: bind_map_addr)。長さや family の確かめは前に (aa_map_addr)
+    fn of(a: Option<&'a [u8]>, bind: bool) -> Self {
+        match a.filter(|a| a.len() >= 2).map(|a| (u16::from_le_bytes([a[0], a[1]]), a)) {
+            Some((f, a)) if (f == 2 || (bind && f == 0)) && a.len() >= 8 => InetAddr { port: [a[2], a[3]], ip: &a[4..8] },
+            Some((10, a)) if a.len() >= 24 => InetAddr { port: [a[2], a[3]], ip: &a[8..24] },
+            _ => InetAddr { port: [0, 0], ip: &[] },
+        }
+    }
+
+    /// 特権の port か (0 はちがう)
+    fn privileged(&self) -> bool {
+        (1..PROT_SOCK).contains(&u16::from_be_bytes(self.port))
+    }
+}
+
+/// ここまでで request がみな許されているか (early_match で止まるところ)
+fn covered(p: &Profile, st: u32, request: u32) -> bool {
+    p.policy.lookup(st, true).allow & request == request
+}
+
+/// 許しが足りず、先を見る印 (AA_CONT_MATCH) もないところ (Ubuntu の early_match はここで止めて拒む)。aios はここでも
+/// 先を読み、先がなかったときだけ、ここの許しにする (parser は deny の決まりで (inet, type) のところに印を deny で
+/// 書くので、許しから印が消える: `deny network (connect) inet stream peer=(port=N),` があるだけで、Ubuntu ではその型の
+/// op がみな止まる)
+fn stops(p: &Profile, st: u32, request: u32) -> bool {
+    let e = p.policy.lookup(st, true);
+    e.allow & request != request && e.allow & CONT_MATCH == 0
+}
+
+/// match_addr_label: 番地 (種類、port、長さ、ip) と区切り、早くきまればそこで (true)、でなければラベル (いまは区切りだけ)。
+/// 相手の番地では早く止めない (aios: parser は自分の番地の条件のない決まりの自分のところを「種類 + port はなんでも」で
+/// 書くので、相手の番地 (種類 ADDR_REMOTE) もそこにあたる。Ubuntu のようにそこで止めると、peer=(...) の決まりが、どの
+/// 相手にも許してしまう。相手の条件は、そのあとの CMD_ADDR と自分の番地まで見てはじめて決まる)。stop は stops の
+/// ところ (いちばん深いもの)
+#[allow(clippy::too_many_arguments)]
+fn inet_addr(p: &Profile, d: &Dfa, st: u32, kind: u8, a: &InetAddr, request: u32, info: &mut Option<&'static str>, stop: &mut Option<u32>) -> (u32, bool) {
+    let len = match a.ip.len() {
+        4 => 1,
+        16 => 2,
+        _ => 0,
+    };
+    let mut st = d.match_len(st, &[kind]);
+    st = d.match_len(st, &a.port);
+    st = d.match_len(st, &[len]);
+    st = d.match_len(st, a.ip);
+    if st != DFA_NOMATCH {
+        st = d.step(st, 0);
+    }
+    if st == DFA_NOMATCH {
+        *info = Some(if kind == ADDR_REMOTE { "failed remote addr match" } else { "failed local addr match" });
+        return (st, true);
+    }
+    if kind != ADDR_REMOTE {
+        if covered(p, st, request) {
+            return (st, true);
+        }
+        if stops(p, st, request) {
+            *stop = Some(st);
+        }
+    }
+    (d.step(st, 0), false)
+}
+
+/// (inet, type, protocol) から op の形のとおりにたどった状態 (af はもうたどったところ st から)。lkind は自分の番地の種類。
+/// 先がなければ、いちばん深い stops のところ (v8 の決まりなら (inet, type) のところで、Linux と同じ)
+#[allow(clippy::too_many_arguments)]
+fn inet_walk(p: &Profile, d: &Dfa, st: u32, request: u32, typ: u32, protocol: u32, lkind: u8, local: &InetAddr, what: &InetOp, info: &mut Option<&'static str>) -> u32 {
+    let mut stop = None;
+    let st = inet_walk_to(p, d, st, request, typ, protocol, lkind, local, what, info, &mut stop);
+    match stop {
+        Some(s) if st == DFA_NOMATCH => {
+            // v8 の決まりは protocol を書かない (そこで止まるのがふつう)
+            if *info == Some("failed protocol match") {
+                *info = None;
+            }
+            s
+        }
+        _ => st,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inet_walk_to(p: &Profile, d: &Dfa, st: u32, request: u32, typ: u32, protocol: u32, lkind: u8, local: &InetAddr, what: &InetOp, info: &mut Option<&'static str>, stop: &mut Option<u32>) -> u32 {
+    let be = |v: u32| (v as u16).to_be_bytes();
+    // match_to_prot
+    let st = d.match_len(st, &be(typ));
+    if st == DFA_NOMATCH {
+        *info = Some("failed type match");
+        return st;
+    }
+    if covered(p, st, request) {
+        return st;
+    }
+    if stops(p, st, request) {
+        *stop = Some(st);
+    }
+    let st = d.match_len(st, &be(protocol));
+    if st == DFA_NOMATCH {
+        *info = Some("failed protocol match");
+        return st;
+    }
+    let (first, kind, cmd) = match what {
+        InetOp::Remote(r) => (InetAddr::of(*r, false), ADDR_REMOTE, Some(CMD_ADDR)),
+        InetOp::Cmd(c, _) => (InetAddr { port: local.port, ip: local.ip }, lkind, Some(*c)),
+        _ => (InetAddr { port: local.port, ip: local.ip }, lkind, None),
+    };
+    let (st, done) = inet_addr(p, d, st, kind, &first, request, info, stop);
+    let Some(cmd) = cmd.filter(|_| !done) else { return st };
+    // match_to_cmd
+    let mut st = d.step(st, cmd);
+    if st == DFA_NOMATCH {
+        *info = Some("failed cmd selection match");
+        return st;
+    }
+    match what {
+        // 相手のあることは、自分の番地とのくみあわせか
+        InetOp::Remote(_) => inet_addr(p, d, st, lkind, local, request, info, stop).0,
+        InetOp::Cmd(c, rest) => {
+            for v in rest.iter() {
+                st = d.match_len(st, &v.to_be_bytes());
+            }
+            if st == DFA_NOMATCH {
+                *info = Some(if *c == CMD_LISTEN { "failed listen backlog match" } else { "failed sockopt match" });
+            }
+            st
+        }
+        _ => st,
+    }
+}
+
+/// 2 つの読みの許しを 1 つに: どちらかが許し、どちらも拒まないもの
+fn perms_union(a: &Perms, b: &Perms) -> Perms {
+    let deny = a.deny | b.deny;
+    Perms {
+        allow: (a.allow | b.allow) & !deny,
+        deny,
+        kill: a.kill | b.kill,
+        complain: a.complain | b.complain,
+        prompt: a.prompt | b.prompt,
+        audit: a.audit | b.audit,
+        quiet: a.quiet | b.quiet,
+        hide: a.hide | b.hide,
+        ..*a
+    }
+}
+
+/// AF_INET のソケットへの op を、いまのプロセスの決まりで。local は自分の番地 (getsockname と同じ sockaddr)。
+/// 自分の番地の種類は、bind で特権の port なら ADDR_LOCAL_PRIV (Ubuntu と同じ)。bind のほかの op で自分の port が特権の
+/// ときは、ADDR_LOCAL と ADDR_LOCAL_PRIV の両方で読んで、許しを合わせる (aios: parser は bind を許す決まりの特権の
+/// port をみな ADDR_LOCAL_PRIV で書くので、Ubuntu のように ADDR_LOCAL だけで読むと、`network inet stream port=80,` で
+/// bind できても listen や accept や送る・受けるができない)
+#[allow(clippy::too_many_arguments)]
+pub fn inet_perm(op: &str, request: u32, typ: u32, protocol: u32, local: &[u8], what: InetOp, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
+    let Some(p) = current_profile() else { return Ok(()) };
+    let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    // RULE_MEDIATES_AF: v9 の決まりで inet を書いていなければ v8 のように
+    let st = d.match_len(v9, &2u16.to_be_bytes());
+    if st == DFA_NOMATCH {
+        return af_perm(&p, op, request, 2, typ, protocol, extra);
+    }
+    let (local, kinds): (InetAddr, &[u8]) = match &what {
+        InetOp::Bind(a) => {
+            let a = InetAddr::of(Some(a), true);
+            let k: &[u8] = if a.privileged() { &[ADDR_LOCAL_PRIV] } else { &[ADDR_LOCAL] };
+            (a, k)
+        }
+        _ => {
+            let a = InetAddr::of(Some(local), false);
+            let k: &[u8] = if a.privileged() { &[ADDR_LOCAL, ADDR_LOCAL_PRIV] } else { &[ADDR_LOCAL] };
+            (a, k)
+        }
+    };
+    let mut info = None;
+    let mut perms: Option<Perms> = None;
+    for &k in kinds {
+        let mut i = None;
+        let s = inet_walk(&p, d, st, request, typ, protocol, k, &local, &what, &mut i);
+        let q = p.policy.lookup(s, true);
+        // たどれなかったわけは、どの読みでもたどれなかったときだけ
+        info = if perms.is_none() || info.is_some() { i } else { None };
+        perms = Some(match perms {
+            Some(a) => perms_union(&a, &q),
+            None => q,
+        });
+    }
+    net_check_perms(&p, perms.unwrap_or_default(), info, op, request, 2, typ, protocol, extra)
 }
 
 /// いまのプロセスに決まりがあり、net を見るか (af_inet.c の label_mediates(label, AA_CLASS_NET): 番地の確かめもこのときだけ)
@@ -3104,8 +3332,14 @@ pub const FEATURES: &[(&str, &str)] = &[
     ("network_v8/af_mask", AF_MASK),
     ("network_v8/tcp-fast-open", "yes"),
     ("network_v9/af_mask", AF_MASK),
+    // aios がえらんだちがい (apparmor-inet): Linux 7.3 は af_inet を名のらない
+    ("network_v9/af_inet", "yes"),
     ("network_v9/af_unix", "yes"),
     ("network_v9/tcp-fast-open", "yes"),
+    // 許しの表 (perms: Linux の PERMS32STR)。network_v9 の af_inet の決まりは、まだ先を見る印 (AA_CONT_MATCH) を
+    // accept にうめこめないので、表で読む (Linux 7.3 も名のる)
+    ("policy/permstable32", "allow deny subtree cond kill complain prompt audit quiet hide xindex tag label"),
+    ("policy/permstable32_version", "0x000003"),
     ("policy/set_load", "yes"),
     ("policy/versions/v5", "yes"),
     ("policy/versions/v6", "yes"),

@@ -1,5 +1,6 @@
 // BSD ソケットのシステムコール。AF_UNIX は unix.rs、AF_INET の TCP と UDP は inet.rs、ICMP の echo (ping) と raw は
 // ここで smoltcp のソケットを使う
+use crate::apparmor::InetOp;
 use crate::cell::Bkl;
 use crate::file::{self, FileRef, Kind};
 use crate::inet::InetRef;
@@ -343,40 +344,55 @@ fn aa_create(domain: u64, t: u64, protocol: u64) -> Result<(), i64> {
 }
 
 /// ソケットへの op (getsockname、getpeername、shutdown、sockopt、listen、accept、bind。inet は sendmsg と recvmsg も:
-/// remote はその名前で、番地を確かめて記録に)。AF_UNIX の送る・受けるは unix.rs (unix_may_send) で見る
-fn aa_sk(s: &Sock, op: &str, request: u32, remote: Option<&[u8]>) -> Result<(), i64> {
+/// what は AF_INET の番地の見かた。相手の名前は確かめて記録に)。AF_UNIX の送る・受けるは unix.rs (unix_may_send) で見る
+fn aa_sk(s: &Sock, op: &str, request: u32, what: InetOp) -> Result<(), i64> {
     if !crate::apparmor::confined() {
         return Ok(());
     }
     match s {
         Sock::Unix(_, u) => crate::unix::aa_perm(u, op, request),
-        Sock::Inet(_, u) => aa_inet(u, op, request, remote),
+        Sock::Inet(_, u) => aa_inet(u, op, request, what),
         Sock::Smol(s) => {
-            let t = if s.borrow().proto == Proto::Raw { 3 } else { 2 };
-            crate::apparmor::net_perm(op, request, AF_INET as u32, t, IPPROTO_ICMP as u32, &crate::apparmor::NetAudit::default)
+            if let InetOp::Remote(r) = &what
+                && crate::apparmor::net_mediated()
+            {
+                crate::inet::aa_map_addr(*r)?;
+            }
+            let (t, local) = {
+                let s = s.borrow();
+                (if s.proto == Proto::Raw { 3 } else { 2 }, smol_name(&s))
+            };
+            crate::apparmor::inet_perm(op, request, t, IPPROTO_ICMP as u32, &local, what, &crate::apparmor::NetAudit::default)
         }
     }
+}
+
+/// ICMP と raw のソケットの名前 (getsockname と同じ)
+fn smol_name(s: &Socket) -> [u8; 16] {
+    endpoint_bytes(s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::addr())), l.port)))
 }
 
 /// AF_INET へ送る (apparmor_socket_sendmsg: TCP の MSG_FASTOPEN で名前があれば、つなぐのも見る)
 fn aa_send(u: &InetRef, flags: u64, to: Option<&[u8]>) -> Result<(), i64> {
     const MSG_FASTOPEN: u64 = 0x2000_0000;
-    aa_inet(u, "sendmsg", crate::apparmor::MAY_SEND, to)?;
+    aa_inet(u, "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to))?;
     if flags & MSG_FASTOPEN != 0 && to.is_some() && u.borrow().tcp {
-        aa_inet(u, "connect", crate::apparmor::MAY_CONNECT, to)?;
+        aa_inet(u, "connect", crate::apparmor::MAY_CONNECT, InetOp::Remote(to))?;
     }
     Ok(())
 }
 
 /// AF_INET のソケットへの op (read / write も: sock_read_iter と sock_write_iter は recvmsg と sendmsg の hook を通る)
-fn aa_inet(u: &InetRef, op: &str, request: u32, remote: Option<&[u8]>) -> Result<(), i64> {
+fn aa_inet(u: &InetRef, op: &str, request: u32, what: InetOp) -> Result<(), i64> {
     if !crate::apparmor::confined() {
         return Ok(());
     }
-    if crate::apparmor::net_mediated() {
-        crate::inet::aa_map_addr(remote)?;
+    if let InetOp::Remote(r) = &what
+        && crate::apparmor::net_mediated()
+    {
+        crate::inet::aa_map_addr(*r)?;
     }
-    crate::inet::aa_perm(u, op, request, None, remote)
+    crate::inet::aa_perm(u, op, request, what)
 }
 
 /// fd のソケット (ない fd は EBADF、ソケットでなければ ENOTSOCK)
@@ -523,7 +539,7 @@ pub fn inet_readv(f: &FileRef, u: &InetRef, iov: &[(usize, usize)], nowait: bool
     if iov.iter().all(|x| x.1 == 0) {
         return Ok(0);
     }
-    aa_inet(u, "recvmsg", crate::apparmor::MAY_RECEIVE, None)?;
+    aa_inet(u, "recvmsg", crate::apparmor::MAY_RECEIVE, InetOp::Remote(None))?;
     let r = inet_recv(u, iov, 0, nowait || nonblock_of(f, 0))?;
     Ok(r.ret as i64)
 }
@@ -677,12 +693,18 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
                 if crate::apparmor::net_mediated() {
                     aa_bind_addr(&a)?;
                 }
-                crate::inet::aa_perm(&u, "bind", crate::apparmor::MAY_BIND, Some(&a), None)?;
+                crate::inet::aa_perm(&u, "bind", crate::apparmor::MAY_BIND, InetOp::Bind(&a))?;
             }
             crate::inet::bind(&u, &a)
         }
         Sock::Smol(s) => {
-            aa_sk(&Sock::Smol(s.clone()), "bind", crate::apparmor::MAY_BIND, None)?;
+            if crate::apparmor::confined() {
+                let a = addr_in(addr, len)?;
+                if crate::apparmor::net_mediated() {
+                    aa_bind_addr(&a)?;
+                }
+                aa_sk(&Sock::Smol(s.clone()), "bind", crate::apparmor::MAY_BIND, InetOp::Bind(&a))?;
+            }
             let ep = read_addr(addr, len)?;
             let mut s = s.borrow_mut();
             let a = if ep.addr.is_unspecified() { None } else { Some(ep.addr) };
@@ -712,7 +734,7 @@ pub fn listen(fd: u64, backlog: u64) -> R {
     let s = sock(fd)?;
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_listen(u, (backlog as u32).min(crate::unix::SOMAXCONN))?,
-        _ => aa_sk(&s, "listen", crate::apparmor::MAY_LISTEN, None)?,
+        _ => aa_sk(&s, "listen", crate::apparmor::MAY_LISTEN, InetOp::Cmd(crate::apparmor::CMD_LISTEN, &[(backlog as u32).min(crate::unix::SOMAXCONN) as u16]))?,
     }
     match s {
         Sock::Unix(_, u) => crate::unix::listen(&u, (backlog as u32).min(crate::unix::SOMAXCONN)),
@@ -733,7 +755,7 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
     // AppArmor: 受けるのを待つ前に (security_socket_accept)
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_accept(u)?,
-        _ => aa_sk(&s, "accept", crate::apparmor::MAY_ACCEPT, None)?,
+        _ => aa_sk(&s, "accept", crate::apparmor::MAY_ACCEPT, InetOp::Sk)?,
     }
     match s {
         Sock::Unix(f, u) => {
@@ -778,13 +800,16 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
                     return Err(crate::why::inval());
                 }
                 if a.len() >= 2 && u16::from_le_bytes([a[0], a[1]]) != 0 {
-                    aa_inet(&u, "connect", crate::apparmor::MAY_CONNECT, Some(&a))?;
+                    aa_inet(&u, "connect", crate::apparmor::MAY_CONNECT, InetOp::Remote(Some(&a)))?;
                 }
             }
             crate::inet::connect(&f, &u, &a)
         }
         Sock::Smol(s) => {
-            aa_sk(&Sock::Smol(s.clone()), "connect", crate::apparmor::MAY_CONNECT, None)?;
+            if crate::apparmor::confined() {
+                let a = addr_in(addr, len)?;
+                aa_sk(&Sock::Smol(s.clone()), "connect", crate::apparmor::MAY_CONNECT, InetOp::Remote(Some(&a)))?;
+            }
             let ep = read_addr(addr, len)?;
             let mut s = s.borrow_mut();
             if s.isolated {
@@ -816,7 +841,10 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
             crate::inet::send(&u, crate::unix::Src::User(&iov), len, to.as_deref(), &[], flags, nb)
         }
         Sock::Smol(s) => {
-            aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, None)?;
+            if crate::apparmor::confined() {
+                let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
+                aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to.as_deref()))?;
+            }
             let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
             let mut data = uninit(len.min(64 * 1024));
             proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
@@ -830,7 +858,7 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
     let iov = [(buf, len.min(MAX_RW))];
     let s = sock(fd)?;
     if !matches!(s, Sock::Unix(..)) {
-        aa_sk(&s, "recvmsg", crate::apparmor::MAY_RECEIVE, None)?;
+        aa_sk(&s, "recvmsg", crate::apparmor::MAY_RECEIVE, InetOp::Remote(None))?;
     }
     match s {
         Sock::Unix(f, u) => {
@@ -861,7 +889,7 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
 
 pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
     let s = sock(fd)?;
-    aa_sk(&s, "getsockname", crate::apparmor::MAY_GETATTR, None)?;
+    aa_sk(&s, "getsockname", crate::apparmor::MAY_GETATTR, InetOp::Sk)?;
     match s {
         Sock::Unix(_, u) => addr_out(addr, lenp, &crate::unix::name(&u, false)?)?,
         Sock::Inet(_, u) => addr_out(addr, lenp, &crate::inet::name(&u, 0)?)?,
@@ -876,7 +904,7 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
 
 pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
     let s = sock(fd)?;
-    aa_sk(&s, "getpeername", crate::apparmor::MAY_GETATTR, None)?;
+    aa_sk(&s, "getpeername", crate::apparmor::MAY_GETATTR, InetOp::Sk)?;
     match s {
         Sock::Unix(_, u) => addr_out(addr, lenp, &crate::unix::name(&u, true)?)?,
         Sock::Inet(_, u) => addr_out(addr, lenp, &crate::inet::name(&u, 1)?)?,
@@ -898,7 +926,7 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     // AppArmor: 長さを読む前に (do_sock_getsockopt)
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_opt(u, "getsockopt", crate::apparmor::MAY_GETOPT, opt as u32)?,
-        _ => aa_sk(&s, "getsockopt", crate::apparmor::MAY_GETOPT, None)?,
+        _ => aa_sk(&s, "getsockopt", crate::apparmor::MAY_GETOPT, InetOp::Cmd(crate::apparmor::CMD_OPT, &[level as u16, opt as u16]))?,
     }
     let pt = proc::current().pt();
     let mut l = [0u8; 4];
@@ -927,7 +955,7 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
 
 pub fn shutdown(fd: u64, how: u64) -> R {
     let s = sock(fd)?;
-    aa_sk(&s, "socket_shutdown", crate::apparmor::MAY_SHUTDOWN, None)?;
+    aa_sk(&s, "socket_shutdown", crate::apparmor::MAY_SHUTDOWN, InetOp::Sk)?;
     match s {
         Sock::Unix(_, u) => crate::unix::shutdown(&u, how as u32 as u64),
         Sock::Inet(_, u) => crate::inet::shutdown(&u, how),
@@ -1000,14 +1028,18 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
             crate::inet::send(&u, crate::unix::Src::User(&m.iov), total, to.as_deref(), &ctl, flags, nonblock_of(&f, flags))
         }
         Sock::Smol(s) => {
-            aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, None)?;
-            let to = if m.name != 0 {
+            let namelen = if m.name != 0 {
                 let mut l = [0u8; 4];
                 proc::current().pt().copy_in(&mut l, m.namelen_at).ok_or(-EFAULT)?;
-                Some(read_addr(m.name, u32::from_le_bytes(l) as usize)?)
+                Some(u32::from_le_bytes(l) as usize)
             } else {
                 None
             };
+            if crate::apparmor::confined() {
+                let to = namelen.map(|n| addr_in(m.name, n)).transpose()?;
+                aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to.as_deref()))?;
+            }
+            let to = namelen.map(|n| read_addr(m.name, n)).transpose()?;
             let mut data = Vec::new();
             for (base, len) in &m.iov {
                 let start = data.len();
@@ -1081,7 +1113,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
     let s = sock(fd)?;
     let m = read_msghdr(msg)?;
     if !matches!(s, Sock::Unix(..)) {
-        aa_sk(&s, "recvmsg", crate::apparmor::MAY_RECEIVE, None)?;
+        aa_sk(&s, "recvmsg", crate::apparmor::MAY_RECEIVE, InetOp::Remote(None))?;
     }
     let pt = proc::current().pt();
     let namelen = |m: &MsgHdr| -> Result<i32, i64> {
@@ -1161,7 +1193,7 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     }
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_opt(u, "setsockopt", crate::apparmor::MAY_SETOPT, opt as u32)?,
-        _ => aa_sk(&s, "setsockopt", crate::apparmor::MAY_SETOPT, None)?,
+        _ => aa_sk(&s, "setsockopt", crate::apparmor::MAY_SETOPT, InetOp::Cmd(crate::apparmor::CMD_OPT, &[level as u16, opt as u16]))?,
     }
     let mut b = vec![0u8; (len as usize).min(64)];
     match s {

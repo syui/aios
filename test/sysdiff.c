@@ -293,6 +293,9 @@ static const struct {
     {"pipe-fault", "パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT)。Linux はパイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す)"},
     {"pipe-nowait", "パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く (待たない)。Linux は splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP"},
     {"unix-gc-now", "送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じたものなど) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF)。Linux はほかの AF_UNIX のソケットが閉じたときに、うしろ (kworker) で片づけるので、それまで相手からはつながったまま"},
+    {"select-ebadf", "select / pselect6 で nfds までに開いていない fd のビットがあれば、どの番号でも EBADF (POSIX)。Linux は fd の表の大きさ (はじめは 64) より先のビットを見ずにすてる (select(2) の BUGS)。ロボットは select を使わない (test/chosen.c がたしかめる)"},
+    {"lock-deadlock", "fcntl のレコードロックの行きどまりを、輪の長さによらず EDEADLK にする。Linux は 11 たどるとやめるので、13 より多い持ち主の輪は見のがして、みないつまでも待つ (fcntl(2) の BUGS)。ロボットはロックを待たない (test/chosen.c がたしかめる)"},
+    {"apparmor-inet", "AppArmor の network_v9 の af_inet を名のり、ip= と port= の決まりを効かせる (Ubuntu のカーネルの読みかたで、特権の port、deny の決まり、自分の番地の条件のない peer の決まりのまちがいはなおして)。Linux 7.3 は af_inet を名のらないので、apparmor_parser が番地を落として (inet, type) の決まりに広げる。ロボットは AppArmor を見ない (test/apparmor.c がたしかめる)"},
 };
 
 // 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)
