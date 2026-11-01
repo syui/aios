@@ -55,6 +55,7 @@
   {"name": "module", "type": "extra", "src": "src/module.rs", "what": "モジュール: カーネルに入っているが、起動しただけでは動かさないドライバ (画面、入力、音)", "off": "init_module、finit_module、delete_module が ENOSYS (画面、入力、音のドライバを起こせない)"},
   {"name": "net", "type": "extra", "src": "src/net.rs", "what": "ネットワーク: virtio-net を smoltcp (TCP/IP) につなぐ", "off": "ネットワークを起こさない (virtio-net も lo もない。ラズパイと同じ)"},
   {"name": "netif", "type": "extra", "src": "src/netif.rs", "what": "ネットワークのインターフェースの ioctl (Linux と同じ番号と形。ソケットの fd に)"},
+  {"name": "netlink", "type": "extra", "src": "src/netlink.rs", "what": "AF_NETLINK のソケット (Linux の af_netlink.c と同じ: ポート、bind、データグラム、NLMSG_DONE、NLMSG_ERROR と ACK) と NETLINK_ROUTE の口とアドレスの一覧 (RTM_GETLINK と RTM_GETADDR: getifaddrs、if_nameindex)。nftables をのせる土台"},
   {"name": "ns", "type": "extra", "src": "src/ns.rs", "what": "namespace: プロセスから見える世界を分ける (Linux と同じ CLONE_NEW* と unshare)", "off": "clone と unshare の CLONE_NEW* が EINVAL"},
   {"name": "procfs", "type": "extra", "src": "src/procfs.rs", "what": "/proc: プロセスの様子を見せる小さなファイルシステム"},
   {"name": "prof", "type": "extra", "src": "src/prof.rs", "what": "調べもの用: カーネルの中の区間ごとの回数と時間 (/proc/ai/ctl の prof on、/proc/ai/prof)"},

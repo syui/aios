@@ -3,7 +3,9 @@
 //           SIOCGIFHWADDR (MAC) SIOCGIFMTU SIOCGIFINDEX
 //   変える: SIOCSIFADDR (0.0.0.0 なら DHCP にもどす) SIOCSIFNETMASK
 //           SIOCADDRT SIOCDELRT (デフォルトのゲートウェイだけ)  ← root だけ
-// struct ifreq は 名前 16 バイト + 中身 (sockaddr など) 24 バイト。インターフェースは eth0 だけ
+// struct ifreq は 名前 16 バイト + 中身 (sockaddr など) 24 バイト。インターフェースは lo (番号 1) と eth0 (2: netlink と
+// /sys/class/net と同じ。Linux と同じ番号)。SIOCGIFCONF は eth0 だけ (aios の ip と networkd は、はじめのものを eth0 と
+// みなす。lo は名前で聞ける)
 use crate::net;
 use crate::proc;
 use smoltcp::wire::Ipv4Address;
@@ -29,6 +31,7 @@ const EADDRNOTAVAIL: i64 = 99;
 
 const AF_INET: u16 = 2;
 const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
 const IFF_UP: u16 = 0x1;
 const IFF_BROADCAST: u16 = 0x2;
 const IFF_RUNNING: u16 = 0x40;
@@ -135,6 +138,9 @@ pub fn ioctl(req: u64, arg: usize) -> R {
     let mut r = [0u8; IFREQ];
     copy_in(&mut r, arg)?;
     let name_len = r[..16].iter().position(|&b| b == 0).unwrap_or(16);
+    if &r[..name_len] == b"lo" {
+        return lo(req, arg, r);
+    }
     if &r[..name_len] != net::IFNAME.as_bytes() {
         return Err(-ENODEV);
     }
@@ -142,6 +148,7 @@ pub fn ioctl(req: u64, arg: usize) -> R {
     match req {
         SIOCGIFFLAGS => {
             let f = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+            debug_assert_eq!(f, crate::netlink::ETH_FLAGS);
             r[16..18].copy_from_slice(&f.to_le_bytes());
         }
         SIOCGIFADDR => {
@@ -162,7 +169,7 @@ pub fn ioctl(req: u64, arg: usize) -> R {
             r[18..24].copy_from_slice(&net::mac().unwrap_or_default());
         }
         SIOCGIFMTU => r[16..20].copy_from_slice(&1500i32.to_le_bytes()),
-        SIOCGIFINDEX => r[16..20].copy_from_slice(&1i32.to_le_bytes()),
+        SIOCGIFINDEX => r[16..20].copy_from_slice(&crate::netlink::ETH_INDEX.to_le_bytes()),
         SIOCSIFADDR => {
             root()?;
             net::set_addr(addr_of(&r[16..32]), None);
@@ -174,6 +181,29 @@ pub fn ioctl(req: u64, arg: usize) -> R {
             let c = cidr.ok_or(-EADDRNOTAVAIL)?;
             net::set_addr(c.address(), Some(p));
             return Ok(0);
+        }
+        _ => return Err(-ENOTTY),
+    }
+    copy_out(arg, &r)?;
+    Ok(0)
+}
+
+/// lo への ioctl: 見るものは Linux の lo と同じ (127.0.0.1/8、ブロードキャストなし、MTU 65536)。変えるのはできない
+fn lo(req: u64, arg: usize, mut r: [u8; IFREQ]) -> R {
+    match req {
+        SIOCGIFFLAGS => r[16..18].copy_from_slice(&crate::netlink::LO_FLAGS.to_le_bytes()),
+        SIOCGIFADDR => r[16..32].copy_from_slice(&sockaddr(Ipv4Address::new(127, 0, 0, 1))),
+        SIOCGIFNETMASK => r[16..32].copy_from_slice(&sockaddr(mask_of(8))),
+        SIOCGIFBRDADDR => r[16..32].copy_from_slice(&sockaddr(Ipv4Address::UNSPECIFIED)),
+        SIOCGIFHWADDR => {
+            r[16..18].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            r[18..24].fill(0);
+        }
+        SIOCGIFMTU => r[16..20].copy_from_slice(&65536i32.to_le_bytes()),
+        SIOCGIFINDEX => r[16..20].copy_from_slice(&crate::netlink::LO_INDEX.to_le_bytes()),
+        SIOCSIFADDR | SIOCSIFNETMASK => {
+            root()?;
+            return Err(crate::why::inval());
         }
         _ => return Err(-ENOTTY),
     }

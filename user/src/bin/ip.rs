@@ -49,8 +49,10 @@ fn dev(rest: &[&str]) -> std::io::Result<String> {
     netif::names()?.into_iter().next().ok_or_else(|| bad("no interface"))
 }
 
+/// n は並びの番号 (カーネルの番号が聞けなかったとき)
 fn header(i: &netif::If, n: usize) {
     let flags = if i.up { "BROADCAST,MULTICAST,UP,LOWER_UP" } else { "BROADCAST,MULTICAST" };
+    let n = if i.index > 0 { i.index as usize } else { n };
     println!("{}: {}: <{}> mtu {} state {}", n, i.name, flags, i.mtu, if i.up { "UP" } else { "DOWN" });
     let m = i.mac;
     println!("    link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} brd ff:ff:ff:ff:ff:ff", m[0], m[1], m[2], m[3], m[4], m[5]);

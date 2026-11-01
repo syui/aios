@@ -44,6 +44,7 @@ mod prof;
 mod inet;
 mod net;
 mod netif;
+mod netlink;
 mod parts;
 mod proc;
 mod sd;

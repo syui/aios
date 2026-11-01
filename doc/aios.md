@@ -635,6 +635,47 @@ apparmor.service と同じく Before=sysinit.target で、aios の init は Befo
 した (0 だと、libapparmor の path_from_fd が lstat の大きさから readlink を始めて足りなければ倍にするので、0 のまま回り
 つづけ、--write-cache が止まっていた)。
 
+### ファイアウォール (nftables) の考え (まだ作っていない)
+
+いまの aios のネットワーク: 外 (eth0 の向こう) は virtio-net のフレームを smoltcp にわたし、中どうし (127.0.0.0/8、eth0 の
+アドレス) はパケットを作らずに相手のソケットの行列へじかに入れる (inet.rs、unix.rs)。netlink は段階 0 で入れた (それまで
+getifaddrs と if_nameindex も EAFNOSUPPORT でしくじっていた)。aibox は landlock でポートをしぼるだけで、名前空間に口 (veth)
+はないので、転送と NAT はいまはいらない。ファイアウォールの仕事は、eth0 から入るものと出るもの。
+
+Linux と同じ nftables にする (nft の道具がそのまま動き、Linux の決まりのファイルがそのまま使える)。段階:
+
+- 段階 0 (できた): netlink (AF_NETLINK、kernel/src/netlink.rs) と NETLINK_ROUTE の口とアドレスの一覧 (RTM_GETLINK、
+  RTM_GETADDR の dump と 1 つの RTM_GETLINK)。getifaddrs、if_nameindex、node の os.networkInterfaces() などが動く。
+  ソケットのきまり (ポートは tgid から、bind、データグラムごとに受けて短ければ MSG_TRUNC、dump は中身と NLMSG_DONE の 2 つの
+  データグラム、NLMSG_ERROR ともとのメッセージ、NETLINK_CAP_ACK、REQUEST のないものと短いものには答えない、root でなければ
+  変える type は EPERM) は Linux 7.3.1 と同じ (test/netlink.c の 79 の答え)。口の番号は Linux と同じ lo 1、eth0 2 に
+  そろえた (ioctl の SIOCGIFINDEX と /sys/class/net。前は eth0 が 1)。ioctl は名前で lo も聞ける。SIOCGIFCONF は eth0
+  だけのまま (aios の ip、networkd、aios は、はじめのものを eth0 とみなす)。ほかの protocol (NETLINK_NETFILTER など) は
+  EPROTONOSUPPORT、口やアドレスを netlink で変えるのはまだ (EOPNOTSUPP。ioctl でできる)
+- 段階 1: nfnetlink と nf_tables の表 (table、chain、rule、set とその要素、生成番号、batch で一度に入れかえる)。
+  `nft -f` と `nft list ruleset` が Linux と同じに通る。パッケージ nftables (nft、libnftnl、libmnl を静的に)
+- 段階 2: 評価 (nft の VM: レジスタと式 payload、meta、cmp、bitwise、immediate (verdict)、lookup、range、counter、limit、
+  log、reject) とフック。外から来たフレームは smoltcp にわたす前 (prerouting、input)、出すフレームは出す前 (output、
+  postrouting)。中どうしはパケットがないので、connect、送る、受けるところで同じ見かけ (5 つ組、iif / oif は lo) を作って
+  同じ鎖を通す
+- 段階 3: conntrack (ct state new / established / related / invalid。よく使う `ct state established,related accept` の
+  ため。TCP の状態は smoltcp と inet.rs が持っている)
+- そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 (aios に IPv6 ができてから)
+
+Linux とのくらべかた: 手本の Linux (test/linux.config) に nf_tables と virtio-net を入れ、同じ nft の決まりで、同じ相手
+(QEMU のユーザーネットワークの 10.0.2.2) へのつなぎと受けの答え (つながる、ECONNREFUSED、時間切れ)、`nft -j list ruleset`、
+counter の数をくらべる。nf_tables の大きさは、Linux 7.3.1 で nf_tables_api.c が 1 万 2 千行、netlink (af_netlink.c と
+nfnetlink.c) が 3 千 8 百行、conntrack の核と TCP が 4 千 5 百行ほど。
+
+Linux よりよくできそうなところ: (1) 止めたわけが見える: ファイアウォールで捨てたら /proc/ai/why に、どの table、chain、
+rule (handle) かを書く (connect が時間切れになったプロセスにも)。Linux は黙って捨てる (log や `nft monitor trace` を自分で
+入れる)。(2) 中どうし (lo) も同じ決まりで、パケットを作らない aios でも効く。(3) アプリごとの決まりは、いまでも
+AppArmor の network_v9 の af_inet (ip と port。Linux の本体は効かせない: apparmor-inet) と landlock (TCP の bind と
+connect のポート) でかけられる。nftables は、システムぜんたいの決まり (外から来るつなぎなど)。
+
+決めること: nft と同じ API にするか (すすめ)、aios だけの小さな決まり (/etc/aios.json の firewall など) からはじめるか。
+conntrack まで要るか。外 (eth0) だけでよいか、中どうし (lo) にもかけるか。
+
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
 プログラムは、この CPU で使える命令を AT_HWCAP と AT_HWCAP2 (getauxval) か /proc/cpuinfo の `Features` で知る。前の aios

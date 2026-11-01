@@ -13,6 +13,8 @@ pub struct If {
     pub up: bool,
     /// DHCP でもらったアドレスか (/proc/net/pnp)
     pub dhcp: bool,
+    /// カーネルの番号 (SIOCGIFINDEX。lo が 1、eth0 が 2。聞けなければ 0)
+    pub index: i32,
 }
 
 const SIOCGIFCONF: libc::c_ulong = 0x8912;
@@ -23,6 +25,7 @@ const SIOCGIFNETMASK: libc::c_ulong = 0x891b;
 const SIOCSIFNETMASK: libc::c_ulong = 0x891c;
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
 const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
+const SIOCGIFINDEX: libc::c_ulong = 0x8933;
 const SIOCADDRT: libc::c_ulong = 0x890b;
 const SIOCDELRT: libc::c_ulong = 0x890c;
 
@@ -118,7 +121,9 @@ pub fn get(name: &str) -> io::Result<If> {
     let mut r = ifreq(name);
     let prefix = s.ioctl(SIOCGIFNETMASK, &mut r).ok().map_or(0, |_| u32::from_be_bytes(get_addr(&r[16..])).leading_ones() as u8);
     let dhcp = std::fs::read_to_string("/proc/net/pnp").is_ok_and(|p| p.starts_with("#PROTO: DHCP"));
-    Ok(If { name: name.to_string(), addr, prefix, mac, mtu, up, dhcp })
+    let mut r = ifreq(name);
+    let index = s.ioctl(SIOCGIFINDEX, &mut r).ok().map_or(0, |_| i32::from_le_bytes(r[16..20].try_into().unwrap()));
+    Ok(If { name: name.to_string(), addr, prefix, mac, mtu, up, dhcp, index })
 }
 
 /// アドレスを決める (DHCP はやめる)

@@ -34,7 +34,7 @@
               "uart", "console", "kmsg", "tty", "proc", "signal", "syscall", "exec", "file", "locks", "futex", "sysfile", "vfs", "statc", "fastdir", "fs", "tmpfs",
               "initrd", "cred", "crypto", "rand", "parts"],
     "extra": ["aiproc", "apparmor", "bcm2835_rng", "block", "efi", "epoll", "extfs", "gpu", "htree", "inet", "inotify", "input", "jbd2", "landlock",
-              "module", "net", "netif", "ns", "procfs", "prof", "fail", "trace", "why", "sd", "seccomp", "securityfs", "socket", "sound", "swap", "sysctl", "sysfs",
+              "module", "net", "netif", "netlink", "ns", "procfs", "prof", "fail", "trace", "why", "sd", "seccomp", "securityfs", "socket", "sound", "swap", "sysctl", "sysfs",
               "timerfd", "unix", "vdso", "vfat", "virtio", "virtio_blk", "virtio_net", "virtio_rng"],
     "quirk": ["tty-root-fdlink", "sound-min-period", "qemu-uart-burst"],
     "todo":  ["fine-grained lock (BKL)"]

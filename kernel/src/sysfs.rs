@@ -25,7 +25,7 @@ const PART_FILES: [&str; 6] = ["size", "start", "stat", "dev", "partition", "ro"
 const NET_FILES: [&str; 7] = ["address", "mtu", "operstate", "carrier", "ifindex", "type", "flags"];
 const NET_STATS: [&str; 8] = ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"];
 const CPU_FILES: [&str; 3] = ["online", "possible", "present"];
-/// ネットワークのインターフェース: eth0 (ioctl の SIOCGIFINDEX と同じ 1) と lo
+/// ネットワークのインターフェース: eth0 と lo (番号は netlink と ioctl の SIOCGIFINDEX と同じ: lo 1、eth0 2)
 const NETS: [&str; 2] = ["eth0", "lo"];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -169,11 +169,11 @@ impl SysInode {
                     "mtu" => if lo { "65536\n".into() } else { "1500\n".into() },
                     "operstate" => if lo { "unknown\n".into() } else { "up\n".into() },
                     "carrier" => "1\n".into(),
-                    "ifindex" => if lo { "2\n".into() } else { "1\n".into() },
+                    "ifindex" => format!("{}\n", if lo { crate::netlink::LO_INDEX } else { crate::netlink::ETH_INDEX }),
                     // ARPHRD_LOOPBACK と ARPHRD_ETHER
                     "type" => if lo { "772\n".into() } else { "1\n".into() },
-                    // IFF_UP | IFF_LOOPBACK | IFF_RUNNING と IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
-                    _ => if lo { "0x49\n".into() } else { "0x1043\n".into() },
+                    // dev->flags (Linux は IFF_RUNNING を入れない): IFF_UP | IFF_LOOPBACK と IFF_UP | IFF_BROADCAST | IFF_MULTICAST
+                    _ => if lo { "0x9\n".into() } else { "0x1003\n".into() },
                 }
             }
             Node::NetStat(n, i) => {

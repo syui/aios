@@ -35,6 +35,7 @@ const ENETUNREACH: i64 = 101;
 
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
+const AF_NETLINK: u64 = 16;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
@@ -637,10 +638,47 @@ pub fn socketpair(domain: u64, typ: u64, protocol: u64, sv: usize) -> R {
     Ok(0)
 }
 
+// ---- AF_NETLINK (netlink.rs): どのシステムコールも、はじめに netlink の fd かを見て、そちらへ ----
+
+/// 入れ物 (iovec) から送るものを集める
+fn gather(iov: &[(usize, usize)], total: usize) -> Result<Vec<u8>, i64> {
+    let mut data = Vec::with_capacity(total);
+    for &(base, len) in iov {
+        let k = len.min(total - data.len());
+        if k == 0 {
+            continue;
+        }
+        let at = data.len();
+        data.resize(at + k, 0);
+        proc::current().pt().copy_in(&mut data[at..], base).ok_or(-EFAULT)?;
+    }
+    Ok(data)
+}
+
+/// netlink に送る (sendto と sendmsg)
+fn nl_send(n: &crate::netlink::NetlinkRef, iov: &[(usize, usize)], to: Option<&[u8]>, flags: u64) -> R {
+    let total = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
+    let data = gather(iov, total)?;
+    crate::netlink::send(n, &data, to, flags)
+}
+
+/// netlink から受ける (recvfrom と recvmsg): (返す数、msg_flags、送ったものの名前)
+fn nl_recv(f: &FileRef, n: &crate::netlink::NetlinkRef, iov: &[(usize, usize)], flags: u64) -> Result<(i64, u32, [u8; 12]), i64> {
+    let room = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
+    let r = crate::netlink::recv(n, room, flags, nonblock_of(f, flags))?;
+    copy_out_iov(iov, &r.data)?;
+    Ok((r.len as i64, r.flags, r.from))
+}
+
 pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     let (domain, t, flags) = sock_args(domain, typ)?;
     aa_create(domain, t, protocol)?;
     let cloexec = flags & SOCK_CLOEXEC != 0;
+    if domain == AF_NETLINK {
+        let n = crate::netlink::create(t, protocol)?;
+        let fd = proc::current().files().add(crate::netlink::file_of(n, flags), cloexec, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     if domain == AF_UNIX {
         let u = crate::unix::create(t, protocol as u32 as u64)?;
         let fd = proc::current().files().add(crate::unix::file_of(u, flags), cloexec, 0).ok_or(-EMFILE)?;
@@ -677,6 +715,9 @@ fn port_of(a: &[u8]) -> Option<u16> {
 }
 
 pub fn bind(fd: u64, addr: usize, len: usize) -> R {
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        return crate::netlink::bind(&n, &addr_in(addr, len)?);
+    }
     match sock(fd)? {
         Sock::Unix(_, u) => {
             let a = addr_in(addr, len)?;
@@ -736,6 +777,9 @@ fn aa_bind_addr(a: &[u8]) -> Result<(), i64> {
 
 /// listen: backlog は (unsigned で) somaxconn まで
 pub fn listen(fd: u64, backlog: u64) -> R {
+    if crate::netlink::of_fd(fd).is_some() {
+        return Err(-EOPNOTSUPP);
+    }
     let s = sock(fd)?;
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_listen(u, (backlog as u32).min(crate::unix::SOMAXCONN))?,
@@ -755,6 +799,9 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
     let flags = flags as u32 as u64;
     if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
         return Err(crate::why::inval());
+    }
+    if crate::netlink::of_fd(fd).is_some() {
+        return Err(-EOPNOTSUPP);
     }
     let s = sock(fd)?;
     // AppArmor: 受けるのを待つ前に (security_socket_accept)
@@ -789,6 +836,9 @@ pub fn accept(fd: u64, addr: usize, lenp: usize, flags: u64) -> R {
 }
 
 pub fn connect(fd: u64, addr: usize, len: usize) -> R {
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        return crate::netlink::connect(&n, &addr_in(addr, len)?);
+    }
     match sock(fd)? {
         Sock::Unix(f, u) => {
             let a = addr_in(addr, len)?;
@@ -831,6 +881,10 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
 
 pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: usize) -> R {
     let len = len.min(MAX_RW);
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
+        return nl_send(&n, &[(buf, len)], to.as_deref(), flags);
+    }
     match sock(fd)? {
         Sock::Unix(f, u) => {
             let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
@@ -861,6 +915,13 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
 
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
     let iov = [(buf, len.min(MAX_RW))];
+    if let Some((f, n)) = crate::netlink::of_fd(fd) {
+        let (k, _, from) = nl_recv(&f, &n, &iov, flags)?;
+        if addr != 0 {
+            addr_out(addr, lenp, &from)?;
+        }
+        return Ok(k);
+    }
     let s = sock(fd)?;
     if !matches!(s, Sock::Unix(..)) {
         aa_sk(&s, "recvmsg", crate::apparmor::MAY_RECEIVE, InetOp::Remote(None))?;
@@ -893,6 +954,10 @@ pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: 
 }
 
 pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        addr_out(addr, lenp, &crate::netlink::name(&n, false))?;
+        return Ok(0);
+    }
     let s = sock(fd)?;
     aa_sk(&s, "getsockname", crate::apparmor::MAY_GETATTR, InetOp::Sk)?;
     match s {
@@ -908,6 +973,10 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
 }
 
 pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        addr_out(addr, lenp, &crate::netlink::name(&n, true))?;
+        return Ok(0);
+    }
     let s = sock(fd)?;
     aa_sk(&s, "getpeername", crate::apparmor::MAY_GETATTR, InetOp::Sk)?;
     match s {
@@ -927,6 +996,20 @@ pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
 pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SOL_SOCKET: u64 = 1;
     const SO_TYPE: u64 = 3;
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        let v = crate::netlink::getsockopt(&n, level, opt)?;
+        let pt = proc::current().pt();
+        let mut l = [0u8; 4];
+        pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
+        let len = i32::from_le_bytes(l);
+        if len < 0 {
+            return Err(crate::why::inval());
+        }
+        let k = (len as usize).min(v.len());
+        pt.copy_out(val, &v[..k]).ok_or(-EFAULT)?;
+        pt.copy_out(lenp, &(k as u32).to_le_bytes()).ok_or(-EFAULT)?;
+        return Ok(0);
+    }
     let s = sock(fd)?;
     // AppArmor: 長さを読む前に (do_sock_getsockopt)
     match &s {
@@ -959,6 +1042,9 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
 }
 
 pub fn shutdown(fd: u64, how: u64) -> R {
+    if crate::netlink::of_fd(fd).is_some() {
+        return Err(-EOPNOTSUPP);
+    }
     let s = sock(fd)?;
     aa_sk(&s, "socket_shutdown", crate::apparmor::MAY_SHUTDOWN, InetOp::Sk)?;
     match s {
@@ -1019,6 +1105,11 @@ fn send_parts(m: &MsgHdr) -> Result<(Option<Vec<u8>>, Vec<u8>), i64> {
 }
 
 pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
+    if let Some((_, n)) = crate::netlink::of_fd(fd) {
+        let m = read_msghdr(msg)?;
+        let (to, _) = send_parts(&m)?;
+        return nl_send(&n, &m.iov, to.as_deref(), flags);
+    }
     let s = sock(fd)?;
     let m = read_msghdr(msg)?;
     let total = m.iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
@@ -1155,6 +1246,17 @@ fn put_cmsgs(list: &[(i32, i32, Vec<u8>)], space: Option<usize>) -> (Vec<(usize,
 }
 
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
+    if let Some((f, n)) = crate::netlink::of_fd(fd) {
+        let m = read_msghdr(msg)?;
+        let (k, mflags, from) = nl_recv(&f, &n, &m.iov, flags)?;
+        let pt = proc::current().pt();
+        if m.name != 0 {
+            addr_out(m.name, m.namelen_at, &from)?;
+        }
+        pt.copy_out(m.controllen_at, &0u64.to_le_bytes()).ok_or(-EFAULT)?;
+        pt.copy_out(m.flags_at, &mflags.to_le_bytes()).ok_or(-EFAULT)?;
+        return Ok(k);
+    }
     let s = sock(fd)?;
     let m = read_msghdr(msg)?;
     if !matches!(s, Sock::Unix(..)) {
@@ -1230,12 +1332,21 @@ pub fn proc_net(want_tcp: bool) -> alloc::string::String {
 pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
     const IPPROTO_IP: u64 = 0;
     const IP_TTL: u64 = 2;
-    let s = sock(fd)?;
+    let nl = crate::netlink::of_fd(fd);
+    let s = if nl.is_some() { None } else { Some(sock(fd)?) };
     // Linux の do_sock_setsockopt: 長さ < 0 は EINVAL
     let len = len as u32 as i32;
     if len < 0 {
         return Err(crate::why::inval());
     }
+    if let Some((_, n)) = nl {
+        let mut b = vec![0u8; (len as usize).min(64)];
+        if !b.is_empty() {
+            proc::current().pt().copy_in(&mut b, val).ok_or(-EFAULT)?;
+        }
+        return crate::netlink::setsockopt(&n, level, opt, &b);
+    }
+    let s = s.unwrap();
     match &s {
         Sock::Unix(_, u) if crate::apparmor::confined() => crate::unix::aa_opt(u, "setsockopt", crate::apparmor::MAY_SETOPT, opt as u32)?,
         _ => aa_sk(&s, "setsockopt", crate::apparmor::MAY_SETOPT, InetOp::Cmd(crate::apparmor::CMD_OPT, &[level as u16, opt as u16]))?,
