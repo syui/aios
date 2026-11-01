@@ -23,7 +23,7 @@ sed -i 's/CheckSpace/#CheckSpace/' $ROOTFS/etc/pacman.conf
 sed -i '/\[options\]/a NoUpgrade = etc/os-release' $ROOTFS/etc/pacman.conf
 
 arch-chroot $ROOTFS /bin/sh -c 'pacman-key --init && pacman-key --populate archlinux'
-arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs pnpm uv zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs ufw'
+arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc openssh jq nodejs pnpm uv zsh-autosuggestions zsh-syntax-highlighting zsh-history-substring-search uutils-coreutils sudo-rs nftables'
 
 # AppArmor only on bare metal (cfg/image.zsh adds lsm=...apparmor... to the boot entry):
 # in an nspawn container the host kernel's LSM is the host's business, and the
@@ -79,11 +79,7 @@ cp cfg/zshrc $ROOTFS/home/ai/.zshrc
 arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
 cp -r cfg/etc/. $ROOTFS/etc/
-cp -r cfg/usr/. $ROOTFS/usr/
-arch-chroot $ROOTFS /bin/sh -c '
-  chmod +x /usr/local/bin/aios-firewall.sh
-  systemctl enable aios-firewall.service
-'
+arch-chroot $ROOTFS /bin/sh -c 'systemctl enable nftables.service'
 
 # gnu-coreutils -> uutils-coreutils
 arch-chroot $ROOTFS /bin/bash -c '
