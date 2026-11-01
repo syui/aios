@@ -5,7 +5,8 @@
 //   1. 設定テーブルから DTB を探し、LoadOptions (systemd-boot の options や UEFI シェルの引数) を
 //      カーネルのコマンドラインとして覚える。EFI_RNG_PROTOCOL があれば乱数を 32 バイトもらっておく (rand のもと)
 //   2. メモリマップから RAM の先頭を探し、RAM の先頭 + 0x80000 を AllocatePages で押さえる
-//   3. ExitBootServices
+//   3. ExitBootServices。そのときのメモリマップから、あとも使えるランタイムサービスの領域 (EFI_MEMORY_RUNTIME) を
+//      覚えておく (efirt.rs が呼ぶ。kalloc はそこを使わない)
 //   4. そこへ自分を写し、キャッシュを掃き出し、MMU とキャッシュを切って primary へ (x0 = DTB)
 // ここはリンクした場所 (上位アドレス) ではないところで動くので、PC 相対でしか
 // 読み書きしない (パニックしない。static は adrp で PC 相対に指されるので、写す前の自分に書ける)。
@@ -16,7 +17,10 @@ const EFI_SUCCESS: Status = 0;
 const EFI_LOAD_ERROR: Status = (1 << 63) | 1;
 
 // EFI_SYSTEM_TABLE / EFI_BOOT_SERVICES の中の場所
+const ST_FW_VENDOR: usize = 0x18;
+const ST_FW_REVISION: usize = 0x20;
 const ST_CONOUT: usize = 0x40;
+const ST_RUNTIME: usize = 0x58;
 const ST_BOOT_SERVICES: usize = 0x60;
 const ST_NUM_TABLES: usize = 0x68;
 const ST_TABLES: usize = 0x70;
@@ -104,6 +108,129 @@ unsafe fn save_seed(bs: usize, st: usize) {
         if get(rng, 0, 32, buf.add(1) as usize) == EFI_SUCCESS {
             core::ptr::write_volatile(buf, 32);
             say(st, b"aios: 32 random bytes from EFI_RNG_PROTOCOL\n");
+        }
+    }
+}
+
+/// ランタイムの領域の数の上限 (QEMU の AAVMF で 20 ほど)
+pub const RT_MAX: usize = 64;
+/// メモリマップの属性: キャッシュできる (WB)、書けない (RO)、実行しない (XP)、ランタイム
+pub const MEM_WB: u64 = 1 << 3;
+pub const MEM_XP: u64 = 1 << 14;
+pub const MEM_RO: u64 = 1 << 17;
+const MEM_RUNTIME: u64 = 1 << 63;
+
+/// UEFI のランタイムサービス (ExitBootServices のあとも呼べるもの。efirt.rs) を呼ぶのに要るもの
+#[derive(Clone, Copy)]
+pub struct Runtime {
+    /// EFI_SYSTEM_TABLE と EFI_RUNTIME_SERVICES の物理アドレス (UEFI から起動していなければ 0)
+    pub systab: u64,
+    pub runtime: u64,
+    /// UEFI の版 (表の頭の Revision: 0x0002_0046 なら 2.70) とファームウェアの版
+    pub uefi_revision: u32,
+    pub fw_revision: u32,
+    /// ファームウェアの名前 (FirmwareVendor。ASCII の範囲だけ。NUL まで)
+    pub vendor: [u8; 32],
+    /// 設定テーブル: ACPI 2.0、ACPI、SMBIOS 3、SMBIOS (/sys/firmware/efi/systab。なければ 0)
+    pub acpi20: u64,
+    pub acpi: u64,
+    pub smbios3: u64,
+    pub smbios: u64,
+    /// メモリマップのうち EFI_MEMORY_RUNTIME のもの: (種類, 物理アドレス, ページ数, 属性)
+    pub n: usize,
+    pub map: [[u64; 4]; RT_MAX],
+}
+
+/// bss は primary で消されるので .data に置く
+#[unsafe(link_section = ".data")]
+static RT: crate::cell::Early<Runtime> = crate::cell::Early::new(Runtime {
+    systab: 0,
+    runtime: 0,
+    uefi_revision: 0,
+    fw_revision: 0,
+    vendor: [0; 32],
+    acpi20: 0,
+    acpi: 0,
+    smbios3: 0,
+    smbios: 0,
+    n: 0,
+    map: [[0; 4]; RT_MAX],
+});
+
+pub fn runtime() -> &'static Runtime {
+    RT.get()
+}
+
+/// 設定テーブルの GUID: ACPI 2.0 (8868e871-e4f1-11d3-bc22-0080c73c8881)、ACPI (eb9d2d30-2d88-11d3-9a16-0090273fc14d)、
+/// SMBIOS 3 (f2fd1544-9794-4a2c-992e-e5bbcf20e394)、SMBIOS (eb9d2d31-2d88-11d3-9a16-0090273fc14d)
+const ACPI20_GUID: [u8; 16] = [0x71, 0xe8, 0x68, 0x88, 0xf1, 0xe4, 0xd3, 0x11, 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81];
+const ACPI_GUID: [u8; 16] = [0x30, 0x2d, 0x9d, 0xeb, 0x88, 0x2d, 0xd3, 0x11, 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d];
+const SMBIOS3_GUID: [u8; 16] = [0x44, 0x15, 0xfd, 0xf2, 0x94, 0x97, 0x2c, 0x4a, 0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94];
+const SMBIOS_GUID: [u8; 16] = [0x31, 0x2d, 0x9d, 0xeb, 0x88, 0x2d, 0xd3, 0x11, 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d];
+/// EFI_RUNTIME_SERVICES の頭の印 ("RUNTSERV")
+const RT_SIGNATURE: u64 = 0x5652_4553_544e_5552;
+
+/// ExitBootServices の前に: 表のアドレス、版、名前、設定テーブル
+unsafe fn save_runtime(st: usize) {
+    unsafe {
+        let rt = RT.get_mut();
+        let runtime = rd64(st + ST_RUNTIME);
+        if runtime == 0 || rd64(runtime) as u64 != RT_SIGNATURE {
+            return;
+        }
+        rt.systab = st as u64;
+        rt.runtime = runtime as u64;
+        rt.uefi_revision = read_volatile((st + 8) as *const u32);
+        rt.fw_revision = read_volatile((st + ST_FW_REVISION) as *const u32);
+        let vendor = rd64(st + ST_FW_VENDOR);
+        if vendor != 0 {
+            let mut i = 0;
+            while i + 1 < rt.vendor.len() {
+                let c = read_volatile((vendor + i * 2) as *const u16);
+                if c == 0 {
+                    break;
+                }
+                rt.vendor[i] = if (0x20..0x7f).contains(&c) { c as u8 } else { b'?' };
+                i += 1;
+            }
+        }
+        let n = rd64(st + ST_NUM_TABLES);
+        let tables = rd64(st + ST_TABLES);
+        for i in 0..n {
+            let e = tables + i * 24;
+            let a = rd64(e + 16) as u64;
+            if guid_eq(e, &ACPI20_GUID) {
+                rt.acpi20 = a;
+            } else if guid_eq(e, &ACPI_GUID) {
+                rt.acpi = a;
+            } else if guid_eq(e, &SMBIOS3_GUID) {
+                rt.smbios3 = a;
+            } else if guid_eq(e, &SMBIOS_GUID) {
+                rt.smbios = a;
+            }
+        }
+    }
+}
+
+/// ExitBootServices のあとに: そのときのメモリマップのランタイムの領域
+unsafe fn save_runtime_map(buf: usize, map_size: usize, desc_size: usize) {
+    unsafe {
+        let rt = RT.get_mut();
+        if rt.runtime == 0 {
+            return;
+        }
+        for i in 0..map_size / desc_size {
+            let d = buf + i * desc_size;
+            let attr = rd64(d + 32) as u64;
+            if attr & MEM_RUNTIME == 0 || rt.n >= RT_MAX {
+                continue;
+            }
+            let e = rt.map.as_mut_ptr().add(rt.n) as *mut u64;
+            core::ptr::write_volatile(e, read_volatile(d as *const u32) as u64);
+            core::ptr::write_volatile(e.add(1), rd64(d + 8) as u64);
+            core::ptr::write_volatile(e.add(2), rd64(d + 24) as u64);
+            core::ptr::write_volatile(e.add(3), attr);
+            rt.n += 1;
         }
     }
 }
@@ -260,6 +387,7 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
         let dtb_size = u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize;
         save_options(image, bs, st);
         save_seed(bs, st);
+        save_runtime(st);
 
         // 2. メモリマップ (RAM の先頭を探すのと、ExitBootServices の key に使う)
         let get_map: Fn5 = core::mem::transmute(rd64(bs + BS_GET_MEMORY_MAP));
@@ -319,7 +447,8 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
         if !ok {
             return EFI_LOAD_ERROR;
         }
-        // もうファームウェアは使えない
+        save_runtime_map(buf, map_size, desc_size);
+        // もうファームウェアのブートサービスは使えない (ランタイムサービスは efirt.rs が呼ぶ)
         efi_enter(dest, base, size, dtb, dtb_size)
     }
 }

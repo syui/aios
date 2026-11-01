@@ -6,6 +6,8 @@ extern crate alloc;
 mod aiproc;
 mod apparmor;
 mod securityfs;
+mod efirt;
+mod efivarfs;
 mod trace;
 mod fail;
 mod oom;
@@ -119,6 +121,8 @@ pub extern "C" fn kmain() -> ! {
     let early = kalloc::init(heap::boot_extra());
     heap::init(early);
     println!("kalloc: {} pages free", kalloc::nfree());
+    // UEFI のランタイムサービス (efivarfs が使う)
+    efirt::init();
     println!("initrd: {} entries", initrd::count());
     dtb::summary();
     // 実験のために切ったところ (aios.off=)

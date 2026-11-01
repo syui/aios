@@ -7,6 +7,8 @@
 //   /sys/class/net/IF/statistics/{rx,tx}_{bytes,packets,errors,dropped}
 //   /sys/devices/system/cpu/{online,possible,present} と cpuN/online
 //   /sys/kernel/security                             securityfs をかぶせるところ (securityfs.rs)
+//   /sys/firmware/efi/{fw_platform_size,systab}      UEFI から起動したとき (arm64 の Linux と同じもの。systab は root だけ)
+//   /sys/firmware/efi/efivars                        efivarfs をかぶせるところ (efivarfs.rs)
 //   /sys/module/apparmor/parameters/enabled          Y (aios.off=apparmor なら N。libapparmor の aa_is_enabled が読む)
 // 大きさはセクタ (512 バイト)、stat は /proc/diskstats の 4 列目からの 11 列と同じ
 use crate::vfs::*;
@@ -25,6 +27,7 @@ const PART_FILES: [&str; 6] = ["size", "start", "stat", "dev", "partition", "ro"
 const NET_FILES: [&str; 7] = ["address", "mtu", "operstate", "carrier", "ifindex", "type", "flags"];
 const NET_STATS: [&str; 8] = ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"];
 const CPU_FILES: [&str; 3] = ["online", "possible", "present"];
+const EFI_FILES: [&str; 2] = ["fw_platform_size", "systab"];
 /// ネットワークのインターフェース: eth0 と lo (番号は netlink と ioctl の SIOCGIFINDEX と同じ: lo 1、eth0 2)
 const NETS: [&str; 2] = ["eth0", "lo"];
 
@@ -57,6 +60,10 @@ enum Node {
     ModAa,
     ModAaParams,
     ModAaEnabled,
+    Firmware,
+    Efi,
+    EfiFile(u8),
+    EfiVars,
 }
 
 pub struct SysInode {
@@ -110,6 +117,10 @@ impl SysInode {
             Node::ModAa => 13,
             Node::ModAaParams => 14,
             Node::ModAaEnabled => 15,
+            Node::Firmware => 16,
+            Node::Efi => 17,
+            Node::EfiVars => 18,
+            Node::EfiFile(i) => 0x400 + i as u64,
             Node::DiskFile(i) => 0x100 + i as u64,
             Node::QueueFile(i) => 0x200 + i as u64,
             Node::CpuFile(i) => 0x300 + i as u64,
@@ -127,7 +138,7 @@ impl SysInode {
     fn is_dir(&self) -> bool {
         matches!(
             self.node,
-            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams
+            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars
         )
     }
 
@@ -190,6 +201,21 @@ impl SysInode {
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
             Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
+            Node::EfiFile(0) => "64\n".into(),
+            // 設定テーブルの ACPI と SMBIOS (Linux の systab_show の順)
+            Node::EfiFile(_) => {
+                if !crate::cred::current().capable(crate::cred::CAP_DAC_READ_SEARCH) {
+                    return Err(-EACCES);
+                }
+                let rt = crate::efi::runtime();
+                let mut t = String::new();
+                for (k, v) in [("ACPI20", rt.acpi20), ("ACPI", rt.acpi), ("SMBIOS3", rt.smbios3), ("SMBIOS", rt.smbios)] {
+                    if v != 0 {
+                        t.push_str(&format!("{}={:#x}\n", k, v));
+                    }
+                }
+                t
+            }
             _ => return Err(-EISDIR),
         })
     }
@@ -205,7 +231,11 @@ impl Inode for SysInode {
     }
 
     fn meta(&self) -> Meta {
-        let mode = if self.is_dir() { S_IFDIR | 0o555 } else { S_IFREG | 0o444 };
+        let mode = match self.node {
+            _ if self.is_dir() => S_IFDIR | 0o555,
+            Node::EfiFile(1) => S_IFREG | 0o400,
+            _ => S_IFREG | 0o444,
+        };
         let now = crate::timer::epoch_ns();
         Meta { ino: self.ino(), mode, nlink: 1, uid: 0, gid: 0, size: if self.is_dir() { 0 } else { 4096 }, rdev: 0, blocks: 0, mtime: now, ctime: now }
     }
@@ -242,8 +272,12 @@ impl Inode for SysInode {
                 "devices" => Node::Devices,
                 "kernel" => Node::Kernel,
                 "module" => Node::Module,
+                "firmware" => Node::Firmware,
                 _ => return Err(-ENOENT),
             },
+            Node::Firmware if name == "efi" && crate::efirt::available() => Node::Efi,
+            Node::Efi if name == "efivars" => Node::EfiVars,
+            Node::Efi => Node::EfiFile(pos(&EFI_FILES)?),
             Node::Kernel if name == "security" => Node::Security,
             Node::Module if name == "apparmor" => Node::ModAa,
             Node::ModAa if name == "parameters" => Node::ModAaParams,
@@ -296,7 +330,20 @@ impl Inode for SysInode {
                 add("devices".into(), Node::Devices);
                 add("kernel".into(), Node::Kernel);
                 add("module".into(), Node::Module);
+                add("firmware".into(), Node::Firmware);
             }
+            Node::Firmware => {
+                if crate::efirt::available() {
+                    add("efi".into(), Node::Efi);
+                }
+            }
+            Node::Efi => {
+                for (i, f) in EFI_FILES.iter().enumerate() {
+                    add((*f).into(), Node::EfiFile(i as u8));
+                }
+                add("efivars".into(), Node::EfiVars);
+            }
+            Node::EfiVars => {}
             Node::Kernel => add("security".into(), Node::Security),
             Node::Security => {}
             Node::Module => add("apparmor".into(), Node::ModAa),

@@ -1375,6 +1375,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         file::O_WRONLY => PW,
         _ => PR | PW,
     } | if flags & O_TRUNC != 0 { PW } else { 0 };
+    // 変えられない印のあるもの (efivarfs) を書くために開くのは EPERM (Linux の inode_permission: 許可を見る前)
+    if want & PW != 0 && ino.immutable() {
+        return Err(-vfs::EPERM);
+    }
     cred::current().check(&ino.meta(), want)?;
     // AppArmor (file_open): 開く口の許しをパスで
     {
@@ -2752,6 +2756,33 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         };
         return out(arg, &v.to_le_bytes()).map(|_| 0);
     }
+    // FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (lsattr / chattr。Linux の vfs_fileattr_get / set): 持つのは efivarfs だけ。
+    // 変えるのは持ち主か CAP_FOWNER、変えられない印と足すだけの印を変えるのは CAP_LINUX_IMMUTABLE
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    if req == FS_IOC_GETFLAGS || req == FS_IOC_SETFLAGS {
+        let ino = match &f.borrow().kind {
+            Kind::Inode(i, _) => i.clone(),
+            _ => return Err(-ENOTTY),
+        };
+        let old = ino.fs_flags()?;
+        if req == FS_IOC_GETFLAGS {
+            return out(arg, &old.to_le_bytes()).map(|_| 0);
+        }
+        let mut v = [0u8; 4];
+        proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
+        let new = u32::from_le_bytes(v);
+        let c = cred::current();
+        if c.euid != ino.meta().uid && !c.capable(cred::CAP_FOWNER) {
+            return Err(-vfs::EPERM);
+        }
+        const FS_APPEND_FL: u32 = 0x20;
+        if (old ^ new) & (crate::efivarfs::FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 && !c.capable(cred::CAP_LINUX_IMMUTABLE) {
+            return Err(-vfs::EPERM);
+        }
+        ino.set_fs_flags(new)?;
+        return Ok(0);
+    }
     // FIONREAD: いま読めるバイト数 (パイプ、AF_UNIX のソケット (listen しているものは EINVAL)、TCP / UDP のソケット、
     // ふつうのファイル)。端末のものは tty の ioctl で
     const FIONREAD: u64 = 0x541b;
@@ -2890,6 +2921,7 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
             "proc" => crate::procfs::new_root(),
             "sysfs" => crate::sysfs::new_root(),
             "securityfs" => crate::securityfs::new_root(),
+            "efivarfs" => crate::efivarfs::new_root()?,
             _ => return Err(-ENODEV),
         };
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
@@ -2957,7 +2989,7 @@ fn aa_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir
         // 知らない fs の種類は ENODEV (get_fs_type)。aios の fs にデバイスの要るもの (FS_REQUIRES_DEV) やバイナリの
         // データのものはない
         let fstype = opt(typep)?;
-        if fstype.as_deref().is_some_and(|t| !matches!(t, "tmpfs" | "proc" | "sysfs" | "securityfs")) {
+        if fstype.as_deref().is_some_and(|t| !matches!(t, "tmpfs" | "proc" | "sysfs" | "securityfs" | "efivarfs")) {
             return Err(-19);
         }
         let dev = opt(srcp)?;

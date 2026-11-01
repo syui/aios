@@ -209,6 +209,20 @@ pub trait Inode {
     fn add_seals(&self, _seals: u32) -> Result<(), i64> {
         Err(crate::why::inval())
     }
+    /// 開いた (open で OpenFile を作った) / 最後の口を閉じた (Linux の f_op->open と release)。数えるもの (efivarfs) だけ
+    fn opened(&self) {}
+    fn released(&self) {}
+    /// 変えられない印 (Linux の S_IMMUTABLE): 書くために開く、切りつめる、消す、属性を変えるのは EPERM
+    fn immutable(&self) -> bool {
+        false
+    }
+    /// FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (chattr / lsattr の FS_*_FL)。持たないものは ENOTTY (Linux の fileattr_get がない)
+    fn fs_flags(&self) -> Result<u32, i64> {
+        Err(-25)
+    }
+    fn set_fs_flags(&self, _flags: u32) -> Result<(), i64> {
+        Err(-25)
+    }
 }
 
 /// カーネルの中だけの戻り値: ディスクを眠って待つあいだにファイルシステムが書きかえられたので、読みを

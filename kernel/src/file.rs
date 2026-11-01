@@ -164,6 +164,9 @@ pub struct Dirents {
 }
 
 pub fn new(kind: Kind, flags: u32) -> FileRef {
+    if let Kind::Inode(ino, _) = &kind {
+        ino.opened();
+    }
     Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false }))
 }
 
@@ -1287,6 +1290,7 @@ impl Drop for OpenFile {
             Kind::Inode(ino, path) => {
                 let ev = if self.writable() { crate::inotify::IN_CLOSE_WRITE } else { crate::inotify::IN_CLOSE_NOWRITE };
                 crate::inotify::file_event(path, ino, ev);
+                ino.released();
             }
             Kind::PipeRead(p) => {
                 { let mut pp = p.borrow_mut(); pp.readers -= 1; pp.generation += 1; }

@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor bigunmap chosen clone3 cpuid createrace dev dirents epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist mmapcoh mnt mremap netlink ns opencache openat2 openfast openrace orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="apparmor bigunmap chosen clone3 cpuid createrace dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist mmapcoh mnt mremap netlink ns opencache openat2 openfast openrace orphan pagecache pathcache pipeslots procmaps procwait pwfast random rlock seccomp sigtramp sleeps splice statc statcache unixrace unixsock userns"
 
 case $1 in
 build)
@@ -45,6 +45,8 @@ run)
     # openfast と openrace (棚にないファイルの大きなロックなしの open) は ext4 (ホーム) で。openrace は 5 秒
     openfast) cmd="./$t $HOME" ;;
     openrace) cmd="./$t $HOME 5" ;;
+    # efivarfs は root で (UEFI の変数を作る・消す・chattr。UEFI から起動していなければ何もしない)
+    efivarfs) cmd="sudo -n ./$t" ;;
     *) cmd="./$t" ;;
     esac
     # pathcache は root でも (マウントと、ほかの人から引いたとき。ext4 はほかの人も通れる /var/tmp で)

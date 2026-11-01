@@ -690,6 +690,33 @@ test/cpuid.c が、MRS で読んだ ID レジスタ、AT_HWCAP / AT_HWCAP2、/pr
 `-cpu max` で、aios も Linux 7.3 も同じ 34 の印)。TCG の VM の CPU は `AIOS_CPU=max` で変えられる (bin/run.sh。既定は
 cortex-a72)。
 
+### UEFI のランタイムサービスと efivarfs (/sys/firmware/efi/efivars)
+
+UEFI から起動したとき (aiboot、systemd-boot、ファームウェアからじか)、ExitBootServices のあとも UEFI の変数を読み書き
+できる。systemd-boot の `bootctl`、`efibootmgr`、systemd の `LoaderEntrySelected` などを読むものがそのまま動く:
+
+- EFI スタブ (kernel/src/efi.rs) が、ExitBootServices のときのメモリマップからランタイムの領域 (EFI_MEMORY_RUNTIME)
+  と、システムテーブル、ランタイムサービスの表、ファームウェアの名前、設定テーブル (ACPI、SMBIOS) を覚える。
+  kalloc はランタイムの RAM を使わない (ページの表もそこを避けて置く)
+- kernel/src/efirt.rs が、ランタイムの領域を物理アドレスと同じ仮想アドレス (1:1) に写した表を作り、呼ぶあいだだけ
+  TTBR0 をそれにする (SetVirtualAddressMap は呼ばない)。カーネルの半分 (TTBR1) はそのままなので、引数のバッファは
+  カーネルのもののまま。ひとつのロックで (割り込みも止める)、ユーザーの FP/SIMD のレジスタと x18 は戻す。
+  起動のときに Linux と同じく `efi: EFI v2.7 by EDK II` と出す
+- /sys/firmware/efi/ に `fw_platform_size` (64)、`systab` (root だけ。ACPI20= SMBIOS3= など)、`efivars/`
+  (arm64 の Linux と同じもの)。efivarfs は起動のときに /sys/firmware/efi/efivars にかぶせる (Linux では systemd が。
+  `mount -t efivarfs` も。UEFI から起動していなければ ENODEV)
+- efivarfs (kernel/src/efivarfs.rs) は Linux 7.3 の fs/efivarfs と同じ: ファイルの名前は「名前-GUID」(GUID は
+  大文字小文字をくべつしない)、読むと属性 (4 バイト) と中身、1 回の write が 1 回の SetVariable (頭の 4 バイトが属性。
+  知らないビットは EINVAL、APPEND_WRITE で足す、中身 0 バイトで消す)、作っただけ・消したものは 0 バイトで、閉じると
+  消える。Linux が知っている変数 (EFI の BootOrder、Boot####、Timeout、Lang など) のほかは変えられない印
+  (FS_IMMUTABLE_FL) がつく: 書く・消すには `chattr -i` (FS_IOC_SETFLAGS) を先に。Boot#### と Driver#### は
+  EFI_LOAD_OPTION の形を確かめる (Linux は名前の長さに NUL を足してくらべるので、* のない名前は確かめない。同じにした)。
+  statfs は QueryVariableInfo (f_bsize 1)
+- 確かめかた: `test/efivarfs.c` (root で。aios の中と、手本の Linux を `LINUX_EFI=1 test/linux-vm.sh rootexec`
+  で UEFI のファームウェアから起こしたもので同じ答え: aios 73、Linux 74 (efivarfs をかぶせる 1 つが多い)。CI の
+  ctests でも sudo で)。手本の Linux の設定 (test/linux.config) に CONFIG_EFI と
+  CONFIG_EFIVAR_FS を入れた (-kernel でじかに起こすときは使わない。sysdiff の答えは入れる前と同じ)
+
 ### カーネルの砂場 (aios.off= と aish の box)
 
 `off` のあるもの (extra と quirk) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる

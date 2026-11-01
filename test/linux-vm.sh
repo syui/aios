@@ -11,6 +11,8 @@
 #                                                 /work は ext4、/tmp は tmpfs (たとえば pipeslots /work/.ps)
 #   test/linux-vm.sh rootexec [latest|X.Y.Z] PROG [ARG...]
 #                                                 exec と同じを root で (AppArmor の test/apparmor.c)
+# LINUX_EFI=1 なら QEMU の UEFI のファームウェア (AAVMF / edk2。bin/run.sh と同じものを探す。変数はそのたびに
+# まっさらなもの) から -kernel を起こす (UEFI のランタイムサービスと efivarfs: test/efivarfs.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
 # cortex-a72 にする
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
@@ -138,7 +140,26 @@ boot() {
   # ext4 は aios のディスクと同じく 4 KiB のブロックで (小さなものの既定は 1 KiB)
   truncate -s 1G "$tmp/work.img"
   mkfs.ext4 -q -F -b 4096 -E root_owner=0:0 "$tmp/work.img"
-  timeout 1800 qemu-system-aarch64 -M virt -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot \
+  machine=virt
+  set --
+  if [ -n "${LINUX_EFI:-}" ]; then
+    efi_code=
+    for f in "${AIOS_EFI_CODE:-}" /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd /usr/share/AAVMF/AAVMF_CODE.fd \
+      /usr/share/edk2/aarch64/QEMU_CODE.fd /usr/share/edk2-armvirt/aarch64/QEMU_CODE.fd /usr/share/qemu/edk2-aarch64-code.fd; do
+      [ -n "$f" ] && [ -f "$f" ] && { efi_code=$f; break; }
+    done
+    [ -n "$efi_code" ] || { echo "linux-vm: LINUX_EFI=1 but no UEFI firmware (AAVMF / edk2)" >&2; exit 2; }
+    vars=$(echo "$efi_code" | sed 's/CODE\(\.[a-z-]*\)\{0,1\}\.fd$/VARS.fd/; s/-code\.fd$/-vars.fd/')
+    if [ "$vars" != "$efi_code" ] && [ -f "$vars" ]; then
+      cp "$vars" "$tmp/vars.fd"
+    else
+      truncate -s "$(wc -c < "$efi_code")" "$tmp/vars.fd"
+    fi
+    # ACPI を切ると、ファームウェアは QEMU の DTB を渡す (aios と同じ)
+    machine=virt,acpi=off
+    set -- -drive if=pflash,format=raw,readonly=on,file="$efi_code" -drive if=pflash,format=raw,file="$tmp/vars.fd"
+  fi
+  timeout 1800 qemu-system-aarch64 -M "$machine" -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot "$@" \
     -kernel "$image" -initrd "$tmp/initrd" -append "console=ttyAMA0 rdinit=/init quiet" \
     -drive file="$tmp/work.img",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
     > "$tmp/serial" 2>&1 || true

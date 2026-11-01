@@ -128,6 +128,10 @@ fn setup_dirs(mtab: &str) {
         let _ = vfs::mount("sys", crate::sysfs::new_root(), "sysfs", "sysfs");
         // securityfs (Linux では init がかぶせる。libapparmor は /proc/mounts の securityfs から apparmor/ をさがす)
         let _ = vfs::mount("sys/kernel/security", crate::securityfs::new_root(), "securityfs", "securityfs");
+        // efivarfs (Linux では systemd がかぶせる)。UEFI から起動していなければない
+        if let Ok(efi) = crate::efivarfs::new_root() {
+            let _ = vfs::mount("sys/firmware/efi/efivars", efi, "efivarfs", "efivarfs");
+        }
     }
     // df などが読むマウント表 (起動のたびに書きなおす)
     if let Ok(etc) = vfs::resolve("", "etc", true) {

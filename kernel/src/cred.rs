@@ -24,6 +24,7 @@ pub const CAP_FSETID: u32 = 4;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 pub const CAP_SETUID: u32 = 7;
+pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_ADMIN: u32 = 12;
 pub const CAP_NET_RAW: u32 = 13;

@@ -243,9 +243,37 @@ pub fn init(early: usize) -> Option<*mut u8> {
     let mut k = KMEM.lock();
     let mut lo = idx_of(pg_round_up(&raw const __kernel_end as usize) as *mut u8);
     let hi = ((phystop() - ram_base()) / PGSIZE).min(MAX_PAGES);
-    // 表は RAM のおしまいに (ページの番号 0..hi で引く: 頭のしるしに 1 ビット、次と前と大きさに 8 バイト)
+    // UEFI のランタイムサービスの RAM (ファームウェアがあとも使う。efirt.rs) はよける: ページの番号 [a, b) を順に
+    let mut resv = [(0usize, 0usize); crate::efi::RT_MAX];
+    let mut nr = 0;
+    let rt = crate::efi::runtime();
+    for d in &rt.map[..rt.n] {
+        let (pa, len) = (d[1] as usize, d[2] as usize * PGSIZE);
+        if d[3] & crate::efi::MEM_WB == 0 || pa + len <= ram_base() || pa >= ram_base() + hi * PGSIZE {
+            continue;
+        }
+        let a = (pa.max(ram_base()) - ram_base()) / PGSIZE;
+        let b = ((pa + len - ram_base()).div_ceil(PGSIZE)).min(hi);
+        let mut j = nr;
+        while j > 0 && resv[j - 1].0 > a {
+            resv[j] = resv[j - 1];
+            j -= 1;
+        }
+        resv[j] = (a, b);
+        nr += 1;
+    }
+    let resv = &resv[..nr];
+    // 表は RAM のおしまいに (ページの番号 0..hi で引く: 頭のしるしに 1 ビット、次と前と大きさに 8 バイト)。
+    // よける領域にかかれば、その下へ (上に残るすきまは使わない)
     let words = hi.div_ceil(64);
-    let top = hi - (words * 8 + hi * 8).div_ceil(PGSIZE);
+    let tpages = (words * 8 + hi * 8).div_ceil(PGSIZE);
+    let mut top = hi - tpages;
+    while let Some(r) = resv.iter().rev().find(|r| r.0 < top + tpages && r.1 > top) {
+        if r.0 < tpages {
+            break;
+        }
+        top = r.0 - tpages;
+    }
     let base = page_of(top);
     k.heads = base as *mut u64;
     unsafe { ptr::write_bytes(k.heads, 0, words) };
@@ -259,7 +287,19 @@ pub fn init(early: usize) -> Option<*mut u8> {
     };
     k.lo = lo;
     k.hi = top;
-    k.give_range(lo, top);
+    let mut at = lo;
+    for &(a, b) in resv {
+        if a > at {
+            k.give_range(at, a.min(top));
+        }
+        at = at.max(b);
+        if at >= top {
+            break;
+        }
+    }
+    if at < top {
+        k.give_range(at, top);
+    }
     NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
     got
 }
