@@ -673,8 +673,8 @@ rule (handle) かを書く (connect が時間切れになったプロセスに�
 AppArmor の network_v9 の af_inet (ip と port。Linux の本体は効かせない: apparmor-inet) と landlock (TCP の bind と
 connect のポート) でかけられる。nftables は、システムぜんたいの決まり (外から来るつなぎなど)。
 
-決めること: nft と同じ API にするか (すすめ)、aios だけの小さな決まり (/etc/aios.json の firewall など) からはじめるか。
-conntrack まで要るか。外 (eth0) だけでよいか、中どうし (lo) にもかけるか。
+決めたこと (syui、2026-11-01): nft と同じ API にする (aios だけの小さな決まりは作らない)。conntrack (段階 3) も作る。
+外 (eth0) だけでなく、中どうし (lo) にもかける。
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
