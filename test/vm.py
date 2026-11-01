@@ -269,13 +269,13 @@ class Serve:
                 return {'ready': False, 'error': 'no aiboot menu (is there a timeout in /boot/loader/loader.conf?)'}
             # 一覧は wait_for が返した出力の中 (self.buf からは、見つけたところまでが消えている)
             menu = ANSI.sub('', ok.decode('utf-8', 'replace'))
-            for m in re.finditer(r'^\s*\*?\s*(\d)\. (.*)$', menu, re.M):
-                if choose in m.group(2):
-                    chose = m.group(2).strip()
-                    os.write(self.m, m.group(1).encode())
-                    break
-            else:
+            # 題がちょうど同じものを先に (「aios」と「aios (new kernel)」)、なければ題にふくむもの
+            items = [(n, t.strip()) for n, t in re.findall(r'^\s*\*?\s*(\d)\. (.*)$', menu, re.M)]
+            hit = [i for i in items if i[1] == choose] or [i for i in items if choose in i[1]]
+            if not hit:
                 return {'ready': False, 'error': 'no menu entry with %r' % choose, 'menu': menu[-800:]}
+            chose = hit[0][1]
+            os.write(self.m, hit[0][0].encode())
         pat = re.compile(PROMPT.pattern + b'|' + PANIC.pattern)
         reset = False
         while True:

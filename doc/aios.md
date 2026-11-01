@@ -34,7 +34,7 @@
 | `pkg` | 入っているパッケージと版、リポジトリ |
 | `net` | インターフェイスとアドレス、経路、DNS |
 | `user` | ユーザー (uid、ホーム、シェル) |
-| `boot` | ESP のカーネルとローダーのエントリ、`try` (新しいカーネルを試す残りの回数)、`fallback` (前のカーネルに戻して起動したか)、`prev` (`/boot/Image.prev` があるか)、`last` (最後の起動の結果) |
+| `boot` | ESP のカーネルとローダーのエントリ、`new` (試している新しいカーネルの entry、`aios-new+1.conf` など)、`try` (その残りの回数)、`prev` (`/boot/Image.prev` があるか)、`last` (最後の起動の結果と、新しいカーネルで起動しなかったわけ `why`) |
 | `log` | `aiosd` (`/var/log/aiosd.log` の新しい 20 件)、`apply` (`aios apply` / `rollback` の記録の一覧: 番号、時刻、うまくいったか) |
 
 - `PATH` は点でつなぐ: `kernel.cpus`、`pkg.installed.cargo`、`service.sshd.active`。
@@ -1630,27 +1630,33 @@ llama bench                                   # この機械での速さ (prompt
 aios src                       # /usr/src/aios に aios のソース (なければ git clone、あれば git pull)。wheel の人が書ける
                                # (git が要る: sudo ap -S git。aiosd が /etc/gitconfig の safe.directory に足す)
 aios build kernel              # AIOS_INITRD=none でビルドし、target/Image (起動できる形) を作る (objcopy の代わりも aios がする)
-aios install kernel            # /boot/Image を入れかえる (aiosd)。前のものは /boot/Image.prev
-aios install kernel --revert   # /boot/Image と /boot/Image.prev を入れかえる
+aios install kernel            # 新しいカーネルを試す (aiosd)。起動できたら /boot/Image になり、前のものは /boot/Image.prev
+aios install kernel --revert   # 試すのをやめる (試していなければ /boot/Image と /boot/Image.prev を入れかえる)
 aios build pkg NAME|DIR [-o DIR]   # PKGBUILD からパッケージを作る (NAME は /usr/src/aios/pkg/*/NAME)
 aios install pkg FILE...       # 作ったパッケージを入れる (aiosd が aipkg -U で)
 ```
 
 - 前のカーネルは起動の一覧に「aios (previous kernel)」(`/boot/loader/entries/prev-aios.conf`) として出る。
   一覧が出るように、loader.conf の `timeout 0` は 3 秒にする
-- 起動しなかったら自動で前のものに戻す (systemd-boot の boot counting を小さくしたもの):
-  1. `aios install kernel` で aiosd が `/boot/loader/try` に試す回数 (1) を書く
-  2. aiboot は try があれば 1 減らして新しいカーネルを起動する。もう 0 なら (前の起動が aiosd まで来なかった)、
-     前のカーネルを `aios.fallback=1` をつけて起動する (一覧で前のものを選んだときも同じ)。わけは
-     `aios.fallback_why=`: `unfinished` (前の起動が aiosd まで来なかった)、`load` (新しいものを UEFI の LoadImage が
-     読めなかった。その場で前のものへ)、`chosen` (一覧で選んだ)
-  3. 起動して aiosd が動くと try を消す (起動できた)。`aios.fallback=1` で起きたときは `/boot/Image` を前のもの
-     (いま動いているもの) に戻す。どちらも `/var/log/aiosd.log` に `{"op":"boot",...}` で残り、`aios get boot.last`
-     の `result` と `why` で読める
-  新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る
-- `test/vm-boot.sh [--new]` (開発のマシン) は、これを aios.img の VM (-snapshot) で確かめる: 起動するもの、読めないもの、
-  止まるもの (`AIOS_TEST_HANG=1` でビルドしたカーネル) を入れて再起動し (`test/vm.py reboot --reset-after`)、
-  前のものに戻ったか、わけ (why) を見る。`--new` はこのソースの aiboot、aiosd、aios を入れてから
+- 新しいカーネルは、起動できるとわかるまで `/boot/Image` にしない。試すのは systemd-boot と同じ boot counting
+  (Automatic Boot Assessment) なので、ローダーは aiboot でも systemd-boot でもよい:
+  1. `aios install kernel` で aiosd が新しいものを `/boot/Image.new` に置き、試す entry
+     `/boot/loader/entries/aios-new+1.conf` を作る (名前の `+1` が残りの回数。`sort-key aios` があるので一覧の先頭で、
+     loader.conf の `default aios*` に当たる。options は aios.conf と同じに `aios.new=1` を足す)
+  2. ローダーは数える名前の entry を起動する前に、名前を `aios-new+0-1.conf` に変える (残り 0、済んだ 1)。
+     残りが 0 の entry は一覧のうしろに並ぶので、次の起動では default が `aios.conf` (いまの /boot/Image) に当たる
+  3. aiosd が動くと (systemd-bless-boot の役): `aios.new=1` で起きていれば、/boot/Image を /boot/Image.prev に、
+     /boot/Image.new を /boot/Image にして、試す entry を消す (起動できた)。ほかのもので起きていれば、試すのをやめて
+     (entry と /boot/Image.new を消す) わけを残す: `unfinished` (ローダーが試したのに aiosd まで来なかった。止まって
+     リセットした)、`load` (UEFI の LoadImage が読めなかった。aiboot がその場で次の entry へ行き、
+     `aios.fallback_why=load` を渡す。systemd-boot は起動しなおすので `unfinished` になる)、`chosen` (一覧で
+     ほかのものを選んだ。entry の名前が数えられていない)。どれも `/var/log/aiosd.log` に `{"op":"boot",...}` で残り、
+     `aios get boot.last` の `result` と `why` で読める
+  新しいカーネルが止まったら、電源を入れなおす (リセット) だけで前のものに戻る。/boot/Image は試すあいだも変わらない
+- `test/vm-boot.sh [--new] [--sdboot]` (開発のマシン) は、これを aios.img の VM (-snapshot) で確かめる: 起動するもの、
+  読めないもの、止まるもの (`AIOS_TEST_HANG=1` でビルドしたカーネル) を入れて再起動し (`test/vm.py reboot
+  --reset-after`)、/boot/Image がもとのままか、わけ (why) を見る。`--new` はこのソースの aiboot、aiosd、aios を
+  入れてから。`--sdboot` はローダーを本物の systemd-boot (Debian 13 の systemd-boot-efi 257) にして、同じことを確かめる
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる
 - `aios build pkg` は bin/mkpkg.sh と同じものを aios の中で作る (user/src/lib/mkpkg.rs)。PKGBUILD の関数
   (pkgver prepare build package) は bash (brush) で動かし、ソース (git+、http(s) は fetch、横のファイル)、sha256、

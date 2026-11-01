@@ -9,10 +9,10 @@
 //     {"op":"rollback"}   ひとつ前の apply の設定に戻す (/etc/aios.json も戻し、そのとき入れたパッケージは外す)
 //     {"op":"src"}        /usr/src/aios を作る (root:wheel、2775。中身は aios src が wheel の人として git clone)
 //     {"op":"kernel","action":"install","path":"/usr/src/aios/target/Image"}
-//                         /boot/Image を入れかえる。前のものは /boot/Image.prev (起動の一覧の「previous kernel」)
-//     {"op":"kernel","action":"revert"}   /boot/Image と /boot/Image.prev を入れかえる
-// 起動したとき: 新しいカーネルを試していたら (/boot/loader/try) 消して、起動できたことにする。
-//   起動しなかったので aiboot が前のカーネルで起動したとき (aios.fallback=1) は、/boot/Image を前のものに戻す
+//                         新しいカーネルを /boot/Image.new に置き、試す entry (aios-new+1.conf) を作る
+//     {"op":"kernel","action":"revert"}   試すのをやめる (試していなければ /boot/Image と /boot/Image.prev を入れかえる)
+// 起動したとき: 新しいカーネルを試していたら (systemd-boot と同じ boot counting。doc/aios.md の「改造」)、
+//   それで起動していれば (aios.new=1) /boot/Image にし (systemd-bless-boot の役)、ほかので起動していれば試すのをやめる
 //   答え: {"ok":true|false,"status":N,"out":"...","err":"..."}
 // だれが頼んだかは SO_PEERCRED で見る。変える操作は root と wheel のグループの人だけ。
 // したことは /var/log/aiosd.log に 1 行 1 つの JSON で残す。読むだけのこと (状態) は aios get が自分で集める
@@ -318,36 +318,47 @@ fn src_init() -> Result<String, String> {
     Ok(format!("{} (root:wheel 2775)\n", SRC))
 }
 
-/// 新しいカーネルを試す回数 (aiboot が起動のたびに減らし、0 なら前のカーネルで起動する)
-const TRY: &str = "/boot/loader/try";
+// ESP (/boot) の中のカーネルと起動の一覧 (systemd-boot と同じ entry)
+const ENTRIES: &str = "/boot/loader/entries";
+const IMAGE: &str = "/boot/Image";
+const PREV: &str = "/boot/Image.prev";
+/// 試している新しいカーネル。entry は aios-new+LEFT-DONE.conf (state::boot_new_entry)
+const NEW: &str = "/boot/Image.new";
+/// 新しいカーネルを試す回数 (ローダーが起動のたびに名前の LEFT を減らし、0 になった entry はうしろに並ぶ)
+const NEW_TRIES: u32 = 1;
+/// 前の作りで aiboot が読んでいた、試す回数のファイル (いまは使わない)
+const OLD_TRY: &str = "/boot/loader/try";
 
-/// 起動したときに: 試していた新しいカーネルで起動できたか、aiboot が前のものに戻したか
+/// 起動したときに: 試していた新しいカーネルで起動できたか、ローダーがほかのもので起動したか
 fn boot_check() {
-    if !std::path::Path::new(TRY).exists() {
+    let _ = std::fs::remove_file(OLD_TRY);
+    let Some((_, tries)) = state::boot_new_entry() else {
+        // entry のない Image.new は、途中で止まった install の残り
+        let _ = std::fs::remove_file(NEW);
         return;
-    }
+    };
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    // aiboot が前のものに戻したわけ (aios.fallback_why=): unfinished / load / chosen (古い aiboot にはない)
-    let why = cmdline.split_whitespace().find_map(|w| w.strip_prefix("aios.fallback_why=")).unwrap_or("").to_string();
-    let (msg, status) = if cmdline.split_whitespace().any(|w| w == "aios.fallback=1") {
-        let what = match why.as_str() {
-            "unfinished" => "the new kernel did not finish booting (it stopped before aiosd started; reset went back)",
-            "load" => "the new kernel could not be loaded (the firmware's LoadImage failed: not a bootable Image)",
-            "chosen" => "the previous kernel was chosen in the boot menu",
-            _ => "the new kernel did not boot",
-        };
-        // 前のカーネルで起動している。/boot/Image を前のもの (いま動いているもの) にする
-        match kernel("revert", "") {
-            Ok(_) => (format!("{}; /boot/Image is the previous one again (the new one is /boot/Image.prev)", what), 1),
+    let words: Vec<&str> = cmdline.split_whitespace().collect();
+    let (msg, why, status) = if words.contains(&"aios.new=1") {
+        match promote() {
+            Ok(()) => ("the new kernel booted".to_string(), String::new(), 0),
             Err(e) => {
                 eprintln!("aiosd: {}", e);
-                let _ = std::fs::remove_file(TRY);
-                (format!("{}, and going back failed", what), 2)
+                (format!("the new kernel booted, but making it /boot/Image failed: {}", e), String::new(), 2)
             }
         }
     } else {
-        let _ = std::fs::remove_file(TRY);
-        ("the new kernel booted".to_string(), 0)
+        // わけ: aiboot が渡したもの (load) か、数えから (ローダーが試した: unfinished、試していない: chosen)
+        let why = words.iter().find_map(|w| w.strip_prefix("aios.fallback_why=")).map(String::from).unwrap_or_else(|| {
+            if matches!(tries, Some((0, _))) { "unfinished" } else { "chosen" }.to_string()
+        });
+        let what = match why.as_str() {
+            "unfinished" => "the new kernel did not finish booting (it was tried, but aiosd did not start; reset went back)",
+            "load" => "the new kernel could not be loaded (the firmware's LoadImage failed: not a bootable Image)",
+            _ => "another entry was chosen in the boot menu (the new kernel was not tried)",
+        };
+        cancel();
+        (format!("{}; /boot/Image is the old one", what), why, 1)
     };
     println!("aiosd: {}", msg);
     let mut req = json!({ "op": "boot", "result": msg });
@@ -357,59 +368,94 @@ fn boot_check() {
     record(0, std::process::id() as i32, &req, status);
 }
 
-/// /boot/Image を入れかえる / 戻す。前のものは /boot/Image.prev と、起動の一覧の entry に残す
+/// 試していた新しいカーネルで起動できた: /boot/Image にして (前のものは /boot/Image.prev と一覧の
+/// 「previous kernel」)、試す entry を消す
+fn promote() -> Result<(), String> {
+    if std::path::Path::new(IMAGE).exists() {
+        std::fs::rename(IMAGE, PREV).map_err(|e| format!("{} -> {}: {}", IMAGE, PREV, e))?;
+    }
+    std::fs::rename(NEW, IMAGE).map_err(|e| format!("{} -> {}: {}", NEW, IMAGE, e))?;
+    prev_entry()?;
+    cancel();
+    Ok(())
+}
+
+/// 試すのをやめる: 試す entry と /boot/Image.new を消す (/boot/Image はそのまま)
+fn cancel() {
+    while let Some((name, _)) = state::boot_new_entry() {
+        if std::fs::remove_file(format!("{}/{}", ENTRIES, name)).is_err() {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(NEW);
+}
+
+/// 新しいカーネルを試す / やめる。試すのは systemd-boot と同じ boot counting (doc/aios.md の「改造」)
 fn kernel(action: &str, path: &str) -> Result<String, String> {
-    const IMAGE: &str = "/boot/Image";
-    const PREV: &str = "/boot/Image.prev";
     match action {
         "install" => {
             let new = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
             if !image::is_image(&new) {
                 return Err(format!("{}: not an arm64 Image (aios build kernel makes one)", path));
             }
-            if std::path::Path::new(IMAGE).exists() {
-                std::fs::copy(IMAGE, PREV).map_err(|e| format!("{} -> {}: {}", IMAGE, PREV, e))?;
-            }
-            std::fs::write(IMAGE, &new).map_err(|e| format!("{}: {}", IMAGE, e))?;
-            prev_entry()?;
-            // 1 回だけ試す: 起動して aiosd が動けば消す。動かずに起動しなおすと aiboot が前のものにする
-            std::fs::write(TRY, "1").map_err(|e| format!("{}: {}", TRY, e))?;
+            cancel();
+            std::fs::write(NEW, &new).map_err(|e| format!("{}: {}", NEW, e))?;
+            // sort-key があるので、残りがあるあいだは一覧の先頭 (default の aios* に当たる)。
+            // options は今の aios.conf と同じに、aiosd が見分けるための aios.new=1 を足す
+            let name = format!("aios-new+{}.conf", NEW_TRIES);
+            let text = format!("title   aios (new kernel)\nsort-key aios\nlinux   /Image.new\n{}options aios.new=1\n", options("aios.conf"));
+            std::fs::create_dir_all(ENTRIES).map_err(|e| format!("{}: {}", ENTRIES, e))?;
+            std::fs::write(format!("{}/{}", ENTRIES, name), text).map_err(|e| format!("{}/{}: {}", ENTRIES, name, e))?;
+            show_menu();
             Ok(format!(
-                "{} <- {} ({} bytes). the old one is {}. reboot to use it; if it does not boot, the next boot goes back to the old one\n",
-                IMAGE,
+                "{} <- {} ({} bytes), {}/{}. reboot to try it: if it boots, it becomes {} (the old one {}); if not, the next boot goes back to the old one\n",
+                NEW,
                 path,
                 new.len(),
+                ENTRIES,
+                name,
+                IMAGE,
                 PREV
             ))
         }
         "revert" => {
+            if state::boot_new_entry().is_some() {
+                cancel();
+                return Ok(format!("stopped trying the new kernel ({} removed). {} stays\n", NEW, IMAGE));
+            }
             let (a, b) = (std::fs::read(IMAGE).map_err(|e| format!("{}: {}", IMAGE, e))?, std::fs::read(PREV).map_err(|e| format!("{}: {} (nothing to revert to)", PREV, e))?);
             std::fs::write(IMAGE, &b).map_err(|e| format!("{}: {}", IMAGE, e))?;
             std::fs::write(PREV, &a).map_err(|e| format!("{}: {}", PREV, e))?;
-            let _ = std::fs::remove_file(TRY);
             Ok(format!("{} and {} swapped. reboot to use it\n", IMAGE, PREV))
         }
         a => Err(format!("kernel: unknown action {:?} (install revert)", a)),
     }
 }
 
-/// 起動の一覧に前のカーネルを出し (prev-aios.conf。default の aios* には当たらない名前)、
-/// 一覧が出るように timeout を 0 から 3 秒にする
-fn prev_entry() -> Result<(), String> {
-    let dir = "/boot/loader/entries";
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
-    // options (root= など) は今のエントリと同じに
-    let options: String = std::fs::read_to_string(format!("{}/aios.conf", dir))
+/// entry の options の行 (root= など)
+fn options(entry: &str) -> String {
+    std::fs::read_to_string(format!("{}/{}", ENTRIES, entry))
         .unwrap_or_default()
         .lines()
         .filter(|l| l.split_whitespace().next() == Some("options"))
         .map(|l| format!("{}\n", l))
-        .collect();
-    std::fs::write(format!("{}/prev-aios.conf", dir), format!("title   aios (previous kernel)\nlinux   /Image.prev\n{}", options)).map_err(|e| format!("{}: {}", dir, e))?;
+        .collect()
+}
+
+/// 起動の一覧に前のカーネルを出す (prev-aios.conf。default の aios* には当たらない名前)
+fn prev_entry() -> Result<(), String> {
+    std::fs::create_dir_all(ENTRIES).map_err(|e| format!("{}: {}", ENTRIES, e))?;
+    let text = format!("title   aios (previous kernel)\nlinux   /Image.prev\n{}", options("aios.conf"));
+    std::fs::write(format!("{}/prev-aios.conf", ENTRIES), text).map_err(|e| format!("{}: {}", ENTRIES, e))?;
+    show_menu();
+    Ok(())
+}
+
+/// 一覧が出るように、loader.conf の timeout 0 を 3 秒にする
+fn show_menu() {
     let conf = "/boot/loader/loader.conf";
     if let Ok(t) = std::fs::read_to_string(conf) {
         let fixed: Vec<String> = t.lines().map(|l| if l.split_whitespace().collect::<Vec<_>>() == ["timeout", "0"] { "timeout 3".to_string() } else { l.to_string() }).collect();
         let _ = std::fs::write(conf, fixed.join("\n") + "\n");
     }
-    Ok(())
 }

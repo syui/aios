@@ -15,7 +15,9 @@
 //   aios src                   aios のソースを /usr/src/aios に (なければ git clone、あれば git pull。wheel の人)
 //   aios build kernel          /usr/src/aios のカーネルをビルドして target/Image に (起動できる形)
 //   aios install kernel [IMAGE] | --revert
-//                              /boot/Image を入れかえる (aiosd に頼む)。前のものは起動の一覧の「previous kernel」
+//                              新しいカーネルを試す (aiosd に頼む。systemd-boot と同じ boot counting)。起動できたら
+//                              /boot/Image になり、前のものは起動の一覧の「previous kernel」。--revert は試すのを
+//                              やめる (試していなければ /boot/Image と /boot/Image.prev を入れかえる)
 //   aios build pkg NAME|DIR [-o DIR]
 //                              PKGBUILD からパッケージを作る (NAME は /usr/src/aios/pkg/*/NAME)。できたものは
 //                              いまのディレクトリ (-o で変える) に。作業は ~/.cache/aios/build/NAME

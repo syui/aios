@@ -380,6 +380,29 @@ fn users() -> Value {
 
 // ---- boot ----
 
+/// 起動の一覧 (systemd-boot と同じ entry)
+pub const BOOT_ENTRIES: &str = "/boot/loader/entries";
+
+/// 試している新しいカーネルの entry (aios install kernel が作る aios-new+LEFT-DONE.conf。systemd-boot と aiboot が
+/// 起動のたびに名前の数を進める): ファイルの名前と、残りと済んだ回数 (数えの名前でなければ None)
+pub fn boot_new_entry() -> Option<(String, Option<(u64, u64)>)> {
+    let mut names: Vec<String> = fs::read_dir(BOOT_ENTRIES).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names.into_iter().find_map(|n| {
+        let lower = n.to_ascii_lowercase();
+        let stem = lower.strip_suffix(".conf")?;
+        if stem == "aios-new" {
+            return Some((n, None));
+        }
+        let rest = stem.strip_prefix("aios-new+")?;
+        let tries = match rest.split_once('-') {
+            Some((l, d)) => (l.parse().ok()?, d.parse().ok()?),
+            None => (rest.parse().ok()?, 0),
+        };
+        Some((n, Some(tries)))
+    })
+}
+
 fn boot() -> Value {
     let list = |dir: &str| -> Vec<Value> {
         let mut v: Vec<String> = fs::read_dir(dir).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
@@ -387,12 +410,12 @@ fn boot() -> Value {
         v.into_iter().map(Value::from).collect()
     };
     let kernels: Vec<Value> = list("/boot").into_iter().filter(|n| n.as_str().is_some_and(|s| s.starts_with("Image"))).collect();
-    let cmdline = read("/proc/cmdline").unwrap_or_default();
-    // boot counting (doc/aios.md): try は新しいカーネルを試す残りの回数 (なければ試していない)、
-    // fallback は前のカーネルに戻して起動したか。last は aiosd が残した最後の起動の結果
+    let new = boot_new_entry();
+    // boot counting (doc/aios.md): new は試している新しいカーネルの entry、try はその残りの回数
+    // (どちらも試していなければ null)。last は aiosd が残した最後の起動の結果
     let last = aiosd_log().into_iter().rev().find(|r| r["req"]["op"] == "boot").map(|r| {
         let mut l = json!({ "t": r["t"], "result": r["req"]["result"], "status": r["status"] });
-        // 前のカーネルに戻したわけ (aiboot の aios.fallback_why: unfinished / load / chosen)
+        // 新しいカーネルで起動しなかったわけ (unfinished / load / chosen)
         if !r["req"]["why"].is_null() {
             l["why"] = r["req"]["why"].clone();
         }
@@ -401,9 +424,9 @@ fn boot() -> Value {
     json!({
         "esp": "/boot",
         "kernels": kernels,
-        "entries": list("/boot/loader/entries"),
-        "try": read("/boot/loader/try").and_then(|t| t.trim().parse::<u64>().ok()),
-        "fallback": cmdline.split_whitespace().any(|w| w == "aios.fallback=1"),
+        "entries": list(BOOT_ENTRIES),
+        "new": new.as_ref().map(|n| n.0.clone()),
+        "try": new.and_then(|n| n.1).map(|t| t.0),
         "prev": fs::metadata("/boot/Image.prev").is_ok(),
         "last": last,
     })
