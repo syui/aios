@@ -375,6 +375,7 @@ fn load_elf(pt: &mut PageTable, ino: &crate::vfs::InodeRef, size: usize, base: u
 #[derive(Clone, Copy)]
 enum Id {
     Pfr0,
+    Pfr1,
     Isar0,
     Isar1,
     Isar2,
@@ -386,7 +387,8 @@ enum Id {
 /// 印 1 つ: (/proc/cpuinfo の名前, AT_HWCAP2 か, ビット, レジスタ, 欄の位置, 最小の値, 符号つきの欄か)。Linux の
 /// arch/arm64/kernel/cpufeature.c (arm64_elf_hwcaps) と同じ決まりで、ビットの順 (cpuinfo の Features もこの順)。
 /// カーネルが使わせていないもの (SVE と SME: Z と ZA のレジスタを切りかえで残さない、MTE、BTI、ポインタ認証、GCS、
-/// MOPS、WFxT) と、仕掛けのないもの (evtstrm: タイマのイベントの流れ、SSBS) は出さない
+/// MOPS、WFxT) と、仕掛けのないもの (evtstrm: タイマのイベントの流れ) は出さない。SSBS は cpuvuln.rs が PSTATE.SSBS を
+/// スレッドごとに扱うので出す (Linux と同じく SSBS2 から: EL0 の MRS / MSR SSBS)
 const CAPS: &[(&str, bool, u32, Id, u32, u64, bool)] = &[
     ("fp", false, 0, Id::Pfr0, 16, 0, true),
     ("asimd", false, 1, Id::Pfr0, 20, 0, true),
@@ -414,6 +416,7 @@ const CAPS: &[(&str, bool, u32, Id, u32, u64, bool)] = &[
     ("uscat", false, 25, Id::Mmfr2, 32, 1, false),
     ("ilrcpc", false, 26, Id::Isar1, 20, 2, false),
     ("flagm", false, 27, Id::Isar0, 52, 1, false),
+    ("ssbs", false, 28, Id::Pfr1, 4, 2, false),
     ("sb", false, 29, Id::Isar1, 36, 1, false),
     ("dcpodp", true, 0, Id::Isar1, 0, 2, false),
     ("flagm2", true, 7, Id::Isar0, 52, 2, false),
@@ -439,6 +442,7 @@ fn id_reg(r: Id) -> u64 {
     unsafe {
         match r {
             Id::Pfr0 => core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) v),
+            Id::Pfr1 => core::arch::asm!("mrs {}, id_aa64pfr1_el1", out(reg) v),
             Id::Isar0 => core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) v),
             Id::Isar1 => core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) v),
             // 古いアセンブラの名前のない ID_AA64ISAR2_EL1 (op0 3, op1 0, CRn 0, CRm 6, op2 2)

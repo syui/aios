@@ -685,6 +685,8 @@ secondary_entry:
     orr     x0, x0, #(1 << 14)
     orr     x0, x0, #(1 << 15)
     orr     x0, x0, #(1 << 26)
+    // DSSBS (44) は 0: 例外でカーネルに入ると PSTATE.SSBS が落ちる (投機的なストアの追いこしを止める。cpuvuln.rs)
+    bic     x0, x0, #(1 << 44)
     msr     sctlr_el1, x0
     isb
     ldr     x0, =2f

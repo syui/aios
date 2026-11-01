@@ -610,7 +610,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),
         RT_SIGPROCMASK => signal::rt_sigprocmask(a[0], a[1] as usize, a[2] as usize),
         RT_SIGACTION => signal::rt_sigaction(a[0] as usize, a[1] as usize, a[2] as usize),
-        PRCTL => sys_prctl(a[0], a[1] as usize, a[2] as usize),
+        PRCTL => sys_prctl(a[0], a[1] as usize, a[2] as usize, a[3], a[4]),
         SCHED_YIELD => {
             proc::yield_voluntary();
             Ok(0)
@@ -1847,8 +1847,11 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     }
 }
 
-/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp。ほかは何もしない
-fn sys_prctl(op: u64, arg: usize, arg3: usize) -> R {
+/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)。
+/// ほかは何もしない
+fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
+    const PR_GET_SPECULATION_CTRL: u64 = 52;
+    const PR_SET_SPECULATION_CTRL: u64 = 53;
     const PR_GET_SECCOMP: u64 = 21;
     const PR_SET_SECCOMP: u64 = 22;
     const PR_SET_NAME: u64 = 15;
@@ -1877,6 +1880,21 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize) -> R {
         PR_GET_NAME => {
             let c = p.comm;
             p.pt().copy_out(arg, &c).ok_or(-14)?;
+        }
+        // 投機的なストアの追いこし (cpuvuln.rs。Linux の arch_prctl_spec_ctrl_get / set): このスレッドだけ
+        PR_GET_SPECULATION_CTRL => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            return crate::cpuvuln::prctl_get(arg as u64, p.spec_ssb);
+        }
+        PR_SET_SPECULATION_CTRL => {
+            if arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            p.spec_ssb = crate::cpuvuln::prctl_set(arg as u64, arg3 as u64, p.spec_ssb)?;
+            let ssb = p.spec_ssb;
+            crate::cpuvuln::task_spsr(&mut p.tf().spsr, ssb);
         }
         _ => {}
     }

@@ -683,11 +683,12 @@ connect のポート) でかけられる。nftables は、システムぜんた�
 なので dotprod (asimddp)、fp16 (asimdhp)、i8mm を見て道を選ぶもの (llama.cpp の ggml、zstd、dav1d など) は、Apple M や
 cortex-a76 でも、いちばんおそい道を選んでいた。いまは Linux (arch/arm64/kernel/cpufeature.c の arm64_elf_hwcaps) と同じ
 決まりで、cpuid のほかに ID レジスタから 42 の印を出す (kernel/src/exec.rs の CAPS。cpuinfo の名前と順も Linux と同じ)。カーネルが
-使わせていないもの (SVE と SME、MTE、BTI、ポインタ認証、GCS、MOPS、WFxT) と、仕掛けのないもの (evtstrm、SSBS) は出さない。
+使わせていないもの (SVE と SME、MTE、BTI、ポインタ認証、GCS、MOPS、WFxT) と、仕掛けのないもの (evtstrm) は出さない。
+ssbs は出す (PSTATE.SSBS をスレッドごとに扱う: 下の「CPU のぜい弱性」。ID_AA64PFR1 の SSBS の欄も EL0 に見せる)。
 EL0 の MRS で読む ID レジスタ (trap.rs の emulate_mrs) も同じものを見せる: ID_AA64ISAR2 の RPRES、BC、RPRFM、CSSC を
 足し、ID_AA64PFR0 は DIT を足して、EL0 と EL1 を「AArch64 だけ」にした (aios は AArch32 のプログラムを動かさない)。
 test/cpuid.c が、MRS で読んだ ID レジスタ、AT_HWCAP / AT_HWCAP2、/proc/cpuinfo の 3 つが合うかを見る (QEMU の
-`-cpu max` で、aios も Linux 7.3 も同じ 34 の印)。TCG の VM の CPU は `AIOS_CPU=max` で変えられる (bin/run.sh。既定は
+`-cpu max` で、aios も Linux 7.3 も同じ 35 の印)。TCG の VM の CPU は `AIOS_CPU=max` で変えられる (bin/run.sh。既定は
 cortex-a72)。
 
 ### UEFI のランタイムサービスと efivarfs (/sys/firmware/efi/efivars)
@@ -716,6 +717,31 @@ UEFI から起動したとき (aiboot、systemd-boot、ファームウェアか�
   で UEFI のファームウェアから起こしたもので同じ答え: aios 73、Linux 74 (efivarfs をかぶせる 1 つが多い)。CI の
   ctests でも sudo で)。手本の Linux の設定 (test/linux.config) に CONFIG_EFI と
   CONFIG_EFIVAR_FS を入れた (-kernel でじかに起こすときは使わない。sysdiff の答えは入れる前と同じ)
+
+### CPU のぜい弱性 (/sys/devices/system/cpu/vulnerabilities、SSBS)
+
+`/sys/devices/system/cpu/vulnerabilities/` に Linux 7.3 と同じ 19 のファイル (meltdown、spectre_v1、spectre_v2、
+spec_store_bypass と、x86 などのもの) を出す (kernel/src/cpuvuln.rs)。「当たるか」は Linux の arm64 と同じ決め方
+(proton-pack.c と cpufeature.c): MIDR の安全なものの表、ID レジスタ (CSV2、CSV3、SSBS、ECBHB)、ファームウェアへの
+問いあわせ (SMCCC 1.1 の ARCH_FEATURES で ARCH_WORKAROUND_1 / 2。PSCI と同じ hvc / smc)。「対策」は aios がしている
+ものだけを書く:
+
+| ファイル | aios | Linux |
+|---|---|---|
+| meltdown | 当たれば Vulnerable (KPTI をしない) | KPTI で Mitigation: PTI |
+| spectre_v1 | Mitigation: __user pointer sanitization (ユーザーのポインタはユーザーのページ表を引いてから、カーネルの写しで読み書きする: vm.rs の copy_in / copy_out) | 同じ文 (uaccess のマスク) |
+| spectre_v2 | CSV2 か安全な表のものは Not affected。ほかは Vulnerable (ファームウェアの WORKAROUND_1 を呼ばない)。BHB はハードウェア (ECBHB) だけ | ファームウェアと BHB のループ / CLEARBHB / WORKAROUND_3 |
+| spec_store_bypass | SSBS があれば Linux と同じ「prctl で」: カーネルは SSBS を落として動き (SCTLR_EL1.DSSBS = 0)、ユーザーはふだん立てて、prctl で止めたスレッドだけ落とす。SSBS がなければ Vulnerable | SSBS がなければファームウェアの WORKAROUND_2 |
+
+prctl の PR_GET/SET_SPECULATION_CTRL (PR_SPEC_STORE_BYPASS: ENABLE、DISABLE、FORCE_DISABLE、DISABLE_NOEXEC。
+ほかの種類は ENODEV、ちがう値は ERANGE) と、/proc/PID/status の `Speculation_Store_Bypass` と
+`SpeculationIndirectBranch` も Linux と同じ。印はスレッドごとで fork で受けつぎ、DISABLE_NOEXEC は exec で外れ、
+PSTATE.SSBS はスケジューラが切りかえのたびに印から決めなおす (Linux の __switch_to と同じ)。sigreturn も SSBS を残す。
+AT_HWCAP と /proc/cpuinfo に ssbs を出し、EL0 の MRS で読む ID_AA64PFR1 も SSBS の欄だけ見せる。
+QEMU の cortex-a72 と max で、aios と Linux 7.3.1 の答えがみな同じ (`test/cpuvuln.c`: 出すだけのテストなので、
+`LINUX_CPU=cortex-a72 test/linux-vm.sh exec latest ...` の出力とくらべる。cortex-a72 は spectre_v2 と
+spec_store_bypass が Vulnerable、max は `Mitigation: CSV2, but not BHB` と `... disabled via prctl`)。
+Linux より弱いところ (KPTI、BHB のループ、ファームウェアの手当て) は、その CPU で動かすときに足す。
 
 ### カーネルの砂場 (aios.off= と aish の box)
 

@@ -8,6 +8,7 @@ mod apparmor;
 mod securityfs;
 mod efirt;
 mod efivarfs;
+mod cpuvuln;
 mod trace;
 mod fail;
 mod oom;
@@ -123,6 +124,8 @@ pub extern "C" fn kmain() -> ! {
     println!("kalloc: {} pages free", kalloc::nfree());
     // UEFI のランタイムサービス (efivarfs が使う)
     efirt::init();
+    // CPU のぜい弱性 (Spectre / Meltdown) と、SSBS の手当て
+    cpuvuln::init();
     println!("initrd: {} entries", initrd::count());
     dtb::summary();
     // 実験のために切ったところ (aios.off=)

@@ -759,8 +759,8 @@ pub fn rt_sigreturn(tf: &mut TrapFrame) -> R {
     }
     tf.sp_el0 = u(mc + 256);
     tf.elr = u(mc + 264);
-    // EL0 のまま、条件フラグだけ戻す
-    tf.spsr = u(mc + 272) & 0xf000_0000;
+    // EL0 のまま、条件フラグと SSBS だけ戻す (SSBS はユーザーも MSR で変えられる。Linux の valid_user_regs も残す)
+    tf.spsr = u(mc + 272) & (0xf000_0000 | 1 << 12);
     let r = mc + MC_RESERVED;
     if u32::from_le_bytes(f[r..r + 4].try_into().unwrap()) == FPSIMD_MAGIC {
         let mut fp = proc::fp_snapshot();

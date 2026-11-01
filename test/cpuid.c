@@ -16,7 +16,7 @@
 #define MRS(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 
 // (名前, AT_HWCAP2 か, ビット, レジスタ, 欄の位置, 最小の値, 符号つき)。レジスタ: 0 PFR0 1 ISAR0 2 ISAR1 3 ISAR2
-// 4 MMFR0 5 MMFR1 6 MMFR2
+// 4 MMFR0 5 MMFR1 6 MMFR2 7 PFR1
 static const struct cap {
   const char *name;
   int word2, bit, reg, shift, min, sign;
@@ -29,7 +29,7 @@ static const struct cap {
     {"sha3", 0, 17, 1, 32, 1, 0},    {"sm3", 0, 18, 1, 36, 1, 0},       {"sm4", 0, 19, 1, 40, 1, 0},
     {"asimddp", 0, 20, 1, 44, 1, 0}, {"sha512", 0, 21, 1, 12, 2, 0},    {"asimdfhm", 0, 23, 1, 48, 1, 0},
     {"dit", 0, 24, 0, 48, 1, 0},     {"uscat", 0, 25, 6, 32, 1, 0},     {"ilrcpc", 0, 26, 2, 20, 2, 0},
-    {"flagm", 0, 27, 1, 52, 1, 0},   {"sb", 0, 29, 2, 36, 1, 0},        {"dcpodp", 1, 0, 2, 0, 2, 0},
+    {"flagm", 0, 27, 1, 52, 1, 0},   {"ssbs", 0, 28, 7, 4, 2, 0},       {"sb", 0, 29, 2, 36, 1, 0},        {"dcpodp", 1, 0, 2, 0, 2, 0},
     {"flagm2", 1, 7, 1, 52, 2, 0},   {"frint", 1, 8, 2, 32, 1, 0},      {"i8mm", 1, 13, 2, 52, 1, 0},
     {"bf16", 1, 14, 2, 44, 1, 0},    {"dgh", 1, 15, 2, 48, 1, 0},       {"rng", 1, 16, 1, 60, 1, 0},
     {"ecv", 1, 19, 4, 60, 1, 0},     {"afp", 1, 20, 5, 44, 1, 0},       {"rpres", 1, 21, 3, 4, 1, 0},
@@ -47,7 +47,7 @@ static int in_features(const char *line, const char *name) {
 
 // 表のものが、ID レジスタ、AT_HWCAP / AT_HWCAP2、/proc/cpuinfo の 3 つで合うか
 static int check_caps(uint64_t pfr0, uint64_t isar0, uint64_t isar1) {
-  uint64_t regs[7] = {pfr0, isar0, isar1, MRS("s3_0_c0_c6_2"), MRS("id_aa64mmfr0_el1"), MRS("id_aa64mmfr1_el1"), MRS("id_aa64mmfr2_el1")};
+  uint64_t regs[8] = {pfr0, isar0, isar1, MRS("s3_0_c0_c6_2"), MRS("id_aa64mmfr0_el1"), MRS("id_aa64mmfr1_el1"), MRS("id_aa64mmfr2_el1"), MRS("s3_0_c0_c4_1")};
   uint64_t hw[2] = {getauxval(AT_HWCAP), getauxval(AT_HWCAP2)};
   char line[4096] = "";
   FILE *f = fopen("/proc/cpuinfo", "r");

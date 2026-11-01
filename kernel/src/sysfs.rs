@@ -6,6 +6,7 @@
 //   /sys/class/net/{eth0,lo}/{address,mtu,operstate,carrier,ifindex,type,flags}
 //   /sys/class/net/IF/statistics/{rx,tx}_{bytes,packets,errors,dropped}
 //   /sys/devices/system/cpu/{online,possible,present} と cpuN/online
+//   /sys/devices/system/cpu/vulnerabilities/*       Spectre / Meltdown などの様子 (cpuvuln.rs。Linux 7.3 と同じ 19 のファイル)
 //   /sys/kernel/security                             securityfs をかぶせるところ (securityfs.rs)
 //   /sys/firmware/efi/{fw_platform_size,systab}      UEFI から起動したとき (arm64 の Linux と同じもの。systab は root だけ)
 //   /sys/firmware/efi/efivars                        efivarfs をかぶせるところ (efivarfs.rs)
@@ -54,6 +55,8 @@ enum Node {
     CpuFile(u8),
     CpuN(u16),
     CpuOnline(u16),
+    Vulns,
+    Vuln(u8),
     Kernel,
     Security,
     Module,
@@ -132,13 +135,15 @@ impl SysInode {
             Node::NetStat(n, i) => 0x2_0000 + ((n as u64) << 8) + 0x41 + i as u64,
             Node::CpuN(n) => 0x3_0000 + ((n as u64) << 4),
             Node::CpuOnline(n) => 0x3_0000 + ((n as u64) << 4) + 1,
+            Node::Vulns => 19,
+            Node::Vuln(i) => 0x500 + i as u64,
         }
     }
 
     fn is_dir(&self) -> bool {
         matches!(
             self.node,
-            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars
+            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars
         )
     }
 
@@ -200,6 +205,7 @@ impl SysInode {
             }
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
+            Node::Vuln(i) => crate::cpuvuln::show(crate::cpuvuln::FILES[i as usize]),
             Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
             Node::EfiFile(0) => "64\n".into(),
             // 設定テーブルの ACPI と SMBIOS (Linux の systab_show の順)
@@ -300,6 +306,8 @@ impl Inode for SysInode {
             Node::NetStats(n) => Node::NetStat(n, pos(&NET_STATS)?),
             Node::Devices if name == "system" => Node::System,
             Node::System if name == "cpu" => Node::Cpu,
+            Node::Cpu if name == "vulnerabilities" => Node::Vulns,
+            Node::Vulns => Node::Vuln(pos(&crate::cpuvuln::FILES)?),
             Node::Cpu => match pos(&CPU_FILES) {
                 Ok(i) => Node::CpuFile(i),
                 Err(_) => {
@@ -398,6 +406,12 @@ impl Inode for SysInode {
                 }
                 for n in 0..crate::smp::online().max(1) {
                     add(format!("cpu{}", n), Node::CpuN(n as u16));
+                }
+                add("vulnerabilities".into(), Node::Vulns);
+            }
+            Node::Vulns => {
+                for (i, f) in crate::cpuvuln::FILES.iter().enumerate() {
+                    add((*f).into(), Node::Vuln(i as u8));
                 }
             }
             Node::CpuN(n) => add("online".into(), Node::CpuOnline(n)),

@@ -237,6 +237,8 @@ fn emulate_mrs(tf: &mut TrapFrame) -> bool {
         // ID_AA64PFR0: EL2 と EL3、FP、AdvSIMD、DIT。EL0 と EL1 は AArch64 だけ (1): aios は AArch32 のプログラムを動かさない
         // (Linux の COMPAT のないものと同じ)
         (4, 0) => keep(rd!("id_aa64pfr0_el1"), &[8, 12, 16, 20, 48]) | 0x11,
+        // ID_AA64PFR1: SSBS だけ (Linux も BT と MTE は使わせているときだけ)
+        (4, 1) => keep(rd!("id_aa64pfr1_el1"), &[4]),
         (6, 0) => rd!("id_aa64isar0_el1"),
         // ID_AA64ISAR1: ポインタ認証 (APA API GPA GPI) を外す
         (6, 1) => rd!("id_aa64isar1_el1") & !(0xff << 4 | 0xff << 24),

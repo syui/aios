@@ -306,6 +306,8 @@ pub struct Proc {
     pub cred: crate::cred::Cred,
     /// プログラムの名前 (/proc/PID/stat や ps に出る。最大 15 バイト)
     pub comm: [u8; 16],
+    /// 投機的なストアの追いこし (SSB) の印 (prctl の PR_SET_SPECULATION_CTRL: cpuvuln::SSB_*)。fork で受けつぐ
+    pub spec_ssb: u8,
     /// trace の名前の絞りに合うかの覚え: (絞りの版 << 1 | 合う)。版が trace::FILTER_GEN と同じあいだ使う (trace::wanted)
     pub trace_mark: u64,
     /// 代表でないスレッド。親は wait せず、終わったらスケジューラが片付ける
@@ -426,6 +428,7 @@ impl Proc {
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
         comm: [0; 16],
+        spec_ssb: 0,
         trace_mark: 0,
         thread: false,
         kthread: false,
@@ -536,6 +539,10 @@ impl Proc {
         tf.elr = img.entry as u64;
         tf.sp_el0 = img.sp as u64;
         tf.spsr = 0; // EL0t, 割り込み許可
+        // PR_SPEC_DISABLE_NOEXEC は exec で外れる。PSTATE.SSBS は印から
+        crate::cpuvuln::exec(&mut self.spec_ssb);
+        let ssb = self.spec_ssb;
+        crate::cpuvuln::task_spsr(&mut self.tf().spsr, ssb);
     }
 
     /// 同じスレッドグループの他の Proc (リーダーも)
@@ -1148,6 +1155,11 @@ pub fn scheduler() -> ! {
                 ON_CPU[crate::smp::id()].store(i + 1, Relaxed);
                 p.pt().activate_lazy();
                 fp_load(&p.fp);
+                // ユーザーに戻るときの PSTATE.SSBS は、切りかえのたびにスレッドの印から (Linux の __switch_to)
+                if !p.kthread {
+                    let ssb = p.spec_ssb;
+                    crate::cpuvuln::task_spsr(&mut p.tf().spsr, ssb);
+                }
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
                 crate::smp::dev_wait(2, t0);
                 swtch(sched_ctx(), &p.context);
@@ -1674,6 +1686,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     child.cred = cred;
     child.comm = parent.comm;
+    child.spec_ssb = parent.spec_ssb;
     child.thread = thread;
     if thread {
         child.tgid = parent.tgid;

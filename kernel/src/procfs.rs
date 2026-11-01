@@ -361,7 +361,7 @@ impl ProcInode {
                 let threads = proc::threads_of(p.tgid).len();
                 let (vsize, rss) = mem_of(p);
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nNoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nNoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
                     p.comm(),
                     state_name(p),
                     crate::ns::local_or_0(p.tgid),
@@ -381,7 +381,8 @@ impl ProcInode {
                     c.no_new_privs as u8,
                     crate::landlock::layers(c),
                     crate::seccomp::mode(c).0,
-                    crate::seccomp::mode(c).1
+                    crate::seccomp::mode(c).1,
+                    crate::cpuvuln::status(p.spec_ssb)
                 )
             }
             Node::Cmdline(pid) => {
