@@ -76,6 +76,8 @@ EOF
 cat > /mnt/aios/boot/loader/entries/aios.conf <<EOF
 title   aios
 linux   /vmlinuz-linux-aios
+initrd  /intel-ucode.img
+initrd  /amd-ucode.img
 initrd  /initramfs-linux-aios.img
 options root=UUID=$ROOT_UUID rw lsm=landlock,lockdown,yama,integrity,apparmor,bpf slab_nomerge vsyscall=none page_alloc.shuffle=1 module_blacklist=ksmbd
 EOF

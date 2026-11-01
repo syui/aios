@@ -29,7 +29,7 @@ arch-chroot $ROOTFS /bin/sh -c 'pacman -Syu --noconfirm vim git zsh rust gcc ope
 # in an nspawn container the host kernel's LSM is the host's business, and the
 # tarball stays free of the python that apparmor pulls in.
 if [[ "$BUILD_MODE" == "image" ]]; then
-  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio apparmor'
+  arch-chroot $ROOTFS /bin/sh -c 'pacman -S --noconfirm linux-aios linux-firmware mkinitcpio apparmor intel-ucode amd-ucode'
   arch-chroot $ROOTFS /bin/sh -c 'systemctl enable apparmor.service'
 fi
 
