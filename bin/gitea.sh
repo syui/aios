@@ -132,9 +132,39 @@ case "$1" in
       exit 0
     fi
     changes=$(g diff-index --cached --name-status "$base" | sed 's/^/  /')
+    commit() { g -c gpg.format=openpgp -c user.name="$name" -c user.email="$mail" commit-tree -S"$fpr" "$@"; }
+    # git.syui.ai の前の Cloudflare は 1 回に 100 MB までしか受けない (こえると 413)。新しいパッケージがそれより多ければ、
+    # 先にそれだけを、前の aios.db のまま前のパッケージも消さずに (aipkg から見て前のままの形で) いくつかに分けて送り、
+    # さいごにまるごと送る (そのときは、もう送ったものは送らない)
+    limit=$((80 * 1024 * 1024))
+    batch= size=0 total=0 n=0
+    for p in $(g diff-index --cached --diff-filter=AM --name-only "$base" -- '*.pkg.tar.zst'); do
+      total=$((total + $(g cat-file -s ":$p")))
+    done
+    if [ "$total" -gt "$limit" ]; then
+      # 分けて送るものの木は別の index で (g の index はさいごのまるごとの木)
+      gs() { GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/step" git "$@"; }
+      step() {
+        n=$((n + 1))
+        gs read-tree "$base"
+        for q in $batch; do
+          gs update-index --add --cacheinfo "100644,$(g rev-parse ":$q"),$q"
+        done
+        c=$(commit -m "aarch64: add new packages ($n)" "$(gs write-tree)")
+        echo "ai/repo: sending new packages, part $n ($((size / 1048576)) MB)" >&2
+        (cd "$dir" && git_push -q --force "$host/ai/repo.git" "$c:refs/heads/main")
+        size=0
+      }
+      for p in $(g diff-index --cached --diff-filter=AM --name-only "$base" -- '*.pkg.tar.zst'); do
+        s=$(g cat-file -s ":$p")
+        [ "$size" -gt 0 ] && [ $((size + s)) -gt "$limit" ] && step
+        batch="$batch $p" size=$((size + s))
+      done
+      [ "$size" -gt 0 ] && step
+    fi
     # 歴史は残さない: いまのファイルだけの 1 コミット (親なし) で main を置きかえる。パッケージは圧縮したバイナリで
     # 差分がとれず、作りなおすたびに積もるので (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
-    new=$(g -c gpg.format=openpgp -c user.name="$name" -c user.email="$mail" commit-tree -S"$fpr" -m "aarch64: update packages" -m "$changes" "$tree")
+    new=$(commit -m "aarch64: update packages" -m "$changes" "$tree")
     (cd "$dir" && git_push -q --force "$host/ai/repo.git" "$new:refs/heads/main")
     # 写しも送ったものに (書きかわるのは変わったファイルだけ)。前のコミットのものは、ふくらまないように捨てる
     # (ばらばらのものだけ。clone したときの pack はそのまま。gc で詰めなおすと、このディスクでは何分もかかる)
