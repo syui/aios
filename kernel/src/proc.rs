@@ -1865,7 +1865,8 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     // files を他と共有していたなら切り離す
     let files = p.files().clone();
     p.files = Some(Shared::new(files));
-    for f in p.files().fds.iter_mut() {
+    // 大きい番号から閉じる (Linux 7.4 の close_cloexec_files)
+    for f in p.files().fds.iter_mut().rev() {
         if f.as_ref().is_some_and(|f| f.cloexec) {
             *f = None;
         }

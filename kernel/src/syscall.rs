@@ -473,8 +473,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UTIMENSAT => sysfile::utimensat(int(a[0]), a[1] as usize, a[2] as usize, a[3]),
         PREAD64 => sysfile::pread(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
         PWRITE64 => sysfile::pwrite(a[0], a[1] as usize, a[2] as usize, a[3] as i64),
-        PREADV => sysfile::preadv2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
-        PWRITEV => sysfile::pwritev2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
+        PREADV => sysfile::preadv(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
+        PWRITEV => sysfile::pwritev(a[0], a[1] as usize, a[2] as usize, a[3] as i64, 0),
         // (fd, iov, vlen, pos_l, pos_h, flags): 64 ビットでは pos は pos_l (-1 ならいまの位置)
         PREADV2 => sysfile::preadv2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, a[5] as u32),
         PWRITEV2 => sysfile::pwritev2(a[0], a[1] as usize, a[2] as usize, a[3] as i64, a[5] as u32),

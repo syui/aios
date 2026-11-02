@@ -1,7 +1,10 @@
 #!/bin/sh
 # ロボット (test/sysdiff.c) の手本にする Linux を、このマシンのカーネルでなく、kernel.org の最新の安定版にする:
 # arm64 の Linux を小さな設定 (test/linux.config) で作り、aios と同じ QEMU の virt で起こして、その中で動かす。
-#   test/linux-vm.sh version [latest|X.Y.Z]      kernel.org の latest_stable (または X.Y.Z) の版
+#   test/linux-vm.sh version [latest|mainline|X.Y.Z|X.Y-rcN]
+#                                                 kernel.org の latest_stable (mainline なら mainline の X.Y-rcN。
+#                                                 または X.Y.Z、X.Y-rcN) の版。rc の tarball は git.kernel.org から
+#                                                 (kernel.org は rc の sha256 を出さないので、HTTPS で取るだけ)
 #   test/linux-vm.sh build [latest|X.Y.Z]        作る (できていればそのまま)。Image のパスを出す
 #   test/linux-vm.sh run IMAGE SYSDIFF CASES OPS home|tmp OUT
 #                                                 sysdiff (aarch64 の静的なもの) を nobody で、home なら ext4、
@@ -28,6 +31,11 @@ cross=${CROSS_COMPILE:-aarch64-linux-gnu-}
 
 version() {
   case "${1:-latest}" in
+  mainline)
+    v=$(curl -fsS --max-time 30 https://www.kernel.org/releases.json 2>/dev/null |
+      python3 -c 'import json,sys; print(next(r["version"] for r in json.load(sys.stdin)["releases"] if r["moniker"] == "mainline"))' 2>/dev/null) || v=
+    [ -n "$v" ] || { echo "linux-vm: cannot reach kernel.org for the mainline version" >&2; exit 1; }
+    echo "$v" ;;
   latest)
     v=$(curl -fsS --max-time 30 https://www.kernel.org/releases.json 2>/dev/null |
       python3 -c 'import json,sys; print(json.load(sys.stdin)["latest_stable"]["version"])' 2>/dev/null) || v=
@@ -54,6 +62,16 @@ build() {
   mkdir -p "$out"
   major=${v%%.*}
   tar=$dir/linux-$v.tar.xz
+  case $v in
+  *-rc*)
+    # rc は git.kernel.org のタグの tarball (gzip。sha256 の一覧はない)
+    tar=$dir/linux-$v.tar.gz
+    if [ ! -s "$tar" ]; then
+      curl -fsSL --max-time 1800 -o "$tar.part" "https://git.kernel.org/torvalds/t/linux-$v.tar.gz"
+      gzip -t "$tar.part"
+      mv "$tar.part" "$tar"
+    fi ;;
+  esac
   if [ ! -s "$tar" ]; then
     curl -fsSL --max-time 900 -o "$tar.part" "https://cdn.kernel.org/pub/linux/kernel/v$major.x/linux-$v.tar.xz"
     want=$(curl -fsS --max-time 60 "https://cdn.kernel.org/pub/linux/kernel/v$major.x/sha256sums.asc" | awk -v f="linux-$v.tar.xz" '$2 == f { print $1 }')
@@ -69,7 +87,7 @@ build() {
   obj=$dir/obj-$v
   rm -rf "$src" "$obj"
   mkdir -p "$src" "$obj"
-  tar -xJf "$tar" -C "$src" --strip-components=1
+  case $tar in *.gz) tar -xzf "$tar" -C "$src" --strip-components=1 ;; *) tar -xJf "$tar" -C "$src" --strip-components=1 ;; esac
   mk() { make -s -C "$src" O="$obj" ARCH=arm64 CROSS_COMPILE="$cross" "$@"; }
   mk tinyconfig >/dev/null
   cat "$top/test/linux.config" >> "$obj/.config"

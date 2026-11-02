@@ -984,6 +984,32 @@ heap、smp、mem は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spi
 ほかの重さ: 偽の TrapFrame で trap_handler をそのまま呼んで、速い道 (getppid、ロックなし)、大きなロックを取る道 (umask)、
 その中の dispatch だけ、ユーザーへ戻るまえ (resched、killed、signal) だけ、ESR を 1 回読む、CPU の番号を読む (7 回まわして速いもの)。
 
+### Linux 7.4 に合わせる (7.4-rc1、2026-11-02)
+
+Linux 7.4 は 11 月 1 日に rc1 が出た (安定版はまだ 7.3.1)。新しい機能は merge window で rc1 までに入るので、手本を 7.4-rc1 に
+して答えあわせをした (test/linux-vm.sh の `mainline`)。システムコールの表 (scripts/syscall.tbl) は 7.3 と同じ。aios に
+かかわる変わりめと、したこと:
+
+- close_range: `CLOSE_RANGE_EXCEPT` (8。範囲の外のものに。範囲は残すもの) と `CLOSE_RANGE_CLOEXEC_ONLY` (16。FD_CLOEXEC の
+  ものだけ閉じる。CLOEXEC とはいっしょに使えず EINVAL)。閉じるのは大きい番号から (close_range、exec の close-on-exec)。
+  aios は前から知らない印を見ずに閉じていた (8 をわたすとみな閉じた) ので、7.4 と同じく EINVAL に。CLOSE_RANGE_UNSHARE も
+  無視していたので、スレッドと分けている fd の表なら先に自分のものにする。`test/closerange.c` (22 の case: 新しい印、
+  まちがった印、UNSHARE、スレッドから見た fd) が 7.4-rc1 と 1 バイトもちがわない (6.18 と 7.3 では新しい印は EINVAL)
+- pread64 / pwrite64 / preadv / pwritev (fs/read_write.c): たしかめる順が、fd (EBADF)、負の off (EINVAL)、位置のないもの
+  (ESPIPE) に (7.3 までは負の off の EINVAL がいちばん先)。sysdiff の `pwrite64(-1, ..., -1)` が EBADF になった。ついでに、
+  aios は preadv と pwritev でも off の -1 を「いまの位置」にしていた (それは preadv2 と pwritev2 だけ。Linux の preadv(-1) は
+  EINVAL) のを直した
+- copy_file_range: 写すものが 0 バイトなら、書く側の大きさの上限 (EFBIG) を見ない
+- まだ (aios にもとからないもの): SO_PASSPIDFD_THREAD / SO_PEERPIDFD_THREAD (aios は SO_PEERPIDFD もまだ)、
+  SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV (seccomp の user notification)、OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
+  (aios は ABI 4)、ctnetlink の CTA_FILTER_ZONE、RTM_GETMULTICAST (PF_PACKET) と IFA_F_GLOBAL、リンクの IFLA_PACING_OFFLOAD
+  (aios のリンクの答えはもとから一部の属性だけ)
+
+たしかめたこと: sysdiff は CI と同じ 800 case (test/sysdiff/ を 7.4-rc1 で作りなおした) が 0 differ、aish の sysdiff (300) も
+0 differ。test/nftables.c の出力 (457 行) と test/netlink.c (79) も 7.4-rc1 と同じ。test/nfteval.c (394 行)、
+test/chosen.c (aios がえらんだちがいは 7.4 でもみな Linux とちがう)、test/inetsock.c (81) と test/unixsock.c (60) は、Linux 7.3.1
+と 7.4-rc1 の答えが同じ (7.3.1 と同じだった aios はそのまま)。
+
 ### Linux と答えあわせ (sysdiff)
 
 test/sysdiff.c は、種 (seed) から決まるシステムコールの並び (open、openat2、read、write、pread、lseek、truncate、stat、statx、
@@ -1031,11 +1057,14 @@ aios の中は ai。許可のしらべが同じになるように)、ちがい�
 test/linux-vm.sh が arm64 の Linux を小さな設定 (test/linux.config) で作り (版ごとに一度、3 分ほど。build/linux/)、aios と同じ
 QEMU の virt で起こして、その中で動かす (/init は test/linux-init.c。ext4 は 4 KiB のブロックの新しいディスク、tmpfs は /tmp)。
 新しい安定版が出れば、次の `sysdiff` がそれを作ってくらべるので、手本はいつも最新になる。`base: 7.2.11` のように版を選ぶことも、
+`base: mainline` (kernel.org の mainline。いまは 7.4-rc1: rc の tarball は git.kernel.org から、kernel.org は rc の sha256 を
+出さないので HTTPS で取るだけ) や `base: 7.4-rc1` で、安定版になる前の新しい Linux とくらべることも、
 `base: host` でこのマシンのカーネルにすることもできる。ほかの Linux (たとえば aios(main)) の答えでくらべるなら、そこで
 `cc -O2 -o sysdiff test/sysdiff.c && ./sysdiff -n 30 DIR 1-300 > linux.txt` とし、`linux` にそのファイルをわたす。
 
 ホームの ext4 (`fs` の既定) と /tmp の tmpfs (`fs: tmp`) の両方で、30 op と、長い並び (`ops: 80`) の種を見る。いまの aios は
 Linux 7.2.11 (最新の安定版) と、ext4 で 500 の種 (30 op) と 3000 の種 (80 op)、tmpfs で 1000 の種 (80 op) のどれもちがわない。
+CI の答え (test/sysdiff/、`test/sysdiff-ci.sh golden mainline`) は 7.4-rc1 のもの (下の「Linux 7.4 に合わせる」)。
 手本を 6.18 (このマシン) から 7.2 にしたときに出たちがいは rename の順だけ: Linux 7 は名前を引いたすぐあと (`__start_renaming`) に
 自分の上や下への rename (EINVAL、ENOTEMPTY) を見るので、`name/` の ENOTDIR より先になった。aios は新しい順に合わせた。
 えらんだちがいを 6 つにしたあとも、どれもちがわない。そのとき見つかった同じファイルの中の sendfile (Linux は読むページの

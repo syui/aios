@@ -672,15 +672,18 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
 /// pread64 / pwrite64 (と preadv / pwritev) の確かめ。Linux の ksys_pread64 と vfs_read と同じ順に: 位置が負なら
 /// EINVAL、fd がない (O_PATH も) なら EBADF、位置のないもの (パイプ、端末、ソケットなど) は ESPIPE、読めない
 /// (書けない) 口なら EBADF
+/// 位置を決めて読み書きするもの (pread64、pwrite64、preadv、pwritev) の fd。たしかめる順は Linux 7.4 の ksys_pread64 と
+/// do_preadv: fd がない (O_PATH も) は EBADF、負の off は EINVAL、位置のないもの (パイプ、ソケット) は ESPIPE、読めない・
+/// 書けないものは EBADF (7.3 までは負の off の EINVAL がいちばん先)。符号のない位置のファイル (/dev/mem) は aios にない
 fn positional(fd: u64, off: i64, write: bool) -> Result<FileRef, i64> {
-    if off < 0 {
-        return Err(crate::why::inval());
-    }
     let f = file_of(fd)?;
     {
         let b = f.borrow();
         if b.flags & file::O_PATH != 0 {
             return Err(-EBADF);
+        }
+        if off < 0 {
+            return Err(crate::why::inval());
         }
         if !matches!(b.kind, Kind::Inode(..) | Kind::Block(_) | Kind::Fb | Kind::Null | Kind::Zero | Kind::Random) {
             return Err(-file::ESPIPE);
@@ -956,12 +959,17 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     Ok(done as i64)
 }
 
-/// preadv / preadv2: off から順に、iovec ごとに pread。off が -1 なら、いまの位置で readv (Linux の do_preadv:
-/// off < 0 は EINVAL、位置のないもの (パイプ) は ESPIPE、が先)
+/// preadv2: off が -1 なら、いまの位置で readv。ほかは preadv と同じ
 pub fn preadv2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     if off == -1 {
         return readv2(fd, iov, cnt, flags);
     }
+    preadv(fd, iov, cnt, off, flags)
+}
+
+/// preadv: off から順に、iovec ごとに pread (Linux の do_preadv。たしかめる順は positional。-1 も負の off で EINVAL:
+/// いまの位置になるのは preadv2 だけ。前は preadv も -1 をいまの位置にしていた)
+pub fn preadv(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     let f = positional(fd, off, false)?;
     let v = iovecs(iov, cnt)?;
     let total = iov_total(&v)?;
@@ -989,12 +997,18 @@ pub fn preadv2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     Ok(done as i64)
 }
 
-/// pwritev / pwritev2。RWF_APPEND なら off は見ずに終わりに (Linux の generic_write_checks)。O_APPEND の fd でも off に
-/// 書くのは pwrite と同じ (aios がえらんだちがい pwrite-append。Linux は RWF_NOAPPEND のときだけ)
+/// pwritev2: off が -1 なら、いまの位置で writev。ほかは pwritev と同じ
 pub fn pwritev2(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     if off == -1 {
         return writev2(fd, iov, cnt, flags);
     }
+    pwritev(fd, iov, cnt, off, flags)
+}
+
+/// pwritev: off から順に、iovec ごとに pwrite (-1 も EINVAL。いまの位置になるのは pwritev2 だけ)。RWF_APPEND なら off は
+/// 見ずに終わりに (Linux の generic_write_checks)。O_APPEND の fd でも off に書くのは pwrite と同じ (aios がえらんだ
+/// ちがい pwrite-append。Linux は RWF_NOAPPEND のときだけ)
+pub fn pwritev(fd: u64, iov: usize, cnt: usize, off: i64, flags: u32) -> R {
     let f = positional(fd, off, true)?;
     let v = iovecs(iov, cnt)?;
     let total = iov_total(&v)?;
@@ -3580,13 +3594,14 @@ pub fn copy_file_range(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, l
     }
     let size = ii.meta().size;
     let count = if pos_in >= size as i64 { 0 } else { count.min(size.wrapping_sub(pos_in as u64)) };
-    // 書くほうの大きさの上限 (generic_write_check_limits)
+    // 書くほうの大きさの上限 (generic_write_check_limits)。写すものがなければ見ない (Linux 7.4 の
+    // generic_copy_file_checks。7.3 までは 0 バイトでも上限をこえた off_out は EFBIG)
     const EFBIG: i64 = 27;
     let max = io.max_bytes() as i64;
-    if pos_out >= max {
+    if count != 0 && pos_out >= max {
         return Err(-EFBIG);
     }
-    let count = count.min(max.wrapping_sub(pos_out) as u64) as usize;
+    let count = if count == 0 { 0 } else { count.min(max.wrapping_sub(pos_out) as u64) as usize };
     if ii.id() == io.id() && pos_out as u64 + count as u64 > pos_in as u64 && (pos_out as u64) < pos_in as u64 + count as u64 {
         return Err(crate::why::inval());
     }
@@ -3789,20 +3804,36 @@ pub fn flock(fd: u64, op: u64) -> R {
     crate::locks::flock(fd, op)
 }
 
-/// close_range(first, last, flags): まとめて閉じる (CLOSE_RANGE_CLOEXEC なら印をつけるだけ)
+/// close_range(first, last, flags): まとめて閉じる (Linux 7.4 の fs/file.c と同じ)。first と last は unsigned int。
+///   CLOSE_RANGE_UNSHARE: 分けている fd の表 (CLONE_FILES のスレッド) なら、先に自分のものにする
+///   CLOSE_RANGE_CLOEXEC: 閉じずに FD_CLOEXEC の印をつける
+///   CLOSE_RANGE_EXCEPT (7.4): 範囲の外のものに (範囲は残すもの)
+///   CLOSE_RANGE_CLOEXEC_ONLY (7.4): FD_CLOEXEC の印のあるものだけ閉じる (CLOEXEC とはいっしょに使えない)
+/// 閉じるのは大きい番号から (7.4 の __range_close と close_files)。知らない印は EINVAL (前は見ずに閉じていた)
 pub fn close_range(first: u64, last: u64, flags: u64) -> R {
-    const CLOSE_RANGE_CLOEXEC: u64 = 4;
-    if first > last {
+    const UNSHARE: u32 = 1 << 1;
+    const CLOEXEC: u32 = 1 << 2;
+    const EXCEPT: u32 = 1 << 3;
+    const CLOEXEC_ONLY: u32 = 1 << 4;
+    let (first, last, flags) = (first as u32 as usize, last as u32 as usize, flags as u32);
+    if flags & !(UNSHARE | CLOEXEC | EXCEPT | CLOEXEC_ONLY) != 0 || (flags & CLOEXEC != 0 && flags & CLOEXEC_ONLY != 0) || first > last {
         return Err(crate::why::inval());
     }
-    let files = proc::current().files();
-    let end = (last as usize).min(files.fds.len().saturating_sub(1));
-    for i in first as usize..=end {
-        if flags & CLOSE_RANGE_CLOEXEC != 0 {
-            if let Some(f) = files.fds[i].as_mut() {
-                f.cloexec = true;
-            }
-        } else {
+    let p = proc::current();
+    if flags & UNSHARE != 0 && p.files.as_ref().is_some_and(|f| !f.private()) {
+        let mine = p.files().clone();
+        p.files = Some(proc::Shared::new(mine));
+    }
+    let files = p.files();
+    let except = flags & EXCEPT != 0;
+    for i in (0..files.fds.len()).rev() {
+        if (first..=last).contains(&i) == except {
+            continue;
+        }
+        let Some(f) = files.fds[i].as_mut() else { continue };
+        if flags & CLOEXEC != 0 {
+            f.cloexec = true;
+        } else if flags & CLOEXEC_ONLY == 0 || f.cloexec {
             files.set(i, None);
         }
     }
