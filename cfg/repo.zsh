@@ -212,11 +212,17 @@ done
 rm -f *.old *.old.sig
 
 cd "$REPO_DIR"
+old_upstream=$(git rev-parse '@{u}')
 git add -A
 if ! git diff --cached --quiet; then
   git commit -m "update $(date +%Y.%m.%d)"
 fi
-git push
+if ! git push; then
+  echo "=== push rejected, replaying local commits onto the new origin/main ==="
+  git fetch origin main
+  git rebase --onto origin/main "$old_upstream" || { git rebase --abort; echo "ERROR: rebase onto origin/main failed"; exit 1; }
+  git push
+fi
 
 echo "=== Done ==="
 REMOTE
