@@ -11,8 +11,8 @@
 #   モデルの置き場所は /var/lib/ai/models、使うものは /var/lib/ai/model.gguf へのリンクにする。それがあれば
 #   etc/systemd/system/llama-server.service が起動のたびに 127.0.0.1:8080 で動かす (doc/aios.md の「ローカルの AI」)
 pkgname=llama.cpp
-pkgver=11887
-pkgrel=4
+pkgver=12033
+pkgrel=1
 pkgdesc='LLM inference in C/C++: the llama binary (server, cli, bench, quantize), static, CPU variants for aios'
 arch=('aarch64')
 url='https://github.com/ggml-org/llama.cpp'

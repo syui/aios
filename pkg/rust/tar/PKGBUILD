@@ -1,9 +1,9 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/tar)
 # uutils/tar はまだリリースがないので、コミットを決めて日付を版にする
 pkgname=tar
-pkgver=0.1.0.20261022
+pkgver=0.1.0.20261101
 pkgrel=1
-_commit=b4538492e05183443be1cf2f7fd975421a29df35
+_commit=8bb814d16a21a2f5e7a273ff08763efc993f9ed4
 pkgdesc='Rust implementation of tar (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/tar'
@@ -15,8 +15,9 @@ sha256sums=('SKIP')
 build() {
   . "$startdir/../cross.sh"
   cd tar
-  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): chacha20 (0.10.1 は yanked)
-  cargo_update chacha20@0.10.2
+  # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): chacha20 (0.10.1 は yanked)、ctutils
+  # (RUSTSEC-2026-0385)
+  cargo_update chacha20@0.10.2 ctutils@0.4.4
   musl_build --bin tarapp
 }
 

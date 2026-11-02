@@ -2,8 +2,8 @@
 #   Wayland だけ (X11 はなし)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする
 #   ビルドには cmake、ninja、このマシンの wayland-scanner (Debian / Ubuntu: libwayland-bin) が要る。/opt/c に入る
 pkgname=vulkan-tools
-pkgver=1.4.365
-pkgrel=3
+pkgver=1.4.367
+pkgrel=1
 pkgdesc='Vulkan utilities: vulkaninfo and vkcube (Wayland, for aios)'
 arch=('aarch64')
 url='https://github.com/KhronosGroup/Vulkan-Tools'

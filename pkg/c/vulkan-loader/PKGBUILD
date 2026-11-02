@@ -2,8 +2,8 @@
 #   ドライバは /opt/c/share/vulkan/icd.d などの JSON で見つける (mesa の lavapipe)。Wayland だけ (X11 はなし)
 #   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
 pkgname=vulkan-loader
-pkgver=1.4.365
-pkgrel=3
+pkgver=1.4.367
+pkgrel=1
 pkgdesc='Vulkan Installable Client Driver (ICD) loader: libvulkan.so (shared, for aios)'
 arch=('aarch64')
 url='https://github.com/KhronosGroup/Vulkan-Loader'
