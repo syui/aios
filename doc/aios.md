@@ -671,15 +671,59 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     の形 (netlink.rs の ack)。dump は 3776 バイト (NLMSG_GOODSIZE) ずつ、set の要素の dump は Linux と同じく
     おしまいに要素のないメッセージと NLMSG_DONE を 1 つのデータグラムで
   - まだ: object (名前のついた counter や quota)、flowtable、set の要素ごとの式、dynset、nft monitor (組への知らせ)、
-    NLM_F_ECHO、決まった要素を聞く get element、reject などをフックで確かめること
-  - 確かめかた: `test/nftables.c` (root で。8 つの case の nft -f と list ruleset -a -j。112 の段がみな手本の
-    Linux 7.3.1 と同じ: `LINUX_FILES="nft=NFT" test/linux-vm.sh rootexec latest test/bin/nftables /nft`)。手本の Linux の
+    NLM_F_ECHO、決まった要素を聞く get element
+  - 確かめかた: `test/nftables.c` (root で。10 の case (段階 2 で jump の深さと reject のフックのたしかめを足した) の
+    nft -f と list ruleset -a -j。出力がみな手本の Linux 7.3.1 と同じ: `LINUX_FILES="nft=NFT" test/linux-vm.sh rootexec latest test/bin/nftables /nft`)。手本の Linux の
     test/linux.config に NETFILTER、NF_TABLES (INET、IPV4、IPV6)、NFT_LOG (と NF_LOG_SYSLOG)、NFT_LIMIT、NFT_REJECT、
     NFT_QUOTA と IPV6 を入れた (sysdiff と netlink の答えは入れる前と同じ)
-- 段階 2: 評価 (nft の VM: レジスタと式 payload、meta、cmp、bitwise、immediate (verdict)、lookup、range、counter、limit、
-  log、reject) とフック。外から来たフレームは smoltcp にわたす前 (prerouting、input)、出すフレームは出す前 (output、
-  postrouting)。中どうしはパケットがないので、connect、送る、受けるところで同じ見かけ (5 つ組、iif / oif は lo) を作って
-  同じ鎖を通す
+- 段階 2 (できた): 評価とフック。式を動かすところ (nftables.rs の VM) と、パケットが決まりをとおる道 (kernel/src/nfhook.rs)
+  - VM: Linux の nft_do_chain と同じ: 20 の 32 ビットのレジスタ (判定は別)、決まりごとに式を順に (NFT_BREAK で次の
+    決まり)、jump は 16 段まで (goto はもどらない)、return と鎖の終わりでもどり、基の鎖の終わりは policy。queue は
+    受ける人がいないので drop (bypass なら accept)。式は immediate cmp payload (読む、書く: チェックサムも差分で直す)
+    meta (len protocol priority mark iif oif iifname oifname iiftype oiftype skuid skgid nfproto l4proto pkttype cpu
+    iifgroup oifgroup random time day hour sdif sdifname。mark priority pkttype は書ける) bitwise (and/xor、shift、
+    and/or/xor) byteorder lookup (hash、rbtree の区間、pipapo (concat の区間)、catchall、判定の map、消える時刻)
+    range counter log limit (ns の token bucket) reject quota last exthdr (TCP のオプション) rt (nexthop、tcpmss)
+  - フックの順: ip と inet の表 (dormant でないもの) の基の鎖を priority の順、同じなら先に入れたもの (起こした表は
+    後ろへ)。drop したらそこで終わり。どの表もなければパケットを作らない
+  - たしかめ (nft_table_validate): 基の鎖からたどって 16 段より深い jump は EMLINK (基の鎖から届かない輪はよい)、
+    reject は ip では input forward output だけ (inet は prerouting と ingress も)、rt は forward output postrouting、
+    meta の pkttype を変えるのは prerouting、sdif は input と forward。commit でしくじれば、Linux と同じく batch を
+    はじめからやりなおし、決まりと要素を足すたびにたしかめて、しくじったものがエラーを返す (番号 handle は 2 度目のぶんも
+    進む)。段階 1 で commit のときに BEGIN に返していた ELOOP は、これで Linux と同じ EMLINK に
+  - 道: eth0 から来たもの (net.rs の受け) は PRE_ROUTING (iif eth0) と、aios あて (自分のアドレス、ブロードキャスト、
+    マルチキャスト。おかしな送り元・あて先は PRE_ROUTING のあとで捨てる) なら LOCAL_IN。頭のおかしいものと、ほかの
+    あて先 (PACKET_OTHERHOST) は決まりの前に smoltcp が捨てる。eth0 へ出すものは LOCAL_OUT と POST_ROUTING: smoltcp が
+    作る TCP と ICMP は出す前に、UDP は sendmsg のとき (Linux と同じく、出す側で落ちれば EPERM)。DHCP は出すものを
+    通さず、受けるものは落ちても届ける (Linux の DHCP は AF_PACKET なので netfilter に関わらない)
+  - 中どうし (lo。127.0.0.0/8 と eth0 のアドレス): aios はパケットを作らないので、Linux が lo に流すのと同じ形のものを
+    作って LOCAL_OUT、POST_ROUTING (oif lo)、PRE_ROUTING、LOCAL_IN (iif lo。MAC は 0 の 14 バイト) に通す。mark と
+    priority は受ける側にも残る。TCP は SYN (窓 65495、MSS・SACK・timestamp・window scale のオプション)、SYN-ACK、
+    だれもいないときにカーネルが返す RST。どれかが落ちれば SYN をやりなおす (1、2、4 … 秒、127 秒で ETIMEDOUT)。
+    UDP はデータグラムごと (だれもいないときの ICMP の port unreachable も)
+  - reject: 判定は drop。返すもの (nf_send_reset の RST: id 0、DF、TTL 64、窓 0。nf_send_unreach → __icmp_send の
+    ICMP: TOS は 0xc0 を足し、もとのものを 576 バイトまで) も決まりの道をとおる (自分あては lo の 4 つ、外へは eth0 の
+    LOCAL_OUT と POST_ROUTING)。RST への RST、ICMP のエラーへのエラー、断片、ブロードキャスト、受けたもののチェックサムの
+    ちがうものには返さない。外へ返す ICMP は相手ごとに 1 秒に 1 つ (はじめは 6 つまで)。届いた RST は ECONNREFUSED、
+    ICMP は icmp_err_convert の errno (port は ECONNREFUSED、host と admin-prohibited は EHOSTUNREACH、net は
+    ENETUNREACH)。UDP は connect したものと IP_RECVERR だけ (致命でないものは IP_RECVERR だけ)。smoltcp のソケットへの
+    RST は smoltcp に受けさせ、ICMP は poll のあとで inet.rs が当てる
+  - log: Linux の nf_log_syslog と同じ 1 行 (IN= OUT= MAC= (flags の macdecode なら MACSRC= MACDST= MACPROTO=) SRC= DST=
+    LEN= TOS= PREC= TTL= ID= DF PROTO= …、ICMP のエラーは中のものを [] で) を kmsg に (dmesg で見える。シリアルの
+    画面には出さない)
+  - Linux よりよいところ: ファイアウォールが落としたものに当たったシステムコールは /proc/ai/why に「the firewall dropped
+    the packet: nftables inet filter output handle 5」(policy なら policy drop) と残る (sendmsg の EPERM、connect の
+    ECONNREFUSED など)
+  - まだ: 中どうしの TCP のつながったあとのデータ (つなぐときだけ通すので、つながったものは止まらない: conntrack の
+    established accept と同じ見かけ)、受けるものの meta skuid (Linux は early demux でつながったものだけわかる)、
+    exthdr の IPv4 オプションと書くもの、ingress、forward (転送しない)、外へつなぐ TCP の SYN のやりなおしの間は smoltcp の
+    もの (counter の数が Linux とちがう)
+  - 確かめかた: `test/nfteval.c` (root で。12 の case: 中どうしの TCP と UDP、eth0 のアドレス、外のだれもいないポート、
+    QEMU を一回りして外から来る TCP と UDP (hostfwd: bin/run.sh の AIOS_FWD と test/linux-vm.sh の LINUX_NET)。答え
+    (つながる、ECONNREFUSED、EHOSTUNREACH、時間切れ、届いた数、EPERM)、counter、log の行を、手本の Linux 7.3.1
+    (test/linux.config に VIRTIO_NET と IP_PNP_DHCP を入れた) とくらべる: 50 のためしと counter と log の行が、みな
+    同じ。netlink と sysdiff の手本の答えは、入れる前と同じ)。`test/nftables.c` にも jump の深さと reject の
+    フックの case を足した
 - 段階 3: conntrack (ct state new / established / related / invalid。よく使う `ct state established,related accept` の
   ため。TCP の状態は smoltcp と inet.rs が持っている)
 - そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 (aios に IPv6 ができてから)

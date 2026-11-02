@@ -15,6 +15,8 @@
 # test/nftables.c の /nft など)
 # LINUX_EFI=1 なら QEMU の UEFI のファームウェア (AAVMF / edk2。bin/run.sh と同じものを探す。変数はそのたびに
 # まっさらなもの) から -kernel を起こす (UEFI のランタイムサービスと efivarfs: test/efivarfs.c)
+# LINUX_NET=P1,P2 なら virtio-net を QEMU のユーザーネットワークにつなぎ (ip=dhcp で 10.0.2.15)、ホストの
+# 127.0.0.1:P1 を中の TCP 7001 へ、P2 を UDP 7002 へ (aios の bin/run.sh の AIOS_FWD と同じ。test/nfteval.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
 # cortex-a72 にする
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
@@ -161,8 +163,15 @@ boot() {
     machine=virt,acpi=off
     set -- -drive if=pflash,format=raw,readonly=on,file="$efi_code" -drive if=pflash,format=raw,file="$tmp/vars.fd"
   fi
+  append="console=ttyAMA0 rdinit=/init quiet"
+  if [ -n "${LINUX_NET:-}" ]; then
+    p1=${LINUX_NET%%,*} p2=${LINUX_NET#*,}
+    set -- "$@" -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$p1-:7001,hostfwd=udp:127.0.0.1:$p2-:7002" \
+      -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
+    append="$append ip=dhcp"
+  fi
   timeout 1800 qemu-system-aarch64 -M "$machine" -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot "$@" \
-    -kernel "$image" -initrd "$tmp/initrd" -append "console=ttyAMA0 rdinit=/init quiet" \
+    -kernel "$image" -initrd "$tmp/initrd" -append "$append" \
     -drive file="$tmp/work.img",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
     > "$tmp/serial" 2>&1 || true
 }

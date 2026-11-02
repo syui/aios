@@ -968,13 +968,24 @@ fn adv_mss(user_mss: i32) -> i32 {
 }
 
 /// SYN を送る (connect とやりなおし): 自分につないだもの、listen しているものの行列 (あふれていれば落とされる:
-/// SYN_SENT のまま、やりなおしの時刻を決める)、いなければ RST (ECONNREFUSED)
-fn syn(u: &InetRef) {
+/// SYN_SENT のまま、やりなおしの時刻を決める)、いなければ RST (ECONNREFUSED)。in_call は connect のシステムコールの
+/// 中か (ファイアウォールが落としたわけを、そのシステムコールに残す。tick のやりなおしでは残さない)
+fn syn(u: &InetRef, in_call: bool) {
     let _p = crate::prof::span("inet:syn");
     let (netns, saddr, sport, daddr, dport, my_mss, my_ttl) = {
         let s = u.borrow();
         (s.net, s.saddr, s.num, s.daddr, s.dport, s.user_mss, if s.uc_ttl < 0 { 64 } else { s.uc_ttl })
     };
+    // ファイアウォール (lo の 4 つのフック): Linux が lo に流す SYN と同じもの。落ちれば届かなかった SYN と同じく
+    // やりなおす (reject の RST や ICMP が届けば、それで終わる)
+    let fw = netns == 0 && crate::nfhook::active();
+    let isn = if fw { crate::rand::u32() } else { 0 };
+    if fw && !fw_tcp(Some(u), saddr, sport, daddr, dport, crate::nfhook::SYN, isn, 0, adv_mss(my_mss) as u16, in_call) {
+        if u.borrow().state == St::SynSent {
+            syn_lost(u);
+        }
+        return;
+    }
     // 自分につないだ (同時に開く: SYN を受けて SYN_RECV、SYN-ACK を受けて ESTABLISHED)
     if saddr == daddr && sport == dport {
         let mut s = u.borrow_mut();
@@ -986,6 +997,11 @@ fn syn(u: &InetRef) {
         return;
     }
     let Some(l) = lookup_listener(netns, daddr, dport) else {
+        // だれもいない: カーネルが返す RST (tcp_v4_send_reset) も決まりを通る。落ちれば SYN をやりなおす
+        if fw && !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::RST | crate::nfhook::ACK, 0, isn.wrapping_add(1), 0, false) {
+            syn_lost(u);
+            return;
+        }
         tcp_reset(u);
         return;
     };
@@ -994,12 +1010,16 @@ fn syn(u: &InetRef) {
         l.acceptq.len() as u32 > l.max_backlog
     };
     if full {
-        let mut s = u.borrow_mut();
-        let rto = 1u64 << s.syn_tries.min(10);
-        s.syn_next = ticks() + rto * HZ;
-        drop(s);
-        arm(u);
+        syn_lost(u);
         return;
+    }
+    // SYN-ACK (listen しているほうから)。落ちれば SYN をやりなおす (返すものは listen しているほうへ: 見ない)
+    if fw {
+        let theirs = adv_mss(l.borrow().user_mss) as u16;
+        if !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::SYN | crate::nfhook::ACK, crate::rand::u32(), isn.wrapping_add(1), theirs, false) {
+            syn_lost(u);
+            return;
+        }
     }
     // listen しているものを写して受ける口を作る (Linux の sk_clone_lock: 決めたものはみな引きつぐ)
     let c = {
@@ -1083,6 +1103,133 @@ fn syn(u: &InetRef) {
     l.borrow_mut().acceptq.push_back(c);
     notify(&l);
     notify(u);
+}
+
+/// SYN が届かなかった (listen の行列があふれた、ファイアウォールが落とした): SYN_SENT のまま、やりなおす時刻を決める
+fn syn_lost(u: &InetRef) {
+    let mut s = u.borrow_mut();
+    let rto = 1u64 << s.syn_tries.min(10);
+    s.syn_next = ticks() + rto * HZ;
+    drop(s);
+    arm(u);
+}
+
+// ---- ファイアウォール (nftables: nfhook.rs と nftables.rs) ----
+
+/// 中どうしの TCP の 1 つのパケット (SYN、SYN-ACK、RST) を、Linux が lo に流すものと同じ形で lo の決まりに通す。
+/// 通れば true。落ちて返すもの (reject の RST か ICMP) が届けば、送った側 (from) にそれを当てる
+#[allow(clippy::too_many_arguments)]
+fn fw_tcp(from: Option<&InetRef>, src: u32, sport: u16, dst: u32, dport: u16, flags: u8, seq: u32, ack: u32, mss: u16, in_call: bool) -> bool {
+    use crate::nfhook;
+    let (tos, ttl, sk, prio) = match from {
+        Some(u) => {
+            let s = u.borrow();
+            (s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, Some((s.uid, s.gid)), s.priority)
+        }
+        None => (0, 64, None, 0),
+    };
+    let ts = (crate::timer::uptime_ns() / 1_000_000) as u32;
+    let mut pkt = if flags & nfhook::SYN != 0 {
+        // SYN は窓 65495、SYN-ACK は 65483 (lo の MTU と既定の入れ物での Linux の値)。IP の id は SYN が乱数、ほかは 0
+        let opts = nfhook::syn_opts(mss, ts, if flags & nfhook::ACK != 0 { ts } else { 0 });
+        let (win, id) = if flags & nfhook::ACK != 0 { (65483, 0) } else { (65495, crate::rand::u32() as u16) };
+        nfhook::tcp(src, sport, dst, dport, seq, ack, flags, win, &opts, tos, ttl, id)
+    } else {
+        nfhook::tcp(src, sport, dst, dport, seq, ack, flags, 0, &[], tos, ttl, 0)
+    };
+    let reply = match nfhook::lo(&mut pkt, sk, 0, prio) {
+        nfhook::Path::Pass => return true,
+        nfhook::Path::Out(r, why) | nfhook::Path::In(r, why) => {
+            if in_call {
+                crate::why::firewall(&why.text());
+            }
+            r
+        }
+    };
+    if let (Some(u), Some(r)) = (from, reply) {
+        match nfhook::icmp_of(&r) {
+            Some((3, code)) => tcp_icmp(u, nfhook::icmp_errno(code).0),
+            Some(_) => {}
+            None => tcp_reset(u),
+        }
+    }
+    false
+}
+
+/// ICMP の到達不能を受けた TCP (Linux の tcp_v4_err): つなぐところ (SYN_SENT、SYN_RECV) ならそのエラーで終わる。
+/// つながったものには、やわらかいエラー (sk_err_soft) なので何もしない
+fn tcp_icmp(u: &InetRef, errno: i64) {
+    let (st, ext) = {
+        let s = u.borrow();
+        (s.state, s.ext)
+    };
+    if !matches!(st, St::SynSent | St::SynRecv) {
+        return;
+    }
+    if let Some(h) = ext {
+        tcp_sock(h).abort();
+    }
+    u.borrow_mut().err = -errno;
+    tcp_done(u);
+}
+
+/// smoltcp が出す TCP のソケットの持ち主 (meta skuid / skgid)。ip は IPv4 の頭から。listen しているものの SYN-ACK
+/// は、その持ち主
+pub fn ext_owner(ip: &[u8]) -> Option<(u32, u32)> {
+    let ihl = (*ip.first()? & 15) as usize * 4;
+    if ip.len() < ihl + 4 || ip[9] != 6 {
+        return None;
+    }
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let (sa, da) = (be32(&ip[12..16]), be32(&ip[16..20]));
+    let (sp, dp) = (u16::from_be_bytes([ip[ihl], ip[ihl + 1]]), u16::from_be_bytes([ip[ihl + 2], ip[ihl + 3]]));
+    let mut listener = None;
+    for w in all().iter() {
+        let Some(u) = w.upgrade() else { continue };
+        let Ok(s) = u.try_borrow() else { continue };
+        if !s.tcp {
+            continue;
+        }
+        if s.ext.is_some() && s.sport == sp && s.daddr == da && s.dport == dp {
+            return Some((s.uid, s.gid));
+        }
+        if s.ext_listen.is_some() && s.num == sp && (s.rcv_saddr == 0 || s.rcv_saddr == sa) {
+            listener = Some((s.uid, s.gid));
+        }
+    }
+    listener
+}
+
+/// ファイアウォールが返した ICMP の到達不能 (自分あて。IPv4 の頭から) を、送ったソケットに (tcp_v4_err、__udp4_lib_err)
+pub fn icmp_error(r: &[u8]) {
+    if r.len() < 28 + 20 + 8 || r[20] != 3 {
+        return;
+    }
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let (code, offender) = (r[21], be32(&r[12..16]));
+    let inner = &r[28..];
+    let ihl = (inner[0] & 15) as usize * 4;
+    if inner.len() < ihl + 8 {
+        return;
+    }
+    let (sa, da, proto) = (be32(&inner[12..16]), be32(&inner[16..20]), inner[9]);
+    let (sp, dp) = (u16::from_be_bytes([inner[ihl], inner[ihl + 1]]), u16::from_be_bytes([inner[ihl + 2], inner[ihl + 3]]));
+    match proto {
+        6 => {
+            let u = all().iter().filter_map(|w| w.upgrade()).find(|u| u.try_borrow().is_ok_and(|s| s.tcp && s.saddr == sa && s.sport == sp && s.daddr == da && s.dport == dp && s.state != St::Listen));
+            if let Some(u) = u {
+                tcp_icmp(&u, crate::nfhook::icmp_errno(code).0);
+            }
+        }
+        17 => {
+            if let Some(u) = udp_lookup(0, da, dp, sa, sp)
+                && u.try_borrow_mut().is_ok()
+            {
+                icmp_err_udp(&u, &inner[ihl + 8..], da, dp, sa, code, offender);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// connect (Linux の __inet_stream_connect と tcp_v4_connect)。aios の中のあいてには、そのまま SYN を届けて答えも
@@ -1215,7 +1362,7 @@ fn tcp_v4_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
         }
         return Ok(());
     }
-    syn(u);
+    syn(u, true);
     Ok(())
 }
 
@@ -2312,7 +2459,19 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
         }
         None => data,
     };
+    let fw = netns == 0 && crate::nfhook::active();
     if !local {
+        if fw {
+            let (sport, my_tos, my_ttl) = {
+                let s = u.borrow();
+                (s.sport, s.tos, s.uc_ttl)
+            };
+            let t = ttl.unwrap_or(if my_ttl < 0 { 64 } else { my_ttl as u8 });
+            let src = if saddr >> 24 == 127 || saddr == 0 { eth() } else { saddr };
+            if !fw_udp(u, src, sport, daddr, dport, &data, tos.unwrap_or(my_tos), t, false)? {
+                return Ok(len as i64);
+            }
+        }
         ext_udp_send(u, &data, daddr, dport, ttl)?;
         return Ok(len as i64);
     }
@@ -2322,6 +2481,9 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
     };
     let ttl = ttl.unwrap_or(if my_ttl < 0 { 64 } else { my_ttl as u8 });
     let tos = tos.unwrap_or(my_tos);
+    if fw && !fw_udp(u, saddr, sport, daddr, dport, &data, tos, ttl, true)? {
+        return Ok(len as i64);
+    }
     match udp_lookup(netns, saddr, sport, daddr, dport) {
         Some(r) => {
             let ts = udp_truesize(data.len());
@@ -2341,20 +2503,38 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
             }
         }
         // だれもいない: ICMP の port unreachable が返る (Linux の __udp4_lib_err)。connect した相手そのものか、
-        // IP_RECVERR なら、エラーを覚える
-        None => icmp_unreach(u, &data, daddr, dport, saddr),
+        // IP_RECVERR なら、エラーを覚える。ファイアウォールがあれば、その ICMP も lo の決まりを通る
+        None => {
+            if fw {
+                let pkt = crate::nfhook::udp(saddr, sport, daddr, dport, &data, tos, ttl, 0, true);
+                if let Some(mut icmp) = crate::nfhook::kernel_unreach(&pkt, 3)
+                    && matches!(crate::nfhook::lo(&mut icmp, None, 0, 0), crate::nfhook::Path::Pass)
+                {
+                    icmp_unreach(u, &data, daddr, dport, saddr);
+                }
+            } else {
+                icmp_unreach(u, &data, daddr, dport, saddr);
+            }
+        }
     }
     Ok(len as i64)
 }
 
 /// ICMP の port unreachable を受けた (Linux の __udp4_lib_err と ip_icmp_error)
 fn icmp_unreach(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32) {
+    icmp_err_udp(u, data, daddr, dport, saddr, 3, daddr);
+}
+
+/// ICMP の到達不能 (code) を受けた UDP。IP_RECVERR ならいつも、でなければ致命のもの (icmp_err_convert の fatal) で
+/// connect したものだけ、エラーを覚える。offender は ICMP を送ってきたアドレス
+fn icmp_err_udp(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32, code: u8, offender: u32) {
+    let (errno, fatal) = crate::nfhook::icmp_errno(code);
     let deliver = {
         let s = u.borrow();
         // 自分あてか (送り元と相手で、このソケットが受けるものか)
         let mine = s.rcv_saddr == 0 || s.rcv_saddr == saddr;
         let peer_ok = s.daddr == 0 || (s.daddr == daddr && (s.dport == 0 || s.dport == dport));
-        mine && peer_ok && (s.recverr || s.state == St::Established)
+        mine && peer_ok && (s.recverr || (fatal && s.state == St::Established))
     };
     if !deliver {
         return;
@@ -2364,11 +2544,42 @@ fn icmp_unreach(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32) {
         if s.recverr {
             // ICMP にのるのは 576 バイトまで (IP と ICMP の頭、送ったものの IP と UDP の頭をのぞいた中身)
             let keep = data.len().min(576 - 20 - 8 - 20 - 8);
-            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: ECONNREFUSED as u32, typ: 3, code: 3, to: (daddr, dport), offender: daddr });
+            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, typ: 3, code, to: (daddr, dport), offender });
         }
-        s.err = -ECONNREFUSED;
+        s.err = -errno;
     }
     notify(u);
+}
+
+/// UDP のデータグラムを決まりに通す (中どうしは lo の 4 つ、外へは eth0 の LOCAL_OUT と POST_ROUTING)。Err は出す側で
+/// 落ちた (sendmsg は EPERM)、Ok(false) は受ける側で落ちた (sendmsg はうまくいったことに)。返すもの (reject の ICMP) は
+/// 送ったソケットに
+#[allow(clippy::too_many_arguments)]
+fn fw_udp(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16, data: &[u8], tos: u8, ttl: u8, local: bool) -> Result<bool, i64> {
+    use crate::nfhook;
+    let (sk, prio, df, connected) = {
+        let s = u.borrow();
+        (Some((s.uid, s.gid)), s.priority, s.pmtudisc != 0, s.state == St::Established)
+    };
+    let id = if df && !connected { 0 } else { crate::rand::u32() as u16 };
+    let mut pkt = nfhook::udp(saddr, sport, daddr, dport, data, tos, ttl, id, df);
+    let path = if local { nfhook::lo(&mut pkt, sk, 0, prio) } else { nfhook::out_eth(&mut pkt, sk, 0, prio) };
+    let (reply, out, why) = match path {
+        nfhook::Path::Pass => return Ok(true),
+        nfhook::Path::Out(r, w) => (r, true, w),
+        nfhook::Path::In(r, w) => (r, false, w),
+    };
+    if let Some(r) = reply
+        && let Some((3, code)) = nfhook::icmp_of(&r)
+    {
+        let offender = u32::from_be_bytes([r[12], r[13], r[14], r[15]]);
+        icmp_err_udp(u, data, daddr, dport, saddr, code, offender);
+    }
+    if out {
+        crate::why::firewall(&why.text());
+        return Err(-EPERM);
+    }
+    Ok(false)
 }
 
 /// IP_RECVERR の付帯データ (struct sock_extended_err と、知らせてきたアドレスの sockaddr_in)
@@ -3277,7 +3488,7 @@ pub fn tick() {
                         s.syn_tries += 1;
                         s.syn_next = 0;
                     }
-                    syn(&u);
+                    syn(&u, false);
                     notify(&u);
                 }
             }

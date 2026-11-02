@@ -19,7 +19,7 @@ struct tc {
     const char *name;
     const char *text;
     // あとで続けて動かす nft の引数 (空白で分ける。NULL なら list ruleset など)
-    const char *cmds[8];
+    const char *cmds[12];
 };
 
 static const struct tc cases[] = {
@@ -80,6 +80,17 @@ static const struct tc cases[] = {
     {"replace",
      "table ip t {\n\tchain c {\n\t\taccept\n\t}\n}\ndelete table ip t\ntable ip t {\n\tchain d {\n\t\tdrop\n\t}\n}\n",
      {"flush table ip t", "delete chain ip t d", NULL}},
+    // jump の輪 (nf_tables_check_loops / nft_chain_validate) と、reject を置けないフック (nft_reject_validate)
+    {"validate", "",
+     {"add table ip t", "add chain ip t a", "add chain ip t b", "add rule ip t a jump b", "add rule ip t b jump a",
+      "add chain ip t post { type filter hook postrouting priority 0 ; }", "add rule ip t post reject",
+      "add rule ip t b reject", "add rule ip t post jump b", NULL}},
+    {"validate-file",
+     "table ip t {\n\tchain post {\n\t\ttype filter hook postrouting priority 0; policy accept;\n\t\tjump r\n\t}\n"
+     "\tchain r {\n\t\tcounter\n\t\treject\n\t}\n\tchain pre {\n\t\ttype filter hook prerouting priority 0; policy accept;\n"
+     "\t\treject with tcp reset\n\t}\n}\n",
+     {"add table ip u", "add chain ip u c1", "add chain ip u c2", "add chain ip u c3", "add rule ip u c1 jump c2",
+      "add rule ip u c2 jump c3", "add rule ip u c3 jump c1", NULL}},
 };
 
 // nft ARGS を動かし、出力 (標準出力と標準エラー) と終わりの番号を出す

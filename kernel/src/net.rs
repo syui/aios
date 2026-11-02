@@ -45,14 +45,37 @@ pub fn now() -> Instant {
     Instant::from_micros((timer::uptime_ns() / 1000) as i64)
 }
 
-/// virtio-net と、自分あてのフレームの列 (ループバック)
+/// virtio-net と、自分あてのフレームの列 (ループバック。入れるときにファイアウォールを通してある)
 pub struct NetDev {
     virtio: VirtioNet,
     lo: VecDeque<Vec<u8>>,
+    mac: [u8; 6],
 }
 
-/// eth0 のいまのアドレス (自分あてかを見分ける。なければ 0)
+/// eth0 のいまのアドレス (自分あてかを見分ける。なければ 0)、ネットマスクの長さ、ゲートウェイ (ファイアウォールが
+/// smoltcp の poll の中から見るので、Net を通さずに)
 static ETH_ADDR: AtomicU32 = AtomicU32::new(0);
+static ETH_PREFIX: AtomicU32 = AtomicU32::new(0);
+static ETH_GW: AtomicU32 = AtomicU32::new(0);
+
+pub fn eth_addr() -> u32 {
+    ETH_ADDR.load(Ordering::Relaxed)
+}
+
+pub fn eth_prefix() -> u8 {
+    ETH_PREFIX.load(Ordering::Relaxed) as u8
+}
+
+pub fn eth_gateway() -> u32 {
+    ETH_GW.load(Ordering::Relaxed)
+}
+
+fn set_gw(r: Option<Ipv4Address>) {
+    ETH_GW.store(r.map_or(0, |a| u32::from_be_bytes(a.octets())), Ordering::Relaxed);
+}
+
+/// ファイアウォールが返した ICMP のエラーで、smoltcp の外 (inet.rs) のソケットに届けるもの (poll のあとで)
+static ICMP_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
 /// 送り受けの数 (eth0 と lo): 受けたバイト, 受けたフレーム, 出したバイト, 出したフレーム
 static ETH_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 static LO_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
@@ -96,12 +119,17 @@ impl Device for NetDev {
             count(true, true, frame.len());
             return Some((Rx(frame), Tx(self)));
         }
-        if !self.virtio.can_send() {
-            return None;
+        loop {
+            if !self.virtio.can_send() {
+                return None;
+            }
+            let mut frame = self.virtio.recv()?;
+            count(false, true, frame.len());
+            // ファイアウォール (PRE_ROUTING と LOCAL_IN)。落とせば次のフレームを
+            if self.filter_in(&mut frame) {
+                return Some((Rx(frame), Tx(self)));
+            }
         }
-        let frame = self.virtio.recv()?;
-        count(false, true, frame.len());
-        Some((Rx(frame), Tx(self)))
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Tx<'_>> {
@@ -128,13 +156,15 @@ pub struct Tx<'a>(&'a mut NetDev);
 
 impl TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        // 先に作ってみて、自分あてなら受け取りの列へ、ほかは virtio へ
+        // 先に作ってみて、自分あてなら受け取りの列へ、ほかは virtio へ (どちらもファイアウォールを通ったものだけ)
         let mut buf = alloc::vec![0u8; len];
         let r = f(&mut buf);
         if loops_back(&buf) {
-            count(true, false, len);
-            self.0.lo.push_back(buf);
-        } else {
+            if self.0.filter_out(&mut buf, true) {
+                count(true, false, len);
+                self.0.lo.push_back(buf);
+            }
+        } else if self.0.filter_out(&mut buf, false) {
             count(false, false, len);
             self.0.virtio.send(len, |b| b.copy_from_slice(&buf));
         }
@@ -142,10 +172,98 @@ impl TxToken for Tx<'_> {
     }
 }
 
+/// IPv4 のフレームなら、IP の頭がおかしくないか (版、長さ、頭のチェックサム)。おかしいものは決まりに通さず smoltcp に
+/// まかせる (Linux の ip_rcv_core はフックの前に捨てる)
+fn ipv4_ok(f: &[u8]) -> bool {
+    if f.len() < 34 || u16::from_be_bytes([f[12], f[13]]) != 0x0800 {
+        return false;
+    }
+    let ip = &f[14..];
+    let ihl = (ip[0] & 15) as usize * 4;
+    let tot = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    ip[0] >> 4 == 4 && ihl >= 20 && tot >= ihl && tot <= ip.len() && crate::nfhook::csum_fold(crate::nfhook::csum_add(0, &ip[..ihl])) == 0
+}
+
+impl NetDev {
+    /// eth0 から来たフレームを決まりに通す (false なら捨てる)。DHCP の答え (UDP 67 → 68) は落とされても届ける
+    /// (Linux の DHCP は AF_PACKET で受けるので、netfilter に関わらず届く)
+    fn filter_in(&mut self, f: &mut [u8]) -> bool {
+        if !crate::nfhook::active() || !ipv4_ok(f) {
+            return true;
+        }
+        use crate::nfhook::{PACKET_BROADCAST, PACKET_HOST, PACKET_MULTICAST};
+        let pkttype = if f[..6] == [0xff; 6] {
+            PACKET_BROADCAST
+        } else if f[0] & 1 != 0 {
+            PACKET_MULTICAST
+        } else if f[..6] == self.mac {
+            PACKET_HOST
+        } else {
+            // ほかのあて先 (PACKET_OTHERHOST): Linux はフックの前に捨てる
+            return true;
+        };
+        let ip = &f[14..];
+        let (saddr, daddr) = (u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]), u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]));
+        // aios あてか (ip_route_input: おかしな送り元とあて先 (martian) は、PRE_ROUTING のあとで捨てる)
+        let martian = saddr >> 24 == 127 || saddr >> 28 == 0xe || saddr == u32::MAX || (saddr == 0 && daddr != u32::MAX) || daddr >> 24 == 127 || daddr == 0;
+        let me = eth_addr();
+        let local = !martian && ((me != 0 && daddr == me) || crate::nfhook::is_bcast_or_mcast(daddr));
+        let ihl = (ip[0] & 15) as usize * 4;
+        let dhcp = ip[9] == 17 && ip.len() >= ihl + 4 && ip[ihl..ihl + 4] == [0, 67, 0, 68];
+        match crate::nfhook::in_eth(f, local, pkttype) {
+            crate::nfhook::EthIn::Pass => true,
+            crate::nfhook::EthIn::Drop(reply) => {
+                if let Some(r) = reply
+                    && self.virtio.can_send()
+                {
+                    count(false, false, r.len());
+                    self.virtio.send(r.len(), |b| b.copy_from_slice(&r));
+                }
+                dhcp
+            }
+        }
+    }
+
+    /// smoltcp が出すフレームを決まりに通す (false なら出さない)。lo は自分あて (4 つのフック)、ほかは eth0
+    /// (LOCAL_OUT と POST_ROUTING)。UDP は sendmsg のときに通してある (DHCP は通さない) ので、ここでは見ない
+    fn filter_out(&mut self, f: &mut [u8], lo: bool) -> bool {
+        if !crate::nfhook::active() || !ipv4_ok(f) {
+            return true;
+        }
+        let tot = u16::from_be_bytes([f[16], f[17]]) as usize;
+        let proto = f[23];
+        if proto == 17 && !lo {
+            return true;
+        }
+        let ip = &mut f[14..14 + tot];
+        let sk = crate::inet::ext_owner(ip);
+        let path = if lo { crate::nfhook::lo(ip, sk, 0, 0) } else { crate::nfhook::out_eth(ip, sk, 0, 0) };
+        let reply = match path {
+            crate::nfhook::Path::Pass => return true,
+            crate::nfhook::Path::Out(r, _) | crate::nfhook::Path::In(r, _) => r,
+        };
+        // 返すもの (自分あて): RST は smoltcp に受けさせ、ICMP は poll のあとで inet.rs に
+        if let Some(r) = reply {
+            if crate::nfhook::icmp_of(&r).is_some() {
+                ICMP_LATER.get().push(r);
+            } else {
+                let mut fr = Vec::with_capacity(14 + r.len());
+                fr.extend_from_slice(&self.mac);
+                fr.extend_from_slice(&f[..6]);
+                fr.extend_from_slice(&[8, 0]);
+                fr.extend_from_slice(&r);
+                self.lo.push_back(fr);
+            }
+        }
+        false
+    }
+}
+
 /// インターフェースのアドレス: eth0 のもの、それにいつも 127.0.0.1/8。
 /// eth0 を先に置く (smoltcp は同じネットワークのものがなければ先頭を送り元にするので、外へは eth0 から出る)
 fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
     ETH_ADDR.store(eth.map_or(0, |c| u32::from_be_bytes(c.address().octets())), Ordering::Relaxed);
+    ETH_PREFIX.store(eth.map_or(0, |c| c.prefix_len() as u32), Ordering::Relaxed);
     iface.update_ip_addrs(|a| {
         a.clear();
         if let Some(c) = eth {
@@ -158,7 +276,7 @@ fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
 pub fn init() {
     let Some(virtio) = VirtioNet::probe() else { return };
     let mac = EthernetAddress(virtio.mac);
-    let mut dev = NetDev { virtio, lo: VecDeque::new() };
+    let mut dev = NetDev { mac: virtio.mac, virtio, lo: VecDeque::new() };
     let mut cfg = Config::new(mac.into());
     cfg.random_seed = crate::rand::u64();
     let mut iface = Interface::new(cfg, &mut dev, now());
@@ -205,6 +323,7 @@ pub fn set_addr(addr: Ipv4Address, prefix: Option<u8>) {
             n.dhcp = Some(n.sockets.add(dhcpv4::Socket::new()));
             set_addrs(&mut n.iface, None);
             n.iface.routes_mut().remove_default_ipv4_route();
+            set_gw(None);
             n.lease = None;
             println!("net: dhcp");
         }
@@ -241,6 +360,7 @@ pub fn set_gateway(gw: Option<Ipv4Address>) {
     if let Some(l) = n.lease.as_mut() {
         l.router = gw;
     }
+    set_gw(gw);
     poll();
 }
 
@@ -259,6 +379,7 @@ fn dhcp_event(n: &mut Net) {
                     n.iface.routes_mut().remove_default_ipv4_route();
                 }
             }
+            set_gw(c.router);
             let lease = Lease { addr: c.address, router: c.router, dns: c.dns_servers.iter().copied().collect() };
             let changed = n.lease.as_ref().is_none_or(|l| l.addr != lease.addr || l.router != lease.router);
             if changed {
@@ -280,6 +401,7 @@ fn dhcp_event(n: &mut Net) {
             }
             set_addrs(&mut n.iface, None);
             n.iface.routes_mut().remove_default_ipv4_route();
+            set_gw(None);
             n.lease = None;
         }
         None => {}
@@ -312,6 +434,11 @@ pub fn poll() {
         changed |= n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     }
     dhcp_event(n);
+    // ファイアウォールが返した ICMP のエラーを、受けるソケットに (smoltcp の poll の外で)
+    let later = core::mem::take(ICMP_LATER.get());
+    for r in later {
+        crate::inet::icmp_error(&r);
+    }
     // 終わった孤児を片付ける
     let sockets = &mut n.sockets;
     n.orphans.retain(|&h| {

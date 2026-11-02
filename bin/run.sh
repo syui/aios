@@ -137,6 +137,11 @@ if [ "$ssh_port" != 0 ]; then
     fwd=",hostfwd=tcp:127.0.0.1:$ssh_port-:22"
   fi
 fi
+# AIOS_FWD=P1,P2: ホストの 127.0.0.1:P1 を中の TCP 7001 へ、P2 を UDP 7002 へ (ファイアウォールの答えあわせ: test/nfteval.c。
+# 手本の Linux の test/linux-vm.sh の LINUX_NET と同じ)
+if [ -n "${AIOS_FWD:-}" ]; then
+  fwd="$fwd,hostfwd=tcp:127.0.0.1:${AIOS_FWD%%,*}-:7001,hostfwd=udp:127.0.0.1:${AIOS_FWD#*,}-:7002"
+fi
 set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f "$disk" ]; then
   set -- "$@" \

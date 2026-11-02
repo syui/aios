@@ -58,9 +58,12 @@ pub enum Code {
     BadFd,
     /// EINVAL を返したカーネルのソースの場所 (name はファイル、num は行。そこに断ったわけが書いてある)
     Where,
+    /// ファイアウォール (nftables) の決まりが止めた。path は "nftables FAMILY TABLE CHAIN handle N" (policy なら
+    /// "policy drop")
+    Firewall,
 }
 
-const CODES: [&str; 15] = ["", "perm", "missing", "missing_cached", "not_dir", "loop", "name_too_long", "seccomp", "landlock", "injected", "part_off", "no_sys", "not_link", "bad_fd", "where"];
+const CODES: [&str; 16] = ["", "perm", "missing", "missing_cached", "not_dir", "loop", "name_too_long", "seccomp", "landlock", "injected", "part_off", "no_sys", "not_link", "bad_fd", "where", "firewall"];
 
 /// 1 つのわけ (Proc に 1 つ。輪にも)
 #[derive(Clone, Copy)]
@@ -199,6 +202,16 @@ pub fn landlock(access: u64, net: bool, what: &str) -> i64 {
     -crate::cred::EACCES
 }
 
+/// ファイアウォールが、いまのシステムコールのパケットを落とした (nfhook.rs の道から)。errno は返すときに決まる
+/// (sendmsg の EPERM、connect の ECONNREFUSED など) ので、done がそのとき合わせる
+#[cold]
+pub fn firewall(what: &str) {
+    if let Some(n) = me() {
+        *n = Note { code: Code::Firewall, errno: 0, ..NONE };
+        n.plen = copy(&mut n.path, what);
+    }
+}
+
 /// LANDLOCK_ACCESS_FS_* と LANDLOCK_ACCESS_NET_* のビットの名前
 fn landlock_names(access: u64, net: bool) -> String {
     const FS: [&str; 16] = ["execute", "write_file", "read_file", "read_dir", "remove_dir", "remove_file", "make_char", "make_dir", "make_reg", "make_sock", "make_fifo", "make_block", "make_sym", "refer", "truncate", "ioctl_dev"];
@@ -268,10 +281,11 @@ fn done_slow(nr: u64, e: i64, a: &[u64]) {
     }
     let Some(p) = crate::proc::try_current() else { return };
     let mut note = p.why;
-    if note.code != Code::None && note.errno as i64 != -e {
+    // ファイアウォールのわけ (errno 0) は、返す errno がなんでも
+    if note.code != Code::None && note.errno as i64 != -e && !(note.code == Code::Firewall && note.errno == 0) {
         note = NONE;
     }
-    if note.code == Code::None {
+    if note.code == Code::None || note.errno == 0 {
         note.errno = (-e) as u16;
     }
     // わけを書いたところがパスを知らなければ (許可を見るところなど)、プログラムがたのんだパスを
@@ -418,6 +432,7 @@ fn sentence(n: &Note, syscall: &str) -> String {
         Code::BadFd => format!("fd {} is not open in this process", n.num),
         Code::Where if path.is_empty() => format!("refused at {}:{} (the check there says why)", name, n.num),
         Code::Where => format!("refused at {}:{} (the check there says why), for {}", name, n.num, p),
+        Code::Firewall => format!("the firewall dropped the packet: {}", path),
         Code::None => String::new(),
     }
 }
