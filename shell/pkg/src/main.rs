@@ -460,8 +460,22 @@ fn daily() -> Value {
     if !since.is_empty() {
         text.push_str(&format!("behind: {}\n", since.join(", ")));
     }
+    // 改善の種: Linux の新しい版、CI のしくじり、課題の一覧 (todo.json)
+    for l in r["linux"].as_array().into_iter().flatten() {
+        text.push_str(&format!("linux: {} ({}) is out; the reference is {}\n", l["version"].as_str().unwrap_or("?"), l["kind"].as_str().unwrap_or("?"), l["reference"].as_str().unwrap_or("?")));
+    }
+    for c in r["ci"].as_array().into_iter().flatten() {
+        text.push_str(&format!("ci: {} fails on main at {} ({})\n", c["workflow"].as_str().unwrap_or("?"), c["sha"].as_str().unwrap_or("?"), c["url"].as_str().unwrap_or("")));
+    }
+    if let Some(t) = r["todo"].as_array().filter(|t| !t.is_empty()) {
+        let areas: std::collections::BTreeMap<&str, usize> = t.iter().fold(Default::default(), |mut m, x| {
+            *m.entry(x["area"].as_str().unwrap_or("?")).or_default() += 1;
+            m
+        });
+        text.push_str(&format!("todo: {} open ({}) in todo.json\n", t.len(), areas.iter().map(|(a, n)| format!("{} {}", a, n)).collect::<Vec<_>>().join(", ")));
+    }
     let mut out = json!({ "text": text, "date": r["date"], "feed": r["feed"] });
-    for k in ["new", "not_out", "vulns", "errors"] {
+    for k in ["new", "not_out", "vulns", "linux", "ci", "todo", "errors"] {
         if r[k].as_array().is_some_and(|a| !a.is_empty()) {
             out[k] = r[k].clone();
         }
@@ -496,7 +510,7 @@ fn cli(args: &[String]) -> i32 {
                 if answer.get("error").is_some() {
                     answer
                 } else {
-                    report::write(&root, Path::new(out), rest.get(1).map(Path::new), &answer, &rs, &vulns).unwrap_or_else(error)
+                    report::write(&root, Path::new(out), rest.get(1).map(Path::new), &answer, &rs, &vulns, report::gather(&root)).unwrap_or_else(error)
                 }
             }
             None => error("aish-pkg report DIR [PREV]"),

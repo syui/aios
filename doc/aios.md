@@ -22,6 +22,27 @@
 4. **改造 (src / build)** ✅: aios のソースを `/usr/src/aios` に置き、カーネルやパッケージをビルドして入れる。
    カーネルは前のものを ESP に残し、起動しなかったら前のもので起動しなおせるようにする
 
+## AI が把握して、直しつづけるしくみ
+
+AI (Claude の aish、アイ) が aios をつかみ、自分で次の仕事を見つけて直しつづけるための 3 つ。どれも「まずここを見る」口:
+
+- **いま (aios health)**: 動いている aios の見たて。サービスのしくじり、ディスクとメモリ、BKL の取りわすれ、カーネルのヒープと
+  oom、固まったスレッド、試している新しいカーネル、ファイアウォールの確かめ待ち、apply のしくじり、新しい版のあるパッケージを
+  1 つずつ ok / info / warn / crit と、次に使う道具 (hint) で。aish-sys の `health`、`aios health` (終わりの番号 0 / 1 / 2)、
+  `aios get health` (下の状態の木)
+- **毎日 (改善の種の報告)**: CI (.github/workflows/pkg.yml の report、毎日と手で) の `aish-pkg report` が、パッケージ (新しい版、
+  タグだけで tarball のまだないもの、直っていない CVE、見られなかった配布元)、Linux (kernel.org の安定版と mainline が手本の
+  test/sysdiff/linux.sum より新しければ: 答えあわせのしなおし)、CI (main の unix がしくじっていれば)、課題 (todo.json の open と
+  doing) を、GitHub のリリース pkg-updates の updates.json と Atom の feed (updates.atom) に置く。entry の id は中身で決まるので、
+  aigpt の feed (`aios-pkg`) の `fetch_feed` は新しく出たものだけを見せる。`pkg_check` の `daily: true` は報告をすぐ読む (いつから
+  遅れているか (since) も)。パッケージは `pkg_update` (daily で) でまとめて上げる
+- **課題の一覧 (todo.json)**: リポジトリの一番上の、機械が読める課題の一覧 (1 行 1 つ: id、area、status (open / doing / done)、
+  since、what、why、verify)。doc や記憶にばらばらに書いていた「のこり」をここへ。どの AI のセッションも同じものを見て続ける。
+  とりかかったら doing、終わったら done (verify のとおりに確かめてから) にしてコミットする。新しく見つけたものは足す
+
+回り方: feed (や pkg_check daily) で新しい種を受けとる → `aios health` といまの様子で確かめる → なおす (todo.json の verify で
+確かめ、Linux とくらべるものは test/linux-vm.sh の手本と) → todo.json と doc を書きかえてコミット → 次の日の報告が消える。
+
 ## 状態の木 (aios get)
 
 | PATH | 中身 |
