@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/klog.h>
+#include <linux/sockios.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -342,6 +344,15 @@ static const struct tc cases[] = {
      "\t\tip protocol icmp ct state related counter\n\t\tip protocol icmp ct state invalid counter\n"
      "\t\ttcp flags rst ct state related counter\n\t\ttcp flags rst ct state established counter\n\t}\n}\n",
      "tuvQ"},
+    // 中どうしの TCP のデータ (データの segment も決まりを通る: PSH ACK)
+    {"lo-data",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\ttcp dport 7001 tcp flags & (psh | ack) == psh | ack counter\n"
+     "\t\ttcp sport 7001 tcp flags & (psh | ack) == psh | ack counter\n"
+     "\t\ttcp dport 7001 meta length > 52 counter\n\t}\n}\n",
+     "D"},
+    // つながったあとで落とすと届かず (送りなおし)、決まりを消すと届く
+    {"lo-retransmit", "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\n", "R"},
     {"ct-list", "table inet t {\n\tchain c {\n\t\tct state new\n\t}\n}\n", "C"},
     {"order",
      "table inet a {\n\tchain in {\n\t\ttype filter hook input priority 10; policy accept;\n\t\tudp dport 7002 counter\n\t}\n}\n"
@@ -413,6 +424,79 @@ static void conntrack_list(void) {
     printf("ct (%d with 10.0.2.2)\n", ext);
 }
 
+// TCP でデータを送り受け (中どうし): 3 回送って、1 回返す
+static int tcp_pair(int *l, int *c, int *k) {
+    *l = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(*l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = sa("0.0.0.0", 7001);
+    if (bind(*l, (void *)&a, sizeof a) < 0 || listen(*l, 8) < 0)
+        return -1;
+    *c = socket(AF_INET, SOCK_STREAM, 0);
+    a = sa("127.0.0.1", 7001);
+    if (connect(*c, (void *)&a, sizeof a) < 0)
+        return -1;
+    *k = accept(*l, NULL, NULL);
+    return *k < 0 ? -1 : 0;
+}
+
+static int drain(int fd) {
+    char b[4096];
+    int n = 0;
+    long r;
+    while ((r = recv(fd, b, sizeof b, MSG_DONTWAIT)) > 0)
+        n += r;
+    return n;
+}
+
+static void data_probe(void) {
+    int l, c, k;
+    if (tcp_pair(&l, &c, &k) < 0) {
+        printf("tcp data: %s\n", ename(errno));
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        send(c, "hello", 5, 0);
+        ms_sleep(50);
+    }
+    ms_sleep(100);
+    int got = drain(k);
+    send(k, "bye", 3, 0);
+    ms_sleep(100);
+    int back = drain(c);
+    printf("tcp data: server got %d, client got %d\n", got, back);
+    close(k);
+    close(c);
+    close(l);
+    ms_sleep(100);
+}
+
+static void retransmit_probe(void) {
+    int l, c, k;
+    if (tcp_pair(&l, &c, &k) < 0) {
+        printf("tcp retransmit: %s\n", ename(errno));
+        return;
+    }
+    send(c, "one", 3, 0);
+    ms_sleep(100);
+    int before = drain(k);
+    nft_run("add rule inet t in tcp dport 7001 drop");
+    int sent = send(c, "two", 3, 0);
+    ms_sleep(500);
+    int during = drain(k);
+    int outq = -1, outq2 = -1;
+    ioctl(c, SIOCOUTQ, &outq);
+    nft_run("flush chain inet t in");
+    ms_sleep(1500);
+    int after = drain(k);
+    ioctl(c, SIOCOUTQ, &outq2);
+    printf("tcp retransmit: before %d, sent %d, while dropped %d (outq %d), after %d (outq %d)\n", before, sent, during, outq, after, outq2);
+    close(k);
+    close(c);
+    close(l);
+    ms_sleep(100);
+}
+
 static void probe(char c) {
     char lbl[64];
     // ポート 0: hostfwd がない (vm-ctests) ので外を一回りするもの、ホストのポートがないので外のだれもいないもの、はしない
@@ -434,6 +518,12 @@ static void probe(char c) {
         break;
     case 'C':
         conntrack_list();
+        break;
+    case 'D':
+        data_probe();
+        break;
+    case 'R':
+        retransmit_probe();
         break;
     }
 }

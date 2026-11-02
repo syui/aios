@@ -293,8 +293,15 @@ pub struct Inet {
     ctime: u64,
     /// 状態が変わるたびに増える数 (epoll の EPOLLET)
     pub generation: u64,
-    /// 中どうしの TCP で、conntrack に見せる次の seq (データは見せないので、つないだときの ISN + 1 から。0 は見せない)
+    /// 中どうしの TCP で、決まりと conntrack に見せる次の seq (つないだときの ISN + 1 から、データの長さだけ進む。0 は
+    /// まだ見せていない)
     ct_seq: u32,
+    /// ファイアウォールが落としたデータの segment (seq、中身、urgent)。送りなおすまで相手に届かない (Linux の再送)
+    fw_hold: VecDeque<(u32, Vec<u8>, bool)>,
+    /// 送りなおしの時刻 (tick)、回数、FIN も待っているか
+    fw_next: u64,
+    fw_tries: u32,
+    fw_fin: bool,
 }
 
 pub type InetRef = Rc<RefCell<Inet>>;
@@ -485,6 +492,10 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         ctime: now,
         generation: 0,
         ct_seq: 0,
+        fw_hold: VecDeque::new(),
+        fw_next: 0,
+        fw_tries: 0,
+        fw_fin: false,
     }));
     let a = all();
     let sweep = SWEEP.get();
@@ -854,11 +865,15 @@ pub fn listen(u: &InetRef, backlog: u64) -> R {
 /// FIN_WAIT2 / TIME_WAIT なら終わり) で表に入れなおす。どれでもなければ表から出す
 fn arm(u: &InetRef) {
     let mut s = u.borrow_mut();
-    let at = match s.state {
+    let mut at = match s.state {
         St::SynSent => s.syn_next,
         St::TimeWait | St::FinWait2 if s.dead => s.expires,
         _ => 0,
     };
+    // ファイアウォールが落としたデータの送りなおし
+    if s.fw_next != 0 && (at == 0 || s.fw_next < at) {
+        at = s.fw_next;
+    }
     if s.tkey == at {
         return;
     }
@@ -1639,6 +1654,11 @@ fn send_fin(u: &InetRef) {
         net::poll();
         return;
     }
+    // ファイアウォールが落としたデータが残っていれば、FIN はそのあと (送りなおしが終わってから)
+    if !u.borrow().fw_hold.is_empty() {
+        u.borrow_mut().fw_fin = true;
+        return;
+    }
     if let Some(p) = &peer {
         // conntrack には FIN と、相手の ACK を
         ct_seg(u, crate::nfhook::FIN | crate::nfhook::ACK);
@@ -2070,16 +2090,163 @@ fn stream_error(u: &InetRef, flags: u64, err: i64) -> i64 {
 /// 相手の行列のあき (自分につないだものは自分の行列)
 fn room(u: &InetRef) -> Option<usize> {
     let p = upgrade(&u.borrow().peer)?;
+    // ファイアウォールが落として送りなおしを待つものも、入れ物を使っている
+    let held: usize = if Rc::ptr_eq(&p, u) { 0 } else { u.borrow().fw_hold.iter().map(|x| x.1.len()).sum() };
     let s = p.borrow();
     let cap = if s.lock_rcvbuf { s.rcvbuf } else { TCP_QUEUE.max(s.rcvbuf) };
     let used = s.rcv_nxt.wrapping_sub(s.copied_seq) as usize;
-    Some(cap.saturating_sub(used))
+    Some(cap.saturating_sub(used).saturating_sub(held))
 }
 
-/// 相手 (aios の中) に届ける。相手が閉じていて読まない (FIN_WAIT2、TIME_WAIT で fd がない) なら RST が返る。
+/// 相手 (aios の中) に届ける。ファイアウォールがあれば、データの segment (MSS ずつ) を Linux が lo に流すのと同じ形で
+/// 決まりに通し (相手の ACK も)、落ちたものとそのあとのものは送りなおしの列へ (fw_hold: 200 ms から倍に、
+/// 120 秒まで。15 回で ETIMEDOUT: Linux の tcp_retries2)
+fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
+    if !crate::nfhook::active() || data.is_empty() {
+        return deliver_now(u, data, urg);
+    }
+    let Some(p) = upgrade(&u.borrow().peer) else { return deliver_now(u, data, urg) };
+    if Rc::ptr_eq(&p, u) {
+        return deliver_now(u, data, urg);
+    }
+    // ファイアウォールが入る前につないだもの: ここから数える (conntrack は途中から拾う)
+    for x in [u, &p] {
+        let mut s = x.borrow_mut();
+        if s.ct_seq == 0 {
+            s.ct_seq = crate::rand::u32() | 1;
+        }
+    }
+    let mss = (u.borrow().mss_cache.max(536) as usize).min(65483);
+    let n = data.len();
+    let mut at = 0;
+    while at < n {
+        let end = (at + mss).min(n);
+        let seg = data[at..end].to_vec();
+        let surg = urg && end == n;
+        let seq = {
+            let mut s = u.borrow_mut();
+            let q = s.ct_seq;
+            s.ct_seq = q.wrapping_add(seg.len() as u32);
+            q
+        };
+        if !u.borrow().fw_hold.is_empty() || !fw_data(u, seq, &seg, surg) {
+            if u.borrow().state == St::Close {
+                return;
+            }
+            fw_hold(u, seq, seg, surg);
+        } else {
+            deliver_now(u, seg, surg);
+            ct_seg(&p, crate::nfhook::ACK);
+            if u.borrow().state == St::Close {
+                return;
+            }
+        }
+        at = end;
+    }
+}
+
+/// データの segment を lo の決まりに通す (PSH ACK、timestamp つき、窓 512)。通れば true。reject の RST が届けば
+/// つながりはこわれる (ECONNRESET)。ICMP はつながったものにはやわらかいエラーなので何もしない
+fn fw_data(u: &InetRef, seq: u32, seg: &[u8], urg: bool) -> bool {
+    use crate::nfhook;
+    let (src, sport, dst, dport, tos, ttl, peer, sk, prio) = {
+        let s = u.borrow();
+        (s.saddr, s.sport, s.daddr, s.dport, s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, upgrade(&s.peer), (s.uid, s.gid), s.priority)
+    };
+    let ack = peer.as_ref().map_or(0, |p| p.borrow().ct_seq);
+    let ts = (crate::timer::uptime_ns() / 1_000_000) as u32;
+    let mut opt = [1u8, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+    opt[4..8].copy_from_slice(&ts.to_be_bytes());
+    opt[8..12].copy_from_slice(&ts.to_be_bytes());
+    let flags = nfhook::PSH | nfhook::ACK | if urg { 0x20 } else { 0 };
+    // 中身も (payload の決まりのため)
+    let mut pkt = nfhook::tcp_data(src, sport, dst, dport, seq, ack, flags, 512, &opt, tos, ttl, 0, seg);
+    let reply = match nfhook::lo(&mut pkt, Some(sk), 0, prio) {
+        nfhook::Path::Pass => return true,
+        nfhook::Path::Out(r, _) | nfhook::Path::In(r, _) => r,
+    };
+    if let Some(r) = reply
+        && nfhook::icmp_of(&r).is_none()
+    {
+        tcp_reset(u);
+    }
+    false
+}
+
+/// 落ちた segment を送りなおしの列に (はじめのものなら時計をかける)
+fn fw_hold(u: &InetRef, seq: u32, seg: Vec<u8>, urg: bool) {
+    {
+        let mut s = u.borrow_mut();
+        if s.fw_hold.is_empty() {
+            s.fw_tries = 0;
+            s.fw_next = ticks() + HZ / 5;
+        }
+        s.fw_hold.push_back((seq, seg, urg));
+    }
+    arm(u);
+}
+
+/// 送りなおし (tick から): はじめのものから決まりに通し、通ったものは届ける。また落ちれば待ちを倍に、15 回で ETIMEDOUT
+fn fw_retransmit(u: &InetRef) {
+    let peer = upgrade(&u.borrow().peer);
+    loop {
+        let front = u.borrow().fw_hold.front().cloned();
+        let Some((seq, seg, urg)) = front else { break };
+        if !fw_data(u, seq, &seg, urg) {
+            if u.borrow().state == St::Close {
+                return;
+            }
+            let give_up = {
+                let mut s = u.borrow_mut();
+                s.fw_tries += 1;
+                s.fw_tries > 15
+            };
+            if give_up {
+                {
+                    let mut s = u.borrow_mut();
+                    s.fw_hold.clear();
+                    s.fw_next = 0;
+                    s.fw_fin = false;
+                    s.err = -ETIMEDOUT;
+                }
+                tcp_done(u);
+                return;
+            }
+            {
+                let mut s = u.borrow_mut();
+                let rto = (HZ / 5) << s.fw_tries.min(10);
+                s.fw_next = ticks() + rto.min(120 * HZ);
+            }
+            arm(u);
+            return;
+        }
+        u.borrow_mut().fw_hold.pop_front();
+        deliver_now(u, seg, urg);
+        if let Some(p) = &peer {
+            ct_seg(p, crate::nfhook::ACK);
+        }
+        if u.borrow().state == St::Close {
+            return;
+        }
+    }
+    // みな届いた: 待っていた FIN も
+    let fin = {
+        let mut s = u.borrow_mut();
+        s.fw_next = 0;
+        s.fw_tries = 0;
+        core::mem::take(&mut s.fw_fin)
+    };
+    arm(u);
+    notify(u);
+    if fin {
+        send_fin(u);
+    }
+}
+
+/// いますぐ相手に届ける。相手が閉じていて読まない (FIN_WAIT2、TIME_WAIT で fd がない) なら RST が返る。
 /// 相手が FIN を送ったあと (FIN_WAIT1 / FIN_WAIT2) で RCV も shutdown していれば、相手はこわれて (ECONNRESET) RST が返る
 /// (Linux の tcp_rcv_state_process: RFC 1122 の MUST)
-fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
+fn deliver_now(u: &InetRef, data: Vec<u8>, urg: bool) {
     let _p = crate::prof::span("inet:deliver");
     let Some(p) = upgrade(&u.borrow().peer) else { return };
     let (gone, abort) = {
@@ -2947,7 +3114,8 @@ pub fn outq(u: &InetRef) -> Result<i32, i64> {
             return Ok(tcp_sock(h).send_queue() as i32);
         }
     }
-    Ok(0)
+    // 中どうし: ファイアウォールが落として送りなおしを待つもの (Linux の SIOCOUTQ はまだ ACK のないもの)
+    Ok(s.fw_hold.iter().map(|x| x.1.len()).sum::<usize>() as i32)
 }
 
 /// SIOCATMARK (TCP だけ: 次に読むところが urgent のバイト)
@@ -3538,6 +3706,13 @@ pub fn tick() {
             }
             St::TimeWait | St::FinWait2 if dead && exp != 0 && now >= exp => kill(&u),
             _ => {}
+        }
+        let fw_due = {
+            let s = u.borrow();
+            s.fw_next != 0 && now >= s.fw_next
+        };
+        if fw_due {
+            fw_retransmit(&u);
         }
         // まだ先の時刻があれば入れなおす (時刻が動いたもの、やりなおしの SYN がまた落とされたもの)
         arm(&u);

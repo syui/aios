@@ -734,7 +734,11 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     作って LOCAL_OUT、POST_ROUTING (oif lo)、PRE_ROUTING、LOCAL_IN (iif lo。MAC は 0 の 14 バイト) に通す。mark と
     priority は受ける側にも残る。TCP は SYN (窓 65495、MSS・SACK・timestamp・window scale のオプション)、SYN-ACK、
     だれもいないときにカーネルが返す RST。どれかが落ちれば SYN をやりなおす (1、2、4 … 秒、127 秒で ETIMEDOUT)。
-    UDP はデータグラムごと (だれもいないときの ICMP の port unreachable も)
+    つながったあとのデータも MSS ずつの segment (PSH ACK、timestamp つき) にして通し、受けた側の ACK も通す (`meta length`
+    や payload の決まりも効く)。落ちた segment とそのあとのものは相手に届かず、送りなおしを待つ (200 ms から倍に、
+    120 秒まで。15 回で ETIMEDOUT: Linux の tcp_retries2。待つあいだの SIOCOUTQ はその長さ、FIN はそのあと)。
+    reject の RST が来ればつながりはこわれる (ECONNRESET)。UDP はデータグラムごと (だれもいないときの ICMP の
+    port unreachable も)
   - reject: 判定は drop。返すもの (nf_send_reset の RST: id 0、DF、TTL 64、窓 0。nf_send_unreach → __icmp_send の
     ICMP: TOS は 0xc0 を足し、もとのものを 576 バイトまで) も決まりの道をとおる (自分あては lo の 4 つ、外へは eth0 の
     LOCAL_OUT と POST_ROUTING)。RST への RST、ICMP のエラーへのエラー、断片、ブロードキャスト、受けたもののチェックサムの
@@ -748,8 +752,7 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
   - Linux よりよいところ: ファイアウォールが落としたものに当たったシステムコールは /proc/ai/why に「the firewall dropped
     the packet: nftables inet filter output handle 5」(policy なら policy drop) と残る (sendmsg の EPERM、connect の
     ECONNREFUSED など)
-  - まだ: 中どうしの TCP のつながったあとのデータ (つなぐときだけ通すので、つながったものは止まらない: conntrack の
-    established accept と同じ見かけ)、受けるものの meta skuid (Linux は early demux でつながったものだけわかる)、
+  - まだ: 受けるものの meta skuid (Linux は early demux でつながったものだけわかる)、
     exthdr の IPv4 オプションと書くもの、ingress、forward (転送しない)、外へつなぐ TCP の SYN のやりなおしの間は smoltcp の
     もの (counter の数が Linux とちがう)
   - 確かめかた: `test/nfteval.c` (root で。12 の case: 中どうしの TCP と UDP、eth0 のアドレス、外のだれもいないポート、
@@ -758,6 +761,8 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     (test/linux.config に VIRTIO_NET と IP_PNP_DHCP を入れた) とくらべる: 50 のためしと counter と log の行が、みな
     同じ。netlink と sysdiff の手本の答えは、入れる前と同じ)。`test/nftables.c` にも jump の深さと reject の
     フックの case を足した
+    あとで、つながったあとのデータの case を 2 つ足した (lo-data: 向きごとの counter と `meta length`、lo-retransmit:
+    つながったあとに drop を入れて SIOCOUTQ を見て、消すと送りなおしで届く)。これも手本の Linux と 1 バイトもちがわない
 - 段階 3 (できた): conntrack (kernel/src/conntrack.rs。Linux 7.3 の nf_conntrack_core.c、proto_tcp.c、proto_udp.c、
   proto_icmp.c、proto_generic.c、nf_conntrack_standalone.c と同じ答え) と nft の `ct` の式
   - 動くのは、IPv4 の ip か inet の表に ct の式があるときだけ (Linux の nf_ct_netns_get: dormant の表でも)。フックは
@@ -780,8 +785,9 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     proto-dst packets bytes avgpkt (使うと数えはじめる: nf_ct_set_acct) id。`ct mark set`、`notrack` (raw の priority
     で)。手本の Linux にない secmark label zone event は EOPNOTSUPP。dump は Linux と同じ形
   - 中どうし (lo) の TCP: つなぐときの SYN、SYN-ACK に、3 つ目の ACK と閉じるときの FIN、ACK、RST (Linux と同じ
-    timestamp つきの 52 バイト) も、lo の決まりと conntrack に通す (落とされても止めない)。conntrack にはデータの
-    segment を見せないので、seq はデータのないつながりとして進む (ESTABLISHED → FIN_WAIT … → TIME_WAIT)
+    timestamp つきの 52 バイト) も、lo の決まりと conntrack に通す (落とされても止めない)。データの segment も通すので
+    (ファイアウォールが入る前につないだものは途中から拾う)、conntrack の seq もデータの長さだけ進む
+    (ESTABLISHED → FIN_WAIT … → TIME_WAIT)
   - /proc/net/nf_conntrack (root だけ。Linux と同じ行: ipv4 2 tcp 6 残りの秒 状態 組 [UNREPLIED] 組 [ASSURED] mark use)、
     /proc/sys/net/netfilter/nf_conntrack_{count,max,buckets,acct,checksum,tcp_loose,tcp_be_liberal,tcp_max_retrans,
     tcp_ignore_invalid_rst,tcp_timeout_*,udp_timeout,udp_timeout_stream,icmp_timeout,generic_timeout} と

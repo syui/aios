@@ -431,6 +431,22 @@ pub fn tcp(src: u32, sport: u16, dst: u32, dport: u16, seq: u32, ack: u32, flags
     b
 }
 
+/// TCP のパケットに中身もつけて (チェックサムも中身ごと)
+#[allow(clippy::too_many_arguments)]
+pub fn tcp_data(src: u32, sport: u16, dst: u32, dport: u16, seq: u32, ack: u32, flags: u8, win: u16, opts: &[u8], tos: u8, ttl: u8, id: u16, data: &[u8]) -> Vec<u8> {
+    let mut b = tcp(src, sport, dst, dport, seq, ack, flags, win, opts, tos, ttl, id);
+    let tot = b.len() + data.len();
+    b[2..4].copy_from_slice(&(tot as u16).to_be_bytes());
+    b[10..12].copy_from_slice(&[0, 0]);
+    let c = csum_fold(csum_add(0, &b[..20]));
+    b[10..12].copy_from_slice(&c.to_be_bytes());
+    b.extend_from_slice(data);
+    b[36..38].copy_from_slice(&[0, 0]);
+    let c = l4sum(src, dst, PROTO_TCP, &b[20..]);
+    b[36..38].copy_from_slice(&c.to_be_bytes());
+    b
+}
+
 /// SYN と SYN-ACK の TCP のオプション (Linux の tcp_syn_options: MSS、SACK_PERM と timestamp、NOP と window scale 7)
 pub fn syn_opts(mss: u16, tsval: u32, tsecr: u32) -> [u8; 20] {
     let mut o = [0u8; 20];
