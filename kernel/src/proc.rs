@@ -320,6 +320,9 @@ pub struct Proc {
     pub fallible: u32,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
     pub clear_tid: usize,
+    /// set_robust_list の頭 (struct robust_list_head のユーザーの番地。0 はなし)。終わるときと exec で
+    /// futex::exit_robust_list がたどる。fork の子は 0 から (Linux の futex_init_task)
+    pub robust_list: usize,
     /// はじめて走るとき (forkret)、大きなロックを放してから自分の tid を書く場所 (CLONE_CHILD_SETTID。Linux の
     /// schedule_tail と同じ。fork の子では書くと COW になるので、前は親の clone が大きなロックを持ったまま写していた)
     set_child_tid: usize,
@@ -438,6 +441,7 @@ impl Proc {
         dirtied: false,
         fallible: 0,
         clear_tid: 0,
+        robust_list: 0,
         set_child_tid: 0,
         vfork_parent: 0,
         exec_takeover: None,
@@ -1521,6 +1525,8 @@ fn exit_status(status: i32) -> ! {
     let p = current();
     crate::trace::exit(p.pid, status as i64);
     crate::ns::init_exited(p);
+    // 持ったまま終わる robust futex に OWNER_DIED (Linux の futex_exit_release は mm_release の clear_child_tid より先)
+    crate::futex::exit_robust_list();
     clear_child_tid(p);
     crate::futex::exit(p.pid);
     vfork_done(p);
@@ -1849,6 +1855,8 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     p.cred.apparmor = img.apparmor.label.clone();
     (p.cred.aa_onexec, p.cred.aa_prev, p.cred.aa_token) = (None, None, 0);
     let fatal = img.apparmor.fatal;
+    // 前のプログラムの robust futex (Linux の futex_exec_release: 前のアドレス空間で、外す前に)
+    crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
     if fatal {

@@ -721,6 +721,116 @@ pub fn wake_exit(uaddr: usize) {
     }
 }
 
+// ---- robust futex (Linux 7.4 の kernel/futex/core.c の exit_robust_list と handle_futex_death) ----
+//   struct robust_list_head { struct robust_list list (next), long futex_offset, struct robust_list *list_op_pending }
+//   list は持っている robust な futex (pthread の robust mutex) のつながり。番地の 1 ビットめは PI の印。持ったまま
+//   終わった (exec した) スレッドの futex には FUTEX_OWNER_DIED をつけ、待っているものを 1 つ起こす (次に取ったものは
+//   EOWNERDEAD を受ける)。glibc の robust mutex はいつも共有の op (FUTEX_PRIVATE_FLAG なし) で待つので、起こすのも共有の key
+
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+/// 長すぎるか輪になった list はここでやめる (Linux の ROBUST_LIST_LIMIT)
+const ROBUST_LIST_LIMIT: usize = 2048;
+
+/// ユーザーの番地 (8 バイト) を読む: (番地、PI の印)
+fn robust_entry(ua: usize) -> Option<(usize, bool)> {
+    let mut b = [0u8; 8];
+    proc::current().pt().copy_in(&mut b, ua)?;
+    let v = u64::from_le_bytes(b) as usize;
+    Some((v & !1, v & 1 != 0))
+}
+
+/// いまのスレッドの robust list をたどる (終わるときと exec のとき。たどったら忘れる)
+pub fn exit_robust_list() {
+    let p = proc::current();
+    let head = core::mem::take(&mut p.robust_list);
+    if head == 0 || p.mm.is_none() {
+        return;
+    }
+    let Some((mut entry, mut pi)) = robust_entry(head) else { return };
+    let mut off = [0u8; 8];
+    if proc::current().pt().copy_in(&mut off, head + 8).is_none() {
+        return;
+    }
+    let off = i64::from_le_bytes(off) as usize;
+    let Some((pending, ppi)) = robust_entry(head + 16) else { return };
+    let mut limit = ROBUST_LIST_LIMIT;
+    while entry != head {
+        // 次を先に読む (handle_futex_death で書きかわるかもしれないので)
+        let next = robust_entry(entry);
+        // 取りかけ (pending) が list にもあれば、2 度は見ない
+        if entry != pending && handle_futex_death(entry.wrapping_add(off), pi, false).is_err() {
+            return;
+        }
+        let Some((n, npi)) = next else { return };
+        (entry, pi) = (n, npi);
+        limit -= 1;
+        if limit == 0 {
+            break;
+        }
+    }
+    if pending != 0 {
+        let _ = handle_futex_death(pending.wrapping_add(off), ppi, true);
+    }
+}
+
+/// 終わるスレッドが uaddr の futex を持っていれば OWNER_DIED をつけて、待っているものを 1 つ起こす。
+/// 取りかけ (pending_op) の PI でない futex で持ち主がいなければ (放したあとで起こす前に死んだ)、起こすだけ
+fn handle_futex_death(uaddr: usize, pi: bool, pending_op: bool) -> Result<(), ()> {
+    if uaddr % 4 != 0 {
+        return Err(());
+    }
+    let me = vtid(proc::current().pid);
+    loop {
+        let uval = get(uaddr).map_err(|_| ())?;
+        let owner = uval & FUTEX_TID_MASK;
+        if pending_op && !pi && owner == 0 {
+            wake_exit(uaddr);
+            return Ok(());
+        }
+        if owner != me {
+            return Ok(());
+        }
+        let mval = (uval & FUTEX_WAITERS) | OWNER_DIED;
+        if cmpxchg(uaddr, uval, mval).map_err(|_| ())? != uval {
+            // ほかの CPU のユーザーが変えた: 読みなおす
+            continue;
+        }
+        // PI のものは exit (exit_pi_state_list) が、待っているものにゆずる
+        if !pi && uval & FUTEX_WAITERS != 0 {
+            wake_exit(uaddr);
+        }
+        return Ok(());
+    }
+}
+
+/// get_robust_list(pid, head_ptr, len_ptr): pid (0 は自分) のスレッドの robust list の頭と大きさ (24)。
+/// ほかのプロセスのものは ptrace で読めるときだけ (Linux の PTRACE_MODE_READ_REALCREDS: 本当の uid と gid が
+/// あいての uid、euid、suid と gid、egid、sgid にみな合うか、CAP_SYS_PTRACE。それから AppArmor の ptrace の read)。
+/// だめなら EPERM、いなければ ESRCH
+pub fn get_robust_list(pid: i32, head_ptr: usize, len_ptr: usize) -> Result<i64, i64> {
+    const ESRCH: i64 = 3;
+    const EPERM: i64 = 1;
+    let me = proc::current();
+    let head = if pid == 0 {
+        me.robust_list
+    } else {
+        let tid = crate::ns::arg_pid(pid as i64).map_err(|_| -ESRCH)? as u32;
+        let t = proc::find_thread(tid).ok_or(-ESRCH)?;
+        if t.tgid != me.tgid {
+            let (c, tc) = (&me.cred, &t.cred);
+            let ids = [tc.uid, tc.euid, tc.suid].iter().all(|&u| u == c.uid) && [tc.gid, tc.egid, tc.sgid].iter().all(|&g| g == c.gid);
+            if !(ids || c.capable(crate::cred::CAP_SYS_PTRACE)) || crate::apparmor::may_ptrace(tc, true).is_err() {
+                return Err(-EPERM);
+            }
+        }
+        t.robust_list
+    };
+    me.pt().copy_out(len_ptr, &24u64.to_le_bytes()).ok_or(-EFAULT)?;
+    me.pt().copy_out(head_ptr, &(head as u64).to_le_bytes()).ok_or(-EFAULT)?;
+    Ok(0)
+}
+
 /// スレッドが終わる: 持っている PI の futex を、待っているいちばん前のものにゆずる (Linux の exit_pi_state_list)
 pub fn exit(tid: u32) {
     let owned: Vec<Key> = t().pi.iter().filter(|&(_, &o)| o == tid).map(|(&k, _)| k).collect();

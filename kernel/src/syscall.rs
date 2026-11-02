@@ -126,6 +126,7 @@ nrs! {
     SET_TID_ADDRESS = 96,
     FUTEX = 98,
     SET_ROBUST_LIST = 99,
+    GET_ROBUST_LIST = 100,
     FUTEX_WAITV = 449,
     NANOSLEEP = 101,
     GETITIMER = 102,
@@ -605,10 +606,15 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             f.umask = a[0] as u32 & 0o777;
             Ok(old as i64)
         }
-        // robust futex の表は覚えない (持ったまま終わったスレッドの futex に OWNER_DIED をつけない)。長さだけ Linux と
-        // 同じく確かめる (struct robust_list_head は 24 バイト)。ふだんは fast で答える
+        // robust futex の list の頭を覚える (終わるときと exec に futex::exit_robust_list がたどる)。長さは Linux と同じく
+        // struct robust_list_head の 24 バイトだけ。ふだんは fast で答える
         SET_ROBUST_LIST if a[1] != 24 => Err(crate::why::inval()),
-        SET_ROBUST_LIST | MEMBARRIER => Ok(0),
+        SET_ROBUST_LIST => {
+            crate::proc::current().robust_list = a[0] as usize;
+            Ok(0)
+        }
+        GET_ROBUST_LIST => crate::futex::get_robust_list(a[0] as i32, a[1] as usize, a[2] as usize),
+        MEMBARRIER => Ok(0),
         RSEQ => Err(-ENOSYS),
         SIGALTSTACK => signal::sigaltstack(a[0] as usize, a[1] as usize),
         RT_SIGPROCMASK => signal::rt_sigprocmask(a[0], a[1] as usize, a[2] as usize),
@@ -886,8 +892,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         // スレッドは代表を表から探すので、ふつうの道へ
         GETPGID | GETSID if a[0] == 0 && p.is_leader() => if nr == GETPGID { p.pgid as i64 } else { p.sid as i64 },
         // glibc はスレッドのはじめと fork した子でかならず呼ぶ (前は fork のたびに大きなロックを 7.5 µs 持っていた)。
-        // 何も覚えないので、長さを見るだけ (ちがえば EINVAL のわけを残すふつうの道へ)
-        SET_ROBUST_LIST if a[1] == 24 => 0,
+        // 自分の Proc に頭を覚えるだけ (長さがちがえば EINVAL のわけを残すふつうの道へ)
+        SET_ROBUST_LIST if a[1] == 24 => {
+            p.robust_list = a[0] as usize;
+            0
+        }
         GETUID => p.cred.uid as i64,
         GETEUID => p.cred.euid as i64,
         GETGID => p.cred.gid as i64,

@@ -459,6 +459,24 @@ Firefox (4 つの CPU) の futex は 1 回 54 µs から 37 µs に (合計 198 
 (signal と broadcast)、時間切れで終わる待ち、生の CMP_REQUEUE を、いくつもの CPU で同時に動かす (起こしが消えれば alarm で
 失敗)。
 
+### robust futex (set_robust_list と、持ったまま終わったもの)
+
+pthread の robust mutex (PTHREAD_MUTEX_ROBUST) は、持ったまま死んだスレッドがいても、次に取ったものが EOWNERDEAD を受けて
+直せるようにするしくみ。glibc はスレッドのはじめと fork した子で set_robust_list に robust list の頭 (struct robust_list_head:
+list の next、futex_offset、list_op_pending) を渡し、持っている robust mutex をその list につなぐ。前の aios は長さを見て 0 を
+返すだけだったので、持ったまま死んだスレッドのものは取れず、待っているものはいつまでも眠った (todo.json の robust-futex)。
+
+いまは Linux 7.4 の kernel/futex/core.c と同じ: Proc の robust_list に頭を覚え (syscall::fast でも)、スレッドが終わるとき
+(clear_child_tid より先: futex_exit_release) と exec のとき (前のアドレス空間で: futex_exec_release) に list をたどる
+(futex::exit_robust_list。2048 で止める。番地の 1 ビットめは PI の印、取りかけの list_op_pending は 2 度見ない)。
+自分の tid の入った語には FUTEX_OWNER_DIED をつけ (FUTEX_WAITERS はのこす。cmpxchg で、ほかの CPU が変えたら読みなおす)、
+PI でなく待っているものがあれば 1 つ起こす (共有の key で: glibc の robust mutex はいつも FUTEX_PRIVATE_FLAG なしで待つ)。
+取りかけで持ち主のいない PI でない語は、変えずに起こすだけ (handle_futex_death)。fork の子は 0 から。get_robust_list は
+自分のものと、ptrace で読めるもの (本当の uid と gid が相手の 3 つにみな合うか CAP_SYS_PTRACE、それから AppArmor の ptrace
+の read) だけ (EPERM、ESRCH、EFAULT)。`test/robust.c` (14 行: 持ったまま終わるスレッド、待っているもの、MAP_SHARED の
+プロセスの _exit・SIGKILL・exec、待っているプロセス、手で作った list の自分のもの・ほかのもの・PI・取りかけ、set と get の
+まちがい) が Linux 7.4-rc1 と 1 バイトもちがわない。
+
 ### 自分だけの無名の mmap / munmap は大きなロックなしで
 
 smpbench を 4 つの CPU で動かすと、大きなロックを待つ時間のいちばん多いものの 1 つは、無名の領域を作って外すだけの
