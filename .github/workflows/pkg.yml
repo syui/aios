@@ -4,6 +4,8 @@
 #   動くとき: 1 日 1 回 (配布元に新しい版が出ていれば、その版で)、一覧のパッケージのディレクトリを変えた push、手で (name)
 #   どれも、リリースにその版がもうあれば作らない。作るもの: NAME-VER-REL-aarch64.pkg.tar.zst と、使った PKGBUILD
 #   前の形のリリース (NAME-VER-REL、版ごと) は、手で migrate: いちばん新しいものを pkg-NAME に移して、ほかは消す
+#   report (毎日と手で): aish-pkg report が pkg_check をまるごと回して、まだ上げていないもの (updates.json) と、その
+#   Atom の feed (updates.atom。aigpt の feed の aios-pkg が読む) をリリース pkg-updates に置く (pkg_check の daily も読む)
 #   増やすときは pkg/ci.json に 1 行 (name, path, setup = bin/setup-build.sh の引数, free_disk, timeout = 分、
 #   runs_on = マシン (既定 ubuntu-24.04-arm))
 name: pkg
@@ -250,6 +252,42 @@ jobs:
 
   # 前の形のリリース (NAME-VER-REL、版ごとにたまる) を、いちばん新しい版だけリリース pkg-NAME (タグもタイトルも、
   # ノートの 1 行目に * vVER-REL) に移して、ほかは消す。手で一度 (migrate)。前の形がなければ何もしない
+  report:
+    # 毎日の見はり: 新しい版、タグだけで tarball がまだないもの、直っていない CVE、見られなかったもの。前の日の
+    # updates.json から、はじめて見た日 (since) をうけつぐ。作るのも送るのもしない (送るのは手元の ai の鍵で)
+    name: Report
+    if: ${{ !inputs.migrate && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Report
+        run: |
+          # aish-pkg はこのマシンのもの (shell/.cargo/config.toml の既定は aios の aarch64 musl)
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          (cd shell && cargo build -q --release -p aish-pkg --target "$host")
+          mkdir -p build/report
+          prev=
+          if gh release download pkg-updates --repo "$GITHUB_REPOSITORY" --pattern updates.json --output build/prev.json 2>/dev/null; then
+            prev=build/prev.json
+          fi
+          shell/target/$host/release/aish-pkg report build/report $prev
+          { echo '```'; jq -r .text build/report/updates.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish
+        run: |
+          if ! gh release view pkg-updates --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf '%s\n' 'aios のパッケージの毎日の見はり (.github/workflows/pkg.yml の report、aish-pkg report)。' '' \
+              '- updates.json: まだ上げていない新しい版、タグだけで tarball がまだないもの、直っていない CVE、見られなかったもの (since: はじめて見た日)' \
+              '- updates.atom: そのやること (新しい版と CVE) の Atom の feed' > notes.md
+            gh release create pkg-updates --repo "$GITHUB_REPOSITORY" --title pkg-updates --notes-file notes.md --target "$GITHUB_SHA" --prerelease
+          fi
+          gh release upload pkg-updates build/report/updates.json build/report/updates.atom --repo "$GITHUB_REPOSITORY" --clobber
+
   migrate:
     name: Migrate releases
     if: ${{ inputs.migrate }}

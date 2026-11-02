@@ -1,0 +1,20 @@
+# pnpm: npm で入れるパッケージ (sudo ap -S pnpm)。claude と同じ形:
+#   本体はこのパッケージに入れない。入れたとき (post_install) に npm install -g でその版の pnpm を /usr/local に取ってくる。
+#   版は npm の pnpm の版 (_npm)。pkg_check が npm の latest とくらべ、pkg_edit pnpm で上げて (.aios.json の
+#   pkg.linux.npm も)、作って ai/repo に送ると、ap -Syu の post_upgrade がその版を入れる。ap -R pnpm で npm からも消す
+pkgname=pnpm
+pkgver=12.16.1
+pkgrel=1
+_npm=pnpm
+_latest_url=https://registry.npmjs.org/-/package/pnpm/dist-tags
+_latest_regex='latest":"([0-9]+[.][0-9]+[.][0-9]+)'
+pkgdesc='pnpm, installed from npm'
+arch=('any')
+url='https://pnpm.io'
+license=('MIT')
+depends=('nodejs')
+install=pnpm.install
+
+package() {
+  install -Dm644 "$startdir/pnpm.install" "$pkgdir/usr/share/pnpm/pnpm.install"
+}

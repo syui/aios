@@ -22,6 +22,7 @@
 mod batch;
 mod elf;
 mod embed;
+mod report;
 mod repo;
 mod test;
 mod up;
@@ -33,7 +34,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで。みなを見ると 1 分ほど)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
+const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"daily":{"type":"boolean","description":"見に行かずに、CI が毎日作る報告 (GitHub のリリース pkg-updates の updates.json) を読む (すぐ答える。いつ作ったものか、いつから遅れているか (since) も)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで。みなを見ると 1 分ほど)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const TEST: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"vm":{"type":"boolean","description":"aios の VM (-snapshot で repo/ を出したもの。動いていなければ起こし、終わっても止めない) にも ap -S で入れて、bin/ のものを aios のカーネルの上で動かす (このマシンの qemu-user で動いたものが aios で動かなければしくじり)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
 const PUSH: &str = r#"{"type":"object","properties":{"force":{"type":"boolean","description":"ai/repo のほうが新しいもの (ほかで送ったもの) を消す・下げることになっても送る"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}}}"#;
@@ -43,7 +44,7 @@ const EDIT: &str = r#"{"type":"object","properties":{"name":{"type":"string","de
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push" | "scan" | "rebuild")) {
+    if matches!(args.first().map(String::as_str), Some("check" | "edit" | "build" | "fetch" | "test" | "push" | "scan" | "rebuild" | "report")) {
         std::process::exit(cli(&args));
     }
     let spec = Spec {
@@ -51,7 +52,7 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-p", "check")],
         tools: &[
-            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)。直っていない CVE は vulns に (Alpine の secdb の「この版で直した」とくらべる。pkg/c のものなど。firefox は Mozilla の advisories と): fixed in VER なら pkg_edit でそれから上に、patched by Alpine (同じ版にパッチ) なら aports のパッチを足して PKGBUILD に CVE の番号を書く (あてはまらないものも番号を書けば出なくなる)。Rust の crate も (aios の Cargo.lock と pkg/rust の配布元の Cargo.lock を cargo audit と同じ RustSec の advisories と。PKGBUILD の cargo_update で上げたものは上げた版で): crate の fixed in VER なら pkg/rust は build() に cargo_update CRATE@VER (cross.sh) を足して pkg_edit rebuild、aios の Cargo.lock は cargo update -p CRATE。npm も (.aios.json の pkg.linux.npm の版を npm audit と同じ advisories と)。uv で入れる python も (.aios.json の pkg.linux.uv の版を Alpine の python3 と)。うしろで動くので、終わっていなければ running (配布元をみな見ると 1 分ほど。もういちど呼ぶと続きを待つ)", input: CHECK },
+            Tool { name: "pkg_check", desc: "aios のパッケージ (pkg/*/NAME/PKGBUILD) の配布元の最新の版を見て、いまの pkgver とくらべる。1 行に 1 つ: NAME いま → 最新 (ライブラリなら、それを中に入れているパッケージも)。all で全部の一覧 (name type src now latest。pkg/pkg.json にも)。中に古いライブラリが入ったまま (静的リンク。c_deps のもの) か、いまとちがう Zig (zig.sh の ZIG_VERSION-ZIG_REL。makedepend = zig=...) で作ったパッケージは rebuild に: pkg_edit (rebuild) → pkg_build → pkg_test → pkg_push。Zig を書きとめる前に作ったものは unrecorded に (作った日の Zig の版ごと)。直っていない CVE は vulns に (Alpine の secdb の「この版で直した」とくらべる。pkg/c のものなど。firefox は Mozilla の advisories と): fixed in VER なら pkg_edit でそれから上に、patched by Alpine (同じ版にパッチ) なら aports のパッチを足して PKGBUILD に CVE の番号を書く (あてはまらないものも番号を書けば出なくなる)。Rust の crate も (aios の Cargo.lock と pkg/rust の配布元の Cargo.lock を cargo audit と同じ RustSec の advisories と。PKGBUILD の cargo_update で上げたものは上げた版で): crate の fixed in VER なら pkg/rust は build() に cargo_update CRATE@VER (cross.sh) を足して pkg_edit rebuild、aios の Cargo.lock は cargo update -p CRATE。npm も (.aios.json の pkg.linux.npm の版を npm audit と同じ advisories と)。uv で入れる python も (.aios.json の pkg.linux.uv の版を Alpine の python3 と)。npm で入れるもの (.aios.json の pkg.linux.npm) の新しい版も。daily なら、CI が毎日作る報告を読むだけ (すぐ)。うしろで動くので、終わっていなければ running (配布元をみな見ると 1 分ほど。もういちど呼ぶと続きを待つ)", input: CHECK },
             Tool { name: "pkg_build", desc: "パッケージを作る (bin/mkpkg.sh)。できたものは repo/aarch64/KIND/ に置き、古い版を外して aios.db を作りなおす。repo/aarch64 がなければ ai/repo からそろえる。うしろで動くので、終わっていなければ running とログの終わり。もういちど呼ぶと続きを待つ (stop で止める。aish が入れかわっても引きつぐ)。このライブラリを中に入れているパッケージは rebuild に。前の版にあったライブラリ (SONAME) がなくなれば、それを使う (NEEDED) パッケージは soname.rebuild に", input: BUILD },
             Tool { name: "pkg_fetch", desc: "重いパッケージ (pkg/ci.json の firefox、llvm、uv) は GitHub の CI (.github/workflows/pkg.yml) が作ってリリース pkg-NAME (新しい版で置きかえる) に置く。それを取ってきて (SHA256SUMS を確かめる)、pkg_build と同じく repo/aarch64/KIND/ に置き、PKGBUILD もリリースのもの (CI が版を上げたもの) にする。あとは pkg_test → pkg_push。うしろで動く", input: BUILD },
             Tool { name: "pkg_test", desc: "pkg_build で作ったものを確かめる: 版が PKGBUILD と同じか、中の ELF がみな aarch64 か、COPY で写したライブラリのデータが 1 つの場所に重なっていないか (copies。古い Zig の libc.so でリンクすると stdin stdout stderr が 1 つ)、NEEDED が depends の中にあるか (needs)、bin/ のプログラムが --version で動くか (aarch64 でなければ qemu-aarch64 で。使うパッケージと musl も広げる)。vm なら aios の VM にも ap -S で入れて、aios のカーネルの上で動かす。通ったものだけ pkg_push で送れる。うしろで動く", input: TEST },
@@ -67,6 +68,7 @@ fn main() {
             let a = &v["args"];
             let root = root(a["dir"].as_str(), s(v, "pwd"));
             match s(v, "name") {
+                "pkg_check" if a["daily"] == true => daily(),
                 "pkg_check" => {
                     // 配布元をみな見ると 1 分ほどかかり、ツールが 60 秒で切れるので、build と同じくうしろで
                     let names: Vec<&str> = a["names"].as_array().map(|x| x.iter().filter_map(|n| n.as_str()).filter(|n| !n.is_empty() && !n.starts_with('-')).collect()).unwrap_or_default();
@@ -332,9 +334,14 @@ fn root(dir: Option<&str>, pwd: &str) -> PathBuf {
 
 /// check の答え: text は新しいもの (all なら全部) としくじったもの
 fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
+    check_full(root, names, all, refresh).0
+}
+
+/// check の答えと、その材料 (up::check の 1 つずつと、直っていないもの。report が使う)
+fn check_full(root: &Path, names: &[String], all: bool, refresh: bool) -> (Value, Vec<Value>, Vec<vuln::Vuln>) {
     let rs = match up::check(&root.join("pkg"), names, refresh) {
         Ok(r) => r,
-        Err(e) => return error(e),
+        Err(e) => return (error(e), vec![], vec![]),
     };
     // 中に古いライブラリが入ったままのもの (ネットは見ない)
     let stale = embed::stale(root);
@@ -416,7 +423,34 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
     if !vnote.is_empty() {
         r["vulns_note"] = json!(vnote);
     }
-    r
+    (r, rs, vulns)
+}
+
+/// pkg_check の daily: CI が毎日作る報告 (report.rs) を読む。text はそのまま、いつ作ったものかと、遅れているものの
+/// はじめて見た日も
+fn daily() -> Value {
+    let url = format!("{}/updates.json", report::RELEASE);
+    let r: Value = match up::get(&url).and_then(|t| serde_json::from_str(&t).map_err(|e| format!("{}: {}", url, e))) {
+        Ok(v) => v,
+        Err(e) => return error(format!("no daily report yet ({}): the CI writes it every day (.github/workflows/pkg.yml report)", e)),
+    };
+    let mut text = format!("daily report of {} ({})\n", r["date"].as_str().unwrap_or("?"), url);
+    text.push_str(r["text"].as_str().unwrap_or(""));
+    let since: Vec<String> = ["new", "vulns"]
+        .iter()
+        .flat_map(|k| r[*k].as_array().into_iter().flatten())
+        .filter_map(|x| Some(format!("{} since {}", x["name"].as_str()?, x["since"].as_str()?.get(..10)?)))
+        .collect();
+    if !since.is_empty() {
+        text.push_str(&format!("behind: {}\n", since.join(", ")));
+    }
+    let mut out = json!({ "text": text, "date": r["date"], "feed": r["feed"] });
+    for k in ["new", "not_out", "vulns", "errors"] {
+        if r[k].as_array().is_some_and(|a| !a.is_empty()) {
+            out[k] = r[k].clone();
+        }
+    }
+    out
 }
 
 fn cli(args: &[String]) -> i32 {
@@ -439,6 +473,18 @@ fn cli(args: &[String]) -> i32 {
             return if r.get("error").is_some() { 1 } else { 0 };
         }
         "check" => check(&root, &rest, args.iter().any(|a| a == "--all"), args.iter().any(|a| a == "--refresh")),
+        // 毎日の見はり (CI): report DIR [PREV] で DIR に updates.json と updates.atom (report.rs)
+        "report" => match rest.first() {
+            Some(out) => {
+                let (answer, rs, vulns) = check_full(&root, &[], false, false);
+                if answer.get("error").is_some() {
+                    answer
+                } else {
+                    report::write(&root, Path::new(out), rest.get(1).map(Path::new), &answer, &rs, &vulns).unwrap_or_else(error)
+                }
+            }
+            None => error("aish-pkg report DIR [PREV]"),
+        },
         "build" => match rest.first() {
             Some(n) => repo::build(&root, n).unwrap_or_else(error),
             None => error("aish-pkg build NAME"),

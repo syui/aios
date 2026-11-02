@@ -69,6 +69,7 @@
   {"from":"pkgbuild","git":"https://github.com/PCRE2Project/pcre2.git","name":"pcre2","tag":"^pcre2\\-([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:pixman","name":"pixman","nvchecker":{"gitlab":"pixman/pixman","host":"gitlab.freedesktop.org","prefix":"pixman-","source":"gitlab","use_max_tag":true}},
   {"from":"arch:pkgconf","name":"pkgconf","nvchecker":{"git":"https://github.com/pkgconf/pkgconf","include_regex":"pkgconf-(\\d+\\.)*([1-8]\\d*)?\\d","prefix":"pkgconf-","source":"git"}},
+  {"from":"pkgbuild","name":"pnpm","nvchecker":{"join":true,"regex":"latest\":\"([0-9]+[.][0-9]+[.][0-9]+)","source":"regex","url":"https://registry.npmjs.org/-/package/pnpm/dist-tags"}},
   {"from":"arch:procps-ng","name":"procps-ng","nvchecker":{"exclude_regex":".*rc.*","git":"https://gitlab.com/procps-ng/procps.git","prefix":"v","source":"git"}},
   {"from":"pkgbuild","git":"https://github.com/BurntSushi/ripgrep","name":"ripgrep","tag":"^([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:sed","name":"sed","nvchecker":{"git":"https://git.savannah.gnu.org/git/sed.git","prefix":"v","source":"git"}},

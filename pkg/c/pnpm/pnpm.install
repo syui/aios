@@ -1,0 +1,19 @@
+# ap が動かす (pacman と同じ形)。npm は nodejs パッケージのもの (/usr/local に新しいのがあればそれ)
+_npm() {
+  PATH=/usr/local/bin:/opt/c/bin:$PATH npm "$@"
+}
+
+# $1 はパッケージの版 (12.16.1-1)。パッケージの版は pnpm の版なので、その版を入れる (なければ latest)
+post_install() {
+  _v=${1%-*}
+  _npm install -g "pnpm${_v:+@$_v}"
+  echo "pnpm: $(PATH=/usr/local/bin:$PATH pnpm --version 2>/dev/null)"
+}
+
+post_upgrade() {
+  post_install "$1"
+}
+
+pre_remove() {
+  _npm uninstall -g pnpm
+}
