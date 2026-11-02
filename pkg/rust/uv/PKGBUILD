@@ -2,7 +2,7 @@
 # uv: Python のパッケージと Python そのものを入れる (uv python install で 3.15 (0.13 からの既定) など
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
-pkgver=0.13.5
+pkgver=0.13.6
 pkgrel=1
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
@@ -33,8 +33,12 @@ build() {
   # 配布元の Cargo.lock のうち、直った版が出ているもの (cargo audit): rustls (RUSTSEC-2026-0346 RUSTSEC-2026-0347
   # RUSTSEC-2026-0348 RUSTSEC-2026-0349)、rustls-webpki (RUSTSEC-2026-0382)、h2 (RUSTSEC-2026-0258)、
   # memmap2 (RUSTSEC-2026-0186)、event-listener (RUSTSEC-2026-0221)。rsa (RUSTSEC-2023-0071, Marvin) は直った版がない
-  # (reqsign が Azure と Google のストレージへの署名に使う)
-  cargo_update rustls@0.23.46 rustls-webpki@0.103.16 h2@0.4.20 memmap2@0.9.11 event-listener@5.4.2
+  # (reqsign が Azure と Google のストレージへの署名に使う)。async-compression の zstd 0.14 と zstd-safe 8
+  # (RUSTSEC-2026-0391 RUSTSEC-2026-0398 RUSTSEC-2026-0403)、digest の ctutils (RUSTSEC-2026-0385) も。
+  # uv-python-managed の zstd 0.13 (zstd-safe 7) は直った版がない (0.14 から) が、あてはまらない: 使うのは
+  # read::Decoder::with_buffer と write::Encoder::new だけ (with_context は使わない)、default-features = false なので
+  # legacy と seekable の機能は入らない
+  cargo_update rustls@0.23.46 rustls-webpki@0.103.16 h2@0.4.20 memmap2@0.9.11 event-listener@5.4.2 zstd@0.14.3 zstd-safe@8.2.0 ctutils@0.4.4
   musl_build --bin uv --bin uvx
 }
 

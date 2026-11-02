@@ -3,7 +3,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=ffmpeg
 pkgver=9.0.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Complete solution to record, convert and stream audio and video: libav* and ffmpeg, ffprobe (shared, for aios)'
 arch=('aarch64')
 url='https://ffmpeg.org/'
