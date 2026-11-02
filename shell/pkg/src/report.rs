@@ -298,9 +298,10 @@ fn linux_news(root: &Path) -> Result<(String, Vec<(String, String)>), String> {
 }
 
 /// main の unix ワークフローの、いちばん新しい終わった run がしくじっていれば (短いコミット, run の URL)。
-/// GH_TOKEN があれば使う (CI の中。なければ名前なしで: 1 時間に 60 回まで)
+/// 次の push に追いこされて止められたもの (cancelled) と飛ばしたもの (skipped) は見ない (しくじりではない。前は
+/// それを知らせていた)。GH_TOKEN があれば使う (CI の中。なければ名前なしで: 1 時間に 60 回まで)
 fn ci_failure() -> Result<Option<(String, String)>, String> {
-    let url = "https://api.github.com/repos/syui/aios/actions/workflows/unix.yml/runs?branch=main&status=completed&per_page=1";
+    let url = "https://api.github.com/repos/syui/aios/actions/workflows/unix.yml/runs?branch=main&status=completed&per_page=20";
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-fsSL", "-m", "30", "-H", "Accept: application/vnd.github+json"]);
     if let Ok(t) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
@@ -311,7 +312,7 @@ fn ci_failure() -> Result<Option<(String, String)>, String> {
         return Err(format!("{}: {}", url, String::from_utf8_lossy(&o.stderr).trim()));
     }
     let v: Value = serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())?;
-    let Some(run) = v["workflow_runs"].as_array().and_then(|a| a.first()) else { return Ok(None) };
+    let Some(run) = v["workflow_runs"].as_array().and_then(|a| a.iter().find(|r| !matches!(r["conclusion"].as_str(), Some("cancelled" | "skipped")))) else { return Ok(None) };
     if run["conclusion"] == "success" {
         return Ok(None);
     }
