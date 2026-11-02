@@ -7,6 +7,9 @@
 //     4. source が #commit= (awk、tar、egl-headers) なら、そのリポジトリの最新のコミット (HEAD) とくらべる
 //     5. download.gnome.org のもので Arch にないもの (atk) は、その cache.json から
 //   最新はタグ (git ls-remote) か配布元のページ (nvchecker の regex) から。いまの pkgver とくらべる
+//   見に行くものはみな GIVE_UP 秒で切る。しくじれば、source の tarball のディレクトリの一覧 (ftp.gnu.org/gnu/NAME/
+//   など。ファイルの名前に $pkgver があるもの) からも見る (savannah の git は 500 を返したり、60 秒より長く何も
+//   返さなかったりする)
 // 自作のもの (0.0.1) は見ない。取ってくるのは git と fetch (なければ curl)
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -18,6 +21,41 @@ pub const FILE: &str = "upstream.json";
 const ARCH: &str = "https://gitlab.archlinux.org/archlinux/packaging/packages";
 /// いちどに見に行く数
 const JOBS: usize = 8;
+/// 1 つの配布元を待つ長さ (秒)
+const GIVE_UP: u64 = 30;
+
+/// cmd を動かして出力を取る。secs 秒で終わらなければ止めて Err (標準入力はつながない)
+fn output_within(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    // 出力は別の糸で読む (タグの多いリポジトリはパイプがいっぱいになる)
+    let read = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut b);
+            }
+            b
+        })
+    };
+    let out = read(child.stdout.take().map(|x| Box::new(x) as Box<dyn Read + Send>));
+    let err = read(child.stderr.take().map(|x| Box::new(x) as Box<dyn Read + Send>));
+    let end = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no answer in {} s", secs));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
 
 /// pkg/*/NAME/PKGBUILD (名前の順)
 pub fn pkgbuilds(pkg: &Path) -> Vec<(String, PathBuf)> {
@@ -106,6 +144,29 @@ fn template_regex(t: &str) -> Option<(String, bool)> {
     Some((format!("^{}{}{}$", regex::escape(a), ver, regex::escape(b)), *under))
 }
 
+/// 2 つめの見かた: source の tarball のあるディレクトリの一覧 (https://ftp.gnu.org/gnu/diffutils/ の
+/// diffutils-3.12.tar.xz など)。ディレクトリに $ がなく、ファイルの名前に $pkgver があるものだけ
+fn listing(src: &str) -> Option<Map<String, Value>> {
+    if !src.starts_with("https://") && !src.starts_with("http://") {
+        return None;
+    }
+    let (dir, file) = src.rsplit_once('/')?;
+    if dir.contains('$') || dir.matches('/').count() < 3 {
+        return None;
+    }
+    let (re, under) = template_regex(file)?;
+    if under {
+        return None;
+    }
+    // ページの中の名前なので、はじめと終わりの印はとる (diffutils-3.12.tar.xz.sig も同じ版)
+    let re = re.trim_start_matches('^').trim_end_matches('$');
+    let mut m = Map::new();
+    m.insert("source".into(), json!("regex"));
+    m.insert("url".into(), json!(format!("{}/", dir)));
+    m.insert("regex".into(), json!(re));
+    Some(m)
+}
+
 /// .nvchecker.toml の最初の表を読む (使うのは文字と真偽だけ)
 fn parse_toml(text: &str) -> Option<Map<String, Value>> {
     let mut m = Map::new();
@@ -150,12 +211,16 @@ fn parse_toml(text: &str) -> Option<Map<String, Value>> {
 
 /// url の中身 (fetch か curl)
 pub fn get(url: &str) -> Result<String, String> {
-    let out = if Command::new("fetch").arg("--help").output().is_ok() {
-        Command::new("fetch").args([url, "-o", "-"]).output()
+    let cmd = if Command::new("fetch").arg("--help").output().is_ok() {
+        let mut c = Command::new("fetch");
+        c.args([url, "-o", "-"]);
+        c
     } else {
-        Command::new("curl").args(["-fsSL", "-m", "30", url]).output()
-    }
-    .map_err(|e| e.to_string())?;
+        let mut c = Command::new("curl");
+        c.args(["-fsSL", "-m", &GIVE_UP.to_string(), url]);
+        c
+    };
+    let out = output_within(cmd, GIVE_UP + 5).map_err(|e| format!("{}: {}", url, e))?;
     if !out.status.success() {
         return Err(format!("{}: {}", url, String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -164,11 +229,9 @@ pub fn get(url: &str) -> Result<String, String> {
 
 /// リポジトリのタグ
 fn tags(git: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
-        .args(["ls-remote", "--tags", "--refs", git])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| format!("git: {}", e))?;
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", "--tags", "--refs", git]).env("GIT_TERMINAL_PROMPT", "0");
+    let out = output_within(cmd, GIVE_UP).map_err(|e| format!("git ls-remote {}: {}", git, e))?;
     if !out.status.success() {
         return Err(format!("git ls-remote {}: {}", git, String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -438,7 +501,9 @@ fn nvchecker(m: &Map<String, Value>) -> Result<String, String> {
 
 /// リポジトリの HEAD (既定のブランチの最新のコミット)
 fn head(git: &str) -> Result<String, String> {
-    let out = Command::new("git").args(["ls-remote", git, "HEAD"]).env("GIT_TERMINAL_PROMPT", "0").output().map_err(|e| format!("git: {}", e))?;
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", git, "HEAD"]).env("GIT_TERMINAL_PROMPT", "0");
+    let out = output_within(cmd, GIVE_UP).map_err(|e| format!("git ls-remote {}: {}", git, e))?;
     String::from_utf8_lossy(&out.stdout).split_whitespace().next().filter(|h| h.len() == 40).map(String::from).ok_or_else(|| format!("git ls-remote {} HEAD: no answer", git))
 }
 
@@ -465,6 +530,7 @@ pub fn latest(r: &Value) -> Result<String, String> {
 pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, String> {
     let rules = rules(pkg, if refresh { only } else { &[] }, refresh)?;
     // いまの PKGBUILD の pkgver と _commit (pkg_edit で上げたら、すぐにそれとくらべる)
+    let mut srcs = std::collections::HashMap::new();
     let (now, pins): (std::collections::HashMap<String, String>, std::collections::HashMap<String, String>) =
         pkgbuilds(pkg)
             .into_iter()
@@ -472,6 +538,9 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
                 let text = fs::read_to_string(&p).unwrap_or_default();
                 let v = scalar(&text, "pkgver").unwrap_or_default();
                 let v = if v.contains('$') { expand_var(p.parent().unwrap_or(Path::new(".")), &text, "pkgver") } else { v };
+                if first_source(&text).is_some() {
+                    srcs.insert(n.clone(), (p.parent().unwrap_or(Path::new(".")).to_path_buf(), text.clone()));
+                }
                 ((n.clone(), v), (n, scalar(&text, "_commit").unwrap_or_default()))
             })
             .unzip();
@@ -479,15 +548,47 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
     let rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
         let cur = now.get(&name).cloned().unwrap_or_default();
-        match latest(&r) {
+        // しくじれば、source の tarball のディレクトリの一覧から (コミットで決めているものはしない)
+        let mut via = None;
+        let got = match latest(&r) {
+            Err(e) if r["from"] != "commit" => match srcs.get(&name).and_then(|(_, t)| first_source(t)).and_then(|s| listing(&s)) {
+                Some(m) => match nvchecker(&m) {
+                    Ok(v) => {
+                        via = Some(json!({ "listing": m["url"], "because": e }));
+                        Ok(v)
+                    }
+                    Err(e2) => Err(format!("{}; the file list {}: {}", e, m["url"].as_str().unwrap_or(""), e2)),
+                },
+                None => Err(e),
+            },
+            x => x,
+        };
+        let mut out = match got {
             // コミットで決めているもの: HEAD が PKGBUILD の _commit とちがえば新しい
             Ok(h) if r["from"] == "commit" => {
                 let pinned = pins.get(&name).map(String::as_str).unwrap_or("");
                 json!({ "name": name, "pkgver": cur, "latest": format!("commit {}", &h[..7]), "commit": h, "new": !pinned.is_empty() && !h.starts_with(pinned) && !pinned.starts_with(&h) })
             }
-            Ok(v) => json!({ "name": name, "pkgver": cur, "latest": v, "new": vercmp(&v, &cur).is_gt() }),
+            Ok(v) => {
+                let new = vercmp(&v, &cur).is_gt();
+                let mut o = json!({ "name": name, "pkgver": cur, "latest": v, "new": new });
+                // タグだけ先に出て、配る tarball がまだないもの (xkeyboard-config 2.49): 新しい版の source を 1 バイト取ってみる
+                if new
+                    && let Some((dir, text)) = srcs.get(&name)
+                    && first_sum(text).is_some_and(|s| s != "SKIP")
+                    && let Ok(url) = expand_source(dir, &set(text, "pkgver", &v))
+                    && let Some(code @ (404 | 410)) = http_status(&url)
+                {
+                    o["not_out"] = json!(format!("{} {}", code, url));
+                }
+                o
+            }
             Err(e) => json!({ "name": name, "pkgver": cur, "error": e }),
+        };
+        if let Some(v) = via {
+            out["via"] = v;
         }
+        out
     });
     // しくじったもの (配布元が切れたなど) は、一覧の前の値を残す
     let seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
@@ -843,10 +944,26 @@ pub(crate) fn expand_source(dir: &Path, text: &str) -> Result<String, String> {
     Ok(s.rsplit_once("::").map_or(s.clone(), |(_, u)| u.to_string()))
 }
 
+/// url の HTTP の答えの番号 (はじめの 1 バイトだけ取る。HEAD を受けない配布元もあるので GET の Range で)。
+/// 答えがなければ None
+fn http_status(url: &str) -> Option<u16> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return None;
+    }
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sL", "-r", "0-0", "-o", "/dev/null", "-w", "%{http_code}", "-m", &GIVE_UP.to_string(), url]);
+    let out = output_within(cmd, GIVE_UP + 5).ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok().filter(|c| *c != 0)
+}
+
 /// url を取ってきて sha256 (取ってきたものは消す)
 fn sha256_url(url: &str) -> Result<String, String> {
     use sha2::Digest;
     use std::io::Read;
+    // ないもの (404、410) は取りなおしても来ない (前は 10 回やりなおして 1 分待った)
+    if let Some(code @ (404 | 410)) = http_status(url) {
+        return Err(format!("{}: {} (the file is not out yet: a tag can come before its release tarball)", url, code));
+    }
     let tmp = std::env::temp_dir().join(format!("aish-pkg-{}", std::process::id()));
     let ok = if Command::new("fetch").arg("--help").output().is_ok() {
         Command::new("fetch").arg(url).arg("-o").arg(&tmp).status()
@@ -919,6 +1036,20 @@ fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_reads_the_source_directory() {
+        let m = listing("https://ftp.gnu.org/gnu/diffutils/diffutils-$pkgver.tar.xz").unwrap();
+        assert_eq!(m["url"], "https://ftp.gnu.org/gnu/diffutils/");
+        let re = regex::Regex::new(m["regex"].as_str().unwrap()).unwrap();
+        let page = r#"<a href="diffutils-3.11.tar.xz">x</a> <a href="diffutils-3.12.tar.xz.sig">s</a> <a href="diffutils-3.9.tar.gz">"#;
+        let vs: Vec<&str> = re.captures_iter(page).map(|c| c.get(1).unwrap().as_str()).collect();
+        assert_eq!(vs, ["3.11", "3.12"]);
+        // ディレクトリに版があるもの、git、版を使わないものは見ない
+        assert!(listing("https://archive.example.org/$pkgver/foo-$pkgver.tar.xz").is_none());
+        assert!(listing("git+https://github.com/a/b#tag=v$pkgver").is_none());
+        assert!(listing("https://example.org/pub/foo.tar.xz").is_none());
+    }
 
     const J: &str = r#"{
   "updated": "2000-01-01",

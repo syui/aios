@@ -352,7 +352,11 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
             // ライブラリなら、上げたあとに作りなおすもの
             let users = embed::embedders(root, n);
             let users = if users.is_empty() { String::new() } else { format!("  (embedded in: {})", users.join(" ")) };
-            text.push_str(&format!("{:w$}  {} → {}{}\n", n, cur, r["latest"].as_str().unwrap_or(""), users));
+            // 配布元がだめで、source のディレクトリの一覧から見たもの
+            let via = r["via"]["listing"].as_str().map_or(String::new(), |u| format!("  (from the file list {})", u));
+            // タグだけで、配る tarball がまだないもの: まだ上げられない
+            let out = r["not_out"].as_str().map_or(String::new(), |u| format!("  (not out yet: {})", u));
+            text.push_str(&format!("{:w$}  {} → {}{}{}{}\n", n, cur, r["latest"].as_str().unwrap_or(""), users, via, out));
         } else {
             same += 1;
             if all {
@@ -385,13 +389,23 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
         let by: Vec<String> = unrec.iter().map(|(v, ns)| format!("{} with zig {}", ns.len(), if v.is_empty() { "?" } else { v })).collect();
         text.push_str(&format!("{} packages were built before the zig record ({}); pkg_edit rebuild to build them with zig {}\n", n, by.join(", "), embed::zig_now(root).unwrap_or_default()));
     }
-    let news: Vec<&Value> = rs.iter().filter(|r| r["new"] == true).map(|r| &r["name"]).collect();
+    let news: Vec<&Value> = rs.iter().filter(|r| r["new"] == true && r.get("not_out").is_none()).map(|r| &r["name"]).collect();
     let mut r = json!({ "text": text, "new": news, "latest": same, "errors": bad, "count": new + same + bad });
+    // 新しい版のタグはあるが、配る tarball がまだないもの (pkg_edit はまだできない)
+    let not_out: Vec<&Value> = rs.iter().filter(|r| r.get("not_out").is_some()).map(|r| &r["name"]).collect();
+    if !not_out.is_empty() {
+        r["not_out"] = json!(not_out);
+    }
     if !stale.is_empty() {
         r["rebuild"] = embed::to_json(&stale);
     }
     if !unrec.is_empty() {
         r["unrecorded"] = json!(unrec);
+    }
+    // 配布元 (git など) がだめで、source のディレクトリの一覧から版を見たもの
+    let via: Vec<Value> = rs.iter().filter(|x| x.get("via").is_some()).map(|x| json!({ "name": x["name"], "listing": x["via"]["listing"], "because": x["via"]["because"] })).collect();
+    if !via.is_empty() {
+        r["via_listing"] = json!(via);
     }
     if !vulns.is_empty() {
         r["vulns"] = vuln::to_json(&vulns);
