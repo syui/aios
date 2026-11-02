@@ -724,8 +724,51 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     (test/linux.config に VIRTIO_NET と IP_PNP_DHCP を入れた) とくらべる: 50 のためしと counter と log の行が、みな
     同じ。netlink と sysdiff の手本の答えは、入れる前と同じ)。`test/nftables.c` にも jump の深さと reject の
     フックの case を足した
-- 段階 3: conntrack (ct state new / established / related / invalid。よく使う `ct state established,related accept` の
-  ため。TCP の状態は smoltcp と inet.rs が持っている)
+- 段階 3 (できた): conntrack (kernel/src/conntrack.rs。Linux 7.3 の nf_conntrack_core.c、proto_tcp.c、proto_udp.c、
+  proto_icmp.c、proto_generic.c、nf_conntrack_standalone.c と同じ答え) と nft の `ct` の式
+  - 動くのは、IPv4 の ip か inet の表に ct の式があるときだけ (Linux の nf_ct_netns_get: dormant の表でも)。フックは
+    PRE_ROUTING と LOCAL_OUT の priority -200 (見て、なければ作る) と、LOCAL_IN と POST_ROUTING のいちばん後 (confirm:
+    表に入れる)。そのあいだで落ちた新しいものは表に入らない。lo は出す側でついたつながりを受ける側もそのまま使う
+  - つながりは向きごとの組 (送り元、あて先、protocol、ポートか ICMP の type・code・id) を 2 つ持つ。ctinfo は Linux と同じ
+    (答えの向きは ESTABLISHED、元の向きは答えを見たら ESTABLISHED、それまで NEW)。`ct state` は invalid 1、
+    established 2、related 4、new 8、untracked 64
+  - TCP: tcp_conntracks の表 (2 つの向き × 6 つのフラグの組 × 10 の状態)、sIG (見なかったことに) と、前に見なかった
+    SYN への SYN-ACK でそろえなおすこと、TIME_WAIT からの開きなおし (消してもう一度)、同時に開く (SYN_SENT2)、
+    RST のたしかめ、RFC 5961 の challenge ACK、tcp_in_window (窓、window scale、SACK、外れは INVALID か IGNORE)、
+    tcp_loose (途中から拾う)、時間切れの表 (ESTABLISHED 5 日、TIME_WAIT 120 秒 …、retrans と unacknowledged)、答えが
+    RST だけのものは消す、ASSURED。頭のたしかめ (長さ、PRE_ROUTING のチェックサム、フラグの組)
+  - UDP: 答えを見るまで 30 秒、答えを見てから 2 秒より後のパケットで 120 秒にのばして ASSURED。ICMP: echo などの問い
+    だけがつながりになり (30 秒)、エラーは中の組から見つけたつながりの RELATED (外のあて先が合うものだけ)。ほかは
+    generic (600 秒)
+  - reject の返すもの (RST と ICMP) は、もとのつながりを持つ (nf_ct_attach: related)。RST で reject した TCP の
+    つながりは CLOSE に (nf_ct_set_closing、10 秒)
+  - `ct` の式: state direction status mark expiration (ms) l3proto protocol saddr daddr (ip saddr / daddr) proto-src
+    proto-dst packets bytes avgpkt (使うと数えはじめる: nf_ct_set_acct) id。`ct mark set`、`notrack` (raw の priority
+    で)。手本の Linux にない secmark label zone event は EOPNOTSUPP。dump は Linux と同じ形
+  - 中どうし (lo) の TCP: つなぐときの SYN、SYN-ACK に、3 つ目の ACK と閉じるときの FIN、ACK、RST (Linux と同じ
+    timestamp つきの 52 バイト) も、lo の決まりと conntrack に通す (落とされても止めない)。conntrack にはデータの
+    segment を見せないので、seq はデータのないつながりとして進む (ESTABLISHED → FIN_WAIT … → TIME_WAIT)
+  - /proc/net/nf_conntrack (root だけ。Linux と同じ行: ipv4 2 tcp 6 残りの秒 状態 組 [UNREPLIED] 組 [ASSURED] mark use)、
+    /proc/sys/net/netfilter/nf_conntrack_{count,max,buckets,acct,checksum,tcp_loose,tcp_be_liberal,tcp_max_retrans,
+    tcp_ignore_invalid_rst,tcp_timeout_*,udp_timeout,udp_timeout_stream,icmp_timeout,generic_timeout} と
+    /proc/sys/net/nf_conntrack_max。max は RAM から Linux と同じ式 (16 KiB ごとに 1 つ、1 GiB より多ければ 65536)
+  - 確かめかた: test/nfteval.c に 5 つの case (ct-state: よくある `ct state established,related accept` と policy drop、
+    ct-keys、ct-notrack、ct-related、ct-list: /proc/net/nf_conntrack をならべたもの)。手本の Linux (test/linux.config に
+    NF_CONNTRACK、NF_CONNTRACK_MARK、NF_CONNTRACK_PROCFS、NFT_CT) と 1 バイトもちがわない。外 (10.0.2.2) とのつながりの
+    状態は、smoltcp と Linux の TCP のちがい (FIN の出しかたなど) がでるので数だけ
+  - まだ: ctnetlink (conntrack -L の道具。/proc/net/nf_conntrack は読める)、helper (ftp など)、expectation、zone、
+    label、event、ct count (connlimit)、NAT
+- AI が見る口 (aios だけ): /proc/ai/fw と aish-sys の `fw` ツール。root と wheel の人だけ
+  - 基の鎖ごとに通った数と policy まで来た数、決まりごとに当たった数 (counter がなくても) とさいごに当たってからの時間と
+    式 (nft --debug=netlink と同じ形: `[ payload load 2b @ transport header + 2 => reg 1 ] [ cmp eq reg 1 0x00001600 ]`)、
+    集まりの要素の数
+  - 落としたものの輪 (新しい順に 64: いつ、フック、口、proto、送り元とあて先、TCP のフラグ、長さ、どの決まり (表、鎖、
+    handle か policy)、reject、出したソケットの uid)。Linux は log の決まりや `nft monitor trace` を入れないと見えない
+  - conntrack の数と状態ごとの数、つながり (64 まで)
+  - trace: `/proc/ai/ctl` に `fw trace in eth0 tcp 10.0.2.2:40000 10.0.2.15:22 syn` (in / out、eth0 / lo、tcp / udp /
+    icmp、フラグ) で、パケットを流さずに、いまの決まり (写したもの) にとおして、鎖と決まりごとに「どの式で外れたか、
+    どの判定か」と答え (/proc/ai/fw の trace の行)。counter も limit も conntrack も変えない。つながらない・届かない
+    わけを、AI がパケットを送らずに探せる
 - そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 (aios に IPv6 ができてから)
 
 Linux とのくらべかた: 手本の Linux (test/linux.config) に nf_tables と virtio-net を入れ、同じ nft の決まりで、同じ相手

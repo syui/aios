@@ -293,6 +293,8 @@ pub struct Inet {
     ctime: u64,
     /// 状態が変わるたびに増える数 (epoll の EPOLLET)
     pub generation: u64,
+    /// 中どうしの TCP で、conntrack に見せる次の seq (データは見せないので、つないだときの ISN + 1 から。0 は見せない)
+    ct_seq: u32,
 }
 
 pub type InetRef = Rc<RefCell<Inet>>;
@@ -482,6 +484,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         mtime: now,
         ctime: now,
         generation: 0,
+        ct_seq: 0,
     }));
     let a = all();
     let sweep = SWEEP.get();
@@ -1014,9 +1017,10 @@ fn syn(u: &InetRef, in_call: bool) {
         return;
     }
     // SYN-ACK (listen しているほうから)。落ちれば SYN をやりなおす (返すものは listen しているほうへ: 見ない)
+    let sisn = if fw { crate::rand::u32() } else { 0 };
     if fw {
         let theirs = adv_mss(l.borrow().user_mss) as u16;
-        if !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::SYN | crate::nfhook::ACK, crate::rand::u32(), isn.wrapping_add(1), theirs, false) {
+        if !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::SYN | crate::nfhook::ACK, sisn, isn.wrapping_add(1), theirs, false) {
             syn_lost(u);
             return;
         }
@@ -1100,9 +1104,43 @@ fn syn(u: &InetRef, in_call: bool) {
             send_fin(&c);
         }
     }
+    // 3 つ目の ACK (SYN_RECV → ESTABLISHED、ASSURED)。このあとの FIN や RST も ct_seg で
+    if fw {
+        u.borrow_mut().ct_seq = isn.wrapping_add(1);
+        c.borrow_mut().ct_seq = sisn.wrapping_add(1);
+        ct_seg(u, crate::nfhook::ACK);
+    }
     l.borrow_mut().acceptq.push_back(c);
     notify(&l);
     notify(u);
+}
+
+/// 中どうしの TCP の、データのない segment (3 つ目の ACK、閉じるときの FIN と ACK、RST) を Linux が lo に流すのと
+/// 同じ形 (timestamp のオプションつきの 52 バイト、窓 512) で lo の決まりと conntrack に通す (u から相手へ)。落とされても
+/// 止めない (つながりはもうできている。データの segment は通さない)
+fn ct_seg(u: &InetRef, flags: u8) {
+    use crate::nfhook;
+    if !nfhook::active() {
+        return;
+    }
+    let (src, sport, dst, dport, seq, tos, ttl, peer, sk, prio) = {
+        let s = u.borrow();
+        (s.saddr, s.sport, s.daddr, s.dport, s.ct_seq, s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, upgrade(&s.peer), (s.uid, s.gid), s.priority)
+    };
+    if seq == 0 {
+        return;
+    }
+    let ack = peer.as_ref().map_or(0, |p| p.borrow().ct_seq);
+    let fl = if flags & nfhook::RST != 0 && ack == 0 { flags & !nfhook::ACK } else { flags };
+    let ts = (crate::timer::uptime_ns() / 1_000_000) as u32;
+    let mut opt = [1u8, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+    opt[4..8].copy_from_slice(&ts.to_be_bytes());
+    opt[8..12].copy_from_slice(&ts.to_be_bytes());
+    let mut pkt = nfhook::tcp(src, sport, dst, dport, seq, ack, fl, 512, &opt, tos, ttl, 0);
+    let _ = nfhook::lo(&mut pkt, Some(sk), 0, prio);
+    if flags & nfhook::FIN != 0 {
+        u.borrow_mut().ct_seq = seq.wrapping_add(1);
+    }
 }
 
 /// SYN が届かなかった (listen の行列があふれた、ファイアウォールが落とした): SYN_SENT のまま、やりなおす時刻を決める
@@ -1585,6 +1623,7 @@ fn tcp_reset(u: &InetRef) {
 fn send_reset(u: &InetRef) {
     let peer = upgrade(&u.borrow().peer);
     if let Some(p) = peer {
+        ct_seg(u, crate::nfhook::RST | crate::nfhook::ACK);
         if !Rc::ptr_eq(&p, u) {
             tcp_reset(&p);
         }
@@ -1601,6 +1640,11 @@ fn send_fin(u: &InetRef) {
         return;
     }
     if let Some(p) = &peer {
+        // conntrack には FIN と、相手の ACK を
+        ct_seg(u, crate::nfhook::FIN | crate::nfhook::ACK);
+        if !Rc::ptr_eq(p, u) {
+            ct_seg(p, crate::nfhook::ACK);
+        }
         rx_fin(p);
         wnd_seen(p);
         wnd_seen(u);

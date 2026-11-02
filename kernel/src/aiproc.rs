@@ -11,6 +11,9 @@
 //             ページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス (mem_json)
 //   fs        ファイルシステムの中: マウントごとの様子 (ext4 のブロックキャッシュ、ジャーナル、inode の覚え。tmpfs の
 //             ページ)、パスの覚え、開いているファイルの数、区画ごとのディスクの読み書き (fs_json)
+//   fw        ファイアウォール (nftables.rs、nfhook.rs、conntrack.rs) の様子: まとめ、基の鎖 (通った数、policy まで
+//             来た数)、決まり (当たった数、さいごに当たってからの時間、短い式。counter がなくても数える)、集まりの要素の数、
+//             落としたもの (新しい順に 64: フック、口、組、どの決まりか、reject)、conntrack の数とつながり、さいごの trace
 //   fail      わざとしくじらせる決まり (fail.rs) のいまの様子: 相手、何を、あと何回、効いた数。ctl の fail で決める
 //   parts     切れるところ (parts.rs) のいまの様子: 切ってあるか、動かしたまま変えられるか。だれでも読める
 //   trace     カーネルの中の出来事の記録 (trace.rs): システムコールの入りと出、スレッドの切りかえ、眠りと起こし、
@@ -41,6 +44,8 @@
 //                             だけ: システムコールと quirk。装置と aiproc はできない)。/proc/ai/parts で見る
 //               trace on [NAME]|off|clear  出来事の記録を始める (NAME があれば、その名前で始まるプロセスのシステム
 //                             コールとフォルトだけ)、止める、空にする (/proc/ai/trace)
+//               fw trace in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [FLAGS]  決まりを写したものに作った
+//                             パケットを通してみる (counter も conntrack も変えない)。道は /proc/ai/fw の trace の行
 //               panic [TEXT]  カーネルを panic させる (root だけ。panic の出力とバックトレースを確かめる。Linux の
 //                             sysrq-trigger の c と同じ)
 use alloc::format;
@@ -207,7 +212,7 @@ pub fn fs_json() -> String {
     )
 }
 
-pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nbkl selftest\nheap trace on|off\nheap check\nheap hog N\npage cycle\npage check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
+pub const CTL_HELP: &str = "kick PID\nraw TID\npcmiss on|off\nstrace NAME\nbkl reset\nbkl selftest\nheap trace on|off\nheap check\nheap hog N\npage cycle\npage check\nprof on|off\nlockbench\ntrace on [NAME]|off|clear\npart NAME off|on\nfw trace in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst]\nfail pid N|name NAME sys NR|all ERRNO [TIMES] | heap [TIMES] | oom [TIMES] | page [TIMES]\nfail off\npanic [TEXT]\n";
 
 /// /proc/ai/ctl に書いたもの (root と wheel だけ。呼ぶ側で allowed を確かめる)
 pub fn ctl(b: &[u8]) -> Result<(), i64> {
@@ -238,6 +243,13 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         "lockbench" => crate::spinlock::bench(),
         "trace" => crate::trace::ctl(arg)?,
         "fail" => crate::fail::ctl(arg)?,
+        "fw" => {
+            let (sub, rest) = arg.split_once(' ').map_or((arg, ""), |(a, b)| (a, b.trim()));
+            match sub {
+                "trace" => crate::nfhook::trace_cmd(rest)?,
+                _ => return Err(crate::why::inval()),
+            }
+        }
         "part" => {
             let (name, how) = arg.split_once(' ').ok_or_else(|| crate::why::inval())?;
             let on = match how.trim() {

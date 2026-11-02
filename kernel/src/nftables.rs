@@ -415,6 +415,9 @@ struct Chain {
     rules: Vec<Rule>,
     /// この batch で作ったときの NFTA_CHAIN_ID (0 はなし)
     id: u32,
+    /// 基の鎖: 通ったパケットの数と、policy まで来た数 (/proc/ai/fw)
+    seen: u64,
+    to_policy: u64,
 }
 
 #[derive(Clone)]
@@ -424,6 +427,9 @@ struct Rule {
     udata: Option<Vec<u8>>,
     /// この batch の NFTA_RULE_ID
     id: u32,
+    /// 当たった数 (式がみな通った: counter がなくても数える。/proc/ai/fw) と、さいごに当たった時刻
+    hits: u64,
+    last: u64,
 }
 
 /// 式: 名前と、Linux の dump と同じ形の NFTA_EXPR_DATA の中身。たどるもの (集まり、jump / goto の先の鎖) も
@@ -1066,7 +1072,7 @@ fn newchain(cx: &mut Cx, t: &[Option<A>]) -> Res<()> {
         None => return Err(fail(EINVAL)),
     };
     let id = t[NFTA_CHAIN_ID as usize].map_or(0, |a| a.be32());
-    cx.st.tables[ti].chains.push(Chain { name, handle, base, flags, udata: t[NFTA_CHAIN_USERDATA as usize].map(|a| a.d.to_vec()), rules: Vec::new(), id });
+    cx.st.tables[ti].chains.push(Chain { name, handle, base, flags, udata: t[NFTA_CHAIN_USERDATA as usize].map(|a| a.d.to_vec()), rules: Vec::new(), id, seen: 0, to_policy: 0 });
     Ok(())
 }
 
@@ -1207,7 +1213,7 @@ fn newrule(cx: &mut Cx, t: &[Option<A>]) -> Res<()> {
         let x = expr_new(&mut cx.st.tables[ti], cx.family, name, data).map_err(|err| bad(err, Some(e)))?;
         exprs.push(x);
     }
-    let rule = Rule { handle, exprs, udata: t[NFTA_RULE_USERDATA as usize].map(|a| a.d.to_vec()), id: t[NFTA_RULE_ID as usize].map_or(0, |a| a.be32()) };
+    let rule = Rule { handle, exprs, udata: t[NFTA_RULE_USERDATA as usize].map(|a| a.d.to_vec()), id: t[NFTA_RULE_ID as usize].map_or(0, |a| a.be32()), hits: 0, last: 0 };
     let c = &mut cx.st.tables[ti].chains[ci];
     if cx.flags & NLM_F_REPLACE != 0 {
         let i = old.unwrap_or(0);
@@ -1290,7 +1296,7 @@ fn delrule(cx: &mut Cx, t: &[Option<A>]) -> Res<()> {
 
 /// 使える式の名前 (手本の Linux の核のものと、入れたもの: log limit reject quota)
 fn expr_name(n: &[u8]) -> Option<&'static str> {
-    const NAMES: [&str; 16] = ["immediate", "cmp", "payload", "meta", "bitwise", "byteorder", "lookup", "range", "counter", "log", "limit", "reject", "quota", "exthdr", "rt", "last"];
+    const NAMES: [&str; 18] = ["immediate", "cmp", "payload", "meta", "bitwise", "byteorder", "lookup", "range", "counter", "log", "limit", "reject", "quota", "exthdr", "rt", "last", "ct", "notrack"];
     NAMES.iter().copied().find(|x| x.as_bytes() == n)
 }
 
@@ -1746,6 +1752,65 @@ fn expr_new(tb: &mut Table, family: u8, name: &'static str, data: Option<A>) -> 
             op = Op::Last { set: lset, at: at_ns };
             w.0 = last_dump(lset, at_ns);
         }
+        "ct" => {
+            // DREG 1、KEY 2、DIRECTION 3、SREG 4 (nft_ct_select_ops、nft_ct_get_init / nft_ct_set_init。手本の Linux に
+            // ないもの (secmark labels zone eventmask) は EOPNOTSUPP)
+            let key = u32of(2)?;
+            let dir = at(3).and_then(|a| a.d.first().copied());
+            if at(1).is_some() && at(4).is_some() {
+                return Err(EINVAL);
+            }
+            if let Some(d) = at(1) {
+                let need_dir = matches!(key, 8 | 9 | 11 | 12 | 19..=22);
+                let no_dir = matches!(key, 1 | 0 | 2 | 3 | 5 | 6 | 23);
+                if (need_dir && dir.is_none()) || (no_dir && dir.is_some()) {
+                    return Err(EINVAL);
+                }
+                let len = match key {
+                    1 | 7 | 10 => 1,
+                    0 | 2 | 3 | 5 | 23 | 19 | 20 => 4,
+                    6 => 16,
+                    8 | 9 => {
+                        if family == NFPROTO_IPV4 {
+                            4
+                        } else {
+                            16
+                        }
+                    }
+                    21 | 22 => 16,
+                    11 | 12 => 2,
+                    14..=16 => 8,
+                    _ => return Err(EOPNOTSUPP),
+                };
+                if let Some(x) = dir
+                    && x > 1
+                {
+                    return Err(EINVAL);
+                }
+                let dreg = store(Some(d), len, false)?;
+                w.be32(1, dump_reg(dreg));
+                w.be32(2, key);
+                if matches!(key, 8 | 9 | 11 | 12 | 19..=22) || (matches!(key, 14..=16) && dir.is_some()) {
+                    w.attr(3, &[dir.unwrap_or(0)]);
+                }
+                op = Op::Ct { dreg: dreg as u8, key, dir: dir.unwrap_or(2) };
+            } else if let Some(sr) = at(4) {
+                // 書けるのは mark だけ (CONFIG_NF_CONNTRACK_MARK)
+                if key != 3 {
+                    return Err(EOPNOTSUPP);
+                }
+                if dir.is_some() {
+                    return Err(EINVAL);
+                }
+                let sreg = load(Some(sr), 4)?;
+                w.be32(4, dump_reg(sreg));
+                w.be32(2, key);
+                op = Op::CtSet(sreg as u8);
+            } else {
+                return Err(EINVAL);
+            }
+        }
+        "notrack" => op = Op::Notrack,
         "rt" => {
             // DREG 1、KEY 2 (nft_rt_get_init: classid と xfrm は手本の Linux にない)
             let key = u32of(2)?;
@@ -2574,6 +2639,11 @@ enum Op {
     Last { set: u32, at: u64 },
     Exthdr { dreg: u8, typ: u8, off: u32, len: u32, flags: u32 },
     Rt { dreg: u8, key: u32 },
+    /// ct の式 (dir 2 は向きなし)
+    Ct { dreg: u8, key: u32, dir: u8 },
+    /// ct mark set (書けるのは mark だけ)
+    CtSet(u8),
+    Notrack,
 }
 
 /// nft_limit: ns の token bucket (bytes ならパケットの長さぶん)
@@ -2598,18 +2668,38 @@ pub fn active() -> bool {
     ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// conntrack を動かすか (IPv4 の ip と inet の表に ct の式がある: nf_ct_netns_get。dormant の表でも)
+static CT_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn ct_on() -> bool {
+    CT_ON.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn refresh_active() {
-    let on = g().cur.tables.iter().any(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET) && t.flags & NFT_TABLE_F_DORMANT == 0 && t.chains.iter().any(|c| c.base.is_some()));
+    let tables = &g().cur.tables;
+    let on = tables.iter().any(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET) && t.flags & NFT_TABLE_F_DORMANT == 0 && t.chains.iter().any(|c| c.base.is_some()));
     ACTIVE.store(on, core::sync::atomic::Ordering::Relaxed);
+    let exprs = || tables.iter().filter(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET)).flat_map(|t| t.chains.iter()).flat_map(|c| c.rules.iter()).flat_map(|r| r.exprs.iter());
+    let ct = exprs().any(|e| matches!(e.op, Op::Ct { .. } | Op::CtSet(_)));
+    CT_ON.store(ct, core::sync::atomic::Ordering::Relaxed);
+    // ct bytes / packets / avgpkt は数えることを始める (nf_ct_set_acct: もどさない)
+    if exprs().any(|e| matches!(e.op, Op::Ct { key: 14..=16, .. })) {
+        crate::conntrack::KNOBS.get().acct = true;
+    }
 }
 
 /// 1 つのフック (IPv4): ip と inet の表の基の鎖を priority の順 (同じなら先に入れたもの) に。drop したらそこで
 pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
-    if !active() {
+    if !active() && !ct_on() {
         return Verdict::Accept;
     }
     let st = &mut g().cur;
     let mut list: Vec<(i32, u64, usize, usize)> = Vec::new();
+    // conntrack: PRE_ROUTING と LOCAL_OUT の -200 (NF_IP_PRI_CONNTRACK) で見る。表は usize::MAX で印をつける
+    let ct = ct_on();
+    if ct && matches!(h, 0 | 3) {
+        list.push((-200, 0, usize::MAX, 0));
+    }
     for (ti, t) in st.tables.iter().enumerate() {
         if !matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET) || t.flags & NFT_TABLE_F_DORMANT != 0 {
             continue;
@@ -2624,9 +2714,19 @@ pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
     }
     list.sort_unstable_by_key(|x| (x.0, x.1));
     for (_, _, ti, ci) in list {
+        if ti == usize::MAX {
+            if crate::conntrack::conntrack_in(p.ip, h, &mut p.ct) == NF_DROP {
+                return Verdict::Drop { reject: None, why: Why { family: "ip", table: String::from("conntrack"), chain: String::from("table full"), handle: 0 } };
+            }
+            continue;
+        }
         if let v @ Verdict::Drop { .. } = do_chain(&mut st.tables[ti], ci, p, h) {
             return v;
         }
+    }
+    // LOCAL_IN と POST_ROUTING のいちばん後 (NF_IP_PRI_CONNTRACK_CONFIRM): 表に入れる
+    if ct && matches!(h, 1 | 4) {
+        crate::conntrack::confirm(&mut p.ct);
     }
     Verdict::Accept
 }
@@ -2651,14 +2751,37 @@ fn do_chain(tb: &mut Table, base: usize, p: &mut Pkt, h: u32) -> Verdict {
     let l4 = p.valid();
     let now = crate::timer::uptime_ns();
     let why = |chains: &[Chain], c: usize, handle: u64| Why { family: fam, table: name.clone(), chain: chains[c].name.clone(), handle };
+    let tracing = TRACE.get().is_some();
+    if tracing {
+        let b = chains[base].base.as_ref();
+        trace(alloc::format!("chain {} {} {} (hook {}, priority {}, policy {})", fam, name, chains[base].name, crate::nfhook::hook_name(h), b.map_or(0, |b| b.prio), if b.is_some_and(|b| b.policy == NF_DROP as u32) { "drop" } else { "accept" }));
+    } else {
+        chains[base].seen += 1;
+    }
     loop {
         if ri < chains[c].rules.len() {
             r.code = NFT_CONTINUE;
-            for e in chains[c].rules[ri].exprs.iter_mut() {
+            let mut stopped = None;
+            for (k, e) in chains[c].rules[ri].exprs.iter_mut().enumerate() {
                 eval(&mut e.op, e.set.as_deref(), &mut r, p, sets, h, l4, now, &mut rj, *family);
                 if r.code != NFT_CONTINUE {
+                    if r.code == NFT_BREAK {
+                        stopped = Some((k, e.name));
+                    }
                     break;
                 }
+            }
+            if tracing {
+                let rule = &chains[c].rules[ri];
+                let v = match stopped {
+                    Some((k, n)) => alloc::format!("no match at expr {} ({})", k + 1, n),
+                    None => verdict_text(r.code, r.chain.as_deref()),
+                };
+                trace(alloc::format!("  {} rule {}: {} -> {}", chains[c].name, rule.handle, rule_text(rule), v));
+            } else if stopped.is_none() {
+                let rule = &mut chains[c].rules[ri];
+                rule.hits += 1;
+                rule.last = now;
             }
             match r.code {
                 NFT_CONTINUE | NFT_BREAK => {
@@ -2698,6 +2821,11 @@ fn do_chain(tb: &mut Table, base: usize, p: &mut Pkt, h: u32) -> Verdict {
             continue;
         }
         let pol = chains[base].base.as_ref().map_or(NF_ACCEPT as u32, |b| b.policy);
+        if tracing {
+            trace(alloc::format!("  policy {}", if pol == NF_DROP as u32 { "drop" } else { "accept" }));
+        } else {
+            chains[base].to_policy += 1;
+        }
         return if pol == NF_DROP as u32 { Verdict::Drop { reject: None, why: why(chains, base, 0) } } else { Verdict::Accept };
     }
 }
@@ -3174,6 +3302,63 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
                 (None, false) => r.code = NFT_BREAK,
             }
         }
+        Op::Ct { dreg, key, dir } => {
+            use crate::conntrack as ctk;
+            // nft_ct_get_eval: state はつながりがなくても (invalid か untracked)
+            if *key == 0 {
+                let st = match (&p.ct, p.ct.info()) {
+                    (_, Some(i)) => 1u32 << (i % 3 + 1),
+                    (ctk::Ct::Untracked, None) => 64,
+                    _ => 1,
+                };
+                put32(&mut r.d, *dreg, st);
+                return;
+            }
+            let info = p.ct.info().unwrap_or(0);
+            let Some(c) = ctk::conn_of(&p.ct) else {
+                r.code = NFT_BREAK;
+                return;
+            };
+            let count = |k: u32, d: u8| -> u64 {
+                let Some(a) = ctk::acct(c) else { return 0 };
+                let i = if k == 15 { 1 } else { 0 };
+                if d < 2 { a[d as usize][i] } else { a[0][i] + a[1][i] }
+            };
+            let t = &c.tuple[if *dir < 2 { *dir as usize } else { 0 }];
+            match *key {
+                1 => put8(&mut r.d, *dreg, (info >= ctk::CT_IS_REPLY) as u8),
+                2 => put32(&mut r.d, *dreg, c.status),
+                3 => put32(&mut r.d, *dreg, c.mark),
+                5 => put32(&mut r.d, *dreg, (ctk::expires_ns(c) / 1_000_000) as u32),
+                7 => put8(&mut r.d, *dreg, NFPROTO_IPV4),
+                10 => put8(&mut r.d, *dreg, t.proto),
+                14 | 15 => reg_at(&mut r.d, *dreg, 8).copy_from_slice(&count(*key, *dir).to_ne_bytes()),
+                16 => {
+                    let (pk, by) = (count(14, *dir), count(15, *dir));
+                    reg_at(&mut r.d, *dreg, 8).copy_from_slice(&by.checked_div(pk).unwrap_or(0).to_ne_bytes());
+                }
+                23 => put32(&mut r.d, *dreg, c.id),
+                // 送り元とあて先 (IPv4 の 4 バイト。inet の表でもレジスタの残りはそのまま)
+                8 | 19 => reg_at(&mut r.d, *dreg, 4).copy_from_slice(&t.src.to_be_bytes()),
+                9 | 20 => reg_at(&mut r.d, *dreg, 4).copy_from_slice(&t.dst.to_be_bytes()),
+                // ポート (ICMP は src が id、dst が type と code)
+                11 => put16(&mut r.d, *dreg, t.sport.to_be_bytes()),
+                12 => put16(&mut r.d, *dreg, t.dport.to_be_bytes()),
+                _ => r.code = NFT_BREAK,
+            }
+        }
+        Op::CtSet(sreg) => {
+            let o = *sreg as usize * 4;
+            let v = u32::from_ne_bytes(r.d[o..o + 4].try_into().unwrap());
+            if let Some(c) = crate::conntrack::conn_of_mut(&mut p.ct) {
+                c.mark = v;
+            }
+        }
+        Op::Notrack => {
+            if matches!(p.ct, crate::conntrack::Ct::None) {
+                p.ct = crate::conntrack::Ct::Untracked;
+            }
+        }
         Op::Rt { dreg, key } => {
             // みち (dst) は PRE_ROUTING ではまだない。nexthop は IPv4 だけ
             let oif = if p.oif != 0 { p.oif } else { p.iif };
@@ -3220,4 +3405,173 @@ fn expr_data(e: &Expr) -> Vec<u8> {
         Op::Last { set, at } => last_dump(*set, *at),
         _ => e.data.clone(),
     }
+}
+
+// ---- AI が見る口 (/proc/ai/fw と ctl の fw trace: aish-sys の fw ツール) ----
+
+/// trace のあいだの記録 (None なら記録しない)
+static TRACE: Bkl<Option<Vec<String>>> = Bkl::new(None);
+/// さいごの trace (/proc/ai/fw に)
+static LAST_TRACE: Bkl<Vec<String>> = Bkl::new(Vec::new());
+
+fn trace(line: String) {
+    if let Some(v) = TRACE.get().as_mut() {
+        v.push(line);
+    }
+}
+
+pub fn tracing() -> bool {
+    TRACE.get().is_some()
+}
+
+fn verdict_text(code: i32, chain: Option<&str>) -> String {
+    match code {
+        NFT_CONTINUE => String::from("continue"),
+        NFT_JUMP => alloc::format!("jump {}", chain.unwrap_or("?")),
+        NFT_GOTO => alloc::format!("goto {}", chain.unwrap_or("?")),
+        NFT_RETURN => String::from("return"),
+        c if c as u32 & NF_VERDICT_MASK == 0 => String::from("drop"),
+        c if c as u32 & NF_VERDICT_MASK == 1 => String::from("accept"),
+        c if c as u32 & NF_VERDICT_MASK == 3 => String::from("queue"),
+        c => alloc::format!("verdict {}", c),
+    }
+}
+
+const META_NAMES: [&str; 37] = [
+    "len", "protocol", "priority", "mark", "iif", "oif", "iifname", "oifname", "iiftype", "oiftype", "skuid", "skgid", "nftrace", "rtclassid", "secmark", "nfproto", "l4proto", "bri_iifname", "bri_oifname",
+    "pkttype", "cpu", "iifgroup", "oifgroup", "cgroup", "random", "secpath", "iifkind", "oifkind", "bri_iifpvid", "bri_iifvproto", "time", "day", "hour", "sdif", "sdifname", "bri_broute", "bri_iifhwaddr",
+];
+const CT_NAMES: [&str; 24] = [
+    "state", "direction", "status", "mark", "secmark", "expiration", "helper", "l3protocol", "src", "dst", "protocol", "proto_src", "proto_dst", "label", "packets", "bytes", "avgpkt", "zone", "eventmask",
+    "src_ip", "dst_ip", "src_ip6", "dst_ip6", "id",
+];
+
+/// libnftnl の data の見せかた: 32 ビットずつ (この CPU の順で) 0x%08x
+fn hex(b: &[u8]) -> String {
+    let mut v: Vec<String> = Vec::new();
+    for c in b.chunks(4) {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        v.push(alloc::format!("0x{:08x}", u32::from_le_bytes(w)));
+    }
+    v.join(" ")
+}
+
+/// 決まりの式を、nft --debug=netlink (libnftnl の snprintf) と同じ形で: [ payload load 2b @ transport header + 2 => reg 1 ]
+fn rule_text(r: &Rule) -> String {
+    let reg = |x: u8| dump_reg(x as u32);
+    let base = |b: u32| ["link", "network", "transport", "inner"][b.min(3) as usize];
+    let mut out: Vec<String> = Vec::new();
+    for e in &r.exprs {
+        let t = match &e.op {
+            Op::Imm(d, v) => alloc::format!("immediate reg {} {}", reg(*d), hex(v)),
+            Op::Verdict(c, ch) => match *c {
+                NFT_JUMP | NFT_GOTO => alloc::format!("immediate reg 0 {} -> {}", if *c == NFT_JUMP { "jump" } else { "goto" }, ch.as_deref().unwrap_or("?")),
+                c => alloc::format!("immediate reg 0 {}", verdict_text(c, None)),
+            },
+            Op::Cmp(sr, op, v) => alloc::format!("cmp {} reg {} {}", ["eq", "neq", "lt", "lte", "gt", "gte"][(*op).min(5) as usize], reg(*sr), hex(v)),
+            Op::Payload { dreg, base: b, off, len } => alloc::format!("payload load {}b @ {} header + {} => reg {}", len, base(*b), off, reg(*dreg)),
+            Op::PayloadSet { sreg, base: b, off, len, csum, csum_off, l4 } => alloc::format!("payload write reg {} => {}b @ {} header + {} csum_type {} csum_off {} csum_flags 0x{:x}", reg(*sreg), len, base(*b), off, csum, csum_off, *l4 as u8),
+            Op::Meta(d, k) => alloc::format!("meta load {} => reg {}", META_NAMES.get(*k as usize).unwrap_or(&"?"), reg(*d)),
+            Op::MetaSet(sr, k) => alloc::format!("meta set {} with reg {}", META_NAMES.get(*k as usize).unwrap_or(&"?"), reg(*sr)),
+            Op::Bitwise { sreg, dreg, op, mask, xor, shift, sreg2, .. } => match op {
+                0 => alloc::format!("bitwise reg {} = ( reg {} & {} ) ^ {}", reg(*dreg), reg(*sreg), hex(mask), hex(xor)),
+                1 | 2 => alloc::format!("bitwise reg {} = ( reg {} {} 0x{:08x} )", reg(*dreg), reg(*sreg), if *op == 1 { "<<" } else { ">>" }, shift),
+                _ => alloc::format!("bitwise reg {} = ( reg {} {} reg {} )", reg(*dreg), reg(*sreg), ["&", "|", "^"][(*op as usize).saturating_sub(3).min(2)], reg(*sreg2)),
+            },
+            Op::Byteorder { sreg, dreg, len, size } => alloc::format!("byteorder reg {} = ntoh(reg {}, {}, {})", reg(*dreg), reg(*sreg), size, len),
+            Op::Lookup { sreg, dreg, inv } => alloc::format!("lookup reg {} set {}{}{}", reg(*sreg), e.set.as_deref().unwrap_or("?"), dreg.map_or(String::new(), |d| alloc::format!(" dreg {}", reg(d))), if *inv { " 0x1" } else { "" }),
+            Op::Range { sreg, op, from, to } => alloc::format!("range {} reg {} {} {}", if *op == 1 { "neq" } else { "eq" }, reg(*sreg), hex(from), hex(to)),
+            Op::Counter { bytes, packets } => alloc::format!("counter pkts {} bytes {}", packets, bytes),
+            Op::Log { prefix, level, flags } => alloc::format!("log prefix {} level {} flags {}", prefix, level, flags),
+            Op::Limit(l) => alloc::format!("limit rate {}/{}s{} flags 0x{:x}", l.rate, l.nsecs / 1_000_000_000, if l.bytes { " type bytes" } else { "" }, l.inv as u8),
+            Op::Reject { typ, code } => alloc::format!("reject type {} code {}", typ, code),
+            Op::Quota { quota, consumed, flags } => alloc::format!("quota bytes {} consumed {} flags {}", quota, consumed, flags),
+            Op::Last { .. } => String::from("last"),
+            Op::Exthdr { dreg, typ, off, len, .. } => alloc::format!("exthdr load tcpopt {}b @ {} + {} => reg {}", len, typ, off, reg(*dreg)),
+            Op::Rt { dreg, key } => alloc::format!("rt load {} => reg {}", if *key == 1 { "nexthop4" } else { "tcpmss" }, reg(*dreg)),
+            Op::Ct { dreg, key, dir } => alloc::format!("ct load {} => reg {}{}", CT_NAMES.get(*key as usize).unwrap_or(&"?"), reg(*dreg), if *dir < 2 { [" , dir original", " , dir reply"][*dir as usize] } else { "" }),
+            Op::CtSet(sr) => alloc::format!("ct set mark with reg {}", reg(*sr)),
+            Op::Notrack => String::from("notrack"),
+            Op::Break => alloc::format!("{} (not evaluated)", e.name),
+        };
+        out.push(alloc::format!("[ {} ]", t));
+    }
+    out.join(" ")
+}
+
+fn esc(s: &str) -> String {
+    crate::aiproc::esc(s)
+}
+
+/// /proc/ai/fw: まとめ、基の鎖、決まり (当たった数と短い式)、落としたもの、conntrack、さいごの trace (1 行 1 つの JSON)
+pub fn ai_json() -> String {
+    let now = crate::timer::uptime_ns();
+    let st = &g().cur;
+    let mut s = String::new();
+    let nrules: usize = st.tables.iter().flat_map(|t| t.chains.iter()).map(|c| c.rules.len()).sum();
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{{\"fw\":\"nftables\",\"active\":{},\"conntrack\":{},\"tables\":{},\"rules\":{},\"generation\":{}}}\n", active(), ct_on(), st.tables.len(), nrules, g().base_seq));
+    for t in &st.tables {
+        let fam = match t.family {
+            NFPROTO_INET => "inet",
+            NFPROTO_IPV4 => "ip",
+            NFPROTO_IPV6 => "ip6",
+            _ => "?",
+        };
+        for c in &t.chains {
+            if let Some(b) = &c.base {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut s,
+                    format_args!(
+                        "{{\"chain\":\"{} {} {}\",\"hook\":\"{}\",\"priority\":{},\"policy\":\"{}\",\"type\":\"{}\",\"dormant\":{},\"seen\":{},\"to_policy\":{},\"rules\":{}}}\n",
+                        fam,
+                        esc(&t.name),
+                        esc(&c.name),
+                        crate::nfhook::hook_name(b.hooknum),
+                        b.prio,
+                        if b.policy == NF_DROP as u32 { "drop" } else { "accept" },
+                        b.typ,
+                        t.flags & NFT_TABLE_F_DORMANT != 0,
+                        c.seen,
+                        c.to_policy,
+                        c.rules.len()
+                    ),
+                );
+            } else {
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{{\"chain\":\"{} {} {}\",\"rules\":{}}}\n", fam, esc(&t.name), esc(&c.name), c.rules.len()));
+            }
+            for r in &c.rules {
+                let ago = if r.last == 0 { String::from("null") } else { alloc::format!("{}", (now - r.last) / 1_000_000) };
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{{\"rule\":\"{} {} {}\",\"handle\":{},\"hits\":{},\"ago_ms\":{},\"expr\":\"{}\"}}\n", fam, esc(&t.name), esc(&c.name), r.handle, r.hits, ago, esc(&rule_text(r))));
+            }
+        }
+        for set in &t.sets {
+            let live = set.elems.iter().filter(|e| e.expires == 0 || now < e.expires).count();
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{{\"set\":\"{} {} {}\",\"elements\":{},\"interval\":{},\"map\":{}}}\n", fam, esc(&t.name), esc(&set.name), live, set.flags & NFT_SET_INTERVAL != 0, set.flags & NFT_SET_MAP != 0));
+        }
+    }
+    s.push_str(&crate::nfhook::drops_json());
+    s.push_str(&crate::conntrack::summary());
+    s.push_str(&crate::conntrack::json_lines(64));
+    for l in LAST_TRACE.get().iter() {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{{\"trace\":\"{}\"}}\n", esc(l)));
+    }
+    s
+}
+
+/// ctl の fw trace: 決まりをいまのまま写して、作ったパケットを通してみる (counter も conntrack も変えない)。
+/// 行は LAST_TRACE に
+pub fn run_trace(what: &str, f: impl FnOnce()) {
+    let saved = core::mem::replace(&mut g().cur, g().cur.clone());
+    *TRACE.get() = Some(alloc::vec![alloc::format!("trace {}", what)]);
+    crate::conntrack::set_dry(true);
+    f();
+    crate::conntrack::set_dry(false);
+    *LAST_TRACE.get() = TRACE.get().take().unwrap_or_default();
+    g().cur = saved;
+}
+
+/// trace の終わりの行 (道の答え)
+pub fn trace_note(line: String) {
+    trace(line);
 }

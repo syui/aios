@@ -312,12 +312,106 @@ static const struct tc cases[] = {
      "\t\tmeta mark 42 counter\n\t\tip protocol icmp log prefix \"nfteval-icmp: \" counter\n\t}\n"
      "}\n",
      "ukv"},
+    // conntrack (段階 3)
+    {"ct-state",
+     "table inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n"
+     "\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tiif \"lo\" accept\n"
+     "\t\ttcp dport 7001 ct state new counter accept\n\t}\n}\n",
+     "tnuxhk"},
+    {"ct-keys",
+     "table inet t {\n"
+     "\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\tudp dport 7002 ct mark set 42\n\t\tct direction original udp dport 7002 counter\n"
+     "\t\tct original proto-dst 7002 ct original ip saddr 127.0.0.1 counter\n\t}\n"
+     "\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tct mark 42 counter\n\t\tct direction reply tcp flags & (syn | ack) == syn | ack counter\n"
+     "\t\tct state new tcp dport 7001 counter\n\t\tct status seen-reply tcp sport 7001 counter\n"
+     "\t\tct l3proto ipv4 ct protocol udp udp dport 7002 counter\n\t}\n}\n",
+     "tu"},
+    {"ct-notrack",
+     "table inet t {\n"
+     "\tchain raw {\n\t\ttype filter hook output priority raw; policy accept;\n\t\tudp dport 7002 notrack\n\t}\n"
+     "\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tct state untracked udp dport 7002 counter\n\t\tct state new udp dport 7004 counter\n\t}\n}\n",
+     "uv"},
+    {"ct-related",
+     "table inet t {\n"
+     "\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n\t\tudp dport 7003 reject\n\t}\n"
+     "\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tudp dport 7002 reject\n\t\ttcp dport 7001 reject with tcp reset\n"
+     "\t\tip protocol icmp ct state related counter\n\t\tip protocol icmp ct state invalid counter\n"
+     "\t\ttcp flags rst ct state related counter\n\t\ttcp flags rst ct state established counter\n\t}\n}\n",
+     "tuvQ"},
+    {"ct-list", "table inet t {\n\tchain c {\n\t\tct state new\n\t}\n}\n", "C"},
     {"order",
      "table inet a {\n\tchain in {\n\t\ttype filter hook input priority 10; policy accept;\n\t\tudp dport 7002 counter\n\t}\n}\n"
      "table ip b {\n\tchain in {\n\t\ttype filter hook input priority -10; policy accept;\n\t\tudp dport 7002 counter drop\n\t}\n}\n"
      "table inet c {\n\tflags dormant\n\tchain in {\n\t\ttype filter hook input priority -20; policy drop;\n\t}\n}\n",
      "uk"},
 };
+
+// /proc/net/nf_conntrack を、時間切れの秒と 32768 からのポートを * にして、ならべて出す。外 (10.0.2.2) のものは
+// TCP の見張りの道 (smoltcp と Linux) がちがうので、数だけ
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void conntrack_list(void) {
+    FILE *f = fopen("/proc/net/nf_conntrack", "r");
+    if (!f) {
+        printf("conntrack: %s\n", strerror(errno));
+        return;
+    }
+    char *lines[512];
+    int n = 0, ext = 0;
+    char l[512];
+    while (n < 512 && fgets(l, sizeof l, f)) {
+        if (strstr(l, "10.0.2.2")) {
+            ext++;
+            continue;
+        }
+        char o[512];
+        int w = 0, field = 0;
+        for (char *p = l; *p && w < (int)sizeof o - 4;) {
+            if (*p == ' ') {
+                field++;
+                while (*p == ' ')
+                    o[w++] = *p++;
+                continue;
+            }
+            // 5 つめ (ipv4 2 tcp 6 の次) は残りの秒
+            if (field == 4 && *p >= '0' && *p <= '9') {
+                while (*p >= '0' && *p <= '9')
+                    p++;
+                o[w++] = '*';
+                continue;
+            }
+            int key = !strncmp(p, "sport=", 6) || !strncmp(p, "dport=", 6) ? 6 : 0;
+            if (key) {
+                memcpy(o + w, p, key);
+                w += key;
+                p += key;
+                long v = strtol(p, NULL, 10);
+                char *e = p;
+                while (*e >= '0' && *e <= '9')
+                    e++;
+                if (v >= 32768) {
+                    o[w++] = '*';
+                } else {
+                    memcpy(o + w, p, e - p);
+                    w += e - p;
+                }
+                p = e;
+                continue;
+            }
+            o[w++] = *p++;
+        }
+        o[w] = 0;
+        lines[n++] = strdup(o);
+    }
+    fclose(f);
+    qsort(lines, n, sizeof *lines, cmp_str);
+    for (int i = 0; i < n; i++)
+        printf("ct %s", lines[i]);
+    printf("ct (%d with 10.0.2.2)\n", ext);
+}
 
 static void probe(char c) {
     char lbl[64];
@@ -337,6 +431,9 @@ static void probe(char c) {
     case 'Q':
         snprintf(lbl, sizeof lbl, "quota 7003");
         udp_probe(lbl, "127.0.0.1", 7003, 7003, 3, 50);
+        break;
+    case 'C':
+        conntrack_list();
         break;
     }
 }

@@ -25,6 +25,9 @@
 //   part    カーネルの切れるところ (/proc/ai/parts): いま切ってあるか。off / on で、動かしたまま切る・入れる (ctl の part)
 //   trace   カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだのシステムコールの入りと出、切りかえ、眠りと
 //           起こし、割り込み、ディスク、フォルトを記録して、スレッドごと・システムコールごと・遅かったものにまとめる
+//   fw      ファイアウォール (/proc/ai/fw): nftables の基の鎖と決まり (当たった数、さいごに当たってから、短い式)、
+//           落としたもの (どのパケットを、どのフックで、どの決まりが)、conntrack のつながり、trace (パケットを流さずに
+//           決まりの道を試す: ctl の fw trace)。nft があれば nft -a list ruleset も
 //   M-s     まとめを画面に出す (キーを押すと消える)
 // /proc/bkl、/proc/strace を 0 からにするのは root だけなので、root でなければ sudo -n tee で書く。
 // 開発の Linux でも動く (aios にしかないものは「ない」と答える)
@@ -54,6 +57,7 @@ const DELTA: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","de
 const PART: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"切れるところの名前 (kernel.json の off のあるもの: epoll inotify landlock module ns seccomp swap timerfd vdso tty-root-fdlink sound-min-period qemu-uart-burst。装置 (net、virtio_rng、bcm2835_rng) と aiproc は起動のときだけ: box で)"},"off":{"type":"boolean","description":"true で切る、false で入れる。なければ見るだけ"}}}"#;
 const TRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。記録を空にして始め、終わったら止めて読む。なければ、いま記録にあるものを読むだけ"},"name":{"type":"string","description":"この名前で始まるプロセスのシステムコールとフォルトだけ (既定: cmd の最初の語。切りかえ・眠り・起こし・割り込み・ディスクはみな)"},"all":{"type":"boolean","description":"名前で絞らない (みなのシステムコールも)"},"limit":{"type":"integer","description":"events に返す出来事の数 (終わりから。既定 200)"},"timeout_ms":{"type":"integer","description":"cmd をこれで止める (既定 50000)"}}}"#;
 const MEM: &str = r#"{"type":"object","properties":{"files":{"type":"integer","description":"ページキャッシュを多く使っているファイルをいくつまで (既定 10)"},"procs":{"type":"integer","description":"メモリを多く使っているプロセスをいくつまで (既定 8)"}}}"#;
+const FW: &str = r#"{"type":"object","properties":{"trace":{"type":"string","description":"パケットを流さずに決まりの道を試す: 'in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst]' (in eth0: 外から来るもの、out eth0: 外へ出すもの、lo: 中どうし)。counter も conntrack も変えない"},"drops":{"type":"integer","description":"落としたものをいくつまで (新しい順。既定 20)"},"ct":{"type":"boolean","description":"conntrack のつながりも 1 つずつ (既定 false: 数だけ)"},"grep":{"type":"string","description":"この文字をふくむ決まり (表、鎖、式) だけ"},"nft":{"type":"boolean","description":"nft -a list ruleset の出力も (nft があれば。root でなければ sudo -n で)"}}}"#;
 const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer"}},"required":["cmd"]}"#;
 
 fn main() {
@@ -81,6 +85,7 @@ fn main() {
             Tool { name: "delta", desc: "cmd を動かした前と後の、カーネルの中の数のちがい (/proc/ai/mem、/proc/ai/fs、/proc/bkl): ページキャッシュ (ページ、読みそこね、捨てた)、ヒープ (使っている、いちばん多かった、取れなかった)、tmpfs、スワップ、ページフォルト、ext4 のブロックキャッシュ (当たり、外れ、まとめ読み、捨てた、書き出し)、パスの覚え (当たり、外れ)、開いているファイル、区画ごとのディスクの読み書き、大きなロック。そのコマンドがカーネルに何をさせたかがわかる。root か wheel の人だけ", input: DELTA },
             Tool { name: "part", desc: "カーネルの切れるところ (kernel.json の extra と quirk で off のあるもの) のいまの様子 (/proc/ai/parts: 切ってあるか、動かしたまま変えられるか)。name と off で、動かしたまま切る (システムコールは ENOSYS、quirk は手当てをしない) か入れる: 入れずに作った Linux のようにしてプログラムを動かし、戻せる。装置と aiproc は起動のときだけ (vm start の off か box)。root か wheel の人だけ", input: PART },
             Tool { name: "trace", desc: "カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだの、システムコールの入りと出 (かかった時間)、スレッドの切りかえ、眠りと起こし (待った時間、起こされてから走るまで)、割り込み、ディスクの読み書き、ページフォルトを記録して、スレッドごと、システムコールごと (回数、合計、最大)、遅かった順、ディスク、割り込みにまとめる (text)。events は終わりの limit こ (t は起動からの ns、c は CPU、p は tid、k は sys/ret/switch/sleep/wake/irq/blk/blkdone/fault/exec/exit)。cmd がなければ、いま記録にあるもの (ctl の trace on で始めたもの)。root か wheel の人だけ", input: TRACE },
+            Tool { name: "fw", desc: "ファイアウォール (nftables) のいまの様子 (/proc/ai/fw): 基の鎖 (フック、priority、policy、通った数、policy まで来た数) と決まり (handle、当たった数 (counter がなくても)、さいごに当たってからの ms、短い式)、集まりの要素の数、落としたもの (新しい順: いつ、フック、口、proto、送り元とあて先、TCP のフラグ、どの決まりか (handle か policy)、reject、出したソケットの uid)、conntrack (数、状態ごと、ct: true でつながり)。trace: パケットを流さずに、いまの決まりでどこを通ってどうなるかを決まりごとに (つながらない・届かないわけを探すとき)。root か wheel の人だけ", input: FW },
             Tool { name: "fs", desc: "ファイルシステムの中 (/proc/ai/fs): マウントごとの様子 (ext4 はブロックキャッシュの数と当たり・外れ・捨てた数、まだ書いていないブロック、書き出した回数、ジャーナル、inode と名前の覚え、空き。tmpfs はページ)、パスの覚え (数、当たり・外れ、捨てた回数)、開いているファイルの数、区画ごとのディスクの読み書き。text はまとめ、ほかはそのままの数。root か wheel の人だけ", input: NONE },
         ],
     };
@@ -104,6 +109,7 @@ fn main() {
                 "strace" => strace(a, pwd),
                 "mem" => mem(a),
                 "fs" => fs(),
+                "fw" => fw(a),
                 "trace" => trace(a, pwd),
                 "part" => part(a),
                 "fail" => fail(a, pwd),
@@ -1334,4 +1340,163 @@ fn watch(a: &Value) -> Value {
     let all: Vec<Value> = log.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let recent: Vec<Value> = all.iter().skip(all.len().saturating_sub(n)).cloned().collect();
     json!({ "active": state["active"], "checked_at": state["t"], "interval_s": state["interval_s"], "log": recent })
+}
+
+// ---- fw: ファイアウォール (/proc/ai/fw) ----
+
+fn fw(a: &Value) -> Value {
+    if !Path::new("/proc/ai/fw").exists() {
+        return error("no /proc/ai/fw (not aios, or an older kernel)");
+    }
+    let mut trace_err = None;
+    if let Some(t) = a["trace"].as_str().filter(|t| !t.trim().is_empty())
+        && let Err(e) = write_root("/proc/ai/ctl", &format!("fw trace {}", t.trim()))
+    {
+        trace_err = Some(format!("{} (want: in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst])", e));
+    }
+    let lines = match json_lines("/proc/ai/fw") {
+        Ok(l) => l,
+        Err(e) => return error(e),
+    };
+    let ndrops = a["drops"].as_u64().unwrap_or(20) as usize;
+    let want_ct = a["ct"].as_bool().unwrap_or(false);
+    let pat = a["grep"].as_str().unwrap_or("");
+    let u = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut t = String::new();
+    let (mut chains, mut rules, mut drops, mut conns, mut trace, mut sets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut head = Value::Null;
+    let (mut ct, mut dtotal) = (Value::Null, 0);
+    for l in lines {
+        if l.get("fw").is_some() {
+            head = l;
+        } else if l.get("chain").is_some() {
+            chains.push(l);
+        } else if l.get("rule").is_some() {
+            if pat.is_empty() || l.to_string().contains(pat) {
+                rules.push(l);
+            }
+        } else if l.get("set").is_some() {
+            sets.push(l);
+        } else if let Some(n) = l.get("drops") {
+            dtotal = n.as_u64().unwrap_or(0);
+        } else if l.get("ago_ms").is_some() && l.get("hook").is_some() {
+            if drops.len() < ndrops {
+                drops.push(l);
+            }
+        } else if let Some(c) = l.get("conntrack") {
+            ct = c.clone();
+        } else if let Some(c) = l.get("ct") {
+            if want_ct {
+                conns.push(c.clone());
+            }
+        } else if let Some(x) = l.get("trace") {
+            trace.push(x.as_str().unwrap_or("").to_string());
+        }
+    }
+    t.push_str(&format!(
+        "nftables: {}, conntrack {}, {} tables, {} rules (generation {})\n",
+        if head["active"].as_bool().unwrap_or(false) { "active" } else { "no base chains (nothing is filtered)" },
+        if head["conntrack"].as_bool().unwrap_or(false) { "on" } else { "off" },
+        u(&head["tables"]),
+        u(&head["rules"]),
+        u(&head["generation"])
+    ));
+    for c in &chains {
+        let name = s(c, "chain");
+        if c.get("hook").is_some() {
+            t.push_str(&format!(
+                "chain {}  hook {} priority {} policy {}{}  seen {} to_policy {}\n",
+                name,
+                s(c, "hook"),
+                c["priority"].as_i64().unwrap_or(0),
+                s(c, "policy"),
+                if c["dormant"].as_bool().unwrap_or(false) { " (dormant)" } else { "" },
+                u(&c["seen"]),
+                u(&c["to_policy"])
+            ));
+        } else {
+            t.push_str(&format!("chain {}  (regular)\n", name));
+        }
+        for r in rules.iter().filter(|r| s(r, "rule") == name) {
+            let ago = r["ago_ms"].as_u64().map_or(String::from("never"), |ms| format!("{} ms ago", ms));
+            t.push_str(&format!("  handle {:<4} hits {:<6} {:<14} {}\n", u(&r["handle"]), u(&r["hits"]), ago, s(r, "expr")));
+        }
+    }
+    for st in &sets {
+        t.push_str(&format!("set {}  {} elements{}{}\n", s(st, "set"), u(&st["elements"]), if st["interval"].as_bool().unwrap_or(false) { " (interval)" } else { "" }, if st["map"].as_bool().unwrap_or(false) { " (map)" } else { "" }));
+    }
+    t.push_str(&format!("drops: {} in all{}\n", dtotal, if drops.is_empty() { "" } else { ", newest first:" }));
+    for d in &drops {
+        let ports = if d.get("sport").is_some() { format!(":{} > {}:{}", u(&d["sport"]), s(d, "dst"), u(&d["dport"])) } else { format!(" > {}", s(d, "dst")) };
+        t.push_str(&format!(
+            "  {} ms ago {} {}{} {} {}{}{} len {} by {}{}{}\n",
+            u(&d["ago_ms"]),
+            s(d, "hook"),
+            if s(d, "iif").is_empty() { "" } else { "in " },
+            if s(d, "iif").is_empty() { format!("out {}", s(d, "oif")) } else { s(d, "iif").to_string() },
+            s(d, "proto"),
+            s(d, "src"),
+            ports,
+            d.get("flags").map_or(String::new(), |f| format!(" [{}]", f.as_str().unwrap_or(""))),
+            u(&d["len"]),
+            s(d, "by"),
+            d.get("reject").map_or(String::new(), |r| format!(", reject {}", r.as_str().unwrap_or(""))),
+            d.get("uid").map_or(String::new(), |x| format!(", uid {}", x))
+        ));
+    }
+    if ct.is_object() {
+        let mut parts = Vec::new();
+        if let Some(o) = ct.as_object() {
+            for (k, v) in o {
+                if k != "count" && k != "max" {
+                    parts.push(format!("{} {}", k, v));
+                }
+            }
+        }
+        t.push_str(&format!("conntrack: {} / {}{}\n", u(&ct["count"]), u(&ct["max"]), if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }));
+        for c in &conns {
+            t.push_str(&format!(
+                "  {} {} {}:{} > {}:{}{}{} expires {} s mark {}\n",
+                s(c, "proto"),
+                s(c, "state"),
+                s(c, "src"),
+                u(&c["sport"]),
+                s(c, "dst"),
+                u(&c["dport"]),
+                if c["replied"].as_bool().unwrap_or(false) { "" } else { " [UNREPLIED]" },
+                if c["assured"].as_bool().unwrap_or(false) { " [ASSURED]" } else { "" },
+                u(&c["expires_s"]),
+                u(&c["mark"])
+            ));
+        }
+    }
+    if a["trace"].as_str().is_some() {
+        if let Some(e) = &trace_err {
+            t.push_str(&format!("trace: {}\n", e));
+        } else {
+            for l in &trace {
+                t.push_str(&format!("{}\n", l));
+            }
+        }
+    }
+    let mut out = json!({ "text": t, "chains": chains, "rules": rules, "drops": drops, "drops_total": dtotal, "conntrack": ct });
+    if want_ct {
+        out["ct"] = json!(conns);
+    }
+    if a["trace"].as_str().is_some() {
+        out["trace"] = json!(trace);
+        if let Some(e) = trace_err {
+            out["trace_error"] = json!(e);
+        }
+    }
+    if a["nft"].as_bool().unwrap_or(false) {
+        let nft = ["/opt/c/bin/nft", "/usr/sbin/nft", "/usr/bin/nft"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("nft");
+        let o = if unsafe { libc::geteuid() } == 0 { Command::new(nft).args(["-a", "list", "ruleset"]).output() } else { Command::new("sudo").args(["-n", nft, "-a", "list", "ruleset"]).output() };
+        out["nft"] = match o {
+            Ok(o) if o.status.success() => json!(String::from_utf8_lossy(&o.stdout)),
+            Ok(o) => json!(format!("nft: {}", String::from_utf8_lossy(&o.stderr).trim())),
+            Err(e) => json!(format!("{}: {} (ap -S nftables)", nft, e)),
+        };
+    }
+    out
 }

@@ -10,6 +10,7 @@
 //   /proc/sys/fs/inotify/max_user_watches    1 つの inotify の watch の数
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
 //   /proc/sys/vm/min_free_kbytes             空きがこれを割ったら swap へ回収する (その 4 倍まで)
+//   /proc/sys/net/netfilter/nf_conntrack_*   conntrack の数、上限、時間切れ、tcp_loose など (conntrack.rs)
 //
 // 書けるのは root だけ。値は 1 行 (終わりの改行や空白はなくてよい)。起動のときに init が
 // /etc/sysctl.d/*.conf を読んでここに書く (aios apply の sysctl)
@@ -115,6 +116,31 @@ pub static TABLE: &[Entry] = &[
         // 64 KiB から 1 GiB
         set: Some(|s| Ok(MIN_FREE_PAGES.store(num(s, 64, 1 << 20)? * 1024 / crate::memlayout::PGSIZE, Ordering::Relaxed))),
     },
+    // conntrack (conntrack.rs。Linux の nf_conntrack_standalone.c と同じ名前と既定)
+    Entry { path: "net/netfilter/nf_conntrack_acct", get: || format!("{}", crate::conntrack::KNOBS.get().acct as u8), set: Some(|s| { crate::conntrack::KNOBS.get().acct = num(s, 0, 1)? == 1; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_buckets", get: || format!("{}", crate::conntrack::buckets()), set: None },
+    Entry { path: "net/netfilter/nf_conntrack_checksum", get: || format!("{}", crate::conntrack::KNOBS.get().checksum as u8), set: Some(|s| { crate::conntrack::KNOBS.get().checksum = num(s, 0, 1)? == 1; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_count", get: || format!("{}", crate::conntrack::count()), set: None },
+    Entry { path: "net/netfilter/nf_conntrack_generic_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().generic), set: Some(|s| { crate::conntrack::TIMEOUTS.get().generic = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_icmp_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().icmp), set: Some(|s| { crate::conntrack::TIMEOUTS.get().icmp = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_max", get: || format!("{}", crate::conntrack::max()), set: Some(|s| { crate::conntrack::KNOBS.get().max = num(s, 1, 1 << 30)?; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_be_liberal", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_be_liberal as u8), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_be_liberal = num(s, 0, 1)? == 1; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_ignore_invalid_rst", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_ignore_invalid_rst as u8), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_ignore_invalid_rst = num(s, 0, 1)? == 1; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_loose", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_loose as u8), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_loose = num(s, 0, 1)? == 1; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_max_retrans", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_max_retrans), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_max_retrans = num(s, 0, 255)? as u8; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_close", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[8]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[8] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_close_wait", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[5]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[5] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_established", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[3]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[3] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_fin_wait", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[4]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[4] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_last_ack", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[6]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[6] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_max_retrans", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[12]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[12] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_syn_recv", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[2]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[2] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_syn_sent", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[1]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[1] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_time_wait", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[7]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[7] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_tcp_timeout_unacknowledged", get: || format!("{}", crate::conntrack::TIMEOUTS.get().tcp[13]), set: Some(|s| { crate::conntrack::TIMEOUTS.get().tcp[13] = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_udp_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().udp), set: Some(|s| { crate::conntrack::TIMEOUTS.get().udp = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_udp_timeout_stream", get: || format!("{}", crate::conntrack::TIMEOUTS.get().udp_stream), set: Some(|s| { crate::conntrack::TIMEOUTS.get().udp_stream = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/nf_conntrack_max", get: || format!("{}", crate::conntrack::max()), set: Some(|s| { crate::conntrack::KNOBS.get().max = num(s, 1, 1 << 30)?; Ok(()) }) },
 ];
 
 /// パスを / で分けたものの d 番目まで

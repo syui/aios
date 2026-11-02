@@ -51,6 +51,8 @@ enum Node {
     NetUnix,
     /// /proc/net/dev (インターフェースごとの送り受けの数。psutil や ifconfig が読む)
     NetDev,
+    /// /proc/net/nf_conntrack (conntrack のつながり: conntrack.rs。root だけ)
+    NetConntrack,
     /// まだ中身のない /proc/net のファイル (見出しだけ。netstat が読む): NET_STUBS の番号
     NetStub(u8),
     KernelCmdline,
@@ -112,6 +114,8 @@ enum Node {
     AiFd(u32),
     /// /proc/ai/why: しくじったシステムコールのわけ (why.rs)
     AiWhy,
+    /// /proc/ai/fw (ファイアウォールの様子: nftables::ai_json)
+    AiFw,
     /// /proc/ai/stack と stack/TID (スレッドの番号)
     AiStackDir,
     AiStack(u32),
@@ -188,6 +192,7 @@ impl ProcInode {
             Node::NetSnmp => 38,
             Node::NetUnix => 23,
             Node::NetDev => 39,
+            Node::NetConntrack => 40,
             Node::NetStub(i) => 18 + i as u64,
             Node::SysDir(i, d) => 0x100 + i as u64 * 8 + d as u64,
             Node::Sys(i) => 0x1000 + i as u64,
@@ -229,6 +234,7 @@ impl ProcInode {
             Node::AiFdDir => 44,
             Node::AiFd(p) => (p as u64) << 16 | 30,
             Node::AiWhy => 54,
+            Node::AiFw => 55,
             Node::AiStackDir => 45,
             Node::AiStack(t) => (t as u64) << 16 | 31,
         }
@@ -295,7 +301,7 @@ impl ProcInode {
             }
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
-            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFail | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
+            Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFail | Node::AiFw | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => proc::ai_threads(),
             Node::AiBkl => crate::smp::stats_json(),
@@ -308,6 +314,7 @@ impl ProcInode {
             Node::AiTrace => crate::trace::json(),
             Node::AiParts => crate::parts::json(),
             Node::AiFail => crate::fail::json(),
+            Node::AiFw => crate::nftables::ai_json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::AiWhy => crate::why::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
             Node::Strace => crate::syscall::strace_get(),
@@ -324,6 +331,7 @@ impl ProcInode {
                 }
                 s
             }
+            Node::NetConntrack => crate::conntrack::proc_text(),
             Node::NetTcp => crate::socket::proc_net(true),
             Node::NetUdp => crate::socket::proc_net(false),
             Node::NetSockstat => crate::socket::proc_sockstat(),
@@ -687,6 +695,7 @@ impl Inode for ProcInode {
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
             Node::Strace | Node::Bkl | Node::IdMap(..) => S_IFREG | 0o644,
+            Node::NetConntrack => S_IFREG | 0o440,
             _ => S_IFREG | 0o444,
         };
         let now = crate::timer::epoch_ns();
@@ -853,6 +862,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "trace") => Node::AiTrace,
             (Node::AiDir, "parts") => Node::AiParts,
             (Node::AiDir, "fail") => Node::AiFail,
+            (Node::AiDir, "fw") => Node::AiFw,
             (Node::AiDir, "fd") => Node::AiFdDir,
             (Node::AiDir, "why") => Node::AiWhy,
             (Node::AiDir, "stack") => Node::AiStackDir,
@@ -872,6 +882,7 @@ impl Inode for ProcInode {
             (Node::NetDir, "snmp") => Node::NetSnmp,
             (Node::NetDir, "unix") => Node::NetUnix,
             (Node::NetDir, "dev") => Node::NetDev,
+            (Node::NetDir, "nf_conntrack") => Node::NetConntrack,
             (Node::NetDir, n) if NET_STUBS.iter().any(|(s, _)| *s == n) => Node::NetStub(NET_STUBS.iter().position(|(s, _)| *s == n).unwrap() as u8),
             (Node::Root, "sys") => Node::SysDir(0, 0),
             (Node::SysDir(i, d), _) => match crate::sysctl::lookup(i as usize, d as usize, name).ok_or(-ENOENT)? {
@@ -970,6 +981,7 @@ impl Inode for ProcInode {
                 add("trace".into(), Node::AiTrace);
                 add("parts".into(), Node::AiParts);
                 add("fail".into(), Node::AiFail);
+                add("fw".into(), Node::AiFw);
                 add("fd".into(), Node::AiFdDir);
                 add("stack".into(), Node::AiStackDir);
                 add("why".into(), Node::AiWhy);
@@ -994,6 +1006,7 @@ impl Inode for ProcInode {
                 add("snmp".into(), Node::NetSnmp);
                 add("unix".into(), Node::NetUnix);
                 add("dev".into(), Node::NetDev);
+                add("nf_conntrack".into(), Node::NetConntrack);
                 for (i, (n, _)) in NET_STUBS.iter().enumerate() {
                     add((*n).into(), Node::NetStub(i as u8));
                 }

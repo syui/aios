@@ -18,6 +18,7 @@
 //   (自分あてなら lo の 4 つ、外へは eth0 の LOCAL_OUT と POST_ROUTING)。ICMP は lo でなければ相手ごとに 1 秒に 1 つ
 //   (はじめは 6 つまで: Linux の icmp_ratelimit と XRLIM_BURST_FACTOR)
 // - log: Linux の nf_log_syslog と同じ 1 行を kmsg に (dmesg で見える。シリアルの画面には出さない)
+use crate::conntrack::{self, Ct};
 use crate::nftables;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -60,6 +61,8 @@ pub struct Pkt<'a> {
     /// 出すソケットの持ち主 (fsuid, fsgid)。なければ meta skuid は当たらない
     pub sk: Option<(u32, u32)>,
     pub pkttype: u8,
+    /// つながり (conntrack.rs。skb->_nfct)
+    pub ct: Ct,
 }
 
 impl Pkt<'_> {
@@ -130,14 +133,16 @@ impl Why {
     }
 }
 
-/// 決まりを入れたか (基の鎖が 1 つでもある。なければパケットを作らない)
+/// 決まりを入れたか (基の鎖が 1 つでもあるか、conntrack が動いている。なければパケットを作らない)
 pub fn active() -> bool {
-    nftables::active()
+    nftables::active() || nftables::ct_on()
 }
 
+/// フックを順に。落ちたら (reject, わけ, フック)。落としたものは /proc/ai/fw の輪にも
 fn hooks(hs: &[u32], p: &mut Pkt) -> Option<(Option<Reject>, Why, u32)> {
     for &h in hs {
         if let Verdict::Drop { reject, why } = nftables::hook(h, p) {
+            remember_drop(p, h, &why, reject);
             return Some((reject, why, h));
         }
     }
@@ -155,28 +160,34 @@ pub enum Path {
 
 /// 中どうし (lo) のパケット。返すもの (reject の RST か ICMP) は、それも lo の道をとおって届いたものだけ
 pub fn lo(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32) -> Path {
-    lo_depth(ip, sk, mark, priority, 0)
+    lo_depth(ip, sk, mark, priority, Ct::None, 0)
 }
 
 const LO_LL: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0];
 
-fn lo_depth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32, depth: u32) -> Path {
+fn lo_depth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32, ct: Ct, depth: u32) -> Path {
     let r = {
-        let mut p = Pkt { ip: &mut *ip, ll: None, iif: 0, oif: IF_LO, mark, priority, sk, pkttype: PACKET_HOST };
+        let mut p = Pkt { ip: &mut *ip, ll: None, iif: 0, oif: IF_LO, mark, priority, sk, pkttype: PACKET_HOST, ct };
         if let Some(d) = hooks(&[LOCAL_OUT, POST_ROUTING], &mut p) {
-            Some((d, true, p.mark))
+            Some((d, true, p.mark, conntrack::attach(&mut p.ct)))
         } else {
-            // lo をとおっても mark と priority はそのまま (loopback_xmit)。ソケットは外れる (skb_orphan)
-            let (mark, priority) = (p.mark, p.priority);
-            let mut p = Pkt { ip: &mut *ip, ll: Some(&LO_LL), iif: IF_LO, oif: 0, mark, priority, sk: None, pkttype: PACKET_HOST };
-            hooks(&[PRE_ROUTING, LOCAL_IN], &mut p).map(|d| (d, false, p.mark))
+            // lo をとおっても mark と priority とつながりはそのまま (loopback_xmit)。ソケットは外れる (skb_orphan)
+            let (mark, priority, ct) = (p.mark, p.priority, core::mem::take(&mut p.ct));
+            let mut p = Pkt { ip: &mut *ip, ll: Some(&LO_LL), iif: IF_LO, oif: 0, mark, priority, sk: None, pkttype: PACKET_HOST, ct };
+            hooks(&[PRE_ROUTING, LOCAL_IN], &mut p).map(|d| (d, false, p.mark, conntrack::attach(&mut p.ct)))
         }
     };
-    let Some(((rj, why, hook), out, mark)) = r else { return Path::Pass };
-    // 返すもの: 自分あて (送ったもの) へ、lo の道で
-    let reply = rj.filter(|_| depth == 0).and_then(|rj| reply(ip, rj, hook, if out { 0 } else { IF_LO }, PACKET_HOST, mark)).and_then(|mut r| match lo_depth(&mut r, None, 0, 0, depth + 1) {
-        Path::Pass => Some(r),
-        _ => None,
+    let Some(((rj, why, hook), out, mark, rct)) = r else { return Path::Pass };
+    // 返すもの: 自分あて (送ったもの) へ、lo の道で。もとのつながりを持つ (nf_ct_attach: related。RST なら TCP の
+    // つながりは CLOSE に: nf_ct_set_closing)
+    let reply = rj.filter(|_| depth == 0).and_then(|rj| reply(ip, rj, hook, if out { 0 } else { IF_LO }, PACKET_HOST, mark).map(|r| (r, rj.rst))).and_then(|(mut r, rst)| {
+        if rst {
+            conntrack::set_closing(&rct);
+        }
+        match lo_depth(&mut r, None, 0, 0, rct, depth + 1) {
+            Path::Pass => Some(r),
+            _ => None,
+        }
     });
     if out { Path::Out(reply, why) } else { Path::In(reply, why) }
 }
@@ -184,13 +195,18 @@ fn lo_depth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32, dep
 /// 外 (eth0) へ出すもの: LOCAL_OUT と POST_ROUTING。返すもの (自分あて) は lo の道で届いたものだけ
 pub fn out_eth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32) -> Path {
     let r = {
-        let mut p = Pkt { ip: &mut *ip, ll: None, iif: 0, oif: IF_ETH0, mark, priority, sk, pkttype: PACKET_HOST };
-        hooks(&[LOCAL_OUT, POST_ROUTING], &mut p).map(|d| (d, p.mark))
+        let mut p = Pkt { ip: &mut *ip, ll: None, iif: 0, oif: IF_ETH0, mark, priority, sk, pkttype: PACKET_HOST, ct: Ct::None };
+        hooks(&[LOCAL_OUT, POST_ROUTING], &mut p).map(|d| (d, p.mark, conntrack::attach(&mut p.ct)))
     };
-    let Some(((rj, why, hook), mark)) = r else { return Path::Pass };
-    let reply = rj.and_then(|rj| reply(ip, rj, hook, 0, PACKET_HOST, mark)).and_then(|mut r| match lo_depth(&mut r, None, 0, 0, 1) {
-        Path::Pass => Some(r),
-        _ => None,
+    let Some(((rj, why, hook), mark, rct)) = r else { return Path::Pass };
+    let reply = rj.and_then(|rj| reply(ip, rj, hook, 0, PACKET_HOST, mark).map(|r| (r, rj.rst))).and_then(|(mut r, rst)| {
+        if rst {
+            conntrack::set_closing(&rct);
+        }
+        match lo_depth(&mut r, None, 0, 0, rct, 1) {
+            Path::Pass => Some(r),
+            _ => None,
+        }
     });
     Path::Out(reply, why)
 }
@@ -208,13 +224,17 @@ pub fn in_eth(frame: &mut [u8], local: bool, pkttype: u8) -> EthIn {
     let ip = &mut ip[..tot];
     let ll: &[u8] = ll;
     let r = {
-        let mut p = Pkt { ip: &mut *ip, ll: Some(ll), iif: IF_ETH0, oif: 0, mark: 0, priority: 0, sk: None, pkttype };
+        let mut p = Pkt { ip: &mut *ip, ll: Some(ll), iif: IF_ETH0, oif: 0, mark: 0, priority: 0, sk: None, pkttype, ct: Ct::None };
         let hs: &[u32] = if local { &[PRE_ROUTING, LOCAL_IN] } else { &[PRE_ROUTING] };
-        hooks(hs, &mut p).map(|d| (d, p.mark))
+        hooks(hs, &mut p).map(|d| (d, p.mark, conntrack::attach(&mut p.ct)))
     };
-    let Some(((rj, _why, hook), mark)) = r else { return EthIn::Pass };
-    let Some(mut r) = rj.and_then(|rj| reply(ip, rj, hook, IF_ETH0, pkttype, mark)) else { return EthIn::Drop(None) };
-    if let Path::Pass = out_reply(&mut r) {
+    let Some(((rj, _why, hook), mark, rct)) = r else { return EthIn::Pass };
+    let Some(rj) = rj else { return EthIn::Drop(None) };
+    let Some(mut r) = reply(ip, rj, hook, IF_ETH0, pkttype, mark) else { return EthIn::Drop(None) };
+    if rj.rst {
+        conntrack::set_closing(&rct);
+    }
+    if let Path::Pass = out_reply(&mut r, rct) {
         let mut f = Vec::with_capacity(14 + r.len());
         f.extend_from_slice(&ll[6..12]);
         f.extend_from_slice(&ll[0..6]);
@@ -226,12 +246,120 @@ pub fn in_eth(frame: &mut [u8], local: bool, pkttype: u8) -> EthIn {
 }
 
 /// 外へ返すもの (reject の RST と ICMP): LOCAL_OUT と POST_ROUTING (返すもののために返すものは作らない)
-fn out_reply(r: &mut [u8]) -> Path {
-    let mut p = Pkt { ip: r, ll: None, iif: 0, oif: IF_ETH0, mark: 0, priority: 0, sk: None, pkttype: PACKET_HOST };
+fn out_reply(r: &mut [u8], ct: Ct) -> Path {
+    let mut p = Pkt { ip: r, ll: None, iif: 0, oif: IF_ETH0, mark: 0, priority: 0, sk: None, pkttype: PACKET_HOST, ct };
     match hooks(&[LOCAL_OUT, POST_ROUTING], &mut p) {
         None => Path::Pass,
         Some((_, why, _)) => Path::Out(None, why),
     }
+}
+
+
+// ---- 落としたものの輪 (/proc/ai/fw の drop。Linux にはない: nft monitor trace や log の決まりを入れないと見えない) ----
+
+struct Drop {
+    ns: u64,
+    hook: u32,
+    iif: u32,
+    oif: u32,
+    head: [u8; 40],
+    len: u16,
+    why: String,
+    reject: Option<Reject>,
+    uid: Option<u32>,
+}
+
+static DROPS: crate::cell::Bkl<(Vec<Drop>, usize, u64)> = crate::cell::Bkl::new((Vec::new(), 0, 0));
+const DROPS_MAX: usize = 64;
+
+fn remember_drop(p: &Pkt, hook: u32, why: &Why, reject: Option<Reject>) {
+    if nftables::tracing() {
+        return;
+    }
+    let mut head = [0u8; 40];
+    let n = p.ip.len().min(40);
+    head[..n].copy_from_slice(&p.ip[..n]);
+    let d = Drop { ns: crate::timer::uptime_ns(), hook, iif: p.iif, oif: p.oif, head, len: p.ip.len() as u16, why: why.text(), reject, uid: p.sk.map(|s| s.0) };
+    let (v, at, total) = DROPS.get();
+    if v.len() < DROPS_MAX {
+        v.push(d);
+    } else {
+        v[*at] = d;
+    }
+    *at = (*at + 1) % DROPS_MAX;
+    *total += 1;
+}
+
+pub fn hook_name(h: u32) -> &'static str {
+    ["prerouting", "input", "forward", "output", "postrouting", "ingress"].get(h as usize).copied().unwrap_or("?")
+}
+
+/// 落としたもの (新しい順、1 行 1 つの JSON) と、いままでの数
+pub fn drops_json() -> String {
+    let (v, at, total) = DROPS.get();
+    let now = crate::timer::uptime_ns();
+    let mut s = alloc::format!("{{\"drops\":{},\"kept\":{}}}\n", total, v.len());
+    let n = v.len();
+    for k in 0..n {
+        let d = &v[(*at + n - 1 - k) % n];
+        let ip = &d.head;
+        let ihl = (ip[0] & 15) as usize * 4;
+        let proto = ip[9];
+        let (sp, dp, flags) = if (proto == 6 || proto == 17) && ihl + 4 <= 40 {
+            let f = if proto == 6 && ihl + 14 <= 40 { ip[ihl + 13] } else { 0 };
+            (be16(&ip[ihl..ihl + 2]), be16(&ip[ihl + 2..ihl + 4]), f)
+        } else {
+            (0, 0, 0)
+        };
+        let pname = match proto {
+            1 => "icmp",
+            6 => "tcp",
+            17 => "udp",
+            _ => "other",
+        };
+        let mut fl = String::new();
+        for (bit, name) in [(SYN, "syn"), (ACK, "ack"), (FIN, "fin"), (RST, "rst"), (PSH, "psh")] {
+            if proto == 6 && flags & bit != 0 {
+                if !fl.is_empty() {
+                    fl.push(',');
+                }
+                fl.push_str(name);
+            }
+        }
+        let _ = write!(
+            s,
+            "{{\"ago_ms\":{},\"hook\":\"{}\",\"iif\":\"{}\",\"oif\":\"{}\",\"proto\":\"{}\",\"src\":\"{}\",\"dst\":\"{}\"",
+            (now - d.ns) / 1_000_000,
+            hook_name(d.hook),
+            ifname(d.iif),
+            ifname(d.oif),
+            pname,
+            dotted(&ip[12..16]),
+            dotted(&ip[16..20])
+        );
+        if proto == 6 || proto == 17 {
+            let _ = write!(s, ",\"sport\":{},\"dport\":{}", sp, dp);
+        }
+        if proto == 1 && ihl + 2 <= 40 {
+            let _ = write!(s, ",\"type\":{},\"code\":{}", ip[ihl], ip[ihl + 1]);
+        }
+        if !fl.is_empty() {
+            let _ = write!(s, ",\"flags\":\"{}\"", fl);
+        }
+        let _ = write!(s, ",\"len\":{},\"by\":\"{}\"", d.len, d.why);
+        match d.reject {
+            Some(r) if r.rst => s.push_str(",\"reject\":\"tcp reset\""),
+            Some(r) => {
+                let _ = write!(s, ",\"reject\":\"icmp code {}\"", r.code);
+            }
+            None => {}
+        }
+        if let Some(u) = d.uid {
+            let _ = write!(s, ",\"uid\":{}", u);
+        }
+        s.push_str("}\n");
+    }
+    s
 }
 
 // ---- 返すもの (reject) ----
@@ -689,4 +817,94 @@ fn dump_ip(m: &mut String, ip: &[u8], depth: u32, flags: u32) {
             let _ = write!(m, "PROTO={} ", p);
         }
     }
+}
+
+// ---- trace (/proc/ai/ctl の fw trace: パケットを流さずに道を試す) ----
+
+/// `fw trace in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst]`。in eth0 は PRE_ROUTING と
+/// (aios あてなら) LOCAL_IN、out eth0 は LOCAL_OUT と POST_ROUTING、lo は 4 つ。決まりを写したものに通すので、counter
+/// も limit も conntrack も変わらない。道は /proc/ai/fw の trace の行に
+pub fn trace_cmd(arg: &str) -> Result<(), i64> {
+    let w: Vec<&str> = arg.split_whitespace().collect();
+    if w.len() < 5 {
+        return Err(crate::why::inval());
+    }
+    let ep = |s: &str| -> Result<(u32, u16), i64> {
+        let (a, p) = s.split_once(':').map_or((s, "0"), |(a, p)| (a, p));
+        let mut b = [0u8; 4];
+        let mut n = 0;
+        for (i, x) in a.split('.').enumerate() {
+            if i >= 4 {
+                return Err(crate::why::inval());
+            }
+            b[i] = x.parse::<u8>().map_err(|_| crate::why::inval())?;
+            n += 1;
+        }
+        if n != 4 {
+            return Err(crate::why::inval());
+        }
+        Ok((u32::from_be_bytes(b), p.parse::<u16>().map_err(|_| crate::why::inval())?))
+    };
+    let (dir, dev, proto) = (w[0], w[1], w[2]);
+    let ((src, sp), (dst, dp)) = (ep(w[3])?, ep(w[4])?);
+    let fl = w.get(5).copied().unwrap_or(if proto == "tcp" { "syn" } else { "" });
+    let mut pkt = match proto {
+        "tcp" => {
+            let f = match fl {
+                "syn" => SYN,
+                "ack" => ACK,
+                "synack" => SYN | ACK,
+                "fin" => FIN | ACK,
+                "rst" => RST,
+                _ => return Err(crate::why::inval()),
+            };
+            let opts = if f & SYN != 0 { syn_opts(1460, 1, 0).to_vec() } else { Vec::new() };
+            tcp(src, sp, dst, dp, 1, if f & ACK != 0 { 1 } else { 0 }, f, 64240, &opts, 0, 64, 0)
+        }
+        "udp" => udp(src, sp, dst, dp, b"trace", 0, 64, 0, true),
+        "icmp" => {
+            let mut b = Vec::with_capacity(28);
+            iphdr(&mut b, 0, 28, 0, true, 64, PROTO_ICMP, src, dst);
+            b.extend_from_slice(&[8, 0, 0, 0, 0, 1, 0, 1]);
+            let c = csum_fold(csum_add(0, &b[20..]));
+            b[22..24].copy_from_slice(&c.to_be_bytes());
+            b
+        }
+        _ => return Err(crate::why::inval()),
+    };
+    let what = alloc::format!("{} {} {} {}:{} > {}:{} {}", dir, dev, proto, dotted(&src.to_be_bytes()), sp, dotted(&dst.to_be_bytes()), dp, fl);
+    let mut res = Ok(());
+    nftables::run_trace(&what, || {
+        let v = match (dir, dev) {
+            (_, "lo") => match lo(&mut pkt, None, 0, 0) {
+                Path::Pass => String::from("result: accept (delivered on lo)"),
+                Path::Out(_, why) => alloc::format!("result: drop on output by {}", why.text()),
+                Path::In(_, why) => alloc::format!("result: drop on input by {}", why.text()),
+            },
+            ("out", "eth0") => match out_eth(&mut pkt, None, 0, 0) {
+                Path::Pass => String::from("result: accept (sent on eth0)"),
+                Path::Out(_, why) | Path::In(_, why) => alloc::format!("result: drop on output by {} (sendmsg gets EPERM)", why.text()),
+            },
+            ("in", "eth0") => {
+                let local = (dst != 0 && dst == crate::net::eth_addr()) || is_bcast_or_mcast(dst);
+                let mut f = Vec::with_capacity(14 + pkt.len());
+                f.extend_from_slice(&[0x52, 0x54, 0, 0x12, 0x34, 0x56, 0x52, 0x55, 0x0a, 0, 2, 2, 8, 0]);
+                if let Some(m) = crate::net::mac() {
+                    f[..6].copy_from_slice(&m);
+                }
+                f.extend_from_slice(&pkt);
+                match in_eth(&mut f, local, PACKET_HOST) {
+                    EthIn::Pass if local => String::from("result: accept (delivered to aios)"),
+                    EthIn::Pass => String::from("result: accept on prerouting (not addressed to aios: not delivered)"),
+                    EthIn::Drop(r) => alloc::format!("result: drop{}", if r.is_some() { " (a reject reply would be sent back)" } else { "" }),
+                }
+            }
+            _ => {
+                res = Err(crate::why::inval());
+                String::new()
+            }
+        };
+        nftables::trace_note(v);
+    });
+    res
 }

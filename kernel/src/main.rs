@@ -50,6 +50,7 @@ mod netif;
 mod netlink;
 mod nftables;
 mod nfhook;
+mod conntrack;
 mod parts;
 mod proc;
 mod sd;
