@@ -1,0 +1,16 @@
+# nftables: 起動のたびに /etc/nftables.conf の決まりをカーネルに入れる (Linux の nftables.service と同じ)。aios apply が
+# /etc/aios.json の firewall から /etc/nftables.conf を書いて、これを有効にする (パッケージを入れただけでは有効にしない)。
+# Before=sysinit.target: aios の init はほかのサービスより先に起こして終わるのを待つので、sshd などが外とつなぐ前に決まりが
+# 入る。決まりを書きかえたら sudo systemctl restart nftables (か sudo nft -f /etc/nftables.conf)
+[Unit]
+Description=Netfilter Tables (load /etc/nftables.conf)
+Documentation=man:nft(8)
+ConditionPathExists=/etc/nftables.conf
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/c/bin/nft -f /etc/nftables.conf
+
+[Install]
+WantedBy=multi-user.target

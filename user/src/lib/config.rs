@@ -14,7 +14,18 @@ const MODULES: &str = "/etc/modules-load.d/aios.conf";
 const NETWORK: &str = "/etc/systemd/network";
 
 /// 一番上に書けるもの
-const KEYS: [&str; 7] = ["host", "pkg", "service", "kernel", "user", "net", "sysctl"];
+const KEYS: [&str; 8] = ["host", "pkg", "service", "kernel", "user", "net", "sysctl", "firewall"];
+
+/// ファイアウォール (firewall): nft の決まりのファイル (Linux の nftables.service が起動で読むところ)、aios が入れた
+/// ときの記録 (生成番号とファイルの中身のしるし)、入れる前の決まり (confirm がなければもどす: aiosd)
+pub const NFT_CONF: &str = "/etc/nftables.conf";
+pub const FW_STATE: &str = "/var/lib/aios/firewall.json";
+pub const FW_PREV: &str = "/var/lib/aios/firewall.prev.nft";
+pub const FW_PREV_CONF: &str = "/var/lib/aios/nftables.conf.prev";
+/// confirm を待っているもの (aiosd): {"n", "deadline", "confirm", "prev"}。起動したときに残っていれば、もどす
+pub const FW_PENDING: &str = "/var/lib/aios/firewall-pending.json";
+/// aios が書いた /etc/nftables.conf のしるし (2 行目)
+const FW_MARK: &str = "# aios apply (/etc/aios.json の firewall) が書く";
 
 /// そろえるための 1 つの手順
 #[derive(Clone)]
@@ -32,6 +43,8 @@ pub enum Act {
     Write(String, String),
     Remove(String),
     Hostname(String),
+    /// /etc/nftables.conf の中身と、confirm を待つ秒 (0 は待たない)
+    Firewall(String, u64),
 }
 
 impl Step {
@@ -41,6 +54,8 @@ impl Step {
             Act::Write(p, _) => format!("write {}", p),
             Act::Remove(p) => format!("rm {}", p),
             Act::Hostname(n) => format!("hostname {}", n),
+            Act::Firewall(_, 0) => format!("nft -c -f, then nft -f {}", NFT_CONF),
+            Act::Firewall(_, c) => format!("nft -c -f, then nft -f {} (reverted unless confirmed in {} s)", NFT_CONF, c),
         };
         json!({ "what": self.what, "from": self.from, "to": self.to, "do": how })
     }
@@ -272,7 +287,161 @@ pub fn plan(cfg: &Value) -> Result<Vec<Step>, String> {
             steps.push(step("net".into(), "", "applied", run(&["networkd"])));
         }
     }
+    // firewall: /etc/nftables.conf に書いて nft -f で入れ (先に nft -c でたしかめる)、起動でも入るように nftables.service を
+    // enable。ファイルがそろっていても、aios が入れたあとにだれかが nft で変えていれば (生成番号がちがう) 入れなおす
+    if let Some(fw) = cfg.get("firewall") {
+        let (content, confirm) = firewall_content(fw)?;
+        if nft().is_none() {
+            steps.push(step("pkg nftables (firewall)".into(), "absent", "installed", run(&["aipkg", "-S", "nftables"])));
+        }
+        let now = fs::read_to_string(NFT_CONF).unwrap_or_default();
+        let rec: Value = fs::read_to_string(FW_STATE).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let live_gen = fw_generation();
+        let same_file = now == content && rec["sha"].as_str() == Some(&sha(&content));
+        // 起動しなおしていれば (生成番号は 1 から)、起動の nftables.service が aios の書いたファイルを入れている
+        let rebooted = rec["boot_id"].as_str() != Some(&boot_id()) && std::path::Path::new("/etc/systemd/system/multi-user.target.wants/nftables.service").exists();
+        let same_live = live_gen.is_none() || rec["generation"].as_u64() == live_gen || (rebooted && same_file);
+        if !same_file || !same_live {
+            let from = if !same_file { fw_summary(&now) } else { format!("changed outside aios (generation {} != {})", live_gen.unwrap_or(0), rec["generation"]) };
+            steps.push(step("firewall".into(), &from, &fw_summary(&content), Act::Firewall(content, confirm)));
+        }
+        if !std::path::Path::new("/etc/systemd/system/multi-user.target.wants/nftables.service").exists() {
+            steps.push(step("service nftables enable".into(), "disabled", "enabled", run(&["systemctl", "enable", "nftables"])));
+        }
+    }
     Ok(steps)
+}
+
+/// nft のプログラム (パッケージ nftables は /opt/c/bin に)
+pub fn nft() -> Option<&'static str> {
+    ["/opt/c/bin/nft", "/usr/sbin/nft", "/usr/bin/nft"].into_iter().find(|p| std::path::Path::new(p).exists())
+}
+
+/// いまの決まりの生成番号 (/proc/ai/fw のはじめの行。aios のカーネルで、読める人だけ)
+pub fn fw_generation() -> Option<u64> {
+    let t = fs::read_to_string("/proc/ai/fw").ok()?;
+    let v: Value = serde_json::from_str(t.lines().next()?).ok()?;
+    v["generation"].as_u64()
+}
+
+/// 中身のしるし (FNV-1a 64)
+pub fn sha(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:016x}", h)
+}
+
+/// aios.json の firewall から /etc/nftables.conf の中身と confirm の秒。書きかた: 決まりの文字 ("table inet filter {...}")、
+/// 行の並び、{"rules": 文字か行の並び, "confirm": 秒 (10 から 3600。なければ待たない)}
+pub fn firewall_content(fw: &Value) -> Result<(String, u64), String> {
+    let lines = |v: &Value| -> Result<String, String> {
+        match v {
+            Value::String(s) => Ok(s.clone()),
+            Value::Array(a) => a.iter().map(|l| l.as_str().map(String::from).ok_or("firewall.rules: a list of lines (strings)".to_string())).collect::<Result<Vec<_>, _>>().map(|v| v.join("\n")),
+            _ => Err("firewall.rules: nft rules as a string or a list of lines".into()),
+        }
+    };
+    let (rules, confirm) = match fw {
+        Value::Object(o) => {
+            for k in o.keys() {
+                if !["rules", "confirm"].contains(&k.as_str()) {
+                    return Err(format!("firewall: unknown key {:?} (one of: rules confirm)", k));
+                }
+            }
+            let c = match o.get("confirm") {
+                None => 0,
+                Some(c) => c.as_u64().filter(|c| (10..=3600).contains(c)).ok_or("firewall.confirm: seconds from 10 to 3600")?,
+            };
+            (lines(o.get("rules").unwrap_or(&Value::String(String::new())))?, c)
+        }
+        v => (lines(v)?, 0),
+    };
+    if rules.contains('\0') {
+        return Err("firewall.rules: no NUL".into());
+    }
+    let mut c = format!("#!/opt/c/bin/nft -f\n{}。手で変えても、次の aios apply でもどる\nflush ruleset\n", FW_MARK);
+    if !rules.trim().is_empty() {
+        c.push('\n');
+        c.push_str(rules.trim_end());
+        c.push('\n');
+    }
+    Ok((c, confirm))
+}
+
+/// 決まりのファイルを 1 行に (diff の from / to): 表の数と行の数
+fn fw_summary(t: &str) -> String {
+    if t.is_empty() {
+        return "none".into();
+    }
+    let body: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#') && l.trim() != "flush ruleset").collect();
+    let tables = body.iter().filter(|l| l.trim_start().starts_with("table ")).count();
+    format!("{} tables, {} lines, {}", tables, body.len(), sha(t))
+}
+
+/// 決まりを入れる (root で): nft -c -f でたしかめ、いまの決まりを nft list ruleset でとっておき (confirm がないときに
+/// もどすため)、/etc/nftables.conf に書いて nft -f。生成番号を記録に
+fn fw_load(content: &str, path_env: &str) -> (bool, String) {
+    let nft = nft().unwrap_or("nft");
+    let _ = fs::create_dir_all("/var/lib/aios");
+    let cand = "/var/lib/aios/nftables.new";
+    if let Err(e) = fs::write(cand, content) {
+        return (false, format!("{}: {}", cand, e));
+    }
+    let sh = |args: &[&str]| std::process::Command::new(nft).args(args).env("PATH", path_env).stdin(std::process::Stdio::null()).output();
+    match sh(&["-c", "-f", cand]) {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => return (false, format!("nft -c: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+        Err(e) => return (false, format!("{}: {}", nft, e)),
+    }
+    let live = sh(&["list", "ruleset"]).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let _ = fs::write(FW_PREV, format!("flush ruleset\n{}", live));
+    match fs::read_to_string(NFT_CONF) {
+        Ok(t) => {
+            let _ = fs::write(FW_PREV_CONF, t);
+        }
+        Err(_) => {
+            let _ = fs::remove_file(FW_PREV_CONF);
+        }
+    }
+    if let Err(e) = fs::rename(cand, NFT_CONF) {
+        return (false, format!("{}: {}", NFT_CONF, e));
+    }
+    match sh(&["-f", NFT_CONF]) {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => return (false, format!("nft -f: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+        Err(e) => return (false, format!("{}: {}", nft, e)),
+    }
+    fw_record(content);
+    (true, String::new())
+}
+
+/// aios が入れたときの生成番号、中身のしるし、起動の番号 (生成番号は起動ごとに 1 から)
+pub fn fw_record(content: &str) {
+    let rec = json!({ "generation": fw_generation(), "sha": sha(content), "boot_id": boot_id() });
+    let _ = fs::write(FW_STATE, rec.to_string() + "\n");
+}
+
+fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().to_string()
+}
+
+/// 起動したとき (aiosd): nftables.service が入れたのが aios の書いた /etc/nftables.conf なら、この起動の生成番号を記録に
+/// (aios diff が「aios の外で変わった」と言わないように)
+pub fn fw_boot_sync() {
+    let Some(rec) = fs::read_to_string(FW_STATE).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+    if rec["boot_id"].as_str() == Some(&boot_id()) {
+        return;
+    }
+    // まだ入っていなければ (生成番号は 1 のまま: 起動の順で aiosd が先だったとき) 記録しない
+    if let Ok(t) = fs::read_to_string(NFT_CONF)
+        && rec["sha"].as_str() == Some(&sha(&t))
+        && fw_generation().is_some_and(|g| g > 1)
+    {
+        fw_record(&t);
+    }
 }
 
 /// net.IFACE から networkd のファイルを作る。(中身, 手で決めたアドレス)
@@ -344,6 +513,7 @@ pub fn exec(s: &Step, path_env: &str) -> (bool, String) {
             Ok(()) => (true, String::new()),
             Err(e) => (false, format!("{}: {}", p, e)),
         },
+        Act::Firewall(c, _) => fw_load(c, path_env),
         Act::Hostname(n) => {
             let r = fs::write("/etc/hostname", format!("{}\n", n));
             let c = std::ffi::CString::new(n.as_str()).unwrap_or_default();
@@ -414,6 +584,13 @@ pub fn export() -> Value {
         sc.insert(k, v.parse::<i64>().map_or(json!(v), |n| json!(n)));
     }
     m.insert("sysctl".into(), Value::Object(sc));
+    // firewall: aios が書いた /etc/nftables.conf の決まり (flush ruleset とはじめの説明をのぞいた行)
+    if let Ok(t) = fs::read_to_string(NFT_CONF)
+        && t.lines().nth(1).is_some_and(|l| l.starts_with(FW_MARK))
+    {
+        let lines: Vec<Value> = t.lines().skip(3).skip_while(|l| l.is_empty()).map(|l| json!(l)).collect();
+        m.insert("firewall".into(), json!({ "rules": lines }));
+    }
     Value::Object(m)
 }
 

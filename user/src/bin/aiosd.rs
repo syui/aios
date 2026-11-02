@@ -7,6 +7,9 @@
 //     {"op":"power","action":"reboot|poweroff"}
 //     {"op":"apply"}      /etc/aios.json のとおりにそろえる (記録は /var/lib/aios/history/N.json)
 //     {"op":"rollback"}   ひとつ前の apply の設定に戻す (/etc/aios.json も戻し、そのとき入れたパッケージは外す)
+//     {"op":"apply","confirm":60}  ファイアウォールを変えるなら、60 秒のうちに confirm がなければ前の決まりにもどす
+//                         (aios.json の firewall.confirm より先。AI が ssh ごしに自分を締め出しても、もどってくる)
+//     {"op":"confirm"}    いまのファイアウォールでよい (もどすのをやめる)
 //     {"op":"src"}        /usr/src/aios を作る (root:wheel、2775。中身は aios src が wheel の人として git clone)
 //     {"op":"kernel","action":"install","path":"/usr/src/aios/target/Image"}
 //                         新しいカーネルを /boot/Image.new に置き、試す entry (aios-new+1.conf) を作る
@@ -60,6 +63,11 @@ fn main() {
     let _ = std::fs::set_permissions(SOCK, std::os::unix::fs::PermissionsExt::from_mode(0o666));
     println!("aiosd: listening on {}", SOCK);
     boot_check();
+    // confirm を待っているあいだに電源が切れた (起動の nftables.service は新しい決まりを入れた): 前のものにもどす
+    if std::path::Path::new(config::FW_PENDING).exists() {
+        fw_revert("not confirmed before the reboot");
+    }
+    config::fw_boot_sync();
     for c in l.incoming().flatten() {
         std::thread::spawn(move || serve(c));
     }
@@ -178,10 +186,36 @@ fn handle(req: &Value, uid: u32, pid: i32) -> Value {
                 return deny(uid, pid, req);
             }
             let _busy = BUSY.lock();
+            let confirm = req["confirm"].as_u64();
+            if confirm.is_some_and(|c| !(10..=3600).contains(&c)) {
+                return fail("apply: confirm is seconds from 10 to 3600");
+            }
+            // もどす先は、いちばん新しい記録 (いま入っているはずのもの) の firewall
+            let before = config::history().last().and_then(|&n| config::read_history(n)).map(|r| r["config"]["firewall"].clone());
             let r = if op == "apply" { apply() } else { rollback() };
-            let r = match r {
-                Ok((cfg, rollback_of)) => apply_cfg(&cfg, uid, rollback_of),
+            let mut r = match r {
+                Ok((cfg, rollback_of)) => apply_cfg(&cfg, uid, rollback_of, confirm),
                 Err(e) => fail(e),
+            };
+            // ファイアウォールを入れなおして confirm を待つなら、時計をかける
+            if let Some(secs) = r["confirm"].as_u64() {
+                fw_wait(r["n"].as_u64().unwrap_or(0), secs, before.unwrap_or(Value::Null));
+                r["revert_in_s"] = json!(secs);
+            }
+            record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
+            return r;
+        }
+        "confirm" => {
+            if !allowed(uid) {
+                return deny(uid, pid, req);
+            }
+            let r = match std::fs::read_to_string(config::FW_PENDING).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+                Some(p) => {
+                    let _ = std::fs::remove_file(config::FW_PENDING);
+                    println!("aiosd: firewall of record {} confirmed", p["n"]);
+                    json!({ "ok": true, "status": 0, "confirmed": p["n"] })
+                }
+                None => fail("confirm: nothing is waiting (no firewall apply with confirm)"),
             };
             record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
             return r;
@@ -199,7 +233,7 @@ fn handle(req: &Value, uid: u32, pid: i32) -> Value {
             record(uid, pid, req, if r["ok"] == true { 0 } else { 1 });
             return r;
         }
-        _ => return fail(format!("unknown op {:?} (ping service pkg power apply rollback src kernel)", op)),
+        _ => return fail(format!("unknown op {:?} (ping service pkg power apply rollback confirm src kernel)", op)),
     };
     if !allowed(uid) {
         return deny(uid, pid, req);
@@ -259,12 +293,23 @@ fn rollback() -> Result<(Value, Option<u64>), String> {
     Ok((cfg, Some(last)))
 }
 
-/// cfg にそろえて、記録を残す
-fn apply_cfg(cfg: &Value, uid: u32, rollback_of: Option<u64>) -> Value {
-    let steps = match config::plan(cfg) {
+/// cfg にそろえて、記録を残す。confirm (秒) は aios.json の firewall.confirm より先
+fn apply_cfg(cfg: &Value, uid: u32, rollback_of: Option<u64>, confirm: Option<u64>) -> Value {
+    let mut steps = match config::plan(cfg) {
         Ok(s) => s,
         Err(e) => return fail(e),
     };
+    let mut wait = None;
+    for st in steps.iter_mut() {
+        if let config::Act::Firewall(_, c) = &mut st.act {
+            if let Some(x) = confirm {
+                *c = x;
+            }
+            if *c > 0 {
+                wait = Some(*c);
+            }
+        }
+    }
     let mut done = Vec::new();
     let mut installed: Vec<String> = Vec::new();
     let mut all_ok = true;
@@ -285,7 +330,67 @@ fn apply_cfg(cfg: &Value, uid: u32, rollback_of: Option<u64>) -> Value {
     }
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let n = config::write_history(&json!({ "t": t, "uid": uid, "config": cfg, "steps": done, "installed": installed, "rollback_of": rollback_of }));
-    json!({ "ok": all_ok, "n": n, "steps": done })
+    let fw_ok = done.iter().any(|d| d["what"] == "firewall" && d["ok"] == true);
+    let mut r = json!({ "ok": all_ok, "n": n, "steps": done });
+    if let (Some(c), true) = (wait, fw_ok) {
+        r["confirm"] = json!(c);
+    }
+    r
+}
+
+// ---- ファイアウォールの confirm (Linux にはない: iptables-apply や netplan try にあたるものを、apply そのものに) ----
+
+/// confirm を待つ: 記録 (/var/lib/aios/firewall-pending.json) を残して、secs 秒たっても残っていれば、もどす
+fn fw_wait(n: u64, secs: u64, prev: Value) {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let p = json!({ "n": n, "deadline": t + secs, "confirm": secs, "prev": prev });
+    let _ = std::fs::write(config::FW_PENDING, p.to_string() + "\n");
+    println!("aiosd: firewall of record {} loaded; reverted in {} s unless confirmed (aios confirm)", n, secs);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let _busy = BUSY.lock();
+        let still = std::fs::read_to_string(config::FW_PENDING).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        if still.is_some_and(|p| p["n"].as_u64() == Some(n)) {
+            fw_revert(&format!("not confirmed in {} s", secs));
+        }
+    });
+}
+
+/// 前の決まりにもどす: nft -f で入れる前の決まりを入れなおし、/etc/nftables.conf と /etc/aios.json の firewall も前のものに。
+/// 記録 (history) にも残す
+fn fw_revert(why: &str) {
+    let Some(p) = std::fs::read_to_string(config::FW_PENDING).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+    let _ = std::fs::remove_file(config::FW_PENDING);
+    let nft = config::nft().unwrap_or("nft");
+    let o = Command::new(nft).args(["-f", config::FW_PREV]).env("PATH", PATH).stdin(std::process::Stdio::null()).output();
+    let (ok, out) = match o {
+        Ok(o) => (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+        Err(e) => (false, format!("{}: {}", nft, e)),
+    };
+    match std::fs::read_to_string(config::FW_PREV_CONF) {
+        Ok(t) => {
+            let _ = std::fs::write(config::NFT_CONF, &t);
+            config::fw_record(&t);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(config::NFT_CONF);
+            let _ = std::fs::remove_file(config::FW_STATE);
+        }
+    }
+    let mut cfg = config::load(config::PATH).unwrap_or_else(|_| json!({}));
+    if let Some(m) = cfg.as_object_mut() {
+        if p["prev"].is_null() {
+            m.remove("firewall");
+        } else {
+            m.insert("firewall".into(), p["prev"].clone());
+        }
+    }
+    let _ = std::fs::write(config::PATH, serde_json::to_string_pretty(&cfg).unwrap_or_default() + "\n");
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let step = json!({ "what": "firewall", "from": format!("record {}", p["n"]), "to": "the rules before it", "do": format!("revert: {}", why), "ok": ok, "out": out });
+    let n = config::write_history(&json!({ "t": t, "uid": 0, "config": cfg, "steps": [step], "installed": [], "revert_of": p["n"] }));
+    println!("aiosd: firewall of record {} reverted ({}); record {}", p["n"], why, n);
+    record(0, 0, &json!({ "op": "revert", "of": p["n"], "why": why }), if ok { 0 } else { 1 });
 }
 
 // ---- 改造 (段階 4) ----

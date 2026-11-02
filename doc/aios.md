@@ -32,7 +32,7 @@
 | `proc` | プロセス (pid ppid 状態 スレッド CPU 秒 メモリ コマンド) |
 | `service` | ユニット (動いているか、enable か、説明) |
 | `pkg` | 入っているパッケージと版、リポジトリ |
-| `net` | インターフェイスとアドレス、経路、DNS |
+| `net` | インターフェイスとアドレス、経路、DNS、`firewall` (nftables のいまの様子: 基の鎖、決まりの数、落としたもの、conntrack、aios の外で変わったか、confirm を待っているか) |
 | `user` | ユーザー (uid、ホーム、シェル) |
 | `boot` | ESP のカーネルとローダーのエントリ、`new` (試している新しいカーネルの entry、`aios-new+1.conf` など)、`try` (その残りの回数)、`prev` (`/boot/Image.prev` があるか)、`last` (最後の起動の結果と、新しいカーネルで起動しなかったわけ `why`) |
 | `log` | `aiosd` (`/var/log/aiosd.log` の新しい 20 件)、`apply` (`aios apply` / `rollback` の記録の一覧: 番号、時刻、うまくいったか) |
@@ -65,6 +65,8 @@ aios diff                               # いまとのちがいと、そろえ�
 aios apply                              # そろえる (aiosd に頼む)。記録は /var/lib/aios/history/N.json
 aios history [N]                        # apply の記録
 aios rollback                           # ひとつ前の apply の設定に戻す
+aios apply --confirm 60                 # ファイアウォールを変えるなら、60 秒のうちに confirm がなければ前の決まりにもどす
+aios confirm                            # いまのファイアウォールでよい (もどすのをやめる)
 ```
 
 - `host.name`: /etc/hostname とカーネル (sethostname)
@@ -77,6 +79,23 @@ aios rollback                           # ひとつ前の apply の設定に戻�
   aios が書いたもので、もう書いていないインターフェースのものは消す
 - `sysctl`: カーネルの値 (`/proc/sys`)。`/etc/sysctl.d/aios.conf` に書き (起動のときに init が入れる)、
   いまの値がちがうものは今 `/proc/sys` に書く
+- `firewall`: nft の決まり (`"rules"`: 文字か行の並び。nft -f の書きかたそのまま: 「ファイアウォール (nftables)」) と
+  `"confirm"` (秒、10 から 3600。なくてもよい)。apply は nft のパッケージ (nftables) がなければ入れ、`nft -c -f` で
+  たしかめてから (まちがいがあれば何も変えずにしくじる) `/etc/nftables.conf` に書いて (はじめに `flush ruleset`)
+  `nft -f` で入れ、起動のたびに入るよう nftables.service (パッケージのもの。Before=sysinit.target なので sshd などが
+  外とつなぐ前) を enable する。aios が入れたときの生成番号とファイルのしるしを `/var/lib/aios/firewall.json` に
+  残し、そのあとに nft で変えたもの (生成番号がちがう) も diff に出て、apply で aios.json のものにもどる
+  (起動しなおしたときは、ファイルが同じならそろっているとみる)。`aios config` は aios が書いた決まりを書き出す。
+  `aios get net.firewall` に、いまの様子 (基の鎖、決まりの数、落とした数と新しいもの、conntrack の数、aios の外で
+  変わったか、confirm を待っているか)
+- **戻せる apply** (Linux にはない: iptables-apply や netplan try にあたるものを apply そのものに): `confirm` の秒
+  (aios.json の `firewall.confirm` か `aios apply --confirm N`) があれば、入れたあとその秒のうちに `aios confirm`
+  (aish の do の op confirm) がなければ、aiosd が入れる前の決まり (`nft list ruleset` でとっておいたもの) と
+  `/etc/nftables.conf`、`/etc/aios.json` の firewall を前のものにもどし、記録に「firewall of N reverted (not
+  confirmed)」を残す。confirm を待っているあいだに電源が切れても、次の起動で aiosd がもどす
+  (`/var/lib/aios/firewall-pending.json`)。AI が ssh ごしに決まりを変えて自分を締め出しても、その秒のあとにはまた
+  つながる (VM で確かめた: 外を締め出す決まりで hostfwd のつなぎが時間切れになり、20 秒後にもどった)。まちがいの
+  ないものは `nft -c` で止まるので、confirm が守るのは「書きかたは正しいが、つながりを切ってしまう」決まり
 
 ```json
 {
@@ -86,7 +105,22 @@ aios rollback                           # ひとつ前の apply の設定に戻�
   "kernel":  { "modules": ["virtio_gpu", "virtio_input", "virtio_snd"] },
   "user":    { "ai": { "shell": "/bin/aish", "groups": ["wheel"] } },
   "net":     { "eth0": { "address": "10.0.2.15/24", "gateway": "10.0.2.2", "dns": ["1.1.1.1"] } },
-  "sysctl":  { "vm.min_free_kbytes": 8192, "fs.inotify.max_user_watches": 65536 }
+  "sysctl":  { "vm.min_free_kbytes": 8192, "fs.inotify.max_user_watches": 65536 },
+  "firewall": {
+    "rules": [
+      "table inet filter {",
+      "  chain input {",
+      "    type filter hook input priority filter; policy drop;",
+      "    ct state established,related accept",
+      "    ct state invalid drop",
+      "    iif \"lo\" accept",
+      "    tcp dport 22 accept",
+      "    icmp type echo-request accept",
+      "  }",
+      "}"
+    ],
+    "confirm": 60
+  }
 }
 ```
 

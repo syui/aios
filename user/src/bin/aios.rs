@@ -9,6 +9,8 @@
 //                                reboot / poweroff / ping
 //   aios diff                  /etc/aios.json (望む状態) といまのちがいと、そろえる手順 (読むだけ)
 //   aios apply                 /etc/aios.json のとおりにそろえる (aiosd に頼む)
+//   aios apply --confirm N     ファイアウォールを変えるなら、N 秒のうちに aios confirm がなければ前の決まりにもどす
+//   aios confirm               いまのファイアウォールでよい (もどすのをやめる)
 //   aios rollback              ひとつ前の apply の設定に戻す (aiosd に頼む)
 //   aios history [N]           apply の記録
 //   aios config                いまの状態を aios.json の形で (はじめて作るとき: aios config | sudo tee /etc/aios.json)
@@ -72,7 +74,17 @@ fn main() {
         Some("top") => top(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10)),
         Some("do") => do_(&args[1..]),
         Some("diff") => diff(),
-        Some("apply") => send(serde_json::json!({ "op": "apply" }), args.iter().any(|a| a == "--json")),
+        Some("apply") => {
+            let mut req = serde_json::json!({ "op": "apply" });
+            if let Some(i) = args.iter().position(|a| a == "--confirm") {
+                match args.get(i + 1).and_then(|n| n.parse::<u64>().ok()) {
+                    Some(n) => req["confirm"] = serde_json::json!(n),
+                    None => usage(2),
+                }
+            }
+            send(req, args.iter().any(|a| a == "--json"))
+        }
+        Some("confirm") => send(serde_json::json!({ "op": "confirm" }), args.iter().any(|a| a == "--json")),
         Some("rollback") => send(serde_json::json!({ "op": "rollback" }), args.iter().any(|a| a == "--json")),
         Some("history") => history(args.get(1)),
         Some("src") => src(),
@@ -97,7 +109,7 @@ fn usage(code: i32) -> ! {
     eprintln!("       aios do service start|stop|restart|enable|disable NAME");
     eprintln!("       aios do pkg install|remove NAME... | pkg upgrade | pkg refresh");
     eprintln!("       aios do reboot | poweroff | ping   (aiosd に頼む。root と wheel の人だけ)");
-    eprintln!("       aios diff | apply | rollback | history [N] | config   (/etc/aios.json)");
+    eprintln!("       aios diff | apply [--confirm N] | confirm | rollback | history [N] | config   (/etc/aios.json)");
     eprintln!("       aios src | build kernel | install kernel [IMAGE] | install kernel --revert   (改造)");
     eprintln!("       aios build pkg NAME|DIR [-o DIR] | install pkg FILE...   (パッケージ)");
     eprintln!("       aios tune NAME=V1,V2,... [-n N] [--apply] [--json] -- CMD...   (sysctl の値をくらべる。root)");
@@ -221,6 +233,8 @@ fn send(req: serde_json::Value, as_json: bool) {
         println!("{}", line.trim_end());
     } else if let Some(e) = r["err"].as_str() {
         eprintln!("aios: {}", e);
+    } else if let Some(n) = r.get("confirmed") {
+        println!("aios: firewall of record {} confirmed (it stays)", n);
     } else {
         let steps = r["steps"].as_array().cloned().unwrap_or_default();
         if steps.is_empty() {
@@ -228,6 +242,9 @@ fn send(req: serde_json::Value, as_json: bool) {
         }
         show_steps(&steps);
         println!("(record {}: aios history {})", r["n"], r["n"]);
+        if let Some(s) = r["revert_in_s"].as_u64() {
+            println!("aios: the new firewall is reverted in {} s unless you run: aios confirm", s);
+        }
     }
     std::process::exit(if r["ok"] == true { 0 } else { 1 });
 }
@@ -351,9 +368,10 @@ fn history(n: Option<&String>) {
         let Some(r) = config::read_history(n) else { continue };
         let steps = r["steps"].as_array().map_or(0, |a| a.len());
         let bad = r["steps"].as_array().map_or(0, |a| a.iter().filter(|s| s["ok"] == false).count());
-        let what = match r["rollback_of"].as_u64() {
-            Some(l) => format!("rollback of {}", l),
-            None => "apply".into(),
+        let what = match (r["rollback_of"].as_u64(), r["revert_of"].as_u64()) {
+            (Some(l), _) => format!("rollback of {}", l),
+            (_, Some(l)) => format!("firewall of {} reverted (not confirmed)", l),
+            _ => "apply".into(),
         };
         println!("{:>4}  t={}  uid={}  {}  {} steps{}", n, r["t"], r["uid"], what, steps, if bad > 0 { format!(", {} failed", bad) } else { String::new() });
     }

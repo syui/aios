@@ -40,7 +40,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const GET: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"点でつなぐ: host kernel mem disk proc service pkg net user boot log の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"}}}"#;
-const DO: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"service / pkg / power / apply (/etc/aios.json のとおりにそろえる) / rollback (ひとつ前の apply に戻す) / ping"},"action":{"type":"string","description":"service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"},"name":{"type":"string","description":"service の名前 (sshd など)"},"names":{"type":"array","items":{"type":"string"},"description":"pkg install / remove のパッケージ"}},"required":["op"]}"#;
+const DO: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"service / pkg / power / apply (/etc/aios.json のとおりにそろえる) / rollback (ひとつ前の apply に戻す) / confirm (confirm つきで入れたファイアウォールでよいとする: しなければ前の決まりにもどる) / ping"},"confirm":{"type":"integer","description":"apply のとき: ファイアウォール (aios.json の firewall) を変えるなら、この秒 (10 から 3600) のうちに op confirm がなければ前の決まりにもどす。ssh ごしに決まりを変えるときは、つけて、つながりを確かめてから confirm"},"action":{"type":"string","description":"service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"},"name":{"type":"string","description":"service の名前 (sshd など)"},"names":{"type":"array","items":{"type":"string"},"description":"pkg install / remove のパッケージ"}},"required":["op"]}"#;
 const DIFF: &str = r#"{"type":"object","properties":{}}"#;
 const TUNE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"sysctl の名前 (kernel.sched_timeslice_ms など。aios get kernel.sysctl で一覧)"},"values":{"type":"array","items":{"type":"string"},"description":"くらべる値"},"cmd":{"type":"string","description":"測る仕事 (sh -c)。値ごとに n 回動かす"},"n":{"type":"integer","description":"値ごとに動かす回数 (既定 3)"},"apply":{"type":"boolean","description":"いちばん速かった値を /etc/aios.json の sysctl に書いて aios apply する"}},"required":["name","values","cmd"]}"#;
 const NONE: &str = r#"{"type":"object","properties":{}}"#;
@@ -67,7 +67,7 @@ fn main() {
         keys: &[("M-s", "sys")],
         tools: &[
             Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。host kernel mem disk proc service pkg net user boot log。path で一部だけ", input: GET },
-            Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
+            Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)、confirm (confirm つきの apply で入れたファイアウォールを残す)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
             Tool { name: "diff", desc: "/etc/aios.json (望む状態) といまのちがいと、そろえる手順 (aios diff。動かさない)。そろえるのは do の apply", input: DIFF },
             Tool { name: "tune", desc: "sysctl の値を順に変えて cmd を n 回ずつ動かし、かかった時間のまんなか (ms) でくらべる (aios tune。root で。終わったら元の値に戻す)。apply でいちばん速かった値を /etc/aios.json に書いて apply。50 秒をこえそうなら run の bg で sudo aios tune NAME=V1,V2 -- CMD", input: TUNE },
             Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", input: NONE },

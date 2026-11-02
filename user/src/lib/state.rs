@@ -348,7 +348,41 @@ fn net() -> Value {
         .lines()
         .filter_map(|l| l.strip_prefix("nameserver").map(|s| json!(s.trim())))
         .collect();
-    json!({ "interfaces": ifs, "routes": routes, "dns": dns })
+    json!({ "interfaces": ifs, "routes": routes, "dns": dns, "firewall": firewall() })
+}
+
+/// net.firewall: nftables のいまの様子 (/proc/ai/fw のまとめ: root と wheel の人だけ読める)、aios が入れた決まり
+/// (/etc/nftables.conf と、そのあとにだれかが変えたか)、confirm を待っているもの
+fn firewall() -> Value {
+    let mut f = json!({ "file": crate::config::NFT_CONF, "file_exists": std::path::Path::new(crate::config::NFT_CONF).exists() });
+    let rec: Value = read(crate::config::FW_STATE).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    match read("/proc/ai/fw") {
+        Some(t) => {
+            let lines: Vec<Value> = t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            if let Some(h) = lines.first() {
+                for k in ["active", "conntrack", "tables", "rules", "generation"] {
+                    f[k] = h[k].clone();
+                }
+                f["changed_outside_aios"] = json!(rec["generation"].as_u64().is_some_and(|g| h["generation"].as_u64() != Some(g)));
+            }
+            let chains: Vec<Value> = lines.iter().filter(|l| l.get("hook").is_some() && l.get("chain").is_some()).map(|c| json!({ "chain": c["chain"], "hook": c["hook"], "priority": c["priority"], "policy": c["policy"], "seen": c["seen"], "to_policy": c["to_policy"] })).collect();
+            f["base_chains"] = json!(chains);
+            if let Some(d) = lines.iter().find(|l| l.get("drops").is_some()) {
+                f["drops"] = d["drops"].clone();
+            }
+            let recent: Vec<Value> = lines.iter().filter(|l| l.get("ago_ms").is_some() && l.get("hook").is_some()).take(5).cloned().collect();
+            f["recent_drops"] = json!(recent);
+            if let Some(c) = lines.iter().find_map(|l| l.get("conntrack").filter(|c| c.is_object())) {
+                f["conntrack_entries"] = c.clone();
+            }
+        }
+        None => f["error"] = json!("/proc/ai/fw: not readable (root or wheel), or not the aios kernel"),
+    }
+    if let Some(p) = read(crate::config::FW_PENDING).and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        f["pending_confirm"] = json!({ "record": p["n"], "revert_in_s": p["deadline"].as_u64().unwrap_or(0).saturating_sub(t) });
+    }
+    f
 }
 
 // ---- user ----
