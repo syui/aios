@@ -13,7 +13,8 @@
 
 ## 段階
 
-1. **把握 (get)** ✅: `aios get [PATH]` で状態の木を読む。読むだけなので aiosd なしで、呼んだプロセスの中で集める
+1. **把握 (get)** ✅: `aios get [PATH]` で状態の木を読む。読むだけなので aiosd なしで、呼んだプロセスの中で集める。
+   `aios health` (と aish-sys の `health`) は、そこから「どこがおかしいか」の見たて: AI がまず見るところ
 2. **操作 (do)** ✅: aiosd (root で動くサービス) が `/run/aiosd.sock` で受ける。だれが呼んだかは SO_PEERCRED で見る
    (読むのはだれでも、変えるのは root と wheel)。したことは `/var/log/aiosd.log` に残す
 3. **設定 (apply)** ✅: `/etc/aios.json` (望む状態) と状態の木をくらべて (`aios diff`)、ちがうところだけ直す (`aios apply`)。
@@ -25,6 +26,7 @@
 
 | PATH | 中身 |
 |---|---|
+| `health` | いまの見たて (`aios health` が短い形で出し、終わりの番号は ok と info が 0、warn が 1、crit が 2)。`status` (いちばん悪いもの)、`summary`、`checks` (1 つずつ name、status: ok / info / warn / crit、what、warn からは hint: 次に使う道具): `service` (しくじったユニット: crit)、`disk` (9 割で warn、98% で crit)、`mem` (使えるものが 1 割を切る・3% を切る、スワップが半分をこえる)、`bkl` (大きなロックなしでさわったところ: カーネルのまちがいなので crit)、`heap` (カーネルのヒープ、取りそこね、oom で殺した数)、`oom` (kmsg の oom: killed)、`hung` (ディスクを待つ (ps の D) スレッドが 60 秒より長い)、`boot` (試している新しいカーネル)、`firewall` (aios confirm 待ち、aios の外で変えた決まり)、`apply` (いちばん新しい apply がしくじった)、`pkg` (`ap -Qu`: 同期データベースに新しい版があるもの。ネットは見ない。同期したことがなければ info)。/proc/ai が読めない (root と wheel でない) ものは見ずに、そう書く |
 | `host` | 名前、OS (/etc/os-release の NAME と VARIANT と base の版: `aios (aikernel) 0.0.1.r…`。VARIANT の aikernel は、カーネルから作った aios を Arch Linux から作った aios と見分ける) |
 | `kernel` | 版、コマンドライン、起きてからの秒、CPU の数、モジュール、BKL (`/proc/bkl`)、メッセージの終わり (`/proc/kmsg`)、`sysctl` (`/proc/sys`) |
 | `mem` | メモリとスワップ (KiB) |

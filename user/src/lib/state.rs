@@ -3,8 +3,8 @@
 use serde_json::{Map, Value, json};
 use std::fs;
 
-/// 木の一番上の名前 (この順に出す)
-pub const ROOTS: [&str; 11] = ["host", "kernel", "mem", "disk", "proc", "service", "pkg", "net", "user", "boot", "log"];
+/// 木の一番上の名前 (この順に出す)。health はほかの根から見たて (いちばん上: まずここを見る)
+pub const ROOTS: [&str; 12] = ["health", "host", "kernel", "mem", "disk", "proc", "service", "pkg", "net", "user", "boot", "log"];
 
 fn read(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
@@ -13,6 +13,7 @@ fn read(path: &str) -> Option<String> {
 /// root の名前の部分だけ集める (aios get kernel なら kernel だけ見る)
 pub fn collect(root: &str) -> Option<Value> {
     Some(match root {
+        "health" => health(),
         "host" => host(),
         "kernel" => kernel(),
         "mem" => mem(),
@@ -500,4 +501,171 @@ fn log() -> Value {
     hist.sort_by_key(|h| h.0);
     let apply: Vec<Value> = hist.into_iter().rev().take(LOG_TAIL).rev().map(|h| h.1).collect();
     json!({ "aiosd": aiosd, "apply": apply })
+}
+
+// ---- health ----
+//
+// いまの見たて (aios get health): ほかの根と /proc/ai から「どこがおかしいか」を集め、1 つずつ status (ok / info / warn /
+// crit)、what (何が)、hint (次に使う道具: aios get、aish のツール、コマンド) を出す。いちばん悪いものが全体の status。
+// AI がまず見るところ。読めないもの (/proc/ai は root と wheel) は見ずに、そう書く。ネットは見ない (ap -Qu は
+// いちばん新しい ap -Sy の同期データベースとくらべる)
+
+/// 1 つの見たて
+fn check(name: &str, status: &str, what: String, hint: &str) -> Value {
+    let mut c = json!({ "name": name, "status": status, "what": what });
+    if !hint.is_empty() && status != "ok" {
+        c["hint"] = json!(hint);
+    }
+    c
+}
+
+fn rank(s: &str) -> u8 {
+    match s {
+        "crit" => 3,
+        "warn" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+/// KiB を読みやすく
+fn kib(k: u64) -> String {
+    if k >= 1 << 20 { format!("{:.1} GiB", k as f64 / (1u64 << 20) as f64) } else { format!("{} MiB", k >> 10) }
+}
+
+fn health() -> Value {
+    let mut cs: Vec<Value> = Vec::new();
+
+    // サービス: しくじったもの
+    let svc = services();
+    let failed: Vec<String> = svc.as_array().into_iter().flatten().filter(|s| s["active"] == "failed").filter_map(|s| s["name"].as_str().map(String::from)).collect();
+    cs.push(if failed.is_empty() {
+        check("service", "ok", format!("{} units, none failed", svc.as_array().map_or(0, |a| a.len())), "")
+    } else {
+        check("service", "crit", format!("failed: {}", failed.join(" ")), "systemctl status NAME; journalctl -u NAME (aish: log)")
+    });
+
+    // ディスク: 9 割で warn、98% で crit
+    let mut full: Vec<(String, u64, u64)> = Vec::new();
+    for d in disk().as_array().into_iter().flatten() {
+        let (used, total) = (d["used_kib"].as_u64().unwrap_or(0), d["total_kib"].as_u64().unwrap_or(0));
+        if total > 0 && used * 100 >= total * 90 {
+            full.push((d["mount"].as_str().unwrap_or("?").to_string(), used * 100 / total, total - used));
+        }
+    }
+    let worst = full.iter().map(|f| f.1).max().unwrap_or(0);
+    cs.push(if full.is_empty() {
+        check("disk", "ok", "every mount under 90%".into(), "")
+    } else {
+        let what = full.iter().map(|(m, p, left)| format!("{} {}% ({} left)", m, p, kib(*left))).collect::<Vec<_>>().join(", ");
+        check("disk", if worst >= 98 { "crit" } else { "warn" }, what, "aios get disk; du -sh /var/cache/* ~/.cache/*; ap -Sc")
+    });
+
+    // メモリ: 使えるものが 1 割を切ったら warn、3% で crit。スワップが半分をこえたら warn
+    let m = meminfo();
+    let g = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let (total, avail) = (g("MemTotal"), if m.contains_key("MemAvailable") { g("MemAvailable") } else { g("MemFree") });
+    let (st, sf) = (g("SwapTotal"), g("SwapFree"));
+    let pct = (avail * 100).checked_div(total).unwrap_or(100);
+    let mut ms = if pct < 3 { "crit" } else if pct < 10 { "warn" } else { "ok" };
+    let mut what = format!("{} of {} available ({}%)", kib(avail), kib(total), pct);
+    if st > 0 && (st - sf) * 2 > st {
+        ms = if rank(ms) < 2 { "warn" } else { ms };
+        what.push_str(&format!(", swap {} of {} used", kib(st - sf), kib(st)));
+    }
+    cs.push(check("mem", ms, what, "aios get proc (rss_kib); aish: mem"));
+
+    // カーネル (aios のものだけ): BKL の取りわすれ、ヒープ、oom
+    if let Some(b) = read("/proc/bkl") {
+        let unlocked: Vec<&str> = b.lines().filter(|l| l.starts_with("unlocked ")).collect();
+        cs.push(if unlocked.is_empty() {
+            check("bkl", "ok", "nothing touched without the big lock".into(), "")
+        } else {
+            check("bkl", "crit", format!("touched without the big lock: {}", unlocked.iter().map(|l| l.trim_start_matches("unlocked ")).collect::<Vec<_>>().join(", ")), "a kernel bug: the FILE:LINE in kernel/src; cat /proc/bkl; aish: bkl")
+        });
+        match read("/proc/ai/heap").and_then(|t| serde_json::from_str::<Value>(t.lines().next()?).ok()) {
+            Some(h) => {
+                let n = |k: &str| h[k].as_u64().unwrap_or(0);
+                let (fails, kills, emerg) = (n("fails"), n("oom_kills"), n("emergencies"));
+                let st = if kills > 0 || emerg > 0 { "warn" } else if fails > 0 { "info" } else { "ok" };
+                cs.push(check("heap", st, format!("kernel heap {} used of {} (peak {}), {} failed allocations, {} oom kills, {} emergencies", kib(n("used") / 1024), kib(n("size") / 1024), kib(n("peak") / 1024), fails, kills, emerg), "cat /proc/ai/heap; dmesg | grep oom; aish: mem"));
+            }
+            None => cs.push(check("heap", "info", "/proc/ai/heap: not readable (root or wheel)".into(), "sudo aios get health")),
+        }
+        // oom で殺したもの (kmsg の終わり)
+        let kills: Vec<String> = read("/proc/kmsg").unwrap_or_default().lines().filter(|l| l.contains("oom: killed")).map(|l| l.trim().to_string()).collect();
+        if let Some(last) = kills.last() {
+            cs.push(check("oom", "warn", format!("{} oom kill(s) in the kernel log, last: {}", kills.len(), last), "dmesg | grep oom; aios get proc"));
+        }
+        // 長く眠ったままのスレッド: ディスクを待つもの (ps の D) が 60 秒より長い (Linux の hung task は 120 秒)
+        let d: Vec<u64> = procs().as_array().into_iter().flatten().filter(|p| p["state"] == "D").filter_map(|p| p["pid"].as_u64()).collect();
+        if !d.is_empty() {
+            let stuck: Vec<String> = read("/proc/ai/threads")
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|t| t["pid"].as_u64().is_some_and(|p| d.contains(&p)) && t["slept_s"].as_f64().is_some_and(|s| s > 60.0))
+                .map(|t| format!("{} ({}) {}s in {}", t["tid"], t["name"].as_str().unwrap_or("?"), t["slept_s"].as_f64().unwrap_or(0.0) as u64, t["sys"].as_str().unwrap_or("?")))
+                .collect();
+            cs.push(if stuck.is_empty() {
+                check("hung", "ok", format!("{} in disk wait, none longer than 60 s", d.len()), "")
+            } else {
+                check("hung", "warn", format!("waiting on the disk for long: {}", stuck.join(", ")), "aish: hang, stack TID, threads")
+            });
+        } else {
+            cs.push(check("hung", "ok", "nothing waiting on the disk".into(), ""));
+        }
+    }
+
+    // 起動: 試している新しいカーネル
+    match boot_new_entry() {
+        Some((e, tries)) => cs.push(check("boot", "info", format!("trying a new kernel ({}{}); aiosd keeps it once it boots", e, tries.map_or(String::new(), |t| format!(", {} tries left", t.0))), "aios get boot")),
+        None => cs.push(check("boot", "ok", "no kernel on trial".into(), "")),
+    }
+
+    // ファイアウォール: 確かめ待ち (aios confirm しなければ戻る)、aios の外で変えたもの
+    let fw = firewall();
+    if let Some(p) = fw.get("pending_confirm") {
+        cs.push(check("firewall", "warn", format!("apply {} waits for aios confirm; reverts in {} s", p["record"], p["revert_in_s"]), "aios confirm (or let it revert); aios get net.firewall"));
+    } else if fw["changed_outside_aios"] == true {
+        cs.push(check("firewall", "info", "the ruleset was changed outside aios apply".into(), "aios diff; aios config (to keep it) or aios apply (to restore)"));
+    } else {
+        cs.push(check("firewall", "ok", format!("{} rules", fw["rules"].as_u64().unwrap_or(0)), ""));
+    }
+
+    // apply: いちばん新しい記録がしくじった
+    let lg = log();
+    if let Some(last) = lg["apply"].as_array().and_then(|a| a.last()) {
+        cs.push(if last["ok"] == true {
+            check("apply", "ok", format!("last apply {} ok", last["n"]), "")
+        } else {
+            check("apply", "warn", format!("last apply {} failed", last["n"]), "aios get log.apply; aios history; aios rollback")
+        });
+    }
+
+    // パッケージ: 同期データベースより古いもの (ap -Qu。ネットは見ない)
+    if let Ok(o) = std::process::Command::new("ap").arg("-Qu").stderr(std::process::Stdio::null()).output() {
+        let lines: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
+        let synced = fs::read_dir("/var/lib/aipkg/sync")
+            .ok()
+            .and_then(|d| d.flatten().filter_map(|e| e.metadata().ok()?.modified().ok()).max())
+            .and_then(|t| t.elapsed().ok());
+        let age = synced.map_or(String::from("never synced"), |a| format!("synced {} h ago", a.as_secs() / 3600));
+        cs.push(if synced.is_none() {
+            // 同期データベースがなければ、新しい版があるかはわからない
+            check("pkg", "info", "the repository was never synced: cannot tell what is new".into(), "sudo ap -Sy; then aios health")
+        } else if lines.is_empty() {
+            check("pkg", "ok", format!("up to date ({})", age), "")
+        } else {
+            check("pkg", "info", format!("{} can be upgraded ({}): {}", lines.len(), age, lines.iter().take(8).cloned().collect::<Vec<_>>().join(", ")), "sudo ap -Syu")
+        });
+    }
+
+    let worst = cs.iter().map(|c| c["status"].as_str().unwrap_or("ok")).max_by_key(|s| rank(s)).unwrap_or("ok").to_string();
+    let bad: Vec<String> = cs.iter().filter(|c| rank(c["status"].as_str().unwrap_or("ok")) >= 2).map(|c| format!("{}: {}", c["name"].as_str().unwrap_or(""), c["what"].as_str().unwrap_or(""))).collect();
+    json!({
+        "status": worst,
+        "summary": if bad.is_empty() { "nothing needs attention".to_string() } else { bad.join("; ") },
+        "checks": cs,
+    })
 }

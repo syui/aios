@@ -8,6 +8,7 @@
 //   aipkg -R pkg...     外す
 //   aipkg -Q / -Qi / -Ql [pkg]  入っているもの / 情報 / ファイル一覧
 //   aipkg -Qo FILE...          そのファイルのパッケージ (/ のない名前は PATH から)
+//   aipkg -Qu [NAME...]        入っているもののうち、同期データベース (ap -Sy) に新しい版があるもの (名前 版 -> 新しい版)
 //   -S --needed で、同じ版が入っているものは飛ばす
 //
 // 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)。
@@ -1088,6 +1089,26 @@ fn main() {
         }
     } else if flags.contains(&'R') {
         remove(&targets);
+    } else if flags.contains(&'Q') && flags.contains(&'u') {
+        // -Qu: 入っているもののうち、同期データベース (いちばん新しい ap -Sy のとき) により新しい版があるもの
+        // (pacman と同じ「名前 いまの版 -> 新しい版」。なければ終わりの番号 1)
+        let repos = read_conf();
+        let sync = sync_all(&repos);
+        let mut n = 0;
+        for (name, (d, _)) in installed() {
+            if !targets.is_empty() && !targets.contains(&name) {
+                continue;
+            }
+            let have = get(&d, "VERSION").to_string();
+            if let Some((_, nd)) = sync.get(&name) {
+                let want = get(nd, "VERSION");
+                if vercmp(want, &have) == std::cmp::Ordering::Greater {
+                    println!("{} {} -> {}", name, have, want);
+                    n += 1;
+                }
+            }
+        }
+        exit(if n == 0 { 1 } else { 0 });
     } else if flags.contains(&'Q') && flags.contains(&'o') {
         // -Qo FILE: どのパッケージのファイルか (pacman と同じ。/ のない名前は PATH から)
         let db = installed();

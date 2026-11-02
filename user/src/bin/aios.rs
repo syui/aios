@@ -1,7 +1,9 @@
 // aios: aios を把握・設定・操作するコマンド (doc/aios.md)
 //   aios                       様子をロゴといっしょに出す (neofetch のようなもの)。あとに /etc/motd も。
 //                              起動のときは motd.service が動かす
-//   aios get [PATH] [--json]   状態の木 (host kernel mem disk proc service pkg net user boot log)。
+//   aios health [--json]       いまの見たて (aios get health の短い形): 1 つ 1 行の status と何が、warn か crit には
+//                              次に使う道具。終わりの番号は ok と info は 0、warn は 1、crit は 2
+//   aios get [PATH] [--json]   状態の木 (health host kernel mem disk proc service pkg net user boot log)。
 //                              PATH は点でつなぐ (kernel.cpus、service.sshd.active)。ふだんは PATH = 値 の行
 //   aios do OP ...  [--json]   aiosd (root で動く) に頼んで変える。root と wheel の人だけ:
 //                                service start|stop|restart|enable|disable NAME
@@ -71,6 +73,7 @@ fn main() {
     match args.first().map(String::as_str) {
         None => info(),
         Some("get") => get(&args[1..]),
+        Some("health") => health(&args[1..]),
         Some("top") => top(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10)),
         Some("do") => do_(&args[1..]),
         Some("diff") => diff(),
@@ -128,6 +131,27 @@ fn top(n: usize) {
 }
 
 /// aios get [PATH] [--json]
+/// aios health: 見たて (state.rs の health) を 1 つ 1 行で。終わりの番号でも知らせる (ok / info 0、warn 1、crit 2)
+fn health(args: &[String]) {
+    let h = state::collect("health").unwrap_or_default();
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&h).unwrap_or_default());
+    } else {
+        for c in h["checks"].as_array().into_iter().flatten() {
+            println!("{:<5} {:<9} {}", c["status"].as_str().unwrap_or("?"), c["name"].as_str().unwrap_or("?"), c["what"].as_str().unwrap_or(""));
+            if let Some(hint) = c["hint"].as_str() {
+                println!("{:<15} → {}", "", hint);
+            }
+        }
+        println!("{}: {}", h["status"].as_str().unwrap_or("?"), h["summary"].as_str().unwrap_or(""));
+    }
+    std::process::exit(match h["status"].as_str() {
+        Some("crit") => 2,
+        Some("warn") => 1,
+        _ => 0,
+    });
+}
+
 fn get(args: &[String]) {
     let as_json = args.iter().any(|a| a == "--json");
     let path = args.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("");

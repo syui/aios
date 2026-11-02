@@ -66,7 +66,8 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-s", "sys")],
         tools: &[
-            Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。host kernel mem disk proc service pkg net user boot log。path で一部だけ", input: GET },
+            Tool { name: "health", desc: "いまの見たて (aios health --json): サービスのしくじり、ディスクとメモリの足りなさ、BKL の取りわすれ、カーネルのヒープと oom、ディスクを待って固まったスレッド、試している新しいカーネル、ファイアウォールの確かめ待ち、apply のしくじり、新しい版のあるパッケージ。1 つずつ status (ok / info / warn / crit)、what、hint (次に使う道具)。まずここを見る", input: NONE },
+            Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。health host kernel mem disk proc service pkg net user boot log。path で一部だけ", input: GET },
             Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)、confirm (confirm つきの apply で入れたファイアウォールを残す)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
             Tool { name: "diff", desc: "/etc/aios.json (望む状態) といまのちがいと、そろえる手順 (aios diff。動かさない)。そろえるのは do の apply", input: DIFF },
             Tool { name: "tune", desc: "sysctl の値を順に変えて cmd を n 回ずつ動かし、かかった時間のまんなか (ms) でくらべる (aios tune。root で。終わったら元の値に戻す)。apply でいちばん速かった値を /etc/aios.json に書いて apply。50 秒をこえそうなら run の bg で sudo aios tune NAME=V1,V2 -- CMD", input: TUNE },
@@ -94,6 +95,23 @@ fn main() {
             let a = &v["args"];
             let pwd = s(v, "pwd");
             match s(v, "name") {
+                "health" => match Command::new("aios").args(["health", "--json"]).output() {
+                    // 終わりの番号は見たて (warn 1、crit 2) なので、しくじりにしない
+                    Ok(o) => {
+                        let v: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| json!({ "error": String::from_utf8_lossy(&o.stderr) }));
+                        let text: String = v["checks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|c| {
+                                let hint = c["hint"].as_str().map_or(String::new(), |h| format!("  → {}", h));
+                                format!("{:<5} {:<9} {}{}\n", c["status"].as_str().unwrap_or("?"), c["name"].as_str().unwrap_or("?"), c["what"].as_str().unwrap_or(""), hint)
+                            })
+                            .collect();
+                        json!({ "text": text, "status": v["status"], "summary": v["summary"], "checks": v["checks"] })
+                    }
+                    Err(e) => error(format!("aios: {}", e)),
+                },
                 "get" => get(a),
                 "do" => do_(a),
                 "diff" => match Command::new("aios").arg("diff").output() {
