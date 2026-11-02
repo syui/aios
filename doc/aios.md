@@ -493,6 +493,18 @@ mmap と同じく fast_users を増やしておくので、そのあいだに大
 MAP_SHARED の無名とファイルの写しは親と子で同じページなこと、fork した子の exec、3 つのプロセスが 300 回ずつ fork と書きこみを
 くりかえすあいだに親がそれぞれの /proc/PID/maps、status、cmdline を読むのを確かめる。
 
+そのつづき (752aca9): glibc が fork した子とスレッドのはじめにかならず呼ぶ set_robust_list は、0 を返すだけなのに大きなロックを
+取っていた (fork のたびに 7.5 µs): syscall::fast で答える (長さが 24 でなければ、ふつうの道で EINVAL)。CLONE_CHILD_SETTID の
+書きこみ (fork の子ではそのページの COW: 14 µs) は、親の clone からはずして、子がはじめて走るとき (forkret) にロックを放して
+から、ロックなしのフォールト (fast_fault) で写して書く (Linux の schedule_tail と同じ)。子のスロットは NPROC の表を頭から
+見て、取ったものを Proc::UNUSED で書きなおしていたのを、LIVE のビットの 0 から取って書きなおさない (free_slot がもう空にした)。
+clone がロックを持つ時間は 90 µs から 67 µs。`smpbench -a -o fork` と prof で分けた 1 回の fork のロックの中は、clone 61
+(領域の写し 21.6、スロット 13.5、fd の表 6.9)、exit 80 (exit_notify 35、exit_mm 25: release_deferred 10、Mm を捨てる (領域の
+木とファイルの Rc。ロックの外では捨てられない) 6、deactivate の TLB 4、exit_files 7〜10)、wait4 (子さがし 13 を眠る前と
+起きたあとに 2 回、reap 13.5)。どれも 4〜14 µs のこまかいもので、fork はもう 4 つの CPU で Linux 7.3 の 4 分の 1 ほどの時間
+(260〜330 µs と 1156 µs) なので、ここはいったん止める。のこり: wait4 の子さがしを親ごとの子の並びに、exit で init を毎回
+起こさない (子を init にわたしたときだけ)、親を起こす wakeup が 2 回。
+
 たしかめているあいだに test/random.c が一度だけ「AT_RANDOM が exec ごとにちがわない」で落ちた。見ると、AT_HWCAP2 を
 足して auxv が 18 になったのに、スタックの並びの大きさは 17 のままで、おしまいの AT_NULL (0 が 16 バイト) が AT_RANDOM の
 16 バイトに重なり、そのほとんどを 0 にしていた (ずれは環境の長さによる。glibc はここからスタックの番人をとる)。いまは数と
