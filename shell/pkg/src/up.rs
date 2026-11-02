@@ -6,6 +6,8 @@
 //     3. PKGBUILD に _latest_url と _latest_regex があれば、そのページから (手で確かめていたもの。ca-certificates)
 //     4. source が #commit= (awk、tar、egl-headers) なら、そのリポジトリの最新のコミット (HEAD) とくらべる
 //     5. download.gnome.org のもので Arch にないもの (atk) は、その cache.json から
+//   npm で入れるもの (.aios.json の pkg.linux.npm に人が書いた pnpm など) は、npm の registry の dist-tags の latest と。
+//   PKGBUILD に _npm=NAME があれば、そのパッケージの版が npm の NAME の版 (claude: post_install がその版を入れる)
 //   最新はタグ (git ls-remote) か配布元のページ (nvchecker の regex) から。いまの pkgver とくらべる
 //   見に行くものはみな GIVE_UP 秒で切る。しくじれば、source の tarball のディレクトリの一覧 (ftp.gnu.org/gnu/NAME/
 //   など。ファイルの名前に $pkgver があるもの) からも見る (savannah の git は 500 を返したり、60 秒より長く何も
@@ -545,7 +547,7 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
             })
             .unzip();
     let todo: Vec<Value> = rules.into_iter().filter(|r| r.get("skip").is_none() && (only.is_empty() || only.iter().any(|o| r["name"] == o.as_str()))).collect();
-    let rs = par(todo, |r| {
+    let mut rs = par(todo, |r| {
         let name = r["name"].as_str().unwrap_or("").to_string();
         let cur = now.get(&name).cloned().unwrap_or_default();
         // しくじれば、source の tarball のディレクトリの一覧から (コミットで決めているものはしない)
@@ -593,7 +595,66 @@ pub fn check(pkg: &Path, only: &[String], refresh: bool) -> Result<Vec<Value>, S
     // しくじったもの (配布元が切れたなど) は、一覧の前の値を残す
     let seen: std::collections::HashMap<String, String> = rs.iter().filter_map(|r| Some((r["name"].as_str()?.to_string(), r["latest"].as_str()?.to_string()))).collect();
     overview(pkg, &seen);
+    // npm で入れるもの (パッケージの版にしているもの (_npm) は、そのパッケージのほうで見る)
+    let root = pkg.parent().unwrap_or(Path::new("."));
+    let tracked = npm_tracked(pkg);
+    let npm: Vec<(String, String, String)> = npm_list(root).into_iter().filter(|(n, _, _)| !tracked.contains(n) && (only.is_empty() || only.contains(n))).collect();
+    rs.extend(par(npm, |(n, v, _)| match npm_latest(&n) {
+        Ok(l) => json!({ "name": n, "pkgver": v, "latest": l, "new": vercmp(&l, &v).is_gt(), "kind": "npm" }),
+        Err(e) => json!({ "name": n, "pkgver": v, "error": e, "kind": "npm" }),
+    }));
     Ok(rs)
+}
+
+/// .aios.json の pkg.linux.npm (人が書く): (名前, 版, うしろの書きそえ (" (ap -S claude)" など))
+pub fn npm_list(root: &Path) -> Vec<(String, String, String)> {
+    let v: Value = fs::read_to_string(root.join(".aios.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    v["pkg"]["linux"]["npm"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(n, x)| {
+            let s = x.as_str()?;
+            let (ver, rest) = s.split_once(' ').unwrap_or((s, ""));
+            Some((n.clone(), ver.to_string(), if rest.is_empty() { String::new() } else { format!(" {}", rest) }))
+        })
+        .collect()
+}
+
+/// PKGBUILD に _npm=NAME と書いたもの (パッケージの版が npm の NAME の版) の NAME
+fn npm_tracked(pkg: &Path) -> Vec<String> {
+    pkgbuilds(pkg).iter().filter_map(|(_, p)| scalar(&fs::read_to_string(p).unwrap_or_default(), "_npm")).collect()
+}
+
+/// npm の registry の latest (dist-tags。npm install -g NAME が入れるもの)
+fn npm_latest(name: &str) -> Result<String, String> {
+    let url = format!("https://registry.npmjs.org/-/package/{}/dist-tags", name.replace('/', "%2f"));
+    let v: Value = serde_json::from_str(&get(&url)?).map_err(|e| format!("{}: {}", url, e))?;
+    v["latest"].as_str().map(String::from).ok_or_else(|| format!("{}: no latest", url))
+}
+
+/// .aios.json の pkg.linux.npm の NAME の版を ver に (書きそえはそのまま)。NAME がなければ false
+fn npm_set(root: &Path, name: &str, ver: &str) -> Result<bool, String> {
+    let Some((_, _, rest)) = npm_list(root).into_iter().find(|(n, _, _)| n == name) else { return Ok(false) };
+    aios_json(&root.join(".aios.json"), name, &format!("{}{}", ver, rest))
+}
+
+/// npm で入れるもの (PKGBUILD がない): .aios.json の版を npm の latest (か ver) に
+fn edit_npm(root: &Path, name: &str, old: &str, ver: Option<&str>) -> Result<Value, String> {
+    let ver = match ver {
+        Some(v) => v.to_string(),
+        None => npm_latest(name)?,
+    };
+    if !ver.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c)) {
+        return Err(format!("{}: bad version", ver));
+    }
+    let mut r = json!({ "name": name, "from": old, "to": ver, "kind": "npm", "files": [] });
+    if ver == old {
+        r["same"] = json!(true);
+    } else if npm_set(root, name, &ver)? {
+        r["files"] = json!([".aios.json"]);
+    }
+    Ok(r)
 }
 
 /// 一覧に作るファイル: 1 つのパッケージに 1 行で name type src now latest
@@ -807,7 +868,13 @@ fn expand_var(dir: &Path, text: &str, key: &str) -> String {
 /// 取ってきて sha256sums の 1 つめを書きかえる。.aios.json の pkg の版と updated も
 pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String> {
     let pkg = root.join("pkg");
-    let (_, path) = pkgbuilds(&pkg).into_iter().find(|(n, _)| n == name).ok_or_else(|| format!("{}: no PKGBUILD", name))?;
+    let Some((_, path)) = pkgbuilds(&pkg).into_iter().find(|(n, _)| n == name) else {
+        // npm で入れるもの (.aios.json の pkg.linux.npm) は、そこの版を
+        return match npm_list(root).into_iter().find(|(n, _, _)| n == name) {
+            Some((_, old, _)) => edit_npm(root, name, &old, ver),
+            None => Err(format!("{}: no PKGBUILD", name)),
+        };
+    };
     let old_text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let old = scalar(&old_text, "pkgver").unwrap_or_default();
     let rule = rules(&pkg, &[], false)?.into_iter().find(|r| r["name"] == name).ok_or("no rule")?;
@@ -848,7 +915,9 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     }
     fs::write(&path, &text).map_err(|e| e.to_string())?;
     let mut files = vec![json!(path.strip_prefix(root).unwrap_or(&path).display().to_string())];
-    if aios_json(&root.join(".aios.json"), name, &ver)? {
+    // npm の NAME の版をパッケージの版にしているもの (_npm): .aios.json の pkg.linux.npm のほうも
+    let npm = scalar(&text, "_npm").map(|n| npm_set(root, &n, &ver)).transpose()?.unwrap_or(false);
+    if aios_json(&root.join(".aios.json"), name, &ver)? || npm {
         files.push(json!(".aios.json"));
     }
     files.push(json!("pkg/pkg.json"));

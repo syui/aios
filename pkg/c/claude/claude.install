@@ -3,13 +3,15 @@ _npm() {
   PATH=/usr/local/bin:/opt/c/bin:$PATH npm "$@"
 }
 
+# $1 はパッケージの版 (2.1.316-1)。パッケージの版は claude-code の版なので、その版を入れる (なければ latest)
 post_install() {
-  _npm install -g --libc=musl --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
+  _v=${1%-*}
+  _npm install -g --libc=musl --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code${_v:+@$_v}"
   echo "claude: $(PATH=/usr/local/bin:$PATH claude --version 2>/dev/null)"
 }
 
 post_upgrade() {
-  post_install
+  post_install "$1"
 }
 
 pre_remove() {

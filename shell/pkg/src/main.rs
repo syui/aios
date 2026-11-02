@@ -81,7 +81,8 @@ fn main() {
                 }
                 "pkg_edit" => {
                     let n = s(a, "name");
-                    if n.is_empty() || n.contains('/') {
+                    // npm の @SCOPE/NAME (.aios.json の pkg.linux.npm) は / をゆるす (ログの名前では _ に)
+                    if n.is_empty() || n.contains("..") || (n.contains('/') && !(n.starts_with('@') && n.matches('/').count() == 1)) {
                         return error("give name");
                     }
                     if a["rebuild"] == true {
@@ -93,7 +94,7 @@ fn main() {
                     if let Some(v) = a["ver"].as_str() {
                         argv.push(v);
                     }
-                    job(&mut jobs, &root, &format!("edit-{}", n), &argv, a)
+                    job(&mut jobs, &root, &format!("edit-{}", n.replace('/', "_")), &argv, a)
                 }
                 "pkg_build" => {
                     let n = s(a, "name");
@@ -356,6 +357,8 @@ fn check(root: &Path, names: &[String], all: bool, refresh: bool) -> Value {
             let via = r["via"]["listing"].as_str().map_or(String::new(), |u| format!("  (from the file list {})", u));
             // タグだけで、配る tarball がまだないもの: まだ上げられない
             let out = r["not_out"].as_str().map_or(String::new(), |u| format!("  (not out yet: {})", u));
+            // npm で入れるもの (.aios.json の pkg.linux.npm): pkg_edit は .aios.json の版を書きかえる
+            let out = if r["kind"] == "npm" { format!("{}  (npm: npm install -g {}@{})", out, n, r["latest"].as_str().unwrap_or("")) } else { out };
             text.push_str(&format!("{:w$}  {} → {}{}{}{}\n", n, cur, r["latest"].as_str().unwrap_or(""), users, via, out));
         } else {
             same += 1;

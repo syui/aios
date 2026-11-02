@@ -21,7 +21,7 @@
   {"from":"pkgbuild","name":"ca-certificates","nvchecker":{"join":true,"regex":"cacert-([0-9]{4})-([0-9]{2})-([0-9]{2})\\.pem","source":"regex","url":"https://curl.se/docs/caextract.html"}},
   {"from":"arch:cairo","name":"cairo","nvchecker":{"git":"https://gitlab.freedesktop.org/cairo/cairo.git","include_regex":"\\d+\\.\\d*[02468]\\.\\d*[02468]","source":"git"}},
   {"from":"arch:rust","name":"cargo","nvchecker":{"git":"https://github.com/rust-lang/rust.git","source":"git"}},
-  {"name":"claude","skip":"aios"},
+  {"from":"pkgbuild","name":"claude","nvchecker":{"join":true,"regex":"latest\":\"([0-9]+[.][0-9]+[.][0-9]+)","source":"regex","url":"https://registry.npmjs.org/-/package/@anthropic-ai%2fclaude-code/dist-tags"}},
   {"from":"pkgbuild","git":"https://github.com/uutils/coreutils","name":"coreutils","tag":"^([0-9][0-9A-Za-z.]*)$"},
   {"from":"arch:curl","name":"curl","nvchecker":{"exclude_regex":".*(tiny|beta).*","from_pattern":"_","git":"https://github.com/curl/curl.git","prefix":"curl-","source":"git","to_pattern":"."}},
   {"from":"arch:diffutils","name":"diffutils","nvchecker":{"git":"https://git.savannah.gnu.org/git/diffutils.git","prefix":"v","source":"git"}},

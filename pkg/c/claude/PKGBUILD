@@ -2,9 +2,15 @@
 #   本体はこのパッケージに入れない (Anthropic のもの)。入れたとき (post_install) に
 #   npm install -g --libc=musl で @anthropic-ai/claude-code を /usr/local に取ってくる。
 #   ap -Syu でこのパッケージが上がると、claude も新しくする。ap -R claude で npm からも消す
+# 版は npm の @anthropic-ai/claude-code の版 (_npm)。pkg_check が npm の latest とくらべ、pkg_edit claude で上げて
+# (.aios.json の pkg.linux.npm も)、作って ai/repo に送ると、ap -Syu の post_upgrade がその版を入れる
+# (claude-code は 1 日に 1 つほど出る。前は 0.0.1 のままで、入れたときの latest から上がらなかった)
 pkgname=claude
-pkgver=0.0.1
+pkgver=2.1.316
 pkgrel=1
+_npm=@anthropic-ai/claude-code
+_latest_url=https://registry.npmjs.org/-/package/@anthropic-ai%2fclaude-code/dist-tags
+_latest_regex='latest":"([0-9]+[.][0-9]+[.][0-9]+)'
 pkgdesc='Claude Code, installed from npm (@anthropic-ai/claude-code, musl)'
 arch=('any')
 url='https://code.claude.com'
