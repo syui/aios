@@ -424,15 +424,16 @@ impl Shell {
         let mut text = format!("aish {}  pid {}  up {}\n  {}\n", env!("CARGO_PKG_VERSION"), PID.load(Ordering::Relaxed), dur(t0.elapsed().as_secs()), exe);
         let disk = FileId::of(&exe);
         let rebuilt = disk.is_some() && disk != file;
+        // うしろのジョブが動いているか、終わっても job で読んでいないあいだは入れかわらない (should_reload。
+        // 入れかわるとジョブが止まり、出力もなくなる)。ビルドしなおしたプラグインも、aish ごと入れかわるので同じ
+        let held: Vec<String> = JOBS.lock().map(|j| j.iter().map(|x| x.id.to_string()).collect()).unwrap_or_default();
+        let when = if held.is_empty() {
+            "at the next tool call".to_string()
+        } else {
+            format!("once job {} has ended and been read with job (or job kill, then job)", held.join(", "))
+        };
         if rebuilt {
-            // うしろのジョブが動いているか、終わっても job で読んでいないあいだは入れかわらない (should_reload。
-            // 入れかわるとジョブが止まり、出力もなくなる)
-            let held: Vec<String> = JOBS.lock().map(|j| j.iter().map(|x| x.id.to_string()).collect()).unwrap_or_default();
-            problems.push(if held.is_empty() {
-                "aish: rebuilt after the server started; it restarts itself with the new build at the next tool call".into()
-            } else {
-                format!("aish: rebuilt after the server started; it restarts itself with the new build once job {} has ended and been read with job (or job kill, then job)", held.join(", "))
-            });
+            problems.push(format!("aish: rebuilt after the server started; it restarts itself with the new build {}", when));
         }
         // ソースのほうが新しい: まだビルドしていない (ディスクのバイナリとくらべる)
         let stale = |dirs: &[String], bin: Option<u64>| -> Option<String> {
@@ -457,7 +458,7 @@ impl Shell {
                 problems.push(format!("plugin {}: stopped ({}); rebuild it, or reconnect (/mcp), to start it again", name, why));
             } else if p["rebuilt"] == true {
                 note = "  [rebuilt]".into();
-                problems.push(format!("plugin {}: rebuilt after it started; aish restarts with it at the next tool call", name));
+                problems.push(format!("plugin {}: rebuilt after it started; aish restarts with it {}", name, when));
             }
             if let (Some(src), Some(prog)) = (&src, p["prog"].as_str()) {
                 // aish-edit は shell/edit (と SDK の shell/plugin)
