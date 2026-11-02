@@ -61,6 +61,7 @@
   {"from":"arch:mesa","name":"mesa","nvchecker":{"from_pattern":"-([a-z])","git":"https://gitlab.freedesktop.org/mesa/mesa.git","include_regex":"mesa-\\d+\\.\\d+\\.[1-9]\\d*","prefix":"mesa-","source":"git","to_pattern":"\\1"}},
   {"from":"arch:musl","name":"musl","nvchecker":{"git":"https://git.musl-libc.org/git/musl","prefix":"v","source":"git"}},
   {"from":"arch:ncurses","name":"ncurses","nvchecker":{"regex":"ncurses-([\\d.]+)\\.tar\\.gz?","source":"regex","url":"https://invisible-mirror.net/archives/ncurses/"}},
+  {"from":"arch:nftables","name":"nftables","nvchecker":{"regex":"nftables-([\\d.]+)\\.tar\\.xz","source":"regex","url":"https://netfilter.org/pub/nftables/"}},
   {"from":"arch:nodejs","name":"nodejs","nvchecker":{"regex":">node\\-v(.*)\\.tar\\.xz","source":"regex","url":"https://nodejs.org/dist/latest/"}},
   {"from":"arch:openssh","name":"openssh","nvchecker":{"exclude_regex":"V_10_0_P2","from_pattern":"V_(\\d+)_(\\d+)_P(\\d+)","git":"https://github.com/openssh/openssh-portable","source":"git","to_pattern":"\\1.\\2p\\3"}},
   {"from":"arch:pango","name":"pango","nvchecker":{"git":"https://gitlab.gnome.org/GNOME/pango.git","include_regex":"\\d+\\.\\d+\\.\\d+","source":"git"}},

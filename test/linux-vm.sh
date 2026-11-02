@@ -11,6 +11,8 @@
 #                                                 /work は ext4、/tmp は tmpfs (たとえば pipeslots /work/.ps)
 #   test/linux-vm.sh rootexec [latest|X.Y.Z] PROG [ARG...]
 #                                                 exec と同じを root で (AppArmor の test/apparmor.c)
+# LINUX_FILES="NAME=FILE ..." で exec / rootexec の initramfs に /NAME を足す (実行できるものは実行できるまま。
+# test/nftables.c の /nft など)
 # LINUX_EFI=1 なら QEMU の UEFI のファームウェア (AAVMF / edk2。bin/run.sh と同じものを探す。変数はそのたびに
 # まっさらなもの) から -kernel を起こす (UEFI のランタイムサービスと efivarfs: test/efivarfs.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
@@ -98,7 +100,7 @@ for d in ("dev", "proc", "sys", "tmp", "work"):
 for f in files:
     name, path = f.split("=", 1)
     data = open(path, "rb").read() if path != "-" else b""
-    mode = 0o100755 if name in ("init", "sysdiff", "prog") else 0o100644
+    mode = 0o100755 if name in ("init", "sysdiff", "prog") or (path != "-" and os.access(path, os.X_OK)) else 0o100644
     blob += entry(name, mode, data, ino); ino += 1
 blob += entry("TRAILER!!!", 0, b"", 0)
 open(out, "wb").write(blob)
@@ -173,7 +175,8 @@ exec_prog() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   echo "$mode $*" > "$tmp/args"
-  boot "$image" prog="$prog" args="$tmp/args"
+  # shellcheck disable=SC2086
+  boot "$image" prog="$prog" args="$tmp/args" ${LINUX_FILES:-}
   st=$(debugfs -R "cat /status" "$tmp/work.img" 2>/dev/null | tr -d '\n')
   debugfs -R "cat /out.txt" "$tmp/work.img" 2>/dev/null
   debugfs -R "cat /err.txt" "$tmp/work.img" 2>/dev/null >&2

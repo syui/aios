@@ -635,7 +635,7 @@ apparmor.service と同じく Before=sysinit.target で、aios の init は Befo
 した (0 だと、libapparmor の path_from_fd が lstat の大きさから readlink を始めて足りなければ倍にするので、0 のまま回り
 つづけ、--write-cache が止まっていた)。
 
-### ファイアウォール (nftables) の考え (まだ作っていない)
+### ファイアウォール (nftables)
 
 いまの aios のネットワーク: 外 (eth0 の向こう) は virtio-net のフレームを smoltcp にわたし、中どうし (127.0.0.0/8、eth0 の
 アドレス) はパケットを作らずに相手のソケットの行列へじかに入れる (inet.rs、unix.rs)。netlink は段階 0 で入れた (それまで
@@ -650,10 +650,32 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
   データグラム、NLMSG_ERROR ともとのメッセージ、NETLINK_CAP_ACK、REQUEST のないものと短いものには答えない、root でなければ
   変える type は EPERM) は Linux 7.3.1 と同じ (test/netlink.c の 79 の答え)。口の番号は Linux と同じ lo 1、eth0 2 に
   そろえた (ioctl の SIOCGIFINDEX と /sys/class/net。前は eth0 が 1)。ioctl は名前で lo も聞ける。SIOCGIFCONF は eth0
-  だけのまま (aios の ip、networkd、aios は、はじめのものを eth0 とみなす)。ほかの protocol (NETLINK_NETFILTER など) は
-  EPROTONOSUPPORT、口やアドレスを netlink で変えるのはまだ (EOPNOTSUPP。ioctl でできる)
-- 段階 1: nfnetlink と nf_tables の表 (table、chain、rule、set とその要素、生成番号、batch で一度に入れかえる)。
-  `nft -f` と `nft list ruleset` が Linux と同じに通る。パッケージ nftables (nft、libnftnl、libmnl を静的に)
+  だけのまま (aios の ip、networkd、aios は、はじめのものを eth0 とみなす)。NETLINK_ROUTE と NETLINK_NETFILTER (段階 1)
+  のほかの protocol は EPROTONOSUPPORT、口やアドレスを netlink で変えるのはまだ (EOPNOTSUPP。ioctl でできる)
+- 段階 1 (できた): nfnetlink と nf_tables の表 (kernel/src/nftables.rs。Linux 7.3 の nfnetlink.c と nf_tables_api.c
+  と同じ形と答え)。本物の nft (パッケージ nftables: nft 1.1.7、libnftnl 1.3.2、libmnl 1.0.5、jansson を静的に。
+  /opt/c/bin/nft) がそのまま動く: `nft -f`、`nft list ruleset` (`-a`、`-j`)、add / insert / delete / flush。
+  - batch: BEGIN (生成番号つきなら、ちがえば ERESTART) から END まで、いまの表を写したものに順に当て、みな通れば
+    入れかえて生成番号を進める。しくじれば捨てて、しくじりを順に返す (ほかのものもみな見る)。変えるものは batch の
+    中だけ、見るものは外だけ (どちらも外れれば EINVAL)。ぜんぶ CAP_NET_ADMIN
+  - table (ip、ip6、inet。arp、bridge、netdev は手本の Linux に入れていないので EOPNOTSUPP。dormant、owner (持ち主の
+    ソケットが閉じると消える。persist なら残る)、userdata)、chain (filter と route の型、フックと priority、policy、
+    jump の先、use の数)、rule (末尾、先頭、position / position_id の前後、replace、handle と id で消す)、set と map
+    (名前のないもの `__set%d` は使う決まりがなくなると消える、constant、interval、timeout、size、concat の長さ、
+    verdict の map)、要素 (同じものは EEXIST か何もしない、interval の終わり、map の中身、消す、flush)
+  - 番号 (handle): 表は全体で、鎖・決まり・集まりは表ごとに 1 から。しくじった batch でも進んだまま (Linux と同じ)
+  - 式は immediate cmp payload meta bitwise byteorder lookup range counter log limit reject quota を読んで、Linux の
+    dump と同じ形で返す (レジスタは 32 ビットの番号にしてから返す: NFT_REG32_00 は NFT_REG_1)。exthdr rt last は
+    来たまま。ct などの手本の Linux に入れていないものは ENOENT
+  - しくじりの答えは Linux と同じところで NLMSGERR_ATTR_OFFS (nft はそれで「^^^」の場所を決める)。ACK は NETLINK_EXT_ACK
+    の形 (netlink.rs の ack)。dump は 3776 バイト (NLMSG_GOODSIZE) ずつ、set の要素の dump は Linux と同じく
+    おしまいに要素のないメッセージと NLMSG_DONE を 1 つのデータグラムで
+  - まだ: object (名前のついた counter や quota)、flowtable、set の要素ごとの式、dynset、nft monitor (組への知らせ)、
+    NLM_F_ECHO、決まった要素を聞く get element、reject などをフックで確かめること
+  - 確かめかた: `test/nftables.c` (root で。8 つの case の nft -f と list ruleset -a -j。112 の段がみな手本の
+    Linux 7.3.1 と同じ: `LINUX_FILES="nft=NFT" test/linux-vm.sh rootexec latest test/bin/nftables /nft`)。手本の Linux の
+    test/linux.config に NETFILTER、NF_TABLES (INET、IPV4、IPV6)、NFT_LOG (と NF_LOG_SYSLOG)、NFT_LIMIT、NFT_REJECT、
+    NFT_QUOTA と IPV6 を入れた (sysdiff と netlink の答えは入れる前と同じ)
 - 段階 2: 評価 (nft の VM: レジスタと式 payload、meta、cmp、bitwise、immediate (verdict)、lookup、range、counter、limit、
   log、reject) とフック。外から来たフレームは smoltcp にわたす前 (prerouting、input)、出すフレームは出す前 (output、
   postrouting)。中どうしはパケットがないので、connect、送る、受けるところで同じ見かけ (5 つ組、iif / oif は lo) を作って

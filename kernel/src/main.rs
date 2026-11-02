@@ -48,6 +48,7 @@ mod inet;
 mod net;
 mod netif;
 mod netlink;
+mod nftables;
 mod parts;
 mod proc;
 mod sd;

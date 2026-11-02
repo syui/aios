@@ -1,10 +1,12 @@
 // netlink (AF_NETLINK): カーネルとプロセスが、メッセージ (struct nlmsghdr と属性 rtattr) でやりとりするソケット
-// (Linux の net/netlink/af_netlink.c と同じ形と答え)。いまは NETLINK_ROUTE の口とアドレスの一覧だけ (rtnetlink.c の
-// RTM_GETLINK と RTM_GETADDR: musl や glibc の getifaddrs と if_nameindex、node の os.networkInterfaces())。nftables
-// (NETLINK_NETFILTER) をのせる土台 (doc/aios.md の「ファイアウォール (nftables) の考え」の段階 0)。
+// (Linux の net/netlink/af_netlink.c と同じ形と答え)。NETLINK_ROUTE の口とアドレスの一覧 (rtnetlink.c の
+// RTM_GETLINK と RTM_GETADDR: musl や glibc の getifaddrs と if_nameindex、node の os.networkInterfaces()) と、
+// NETLINK_NETFILTER の nftables (nftables.rs。doc/aios.md の「ファイアウォール (nftables)」)。
 //
-// - socket(AF_NETLINK, SOCK_RAW か SOCK_DGRAM, NETLINK_ROUTE)。ほかの型は ESOCKTNOSUPPORT、ほかの protocol は
-//   EPROTONOSUPPORT (Linux でその機能を入れずに作ったときと同じ)
+// - socket(AF_NETLINK, SOCK_RAW か SOCK_DGRAM, NETLINK_ROUTE か NETLINK_NETFILTER)。ほかの型は ESOCKTNOSUPPORT、
+//   ほかの protocol は EPROTONOSUPPORT (Linux でその機能を入れずに作ったときと同じ)
+// - ACK (netlink_ack): しくじりでなければいつも NLM_F_CAPPED。NETLINK_EXT_ACK なら、しくじりのわけと属性の場所
+//   (NLMSGERR_ATTR_MSG と NLMSGERR_ATTR_OFFS) を足して NLM_F_ACK_TLVS
 // - ポート (nl_pid): bind で決めるか、送るか bind(0) で自分で (はじめはプロセスの tgid、使われていれば -4097 から下へ)
 // - カーネル (nl_pid 0) へのメッセージは、送ったときにみな答える (netlink_rcv_skb と同じ順: NLM_F_REQUEST のないもの
 //   と制御のもの (type < 16) は答えない (NLM_F_ACK なら 0 の ACK)、しくじりか NLM_F_ACK なら NLMSG_ERROR)。答えは
@@ -162,7 +164,7 @@ pub fn create(typ: u64, protocol: u64) -> Result<NetlinkRef, i64> {
         return Err(-ESOCKTNOSUPPORT);
     }
     let protocol = protocol as u32;
-    if protocol >= MAX_LINKS || protocol != NETLINK_ROUTE {
+    if protocol >= MAX_LINKS || (protocol != NETLINK_ROUTE && protocol != crate::nftables::NETLINK_NETFILTER) {
         return Err(-EPROTONOSUPPORT);
     }
     let n = Rc::new(RefCell::new(Netlink::default()));
@@ -193,6 +195,10 @@ impl Drop for Netlink {
     fn drop(&mut self) {
         if self.bound {
             PORTS.get().remove(&(self.protocol, self.portid));
+            // 持ち主の表を消す (NETLINK_URELEASE)
+            if self.protocol == crate::nftables::NETLINK_NETFILTER {
+                crate::nftables::release(self.portid);
+            }
         }
     }
 }
@@ -531,13 +537,42 @@ fn attr_str(out: &mut Vec<u8>, typ: u16, s: &str) {
 
 /// NLMSG_ERROR (netlink_ack: エラーとともとの頭。しくじりなら、NETLINK_CAP_ACK でなければもとのメッセージまるごと)
 fn put_ack(out: &mut Vec<u8>, req: &[u8], err: i64, cap_ack: bool, pid: u32) {
+    out.extend_from_slice(&ack(req, err, cap_ack, false, None, None, pid));
+}
+
+/// NLMSGERR_ATTR_MSG と NLMSGERR_ATTR_OFFS (NETLINK_EXT_ACK)
+const NLMSGERR_ATTR_MSG: u16 = 1;
+const NLMSGERR_ATTR_OFFS: u16 = 2;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+
+/// netlink_ack: NLMSG_ERROR のデータグラム。もとの頭 (しくじりで NETLINK_CAP_ACK でなければ、もとのメッセージまるごと:
+/// でなければ NLM_F_CAPPED)。NETLINK_EXT_ACK なら、しくじりのわけ (msg) とどの属性か (off: メッセージの頭から) を
+/// うしろに足して NLM_F_ACK_TLVS
+pub fn ack(req: &[u8], err: i64, cap_ack: bool, ext_ack: bool, off: Option<usize>, msg: Option<&str>, pid: u32) -> Vec<u8> {
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
     let reqlen = (u32::from_le_bytes(req[0..4].try_into().unwrap()) as usize).min(req.len());
     let whole = err != 0 && !cap_ack;
+    let mut flags = if whole { 0 } else { NLM_F_CAPPED };
     let mut p = Vec::new();
     p.extend_from_slice(&(err as i32).to_le_bytes());
     p.extend_from_slice(&req[..if whole { reqlen } else { NLMSG_HDRLEN }]);
-    put_msg(out, NLMSG_ERROR, if err != 0 && cap_ack { NLM_F_CAPPED } else { 0 }, seq, pid, &p);
+    if ext_ack {
+        let mut tlv = Vec::new();
+        if let Some(m) = msg {
+            attr_str(&mut tlv, NLMSGERR_ATTR_MSG, m);
+        }
+        if let Some(o) = off.filter(|&o| err != 0 && o < reqlen) {
+            attr_u32(&mut tlv, NLMSGERR_ATTR_OFFS, o as u32);
+        }
+        if !tlv.is_empty() {
+            flags |= NLM_F_ACK_TLVS;
+            p.resize(align4(p.len()), 0);
+            p.extend_from_slice(&tlv);
+        }
+    }
+    let mut out = Vec::new();
+    put_msg(&mut out, NLMSG_ERROR, flags, seq, pid, &p);
+    out
 }
 
 // ---- カーネルの受け口 (netlink_rcv_skb と rtnetlink_rcv_msg) ----
@@ -546,6 +581,11 @@ fn put_ack(out: &mut Vec<u8>, req: &[u8], err: i64, cap_ack: bool, pid: u32) {
 /// netlink_unicast と同じ)。me は送ったソケットのポート
 fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
     let cap_ack = n.borrow().opts & (1 << NETLINK_CAP_ACK) != 0;
+    // nftables (nfnetlink の nf_tables)
+    if n.borrow().protocol == crate::nftables::NETLINK_NETFILTER {
+        let ext_ack = n.borrow().opts & (1 << NETLINK_EXT_ACK) != 0;
+        return crate::nftables::rcv(data, me, cap_ack, ext_ack);
+    }
     let mut out = Vec::new();
     let mut at = 0;
     while data.len() - at >= NLMSG_HDRLEN {
