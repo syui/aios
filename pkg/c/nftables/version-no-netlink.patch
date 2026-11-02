@@ -1,0 +1,20 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -377,6 +377,17 @@
+ 	if (!nft_options_check(argc, argv))
+ 		exit(EXIT_FAILURE);
+ 
++	/* aios: print the version without opening the netlink socket (nft -v
++	 * works where NETLINK_NETFILTER is not available, e.g. qemu-user) */
++	if (argc == 2 && (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version"))) {
++		printf("%s v%s (%s)\n", PACKAGE_NAME, PACKAGE_VERSION, RELEASE_NAME);
++		return EXIT_SUCCESS;
++	}
++	if (argc == 2 && !strcmp(argv[1], "-V")) {
++		show_version();
++		return EXIT_SUCCESS;
++	}
++
+ 	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+ 
+ 	while (1) {

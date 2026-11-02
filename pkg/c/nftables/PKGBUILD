@@ -5,7 +5,7 @@
 #   ここで静的に作る (ほかのパッケージは使わないので、別のパッケージにしない)。大きな数は mini-gmp、対話 (nft -i) はなし
 pkgname=nftables
 pkgver=1.1.7
-pkgrel=1
+pkgrel=2
 _nftnl=1.3.2
 _mnl=1.0.5
 _jansson=2.14.1
@@ -16,11 +16,13 @@ license=('GPL-2.0-only' 'GPL-2.0-or-later' 'LGPL-2.1-or-later' 'MIT')
 source=("https://netfilter.org/pub/nftables/nftables-$pkgver.tar.xz"
         "https://netfilter.org/pub/libnftnl/libnftnl-$_nftnl.tar.xz"
         "https://netfilter.org/pub/libmnl/libmnl-$_mnl.tar.bz2"
-        "https://github.com/akheron/jansson/releases/download/v$_jansson/jansson-$_jansson.tar.bz2")
+        "https://github.com/akheron/jansson/releases/download/v$_jansson/jansson-$_jansson.tar.bz2"
+        version-no-netlink.patch)
 sha256sums=('a6fbf060d8d4fff001517a2b94f356bb4366bfbf0ba366366f9d27cc38caa58f'
             'c97abc3409f8fa396b4462b2bb7f147a3a47a4ddc97cfa0b2f18890c9cfde8b0'
             '274b9b919ef3152bfb3da3a13c950dd60d6e2bcd54230ffeca298d03b40d0525'
-            '6bd82d3043dadbcd58daaf903d974891128d22aab7dada5d399cb39094af49ce')
+            '6bd82d3043dadbcd58daaf903d974891128d22aab7dada5d399cb39094af49ce'
+            'SKIP')
 
 prepare() {
   rm -rf "nftables-$pkgver" "libnftnl-$_nftnl" "libmnl-$_mnl" "jansson-$_jansson"
@@ -28,6 +30,10 @@ prepare() {
   tar -xJf "libnftnl-$_nftnl.tar.xz"
   tar -xjf "libmnl-$_mnl.tar.bz2"
   tar -xjf "jansson-$_jansson.tar.bz2"
+  # nft -v (-V、--version) は netlink のソケットを開く前に版を出す (NETLINK_NETFILTER のないところでも:
+  # aish の pkg_test は qemu-user で --version を動かす)。ほかのふるまいは変えない
+  patch -s -p1 -d "nftables-$pkgver" < version-no-netlink.patch
+  grep -q 'aios: print the version' "nftables-$pkgver/src/main.c"
 }
 
 build() {
