@@ -320,6 +320,9 @@ pub struct Proc {
     pub fallible: u32,
     /// 終了時に 0 を書いて futex で起こす場所 (CLONE_CHILD_CLEARTID)
     pub clear_tid: usize,
+    /// はじめて走るとき (forkret)、大きなロックを放してから自分の tid を書く場所 (CLONE_CHILD_SETTID。Linux の
+    /// schedule_tail と同じ。fork の子では書くと COW になるので、前は親の clone が大きなロックを持ったまま写していた)
+    set_child_tid: usize,
     /// CLONE_VFORK で作られた子: exec か終わりまで待っている親の pid (なければ 0)
     pub vfork_parent: u32,
     /// 代表でないスレッドが execve した (代表スレッドに置く): 読みこんだプログラムとパス。
@@ -435,6 +438,7 @@ impl Proc {
         dirtied: false,
         fallible: 0,
         clear_tid: 0,
+        set_child_tid: 0,
         vfork_parent: 0,
         exec_takeover: None,
         prefork: None,
@@ -985,11 +989,24 @@ unsafe extern "C" {
 
 /// 空きスロットを取り、forkret から EL0 へ戻れるようにする
 fn alloc_proc() -> Option<&'static mut Proc> {
-    let Some(p) = procs().iter_mut().find(|p| p.state == State::Unused) else {
-        println!("proc: no free slot (NPROC = {})", NPROC);
-        return None;
+    // 空きは LIVE の 0 のビット (free_slot が Proc::UNUSED に戻してから消す。一度も使っていないものは、はじめから
+    // UNUSED で 0)。なので書きなおさない (前は NPROC の表を頭から見て、取ったものを UNUSED で書きなおしていた:
+    // Proc は数 KiB)。印がついたまま Unused のもの (取ってすぐしくじったもの) は、空きがないときに表を見て使う
+    let live = LIVE.get();
+    let free = (0..WORDS).find_map(|w| (!live[w] != 0).then(|| w * 64 + (!live[w]).trailing_zeros() as usize));
+    let p = match free.filter(|&i| i < NPROC && procs()[i].state == State::Unused) {
+        Some(i) => &mut procs()[i],
+        None => match procs().iter_mut().find(|p| p.state == State::Unused) {
+            Some(p) => {
+                *p = Proc::UNUSED;
+                p
+            }
+            None => {
+                println!("proc: no free slot (NPROC = {})", NPROC);
+                return None;
+            }
+        },
     };
-    *p = Proc::UNUSED;
     let i = slot_of(p);
     crate::prof::thread_start(i);
     LIVE.get()[i / 64] |= 1u64 << (i % 64);
@@ -1051,6 +1068,28 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
 extern "C" fn forkret_unlock() {
     crate::smp::unlock();
     crate::vm::free_deferred();
+    set_child_tid();
+}
+
+/// CLONE_CHILD_SETTID: はじめてユーザーへ戻る前に、自分の tid を書く (大きなロックなしで)。fork の子のそのページは
+/// 親と分けている (COW) ので、ロックなしのフォールト (vm::PageTable::fast_fault) で写してから。それでも書けないもの
+/// (ファイルの写し、スワップへ出したページ、だれかが表を変えている途中) だけ大きなロックを取る。書けなくても
+/// しくじらない (Linux の schedule_tail の put_user と同じ)
+fn set_child_tid() {
+    let Some(i) = cur() else { return };
+    let p = &mut procs()[i];
+    let at = core::mem::take(&mut p.set_child_tid);
+    if at == 0 || p.mm.is_none() {
+        return;
+    }
+    let tid = p.pid.to_le_bytes();
+    let pt = p.pt();
+    if pt.copy_out_nofault(at, &tid) || (pt.fast_fault(at, true, false) && pt.copy_out_nofault(at, &tid)) {
+        return;
+    }
+    crate::smp::lock();
+    let _ = current().pt().copy_out(at, &tid);
+    crate::smp::unlock();
 }
 
 /// 次に走らせるもの: 実行できるもののうち recent が一番少ないもの (同じなら start から順に見て先のもの)。
@@ -1713,7 +1752,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         parent.pt().copy_out(ptid, &tid.to_le_bytes());
     }
     if flags & CLONE_CHILD_SETTID != 0 {
-        child.pt().copy_out(ctid, &tid.to_le_bytes());
+        child.set_child_tid = ctid;
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_tid = ctid;
