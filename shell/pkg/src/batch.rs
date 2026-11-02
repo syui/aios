@@ -43,7 +43,7 @@ struct Step {
 }
 
 /// CI (.github/workflows/pkg.yml) が作るもの
-fn ci_names(root: &Path) -> Vec<String> {
+pub(crate) fn ci_names(root: &Path) -> Vec<String> {
     let text = fs::read_to_string(root.join("pkg/ci.json")).unwrap_or_default();
     serde_json::from_str::<Value>(&text).ok().and_then(|v| v.as_array().map(|a| a.iter().filter_map(|e| e["name"].as_str().map(String::from)).collect())).unwrap_or_default()
 }
