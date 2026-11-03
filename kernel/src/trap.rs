@@ -194,6 +194,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     };
     crate::smp::seg_begin(&cause, t0);
     let sw = crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed);
+    // ロックなしの munmap が外したファイルの写しの Rc を捨てる (割り込みではなく、プロセスの中で)
+    if kind == EL0_SYNC {
+        crate::vm::drop_unmapped();
+    }
     handle(tf, kind, claimed, esr);
     crate::proc::drop_prefork();
     crate::extfs::fs_check_released();

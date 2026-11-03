@@ -1052,6 +1052,35 @@ fn release_shared_ranges(ranges: &[(FileKey, FileKey)]) {
     }
 }
 
+/// 大きなロックなしの munmap (PageTable::fast_unmap) が外した、Rc を持つ領域 (写したファイルの inode、名前) と、
+/// 写しの表 (SHARED_FILE: MAP_PRIVATE の穴の 0 のページ) で返すかもしれない鍵の範囲。Rc の数と写しの表は大きなロックの
+/// 中でだけ変えるので、捨てて返すのは、次に大きなロックを取ったシステムコールかフォルトの入口で (drop_unmapped)
+struct Unmapped {
+    vmas: Vec<Vma>,
+    ranges: Vec<(FileKey, FileKey)>,
+}
+// 中の Rc は動かすだけで、数を変えるのは大きなロックの中 (drop_unmapped) だけ
+unsafe impl Send for Unmapped {}
+static UNMAPPED: SpinLock<Unmapped> = SpinLock::new(Unmapped { vmas: Vec::new(), ranges: Vec::new() });
+/// UNMAPPED の領域の数 (0 なら drop_unmapped は何もしない。多すぎれば fast_unmap はふつうの道へ)
+static UNMAPPED_N: AtomicUsize = AtomicUsize::new(0);
+const UNMAPPED_MAX: usize = 1024;
+
+/// fast_unmap が外したものを捨てる。大きなロックを持って、プロセスの中から (trap.rs: inode を最後に放すと、消した
+/// ファイルを片づけるのでディスクにさわる)
+pub fn drop_unmapped() {
+    if UNMAPPED_N.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (vmas, ranges) = {
+        let mut u = UNMAPPED.lock();
+        UNMAPPED_N.store(0, Ordering::Relaxed);
+        (core::mem::take(&mut u.vmas), core::mem::take(&mut u.ranges))
+    };
+    release_shared_ranges(&ranges);
+    drop(vmas);
+}
+
 /// 外したページを少しずつまとめて返す (Linux の mmu_gather)。PTE を 0 にしたページを GATHER 枚ためたら、TLB を消して、
 /// ほかの CPU が使い終わるのを待ってから返す。ヒープを使わない (外すページの数だけの Vec は、何 GiB もの領域では
 /// 何 MB にもなり、メモリが足りないときに取れない)
@@ -1479,6 +1508,38 @@ impl PageTable {
                 unsafe { *pte = v2p(next as usize) as u64 | PTE_VALID | PTE_TABLE };
                 table = next;
             }
+        }
+        Some(unsafe { table.add(index(va, 3)) })
+    }
+
+    /// walk (alloc) の、大きなロックなしのもの (fast_fault): 途中のテーブルがなければ作って compare-exchange でつなぐ
+    /// (同じ表のスレッドが同時に作れば、負けたほうは返す)。テーブルは表を捨てるまで返さない (free_level) ので、
+    /// つないだものはそのまま使える。大きなロックを持って表を変えるもの (mutating) とは fast_users ですれちがう
+    fn walk_fast(&self, va: usize) -> Option<*mut u64> {
+        if va >= MAXVA {
+            return None;
+        }
+        let mut table = self.root;
+        for level in 1..3 {
+            let slot = unsafe { AtomicU64::from_ptr(table.add(index(va, level))) };
+            let mut e = slot.load(Ordering::Acquire);
+            if e & PTE_VALID == 0 {
+                // kalloc::alloc は 0 にしたページ。0 の中身が (表をたどる CPU にも) 見えてからつなぐ (walk と同じ)
+                let next = kalloc::alloc()?;
+                unsafe { core::arch::asm!("dmb ishst") };
+                let new = v2p(next as usize) as u64 | PTE_VALID | PTE_TABLE;
+                match slot.compare_exchange(e, new, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => e = new,
+                    Err(cur) => {
+                        kalloc::free(next);
+                        e = cur;
+                        if e & PTE_VALID == 0 {
+                            return None;
+                        }
+                    }
+                }
+            }
+            table = table_at(e);
         }
         Some(unsafe { table.add(index(va, 3)) })
     }
@@ -2416,7 +2477,8 @@ impl PageTable {
             return (false, None);
         }
         let page_va = pg_down(va);
-        let Some(pte) = self.walk(page_va, false) else { return (false, None) };
+        // まだテーブルのないところ (mmap はいつも先へ写すので、2 MiB ごとに) も、ここで作る
+        let Some(pte) = self.walk_fast(page_va) else { return (false, None) };
         let slot = unsafe { AtomicU64::from_ptr(pte) };
         let e = slot.load(Ordering::Acquire);
         if is_swap(e) {
@@ -2624,17 +2686,27 @@ impl PageTable {
         r
     }
 
-    /// 大きなロックなしの munmap (syscall::fast): [start, end) にかかる領域がみな、名前のない自分だけの無名のもので、
-    /// スワップへ出したページがないとき (ファイルの写し、共有のページ、スワップのスロット、名前の Rc は大きなロックで
-    /// 守っている)。スレッドで分けていない表だけ (fast_map と同じ)。ほかのスレッドがいないので、PTE を消して TLB を
-    /// 消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce で fast_users を待つが、
-    /// ここでは自分がそれ)。できないものと、だれかが変えている途中なら None (ふつうの道へ)
+    /// 大きなロックなしの munmap (syscall::fast): [start, end) にかかる領域がみな自分だけの (MAP_PRIVATE の) 無名か
+    /// ファイルの写しで、スワップへ出したページがないとき (共有のページとスワップのスロットは大きなロックで守っている)。
+    /// ファイルの写しと名前のある領域は、まるごと外すときだけ (分けると Rc を写すことになる)。外した Rc と写しの表の鍵は
+    /// drop_unmapped にまかせる。スレッドで分けていない表だけ (fast_map と同じ)。ほかのスレッドがいないので、PTE を消して
+    /// TLB を消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce で fast_users を
+    /// 待つが、ここでは自分がそれ)。ページキャッシュのページも参照を返すだけ。できないものと、だれかが変えている途中なら
+    /// None (ふつうの道へ)
     pub fn fast_unmap(&mut self, start: usize, end: usize) -> Option<()> {
         let (start, end) = (pg_down(start), pg_up(end));
         if start >= end || end > MAXVA || !self.fast_enter() {
             return None;
         }
-        let plain = self.vmas_in(start, end).all(|(_, v)| !v.shared && matches!(v.back, Backing::Anon) && v.name.is_none());
+        let whole = |s: usize, v: &Vma| s >= start && v.end <= end;
+        let plain = self.vmas_in(start, end).all(|(&s, v)| {
+            !v.shared
+                && match v.back {
+                    Backing::Anon => v.name.is_none() || whole(s, v),
+                    Backing::File { .. } => whole(s, v) && UNMAPPED_N.load(Ordering::Relaxed) < UNMAPPED_MAX,
+                    Backing::Pages { .. } => false,
+                }
+        });
         let mut swapped = false;
         if plain {
             self.each_entry(start, end, |_, pte| swapped |= is_swap(unsafe { *pte }));
@@ -2648,9 +2720,14 @@ impl PageTable {
         if self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start) {
             self.split(start);
             self.split(end);
+            let ranges = self.shared_ranges(start, end);
             let keys: Vec<usize> = self.vmas.range(start..end).map(|(&k, _)| k).collect();
+            // Rc を持つもの (ファイル、名前) は、捨てずに drop_unmapped へ
+            let mut held: Vec<Vma> = Vec::new();
             for k in keys {
-                self.vmas.remove(&k);
+                if let Some(v) = self.vmas.remove(&k).filter(|v| v.name.is_some() || !matches!(v.back, Backing::Anon)) {
+                    held.push(v);
+                }
             }
             let mut pages: Vec<*mut u8> = Vec::new();
             let mut vas: Vec<usize> = Vec::new();
@@ -2666,6 +2743,12 @@ impl PageTable {
             flush_pages_in(self.root_pa(), &vas);
             for p in pages {
                 kalloc::put(p);
+            }
+            if !held.is_empty() || !ranges.is_empty() {
+                let mut u = UNMAPPED.lock();
+                UNMAPPED_N.fetch_add(held.len().max(1), Ordering::Relaxed);
+                u.vmas.append(&mut held);
+                u.ranges.extend(ranges);
             }
         }
         self.fast_leave();

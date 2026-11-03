@@ -2,7 +2,9 @@
 //   スレッドが 1 つのプロセスが無名の領域を作って外すのを何千回もくりかえすあいだに、ほかのプロセスが
 //   /proc/PID/maps、stat、status を読みつづける (大きなロックを持ってほかの表を読む道: PageTable::hold)。
 //   外した真ん中だけ (領域を分ける)、いくつもの領域にかかる munmap、fork したあとの COW のページを外す、
-//   ファイルの写しのまざる範囲 (ふつうの道へ回る)、外したところに触ると SIGSEGV、のこりの中身が変わらないこと
+//   ファイルの写しのまざる範囲、外したところに触ると SIGSEGV、のこりの中身が変わらないこと。
+//   ファイルの写し (MAP_PRIVATE) の munmap: まるごと (大きなロックなし。inode と名前の Rc は vm::drop_unmapped があとで
+//   捨てる)、一部 (ふつうの道)、書いた写し、穴の 0 のページ、消したファイル (外したあと inode が片づく)、何千回も
 #include <errno.h>
 #include <fcntl.h>
 #include <setjmp.h>
@@ -11,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -115,6 +118,80 @@ int main(void) {
   CHECK(faults(a) && faults(a + PG) && faults(a + 2 * PG), "file range not unmapped");
   close(fd);
   unlink(path);
+
+  // 5. ファイルの写し (MAP_PRIVATE) の munmap
+  char fpath[] = "fastmap-fileXXXXXX";
+  int ff = mkstemp(fpath);
+  CHECK(ff >= 0, "file 5");
+  char page[PG];
+  for (int i = 0; i < 8; i++) {
+    memset(page, 'A' + i, PG);
+    CHECK(pwrite(ff, page, PG, (off_t)i * PG) == PG, "pwrite %d", i);
+  }
+  // まるごと外す
+  char *m = mmap(NULL, 8 * PG, PROT_READ, MAP_PRIVATE, ff, 0);
+  CHECK(m != MAP_FAILED, "mmap file");
+  int same = 1;
+  for (int i = 0; i < 8; i++)
+    same &= m[i * PG] == 'A' + i && m[i * PG + PG - 1] == 'A' + i;
+  CHECK(same, "file contents");
+  CHECK(munmap(m, 8 * PG) == 0, "munmap whole file mapping");
+  CHECK(faults(m) && faults(m + 7 * PG), "whole file mapping still there");
+  // 一部を外す (領域を分ける: ふつうの道)。のこりは同じ中身
+  m = mmap(NULL, 8 * PG, PROT_READ, MAP_PRIVATE, ff, 0);
+  CHECK(m != MAP_FAILED, "mmap file 2");
+  CHECK(munmap(m + 2 * PG, 2 * PG) == 0, "munmap part of a file mapping");
+  CHECK(faults(m + 2 * PG) && faults(m + 3 * PG), "part still there");
+  CHECK(m[0] == 'A' && m[PG] == 'B' && m[4 * PG] == 'E' && m[7 * PG] == 'H', "rest of the file mapping");
+  CHECK(munmap(m, 8 * PG) == 0, "munmap the rest");
+  // 書いた写し (自分のページ) を外しても、ファイルは変わらない
+  m = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, ff, 0);
+  CHECK(m != MAP_FAILED, "mmap file rw");
+  m[0] = 'z';
+  CHECK(munmap(m, 2 * PG) == 0, "munmap written private mapping");
+  CHECK(pread(ff, page, 1, 0) == 1 && page[0] == 'A', "private write reached the file");
+  // 無名の領域とファイルの写しがならぶ範囲を一度に
+  char *n = mmap(NULL, 4 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK(n != MAP_FAILED, "mmap anon 5");
+  CHECK(mmap(n + PG, 2 * PG, PROT_READ, MAP_PRIVATE | MAP_FIXED, ff, 2 * PG) == n + PG, "mmap file fixed 5");
+  n[0] = 1;
+  n[3 * PG] = 1;
+  CHECK(n[PG] == 'C' && n[2 * PG] == 'D', "file in the middle");
+  CHECK(munmap(n, 4 * PG) == 0, "munmap anon + file");
+  CHECK(faults(n) && faults(n + PG) && faults(n + 3 * PG), "anon + file still there");
+  // 穴 (0 のページ) を読んで外し、ファイルに書いてから写しなおすと、書いたもの
+  CHECK(ftruncate(ff, 12 * PG) == 0, "ftruncate holes");
+  m = mmap(NULL, 4 * PG, PROT_READ, MAP_PRIVATE, ff, 8 * PG);
+  CHECK(m != MAP_FAILED, "mmap holes");
+  CHECK(m[0] == 0 && m[3 * PG] == 0, "holes are not 0");
+  CHECK(munmap(m, 4 * PG) == 0, "munmap holes");
+  memset(page, 'h', PG);
+  CHECK(pwrite(ff, page, PG, 9 * PG) == PG, "pwrite into a hole");
+  m = mmap(NULL, 4 * PG, PROT_READ, MAP_PRIVATE, ff, 8 * PG);
+  CHECK(m != MAP_FAILED && m[0] == 0 && m[PG] == 'h', "hole written after the mapping went");
+  munmap(m, 4 * PG);
+  // 何千回も (外したものがたまっても)
+  int bad = 0;
+  for (int i = 0; i < 3000; i++) {
+    m = mmap(NULL, 8 * PG, PROT_READ, MAP_PRIVATE, ff, 0);
+    if (m == MAP_FAILED || m[(i % 8) * PG] != 'A' + i % 8 || munmap(m, 8 * PG) != 0)
+      bad++;
+  }
+  CHECK(bad == 0, "file map/unmap loop: %d bad", bad);
+  close(ff);
+  // 消したファイル: 写しだけが持っているものを外すと、inode が片づく (ファイルの数がもとにもどる)
+  struct statvfs v0, v1;
+  CHECK(statvfs(".", &v0) == 0, "statvfs");
+  char gpath[] = "fastmap-goneXXXXXX";
+  int gf = mkstemp(gpath);
+  CHECK(gf >= 0 && pwrite(gf, page, PG, 0) == PG, "file gone");
+  m = mmap(NULL, PG, PROT_READ, MAP_PRIVATE, gf, 0);
+  CHECK(m != MAP_FAILED && m[0] == 'h', "mmap gone");
+  close(gf);
+  unlink(gpath);
+  CHECK(munmap(m, PG) == 0, "munmap gone");
+  CHECK(statvfs(".", &v1) == 0 && v1.f_ffree == v0.f_ffree, "inode of the unlinked file not freed: %lu -> %lu", (unsigned long)v0.f_ffree, (unsigned long)v1.f_ffree);
+  unlink(fpath);
 
   // 4. いくつものプロセスが作って外すあいだに、親がそれぞれの /proc/PID/maps、stat、status を読む
   enum { N = 3, ROUNDS = 3000 };

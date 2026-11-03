@@ -956,9 +956,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
                 None => return false,
             }
         }
-        // 自分だけの無名の mmap (MAP_FIXED でないもの) と、そういう領域の munmap。スレッドで分けていない表だけ
-        // (vm::PageTable::fast_map、fast_unmap)。ファイル、共有、MAP_FIXED、スワップへ出したページのあるところ、知らない
-        // 印や prot は、ふつうの道 (sys_mmap、sys_munmap) へ
+        // 自分だけの無名の mmap (MAP_FIXED でないもの) と、自分だけの無名とファイルの写し (MAP_PRIVATE。ファイルはまるごと)
+        // の munmap。スレッドで分けていない表だけ (vm::PageTable::fast_map、fast_unmap)。ファイルの mmap、共有、MAP_FIXED、
+        // スワップへ出したページのあるところ、知らない印や prot は、ふつうの道 (sys_mmap、sys_munmap) へ
         MMAP if a[3] & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK) == 0
             && a[3] & (MAP_PRIVATE | MAP_ANONYMOUS) == MAP_PRIVATE | MAP_ANONYMOUS
             && a[2] & !7 == 0
