@@ -282,7 +282,7 @@ impl ProcInode {
                 let (st, sf) = crate::swap::totals();
                 format!(
                     // Buffers から下は、Linux の道具 (free、vmstat、top、psutil) が読む行。aios にない区分は 0
-                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nBuffers:      {:8} kB\nCached:       {:8} kB\nSwapCached:   {:8} kB\nActive:       {:8} kB\nInactive:     {:8} kB\nShmem:        {:8} kB\nSlab:         {:8} kB\nSReclaimable: {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\nDirty:        {:8} kB\n",
+                    "MemTotal:     {:8} kB\nMemFree:      {:8} kB\nMemAvailable: {:8} kB\nBuffers:      {:8} kB\nCached:       {:8} kB\nSwapCached:   {:8} kB\nActive:       {:8} kB\nInactive:     {:8} kB\nShmem:        {:8} kB\nSlab:         {:8} kB\nSReclaimable: {:8} kB\nSwapTotal:    {:8} kB\nSwapFree:     {:8} kB\nDirty:        {:8} kB\nPageTables:   {:8} kB\n",
                     total,
                     free,
                     free + crate::vm::cached_pages() * PGSIZE / 1024,
@@ -296,7 +296,8 @@ impl ProcInode {
                     0,
                     st * PGSIZE / 1024,
                     sf * PGSIZE / 1024,
-                    0
+                    0,
+                    crate::vm::table_pages() * PGSIZE / 1024
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),

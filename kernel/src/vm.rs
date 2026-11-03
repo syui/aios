@@ -1187,6 +1187,11 @@ pub struct PageTable {
     fclock: usize,
     /// 最近の map / protect / unmap (操作, 始め, 終わり, prot)。落ちたときに、そのアドレスにかかわったものを出す (調べもの用)
     hist: alloc::collections::VecDeque<(u8, usize, usize, u8)>,
+    /// いちばん新しく写した領域の終わり (つぎの mmap が来るところ)。そこの 2 MiB のテーブルは、空になっても返さずに
+    /// とっておく (unlink_tables: 小さな mmap と munmap をくりかえすたびに、テーブルを返して作りなおさないように)
+    last_end: usize,
+    /// とっておいたテーブルの 2 MiB のまど (つぎの unlink_tables で、もう last_end のものでなければ返す)
+    kept: usize,
 }
 
 /// hist に覚える数
@@ -1457,7 +1462,9 @@ pub fn deactivate() {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: kalloc::alloc()? as *mut u64, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new() })
+        let root = kalloc::alloc()? as *mut u64;
+        TABLES.fetch_add(1, Ordering::Relaxed);
+        Some(Self { root, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new(), last_end: 0, kept: usize::MAX })
     }
 
     /// exit で (大きなロックを持って、自分だけの表に。このあとすぐ捨てること): ページとテーブルを返すのは、この CPU が
@@ -1503,6 +1510,7 @@ impl PageTable {
                     return None;
                 }
                 let next = kalloc::alloc()? as *mut u64;
+                TABLES.fetch_add(1, Ordering::Relaxed);
                 // 0 にした中身が見えてから、ほかの CPU (copy_out_nofault) にたどらせる
                 unsafe { core::arch::asm!("dmb ishst") };
                 unsafe { *pte = v2p(next as usize) as u64 | PTE_VALID | PTE_TABLE };
@@ -1529,7 +1537,10 @@ impl PageTable {
                 unsafe { core::arch::asm!("dmb ishst") };
                 let new = v2p(next as usize) as u64 | PTE_VALID | PTE_TABLE;
                 match slot.compare_exchange(e, new, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => e = new,
+                    Ok(_) => {
+                        TABLES.fetch_add(1, Ordering::Relaxed);
+                        e = new;
+                    }
                     Err(cur) => {
                         kalloc::free(next);
                         e = cur;
@@ -1542,6 +1553,60 @@ impl PageTable {
             table = table_at(e);
         }
         Some(unsafe { table.add(index(va, 3)) })
+    }
+
+    /// munmap のあと (Linux の free_pgtables): [start, end) にかかる 2 MiB のまど (L3 のテーブル) と 1 GiB のまど (L2) の
+    /// うち、どの領域もかからないものを親から外し、外したテーブルのページを返す (返すのは呼ぶほう: TLB と、ロックなしで
+    /// たどる CPU を待ってから)。PTE があるのは領域の中だけなので、領域のかからないまどのテーブルは空 (念のため中を見て、
+    /// 空でなければ残す)。前はテーブルを表を捨てるまで返さず、mmap はいつも先へ写すので、mmap と munmap をくりかえす
+    /// プロセスは 2 MiB ごとにテーブルをふやしていた
+    fn unlink_tables(&mut self, start: usize, end: usize) -> Vec<*mut u8> {
+        const L3_SPAN: usize = 1 << 21;
+        // つぎの mmap が来る 2 MiB のテーブルはとっておく。前にとっておいたものが、もうそこでなければ見なおす
+        let keep = self.last_end & !(L3_SPAN - 1);
+        let old = core::mem::replace(&mut self.kept, keep);
+        let mut freed = self.unlink_tables_in(start, end, keep);
+        if old != keep && old != usize::MAX && !(start..end).contains(&old) {
+            freed.extend(self.unlink_tables_in(old, old + L3_SPAN, keep));
+        }
+        freed
+    }
+
+    fn unlink_tables_in(&self, start: usize, end: usize, keep: usize) -> Vec<*mut u8> {
+        const L3_SPAN: usize = 1 << 21;
+        const L2_SPAN: usize = 1 << 30;
+        let empty = |t: *mut u64| (0..512).all(|i| unsafe { *t.add(i) } == 0);
+        let mut freed = Vec::new();
+        let mut g = start & !(L2_SPAN - 1);
+        while g < end.min(MAXVA) {
+            let l1e = unsafe { self.root.add(index(g, 1)) };
+            let e1 = unsafe { *l1e };
+            if e1 & PTE_VALID != 0 {
+                let l2 = table_at(e1);
+                if !self.overlaps(g, g + L2_SPAN) && !(g..g + L2_SPAN).contains(&keep) {
+                    // 1 GiB にどの領域もない: L2 と、その下の L3 をみな
+                    let l3s: Vec<*mut u64> = (0..512).map(|i| unsafe { *l2.add(i) }).filter(|e| e & PTE_VALID != 0).map(table_at).collect();
+                    if l3s.iter().all(|&t| empty(t)) {
+                        unsafe { *l1e = 0 };
+                        freed.extend(l3s.into_iter().map(|t| t as *mut u8));
+                        freed.push(l2 as *mut u8);
+                    }
+                } else {
+                    let mut m = start.max(g) & !(L3_SPAN - 1);
+                    while m < end.min(g + L2_SPAN) {
+                        let l2e = unsafe { l2.add(index(m, 2)) };
+                        let e2 = unsafe { *l2e };
+                        if e2 & PTE_VALID != 0 && m != keep && !self.overlaps(m, m + L3_SPAN) && empty(table_at(e2)) {
+                            unsafe { *l2e = 0 };
+                            freed.push(table_at(e2) as *mut u8);
+                        }
+                        m += L3_SPAN;
+                    }
+                }
+            }
+            g += L2_SPAN;
+        }
+        freed
     }
 
     /// [start, end) のページを持っている PTE ごとに f (途中のテーブルがないところは飛ばす)
@@ -1744,6 +1809,7 @@ impl PageTable {
         }
         self.unmap_inner(start, end);
         self.note(b'm', start, end, prot);
+        self.last_end = end;
         self.vmas.insert(start, Vma { end, prot, shared, back, name: None });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
@@ -1764,6 +1830,20 @@ impl PageTable {
             self.note(b'u', s, e, 0);
         }
         self.unmap_inner(start, end);
+        // 空になったテーブル: 外して、表をたどる CPU のキャッシュ (walk cache) から消し、ロックなしでたどっている CPU を
+        // 待ってから返す
+        if s < e {
+            let _m = self.mutating();
+            let freed = self.unlink_tables(s, e);
+            if !freed.is_empty() {
+                flush_all_in(self.root_pa());
+                self.quiesce();
+                for t in freed {
+                    kalloc::free(t);
+                    TABLES.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     fn unmap_inner(&mut self, start: usize, end: usize) {
@@ -2677,6 +2757,7 @@ impl PageTable {
             Some(end) if end <= MAXVA && len != 0 => {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
+                self.last_end = end;
                 self.vmas.insert(va, Vma { end, prot, shared: false, back: Backing::Anon, name: None });
                 Some(va)
             }
@@ -2743,6 +2824,16 @@ impl PageTable {
             flush_pages_in(self.root_pa(), &vas);
             for p in pages {
                 kalloc::put(p);
+            }
+            // 空になったテーブルも (ほかのスレッドはいないので、TLB を消せば待たずに返せる: ページと同じ)
+            let tables = self.unlink_tables(start, end);
+            if !tables.is_empty() {
+                fence(Ordering::SeqCst);
+                flush_all_in(self.root_pa());
+                for t in tables {
+                    kalloc::free(t);
+                    TABLES.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             if !held.is_empty() || !ranges.is_empty() {
                 let mut u = UNMAPPED.lock();
@@ -3112,6 +3203,13 @@ impl Drop for PageTable {
     }
 }
 
+/// ページ表のテーブルのページの数 (根もふくむ。/proc/meminfo の PageTables)
+static TABLES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn table_pages() -> usize {
+    TABLES.load(Ordering::Relaxed)
+}
+
 /// どの CPU にも「載っている」と思わせない (activate_lazy が、同じ場所に作りなおされたものを載せなおすように)
 fn unload(root: usize) {
     for a in ACTIVE_ROOT.iter() {
@@ -3157,4 +3255,5 @@ fn free_level(table: *mut u64, level: usize, unlocked: bool) {
         }
     }
     kalloc::free(table as *mut u8);
+    TABLES.fetch_sub(1, Ordering::Relaxed);
 }

@@ -593,6 +593,28 @@ aios (tmpfs と ext4) でも Linux 7.4-rc1 でも 0 failed。4 つの CPU の ma
 ロックを待つ時間は 174% から 115%。かかる時間は 1 つで 272〜292 µs と前 (285〜320) とかわらず、4 つでまんなか 181 µs から
 165 µs ほど (のこりは TCG で全部の CPU に TLB を消させるところと、ページキャッシュのスピンロック)。
 
+### munmap で空になったページ表を返す (Linux の free_pgtables)
+
+ページ表のテーブル (L3 は 2 MiB、L2 は 1 GiB ぶん) は、作ったら表を捨てる (exit、exec) まで返さなかった。aios の mmap は
+いつも先へ写す (mmap_next、MAXVA で頭にもどる) ので、mmap と munmap をくりかえすプロセスは 2 MiB ごとにテーブルをふやし、
+1 MiB を 20000 回で 40 MB (MemFree がそれだけへったまま)、MAXVA (512 GiB) ぶんで 1 GiB までたまりえた。
+
+いまは munmap (vm::PageTable::unmap と、ロックなしの fast_unmap) のあと、外した範囲にかかる 2 MiB と 1 GiB のまどのうち、どの
+領域もかからないものの L3 / L2 を親から外して返す (unlink_tables)。PTE があるのは領域の中だけなので、そのテーブルは空 (念の
+ため中を見て、空でなければ残す)。返す前に、表をたどる CPU のキャッシュ (walk cache) を TLB ごと消し (flush_all_in。ほかの CPU
+が載せていなければ自分のものだけ)、大きなロックの道ではロックなしでたどっている CPU を待つ (quiesce: ページを返すときと同じ。
+外したあとにたどりはじめた CPU は 0 を読む)。fast_fault がロックなしで作るテーブル (walk_fast) とは mutating ですれちがう。
+返したまどをまた写せば、フォルトがテーブルを作りなおす。ただし、小さな mmap と munmap をくりかえすと、そのたびにテーブルを
+返して作りなおすことになる (bench smp の mmap が 23 µs から 82 µs になった) ので、いちばん新しく写した領域の終わり (つぎの mmap
+が来るところ) の 2 MiB のテーブルはとっておき、そこから動いたら次の unlink_tables で返す (とっておくのはいつも 1 つ)。Linux は
+上から写して外したところをまた使うので、同じことが起きにくい。
+
+/proc/meminfo に PageTables (テーブルのページの数: 根もふくむ) を足した。新しい test/pagetables.c (13 行: 1 MiB の mmap と
+munmap を 20000 回、ファイルの写し 5000 回、スレッドがいるとき 5000 回で PageTables が 256 kB もふえない、テーブルを返した
+まどをまた写すと 0、となりの 2 MiB のまどの中身はそのまま、ほかのスレッドが読みつづけるあいだに 2000 回写して書いて外しても
+0 か書いたものか SIGSEGV しか見えない) は Linux 7.4-rc1 と同じ。1 MiB を 20000 回のあとの MemFree のへりは 40080 kB から
+4 kB (とっておいた 1 つ)。bench smp の mmap と mmap-busy は前とゆれの中で同じ。
+
 ### AppArmor (Linux と同じプロファイル)
 
 AppArmor のプロファイル (文字で書いた決まり) は、Linux と同じく apparmor_parser がバイナリにして
