@@ -163,6 +163,9 @@ pub struct Dirents {
     generation: u64,
 }
 
+/// pidfd の印 (Linux の PIDFD_THREAD = O_EXCL): そのスレッドを指す pidfd (open のときだけの印なので、ほかのファイルには残らない)
+pub const PIDFD_THREAD: u32 = 0o200;
+
 pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
@@ -965,7 +968,11 @@ impl OpenFile {
             Kind::EventFd(e) => crate::epoll::readiness(e),
             Kind::TimerFd(t) => crate::timerfd::readiness(t),
             Kind::Inotify(n) => crate::inotify::readiness(n),
-            Kind::PidFd(pid) => (proc::has_exited(*pid), false, proc::has_exited(*pid)),
+            // 終わったら読める、片づけられたら POLLHUP も (PIDFD_THREAD のものは O_EXCL の印: そのスレッドを見る)
+            Kind::PidFd(pid) => {
+                let (exited, reaped) = proc::pidfd_state(*pid, self.flags & PIDFD_THREAD != 0);
+                (exited, false, reaped)
+            }
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
             Kind::Input(n) => (crate::input::readable(*n), false, false),
             Kind::SndPcm => crate::sound::readiness(),

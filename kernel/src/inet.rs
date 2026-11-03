@@ -3207,6 +3207,10 @@ pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
                 14 => int(0),
                 15 => int(s.reuseport as i64),
                 16 => return Err(-EOPNOTSUPP),
+                // SO_PASSPIDFD、SO_PASSPIDFD_THREAD、SO_PEERPIDFD_THREAD は AF_UNIX だけ。SO_PEERPIDFD は相手の pid がない
+                // (Linux 7.4 の sk_getsockopt)
+                76 | 86 | 87 => return Err(-EOPNOTSUPP),
+                77 => return Err(-61),
                 17 => {
                     let mut b = Vec::with_capacity(12);
                     b.extend_from_slice(&0u32.to_le_bytes());
@@ -3456,6 +3460,8 @@ fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
             }
             14 => {}
             16 => return Err(-EOPNOTSUPP),
+            // SO_PASSPIDFD と SO_PASSPIDFD_THREAD は AF_UNIX だけ (Linux 7.4 の sk_setsockopt)
+            76 | 86 => return Err(-EOPNOTSUPP),
             18 => {
                 let v = if v < 0 { i32::MAX } else { v };
                 if s.tcp {

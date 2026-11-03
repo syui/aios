@@ -112,8 +112,8 @@ enum State {
     Established,
 }
 
-/// (pid は本当の番号, uid, gid)
-pub type Cred = (u32, u32, u32);
+/// (pid は本当の番号, uid, gid, tid は送った・つないだスレッドの本当の番号: SO_PEERPIDFD_THREAD と SCM_PIDFD_THREAD)
+pub type Cred = (u32, u32, u32, u32);
 
 /// 受ける行列のメッセージ (Linux の skb)
 struct Msg {
@@ -193,9 +193,12 @@ pub struct Unix {
     wmem: usize,
     sndbuf: usize,
     rcvbuf: usize,
-    /// SO_PEERCRED
+    /// SO_PEERCRED (と SO_PEERPIDFD、SO_PEERPIDFD_THREAD)
     peercred: Option<Cred>,
     passcred: bool,
+    /// SO_PASSPIDFD と SO_PASSPIDFD_THREAD (7.4): 受けたものに、送った人の pidfd (SCM_PIDFD、SCM_PIDFD_THREAD)
+    passpidfd: bool,
+    passpidfd_thread: bool,
     passrights: bool,
     reuse: bool,
     keepalive: bool,
@@ -355,16 +358,32 @@ fn notify(u: &UnixRef) {
     proc::poll_wake(key(u));
 }
 
-/// いまのプロセスの (pid, euid, egid) (SO_PEERCRED: Linux の cred_to_ucred は euid)
+/// いまのプロセスの (pid, euid, egid, tid) (SO_PEERCRED: Linux の cred_to_ucred は euid)
 pub fn me() -> Cred {
     let c = proc::current_cred_ref();
-    (proc::current().tgid, c.euid, c.egid)
+    let p = proc::current();
+    (p.tgid, c.euid, c.egid, p.pid)
 }
 
-/// いまのプロセスの (pid, uid, gid) (メッセージの資格情報: Linux の current_uid_gid は本当の uid)
+/// いまのプロセスの (pid, uid, gid, tid) (メッセージの資格情報: Linux の current_uid_gid は本当の uid)
 fn me_real() -> Cred {
     let c = proc::current_cred_ref();
-    (proc::current().tgid, c.uid, c.gid)
+    let p = proc::current();
+    (p.tgid, c.uid, c.gid, p.pid)
+}
+
+/// 資格情報か pidfd を受けたいか (Linux 7.4 の unix_may_passcred: SO_PASSCRED、SO_PASSPIDFD、SO_PASSPIDFD_THREAD)
+fn may_passcred(s: &Unix) -> bool {
+    s.passcred || s.passpidfd || s.passpidfd_thread
+}
+
+/// 受けたもので、同じ書き手のものか (Linux の unix_skb_scm_eq: pid と uid と gid。スレッドの pidfd を受けるなら、
+/// 送ったスレッドも)
+fn same_writer(a: Option<Cred>, b: Option<Cred>, thread: bool) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.0 == y.0 && x.1 == y.1 && x.2 == y.2 && (!thread || x.3 == y.3),
+        (x, y) => x.is_none() && y.is_none(),
+    }
 }
 
 fn new_sock(typ: u8) -> UnixRef {
@@ -389,6 +408,8 @@ fn new_sock(typ: u8) -> UnixRef {
         rcvbuf: BUF_DEFAULT,
         peercred: None,
         passcred: false,
+        passpidfd: false,
+        passpidfd_thread: false,
         passrights: true,
         reuse: false,
         keepalive: false,
@@ -579,10 +600,10 @@ fn find_other(a: &[u8], typ: u8, net: u64) -> Result<UnixRef, i64> {
     abstract_names().get(&(net, typ, a.to_vec())).and_then(|w| w.upgrade()).ok_or(-ECONNREFUSED)
 }
 
-/// SO_PASSCRED で名前がない (送る前、つなぐ前に autobind する。Linux の unix_may_passcred)
+/// SO_PASSCRED (か SO_PASSPIDFD) で名前がない (送る前、つなぐ前に autobind する。Linux の unix_may_passcred)
 fn needs_autobind(u: &UnixRef) -> bool {
     let s = u.borrow();
-    s.passcred && s.addr.is_none()
+    may_passcred(&s) && s.addr.is_none()
 }
 
 /// 名前のないもの: 抽象名前空間の "\0%05x" (Linux の unix_autobind。もう名前があれば何もしない)
@@ -777,6 +798,8 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
         es.inode = o.inode.clone();
         es.fs_path = o.fs_path.clone();
         es.passcred = o.passcred;
+        es.passpidfd = o.passpidfd;
+        es.passpidfd_thread = o.passpidfd_thread;
         es.passrights = o.passrights;
         es.has_file = false;
         es.net = o.net;
@@ -972,7 +995,10 @@ pub fn scm_parse(b: &[u8]) -> Result<Scm, i64> {
                         return Err(-EPERM);
                     }
                     let g = crate::ns::to_global(pid).filter(|&g| g != 0 && crate::proc::find_any(g).is_some()).ok_or(-ESRCH)?;
-                    scm.cred = Some((g, uid, gid));
+                    // 自分のプロセスを名のるなら、送ったスレッドは自分 (Linux 7.4 の scm_send の thread_pid)
+                    let me = proc::current();
+                    let tid = if g == me.tgid { me.pid } else { g };
+                    scm.cred = Some((g, uid, gid, tid));
                 }
                 _ => return Err(crate::why::inval()),
             }
@@ -1060,10 +1086,10 @@ fn add_creds(cred: Option<Cred>, u: &UnixRef, other: &UnixRef) -> Option<Cred> {
         return cred;
     }
     // 相手は自分のこともある (自分に送る dgram): 1 つずつ借りる
-    let mine = u.borrow().passcred;
+    let mine = may_passcred(&u.borrow());
     let need = mine || {
         let o = other.borrow();
-        o.passcred || !o.has_file
+        may_passcred(&o) || !o.has_file
     };
     need.then(me_real)
 }
@@ -1310,7 +1336,7 @@ pub struct Recv {
     /// 付帯データを返す (Linux の scm_recv_unix。MSG_OOB で受けたときはない)
     pub scm: bool,
     pub fds: Vec<FileRef>,
-    /// SO_PASSCRED なら資格情報 (このプロセスから見た pid、uid、gid)
+    /// 送った人の資格情報 (本当の番号。SO_PASSCRED、SO_PASSPIDFD のとき: 見せかたは scm_out)。None は資格情報なし
     pub cred: Option<Cred>,
     /// msg_flags (MSG_TRUNC、MSG_OOB)
     pub flags: u32,
@@ -1325,10 +1351,10 @@ impl Recv {
     }
 }
 
-/// 資格情報の見せかた (なければ pid 0、uid と gid は overflowuid)
-fn show_cred(c: Option<Cred>) -> Cred {
+/// 資格情報の見せかた (なければ pid 0、uid と gid は overflowuid): (pid, uid, gid)
+fn show_cred(c: Option<Cred>) -> (u32, u32, u32) {
     match c {
-        Some((pid, uid, gid)) => (crate::ns::local_or_0(pid), crate::ns::show_uid(uid), crate::ns::show_gid(gid)),
+        Some((pid, uid, gid, _)) => (crate::ns::local_or_0(pid), crate::ns::show_uid(uid), crate::ns::show_gid(gid)),
         None => (0, OVERFLOW_ID, OVERFLOW_ID),
     }
 }
@@ -1340,9 +1366,10 @@ fn sender_name(m: &Msg, me: &Unix, u: &UnixRef) -> Option<Vec<u8>> {
     a.map(|a| (*a).clone())
 }
 
-/// SO_PASSCRED か (付帯データに資格情報を入れる)
-pub fn passcred(u: &UnixRef) -> bool {
-    u.borrow().passcred
+/// 付帯データに入れるもの: (SO_PASSCRED, SO_PASSPIDFD, SO_PASSPIDFD_THREAD)
+pub fn scm_opts(u: &UnixRef) -> (bool, bool, bool) {
+    let s = u.borrow();
+    (s.passcred, s.passpidfd, s.passpidfd_thread)
 }
 
 /// 受ける (recvfrom、recvmsg、read)。max は入れ物の大きさ
@@ -1410,7 +1437,7 @@ fn dgram_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Rec
             wait(key(u), timeo)?;
             continue;
         };
-        let passcred = s.passcred;
+        let passcred = may_passcred(&s);
         let from = sender_name(&s.q[i], &s, u);
         let m = &mut s.q[i];
         let len = m.len();
@@ -1426,7 +1453,7 @@ fn dgram_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Rec
         out.ret = if flags & MSG_TRUNC != 0 { len - skip } else { size };
         out.from = from;
         if passcred {
-            out.cred = Some(show_cred(m.cred));
+            out.cred = m.cred;
         }
         if peek {
             if len == 0 {
@@ -1542,7 +1569,7 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
     let mut out = Recv::new();
     let mut size = max;
     let mut err = 0i64;
-    // SO_PASSCRED なら、はじめのメッセージの資格情報を見せ、ちがう人のものはつなげない
+    // SO_PASSCRED (か SO_PASSPIDFD) なら、はじめのメッセージの資格情報を見せ、ちがう人のものはつなげない
     let mut creds: Option<Option<Cred>> = None;
     let mut dropped = Freed::default();
     'redo: loop {
@@ -1601,10 +1628,11 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
                     cur = None;
                     continue;
                 }
-                let passcred = s.passcred;
+                let passcred = may_passcred(&s);
+                let thread = s.passpidfd_thread;
                 let m = &s.q[i];
                 match creds {
-                    Some(c) if c != m.cred => break 'redo,
+                    Some(c) if !same_writer(c, m.cred, thread) => break 'redo,
                     None if passcred => creds = Some(m.cred),
                     _ => {}
                 }
@@ -1674,7 +1702,7 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
         return Err(-err);
     }
     if let Some(c) = creds {
-        out.cred = Some(show_cred(c));
+        out.cred = c;
     }
     out.ret = out.data.len();
     Ok(out)
@@ -2317,7 +2345,12 @@ const SO_DOMAIN: i32 = 39;
 const SO_PEEK_OFF: i32 = 42;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
+const SO_PASSPIDFD: i32 = 76;
+const SO_PEERPIDFD: i32 = 77;
 const SO_PASSRIGHTS: i32 = 83;
+const SO_PASSPIDFD_THREAD: i32 = 86;
+const SO_PEERPIDFD_THREAD: i32 = 87;
+const ENODATA: i64 = 61;
 
 fn timeval(ns: u64) -> Vec<u8> {
     let mut b = Vec::with_capacity(16);
@@ -2363,7 +2396,20 @@ pub fn getsockopt(u: &UnixRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
         SO_RCVLOWAT => int(s.rcvlowat as i64),
         SO_SNDLOWAT => int(1),
         SO_PASSCRED => int(s.passcred as i64),
+        SO_PASSPIDFD => int(s.passpidfd as i64),
+        SO_PASSPIDFD_THREAD => int(s.passpidfd_thread as i64),
         SO_PASSRIGHTS => int(s.passrights as i64),
+        // 相手 (つないだ、listen した、socketpair を作った人) を指す pidfd を fd の表に入れて、その番号 (Linux の
+        // sk_getsockopt_peerpidfd: 長さは 4 まで。相手がもう片づけられていても作る)
+        SO_PEERPIDFD | SO_PEERPIDFD_THREAD => {
+            let Some((pid, _, _, tid)) = s.peercred else { return Err(-ENODATA) };
+            drop(s);
+            let thread = opt == SO_PEERPIDFD_THREAD;
+            let fd = crate::syscall::pidfd_install(if thread { tid } else { pid }, thread, false)?;
+            let mut v = int(fd as i64);
+            v.truncate(len as usize);
+            return Ok(v);
+        }
         SO_ACCEPTCONN => int((s.state == State::Listen) as i64),
         SO_PEEK_OFF => int(s.peek_off as i64),
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => timeval(s.rcvtimeo),
@@ -2371,7 +2417,7 @@ pub fn getsockopt(u: &UnixRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
         SO_PEERCRED => {
             // 相手がいないものは pid 0、uid と gid は -1 (Linux の cred_to_ucred)
             let (pid, uid, gid) = match s.peercred {
-                Some((p, u, g)) => (crate::ns::local_or_0(p), crate::ns::show_uid(u), crate::ns::show_gid(g)),
+                Some((p, u, g, _)) => (crate::ns::local_or_0(p), crate::ns::show_uid(u), crate::ns::show_gid(g)),
                 None => (0, u32::MAX, u32::MAX),
             };
             let mut b = Vec::with_capacity(12);
@@ -2457,6 +2503,8 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
             }
             SO_RCVLOWAT => s.rcvlowat = if v < 0 { i32::MAX } else if v == 0 { 1 } else { v },
             SO_PASSCRED => s.passcred = b,
+            SO_PASSPIDFD => s.passpidfd = b,
+            SO_PASSPIDFD_THREAD => s.passpidfd_thread = b,
             SO_PASSRIGHTS => s.passrights = b,
             _ => return Err(-ENOPROTOOPT),
         }
@@ -2468,30 +2516,35 @@ pub fn setsockopt(u: &UnixRef, level: i32, opt: i32, val: &[u8]) -> R {
 
 // ---- 受けた fd と資格情報を付帯データに (Linux の scm_recv_unix) ----
 
-/// 付帯データ: 入れ物の中のどこに何を書くか (資格情報と fd の 2 つまで)、使った長さ (msg_controllen に返すもの)、
-/// msg_flags (MSG_CTRUNC)
+/// 付帯データ: 入れ物の中のどこに何を書くか (資格情報、fd、pidfd、スレッドの pidfd の 4 つまで)、使った長さ
+/// (msg_controllen に返すもの)、msg_flags (MSG_CTRUNC)
 pub struct ScmOut {
-    pub writes: [Option<(usize, Vec<u8>)>; 2],
+    pub writes: [Option<(usize, Vec<u8>)>; 4],
     pub used: usize,
     pub flags: u32,
 }
 
-/// cmsghdr の頭 (cmsg_len、cmsg_level、cmsg_type) を b の先に書く
 fn cmsg_head(b: &mut [u8], len: usize, typ: i32) {
     b[..8].copy_from_slice(&(len as u64).to_le_bytes());
     b[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
     b[12..16].copy_from_slice(&typ.to_le_bytes());
 }
 
-/// space は入れ物の長さ (msg_control が NULL なら None)。fd はこのプロセスの fd にする (入らなかったものは閉じる)
-pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool) -> ScmOut {
-    let mut out = ScmOut { writes: [None, None], used: 0, flags: 0 };
+const SCM_PIDFD: i32 = 4;
+const SCM_PIDFD_THREAD: i32 = 5;
+
+/// opts は scm_opts (SO_PASSCRED, SO_PASSPIDFD, SO_PASSPIDFD_THREAD)。space は入れ物の長さ (msg_control が NULL なら
+/// None)。fd はこのプロセスの fd にする (入らなかったものは閉じる)。並びは Linux 7.4 の scm_recv_unix と同じ:
+/// SCM_CREDENTIALS、SCM_RIGHTS、SCM_PIDFD、SCM_PIDFD_THREAD
+pub fn scm_out(r: &mut Recv, opts: (bool, bool, bool), space: Option<usize>, cloexec: bool) -> ScmOut {
+    let (passcred, pidfd, pidfd_thread) = opts;
+    let mut out = ScmOut { writes: [None, None, None, None], used: 0, flags: 0 };
     let fds = core::mem::take(&mut r.fds);
     if !r.scm {
         return out;
     }
     let Some(room) = space else {
-        if passcred || !fds.is_empty() {
+        if passcred || pidfd || pidfd_thread || !fds.is_empty() {
             out.flags |= MSG_CTRUNC;
         }
         return out;
@@ -2499,7 +2552,7 @@ pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool
     let mut left = room;
     // SCM_CREDENTIALS (Linux の put_cmsg: 入らなければ切って MSG_CTRUNC)
     if passcred {
-        let (pid, uid, gid) = r.cred.unwrap_or((0, OVERFLOW_ID, OVERFLOW_ID));
+        let (pid, uid, gid) = show_cred(r.cred);
         if left < 16 {
             out.flags |= MSG_CTRUNC;
         } else {
@@ -2537,11 +2590,35 @@ pub fn scm_out(r: &mut Recv, passcred: bool, space: Option<usize>, cloexec: bool
             let cmlen = b.len();
             cmsg_head(&mut b, cmlen, SCM_RIGHTS);
             out.writes[1] = Some((out.used, b));
-            out.used += ((cmlen + 7) & !7).min(left);
+            let step = ((cmlen + 7) & !7).min(left);
+            out.used += step;
+            left -= step;
         }
         if n < fds.len() || fdmax == 0 {
             out.flags |= MSG_CTRUNC;
         }
+    }
+    // SCM_PIDFD と SCM_PIDFD_THREAD (Linux の scm_pidfd_recv): 1 つ 20 バイトが入らなければ MSG_CTRUNC (送った人が
+    // わからなくても)。わからなければ何も入れない。pidfd はいつも close-on-exec で、作れなければ -errno をそのまま入れる。
+    // 送った人がもう片づけられていても作る (PIDFD_STALE)
+    for (slot, want, typ) in [(2, pidfd, SCM_PIDFD), (3, pidfd_thread, SCM_PIDFD_THREAD)] {
+        if !want {
+            continue;
+        }
+        if left < 16 + 4 {
+            out.flags |= MSG_CTRUNC;
+            continue;
+        }
+        let Some((pid, _, _, tid)) = r.cred else { continue };
+        let thread = typ == SCM_PIDFD_THREAD;
+        let fd = crate::syscall::pidfd_install(if thread { tid } else { pid }, thread, false).unwrap_or_else(|e| e as i32);
+        let mut b = alloc::vec![0u8; 20];
+        cmsg_head(&mut b, 20, typ);
+        b[16..20].copy_from_slice(&fd.to_le_bytes());
+        out.writes[slot] = Some((out.used, b));
+        let step = 24.min(left);
+        out.used += step;
+        left -= step;
     }
     out
 }

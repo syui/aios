@@ -1095,8 +1095,8 @@ Linux 7.4 は 11 月 1 日に rc1 が出た (安定版はまだ 7.3.1)。新し�
   aios は preadv と pwritev でも off の -1 を「いまの位置」にしていた (それは preadv2 と pwritev2 だけ。Linux の preadv(-1) は
   EINVAL) のを直した
 - copy_file_range: 写すものが 0 バイトなら、書く側の大きさの上限 (EFBIG) を見ない
-- まだ (aios にもとからないもの): SO_PASSPIDFD_THREAD / SO_PEERPIDFD_THREAD (aios は SO_PEERPIDFD もまだ)、
-  SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV (seccomp の user notification)、OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
+- SO_PASSPIDFD_THREAD / SO_PEERPIDFD_THREAD: 下の「相手を pidfd で見る」(2026-11-03)
+- まだ (aios にもとからないもの): SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV (seccomp の user notification)、OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
   (aios は ABI 4)、ctnetlink の CTA_FILTER_ZONE、RTM_GETMULTICAST (PF_PACKET) と IFA_F_GLOBAL、リンクの IFLA_PACING_OFFLOAD
   (aios のリンクの答えはもとから一部の属性だけ)
 
@@ -1104,6 +1104,34 @@ Linux 7.4 は 11 月 1 日に rc1 が出た (安定版はまだ 7.3.1)。新し�
 0 differ。test/nftables.c の出力 (457 行) と test/netlink.c (79) も 7.4-rc1 と同じ。test/nfteval.c (394 行)、
 test/chosen.c (aios がえらんだちがいは 7.4 でもみな Linux とちがう)、test/inetsock.c (81) と test/unixsock.c (60) は、Linux 7.3.1
 と 7.4-rc1 の答えが同じ (7.3.1 と同じだった aios はそのまま)。
+
+### 相手を pidfd で見る (SO_PEERPIDFD、SCM_PIDFD、7.4 の _THREAD)
+
+systemd や dbus-broker は、AF_UNIX の相手を番号 (SO_PEERCRED の pid は、相手が終わって番号が使いまわされると別人を指す)
+ではなく pidfd で持つ。aios は ENOPROTOOPT だった。Linux 7.4-rc1 の net/core/sock.c、scm.c、af_unix.c、fs/pidfs.c と同じに:
+
+- SO_PEERPIDFD (77): 相手 (connect した、listen した、socketpair を作った人。SO_PEERCRED と同じ時に覚える) を指す pidfd を
+  fd の表に入れて返す (長さは 4 まで、いつも close-on-exec)。相手がいなければ ENODATA。相手がもう片づけられていても作る
+  (Linux の PIDFD_STALE: シグナルは ESRCH、poll はすぐ POLLIN | POLLHUP)。SO_PEERPIDFD_THREAD (87、7.4) は、つないだ
+  スレッドを指す PIDFD_THREAD の pidfd
+- SO_PASSPIDFD (76) と SO_PASSPIDFD_THREAD (86、7.4): 受けたものに SCM_PIDFD (4) と SCM_PIDFD_THREAD (5) を足す。並びは
+  SCM_CREDENTIALS、SCM_RIGHTS、SCM_PIDFD、SCM_PIDFD_THREAD。1 つ 20 バイトが入らなければ MSG_CTRUNC (送った人がわからなく
+  ても)、msg_control が NULL でも MSG_CTRUNC。送ったものに資格情報がつくのは、どちらかがこの 3 つ (SO_PASSCRED もふくむ:
+  7.4 の unix_may_passcred) のどれかのとき。名前のないものは autobind。accept した口は listen したものから受けつぐ
+- stream は、SO_PASSPIDFD_THREAD なら、同じプロセスでも別のスレッドが書いたものをつなげない (7.4 の unix_skb_scm_eq)
+- メッセージと相手の資格情報 (unix::Cred) に、送った・つないだスレッドの番号を足した。SCM_CREDENTIALS で自分のプロセスを
+  名のれば、そのスレッドは自分
+- AF_INET: SO_PEERPIDFD は ENODATA、ほかの 3 つは EOPNOTSUPP
+- pidfd: PIDFD_THREAD (O_EXCL。F_GETFL に見える) の pidfd を持てるように。pidfd_open は PIDFD_THREAD でスレッドの番号を
+  受け、代表でないスレッドを PIDFD_THREAD なしで指せば ENOENT (7.4)、終わってまだ片づけられていないものも開ける。
+  pidfd_send_signal は PIDFD_THREAD ならそのスレッドに、ほかはプロセスに (kill と同じく、ゾンビには送れて何も起きない:
+  前は ESRCH)。poll は終わったら POLLIN、片づけられたら POLLHUP も (前は終わったら POLLHUP も)
+
+`test/peerpidfd.c` (71 行: pidfd_open、socketpair・listen・connect・accept・片づけたあとの SO_PEERPIDFD と _THREAD、
+SO_PASSPIDFD の get / set、AF_INET の TCP と UDP、dgram の SCM_PIDFD (子が送って終わった、片づけたあと)、入れ物の大きさ
+7 とおりの MSG_CTRUNC、SCM_RIGHTS といっしょの並び、スレッドが送ったもの、stream のつなぎかた) は Linux 7.4-rc1 と 1 バイトも
+ちがわない。pidfd がどれを指すかは、子なら waitid(P_PIDFD) の si_pid、スレッドなら pidfd_send_signal で起きたハンドラの
+gettid で見る。/proc/PID/fdinfo (pidfd の Pid:) と PIDFD_GET_INFO はまだ (todo.json の pidfd-info)。
 
 ### Linux と答えあわせ (sysdiff)
 

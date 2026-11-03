@@ -1283,7 +1283,7 @@ pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
             }
             let space = (m.control != 0).then_some(m.controllen);
             let cloexec = flags & crate::unix::MSG_CMSG_CLOEXEC != 0;
-            let out = crate::unix::scm_out(&mut r, crate::unix::passcred(&u), space, cloexec);
+            let out = crate::unix::scm_out(&mut r, crate::unix::scm_opts(&u), space, cloexec);
             for (off, b) in out.writes.iter().flatten() {
                 pt.copy_out(m.control + off, b).ok_or(-EFAULT)?;
             }

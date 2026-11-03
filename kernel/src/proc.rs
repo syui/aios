@@ -2089,9 +2089,15 @@ pub fn group_utime(tgid: u32) -> u64 {
     live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
 }
 
-/// pidfd: そのプロセスが終わった (ゾンビか、もういない) か
-pub fn has_exited(pid: u32) -> bool {
-    !live().any(|p| p.pid == pid && !p.thread && p.state != State::Unused && p.state != State::Zombie)
+/// pidfd のようす (Linux の pidfd_poll): (終わった, 片づけられた)。thread なら PIDFD_THREAD の pidfd で、pid はそのスレッドの
+/// 番号 (スレッドは終わるとすぐ片づくので、両方とも true になる)。プロセスのものは代表がゾンビなら終わった、もういなければ
+/// 片づけられた
+pub fn pidfd_state(pid: u32, thread: bool) -> (bool, bool) {
+    let p = live().find(|p| p.pid == pid && p.state != State::Unused && (thread || !p.thread));
+    match p {
+        None => (true, true),
+        Some(p) => (p.state == State::Zombie, false),
+    }
 }
 
 /// 止められたスレッドグループの再開を待つ (SIGCONT か SIGKILL まで)。
