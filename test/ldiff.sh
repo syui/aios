@@ -8,6 +8,9 @@
 #     4. くらべる: 同じなら "same: N lines"、ちがえば diff -u (--- Linux、+++ aios) と、それぞれの終わりの番号
 #   --root: Linux は rootexec、aios は sudo -n で (test/apparmor.c のようなもの)
 #   引数の @home は ext4 のところ: Linux は /work、aios はホーム ($HOME) に読みかえる (test/chosen.c @home /tmp など)
+#     5. 手本の Linux に足りない機能 (aios にはある) を知らせる: test/features.c を両方で動かしてくらべる。テストが使う
+#        機能が手本の Linux になければ、ENOSYS や EINVAL がテストの答えにかくれて同じに見えることがある (そのときは
+#        test/linux.config に足す)。LDIFF_NO_FEATURES=1 で見ない
 #   出力: build/ldiff/NAME.linux と NAME.aios。終わりの番号: 同じなら 0、ちがえば 1、動かせなければ 2
 # Linux は nobody で、aios は ai で動く。uid や pid の番号をじかに出すテストは、そのぶんちがって見える (あてはまるかを出す)
 set -e
@@ -96,11 +99,24 @@ fi
 cp "$ans.out" "$lout"
 lst=$(cat "$ans.st" 2>/dev/null || echo '?')
 
+# 手本の Linux に足りない機能 (aios にはある)。features そのものと、その中からは見ない
+lacks() {
+  [ "$name" = features ] && return 0
+  [ -n "${LDIFF_NO_FEATURES:-}" ] && return 0
+  LDIFF_NO_FEATURES=1 sh "$0" --linux "$ver" features >/dev/null 2>&1 || true
+  l=build/ldiff/features.linux a=build/ldiff/features.aios
+  [ -s "$l" ] && [ -s "$a" ] || return 0
+  miss=$(awk 'NR == FNR { lin[$1] = $2; next } $2 == "yes" && lin[$1] == "no" { printf "%s ", $1 }' "$l" "$a")
+  [ -z "$miss" ] || echo "note: the reference Linux lacks what aios has: $miss(test/features.c; if the test uses them, add them to test/linux.config)"
+}
+
 if cmp -s "$lout" "$aout"; then
   echo "same: $(wc -l < "$lout") lines (Linux $v exit $lst, aios exit $(echo "$ast" | head -1))"
+  lacks
   exit 0
 fi
 diff -u --label "Linux $v" --label aios "$lout" "$aout" || true
 echo "differ: Linux $v exit $lst, aios exit $(echo "$ast" | head -1)"
 echo "$ast" | tail -n +2 | sed 's/^/aios stderr: /'
+lacks
 exit 1

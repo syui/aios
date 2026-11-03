@@ -1274,6 +1274,14 @@ stderr の終わり。Linux の答えは build/linux-answers/ にとっておき
 のぞき、aios の出力を vm.py get で取り出して diff していた。test/linux-vm.sh は、Linux を作るとき (15 分ほど) に、作り
 はじめと終わりを stderr で知らせる (前は終わるまで何も出さず、止まっているのか見わけられなかった)。
 
+くらべたあと、手本の Linux に足りない機能 (aios にはある) を 1 行で知らせる (`note: the reference Linux lacks what aios
+has: ...`)。test/features.c (システムコールが ENOSYS か、namespace を作れるか、ソケットの family、LSM、/proc と /sys の
+もの: 76 こを yes / no で) を両方で動かしてくらべる。手本の Linux は tinyconfig に test/linux.config を足したものなので、
+テストが使う機能がないと、ENOSYS や EINVAL がテストの答えにかくれて同じに見える (CONFIG_USER_NS がなかったとき、
+test/landlockabi.c の namespace の行が、どちらも「止められていない」に見えた)。そのときは test/linux.config に足す。
+`test/ldiff.sh features` は、両方の機能の一覧そのものをくらべる (aios にないもの: IPv6、cgroup と time の namespace、
+/proc/self/mountinfo、NETLINK_AUDIT など)。
+
 ### Linux と答えあわせ (sysdiff)
 
 test/sysdiff.c は、種 (seed) から決まるシステムコールの並び (open、openat2、read、write、pread、lseek、truncate、stat、statx、
