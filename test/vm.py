@@ -6,7 +6,9 @@
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
 #   test/vm.py bg 'CMD'            中でうしろで動かしてすぐ答える ({"job": ID})。長いもの (ap -S firefox など) のあいだも run が使える
 #   test/vm.py job [ID] [-w SEC] [--kill]
-#                                  うしろのものの様子と、前に見せたところから先の出力 (-w 秒まで終わるのを待つ。ID がなければ一覧)
+#                                  うしろのものの様子と、前に見せたところから先の出力 (-w 秒まで終わるのを待つ。ID がなければ一覧)。
+#                                  終わったのは、終わりの番号があるか、そのグループにゾンビでないものがもういないとき。VM が
+#                                  いそがしくて読めなければ busy: true (終わったとは言わない。また聞く)
 #   test/vm.py type 'TEXT'         画面のキーボードで打つ (\n で Enter。aiwm の上の aiterm など)
 #   test/vm.py keys ARG...         画面のキーボードで: @ で始まるものは QEMU のキーの名前 (@alt-b @ctrl-l @ret @f5)、
 #                                  ほかは文字として打つ (vm.py keys @ctrl-l 'example.com' @ret)
@@ -220,18 +222,29 @@ class Serve:
             self.run('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && {{ kill -TERM -$p 2>/dev/null || kill -TERM $p; }}'.format(f=f), 20)
         mark = '@@VMJOB@@'
         end = time.time() + wait
+        # 様子を読むのに使ってよいのは、待つ長さの 10 秒あとまで (aish の vm job は wait + 15 秒で見切る)。VM がいそがしくて
+        # 読めなければ、エラーにせず、その時までくりかえす。それでも読めなければ busy (終わったとは言わない)
+        last = end + 10
         while True:
-            # pid がいるか、終わりの番号 (なければ空)、ログの大きさ、まだ見せていないところ。pid を先に見る: 番号を先に読むと、
-            # そのあいだに終わったものが「番号のないまま終わった」に見えた (ap -Sy ncurses が exit ? になった。.rc は 0)。
-            # 子は .rc を書いてから終わるので、いないと見たあとに読めば番号はある
-            r = self.run(('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && [ -d /proc/$p ] && echo alive; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
-                          'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit), 30)
+            # いるか: そのグループ (aish はうしろのものを pid と同じ番号のグループに入れる) に、ゾンビでないものがいるか。
+            # pid だけを見ると、外側のサブシェルが先にいなくなって、中のもの (sysdiff など) がまだ動いているのに「番号の
+            # ないまま終わった」に見えた。ps がなければ /proc/PID で。
+            # pid を先に見る: 番号を先に読むと、そのあいだに終わったものが「番号のないまま終わった」に見えた
+            # (ap -Sy ncurses が exit ? になった。.rc は 0)。子は .rc を書いてから終わるので、いないと見たあとに読めば番号はある
+            r = self.run(('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && {{ ps -e -o pgid=,stat= 2>/dev/null | awk -v g="$p" \'$1 == g && $2 !~ /^Z/ {{ f = 1 }} END {{ exit !f }}\' '
+                          '|| {{ ! ps -o pid= >/dev/null 2>&1 && [ -d /proc/$p ]; }}; }} && echo alive; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
+                          'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit),
+                         max(5, min(30, last - time.time())))
             # aish が、しくじったコマンドのわけ (aish: why: ...) を端末に出すことがある (.rc がまだないときの cat):
             # 番号やログとまちがえないように捨てる
             out = '\n'.join(l for l in r.get('out', '').split('\n') if 'aish: why:' not in l)
             parts = out.split(mark)
-            if len(parts) < 4:
-                return {'error': 'could not read the job', 'out': r.get('out', '')}
+            if r.get('timeout') or len(parts) < 4:
+                if time.time() + 5 < last:
+                    time.sleep(1)
+                    continue
+                return {'id': jid, 'done': False, 'busy': True, 'ms': int((time.time() - j['t0']) * 1000), 'out': '', 'shown_before': j['shown'],
+                        'note': 'the VM was too busy to answer in time; the job was not seen to end (ask again)'}
             alive, rc, size, new = 'alive' in parts[0], parts[1].strip(), parts[2].strip(), parts[3]
             done = rc != '' or not alive
             if done or time.time() >= end:
