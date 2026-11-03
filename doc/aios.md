@@ -1263,6 +1263,17 @@ kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。
 スレッドと 4 つの大きさで、pidfd_getfd、pidfd_send_signal の flags と siginfo) は Linux 7.4-rc1 と 1 バイトもちがわない。
 番号 (pid、ino、mnt_id) と uid はじかに出さず、あてはまるかを出す。
 
+### 出すだけのテストの答えあわせ (test/ldiff.sh)
+
+`test/ldiff.sh [--root] [--linux VER] [--fresh] NAME [ARG...]` は、出すだけのテスト (test/NAME.c) を作って (test/bin/NAME)、
+手本の Linux (test/linux-vm.sh exec。既定は mainline) と、いま動いている aios の VM (test/vm.py start --www test) で同時に
+動かし、出力をくらべる。同じなら `same: N lines`、ちがえば `diff -u` (- が Linux、+ が aios) と両方の終わりの番号と aios の
+stderr の終わり。Linux の答えは build/linux-answers/ にとっておき、プログラムと引数と Linux の版と test/linux.config が
+同じなら動かしなおさない (aios だけ直したときは数秒で終わる)。引数の `@home` は ext4 のところ (Linux は /work、aios は
+ホーム)。`--root` は Linux の rootexec と aios の sudo -n。前は、Linux の出力から `.config:` の警告と終わりの番号を手で
+のぞき、aios の出力を vm.py get で取り出して diff していた。test/linux-vm.sh は、Linux を作るとき (15 分ほど) に、作り
+はじめと終わりを stderr で知らせる (前は終わるまで何も出さず、止まっているのか見わけられなかった)。
+
 ### Linux と答えあわせ (sysdiff)
 
 test/sysdiff.c は、種 (seed) から決まるシステムコールの並び (open、openat2、read、write、pread、lseek、truncate、stat、statx、

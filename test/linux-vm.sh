@@ -60,6 +60,13 @@ build() {
     return
   fi
   mkdir -p "$out"
+  # 15 分ほどかかる。終わるまで何も出さないと、作っているのか止まっているのかわからないので知らせる (stderr)
+  if [ -s "$out/Image" ]; then
+    echo "linux-vm: building Linux $v again: test/linux.config changed (about 15 minutes)" >&2
+  else
+    echo "linux-vm: building Linux $v (about 15 minutes)" >&2
+  fi
+  t0=$(date +%s)
   major=${v%%.*}
   tar=$dir/linux-$v.tar.xz
   case $v in
@@ -96,11 +103,13 @@ build() {
   grep '^CONFIG_' "$top/test/linux.config" | while IFS= read -r l; do
     grep -qx "$l" "$obj/.config" || echo "linux-vm: $l did not stick" >&2
   done
+  echo "linux-vm: compiling (make -j$(nproc) Image)" >&2
   mk -j"$(nproc)" Image
   cp "$obj/arch/arm64/boot/Image" "$out/Image"
   cp "$obj/.config" "$out/config"
   echo "$sum" > "$out/config.sha256"
   rm -rf "$src" "$obj" "$tar"
+  echo "linux-vm: built $out/Image in $(( $(date +%s) - t0 )) s" >&2
   echo "$out/Image"
 }
 
