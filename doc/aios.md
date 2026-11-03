@@ -1266,13 +1266,20 @@ kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 
 `test/ldiff.sh [--root] [--linux VER] [--fresh] NAME [ARG...]` は、出すだけのテスト (test/NAME.c) を作って (test/bin/NAME)、
-手本の Linux (test/linux-vm.sh exec。既定は mainline) と、いま動いている aios の VM (test/vm.py start --www test) で同時に
+手本の Linux (test/linux-vm.sh exec。既定は mainline) と、いま動いている aios の VM (test/vm.py start --www test。
+`--kernel .` なら作業中のソースのカーネルを作って起こしなおしてから) で同時に
 動かし、出力をくらべる。同じなら `same: N lines`、ちがえば `diff -u` (- が Linux、+ が aios) と両方の終わりの番号と aios の
 stderr の終わり。Linux の答えは build/linux-answers/ にとっておき、プログラムと引数と Linux の版と test/linux.config が
 同じなら動かしなおさない (aios だけ直したときは数秒で終わる)。引数の `@home` は ext4 のところ (Linux は /work、aios は
 ホーム)。`--root` は Linux の rootexec と aios の sudo -n。前は、Linux の出力から `.config:` の警告と終わりの番号を手で
 のぞき、aios の出力を vm.py get で取り出して diff していた。test/linux-vm.sh は、Linux を作るとき (15 分ほど) に、作り
 はじめと終わりを stderr で知らせる (前は終わるまで何も出さず、止まっているのか見わけられなかった)。
+
+`test/vm.py start --kernel .|FILE|COMMIT [--snapshot] [--off NAME,...] [--www DIR]` は、aish の `vm start kernel=` と同じ
+作りかたと置き場 (build/aish-vm/kernels。コミットは build/aish-vm/wt で作る) でカーネルを作り、動いている VM を止めて
+起こしなおす。aish の MCP がつながらないときも、これだけで作業中のカーネルをためせる (前は AIOS_INITRD=none と
+CARGO_TARGET_DIR と AIOS_KERNEL と AIOS_QEMU_ARGS=-snapshot を手でそろえていた)。`vm.py job` は、job のプロセスグループに
+ゾンビでないものがいるあいだは終わったと言わず、VM がいそがしくて読めなければ busy で答える。
 
 くらべたあと、手本の Linux に足りない機能 (aios にはある) を 1 行で知らせる (`note: the reference Linux lacks what aios
 has: ...`)。test/features.c (システムコールが ENOSYS か、namespace を作れるか、ソケットの family、LSM、/proc と /sys の

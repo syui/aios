@@ -1,10 +1,11 @@
 #!/bin/sh
 # 出すだけのテスト (test/NAME.c) を、手本の Linux と aios の VM で動かして、出力をくらべる (答えあわせを 1 つの口で)
-#   test/ldiff.sh [--root] [--linux VER] [--fresh] NAME [ARG...]
+#   test/ldiff.sh [--root] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] NAME [ARG...]
 #     1. test/NAME.c を aarch64 の静的なもの (test/bin/NAME) に作る (なければ、.c のほうが新しければ)
 #     2. 手本の Linux (test/linux-vm.sh exec VER。既定は mainline) で動かす。答えは build/linux-answers/ にとっておき、
 #        プログラムと引数と Linux の版と test/linux.config が同じなら、もう一度は動かさない (--fresh で動かしなおす)
-#     3. いま動いている aios の VM (test/vm.py start --www test) で動かす (Linux と同時に)
+#     3. いま動いている aios の VM (test/vm.py start --www test) で動かす (Linux と同時に)。--kernel なら、そのカーネル
+#        (. は作業中のソース) を作って VM を起こしなおしてから (test/vm.py start --kernel ... --snapshot --www test)
 #     4. くらべる: 同じなら "same: N lines"、ちがえば diff -u (--- Linux、+++ aios) と、それぞれの終わりの番号
 #   --root: Linux は rootexec、aios は sudo -n で (test/apparmor.c のようなもの)
 #   引数の @home は ext4 のところ: Linux は /work、aios はホーム ($HOME) に読みかえる (test/chosen.c @home /tmp など)
@@ -16,10 +17,11 @@
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
-root= ver=mainline fresh=
+root= ver=mainline fresh= kernel=
 while :; do
   case "$1" in
   --root) root=1; shift ;;
+  --kernel) kernel=$2; shift 2 ;;
   --linux) ver=$2; shift 2 ;;
   --fresh) fresh=1; shift ;;
   *) break ;;
@@ -38,10 +40,13 @@ if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
 fi
 
 # aios の VM は動いているか (test/ を http で見せているもの)
+if [ -n "$kernel" ]; then
+  python3 test/vm.py start --kernel "$kernel" --snapshot --www test >/dev/null || { echo "ldiff: the VM did not come up" >&2; exit 2; }
+fi
 st=$(python3 test/vm.py status 2>/dev/null || true)
 case "$st" in
 *'"ready": true'*'"www": "'"$top"/test'"'*) ;;
-*) echo "ldiff: no aios VM with test/ served; start one: AIOS_KERNEL=... test/vm.py start --www test (or aish vm start kernel=. www=test)" >&2; exit 2 ;;
+*) echo "ldiff: no aios VM with test/ served; start one: test/vm.py start --kernel . --snapshot --www test (or ldiff --kernel .)" >&2; exit 2 ;;
 esac
 
 # Linux の答え: とっておいたものか、動かす (うしろで)

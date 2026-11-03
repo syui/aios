@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # aios を QEMU で起こしたままにして、外からコマンドを送る (人の手の代わり。Claude が aios の中で確かめるため)
 #
-#   test/vm.py start [--www DIR]   起こして、プロンプトが出るまで待つ (bin/run.sh。画面は AIOS_DISPLAY=none。
-#                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)
+#   test/vm.py start [--www DIR] [--kernel .|FILE|COMMIT] [--snapshot] [--off NAME,...]
+#                                  起こして、プロンプトが出るまで待つ (bin/run.sh。画面は AIOS_DISPLAY=none。
+#                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)。--kernel . は作業中の
+#                                  ソースから、COMMIT はそのコミットから (build/aish-vm/wt で) カーネルを作って起こす
+#                                  (aish の vm start kernel= と同じ作りかたと置き場 build/aish-vm/kernels。動いていれば
+#                                  止めてから)。--snapshot はディスクに書き残さない、--off は kernel.json の extra や quirk を
+#                                  切る (aios.off=)。aish がつながらないときも、これだけで作業中のカーネルをためせる
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
 #   test/vm.py bg 'CMD'            中でうしろで動かしてすぐ答える ({"job": ID})。長いもの (ap -S firefox など) のあいだも run が使える
 #   test/vm.py job [ID] [-w SEC] [--kill]
@@ -514,12 +519,61 @@ def ask(req, timeout=None):
     return json.loads(f.readline())
 
 
+def kernel_for(spec):
+    # カーネルの選び方 (FILE / . / git のコミット) から、そのカーネルのパス (aish の vm (shell/vm) の kernel_for と同じ)
+    kdir = ROOT + '/build/aish-vm/kernels'
+    os.makedirs(kdir, exist_ok=True)
+    if spec != '.' and os.path.isfile(spec):
+        return os.path.abspath(spec)
+
+    def build(src, target):
+        print('vm: building the kernel (%s)' % ('working tree' if spec == '.' else spec), file=sys.stderr)
+        env = dict(os.environ, AIOS_INITRD='none', CARGO_TARGET_DIR=target)
+        r = subprocess.run(['cargo', 'build', '--release', '-p', 'aios'], cwd=src, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            sys.exit('vm: kernel build failed: ' + ' / '.join([l for l in r.stderr.splitlines() if l.startswith('error')][:5]))
+        return target + '/aarch64-unknown-none-softfloat/release/aios'
+
+    if spec == '.':
+        dst = kdir + '/work'
+        shutil.copy(build(ROOT, ROOT + '/build/aish-vm/target'), dst)
+        return dst
+    git = lambda *x, cwd=ROOT: subprocess.run(['git'] + list(x), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    r = git('rev-parse', '--verify', spec + '^{commit}')
+    if r.returncode != 0:
+        sys.exit('vm: --kernel %s: not a file, ., or a commit' % spec)
+    sha = r.stdout.strip()
+    dst = kdir + '/' + sha
+    if os.path.isfile(dst):
+        return dst
+    wt = ROOT + '/build/aish-vm/wt'
+    if not os.path.exists(wt + '/.git'):
+        git('worktree', 'add', '--detach', wt, 'HEAD')
+    if git('checkout', '--detach', '-f', sha, cwd=wt).returncode != 0:
+        sys.exit('vm: cannot check out %s in %s' % (sha, wt))
+    shutil.copy(build(wt, ROOT + '/build/aish-vm/target-wt'), dst)
+    return dst
+
+
 def main():
     a = sys.argv[1:]
     op = a[0] if a else 'status'
     if op == 'serve':
         serve(a[1] if len(a) > 1 else None)
     elif op == 'start':
+        # --kernel: 作って (選んで)、動いているものは止めてから、それで起こす
+        if '--kernel' in a:
+            k = kernel_for(a[a.index('--kernel') + 1])
+            os.environ['AIOS_KERNEL'] = k
+            # panic のバックトレースを関数の名前にするため (aish の vm の symbolize)
+            open(ROOT + '/build/aish-vm/booted-kernel', 'w').write(k)
+            # 止める (答えなければ QEMU ごと: vm.py stop と同じ)
+            if os.path.exists(CTL):
+                subprocess.run([sys.executable, os.path.abspath(__file__), 'stop'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if '--snapshot' in a:
+            os.environ['AIOS_QEMU_ARGS'] = (os.environ.get('AIOS_QEMU_ARGS', '') + ' -snapshot').strip()
+        if '--off' in a:
+            os.environ['AIOS_CMDLINE'] = 'aios.off=' + a[a.index('--off') + 1]
         if os.path.exists(CTL):
             try:
                 print(json.dumps(ask({'op': 'status'}, 5)))
