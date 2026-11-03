@@ -2,7 +2,9 @@
 # main に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
 #   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース latest
 #      (タイトル aios) に置くのを待ち、git.syui.ai の ai/os の latest にも同じものを置く (bin/gitea.sh mirror)。
-#      CI が動かないコミット (paths-ignore: ドキュメントなど) なら、ここはとばす
+#      CI が動かないコミット (paths-ignore: ドキュメント、pkg.json など) なら、CI の走った一番新しいコミットのうち、
+#      そこから HEAD までに CI が見るファイルが変わっていないものの run を待って使う (まだ走っていても)。
+#      ai/os の latest がもうそのコミットのものなら置きなおさない
 #   2. base / aikernel / aiboot のうち、ai/repo にある版 (0.0.1.rN.gSHA) のあとでソースが変わったものを作って確かめ、
 #      ai/repo に送る (aish-pkg build / test / push)。CI はこの 3 つをディスクに入れるだけで ai/repo には送らないので、
 #      これをしないと、入っている aios の ap -Syu に来ない。ドキュメントだけの変更では送らない
@@ -42,18 +44,30 @@ for i in $(seq 1 12); do
   [ -n "$run" ] && break
   sleep 5
 done
+# リリースになるコミット (このコミットか、run を借りるコミット)
+rsha=$sha
 if [ -z "$run" ]; then
-  # paths-ignore で動かないのか、GitHub が動かさなかった (遅れている) だけか。CI が最後に通ったコミットから CI が見る
-  # ものが変わっているのに run がなければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
-  last=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&status=success&per_page=1" | json 'd["workflow_runs"][0]["head_sha"] if d["workflow_runs"] else ""' 2>/dev/null) || last=
-  changed=$(ci_changed "$last")
-  if [ -n "$changed" ]; then
-    echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the last passing run (${last:-?}: ${changed}): GitHub did not start it (yet). Run unix.yml by hand (Actions: unix, Run workflow on unix; or workflow_dispatch) or wait, then bin/publish.sh again" >&2
+  # paths-ignore で動かないのか、GitHub が動かさなかった (遅れている) だけか。main の run を新しい順に見て、HEAD の祖先で
+  # そこから CI が見るものが変わっていない一番新しいものを使う (pkg.json だけのコミットの前のコミットの CI がまだ走って
+  # いれば、それを待つ)。なければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
+  runs=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&per_page=30" | json '"\n".join(str(r["id"]) + " " + r["head_sha"] for r in d["workflow_runs"])')
+  newest= changed=
+  while read -r id s; do
+    [ -n "$id" ] && git merge-base --is-ancestor "$s" HEAD 2>/dev/null || continue
+    c=$(ci_changed "$s")
+    [ -n "$newest" ] || { newest=$s changed=$c; }
+    [ -z "$c" ] && { run=$id rsha=$s; break; }
+  done <<RUNS
+$runs
+RUNS
+  if [ -z "$run" ]; then
+    echo "publish: no unix.yml run for $(git rev-parse --short HEAD), but it changes what CI builds since the newest run (${newest:+$(git rev-parse --short "$newest")}: ${changed:-?}): GitHub did not start it (yet). Run unix.yml by hand (Actions: unix, Run workflow on main; or workflow_dispatch) or wait, then bin/publish.sh again" >&2
     [ -n "$dry" ] || exit 1
   else
-    echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); the release stays"
+    echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); using the run of $(git rev-parse --short "$rsha") (nothing CI builds changed since)"
   fi
-else
+fi
+if [ -n "$run" ]; then
   while :; do
     st=$(curl -fsS "$api/actions/runs/$run" | json 'd["status"] + " " + str(d["conclusion"])')
     case "$st" in completed*) break ;; esac
@@ -65,11 +79,18 @@ else
     # リリースは CI のおしまいに作りなおされる
     for i in $(seq 1 20); do
       t=$(curl -fsS "$api/releases/tags/latest" | json 'd["target_commitish"]' 2>/dev/null) || t=
-      [ "$t" = "$sha" ] && break
+      [ "$t" = "$rsha" ] && break
       sleep 6
     done
-    [ "$t" = "$sha" ] || { echo "publish: the release latest is not $sha" >&2; exit 1; }
-    if [ -n "$dry" ]; then echo "would: bin/gitea.sh mirror"; else sh bin/gitea.sh mirror; fi
+    [ "$t" = "$rsha" ] || { echo "publish: the release latest is not $rsha" >&2; exit 1; }
+    g=$(curl -fsS "https://git.syui.ai/api/v1/repos/ai/os/releases/tags/latest" | json 'd["target_commitish"]' 2>/dev/null) || g=
+    if [ "$g" = "$rsha" ]; then
+      echo "ai/os: latest is already $(git rev-parse --short "$rsha")"
+    elif [ -n "$dry" ]; then
+      echo "would: bin/gitea.sh mirror"
+    else
+      sh bin/gitea.sh mirror
+    fi
   elif [ -n "$dry" ]; then
     case "$st" in completed*) echo "would: stop (CI did not pass)" ;; *) echo "would: wait for CI, then bin/gitea.sh mirror" ;; esac
   else

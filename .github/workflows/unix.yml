@@ -19,6 +19,8 @@ on:
     - 'pkg/desktop/**'
     - 'pkg/pkg.json'
     - 'pkg/upstream.json'
+    # 課題の一覧 (aish-pkg report が pkg.yml で読む。イメージには入らない)
+    - 'todo.json'
     - 'desktop/**'
   workflow_dispatch:
 
