@@ -508,6 +508,18 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
 }
 
 /// socket(AF_INET, SOCK_STREAM | SOCK_DGRAM, protocol): 型と protocol は呼ぶほうで見た (socket.rs の inet_check)
+/// landlock が見るソケットか (Linux の sk_is_tcp / sk_is_udp: SOCK_STREAM の IPPROTO_TCP、SOCK_DGRAM の IPPROTO_UDP) と、
+/// もう口が決まっているか (inet_num。UDP は決まっていなければ送る・つなぐときに autobind する)
+pub fn ll_kind(u: &InetRef) -> (Option<bool>, bool) {
+    let s = u.borrow();
+    let kind = match (s.tcp, s.protocol) {
+        (true, 6) => Some(true),
+        (false, 17) => Some(false),
+        _ => None,
+    };
+    (kind, s.num != 0)
+}
+
 pub fn create(typ: u64, protocol: u64) -> InetRef {
     let tcp = typ == 1;
     let c = proc::current_cred_ref();

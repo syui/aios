@@ -378,9 +378,28 @@ fn smol_name(s: &Socket) -> [u8; 16] {
     endpoint_bytes(s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::addr())), l.port)))
 }
 
-/// AF_INET へ送る (apparmor_socket_sendmsg: TCP の MSG_FASTOPEN で名前があれば、つなぐのも見る)
-fn aa_send(u: &InetRef, flags: u64, to: Option<&[u8]>) -> Result<(), i64> {
+/// AF_INET へ送る (security_socket_sendmsg)。landlock (hook_socket_sendmsg): TCP の MSG_FASTOPEN は送り先の CONNECT_TCP、
+/// UDP は送り先の SEND_UDP と、口がまだなければ autobind のポート 0 の BIND_UDP。それから AppArmor
+/// (apparmor_socket_sendmsg: TCP の MSG_FASTOPEN で名前があれば、つなぐのも見る)
+fn lsm_send(u: &InetRef, flags: u64, to: Option<&[u8]>) -> Result<(), i64> {
     const MSG_FASTOPEN: u64 = 0x2000_0000;
+    if crate::cred::current().landlock.is_some() {
+        use crate::landlock::*;
+        match crate::inet::ll_kind(u) {
+            (Some(true), _) => {
+                if let Some(a) = to.filter(|_| flags & MSG_FASTOPEN != 0) {
+                    check_socket(AF_INET as u16, a, CONNECT_TCP, true)?;
+                }
+            }
+            (Some(false), bound) => {
+                if let Some(a) = to {
+                    check_socket(AF_INET as u16, a, SEND_UDP, false)?;
+                }
+                check_autobind_udp(AF_INET as u16, bound)?;
+            }
+            _ => {}
+        }
+    }
     aa_inet(u, "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to))?;
     if flags & MSG_FASTOPEN != 0 && to.is_some() && u.borrow().tcp {
         aa_inet(u, "connect", crate::apparmor::MAY_CONNECT, InetOp::Remote(to))?;
@@ -552,7 +571,7 @@ pub fn inet_readv(f: &FileRef, u: &InetRef, iov: &[(usize, usize)], nowait: bool
 
 /// write / writev / pwritev2 で AF_INET のソケットへ (TCP の EPIPE は SIGPIPE、RWF_NOSIGNAL なら送らない)
 pub fn inet_writev(f: &FileRef, u: &InetRef, iov: &[(usize, usize)], nowait: bool, nosignal: bool) -> R {
-    aa_send(u, 0, None)?;
+    lsm_send(u, 0, None)?;
     let total = iov.iter().fold(0usize, |a, x| a.saturating_add(x.1)).min(MAX_RW);
     let flags = if nosignal { crate::inet::MSG_NOSIGNAL } else { 0 };
     crate::inet::send(u, crate::unix::Src::User(iov), total, None, &[], flags, nowait || nonblock_of(f, 0))
@@ -709,11 +728,6 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     Ok(fd as i64)
 }
 
-/// sockaddr_in のポート (landlock の TCP の bind / connect)
-fn port_of(a: &[u8]) -> Option<u16> {
-    (a.len() >= 4 && u16::from_le_bytes([a[0], a[1]]) as u64 == AF_INET).then(|| u16::from_be_bytes([a[2], a[3]]))
-}
-
 pub fn bind(fd: u64, addr: usize, len: usize) -> R {
     if let Some((_, n)) = crate::netlink::of_fd(fd) {
         return crate::netlink::bind(&n, &addr_in(addr, len)?);
@@ -732,8 +746,10 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
         }
         Sock::Inet(_, u) => {
             let a = addr_in(addr, len)?;
-            if let (true, Some(p)) = (u.borrow().tcp, port_of(&a)) {
-                crate::landlock::check_net(p, crate::landlock::BIND_TCP)?;
+            // landlock (hook_socket_bind): TCP は BIND_TCP、UDP は BIND_UDP
+            if let (Some(tcp), _) = crate::inet::ll_kind(&u) {
+                use crate::landlock::*;
+                check_socket(AF_INET as u16, &a, if tcp { BIND_TCP } else { BIND_UDP }, false)?;
             }
             if crate::apparmor::confined() {
                 if crate::apparmor::net_mediated() {
@@ -846,8 +862,14 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
         }
         Sock::Inet(f, u) => {
             let a = addr_in(addr, len)?;
-            if let (true, Some(p)) = (u.borrow().tcp, port_of(&a)) {
-                crate::landlock::check_net(p, crate::landlock::CONNECT_TCP)?;
+            // landlock (hook_socket_connect): TCP は CONNECT_TCP、UDP は SEND_UDP (AF_UNSPEC で切るのはよい) と、口が
+            // まだなければ autobind のポート 0 の BIND_UDP
+            if let (Some(tcp), bound) = crate::inet::ll_kind(&u) {
+                use crate::landlock::*;
+                check_socket(AF_INET as u16, &a, if tcp { CONNECT_TCP } else { SEND_UDP }, true)?;
+                if !tcp && a.len() >= 2 && u16::from_le_bytes([a[0], a[1]]) != 0 {
+                    check_autobind_udp(AF_INET as u16, bound)?;
+                }
             }
             // AppArmor (aa_inet_connect_perm): AF_UNSPEC (つなぐのをやめる) は見ない
             if crate::apparmor::confined() {
@@ -894,7 +916,7 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
         }
         Sock::Inet(f, u) => {
             let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
-            aa_send(&u, flags, to.as_deref())?;
+            lsm_send(&u, flags, to.as_deref())?;
             let iov = [(buf, len)];
             let nb = nonblock_of(&f, flags);
             crate::inet::send(&u, crate::unix::Src::User(&iov), len, to.as_deref(), &[], flags, nb)
@@ -1120,7 +1142,7 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
         }
         Sock::Inet(f, u) => {
             let (to, ctl) = send_parts(&m)?;
-            aa_send(&u, flags, to.as_deref())?;
+            lsm_send(&u, flags, to.as_deref())?;
             crate::inet::send(&u, crate::unix::Src::User(&m.iov), total, to.as_deref(), &ctl, flags, nonblock_of(&f, flags))
         }
         Sock::Smol(s) => {

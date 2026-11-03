@@ -237,6 +237,9 @@ pub struct Unix {
     /// AppArmor: 作ったプロセスのラベル (受けた口は listen しているもののラベル: Linux の aa_sk_ctx)。相手の側の決まりを
     /// 見るのに使う
     pub label: Option<crate::apparmor::Label>,
+    /// landlock: ソケットの fd を作ったプロセスの層 (Linux の sk_socket->file->f_cred。accept されるまでの口にはない)。
+    /// RESOLVE_UNIX と抽象名前空間の scope で、つなぐほうが同じ層の中かを見る
+    pub ll: Option<crate::landlock::Domain>,
     /// socket(2) の protocol (0 か PF_UNIX。AppArmor の決まりの 3 つめ)
     protocol: u8,
     /// パスの名前で bind したもののパス (AppArmor のファイルの決まり: Linux の u->path)
@@ -436,6 +439,7 @@ fn new_sock(typ: u8) -> UnixRef {
         watchers: 0,
         epolled: false,
         label: crate::apparmor::current_label(),
+        ll: crate::cred::current().landlock.clone(),
         protocol: 0,
         fs_path: None,
     }));
@@ -510,6 +514,22 @@ fn aa_connect(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
         }
     }
     r
+}
+
+/// landlock の scope (hook_unix_stream_connect と hook_unix_may_send): 抽象名前空間の名前のソケットで、作ったプロセスが
+/// 自分の層の外なら EPERM。もうつないでいる相手はよい
+fn ll_scope(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
+    if crate::cred::current().landlock.is_none() || same(&u.borrow().peer, other) {
+        return Ok(());
+    }
+    let (abs, dom) = {
+        let o = other.borrow();
+        (o.addr.as_ref().is_some_and(|a| a.len() > 2 && a[2] == 0), o.ll.clone())
+    };
+    if !abs {
+        return Ok(());
+    }
+    crate::landlock::check_scope_unix(dom.as_ref())
 }
 
 /// dgram を送る・つなぐ (apparmor_unix_may_send): 自分は SEND、相手のソケットのラベルの決まりで RECEIVE (両方見て、
@@ -587,13 +607,18 @@ fn validate(a: &[u8]) -> Result<(), i64> {
 fn find_other(a: &[u8], typ: u8, net: u64) -> Result<UnixRef, i64> {
     if a[2] != 0 {
         let (path, _) = bsd_name(a);
-        let i = crate::sysfile::find_sock(&path)?;
+        let (full, i) = crate::sysfile::find_sock(&path)?;
         if i.meta().mode & crate::vfs::S_IFMT != crate::vfs::S_IFSOCK {
             return Err(-ECONNREFUSED);
         }
         let s = bsd_names().get(&i.id()).and_then(|w| w.upgrade()).ok_or(-ECONNREFUSED)?;
         if s.borrow().typ != typ {
             return Err(-EPROTOTYPE);
+        }
+        // landlock (security_unix_find): 相手を作ったプロセスが同じ層の中でなければ、パスの RESOLVE_UNIX
+        if crate::cred::current().landlock.is_some() {
+            let other = s.borrow().ll.clone();
+            crate::landlock::check_resolve_unix(&full, other.as_ref())?;
         }
         return Ok(s);
     }
@@ -779,6 +804,7 @@ pub fn connect(f: &FileRef, u: &UnixRef, a: &[u8]) -> R {
             State::Established => return Err(-EISCONN),
             State::Listen => return Err(crate::why::inval()),
         }
+        ll_scope(u, &other)?;
         aa_connect(u, &other)?;
         join(u, &other, typ);
         return Ok(0);
@@ -802,6 +828,7 @@ fn join(u: &UnixRef, other: &UnixRef, typ: u8) {
         es.passpidfd_thread = o.passpidfd_thread;
         es.passrights = o.passrights;
         es.has_file = false;
+        es.ll = None;
         es.net = o.net;
         es.label = o.label.clone();
     }
@@ -831,6 +858,7 @@ fn dgram_connect(u: &UnixRef, a: &[u8]) -> R {
         if other.borrow().peer.as_ref().is_some_and(|p| !Arc::ptr_eq(p, u)) {
             return Err(-EPERM);
         }
+        ll_scope(u, &other)?;
         aa_may_send(u, &other)?;
         u.borrow_mut().state = State::Established;
         other.borrow_mut().state = State::Established;
@@ -896,7 +924,11 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
             }
             if let Some(e) = s.embryos.pop_front() {
                 drop(s);
-                e.borrow_mut().has_file = true;
+                {
+                    let mut es = e.borrow_mut();
+                    es.has_file = true;
+                    es.ll = crate::cred::current().landlock.clone();
+                }
                 notify(u);
                 return Ok(e);
             }
@@ -1279,6 +1311,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
             }
         }
         if typ != SOCK_SEQPACKET {
+            ll_scope(u, &other)?;
             aa_may_send(u, &other)?;
         }
         // 相手の行列がいっぱい (相手がこちらにつないでいなければ: Linux の unix_recvq_full)

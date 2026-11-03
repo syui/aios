@@ -148,6 +148,9 @@ pub struct OpenFile {
     pub reuse: bool,
     /// flock か OFD ロックを置いたことがある (閉じるときに外す): 棚にはしまわない
     pub locked: bool,
+    /// landlock: 開いたときに許されなかった TRUNCATE と IOCTL_DEV (デバイスだけ)。あとの ftruncate と ioctl はこれで
+    /// 決める (Linux の landlock_file の allowed_access。渡された fd でも、層のないプロセスでも同じ)
+    pub ll_deny: u32,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
@@ -172,7 +175,7 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
     }
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0 }))
 }
 
 /// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
@@ -767,6 +770,8 @@ impl OpenFile {
                 Ok(n)
             }
             Kind::PipeWrite(_) => Err(-EBADF),
+            // landlock の決まりの束: 読み書きできる口だが、読めない (Linux の fop_dummy_read)
+            Kind::Landlock(_) => Err(crate::why::inval()),
             k => read_stream(k, dst, self.flags & O_NONBLOCK != 0),
         }
     }
@@ -822,6 +827,7 @@ impl OpenFile {
                 Ok(n)
             }
             Kind::PipeRead(_) => Err(-EBADF),
+            Kind::Landlock(_) => Err(crate::why::inval()),
             k => write_stream(k, src, self.flags & O_NONBLOCK != 0),
         }
     }
@@ -903,7 +909,7 @@ impl OpenFile {
             Kind::Inotify(_) => "anon_inode:inotify".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
             Kind::SeccompNotify(_) => "anon_inode:seccomp notify".into(),
-            Kind::Landlock(_) => "anon_inode:landlock-ruleset".into(),
+            Kind::Landlock(_) => "anon_inode:[landlock-ruleset]".into(),
             Kind::Block(p) => crate::block::part_name(p),
         }
     }

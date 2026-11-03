@@ -274,12 +274,16 @@ pub fn send_chld(parent: &Proc, info: SigInfo) {
 }
 
 /// 送り主が送ってよいか (Linux の check_kill_permission: uid が合うか CAP_KILL、でなければ EPERM。それから
-/// security_task_kill: AppArmor の signal の決まりで、だめなら EACCES)
+/// security_task_kill: landlock の scope (相手が層の外なら EPERM。同じスレッドグループはよい)、AppArmor の signal の決まりで、
+/// だめなら EACCES)
 fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     let me = proc::current();
     let (a, b) = (&me.cred, &target.cred);
     if !(a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)) {
         return Err(-EPERM);
+    }
+    if a.landlock.is_some() && me.tgid != target.tgid {
+        crate::landlock::check_scope_signal(b.landlock.as_ref())?;
     }
     crate::apparmor::may_signal(b, sig)
 }

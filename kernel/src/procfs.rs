@@ -611,6 +611,8 @@ fn aa_ptrace(pid: u32, read: bool) -> Result<(), i64> {
     if p.tgid == proc::current().tgid {
         return Ok(());
     }
+    // landlock (hook_ptrace_access_check): 相手が自分の層の中でなければ
+    crate::landlock::check_ptrace(crate::cred::current().landlock.as_ref(), p.cred.landlock.as_ref()).map_err(|_| if read { -EACCES } else { -EPERM })?;
     crate::apparmor::may_ptrace(&p.cred, read).map_err(|_| if read { -EACCES } else { -EPERM })
 }
 
@@ -624,7 +626,10 @@ fn mm_access(pid: u32, ids: bool) -> Result<(), i64> {
         return Ok(());
     }
     let c = crate::cred::current();
-    if (!ids || c.euid == p.cred.uid || c.capable(CAP_SYS_PTRACE)) && crate::apparmor::may_ptrace(&p.cred, true).is_ok() {
+    if (!ids || c.euid == p.cred.uid || c.capable(CAP_SYS_PTRACE))
+        && crate::landlock::check_ptrace(c.landlock.as_ref(), p.cred.landlock.as_ref()).is_ok()
+        && crate::apparmor::may_ptrace(&p.cred, true).is_ok()
+    {
         return Ok(());
     }
     if c.capable(CAP_PERFMON) || c.capable(CAP_SYS_ADMIN) {

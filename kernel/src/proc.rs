@@ -1801,7 +1801,10 @@ pub fn unshare(flags: u64) -> Result<i64, i64> {
         return Err(-22);
     }
     let p = current();
-    crate::ns::renew(&mut p.cred, flags)?;
+    // しくじったら何も変えない (ユーザーの namespace だけ作って、ほかで EPERM のときも)
+    let mut cred = p.cred.clone();
+    crate::ns::renew(&mut cred, flags)?;
+    p.cred = cred;
     if flags & CLONE_FILES != 0 {
         let f = Shared::new(p.files().clone());
         p.files = Some(f);

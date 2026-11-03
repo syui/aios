@@ -1119,8 +1119,8 @@ Linux 7.4 は 11 月 1 日に rc1 が出た (安定版はまだ 7.3.1)。新し�
 - copy_file_range: 写すものが 0 バイトなら、書く側の大きさの上限 (EFBIG) を見ない
 - SO_PASSPIDFD_THREAD / SO_PEERPIDFD_THREAD: 下の「相手を pidfd で見る」(2026-11-03)
 - SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV: 下の「seccomp の user notification」(2026-11-03)
-- まだ (aios にもとからないもの): OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
-  (aios は ABI 4)、ctnetlink の CTA_FILTER_ZONE、RTM_GETMULTICAST (PF_PACKET) と IFA_F_GLOBAL、リンクの IFLA_PACING_OFFLOAD
+- Landlock の ABI 12: 下の「Landlock の ABI 12」(2026-11-03)
+- まだ (aios にもとからないもの): OPEN_TREE_DROP_MNTNS_MOUNTS、ctnetlink の CTA_FILTER_ZONE、RTM_GETMULTICAST (PF_PACKET) と IFA_F_GLOBAL、リンクの IFLA_PACING_OFFLOAD
   (aios のリンクの答えはもとから一部の属性だけ)
 
 たしかめたこと: sysdiff は CI と同じ 800 case (test/sysdiff/ を 7.4-rc1 で作りなおした) が 0 differ、aish の sysdiff (300) も
@@ -1183,6 +1183,50 @@ AI がシステムコールを 1 つずつ見て「いいよ・だめだよ」�
 
 `test/seccompnotify.c` (73 行) は Linux 7.4-rc1 と 1 バイトもちがわない。手本の Linux (test/linux.config) に seccomp が
 入っていなかったので、CONFIG_SECCOMP と CONFIG_SECCOMP_FILTER を足した (test/sysdiff/ の手本はそれで作りなおして変わらない)。
+
+### Landlock の ABI 12 (Linux 7.4)
+
+aios の landlock は ABI 4 (ファイルと TCP) だった。Linux 7.4-rc1 の security/landlock/ と同じ ABI 12 に
+(kernel/src/landlock.rs)。`LANDLOCK_CREATE_RULESET_VERSION` は 12、`_ERRATA` は 15 (直したもの 1 から 4: TCP は IPPROTO_TCP
+だけ、scope のシグナルは同じスレッドグループを許す、つながっていないディレクトリ、whiteout (S_IFCHR の 0:0) を作るのは MAKE_REG)。
+
+- `landlock_create_ruleset`: struct landlock_ruleset_attr は 7 つの欄 (56 バイト。handled_access_fs / net、scoped、
+  quiet_access_fs / net、quiet_scoped、handled_permissions)。古い大きさ (8 バイトから) も受け、知らない続きが 0 でなければ
+  E2BIG、4096 より大きければ E2BIG、attr が NULL なら EFAULT。quiet の欄は見張るものの中だけ (でなければ EINVAL)。fd の名前は
+  7.4 と同じ `anon_inode:[landlock-ruleset]`、read と write は EINVAL (前は EBADF)
+- `landlock_add_rule`: 印 `LANDLOCK_ADD_RULE_QUIET` (PATH_BENEATH と NET_PORT。quiet の欄がなければ EINVAL、許すものが 0 でも
+  よい)。`LANDLOCK_RULE_NAMESPACE` (3。作ってよい CLONE_NEW*) と `LANDLOCK_RULE_CAPABILITY` (4。使ってよい CAP_*): permissions が
+  ちょうどその 1 つで、束がそれを見張っていなければ EINVAL、allowed と quiet がどちらも 0 なら ENOMSG、知らないビットはだまって
+  捨てる。NET_PORT は束が net を見張っていなければ EINVAL (前は EOPNOTSUPP)。デバイスを開いた fd (/dev/null) も PATH_BENEATH の
+  場所になる
+- `landlock_restrict_self` の印: LOG_SAME_EXEC_OFF、LOG_NEW_EXEC_ON、LOG_SUBDOMAINS_OFF (fd が -1 でもよい: 層は足さない)、
+  TSYNC (同じプロセスのほかのスレッドにも同じ層、呼んだスレッドが no_new_privs ならそれも)、NO_NEW_PRIVS (no_new_privs が
+  なくてもかけられ、うまくいけば立てる)。aios に記録 (audit) はないので、LOG_* と quiet は形だけたしかめて覚える
+- 止めかた (新しいもの):
+  - UDP: bind は BIND_UDP、connect と sendto / sendmsg の送り先は CONNECT_SEND_UDP (connect の AF_UNSPEC はよい)。名前の
+    ないソケットは送る・つなぐときに autobind するので、ポート 0 の BIND_UDP も要る (write も sendmsg の hook を通る)。TCP の
+    MSG_FASTOPEN は送り先の CONNECT_TCP。名前の長さと family のたしかめも Linux の current_check_access_socket と同じ順
+  - RESOLVE_UNIX: 名前のある unix ソケットにつなぐ・送るのは、パスの決まりの RESOLVE_UNIX (ファイルの決まりにも書ける)。相手の
+    ソケットを作ったプロセスがその層の中なら見ない (ソケットに作ったプロセスの層を覚える。accept したものは accept したプロセス)
+  - IOCTL_DEV と TRUNCATE は開いたときに決める: open で、TRUNCATE と (デバイスなら) IOCTL_DEV の許しを開いたファイルに覚え
+    (OpenFile の ll_deny)、あとの ftruncate と ioctl はそれで (渡された fd でも、層のないプロセスでも)。デバイスの ioctl のうち
+    FIOCLEX、FIONCLEX、FIONBIO、FIOASYNC、FIOQSIZE、FIFREEZE、FITHAW、FIEMAP、FIGETBSZ、FICLONE なかま、GETFSUUID、
+    GETFSSYSFSPATH はいつもよい (FIONREAD などデバイスに回るものはだめ)
+  - scope: ABSTRACT_UNIX_SOCKET (抽象名前空間のソケットを作ったプロセスが層の外なら、つなぐ・送るのは EPERM。もうつないで
+    いる相手はよい) と SIGNAL (相手が層の外なら kill などは EPERM。同じスレッドグループはよい)。「層の中」は Linux の
+    hierarchy と同じく、その段の層が同じものか (restrict_self は新しい層を 1 つ作り、古い層をそのまま並べるので、ある段が同じ
+    ならその下もみな同じ)
+  - permission: NAMESPACE_USE は unshare と clone の CLONE_NEW* (ユーザーの namespace も)、CAPABILITY_USE は Cred::capable
+    (commoncap が許したあとで止めるだけ。LSM の順は landlock、AppArmor) と、aios がユーザーの namespace の中で cap を見ない
+    ところ (ほかの namespace を作る、自分の UTS の sethostname)。どちらも EPERM
+  - ptrace (Linux の ABI 1 から): /proc/PID の environ や maps などを見るのは、相手が自分の層の中のときだけ
+- ついでに直したもの: unshare は、しくじったら何も変えない (ユーザーの namespace だけ作って EPERM のとき、前は作ったものが
+  残った)。`ioctl(FIOCLEX / FIONCLEX)` はどの fd でも close-on-exec を (前はデバイスやソケットで ENOTTY)
+
+aibox はいままでどおり (ファイルの権利は TRUNCATE まで、TCP の connect と bind)。`test/landlockabi.c` (127 行: 入口のたしかめ 78 と、
+止めかたを子のプロセスで 49。nobody で) は Linux 7.4-rc1 と 1 バイトもちがわない。手本の Linux (test/linux.config) に
+landlock (CONFIG_LSM は landlock,apparmor) と、namespace の permission を見るためにユーザーと UTS の namespace を足した
+(test/sysdiff/ の手本はそれで作りなおして変わらない)。
 
 ### Linux と答えあわせ (sysdiff)
 

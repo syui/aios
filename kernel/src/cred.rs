@@ -78,12 +78,17 @@ impl Cred {
     /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても AppArmor のプロファイルが
     /// 許さなければ持たない (記録する: apparmor::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
     pub fn capable(&self, cap: u32) -> bool {
-        self.euid == 0 && crate::apparmor::capable(self, cap, true)
+        self.euid == 0 && self.lsm_capable(cap, true)
     }
 
     /// capable と同じだが記録しない (ns_capable_noaudit: できなければほかのやりかたに回るもの)
     pub fn capable_noaudit(&self, cap: u32) -> bool {
-        self.euid == 0 && crate::apparmor::capable(self, cap, false)
+        self.euid == 0 && self.lsm_capable(cap, false)
+    }
+
+    /// commoncap が許したあとの LSM (security_capable): landlock の CAPABILITY_USE、それから AppArmor (CONFIG_LSM の順)
+    fn lsm_capable(&self, cap: u32, audit: bool) -> bool {
+        crate::landlock::cap_ok(self, cap) && crate::apparmor::capable(self, cap, audit)
     }
 
     /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)。Linux の
@@ -104,7 +109,7 @@ impl Cred {
         if uid != 0 {
             return false;
         }
-        let cap = |c: u32| crate::apparmor::capable(self, c, true);
+        let cap = |c: u32| self.lsm_capable(c, true);
         if m.mode & S_IFMT == S_IFDIR {
             return (want & W == 0 && cap(CAP_DAC_READ_SEARCH)) || cap(CAP_DAC_OVERRIDE);
         }

@@ -202,6 +202,17 @@ pub fn landlock(access: u64, net: bool, what: &str) -> i64 {
     -crate::cred::EACCES
 }
 
+/// landlock の scope か permission が止めた (抽象 unix ソケット、シグナル、ptrace、namespace、capability)。what は
+/// 止めたこと。EPERM を返す
+#[cold]
+pub fn landlock_scope(what: &str) -> i64 {
+    if let Some(n) = me() {
+        *n = Note { code: Code::Landlock, errno: crate::cred::EPERM as u16, want: 2, ..NONE };
+        n.plen = copy(&mut n.path, what);
+    }
+    -crate::cred::EPERM
+}
+
 /// ファイアウォールが、いまのシステムコールのパケットを落とした (nfhook.rs の道から)。errno は返すときに決まる
 /// (sendmsg の EPERM、connect の ECONNREFUSED など) ので、done がそのとき合わせる
 #[cold]
@@ -214,8 +225,8 @@ pub fn firewall(what: &str) {
 
 /// LANDLOCK_ACCESS_FS_* と LANDLOCK_ACCESS_NET_* のビットの名前
 fn landlock_names(access: u64, net: bool) -> String {
-    const FS: [&str; 16] = ["execute", "write_file", "read_file", "read_dir", "remove_dir", "remove_file", "make_char", "make_dir", "make_reg", "make_sock", "make_fifo", "make_block", "make_sym", "refer", "truncate", "ioctl_dev"];
-    const NET: [&str; 2] = ["bind_tcp", "connect_tcp"];
+    const FS: [&str; 17] = ["execute", "write_file", "read_file", "read_dir", "remove_dir", "remove_file", "make_char", "make_dir", "make_reg", "make_sock", "make_fifo", "make_block", "make_sym", "refer", "truncate", "ioctl_dev", "resolve_unix"];
+    const NET: [&str; 4] = ["bind_tcp", "connect_tcp", "bind_udp", "connect_send_udp"];
     let names: &[&str] = if net { &NET } else { &FS };
     let v: Vec<&str> = names.iter().enumerate().filter(|(i, _)| access & (1 << i) != 0).map(|(_, n)| *n).collect();
     if v.is_empty() { format!("{:#x}", access) } else { v.join(" ") }
@@ -423,6 +434,7 @@ fn sentence(n: &Note, syscall: &str) -> String {
         Code::Loop => format!("too many symbolic links (more than 40) or a link where links are not allowed, at {}", joined),
         Code::NameTooLong => format!("the name \"{}...\" is longer than 255 bytes", name.get(..16).unwrap_or(name)),
         Code::Seccomp => format!("a seccomp filter of this process returns this errno for {}", syscall),
+        Code::Landlock if n.want == 2 => format!("a landlock ruleset of this process does not allow {}", path),
         Code::Landlock if n.want != 0 => format!("a landlock ruleset of this process does not allow {} on {}", landlock_names(n.num, true), path),
         Code::Landlock => format!("a landlock ruleset of this process does not allow {} under {}", landlock_names(n.num, false), p),
         Code::Injected => String::from("injected on purpose by the fail rule in /proc/ai/ctl"),
