@@ -546,6 +546,23 @@ clone がロックを持つ時間は 90 µs から 67 µs。`smpbench -a -o fork
 (260〜330 µs と 1156 µs) なので、ここはいったん止める。のこり: wait4 の子さがしを親ごとの子の並びに、exit で init を毎回
 起こさない (子を init にわたしたときだけ)、親を起こす wakeup が 2 回。
 
+そのつづき (子の並び): wait4 は、待つたびに生きている Proc をみな見て自分の子を集め、番号の順にならべていた (眠る前と
+起きたあとで 2 回、1 回 15 µs)。いまは Linux の children / sibling と同じく、親 (代表スレッド) が子の並び (Proc::kids。子は
+Proc::sib でつなぐ) を持ち、clone で末尾につなぎ、free_slot で外す。wait4 はその並びを古い子から見るだけ (prof の
+proc:wait_scan はなくした)。親が終わるときは、子を同じ順で init の並びの末尾へうつす (Linux の forget_original_parent)。
+exit は、親を表から 2 回探して SIGCHLD を送り、親と、いつも init を起こしていた: 親は子の並びのつなぎから取り、init を
+起こすのは終わっている (ゾンビの) 子をわたしたとき (Linux と同じく init に SIGCHLD も) だけ。ハンドラのない SIGCHLD
+(無視される) は、send_group がスレッドを集めてから捨てていたので、代表がブロックしていなければ集めずに捨てる
+(signal::send_chld)。直していて Linux とのちがいも 1 つ見つけた: 親が終わって init にわたされた子のスレッドの getppid が、
+前の親のままだった (代表の ppid だけを 1 にしていた。Linux はスレッドみなの real_parent を変える)。
+
+test/procwait.c の kids は、待てる子だけを古い順に (動いている子はとばす)、スレッドが fork した子を代表スレッドが待つのと
+その逆、子のないスレッドの ECHILD、親が終わったあとの孫の getppid (代表スレッドとスレッド) と /proc/PID/status の PPid、
+init にわたされたゾンビを確かめる。Linux 7.4-rc1 と同じ 109 checks, 0 failed (前のカーネルは getppid で 1 つ落ちる)。
+`smpbench -a -o fork` の prof で、1 回の fork から wait4 の子さがし (15 µs を 2 回) がなくなり、exit_notify は 38 µs から 18 µs、
+wakeup は 2.1 回から 1.1 回、exit_kids は 4.1 µs から 1.5 µs。bench smp の fork-x4 は 319 µs から 234 µs (伸び 1.6 から 2.1)、
+wait4 がロックを持つ時間は 1 回 68 µs から 37 µs、ロックを待つ時間は 199% から 178%。
+
 たしかめているあいだに test/random.c が一度だけ「AT_RANDOM が exec ごとにちがわない」で落ちた。見ると、AT_HWCAP2 を
 足して auxv が 18 になったのに、スタックの並びの大きさは 17 のままで、おしまいの AT_NULL (0 が 16 バイト) が AT_RANDOM の
 16 バイトに重なり、そのほとんどを 0 にしていた (ずれは環境の長さによる。glibc はここからスタックの番人をとる)。いまは数と

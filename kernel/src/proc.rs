@@ -400,6 +400,11 @@ pub struct Proc {
     tm: Link,
     /// 走れるものの並びのつなぎ (RUNQ)
     rq: Link,
+    /// 子 (fork したプロセス。スレッドは入らない) の並びの先頭と末尾のスロット。代表スレッドが持つ (Linux の
+    /// children)。wait4 と、終わるときに子を init にわたすのは、これだけを見る (前は生きているものをみな見ていた)
+    kids: (u16, u16),
+    /// 親 (代表スレッド) の子の並びのつなぎ (Linux の sibling と real_parent)
+    sib: Sib,
     /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
     poll_keys: Option<Vec<usize>>,
     context: Context,
@@ -480,6 +485,8 @@ impl Proc {
         wq: Link::NONE,
         tm: Link::NONE,
         rq: Link::NONE,
+        kids: (NONE, NONE),
+        sib: Sib::NONE,
         poll_keys: None,
         context: Context::ZERO,
         tpidr: 0,
@@ -678,6 +685,9 @@ pub fn drop_prefork() {
 fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     let i = slot_of(p);
+    kid_unlink(i);
+    // 子はふつう終わるときに init にわたしている (そのあとに、残っていたスレッドが fork したものも)
+    reparent_kids(i);
     wq_leave(i);
     unlink(i, |p| &mut p.rq);
     LIVE.get()[i / 64] &= !(1u64 << (i % 64));
@@ -773,6 +783,102 @@ fn unlink(i: usize, l: fn(&mut Proc) -> &mut Link) {
         l(&mut procs()[me.next as usize]).prev = me.prev;
     }
     *l(&mut procs()[i]) = Link::NONE;
+}
+
+// ---- 子の並び ----
+// 親 (代表スレッド) ごとの、fork した子の並び (Linux の children と sibling)。古い子から (wait4 は Linux と同じく古い
+// 子から見る)。clone でつなぎ、free_slot で外し、親が終わるときは init の並びの末尾へ同じ順でうつす
+
+/// 子の並びのつなぎ: parent は親のスロット、prev / next は兄弟のスロット (NONE で終わり)
+#[derive(Clone, Copy)]
+struct Sib {
+    parent: u16,
+    prev: u16,
+    next: u16,
+}
+
+impl Sib {
+    const NONE: Sib = Sib { parent: NONE, prev: NONE, next: NONE };
+}
+
+/// child を parent (代表スレッドのスロット) の子の並びの末尾に
+fn kid_link(parent: usize, child: usize) {
+    let ps = procs();
+    let tail = ps[parent].kids.1;
+    ps[child].sib = Sib { parent: parent as u16, prev: tail, next: NONE };
+    if tail != NONE {
+        ps[tail as usize].sib.next = child as u16;
+    } else {
+        ps[parent].kids.0 = child as u16;
+    }
+    ps[parent].kids.1 = child as u16;
+}
+
+/// child を親の子の並びから外す (入っていなければ何もしない)
+fn kid_unlink(child: usize) {
+    let ps = procs();
+    let s = ps[child].sib;
+    if s.parent == NONE {
+        return;
+    }
+    let parent = s.parent as usize;
+    if s.prev != NONE {
+        ps[s.prev as usize].sib.next = s.next;
+    } else {
+        ps[parent].kids.0 = s.next;
+    }
+    if s.next != NONE {
+        ps[s.next as usize].sib.prev = s.prev;
+    } else {
+        ps[parent].kids.1 = s.prev;
+    }
+    ps[child].sib = Sib::NONE;
+}
+
+/// me (スロット) の子をみな init にわたす (Linux の forget_original_parent): init の子の並びの末尾へ同じ順で。子の
+/// スレッドの ppid も 1 に (getppid。Linux は子のスレッドみなの real_parent を変える)。終わっている (ゾンビの) 子は、
+/// Linux と同じく init に SIGCHLD を送って、wait で眠っている init を起こす (ゾンビがいなければ init は起こさない)
+fn reparent_kids(me: usize) {
+    let ps = procs();
+    let first = ps[me].kids.0;
+    if first == NONE {
+        return;
+    }
+    ps[me].kids = (NONE, NONE);
+    let tgid = ps[me].tgid;
+    for c in live() {
+        if c.ppid == tgid && c.tgid != tgid {
+            c.ppid = 1;
+        }
+    }
+    let init = find(1).map(|p| slot_of(p));
+    let mut zombie = false;
+    let mut i = first;
+    while i != NONE {
+        let c = i as usize;
+        let next = ps[c].sib.next;
+        ps[c].sib = Sib::NONE;
+        if let Some(init) = init {
+            kid_link(init, c);
+            if procs()[c].state == State::Zombie && !procs()[c].autoreap {
+                zombie = true;
+                if !crate::signal::parent_reaps_automatically(&procs()[init]) {
+                    sigchld(&procs()[c], &procs()[init]);
+                }
+            }
+        }
+        i = next;
+    }
+    if let Some(init) = init.filter(|_| zombie) {
+        wakeup(&mut procs()[init] as *mut Proc as usize);
+    }
+}
+
+/// 終わった子 c のことを親 (代表スレッド) に SIGCHLD で知らせる
+fn sigchld(c: &Proc, parent: &Proc) {
+    let (code, st) = if c.xstatus & 0x7f != 0 { (crate::signal::CLD_KILLED, c.xstatus & 0x7f) } else { (crate::signal::CLD_EXITED, (c.xstatus >> 8) & 0xff) };
+    let info = SigInfo { code, pid: c.tgid, uid: c.cred.uid, status: st, ..SigInfo::ZERO };
+    crate::signal::send_chld(parent, info);
 }
 
 /// いまのスレッドを、chan (と期限があれば TIMED) の並びに入れる (Sleeping にしてから、sched の前に)
@@ -1550,11 +1656,7 @@ fn exit_status(status: i32) -> ! {
         panic!("init exited with status {}", status);
     }
     let _p = crate::prof::span("proc:exit_kids");
-    for c in live() {
-        if c.state != State::Unused && c.ppid == p.tgid && !c.thread {
-            c.ppid = 1;
-        }
-    }
+    reparent_kids(slot_of(p));
     drop(_p);
     let _p = crate::prof::span("proc:exit_files");
     p.files = None;
@@ -1576,21 +1678,18 @@ fn exit_status(status: i32) -> ! {
     let _p = crate::prof::span("proc:exit_notify");
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
-    if let Some(parent) = find(p.ppid) {
+    // 親は子の並びのつなぎから (表を探さない)。init を起こすのは、ゾンビの子をわたしたときだけ (reparent_kids)
+    let parent = match p.sib.parent {
+        NONE => find(p.ppid),
+        s => Some(&mut procs()[s as usize]),
+    };
+    if let Some(parent) = parent {
         if crate::signal::parent_reaps_automatically(parent) {
             p.autoreap = true;
         } else {
-            let (code, st) = if p.xstatus & 0x7f != 0 { (crate::signal::CLD_KILLED, p.xstatus & 0x7f) } else { (crate::signal::CLD_EXITED, (p.xstatus >> 8) & 0xff) };
-            let info = SigInfo { code, pid: p.tgid, uid: p.cred.uid, status: st, ..SigInfo::ZERO };
-            let ppid = p.ppid;
-            let _ = crate::signal::send_group(ppid, crate::signal::SIGCHLD, info);
+            sigchld(p, parent);
         }
-        if let Some(parent) = find(current().ppid) {
-            wakeup(parent as *mut Proc as usize);
-        }
-    }
-    if let Some(init) = find(1) {
-        wakeup(init as *mut Proc as usize);
+        wakeup(parent as *mut Proc as usize);
     }
     // pidfd を poll / epoll しているもの (印は pidfd_key。印なしで眠っているものも起きる)
     poll_wake(pidfd_key());
@@ -1738,6 +1837,11 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.ppid = parent.ppid;
     } else {
         child.ppid = parent.tgid;
+        // 子の並びは代表スレッドに
+        let leader = if parent.thread { find(parent.tgid).map(|l| slot_of(l)) } else { Some(slot_of(parent)) };
+        if let Some(l) = leader {
+            kid_link(l, slot_of(child));
+        }
     }
     unsafe {
         fp_save(&mut child.fp);
@@ -1896,14 +2000,15 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
     const ECHILD: i64 = 10;
     let me = current();
     let (my_tgid, my_pgid) = (me.tgid, me.pgid);
+    // 子の並びは代表スレッドが持つ (親が待つのも代表スレッドのアドレス)
+    let leader = if me.thread { slot_of(find(my_tgid).ok_or(-ECHILD)?) } else { slot_of(me) };
     loop {
         let mut have = false;
-        let scan = crate::prof::span("proc:wait_scan");
-        // Linux と同じく古い子から (子の並びは fork した順。番号はふえるだけなので番号の順)
-        let mut kids: Vec<&'static mut Proc> = live().filter(|c| c.state != State::Unused && !c.thread && c.ppid == my_tgid).collect();
-        kids.sort_by_key(|c| c.pid);
-        drop(scan);
-        for c in kids {
+        // Linux と同じく古い子から (子の並びは fork した順、init にわたされたものはそのあと)
+        let mut i = procs()[leader].kids.0;
+        while i != NONE {
+            let c = &mut procs()[i as usize];
+            i = c.sib.next;
             let wanted = match pid {
                 p if p > 0 => c.pid as i64 == p,
                 0 => c.pgid == my_pgid,
@@ -1926,9 +2031,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                     let _p = crate::prof::span("proc:reap");
                     let t = c.utime + c.cutime;
                     free_slot(c);
-                    if let Some(me) = find(my_tgid) {
-                        me.cutime += t;
-                    }
+                    procs()[leader].cutime += t;
                 }
                 return Ok(r);
             }
@@ -1952,10 +2055,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
         if options & WNOHANG != 0 {
             return Ok((0, 0));
         }
-        // 親が待つのは代表スレッドのアドレス
-        let me = current();
-        let leader = find(me.tgid).map_or(me as *mut Proc as usize, |l| l as *mut Proc as usize);
-        sleep(leader)?;
+        sleep(&mut procs()[leader] as *mut Proc as usize)?;
     }
 }
 

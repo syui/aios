@@ -5,6 +5,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -256,6 +258,126 @@ static void orphan(void) {
     reap(q);
 }
 
+// /proc/PID/status の PPid (なければ -1)
+static long ppid_of(pid_t pid) {
+    char p[64], b[2048];
+    snprintf(p, sizeof p, "/proc/%d/status", (int)pid);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    b[n] = 0;
+    char *q = strstr(b, "\nPPid:");
+    return q ? strtol(q + 6, NULL, 10) : -1;
+}
+
+static pid_t thread_kid, thread_wpid;
+static long thread_wres;
+static int thread_wst;
+static void *fork_in_thread(void *a) {
+    (void)a;
+    pid_t p = fork();
+    if (p == 0)
+        _exit(5);
+    thread_kid = p;
+    return NULL;
+}
+static void *wait_in_thread(void *a) {
+    (void)a;
+    thread_wres = w4(thread_wpid, 0, &thread_wst);
+    return NULL;
+}
+
+// 親が変わるまで待って、getppid を fd に書く (孫の代表スレッドとスレッド)
+static pid_t old_parent;
+static int report_fd;
+static void *report_ppid(void *a) {
+    (void)a;
+    for (int i = 0; i < 400 && getppid() == old_parent; i++)
+        msleep(5);
+    int v = getppid();
+    if (write(report_fd, &v, sizeof v) != sizeof v)
+        _exit(1);
+    return NULL;
+}
+
+// 3 秒まで待って int を 1 つ読む (来なければ -1)
+static int read_int(int fd) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+    int v = -1;
+    if (poll(&pfd, 1, 3000) == 1 && read(fd, &v, sizeof v) == sizeof v)
+        return v;
+    return -1;
+}
+
+static void kids(void) {
+    int st;
+    // 待てる子だけを古い順に (動いている子はとばす)
+    pid_t a = kid_exit(1), b = kid_pause(), c = kid_exit(3);
+    check("kids: the oldest exited one", w4(-1, WNOHANG, &st), a);
+    check("kids: skips the running one", w4(-1, WNOHANG, &st), c);
+    check("kids: the running one is left", w4(-1, WNOHANG, &st), 0);
+    reap(b);
+    check("kids: none left", w4(-1, WNOHANG, &st), -ECHILD);
+    // スレッドが fork した子を代表スレッドが待ち、代表スレッドが fork した子をスレッドが待つ
+    pthread_t t;
+    pthread_create(&t, NULL, fork_in_thread, NULL);
+    pthread_join(t, NULL);
+    check("a thread's kid: the main thread waits it", w4(-1, 0, &st), thread_kid);
+    check("a thread's kid: status 5", WIFEXITED(st) && WEXITSTATUS(st) == 5, 1);
+    thread_wpid = kid_exit(6);
+    pthread_create(&t, NULL, wait_in_thread, NULL);
+    pthread_join(t, NULL);
+    check("the main thread's kid: a thread waits it", thread_wres, thread_wpid);
+    check("the main thread's kid: status 6", WIFEXITED(thread_wst) && WEXITSTATUS(thread_wst) == 6, 1);
+    thread_wpid = -1;
+    pthread_create(&t, NULL, wait_in_thread, NULL);
+    pthread_join(t, NULL);
+    check("no kids: a thread gets ECHILD", thread_wres, -ECHILD);
+    // 親が終わると、その子 (動いているものも、終わったゾンビも) の親は init。動いている孫は、代表スレッドも
+    // スレッドも getppid が 1
+    int fds[2];
+    if (pipe(fds) < 0)
+        return;
+    pid_t m = fork();
+    if (m == 0) {
+        pid_t z = fork();
+        if (z == 0)
+            _exit(0);
+        pid_t g = fork();
+        if (g == 0) {
+            old_parent = getppid();
+            report_fd = fds[1];
+            pthread_t gt;
+            pthread_create(&gt, NULL, report_ppid, NULL);
+            report_ppid(NULL);
+            pthread_join(gt, NULL);
+            for (;;)
+                pause();
+        }
+        waitstate(z, "Z");
+        if (write(fds[1], &z, sizeof z) != sizeof z || write(fds[1], &g, sizeof g) != sizeof g)
+            _exit(1);
+        _exit(0);
+    }
+    pid_t z = read_int(fds[0]), g = read_int(fds[0]);
+    check("middle parent exits", w4(m, 0, &st), m);
+    int p1 = read_int(fds[0]), p2 = read_int(fds[0]);
+    check("orphan: getppid of the main thread and a thread is 1", p1 == 1 && p2 == 1, 1);
+    check("orphan: /proc/PID/status PPid 1", ppid_of(g), 1);
+    check("orphan: not my kid any more", w4(g, WNOHANG, &st), -ECHILD);
+    long zp = ppid_of(z);
+    check("orphaned zombie: init has it (PPid 1) or reaped it", zp == 1 || zp == -1, 1);
+    check("orphaned zombie: not my kid", w4(z, WNOHANG, &st), -ECHILD);
+    kill(g, SIGKILL);
+    waitstate(g, "ZX");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 static void pgids(void) {
     pid_t a = kid_pause(), b = kid_pause();
     check("setpgid: negative pgid EINVAL (before ESRCH)", setpgid(4000000, -1) < 0 ? errno : 0, EINVAL);
@@ -345,6 +467,7 @@ int main(int argc, char **argv) {
     stopcont();
     chld();
     orphan();
+    kids();
     pgids();
     kills();
     printf("procwait: %d checks, %d failed\n", checks, fails);

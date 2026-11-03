@@ -263,6 +263,16 @@ pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
     Ok(())
 }
 
+/// 終わった子のことを親 (代表スレッド) に SIGCHLD で知らせる。代表がブロックしていない無視されるシグナル (ハンドラの
+/// ない SIGCHLD はふつうこれ) なら、send_group も代表を選んで捨てるので、スレッドを集めずに捨てる (子が終わるたびに)
+pub fn send_chld(parent: &Proc, info: SigInfo) {
+    let b = bit(SIGCHLD);
+    if parent.state != proc::State::Zombie && parent.sig_mask & b == 0 && ignored(parent, SIGCHLD) {
+        return;
+    }
+    let _ = send_group(parent.tgid, SIGCHLD, info);
+}
+
 /// 送り主が送ってよいか (Linux の check_kill_permission: uid が合うか CAP_KILL、でなければ EPERM。それから
 /// security_task_kill: AppArmor の signal の決まりで、だめなら EACCES)
 fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
