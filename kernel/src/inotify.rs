@@ -78,12 +78,43 @@ pub fn fdinfo(n: &InotifyRef) -> alloc::string::String {
     s
 }
 
-/// IN_ACCESS を待つ見張りが置かれたことがある (それからは、大きなロックなしの read はしない: file::fast_read_file)
-pub static ACCESS_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// IN_ACCESS を待つ見張りの数 (0 でなければ、大きなロックなしの read はしない: file::fast_read_file)
+pub static ACCESS_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// 作る・消すのできごと (IN_CREATE、IN_DELETE、IN_ATTRIB、IN_DELETE_SELF) を待つ見張りが置かれたことがある (それからは、
-/// 大きなロックなしの作る・消す (fastdir.rs) はしない: できごとはふつうの道が出す)
-pub static NAME_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 作る・消すのできごと (IN_CREATE、IN_DELETE、IN_ATTRIB、IN_DELETE_SELF) を待つ見張りの数 (0 でなければ、大きなロックなしの
+/// 作る・消す (fastdir.rs) はしない: できごとはふつうの道が出す)
+pub static NAME_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+const NAME_BITS: u32 = IN_CREATE | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF;
+const OPEN_BITS: u32 = IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
+
+/// 見張り 1 つ (mask) のぶん、ACCESS_WATCHED、NAME_WATCHED、file::OPEN_WATCHED を足す (add) か引く。前は「一度でも置かれた」の
+/// 印で、見張りを外しても inotify を閉じても、大きなロックなしの道は切れたままだった (先に inotify を使ったテストのあとで、
+/// test/createrace.c の fast-path が落ちた)。足すのは見張りを置く前、引くのは外したあと。数なので、大きなロックの外で
+/// inotify が捨てられても (Drop) よい
+fn count(mask: u32, add: bool) {
+    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let f = |a: &AtomicUsize, bits: u32| {
+        if mask & bits != 0 {
+            if add {
+                a.fetch_add(1, SeqCst);
+            } else {
+                a.fetch_sub(1, SeqCst);
+            }
+        }
+    };
+    f(&ACCESS_WATCHED, IN_ACCESS);
+    f(&NAME_WATCHED, NAME_BITS);
+    f(&crate::file::OPEN_WATCHED, OPEN_BITS);
+}
+
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        for w in &self.watches {
+            count(w.mask, false);
+        }
+    }
+}
 
 /// 生きている inotify (見張りがあるかを速く知るため)
 static LIST: Bkl<Vec<Weak<RefCell<Inotify>>>> = Bkl::new(Vec::new());
@@ -137,40 +168,40 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     crate::cred::current().check(&ino.meta(), crate::cred::R)?;
     let id = ino.id();
     let keep = mask & (IN_ALL_EVENTS | IN_ONESHOT | IN_EXCL_UNLINK);
-    // 大きなロックなしの read は IN_ACCESS を、pwrite は IN_MODIFY を出さない: これからはふつうの道で
-    // (いまある watch に足すときも)
-    if keep & IN_ACCESS != 0 {
-        ACCESS_WATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+    // 同じ inode の見張りがあれば、その印をかえる (IN_MASK_ADD なら足す)
+    let old = n.borrow().watches.iter().find(|w| w.id == id).map(|w| w.mask);
+    if old.is_some() && mask & IN_MASK_CREATE != 0 {
+        return Err(-EEXIST);
     }
-    if keep & IN_MODIFY != 0 {
+    if old.is_none() && n.borrow().watches.len() >= crate::sysctl::INOTIFY_MAX_WATCHES.load(core::sync::atomic::Ordering::Relaxed) {
+        return Err(-ENOSPC);
+    }
+    let new = match old {
+        Some(m) if mask & IN_MASK_ADD != 0 => m | keep,
+        _ => keep,
+    };
+    // 大きなロックなしの read は IN_ACCESS を、pwrite は IN_MODIFY を、作る・消すはそのできごとを、open / close (file の棚) は
+    // IN_OPEN と IN_CLOSE を出さない: 見張りの数を先に足して、これからはふつうの道で
+    if new & IN_MODIFY != 0 {
         crate::vm::write_permits_revoke();
     }
-    if keep & (IN_CREATE | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF) != 0 {
-        NAME_WATCHED.store(true, core::sync::atomic::Ordering::SeqCst);
-    }
-    // 大きなロックなしの open / close (file の棚) は IN_OPEN と IN_CLOSE を出さない: これからはふつうの道で。
+    count(new, true);
     // 棚にしまってあるものは、ここで閉じる (見張りが置かれる前なので、できごとはない)
-    if keep & (IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) != 0 {
-        crate::file::OPEN_WATCHED.store(true, core::sync::atomic::Ordering::SeqCst);
+    if new & OPEN_BITS != 0 {
         crate::file::shelf_flush_all();
     }
     // いま大きなロックなしで作っている・消しているもの (fastdir.rs) が終わるのを待つ (ext4 のロック): あとから来るものは、
-    // ロックを取ってから印を見るので、ふつうの道へ行く
+    // ロックを取ってから数を見るので、ふつうの道へ行く
     drop(crate::extfs::fs_lock());
     let mut n = n.borrow_mut();
     if let Some(w) = n.watches.iter_mut().find(|w| w.id == id) {
-        if mask & IN_MASK_CREATE != 0 {
-            return Err(-EEXIST);
-        }
-        w.mask = if mask & IN_MASK_ADD != 0 { w.mask | keep } else { keep };
+        count(w.mask, false);
+        w.mask = new;
         return Ok(w.wd as i64);
-    }
-    if n.watches.len() >= crate::sysctl::INOTIFY_MAX_WATCHES.load(core::sync::atomic::Ordering::Relaxed) {
-        return Err(-ENOSPC);
     }
     let wd = n.next_wd;
     n.next_wd += 1;
-    n.watches.push(Watch { wd, id, mask: keep });
+    n.watches.push(Watch { wd, id, mask: new });
     Ok(wd as i64)
 }
 
@@ -180,7 +211,8 @@ pub fn rm_watch(fd: u64, wd: i32) -> Result<i64, i64> {
     let found = {
         let mut b = n.borrow_mut();
         let i = b.watches.iter().position(|w| w.wd == wd).ok_or_else(|| crate::why::inval())?;
-        b.watches.remove(i);
+        let w = b.watches.remove(i);
+        count(w.mask, false);
         true
     };
     if found {
@@ -256,7 +288,13 @@ fn deliver(id: (usize, u64), mask: u32, cookie: u32, name: Option<&str>) {
         for (wd, oneshot) in hits {
             push(&n, wd, mask, cookie, name);
             if oneshot {
-                n.borrow_mut().watches.retain(|w| w.wd != wd);
+                n.borrow_mut().watches.retain(|w| {
+                    let keep = w.wd != wd;
+                    if !keep {
+                        count(w.mask, false);
+                    }
+                    keep
+                });
                 push(&n, wd, IN_IGNORED, 0, None);
             }
         }
@@ -307,7 +345,13 @@ pub fn gone(ino: &InodeRef) {
     for w in list().clone() {
         let Some(n) = w.upgrade() else { continue };
         let wds: Vec<i32> = n.borrow().watches.iter().filter(|w| w.id == id).map(|w| w.wd).collect();
-        n.borrow_mut().watches.retain(|w| w.id != id);
+        n.borrow_mut().watches.retain(|w| {
+            let keep = w.id != id;
+            if !keep {
+                count(w.mask, false);
+            }
+            keep
+        });
         for wd in wds {
             push(&n, wd, IN_IGNORED, 0, None);
         }

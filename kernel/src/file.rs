@@ -264,9 +264,9 @@ fn reuse_off(of: &mut OpenFile) {
     }
 }
 
-/// IN_OPEN か IN_CLOSE を待つ見張りが置かれたことがある (大きなロックなしの open / close はできごとを出さないので、
-/// それからはふつうの道で)
-pub static OPEN_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// IN_OPEN か IN_CLOSE を待つ見張りの数 (大きなロックなしの open / close はできごとを出さないので、0 でなければふつうの道で。
+/// inotify.rs の count)
+pub static OPEN_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// 大きなロックなしの open / close の数: [0] 棚から開いた、[1] ない (ENOENT) と答えた、[2] 棚にしまった、
 /// ふつうの道へ: [3] statc の表にない・古い、[4] 棚になく、新しくも開けない、[5] 開けない形 (フラグ、fd の表、見張り)、
@@ -288,7 +288,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
     let acc = flags & O_ACCMODE as u64;
-    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) {
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) != 0 {
         note(5);
         return None;
     }
@@ -384,7 +384,7 @@ pub fn fast_install(t: &mut proc::Files, fd: usize, file: FileRef, cloexec: bool
 pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     let files = me.files.as_ref()?;
-    if !files.private() || OPEN_WATCHED.load(Relaxed) || crate::fail::ON.load(Relaxed) {
+    if !files.private() || OPEN_WATCHED.load(Relaxed) != 0 || crate::fail::ON.load(Relaxed) {
         return None;
     }
     let t = files.get();
@@ -1645,7 +1645,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
     if len == 0 || len > MAX {
         return Err(1);
     }
-    if crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+    if crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return Err(2);
     }
     let files = me.files.as_ref().ok_or(3usize)?;
@@ -1674,7 +1674,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
 /// あるとき。オフセットを動かさないので、fd の表をほかのスレッドと分けていても (門を通って) 読める
 pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
     const MAX: usize = 256 * 1024;
-    if len == 0 || len > MAX || off < 0 || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+    if len == 0 || len > MAX || off < 0 || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return None;
     }
     let files = me.files.as_ref()?;
@@ -1763,7 +1763,7 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
             // ino.meta() は見ない: inode の中身は大きなロックで守られている (ほかの CPU が書いているかもしれない)。
             // ページキャッシュにはふつうのファイルのページしか入らない (vm::read_cached と mmap) ので、ディレクトリなどは
             // with_cached が None でふつうの道へ (fast_pread と同じ)
-            if !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+            if !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
                 return None;
             }
             // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)
