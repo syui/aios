@@ -241,6 +241,7 @@ nrs! {
     TIMES = 153,
     PIDFD_SEND_SIGNAL = 424,
     PIDFD_OPEN = 434,
+    PIDFD_GETFD = 438,
     LANDLOCK_CREATE_RULESET = 444,
     SECCOMP = 277,
     LANDLOCK_ADD_RULE = 445,
@@ -565,7 +566,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SECCOMP => crate::seccomp::sys_seccomp(a[0], a[1], a[2] as usize),
         LANDLOCK_ADD_RULE => crate::landlock::add_rule(a[0], a[1], a[2] as usize, a[3]),
         LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
-        PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(int(a[0]), int(a[1]) as i32),
+        PIDFD_SEND_SIGNAL => crate::pidfd::send_signal(int(a[0]), int(a[1]) as i32, a[2] as usize, a[3] as u32 as u64),
+        PIDFD_GETFD => crate::pidfd::getfd(int(a[0]), int(a[1]), a[2] as u32 as u64),
         KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),
         // tkill / tgkill: 番号が 0 以下なら EINVAL (Linux)
         TKILL if int(a[0]) <= 0 => Err(crate::why::inval()),
@@ -1748,6 +1750,7 @@ fn pidfd_pid(fd: i64) -> Result<u32, i64> {
 pub fn pidfd_install(pid: u32, thread: bool, nonblock: bool) -> Result<i32, i64> {
     let fl = crate::file::O_RDWR | if thread { crate::file::PIDFD_THREAD } else { 0 } | if nonblock { crate::file::O_NONBLOCK } else { 0 };
     let f = crate::file::new(crate::file::Kind::PidFd(pid), fl);
+    crate::pidfd::opened(pid);
     let fd = proc::current().files().add(f, true, 0).ok_or(-24)?;
     Ok(fd as i32)
 }
@@ -1768,18 +1771,6 @@ fn sys_pidfd_open(pid: i64, flags: u64) -> R {
         return Err(-ENOENT);
     }
     pidfd_install(pid as u32, flags & PIDFD_THREAD != 0, flags & PIDFD_NONBLOCK != 0).map(|fd| fd as i64)
-}
-
-/// pidfd_send_signal(fd, sig, info, flags): PIDFD_THREAD の pidfd ならそのスレッドに、ほかはプロセスに (Linux 7.4 の
-/// flags 0 のとき)。終わってまだ片づけられていないものには送れて何も起きない (kill と同じ)、片づけられたものは ESRCH
-fn sys_pidfd_send_signal(fd: i64, sig: i32) -> R {
-    const ESRCH: i64 = 3;
-    let (pid, thread) = pidfd_of(fd)?;
-    if thread {
-        let tgid = proc::find_thread(pid).ok_or(-ESRCH)?.tgid;
-        return signal::tgkill(tgid, pid, sig).map(|_| 0);
-    }
-    signal::kill(pid as i64, sig).map(|_| 0)
 }
 
 /// waitid(idtype, id, siginfo, options, rusage): 結果を siginfo で返す wait
@@ -1897,7 +1888,7 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     }
 }
 
-/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)。
+/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)、dumpable。
 /// ほかは何もしない
 fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_SPECULATION_CTRL: u64 = 52;
@@ -1908,8 +1899,18 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_NAME: u64 = 16;
     const PR_SET_NO_NEW_PRIVS: u64 = 38;
     const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
     let p = proc::current();
     match op {
+        // 持ちもの (mm) の dumpable (pidfd.rs: PIDFD_GET_INFO の coredump の印、pidfd_getfd の許し)。つけられるのは 0 と 1
+        PR_GET_DUMPABLE => return Ok(p.mm().dumpable as i64),
+        PR_SET_DUMPABLE => {
+            if arg > 1 {
+                return Err(crate::why::inval());
+            }
+            p.mm().dumpable = arg as u8;
+        }
         // 一度つけたら外せない (arg は 1 だけ)
         PR_SET_NO_NEW_PRIVS => {
             if arg != 1 {

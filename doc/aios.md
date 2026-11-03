@@ -1154,7 +1154,7 @@ systemd や dbus-broker は、AF_UNIX の相手を番号 (SO_PEERCRED の pid �
 SO_PASSPIDFD の get / set、AF_INET の TCP と UDP、dgram の SCM_PIDFD (子が送って終わった、片づけたあと)、入れ物の大きさ
 7 とおりの MSG_CTRUNC、SCM_RIGHTS といっしょの並び、スレッドが送ったもの、stream のつなぎかた) は Linux 7.4-rc1 と 1 バイトも
 ちがわない。pidfd がどれを指すかは、子なら waitid(P_PIDFD) の si_pid、スレッドなら pidfd_send_signal で起きたハンドラの
-gettid で見る。/proc/PID/fdinfo (pidfd の Pid:) と PIDFD_GET_INFO はまだ (todo.json の pidfd-info)。
+gettid で見る。/proc/PID/fdinfo (pidfd の Pid:) と PIDFD_GET_INFO は下の「pidfd のことを答える口」(2026-11-03)。
 
 ### seccomp の user notification (NEW_LISTENER、RET_USER_NOTIF、7.4 の RESTART_BEFORE_RECV)
 
@@ -1227,6 +1227,41 @@ aibox はいままでどおり (ファイルの権利は TRUNCATE まで、TCP �
 止めかたを子のプロセスで 49。nobody で) は Linux 7.4-rc1 と 1 バイトもちがわない。手本の Linux (test/linux.config) に
 landlock (CONFIG_LSM は landlock,apparmor) と、namespace の permission を見るためにユーザーと UTS の namespace を足した
 (test/sysdiff/ の手本はそれで作りなおして変わらない)。
+
+### pidfd のことを答える口 (/proc/PID/fdinfo、PIDFD_GET_INFO、pidfd_getfd、pidfd_send_signal)
+
+systemd の pidfd_get_pid は ioctl の PIDFD_GET_INFO で pidfd の指すプロセスを聞き、なければ /proc/self/fdinfo/N の `Pid:` を
+読む。aios はどちらもなかった (/proc/PID/fdinfo そのものがなかった)。Linux 7.4-rc1 の fs/pidfs.c、fs/proc/fd.c、
+kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。core):
+
+- `/proc/PID/fdinfo/` (040555。一覧は fd/ と同じ) と `fdinfo/N` (0100444。読めるのは ptrace で READ できる人): `pos`、
+  `flags` (8 進。fd の FD_CLOEXEC は O_CLOEXEC として)、`mnt_id`、`ino` (fstat の st_ino と同じ) と、ものごとの行: pidfd の
+  `Pid:` と `NSpid:` (片づけられたら -1、見えなければ 0)、eventfd の `eventfd-count` (16 けたの 16 進) と `-id`、
+  `-semaphore`、timerfd の `clockid`、`ticks`、`settime flags`、`it_value` (のこり)、`it_interval`、epoll の `tfd:` の行
+  (EPOLLERR と EPOLLHUP はいつも入る)、inotify の `inotify wd:` の行、AF_UNIX の `scm_fds` (受ける行列の SCM_RIGHTS の数)。
+  mnt_id は aios ではファイルシステムごと (bind マウントも同じ番号)。inotify の file handle (`fhandle-bytes` など) はまだ
+- `flags` と F_GETFL は、open で開いたもの (ファイル、デバイス) に 64 ビットの Linux がいつも足す O_LARGEFILE を見せる
+  (しまうものは変えない: 棚の速い open は口をくらべるので)。O_PATH は O_PATH、O_DIRECTORY、O_NOFOLLOW だけ
+- `PIDFD_GET_INFO` (`_IOWR(0xFF, 11, struct pidfd_info)`。大きさは 64、72、80、88 の版で、それより小さければ ENOTTY、
+  大きければ知らない続きを 0 に): いつも番号 (pid、tgid、ppid) と資格情報、頼まれれば COREDUMP (PR_SET_DUMPABLE からの印:
+  1 なら USER、0 なら SKIP) と SUPPORTED_MASK (0xff)。入らない欄の印は落とす。片づけられたあとは EXIT だけ (頼まなければ
+  ESRCH): exit_code は wait の status で、片づけたとき (proc の free_slot) に覚える。Linux と同じく、それまでに pidfd を
+  開いていたものだけ (pidfd がみな閉じたら忘れる)。ゾンビのあいだはまだ EXIT はない。cgroup がないので CGROUPID は
+  入らない (手本の Linux も同じ)。namespace の fd を返す PIDFD_GET_*_NAMESPACE はまだ (ENOTTY)
+- pidfd の st_ino はプロセス (スレッド) ごと (aios の pid は使いまわさないので番号そのもの。同じものを指す pidfd は同じ ino)
+- `pidfd_getfd` (438): 相手の fd を写して close-on-exec で受けとる。ptrace で ATTACH できる相手だけ (実の uid と gid が
+  相手の 3 つの id と同じで dumpable、でなければ CAP_SYS_PTRACE。landlock と AppArmor の ptrace の決まりも)。ゾンビは ESRCH
+- `pidfd_send_signal` の flags (THREAD、THREAD_GROUP、PROCESS_GROUP のどれか 1 つ。PROCESS_GROUP は pidfd の指すプロセスの
+  番号のグループへ) と siginfo (si_signo がちがえば EINVAL、ほかのプロセスへはカーネルの si_code (0 以上と SI_TKILL) は
+  EPERM)。info がなければ THREAD は SI_TKILL、ほかは SI_USER。pidfd のかわりの PIDFD_SELF_THREAD (-10000) と
+  PIDFD_SELF_THREAD_GROUP (-10001)。pidfd でない fd は EBADF (前は EINVAL)
+- ついでに足したもの: `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)` (持ちもの (mm) ごと、fork で引き継ぎ、exec で 1。setuid の
+  プログラムで id が変われば 0)。epoll に poll のできないもの (ディレクトリ、ext4 や tmpfs のふつうのファイル、/dev/null と
+  /dev/zero、ブロックデバイス) を入れるのは EPERM (前の aios は入れて、いつも読める・書けると答えていた)
+
+`test/pidfdinfo.c` (176 行: fdinfo を 13 種類の fd で、PIDFD_GET_INFO を自分・子 (動いている、ゾンビ、片づけたあと)・
+スレッドと 4 つの大きさで、pidfd_getfd、pidfd_send_signal の flags と siginfo) は Linux 7.4-rc1 と 1 バイトもちがわない。
+番号 (pid、ino、mnt_id) と uid はじかに出さず、あてはまるかを出す。
 
 ### Linux と答えあわせ (sysdiff)
 

@@ -2252,6 +2252,17 @@ pub fn pending(u: &UnixRef) -> u64 {
     u.borrow().q.iter().map(|m| m.len() as u64).sum()
 }
 
+/// /proc/PID/fdinfo の scm_fds: 受ける行列にある (まだ受けとられていない) SCM_RIGHTS の fd の数。listen しているものは、
+/// つないできた口の行列のぶん (Linux の unix_count_nr_fds)
+pub fn scm_fds(u: &UnixRef) -> usize {
+    let s = u.borrow();
+    if s.state == State::Listen {
+        s.embryos.iter().map(|e| e.borrow().q.iter().map(|m| m.fds.len()).sum::<usize>()).sum()
+    } else {
+        s.q.iter().map(|m| m.fds.len()).sum()
+    }
+}
+
 pub fn stat(u: &UnixRef) -> Stat {
     let s = u.borrow();
     Stat { ino: s.ino, uid: s.uid, gid: s.gid, mtime: s.mtime, ctime: s.ctime, ..Stat::dev(0o140000 | s.mode, 0) }

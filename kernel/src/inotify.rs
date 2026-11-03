@@ -67,6 +67,17 @@ pub struct Inotify {
 
 pub type InotifyRef = Rc<RefCell<Inotify>>;
 
+/// /proc/PID/fdinfo の行 (Linux の inotify_show_fdinfo): 見張りごとに wd、inode、dev、待つできごと。file handle (Linux の
+/// CONFIG_EXPORTFS の fhandle-bytes など) は、aios に name_to_handle_at がないので出さない
+pub fn fdinfo(n: &InotifyRef) -> alloc::string::String {
+    const USER_MASK: u32 = 0xfff | 0x0400_0000 | 0x8000_0000;
+    let mut s = alloc::string::String::new();
+    for w in n.borrow().watches.iter() {
+        s.push_str(&alloc::format!("inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0 \n", w.wd, w.id.1, crate::file::ST_DEV_KERNEL, w.mask & USER_MASK));
+    }
+    s
+}
+
 /// IN_ACCESS を待つ見張りが置かれたことがある (それからは、大きなロックなしの read はしない: file::fast_read_file)
 pub static ACCESS_WATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 

@@ -881,6 +881,49 @@ pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
     Ok(0)
 }
 
+/// pidfd_send_signal (Linux の kill_pid_info_type): pid の Proc (回収されるまでのゾンビも) に、thread ならそのスレッド
+/// だけ、でなければそのスレッドグループに info で。いなければ ESRCH、番号 (EINVAL)、許可 (EPERM) の順。ゾンビには 0
+pub fn send_pid_info(pid: u32, thread: bool, sig: i32, info: SigInfo) -> R {
+    let t = proc::find_any(pid).ok_or(-ESRCH)?;
+    if !(0..NSIG as i32).contains(&sig) {
+        return Err(crate::why::inval());
+    }
+    can_signal(t, sig)?;
+    if sig == 0 || t.state == proc::State::Zombie {
+        return Ok(0);
+    }
+    if thread {
+        send_thread(t, sig, info);
+        Ok(0)
+    } else {
+        let tgid = t.tgid;
+        send_group(tgid, sig, info).map(|_| 0)
+    }
+}
+
+/// プロセスグループ pgid のみなに info で (Linux の __kill_pgrp_info: ひとつでも送れれば 0、だれもいなければ ESRCH、
+/// みな許されなければ最後のわけ)
+pub fn send_pgrp_info(pgid: u32, sig: i32, info: SigInfo) -> R {
+    if !(0..NSIG as i32).contains(&sig) {
+        return Err(crate::why::inval());
+    }
+    let mut res = Err(-ESRCH);
+    let mut sent = false;
+    for tgid in proc::leaders_in_pgrp_any(pgid) {
+        let Some(l) = proc::find_leader_any(tgid) else { continue };
+        match can_signal(l, sig) {
+            Ok(()) => {
+                if sig != 0 && l.state != proc::State::Zombie {
+                    send_group(tgid, sig, info)?;
+                }
+                sent = true;
+            }
+            Err(e) => res = Err(e),
+        }
+    }
+    if sent { Ok(0) } else { res }
+}
+
 // ---- タイマー ----
 
 fn read_timespec(va: usize) -> Result<u64, i64> {

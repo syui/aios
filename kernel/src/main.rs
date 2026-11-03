@@ -52,6 +52,7 @@ mod nftables;
 mod nfhook;
 mod conntrack;
 mod parts;
+mod pidfd;
 mod proc;
 mod sd;
 mod smp;

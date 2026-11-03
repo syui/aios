@@ -2610,7 +2610,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             entry.cloexec = arg & FD_CLOEXEC != 0;
             Ok(0)
         }
-        F_GETFL => Ok(entry.file.borrow().flags as i64),
+        F_GETFL => Ok(entry.file.borrow().linux_flags() as i64),
         F_SETFL => {
             // 変えられるのは O_APPEND、O_NONBLOCK、O_DIRECT、O_NOATIME (Linux の SETFL_MASK)。O_NOATIME をつけるのは
             // 持ち主か root だけ (EPERM)、O_DIRECT はふつうのファイルとパイプだけ (EINVAL。setfl)
@@ -2758,6 +2758,14 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     }
     if matches!(f.borrow().kind, Kind::Fb) {
         return crate::gpu::ioctl(req, arg);
+    }
+    // pidfd (PIDFD_GET_INFO: pidfd.rs)
+    let pidfd = match &f.borrow().kind {
+        Kind::PidFd(pid) => Some((*pid, f.borrow().flags & file::PIDFD_THREAD != 0)),
+        _ => None,
+    };
+    if let Some((pid, thread)) = pidfd {
+        return crate::pidfd::ioctl(pid, thread, req, arg);
     }
     // seccomp の listener (NOTIF_RECV は眠るので、OpenFile を借りたままにしない)
     let listener = match &f.borrow().kind {

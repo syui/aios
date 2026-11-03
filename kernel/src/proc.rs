@@ -87,6 +87,9 @@ pub struct Mm {
     pub exe_id: (usize, u64),
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
     pub args: (usize, usize, usize),
+    /// PR_GET_DUMPABLE / PR_SET_DUMPABLE (0 作らない、1 作る、2 root の権利で)。exec で 1 (setuid / setgid のもので
+    /// id が変わったら 0: Linux の suid_dumpable の既定)。fork で引き継ぐ。PIDFD_GET_INFO の coredump の印と、ptrace の許し
+    pub dumpable: u8,
 }
 
 impl Mm {
@@ -560,7 +563,7 @@ impl Proc {
 
     fn load_image(&mut self, img: Image) {
         self.execed = true;
-        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args }));
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1 }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -698,6 +701,8 @@ fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     // seccomp の listener に、フィルタを使う人が減ったことを (使う人がいなくなれば POLLHUP)
     crate::seccomp::released(&p.cred);
+    // pidfd があれば、終わったときの status を (PIDFD_GET_INFO の PIDFD_INFO_EXIT)
+    crate::pidfd::reaped(p.pid, p.xstatus);
     let i = slot_of(p);
     kid_unlink(i);
     // 子はふつう終わるときに init にわたしている (そのあとに、残っていたスレッドが fork したものも)
@@ -1178,7 +1183,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0) }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1 }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -1839,7 +1844,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             None => m.pt.fork(),
         };
         let pt = pt.ok_or(-ENOMEM)?;
-        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
@@ -2002,6 +2007,9 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
+    if p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid {
+        p.mm().dumpable = 0;
+    }
     if fatal {
         crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
     }

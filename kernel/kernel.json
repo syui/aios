@@ -22,6 +22,7 @@
   {"name": "tty", "type": "core", "src": "src/tty.rs", "what": "端末 (tty) と行規律 (termios)。コンソールと疑似端末 (pty) で同じものを使う"},
   {"name": "proc", "type": "core", "src": "src/proc.rs", "what": "プロセス・スレッドとスケジューラ。wait (古い子から、ゾンビは WEXITED のときだけ待つ相手)、孤児のプロセスグループ、ゾンビは回収されるまでいる (kill は 0、/proc/PID は Z)"},
   {"name": "signal", "type": "core", "src": "src/signal.rs", "what": "シグナル: 送る、ためる、EL0 へ戻るときにハンドラを呼ぶ (Linux arm64 と同じ rt_sigframe)"},
+  {"name": "pidfd", "type": "core", "src": "src/pidfd.rs", "what": "pidfd のことを答える口 (Linux の pidfs): /proc/PID/fdinfo の Pid: と NSpid:、PIDFD_GET_INFO (番号、資格情報、片づけられたときの exit_code、coredump の印)、pidfd_getfd、pidfd_send_signal の flags と siginfo"},
   {"name": "syscall", "type": "core", "src": "src/syscall.rs", "what": "aarch64 Linux 互換のシステムコール"},
   {"name": "exec", "type": "core", "src": "src/exec.rs", "what": "ELF を新しいアドレス空間に読み込み、Linux と同じ形 (argc, argv, envp, auxv) のスタックを作る。AT_HWCAP と AT_HWCAP2 と /proc/cpuinfo の Features は ID レジスタから Linux と同じ決まりで (CAPS)"},
   {"name": "file", "type": "core", "src": "src/file.rs", "what": "開いたファイル (fd の向こう側)。閉じたふつうのファイルの棚 (Shelf): 読むだけで開いた ext4 のファイルを閉じるとき OpenFile をしまい、同じパスをまた開くとき、statc がいまも同じ inode で読めると答えれば、大きなロックなしで出す (Rc の数は変えない)。ない (ENOENT) ものの openat も大きなロックなしで答える。test/opencache.c が確かめる", "bench": "test/smpbench.c (aish の bench smp の open-close-x4。/proc/bkl のロックなしの open / close)"},

@@ -24,6 +24,9 @@ const TFD_NONBLOCK: u64 = 0o4000;
 
 pub struct TimerFd {
     realtime: bool,
+    /// 作ったときの時計と、さいごの settime の印 (TFD_TIMER_ABSTIME と TFD_TIMER_CANCEL_ON_SET。/proc/PID/fdinfo)
+    clockid: u8,
+    settime_flags: u8,
     /// 次の期限 (起動からの ns。0 なら止まっている)
     next: u64,
     interval: u64,
@@ -77,7 +80,7 @@ pub fn create(clock: u64, flags: u64) -> Result<i64, i64> {
     if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM) || flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
         return Err(crate::why::inval());
     }
-    let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), next: 0, interval: 0, ticks: 0, generation: 0 }));
+    let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), clockid: clock as u8, settime_flags: 0, next: 0, interval: 0, ticks: 0, generation: 0 }));
     let fl = file::O_RDWR | if flags & TFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
     let fd = proc::current().files().add(file::new(Kind::TimerFd(t), fl), flags & TFD_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
@@ -118,6 +121,23 @@ fn current_spec(t: &mut TimerFd) -> [u8; 32] {
     b
 }
 
+/// /proc/PID/fdinfo の行 (Linux の timerfd_show): 時計、まだ読まれていない期限の数、settime の印、のこりと間隔
+pub fn fdinfo(t: &TimerRef) -> alloc::string::String {
+    let b = current_spec(&mut t.borrow_mut());
+    let w = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let tm = t.borrow();
+    alloc::format!(
+        "clockid: {}\nticks: {}\nsettime flags: 0{:o}\nit_value: ({}, {})\nit_interval: ({}, {})\n",
+        tm.clockid,
+        tm.ticks,
+        tm.settime_flags,
+        w(16),
+        w(24),
+        w(0),
+        w(8)
+    )
+}
+
 pub fn settime(fd: u64, flags: u64, new: usize, old: usize) -> Result<i64, i64> {
     let t = timer_of(fd)?;
     let pt = proc::current().pt();
@@ -129,6 +149,7 @@ pub fn settime(fd: u64, flags: u64, new: usize, old: usize) -> Result<i64, i64> 
         let mut tm = t.borrow_mut();
         tm.ticks = 0;
         tm.interval = interval;
+        tm.settime_flags = (flags & 3) as u8;
         tm.next = if value == 0 {
             0
         } else if flags & TFD_TIMER_ABSTIME != 0 {

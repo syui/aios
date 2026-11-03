@@ -630,6 +630,9 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
 }
 
 /// Linux (asm-generic) の struct stat
+/// fstat の st_dev (aios はいつも 1: major 0、minor 1) を、カーネルの形 (major << 20 | minor) にしたもの (fdinfo の sdev)
+pub const ST_DEV_KERNEL: u32 = 1;
+
 #[derive(Clone, Copy)]
 pub struct Stat {
     pub ino: u64,
@@ -864,9 +867,57 @@ impl OpenFile {
             Kind::Netlink(n) => Stat { ino: crate::netlink::ino(n), ..Stat::dev(0o140000 | 0o777, 0) },
             Kind::Unix(u) => crate::unix::stat(u),
             Kind::Inet(u) => crate::inet::stat(u),
+            // pidfd はプロセス (スレッド) ごとの inode (Linux の pidfs: 同じものを指す pidfd は同じ ino。aios の pid は
+            // 使いまわさないので番号そのもの)
+            Kind::PidFd(pid) => Stat { ino: *pid as u64, ..Stat::dev(0o600, 0) },
             // 名前のない inode (anon_inode)
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
         }
+    }
+
+    /// Linux の f_flags (F_GETFL と /proc/PID/fdinfo の flags)。open で開いたもの (ファイル、デバイス) には、64 ビットの
+    /// カーネルがいつも足す O_LARGEFILE を見せる (aios はしまわない: 棚の速い open が口をくらべるので)。O_PATH は O_PATH、
+    /// O_DIRECTORY、O_NOFOLLOW だけ (Linux の O_PATH_FLAGS)
+    pub fn linux_flags(&self) -> u32 {
+        const O_LARGEFILE: u32 = 0o400000;
+        const O_DIRECTORY: u32 = 0o40000;
+        const O_NOFOLLOW: u32 = 0o100000;
+        if self.flags & O_PATH != 0 {
+            return self.flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW);
+        }
+        let opened = matches!(self.kind, Kind::Inode(..) | Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm);
+        self.flags | if opened { O_LARGEFILE } else { 0 }
+    }
+
+    /// このファイルのあるマウントの番号 (fdinfo の mnt_id)。aios はファイルシステムごとに 1 つ (21 から)。名前のないもの
+    /// (パイプ、ソケット、anon_inode、pidfd) は Linux の中のマウントのように小さな番号
+    fn mnt_id(&self) -> u64 {
+        match &self.kind {
+            Kind::Inode(ino, _) => 21 + ino.id().0 as u64,
+            Kind::PidFd(_) => 12,
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => 14,
+            Kind::Socket(_) | Kind::Netlink(_) | Kind::Unix(_) | Kind::Inet(_) => 15,
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 16,
+            // デバイスは /dev のノードのあるところ
+            _ => vfs::resolve("", &self.describe(), true).map_or(20, |i| 21 + i.id().0 as u64),
+        }
+    }
+
+    /// /proc/PID/fdinfo/N の中身 (Linux の seq_show と、ものごとの show_fdinfo)。cloexec はその fd の FD_CLOEXEC
+    pub fn fdinfo(&self, cloexec: bool) -> String {
+        const O_CLOEXEC: u32 = 0o2000000;
+        let flags = self.linux_flags() | if cloexec { O_CLOEXEC } else { 0 };
+        let mut s = alloc::format!("pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n", self.offset, flags, self.mnt_id(), self.stat().ino);
+        match &self.kind {
+            Kind::PidFd(pid) => s.push_str(&crate::pidfd::fdinfo(*pid, self.flags & PIDFD_THREAD != 0)),
+            Kind::EventFd(e) => s.push_str(&crate::epoll::eventfd_fdinfo(e)),
+            Kind::TimerFd(t) => s.push_str(&crate::timerfd::fdinfo(t)),
+            Kind::Epoll(e) => s.push_str(&crate::epoll::fdinfo(e)),
+            Kind::Inotify(n) => s.push_str(&crate::inotify::fdinfo(n)),
+            Kind::Unix(u) => s.push_str(&alloc::format!("scm_fds: {}\n", crate::unix::scm_fds(u))),
+            _ => {}
+        }
+        s
     }
 
     /// 状態が変わるたびに増える数 (epoll の EPOLLET 用)。数えていないものは 0
@@ -1305,6 +1356,7 @@ impl Drop for OpenFile {
         crate::locks::release_file(self as *const OpenFile as usize);
         match &self.kind {
             Kind::SndPcm => crate::sound::close_pcm(),
+            Kind::PidFd(pid) => crate::pidfd::closed(*pid),
             Kind::Inode(ino, path) => {
                 let ev = if self.writable() { crate::inotify::IN_CLOSE_WRITE } else { crate::inotify::IN_CLOSE_NOWRITE };
                 crate::inotify::file_event(path, ino, ev);

@@ -14,6 +14,7 @@ const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
+const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
 const ELOOP: i64 = 40;
 
@@ -154,10 +155,33 @@ pub fn create1(flags: u64) -> Result<i64, i64> {
     Ok(fd as i64)
 }
 
+/// epoll に入れられるか (Linux の f_op->poll があるもの)。ディレクトリ、ext4 や tmpfs のふつうのファイル、/dev/null と
+/// /dev/zero、ブロックデバイス、landlock の決まりの束はない。/proc と /sys のファイルはある (いつも読める)
+fn pollable(f: &file::OpenFile) -> bool {
+    const PROC_MAGIC: u64 = 0x9fa0;
+    const SYSFS_MAGIC: u64 = 0x6265_6572;
+    match &f.kind {
+        Kind::Inode(ino, _) => {
+            if ino.meta().is_dir() {
+                return false;
+            }
+            let magic = u64::from_le_bytes(ino.statfs()[0..8].try_into().unwrap());
+            magic == PROC_MAGIC || magic == SYSFS_MAGIC
+        }
+        Kind::Null | Kind::Zero | Kind::Block(_) | Kind::Landlock(_) => false,
+        _ => true,
+    }
+}
+
 pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
     let ep = epoll_of(epfd)?;
     let key = Rc::as_ptr(&ep) as usize;
     let target = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
+    // poll のできないもの (ふつうのファイルやディレクトリ、/dev/null など) は EPERM (Linux の file_can_poll。前の aios は
+    // 入れて、いつも読める・書けると答えていた)
+    if !pollable(&target.borrow()) {
+        return Err(-EPERM);
+    }
     if matches!(target.borrow().kind, Kind::Epoll(ref e) if Rc::ptr_eq(e, &ep)) {
         return Err(-ELOOP);
     }
@@ -260,6 +284,8 @@ pub fn ms_to_ns(ms: i64) -> Option<u64> {
 pub struct EventFd {
     count: u64,
     semaphore: bool,
+    /// 番号 (/proc/PID/fdinfo の eventfd-id。Linux の ida と同じく 0 から)
+    id: u32,
     /// 書かれた回数
     generation: u64,
 }
@@ -270,6 +296,29 @@ pub fn generation(e: &EventFdRef) -> u64 {
 
 pub type EventFdRef = Rc<RefCell<EventFd>>;
 
+static EVENTFD_IDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// /proc/PID/fdinfo の行 (Linux の eventfd_show_fdinfo)
+pub fn eventfd_fdinfo(e: &EventFdRef) -> alloc::string::String {
+    let e = e.borrow();
+    alloc::format!("eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: {}\n", e.count, e.id, e.semaphore as u8)
+}
+
+/// /proc/PID/fdinfo の行 (Linux の ep_show_fdinfo): 見張っているものごとに fd、待つできごと (EPOLLERR と EPOLLHUP は
+/// いつも)、data、相手の位置と inode と dev (カーネルの形の major << 20 | minor)
+pub fn fdinfo(ep: &EpollRef) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for (fd, e) in ep.borrow().entries.iter() {
+        let Some(f) = e.file.upgrade() else { continue };
+        let (pos, ino) = {
+            let f = f.borrow();
+            (f.offset, f.stat().ino)
+        };
+        s.push_str(&alloc::format!("tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}\n", fd, e.events | EPOLLERR | EPOLLHUP, e.data, pos, ino, crate::file::ST_DEV_KERNEL));
+    }
+    s
+}
+
 pub fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     const EFD_SEMAPHORE: u64 = 1;
     const EFD_CLOEXEC: u64 = 0o2000000;
@@ -277,7 +326,7 @@ pub fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     if flags & !(EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK) != 0 {
         return Err(crate::why::inval());
     }
-    let e = Rc::new(RefCell::new(EventFd { count: initval & 0xffff_ffff, semaphore: flags & EFD_SEMAPHORE != 0, generation: 0 }));
+    let e = Rc::new(RefCell::new(EventFd { count: initval & 0xffff_ffff, semaphore: flags & EFD_SEMAPHORE != 0, id: EVENTFD_IDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed), generation: 0 }));
     let fl = file::O_RDWR | if flags & EFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
     let fd = proc::current().files().add(file::new(Kind::EventFd(e), fl), flags & EFD_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)

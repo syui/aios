@@ -82,6 +82,9 @@ enum Node {
     Stack(u32),
     FdDir(u32),
     Fd(u32, usize),
+    /// /proc/PID/fdinfo と fdinfo/N (pos、flags、mnt_id、ino と、ものごとの行: file::OpenFile::fdinfo)
+    FdInfoDir(u32),
+    FdInfo(u32, usize),
     /// /proc/PID/ns と、その中のリンク (NS_KINDS の番号)
     NsDir(u32),
     NsLink(u32, u8),
@@ -210,6 +213,8 @@ impl ProcInode {
             Node::Stack(p) => (p as u64) << 16 | 9,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
+            Node::FdInfoDir(p) => (p as u64) << 16 | 25,
+            Node::FdInfo(p, n) => 1 << 63 | (p as u64) << 16 | (0x100 + n as u64),
             Node::NsDir(p) => (p as u64) << 16 | 14,
             Node::PidMounts(p) => (p as u64) << 16 | 15,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
@@ -242,7 +247,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
             _ => None,
         }
     }
@@ -404,6 +409,15 @@ impl ProcInode {
                     // 読めないとき: comm を出す
                     _ => format!("{}\0", p.comm()),
                 }
+            }
+            // 見るのは ptrace で READ できる人だけ (Linux の proc_fdinfo_permission)
+            Node::FdInfo(pid, n) => {
+                mm_access(pid, true)?;
+                let p = leader(pid)?;
+                let fd = p.files().fds.get(n).and_then(|f| f.as_ref()).ok_or(-ENOENT)?;
+                let (f, cloexec) = (fd.file.clone(), fd.cloexec);
+                let s = f.borrow().fdinfo(cloexec);
+                s
             }
             Node::Environ(pid) => {
                 mm_access(pid, true)?;
@@ -693,6 +707,7 @@ impl Inode for ProcInode {
             Node::AiCtl => S_IFREG | 0o664,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
+            Node::FdInfoDir(_) => S_IFDIR | 0o555,
             Node::NsDir(_) => S_IFDIR | 0o511,
             Node::TaskDir(_) | Node::Task(..) | Node::AttrDir(..) => S_IFDIR | 0o555,
             // だれでも開けるが、書けるのは自分のものだけ (write_at)。prev は読むだけ
@@ -913,6 +928,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "maps") => Node::Maps(p),
             (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
+            (Node::Pid(p), "fdinfo") => Node::FdInfoDir(p),
             (Node::Pid(p), "ns") => Node::NsDir(p),
             (Node::Pid(p), "attr") => Node::AttrDir(p, false),
             (Node::AttrDir(p, false), "apparmor") => Node::AttrDir(p, true),
@@ -931,6 +947,11 @@ impl Inode for ProcInode {
                 let n = num.ok_or(-ENOENT)? as usize;
                 leader(p)?.files().get(n as u64).ok_or(-ENOENT)?;
                 Node::Fd(p, n)
+            }
+            (Node::FdInfoDir(p), _) => {
+                let n = num.ok_or(-ENOENT)? as usize;
+                leader(p)?.files().get(n as u64).ok_or(-ENOENT)?;
+                Node::FdInfo(p, n)
             }
             _ => return Err(-ENOENT),
         };
@@ -1040,6 +1061,7 @@ impl Inode for ProcInode {
                 add("maps".into(), Node::Maps(p));
                 add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
+                add("fdinfo".into(), Node::FdInfoDir(p));
                 add("ns".into(), Node::NsDir(p));
                 add("attr".into(), Node::AttrDir(p, false));
             }
@@ -1067,10 +1089,11 @@ impl Inode for ProcInode {
                     add((*k).into(), Node::NsLink(p, i as u8));
                 }
             }
-            Node::FdDir(p) => {
+            Node::FdDir(p) | Node::FdInfoDir(p) => {
                 let fds: Vec<usize> = leader(p)?.files().fds.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| i).collect();
+                let info = matches!(self.node, Node::FdInfoDir(_));
                 for n in fds {
-                    add(format!("{}", n), Node::Fd(p, n));
+                    add(format!("{}", n), if info { Node::FdInfo(p, n) } else { Node::Fd(p, n) });
                 }
             }
             _ => return Err(-ENOTDIR),
