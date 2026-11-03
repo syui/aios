@@ -57,6 +57,8 @@ pub enum Kind {
     Inotify(crate::inotify::InotifyRef),
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
+    /// seccomp の user notification の listener (SECCOMP_FILTER_FLAG_NEW_LISTENER。知らせが来ると読める)
+    SeccompNotify(Rc<crate::seccomp::Listener>),
     /// ディスクか区画 (/dev/vda2 など)。セクタに合わないところは読んでから書く
     Block(crate::block::Part),
     /// 画面 (/dev/fb0、virtio-gpu)
@@ -97,7 +99,7 @@ impl Kind {
             Kind::Tty(_) | Kind::PtyMaster(_) => 6,
             Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm => 7,
             Kind::TimerFd(_) => 8,
-            Kind::Epoll(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => 9,
+            Kind::Epoll(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 9,
         }
     }
 
@@ -857,7 +859,7 @@ impl OpenFile {
             Kind::Unix(u) => crate::unix::stat(u),
             Kind::Inet(u) => crate::inet::stat(u),
             // 名前のない inode (anon_inode)
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) => Stat::dev(0o600, 0),
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
         }
     }
 
@@ -900,6 +902,7 @@ impl OpenFile {
             Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
             Kind::Inotify(_) => "anon_inode:inotify".into(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
+            Kind::SeccompNotify(_) => "anon_inode:seccomp notify".into(),
             Kind::Landlock(_) => "anon_inode:landlock-ruleset".into(),
             Kind::Block(p) => crate::block::part_name(p),
         }
@@ -974,6 +977,7 @@ impl OpenFile {
                 (exited, false, reaped)
             }
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
+            Kind::SeccompNotify(l) => crate::seccomp::readiness(l),
             Kind::Input(n) => (crate::input::readable(*n), false, false),
             Kind::SndPcm => crate::sound::readiness(),
             _ => (true, true, false),
@@ -1031,6 +1035,7 @@ impl OpenFile {
             Kind::Socket(_) => alloc::vec![crate::net::chan()],
             Kind::Netlink(n) => alloc::vec![crate::netlink::chan(n)],
             Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
+            Kind::SeccompNotify(l) => alloc::vec![crate::seccomp::listener_chan(l)],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],

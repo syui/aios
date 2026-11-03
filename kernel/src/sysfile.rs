@@ -2737,6 +2737,14 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if matches!(f.borrow().kind, Kind::Fb) {
         return crate::gpu::ioctl(req, arg);
     }
+    // seccomp の listener (NOTIF_RECV は眠るので、OpenFile を借りたままにしない)
+    let listener = match &f.borrow().kind {
+        Kind::SeccompNotify(l) => Some(l.clone()),
+        _ => None,
+    };
+    if let Some(l) = listener {
+        return crate::seccomp::ioctl(&l, req, arg);
+    }
     if let Kind::Input(n) = f.borrow().kind {
         return crate::input::ioctl(n, req, arg);
     }

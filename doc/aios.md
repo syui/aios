@@ -1096,7 +1096,8 @@ Linux 7.4 は 11 月 1 日に rc1 が出た (安定版はまだ 7.3.1)。新し�
   EINVAL) のを直した
 - copy_file_range: 写すものが 0 バイトなら、書く側の大きさの上限 (EFBIG) を見ない
 - SO_PASSPIDFD_THREAD / SO_PEERPIDFD_THREAD: 下の「相手を pidfd で見る」(2026-11-03)
-- まだ (aios にもとからないもの): SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV (seccomp の user notification)、OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
+- SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV: 下の「seccomp の user notification」(2026-11-03)
+- まだ (aios にもとからないもの): OPEN_TREE_DROP_MNTNS_MOUNTS、Landlock の ABI 12
   (aios は ABI 4)、ctnetlink の CTA_FILTER_ZONE、RTM_GETMULTICAST (PF_PACKET) と IFA_F_GLOBAL、リンクの IFLA_PACING_OFFLOAD
   (aios のリンクの答えはもとから一部の属性だけ)
 
@@ -1132,6 +1133,34 @@ SO_PASSPIDFD の get / set、AF_INET の TCP と UDP、dgram の SCM_PIDFD (子�
 7 とおりの MSG_CTRUNC、SCM_RIGHTS といっしょの並び、スレッドが送ったもの、stream のつなぎかた) は Linux 7.4-rc1 と 1 バイトも
 ちがわない。pidfd がどれを指すかは、子なら waitid(P_PIDFD) の si_pid、スレッドなら pidfd_send_signal で起きたハンドラの
 gettid で見る。/proc/PID/fdinfo (pidfd の Pid:) と PIDFD_GET_INFO はまだ (todo.json の pidfd-info)。
+
+### seccomp の user notification (NEW_LISTENER、RET_USER_NOTIF、7.4 の RESTART_BEFORE_RECV)
+
+seccomp のフィルタが SECCOMP_RET_USER_NOTIF と答えたシステムコールを、別のプロセスに決めてもらう口 (Linux 5.0 から。コンテナの
+道具 (podman、LXD、crun) が mount や mknod をかわりにするのに使う)。aios はフィルタはあったが、USER_NOTIF は ENOSYS だった。
+AI がシステムコールを 1 つずつ見て「いいよ・だめだよ」を決める口にもなる。Linux 7.4-rc1 の kernel/seccomp.c と同じに
+(kernel/src/seccomp.rs の「user notification」):
+
+- `seccomp(SET_MODE_FILTER, NEW_LISTENER)` はフィルタをかけて listener の fd (close-on-exec、`anon_inode:seccomp notify`) を
+  返す。上のフィルタにもう listener があれば EBUSY、TSYNC といっしょなら TSYNC_ESRCH がいる (なければ EINVAL)、待ちかたの印
+  (WAIT_KILLABLE_RECV、RESTART_BEFORE_RECV) は NEW_LISTENER がなければ EINVAL。GET_ACTION_AVAIL は USER_NOTIF も 0、
+  GET_NOTIF_SIZES は 80 / 24 / 64
+- USER_NOTIF になったシステムコールは、知らせ (id、スレッド、seccomp_data) を並べて眠る。listener の持ち主が
+  `SECCOMP_IOCTL_NOTIF_RECV` で受け (入れ物は 0 でなければ EINVAL。使う人がいなければ ENOENT)、`NOTIF_SEND` で答える
+  (値か、エラー (そのまま返す)、CONTINUE ならそのシステムコールをする。答えは 1 度だけ: 知らない id は ENOENT、受けていない
+  ものは EINPROGRESS)。`NOTIF_ID_VALID` は受けて答えていないものなら 0。`NOTIF_ADDFD` は答えの前に相手の fd の表に fd を
+  入れる (SETFD で番号を、SEND でそれを答えに)。`NOTIF_SET_FLAGS` は SYNC_WAKE_UP だけ
+- poll: 受けていない知らせがあれば POLLIN、答えていないものがあれば POLLOUT、そのフィルタを使うスレッドがいなくなれば
+  (回収されるまでのゾンビも使う人) POLLHUP
+- listener を閉じると、待っているものはみな ENOSYS、それからの知らせも ENOSYS (listener がないのと同じ)
+- 待つ眠りはシグナルで起き、知らせは消える (ERESTARTSYS: ハンドラが SA_RESTART でなければ EINTR)。RESTART_BEFORE_RECV
+  (7.4) なら、受けられる前のものはハンドラのあとでいつもやりなおす (ERESTARTNOINTR: 新しい知らせになる)。
+  WAIT_KILLABLE_RECV なら、受けられたあとは SIGKILL でだけ起きる (aios に SIGKILL でだけ起きる眠り proc::sleep_killable を
+  足した: Linux の TASK_KILLABLE)
+- fork した子も同じフィルタ (知らせの pid は子のスレッド)
+
+`test/seccompnotify.c` (73 行) は Linux 7.4-rc1 と 1 バイトもちがわない。手本の Linux (test/linux.config) に seccomp が
+入っていなかったので、CONFIG_SECCOMP と CONFIG_SECCOMP_FILTER を足した (test/sysdiff/ の手本はそれで作りなおして変わらない)。
 
 ### Linux と答えあわせ (sysdiff)
 

@@ -238,6 +238,15 @@ impl Files {
         self.set(i, Some(Fd { file, cloexec }));
         Some(i)
     }
+
+    /// fd i に置く (あったものは閉じる: dup2 と同じ。Linux の replace_fd: RLIMIT_NOFILE をこえれば EBADF)
+    pub fn put_at(&mut self, i: usize, file: FileRef, cloexec: bool) -> Result<usize, i64> {
+        if i >= self.nofile {
+            return Err(-9);
+        }
+        self.set(i, Some(Fd { file, cloexec }));
+        Ok(i)
+    }
 }
 
 /// swtch で保存する callee-saved レジスタ
@@ -359,6 +368,8 @@ pub struct Proc {
     pub flush_sleep: u32,
     /// シグナルでは起こさない眠りの中 (sleep_nointr: ディスクの要求の終わりを待つ。Linux の TASK_UNINTERRUPTIBLE、ps の D)
     pub nointr: bool,
+    /// SIGKILL でだけ起きる眠りの中 (sleep_killable: seccomp の WAIT_KILLABLE_RECV。Linux の TASK_KILLABLE)
+    pub killable: bool,
     /// ディスクを読まない区間 (preadv2 の RWF_NOWAIT): キャッシュになければ EAGAIN (extfs の with_block)
     pub noio: u32,
     /// 新しく読んだものをキャッシュに残さない区間 (RWF_DONTCACHE)
@@ -465,6 +476,7 @@ impl Proc {
         slept_at: 0,
         io_sleep: 0,
         nointr: false,
+        killable: false,
         flush_sleep: 0,
         noio: 0,
         dontcache: 0,
@@ -684,6 +696,8 @@ pub fn drop_prefork() {
 /// スロットを空ける
 fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
+    // seccomp の listener に、フィルタを使う人が減ったことを (使う人がいなくなれば POLLHUP)
+    crate::seccomp::released(&p.cred);
     let i = slot_of(p);
     kid_unlink(i);
     // 子はふつう終わるときに init にわたしている (そのあとに、残っていたスレッドが fork したものも)
@@ -1409,6 +1423,28 @@ pub fn sleep_nointr(chan: usize) {
 }
 
 /// chan で起こされるか deadline (tick, 0 なら無し) まで眠る。時間切れなら Ok(false)
+/// chan で起こされるまで眠る。ふつうのシグナルでは起きず、SIGKILL (killed) でだけ EINTR で起きる (Linux の
+/// TASK_KILLABLE: seccomp の WAIT_KILLABLE_RECV)
+pub fn sleep_killable(chan: usize) -> Result<(), i64> {
+    let p = current();
+    if p.killed {
+        return Err(-EINTR);
+    }
+    p.chan = chan;
+    p.wake_at = 0;
+    p.killable = true;
+    p.state = State::Sleeping;
+    p.slept_at = crate::timer::ticks();
+    crate::trace::sleep(chan);
+    wq_enter();
+    sched();
+    wq_exit();
+    let p = current();
+    p.chan = 0;
+    p.killable = false;
+    if p.killed { Err(-EINTR) } else { Ok(()) }
+}
+
 pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     let p = current();
     if p.killed || crate::signal::deliverable(p) {
@@ -2154,7 +2190,7 @@ pub fn stop_chan(leader: &Proc) -> usize {
 /// 眠っているスレッドをシグナルで起こす (sleep は EINTR で戻る。sleep_nointr の中なら起こさない: 戻ってから受ける)
 pub fn interrupt(t: &mut Proc) {
     match t.state {
-        State::Sleeping if !t.nointr => {
+        State::Sleeping if !t.nointr && (!t.killable || t.killed) => {
             make_runnable(t);
             crate::smp::wake_idle();
         }
@@ -2176,6 +2212,11 @@ pub fn kill_group(tgid: u32, sig: i32) {
 
 pub fn threads_of(tgid: u32) -> Vec<&'static mut Proc> {
     live().filter(|p| p.state != State::Unused && p.state != State::Zombie && p.tgid == tgid).collect()
+}
+
+/// 資格情報が f に合う Proc (スレッドも、回収されるまでのゾンビも) の数 (seccomp の listener: フィルタを使う人)
+pub fn count_live(f: impl Fn(&crate::cred::Cred) -> bool) -> usize {
+    live().filter(|p| p.state != State::Unused && f(&p.cred)).count()
 }
 
 /// 終わったもの (ゾンビ) も

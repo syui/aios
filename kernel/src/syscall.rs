@@ -395,6 +395,22 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 println!("seccomp: pid {} killed at syscall {}", proc::current().pid, nr);
                 proc::die(signal::SIGSYS);
             }
+            // user notification: listener の答えを待つ。CONTINUE ならそのままシステムコールを
+            crate::seccomp::Verdict::Notify(f, data) => match crate::seccomp::notify(&f, data) {
+                crate::seccomp::Notified::Continue => {}
+                crate::seccomp::Notified::Return(v) => {
+                    tf.x[0] = v as u64;
+                    crate::trace::sys_exit(nr, v);
+                    strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
+                    return None;
+                }
+                // シグナルで割りこまれた: Linux の ERESTARTSYS (RESTART_BEFORE_RECV で受ける前なら ERESTARTNOINTR)
+                crate::seccomp::Notified::Interrupted { always } => {
+                    tf.x[0] = (-EINTR_) as u64;
+                    crate::trace::sys_exit(nr, -EINTR_);
+                    return Some(Restart { restartable: true, always });
+                }
+            },
         }
     }
     // 切ったところ (aios.off=。parts.rs) のシステムコールは、それを入れずに作った Linux と同じ ENOSYS

@@ -6,11 +6,14 @@
 //   フィルタをかけるには prctl(PR_SET_NO_NEW_PRIVS) か root が要る (setuid のプログラムをだませないように。landlock と同じ)
 // システムコールのたびに、かかっているフィルタをぜんぶ動かし、いちばんきびしい答えにしたがう:
 //   KILL_PROCESS > KILL_THREAD > TRAP (SIGSYS) > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW
-// USER_NOTIF と TRACE は受け手 (ptrace、listener) がないので ENOSYS にする (Linux も受け手がなければそう)
+// USER_NOTIF は、そのフィルタを NEW_LISTENER でかけたときにできた listener (fd) を持つ人に知らせて答えを待つ
+// (user notification: 下の「user notification」)。listener がなければ ENOSYS。TRACE は受け手 (ptrace) がないので ENOSYS
+// (Linux も受け手がなければそう)
 use crate::cred::Cred;
 use crate::proc;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
@@ -29,6 +32,11 @@ const GET_NOTIF_SIZES: u64 = 3;
 const FLAG_TSYNC: u64 = 1;
 const FLAG_LOG: u64 = 2;
 const FLAG_SPEC_ALLOW: u64 = 4;
+const FLAG_NEW_LISTENER: u64 = 8;
+const FLAG_TSYNC_ESRCH: u64 = 16;
+const FLAG_WAIT_KILLABLE_RECV: u64 = 32;
+/// Linux 7.4: 受け手が受ける前にシグナルで割りこまれたら、ハンドラのあとでいつもやりなおす (ERESTARTNOINTR)
+const FLAG_RESTART_BEFORE_RECV: u64 = 64;
 
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
 const RET_KILL_THREAD: u32 = 0x0000_0000;
@@ -61,7 +69,16 @@ pub struct Insn {
 /// かかっているもの: strict か、フィルタの重なり (新しいものが後ろ)
 pub struct State {
     pub strict: bool,
-    pub filters: Vec<Rc<Vec<Insn>>>,
+    pub filters: Vec<Rc<Filter>>,
+}
+
+/// フィルタ 1 つ (Linux の seccomp_filter): プログラムと、NEW_LISTENER でかけたなら user notification の受け口
+pub struct Filter {
+    prog: Vec<Insn>,
+    /// listener があるあいだの、待っている知らせ (大きなロックの中で)
+    notif: RefCell<Option<Notif>>,
+    wait_killable: bool,
+    restart_before_recv: bool,
 }
 
 pub type Seccomp = Rc<State>;
@@ -93,6 +110,308 @@ const LEN: u16 = 0x80;
 const K: u16 = 0x00;
 const X: u16 = 0x08;
 const A: u16 = 0x10;
+
+// ---- user notification ----
+// フィルタが RET_USER_NOTIF と答えたシステムコールは、知らせ (Knotif: id、スレッド、seccomp_data) を並べ、listener の
+// 持ち主が NOTIF_RECV で受けて NOTIF_SEND で答えるまで眠る (Linux の seccomp_do_user_notification)。答えは値かエラー、
+// CONTINUE ならそのままシステムコールをする。NOTIF_ADDFD は答えの前に相手の fd の表に fd を入れる。listener を閉じると、
+// 待っているものはみな ENOSYS、それからの知らせも ENOSYS。眠りはシグナルで起き (知らせは消える)、RESTART_BEFORE_RECV
+// なら受ける前のものはいつもやりなおす (ERESTARTNOINTR)、WAIT_KILLABLE_RECV なら受けたあとは SIGKILL だけで起きる
+
+const ENOENT: i64 = 2;
+const EBADF: i64 = 9;
+const EBUSY: i64 = 16;
+const EINPROGRESS: i64 = 115;
+const E2BIG: i64 = 7;
+const NOTIFY_INIT: u8 = 0;
+const NOTIFY_SENT: u8 = 1;
+const NOTIFY_REPLIED: u8 = 2;
+const USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+const USER_NOTIF_FD_SYNC_WAKE_UP: u64 = 1;
+const ADDFD_FLAG_SETFD: u32 = 1;
+const ADDFD_FLAG_SEND: u32 = 2;
+const O_CLOEXEC: u32 = 0o2000000;
+/// struct seccomp_notif (id 8、pid 4、flags 4、seccomp_data 64)、seccomp_notif_resp (id 8、val 8、error 4、flags 4)、
+/// seccomp_notif_addfd (id 8、flags、srcfd、newfd、newfd_flags 4 ずつ)
+const NOTIF_SIZE: usize = 80;
+const RESP_SIZE: usize = 24;
+const ADDFD_SIZE: usize = 24;
+/// ioctl の番号 ('!' の _IOWR / _IOW。ID_VALID は昔のまちがえた向きのものも)
+const IOCTL_NOTIF_RECV: u64 = 0xc050_2100;
+const IOCTL_NOTIF_SEND: u64 = 0xc018_2101;
+const IOCTL_NOTIF_ID_VALID: u64 = 0x4008_2102;
+const IOCTL_NOTIF_ID_VALID_WRONG_DIR: u64 = 0x8008_2102;
+const IOCTL_NOTIF_ADDFD: u64 = 0x4018_2103;
+const IOCTL_NOTIF_SET_FLAGS: u64 = 0x4008_2104;
+
+/// 待っている知らせ
+struct Knotif {
+    id: u64,
+    /// 知らせたスレッド (本当の番号)
+    tid: u32,
+    state: u8,
+    data: [u8; DATA_LEN as usize],
+    error: i64,
+    val: i64,
+    flags: u32,
+}
+
+/// listener の受け口 (Linux の notification)
+struct Notif {
+    next_id: u64,
+    list: Vec<Knotif>,
+    /// listener を閉じた (待っていたものは ENOSYS で起こした。新しい知らせは作らない)
+    closed: bool,
+}
+
+/// listener の fd (anon_inode:seccomp notify)。さいごの参照を閉じると、待っているものはみな ENOSYS
+pub struct Listener(Rc<Filter>);
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let f = &self.0;
+        if let Some(n) = f.notif.borrow_mut().as_mut() {
+            n.closed = true;
+            for k in n.list.iter_mut().filter(|k| k.state != NOTIFY_REPLIED) {
+                k.state = NOTIFY_REPLIED;
+                k.error = -ENOSYS;
+                k.val = 0;
+                k.flags = 0;
+            }
+        }
+        proc::wakeup(notify_chan(f));
+    }
+}
+
+/// 知らせたものが眠る chan (答え、ADDFD、listener を閉じたとき)
+fn notify_chan(f: &Rc<Filter>) -> usize {
+    Rc::as_ptr(f) as usize + 1
+}
+
+/// listener の NOTIF_RECV が眠り、poll が見る chan
+pub fn listener_chan(l: &Listener) -> usize {
+    Rc::as_ptr(&l.0) as usize
+}
+
+fn wake_listener(f: &Rc<Filter>) {
+    proc::wakeup(Rc::as_ptr(f) as usize);
+    proc::poll_wake(Rc::as_ptr(f) as usize);
+}
+
+/// そのフィルタをかけているスレッドの数 (Linux の users: 回収されるまでのゾンビもふくむ)。0 なら listener は POLLHUP
+fn users(f: &Rc<Filter>) -> usize {
+    proc::count_live(|c| c.seccomp.as_ref().is_some_and(|s| s.filters.iter().any(|x| Rc::ptr_eq(x, f))))
+}
+
+/// スレッドの Proc が片づけられる (proc::free_slot): そのフィルタの listener を起こす (使う人がいなくなったかも)
+pub fn released(c: &Cred) {
+    if let Some(s) = &c.seccomp {
+        for f in s.filters.iter().filter(|f| f.notif.borrow().is_some()) {
+            wake_listener(f);
+        }
+    }
+}
+
+/// 知らせて答えを待った結果
+pub enum Notified {
+    /// この値で返す (システムコールはしない)
+    Return(i64),
+    /// CONTINUE: システムコールをする
+    Continue,
+    /// シグナルで割りこまれた (always ならハンドラのあとでもいつもやりなおす)
+    Interrupted { always: bool },
+}
+
+/// RET_USER_NOTIF: f の listener に知らせて、答えを待つ
+pub fn notify(f: &Rc<Filter>, data: [u8; DATA_LEN as usize]) -> Notified {
+    let id = {
+        let mut n = f.notif.borrow_mut();
+        let Some(n) = n.as_mut().filter(|n| !n.closed) else { return Notified::Return(-ENOSYS) };
+        let id = n.next_id;
+        n.next_id = n.next_id.wrapping_add(1);
+        n.list.push(Knotif { id, tid: proc::current().pid, state: NOTIFY_INIT, data, error: 0, val: 0, flags: 0 });
+        id
+    };
+    wake_listener(f);
+    let state = |f: &Rc<Filter>| f.notif.borrow().as_ref().and_then(|n| n.list.iter().find(|k| k.id == id).map(|k| k.state)).unwrap_or(NOTIFY_REPLIED);
+    loop {
+        let st = state(f);
+        if st == NOTIFY_REPLIED {
+            break;
+        }
+        // 受けられたあとは、WAIT_KILLABLE_RECV なら SIGKILL でだけ起きる
+        let killable = f.wait_killable && st >= NOTIFY_SENT;
+        let r = if killable { proc::sleep_killable(notify_chan(f)) } else { proc::sleep(notify_chan(f)) };
+        if r.is_err() {
+            let st = state(f);
+            if st == NOTIFY_REPLIED {
+                break;
+            }
+            // 眠っているあいだに受けられた: WAIT_KILLABLE_RECV なら、ふつうのシグナルではやめずに待ちなおす
+            if !killable && f.wait_killable && st >= NOTIFY_SENT && !proc::current().killed {
+                continue;
+            }
+            let always = f.restart_before_recv && st == NOTIFY_INIT;
+            remove(f, id);
+            return Notified::Interrupted { always };
+        }
+    }
+    let k = remove(f, id);
+    match k {
+        Some(k) if k.flags & USER_NOTIF_FLAG_CONTINUE != 0 => Notified::Continue,
+        Some(k) => Notified::Return(if k.error != 0 { k.error } else { k.val }),
+        None => Notified::Return(-ENOSYS),
+    }
+}
+
+fn remove(f: &Rc<Filter>, id: u64) -> Option<Knotif> {
+    let mut n = f.notif.borrow_mut();
+    let n = n.as_mut()?;
+    let i = n.list.iter().position(|k| k.id == id)?;
+    Some(n.list.remove(i))
+}
+
+/// listener の poll: (読める: まだ受けていない知らせ, 書ける: 受けて答えていない知らせ, POLLHUP: 使う人がいない)
+pub fn readiness(l: &Listener) -> (bool, bool, bool) {
+    let f = &l.0;
+    let (mut i, mut o) = (false, false);
+    if let Some(n) = f.notif.borrow().as_ref() {
+        i = n.list.iter().any(|k| k.state == NOTIFY_INIT);
+        o = n.list.iter().any(|k| k.state == NOTIFY_SENT);
+    }
+    (i, o, users(f) == 0)
+}
+
+/// listener の ioctl (Linux の seccomp_notify_ioctl)。l は fd の OpenFile を借りずに写したもの (RECV は眠る)
+pub fn ioctl(l: &Rc<Listener>, req: u64, arg: usize) -> Result<i64, i64> {
+    let f = &l.0;
+    match req {
+        IOCTL_NOTIF_RECV => recv(f, arg),
+        IOCTL_NOTIF_SEND => send(f, arg),
+        IOCTL_NOTIF_ID_VALID | IOCTL_NOTIF_ID_VALID_WRONG_DIR => {
+            let id = u64::from_le_bytes(read_user::<8>(arg)?);
+            let ok = f.notif.borrow().as_ref().is_some_and(|n| n.list.iter().any(|k| k.id == id && k.state == NOTIFY_SENT));
+            if ok { Ok(0) } else { Err(-ENOENT) }
+        }
+        IOCTL_NOTIF_SET_FLAGS => {
+            // FD_SYNC_WAKE_UP: 答えたら同じ CPU で起こす (aios はいつも同じ起こしかた)
+            if arg as u64 & !USER_NOTIF_FD_SYNC_WAKE_UP != 0 {
+                return Err(crate::why::inval());
+            }
+            Ok(0)
+        }
+        // 大きさの入る形 (Linux の EA_IOCTL: 向きと大きさをのぞいて番号で)
+        r if r & !(0xc000_0000 | 0x3fff_0000) == IOCTL_NOTIF_ADDFD & 0xffff => addfd(f, arg, ((r >> 16) & 0x3fff) as usize),
+        _ => Err(crate::why::inval()),
+    }
+}
+
+fn read_user<const N: usize>(va: usize) -> Result<[u8; N], i64> {
+    let mut b = [0u8; N];
+    proc::current().pt().copy_in(&mut b, va).ok_or(-EFAULT)?;
+    Ok(b)
+}
+
+/// NOTIF_RECV: まだ受けていない知らせを待って (使う人がいなくなれば ENOENT)、受けたことにして渡す。入れ物は 0 でなければ EINVAL
+fn recv(f: &Rc<Filter>, arg: usize) -> Result<i64, i64> {
+    if read_user::<NOTIF_SIZE>(arg)?.iter().any(|&b| b != 0) {
+        return Err(crate::why::inval());
+    }
+    let chan = Rc::as_ptr(f) as usize;
+    let (id, tid, data) = loop {
+        let found = f.notif.borrow().as_ref().and_then(|n| n.list.iter().find(|k| k.state == NOTIFY_INIT).map(|k| (k.id, k.tid, k.data)));
+        if let Some(x) = found {
+            break x;
+        }
+        if users(f) == 0 {
+            return Err(-ENOENT);
+        }
+        proc::sleep(chan)?;
+    };
+    let mut b = [0u8; NOTIF_SIZE];
+    b[0..8].copy_from_slice(&id.to_le_bytes());
+    b[8..12].copy_from_slice(&crate::ns::local_or_0(tid).to_le_bytes());
+    b[16..80].copy_from_slice(&data);
+    // 写せなければ受けなかったことに (Linux と同じく EFAULT)
+    proc::current().pt().copy_out(arg, &b).ok_or(-EFAULT)?;
+    if let Some(n) = f.notif.borrow_mut().as_mut()
+        && let Some(k) = n.list.iter_mut().find(|k| k.id == id)
+    {
+        k.state = NOTIFY_SENT;
+    }
+    proc::poll_wake(chan);
+    Ok(0)
+}
+
+/// NOTIF_SEND: 受けた知らせに答える (1 度だけ)
+fn send(f: &Rc<Filter>, arg: usize) -> Result<i64, i64> {
+    let b = read_user::<RESP_SIZE>(arg)?;
+    let id = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let val = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    let error = i32::from_le_bytes(b[16..20].try_into().unwrap()) as i64;
+    let flags = u32::from_le_bytes(b[20..24].try_into().unwrap());
+    if flags & !USER_NOTIF_FLAG_CONTINUE != 0 || (flags & USER_NOTIF_FLAG_CONTINUE != 0 && (error != 0 || val != 0)) {
+        return Err(crate::why::inval());
+    }
+    let mut n = f.notif.borrow_mut();
+    let k = n.as_mut().and_then(|n| n.list.iter_mut().find(|k| k.id == id)).ok_or(-ENOENT)?;
+    if k.state != NOTIFY_SENT {
+        return Err(-EINPROGRESS);
+    }
+    k.state = NOTIFY_REPLIED;
+    k.error = error;
+    k.val = val;
+    k.flags = flags;
+    drop(n);
+    proc::wakeup(notify_chan(f));
+    Ok(0)
+}
+
+/// NOTIF_ADDFD: 受けた知らせのスレッドの fd の表に、こちらの srcfd のファイルを入れる (SETFD なら newfd の番号に、
+/// SEND ならそれを答えにする)。入れた番号を返す
+fn addfd(f: &Rc<Filter>, arg: usize, size: usize) -> Result<i64, i64> {
+    if !(ADDFD_SIZE..4096).contains(&size) {
+        return Err(crate::why::inval());
+    }
+    let mut raw = alloc::vec![0u8; size];
+    proc::current().pt().copy_in(&mut raw, arg).ok_or(-EFAULT)?;
+    // 知らない後ろのところは 0 (Linux の copy_struct_from_user)
+    if raw[ADDFD_SIZE..].iter().any(|&b| b != 0) {
+        return Err(-E2BIG);
+    }
+    let w = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+    let id = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let (flags, srcfd, newfd, newfd_flags) = (w(8), w(12), w(16), w(20));
+    if newfd_flags & !O_CLOEXEC != 0 || flags & !(ADDFD_FLAG_SETFD | ADDFD_FLAG_SEND) != 0 || (newfd != 0 && flags & ADDFD_FLAG_SETFD == 0) {
+        return Err(crate::why::inval());
+    }
+    // O_PATH のものも (SCM_RIGHTS と同じ)
+    let file = proc::current().files().get(srcfd as u64).cloned().ok_or(-EBADF)?;
+    let tid = {
+        let n = f.notif.borrow();
+        let k = n.as_ref().and_then(|n| n.list.iter().find(|k| k.id == id)).ok_or(-ENOENT)?;
+        if k.state != NOTIFY_SENT {
+            return Err(-EINPROGRESS);
+        }
+        k.tid
+    };
+    let t = proc::find_thread(tid).ok_or(-ENOENT)?;
+    let cloexec = newfd_flags & O_CLOEXEC != 0;
+    let files = t.files();
+    let fd = if flags & ADDFD_FLAG_SETFD != 0 { files.put_at(newfd as usize, file, cloexec)? } else { files.add(file, cloexec, 0).ok_or(-24)? };
+    if flags & ADDFD_FLAG_SEND != 0 {
+        if let Some(n) = f.notif.borrow_mut().as_mut()
+            && let Some(k) = n.list.iter_mut().find(|k| k.id == id)
+        {
+            k.state = NOTIFY_REPLIED;
+            k.error = 0;
+            k.val = fd as i64;
+            k.flags = 0;
+        }
+        proc::wakeup(notify_chan(f));
+    }
+    Ok(fd as i64)
+}
 
 /// 読みこんだプログラムを確かめる (使える命令だけ、跳び先は中、読む場所は seccomp_data の中、終わりは RET)
 fn validate(p: &[Insn]) -> Result<(), i64> {
@@ -220,6 +539,8 @@ fn strict_allows(nr: u64) -> bool {
 /// したがうこと
 pub enum Verdict {
     Allow,
+    /// listener に知らせて答えを待つ (notify)
+    Notify(Rc<Filter>, [u8; DATA_LEN as usize]),
     /// このエラーで返す (システムコールはしない)
     Errno(i64),
     /// SIGSYS を送る (付帯情報の errno)
@@ -243,12 +564,14 @@ pub fn check(s: &State, nr: u64, args: &[u64; 6], pc: u64) -> Verdict {
     for (i, v) in args.iter().enumerate() {
         d[16 + i * 8..24 + i * 8].copy_from_slice(&v.to_le_bytes());
     }
-    // いちばんきびしいもの (答えの上 16 ビットを符号つきでくらべて小さいほう)
+    // いちばんきびしいもの (答えの上 16 ビットを符号つきでくらべて小さいほう。同じなら新しいフィルタ)
     let mut best = RET_ALLOW;
+    let mut matched: Option<&Rc<Filter>> = None;
     for f in s.filters.iter().rev() {
-        let r = run(f, &d);
+        let r = run(&f.prog, &d);
         if ((r & RET_ACTION_FULL) as i32) < ((best & RET_ACTION_FULL) as i32) {
             best = r;
+            matched = Some(f);
         }
     }
     let data = (best & RET_DATA) as u16;
@@ -260,7 +583,11 @@ pub fn check(s: &State, nr: u64, args: &[u64; 6], pc: u64) -> Verdict {
         }
         RET_ERRNO => Verdict::Errno(-(data.min(4095) as i64)),
         RET_TRAP => Verdict::Trap(data),
-        RET_TRACE | RET_USER_NOTIF => Verdict::Errno(-ENOSYS),
+        RET_USER_NOTIF => match matched {
+            Some(f) => Verdict::Notify(f.clone(), d),
+            None => Verdict::Errno(-ENOSYS),
+        },
+        RET_TRACE => Verdict::Errno(-ENOSYS),
         // KILL_THREAD、KILL_PROCESS、知らない答え (Linux は KILL_PROCESS とみなす)
         _ => Verdict::Kill,
     }
@@ -296,13 +623,13 @@ fn read_prog(addr: usize) -> Result<Vec<Insn>, i64> {
 }
 
 /// 今のもの (なければ空) に足した新しい State
-fn add(old: &Option<Seccomp>, strict: bool, prog: Option<Rc<Vec<Insn>>>) -> Result<Seccomp, i64> {
+fn add(old: &Option<Seccomp>, strict: bool, prog: Option<Rc<Filter>>) -> Result<Seccomp, i64> {
     let (s0, mut f) = match old {
         Some(s) => (s.strict, s.filters.clone()),
         None => (false, Vec::new()),
     };
     if let Some(p) = prog {
-        if f.iter().map(|x| x.len()).sum::<usize>() + p.len() > MAX_TOTAL {
+        if f.iter().map(|x| x.prog.len()).sum::<usize>() + p.prog.len() > MAX_TOTAL {
             return Err(-ENOMEM);
         }
         f.push(p);
@@ -310,22 +637,38 @@ fn add(old: &Option<Seccomp>, strict: bool, prog: Option<Rc<Vec<Insn>>>) -> Resu
     Ok(Rc::new(State { strict: s0 || strict, filters: f }))
 }
 
-/// 自分 (TSYNC ならスレッドグループのみな) にかける
-fn install(strict: bool, prog: Option<Vec<Insn>>, tsync: bool) -> Result<i64, i64> {
+/// 自分 (TSYNC ならスレッドグループのみな) にかける。listener なら、その fd (close-on-exec) を返す
+fn install(strict: bool, prog: Option<Vec<Insn>>, flags: u64) -> Result<i64, i64> {
+    let tsync = flags & FLAG_TSYNC != 0;
     let p = proc::current();
     // フィルタは no_new_privs か root が要る。strict は要らない (できることが減るだけなので。Linux と同じ)
     if prog.is_some() {
         may_set(&p.cred)?;
     }
-    let prog = prog.map(Rc::new);
-    p.cred.seccomp = Some(add(&p.cred.seccomp, strict, prog.clone())?);
+    let listener = flags & FLAG_NEW_LISTENER != 0;
+    let prog = prog.map(|prog| {
+        let notif = listener.then(|| Notif { next_id: (crate::rand::u32() as u64) << 32 | crate::rand::u32() as u64, list: Vec::new(), closed: false });
+        Rc::new(Filter { prog, notif: RefCell::new(notif), wait_killable: flags & FLAG_WAIT_KILLABLE_RECV != 0, restart_before_recv: flags & FLAG_RESTART_BEFORE_RECV != 0 })
+    });
+    // 上のフィルタにもう listener があれば EBUSY (Linux の has_duplicate_listener)
+    if listener && p.cred.seccomp.as_ref().is_some_and(|s| s.filters.iter().any(|x| x.notif.borrow().as_ref().is_some_and(|n| !n.closed))) {
+        return Err(-EBUSY);
+    }
+    let new = add(&p.cred.seccomp, strict, prog.clone())?;
+    let mut fd = 0;
+    if let Some(f) = prog.as_ref().filter(|_| listener) {
+        let file = crate::file::new(crate::file::Kind::SeccompNotify(Rc::new(Listener(f.clone()))), crate::file::O_RDWR);
+        fd = p.files().add(file, true, 0).ok_or(-24)? as i64;
+    }
+    let p = proc::current();
+    p.cred.seccomp = Some(new);
     if tsync {
         let s = p.cred.seccomp.clone();
         for t in p.siblings() {
             t.cred.seccomp = s.clone();
         }
     }
-    Ok(0)
+    Ok(fd)
 }
 
 /// seccomp(2)
@@ -335,25 +678,41 @@ pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
             if flags != 0 || args != 0 {
                 return Err(crate::why::inval());
             }
-            install(true, None, false)
+            install(true, None, 0)
         }
         SET_MODE_FILTER => {
-            if flags & !(FLAG_TSYNC | FLAG_LOG | FLAG_SPEC_ALLOW) != 0 {
-                // NEW_LISTENER (USER_NOTIF の受け手) などはない
+            const ALL: u64 = FLAG_TSYNC | FLAG_LOG | FLAG_SPEC_ALLOW | FLAG_NEW_LISTENER | FLAG_TSYNC_ESRCH | FLAG_WAIT_KILLABLE_RECV | FLAG_RESTART_BEFORE_RECV;
+            if flags & !ALL != 0 {
+                return Err(crate::why::inval());
+            }
+            // TSYNC がしくじったときの答え (スレッドの番号) と listener の fd が見わけられないので、TSYNC_ESRCH がいる
+            if flags & FLAG_TSYNC != 0 && flags & FLAG_NEW_LISTENER != 0 && flags & FLAG_TSYNC_ESRCH == 0 {
+                return Err(crate::why::inval());
+            }
+            // 待ちかたの印は listener があるときだけ
+            if flags & (FLAG_WAIT_KILLABLE_RECV | FLAG_RESTART_BEFORE_RECV) != 0 && flags & FLAG_NEW_LISTENER == 0 {
                 return Err(crate::why::inval());
             }
             let prog = read_prog(args)?;
-            install(false, Some(prog), flags & FLAG_TSYNC != 0)
+            install(false, Some(prog), flags)
         }
         GET_ACTION_AVAIL => {
             let mut b = [0u8; 4];
             proc::current().pt().copy_in(&mut b, args).ok_or(-EFAULT)?;
             match u32::from_le_bytes(b) {
-                RET_KILL_PROCESS | RET_KILL_THREAD | RET_TRAP | RET_ERRNO | RET_TRACE | RET_LOG | RET_ALLOW => Ok(0),
+                RET_KILL_PROCESS | RET_KILL_THREAD | RET_TRAP | RET_ERRNO | RET_USER_NOTIF | RET_TRACE | RET_LOG | RET_ALLOW => Ok(0),
                 _ => Err(-EOPNOTSUPP),
             }
         }
-        GET_NOTIF_SIZES => Err(-EOPNOTSUPP),
+        // struct seccomp_notif_sizes: seccomp_notif、seccomp_notif_resp、seccomp_data の大きさ (u16 ずつ)
+        GET_NOTIF_SIZES => {
+            let mut b = [0u8; 6];
+            b[0..2].copy_from_slice(&(NOTIF_SIZE as u16).to_le_bytes());
+            b[2..4].copy_from_slice(&(RESP_SIZE as u16).to_le_bytes());
+            b[4..6].copy_from_slice(&(DATA_LEN as u16).to_le_bytes());
+            proc::current().pt().copy_out(args, &b).ok_or(-EFAULT)?;
+            Ok(0)
+        }
         _ => Err(crate::why::inval()),
     }
 }
@@ -361,8 +720,8 @@ pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
 /// prctl(PR_SET_SECCOMP, mode, prog)
 pub fn prctl_set(mode: u64, prog: usize) -> Result<i64, i64> {
     match mode {
-        MODE_STRICT => install(true, None, false),
-        MODE_FILTER => install(false, Some(read_prog(prog)?), false),
+        MODE_STRICT => install(true, None, 0),
+        MODE_FILTER => install(false, Some(read_prog(prog)?), 0),
         _ => Err(crate::why::inval()),
     }
 }
