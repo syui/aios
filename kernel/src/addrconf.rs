@@ -8,6 +8,8 @@
 //     その prefix の道 (proto kernel、metric 256、expires)、A で 64 ビットなら SLAAC の番地: prefix + EUI-64、
 //     IFAPROT_KERNEL_RA、IFA_F_MANAGETEMPADDR、preferred と valid の lifetime)。SLLA は近所の表へ (netlink.rs)
 //   - DAD と MLD はしない (QEMU のユーザーネットワークでは同じ番地の人はいない。Linux は 1 秒 tentative で待つ)
+//   - netlink で足す番地と道 (ip -6 addr add / route add: netlink.rs): 番地には prefix の道 (proto kernel、metric 256。
+//     同じ prefix の番地がなくなれば消す)、道はゲートウェイを通るもの (smoltcp の道の表に)
 // smoltcp には、ここの番地と既定のルーターを net.rs が渡す (近所さがし (NS/NA) と echo の答えは smoltcp がする)
 use crate::cell::Bkl;
 use alloc::vec::Vec;
@@ -75,10 +77,20 @@ struct Router {
     hoplimit: u8,
 }
 
+/// netlink で足した番地の prefix の道 (addrconf_prefix_route。None はいつまでも)
+struct UPrefix {
+    prefix: u128,
+    len: u8,
+    expires: Option<u64>,
+}
+
 struct State {
     mac: [u8; 6],
     addrs: Vec<Addr>,
     prefixes: Vec<Prefix>,
+    uprefixes: Vec<UPrefix>,
+    /// netlink で足した道 (ip -6 route add)
+    uroutes: Vec<Route>,
     router: Option<Router>,
     hop_limit: u8,
     mtu: u32,
@@ -115,7 +127,7 @@ pub fn init(mac: [u8; 6]) {
     let now = ms();
     let ll = 0xfe80u128 << 112 | eui64(mac);
     let a = Addr { addr: ll, prefix: 64, flags: IFA_F_PERMANENT, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now };
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: now, rs_gap: 4000 });
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: now, rs_gap: 4000 });
     changed();
 }
 
@@ -192,6 +204,20 @@ pub fn routes() -> Vec<Route> {
             flags: RTF_UP | RTF_EXPIRES | RTF_ADDRCONF | RTF_PREFIX_RT,
         });
     }
+    for p in &s.uprefixes {
+        v.push(Route {
+            dst: p.prefix,
+            len: p.len,
+            gw: 0,
+            metric: 256,
+            proto: RTPROT_KERNEL,
+            typ: 1,
+            expires: p.expires,
+            hoplimit: 0,
+            flags: RTF_UP | if p.expires.is_some() { RTF_EXPIRES } else { 0 },
+        });
+    }
+    v.extend(s.uroutes.iter().cloned());
     if let Some(r) = &s.router {
         v.push(Route {
             dst: 0,
@@ -215,17 +241,170 @@ pub fn lookup(dst: u128) -> Option<Route> {
     routes().into_iter().filter(|r| in_prefix(dst, r.dst, r.len)).max_by_key(|r| (r.len, u32::MAX - r.metric))
 }
 
-/// 送り元のえらびかた (ipv6_dev_get_saddr: RFC 6724 のうち、scope のあうもの、deprecated でないもの、prefix が長く
-/// あうもの): link-local やマルチキャストの link-local あてなら link-local、ほかは site か global のもの (なければ
-/// link-local)
+/// RFC 6724 の scope (__ipv6_addr_src_scope: マルチキャストはその 4 ビット、::1 は 1、link-local 2、site-local 5、ほか
+/// (ULA の fc00::/7 も) global の 14)
+fn rfc_scope(a: u128) -> i32 {
+    if a >> 120 == 0xff {
+        ((a >> 112) & 0xf) as i32
+    } else if a == 1 {
+        1
+    } else if is_link_local(a) {
+        2
+    } else if a >> 118 == 0x3fb {
+        5
+    } else {
+        14
+    }
+}
+
+/// 送り元のえらびかた (ipv6_dev_get_saddr: RFC 6724 のうち、rule 1 同じ番地、rule 2 scope (あて先の scope 以上で狭い
+/// ものを。なければ広いものを)、rule 3 deprecated でないもの、rule 8 prefix の長くあうもの)
 pub fn source_for(dst: u128) -> Option<u128> {
     let s = ST.get().as_ref()?;
     let now = ms();
-    let link = matches!(scope_of(dst), 0x10 | 0x20);
+    let ds = rfc_scope(dst);
     s.addrs
         .iter()
-        .max_by_key(|a| ((scope_of(a.addr) == 0x20) == link, a.preferred.is_none_or(|t| t > now), common_bits(a.addr, dst)))
+        .max_by_key(|a| {
+            let sc = rfc_scope(a.addr);
+            let r2 = if sc >= ds { (1, -sc) } else { (0, sc) };
+            (a.addr == dst, r2, a.preferred.is_none_or(|t| t > now), common_bits(a.addr, dst))
+        })
         .map(|a| a.addr)
+}
+
+/// いつまで (lifetime の秒。INFINITY_LIFE_TIME は None)
+fn until(now: u64, secs: u32) -> Option<u64> {
+    (secs != u32::MAX).then(|| now + secs as u64 * 1000)
+}
+
+/// その番地 (eth0 のもの)
+pub fn find(a: u128) -> Option<Addr> {
+    ST.get().as_ref()?.addrs.iter().find(|x| x.addr == a).cloned()
+}
+
+/// netlink の番地の flags のうち、持てるもの (inet6_rtm_newaddr: NODAD、HOMEADDRESS、MANAGETEMPADDR、NOPREFIXROUTE、
+/// MCAUTOJOIN、OPTIMISTIC)
+pub const IFA_USER_FLAGS: u32 = 0x02 | 0x10 | 0x100 | 0x200 | 0x400 | 0x04;
+const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+
+/// ip -6 addr add (inet6_addr_add): 番地 (DAD はしない: Linux の nodad と同じ) と、prefix の道がなければ作る。
+/// valid がいつまでもなら IFA_F_PERMANENT。作った prefix の道があれば true
+pub fn add_addr(addr: u128, plen: u8, flags: u32, preferred: u32, valid: u32, proto: u8) -> bool {
+    let now = ms();
+    let Some(st) = ST.get().as_mut() else { return false };
+    let mut fl = flags & IFA_USER_FLAGS;
+    if valid == u32::MAX {
+        fl |= IFA_F_PERMANENT;
+    }
+    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now });
+    let made = prefix_route(st, addr, plen, fl, until(now, valid));
+    changed();
+    made
+}
+
+/// prefix の道 (addrconf_prefix_route): なければ作り (true)、あれば時間切れをいまのものに
+fn prefix_route(st: &mut State, addr: u128, plen: u8, flags: u32, expires: Option<u64>) -> bool {
+    if flags & IFA_F_NOPREFIXROUTE != 0 || plen == 128 {
+        return false;
+    }
+    let p = if plen == 0 { 0 } else { addr >> (128 - plen as u32) << (128 - plen as u32) };
+    // fe80::/64 と RA の prefix の道はもうある
+    if (p == 0xfe80u128 << 112 && plen == 64) || st.prefixes.iter().any(|x| x.prefix == p && x.len == plen) {
+        return false;
+    }
+    match st.uprefixes.iter_mut().find(|x| x.prefix == p && x.len == plen) {
+        Some(x) => {
+            x.expires = expires;
+            false
+        }
+        None => {
+            st.uprefixes.push(UPrefix { prefix: p, len: plen, expires });
+            true
+        }
+    }
+}
+
+/// ip -6 addr replace (inet6_addr_modify): flags と lifetime を変え、prefix の道の時間切れも
+pub fn modify_addr(addr: u128, flags: u32, preferred: u32, valid: u32) {
+    let now = ms();
+    let Some(st) = ST.get().as_mut() else { return };
+    let Some(a) = st.addrs.iter_mut().find(|x| x.addr == addr) else { return };
+    let mut fl = (a.flags & !IFA_USER_FLAGS & !IFA_F_PERMANENT) | (flags & IFA_USER_FLAGS);
+    if valid == u32::MAX {
+        fl |= IFA_F_PERMANENT;
+    }
+    a.flags = fl;
+    a.valid = until(now, valid);
+    a.preferred = until(now, preferred);
+    a.updated = now;
+    let (plen, exp) = (a.prefix, a.valid);
+    prefix_route(st, addr, plen, fl, exp);
+    changed();
+}
+
+/// ip -6 addr del (inet6_addr_del): 番地と、同じ prefix の番地がもうなければ prefix の道も (cleanup_prefix_route)。
+/// (消した番地, 消した prefix の道があれば true)。なければ None
+pub fn del_addr(addr: u128, plen: u8) -> Option<(Addr, bool)> {
+    let st = ST.get().as_mut()?;
+    let i = st.addrs.iter().position(|x| x.addr == addr && x.prefix == plen)?;
+    let a = st.addrs.remove(i);
+    let p = if plen == 0 { 0 } else { addr >> (128 - plen as u32) << (128 - plen as u32) };
+    let others = st.addrs.iter().any(|x| x.prefix == plen && in_prefix(x.addr, p, plen) && x.flags & IFA_F_NOPREFIXROUTE == 0);
+    let mut gone = false;
+    if !others && let Some(j) = st.uprefixes.iter().position(|x| x.prefix == p && x.len == plen) {
+        st.uprefixes.remove(j);
+        gone = true;
+    }
+    changed();
+    Some((a, gone))
+}
+
+/// ip -6 route add (ゲートウェイを通る unicast)。同じあて先と長さと metric の道があれば、replace ならそれと入れかえ、
+/// ほかは EEXIST
+pub fn add_route(r: Route, replace: bool) -> Result<Option<Route>, i64> {
+    const EEXIST: i64 = 17;
+    let same = |x: &Route| x.dst == r.dst && x.len == r.len && x.metric == r.metric;
+    let old = routes().into_iter().find(same);
+    let st = ST.get().as_mut().ok_or(-19i64)?;
+    let mut replaced = None;
+    if let Some(o) = old {
+        if !replace {
+            return Err(-EEXIST);
+        }
+        let Some(i) = st.uroutes.iter().position(same) else { return Err(-95) };
+        replaced = Some(st.uroutes.remove(i));
+        let _ = o;
+    }
+    st.uroutes.push(r);
+    changed();
+    Ok(replaced)
+}
+
+/// ip -6 route del: 来たもの (ゲートウェイ、metric、proto) にあう道のうち metric の小さいもの。netlink で足した道と、RA の
+/// 既定の道 (つぎの RA でまたできる) を消せる。ほかの道は EOPNOTSUPP、なければ ESRCH
+pub fn del_route(dst: u128, len: u8, gw: u128, metric: u32, proto: u8) -> Result<Route, i64> {
+    let hit = |x: &Route| x.dst == dst && x.len == len && (gw == 0 || x.gw == gw) && (metric == 0 || x.metric == metric) && (proto == 0 || x.proto == proto);
+    let r = routes().into_iter().filter(|x| x.typ == 1 && hit(x)).min_by_key(|x| x.metric).ok_or(-3i64)?;
+    let st = ST.get().as_mut().ok_or(-3i64)?;
+    if let Some(i) = st.uroutes.iter().position(|x| x.dst == r.dst && x.len == r.len && x.metric == r.metric && x.gw == r.gw) {
+        st.uroutes.remove(i);
+    } else if r.len == 0 && r.proto == RTPROT_RA {
+        st.router = None;
+    } else {
+        return Err(-95);
+    }
+    changed();
+    Ok(r)
+}
+
+/// smoltcp に渡す道 (あて先、長さ、ゲートウェイ): netlink で足した道の、prefix ごとに metric のいちばん小さいもの
+pub fn user_routes() -> Vec<(u128, u8, u128)> {
+    let Some(s) = ST.get().as_ref() else { return Vec::new() };
+    let mut v: Vec<&Route> = s.uroutes.iter().collect();
+    v.sort_by_key(|r| (r.dst, r.len, r.metric));
+    v.dedup_by_key(|r| (r.dst, r.len));
+    v.iter().map(|r| (r.dst, r.len, r.gw)).collect()
 }
 
 fn common_bits(a: u128, b: u128) -> u32 {
@@ -243,6 +422,9 @@ pub fn tick() -> Option<Vec<u8>> {
     let before = st.prefixes.len();
     st.prefixes.retain(|p| p.until > now);
     ch |= st.prefixes.len() != before;
+    let before = st.uprefixes.len();
+    st.uprefixes.retain(|p| p.expires.is_none_or(|t| t > now));
+    ch |= st.uprefixes.len() != before;
     if st.router.as_ref().is_some_and(|r| r.until <= now) {
         st.router = None;
         ch = true;

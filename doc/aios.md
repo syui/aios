@@ -1108,9 +1108,27 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - smoltcp の近所さがしは、NS を 1 つ出すと、どのあて先にも 1 秒は出さない (近所の表は 60 秒で切れる)。Linux はあて先
   ごと。表が切れたあとに 2 つのあて先へ続けて送ると、2 つ目が 1 秒おくれる (todo の smoltcp-nd-silence)
 - conntrack (段階 2e): IPv6 も (上の「ファイアウォール (nftables)」の IPv6)
+- netlink で変える (段階 2f: inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ:
+  - ip -6 addr add: eth0 の番地 (DAD はしない: nodad と同じ)、IFA_FLAGS (NODAD、NOPREFIXROUTE、MANAGETEMPADDR など)、
+    IFA_CACHEINFO の lifetime (valid がいつまでもなら IFA_F_PERMANENT)、IFA_PROTO。prefix の道 (proto kernel、metric 256、
+    lifetime があれば expires) を作る。NLM_F_CREATE がなくても作り、もうあれば NLM_F_EXCL か REPLACE なしで EEXIST、
+    REPLACE なら flags と lifetime を変える。prefix が 128 より長いと EINVAL、口がなければ ENODEV、::、::1、
+    マルチキャストは EADDRNOTAVAIL。lo は EOPNOTSUPP
+  - ip -6 addr del: 番地と長さのあうもの (なければ EADDRNOTAVAIL)。同じ prefix の番地がもうなければ prefix の道も
+  - ip -6 route add / del: ゲートウェイを通る unicast の道 (metric の既定は 1024、proto は来たもの)。link-local の
+    ゲートウェイに口がなければ EINVAL、同じあて先と長さと metric があれば EEXIST (REPLACE なら入れかえ)。del は
+    あうもののうち metric の小さいもの (なければ ESRCH)。RA の既定の道も消せる (つぎの RA でまたできる)。口だけの道と
+    unicast でないものは EOPNOTSUPP (IPv4 と同じく aios のできないこと)。smoltcp の道の表には prefix ごとに metric の
+    いちばん小さいもの
+  - 知らせ: RTMGRP_IPV6_IFADDR と RTMGRP_IPV6_ROUTE (番地を足すと prefix の道、RTM_NEWADDR、local の道の順、消すと
+    RTM_DELADDR、local の道、prefix の道。道の RTM_NEWROUTE は NLM_F_EXCL|NLM_F_CREATE)。RA と lifetime の時間切れで
+    変わったものは前とくらべて
+  - 送り元のえらびかたに RFC 6724 の rule 2 (あて先の scope 以上で狭いもの: global のあて先には fec0:: より fd00::)
+  - 確かめかた: `test/ldiff.sh --root --net rtnl6` (fd00::1/64 と fd00::3/64 を足して入れかえて消し、2001:db8:1::/48 via
+    fe80::2 を metric 100 と 200 で足して消す。まちがいの errno、知らせ、dump、ip route get、送り元)。手本の Linux 7.4-rc1
+    と 67 行同じ。ctests にも
 - まだ: DAD、MLD、
-  packet too big (PMTU)、IPV6_RECVERR の行列、ip -6 addr add / route add (RTM_NEWADDR と RTM_NEWROUTE の AF_INET6)、
-  IPv6 の番地と道の netlink の知らせ (RTNLGRP_IPV6_*)、RDNSS (DNS)、一時アドレス
+  packet too big (PMTU)、IPV6_RECVERR の行列、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`

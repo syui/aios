@@ -440,7 +440,9 @@ fn sync6(n: &mut Net) {
             n.iface.routes_mut().remove_default_ipv6_route();
         }
     }
+    routes_rebuild(n);
     crate::netlink::changed();
+    crate::netlink::changed6();
 }
 
 pub fn init() {
@@ -539,16 +541,42 @@ pub fn set_gateway(gw: Option<Ipv4Address>) {
     poll();
 }
 
-/// ip route add の道 (宛先、prefix の長さ、ゲートウェイ) を smoltcp の道の表に (既定の道はそのまま)。入りきらなければ false
+/// ip route add の道 (宛先、prefix の長さ、ゲートウェイ)
+static EXTRA4: Bkl<Vec<(u32, u8, u32)>> = Bkl::new(Vec::new());
+
+/// ip route add の道を smoltcp の道の表に (既定の道はそのまま。IPv6 の ip -6 route add のものも入れなおす)。入りきらなければ
+/// false
 pub fn set_routes(rs: &[(u32, u8, u32)]) -> bool {
+    *EXTRA4.get() = rs.to_vec();
     let Some(n) = get() else { return false };
+    routes_rebuild(n)
+}
+
+fn routes_rebuild(n: &mut Net) -> bool {
     let mut ok = true;
+    let v4 = EXTRA4.get().clone();
+    let v6 = crate::addrconf::user_routes();
     n.iface.routes_mut().update(|v| {
         v.retain(|r| r.cidr.prefix_len() == 0);
-        for &(dst, len, gw) in rs {
+        for &(dst, len, gw) in &v4 {
             let r = smoltcp::iface::Route {
                 cidr: smoltcp::wire::IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::from_bits(dst), len)),
                 via_router: smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bits(gw)),
+                preferred_until: None,
+                expires_at: None,
+            };
+            if v.push(r).is_err() {
+                ok = false;
+            }
+        }
+        for &(dst, len, gw) in &v6 {
+            // 既定の道 (::/0) は RA のものと同じ場所なので入れない
+            if len == 0 {
+                continue;
+            }
+            let r = smoltcp::iface::Route {
+                cidr: smoltcp::wire::IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(smoltcp::wire::Ipv6Address::from_bits(dst), len)),
+                via_router: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_bits(gw)),
                 preferred_until: None,
                 expires_at: None,
             };

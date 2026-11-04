@@ -726,6 +726,9 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         (RTM_GETROUTE, false) if family == AF_INET6 => get_route6(body, seq, me, out),
         (RTM_GETROUTE, false) if family == AF_INET => get_route(body, strict, seq, me, out),
         (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET => change_route(body, typ == RTM_NEWROUTE, nlflags, seq, me),
+        (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET6 => change_route6(body, typ == RTM_NEWROUTE, nlflags),
+        (RTM_NEWADDR, _) if family == AF_INET6 => new_addr6(body, nlflags),
+        (RTM_DELADDR, _) if family == AF_INET6 => del_addr6(body),
         (RTM_GETNEIGH, true) => {
             dump_neigh(body, family, strict, seq, me, out);
             0
@@ -2004,20 +2007,283 @@ pub struct Addr6 {
 pub fn addrs6() -> Vec<Addr6> {
     let mut v = alloc::vec![Addr6 { index: LO_INDEX, addr: 1, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: 1, preferred: u32::MAX, valid: u32::MAX, cstamp: 0, tstamp: 0 }];
     for a in crate::addrconf::addrs() {
-        v.push(Addr6 {
-            index: ETH_INDEX,
-            addr: a.addr,
-            prefix: a.prefix,
-            scope: crate::addrconf::rt_scope(a.addr),
-            flags: a.flags,
-            proto: a.proto,
-            preferred: crate::addrconf::left_secs(a.preferred),
-            valid: crate::addrconf::left_secs(a.valid),
-            cstamp: (a.created / 10) as u32,
-            tstamp: (a.updated / 10) as u32,
-        });
+        v.push(addr6_of(&a));
     }
     v
+}
+
+/// eth0 の番地を netlink の形に
+fn addr6_of(a: &crate::addrconf::Addr) -> Addr6 {
+    Addr6 {
+        index: ETH_INDEX,
+        addr: a.addr,
+        prefix: a.prefix,
+        scope: crate::addrconf::rt_scope(a.addr),
+        flags: a.flags,
+        proto: a.proto,
+        preferred: crate::addrconf::left_secs(a.preferred),
+        valid: crate::addrconf::left_secs(a.valid),
+        cstamp: (a.created / 10) as u32,
+        tstamp: (a.updated / 10) as u32,
+    }
+}
+
+// ---- IPv6 の番地と道を変える (inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ ----
+//
+// 番地は eth0 のものだけ (lo は ::1 だけで EOPNOTSUPP)。DAD はしない (Linux の nodad と同じ: tentative にならない)。
+// 道はゲートウェイを通る unicast だけ (口だけの道、blackhole などは EOPNOTSUPP: IPv4 と同じく aios のできないこと)
+
+const RTNLGRP_IPV6_IFADDR: u32 = 9;
+const RTNLGRP_IPV6_ROUTE: u32 = 11;
+
+fn ev_addr6(a: &Addr6, typ: u16) {
+    let mut d = Vec::new();
+    put_addr6(&mut d, a, typ, 0, 0, 0);
+    notify(RTNLGRP_IPV6_IFADDR, d);
+}
+
+/// RTM_NEWROUTE は NLM_F_EXCL|NLM_F_CREATE (fib6_add_rt2node が新しく入れたもの)
+fn ev_route6(r: &Route6, typ: u16) {
+    let mut d = Vec::new();
+    put_route6_msg(&mut d, r, typ, if typ == RTM_NEWROUTE { NLM_F_EXCL | NLM_F_CREATE } else { 0 }, 0, 0);
+    notify(RTNLGRP_IPV6_ROUTE, d);
+}
+
+fn local_route6(a: u128) -> Route6 {
+    use crate::addrconf::{RTF_LOCAL, RTF_NONEXTHOP, RTF_UP};
+    Route6 { dst: a, len: 128, gw: 0, metric: 0, proto: RTPROT_KERNEL, typ: RTN_LOCAL, oif: ETH_INDEX, expires: None, hoplimit: 0, prefsrc: 0, rtf: RTF_UP | RTF_NONEXTHOP | RTF_LOCAL }
+}
+
+/// 道の表のうち (あて先, 長さ) の unicast のゲートウェイのない道 (prefix の道)
+fn prefix_route6(addr: u128, plen: u8) -> Option<Route6> {
+    let p = if plen == 0 { 0 } else { addr >> (128 - plen as u32) << (128 - plen as u32) };
+    routes6().into_iter().find(|r| r.dst == p && r.len == plen && r.typ == RTN_UNICAST && r.gw == 0)
+}
+
+/// ifaddrmsg の prefix の長さ、flags、口と、属性、番地
+type AddrMsg6<'a> = (u8, u8, i32, BTreeMap<u16, &'a [u8]>, u128);
+
+/// 番地 (IFA_LOCAL か IFA_ADDRESS: extract_addr) と ifaddrmsg
+fn addr_msg6(body: &[u8]) -> Result<AddrMsg6<'_>, i64> {
+    if body.len() < 8 {
+        return Err(crate::why::inval());
+    }
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    let a = attrs_of(&body[8..]);
+    let Some(v) = a.get(&IFA_LOCAL).or(a.get(&IFA_ADDRESS)).filter(|v| v.len() >= 16) else { return Err(crate::why::inval()) };
+    let pfx = u128::from_be_bytes(v[..16].try_into().unwrap());
+    Ok((body[1], body[2], index, a, pfx))
+}
+
+/// ip -6 addr add / replace (inet6_rtm_newaddr と inet6_addr_add / inet6_addr_modify): 口がなければ ENODEV、lifetime は
+/// IFA_CACHEINFO (valid が 0 か preferred > valid は EINVAL)、もうある番地は NLM_F_EXCL か REPLACE なしなら EEXIST、
+/// REPLACE なら変える。新しい番地は prefix が 128 より長ければ EINVAL、::、マルチキャスト、::1 は EADDRNOTAVAIL。
+/// NLM_F_CREATE がなくても作る (Linux と同じ)。知らせは prefix の道 (新しければ)、RTM_NEWADDR、local の道
+fn new_addr6(body: &[u8], nlflags: u16) -> i64 {
+    let (plen, hflags, index, a, pfx) = match addr_msg6(body) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let flags = a.get(&IFA_FLAGS).map_or(hflags as u32, |v| u32_of(Some(v))) & crate::addrconf::IFA_USER_FLAGS;
+    let proto = a.get(&11).and_then(|v| v.first().copied()).unwrap_or(0);
+    if !links().iter().any(|l| l.index == index) {
+        return -ENODEV;
+    }
+    let (pref, valid) = match a.get(&IFA_CACHEINFO).filter(|v| v.len() >= 8) {
+        Some(v) => (u32::from_le_bytes(v[0..4].try_into().unwrap()), u32::from_le_bytes(v[4..8].try_into().unwrap())),
+        None => (u32::MAX, u32::MAX),
+    };
+    if valid == 0 || pref > valid {
+        return crate::why::inval();
+    }
+    if index != ETH_INDEX {
+        return -EOPNOTSUPP;
+    }
+    if let Some(_old) = crate::addrconf::find(pfx) {
+        if nlflags & NLM_F_EXCL != 0 || nlflags & NLM_F_REPLACE == 0 {
+            return -EEXIST;
+        }
+        crate::addrconf::modify_addr(pfx, flags, pref, valid);
+        if let Some(x) = crate::addrconf::find(pfx) {
+            ev_addr6(&addr6_of(&x), RTM_NEWADDR);
+        }
+        snapshot6();
+        return 0;
+    }
+    if plen > 128 {
+        return crate::why::inval();
+    }
+    if flags & 0x100 != 0 && plen != 64 {
+        return crate::why::inval();
+    }
+    if pfx == 0 || pfx == 1 || pfx >> 120 == 0xff {
+        return -99;
+    }
+    let made = crate::addrconf::add_addr(pfx, plen, flags, pref, valid, proto);
+    if made && let Some(r) = prefix_route6(pfx, plen) {
+        ev_route6(&r, RTM_NEWROUTE);
+    }
+    if let Some(x) = crate::addrconf::find(pfx) {
+        ev_addr6(&addr6_of(&x), RTM_NEWADDR);
+    }
+    ev_route6(&local_route6(pfx), RTM_NEWROUTE);
+    snapshot6();
+    0
+}
+
+/// ip -6 addr del (inet6_rtm_deladdr と inet6_addr_del): prefix が 128 より長ければ EINVAL、口がなければ ENODEV、番地と
+/// 長さのあうものがなければ EADDRNOTAVAIL。知らせは RTM_DELADDR、local の道、(同じ prefix の番地がなくなれば) prefix の道
+fn del_addr6(body: &[u8]) -> i64 {
+    let (plen, _, index, _, pfx) = match addr_msg6(body) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if plen > 128 {
+        return crate::why::inval();
+    }
+    if !links().iter().any(|l| l.index == index) {
+        return -ENODEV;
+    }
+    if index != ETH_INDEX {
+        return -99;
+    }
+    let pr = prefix_route6(pfx, plen);
+    let Some((a, gone)) = crate::addrconf::del_addr(pfx, plen) else { return -99 };
+    ev_addr6(&addr6_of(&a), RTM_DELADDR);
+    ev_route6(&local_route6(pfx), RTM_DELROUTE);
+    if gone && let Some(r) = pr {
+        ev_route6(&r, RTM_DELROUTE);
+    }
+    snapshot6();
+    0
+}
+
+/// ip -6 route add / del (rtm_to_fib6_config、ip6_route_add、ip6_route_del): tos は EINVAL、RTA_VIA は EINVAL、長さが 128
+/// より長ければ EINVAL。add: metric の既定は 1024、口がなければ ENODEV、link-local のゲートウェイに口がなければ EINVAL、
+/// ゲートウェイのないもの (口だけの道) と unicast でないものは EOPNOTSUPP、同じあて先と長さと metric があれば EEXIST
+/// (REPLACE なら入れかえ)。del: あうもののうち metric の小さいもの、なければ ESRCH
+fn change_route6(body: &[u8], add: bool, nlflags: u16) -> i64 {
+    if body.len() < 12 {
+        return crate::why::inval();
+    }
+    let (dst_len, tos, proto, typ) = (body[1], body[3], body[5], body[7]);
+    if tos != 0 {
+        return crate::why::inval();
+    }
+    let a = attrs_of(&body[12..]);
+    if a.contains_key(&RTA_VIA) {
+        return crate::why::inval();
+    }
+    let addr16 = |k: u16| a.get(&k).filter(|v| v.len() >= 16).map(|v| u128::from_be_bytes(v[..16].try_into().unwrap()));
+    let need = (dst_len as usize).div_ceil(8);
+    if a.get(&RTA_DST).is_some_and(|v| v.len() < need) {
+        return crate::why::inval();
+    }
+    if dst_len > 128 {
+        return crate::why::inval();
+    }
+    let mut dst = addr16(RTA_DST).unwrap_or(0);
+    if dst_len < 128 {
+        dst = if dst_len == 0 { 0 } else { dst >> (128 - dst_len as u32) << (128 - dst_len as u32) };
+    }
+    let gw = addr16(RTA_GATEWAY).unwrap_or(0);
+    let oif = u32_of(a.get(&RTA_OIF)) as i32;
+    let metric = u32_of(a.get(&RTA_PRIORITY));
+    if !add {
+        return match crate::addrconf::del_route(dst, dst_len, gw, metric, proto) {
+            Ok(r) => {
+                ev_route6(&route6_of(&r), RTM_DELROUTE);
+                snapshot6();
+                0
+            }
+            Err(e) => e,
+        };
+    }
+    if oif != 0 && !links().iter().any(|l| l.index == oif) {
+        return -ENODEV;
+    }
+    if typ != RTN_UNICAST {
+        return -EOPNOTSUPP;
+    }
+    if gw == 0 {
+        return -EOPNOTSUPP;
+    }
+    if crate::addrconf::is_link_local(gw) && oif == 0 {
+        return crate::why::inval();
+    }
+    if oif != 0 && oif != ETH_INDEX {
+        return -EOPNOTSUPP;
+    }
+    let r = crate::addrconf::Route {
+        dst,
+        len: dst_len,
+        gw,
+        metric: if metric == 0 { 1024 } else { metric },
+        proto,
+        typ: RTN_UNICAST,
+        expires: None,
+        hoplimit: 0,
+        flags: crate::addrconf::RTF_UP | crate::addrconf::RTF_GATEWAY,
+    };
+    match crate::addrconf::add_route(r.clone(), nlflags & NLM_F_REPLACE != 0) {
+        Ok(_) => {
+            ev_route6(&route6_of(&r), RTM_NEWROUTE);
+            snapshot6();
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+fn route6_of(r: &crate::addrconf::Route) -> Route6 {
+    Route6 { dst: r.dst, len: r.len, gw: r.gw, metric: r.metric, proto: r.proto, typ: r.typ, oif: ETH_INDEX, expires: r.expires, hoplimit: r.hoplimit, prefsrc: 0, rtf: r.flags }
+}
+
+/// 知らせたときの IPv6 の番地と道 (RA や時間切れで変わったら、くらべて知らせる)
+/// 番地 (番地、長さ、flags、proto) と道 (あて先、長さ、ゲートウェイ、metric、proto、type、口) のくらべる形
+type Snap6 = (Vec<(u128, u8, u32, u8)>, Vec<(u128, u8, u128, u32, u8, u8, i32)>);
+static SNAP6: Bkl<Option<Snap6>> = Bkl::new(None);
+
+fn snap6_now() -> Snap6 {
+    let a = addrs6().iter().map(|x| (x.addr, x.prefix, x.flags, x.proto)).collect();
+    let r = routes6().iter().map(|x| (x.dst, x.len, x.gw, x.metric, x.proto, x.typ, x.oif)).collect();
+    (a, r)
+}
+
+fn snapshot6() {
+    *SNAP6.get() = Some(snap6_now());
+}
+
+/// IPv6 の番地や道が変わったとき (RA の SLAAC、lifetime の時間切れ): 前とくらべて、なくなったものを RTM_DELADDR と
+/// RTM_DELROUTE で、増えたものを道 (prefix のもの)、RTM_NEWADDR、local の道の順に知らせる。はじめて見たときは知らせない
+pub fn changed6() {
+    let (na, nr) = snap6_now();
+    let Some((oa, or)) = SNAP6.get().take() else {
+        *SNAP6.get() = Some((na, nr));
+        return;
+    };
+    let addrs = addrs6();
+    let routes = routes6();
+    // なくなったもの: 前の番地と道は、いまの表にないので形だけ作る
+    for &(addr, prefix, flags, proto) in oa.iter().filter(|x| !na.contains(x)) {
+        let a = Addr6 { index: ETH_INDEX, addr, prefix, scope: crate::addrconf::rt_scope(addr), flags, proto, preferred: 0, valid: 0, cstamp: 0, tstamp: 0 };
+        ev_addr6(&a, RTM_DELADDR);
+    }
+    for &(dst, len, gw, metric, proto, typ, oif) in or.iter().filter(|x| !nr.contains(x)) {
+        let r = Route6 { dst, len, gw, metric, proto, typ, oif, expires: None, hoplimit: 0, prefsrc: 0, rtf: 0 };
+        ev_route6(&r, RTM_DELROUTE);
+    }
+    let key_r = |x: &Route6| (x.dst, x.len, x.gw, x.metric, x.proto, x.typ, x.oif);
+    for r in routes.iter().filter(|x| x.typ != RTN_LOCAL && !or.contains(&key_r(x))) {
+        ev_route6(r, RTM_NEWROUTE);
+    }
+    for a in addrs.iter().filter(|x| !oa.contains(&(x.addr, x.prefix, x.flags, x.proto))) {
+        ev_addr6(a, RTM_NEWADDR);
+    }
+    for r in routes.iter().filter(|x| x.typ == RTN_LOCAL && !or.contains(&key_r(x))) {
+        ev_route6(r, RTM_NEWROUTE);
+    }
+    *SNAP6.get() = Some((na, nr));
 }
 
 /// RTM_NEWADDR (inet6_fill_ifaddr の属性の順: IFA_ADDRESS、IFA_CACHEINFO、IFA_FLAGS、IFA_PROTO)
@@ -2097,6 +2363,11 @@ pub fn routes6() -> Vec<Route6> {
 /// RTM_NEWROUTE (rt6_fill_node の属性の順: RTA_TABLE、RTA_DST、(RTA_PREFSRC)、(RTA_METRICS)、RTA_PRIORITY、
 /// (RTA_GATEWAY)、RTA_OIF、RTA_CACHEINFO (expires は 1/100 秒)、RTA_PREF)
 fn put_route6(out: &mut Vec<u8>, r: &Route6, flags: u16, seq: u32, me: u32) {
+    put_route6_msg(out, r, RTM_NEWROUTE, flags, seq, me);
+}
+
+/// RTM_NEWROUTE か RTM_DELROUTE
+fn put_route6_msg(out: &mut Vec<u8>, r: &Route6, typ: u16, flags: u16, seq: u32, me: u32) {
     const RTA_PREF: u16 = 20;
     const RTAX_HOPLIMIT: u16 = 10;
     let mut p = Vec::new();
@@ -2126,7 +2397,7 @@ fn put_route6(out: &mut Vec<u8>, r: &Route6, flags: u16, seq: u32, me: u32) {
     }
     attr(&mut p, RTA_CACHEINFO, &ci);
     attr(&mut p, RTA_PREF, &[0]);
-    put_msg(out, RTM_NEWROUTE, flags, seq, me, &p);
+    put_msg(out, typ, flags, seq, me, &p);
 }
 
 /// 1 つの IPv6 の道 (inet6_rtm_getroute と ip6_route_output): 自分の番地は lo の local (metric 0)、ほかは道の表から
