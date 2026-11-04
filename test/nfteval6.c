@@ -5,10 +5,17 @@
 //   LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root nfteval6 /nft      (aios の中は /opt/c/bin/nft)
 // counter は、どちらでも同じ数になるもの (SYN だけの TCP と UDP) だけ (aios の中どうしの TCP は、つなぐときの SYN と
 // SYN-ACK だけが決まりを通る: test/nfteval.c と同じ)
+// net をつけると eth0 の IPv6 の case も (SLAAC を待ってから。QEMU のユーザーネットワークの fec0::2 と fe80::2 へ
+// ping6 と TCP と UDP。ホストに IPv6 がなくても QEMU が echo に答え、TCP と UDP には ICMPv6 のエラーを返す):
+//   LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net nfteval6 /nft net
+// eth0 の TCP の SYN は smoltcp と Linux で長さがちがうので、数えるのは ICMPv6 の echo だけ。QEMU は TCP に fe80::2 から
+// ICMPv6 の no route を返すが、Linux はそれが connect のあいだ (ソケットを持っているあいだ) に着くと sk_err_soft にしまう
+// だけで、つながるのを待ちつづける (時間しだい) ので、TCP は出す側で落とす・RST で断る・受ける側で落とすものだけ
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/icmp6.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -188,9 +195,87 @@ static void udp_probe(const char *label, const char *to, int port, int lport, in
         close(r);
 }
 
+// eth0 に link-local でないアドレスができて tentative でなくなるのを待つ (30 秒まで)
+static int wait_slaac(void) {
+    for (int i = 0; i < 300; i++) {
+        FILE *f = fopen("/proc/net/if_inet6", "r");
+        char line[256];
+        int ok = 0;
+        while (f && fgets(line, sizeof line, f)) {
+            unsigned idx, plen, scope, flags;
+            char addr[40], name[32];
+            if (sscanf(line, "%39s %x %x %x %x %31s", addr, &idx, &plen, &scope, &flags, name) == 6 && !strcmp(name, "eth0") && scope != 0x20 &&
+                !(flags & 0x40))
+                ok = 1;
+        }
+        if (f)
+            fclose(f);
+        if (ok)
+            return 1;
+        ms_sleep(100);
+    }
+    return 0;
+}
+
+// ping6 (raw の ICMPv6、echo reply と destination unreachable だけを受ける): 送りの答えと、2.5 秒のうちに来たもの
+// (aios の smoltcp は近所さがしの NS を 1 つ出すと、どのあて先にも 1 秒は出さないので、近所の表が切れたあとは
+// 2 つ目のあて先の答えが 1 秒おくれる)
+static void ping_probe(const char *to, unsigned scope) {
+    int s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    struct icmp6_filter f;
+    ICMP6_FILTER_SETBLOCKALL(&f);
+    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &f);
+    ICMP6_FILTER_SETPASS(ICMP6_DST_UNREACH, &f);
+    setsockopt(s, IPPROTO_ICMPV6, ICMP6_FILTER, &f, sizeof f);
+    struct sockaddr_in6 a = sa6(to, 0);
+    a.sin6_scope_id = scope;
+    unsigned char pkt[16] = {ICMP6_ECHO_REQUEST, 0, 0, 0, 0x12, 0x34, 0, 7, 'n', 'f', 't', 'e', 'v', 'a', 'l', '6'};
+    long r = sendto(s, pkt, sizeof pkt, 0, (void *)&a, sizeof a);
+    printf("ping %s: send %s", to, r == sizeof pkt ? "ok" : ename(errno));
+    struct pollfd pf = {s, POLLIN, 0};
+    if (poll(&pf, 1, 2500) > 0) {
+        unsigned char b[256];
+        struct sockaddr_in6 from;
+        socklen_t fl = sizeof from;
+        long got = recvfrom(s, b, sizeof b, 0, (void *)&from, &fl);
+        char ip[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &from.sin6_addr, ip, sizeof ip);
+        printf("; got type %u code %u from %s len %ld\n", b[0], b[1], ip, got);
+    } else {
+        printf("; nothing\n");
+    }
+    close(s);
+}
+
+// eth0 の向こうへの TCP (待たない connect、0.9 秒まで: Linux の SYN のやりなおしは 1 秒から)
+static void tcp_out(const char *to, int port) {
+    int c = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in6 a = sa6(to, port);
+    int r = connect(c, (void *)&a, sizeof a);
+    const char *res = r == 0 ? "connected" : ename(errno);
+    if (r < 0 && errno == EINPROGRESS) {
+        struct pollfd pf = {c, POLLOUT, 0};
+        if (poll(&pf, 1, 900) == 0) {
+            res = "timeout";
+        } else {
+            int e = 0;
+            socklen_t el = sizeof e;
+            getsockopt(c, SOL_SOCKET, SO_ERROR, &e, &el);
+            res = e ? ename(e) : "connected";
+        }
+    }
+    printf("tcp %s %d: %s\n", to, port, res);
+    close(c);
+}
+
 // dmesg の nfteval- の行 (log の prefix) (前に見せたものより後)。時刻と段を取り、変わるもの (IP の id、32768 からのポート) は *
 static int seen;
+static void klog_print(int print);
 static void klog(void) {
+    klog_print(1);
+}
+
+static void klog_print(int print) {
     static char b[1 << 20];
     int n = klogctl(3, b, sizeof b - 1);
     if (n < 0) {
@@ -234,7 +319,8 @@ static void klog(void) {
             o[w++] = *p++;
         }
         o[w] = 0;
-        printf("log %s\n", o);
+        if (print)
+            printf("log %s\n", o);
     }
     seen = idx;
 }
@@ -304,6 +390,53 @@ static const struct tc cases[] = {
      "un"},
 };
 
+// eth0 の case (net をつけたとき)。probes: p (fec0::2 へ ping6)、l (fe80::2%eth0 へ ping6)、t (fec0::2 の TCP 1)、
+// w (fec0::2 の UDP 9 へ 2 つ)
+static const struct tc net_cases[] = {
+    {"eth-accept",
+     "table inet t {\n"
+     "\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tiif eth0 ip6 saddr fec0::2 icmpv6 type echo-reply counter\n\t\tmeta nfproto ipv6 icmpv6 type echo-reply counter\n"
+     "\t\tip6 saddr fe80::2 icmpv6 type echo-reply counter\n\t}\n"
+     "\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\toif eth0 ip6 daddr fec0::2 icmpv6 type echo-request counter\n\t\tip6 daddr fe80::2 icmpv6 type echo-request counter\n\t}\n"
+     "\tchain pre {\n\t\ttype filter hook prerouting priority filter; policy accept;\n"
+     "\t\tiif eth0 icmpv6 type echo-reply counter\n\t}\n"
+     "\tchain post {\n\t\ttype filter hook postrouting priority filter; policy accept;\n"
+     "\t\toif eth0 icmpv6 type echo-request counter\n\t}\n"
+     "}\n",
+     "pl"},
+    {"eth-drop-in",
+     "table ip6 t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tip6 saddr fec0::2 icmpv6 type echo-reply counter drop\n\t}\n}\n",
+     "p"},
+    {"eth-drop-out",
+     "table ip6 t {\n\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\tip6 daddr fec0::2 icmpv6 type echo-request counter drop\n\t\tip6 daddr fec0::2 tcp dport 1 drop\n\t\tip6 daddr fec0::2 udp dport 9 drop\n\t}\n}\n",
+     "ptw"},
+    {"eth-reject-out",
+     "table inet t {\n\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\tip6 daddr fec0::2 icmpv6 type echo-request reject with icmpv6 admin-prohibited\n"
+     "\t\tip6 daddr fec0::2 tcp dport 1 reject with tcp reset\n\t\tip6 daddr fec0::2 udp dport 9 reject\n\t}\n}\n",
+     "ptw"},
+    {"eth-reject-in",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tip6 saddr fec0::2 icmpv6 type echo-reply counter reject with icmpv6 admin-prohibited\n\t}\n"
+     "\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\tip6 daddr fec0::2 icmpv6 type destination-unreachable counter\n\t}\n}\n",
+     "p"},
+    {"eth-policy-drop",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy drop;\n"
+     "\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, echo-reply } accept\n\t}\n}\n",
+     "pt"},
+    {"eth-log",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
+     "\t\tiif eth0 icmpv6 type echo-reply log prefix \"nfteval6-ein \"\n\t}\n"
+     "\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\toif eth0 icmpv6 type echo-request log prefix \"nfteval6-eout \"\n\t}\n}\n",
+     "p"},
+};
+
 static void probe(char c) {
     switch (c) {
     case '6': tcp_probe("::1 7101", AF_INET6, "::1", 7101, 7101); break;
@@ -312,6 +445,10 @@ static void probe(char c) {
     case 'v': udp_probe("::1 7104 (nobody)", "::1", 7104, 0, 2, 5); break;
     case '4': tcp_probe("127.0.0.1 7101", AF_INET, "127.0.0.1", 7101, 7101); break;
     case 'm': tcp_probe("::ffff:127.0.0.1 7101", AF_INET, "::ffff:127.0.0.1", 7101, 7101); break;
+    case 'p': ping_probe("fec0::2", 0); break;
+    case 'l': ping_probe("fe80::2", 2); break;
+    case 't': tcp_out("fec0::2", 1); break;
+    case 'w': udp_probe("fec0::2 9", "fec0::2", 9, 0, 2, 5); break;
     }
 }
 
@@ -326,11 +463,16 @@ int main(int argc, char **argv) {
         printf("nfteval6: no %s (skipped)\n", nft);
         return 0;
     }
-    const char *only = argc > 2 ? argv[2] : NULL;
+    const char *only = argc > 2 && strcmp(argv[2], "net") ? argv[2] : NULL;
+    int net = argc > 2 && !strcmp(argv[argc - 1], "net");
+    if (net)
+        printf("eth0 slaac: %s\n", wait_slaac() ? "yes" : "no");
     nft_run("flush ruleset");
-    klog();
-    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        const struct tc *t = &cases[i];
+    // 前に動かしたときの行は数えるだけ
+    klog_print(0);
+    size_t nc = sizeof cases / sizeof *cases, nn = net ? sizeof net_cases / sizeof *net_cases : 0;
+    for (size_t i = 0; i < nc + nn; i++) {
+        const struct tc *t = i < nc ? &cases[i] : &net_cases[i - nc];
         if (only && strcmp(only, t->name))
             continue;
         printf("== %s\n", t->name);

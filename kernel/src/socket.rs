@@ -264,6 +264,25 @@ impl Socket {
                 pkt[42..44].copy_from_slice(&[0, 0]);
                 let sum = crate::addrconf::icmp6_sum(src, dst, &pkt[40..]);
                 pkt[42..44].copy_from_slice(&sum.to_be_bytes());
+                // ファイアウォール (ip6_local_out: 自分あては lo の 4 つ、外へは LOCAL_OUT と POST_ROUTING)。落ちたら EPERM、
+                // 返すもの (reject) は受け取りの列へ。通ったものは net.rs が通しなおさない
+                if crate::nfhook::active() {
+                    let sk = proc::current().cred.uid;
+                    let sk = Some((sk, proc::current().cred.gid));
+                    let mut p = pkt.clone();
+                    let path = if crate::addrconf::is_mine(dst) { crate::nfhook::lo(&mut p, sk, 0, 0) } else { crate::nfhook::out_eth(&mut p, sk, 0, 0) };
+                    match path {
+                        crate::nfhook::Path::Pass => net::raw6_passed(pkt.clone()),
+                        crate::nfhook::Path::Out(r, w) | crate::nfhook::Path::In(r, w) => {
+                            if let Some(r) = r {
+                                net::inject6(r);
+                                net::poll();
+                            }
+                            crate::why::firewall(&w.text());
+                            return Err(-EPERM);
+                        }
+                    }
+                }
                 raw_sock(h).send_slice(&pkt).map_err(|_| -EAGAIN)?;
                 net::poll();
                 Ok(buf.len())

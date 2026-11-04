@@ -928,8 +928,25 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     (致命))。つなぐ TCP は致命のもので終わり (EACCES など)、UDP は connect したものに致命のものだけ。だれもいない UDP
     へのカーネルの port unreachable も決まりの道を通る
   - log: nf_log_ip6_packet と同じ行 (SRC= DST= は 4 けたの 16 進を 8 つ、LEN= TC= HOPLIMIT= FLOWLBL= PROTO= …)
-  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)、eth0 の IPv6 の
-    フレーム (eth0 の IPv6 はあるが、決まりに通すのは IPv4 のフレームだけ)
+  - eth0 の IPv6 のフレーム (段階 2d、IPv6 の段階 2c のあと): 受けたものは PRE_ROUTING と、自分の番地か受ける
+    マルチキャスト (ff02::1、自分の番地の solicited-node) あてなら LOCAL_IN (ip6_rcv_core のたしかめのあと。RA、NS、NA
+    も決まりを通る: Linux と同じく、近所さがしの ICMPv6 を通さない policy drop では IPv6 がつながらない。通ったものだけを
+    addrconf と近くの番地の表が読む)。smoltcp が出すもの (TCP、ICMPv6、近所さがし、addrconf の RS) は LOCAL_OUT と
+    POST_ROUTING。UDP と raw の ICMPv6 は送るときに通して、落ちたら EPERM (ip6_local_out)。自分の番地へのもの
+    (raw の ping6 など) は lo の 4 つ
+  - eth0 の reject: RST と ICMPv6 は eth0 の向こうへ (LOCAL_OUT と POST_ROUTING を通して)。受けたもののチェックサムを
+    確かめ、ICMPv6 は自分あて (PACKET_HOST) のものにだけ、相手ごとに 1 秒に 1 つ (はじめは 6 つまで:
+    icmpv6_xrlim_allow)。自分が出したものを返す ICMPv6 の送り元は自分の番地 (icmp6_send)。返したものは raw の
+    ソケットと、TCP と UDP のソケット (ICMPv6 のエラー) に届く
+  - つなぐ途中の TCP を ICMPv6 のエラーでやめるときは、smoltcp の abort (RST を送る) ではなく close で (Linux の
+    tcp_done は何も送らない)
+  - /proc/ai/fw の落としたものの輪も IPv6 の番地とポート、icmpv6 の type と code を見せる
+  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)
+  - 確かめかた (eth0): `LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net nfteval6 /nft net` (7 つの case:
+    fec0::2 と fe80::2 への ping6 と counter、受けと出しの drop、出しの reject (icmpv6、tcp reset、UDP)、受けの reject
+    (外へ返す ICMPv6 を output で数える)、近所さがしを通す policy drop、eth0 の log)。手本の Linux 7.4-rc1 と 289 行
+    同じ。QEMU は TCP に fe80::2 から ICMPv6 の no route を返すが、Linux はそれが connect のあいだに着くと待ちつづける
+    (時間しだい) ので、TCP は落とすか RST で断るものだけ
   - 確かめかた: `test/nfteval6.c` (root で。11 の case: accept と counter、input の drop と reject (tcp reset、icmpv6 の
     admin-prohibited・addr-unreachable・no-route、icmpx)、output の drop と reject、ip だけ・ip6 だけの表 (::1、
     127.0.0.1、::ffff:127.0.0.1 へ)、inet の policy drop と nfproto、log)。
@@ -1077,7 +1094,10 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
     INCOMPLETE、NA で REACHABLE か STALE、R はルーター (NTF_ROUTER)、RA の SLLA で STALE)。/proc/net/if_inet6 と
     ipv6_route (refcnt はいつも 1)、/proc/sys/net/ipv6/conf/{all,default,lo,eth0}/ のいくつか (読むだけ) と
     net/ipv4/ping_group_range
-- まだ: eth0 の IPv6 のファイアウォール (nftables は eth0 の IPv6 のフレームを見ない) と IPv6 の conntrack、DAD、MLD、
+- ファイアウォール (段階 2d): eth0 の IPv6 のフレームも決まりを通る (上の「ファイアウォール (nftables)」の IPv6)
+- smoltcp の近所さがしは、NS を 1 つ出すと、どのあて先にも 1 秒は出さない (近所の表は 60 秒で切れる)。Linux はあて先
+  ごと。表が切れたあとに 2 つのあて先へ続けて送ると、2 つ目が 1 秒おくれる (todo の smoltcp-nd-silence)
+- まだ: IPv6 の conntrack、DAD、MLD、
   packet too big (PMTU)、IPV6_RECVERR の行列、ip -6 addr add / route add (RTM_NEWADDR と RTM_NEWROUTE の AF_INET6)、
   IPv6 の番地と道の netlink の知らせ (RTNLGRP_IPV6_*)、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、

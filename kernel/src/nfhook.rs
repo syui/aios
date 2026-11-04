@@ -265,7 +265,8 @@ pub enum EthIn {
 
 pub fn in_eth(frame: &mut [u8], local: bool, pkttype: u8) -> EthIn {
     let (ll, ip) = frame.split_at_mut(14);
-    let tot = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    let v6 = ip[0] >> 4 == 6;
+    let tot = if v6 { 40 + u16::from_be_bytes([ip[4], ip[5]]) as usize } else { u16::from_be_bytes([ip[2], ip[3]]) as usize };
     let ip = &mut ip[..tot];
     let ll: &[u8] = ll;
     let r = {
@@ -283,7 +284,7 @@ pub fn in_eth(frame: &mut [u8], local: bool, pkttype: u8) -> EthIn {
         let mut f = Vec::with_capacity(14 + r.len());
         f.extend_from_slice(&ll[6..12]);
         f.extend_from_slice(&ll[0..6]);
-        f.extend_from_slice(&[8, 0]);
+        f.extend_from_slice(if v6 { &[0x86, 0xdd] } else { &[8, 0] });
         f.extend_from_slice(&r);
         return EthIn::Drop(Some(f));
     }
@@ -307,7 +308,8 @@ struct Drop {
     hook: u32,
     iif: u32,
     oif: u32,
-    head: [u8; 40],
+    /// 頭から 64 バイト (IPv6 の 40 と TCP の頭のはじめ)
+    head: [u8; 64],
     len: u16,
     why: String,
     reject: Option<Reject>,
@@ -321,8 +323,8 @@ fn remember_drop(p: &Pkt, hook: u32, why: &Why, reject: Option<Reject>) {
     if nftables::tracing() {
         return;
     }
-    let mut head = [0u8; 40];
-    let n = p.ip.len().min(40);
+    let mut head = [0u8; 64];
+    let n = p.ip.len().min(64);
     head[..n].copy_from_slice(&p.ip[..n]);
     let d = Drop { ns: crate::timer::uptime_ns(), hook, iif: p.iif, oif: p.oif, head, len: p.ip.len() as u16, why: why.text(), reject, uid: p.sk.map(|s| s.0) };
     let (v, at, total) = DROPS.get();
@@ -348,10 +350,15 @@ pub fn drops_json() -> String {
     for k in 0..n {
         let d = &v[(*at + n - 1 - k) % n];
         let ip = &d.head;
-        let ihl = (ip[0] & 15) as usize * 4;
-        let proto = ip[9];
-        let (sp, dp, flags) = if (proto == 6 || proto == 17) && ihl + 4 <= 40 {
-            let f = if proto == 6 && ihl + 14 <= 40 { ip[ihl + 13] } else { 0 };
+        let v6 = ip[0] >> 4 == 6;
+        // IPv6 は拡張ヘッダーをとばして (頭の 64 バイトの中で)
+        let (ihl, proto) = if v6 {
+            v6_l4(&ip[..(d.len as usize).min(64)]).map_or((40, ip[6]), |(o, p, _)| (o, p))
+        } else {
+            ((ip[0] & 15) as usize * 4, ip[9])
+        };
+        let (sp, dp, flags) = if (proto == 6 || proto == 17) && ihl + 4 <= 64 {
+            let f = if proto == 6 && ihl + 14 <= 64 { ip[ihl + 13] } else { 0 };
             (be16(&ip[ihl..ihl + 2]), be16(&ip[ihl + 2..ihl + 4]), f)
         } else {
             (0, 0, 0)
@@ -360,7 +367,14 @@ pub fn drops_json() -> String {
             1 => "icmp",
             6 => "tcp",
             17 => "udp",
+            58 => "icmpv6",
             _ => "other",
+        };
+        let (src, dst) = if v6 {
+            let a = |b: &[u8]| alloc::format!("{}", core::net::Ipv6Addr::from(u128::from_be_bytes(b.try_into().unwrap())));
+            (a(&ip[8..24]), a(&ip[24..40]))
+        } else {
+            (dotted(&ip[12..16]), dotted(&ip[16..20]))
         };
         let mut fl = String::new();
         for (bit, name) in [(SYN, "syn"), (ACK, "ack"), (FIN, "fin"), (RST, "rst"), (PSH, "psh")] {
@@ -379,13 +393,13 @@ pub fn drops_json() -> String {
             ifname(d.iif),
             ifname(d.oif),
             pname,
-            dotted(&ip[12..16]),
-            dotted(&ip[16..20])
+            src,
+            dst
         );
         if proto == 6 || proto == 17 {
             let _ = write!(s, ",\"sport\":{},\"dport\":{}", sp, dp);
         }
-        if proto == 1 && ihl + 2 <= 40 {
+        if (proto == 1 || proto == 58) && ihl + 2 <= 64 {
             let _ = write!(s, ",\"type\":{},\"code\":{}", ip[ihl], ip[ihl + 1]);
         }
         if !fl.is_empty() {
@@ -631,11 +645,26 @@ pub fn icmp6_of(r: &[u8]) -> Option<u8> {
 /// IPv6 の reject の返すもの (nf_send_reset6 と nf_send_unreach6 → icmp6_send)。返せないもの (RST への RST、ICMPv6
 /// のエラーへのエラー、multicast、はじめでない断片) は None
 fn reply6(ip: &[u8], rj: Reject) -> Option<Vec<u8>> {
+    reply6_at(ip, rj, false, PACKET_HOST)
+}
+
+/// reply6 の中身。eth0 から受けたもの (from_eth) はチェックサムを確かめ (nf_reject_verify_csum と
+/// nf_reject_ip6_tcphdr_get)、ICMPv6 は自分あて (PACKET_HOST) のものにだけ、外へは相手ごとに数をしぼる
+/// (icmpv6_xrlim_allow: 1 秒に 1 つ、はじめは 6 つまで)。ICMPv6 の送り元は、もとのあて先が自分のものならそれ、
+/// ちがえば (自分が出したものを返す) もとの送り元 (icmp6_send の saddr)
+fn reply6_at(ip: &[u8], rj: Reject, from_eth: bool, pkttype: u8) -> Option<Vec<u8>> {
     let (thoff, proto, frag) = v6_l4(ip)?;
     let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
     let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
     if dst >> 120 == 0xff {
         return None;
+    }
+    if from_eth && frag == 0 && matches!(proto, PROTO_TCP | PROTO_UDP | 58) && ip.len() > thoff {
+        let seg = &ip[thoff..];
+        let skip = proto == PROTO_UDP && seg.len() >= 8 && be16(&seg[6..8]) == 0;
+        if !skip && l4sum6(src, dst, proto, seg) != 0 {
+            return None;
+        }
     }
     if rj.rst {
         // nf_reject_ip6_tcphdr_get: TCP、はじめの断片、RST には返さない
@@ -672,15 +701,51 @@ fn reply6(ip: &[u8], rj: Reject) -> Option<Vec<u8>> {
     if proto == 58 && ip.len() > thoff && ip[thoff] < 128 {
         return None;
     }
+    if pkttype != PACKET_HOST {
+        return None;
+    }
+    let local = |a: u128| a == 1 || crate::addrconf::is_mine(a);
+    let from = if local(dst) { dst } else { src };
+    if !local(src) && !ratelimit6(src) {
+        return None;
+    }
     // icmp6_send: もとのパケットを IPv6 の最小の MTU (1280) に入るまで
     let keep = ip.len().min(1280 - 48);
     let mut b = Vec::with_capacity(48 + keep);
-    ip6hdr(&mut b, 0, 0, 8 + keep, 58, 64, dst, src);
+    ip6hdr(&mut b, 0, 0, 8 + keep, 58, 64, from, src);
     b.extend_from_slice(&[1, rj.code, 0, 0, 0, 0, 0, 0]);
     b.extend_from_slice(&ip[..keep]);
-    let c = l4sum6(dst, src, 58, &b[40..]);
+    let c = l4sum6(from, src, 58, &b[40..]);
     b[42..44].copy_from_slice(&c.to_be_bytes());
     Some(b)
+}
+
+/// ICMPv6 のエラーを外へ出す数のしぼり (相手ごと: ratelimit と同じ token bucket)
+fn ratelimit6(peer: u128) -> bool {
+    use crate::cell::Bkl;
+    static PEERS: Bkl<Vec<(u128, u64, u64)>> = Bkl::new(Vec::new());
+    const HZ_NS: u64 = 1_000_000_000;
+    let now = crate::timer::uptime_ns();
+    let v = PEERS.get();
+    let i = match v.iter().position(|p| p.0 == peer) {
+        Some(i) => i,
+        None => {
+            if v.len() >= 64 {
+                v.remove(0);
+            }
+            v.push((peer, 0, now.saturating_sub(60 * HZ_NS)));
+            v.len() - 1
+        }
+    };
+    let (_, tokens, last) = &mut v[i];
+    let mut t = (*tokens + now.saturating_sub(*last)).min(6 * HZ_NS);
+    *last = now;
+    let ok = t >= HZ_NS;
+    if ok {
+        t -= HZ_NS;
+    }
+    *tokens = t;
+    ok
 }
 
 /// カーネルが返す ICMPv6 の到達不能 (だれもいない UDP の port unreachable など)
@@ -721,7 +786,7 @@ pub fn nexthop(daddr: u32, oif: u32) -> u32 {
 fn reply(ip: &[u8], rj: Reject, hook: u32, iif: u32, pkttype: u8, mark: u32) -> Option<Vec<u8>> {
     let _ = mark;
     if ip[0] >> 4 == 6 {
-        return reply6(ip, rj);
+        return reply6_at(ip, rj, matches!(hook, PRE_ROUTING | LOCAL_IN) && iif == IF_ETH0, pkttype);
     }
     let ihl = (ip[0] & 15) as usize * 4;
     let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff;

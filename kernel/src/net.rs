@@ -139,7 +139,11 @@ impl Device for NetDev {
             if frame.len() >= 14 && frame[12..14] == [8, 6] {
                 crate::netlink::arp_in(&frame, frame[..6] == self.mac);
             }
-            // IPv6: RA は addrconf が読み、NS / NA / RA は近くの番地の表に (どれも smoltcp にもわたす)
+            // ファイアウォール (PRE_ROUTING と LOCAL_IN)。落とせば次のフレームを
+            if !self.filter_in(&mut frame) {
+                continue;
+            }
+            // IPv6 (決まりを通ったもの): RA は addrconf が読み、NS / NA / RA は近くの番地の表に (どれも smoltcp にもわたす)
             if frame.len() >= 54 && frame[12..14] == [0x86, 0xdd] {
                 crate::addrconf::rx(&frame);
                 crate::netlink::nd_in(&frame, frame[..6] == self.mac);
@@ -148,10 +152,7 @@ impl Device for NetDev {
                     ICMP6_LATER.get().push(frame[14..].to_vec());
                 }
             }
-            // ファイアウォール (PRE_ROUTING と LOCAL_IN)。落とせば次のフレームを
-            if self.filter_in(&mut frame) {
-                return Some((Rx(frame), Tx(self)));
-            }
+            return Some((Rx(frame), Tx(self)));
         }
     }
 
@@ -213,11 +214,54 @@ fn ipv4_ok(f: &[u8]) -> bool {
     ip[0] >> 4 == 4 && ihl >= 20 && tot >= ihl && tot <= ip.len() && crate::nfhook::csum_fold(crate::nfhook::csum_add(0, &ip[..ihl])) == 0
 }
 
+/// IPv6 のフレームなら、頭がおかしくないか (版と長さ: ip6_rcv_core)
+fn ipv6_ok(f: &[u8]) -> bool {
+    f.len() >= 54 && f[12..14] == [0x86, 0xdd] && f[14] >> 4 == 6 && 54 + u16::from_be_bytes([f[18], f[19]]) as usize <= f.len()
+}
+
+/// aios が受けるマルチキャスト (ff02::1 と、自分の番地の solicited-node の ff02::1:ffXX:XXXX)
+fn mc_joined(a: u128) -> bool {
+    a == 0xff02u128 << 112 | 1
+        || (a >> 24 == (0xff02u128 << 88 | 1 << 8 | 0xff) && crate::addrconf::addrs().iter().any(|x| x.addr & 0xff_ffff == a & 0xff_ffff))
+}
+
+/// IPv6 の外への (送るときに決まりを通した) raw の ICMPv6 のパケット: filter_out は通しなおさない
+static RAW6_PASSED: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
+
+pub fn raw6_passed(ip: Vec<u8>) {
+    let v = RAW6_PASSED.get();
+    if v.len() >= 16 {
+        v.remove(0);
+    }
+    v.push(ip);
+}
+
+/// 自分あてのもの (IPv6 の頭から: ファイアウォールが返した ICMPv6 や RST) を受け取りの列に (raw のソケットと smoltcp が
+/// 受ける)。ICMPv6 のエラーは poll のあとで inet.rs にも
+pub fn inject6(ip: Vec<u8>) {
+    let Some(n) = get() else { return };
+    if ip.len() > 40 && ip[6] == 58 && ip[40] < 128 {
+        ICMP6_LATER.get().push(ip.clone());
+    }
+    let mut f = Vec::with_capacity(14 + ip.len());
+    f.extend_from_slice(&n.dev.mac);
+    f.extend_from_slice(&n.dev.mac);
+    f.extend_from_slice(&[0x86, 0xdd]);
+    f.extend_from_slice(&ip);
+    n.dev.lo.push_back(f);
+}
+
 impl NetDev {
     /// eth0 から来たフレームを決まりに通す (false なら捨てる)。DHCP の答え (UDP 67 → 68) は落とされても届ける
     /// (Linux の DHCP は AF_PACKET で受けるので、netfilter に関わらず届く)
     fn filter_in(&mut self, f: &mut [u8]) -> bool {
-        if !crate::nfhook::active() || !ipv4_ok(f) {
+        if !crate::nfhook::active() {
+            return true;
+        }
+        if ipv6_ok(f) {
+            return self.filter_in6(f);
+        }
+        if !ipv4_ok(f) {
             return true;
         }
         use crate::nfhook::{PACKET_BROADCAST, PACKET_HOST, PACKET_MULTICAST};
@@ -253,10 +297,44 @@ impl NetDev {
         }
     }
 
+    /// eth0 から来た IPv6 のフレーム (ip6_rcv_finish と ip6_input): 自分の番地か、受けるマルチキャストあてなら LOCAL_IN
+    /// も。ほかのあて先 (PACKET_OTHERHOST) は決まりの前に捨てる (smoltcp も)
+    fn filter_in6(&mut self, f: &mut [u8]) -> bool {
+        use crate::nfhook::{PACKET_HOST, PACKET_MULTICAST};
+        let pkttype = if f[0] & 1 != 0 {
+            PACKET_MULTICAST
+        } else if f[..6] == self.mac {
+            PACKET_HOST
+        } else {
+            return true;
+        };
+        let dst = u128::from_be_bytes(f[38..54].try_into().unwrap());
+        let local = crate::addrconf::is_mine(dst) || (dst >> 120 == 0xff && mc_joined(dst));
+        let tot = 54 + u16::from_be_bytes([f[18], f[19]]) as usize;
+        match crate::nfhook::in_eth(&mut f[..tot], local, pkttype) {
+            crate::nfhook::EthIn::Pass => true,
+            crate::nfhook::EthIn::Drop(reply) => {
+                if let Some(r) = reply
+                    && self.virtio.can_send()
+                {
+                    count(false, false, r.len());
+                    self.virtio.send(r.len(), |b| b.copy_from_slice(&r));
+                }
+                false
+            }
+        }
+    }
+
     /// smoltcp が出すフレームを決まりに通す (false なら出さない)。lo は自分あて (4 つのフック)、ほかは eth0
     /// (LOCAL_OUT と POST_ROUTING)。UDP は sendmsg のときに通してある (DHCP は通さない) ので、ここでは見ない
     fn filter_out(&mut self, f: &mut [u8], lo: bool) -> bool {
-        if !crate::nfhook::active() || !ipv4_ok(f) {
+        if !crate::nfhook::active() {
+            return true;
+        }
+        if ipv6_ok(f) {
+            return self.filter_out6(f, lo);
+        }
+        if !ipv4_ok(f) {
             return true;
         }
         let tot = u16::from_be_bytes([f[16], f[17]]) as usize;
@@ -283,6 +361,46 @@ impl NetDev {
                 fr.extend_from_slice(&r);
                 self.lo.push_back(fr);
             }
+        }
+        false
+    }
+
+    /// IPv6 のフレーム (ip6_local_out: LOCAL_OUT と POST_ROUTING、自分あては lo の 4 つ)。UDP は sendmsg のときに、
+    /// raw の ICMPv6 は sendto のときに通してある。自分の番地のための NS と NA (Linux にはない: 自分あては近所を
+    /// さがさない) は通さない。返すもの (自分あて: reject の RST と ICMPv6) は受け取りの列に
+    fn filter_out6(&mut self, f: &mut [u8], lo: bool) -> bool {
+        let tot = 54 + u16::from_be_bytes([f[18], f[19]]) as usize;
+        let nh = f[20];
+        if nh == 17 {
+            return true;
+        }
+        if nh == 58 {
+            let v = RAW6_PASSED.get();
+            if let Some(i) = v.iter().position(|p| p[..] == f[14..tot]) {
+                v.remove(i);
+                return true;
+            }
+            if lo && f.len() > 54 && matches!(f[54], 135 | 136) {
+                return true;
+            }
+        }
+        let ip = &mut f[14..tot];
+        let sk = crate::inet::ext_owner(ip);
+        let path = if lo { crate::nfhook::lo(ip, sk, 0, 0) } else { crate::nfhook::out_eth(ip, sk, 0, 0) };
+        let reply = match path {
+            crate::nfhook::Path::Pass => return true,
+            crate::nfhook::Path::Out(r, _) | crate::nfhook::Path::In(r, _) => r,
+        };
+        if let Some(r) = reply {
+            if r.len() > 40 && r[6] == 58 && r[40] < 128 {
+                ICMP6_LATER.get().push(r.clone());
+            }
+            let mut fr = Vec::with_capacity(14 + r.len());
+            fr.extend_from_slice(&self.mac);
+            fr.extend_from_slice(&f[..6]);
+            fr.extend_from_slice(&[0x86, 0xdd]);
+            fr.extend_from_slice(&r);
+            self.lo.push_back(fr);
         }
         false
     }
@@ -511,8 +629,9 @@ pub fn chan() -> usize {
 pub fn poll() {
     let Some(n) = get() else { return };
     // IPv6: RS を出す、lifetime の切れたものを捨てる、変わったものを smoltcp に
-    if let Some(rs) = crate::addrconf::tick()
+    if let Some(mut rs) = crate::addrconf::tick()
         && n.dev.virtio.can_send()
+        && n.dev.filter_out(&mut rs, false)
     {
         count(false, false, rs.len());
         n.dev.virtio.send(rs.len(), |b| b.copy_from_slice(&rs));

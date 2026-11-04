@@ -1624,8 +1624,14 @@ fn tcp_icmp(u: &InetRef, errno: i64) {
     if !matches!(st, St::SynSent | St::SynRecv) {
         return;
     }
+    // smoltcp の abort は RST を送るが、Linux はつなぐ途中 (SYN_SENT) でやめるときは何も送らない (tcp_done)
     if let Some(h) = ext {
-        tcp_sock(h).abort();
+        let t = tcp_sock(h);
+        if t.state() == tcp::State::SynSent {
+            t.close();
+        } else {
+            t.abort();
+        }
     }
     u.borrow_mut().err = -errno;
     tcp_done(u);
@@ -1634,6 +1640,9 @@ fn tcp_icmp(u: &InetRef, errno: i64) {
 /// smoltcp が出す TCP のソケットの持ち主 (meta skuid / skgid)。ip は IPv4 の頭から。listen しているものの SYN-ACK
 /// は、その持ち主
 pub fn ext_owner(ip: &[u8]) -> Option<(u32, u32)> {
+    if *ip.first()? >> 4 == 6 {
+        return ext_owner6(ip);
+    }
     let ihl = (*ip.first()? & 15) as usize * 4;
     if ip.len() < ihl + 4 || ip[9] != 6 {
         return None;
@@ -1652,6 +1661,32 @@ pub fn ext_owner(ip: &[u8]) -> Option<(u32, u32)> {
             return Some((s.uid, s.gid));
         }
         if s.ext_listen.is_some() && s.num == sp && (s.rcv_saddr == 0 || s.rcv_saddr == sa) {
+            listener = Some((s.uid, s.gid));
+        }
+    }
+    listener
+}
+
+/// ext_owner の IPv6 (smoltcp が出す TCP)
+fn ext_owner6(ip: &[u8]) -> Option<(u32, u32)> {
+    let (thoff, proto, _) = crate::nfhook::v6_l4(ip)?;
+    if proto != 6 || ip.len() < thoff + 4 {
+        return None;
+    }
+    let sa = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+    let da = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+    let (sp, dp) = (u16::from_be_bytes([ip[thoff], ip[thoff + 1]]), u16::from_be_bytes([ip[thoff + 2], ip[thoff + 3]]));
+    let mut listener = None;
+    for w in all().iter() {
+        let Some(u) = w.upgrade() else { continue };
+        let Ok(s) = u.try_borrow() else { continue };
+        if !s.tcp {
+            continue;
+        }
+        if s.ext.is_some() && s.v6 && s.sport == sp && s.daddr6 == da && s.dport == dp {
+            return Some((s.uid, s.gid));
+        }
+        if s.ext_listen.is_some() && s.num == sp && (s.rcv6 == 0 || s.rcv6 == sa) {
             listener = Some((s.uid, s.gid));
         }
     }
@@ -3291,19 +3326,15 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
         let s = u.borrow();
         (s.net, s.sport, if s.hops6 < 0 { 64 } else { s.hops6 as u8 }, s.tclass as u8, (s.uid, s.gid), s.priority)
     };
-    // 外へ (eth0): smoltcp の UDP のソケットから (eth0 の IPv6 のファイアウォールはまだ)
-    if !local {
-        let hops = u.borrow().hops6;
-        ext_udp_send6(u, &data, src6, daddr, dport, if hops < 0 { None } else { Some(hops as u8) })?;
-        return Ok(len as i64);
-    }
-    // ファイアウォール (lo の 4 つのフック、IPv6 の頭で)。出す側で落ちたら EPERM。返ってきた ICMPv6 の到達不能は
-    // connect したもので致命のものなら次に (__udp6_lib_err)
+    // ファイアウォール (自分あては lo の 4 つのフック、外へは LOCAL_OUT と POST_ROUTING。IPv6 の頭で)。出す側で落ちたら
+    // EPERM。返ってきた ICMPv6 の到達不能は connect したもので致命のものなら次に (__udp6_lib_err)
     let fw = netns == 0 && crate::nfhook::active();
     if fw {
         use crate::nfhook;
+        let hops = if local { hops } else { u.borrow().hops6.try_into().unwrap_or(crate::addrconf::hop_limit()) };
         let mut pkt = nfhook::udp_ends(nfhook::Ends::V6(src6, daddr), sport, dport, &data, tclass, hops, 0, false);
-        let (reply, out, why) = match nfhook::lo(&mut pkt, Some(sk), 0, prio) {
+        let path = if local { nfhook::lo(&mut pkt, Some(sk), 0, prio) } else { nfhook::out_eth(&mut pkt, Some(sk), 0, prio) };
+        let (reply, out, why) = match path {
             nfhook::Path::Pass => (None, false, None),
             nfhook::Path::Out(r, w) => (r, true, Some(w)),
             nfhook::Path::In(r, w) => (r, false, Some(w)),
@@ -3318,6 +3349,12 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             }
             return Ok(len as i64);
         }
+    }
+    // 外へ (eth0): smoltcp の UDP のソケットから
+    if !local {
+        let hops = u.borrow().hops6;
+        ext_udp_send6(u, &data, src6, daddr, dport, if hops < 0 { None } else { Some(hops as u8) })?;
+        return Ok(len as i64);
     }
     match udp_lookup6(netns, src6, sport, daddr, dport) {
         Some(r) => {
