@@ -968,9 +968,9 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   inet_rtm_valid_getroute_req (長さは 0 か 32、table・protocol・scope・type は 0、属性は IIF OIF SRC DST IP_PROTO
   SPORT DPORT MARK UID だけ)。入ってくる道 (RTA_IIF) はまだ (EOPNOTSUPP)
 - 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。RTM_GETADDR は AF_INET が v4、AF_INET6
-  が v6、ほかは rtnl_dump_all (v4 のあとに v6: 下の「IPv6」)。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (まだない)、
-  ほかは v4 の道。RTM_GETLINK は PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの RTM_GETROUTE は
-  AF_INET だけ (ほかは EOPNOTSUPP)
+  が v6、ほかは rtnl_dump_all (v4 のあとに v6: 下の「IPv6」)。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (lo の
+  local ::1)、ほかは v4 の道。RTM_GETLINK は PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの
+  RTM_GETROUTE は AF_INET と AF_INET6 (ほかは EOPNOTSUPP)
 - ついでに SIOCGIFNAME (番号から名前: glibc と musl の if_indextoname)。前は ENOTTY だった
 - 近くの番地の表 (RTM_GETNEIGH: ip neigh、Firefox の network ID): ARP は smoltcp がする (その表は外から見えない) ので、
   eth0 を通る ARP のフレームから Linux と同じ表を作る (net.rs の受けと出しで netlink::arp_in / arp_out)。smoltcp が問い
@@ -1027,11 +1027,13 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - netlink: lo の ::1/128 (scope host、IFA_F_PERMANENT、IFA_PROTO 1)。RTM_GETADDR は AF_INET が v4、AF_INET6 が v6 (中身と
   DONE が 1 つのデータグラム)、ほかは両方。1 つの RTM_GETADDR (AF_INET6)。getifaddrs に lo の inet6 ::1 が出る。
   RTM_GETNEIGH の AF_INET6 は空の表 (ENOENT)。AppArmor は inet6 の決まりで見る
-- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、IPv6 の道の表 (RTM_GETROUTE の AF_INET6)、
-  raw と ICMPv6、IPv6 のファイアウォール (nftables の ip6 と inet の決まりは IPv6 のものを見ない) と conntrack
+- IPv6 の道 (段階 2a、rt6_fill_node と inet6_rtm_getroute): lo の local ::1 (IPV6_MULTIPLE_TABLES のない Linux と同じく
+  表 254、proto kernel、metric 0、RTA_PREF 0)。dump は中身と DONE が別のデータグラム (strict なら NLM_F_DUMP_FILTERED)、
+  1 つの道は ::1 なら RTA_PREFSRC ::1 つき、ほかは ENETUNREACH
+- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、raw と ICMPv6、IPv6 のファイアウォール (nftables の ip6 と inet の決まりは IPv6 のものを見ない) と conntrack
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
-  二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net)。Linux 7.4-rc1 と
-  156 行同じ。route、rtnl、netlink も同じまま
+  二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道)。Linux
+  7.4-rc1 と 185 行同じ。route、rtnl、netlink も同じまま
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 

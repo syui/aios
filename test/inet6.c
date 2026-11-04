@@ -573,6 +573,106 @@ static void addr_dump(const char *what, int family) {
     close(s);
 }
 
+// RTM_NEWROUTE (AF_INET6) を 1 行に
+static void show_route6(struct nlmsghdr *h) {
+    struct rtmsg *r = NLMSG_DATA(h);
+    char line[1024];
+    int n = snprintf(line, sizeof line, "  route6 flags=%#x table=%u type=%u scope=%u proto=%u dst_len=%u src_len=%u tos=%u rtm_flags=%#x:",
+                     h->nlmsg_flags, r->rtm_table, r->rtm_type, r->rtm_scope, r->rtm_protocol, r->rtm_dst_len, r->rtm_src_len, r->rtm_tos,
+                     r->rtm_flags);
+    int len = RTM_PAYLOAD(h);
+    for (struct rtattr *a = RTM_RTA(r); RTA_OK(a, len); a = RTA_NEXT(a, len)) {
+        unsigned char *d = RTA_DATA(a);
+        char ip[INET6_ADDRSTRLEN];
+        unsigned v = RTA_PAYLOAD(a) >= 4 ? *(unsigned *)d : 0;
+        switch (a->rta_type) {
+        case RTA_TABLE: n += snprintf(line + n, sizeof line - n, " table %u", v); break;
+        case RTA_DST: inet_ntop(AF_INET6, d, ip, sizeof ip); n += snprintf(line + n, sizeof line - n, " dst %s", ip); break;
+        case RTA_PREFSRC: inet_ntop(AF_INET6, d, ip, sizeof ip); n += snprintf(line + n, sizeof line - n, " prefsrc %s", ip); break;
+        case RTA_GATEWAY: inet_ntop(AF_INET6, d, ip, sizeof ip); n += snprintf(line + n, sizeof line - n, " via %s", ip); break;
+        case RTA_OIF: n += snprintf(line + n, sizeof line - n, " oif %u", v); break;
+        case RTA_PRIORITY: n += snprintf(line + n, sizeof line - n, " metric %u", v); break;
+        case RTA_PREF: n += snprintf(line + n, sizeof line - n, " pref %u", d[0]); break;
+        case RTA_UID: n += snprintf(line + n, sizeof line - n, " uid %s", v == getuid() ? "self" : "other"); break;
+        case RTA_CACHEINFO: {
+            struct rta_cacheinfo *c = (void *)d;
+            n += snprintf(line + n, sizeof line - n, " cache(len %u error %u expires %d)", (unsigned)RTA_PAYLOAD(a), c->rta_error, c->rta_expires);
+            break;
+        }
+        default: n += snprintf(line + n, sizeof line - n, " attr%u(%u)", a->rta_type, (unsigned)RTA_PAYLOAD(a)); break;
+        }
+    }
+    printf("%s\n", line);
+}
+
+// RTM_GETROUTE: dump (dst が NULL) か 1 つの道
+static void route6(const char *what, int strict, const char *dst, int dump) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (strict) {
+        int one = 1;
+        setsockopt(s, SOL_NETLINK, 12, &one, sizeof one);
+    }
+    struct {
+        struct nlmsghdr h;
+        struct rtmsg r;
+        char attrs[64];
+    } req;
+    memset(&req, 0, sizeof req);
+    req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.h.nlmsg_type = RTM_GETROUTE;
+    req.h.nlmsg_flags = NLM_F_REQUEST | (dump ? NLM_F_DUMP : 0);
+    req.h.nlmsg_seq = 88;
+    req.r.rtm_family = AF_INET6;
+    if (dst) {
+        struct rtattr *a = (struct rtattr *)((char *)&req + NLMSG_ALIGN(req.h.nlmsg_len));
+        a->rta_type = RTA_DST;
+        a->rta_len = RTA_LENGTH(16);
+        inet_pton(AF_INET6, dst, RTA_DATA(a));
+        req.h.nlmsg_len = NLMSG_ALIGN(req.h.nlmsg_len) + RTA_ALIGN(a->rta_len);
+        req.r.rtm_dst_len = 128;
+    }
+    struct sockaddr_nl k = {.nl_family = AF_NETLINK};
+    sendto(s, &req, req.h.nlmsg_len, 0, (struct sockaddr *)&k, sizeof k);
+    printf("%s\n", what);
+    static char buf[65536];
+    for (int dg = 0; dg < 16; dg++) {
+        long got = recv(s, buf, sizeof buf, MSG_DONTWAIT);
+        if (got < 0) {
+            printf("  (no more)\n");
+            break;
+        }
+        int end = 0;
+        printf(" datagram:\n");
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, got); h = NLMSG_NEXT(h, got)) {
+            if (h->nlmsg_type == NLMSG_DONE) {
+                printf("  DONE flags=%#x error=%d\n", h->nlmsg_flags, *(int *)NLMSG_DATA(h));
+                end = 1;
+            } else if (h->nlmsg_type == NLMSG_ERROR) {
+                int e = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+                printf("  ERROR %s\n", en(-e));
+                end = 1;
+            } else if (h->nlmsg_type == RTM_NEWROUTE && ((struct rtmsg *)NLMSG_DATA(h))->rtm_family == AF_INET6) {
+                show_route6(h);
+            }
+        }
+        if (end || !dump)
+            break;
+    }
+    close(s);
+}
+
+static void routes6(void) {
+    printf("-- ipv6 routes\n");
+    route6("dump AF_INET6", 0, NULL, 1);
+    route6("strict dump AF_INET6", 1, NULL, 1);
+    route6("get ::1", 0, "::1", 0);
+    route6("get ::", 0, "::", 0);
+    route6("get 2001:db8::1", 0, "2001:db8::1", 0);
+    route6("get ::ffff:127.0.0.1", 0, "::ffff:127.0.0.1", 0);
+    route6("get ff02::1", 0, "ff02::1", 0);
+    route6("strict get ::1", 1, "::1", 0);
+}
+
 static void addrs(void) {
     printf("-- addresses\n");
     addr_dump("RTM_GETADDR AF_INET6", AF_INET6);
@@ -600,6 +700,7 @@ static void addrs(void) {
     for (int i = 0; i < 2; i++) {
         f = fopen(files[i], "r");
         int hdr = 1;
+        char found[2][256] = {"", ""};
         while (f && fgets(line, sizeof line, f)) {
             if (hdr) {
                 printf("%s header: %s", files[i], line);
@@ -610,9 +711,12 @@ static void addrs(void) {
             unsigned lp, rp, st;
             if (sscanf(line, "%*d: %63[0-9A-F]:%x %63[0-9A-F]:%x %x", la, &lp, ra, &rp, &st) != 5)
                 continue;
+            // Linux の順はポートのハッシュの順なので、P1、P2 の順にならべる
             if (lp == (unsigned)p1 || lp == (unsigned)p2)
-                printf("%s: local %s:%s remote %s:%u st %02X\n", files[i], la, lp == (unsigned)p1 ? "P1" : "P2", ra, rp, st);
+                snprintf(found[lp == (unsigned)p1 ? 0 : 1], sizeof found[0], "%s: local %s:%s remote %s:%u st %02X\n", files[i], la,
+                         lp == (unsigned)p1 ? "P1" : "P2", ra, rp, st);
         }
+        printf("%s%s", found[0], found[1]);
         if (f)
             fclose(f);
     }
@@ -623,6 +727,7 @@ static void addrs(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     addrs();
+    routes6();
     sockets();
     binds();
     clashes();

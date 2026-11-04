@@ -653,9 +653,8 @@ fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<
 /// 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。RTM_GETLINK は PF_BRIDGE
 /// (rtnl_bridge_getlink: ブリッジがないので空) のほかはみな口の一覧。RTM_GETADDR は AF_INET が v4 だけ、AF_INET6 が
 /// v6 だけ (inet6_dump_ifaddr: 中身と DONE が 1 つのデータグラム)、ほかは rtnl_dump_all (v4 のあとに v6)。だから
-/// AF_PACKET (Firefox の NetlinkService) でも両方が来る。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (まだない: 空)、
-/// ほかは v4 の道。1 つの RTM_GETROUTE は AF_INET だけ (AF_INET6 の inet6_rtm_getroute はまだ。ほかは PF_UNSPEC に
-/// doit がなく EOPNOTSUPP)
+/// AF_PACKET (Firefox の NetlinkService) でも両方が来る。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (lo の local ::1)、
+/// ほかは v4 の道。1 つの RTM_GETROUTE は AF_INET と AF_INET6 (ほかは PF_UNSPEC に doit がなく EOPNOTSUPP)
 fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> i64 {
     if typ > RTM_MAX {
         return -EOPNOTSUPP;
@@ -720,15 +719,11 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
             0
         }
         (RTM_GETADDR, false) if family == AF_INET6 => get_addr6(body, seq, me, out),
-        (RTM_GETROUTE, true) if family == AF_INET6 => {
-            // IPv6 の道 (::1 の local と main) はまだ出さない
-            done(out, Vec::new(), seq, me);
-            0
-        }
         (RTM_GETROUTE, true) => {
-            dump_routes(body, strict, seq, me, out);
+            dump_routes(body, strict, family == AF_INET6, seq, me, out);
             0
         }
+        (RTM_GETROUTE, false) if family == AF_INET6 => get_route6(body, seq, me, out),
         (RTM_GETROUTE, false) if family == AF_INET => get_route(body, strict, seq, me, out),
         (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET => change_route(body, typ == RTM_NEWROUTE, nlflags, seq, me),
         (RTM_GETNEIGH, true) => {
@@ -1263,7 +1258,7 @@ fn get_route(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>
 
 /// inet_dump_fib: strict (ip_valid_fib_dump_req) なら頭と RTA_TABLE・RTA_OIF で選ぶ (NLM_F_DUMP_FILTERED)。
 /// しくじりは DONE の errno に
-fn dump_routes(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) {
+fn dump_routes(body: &[u8], strict: bool, v6: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) {
     let (mut rflags, mut table, mut proto, mut rtype, mut dev) = (0u32, 0u32, 0u8, 0u8, 0i32);
     let (mut routes_too, mut filter_set) = (true, false);
     if strict {
@@ -1315,6 +1310,14 @@ fn dump_routes(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u
             255 => &[RT_TABLE_LOCAL],
             _ => &[RT_TABLE_MAIN],
         };
+        // IPv6 (inet6_dump_fib: IPV6_MULTIPLE_TABLES のない Linux は表が 1 つ): lo の local ::1 だけ
+        if v6 {
+            if (rtype == 0 || rtype == RTN_LOCAL) && (proto == 0 || proto == RTPROT_KERNEL) && (dev == 0 || dev == LO_INDEX) {
+                put_route6(&mut d, false, flags, seq, me);
+            }
+            done_with(out, d, seq, me, answer, 0);
+            return;
+        }
         let rs = routes();
         for &t in tables {
             for r in rs.iter().filter(|r| r.table == t) {
@@ -1924,6 +1927,41 @@ fn get_addr6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     let Some(x) = addrs6().into_iter().find(|x| x.addr == want && (index == 0 || x.index == index)) else { return -99 };
     let mut d = Vec::new();
     put_addr6(&mut d, &x, RTM_NEWADDR, 0, seq, me);
+    out.push(d);
+    0
+}
+
+/// IPv6 の道 (rt6_fill_node): lo の local ::1 (表 254、metric 0)。get は RTA_PREFSRC も。属性の順は RTA_TABLE、
+/// RTA_DST、(RTA_PREFSRC)、RTA_PRIORITY、RTA_OIF、RTA_CACHEINFO、RTA_PREF
+fn put_route6(out: &mut Vec<u8>, get: bool, flags: u16, seq: u32, me: u32) {
+    const RTA_PREF: u16 = 20;
+    let mut p = Vec::new();
+    p.extend_from_slice(&[AF_INET6, 128, 0, 0, RT_TABLE_MAIN, RTPROT_KERNEL, RT_SCOPE_UNIVERSE, RTN_LOCAL]);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    attr_u32(&mut p, RTA_TABLE, RT_TABLE_MAIN as u32);
+    attr(&mut p, RTA_DST, &1u128.to_be_bytes());
+    if get {
+        attr(&mut p, RTA_PREFSRC, &1u128.to_be_bytes());
+    }
+    attr_u32(&mut p, RTA_PRIORITY, 0);
+    attr_u32(&mut p, RTA_OIF, LO_INDEX as u32);
+    attr(&mut p, RTA_CACHEINFO, &[0u8; 32]);
+    attr(&mut p, RTA_PREF, &[0]);
+    put_msg(out, RTM_NEWROUTE, flags, seq, me, &p);
+}
+
+/// 1 つの IPv6 の道 (inet6_rtm_getroute): ::1 のほかは、まだ道がないので ENETUNREACH
+fn get_route6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+    if body.len() < 12 {
+        return crate::why::inval();
+    }
+    let a = attrs_of(&body[12..]);
+    let dst = a.get(&RTA_DST).filter(|v| v.len() >= 16).map_or(0, |v| u128::from_be_bytes(v[..16].try_into().unwrap()));
+    if dst != 1 {
+        return -ENETUNREACH;
+    }
+    let mut d = Vec::new();
+    put_route6(&mut d, true, 0, seq, me);
     out.push(d);
     0
 }
