@@ -4,6 +4,7 @@
 //   aios の中で: sudo ./nfteval NFT P1 P2 P3
 //   Linux で: LINUX_NET=P1,P2 LINUX_FILES="nft=NFT" test/linux-vm.sh rootexec latest test/bin/nfteval /nft P1 P2 P3
 //   aios の VM: AIOS_FWD=P1,P2 test/vm.py start (bin/run.sh が hostfwd を足す)
+//   中どうしだけなら: LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net nfteval /nft 0 0 0
 //   P1 か P3 を 0 にすると、それを使うもの (外を一回りするもの、外のだれもいないポート) はしない (vm-ctests)
 // 道:
 //   - 中どうし (lo): 127.0.0.1 と eth0 のアドレス (10.0.2.15) への TCP の connect と UDP
@@ -532,6 +533,9 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1)
         nft = argv[1];
+    // 手本の Linux は /nft (LINUX_FILES)、aios は /opt/c/bin/nft: あるほうを (test/ldiff.sh で同じ引数で動かせる)
+    if (access(nft, X_OK) != 0)
+        nft = access("/opt/c/bin/nft", X_OK) == 0 ? "/opt/c/bin/nft" : "/nft";
     if (access(nft, X_OK) != 0) {
         printf("nfteval: no %s (skipped)\n", nft);
         return 0;

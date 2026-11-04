@@ -3,8 +3,9 @@
 // nf_reject_ipv4.c (nf_send_reset、nf_send_unreach)、icmp.c (__icmp_send、icmp_unreach)、nf_log_syslog.c
 // (nf_log_ip_packet) と同じ形と答え。
 //
-// - パケット (Pkt): IPv4 の頭から tot_len まで、受けたものならリンク層の頭 (Ethernet の 14 バイト)、口 (lo 1、eth0 2)、
-//   mark、priority、ソケットの持ち主 (meta skuid / skgid)
+// - パケット (Pkt): IPv4 か IPv6 の頭から終わりまで、受けたものならリンク層の頭 (Ethernet の 14 バイト)、口 (lo 1、
+//   eth0 2)、mark、priority、ソケットの持ち主 (meta skuid / skgid)。IPv6 は nf_reject_ipv6.c (nf_send_reset6、
+//   nf_send_unreach6)、icmp.c の icmp6_send、nf_log_syslog.c の dump_ipv6_packet も (aios の中の ::1: inet.rs)
 // - 道 (path):
 //   - eth0 から来たもの (net.rs の受け): PRE_ROUTING (iif eth0)、aios あて (自分のアドレス、ブロードキャスト、マルチ
 //     キャスト) なら LOCAL_IN。ほかの口へは送らない (ip_forward は 0) ので FORWARD はない
@@ -50,7 +51,7 @@ pub const ACK: u8 = 0x10;
 
 /// 決まりを通るパケット
 pub struct Pkt<'a> {
-    /// IPv4 の頭から tot_len まで
+    /// IPv4 の頭から tot_len まで、か IPv6 の頭から payload_len まで
     pub ip: &'a mut [u8],
     /// 受けたもの: リンク層の頭 (Ethernet の 14 バイト。lo では 0 の MAC と 0x0800)
     pub ll: Option<&'a [u8]>,
@@ -66,9 +67,16 @@ pub struct Pkt<'a> {
 }
 
 impl Pkt<'_> {
-    /// 頭がおかしくないか (nft_set_pktinfo_ipv4_validate)
+    /// IPv6 のパケットか
+    pub fn v6(&self) -> bool {
+        !self.ip.is_empty() && self.ip[0] >> 4 == 6
+    }
+    /// 頭がおかしくないか (nft_set_pktinfo_ipv4_validate と nft_set_pktinfo_ipv6_validate)
     pub fn valid(&self) -> bool {
         let ip = &*self.ip;
+        if self.v6() {
+            return ip.len() >= 40 && 40 + u16::from_be_bytes([ip[4], ip[5]]) as usize <= ip.len() && v6_l4(ip).is_some();
+        }
         if ip.len() < 20 || ip[0] >> 4 != 4 || ip[0] & 15 < 5 {
             return false;
         }
@@ -80,17 +88,52 @@ impl Pkt<'_> {
         self.ip.len()
     }
     pub fn thoff(&self) -> usize {
+        if self.v6() {
+            return v6_l4(self.ip).map_or(40, |x| x.0);
+        }
         (self.ip[0] & 15) as usize * 4
     }
     pub fn tprot(&self) -> u8 {
+        if self.v6() {
+            return v6_l4(self.ip).map_or(0, |x| x.1);
+        }
         self.ip[9]
     }
     pub fn fragoff(&self) -> u16 {
+        if self.v6() {
+            return v6_l4(self.ip).map_or(0, |x| x.2);
+        }
         u16::from_be_bytes([self.ip[6], self.ip[7]]) & 0x1fff
     }
     pub fn daddr(&self) -> u32 {
         be32(&self.ip[16..20])
     }
+}
+
+/// IPv6 の拡張ヘッダ (hop-by-hop、routing、destination、fragment、AH) をとばした上の層 (ipv6_find_hdr):
+/// (その場所, protocol, 断片の位置 (8 バイトの数)。はじめの断片でなければ上の層はない)
+pub fn v6_l4(ip: &[u8]) -> Option<(usize, u8, u16)> {
+    let mut nh = *ip.get(6)?;
+    let mut off = 40;
+    for _ in 0..8 {
+        match nh {
+            0 | 43 | 60 | 51 => {
+                let hl = if nh == 51 { (*ip.get(off + 1)? as usize + 2) * 4 } else { (*ip.get(off + 1)? as usize + 1) * 8 };
+                nh = *ip.get(off)?;
+                off += hl;
+            }
+            44 => {
+                let fo = u16::from_be_bytes([*ip.get(off + 2)?, *ip.get(off + 3)?]) >> 3;
+                nh = *ip.get(off)?;
+                off += 8;
+                if fo != 0 {
+                    return Some((off, nh, fo));
+                }
+            }
+            _ => break,
+        }
+    }
+    (off <= ip.len()).then_some((off, nh, 0))
 }
 
 fn be32(b: &[u8]) -> u32 {
@@ -164,6 +207,7 @@ pub fn lo(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32) -> Pa
 }
 
 const LO_LL: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0];
+const LO_LL6: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x86, 0xdd];
 
 fn lo_depth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32, ct: Ct, depth: u32) -> Path {
     let r = {
@@ -173,7 +217,8 @@ fn lo_depth(ip: &mut [u8], sk: Option<(u32, u32)>, mark: u32, priority: u32, ct:
         } else {
             // lo をとおっても mark と priority とつながりはそのまま (loopback_xmit)。ソケットは外れる (skb_orphan)
             let (mark, priority, ct) = (p.mark, p.priority, core::mem::take(&mut p.ct));
-            let mut p = Pkt { ip: &mut *ip, ll: Some(&LO_LL), iif: IF_LO, oif: 0, mark, priority, sk: None, pkttype: PACKET_HOST, ct };
+            let ll: &[u8] = if ip[0] >> 4 == 6 { &LO_LL6 } else { &LO_LL };
+            let mut p = Pkt { ip: &mut *ip, ll: Some(ll), iif: IF_LO, oif: 0, mark, priority, sk: None, pkttype: PACKET_HOST, ct };
             hooks(&[PRE_ROUTING, LOCAL_IN], &mut p).map(|d| (d, false, p.mark, conntrack::attach(&mut p.ct)))
         }
     };
@@ -484,6 +529,165 @@ pub fn udp(src: u32, sport: u16, dst: u32, dport: u16, data: &[u8], tos: u8, ttl
     b
 }
 
+// ---- IPv6 ----
+
+/// 送り元とあて先 (IPv4 か IPv6)
+#[derive(Clone, Copy)]
+pub enum Ends {
+    V4(u32, u32),
+    V6(u128, u128),
+}
+
+/// IPv6 の頭 (40 バイト: 版、traffic class、flow label、payload の長さ、次の頭、hop limit、送り元、あて先)
+#[allow(clippy::too_many_arguments)]
+pub fn ip6hdr(b: &mut Vec<u8>, tclass: u8, flow: u32, plen: usize, nh: u8, hop: u8, src: u128, dst: u128) {
+    let w = (6u32 << 28) | ((tclass as u32) << 20) | (flow & 0xfffff);
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&(plen as u16).to_be_bytes());
+    b.extend_from_slice(&[nh, hop]);
+    b.extend_from_slice(&src.to_be_bytes());
+    b.extend_from_slice(&dst.to_be_bytes());
+}
+
+/// IPv6 の疑似ヘッダつきのチェックサム (送り元、あて先、上の層の長さ、次の頭)
+fn l4sum6(src: u128, dst: u128, proto: u8, seg: &[u8]) -> u16 {
+    let mut ph = [0u8; 40];
+    ph[0..16].copy_from_slice(&src.to_be_bytes());
+    ph[16..32].copy_from_slice(&dst.to_be_bytes());
+    ph[32..36].copy_from_slice(&(seg.len() as u32).to_be_bytes());
+    ph[39] = proto;
+    csum_fold(csum_add(csum_add(0, &ph), seg))
+}
+
+/// lo の IPv6 のパケットの flow label (Linux は自分で作る: ip6_make_flowlabel のハッシュ。ここではポートから)
+fn flow6(sport: u16, dport: u16) -> u32 {
+    let h = (sport as u32).wrapping_mul(0x9e37_79b1) ^ (dport as u32).wrapping_mul(0x85eb_ca6b);
+    (h ^ (h >> 13)) & 0xfffff | 1
+}
+
+/// TCP のパケット (IPv4 か IPv6)。IPv6 は tos が traffic class、ttl が hop limit (id は使わない)
+#[allow(clippy::too_many_arguments)]
+pub fn tcp_ends(e: Ends, sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, win: u16, opts: &[u8], tos: u8, ttl: u8, id: u16, data: &[u8]) -> Vec<u8> {
+    let (src6, dst6) = match e {
+        Ends::V4(s, d) => return tcp_data(s, sport, d, dport, seq, ack, flags, win, opts, tos, ttl, id, data),
+        Ends::V6(s, d) => (s, d),
+    };
+    let hl = 20 + opts.len();
+    let mut b = Vec::with_capacity(40 + hl + data.len());
+    ip6hdr(&mut b, tos, flow6(sport, dport), hl + data.len(), PROTO_TCP, ttl, src6, dst6);
+    b.extend_from_slice(&sport.to_be_bytes());
+    b.extend_from_slice(&dport.to_be_bytes());
+    b.extend_from_slice(&seq.to_be_bytes());
+    b.extend_from_slice(&ack.to_be_bytes());
+    b.extend_from_slice(&[((hl / 4) as u8) << 4, flags]);
+    b.extend_from_slice(&win.to_be_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(opts);
+    b.extend_from_slice(data);
+    let c = l4sum6(src6, dst6, PROTO_TCP, &b[40..]);
+    b[56..58].copy_from_slice(&c.to_be_bytes());
+    b
+}
+
+/// UDP のパケット (IPv4 か IPv6)
+#[allow(clippy::too_many_arguments)]
+pub fn udp_ends(e: Ends, sport: u16, dport: u16, data: &[u8], tos: u8, ttl: u8, id: u16, df: bool) -> Vec<u8> {
+    let (src6, dst6) = match e {
+        Ends::V4(s, d) => return udp(s, sport, d, dport, data, tos, ttl, id, df),
+        Ends::V6(s, d) => (s, d),
+    };
+    let mut b = Vec::with_capacity(48 + data.len());
+    ip6hdr(&mut b, tos, flow6(sport, dport), 8 + data.len(), PROTO_UDP, ttl, src6, dst6);
+    b.extend_from_slice(&sport.to_be_bytes());
+    b.extend_from_slice(&dport.to_be_bytes());
+    b.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(data);
+    let mut c = l4sum6(src6, dst6, PROTO_UDP, &b[40..]);
+    if c == 0 {
+        c = 0xffff;
+    }
+    b[46..48].copy_from_slice(&c.to_be_bytes());
+    b
+}
+
+/// ICMPv6 の到達不能を errno に (icmpv6_err_convert の tab_unreach: (errno, 致命か))
+pub fn icmp6_errno(code: u8) -> (i64, bool) {
+    match code {
+        0 => (101, false),
+        1 => (13, true),
+        2 | 3 => (113, false),
+        4 => (111, true),
+        5 | 6 => (13, true),
+        _ => (113, false),
+    }
+}
+
+/// 返ってきたものが ICMPv6 の到達不能なら (type 1、code)
+pub fn icmp6_of(r: &[u8]) -> Option<u8> {
+    (r.len() >= 48 && r[0] >> 4 == 6 && r[6] == 58 && r[40] == 1).then(|| r[41])
+}
+
+/// IPv6 の reject の返すもの (nf_send_reset6 と nf_send_unreach6 → icmp6_send)。返せないもの (RST への RST、ICMPv6
+/// のエラーへのエラー、multicast、はじめでない断片) は None
+fn reply6(ip: &[u8], rj: Reject) -> Option<Vec<u8>> {
+    let (thoff, proto, frag) = v6_l4(ip)?;
+    let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+    let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+    if dst >> 120 == 0xff {
+        return None;
+    }
+    if rj.rst {
+        // nf_reject_ip6_tcphdr_get: TCP、はじめの断片、RST には返さない
+        if proto != PROTO_TCP || frag != 0 || ip.len() < thoff + 20 {
+            return None;
+        }
+        let th = &ip[thoff..];
+        let flags = th[13];
+        if flags & RST != 0 {
+            return None;
+        }
+        let doff = (th[12] >> 4) as usize * 4;
+        let dlen = (ip.len() - thoff).saturating_sub(doff) as u32;
+        let (seq, ack, fl) = if flags & ACK != 0 {
+            (be32(&th[8..12]), 0, RST)
+        } else {
+            (0, be32(&th[4..8]).wrapping_add(dlen).wrapping_add((flags & SYN != 0) as u32).wrapping_add((flags & FIN != 0) as u32), RST | ACK)
+        };
+        let sport = be16(&th[2..4]);
+        let dport = be16(&th[0..2]);
+        // nf_reject_ip6hdr_put: traffic class 0、flow label 0、hop limit は口の (64)
+        let mut b = Vec::with_capacity(60);
+        ip6hdr(&mut b, 0, 0, 20, PROTO_TCP, 64, dst, src);
+        b.extend_from_slice(&sport.to_be_bytes());
+        b.extend_from_slice(&dport.to_be_bytes());
+        b.extend_from_slice(&seq.to_be_bytes());
+        b.extend_from_slice(&ack.to_be_bytes());
+        b.extend_from_slice(&[5 << 4, fl, 0, 0, 0, 0, 0, 0]);
+        let c = l4sum6(dst, src, PROTO_TCP, &b[40..]);
+        b[56..58].copy_from_slice(&c.to_be_bytes());
+        return Some(b);
+    }
+    // ICMPv6 のエラー (type < 128) には返さない
+    if proto == 58 && ip.len() > thoff && ip[thoff] < 128 {
+        return None;
+    }
+    // icmp6_send: もとのパケットを IPv6 の最小の MTU (1280) に入るまで
+    let keep = ip.len().min(1280 - 48);
+    let mut b = Vec::with_capacity(48 + keep);
+    ip6hdr(&mut b, 0, 0, 8 + keep, 58, 64, dst, src);
+    b.extend_from_slice(&[1, rj.code, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&ip[..keep]);
+    let c = l4sum6(dst, src, 58, &b[40..]);
+    b[42..44].copy_from_slice(&c.to_be_bytes());
+    Some(b)
+}
+
+/// カーネルが返す ICMPv6 の到達不能 (だれもいない UDP の port unreachable など)
+pub fn kernel_unreach6(ip: &mut [u8], code: u8) -> Option<Vec<u8>> {
+    reply6(ip, Reject { rst: false, code })
+}
+
 /// aios のアドレスか (送り元を決めるため: 127.0.0.0/8 と eth0 のもの)
 pub fn is_local(a: u32) -> bool {
     a >> 24 == 127 || (a != 0 && a == crate::net::eth_addr())
@@ -516,6 +720,9 @@ pub fn nexthop(daddr: u32, oif: u32) -> u32 {
 /// ものなら 0)
 fn reply(ip: &[u8], rj: Reject, hook: u32, iif: u32, pkttype: u8, mark: u32) -> Option<Vec<u8>> {
     let _ = mark;
+    if ip[0] >> 4 == 6 {
+        return reply6(ip, rj);
+    }
     let ihl = (ip[0] & 15) as usize * 4;
     let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff;
     if frag != 0 {
@@ -711,7 +918,113 @@ fn dotted(a: &[u8]) -> String {
     alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
 }
 
+/// TCP の頭 (nf_log_dump_tcp_header: IPv4 と IPv6 で同じ)。frag ならはじめの断片でない
+fn log_tcp(m: &mut String, rest: &[u8], frag: bool, flags: u32) {
+    m.push_str("PROTO=TCP ");
+    if frag {
+        return;
+    }
+    if rest.len() < 20 {
+        let _ = write!(m, "INCOMPLETE [{} bytes] ", rest.len());
+        return;
+    }
+    let th = rest;
+    let _ = write!(m, "SPT={} DPT={} ", be16(&th[0..2]), be16(&th[2..4]));
+    if flags & NF_LOG_TCPSEQ != 0 {
+        let _ = write!(m, "SEQ={} ACK={} ", be32(&th[4..8]), be32(&th[8..12]));
+    }
+    let _ = write!(m, "WINDOW={} ", be16(&th[14..16]));
+    let _ = write!(m, "RES=0x{:02x} ", ((be32(&th[12..16]) & 0x0f00_0000) >> 22) as u8);
+    let f = th[13];
+    for (bit, name) in [(0x80, "CWR "), (0x40, "ECE "), (0x20, "URG "), (ACK, "ACK "), (PSH, "PSH "), (RST, "RST "), (SYN, "SYN "), (FIN, "FIN ")] {
+        if f & bit != 0 {
+            m.push_str(name);
+        }
+    }
+    let _ = write!(m, "URGP={} ", be16(&th[18..20]));
+    let doff = (th[12] >> 4) as usize * 4;
+    if flags & NF_LOG_TCPOPT != 0 && doff > 20 && th.len() >= doff {
+        m.push_str("OPT (");
+        for b in &th[20..doff] {
+            let _ = write!(m, "{:02X}", b);
+        }
+        m.push_str(") ");
+    }
+}
+
+/// UDP の頭 (nf_log_dump_udp_header)
+fn log_udp(m: &mut String, rest: &[u8], frag: bool) {
+    m.push_str("PROTO=UDP ");
+    if frag {
+        return;
+    }
+    if rest.len() < 8 {
+        let _ = write!(m, "INCOMPLETE [{} bytes] ", rest.len());
+        return;
+    }
+    let _ = write!(m, "SPT={} DPT={} LEN={} ", be16(&rest[0..2]), be16(&rest[2..4]), be16(&rest[4..6]));
+}
+
+/// IPv6 のパケット (dump_ipv6_packet: SRC と DST は 8 つの 4 桁、LEN は頭もふくめて、TC、HOPLIMIT、FLOWLBL。拡張
+/// ヘッダをとばして上の層)
+fn dump_ip6(m: &mut String, ip: &[u8], depth: u32, flags: u32) {
+    if ip.len() < 40 {
+        let _ = write!(m, "TRUNCATED");
+        return;
+    }
+    let a6 = |b: &[u8]| (0..8).map(|i| alloc::format!("{:04x}", be16(&b[i * 2..i * 2 + 2]))).collect::<Vec<_>>().join(":");
+    let w = be32(&ip[0..4]);
+    let _ = write!(m, "SRC={} DST={} ", a6(&ip[8..24]), a6(&ip[24..40]));
+    let _ = write!(m, "LEN={} TC={} HOPLIMIT={} FLOWLBL={} ", be16(&ip[4..6]) as usize + 40, (w & 0x0ff0_0000) >> 20, ip[7], w & 0xfffff);
+    let Some((thoff, proto, fo)) = v6_l4(ip) else { return };
+    if fo != 0 {
+        let _ = write!(m, "FRAG:{} ", (fo as u32) << 3);
+    }
+    let rest = ip.get(thoff..).unwrap_or(&[]);
+    match proto {
+        PROTO_TCP => log_tcp(m, rest, fo != 0, flags),
+        PROTO_UDP => log_udp(m, rest, fo != 0),
+        58 => {
+            m.push_str("PROTO=ICMPv6 ");
+            if fo != 0 {
+                return;
+            }
+            if rest.len() < 8 {
+                let _ = write!(m, "INCOMPLETE [{} bytes] ", rest.len());
+                return;
+            }
+            let (ty, c) = (rest[0], rest[1]);
+            let _ = write!(m, "TYPE={} CODE={} ", ty, c);
+            match ty {
+                128 | 129 => {
+                    let _ = write!(m, "ID={} SEQ={} ", be16(&rest[4..6]), be16(&rest[6..8]));
+                }
+                1..=4 => {
+                    if ty == 4 {
+                        let _ = write!(m, "POINTER={:08x} ", be32(&rest[4..8]));
+                    }
+                    if depth == 0 {
+                        m.push('[');
+                        dump_ip6(m, &rest[8..], depth + 1, flags);
+                        m.push_str("] ");
+                    }
+                    if ty == 2 {
+                        let _ = write!(m, "MTU={} ", be32(&rest[4..8]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        p => {
+            let _ = write!(m, "PROTO={} ", p);
+        }
+    }
+}
+
 fn dump_ip(m: &mut String, ip: &[u8], depth: u32, flags: u32) {
+    if !ip.is_empty() && ip[0] >> 4 == 6 {
+        return dump_ip6(m, ip, depth, flags);
+    }
     if ip.len() < 20 {
         let _ = write!(m, "TRUNCATED");
         return;
@@ -742,49 +1055,8 @@ fn dump_ip(m: &mut String, ip: &[u8], depth: u32, flags: u32) {
     }
     let rest = ip.get(ihl..).unwrap_or(&[]);
     match ip[9] {
-        PROTO_TCP => {
-            m.push_str("PROTO=TCP ");
-            if off != 0 {
-                return;
-            }
-            if rest.len() < 20 {
-                let _ = write!(m, "INCOMPLETE [{} bytes] ", rest.len());
-                return;
-            }
-            let th = rest;
-            let _ = write!(m, "SPT={} DPT={} ", be16(&th[0..2]), be16(&th[2..4]));
-            if flags & NF_LOG_TCPSEQ != 0 {
-                let _ = write!(m, "SEQ={} ACK={} ", be32(&th[4..8]), be32(&th[8..12]));
-            }
-            let _ = write!(m, "WINDOW={} ", be16(&th[14..16]));
-            let _ = write!(m, "RES=0x{:02x} ", ((be32(&th[12..16]) & 0x0f00_0000) >> 22) as u8);
-            let f = th[13];
-            for (bit, name) in [(0x80, "CWR "), (0x40, "ECE "), (0x20, "URG "), (ACK, "ACK "), (PSH, "PSH "), (RST, "RST "), (SYN, "SYN "), (FIN, "FIN ")] {
-                if f & bit != 0 {
-                    m.push_str(name);
-                }
-            }
-            let _ = write!(m, "URGP={} ", be16(&th[18..20]));
-            let doff = (th[12] >> 4) as usize * 4;
-            if flags & NF_LOG_TCPOPT != 0 && doff > 20 && th.len() >= doff {
-                m.push_str("OPT (");
-                for b in &th[20..doff] {
-                    let _ = write!(m, "{:02X}", b);
-                }
-                m.push_str(") ");
-            }
-        }
-        PROTO_UDP => {
-            m.push_str("PROTO=UDP ");
-            if off != 0 {
-                return;
-            }
-            if rest.len() < 8 {
-                let _ = write!(m, "INCOMPLETE [{} bytes] ", rest.len());
-                return;
-            }
-            let _ = write!(m, "SPT={} DPT={} LEN={} ", be16(&rest[0..2]), be16(&rest[2..4]), be16(&rest[4..6]));
-        }
+        PROTO_TCP => log_tcp(m, rest, off != 0, flags),
+        PROTO_UDP => log_udp(m, rest, off != 0),
         PROTO_ICMP => {
             m.push_str("PROTO=ICMP ");
             if off != 0 {

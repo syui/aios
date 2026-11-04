@@ -2677,7 +2677,7 @@ pub fn ct_on() -> bool {
 
 fn refresh_active() {
     let tables = &g().cur.tables;
-    let on = tables.iter().any(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET) && t.flags & NFT_TABLE_F_DORMANT == 0 && t.chains.iter().any(|c| c.base.is_some()));
+    let on = tables.iter().any(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) && t.flags & NFT_TABLE_F_DORMANT == 0 && t.chains.iter().any(|c| c.base.is_some()));
     ACTIVE.store(on, core::sync::atomic::Ordering::Relaxed);
     let exprs = || tables.iter().filter(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET)).flat_map(|t| t.chains.iter()).flat_map(|c| c.rules.iter()).flat_map(|r| r.exprs.iter());
     let ct = exprs().any(|e| matches!(e.op, Op::Ct { .. } | Op::CtSet(_)));
@@ -2688,7 +2688,8 @@ fn refresh_active() {
     }
 }
 
-/// 1 つのフック (IPv4): ip と inet の表の基の鎖を priority の順 (同じなら先に入れたもの) に。drop したらそこで
+/// 1 つのフック: IPv4 のパケットは ip と inet の表、IPv6 のものは ip6 と inet の表の基の鎖を priority の順 (同じなら
+/// 先に入れたもの) に。drop したらそこで。conntrack はまだ IPv4 だけ
 pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
     if !active() && !ct_on() {
         return Verdict::Accept;
@@ -2696,12 +2697,14 @@ pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
     let st = &mut g().cur;
     let mut list: Vec<(i32, u64, usize, usize)> = Vec::new();
     // conntrack: PRE_ROUTING と LOCAL_OUT の -200 (NF_IP_PRI_CONNTRACK) で見る。表は usize::MAX で印をつける
-    let ct = ct_on();
+    let v6 = p.v6();
+    let ct = ct_on() && !v6;
     if ct && matches!(h, 0 | 3) {
         list.push((-200, 0, usize::MAX, 0));
     }
+    let l3 = if v6 { NFPROTO_IPV6 } else { NFPROTO_IPV4 };
     for (ti, t) in st.tables.iter().enumerate() {
-        if !matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET) || t.flags & NFT_TABLE_F_DORMANT != 0 {
+        if !(t.family == l3 || t.family == NFPROTO_INET) || t.flags & NFT_TABLE_F_DORMANT != 0 {
             continue;
         }
         for (ci, c) in t.chains.iter().enumerate() {
@@ -2742,6 +2745,7 @@ fn do_chain(tb: &mut Table, base: usize, p: &mut Pkt, h: u32) -> Verdict {
     let Table { chains, sets, name, family, .. } = tb;
     let fam = match *family {
         NFPROTO_INET => "inet",
+        NFPROTO_IPV6 => "ip6",
         _ => "ip",
     };
     let mut r = Regs { d: [0; 80], code: NFT_CONTINUE, chain: None };
@@ -3069,7 +3073,7 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
                 10 => p.sk.map(|s| put32(d, dr, s.0)).is_some(),
                 11 => p.sk.map(|s| put32(d, dr, s.1)).is_some(),
                 15 => {
-                    put8(d, dr, NFPROTO_IPV4);
+                    put8(d, dr, if p.v6() { NFPROTO_IPV6 } else { NFPROTO_IPV4 });
                     true
                 }
                 16 => {
@@ -3248,11 +3252,13 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
             }
         }
         Op::Reject { typ, code } => {
-            // nft_reject_ipv4_eval / nft_reject_inet_eval (icmpx の番号は ICMP の番号に: nft_reject_icmp_code)
+            // nft_reject_ipv4_eval / nft_reject_ipv6_eval / nft_reject_inet_eval (icmpx の番号は ICMP か ICMPv6 の
+            // 番号に: nft_reject_icmp_code と nft_reject_icmpv6_code)
+            let icmpx: [u8; 4] = if p.v6() { [0, 4, 3, 1] } else { [0, 3, 1, 13] };
             *rj = match *typ {
                 0 => Some(Reject { rst: false, code: *code }),
                 1 => Some(Reject { rst: true, code: 0 }),
-                2 if family == NFPROTO_INET => Some(Reject { rst: false, code: [0, 3, 1, 13][(*code as usize).min(3)] }),
+                2 if family == NFPROTO_INET => Some(Reject { rst: false, code: icmpx[(*code as usize).min(3)] }),
                 _ => None,
             };
             r.code = NF_DROP;
@@ -3360,16 +3366,23 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
             }
         }
         Op::Rt { dreg, key } => {
-            // みち (dst) は PRE_ROUTING ではまだない。nexthop は IPv4 だけ
+            // みち (dst) は PRE_ROUTING ではまだない
             let oif = if p.oif != 0 { p.oif } else { p.iif };
             match *key {
-                1 if h != crate::nfhook::PRE_ROUTING => {
+                // NFT_RT_NEXTHOP4 は IPv4 のパケットだけ、NFT_RT_NEXTHOP6 は IPv6 (aios の IPv6 は ::1 だけ: あて先そのもの)
+                1 if h != crate::nfhook::PRE_ROUTING && !p.v6() => {
                     let gw = crate::nfhook::nexthop(p.daddr(), oif);
                     reg_at(&mut r.d, *dreg, 4).copy_from_slice(&gw.to_be_bytes());
                 }
+                2 if h != crate::nfhook::PRE_ROUTING && p.v6() && p.ip.len() >= 40 => {
+                    let d: [u8; 16] = p.ip[24..40].try_into().unwrap();
+                    reg_at(&mut r.d, *dreg, 16).copy_from_slice(&d);
+                }
+                // TCPMSS: 口の MTU から IP の頭 (20 か 40) と TCP の 20
                 3 if h != crate::nfhook::PRE_ROUTING => {
                     let mtu: u32 = if oif == crate::nfhook::IF_LO { 65536 } else { 1500 };
-                    put16(&mut r.d, *dreg, ((mtu - 40) as u16).to_ne_bytes());
+                    let iph: u32 = if p.v6() { 60 } else { 40 };
+                    put16(&mut r.d, *dreg, ((mtu - iph) as u16).to_ne_bytes());
                 }
                 _ => r.code = NFT_BREAK,
             }

@@ -153,7 +153,10 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1)
         nft = argv[1];
-    // nftables のパッケージが入っていなければ何もしない (ap -S nftables)
+    // nftables のパッケージが入っていなければ何もしない (ap -S nftables)。手本の Linux は /nft (LINUX_FILES)、aios は
+    // /opt/c/bin/nft: あるほうを (test/ldiff.sh で同じ引数で動かせる)
+    if (access(nft, X_OK) != 0)
+        nft = access("/opt/c/bin/nft", X_OK) == 0 ? "/opt/c/bin/nft" : "/nft";
     if (access(nft, X_OK) != 0) {
         printf("nftables: no %s (skipped)\n", nft);
         return 0;

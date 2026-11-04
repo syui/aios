@@ -915,6 +915,26 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     状態は、smoltcp と Linux の TCP のちがい (FIN の出しかたなど) がでるので数だけ
   - まだ: ctnetlink (conntrack -L の道具。/proc/net/nf_conntrack は読める)、helper (ftp など)、expectation、zone、
     label、event、ct count (connlimit)、NAT
+- IPv6 (段階 2b、IPv6 の段階 1 のあと): aios の中の ::1 の TCP と UDP も、IPv4 と同じく lo の 4 つのフックに通す。
+  パケットは Linux が lo に流すのと同じ IPv6 の頭 (traffic class、flow label、hop limit 64。MAC の型は 86dd)
+  - ip6 と inet の表が見る (ip の表は IPv6 を、ip6 の表は IPv4 を見ない。::ffff:127.0.0.1 へのものは IPv4 のパケット)。
+    `meta nfproto` は ipv6、`rt ip6 nexthop` はあて先、`rt tcpmss` は 60 を引く。L4 は拡張ヘッダー (hop-by-hop、
+    routing、destination、AH、fragment) をとばして見つける
+  - SYN は窓 65476 (SYN-ACK は 65464) と MSS 65476 のオプション (Linux の ::1 と同じ 80 バイト)
+  - reject: nf_send_reset6 の RST (traffic class 0、flow label 0、hop limit 64) と nf_send_unreach6 の ICMPv6 の
+    到達不能 (type 1、もとのものを 1232 バイトまで)。icmpx は IPv6 の code (no-route 0、port 4、host 3、admin 1)。
+    マルチキャストのあて先、RST、ICMPv6 のエラーには返さない。受けた側は icmpv6_err_convert の errno (no-route は
+    ENETUNREACH、admin と policy は EACCES (致命)、addr と beyond-scope は EHOSTUNREACH、port は ECONNREFUSED
+    (致命))。つなぐ TCP は致命のもので終わり (EACCES など)、UDP は connect したものに致命のものだけ。だれもいない UDP
+    へのカーネルの port unreachable も決まりの道を通る
+  - log: nf_log_ip6_packet と同じ行 (SRC= DST= は 4 けたの 16 進を 8 つ、LEN= TC= HOPLIMIT= FLOWLBL= PROTO= …)
+  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)、eth0 の IPv6
+  - 確かめかた: `test/nfteval6.c` (root で。11 の case: accept と counter、input の drop と reject (tcp reset、icmpv6 の
+    admin-prohibited・addr-unreachable・no-route、icmpx)、output の drop と reject、ip だけ・ip6 だけの表 (::1、
+    127.0.0.1、::ffff:127.0.0.1 へ)、inet の policy drop と nfproto、log)。
+    `LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root nfteval6 /nft` で手本の Linux 7.4-rc1 と 171 行同じ。
+    IPv4 の nfteval (中どうしだけ: `--root --net nfteval /nft 0 0 0` で 370 行) と nftables (457 行) も同じまま。
+    nfteval と nftables も、aios では nft が /opt/c/bin/nft にあればそれを使うので、ldiff に同じ引数で渡せる
 - AI が見る口 (aios だけ): /proc/ai/fw と aish-sys の `fw` ツール。root と wheel の人だけ
   - 基の鎖ごとに通った数と policy まで来た数、決まりごとに当たった数 (counter がなくても) とさいごに当たってからの時間と
     式 (nft --debug=netlink と同じ形: `[ payload load 2b @ transport header + 2 => reg 1 ] [ cmp eq reg 1 0x00001600 ]`)、
@@ -926,7 +946,7 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     icmp、フラグ) で、パケットを流さずに、いまの決まり (写したもの) にとおして、鎖と決まりごとに「どの式で外れたか、
     どの判定か」と答え (/proc/ai/fw の trace の行)。counter も limit も conntrack も変えない。つながらない・届かない
     わけを、AI がパケットを送らずに探せる
-- そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 (aios に IPv6 ができてから)
+- そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 の conntrack と eth0 の IPv6 (aios の eth0 に IPv6 ができてから)
 
 Linux とのくらべかた: 手本の Linux (test/linux.config) に nf_tables と virtio-net を入れ、同じ nft の決まりで、同じ相手
 (QEMU のユーザーネットワークの 10.0.2.2) へのつなぎと受けの答え (つながる、ECONNREFUSED、時間切れ)、`nft -j list ruleset`、
@@ -1030,10 +1050,12 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - IPv6 の道 (段階 2a、rt6_fill_node と inet6_rtm_getroute): lo の local ::1 (IPV6_MULTIPLE_TABLES のない Linux と同じく
   表 254、proto kernel、metric 0、RTA_PREF 0)。dump は中身と DONE が別のデータグラム (strict なら NLM_F_DUMP_FILTERED)、
   1 つの道は ::1 なら RTA_PREFSRC ::1 つき、ほかは ENETUNREACH
-- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、raw と ICMPv6、IPv6 のファイアウォール (nftables の ip6 と inet の決まりは IPv6 のものを見ない) と conntrack
+- ファイアウォール (段階 2b): ::1 の TCP と UDP も lo の 4 つのフックに通す (上の「ファイアウォール (nftables)」の
+  IPv6)。ip6 と inet の決まり、reject の RST と ICMPv6、log が Linux と同じ
+- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、raw と ICMPv6、IPv6 の conntrack
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道)。Linux
-  7.4-rc1 と 185 行同じ。route、rtnl、netlink も同じまま
+  7.4-rc1 と 185 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c` (171 行同じ)
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 

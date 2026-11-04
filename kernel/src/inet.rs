@@ -6,7 +6,8 @@
 // v6 の欄 (rcv6 ...) があり、IPv4 とのやりとり (写した番地、:: で待つものへの IPv4) は v4 の欄でいつもの道を通る。
 // IPv6 だけのもの (v6) は v4 の欄が LOOPBACK4_IPV6 (127.0.0.6) で、v6only なので IPv4 からは見えない。ポートの表は
 // v4 と v6 で 1 つ (Linux の bhash)。IPv6 の番地は aios の中の ::1 だけ (eth0 の IPv6 はまだ: ほかは ENETUNREACH)。
-// ファイアウォール (nftables) と conntrack は IPv6 のものを見ない
+// ファイアウォール (nftables) は ::1 のものも IPv4 と同じく lo の 4 つのフックに通す (IPv6 の頭で)。conntrack はまだ
+// IPv6 を見ない
 //
 // Linux とちがうところ: aios の中どうし (127.0.0.0/8、eth0 のアドレス、0.0.0.0 あて) はパケットを作らない。TCP は
 // つないだ相手の受ける行列に送ったものをそのまま入れ、UDP は届け先のソケットの行列に入れる (Linux は lo をとおして
@@ -777,6 +778,17 @@ fn name_of(s: &Inet, a4: u32, a6: u128, port: u16) -> Vec<u8> {
     if s.family == AF_INET6 { sockaddr6(a6, port).to_vec() } else { sockaddr(a4, port).to_vec() }
 }
 
+/// lo の決まりに通すパケットの送り元とあて先 (IPv6 のつながりなら v6 の欄)。rev は相手からのもの
+fn ends(s: &Inet, rev: bool) -> crate::nfhook::Ends {
+    use crate::nfhook::Ends;
+    match (s.v6, rev) {
+        (true, false) => Ends::V6(s.saddr6, s.daddr6),
+        (true, true) => Ends::V6(s.daddr6, s.saddr6),
+        (false, false) => Ends::V4(s.saddr, s.daddr),
+        (false, true) => Ends::V4(s.daddr, s.saddr),
+    }
+}
+
 /// bind で決めていないアドレスを手放す (Linux の inet_reset_saddr: v6 の欄も)
 fn reset_saddr(s: &mut Inet) {
     s.saddr = 0;
@@ -1326,10 +1338,14 @@ fn syn(u: &InetRef, in_call: bool) {
     // IPv6 のループバックの MSS と窓
     let (adv, half_client) = if v6 { (adv_mss6 as fn(i32) -> i32, HALF_WND_CLIENT6) } else { (adv_mss as fn(i32) -> i32, HALF_WND_CLIENT) };
     // ファイアウォール (lo の 4 つのフック): Linux が lo に流す SYN と同じもの。落ちれば届かなかった SYN と同じく
-    // やりなおす (reject の RST や ICMP が届けば、それで終わる)。IPv6 のものはまだ見ない
-    let fw = netns == 0 && crate::nfhook::active() && !v6;
+    // やりなおす (reject の RST や ICMP が届けば、それで終わる)。IPv6 のものは IPv6 の頭で
+    let fw = netns == 0 && crate::nfhook::active();
     let isn = if fw { crate::rand::u32() } else { 0 };
-    if fw && !fw_tcp(Some(u), saddr, sport, daddr, dport, crate::nfhook::SYN, isn, 0, adv_mss(my_mss) as u16, in_call) {
+    let (fwd, back) = {
+        let s = u.borrow();
+        (ends(&s, false), ends(&s, true))
+    };
+    if fw && !fw_tcp(Some(u), fwd, sport, dport, crate::nfhook::SYN, isn, 0, adv(my_mss) as u16, in_call) {
         if u.borrow().state == St::SynSent {
             syn_lost(u);
         }
@@ -1348,7 +1364,7 @@ fn syn(u: &InetRef, in_call: bool) {
     let found = if v6 { lookup_listener6(netns, daddr6, dport) } else { lookup_listener(netns, daddr, dport) };
     let Some(l) = found else {
         // だれもいない: カーネルが返す RST (tcp_v4_send_reset) も決まりを通る。落ちれば SYN をやりなおす
-        if fw && !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::RST | crate::nfhook::ACK, 0, isn.wrapping_add(1), 0, false) {
+        if fw && !fw_tcp(None, back, dport, sport, crate::nfhook::RST | crate::nfhook::ACK, 0, isn.wrapping_add(1), 0, false) {
             syn_lost(u);
             return;
         }
@@ -1366,8 +1382,8 @@ fn syn(u: &InetRef, in_call: bool) {
     // SYN-ACK (listen しているほうから)。落ちれば SYN をやりなおす (返すものは listen しているほうへ: 見ない)
     let sisn = if fw { crate::rand::u32() } else { 0 };
     if fw {
-        let theirs = adv_mss(l.borrow().user_mss) as u16;
-        if !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::SYN | crate::nfhook::ACK, sisn, isn.wrapping_add(1), theirs, false) {
+        let theirs = adv(l.borrow().user_mss) as u16;
+        if !fw_tcp(None, back, dport, sport, crate::nfhook::SYN | crate::nfhook::ACK, sisn, isn.wrapping_add(1), theirs, false) {
             syn_lost(u);
             return;
         }
@@ -1486,9 +1502,9 @@ fn ct_seg(u: &InetRef, flags: u8) {
     if !nfhook::active() {
         return;
     }
-    let (src, sport, dst, dport, seq, tos, ttl, peer, sk, prio) = {
+    let (e, sport, dport, seq, tos, ttl, peer, sk, prio) = {
         let s = u.borrow();
-        (s.saddr, s.sport, s.daddr, s.dport, s.ct_seq, s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, upgrade(&s.peer), (s.uid, s.gid), s.priority)
+        (ends(&s, false), s.sport, s.dport, s.ct_seq, ip_tos(&s), ip_ttl(&s), upgrade(&s.peer), (s.uid, s.gid), s.priority)
     };
     if seq == 0 {
         return;
@@ -1499,7 +1515,7 @@ fn ct_seg(u: &InetRef, flags: u8) {
     let mut opt = [1u8, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
     opt[4..8].copy_from_slice(&ts.to_be_bytes());
     opt[8..12].copy_from_slice(&ts.to_be_bytes());
-    let mut pkt = nfhook::tcp(src, sport, dst, dport, seq, ack, fl, 512, &opt, tos, ttl, 0);
+    let mut pkt = nfhook::tcp_ends(e, sport, dport, seq, ack, fl, 512, &opt, tos, ttl, 0, &[]);
     let _ = nfhook::lo(&mut pkt, Some(sk), 0, prio);
     if flags & nfhook::FIN != 0 {
         u.borrow_mut().ct_seq = seq.wrapping_add(1);
@@ -1520,23 +1536,30 @@ fn syn_lost(u: &InetRef) {
 /// 中どうしの TCP の 1 つのパケット (SYN、SYN-ACK、RST) を、Linux が lo に流すものと同じ形で lo の決まりに通す。
 /// 通れば true。落ちて返すもの (reject の RST か ICMP) が届けば、送った側 (from) にそれを当てる
 #[allow(clippy::too_many_arguments)]
-fn fw_tcp(from: Option<&InetRef>, src: u32, sport: u16, dst: u32, dport: u16, flags: u8, seq: u32, ack: u32, mss: u16, in_call: bool) -> bool {
+fn fw_tcp(from: Option<&InetRef>, e: crate::nfhook::Ends, sport: u16, dport: u16, flags: u8, seq: u32, ack: u32, mss: u16, in_call: bool) -> bool {
     use crate::nfhook;
+    let v6 = matches!(e, nfhook::Ends::V6(..));
     let (tos, ttl, sk, prio) = match from {
         Some(u) => {
             let s = u.borrow();
-            (s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, Some((s.uid, s.gid)), s.priority)
+            (ip_tos(&s), ip_ttl(&s), Some((s.uid, s.gid)), s.priority)
         }
         None => (0, 64, None, 0),
     };
     let ts = (crate::timer::uptime_ns() / 1_000_000) as u32;
     let mut pkt = if flags & nfhook::SYN != 0 {
-        // SYN は窓 65495、SYN-ACK は 65483 (lo の MTU と既定の入れ物での Linux の値)。IP の id は SYN が乱数、ほかは 0
+        // SYN は窓 65495、SYN-ACK は 65483 (lo の MTU と既定の入れ物での Linux の値。IPv6 は 65476 と 65464)。IP の id は
+        // SYN が乱数、ほかは 0
         let opts = nfhook::syn_opts(mss, ts, if flags & nfhook::ACK != 0 { ts } else { 0 });
-        let (win, id) = if flags & nfhook::ACK != 0 { (65483, 0) } else { (65495, crate::rand::u32() as u16) };
-        nfhook::tcp(src, sport, dst, dport, seq, ack, flags, win, &opts, tos, ttl, id)
+        let (win, id) = match (flags & nfhook::ACK != 0, v6) {
+            (true, false) => (65483, 0),
+            (false, false) => (65495, crate::rand::u32() as u16),
+            (true, true) => (65464, 0),
+            (false, true) => (65476, 0),
+        };
+        nfhook::tcp_ends(e, sport, dport, seq, ack, flags, win, &opts, tos, ttl, id, &[])
     } else {
-        nfhook::tcp(src, sport, dst, dport, seq, ack, flags, 0, &[], tos, ttl, 0)
+        nfhook::tcp_ends(e, sport, dport, seq, ack, flags, 0, &[], tos, ttl, 0, &[])
     };
     let reply = match nfhook::lo(&mut pkt, sk, 0, prio) {
         nfhook::Path::Pass => return true,
@@ -1548,6 +1571,15 @@ fn fw_tcp(from: Option<&InetRef>, src: u32, sport: u16, dst: u32, dport: u16, fl
         }
     };
     if let (Some(u), Some(r)) = (from, reply) {
+        if r[0] >> 4 == 6 {
+            // ICMPv6 の到達不能 (tcp_v6_err) か RST
+            match nfhook::icmp6_of(&r) {
+                Some(code) => tcp_icmp(u, nfhook::icmp6_errno(code).0),
+                None if r.get(6) == Some(&58) => {}
+                None => tcp_reset(u),
+            }
+            return false;
+        }
         match nfhook::icmp_of(&r) {
             Some((3, code)) => tcp_icmp(u, nfhook::icmp_errno(code).0),
             Some(_) => {}
@@ -1555,6 +1587,16 @@ fn fw_tcp(from: Option<&InetRef>, src: u32, sport: u16, dst: u32, dport: u16, fl
         }
     }
     false
+}
+
+/// lo の決まりに通すパケットの TOS と TTL (IPv6 なら traffic class と hop limit)
+fn ip_tos(s: &Inet) -> u8 {
+    if s.v6 { s.tclass as u8 } else { s.tos }
+}
+
+fn ip_ttl(s: &Inet) -> u8 {
+    let t = if s.v6 { s.hops6 } else { s.uc_ttl };
+    if t < 0 { 64 } else { t as u8 }
 }
 
 /// ICMP の到達不能を受けた TCP (Linux の tcp_v4_err): つなぐところ (SYN_SENT、SYN_RECV) ならそのエラーで終わる。
@@ -2583,9 +2625,9 @@ fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
 /// つながりはこわれる (ECONNRESET)。ICMP はつながったものにはやわらかいエラーなので何もしない
 fn fw_data(u: &InetRef, seq: u32, seg: &[u8], urg: bool) -> bool {
     use crate::nfhook;
-    let (src, sport, dst, dport, tos, ttl, peer, sk, prio) = {
+    let (e, sport, dport, tos, ttl, peer, sk, prio) = {
         let s = u.borrow();
-        (s.saddr, s.sport, s.daddr, s.dport, s.tos, if s.uc_ttl < 0 { 64 } else { s.uc_ttl as u8 }, upgrade(&s.peer), (s.uid, s.gid), s.priority)
+        (ends(&s, false), s.sport, s.dport, ip_tos(&s), ip_ttl(&s), upgrade(&s.peer), (s.uid, s.gid), s.priority)
     };
     let ack = peer.as_ref().map_or(0, |p| p.borrow().ct_seq);
     let ts = (crate::timer::uptime_ns() / 1_000_000) as u32;
@@ -2594,13 +2636,13 @@ fn fw_data(u: &InetRef, seq: u32, seg: &[u8], urg: bool) -> bool {
     opt[8..12].copy_from_slice(&ts.to_be_bytes());
     let flags = nfhook::PSH | nfhook::ACK | if urg { 0x20 } else { 0 };
     // 中身も (payload の決まりのため)
-    let mut pkt = nfhook::tcp_data(src, sport, dst, dport, seq, ack, flags, 512, &opt, tos, ttl, 0, seg);
+    let mut pkt = nfhook::tcp_ends(e, sport, dport, seq, ack, flags, 512, &opt, tos, ttl, 0, seg);
     let reply = match nfhook::lo(&mut pkt, Some(sk), 0, prio) {
         nfhook::Path::Pass => return true,
         nfhook::Path::Out(r, _) | nfhook::Path::In(r, _) => r,
     };
     if let Some(r) = reply
-        && nfhook::icmp_of(&r).is_none()
+        && (if r[0] >> 4 == 6 { r.get(6) != Some(&58) } else { nfhook::icmp_of(&r).is_none() })
     {
         tcp_reset(u);
     }
@@ -3215,10 +3257,32 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
         return Err(-EPIPE);
     }
     let data = take(src, 0, len)?;
-    let (netns, sport, hops, tclass) = {
+    let (netns, sport, hops, tclass, sk, prio) = {
         let s = u.borrow();
-        (s.net, s.sport, if s.hops6 < 0 { 64 } else { s.hops6 as u8 }, s.tclass as u8)
+        (s.net, s.sport, if s.hops6 < 0 { 64 } else { s.hops6 as u8 }, s.tclass as u8, (s.uid, s.gid), s.priority)
     };
+    // ファイアウォール (lo の 4 つのフック、IPv6 の頭で)。出す側で落ちたら EPERM。返ってきた ICMPv6 の到達不能は
+    // connect したもので致命のものなら次に (__udp6_lib_err)
+    let fw = netns == 0 && crate::nfhook::active();
+    if fw {
+        use crate::nfhook;
+        let mut pkt = nfhook::udp_ends(nfhook::Ends::V6(src6, daddr), sport, dport, &data, tclass, hops, 0, false);
+        let (reply, out, why) = match nfhook::lo(&mut pkt, Some(sk), 0, prio) {
+            nfhook::Path::Pass => (None, false, None),
+            nfhook::Path::Out(r, w) => (r, true, Some(w)),
+            nfhook::Path::In(r, w) => (r, false, Some(w)),
+        };
+        if let Some(code) = reply.as_deref().and_then(nfhook::icmp6_of) {
+            udp6_icmp(u, daddr, dport, code);
+        }
+        if let Some(w) = why {
+            if out {
+                crate::why::firewall(&w.text());
+                return Err(-EPERM);
+            }
+            return Ok(len as i64);
+        }
+    }
     match udp_lookup6(netns, src6, sport, daddr, dport) {
         Some(r) => {
             let ts = udp_truesize(data.len());
@@ -3236,14 +3300,31 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             }
         }
         None => {
-            // __udp6_lib_err: port unreachable はかならず届く (harderr)。connect したものなら sk_err に
-            let mut s = u.borrow_mut();
-            if s.state == St::Established && s.v6 && s.daddr6 == daddr && s.dport == dport {
-                s.err = -ECONNREFUSED;
+            // だれもいない: カーネルの ICMPv6 の port unreachable (ファイアウォールがあれば、それも lo の道を通る)
+            if fw {
+                use crate::nfhook;
+                let mut pkt = nfhook::udp_ends(nfhook::Ends::V6(src6, daddr), sport, dport, &data, tclass, hops, 0, false);
+                if let Some(mut icmp) = nfhook::kernel_unreach6(&mut pkt, 4)
+                    && matches!(nfhook::lo(&mut icmp, None, 0, 0), nfhook::Path::Pass)
+                {
+                    udp6_icmp(u, daddr, dport, 4);
+                }
+            } else {
+                udp6_icmp(u, daddr, dport, 4);
             }
         }
     }
     Ok(len as i64)
+}
+
+/// ICMPv6 の到達不能を受けた UDP (__udp6_lib_err): 致命のもの (icmpv6_err_convert) で、connect した相手へのものなら
+/// sk_err に (IPV6_RECVERR のエラーの行列はまだ)
+fn udp6_icmp(u: &InetRef, daddr: u128, dport: u16, code: u8) {
+    let (errno, fatal) = crate::nfhook::icmp6_errno(code);
+    let mut s = u.borrow_mut();
+    if fatal && s.state == St::Established && s.v6 && s.daddr6 == daddr && s.dport == dport {
+        s.err = -errno;
+    }
 }
 
 fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
