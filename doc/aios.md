@@ -796,7 +796,7 @@ getifaddrs と if_nameindex も EAFNOSUPPORT でしくじっていた)。aibox �
 Linux と同じ nftables にする (nft の道具がそのまま動き、Linux の決まりのファイルがそのまま使える)。段階:
 
 - 段階 0 (できた): netlink (AF_NETLINK、kernel/src/netlink.rs) と NETLINK_ROUTE の口とアドレスの一覧 (RTM_GETLINK、
-  RTM_GETADDR の dump と 1 つの RTM_GETLINK)。getifaddrs、if_nameindex、node の os.networkInterfaces() などが動く。
+  RTM_GETADDR の dump と 1 つの RTM_GETLINK。道の RTM_GETROUTE はあとで: 下の「道の表」)。getifaddrs、if_nameindex、node の os.networkInterfaces() などが動く。
   ソケットのきまり (ポートは tgid から、bind、データグラムごとに受けて短ければ MSG_TRUNC、dump は中身と NLMSG_DONE の 2 つの
   データグラム、NLMSG_ERROR ともとのメッセージ、NETLINK_CAP_ACK、REQUEST のないものと短いものには答えない、root でなければ
   変える type は EPERM) は Linux 7.3.1 と同じ (test/netlink.c の 79 の答え)。口の番号は Linux と同じ lo 1、eth0 2 に
@@ -941,6 +941,41 @@ connect のポート) でかけられる。nftables は、システムぜんた�
 
 決めたこと (syui、2026-11-01): nft と同じ API にする (aios だけの小さな決まりは作らない)。conntrack (段階 3) も作る。
 外 (eth0) だけでなく、中どうし (lo) にもかける。
+
+### 道の表 (NETLINK_ROUTE の RTM_GETROUTE、ip route get)
+
+Firefox が「Network is offline」(services.settings の NetworkOfflineError) と言っていたわけ: Firefox の NetlinkService
+(netwerk/system/netlink) は、AF_PACKET の RTM_GETLINK・RTM_GETADDR・RTM_GETROUTE の dump のあと、ROUTE_CHECK の番地への
+道を 1 つの RTM_GETROUTE で聞き、答えが unicast で scope universe で RTA_OIF があるときだけ「つながっている」とする。
+aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も空だったので、ページは読めるのに link down だった。
+
+- 道は口のアドレスとゲートウェイから作る (kernel/src/netlink.rs の routes): Linux の fib_add_ifaddr と同じく、アドレス
+  ごとに local の /32、broadcast、網の道 (lo は local の 127.0.0.0/8、eth0 は main の 10.0.2.0/24 proto kernel scope
+  link src)、網の broadcast。DHCP のゲートウェイは ip=dhcp の ipconfig と同じ既定の道 (main、proto boot、scope
+  universe、prefsrc なし)。IP_MULTIPLE_TABLES のない Linux と同じく local (255) と main (254) は 1 つの trie: dump は
+  main を番地の順に、そのあと local (葉の中は長い prefix、同じなら表の番号の大きいもの)
+- dump (inet_dump_fib): 中身と NLMSG_DONE の 2 つのデータグラム。RTM_F_PREFIX は空。strict (NETLINK_GET_STRICT_CHK:
+  iproute2 の ip) なら ip_valid_fib_dump_req と同じたしかめ (頭の dst_len・src_len・tos・scope は 0、flags は
+  CLONED と PREFIX だけ、属性は RTA_TABLE と RTA_OIF だけ。しくじりは DONE の errno) と選びかた (表、protocol、type、
+  口。表は 255 のほかはみな main。CLONED は例外だけなので空)。strict ならいつも NLM_F_DUMP_FILTERED、選んだら DONE にも
+- 1 つの道 (inet_rtm_getroute、ip route get): ip_route_output_key_hash_rcu と同じ順で、RTA_SRC (multicast や
+  255.255.255.255 は EINVAL、自分のでなければ ENETUNREACH)、RTA_OIF (ない口は ENODEV。表で見つからなくても同じ網と
+  みなす)、宛先なし (127.0.0.1 の local)、いちばん長い prefix、local は lo から (prefsrc か宛先そのもの)、ほかは
+  prefsrc か inet_select_addr。__mkroute_output の 127.x を lo のほかから送るのは EINVAL、0.x.x.x は EINVAL、
+  255.255.255.255 は broadcast。答えは rt_fill_info: table 254、scope universe、protocol 0、RTM_F_CLONED と RTCF_LOCAL・
+  RTCF_BROADCAST (上の 16 ビット)、RTA_TABLE、DST、SRC、OIF、PREFSRC (src とちがえば)、GATEWAY、MARK、UID (呼んだ人)、
+  CACHEINFO。RTM_F_FIB_MATCH は当たった道を fib_dump_info で (table は 254、type は出ていく道の type)。strict は
+  inet_rtm_valid_getroute_req (長さは 0 か 32、table・protocol・scope・type は 0、属性は IIF OIF SRC DST IP_PROTO
+  SPORT DPORT MARK UID だけ)。入ってくる道 (RTA_IIF) はまだ (EOPNOTSUPP)
+- 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。aios は IPv6 を入れずに作った Linux と同じ
+  で、RTM_GETADDR と RTM_GETROUTE の dump は AF_INET のほかはみな rtnl_dump_all (AF_INET のもの)、RTM_GETLINK は
+  PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの RTM_GETROUTE は AF_INET だけ (ほかは EOPNOTSUPP)
+- ついでに SIOCGIFNAME (番号から名前: glibc と musl の if_indextoname)。前は ENOTTY だった
+- まだ: RTM_GETNEIGH (ARP の表: Firefox は network ID に使う。smoltcp の表は外から見えない)、道や口が変わったときの
+  組への知らせ (RTMGRP_IPV4_ROUTE など)、ip route add の RTM_NEWROUTE (いまは ioctl の SIOCADDRT で既定の道だけ)
+- 確かめかた: `test/ldiff.sh --net route` (手本の Linux は ip=dhcp の virtio-net で、aios の VM と同じ 10.0.2.15/24 と
+  ゲートウェイ 10.0.2.2。IPv6 のものは出さない)。dump (家族、strict の表えらび)、1 つの道 (19 の宛先と元と oif、
+  fibmatch、strict のしくじり)、Firefox と同じ問いあわせで link up。Linux 7.4-rc1 と 232 行同じ。ldiff に --net を足した
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 

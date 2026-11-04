@@ -1,6 +1,6 @@
 // ネットワークのインターフェースの ioctl (Linux と同じ番号と形。ソケットの fd に)
 //   見る:   SIOCGIFCONF (一覧) SIOCGIFFLAGS SIOCGIFADDR SIOCGIFNETMASK SIOCGIFBRDADDR
-//           SIOCGIFHWADDR (MAC) SIOCGIFMTU SIOCGIFINDEX
+//           SIOCGIFHWADDR (MAC) SIOCGIFMTU SIOCGIFINDEX SIOCGIFNAME (番号から名前: if_indextoname)
 //   変える: SIOCSIFADDR (0.0.0.0 なら DHCP にもどす) SIOCSIFNETMASK
 //           SIOCADDRT SIOCDELRT (デフォルトのゲートウェイだけ)  ← root だけ
 // struct ifreq は 名前 16 バイト + 中身 (sockaddr など) 24 バイト。インターフェースは lo (番号 1) と eth0 (2: netlink と
@@ -11,6 +11,7 @@ use crate::proc;
 use smoltcp::wire::Ipv4Address;
 
 const SIOCADDRT: u64 = 0x890b;
+const SIOCGIFNAME: u64 = 0x8910;
 const SIOCDELRT: u64 = 0x890c;
 const SIOCGIFCONF: u64 = 0x8912;
 const SIOCGIFFLAGS: u64 = 0x8913;
@@ -45,7 +46,7 @@ type R = Result<i64, i64>;
 pub fn handles(req: u64) -> bool {
     matches!(
         req,
-        SIOCADDRT | SIOCDELRT | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCSIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCSIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX
+        SIOCADDRT | SIOCDELRT | SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCSIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCSIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX
     )
 }
 
@@ -89,6 +90,17 @@ fn prefix_of(m: Ipv4Address) -> Option<u8> {
 }
 
 pub fn ioctl(req: u64, arg: usize) -> R {
+    if req == SIOCGIFNAME {
+        // dev_ifname: ifr_ifindex (中身の頭の int) の口の名前を ifr_name に。なければ ENODEV (lo はいつもある)
+        let mut r = [0u8; IFREQ];
+        copy_in(&mut r, arg)?;
+        let index = i32::from_le_bytes(r[16..20].try_into().unwrap());
+        let Some(l) = crate::netlink::links().into_iter().find(|l| l.index == index) else { return Err(-ENODEV) };
+        r[..16].fill(0);
+        r[..l.name.len()].copy_from_slice(l.name.as_bytes());
+        copy_out(arg, &r)?;
+        return Ok(0);
+    }
     if net::get().is_none() {
         return Err(-ENODEV);
     }

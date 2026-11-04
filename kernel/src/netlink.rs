@@ -1,6 +1,7 @@
 // netlink (AF_NETLINK): カーネルとプロセスが、メッセージ (struct nlmsghdr と属性 rtattr) でやりとりするソケット
 // (Linux の net/netlink/af_netlink.c と同じ形と答え)。NETLINK_ROUTE の口とアドレスの一覧 (rtnetlink.c の
-// RTM_GETLINK と RTM_GETADDR: musl や glibc の getifaddrs と if_nameindex、node の os.networkInterfaces()) と、
+// RTM_GETLINK と RTM_GETADDR: musl や glibc の getifaddrs と if_nameindex、node の os.networkInterfaces())、道の表
+// (RTM_GETROUTE: ip route get、Firefox の NetlinkService がつながっているかを見る。下の「道の表」) と、
 // NETLINK_NETFILTER の nftables (nftables.rs。doc/aios.md の「ファイアウォール (nftables)」)。
 //
 // - socket(AF_NETLINK, SOCK_RAW か SOCK_DGRAM, NETLINK_ROUTE か NETLINK_NETFILTER)。ほかの型は ESOCKTNOSUPPORT、
@@ -57,12 +58,14 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 /// これより大きい type は EOPNOTSUPP (RTM_MAX: 7.3 は RTM_NEWTUNNEL の次の組のおわり)
 const RTM_MAX: u16 = 123;
 
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
-const AF_PACKET: u8 = 17;
+const AF_BRIDGE: u8 = 7;
 
 // IFLA_* (if_link.h) と IFA_* (if_addr.h)
 const IFLA_ADDRESS: u16 = 1;
@@ -581,6 +584,7 @@ pub fn ack(req: &[u8], err: i64, cap_ack: bool, ext_ack: bool, off: Option<usize
 /// netlink_unicast と同じ)。me は送ったソケットのポート
 fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
     let cap_ack = n.borrow().opts & (1 << NETLINK_CAP_ACK) != 0;
+    let strict = n.borrow().opts & (1 << NETLINK_GET_STRICT_CHK) != 0;
     // nftables (nfnetlink の nf_tables)
     if n.borrow().protocol == crate::nftables::NETLINK_NETFILTER {
         let ext_ack = n.borrow().opts & (1 << NETLINK_EXT_ACK) != 0;
@@ -599,7 +603,7 @@ fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
         let flags = u16::from_le_bytes([msg[6], msg[7]]);
         let (mut err, mut dumped) = (0, false);
         if flags & NLM_F_REQUEST != 0 && typ >= NLMSG_MIN_TYPE {
-            (err, dumped) = route(msg, typ, flags, me, &mut out);
+            (err, dumped) = route(msg, typ, flags, me, strict, &mut out);
         }
         // dump は NLMSG_DONE で終わるので ACK はない (netlink_dump_start が -EINTR を返して skip)
         if !dumped && (flags & NLM_F_ACK != 0 || err != 0) {
@@ -613,16 +617,21 @@ fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
 }
 
 /// rtnetlink_rcv_msg: type の範囲、短いものは答えない、GET のほかは CAP_NET_ADMIN、dump か 1 つか。(負の errno か 0、
-/// dump したか)
-fn route(msg: &[u8], typ: u16, flags: u16, me: u32, out: &mut Vec<Vec<u8>>) -> (i64, bool) {
+/// dump したか)。strict は NETLINK_GET_STRICT_CHK
+fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> (i64, bool) {
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-    let r = route_msg(msg, typ, dump, me, out);
-    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR))
+    let r = route_msg(msg, typ, dump, me, strict, out);
+    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE))
 }
 
 /// out に答えのデータグラムを足す。dump は、中身があれば中身と NLMSG_DONE の 2 つ (Linux の netlink_dump は、dump が
-/// 中身を返すとまた呼び、なにもなくなったところで DONE を次のデータグラムに)、なければ DONE だけ
-fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+/// 中身を返すとまた呼び、なにもなくなったところで DONE を次のデータグラムに)、なければ DONE だけ。
+/// 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。aios は IPv6 を入れずに作った Linux と同じで、
+/// RTM_GETLINK は PF_BRIDGE (rtnl_bridge_getlink: ブリッジがないので空) のほかはみな口の一覧、RTM_GETADDR と
+/// RTM_GETROUTE の dump は AF_INET のほかは rtnl_dump_all (PF_PACKET をとばして AF_INET のもの)。だから AF_PACKET
+/// (Firefox の NetlinkService) でも AF_INET のアドレスと道が来る。1 つの RTM_GETROUTE は AF_INET だけ (ほかは
+/// PF_UNSPEC に doit がなく EOPNOTSUPP)
+fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> i64 {
     if typ > RTM_MAX {
         return -EOPNOTSUPP;
     }
@@ -640,7 +649,7 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, out: &mut Vec<Vec<u8>>) 
     match (typ, dump) {
         (RTM_GETLINK, true) => {
             let mut d = Vec::new();
-            if family == AF_UNSPEC || family == AF_PACKET {
+            if family != AF_BRIDGE {
                 for l in links() {
                     put_link(&mut d, &l, NLM_F_MULTI, seq, me);
                 }
@@ -666,25 +675,33 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, out: &mut Vec<Vec<u8>>) 
         }
         (RTM_GETADDR, true) => {
             let mut d = Vec::new();
-            if family == AF_UNSPEC || family == AF_INET {
-                for a in addrs() {
-                    put_addr(&mut d, &a, NLM_F_MULTI, seq, me);
-                }
+            for a in addrs() {
+                put_addr(&mut d, &a, NLM_F_MULTI, seq, me);
             }
             done(out, d, seq, me);
             0
         }
+        (RTM_GETROUTE, true) => {
+            dump_routes(body, strict, seq, me, out);
+            0
+        }
+        (RTM_GETROUTE, false) if family == AF_INET => get_route(body, strict, seq, me, out),
         _ => -EOPNOTSUPP,
     }
 }
 
 /// dump の中身 d (空でなければ 1 つのデータグラム) と、NLMSG_DONE のデータグラム
 fn done(out: &mut Vec<Vec<u8>>, d: Vec<u8>, seq: u32, me: u32) {
+    done_with(out, d, seq, me, 0, 0);
+}
+
+/// done に、DONE のフラグ (cb->answer_flags: NLM_F_DUMP_FILTERED) と dump のしくじり (dump_done_errno) を
+fn done_with(out: &mut Vec<Vec<u8>>, d: Vec<u8>, seq: u32, me: u32, flags: u16, err: i64) {
     if !d.is_empty() {
         out.push(d);
     }
     let mut e = Vec::new();
-    put_msg(&mut e, NLMSG_DONE, NLM_F_MULTI, seq, me, &0i32.to_le_bytes());
+    put_msg(&mut e, NLMSG_DONE, NLM_F_MULTI | flags, seq, me, &(err as i32).to_le_bytes());
     out.push(e);
 }
 
@@ -816,4 +833,448 @@ fn put_addr(out: &mut Vec<u8>, a: &Addr, flags: u16, seq: u32, me: u32) {
     ci.extend_from_slice(&0u32.to_le_bytes());
     attr(&mut p, IFA_CACHEINFO, &ci);
     put_msg(out, RTM_NEWADDR, flags, seq, me, &p);
+}
+
+// ---- 道の表 (RTM_GETROUTE: Linux の fib_frontend.c、fib_semantics.c、fib_trie.c と route.c) ----
+//
+// 道は口のアドレスとゲートウェイから作る (Linux の fib_add_ifaddr と、ip=dhcp の ipconfig が足す既定の道と同じもの)。
+// IP_MULTIPLE_TABLES のない Linux と同じく、local (255) の表は main (254) と 1 つの trie を分けあう: dump は main の
+// ものを番地の順に、そのあと local のものを。さがす (fib_lookup) のは両方をまとめて、いちばん長い prefix
+
+const RTA_DST: u16 = 1;
+const RTA_SRC: u16 = 2;
+const RTA_IIF: u16 = 3;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PREFSRC: u16 = 7;
+const RTA_CACHEINFO: u16 = 12;
+const RTA_TABLE: u16 = 15;
+const RTA_MARK: u16 = 16;
+const RTA_UID: u16 = 25;
+const RTA_IP_PROTO: u16 = 27;
+const RTA_SPORT: u16 = 28;
+const RTA_DPORT: u16 = 29;
+/// RTA_MAX (7.4: RTA_FLOWLABEL)
+const RTA_MAX: u16 = 31;
+const RTN_UNICAST: u8 = 1;
+const RTN_LOCAL: u8 = 2;
+const RTN_BROADCAST: u8 = 3;
+const RTN_MULTICAST: u8 = 5;
+const RT_SCOPE_LINK: u8 = 253;
+const RTPROT_KERNEL: u8 = 2;
+const RTPROT_BOOT: u8 = 3;
+const RT_TABLE_MAIN: u8 = 254;
+const RT_TABLE_LOCAL: u8 = 255;
+const RTM_F_NOTIFY: u32 = 0x100;
+const RTM_F_CLONED: u32 = 0x200;
+const RTM_F_PREFIX: u32 = 0x800;
+const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
+const RTM_F_FIB_MATCH: u32 = 0x2000;
+const RTCF_NOTIFY: u32 = 0x0001_0000;
+const RTCF_MULTICAST: u32 = 0x2000_0000;
+const RTCF_BROADCAST: u32 = 0x1000_0000;
+const RTCF_LOCAL: u32 = 0x8000_0000;
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
+const ENETUNREACH: i64 = 101;
+const EHOSTUNREACH: i64 = 113;
+const LOOPBACK: u32 = 0x7f00_0001;
+const LBCAST: u32 = 0xffff_ffff;
+
+/// 1 つの道 (fib_alias と fib_info)。番地はホストの順の u32 (0 はなし)
+#[derive(Clone, PartialEq)]
+pub struct Route {
+    pub table: u8,
+    pub typ: u8,
+    pub scope: u8,
+    pub proto: u8,
+    pub dst: u32,
+    pub len: u8,
+    pub prefsrc: u32,
+    pub gw: u32,
+    pub oif: i32,
+}
+
+fn mask(len: u8) -> u32 {
+    if len == 0 { 0 } else { u32::MAX << (32 - len as u32) }
+}
+
+fn is_multicast(a: u32) -> bool {
+    a & 0xf000_0000 == 0xe000_0000
+}
+
+/// 道の一覧 (trie の葉の順: 番地、そのなかで長い prefix、同じなら表の番号の大きいもの)
+pub fn routes() -> Vec<Route> {
+    let mut v: Vec<Route> = Vec::new();
+    let mut add = |r: Route| {
+        // fib_table_insert: まったく同じもの (NLM_F_APPEND でも) は足さない
+        if !v.contains(&r) {
+            v.push(r);
+        }
+    };
+    for a in addrs() {
+        let lo = a.index == LO_INDEX;
+        let addr = u32::from_be_bytes(a.addr);
+        let m = mask(a.prefix);
+        let prefix = addr & m;
+        // fib_magic: proto kernel、prefsrc は口のアドレス、LOCAL は scope host でほかは link、UNICAST だけ main
+        let magic = |typ: u8, dst: u32, len: u8| Route {
+            table: if typ == RTN_UNICAST { RT_TABLE_MAIN } else { RT_TABLE_LOCAL },
+            typ,
+            scope: if typ == RTN_LOCAL { RT_SCOPE_HOST } else { RT_SCOPE_LINK },
+            proto: RTPROT_KERNEL,
+            dst,
+            len,
+            prefsrc: addr,
+            gw: 0,
+            oif: a.index,
+        };
+        add(magic(RTN_LOCAL, addr, 32));
+        if let Some(b) = a.brd.map(u32::from_be_bytes).filter(|&b| b != 0 && b != LBCAST) {
+            add(magic(RTN_BROADCAST, b, 32));
+        }
+        if prefix != 0 && (prefix != addr || a.prefix < 32) {
+            add(magic(if lo { RTN_LOCAL } else { RTN_UNICAST }, prefix, a.prefix));
+            if a.prefix < 31 {
+                add(magic(RTN_BROADCAST, prefix | !m, 32));
+            }
+        }
+    }
+    // ipconfig (ip_rt_ioctl の SIOCADDRT): 既定の道は proto boot、scope universe、prefsrc なし
+    if let Some(gw) = crate::net::get().and(crate::net::gateway()) {
+        add(Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto: RTPROT_BOOT, dst: 0, len: 0, prefsrc: 0, gw: u32::from_be_bytes(gw.octets()), oif: ETH_INDEX });
+    }
+    v.sort_by_key(|r| (r.dst, 32 - r.len, 255 - r.table));
+    v
+}
+
+/// fib_table_lookup: いちばん長い prefix (同じなら葉の順で先のもの)。oif があれば、その口のものだけ
+fn lookup(rs: &[Route], dst: u32, oif: i32) -> Option<&Route> {
+    rs.iter().filter(|r| dst & mask(r.len) == r.dst && (oif == 0 || r.oif == oif)).min_by_key(|r| 32 - r.len)
+}
+
+/// 口が持つアドレスか (__ip_dev_find: 口のアドレスか、local の表で RTN_LOCAL)
+fn is_local(rs: &[Route], a: u32) -> bool {
+    lookup(rs, a, 0).is_some_and(|r| r.typ == RTN_LOCAL)
+}
+
+/// inet_select_addr: dev の (dst と同じ網のものを先に) scope が scope 以下のアドレス。なければほかの口から
+/// (in_dev_select_addr: scope link のものはとらない)
+fn select_addr(dev: i32, dst: u32, scope: u8) -> u32 {
+    let all = addrs();
+    let ok = |a: &&Addr| a.scope <= scope;
+    let mine: Vec<&Addr> = all.iter().filter(|a| a.index == dev).filter(ok).collect();
+    if let Some(a) = mine.iter().find(|a| dst == 0 || dst & mask(a.prefix) == u32::from_be_bytes(a.addr) & mask(a.prefix)).or(mine.first()) {
+        return u32::from_be_bytes(a.addr);
+    }
+    all.iter().find(|a| a.scope != RT_SCOPE_LINK && a.scope <= scope).map_or(0, |a| u32::from_be_bytes(a.addr))
+}
+
+/// 出ていく道 (rtable)
+struct Out {
+    typ: u8,
+    /// RTCF_*
+    flags: u32,
+    oif: i32,
+    saddr: u32,
+    /// rt_uses_gateway のときのゲートウェイ
+    gw: u32,
+    /// fib_lookup で当たった道 (FIB_MATCH が出すもの)。ないこともある
+    fi: Option<Route>,
+}
+
+/// ip_route_output_key_hash_rcu と __mkroute_output (ほかの VRF と multicast の group は見ない)
+fn output(dst: u32, src: u32, oif: i32) -> Result<Out, i64> {
+    let rs = routes();
+    let devs = links();
+    let (mut daddr, mut saddr) = (dst, src);
+    let mut typ = 0u8;
+    let mut flags = 0u32;
+    let mut fi: Option<Route> = None;
+    let dev;
+    'make: {
+        if saddr != 0 {
+            if is_multicast(saddr) || saddr == LBCAST {
+                return Err(crate::why::inval());
+            }
+            if oif == 0 && (is_multicast(daddr) || daddr == LBCAST) {
+                // saddr の口から (vic や vat のための hack)
+                let Some(r) = lookup(&rs, saddr, 0).filter(|r| r.typ == RTN_LOCAL) else { return Err(-ENETUNREACH) };
+                dev = r.oif;
+                break 'make;
+            }
+            if !is_local(&rs, saddr) {
+                return Err(-ENETUNREACH);
+            }
+        }
+        if oif != 0 {
+            if !devs.iter().any(|l| l.index == oif) {
+                return Err(-ENODEV);
+            }
+            if daddr & 0xffff_ff00 == 0xe000_0000 || daddr == LBCAST {
+                if saddr == 0 {
+                    saddr = select_addr(oif, 0, RT_SCOPE_LINK);
+                }
+                dev = oif;
+                break 'make;
+            }
+            if saddr == 0 {
+                if is_multicast(daddr) {
+                    saddr = select_addr(oif, 0, RT_SCOPE_UNIVERSE);
+                } else if daddr == 0 {
+                    saddr = select_addr(oif, 0, RT_SCOPE_HOST);
+                }
+            }
+        }
+        if daddr == 0 {
+            daddr = if saddr != 0 { saddr } else { LOOPBACK };
+            saddr = daddr;
+            typ = RTN_LOCAL;
+            flags |= RTCF_LOCAL;
+            dev = LO_INDEX;
+            break 'make;
+        }
+        let Some(r) = lookup(&rs, daddr, oif) else {
+            if oif != 0 {
+                // 表がまちがっていても、oif があれば同じ網にいるとみなす
+                if saddr == 0 {
+                    saddr = select_addr(oif, 0, RT_SCOPE_LINK);
+                }
+                typ = RTN_UNICAST;
+                dev = oif;
+                break 'make;
+            }
+            return Err(-ENETUNREACH);
+        };
+        typ = r.typ;
+        fi = Some(r.clone());
+        if r.typ == RTN_LOCAL {
+            if saddr == 0 {
+                saddr = if r.prefsrc != 0 { r.prefsrc } else { daddr };
+            }
+            flags |= RTCF_LOCAL;
+            dev = LO_INDEX;
+            break 'make;
+        }
+        dev = r.oif;
+        if saddr == 0 {
+            saddr = if r.prefsrc != 0 { r.prefsrc } else { select_addr(r.oif, r.gw, r.scope) };
+        }
+    }
+    // __mkroute_output
+    if saddr >> 24 == 127 && dev != LO_INDEX {
+        return Err(crate::why::inval());
+    }
+    let mut nh = fi.clone();
+    if daddr == LBCAST {
+        typ = RTN_BROADCAST;
+        nh = None;
+    } else if is_multicast(daddr) {
+        typ = RTN_MULTICAST;
+    } else if daddr >> 24 == 0 {
+        return Err(crate::why::inval());
+    }
+    if dev == LO_INDEX {
+        flags |= RTCF_LOCAL;
+    }
+    if typ == RTN_BROADCAST {
+        flags |= RTCF_BROADCAST | RTCF_LOCAL;
+    } else if typ == RTN_MULTICAST {
+        // ip_check_mc_rcu: aios の口は multicast の group に入らないので、RTCF_LOCAL はつけない
+        flags |= RTCF_MULTICAST;
+        if nh.as_ref().is_some_and(|r| r.len < 4) {
+            nh = None;
+        }
+    }
+    let gw = nh.as_ref().map_or(0, |r| r.gw);
+    Ok(Out { typ, flags, oif: dev, saddr, gw, fi })
+}
+
+/// rtattr を type ごとに (後のものが勝つ。長さのおかしいところで終わり)
+fn attrs_of(mut a: &[u8]) -> BTreeMap<u16, &[u8]> {
+    let mut m = BTreeMap::new();
+    while a.len() >= 4 {
+        let len = u16::from_le_bytes([a[0], a[1]]) as usize;
+        if len < 4 || len > a.len() {
+            break;
+        }
+        m.insert(u16::from_le_bytes([a[2], a[3]]) & 0x3fff, &a[4..len]);
+        a = &a[align4(len).min(a.len())..];
+    }
+    m
+}
+
+fn u32_of(a: Option<&&[u8]>) -> u32 {
+    a.filter(|v| v.len() >= 4).map_or(0, |v| u32::from_le_bytes(v[..4].try_into().unwrap()))
+}
+
+fn addr_of(a: Option<&&[u8]>) -> u32 {
+    a.filter(|v| v.len() >= 4).map_or(0, |v| u32::from_be_bytes(v[..4].try_into().unwrap()))
+}
+
+/// inet_rtm_getroute (ip route get): rtmsg の頭と RTA_DST・RTA_SRC・RTA_OIF・RTA_MARK・RTA_UID。答えは rt_fill_info
+/// (FIB_MATCH なら当たった道を fib_dump_info で)
+fn get_route(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+    // struct rtmsg: family、dst_len、src_len、tos、table、protocol、scope、type、flags (u32)
+    if body.len() < 12 {
+        return crate::why::inval();
+    }
+    let (dst_len, src_len, table, proto, scope, rtype) = (body[1], body[2], body[4], body[5], body[6], body[7]);
+    let rflags = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let a = attrs_of(&body[12..]);
+    if strict {
+        // inet_rtm_valid_getroute_req
+        if (src_len != 0 && src_len != 32) || (dst_len != 0 && dst_len != 32) || table != 0 || proto != 0 || scope != 0 || rtype != 0 {
+            return crate::why::inval();
+        }
+        if rflags & !(RTM_F_NOTIFY | RTM_F_LOOKUP_TABLE | RTM_F_FIB_MATCH) != 0 {
+            return crate::why::inval();
+        }
+        if a.keys().any(|&k| k > RTA_MAX) || (a.contains_key(&RTA_SRC) && src_len == 0) || (a.contains_key(&RTA_DST) && dst_len == 0) {
+            return crate::why::inval();
+        }
+        if a.keys().any(|k| !matches!(*k, RTA_IIF | RTA_OIF | RTA_SRC | RTA_DST | RTA_IP_PROTO | RTA_SPORT | RTA_DPORT | RTA_MARK | RTA_UID)) {
+            return crate::why::inval();
+        }
+    }
+    let src = addr_of(a.get(&RTA_SRC));
+    let dst = addr_of(a.get(&RTA_DST));
+    let mark = u32_of(a.get(&RTA_MARK));
+    if a.contains_key(&RTA_IIF) && u32_of(a.get(&RTA_IIF)) != 0 {
+        // 入ってくる道 (ip_route_input_rcu) はまだない
+        return -EOPNOTSUPP;
+    }
+    let uid = if a.contains_key(&RTA_UID) { u32_of(a.get(&RTA_UID)) } else { proc::current().cred.uid };
+    let rt = match output(dst, src, u32_of(a.get(&RTA_OIF)) as i32) {
+        Ok(rt) => rt,
+        Err(e) => return e,
+    };
+    // RTM_F_LOOKUP_TABLE: 当たった表 (local も main の trie なので 254。さがさなかったら 0)
+    let table_id = if rflags & RTM_F_LOOKUP_TABLE != 0 && rt.fi.is_none() { 0 } else { RT_TABLE_MAIN };
+    let mut d = Vec::new();
+    if rflags & RTM_F_FIB_MATCH != 0 {
+        let Some(mut f) = rt.fi else { return -EHOSTUNREACH };
+        f.table = table_id;
+        f.typ = rt.typ;
+        put_route(&mut d, &f, 0, seq, me);
+        out.push(d);
+        return 0;
+    }
+    let mut flags = rt.flags;
+    if rflags & RTM_F_NOTIFY != 0 {
+        flags |= RTCF_NOTIFY;
+    }
+    // rtm_tos は当たった道の dscp (aios の道はみな 0)、protocol は RTPROT_UNSPEC
+    let mut p = Vec::new();
+    p.extend_from_slice(&[AF_INET, 32, if src != 0 { 32 } else { 0 }, 0, table_id, 0, RT_SCOPE_UNIVERSE, rt.typ]);
+    let rtm_flags = (flags & !0xffff) | RTM_F_CLONED | if flags & RTCF_NOTIFY != 0 { RTM_F_NOTIFY } else { 0 };
+    p.extend_from_slice(&rtm_flags.to_le_bytes());
+    attr_u32(&mut p, RTA_TABLE, table_id as u32);
+    attr(&mut p, RTA_DST, &dst.to_be_bytes());
+    if src != 0 {
+        attr(&mut p, RTA_SRC, &src.to_be_bytes());
+    }
+    attr_u32(&mut p, RTA_OIF, rt.oif as u32);
+    if rt.saddr != src {
+        attr(&mut p, RTA_PREFSRC, &rt.saddr.to_be_bytes());
+    }
+    if rt.gw != 0 {
+        attr(&mut p, RTA_GATEWAY, &rt.gw.to_be_bytes());
+    }
+    if mark != 0 {
+        attr_u32(&mut p, RTA_MARK, mark);
+    }
+    attr_u32(&mut p, RTA_UID, uid);
+    // struct rta_cacheinfo: clntref、lastuse、expires、error、used、id、ts、tsage
+    let mut ci = [0u32; 8];
+    ci[0] = 1;
+    attr(&mut p, RTA_CACHEINFO, &ci.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    put_msg(&mut d, RTM_NEWROUTE, 0, seq, me, &p);
+    out.push(d);
+    0
+}
+
+/// inet_dump_fib: strict (ip_valid_fib_dump_req) なら頭と RTA_TABLE・RTA_OIF で選ぶ (NLM_F_DUMP_FILTERED)。
+/// しくじりは DONE の errno に
+fn dump_routes(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) {
+    let (mut rflags, mut table, mut proto, mut rtype, mut dev) = (0u32, 0u32, 0u8, 0u8, 0i32);
+    let (mut routes_too, mut filter_set) = (true, false);
+    if strict {
+        let e = (|| {
+            if body.len() < 12 {
+                return Err(crate::why::inval());
+            }
+            if body[1] != 0 || body[2] != 0 || body[3] != 0 || body[6] != 0 {
+                return Err(crate::why::inval());
+            }
+            rflags = u32::from_le_bytes(body[8..12].try_into().unwrap());
+            if rflags & !(RTM_F_CLONED | RTM_F_PREFIX) != 0 {
+                return Err(crate::why::inval());
+            }
+            // RTM_F_CLONED なら例外 (fnhe) だけ: aios にはない
+            routes_too = rflags & RTM_F_CLONED == 0;
+            (proto, rtype, table) = (body[5], body[7], body[4] as u32);
+            let a = attrs_of(&body[12..]);
+            for (&k, v) in a.iter() {
+                match k {
+                    RTA_TABLE => table = u32_of(Some(v)),
+                    RTA_OIF => {
+                        dev = u32_of(Some(v)) as i32;
+                        if !links().iter().any(|l| l.index == dev) {
+                            return Err(-ENODEV);
+                        }
+                    }
+                    _ => return Err(crate::why::inval()),
+                }
+            }
+            filter_set = rflags != 0 || proto != 0 || rtype != 0 || table != 0 || dev != 0;
+            Ok(())
+        })();
+        if let Err(e) = e {
+            done_with(out, Vec::new(), seq, me, 0, e);
+            return;
+        }
+    } else if body.len() >= 12 {
+        rflags = u32::from_le_bytes(body[8..12].try_into().unwrap()) & (RTM_F_PREFIX | RTM_F_CLONED);
+    }
+    let answer = if filter_set { NLM_F_DUMP_FILTERED } else { 0 };
+    // strict でないとき: 例外も道も出す。strict なら片方だけなので NLM_F_DUMP_FILTERED
+    let flags = NLM_F_MULTI | if strict { NLM_F_DUMP_FILTERED } else { 0 };
+    let mut d = Vec::new();
+    if rflags & RTM_F_PREFIX == 0 && routes_too {
+        // 表をえらぶと、その表だけ (fib_get_table: 255 のほかはみな main)
+        let tables: &[u8] = match table {
+            0 => &[RT_TABLE_MAIN, RT_TABLE_LOCAL],
+            255 => &[RT_TABLE_LOCAL],
+            _ => &[RT_TABLE_MAIN],
+        };
+        let rs = routes();
+        for &t in tables {
+            for r in rs.iter().filter(|r| r.table == t) {
+                if (rtype != 0 && r.typ != rtype) || (proto != 0 && r.proto != proto) || (dev != 0 && r.oif != dev) {
+                    continue;
+                }
+                put_route(&mut d, r, flags, seq, me);
+            }
+        }
+    }
+    done_with(out, d, seq, me, answer, 0);
+}
+
+/// RTM_NEWROUTE (fib_dump_info の属性の順)
+fn put_route(out: &mut Vec<u8>, r: &Route, flags: u16, seq: u32, me: u32) {
+    let mut p = Vec::new();
+    p.extend_from_slice(&[AF_INET, r.len, 0, 0, r.table, r.proto, r.scope, r.typ]);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    attr_u32(&mut p, RTA_TABLE, r.table as u32);
+    if r.len != 0 {
+        attr(&mut p, RTA_DST, &r.dst.to_be_bytes());
+    }
+    if r.prefsrc != 0 {
+        attr(&mut p, RTA_PREFSRC, &r.prefsrc.to_be_bytes());
+    }
+    if r.gw != 0 {
+        attr(&mut p, RTA_GATEWAY, &r.gw.to_be_bytes());
+    }
+    attr_u32(&mut p, RTA_OIF, r.oif as u32);
+    put_msg(out, RTM_NEWROUTE, flags, seq, me, &p);
 }

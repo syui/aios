@@ -1,6 +1,6 @@
 #!/bin/sh
 # 出すだけのテスト (test/NAME.c) を、手本の Linux と aios の VM で動かして、出力をくらべる (答えあわせを 1 つの口で)
-#   test/ldiff.sh [--root] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] NAME [ARG...]
+#   test/ldiff.sh [--root] [--net] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] NAME [ARG...]
 #     1. test/NAME.c を aarch64 の静的なもの (test/bin/NAME) に作る (なければ、.c のほうが新しければ)
 #     2. 手本の Linux (test/linux-vm.sh exec VER。既定は mainline) で動かす。答えは build/linux-answers/ にとっておき、
 #        プログラムと引数と Linux の版と test/linux.config が同じなら、もう一度は動かさない (--fresh で動かしなおす)
@@ -8,6 +8,8 @@
 #        (. は作業中のソース) を作って VM を起こしなおしてから (test/vm.py start --kernel ... --snapshot --www test)
 #     4. くらべる: 同じなら "same: N lines"、ちがえば diff -u (--- Linux、+++ aios) と、それぞれの終わりの番号
 #   --root: Linux は rootexec、aios は sudo -n で (test/apparmor.c のようなもの)
+#   --net: 手本の Linux に virtio-net をつなぐ (ip=dhcp で 10.0.2.15/24、ゲートウェイ 10.0.2.2: aios の VM と同じ。
+#     test/route.c)
 #   引数の @home は ext4 のところ: Linux は /work、aios はホーム ($HOME) に読みかえる (test/chosen.c @home /tmp など)
 #     5. 手本の Linux に足りない機能 (aios にはある) を知らせる: test/features.c を両方で動かしてくらべる。テストが使う
 #        機能が手本の Linux になければ、ENOSYS や EINVAL がテストの答えにかくれて同じに見えることがある (そのときは
@@ -17,10 +19,11 @@
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
-root= ver=mainline fresh= kernel=
+root= ver=mainline fresh= kernel= net=
 while :; do
   case "$1" in
   --root) root=1; shift ;;
+  --net) net=1; shift ;;
   --kernel) kernel=$2; shift 2 ;;
   --linux) ver=$2; shift 2 ;;
   --fresh) fresh=1; shift ;;
@@ -28,7 +31,7 @@ while :; do
   esac
 done
 name=$1
-[ -n "$name" ] || { sed -n '2,12p' "$0" >&2; exit 2; }
+[ -n "$name" ] || { sed -n '2,18p' "$0" >&2; exit 2; }
 shift
 src=test/$name.c bin=test/bin/$name
 [ -f "$src" ] || { echo "ldiff: no $src" >&2; exit 2; }
@@ -51,7 +54,7 @@ esac
 
 # Linux の答え: とっておいたものか、動かす (うしろで)
 v=$(sh test/linux-vm.sh version "$ver")
-key=$(cat "$bin" test/linux.config | sha256sum | cut -c1-16)-$(printf '%s %s %s' "$v" "$root" "$*" | sha256sum | cut -c1-8)
+key=$(cat "$bin" test/linux.config | sha256sum | cut -c1-16)-$(printf '%s %s %s%s' "$v" "$root" "${net:+net }" "$*" | sha256sum | cut -c1-8)
 ans=build/linux-answers/$name-$key
 lout=build/ldiff/$name.linux aout=build/ldiff/$name.aios
 lpid=
@@ -65,6 +68,8 @@ else
       shift
       case "$a" in @home*) set -- "$@" "/work${a#@home}" ;; *) set -- "$@" "$a" ;; esac
     done
+    # --net: ホストのポートは使っていないものを (中の 7001 と 7002 へ。テストは使わない)
+    [ -z "$net" ] || export LINUX_NET=$((20000 + $$ % 20000)),$((40000 + $$ % 20000))
     sh test/linux-vm.sh "$([ -n "$root" ] && echo rootexec || echo exec)" "$v" "$bin" "$@" > "$ans.tmp" 2> "$ans.err"
     echo $? > "$ans.st"
     mv "$ans.tmp" "$ans.out"
