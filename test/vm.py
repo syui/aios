@@ -35,6 +35,8 @@ import json, os, pty, re, select, shutil, signal, socket, subprocess, sys, threa
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.environ.get('AIOS_VM_DIR') or '/tmp/aios-vm-%d' % os.getuid()
 CTL, MON, LOG = DIR + '/ctl', DIR + '/mon', DIR + '/serial.log'
+# カーネルがシリアルに出す、シグナルで終わったプロセスの知らせ (コマンドの出力にまざる)
+KMSG = re.compile(r'^\s*pid \d+ \(.*\): (killed by signal|dumped core|segfault)')
 PROMPT = re.compile(rb'aios[^\n]*\][$#] ')
 # 起動のとちゅうでカーネルが止まった (それより待ってもプロンプトは来ない)
 PANIC = re.compile(rb'(^|\n)panic: ')
@@ -236,21 +238,29 @@ class Serve:
             # ないまま終わった」に見えた。ps がなければ /proc/PID で。
             # pid を先に見る: 番号を先に読むと、そのあいだに終わったものが「番号のないまま終わった」に見えた
             # (ap -Sy ncurses が exit ? になった。.rc は 0)。子は .rc を書いてから終わるので、いないと見たあとに読めば番号はある
-            r = self.run(('p=$(cat {f}.pid 2>/dev/null); [ -n "$p" ] && {{ ps -e -o pgid=,stat= 2>/dev/null | awk -v g="$p" \'$1 == g && $2 !~ /^Z/ {{ f = 1 }} END {{ exit !f }}\' '
-                          '|| {{ ! ps -o pid= >/dev/null 2>&1 && [ -d /proc/$p ]; }}; }} && echo alive; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
+            # シリアルにはカーネルの知らせ (pid N (sysdiff): killed by signal ...) もまざって、行のとちゅうに入ることがある。
+            # 前は 'alive' の文字がこわれると「いない」に見え、sysdiff が動いているのに「番号のないまま終わった」と言った。
+            # alive=1 / alive=0 と、番号 (数字か空) と大きさ (数字) がきちんと読めたときだけ信じ、でなければ読みなおす
+            r = self.run(('p=$(cat {f}.pid 2>/dev/null); a=0; [ -n "$p" ] && {{ ps -e -o pgid=,stat= 2>/dev/null | awk -v g="$p" \'$1 == g && $2 !~ /^Z/ {{ f = 1 }} END {{ exit !f }}\' '
+                          '|| {{ ! ps -o pid= >/dev/null 2>&1 && [ -d /proc/$p ]; }}; }} && a=1; echo {m}; echo "alive=$a;"; echo {m}; cat {f}.rc 2>/dev/null; echo {m}; '
                           'wc -c < {f}.log 2>/dev/null; echo {m}; tail -c +{o} {f}.log 2>/dev/null | head -c {n}').format(f=f, m=mark, o=j['shown'] + 1, n=limit),
                          max(5, min(30, last - time.time())))
             # aish が、しくじったコマンドのわけ (aish: why: ...) を端末に出すことがある (.rc がまだないときの cat):
             # 番号やログとまちがえないように捨てる
-            out = '\n'.join(l for l in r.get('out', '').split('\n') if 'aish: why:' not in l)
+            # カーネルの行 (pid N (comm): killed by signal ...) も、まるごとの行なら捨てる
+            out = '\n'.join(l for l in r.get('out', '').split('\n') if 'aish: why:' not in l and not KMSG.match(l))
             parts = out.split(mark)
-            if r.get('timeout') or len(parts) < 4:
+            ok = not r.get('timeout') and len(parts) >= 5
+            if ok:
+                state, rc, size, new = parts[1].strip(), parts[2].strip(), parts[3].strip(), parts[4]
+                ok = state in ('alive=1;', 'alive=0;') and (rc == '' or rc.lstrip('-').isdigit()) and size.isdigit()
+            if not ok:
                 if time.time() + 5 < last:
                     time.sleep(1)
                     continue
                 return {'id': jid, 'done': False, 'busy': True, 'ms': int((time.time() - j['t0']) * 1000), 'out': '', 'shown_before': j['shown'],
-                        'note': 'the VM was too busy to answer in time; the job was not seen to end (ask again)'}
-            alive, rc, size, new = 'alive' in parts[0], parts[1].strip(), parts[2].strip(), parts[3]
+                        'note': 'the VM was too busy (or its console too noisy) to read the job in time; the job was not seen to end (ask again)'}
+            alive = state == 'alive=1;'
             done = rc != '' or not alive
             if done or time.time() >= end:
                 break
