@@ -564,7 +564,7 @@ pub fn ip6hdr(b: &mut Vec<u8>, tclass: u8, flow: u32, plen: usize, nh: u8, hop: 
 }
 
 /// IPv6 の疑似ヘッダつきのチェックサム (送り元、あて先、上の層の長さ、次の頭)
-fn l4sum6(src: u128, dst: u128, proto: u8, seg: &[u8]) -> u16 {
+pub fn l4sum6(src: u128, dst: u128, proto: u8, seg: &[u8]) -> u16 {
     let mut ph = [0u8; 40];
     ph[0..16].copy_from_slice(&src.to_be_bytes());
     ph[16..32].copy_from_slice(&dst.to_be_bytes());

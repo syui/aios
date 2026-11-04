@@ -2679,7 +2679,7 @@ fn refresh_active() {
     let tables = &g().cur.tables;
     let on = tables.iter().any(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) && t.flags & NFT_TABLE_F_DORMANT == 0 && t.chains.iter().any(|c| c.base.is_some()));
     ACTIVE.store(on, core::sync::atomic::Ordering::Relaxed);
-    let exprs = || tables.iter().filter(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_INET)).flat_map(|t| t.chains.iter()).flat_map(|c| c.rules.iter()).flat_map(|r| r.exprs.iter());
+    let exprs = || tables.iter().filter(|t| matches!(t.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET)).flat_map(|t| t.chains.iter()).flat_map(|c| c.rules.iter()).flat_map(|r| r.exprs.iter());
     let ct = exprs().any(|e| matches!(e.op, Op::Ct { .. } | Op::CtSet(_)));
     CT_ON.store(ct, core::sync::atomic::Ordering::Relaxed);
     // ct bytes / packets / avgpkt は数えることを始める (nf_ct_set_acct: もどさない)
@@ -2689,7 +2689,7 @@ fn refresh_active() {
 }
 
 /// 1 つのフック: IPv4 のパケットは ip と inet の表、IPv6 のものは ip6 と inet の表の基の鎖を priority の順 (同じなら
-/// 先に入れたもの) に。drop したらそこで。conntrack はまだ IPv4 だけ
+/// 先に入れたもの) に。drop したらそこで
 pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
     if !active() && !ct_on() {
         return Verdict::Accept;
@@ -2698,7 +2698,7 @@ pub fn hook(h: u32, p: &mut Pkt) -> Verdict {
     let mut list: Vec<(i32, u64, usize, usize)> = Vec::new();
     // conntrack: PRE_ROUTING と LOCAL_OUT の -200 (NF_IP_PRI_CONNTRACK) で見る。表は usize::MAX で印をつける
     let v6 = p.v6();
-    let ct = ct_on() && !v6;
+    let ct = ct_on();
     if ct && matches!(h, 0 | 3) {
         list.push((-200, 0, usize::MAX, 0));
     }
@@ -3336,7 +3336,7 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
                 2 => put32(&mut r.d, *dreg, c.status),
                 3 => put32(&mut r.d, *dreg, c.mark),
                 5 => put32(&mut r.d, *dreg, (ctk::expires_ns(c) / 1_000_000) as u32),
-                7 => put8(&mut r.d, *dreg, NFPROTO_IPV4),
+                7 => put8(&mut r.d, *dreg, if t.l3 == 6 { NFPROTO_IPV6 } else { NFPROTO_IPV4 }),
                 10 => put8(&mut r.d, *dreg, t.proto),
                 14 | 15 => reg_at(&mut r.d, *dreg, 8).copy_from_slice(&count(*key, *dir).to_ne_bytes()),
                 16 => {
@@ -3344,9 +3344,18 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
                     reg_at(&mut r.d, *dreg, 8).copy_from_slice(&by.checked_div(pk).unwrap_or(0).to_ne_bytes());
                 }
                 23 => put32(&mut r.d, *dreg, c.id),
-                // 送り元とあて先 (IPv4 の 4 バイト。inet の表でもレジスタの残りはそのまま)
-                8 | 19 => reg_at(&mut r.d, *dreg, 4).copy_from_slice(&t.src.to_be_bytes()),
-                9 | 20 => reg_at(&mut r.d, *dreg, 4).copy_from_slice(&t.dst.to_be_bytes()),
+                // 送り元とあて先: NFT_CT_SRC / DST は家族の長さ (IPv4 は 4 バイト。inet の表でもレジスタの残りはそのまま)、
+                // SRC_IP / DST_IP は IPv4 だけ、SRC_IP6 / DST_IP6 は IPv6 だけ (ちがえば NFT_BREAK)
+                8 | 9 => {
+                    let a = if *key == 8 { t.src } else { t.dst };
+                    if t.l3 == 6 {
+                        reg_at(&mut r.d, *dreg, 16).copy_from_slice(&a.to_be_bytes());
+                    } else {
+                        reg_at(&mut r.d, *dreg, 4).copy_from_slice(&(a as u32).to_be_bytes());
+                    }
+                }
+                19 | 20 if t.l3 == 4 => reg_at(&mut r.d, *dreg, 4).copy_from_slice(&((if *key == 19 { t.src } else { t.dst }) as u32).to_be_bytes()),
+                21 | 22 if t.l3 == 6 => reg_at(&mut r.d, *dreg, 16).copy_from_slice(&(if *key == 21 { t.src } else { t.dst }).to_be_bytes()),
                 // ポート (ICMP は src が id、dst が type と code)
                 11 => put16(&mut r.d, *dreg, t.sport.to_be_bytes()),
                 12 => put16(&mut r.d, *dreg, t.dport.to_be_bytes()),

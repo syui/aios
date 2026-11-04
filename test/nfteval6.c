@@ -247,6 +247,65 @@ static void ping_probe(const char *to, unsigned scope) {
     close(s);
 }
 
+// /proc/net/nf_conntrack の ipv6 の行のうち want をふくむものを、時間切れの秒と 32768 からのポートを * にして、ならべて
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void conntrack_list(const char *want) {
+    FILE *f = fopen("/proc/net/nf_conntrack", "r");
+    if (!f) {
+        printf("conntrack: %s\n", ename(errno));
+        return;
+    }
+    char *lines[256];
+    int n = 0;
+    char l[512];
+    while (n < 256 && fgets(l, sizeof l, f)) {
+        if (strncmp(l, "ipv6", 4) || !strstr(l, want))
+            continue;
+        char o[512];
+        int w = 0, field = 0;
+        for (char *p = l; *p && w < (int)sizeof o - 4;) {
+            if (*p == ' ') {
+                field++;
+                while (*p == ' ')
+                    o[w++] = *p++;
+                continue;
+            }
+            if (field == 4 && *p >= '0' && *p <= '9') {
+                while (*p >= '0' && *p <= '9')
+                    p++;
+                o[w++] = '*';
+                continue;
+            }
+            int key = !strncmp(p, "sport=", 6) || !strncmp(p, "dport=", 6) ? 6 : 0;
+            if (key) {
+                memcpy(o + w, p, key);
+                w += key;
+                p += key;
+                long v = strtol(p, NULL, 10);
+                char *e = p;
+                while (*e >= '0' && *e <= '9')
+                    e++;
+                if (v >= 32768) {
+                    o[w++] = '*';
+                } else {
+                    memcpy(o + w, p, e - p);
+                    w += e - p;
+                }
+                p = e;
+                continue;
+            }
+            o[w++] = *p++;
+        }
+        o[w] = 0;
+        lines[n++] = strdup(o);
+    }
+    fclose(f);
+    qsort(lines, n, sizeof *lines, cmp_str);
+    for (int i = 0; i < n; i++)
+        printf("ct %s", lines[i]);
+    printf("ct (%d)\n", n);
+}
+
 // eth0 の向こうへの TCP (待たない connect、0.9 秒まで: Linux の SYN のやりなおしは 1 秒から)
 static void tcp_out(const char *to, int port) {
     int c = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -329,7 +388,7 @@ struct tc {
     const char *name;
     const char *rules;
     // 動かすもの: 6 (::1 の TCP)、n (::1 のだれもいない TCP)、u (::1 の UDP)、v (::1 のだれもいない UDP)、
-    // 4 (127.0.0.1 の TCP)、m (AF_INET6 から ::ffff:127.0.0.1 の TCP: IPv4)
+    // 4 (127.0.0.1 の TCP)、m (AF_INET6 から ::ffff:127.0.0.1 の TCP: IPv4)、c (conntrack の ::1 の行)
     const char *probes;
 };
 
@@ -388,10 +447,21 @@ static const struct tc cases[] = {
      "\t\tudp dport 7102 log prefix \"nfteval6-udp \"\n"
      "\t\ttcp dport 7103 log prefix \"nfteval6-tcp \" level warn\n\t}\n}\n",
      "un"},
+    {"ct-state6",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy drop;\n"
+     "\t\tct state established,related counter accept\n\t\tct state new tcp dport 7101 counter accept\n"
+     "\t\tct state new udp dport { 7102, 7104 } counter accept\n\t\tct state invalid counter drop\n\t\tct state untracked counter accept\n\t}\n}\n",
+     "6uvnc"},
+    {"ct-keys6",
+     "table inet t {\n\tchain out {\n\t\ttype filter hook output priority filter; policy accept;\n"
+     "\t\tct l3proto ipv6 udp dport 7102 counter\n\t\tct original ip6 saddr ::1 udp dport 7102 counter\n"
+     "\t\tct protocol udp ct original proto-dst 7102 counter\n\t\tct direction original udp dport 7102 counter\n"
+     "\t\tct l3proto ipv4 udp dport 7102 counter\n\t\tmeta nfproto ipv6 ct state new udp dport 7102 counter\n\t}\n}\n",
+     "u"},
 };
 
 // eth0 の case (net をつけたとき)。probes: p (fec0::2 へ ping6)、l (fe80::2%eth0 へ ping6)、t (fec0::2 の TCP 1)、
-// w (fec0::2 の UDP 9 へ 2 つ)
+// w (fec0::2 の UDP 9 へ 2 つ)、x (2001:db8::1 へ ping6)、C (conntrack の fec0:: の行)
 static const struct tc net_cases[] = {
     {"eth-accept",
      "table inet t {\n"
@@ -429,6 +499,11 @@ static const struct tc net_cases[] = {
      "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy drop;\n"
      "\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, echo-reply } accept\n\t}\n}\n",
      "pt"},
+    {"eth-ct",
+     "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy drop;\n"
+     "\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept\n"
+     "\t\tct state established,related counter accept\n\t}\n}\n",
+     "pxC"},
     {"eth-log",
      "table inet t {\n\tchain in {\n\t\ttype filter hook input priority filter; policy accept;\n"
      "\t\tiif eth0 icmpv6 type echo-reply log prefix \"nfteval6-ein \"\n\t}\n"
@@ -449,6 +524,9 @@ static void probe(char c) {
     case 'l': ping_probe("fe80::2", 2); break;
     case 't': tcp_out("fec0::2", 1); break;
     case 'w': udp_probe("fec0::2 9", "fec0::2", 9, 0, 2, 5); break;
+    case 'x': ping_probe("2001:db8::1", 0); break;
+    case 'c': conntrack_list("0000:0000:0000:0000:0000:0000:0000:0001"); break;
+    case 'C': conntrack_list("fec0:"); break;
     }
 }
 

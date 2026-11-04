@@ -882,7 +882,7 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     つながったあとに drop を入れて SIOCOUTQ を見て、消すと送りなおしで届く)。これも手本の Linux と 1 バイトもちがわない
 - 段階 3 (できた): conntrack (kernel/src/conntrack.rs。Linux 7.3 の nf_conntrack_core.c、proto_tcp.c、proto_udp.c、
   proto_icmp.c、proto_generic.c、nf_conntrack_standalone.c と同じ答え) と nft の `ct` の式
-  - 動くのは、IPv4 の ip か inet の表に ct の式があるときだけ (Linux の nf_ct_netns_get: dormant の表でも)。フックは
+  - 動くのは、ip か ip6 か inet の表に ct の式があるときだけ (Linux の nf_ct_netns_get: dormant の表でも)。フックは
     PRE_ROUTING と LOCAL_OUT の priority -200 (見て、なければ作る) と、LOCAL_IN と POST_ROUTING のいちばん後 (confirm:
     表に入れる)。そのあいだで落ちた新しいものは表に入らない。lo は出す側でついたつながりを受ける側もそのまま使う
   - つながりは向きごとの組 (送り元、あて先、protocol、ポートか ICMP の type・code・id) を 2 つ持つ。ctinfo は Linux と同じ
@@ -904,7 +904,9 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
   - 中どうし (lo) の TCP: つなぐときの SYN、SYN-ACK に、3 つ目の ACK と閉じるときの FIN、ACK、RST (Linux と同じ
     timestamp つきの 52 バイト) も、lo の決まりと conntrack に通す (落とされても止めない)。データの segment も通すので
     (ファイアウォールが入る前につないだものは途中から拾う)、conntrack の seq もデータの長さだけ進む
-    (ESTABLISHED → FIN_WAIT … → TIME_WAIT)
+    (ESTABLISHED → FIN_WAIT … → TIME_WAIT)。ESTABLISHED で FIN を受けた側の ACK は、Linux の tcp_fin と同じく
+    おくらせ (pingpong の delayed ACK: lo では 40 ms)、そのあいだに自分も閉じれば FIN が ACK を運ぶ (前はすぐ ACK を
+    出していたので、すぐ閉じる 2 つのソケットで segment が 1 つ多かった)
   - /proc/net/nf_conntrack (root だけ。Linux と同じ行: ipv4 2 tcp 6 残りの秒 状態 組 [UNREPLIED] 組 [ASSURED] mark use)、
     /proc/sys/net/netfilter/nf_conntrack_{count,max,buckets,acct,checksum,tcp_loose,tcp_be_liberal,tcp_max_retrans,
     tcp_ignore_invalid_rst,tcp_timeout_*,udp_timeout,udp_timeout_stream,icmp_timeout,generic_timeout} と
@@ -941,7 +943,15 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
   - つなぐ途中の TCP を ICMPv6 のエラーでやめるときは、smoltcp の abort (RST を送る) ではなく close で (Linux の
     tcp_done は何も送らない)
   - /proc/ai/fw の落としたものの輪も IPv6 の番地とポート、icmpv6 の type と code を見せる
-  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)
+  - IPv6 の conntrack (段階 2e: nf_conntrack_ipv6 と nf_conntrack_proto_icmpv6): 組の番地は IPv6 のもの (拡張ヘッダーを
+    とばして。断片はまとめないので見ない)、TCP と UDP は IPv4 と同じ状態表 (チェックサムは擬似ヘッダーの IPv6)、
+    ICMPv6 は echo と node information の問いがつながり (30 秒: nf_conntrack_icmpv6_timeout)、エラー (type < 128) は
+    中のパケットのつながりの related (外のあて先が合うもの)、近所さがしと MLD (130〜136、143) は untracked。ct の式の
+    l3proto、original / reply の ip6 saddr / daddr (NFT_CT_SRC_IP6 と DST_IP6。IPv4 のつながりでは NFT_BREAK)、
+    /proc/net/nf_conntrack の ipv6 の行 (ipv6 10、番地は %pI6 の形)、/proc/ai/fw のつながり
+  - 確かめかた (conntrack): test/nfteval6.c の ct-state6 (lo の TCP と UDP、ICMPv6 の port unreachable の related、
+    conntrack の行)、ct-keys6、eth-ct (fec0::2 への ping6 の答えが established、近所さがしを通す policy drop)。
+    `--root --net nfteval6 /nft net` で手本の Linux 7.4-rc1 と 344 行、ネットなしで 210 行同じ
   - 確かめかた (eth0): `LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net nfteval6 /nft net` (7 つの case:
     fec0::2 と fe80::2 への ping6 と counter、受けと出しの drop、出しの reject (icmpv6、tcp reset、UDP)、受けの reject
     (外へ返す ICMPv6 を output で数える)、近所さがしを通す policy drop、eth0 の log)。手本の Linux 7.4-rc1 と 289 行
@@ -1097,7 +1107,8 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - ファイアウォール (段階 2d): eth0 の IPv6 のフレームも決まりを通る (上の「ファイアウォール (nftables)」の IPv6)
 - smoltcp の近所さがしは、NS を 1 つ出すと、どのあて先にも 1 秒は出さない (近所の表は 60 秒で切れる)。Linux はあて先
   ごと。表が切れたあとに 2 つのあて先へ続けて送ると、2 つ目が 1 秒おくれる (todo の smoltcp-nd-silence)
-- まだ: IPv6 の conntrack、DAD、MLD、
+- conntrack (段階 2e): IPv6 も (上の「ファイアウォール (nftables)」の IPv6)
+- まだ: DAD、MLD、
   packet too big (PMTU)、IPV6_RECVERR の行列、ip -6 addr add / route add (RTM_NEWADDR と RTM_NEWROUTE の AF_INET6)、
   IPv6 の番地と道の netlink の知らせ (RTNLGRP_IPV6_*)、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、

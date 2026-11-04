@@ -108,6 +108,7 @@ pub struct Timeouts {
     pub udp: u64,
     pub udp_stream: u64,
     pub icmp: u64,
+    pub icmpv6: u64,
     pub generic: u64,
 }
 
@@ -117,6 +118,7 @@ pub static TIMEOUTS: Bkl<Timeouts> = Bkl::new(Timeouts {
     udp: 30,
     udp_stream: 120,
     icmp: 30,
+    icmpv6: 30,
     generic: 600,
 });
 
@@ -133,11 +135,13 @@ pub struct Knobs {
 
 pub static KNOBS: Bkl<Knobs> = Bkl::new(Knobs { tcp_loose: true, tcp_be_liberal: false, tcp_max_retrans: 3, tcp_ignore_invalid_rst: false, checksum: true, acct: false, max: 0 });
 
-/// 向きごとの組 (ICMP は sport が id、dport が type << 8 | code)
+/// 向きごとの組 (ICMP と ICMPv6 は sport が id、dport が type << 8 | code)。番地は IPv4 なら下の 32 ビット
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Tuple {
-    pub src: u32,
-    pub dst: u32,
+    /// 4 か 6
+    pub l3: u8,
+    pub src: u128,
+    pub dst: u128,
     pub proto: u8,
     pub sport: u16,
     pub dport: u16,
@@ -274,18 +278,22 @@ pub fn count() -> usize {
 
 /// パケットの組 (nf_ct_get_tuple)。ICMP のエラーやおかしな頭は None
 fn tuple_of(ip: &[u8]) -> Option<Tuple> {
-    let ihl = (ip[0] & 15) as usize * 4;
+    let (l3, ihl, src, dst, proto) = if *ip.first()? >> 4 == 6 {
+        let (thoff, proto, _) = crate::nfhook::v6_l4(ip)?;
+        (6, thoff, u128::from_be_bytes(ip[8..24].try_into().ok()?), u128::from_be_bytes(ip[24..40].try_into().ok()?), proto)
+    } else {
+        (4, (ip[0] & 15) as usize * 4, be32(&ip[12..16]) as u128, be32(&ip[16..20]) as u128, ip[9])
+    };
     let l4 = ip.get(ihl..)?;
-    let (src, dst, proto) = (be32(&ip[12..16]), be32(&ip[16..20]), ip[9]);
     let (sport, dport) = match proto {
         6 | 17 => (be16(l4.get(0..2)?), be16(l4.get(2..4)?)),
-        1 => {
+        1 | 58 => {
             let h = l4.get(0..8)?;
             (be16(&h[4..6]), (h[0] as u16) << 8 | h[1] as u16)
         }
         _ => (0, 0),
     };
-    Some(Tuple { src, dst, proto, sport, dport })
+    Some(Tuple { l3, src, dst, proto, sport, dport })
 }
 
 /// 逆向きの組 (nf_ct_invert_tuple)。ICMP は問いと答えの type を入れかえる (それ以外は作れない)
@@ -306,10 +314,22 @@ fn invert(t: &Tuple) -> Option<Tuple> {
             };
             (t.sport, (inv as u16) << 8 | code as u16)
         }
+        // ICMPv6 (icmpv6_invert_tuple の invmap): echo と node information の問いと答え
+        58 => {
+            let (ty, code) = ((t.dport >> 8) as u8, t.dport as u8);
+            let inv = match ty {
+                128 => 129,
+                129 => 128,
+                139 => 140,
+                140 => 139,
+                _ => return None,
+            };
+            (t.sport, (inv as u16) << 8 | code as u16)
+        }
         6 | 17 => (t.dport, t.sport),
         _ => (0, 0),
     };
-    Some(Tuple { src: t.dst, dst: t.src, proto: t.proto, sport, dport })
+    Some(Tuple { l3: t.l3, src: t.dst, dst: t.src, proto: t.proto, sport, dport })
 }
 
 /// 表で引く (時間切れのものは消す)
@@ -386,12 +406,38 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
     if !matches!(ct, Ct::None) {
         return 1;
     }
-    if ip.len() < 20 || u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
-        return 1;
+    let v6 = ip.first().is_some_and(|b| b >> 4 == 6);
+    let (ihl, proto) = if v6 {
+        // IPv6: 拡張ヘッダーをとばして。断片はまとめないので見ない (Linux は nf_defrag_ipv6 でまとめる)
+        let Some((thoff, proto, frag)) = crate::nfhook::v6_l4(ip) else { return 1 };
+        if frag != 0 {
+            return 1;
+        }
+        (thoff, proto)
+    } else {
+        if ip.len() < 20 || u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
+            return 1;
+        }
+        ((ip[0] & 15) as usize * 4, ip[9])
+    };
+    // ICMPv6 (nf_conntrack_icmpv6_error): 近所さがしと MLD は untracked、エラーは中のパケットのつながり (related)
+    if proto == 58 {
+        let Some(h) = ip.get(ihl..ihl + 8) else { return 1 };
+        if KNOBS.get().checksum && hook == crate::nfhook::PRE_ROUTING && !l4_ok(ip, ihl, 58) {
+            return 1;
+        }
+        if matches!(h[0], 130..=136 | 143) {
+            *ct = Ct::Untracked;
+            return 1;
+        }
+        if h[0] < 128 {
+            if let Some((id, info)) = inner_error(ip, ihl + 8, |c, dir| c.tuple[dir as usize].dst == u128::from_be_bytes(ip[24..40].try_into().unwrap())) {
+                *ct = Ct::Known(id, info);
+            }
+            return 1;
+        }
     }
-    let ihl = (ip[0] & 15) as usize * 4;
-    let proto = ip[9];
-    if proto == 1 {
+    if proto == 1 && !v6 {
         match icmp_error(ip, ihl, hook) {
             // エラーでない ICMP: ふつうに
             None => {}
@@ -417,7 +463,7 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
                     let proto = match proto {
                         6 => Proto::Tcp(TcpCt::default()),
                         17 => Proto::Udp { stream_ts: 0 },
-                        1 => Proto::Icmp,
+                        1 | 58 => Proto::Icmp,
                         _ => Proto::Generic,
                     };
                     *ct = Ct::New(Box::new(Conn { id: 0, tuple: [t, r], status: 0, timeout: 0, mark: 0, acct: None, proto }), CT_NEW);
@@ -455,7 +501,7 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
                 let proto_state = match proto {
                     6 => Proto::Tcp(TcpCt::default()),
                     17 => Proto::Udp { stream_ts: 0 },
-                    1 => Proto::Icmp,
+                    1 | 58 => Proto::Icmp,
                     _ => Proto::Generic,
                 };
                 let tb = table();
@@ -472,7 +518,7 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
             match proto {
                 6 => tcp_packet(conn, ip, ihl, dir, hook),
                 17 => udp_packet(conn, ip, ihl, hook),
-                1 => icmp_packet(conn),
+                1 | 58 => icmp_packet(conn),
                 _ => {
                     let to = TIMEOUTS.get().generic;
                     refresh(conn, to);
@@ -619,28 +665,35 @@ fn icmp_error(ip: &[u8], ihl: usize, hook: u32) -> Option<Option<(u32, u8)>> {
     if !matches!(ty, 3 | 4 | 5 | 11 | 12) {
         return None;
     }
-    let inner = ip.get(ihl + 8..)?;
-    if inner.len() < 20 {
-        return Some(None);
-    }
-    let Some(orig) = tuple_of(inner) else { return Some(None) };
-    let Some(want) = invert(&orig) else { return Some(None) };
-    let Some((id, dir)) = find(&want) else { return Some(None) };
-    // 外のあて先と、見つけた組のあて先が同じこと
-    let c = &table().conns[&id];
-    if c.tuple[dir as usize].dst != be32(&ip[16..20]) {
-        return Some(None);
-    }
-    Some(Some((id, if dir == DIR_REPLY { CT_RELATED_REPLY } else { CT_RELATED })))
+    let outer = be32(&ip[16..20]) as u128;
+    Some(inner_error(ip, ihl + 8, |c, dir| c.tuple[dir as usize].dst == outer))
 }
 
-/// nf_conntrack_icmp_packet: 問い (echo、timestamp、info、address mask) だけがつながりになる
+/// ICMP / ICMPv6 のエラーの中のパケット (at から) のつながり (nf_conntrack_inet_error): 中の組を逆にして引き、外の
+/// あて先と、見つけた組のあて先が同じこと (same_dst)
+fn inner_error(ip: &[u8], at: usize, same_dst: impl Fn(&Conn, u8) -> bool) -> Option<(u32, u8)> {
+    let inner = ip.get(at..)?;
+    if inner.len() < 20 {
+        return None;
+    }
+    let orig = tuple_of(inner)?;
+    let want = invert(&orig)?;
+    let (id, dir) = find(&want)?;
+    if !same_dst(&table().conns[&id], dir) {
+        return None;
+    }
+    Some((id, if dir == DIR_REPLY { CT_RELATED_REPLY } else { CT_RELATED }))
+}
+
+/// nf_conntrack_icmp_packet と nf_conntrack_icmpv6_packet: 問い (ICMP は echo、timestamp、info、address mask、ICMPv6 は
+/// echo と node information) だけがつながりになる
 fn icmp_packet(c: &mut Conn) -> Res {
     let ty = (c.tuple[0].dport >> 8) as u8;
-    if !matches!(ty, 8 | 13 | 15 | 17) {
+    let v6 = c.tuple[0].proto == 58;
+    if !(if v6 { matches!(ty, 128 | 139) } else { matches!(ty, 8 | 13 | 15 | 17) }) {
         return Res::Invalid;
     }
-    let to = TIMEOUTS.get().icmp;
+    let to = if v6 { TIMEOUTS.get().icmpv6 } else { TIMEOUTS.get().icmp };
     refresh(c, to);
     Res::Accept
 }
@@ -654,7 +707,7 @@ fn udp_packet(c: &mut Conn, ip: &[u8], ihl: usize, hook: u32) -> Res {
     if ulen > ip.len() - ihl || ulen < 8 {
         return Res::Invalid;
     }
-    if KNOBS.get().checksum && hook == crate::nfhook::PRE_ROUTING && be16(&uh[6..8]) != 0 && !l4_ok(ip, ihl) {
+    if KNOBS.get().checksum && hook == crate::nfhook::PRE_ROUTING && be16(&uh[6..8]) != 0 && !l4_ok(ip, ihl, 17) {
         return Res::Invalid;
     }
     if let Proto::Udp { stream_ts } = &mut c.proto {
@@ -681,8 +734,13 @@ fn udp_packet(c: &mut Conn, ip: &[u8], ihl: usize, hook: u32) -> Res {
     Res::Accept
 }
 
-fn l4_ok(ip: &[u8], ihl: usize) -> bool {
+fn l4_ok(ip: &[u8], ihl: usize, proto: u8) -> bool {
     let seg = &ip[ihl..];
+    if ip[0] >> 4 == 6 {
+        let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+        let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+        return crate::nfhook::l4sum6(src, dst, proto, seg) == 0;
+    }
     let mut ph = [0u8; 12];
     ph[0..8].copy_from_slice(&ip[12..20]);
     ph[9] = ip[9];
@@ -957,7 +1015,7 @@ fn tcp_packet(c: &mut Conn, ip: &[u8], ihl: usize, dir: u8, hook: u32) -> Res {
         return Res::Invalid;
     }
     let th = &ip[ihl..ihl + doff];
-    if KNOBS.get().checksum && hook == crate::nfhook::PRE_ROUTING && !l4_ok(ip, ihl) {
+    if KNOBS.get().checksum && hook == crate::nfhook::PRE_ROUTING && !l4_ok(ip, ihl, 6) {
         return Res::Invalid;
     }
     if !tcp_valid_flags(th[13]) {
@@ -1142,13 +1200,27 @@ fn dotted(a: u32) -> String {
     alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
+/// /proc/net/nf_conntrack の番地 (IPv4 は 4 つの 10 進、IPv6 は %pI6: 4 けたの 16 進を 8 つ)
+fn addr_text(l3: u8, a: u128) -> String {
+    if l3 == 6 {
+        (0..8).map(|i| alloc::format!("{:04x}", (a >> (112 - 16 * i)) as u16)).collect::<alloc::vec::Vec<_>>().join(":")
+    } else {
+        dotted(a as u32)
+    }
+}
+
+/// AI の見る口の番地 (IPv6 はちぢめた形)
+fn addr_short(l3: u8, a: u128) -> String {
+    if l3 == 6 { alloc::format!("{}", core::net::Ipv6Addr::from(a)) } else { dotted(a as u32) }
+}
+
 fn tuple_text(s: &mut String, t: &Tuple) {
-    let _ = write!(s, "src={} dst={} ", dotted(t.src), dotted(t.dst));
+    let _ = write!(s, "src={} dst={} ", addr_text(t.l3, t.src), addr_text(t.l3, t.dst));
     match t.proto {
         6 | 17 => {
             let _ = write!(s, "sport={} dport={} ", t.sport, t.dport);
         }
-        1 => {
+        1 | 58 => {
             let _ = write!(s, "type={} code={} id={} ", t.dport >> 8, t.dport & 0xff, t.sport);
         }
         _ => {}
@@ -1160,6 +1232,7 @@ fn proto_name(p: u8) -> &'static str {
         1 => "icmp",
         6 => "tcp",
         17 => "udp",
+        58 => "icmpv6",
         33 => "dccp",
         47 => "gre",
         132 => "sctp",
@@ -1172,7 +1245,8 @@ fn proto_name(p: u8) -> &'static str {
 pub fn line(c: &Conn) -> String {
     let mut s = String::new();
     let p = c.tuple[0].proto;
-    let _ = write!(s, "{:<8} {} {:<8} {} ", "ipv4", 2, proto_name(p), p);
+    let (l3, l3num) = if c.tuple[0].l3 == 6 { ("ipv6", 10) } else { ("ipv4", 2) };
+    let _ = write!(s, "{:<8} {} {:<8} {} ", l3, l3num, proto_name(p), p);
     let _ = write!(s, "{} ", expires_ns(c) / HZ_NS);
     if let Proto::Tcp(t) = &c.proto {
         let _ = write!(s, "{} ", TCP_NAMES[t.state.min(9) as usize]);
@@ -1220,6 +1294,7 @@ pub fn summary() -> String {
                     "udp_unreplied"
                 }
             }
+            Proto::Icmp if c.tuple[0].proto == 58 => "icmpv6",
             Proto::Icmp => "icmp",
             Proto::Generic => "other",
         };
@@ -1249,8 +1324,8 @@ pub fn json_lines(limit: usize) -> String {
             c.id,
             proto_name(t.proto),
             st,
-            dotted(t.src),
-            dotted(t.dst),
+            addr_short(t.l3, t.src),
+            addr_short(t.l3, t.dst),
             t.sport,
             t.dport,
             c.status & IPS_SEEN_REPLY != 0,

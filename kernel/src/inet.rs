@@ -131,6 +131,8 @@ const URG_NOTYET: u16 = 0x200;
 const URG_READ: u16 = 0x400;
 
 const HZ: u64 = crate::timer::HZ;
+/// delayed ACK の短いほう (TCP_DELACK_MIN: 40 ms。lo の srtt はこれより短いので、pingpong の ato はこれ)
+const DELACK_MIN: u64 = HZ / 25;
 
 /// TCP の状態 (番号は Linux と同じ: /proc/net/tcp の st)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -338,6 +340,9 @@ pub struct Inet {
     /// 中どうしの TCP で、決まりと conntrack に見せる次の seq (つないだときの ISN + 1 から、データの長さだけ進む。0 は
     /// まだ見せていない)
     ct_seq: u32,
+    /// おくらせている ACK (tick。0 はなし): ESTABLISHED で FIN を受けた側は Linux の tcp_fin が pingpong にして、ACK を
+    /// delayed ACK (lo では TCP_DELACK_MIN の 40 ms) で出す。そのあいだに自分も閉じれば、FIN が ACK も運ぶ
+    ack_due: u64,
     /// ファイアウォールが落としたデータの segment (seq、中身、urgent)。送りなおすまで相手に届かない (Linux の再送)
     fw_hold: VecDeque<(u32, Vec<u8>, bool)>,
     /// 送りなおしの時刻 (tick)、回数、FIN も待っているか
@@ -549,6 +554,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         ctime: now,
         generation: 0,
         ct_seq: 0,
+        ack_due: 0,
         fw_hold: VecDeque::new(),
         fw_next: 0,
         fw_tries: 0,
@@ -1201,6 +1207,10 @@ fn arm(u: &InetRef) {
     if s.fw_next != 0 && (at == 0 || s.fw_next < at) {
         at = s.fw_next;
     }
+    // おくらせている ACK
+    if s.ack_due != 0 && (at == 0 || s.ack_due < at) {
+        at = s.ack_due;
+    }
     if s.tkey == at {
         return;
     }
@@ -1514,6 +1524,10 @@ fn syn(u: &InetRef, in_call: bool) {
 /// 止めない (つながりはもうできている。データの segment は通さない)
 fn ct_seg(u: &InetRef, flags: u8) {
     use crate::nfhook;
+    // ACK を運ぶ segment なら、おくらせていた ACK はいらない
+    if flags & nfhook::ACK != 0 {
+        u.borrow_mut().ack_due = 0;
+    }
     if !nfhook::active() {
         return;
     }
@@ -2194,10 +2208,15 @@ fn send_fin(u: &InetRef) {
         return;
     }
     if let Some(p) = &peer {
-        // conntrack には FIN と、相手の ACK を
+        // conntrack には FIN と、相手の ACK を (ESTABLISHED の相手はおくらせる: ack_due)
         ct_seg(u, crate::nfhook::FIN | crate::nfhook::ACK);
         if !Rc::ptr_eq(p, u) {
-            ct_seg(p, crate::nfhook::ACK);
+            if p.borrow().state == St::Established && crate::nfhook::active() {
+                p.borrow_mut().ack_due = ticks() + DELACK_MIN;
+                arm(p);
+            } else {
+                ct_seg(p, crate::nfhook::ACK);
+            }
         }
         rx_fin(p);
         wnd_seen(p);
@@ -2682,6 +2701,8 @@ fn deliver(u: &InetRef, data: Vec<u8>, urg: bool) {
 /// データの segment を lo の決まりに通す (PSH ACK、timestamp つき、窓 512)。通れば true。reject の RST が届けば
 /// つながりはこわれる (ECONNRESET)。ICMP はつながったものにはやわらかいエラーなので何もしない
 fn fw_data(u: &InetRef, seq: u32, seg: &[u8], urg: bool) -> bool {
+    // データの segment も ACK を運ぶ
+    u.borrow_mut().ack_due = 0;
     use crate::nfhook;
     let (e, sport, dport, tos, ttl, peer, sk, prio) = {
         let s = u.borrow();
@@ -4659,6 +4680,13 @@ pub fn tick() {
         };
         if fw_due {
             fw_retransmit(&u);
+        }
+        let ack_due = {
+            let s = u.borrow();
+            s.ack_due != 0 && now >= s.ack_due
+        };
+        if ack_due {
+            ct_seg(&u, crate::nfhook::ACK);
         }
         // まだ先の時刻があれば入れなおす (時刻が動いたもの、やりなおしの SYN がまた落とされたもの)
         arm(&u);

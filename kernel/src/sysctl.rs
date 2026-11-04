@@ -124,6 +124,7 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "net/netfilter/nf_conntrack_count", get: || format!("{}", crate::conntrack::count()), set: None },
     Entry { path: "net/netfilter/nf_conntrack_generic_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().generic), set: Some(|s| { crate::conntrack::TIMEOUTS.get().generic = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
     Entry { path: "net/netfilter/nf_conntrack_icmp_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().icmp), set: Some(|s| { crate::conntrack::TIMEOUTS.get().icmp = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
+    Entry { path: "net/netfilter/nf_conntrack_icmpv6_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().icmpv6), set: Some(|s| { crate::conntrack::TIMEOUTS.get().icmpv6 = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
     Entry { path: "net/netfilter/nf_conntrack_max", get: || format!("{}", crate::conntrack::max()), set: Some(|s| { crate::conntrack::KNOBS.get().max = num(s, 1, 1 << 30)?; Ok(()) }) },
     Entry { path: "net/netfilter/nf_conntrack_tcp_be_liberal", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_be_liberal as u8), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_be_liberal = num(s, 0, 1)? == 1; Ok(()) }) },
     Entry { path: "net/netfilter/nf_conntrack_tcp_ignore_invalid_rst", get: || format!("{}", crate::conntrack::KNOBS.get().tcp_ignore_invalid_rst as u8), set: Some(|s| { crate::conntrack::KNOBS.get().tcp_ignore_invalid_rst = num(s, 0, 1)? == 1; Ok(()) }) },
