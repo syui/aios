@@ -928,7 +928,8 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     (致命))。つなぐ TCP は致命のもので終わり (EACCES など)、UDP は connect したものに致命のものだけ。だれもいない UDP
     へのカーネルの port unreachable も決まりの道を通る
   - log: nf_log_ip6_packet と同じ行 (SRC= DST= は 4 けたの 16 進を 8 つ、LEN= TC= HOPLIMIT= FLOWLBL= PROTO= …)
-  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)、eth0 の IPv6
+  - まだ: IPv6 の conntrack (ct の式は IPv6 のパケットでは動かない: Linux は nf_conntrack_ipv6)、eth0 の IPv6 の
+    フレーム (eth0 の IPv6 はあるが、決まりに通すのは IPv4 のフレームだけ)
   - 確かめかた: `test/nfteval6.c` (root で。11 の case: accept と counter、input の drop と reject (tcp reset、icmpv6 の
     admin-prohibited・addr-unreachable・no-route、icmpx)、output の drop と reject、ip だけ・ip6 だけの表 (::1、
     127.0.0.1、::ffff:127.0.0.1 へ)、inet の policy drop と nfproto、log)。
@@ -946,7 +947,7 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     icmp、フラグ) で、パケットを流さずに、いまの決まり (写したもの) にとおして、鎖と決まりごとに「どの式で外れたか、
     どの判定か」と答え (/proc/ai/fw の trace の行)。counter も limit も conntrack も変えない。つながらない・届かない
     わけを、AI がパケットを送らずに探せる
-- そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 の conntrack と eth0 の IPv6 (aios の eth0 に IPv6 ができてから)
+- そのあと: NAT と転送 (名前空間に口を作るとき)、IPv6 の conntrack と eth0 の IPv6 のフレーム
 
 Linux とのくらべかた: 手本の Linux (test/linux.config) に nf_tables と virtio-net を入れ、同じ nft の決まりで、同じ相手
 (QEMU のユーザーネットワークの 10.0.2.2) へのつなぎと受けの答え (つながる、ECONNREFUSED、時間切れ)、`nft -j list ruleset`、
@@ -1018,7 +1019,7 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   ゲートウェイ 10.0.2.2。IPv6 のものは出さない)。dump (家族、strict の表えらび)、1 つの道 (19 の宛先と元と oif、
   fibmatch、strict のしくじり)、Firefox と同じ問いあわせで link up。Linux 7.4-rc1 と 232 行同じ。ldiff に --net を足した
 
-### IPv6 (AF_INET6、段階 1: ::1 と、v4 の番地を写したもの)
+### IPv6 (AF_INET6: ::1 と v4 の番地を写したもの、eth0 の IPv6)
 
 多くのプログラムが IPv6 を先にためす (`::` や `::1` で待つ、名前の AAAA)。aios は AF_INET6 がなく EAFNOSUPPORT だった
 (test/features.c で見つけた)。段階 1 は aios の中 (ループバック) と、IPv4 とのつなぎ。
@@ -1027,8 +1028,8 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   など) がある (kernel/src/inet.rs)。IPv4 とのやりとり (`::ffff:a.b.c.d` へ、`::` で待つものへの IPv4) は v4 の欄で
   いつもの道を通り、名前だけ写した番地 (sockaddr_in6) で見せる。IPv6 だけのもの (v6) は v4 の欄が LOOPBACK4_IPV6
   (127.0.0.6) で、v6only なので IPv4 からは見えない。ポートの表は v4 と v6 で 1 つ
-- socket(AF_INET6): SOCK_STREAM (TCP) と SOCK_DGRAM (UDP)。raw と ping (ICMPv6) はまだ (EPROTONOSUPPORT と EACCES)。
-  socketpair は EOPNOTSUPP
+- socket(AF_INET6): SOCK_STREAM (TCP) と SOCK_DGRAM (UDP)、SOCK_RAW の IPPROTO_ICMPV6 (段階 2c、root)。ほかの raw は
+  EPROTONOSUPPORT、ping ソケット (SOCK_DGRAM の ICMPv6) は ping_group_range (1 0) で EACCES。socketpair は EOPNOTSUPP
 - bind (__inet6_bind): 24 バイトから、写した番地は v6only なら EINVAL、IPv6 の番地に bind すると v6only になる、
   fe80:: は口がなければ EINVAL、自分のもの (::1) でなければ EADDRNOTAVAIL、TCP に multicast は EINVAL。ぶつかりは
   inet_rcv_saddr_equal (ipv6_rcv_saddr_equal: `::` は v6only の写した番地でなければ重なる)
@@ -1052,10 +1053,39 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   1 つの道は ::1 なら RTA_PREFSRC ::1 つき、ほかは ENETUNREACH
 - ファイアウォール (段階 2b): ::1 の TCP と UDP も lo の 4 つのフックに通す (上の「ファイアウォール (nftables)」の
   IPv6)。ip6 と inet の決まり、reject の RST と ICMPv6、log が Linux と同じ
-- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、raw と ICMPv6、IPv6 の conntrack
+- eth0 の IPv6 (段階 2c、kernel/src/addrconf.rs: Linux の addrconf.c と ndisc.c の RA のところ)。smoltcp の proto-ipv6
+  を入れ、近所さがし (NS と NA) と echo の答えは smoltcp が、ほかはここで:
+  - link-local は起こしたときに fe80::/64 + MAC からの EUI-64 (addr_gen_mode 0。IFA_F_PERMANENT、IFA_PROTO 3)。道は
+    fe80::/64 (proto kernel、metric 256) と ff00::/8 (RTN_MULTICAST)
+  - RS を ff02::2 へ (SLLA つき。RA が来るまで 4 秒から倍に)。RA (link-local から、hop limit 255) を読む: cur hop limit は
+    hop_limit と既定の道の RTAX_HOPLIMIT、router lifetime は既定の道 (proto ra、metric 1024、expires)、MTU、prefix
+    (L はその道 (proto kernel、metric 256、expires)、A で /64 なら SLAAC の番地: prefix + EUI-64、IFA_F_MANAGETEMPADDR、
+    IFA_PROTO 2、preferred と valid の lifetime。切れたら消す)、SLLA は近くの番地の表へ (ルーター)。QEMU の
+    ユーザーネットワークでは fec0::5054:ff:fe12:3456/64 (fec0::/10 は site-local: scope 200、if_inet6 の 40)
+  - DAD と MLD はしない (Linux は DAD のあいだ 1 秒 tentative)
+  - 送り元のえらびかた (ipv6_dev_get_saddr のうち scope と deprecated と prefix の長さ)、道のさがしかた (長い prefix、
+    metric)。自分の番地へは lo (IPv4 と同じく相手の行列へじかに)、ほかは smoltcp。link-local は scope id がいり
+    (なければ EINVAL、eth0 でなければ ENETUNREACH)、名前の scope id は eth0 (aios の口は 1 つ)
+  - 外への TCP と UDP は smoltcp のソケット (送り元も決めて)。listen は `::` か eth0 の番地なら外からも受け、IPv6 の
+    つながりは v4 の欄が LOOPBACK4_IPV6。eth0 から来た ICMPv6 のエラーは中のもとのパケットの組のソケットに
+    (tcp_v6_err: つなぐ途中ならどのエラーでも止める。__udp6_lib_err: connect したものに致命のもの)。QEMU のホストに
+    IPv6 がなければ、外へのつなぎは ICMPv6 の no route で ENETUNREACH になる (Linux も同じ)
+  - raw の ICMPv6 (rawv6: ICMPv6 の頭から送り受け、チェックサムはカーネル、ICMP6_FILTER、IPV6_UNICAST_HOPS)。ping6 が
+    外 (fec0::2、fe80::2) と自分の番地に届く
+  - netlink: eth0 の番地 (scope、flags、IFA_PROTO、のこりの lifetime)、道 (上のもの、自分の番地の RTN_LOCAL: dump の口は
+    eth0、get の答えは lo)、1 つの道 (prefsrc、via、RTA_METRICS)、近くの番地の表の IPv6 (nd_tbl: smoltcp が出す NS で
+    INCOMPLETE、NA で REACHABLE か STALE、R はルーター (NTF_ROUTER)、RA の SLLA で STALE)。/proc/net/if_inet6 と
+    ipv6_route (refcnt はいつも 1)、/proc/sys/net/ipv6/conf/{all,default,lo,eth0}/ のいくつか (読むだけ) と
+    net/ipv4/ping_group_range
+- まだ: eth0 の IPv6 のファイアウォール (nftables は eth0 の IPv6 のフレームを見ない) と IPv6 の conntrack、DAD、MLD、
+  packet too big (PMTU)、IPV6_RECVERR の行列、ip -6 addr add / route add (RTM_NEWADDR と RTM_NEWROUTE の AF_INET6)、
+  IPv6 の番地と道の netlink の知らせ (RTNLGRP_IPV6_*)、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
-  二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道)。Linux
-  7.4-rc1 と 185 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c` (171 行同じ)
+  二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
+  ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
+  (171 行同じ)。eth0 の IPv6 は `test/ldiff.sh --root --net inet6net` (手本の Linux も ip=dhcp の virtio-net で、MAC が
+  同じなので番地も同じ。SLAAC を待ち、if_inet6、RTM_GETADDR、getifaddrs、道の dump と get、送り元、自分の番地への
+  TCP と UDP、外への TCP、ping6、近くの番地、sysctl、ipv6_route): 78 行同じ。ctests にも (root で)
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 

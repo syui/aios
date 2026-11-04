@@ -58,6 +58,10 @@ enum Proto {
     /// raw の ICMP (SOCK_RAW + IPPROTO_ICMP、root だけ)。受けるのは IP ヘッダーからの ICMP ぜんぶ (traceroute が
     /// 途中のルーターの「時間切れ」を受ける)。送るものには IP ヘッダーをつける
     Raw,
+    /// raw の ICMPv6 (AF_INET6 の SOCK_RAW + IPPROTO_ICMPV6、root だけ: ping6 など。Linux の rawv6)。送るのも受けるのも
+    /// ICMPv6 の頭から (IPv6 の頭はカーネルがつけ、はずす)。チェックサムはカーネルが (IPV6_CHECKSUM は 2 にきまり)。
+    /// 受けるものは ICMP6_FILTER (type ごとのビット: 立っていれば捨てる) をとおったもの
+    Raw6,
 }
 
 pub struct Socket {
@@ -74,6 +78,8 @@ pub struct Socket {
     ttl: Option<u8>,
     /// 分けた NET (ns.rs) の中: どこへも送れない
     isolated: bool,
+    /// ICMP6_FILTER (Raw6。0 はみなとおす)
+    filter6: [u32; 8],
 }
 
 pub type SockRef = Rc<RefCell<Socket>>;
@@ -162,6 +168,29 @@ impl Socket {
                     wait(nb)?;
                 }
             }
+            // ICMPv6 の頭から。送り元は IPv6 の頭の中 (link-local なら scope は eth0)。ICMP6_FILTER で捨てるものは読みとばす
+            Proto::Raw6 => {
+                let h = self.bind_raw()?;
+                loop {
+                    let s = raw_sock(h);
+                    if s.can_recv() {
+                        let mut pkt = vec![0u8; 65536];
+                        let k = if peek { s.peek_slice(&mut pkt) } else { s.recv_slice(&mut pkt) }.map_err(|_| crate::why::inval())?;
+                        let blocked = k < 41 || (self.filter6[pkt[40] as usize >> 5] >> (pkt[40] & 31)) & 1 != 0;
+                        if blocked {
+                            if peek {
+                                let _ = s.recv_slice(&mut pkt);
+                            }
+                            continue;
+                        }
+                        let n = (k - 40).min(buf.len());
+                        buf[..n].copy_from_slice(&pkt[40..40 + n]);
+                        let from = smoltcp::wire::Ipv6Address::from_bits(u128::from_be_bytes(pkt[8..24].try_into().unwrap()));
+                        return Ok((n, Some(IpEndpoint::new(IpAddress::Ipv6(from), 0))));
+                    }
+                    wait(nb)?;
+                }
+            }
             // ICMP の echo reply (IP ヘッダーなし、ICMP ヘッダーから)
             Proto::Icmp => {
                 let h = self.bind_icmp()?;
@@ -185,7 +214,7 @@ impl Socket {
             // ICMP のメッセージに IP ヘッダーをつけて送る (Linux の raw で IP_HDRINCL なしと同じ)
             Proto::Raw => {
                 let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
-                let IpAddress::Ipv4(dst) = to.addr;
+                let IpAddress::Ipv4(dst) = to.addr else { return Err(-EAFNOSUPPORT) };
                 let h = self.bind_raw()?;
                 let total = 20 + buf.len();
                 if total > 65535 {
@@ -205,9 +234,46 @@ impl Socket {
                 net::poll();
                 Ok(buf.len())
             }
+            // ICMPv6 のメッセージに IPv6 の頭をつけて (rawv6_sendmsg: 送り元は道の送り元のえらびかた、hop limit は
+            // IPV6_UNICAST_HOPS か口のもの (マルチキャストは 1)、チェックサムは擬似ヘッダーから)
+            Proto::Raw6 => {
+                let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
+                let IpAddress::Ipv6(dst) = to.addr else { return Err(-EAFNOSUPPORT) };
+                let dst = dst.to_bits();
+                if buf.len() < 4 {
+                    return Err(crate::why::inval());
+                }
+                if buf.len() > 65535 {
+                    return Err(-90);
+                }
+                let h = self.bind_raw()?;
+                let src = if crate::addrconf::is_mine(dst) {
+                    dst
+                } else {
+                    crate::addrconf::lookup(dst).ok_or(-ENETUNREACH)?;
+                    crate::addrconf::source_for(dst).ok_or(-ENETUNREACH)?
+                };
+                let hops = self.ttl.unwrap_or(if dst >> 120 == 0xff { 1 } else { crate::addrconf::hop_limit() });
+                let mut pkt = Vec::with_capacity(40 + buf.len());
+                pkt.extend_from_slice(&[0x60, 0, 0, 0]);
+                pkt.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+                pkt.extend_from_slice(&[58, hops]);
+                pkt.extend_from_slice(&src.to_be_bytes());
+                pkt.extend_from_slice(&dst.to_be_bytes());
+                pkt.extend_from_slice(buf);
+                pkt[42..44].copy_from_slice(&[0, 0]);
+                let sum = crate::addrconf::icmp6_sum(src, dst, &pkt[40..]);
+                pkt[42..44].copy_from_slice(&sum.to_be_bytes());
+                raw_sock(h).send_slice(&pkt).map_err(|_| -EAGAIN)?;
+                net::poll();
+                Ok(buf.len())
+            }
             // ICMP の echo request: Linux と同じく id をこのソケットの番号にして、チェックサムを計算しなおす
             Proto::Icmp => {
                 let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
+                if !matches!(to.addr, IpAddress::Ipv4(_)) {
+                    return Err(-EAFNOSUPPORT);
+                }
                 if buf.len() < 8 || buf[0] != 8 {
                     return Err(crate::why::inval());
                 }
@@ -230,7 +296,8 @@ impl Socket {
             return Ok(h);
         }
         let meta = || vec![raw::PacketMetadata::EMPTY; 16];
-        let sock = raw::Socket::new(IpVersion::Ipv4, IpProtocol::Icmp, raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]), raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]));
+        let (ver, proto) = if self.proto == Proto::Raw6 { (IpVersion::Ipv6, IpProtocol::Icmpv6) } else { (IpVersion::Ipv4, IpProtocol::Icmp) };
+        let sock = raw::Socket::new(ver, proto, raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]), raw::PacketBuffer::new(meta(), vec![0; 16 * 1024]));
         let h = n()?.sockets.add(sock);
         self.handle = Some(h);
         Ok(h)
@@ -267,6 +334,7 @@ impl Socket {
         match self.proto {
             Proto::Icmp => usize::from(icmp_sock(h).can_recv()),
             Proto::Raw => raw_sock(h).peek().map_or(0, |d| d.len()),
+            Proto::Raw6 => raw_sock(h).peek().map_or(0, |d| d.len().saturating_sub(40)),
         }
     }
 
@@ -276,14 +344,32 @@ impl Socket {
         let Some(h) = self.handle else { return (false, true, false) };
         match self.proto {
             Proto::Icmp => (icmp_sock(h).can_recv(), true, false),
-            Proto::Raw => (raw_sock(h).can_recv(), true, false),
+            Proto::Raw | Proto::Raw6 => (raw_sock(h).can_recv(), true, false),
         }
     }
 }
 
 // ---- sockaddr_in ----
 
-fn read_addr(va: usize, len: usize) -> Result<IpEndpoint, i64> {
+/// sockaddr_in (v6 なら sockaddr_in6: 24 バイトから。link-local は scope id がいる)
+fn read_addr(va: usize, len: usize, v6: bool) -> Result<IpEndpoint, i64> {
+    if v6 {
+        if len < 24 {
+            return Err(crate::why::inval());
+        }
+        let mut b = [0u8; 28];
+        let n = len.min(28);
+        proc::current().pt().copy_in(&mut b[..n], va).ok_or(-EFAULT)?;
+        if u16::from_le_bytes([b[0], b[1]]) as u64 != AF_INET6 {
+            return Err(-EAFNOSUPPORT);
+        }
+        let a = u128::from_be_bytes(b[8..24].try_into().unwrap());
+        let scope = u32::from_le_bytes(b[24..28].try_into().unwrap());
+        if (crate::addrconf::is_link_local(a) || (a >> 120 == 0xff && (a >> 112) & 0xf == 2)) && scope == 0 {
+            return Err(crate::why::inval());
+        }
+        return Ok(IpEndpoint::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_bits(a)), u16::from_be_bytes([b[2], b[3]])));
+    }
     if len < 8 {
         return Err(crate::why::inval());
     }
@@ -296,13 +382,26 @@ fn read_addr(va: usize, len: usize) -> Result<IpEndpoint, i64> {
     Ok(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(b[4], b[5], b[6], b[7])), port))
 }
 
-fn endpoint_bytes(ep: Option<IpEndpoint>) -> [u8; 16] {
-    let mut b = [0u8; 16];
+/// sockaddr_in か sockaddr_in6 (link-local の scope id は eth0)
+fn endpoint_bytes(ep: Option<IpEndpoint>) -> Vec<u8> {
+    if let Some(IpEndpoint { addr: IpAddress::Ipv6(a), port }) = ep {
+        let a = a.to_bits();
+        let mut b = vec![0u8; 28];
+        b[0..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        b[2..4].copy_from_slice(&port.to_be_bytes());
+        b[8..24].copy_from_slice(&a.to_be_bytes());
+        if crate::addrconf::is_link_local(a) || (a >> 120 == 0xff && (a >> 112) & 0xf == 2) {
+            b[24..28].copy_from_slice(&(crate::netlink::ETH_INDEX as u32).to_le_bytes());
+        }
+        return b;
+    }
+    let mut b = vec![0u8; 16];
     b[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
     if let Some(ep) = ep {
         b[2..4].copy_from_slice(&ep.port.to_be_bytes());
-        let IpAddress::Ipv4(a) = ep.addr;
-        b[4..8].copy_from_slice(&a.octets());
+        if let IpAddress::Ipv4(a) = ep.addr {
+            b[4..8].copy_from_slice(&a.octets());
+        }
     }
     b
 }
@@ -365,17 +464,20 @@ fn aa_sk(s: &Sock, op: &str, request: u32, what: InetOp) -> Result<(), i64> {
             {
                 crate::inet::aa_map_addr(*r)?;
             }
-            let (t, local) = {
+            let (t, local, proto) = {
                 let s = s.borrow();
-                (if s.proto == Proto::Raw { 3 } else { 2 }, smol_name(&s))
+                (if matches!(s.proto, Proto::Raw | Proto::Raw6) { 3 } else { 2 }, smol_name(&s), if s.proto == Proto::Raw6 { 58 } else { IPPROTO_ICMP as u32 })
             };
-            crate::apparmor::inet_perm(op, request, t, IPPROTO_ICMP as u32, &local, what, &crate::apparmor::NetAudit::default)
+            crate::apparmor::inet_perm(op, request, t, proto, &local, what, &crate::apparmor::NetAudit::default)
         }
     }
 }
 
-/// ICMP と raw のソケットの名前 (getsockname と同じ)
-fn smol_name(s: &Socket) -> [u8; 16] {
+/// ICMP と raw のソケットの名前 (getsockname と同じ。raw の ICMPv6 は :: とポートの欄に protocol の 58: inet6_create)
+fn smol_name(s: &Socket) -> Vec<u8> {
+    if s.proto == Proto::Raw6 {
+        return endpoint_bytes(Some(IpEndpoint::new(s.local.and_then(|l| l.addr).unwrap_or(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)), 58)));
+    }
     endpoint_bytes(s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::addr())), l.port)))
 }
 
@@ -706,11 +808,20 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
         let fd = proc::current().files().add(crate::unix::file_of(u, flags), cloexec, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
-    // AF_INET6 (inet.rs の段階 1: TCP と UDP。raw と ping はまだ)
+    // AF_INET6 (inet.rs の TCP と UDP。raw は ICMPv6 だけ。ping ソケットは ping_group_range で EACCES)
     if domain == AF_INET6 {
         inet_check(t, protocol, true)?;
         if t == SOCK_RAW {
-            return Err(-EPROTONOSUPPORT);
+            if protocol as u32 != 58 {
+                return Err(-EPROTONOSUPPORT);
+            }
+            n()?;
+            let isolated = crate::ns::net().is_some();
+            let mut s = Socket { proto: Proto::Raw6, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated, filter6: [0; 8] };
+            if !isolated {
+                s.bind_raw()?;
+            }
+            return add_fd(s, cloexec);
         }
         let u = crate::inet::create6(t, protocol as u32 as u64);
         let fd = proc::current().files().add(crate::inet::file_of(u, flags), cloexec, 0).ok_or(-EMFILE)?;
@@ -725,7 +836,7 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     if (t == SOCK_DGRAM && protocol == IPPROTO_ICMP) || (t == SOCK_RAW && protocol == IPPROTO_ICMP && crate::cred::current().capable(crate::cred::CAP_NET_RAW)) {
         n()?;
         let proto = if t == SOCK_RAW { Proto::Raw } else { Proto::Icmp };
-        let mut s = Socket { proto, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated };
+        let mut s = Socket { proto, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated, filter6: [0; 8] };
         // raw は作ったときから受ける (traceroute は受ける口を poll で待つだけで、送らない)
         if s.proto == Proto::Raw && !isolated {
             s.bind_raw()?;
@@ -780,7 +891,8 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
                 }
                 aa_sk(&Sock::Smol(s.clone()), "bind", crate::apparmor::MAY_BIND, InetOp::Bind(&a))?;
             }
-            let ep = read_addr(addr, len)?;
+            let v6 = s.borrow().proto == Proto::Raw6;
+            let ep = read_addr(addr, len, v6)?;
             let mut s = s.borrow_mut();
             let a = if ep.addr.is_unspecified() { None } else { Some(ep.addr) };
             s.local = Some(IpListenEndpoint { addr: a, port: ep.port });
@@ -900,7 +1012,8 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
                 let a = addr_in(addr, len)?;
                 aa_sk(&Sock::Smol(s.clone()), "connect", crate::apparmor::MAY_CONNECT, InetOp::Remote(Some(&a)))?;
             }
-            let ep = read_addr(addr, len)?;
+            let v6 = s.borrow().proto == Proto::Raw6;
+            let ep = read_addr(addr, len, v6)?;
             let mut s = s.borrow_mut();
             if s.isolated {
                 return Err(-ENETUNREACH);
@@ -908,7 +1021,7 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
             s.peer = Some(ep);
             match s.proto {
                 Proto::Icmp => s.bind_icmp().map(|_| 0),
-                Proto::Raw => s.bind_raw().map(|_| 0),
+                Proto::Raw | Proto::Raw6 => s.bind_raw().map(|_| 0),
             }
         }
     }
@@ -939,7 +1052,8 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
                 let to = if addr != 0 { Some(addr_in(addr, alen)?) } else { None };
                 aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to.as_deref()))?;
             }
-            let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
+            let v6 = s.borrow().proto == Proto::Raw6;
+            let to = if addr != 0 { Some(read_addr(addr, alen, v6)?) } else { None };
             let mut data = uninit(len.min(64 * 1024));
             proc::current().pt().copy_in(&mut data, buf).ok_or(-EFAULT)?;
             let n = s.borrow_mut().send(&data, to, flags & MSG_DONTWAIT != 0)?;
@@ -1000,8 +1114,7 @@ pub fn getsockname(fd: u64, addr: usize, lenp: usize) -> R {
         Sock::Inet(_, u) => addr_out(addr, lenp, &crate::inet::name(&u, 0)?)?,
         Sock::Smol(s) => {
             let s = s.borrow();
-            let ep = s.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(IpAddress::Ipv4(net::addr())), l.port));
-            addr_out(addr, lenp, &endpoint_bytes(ep))?;
+            addr_out(addr, lenp, &smol_name(&s))?;
         }
     }
     Ok(0)
@@ -1058,9 +1171,16 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     let v = match s {
         Sock::Unix(_, u) => crate::unix::getsockopt(&u, level as i32, opt as i32, len)?,
         Sock::Inet(_, u) => crate::inet::getsockopt(&u, level as i32, opt as i32, len)?,
+        // ICMP6_FILTER (raw の ICMPv6: 32 バイト)
+        Sock::Smol(s) if (level, opt) == (58, 1) && s.borrow().proto == Proto::Raw6 => {
+            let f = s.borrow().filter6;
+            let mut b: Vec<u8> = f.iter().flat_map(|w| w.to_le_bytes()).collect();
+            b.truncate(len.clamp(0, 32) as usize);
+            b
+        }
         Sock::Smol(s) => {
             let v: i32 = match (level, opt) {
-                (SOL_SOCKET, SO_TYPE) => if s.borrow().proto == Proto::Raw { 3 } else { 2 },
+                (SOL_SOCKET, SO_TYPE) => if matches!(s.borrow().proto, Proto::Raw | Proto::Raw6) { 3 } else { 2 },
                 (0, 2) => s.borrow().ttl.unwrap_or(64) as i32,
                 _ => 0,
             };
@@ -1170,7 +1290,8 @@ pub fn sendmsg(fd: u64, msg: usize, flags: u64) -> R {
                 let to = namelen.map(|n| addr_in(m.name, n)).transpose()?;
                 aa_sk(&Sock::Smol(s.clone()), "sendmsg", crate::apparmor::MAY_SEND, InetOp::Remote(to.as_deref()))?;
             }
-            let to = namelen.map(|n| read_addr(m.name, n)).transpose()?;
+            let v6 = s.borrow().proto == Proto::Raw6;
+            let to = namelen.map(|n| read_addr(m.name, n, v6)).transpose()?;
             let mut data = Vec::new();
             for (base, len) in &m.iov {
                 let start = data.len();
@@ -1407,6 +1528,32 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
             crate::inet::setsockopt(&u, level as i32, opt as i32, &b)
         }
         Sock::Smol(s) => {
+            // ICMP6_FILTER (raw の ICMPv6: 32 バイトより長ければ 32 まで)
+            if (level, opt) == (58, 1) && s.borrow().proto == Proto::Raw6 {
+                let mut v = [0u8; 32];
+                let n = (len as usize).min(32);
+                proc::current().pt().copy_in(&mut v[..n], val).ok_or(-EFAULT)?;
+                let mut f = [0u32; 8];
+                for (i, w) in f.iter_mut().enumerate() {
+                    *w = u32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                s.borrow_mut().filter6 = f;
+                return Ok(0);
+            }
+            // IPV6_UNICAST_HOPS (raw の ICMPv6)
+            if (level, opt) == (41, 16) && s.borrow().proto == Proto::Raw6 {
+                let mut v = [0u8; 4];
+                let n = (len as usize).min(4);
+                proc::current().pt().copy_in(&mut v[..n], val).ok_or(-EFAULT)?;
+                let v = i32::from_le_bytes(v);
+                let hops = match v {
+                    -1 => None,
+                    0..=255 => Some(v as u8),
+                    _ => return Err(crate::why::inval()),
+                };
+                s.borrow_mut().set_ttl(hops);
+                return Ok(0);
+            }
             if (level, opt) == (IPPROTO_IP, IP_TTL) {
                 let mut v = [0u8; 4];
                 let n = (len as usize).min(4);

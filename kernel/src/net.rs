@@ -5,6 +5,9 @@
 // 0.0.0.0 にすると DHCP にもどす。インターフェースは 1 つ (eth0)
 // ループバック: 127.0.0.1/8 もいつも持ち、自分あて (127.x と自分のアドレス) のフレームは
 // virtio に出さずに受け取りの列へもどす (ARP も自分で答える)
+// IPv6: eth0 の番地と道は addrconf.rs (link-local と RA からの SLAAC)。それを smoltcp に渡し (sync6)、RS を出す。
+// 自分の IPv6 の番地あてのフレーム (と、それを問う NS) も受け取りの列へ。NS / NA / RA は近くの番地の表に (netlink.rs)、
+// eth0 から来た ICMPv6 のエラーは poll のあとで inet.rs に
 use crate::cell::Bkl;
 use crate::proc;
 use crate::timer;
@@ -30,6 +33,8 @@ pub struct Net {
     dhcp: Option<SocketHandle>,
     /// DHCP でもらったもの、または手で決めたもの (dns は DHCP でもらっていたもの)
     pub lease: Option<Lease>,
+    /// smoltcp に渡した IPv6 の番地と道の版 (addrconf::generation)
+    v6gen: u64,
 }
 
 #[derive(Clone)]
@@ -76,6 +81,8 @@ fn set_gw(r: Option<Ipv4Address>) {
 
 /// ファイアウォールが返した ICMP のエラーで、smoltcp の外 (inet.rs) のソケットに届けるもの (poll のあとで)
 static ICMP_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
+/// eth0 から来た ICMPv6 のエラー (IPv6 の頭から): smoltcp は TCP と UDP のソケットに当てないので、poll のあとで inet.rs に
+static ICMP6_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
 /// 送り受けの数 (eth0 と lo): 受けたバイト, 受けたフレーム, 出したバイト, 出したフレーム
 static ETH_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 static LO_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
@@ -98,14 +105,17 @@ fn is_local(ip: &[u8]) -> bool {
     ip[0] == 127 || (u32::from_be_bytes([ip[0], ip[1], ip[2], ip[3]]) == ETH_ADDR.load(Ordering::Relaxed) && ip != [0, 0, 0, 0])
 }
 
-/// 出すフレームが自分あてか (IPv4 の宛先、ARP の問い合わせ先で見る)
+/// 出すフレームが自分あてか (IPv4 の宛先、ARP の問い合わせ先、IPv6 の宛先と NS の問い合わせ先で見る)
 fn loops_back(f: &[u8]) -> bool {
     if f.len() < 14 {
         return false;
     }
+    let mine6 = |b: &[u8]| crate::addrconf::is_mine(u128::from_be_bytes(b.try_into().unwrap()));
     match u16::from_be_bytes([f[12], f[13]]) {
         0x0800 if f.len() >= 34 => is_local(&f[30..34]),
         0x0806 if f.len() >= 42 => is_local(&f[38..42]),
+        // NS (ICMPv6 の 135) は問い合わせる番地 (target) で
+        0x86dd if f.len() >= 54 => mine6(&f[38..54]) || (f.len() >= 78 && f[20] == 58 && f[54] == 135 && mine6(&f[62..78])),
         _ => false,
     }
 }
@@ -128,6 +138,15 @@ impl Device for NetDev {
             // ARP は近くの番地の表に (netlink の RTM_GETNEIGH。自分の MAC あてなら PACKET_HOST)
             if frame.len() >= 14 && frame[12..14] == [8, 6] {
                 crate::netlink::arp_in(&frame, frame[..6] == self.mac);
+            }
+            // IPv6: RA は addrconf が読み、NS / NA / RA は近くの番地の表に (どれも smoltcp にもわたす)
+            if frame.len() >= 54 && frame[12..14] == [0x86, 0xdd] {
+                crate::addrconf::rx(&frame);
+                crate::netlink::nd_in(&frame, frame[..6] == self.mac);
+                // ICMPv6 のエラー (type が 128 より小さいもの) で自分あてのもの
+                if frame.len() >= 54 + 48 && frame[20] == 58 && frame[54] < 128 && crate::addrconf::is_mine(u128::from_be_bytes(frame[38..54].try_into().unwrap())) {
+                    ICMP6_LATER.get().push(frame[14..].to_vec());
+                }
             }
             // ファイアウォール (PRE_ROUTING と LOCAL_IN)。落とせば次のフレームを
             if self.filter_in(&mut frame) {
@@ -172,6 +191,9 @@ impl TxToken for Tx<'_> {
             count(false, false, len);
             if len >= 14 && buf[12..14] == [8, 6] {
                 crate::netlink::arp_out(&buf);
+            }
+            if len >= 54 && buf[12..14] == [0x86, 0xdd] {
+                crate::netlink::nd_out(&buf);
             }
             self.0.virtio.send(len, |b| b.copy_from_slice(&buf));
         }
@@ -266,7 +288,7 @@ impl NetDev {
     }
 }
 
-/// インターフェースのアドレス: eth0 のもの、それにいつも 127.0.0.1/8。
+/// インターフェースのアドレス: eth0 のもの、それにいつも 127.0.0.1/8、そして eth0 の IPv6 のもの (addrconf)。
 /// eth0 を先に置く (smoltcp は同じネットワークのものがなければ先頭を送り元にするので、外へは eth0 から出る)
 fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
     ETH_ADDR.store(eth.map_or(0, |c| u32::from_be_bytes(c.address().octets())), Ordering::Relaxed);
@@ -277,7 +299,30 @@ fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
             let _ = a.push(IpCidr::Ipv4(c));
         }
         let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)));
+        for x in crate::addrconf::addrs() {
+            let _ = a.push(IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(smoltcp::wire::Ipv6Address::from_bits(x.addr), x.prefix)));
+        }
     });
+}
+
+/// IPv6 の番地と既定のルーターが変わったら smoltcp に (addrconf の版で見る)
+fn sync6(n: &mut Net) {
+    let g = crate::addrconf::generation();
+    if g == n.v6gen {
+        return;
+    }
+    n.v6gen = g;
+    let v4 = n.lease.as_ref().map(|l| l.addr);
+    set_addrs(&mut n.iface, v4);
+    match crate::addrconf::router() {
+        Some(r) => {
+            let _ = n.iface.routes_mut().add_default_ipv6_route(smoltcp::wire::Ipv6Address::from_bits(r));
+        }
+        None => {
+            n.iface.routes_mut().remove_default_ipv6_route();
+        }
+    }
+    crate::netlink::changed();
 }
 
 pub fn init() {
@@ -287,13 +332,18 @@ pub fn init() {
     let mut cfg = Config::new(mac.into());
     cfg.random_seed = crate::rand::u64();
     let mut iface = Interface::new(cfg, &mut dev, now());
+    crate::addrconf::init(virtio_mac(&dev));
     set_addrs(&mut iface, None);
     let mut sockets = SocketSet::new(Vec::new());
     let dhcp = sockets.add(dhcpv4::Socket::new());
     crate::irq::enable(dev.virtio.mmio.irq);
     println!("net: {} (dhcp)", mac);
-    *NET.get() = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None });
+    *NET.get() = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None, v6gen: crate::addrconf::generation() });
     poll();
+}
+
+fn virtio_mac(d: &NetDev) -> [u8; 6] {
+    d.mac
 }
 
 /// 今のアドレス (まだなければ 0.0.0.0)
@@ -460,6 +510,14 @@ pub fn chan() -> usize {
 /// パケットを出し入れし、待っている人を起こす。タイマ、割り込み、システムコールから呼ぶ
 pub fn poll() {
     let Some(n) = get() else { return };
+    // IPv6: RS を出す、lifetime の切れたものを捨てる、変わったものを smoltcp に
+    if let Some(rs) = crate::addrconf::tick()
+        && n.dev.virtio.can_send()
+    {
+        count(false, false, rs.len());
+        n.dev.virtio.send(rs.len(), |b| b.copy_from_slice(&rs));
+    }
+    sync6(n);
     let mut changed = n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     // 自分あてに出したものを受け取る (ARP の問い合わせ → 答え → パケット、と続くので何回か)
     for _ in 0..16 {
@@ -469,11 +527,16 @@ pub fn poll() {
         changed |= n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     }
     dhcp_event(n);
+    sync6(n);
     crate::netlink::neigh_tick();
     // ファイアウォールが返した ICMP のエラーを、受けるソケットに (smoltcp の poll の外で)
     let later = core::mem::take(ICMP_LATER.get());
     for r in later {
         crate::inet::icmp_error(&r);
+    }
+    let later6 = core::mem::take(ICMP6_LATER.get());
+    for r in later6 {
+        crate::inet::icmp6_error(&r);
     }
     // 終わった孤児を片付ける
     let sockets = &mut n.sockets;

@@ -45,6 +45,7 @@ mod kalloc;
 mod memlayout;
 mod prof;
 mod inet;
+mod addrconf;
 mod net;
 mod netif;
 mod netlink;

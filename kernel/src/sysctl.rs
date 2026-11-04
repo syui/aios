@@ -11,6 +11,7 @@
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
 //   /proc/sys/vm/min_free_kbytes             空きがこれを割ったら swap へ回収する (その 4 倍まで)
 //   /proc/sys/net/netfilter/nf_conntrack_*   conntrack の数、上限、時間切れ、tcp_loose など (conntrack.rs)
+//   /proc/sys/net/ipv6/conf/*/                口ごとの IPv6 の値 (addrconf.rs。読むだけ)、net/ipv4/ping_group_range
 //
 // 書けるのは root だけ。値は 1 行 (終わりの改行や空白はなくてよい)。起動のときに init が
 // /etc/sysctl.d/*.conf を読んでここに書く (aios apply の sysctl)
@@ -141,6 +142,41 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "net/netfilter/nf_conntrack_udp_timeout", get: || format!("{}", crate::conntrack::TIMEOUTS.get().udp), set: Some(|s| { crate::conntrack::TIMEOUTS.get().udp = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
     Entry { path: "net/netfilter/nf_conntrack_udp_timeout_stream", get: || format!("{}", crate::conntrack::TIMEOUTS.get().udp_stream), set: Some(|s| { crate::conntrack::TIMEOUTS.get().udp_stream = num(s, 0, 1 << 30)? as u64; Ok(()) }) },
     Entry { path: "net/nf_conntrack_max", get: || format!("{}", crate::conntrack::max()), set: Some(|s| { crate::conntrack::KNOBS.get().max = num(s, 1, 1 << 30)?; Ok(()) }) },
+    // ping ソケット (SOCK_DGRAM の ICMP と ICMPv6) を作れる group (既定の 1 0 はだれも。aios の IPv4 の ping はだれでも)
+    Entry { path: "net/ipv4/ping_group_range", get: || "1\t0".to_string(), set: None },
+    // IPv6 の口ごとの値 (addrconf の devconf: all と default と lo と eth0。いまは読むだけ)
+    Entry { path: "net/ipv6/conf/all/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/addr_gen_mode", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/disable_ipv6", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/forwarding", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/hop_limit", get: || "64".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/mtu", get: || "1280".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/use_tempaddr", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/addr_gen_mode", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/disable_ipv6", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/forwarding", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/hop_limit", get: || "64".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/mtu", get: || "1280".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/use_tempaddr", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/addr_gen_mode", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/disable_ipv6", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/forwarding", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/hop_limit", get: || format!("{}", crate::addrconf::hop_limit()), set: None },
+    Entry { path: "net/ipv6/conf/eth0/mtu", get: || format!("{}", crate::addrconf::mtu()), set: None },
+    Entry { path: "net/ipv6/conf/eth0/use_tempaddr", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/addr_gen_mode", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/disable_ipv6", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/forwarding", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/hop_limit", get: || "64".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/mtu", get: || "65536".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/use_tempaddr", get: || "-1".to_string(), set: None },
 ];
 
 /// パスを / で分けたものの d 番目まで

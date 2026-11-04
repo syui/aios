@@ -1310,10 +1310,13 @@ fn dump_routes(body: &[u8], strict: bool, v6: bool, seq: u32, me: u32, out: &mut
             255 => &[RT_TABLE_LOCAL],
             _ => &[RT_TABLE_MAIN],
         };
-        // IPv6 (inet6_dump_fib: IPV6_MULTIPLE_TABLES のない Linux は表が 1 つ): lo の local ::1 だけ
+        // IPv6 (inet6_dump_fib: IPV6_MULTIPLE_TABLES のない Linux は表が 1 つ)
         if v6 {
-            if (rtype == 0 || rtype == RTN_LOCAL) && (proto == 0 || proto == RTPROT_KERNEL) && (dev == 0 || dev == LO_INDEX) {
-                put_route6(&mut d, false, flags, seq, me);
+            for r in routes6() {
+                if (rtype != 0 && r.typ != rtype) || (proto != 0 && r.proto != proto) || (dev != 0 && r.oif != dev) {
+                    continue;
+                }
+                put_route6(&mut d, &r, flags, seq, me);
             }
             done_with(out, d, seq, me, answer, 0);
             return;
@@ -1601,7 +1604,11 @@ const NEIGH_MAX: usize = 256;
 
 #[derive(Clone)]
 struct Neigh {
-    ip: u32,
+    /// IPv4 は下の 32 ビット
+    ip: u128,
+    /// IPv6 の近所 (nd_tbl) か、ルーター (NTF_ROUTER: RA と NA の R から)
+    v6: bool,
+    router: bool,
     mac: [u8; 6],
     state: u16,
     probes: u32,
@@ -1671,16 +1678,22 @@ pub fn arp_out(f: &[u8]) {
     if local_ip(tpa) || tpa == 0 {
         return;
     }
+    solicit(tpa as u128, false);
+}
+
+/// 問い合わせを出した (arp_solicit と ndisc_solicit): なければ INCOMPLETE で作り (probes は ucast_probes から)、FAILED なら
+/// INCOMPLETE にもどし、知っていたもの (STALE など) は PROBE
+fn solicit(ip: u128, v6: bool) {
     let now = ms();
     let t = NEIGH.get();
-    match t.iter_mut().find(|e| e.ip == tpa) {
+    match t.iter_mut().find(|e| e.ip == ip && e.v6 == v6) {
         None => {
             if t.len() >= NEIGH_MAX
                 && let Some(i) = t.iter().position(|e| e.state & (NUD_FAILED | NUD_STALE) != 0)
             {
                 t.remove(i);
             }
-            t.push(Neigh { ip: tpa, mac: [0; 6], state: NUD_INCOMPLETE, probes: UCAST_PROBES + 1, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now });
+            t.push(Neigh { ip, v6, router: false, mac: [0; 6], state: NUD_INCOMPLETE, probes: UCAST_PROBES + 1, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now });
         }
         Some(e) => {
             e.used = now;
@@ -1702,6 +1715,105 @@ pub fn arp_out(f: &[u8]) {
     }
 }
 
+/// 表のもの (なければ state 0 で作る)
+fn neigh_entry(t: &mut Vec<Neigh>, ip: u128, v6: bool, now: u64) -> &mut Neigh {
+    if let Some(i) = t.iter().position(|e| e.ip == ip && e.v6 == v6) {
+        return &mut t[i];
+    }
+    if t.len() >= NEIGH_MAX
+        && let Some(i) = t.iter().position(|e| e.state & (NUD_FAILED | NUD_STALE) != 0)
+    {
+        t.remove(i);
+    }
+    t.push(Neigh { ip, v6, router: false, mac: [0; 6], state: 0, probes: 0, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now });
+    t.last_mut().unwrap()
+}
+
+// ---- IPv6 の近所 (ndisc.c): ARP と同じく smoltcp の表は見えないので、eth0 を通る NS / NA / RA から ----
+
+/// 自分の番地か (::1 と eth0 のもの)
+fn local_ip6(a: u128) -> bool {
+    a == 1 || crate::addrconf::is_mine(a)
+}
+
+/// Ethernet の IPv6 の ICMPv6 の近所さがし (hop limit 255) なら (ICMPv6 の type, 送り元, 中身)
+fn nd_fields(f: &[u8]) -> Option<(u8, u128, &[u8])> {
+    if f.len() < 54 + 24 || f[12..14] != [0x86, 0xdd] || f[20] != 58 || f[21] != 255 {
+        return None;
+    }
+    let plen = u16::from_be_bytes([f[18], f[19]]) as usize;
+    let icmp = f.get(54..54 + plen)?;
+    let src = u128::from_be_bytes(f[22..38].try_into().unwrap());
+    (icmp.len() >= 24 && icmp[1] == 0).then_some((icmp[0], src, icmp))
+}
+
+/// 近所さがしのオプションの MAC (type 1 は SLLA、2 は TLLA)
+fn nd_lladdr(m: &[u8], ty: u8) -> Option<[u8; 6]> {
+    let mut o = m.get(24..)?;
+    while o.len() >= 8 {
+        let len = o[1] as usize * 8;
+        if len == 0 || len > o.len() {
+            return None;
+        }
+        if o[0] == ty {
+            return o[2..8].try_into().ok();
+        }
+        o = &o[len..];
+    }
+    None
+}
+
+/// smoltcp が eth0 に出す NS (DAD でないもの): 問い合わせる番地を INCOMPLETE か PROBE に
+pub fn nd_out(f: &[u8]) {
+    let Some((135, src, m)) = nd_fields(f) else { return };
+    let target = u128::from_be_bytes(m[8..24].try_into().unwrap());
+    if src == 0 || local_ip6(target) {
+        return;
+    }
+    solicit(target, true);
+}
+
+/// eth0 から来た NS / NA (ndisc_recv_ns、ndisc_recv_na): NS の送り元 (SLLA つき) は STALE で作る。NA は表にあるものだけ:
+/// 自分あて (PACKET_HOST) の solicited なら REACHABLE、ほかは STALE (override がなく MAC がちがえばそのまま)。R は router
+pub fn nd_in(f: &[u8], to_me: bool) {
+    let Some((ty, src, m)) = nd_fields(f) else { return };
+    let now = ms();
+    let t = NEIGH.get();
+    match ty {
+        135 if src != 0 && !local_ip6(src) => {
+            if let Some(mac) = nd_lladdr(m, 1) {
+                let e = neigh_entry(t, src, true, now);
+                neigh_update(e, mac, NUD_STALE, now);
+            }
+        }
+        136 => {
+            let target = u128::from_be_bytes(m[8..24].try_into().unwrap());
+            let (router, solicited, over) = (m[4] & 0x80 != 0, m[4] & 0x40 != 0, m[4] & 0x20 != 0);
+            let mac = nd_lladdr(m, 2).unwrap_or_else(|| f[6..12].try_into().unwrap());
+            if let Some(e) = t.iter_mut().find(|e| e.v6 && e.ip == target) {
+                if !over && e.state & NUD_VALID != 0 && e.mac != mac {
+                    return;
+                }
+                let state = if solicited && to_me { NUD_REACHABLE } else { NUD_STALE };
+                if e.router != router {
+                    e.router = router;
+                    e.updated = now;
+                }
+                neigh_update(e, mac, state, now);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// RA の SLLA (ndisc_router_discovery の ndisc_update: STALE、ルーター)
+pub fn nd_router(ip: u128, mac: [u8; 6]) {
+    let now = ms();
+    let e = neigh_entry(NEIGH.get(), ip, true, now);
+    e.router = true;
+    neigh_update(e, mac, NUD_STALE, now);
+}
+
 /// eth0 から来た ARP (arp_process): 自分への問い合わせなら、送ったものを STALE で (なければ作る)。ほかは、もう表に
 /// あるものだけ: 自分あて (PACKET_HOST) の答えなら REACHABLE、ほかは STALE
 pub fn arp_in(f: &[u8], to_me: bool) {
@@ -1712,17 +1824,11 @@ pub fn arp_in(f: &[u8], to_me: bool) {
     let now = ms();
     let t = NEIGH.get();
     if op == 1 && tpa != 0 && tpa == crate::net::eth_addr() {
-        match t.iter_mut().find(|e| e.ip == spa) {
-            Some(e) => neigh_update(e, sha, NUD_STALE, now),
-            None => {
-                let mut e = Neigh { ip: spa, mac: [0; 6], state: 0, probes: 0, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now };
-                neigh_update(&mut e, sha, NUD_STALE, now);
-                t.push(e);
-            }
-        }
+        let e = neigh_entry(t, spa as u128, false, now);
+        neigh_update(e, sha, NUD_STALE, now);
         return;
     }
-    if let Some(e) = t.iter_mut().find(|e| e.ip == spa) {
+    if let Some(e) = t.iter_mut().find(|e| !e.v6 && e.ip == spa as u128) {
         let state = if op == 2 && to_me { NUD_REACHABLE } else { NUD_STALE };
         neigh_update(e, sha, state, now);
     }
@@ -1756,11 +1862,15 @@ fn put_neigh(out: &mut Vec<u8>, e: &Neigh, flags: u16, seq: u32, me: u32) {
     let now = ms();
     let mut p = Vec::new();
     // struct ndmsg: family、pad1、pad2、ifindex、state、flags、type (RTN_UNICAST)
-    p.extend_from_slice(&[AF_INET, 0, 0, 0]);
+    p.extend_from_slice(&[if e.v6 { AF_INET6 } else { AF_INET }, 0, 0, 0]);
     p.extend_from_slice(&ETH_INDEX.to_le_bytes());
     p.extend_from_slice(&e.state.to_le_bytes());
-    p.extend_from_slice(&[0, RTN_UNICAST]);
-    attr(&mut p, NDA_DST, &e.ip.to_be_bytes());
+    p.extend_from_slice(&[if e.router { 0x80 } else { 0 }, RTN_UNICAST]);
+    if e.v6 {
+        attr(&mut p, NDA_DST, &e.ip.to_be_bytes());
+    } else {
+        attr(&mut p, NDA_DST, &(e.ip as u32).to_be_bytes());
+    }
     if e.state & NUD_VALID != 0 {
         attr(&mut p, NDA_LLADDR, &e.mac);
     }
@@ -1772,7 +1882,7 @@ fn put_neigh(out: &mut Vec<u8>, e: &Neigh, flags: u16, seq: u32, me: u32) {
     put_msg(out, RTM_NEWNEIGH, flags, seq, me, &p);
 }
 
-/// neigh_dump_info: 家族が 0 か AF_INET なら ARP の表 (ほかの家族の表はない)。strict なら neigh_valid_dump_req
+/// neigh_dump_info: 家族が 0 なら ARP の表と IPv6 の表 (nd_tbl) の順、AF_INET か AF_INET6 ならその表 (ほかの家族の表はない)。strict なら neigh_valid_dump_req
 /// (頭は ndmsg、ifindex・state・type は 0、flags は NTF_PROXY だけ、属性は NDA_IFINDEX と NDA_MASTER)。中身と
 /// NLMSG_DONE は 1 つのデータグラム (RTNL_FLAG_DUMP_SPLIT_NLM_DONE がない)
 fn dump_neigh(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) {
@@ -1817,9 +1927,14 @@ fn dump_neigh(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mu
     }
     neigh_tick();
     let filtered = dev != 0;
-    if !proxy && (family == AF_UNSPEC || family == AF_INET) && (dev == 0 || dev == ETH_INDEX) {
-        for n in NEIGH.get().iter() {
-            put_neigh(&mut d, n, NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 }, seq, me);
+    if !proxy && (dev == 0 || dev == ETH_INDEX) {
+        for v6 in [false, true] {
+            if family != AF_UNSPEC && family != if v6 { AF_INET6 } else { AF_INET } {
+                continue;
+            }
+            for n in NEIGH.get().iter().filter(|n| n.v6 == v6) {
+                put_neigh(&mut d, n, NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 }, seq, me);
+            }
         }
     }
     put_msg(&mut d, NLMSG_DONE, NLM_F_MULTI, seq, me, &0i32.to_le_bytes());
@@ -1851,13 +1966,7 @@ fn get_neigh(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     if dst.len() != if body[0] == AF_INET6 { 16 } else { 4 } {
         return crate::why::inval();
     }
-    if body[0] == AF_INET6 {
-        // nd_tbl (IPv6 の近くの番地) はまだ空
-        if ifindex != 0 && !links().iter().any(|l| l.index == ifindex) {
-            return -ENODEV;
-        }
-        return -ENOENT;
-    }
+    let v6 = body[0] == AF_INET6;
     if ifindex != 0 && !links().iter().any(|l| l.index == ifindex) {
         return -ENODEV;
     }
@@ -1865,8 +1974,8 @@ fn get_neigh(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
         return -ENOENT;
     }
     neigh_tick();
-    let ip = u32::from_be_bytes(dst.try_into().unwrap());
-    let Some(e) = NEIGH.get().iter().find(|e| e.ip == ip && ifindex == ETH_INDEX).cloned() else { return -ENOENT };
+    let ip = if v6 { u128::from_be_bytes(dst.try_into().unwrap()) } else { u32::from_be_bytes(dst.try_into().unwrap()) as u128 };
+    let Some(e) = NEIGH.get().iter().find(|e| e.v6 == v6 && e.ip == ip && ifindex == ETH_INDEX).cloned() else { return -ENOENT };
     let mut d = Vec::new();
     put_neigh(&mut d, &e, 0, seq, me);
     out.push(d);
@@ -1884,11 +1993,31 @@ pub struct Addr6 {
     pub flags: u32,
     /// IFA_PROTO (IFAPROT_KERNEL_LO は 1)
     pub proto: u8,
+    /// のこりの秒 (いつまでもは u32::MAX) と、作った・変えた時刻 (1/100 秒)
+    pub preferred: u32,
+    pub valid: u32,
+    pub cstamp: u32,
+    pub tstamp: u32,
 }
 
-/// IPv6 のアドレス: lo の ::1/128 (init_loopback: IFA_HOST、IFA_F_PERMANENT、IFAPROT_KERNEL_LO)
+/// IPv6 のアドレス: lo の ::1/128 (init_loopback: IFA_HOST、IFA_F_PERMANENT、IFAPROT_KERNEL_LO) と eth0 のもの (addrconf)
 pub fn addrs6() -> Vec<Addr6> {
-    alloc::vec![Addr6 { index: LO_INDEX, addr: 1, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: 1 }]
+    let mut v = alloc::vec![Addr6 { index: LO_INDEX, addr: 1, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: 1, preferred: u32::MAX, valid: u32::MAX, cstamp: 0, tstamp: 0 }];
+    for a in crate::addrconf::addrs() {
+        v.push(Addr6 {
+            index: ETH_INDEX,
+            addr: a.addr,
+            prefix: a.prefix,
+            scope: crate::addrconf::rt_scope(a.addr),
+            flags: a.flags,
+            proto: a.proto,
+            preferred: crate::addrconf::left_secs(a.preferred),
+            valid: crate::addrconf::left_secs(a.valid),
+            cstamp: (a.created / 10) as u32,
+            tstamp: (a.updated / 10) as u32,
+        });
+    }
+    v
 }
 
 /// RTM_NEWADDR (inet6_fill_ifaddr の属性の順: IFA_ADDRESS、IFA_CACHEINFO、IFA_FLAGS、IFA_PROTO)
@@ -1897,12 +2026,12 @@ fn put_addr6(out: &mut Vec<u8>, a: &Addr6, typ: u16, flags: u16, seq: u32, me: u
     p.extend_from_slice(&[AF_INET6, a.prefix, a.flags as u8, a.scope]);
     p.extend_from_slice(&(a.index as u32).to_le_bytes());
     attr(&mut p, IFA_ADDRESS, &a.addr.to_be_bytes());
-    // struct ifa_cacheinfo: いつまでも (INFINITY_LIFE_TIME) と、作った時刻 (1/100 秒)
+    // struct ifa_cacheinfo: のこりの秒 (いつまでもは INFINITY_LIFE_TIME) と、作った・変えた時刻 (1/100 秒)
     let mut ci = Vec::new();
-    ci.extend_from_slice(&u32::MAX.to_le_bytes());
-    ci.extend_from_slice(&u32::MAX.to_le_bytes());
-    ci.extend_from_slice(&0u32.to_le_bytes());
-    ci.extend_from_slice(&0u32.to_le_bytes());
+    ci.extend_from_slice(&a.preferred.to_le_bytes());
+    ci.extend_from_slice(&a.valid.to_le_bytes());
+    ci.extend_from_slice(&a.cstamp.to_le_bytes());
+    ci.extend_from_slice(&a.tstamp.to_le_bytes());
     attr(&mut p, IFA_CACHEINFO, &ci);
     attr_u32(&mut p, IFA_FLAGS, a.flags);
     if a.proto != 0 {
@@ -1931,37 +2060,111 @@ fn get_addr6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     0
 }
 
-/// IPv6 の道 (rt6_fill_node): lo の local ::1 (表 254、metric 0)。get は RTA_PREFSRC も。属性の順は RTA_TABLE、
-/// RTA_DST、(RTA_PREFSRC)、RTA_PRIORITY、RTA_OIF、RTA_CACHEINFO、RTA_PREF
-fn put_route6(out: &mut Vec<u8>, get: bool, flags: u16, seq: u32, me: u32) {
+/// IPv6 の道 (表 254: IPV6_MULTIPLE_TABLES のない Linux は local のものも main に)
+pub struct Route6 {
+    pub dst: u128,
+    pub len: u8,
+    pub gw: u128,
+    pub metric: u32,
+    pub proto: u8,
+    pub typ: u8,
+    pub oif: i32,
+    /// いつまで (ミリ秒、net::now)
+    pub expires: Option<u64>,
+    /// RTAX_HOPLIMIT (0 はなし)
+    pub hoplimit: u8,
+    /// get の答えの RTA_PREFSRC (0 はなし)
+    pub prefsrc: u128,
+    /// RTF_* (/proc/net/ipv6_route)
+    pub rtf: u32,
+}
+
+/// IPv6 の道の表: lo の local ::1、eth0 の道 (addrconf: fe80::/64、RA の prefix と既定の道、ff00::/8) と、eth0 の番地の
+/// local の道 (dump では口が eth0、get の答えは lo)
+pub fn routes6() -> Vec<Route6> {
+    use crate::addrconf::{RTF_LOCAL, RTF_NONEXTHOP, RTF_UP};
+    let local = |a: u128, oif: i32| Route6 { dst: a, len: 128, gw: 0, metric: 0, proto: RTPROT_KERNEL, typ: RTN_LOCAL, oif, expires: None, hoplimit: 0, prefsrc: 0, rtf: RTF_UP | RTF_NONEXTHOP | RTF_LOCAL };
+    let mut v = alloc::vec![local(1, LO_INDEX)];
+    for r in crate::addrconf::routes() {
+        v.push(Route6 { dst: r.dst, len: r.len, gw: r.gw, metric: r.metric, proto: r.proto, typ: r.typ, oif: ETH_INDEX, expires: r.expires, hoplimit: r.hoplimit, prefsrc: 0, rtf: r.flags });
+    }
+    for a in crate::addrconf::addrs() {
+        v.push(local(a.addr, ETH_INDEX));
+    }
+    v
+}
+
+/// RTM_NEWROUTE (rt6_fill_node の属性の順: RTA_TABLE、RTA_DST、(RTA_PREFSRC)、(RTA_METRICS)、RTA_PRIORITY、
+/// (RTA_GATEWAY)、RTA_OIF、RTA_CACHEINFO (expires は 1/100 秒)、RTA_PREF)
+fn put_route6(out: &mut Vec<u8>, r: &Route6, flags: u16, seq: u32, me: u32) {
     const RTA_PREF: u16 = 20;
+    const RTAX_HOPLIMIT: u16 = 10;
     let mut p = Vec::new();
-    p.extend_from_slice(&[AF_INET6, 128, 0, 0, RT_TABLE_MAIN, RTPROT_KERNEL, RT_SCOPE_UNIVERSE, RTN_LOCAL]);
+    p.extend_from_slice(&[AF_INET6, r.len, 0, 0, RT_TABLE_MAIN, r.proto, RT_SCOPE_UNIVERSE, r.typ]);
     p.extend_from_slice(&0u32.to_le_bytes());
     attr_u32(&mut p, RTA_TABLE, RT_TABLE_MAIN as u32);
-    attr(&mut p, RTA_DST, &1u128.to_be_bytes());
-    if get {
-        attr(&mut p, RTA_PREFSRC, &1u128.to_be_bytes());
+    if r.len != 0 {
+        attr(&mut p, RTA_DST, &r.dst.to_be_bytes());
     }
-    attr_u32(&mut p, RTA_PRIORITY, 0);
-    attr_u32(&mut p, RTA_OIF, LO_INDEX as u32);
-    attr(&mut p, RTA_CACHEINFO, &[0u8; 32]);
+    if r.prefsrc != 0 {
+        attr(&mut p, RTA_PREFSRC, &r.prefsrc.to_be_bytes());
+    }
+    if r.hoplimit != 0 {
+        let mut m = Vec::new();
+        attr_u32(&mut m, RTAX_HOPLIMIT, r.hoplimit as u32);
+        attr(&mut p, RTA_METRICS, &m);
+    }
+    attr_u32(&mut p, RTA_PRIORITY, r.metric);
+    if r.gw != 0 {
+        attr(&mut p, RTA_GATEWAY, &r.gw.to_be_bytes());
+    }
+    attr_u32(&mut p, RTA_OIF, r.oif as u32);
+    let mut ci = [0u8; 32];
+    if let Some(t) = r.expires {
+        let left = (t.saturating_sub(ms()) / 10).min(i32::MAX as u64) as i32;
+        ci[8..12].copy_from_slice(&left.max(1).to_le_bytes());
+    }
+    attr(&mut p, RTA_CACHEINFO, &ci);
     attr(&mut p, RTA_PREF, &[0]);
     put_msg(out, RTM_NEWROUTE, flags, seq, me, &p);
 }
 
-/// 1 つの IPv6 の道 (inet6_rtm_getroute): ::1 のほかは、まだ道がないので ENETUNREACH
+/// 1 つの IPv6 の道 (inet6_rtm_getroute と ip6_route_output): 自分の番地は lo の local (metric 0)、ほかは道の表から
+/// (あて先そのものの /128 で、prefsrc は送り元のえらびかたのもの、expires は見せない)。道がなければ ENETUNREACH
 fn get_route6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     if body.len() < 12 {
         return crate::why::inval();
     }
     let a = attrs_of(&body[12..]);
     let dst = a.get(&RTA_DST).filter(|v| v.len() >= 16).map_or(0, |v| u128::from_be_bytes(v[..16].try_into().unwrap()));
-    if dst != 1 {
-        return -ENETUNREACH;
-    }
+    let r = if dst == 1 || crate::addrconf::is_mine(dst) {
+        Route6 { dst, len: 128, gw: 0, metric: 0, proto: RTPROT_KERNEL, typ: RTN_LOCAL, oif: LO_INDEX, expires: None, hoplimit: 0, prefsrc: dst, rtf: 0 }
+    } else {
+        let Some(x) = crate::addrconf::lookup(dst) else { return -ENETUNREACH };
+        Route6 { dst, len: 128, gw: x.gw, metric: x.metric, proto: x.proto, typ: x.typ, oif: ETH_INDEX, expires: None, hoplimit: x.hoplimit, prefsrc: crate::addrconf::source_for(dst).unwrap_or(0), rtf: 0 }
+    };
     let mut d = Vec::new();
-    put_route6(&mut d, true, 0, seq, me);
+    put_route6(&mut d, &r, 0, seq, me);
     out.push(d);
     0
+}
+
+/// /proc/net/if_inet6 (if6_seq_show: 番地、口の番号、prefix の長さ、scope、flags の下の 8 ビット、名前)
+pub fn proc_if_inet6() -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for a in addrs6() {
+        let dev = if a.index == LO_INDEX { "lo" } else { crate::net::IFNAME };
+        s.push_str(&alloc::format!("{:032x} {:02x} {:02x} {:02x} {:02x} {:>8}\n", a.addr, a.index, a.prefix, crate::addrconf::scope_of(a.addr), a.flags as u8, dev));
+    }
+    s
+}
+
+/// /proc/net/ipv6_route (ipv6_route_native_seq_show: あて先、長さ、送り元、長さ、次、metric、refcnt、use、flags、口)
+pub fn proc_ipv6_route() -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for r in routes6() {
+        let dev = if r.oif == LO_INDEX { "lo" } else { crate::net::IFNAME };
+        s.push_str(&alloc::format!("{:032x} {:02x} {:032x} {:02x} {:032x} {:08x} {:08x} {:08x} {:08x} {:>8}\n", r.dst, r.len, 0, 0, r.gw, r.metric, 1, 0, r.rtf, dev));
+    }
+    s
 }

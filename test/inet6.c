@@ -2,7 +2,8 @@
 // たしかめ、::1 の TCP と UDP、名前 (sockaddr_in6)、二つで一つ (:: で待つものに IPv4 がつながる)、v4 と v6 の
 // ポートのぶつかり、connect のしくじり、SOL_IPV6 の sockopt、IPV6_RECVPKTINFO。
 // 出すだけのテスト: 手本の Linux (ネットワークなし: lo だけ) とくらべる (test/ldiff.sh inet6)。ふつうの人で。ポートは
-// その場でとる (番号はじかに出さない)
+// その場でとる (番号はじかに出さない)。aios の VM には eth0 の IPv6 があるので、lo のものだけを出す (eth0 の番地と道、
+// 外へのあて先は test/inet6net.c で)
 //   aios の中で: ./inet6      aarch64-linux-gnu-gcc -O2 -static -o inet6 test/inet6.c
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -393,8 +394,6 @@ static void connects(void) {
     R("connect len 23", connect(c, (struct sockaddr *)&a, 23));
     struct sockaddr_in b = a4("127.0.0.1", 9);
     R("connect sockaddr_in", connect(c, (struct sockaddr *)&b, sizeof b));
-    a = a6("2001:db8::1", 9);
-    R("connect 2001:db8::1", connect(c, (struct sockaddr *)&a, sizeof a));
     a = a6("ff02::1", 9);
     R("connect ff02::1", connect(c, (struct sockaddr *)&a, sizeof a));
     a = a6("fe80::1", 9);
@@ -415,11 +414,6 @@ static void connects(void) {
     c = socket(AF_INET, SOCK_STREAM, 0);
     a = a6("::1", 9);
     R("AF_INET socket connect sockaddr_in6", connect(c, (struct sockaddr *)&a, sizeof a));
-    close(c);
-    c = udp6();
-    a = a6("2001:db8::1", 9);
-    R("udp connect 2001:db8::1", connect(c, (struct sockaddr *)&a, sizeof a));
-    R("udp sendto 2001:db8::1", sendto(c, "x", 1, 0, (struct sockaddr *)&a, sizeof a));
     close(c);
 }
 
@@ -605,7 +599,16 @@ static void show_route6(struct nlmsghdr *h) {
     printf("%s\n", line);
 }
 
-// RTM_GETROUTE: dump (dst が NULL) か 1 つの道
+// 道の口 (RTA_OIF)
+static unsigned route_oif(struct nlmsghdr *h) {
+    int len = RTM_PAYLOAD(h);
+    for (struct rtattr *a = RTM_RTA((struct rtmsg *)NLMSG_DATA(h)); RTA_OK(a, len); a = RTA_NEXT(a, len))
+        if (a->rta_type == RTA_OIF)
+            return *(unsigned *)RTA_DATA(a);
+    return 0;
+}
+
+// RTM_GETROUTE: dump (dst が NULL) か 1 つの道 (dump は lo のものだけ)
 static void route6(const char *what, int strict, const char *dst, int dump) {
     int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (strict) {
@@ -651,7 +654,7 @@ static void route6(const char *what, int strict, const char *dst, int dump) {
                 int e = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
                 printf("  ERROR %s\n", en(-e));
                 end = 1;
-            } else if (h->nlmsg_type == RTM_NEWROUTE && ((struct rtmsg *)NLMSG_DATA(h))->rtm_family == AF_INET6) {
+            } else if (h->nlmsg_type == RTM_NEWROUTE && ((struct rtmsg *)NLMSG_DATA(h))->rtm_family == AF_INET6 && route_oif(h) == 1) {
                 show_route6(h);
             }
         }
@@ -666,10 +669,6 @@ static void routes6(void) {
     route6("dump AF_INET6", 0, NULL, 1);
     route6("strict dump AF_INET6", 1, NULL, 1);
     route6("get ::1", 0, "::1", 0);
-    route6("get ::", 0, "::", 0);
-    route6("get 2001:db8::1", 0, "2001:db8::1", 0);
-    route6("get ::ffff:127.0.0.1", 0, "::ffff:127.0.0.1", 0);
-    route6("get ff02::1", 0, "ff02::1", 0);
     route6("strict get ::1", 1, "::1", 0);
 }
 
@@ -680,7 +679,7 @@ static void addrs(void) {
     struct ifaddrs *ia;
     if (getifaddrs(&ia) == 0) {
         for (struct ifaddrs *p = ia; p; p = p->ifa_next)
-            if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET6) {
+            if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET6 && strcmp(p->ifa_name, "lo") == 0) {
                 char ip[INET6_ADDRSTRLEN], m[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET6, &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr, ip, sizeof ip);
                 inet_ntop(AF_INET6, &((struct sockaddr_in6 *)p->ifa_netmask)->sin6_addr, m, sizeof m);
@@ -691,7 +690,8 @@ static void addrs(void) {
     char line[256];
     FILE *f = fopen("/proc/net/if_inet6", "r");
     while (f && fgets(line, sizeof line, f))
-        printf("if_inet6: %s", line);
+        if (strstr(line, " lo\n"))
+            printf("if_inet6: %s", line);
     if (f)
         fclose(f);
     // /proc/net/tcp6 の listen しているもの (::1 と ::) と /proc/net/tcp に出ないこと
