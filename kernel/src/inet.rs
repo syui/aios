@@ -1,6 +1,13 @@
 // AF_INET の TCP と UDP。答え (返す数、エラー、poll のビット、名前、sockopt) は Linux 7.3 の net/ipv4 (af_inet.c、
 // tcp.c、tcp_input.c、tcp_ipv4.c、tcp_minisocks.c、udp.c、datagram.c、inet_connection_sock.c、ip_sockglue.c) と同じ。
 //
+// AF_INET6 (段階 1: Linux 7.4 の net/ipv6 の af_inet6.c、tcp_ipv6.c、udp.c、datagram.c、ipv6_sockglue.c): ::1 と ::、
+// v4 の番地を写したもの (::ffff:a.b.c.d)、IPV6_V6ONLY。Linux と同じく 1 つのソケットに v4 の欄 (rcv_saddr ...) と
+// v6 の欄 (rcv6 ...) があり、IPv4 とのやりとり (写した番地、:: で待つものへの IPv4) は v4 の欄でいつもの道を通る。
+// IPv6 だけのもの (v6) は v4 の欄が LOOPBACK4_IPV6 (127.0.0.6) で、v6only なので IPv4 からは見えない。ポートの表は
+// v4 と v6 で 1 つ (Linux の bhash)。IPv6 の番地は aios の中の ::1 だけ (eth0 の IPv6 はまだ: ほかは ENETUNREACH)。
+// ファイアウォール (nftables) と conntrack は IPv6 のものを見ない
+//
 // Linux とちがうところ: aios の中どうし (127.0.0.0/8、eth0 のアドレス、0.0.0.0 あて) はパケットを作らない。TCP は
 // つないだ相手の受ける行列に送ったものをそのまま入れ、UDP は届け先のソケットの行列に入れる (Linux は lo をとおして
 // TCP をまるごと動かす: 3 回のあいさつ、ACK、窓、再送のタイマ、Nagle、遅らせた ACK)。見えるもの (状態、エラー、poll、
@@ -34,6 +41,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
+const ENODEV: i64 = 19;
 const EFAULT: i64 = 14;
 const EPIPE: i64 = 32;
 const EDOM: i64 = 33;
@@ -67,7 +75,12 @@ use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDHUP, POLLRDN
 
 const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
 const LOOPBACK: u32 = 0x7f00_0001;
+/// ::1
+const LOOPBACK6: u128 = 1;
+/// IPv6 だけのソケットの v4 の欄 (Linux の LOOPBACK4_IPV6: 127.0.0.6)
+const LOOPBACK4_IPV6: u32 = 0x7f00_0006;
 
 /// shutdown のビット (Linux の RCV_SHUTDOWN と SEND_SHUTDOWN)
 const RCV: u8 = 1;
@@ -88,6 +101,9 @@ const MIN_RCVBUF: usize = 2304;
 const MSS_DEFAULT: i32 = 536;
 const ADV_MSS: i32 = 65495;
 const HALF_WND_CLIENT: i32 = 32741;
+/// IPv6 のループバック: MSS は 65536 から IPv6 の頭 40 と TCP の 20、connect した側の窓の半分は 65464 の半分
+const ADV_MSS6: i32 = 65476;
+const HALF_WND_CLIENT6: i32 = 32732;
 const HALF_WND_SERVER: i32 = 32768;
 /// TCP の受ける行列にためておける大きさ (送る側はこれより多くは書けない: 待つ / EAGAIN)。SO_RCVBUF を決めたものは
 /// その大きさ
@@ -158,6 +174,8 @@ struct Dgram {
     data: Vec<u8>,
     from: (u32, u16),
     to: u32,
+    /// IPv6 のもの: (送り元, あて先)
+    v6: Option<(u128, u128)>,
     tos: u8,
     ttl: u8,
     truesize: usize,
@@ -198,6 +216,27 @@ pub struct Inet {
     sport: u16,
     daddr: u32,
     dport: u16,
+    /// AF_INET か AF_INET6
+    pub family: u16,
+    /// AF_INET6 の IPv6 の欄 (Linux の sk_v6_rcv_saddr、np->saddr、sk_v6_daddr): bind と connect で決まる (IPv4 の
+    /// ものは v4 の番地を写したもの。:: は 0)。v6only は IPV6_V6ONLY (ipv6_only_sock: IPv6 だけの番地に bind しても立つ)。
+    /// v6 はいまの bind かつながりが IPv6 だけのもの (v4 の欄は LOOPBACK4_IPV6)
+    rcv6: u128,
+    saddr6: u128,
+    daddr6: u128,
+    v6only: bool,
+    v6: bool,
+    // IPPROTO_IPV6 (IPV6_UNICAST_HOPS は -1 なら 64、IPV6_MULTICAST_HOPS、IPV6_MULTICAST_LOOP、IPV6_TCLASS、
+    // IPV6_RECVPKTINFO / RECVTCLASS / RECVHOPLIMIT、IPV6_MTU_DISCOVER、IPV6_RECVERR)
+    hops6: i32,
+    mc_hops6: i32,
+    mc_loop6: bool,
+    tclass: i32,
+    rx_pktinfo6: bool,
+    rx_tclass: bool,
+    rx_hoplimit: bool,
+    pmtudisc6: i32,
+    recverr6: bool,
     /// bind で決めたもの (SOCK_BINDADDR_LOCK / SOCK_BINDPORT_LOCK) と、setsockopt で決めた入れ物 (SOCK_SNDBUF_LOCK /
     /// SOCK_RCVBUF_LOCK)
     lock_addr: bool,
@@ -416,6 +455,21 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         sport: 0,
         daddr: 0,
         dport: 0,
+        family: AF_INET,
+        rcv6: 0,
+        saddr6: 0,
+        daddr6: 0,
+        v6only: false,
+        v6: false,
+        hops6: -1,
+        mc_hops6: 1,
+        mc_loop6: true,
+        tclass: 0,
+        rx_pktinfo6: false,
+        rx_tclass: false,
+        rx_hoplimit: false,
+        pmtudisc6: 1,
+        recverr6: false,
         lock_addr: false,
         lock_port: false,
         lock_sndbuf: false,
@@ -526,6 +580,17 @@ pub fn create(typ: u64, protocol: u64) -> InetRef {
     new_sock_as(tcp, if protocol != 0 { protocol as u8 } else if tcp { 6 } else { 17 }, c.euid, c.egid, crate::ns::net().unwrap_or(0))
 }
 
+/// socket(AF_INET6, ...): IPV6_V6ONLY ははじめ 0 (net.ipv6.bindv6only)
+pub fn create6(typ: u64, protocol: u64) -> InetRef {
+    let u = create(typ, protocol);
+    u.borrow_mut().family = AF_INET6;
+    u
+}
+
+pub fn family(u: &InetRef) -> u16 {
+    u.borrow().family
+}
+
 pub fn file_of(u: InetRef, flags: u64) -> FileRef {
     file::new(Kind::Inet(u), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
 }
@@ -551,8 +616,9 @@ pub fn aa_perm(u: &InetRef, op: &str, request: u32, what: crate::apparmor::InetO
     use crate::apparmor::{InetOp, inet_addr_audit};
     let (typ, proto, sk, local) = {
         let s = u.borrow();
-        let sk = inet_addr_audit(Some(&sockaddr(s.rcv_saddr, s.sport)), "laddr", "lport") + &inet_addr_audit(Some(&sockaddr(s.daddr, s.dport)), "faddr", "fport");
-        let local = sockaddr(if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr }, s.sport);
+        let sk = inet_addr_audit(Some(&name_of(&s, s.rcv_saddr, if s.v6 { s.rcv6 } else { mapped(s.rcv_saddr) }, s.sport)), "laddr", "lport")
+            + &inet_addr_audit(Some(&name_of(&s, s.daddr, peer6(&s), s.dport)), "faddr", "fport");
+        let local = name_of(&s, if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr }, local6(&s), s.sport);
         (if s.tcp { 1 } else { 2 }, s.protocol as u32, sk, local)
     };
     let (bind, remote) = match &what {
@@ -635,6 +701,91 @@ fn ipv4(a: u32) -> Ipv4Address {
     Ipv4Address::from_bits(a)
 }
 
+// ---- IPv6 のアドレス (128 ビットの数。:: は 0、::1 は 1) ----
+
+/// v4 の番地を写したもの (::ffff:a.b.c.d)
+fn mapped(a: u32) -> u128 {
+    0xffff_0000_0000u128 | a as u128
+}
+
+fn is_mapped(a: u128) -> bool {
+    a >> 32 == 0xffff
+}
+
+fn v6_multicast(a: u128) -> bool {
+    a >> 120 == 0xff
+}
+
+/// scope id がいるもの (__ipv6_addr_needs_scope_id: fe80::/10 と、multicast の link-local・interface-local)
+fn v6_needs_scope(a: u128) -> bool {
+    a >> 118 == 0x3fa || (v6_multicast(a) && matches!((a >> 112) & 0xf, 1 | 2))
+}
+
+/// aios の中の IPv6 のアドレスか (いまは ::1 だけ: eth0 の IPv6 はまだ)
+fn is_local6(a: u128) -> bool {
+    a == LOOPBACK6
+}
+
+/// IPv6 のあて先へのみち (ip6_route_output): (あて先, 送り元)。::1 だけ
+fn route6(daddr: u128, saddr: u128) -> Result<(u128, u128), i64> {
+    if !is_local6(daddr) {
+        return Err(-ENETUNREACH);
+    }
+    Ok((daddr, if saddr != 0 { saddr } else { daddr }))
+}
+
+/// sockaddr_in6 (28 バイト: family、port、flowinfo、addr、scope_id)
+fn sockaddr6(a: u128, port: u16) -> [u8; 28] {
+    let mut b = [0u8; 28];
+    b[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+    b[2..4].copy_from_slice(&port.to_be_bytes());
+    b[8..24].copy_from_slice(&a.to_be_bytes());
+    b
+}
+
+/// sockaddr_in6 を読む: (family, port, addr, scope_id)。短いところは 0
+fn parse6(a: &[u8]) -> (u16, u16, u128, u32) {
+    let fam = if a.len() >= 2 { u16::from_le_bytes([a[0], a[1]]) } else { 0 };
+    let port = if a.len() >= 4 { u16::from_be_bytes([a[2], a[3]]) } else { 0 };
+    let addr = if a.len() >= 24 { u128::from_be_bytes(a[8..24].try_into().unwrap()) } else { 0 };
+    let scope = if a.len() >= 28 { u32::from_le_bytes(a[24..28].try_into().unwrap()) } else { 0 };
+    (fam, port, addr, scope)
+}
+
+/// 自分の名前の IPv6 の番地 (inet6_getname: sk_v6_rcv_saddr、:: なら np->saddr。IPv4 のものは写した番地)
+fn local6(s: &Inet) -> u128 {
+    if s.v6 {
+        return if s.rcv6 != 0 { s.rcv6 } else { s.saddr6 };
+    }
+    let a = if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr };
+    if a == 0 && !is_mapped(s.rcv6) { 0 } else { mapped(a) }
+}
+
+/// 相手の IPv6 の番地
+fn peer6(s: &Inet) -> u128 {
+    if s.v6 {
+        s.daddr6
+    } else if s.daddr == 0 {
+        0
+    } else {
+        mapped(s.daddr)
+    }
+}
+
+/// ソケットの名前 (family のもの)
+fn name_of(s: &Inet, a4: u32, a6: u128, port: u16) -> Vec<u8> {
+    if s.family == AF_INET6 { sockaddr6(a6, port).to_vec() } else { sockaddr(a4, port).to_vec() }
+}
+
+/// bind で決めていないアドレスを手放す (Linux の inet_reset_saddr: v6 の欄も)
+fn reset_saddr(s: &mut Inet) {
+    s.saddr = 0;
+    s.rcv_saddr = 0;
+    s.rcv6 = 0;
+    s.saddr6 = 0;
+    s.v6 = false;
+}
+
 // ---- ポートの表 ----
 
 /// その口のポートにいるもの (bind した順。消えたものは掃く)
@@ -704,18 +855,57 @@ struct Me {
     tcp: bool,
     net: u64,
     rcv_saddr: u32,
+    family: u16,
+    rcv6: u128,
+    v6only: bool,
     reuse: bool,
     reuseport: bool,
     uid: u32,
 }
 
 fn me_of(s: &Inet) -> Me {
-    Me { tcp: s.tcp, net: s.net, rcv_saddr: s.rcv_saddr, reuse: s.reuse, reuseport: s.reuseport, uid: s.uid }
+    Me { tcp: s.tcp, net: s.net, rcv_saddr: s.rcv_saddr, family: s.family, rcv6: s.rcv6, v6only: s.v6only, reuse: s.reuse, reuseport: s.reuseport, uid: s.uid }
 }
 
-/// アドレスが重なるか (どちらかが 0.0.0.0 か、同じ: Linux の inet_rcv_saddr_equal の match_wildcard)
-fn addr_overlap(a: u32, b: u32) -> bool {
-    a == 0 || b == 0 || a == b
+/// IPv6 の番地の種類 (ipv6_addr_type のうち bind に要るもの)
+#[derive(PartialEq, Clone, Copy)]
+enum T6 {
+    Any,
+    Mapped,
+    Native,
+}
+
+fn t6(a: u128) -> T6 {
+    if a == 0 {
+        T6::Any
+    } else if is_mapped(a) {
+        T6::Mapped
+    } else {
+        T6::Native
+    }
+}
+
+/// アドレスが重なるか (Linux の inet_rcv_saddr_equal で match_wildcard: v4 どうしは 0.0.0.0 か同じ。AF_INET6 は
+/// ipv6_rcv_saddr_equal: どちらも写した番地なら v4 として、:: は相手が v6only の写した番地でなければ重なる、ほかは同じ番地)
+fn addr_overlap(me: &Me, o: &Inet) -> bool {
+    let v4 = |a: u32, b: u32| a == b || a == 0 || b == 0;
+    if me.family != AF_INET6 {
+        return !o.v6only && v4(me.rcv_saddr, o.rcv_saddr);
+    }
+    let (a1, a2) = (t6(me.rcv6), if o.family == AF_INET6 { t6(o.rcv6) } else { T6::Mapped });
+    if a1 == T6::Mapped && a2 == T6::Mapped {
+        return !o.v6only && v4(me.rcv_saddr, o.rcv_saddr);
+    }
+    if a1 == T6::Any && a2 == T6::Any {
+        return true;
+    }
+    if a2 == T6::Any && !(o.v6only && a1 == T6::Mapped) {
+        return true;
+    }
+    if a1 == T6::Any && !(me.v6only && a2 == T6::Mapped) {
+        return true;
+    }
+    o.family == AF_INET6 && o.rcv6 == me.rcv6
 }
 
 /// port に bind するとぶつかるか。TCP は Linux の inet_bind_conflict (relax、reuseport_ok): どちらも SO_REUSEADDR で
@@ -727,7 +917,7 @@ fn conflicts(me: &Me, u: &InetRef, port: u16) -> bool {
     if me.tcp {
         return list.iter().filter(|o| !Rc::ptr_eq(o, u)).any(|o| {
             let o = o.borrow();
-            if !addr_overlap(me.rcv_saddr, o.rcv_saddr) {
+            if !addr_overlap(me, &o) {
                 return false;
             }
             if me.reuse && o.reuse && o.state != St::Listen {
@@ -738,7 +928,7 @@ fn conflicts(me: &Me, u: &InetRef, port: u16) -> bool {
     }
     for o in list.iter().rev().filter(|o| !Rc::ptr_eq(o, u)) {
         let o = o.borrow();
-        if (!o.reuse || !me.reuse) && addr_overlap(me.rcv_saddr, o.rcv_saddr) {
+        if (!o.reuse || !me.reuse) && addr_overlap(me, &o) {
             return !(o.reuseport && me.reuseport && o.uid == me.uid);
         }
     }
@@ -786,6 +976,9 @@ fn autobind(u: &InetRef) -> Result<(), i64> {
 /// bind (Linux の __inet_bind): 長さ、family (AF_UNSPEC は 0.0.0.0 だけ)、自分のアドレスか (でなければ
 /// EADDRNOTAVAIL。IP_FREEBIND ならよい)、1024 より下は root だけ、もう bind していれば EINVAL、ポート
 pub fn bind(u: &InetRef, a: &[u8]) -> R {
+    if u.borrow().family == AF_INET6 {
+        return bind6(u, a);
+    }
     if a.len() < 16 {
         return Err(crate::why::inval());
     }
@@ -834,6 +1027,101 @@ pub fn bind(u: &InetRef, a: &[u8]) -> R {
         s.dport = 0;
     }
     ext_udp_bind(u);
+    Ok(0)
+}
+
+/// AF_INET6 の bind (Linux の inet6_bind と __inet6_bind): 長さ (SIN6_LEN_RFC2133 の 24)、family、TCP に multicast は
+/// EINVAL、1024 より下は root だけ、もう bind していれば EINVAL。写した番地は v6only なら EINVAL、v4 のたしかめ。IPv6 の
+/// 番地は scope のいるもの (fe80::) は口がなければ EINVAL、自分のもの (::1) でなければ EADDRNOTAVAIL。IPv6 だけの
+/// 番地に bind したら v6only になる
+fn bind6(u: &InetRef, a: &[u8]) -> R {
+    if a.len() < 24 {
+        return Err(crate::why::inval());
+    }
+    let (fam, port, addr, scope) = parse6(a);
+    if fam != AF_INET6 {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (tcp, netns, freebind, v6only) = {
+        let s = u.borrow();
+        (s.tcp, s.net, s.freebind, s.v6only)
+    };
+    if v6_multicast(addr) && tcp {
+        return Err(crate::why::inval());
+    }
+    if port != 0 && port < PRIV_PORT && !proc::current_cred_ref().capable(crate::cred::CAP_NET_BIND_SERVICE) {
+        return Err(-EACCES);
+    }
+    {
+        let s = u.borrow();
+        if s.state != St::Close || s.num != 0 {
+            return Err(crate::why::inval());
+        }
+    }
+    let native = addr != 0 && !is_mapped(addr);
+    let v4 = if is_mapped(addr) {
+        if v6only {
+            return Err(crate::why::inval());
+        }
+        let v4 = addr as u32;
+        if !(v4 == 0 || is_local(v4, netns) || is_multicast(v4) || is_broadcast(v4) || freebind) {
+            return Err(-EADDRNOTAVAIL);
+        }
+        v4
+    } else if native {
+        if v6_needs_scope(addr) {
+            // 口 (scope id) がなければ EINVAL。口があっても、aios の口には link-local の番地がない
+            if scope == 0 {
+                return Err(crate::why::inval());
+            }
+            if !crate::netlink::links().iter().any(|l| l.index as u32 == scope) {
+                return Err(-ENODEV);
+            }
+        }
+        if !v6_multicast(addr) && !(is_local6(addr) || freebind) {
+            return Err(-EADDRNOTAVAIL);
+        }
+        LOOPBACK4_IPV6
+    } else {
+        0
+    };
+    {
+        let mut s = u.borrow_mut();
+        s.rcv_saddr = v4;
+        s.saddr = v4;
+        s.rcv6 = addr;
+        if !v6_multicast(addr) {
+            s.saddr6 = addr;
+        }
+        if native {
+            s.v6only = true;
+            s.v6 = true;
+        }
+    }
+    let no_port = u.borrow().bind_no_port;
+    if port != 0 || !no_port {
+        if let Err(e) = get_port(u, port) {
+            let mut s = u.borrow_mut();
+            s.v6only = v6only;
+            reset_saddr(&mut s);
+            return Err(e);
+        }
+    }
+    {
+        let mut s = u.borrow_mut();
+        if addr != 0 {
+            s.lock_addr = true;
+        }
+        if port != 0 {
+            s.lock_port = true;
+        }
+        s.sport = s.num;
+        s.daddr = 0;
+        s.dport = 0;
+    }
+    if !native {
+        ext_udp_bind(u);
+    }
     Ok(0)
 }
 
@@ -918,9 +1206,9 @@ fn drop_orphan(u: &InetRef) {
 /// 4 つ組 (自分のアドレスとポート、相手のアドレスとポート) がもう使われているか (Linux の __inet_check_established:
 /// つながったもの、TIME_WAIT。TIME_WAIT は 1 秒たっていれば使いなおせる: tcp_tw_reuse の 2 はループバックだけ)
 fn tuple_used(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16) -> bool {
-    let (netns, tcp) = {
+    let (netns, tcp, v6, s6, d6) = {
         let s = u.borrow();
-        (s.net, s.tcp)
+        (s.net, s.tcp, s.v6, s.rcv6, s.daddr6)
     };
     for o in owners(netns, tcp, sport) {
         if Rc::ptr_eq(&o, u) {
@@ -928,7 +1216,8 @@ fn tuple_used(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16) -> bo
         }
         let (hit, tw, exp) = {
             let x = o.borrow();
-            let hit = x.rcv_saddr == saddr && x.daddr == daddr && x.dport == dport && !matches!(x.state, St::Listen | St::Close);
+            let same = if v6 { x.v6 && x.rcv6 == s6 && x.daddr6 == d6 } else { !x.v6 && x.rcv_saddr == saddr && x.daddr == daddr };
+            let hit = same && x.dport == dport && !matches!(x.state, St::Listen | St::Close);
             (hit, x.state == St::TimeWait, x.expires)
         };
         if !hit {
@@ -959,8 +1248,31 @@ fn lookup_listener(netns: u64, daddr: u32, dport: u16) -> Option<InetRef> {
     if v.is_empty() {
         listeners().remove(&k);
     }
-    let pick = |exact: bool| list.iter().rev().find(|o| if exact { o.borrow().rcv_saddr == daddr } else { o.borrow().rcv_saddr == 0 }).cloned();
+    // v6only の AF_INET6 は IPv4 を受けない。同じなら AF_INET を先に (compute_score)、そのなかで新しいもの
+    let pick = |exact: bool| {
+        let ok = |o: &&InetRef| {
+            let o = o.borrow();
+            !o.v6only && if exact { o.rcv_saddr == daddr } else { o.rcv_saddr == 0 }
+        };
+        let v: Vec<&InetRef> = list.iter().rev().filter(ok).collect();
+        v.iter().find(|o| o.borrow().family == AF_INET).or(v.first()).map(|o| (*o).clone())
+    };
     pick(true).or_else(|| pick(false))
+}
+
+/// IPv6 のあて先に listen しているもの (inet6_lookup_listener: AF_INET6 だけ、その番地のものを先に、なければ ::)
+fn lookup_listener6(netns: u64, daddr: u128, dport: u16) -> Option<InetRef> {
+    let k = (netns, dport);
+    let v = listeners().get(&k)?;
+    let list: Vec<InetRef> = v
+        .iter()
+        .filter_map(|(&q, w)| w.upgrade().filter(|o| {
+            let o = o.borrow();
+            o.state == St::Listen && o.hashed && o.pseq == q && o.num == dport && o.family == AF_INET6
+        }))
+        .collect();
+    let pick = |want: u128| list.iter().rev().find(|o| o.borrow().rcv6 == want).cloned();
+    pick(daddr).or_else(|| pick(0))
 }
 
 /// つながった (Linux の tcp_finish_connect / tcp_init_transfer): MSS (相手の知らせたもの、自分の TCP_MAXSEG、窓の
@@ -997,18 +1309,25 @@ fn adv_mss(user_mss: i32) -> i32 {
     if user_mss != 0 && user_mss < ADV_MSS { user_mss } else { ADV_MSS }
 }
 
+/// IPv6 のループバックで知らせる MSS
+fn adv_mss6(user_mss: i32) -> i32 {
+    if user_mss != 0 && user_mss < ADV_MSS6 { user_mss } else { ADV_MSS6 }
+}
+
 /// SYN を送る (connect とやりなおし): 自分につないだもの、listen しているものの行列 (あふれていれば落とされる:
 /// SYN_SENT のまま、やりなおしの時刻を決める)、いなければ RST (ECONNREFUSED)。in_call は connect のシステムコールの
 /// 中か (ファイアウォールが落としたわけを、そのシステムコールに残す。tick のやりなおしでは残さない)
 fn syn(u: &InetRef, in_call: bool) {
     let _p = crate::prof::span("inet:syn");
-    let (netns, saddr, sport, daddr, dport, my_mss, my_ttl) = {
+    let (netns, saddr, sport, daddr, dport, my_mss, my_ttl, v6, saddr6, daddr6) = {
         let s = u.borrow();
-        (s.net, s.saddr, s.num, s.daddr, s.dport, s.user_mss, if s.uc_ttl < 0 { 64 } else { s.uc_ttl })
+        (s.net, s.saddr, s.num, s.daddr, s.dport, s.user_mss, if s.uc_ttl < 0 { 64 } else { s.uc_ttl }, s.v6, s.saddr6, s.daddr6)
     };
+    // IPv6 のループバックの MSS と窓
+    let (adv, half_client) = if v6 { (adv_mss6 as fn(i32) -> i32, HALF_WND_CLIENT6) } else { (adv_mss as fn(i32) -> i32, HALF_WND_CLIENT) };
     // ファイアウォール (lo の 4 つのフック): Linux が lo に流す SYN と同じもの。落ちれば届かなかった SYN と同じく
-    // やりなおす (reject の RST や ICMP が届けば、それで終わる)
-    let fw = netns == 0 && crate::nfhook::active();
+    // やりなおす (reject の RST や ICMP が届けば、それで終わる)。IPv6 のものはまだ見ない
+    let fw = netns == 0 && crate::nfhook::active() && !v6;
     let isn = if fw { crate::rand::u32() } else { 0 };
     if fw && !fw_tcp(Some(u), saddr, sport, daddr, dport, crate::nfhook::SYN, isn, 0, adv_mss(my_mss) as u16, in_call) {
         if u.borrow().state == St::SynSent {
@@ -1017,16 +1336,17 @@ fn syn(u: &InetRef, in_call: bool) {
         return;
     }
     // 自分につないだ (同時に開く: SYN を受けて SYN_RECV、SYN-ACK を受けて ESTABLISHED)
-    if saddr == daddr && sport == dport {
+    if (if v6 { saddr6 == daddr6 } else { saddr == daddr }) && sport == dport {
         let mut s = u.borrow_mut();
-        established(&mut s, adv_mss(my_mss), HALF_WND_SERVER);
+        established(&mut s, adv(my_mss), HALF_WND_SERVER);
         s.peer = Some(Rc::downgrade(u));
         s.syn_tries = 0;
         drop(s);
         notify(u);
         return;
     }
-    let Some(l) = lookup_listener(netns, daddr, dport) else {
+    let found = if v6 { lookup_listener6(netns, daddr6, dport) } else { lookup_listener(netns, daddr, dport) };
+    let Some(l) = found else {
         // だれもいない: カーネルが返す RST (tcp_v4_send_reset) も決まりを通る。落ちれば SYN をやりなおす
         if fw && !fw_tcp(None, daddr, dport, saddr, sport, crate::nfhook::RST | crate::nfhook::ACK, 0, isn.wrapping_add(1), 0, false) {
             syn_lost(u);
@@ -1107,8 +1427,24 @@ fn syn(u: &InetRef, in_call: bool) {
             x.lock_port = l.lock_port;
             x.daddr = saddr;
             x.dport = sport;
+            // AF_INET6 で待つものの子は AF_INET6 (IPv4 のつながりなら名前は写した番地)。IPv6 の設定も引きつぐ
+            x.family = l.family;
+            x.v6only = l.v6only;
+            x.v6 = v6;
+            x.rcv6 = if v6 { daddr6 } else { mapped(daddr) };
+            x.saddr6 = x.rcv6;
+            x.daddr6 = if v6 { saddr6 } else { mapped(saddr) };
+            x.hops6 = l.hops6;
+            x.mc_hops6 = l.mc_hops6;
+            x.mc_loop6 = l.mc_loop6;
+            x.tclass = l.tclass;
+            x.rx_pktinfo6 = l.rx_pktinfo6;
+            x.rx_tclass = l.rx_tclass;
+            x.rx_hoplimit = l.rx_hoplimit;
+            x.pmtudisc6 = l.pmtudisc6;
+            x.recverr6 = l.recverr6;
             x.ss = Ss::Connected;
-            established(&mut x, adv_mss(my_mss), HALF_WND_SERVER);
+            established(&mut x, adv(my_mss), HALF_WND_SERVER);
             // listen する前の shutdown の印も写る (Linux の sk_clone_lock は sk_shutdown もそのまま写す)
             x.shutdown = l.shutdown;
             x.peer = Some(Rc::downgrade(u));
@@ -1118,9 +1454,9 @@ fn syn(u: &InetRef, in_call: bool) {
     let lport = l.borrow().num;
     hash_port(&c, lport);
     {
-        let theirs = adv_mss(l.borrow().user_mss);
+        let theirs = adv(l.borrow().user_mss);
         let mut s = u.borrow_mut();
-        established(&mut s, theirs, HALF_WND_CLIENT);
+        established(&mut s, theirs, half_client);
         s.peer = Some(Rc::downgrade(&c));
         s.syn_tries = 0;
     }
@@ -1322,7 +1658,11 @@ pub fn connect(f: &FileRef, u: &InetRef, a: &[u8]) -> R {
             if u.borrow().state != St::Close {
                 return Err(-EISCONN);
             }
-            tcp_v4_connect(u, a)?;
+            if u.borrow().family == AF_INET6 {
+                tcp_v6_connect(u, a)?;
+            } else {
+                tcp_v4_connect(u, a)?;
+            }
             u.borrow_mut().ss = Ss::Connecting;
             -EINPROGRESS
         }
@@ -1431,15 +1771,91 @@ fn tcp_v4_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
     Ok(())
 }
 
-/// tcp_v4_connect がしくじった: CLOSE にもどす (bind で決めていないアドレスとポートは手放す)
+/// AF_INET6 の TCP の connect (Linux の tcp_v6_connect): 長さと family、:: は ::1 (写した番地に bind していれば
+/// 127.0.0.1)、multicast は ENETUNREACH、scope のいるものは口がなければ EINVAL。写した番地は v6only なら ENETUNREACH、
+/// でなければ IPv4 の connect (名前は写した番地)。IPv6 は、写した番地に bind していれば EAFNOSUPPORT
+/// (ip6_dst_lookup_tail)、みち (::1 だけ)、ポート、SYN
+fn tcp_v6_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
+    if a.len() < 24 {
+        return Err(crate::why::inval());
+    }
+    let (fam, dport, mut daddr, scope) = parse6(a);
+    if fam != AF_INET6 {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (rcv6, v6only) = {
+        let s = u.borrow();
+        (s.rcv6, s.v6only)
+    };
+    if daddr == 0 {
+        daddr = if is_mapped(rcv6) { mapped(LOOPBACK) } else { LOOPBACK6 };
+    }
+    if v6_multicast(daddr) {
+        return Err(-ENETUNREACH);
+    }
+    if v6_needs_scope(daddr) && scope == 0 {
+        return Err(crate::why::inval());
+    }
+    if is_mapped(daddr) {
+        if v6only {
+            return Err(-ENETUNREACH);
+        }
+        tcp_v4_connect(u, &sockaddr(daddr as u32, dport))?;
+        let mut s = u.borrow_mut();
+        s.rcv6 = mapped(s.rcv_saddr);
+        s.saddr6 = s.rcv6;
+        s.daddr6 = mapped(s.daddr);
+        return Ok(());
+    }
+    if is_mapped(rcv6) {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (daddr, src) = route6(daddr, rcv6)?;
+    {
+        let mut s = u.borrow_mut();
+        if s.rcv6 == 0 {
+            s.rcv6 = src;
+        }
+        s.saddr6 = s.rcv6;
+        s.daddr6 = daddr;
+        s.v6 = true;
+        s.saddr = LOOPBACK4_IPV6;
+        s.rcv_saddr = LOOPBACK4_IPV6;
+        s.daddr = LOOPBACK4_IPV6;
+        s.dport = dport;
+        s.state = St::SynSent;
+        s.syn_tries = 0;
+        s.syn_next = 0;
+        s.err = 0;
+    }
+    let r = if u.borrow().num == 0 {
+        get_port(u, 0).map_err(|_| -EADDRNOTAVAIL)
+    } else {
+        let p1 = u.borrow().num;
+        if tuple_used(u, LOOPBACK4_IPV6, p1, LOOPBACK4_IPV6, dport) { Err(-EADDRNOTAVAIL) } else { Ok(()) }
+    };
+    if let Err(e) = r {
+        connect_failed(u);
+        return Err(e);
+    }
+    {
+        let mut s = u.borrow_mut();
+        s.sport = s.num;
+        s.mss_cache = if s.user_mss != 0 { s.user_mss } else { MSS_DEFAULT } - 12;
+    }
+    syn(u, true);
+    Ok(())
+}
+
+/// tcp_v4_connect / tcp_v6_connect がしくじった: CLOSE にもどす (bind で決めていないアドレスとポートは手放す)
 fn connect_failed(u: &InetRef) {
     let lock_port = {
         let mut s = u.borrow_mut();
         s.state = St::Close;
         if !s.lock_addr {
-            s.saddr = 0;
-            s.rcv_saddr = 0;
+            reset_saddr(&mut s);
         }
+        s.daddr6 = 0;
         s.dport = 0;
         s.lock_port
     };
@@ -1574,6 +1990,12 @@ fn time_wait(u: &InetRef) {
             t.saddr = s.saddr;
             t.daddr = s.daddr;
             t.dport = s.dport;
+            t.family = s.family;
+            t.rcv6 = s.rcv6;
+            t.saddr6 = s.saddr6;
+            t.daddr6 = s.daddr6;
+            t.v6only = s.v6only;
+            t.v6 = s.v6;
             t.reuse = s.reuse;
             t.reuseport = s.reuseport;
             t.expires = until;
@@ -1743,9 +2165,9 @@ fn tcp_disconnect(u: &InetRef) -> Result<(), i64> {
         s.peek_off = -1;
         s.dport = 0;
         if !s.lock_addr {
-            s.saddr = 0;
-            s.rcv_saddr = 0;
+            reset_saddr(&mut s);
         }
+        s.daddr6 = 0;
         s.shutdown = 0;
         s.done = false;
         s.user_mss = 0;
@@ -1779,8 +2201,8 @@ pub struct Recv {
     pub data: Vec<u8>,
     /// 返す数 (MSG_TRUNC のデータグラムは入れ物より大きいことがある)
     pub ret: usize,
-    /// 送り元の名前 (TCP はなし: msg_namelen は 0)
-    pub from: Option<[u8; 16]>,
+    /// 送り元の名前 (TCP はなし: msg_namelen は 0)。sockaddr_in か sockaddr_in6
+    pub from: Option<Vec<u8>>,
     /// msg_flags
     pub flags: u32,
     /// 付帯データ (level, type, 中身)
@@ -2501,7 +2923,8 @@ fn udp_truesize(len: usize) -> usize {
 fn udp_lookup(netns: u64, saddr: u32, sport: u16, daddr: u32, dport: u16) -> Option<InetRef> {
     let v = ports().get(&(netns, false, dport))?;
     let score = |o: &Inet, want: u32| -> i32 {
-        if o.rcv_saddr != want {
+        // v6only の AF_INET6 は IPv4 を受けない
+        if o.rcv_saddr != want || o.v6only {
             return -1;
         }
         let mut sc = 2;
@@ -2534,9 +2957,126 @@ fn udp_lookup(netns: u64, saddr: u32, sport: u16, daddr: u32, dport: u16) -> Opt
     None
 }
 
+/// IPv6 のあて先の UDP (udp6_lib_lookup の compute_score: AF_INET6 だけ、その番地のものを先に、なければ ::。
+/// connect したものは相手が合うこと)
+fn udp_lookup6(netns: u64, saddr: u128, sport: u16, daddr: u128, dport: u16) -> Option<InetRef> {
+    let v = ports().get(&(netns, false, dport))?;
+    let score = |o: &Inet, want: u128| -> i32 {
+        if o.family != AF_INET6 || o.rcv6 != want {
+            return -1;
+        }
+        let mut sc = 2;
+        if o.dport != 0 {
+            if o.dport != sport {
+                return -1;
+            }
+            sc += 4;
+        }
+        if o.daddr6 != 0 {
+            if o.daddr6 != saddr {
+                return -1;
+            }
+            sc += 4;
+        }
+        sc
+    };
+    for want in [daddr, 0] {
+        let mut best: Option<(i32, InetRef)> = None;
+        for o in v.values().rev().filter_map(|w| w.upgrade()) {
+            let sc = score(&o.borrow(), want);
+            if sc > 0 && best.as_ref().is_none_or(|(b, _)| sc > *b) {
+                best = Some((sc, o));
+            }
+        }
+        if let Some((_, o)) = best {
+            return Some(o);
+        }
+    }
+    None
+}
+
+fn udp_connect(u: &InetRef, a: &[u8]) -> R {
+    if u.borrow().family == AF_INET6 { udp6_connect(u, a) } else { udp_connect4(u, a) }
+}
+
+/// AF_INET6 の UDP の connect (Linux の __ip6_datagram_connect): AF_UNSPEC は相手を外す。先に autobind。sockaddr_in
+/// も受ける (v6only なら EAFNOSUPPORT)。:: は ::1、写した番地は IPv4 の connect (v6only なら ENETUNREACH)。IPv6 は
+/// 写した番地に bind していれば EAFNOSUPPORT、みち (::1 だけ)
+fn udp6_connect(u: &InetRef, a: &[u8]) -> R {
+    if a.len() < 2 {
+        return Err(crate::why::inval());
+    }
+    let fam = u16::from_le_bytes([a[0], a[1]]);
+    if fam == AF_UNSPEC {
+        udp_disconnect(u);
+        return Ok(0);
+    }
+    autobind(u)?;
+    let (v6only, rcv6) = {
+        let s = u.borrow();
+        (s.v6only, s.rcv6)
+    };
+    let v4 = |u: &InetRef, a: &[u8]| -> R {
+        udp_connect4(u, a)?;
+        let mut s = u.borrow_mut();
+        s.daddr6 = mapped(s.daddr);
+        if s.saddr6 == 0 || s.saddr6 == mapped(0) {
+            s.saddr6 = mapped(s.saddr);
+        }
+        if s.rcv6 == 0 || s.rcv6 == mapped(0) {
+            s.rcv6 = mapped(s.rcv_saddr);
+        }
+        Ok(0)
+    };
+    if fam == AF_INET {
+        if v6only {
+            return Err(-EAFNOSUPPORT);
+        }
+        return v4(u, a);
+    }
+    if a.len() < 24 {
+        return Err(crate::why::inval());
+    }
+    if fam != AF_INET6 {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (_, port, mut daddr, scope) = parse6(a);
+    if daddr == 0 {
+        daddr = if is_mapped(rcv6) { mapped(LOOPBACK) } else { LOOPBACK6 };
+    }
+    if is_mapped(daddr) {
+        if v6only {
+            return Err(-ENETUNREACH);
+        }
+        return v4(u, &sockaddr(daddr as u32, port));
+    }
+    if v6_needs_scope(daddr) && scope == 0 {
+        return Err(crate::why::inval());
+    }
+    if is_mapped(rcv6) {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (daddr, src) = route6(daddr, rcv6)?;
+    let mut s = u.borrow_mut();
+    s.daddr6 = daddr;
+    s.dport = port;
+    if s.rcv6 == 0 {
+        s.rcv6 = src;
+        s.rcv_saddr = LOOPBACK4_IPV6;
+    }
+    if s.saddr6 == 0 {
+        s.saddr6 = src;
+        s.saddr = LOOPBACK4_IPV6;
+    }
+    s.daddr = LOOPBACK4_IPV6;
+    s.v6 = true;
+    s.state = St::Established;
+    Ok(0)
+}
+
 /// UDP の connect (Linux の inet_dgram_connect と __ip4_datagram_connect): AF_UNSPEC は相手を外す。先に autobind。
 /// 送り元のアドレスが決まっていなければ、みちの送り元に
-fn udp_connect(u: &InetRef, a: &[u8]) -> R {
+fn udp_connect4(u: &InetRef, a: &[u8]) -> R {
     if a.len() < 2 {
         return Err(crate::why::inval());
     }
@@ -2585,9 +3125,9 @@ fn udp_disconnect(u: &InetRef) {
         s.state = St::Close;
         s.daddr = 0;
         s.dport = 0;
+        s.daddr6 = 0;
         if !s.lock_addr {
-            s.saddr = 0;
-            s.rcv_saddr = 0;
+            reset_saddr(&mut s);
         }
         !s.lock_port
     };
@@ -2601,6 +3141,112 @@ fn udp_disconnect(u: &InetRef) {
 /// UDP の sendmsg (Linux の udp_sendmsg): 長さ、MSG_OOB、ためているもの (MSG_MORE) につなげる、あて先 (なければ
 /// connect したもの: なければ EDESTADDRREQ)、付帯データ、みち、たまっているエラーと SEND の shutdown (EPIPE)
 fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
+    if u.borrow().family == AF_INET6 { udp6_send(u, src, len, to, ctl, flags) } else { udp_send4(u, src, len, to, ctl, flags) }
+}
+
+/// AF_INET6 の UDP の sendmsg (Linux の udpv6_sendmsg): あて先は sockaddr_in6 (24 バイトから)、sockaddr_in (IPv4 へ)、
+/// AF_UNSPEC (connect したものへ)。写した番地と IPv4 は udp_sendmsg (v6only なら ENETUNREACH)。IPv6 は :: が ::1、
+/// ポート 0 は EINVAL、みち (::1 だけ)、autobind、届ける (だれもいなければ ICMPv6 の port unreachable: connect した相手
+/// なら次に ECONNREFUSED)
+fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
+    let (v6only, saddr6, rcv6, pending) = {
+        let s = u.borrow();
+        (s.v6only, s.saddr6, s.rcv6, s.pending.is_some())
+    };
+    let mut dest: Option<(u128, u16)> = None;
+    if let Some(a) = to {
+        if a.len() < 2 {
+            return Err(crate::why::inval());
+        }
+        match u16::from_le_bytes([a[0], a[1]]) {
+            AF_INET6 => {
+                if a.len() < 24 {
+                    return Err(crate::why::inval());
+                }
+                let (_, port, mut d, _) = parse6(a);
+                if d == 0 && is_mapped(saddr6) {
+                    d = mapped(LOOPBACK);
+                }
+                dest = Some((d, port));
+            }
+            AF_INET => return if v6only { Err(-ENETUNREACH) } else { udp_send4(u, src, len, to, ctl, flags) },
+            AF_UNSPEC => {}
+            _ => return Err(crate::why::inval()),
+        }
+    }
+    let (daddr, dport) = match dest {
+        Some(d) => d,
+        None if pending => return udp_send4(u, src, len, None, ctl, flags),
+        None => {
+            let s = u.borrow();
+            if s.state != St::Established {
+                return Err(-EDESTADDRREQ);
+            }
+            (peer6(&s), s.dport)
+        }
+    };
+    if is_mapped(daddr) {
+        if v6only {
+            return Err(-ENETUNREACH);
+        }
+        let to4 = sockaddr(daddr as u32, dport);
+        return udp_send4(u, src, len, if dest.is_some() { Some(&to4) } else { None }, ctl, flags);
+    }
+    if len > 0xffff - 8 {
+        return Err(-EMSGSIZE);
+    }
+    if flags & MSG_OOB != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    if dest.is_some() && dport == 0 {
+        return Err(crate::why::inval());
+    }
+    let daddr = if daddr == 0 { LOOPBACK6 } else { daddr };
+    if is_mapped(rcv6) {
+        return Err(-EAFNOSUPPORT);
+    }
+    let (daddr, src6) = route6(daddr, if rcv6 != 0 { rcv6 } else { saddr6 })?;
+    autobind(u)?;
+    let e = take_err(u);
+    if e != 0 {
+        return Err(e);
+    }
+    if u.borrow().shutdown & SEND != 0 {
+        return Err(-EPIPE);
+    }
+    let data = take(src, 0, len)?;
+    let (netns, sport, hops, tclass) = {
+        let s = u.borrow();
+        (s.net, s.sport, if s.hops6 < 0 { 64 } else { s.hops6 as u8 }, s.tclass as u8)
+    };
+    match udp_lookup6(netns, src6, sport, daddr, dport) {
+        Some(r) => {
+            let ts = udp_truesize(data.len());
+            let ok = {
+                let mut x = r.borrow_mut();
+                let full = x.rmem + ts > x.rcvbuf && x.rmem != 0;
+                if !full {
+                    x.rmem += ts;
+                    x.dq.push_back(Dgram { data, from: (LOOPBACK4_IPV6, sport), to: LOOPBACK4_IPV6, v6: Some((src6, daddr)), tos: tclass, ttl: hops, truesize: ts });
+                }
+                !full
+            };
+            if ok {
+                notify(&r);
+            }
+        }
+        None => {
+            // __udp6_lib_err: port unreachable はかならず届く (harderr)。connect したものなら sk_err に
+            let mut s = u.borrow_mut();
+            if s.state == St::Established && s.v6 && s.daddr6 == daddr && s.dport == dport {
+                s.err = -ECONNREFUSED;
+            }
+        }
+    }
+    Ok(len as i64)
+}
+
+fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
     let _p = crate::prof::span("inet:udp_send");
     if len > 0xffff {
         return Err(-EMSGSIZE);
@@ -2715,7 +3361,7 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
                 let full = x.rmem + ts > x.rcvbuf && x.rmem != 0;
                 if !full {
                     x.rmem += ts;
-                    x.dq.push_back(Dgram { data, from: (saddr, sport), to: daddr, tos, ttl, truesize: ts });
+                    x.dq.push_back(Dgram { data, from: (saddr, sport), to: daddr, v6: None, tos, ttl, truesize: ts });
                     true
                 } else {
                     false
@@ -2828,7 +3474,7 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
     }
     r.data = m.data[..n].to_vec();
     r.ret = n;
-    r.from = Some(sockaddr(m.to.0, m.to.1));
+    r.from = Some(sockaddr(m.to.0, m.to.1).to_vec());
     r.flags |= MSG_ERRQUEUE as u32;
     // IP_RECVERR (SOL_IP 0、11)
     r.cmsgs.push((0, 11, exterr(&m)));
@@ -2873,7 +3519,13 @@ fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv,
                 r.flags |= MSG_TRUNC as u32;
             }
             r.data = d.data[off..off + copied].to_vec();
-            r.from = Some(sockaddr(d.from.0, d.from.1));
+            r.from = Some(if s.family == AF_INET6 {
+                sockaddr6(d.v6.map_or(mapped(d.from.0), |v| v.0), d.from.1).to_vec()
+            } else {
+                sockaddr(d.from.0, d.from.1).to_vec()
+            });
+            let (rx6, rxhl, rxtc) = (s.rx_pktinfo6, s.rx_hoplimit, s.rx_tclass);
+            let (pktinfo, recvtos, recvttl) = if d.v6.is_some() { (false, false, false) } else { (pktinfo, recvtos, recvttl) };
             if pktinfo {
                 let mut b = Vec::with_capacity(12);
                 b.extend_from_slice(&1u32.to_le_bytes());
@@ -2886,6 +3538,20 @@ fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv,
             }
             if recvtos {
                 r.cmsgs.push((0, 1, alloc::vec![d.tos]));
+            }
+            // SOL_IPV6 (ip6_datagram_recv_common_ctl と specific_ctl): IPV6_PKTINFO (in6_pktinfo: あて先と口)、
+            // IPV6_HOPLIMIT、IPV6_TCLASS
+            if rx6 {
+                let mut b = Vec::with_capacity(20);
+                b.extend_from_slice(&d.v6.map_or(mapped(d.to), |v| v.1).to_be_bytes());
+                b.extend_from_slice(&1u32.to_le_bytes());
+                r.cmsgs.push((41, 50, b));
+            }
+            if rxhl && d.v6.is_some() {
+                r.cmsgs.push((41, 52, (d.ttl as i32).to_le_bytes().to_vec()));
+            }
+            if rxtc && d.v6.is_some() {
+                r.cmsgs.push((41, 67, (d.tos as i32).to_le_bytes().to_vec()));
             }
             r.ret = if flags & MSG_TRUNC != 0 { ulen } else { copied };
             if peek {
@@ -3155,16 +3821,16 @@ pub fn pending(u: &InetRef) -> u64 {
 
 /// getsockname (peer = false) と getpeername / accept の名前 (peer = 1 は getpeername: CLOSE と SYN_SENT は
 /// ENOTCONN。2 は accept: 状態を見ない)
-pub fn name(u: &InetRef, peer: u8) -> Result<[u8; 16], i64> {
+pub fn name(u: &InetRef, peer: u8) -> Result<Vec<u8>, i64> {
     let s = u.borrow();
     if peer != 0 {
         if s.dport == 0 || (matches!(s.state, St::Close | St::SynSent) && peer == 1) {
             return Err(-ENOTCONN);
         }
-        return Ok(sockaddr(s.daddr, s.dport));
+        return Ok(name_of(&s, s.daddr, peer6(&s), s.dport));
     }
     let a = if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr };
-    Ok(sockaddr(a, s.sport))
+    Ok(name_of(&s, a, local6(&s), s.sport))
 }
 
 // ---- sockopt ----
@@ -3191,6 +3857,15 @@ pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
     }
     let int = |v: i64| (v as i32).to_le_bytes().to_vec();
     let tcp = u.borrow().tcp;
+    // AF_INET6: SOL_IPV6 (do_ipv6_getsockopt)。SOL_IP は IPv4 のもの、ほかの level は ENOPROTOOPT
+    if u.borrow().family == AF_INET6 {
+        if level == IPPROTO_IPV6 {
+            return ipv6_get(u, opt);
+        }
+        if !matches!(level, SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | IPPROTO_UDP) {
+            return Err(-ENOPROTOOPT);
+        }
+    }
     let mut v = match level {
         SOL_SOCKET => {
             let mut s = u.borrow_mut();
@@ -3236,7 +3911,7 @@ pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
                 21 | 67 => timeval(s.sndtimeo),
                 30 => int((s.state == St::Listen) as i64),
                 38 => int(s.protocol as i64),
-                39 => int(2),
+                39 => int(s.family as i64),
                 42 => int(s.peek_off as i64),
                 _ => return Err(-ENOPROTOOPT),
             }
@@ -3327,6 +4002,9 @@ pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
 
 pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
     let tcp = u.borrow().tcp;
+    if u.borrow().family == AF_INET6 && level == IPPROTO_IPV6 {
+        return ipv6_set(u, opt, val);
+    }
     match level {
         SOL_SOCKET => sol_socket_set(u, opt, val),
         IPPROTO_TCP if tcp => {
@@ -3408,6 +4086,102 @@ pub fn setsockopt(u: &InetRef, level: i32, opt: i32, val: &[u8]) -> R {
         // Linux の ip_setsockopt: IP でない level は ENOPROTOOPT (getsockopt は EOPNOTSUPP)
         _ => Err(-ENOPROTOOPT),
     }
+}
+
+const IPPROTO_IPV6: i32 = 41;
+
+/// SOL_IPV6 の getsockopt (do_ipv6_getsockopt のうち aios が持つもの)
+fn ipv6_get(u: &InetRef, opt: i32) -> Result<Vec<u8>, i64> {
+    let s = u.borrow();
+    let v: i64 = match opt {
+        // IPV6_V6ONLY
+        26 => s.v6only as i64,
+        // IPV6_UNICAST_HOPS (-1 なら口の hop_limit: 64)、IPV6_MULTICAST_HOPS、IPV6_MULTICAST_LOOP
+        16 => if s.hops6 < 0 { 64 } else { s.hops6 as i64 },
+        18 => s.mc_hops6 as i64,
+        19 => s.mc_loop6 as i64,
+        // IPV6_MULTICAST_IF、IPV6_UNICAST_IF
+        17 | 76 => 0,
+        // IPV6_TCLASS、IPV6_RECVPKTINFO、IPV6_RECVHOPLIMIT、IPV6_RECVTCLASS、IPV6_MTU_DISCOVER、IPV6_RECVERR
+        67 => s.tclass as i64,
+        49 => s.rx_pktinfo6 as i64,
+        51 => s.rx_hoplimit as i64,
+        66 => s.rx_tclass as i64,
+        23 => s.pmtudisc6 as i64,
+        25 => s.recverr6 as i64,
+        // IPV6_FREEBIND
+        78 => s.freebind as i64,
+        _ => return Err(-ENOPROTOOPT),
+    };
+    Ok((v as i32).to_le_bytes().to_vec())
+}
+
+/// SOL_IPV6 の setsockopt (do_ipv6_setsockopt のうち aios が持つもの。ほかは ENOPROTOOPT)
+fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
+    let int = || -> Result<i32, i64> { if val.len() < 4 { Err(crate::why::inval()) } else { Ok(i32::from_le_bytes(val[..4].try_into().unwrap())) } };
+    let mut s = u.borrow_mut();
+    match opt {
+        // IPV6_V6ONLY: bind したら変えられない
+        26 => {
+            let v = int()?;
+            if s.num != 0 {
+                return Err(crate::why::inval());
+            }
+            s.v6only = v != 0;
+        }
+        16 => {
+            let v = int()?;
+            if !(-1..=255).contains(&v) {
+                return Err(crate::why::inval());
+            }
+            s.hops6 = v;
+        }
+        18 => {
+            if s.tcp {
+                return Err(-ENOPROTOOPT);
+            }
+            let v = int()?;
+            if !(-1..=255).contains(&v) {
+                return Err(crate::why::inval());
+            }
+            s.mc_hops6 = if v == -1 { 1 } else { v };
+        }
+        19 => {
+            let v = int()?;
+            if v != 0 && v != 1 {
+                return Err(crate::why::inval());
+            }
+            s.mc_loop6 = v != 0;
+        }
+        // IPV6_TCLASS: -1 は 0、TCP は ECN の 2 ビットを変えない
+        67 => {
+            let mut v = int()?;
+            if !(-1..=0xff).contains(&v) {
+                return Err(crate::why::inval());
+            }
+            if v == -1 {
+                v = 0;
+            }
+            if s.tcp {
+                v = (v & !3) | (s.tclass & 3);
+            }
+            s.tclass = v;
+        }
+        49 => s.rx_pktinfo6 = int()? != 0,
+        51 => s.rx_hoplimit = int()? != 0,
+        66 => s.rx_tclass = int()? != 0,
+        23 => {
+            let v = int()?;
+            if !(0..=5).contains(&v) {
+                return Err(crate::why::inval());
+            }
+            s.pmtudisc6 = v;
+        }
+        25 => s.recverr6 = int()? != 0,
+        78 => s.freebind = int()? != 0,
+        _ => return Err(-ENOPROTOOPT),
+    }
+    Ok(0)
 }
 
 fn sol_socket_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
@@ -3812,21 +4586,36 @@ pub fn debug(u: &InetRef) -> String {
 /// /proc/net/tcp と /proc/net/udp (Linux と同じ形。ss と netstat が読む)。inode は fstat のもの (fd のないもの、
 /// TIME_WAIT は 0)
 pub fn proc_net(want_tcp: bool) -> String {
-    let hex = |a: u32| alloc::format!("{:08X}", a.swap_bytes());
-    let mut out = String::from(if want_tcp {
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-    } else {
-        "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+    proc_net_of(want_tcp, false)
+}
+
+/// /proc/net/tcp6 と udp6: AF_INET6 のもの (番地は 32 ビットずつ、Linux の s6_addr32 をホストの順で)
+pub fn proc_net6(want_tcp: bool) -> String {
+    proc_net_of(want_tcp, true)
+}
+
+fn proc_net_of(want_tcp: bool, v6: bool) -> String {
+    let hex4 = |a: u32| alloc::format!("{:08X}", a.swap_bytes());
+    let hex6 = |a: u128| (0..4).map(|i| alloc::format!("{:08X}", ((a >> (96 - 32 * i)) as u32).swap_bytes())).collect::<String>();
+    let mut out = String::from(match (want_tcp, v6) {
+        (true, false) => "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        (false, false) => "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        (true, true) => "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        (false, true) => "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
     });
     let netns = crate::ns::net().unwrap_or(0);
     let mut i = 0;
     for w in all().iter() {
         let Some(u) = w.upgrade() else { continue };
         let s = u.borrow();
-        if s.tcp != want_tcp || s.net != netns || (!s.hashed && s.num == 0) {
+        if s.tcp != want_tcp || s.net != netns || (!s.hashed && s.num == 0) || (s.family == AF_INET6) != v6 {
             continue;
         }
-        let local = if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr };
+        let (hex_l, hex_r) = if v6 {
+            (hex6(local6(&s)), hex6(peer6(&s)))
+        } else {
+            (hex4(if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr }), hex4(s.daddr))
+        };
         let inode = if s.has_file { s.ino } else { 0 };
         // Linux の tw (TIME_WAIT と fd のない FIN_WAIT2) は持ち主を覚えていない
         let uid = if is_tw(&s) { 0 } else { s.uid };
@@ -3835,9 +4624,9 @@ pub fn proc_net(want_tcp: bool) -> String {
             alloc::format!(
                 "{:4}: {}:{:04X} {}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5}        0 {} 1 0000000000000000 100 0 0 10 0\n",
                 i,
-                hex(local),
+                hex_l,
                 s.sport,
-                hex(s.daddr),
+                hex_r,
                 s.dport,
                 s.state as u8,
                 0,
@@ -3849,9 +4638,9 @@ pub fn proc_net(want_tcp: bool) -> String {
             alloc::format!(
                 "{:5}: {}:{:04X} {}:{:04X} {:02X} 00000000:{:08X} 00:00000000 00000000 {:5}        0 {} 2 0000000000000000 0\n",
                 i,
-                hex(local),
+                hex_l,
                 s.sport,
-                hex(s.daddr),
+                hex_r,
                 s.dport,
                 s.state as u8,
                 s.rmem,
@@ -3862,7 +4651,13 @@ pub fn proc_net(want_tcp: bool) -> String {
         out.push_str(&line);
         i += 1;
     }
-    out
+    if v6 {
+        return out;
+    }
+    // tcp4_seq_show と udp4_seq_show は 1 行を 149 (TMPSZ - 1) と 127 文字に空白でそろえる (seq_setwidth と seq_pad)。
+    // tcp6 と udp6 はそろえない
+    let width = if want_tcp { 149 } else { 127 };
+    out.lines().map(|l| alloc::format!("{:<width$}\n", l, width = width)).collect()
 }
 
 /// /proc/net/sockstat と snmp の数 (Linux の数えかた)
@@ -3881,6 +4676,9 @@ pub struct Counts {
     pub udp: usize,
     /// UDP のソケットすべて (sockets: used に)
     pub udp_all: usize,
+    /// AF_INET6 の TCP と UDP の inuse (/proc/net/sockstat6。Linux は prot ごとに数える: ほかの数は v4 と v6 で 1 つ)
+    pub inuse6: usize,
+    pub udp6: usize,
 }
 
 /// Linux なら小さな tw になっているもの: TIME_WAIT と、fd のない FIN_WAIT2 (aios ではどちらもふつうのソケット。
@@ -3895,10 +4693,15 @@ pub fn counts() -> Counts {
     for w in all().iter() {
         let Some(u) = w.upgrade() else { continue };
         let s = u.borrow();
+        let six = s.family == AF_INET6;
         if !s.tcp {
             c.udp_all += 1;
             if s.hashed {
-                c.udp += 1;
+                if six {
+                    c.udp6 += 1;
+                } else {
+                    c.udp += 1;
+                }
             }
             continue;
         }
@@ -3908,7 +4711,11 @@ pub fn counts() -> Counts {
         }
         c.alloc += 1;
         if s.state != St::Close {
-            c.inuse += 1;
+            if six {
+                c.inuse6 += 1;
+            } else {
+                c.inuse += 1;
+            }
             if s.dead {
                 c.orphan += 1;
             }
@@ -3935,7 +4742,7 @@ fn udp_sock(h: SocketHandle) -> &'static mut udp::Socket<'static> {
 
 /// 外から届きうるか (分けていない NET で、0.0.0.0 か eth0 のアドレスに bind したもの)
 fn reachable_from_outside(s: &Inet) -> bool {
-    s.net == 0 && net::get().is_some() && (s.rcv_saddr == 0 || (s.rcv_saddr == eth() && eth() != 0))
+    s.net == 0 && net::get().is_some() && !s.v6only && !s.v6 && (s.rcv_saddr == 0 || (s.rcv_saddr == eth() && eth() != 0))
 }
 
 fn ext_connect(u: &InetRef) -> Result<(), i64> {
@@ -4150,7 +4957,7 @@ fn ext_udp_pull(u: &InetRef) {
             continue;
         }
         s.rmem += ts;
-        s.dq.push_back(Dgram { data: buf, from, to: eth(), tos: 0, ttl: 64, truesize: ts });
+        s.dq.push_back(Dgram { data: buf, from, to: eth(), v6: None, tos: 0, ttl: 64, truesize: ts });
         got = true;
     }
     if got {
@@ -4230,6 +5037,11 @@ fn ext_accept(u: &InetRef) {
             }
             x.nodelay = l.nodelay;
             x.keepalive = l.keepalive;
+            x.family = l.family;
+            x.v6only = l.v6only;
+            x.rcv6 = mapped(x.rcv_saddr);
+            x.saddr6 = x.rcv6;
+            x.daddr6 = mapped(x.daddr);
         }
         c
     };

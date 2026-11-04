@@ -2752,10 +2752,12 @@ fn perms_union(a: &Perms, b: &Perms) -> Perms {
 pub fn inet_perm(op: &str, request: u32, typ: u32, protocol: u32, local: &[u8], what: InetOp, extra: &dyn Fn() -> NetAudit) -> Result<(), i64> {
     let Some(p) = current_profile() else { return Ok(()) };
     let (Some(d), v9) = (&p.policy.dfa, p.policy.start[CLASS_NETV9]) else { return Ok(()) };
+    // family はソケットの名前のもの (inet か inet6)
+    let fam: u16 = if local.len() >= 2 && u16::from_le_bytes([local[0], local[1]]) == 10 { 10 } else { 2 };
     // RULE_MEDIATES_AF: v9 の決まりで inet を書いていなければ v8 のように
-    let st = d.match_len(v9, &2u16.to_be_bytes());
+    let st = d.match_len(v9, &fam.to_be_bytes());
     if st == DFA_NOMATCH {
-        return af_perm(&p, op, request, 2, typ, protocol, extra);
+        return af_perm(&p, op, request, fam as u32, typ, protocol, extra);
     }
     let (local, kinds): (InetAddr, &[u8]) = match &what {
         InetOp::Bind(a) => {

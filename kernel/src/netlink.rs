@@ -71,6 +71,7 @@ const RTM_MAX: u16 = 123;
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
 const AF_BRIDGE: u8 = 7;
+const AF_INET6: u8 = 10;
 
 // IFLA_* (if_link.h) と IFA_* (if_addr.h)
 const IFLA_ADDRESS: u16 = 1;
@@ -649,11 +650,12 @@ fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<
 
 /// out に答えのデータグラムを足す。dump は、中身があれば中身と NLMSG_DONE の 2 つ (Linux の netlink_dump は、dump が
 /// 中身を返すとまた呼び、なにもなくなったところで DONE を次のデータグラムに)、なければ DONE だけ。
-/// 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。aios は IPv6 を入れずに作った Linux と同じで、
-/// RTM_GETLINK は PF_BRIDGE (rtnl_bridge_getlink: ブリッジがないので空) のほかはみな口の一覧、RTM_GETADDR と
-/// RTM_GETROUTE の dump は AF_INET のほかは rtnl_dump_all (PF_PACKET をとばして AF_INET のもの)。だから AF_PACKET
-/// (Firefox の NetlinkService) でも AF_INET のアドレスと道が来る。1 つの RTM_GETROUTE は AF_INET だけ (ほかは
-/// PF_UNSPEC に doit がなく EOPNOTSUPP)
+/// 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。RTM_GETLINK は PF_BRIDGE
+/// (rtnl_bridge_getlink: ブリッジがないので空) のほかはみな口の一覧。RTM_GETADDR は AF_INET が v4 だけ、AF_INET6 が
+/// v6 だけ (inet6_dump_ifaddr: 中身と DONE が 1 つのデータグラム)、ほかは rtnl_dump_all (v4 のあとに v6)。だから
+/// AF_PACKET (Firefox の NetlinkService) でも両方が来る。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (まだない: 空)、
+/// ほかは v4 の道。1 つの RTM_GETROUTE は AF_INET だけ (AF_INET6 の inet6_rtm_getroute はまだ。ほかは PF_UNSPEC に
+/// doit がなく EOPNOTSUPP)
 fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> i64 {
     if typ > RTM_MAX {
         return -EOPNOTSUPP;
@@ -698,10 +700,29 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         }
         (RTM_GETADDR, true) => {
             let mut d = Vec::new();
-            for a in addrs() {
-                put_addr(&mut d, &a, NLM_F_MULTI, seq, me);
+            if family != AF_INET6 {
+                for a in addrs() {
+                    put_addr(&mut d, &a, NLM_F_MULTI, seq, me);
+                }
             }
-            done(out, d, seq, me);
+            if family != AF_INET {
+                for a in addrs6() {
+                    put_addr6(&mut d, &a, RTM_NEWADDR, NLM_F_MULTI, seq, me);
+                }
+            }
+            if family == AF_INET6 {
+                // inet6_dump_ifaddr には RTNL_FLAG_DUMP_SPLIT_NLM_DONE がない
+                put_msg(&mut d, NLMSG_DONE, NLM_F_MULTI, seq, me, &0i32.to_le_bytes());
+                out.push(d);
+            } else {
+                done(out, d, seq, me);
+            }
+            0
+        }
+        (RTM_GETADDR, false) if family == AF_INET6 => get_addr6(body, seq, me, out),
+        (RTM_GETROUTE, true) if family == AF_INET6 => {
+            // IPv6 の道 (::1 の local と main) はまだ出さない
+            done(out, Vec::new(), seq, me);
             0
         }
         (RTM_GETROUTE, true) => {
@@ -1820,12 +1841,19 @@ fn get_neigh(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     if a.keys().any(|&k| k > NDA_MAX || k != NDA_DST) || !a.contains_key(&NDA_DST) {
         return crate::why::inval();
     }
-    if body[0] != AF_INET {
+    if body[0] != AF_INET && body[0] != AF_INET6 {
         return -EAFNOSUPPORT;
     }
     let dst = a[&NDA_DST];
-    if dst.len() != 4 {
+    if dst.len() != if body[0] == AF_INET6 { 16 } else { 4 } {
         return crate::why::inval();
+    }
+    if body[0] == AF_INET6 {
+        // nd_tbl (IPv6 の近くの番地) はまだ空
+        if ifindex != 0 && !links().iter().any(|l| l.index == ifindex) {
+            return -ENODEV;
+        }
+        return -ENOENT;
     }
     if ifindex != 0 && !links().iter().any(|l| l.index == ifindex) {
         return -ENODEV;
@@ -1838,6 +1866,64 @@ fn get_neigh(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     let Some(e) = NEIGH.get().iter().find(|e| e.ip == ip && ifindex == ETH_INDEX).cloned() else { return -ENOENT };
     let mut d = Vec::new();
     put_neigh(&mut d, &e, 0, seq, me);
+    out.push(d);
+    0
+}
+
+// ---- IPv6 のアドレス (addrconf: いまは lo の ::1 だけ。inet.rs の AF_INET6 の段階 1) ----
+
+pub struct Addr6 {
+    pub index: i32,
+    pub addr: u128,
+    pub prefix: u8,
+    pub scope: u8,
+    /// IFA_F_*
+    pub flags: u32,
+    /// IFA_PROTO (IFAPROT_KERNEL_LO は 1)
+    pub proto: u8,
+}
+
+/// IPv6 のアドレス: lo の ::1/128 (init_loopback: IFA_HOST、IFA_F_PERMANENT、IFAPROT_KERNEL_LO)
+pub fn addrs6() -> Vec<Addr6> {
+    alloc::vec![Addr6 { index: LO_INDEX, addr: 1, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: 1 }]
+}
+
+/// RTM_NEWADDR (inet6_fill_ifaddr の属性の順: IFA_ADDRESS、IFA_CACHEINFO、IFA_FLAGS、IFA_PROTO)
+fn put_addr6(out: &mut Vec<u8>, a: &Addr6, typ: u16, flags: u16, seq: u32, me: u32) {
+    let mut p = Vec::new();
+    p.extend_from_slice(&[AF_INET6, a.prefix, a.flags as u8, a.scope]);
+    p.extend_from_slice(&(a.index as u32).to_le_bytes());
+    attr(&mut p, IFA_ADDRESS, &a.addr.to_be_bytes());
+    // struct ifa_cacheinfo: いつまでも (INFINITY_LIFE_TIME) と、作った時刻 (1/100 秒)
+    let mut ci = Vec::new();
+    ci.extend_from_slice(&u32::MAX.to_le_bytes());
+    ci.extend_from_slice(&u32::MAX.to_le_bytes());
+    ci.extend_from_slice(&0u32.to_le_bytes());
+    ci.extend_from_slice(&0u32.to_le_bytes());
+    attr(&mut p, IFA_CACHEINFO, &ci);
+    attr_u32(&mut p, IFA_FLAGS, a.flags);
+    if a.proto != 0 {
+        attr(&mut p, 11, &[a.proto]);
+    }
+    put_msg(out, typ, flags, seq, me, &p);
+}
+
+/// 1 つの IPv6 のアドレス (inet6_rtm_getaddr): IFA_ADDRESS か IFA_LOCAL の番地 (なければ EINVAL)、口 (ifa_index が
+/// あれば)、なければ EADDRNOTAVAIL
+fn get_addr6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+    if body.len() < 8 {
+        return crate::why::inval();
+    }
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    let a = attrs_of(&body[8..]);
+    let Some(v) = a.get(&IFA_LOCAL).or(a.get(&IFA_ADDRESS)).filter(|v| v.len() >= 16) else { return crate::why::inval() };
+    let want = u128::from_be_bytes(v[..16].try_into().unwrap());
+    if index != 0 && !links().iter().any(|l| l.index == index) {
+        return -ENODEV;
+    }
+    let Some(x) = addrs6().into_iter().find(|x| x.addr == want && (index == 0 || x.index == index)) else { return -99 };
+    let mut d = Vec::new();
+    put_addr6(&mut d, &x, RTM_NEWADDR, 0, seq, me);
     out.push(d);
     0
 }

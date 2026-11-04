@@ -138,13 +138,16 @@ pub fn new_root() -> InodeRef {
 /// /proc/PID/attr の中 (LSM の属性: AppArmor が使うもの)
 const ATTRS: [&str; 3] = ["current", "exec", "prev"];
 
-/// IPv6 と raw のソケットの一覧は見出しだけ (IPv6 と raw はない。netstat がないと言って止まる)
-const NET_STUBS: [(&str, &str); 5] = [
+/// IPv6 と raw のもの: tcp6、udp6、sockstat6、if_inet6 は中身を作る (inet.rs の AF_INET6)。raw はまだ見出しだけ
+/// (なければ netstat がないと言って止まる)
+const NET_STUBS: [(&str, &str); 6] = [
     ("sockstat6", "TCP6: inuse 0\nUDP6: inuse 0\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n"),
     ("tcp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"),
     ("udp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
     ("raw", "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
     ("raw6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
+    // 口の IPv6 の番地 (addrconf の if6_seq_show: 番地、口の番号、prefix の長さ、scope、flags、名前)。いまは lo の ::1
+    ("if_inet6", "00000000000000000000000000000001 01 80 10 80       lo\n"),
 ];
 
 /// プロセス pid のスレッド tid (終わったものはなし)
@@ -346,7 +349,15 @@ impl ProcInode {
             Node::NetSockstat => crate::socket::proc_sockstat(),
             Node::NetSnmp => crate::socket::proc_snmp(),
             Node::NetUnix => crate::unix::proc_net(),
-            Node::NetStub(i) => NET_STUBS[i as usize].1.into(),
+            Node::NetStub(i) => match NET_STUBS[i as usize].0 {
+                "tcp6" => crate::inet::proc_net6(true),
+                "udp6" => crate::inet::proc_net6(false),
+                "sockstat6" => {
+                    let c = crate::inet::counts();
+                    alloc::format!("TCP6: inuse {}\nUDP6: inuse {}\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n", c.inuse6, c.udp6)
+                }
+                _ => NET_STUBS[i as usize].1.into(),
+            },
             Node::Sys(i) => crate::sysctl::TABLE[i as usize].read(),
             Node::Pnp => {
                 // Linux と同じく、DHCP なら #PROTO: DHCP、手で決めたなら #MANUAL

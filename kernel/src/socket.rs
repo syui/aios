@@ -35,6 +35,7 @@ const ENETUNREACH: i64 = 101;
 
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
@@ -388,14 +389,14 @@ fn lsm_send(u: &InetRef, flags: u64, to: Option<&[u8]>) -> Result<(), i64> {
         match crate::inet::ll_kind(u) {
             (Some(true), _) => {
                 if let Some(a) = to.filter(|_| flags & MSG_FASTOPEN != 0) {
-                    check_socket(AF_INET as u16, a, CONNECT_TCP, true)?;
+                    check_socket(crate::inet::family(u), a, CONNECT_TCP, true)?;
                 }
             }
             (Some(false), bound) => {
                 if let Some(a) = to {
-                    check_socket(AF_INET as u16, a, SEND_UDP, false)?;
+                    check_socket(crate::inet::family(u), a, SEND_UDP, false)?;
                 }
-                check_autobind_udp(AF_INET as u16, bound)?;
+                check_autobind_udp(crate::inet::family(u), bound)?;
             }
             _ => {}
         }
@@ -577,17 +578,19 @@ pub fn inet_writev(f: &FileRef, u: &InetRef, iov: &[(usize, usize)], nowait: boo
     crate::inet::send(u, crate::unix::Src::User(iov), total, None, &[], flags, nowait || nonblock_of(f, 0))
 }
 
-/// AF_INET の型と protocol (Linux の inet_create: 型ごとの表にあるか (なければ ESOCKTNOSUPPORT、protocol がちがえば
-/// EPROTONOSUPPORT)、raw は CAP_NET_RAW、ping は net.ipv4.ping_group_range (既定の 1 0 はだれも入らない))
-fn inet_check(t: u64, protocol: u64) -> Result<(), i64> {
+/// AF_INET と AF_INET6 の型と protocol (Linux の inet_create と inet6_create: 型ごとの表にあるか (なければ
+/// ESOCKTNOSUPPORT、protocol がちがえば EPROTONOSUPPORT)、raw は CAP_NET_RAW、ping (ICMP、ICMPv6) は
+/// net.ipv4.ping_group_range (既定の 1 0 はだれも入らない))
+fn inet_check(t: u64, protocol: u64, v6: bool) -> Result<(), i64> {
     let p = protocol as u32 as i32;
     if !(0..263).contains(&p) {
         return Err(crate::why::inval());
     }
+    let ping = if v6 { 58 } else { 1 };
     match t {
         SOCK_STREAM if p == 0 || p == 6 => Ok(()),
         SOCK_DGRAM if p == 0 || p == 17 => Ok(()),
-        SOCK_DGRAM if p == 1 => Err(-EACCES),
+        SOCK_DGRAM if p == ping => Err(-EACCES),
         SOCK_RAW if p != 0 => {
             if crate::cred::current().capable(crate::cred::CAP_NET_RAW) { Ok(()) } else { Err(-EPERM) }
         }
@@ -626,8 +629,8 @@ pub fn socketpair(domain: u64, typ: u64, protocol: u64, sv: usize) -> R {
     let (domain, t, flags) = sock_args(domain, typ)?;
     // AppArmor の create は口ごとに (Linux は sock_create を 2 度)
     aa_create(domain, t, protocol)?;
-    if domain == AF_INET {
-        inet_check(t, protocol)?;
+    if domain == AF_INET || domain == AF_INET6 {
+        inet_check(t, protocol, domain == AF_INET6)?;
         aa_create(domain, t, protocol)?;
         return Err(-EOPNOTSUPP);
     }
@@ -703,6 +706,16 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
         let fd = proc::current().files().add(crate::unix::file_of(u, flags), cloexec, 0).ok_or(-EMFILE)?;
         return Ok(fd as i64);
     }
+    // AF_INET6 (inet.rs の段階 1: TCP と UDP。raw と ping はまだ)
+    if domain == AF_INET6 {
+        inet_check(t, protocol, true)?;
+        if t == SOCK_RAW {
+            return Err(-EPROTONOSUPPORT);
+        }
+        let u = crate::inet::create6(t, protocol as u32 as u64);
+        let fd = proc::current().files().add(crate::inet::file_of(u, flags), cloexec, 0).ok_or(-EMFILE)?;
+        return Ok(fd as i64);
+    }
     if domain != AF_INET {
         return Err(-EAFNOSUPPORT);
     }
@@ -719,7 +732,7 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
         }
         return add_fd(s, cloexec);
     }
-    inet_check(t, protocol)?;
+    inet_check(t, protocol, false)?;
     if t == SOCK_RAW {
         return Err(-EPROTONOSUPPORT);
     }
@@ -749,7 +762,7 @@ pub fn bind(fd: u64, addr: usize, len: usize) -> R {
             // landlock (hook_socket_bind): TCP は BIND_TCP、UDP は BIND_UDP
             if let (Some(tcp), _) = crate::inet::ll_kind(&u) {
                 use crate::landlock::*;
-                check_socket(AF_INET as u16, &a, if tcp { BIND_TCP } else { BIND_UDP }, false)?;
+                check_socket(crate::inet::family(&u), &a, if tcp { BIND_TCP } else { BIND_UDP }, false)?;
             }
             if crate::apparmor::confined() {
                 if crate::apparmor::net_mediated() {
@@ -866,9 +879,9 @@ pub fn connect(fd: u64, addr: usize, len: usize) -> R {
             // まだなければ autobind のポート 0 の BIND_UDP
             if let (Some(tcp), bound) = crate::inet::ll_kind(&u) {
                 use crate::landlock::*;
-                check_socket(AF_INET as u16, &a, if tcp { CONNECT_TCP } else { SEND_UDP }, true)?;
+                check_socket(crate::inet::family(&u), &a, if tcp { CONNECT_TCP } else { SEND_UDP }, true)?;
                 if !tcp && a.len() >= 2 && u16::from_le_bytes([a[0], a[1]]) != 0 {
-                    check_autobind_udp(AF_INET as u16, bound)?;
+                    check_autobind_udp(crate::inet::family(&u), bound)?;
                 }
             }
             // AppArmor (aa_inet_connect_perm): AF_UNSPEC (つなぐのをやめる) は見ない

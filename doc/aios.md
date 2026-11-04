@@ -967,9 +967,10 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   CACHEINFO。RTM_F_FIB_MATCH は当たった道を fib_dump_info で (table は 254、type は出ていく道の type)。strict は
   inet_rtm_valid_getroute_req (長さは 0 か 32、table・protocol・scope・type は 0、属性は IIF OIF SRC DST IP_PROTO
   SPORT DPORT MARK UID だけ)。入ってくる道 (RTA_IIF) はまだ (EOPNOTSUPP)
-- 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。aios は IPv6 を入れずに作った Linux と同じ
-  で、RTM_GETADDR と RTM_GETROUTE の dump は AF_INET のほかはみな rtnl_dump_all (AF_INET のもの)、RTM_GETLINK は
-  PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの RTM_GETROUTE は AF_INET だけ (ほかは EOPNOTSUPP)
+- 家族: その家族の口がなければ PF_UNSPEC の口 (rtnl_get_link の fallback)。RTM_GETADDR は AF_INET が v4、AF_INET6
+  が v6、ほかは rtnl_dump_all (v4 のあとに v6: 下の「IPv6」)。RTM_GETROUTE の dump は AF_INET6 が v6 の道 (まだない)、
+  ほかは v4 の道。RTM_GETLINK は PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの RTM_GETROUTE は
+  AF_INET だけ (ほかは EOPNOTSUPP)
 - ついでに SIOCGIFNAME (番号から名前: glibc と musl の if_indextoname)。前は ENOTTY だった
 - 近くの番地の表 (RTM_GETNEIGH: ip neigh、Firefox の network ID): ARP は smoltcp がする (その表は外から見えない) ので、
   eth0 を通る ARP のフレームから Linux と同じ表を作る (net.rs の受けと出しで netlink::arp_in / arp_out)。smoltcp が問い
@@ -996,6 +997,41 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - 確かめかた: `test/ldiff.sh --net route` (手本の Linux は ip=dhcp の virtio-net で、aios の VM と同じ 10.0.2.15/24 と
   ゲートウェイ 10.0.2.2。IPv6 のものは出さない)。dump (家族、strict の表えらび)、1 つの道 (19 の宛先と元と oif、
   fibmatch、strict のしくじり)、Firefox と同じ問いあわせで link up。Linux 7.4-rc1 と 232 行同じ。ldiff に --net を足した
+
+### IPv6 (AF_INET6、段階 1: ::1 と、v4 の番地を写したもの)
+
+多くのプログラムが IPv6 を先にためす (`::` や `::1` で待つ、名前の AAAA)。aios は AF_INET6 がなく EAFNOSUPPORT だった
+(test/features.c で見つけた)。段階 1 は aios の中 (ループバック) と、IPv4 とのつなぎ。
+
+- Linux と同じく 1 つのソケットに v4 の欄 (rcv_saddr、saddr、daddr) と v6 の欄 (rcv6、saddr6、daddr6: sk_v6_rcv_saddr
+  など) がある (kernel/src/inet.rs)。IPv4 とのやりとり (`::ffff:a.b.c.d` へ、`::` で待つものへの IPv4) は v4 の欄で
+  いつもの道を通り、名前だけ写した番地 (sockaddr_in6) で見せる。IPv6 だけのもの (v6) は v4 の欄が LOOPBACK4_IPV6
+  (127.0.0.6) で、v6only なので IPv4 からは見えない。ポートの表は v4 と v6 で 1 つ
+- socket(AF_INET6): SOCK_STREAM (TCP) と SOCK_DGRAM (UDP)。raw と ping (ICMPv6) はまだ (EPROTONOSUPPORT と EACCES)。
+  socketpair は EOPNOTSUPP
+- bind (__inet6_bind): 24 バイトから、写した番地は v6only なら EINVAL、IPv6 の番地に bind すると v6only になる、
+  fe80:: は口がなければ EINVAL、自分のもの (::1) でなければ EADDRNOTAVAIL、TCP に multicast は EINVAL。ぶつかりは
+  inet_rcv_saddr_equal (ipv6_rcv_saddr_equal: `::` は v6only の写した番地でなければ重なる)
+- TCP の connect (tcp_v6_connect): `::` は ::1、写した番地は IPv4 の connect (v6only なら ENETUNREACH)、写した番地に
+  bind したものから IPv6 へは EAFNOSUPPORT、::1 のほかの IPv6 は ENETUNREACH。listen しているものは inet6 のもの
+  (AF_INET6 だけ、その番地か `::`)、IPv4 のさがしかたは v6only をとばし AF_INET を先に。MSS は IPv6 のループバックの
+  65476 (つないだ側は窓の半分の 32732)。子は AF_INET6 と IPv6 の設定を引きつぐ
+- UDP (udpv6_sendmsg、__ip6_datagram_connect): sockaddr_in6、sockaddr_in (v6only なら ENETUNREACH / EAFNOSUPPORT)、
+  AF_UNSPEC。受けた名前は sockaddr_in6 (IPv4 のものは写した番地)、IPV6_PKTINFO (in6_pktinfo)、IPV6_HOPLIMIT、
+  IPV6_TCLASS。だれもいない ::1 へは、connect したものの次の送りが ECONNREFUSED
+- SOL_IPV6: IPV6_V6ONLY (bind のあとは EINVAL)、UNICAST_HOPS (-1 は 64)、MULTICAST_HOPS (TCP は ENOPROTOOPT)、
+  MULTICAST_LOOP、TCLASS (TCP は ECN を変えない)、RECVPKTINFO、RECVHOPLIMIT、RECVTCLASS、MTU_DISCOVER、RECVERR、
+  FREEBIND。SOL_IP は IPv4 のもの。ほかの level は ENOPROTOOPT。SO_DOMAIN は 10
+- /proc/net/tcp6、udp6 (番地は 32 ビットずつ)、sockstat6、if_inet6 (lo の ::1)。/proc/net/tcp と udp は AF_INET だけで、
+  Linux と同じく 1 行を 149 と 127 文字に空白でそろえる (前はそろえていなかった)
+- netlink: lo の ::1/128 (scope host、IFA_F_PERMANENT、IFA_PROTO 1)。RTM_GETADDR は AF_INET が v4、AF_INET6 が v6 (中身と
+  DONE が 1 つのデータグラム)、ほかは両方。1 つの RTM_GETADDR (AF_INET6)。getifaddrs に lo の inet6 ::1 が出る。
+  RTM_GETNEIGH の AF_INET6 は空の表 (ENOENT)。AppArmor は inet6 の決まりで見る
+- まだ: eth0 の IPv6 (link-local、SLAAC、外への道: smoltcp の proto-ipv6)、IPv6 の道の表 (RTM_GETROUTE の AF_INET6)、
+  raw と ICMPv6、IPv6 のファイアウォール (nftables の ip6 と inet の決まりは IPv6 のものを見ない) と conntrack
+- 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
+  二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net)。Linux 7.4-rc1 と
+  156 行同じ。route、rtnl、netlink も同じまま
 
 ### CPU の印 (AT_HWCAP、AT_HWCAP2、/proc/cpuinfo)
 
