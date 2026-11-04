@@ -128,6 +128,7 @@ fn parse_pkginfo(s: &str) -> Desc {
         ("arch", "ARCH"),
         ("license", "LICENSE"),
         ("depend", "DEPENDS"),
+        ("optdepend", "OPTDEPENDS"),
         ("provides", "PROVIDES"),
         ("conflict", "CONFLICTS"),
         ("replaces", "REPLACES"),
@@ -606,6 +607,14 @@ fn install(path: &str, explicit: bool) {
     let mut fd = Desc::new();
     fd.insert("FILES".into(), files);
     fs::write(format!("{}/files", dir), write_desc(&fd)).unwrap_or_else(|e| die(e));
+    // はじめて入れたものは、あとから足せるもの (optdepends) を知らせる (pacman と同じ。firefox の ffmpeg (H.264 と
+    // AAC: これがないと YouTube の音が出ない) や mesa (WebGL) は、言われないと気づかない)
+    if old_ver.is_none() && !list(&info, "OPTDEPENDS").is_empty() {
+        println!("Optional dependencies for {}", name);
+        for o in optdeps(&info, &installed()) {
+            println!("    {}", o);
+        }
+    }
     // .INSTALL は pacman と同じく local の install に残す (消すときの pre_remove / post_remove のため)
     if let Some(s) = script {
         let at = format!("{}/install", dir);
@@ -985,13 +994,32 @@ fn info(d: &Desc, repo: Option<&str>) {
         ("URL", "URL"),
         ("Licenses", "LICENSE"),
         ("Depends On", "DEPENDS"),
+        ("Optional Deps", "OPTDEPENDS"),
         ("Packager", "PACKAGER"),
     ];
+    let have = installed();
     for (label, k) in rows {
+        if k == "OPTDEPENDS" {
+            // pacman と同じく 1 行に 1 つ、入っていれば [installed]
+            let v = optdeps(d, &have);
+            println!("{:<16}: {}", label, if v.is_empty() { "None".to_string() } else { v.join(&format!("\n{:<18}", "")) });
+            continue;
+        }
         let v = list(d, k).join("  ");
         println!("{:<16}: {}", label, if v.is_empty() { "None" } else { &v });
     }
     println!();
+}
+
+/// optdepends (「名前: わけ」) を、入っているものに [installed] をつけて
+fn optdeps(d: &Desc, have: &BTreeMap<String, (Desc, Vec<String>)>) -> Vec<String> {
+    list(d, "OPTDEPENDS")
+        .iter()
+        .map(|o| {
+            let n = dep_name(o.split(':').next().unwrap_or(o).trim());
+            if have.contains_key(n) { format!("{} [installed]", o) } else { o.clone() }
+        })
+        .collect()
 }
 
 fn main() {
@@ -1174,6 +1202,13 @@ mod tests {
         let mut d = Desc::new();
         d.insert("PROVIDES".into(), provides.iter().map(|p| p.to_string()).collect());
         (0, d)
+    }
+
+    #[test]
+    fn pkginfo_optdepends() {
+        let d = parse_pkginfo("pkgname = firefox\ndepend = gtk3\noptdepend = ffmpeg: H.264、AAC\noptdepend = mesa: WebGL\n");
+        assert_eq!(list(&d, "DEPENDS"), ["gtk3"]);
+        assert_eq!(list(&d, "OPTDEPENDS"), ["ffmpeg: H.264、AAC", "mesa: WebGL"]);
     }
 
     #[test]
