@@ -125,6 +125,10 @@ impl Device for NetDev {
             }
             let mut frame = self.virtio.recv()?;
             count(false, true, frame.len());
+            // ARP は近くの番地の表に (netlink の RTM_GETNEIGH。自分の MAC あてなら PACKET_HOST)
+            if frame.len() >= 14 && frame[12..14] == [8, 6] {
+                crate::netlink::arp_in(&frame, frame[..6] == self.mac);
+            }
             // ファイアウォール (PRE_ROUTING と LOCAL_IN)。落とせば次のフレームを
             if self.filter_in(&mut frame) {
                 return Some((Rx(frame), Tx(self)));
@@ -166,6 +170,9 @@ impl TxToken for Tx<'_> {
             }
         } else if self.0.filter_out(&mut buf, false) {
             count(false, false, len);
+            if len >= 14 && buf[12..14] == [8, 6] {
+                crate::netlink::arp_out(&buf);
+            }
             self.0.virtio.send(len, |b| b.copy_from_slice(&buf));
         }
         r
@@ -364,6 +371,27 @@ pub fn set_gateway(gw: Option<Ipv4Address>) {
     poll();
 }
 
+/// ip route add の道 (宛先、prefix の長さ、ゲートウェイ) を smoltcp の道の表に (既定の道はそのまま)。入りきらなければ false
+pub fn set_routes(rs: &[(u32, u8, u32)]) -> bool {
+    let Some(n) = get() else { return false };
+    let mut ok = true;
+    n.iface.routes_mut().update(|v| {
+        v.retain(|r| r.cidr.prefix_len() == 0);
+        for &(dst, len, gw) in rs {
+            let r = smoltcp::iface::Route {
+                cidr: smoltcp::wire::IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::from_bits(dst), len)),
+                via_router: smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bits(gw)),
+                preferred_until: None,
+                expires_at: None,
+            };
+            if v.push(r).is_err() {
+                ok = false;
+            }
+        }
+    });
+    ok
+}
+
 /// DHCP の知らせをインターフェースに映す
 fn dhcp_event(n: &mut Net) {
     let Some(h) = n.dhcp else { return };
@@ -393,16 +421,23 @@ fn dhcp_event(n: &mut Net) {
                 println!();
             }
             n.lease = Some(lease);
+            if changed {
+                crate::netlink::changed();
+            }
         }
         Some(dhcpv4::Event::Deconfigured) => {
             // 始めにも来るので、持っていたときだけ知らせる
             if n.lease.is_some() {
                 println!("net: dhcp lease lost");
             }
+            let had = n.lease.is_some();
             set_addrs(&mut n.iface, None);
             n.iface.routes_mut().remove_default_ipv4_route();
             set_gw(None);
             n.lease = None;
+            if had {
+                crate::netlink::changed();
+            }
         }
         None => {}
     }
@@ -434,6 +469,7 @@ pub fn poll() {
         changed |= n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     }
     dhcp_event(n);
+    crate::netlink::neigh_tick();
     // ファイアウォールが返した ICMP のエラーを、受けるソケットに (smoltcp の poll の外で)
     let later = core::mem::take(ICMP_LATER.get());
     for r in later {

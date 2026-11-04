@@ -142,6 +142,8 @@ pub fn ioctl(req: u64, arg: usize) -> R {
             }
             net::set_gateway(Some(gw));
         }
+        // netlink の組 (RTMGRP_IPV4_ROUTE) に知らせる
+        crate::netlink::changed();
         return Ok(0);
     }
     if !handles(req) {
@@ -185,6 +187,7 @@ pub fn ioctl(req: u64, arg: usize) -> R {
         SIOCSIFADDR => {
             root()?;
             net::set_addr(addr_of(&r[16..32]), None);
+            crate::netlink::changed();
             return Ok(0);
         }
         SIOCSIFNETMASK => {
@@ -192,6 +195,7 @@ pub fn ioctl(req: u64, arg: usize) -> R {
             let p = prefix_of(addr_of(&r[16..32])).ok_or_else(|| crate::why::inval())?;
             let c = cidr.ok_or(-EADDRNOTAVAIL)?;
             net::set_addr(c.address(), Some(p));
+            crate::netlink::changed();
             return Ok(0);
         }
         _ => return Err(-ENOTTY),

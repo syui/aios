@@ -22,6 +22,7 @@ use alloc::rc::{Rc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
@@ -58,8 +59,12 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_GETNEIGH: u16 = 30;
 /// これより大きい type は EOPNOTSUPP (RTM_MAX: 7.3 は RTM_NEWTUNNEL の次の組のおわり)
 const RTM_MAX: u16 = 123;
 
@@ -139,8 +144,8 @@ pub struct Netlink {
     /// connect した相手
     dst_pid: u32,
     dst_groups: u32,
-    /// 受ける行列 (データグラムごとに、送ったもののポート: カーネルは 0)
-    rq: VecDeque<(u32, Vec<u8>)>,
+    /// 受ける行列 (データグラムごとに、送ったもののポート (カーネルは 0) と multicast の組のビット (組あてでなければ 0))
+    rq: VecDeque<(u32, u32, Vec<u8>)>,
     rcvbuf: usize,
     sndbuf: usize,
     /// NETLINK_* のフラグのオプション (opt の番号のビット)
@@ -335,25 +340,41 @@ pub fn send(n: &NetlinkRef, data: &[u8], to: Option<&[u8]>, flags: u64) -> R {
         let protocol = n.borrow().protocol;
         let Some(peer) = ports().get(&(protocol, dst)).and_then(|w| w.upgrade()) else { return Err(-ECONNREFUSED) };
         let me = n.borrow().portid;
-        deliver(&peer, me, data.to_vec());
+        deliver(&peer, me, 0, data.to_vec());
         return Ok(data.len() as i64);
     }
     let me = n.borrow().portid;
     for d in rcv(n, data, me) {
-        deliver(n, 0, d);
+        deliver(n, 0, 0, d);
     }
     Ok(data.len() as i64)
 }
 
-/// 受ける行列に入れて起こす (入れ物があふれたら捨てる: Linux は ENOBUFS を次に返す)
-fn deliver(n: &NetlinkRef, from: u32, d: Vec<u8>) {
+/// カーネルからの知らせ (rtnl_notify と nlmsg_multicast): NETLINK_ROUTE の組 group (RTNLGRP_*) に入っているソケット
+/// みなに、データグラム 1 つで。送ったもののポートは 0、recvmsg の nl_groups は組のビット
+pub fn notify(group: u32, msg: Vec<u8>) {
+    let bit = 1u64 << (group - 1);
+    let members: Vec<NetlinkRef> = ports()
+        .iter()
+        .filter(|(k, _)| k.0 == NETLINK_ROUTE)
+        .filter_map(|(_, w)| w.upgrade())
+        .filter(|n| n.borrow().groups & bit != 0)
+        .collect();
+    for n in members {
+        deliver(&n, 0, if group <= 32 { bit as u32 } else { 0 }, msg.clone());
+    }
+}
+
+/// 受ける行列に入れて起こす (入れ物があふれたら捨てる: Linux は ENOBUFS を次に返す)。group は multicast の組の
+/// ビット (recvmsg の nl_groups)
+fn deliver(n: &NetlinkRef, from: u32, group: u32, d: Vec<u8>) {
     {
         let mut s = n.borrow_mut();
-        let used: usize = s.rq.iter().map(|x| x.1.len()).sum();
+        let used: usize = s.rq.iter().map(|x| x.2.len()).sum();
         if used > 0 && used + d.len() > s.rcvbuf {
             return;
         }
-        s.rq.push_back((from, d));
+        s.rq.push_back((from, group, d));
         s.generation += 1;
     }
     proc::wakeup(chan(n));
@@ -372,11 +393,11 @@ pub fn recv(n: &NetlinkRef, room: usize, flags: u64, nonblock: bool) -> Result<R
     loop {
         {
             let mut s = n.borrow_mut();
-            if let Some((from, d)) = s.rq.front() {
+            if let Some((from, group, d)) = s.rq.front() {
                 let len = d.len();
                 let k = len.min(room);
                 let data = d[..k].to_vec();
-                let from = sockaddr_of(*from, 0);
+                let from = sockaddr_of(*from, *group);
                 if flags & MSG_PEEK == 0 {
                     s.rq.pop_front();
                     s.generation += 1;
@@ -419,7 +440,7 @@ pub fn readiness(n: &NetlinkRef) -> (bool, bool, bool) {
 
 /// 次に読める長さ (FIONREAD)
 pub fn pending(n: &NetlinkRef) -> u64 {
-    n.borrow().rq.front().map_or(0, |d| d.1.len() as u64)
+    n.borrow().rq.front().map_or(0, |d| d.2.len() as u64)
 }
 
 pub fn describe(n: &NetlinkRef) -> String {
@@ -619,9 +640,11 @@ fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
 /// rtnetlink_rcv_msg: type の範囲、短いものは答えない、GET のほかは CAP_NET_ADMIN、dump か 1 つか。(負の errno か 0、
 /// dump したか)。strict は NETLINK_GET_STRICT_CHK
 fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> (i64, bool) {
-    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-    let r = route_msg(msg, typ, dump, me, strict, out);
-    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE))
+    // NLM_F_DUMP (ROOT|MATCH) は GET のときだけ。NEW では同じビットが REPLACE|EXCL
+    let get = typ >= RTM_BASE && (typ - RTM_BASE) & 3 == 2;
+    let dump = get && flags & NLM_F_DUMP == NLM_F_DUMP;
+    let r = route_msg(msg, typ, dump, flags, me, strict, out);
+    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH))
 }
 
 /// out に答えのデータグラムを足す。dump は、中身があれば中身と NLMSG_DONE の 2 つ (Linux の netlink_dump は、dump が
@@ -631,7 +654,7 @@ fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<
 /// RTM_GETROUTE の dump は AF_INET のほかは rtnl_dump_all (PF_PACKET をとばして AF_INET のもの)。だから AF_PACKET
 /// (Firefox の NetlinkService) でも AF_INET のアドレスと道が来る。1 つの RTM_GETROUTE は AF_INET だけ (ほかは
 /// PF_UNSPEC に doit がなく EOPNOTSUPP)
-fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> i64 {
+fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bool, out: &mut Vec<Vec<u8>>) -> i64 {
     if typ > RTM_MAX {
         return -EOPNOTSUPP;
     }
@@ -686,6 +709,12 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, me: u32, strict: bool, out: &mut 
             0
         }
         (RTM_GETROUTE, false) if family == AF_INET => get_route(body, strict, seq, me, out),
+        (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET => change_route(body, typ == RTM_NEWROUTE, nlflags, seq, me),
+        (RTM_GETNEIGH, true) => {
+            dump_neigh(body, family, strict, seq, me, out);
+            0
+        }
+        (RTM_GETNEIGH, false) => get_neigh(body, seq, me, out),
         _ => -EOPNOTSUPP,
     }
 }
@@ -788,6 +817,7 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     put_msg(out, RTM_NEWLINK, flags, seq, me, &p);
 }
 
+#[derive(Clone, PartialEq)]
 pub struct Addr {
     pub index: i32,
     pub label: &'static str,
@@ -814,6 +844,11 @@ pub fn addrs() -> Vec<Addr> {
 
 /// RTM_NEWADDR (inet_fill_ifaddr の属性の順)
 fn put_addr(out: &mut Vec<u8>, a: &Addr, flags: u16, seq: u32, me: u32) {
+    put_addr_msg(out, a, RTM_NEWADDR, flags, seq, me);
+}
+
+/// RTM_NEWADDR か RTM_DELADDR
+fn put_addr_msg(out: &mut Vec<u8>, a: &Addr, typ: u16, flags: u16, seq: u32, me: u32) {
     let mut p = Vec::new();
     // struct ifaddrmsg: family、prefixlen、flags、scope、index
     p.extend_from_slice(&[AF_INET, a.prefix, IFA_F_PERMANENT as u8, a.scope]);
@@ -832,7 +867,7 @@ fn put_addr(out: &mut Vec<u8>, a: &Addr, flags: u16, seq: u32, me: u32) {
     ci.extend_from_slice(&0u32.to_le_bytes());
     ci.extend_from_slice(&0u32.to_le_bytes());
     attr(&mut p, IFA_CACHEINFO, &ci);
-    put_msg(out, RTM_NEWADDR, flags, seq, me, &p);
+    put_msg(out, typ, flags, seq, me, &p);
 }
 
 // ---- 道の表 (RTM_GETROUTE: Linux の fib_frontend.c、fib_semantics.c、fib_trie.c と route.c) ----
@@ -904,6 +939,14 @@ fn is_multicast(a: u32) -> bool {
 
 /// 道の一覧 (trie の葉の順: 番地、そのなかで長い prefix、同じなら表の番号の大きいもの)
 pub fn routes() -> Vec<Route> {
+    let mut v = route_list(&addrs());
+    v.sort_by_key(|r| (r.dst, 32 - r.len, 255 - r.table));
+    v
+}
+
+/// 道を足した順 (知らせの順): アドレスごとに fib_add_ifaddr の local、broadcast、網、網の broadcast。そのあと既定の道と
+/// ip route add のもの
+fn route_list(addrs: &[Addr]) -> Vec<Route> {
     let mut v: Vec<Route> = Vec::new();
     let mut add = |r: Route| {
         // fib_table_insert: まったく同じもの (NLM_F_APPEND でも) は足さない
@@ -911,7 +954,7 @@ pub fn routes() -> Vec<Route> {
             v.push(r);
         }
     };
-    for a in addrs() {
+    for a in addrs {
         let lo = a.index == LO_INDEX;
         let addr = u32::from_be_bytes(a.addr);
         let m = mask(a.prefix);
@@ -939,11 +982,15 @@ pub fn routes() -> Vec<Route> {
             }
         }
     }
-    // ipconfig (ip_rt_ioctl の SIOCADDRT): 既定の道は proto boot、scope universe、prefsrc なし
+    // ipconfig (ip_rt_ioctl の SIOCADDRT): 既定の道は proto boot、scope universe、prefsrc なし (netlink で足したら
+    // その protocol)。ip route add のものも同じ形
     if let Some(gw) = crate::net::get().and(crate::net::gateway()) {
-        add(Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto: RTPROT_BOOT, dst: 0, len: 0, prefsrc: 0, gw: u32::from_be_bytes(gw.octets()), oif: ETH_INDEX });
+        let proto = GW_PROTO.load(Ordering::Relaxed);
+        add(Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto, dst: 0, len: 0, prefsrc: 0, gw: u32::from_be_bytes(gw.octets()), oif: ETH_INDEX });
     }
-    v.sort_by_key(|r| (r.dst, 32 - r.len, 255 - r.table));
+    for x in EXTRA.get().iter() {
+        add(Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto: x.proto, dst: x.dst, len: x.len, prefsrc: 0, gw: x.gw, oif: ETH_INDEX });
+    }
     v
 }
 
@@ -1262,6 +1309,11 @@ fn dump_routes(body: &[u8], strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u
 
 /// RTM_NEWROUTE (fib_dump_info の属性の順)
 fn put_route(out: &mut Vec<u8>, r: &Route, flags: u16, seq: u32, me: u32) {
+    put_route_msg(out, r, RTM_NEWROUTE, flags, seq, me);
+}
+
+/// RTM_NEWROUTE か RTM_DELROUTE
+fn put_route_msg(out: &mut Vec<u8>, r: &Route, typ: u16, flags: u16, seq: u32, me: u32) {
     let mut p = Vec::new();
     p.extend_from_slice(&[AF_INET, r.len, 0, 0, r.table, r.proto, r.scope, r.typ]);
     p.extend_from_slice(&0u32.to_le_bytes());
@@ -1276,5 +1328,516 @@ fn put_route(out: &mut Vec<u8>, r: &Route, flags: u16, seq: u32, me: u32) {
         attr(&mut p, RTA_GATEWAY, &r.gw.to_be_bytes());
     }
     attr_u32(&mut p, RTA_OIF, r.oif as u32);
-    put_msg(out, RTM_NEWROUTE, flags, seq, me, &p);
+    put_msg(out, typ, flags, seq, me, &p);
+}
+
+// ---- 道を変える (ip route add / del: inet_rtm_newroute と inet_rtm_delroute) と、変わったときの知らせ ----
+//
+// aios が持てる道は、main の表の、eth0 のゲートウェイを通る unicast のもの (smoltcp の道の表: net::set_routes) と既定の
+// 道だけ。口だけの道 (ゲートウェイなし)、ほかの type や表、metric や prefsrc は EOPNOTSUPP (aios のできないこと)
+
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_CREATE: u16 = 0x400;
+const RTA_METRICS: u16 = 8;
+const RTA_MULTIPATH: u16 = 9;
+const RTA_PRIORITY: u16 = 6;
+const RTA_ENCAP: u16 = 22;
+const RTA_VIA: u16 = 18;
+const RTA_NH_ID: u16 = 30;
+const RTN_MAX: u8 = 12;
+const RT_SCOPE_NOWHERE: u8 = 255;
+const ESRCH: i64 = 3;
+const ENOENT: i64 = 2;
+const EEXIST: i64 = 17;
+const ENOBUFS: i64 = 105;
+const EAFNOSUPPORT: i64 = 97;
+/// RTNLGRP_* (組の番号)
+const RTNLGRP_NEIGH: u32 = 3;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
+const RTNLGRP_IPV4_ROUTE: u32 = 7;
+
+/// 既定の道の protocol (ipconfig と SIOCADDRT は boot、netlink で足したらそのもの)
+static GW_PROTO: AtomicU8 = AtomicU8::new(RTPROT_BOOT);
+
+/// ip route add で足した道
+#[derive(Clone)]
+struct Extra {
+    dst: u32,
+    len: u8,
+    gw: u32,
+    proto: u8,
+}
+
+static EXTRA: Bkl<Vec<Extra>> = Bkl::new(Vec::new());
+
+fn sync_extra() -> bool {
+    let v: Vec<(u32, u8, u32)> = EXTRA.get().iter().map(|x| (x.dst, x.len, x.gw)).collect();
+    crate::net::set_routes(&v)
+}
+
+/// RTM_NEWROUTE と RTM_DELROUTE (rtm_to_fib_config、fib_create_info、fib_table_insert と fib_table_delete のたしかめの順)
+fn change_route(body: &[u8], add: bool, nlflags: u16, seq: u32, me: u32) -> i64 {
+    if body.len() < 12 {
+        return crate::why::inval();
+    }
+    let (dst_len, tos, proto, scope, typ) = (body[1], body[3], body[5], body[6], body[7]);
+    // ECN のビットは 0、type は RTN_MAX まで
+    if tos & 3 != 0 || typ > RTN_MAX {
+        return crate::why::inval();
+    }
+    let a = attrs_of(&body[12..]);
+    let dst = addr_of(a.get(&RTA_DST));
+    let gw = addr_of(a.get(&RTA_GATEWAY));
+    let oif = u32_of(a.get(&RTA_OIF)) as i32;
+    if a.contains_key(&RTA_GATEWAY) && a.contains_key(&RTA_VIA) {
+        return crate::why::inval();
+    }
+    let mut table = if a.contains_key(&RTA_TABLE) { u32_of(a.get(&RTA_TABLE)) } else { body[4] as u32 };
+    if dst_len > 32 || (dst_len < 32 && dst << dst_len != 0) {
+        return crate::why::inval();
+    }
+    if table == 0 {
+        table = RT_TABLE_MAIN as u32;
+    }
+    // IP_MULTIPLE_TABLES のない Linux: 255 のほかはみな main
+    let tbl = if table == RT_TABLE_LOCAL as u32 { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
+    let rs = routes();
+    if !add {
+        // fib_table_delete: 同じ宛先と長さのもののうち、来たもの (type、scope、protocol、ゲートウェイ、口) にあうもの
+        let found = rs.iter().find(|r| {
+            r.table == tbl
+                && r.dst == dst
+                && r.len == dst_len
+                && (typ == 0 || r.typ == typ)
+                && (scope == RT_SCOPE_NOWHERE || r.scope == scope)
+                && (proto == 0 || r.proto == proto)
+                && (gw == 0 || r.gw == gw)
+                && (oif == 0 || r.oif == oif)
+        });
+        let Some(r) = found.cloned() else { return -ESRCH };
+        if r.table == RT_TABLE_MAIN && r.len == 0 && r.gw != 0 {
+            crate::net::set_gateway(None);
+            GW_PROTO.store(RTPROT_BOOT, Ordering::Relaxed);
+        } else if let Some(i) = EXTRA.get().iter().position(|x| x.dst == r.dst && x.len == r.len) {
+            EXTRA.get().remove(i);
+            sync_extra();
+        } else {
+            // 口のアドレスから作った道は消せない
+            return -EOPNOTSUPP;
+        }
+        let mut d = Vec::new();
+        put_route_msg(&mut d, &r, RTM_DELROUTE, 0, seq, me);
+        notify(RTNLGRP_IPV4_ROUTE, d);
+        snapshot();
+        return 0;
+    }
+    // fib_create_info と fib_check_nh
+    if typ == 0 || scope == RT_SCOPE_NOWHERE {
+        return crate::why::inval();
+    }
+    if tbl == RT_TABLE_LOCAL || typ != RTN_UNICAST || scope != RT_SCOPE_UNIVERSE {
+        return -EOPNOTSUPP;
+    }
+    if u32_of(a.get(&RTA_PRIORITY)) != 0 || [RTA_PREFSRC, RTA_METRICS, RTA_MULTIPATH, RTA_ENCAP, RTA_VIA, RTA_NH_ID].iter().any(|k| a.contains_key(k)) {
+        return -EOPNOTSUPP;
+    }
+    if oif != 0 && !links().iter().any(|l| l.index == oif) {
+        return -ENODEV;
+    }
+    if gw == 0 {
+        // 口だけの道は、口がなければ ENODEV (fib_check_nh_nongw)
+        return if oif == 0 { -ENODEV } else { -EOPNOTSUPP };
+    }
+    if oif == LO_INDEX {
+        return -EOPNOTSUPP;
+    }
+    // ゲートウェイは scope link の道 (eth0 の網) で行けるところ。broadcast などは EINVAL、自分のアドレスはできない
+    match lookup(&rs, gw, 0) {
+        Some(r) if r.scope >= RT_SCOPE_LINK && r.typ == RTN_UNICAST => {}
+        Some(r) if r.scope >= RT_SCOPE_LINK && r.typ == RTN_LOCAL => return -EOPNOTSUPP,
+        Some(r) if r.scope >= RT_SCOPE_LINK => return crate::why::inval(),
+        _ => return -ENETUNREACH,
+    }
+    let have = rs.iter().any(|r| r.table == RT_TABLE_MAIN && r.dst == dst && r.len == dst_len);
+    let mut flags = NLM_F_EXCL;
+    if have {
+        if nlflags & NLM_F_EXCL != 0 {
+            return -EEXIST;
+        }
+        if nlflags & NLM_F_REPLACE == 0 {
+            // 同じ宛先に 2 つめの道を足す (NLM_F_APPEND) のはできない
+            return -EOPNOTSUPP;
+        }
+        flags = NLM_F_REPLACE;
+    } else {
+        if nlflags & NLM_F_CREATE == 0 {
+            return -ENOENT;
+        }
+        flags |= NLM_F_CREATE;
+    }
+    if dst_len == 0 {
+        crate::net::set_gateway(Some(smoltcp::wire::Ipv4Address::from_bits(gw)));
+        GW_PROTO.store(proto, Ordering::Relaxed);
+    } else {
+        if dst_len != 0 && rs.iter().any(|r| r.table == RT_TABLE_MAIN && r.dst == dst && r.len == dst_len && r.proto == RTPROT_KERNEL) {
+            return -EOPNOTSUPP;
+        }
+        let x = EXTRA.get();
+        x.retain(|x| !(x.dst == dst && x.len == dst_len));
+        x.push(Extra { dst, len: dst_len, gw, proto });
+        if !sync_extra() {
+            EXTRA.get().pop();
+            sync_extra();
+            return -ENOBUFS;
+        }
+    }
+    let r = Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto, dst, len: dst_len, prefsrc: 0, gw, oif: ETH_INDEX };
+    let mut d = Vec::new();
+    put_route(&mut d, &r, flags, seq, me);
+    notify(RTNLGRP_IPV4_ROUTE, d);
+    snapshot();
+    0
+}
+
+/// 知らせたときのアドレスと道 (つぎに変わったらくらべる)
+static SNAP: Bkl<Option<(Vec<Addr>, Vec<Route>)>> = Bkl::new(None);
+
+fn snapshot() {
+    let a = addrs();
+    let r = route_list(&a);
+    *SNAP.get() = Some((a, r));
+}
+
+/// アドレスや道が変わったとき (DHCP、ioctl): 前とくらべて、なくなったものを RTM_DELADDR と RTM_DELROUTE で、増えたものを
+/// RTM_NEWADDR と RTM_NEWROUTE (NLM_F_EXCL|NLM_F_CREATE) で知らせる (inet_insert_ifa は RTM_NEWADDR のあとに
+/// fib_add_ifaddr の道)。はじめは lo だけだったとみなす
+pub fn changed() {
+    let a = addrs();
+    let r = route_list(&a);
+    let (oa, or) = SNAP.get().take().unwrap_or_else(|| {
+        let lo: Vec<Addr> = a.iter().filter(|x| x.index == LO_INDEX).cloned().collect();
+        let lr = route_list(&lo).into_iter().filter(|x| x.oif == LO_INDEX).collect();
+        (lo, lr)
+    });
+    for x in oa.iter().filter(|x| !a.contains(x)) {
+        let mut d = Vec::new();
+        put_addr_msg(&mut d, x, RTM_DELADDR, 0, 0, 0);
+        notify(RTNLGRP_IPV4_IFADDR, d);
+    }
+    for x in or.iter().filter(|x| !r.contains(x)) {
+        let mut d = Vec::new();
+        put_route_msg(&mut d, x, RTM_DELROUTE, 0, 0, 0);
+        notify(RTNLGRP_IPV4_ROUTE, d);
+    }
+    for x in a.iter().filter(|x| !oa.contains(x)) {
+        let mut d = Vec::new();
+        put_addr_msg(&mut d, x, RTM_NEWADDR, 0, 0, 0);
+        notify(RTNLGRP_IPV4_IFADDR, d);
+    }
+    for x in r.iter().filter(|x| !or.contains(x)) {
+        let mut d = Vec::new();
+        put_route_msg(&mut d, x, RTM_NEWROUTE, NLM_F_EXCL | NLM_F_CREATE, 0, 0);
+        notify(RTNLGRP_IPV4_ROUTE, d);
+    }
+    *SNAP.get() = Some((a, r));
+}
+
+// ---- 近くの番地の表 (ARP: Linux の neighbour.c と arp.c) ----
+//
+// ARP は smoltcp がする (その表は外から見えない) ので、eth0 を通る ARP のフレームから同じ表を作る (net.rs): smoltcp が
+// 問い合わせを出したら INCOMPLETE (知っていたものは PROBE)、自分あての答えで REACHABLE、自分への問い合わせで STALE。
+// 時間で REACHABLE → STALE (reachable_time: Linux は 30 秒をもとに 15〜45 秒のどれか、aios は 30 秒)、INCOMPLETE と
+// PROBE は 3 秒 (retrans_time 1 秒 × 3) 答えがなければ FAILED。状態や MAC が変わったら RTM_NEWNEIGH で知らせる。
+// DELAY はない (aios はつかうたびに確かめる問い合わせを出さず、smoltcp が自分の表の 60 秒ごとに問い合わせなおす)
+
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const NDA_CACHEINFO: u16 = 3;
+const NDA_PROBES: u16 = 4;
+const NDA_IFINDEX: u16 = 8;
+const NDA_MASTER: u16 = 9;
+const NDA_MAX: u16 = 17;
+const NUD_INCOMPLETE: u16 = 0x01;
+const NUD_REACHABLE: u16 = 0x02;
+const NUD_STALE: u16 = 0x04;
+const NUD_DELAY: u16 = 0x08;
+const NUD_PROBE: u16 = 0x10;
+const NUD_FAILED: u16 = 0x20;
+const NUD_NOARP: u16 = 0x40;
+const NUD_PERMANENT: u16 = 0x80;
+const NUD_VALID: u16 = NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE | NUD_DELAY;
+const NTF_PROXY: u8 = 0x08;
+const REACHABLE_MS: u64 = 30_000;
+const RETRANS_MS: u64 = 1000;
+const UCAST_PROBES: u32 = 3;
+const MCAST_PROBES: u32 = 3;
+/// 表の大きさの上限 (gc_thresh3 は 1024。aios は古い FAILED と STALE から捨てる)
+const NEIGH_MAX: usize = 256;
+
+#[derive(Clone)]
+struct Neigh {
+    ip: u32,
+    mac: [u8; 6],
+    state: u16,
+    probes: u32,
+    /// ミリ秒 (net::now)
+    confirmed: u64,
+    used: u64,
+    updated: u64,
+}
+
+static NEIGH: Bkl<Vec<Neigh>> = Bkl::new(Vec::new());
+static NEIGH_TICK: AtomicU64 = AtomicU64::new(0);
+
+fn ms() -> u64 {
+    crate::net::now().total_millis() as u64
+}
+
+fn neigh_notify(e: &Neigh) {
+    let mut d = Vec::new();
+    put_neigh(&mut d, e, 0, 0, 0);
+    notify(RTNLGRP_NEIGH, d);
+}
+
+/// neigh_update (__neigh_update): 新しい状態と MAC。状態か MAC が変われば知らせる
+fn neigh_update(e: &mut Neigh, mac: [u8; 6], mut new: u16, now: u64) {
+    let old = e.state;
+    // 同じ MAC で STALE にするのは、いまの (VALID な) 状態のまま
+    if old & NUD_VALID != 0 && new == NUD_STALE && mac == e.mac {
+        new = old;
+    }
+    let changed = new != old || (mac != e.mac && new & NUD_VALID != 0);
+    if new & (NUD_REACHABLE | NUD_PERMANENT | NUD_NOARP) != 0 {
+        e.confirmed = now;
+    }
+    if new != old || mac != e.mac {
+        e.updated = now;
+    }
+    if new == NUD_PROBE && old != NUD_PROBE {
+        e.probes = 0;
+    }
+    e.mac = mac;
+    e.state = new;
+    if changed {
+        neigh_notify(e);
+    }
+}
+
+fn arp_fields(f: &[u8]) -> Option<(u16, [u8; 6], u32, u32)> {
+    // Ethernet の頭 14 と ARP (ハードウェア 1 (Ethernet) と IPv4、長さ 6 と 4)
+    if f.len() < 42 || f[12..14] != [8, 6] || f[14..20] != [0, 1, 8, 0, 6, 4] {
+        return None;
+    }
+    let op = u16::from_be_bytes([f[20], f[21]]);
+    let sha: [u8; 6] = f[22..28].try_into().unwrap();
+    let spa = u32::from_be_bytes(f[28..32].try_into().unwrap());
+    let tpa = u32::from_be_bytes(f[38..42].try_into().unwrap());
+    Some((op, sha, spa, tpa))
+}
+
+fn local_ip(a: u32) -> bool {
+    a >> 24 == 127 || (a != 0 && a == crate::net::eth_addr())
+}
+
+/// smoltcp が eth0 に出す ARP の問い合わせ (arp_solicit): なければ INCOMPLETE で作り (probes は ucast_probes から)、
+/// FAILED なら INCOMPLETE にもどし、知っていたもの (STALE など) は PROBE
+pub fn arp_out(f: &[u8]) {
+    let Some((1, _, _, tpa)) = arp_fields(f) else { return };
+    if local_ip(tpa) || tpa == 0 {
+        return;
+    }
+    let now = ms();
+    let t = NEIGH.get();
+    match t.iter_mut().find(|e| e.ip == tpa) {
+        None => {
+            if t.len() >= NEIGH_MAX
+                && let Some(i) = t.iter().position(|e| e.state & (NUD_FAILED | NUD_STALE) != 0)
+            {
+                t.remove(i);
+            }
+            t.push(Neigh { ip: tpa, mac: [0; 6], state: NUD_INCOMPLETE, probes: UCAST_PROBES + 1, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now });
+        }
+        Some(e) => {
+            e.used = now;
+            match e.state {
+                NUD_INCOMPLETE | NUD_PROBE => e.probes = (e.probes + 1).min(UCAST_PROBES + MCAST_PROBES),
+                NUD_FAILED => {
+                    e.state = NUD_INCOMPLETE;
+                    e.updated = now;
+                    e.probes = UCAST_PROBES + 1;
+                }
+                NUD_REACHABLE | NUD_STALE | NUD_DELAY => {
+                    let mac = e.mac;
+                    neigh_update(e, mac, NUD_PROBE, now);
+                    e.probes = 1;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// eth0 から来た ARP (arp_process): 自分への問い合わせなら、送ったものを STALE で (なければ作る)。ほかは、もう表に
+/// あるものだけ: 自分あて (PACKET_HOST) の答えなら REACHABLE、ほかは STALE
+pub fn arp_in(f: &[u8], to_me: bool) {
+    let Some((op, sha, spa, tpa)) = arp_fields(f) else { return };
+    if spa == 0 || local_ip(spa) || spa & 0xf000_0000 == 0xe000_0000 || spa == LBCAST {
+        return;
+    }
+    let now = ms();
+    let t = NEIGH.get();
+    if op == 1 && tpa != 0 && tpa == crate::net::eth_addr() {
+        match t.iter_mut().find(|e| e.ip == spa) {
+            Some(e) => neigh_update(e, sha, NUD_STALE, now),
+            None => {
+                let mut e = Neigh { ip: spa, mac: [0; 6], state: 0, probes: 0, confirmed: now.saturating_sub(2 * REACHABLE_MS), used: now, updated: now };
+                neigh_update(&mut e, sha, NUD_STALE, now);
+                t.push(e);
+            }
+        }
+        return;
+    }
+    if let Some(e) = t.iter_mut().find(|e| e.ip == spa) {
+        let state = if op == 2 && to_me { NUD_REACHABLE } else { NUD_STALE };
+        neigh_update(e, sha, state, now);
+    }
+}
+
+/// 時間で変わるもの (neigh_timer_handler): REACHABLE は reachable_time で STALE、INCOMPLETE と PROBE は 3 秒で FAILED。
+/// net::poll から (100 ミリ秒に 1 回まで) と、表を見るとき
+pub fn neigh_tick() {
+    let now = ms();
+    let last = NEIGH_TICK.load(Ordering::Relaxed);
+    if now < last + 100 && last != 0 {
+        return;
+    }
+    NEIGH_TICK.store(now, Ordering::Relaxed);
+    for e in NEIGH.get().iter_mut() {
+        if e.state == NUD_REACHABLE && now > e.confirmed + REACHABLE_MS {
+            e.state = NUD_STALE;
+            e.updated = now;
+            neigh_notify(e);
+        } else if e.state & (NUD_INCOMPLETE | NUD_PROBE) != 0 && now >= e.updated + 3 * RETRANS_MS {
+            e.probes = if e.state == NUD_PROBE { UCAST_PROBES } else { UCAST_PROBES + MCAST_PROBES };
+            e.state = NUD_FAILED;
+            e.updated = now;
+            neigh_notify(e);
+        }
+    }
+}
+
+/// RTM_NEWNEIGH (__neigh_fill_info の属性の順: DST、LLADDR (VALID のとき)、PROBES、CACHEINFO)
+fn put_neigh(out: &mut Vec<u8>, e: &Neigh, flags: u16, seq: u32, me: u32) {
+    let now = ms();
+    let mut p = Vec::new();
+    // struct ndmsg: family、pad1、pad2、ifindex、state、flags、type (RTN_UNICAST)
+    p.extend_from_slice(&[AF_INET, 0, 0, 0]);
+    p.extend_from_slice(&ETH_INDEX.to_le_bytes());
+    p.extend_from_slice(&e.state.to_le_bytes());
+    p.extend_from_slice(&[0, RTN_UNICAST]);
+    attr(&mut p, NDA_DST, &e.ip.to_be_bytes());
+    if e.state & NUD_VALID != 0 {
+        attr(&mut p, NDA_LLADDR, &e.mac);
+    }
+    attr_u32(&mut p, NDA_PROBES, e.probes);
+    // struct nda_cacheinfo: confirmed、used、updated (どれも何 1/100 秒前)、refcnt
+    let ago = |t: u64| (now.saturating_sub(t) / 10) as u32;
+    let ci = [ago(e.confirmed), ago(e.used), ago(e.updated), 0];
+    attr(&mut p, NDA_CACHEINFO, &ci.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    put_msg(out, RTM_NEWNEIGH, flags, seq, me, &p);
+}
+
+/// neigh_dump_info: 家族が 0 か AF_INET なら ARP の表 (ほかの家族の表はない)。strict なら neigh_valid_dump_req
+/// (頭は ndmsg、ifindex・state・type は 0、flags は NTF_PROXY だけ、属性は NDA_IFINDEX と NDA_MASTER)。中身と
+/// NLMSG_DONE は 1 つのデータグラム (RTNL_FLAG_DUMP_SPLIT_NLM_DONE がない)
+fn dump_neigh(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) {
+    let mut dev = 0i32;
+    let mut proxy = false;
+    if body.len() >= 12 && body[10] == NTF_PROXY {
+        proxy = true;
+    }
+    let e = (|| {
+        if strict {
+            if body.len() < 12 {
+                return Err(crate::why::inval());
+            }
+            if body[1] != 0 || body[2] != 0 || body[3] != 0 || body[4..8] != [0; 4] || body[8..10] != [0; 2] || body[11] != 0 {
+                return Err(crate::why::inval());
+            }
+            if body[10] & !NTF_PROXY != 0 {
+                return Err(crate::why::inval());
+            }
+        }
+        if body.len() >= 12 {
+            let a = attrs_of(&body[12..]);
+            for (&k, v) in a.iter() {
+                match k {
+                    NDA_IFINDEX => dev = u32_of(Some(v)) as i32,
+                    NDA_MASTER => {}
+                    _ if strict => return Err(crate::why::inval()),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+    let mut d = Vec::new();
+    match e {
+        Err(e) if strict => {
+            put_msg(&mut d, NLMSG_DONE, NLM_F_MULTI, seq, me, &(e as i32).to_le_bytes());
+            out.push(d);
+            return;
+        }
+        _ => {}
+    }
+    neigh_tick();
+    let filtered = dev != 0;
+    if !proxy && (family == AF_UNSPEC || family == AF_INET) && (dev == 0 || dev == ETH_INDEX) {
+        for n in NEIGH.get().iter() {
+            put_neigh(&mut d, n, NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 }, seq, me);
+        }
+    }
+    put_msg(&mut d, NLMSG_DONE, NLM_F_MULTI, seq, me, &0i32.to_le_bytes());
+    out.push(d);
+}
+
+/// neigh_get (ip neigh get): neigh_valid_get_req (頭のたしかめ、口がいる、属性は NDA_DST だけ) のあと、家族の表、
+/// 番地の長さ、口、さがす
+fn get_neigh(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+    if body.len() < 12 {
+        return crate::why::inval();
+    }
+    let ifindex = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    if body[1] != 0 || body[2..4] != [0; 2] || body[8..10] != [0; 2] || body[11] != 0 {
+        return crate::why::inval();
+    }
+    let flags = body[10];
+    if flags & !NTF_PROXY != 0 || (flags & NTF_PROXY == 0 && ifindex == 0) {
+        return crate::why::inval();
+    }
+    let a = attrs_of(&body[12..]);
+    if a.keys().any(|&k| k > NDA_MAX || k != NDA_DST) || !a.contains_key(&NDA_DST) {
+        return crate::why::inval();
+    }
+    if body[0] != AF_INET {
+        return -EAFNOSUPPORT;
+    }
+    let dst = a[&NDA_DST];
+    if dst.len() != 4 {
+        return crate::why::inval();
+    }
+    if ifindex != 0 && !links().iter().any(|l| l.index == ifindex) {
+        return -ENODEV;
+    }
+    if flags & NTF_PROXY != 0 {
+        return -ENOENT;
+    }
+    neigh_tick();
+    let ip = u32::from_be_bytes(dst.try_into().unwrap());
+    let Some(e) = NEIGH.get().iter().find(|e| e.ip == ip && ifindex == ETH_INDEX).cloned() else { return -ENOENT };
+    let mut d = Vec::new();
+    put_neigh(&mut d, &e, 0, seq, me);
+    out.push(d);
+    0
 }

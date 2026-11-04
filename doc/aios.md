@@ -971,8 +971,28 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   で、RTM_GETADDR と RTM_GETROUTE の dump は AF_INET のほかはみな rtnl_dump_all (AF_INET のもの)、RTM_GETLINK は
   PF_BRIDGE (ブリッジがないので空) のほかはみな口の一覧。1 つの RTM_GETROUTE は AF_INET だけ (ほかは EOPNOTSUPP)
 - ついでに SIOCGIFNAME (番号から名前: glibc と musl の if_indextoname)。前は ENOTTY だった
-- まだ: RTM_GETNEIGH (ARP の表: Firefox は network ID に使う。smoltcp の表は外から見えない)、道や口が変わったときの
-  組への知らせ (RTMGRP_IPV4_ROUTE など)、ip route add の RTM_NEWROUTE (いまは ioctl の SIOCADDRT で既定の道だけ)
+- 近くの番地の表 (RTM_GETNEIGH: ip neigh、Firefox の network ID): ARP は smoltcp がする (その表は外から見えない) ので、
+  eth0 を通る ARP のフレームから Linux と同じ表を作る (net.rs の受けと出しで netlink::arp_in / arp_out)。smoltcp が問い
+  合わせを出したら INCOMPLETE (probes は ucast_probes の 3 から。知っていたものは PROBE)、自分の MAC あての答えで
+  REACHABLE、自分への問い合わせで STALE (なければ作る)、ほかは表にあるものだけ STALE。時間で (net::poll から 100 ミリ秒
+  ごとと、表を見るとき) REACHABLE は 30 秒で STALE (Linux は 15〜45 秒のどれか)、INCOMPLETE と PROBE は 3 秒で FAILED。
+  状態か MAC が変われば RTM_NEWNEIGH を RTMGRP_NEIGH に。DELAY はない (aios は使うたびの確かめの問い合わせを出さず、
+  smoltcp が自分の表の 60 秒ごとに問い合わせなおす)。dump は中身と DONE が 1 つのデータグラム (道とちがい
+  RTNL_FLAG_DUMP_SPLIT_NLM_DONE がない)、家族は 0 と AF_INET だけ、strict と NDA_IFINDEX。get は neigh_valid_get_req
+  のとおり (口がいる、属性は NDA_DST だけ、AF_INET のほかは EAFNOSUPPORT、NTF_PROXY は ENOENT)
+- 道を変える (RTM_NEWROUTE / RTM_DELROUTE: ip route add / replace / del): rtm_to_fib_config と fib_create_info と
+  fib_table_insert / delete のたしかめの順 (ECN、type、prefix のはみ出しは EINVAL、ゲートウェイが eth0 の網になければ
+  ENETUNREACH、broadcast なら EINVAL、あれば NLM_F_EXCL で EEXIST、なくて NLM_F_CREATE がなければ ENOENT、消すものが
+  なければ ESRCH)。aios が持てるのは main の表の、eth0 のゲートウェイを通る unicast の道 (smoltcp の道の表に入れる:
+  net::set_routes、16 まで) と既定の道だけで、口だけの道、ほかの type や表、metric、prefsrc、同じ宛先の 2 つめ
+  (NLM_F_APPEND)、アドレスから作った道を消すのは EOPNOTSUPP (aios のできないこと)
+- 知らせ (rtnl_notify): netlink で道を変えたら RTM_NEWROUTE (NLM_F_EXCL|NLM_F_CREATE、replace は NLM_F_REPLACE) か
+  RTM_DELROUTE を、送ったソケットのポートと seq で RTMGRP_IPV4_ROUTE に。ioctl (SIOCADDRT / SIOCDELRT / SIOCSIFADDR /
+  SIOCSIFNETMASK) と DHCP で変わったら、前とくらべて RTM_DELADDR、RTM_DELROUTE、RTM_NEWADDR (RTMGRP_IPV4_IFADDR)、
+  RTM_NEWROUTE をポート 0 で (netlink::changed)。組あての受けの nl_groups は組のビット
+- 確かめかた (つづき): `test/ldiff.sh --root --net rtnl` (10.0.2.3 にはじめて送ったときの ARP と知らせ、dump と get の
+  しくじり、ioctl と netlink で既定の道と 192.168.7.0/24 を消して足す知らせ、しくじりの errno。おわりに既定の道を
+  もどす)。Linux 7.4-rc1 と 195 行同じ。10.0.2.3 にもう問い合わせた VM では、はじめの知らせがちがって見える
 - 確かめかた: `test/ldiff.sh --net route` (手本の Linux は ip=dhcp の virtio-net で、aios の VM と同じ 10.0.2.15/24 と
   ゲートウェイ 10.0.2.2。IPv6 のものは出さない)。dump (家族、strict の表えらび)、1 つの道 (19 の宛先と元と oif、
   fibmatch、strict のしくじり)、Firefox と同じ問いあわせで link up。Linux 7.4-rc1 と 232 行同じ。ldiff に --net を足した
