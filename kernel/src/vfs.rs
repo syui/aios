@@ -412,9 +412,28 @@ pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result
     mount_ro(path, fsroot, source, fstype, false)
 }
 
-/// 読むだけのマウントが置かれたことがある (大きなロックなしの作る・消す (fastdir.rs) は、それからはふつうの道で:
-/// EROFS を決める check_writable はマウントの表を見る)
+/// どこかの表に読むだけのマウントがある (大きなロックなしの作る・消す (fastdir.rs) は、あるあいだはふつうの道で:
+/// EROFS を決める check_writable はマウントの表を見る)。置くときは印を立ててから ext4 のロックを取る。外したとき、
+/// remount で書けるようにしたとき、namespace が消えたときに数えなおす (前は一度立つと立ったままで、test/mountinfo.c の
+/// あとの test/createrace.c が速い道を使えなかった)
 pub static RO_MOUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RO_MOUNTED を数えなおす (生きている表のどれかに ro のマウントがあるか)
+fn ro_refresh() {
+    let mut tables = alloc::vec![init_mnt()];
+    tables.extend(ALL_MNT.get().iter().filter_map(|w| w.upgrade()));
+    let any = tables.iter().any(|t| t.list.try_borrow().map_or(true, |l| l.iter().any(|m| m.ro)));
+    RO_MOUNTED.store(any, core::sync::atomic::Ordering::SeqCst);
+}
+
+impl Drop for MountNs {
+    fn drop(&mut self) {
+        // この表の ro のマウントがなくなる (ALL_MNT のこれはもう upgrade できない)
+        if self.list.get_mut().iter().any(|m| m.ro) {
+            ro_refresh();
+        }
+    }
+}
 
 pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
     mount_at(path, fsroot, "/", source, fstype, ro)
@@ -531,6 +550,10 @@ pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
         drop(crate::extfs::fs_lock());
     }
     m.ro = ro;
+    drop(l);
+    if !ro {
+        ro_refresh();
+    }
     Ok(())
 }
 
@@ -555,8 +578,11 @@ pub fn umount(path: &str) -> Result<(), i64> {
     if l[i + 1..].iter().any(|m| m.at == top.id()) {
         return Err(-16); // EBUSY
     }
-    l.remove(i);
+    let was_ro = l.remove(i).ro;
     drop(l);
+    if was_ro {
+        ro_refresh();
+    }
     mount_at_refresh();
     names_changed();
     // 閉じたファイルの棚 (file::Shelf) に、外したものの inode が残らないように
