@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist landlockabi mmapcoh mnt mremap netlink nftables nfteval ns opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pipeslots procmaps procwait pwfast random rlock robust seccomp seccompnotify sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inetsock inotify landlock-eexist landlockabi mmapcoh mnt mountinfo mremap netlink nftables nfteval ns opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pipeslots procmaps procwait pwfast random rlock robust seccomp seccompnotify sigtramp sleeps splice statc statcache unixrace unixsock userns"
 
 case $1 in
 build)
@@ -38,6 +38,8 @@ run)
     # pwfast (大きなロックなしの pwrite)、opencache (閉じたファイルの棚)、createrace (大きなロックなしの作る・消す)、
     # orphan (消したファイルが片づくか) も
     chosen | mmapcoh | rlock | pwfast | opencache | createrace | orphan) cmd="./$t $HOME /tmp" ;;
+    # mountinfo (マウントの番号と st_dev のそろい方) も ext4 (ホーム) と tmpfs (/tmp) で
+    mountinfo) cmd="./$t $HOME /tmp" ;;
     # statc (大きなロックなしの stat) は ext4 (ホーム) と tmpfs (/tmp) で。root でも (見る人をほかの人にして)
     statc) cmd="./$t $HOME /tmp" ;;
     # flushrace (fsync と sync が眠って書くあいだの読み書き) は ext4 (ホーム) で 8 秒

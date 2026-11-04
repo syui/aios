@@ -1116,8 +1116,12 @@ impl ExtFs {
             println!("extfs: unsupported features for writing ({:#x}), read-only", ro_compat & !RO_WRITE);
             ro = true;
         }
+        let id = new_fs_id();
+        // stat の st_dev と mountinfo の major:minor は、ルートの区画の番号 (Linux の ext4 の s_dev)
+        let (ma, mi) = crate::block::dev_of_part(&crate::block::root());
+        crate::vfs::set_fs_dev(id, ma, mi);
         let fs = Rc::new(ExtFs {
-            fs: new_fs_id(),
+            fs: id,
             bsize,
             inode_size,
             ipg,
@@ -3866,7 +3870,7 @@ impl ExtFs {
             })
         })?;
         let (ino, m, v) = ino;
-        let st = crate::file::Stat { ino: m.ino, mode: m.mode, nlink: m.nlink, uid: m.uid, gid: m.gid, rdev: m.rdev, size: m.size, blocks: m.blocks, mtime: m.mtime, ctime: m.ctime };
+        let st = crate::file::Stat { dev: crate::vfs::st_dev(self.fs), ino: m.ino, mode: m.mode, nlink: m.nlink, uid: m.uid, gid: m.gid, rdev: m.rdev, size: m.size, blocks: m.blocks, mtime: m.mtime, ctime: m.ctime };
         Some((ExtInode::make(self, ino), st, v))
     }
 

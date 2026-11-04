@@ -2265,7 +2265,7 @@ pub fn scm_fds(u: &UnixRef) -> usize {
 
 pub fn stat(u: &UnixRef) -> Stat {
     let s = u.borrow();
-    Stat { ino: s.ino, uid: s.uid, gid: s.gid, mtime: s.mtime, ctime: s.ctime, ..Stat::dev(0o140000 | s.mode, 0) }
+    Stat { dev: crate::vfs::encode_dev(crate::vfs::SOCK_DEV), ino: s.ino, uid: s.uid, gid: s.gid, mtime: s.mtime, ctime: s.ctime, ..Stat::dev(0o140000 | s.mode, 0) }
 }
 
 /// utimensat: mtime を変え (None はそのまま)、ctime はいまに

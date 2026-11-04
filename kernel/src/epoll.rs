@@ -310,11 +310,11 @@ pub fn fdinfo(ep: &EpollRef) -> alloc::string::String {
     let mut s = alloc::string::String::new();
     for (fd, e) in ep.borrow().entries.iter() {
         let Some(f) = e.file.upgrade() else { continue };
-        let (pos, ino) = {
+        let (pos, st) = {
             let f = f.borrow();
-            (f.offset, f.stat().ino)
+            (f.offset, f.stat())
         };
-        s.push_str(&alloc::format!("tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}\n", fd, e.events | EPOLLERR | EPOLLHUP, e.data, pos, ino, crate::file::ST_DEV_KERNEL));
+        s.push_str(&alloc::format!("tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}\n", fd, e.events | EPOLLERR | EPOLLHUP, e.data, pos, st.ino, st.kdev()));
     }
     s
 }

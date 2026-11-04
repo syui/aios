@@ -90,6 +90,8 @@ enum Node {
     NsLink(u32, u8),
     /// /proc/PID/mounts (そのプロセスのマウントの namespace の表)
     PidMounts(u32),
+    /// /proc/PID/mountinfo (番号と親、major:minor、根: vfs::mountinfo_text_of)
+    MountInfo(u32),
     /// /proc/PID/uid_map、gid_map、setgroups (ユーザーの namespace の地図。0 uid、1 gid、2 setgroups)
     IdMap(u32, u8),
     /// /proc/PID/task (スレッドの一覧)、task/TID、その中の stat / status / comm (0 1 2)。番号は本当のもの
@@ -217,6 +219,7 @@ impl ProcInode {
             Node::FdInfo(p, n) => 1 << 63 | (p as u64) << 16 | (0x100 + n as u64),
             Node::NsDir(p) => (p as u64) << 16 | 14,
             Node::PidMounts(p) => (p as u64) << 16 | 15,
+            Node::MountInfo(p) => (p as u64) << 16 | 26,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
             Node::TaskDir(p) => (p as u64) << 16 | 20,
             Node::Task(_, t) => (t as u64) << 16 | 21,
@@ -247,7 +250,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
             _ => None,
         }
     }
@@ -467,6 +470,12 @@ impl ProcInode {
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader_any(pid)?.comm()),
             Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
+            // そのプロセスの namespace の表を、そのプロセスの chroot の根から
+            Node::MountInfo(pid) => {
+                let p = leader(pid)?;
+                let root = p.files.as_ref().map(|f| f.get().root.trim_start_matches('/').to_string()).unwrap_or_default();
+                crate::vfs::mountinfo_text_of(p.cred.ns.mnt.clone(), &root)
+            }
             Node::TaskFile(pid, tid, k) => {
                 let t = thread(pid, tid)?;
                 match k {
@@ -919,6 +928,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "statm") => Node::Statm(p),
             (Node::Pid(p), "comm") => Node::Comm(p),
             (Node::Pid(p), "mounts") => Node::PidMounts(p),
+            (Node::Pid(p), "mountinfo") => Node::MountInfo(p),
             (Node::Pid(p), "uid_map") => Node::IdMap(p, 0),
             (Node::Pid(p), "gid_map") => Node::IdMap(p, 1),
             (Node::Pid(p), "setgroups") => Node::IdMap(p, 2),
@@ -1051,6 +1061,7 @@ impl Inode for ProcInode {
                 add("statm".into(), Node::Statm(p));
                 add("comm".into(), Node::Comm(p));
                 add("mounts".into(), Node::PidMounts(p));
+                add("mountinfo".into(), Node::MountInfo(p));
                 add("task".into(), Node::TaskDir(p));
                 add("uid_map".into(), Node::IdMap(p, 0));
                 add("gid_map".into(), Node::IdMap(p, 1));

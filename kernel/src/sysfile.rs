@@ -143,6 +143,15 @@ fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
     }
 }
 
+/// at_path と同じものを探し、たどったパス (先頭 / なし) といっしょに返す (statx のマウント: vfs::mount_of)
+fn at_full(dirfd: i64, path: &str, flags: u64) -> Result<(String, InodeRef), i64> {
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    match base_ino(dirfd, path)? {
+        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow),
+        None => vfs::lookup(&proc::current().files().cwd.clone(), path, follow),
+    }
+}
+
 /// at と同じものを探し、そのパス (先頭 / なし) を返す
 fn old_path(dirfd: i64, pathp: usize, flags: u64) -> Result<String, i64> {
     let path = user_str(pathp)?;
@@ -1578,12 +1587,12 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
     let of_file = |f: &FileRef| {
         let b = f.borrow();
         let mg = matches!(&b.kind, Kind::Inode(i, _) if mgtime(i));
-        (b.stat(), mg)
+        (b.stat(), mg, b.mount())
     };
-    let (s, mg) = if path.is_empty() {
+    let (s, mg, mnt) = if path.is_empty() {
         if dirfd == AT_FDCWD {
-            let i = vfs::resolve("", &proc::current().files().cwd.clone(), true)?;
-            (Stat::of_inode(&i), mgtime(&i))
+            let (full, i) = vfs::lookup("", &proc::current().files().cwd.clone(), true)?;
+            (Stat::of_inode(&i), mgtime(&i), vfs::mount_of(&full))
         } else {
             of_file(&file_of(dirfd as u64)?)
         }
@@ -1594,7 +1603,7 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
     } else {
         // 大きなロックなしの statx の覚えに (statc.rs。newfstatat と同じ)
         let (learn, follow) = (dirfd == AT_FDCWD || path.starts_with('/'), flags & AT_SYMLINK_NOFOLLOW == 0);
-        let i = match at_path(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW) {
+        let (full, i) = match at_full(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW) {
             Err(e) if e == -ENOENT && learn => {
                 crate::statc::learn_missing(&path, follow);
                 return Err(e);
@@ -1603,13 +1612,13 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
         };
         aa_at(crate::apparmor::OP_GETATTR, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW, crate::apparmor::MAY_GETATTR)?;
         let (s, mg) = (Stat::of_inode(&i), mgtime(&i));
-        out(buf, &s.to_statx(mask, mg))?;
+        out(buf, &s.to_statx(mask, mg, vfs::mount_of(&full)))?;
         if learn && i.fast_stat() {
             crate::statc::learn(&path, follow, &i, mg);
         }
         return Ok(0);
     };
-    out(buf, &s.to_statx(mask, mg))?;
+    out(buf, &s.to_statx(mask, mg, mnt))?;
     Ok(0)
 }
 
@@ -2954,14 +2963,16 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     if !dir.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    let (root, source, fstype) = if flags & MS_BIND != 0 {
+    if flags & MS_BIND != 0 {
         let src = user_str(srcp)?;
         let (sfull, s) = vfs::lookup(&cwd, &src, true)?;
         if !s.meta().is_dir() {
             return Err(crate::why::inval());
         }
-        (s, alloc::format!("/{}", sfull), String::from("none"))
-    } else {
+        vfs::mount_bind(&full, s, &sfull, flags & MS_RDONLY != 0)?;
+        return Ok(0);
+    }
+    let (root, source, fstype) = {
         let fstype = user_str(typep)?;
         let root = match fstype.as_str() {
             // /tmp と同じく、だれでも作れて他人のものは消せない (Linux の tmpfs の既定)

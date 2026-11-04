@@ -630,11 +630,10 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
 }
 
 /// Linux (asm-generic) の struct stat
-/// fstat の st_dev (aios はいつも 1: major 0、minor 1) を、カーネルの形 (major << 20 | minor) にしたもの (fdinfo の sdev)
-pub const ST_DEV_KERNEL: u32 = 1;
-
 #[derive(Clone, Copy)]
 pub struct Stat {
+    /// st_dev (stat の形: vfs::encode_dev)。ファイルシステムごと (vfs::fs_dev)
+    pub dev: u64,
     pub ino: u64,
     pub mode: u32,
     pub nlink: u32,
@@ -649,11 +648,13 @@ pub struct Stat {
 
 impl Stat {
     pub fn of_inode(i: &InodeRef) -> Stat {
-        Stat::of_meta(&i.meta())
+        Stat::of_meta(&i.meta(), i.id().0)
     }
 
-    pub fn of_meta(m: &vfs::Meta) -> Stat {
+    /// fs はファイルシステムの番号 (InodeRef::id の .0。st_dev になる)
+    pub fn of_meta(m: &vfs::Meta, fs: usize) -> Stat {
         Stat {
+            dev: vfs::st_dev(fs),
             ino: m.ino,
             mode: m.mode,
             nlink: m.nlink,
@@ -667,13 +668,20 @@ impl Stat {
         }
     }
 
+    /// ファイルシステムのないもの (anon_inode の dev。ソケットとパイプは呼ぶほうが dev を)
     pub fn dev(mode: u32, rdev: u64) -> Stat {
-        Stat { ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, mtime: 0, ctime: 0 }
+        Stat { dev: vfs::encode_dev(vfs::ANON_DEV), ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, mtime: 0, ctime: 0 }
+    }
+
+    /// st_dev をカーネルの形 (major << 20 | minor) に (fdinfo の sdev)
+    pub fn kdev(&self) -> u32 {
+        let (ma, mi) = vfs::decode_dev(self.dev);
+        ma << 20 | mi
     }
 
     pub fn to_bytes(&self) -> [u8; 128] {
         let mut b = [0u8; 128];
-        b[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
+        b[0..8].copy_from_slice(&self.dev.to_le_bytes());
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());
         b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
@@ -692,16 +700,26 @@ impl Stat {
         b
     }
 
-    /// struct statx (STATX_BASIC_STATS だけ)
+    /// struct statx (STATX_BASIC_STATS と、マウントの番号)
     /// statx の答え。mask は頼まれたもの。mg (ext4 と tmpfs: Linux の multigrain の時刻) なら、mtime も ctime も
-    /// 頼まれていなければ、その 2 つは出さない (Linux の fill_mg_cmtime)
-    pub fn to_statx(&self, mask: u32, mg: bool) -> [u8; 256] {
+    /// 頼まれていなければ、その 2 つは出さない (Linux の fill_mg_cmtime)。mnt はそのものがあるマウント (番号、その根か:
+    /// vfs::mount_of)。stx_mnt_id はいつも (STATX_MNT_ID_UNIQUE を頼まれればその番号で)、根なら STATX_ATTR_MOUNT_ROOT
+    /// (Linux の vfs_statx_path)
+    pub fn to_statx(&self, mask: u32, mg: bool, mnt: (u64, bool)) -> [u8; 256] {
         const MTIME: u32 = 0x40;
         const CTIME: u32 = 0x80;
+        const MNT_ID: u32 = 0x1000;
+        const MNT_ID_UNIQUE: u32 = 0x4000;
+        const ATTR_MOUNT_ROOT: u64 = 0x2000;
         let cm = !mg || mask & (MTIME | CTIME) != 0;
         let mut b = [0u8; 256];
-        // stx_mask = STATX_BASIC_STATS (と、なければ mtime / ctime をのぞく)
-        b[0..4].copy_from_slice(&(if cm { 0x7ffu32 } else { 0x7ff & !(MTIME | CTIME) }).to_le_bytes());
+        // stx_mask = STATX_BASIC_STATS (と、なければ mtime / ctime をのぞく) とマウントの番号
+        let unique = mask & MNT_ID_UNIQUE != 0;
+        let got = (if cm { 0x7ffu32 } else { 0x7ff & !(MTIME | CTIME) }) | if unique { MNT_ID_UNIQUE } else { MNT_ID };
+        b[0..4].copy_from_slice(&got.to_le_bytes());
+        b[8..16].copy_from_slice(&(if mnt.1 { ATTR_MOUNT_ROOT } else { 0 }).to_le_bytes());
+        b[56..64].copy_from_slice(&ATTR_MOUNT_ROOT.to_le_bytes());
+        b[144..152].copy_from_slice(&(if unique { vfs::unique_mnt_id(mnt.0) } else { mnt.0 }).to_le_bytes());
         b[4..8].copy_from_slice(&4096u32.to_le_bytes());
         b[16..20].copy_from_slice(&self.nlink.to_le_bytes());
         b[20..24].copy_from_slice(&crate::ns::show_uid(self.uid).to_le_bytes());
@@ -722,7 +740,9 @@ impl Stat {
         let minor = ((d >> 12) & 0xffff_ff00) | (d & 0xff);
         b[128..132].copy_from_slice(&(major as u32).to_le_bytes());
         b[132..136].copy_from_slice(&(minor as u32).to_le_bytes());
-        b[140..144].copy_from_slice(&1u32.to_le_bytes()); // st_dev = 1
+        let (dma, dmi) = vfs::decode_dev(self.dev);
+        b[136..140].copy_from_slice(&dma.to_le_bytes());
+        b[140..144].copy_from_slice(&dmi.to_le_bytes());
         b
     }
 }
@@ -861,15 +881,15 @@ impl OpenFile {
             // dev と ino が同じなら同じファイルとみなす
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 use core::sync::atomic::Ordering::Relaxed;
-                Stat { ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
+                Stat { dev: vfs::encode_dev(vfs::PIPE_DEV), ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
             }
-            Kind::Socket(_) => Stat::dev(0o140000 | 0o777, 0),
-            Kind::Netlink(n) => Stat { ino: crate::netlink::ino(n), ..Stat::dev(0o140000 | 0o777, 0) },
+            Kind::Socket(_) => Stat { dev: vfs::encode_dev(vfs::SOCK_DEV), ..Stat::dev(0o140000 | 0o777, 0) },
+            Kind::Netlink(n) => Stat { dev: vfs::encode_dev(vfs::SOCK_DEV), ino: crate::netlink::ino(n), ..Stat::dev(0o140000 | 0o777, 0) },
             Kind::Unix(u) => crate::unix::stat(u),
             Kind::Inet(u) => crate::inet::stat(u),
             // pidfd はプロセス (スレッド) ごとの inode (Linux の pidfs: 同じものを指す pidfd は同じ ino。aios の pid は
             // 使いまわさないので番号そのもの)
-            Kind::PidFd(pid) => Stat { ino: *pid as u64, ..Stat::dev(0o600, 0) },
+            Kind::PidFd(pid) => Stat { dev: vfs::encode_dev(vfs::PIDFS_DEV), ino: *pid as u64, ..Stat::dev(0o600, 0) },
             // 名前のない inode (anon_inode)
             Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
         }
@@ -889,17 +909,17 @@ impl OpenFile {
         self.flags | if opened { O_LARGEFILE } else { 0 }
     }
 
-    /// このファイルのあるマウントの番号 (fdinfo の mnt_id)。aios はファイルシステムごとに 1 つ (21 から)。名前のないもの
-    /// (パイプ、ソケット、anon_inode、pidfd) は Linux の中のマウントのように小さな番号
-    fn mnt_id(&self) -> u64 {
+    /// このファイルのあるマウント (番号、その根か: statx と fdinfo の mnt_id)。開いたときのパスの、いまのプロセスの
+    /// マウントの表で (vfs::mount_of)。名前のないもの (パイプ、ソケット、anon_inode、pidfd) は Linux の中のマウントの番号
+    pub fn mount(&self) -> (u64, bool) {
         match &self.kind {
-            Kind::Inode(ino, _) => 21 + ino.id().0 as u64,
-            Kind::PidFd(_) => 12,
-            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => 14,
-            Kind::Socket(_) | Kind::Netlink(_) | Kind::Unix(_) | Kind::Inet(_) => 15,
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 16,
+            Kind::Inode(_, path) => vfs::mount_of(path.trim_start_matches('/')),
+            Kind::PidFd(_) => (vfs::PIDFS_MNT, false),
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => (vfs::PIPE_MNT, false),
+            Kind::Socket(_) | Kind::Netlink(_) | Kind::Unix(_) | Kind::Inet(_) => (vfs::SOCK_MNT, false),
+            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => (vfs::ANON_MNT, false),
             // デバイスは /dev のノードのあるところ
-            _ => vfs::resolve("", &self.describe(), true).map_or(20, |i| 21 + i.id().0 as u64),
+            _ => vfs::mount_of(self.describe().trim_start_matches('/')),
         }
     }
 
@@ -907,7 +927,7 @@ impl OpenFile {
     pub fn fdinfo(&self, cloexec: bool) -> String {
         const O_CLOEXEC: u32 = 0o2000000;
         let flags = self.linux_flags() | if cloexec { O_CLOEXEC } else { 0 };
-        let mut s = alloc::format!("pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n", self.offset, flags, self.mnt_id(), self.stat().ino);
+        let mut s = alloc::format!("pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n", self.offset, flags, self.mount().0, self.stat().ino);
         match &self.kind {
             Kind::PidFd(pid) => s.push_str(&crate::pidfd::fdinfo(*pid, self.flags & PIDFD_THREAD != 0)),
             Kind::EventFd(e) => s.push_str(&crate::epoll::eventfd_fdinfo(e)),

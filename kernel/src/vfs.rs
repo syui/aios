@@ -275,10 +275,61 @@ pub fn new_fs_id() -> usize {
     *NEXT_FS.get()
 }
 
+// ---- ファイルシステムごとの dev (stat の st_dev、statx の stx_dev、mountinfo の major:minor) ----
+// 前はどのファイルシステムも st_dev = 1 で、cp や tar が (dev, ino) で、ちがうファイルシステムの同じ番号のものを同じ
+// ファイルとみなすことがあった。ブロックデバイスの上のもの (ext4、vfat) はその番号 (set_fs_dev)、ほかは Linux の名前の
+// ないもの (get_anon_bdev) と同じく major 0 で、minor はファイルシステムの番号から。読むのは大きなロックなしでも
+
+static FS_DEV: [core::sync::atomic::AtomicU32; 256] = [const { core::sync::atomic::AtomicU32::new(0) }; 256];
+/// 名前のないファイルシステムの minor は ANON_MINOR + ファイルシステムの番号 (下の 4 つの中のもののあと)
+const ANON_MINOR: u32 = 32;
+/// ファイルシステムを持たない中のもの (Linux の中のマウント) の dev: ソケット、パイプ、anon_inode、pidfd
+pub const SOCK_DEV: (u32, u32) = (0, 8);
+pub const PIPE_DEV: (u32, u32) = (0, 14);
+pub const ANON_DEV: (u32, u32) = (0, 15);
+pub const PIDFS_DEV: (u32, u32) = (0, 16);
+/// それらのマウントの番号 (fdinfo の mnt_id。mountinfo には出ない: Linux の MNT_INTERNAL)
+pub const SOCK_MNT: u64 = 1;
+pub const PIPE_MNT: u64 = 2;
+pub const ANON_MNT: u64 = 3;
+pub const PIDFS_MNT: u64 = 4;
+
+/// ブロックデバイスの上のファイルシステムの番号 (ext4 と vfat がマウントのときに)
+pub fn set_fs_dev(fs: usize, major: u32, minor: u32) {
+    if let Some(a) = FS_DEV.get(fs) {
+        a.store(major << 20 | (minor & 0xfffff), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// ファイルシステム fs (InodeRef::id の .0) の (major, minor)
+pub fn fs_dev(fs: usize) -> (u32, u32) {
+    match FS_DEV.get(fs).map_or(0, |a| a.load(core::sync::atomic::Ordering::Relaxed)) {
+        0 => (0, ANON_MINOR + fs as u32),
+        v => (v >> 20, v & 0xfffff),
+    }
+}
+
+/// (major, minor) を stat の st_dev の形に (Linux の new_encode_dev。glibc の makedev と同じ)
+pub fn encode_dev(d: (u32, u32)) -> u64 {
+    let (ma, mi) = (d.0 as u64, d.1 as u64);
+    (mi & 0xff) | (ma << 8) | ((mi & !0xff) << 12)
+}
+
+/// stat の st_dev の形を (major, minor) に
+pub fn decode_dev(d: u64) -> (u32, u32) {
+    ((((d >> 32) & 0xffff_f000) | ((d >> 8) & 0xfff)) as u32, (((d >> 12) & 0xffff_ff00) | (d & 0xff)) as u32)
+}
+
+/// ファイルシステム fs のものの st_dev
+pub fn st_dev(fs: usize) -> u64 {
+    encode_dev(fs_dev(fs))
+}
+
 pub fn set_root(r: InodeRef, source: &str, fstype: &str) {
     names_changed();
     *ROOT.get() = Some(r);
     *ROOT_INFO.get() = (source.into(), fstype.into());
+    mount_at_refresh();
 }
 
 pub fn root() -> InodeRef {
@@ -291,9 +342,14 @@ pub fn root() -> InodeRef {
 
 #[derive(Clone)]
 pub struct Mount {
+    /// マウントの番号 (mountinfo、statx の stx_mnt_id、fdinfo の mnt_id。namespace を写すと新しい番号)
+    id: u32,
     /// マウント先のディレクトリの id
     at: (usize, u64),
     root: InodeRef,
+    /// root がそのファイルシステムのどこか (mountinfo の 4 つめ。bind マウントでなければ "/")
+    root_path: String,
+    /// もと (bind マウントは、もとのファイルシステムのもの: Linux と同じ)
     source: String,
     /// マウント先のパス (先頭 / なし。/proc/mounts 用)
     target: String,
@@ -306,7 +362,21 @@ pub struct MountNs {
     pub id: u64,
     /// 作ったときのユーザーの namespace (その中の root がマウントしてよい)
     pub owner: u64,
+    /// ルート (/) のマウントの番号
+    root_id: u32,
     list: core::cell::RefCell<Vec<Mount>>,
+}
+
+/// マウントの番号 (Linux の mnt_id。中のもの (SOCK_MNT ...) のあと、21 から。aios は使いまわさない)
+static NEXT_MNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(21);
+
+fn new_mnt_id() -> u32 {
+    NEXT_MNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// statx の STATX_MNT_ID_UNIQUE の番号 (Linux は 2^31 + 1 から: MNT_UNIQUE_ID_OFFSET)
+pub fn unique_mnt_id(id: u64) -> u64 {
+    (1u64 << 31) + id
 }
 
 static INIT_MNT: Bkl<Option<Rc<MountNs>>> = Bkl::new(None);
@@ -315,7 +385,7 @@ static ALL_MNT: Bkl<Vec<alloc::rc::Weak<MountNs>>> = Bkl::new(Vec::new());
 
 fn init_mnt() -> Rc<MountNs> {
     (*INIT_MNT.get())
-        .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, list: core::cell::RefCell::new(Vec::new()) }))
+        .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, root_id: new_mnt_id(), list: core::cell::RefCell::new(Vec::new()) }))
         .clone()
 }
 
@@ -324,9 +394,13 @@ fn current_mnt() -> Rc<MountNs> {
     crate::proc::current_mnt().unwrap_or_else(init_mnt)
 }
 
-/// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)
+/// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)。写したマウントは新しい番号 (Linux の copy_tree)
 pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
-    let n = Rc::new(MountNs { id, owner, list: core::cell::RefCell::new(current_mnt().list.borrow().clone()) });
+    let mut list = current_mnt().list.borrow().clone();
+    for m in list.iter_mut() {
+        m.id = new_mnt_id();
+    }
+    let n = Rc::new(MountNs { id, owner, root_id: new_mnt_id(), list: core::cell::RefCell::new(list) });
     let all = ALL_MNT.get();
     all.retain(|w| w.strong_count() > 0);
     all.push(Rc::downgrade(&n));
@@ -343,6 +417,46 @@ pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result
 pub static RO_MOUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+    mount_at(path, fsroot, "/", source, fstype, ro)
+}
+
+/// bind マウント (MS_BIND): src (先頭 / なし、たどったあと) のディレクトリ root を path に。mountinfo の root の欄と、
+/// もと・種類は、src をふくむマウントのもの (Linux と同じ。前の aios は もと が "/src"、種類が "none" だった)
+pub fn mount_bind(path: &str, root: InodeRef, src: &str, ro: bool) -> Result<(), i64> {
+    let (root_path, source, fstype) = {
+        let ns = current_mnt();
+        let l = ns.list.borrow();
+        let (rp, source, fstype, target) = match containing(&l, src, l.len()) {
+            Some(i) => (l[i].root_path.clone(), l[i].source.clone(), l[i].fstype.clone(), l[i].target.clone()),
+            None => {
+                let (s, t) = ROOT_INFO.get().clone();
+                (String::from("/"), s, t, String::new())
+            }
+        };
+        let rel = if target.is_empty() { src } else { src[target.len()..].trim_start_matches('/') };
+        let rp = if rel.is_empty() {
+            rp
+        } else if rp == "/" {
+            alloc::format!("/{}", rel)
+        } else {
+            alloc::format!("{}/{}", rp, rel)
+        };
+        (rp, source, fstype)
+    };
+    mount_at(path, root, &root_path, &source, &fstype, ro)
+}
+
+/// path が t の下 (t そのものも)。t が "" (ルート) ならどれも
+fn under(path: &str, t: &str) -> bool {
+    t.is_empty() || path == t || (path.len() > t.len() && path.starts_with(t) && path.as_bytes()[t.len()] == b'/')
+}
+
+/// l[..before] のうち、path をふくむいちばん深いマウント (同じところに重ねたものは上のもの)。なければルート (None)
+fn containing(l: &[Mount], path: &str, before: usize) -> Option<usize> {
+    l[..before].iter().enumerate().filter(|(_, m)| under(path, &m.target)).max_by_key(|(_, m)| m.target.len()).map(|(i, _)| i)
+}
+
+fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
     if ro {
         RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
         drop(crate::extfs::fs_lock());
@@ -351,7 +465,7 @@ pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bo
     if !dir.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    current_mnt().list.borrow_mut().push(Mount { at: dir.id(), root: fsroot, source: source.into(), target, fstype: fstype.into(), ro });
+    current_mnt().list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro });
     // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
     mount_at_refresh();
     names_changed();
@@ -368,11 +482,23 @@ fn mount_key(id: (usize, u64)) -> u64 {
     id.1 | (id.0 as u64) << 48
 }
 
+/// はじめの namespace で、ルートのファイルシステムがルート (/) にだけ見えていれば、そのマウントの番号 (statx の stx_mnt_id。
+/// 大きなロックなしの stat (statc) が、覚えにない名前をルートの ext4 で引いたとき)。bind でほかにも見えていれば 0
+static ROOT_FS_MNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ROOT_FS_MNT (0 はわからない: ふつうの道へ)
+pub fn root_fs_mount() -> u64 {
+    ROOT_FS_MNT.load(core::sync::atomic::Ordering::SeqCst)
+}
+
 /// マウントの表が変わった (大きなロックの中で): はじめの namespace のマウント先を MOUNT_AT に写しなおす
 fn mount_at_refresh() {
     use core::sync::atomic::Ordering::SeqCst;
     let ns = init_mnt();
     let l = ns.list.borrow();
+    let rootfs = ROOT.get().as_ref().map(|r| r.id().0);
+    let alone = rootfs.is_some_and(|fs| !l.iter().any(|m| m.root.id().0 == fs));
+    ROOT_FS_MNT.store(if alone { ns.root_id as u64 } else { 0 }, SeqCst);
     if l.len() > MOUNT_AT.len() {
         MOUNT_MANY.store(true, SeqCst);
     }
@@ -438,6 +564,87 @@ pub fn umount(path: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// path (先頭 / なし、たどったあと) をふくむマウントの番号と、path がそのマウントの根か (statx の stx_mnt_id と
+/// STATX_ATTR_MOUNT_ROOT、fdinfo の mnt_id)。いまのプロセスの表で
+pub fn mount_of(path: &str) -> (u64, bool) {
+    mount_of_in(&current_mnt(), path)
+}
+
+fn mount_of_in(ns: &MountNs, path: &str) -> (u64, bool) {
+    let l = ns.list.borrow();
+    match containing(&l, path, l.len()) {
+        Some(i) => (l[i].id as u64, path == l[i].target),
+        None => (ns.root_id as u64, path.is_empty()),
+    }
+}
+
+/// はじめの namespace で、ファイルシステム fs のものがどのマウントにあるか (大きなロックなしの stat の表: statc。
+/// そこはパスのかわりに inode しか知らない)。fs をかぶせたマウントが 1 つだけなら (番号、ino がその根か)。bind で
+/// いくつにも見えているもの、どこにもないものは None (statc は覚えない)
+pub fn init_mount_of_fs(ino: &InodeRef) -> Option<(u64, bool)> {
+    let ns = init_mnt();
+    let l = ns.list.borrow();
+    let fs = ino.id().0;
+    let mut found = None;
+    let root = ROOT.get().clone();
+    if root.as_ref().is_some_and(|r| r.id().0 == fs) {
+        found = Some((ns.root_id as u64, root.as_ref().is_some_and(|r| r.id() == ino.id())));
+    }
+    for m in l.iter().filter(|m| m.root.id().0 == fs) {
+        if found.is_some() {
+            return None;
+        }
+        found = Some((m.id as u64, m.root.id() == ino.id()));
+    }
+    found
+}
+
+/// mountinfo と /proc/mounts の名前の書き方 (Linux の mangle と seq_path: 空白、タブ、改行、\ を 8 進に。もとと種類は # も)
+fn mangle(s: &str, hash: bool) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ' ' | '\t' | '\n' | '\\' => o.push_str(&alloc::format!("\\{:03o}", c as u32)),
+            '#' if hash => o.push_str("\\043"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+/// /proc/PID/mountinfo (Linux の show_mountinfo): ns の表を、root (先頭 / なし。chroot の根: "" はルート) から見たもの。
+///   番号 親の番号 major:minor 根 マウント先 マウントの印 - 種類 もと ファイルシステムの印
+/// 親は、マウント先をふくむ前のマウント (なければルートのマウント。ルートの親は自分)。伝わり方 (shared: など) は、aios の
+/// マウントはいつも private なので出さない。印は rw か ro と relatime (Linux の既定) だけ (nosuid などはまだ見ていない)。
+/// root の外にあるマウントは出さない (Linux の seq_path_root の SEQ_SKIP)
+pub fn mountinfo_text_of(ns: Option<Rc<MountNs>>, root: &str) -> String {
+    let ns = ns.unwrap_or_else(init_mnt);
+    let l = ns.list.borrow();
+    let shown = |target: &str| -> Option<String> {
+        if !under(target, root) {
+            return None;
+        }
+        let rel = if root.is_empty() { target } else { target[root.len()..].trim_start_matches('/') };
+        Some(alloc::format!("/{}", mangle(rel, false)))
+    };
+    let line = |id: u32, parent: u32, dev: (u32, u32), root_path: &str, point: &str, ro: bool, fstype: &str, source: &str| {
+        let rw = if ro { "ro" } else { "rw" };
+        alloc::format!("{} {} {}:{} {} {} {},relatime - {} {} {}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, rw, mangle(fstype, true), mangle(source, true), rw)
+    };
+    let mut s = String::new();
+    if let Some(p) = shown("") {
+        let (src, ty) = ROOT_INFO.get().clone();
+        let fs = ROOT.get().as_ref().map_or(0, |r| r.id().0);
+        s.push_str(&line(ns.root_id, ns.root_id, fs_dev(fs), "/", &p, false, &ty, &src));
+    }
+    for (i, m) in l.iter().enumerate() {
+        let Some(p) = shown(&m.target) else { continue };
+        let parent = containing(&l, &m.target, i).map_or(ns.root_id, |j| l[j].id);
+        s.push_str(&line(m.id, parent, fs_dev(m.root.id().0), &m.root_path, &p, m.ro, &m.fstype, &m.source));
+    }
+    s
+}
+
 /// /proc/mounts (いまの表)
 pub fn mounts_text() -> String {
     mounts_text_of(crate::proc::current_mnt())
@@ -446,9 +653,9 @@ pub fn mounts_text() -> String {
 /// /proc/PID/mounts (ns の表。None ははじめのもの)
 pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
     let (src, ty) = ROOT_INFO.get().clone();
-    let mut s = alloc::format!("{} / {} rw 0 0\n", src, ty);
+    let mut s = alloc::format!("{} / {} rw 0 0\n", mangle(&src, true), mangle(&ty, true));
     for m in ns.unwrap_or_else(init_mnt).list.borrow().iter() {
-        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", m.source, m.target, m.fstype, if m.ro { "ro" } else { "rw" }));
+        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), if m.ro { "ro" } else { "rw" }));
     }
     s
 }

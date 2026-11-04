@@ -3741,7 +3741,7 @@ pub fn tick() {
 
 pub fn stat(u: &InetRef) -> Stat {
     let s = u.borrow();
-    Stat { ino: s.ino, uid: s.uid, gid: s.gid, mtime: s.mtime, ctime: s.ctime, ..Stat::dev(0o140000 | s.mode, 0) }
+    Stat { dev: crate::vfs::encode_dev(crate::vfs::SOCK_DEV), ino: s.ino, uid: s.uid, gid: s.gid, mtime: s.mtime, ctime: s.ctime, ..Stat::dev(0o140000 | s.mode, 0) }
 }
 
 pub fn touch(u: &InetRef, mtime: Option<u64>) {

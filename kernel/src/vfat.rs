@@ -121,8 +121,11 @@ impl FatFs {
                 info = 0;
             }
         }
+        let id = new_fs_id();
+        let (ma, mi) = block::dev_of_part(&p);
+        crate::vfs::set_fs_dev(id, ma, mi);
         Ok(Rc::new(FatFs {
-            id: new_fs_id(),
+            id,
             part: p,
             fat32,
             csize: spc * SECTOR,

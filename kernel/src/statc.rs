@@ -45,8 +45,9 @@ const NAME_BOXES: usize = 65536;
 /// パスの長さの上限 (先頭の / なし、cwd をつけたあと)
 pub const PATH: usize = 192;
 /// 覚える、通ったディレクトリと gates の数の上限。ディレクトリは 1 つの 64 語に入るだけ (12 のときは、/home/USER の下の
-/// 10 段のパス (fsbench の deep-stat) がいつも入らず、そのたびに表を引いて外れ、ふつうの道で覚えようとして断っていた)
-const DIRS_MAX: usize = 22;
+/// 10 段のパス (fsbench の deep-stat) がいつも入らず、そのたびに表を引いて外れ、ふつうの道で覚えようとして断っていた)。
+/// 22 から 21 に: マウントの語 (MNT_W) のため
+const DIRS_MAX: usize = 21;
 const GATES_MAX: usize = 4;
 
 // 1 つの並び (AtomicU64 の番号)
@@ -65,9 +66,36 @@ const DIR0: usize = 5;
 const GATE0: usize = DIR0 + DIRS_MAX;
 const GATE_MODES: usize = GATE0 + GATES_MAX;
 const PATH0: usize = GATE_MODES + 1;
-/// file::Stat: ino、mode | nlink << 32、uid | gid << 32、rdev、size、blocks、mtime、ctime
+/// file::Stat: ino、mode | nlink << 32、uid | gid << 32、rdev << 32 | dev (どちらもカーネルの形の 32 ビット: major << 20 |
+/// minor)、size、blocks、mtime、ctime
 const STAT0: usize = PATH0 + PATH / 8;
-const WORDS: usize = STAT0 + 8;
+/// stat の 8 つのあとに、マウント (番号 | その根なら 1 << 63。0 はわからない: statx はふつうの道へ)
+const MNT_W: usize = STAT0 + 8;
+const WORDS: usize = STAT0 + 9;
+
+/// マウントの語 (番号、その根か)。0 はわからない
+fn mnt_word(m: Option<(u64, bool)>) -> u64 {
+    m.map_or(0, |(id, root)| id | (root as u64) << 63)
+}
+
+/// st_dev の形 (encode_dev) とカーネルの形 (major << 20 | minor) を行き来する
+fn kdev(d: u64) -> u64 {
+    let (ma, mi) = crate::vfs::decode_dev(d);
+    ((ma as u64) << 20 | mi as u64) & 0xffff_ffff
+}
+
+fn udev(k: u64) -> u64 {
+    crate::vfs::encode_dev(((k >> 20) as u32, (k & 0xfffff) as u32))
+}
+
+/// Stat を表の 8 語に
+fn stat_words(st: &Stat) -> [u64; 8] {
+    [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, kdev(st.rdev) << 32 | kdev(st.dev), st.size, st.blocks, st.mtime, st.ctime]
+}
+
+fn words_stat(w: &[u64]) -> Stat {
+    Stat { dev: udev(w[3] & 0xffff_ffff), ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: udev(w[3] >> 32), size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] }
+}
 
 #[repr(align(64))]
 struct Slot([AtomicU64; 64]);
@@ -245,7 +273,7 @@ fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, bool)>)
     let epoch = EPOCH.load(Acquire);
     let ino_ver = found.map(|(ino, _)| {
         let ib = box_of(ino.id());
-        (ib, INOS[ib].load(Acquire), Stat::of_inode(ino))
+        (ib, INOS[ib].load(Acquire), Stat::of_inode(ino), mnt_word(crate::vfs::init_mount_of_fs(ino)))
     });
     // ディレクトリの版は、パスの覚えを確かめる前に読んだもの (vfs::fast_stat_trail)
     let mut dw = [0u64; DIRS_MAX];
@@ -262,9 +290,9 @@ fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, bool)>)
 }
 
 /// 表に書く: dirs は (箱 << 48 | 版)、gates は (uid << 32 | gid) で、その mode は modes に 16 ビットずつ。
-/// found は (inode の箱, その版, 答え)。None なら「ない」。plain はリンクをたどらずに着いたもの (SHAPE)
+/// found は (inode の箱, その版, 答え, マウントの語 (mnt_word))。None なら「ない」。plain はリンクをたどらずに着いたもの (SHAPE)
 #[allow(clippy::too_many_arguments)]
-fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch: u64, mg: bool, plain: bool, found: Option<&(usize, u64, Stat)>) {
+fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch: u64, mg: bool, plain: bool, found: Option<&(usize, u64, Stat, u64)>) {
     let s = slot_for(hash(key, follow), key, follow);
     // 書く人は 1 人ずつ (ほかの人が書いていれば書かない)
     let seq = s[SEQ].load(Relaxed);
@@ -274,7 +302,7 @@ fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch:
     core::sync::atomic::fence(Release);
     s[SHAPE].store(key.len() as u64 | (follow as u64) << 16 | (dirs.len() as u64) << 24 | (gates.len() as u64) << 32 | (mg as u64) << 40 | (found.is_none() as u64) << 41 | (plain as u64) << 42, Relaxed);
     s[EPOCH_W].store(epoch, Relaxed);
-    if let Some((ib, v, _)) = found {
+    if let Some((ib, v, _, _)) = found {
         s[INO_BOX].store(*ib as u64, Relaxed);
         s[INO_GEN].store(*v, Relaxed);
     }
@@ -288,11 +316,11 @@ fn put(key: &[u8], follow: bool, dirs: &[u64], gates: &[u64], modes: u64, epoch:
     for (i, w) in words(key).enumerate() {
         s[PATH0 + i].store(w, Relaxed);
     }
-    if let Some((_, _, st)) = found {
-        let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
-        for (i, w) in w.iter().enumerate() {
+    if let Some((_, _, st, mnt)) = found {
+        for (i, w) in stat_words(st).iter().enumerate() {
             s[STAT0 + i].store(*w, Relaxed);
         }
+        s[MNT_W].store(*mnt, Relaxed);
     }
     s[SEQ].store((seq | 1) + 1, Release);
 }
@@ -324,7 +352,8 @@ fn learn_under(parent: &[u8], name: &str, follow: bool, dir: (usize, u64), want:
         n += part.len();
     }
     let key = &buf[..len];
-    let ino_ver = found.map(|(id, st, ver)| (box_of(id), ver, st));
+    // ルートの ext4 の名前 (マウント先でないもの): ルートのマウント
+    let ino_ver = found.map(|(id, st, ver)| (box_of(id), ver, st, crate::vfs::root_fs_mount()));
     let dbox = name_box(dir, crate::vfs::name_hash(name));
     // 親の答え (check と同じに、seq のあいだに読む)。いまも正しいディレクトリのものだけ
     let s = slot_of(hash(parent, true), parent, true)?;
@@ -397,7 +426,8 @@ fn learn_lookup(p: &Proc, key: &[u8], follow: bool, base: Option<(usize, u64)>) 
                 return None;
             }
             let plain = learn_under(parent, name, follow, did, before, epoch, Some(((fs, ino), st, ver)));
-            Some(Answer::Found(st, true, plain.unwrap_or(false) && st.mode & 0o170000 != 0o120000, true))
+            // ルートの ext4 の名前 (マウント先でないもの): ルートのマウント
+            Some(Answer::Found(st, true, plain.unwrap_or(false) && st.mode & 0o170000 != 0o120000, true, crate::vfs::root_fs_mount()))
         }
     }
 }
@@ -426,8 +456,8 @@ const AT_NO_AUTOMOUNT: u64 = 0x800;
 
 /// 表の答え: あるもの (と mg) か、ない
 enum Answer {
-    /// stat、mg、plain (SHAPE)、fresh (inode の中身の版がいまのもの: stat がいまの inode のもの)
-    Found(Stat, bool, bool, bool),
+    /// stat、mg、plain (SHAPE)、fresh (inode の中身の版がいまのもの: stat がいまの inode のもの)、マウントの語 (mnt_word)
+    Found(Stat, bool, bool, bool, u64),
     /// 「ない」(いまディレクトリで引いたものなら true: /proc/ai/why のわけ)
     Missing(bool),
 }
@@ -444,7 +474,7 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
     } else {
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
-            Answer::Found(s, _, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0)),
+            Answer::Found(s, _, _, fresh, _) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0)),
             Answer::Missing(looked) => Some(missing(p, NEWFSTATAT, &norm[..len], looked)),
         })
     };
@@ -473,7 +503,9 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
         let mut norm = [0u8; PATH];
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
-            Answer::Found(s, mg, _, fresh) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg)).then_some(0)),
+            // マウントがわからなければ (bind で同じファイルシステムがいくつにも見えているなど) ふつうの道へ
+            Answer::Found(_, _, _, _, 0) => None,
+            Answer::Found(s, mg, _, fresh, mnt) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg, (mnt & !(1 << 63), mnt >> 63 != 0))).then_some(0)),
             Answer::Missing(looked) => Some(missing(p, STATX, &norm[..len], looked)),
         })
     };
@@ -540,8 +572,7 @@ fn refresh(key: &[u8], follow: bool, ib: usize, ver: u64, st: &Stat) {
     let same = (shape & 0xffff) as usize == key.len() && (shape >> 16 & 1 != 0) == follow && shape >> 41 & 1 == 0 && s[INO_BOX].load(Relaxed) as usize % BOXES == ib && s[STAT0].load(Relaxed) == st.ino && words(key).enumerate().all(|(i, w)| s[PATH0 + i].load(Relaxed) == w);
     if same {
         s[INO_GEN].store(ver, Relaxed);
-        let w = [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, st.rdev, st.size, st.blocks, st.mtime, st.ctime];
-        for (i, w) in w.iter().enumerate() {
+        for (i, w) in stat_words(st).iter().enumerate() {
             s[STAT0 + i].store(*w, Relaxed);
         }
     }
@@ -571,7 +602,7 @@ pub enum Open {
 pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) -> Option<(Open, usize)> {
     find(p, dirfd, pathp, true, false, norm).map(|(a, len, base)| {
         let a = match a {
-            Answer::Found(s, _, plain, fresh) => Open::Found(s, plain, fresh, base),
+            Answer::Found(s, _, plain, fresh, _) => Open::Found(s, plain, fresh, base),
             Answer::Missing(looked) => Open::Missing(looked),
         };
         (a, len)
@@ -730,7 +761,7 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
             return None;
         }
     }
-    let mut w = [0u64; 8];
+    let mut w = [0u64; 9];
     for (i, w) in w.iter_mut().enumerate() {
         *w = s[STAT0 + i].load(Relaxed);
     }
@@ -742,6 +773,6 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
     if is_missing {
         return Some(Answer::Missing(false));
     }
-    let st = Stat { ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: w[3], size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] };
-    Some(Answer::Found(st, shape >> 40 & 1 != 0, shape >> 42 & 1 != 0, fresh))
+    let st = words_stat(&w);
+    Some(Answer::Found(st, shape >> 40 & 1 != 0, shape >> 42 & 1 != 0, fresh, w[8]))
 }

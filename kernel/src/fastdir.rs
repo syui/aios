@@ -183,7 +183,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
 pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
     let fs = crate::extfs::ExtFs::root_fs()?;
     let _e = crate::extfs::fs_lock_shared();
-    fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m))
+    fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
 
 /// 表の答えの stat が古いもの (inode を書いたあと) を、ext4 の inode の覚え (metas) から (覚えになければ None)。名前が
@@ -191,7 +191,7 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
 pub fn cached_stat(ino: u64) -> Option<file::Stat> {
     let fs = crate::extfs::ExtFs::root_fs()?;
     let _e = crate::extfs::fs_lock_shared();
-    fs.cached_meta(ino as u32).map(|m| file::Stat::of_meta(&m))
+    fs.cached_meta(ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
 
 /// ルートの ext4 の vfs の id の 1 つめ (statc が (ディレクトリ, 名前) の箱を引くため)
@@ -205,7 +205,7 @@ pub fn root_fs_id() -> Option<usize> {
 pub fn lookup_name(me: &Proc, dir: u64, name: &str) -> Option<Option<(u64, file::Stat, u64)>> {
     let fs = crate::extfs::ExtFs::root_fs()?;
     let _e = crate::extfs::fs_lock_shared();
-    fs.fast_lookup(dir as u32, name, &me.cred).map(|r| r.map(|(ino, m, ver)| (ino as u64, file::Stat::of_meta(&m), ver)))
+    fs.fast_lookup(dir as u32, name, &me.cred).map(|r| r.map(|(ino, m, ver)| (ino as u64, file::Stat::of_meta(&m, fs.fs_id()), ver)))
 }
 
 /// syscall::fast の unlinkat (flags が 0 のもの)

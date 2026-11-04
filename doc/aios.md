@@ -1228,6 +1228,34 @@ aibox はいままでどおり (ファイルの権利は TRUNCATE まで、TCP �
 landlock (CONFIG_LSM は landlock,apparmor) と、namespace の permission を見るためにユーザーと UTS の namespace を足した
 (test/sysdiff/ の手本はそれで作りなおして変わらない)。
 
+### マウントの番号と st_dev (/proc/PID/mountinfo、statx の STATX_MNT_ID)
+
+systemd、findmnt、psutil、コンテナの道具は、マウントを /proc/self/mountinfo で知り、statx の stx_mnt_id と
+STATX_ATTR_MOUNT_ROOT で「ここがマウントの根か」を見分ける。aios にはどれもなく、stat の st_dev はどのファイルシステムでも 1
+だった (cp や tar は (dev, ino) で同じファイルかを見るので、ちがうファイルシステムの同じ番号のものを同じとみなしうる)。
+Linux 7.4-rc1 の fs/proc_namespace.c (show_mountinfo) と fs/stat.c と同じに (kernel/src/vfs.rs):
+
+- st_dev はファイルシステムごと: ブロックデバイスの上のもの (ext4、vfat) はその番号 (ルートの ext4 は 254:2)、ほかは
+  Linux の名前のないものと同じく major 0 (minor はファイルシステムの番号から)。ソケット、パイプ、anon_inode、pidfd は
+  それぞれの中の dev。statx の stx_dev_major / minor、fdinfo の epoll と inotify の sdev もそれで
+- マウントに番号 (21 から。namespace を写すと新しい番号: Linux の copy_tree)。`/proc/PID/mountinfo`: 番号、親 (マウント先を
+  ふくむ前のマウント。ルートの親は自分)、major:minor、根 (bind マウントは、もとのファイルシステムの中のパス)、マウント先
+  (そのプロセスの chroot の根から。外のものは出さない)、`rw` か `ro` と `relatime`、`-` 種類 もと `rw` か `ro`。名前の空白、
+  タブ、改行、\ は 8 進 (`\040`)。伝わり方 (shared: など) は、aios のマウントはいつも private なので出さない
+- bind マウントのもとと種類は、もとのファイルシステムのもの (前は もと が "/パス"、種類が "none": /proc/mounts も)
+- statx はいつも STATX_MNT_ID と stx_mnt_id (STATX_MNT_ID_UNIQUE を頼めば 2^31 + 番号)、マウントの根なら
+  STATX_ATTR_MOUNT_ROOT (attributes_mask にはいつも)。fdinfo の mnt_id もマウントの番号 (開いたときのパスで)
+- 大きなロックなしの stat の表 (statc) にも dev とマウントを (1 つの覚えは 64 語のまま: rdev と dev をカーネルの形の
+  32 ビットずつで 1 語に、通るディレクトリの上限を 22 から 21 に)。覚えにない名前をルートの ext4 で引いたときは、ルートの
+  ext4 が / にしか見えていなければルートのマウント。bind で同じファイルシステムがいくつにも見えているときは、statx は
+  ふつうの道へ
+
+`test/mountinfo.c` (75 行: 行の形、親、st_dev と major:minor、statx と fdinfo の番号、ユーザーとマウントの namespace の
+中の tmpfs・bind・ro・umount・空白の名前、ほかのプロセスの /proc/PID/mountinfo) は Linux 7.4-rc1 と 1 バイトもちがわない
+(`test/ldiff.sh mountinfo @home /tmp`。表の中身は Linux と aios でちがうので、番号はじかに出さず、そろい方を出す)。
+まだ: nosuid、nodev、noexec などのマウントの印 (aios は見ていない)、ファイルシステムの印 (tmpfs の size= など)、
+listmount / statmount。
+
 ### pidfd のことを答える口 (/proc/PID/fdinfo、PIDFD_GET_INFO、pidfd_getfd、pidfd_send_signal)
 
 systemd の pidfd_get_pid は ioctl の PIDFD_GET_INFO で pidfd の指すプロセスを聞き、なければ /proc/self/fdinfo/N の `Pid:` を
@@ -1239,7 +1267,7 @@ kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。
   `Pid:` と `NSpid:` (片づけられたら -1、見えなければ 0)、eventfd の `eventfd-count` (16 けたの 16 進) と `-id`、
   `-semaphore`、timerfd の `clockid`、`ticks`、`settime flags`、`it_value` (のこり)、`it_interval`、epoll の `tfd:` の行
   (EPOLLERR と EPOLLHUP はいつも入る)、inotify の `inotify wd:` の行、AF_UNIX の `scm_fds` (受ける行列の SCM_RIGHTS の数)。
-  mnt_id は aios ではファイルシステムごと (bind マウントも同じ番号)。inotify の file handle (`fhandle-bytes` など) はまだ
+  mnt_id はマウントの番号 (上の「マウントの番号と st_dev」)。inotify の file handle (`fhandle-bytes` など) はまだ
 - `flags` と F_GETFL は、open で開いたもの (ファイル、デバイス) に 64 ビットの Linux がいつも足す O_LARGEFILE を見せる
   (しまうものは変えない: 棚の速い open は口をくらべるので)。O_PATH は O_PATH、O_DIRECTORY、O_NOFOLLOW だけ
 - `PIDFD_GET_INFO` (`_IOWR(0xFF, 11, struct pidfd_info)`。大きさは 64、72、80、88 の版で、それより小さければ ENOTTY、

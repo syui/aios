@@ -73,7 +73,8 @@ pub fn fdinfo(n: &InotifyRef) -> alloc::string::String {
     const USER_MASK: u32 = 0xfff | 0x0400_0000 | 0x8000_0000;
     let mut s = alloc::string::String::new();
     for w in n.borrow().watches.iter() {
-        s.push_str(&alloc::format!("inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0 \n", w.wd, w.id.1, crate::file::ST_DEV_KERNEL, w.mask & USER_MASK));
+        let (ma, mi) = crate::vfs::fs_dev(w.id.0);
+        s.push_str(&alloc::format!("inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0 \n", w.wd, w.id.1, ma << 20 | mi, w.mask & USER_MASK));
     }
     s
 }
