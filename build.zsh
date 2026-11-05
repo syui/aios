@@ -80,6 +80,7 @@ arch-chroot $ROOTFS /bin/sh -c 'chown ai:ai /home/ai/.zshrc'
 
 cp -r cfg/etc/. $ROOTFS/etc/
 arch-chroot $ROOTFS /bin/sh -c 'systemctl enable nftables.service'
+arch-chroot $ROOTFS /bin/sh -c 'systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target'
 
 # gnu-coreutils -> uutils-coreutils
 arch-chroot $ROOTFS /bin/bash -c '
