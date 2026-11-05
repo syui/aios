@@ -307,15 +307,86 @@ pub fn raw6_passed(ip: Vec<u8>) {
 /// 受ける)。ICMPv6 のエラーは poll のあとで inet.rs にも
 pub fn inject6(ip: Vec<u8>) {
     let Some(n) = get() else { return };
-    if ip.len() > 40 && ip[6] == 58 && ip[40] < 128 {
+    inject_to(n, ip);
+}
+
+/// inject6 と、IPv4 の ICMP のエラー (受け取りの列と、poll のあとで inet.rs に)
+fn inject_to(n: &mut Net, ip: Vec<u8>) {
+    let v6 = ip.first().is_some_and(|b| b >> 4 == 6);
+    if v6 && ip.len() > 40 && ip[6] == 58 && ip[40] < 128 {
         ICMP6_LATER.get().push(ip.clone());
+    }
+    if !v6 && ip.len() > 20 && ip[9] == 1 && matches!(ip[(ip[0] & 15) as usize * 4], 3 | 11) {
+        ICMP_LATER.get().push(ip.clone());
     }
     let mut f = Vec::with_capacity(14 + ip.len());
     f.extend_from_slice(&n.dev.mac);
     f.extend_from_slice(&n.dev.mac);
-    f.extend_from_slice(&[0x86, 0xdd]);
+    f.extend_from_slice(if v6 { &[0x86, 0xdd] } else { &[0x08, 0x00] });
     f.extend_from_slice(&ip);
     n.dev.lo.push_back(f);
+}
+
+/// 近所さがしが MAX_PROBES (3) 度答えをもらえず、smoltcp が捨てたパケット (IP の頭から) に、Linux と同じく自分から自分へ
+/// 「たどりつけない」を返す (neigh_invalidate → arp_error_report / ndisc_error_report → ipv4_link_failure の
+/// icmp_send (ICMP_HOST_UNREACH)、ip6_link_failure の icmpv6_send (ICMPV6_ADDR_UNREACH))。送り元とあて先は、捨てた
+/// パケットの送り元 (自分)。中身は捨てたものの頭から (IPv4 は ICMP のパケットが 576 バイト、IPv6 は 1280 バイトまで)。
+/// ICMP のエラーと、断片の 2 つめから先には返さない。受けるのは raw のソケットと、送った TCP (connect が
+/// EHOSTUNREACH) と UDP (つないだもの)
+fn link_failure(n: &mut Net, p: &[u8]) {
+    use crate::nfhook::{csum_add, csum_fold};
+    match p.first().map(|b| b >> 4) {
+        Some(4) if p.len() >= 20 => {
+            let ihl = (p[0] & 15) as usize * 4;
+            if p.len() < ihl || u16::from_be_bytes([p[6], p[7]]) & 0x1fff != 0 {
+                return;
+            }
+            // icmp_pointers の error のもの (到達不能、source quench、redirect、時間切れ、parameter problem)
+            if p[9] == 1 && p.get(ihl).is_some_and(|&ty| matches!(ty, 3 | 4 | 5 | 11 | 12)) {
+                return;
+            }
+            let src = &p[12..16];
+            let quote = &p[..p.len().min(576 - 28)];
+            let mut ip = Vec::with_capacity(28 + quote.len());
+            // tos は IPTOS_TOS と IPTOS_PREC_INTERNETCONTROL、DF なし、TTL 64
+            ip.extend_from_slice(&[0x45, (p[1] & 0x1e) | 0xc0]);
+            ip.extend_from_slice(&((28 + quote.len()) as u16).to_be_bytes());
+            ip.extend_from_slice(&[0, 0, 0, 0, 64, 1, 0, 0]);
+            ip.extend_from_slice(src);
+            ip.extend_from_slice(src);
+            let c = csum_fold(csum_add(0, &ip[..20]));
+            ip[10..12].copy_from_slice(&c.to_be_bytes());
+            ip.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0]);
+            ip.extend_from_slice(quote);
+            let c = csum_fold(csum_add(0, &ip[20..]));
+            ip[22..24].copy_from_slice(&c.to_be_bytes());
+            inject_to(n, ip);
+        }
+        Some(6) if p.len() >= 40 => {
+            // ICMPv6 のエラー (type が 128 より小さいもの) には返さない (icmpv6_send の is_ineligible)
+            if let Some((thoff, 58, _)) = crate::nfhook::v6_l4(p)
+                && p.get(thoff).is_some_and(|&ty| ty < 128)
+            {
+                return;
+            }
+            let src = u128::from_be_bytes(p[8..24].try_into().unwrap());
+            let quote = &p[..p.len().min(1280 - 48)];
+            let mut body = Vec::with_capacity(8 + quote.len());
+            body.extend_from_slice(&[1, 3, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(quote);
+            let c = crate::addrconf::icmp6_sum(src, src, &body);
+            body[2..4].copy_from_slice(&c.to_be_bytes());
+            let mut ip = Vec::with_capacity(40 + body.len());
+            ip.extend_from_slice(&[0x60, 0, 0, 0]);
+            ip.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            ip.extend_from_slice(&[58, 64]);
+            ip.extend_from_slice(&src.to_be_bytes());
+            ip.extend_from_slice(&src.to_be_bytes());
+            ip.extend_from_slice(&body);
+            inject_to(n, ip);
+        }
+        _ => {}
+    }
 }
 
 impl NetDev {
@@ -756,6 +827,11 @@ pub fn poll() {
     let mut changed = n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     // 自分あてに出したものを受け取る (ARP の問い合わせ → 答え → パケット、と続くので何回か)
     for _ in 0..16 {
+        // 近所さがしがしくじって捨てたものには、自分から自分へ「たどりつけない」を (lo の列と、inet.rs のソケットに)
+        for p in n.iface.take_neighbor_failures() {
+            link_failure(n, &p);
+            changed = true;
+        }
         if n.dev.lo.is_empty() {
             break;
         }

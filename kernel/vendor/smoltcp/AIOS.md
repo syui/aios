@@ -11,4 +11,12 @@ profile を外した `Cargo.toml`。ルートの `Cargo.toml` の `[patch.crates
   たびに、ほかのあて先はずっと問い合わせてもらえなかった (Linux は neighbour ごとの retrans_time)。0.14 も同じ。
   test/ndsilence.c (todo の smoltcp-nd-silence)
 
+- 近所さがしの失敗 (Linux の NUD_FAILED): あて先ごとに続けて問い合わせた数をおぼえ (`Probe`。だまる時間が
+  終わってからさらに 1 秒あけば数えなおす)、`MAX_PROBES` (3) 度答えがなければ `Answer::Failed` と
+  `DispatchError::NeighborFailed`。そのパケットは `InterfaceInner::neighbor_failed` にとっておき (16 まで、1232 バイトまで)、
+  ソケットの送り出しでは送ったことにして列から外す (もとは列の先にいつまでも残った)。aios は
+  `Interface::take_neighbor_failures` で受けとって ICMP の到達不能を作る。答えが来たら数は消える (`fill`)
+- `tcp::Socket::forget`: なにも送らずにつながりを捨てる (`reset`)。`abort` と `close` は相手が決まったまま CLOSED に
+  するので、SYN-SENT でも RST を送る (Linux は ICMP のエラーで SYN-SENT をやめるとき何も送らない)。test/ndsilence.c
+
 smoltcp を上げるときは、新しい版の写しにこれらをあてなおす。

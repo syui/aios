@@ -145,6 +145,10 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+    /// aios: IP packets dropped because neighbor discovery failed (oldest first, at most 16), for the host to
+    /// answer with ICMP errors (Linux's neigh_invalidate → error_report)
+    #[cfg(feature = "alloc")]
+    neighbor_failed: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -252,6 +256,8 @@ impl Interface {
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "multicast")]
                 multicast: multicast::State::new(),
+                #[cfg(feature = "alloc")]
+                neighbor_failed: alloc::vec::Vec::new(),
                 #[cfg(feature = "medium-ieee802154")]
                 sequence_no,
                 #[cfg(feature = "medium-ieee802154")]
@@ -265,6 +271,12 @@ impl Interface {
                 rand,
             },
         }
+    }
+
+    /// aios: take the IP packets (header first) that were dropped because neighbor discovery failed.
+    #[cfg(feature = "alloc")]
+    pub fn take_neighbor_failures(&mut self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        core::mem::take(&mut self.inner.neighbor_failed)
     }
 
     /// Get the socket context.
@@ -670,9 +682,13 @@ impl Interface {
                     EgressError::Exhausted
                 })?;
 
-                inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                match inner.dispatch_ip(t, meta, response, &mut self.fragmenter) {
+                    Ok(()) => {}
+                    // aios: discovery failed: the packet is dropped (kept for the host in neighbor_failed), not
+                    // retried, so it no longer blocks the socket's queue
+                    Err(DispatchError::NeighborFailed) => {}
+                    Err(_) => return Err(EgressError::Dispatch),
+                }
 
                 result = PollResult::SocketStateChanged;
 
@@ -1041,6 +1057,11 @@ impl InterfaceInner {
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
             NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
+            // aios: MAX_PROBES requests went unanswered: report it once, and let the next packet start again
+            NeighborAnswer::Failed => {
+                self.neighbor_cache.forget_failed(&dst_addr);
+                return Err(DispatchError::NeighborFailed);
+            }
             _ => (), // XXX
         }
 
@@ -1165,9 +1186,25 @@ impl InterfaceInner {
         #[cfg(feature = "medium-ethernet")]
         let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
             Medium::Ethernet => {
-                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
-                    (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
-                    (_, _) => unreachable!(),
+                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag) {
+                    Ok((HardwareAddress::Ethernet(addr), tx_token)) => (addr, tx_token),
+                    Ok((_, _)) => unreachable!(),
+                    // aios: keep the undeliverable packet for the host (at most 1232 bytes: what an ICMPv6
+                    // error quotes)
+                    #[cfg(feature = "alloc")]
+                    Err(DispatchError::NeighborFailed) => {
+                        let mut b = alloc::vec![0u8; ip_repr.buffer_len()];
+                        ip_repr.emit(&mut b[..], &self.caps.checksum);
+                        let hl = ip_repr.header_len();
+                        packet.emit_payload(&ip_repr, &mut b[hl..], &caps);
+                        b.truncate(1232);
+                        if self.neighbor_failed.len() >= 16 {
+                            self.neighbor_failed.remove(0);
+                        }
+                        self.neighbor_failed.push(b);
+                        return Err(DispatchError::NeighborFailed);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             _ => (EthernetAddress([0; 6]), tx_token),
@@ -1323,4 +1360,6 @@ enum DispatchError {
     /// the neighbor for it yet. Discovery has been initiated, dispatch
     /// should be retried later.
     NeighborPending,
+    /// aios: discovery of the neighbor failed (no answer to MAX_PROBES requests); the packet is dropped.
+    NeighborFailed,
 }

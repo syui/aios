@@ -29,6 +29,16 @@ pub(crate) enum Answer {
     /// The neighbor address is not in the cache, or has expired,
     /// and a lookup has been made recently.
     RateLimited,
+    /// aios: `MAX_PROBES` discovery requests got no answer (Linux's NUD_FAILED): drop the packet.
+    Failed,
+}
+
+/// aios: discovery state of one address: no new request until `until`, and how many were sent in a row.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct Probe {
+    until: Instant,
+    probes: u8,
 }
 
 impl Answer {
@@ -45,10 +55,11 @@ impl Answer {
 #[derive(Debug)]
 pub struct Cache {
     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
-    /// aios: per-address time until which no new discovery request is sent (Linux's per-neighbour retrans_time).
-    /// Upstream keeps a single `silent_until` for the whole cache, so one request silences every other address
-    /// for a second, and a socket that keeps retrying one unreachable address starves all the others.
-    silent_until: LinearMap<IpAddress, Instant, IFACE_NEIGHBOR_CACHE_COUNT>,
+    /// aios: per-address time until which no new discovery request is sent (Linux's per-neighbour retrans_time),
+    /// and the number of requests sent in a row. Upstream keeps a single `silent_until` for the whole cache, so
+    /// one request silences every other address for a second, and a socket that keeps retrying one unreachable
+    /// address starves all the others.
+    silent_until: LinearMap<IpAddress, Probe, IFACE_NEIGHBOR_CACHE_COUNT>,
 }
 
 impl Cache {
@@ -57,6 +68,9 @@ impl Cache {
 
     /// Neighbor entry lifetime, in milliseconds.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
+
+    /// aios: discovery requests without an answer before the address fails (Linux's mcast_probes, 3).
+    pub(crate) const MAX_PROBES: u8 = 3;
 
     /// Create a cache.
     pub fn new() -> Self {
@@ -109,6 +123,8 @@ impl Cache {
             expires_at,
             hardware_addr,
         };
+        // aios: an answer ends the discovery
+        self.silent_until.remove(&protocol_addr);
         match self.storage.insert(protocol_addr, neighbor) {
             Ok(Some(old_neighbor)) => {
                 if old_neighbor.hardware_addr != hardware_addr {
@@ -164,25 +180,41 @@ impl Cache {
         }
 
         match self.silent_until.get(protocol_addr) {
-            Some(&until) if timestamp < until => Answer::RateLimited,
+            Some(p) if timestamp < p.until => Answer::RateLimited,
+            // aios: the last of MAX_PROBES requests went unanswered (and the retry came in time: a request long
+            // ago starts a new discovery)
+            Some(p) if p.probes >= Self::MAX_PROBES && timestamp < p.until + Self::SILENT_TIME => Answer::Failed,
             _ => Answer::NotFound,
         }
     }
 
-    /// aios: a discovery request for `protocol_addr` was sent; silence only that address.
+    /// aios: a discovery request for `protocol_addr` was sent; silence only that address, and count it (a request
+    /// more than SILENT_TIME after the previous silence ended starts the count again).
     pub(crate) fn limit_rate(&mut self, protocol_addr: IpAddress, timestamp: Instant) {
         let until = timestamp + Self::SILENT_TIME;
-        if let Err((addr, until)) = self.silent_until.insert(protocol_addr, until) {
+        if let Some(p) = self.silent_until.get_mut(&protocol_addr) {
+            let fresh = timestamp >= p.until + Self::SILENT_TIME;
+            p.probes = if fresh { 1 } else { p.probes.saturating_add(1) };
+            p.until = until;
+            return;
+        }
+        let probe = Probe { until, probes: 1 };
+        if let Err((addr, probe)) = self.silent_until.insert(protocol_addr, probe) {
             // Full: forget the address whose silence ends first (usually one already past).
             let oldest = *self
                 .silent_until
                 .iter()
-                .min_by_key(|(_, until)| **until)
+                .min_by_key(|(_, p)| p.until)
                 .expect("empty silence map")
                 .0;
             self.silent_until.remove(&oldest);
-            let _ = self.silent_until.insert(addr, until);
+            let _ = self.silent_until.insert(addr, probe);
         }
+    }
+
+    /// aios: the discovery of `protocol_addr` failed and was reported; the next packet starts a new one.
+    pub(crate) fn forget_failed(&mut self, protocol_addr: &IpAddress) {
+        self.silent_until.remove(protocol_addr);
     }
 
     pub(crate) fn flush(&mut self) {
@@ -313,6 +345,18 @@ mod test {
         // aios: other addresses are not silenced
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(100)),
+            Answer::NotFound
+        );
+        // aios: three unanswered requests in a row fail
+        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(1000));
+        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(2000));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(3000)),
+            Answer::Failed
+        );
+        cache.forget_failed(&MOCK_IP_ADDR_1.into());
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(3000)),
             Answer::NotFound
         );
         assert_eq!(

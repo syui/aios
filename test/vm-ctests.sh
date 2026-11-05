@@ -60,6 +60,8 @@ run)
     rtnl6) cmd="sudo -n ./$t" ;;
     # rtnladdr も root で (ip addr を足して消す)
     rtnladdr) cmd="sudo -n ./$t" ;;
+    # ndsilence も root で (raw の ICMP。近所さがしの失敗を 6 秒見る)
+    ndsilence) cmd="sudo -n ./$t" ;;
     *) cmd="./$t" ;;
     esac
     # pathcache は root でも (マウントと、ほかの人から引いたとき。ext4 はほかの人も通れる /var/tmp で)

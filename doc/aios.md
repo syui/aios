@@ -1148,9 +1148,21 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   写し (kernel/vendor/smoltcp、ルートの Cargo.toml の [patch.crates-io]) で直した: 変えたところは
   kernel/vendor/smoltcp/AIOS.md。test/ndsilence.c (ldiff --net、ctests にも) が 10.0.2.200/.201 と fec0::200/::201 へ
   別々のソケットで続けて送り、0.3 秒あとに 4 つとも INCOMPLETE (Linux 7.4-rc1 と 3 行同じ)。nfteval6 の ping6 の待ちも
-  2.5 秒から 1 秒にもどした。まだ: 3 度問い合わせて答えがなければ FAILED にして、待っているパケットを捨て、送った
-  ソケットに EHOSTUNREACH (Linux。smoltcp は 1 秒ごとに問い合わせつづけ、そのソケットのうしろのパケットも出ない:
-  todo の neigh-failed)
+  2.5 秒から 1 秒にもどした
+- 近所さがしの失敗 (Linux の neigh_invalidate): 1 秒ごとに 3 度 (mcast_probes) 問い合わせて答えがなければ、待っていた
+  パケットを捨て、自分から自分へ「たどりつけない」を返す (arp_error_report → ipv4_link_failure の ICMP host unreachable、
+  ndisc_error_report → ip6_link_failure の ICMPv6 address unreachable。送り元とあて先は捨てたパケットの送り元、中身は
+  捨てたものの頭から 576 / 1280 バイトまで、ICMP のエラーと断片の 2 つめから先には返さない: net.rs の link_failure)。
+  TCP の connect は 3 秒ほどで EHOSTUNREACH (なにも送らずに終わる: 写しの smoltcp に足した TcpSocket::forget。smoltcp の
+  close と abort は SYN_SENT でも RST を送っていた)、raw のソケット (ping) はその ICMP を受け、つないだ UDP は (Linux と
+  同じく host unreachable は致命でないので) 知らない。近所の表は FAILED のまま、次に送るものがまた問い合わせはじめる。
+  smoltcp は写しで: あて先ごとに問い合わせた数をおぼえ (間があけば数えなおす)、3 度で NeighborFailed、そのパケットは
+  送ったことにしてソケットの列から外し (前は答えのないあて先へのパケットが列の先にいつまでも残り、うしろも出なかった)、
+  Interface::take_neighbor_failures で aios に渡す。近所の表 (smoltcp の neighbor cache) は 8 から 64 に
+  (iface-neighbor-cache-count-64)。test/ndsilence.c (--root --net、ctests にも) が Linux 7.4-rc1 と 17 行同じ (raw の
+  ソケットに来る順は時間しだいなのでならべる、DAD の終わりを待つ: Linux は DAD のあいだの番地を送り元にしない)。
+  まだ: 1 つのソケットの列に同じあて先へのものがいくつもあると、捨てるのは先のものだけで、うしろはまた 3 秒問い合わせる
+  (Linux は待っていたものをみな捨てる)
 - conntrack (段階 2e): IPv6 も (上の「ファイアウォール (nftables)」の IPv6)
 - netlink で変える (段階 2f: inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ:
   - ip -6 addr add: eth0 の番地 (DAD はしない: nodad と同じ)、IFA_FLAGS (NODAD、NOPREFIXROUTE、MANAGETEMPADDR など)、

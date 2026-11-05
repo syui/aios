@@ -1638,11 +1638,12 @@ fn tcp_icmp(u: &InetRef, errno: i64) {
     if !matches!(st, St::SynSent | St::SynRecv) {
         return;
     }
-    // smoltcp の abort は RST を送るが、Linux はつなぐ途中 (SYN_SENT) でやめるときは何も送らない (tcp_done)
+    // smoltcp の abort と close は相手が決まったまま CLOSED にするので RST を送るが、Linux はつなぐ途中 (SYN_SENT) で
+    // やめるときは何も送らない (tcp_done): 写しの smoltcp に足した forget で
     if let Some(h) = ext {
         let t = tcp_sock(h);
         if t.state() == tcp::State::SynSent {
-            t.close();
+            t.forget();
         } else {
             t.abort();
         }

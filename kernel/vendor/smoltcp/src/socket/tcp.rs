@@ -1031,6 +1031,12 @@ impl<'a> Socket<'a> {
         self.set_state(State::Closed);
     }
 
+    /// aios: drop the connection without sending anything (Linux's tcp_done when an ICMP error ends a
+    /// connection in SYN-SENT). `abort` and `close` leave the endpoint set, so the socket then sends an RST.
+    pub fn forget(&mut self) {
+        self.reset();
+    }
+
     /// Return whether the socket is passively listening for incoming connections.
     ///
     /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
