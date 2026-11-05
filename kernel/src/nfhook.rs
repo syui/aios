@@ -755,7 +755,7 @@ pub fn kernel_unreach6(ip: &mut [u8], code: u8) -> Option<Vec<u8>> {
 
 /// aios のアドレスか (送り元を決めるため: 127.0.0.0/8 と eth0 のもの)
 pub fn is_local(a: u32) -> bool {
-    a >> 24 == 127 || (a != 0 && a == crate::net::eth_addr())
+    a >> 24 == 127 || crate::net::is_eth_addr(a)
 }
 
 /// ブロードキャストかマルチキャストか (eth0 のネットワークのブロードキャストも)
@@ -1239,7 +1239,7 @@ pub fn trace_cmd(arg: &str) -> Result<(), i64> {
                 Path::Out(_, why) | Path::In(_, why) => alloc::format!("result: drop on output by {} (sendmsg gets EPERM)", why.text()),
             },
             ("in", "eth0") => {
-                let local = (dst != 0 && dst == crate::net::eth_addr()) || is_bcast_or_mcast(dst);
+                let local = crate::net::is_eth_addr(dst) || is_bcast_or_mcast(dst);
                 let mut f = Vec::with_capacity(14 + pkt.len());
                 f.extend_from_slice(&[0x52, 0x54, 0, 0x12, 0x34, 0x56, 0x52, 0x55, 0x0a, 0, 2, 2, 8, 0]);
                 if let Some(m) = crate::net::mac() {

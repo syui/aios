@@ -1039,6 +1039,24 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   RTM_DELROUTE を、送ったソケットのポートと seq で RTMGRP_IPV4_ROUTE に。ioctl (SIOCADDRT / SIOCDELRT / SIOCSIFADDR /
   SIOCSIFNETMASK) と DHCP で変わったら、前とくらべて RTM_DELADDR、RTM_DELROUTE、RTM_NEWADDR (RTMGRP_IPV4_IFADDR)、
   RTM_NEWROUTE をポート 0 で (netlink::changed)。組あての受けの nl_groups は組のビット
+- 番地を変える (RTM_NEWADDR / RTM_DELADDR の AF_INET: ip addr add / replace / del): inet_rtm_newaddr と
+  inet_rtm_deladdr のたしかめの順 (prefix が 32 より長い、IFA_LOCAL がない、valid が 0 か preferred > valid は EINVAL、
+  口がなければ ENODEV、同じ網・長さ・番地があれば NLM_F_EXCL か REPLACE なしで EEXIST、消すものがなければ
+  EADDRNOTAVAIL)。eth0 の番地は lease (DHCP か SIOCSIFADDR) と netlink で足したもの (net::Addr4) で、Linux の
+  ifa_list の順 (primary のあとに secondary)。先にある番地と同じ網・長さのものは IFA_F_SECONDARY で、道は local
+  (prefsrc は primary) と broadcast だけ。primary は fib_add_ifaddr の local、broadcast (brd があれば)、網、網の
+  broadcast (IFA_F_NOPREFIXROUTE なら網の道なし)。replace は protocol と lifetime (有限なら PERMANENT がとれる) を
+  変える。lifetime は check_lifetime と同じく、preferred が切れたら DEPRECATED、valid が切れたら消す。消すのは
+  promote_secondaries 0 の Linux と同じく、primary なら同じ網の secondary もみな (fib_del_ifaddr の網、broadcast、
+  local の順で、ほかの番地がまだ使う道はのこす)。lease を消すと DHCP とゲートウェイもやめ、eth0 の番地がなくなれば
+  ip route add の道もだまって消える (fib_disable_ip)。送り元は道の prefsrc (secondary の番地へも primary から)。
+  smoltcp にも番地を入れる (8 つまで: 127.0.0.1 と IPv6 の場所をのこす)。lo の番地、peer の番地 (point-to-point)、
+  lease の lifetime を変えるのは EOPNOTSUPP (aios のできないこと)
+  - 知らせ: RTM_NEWADDR (送ったソケットのポートと seq) のあとに足した道 (ポート 0、NLM_F_EXCL|NLM_F_CREATE)。消すと
+    RTM_DELADDR のあとに消えた道
+  - 確かめかた: `test/ldiff.sh --root --net rtnladdr` (10.0.2.50/24 (secondary) と 192.168.50.1/24 brd label eth0:1 を
+    足し、dump、ip route get、送り元、自分の番地への TCP、EEXIST と replace、まちがいの errno、消す)。手本の Linux
+    7.4-rc1 と 54 行同じ。ctests にも (root で)
 - 確かめかた (つづき): `test/ldiff.sh --root --net rtnl` (10.0.2.3 にはじめて送ったときの ARP と知らせ、dump と get の
   しくじり、ioctl と netlink で既定の道と 192.168.7.0/24 を消して足す知らせ、しくじりの errno。おわりに既定の道を
   もどす)。Linux 7.4-rc1 と 195 行同じ。10.0.2.3 にもう問い合わせた VM では、はじめの知らせがちがって見える

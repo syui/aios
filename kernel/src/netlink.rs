@@ -728,6 +728,8 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET => change_route(body, typ == RTM_NEWROUTE, nlflags, seq, me),
         (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET6 => change_route6(body, typ == RTM_NEWROUTE, nlflags),
         (RTM_NEWADDR, _) if family == AF_INET6 => new_addr6(body, nlflags),
+        (RTM_NEWADDR, _) if family == AF_INET => new_addr4(body, nlflags, seq, me),
+        (RTM_DELADDR, _) if family == AF_INET => del_addr4(body, seq, me),
         (RTM_DELADDR, _) if family == AF_INET6 => del_addr6(body),
         (RTM_GETNEIGH, true) => {
             dump_neigh(body, family, strict, seq, me, out);
@@ -836,28 +838,119 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     put_msg(out, RTM_NEWLINK, flags, seq, me, &p);
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Addr {
     pub index: i32,
-    pub label: &'static str,
+    pub label: String,
     pub addr: [u8; 4],
     pub prefix: u8,
     pub scope: u8,
     pub brd: Option<[u8; 4]>,
+    /// IFA_F_* (IFA_F_SECONDARY もここ)
+    pub flags: u32,
+    /// IFA_PROTO (0 はなし)
+    pub proto: u8,
+    /// lifetime (秒、u32::MAX はいつまでも) と、作った・lifetime を決めた時刻 (ミリ秒)
+    pub preferred: u32,
+    pub valid: u32,
+    pub cstamp: u64,
+    pub tstamp: u64,
 }
 
-/// IPv4 のアドレス: lo の 127.0.0.1/8 と、eth0 にあれば
+/// 知らせのくらべ: lifetime と時刻のほか (secondary かどうかは道が変わるので見る)
+impl PartialEq for Addr {
+    fn eq(&self, o: &Addr) -> bool {
+        (self.index, &self.label, self.addr, self.prefix, self.scope, self.brd, self.flags & IFA_F_SECONDARY)
+            == (o.index, &o.label, o.addr, o.prefix, o.scope, o.brd, o.flags & IFA_F_SECONDARY)
+    }
+}
+
+const IFA_F_SECONDARY: u32 = 0x01;
+const IFA_F_DEPRECATED: u32 = 0x20;
+const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+/// IPv6 だけのもの (NODAD、OPTIMISTIC、DADFAILED、HOMEADDRESS、TENTATIVE、MANAGETEMPADDR、STABLE_PRIVACY)
+const IPV6ONLY_FLAGS: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x40 | 0x100 | 0x800;
+const IFA_PROTO: u16 = 11;
+const IFA_RT_PRIORITY: u16 = 9;
+const EADDRNOTAVAIL: i64 = 99;
+const ERANGE: i64 = 34;
+
+fn same_net(a: u32, b: u32, len: u8) -> bool {
+    (a ^ b) & mask(len) == 0
+}
+
+/// netlink で足した番地を netlink の形に
+fn addr4_of(x: &crate::net::Addr4) -> Addr {
+    Addr {
+        index: ETH_INDEX,
+        label: x.label.clone(),
+        addr: x.addr.to_be_bytes(),
+        prefix: x.prefix,
+        scope: x.scope,
+        brd: (x.brd != 0).then(|| x.brd.to_be_bytes()),
+        flags: x.flags,
+        proto: x.proto,
+        preferred: x.preferred,
+        valid: x.valid,
+        cstamp: x.cstamp,
+        tstamp: x.tstamp,
+    }
+}
+
+/// IPv4 のアドレス: lo の 127.0.0.1/8 と eth0 のもの (lease と ip addr add のもの)。eth0 のものは Linux の ifa_list の
+/// 順 (__inet_insert_ifa: primary をならべ、そのあとに secondary)。secondary は先にある番地と同じ網 (同じ長さ) のもの
 pub fn addrs() -> Vec<Addr> {
-    let mut v = alloc::vec![Addr { index: LO_INDEX, label: "lo", addr: [127, 0, 0, 1], prefix: 8, scope: RT_SCOPE_HOST, brd: None }];
-    if crate::net::get().is_some()
-        && let Some(c) = crate::net::cidr()
-    {
+    let mut v = alloc::vec![Addr {
+        index: LO_INDEX,
+        label: String::from("lo"),
+        addr: [127, 0, 0, 1],
+        prefix: 8,
+        scope: RT_SCOPE_HOST,
+        brd: None,
+        flags: IFA_F_PERMANENT,
+        proto: 0,
+        preferred: u32::MAX,
+        valid: u32::MAX,
+        cstamp: 0,
+        tstamp: 0,
+    }];
+    if crate::net::get().is_none() {
+        return v;
+    }
+    let mut eth: Vec<Addr> = Vec::new();
+    if let Some(c) = crate::net::cidr() {
         let a = c.address().octets();
         let p = c.prefix_len();
-        let m = if p == 0 { 0 } else { u32::MAX << (32 - p as u32) };
-        let b = (u32::from_be_bytes(a) | !m).to_be_bytes();
-        v.push(Addr { index: ETH_INDEX, label: crate::net::IFNAME, addr: a, prefix: p, scope: RT_SCOPE_UNIVERSE, brd: Some(b) });
+        let b = (u32::from_be_bytes(a) | !mask(p)).to_be_bytes();
+        eth.push(Addr {
+            index: ETH_INDEX,
+            label: String::from(crate::net::IFNAME),
+            addr: a,
+            prefix: p,
+            scope: RT_SCOPE_UNIVERSE,
+            brd: Some(b),
+            flags: IFA_F_PERMANENT,
+            proto: 0,
+            preferred: u32::MAX,
+            valid: u32::MAX,
+            cstamp: 0,
+            tstamp: 0,
+        });
     }
+    for x in crate::net::extra4() {
+        eth.push(addr4_of(&x));
+    }
+    for i in 0..eth.len() {
+        let me = u32::from_be_bytes(eth[i].addr);
+        let sec = eth[..i].iter().any(|p| p.prefix == eth[i].prefix && same_net(u32::from_be_bytes(p.addr), me, p.prefix));
+        if sec {
+            eth[i].flags |= IFA_F_SECONDARY;
+        } else {
+            eth[i].flags &= !IFA_F_SECONDARY;
+        }
+    }
+    v.extend(eth.iter().filter(|a| a.flags & IFA_F_SECONDARY == 0).cloned());
+    v.extend(eth.iter().filter(|a| a.flags & IFA_F_SECONDARY != 0).cloned());
     v
 }
 
@@ -870,21 +963,32 @@ fn put_addr(out: &mut Vec<u8>, a: &Addr, flags: u16, seq: u32, me: u32) {
 fn put_addr_msg(out: &mut Vec<u8>, a: &Addr, typ: u16, flags: u16, seq: u32, me: u32) {
     let mut p = Vec::new();
     // struct ifaddrmsg: family、prefixlen、flags、scope、index
-    p.extend_from_slice(&[AF_INET, a.prefix, IFA_F_PERMANENT as u8, a.scope]);
+    p.extend_from_slice(&[AF_INET, a.prefix, a.flags as u8, a.scope]);
     p.extend_from_slice(&(a.index as u32).to_le_bytes());
     attr(&mut p, IFA_ADDRESS, &a.addr);
     attr(&mut p, IFA_LOCAL, &a.addr);
     if let Some(b) = a.brd {
         attr(&mut p, IFA_BROADCAST, &b);
     }
-    attr_str(&mut p, IFA_LABEL, a.label);
-    attr_u32(&mut p, IFA_FLAGS, IFA_F_PERMANENT);
-    // struct ifa_cacheinfo: いつまでも (INFINITY_LIFE_TIME) と、作った時刻 (1/100 秒)
+    attr_str(&mut p, IFA_LABEL, &a.label);
+    if a.proto != 0 {
+        attr(&mut p, IFA_PROTO, &[a.proto]);
+    }
+    attr_u32(&mut p, IFA_FLAGS, a.flags);
+    // struct ifa_cacheinfo (put_cacheinfo): のこりの秒 (PERMANENT ならいつまでも) と、作った・変えた時刻 (1/100 秒)
+    let (mut pref, mut valid) = (u32::MAX, u32::MAX);
+    if a.flags & IFA_F_PERMANENT == 0 && a.preferred != u32::MAX {
+        let t = (ms().saturating_sub(a.tstamp) / 1000) as u32;
+        pref = a.preferred.saturating_sub(t);
+        valid = if a.valid == u32::MAX { u32::MAX } else { a.valid.saturating_sub(t) };
+    } else if a.flags & IFA_F_PERMANENT == 0 {
+        valid = a.valid;
+    }
     let mut ci = Vec::new();
-    ci.extend_from_slice(&u32::MAX.to_le_bytes());
-    ci.extend_from_slice(&u32::MAX.to_le_bytes());
-    ci.extend_from_slice(&0u32.to_le_bytes());
-    ci.extend_from_slice(&0u32.to_le_bytes());
+    ci.extend_from_slice(&pref.to_le_bytes());
+    ci.extend_from_slice(&valid.to_le_bytes());
+    ci.extend_from_slice(&((a.cstamp / 10) as u32).to_le_bytes());
+    ci.extend_from_slice(&((a.tstamp / 10) as u32).to_le_bytes());
     attr(&mut p, IFA_CACHEINFO, &ci);
     put_msg(out, typ, flags, seq, me, &p);
 }
@@ -974,31 +1078,8 @@ fn route_list(addrs: &[Addr]) -> Vec<Route> {
         }
     };
     for a in addrs {
-        let lo = a.index == LO_INDEX;
-        let addr = u32::from_be_bytes(a.addr);
-        let m = mask(a.prefix);
-        let prefix = addr & m;
-        // fib_magic: proto kernel、prefsrc は口のアドレス、LOCAL は scope host でほかは link、UNICAST だけ main
-        let magic = |typ: u8, dst: u32, len: u8| Route {
-            table: if typ == RTN_UNICAST { RT_TABLE_MAIN } else { RT_TABLE_LOCAL },
-            typ,
-            scope: if typ == RTN_LOCAL { RT_SCOPE_HOST } else { RT_SCOPE_LINK },
-            proto: RTPROT_KERNEL,
-            dst,
-            len,
-            prefsrc: addr,
-            gw: 0,
-            oif: a.index,
-        };
-        add(magic(RTN_LOCAL, addr, 32));
-        if let Some(b) = a.brd.map(u32::from_be_bytes).filter(|&b| b != 0 && b != LBCAST) {
-            add(magic(RTN_BROADCAST, b, 32));
-        }
-        if prefix != 0 && (prefix != addr || a.prefix < 32) {
-            add(magic(if lo { RTN_LOCAL } else { RTN_UNICAST }, prefix, a.prefix));
-            if a.prefix < 31 {
-                add(magic(RTN_BROADCAST, prefix | !m, 32));
-            }
+        for r in ifa_routes(addrs, a) {
+            add(r);
         }
     }
     // ipconfig (ip_rt_ioctl の SIOCADDRT): 既定の道は proto boot、scope universe、prefsrc なし (netlink で足したら
@@ -1009,6 +1090,50 @@ fn route_list(addrs: &[Addr]) -> Vec<Route> {
     }
     for x in EXTRA.get().iter() {
         add(Route { table: RT_TABLE_MAIN, typ: RTN_UNICAST, scope: RT_SCOPE_UNIVERSE, proto: x.proto, dst: x.dst, len: x.len, prefsrc: 0, gw: x.gw, oif: ETH_INDEX });
+    }
+    v
+}
+
+/// 1 つの番地の道 (fib_add_ifaddr の順: local、broadcast、網、網の broadcast)。fib_magic: proto kernel、prefsrc は
+/// primary の番地 (secondary なら同じ網の primary)、LOCAL は scope host でほかは link、UNICAST だけ main。secondary は
+/// local と broadcast だけ、NOPREFIXROUTE なら網の道はない
+fn ifa_routes(addrs: &[Addr], a: &Addr) -> Vec<Route> {
+    let mut v = Vec::new();
+    let lo = a.index == LO_INDEX;
+    let addr = u32::from_be_bytes(a.addr);
+    let m = mask(a.prefix);
+    let prefix = addr & m;
+    let sec = a.flags & IFA_F_SECONDARY != 0;
+    let prim = if sec {
+        match addrs.iter().find(|p| p.index == a.index && p.flags & IFA_F_SECONDARY == 0 && p.prefix == a.prefix && same_net(u32::from_be_bytes(p.addr), addr, a.prefix)) {
+            Some(p) => u32::from_be_bytes(p.addr),
+            None => return v,
+        }
+    } else {
+        addr
+    };
+    let magic = |typ: u8, dst: u32, len: u8| Route {
+        table: if typ == RTN_UNICAST { RT_TABLE_MAIN } else { RT_TABLE_LOCAL },
+        typ,
+        scope: if typ == RTN_LOCAL { RT_SCOPE_HOST } else { RT_SCOPE_LINK },
+        proto: RTPROT_KERNEL,
+        dst,
+        len,
+        prefsrc: prim,
+        gw: 0,
+        oif: a.index,
+    };
+    v.push(magic(RTN_LOCAL, addr, 32));
+    if let Some(b) = a.brd.map(u32::from_be_bytes).filter(|&b| b != 0 && b != LBCAST) {
+        v.push(magic(RTN_BROADCAST, b, 32));
+    }
+    if !sec && prefix != 0 && (prefix != addr || a.prefix < 32) {
+        if a.flags & IFA_F_NOPREFIXROUTE == 0 {
+            v.push(magic(if lo { RTN_LOCAL } else { RTN_UNICAST }, prefix, a.prefix));
+        }
+        if a.prefix < 31 {
+            v.push(magic(RTN_BROADCAST, prefix | !m, 32));
+        }
     }
     v
 }
@@ -1026,7 +1151,7 @@ fn is_local(rs: &[Route], a: u32) -> bool {
 /// inet_select_addr: dev の (dst と同じ網のものを先に) scope が scope 以下のアドレス。なければほかの口から
 /// (in_dev_select_addr: scope link のものはとらない)
 fn select_addr(dev: i32, dst: u32, scope: u8) -> u32 {
-    let all = addrs();
+    let all: Vec<Addr> = addrs().into_iter().filter(|a| a.flags & IFA_F_SECONDARY == 0).collect();
     let ok = |a: &&Addr| a.scope <= scope;
     let mine: Vec<&Addr> = all.iter().filter(|a| a.index == dev).filter(ok).collect();
     if let Some(a) = mine.iter().find(|a| dst == 0 || dst & mask(a.prefix) == u32::from_be_bytes(a.addr) & mask(a.prefix)).or(mine.first()) {
@@ -1571,6 +1696,272 @@ pub fn changed() {
         notify(RTNLGRP_IPV4_ROUTE, d);
     }
     *SNAP.get() = Some((a, r));
+}
+
+// ---- IPv4 の番地を変える (inet_rtm_newaddr / inet_rtm_deladdr) と知らせ ----
+//
+// 番地は eth0 のものだけ (lo は 127.0.0.1 だけで EOPNOTSUPP)。peer の番地 (point-to-point) もできない。lease (DHCP か
+// SIOCSIFADDR の番地) は lifetime を変えられない。promote_secondaries は 0 (Linux の既定): primary を消すと同じ網の
+// secondary もみな消える
+
+/// lifetime の時間切れをつぎに見るとき (ミリ秒。0 はすぐ)
+static NEXT4: AtomicU64 = AtomicU64::new(0);
+
+/// set_ifa_lifetime: valid がいつまでもなら PERMANENT、preferred が 0 なら DEPRECATED
+fn life_flags(flags: u32, valid: u32, pref: u32) -> u32 {
+    let mut f = flags & !(IFA_F_PERMANENT | IFA_F_DEPRECATED);
+    if valid == u32::MAX {
+        f |= IFA_F_PERMANENT;
+    }
+    if pref == 0 {
+        f |= IFA_F_DEPRECATED;
+    }
+    f
+}
+
+fn cstr(v: &[u8]) -> String {
+    String::from_utf8_lossy(v.split(|&c| c == 0).next().unwrap_or(&[])).into_owned()
+}
+
+fn be32(v: &[u8]) -> u32 {
+    u32::from_be_bytes(v[..4].try_into().unwrap())
+}
+
+fn ev_addr4(a: &Addr, typ: u16, seq: u32, me: u32) {
+    let mut d = Vec::new();
+    put_addr_msg(&mut d, a, typ, 0, seq, me);
+    notify(RTNLGRP_IPV4_IFADDR, d);
+}
+
+/// fib_magic の道の知らせ (seq と portid は 0。足したものは NLM_F_EXCL|NLM_F_CREATE)
+fn ev_route4(r: &Route, typ: u16) {
+    let mut d = Vec::new();
+    put_route_msg(&mut d, r, typ, if typ == RTM_NEWROUTE { NLM_F_EXCL | NLM_F_CREATE } else { 0 }, 0, 0);
+    notify(RTNLGRP_IPV4_ROUTE, d);
+}
+
+/// nlmsg_parse (ifa_ipv4_policy) の長さのたしかめ: u32 のものが短い、cacheinfo が短い、label が長いと ERANGE
+fn addr4_attrs(body: &[u8]) -> Result<BTreeMap<u16, &[u8]>, i64> {
+    if body.len() < 8 {
+        return Err(crate::why::inval());
+    }
+    let a = attrs_of(&body[8..]);
+    let short = [IFA_ADDRESS, IFA_LOCAL, IFA_BROADCAST, IFA_FLAGS, IFA_RT_PRIORITY].iter().any(|k| a.get(k).is_some_and(|v| v.len() < 4));
+    if short || a.get(&IFA_CACHEINFO).is_some_and(|v| v.len() < 16) || a.get(&IFA_PROTO).is_some_and(|v| v.is_empty()) || a.get(&IFA_LABEL).is_some_and(|v| cstr(v).len() > 15) {
+        return Err(-ERANGE);
+    }
+    Ok(a)
+}
+
+/// ip addr add / replace (inet_rtm_newaddr): たしかめの順は prefix の長さ (32 まで)、IFA_LOCAL、IFA_CACHEINFO (valid が
+/// 0 か preferred > valid は EINVAL)、口 (ENODEV)。同じ網・長さ・番地のものがあれば NLM_F_EXCL か REPLACE なしは EEXIST、
+/// REPLACE は protocol と lifetime を変えて RTM_NEWADDR。新しいものは番地 0 ならなにもせず、同じ網に scope のちがう番地が
+/// あれば EINVAL。知らせは RTM_NEWADDR のあとに fib_add_ifaddr の道
+fn new_addr4(body: &[u8], nlflags: u16, seq: u32, me: u32) -> i64 {
+    let a = match addr4_attrs(body) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let (plen, hflags, scope) = (body[1], body[2], body[3]);
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    if plen > 32 {
+        return crate::why::inval();
+    }
+    let Some(lv) = a.get(&IFA_LOCAL) else { return crate::why::inval() };
+    let (mut pref, mut valid) = (u32::MAX, u32::MAX);
+    if let Some(v) = a.get(&IFA_CACHEINFO) {
+        pref = u32::from_le_bytes(v[0..4].try_into().unwrap());
+        valid = u32::from_le_bytes(v[4..8].try_into().unwrap());
+        if valid == 0 || pref > valid {
+            return crate::why::inval();
+        }
+    }
+    let Some(dev) = links().into_iter().find(|l| l.index == index) else { return -ENODEV };
+    let local = be32(lv);
+    let address = a.get(&IFA_ADDRESS).map_or(local, |v| be32(v));
+    let flags = a.get(&IFA_FLAGS).map_or(hflags as u32, |v| u32_of(Some(v)));
+    let brd = a.get(&IFA_BROADCAST).map_or(0, |v| be32(v));
+    let label = a.get(&IFA_LABEL).map_or_else(|| String::from(dev.name), |v| cstr(v));
+    let proto = a.get(&IFA_PROTO).map_or(0, |v| v[0]);
+    let all = addrs();
+    // find_matching_ifa
+    let same = |x: &Addr| x.index == index && x.prefix == plen && same_net(u32::from_be_bytes(x.addr), address, plen);
+    if let Some(x) = all.iter().find(|x| same(x) && u32::from_be_bytes(x.addr) == local) {
+        if nlflags & NLM_F_EXCL != 0 || nlflags & NLM_F_REPLACE == 0 {
+            return -EEXIST;
+        }
+        let mut v = crate::net::extra4();
+        let Some(e) = v.iter_mut().find(|e| e.addr == local && x.index == ETH_INDEX) else {
+            // lo と lease の番地: lifetime はいつまでものまま
+            if valid != u32::MAX {
+                return -EOPNOTSUPP;
+            }
+            ev_addr4(x, RTM_NEWADDR, seq, me);
+            return 0;
+        };
+        e.proto = proto;
+        e.flags = life_flags(e.flags, valid, pref);
+        e.valid = valid;
+        e.preferred = pref;
+        e.tstamp = ms();
+        crate::net::set_extra4(v);
+        NEXT4.store(0, Ordering::Relaxed);
+        if let Some(x) = addrs().iter().find(|x| x.index == ETH_INDEX && u32::from_be_bytes(x.addr) == local) {
+            ev_addr4(x, RTM_NEWADDR, seq, me);
+        }
+        snapshot();
+        return 0;
+    }
+    if local == 0 {
+        return 0;
+    }
+    if index != ETH_INDEX || address != local {
+        return -EOPNOTSUPP;
+    }
+    if all.iter().any(|x| same(x) && x.scope != scope) {
+        return crate::why::inval();
+    }
+    let now = ms();
+    let flags = life_flags(flags & !(IFA_F_SECONDARY | IPV6ONLY_FLAGS), valid, pref);
+    let before = route_list(&all);
+    let mut v = crate::net::extra4();
+    v.push(crate::net::Addr4 { addr: local, prefix: plen, brd, label, flags, proto, scope, valid, preferred: pref, cstamp: now, tstamp: now });
+    crate::net::set_extra4(v);
+    NEXT4.store(0, Ordering::Relaxed);
+    let now_addrs = addrs();
+    if let Some(x) = now_addrs.iter().find(|x| x.index == ETH_INDEX && u32::from_be_bytes(x.addr) == local) {
+        ev_addr4(x, RTM_NEWADDR, seq, me);
+        let mut sent: Vec<Route> = Vec::new();
+        for r in ifa_routes(&now_addrs, x) {
+            if !before.contains(&r) && !sent.contains(&r) {
+                ev_route4(&r, RTM_NEWROUTE);
+                sent.push(r);
+            }
+        }
+    }
+    snapshot();
+    0
+}
+
+/// ip addr del (inet_rtm_deladdr): 口がなければ ENODEV。口の番地を順に見て、IFA_LOCAL、IFA_LABEL、IFA_ADDRESS (と
+/// prefix の長さ) のあう はじめのものを消す。なければ EADDRNOTAVAIL
+fn del_addr4(body: &[u8], seq: u32, me: u32) -> i64 {
+    let a = match addr4_attrs(body) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let plen = body[1];
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    if !links().iter().any(|l| l.index == index) {
+        return -ENODEV;
+    }
+    let local = a.get(&IFA_LOCAL).map(|v| be32(v));
+    let label = a.get(&IFA_LABEL).map(|v| cstr(v));
+    let address = a.get(&IFA_ADDRESS).map(|v| be32(v));
+    for x in addrs().iter().filter(|x| x.index == index) {
+        let ax = u32::from_be_bytes(x.addr);
+        if local.is_some_and(|l| l != ax) || label.as_ref().is_some_and(|l| *l != x.label) {
+            continue;
+        }
+        if address.is_some_and(|ad| plen != x.prefix || !same_net(ad, ax, x.prefix)) {
+            continue;
+        }
+        if index != ETH_INDEX {
+            return -EOPNOTSUPP;
+        }
+        del_ifa(ax, seq, me);
+        return 0;
+    }
+    -(EADDRNOTAVAIL)
+}
+
+/// __inet_del_ifa と fib_del_ifaddr: 消す番地ごとに RTM_DELADDR と、その番地の道のうちほかの番地が使わなくなったもの
+/// (網、broadcast、網の broadcast、local の順)。lease を消したら DHCP とゲートウェイも。eth0 の番地がなくなれば
+/// ip route add の道もだまって消える (fib_disable_ip)
+fn del_ifa(victim: u32, seq: u32, me: u32) {
+    let all = addrs();
+    let Some(x) = all.iter().find(|a| a.index == ETH_INDEX && u32::from_be_bytes(a.addr) == victim).cloned() else { return };
+    let mut gone: Vec<Addr> = Vec::new();
+    if x.flags & IFA_F_SECONDARY == 0 {
+        let xa = u32::from_be_bytes(x.addr);
+        gone.extend(all.iter().filter(|s| s.index == ETH_INDEX && s.flags & IFA_F_SECONDARY != 0 && s.prefix == x.prefix && same_net(u32::from_be_bytes(s.addr), xa, x.prefix)).cloned());
+    }
+    gone.push(x);
+    let mut state = all;
+    for g in &gone {
+        let before = route_list(&state);
+        let rs = ifa_routes(&state, g);
+        state.retain(|a| a != g);
+        let after = route_list(&state);
+        ev_addr4(g, RTM_DELADDR, seq, me);
+        let order = rs.iter().filter(|r| r.typ == RTN_UNICAST).chain(rs.iter().filter(|r| r.typ == RTN_BROADCAST)).chain(rs.iter().filter(|r| r.typ == RTN_LOCAL));
+        let mut sent: Vec<&Route> = Vec::new();
+        for r in order {
+            if before.contains(r) && !after.contains(r) && !sent.contains(&r) {
+                ev_route4(r, RTM_DELROUTE);
+                sent.push(r);
+            }
+        }
+    }
+    let lease = crate::net::cidr().map(|c| u32::from_be_bytes(c.address().octets()));
+    let gone_ip: Vec<u32> = gone.iter().map(|g| u32::from_be_bytes(g.addr)).collect();
+    if lease.is_some_and(|l| gone_ip.contains(&l)) {
+        crate::net::clear_lease();
+    }
+    let mut v = crate::net::extra4();
+    v.retain(|e| !gone_ip.contains(&e.addr));
+    crate::net::set_extra4(v);
+    if !state.iter().any(|a| a.index == ETH_INDEX) {
+        EXTRA.get().clear();
+        sync_extra();
+    }
+    snapshot();
+}
+
+/// check_lifetime: valid が切れた番地を消し、preferred が切れたものを DEPRECATED にして RTM_NEWADDR (net.rs の poll から)
+pub fn addr4_tick() {
+    let now = ms();
+    if now < NEXT4.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut next = u64::MAX;
+    let mut dead = Vec::new();
+    let mut v = crate::net::extra4();
+    let mut deprecated = Vec::new();
+    for e in v.iter_mut().filter(|e| e.flags & IFA_F_PERMANENT == 0) {
+        let at = |s: u32| e.tstamp + s as u64 * 1000;
+        if e.valid != u32::MAX && now >= at(e.valid) {
+            dead.push(e.addr);
+            continue;
+        }
+        if e.valid != u32::MAX {
+            next = next.min(at(e.valid));
+        }
+        if e.preferred != u32::MAX && e.flags & IFA_F_DEPRECATED == 0 {
+            if now >= at(e.preferred) {
+                e.flags |= IFA_F_DEPRECATED;
+                deprecated.push(e.addr);
+            } else {
+                next = next.min(at(e.preferred));
+            }
+        }
+    }
+    NEXT4.store(next, Ordering::Relaxed);
+    if !deprecated.is_empty() {
+        crate::net::set_extra4(v);
+        for x in addrs().iter().filter(|x| x.index == ETH_INDEX && deprecated.contains(&u32::from_be_bytes(x.addr))) {
+            ev_addr4(x, RTM_NEWADDR, 0, 0);
+        }
+        snapshot();
+    }
+    for d in dead {
+        del_ifa(d, 0, 0);
+    }
+}
+
+/// dst へ出すときの送り元 (道の prefsrc か inet_select_addr)。道がなければ None
+pub fn src_for(dst: u32) -> Option<u32> {
+    output(dst, 0, 0).ok().map(|o| o.saddr).filter(|&s| s != 0)
 }
 
 // ---- 近くの番地の表 (ARP: Linux の neighbour.c と arp.c) ----

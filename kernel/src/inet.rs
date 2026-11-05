@@ -653,7 +653,7 @@ fn eth() -> u32 {
 
 /// aios の中のアドレスか (Linux の RTN_LOCAL: 127.0.0.0/8 と、分けていない NET の eth0 のアドレス)
 fn is_local(a: u32, netns: u64) -> bool {
-    a >> 24 == 127 || (netns == 0 && a != 0 && a == eth())
+    a >> 24 == 127 || (netns == 0 && net::is_eth_addr(a))
 }
 
 fn is_multicast(a: u32) -> bool {
@@ -664,11 +664,9 @@ fn is_broadcast(a: u32) -> bool {
     if a == u32::MAX {
         return true;
     }
-    net::cidr().is_some_and(|c| {
-        let p = c.prefix_len() as u32;
-        let base = u32::from_be_bytes(c.address().octets());
-        p < 31 && a == base | (u32::MAX >> p)
-    })
+    let bcast = |base: u32, p: u32| p < 31 && a == base | (u32::MAX >> p);
+    net::cidr().is_some_and(|c| bcast(u32::from_be_bytes(c.address().octets()), c.prefix_len() as u32))
+        || net::extra4().iter().any(|x| bcast(x.addr, x.prefix as u32) || (x.brd != 0 && a == x.brd))
 }
 
 /// あて先へのみち (Linux の ip_route_output): (あて先, 送り元, aios の中か)。あて先 0.0.0.0 は自分 (送り元か
@@ -681,13 +679,15 @@ fn route(netns: u64, daddr: u32, saddr: u32) -> Result<(u32, u32, bool), i64> {
     if daddr >> 24 == 127 {
         return Ok((daddr, if saddr != 0 { saddr } else { LOOPBACK }, true));
     }
-    if netns == 0 && daddr == eth() && daddr != 0 {
-        return Ok((daddr, if saddr != 0 { saddr } else { daddr }, true));
+    if netns == 0 && net::is_eth_addr(daddr) {
+        // local の道の prefsrc (secondary の番地へは primary から)
+        return Ok((daddr, if saddr != 0 { saddr } else { net::src4(daddr) }, true));
     }
     if netns != 0 || net::get().is_none() || eth() == 0 {
         return Err(-ENETUNREACH);
     }
-    Ok((daddr, if saddr != 0 { saddr } else { eth() }, false))
+    // 送り元は道の prefsrc (netlink で足した番地があれば、あて先の網のもの)
+    Ok((daddr, if saddr != 0 { saddr } else { net::src4(daddr) }, false))
 }
 
 /// sockaddr_in (16 バイト)
@@ -3511,7 +3511,7 @@ fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
                 (s.sport, s.tos, s.uc_ttl)
             };
             let t = ttl.unwrap_or(if my_ttl < 0 { 64 } else { my_ttl as u8 });
-            let src = if saddr >> 24 == 127 || saddr == 0 { eth() } else { saddr };
+            let src = if saddr >> 24 == 127 || saddr == 0 { net::src4(daddr) } else { saddr };
             if !fw_udp(u, src, sport, daddr, dport, &data, tos.unwrap_or(my_tos), t, false)? {
                 return Ok(len as i64);
             }
@@ -4931,7 +4931,7 @@ fn reachable_from_outside(s: &Inet) -> bool {
     if s.v6 || (s.family == AF_INET6 && s.v6only) {
         return s.rcv6 == 0 || (s.rcv6 != LOOPBACK6 && crate::addrconf::is_mine(s.rcv6));
     }
-    s.rcv_saddr == 0 || (s.rcv_saddr == eth() && eth() != 0)
+    net::is_eth_addr(s.rcv_saddr) || s.rcv_saddr == 0
 }
 
 /// smoltcp の番地
@@ -4958,8 +4958,9 @@ fn ext_connect(u: &InetRef) -> Result<(), i64> {
         let mut s = u.borrow_mut();
         s.ext = Some(h);
         if !s.v6 && (s.saddr == 0 || s.saddr >> 24 == 127) {
-            s.saddr = eth();
-            s.rcv_saddr = eth();
+            let src = net::src4(daddr);
+            s.saddr = src;
+            s.rcv_saddr = src;
         }
     }
     net::poll();
@@ -5164,7 +5165,8 @@ fn ext_udp_pull(u: &InetRef) {
         // IPv4 のものは v6only でないもの、IPv6 のものは AF_INET6 のものだけ (同じポートの smoltcp のソケットは両方を受ける)
         let d = match meta.endpoint.addr {
             IpAddress::Ipv4(a) if !(s.family == AF_INET6 && s.v6only) => {
-                Dgram { data: buf, from: (u32::from_be_bytes(a.octets()), meta.endpoint.port), to: eth(), v6: None, tos: 0, ttl: 64, truesize: ts }
+                let to = meta.local_address.and_then(|l| if let IpAddress::Ipv4(x) = l { Some(u32::from_be_bytes(x.octets())) } else { None }).unwrap_or_else(eth);
+                Dgram { data: buf, from: (u32::from_be_bytes(a.octets()), meta.endpoint.port), to, v6: None, tos: 0, ttl: 64, truesize: ts }
             }
             IpAddress::Ipv6(a) if s.family == AF_INET6 => {
                 let to = meta.local_address.and_then(|l| if let IpAddress::Ipv6(x) = l { Some(x.to_bits()) } else { None }).unwrap_or(s.rcv6);

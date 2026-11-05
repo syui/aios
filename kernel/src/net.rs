@@ -67,6 +67,73 @@ pub fn eth_addr() -> u32 {
     ETH_ADDR.load(Ordering::Relaxed)
 }
 
+/// netlink で足した IPv4 の番地 (ip addr add: inet_rtm_newaddr)。lease (DHCP か SIOCSIFADDR の番地) のほかに。どれが
+/// primary でどれが secondary か (同じ網の 2 つ目) は netlink.rs が決める
+#[derive(Clone)]
+pub struct Addr4 {
+    pub addr: u32,
+    pub prefix: u8,
+    /// IFA_BROADCAST (0 はなし)
+    pub brd: u32,
+    pub label: alloc::string::String,
+    /// IFA_F_* (IFA_F_PERMANENT と IFA_F_NOPREFIXROUTE など。SECONDARY は netlink.rs が)
+    pub flags: u32,
+    pub proto: u8,
+    pub scope: u8,
+    /// lifetime (秒、u32::MAX はいつまでも。tstamp から数える)
+    pub valid: u32,
+    pub preferred: u32,
+    /// 作った時刻と lifetime を決めた時刻 (ミリ秒、now)
+    pub cstamp: u64,
+    pub tstamp: u64,
+}
+
+static ADDRS4: Bkl<Vec<Addr4>> = Bkl::new(Vec::new());
+/// ADDRS4 の数 (フレームごとの自分あてのたしかめを、ないときは速く)
+static ADDRS4_N: AtomicU32 = AtomicU32::new(0);
+
+pub fn extra4() -> Vec<Addr4> {
+    if ADDRS4_N.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    ADDRS4.get().clone()
+}
+
+/// eth0 の IPv4 の番地か (lease と netlink で足したもの)
+pub fn is_eth_addr(a: u32) -> bool {
+    a != 0 && (a == ETH_ADDR.load(Ordering::Relaxed) || (ADDRS4_N.load(Ordering::Relaxed) != 0 && ADDRS4.get().iter().any(|x| x.addr == a)))
+}
+
+/// netlink で足した番地を入れかえて smoltcp にも
+pub fn set_extra4(v: Vec<Addr4>) {
+    ADDRS4_N.store(v.len() as u32, Ordering::Relaxed);
+    *ADDRS4.get() = v;
+    if let Some(n) = get() {
+        let v4 = n.lease.as_ref().map(|l| l.addr);
+        set_addrs(&mut n.iface, v4);
+    }
+}
+
+/// lease (DHCP か SIOCSIFADDR の番地) を消す (ip addr del でその番地を: DHCP もやめる。ゲートウェイも)
+pub fn clear_lease() {
+    let Some(n) = get() else { return };
+    if let Some(h) = n.dhcp.take() {
+        n.sockets.remove(h);
+    }
+    n.lease = None;
+    n.iface.routes_mut().remove_default_ipv4_route();
+    set_gw(None);
+    set_addrs(&mut n.iface, None);
+}
+
+/// 送り元 (あて先 dst への道の prefsrc。netlink で足した番地がなければ eth0 のもの)
+pub fn src4(dst: u32) -> u32 {
+    if ADDRS4_N.load(Ordering::Relaxed) == 0 {
+        return eth_addr();
+    }
+    crate::netlink::src_for(dst).unwrap_or_else(eth_addr)
+}
+
 pub fn eth_prefix() -> u8 {
     ETH_PREFIX.load(Ordering::Relaxed) as u8
 }
@@ -102,7 +169,7 @@ pub fn stats(lo: bool) -> [u64; 4] {
 
 /// 127.0.0.0/8 か eth0 のアドレス
 fn is_local(ip: &[u8]) -> bool {
-    ip[0] == 127 || (u32::from_be_bytes([ip[0], ip[1], ip[2], ip[3]]) == ETH_ADDR.load(Ordering::Relaxed) && ip != [0, 0, 0, 0])
+    ip[0] == 127 || is_eth_addr(u32::from_be_bytes([ip[0], ip[1], ip[2], ip[3]]))
 }
 
 /// 出すフレームが自分あてか (IPv4 の宛先、ARP の問い合わせ先、IPv6 の宛先と NS の問い合わせ先で見る)
@@ -409,18 +476,34 @@ impl NetDev {
 /// インターフェースのアドレス: eth0 のもの、それにいつも 127.0.0.1/8、そして eth0 の IPv6 のもの (addrconf)。
 /// eth0 を先に置く (smoltcp は同じネットワークのものがなければ先頭を送り元にするので、外へは eth0 から出る)
 fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
-    ETH_ADDR.store(eth.map_or(0, |c| u32::from_be_bytes(c.address().octets())), Ordering::Relaxed);
-    ETH_PREFIX.store(eth.map_or(0, |c| c.prefix_len() as u32), Ordering::Relaxed);
+    // primary は lease、なければ netlink で足したはじめのもの
+    let extra = extra4();
+    let first = eth.map(|c| (u32::from_be_bytes(c.address().octets()), c.prefix_len())).or(extra.first().map(|x| (x.addr, x.prefix)));
+    ETH_ADDR.store(first.map_or(0, |x| x.0), Ordering::Relaxed);
+    ETH_PREFIX.store(first.map_or(0, |x| x.1 as u32), Ordering::Relaxed);
+    let v6 = crate::addrconf::addrs();
     iface.update_ip_addrs(|a| {
         a.clear();
         if let Some(c) = eth {
             let _ = a.push(IpCidr::Ipv4(c));
         }
+        // smoltcp の番地は 8 つまで: 127.0.0.1 と IPv6 の場所をのこして
+        let room = a.capacity().saturating_sub(a.len() + 1 + v6.len());
+        for x in extra.iter().take(room) {
+            let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::from_bits(x.addr), x.prefix)));
+        }
         let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)));
-        for x in crate::addrconf::addrs() {
+        for x in v6 {
             let _ = a.push(IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(smoltcp::wire::Ipv6Address::from_bits(x.addr), x.prefix)));
         }
     });
+}
+
+/// netlink で足した IPv4 の番地の lifetime (check_lifetime: 時間切れは消し、preferred が切れたら deprecated に)
+fn expire4(_n: &mut Net) {
+    if ADDRS4_N.load(Ordering::Relaxed) != 0 {
+        crate::netlink::addr4_tick();
+    }
 }
 
 /// IPv6 の番地と既定のルーターが変わったら smoltcp に (addrconf の版で見る)
@@ -675,6 +758,7 @@ pub fn poll() {
     }
     dhcp_event(n);
     sync6(n);
+    expire4(n);
     crate::netlink::neigh_tick();
     // ファイアウォールが返した ICMP のエラーを、受けるソケットに (smoltcp の poll の外で)
     let later = core::mem::take(ICMP_LATER.get());
