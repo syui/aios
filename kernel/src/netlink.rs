@@ -65,6 +65,7 @@ const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
 const RTM_NEWNEIGH: u16 = 28;
 const RTM_GETNEIGH: u16 = 30;
+const RTM_GETMULTICAST: u16 = 58;
 /// これより大きい type は EOPNOTSUPP (RTM_MAX: 7.3 は RTM_NEWTUNNEL の次の組のおわり)
 const RTM_MAX: u16 = 123;
 
@@ -72,6 +73,7 @@ const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
 const AF_BRIDGE: u8 = 7;
 const AF_INET6: u8 = 10;
+const AF_PACKET: u8 = 17;
 
 // IFLA_* (if_link.h) と IFA_* (if_addr.h)
 const IFLA_ADDRESS: u16 = 1;
@@ -645,7 +647,7 @@ fn route(msg: &[u8], typ: u16, flags: u16, me: u32, strict: bool, out: &mut Vec<
     let get = typ >= RTM_BASE && (typ - RTM_BASE) & 3 == 2;
     let dump = get && flags & NLM_F_DUMP == NLM_F_DUMP;
     let r = route_msg(msg, typ, dump, flags, me, strict, out);
-    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH))
+    (r, r == 0 && dump && matches!(typ, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH | RTM_GETMULTICAST))
 }
 
 /// out に答えのデータグラムを足す。dump は、中身があれば中身と NLMSG_DONE の 2 つ (Linux の netlink_dump は、dump が
@@ -736,6 +738,7 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
             0
         }
         (RTM_GETNEIGH, false) => get_neigh(body, seq, me, out),
+        (RTM_GETMULTICAST, true) if matches!(family, AF_INET | AF_INET6 | AF_PACKET) => dump_mcast(body, family, strict, seq, me, out),
         _ => -EOPNOTSUPP,
     }
 }
@@ -803,7 +806,81 @@ pub fn links() -> Vec<Link> {
     v
 }
 
-/// RTM_NEWLINK (rtnl_fill_ifinfo の属性の順)
+/// IPv4 の口の設定 (IFLA_INET_CONF: ipv4_devconf の 33 の値。IPV4_DEVCONF_FORWARDING から)。Linux 7.4 の lo と eth0
+/// (virtio-net) のもの: lo は NOXFRM と NOPOLICY
+const INET_CONF_ETH: [i32; 33] = [0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 1000, 0, 0, 0, 0, 1];
+/// IPv6 の口の設定 (IFLA_INET6_CONF: ipv6_devconf の 60 の値。DEVCONF_FORWARDING から)。[2] は MTU。lo は use_tempaddr と
+/// accept_dad が -1
+const INET6_CONF_ETH: [i32; 60] = [
+    0, 64, 1500, 1, 1, 1, 1, -1, 4000, 1000, 0, 172800, 86400, 3, 600, 16, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 10000, 1000, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0,
+    3600000, 0, 0, 1, 0, 0, 0, 0, 0, 1024, 0, 65535, -1, 1, 0, 0, 0,
+];
+const IFLA_QDISC: u16 = 6;
+const IFLA_MAP: u16 = 14;
+const IFLA_AF_SPEC: u16 = 26;
+const IFLA_GSO_MAX_SEGS: u16 = 40;
+const IFLA_GSO_MAX_SIZE: u16 = 41;
+const IFLA_PROTO_DOWN: u16 = 39;
+const IFLA_XDP: u16 = 43;
+const IFLA_CARRIER_UP_COUNT: u16 = 47;
+const IFLA_CARRIER_DOWN_COUNT: u16 = 48;
+const IFLA_PERM_ADDRESS: u16 = 54;
+const IFLA_PARENT_DEV_NAME: u16 = 56;
+const IFLA_PARENT_DEV_BUS_NAME: u16 = 57;
+const IFLA_GRO_MAX_SIZE: u16 = 58;
+const IFLA_TSO_MAX_SIZE: u16 = 59;
+const IFLA_TSO_MAX_SEGS: u16 = 60;
+const IFLA_ALLMULTI: u16 = 61;
+const IFLA_DEVLINK_PORT: u16 = 62;
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
+const IFLA_DPLL_PIN: u16 = 65;
+const IFLA_MAX_PACING_OFFLOAD_HORIZON: u16 = 66;
+const IFLA_NETNS_IMMUTABLE: u16 = 67;
+const IFLA_HEADROOM: u16 = 68;
+const IFLA_TAILROOM: u16 = 69;
+/// 7.4
+const IFLA_PACING_OFFLOAD: u16 = 70;
+const NLA_F_NESTED: u16 = 0x8000;
+
+/// IFLA_AF_SPEC (rtnl_fill_link_af: AF_INET の inet_fill_link_af と AF_INET6 の inet6_fill_link_af)
+fn link_af(lo: bool, mtu: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    // AF_INET: IFLA_INET_CONF
+    let mut c4 = INET_CONF_ETH;
+    if lo {
+        // IPV4_DEVCONF_NOXFRM と NOPOLICY
+        c4[14] = 1;
+        c4[15] = 1;
+    }
+    let mut inet = Vec::new();
+    attr(&mut inet, 1, &c4.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    attr(&mut v, AF_INET as u16, &inet);
+    // AF_INET6: FLAGS (IF_READY と、eth0 は IF_RS_SENT と IF_RA_RCVD: addrconf::if_flags)、CACHEINFO (max_reasm_len、tstamp、reachable_time、
+    // retrans_time)、CONF、STATS (IPSTATS_MIB_MAX の 38: [0] は数)、ICMP6STATS (ICMP6_MIB_MAX の 7)、TOKEN、ADDR_GEN_MODE
+    let mut i6 = Vec::new();
+    attr_u32(&mut i6, 1, if lo { 0x8000_0000 } else { crate::addrconf::if_flags() });
+    attr(&mut i6, 5, &[65535u32, 0, 30000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut c6 = INET6_CONF_ETH;
+    c6[2] = mtu as i32;
+    if lo {
+        c6[10] = -1;
+        c6[27] = -1;
+    }
+    attr(&mut i6, 2, &c6.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut st = [0u64; 38];
+    st[0] = 38;
+    attr(&mut i6, 3, &st.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut ic = [0u64; 7];
+    ic[0] = 7;
+    attr(&mut i6, 6, &ic.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    attr(&mut i6, 7, &[0u8; 16]);
+    attr(&mut i6, 8, &[0]);
+    attr(&mut v, AF_INET6 as u16, &i6);
+    v
+}
+
+/// RTM_NEWLINK (Linux 7.4 の rtnl_fill_ifinfo の属性の順と、lo と virtio-net の値)
 fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     let lo = l.index == LO_INDEX;
     let mut p = Vec::new();
@@ -818,15 +895,36 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     // IF_OPER_UNKNOWN (lo) と IF_OPER_UP
     attr(&mut p, IFLA_OPERSTATE, &[if lo { 0 } else { 6 }]);
     attr(&mut p, IFLA_LINKMODE, &[0]);
+    // lo はほかの名前空間へ動かせない
+    attr(&mut p, IFLA_NETNS_IMMUTABLE, &[lo as u8]);
     attr_u32(&mut p, IFLA_MTU, l.mtu);
     attr_u32(&mut p, IFLA_MIN_MTU, if lo { 0 } else { 68 });
     attr_u32(&mut p, IFLA_MAX_MTU, if lo { 0 } else { 65535 });
     attr_u32(&mut p, IFLA_GROUP, 0);
     attr_u32(&mut p, IFLA_PROMISCUITY, 0);
+    attr_u32(&mut p, IFLA_ALLMULTI, 0);
     attr_u32(&mut p, IFLA_NUM_TX_QUEUES, 1);
+    attr_u32(&mut p, IFLA_GSO_MAX_SEGS, 65535);
+    attr_u32(&mut p, IFLA_GSO_MAX_SIZE, 65536);
+    attr_u32(&mut p, IFLA_GRO_MAX_SIZE, 65536);
+    attr_u32(&mut p, IFLA_GSO_IPV4_MAX_SIZE, 65536);
+    attr_u32(&mut p, IFLA_GRO_IPV4_MAX_SIZE, 65536);
+    // lo は GSO_MAX_SIZE の 8 倍 - 8 (loopback_setup)
+    attr_u32(&mut p, IFLA_TSO_MAX_SIZE, if lo { 524280 } else { 65536 });
+    attr_u32(&mut p, IFLA_TSO_MAX_SEGS, 65535);
+    // nla_put_uint (4 バイトにおさまれば u32)
+    attr_u32(&mut p, IFLA_MAX_PACING_OFFLOAD_HORIZON, 0);
+    attr_u32(&mut p, IFLA_PACING_OFFLOAD, 0);
     attr_u32(&mut p, IFLA_NUM_RX_QUEUES, 1);
     attr(&mut p, IFLA_CARRIER, &[1]);
-    attr_u32(&mut p, IFLA_CARRIER_CHANGES, if lo { 0 } else { 1 });
+    // eth0 は起動のときに 1 度下がって上がった (virtio-net の probe)
+    attr_u32(&mut p, IFLA_CARRIER_CHANGES, if lo { 0 } else { 2 });
+    attr_u32(&mut p, IFLA_CARRIER_UP_COUNT, if lo { 0 } else { 1 });
+    attr_u32(&mut p, IFLA_CARRIER_DOWN_COUNT, if lo { 0 } else { 1 });
+    // virtio-net の hdr (12 バイト) の場所
+    attr(&mut p, IFLA_HEADROOM, &(if lo { 0u16 } else { 12 }).to_le_bytes());
+    attr(&mut p, IFLA_TAILROOM, &0u16.to_le_bytes());
+    attr(&mut p, IFLA_PROTO_DOWN, &[0]);
     attr(&mut p, IFLA_ADDRESS, &l.addr);
     attr(&mut p, IFLA_BROADCAST, &l.brd);
     // struct rtnl_link_stats64 (25 の u64) と rtnl_link_stats (24 の u32): rx_packets、tx_packets、rx_bytes、tx_bytes、...
@@ -835,7 +933,127 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     s64[..4].copy_from_slice(&[rxp, txp, rxb, txb]);
     attr(&mut p, IFLA_STATS64, &s64.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     attr(&mut p, IFLA_STATS, &s64[..24].iter().flat_map(|&v| (v as u32).to_le_bytes()).collect::<Vec<u8>>());
+    // XDP: IFLA_XDP_ATTACHED = XDP_ATTACHED_NONE (nla_nest_start_noflag)
+    let mut xdp = Vec::new();
+    attr(&mut xdp, 2, &[0]);
+    attr(&mut p, IFLA_XDP, &xdp);
+    if !lo {
+        attr(&mut p, IFLA_PERM_ADDRESS, &l.addr);
+    }
+    attr_str(&mut p, IFLA_QDISC, if lo { "noqueue" } else { "pfifo_fast" });
+    attr(&mut p, IFLA_AF_SPEC, &link_af(lo, l.mtu));
+    // struct rtnl_link_ifmap (mem_start、mem_end、base_addr、irq、dma、port): virtio-net も 0
+    attr(&mut p, IFLA_MAP, &[0u8; 32]);
+    if !lo {
+        let n = crate::net::virtio_index().unwrap_or(0);
+        attr_str(&mut p, IFLA_PARENT_DEV_NAME, &alloc::format!("virtio{}", n));
+        attr_str(&mut p, IFLA_PARENT_DEV_BUS_NAME, "virtio");
+    }
+    // 中身のない nest (nla_nest_start: NLA_F_NESTED)
+    attr(&mut p, IFLA_DEVLINK_PORT | NLA_F_NESTED, &[]);
+    attr(&mut p, IFLA_DPLL_PIN | NLA_F_NESTED, &[]);
     put_msg(out, RTM_NEWLINK, flags, seq, me, &p);
+}
+
+// ---- マルチキャストの番地の一覧 (RTM_GETMULTICAST: ip maddr) ----
+//
+// aios は IGMP と MLD をしないが、入っている組は Linux と同じ: IPv4 はどの口も 224.0.0.1 (ip_mc_up)、IPv6 は ff01::1 と
+// ff02::1 (ipv6_add_dev) と、eth0 の番地ごとの solicited-node (addrconf_join_solict。lo はない)。Linux の idev->mc_list は
+// 新しく入ったものが先。PF_PACKET (7.4 の dev_mc_dump) は eth0 の装置のマルチキャストの番地 (dev->mc: 入れた順) で、
+// IPv6 の組は link-local より広いものだけ (igmp6_group_added)
+
+const IFA_MULTICAST: u16 = 7;
+const IFA_MC_USERS: u16 = 12;
+const RT_SCOPE_LINK_MC: u8 = 253;
+
+/// eth0 の solicited-node の組 (ff02::1:ffXX:XXXX) と、その組を使う番地の数。入った順 (古いものが先)
+fn solicited_groups() -> Vec<(u128, u32)> {
+    let mut v: Vec<(u128, u32)> = Vec::new();
+    for a in crate::addrconf::addrs() {
+        let g = 0xff02u128 << 112 | 1 << 32 | 0xff00_0000 | (a.addr & 0xff_ffff);
+        match v.iter_mut().find(|x| x.0 == g) {
+            Some(x) => x.1 += 1,
+            None => v.push((g, 1)),
+        }
+    }
+    v
+}
+
+/// 1 つの組の答え (inet_fill_ifmcaddr / inet6_fill_ifmcaddr / dev_mc_fill_addr)。hdr は (家族、口、nlmsg の flags、seq、ポート)
+fn put_mcast(d: &mut Vec<u8>, hdr: (u8, i32, u16, u32, u32), addr: &[u8], users: u32) {
+    let (family, index, flags, seq, me) = hdr;
+    let mut p = Vec::new();
+    match family {
+        AF_PACKET => p.extend_from_slice(&[AF_PACKET, 0, 0, RT_SCOPE_LINK_MC]),
+        AF_INET => p.extend_from_slice(&[AF_INET, 32, IFA_F_PERMANENT as u8, RT_SCOPE_UNIVERSE]),
+        _ => p.extend_from_slice(&[AF_INET6, 128, IFA_F_PERMANENT as u8, RT_SCOPE_UNIVERSE]),
+    }
+    p.extend_from_slice(&(index as u32).to_le_bytes());
+    attr(&mut p, IFA_MULTICAST, addr);
+    attr_u32(&mut p, IFA_MC_USERS, users);
+    if family == AF_PACKET {
+        // IFA_F_GLOBAL (7.4: dev_mc_add_global で入れたもの) は aios にない
+        attr_u32(&mut p, IFA_FLAGS, 0);
+    } else {
+        let mut ci = Vec::new();
+        for v in [u32::MAX, u32::MAX, 0, 0] {
+            ci.extend_from_slice(&v.to_le_bytes());
+        }
+        attr(&mut p, IFA_CACHEINFO, &ci);
+    }
+    put_msg(d, RTM_GETMULTICAST, flags, seq, me, &p);
+}
+
+/// RTM_GETMULTICAST の dump (AF_INET、AF_INET6、AF_PACKET。中身と NLMSG_DONE は 1 つのデータグラム)。ifaddrmsg の
+/// prefixlen・flags・scope は 0 (PF_PACKET はいつも、ほかは strict のとき見る: でなければ EINVAL)、index があればその口
+/// だけ (NLM_F_DUMP_FILTERED。ない口は ENODEV)
+fn dump_mcast(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
+    let check = strict || family == AF_PACKET;
+    let mut index = 0;
+    if check {
+        if body.len() < 8 || body[1] != 0 || body[2] != 0 || body[3] != 0 {
+            return crate::why::inval();
+        }
+        index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    }
+    let links = links();
+    if index != 0 && !links.iter().any(|l| l.index == index) {
+        return -ENODEV;
+    }
+    let fl = NLM_F_MULTI | if index != 0 { NLM_F_DUMP_FILTERED } else { 0 };
+    let mut d = Vec::new();
+    for l in links.iter().filter(|l| index == 0 || l.index == index) {
+        let eth = l.index == ETH_INDEX;
+        let hdr = (family, l.index, fl, seq, me);
+        match family {
+            AF_INET => put_mcast(&mut d, hdr, &[224, 0, 0, 1], 1),
+            AF_INET6 => {
+                if eth {
+                    for (g, n) in solicited_groups().iter().rev() {
+                        put_mcast(&mut d, hdr, &g.to_be_bytes(), *n);
+                    }
+                }
+                for g in [0xff02u128 << 112 | 1, 0xff01u128 << 112 | 1] {
+                    put_mcast(&mut d, hdr, &g.to_be_bytes(), 1);
+                }
+            }
+            _ if eth => {
+                // ff02::1、224.0.0.1、solicited-node の順に入れた
+                let mut macs: Vec<[u8; 6]> = alloc::vec![[0x33, 0x33, 0, 0, 0, 1], [0x01, 0x00, 0x5e, 0, 0, 1]];
+                for (g, _) in solicited_groups() {
+                    let b = g.to_be_bytes();
+                    macs.push([0x33, 0x33, b[12], b[13], b[14], b[15]]);
+                }
+                for m in macs {
+                    put_mcast(&mut d, hdr, &m, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    put_msg(&mut d, NLMSG_DONE, NLM_F_MULTI | if index != 0 { NLM_F_DUMP_FILTERED } else { 0 }, seq, me, &0i32.to_le_bytes());
+    out.push(d);
+    0
 }
 
 #[derive(Clone)]

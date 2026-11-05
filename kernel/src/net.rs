@@ -566,6 +566,11 @@ pub fn mac() -> Option<[u8; 6]> {
     get().map(|n| n.dev.virtio.mac)
 }
 
+/// eth0 の virtio の装置の、Linux の virtio バスでの番号 (virtioN)
+pub fn virtio_index() -> Option<usize> {
+    get().map(|n| crate::virtio::linux_index(n.dev.virtio.mmio.base))
+}
+
 /// 今のアドレスとネットマスクの長さ
 pub fn cidr() -> Option<Ipv4Cidr> {
     get().and_then(|n| n.lease.as_ref()).map(|l| l.addr)

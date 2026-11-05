@@ -98,6 +98,9 @@ struct State {
     ra_seen: bool,
     next_rs: u64,
     rs_gap: u64,
+    /// RS を出したか (IF_RS_SENT) と、そのあとに RA を受けたか (IF_RA_RCVD)
+    rs_sent: bool,
+    ra_rcvd: bool,
 }
 
 static ST: Bkl<Option<State>> = Bkl::new(None);
@@ -127,7 +130,7 @@ pub fn init(mac: [u8; 6]) {
     let now = ms();
     let ll = 0xfe80u128 << 112 | eui64(mac);
     let a = Addr { addr: ll, prefix: 64, flags: IFA_F_PERMANENT, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now };
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: now, rs_gap: 4000 });
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: now, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
     changed();
 }
 
@@ -139,6 +142,11 @@ pub fn addrs() -> Vec<Addr> {
 /// eth0 の番地か
 pub fn is_mine(a: u128) -> bool {
     a != 0 && ST.get().as_ref().is_some_and(|s| s.addrs.iter().any(|x| x.addr == a))
+}
+
+/// eth0 の inet6_dev の if_flags (rtnetlink の IFLA_INET6_FLAGS): IF_READY (0x80000000)、IF_RS_SENT (0x10)、IF_RA_RCVD (0x20)
+pub fn if_flags() -> u32 {
+    ST.get().as_ref().map_or(0x8000_0000, |s| 0x8000_0000 | if s.rs_sent { 0x10 } else { 0 } | if s.ra_rcvd { 0x20 } else { 0 })
 }
 
 pub fn hop_limit() -> u8 {
@@ -432,6 +440,7 @@ pub fn tick() -> Option<Vec<u8>> {
     let rs = if !st.ra_seen && now >= st.next_rs {
         st.next_rs = now + st.rs_gap;
         st.rs_gap = (st.rs_gap * 2).min(3_600_000);
+        st.rs_sent = true;
         Some(rs_frame(st.mac, st.addrs[0].addr))
     } else {
         None
@@ -505,6 +514,10 @@ fn ra(src: u128, m: &[u8]) {
     let now = ms();
     let Some(st) = ST.get().as_mut() else { return };
     st.ra_seen = true;
+    // ndisc_router_discovery: RS を出したあとに受けた RA
+    if st.rs_sent {
+        st.ra_rcvd = true;
+    }
     let cur_hop = m[4];
     let lifetime = u16::from_be_bytes([m[6], m[7]]) as u64;
     if cur_hop != 0 {

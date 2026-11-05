@@ -1064,6 +1064,21 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
 - 確かめかた (つづき): `test/ldiff.sh --root --net rtnl` (10.0.2.3 にはじめて送ったときの ARP と知らせ、dump と get の
   しくじり、ioctl と netlink で既定の道と 192.168.7.0/24 を消して足す知らせ、しくじりの errno。おわりに既定の道を
   もどす)。Linux 7.4-rc1 と 195 行同じ。10.0.2.3 にもう問い合わせた VM では、はじめの知らせがちがって見える
+- リンクの答え (rtnl_fill_ifinfo): Linux 7.4 の属性の並びと、lo と virtio-net の値 (NETNS_IMMUTABLE、ALLMULTI、GSO・GRO・
+  TSO の大きさ、MAX_PACING_OFFLOAD_HORIZON と 7.4 の PACING_OFFLOAD、CARRIER の数、HEADROOM (virtio-net の hdr の
+  12) と TAILROOM、PROTO_DOWN、XDP、PERM_ADDRESS、QDISC (noqueue と pfifo_fast)、AF_SPEC (IPv4 の conf と、IPv6 の
+  flags・cacheinfo・conf・統計・token・addr_gen_mode)、MAP、PARENT_DEV_NAME (virtioN: Linux と同じく DTB の順に装置の
+  あるものだけ数える virtio::linux_index) と BUS_NAME、中身のない DEVLINK_PORT と DPLL_PIN)。IPv6 の flags は
+  IF_READY、IF_RS_SENT、RS のあとに RA を受けたら IF_RA_RCVD (addrconf::if_flags)
+- マルチキャストの番地の一覧 (RTM_GETMULTICAST: ip maddr): AF_INET (in_dev_dump_ifmcaddr: どの口も 224.0.0.1)、AF_INET6
+  (inet6_dump_ifmcaddr: eth0 の番地ごとの solicited-node の組 (新しいものが先、users は同じ組の番地の数) と ff02::1、
+  ff01::1)、7.4 の PF_PACKET (dev_mc_dump: eth0 の 33:33:00:00:00:01、01:00:5e:00:00:01、solicited-node の MAC。
+  IFA_FLAGS の IFA_F_GLOBAL は 0)。どれも中身と DONE が 1 つのデータグラム、ヘッダーの prefixlen・flags・scope は
+  0 (PF_PACKET はいつも、ほかは strict のとき見る)、index があればその口だけ (NLM_F_DUMP_FILTERED)。aios は IGMP と
+  MLD をしないが、入っている組は Linux と同じ
+- 確かめかた: `test/ldiff.sh --net rtnllink` (lo と eth0 のリンクの属性をみな、値も (統計と時刻は長さだけ、virtioN の
+  番号と IF_RA_RCVD は見ない)、3 つの家族のマルチキャストと AF_UNSPEC の EOPNOTSUPP)。Linux 7.4-rc1 と 100 行同じ。
+  ctests にも
 - 確かめかた: `test/ldiff.sh --net route` (手本の Linux は ip=dhcp の virtio-net で、aios の VM と同じ 10.0.2.15/24 と
   ゲートウェイ 10.0.2.2。IPv6 のものは出さない)。dump (家族、strict の表えらび)、1 つの道 (19 の宛先と元と oif、
   fibmatch、strict のしくじり)、Firefox と同じ問いあわせで link up。Linux 7.4-rc1 と 232 行同じ。ldiff に --net を足した

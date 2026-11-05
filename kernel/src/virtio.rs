@@ -90,10 +90,8 @@ pub fn probe(device_id: u32, wanted: u64) -> Option<(Mmio, u64)> {
     probe_nth(device_id, wanted, 0)
 }
 
-/// device_id の装置の nth 番目 (0 から)。キーボードとタブレットのように、同じ種類がいくつもあるとき
-pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)> {
-    let mut seen = 0;
-    // DTB があればそこに書かれたもの (base, GIC の INTID)、なければ qemu virt の決まった場所
+/// virtio-mmio の口 (物理番地, GIC の INTID): DTB があればそこに書かれたもの、なければ qemu virt の決まった場所。番地の順
+fn slots() -> alloc::vec::Vec<(usize, u32)> {
     let mut slots = alloc::vec::Vec::new();
     if crate::dtb::present() {
         crate::dtb::each_virtio(|base, spi| slots.push((base as usize, 32 + spi)));
@@ -101,7 +99,26 @@ pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)>
     } else {
         slots.extend((0..MMIO_SLOTS).map(|i| (MMIO_BASE + i * MMIO_STRIDE, IRQ_BASE + i as u32)));
     }
-    for (pa, irq) in slots {
+    slots
+}
+
+/// Linux の virtio バスでのその装置の番号 (virtioN: rtnetlink の IFLA_PARENT_DEV_NAME): Linux は DTB の順 (番地の小さい
+/// もの) に口を見て、装置のある (DEVICE_ID が 0 でない) ものにだけ番号をつける。base は Mmio の base
+pub fn linux_index(base: usize) -> usize {
+    slots()
+        .into_iter()
+        .filter(|&(pa, _)| p2v(pa) < base)
+        .filter(|&(pa, _)| {
+            let m = Mmio { base: p2v(pa), irq: 0 };
+            m.rd(MAGIC) == 0x7472_6976 && m.rd(DEVICE_ID) != 0
+        })
+        .count()
+}
+
+/// device_id の装置の nth 番目 (0 から)。キーボードとタブレットのように、同じ種類がいくつもあるとき
+pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)> {
+    let mut seen = 0;
+    for (pa, irq) in slots() {
         let m = Mmio { base: p2v(pa), irq };
         if m.rd(MAGIC) != 0x7472_6976 || m.rd(DEVICE_ID) != device_id {
             continue;
