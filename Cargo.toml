@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
-exclude = ["user", "boot", "build", "desktop", "aimg"]
+exclude = ["user", "boot", "build", "desktop", "aimg", "kernel/vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,3 +14,7 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+
+# smoltcp は手で直せる写し (kernel/vendor/smoltcp)
+[patch.crates-io]
+smoltcp = { path = "kernel/vendor/smoltcp" }
