@@ -512,6 +512,12 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
     count(r)
 }
 
+/// 大きなロックなしの open (file::fast_open) の、表の stat が古いもの (open_lookup の答え: リンクはたどったもの) を、
+/// いまの inode のものに書きなおして (now_stat)。だめなら None
+pub fn open_now(p: &Proc, key: &[u8], st: Stat, base: Option<(usize, u64)>) -> Option<Stat> {
+    now_stat(p, key, true, st, false, base)
+}
+
 /// 表の答えの stat が古ければ (fresh でない: inode を書いたあと)、いまの stat を inode の覚えから読む (Linux の stat が
 /// dentry の先の inode から読むのと同じ)。まず ext4 の inode の覚え (metas) から、ディレクトリのロックなしで: 読んだあとで、
 /// 表の答えが書きなおされておらず、通ったところの版もいまも同じなら、名前はいまもその inode をさしている (inode を返す

@@ -309,6 +309,17 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         }
         crate::statc::Open::Found(st, plain, fresh, base) => (st, plain, fresh, base),
     };
+    // 読むだけの口で表の stat が古い (inode を書いたあと) なら、stat と同じく、いまの inode のものに書きなおす
+    // (statc::open_now)。書きなおさないと、新しく開く道がいつもうまくいって、だれも覚えなおさず、棚を見ない
+    // (同じファイルを開きなおすたびに新しく開き、閉じたものは棚をふさいでいた)
+    let (st, fresh) = if fresh || acc != O_RDONLY as u64 {
+        (st, fresh)
+    } else {
+        match crate::statc::open_now(me, &norm[..len], st, base) {
+            Some(now) => (now, true),
+            None => (st, false),
+        }
+    };
     // ここからふつうの道へ渡すものは、表の答えをいま確かめたもの (ふつうの道は覚えなおさない)
     let pass = |i: usize| {
         note(i);

@@ -80,6 +80,9 @@ static long shelf_hits(void) {
 static void reopen(const char *dir) {
   const char *p = name(0, dir, "reopen");
   int ok = put(p, "0123456789abcdef") == 0;
+  // 名前を覚えさせてから書きなおす (aios の statc の答えが古くなる: 書いたばかりのファイルの開きなおしも棚を通るか)
+  struct stat sb;
+  ok = ok && stat(p, &sb) == 0 && put(p, "0123456789abcdef") == 0;
   long h0 = shelf_hits();
   for (int k = 0; k < 200 && ok; k++) {
     int fd = open(p, O_RDONLY | (k % 2 ? O_CLOEXEC : 0));
