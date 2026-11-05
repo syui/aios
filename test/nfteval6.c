@@ -217,9 +217,9 @@ static int wait_slaac(void) {
     return 0;
 }
 
-// ping6 (raw の ICMPv6、echo reply と destination unreachable だけを受ける): 送りの答えと、2.5 秒のうちに来たもの
-// (aios の smoltcp は近所さがしの NS を 1 つ出すと、どのあて先にも 1 秒は出さないので、近所の表が切れたあとは
-// 2 つ目のあて先の答えが 1 秒おくれる)
+// ping6 (raw の ICMPv6、echo reply と destination unreachable だけを受ける): 送りの答えと、1 秒のうちに来たもの
+// (前は 2.5 秒: aios の smoltcp が近所さがしの NS を 1 つ出すと、どのあて先にも 1 秒は出さず、近所の表が切れたあとは
+// 2 つ目のあて先の答えが 1 秒おくれた。いまはあて先ごと: kernel/vendor/smoltcp/AIOS.md)
 static void ping_probe(const char *to, unsigned scope) {
     int s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
     struct icmp6_filter f;
@@ -233,7 +233,7 @@ static void ping_probe(const char *to, unsigned scope) {
     long r = sendto(s, pkt, sizeof pkt, 0, (void *)&a, sizeof a);
     printf("ping %s: send %s", to, r == sizeof pkt ? "ok" : ename(errno));
     struct pollfd pf = {s, POLLIN, 0};
-    if (poll(&pf, 1, 2500) > 0) {
+    if (poll(&pf, 1, 1000) > 0) {
         unsigned char b[256];
         struct sockaddr_in6 from;
         socklen_t fl = sizeof from;

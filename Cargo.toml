@@ -15,6 +15,6 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-# smoltcp は手で直せる写し (kernel/vendor/smoltcp)
+# smoltcp は近所さがしを直した写し (kernel/vendor/smoltcp/AIOS.md)
 [patch.crates-io]
 smoltcp = { path = "kernel/vendor/smoltcp" }

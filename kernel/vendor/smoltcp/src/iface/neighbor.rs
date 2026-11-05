@@ -45,7 +45,10 @@ impl Answer {
 #[derive(Debug)]
 pub struct Cache {
     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
-    silent_until: Instant,
+    /// aios: per-address time until which no new discovery request is sent (Linux's per-neighbour retrans_time).
+    /// Upstream keeps a single `silent_until` for the whole cache, so one request silences every other address
+    /// for a second, and a socket that keeps retrying one unreachable address starves all the others.
+    silent_until: LinearMap<IpAddress, Instant, IFACE_NEIGHBOR_CACHE_COUNT>,
 }
 
 impl Cache {
@@ -59,7 +62,7 @@ impl Cache {
     pub fn new() -> Self {
         Self {
             storage: LinearMap::new(),
-            silent_until: Instant::from_millis(0),
+            silent_until: LinearMap::new(),
         }
     }
 
@@ -160,15 +163,26 @@ impl Cache {
             }
         }
 
-        if timestamp < self.silent_until {
-            Answer::RateLimited
-        } else {
-            Answer::NotFound
+        match self.silent_until.get(protocol_addr) {
+            Some(&until) if timestamp < until => Answer::RateLimited,
+            _ => Answer::NotFound,
         }
     }
 
-    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
-        self.silent_until = timestamp + Self::SILENT_TIME;
+    /// aios: a discovery request for `protocol_addr` was sent; silence only that address.
+    pub(crate) fn limit_rate(&mut self, protocol_addr: IpAddress, timestamp: Instant) {
+        let until = timestamp + Self::SILENT_TIME;
+        if let Err((addr, until)) = self.silent_until.insert(protocol_addr, until) {
+            // Full: forget the address whose silence ends first (usually one already past).
+            let oldest = *self
+                .silent_until
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .expect("empty silence map")
+                .0;
+            self.silent_until.remove(&oldest);
+            let _ = self.silent_until.insert(addr, until);
+        }
     }
 
     pub(crate) fn flush(&mut self) {
@@ -291,10 +305,15 @@ mod test {
             Answer::NotFound
         );
 
-        cache.limit_rate(Instant::from_millis(0));
+        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(0));
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(100)),
             Answer::RateLimited
+        );
+        // aios: other addresses are not silenced
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(100)),
+            Answer::NotFound
         );
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(2000)),

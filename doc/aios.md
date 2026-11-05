@@ -1127,8 +1127,15 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
     ipv6_route (refcnt はいつも 1)、/proc/sys/net/ipv6/conf/{all,default,lo,eth0}/ のいくつか (読むだけ) と
     net/ipv4/ping_group_range
 - ファイアウォール (段階 2d): eth0 の IPv6 のフレームも決まりを通る (上の「ファイアウォール (nftables)」の IPv6)
-- smoltcp の近所さがしは、NS を 1 つ出すと、どのあて先にも 1 秒は出さない (近所の表は 60 秒で切れる)。Linux はあて先
-  ごと。表が切れたあとに 2 つのあて先へ続けて送ると、2 つ目が 1 秒おくれる (todo の smoltcp-nd-silence)
+- 近所さがし (ARP と NS) のだまる時間 (1 秒) はあて先ごと (Linux の neighbour ごとの retrans_time)。smoltcp 0.12 (0.14 も)
+  は表全体で 1 つで、1 つ問い合わせると、どのあて先にも 1 秒は問い合わせず、答えのないあて先を問い合わせなおすたびに
+  またそうなるので、ほかのあて先はいつまでも問い合わせてもらえなかった (IPv4 の 2 つ目と IPv6 がみな止まった)。smoltcp は
+  写し (kernel/vendor/smoltcp、ルートの Cargo.toml の [patch.crates-io]) で直した: 変えたところは
+  kernel/vendor/smoltcp/AIOS.md。test/ndsilence.c (ldiff --net、ctests にも) が 10.0.2.200/.201 と fec0::200/::201 へ
+  別々のソケットで続けて送り、0.3 秒あとに 4 つとも INCOMPLETE (Linux 7.4-rc1 と 3 行同じ)。nfteval6 の ping6 の待ちも
+  2.5 秒から 1 秒にもどした。まだ: 3 度問い合わせて答えがなければ FAILED にして、待っているパケットを捨て、送った
+  ソケットに EHOSTUNREACH (Linux。smoltcp は 1 秒ごとに問い合わせつづけ、そのソケットのうしろのパケットも出ない:
+  todo の neigh-failed)
 - conntrack (段階 2e): IPv6 も (上の「ファイアウォール (nftables)」の IPv6)
 - netlink で変える (段階 2f: inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ:
   - ip -6 addr add: eth0 の番地 (DAD はしない: nodad と同じ)、IFA_FLAGS (NODAD、NOPREFIXROUTE、MANAGETEMPADDR など)、
