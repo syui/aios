@@ -202,6 +202,9 @@ case "$1" in
       ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
       sha=$(git rev-parse HEAD)
     fi
+    # タグをつけるコミットが ai/os にないと、リリースを作れない (404)。前の latest を消すまえに見る (消してから
+    # しくじると latest がなくなる。syui が ai/os にじかにコミットして main がずれ、gitea.sh os がしくじったときなど)
+    call "$api/git/commits/$sha" > /dev/null 2>&1 || { echo "ai/os: $sha is not in ai/os (push main first: bin/gitea.sh os); the release $tag is left as is" >&2; exit 1; }
     # 前の latest (リリースとタグ) を消す。前の名前の unix-latest がのこっていれば、それも
     for t in $tag unix-latest; do
       old=$(call "$api/releases/tags/$t" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
