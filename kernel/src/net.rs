@@ -552,7 +552,8 @@ fn set_addrs(iface: &mut Interface, eth: Option<Ipv4Cidr>) {
     let first = eth.map(|c| (u32::from_be_bytes(c.address().octets()), c.prefix_len())).or(extra.first().map(|x| (x.addr, x.prefix)));
     ETH_ADDR.store(first.map_or(0, |x| x.0), Ordering::Relaxed);
     ETH_PREFIX.store(first.map_or(0, |x| x.1 as u32), Ordering::Relaxed);
-    let v6 = crate::addrconf::addrs();
+    // DAD のとちゅうの番地は渡さない (smoltcp がその NS に答えたり、そこあてを受けたりしないように)
+    let v6 = crate::addrconf::usable_addrs();
     iface.update_ip_addrs(|a| {
         a.clear();
         if let Some(c) = eth {
@@ -815,13 +816,12 @@ pub fn chan() -> usize {
 /// パケットを出し入れし、待っている人を起こす。タイマ、割り込み、システムコールから呼ぶ
 pub fn poll() {
     let Some(n) = get() else { return };
-    // IPv6: RS を出す、lifetime の切れたものを捨てる、変わったものを smoltcp に
-    if let Some(mut rs) = crate::addrconf::tick()
-        && n.dev.virtio.can_send()
-        && n.dev.filter_out(&mut rs, false)
-    {
-        count(false, false, rs.len());
-        n.dev.virtio.send(rs.len(), |b| b.copy_from_slice(&rs));
+    // IPv6: DAD の NS と RS を出す、lifetime の切れたものを捨てる、変わったものを smoltcp に
+    for mut f in crate::addrconf::tick() {
+        if n.dev.virtio.can_send() && n.dev.filter_out(&mut f, false) {
+            count(false, false, f.len());
+            n.dev.virtio.send(f.len(), |b| b.copy_from_slice(&f));
+        }
     }
     sync6(n);
     let mut changed = n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;

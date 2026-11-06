@@ -7,7 +7,12 @@
 //     RTAX_HOPLIMIT に、router lifetime があれば既定の道 (proto ra、metric 1024、expires)、MTU、prefix (L なら
 //     その prefix の道 (proto kernel、metric 256、expires)、A で 64 ビットなら SLAAC の番地: prefix + EUI-64、
 //     IFAPROT_KERNEL_RA、IFA_F_MANAGETEMPADDR、preferred と valid の lifetime)。SLLA は近所の表へ (netlink.rs)
-//   - DAD と MLD はしない (QEMU のユーザーネットワークでは同じ番地の人はいない。Linux は 1 秒 tentative で待つ)
+//   - DAD (addrconf_dad_start / addrconf_dad_work / addrconf_dad_completed): 新しい番地 (link-local、SLAAC、nodad でない
+//     ip -6 addr add) は IFA_F_TENTATIVE で、0〜1 秒 (rtr_solicit_delay) 待って NS を 1 つ (dad_transmits: 送り元 ::、
+//     あて先は solicited-node マルチキャスト、nonce つき: enhanced_dad)、1 秒 (RetransTimer) 答えがなければ tentative を
+//     はずす。そのあいだは送り元にえらばず、自分のものとして受けず (bind は EADDRNOTAVAIL)、smoltcp にも渡さない。その
+//     番地の NA か、ほかの人 (nonce のちがう) の DAD の NS が来たら IFA_F_DADFAILED。RS は link-local の DAD のあとで
+//   - MLD はしない (QEMU のユーザーネットワークではだれも聞いていない)
 //   - netlink で足す番地と道 (ip -6 addr add / route add: netlink.rs): 番地には prefix の道 (proto kernel、metric 256。
 //     同じ prefix の番地がなくなれば消す)、道はゲートウェイを通るもの (smoltcp の道の表に)
 // smoltcp には、ここの番地と既定のルーターを net.rs が渡す (近所さがし (NS/NA) と echo の答えは smoltcp がする)
@@ -17,6 +22,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const IFA_F_MANAGETEMPADDR: u32 = 0x100;
 pub const IFA_F_PERMANENT: u32 = 0x80;
+pub const IFA_F_TENTATIVE: u32 = 0x40;
+const IFA_F_DADFAILED: u32 = 0x08;
+const IFA_F_NODAD: u32 = 0x02;
+/// RetransTimer (近所さがしの問い合わせの間、ミリ秒) と、はじめの NS の前に待つ上限 (rtr_solicit_delay)
+const RETRANS_MS: u64 = 1000;
+const DAD_DELAY_MS: u32 = 1000;
 const IFAPROT_KERNEL_LL: u8 = 3;
 const IFAPROT_KERNEL_RA: u8 = 2;
 /// 道の proto (RTPROT_KERNEL、RTPROT_RA)
@@ -36,6 +47,26 @@ pub struct Addr {
     /// 作った時刻と、さいごに変えた時刻 (ミリ秒)
     pub created: u64,
     pub updated: u64,
+    /// DAD のとちゅう: 次にすること (NS を送るか、終える) の時刻と、のこりの NS の数。nonce は NS にのせる 6 バイト
+    dad: Option<(u64, u8)>,
+    nonce: u64,
+}
+
+impl Addr {
+    /// 使える番地か (DAD がおわって、しくじっていない)
+    pub fn usable(&self) -> bool {
+        self.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED) == 0
+    }
+}
+
+/// 新しい番地の DAD をはじめる (addrconf_dad_kick): 0〜1 秒あとにはじめの NS
+fn dad_start(now: u64) -> (Option<(u64, u8)>, u64) {
+    let delay = (crate::rand::u32() % DAD_DELAY_MS) as u64;
+    let mut nonce = 0;
+    while nonce == 0 {
+        nonce = crate::rand::u64() & 0xffff_ffff_ffff;
+    }
+    (Some((now + delay, 1)), nonce)
 }
 
 /// eth0 の IPv6 の道 (表 254)
@@ -129,19 +160,26 @@ fn eui64(mac: [u8; 6]) -> u128 {
 pub fn init(mac: [u8; 6]) {
     let now = ms();
     let ll = 0xfe80u128 << 112 | eui64(mac);
-    let a = Addr { addr: ll, prefix: 64, flags: IFA_F_PERMANENT, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now };
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: now, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
+    let (dad, nonce) = dad_start(now);
+    let a = Addr { addr: ll, prefix: 64, flags: IFA_F_PERMANENT | IFA_F_TENTATIVE, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce };
+    // RS は link-local の DAD がおわってから (next_rs はそのときに)
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: u64::MAX, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
     changed();
 }
 
-/// eth0 の IPv6 の番地 (link-local が先)
+/// eth0 の IPv6 の番地 (link-local が先。DAD のとちゅうのものも)
 pub fn addrs() -> Vec<Addr> {
     ST.get().as_ref().map_or(Vec::new(), |s| s.addrs.clone())
 }
 
-/// eth0 の番地か
+/// eth0 の使える番地 (DAD のとちゅうとしくじったものをのぞく: smoltcp に渡すもの、local の道)
+pub fn usable_addrs() -> Vec<Addr> {
+    ST.get().as_ref().map_or(Vec::new(), |s| s.addrs.iter().filter(|x| x.usable()).cloned().collect())
+}
+
+/// eth0 の (使える) 番地か: DAD のとちゅうの番地あては受けず、bind もできない (ipv6_chk_addr の IFA_F_TENTATIVE)
 pub fn is_mine(a: u128) -> bool {
-    a != 0 && ST.get().as_ref().is_some_and(|s| s.addrs.iter().any(|x| x.addr == a))
+    a != 0 && ST.get().as_ref().is_some_and(|s| s.addrs.iter().any(|x| x.addr == a && x.usable()))
 }
 
 /// eth0 の inet6_dev の if_flags (rtnetlink の IFLA_INET6_FLAGS): IF_READY (0x80000000)、IF_RS_SENT (0x10)、IF_RA_RCVD (0x20)
@@ -273,6 +311,7 @@ pub fn source_for(dst: u128) -> Option<u128> {
     let ds = rfc_scope(dst);
     s.addrs
         .iter()
+        .filter(|a| a.usable())
         .max_by_key(|a| {
             let sc = rfc_scope(a.addr);
             let r2 = if sc >= ds { (1, -sc) } else { (0, sc) };
@@ -296,8 +335,8 @@ pub fn find(a: u128) -> Option<Addr> {
 pub const IFA_USER_FLAGS: u32 = 0x02 | 0x10 | 0x100 | 0x200 | 0x400 | 0x04;
 const IFA_F_NOPREFIXROUTE: u32 = 0x200;
 
-/// ip -6 addr add (inet6_addr_add): 番地 (DAD はしない: Linux の nodad と同じ) と、prefix の道がなければ作る。
-/// valid がいつまでもなら IFA_F_PERMANENT。作った prefix の道があれば true
+/// ip -6 addr add (inet6_addr_add): 番地 (nodad でなければ DAD をして、おわるまで tentative) と、prefix の道がなければ
+/// 作る。valid がいつまでもなら IFA_F_PERMANENT。作った prefix の道があれば true
 pub fn add_addr(addr: u128, plen: u8, flags: u32, preferred: u32, valid: u32, proto: u8) -> bool {
     let now = ms();
     let Some(st) = ST.get().as_mut() else { return false };
@@ -305,7 +344,11 @@ pub fn add_addr(addr: u128, plen: u8, flags: u32, preferred: u32, valid: u32, pr
     if valid == u32::MAX {
         fl |= IFA_F_PERMANENT;
     }
-    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now });
+    let (dad, nonce) = if fl & IFA_F_NODAD == 0 { dad_start(now) } else { (None, 0) };
+    if dad.is_some() {
+        fl |= IFA_F_TENTATIVE;
+    }
+    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now, dad, nonce });
     let made = prefix_route(st, addr, plen, fl, until(now, valid));
     changed();
     made
@@ -339,6 +382,7 @@ pub fn modify_addr(addr: u128, flags: u32, preferred: u32, valid: u32) {
     let Some(st) = ST.get().as_mut() else { return };
     let Some(a) = st.addrs.iter_mut().find(|x| x.addr == addr) else { return };
     let mut fl = (a.flags & !IFA_USER_FLAGS & !IFA_F_PERMANENT) | (flags & IFA_USER_FLAGS);
+    // tentative と dadfailed はそのまま (IFA_USER_FLAGS の外)
     if valid == u32::MAX {
         fl |= IFA_F_PERMANENT;
     }
@@ -419,11 +463,31 @@ fn common_bits(a: u128, b: u128) -> u32 {
     (a ^ b).leading_zeros()
 }
 
-/// 時間で変わるもの (net::poll から): lifetime の切れた番地・prefix・ルーター、送る RS (Ethernet のフレーム)
-pub fn tick() -> Option<Vec<u8>> {
+/// 時間で変わるもの (net::poll から): lifetime の切れた番地・prefix・ルーター、DAD (NS を送る、おえる)、送る RS。
+/// 送るもの (Ethernet のフレーム) を返す
+pub fn tick() -> Vec<Vec<u8>> {
     let now = ms();
-    let st = ST.get().as_mut()?;
+    let Some(st) = ST.get().as_mut() else { return Vec::new() };
+    let mut out = Vec::new();
     let mut ch = false;
+    for a in st.addrs.iter_mut() {
+        let Some((at, left)) = a.dad else { continue };
+        if at > now {
+            continue;
+        }
+        if left > 0 {
+            out.push(dad_ns_frame(st.mac, a.addr, a.nonce));
+            a.dad = Some((now + RETRANS_MS, left - 1));
+        } else {
+            // addrconf_dad_completed: 使えるように。link-local なら RS を
+            a.dad = None;
+            a.flags &= !IFA_F_TENTATIVE;
+            if is_link_local(a.addr) {
+                st.next_rs = now;
+            }
+            ch = true;
+        }
+    }
     let before = st.addrs.len();
     st.addrs.retain(|a| a.valid.is_none_or(|t| t > now));
     ch |= st.addrs.len() != before;
@@ -437,18 +501,18 @@ pub fn tick() -> Option<Vec<u8>> {
         st.router = None;
         ch = true;
     }
-    let rs = if !st.ra_seen && now >= st.next_rs {
+    if !st.ra_seen && now >= st.next_rs
+        && let Some(ll) = st.addrs.iter().find(|a| is_link_local(a.addr) && a.usable())
+    {
         st.next_rs = now + st.rs_gap;
         st.rs_gap = (st.rs_gap * 2).min(3_600_000);
         st.rs_sent = true;
-        Some(rs_frame(st.mac, st.addrs[0].addr))
-    } else {
-        None
-    };
+        out.push(rs_frame(st.mac, ll.addr));
+    }
     if ch {
         changed();
     }
-    rs
+    out
 }
 
 /// ICMPv6 のチェックサム (送り元とあて先の擬似ヘッダーと、中身)
@@ -483,6 +547,19 @@ fn nd_frame(mac: [u8; 6], dmac: [u8; 6], src: u128, dst: u128, mut icmp: Vec<u8>
     f
 }
 
+/// DAD の NS (ndisc_send_ns): 送り元 ::、あて先はその番地の solicited-node マルチキャスト (ff02::1:ffXX:XXXX)、
+/// SLLA なし、nonce (6 バイト) つき
+fn dad_ns_frame(mac: [u8; 6], target: u128, nonce: u64) -> Vec<u8> {
+    let mut icmp = alloc::vec![135, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&target.to_be_bytes());
+    icmp.extend_from_slice(&[14, 1]);
+    icmp.extend_from_slice(&nonce.to_be_bytes()[2..]);
+    let low = target as u32 & 0xff_ffff;
+    let dst = 0xff02u128 << 112 | 1 << 32 | 0xff00_0000 | low as u128;
+    let dmac = [0x33, 0x33, 0xff, (low >> 16) as u8, (low >> 8) as u8, low as u8];
+    nd_frame(mac, dmac, 0, dst, icmp)
+}
+
 /// RS (ndisc_send_rs): ff02::2 へ、SLLA つき
 fn rs_frame(mac: [u8; 6], ll: u128) -> Vec<u8> {
     let mut icmp = alloc::vec![133, 0, 0, 0, 0, 0, 0, 0, 1, 1];
@@ -503,10 +580,44 @@ pub fn rx(f: &[u8]) {
     let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
     let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
     let icmp = &ip[40..40 + plen];
-    if icmp[0] != 134 || icmp[1] != 0 || !is_link_local(src) || icmp6_sum(src, dst, icmp) != 0 {
+    if icmp[1] != 0 || icmp6_sum(src, dst, icmp) != 0 {
         return;
     }
-    ra(src, icmp);
+    match icmp[0] {
+        134 if is_link_local(src) => ra(src, icmp),
+        135 | 136 if icmp.len() >= 24 => dad_check(icmp[0], src, &f[6..12], icmp),
+        _ => {}
+    }
+}
+
+/// DAD のとちゅうの番地への NA (ほかの人がもう使っている) か、ほかの人の DAD の NS (送り元 ::、nonce が自分のもので
+/// ない: ndisc_recv_ns) が来たら、しくじり (addrconf_dad_failure: IFA_F_DADFAILED、tentative のまま)
+fn dad_check(ty: u8, src: u128, smac: &[u8], m: &[u8]) {
+    let target = u128::from_be_bytes(m[8..24].try_into().unwrap());
+    let Some(st) = ST.get().as_mut() else { return };
+    let Some(a) = st.addrs.iter_mut().find(|a| a.addr == target && a.dad.is_some()) else { return };
+    if ty == 135 {
+        if src != 0 {
+            return;
+        }
+        // 自分の NS が返ってきたもの (nonce が同じ) は見ない
+        let mut opts = &m[24..];
+        while opts.len() >= 8 {
+            let len = opts[1] as usize * 8;
+            if len == 0 || len > opts.len() {
+                break;
+            }
+            if opts[0] == 14 && len == 8 && opts[2..8] == a.nonce.to_be_bytes()[2..] {
+                return;
+            }
+            opts = &opts[len..];
+        }
+    }
+    a.dad = None;
+    a.flags |= IFA_F_DADFAILED;
+    let mac = alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", smac[0], smac[1], smac[2], smac[3], smac[4], smac[5]);
+    crate::kmsg::push(&alloc::format!("IPv6: eth0: IPv6 duplicate address {} used by {} detected!\n", smoltcp::wire::Ipv6Address::from_bits(target), mac));
+    changed();
 }
 
 /// RA を読む (ndisc_router_discovery と addrconf_prefix_rcv)
@@ -589,16 +700,21 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) {
                 a.preferred = Some(life(pref));
                 a.updated = now;
             }
-            None if valid != 0 => st.addrs.push(Addr {
-                addr,
-                prefix: 64,
-                flags: IFA_F_MANAGETEMPADDR,
-                proto: IFAPROT_KERNEL_RA,
-                valid: Some(life(valid)),
-                preferred: Some(life(pref)),
-                created: now,
-                updated: now,
-            }),
+            None if valid != 0 => {
+                let (dad, nonce) = dad_start(now);
+                st.addrs.push(Addr {
+                    addr,
+                    prefix: 64,
+                    flags: IFA_F_MANAGETEMPADDR | IFA_F_TENTATIVE,
+                    proto: IFAPROT_KERNEL_RA,
+                    valid: Some(life(valid)),
+                    preferred: Some(life(pref)),
+                    created: now,
+                    updated: now,
+                    dad,
+                    nonce,
+                })
+            }
             None => {}
         }
     }

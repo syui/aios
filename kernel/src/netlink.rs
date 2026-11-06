@@ -368,8 +368,8 @@ pub fn notify(group: u32, msg: Vec<u8>) {
     }
 }
 
-/// 受ける行列に入れて起こす (入れ物があふれたら捨てる: Linux は ENOBUFS を次に返す)。group は multicast の組の
-/// ビット (recvmsg の nl_groups)
+/// 受ける行列に入れて起こす (読んで待つ人と、poll / epoll で待つ人。入れ物があふれたら捨てる: Linux は ENOBUFS を
+/// 次に返す)。group は multicast の組のビット (recvmsg の nl_groups)
 fn deliver(n: &NetlinkRef, from: u32, group: u32, d: Vec<u8>) {
     {
         let mut s = n.borrow_mut();
@@ -381,6 +381,9 @@ fn deliver(n: &NetlinkRef, from: u32, group: u32, d: Vec<u8>) {
         s.generation += 1;
     }
     proc::wakeup(chan(n));
+    // poll で眠る人は poll の場所で眠る (送ったときにもうあった答えは読めたが、タイマーの net::poll から来る知らせ
+    // (DAD のおわりなど) では poll が時間切れまで起きなかった)
+    proc::poll_wake(chan(n));
 }
 
 /// 受けたもの: 入れ物に入れるバイト、返す長さ、msg_flags、送ったものの名前 (sockaddr_nl)
@@ -2639,7 +2642,8 @@ fn addr6_of(a: &crate::addrconf::Addr) -> Addr6 {
 
 // ---- IPv6 の番地と道を変える (inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ ----
 //
-// 番地は eth0 のものだけ (lo は ::1 だけで EOPNOTSUPP)。DAD はしない (Linux の nodad と同じ: tentative にならない)。
+// 番地は eth0 のものだけ (lo は ::1 だけで EOPNOTSUPP)。nodad でなければ DAD のあいだ tentative で、local の道は
+// DAD がおわってから (addrconf の tick → changed6 で RTM_NEWADDR と local の道を知らせる)。
 // 道はゲートウェイを通る unicast だけ (口だけの道、blackhole などは EOPNOTSUPP: IPv4 と同じく aios のできないこと)
 
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
@@ -2734,8 +2738,10 @@ fn new_addr6(body: &[u8], nlflags: u16) -> i64 {
     }
     if let Some(x) = crate::addrconf::find(pfx) {
         ev_addr6(&addr6_of(&x), RTM_NEWADDR);
+        if x.usable() {
+            ev_route6(&local_route6(pfx), RTM_NEWROUTE);
+        }
     }
-    ev_route6(&local_route6(pfx), RTM_NEWROUTE);
     snapshot6();
     0
 }
@@ -2759,7 +2765,10 @@ fn del_addr6(body: &[u8]) -> i64 {
     let pr = prefix_route6(pfx, plen);
     let Some((a, gone)) = crate::addrconf::del_addr(pfx, plen) else { return -99 };
     ev_addr6(&addr6_of(&a), RTM_DELADDR);
-    ev_route6(&local_route6(pfx), RTM_DELROUTE);
+    // local の道は DAD がおわったものにだけある
+    if a.usable() {
+        ev_route6(&local_route6(pfx), RTM_DELROUTE);
+    }
     if gone && let Some(r) = pr {
         ev_route6(&r, RTM_DELROUTE);
     }
@@ -2873,8 +2882,9 @@ pub fn changed6() {
     };
     let addrs = addrs6();
     let routes = routes6();
-    // なくなったもの: 前の番地と道は、いまの表にないので形だけ作る
-    for &(addr, prefix, flags, proto) in oa.iter().filter(|x| !na.contains(x)) {
+    // なくなったもの: 前の番地と道は、いまの表にないので形だけ作る。flags だけ変わったもの (DAD がおわった、
+    // しくじった) は消えていない (下の RTM_NEWADDR だけ)
+    for &(addr, prefix, flags, proto) in oa.iter().filter(|x| !na.contains(x) && !na.iter().any(|y| y.0 == x.0 && y.1 == x.1)) {
         let a = Addr6 { index: ETH_INDEX, addr, prefix, scope: crate::addrconf::rt_scope(addr), flags, proto, preferred: 0, valid: 0, cstamp: 0, tstamp: 0 };
         ev_addr6(&a, RTM_DELADDR);
     }
@@ -2963,7 +2973,7 @@ pub fn routes6() -> Vec<Route6> {
     for r in crate::addrconf::routes() {
         v.push(Route6 { dst: r.dst, len: r.len, gw: r.gw, metric: r.metric, proto: r.proto, typ: r.typ, oif: ETH_INDEX, expires: r.expires, hoplimit: r.hoplimit, prefsrc: 0, rtf: r.flags });
     }
-    for a in crate::addrconf::addrs() {
+    for a in crate::addrconf::usable_addrs() {
         v.push(local(a.addr, ETH_INDEX));
     }
     v

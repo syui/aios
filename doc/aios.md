@@ -1263,7 +1263,16 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
     (L はその道 (proto kernel、metric 256、expires)、A で /64 なら SLAAC の番地: prefix + EUI-64、IFA_F_MANAGETEMPADDR、
     IFA_PROTO 2、preferred と valid の lifetime。切れたら消す)、SLLA は近くの番地の表へ (ルーター)。QEMU の
     ユーザーネットワークでは fec0::5054:ff:fe12:3456/64 (fec0::/10 は site-local: scope 200、if_inet6 の 40)
-  - DAD と MLD はしない (Linux は DAD のあいだ 1 秒 tentative)
+  - DAD (重複アドレス検出: addrconf_dad_start / addrconf_dad_work / addrconf_dad_completed): 新しい番地 (link-local、
+    SLAAC、nodad でない ip -6 addr add) は IFA_F_TENTATIVE で、0〜1 秒 (rtr_solicit_delay) 待って NS を 1 つ
+    (dad_transmits。送り元 ::、あて先は solicited-node マルチキャスト、nonce つき: enhanced_dad)、1 秒 (RetransTimer)
+    答えがなければ tentative をはずして RTM_NEWADDR と local の道の RTM_NEWROUTE を知らせる。そのあいだは送り元に
+    えらばず、そこあては受けず (bind は EADDRNOTAVAIL)、local の道もない (tentative のまま消せば RTM_DELADDR だけ)。
+    その番地への NA か、ほかの人 (nonce のちがう) の DAD の NS が来たら IFA_F_DADFAILED (kmsg に duplicate address)。
+    RS は link-local の DAD がおわってから。`test/ldiff.sh --root --net dad6` で手本の Linux 7.4-rc1 と 40 行同じ
+    (このとき見つけた: netlink の知らせが poll / epoll で待つ人を起こしていなかった。タイマーの中から来る知らせ (DAD の
+    おわり) では poll が時間切れまで起きなかったので、deliver で poll_wake も)
+  - MLD はしない (QEMU のユーザーネットワークではだれも聞いていない)
   - 送り元のえらびかた (ipv6_dev_get_saddr のうち scope と deprecated と prefix の長さ)、道のさがしかた (長い prefix、
     metric)。自分の番地へは lo (IPv4 と同じく相手の行列へじかに)、ほかは smoltcp。link-local は scope id がいり
     (なければ EINVAL、eth0 でなければ ENETUNREACH)、名前の scope id は eth0 (aios の口は 1 つ)
@@ -1302,7 +1311,7 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   (Linux は待っていたものをみな捨てる)
 - conntrack (段階 2e): IPv6 も (上の「ファイアウォール (nftables)」の IPv6)
 - netlink で変える (段階 2f: inet6_rtm_newaddr / deladdr、inet6_rtm_newroute / delroute) と知らせ:
-  - ip -6 addr add: eth0 の番地 (DAD はしない: nodad と同じ)、IFA_FLAGS (NODAD、NOPREFIXROUTE、MANAGETEMPADDR など)、
+  - ip -6 addr add: eth0 の番地 (nodad でなければ DAD のあいだ tentative)、IFA_FLAGS (NODAD、NOPREFIXROUTE、MANAGETEMPADDR など)、
     IFA_CACHEINFO の lifetime (valid がいつまでもなら IFA_F_PERMANENT)、IFA_PROTO。prefix の道 (proto kernel、metric 256、
     lifetime があれば expires) を作る。NLM_F_CREATE がなくても作り、もうあれば NLM_F_EXCL か REPLACE なしで EEXIST、
     REPLACE なら flags と lifetime を変える。prefix が 128 より長いと EINVAL、口がなければ ENODEV、::、::1、
@@ -1327,7 +1336,7 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   まで、ICMP は 520)、名前は送ったあて先、付帯データは IPV6_PKTINFO (たのんでいれば: その ICMPv6 のあて先と口) と
   SOL_IPV6 / IPV6_RECVERR (sock_extended_err、origin は SO_EE_ORIGIN_ICMP6、知らせてきた番地)。RECVERR を切ると行列は
   捨てる。`test/ldiff.sh recverr6` (v6 と v4) で手本の Linux 7.4-rc1 と 120 行同じ
-- まだ: DAD、MLD、packet too big (PMTU)、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
+- まだ: MLD、packet too big (PMTU)、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
