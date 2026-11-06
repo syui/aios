@@ -713,7 +713,7 @@ pub fn check(root: &Path, names: &[String]) -> Result<(Vec<Vuln>, String), Strin
             Err(e) => notes.push(e),
         }
     }
-    let npm: Vec<(String, String)> = hand_list(root, "npm").into_iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
+    let npm: Vec<(String, String)> = crate::up::npm_installed(root).into_iter().filter(|(n, _)| names.is_empty() || names.contains(n)).collect();
     if !npm.is_empty() {
         match npm_audit(root, &npm) {
             Ok((ans, n)) => {

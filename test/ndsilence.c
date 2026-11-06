@@ -4,12 +4,12 @@
 //   .200 はつないだ UDP、.201 は TCP の connect (待たない)、.202 は raw の ICMP の echo (ping)
 // - 0.3 秒あと、近くの番地の表 (RTM_GETNEIGH) で .200 と .201 が両方 INCOMPLETE (Linux はあて先ごとに問い合わせる。
 //   smoltcp 0.12 は 1 つ問い合わせると、どのあて先にも 1 秒は問い合わせず、1 つ目を問い合わせなおすたびにまただまるので、
-//   ほかはいつまでも問い合わせてもらえなかった: todo の smoltcp-nd-silence)
+//   ほかはいつまでも問い合わせてもらえなかった: a828f8c)
 // - 3 度 (1 秒ごと) 問い合わせて答えがなければ FAILED にして、待っていたパケットを捨て、自分から自分へ「たどりつけない」
 //   (ICMP の host unreachable、ICMPv6 の address unreachable) を返す (neigh_invalidate → ipv4_link_failure /
 //   ip6_link_failure)。TCP の connect は 3 秒ほどで EHOSTUNREACH、raw のソケット (ping) はその ICMP を受け、つないだ
 //   UDP は EHOSTUNREACH、5 秒あとの表は FAILED (smoltcp は問い合わせつづけ、パケットはソケットの列の先にのこっていた:
-//   todo の neigh-failed)
+//   450d818)
 // 出すだけのテスト (root で: raw のソケット): 手本の Linux は ip=dhcp の virtio-net (test/ldiff.sh --root --net ndsilence)
 //   aios の中で: sudo ./ndsilence      aarch64-linux-gnu-gcc -O2 -static -o ndsilence test/ndsilence.c
 #define _GNU_SOURCE

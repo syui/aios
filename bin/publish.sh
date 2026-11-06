@@ -2,7 +2,7 @@
 # main に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
 #   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース latest
 #      (タイトル aios) に置くのを待ち、git.syui.ai の ai/os の latest にも同じものを置く (bin/gitea.sh mirror)。
-#      CI が動かないコミット (paths-ignore: ドキュメント、pkg.json など) なら、CI の走った一番新しいコミットのうち、
+#      CI が動かないコミット (paths-ignore: ドキュメント、todo.json など) なら、CI の走った一番新しいコミットのうち、
 #      そこから HEAD までに CI が見るファイルが変わっていないものの run を待って使う (まだ走っていても)。
 #      ai/os の latest がもうそのコミットのものなら置きなおさない
 #   2. base / aikernel / aiboot のうち、ai/repo にある版 (0.0.1.rN.gSHA) のあとでソースが変わったものを作って確かめ、
@@ -48,7 +48,7 @@ done
 rsha=$sha
 if [ -z "$run" ]; then
   # paths-ignore で動かないのか、GitHub が動かさなかった (遅れている) だけか。main の run を新しい順に見て、HEAD の祖先で
-  # そこから CI が見るものが変わっていない一番新しいものを使う (pkg.json だけのコミットの前のコミットの CI がまだ走って
+  # そこから CI が見るものが変わっていない一番新しいものを使う (todo.json だけのコミットの前のコミットの CI がまだ走って
   # いれば、それを待つ)。なければ、ディスクの起動を確かめていないので、パッケージも送らずに止まる
   runs=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&per_page=30" | json '"\n".join(str(r["id"]) + " " + r["head_sha"] for r in d["workflow_runs"])')
   newest= changed=

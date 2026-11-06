@@ -621,6 +621,21 @@ pub fn npm_list(root: &Path) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// npm で入れるもののみな (名前, 版): .aios.json の pkg.linux.npm (人が書く、PKGBUILD のないもの) と、PKGBUILD に
+/// _npm=NAME と書いたもの (版はパッケージの版)。npm の advisories とくらべる (vuln.rs)
+pub fn npm_installed(root: &Path) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = npm_list(root).into_iter().map(|(n, ver, _)| (n, ver)).collect();
+    for (_, p) in pkgbuilds(&root.join("pkg")) {
+        let t = fs::read_to_string(&p).unwrap_or_default();
+        let Some(n) = scalar(&t, "_npm") else { continue };
+        let ver = scalar(&t, "pkgver").unwrap_or_default();
+        let ver = if ver.contains('$') { expand_var(p.parent().unwrap_or(Path::new(".")), &t, "pkgver") } else { ver };
+        v.retain(|(x, _)| *x != n);
+        v.push((n, ver));
+    }
+    v
+}
+
 /// PKGBUILD に _npm=NAME と書いたもの (パッケージの版が npm の NAME の版) の NAME
 fn npm_tracked(pkg: &Path) -> Vec<String> {
     pkgbuilds(pkg).iter().filter_map(|(_, p)| scalar(&fs::read_to_string(p).unwrap_or_default(), "_npm")).collect()
@@ -657,12 +672,21 @@ fn edit_npm(root: &Path, name: &str, old: &str, ver: Option<&str>) -> Result<Val
     Ok(r)
 }
 
-/// 一覧に作るファイル: 1 つのパッケージに 1 行で name type src now latest
+/// 一覧に作るファイル: 1 つのパッケージに 1 行で name type src now latest (リポジトリには入れない: name と type と
+/// src と now は PKGBUILD から、latest は check の見たもので、CI の毎日の報告にもある)
 pub const OVERVIEW: &str = "pkg.json";
 
-/// pkg/pkg.json を作りなおす。latest は seen (いま見たもの) か、前のファイルのもの (known_latest)
+/// 一覧のファイル (ROOT/build/aish-pkg/pkg.json)。pkg は ROOT/pkg
+pub fn overview_file(pkg: &Path) -> PathBuf {
+    pkg.parent().unwrap_or(pkg).join("build").join("aish-pkg").join(OVERVIEW)
+}
+
+/// 一覧 (build/aish-pkg/pkg.json) を作りなおす。latest は seen (いま見たもの) か、前のファイルのもの (known_latest)
 pub fn overview(pkg: &Path, seen: &std::collections::HashMap<String, String>) {
-    let file = pkg.join(OVERVIEW);
+    let file = overview_file(pkg);
+    if let Some(d) = file.parent() {
+        let _ = fs::create_dir_all(d);
+    }
     let old: Vec<Value> = fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let rules: Vec<Value> = fs::read_to_string(pkg.join(FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let items = pkgbuilds(pkg);
@@ -922,7 +946,6 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
     if aios_json(&root.join(".aios.json"), name, &ver)? || npm {
         files.push(json!(".aios.json"));
     }
-    files.push(json!("pkg/pkg.json"));
     let seen: std::collections::HashMap<String, String> = if looked { [(name.to_string(), ver.clone())].into() } else { Default::default() };
     overview(&pkg, &seen);
     r["files"] = json!(files);
@@ -970,7 +993,6 @@ fn edit_commit(root: &Path, name: &str, path: &Path, old_text: &str, rule: &Valu
     if aios_json(&root.join(".aios.json"), name, &to)? {
         files.push(json!(".aios.json"));
     }
-    files.push(json!("pkg/pkg.json"));
     // HEAD にしたときは、それが一覧の latest
     let seen: std::collections::HashMap<String, String> = if ver.is_none() { [(name.to_string(), format!("commit {}", &new[..7]))].into() } else { Default::default() };
     overview(&root.join("pkg"), &seen);

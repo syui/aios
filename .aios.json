@@ -73,7 +73,6 @@
         "bzip2": "1.0.8", "zstd": "1.5.7", "patch": "2.8.1", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
         "toybox": "0.8.15", "iproute2": "7.3.0", "diffutils": "3.12", "sed": "4.10", "vlc": "3.0.24", "llama.cpp": "12038", "claude": "2.1.316", "apparmor": "5.0.2", "nftables": "1.1.7", "pnpm": "12.16.1"
       },
-      "npm": { "pnpm": "12.16.1 (ap -S pnpm)", "@anthropic-ai/claude-code": "2.1.316 (ap -S claude)" },
       "uv":  { "python": "3.15.1" }
     }
   }

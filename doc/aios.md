@@ -36,12 +36,23 @@ AI (Claude の aish、アイ) が aios をつかみ、自分で次の仕事を�
   doing) を、GitHub のリリース pkg-updates の updates.json と Atom の feed (updates.atom) に置く。entry の id は中身で決まるので、
   aigpt の feed (`aios-pkg`) の `fetch_feed` は新しく出たものだけを見せる。`pkg_check` の `daily: true` は報告をすぐ読む (いつから
   遅れているか (since) も)。パッケージは `pkg_update` (daily で) でまとめて上げる
-- **課題の一覧 (todo.json)**: リポジトリの一番上の、機械が読める課題の一覧 (1 行 1 つ: id、area、status (open / doing / done)、
+- **課題の一覧 (todo.json)**: リポジトリの一番上の、機械が読める課題の一覧 (1 行 1 つ: id、area、status (open / doing)、
   since、what、why、verify)。doc や記憶にばらばらに書いていた「のこり」をここへ。どの AI のセッションも同じものを見て続ける。
-  とりかかったら doing、終わったら done (verify のとおりに確かめてから) にしてコミットする。新しく見つけたものは足す
+  とりかかったら doing、終わったら (verify のとおりに確かめてから) 行を消してコミットする (コミットのメッセージに id。終わった
+  ものの記録は git の歴史と doc に)。新しく見つけたものは足す (test/aios-json.py などのたしかめが CI で見る)
+- **リポジトリの JSON の役目**: 1 つのことは 1 か所 (本物) に書き、ほかはそこから作るか、たしかめるだけにする
+  | ファイル | なにか | だれが書く | たしかめ |
+  |---|---|---|---|
+  | `kernel/kernel.json` | カーネルの部品の地図 (core / extra / quirk) | 人 | test/kernel-json.py |
+  | `.aios.json` | OS の見取り図 (パッケージの版と組、プラグイン、カーネルの名前など)。`aigpt import os` で PDS の ai.syui.gpt.os に。OS の中の `/etc/aios.json` (のぞむ設定) とは別のもの | 人と aish-pkg (pkg を PKGBUILD にそろえる) | test/aios-json.py |
+  | `pkg/upstream.json` | 配布元のどこを見るか | pkg_check (PKGBUILD と Arch の .nvchecker.toml から) | |
+  | `pkg/ci.json` | CI で作る重いパッケージ | 人 | pkg.yml |
+  | `todo.json` | のこりの課題 (open と doing だけ) | 人 | aish-pkg report |
+  パッケージの一覧 (name type src now latest) は `build/aish-pkg/pkg.json` に作り、リポジトリには入れない (PKGBUILD から
+  作れて、配布元の最新は CI の毎日の報告にある)
 
 回り方: feed (や pkg_check daily) で新しい種を受けとる → `aios health` といまの様子で確かめる → なおす (todo.json の verify で
-確かめ、Linux とくらべるものは test/linux-vm.sh の手本と) → todo.json と doc を書きかえてコミット → 次の日の報告が消える。
+確かめ、Linux とくらべるものは test/linux-vm.sh の手本と) → todo.json の行を消し doc を書きかえてコミット → 次の日の報告が消える。
 
 ## 状態の木 (aios get)
 
@@ -195,7 +206,7 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 ## カーネルの地図 (kernel/kernel.json)
 
-カーネルのファイルと手当てを、AI が先に読んで見通せるように 3 つに分けた一覧 (pkg/pkg.json と同じく 1 行に 1 つ)。
+カーネルのファイルと手当てを、AI が先に読んで見通せるように 3 つに分けた一覧 (1 行に 1 つ)。
 動いている aios では `/proc/ai/kernel` (だれでも読める)。
 
 | type | 中身 | 1 行 |
@@ -468,7 +479,7 @@ Firefox (4 つの CPU) の futex は 1 回 54 µs から 37 µs に (合計 198 
 pthread の robust mutex (PTHREAD_MUTEX_ROBUST) は、持ったまま死んだスレッドがいても、次に取ったものが EOWNERDEAD を受けて
 直せるようにするしくみ。glibc はスレッドのはじめと fork した子で set_robust_list に robust list の頭 (struct robust_list_head:
 list の next、futex_offset、list_op_pending) を渡し、持っている robust mutex をその list につなぐ。前の aios は長さを見て 0 を
-返すだけだったので、持ったまま死んだスレッドのものは取れず、待っているものはいつまでも眠った (todo.json の robust-futex)。
+返すだけだったので、持ったまま死んだスレッドのものは取れず、待っているものはいつまでも眠った (c374c01)。
 
 いまは Linux 7.4 の kernel/futex/core.c と同じ: Proc の robust_list に頭を覚え (syscall::fast でも)、スレッドが終わるとき
 (clear_child_tid より先: futex_exit_release) と exec のとき (前のアドレス空間で: futex_exec_release) に list をたどる
