@@ -687,6 +687,9 @@ fn ra(src: u128, m: &[u8]) {
     } else {
         st.router = Some(Router { addr: src, until: now + lifetime * 1000, hoplimit: cur_hop });
     }
+    // ユーザーのプログラムに渡す項目 (ndisc_is_useropt: prefix、RDNSS、DNSSL、6CO、captive portal、PREF64)。RA を読み
+    // おえてから、1 つずつ RTM_NEWNDUSEROPT で (ndisc_ra_useropt)
+    let mut useropts: Vec<Vec<u8>> = Vec::new();
     let mut opts = &m[16..];
     while opts.len() >= 8 {
         let (ty, len) = (opts[0], opts[1] as usize * 8);
@@ -694,6 +697,9 @@ fn ra(src: u128, m: &[u8]) {
             break;
         }
         let o = &opts[..len];
+        if matches!(ty, 3 | 25 | 31 | 34 | 37 | 38) {
+            useropts.push(o.to_vec());
+        }
         match ty {
             // SLLA: 近所の表に (ルーター)
             1 if len >= 8 => {
@@ -712,6 +718,9 @@ fn ra(src: u128, m: &[u8]) {
         opts = &opts[len..];
     }
     changed();
+    for o in useropts {
+        crate::netlink::nd_useropt(src, &o);
+    }
 }
 
 /// prefix information (addrconf_prefix_rcv)

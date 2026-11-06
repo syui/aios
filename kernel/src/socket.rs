@@ -74,8 +74,10 @@ pub struct Socket {
     pub nonblock: bool,
     /// /proc/PID/fd の socket:[N] の N (add_fd で決まる)
     ino: usize,
-    /// setsockopt IP_TTL (なければ 64)
+    /// setsockopt IP_TTL (なければ 64) / IPV6_UNICAST_HOPS
     ttl: Option<u8>,
+    /// IPV6_MULTICAST_HOPS (raw の ICMPv6 のマルチキャストのあて先。なければ 1: Linux の np->mcast_hops)
+    mc_hops: Option<u8>,
     /// 分けた NET (ns.rs) の中: どこへも送れない
     isolated: bool,
     /// ICMP6_FILTER (Raw6。0 はみなとおす)
@@ -235,7 +237,7 @@ impl Socket {
                 Ok(buf.len())
             }
             // ICMPv6 のメッセージに IPv6 の頭をつけて (rawv6_sendmsg: 送り元は道の送り元のえらびかた、hop limit は
-            // IPV6_UNICAST_HOPS か口のもの (マルチキャストは 1)、チェックサムは擬似ヘッダーから)
+            // IPV6_UNICAST_HOPS か口のもの (マルチキャストは IPV6_MULTICAST_HOPS、既定 1)、チェックサムは擬似ヘッダーから)
             Proto::Raw6 => {
                 let to = to.or(self.peer).ok_or(-EDESTADDRREQ)?;
                 let IpAddress::Ipv6(dst) = to.addr else { return Err(-EAFNOSUPPORT) };
@@ -253,7 +255,7 @@ impl Socket {
                     crate::addrconf::lookup(dst).ok_or(-ENETUNREACH)?;
                     crate::addrconf::source_for(dst).ok_or(-ENETUNREACH)?
                 };
-                let hops = self.ttl.unwrap_or(if dst >> 120 == 0xff { 1 } else { crate::addrconf::hop_limit() });
+                let hops = if dst >> 120 == 0xff { self.mc_hops.unwrap_or(1) } else { self.ttl.unwrap_or(crate::addrconf::hop_limit()) };
                 let mut pkt = Vec::with_capacity(40 + buf.len());
                 pkt.extend_from_slice(&[0x60, 0, 0, 0]);
                 pkt.extend_from_slice(&(buf.len() as u16).to_be_bytes());
@@ -836,7 +838,7 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
             }
             n()?;
             let isolated = crate::ns::net().is_some();
-            let mut s = Socket { proto: Proto::Raw6, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated, filter6: [0; 8] };
+            let mut s = Socket { proto: Proto::Raw6, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, mc_hops: None, isolated, filter6: [0; 8] };
             if !isolated {
                 s.bind_raw()?;
             }
@@ -855,7 +857,7 @@ pub fn socket(domain: u64, typ: u64, protocol: u64) -> R {
     if (t == SOCK_DGRAM && protocol == IPPROTO_ICMP) || (t == SOCK_RAW && protocol == IPPROTO_ICMP && crate::cred::current().capable(crate::cred::CAP_NET_RAW)) {
         n()?;
         let proto = if t == SOCK_RAW { Proto::Raw } else { Proto::Icmp };
-        let mut s = Socket { proto, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, isolated, filter6: [0; 8] };
+        let mut s = Socket { proto, handle: None, local: None, peer: None, nonblock: flags & SOCK_NONBLOCK != 0, ino: 0, ttl: None, mc_hops: None, isolated, filter6: [0; 8] };
         // raw は作ったときから受ける (traceroute は受ける口を poll で待つだけで、送らない)
         if s.proto == Proto::Raw && !isolated {
             s.bind_raw()?;
@@ -1201,6 +1203,7 @@ pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
             let v: i32 = match (level, opt) {
                 (SOL_SOCKET, SO_TYPE) => if matches!(s.borrow().proto, Proto::Raw | Proto::Raw6) { 3 } else { 2 },
                 (0, 2) => s.borrow().ttl.unwrap_or(64) as i32,
+                (41, 18) if s.borrow().proto == Proto::Raw6 => s.borrow().mc_hops.unwrap_or(1) as i32,
                 _ => 0,
             };
             let mut b = v.to_le_bytes().to_vec();
@@ -1559,7 +1562,18 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
                 s.borrow_mut().filter6 = f;
                 return Ok(0);
             }
-            // IPV6_UNICAST_HOPS (raw の ICMPv6)
+            // IPV6_UNICAST_HOPS と IPV6_MULTICAST_HOPS (raw の ICMPv6。-1 は既定)
+            if (level, opt) == (41, 18) && s.borrow().proto == Proto::Raw6 {
+                let mut v = [0u8; 4];
+                let n = (len as usize).min(4);
+                proc::current().pt().copy_in(&mut v[..n], val).ok_or(-EFAULT)?;
+                s.borrow_mut().mc_hops = match i32::from_le_bytes(v) {
+                    -1 => None,
+                    v @ 0..=255 => Some(v as u8),
+                    _ => return Err(crate::why::inval()),
+                };
+                return Ok(0);
+            }
             if (level, opt) == (41, 16) && s.borrow().proto == Proto::Raw6 {
                 let mut v = [0u8; 4];
                 let n = (len as usize).min(4);

@@ -2648,6 +2648,26 @@ fn addr6_of(a: &crate::addrconf::Addr) -> Addr6 {
 // 道は unicast だけ: ゲートウェイを通るものと、口だけのもの (eth0 のあて先へじかに)。blackhole などは EOPNOTSUPP
 
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
+const RTNLGRP_ND_USEROPT: u32 = 20;
+const RTM_NEWNDUSEROPT: u16 = 68;
+const NDUSEROPT_SRCADDR: u16 = 1;
+
+/// RA の中のユーザーに渡す ND の項目 (RDNSS など。Linux の ndisc_ra_useropt): RTNLGRP_ND_USEROPT に、struct
+/// nduseroptmsg (family、opts_len、ifindex、ICMPv6 の type と code)、その項目のバイト、NDUSEROPT_SRCADDR (RA を送った
+/// ルーター)
+pub fn nd_useropt(src: u128, opt: &[u8]) {
+    let mut p = Vec::with_capacity(16 + opt.len() + 20);
+    p.extend_from_slice(&[AF_INET6, 0]);
+    p.extend_from_slice(&(opt.len() as u16).to_le_bytes());
+    p.extend_from_slice(&ETH_INDEX.to_le_bytes());
+    // nduseropt_icmp_type (RA)、icmp_code、pad2、pad3
+    p.extend_from_slice(&[134, 0, 0, 0, 0, 0, 0, 0]);
+    p.extend_from_slice(opt);
+    attr(&mut p, NDUSEROPT_SRCADDR, &src.to_be_bytes());
+    let mut d = Vec::new();
+    put_msg(&mut d, RTM_NEWNDUSEROPT, 0, 0, 0, &p);
+    notify(RTNLGRP_ND_USEROPT, d);
+}
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 
 fn ev_addr6(a: &Addr6, typ: u16) {

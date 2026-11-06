@@ -1343,7 +1343,13 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   まで、ICMP は 520)、名前は送ったあて先、付帯データは IPV6_PKTINFO (たのんでいれば: その ICMPv6 のあて先と口) と
   SOL_IPV6 / IPV6_RECVERR (sock_extended_err、origin は SO_EE_ORIGIN_ICMP6、知らせてきた番地)。RECVERR を切ると行列は
   捨てる。`test/ldiff.sh recverr6` (v6 と v4) で手本の Linux 7.4-rc1 と 120 行同じ
-- まだ: MLD、packet too big (PMTU)、RDNSS (DNS)、一時アドレス
+- RA のユーザーに渡す項目 (RDNSS など。Linux の ndisc_is_useropt と ndisc_ra_useropt): RA の prefix (3)、RDNSS (25)、
+  DNSSL (31)、6CO (34)、captive portal (37)、PREF64 (38) を、RA を読みおえてから 1 つずつ RTM_NEWNDUSEROPT で
+  RTNLGRP_ND_USEROPT (20) に (struct nduseroptmsg、その項目のバイト、NDUSEROPT_SRCADDR)。DNS をつかう人 (rdisc6 や
+  NetworkManager のようなもの) はこれを聞く。`test/ldiff.sh --root --net rdnss6` (raw の ICMPv6 で RS を送り、QEMU の
+  RA の prefix の項目) で手本の Linux 7.4-rc1 と 7 行同じ (このとき見つけた: raw の ICMPv6 が IPV6_MULTICAST_HOPS を
+  見ず、マルチキャストへはいつも hop limit 1 で、QEMU は RS に答えなかった)
+- まだ: MLD、packet too big (PMTU)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
