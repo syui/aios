@@ -176,6 +176,8 @@ struct State {
     /// RS を出したか (IF_RS_SENT) と、そのあとに RA を受けたか (IF_RA_RCVD)
     rs_sent: bool,
     ra_rcvd: bool,
+    /// packet too big で知ったあて先ごとの path MTU (rt6_update_pmtu の例外の道): (あて先, MTU, いつまで)
+    pmtu: Vec<(u128, u32, u64)>,
 }
 
 static ST: Bkl<Option<State>> = Bkl::new(None);
@@ -209,7 +211,7 @@ pub fn init(mac: [u8; 6]) {
     let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce };
     // RS は link-local の DAD がおわってから (next_rs はそのときに)
     let next_rs = if dad.is_some() { u64::MAX } else { now };
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false, pmtu: Vec::new() });
     changed();
 }
 
@@ -505,6 +507,35 @@ fn common_bits(a: u128, b: u128) -> u32 {
     (a ^ b).leading_zeros()
 }
 
+/// path MTU の例外の道がのこる時間 (ip6_rt_mtu_expires: 10 分)
+const PMTU_EXPIRES_MS: u64 = 600_000;
+
+/// packet too big で知ったそのあて先の path MTU と、いつまで (なければ None)
+pub fn pmtu(dst: u128) -> Option<(u32, u64)> {
+    let now = ms();
+    ST.get().as_ref()?.pmtu.iter().find(|x| x.0 == dst && x.2 > now).map(|x| (x.1, x.2))
+}
+
+/// そのあて先への path MTU (ip6_dst_mtu): 自分あて (lo) は 65536、ほかは packet too big で知ったものか口の mtu
+pub fn path_mtu(dst: u128) -> u32 {
+    if dst == 1 || is_mine(dst) {
+        return 65536;
+    }
+    pmtu(dst).map_or(CONF.get()[CONF_ETH].mtu as u32, |x| x.0)
+}
+
+/// packet too big (__ip6_rt_update_pmtu): 1280 より小さいものと、いまより小さくならないものは見ない。道のあるあて先
+/// だけ、10 分の例外の道に
+pub fn pmtu_update(dst: u128, mtu: u32) {
+    if mtu < 1280 || mtu >= path_mtu(dst) || lookup(dst).is_none() {
+        return;
+    }
+    let until = ms() + PMTU_EXPIRES_MS;
+    let Some(st) = ST.get().as_mut() else { return };
+    st.pmtu.retain(|x| x.0 != dst);
+    st.pmtu.push((dst, mtu, until));
+}
+
 /// 時間で変わるもの (net::poll から): lifetime の切れた番地・prefix・ルーター、DAD (NS を送る、おえる)、送る RS。
 /// 送るもの (Ethernet のフレーム) を返す
 pub fn tick() -> Vec<Vec<u8>> {
@@ -533,6 +564,7 @@ pub fn tick() -> Vec<Vec<u8>> {
     let before = st.addrs.len();
     st.addrs.retain(|a| a.valid.is_none_or(|t| t > now));
     ch |= st.addrs.len() != before;
+    st.pmtu.retain(|x| x.2 > now);
     let before = st.prefixes.len();
     st.prefixes.retain(|p| p.until > now);
     ch |= st.prefixes.len() != before;

@@ -172,6 +172,11 @@ fn is_local(ip: &[u8]) -> bool {
     ip[0] == 127 || is_eth_addr(u32::from_be_bytes([ip[0], ip[1], ip[2], ip[3]]))
 }
 
+/// 自分の番地あての ICMPv6 のエラー (type が 128 より小さいもの) のフレームか: inet.rs の icmp6_error に渡す
+fn icmp6_err_to_me(f: &[u8]) -> bool {
+    f.len() >= 54 + 48 && f[12..14] == [0x86, 0xdd] && f[20] == 58 && f[54] < 128 && crate::addrconf::is_mine(u128::from_be_bytes(f[38..54].try_into().unwrap()))
+}
+
 /// 出すフレームが自分あてか (IPv4 の宛先、ARP の問い合わせ先、IPv6 の宛先と NS の問い合わせ先で見る)
 fn loops_back(f: &[u8]) -> bool {
     if f.len() < 14 {
@@ -215,7 +220,7 @@ impl Device for NetDev {
                 crate::addrconf::rx(&frame);
                 crate::netlink::nd_in(&frame, frame[..6] == self.mac);
                 // ICMPv6 のエラー (type が 128 より小さいもの) で自分あてのもの
-                if frame.len() >= 54 + 48 && frame[20] == 58 && frame[54] < 128 && crate::addrconf::is_mine(u128::from_be_bytes(frame[38..54].try_into().unwrap())) {
+                if icmp6_err_to_me(&frame) {
                     ICMP6_LATER.get().push(frame[14..].to_vec());
                 }
             }
@@ -253,6 +258,11 @@ impl TxToken for Tx<'_> {
         if loops_back(&buf) {
             if self.0.filter_out(&mut buf, true) {
                 count(true, false, len);
+                // 自分から自分への ICMPv6 のエラー (raw の ICMPv6 で作った packet too big など) も、eth0 から来たものと
+                // 同じく inet.rs に (Linux は lo で受けて icmpv6_rcv)
+                if icmp6_err_to_me(&buf) {
+                    ICMP6_LATER.get().push(buf[14..].to_vec());
+                }
                 self.0.lo.push_back(buf);
             }
         } else if self.0.filter_out(&mut buf, false) {

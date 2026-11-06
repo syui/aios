@@ -1351,7 +1351,14 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   見ず、マルチキャストへはいつも hop limit 1 で、QEMU は RS に答えなかった)
 - RA でもうある SLAAC の番地の lifetime を新しくすると (addrconf_prefix_rcv_add_addr の update_lft)、DAD のとちゅうで
   なければ RTM_NEWADDR (番地と flags は変わらないので、前とくらべる知らせには出ない)。rdnss6 で同じ (8 行)
-- まだ: MLD、packet too big (PMTU)、一時アドレス
+- path MTU (packet too big: icmpv6_notify → __udp6_lib_err と rt6_update_pmtu): eth0 から来たもの (と、自分から自分へ
+  送ったもの: raw の ICMPv6 で作ったものも lo で受ける) で、もとのあて先の path MTU を下げる (addrconf の例外の道:
+  1280 より小さいものと、いまより小さくならないものは見ない、10 分で消える)。UDP には EMSGSIZE (IPV6_RECVERR の行列は
+  ee_info に知らされた MTU。IPV6_MTU_DISCOVER が DONT でなければ致命、INTERFACE と OMIT は見ない)。IPV6_MTU
+  (getsockopt) はつないだもののあて先への path MTU (つないでいなければ ENOTCONN)、ip -6 route get はその例外の道
+  (RTM_F_CLONED、RTAX_MTU、expires)。TCP の MSS は smoltcp が変えられないので、そのまま。送るときに path MTU で
+  断片にしたり EMSGSIZE を返したりもまだ。`test/ldiff.sh --root --net pmtu6` で手本の Linux 7.4-rc1 と 22 行同じ
+- まだ: MLD、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`

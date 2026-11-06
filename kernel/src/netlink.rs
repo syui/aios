@@ -3016,11 +3016,18 @@ fn put_route6(out: &mut Vec<u8>, r: &Route6, flags: u16, seq: u32, me: u32) {
 
 /// RTM_NEWROUTE か RTM_DELROUTE
 fn put_route6_msg(out: &mut Vec<u8>, r: &Route6, typ: u16, flags: u16, seq: u32, me: u32) {
+    put_route6_pmtu(out, r, typ, flags, seq, me, 0);
+}
+
+/// put_route6_msg に path MTU (packet too big で知ったもの) をつけて: RTAX_MTU と RTM_F_CLONED (例外の道)
+fn put_route6_pmtu(out: &mut Vec<u8>, r: &Route6, typ: u16, flags: u16, seq: u32, me: u32, mtu: u32) {
     const RTA_PREF: u16 = 20;
+    const RTAX_MTU: u16 = 2;
     const RTAX_HOPLIMIT: u16 = 10;
+    const RTM_F_CLONED: u32 = 0x200;
     let mut p = Vec::new();
     p.extend_from_slice(&[AF_INET6, r.len, 0, 0, RT_TABLE_MAIN, r.proto, RT_SCOPE_UNIVERSE, r.typ]);
-    p.extend_from_slice(&0u32.to_le_bytes());
+    p.extend_from_slice(&(if mtu != 0 { RTM_F_CLONED } else { 0 }).to_le_bytes());
     attr_u32(&mut p, RTA_TABLE, RT_TABLE_MAIN as u32);
     if r.len != 0 {
         attr(&mut p, RTA_DST, &r.dst.to_be_bytes());
@@ -3028,9 +3035,14 @@ fn put_route6_msg(out: &mut Vec<u8>, r: &Route6, typ: u16, flags: u16, seq: u32,
     if r.prefsrc != 0 {
         attr(&mut p, RTA_PREFSRC, &r.prefsrc.to_be_bytes());
     }
-    if r.hoplimit != 0 {
+    if r.hoplimit != 0 || mtu != 0 {
         let mut m = Vec::new();
-        attr_u32(&mut m, RTAX_HOPLIMIT, r.hoplimit as u32);
+        if mtu != 0 {
+            attr_u32(&mut m, RTAX_MTU, mtu);
+        }
+        if r.hoplimit != 0 {
+            attr_u32(&mut m, RTAX_HOPLIMIT, r.hoplimit as u32);
+        }
         attr(&mut p, RTA_METRICS, &m);
     }
     attr_u32(&mut p, RTA_PRIORITY, r.metric);
@@ -3056,14 +3068,18 @@ fn get_route6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
     }
     let a = attrs_of(&body[12..]);
     let dst = a.get(&RTA_DST).filter(|v| v.len() >= 16).map_or(0, |v| u128::from_be_bytes(v[..16].try_into().unwrap()));
+    let mut mtu = 0;
     let r = if dst == 1 || crate::addrconf::is_mine(dst) {
         Route6 { dst, len: 128, gw: 0, metric: 0, proto: RTPROT_KERNEL, typ: RTN_LOCAL, oif: LO_INDEX, expires: None, hoplimit: 0, prefsrc: dst, rtf: 0 }
     } else {
         let Some(x) = crate::addrconf::lookup(dst) else { return -ENETUNREACH };
-        Route6 { dst, len: 128, gw: x.gw, metric: x.metric, proto: x.proto, typ: x.typ, oif: ETH_INDEX, expires: None, hoplimit: x.hoplimit, prefsrc: crate::addrconf::source_for(dst).unwrap_or(0), rtf: 0 }
+        // packet too big で知った path MTU があれば、その例外の道 (mtu と expires)
+        let pm = crate::addrconf::pmtu(dst);
+        mtu = pm.map_or(0, |p| p.0);
+        Route6 { dst, len: 128, gw: x.gw, metric: x.metric, proto: x.proto, typ: x.typ, oif: ETH_INDEX, expires: pm.map(|p| p.1), hoplimit: x.hoplimit, prefsrc: crate::addrconf::source_for(dst).unwrap_or(0), rtf: 0 }
     };
     let mut d = Vec::new();
-    put_route6(&mut d, &r, 0, seq, me);
+    put_route6_pmtu(&mut d, &r, RTM_NEWROUTE, 0, seq, me, mtu);
     out.push(d);
     0
 }
