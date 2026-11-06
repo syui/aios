@@ -12,7 +12,7 @@
 //     あて先は solicited-node マルチキャスト、nonce つき: enhanced_dad)、1 秒 (RetransTimer) 答えがなければ tentative を
 //     はずす。そのあいだは送り元にえらばず、自分のものとして受けず (bind は EADDRNOTAVAIL)、smoltcp にも渡さない。その
 //     番地の NA か、ほかの人 (nonce のちがう) の DAD の NS が来たら IFA_F_DADFAILED。RS は link-local の DAD のあとで
-//   - MLD はしない (QEMU のユーザーネットワークではだれも聞いていない)
+//   - マルチキャストの組 (mc_list) と MLDv2 の報告 (下の「MLDv2」)
 //   - netlink で足す番地と道 (ip -6 addr add / route add: netlink.rs): 番地には prefix の道 (proto kernel、metric 256。
 //     同じ prefix の番地がなくなれば消す)、道はゲートウェイを通るもの (smoltcp の道の表に)
 // smoltcp には、ここの番地と既定のルーターを net.rs が渡す (近所さがし (NS/NA) と echo の答えは smoltcp がする)
@@ -276,6 +276,128 @@ pub fn mc_dec(ifindex: i32, g: u128) {
         if v[i].2 == 0 {
             v.remove(i);
         }
+    }
+}
+
+// ---- MLDv2 (Linux の mcast.c) ----
+//
+// eth0 の組 (ff02::1 と、link-local より狭いもの (ff01::) はのぞく: MAF_NOREPORT) ができる・なくなると (netlink の
+// mc6_sync から)、その組の記録 (CHANGE_TO_EXCLUDE 4 / CHANGE_TO_INCLUDE 3、送り元なし) を robustness (2) 回送る
+// (mld_ifc_event と mld_send_cr: すぐと、0〜1 秒 (unsolicited_report_interval) あと。続けて変わったものは 1 つの
+// 報告に)。ルーターの問い合わせ (MLDv2 の 130、link-local から) には Maximum Response Delay までのでたらめな時刻に、
+// general なら入っている組みなを、組あてならその組を MODE_IS_EXCLUDE (2) で (mld_gq_work / igmp6_timer_handler)。
+// 報告は ff02::16 へ、hop limit 1、Router Alert つき、送り元は link-local (DAD のとちゅうなら ::)。MLDv1 のルーター
+// には合わせない (v1 の問い合わせは見ない)
+
+const MLD_QRV: u8 = 2;
+const MLD_URI_MS: u32 = 1000;
+
+struct Mld {
+    /// 変わった組: (組、記録の種類、のこりの回数)
+    changes: Vec<(u128, u8, u8)>,
+    /// 報告を送るのこりの回数と、次の時刻
+    cr_left: u8,
+    next_cr: u64,
+    /// 問い合わせの答え: (時刻、組 (0 は general))
+    queries: Vec<(u64, u128)>,
+}
+
+static MLD: Bkl<Mld> = Bkl::new(Mld { changes: Vec::new(), cr_left: 0, next_cr: 0, queries: Vec::new() });
+
+fn mld_reportable(g: u128) -> bool {
+    g != ALL_NODES && (g >> 112) & 0xf >= 2
+}
+
+/// eth0 の組ができた・なくなった (netlink の mc6_sync から)
+pub fn mld_change(g: u128, joined: bool) {
+    if !mld_reportable(g) || ST.get().is_none() {
+        return;
+    }
+    let m = MLD.get();
+    m.changes.retain(|x| x.0 != g);
+    m.changes.push((g, if joined { 4 } else { 3 }, MLD_QRV));
+    m.cr_left = MLD_QRV;
+    m.next_cr = ms();
+}
+
+/// MLDv2 の報告のフレーム (mld_newpack と mld_sendpack): 記録は (種類、組)
+fn mld_frame(mac: [u8; 6], src: u128, recs: &[(u8, u128)]) -> Vec<u8> {
+    let dst = 0xff02u128 << 112 | 0x16;
+    let mut icmp = alloc::vec![143, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&(recs.len() as u16).to_be_bytes());
+    for &(t, g) in recs {
+        icmp.extend_from_slice(&[t, 0, 0, 0]);
+        icmp.extend_from_slice(&g.to_be_bytes());
+    }
+    let sum = icmp6_sum(src, dst, &icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut f = Vec::with_capacity(62 + icmp.len());
+    f.extend_from_slice(&[0x33, 0x33, 0, 0, 0, 0x16]);
+    f.extend_from_slice(&mac);
+    f.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    f.extend_from_slice(&((8 + icmp.len()) as u16).to_be_bytes());
+    // hop-by-hop (Router Alert の MLD と PadN) のあとに ICMPv6、hop limit 1
+    f.extend_from_slice(&[0, 1]);
+    f.extend_from_slice(&src.to_be_bytes());
+    f.extend_from_slice(&dst.to_be_bytes());
+    f.extend_from_slice(&[58, 0, 5, 2, 0, 0, 1, 0]);
+    f.extend_from_slice(&icmp);
+    f
+}
+
+/// 送る時刻になった MLD の報告 (tick から)
+fn mld_tick(now: u64) -> Vec<Vec<u8>> {
+    let Some((mac, src)) = ST.get().as_ref().map(|s| (s.mac, s.addrs.iter().find(|a| is_link_local(a.addr) && a.usable()).map_or(0, |a| a.addr))) else {
+        return Vec::new();
+    };
+    let mut recs: Vec<(u8, u128)> = Vec::new();
+    let m = MLD.get();
+    if m.cr_left > 0 && now >= m.next_cr {
+        for x in m.changes.iter_mut() {
+            recs.push((x.1, x.0));
+            x.2 -= 1;
+        }
+        m.changes.retain(|x| x.2 > 0);
+        m.cr_left -= 1;
+        m.next_cr = now + (crate::rand::u32() % MLD_URI_MS) as u64;
+    }
+    let due: Vec<u128> = m.queries.iter().filter(|q| q.0 <= now).map(|q| q.1).collect();
+    m.queries.retain(|q| q.0 > now);
+    if !due.is_empty() {
+        for (g, _) in mc_list(crate::netlink::ETH_INDEX) {
+            if mld_reportable(g) && due.iter().any(|&q| q == 0 || q == g) {
+                recs.push((2, g));
+            }
+        }
+    }
+    recs.chunks(64).map(|c| mld_frame(mac, src, c)).collect()
+}
+
+/// MLD の問い合わせ (hop-by-hop のあとの ICMPv6 の 130。igmp6_event_query): MLDv2 のもの (28 バイトから) だけ。答えは
+/// Maximum Response Delay (ミリ秒。32768 からは指数の形) までのでたらめな時刻に。前に決めたもののほうが早ければそのまま
+fn mld_query(ip: &[u8]) {
+    let plen = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+    let off = 40 + (ip[41] as usize + 1) * 8;
+    if ip[40] != 58 || ip.len() < 40 + plen || off + 28 > 40 + plen {
+        return;
+    }
+    let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+    let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+    let q = &ip[off..40 + plen];
+    if q[0] != 130 || !is_link_local(src) || icmp6_sum(src, dst, q) != 0 {
+        return;
+    }
+    let code = u16::from_be_bytes([q[4], q[5]]) as u64;
+    let mrd = if code < 32768 { code } else { ((code & 0xfff) | 0x1000) << (((code >> 12) & 7) + 3) };
+    let g = u128::from_be_bytes(q[8..24].try_into().unwrap());
+    if g != 0 && !(mld_reportable(g) && mc_has(crate::netlink::ETH_INDEX, g)) {
+        return;
+    }
+    let at = ms() + crate::rand::u64() % mrd.max(1);
+    let m = MLD.get();
+    match m.queries.iter_mut().find(|x| x.1 == g) {
+        Some(x) => x.0 = x.0.min(at),
+        None => m.queries.push((at, g)),
     }
 }
 
@@ -617,8 +739,8 @@ pub fn pmtu_update(dst: u128, mtu: u32) {
 /// 送るもの (Ethernet のフレーム) を返す
 pub fn tick() -> Vec<Vec<u8>> {
     let now = ms();
+    let mut out = mld_tick(now);
     let Some(st) = ST.get().as_mut() else { return Vec::new() };
-    let mut out = Vec::new();
     let mut ch = false;
     for a in st.addrs.iter_mut() {
         let Some((at, left)) = a.dad else { continue };
@@ -720,6 +842,10 @@ fn rs_frame(mac: [u8; 6], ll: u128) -> Vec<u8> {
 
 /// eth0 から来た IPv6 のフレーム: RA なら読む (ほかは見るだけ。smoltcp にもわたる)
 pub fn rx(f: &[u8]) {
+    if f.len() >= 54 + 8 + 28 && f[12..14] == [0x86, 0xdd] && f[20] == 0 {
+        mld_query(&f[14..]);
+        return;
+    }
     if f.len() < 54 + 16 || f[12..14] != [0x86, 0xdd] || f[20] != 58 || f[21] != 255 {
         return;
     }

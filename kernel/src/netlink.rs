@@ -1039,11 +1039,17 @@ pub fn mc6_sync() {
         let mut d = Vec::new();
         put_mcast(&mut d, (AF_INET6, i, RTM_DELMULTICAST, 0, 0, 0), &g.to_be_bytes(), 0);
         notify(RTNLGRP_IPV6_MCADDR, d);
+        if i == ETH_INDEX {
+            crate::addrconf::mld_change(g, false);
+        }
     }
     for &(i, g, n) in now.iter().filter(|x| !old.contains(&(x.0, x.1))) {
         let mut d = Vec::new();
         put_mcast(&mut d, (AF_INET6, i, RTM_NEWMULTICAST, 0, 0, 0), &g.to_be_bytes(), n);
         notify(RTNLGRP_IPV6_MCADDR, d);
+        if i == ETH_INDEX {
+            crate::addrconf::mld_change(g, true);
+        }
     }
 }
 

@@ -1371,7 +1371,16 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   つないだ相手が合い、その組に入っているか IPV6_MULTICAST_ALL)。eth0 から来た組あての UDP も smoltcp にわたさずに
   inet.rs が同じように (チェックサムのおかしいものは捨てる)。IPV6_PKTINFO / IP_PKTINFO の口は受けた口 (外からの
   ものは eth0、前はいつも lo だった)。`test/ldiff.sh --net mld6` で手本の Linux 7.4-rc1 と 110 行同じ
-- まだ: MLD の報告、一時アドレス
+- MLDv2 (Linux の mcast.c): eth0 に新しい組ができると CHANGE_TO_EXCLUDE (4)、なくなると CHANGE_TO_INCLUDE (3) の記録
+  (送り元なし) を robustness (2) 回 (mld_ifc_event と mld_send_cr: すぐと、0〜1 秒あと。続けて変わったものは 1 つの報告
+  に)。ff02::1 と ff01:: の組 (MAF_NOREPORT) と、もうある組に入るだけのものは報告しない。報告は ff02::16 へ、hop limit
+  1、hop-by-hop の Router Alert つき、送り元は link-local (DAD のとちゅうなら ::)、ファイアウォールの OUTPUT を通る。
+  ルーターの MLDv2 の問い合わせ (130、link-local から) には Maximum Response Delay までのでたらめな時刻に、general なら
+  入っている組みな、組あてならその組を MODE_IS_EXCLUDE (2) で (QEMU には問い合わせるものがいないので答えあわせは
+  していない)。MLDv1 のルーターには合わせない。起動のときの solicited-node の組は報告しない (Linux は DAD のはじめに
+  する)。`LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net mldrep6` (nftables の output の鎖の counter で
+  数える。aios には nftables のパッケージがいる) で手本の Linux 7.4-rc1 と 107 行同じ
+- まだ: 一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
