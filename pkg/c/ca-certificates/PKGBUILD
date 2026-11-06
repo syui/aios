@@ -2,7 +2,7 @@
 # curl の配っている日付つきの cacert を、チェックサムを固定して入れる。Arch と同じ場所:
 #   /etc/ssl/certs/ca-certificates.crt  (curl や git など C の拡張が使う。aios の Rust のものは持っている)
 pkgname=ca-certificates
-pkgver=20261020
+pkgver=20261105
 pkgrel=1
 pkgdesc='Mozilla CA certificates for TLS (PEM bundle)'
 arch=('any')
@@ -12,7 +12,7 @@ license=('MPL-2.0')
 _latest_url=https://curl.se/docs/caextract.html
 _latest_regex='cacert-([0-9]{4})-([0-9]{2})-([0-9]{2})\.pem'
 source=("https://curl.se/ca/cacert-${pkgver:0:4}-${pkgver:4:2}-${pkgver:6:2}.pem")
-sha256sums=('796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe')
+sha256sums=('427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285')
 
 package() {
   install -Dm644 "${source[0]##*/}" "$pkgdir/etc/ssl/certs/ca-certificates.crt"

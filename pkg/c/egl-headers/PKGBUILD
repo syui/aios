@@ -1,8 +1,9 @@
 # egl-headers: EGL のヘッダー (Khronos の EGL-Registry)。libepoxy や GTK のビルドに使う
 #   EGL/egl.h, eglext.h, eglplatform.h と KHR/khrplatform.h を /opt/c/include に
-_commit=e964211ff5f7c2bcada786954a16d5b813379395
+_commit=8e56e86e65687697ef54114cdb1afabdfac756bf
 pkgname=egl-headers
-pkgver=0.0.1.r${_commit:0:7}
+# 版の終わりはそのコミットの日付 (コミットの名前は大きさの順にならない。pkg_edit が _commit といっしょに直す)
+pkgver=0.0.1.20261106
 pkgrel=1
 pkgdesc='EGL headers from the Khronos EGL-Registry'
 arch=('any')

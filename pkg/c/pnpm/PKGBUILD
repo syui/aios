@@ -3,7 +3,7 @@
 #   版は npm の pnpm の版 (_npm)。pkg_check が npm の latest とくらべ、pkg_edit pnpm で上げて (.aios.json の
 #   pkg.linux.npm も)、作って ai/repo に送ると、ap -Syu の post_upgrade がその版を入れる。ap -R pnpm で npm からも消す
 pkgname=pnpm
-pkgver=12.16.1
+pkgver=12.18.0
 pkgrel=1
 _npm=pnpm
 _latest_url=https://registry.npmjs.org/-/package/pnpm/dist-tags

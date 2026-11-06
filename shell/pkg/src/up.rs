@@ -247,7 +247,7 @@ fn rule(name: &str, path: &Path) -> Value {
     let pkgver = scalar(&text, "pkgver").unwrap_or_default();
     let mut r = json!({ "name": name });
     // 自作のもの: 版がちょうど 0.0.1 (pkgver() でビルドのときに決めるものも)、ソースがない、git.syui.ai のもの。
-    // egl-headers (0.0.1.r${_commit}) のように、よそのものをコミットで決めているものは見る
+    // egl-headers (_commit と 0.0.1.YYYYMMDD) のように、よそのものをコミットで決めているものは見る
     let src = first_source(&text).unwrap_or_default();
     if pkgver == "0.0.1" || (src.is_empty() && scalar(&text, "_arch").is_none() && scalar(&text, "_latest_url").is_none()) || src.contains("git.syui.ai") {
         r["skip"] = json!("aios");
@@ -878,7 +878,7 @@ pub fn version(path: &Path) -> String {
     format!("{}{}-{}", if epoch.is_empty() { String::new() } else { format!("{}:", epoch) }, ver, rel)
 }
 
-/// PKGBUILD の変数を bash で展開する (pkgver=0.0.1.r${_commit:0:7} など)
+/// PKGBUILD の変数を bash で展開する (pkgver=${_ver}.${_date} など)
 fn expand_var(dir: &Path, text: &str, key: &str) -> String {
     Command::new("bash")
         .args(["-c", &format!("eval \"$1\"; printf %s \"${{{}}}\"", key), "-", text])
@@ -953,7 +953,7 @@ pub fn edit(root: &Path, name: &str, ver: Option<&str>) -> Result<Value, String>
 }
 
 /// コミットで決めているもの: _commit を新しいコミット (なければ HEAD) にし、pkgver の終わりの日付
-/// (0.1.0.20260929 の 20260929) をそのコミットの日付にする。pkgver が ${_commit} を使うもの (egl-headers) はそのまま
+/// (0.0.1.20261106 の 20261106) をそのコミットの日付にする (コミットの名前は大きさの順にならないので、版には使わない)
 fn edit_commit(root: &Path, name: &str, path: &Path, old_text: &str, rule: &Value, ver: Option<&str>) -> Result<Value, String> {
     let git = rule["git"].as_str().unwrap_or("");
     let pinned = scalar(old_text, "_commit").unwrap_or_default();

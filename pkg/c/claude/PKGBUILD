@@ -6,7 +6,7 @@
 # (.aios.json の pkg.linux.npm も)、作って ai/repo に送ると、ap -Syu の post_upgrade がその版を入れる
 # (claude-code は 1 日に 1 つほど出る。前は 0.0.1 のままで、入れたときの latest から上がらなかった)
 pkgname=claude
-pkgver=2.1.316
+pkgver=2.1.318
 pkgrel=1
 _npm=@anthropic-ai/claude-code
 _latest_url=https://registry.npmjs.org/-/package/@anthropic-ai%2fclaude-code/dist-tags
