@@ -847,7 +847,7 @@ const IFLA_PACING_OFFLOAD: u16 = 70;
 const NLA_F_NESTED: u16 = 0x8000;
 
 /// IFLA_AF_SPEC (rtnl_fill_link_af: AF_INET の inet_fill_link_af と AF_INET6 の inet6_fill_link_af)
-fn link_af(lo: bool, mtu: u32) -> Vec<u8> {
+fn link_af(lo: bool) -> Vec<u8> {
     let mut v = Vec::new();
     // AF_INET: IFLA_INET_CONF
     let mut c4 = INET_CONF_ETH;
@@ -864,11 +864,12 @@ fn link_af(lo: bool, mtu: u32) -> Vec<u8> {
     let mut i6 = Vec::new();
     attr_u32(&mut i6, 1, if lo { 0x8000_0000 } else { crate::addrconf::if_flags() });
     attr(&mut i6, 5, &[65535u32, 0, 30000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    // DEVCONF_* のうち /proc/sys/net/ipv6/conf で変えられるもの (addrconf::CONF): HOPLIMIT、MTU6、ACCEPT_RA、AUTOCONF、
+    // DAD_TRANSMITS、USE_TEMPADDR、ACCEPT_DAD
     let mut c6 = INET6_CONF_ETH;
-    c6[2] = mtu as i32;
-    if lo {
-        c6[10] = -1;
-        c6[27] = -1;
+    let c = crate::addrconf::CONF.get()[if lo { crate::addrconf::CONF_LO } else { crate::addrconf::CONF_ETH }];
+    for (i, v) in [(1, c.hop_limit), (2, c.mtu), (3, c.accept_ra), (5, c.autoconf), (6, c.dad_transmits), (10, c.use_tempaddr), (27, c.accept_dad)] {
+        c6[i] = v;
     }
     attr(&mut i6, 2, &c6.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     let mut st = [0u64; 38];
@@ -944,7 +945,7 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
         attr(&mut p, IFLA_PERM_ADDRESS, &l.addr);
     }
     attr_str(&mut p, IFLA_QDISC, if lo { "noqueue" } else { "pfifo_fast" });
-    attr(&mut p, IFLA_AF_SPEC, &link_af(lo, l.mtu));
+    attr(&mut p, IFLA_AF_SPEC, &link_af(lo));
     // struct rtnl_link_ifmap (mem_start、mem_end、base_addr、irq、dma、port): virtio-net も 0
     attr(&mut p, IFLA_MAP, &[0u8; 32]);
     if !lo {

@@ -1285,8 +1285,13 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   - netlink: eth0 の番地 (scope、flags、IFA_PROTO、のこりの lifetime)、道 (上のもの、自分の番地の RTN_LOCAL: dump の口は
     eth0、get の答えは lo)、1 つの道 (prefsrc、via、RTA_METRICS)、近くの番地の表の IPv6 (nd_tbl: smoltcp が出す NS で
     INCOMPLETE、NA で REACHABLE か STALE、R はルーター (NTF_ROUTER)、RA の SLLA で STALE)。/proc/net/if_inet6 と
-    ipv6_route (refcnt はいつも 1)、/proc/sys/net/ipv6/conf/{all,default,lo,eth0}/ のいくつか (読むだけ) と
-    net/ipv4/ping_group_range
+    ipv6_route (refcnt はいつも 1)、/proc/sys/net/ipv6/conf/{all,default,lo,eth0}/ (addrconf::CONF。Linux の
+    ipv6_devconf) と net/ipv4/ping_group_range。conf は accept_dad、accept_ra、autoconf、dad_transmits、hop_limit
+    (1〜255)、mtu (1280〜口の MTU、all と default は上限なし)、use_tempaddr を書ける (符号つきの数、ほかは EINVAL)。効くの
+    は eth0 のもの: hop_limit と mtu (RA でも変わる)、accept_ra が 0 なら RA を見ない、autoconf が 0 なら SLAAC の番地を
+    作らない、DAD は all か eth0 の accept_dad が 1 以上のときに dad_transmits 回 (0 なら NS なしで 0〜1 秒あとにおえる)。
+    use_tempaddr は覚えるだけ。addr_gen_mode、disable_ipv6、forwarding は読むだけ (Linux は書ける)。ip -6 link の
+    IFLA_INET6_CONF にも同じ値。`test/ldiff.sh --root --net sysctl6` で手本の Linux 7.4-rc1 と 88 行同じ
 - ファイアウォール (段階 2d): eth0 の IPv6 のフレームも決まりを通る (上の「ファイアウォール (nftables)」の IPv6)
 - 近所さがし (ARP と NS) のだまる時間 (1 秒) はあて先ごと (Linux の neighbour ごとの retrans_time)。smoltcp 0.12 (0.14 も)
   は表全体で 1 つで、1 つ問い合わせると、どのあて先にも 1 秒は問い合わせず、答えのないあて先を問い合わせなおすたびに

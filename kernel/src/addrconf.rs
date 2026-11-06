@@ -25,6 +25,48 @@ pub const IFA_F_PERMANENT: u32 = 0x80;
 pub const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_DADFAILED: u32 = 0x08;
 const IFA_F_NODAD: u32 = 0x02;
+/// /proc/sys/net/ipv6/conf の口ごとの値 (Linux の ipv6_devconf。addr_gen_mode、disable_ipv6、forwarding は読むだけで
+/// sysctl.rs に)。効くのは eth0 のもの (と DAD の all の accept_dad): hop_limit と mtu (RA でも変わる)、accept_ra (0 なら
+/// RA を見ない)、autoconf (0 なら SLAAC の番地を作らない)、accept_dad (all か eth0 が 1 以上なら DAD)、dad_transmits
+/// (DAD の NS の数)。use_tempaddr は覚えるだけ (一時アドレスはまだない)
+#[derive(Clone, Copy)]
+pub struct DevConf {
+    pub accept_dad: i32,
+    pub accept_ra: i32,
+    pub autoconf: i32,
+    pub dad_transmits: i32,
+    pub hop_limit: i32,
+    pub mtu: i32,
+    pub use_tempaddr: i32,
+}
+
+/// CONF の並び: all、default、lo、eth0
+pub const CONF_ALL: usize = 0;
+pub const CONF_LO: usize = 2;
+pub const CONF_ETH: usize = 3;
+
+const fn devconf(accept_dad: i32, mtu: i32, use_tempaddr: i32) -> DevConf {
+    DevConf { accept_dad, accept_ra: 1, autoconf: 1, dad_transmits: 1, hop_limit: 64, mtu, use_tempaddr }
+}
+
+/// Linux の既定: all は accept_dad 0、default と eth0 は 1、lo は -1 (と mtu 65536、use_tempaddr -1)
+pub static CONF: Bkl<[DevConf; 4]> = Bkl::new([devconf(0, 1280, 0), devconf(1, 1280, 0), devconf(-1, 65536, -1), devconf(1, 1500, 0)]);
+
+/// 口の MTU (conf の mtu の上限。all と default はなし)
+pub fn dev_mtu(i: usize) -> i32 {
+    match i {
+        CONF_LO => 65536,
+        CONF_ETH => 1500,
+        _ => i32::MAX,
+    }
+}
+
+/// DAD をするか (addrconf_dad_begin: all と口の accept_dad のどちらかが 1 以上)
+fn dad_wanted() -> bool {
+    let c = CONF.get();
+    c[CONF_ALL].accept_dad >= 1 || c[CONF_ETH].accept_dad >= 1
+}
+
 /// RetransTimer (近所さがしの問い合わせの間、ミリ秒) と、はじめの NS の前に待つ上限 (rtr_solicit_delay)
 const RETRANS_MS: u64 = 1000;
 const DAD_DELAY_MS: u32 = 1000;
@@ -59,14 +101,18 @@ impl Addr {
     }
 }
 
-/// 新しい番地の DAD をはじめる (addrconf_dad_kick): 0〜1 秒あとにはじめの NS
+/// 新しい番地の DAD をはじめる (addrconf_dad_kick): 0〜1 秒あとにはじめの NS (dad_transmits が 0 なら NS なしでおえる)。
+/// DAD をしない (accept_dad が all も口も 1 より小さい) なら None
 fn dad_start(now: u64) -> (Option<(u64, u8)>, u64) {
+    if !dad_wanted() {
+        return (None, 0);
+    }
     let delay = (crate::rand::u32() % DAD_DELAY_MS) as u64;
     let mut nonce = 0;
     while nonce == 0 {
         nonce = crate::rand::u64() & 0xffff_ffff_ffff;
     }
-    (Some((now + delay, 1)), nonce)
+    (Some((now + delay, CONF.get()[CONF_ETH].dad_transmits as u8)), nonce)
 }
 
 /// eth0 の IPv6 の道 (表 254)
@@ -123,8 +169,6 @@ struct State {
     /// netlink で足した道 (ip -6 route add)
     uroutes: Vec<Route>,
     router: Option<Router>,
-    hop_limit: u8,
-    mtu: u32,
     /// RA を見たか、次の RS の時刻と間
     ra_seen: bool,
     next_rs: u64,
@@ -161,9 +205,11 @@ pub fn init(mac: [u8; 6]) {
     let now = ms();
     let ll = 0xfe80u128 << 112 | eui64(mac);
     let (dad, nonce) = dad_start(now);
-    let a = Addr { addr: ll, prefix: 64, flags: IFA_F_PERMANENT | IFA_F_TENTATIVE, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce };
+    let flags = IFA_F_PERMANENT | if dad.is_some() { IFA_F_TENTATIVE } else { 0 };
+    let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce };
     // RS は link-local の DAD がおわってから (next_rs はそのときに)
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, hop_limit: 64, mtu: 1500, ra_seen: false, next_rs: u64::MAX, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
+    let next_rs = if dad.is_some() { u64::MAX } else { now };
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false });
     changed();
 }
 
@@ -188,11 +234,7 @@ pub fn if_flags() -> u32 {
 }
 
 pub fn hop_limit() -> u8 {
-    ST.get().as_ref().map_or(64, |s| s.hop_limit)
-}
-
-pub fn mtu() -> u32 {
-    ST.get().as_ref().map_or(1500, |s| s.mtu)
+    CONF.get()[CONF_ETH].hop_limit as u8
 }
 
 /// 既定のルーター (smoltcp の既定の道)
@@ -623,6 +665,10 @@ fn dad_check(ty: u8, src: u128, smac: &[u8], m: &[u8]) {
 /// RA を読む (ndisc_router_discovery と addrconf_prefix_rcv)
 fn ra(src: u128, m: &[u8]) {
     let now = ms();
+    // accept_ra が 0 (より小さい) なら RA を見ない (ipv6_accept_ra)
+    if CONF.get()[CONF_ETH].accept_ra <= 0 {
+        return;
+    }
     let Some(st) = ST.get().as_mut() else { return };
     st.ra_seen = true;
     // ndisc_router_discovery: RS を出したあとに受けた RA
@@ -632,7 +678,7 @@ fn ra(src: u128, m: &[u8]) {
     let cur_hop = m[4];
     let lifetime = u16::from_be_bytes([m[6], m[7]]) as u64;
     if cur_hop != 0 {
-        st.hop_limit = cur_hop;
+        CONF.get()[CONF_ETH].hop_limit = cur_hop as i32;
     }
     if lifetime == 0 {
         if st.router.as_ref().is_some_and(|r| r.addr == src) {
@@ -658,7 +704,7 @@ fn ra(src: u128, m: &[u8]) {
             5 if len >= 8 => {
                 let mtu = u32::from_be_bytes(o[4..8].try_into().unwrap());
                 if (1280..=1500).contains(&mtu) {
-                    st.mtu = mtu;
+                    CONF.get()[CONF_ETH].mtu = mtu as i32;
                 }
             }
             _ => {}
@@ -686,7 +732,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) {
             st.prefixes.push(Prefix { prefix, len, until: life(valid) });
         }
     }
-    if auto && len == 64 {
+    if auto && len == 64 && CONF.get()[CONF_ETH].autoconf > 0 {
         let addr = prefix | eui64(st.mac);
         match st.addrs.iter_mut().find(|a| a.addr == addr) {
             Some(a) => {
@@ -705,7 +751,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) {
                 st.addrs.push(Addr {
                     addr,
                     prefix: 64,
-                    flags: IFA_F_MANAGETEMPADDR | IFA_F_TENTATIVE,
+                    flags: IFA_F_MANAGETEMPADDR | if dad.is_some() { IFA_F_TENTATIVE } else { 0 },
                     proto: IFAPROT_KERNEL_RA,
                     valid: Some(life(valid)),
                     preferred: Some(life(pref)),

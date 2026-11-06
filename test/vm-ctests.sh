@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pipeslots procmaps procwait pwfast random recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache unixrace unixsock userns"
+TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pipeslots procmaps procwait pwfast random recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -62,6 +62,8 @@ run)
     dad6) cmd="sudo -n ./$t" ;;
     # onlink6 も root で (ip -6 route add ... dev eth0 を足して消す)
     onlink6) cmd="sudo -n ./$t" ;;
+    # sysctl6 も root で (/proc/sys/net/ipv6/conf を書いて、もとにもどす)
+    sysctl6) cmd="sudo -n ./$t" ;;
     # rtnladdr も root で (ip addr を足して消す)
     rtnladdr) cmd="sudo -n ./$t" ;;
     # ndsilence も root で (raw の ICMP。近所さがしの失敗を 6 秒見る)

@@ -11,7 +11,7 @@
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
 //   /proc/sys/vm/min_free_kbytes             空きがこれを割ったら swap へ回収する (その 4 倍まで)
 //   /proc/sys/net/netfilter/nf_conntrack_*   conntrack の数、上限、時間切れ、tcp_loose など (conntrack.rs)
-//   /proc/sys/net/ipv6/conf/*/                口ごとの IPv6 の値 (addrconf.rs。読むだけ)、net/ipv4/ping_group_range
+//   /proc/sys/net/ipv6/conf/*/                口ごとの IPv6 の値 (addrconf::CONF)、net/ipv4/ping_group_range
 //
 // 書けるのは root だけ。値は 1 行 (終わりの改行や空白はなくてよい)。起動のときに init が
 // /etc/sysctl.d/*.conf を読んでここに書く (aios apply の sysctl)
@@ -84,6 +84,35 @@ fn boot_id() -> String {
     }))
 }
 
+/// /proc/sys/net/ipv6/conf の値 (addrconf::CONF の i 番の口)
+fn conf_get(i: usize, f: fn(&crate::addrconf::DevConf) -> i32) -> String {
+    format!("{}", f(&crate::addrconf::CONF.get()[i]))
+}
+
+/// 書く (Linux の proc_dointvec: 符号つきの数。hop_limit は 1〜255、mtu は 1280〜口の MTU: addrconf_sysctl_mtu)
+fn conf_set(i: usize, key: &str, s: &str) -> Result<(), i64> {
+    let v = s.trim().parse::<i32>().map_err(|_| crate::why::inval())?;
+    let ok = match key {
+        "hop_limit" => (1..=255).contains(&v),
+        "mtu" => (1280..=crate::addrconf::dev_mtu(i)).contains(&v),
+        _ => true,
+    };
+    if !ok {
+        return Err(crate::why::inval());
+    }
+    let c = &mut crate::addrconf::CONF.get()[i];
+    match key {
+        "accept_dad" => c.accept_dad = v,
+        "accept_ra" => c.accept_ra = v,
+        "autoconf" => c.autoconf = v,
+        "dad_transmits" => c.dad_transmits = v,
+        "hop_limit" => c.hop_limit = v,
+        "mtu" => c.mtu = v,
+        _ => c.use_tempaddr = v,
+    }
+    Ok(())
+}
+
 /// 数を lo..=hi の中で受ける
 fn num(s: &str, lo: usize, hi: usize) -> Result<usize, i64> {
     s.trim().parse::<usize>().ok().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| crate::why::inval())
@@ -145,39 +174,47 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "net/nf_conntrack_max", get: || format!("{}", crate::conntrack::max()), set: Some(|s| { crate::conntrack::KNOBS.get().max = num(s, 1, 1 << 30)?; Ok(()) }) },
     // ping ソケット (SOCK_DGRAM の ICMP と ICMPv6) を作れる group (既定の 1 0 はだれも。aios の IPv4 の ping はだれでも)
     Entry { path: "net/ipv4/ping_group_range", get: || "1\t0".to_string(), set: None },
-    // IPv6 の口ごとの値 (addrconf の devconf: all と default と lo と eth0。いまは読むだけ)
-    Entry { path: "net/ipv6/conf/all/accept_ra", get: || "1".to_string(), set: None },
+    // IPv6 の口ごとの値 (addrconf::CONF: all と default と lo と eth0)。addr_gen_mode、disable_ipv6、forwarding は読むだけ
+    Entry { path: "net/ipv6/conf/all/accept_dad", get: || conf_get(0, |c| c.accept_dad), set: Some(|s| conf_set(0, "accept_dad", s)) },
+    Entry { path: "net/ipv6/conf/all/accept_ra", get: || conf_get(0, |c| c.accept_ra), set: Some(|s| conf_set(0, "accept_ra", s)) },
     Entry { path: "net/ipv6/conf/all/addr_gen_mode", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/all/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/autoconf", get: || conf_get(0, |c| c.autoconf), set: Some(|s| conf_set(0, "autoconf", s)) },
+    Entry { path: "net/ipv6/conf/all/dad_transmits", get: || conf_get(0, |c| c.dad_transmits), set: Some(|s| conf_set(0, "dad_transmits", s)) },
     Entry { path: "net/ipv6/conf/all/disable_ipv6", get: || "0".to_string(), set: None },
     Entry { path: "net/ipv6/conf/all/forwarding", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/all/hop_limit", get: || "64".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/all/mtu", get: || "1280".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/all/use_tempaddr", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/default/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/all/hop_limit", get: || conf_get(0, |c| c.hop_limit), set: Some(|s| conf_set(0, "hop_limit", s)) },
+    Entry { path: "net/ipv6/conf/all/mtu", get: || conf_get(0, |c| c.mtu), set: Some(|s| conf_set(0, "mtu", s)) },
+    Entry { path: "net/ipv6/conf/all/use_tempaddr", get: || conf_get(0, |c| c.use_tempaddr), set: Some(|s| conf_set(0, "use_tempaddr", s)) },
+    Entry { path: "net/ipv6/conf/default/accept_dad", get: || conf_get(1, |c| c.accept_dad), set: Some(|s| conf_set(1, "accept_dad", s)) },
+    Entry { path: "net/ipv6/conf/default/accept_ra", get: || conf_get(1, |c| c.accept_ra), set: Some(|s| conf_set(1, "accept_ra", s)) },
     Entry { path: "net/ipv6/conf/default/addr_gen_mode", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/default/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/autoconf", get: || conf_get(1, |c| c.autoconf), set: Some(|s| conf_set(1, "autoconf", s)) },
+    Entry { path: "net/ipv6/conf/default/dad_transmits", get: || conf_get(1, |c| c.dad_transmits), set: Some(|s| conf_set(1, "dad_transmits", s)) },
     Entry { path: "net/ipv6/conf/default/disable_ipv6", get: || "0".to_string(), set: None },
     Entry { path: "net/ipv6/conf/default/forwarding", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/default/hop_limit", get: || "64".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/default/mtu", get: || "1280".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/default/use_tempaddr", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/accept_ra", get: || "1".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/addr_gen_mode", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/autoconf", get: || "1".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/disable_ipv6", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/forwarding", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/eth0/hop_limit", get: || format!("{}", crate::addrconf::hop_limit()), set: None },
-    Entry { path: "net/ipv6/conf/eth0/mtu", get: || format!("{}", crate::addrconf::mtu()), set: None },
-    Entry { path: "net/ipv6/conf/eth0/use_tempaddr", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/lo/accept_ra", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/default/hop_limit", get: || conf_get(1, |c| c.hop_limit), set: Some(|s| conf_set(1, "hop_limit", s)) },
+    Entry { path: "net/ipv6/conf/default/mtu", get: || conf_get(1, |c| c.mtu), set: Some(|s| conf_set(1, "mtu", s)) },
+    Entry { path: "net/ipv6/conf/default/use_tempaddr", get: || conf_get(1, |c| c.use_tempaddr), set: Some(|s| conf_set(1, "use_tempaddr", s)) },
+    Entry { path: "net/ipv6/conf/lo/accept_dad", get: || conf_get(2, |c| c.accept_dad), set: Some(|s| conf_set(2, "accept_dad", s)) },
+    Entry { path: "net/ipv6/conf/lo/accept_ra", get: || conf_get(2, |c| c.accept_ra), set: Some(|s| conf_set(2, "accept_ra", s)) },
     Entry { path: "net/ipv6/conf/lo/addr_gen_mode", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/lo/autoconf", get: || "1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/autoconf", get: || conf_get(2, |c| c.autoconf), set: Some(|s| conf_set(2, "autoconf", s)) },
+    Entry { path: "net/ipv6/conf/lo/dad_transmits", get: || conf_get(2, |c| c.dad_transmits), set: Some(|s| conf_set(2, "dad_transmits", s)) },
     Entry { path: "net/ipv6/conf/lo/disable_ipv6", get: || "0".to_string(), set: None },
     Entry { path: "net/ipv6/conf/lo/forwarding", get: || "0".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/lo/hop_limit", get: || "64".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/lo/mtu", get: || "65536".to_string(), set: None },
-    Entry { path: "net/ipv6/conf/lo/use_tempaddr", get: || "-1".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/lo/hop_limit", get: || conf_get(2, |c| c.hop_limit), set: Some(|s| conf_set(2, "hop_limit", s)) },
+    Entry { path: "net/ipv6/conf/lo/mtu", get: || conf_get(2, |c| c.mtu), set: Some(|s| conf_set(2, "mtu", s)) },
+    Entry { path: "net/ipv6/conf/lo/use_tempaddr", get: || conf_get(2, |c| c.use_tempaddr), set: Some(|s| conf_set(2, "use_tempaddr", s)) },
+    Entry { path: "net/ipv6/conf/eth0/accept_dad", get: || conf_get(3, |c| c.accept_dad), set: Some(|s| conf_set(3, "accept_dad", s)) },
+    Entry { path: "net/ipv6/conf/eth0/accept_ra", get: || conf_get(3, |c| c.accept_ra), set: Some(|s| conf_set(3, "accept_ra", s)) },
+    Entry { path: "net/ipv6/conf/eth0/addr_gen_mode", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/autoconf", get: || conf_get(3, |c| c.autoconf), set: Some(|s| conf_set(3, "autoconf", s)) },
+    Entry { path: "net/ipv6/conf/eth0/dad_transmits", get: || conf_get(3, |c| c.dad_transmits), set: Some(|s| conf_set(3, "dad_transmits", s)) },
+    Entry { path: "net/ipv6/conf/eth0/disable_ipv6", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/forwarding", get: || "0".to_string(), set: None },
+    Entry { path: "net/ipv6/conf/eth0/hop_limit", get: || conf_get(3, |c| c.hop_limit), set: Some(|s| conf_set(3, "hop_limit", s)) },
+    Entry { path: "net/ipv6/conf/eth0/mtu", get: || conf_get(3, |c| c.mtu), set: Some(|s| conf_set(3, "mtu", s)) },
+    Entry { path: "net/ipv6/conf/eth0/use_tempaddr", get: || conf_get(3, |c| c.use_tempaddr), set: Some(|s| conf_set(3, "use_tempaddr", s)) },
 ];
 
 /// パスを / で分けたものの d 番目まで
