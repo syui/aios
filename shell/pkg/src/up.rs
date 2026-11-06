@@ -723,7 +723,8 @@ fn known_latest(rule: Option<&Value>, prev: String, now: &str) -> String {
 
 /// .aios.json の pkg を pkg/*/NAME/PKGBUILD にそろえる (形はそのまま、文字を書きかえる):
 /// 新しいパッケージを足し (自作のもの = upstream.json の skip が aios なら "aios"、ほかは "linux" の下の種類に)、
-/// 版がちがえば直し、PKGBUILD がなくなったものは消す。npm と uv の下は人が書くので見ない。変えた名前を返す
+/// 組か種類がちがえば移し、版がちがえば直し、PKGBUILD がなくなったものは消す。npm と uv の下は人が書くので見ない。
+/// 変えた名前を返す (そろっているかは test/aios-json.py が CI で見る)
 pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join(".aios.json");
     let Ok(mut text) = fs::read_to_string(&path) else { return Ok(vec![]) };
@@ -753,16 +754,17 @@ pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
         let t = fs::read_to_string(p).unwrap_or_default();
         let ver = scalar(&t, "pkgver").unwrap_or_default();
         let ver = if ver.contains('$') { expand_var(dir, &t, "pkgver") } else { ver };
+        let group = if own.contains(name) { "aios" } else { "linux" };
         // どれも text の上で書きかえて、おしまいに 1 度だけ書く
         let next = match have.iter().find(|h| h.2 == *name) {
-            // 種類が変わった (pkg/rust/sed から pkg/c/sed へ、など): 前の種類から消して、いまの種類に入れる
-            // (その種類がこのグループになくて入れられなければ、版だけ直す)
-            Some(h) if h.1 != kind => json_remove(&text, &h.0, &h.1, name)
-                .and_then(|t| json_insert(&t, &h.0, &kind, name, &ver))
+            // 組か種類が変わった (pkg/rust/sed から pkg/c/sed へ、自作になった、など): 前のところから消して、いまの
+            // 組と種類に入れる (入れられなければ、版だけ直す)
+            Some(h) if h.0 != group || h.1 != kind => json_remove(&text, &h.0, &h.1, name)
+                .and_then(|t| json_insert(&t, group, &kind, name, &ver))
                 .or_else(|| if h.3 != ver { json_set(&text, name, &ver) } else { None }),
             Some(h) if h.3 == ver => None,
             Some(_) => json_set(&text, name, &ver),
-            None => json_insert(&text, if own.contains(name) { "aios" } else { "linux" }, &kind, name, &ver),
+            None => json_insert(&text, group, &kind, name, &ver),
         };
         if let Some(t) = next {
             text = t;
@@ -1240,6 +1242,40 @@ mod tests {
         assert_eq!(v["pkg"]["aios"]["rust"], serde_json::json!({"base": "0.0.1"}));
         assert!(t.contains("        \"awk\": \"1\",\n        \"fd\": \"3\"\n"), "{}", t);
         assert!(!t.contains(" \n"), "trailing space: {}", t);
+        assert!(aios_sync(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_moves_group() {
+        // aimodel は自作 (upstream.json の skip が aios) なのに linux に、claude は自作でないのに aios にある: 移す
+        const G: &str = r#"{
+  "updated": "2000-01-01",
+  "pkg": {
+    "aios": {
+      "c": { "base-devel": "0.0.1", "claude": "2.1" }
+    },
+    "linux": {
+      "c": { "zlib": "1.3", "aimodel": "0.0.1" }
+    }
+  }
+}
+"#;
+        let root = std::env::temp_dir().join(format!("aios-group-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (n, v) in [("base-devel", "0.0.1"), ("claude", "2.1"), ("zlib", "1.3"), ("aimodel", "0.0.1")] {
+            let d = root.join("pkg").join("c").join(n);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("PKGBUILD"), format!("pkgname={}\npkgver={}\npkgrel=1\n", n, v)).unwrap();
+        }
+        fs::write(root.join("pkg").join(FILE), "[\n  {\"name\":\"aimodel\",\"skip\":\"aios\"},\n  {\"name\":\"base-devel\",\"skip\":\"aios\"}\n]\n").unwrap();
+        fs::write(root.join(".aios.json"), G).unwrap();
+        let mut ch = aios_sync(&root).unwrap();
+        ch.sort();
+        assert_eq!(ch, ["aimodel", "claude"]);
+        let v: Value = serde_json::from_str(&fs::read_to_string(root.join(".aios.json")).unwrap()).unwrap();
+        assert_eq!(v["pkg"]["aios"]["c"], serde_json::json!({"base-devel": "0.0.1", "aimodel": "0.0.1"}));
+        assert_eq!(v["pkg"]["linux"]["c"], serde_json::json!({"zlib": "1.3", "claude": "2.1"}));
         assert!(aios_sync(&root).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }

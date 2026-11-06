@@ -47,6 +47,10 @@ jobs:
         # カーネルの地図 (kernel/kernel.json: ファイルごとの core と extra、quirk の一覧) とソースがそろっているか
         run: python3 test/kernel-json.py
 
+      - name: .aios.json
+        # リポジトリの見取り図 (.aios.json) が本物 (PKGBUILD の版と組、base の入れるプラグイン) とそろっているか
+        run: python3 test/aios-json.py
+
       - name: Install tools
         run: |
           sudo apt-get update
