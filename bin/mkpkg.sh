@@ -101,8 +101,13 @@ make_one() (
       *://*)
         [ -n "$name" ] || name=${src##*/}
         if [ ! -f "$srcdir/$name" ]; then
-          # 配布元やプロキシーが途中で切ることがある (Connection reset by peer で gawk、iproute2、libdrm の 3 つが落ちた)
-          curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 -o "$srcdir/$name.part" "$src"
+          # 配布元やプロキシーが途中で切ることがある (Connection reset by peer で gawk、iproute2、libdrm の 3 つが落ちた)。
+          # ftp.gnu.org がまるごとつながらないときは、GNU のミラーの入口 ftpmirror.gnu.org から (sha256 は下で確かめる)
+          curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 -o "$srcdir/$name.part" "$src" || {
+            case $src in https://ftp.gnu.org/gnu/*) ;; *) exit 1 ;; esac
+            echo "==> $pkgname: ftp.gnu.org failed, trying ftpmirror.gnu.org" >&2
+            curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 -o "$srcdir/$name.part" "https://ftpmirror.gnu.org/${src#https://ftp.gnu.org/gnu/}"
+          }
           mv "$srcdir/$name.part" "$srcdir/$name"
         fi
         if [ "$want" != SKIP ] && [ "$(sha256 "$srcdir/$name")" != "$want" ]; then
