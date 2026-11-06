@@ -49,6 +49,7 @@ const NLM_F_APPEND: u16 = 0x800;
 // DEL のときのフラグ
 const NLM_F_NONREC: u16 = 0x100;
 
+const NFNL_SUBSYS_CTNETLINK: u16 = 1;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFNL_SUBSYS_COUNT: u16 = 13;
 const NFNL_MSG_BATCH_BEGIN: u16 = 16;
@@ -595,6 +596,10 @@ fn single(m: &[u8], me: u32, out: &mut Vec<Vec<u8>>) -> Result<bool, Fail> {
         return Ok(false);
     }
     let typ = u16::from_le_bytes([m[4], m[5]]);
+    // ctnetlink (conntrack の道具: ctnetlink.rs)
+    if typ >> 8 == NFNL_SUBSYS_CTNETLINK {
+        return crate::ctnetlink::request(m, me, out).map_err(fail);
+    }
     if typ >> 8 != NFNL_SUBSYS_NFTABLES {
         return Err(fail(EINVAL));
     }

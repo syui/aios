@@ -1061,8 +1061,17 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     ct-keys、ct-notrack、ct-related、ct-list: /proc/net/nf_conntrack をならべたもの)。手本の Linux (test/linux.config に
     NF_CONNTRACK、NF_CONNTRACK_MARK、NF_CONNTRACK_PROCFS、NFT_CT) と 1 バイトもちがわない。外 (10.0.2.2) とのつながりの
     状態は、smoltcp と Linux の TCP のちがい (FIN の出しかたなど) がでるので数だけ
-  - まだ: ctnetlink (conntrack -L の道具。/proc/net/nf_conntrack は読める)、helper (ftp など)、expectation、zone、
-    label、event、ct count (connlimit)、NAT
+  - ctnetlink (Linux の nf_conntrack_netlink.c、NETLINK_NETFILTER の subsys 1: kernel/src/ctnetlink.rs) と conntrack の
+    道具 (pkg/c/conntrack-tools: conntrack だけを静的に。中で libnetfilter_conntrack、libnfnetlink、libmnl): IPCTNL_MSG_CT_GET
+    の dump (conntrack -L。nfgenmsg の家族のものだけ、AF_UNSPEC はみな。libmnl の 4096 の入れ物に入るように分ける) と
+    1 つ (-G: 組で引く。use は 2、なければ ENOENT)、CT_DELETE (組で 1 つ、組がなければ家族のものみな: -D と -F)、
+    GET_STATS (-C の数といちばん多いとき) と GET_STATS_CPU (-S: Linux と同じ 10 の数。aios が数えるのは invalid だけ、
+    ほかはハッシュ表の作りの数で 0)。答えのつながりは CT_NEW (組 2 つ、status、のこり時間、TCP の状態と窓の倍率、
+    数 (acct のとき)、mark、id、use)。手本の Linux に NF_CT_NETLINK と NF_CONNTRACK_EVENTS を足した。
+    `LINUX_FILES="conntrack=build/conntrack-static nft=build/nft-static" test/ldiff.sh --root ctnl` (中どうしの TCP と
+    UDP で -L・-o extended・-p・-f ipv6・--state・-C・-S・-G・-D・-F) で手本の Linux 7.4-rc1 と 71 行同じ
+  - まだ: ctnetlink の知らせ (conntrack -E) と CT_NEW (-I / -U)、カーネルでしぼる CTA_FILTER (しぼるのは conntrack
+    の道具もする) と 7.4 の CTA_FILTER_ZONE、helper (ftp など)、expectation、zone、label、ct count (connlimit)、NAT
 - IPv6 (段階 2b、IPv6 の段階 1 のあと): aios の中の ::1 の TCP と UDP も、IPv4 と同じく lo の 4 つのフックに通す。
   パケットは Linux が lo に流すのと同じ IPv6 の頭 (traffic class、flow label、hop limit 64。MAC の型は 86dd)
   - ip6 と inet の表が見る (ip の表は IPv6 を、ip6 の表は IPv4 を見ない。::ffff:127.0.0.1 へのものは IPv4 のパケット)。

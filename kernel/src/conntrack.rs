@@ -360,6 +360,33 @@ fn gc() {
     }
 }
 
+/// おかしいとしたパケットの数 (NF_CT_STAT_INC の invalid: conntrack -S。ほかの数 (表の中の作りの数) は aios にない)
+static INVALID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn invalid_count() -> u32 {
+    INVALID.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 表のつながりみな (ctnetlink の dump。時間切れのものは先に消す)
+pub fn all() -> Vec<Conn> {
+    gc();
+    table().conns.values().cloned().collect()
+}
+
+/// 組 (どちらの向きでも) で引く (ctnetlink の 1 つ)
+pub fn lookup(t: &Tuple) -> Option<Conn> {
+    let (id, _) = find(t)?;
+    table().conns.get(&id).cloned()
+}
+
+/// TCP の状態、窓の倍率 (向きごと)、flags (向きごと: IP_CT_TCP_FLAG_*) (ctnetlink の CTA_PROTOINFO_TCP)
+pub fn tcp_info(c: &Conn) -> Option<(u8, u8, u8, u8, u8)> {
+    match &c.proto {
+        Proto::Tcp(t) => Some((t.state, t.seen[0].td_scale, t.seen[1].td_scale, t.seen[0].flags, t.seen[1].flags)),
+        _ => None,
+    }
+}
+
 /// nf_ct_expires (ns)。まだ表にないもの (長さを持っている) は 0 (Linux も負になって 0)
 pub fn expires_ns(c: &Conn) -> u64 {
     if c.status & IPS_CONFIRMED != 0 { c.timeout.saturating_sub(now()) } else { 0 }
@@ -528,7 +555,10 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
         };
         match res {
             Res::Accept => {}
-            Res::Invalid => return 1,
+            Res::Invalid => {
+                INVALID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return 1;
+            }
             Res::Repeat => {
                 if let Ct::Known(id, _) = c {
                     kill(id);

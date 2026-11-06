@@ -52,6 +52,7 @@ mod netlink;
 mod nftables;
 mod nfhook;
 mod conntrack;
+mod ctnetlink;
 mod parts;
 mod pidfd;
 mod proc;

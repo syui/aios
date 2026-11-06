@@ -1,0 +1,62 @@
+# conntrack-tools: conntrack (つながりの表を見る・消す・数える: conntrack -L / -D / -F / -C / -S / -E。aios のカーネルの
+#   ctnetlink: kernel/src/conntrack.rs、doc/aios.md の「ファイアウォール (nftables)」)。静的なバイナリ 1 つで /opt/c に
+#   入る。conntrackd (つながりの表を機械どうしで写すデーモン) と nfct は入れない (1 用途 1 つ: 核だけ)
+#   中で使う libnetfilter_conntrack、libnfnetlink、libmnl もここで静的に作る (ほかのパッケージは使わないので、別の
+#   パッケージにしない)。NFS の helper のための rpc の頭 (musl にない) は使わないので、libtirpc は空にわたす
+pkgname=conntrack-tools
+pkgver=1.4.9
+pkgrel=1
+_ct=1.1.1
+_nfnl=1.0.2
+_mnl=1.0.5
+pkgdesc='conntrack, the connection tracking tool, with libnetfilter_conntrack, libnfnetlink and libmnl inside (static, for aios)'
+arch=('aarch64')
+url='https://netfilter.org/projects/conntrack-tools/'
+license=('GPL-2.0-or-later' 'LGPL-2.1-or-later')
+source=("https://netfilter.org/pub/conntrack-tools/conntrack-tools-$pkgver.tar.xz"
+        "https://netfilter.org/pub/libnetfilter_conntrack/libnetfilter_conntrack-$_ct.tar.xz"
+        "https://netfilter.org/pub/libnfnetlink/libnfnetlink-$_nfnl.tar.bz2"
+        "https://netfilter.org/pub/libmnl/libmnl-$_mnl.tar.bz2")
+sha256sums=('c15afe488a8d408c9d6d61e97dbd19f3c591942f62c13df6453a961ca4231cae'
+            '769d3eaf57fa4fbdb05dd12873b6cb9a5be7844d8937e222b647381d44284820'
+            'b064c7c3d426efb4786e60a8e6859b82ee2f2c5e49ffeea640cfe4fe33cbc376'
+            '274b9b919ef3152bfb3da3a13c950dd60d6e2bcd54230ffeca298d03b40d0525')
+
+prepare() {
+  rm -rf "conntrack-tools-$pkgver" "libnetfilter_conntrack-$_ct" "libnfnetlink-$_nfnl" "libmnl-$_mnl"
+  tar -xJf "conntrack-tools-$pkgver.tar.xz"
+  tar -xJf "libnetfilter_conntrack-$_ct.tar.xz"
+  tar -xjf "libnfnetlink-$_nfnl.tar.bz2"
+  tar -xjf "libmnl-$_mnl.tar.bz2"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  # 中で使うライブラリは $srcdir/deps に入れ、pkg-config でそこから見る
+  local deps=$srcdir/deps
+  export PKG_CONFIG_LIBDIR=$deps/lib/pkgconfig PKG_CONFIG_PATH=
+  local conf=(--host=aarch64-linux-musl --disable-shared --enable-static)
+  (cd "libmnl-$_mnl" && ./configure "${conf[@]}" --prefix="$deps" && make && make install)
+  (cd "libnfnetlink-$_nfnl" && ./configure "${conf[@]}" --prefix="$deps" && make && make install)
+  (cd "libnetfilter_conntrack-$_ct" && ./configure "${conf[@]}" --prefix="$deps" && make && make install)
+  cd "conntrack-tools-$pkgver"
+  # configure は rpc/rpc_msg.h か libtirpc をいつも探す (使うのは helper だけ): 空でないものをわたして pkg-config を
+  # よけさせる
+  LIBTIRPC_CFLAGS=' ' LIBTIRPC_LIBS=' ' ./configure "${conf[@]}" --prefix="$PREFIX" --sysconfdir=/etc \
+    --disable-cthelper --disable-cttimeout --disable-systemd
+  # conntrack だけ (conntrackd と nfct は作らない)
+  make -C extensions
+  make -C src conntrack
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd "conntrack-tools-$pkgver"
+  install -Dm755 src/conntrack "$pkgdir$PREFIX/bin/conntrack"
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  install -Dm644 "$srcdir/libnetfilter_conntrack-$_ct/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING.libnetfilter_conntrack"
+  install -Dm644 "$srcdir/libnfnetlink-$_nfnl/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING.libnfnetlink"
+  install -Dm644 "$srcdir/libmnl-$_mnl/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING.libmnl"
+}
