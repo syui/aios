@@ -55,6 +55,125 @@ pub struct NetDev {
     virtio: VirtioNet,
     lo: VecDeque<Vec<u8>>,
     mac: [u8; 6],
+    /// eth0 へ出すのを待つフレーム (virtio の送る入れ物は 16 こ: 断片がそれより多いとき。flush で出す)
+    txq: VecDeque<Vec<u8>>,
+}
+
+/// 送り待ちの列がこれより長ければ smoltcp に送らせない
+const TXQ_MAX: usize = 64;
+
+/// 断片のたのみ (udp6_send が入れる: IPV6_MTU_DISCOVER が PROBE からのソケットは path MTU ではなく口の MTU で断片に
+/// するかを決め、IPV6_MTU の frag_size がそれより小さければ断片の大きさはそれで: ip6_skb_dst_mtu と ip6_setup_cork)。
+/// (送り元、あて先、送り元のポート、あて先のポート、断片にするかを決める MTU、断片の大きさの MTU)
+type FragHint = (u128, u128, u16, u16, u32, u32);
+static FRAG_HINT: Bkl<Vec<FragHint>> = Bkl::new(Vec::new());
+
+pub fn frag_hint(src: u128, dst: u128, sport: u16, dport: u16, limit: u32, chunk: u32) {
+    let v = FRAG_HINT.get();
+    v.retain(|x| (x.0, x.1, x.2, x.3) != (src, dst, sport, dport));
+    if v.len() >= 16 {
+        v.remove(0);
+    }
+    v.push((src, dst, sport, dport, limit, chunk));
+}
+
+/// IPv6 のフレームの (断片にするかを決める MTU、断片の大きさの MTU)。ほどけない頭の長さと、その次の頭の番号のあるところも
+fn v6_mtus(ip: &[u8]) -> (usize, usize, usize, usize) {
+    let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+    let (mut hlen, mut nh_at) = (40, 6);
+    if ip[6] == 0 && ip.len() > 41 {
+        hlen += (ip[41] as usize + 1) * 8;
+        nh_at = 40;
+    }
+    let limit = (crate::addrconf::path_mtu(dst) as usize).min(1500);
+    if ip[nh_at] == 17 && ip.len() >= hlen + 4 {
+        let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+        let (sp, dp) = (u16::from_be_bytes([ip[hlen], ip[hlen + 1]]), u16::from_be_bytes([ip[hlen + 2], ip[hlen + 3]]));
+        if let Some(h) = FRAG_HINT.get().iter().find(|x| (x.0, x.1, x.2, x.3) == (src, dst, sp, dp)) {
+            return ((h.4 as usize).min(1500), (h.5 as usize).min(1500), hlen, nh_at);
+        }
+    }
+    (limit, limit, hlen, nh_at)
+}
+
+/// IPv4 の断片の identification (ip_select_ident のかわり)
+static IP_ID: AtomicU32 = AtomicU32::new(0);
+
+/// eth0 に出すフレーム f が MTU より大きければ断片に (Linux の ip6_fragment と ip_fragment)。IPv6 は path MTU (packet too
+/// big で下がったもの、なければ eth0 の mtu) をこえるもの: hop-by-hop のうしろに Fragment ヘッダ、上の層は
+/// ((MTU - 頭) & !7) - 8 バイトずつ (IPV6_MTU の frag_size があればその MTU で)、identification はでたらめ。IPv4 は
+/// 1500 をこえるもの: (1500 - 頭) & !7 バイトずつ、DF をはずして MF と offset。分けられないもの (頭が MTU をこえる) と、
+/// 分けたあとも入れ物 (1514) より大きいものは出さない
+fn fragments(f: Vec<u8>) -> Vec<Vec<u8>> {
+    const MAX: usize = 1514;
+    let v6 = ipv6_ok(&f);
+    let ip = &f[14..];
+    if v6 {
+        let ip = &ip[..40 + u16::from_be_bytes([ip[4], ip[5]]) as usize];
+        // ほどけない頭 (IPv6 の頭と hop-by-hop) の長さ hlen、nh_at はその次の頭の番号のあるところ
+        let (limit, mtu, hlen, nh_at) = v6_mtus(ip);
+        if ip.len() <= limit {
+            return alloc::vec![f];
+        }
+        let mut out = Vec::new();
+        if mtu < hlen + 16 {
+            return out;
+        }
+        let per = ((mtu - hlen) & !7) - 8;
+        let id = crate::rand::u32();
+        let rest = &ip[hlen..];
+        let mut off = 0;
+        while off < rest.len() {
+            let n = per.min(rest.len() - off);
+            let more = off + n < rest.len();
+            let mut fr = Vec::with_capacity(14 + hlen + 8 + n);
+            fr.extend_from_slice(&f[..14]);
+            fr.extend_from_slice(&ip[..hlen]);
+            fr[14 + 4..14 + 6].copy_from_slice(&((hlen - 40 + 8 + n) as u16).to_be_bytes());
+            fr[14 + nh_at] = 44;
+            fr.extend_from_slice(&[ip[nh_at], 0]);
+            fr.extend_from_slice(&(off as u16 | more as u16).to_be_bytes());
+            fr.extend_from_slice(&id.to_be_bytes());
+            fr.extend_from_slice(&rest[off..off + n]);
+            out.push(fr);
+            off += n;
+        }
+        return out;
+    }
+    if f.len() <= MAX {
+        return alloc::vec![f];
+    }
+    let mut out = Vec::new();
+    if ipv4_ok(&f) {
+        let ihl = (ip[0] & 15) as usize * 4;
+        let ip = &ip[..u16::from_be_bytes([ip[2], ip[3]]) as usize];
+        let per = (1500 - ihl) & !7;
+        let mut id = u16::from_be_bytes([ip[4], ip[5]]);
+        if id == 0 {
+            id = (IP_ID.fetch_add(1, Ordering::Relaxed) as u16).wrapping_add(crate::rand::u32() as u16) | 1;
+        }
+        let rest = &ip[ihl..];
+        let mut off = 0;
+        while off < rest.len() {
+            let n = per.min(rest.len() - off);
+            let more = off + n < rest.len();
+            let mut fr = Vec::with_capacity(14 + ihl + n);
+            fr.extend_from_slice(&f[..14]);
+            fr.extend_from_slice(&ip[..ihl]);
+            fr.extend_from_slice(&rest[off..off + n]);
+            let h = &mut fr[14..14 + ihl];
+            h[2..4].copy_from_slice(&((ihl + n) as u16).to_be_bytes());
+            h[4..6].copy_from_slice(&id.to_be_bytes());
+            h[6..8].copy_from_slice(&(((off / 8) as u16) | if more { 0x2000 } else { 0 }).to_be_bytes());
+            h[10..12].fill(0);
+            let sum = crate::nfhook::csum_fold(crate::nfhook::csum_add(0, h));
+            h[10..12].copy_from_slice(&sum.to_be_bytes());
+            out.push(fr);
+            off += n;
+        }
+    }
+    out.retain(|x| x.len() <= MAX);
+    out
 }
 
 /// eth0 のいまのアドレス (自分あてかを見分ける。なければ 0)、ネットマスクの長さ、ゲートウェイ (ファイアウォールが
@@ -205,7 +324,8 @@ impl Device for NetDev {
             return Some((Rx(frame), Tx(self)));
         }
         loop {
-            if !self.virtio.can_send() {
+            self.flush();
+            if self.txq.len() >= TXQ_MAX {
                 return None;
             }
             let mut frame = self.virtio.recv()?;
@@ -237,7 +357,8 @@ impl Device for NetDev {
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Tx<'_>> {
-        self.virtio.can_send().then_some(Tx(self))
+        self.flush();
+        (self.txq.len() < TXQ_MAX).then_some(Tx(self))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -274,14 +395,15 @@ impl TxToken for Tx<'_> {
                 self.0.lo.push_back(buf);
             }
         } else if self.0.filter_out(&mut buf, false) {
-            count(false, false, len);
             if len >= 14 && buf[12..14] == [8, 6] {
                 crate::netlink::arp_out(&buf);
             }
             if len >= 54 && buf[12..14] == [0x86, 0xdd] {
                 crate::netlink::nd_out(&buf);
             }
-            self.0.virtio.send(len, |b| b.copy_from_slice(&buf));
+            // MTU より大きければ断片に (決まりはまるごとのものを見た: Linux も断片にするのは POST_ROUTING のあと)
+            self.0.txq.extend(fragments(buf));
+            self.0.flush();
         }
         r
     }
@@ -408,6 +530,15 @@ fn link_failure(n: &mut Net, p: &[u8]) {
 }
 
 impl NetDev {
+    /// 送り待ちのフレームを、virtio の入れ物があくだけ出す
+    fn flush(&mut self) {
+        while !self.txq.is_empty() && self.virtio.can_send() {
+            let f = self.txq.pop_front().unwrap();
+            count(false, false, f.len());
+            self.virtio.send(f.len(), |b| b.copy_from_slice(&f));
+        }
+    }
+
     /// eth0 から来たフレームを決まりに通す (false なら捨てる)。DHCP の答え (UDP 67 → 68) は落とされても届ける
     /// (Linux の DHCP は AF_PACKET で受けるので、netfilter に関わらず届く)
     fn filter_in(&mut self, f: &mut [u8]) -> bool {
@@ -442,11 +573,9 @@ impl NetDev {
         match crate::nfhook::in_eth(f, local, pkttype) {
             crate::nfhook::EthIn::Pass => true,
             crate::nfhook::EthIn::Drop(reply) => {
-                if let Some(r) = reply
-                    && self.virtio.can_send()
-                {
-                    count(false, false, r.len());
-                    self.virtio.send(r.len(), |b| b.copy_from_slice(&r));
+                if let Some(r) = reply {
+                    self.txq.push_back(r);
+                    self.flush();
                 }
                 dhcp
             }
@@ -470,11 +599,9 @@ impl NetDev {
         match crate::nfhook::in_eth(&mut f[..tot], local, pkttype) {
             crate::nfhook::EthIn::Pass => true,
             crate::nfhook::EthIn::Drop(reply) => {
-                if let Some(r) = reply
-                    && self.virtio.can_send()
-                {
-                    count(false, false, r.len());
-                    self.virtio.send(r.len(), |b| b.copy_from_slice(&r));
+                if let Some(r) = reply {
+                    self.txq.push_back(r);
+                    self.flush();
                 }
                 false
             }
@@ -621,7 +748,7 @@ fn sync6(n: &mut Net) {
 pub fn init() {
     let Some(virtio) = VirtioNet::probe() else { return };
     let mac = EthernetAddress(virtio.mac);
-    let mut dev = NetDev { mac: virtio.mac, virtio, lo: VecDeque::new() };
+    let mut dev = NetDev { mac: virtio.mac, virtio, lo: VecDeque::new(), txq: VecDeque::new() };
     let mut cfg = Config::new(mac.into());
     cfg.random_seed = crate::rand::u64();
     let mut iface = Interface::new(cfg, &mut dev, now());
@@ -835,12 +962,13 @@ pub fn chan() -> usize {
 pub fn poll() {
     let Some(n) = get() else { return };
     // IPv6: DAD の NS と RS を出す、lifetime の切れたものを捨てる、変わったものを smoltcp に
+    n.dev.flush();
     for mut f in crate::addrconf::tick() {
-        if n.dev.virtio.can_send() && n.dev.filter_out(&mut f, false) {
-            count(false, false, f.len());
-            n.dev.virtio.send(f.len(), |b| b.copy_from_slice(&f));
+        if n.dev.filter_out(&mut f, false) {
+            n.dev.txq.push_back(f);
         }
     }
+    n.dev.flush();
     sync6(n);
     let mut changed = n.iface.poll(now(), &mut n.dev, &mut n.sockets) == smoltcp::iface::PollResult::SocketStateChanged;
     // 自分あてに出したものを受け取る (ARP の問い合わせ → 答え → パケット、と続くので何回か)

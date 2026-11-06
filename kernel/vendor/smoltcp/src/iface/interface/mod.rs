@@ -1313,10 +1313,20 @@ impl InterfaceInner {
                         })
                     }
 
+                    // aios: hand the whole packet to the device, which fragments it (like IPv6 below)
                     #[cfg(not(feature = "proto-ipv4-fragmentation"))]
                     {
-                        net_debug!("Enable the `proto-ipv4-fragmentation` feature for fragmentation support.");
-                        Ok(())
+                        tx_token.set_meta(meta);
+                        tx_token.consume(total_len, |mut tx_buffer| {
+                            #[cfg(feature = "medium-ethernet")]
+                            if matches!(self.caps.medium, Medium::Ethernet) {
+                                emit_ethernet(&ip_repr, tx_buffer)?;
+                                tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+                            }
+
+                            emit_ip(&ip_repr, tx_buffer);
+                            Ok(())
+                        })
                     }
                 } else {
                     tx_token.set_meta(meta);

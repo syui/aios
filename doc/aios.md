@@ -1359,7 +1359,7 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   ee_info に知らされた MTU。IPV6_MTU_DISCOVER が DONT でなければ致命、INTERFACE と OMIT は見ない)。IPV6_MTU
   (getsockopt) はつないだもののあて先への path MTU (つないでいなければ ENOTCONN)、ip -6 route get はその例外の道
   (RTM_F_CLONED、RTAX_MTU、expires)。TCP の MSS は smoltcp が変えられないので、そのまま。送るときに path MTU で
-  断片にしたり EMSGSIZE を返したりもまだ。`test/ldiff.sh --root --net pmtu6` で手本の Linux 7.4-rc1 と 22 行同じ
+  断片にするのと EMSGSIZE は下の「MTU より大きい UDP」。`test/ldiff.sh --root --net pmtu6` で手本の Linux 7.4-rc1 と 22 行同じ
 - マルチキャストの組 (Linux の net/ipv6/mcast.c): UDP のソケットが IPV6_JOIN_GROUP / IPV6_LEAVE_GROUP (struct
   ipv6_mreq。TCP は EPROTO) と MCAST_JOIN_GROUP / MCAST_LEAVE_GROUP (struct group_req。AF_INET6 でなければ
   EADDRNOTAVAIL) で組に入る・出る (ipv6_sock_mc_join / drop: マルチキャストでなければ EINVAL、同じ組に 2 度は
@@ -1395,7 +1395,24 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   番地の一覧は idev->addr_list の順 (scope の値の大きいもの (site-local 0x40、link-local 0x20、global 0) が先、同じなら
   新しいものが先)。`test/ldiff.sh --root --net temp6` (RS を送って QEMU の RA で作る。IID は <temp>、lifetime は SLAAC の
   ものとくらべる。/proc/net/if_inet6 は Linux はハッシュの順なので並べる) で手本の Linux 7.4-rc1 と 83 行同じ
-- まだ: path MTU で送るものを断片にする (と IPV6_DONTFRAG の EMSGSIZE)
+- MTU より大きい UDP (Linux の __ip6_append_data・ip6_fragment と __ip_append_data・ip_fragment): 送るときの MTU は
+  IPv6 は path MTU (packet too big で下がったもの、なければ eth0 の mtu。IPV6_MTU_DISCOVER が PROBE からは口の MTU、
+  自分あては lo の mtu。IPV6_MTU の frag_size (0 か 1280 から) がそれより小さければそれ)、IPv4 は 1500 (自分あては 65536)。
+  IPV6_DONTFRAG (ソケットか sendmsg の付帯データ: int でなければ EINVAL) で入らなければ EMSGSIZE で、IPV6_RECVPATHMTU
+  なら次の recvmsg が 0 バイトと IPV6_PATHMTU (struct ip6_mtuinfo: あて先、口、MTU。1 つだけ: ipv6_local_rxpmtu)。
+  IPV6_MTU_DISCOVER / IP_MTU_DISCOVER が DO・PROBE・INTERFACE で入らないか、断片にしても 65535 に入らなければ
+  EMSGSIZE。どれも IPV6_RECVERR / IP_RECVERR ならエラーの行列に SO_EE_ORIGIN_LOCAL (中身 0 バイト、ee_info は MTU、知らせて
+  きた番地なし、付帯データの口なし、名前は IPv6 は送ったあて先とポートで scope 0、IPv4 はつないだ相手のポート。sk_err は
+  変えない: sock_dequeue_err_skb)。getsockopt の IPV6_PATHMTU はつないだあて先への path MTU (番地は 0、つないでいなければ
+  ENOTCONN)。ほかは eth0 で断片にする (net.rs の fragments: 決まりはまるごとのものを見たあと)。IPv6 は Fragment ヘッダ、
+  上の層は ((MTU - 40) & !7) - 8 バイトずつ (1500 なら 1448)、identification はでたらめ。frag_size があると断片の大きさは
+  それで決まるが、断片にするかは path MTU で決まる (1281〜1500 は 1 つのまま: ip6_finish_output のくせ)。IPv4 は 1480
+  バイトずつ、DF をはずして MF と offset (smoltcp の写しは MTU より大きい IPv4 をまるごとわたすように: AIOS.md)。virtio の
+  送る入れ物は 16 こなので、送り待ちの列 (64 まで) から入れ物があくたびに出す。前は IPv6 の大きなものでカーネルが
+  panic し (virtio の入れ物より大きいフレーム)、IPv4 のものは黙って捨てていた。smoltcp の UDP の送る入れ物は 64 KB に
+  (65527 バイトのデータグラム)。`test/ldiff.sh --root --net frag6` (断片は外に出るだけなので eth0 の tx_packets と
+  tx_bytes で数える。近所さがしが入らないように IPv6 はマルチキャスト、IPv4 はブロードキャストへ。Linux の RS のくりかえし
+  は router_solicitations を 0 にして止める) で手本の Linux 7.4-rc1 と 160 行同じ
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`

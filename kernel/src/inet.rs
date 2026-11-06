@@ -203,7 +203,12 @@ struct ErrMsg {
     offender: u128,
     ifindex: u32,
     local: u128,
+    /// ee_origin: SO_EE_ORIGIN_LOCAL (1: 送るときに分かった EMSGSIZE。知らせてきた番地も付帯データの口もない)、
+    /// SO_EE_ORIGIN_ICMP (2)、SO_EE_ORIGIN_ICMP6 (3)
+    origin: u8,
 }
+
+const EE_ORIGIN_LOCAL: u8 = 1;
 
 pub struct Inet {
     pub tcp: bool,
@@ -256,6 +261,12 @@ pub struct Inet {
     rx_hoplimit: bool,
     pmtudisc6: i32,
     recverr6: bool,
+    /// IPV6_DONTFRAG、IPV6_RECVPATHMTU と、まだ読んでいない IPV6_PATHMTU (ipv6_local_rxpmtu: (あて先、口、MTU))、
+    /// IPV6_MTU の frag_size (0 はなし)
+    dontfrag6: bool,
+    rxpmtu_on: bool,
+    rxpmtu: Option<(u128, u32, u32)>,
+    frag_size: u32,
     /// bind で決めたもの (SOCK_BINDADDR_LOCK / SOCK_BINDPORT_LOCK) と、setsockopt で決めた入れ物 (SOCK_SNDBUF_LOCK /
     /// SOCK_RCVBUF_LOCK)
     lock_addr: bool,
@@ -495,6 +506,10 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         rx_hoplimit: false,
         pmtudisc6: 1,
         recverr6: false,
+        dontfrag6: false,
+        rxpmtu_on: false,
+        rxpmtu: None,
+        frag_size: 0,
         lock_addr: false,
         lock_port: false,
         lock_sndbuf: false,
@@ -1501,6 +1516,9 @@ fn syn(u: &InetRef, in_call: bool) {
             x.rx_hoplimit = l.rx_hoplimit;
             x.pmtudisc6 = l.pmtudisc6;
             x.recverr6 = l.recverr6;
+            x.dontfrag6 = l.dontfrag6;
+            x.rxpmtu_on = l.rxpmtu_on;
+            x.frag_size = l.frag_size;
             x.ss = Ss::Connected;
             established(&mut x, adv(my_mss), HALF_WND_SERVER);
             // listen する前の shutdown の印も写る (Linux の sk_clone_lock は sk_shutdown もそのまま写す)
@@ -3397,6 +3415,73 @@ pub fn udp6_mcast_rx(ip: &[u8]) {
     udp6_mcast_deliver(0, src, sport, dst, dport, &udp[8..], ip[7], tclass, crate::netlink::ETH_INDEX);
 }
 
+/// sendmsg の付帯データの IPV6_DONTFRAG (ip6_datagram_send_ctl: int でなければ EINVAL)。ほかは見ない
+fn cmsg6_dontfrag(ctl: &[u8]) -> Result<Option<bool>, i64> {
+    let mut df = None;
+    let mut off = 0usize;
+    while off + 16 <= ctl.len() {
+        let clen = u64::from_le_bytes(ctl[off..off + 8].try_into().unwrap()) as usize;
+        let level = i32::from_le_bytes(ctl[off + 8..off + 12].try_into().unwrap());
+        let typ = i32::from_le_bytes(ctl[off + 12..off + 16].try_into().unwrap());
+        if clen < 16 || clen > ctl.len() - off {
+            return Err(crate::why::inval());
+        }
+        if (level, typ) == (IPPROTO_IPV6, 62) {
+            if clen != 20 {
+                return Err(crate::why::inval());
+            }
+            df = Some(i32::from_le_bytes(ctl[off + 16..off + 20].try_into().unwrap()) != 0);
+        }
+        off += clen.div_ceil(8) * 8;
+    }
+    Ok(df)
+}
+
+/// 送るときに分かったエラーをエラーの行列に (ipv6_local_error / ip_local_error: IPV6_RECVERR / IP_RECVERR のときだけ。
+/// sk_err は変えない)
+fn local_error(u: &InetRef, v6: bool, to: (u128, u16), info: u32) {
+    let mut s = u.borrow_mut();
+    if if v6 { s.recverr6 } else { s.recverr } {
+        s.errq.push_back(ErrMsg { data: Vec::new(), errno: EMSGSIZE as u32, v6, typ: 0, code: 0, info, to, offender: 0, ifindex: 0, local: 0, origin: EE_ORIGIN_LOCAL });
+        drop(s);
+        notify(u);
+    }
+}
+
+/// IPv6 の UDP のデータグラムが MTU に入るか (__ip6_append_data): MTU は ip6_setup_cork の fragsize (IPV6_MTU_DISCOVER
+/// が PROBE からは口の MTU、ほかは path MTU。自分あては lo の mtu。IPV6_MTU の frag_size がそれより小さければそれ)。
+/// DONTFRAG (ソケットか付帯データ) で入らなければ IPV6_PATHMTU を残して EMSGSIZE、DO・PROBE・INTERFACE で入らないか、
+/// 断片にしても IPv6 の 65535 に入らなければ EMSGSIZE (どれも IPV6_RECVERR なら SO_EE_ORIGIN_LOCAL、ee_info は MTU)。
+/// 返すのは eth0 の断片のたのみ (断片にするかを決める MTU、断片の大きさの MTU)。いつもどおりなら (0, 0)
+fn udp6_mtu_check(u: &InetRef, len: usize, daddr: u128, dport: u16, local: bool, cmsg_df: Option<bool>) -> Result<(u32, u32), i64> {
+    let (pmtud, frag, df) = {
+        let s = u.borrow();
+        (s.pmtudisc6, s.frag_size, cmsg_df.unwrap_or(s.dontfrag6))
+    };
+    let dev_mtu = if local { crate::addrconf::CONF.get()[crate::addrconf::CONF_LO].mtu as u32 } else { 1500 };
+    let limit = if local || pmtud >= 3 { dev_mtu } else { crate::addrconf::path_mtu(daddr) };
+    let mtu = if frag != 0 && frag < limit { frag } else { limit };
+    let ulen = len + 8;
+    if df && ulen > mtu as usize - 40 {
+        {
+            let mut s = u.borrow_mut();
+            if s.rxpmtu_on {
+                s.rxpmtu = Some((daddr, if v6_needs_scope(daddr) { crate::netlink::ETH_INDEX as u32 } else { 0 }, mtu));
+            }
+        }
+        local_error(u, true, (daddr, dport), mtu);
+        return Err(-EMSGSIZE);
+    }
+    let ignore_df = pmtud < 2 || pmtud == 5;
+    let maxnonfrag = if ignore_df { 40 + 0xffff } else { mtu as usize };
+    if ulen > maxnonfrag - 40 {
+        local_error(u, true, (daddr, dport), mtu);
+        return Err(-EMSGSIZE);
+    }
+    let dflt = crate::addrconf::path_mtu(daddr);
+    Ok(if local || (limit == dflt && mtu == dflt) { (0, 0) } else { (limit, mtu) })
+}
+
 fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
     let (v6only, saddr6, rcv6, pending) = {
         let s = u.borrow();
@@ -3446,15 +3531,13 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
         let to4 = sockaddr(daddr as u32, dport);
         return udp_send4(u, src, len, if dest.is_some() { Some(&to4) } else { None }, ctl, flags);
     }
-    if len > 0xffff - 8 {
-        return Err(-EMSGSIZE);
-    }
     if flags & MSG_OOB != 0 {
         return Err(-EOPNOTSUPP);
     }
     if dest.is_some() && dport == 0 {
         return Err(crate::why::inval());
     }
+    let cmsg_df = cmsg6_dontfrag(ctl)?;
     let daddr = if daddr == 0 { LOOPBACK6 } else { daddr };
     if is_mapped(rcv6) {
         return Err(-EAFNOSUPPORT);
@@ -3462,6 +3545,7 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
     let netns = u.borrow().net;
     let prefs = u.borrow().srcprefs;
     let (daddr, src6, local) = route6(netns, daddr, if rcv6 != 0 { rcv6 } else { saddr6 }, scope, prefs)?;
+    let (limit, chunk) = udp6_mtu_check(u, len, daddr, dport, local, cmsg_df)?;
     autobind(u)?;
     let e = take_err(u);
     if e != 0 {
@@ -3518,12 +3602,18 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             udp6_mcast_deliver(netns, src6, sport, daddr, dport, &data, mh, tclass, crate::netlink::ETH_INDEX);
         }
         if (daddr >> 112) & 0xf > 1 {
+            if (limit, chunk) != (0, 0) {
+                net::frag_hint(src6, daddr, sport, dport, limit, chunk);
+            }
             ext_udp_send6(u, &data, src6, daddr, dport, Some(mh))?;
         }
         return Ok(len as i64);
     }
     // 外へ (eth0): smoltcp の UDP のソケットから
     if !local {
+        if (limit, chunk) != (0, 0) {
+            net::frag_hint(src6, daddr, sport, dport, limit, chunk);
+        }
         let hops = u.borrow().hops6;
         ext_udp_send6(u, &data, src6, daddr, dport, if hops < 0 { None } else { Some(hops as u8) })?;
         return Ok(len as i64);
@@ -3604,7 +3694,7 @@ fn udp6_icmp(u: &InetRef, data: &[u8], src6: u128, daddr: u128, dport: u16, typ:
         if s.recverr6 {
             // ICMPv6 のエラーにのるのは 1280 バイトまで (IPv6 と ICMPv6 の頭、送ったものの IPv6 と UDP の頭をのぞいた中身)
             let keep = data.len().min(1280 - 40 - 8 - 40 - 8);
-            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: true, typ, code, info, to: (daddr, dport), offender, ifindex, local: src6 });
+            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: true, typ, code, info, to: (daddr, dport), offender, ifindex, local: src6, origin: 3 });
         }
         s.err = -errno;
     }
@@ -3672,9 +3762,18 @@ fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
     if u.borrow().shutdown & SEND != 0 {
         return Err(-EPIPE);
     }
+    // __ip_append_data: IP_MTU_DISCOVER が DO・PROBE・INTERFACE なら MTU (自分あては lo の 65536、ほかは eth0 の 1500) に、
+    // ほかは断片にしても 65535 に入らなければ EMSGSIZE (IP_RECVERR なら SO_EE_ORIGIN_LOCAL、名前のポートはつないだ相手の)
     let already = pending.map_or(0, |p| p.2);
-    if already + len + 8 > 0xffff - 20 {
+    let (pmtud, cport) = {
+        let s = u.borrow();
+        (s.pmtudisc, if s.state == St::Established { s.dport } else { 0 })
+    };
+    let mtu: usize = if local { 65536 } else { 1500 };
+    let maxnonfrag = if pmtud < 2 || pmtud == 5 { 0xffff } else { mtu };
+    if already + len + 8 > maxnonfrag - 20 {
         u.borrow_mut().pending = None;
+        local_error(u, false, (daddr as u128, cport), mtu as u32);
         return Err(-EMSGSIZE);
     }
     let data = take(src, 0, len)?;
@@ -3779,7 +3878,7 @@ fn icmp_err_udp(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32, co
         if s.recverr {
             // ICMP にのるのは 576 バイトまで (IP と ICMP の頭、送ったものの IP と UDP の頭をのぞいた中身)
             let keep = data.len().min(576 - 20 - 8 - 20 - 8);
-            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: false, typ: 3, code, info: 0, to: (daddr as u128, dport), offender: offender as u128, ifindex, local: saddr as u128 });
+            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: false, typ: 3, code, info: 0, to: (daddr as u128, dport), offender: offender as u128, ifindex, local: saddr as u128, origin: 2 });
         }
         s.err = -errno;
     }
@@ -3828,10 +3927,13 @@ fn exterr(m: &ErrMsg, fam6: bool) -> Vec<u8> {
     b.extend_from_slice(&m.errno.to_le_bytes());
     // ee_origin (SO_EE_ORIGIN_ICMP6 か SO_EE_ORIGIN_ICMP)、ee_type、ee_code、ee_pad、ee_info (packet too big の MTU)、
     // ee_data (0)
-    b.extend_from_slice(&[if m.v6 { 3 } else { 2 }, m.typ, m.code, 0]);
+    b.extend_from_slice(&[m.origin, m.typ, m.code, 0]);
     b.extend_from_slice(&m.info.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
-    if fam6 {
+    // SO_EE_ORIGIN_LOCAL は知らせてきた番地がない (AF_UNSPEC)
+    if m.origin == EE_ORIGIN_LOCAL {
+        b.resize(b.len() + if fam6 { 28 } else { 16 }, 0);
+    } else if fam6 {
         b.extend_from_slice(&sockaddr6(err_addr6(m, m.offender), 0));
     } else {
         b.extend_from_slice(&sockaddr(m.offender as u32, 0));
@@ -3853,9 +3955,15 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
     r.data = m.data[..n].to_vec();
     r.ret = n;
     r.flags |= MSG_ERRQUEUE as u32;
+    let local = m.origin == EE_ORIGIN_LOCAL;
     if s.family == AF_INET6 {
-        r.from = Some(sockaddr6(err_addr6(&m, m.to.0), m.to.1).to_vec());
-        if s.rx_pktinfo6 {
+        let mut name = sockaddr6(err_addr6(&m, m.to.0), m.to.1);
+        if local {
+            // ipv6_recv_error の scope は受けた口から (送るときのものは 0)
+            name[24..28].fill(0);
+        }
+        r.from = Some(name.to_vec());
+        if s.rx_pktinfo6 && !local {
             let mut b = Vec::with_capacity(20);
             b.extend_from_slice(&err_addr6(&m, m.local).to_be_bytes());
             b.extend_from_slice(&m.ifindex.to_le_bytes());
@@ -3864,7 +3972,7 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
         r.cmsgs.push((41, 25, exterr(&m, true)));
     } else {
         r.from = Some(sockaddr(m.to.0 as u32, m.to.1).to_vec());
-        if s.pktinfo {
+        if s.pktinfo && !local {
             // in_pktinfo: 口、ipi_spec_dst (エラーでは 0)、そのあて先
             let mut b = Vec::with_capacity(12);
             b.extend_from_slice(&m.ifindex.to_le_bytes());
@@ -3874,7 +3982,14 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
         }
         r.cmsgs.push((0, 11, exterr(&m, false)));
     }
-    s.err = s.errq.front().map_or(0, |x| -(x.errno as i64));
+    // sock_dequeue_err_skb: 次が ICMP のものならその errno を sk_err に、ICMP のものを読んで次がなければ 0 に (送るときの
+    // エラーは sk_err を変えない)
+    let icmp_next = s.errq.front().is_some_and(|x| x.origin != EE_ORIGIN_LOCAL);
+    if icmp_next {
+        s.err = -(s.errq.front().unwrap().errno as i64);
+    } else if !local {
+        s.err = 0;
+    }
     Ok(r)
 }
 
@@ -3884,6 +3999,24 @@ fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv,
     let _p = crate::prof::span("inet:udp_recv");
     if flags & MSG_ERRQUEUE != 0 {
         return recv_error(u, len);
+    }
+    // IPV6_RECVPATHMTU のもの (ipv6_recv_rxpmtu): 中身は 0 バイト、名前はあて先 (port 0)、付帯データ IPV6_PATHMTU
+    {
+        let mut s = u.borrow_mut();
+        if s.rxpmtu_on
+            && let Some((addr, scope, mtu)) = s.rxpmtu.take()
+        {
+            let mut name = [0u8; 28];
+            name[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+            name[8..24].copy_from_slice(&addr.to_be_bytes());
+            name[24..28].copy_from_slice(&scope.to_le_bytes());
+            let mut info = name.to_vec();
+            info.extend_from_slice(&mtu.to_le_bytes());
+            let mut r = Recv::new();
+            r.from = Some(name.to_vec());
+            r.cmsgs.push((41, 61, info));
+            return Ok(r);
+        }
     }
     let peek = flags & MSG_PEEK != 0;
     loop {
@@ -4255,6 +4388,19 @@ pub fn getsockopt(u: &InetRef, level: i32, opt: i32, len: i32) -> Result<Vec<u8>
     let tcp = u.borrow().tcp;
     // AF_INET6: SOL_IPV6 (do_ipv6_getsockopt)。SOL_IP は IPv4 のもの、ほかの level は ENOPROTOOPT
     if u.borrow().family == AF_INET6 {
+        // IPV6_PATHMTU: struct ip6_mtuinfo (番地は 0、つないだあて先への path MTU。つないでいなければ ENOTCONN)
+        if level == IPPROTO_IPV6 && opt == 61 {
+            if len < 32 {
+                return Err(crate::why::inval());
+            }
+            let s = u.borrow();
+            if s.state != St::Established || s.tcp {
+                return Err(-ENOTCONN);
+            }
+            let mut v = alloc::vec![0u8; 32];
+            v[28..32].copy_from_slice(&crate::addrconf::path_mtu(if s.v6 { s.daddr6 } else { mapped(s.daddr) }).to_le_bytes());
+            return Ok(v);
+        }
         if level == IPPROTO_IPV6 {
             return ipv6_get(u, opt);
         }
@@ -4497,6 +4643,8 @@ fn ipv6_get(u: &InetRef, opt: i32) -> Result<Vec<u8>, i64> {
         18 => s.mc_hops6 as i64,
         19 => s.mc_loop6 as i64,
         29 => s.mc_all6 as i64,
+        60 => s.rxpmtu_on as i64,
+        62 => s.dontfrag6 as i64,
         // IPV6_ADDR_PREFERENCES: TMP か PUBLIC か PUBTMP_DEFAULT (0x100)、COA か HOME (0x400)
         72 => {
             let p = s.srcprefs;
@@ -4592,6 +4740,17 @@ fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
         }
         // IPV6_MULTICAST_ALL
         29 => s.mc_all6 = int()? != 0,
+        // IPV6_RECVPATHMTU、IPV6_DONTFRAG
+        60 => s.rxpmtu_on = int()? != 0,
+        62 => s.dontfrag6 = int()? != 0,
+        // IPV6_MTU (frag_size): 0 か 1280 から
+        24 => {
+            let v = int()?;
+            if v != 0 && v < 1280 {
+                return Err(crate::why::inval());
+            }
+            s.frag_size = v as u32;
+        }
         // IPV6_ADDR_PREFERENCES (__ip6_sock_set_addr_preferences): TMP と PUBLIC と PUBTMP_DEFAULT はどれか 1 つ、HOME と
         // COA、CGA と NONCGA もどちらか (でなければ EINVAL)
         72 => {
@@ -5426,7 +5585,8 @@ fn ext_udp_bind(u: &InetRef) {
     }
     let Some(n) = net::get() else { return };
     let meta = || alloc::vec![udp::PacketMetadata::EMPTY; 16];
-    let sock = udp::Socket::new(udp::PacketBuffer::new(meta(), alloc::vec![0; 16 * 1024]), udp::PacketBuffer::new(meta(), alloc::vec![0; 16 * 1024]));
+    // 送るほうは IPv6 のいちばん大きいデータグラム (65527) が入るように
+    let sock = udp::Socket::new(udp::PacketBuffer::new(meta(), alloc::vec![0; 16 * 1024]), udp::PacketBuffer::new(meta(), alloc::vec![0; 64 * 1024]));
     let h = n.sockets.add(sock);
     if udp_sock(h).bind(IpListenEndpoint { addr: None, port }).is_err() {
         n.sockets.remove(h);
