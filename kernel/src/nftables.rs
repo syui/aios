@@ -3370,8 +3370,12 @@ fn eval(op: &mut Op, set: Option<&str>, r: &mut Regs, p: &mut Pkt, sets: &[Set],
         Op::CtSet(sreg) => {
             let o = *sreg as usize * 4;
             let v = u32::from_ne_bytes(r.d[o..o + 4].try_into().unwrap());
-            if let Some(c) = crate::conntrack::conn_of_mut(&mut p.ct) {
+            // nft_ct_set_eval: 変われば IPCT_MARK を知らせる
+            if let Some(c) = crate::conntrack::conn_of_mut(&mut p.ct)
+                && c.mark != v
+            {
                 c.mark = v;
+                c.ev |= crate::conntrack::IPCT_MARK;
             }
         }
         Op::Notrack => {

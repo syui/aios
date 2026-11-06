@@ -5,6 +5,10 @@
 //   - IPCTNL_MSG_CT_DELETE: 組 (CTA_TUPLE_ORIG か CTA_TUPLE_REPLY。CTA_ID があれば合うものだけ) のつながりを消す (-D。
 //     なければ ENOENT)。組がなければ家族のものをみな消す (-F: ctnetlink_flush_conntrack)
 //   - IPCTNL_MSG_CT_GET_STATS_CPU (-S: CPU ごとの数) と IPCTNL_MSG_CT_GET_STATS (-C: 数といちばん多いとき)
+//   - IPCTNL_MSG_CT_NEW (ctnetlink_new_conntrack): なければ NLM_F_CREATE で作る (-I: 組 2 つとのこり時間がいる。
+//     なければ ENOENT)、あれば NLM_F_EXCL なら EEXIST、でなければ変える (-U: mark、のこり時間、status、TCP の状態)
+//   - 知らせ (ctnetlink_conntrack_event): NFNLGRP_CONNTRACK_NEW (CT_NEW、NLM_F_CREATE | NLM_F_EXCL)、UPDATE (CT_NEW)、
+//     DESTROY (CT_DELETE) に。conntrack -E。道具がしたもの (作る・変える・消す) は頭の portid がそのソケット
 // 答えのつながりは IPCTNL_MSG_CT_NEW (ctnetlink_fill_info: 組 2 つ、status、timeout、protoinfo (TCP の状態と窓の
 // 倍率)、mark、id、use)。dump は libmnl の受ける入れ物 (4096) に入るように分ける
 use crate::conntrack::{self, Conn, Tuple};
@@ -68,6 +72,13 @@ const CTA_COUNTERS_BYTES: u16 = 2;
 const CTA_STATS_CPU: [u16; 10] = [2, 4, 8, 9, 10, 11, 12, 13, 14, 15];
 const CTA_STATS_INVALID: u16 = 4;
 const CTA_STATS_GLOBAL_ENTRIES: u16 = 1;
+const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_CREATE: u16 = 0x400;
+const EEXIST: i64 = 17;
+const NETLINK_NETFILTER: u32 = 12;
+const NFNLGRP_CONNTRACK_NEW: u32 = 1;
+const NFNLGRP_CONNTRACK_UPDATE: u32 = 2;
+const NFNLGRP_CONNTRACK_DESTROY: u32 = 3;
 const CTA_STATS_GLOBAL_MAX_ENTRIES: u16 = 2;
 const NLA_F_NESTED: u16 = 0x8000;
 
@@ -229,25 +240,8 @@ fn fill(c: &Conn, typ: u16, flags: u16, seq: u32, pid: u32, use_: u32) -> Vec<u8
     put_tuple(&mut w, CTA_TUPLE_REPLY, &c.tuple[1]);
     w.be32(CTA_STATUS, c.status);
     w.be32(CTA_TIMEOUT, (conntrack::expires_ns(c) / 1_000_000_000) as u32);
-    if let Some((state, ws0, ws1, f0, f1)) = conntrack::tcp_info(c) {
-        let pi = w.start(CTA_PROTOINFO);
-        let t = w.start(CTA_PROTOINFO_TCP);
-        w.attr(CTA_PROTOINFO_TCP_STATE, &[state]);
-        w.attr(CTA_PROTOINFO_TCP_WSCALE_ORIGINAL, &[ws0]);
-        w.attr(CTA_PROTOINFO_TCP_WSCALE_REPLY, &[ws1]);
-        w.attr(CTA_PROTOINFO_TCP_FLAGS_ORIGINAL, &[f0, 0]);
-        w.attr(CTA_PROTOINFO_TCP_FLAGS_REPLY, &[f1, 0]);
-        w.end(t);
-        w.end(pi);
-    }
-    if let Some(a) = conntrack::acct(c) {
-        for (ty, dir) in [(CTA_COUNTERS_ORIG, 0), (CTA_COUNTERS_REPLY, 1)] {
-            let n = w.start(ty);
-            w.attr(CTA_COUNTERS_PACKETS, &a[dir][0].to_be_bytes());
-            w.attr(CTA_COUNTERS_BYTES, &a[dir][1].to_be_bytes());
-            w.end(n);
-        }
-    }
+    put_protoinfo(&mut w, c);
+    put_acct(&mut w, c);
     w.be32(CTA_MARK, c.mark);
     w.be32(CTA_ID, c.id);
     w.be32(CTA_USE, use_);
@@ -270,6 +264,125 @@ fn dump_out(msgs: Vec<Vec<u8>>, seq: u32, pid: u32, out: &mut Vec<Vec<u8>>) {
     }
     cur.extend_from_slice(&d);
     out.push(cur);
+}
+
+/// つながりの知らせ (ctnetlink_conntrack_event): 組 2 つ、id、status、のこり時間 (DESTROY は 0 なら出さない)、DESTROY は
+/// 数と TCP の状態、ほかは IPCT_PROTOINFO なら TCP の状態、IPCT_MARK か mark が 0 でなければ mark。聞いている人が
+/// いなければ作らない
+pub fn event(c: &Conn, ev: u32, portid: u32) {
+    use conntrack::{IPCT_DESTROY, IPCT_MARK, IPCT_NEW, IPCT_PROTOINFO};
+    let (typ, flags, group) = if ev & IPCT_DESTROY != 0 {
+        (CT_DELETE, 0, NFNLGRP_CONNTRACK_DESTROY)
+    } else if ev & IPCT_NEW != 0 {
+        (CT_NEW, NLM_F_CREATE | NLM_F_EXCL, NFNLGRP_CONNTRACK_NEW)
+    } else if ev != 0 {
+        (CT_NEW, 0, NFNLGRP_CONNTRACK_UPDATE)
+    } else {
+        return;
+    };
+    if !crate::netlink::has_listeners(NETLINK_NETFILTER, group) {
+        return;
+    }
+    let mut w = W(Vec::new());
+    put_tuple(&mut w, CTA_TUPLE_ORIG, &c.tuple[0]);
+    put_tuple(&mut w, CTA_TUPLE_REPLY, &c.tuple[1]);
+    w.be32(CTA_ID, c.id);
+    w.be32(CTA_STATUS, c.status);
+    let left = (conntrack::expires_ns(c) / 1_000_000_000) as u32;
+    if ev & IPCT_DESTROY != 0 {
+        if left != 0 {
+            w.be32(CTA_TIMEOUT, left);
+        }
+        put_acct(&mut w, c);
+        put_protoinfo(&mut w, c);
+    } else {
+        w.be32(CTA_TIMEOUT, left);
+        if ev & IPCT_PROTOINFO != 0 {
+            put_protoinfo(&mut w, c);
+        }
+    }
+    if ev & IPCT_MARK != 0 || c.mark != 0 {
+        w.be32(CTA_MARK, c.mark);
+    }
+    let family = if c.tuple[0].l3 == 6 { AF_INET6 } else { AF_INET };
+    crate::netlink::notify_proto(NETLINK_NETFILTER, group, msg(typ, flags, 0, portid, family, 0, &w.0));
+}
+
+/// CTA_PROTOINFO (TCP だけ: 状態、窓の倍率、flags)
+fn put_protoinfo(w: &mut W, c: &Conn) {
+    if let Some((state, ws0, ws1, f0, f1)) = conntrack::tcp_info(c) {
+        let pi = w.start(CTA_PROTOINFO);
+        let t = w.start(CTA_PROTOINFO_TCP);
+        w.attr(CTA_PROTOINFO_TCP_STATE, &[state]);
+        w.attr(CTA_PROTOINFO_TCP_WSCALE_ORIGINAL, &[ws0]);
+        w.attr(CTA_PROTOINFO_TCP_WSCALE_REPLY, &[ws1]);
+        w.attr(CTA_PROTOINFO_TCP_FLAGS_ORIGINAL, &[f0, 0]);
+        w.attr(CTA_PROTOINFO_TCP_FLAGS_REPLY, &[f1, 0]);
+        w.end(t);
+        w.end(pi);
+    }
+}
+
+/// CTA_COUNTERS_ORIG / REPLY (acct のとき)
+fn put_acct(w: &mut W, c: &Conn) {
+    if let Some(a) = conntrack::acct(c) {
+        for (ty, dir) in [(CTA_COUNTERS_ORIG, 0), (CTA_COUNTERS_REPLY, 1)] {
+            let n = w.start(ty);
+            w.attr(CTA_COUNTERS_PACKETS, &a[dir][0].to_be_bytes());
+            w.attr(CTA_COUNTERS_BYTES, &a[dir][1].to_be_bytes());
+            w.end(n);
+        }
+    }
+}
+
+fn be32_of(d: Option<&[u8]>) -> Option<u32> {
+    d.filter(|d| d.len() >= 4).map(|d| u32::from_be_bytes(d[..4].try_into().unwrap()))
+}
+
+/// CTA_PROTOINFO の TCP の状態 (nlattr_to_tcp: 10 より大きければ EINVAL)
+fn parse_tcp_state(a: &[(u16, &[u8])]) -> Result<Option<u8>, i64> {
+    let Some(pi) = get(a, CTA_PROTOINFO) else { return Ok(None) };
+    let pi = attrs(pi);
+    let Some(t) = get(&pi, CTA_PROTOINFO_TCP) else { return Ok(None) };
+    let t = attrs(t);
+    match get(&t, CTA_PROTOINFO_TCP_STATE).and_then(|d| d.first().copied()) {
+        Some(s) if s >= 10 => Err(EINVAL),
+        s => Ok(s),
+    }
+}
+
+/// CT_NEW (ctnetlink_new_conntrack)
+fn new_conntrack(a: &[(u16, &[u8])], family: u8, flags: u16, me: u32) -> Result<(), i64> {
+    let orig = get(a, CTA_TUPLE_ORIG).map(|d| parse_tuple(d, family)).transpose()?;
+    let reply = get(a, CTA_TUPLE_REPLY).map(|d| parse_tuple(d, family)).transpose()?;
+    let found = match (orig, reply) {
+        (Some(t), _) => conntrack::lookup(&t).filter(|c| c.tuple[0] == t),
+        (None, Some(t)) => conntrack::lookup(&t).filter(|c| c.tuple[1] == t),
+        _ => None,
+    };
+    let tcp = parse_tcp_state(a)?;
+    let mark = be32_of(get(a, CTA_MARK));
+    let status = be32_of(get(a, CTA_STATUS));
+    let timeout = be32_of(get(a, CTA_TIMEOUT));
+    match found {
+        None => {
+            if flags & NLM_F_CREATE == 0 {
+                return Err(ENOENT);
+            }
+            let (Some(o), Some(r)) = (orig, reply) else { return Err(EINVAL) };
+            if o.proto != r.proto {
+                return Err(EINVAL);
+            }
+            let t = timeout.ok_or(EINVAL)?;
+            conntrack::create(o, r, t, status.unwrap_or(0), mark.unwrap_or(0), tcp, me)
+        }
+        Some(c) => {
+            if flags & NLM_F_EXCL != 0 {
+                return Err(EEXIST);
+            }
+            conntrack::change(c.id, timeout, status, mark, tcp, me)
+        }
+    }
 }
 
 /// nfnetlink の subsys 1 の要求 (batch の外)。Ok(true) は dump した (ACK はない)
@@ -315,11 +428,11 @@ pub fn request(m: &[u8], me: u32, out: &mut Vec<Vec<u8>>) -> Result<bool, i64> {
                     {
                         return Err(ENOENT);
                     }
-                    conntrack::kill(c.id);
+                    conntrack::kill_by(c.id, me);
                 }
                 None => {
                     for c in conntrack::all().iter().filter(|c| fam_ok(c)) {
-                        conntrack::kill(c.id);
+                        conntrack::kill_by(c.id, me);
                     }
                 }
             }
@@ -350,7 +463,7 @@ pub fn request(m: &[u8], me: u32, out: &mut Vec<Vec<u8>>) -> Result<bool, i64> {
             dump_out(Vec::new(), seq, me, out);
             Ok(true)
         }
-        CT_NEW => Err(EOPNOTSUPP),
+        CT_NEW => new_conntrack(&a, family, flags, me).map(|()| false),
         _ => Err(EOPNOTSUPP),
     }
 }

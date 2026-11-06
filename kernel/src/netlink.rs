@@ -356,10 +356,21 @@ pub fn send(n: &NetlinkRef, data: &[u8], to: Option<&[u8]>, flags: u64) -> R {
 /// カーネルからの知らせ (rtnl_notify と nlmsg_multicast): NETLINK_ROUTE の組 group (RTNLGRP_*) に入っているソケット
 /// みなに、データグラム 1 つで。送ったもののポートは 0、recvmsg の nl_groups は組のビット
 pub fn notify(group: u32, msg: Vec<u8>) {
+    notify_proto(NETLINK_ROUTE, group, msg);
+}
+
+/// 組 group に入っているソケットがあるか (nfnetlink_has_listeners)
+pub fn has_listeners(protocol: u32, group: u32) -> bool {
+    let bit = 1u64 << (group - 1);
+    ports().iter().filter(|(k, _)| k.0 == protocol).filter_map(|(_, w)| w.upgrade()).any(|n| n.borrow().groups & bit != 0)
+}
+
+/// notify のほかの protocol のもの (NETLINK_NETFILTER の ctnetlink の知らせ)
+pub fn notify_proto(protocol: u32, group: u32, msg: Vec<u8>) {
     let bit = 1u64 << (group - 1);
     let members: Vec<NetlinkRef> = ports()
         .iter()
-        .filter(|(k, _)| k.0 == NETLINK_ROUTE)
+        .filter(|(k, _)| k.0 == protocol)
         .filter_map(|(_, w)| w.upgrade())
         .filter(|n| n.borrow().groups & bit != 0)
         .collect();
@@ -482,7 +493,9 @@ pub fn setsockopt(n: &NetlinkRef, level: u64, opt: u64, val: &[u8]) -> R {
             let v = int()?;
             match opt {
                 NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
-                    if v == 0 || v > RTNLGRP_MAX {
+                    // 組の数: NETLINK_ROUTE は RTNLGRP_MAX、NETLINK_NETFILTER は NFNLGRP_MAX (9: NFNLGRP_NFTRACE)
+                    let max = if n.borrow().protocol == 12 { 9 } else { RTNLGRP_MAX };
+                    if v == 0 || v > max {
                         return Err(crate::why::inval());
                     }
                     autobind(n);

@@ -40,6 +40,17 @@ pub const IPS_SEEN_REPLY: u32 = 2;
 pub const IPS_ASSURED: u32 = 4;
 pub const IPS_CONFIRMED: u32 = 8;
 pub const IPS_FIXED_TIMEOUT: u32 = 1 << 10;
+/// netlink で変えられる status (IPS_UNCHANGEABLE_MASK の外: EXPECTED、CONFIRMED、SRC_NAT_DONE などの作りのビットと
+/// DYING、TEMPLATE、UNTRACKED、OFFLOAD をのぞく)
+const USER_STATUS: u32 = IPS_SEEN_REPLY | IPS_ASSURED | IPS_FIXED_TIMEOUT | 1 << 13;
+
+/// つながりの知らせの種類 (enum ip_conntrack_events のビット: ctnetlink.rs が NFNLGRP_CONNTRACK_* に)
+pub const IPCT_NEW: u32 = 1 << 0;
+pub const IPCT_DESTROY: u32 = 1 << 2;
+pub const IPCT_REPLY: u32 = 1 << 3;
+pub const IPCT_ASSURED: u32 = 1 << 4;
+pub const IPCT_PROTOINFO: u32 = 1 << 5;
+pub const IPCT_MARK: u32 = 1 << 7;
 
 /// TCP の状態 (enum tcp_conntrack)
 const NO: u8 = 0;
@@ -192,6 +203,8 @@ pub struct Conn {
     /// [向き][packets, bytes] (acct のとき)
     acct: Option<[[u64; 2]; 2]>,
     proto: Proto,
+    /// まだ知らせていない IPCT_* (nf_conntrack_event_cache: confirm で知らせる)
+    pub ev: u32,
 }
 
 /// パケットについたつながり (skb->_nfct)
@@ -343,13 +356,23 @@ fn find(t: &Tuple) -> Option<(u32, u8)> {
     Some((id, dir))
 }
 
-/// 消す (nf_ct_kill)
+/// 消す (nf_ct_kill)。消したことは知らせる (IPCT_DESTROY)
 pub fn kill(id: u32) {
+    kill_by(id, 0);
+}
+
+/// 消す。portid はたのんだ netlink のソケット (ctnetlink の -D / -F。カーネルが消すものは 0)
+pub fn kill_by(id: u32, portid: u32) {
     let tb = table();
     if let Some(c) = tb.conns.remove(&id) {
         tb.by_tuple.remove(&c.tuple[0]);
         tb.by_tuple.remove(&c.tuple[1]);
+        crate::ctnetlink::event(&c, IPCT_DESTROY, portid);
     }
+}
+
+fn tcp_state(c: &Conn) -> u8 {
+    if let Proto::Tcp(t) = &c.proto { t.state } else { 0 }
 }
 
 fn gc() {
@@ -493,7 +516,7 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
                         1 | 58 => Proto::Icmp,
                         _ => Proto::Generic,
                     };
-                    *ct = Ct::New(Box::new(Conn { id: 0, tuple: [t, r], status: 0, timeout: 0, mark: 0, acct: None, proto }), CT_NEW);
+                    *ct = Ct::New(Box::new(Conn { id: 0, tuple: [t, r], status: 0, timeout: 0, mark: 0, acct: None, proto, ev: 0 }), CT_NEW);
                 }
             }
         }
@@ -535,11 +558,12 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
                 let id = tb.next_id;
                 tb.next_id = tb.next_id.wrapping_add(0x9e37_79b9) | 1;
                 let acct = KNOBS.get().acct.then_some([[0; 2]; 2]);
-                let c = Conn { id, tuple: [t, r], status: 0, timeout: 0, mark: 0, acct, proto: proto_state };
+                let c = Conn { id, tuple: [t, r], status: 0, timeout: 0, mark: 0, acct, proto: proto_state, ev: 0 };
                 (Ct::New(Box::new(c), CT_NEW), CT_NEW)
             }
         };
         let dir = if info >= CT_IS_REPLY { DIR_REPLY } else { DIR_ORIG };
+        let before = conn_of(&c).map(|x| (x.status, tcp_state(x)));
         let res = {
             let Some(conn) = conn_of_mut(&mut c) else { return 1 };
             match proto {
@@ -585,6 +609,19 @@ pub fn conntrack_in(ip: &[u8], hook: u32, ct: &mut Ct) -> i32 {
             if info == CT_ESTABLISHED_REPLY {
                 conn.status |= IPS_SEEN_REPLY;
             }
+            // 変わったものを知らせる (答えを見た、ASSURED、TCP の状態)
+            if let Some((st, ts)) = before {
+                let new = conn.status & !st;
+                if new & IPS_SEEN_REPLY != 0 {
+                    conn.ev |= IPCT_REPLY;
+                }
+                if new & IPS_ASSURED != 0 {
+                    conn.ev |= IPCT_ASSURED;
+                }
+                if tcp_state(conn) != ts {
+                    conn.ev |= IPCT_PROTOINFO;
+                }
+            }
         }
         *ct = c;
         return 1;
@@ -626,6 +663,17 @@ pub fn confirm(ct: &mut Ct) {
     if dry() {
         return;
     }
+    // 表にあるもの: たまった知らせを (nf_ct_deliver_cached_events)
+    if let Ct::Known(id, _) = ct {
+        if let Some(c) = table().conns.get_mut(id)
+            && c.ev != 0
+        {
+            let ev = core::mem::take(&mut c.ev);
+            let snap = c.clone();
+            crate::ctnetlink::event(&snap, ev, 0);
+        }
+        return;
+    }
     let Ct::New(c, info) = ct else { return };
     // reject の返すもの (答えの向き) は入れない
     if *info >= CT_IS_REPLY {
@@ -642,10 +690,77 @@ pub fn confirm(ct: &mut Ct) {
     conn.timeout += now();
     conn.status |= IPS_CONFIRMED;
     let (id, info) = (conn.id, *info);
+    // __nf_conntrack_confirm の IPCT_NEW (TCP は状態も: IPCT_PROTOINFO) と、それまでにたまったもの
+    let ev = core::mem::take(&mut conn.ev) | IPCT_NEW | if matches!(conn.proto, Proto::Tcp(_)) { IPCT_PROTOINFO } else { 0 };
+    let snap = conn.clone();
     tb.by_tuple.insert(conn.tuple[0], (id, DIR_ORIG));
     tb.by_tuple.insert(conn.tuple[1], (id, DIR_REPLY));
     tb.conns.insert(id, conn);
     *ct = Ct::Known(id, info);
+    crate::ctnetlink::event(&snap, ev, 0);
+}
+
+/// ctnetlink の CT_NEW で作る (ctnetlink_create_conntrack): 組 2 つ、のこり時間 (秒)、status (変えられるビット)、mark、
+/// TCP の状態。もうあれば EEXIST、表がいっぱいなら ENOMEM。portid はたのんだソケット (IPCT_NEW と、REPLY・ASSURED・
+/// PROTOINFO・MARK を知らせる)
+pub fn create(orig: Tuple, reply: Tuple, timeout_s: u32, status: u32, mark: u32, tcp: Option<u8>, portid: u32) -> Result<(), i64> {
+    let tb = table();
+    if tb.by_tuple.contains_key(&orig) || tb.by_tuple.contains_key(&reply) {
+        return Err(17);
+    }
+    if tb.conns.len() >= max() {
+        return Err(12);
+    }
+    let proto = match orig.proto {
+        6 => Proto::Tcp(TcpCt { state: tcp.unwrap_or(NO), ..TcpCt::default() }),
+        17 => Proto::Udp { stream_ts: 0 },
+        1 | 58 => Proto::Icmp,
+        _ => Proto::Generic,
+    };
+    let id = tb.next_id;
+    tb.next_id = tb.next_id.wrapping_add(0x9e37_79b9) | 1;
+    let acct = KNOBS.get().acct.then_some([[0; 2]; 2]);
+    let conn = Conn {
+        id,
+        tuple: [orig, reply],
+        status: (status & USER_STATUS) | IPS_CONFIRMED,
+        timeout: now() + timeout_s as u64 * HZ_NS,
+        mark,
+        acct,
+        proto,
+        ev: 0,
+    };
+    let snap = conn.clone();
+    tb.by_tuple.insert(orig, (id, DIR_ORIG));
+    tb.by_tuple.insert(reply, (id, DIR_REPLY));
+    tb.conns.insert(id, conn);
+    crate::ctnetlink::event(&snap, IPCT_NEW | IPCT_REPLY | IPCT_ASSURED | IPCT_PROTOINFO | IPCT_MARK, portid);
+    Ok(())
+}
+
+/// ctnetlink の CT_NEW で変える (ctnetlink_change_conntrack): のこり時間、status (ctnetlink_change_status: EXPECTED・
+/// CONFIRMED・DYING を変えるか、SEEN_REPLY・ASSURED をはずすなら EBUSY)、mark、TCP の状態。変えたら知らせる
+pub fn change(id: u32, timeout_s: Option<u32>, status: Option<u32>, mark: Option<u32>, tcp: Option<u8>, portid: u32) -> Result<(), i64> {
+    let c = table().conns.get_mut(&id).ok_or(2i64)?;
+    if let Some(st) = status {
+        let d = c.status ^ st;
+        if d & (IPS_EXPECTED | IPS_CONFIRMED | 1 << 9) != 0 || (d & IPS_SEEN_REPLY != 0 && st & IPS_SEEN_REPLY == 0) || (d & IPS_ASSURED != 0 && st & IPS_ASSURED == 0) {
+            return Err(16);
+        }
+        c.status = (c.status & !USER_STATUS) | (st & USER_STATUS);
+    }
+    if let Some(t) = timeout_s {
+        c.timeout = now() + t as u64 * HZ_NS;
+    }
+    if let Some(m) = mark {
+        c.mark = m;
+    }
+    if let (Some(s), Proto::Tcp(t)) = (tcp, &mut c.proto) {
+        t.state = s;
+    }
+    let snap = c.clone();
+    crate::ctnetlink::event(&snap, IPCT_REPLY | IPCT_ASSURED | IPCT_PROTOINFO | IPCT_MARK, portid);
+    Ok(())
 }
 
 /// RST で reject したつながりは CLOSE に (nf_ct_set_closing → nf_conntrack_tcp_set_closing: 表にあるものだけ、

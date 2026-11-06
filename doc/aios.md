@@ -1070,8 +1070,19 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     数 (acct のとき)、mark、id、use)。手本の Linux に NF_CT_NETLINK と NF_CONNTRACK_EVENTS を足した。
     `LINUX_FILES="conntrack=build/conntrack-static nft=build/nft-static" test/ldiff.sh --root ctnl` (中どうしの TCP と
     UDP で -L・-o extended・-p・-f ipv6・--state・-C・-S・-G・-D・-F) で手本の Linux 7.4-rc1 と 71 行同じ
-  - まだ: ctnetlink の知らせ (conntrack -E) と CT_NEW (-I / -U)、カーネルでしぼる CTA_FILTER (しぼるのは conntrack
-    の道具もする) と 7.4 の CTA_FILTER_ZONE、helper (ftp など)、expectation、zone、label、ct count (connlimit)、NAT
+  - ctnetlink の知らせ (ctnetlink_conntrack_event: conntrack -E) と CT_NEW: つながりは知らせることをためておき
+    (nf_conntrack_event_cache)、LOCAL_IN と POST_ROUTING の confirm で知らせる。表に入れると NEW (TCP は状態も)、答えを
+    見た (REPLY)・ASSURED・TCP の状態が変わった (PROTOINFO)・nft の ct mark set で mark が変わった (MARK) は UPDATE、
+    消すと DESTROY (時間切れ、TCP のやりなおし、RST、道具の -D と -F)。組は NFNLGRP_CONNTRACK_NEW / UPDATE / DESTROY
+    (NETLINK_NETFILTER の組は 9 まで)、属性は Linux と同じえらびかた (DESTROY は数と TCP の状態、ほかは PROTOINFO の
+    ときだけ状態、MARK か 0 でない mark)。道具がしたもの (CT_NEW で作る -I・変える -U、消す) は頭の portid がそのソケット
+    (conntrack -E の [USERSPACE] portid=)。CT_NEW はなければ NLM_F_CREATE で作り (組 2 つとのこり時間がいる。status は
+    変えられるビットだけ、TCP の状態、mark)、あれば NLM_F_EXCL なら EEXIST、でなければ変える (EXPECTED・CONFIRMED・
+    DYING を変えるか SEEN_REPLY・ASSURED をはずすなら EBUSY)。`LINUX_FILES="conntrack=build/conntrack-static
+    nft=build/nft-static" test/ldiff.sh --root ctev` (-E を動かしたまま中どうしの TCP をつないで閉じ、UDP、-I・-U・-D、
+    -F の DESTROY は並べて。portid は *) で手本の Linux 7.4-rc1 と 48 行同じ
+  - まだ: カーネルでしぼる CTA_FILTER (しぼるのは conntrack の道具もする) と 7.4 の CTA_FILTER_ZONE、helper (ftp など)、
+    expectation (IPCTNL_MSG_EXP_*)、zone、label、ct count (connlimit)、NAT
 - IPv6 (段階 2b、IPv6 の段階 1 のあと): aios の中の ::1 の TCP と UDP も、IPv4 と同じく lo の 4 つのフックに通す。
   パケットは Linux が lo に流すのと同じ IPv6 の頭 (traffic class、flow label、hop limit 64。MAC の型は 86dd)
   - ip6 と inet の表が見る (ip の表は IPv6 を、ip6 の表は IPv4 を見ない。::ffff:127.0.0.1 へのものは IPv4 のパケット)。
