@@ -2,6 +2,8 @@
 // RTM_NEWNDUSEROPT で知らせる (ndisc_ra_useropt: 組は RTNLGRP_ND_USEROPT (20)、項目 1 つに 1 つ。struct nduseroptmsg、
 // その項目のバイト、NDUSEROPT_SRCADDR (RA を送ったルーター))。raw の ICMPv6 で RS を ff02::2 へ送ると、QEMU の
 // ユーザーネットワークが RA (SLLA、prefix、RDNSS fec0::3 など) を返す。
+// その RA で、もうある SLAAC の番地の lifetime を新しくすると RTM_NEWADDR (addrconf_prefix_rcv_add_addr の update_lft:
+// tentative でなければ ipv6_ifa_notify) も。番地と道の知らせ (RTMGRP_IPV6_IFADDR、RTMGRP_IPV6_ROUTE) も出す。
 // 出すだけのテスト: root で、手本の Linux は ip=dhcp の virtio-net (test/ldiff.sh --root --net rdnss6)
 //   aios の中で: sudo ./rdnss6      aarch64-linux-gnu-gcc -O2 -static -o rdnss6 test/rdnss6.c
 #define _GNU_SOURCE
@@ -78,7 +80,7 @@ int main(void) {
     unsigned eth0 = if_nametoindex("eth0");
     printf("eth0 slaac: %s\n", wait_slaac() ? "yes" : "no");
     int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-    struct sockaddr_nl a = {.nl_family = AF_NETLINK, .nl_groups = 1u << (RTNLGRP_ND_USEROPT - 1)};
+    struct sockaddr_nl a = {.nl_family = AF_NETLINK, .nl_groups = 1u << (RTNLGRP_ND_USEROPT - 1) | RTMGRP_IPV6_IFADDR | RTMGRP_IPV6_ROUTE};
     printf("bind nd_useropt: %s\n", bind(nl, (struct sockaddr *)&a, sizeof a) ? strerror(errno) : "ok");
     int g = RTNLGRP_ND_USEROPT;
     printf("add membership: %s\n", setsockopt(nl, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g, sizeof g) ? strerror(errno) : "ok");
@@ -102,6 +104,41 @@ int main(void) {
             break;
         long n = recv(nl, buf, sizeof buf, 0);
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
+                struct ifaddrmsg *ia = NLMSG_DATA(h);
+                char ip[INET6_ADDRSTRLEN] = "";
+                unsigned fl = ia->ifa_flags;
+                const char *pref = "?", *valid = "?";
+                int alen = IFA_PAYLOAD(h);
+                for (struct rtattr *at = IFA_RTA(ia); RTA_OK(at, alen); at = RTA_NEXT(at, alen)) {
+                    if (at->rta_type == IFA_ADDRESS)
+                        inet_ntop(AF_INET6, RTA_DATA(at), ip, sizeof ip);
+                    if (at->rta_type == IFA_FLAGS)
+                        fl = *(unsigned *)RTA_DATA(at);
+                    if (at->rta_type == IFA_CACHEINFO) {
+                        struct ifa_cacheinfo *c = RTA_DATA(at);
+                        pref = c->ifa_prefered == 0xffffffff ? "forever" : "finite";
+                        valid = c->ifa_valid == 0xffffffff ? "forever" : "finite";
+                    }
+                }
+                printf("%s flags=%#x if%s %s/%u flags %#x prefered %s valid %s\n", h->nlmsg_type == RTM_NEWADDR ? "NEWADDR" : "DELADDR", h->nlmsg_flags,
+                       ia->ifa_index == eth0 ? "eth0" : "other", ip, ia->ifa_prefixlen, fl, pref, valid);
+                continue;
+            }
+            if (h->nlmsg_type == RTM_NEWROUTE || h->nlmsg_type == RTM_DELROUTE) {
+                struct rtmsg *rt = NLMSG_DATA(h);
+                char dst[INET6_ADDRSTRLEN] = "::", gw[INET6_ADDRSTRLEN] = "";
+                int alen = RTM_PAYLOAD(h);
+                for (struct rtattr *at = RTM_RTA(rt); RTA_OK(at, alen); at = RTA_NEXT(at, alen)) {
+                    if (at->rta_type == RTA_DST)
+                        inet_ntop(AF_INET6, RTA_DATA(at), dst, sizeof dst);
+                    if (at->rta_type == RTA_GATEWAY)
+                        inet_ntop(AF_INET6, RTA_DATA(at), gw, sizeof gw);
+                }
+                printf("%s flags=%#x %s/%u via %s proto %u type %u\n", h->nlmsg_type == RTM_NEWROUTE ? "NEWROUTE" : "DELROUTE", h->nlmsg_flags, dst, rt->rtm_dst_len,
+                       gw[0] ? gw : "-", rt->rtm_protocol, rt->rtm_type);
+                continue;
+            }
             if (h->nlmsg_type != RTM_NEWNDUSEROPT) {
                 printf("msg type %u\n", h->nlmsg_type);
                 continue;

@@ -1349,6 +1349,8 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   NetworkManager のようなもの) はこれを聞く。`test/ldiff.sh --root --net rdnss6` (raw の ICMPv6 で RS を送り、QEMU の
   RA の prefix の項目) で手本の Linux 7.4-rc1 と 7 行同じ (このとき見つけた: raw の ICMPv6 が IPV6_MULTICAST_HOPS を
   見ず、マルチキャストへはいつも hop limit 1 で、QEMU は RS に答えなかった)
+- RA でもうある SLAAC の番地の lifetime を新しくすると (addrconf_prefix_rcv_add_addr の update_lft)、DAD のとちゅうで
+  なければ RTM_NEWADDR (番地と flags は変わらないので、前とくらべる知らせには出ない)。rdnss6 で同じ (8 行)
 - まだ: MLD、packet too big (PMTU)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の

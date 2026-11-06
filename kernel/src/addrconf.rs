@@ -690,6 +690,8 @@ fn ra(src: u128, m: &[u8]) {
     // ユーザーのプログラムに渡す項目 (ndisc_is_useropt: prefix、RDNSS、DNSSL、6CO、captive portal、PREF64)。RA を読み
     // おえてから、1 つずつ RTM_NEWNDUSEROPT で (ndisc_ra_useropt)
     let mut useropts: Vec<Vec<u8>> = Vec::new();
+    // lifetime を新しくした SLAAC の番地 (RTM_NEWADDR で知らせる)
+    let mut refreshed: Vec<Addr> = Vec::new();
     let mut opts = &m[16..];
     while opts.len() >= 8 {
         let (ty, len) = (opts[0], opts[1] as usize * 8);
@@ -706,7 +708,11 @@ fn ra(src: u128, m: &[u8]) {
                 let mac: [u8; 6] = o[2..8].try_into().unwrap();
                 crate::netlink::nd_router(src, mac);
             }
-            3 if len >= 32 => prefix_info(st, o, now),
+            3 if len >= 32 => {
+                if let Some(a) = prefix_info(st, o, now) {
+                    refreshed.push(a);
+                }
+            }
             5 if len >= 8 => {
                 let mtu = u32::from_be_bytes(o[4..8].try_into().unwrap());
                 if (1280..=1500).contains(&mtu) {
@@ -718,20 +724,24 @@ fn ra(src: u128, m: &[u8]) {
         opts = &opts[len..];
     }
     changed();
+    for a in &refreshed {
+        crate::netlink::addr6_refreshed(a);
+    }
     for o in useropts {
         crate::netlink::nd_useropt(src, &o);
     }
 }
 
-/// prefix information (addrconf_prefix_rcv)
-fn prefix_info(st: &mut State, o: &[u8], now: u64) {
+/// prefix information (addrconf_prefix_rcv)。もうある SLAAC の番地の lifetime を新しくして、DAD のとちゅうでなければ
+/// その番地を返す (addrconf_prefix_rcv_add_addr の update_lft → ipv6_ifa_notify: RTM_NEWADDR)
+fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
     let len = o[2];
     let (onlink, auto) = (o[3] & 0x80 != 0, o[3] & 0x40 != 0);
     let valid = u32::from_be_bytes(o[4..8].try_into().unwrap()) as u64;
     let pref = u32::from_be_bytes(o[8..12].try_into().unwrap()) as u64;
     let prefix = u128::from_be_bytes(o[16..32].try_into().unwrap());
     if len > 128 || is_link_local(prefix) || prefix >> 120 == 0xff || pref > valid {
-        return;
+        return None;
     }
     let prefix = if len == 0 { 0 } else { prefix >> (128 - len as u32) << (128 - len as u32) };
     let life = |v: u64| if v == 0xffff_ffff { u64::MAX } else { now + v * 1000 };
@@ -754,6 +764,9 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) {
                 }
                 a.preferred = Some(life(pref));
                 a.updated = now;
+                if a.usable() {
+                    return Some(a.clone());
+                }
             }
             None if valid != 0 => {
                 let (dad, nonce) = dad_start(now);
@@ -773,6 +786,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) {
             None => {}
         }
     }
+    None
 }
 
 /// のこりの秒 (ifa_cacheinfo の prefered と valid: いつまでもは INFINITY_LIFE_TIME)

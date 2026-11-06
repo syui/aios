@@ -2670,6 +2670,12 @@ pub fn nd_useropt(src: u128, opt: &[u8]) {
 }
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 
+/// RA で lifetime を新しくした SLAAC の番地 (addrconf_prefix_rcv_add_addr → ipv6_ifa_notify): RTM_NEWADDR。番地と flags
+/// は変わらないので changed6 の知らせには出ない
+pub fn addr6_refreshed(a: &crate::addrconf::Addr) {
+    ev_addr6(&addr6_of(a), RTM_NEWADDR);
+}
+
 fn ev_addr6(a: &Addr6, typ: u16) {
     let mut d = Vec::new();
     put_addr6(&mut d, a, typ, 0, 0, 0);
