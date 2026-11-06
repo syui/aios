@@ -11,7 +11,8 @@ license=('MIT')
 # ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく
 # ca-certificates は /etc/ssl/certs/ca-certificates.crt (curl、git、ssh の C のもの、pip などが TLS で使う。
 # aios の Rust のものは持っているが、なければ C のものが https につなげない)
-# tar は libarchive (bsdtar)、awk は gawk、ps は procps-ng (uutils の tar / awk / ps はまだ足りないものが多い)
+# tar は libarchive (bsdtar)、awk は gawk、ps は procps-ng (uutils の tar / awk / ps はまだ足りないものが多いので入れない:
+# 同じ用途のものは 1 つ)
 # ripgrep (rg) は aish の where ツール (定義を探す) が使う。grep ツールと C-f / C-g も、あればそれを使う
 # (.gitignore を読む、速い)。grep は uutils の grep で、rg とは別のもの
 depends=('coreutils' 'grep' 'ripgrep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'brush' 'ca-certificates')

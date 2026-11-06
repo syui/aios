@@ -18,7 +18,7 @@
 //     range: その advisory があてはまる版の範囲
 // PKGBUILD かそのとなりのファイル (パッチなど) に番号 (CVE-、RUSTSEC-、GHSA-) を書いておけば、直した (かあてはまらない) と
 // みて出さない (aios の Cargo.lock は、となりの Cargo.toml などに)。
-// pkg/rust の coreutils (uutils) や tar (aios のもの) は名前が同じでも別のものなので Alpine とはくらべない。名前のちがうもの
+// pkg/rust の coreutils (uutils) は名前が同じでも別のものなので Alpine とはくらべない。名前のちがうもの
 // (glib2 は glib ...) は ALIAS で。どこも書いていないもの (mesa など) は見られない
 // どれも 1 日に 1 回取ってきて build/aish-pkg/secdb/ に置く。取れなければ前のもので (取りなおすのは 1 時間に 1 回まで)
 use serde_json::{Value, json};
