@@ -12,7 +12,7 @@
 #   etc/systemd/system/llama-server.service が起動のたびに 127.0.0.1:8080 で動かす (doc/aios.md の「ローカルの AI」)
 pkgname=llama.cpp
 pkgver=12144
-pkgrel=1
+pkgrel=2
 pkgdesc='LLM inference in C/C++: the llama binary (server, cli, bench, quantize), static, CPU variants for aios'
 arch=('aarch64')
 url='https://github.com/ggml-org/llama.cpp'

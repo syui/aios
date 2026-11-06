@@ -8,7 +8,7 @@
 #   libapparmor は静的に (apparmor_parser と aa-* の中に)。Python / Perl / Ruby の束ねと utils (aa-genprof などの Python) はなし
 pkgname=apparmor
 pkgver=5.0.2
-pkgrel=1
+pkgrel=2
 pkgdesc='AppArmor userspace: apparmor_parser, aa-status, aa-exec and the base of /etc/apparmor.d (static, for aios)'
 arch=('aarch64')
 url='https://apparmor.net/'

@@ -3,7 +3,7 @@
 # CVE-2026-85091 (ノンブロッキングの gzwrite があふれる) は 1.4 に入った (上流の df84af2) ので、もうパッチはあてない
 pkgname=zlib
 pkgver=1.4
-pkgrel=1
+pkgrel=2
 pkgdesc='Compression library implementing the deflate method (static and shared, for aios)'
 arch=('aarch64')
 url='https://zlib.net'
