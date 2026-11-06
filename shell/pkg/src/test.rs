@@ -277,6 +277,12 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
         let mut seen_ver = false;
         // root で動かなかったものは nobody (65534) でもう一度 (VLC のように root では動かないものがある)
         let root_user = Command::new("id").arg("-u").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+        // 動かす場所は捨ててよいディレクトリ (NAME.run)。qemu-user の git は aarch64 のプログラム (git-* など) を exec して
+        // ENOEXEC になると、musl の execvp がそれを /bin/sh のスクリプトとして読み、ELF の中の > でおかしな名前の空の
+        // ファイルをいまいるところ (リポジトリ) に作った
+        let rundir = dir.with_extension("run");
+        let _ = fs::remove_dir_all(&rundir);
+        let _ = fs::create_dir_all(&rundir);
         for b in &bins {
             let path = dir.join(b);
             // --version がなければ -version (ffmpeg)、-V (tmux)、version (zig)、それもなければ --help
@@ -293,7 +299,7 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
                         c.arg("-L").arg(&dir).arg(&path);
                         c
                     };
-                    c.arg(flag);
+                    c.arg(flag).current_dir(&rundir);
                     // データ (GSettings の schema、アイコンなど) は広げたところからだけ (aiwm がつけるものと同じ並び)。qemu-user は
                     // 広げたところにないファイルをこのマシンのもので代わりにするので、既定の /usr/share のままだと Ubuntu の
                     // schema で gsettings が動いた (aios では No schemas installed)
