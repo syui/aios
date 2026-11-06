@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
+TESTS="apparmor bigunmap chosen clone3 closerange cpuid cpuvuln createrace dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -72,6 +72,8 @@ run)
     mldrep6) cmd="sudo -n ./$t" ;;
     # frag6 も root で (raw の ICMPv6 で packet too big を作る)
     frag6) cmd="sudo -n ./$t" ;;
+    # nftsk も root で (nft の決まりと、uid を変えた子)
+    nftsk) cmd="sudo -n ./$t" ;;
     # temp6 も root で (use_tempaddr を書き、raw の ICMPv6 で RS を送る)
     temp6) cmd="sudo -n ./$t" ;;
     # rtnladdr も root で (ip addr を足して消す)

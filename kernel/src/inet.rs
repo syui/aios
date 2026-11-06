@@ -1743,6 +1743,60 @@ fn ext_owner6(ip: &[u8]) -> Option<(u32, u32)> {
     listener
 }
 
+/// 受けたパケット (eth0 から、自分あて。IP の頭から) の early demux (ip_rcv_finish_core の tcp_v4_early_demux /
+/// udp_v4_early_demux と IPv6 のもの): TCP はつながり (SYN_SENT も: ehash) のソケット、UDP は connect して 4 つが
+/// みな合うソケットの持ち主 (fsuid, fsgid)。listen しているものと断片には見ない。LOCAL_IN の meta skuid / skgid
+pub fn demux_owner(ip: &[u8]) -> Option<(u32, u32)> {
+    let v6 = *ip.first()? >> 4 == 6;
+    let (thoff, proto) = if v6 {
+        let (off, proto, frag) = crate::nfhook::v6_l4(ip)?;
+        if frag != 0 {
+            return None;
+        }
+        (off, proto)
+    } else {
+        let ihl = (*ip.first()? & 15) as usize * 4;
+        // MF か offset のある断片
+        if ip.len() < 20 || u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 {
+            return None;
+        }
+        (ihl, ip[9])
+    };
+    if (proto != 6 && proto != 17) || ip.len() < thoff + 4 {
+        return None;
+    }
+    let (sp, dp) = (u16::from_be_bytes([ip[thoff], ip[thoff + 1]]), u16::from_be_bytes([ip[thoff + 2], ip[thoff + 3]]));
+    let (sa, da) = if v6 {
+        (u128::from_be_bytes(ip[8..24].try_into().unwrap()), u128::from_be_bytes(ip[24..40].try_into().unwrap()))
+    } else {
+        (u32::from_be_bytes(ip[12..16].try_into().unwrap()) as u128, u32::from_be_bytes(ip[16..20].try_into().unwrap()) as u128)
+    };
+    for w in all().iter() {
+        let Some(u) = w.upgrade() else { continue };
+        let Ok(s) = u.try_borrow() else { continue };
+        let (peer, me) = if v6 {
+            if !s.v6 {
+                continue;
+            }
+            (s.daddr6, if s.rcv6 != 0 { s.rcv6 } else { s.saddr6 })
+        } else {
+            if s.v6 || (s.family == AF_INET6 && s.v6only) {
+                continue;
+            }
+            (s.daddr as u128, if s.rcv_saddr != 0 { s.rcv_saddr } else { s.saddr } as u128)
+        };
+        let hit = if proto == 6 {
+            s.tcp && s.ext.is_some() && s.sport == dp && peer == sa && s.dport == sp
+        } else {
+            !s.tcp && s.state == St::Established && s.num == dp && peer == sa && s.dport == sp && me == da
+        };
+        if hit {
+            return Some((s.uid, s.gid));
+        }
+    }
+    None
+}
+
 /// ファイアウォールが返した ICMP の到達不能 (自分あて。IPv4 の頭から) を、送ったソケットに (tcp_v4_err、__udp4_lib_err)
 pub fn icmp_error(r: &[u8]) {
     if r.len() < 28 + 20 + 8 || r[20] != 3 {

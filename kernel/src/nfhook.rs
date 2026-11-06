@@ -271,8 +271,15 @@ pub fn in_eth(frame: &mut [u8], local: bool, pkttype: u8) -> EthIn {
     let ll: &[u8] = ll;
     let r = {
         let mut p = Pkt { ip: &mut *ip, ll: Some(ll), iif: IF_ETH0, oif: 0, mark: 0, priority: 0, sk: None, pkttype, ct: Ct::None };
-        let hs: &[u32] = if local { &[PRE_ROUTING, LOCAL_IN] } else { &[PRE_ROUTING] };
-        hooks(hs, &mut p).map(|d| (d, p.mark, conntrack::attach(&mut p.ct)))
+        let mut d = hooks(&[PRE_ROUTING], &mut p);
+        if d.is_none() && local {
+            // early demux (ip_rcv_finish_core: PRE_ROUTING のあと): LOCAL_IN ではつながったソケットの持ち主が見える
+            if pkttype == PACKET_HOST {
+                p.sk = crate::inet::demux_owner(p.ip);
+            }
+            d = hooks(&[LOCAL_IN], &mut p);
+        }
+        d.map(|d| (d, p.mark, conntrack::attach(&mut p.ct)))
     };
     let Some(((rj, _why, hook), mark, rct)) = r else { return EthIn::Pass };
     let Some(rj) = rj else { return EthIn::Drop(None) };

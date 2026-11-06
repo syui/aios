@@ -1010,8 +1010,13 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
   - Linux よりよいところ: ファイアウォールが落としたものに当たったシステムコールは /proc/ai/why に「the firewall dropped
     the packet: nftables inet filter output handle 5」(policy なら policy drop) と残る (sendmsg の EPERM、connect の
     ECONNREFUSED など)
-  - まだ: 受けるものの meta skuid (Linux は early demux でつながったものだけわかる)、
-    exthdr の IPv4 オプションと書くもの、ingress、forward (転送しない)、外へつなぐ TCP の SYN のやりなおしの間は smoltcp の
+  - 受けるものの meta skuid / skgid: Linux の early demux (ip_rcv_finish_core: PRE_ROUTING のあと) と同じく、eth0 から
+    来た自分あてのもの (PACKET_HOST、断片でないもの) の LOCAL_IN でだけ、TCP はつながり (SYN_SENT も) のソケット、
+    UDP は connect して 4 つがみな合うソケットの持ち主 (inet::demux_owner)。PRE_ROUTING と lo から来たもの (dst がある
+    ので early demux しない) と listen しているものには持ち主がない。`LINUX_FILES="nft=build/nft-static" test/ldiff.sh
+    --root --net nftsk` (QEMU のホストのだれもいないポートへ connect して返る RST を、root と uid 4242 の子で) で手本の
+    Linux 7.4-rc1 と 43 行同じ
+  - まだ: exthdr の IPv4 オプションと書くもの、ingress、forward (転送しない)、外へつなぐ TCP の SYN のやりなおしの間は smoltcp の
     もの (counter の数が Linux とちがう)
   - 確かめかた: `test/nfteval.c` (root で。12 の case: 中どうしの TCP と UDP、eth0 のアドレス、外のだれもいないポート、
     QEMU を一回りして外から来る TCP と UDP (hostfwd: bin/run.sh の AIOS_FWD と test/linux-vm.sh の LINUX_NET)。答え

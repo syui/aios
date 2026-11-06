@@ -1,5 +1,4 @@
 [
-{"id": "nft-skuid-in", "area": "net", "status": "open", "since": "2026-11-02", "what": "受けるパケットの meta skuid / skgid (つながったものの持ち主)", "why": "Linux は early demux でつながったソケットの持ち主がわかる。aios は受ける側で見ない", "verify": "test/nfteval.c に input の skuid の case。Linux 7.4 と同じ"},
 {"id": "ctnetlink", "area": "net", "status": "open", "since": "2026-11-02", "what": "ctnetlink (NETLINK_NETFILTER の conntrack: conntrack -L / -D、7.4 の CTA_FILTER_ZONE)", "why": "/proc/net/nf_conntrack は読めるが、conntrack の道具が動かない", "verify": "conntrack -L の出力を Linux 7.4 とくらべる"},
 {"id": "nft-nat", "area": "net", "status": "open", "since": "2026-11-02", "what": "nftables の NAT (masquerade、redirect、dnat、snat) と helper、object、flowtable、set の要素の式、dynset、monitor、echo、get element", "why": "ファイアウォールの段階 3 までののこり", "verify": "test/nftables.c と test/nfteval.c に case。Linux 7.4 と同じ"},
 {"id": "open-tree-drop-mntns", "area": "fs", "status": "open", "since": "2026-11-02", "what": "open_tree の OPEN_TREE_DROP_MNTNS_MOUNTS (7.4)", "why": "7.4 で足された印", "verify": "open_tree を持っているか見て、あれば Linux 7.4 とくらべる"},
