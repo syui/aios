@@ -92,6 +92,8 @@ pub struct Addr {
     /// DAD のとちゅう: 次にすること (NS を送るか、終える) の時刻と、のこりの NS の数。nonce は NS にのせる 6 バイト
     dad: Option<(u64, u8)>,
     nonce: u64,
+    /// 作った順 (マルチキャストの組の並び: solicited-node の組に入った順)
+    seq: u64,
 }
 
 impl Addr {
@@ -202,13 +204,88 @@ fn eui64(mac: [u8; 6]) -> u128 {
     u64::from_be_bytes(b) as u128
 }
 
+// ---- マルチキャストの組 (Linux の idev->mc_list: __ipv6_dev_mc_inc / dec) ----
+//
+// lo と eth0 のどちらも ff01::1 と ff02::1 (ipv6_add_dev)、eth0 は番地ごとの solicited-node (addrconf_join_solict。同じ組は
+// users を足す。番地がなくなれば出る)。ソケットが入れた組 (ipv6_sock_mc_join) は MC に、口と組ごとにソケットの数で
+// (いつもある組に入ったものは、その users に足す)
+
+/// ソケットが入れた組: (口、組、ソケットの数、入った順)
+static MC: Bkl<Vec<(i32, u128, u32, u64)>> = Bkl::new(Vec::new());
+/// 番地と組の作った順
+static SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+pub const ALL_NODES: u128 = 0xff02u128 << 112 | 1;
+const ALL_NODES_IF: u128 = 0xff01u128 << 112 | 1;
+
+/// 番地の solicited-node の組 (ff02::1:ffXX:XXXX)
+pub fn solicited(a: u128) -> u128 {
+    0xff02u128 << 112 | 1 << 32 | 0xff00_0000 | (a & 0xff_ffff)
+}
+
+/// 口 (1 は lo、ETH_INDEX は eth0) の組と users。古いものが先
+pub fn mc_list(ifindex: i32) -> Vec<(u128, u32)> {
+    let mut v: Vec<(u64, u128, u32)> = alloc::vec![(0, ALL_NODES_IF, 1), (0, ALL_NODES, 1)];
+    let add = |v: &mut Vec<(u64, u128, u32)>, seq: u64, g: u128, n: u32| match v.iter_mut().find(|x| x.1 == g) {
+        Some(x) => {
+            x.0 = x.0.min(seq);
+            x.2 += n;
+        }
+        None => v.push((seq, g, n)),
+    };
+    if ifindex == crate::netlink::ETH_INDEX {
+        for a in addrs() {
+            add(&mut v, a.seq, solicited(a.addr), 1);
+        }
+    }
+    for &(i, g, n, seq) in MC.get().iter() {
+        if i == ifindex {
+            add(&mut v, seq, g, n);
+        }
+    }
+    v.sort_by_key(|x| x.0);
+    v.into_iter().map(|x| (x.1, x.2)).collect()
+}
+
+/// 口がその組に入っているか (ipv6_chk_mcast_addr: 受けるか、自分あてに折りかえすか)
+pub fn mc_has(ifindex: i32, g: u128) -> bool {
+    g == ALL_NODES
+        || g == ALL_NODES_IF
+        || (ifindex == crate::netlink::ETH_INDEX && ST.get().as_ref().is_some_and(|s| s.addrs.iter().any(|a| solicited(a.addr) == g)))
+        || MC.get().iter().any(|x| x.0 == ifindex && x.1 == g)
+}
+
+/// ソケットが組に入る (ipv6_dev_mc_inc)
+pub fn mc_inc(ifindex: i32, g: u128) {
+    let v = MC.get();
+    match v.iter_mut().find(|x| x.0 == ifindex && x.1 == g) {
+        Some(x) => x.2 += 1,
+        None => v.push((ifindex, g, 1, next_seq())),
+    }
+}
+
+/// ソケットが組を出る (ipv6_dev_mc_dec)
+pub fn mc_dec(ifindex: i32, g: u128) {
+    let v = MC.get();
+    if let Some(i) = v.iter().position(|x| x.0 == ifindex && x.1 == g) {
+        v[i].2 -= 1;
+        if v[i].2 == 0 {
+            v.remove(i);
+        }
+    }
+}
+
 /// eth0 を起こした (net::init): link-local の番地を
 pub fn init(mac: [u8; 6]) {
     let now = ms();
     let ll = 0xfe80u128 << 112 | eui64(mac);
     let (dad, nonce) = dad_start(now);
     let flags = IFA_F_PERMANENT | if dad.is_some() { IFA_F_TENTATIVE } else { 0 };
-    let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce };
+    let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce, seq: next_seq() };
     // RS は link-local の DAD がおわってから (next_rs はそのときに)
     let next_rs = if dad.is_some() { u64::MAX } else { now };
     *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false, pmtu: Vec::new() });
@@ -392,7 +469,7 @@ pub fn add_addr(addr: u128, plen: u8, flags: u32, preferred: u32, valid: u32, pr
     if dad.is_some() {
         fl |= IFA_F_TENTATIVE;
     }
-    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now, dad, nonce });
+    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now, dad, nonce, seq: next_seq() });
     let made = prefix_route(st, addr, plen, fl, until(now, valid));
     changed();
     made
@@ -813,6 +890,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
                     updated: now,
                     dad,
                     nonce,
+                    seq: next_seq(),
                 })
             }
             None => {}

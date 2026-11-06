@@ -150,6 +150,9 @@ fn set_gw(r: Option<Ipv4Address>) {
 static ICMP_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
 /// eth0 から来た ICMPv6 のエラー (IPv6 の頭から): smoltcp は TCP と UDP のソケットに当てないので、poll のあとで inet.rs に
 static ICMP6_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
+/// eth0 から来たマルチキャストの UDP (eth0 が入っている組あてのもの。IPv6 の頭から): smoltcp は 1 つのソケットにしか
+/// わたさず、ソケットが入れた組も知らないので、poll のあとで inet.rs が同じポートのソケットみなに
+static MC6_LATER: Bkl<Vec<Vec<u8>>> = Bkl::new(Vec::new());
 /// 送り受けの数 (eth0 と lo): 受けたバイト, 受けたフレーム, 出したバイト, 出したフレーム
 static ETH_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 static LO_STATS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
@@ -222,6 +225,11 @@ impl Device for NetDev {
                 // ICMPv6 のエラー (type が 128 より小さいもの) で自分あてのもの
                 if icmp6_err_to_me(&frame) {
                     ICMP6_LATER.get().push(frame[14..].to_vec());
+                }
+                if ipv6_ok(&frame) && frame[20] == 17 && frame[38] == 0xff && mc_joined(u128::from_be_bytes(frame[38..54].try_into().unwrap())) {
+                    let tot = 54 + u16::from_be_bytes([frame[18], frame[19]]) as usize;
+                    MC6_LATER.get().push(frame[14..tot].to_vec());
+                    continue;
                 }
             }
             return Some((Rx(frame), Tx(self)));
@@ -296,10 +304,10 @@ fn ipv6_ok(f: &[u8]) -> bool {
     f.len() >= 54 && f[12..14] == [0x86, 0xdd] && f[14] >> 4 == 6 && 54 + u16::from_be_bytes([f[18], f[19]]) as usize <= f.len()
 }
 
-/// aios が受けるマルチキャスト (ff02::1 と、自分の番地の solicited-node の ff02::1:ffXX:XXXX)
+/// eth0 から受けるマルチキャスト (ipv6_chk_mcast_addr: eth0 が入っている組)。interface-local (ff01::) と scope 0 は外から
+/// 来たら捨てる (ip6_rcv_core: RFC 4291 の 2.7)
 fn mc_joined(a: u128) -> bool {
-    a == 0xff02u128 << 112 | 1
-        || (a >> 24 == (0xff02u128 << 88 | 1 << 8 | 0xff) && crate::addrconf::addrs().iter().any(|x| x.addr & 0xff_ffff == a & 0xff_ffff))
+    (a >> 112) & 0xf >= 2 && crate::addrconf::mc_has(crate::netlink::ETH_INDEX, a)
 }
 
 /// IPv6 の外への (送るときに決まりを通した) raw の ICMPv6 のパケット: filter_out は通しなおさない
@@ -859,6 +867,10 @@ pub fn poll() {
     let later6 = core::mem::take(ICMP6_LATER.get());
     for r in later6 {
         crate::inet::icmp6_error(&r);
+    }
+    let mc6 = core::mem::take(MC6_LATER.get());
+    for ip in mc6 {
+        crate::inet::udp6_mcast_rx(&ip);
     }
     // 終わった孤児を片付ける
     let sockets = &mut n.sockets;

@@ -125,8 +125,8 @@ const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 const NETLINK_CAP_ACK: u64 = 10;
 const NETLINK_EXT_ACK: u64 = 11;
 const NETLINK_GET_STRICT_CHK: u64 = 12;
-/// NETLINK_ROUTE の multicast の組の数 (RTNLGRP_MAX)
-const RTNLGRP_MAX: u32 = 37;
+/// NETLINK_ROUTE の multicast の組の数 (RTNLGRP_MAX: 7.4 は RTNLGRP_IPV6_ACADDR)
+const RTNLGRP_MAX: u32 = 39;
 /// 受ける・送る入れ物の大きさのはじめ (net.core.rmem_default と wmem_default)
 const BUF_DEFAULT: usize = 212992;
 
@@ -961,36 +961,32 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
 
 // ---- マルチキャストの番地の一覧 (RTM_GETMULTICAST: ip maddr) ----
 //
-// aios は IGMP と MLD をしないが、入っている組は Linux と同じ: IPv4 はどの口も 224.0.0.1 (ip_mc_up)、IPv6 は ff01::1 と
-// ff02::1 (ipv6_add_dev) と、eth0 の番地ごとの solicited-node (addrconf_join_solict。lo はない)。Linux の idev->mc_list は
-// 新しく入ったものが先。PF_PACKET (7.4 の dev_mc_dump) は eth0 の装置のマルチキャストの番地 (dev->mc: 入れた順) で、
-// IPv6 の組は link-local より広いものだけ (igmp6_group_added)
+// aios は IGMP をしないが、入っている組は Linux と同じ: IPv4 はどの口も 224.0.0.1 (ip_mc_up)、IPv6 は addrconf.rs の
+// mc_list (ff01::1 と ff02::1、eth0 の solicited-node、ソケットが入れたもの)。Linux の idev->mc_list は新しく入ったものが
+// 先。PF_PACKET (7.4 の dev_mc_dump) は eth0 の装置のマルチキャストの番地 (dev->mc: 入れた順) で、IPv6 の組は link-local
+// より狭くないものだけ (igmp6_group_added)。IPv6 の組ができる・なくなると RTNLGRP_IPV6_MCADDR に知らせる
+// (inet6_ifmcaddr_notify: RTM_NEWMULTICAST / RTM_DELMULTICAST)
 
 const IFA_MULTICAST: u16 = 7;
 const IFA_MC_USERS: u16 = 12;
 const RT_SCOPE_LINK_MC: u8 = 253;
+const RT_SCOPE_SITE: u8 = 200;
+const RTM_NEWMULTICAST: u16 = 56;
+const RTM_DELMULTICAST: u16 = 57;
+const RTNLGRP_IPV6_MCADDR: u32 = 38;
 
-/// eth0 の solicited-node の組 (ff02::1:ffXX:XXXX) と、その組を使う番地の数。入った順 (古いものが先)
-fn solicited_groups() -> Vec<(u128, u32)> {
-    let mut v: Vec<(u128, u32)> = Vec::new();
-    for a in crate::addrconf::addrs() {
-        let g = 0xff02u128 << 112 | 1 << 32 | 0xff00_0000 | (a.addr & 0xff_ffff);
-        match v.iter_mut().find(|x| x.0 == g) {
-            Some(x) => x.1 += 1,
-            None => v.push((g, 1)),
-        }
-    }
-    v
-}
-
-/// 1 つの組の答え (inet_fill_ifmcaddr / inet6_fill_ifmcaddr / dev_mc_fill_addr)。hdr は (家族、口、nlmsg の flags、seq、ポート)
-fn put_mcast(d: &mut Vec<u8>, hdr: (u8, i32, u16, u32, u32), addr: &[u8], users: u32) {
-    let (family, index, flags, seq, me) = hdr;
+/// 1 つの組の答え (inet_fill_ifmcaddr / inet6_fill_ifmcaddr / dev_mc_fill_addr)。hdr は (家族、口、nlmsg の type と
+/// flags、seq、ポート)。IPv6 の site-local の組 (ff05::) の scope は RT_SCOPE_SITE (知らせはいつも universe)
+fn put_mcast(d: &mut Vec<u8>, hdr: (u8, i32, u16, u16, u32, u32), addr: &[u8], users: u32) {
+    let (family, index, typ, flags, seq, me) = hdr;
     let mut p = Vec::new();
     match family {
         AF_PACKET => p.extend_from_slice(&[AF_PACKET, 0, 0, RT_SCOPE_LINK_MC]),
         AF_INET => p.extend_from_slice(&[AF_INET, 32, IFA_F_PERMANENT as u8, RT_SCOPE_UNIVERSE]),
-        _ => p.extend_from_slice(&[AF_INET6, 128, IFA_F_PERMANENT as u8, RT_SCOPE_UNIVERSE]),
+        _ => {
+            let site = typ == RTM_GETMULTICAST && addr[1] & 0xf == 5;
+            p.extend_from_slice(&[AF_INET6, 128, IFA_F_PERMANENT as u8, if site { RT_SCOPE_SITE } else { RT_SCOPE_UNIVERSE }]);
+        }
     }
     p.extend_from_slice(&(index as u32).to_le_bytes());
     attr(&mut p, IFA_MULTICAST, addr);
@@ -1005,7 +1001,50 @@ fn put_mcast(d: &mut Vec<u8>, hdr: (u8, i32, u16, u32, u32), addr: &[u8], users:
         }
         attr(&mut p, IFA_CACHEINFO, &ci);
     }
-    put_msg(d, RTM_GETMULTICAST, flags, seq, me, &p);
+    put_msg(d, typ, flags, seq, me, &p);
+}
+
+/// eth0 の装置のマルチキャストの MAC (dev->mc: 入れた順) と、それを使う組の数。ff02::1 (ipv6_add_dev)、224.0.0.1
+/// (ip_mc_up)、そのあとの IPv6 の組 (scope が link-local より狭いもの (ff01::) はのぞく: igmp6_group_added)
+fn eth_macs() -> Vec<([u8; 6], u32)> {
+    let mut v: Vec<([u8; 6], u32)> = alloc::vec![([0x33, 0x33, 0, 0, 0, 1], 1), ([0x01, 0x00, 0x5e, 0, 0, 1], 1)];
+    for (g, _) in crate::addrconf::mc_list(ETH_INDEX) {
+        if g == crate::addrconf::ALL_NODES || ((g >> 112) & 0xf) < 2 {
+            continue;
+        }
+        let b = g.to_be_bytes();
+        let m = [0x33, 0x33, b[12], b[13], b[14], b[15]];
+        match v.iter_mut().find(|x| x.0 == m) {
+            Some(x) => x.1 += 1,
+            None => v.push((m, 1)),
+        }
+    }
+    v
+}
+
+/// IPv6 の組の知らせ: いまの口ごとの組を前のものとくらべて、なくなったものは RTM_DELMULTICAST (users 0)、できたものは
+/// RTM_NEWMULTICAST。はじめは覚えるだけ
+static MC6_SNAP: Bkl<Option<Vec<(i32, u128)>>> = Bkl::new(None);
+
+pub fn mc6_sync() {
+    let mut now: Vec<(i32, u128, u32)> = Vec::new();
+    for l in links() {
+        for (g, n) in crate::addrconf::mc_list(l.index) {
+            now.push((l.index, g, n));
+        }
+    }
+    let keys: Vec<(i32, u128)> = now.iter().map(|x| (x.0, x.1)).collect();
+    let Some(old) = MC6_SNAP.get().replace(keys.clone()) else { return };
+    for &(i, g) in old.iter().filter(|x| !keys.contains(x)) {
+        let mut d = Vec::new();
+        put_mcast(&mut d, (AF_INET6, i, RTM_DELMULTICAST, 0, 0, 0), &g.to_be_bytes(), 0);
+        notify(RTNLGRP_IPV6_MCADDR, d);
+    }
+    for &(i, g, n) in now.iter().filter(|x| !old.contains(&(x.0, x.1))) {
+        let mut d = Vec::new();
+        put_mcast(&mut d, (AF_INET6, i, RTM_NEWMULTICAST, 0, 0, 0), &g.to_be_bytes(), n);
+        notify(RTNLGRP_IPV6_MCADDR, d);
+    }
 }
 
 /// RTM_GETMULTICAST の dump (AF_INET、AF_INET6、AF_PACKET。中身と NLMSG_DONE は 1 つのデータグラム)。ifaddrmsg の
@@ -1028,28 +1067,17 @@ fn dump_mcast(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mu
     let mut d = Vec::new();
     for l in links.iter().filter(|l| index == 0 || l.index == index) {
         let eth = l.index == ETH_INDEX;
-        let hdr = (family, l.index, fl, seq, me);
+        let hdr = (family, l.index, RTM_GETMULTICAST, fl, seq, me);
         match family {
             AF_INET => put_mcast(&mut d, hdr, &[224, 0, 0, 1], 1),
             AF_INET6 => {
-                if eth {
-                    for (g, n) in solicited_groups().iter().rev() {
-                        put_mcast(&mut d, hdr, &g.to_be_bytes(), *n);
-                    }
-                }
-                for g in [0xff02u128 << 112 | 1, 0xff01u128 << 112 | 1] {
-                    put_mcast(&mut d, hdr, &g.to_be_bytes(), 1);
+                for (g, n) in crate::addrconf::mc_list(l.index).iter().rev() {
+                    put_mcast(&mut d, hdr, &g.to_be_bytes(), *n);
                 }
             }
             _ if eth => {
-                // ff02::1、224.0.0.1、solicited-node の順に入れた
-                let mut macs: Vec<[u8; 6]> = alloc::vec![[0x33, 0x33, 0, 0, 0, 1], [0x01, 0x00, 0x5e, 0, 0, 1]];
-                for (g, _) in solicited_groups() {
-                    let b = g.to_be_bytes();
-                    macs.push([0x33, 0x33, b[12], b[13], b[14], b[15]]);
-                }
-                for m in macs {
-                    put_mcast(&mut d, hdr, &m, 1);
+                for (m, n) in eth_macs() {
+                    put_mcast(&mut d, hdr, &m, n);
                 }
             }
             _ => {}
@@ -2932,6 +2960,8 @@ pub fn changed6() {
         ev_route6(r, RTM_NEWROUTE);
     }
     *SNAP6.get() = Some((na, nr));
+    // 番地の solicited-node の組
+    mc6_sync();
 }
 
 /// RTM_NEWADDR (inet6_fill_ifaddr の属性の順: IFA_ADDRESS、IFA_CACHEINFO、IFA_FLAGS、IFA_PROTO)

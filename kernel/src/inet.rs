@@ -45,6 +45,7 @@ const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const ENODEV: i64 = 19;
+const EPROTO: i64 = 71;
 const EFAULT: i64 = 14;
 const EPIPE: i64 = 32;
 const EDOM: i64 = 33;
@@ -184,6 +185,8 @@ struct Dgram {
     tos: u8,
     ttl: u8,
     truesize: usize,
+    /// 受けた口 (IPV6_PKTINFO の ipi6_ifindex: 自分あては lo、外からのものは eth0)
+    ifindex: u32,
 }
 
 /// IP_RECVERR と IPV6_RECVERR のエラーの行列のもの (Linux の sock_exterr_skb): 送ったものの中身、errno、ICMP (v6 なら
@@ -241,6 +244,10 @@ pub struct Inet {
     hops6: i32,
     mc_hops6: i32,
     mc_loop6: bool,
+    /// 入っている IPv6 のマルチキャストの組 (np->ipv6_mc_list: 新しいものが先): (組、口)。mc_all6 は IPV6_MULTICAST_ALL
+    /// (入っていない組あてのものも受ける)
+    mc6: Vec<(u128, i32)>,
+    mc_all6: bool,
     tclass: i32,
     rx_pktinfo6: bool,
     rx_tclass: bool,
@@ -477,6 +484,8 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         hops6: -1,
         mc_hops6: 1,
         mc_loop6: true,
+        mc6: Vec::new(),
+        mc_all6: true,
         tclass: 0,
         rx_pktinfo6: false,
         rx_tclass: false,
@@ -3276,6 +3285,115 @@ fn udp_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], f
 /// AF_UNSPEC (connect したものへ)。写した番地と IPv4 は udp_sendmsg (v6only なら ENETUNREACH)。IPv6 は :: が ::1、
 /// ポート 0 は EINVAL、みち (::1 だけ)、autobind、届ける (だれもいなければ ICMPv6 の port unreachable: connect した相手
 /// なら次に ECONNREFUSED)
+/// ソケットが IPv6 のマルチキャストの組に入る (ipv6_sock_mc_join): マルチキャストでなければ EINVAL、同じ組 (口が 0 か
+/// 同じ口) にもう入っていれば EADDRINUSE。口が 0 なら道から (ff00::/8 は eth0)、ない口は ENODEV。組の表は netns 0 の
+/// 口のもの (ほかの netns では ENODEV)
+fn mc6_join(u: &InetRef, ifindex: i32, g: u128) -> Result<(), i64> {
+    if !v6_multicast(g) {
+        return Err(crate::why::inval());
+    }
+    let netns = u.borrow().net;
+    if u.borrow().mc6.iter().any(|&(x, i)| x == g && (ifindex == 0 || i == ifindex)) {
+        return Err(-EADDRINUSE);
+    }
+    let dev = if netns != 0 {
+        0
+    } else if ifindex == 0 {
+        if crate::addrconf::lookup(g).is_some() { crate::netlink::ETH_INDEX } else { 0 }
+    } else if crate::netlink::links().iter().any(|l| l.index == ifindex) {
+        ifindex
+    } else {
+        0
+    };
+    if dev == 0 {
+        return Err(-ENODEV);
+    }
+    crate::netlink::mc6_sync();
+    crate::addrconf::mc_inc(dev, g);
+    crate::netlink::mc6_sync();
+    u.borrow_mut().mc6.insert(0, (g, dev));
+    Ok(())
+}
+
+/// 組を出る (ipv6_sock_mc_drop): 口が 0 なら、その組のうち新しく入ったもの。入っていなければ EADDRNOTAVAIL
+fn mc6_drop(u: &InetRef, ifindex: i32, g: u128) -> Result<(), i64> {
+    if !v6_multicast(g) {
+        return Err(crate::why::inval());
+    }
+    let pos = u.borrow().mc6.iter().position(|&(x, i)| x == g && (ifindex == 0 || i == ifindex)).ok_or(-EADDRNOTAVAIL)?;
+    let (_, dev) = u.borrow_mut().mc6.remove(pos);
+    crate::netlink::mc6_sync();
+    crate::addrconf::mc_dec(dev, g);
+    crate::netlink::mc6_sync();
+    Ok(())
+}
+
+/// 閉じるときに入っていた組をみな出る (ipv6_sock_mc_close: 新しいものから)
+fn mc6_close(u: &InetRef) {
+    let v = core::mem::take(&mut u.borrow_mut().mc6);
+    for (g, dev) in v {
+        crate::netlink::mc6_sync();
+        crate::addrconf::mc_dec(dev, g);
+        crate::netlink::mc6_sync();
+    }
+}
+
+/// マルチキャストの UDP を受ける (__udp6_lib_mcast_deliver と __udp_v6_is_mcast_sock): 同じポートの AF_INET6 のソケット
+/// のうち、bind した番地が :: かその組で、つないだ相手が合い、その組に入っている (入っていなければ IPV6_MULTICAST_ALL
+/// の) もの、みなに。ifindex は受けた口 (自分が送ったものの折りかえしも eth0)。だれもいなくても ICMPv6 は返さない
+#[allow(clippy::too_many_arguments)]
+fn udp6_mcast_deliver(netns: u64, src: u128, sport: u16, dst: u128, dport: u16, data: &[u8], hops: u8, tclass: u8, ifindex: i32) {
+    let Some(v) = ports().get(&(netns, false, dport)) else { return };
+    let socks: Vec<InetRef> = v.values().filter_map(|w| w.upgrade()).collect();
+    for r in socks {
+        let ts = udp_truesize(data.len());
+        let ok = {
+            let mut x = r.borrow_mut();
+            let want = x.family == AF_INET6
+                && !x.tcp
+                && !x.dead
+                && (x.rcv6 == 0 || x.rcv6 == dst)
+                && (x.dport == 0 || x.dport == sport)
+                && (x.daddr6 == 0 || x.daddr6 == src)
+                && (x.mc_all6 || x.mc6.iter().any(|m| m.0 == dst));
+            let full = x.rmem + ts > x.rcvbuf && x.rmem != 0;
+            if want && !full {
+                x.rmem += ts;
+                x.dq.push_back(Dgram { data: data.to_vec(), from: (LOOPBACK4_IPV6, sport), to: LOOPBACK4_IPV6, v6: Some((src, dst)), tos: tclass, ttl: hops, truesize: ts, ifindex: ifindex as u32 });
+            }
+            want && !full
+        };
+        if ok {
+            notify(&r);
+        }
+    }
+}
+
+/// eth0 から来たマルチキャストの UDP (IPv6 の頭から。eth0 が入っている組あてのもの: net.rs が smoltcp に渡さずに)。
+/// チェックサムがおかしいもの (0 も) は捨てる
+pub fn udp6_mcast_rx(ip: &[u8]) {
+    if ip.len() < 48 {
+        return;
+    }
+    let plen = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+    let ulen = u16::from_be_bytes([ip[44], ip[45]]) as usize;
+    if ulen < 8 || ulen > plen || 40 + plen > ip.len() || ip[46..48] == [0, 0] {
+        return;
+    }
+    let udp = &ip[40..40 + ulen];
+    let mut sum = crate::nfhook::csum_add(0, &ip[8..40]);
+    sum = crate::nfhook::csum_add(sum, &(ulen as u32).to_be_bytes());
+    sum = crate::nfhook::csum_add(sum, &[0, 0, 0, 17]);
+    if crate::nfhook::csum_fold(crate::nfhook::csum_add(sum, udp)) != 0 {
+        return;
+    }
+    let src = u128::from_be_bytes(ip[8..24].try_into().unwrap());
+    let dst = u128::from_be_bytes(ip[24..40].try_into().unwrap());
+    let tclass = ((u16::from_be_bytes([ip[0], ip[1]]) >> 4) & 0xff) as u8;
+    let (sport, dport) = (u16::from_be_bytes([udp[0], udp[1]]), u16::from_be_bytes([udp[2], udp[3]]));
+    udp6_mcast_deliver(0, src, sport, dst, dport, &udp[8..], ip[7], tclass, crate::netlink::ETH_INDEX);
+}
+
 fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
     let (v6only, saddr6, rcv6, pending) = {
         let s = u.borrow();
@@ -3358,7 +3476,13 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
     let fw = netns == 0 && crate::nfhook::active();
     if fw {
         use crate::nfhook;
-        let hops = if local { hops } else { u.borrow().hops6.try_into().unwrap_or(crate::addrconf::hop_limit()) };
+        let hops = if local {
+            hops
+        } else if v6_multicast(daddr) {
+            u.borrow().mc_hops6 as u8
+        } else {
+            u.borrow().hops6.try_into().unwrap_or(crate::addrconf::hop_limit())
+        };
         let mut pkt = nfhook::udp_ends(nfhook::Ends::V6(src6, daddr), sport, dport, &data, tclass, hops, 0, false);
         let path = if local { nfhook::lo(&mut pkt, Some(sk), 0, prio) } else { nfhook::out_eth(&mut pkt, Some(sk), 0, prio) };
         let (reply, out, why) = match path {
@@ -3379,6 +3503,21 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             return Ok(len as i64);
         }
     }
+    // マルチキャスト (ip6_finish_output2): hop limit は IPV6_MULTICAST_HOPS。IPV6_MULTICAST_LOOP で eth0 がその組に
+    // 入っていれば自分にも (dev_loopback_xmit: 受けた口は eth0。決まりには通さない)。interface-local (ff01::) は外に出さない
+    if v6_multicast(daddr) {
+        let (lp, mh) = {
+            let s = u.borrow();
+            (s.mc_loop6, s.mc_hops6 as u8)
+        };
+        if lp && crate::addrconf::mc_has(crate::netlink::ETH_INDEX, daddr) {
+            udp6_mcast_deliver(netns, src6, sport, daddr, dport, &data, mh, tclass, crate::netlink::ETH_INDEX);
+        }
+        if (daddr >> 112) & 0xf > 1 {
+            ext_udp_send6(u, &data, src6, daddr, dport, Some(mh))?;
+        }
+        return Ok(len as i64);
+    }
     // 外へ (eth0): smoltcp の UDP のソケットから
     if !local {
         let hops = u.borrow().hops6;
@@ -3393,7 +3532,7 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
                 let full = x.rmem + ts > x.rcvbuf && x.rmem != 0;
                 if !full {
                     x.rmem += ts;
-                    x.dq.push_back(Dgram { data, from: (LOOPBACK4_IPV6, sport), to: LOOPBACK4_IPV6, v6: Some((src6, daddr)), tos: tclass, ttl: hops, truesize: ts });
+                    x.dq.push_back(Dgram { data, from: (LOOPBACK4_IPV6, sport), to: LOOPBACK4_IPV6, v6: Some((src6, daddr)), tos: tclass, ttl: hops, truesize: ts, ifindex: 1 });
                 }
                 !full
             };
@@ -3583,7 +3722,7 @@ fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
                 let full = x.rmem + ts > x.rcvbuf && x.rmem != 0;
                 if !full {
                     x.rmem += ts;
-                    x.dq.push_back(Dgram { data, from: (saddr, sport), to: daddr, v6: None, tos, ttl, truesize: ts });
+                    x.dq.push_back(Dgram { data, from: (saddr, sport), to: daddr, v6: None, tos, ttl, truesize: ts, ifindex: 1 });
                     true
                 } else {
                     false
@@ -3781,7 +3920,7 @@ fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv,
             let (pktinfo, recvtos, recvttl) = if d.v6.is_some() { (false, false, false) } else { (pktinfo, recvtos, recvttl) };
             if pktinfo {
                 let mut b = Vec::with_capacity(12);
-                b.extend_from_slice(&1u32.to_le_bytes());
+                b.extend_from_slice(&d.ifindex.to_le_bytes());
                 b.extend_from_slice(&d.to.to_be_bytes());
                 b.extend_from_slice(&d.to.to_be_bytes());
                 r.cmsgs.push((0, 8, b));
@@ -3797,7 +3936,7 @@ fn udp_recv(u: &InetRef, len: usize, flags: u64, nonblock: bool) -> Result<Recv,
             if rx6 {
                 let mut b = Vec::with_capacity(20);
                 b.extend_from_slice(&d.v6.map_or(mapped(d.to), |v| v.1).to_be_bytes());
-                b.extend_from_slice(&1u32.to_le_bytes());
+                b.extend_from_slice(&d.ifindex.to_le_bytes());
                 r.cmsgs.push((41, 50, b));
             }
             if rxhl && d.v6.is_some() {
@@ -4353,6 +4492,7 @@ fn ipv6_get(u: &InetRef, opt: i32) -> Result<Vec<u8>, i64> {
         16 => if s.hops6 < 0 { 64 } else { s.hops6 as i64 },
         18 => s.mc_hops6 as i64,
         19 => s.mc_loop6 as i64,
+        29 => s.mc_all6 as i64,
         // IPV6_MULTICAST_IF、IPV6_UNICAST_IF
         17 | 76 => 0,
         // IPV6_TCLASS、IPV6_RECVPKTINFO、IPV6_RECVHOPLIMIT、IPV6_RECVTCLASS、IPV6_MTU_DISCOVER、IPV6_RECVERR
@@ -4379,6 +4519,28 @@ fn ipv6_get(u: &InetRef, opt: i32) -> Result<Vec<u8>, i64> {
 /// SOL_IPV6 の setsockopt (do_ipv6_setsockopt のうち aios が持つもの。ほかは ENOPROTOOPT)
 fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
     let int = || -> Result<i32, i64> { if val.len() < 4 { Err(crate::why::inval()) } else { Ok(i32::from_le_bytes(val[..4].try_into().unwrap())) } };
+    // IPV6_ADD_MEMBERSHIP / DROP_MEMBERSHIP (struct ipv6_mreq: 組と口。TCP は EPROTO) と MCAST_JOIN_GROUP / LEAVE_GROUP
+    // (struct group_req: 口と、8 からの sockaddr_storage。AF_INET6 でなければ EADDRNOTAVAIL。TCP も入れる)
+    if matches!(opt, 20 | 21 | 42 | 45) {
+        let (g, ifindex) = if opt <= 21 {
+            if val.len() < 20 {
+                return Err(crate::why::inval());
+            }
+            if u.borrow().tcp {
+                return Err(-EPROTO);
+            }
+            (u128::from_be_bytes(val[..16].try_into().unwrap()), i32::from_le_bytes(val[16..20].try_into().unwrap()))
+        } else {
+            if val.len() < 136 {
+                return Err(crate::why::inval());
+            }
+            if u16::from_le_bytes([val[8], val[9]]) != AF_INET6 {
+                return Err(-EADDRNOTAVAIL);
+            }
+            (u128::from_be_bytes(val[16..32].try_into().unwrap()), i32::from_le_bytes(val[..4].try_into().unwrap()))
+        };
+        return if opt == 20 || opt == 42 { mc6_join(u, ifindex, g) } else { mc6_drop(u, ifindex, g) }.map(|_| 0);
+    }
     let mut s = u.borrow_mut();
     match opt {
         // IPV6_V6ONLY: bind したら変えられない
@@ -4413,6 +4575,8 @@ fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
             }
             s.mc_loop6 = v != 0;
         }
+        // IPV6_MULTICAST_ALL
+        29 => s.mc_all6 = int()? != 0,
         // IPV6_TCLASS: -1 は 0、TCP は ECN の 2 ビットを変えない
         67 => {
             let mut v = int()?;
@@ -4640,6 +4804,7 @@ pub fn release(u: &InetRef) {
         s.has_file = false;
         s.dead = true;
     }
+    mc6_close(u);
     if u.borrow().tcp {
         tcp_close(u);
     } else {
@@ -5256,11 +5421,11 @@ fn ext_udp_pull(u: &InetRef) {
         let d = match meta.endpoint.addr {
             IpAddress::Ipv4(a) if !(s.family == AF_INET6 && s.v6only) => {
                 let to = meta.local_address.and_then(|l| if let IpAddress::Ipv4(x) = l { Some(u32::from_be_bytes(x.octets())) } else { None }).unwrap_or_else(eth);
-                Dgram { data: buf, from: (u32::from_be_bytes(a.octets()), meta.endpoint.port), to, v6: None, tos: 0, ttl: 64, truesize: ts }
+                Dgram { data: buf, from: (u32::from_be_bytes(a.octets()), meta.endpoint.port), to, v6: None, tos: 0, ttl: 64, truesize: ts, ifindex: crate::netlink::ETH_INDEX as u32 }
             }
             IpAddress::Ipv6(a) if s.family == AF_INET6 => {
                 let to = meta.local_address.and_then(|l| if let IpAddress::Ipv6(x) = l { Some(x.to_bits()) } else { None }).unwrap_or(s.rcv6);
-                Dgram { data: buf, from: (LOOPBACK4_IPV6, meta.endpoint.port), to: LOOPBACK4_IPV6, v6: Some((a.to_bits(), to)), tos: 0, ttl: 64, truesize: ts }
+                Dgram { data: buf, from: (LOOPBACK4_IPV6, meta.endpoint.port), to: LOOPBACK4_IPV6, v6: Some((a.to_bits(), to)), tos: 0, ttl: 64, truesize: ts, ifindex: crate::netlink::ETH_INDEX as u32 }
             }
             _ => continue,
         };

@@ -1208,11 +1208,13 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   あるものだけ数える virtio::linux_index) と BUS_NAME、中身のない DEVLINK_PORT と DPLL_PIN)。IPv6 の flags は
   IF_READY、IF_RS_SENT、RS のあとに RA を受けたら IF_RA_RCVD (addrconf::if_flags)
 - マルチキャストの番地の一覧 (RTM_GETMULTICAST: ip maddr): AF_INET (in_dev_dump_ifmcaddr: どの口も 224.0.0.1)、AF_INET6
-  (inet6_dump_ifmcaddr: eth0 の番地ごとの solicited-node の組 (新しいものが先、users は同じ組の番地の数) と ff02::1、
-  ff01::1)、7.4 の PF_PACKET (dev_mc_dump: eth0 の 33:33:00:00:00:01、01:00:5e:00:00:01、solicited-node の MAC。
-  IFA_FLAGS の IFA_F_GLOBAL は 0)。どれも中身と DONE が 1 つのデータグラム、ヘッダーの prefixlen・flags・scope は
-  0 (PF_PACKET はいつも、ほかは strict のとき見る)、index があればその口だけ (NLM_F_DUMP_FILTERED)。aios は IGMP と
-  MLD をしないが、入っている組は Linux と同じ
+  (inet6_dump_ifmcaddr: 口の組 (addrconf::mc_list: ff01::1 と ff02::1、eth0 の番地ごとの solicited-node、ソケットが
+  入れたもの) を新しいものから、users は入っているものの数、ff05:: の組は scope が RT_SCOPE_SITE)、7.4 の PF_PACKET
+  (dev_mc_dump: eth0 の 33:33:00:00:00:01、01:00:5e:00:00:01、そのあとの IPv6 の組 (ff01:: はのぞく) の MAC を入れた
+  順に。IFA_FLAGS の IFA_F_GLOBAL は 0)。どれも中身と DONE が 1 つのデータグラム、ヘッダーの prefixlen・flags・scope は
+  0 (PF_PACKET はいつも、ほかは strict のとき見る)、index があればその口だけ (NLM_F_DUMP_FILTERED)。aios は IGMP を
+  しないが、入っている組は Linux と同じ。IPv6 の組ができる・なくなると RTNLGRP_IPV6_MCADDR (38) に RTM_NEWMULTICAST /
+  RTM_DELMULTICAST (inet6_ifmcaddr_notify: scope はいつも universe)。RTNLGRP_MAX は 7.4 の 39
 - 確かめかた: `test/ldiff.sh --net rtnllink` (lo と eth0 のリンクの属性をみな、値も (統計と時刻は長さだけ、virtioN の
   番号と IF_RA_RCVD は見ない)、3 つの家族のマルチキャストと AF_UNSPEC の EOPNOTSUPP)。Linux 7.4-rc1 と 100 行同じ。
   ctests にも
@@ -1358,7 +1360,18 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   (getsockopt) はつないだもののあて先への path MTU (つないでいなければ ENOTCONN)、ip -6 route get はその例外の道
   (RTM_F_CLONED、RTAX_MTU、expires)。TCP の MSS は smoltcp が変えられないので、そのまま。送るときに path MTU で
   断片にしたり EMSGSIZE を返したりもまだ。`test/ldiff.sh --root --net pmtu6` で手本の Linux 7.4-rc1 と 22 行同じ
-- まだ: MLD、一時アドレス
+- マルチキャストの組 (Linux の net/ipv6/mcast.c): UDP のソケットが IPV6_JOIN_GROUP / IPV6_LEAVE_GROUP (struct
+  ipv6_mreq。TCP は EPROTO) と MCAST_JOIN_GROUP / MCAST_LEAVE_GROUP (struct group_req。AF_INET6 でなければ
+  EADDRNOTAVAIL) で組に入る・出る (ipv6_sock_mc_join / drop: マルチキャストでなければ EINVAL、同じ組に 2 度は
+  EADDRINUSE、口が 0 なら道 (ff00::/8 は eth0) から、ない口は ENODEV、入っていない組を出るのは EADDRNOTAVAIL、口が 0
+  なら新しく入ったほうを出る)。閉じると入っていた組をみな出る。口の組 (addrconf::mc_list) の users を足し引きし、
+  できた・なくなった組は netlink が知らせる。組あてに送ると (ip6_finish_output2) hop limit は IPV6_MULTICAST_HOPS、
+  IPV6_MULTICAST_LOOP で eth0 がその組に入っていれば自分にも (受けた口は eth0。決まりには通さない)、ff01:: は外に
+  出さない。受けるのは (__udp6_lib_mcast_deliver) 同じポートの AF_INET6 のソケットみな (bind した番地が :: かその組、
+  つないだ相手が合い、その組に入っているか IPV6_MULTICAST_ALL)。eth0 から来た組あての UDP も smoltcp にわたさずに
+  inet.rs が同じように (チェックサムのおかしいものは捨てる)。IPV6_PKTINFO / IP_PKTINFO の口は受けた口 (外からの
+  ものは eth0、前はいつも lo だった)。`test/ldiff.sh --net mld6` で手本の Linux 7.4-rc1 と 110 行同じ
+- まだ: MLD の報告、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`

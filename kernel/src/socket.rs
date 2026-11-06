@@ -1544,6 +1544,8 @@ pub fn setsockopt(fd: u64, level: u64, opt: u64, val: usize, len: usize) -> R {
             crate::unix::setsockopt(&u, level as i32, opt as i32, &b)
         }
         Sock::Inet(_, u) => {
+            // struct group_req (MCAST_JOIN_GROUP) は 136 バイト
+            b.resize((len as usize).min(512), 0);
             if !b.is_empty() {
                 proc::current().pt().copy_in(&mut b, val).ok_or(-EFAULT)?;
             }
