@@ -24,7 +24,7 @@
 //   urgent (SIOCATMARK、SO_OOBINLINE)。閉じたら FIN (読んでいないものがあれば RST)、閉じたあとも FIN_WAIT2 /
 //   TIME_WAIT で 60 秒残る (ポートを持ち、そのあいだ相手が送ったら RST)
 // - UDP: connect した相手へ届かない (ポートにだれもいない) と次に ECONNREFUSED (Linux の ICMP)、MSG_MORE でためる、
-//   IP_RECVERR のエラーの行列
+//   IP_RECVERR と IPV6_RECVERR のエラーの行列 (ICMP と ICMPv6)
 //
 // 大きなロックの中で動く (Rc と RefCell)。借りたまま眠らない、2 つのソケットを同時に借りない (自分につないだものは
 // 相手が自分)
@@ -186,15 +186,18 @@ struct Dgram {
     truesize: usize,
 }
 
-/// IP_RECVERR のエラーの行列のもの (Linux の sock_exterr_skb): 送ったものの中身、errno、ICMP の種類、あて先、
-/// 知らせてきたアドレス
+/// IP_RECVERR と IPV6_RECVERR のエラーの行列のもの (Linux の sock_exterr_skb): 送ったものの中身、errno、ICMP (v6 なら
+/// ICMPv6) の種類、あて先、知らせてきた番地、その ICMP を受けた口と番地 (IPv4 の番地は下の 32 ビットに)
 struct ErrMsg {
     data: Vec<u8>,
     errno: u32,
+    v6: bool,
     typ: u8,
     code: u8,
-    to: (u32, u16),
-    offender: u32,
+    to: (u128, u16),
+    offender: u128,
+    ifindex: u32,
+    local: u128,
 }
 
 pub struct Inet {
@@ -1733,7 +1736,7 @@ pub fn icmp_error(r: &[u8]) {
             if let Some(u) = udp_lookup(0, da, dp, sa, sp)
                 && u.try_borrow_mut().is_ok()
             {
-                icmp_err_udp(&u, &inner[ihl + 8..], da, dp, sa, code, offender);
+                icmp_err_udp(&u, &inner[ihl + 8..], da, dp, sa, code, offender, crate::netlink::ETH_INDEX as u32);
             }
         }
         _ => {}
@@ -3361,8 +3364,10 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             nfhook::Path::Out(r, w) => (r, true, Some(w)),
             nfhook::Path::In(r, w) => (r, false, Some(w)),
         };
-        if let Some(code) = reply.as_deref().and_then(nfhook::icmp6_of) {
-            udp6_icmp(u, daddr, dport, code);
+        if let Some(r) = reply.as_deref()
+            && let Some(code) = nfhook::icmp6_of(r)
+        {
+            udp6_icmp(u, &data, src6, daddr, dport, 1, code, u128::from_be_bytes(r[8..24].try_into().unwrap()), 1);
         }
         if let Some(w) = why {
             if out {
@@ -3402,24 +3407,53 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
                 if let Some(mut icmp) = nfhook::kernel_unreach6(&mut pkt, 4)
                     && matches!(nfhook::lo(&mut icmp, None, 0, 0), nfhook::Path::Pass)
                 {
-                    udp6_icmp(u, daddr, dport, 4);
+                    udp6_icmp(u, &data, src6, daddr, dport, 1, 4, daddr, 1);
                 }
             } else {
-                udp6_icmp(u, daddr, dport, 4);
+                // icmp6_send の送り元は、自分あての番地 (ここではもとのあて先)
+                udp6_icmp(u, &data, src6, daddr, dport, 1, 4, daddr, 1);
             }
         }
     }
     Ok(len as i64)
 }
 
-/// ICMPv6 の到達不能を受けた UDP (__udp6_lib_err): 致命のもの (icmpv6_err_convert) で、connect した相手へのものなら
-/// sk_err に (IPV6_RECVERR のエラーの行列はまだ)
-fn udp6_icmp(u: &InetRef, daddr: u128, dport: u16, code: u8) {
-    let (errno, fatal) = crate::nfhook::icmp6_errno(code);
-    let mut s = u.borrow_mut();
-    if fatal && s.state == St::Established && s.v6 && s.daddr6 == daddr && s.dport == dport {
+/// ICMPv6 のエラーの errno と、致命か (icmpv6_err_convert: 到達不能は code ごと、time exceeded は EHOSTUNREACH、
+/// parameter problem は EPROTO)。ほかの種類 (packet too big など) は None
+fn icmp6_err(typ: u8, code: u8) -> Option<(i64, bool)> {
+    match typ {
+        1 => Some(crate::nfhook::icmp6_errno(code)),
+        3 => Some((113, false)),
+        4 => Some((71, true)),
+        _ => None,
+    }
+}
+
+/// ICMPv6 のエラーを受けた UDP (__udp6_lib_err と ipv6_icmp_error)。data は送ったものの UDP の後ろ、src6 は送り元、
+/// offender は ICMPv6 を送ってきた番地、ifindex はそれを受けた口。IPV6_RECVERR ならいつも (つないでいなくても) 行列に
+/// 入れて sk_err にも、でなければ致命のもので connect したものだけ sk_err に
+#[allow(clippy::too_many_arguments)]
+fn udp6_icmp(u: &InetRef, data: &[u8], src6: u128, daddr: u128, dport: u16, typ: u8, code: u8, offender: u128, ifindex: u32) {
+    let Some((errno, fatal)) = icmp6_err(typ, code) else { return };
+    let deliver = {
+        let s = u.borrow();
+        let connected = s.state == St::Established;
+        let peer_ok = !connected || (s.daddr6 == daddr && s.dport == dport);
+        peer_ok && (s.recverr6 || (fatal && connected))
+    };
+    if !deliver {
+        return;
+    }
+    {
+        let mut s = u.borrow_mut();
+        if s.recverr6 {
+            // ICMPv6 のエラーにのるのは 1280 バイトまで (IPv6 と ICMPv6 の頭、送ったものの IPv6 と UDP の頭をのぞいた中身)
+            let keep = data.len().min(1280 - 40 - 8 - 40 - 8);
+            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: true, typ, code, to: (daddr, dport), offender, ifindex, local: src6 });
+        }
         s.err = -errno;
     }
+    notify(u);
 }
 
 fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], flags: u64) -> R {
@@ -3567,12 +3601,13 @@ fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
 
 /// ICMP の port unreachable を受けた (Linux の __udp4_lib_err と ip_icmp_error)
 fn icmp_unreach(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32) {
-    icmp_err_udp(u, data, daddr, dport, saddr, 3, daddr);
+    icmp_err_udp(u, data, daddr, dport, saddr, 3, daddr, 1);
 }
 
 /// ICMP の到達不能 (code) を受けた UDP。IP_RECVERR ならいつも、でなければ致命のもの (icmp_err_convert の fatal) で
 /// connect したものだけ、エラーを覚える。offender は ICMP を送ってきたアドレス
-fn icmp_err_udp(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32, code: u8, offender: u32) {
+#[allow(clippy::too_many_arguments)]
+fn icmp_err_udp(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32, code: u8, offender: u32, ifindex: u32) {
     let (errno, fatal) = crate::nfhook::icmp_errno(code);
     let deliver = {
         let s = u.borrow();
@@ -3589,7 +3624,7 @@ fn icmp_err_udp(u: &InetRef, data: &[u8], daddr: u32, dport: u16, saddr: u32, co
         if s.recverr {
             // ICMP にのるのは 576 バイトまで (IP と ICMP の頭、送ったものの IP と UDP の頭をのぞいた中身)
             let keep = data.len().min(576 - 20 - 8 - 20 - 8);
-            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, typ: 3, code, to: (daddr, dport), offender });
+            s.errq.push_back(ErrMsg { data: data[..keep].to_vec(), errno: errno as u32, v6: false, typ: 3, code, to: (daddr as u128, dport), offender: offender as u128, ifindex, local: saddr as u128 });
         }
         s.err = -errno;
     }
@@ -3618,7 +3653,7 @@ fn fw_udp(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16, data: &[u
         && let Some((3, code)) = nfhook::icmp_of(&r)
     {
         let offender = u32::from_be_bytes([r[12], r[13], r[14], r[15]]);
-        icmp_err_udp(u, data, daddr, dport, saddr, code, offender);
+        icmp_err_udp(u, data, daddr, dport, saddr, code, offender, 1);
     }
     if out {
         crate::why::firewall(&why.text());
@@ -3627,19 +3662,30 @@ fn fw_udp(u: &InetRef, saddr: u32, sport: u16, daddr: u32, dport: u16, data: &[u
     Ok(false)
 }
 
-/// IP_RECVERR の付帯データ (struct sock_extended_err と、知らせてきたアドレスの sockaddr_in)
-fn exterr(m: &ErrMsg) -> Vec<u8> {
-    let mut b = Vec::with_capacity(32);
+/// AF_INET6 のソケットに見せる番地 (IPv4 のものは v4 を写した ::ffff:a.b.c.d)
+fn err_addr6(m: &ErrMsg, a: u128) -> u128 {
+    if m.v6 { a } else { mapped(a as u32) }
+}
+
+/// IP_RECVERR / IPV6_RECVERR の付帯データ (struct sock_extended_err と、知らせてきた番地の sockaddr_in か sockaddr_in6)
+fn exterr(m: &ErrMsg, fam6: bool) -> Vec<u8> {
+    let mut b = Vec::with_capacity(44);
     b.extend_from_slice(&m.errno.to_le_bytes());
-    // ee_origin (SO_EE_ORIGIN_ICMP)、ee_type、ee_code、ee_pad
-    b.extend_from_slice(&[2, m.typ, m.code, 0]);
+    // ee_origin (SO_EE_ORIGIN_ICMP6 か SO_EE_ORIGIN_ICMP)、ee_type、ee_code、ee_pad。ee_info と ee_data は 0
+    b.extend_from_slice(&[if m.v6 { 3 } else { 2 }, m.typ, m.code, 0]);
     b.extend_from_slice(&0u32.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&sockaddr(m.offender, 0));
+    if fam6 {
+        b.extend_from_slice(&sockaddr6(err_addr6(m, m.offender), 0));
+    } else {
+        b.extend_from_slice(&sockaddr(m.offender as u32, 0));
+    }
     b
 }
 
-/// MSG_ERRQUEUE (Linux の ip_recv_error): なければ EAGAIN。読んだら sk_err を次のものの errno に
+/// MSG_ERRQUEUE (Linux の ip_recv_error と ipv6_recv_error): なければ EAGAIN。名前は送ったあて先、付帯データは
+/// IP_PKTINFO / IPV6_PKTINFO (その ICMP を受けた口と番地。たのんでいれば) と IP_RECVERR / IPV6_RECVERR。読んだら
+/// sk_err を次のものの errno に
 fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
     let mut s = u.borrow_mut();
     let Some(m) = s.errq.pop_front() else { return Err(-EAGAIN) };
@@ -3650,10 +3696,28 @@ fn recv_error(u: &InetRef, len: usize) -> Result<Recv, i64> {
     }
     r.data = m.data[..n].to_vec();
     r.ret = n;
-    r.from = Some(sockaddr(m.to.0, m.to.1).to_vec());
     r.flags |= MSG_ERRQUEUE as u32;
-    // IP_RECVERR (SOL_IP 0、11)
-    r.cmsgs.push((0, 11, exterr(&m)));
+    if s.family == AF_INET6 {
+        r.from = Some(sockaddr6(err_addr6(&m, m.to.0), m.to.1).to_vec());
+        if s.rx_pktinfo6 {
+            let mut b = Vec::with_capacity(20);
+            b.extend_from_slice(&err_addr6(&m, m.local).to_be_bytes());
+            b.extend_from_slice(&m.ifindex.to_le_bytes());
+            r.cmsgs.push((41, 50, b));
+        }
+        r.cmsgs.push((41, 25, exterr(&m, true)));
+    } else {
+        r.from = Some(sockaddr(m.to.0 as u32, m.to.1).to_vec());
+        if s.pktinfo {
+            // in_pktinfo: 口、ipi_spec_dst (エラーでは 0)、そのあて先
+            let mut b = Vec::with_capacity(12);
+            b.extend_from_slice(&m.ifindex.to_le_bytes());
+            b.extend_from_slice(&0u32.to_be_bytes());
+            b.extend_from_slice(&(m.local as u32).to_be_bytes());
+            r.cmsgs.push((0, 8, b));
+        }
+        r.cmsgs.push((0, 11, exterr(&m, false)));
+    }
     s.err = s.errq.front().map_or(0, |x| -(x.errno as i64));
     Ok(r)
 }
@@ -4353,7 +4417,12 @@ fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
             }
             s.pmtudisc6 = v;
         }
-        25 => s.recverr6 = int()? != 0,
+        25 => {
+            s.recverr6 = int()? != 0;
+            if !s.recverr6 {
+                s.errq.clear();
+            }
+        }
         78 => s.freebind = int()? != 0,
         _ => return Err(-ENOPROTOOPT),
     }
@@ -5219,19 +5288,15 @@ fn ext_udp_send6(u: &InetRef, data: &[u8], src: u128, daddr: u128, dport: u16, h
 }
 
 /// eth0 から来た ICMPv6 のエラー (icmpv6_rcv → icmpv6_notify → tcp_v6_err / __udp6_lib_err): 中のもとのパケットの
-/// 組 (自分の番地とポート、相手の番地とポート) のソケットに。TCP はつなぐ途中ならどのエラーでも止め、UDP は connect
-/// したものに致命のもの。packet too big (2) はまだ見ない
+/// 組 (自分の番地とポート、相手の番地とポート) のソケットに。TCP はつなぐ途中ならどのエラーでも止める。UDP はそれを
+/// 受けるはずのソケット (つないでいないものも) に、IPV6_RECVERR なら行列に (udp6_icmp)。packet too big (2) はまだ見ない
 pub fn icmp6_error(ip: &[u8]) {
     if ip.len() < 48 + 40 + 4 || ip[6] != 58 {
         return;
     }
     let (ty, code) = (ip[40], ip[41]);
-    let (errno, fatal) = match ty {
-        1 => crate::nfhook::icmp6_errno(code),
-        3 => (113, false),
-        4 => (71, true),
-        _ => return,
-    };
+    let Some((errno, _)) = icmp6_err(ty, code) else { return };
+    let offender = u128::from_be_bytes(ip[8..24].try_into().unwrap());
     let inner = &ip[48..];
     let Some((thoff, proto, _)) = crate::nfhook::v6_l4(inner) else { return };
     if inner.len() < thoff + 4 || !matches!(proto, 6 | 17) {
@@ -5241,22 +5306,25 @@ pub fn icmp6_error(ip: &[u8]) {
     let dst = u128::from_be_bytes(inner[24..40].try_into().unwrap());
     let sport = u16::from_be_bytes([inner[thoff], inner[thoff + 1]]);
     let dport = u16::from_be_bytes([inner[thoff + 2], inner[thoff + 3]]);
+    if proto == 17 {
+        if let Some(u) = udp_lookup6(0, dst, dport, src, sport)
+            && u.try_borrow_mut().is_ok()
+        {
+            let payload = inner.get(thoff + 8..).unwrap_or(&[]);
+            udp6_icmp(&u, payload, src, dst, dport, ty, code, offender, crate::netlink::ETH_INDEX as u32);
+        }
+        return;
+    }
     for w in all().iter() {
         let Some(u) = w.upgrade() else { continue };
         let hit = {
             let s = u.borrow();
-            s.net == 0 && s.v6 && s.tcp == (proto == 6) && s.sport == sport && s.saddr6 == src && (s.tcp || s.state == St::Established) && s.daddr6 == dst && s.dport == dport
+            s.net == 0 && s.v6 && s.tcp && s.sport == sport && s.saddr6 == src && s.daddr6 == dst && s.dport == dport
         };
-        if !hit {
-            continue;
-        }
-        if proto == 6 {
+        if hit {
             tcp_icmp(&u, errno);
-        } else if fatal {
-            u.borrow_mut().err = -errno;
-            notify(&u);
+            return;
         }
-        return;
     }
 }
 

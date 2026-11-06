@@ -1002,7 +1002,7 @@ Linux と同じ nftables にする (nft の道具がそのまま動き、Linux �
     LOCAL_OUT と POST_ROUTING)。RST への RST、ICMP のエラーへのエラー、断片、ブロードキャスト、受けたもののチェックサムの
     ちがうものには返さない。外へ返す ICMP は相手ごとに 1 秒に 1 つ (はじめは 6 つまで)。届いた RST は ECONNREFUSED、
     ICMP は icmp_err_convert の errno (port は ECONNREFUSED、host と admin-prohibited は EHOSTUNREACH、net は
-    ENETUNREACH)。UDP は connect したものと IP_RECVERR だけ (致命でないものは IP_RECVERR だけ)。smoltcp のソケットへの
+    ENETUNREACH)。UDP は connect したものと IP_RECVERR / IPV6_RECVERR だけ (致命でないものは RECVERR だけ)。smoltcp のソケットへの
     RST は smoltcp に受けさせ、ICMP は poll のあとで inet.rs が当てる
   - log: Linux の nf_log_syslog と同じ 1 行 (IN= OUT= MAC= (flags の macdecode なら MACSRC= MACDST= MACPROTO=) SRC= DST=
     LEN= TOS= PREC= TTL= ID= DF PROTO= …、ICMP のエラーは中のものを [] で) を kmsg に (dmesg で見える。シリアルの
@@ -1320,8 +1320,14 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   - 確かめかた: `test/ldiff.sh --root --net rtnl6` (fd00::1/64 と fd00::3/64 を足して入れかえて消し、2001:db8:1::/48 via
     fe80::2 を metric 100 と 200 で足して消す。まちがいの errno、知らせ、dump、ip route get、送り元)。手本の Linux 7.4-rc1
     と 67 行同じ。ctests にも
-- まだ: DAD、MLD、
-  packet too big (PMTU)、IPV6_RECVERR の行列、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
+- エラーの行列 (IPV6_RECVERR と IP_RECVERR、MSG_ERRQUEUE。Linux の __udp6_lib_err → ipv6_icmp_error と
+  ipv6_recv_error): UDP が ICMPv6 のエラー (lo の閉じたポートへの port unreachable、ファイアウォールの reject、eth0 から
+  来たもの) を受けると、RECVERR ならつないでいなくても行列に入れて sk_err にも (次の recv や send が ECONNREFUSED を
+  返す)、でなければ致命のものでつないだものだけ sk_err に。読むと中身は送ったものの UDP の後ろ (ICMPv6 は 1184 バイト
+  まで、ICMP は 520)、名前は送ったあて先、付帯データは IPV6_PKTINFO (たのんでいれば: その ICMPv6 のあて先と口) と
+  SOL_IPV6 / IPV6_RECVERR (sock_extended_err、origin は SO_EE_ORIGIN_ICMP6、知らせてきた番地)。RECVERR を切ると行列は
+  捨てる。`test/ldiff.sh recverr6` (v6 と v4) で手本の Linux 7.4-rc1 と 120 行同じ
+- まだ: DAD、MLD、packet too big (PMTU)、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
