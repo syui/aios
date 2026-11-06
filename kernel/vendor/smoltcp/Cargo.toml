@@ -55,11 +55,6 @@ default-features = false
 [dependencies.cfg-if]
 version = "1.0.0"
 
-[dependencies.defmt]
-version = "0.3.8"
-features = ["ip_in_core"]
-optional = true
-
 [dependencies.heapless]
 version = "0.8"
 
@@ -81,7 +76,6 @@ default-features = false
 _proto-fragmentation = []
 alloc = [
     "managed/alloc",
-    "defmt?/alloc",
 ]
 assembler-max-segment-count-1 = []
 assembler-max-segment-count-16 = []
@@ -115,10 +109,6 @@ default = [
     "packetmeta-id",
     "async",
     "multicast",
-]
-defmt = [
-    "dep:defmt",
-    "heapless/defmt-03",
 ]
 dns-max-name-size-128 = []
 dns-max-name-size-255 = []

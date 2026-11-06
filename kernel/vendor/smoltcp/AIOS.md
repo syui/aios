@@ -1,7 +1,7 @@
 # smoltcp 0.12.0 (aios の写し)
 
 crates.io の smoltcp 0.12.0 (0BSD) の `src/`、`build.rs`、`LICENSE-0BSD.txt` と、examples・benches・dev-dependencies・
-profile を外した `Cargo.toml`。ルートの `Cargo.toml` の `[patch.crates-io]` がこれを使う (workspace の exclude にも)。
+profile と、使わない defmt (組みこみ機器のログ。Cargo.lock に 4 つの crate が入っていた) を外した `Cargo.toml`。ルートの `Cargo.toml` の `[patch.crates-io]` がこれを使う (workspace の exclude にも)。
 
 変えたところ (`grep -rn aios src/` で見られる):
 
