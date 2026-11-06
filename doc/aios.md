@@ -1380,7 +1380,22 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   していない)。MLDv1 のルーターには合わせない。起動のときの solicited-node の組は報告しない (Linux は DAD のはじめに
   する)。`LINUX_FILES="nft=build/nft-static" test/ldiff.sh --root --net mldrep6` (nftables の output の鎖の counter で
   数える。aios には nftables のパッケージがいる) で手本の Linux 7.4-rc1 と 107 行同じ
-- まだ: 一時アドレス
+- 一時アドレス (RFC 8981。Linux の manage_tempaddrs、ipv6_create_tempaddr、ipv6_gen_rnd_iid): eth0 の use_tempaddr が
+  0 より大きければ、RA で SLAAC の番地ができたとき (と、新しくしたときに一時アドレスがひとつもなければ)、同じ /64 に
+  でたらめな IID (0、IANA の Ethernet のところ、subnet anycast はよける) の番地 (IFA_F_TEMPORARY、proto 0) を作る。valid は
+  SLAAC のものと temp_valid_lft (172800) の小さいほう、preferred は SLAAC のものと temp_prefered_lft (86400) -
+  desync_factor (max_desync_factor 600 より小さいでたらめな秒) の小さいほう (regen_advance: regen_min_advance 2 +
+  regen_max_retry 3 × dad_transmits × 1 秒より短くなるなら作らない、max_addresses 16 まで)。RA が SLAAC の番地を新しく
+  すると一時アドレスの lifetime もその上限までのばして RTM_NEWADDR、preferred がのこり regen_advance 秒になると次のもの
+  を 1 つ作る。これらの sysctl も /proc/sys/net/ipv6/conf と IFLA_INET6_CONF に。送り元のえらびかたの rule 7: use_tempaddr
+  が 2 から (か IPV6_ADDR_PREFERENCES の IPV6_PREFER_SRC_TMP) なら一時アドレスを先に、PREFER_SRC_PUBLIC ならあとに
+  (rule 8 の prefix は番地の prefix の長さまで)。IPV6_ADDR_PREFERENCES (72) は TMP・PUBLIC・PUBTMP_DEFAULT、HOME・COA、
+  CGA・NONCGA がぶつかれば EINVAL、getsockopt は TMP / PUBLIC / PUBTMP_DEFAULT と COA / HOME。カーネルが作った番地
+  (link-local、SLAAC、一時アドレス) は DAD のあいだは知らせない (addrconf_dad_begin。ip -6 addr add のものは知らせる)。
+  番地の一覧は idev->addr_list の順 (scope の値の大きいもの (site-local 0x40、link-local 0x20、global 0) が先、同じなら
+  新しいものが先)。`test/ldiff.sh --root --net temp6` (RS を送って QEMU の RA で作る。IID は <temp>、lifetime は SLAAC の
+  ものとくらべる。/proc/net/if_inet6 は Linux はハッシュの順なので並べる) で手本の Linux 7.4-rc1 と 83 行同じ
+- まだ: path MTU で送るものを断片にする (と IPV6_DONTFRAG の EMSGSIZE)
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`

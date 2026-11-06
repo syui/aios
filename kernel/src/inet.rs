@@ -248,6 +248,8 @@ pub struct Inet {
     /// (入っていない組あてのものも受ける)
     mc6: Vec<(u128, i32)>,
     mc_all6: bool,
+    /// IPV6_ADDR_PREFERENCES (np->srcprefs: IPV6_PREFER_SRC_TMP 1、PUBLIC 2、COA 4)
+    srcprefs: u32,
     tclass: i32,
     rx_pktinfo6: bool,
     rx_tclass: bool,
@@ -486,6 +488,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
         mc_loop6: true,
         mc6: Vec::new(),
         mc_all6: true,
+        srcprefs: 0,
         tclass: 0,
         rx_pktinfo6: false,
         rx_tclass: false,
@@ -752,7 +755,7 @@ fn is_local6(a: u128) -> bool {
 /// IPv6 のあて先へのみち (ip6_route_output と ip6_dst_lookup_tail): (あて先, 送り元, 自分あてか)。自分の番地へは
 /// lo (送り元はあて先そのもの)、ほかは addrconf の道の表 (なければ ENETUNREACH) で、送り元は決めていなければ
 /// ipv6_dev_get_saddr。scope のいる番地の口が eth0 でなければ ENETUNREACH。分けた NET の中は ::1 だけ
-fn route6(netns: u64, daddr: u128, saddr: u128, scope: u32) -> Result<(u128, u128, bool), i64> {
+fn route6(netns: u64, daddr: u128, saddr: u128, scope: u32, prefs: u32) -> Result<(u128, u128, bool), i64> {
     if v6_needs_scope(daddr) && scope != 0 && scope != crate::netlink::ETH_INDEX as u32 {
         return Err(-ENETUNREACH);
     }
@@ -762,7 +765,7 @@ fn route6(netns: u64, daddr: u128, saddr: u128, scope: u32) -> Result<(u128, u12
     if netns != 0 || crate::addrconf::lookup(daddr).is_none() {
         return Err(-ENETUNREACH);
     }
-    let src = if saddr != 0 { saddr } else { crate::addrconf::source_for(daddr).ok_or(-ENETUNREACH)? };
+    let src = if saddr != 0 { saddr } else { crate::addrconf::source_for_prefs(daddr, prefs).ok_or(-ENETUNREACH)? };
     Ok((daddr, src, false))
 }
 
@@ -1931,8 +1934,8 @@ fn tcp_v6_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
     if is_mapped(rcv6) {
         return Err(-EAFNOSUPPORT);
     }
-    let netns = u.borrow().net;
-    let (daddr, src, local) = route6(netns, daddr, rcv6, scope)?;
+    let (netns, prefs) = (u.borrow().net, u.borrow().srcprefs);
+    let (daddr, src, local) = route6(netns, daddr, rcv6, scope, prefs)?;
     {
         let mut s = u.borrow_mut();
         if s.rcv6 == 0 {
@@ -3192,8 +3195,8 @@ fn udp6_connect(u: &InetRef, a: &[u8]) -> R {
     if is_mapped(rcv6) {
         return Err(-EAFNOSUPPORT);
     }
-    let netns = u.borrow().net;
-    let (daddr, src, _) = route6(netns, daddr, rcv6, scope)?;
+    let (netns, prefs) = (u.borrow().net, u.borrow().srcprefs);
+    let (daddr, src, _) = route6(netns, daddr, rcv6, scope, prefs)?;
     let mut s = u.borrow_mut();
     s.daddr6 = daddr;
     s.dport = port;
@@ -3457,7 +3460,8 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
         return Err(-EAFNOSUPPORT);
     }
     let netns = u.borrow().net;
-    let (daddr, src6, local) = route6(netns, daddr, if rcv6 != 0 { rcv6 } else { saddr6 }, scope)?;
+    let prefs = u.borrow().srcprefs;
+    let (daddr, src6, local) = route6(netns, daddr, if rcv6 != 0 { rcv6 } else { saddr6 }, scope, prefs)?;
     autobind(u)?;
     let e = take_err(u);
     if e != 0 {
@@ -4493,6 +4497,17 @@ fn ipv6_get(u: &InetRef, opt: i32) -> Result<Vec<u8>, i64> {
         18 => s.mc_hops6 as i64,
         19 => s.mc_loop6 as i64,
         29 => s.mc_all6 as i64,
+        // IPV6_ADDR_PREFERENCES: TMP か PUBLIC か PUBTMP_DEFAULT (0x100)、COA か HOME (0x400)
+        72 => {
+            let p = s.srcprefs;
+            (if p & 1 != 0 {
+                1
+            } else if p & 2 != 0 {
+                2
+            } else {
+                0x100
+            }) | if p & 4 != 0 { 4 } else { 0x400 }
+        }
         // IPV6_MULTICAST_IF、IPV6_UNICAST_IF
         17 | 76 => 0,
         // IPV6_TCLASS、IPV6_RECVPKTINFO、IPV6_RECVHOPLIMIT、IPV6_RECVTCLASS、IPV6_MTU_DISCOVER、IPV6_RECVERR
@@ -4577,6 +4592,32 @@ fn ipv6_set(u: &InetRef, opt: i32, val: &[u8]) -> R {
         }
         // IPV6_MULTICAST_ALL
         29 => s.mc_all6 = int()? != 0,
+        // IPV6_ADDR_PREFERENCES (__ip6_sock_set_addr_preferences): TMP と PUBLIC と PUBTMP_DEFAULT はどれか 1 つ、HOME と
+        // COA、CGA と NONCGA もどちらか (でなければ EINVAL)
+        72 => {
+            let v = int()? as u32;
+            let mut mask = u32::MAX;
+            let mut pref = 0;
+            match v & 0x103 {
+                1 | 2 => {
+                    pref |= v & 3;
+                    mask &= !3;
+                }
+                0x100 => mask &= !3,
+                0 => {}
+                _ => return Err(crate::why::inval()),
+            }
+            match v & 0x404 {
+                0x400 => mask &= !4,
+                4 => pref |= 4,
+                0 => {}
+                _ => return Err(crate::why::inval()),
+            }
+            if v & 0x808 == 0x808 {
+                return Err(crate::why::inval());
+            }
+            s.srcprefs = (s.srcprefs & mask) | pref;
+        }
         // IPV6_TCLASS: -1 は 0、TCP は ECN の 2 ビットを変えない
         67 => {
             let mut v = int()?;

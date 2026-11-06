@@ -865,10 +865,24 @@ fn link_af(lo: bool) -> Vec<u8> {
     attr_u32(&mut i6, 1, if lo { 0x8000_0000 } else { crate::addrconf::if_flags() });
     attr(&mut i6, 5, &[65535u32, 0, 30000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     // DEVCONF_* のうち /proc/sys/net/ipv6/conf で変えられるもの (addrconf::CONF): HOPLIMIT、MTU6、ACCEPT_RA、AUTOCONF、
-    // DAD_TRANSMITS、USE_TEMPADDR、ACCEPT_DAD
+    // DAD_TRANSMITS、USE_TEMPADDR、TEMP_VALID_LFT、TEMP_PREFERED_LFT、REGEN_MAX_RETRY、MAX_DESYNC_FACTOR、MAX_ADDRESSES、
+    // ACCEPT_DAD
     let mut c6 = INET6_CONF_ETH;
     let c = crate::addrconf::CONF.get()[if lo { crate::addrconf::CONF_LO } else { crate::addrconf::CONF_ETH }];
-    for (i, v) in [(1, c.hop_limit), (2, c.mtu), (3, c.accept_ra), (5, c.autoconf), (6, c.dad_transmits), (10, c.use_tempaddr), (27, c.accept_dad)] {
+    for (i, v) in [
+        (1, c.hop_limit),
+        (2, c.mtu),
+        (3, c.accept_ra),
+        (5, c.autoconf),
+        (6, c.dad_transmits),
+        (10, c.use_tempaddr),
+        (11, c.temp_valid_lft),
+        (12, c.temp_prefered_lft),
+        (13, c.regen_max_retry),
+        (14, c.max_desync_factor),
+        (15, c.max_addresses),
+        (27, c.accept_dad),
+    ] {
         c6[i] = v;
     }
     attr(&mut i6, 2, &c6.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
@@ -2653,8 +2667,12 @@ pub struct Addr6 {
 /// IPv6 のアドレス: lo の ::1/128 (init_loopback: IFA_HOST、IFA_F_PERMANENT、IFAPROT_KERNEL_LO) と eth0 のもの (addrconf)
 pub fn addrs6() -> Vec<Addr6> {
     let mut v = alloc::vec![Addr6 { index: LO_INDEX, addr: 1, prefix: 128, scope: RT_SCOPE_HOST, flags: IFA_F_PERMANENT, proto: 1, preferred: u32::MAX, valid: u32::MAX, cstamp: 0, tstamp: 0 }];
-    for a in crate::addrconf::addrs() {
-        v.push(addr6_of(&a));
+    // idev->addr_list の順 (ipv6_link_dev_addr): scope の値 (site 0x40、link 0x20、global 0) の大きいものが先、同じなら
+    // 新しいものが先
+    let mut a = crate::addrconf::addrs();
+    a.sort_by_key(|x| (core::cmp::Reverse(crate::addrconf::scope_of(x.addr)), core::cmp::Reverse(x.seq)));
+    for x in &a {
+        v.push(addr6_of(x));
     }
     v
 }
@@ -2926,7 +2944,8 @@ type Snap6 = (Vec<(u128, u8, u32, u8)>, Vec<(u128, u8, u128, u32, u8, u8, i32)>)
 static SNAP6: Bkl<Option<Snap6>> = Bkl::new(None);
 
 fn snap6_now() -> Snap6 {
-    let a = addrs6().iter().map(|x| (x.addr, x.prefix, x.flags, x.proto)).collect();
+    // カーネルが作った番地は DAD がおわるまで知らせない
+    let a = addrs6().iter().filter(|x| !crate::addrconf::quiet(x.addr)).map(|x| (x.addr, x.prefix, x.flags, x.proto)).collect();
     let r = routes6().iter().map(|x| (x.dst, x.len, x.gw, x.metric, x.proto, x.typ, x.oif)).collect();
     (a, r)
 }
@@ -2959,7 +2978,7 @@ pub fn changed6() {
     for r in routes.iter().filter(|x| x.typ != RTN_LOCAL && !or.contains(&key_r(x))) {
         ev_route6(r, RTM_NEWROUTE);
     }
-    for a in addrs.iter().filter(|x| !oa.contains(&(x.addr, x.prefix, x.flags, x.proto))) {
+    for a in addrs.iter().filter(|x| !oa.contains(&(x.addr, x.prefix, x.flags, x.proto)) && na.contains(&(x.addr, x.prefix, x.flags, x.proto))) {
         ev_addr6(a, RTM_NEWADDR);
     }
     for r in routes.iter().filter(|x| x.typ == RTN_LOCAL && !or.contains(&key_r(x))) {

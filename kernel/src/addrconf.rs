@@ -13,6 +13,7 @@
 //     はずす。そのあいだは送り元にえらばず、自分のものとして受けず (bind は EADDRNOTAVAIL)、smoltcp にも渡さない。その
 //     番地の NA か、ほかの人 (nonce のちがう) の DAD の NS が来たら IFA_F_DADFAILED。RS は link-local の DAD のあとで
 //   - マルチキャストの組 (mc_list) と MLDv2 の報告 (下の「MLDv2」)
+//   - 一時アドレス (use_tempaddr: 下の「一時アドレス」)
 //   - netlink で足す番地と道 (ip -6 addr add / route add: netlink.rs): 番地には prefix の道 (proto kernel、metric 256。
 //     同じ prefix の番地がなくなれば消す)、道はゲートウェイを通るもの (smoltcp の道の表に)
 // smoltcp には、ここの番地と既定のルーターを net.rs が渡す (近所さがし (NS/NA) と echo の答えは smoltcp がする)
@@ -23,12 +24,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const IFA_F_MANAGETEMPADDR: u32 = 0x100;
 pub const IFA_F_PERMANENT: u32 = 0x80;
 pub const IFA_F_TENTATIVE: u32 = 0x40;
+pub const IFA_F_TEMPORARY: u32 = 0x01;
 const IFA_F_DADFAILED: u32 = 0x08;
 const IFA_F_NODAD: u32 = 0x02;
 /// /proc/sys/net/ipv6/conf の口ごとの値 (Linux の ipv6_devconf。addr_gen_mode、disable_ipv6、forwarding は読むだけで
 /// sysctl.rs に)。効くのは eth0 のもの (と DAD の all の accept_dad): hop_limit と mtu (RA でも変わる)、accept_ra (0 なら
 /// RA を見ない)、autoconf (0 なら SLAAC の番地を作らない)、accept_dad (all か eth0 が 1 以上なら DAD)、dad_transmits
-/// (DAD の NS の数)。use_tempaddr は覚えるだけ (一時アドレスはまだない)
+/// (DAD の NS の数)、一時アドレス (use_tempaddr、temp_valid_lft、temp_prefered_lft、regen_max_retry、max_desync_factor、
+/// max_addresses、regen_min_advance: 下の「一時アドレス」)
 #[derive(Clone, Copy)]
 pub struct DevConf {
     pub accept_dad: i32,
@@ -38,6 +41,12 @@ pub struct DevConf {
     pub hop_limit: i32,
     pub mtu: i32,
     pub use_tempaddr: i32,
+    pub temp_valid_lft: i32,
+    pub temp_prefered_lft: i32,
+    pub regen_max_retry: i32,
+    pub max_desync_factor: i32,
+    pub max_addresses: i32,
+    pub regen_min_advance: i32,
 }
 
 /// CONF の並び: all、default、lo、eth0
@@ -46,7 +55,21 @@ pub const CONF_LO: usize = 2;
 pub const CONF_ETH: usize = 3;
 
 const fn devconf(accept_dad: i32, mtu: i32, use_tempaddr: i32) -> DevConf {
-    DevConf { accept_dad, accept_ra: 1, autoconf: 1, dad_transmits: 1, hop_limit: 64, mtu, use_tempaddr }
+    DevConf {
+        accept_dad,
+        accept_ra: 1,
+        autoconf: 1,
+        dad_transmits: 1,
+        hop_limit: 64,
+        mtu,
+        use_tempaddr,
+        temp_valid_lft: 172800,
+        temp_prefered_lft: 86400,
+        regen_max_retry: 3,
+        max_desync_factor: 600,
+        max_addresses: 16,
+        regen_min_advance: 2,
+    }
 }
 
 /// Linux の既定: all は accept_dad 0、default と eth0 は 1、lo は -1 (と mtu 65536、use_tempaddr -1)
@@ -92,8 +115,12 @@ pub struct Addr {
     /// DAD のとちゅう: 次にすること (NS を送るか、終える) の時刻と、のこりの NS の数。nonce は NS にのせる 6 バイト
     dad: Option<(u64, u8)>,
     nonce: u64,
-    /// 作った順 (マルチキャストの組の並び: solicited-node の組に入った順)
-    seq: u64,
+    /// 作った順 (マルチキャストの組の並び: solicited-node の組に入った順。番地の一覧は scope ごとに新しいものが先)
+    pub seq: u64,
+    /// カーネルが作ったもの (link-local、SLAAC、一時アドレス): DAD のあいだは知らせない (ip -6 addr add のものは知らせる)
+    auto: bool,
+    /// 一時アドレスで、次のものをもう作った (regen_count)
+    regen: bool,
 }
 
 impl Addr {
@@ -180,6 +207,8 @@ struct State {
     ra_rcvd: bool,
     /// packet too big で知ったあて先ごとの path MTU (rt6_update_pmtu の例外の道): (あて先, MTU, いつまで)
     pmtu: Vec<(u128, u32, u64)>,
+    /// 一時アドレスの preferred lifetime を短くする秒 (desync_factor: max_desync_factor より小さいでたらめな数)
+    desync: u32,
 }
 
 static ST: Bkl<Option<State>> = Bkl::new(None);
@@ -407,10 +436,10 @@ pub fn init(mac: [u8; 6]) {
     let ll = 0xfe80u128 << 112 | eui64(mac);
     let (dad, nonce) = dad_start(now);
     let flags = IFA_F_PERMANENT | if dad.is_some() { IFA_F_TENTATIVE } else { 0 };
-    let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce, seq: next_seq() };
+    let a = Addr { addr: ll, prefix: 64, flags, proto: IFAPROT_KERNEL_LL, valid: None, preferred: None, created: now, updated: now, dad, nonce, seq: next_seq(), auto: true, regen: false };
     // RS は link-local の DAD がおわってから (next_rs はそのときに)
     let next_rs = if dad.is_some() { u64::MAX } else { now };
-    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false, pmtu: Vec::new() });
+    *ST.get() = Some(State { mac, addrs: alloc::vec![a], prefixes: Vec::new(), uprefixes: Vec::new(), uroutes: Vec::new(), router: None, ra_seen: false, next_rs, rs_gap: 4000, rs_sent: false, ra_rcvd: false, pmtu: Vec::new(), desync: u32::MAX });
     changed();
 }
 
@@ -422,6 +451,11 @@ pub fn addrs() -> Vec<Addr> {
 /// eth0 の使える番地 (DAD のとちゅうとしくじったものをのぞく: smoltcp に渡すもの、local の道)
 pub fn usable_addrs() -> Vec<Addr> {
     ST.get().as_ref().map_or(Vec::new(), |s| s.addrs.iter().filter(|x| x.usable()).cloned().collect())
+}
+
+/// DAD のとちゅうの、カーネルが作った番地 (addrconf_dad_begin は知らせない: DAD がおわってから RTM_NEWADDR)
+pub fn quiet(a: u128) -> bool {
+    ST.get().as_ref().is_some_and(|s| s.addrs.iter().any(|x| x.addr == a && x.auto && x.flags & IFA_F_TENTATIVE != 0))
 }
 
 /// eth0 の (使える) 番地か: DAD のとちゅうの番地あては受けず、bind もできない (ipv6_chk_addr の IFA_F_TENTATIVE)
@@ -547,18 +581,25 @@ fn rfc_scope(a: u128) -> i32 {
 }
 
 /// 送り元のえらびかた (ipv6_dev_get_saddr: RFC 6724 のうち、rule 1 同じ番地、rule 2 scope (あて先の scope 以上で狭い
-/// ものを。なければ広いものを)、rule 3 deprecated でないもの、rule 8 prefix の長くあうもの)
+/// ものを。なければ広いものを)、rule 3 deprecated でないもの、rule 7 一時アドレス (prefs: IPV6_ADDR_PREFERENCES の
+/// IPV6_PREFER_SRC_TMP / PUBLIC。どちらもなければ use_tempaddr が 2 からなら一時アドレスを先に)、rule 8 prefix の長く
+/// あうもの (その番地の prefix の長さまで))
 pub fn source_for(dst: u128) -> Option<u128> {
+    source_for_prefs(dst, 0)
+}
+
+pub fn source_for_prefs(dst: u128, prefs: u32) -> Option<u128> {
     let s = ST.get().as_ref()?;
     let now = ms();
     let ds = rfc_scope(dst);
+    let tmp = if prefs & 3 != 0 { prefs & 1 != 0 } else { CONF.get()[CONF_ETH].use_tempaddr >= 2 };
     s.addrs
         .iter()
         .filter(|a| a.usable())
         .max_by_key(|a| {
             let sc = rfc_scope(a.addr);
             let r2 = if sc >= ds { (1, -sc) } else { (0, sc) };
-            (a.addr == dst, r2, a.preferred.is_none_or(|t| t > now), common_bits(a.addr, dst))
+            (a.addr == dst, r2, a.preferred.is_none_or(|t| t > now), (a.flags & IFA_F_TEMPORARY != 0) == tmp, common_bits(a.addr, dst).min(a.prefix as u32))
         })
         .map(|a| a.addr)
 }
@@ -591,7 +632,7 @@ pub fn add_addr(addr: u128, plen: u8, flags: u32, preferred: u32, valid: u32, pr
     if dad.is_some() {
         fl |= IFA_F_TENTATIVE;
     }
-    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now, dad, nonce, seq: next_seq() });
+    st.addrs.push(Addr { addr, prefix: plen, flags: fl, proto, valid: until(now, valid), preferred: until(now, preferred), created: now, updated: now, dad, nonce, seq: next_seq(), auto: false, regen: false });
     let made = prefix_route(st, addr, plen, fl, until(now, valid));
     changed();
     made
@@ -760,6 +801,7 @@ pub fn tick() -> Vec<Vec<u8>> {
             ch = true;
         }
     }
+    regen_tempaddrs(st, now);
     let before = st.addrs.len();
     st.addrs.retain(|a| a.valid.is_none_or(|t| t > now));
     ch |= st.addrs.len() != before;
@@ -925,7 +967,7 @@ fn ra(src: u128, m: &[u8]) {
     // ユーザーのプログラムに渡す項目 (ndisc_is_useropt: prefix、RDNSS、DNSSL、6CO、captive portal、PREF64)。RA を読み
     // おえてから、1 つずつ RTM_NEWNDUSEROPT で (ndisc_ra_useropt)
     let mut useropts: Vec<Vec<u8>> = Vec::new();
-    // lifetime を新しくした SLAAC の番地 (RTM_NEWADDR で知らせる)
+    // lifetime を新しくした SLAAC の番地と一時アドレス (RTM_NEWADDR で知らせる)
     let mut refreshed: Vec<Addr> = Vec::new();
     let mut opts = &m[16..];
     while opts.len() >= 8 {
@@ -943,11 +985,7 @@ fn ra(src: u128, m: &[u8]) {
                 let mac: [u8; 6] = o[2..8].try_into().unwrap();
                 crate::netlink::nd_router(src, mac);
             }
-            3 if len >= 32 => {
-                if let Some(a) = prefix_info(st, o, now) {
-                    refreshed.push(a);
-                }
-            }
+            3 if len >= 32 => prefix_info(st, o, now, &mut refreshed),
             5 if len >= 8 => {
                 let mtu = u32::from_be_bytes(o[4..8].try_into().unwrap());
                 if (1280..=1500).contains(&mtu) {
@@ -969,14 +1007,14 @@ fn ra(src: u128, m: &[u8]) {
 
 /// prefix information (addrconf_prefix_rcv)。もうある SLAAC の番地の lifetime を新しくして、DAD のとちゅうでなければ
 /// その番地を返す (addrconf_prefix_rcv_add_addr の update_lft → ipv6_ifa_notify: RTM_NEWADDR)
-fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
+fn prefix_info(st: &mut State, o: &[u8], now: u64, out: &mut Vec<Addr>) {
     let len = o[2];
     let (onlink, auto) = (o[3] & 0x80 != 0, o[3] & 0x40 != 0);
     let valid = u32::from_be_bytes(o[4..8].try_into().unwrap()) as u64;
     let pref = u32::from_be_bytes(o[8..12].try_into().unwrap()) as u64;
     let prefix = u128::from_be_bytes(o[16..32].try_into().unwrap());
     if len > 128 || is_link_local(prefix) || prefix >> 120 == 0xff || pref > valid {
-        return None;
+        return;
     }
     let prefix = if len == 0 { 0 } else { prefix >> (128 - len as u32) << (128 - len as u32) };
     let life = |v: u64| if v == 0xffff_ffff { u64::MAX } else { now + v * 1000 };
@@ -988,6 +1026,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
     }
     if auto && len == 64 && CONF.get()[CONF_ETH].autoconf > 0 {
         let addr = prefix | eui64(st.mac);
+        let mut create = false;
         match st.addrs.iter_mut().find(|a| a.addr == addr) {
             Some(a) => {
                 // 2 時間より短くは縮めない (RFC 4862 5.5.3 e) のは、すでに 2 時間より短いときと、新しいものが長いとき
@@ -1000,7 +1039,7 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
                 a.preferred = Some(life(pref));
                 a.updated = now;
                 if a.usable() {
-                    return Some(a.clone());
+                    out.push(a.clone());
                 }
             }
             None if valid != 0 => {
@@ -1017,12 +1056,126 @@ fn prefix_info(st: &mut State, o: &[u8], now: u64) -> Option<Addr> {
                     dad,
                     nonce,
                     seq: next_seq(),
-                })
+                    auto: true,
+                    regen: false,
+                });
+                create = true;
             }
-            None => {}
+            None => return,
+        }
+        manage_tempaddrs(st, addr, create, now, out);
+    }
+}
+
+// ---- 一時アドレス (RFC 8981。Linux の manage_tempaddrs、ipv6_create_tempaddr、ipv6_gen_rnd_iid) ----
+//
+// eth0 の use_tempaddr が 1 より大きくなくても 0 より大きければ、RA で SLAAC の番地ができたとき (と、新しくしたときに一時
+// アドレスが 1 つもなければ)、同じ /64 にでたらめな IID の番地 (IFA_F_TEMPORARY、proto 0) を作る。valid lifetime は
+// SLAAC の番地のものと temp_valid_lft の小さいほう、preferred は SLAAC のものと temp_prefered_lft - desync_factor の
+// 小さいほう (regen_advance 秒より短くなるなら作らない)。DAD をして、おわるまでは知らせない。RA が SLAAC の番地を
+// 新しくすると一時アドレスの lifetime も (その上限まで) のばして RTM_NEWADDR。preferred が regen_advance 秒より短く
+// なると次のものを 1 つ作る。送り元のえらびかたは use_tempaddr が 2 から (か IPV6_PREFER_SRC_TMP) で一時アドレスを先に
+
+/// regen_advance (ipv6_get_regen_advance: regen_min_advance + regen_max_retry × dad_transmits × RetransTimer の秒)
+fn regen_advance(c: &DevConf) -> i64 {
+    c.regen_min_advance as i64 + c.regen_max_retry as i64 * c.dad_transmits as i64 * (RETRANS_MS / 1000) as i64
+}
+
+/// RA が SLAAC の番地 pubaddr を作った・新しくした (manage_tempaddrs): その一時アドレスの lifetime をのばし (知らせるものを
+/// out に)、作ったばかりか、一時アドレスがひとつもなければ新しいものを
+fn manage_tempaddrs(st: &mut State, pubaddr: u128, mut create: bool, now: u64, out: &mut Vec<Addr>) {
+    let Some(p) = st.addrs.iter().find(|a| a.addr == pubaddr).cloned() else { return };
+    let c = CONF.get()[CONF_ETH];
+    let secs = |t: Option<u64>| t.map_or(u32::MAX as i64, |t| (t.saturating_sub(now) / 1000) as i64);
+    let (pv, pp) = (secs(p.valid), secs(p.preferred));
+    let desync = st.desync.min(i32::MAX as u32) as i64;
+    for t in st.addrs.iter_mut().filter(|t| t.flags & IFA_F_TEMPORARY != 0 && t.addr >> 64 == pubaddr >> 64) {
+        let age = (now.saturating_sub(t.created) / 1000) as i64;
+        let v = pv.min((c.temp_valid_lft as i64 - age).max(0));
+        let pr = pp.min((c.temp_prefered_lft as i64 - desync - age).max(0));
+        t.valid = Some(now + v as u64 * 1000);
+        t.preferred = Some(now + pr as u64 * 1000);
+        t.updated = now;
+        if t.usable() {
+            out.push(t.clone());
         }
     }
-    None
+    if !st.addrs.iter().any(|t| t.flags & IFA_F_TEMPORARY != 0) && (pv > 0 || pp > 0) {
+        create = true;
+    }
+    if create {
+        create_tempaddr(st, &p, now);
+    }
+}
+
+/// 一時アドレスを作る (ipv6_create_tempaddr)。作れば true
+fn create_tempaddr(st: &mut State, p: &Addr, now: u64) -> bool {
+    let c = CONF.get()[CONF_ETH];
+    if c.use_tempaddr <= 0 {
+        return false;
+    }
+    let adv = regen_advance(&c);
+    let max_desync = (c.max_desync_factor as i64).min(c.temp_prefered_lft as i64 - adv);
+    if st.desync as i64 > max_desync {
+        st.desync = if max_desync > 0 { (crate::rand::u64() % max_desync as u64) as u32 } else { 0 };
+    }
+    let tpl = if c.temp_prefered_lft == 0 { 1 } else { c.temp_prefered_lft as i64 };
+    let secs = |t: Option<u64>| t.map_or(u32::MAX as i64, |t| (t.saturating_sub(now) / 1000) as i64);
+    let valid = secs(p.valid).min(c.temp_valid_lft as i64);
+    let pref = secs(p.preferred).min(tpl - st.desync as i64).min(valid);
+    if pref <= adv || (c.max_addresses > 0 && st.addrs.len() as i64 >= c.max_addresses as i64) {
+        return false;
+    }
+    // でたらめな IID (ipv6_gen_rnd_iid): 0、IANA の Ethernet のところ、subnet anycast と、もうある番地はよけて
+    let prefix = p.addr >> 64 << 64;
+    let addr = loop {
+        let iid = crate::rand::u64();
+        let (hi, lo) = ((iid >> 32) as u32, iid as u32);
+        if iid == 0 || (hi == 0x0200_5eff && lo & 0xff00_0000 == 0xfe00_0000) || (hi == 0xfdff_ffff && lo >= 0xffff_ff80) {
+            continue;
+        }
+        let a = prefix | iid as u128;
+        if !st.addrs.iter().any(|x| x.addr == a) {
+            break a;
+        }
+    };
+    let (dad, nonce) = dad_start(now);
+    st.addrs.push(Addr {
+        addr,
+        prefix: p.prefix,
+        flags: IFA_F_TEMPORARY | if dad.is_some() { IFA_F_TENTATIVE } else { 0 },
+        proto: 0,
+        valid: Some(now + valid as u64 * 1000),
+        preferred: Some(now + pref as u64 * 1000),
+        created: now,
+        updated: now,
+        dad,
+        nonce,
+        seq: next_seq(),
+        auto: true,
+        regen: false,
+    });
+    changed();
+    true
+}
+
+/// preferred lifetime が regen_advance 秒より短くなった一時アドレスの次のもの (addrconf_verify_rtnl: 1 つに 1 度)
+fn regen_tempaddrs(st: &mut State, now: u64) {
+    let adv = regen_advance(&CONF.get()[CONF_ETH]) as u64 * 1000;
+    let due: Vec<u128> = st
+        .addrs
+        .iter_mut()
+        .filter(|t| t.flags & (IFA_F_TEMPORARY | IFA_F_TENTATIVE) == IFA_F_TEMPORARY && !t.regen && t.preferred.is_some_and(|p| p <= now + adv))
+        .map(|t| {
+            t.regen = true;
+            t.addr
+        })
+        .collect();
+    for a in due {
+        if let Some(p) = st.addrs.iter().find(|x| x.flags & (IFA_F_TEMPORARY | IFA_F_MANAGETEMPADDR) == IFA_F_MANAGETEMPADDR && x.addr >> 64 == a >> 64).cloned() {
+            create_tempaddr(st, &p, now);
+        }
+    }
 }
 
 /// のこりの秒 (ifa_cacheinfo の prefered と valid: いつまでもは INFINITY_LIFE_TIME)
