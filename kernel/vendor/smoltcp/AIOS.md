@@ -19,4 +19,7 @@ profile と、使わない defmt (組みこみ機器のログ。Cargo.lock に 4
 - `tcp::Socket::forget`: なにも送らずにつながりを捨てる (`reset`)。`abort` と `close` は相手が決まったまま CLOSED に
   するので、SYN-SENT でも RST を送る (Linux は ICMP のエラーで SYN-SENT をやめるとき何も送らない)。test/ndsilence.c
 
+- 口だけの道 (`src/iface/route.rs` の `Routes::lookup`): `via_router` が未指定 (`::` か `0.0.0.0`) の道は、ルーターでは
+  なくあて先そのものへ (Linux のゲートウェイのない道: ip -6 route add PREFIX dev eth0)。test/onlink6.c
+
 smoltcp を上げるときは、新しい版の写しにこれらをあてなおす。

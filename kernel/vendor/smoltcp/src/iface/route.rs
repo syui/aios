@@ -162,7 +162,9 @@ impl Routes {
             })
             // pick the most specific one (highest prefix_len)
             .max_by_key(|route| route.cidr.prefix_len())
-            .map(|route| route.via_router)
+            // aios: a route via the unspecified address is on-link (ip route add PREFIX dev eth0): send to the
+            // destination itself, as for the interface's own subnets
+            .map(|route| if route.via_router.is_unspecified() { *addr } else { route.via_router })
     }
 }
 

@@ -2644,7 +2644,7 @@ fn addr6_of(a: &crate::addrconf::Addr) -> Addr6 {
 //
 // 番地は eth0 のものだけ (lo は ::1 だけで EOPNOTSUPP)。nodad でなければ DAD のあいだ tentative で、local の道は
 // DAD がおわってから (addrconf の tick → changed6 で RTM_NEWADDR と local の道を知らせる)。
-// 道はゲートウェイを通る unicast だけ (口だけの道、blackhole などは EOPNOTSUPP: IPv4 と同じく aios のできないこと)
+// 道は unicast だけ: ゲートウェイを通るものと、口だけのもの (eth0 のあて先へじかに)。blackhole などは EOPNOTSUPP
 
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
@@ -2778,8 +2778,9 @@ fn del_addr6(body: &[u8]) -> i64 {
 
 /// ip -6 route add / del (rtm_to_fib6_config、ip6_route_add、ip6_route_del): tos は EINVAL、RTA_VIA は EINVAL、長さが 128
 /// より長ければ EINVAL。add: metric の既定は 1024、口がなければ ENODEV、link-local のゲートウェイに口がなければ EINVAL、
-/// ゲートウェイのないもの (口だけの道) と unicast でないものは EOPNOTSUPP、同じあて先と長さと metric があれば EEXIST
-/// (REPLACE なら入れかえ)。del: あうもののうち metric の小さいもの、なければ ESRCH
+/// unicast でないものは EOPNOTSUPP、同じあて先と長さと metric があれば EEXIST
+/// (REPLACE なら入れかえ)。ゲートウェイがなければ口だけの道 (口がなければ ENODEV)。del: あうもののうち metric の小さい
+/// もの、なければ ESRCH
 fn change_route6(body: &[u8], add: bool, nlflags: u16) -> i64 {
     if body.len() < 12 {
         return crate::why::inval();
@@ -2823,8 +2824,9 @@ fn change_route6(body: &[u8], add: bool, nlflags: u16) -> i64 {
     if typ != RTN_UNICAST {
         return -EOPNOTSUPP;
     }
-    if gw == 0 {
-        return -EOPNOTSUPP;
+    // ゲートウェイのない道は口がいる (fib6_nh_init: 口がなければ ENODEV)。そのあて先へじかに (口だけの道)
+    if gw == 0 && oif == 0 {
+        return -ENODEV;
     }
     if crate::addrconf::is_link_local(gw) && oif == 0 {
         return crate::why::inval();
@@ -2841,7 +2843,7 @@ fn change_route6(body: &[u8], add: bool, nlflags: u16) -> i64 {
         typ: RTN_UNICAST,
         expires: None,
         hoplimit: 0,
-        flags: crate::addrconf::RTF_UP | crate::addrconf::RTF_GATEWAY,
+        flags: crate::addrconf::RTF_UP | if gw != 0 { crate::addrconf::RTF_GATEWAY } else { 0 },
     };
     match crate::addrconf::add_route(r.clone(), nlflags & NLM_F_REPLACE != 0) {
         Ok(_) => {

@@ -1317,11 +1317,13 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
     REPLACE なら flags と lifetime を変える。prefix が 128 より長いと EINVAL、口がなければ ENODEV、::、::1、
     マルチキャストは EADDRNOTAVAIL。lo は EOPNOTSUPP
   - ip -6 addr del: 番地と長さのあうもの (なければ EADDRNOTAVAIL)。同じ prefix の番地がもうなければ prefix の道も
-  - ip -6 route add / del: ゲートウェイを通る unicast の道 (metric の既定は 1024、proto は来たもの)。link-local の
-    ゲートウェイに口がなければ EINVAL、同じあて先と長さと metric があれば EEXIST (REPLACE なら入れかえ)。del は
-    あうもののうち metric の小さいもの (なければ ESRCH)。RA の既定の道も消せる (つぎの RA でまたできる)。口だけの道と
-    unicast でないものは EOPNOTSUPP (IPv4 と同じく aios のできないこと)。smoltcp の道の表には prefix ごとに metric の
-    いちばん小さいもの
+  - ip -6 route add / del: unicast の道 (metric の既定は 1024、proto は来たもの): ゲートウェイを通るものと、口だけの
+    もの (ip -6 route add 2001:db8:2::/64 dev eth0: RTF_UP だけで、あて先へじかに。近所さがしはあて先そのもの)。
+    link-local のゲートウェイに口がなければ EINVAL、口もゲートウェイもなければ ENODEV、同じあて先と長さと metric が
+    あれば EEXIST (REPLACE なら入れかえ)。del はあうもののうち metric の小さいもの (なければ ESRCH)。RA の既定の道も
+    消せる (つぎの RA でまたできる)。unicast でないものは EOPNOTSUPP。smoltcp の道の表には prefix ごとに metric の
+    いちばん小さいもの (口だけの道は via が :: で、写しの smoltcp はそれをあて先そのものへ: kernel/vendor/smoltcp/AIOS.md)。
+    `test/ldiff.sh --root --net onlink6` で手本の Linux 7.4-rc1 と 27 行同じ
   - 知らせ: RTMGRP_IPV6_IFADDR と RTMGRP_IPV6_ROUTE (番地を足すと prefix の道、RTM_NEWADDR、local の道の順、消すと
     RTM_DELADDR、local の道、prefix の道。道の RTM_NEWROUTE は NLM_F_EXCL|NLM_F_CREATE)。RA と lifetime の時間切れで
     変わったものは前とくらべて
@@ -1336,7 +1338,7 @@ aios には RTM_GETROUTE がなく (EOPNOTSUPP)、AF_PACKET の RTM_GETADDR も�
   まで、ICMP は 520)、名前は送ったあて先、付帯データは IPV6_PKTINFO (たのんでいれば: その ICMPv6 のあて先と口) と
   SOL_IPV6 / IPV6_RECVERR (sock_extended_err、origin は SO_EE_ORIGIN_ICMP6、知らせてきた番地)。RECVERR を切ると行列は
   捨てる。`test/ldiff.sh recverr6` (v6 と v4) で手本の Linux 7.4-rc1 と 120 行同じ
-- まだ: MLD、packet too big (PMTU)、口だけの IPv6 の道、RDNSS (DNS)、一時アドレス
+- まだ: MLD、packet too big (PMTU)、RDNSS (DNS)、一時アドレス
 - 確かめかた: `test/ldiff.sh inet6` (ネットワークのない手本の Linux とくらべる。ソケット、bind、ぶつかり、::1 の TCP、
   二つで一つ、connect のしくじり、::1 の UDP と IPV6_PKTINFO、netlink と getifaddrs、/proc/net、IPv6 の道。eth0 の
   ものは出さない)。Linux 7.4-rc1 と 170 行同じ。route、rtnl、netlink も同じまま。ファイアウォールは `test/nfteval6.c`
