@@ -63,7 +63,7 @@
         "llvm": "23.1.5", "mbedtls": "4.2.0", "mesa": "26.2.6", "musl": "1.2.6",
         "pango": "1.58.2", "pcre2": "10.49", "pixman": "0.46.4", "pkgconf": "3.0.10", "vulkan-headers": "1.4.368",
         "vulkan-loader": "1.4.368", "vulkan-tools": "1.4.367", "wayland": "1.26.0", "wayland-protocols": "1.50",
-        "xkeyboard-config": "2.48", "zig": "0.17.0", "zlib": "1.4",
+        "xkeyboard-config": "2.48", "zig": "0.17.1", "zlib": "1.4",
 
         "ncurses": "6.6", "libevent": "2.1.13",
         "zsh": "5.9.2", "vim": "9.2.1302", "tmux": "3.8", "openssh": "10.6p1", "jq": "1.8.2",
