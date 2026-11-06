@@ -632,7 +632,7 @@ fn uptime() -> Option<String> {
     })
 }
 
-/// ログインシェル (bash が brush へのリンクなら、そう出す)
+/// ログインシェル (リンクなら、その先も出す)
 fn shell(uid: u32) -> Option<String> {
     let sh = std::env::var("SHELL").ok().or_else(|| passwd_field(uid, 6))?;
     let name = sh.rsplit('/').next()?.to_string();

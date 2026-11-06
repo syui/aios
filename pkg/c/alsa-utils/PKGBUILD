@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。alsamixer (ncurses が要る) はなし。/opt/c に入る
 pkgname=alsa-utils
 pkgver=1.2.16
-pkgrel=3
+pkgrel=4
 pkgdesc='ALSA utilities: aplay, arecord, speaker-test, amixer (for aios)'
 arch=('aarch64')
 url='https://www.alsa-project.org/'
@@ -35,5 +35,7 @@ package() {
   cd "alsa-utils-$pkgver"
   make DESTDIR="$pkgdir" install
   rm -rf "$pkgdir/opt/c/share/man" "$pkgdir/lib" "$pkgdir/usr/lib/udev"
+  # alsa-info.sh (様子を集めて alsa-project.org に送る) は bash のスクリプトで、aios に bash はないので入れない
+  rm -f "$pkgdir/opt/c/sbin/alsa-info.sh"
   install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
 }

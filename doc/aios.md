@@ -2585,6 +2585,7 @@ aios install pkg FILE...       # 作ったパッケージを入れる (aiosd が
   入れてから。`--sdboot` はローダーを本物の systemd-boot (Debian 13 の systemd-boot-efi 257) にして、同じことを確かめる
 - aikernel のパッケージを上げると /boot/Image はパッケージのものになる
 - `aios build pkg` は bin/mkpkg.sh と同じものを aios の中で作る (user/src/lib/mkpkg.rs)。PKGBUILD の関数
-  (pkgver prepare build package) は bash (brush) で動かし、ソース (git+、http(s) は fetch、横のファイル)、sha256、
+  (pkgver prepare build package) は zsh を sh のふり (`emulate -R sh`) で動かし (aios に bash は入れない。pkg/ の
+  PKGBUILD みなを bash と同じに読めることは確かめた。ap の .INSTALL も同じ)、ソース (git+、http(s) は fetch、横のファイル)、sha256、
   .PKGINFO、tar と zstd はこちらでする。zstd のコマンドがなければ ruzstd で縮める (速いが、-19 ほどは縮まない)。
   作業の場所は ~/.cache/aios/build/NAME。root はいらない (ファイルの持ち主は tar の中で root にする)

@@ -3,7 +3,4 @@
 /usr/bin/aish
 /bin/sh
 /usr/bin/sh
-/bin/bash
-/usr/bin/bash
-/bin/brush
-/usr/bin/brush
+/opt/c/bin/zsh

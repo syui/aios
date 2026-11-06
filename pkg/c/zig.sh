@@ -22,6 +22,12 @@ zig_sha256() {
   esac
 }
 
+# このファイルのあるところ (pkg/c)。PKGBUILD は pkg/KIND/NAME にあり、ここを $startdir/../zig.sh か
+# $startdir/../../c/zig.sh で読む。bash の BASH_SOURCE は zsh (aios build pkg) にないので startdir から
+zig_sh_dir() {
+  cd "$startdir/../../c" && pwd
+}
+
 # zig_fix_libc LIBDIR: Zig 0.17 の libc を musl と同じに直す (2 度あててもよい)。Zig は AI で書いた報告を
 # 受けとらないので上流には出していない。ZIG_VERSION を上げたら、まだ要るか見る
 #  - realloc (lib/c/malloc.zig): 大きさ 0 なら NULL を返すが、realloc(NULL, 0) は malloc(0) と同じでなければならず
@@ -48,7 +54,7 @@ zig_fix_libc() {
 # zig_fix_iconv MUSL_DIR
 zig_fix_iconv() {
   local m=$1 p
-  p=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/musl/CVE-2026-6042.patch
+  p=$(zig_sh_dir)/musl/CVE-2026-6042.patch
   [ -f "$m/src/locale/iconv.c" ] || return 0
   grep -q gb18030utf "$m/src/locale/iconv.c" && return 0
   patch -s -p1 -d "$m" < "$p" && grep -q gb18030utf "$m/src/locale/iconv.c" ||
@@ -57,7 +63,7 @@ zig_fix_iconv() {
 
 zig_fix_regcomp() {
   local m=$1 p
-  p=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/musl/CVE-2026-107891.patch
+  p=$(zig_sh_dir)/musl/CVE-2026-107891.patch
   [ -f "$m/src/regex/regcomp.c" ] || return 0
   grep -q check_add "$m/src/regex/regcomp.c" && return 0
   patch -s -p1 -d "$m" < "$p" && grep -q check_add "$m/src/regex/regcomp.c" ||

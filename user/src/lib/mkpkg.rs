@@ -1,5 +1,5 @@
 // mkpkg: PKGBUILD から pacman と同じ形のパッケージ (NAME-VER-REL-ARCH.pkg.tar.zst) を作る (aios build pkg)。
-// bin/mkpkg.sh と同じことを aios の中でする。シェルの関数 (pkgver prepare build package) は bash (brush) で動かし、
+// bin/mkpkg.sh と同じことを aios の中でする。シェルの関数 (pkgver prepare build package) は zsh (sh のふり) で動かし、
 // ソースを取ってくる、sha256 を確かめる、.PKGINFO を書く、tar と zstd にまとめるのはここ (Rust) でする
 // (aios には GNU tar や zstd のコマンドがない)。
 //   source: git+URL (#tag= #commit= #branch=)、http(s) (fetch で取る)、PKGBUILD の横のファイル。NAME::URL で名前
@@ -20,6 +20,19 @@ type Vars = BTreeMap<String, Vec<String>>;
 const SCALARS: &[&str] = &["pkgname", "pkgver", "pkgrel", "epoch", "pkgdesc", "url", "install"];
 const ARRAYS: &[&str] = &["arch", "license", "depends", "optdepends", "makedepends", "provides", "conflicts", "replaces", "backup", "source", "sha256sums"];
 
+/// PKGBUILD (bash の書き方) を動かすシェル: zsh を sh のふりで (emulate -R sh: 配列は 0 から、$x は空白で分ける)。
+/// 配列、[[ ]]、local、${x//a/b} も同じに動く。pkg/ の PKGBUILD みなを bash と同じに読めることは確かめてある。
+/// ちがうのは、ない配列の "${a[@]}" が空の 1 つになること (ここでは ${a[@]+"${a[@]}"} と書く) と、
+/// declare -F (zsh では小数の変数) で、関数があるかは typeset -f で見る
+const ZSH: &[&str] = &["/opt/c/bin/zsh", "/usr/bin/zsh", "/bin/zsh"];
+
+fn zsh(script: &str) -> Result<Command, String> {
+    let zsh = ZSH.iter().find(|p| Path::new(p).exists()).ok_or("zsh runs the PKGBUILD, but it is not installed (ap -S zsh)")?;
+    let mut c = Command::new(zsh);
+    c.arg("-c").arg(format!("emulate -R sh\n{}", script));
+    Ok(c)
+}
+
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -31,9 +44,9 @@ fn read_vars(startdir: &Path) -> Result<Vars, String> {
         script.push_str(&format!("printf '%s\\0%s\\0' {k} \"${{{k}:-}}\"\n"));
     }
     for k in ARRAYS {
-        script.push_str(&format!("for v in \"${{{k}[@]}}\"; do printf '%s\\0%s\\0' {k} \"$v\"; done\n"));
+        script.push_str(&format!("for v in ${{{k}[@]+\"${{{k}[@]}}\"}}; do printf '%s\\0%s\\0' {k} \"$v\"; done\n"));
     }
-    let out = Command::new("bash").arg("-c").arg(&script).current_dir(startdir).output().map_err(|e| format!("bash: {}", e))?;
+    let out = zsh(&script)?.current_dir(startdir).output().map_err(|e| format!("zsh: {}", e))?;
     if !out.status.success() {
         return Err(format!("PKGBUILD: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -242,16 +255,14 @@ pub fn build(startdir: &Path, dest: &Path) -> Result<PathBuf, String> {
     let verfile = work.join("pkgver");
     let script = format!(
         "set -e\nsha256() {{ sha256sum \"$1\" | cut -d' ' -f1; }}\nsource ./PKGBUILD\n\
-         if declare -F pkgver >/dev/null; then pkgver=$(cd \"$srcdir\" && pkgver); fi\n\
+         if typeset -f pkgver >/dev/null 2>&1; then pkgver=$(cd \"$srcdir\" && pkgver); fi\n\
          printf '%s' \"$pkgver\" > {ver}\n\
-         for f in prepare build; do if declare -F $f >/dev/null; then echo \"==> $pkgname: $f()\"; (cd \"$srcdir\" && $f); fi; done\n\
+         for f in prepare build; do if typeset -f $f >/dev/null 2>&1; then echo \"==> $pkgname: $f()\"; (cd \"$srcdir\" && $f); fi; done\n\
          echo \"==> $pkgname: package()\"\n\
          (cd \"$srcdir\" && umask 022 && package)\n",
         ver = sh_quote(&verfile.to_string_lossy())
     );
-    run(Command::new("bash")
-        .arg("-c")
-        .arg(&script)
+    run(zsh(&script)?
         .current_dir(&startdir)
         .env("startdir", &startdir)
         .env("srcdir", &srcdir)

@@ -8,14 +8,15 @@ arch=('aarch64')
 url='https://github.com/syui/aios'
 license=('MIT')
 # base + aikernel + aiboot で使える aios になる (Arch の base + linux のように)。
-# ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。bash (brush) は予備として入れておく
+# ログインシェルは自作の aish。/bin/sh は aish へのリンク (bash と同じやり方)。zsh も入れておく (人の手元のシェル。
+# aios build pkg の PKGBUILD と ap の .INSTALL は、bash の書き方なので zsh を sh のふりで動かす)。bash は入れない
 # ca-certificates は /etc/ssl/certs/ca-certificates.crt (curl、git、ssh の C のもの、pip などが TLS で使う。
 # aios の Rust のものは持っているが、なければ C のものが https につなげない)
 # tar は libarchive (bsdtar)、awk は gawk、ps は procps-ng (uutils の tar / awk / ps はまだ足りないものが多いので入れない:
 # 同じ用途のものは 1 つ)
 # ripgrep (rg) は aish の where ツール (定義を探す) が使う。grep ツールと C-f / C-g も、あればそれを使う
 # (.gitignore を読む、速い)。grep は uutils の grep で、rg とは別のもの
-depends=('coreutils' 'grep' 'ripgrep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'brush' 'ca-certificates')
+depends=('coreutils' 'grep' 'ripgrep' 'sed' 'findutils' 'diffutils' 'libarchive' 'gawk' 'procps-ng' 'gzip' 'sudo-rs' 'zsh' 'ca-certificates')
 makedepends=('rustup')
 # 手で変えることのある設定。更新しても上書きせず .pacnew を置く
 backup=(etc/passwd etc/group etc/shadow etc/sudoers etc/aipkg.conf

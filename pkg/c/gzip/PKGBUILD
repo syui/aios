@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る
 pkgname=gzip
 pkgver=1.15
-pkgrel=3
+pkgrel=4
 pkgdesc='GNU compression utility (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/gzip/'
@@ -22,7 +22,9 @@ build() {
   . "$startdir/../zig.sh"
   zig_env
   cd "gzip-$pkgver"
-  ./configure --host=aarch64-linux-musl --prefix="$PREFIX"
+  # zcat や zgrep などのスクリプトの #! は configure を動かしたシェル (CONFIG_SHELL。ないと見つけた bash) になる。
+  # aios に bash はないので、Linux のディストリと同じく /bin/sh (aios では aish) に
+  CONFIG_SHELL=/bin/sh ./configure --host=aarch64-linux-musl --prefix="$PREFIX"
   make
 }
 
@@ -32,5 +34,6 @@ package() {
   cd "gzip-$pkgver"
   make DESTDIR="$pkgdir" install
   rm -rf "$pkgdir$PREFIX/share"
+  if grep -l '^#!.*bash' "$pkgdir$PREFIX/bin/"*; then echo "gzip: scripts still use bash" >&2; return 1; fi
   install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
 }

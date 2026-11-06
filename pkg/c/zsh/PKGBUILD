@@ -2,12 +2,13 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。補完の関数 (compinit) も入れる
 pkgname=zsh
 pkgver=5.9.2
-pkgrel=4
+pkgrel=5
 pkgdesc='A very advanced and programmable command interpreter (shell) (static, for aios)'
 arch=('aarch64')
 url='https://www.zsh.org/'
 license=('MIT-Modern-Variant')
 depends=('ncurses')
+backup=('etc/zsh/zprofile')
 source=("https://www.zsh.org/pub/zsh-$pkgver.tar.xz")
 sha256sums=('36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81')
 
@@ -38,5 +39,8 @@ package() {
   cd "zsh-$pkgver"
   make DESTDIR="$pkgdir" install.bin install.modules install.fns
   rm -f "$pkgdir/opt/c/bin/zsh-$pkgver"
+  # ログインの zsh も /etc/profile (PATH、umask、/etc/profile.d) を sh のふりで読む (Arch の zprofile と同じ)
+  install -dm755 "$pkgdir/etc/zsh"
+  printf '%s\n' "emulate sh -c '. /etc/profile'" > "$pkgdir/etc/zsh/zprofile"
   install -Dm644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
 }

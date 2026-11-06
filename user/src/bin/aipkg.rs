@@ -626,7 +626,8 @@ fn install(path: &str, explicit: bool) {
     }
 }
 
-/// .INSTALL の関数 (post_install など) を、あれば動かす (pacman と同じく bash の書き方。brush で、なければ sh で)。
+/// .INSTALL の関数 (post_install など) を、あれば動かす (pacman と同じく bash の書き方。zsh を sh のふりで
+/// (aios build pkg の PKGBUILD と同じ)、なければ /bin/sh で)。
 /// しくじっても入れたもの・消したものはそのまま (pacman と同じ)
 fn run_script(script: &str, func: &str, args: &[&str]) {
     let Ok(text) = fs::read_to_string(script) else { return };
@@ -637,9 +638,13 @@ fn run_script(script: &str, func: &str, args: &[&str]) {
     if !defined || ROOT != "/" {
         return;
     }
-    let shell = ["/usr/bin/brush", "/bin/brush", "/bin/sh"].into_iter().find(|p| fs::metadata(p).is_ok()).unwrap_or("/bin/sh");
+    let zsh = ["/opt/c/bin/zsh", "/usr/bin/zsh", "/bin/zsh"].into_iter().find(|p| fs::metadata(p).is_ok());
     println!(":: running {}", func);
-    let st = std::process::Command::new(shell).arg("-c").arg(format!(". \"$0\"; {} \"$@\"", func)).arg(script).args(args).status();
+    let run = format!(". \"$0\"; {} \"$@\"", func);
+    let st = match zsh {
+        Some(z) => std::process::Command::new(z).arg("-c").arg(format!("emulate -R sh\n{}", run)).arg(script).args(args).status(),
+        None => std::process::Command::new("/bin/sh").arg("-c").arg(run).arg(script).args(args).status(),
+    };
     if !st.is_ok_and(|s| s.success()) {
         println!("warning: {} of {} failed", func, script);
     }

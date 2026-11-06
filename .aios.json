@@ -49,7 +49,7 @@
 
     "linux": {
       "rust": {
-        "brush": "0.4.0", "coreutils": "0.12.0",
+        "coreutils": "0.12.0",
         "findutils": "0.10.0", "grep": "0.2.0", "sudo-rs": "0.2.15",
         "ripgrep": "15.2.0", "uv": "0.13.6"
       },
