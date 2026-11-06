@@ -6,7 +6,7 @@
 #   ビルドには cmake、ninja、clang-20 が要る。4 コアで 1 時間ほど
 pkgname=llvm
 pkgver=23.1.5
-pkgrel=1
+pkgrel=2
 pkgdesc='Compiler infrastructure: libLLVM.so for the AArch64 target (for aios)'
 arch=('aarch64')
 url='https://llvm.org/'

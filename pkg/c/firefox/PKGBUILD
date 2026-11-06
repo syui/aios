@@ -7,7 +7,7 @@
 #   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
 pkgname=firefox
 pkgver=159.0.1
-pkgrel=1
+pkgrel=2
 pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
 arch=('aarch64')
 license=('MPL-2.0')
