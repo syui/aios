@@ -54,6 +54,132 @@ AI (Claude の aish、アイ) が aios をつかみ、自分で次の仕事を�
 回り方: feed (や pkg_check daily) で新しい種を受けとる → `aios health` といまの様子で確かめる → なおす (todo.json の verify で
 確かめ、Linux とくらべるものは test/linux-vm.sh の手本と) → todo.json の行を消し doc を書きかえてコミット → 次の日の報告が消える。
 
+## パッケージの手入れ (aish-pkg)
+
+aish-pkg (shell/pkg、aish-pkg のプラグインと `aish-pkg` のコマンド) は、pkg/ のパッケージを最新に保つ道具。ふつうは
+pkg_check → pkg_edit → pkg_build → pkg_test (vm) → pkg_push、重いもの (pkg/ci.json) は CI が作って pkg_fetch、まとめては
+pkg_update。
+
+### ツール
+
+- `pkg_check`: 配布元の最新といまの pkgver。どこを見るか `pkg/upstream.json` は PKGBUILD の git と Arch の `.nvchecker.toml`
+  から作る。`#commit=` のものはリポジトリの HEAD と、PKGBUILD の `_latest_url` と `_latest_regex` があればそのページと、
+  download.gnome.org のものはその cache.json とくらべる。配布元はどれも 30 秒で切り、しくじれば source の tarball
+  のディレクトリの一覧 (ftp.gnu.org/gnu/NAME/ など。ファイルの名前に $pkgver があるもの) から見る (`via_listing`。savannah の
+  git は 500 を返したり何も返さなかったりする)。新しい版のタグはあっても配る tarball がまだないもの (404、410) は `not out yet`
+  (`not_out`。new には入れない)。PKGBUILD のない npm で入れるもの (`.aios.json` の pkg.linux.npm に人が書く。いまはない) は、
+  npm の registry の dist-tags の latest と (`pkg_edit` は `.aios.json` の版を書きかえる。`@SCOPE/NAME` の名前でよい)。PKGBUILD
+  に `_npm=NAME` と書いたもの (claude と pnpm) は、パッケージの版が npm の NAME の版で、`_latest_url` の dist-tags とくらべる
+  (post_install がその版を入れるので、ap -Syu で新しい claude-code が来る)
+- `pkg_edit`: PKGBUILD の pkgver・pkgrel・sha256sums と `.aios.json` を書きかえる。source が 404 か 410
+  ならやりなおさずにすぐしくじる。`rebuild: true` なら pkgrel を 1 つ上げるだけ
+- `pkg_build`: bin/mkpkg.sh で `repo/aarch64/KIND/` に作り、aios.db を作りなおす。前の版にあったライブラリ (SONAME と *.so*
+  の名前) が新しいものになければ、それを NEEDED に書いたパッケージを `soname` に出す (作りなおすまで動かない)。
+  いくつもいっしょに作っても aios.db と .aios.json がこわれないように錠をかける
+- `pkg_fetch`: 重いもの `pkg/ci.json` (firefox、llvm、uv) は GitHub の CI `.github/workflows/pkg.yml` が作ってリリース pkg-NAME
+  (新しい版で置きかえる) に置くので、それを取ってきて SHA256SUMS を確かめ、build と同じく置く。PKGBUILD もリリースのものに
+- `pkg_test`: 版、ELF が aarch64 か、PIC でないプログラムが COPY で写したライブラリのデータを、別のものなのに 1
+  つの場所にまとめていないか (copies。ライブラリのほんとうの番地とくらべる。Zig の libc.so の見本を zig.sh
+  で直す前にリンクしたものは stdin・stdout・stderr が 1 つで、pcre2grep の答えが標準エラーに出た)、NEEDED
+  のライブラリがパッケージと depends と musl の中にあるか (needs)、bin/ を qemu-aarch64 か aarch64 で --version (なければ
+  -version、-V、version、--help。0 でなくても、パッケージの版を出したもの (musl の ldd は版と使い方を出して 1) と、
+  使い方を出して 1 か 2 で終わるもの (vulkaninfo のように版の引数がない) は動いたとみる。シグナルで落ちたものと、
+  ライブラリが読めない 127 はしくじり)。PATH と XDG_DATA_DIRS は広げたところだけにして、このマシンの man や GSettings の schema
+  を使わない。`vm: true` なら aios の VM (`-snapshot` で repo/ を出したもの。動いていなければ起こし、終わっても止めない。
+  ちがうものが動いていれば使わない) にも `ap -S` で入れて、bin/ のものを aiwm と同じ XDG_DATA_DIRS で aios
+  のカーネルの上で動かし、このマシンで動いたのに aios で動かないものがあればしくじり
+- `pkg_scan`: repo/aarch64 のパッケージみなを、動かさずに copies と needs で。Zig を上げたときなどに
+- `pkg_rebuild`: いくつものパッケージを順に pkgrel+1 → build → test、`push: true` ならみな通ったら push。names がなければ
+  pkg_check の `rebuild` のもの、`unrecorded: true` なら Zig を書きとめる前に作ったものも。c_deps で使うものを先に作る。pkgrel
+  を上げるのは、いまの版がもう ai/repo にあるときだけで、もう作りなおしたもの (確かめてあって、古いライブラリもちがう Zig
+  もない) は飛ばすので、もういちど動かしても 2 つ上がらない。CI が作るもの (pkg/ci.json) も飛ばす。しくじったものは飛ばして続け
+  (`fail_fast` で止める)、さいごにまとめる。`vm: true` で pkg_test を aios の VM の中でも。`dry: true` で順だけ。進みぐあいは
+  rebuild.log、くわしくは build-NAME.log / test-NAME.log
+- `pkg_update`: 新しい版の出たものをまとめて上げる: names がなければ pkg_check の new のもの、`daily: true` なら CI
+  の毎日の報告の new を、いま見なおして。タグだけで tarball がまだないものと見られなかったものは飛ばす。npm で入れるもの
+  (pkg.linux.npm) は `.aios.json` の版を書きかえるだけ、CI が作るもの (pkg/ci.json) は PKGBUILD を上げるだけ (main に push
+  すると pkg.yml が作るので、そのあと pkg_fetch)、ほかは pkg_edit で上げ (調べたときの版に)、それを中に入れているもの
+  (静的なライブラリ) といっしょに pkg_rebuild と同じく作って確かめる。`push: true` ならみな通ったら pkg_push、`dry: true`
+  で何をどう上げるかだけ。さいごに、コミットして main に push するファイル (`files`) と次にすること (`next`)
+- `pkg_push`: ai/repo とくらべて bin/gitea.sh repo で送る。ai/repo の写し `build/airepo` から、
+  変わったものだけ取って変わったものだけ送る。pkg_test を通っていないものや、ai/repo のほうが新しいものがあれば止まる。
+  同じ名前で作りなおしたものは、もう一度 pkg_test を通すまで送らない。bin/publish.sh の push とも錠で 1 つずつ
+
+### うしろで動くもの
+
+- check (配布元をみな見ると 1 分ほどかかり、ツールの 60 秒をこえるので) と build と push はうしろで動き、
+  もういちど呼ぶと様子か結果 (`stop: true` で孫の make や zig まで止める)。
+- pid は `build/aish-pkg/KEY.pid` にも書くので、aish やプラグインが入れかわっても (ビルドしなおすたび)、
+  次に呼べば引きついで続きを待つ (終わっていればその答え)。
+
+### 中に入れたライブラリと Zig (作りなおしの見はり)
+
+- 中にまるごと入っているライブラリ (静的リンク。`c_deps` のもの) の見はり: 作るときに入れた版を `.PKGINFO` の
+  `makedepend = NAME=VER-REL` に残し (zig.sh の `c_deps` と mkpkg.sh)、`pkg_check` はそれより新しいライブラリがあるものを
+  `rebuild` に出す (`pkg_edit` の `rebuild` → build → test → push)。
+- 新しい版のあるライブラリには、それを入れているもの (`embedded in: ...`)、`pkg_build` の答えにも作りなおすもの (`rebuild`)。
+- 作った Zig も `makedepend = zig=ZIG_VERSION-ZIG_REL` に残し (zig.sh の `zig_env`。`ZIG_REL` は zig_fix_libc の直しの回)、
+  いまの zig.sh とちがうもので作ったものも `rebuild` に出す (古い libc.so の見本でリンクしたもののように、
+  作りなおすまで直らないので)。
+- 書きとめる前に作ったものは、作った日の zig.sh の版 (git の履歴から) ごとの数を 1 行に (名前は JSON の `unrecorded`)。
+
+### 直っていない CVE (vulns、shell/pkg/src/vuln.rs)
+
+- 直っていない CVE の見はり (`vulns`。vuln.rs): Alpine の secdb (edge の main と community の「この版 `VER-rN` で直した CVE」。
+  1 日に 1 回 `build/aish-pkg/secdb/` に取ってきて、取れなければ前のものを使ってそう書く。取りなおすのは 1 時間に 1 回まで) と
+  pkg/c のもの (と sudo-rs) の pkgver をくらべ、直した版のほうが新しければ `fixed in VER` (pkg_edit で上げる)、Alpine
+  が同じ版にパッチをあてて直したもの (`VER-r1` から) は `patched by Alpine` (aports のパッチを足す)。
+- PKGBUILD かとなりのファイル (パッチなど) に CVE の番号を書いたものは出さない (直したもの、aios にはあてはまらないもの)。
+- 名前のちがうものは ALIAS (glib2 は glib など)、pkg/rust の coreutils (uutils) は名前が同じでも別のものなので見ない。
+- firefox は Mozilla の advisories で (github.com/mozilla/foundation-security-advisories の `announce/YEAR/mfsaYEAR-N.yml` の
+  fixed_in の `Firefox VER` とその CVE。Android だけのもの (title が `Firefox for Android VER`) も fixed_in は `Firefox VER`
+  と書くが、デスクトップにはその版が出ないので見ない。git で浅く、ことしと去年のところだけ `build/aish-pkg/secdb/mfsa` に取り、
+  これも 1 日に 1 回。Alpine は firefox の secfixes を書かず、Arch の security tracker は 2023 年からほとんど動いていない
+  (firefox は 2019 年の 67.0.4 まで))。
+- CVE が多いもの (Mozilla は 1 つのバグに 1 つ) は 4 つと残りの数。
+- どこも書いていないもの (mesa など) は見られない。
+- Rust の crate も (`crate`): aios の Cargo.lock (いちばん上のカーネルのものと、user・shell・desktop・aimg・boot のもの) と、
+  pkg/rust のものの配布元の Cargo.lock (PKGBUILD の source の git のタグかコミットのところを、git で浅く Cargo.lock だけ取って
+  `build/aish-pkg/secdb/locks/` に。HEAD から作るものは 1 日に 1 回) を、cargo audit と同じ RustSec の advisory-db (crates/
+  のところだけ `build/aish-pkg/secdb/rustsec` に、1 日に 1 回) とくらべる。
+- PKGBUILD の `cargo_update CRATE@VER` (pkg/rust/cross.sh: 配布元がまだ上げていない直った版に、同じ semver の中で
+  `cargo update --precise` で上げる。配布元が上げていれば何もしない) で上げたものは、上げた版で見る。
+- informational (unmaintained や unsound) と withdrawn のもの、Linux や aarch64 にあてはまらないものは出さない。
+- 直った版がないものと、プログラムに入らないもの (dev-dependencies) は、RUSTSEC の番号とわけを PKGBUILD (aios の Cargo.lock は、
+  となりの Cargo.toml など) に書く。
+- npm も (`range`): PKGBUILD の `_npm` のもの (パッケージの版) と `.aios.json` の pkg.linux.npm に書いた版を、npm audit と同じ
+  registry.npmjs.org の advisories と (1 日に 1 回。たずねるものが変われば、すぐ)。
+- uv で入れる Python も (`.aios.json` の pkg.linux.uv の python。uv python install の CPython): Alpine の python3 の secfixes
+  と (直ったものは `uv python install VER` で入れて、その版を書く)。
+
+### 一覧と .aios.json
+
+- 一覧は `build/aish-pkg/pkg.json` (リポジトリには入れない。1 つに 1 行で name type src now latest。latest は見たときの最新か、
+  PKGBUILD の版のほうが新しければその版で、`pkg_edit` で上げたあとも足したばかりのものも now より古くならない)。
+- `.aios.json` の pkg は、check・edit・build のたびに pkg/ の PKGBUILD にそろえる (新しいものを足し、版を直し、
+  なくなったものを消す。npm と uv は見ない)。
+- M-p で check を出す。
+
+### 毎日の見はり
+
+- 毎日の見はり: `aish-pkg report DIR [PREV]` が check をまるごと回して DIR に `updates.json` (改善の種として、Linux (kernel.org
+  の安定版と mainline が手本の test/sysdiff/linux.sum より新しいもの)、CI (main の unix がしくじっていれば)、todo.json の open
+  と doing の課題も。まだ上げていない新しい版、タグだけで tarball がまだないもの、直っていない CVE、見られなかったもの。PREV
+  (前の日のもの) から、はじめて見た日 `since` をうけつぐ) と `updates.atom` (そのやること (新しい版と CVE) の Atom の feed。id
+  はパッケージと版か CVE の番号なので、同じものは次の日も同じ id) を書き、CI (`.github/workflows/pkg.yml` の report、毎日と手で)
+  が GitHub のリリース `pkg-updates` に置く。
+- AI は aigpt の feed (`aios-pkg`: https://github.com/syui/aios/releases/download/pkg-updates/updates.atom) の `fetch_feed`
+  で新しく出たものだけを見て、`pkg_check` の `daily: true` で報告をすぐ読む (見に行かない)。
+- CI は作るのも送るのもしない (送るのは手元の ai の鍵で)。
+
+### コマンド
+
+- `aish-pkg check` / `edit NAME [VER] [--rebuild]` / `build NAME` / `fetch NAME` / `test NAME [--vm]` / `push` /
+  `scan [NAME...]` (repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies と needs で。depends にない NEEDED は、
+  それのあるパッケージも) / `rebuild [NAME...] [--unrecorded] [--force] [--fail-fast] [--push] [--vm] [--dry]` /
+  `update [NAME...] [--daily] [--fail-fast] [--push] [--vm] [--dry]` / `report DIR [PREV]` とコマンドでも
+  (`check --json NAME...` は CI が読む 1 行の JSON)
+
 ## 状態の木 (aios get)
 
 | PATH | 中身 |
