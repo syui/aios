@@ -436,6 +436,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
     let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::prof::span) } else { None };
+    // 監査 (audit_syscall_entry: 入れもののあるスレッドだけ)
+    if p.audit.is_some() {
+        crate::audit::syscall_entry(nr, &a);
+    }
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -707,6 +711,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
+    if proc::current().audit.is_some() {
+        crate::audit::syscall_exit(r.unwrap_or_else(|e| e));
+    }
     strace(nr, &a, r);
     // しくじったわけ (why.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
     if let Err(e) = r

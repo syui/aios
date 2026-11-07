@@ -295,6 +295,14 @@ pub fn show_uid(u: u32) -> u32 {
     }
 }
 
+/// show_uid と同じだが、地図にないものは -1 (from_kuid: /proc/PID/loginuid)
+pub fn show_uid_raw(u: u32) -> u32 {
+    match &crate::proc::current_cred_ref().ns.user {
+        Some(n) if u != u32::MAX => n.maps.borrow().uid.iter().flatten().find(|&&(_, o, c)| u >= o && u - o < c).map_or(u32::MAX, |&(i, o, _)| i + (u - o)),
+        _ => u,
+    }
+}
+
 pub fn show_gid(g: u32) -> u32 {
     match &crate::proc::current_cred_ref().ns.user {
         Some(n) => inside(&n.maps.borrow().gid, g),

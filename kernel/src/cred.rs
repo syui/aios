@@ -71,10 +71,14 @@ pub struct Cred {
     pub aa_token: u64,
     /// AUDIT_TTY_SET の設定 (Linux は signal_struct の audit_tty: fork で受けつぎ、exec でも消えない。audit.rs)
     pub audit_tty: u32,
+    /// ログインした人と、そのセッションの番号 (/proc/PID/loginuid と sessionid。audit の記録の auid= ses=)。
+    /// u32::MAX はまだない。fork で受けつぎ、exec でも setuid でも変わらない (Linux は task_struct)
+    pub loginuid: u32,
+    pub sessionid: u32,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0 };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)

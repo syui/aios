@@ -1011,6 +1011,17 @@ fn controlling_of(sid: u32) -> Option<TtyRef> {
     all().into_iter().find(|t| t.borrow().session == sid)
 }
 
+/// 今のプロセスの制御端末の名前 (audit の記録の tty=: Linux の tty_name。なければ "(none)")
+pub fn audit_name() -> alloc::string::String {
+    match controlling().as_ref().map(|t| match &t.borrow().dev {
+        Dev::Console => "ttyAMA0".into(),
+        Dev::Pty(p) => alloc::format!("pts{}", p.index),
+    }) {
+        Some(n) => n,
+        None => "(none)".into(),
+    }
+}
+
 /// 開いた口の名前 (/proc/PID/fd/N)
 pub fn name(tty: &TtyRef, master: bool) -> alloc::string::String {
     match &tty.borrow().dev {

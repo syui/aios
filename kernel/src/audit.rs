@@ -23,8 +23,11 @@
 // - ユーザーの記録は audit が off なら捨てる (AUDIT_USER_AVC だけは off でも)。1 バイトより短いものは EINVAL、終わりの
 //   1 バイトは NUL にする (msg='...' に出るのはそのまえまで)
 // - AUDIT_SIGNAL_INFO: auditd に SIGTERM / SIGHUP / SIGUSR1 / SIGUSR2 を送った最後のもの (uid、pid、ラベル: unconfined は空)
-// - のこり: ルール (auditctl -a、システムコールの監査。AUDIT_ADD_RULE / DEL_RULE / MAKE_EQUIV は EOPNOTSUPP)、loginuid と
-//   session (いつも 4294967295)、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)
+// - loginuid と sessionid (/proc/PID/loginuid と sessionid、記録の auid= ses=): 書けるのは自分だけ (set_loginuid)
+// - システムコールの入れもの (Ctx: audit を一度 on にしたあとに作ったスレッド): そのスレッドのことの記録 (log_task) を
+//   出したシステムコールは、出口で SYSCALL、PROCTITLE、EOE も (Linux 7.4 は記録が出ると dummy をやめる)
+// - のこり: ルール (auditctl -a、システムコールのフィルタ。AUDIT_ADD_RULE / DEL_RULE / MAKE_EQUIV は EOPNOTSUPP)、
+//   PATH と CWD の記録、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)
 use crate::cell::Bkl;
 use crate::netlink::{self, NetlinkRef};
 use crate::proc;
@@ -32,7 +35,7 @@ use crate::spinlock::SpinLock;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 pub const NETLINK_AUDIT: u32 = 9;
 /// 記録の写しを受ける組 (AUDIT_NLGRP_READLOG。ほかの組 (32 まで) にも入れるが、なにも来ない)
@@ -57,6 +60,7 @@ const AUDIT_LIST: u16 = 1002;
 const AUDIT_ADD: u16 = 1003;
 const AUDIT_DEL: u16 = 1004;
 const AUDIT_USER: u16 = 1005;
+const AUDIT_LOGIN: u16 = 1006;
 const AUDIT_SIGNAL_INFO: u16 = 1010;
 const AUDIT_ADD_RULE: u16 = 1011;
 const AUDIT_DEL_RULE: u16 = 1012;
@@ -69,6 +73,9 @@ const AUDIT_SET_FEATURE: u16 = 1018;
 const AUDIT_GET_FEATURE: u16 = 1019;
 const AUDIT_USER_AVC: u16 = 1107;
 const AUDIT_USER_TTY: u16 = 1124;
+const AUDIT_SYSCALL: u16 = 1300;
+const AUDIT_EOE: u16 = 1320;
+const AUDIT_PROCTITLE: u16 = 1327;
 const AUDIT_CONFIG_CHANGE: u16 = 1305;
 const AUDIT_FEATURE_CHANGE: u16 = 1328;
 const AUDIT_REPLACE: u16 = 1329;
@@ -152,6 +159,9 @@ static ST: Bkl<State> = Bkl::new(State {
 /// 記録の番号 (audit_serial: 1 から)
 static SERIAL: AtomicU32 = AtomicU32::new(1);
 
+/// audit を一度でも on にしたか (audit_ever_enabled: このあとに作るスレッドには Ctx をつける)
+static EVER: AtomicBool = AtomicBool::new(false);
+
 /// 受け口の中で出た記録 (種類と文字。答えと ACK のあとに出す)。None は受け口の外
 static DEFER: Bkl<Option<Vec<(u16, String)>>> = Bkl::new(None);
 
@@ -177,10 +187,42 @@ pub fn init() {
 
 // ---- 記録 ----
 
-/// 記録を出す (audit_log_start から audit_log_end): body は "audit(...): " のうしろ。受け口の中ならあとで
+/// 記録を出す (audit_log_start(NULL, ...) から audit_log_end): body は "audit(...): " のうしろ。受け口の中ならあとで
 pub fn log(typ: u16, body: &str) {
     let ns = crate::timer::epoch_ns();
-    let text = format!("audit({}.{:03}:{}): {}", ns / 1_000_000_000, ns / 1_000_000 % 1000, SERIAL.fetch_add(1, Relaxed), body);
+    put(typ, ns, SERIAL.fetch_add(1, Relaxed), body);
+}
+
+/// いまのスレッドのことの記録 (audit_log_start(audit_context(), ...)): システムコールの中なら、その時刻と番号で、
+/// そのシステムコールの終わりに SYSCALL の記録も出す (auditsc_get_stamp と「dummy をやめる」)
+pub fn log_task(typ: u16, body: &str) {
+    let locked = crate::smp::holding() || crate::smp::online() <= 1;
+    let stamp = match proc::try_current().and_then(|p| p.audit.as_mut()).filter(|_| locked) {
+        Some(c) => {
+            c.dummy = false;
+            if c.in_syscall {
+                if c.serial == 0 {
+                    c.serial = SERIAL.fetch_add(1, Relaxed);
+                }
+                if !c.prio {
+                    (c.prio, c.record) = (true, true);
+                }
+                Some((c.ctime, c.serial))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    match stamp {
+        Some((ns, serial)) => put(typ, ns, serial, body),
+        None => log(typ, body),
+    }
+}
+
+/// 時刻と番号をつけて出す
+fn put(typ: u16, ns: u64, serial: u32, body: &str) {
+    let text = format!("audit({}.{:03}:{}): {}", ns / 1_000_000_000, ns / 1_000_000 % 1000, serial, body);
     // 大きなロックの外 (ほかの CPU が動いているとき) からは、状態もソケットも触らずに kmsg へ
     if !crate::smp::holding() && crate::smp::online() > 1 {
         printk(typ, &text);
@@ -213,9 +255,9 @@ fn emit(typ: u16, text: String) {
     printk(typ, &text);
 }
 
-/// kmsg へ (kauditd_printk_skb: 5 秒に 10 こまで)
+/// kmsg へ (kauditd_printk_skb: 5 秒に 10 こまで。AUDIT_EOE は出さない)
 fn printk(typ: u16, text: &str) {
-    if ratelimit("kauditd_printk_skb") {
+    if typ != AUDIT_EOE && ratelimit("kauditd_printk_skb") {
         crate::println!("audit: type={} {}", typ, text);
     }
 }
@@ -299,9 +341,10 @@ fn reset() {
     (s.pid, s.portid) = (0, 0);
 }
 
-/// "auid=... ses=..." (audit_log_session_info。loginuid はまだないので、いつも決まっていないもの)
+/// "auid=... ses=..." (audit_log_session_info: いまのプロセスの loginuid と sessionid)
 fn session() -> String {
-    format!("auid={} ses={}", UNSET, UNSET)
+    let c = &proc::current().cred;
+    format!("auid={} ses={}", c.loginuid, c.sessionid)
 }
 
 /// " subj=ラベル" (audit_log_task_context: AppArmor がなければなし)
@@ -332,11 +375,12 @@ pub fn multicast(group: u32, op: &str, ok: bool) {
     let p = proc::current();
     let (comm, exe) = comm_exe();
     let body = format!(
-        "pid={} uid={} auid={} tty=(none) ses={}{} comm={} exe={} nl-mcgrp={} op={} res={}",
+        "pid={} uid={} auid={} tty={} ses={}{} comm={} exe={} nl-mcgrp={} op={} res={}",
         p.tgid,
         p.cred.uid,
-        UNSET,
-        UNSET,
+        p.cred.loginuid,
+        crate::tty::audit_name(),
+        p.cred.sessionid,
         subj(),
         comm,
         exe,
@@ -344,7 +388,7 @@ pub fn multicast(group: u32, op: &str, ok: bool) {
         op,
         ok as u32
     );
-    log(AUDIT_EVENT_LISTENER, &body);
+    log_task(AUDIT_EVENT_LISTENER, &body);
 }
 
 /// audit_log_task_info: " ppid=… pid=… auid=… uid=… … tty=… ses=… comm=… exe=… subj=…"
@@ -353,10 +397,10 @@ fn task_info() -> String {
     let p = proc::current();
     let c = &p.cred;
     format!(
-        " ppid={} pid={} auid={} uid={} gid={} euid={} suid={} fsuid={} egid={} sgid={} fsgid={} tty=(none) ses={} comm={} exe={}{}",
+        " ppid={} pid={} auid={} uid={} gid={} euid={} suid={} fsuid={} egid={} sgid={} fsgid={} tty={} ses={} comm={} exe={}{}",
         p.ppid,
         p.tgid,
-        UNSET,
+        c.loginuid,
         c.uid,
         c.gid,
         c.euid,
@@ -365,7 +409,8 @@ fn task_info() -> String {
         c.egid,
         c.sgid,
         c.egid,
-        UNSET,
+        crate::tty::audit_name(),
+        c.sessionid,
         comm,
         exe,
         subj()
@@ -383,7 +428,7 @@ fn untrusted(s: &[u8]) -> String {
 
 /// 設定を変えた記録 (audit_log_config_change)
 fn config_change(name: &str, new: u32, old: u32, res: bool) {
-    log(AUDIT_CONFIG_CHANGE, &format!("op=set {}={} old={} {}{} res={}", name, new, old, session(), subj(), res as u32));
+    log_task(AUDIT_CONFIG_CHANGE, &format!("op=set {}={} old={} {}{} res={}", name, new, old, session(), subj(), res as u32));
 }
 
 /// audit_do_config_change: on なら残し、固定 (enabled 2) でなければ変える (固定なら EPERM)
@@ -400,6 +445,183 @@ fn do_config_change(name: &str, field: fn(&mut State) -> &mut u32, new: u32) -> 
     Ok(())
 }
 
+// ---- システムコールの入れもの (auditsc.c の audit_context) ----
+
+/// スレッドごとの入れもの (Linux の struct audit_context のうち使うもの)。システムコールの入口で番号と引数と時刻を
+/// 覚え、そのあいだに出たこのスレッドの記録 (log_task) があれば、出口で SYSCALL と PROCTITLE と EOE の記録を出す
+pub struct Ctx {
+    /// システムコールの中 (AUDIT_CTX_SYSCALL)
+    in_syscall: bool,
+    /// 出口で出すものがない (ルールがなく、まだ記録もない)
+    dummy: bool,
+    /// 出口で出す (AUDIT_STATE_RECORD) と、それを決めたか (prio)
+    record: bool,
+    prio: bool,
+    major: u64,
+    argv: [u64; 4],
+    /// 入口の時刻と、記録の番号 (0 はまだ)
+    ctime: u64,
+    serial: u32,
+    /// PROCTITLE の中身 (はじめて出すときに作り、このスレッドのあいだ使う: exec しても変わらない。Linux と同じ)
+    proctitle: Option<Vec<u8>>,
+}
+
+/// fork で作るスレッドの入れもの (audit_alloc: audit を一度も on にしていなければ作らない)
+pub fn alloc() -> Option<alloc::boxed::Box<Ctx>> {
+    if !EVER.load(Relaxed) {
+        return None;
+    }
+    Some(alloc::boxed::Box::new(Ctx { in_syscall: false, dummy: true, record: false, prio: false, major: 0, argv: [0; 4], ctime: 0, serial: 0, proctitle: None }))
+}
+
+/// システムコールの入口 (__audit_syscall_entry): audit が on なら、番号と引数と時刻を覚える
+pub fn syscall_entry(nr: u64, a: &[u64; 6]) {
+    if st().enabled == OFF {
+        return;
+    }
+    let Some(c) = proc::current().audit.as_mut() else { return };
+    // ルールはまだないので、いつも記録が出るまで dummy (audit_n_rules が 0)
+    c.dummy = true;
+    c.major = nr;
+    c.argv = [a[0], a[1], a[2], a[3]];
+    c.in_syscall = true;
+    c.record = false;
+    c.ctime = crate::timer::epoch_ns() / 1_000_000 * 1_000_000;
+}
+
+/// システムコールの出口 (__audit_syscall_exit): 記録を出すことになっていれば出し、入れものを空にする
+pub fn syscall_exit(ret: i64) {
+    let Some(c) = proc::current().audit.as_mut() else { return };
+    let emit = c.in_syscall && !c.dummy && c.record;
+    c.in_syscall = false;
+    if emit {
+        log_exit(ret);
+    }
+    let Some(c) = proc::current().audit.as_mut() else { return };
+    if !c.dummy {
+        (c.record, c.prio, c.serial, c.ctime, c.major, c.argv) = (false, false, 0, 0, 0, [0; 4]);
+    }
+}
+
+/// audit_log_exit: SYSCALL、PROCTITLE、EOE (同じ時刻と番号で)
+fn log_exit(ret: i64) {
+    const ERESTARTSYS: i64 = 512;
+    const ERESTART_RESTARTBLOCK: i64 = 516;
+    const ENOIOCTLCMD: i64 = 515;
+    const EINTR: i64 = 4;
+    let code = if (-ERESTART_RESTARTBLOCK..=-ERESTARTSYS).contains(&ret) && ret != -ENOIOCTLCMD { -EINTR } else { ret };
+    let success = !(-4095..0).contains(&ret);
+    let (major, argv, ns, serial) = {
+        let c = proc::current().audit.as_mut().unwrap();
+        if c.serial == 0 {
+            c.serial = SERIAL.fetch_add(1, Relaxed);
+        }
+        (c.major, c.argv, c.ctime, c.serial)
+    };
+    let body = format!(
+        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items=0{} key=(null)",
+        crate::seccomp::AUDIT_ARCH_AARCH64,
+        major,
+        if success { "yes" } else { "no" },
+        code,
+        argv[0],
+        argv[1],
+        argv[2],
+        argv[3],
+        task_info()
+    );
+    put(AUDIT_SYSCALL, ns, serial, &body);
+    put(AUDIT_PROCTITLE, ns, serial, &format!("proctitle={}", proctitle()));
+    put(AUDIT_EOE, ns, serial, "");
+}
+
+/// PROCTITLE の中身: 引数の場所の 128 バイトまで、終わりの表示できない文字を落として (audit_proctitle_rtrim)。
+/// 読めなければ (null)
+fn proctitle() -> String {
+    const MAX: usize = 128;
+    let p = proc::current();
+    if p.audit.as_ref().is_some_and(|c| c.proctitle.is_none()) {
+        let b = p.mm.as_ref().and_then(|_| {
+            let (a, e, _) = p.mm().args;
+            if a == 0 || e <= a {
+                return None;
+            }
+            let mut b = alloc::vec![0u8; (e - a).min(MAX)];
+            let pt = &mut p.mm().pt;
+            let _h = pt.hold();
+            pt.copy_in(&mut b, a)?;
+            Some(b)
+        });
+        if let Some(mut b) = b {
+            let printable = |c: u8| (0x20..0x7f).contains(&c);
+            while b.len() > 1 && !printable(b[b.len() - 1]) {
+                b.pop();
+            }
+            if b.len() == 1 && !printable(b[0]) {
+                b.clear();
+            }
+            if !b.is_empty() {
+                p.audit.as_mut().unwrap().proctitle = Some(b);
+            }
+        }
+    }
+    match p.audit.as_ref().and_then(|c| c.proctitle.as_ref()) {
+        Some(b) => untrusted(b),
+        None => untrusted(b"(null)"),
+    }
+}
+
+// ---- loginuid と sessionid (auditsc.c の audit_set_loginuid、/proc/PID/loginuid) ----
+
+/// セッションの番号 (session_id: 1 から。u32::MAX はとばす)
+static SESSION: AtomicU32 = AtomicU32::new(0);
+
+/// /proc/self/loginuid に書いた (proc_loginuid_write のあと): 決めるか (UNSET なら) 外す。決まっていなければだれでも、
+/// 決まっていれば CAP_AUDIT_CONTROL (loginuid_immutable ならだれも、only_unset_loginuid なら外すだけ)。決めると
+/// 新しいセッションの番号。audit が on なら AUDIT_LOGIN の記録
+pub fn set_loginuid(new: u32) -> Result<(), i64> {
+    let (old, old_ses) = {
+        let c = &proc::current().cred;
+        (c.loginuid, c.sessionid)
+    };
+    let features = st().features;
+    let rc = if old == UNSET {
+        Ok(())
+    } else if features & 2 != 0 || !proc::current().cred.capable(crate::cred::CAP_AUDIT_CONTROL) || (features & 1 != 0 && new != UNSET) {
+        Err(-EPERM)
+    } else {
+        Ok(())
+    };
+    let mut ses = UNSET;
+    if rc.is_ok() {
+        if new != UNSET {
+            ses = SESSION.fetch_add(1, Relaxed).wrapping_add(1);
+            if ses == UNSET {
+                ses = SESSION.fetch_add(1, Relaxed).wrapping_add(1);
+            }
+        }
+        let c = &mut proc::current().cred;
+        (c.loginuid, c.sessionid) = (new, ses);
+    }
+    if st().enabled != OFF {
+        let p = proc::current();
+        let body = format!(
+            "pid={} uid={}{} old-auid={} auid={} tty={} old-ses={} ses={} res={}",
+            p.tgid,
+            p.cred.uid,
+            subj(),
+            old,
+            new,
+            crate::tty::audit_name(),
+            old_ses,
+            ses,
+            rc.is_ok() as u32
+        );
+        log_task(AUDIT_LOGIN, &body);
+    }
+    rc
+}
+
 // ---- シグナル (audit_signal_info) ----
 
 /// tgid に sig が送られる: auditd への止める・読みなおすシグナルなら、送ったものを覚える
@@ -413,7 +635,8 @@ pub fn signal_info(tgid: u32, sig: i32) {
         return;
     }
     let p = proc::current();
-    (s.sig_pid, s.sig_uid) = (p.tgid as i32, p.cred.uid);
+    // loginuid があればそれ、なければ uid
+    (s.sig_pid, s.sig_uid) = (p.tgid as i32, if p.cred.loginuid != UNSET { p.cred.loginuid } else { p.cred.uid });
     // ラベル (Linux 7.4 では unconfined のものは空になる)
     s.sig_ctx = crate::apparmor::secctx().filter(|c| c != "unconfined").unwrap_or_default();
 }
@@ -541,7 +764,7 @@ fn receive(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool, o
             }
             if st().enabled == LOCKED {
                 let op = if typ == AUDIT_ADD_RULE { "add_rule" } else { "remove_rule" };
-                log(AUDIT_CONFIG_CHANGE, &format!("{} op={} audit_enabled={} res=0", recv_head(), op, LOCKED));
+                log_task(AUDIT_CONFIG_CHANGE, &format!("{} op={} audit_enabled={} res=0", recv_head(), op, LOCKED));
                 return -EPERM;
             }
             -EOPNOTSUPP
@@ -553,7 +776,7 @@ fn receive(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool, o
         }
         AUDIT_TRIM => {
             if st().enabled != OFF {
-                log(AUDIT_CONFIG_CHANGE, &format!("{} op=trim res=1", recv_head()));
+                log_task(AUDIT_CONFIG_CHANGE, &format!("{} op=trim res=1", recv_head()));
             }
             0
         }
@@ -625,6 +848,9 @@ fn set(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool) -> Re
             return Err(-EINVAL);
         }
         do_config_change("audit_enabled", |s| &mut s.enabled, v)?;
+        if v != OFF {
+            EVER.store(true, Relaxed);
+        }
     }
     if mask & STATUS_FAILURE != 0 {
         let v = w(2);
@@ -762,5 +988,5 @@ fn feature_change(name: &str, old: u32, new: u32, old_lock: u32, new_lock: u32, 
         b(new_lock),
         res as u32
     );
-    log(AUDIT_FEATURE_CHANGE, &body);
+    log_task(AUDIT_FEATURE_CHANGE, &body);
 }

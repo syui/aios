@@ -957,10 +957,24 @@ Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や au
 - kmsg へは 5 秒に 10 こまで (printk_ratelimit: こえたものは捨て、次の窓のはじめに `kauditd_printk_skb: N callbacks
   suppressed`)。AppArmor の記録がたくさん出ても dmesg があふれない
 
-test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。kmsg のかぎりがあるので、ところどころで
+- loginuid と sessionid (/proc/PID/loginuid と sessionid: pam_loginuid が書く。記録の auid= ses=)。書けるのは自分の
+  ものだけ (ほかは EPERM、途中からは EINVAL、数でなければ EINVAL、大きすぎれば ERANGE)。決まっていなければだれでも、
+  決まっていれば CAP_AUDIT_CONTROL (AUDIT_SET_FEATURE の loginuid_immutable ならだれも、only_unset_loginuid なら外す
+  だけ)。決めるたびに新しい sessionid (1 から)、4294967295 を書くと外す。fork で受けつぎ、exec でも setuid でも
+  変わらない。audit が on なら AUDIT_LOGIN (1006: `old-auid=... auid=... old-ses=... ses=... res=1`)
+- システムコールの入れもの (Linux の audit_context): audit を一度でも on にしたあとに作ったスレッドにつく。audit が on
+  なら、システムコールの入口で番号と引数 4 つと時刻を覚え、そのあいだにそのスレッドのことの記録 (設定の変更、
+  AUDIT_LOGIN、組の出入り、AppArmor など) が出れば、それらと同じ時刻と番号で、出口に SYSCALL (1300: `arch=c00000b7
+  syscall=64 success=yes exit=4 a0=... items=0 ppid=... auid=... comm=... exe=... subj=... key=(null)`)、PROCTITLE
+  (1327: 引数の 128 バイトまで。はじめて出すときに作り、exec しても変わらない: Linux と同じ)、EOE (1320: kmsg には
+  出さない) を出す。ユーザーの記録 (AUDIT_USER_*) と TTY_SET はスレッドのことではないので出さない
+
+test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。test/loginuid.c (root で) は
+loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で読んでくらべて同じ (115 行)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
-AUDIT も入る (select)。のこり: ルール (auditctl -a、システムコールの監査: AUDIT_ADD_RULE / DEL_RULE / MAKE_EQUIV は
-EOPNOTSUPP)、loginuid と session (/proc/PID/loginuid: 記録ではいつも 4294967295)、TTY の入力の記録 (TTY_SET は覚えるだけ)、
+AUDIT も入る (select)。のこり: ルール (auditctl -a、システムコールの監査のフィルタ: AUDIT_ADD_RULE / DEL_RULE /
+MAKE_EQUIV は EOPNOTSUPP。ルールができたら、大きなロックなしの道のシステムコールも入口と出口を通す)、PATH と CWD と
+EXECVE の記録、終わるとき (exit_group) の記録、/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、
 backlog (記録はすぐ出すので行列がない)。
 
 ### ファイアウォール (nftables)

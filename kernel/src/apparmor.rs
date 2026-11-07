@@ -1327,7 +1327,7 @@ fn audit_head(kind: &str) -> String {
 
 /// 記録を出す (type=1400)
 fn audit_emit(s: &str) {
-    crate::audit::log(crate::audit::AUDIT_AVC, s);
+    crate::audit::log_task(crate::audit::AUDIT_AVC, s);
 }
 
 /// いまのプロセスのラベルの文字 (security_lsmprop_to_secctx: 記録の subj=)。AppArmor が切られていれば None

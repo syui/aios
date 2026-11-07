@@ -98,6 +98,9 @@ enum Node {
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
+    /// /proc/PID/loginuid と sessionid (ログインした人とそのセッション: audit.rs)
+    LoginUid(u32),
+    SessionId(u32),
     /// /proc/PID/attr (true なら attr/apparmor) と、その中の current exec prev (ATTRS の番号。apparmor.rs)
     AttrDir(u32, bool),
     Attr(u32, bool, u8),
@@ -159,6 +162,30 @@ fn thread(pid: u32, tid: u32) -> Result<&'static mut Proc, i64> {
 
 fn leader(pid: u32) -> Result<&'static mut Proc, i64> {
     proc::find_leader(pid).filter(|p| p.state != State::Zombie).ok_or(-ENOENT)
+}
+
+/// kstrtou32 (10 進): 頭の + と、終わりの改行 1 つはよい。数字がない・ほかの文字は EINVAL、大きすぎれば ERANGE
+fn kstrtou32(b: &[u8]) -> Result<u32, i64> {
+    const ERANGE: i64 = 34;
+    let b = b.strip_prefix(b"+").unwrap_or(b);
+    let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    let mut v: u64 = 0;
+    let mut over = false;
+    for &c in &b[..n] {
+        match v.checked_mul(10).and_then(|x| x.checked_add((c - b'0') as u64)) {
+            Some(x) => v = x,
+            None => over = true,
+        }
+    }
+    if over {
+        return Err(-ERANGE);
+    }
+    let rest = &b[n..];
+    let rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+    if n == 0 || !rest.is_empty() {
+        return Err(crate::why::inval());
+    }
+    u32::try_from(v).map_err(|_| -ERANGE)
 }
 
 /// leader と同じだが、終わってまだ回収されていないもの (ゾンビ) も: /proc/PID と stat、status、comm はある (Linux と同じ)
@@ -225,6 +252,8 @@ impl ProcInode {
             Node::NsDir(p) => (p as u64) << 16 | 14,
             Node::PidMounts(p) => (p as u64) << 16 | 15,
             Node::MountInfo(p) => (p as u64) << 16 | 26,
+            Node::LoginUid(p) => (p as u64) << 16 | 27,
+            Node::SessionId(p) => (p as u64) << 16 | 28,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
             Node::TaskDir(p) => (p as u64) << 16 | 20,
             Node::Task(_, t) => (t as u64) << 16 | 21,
@@ -255,7 +284,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) => Some(p),
             _ => None,
         }
     }
@@ -484,6 +513,9 @@ impl ProcInode {
             }
             Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
             Node::Comm(pid) => format!("{}\n", leader_any(pid)?.comm()),
+            // 改行なし (Linux の proc_loginuid_read と proc_sessionid_read)
+            Node::LoginUid(pid) => format!("{}", crate::ns::show_uid_raw(leader(pid)?.cred.loginuid)),
+            Node::SessionId(pid) => format!("{}", leader(pid)?.cred.sessionid),
             Node::PidMounts(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone()),
             // そのプロセスの namespace の表を、そのプロセスの chroot の根から
             Node::MountInfo(pid) => {
@@ -739,7 +771,7 @@ impl Inode for ProcInode {
             Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             Node::Fd(..) => S_IFLNK | 0o700,
-            Node::Strace | Node::Bkl | Node::IdMap(..) => S_IFREG | 0o644,
+            Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) => S_IFREG | 0o644,
             Node::NetConntrack => S_IFREG | 0o440,
             _ => S_IFREG | 0o444,
         };
@@ -772,7 +804,21 @@ impl Inode for ProcInode {
         Ok(n)
     }
 
-    fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+    fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/PID/loginuid (proc_loginuid_write): 自分のものだけ、はじめから 1 度に。番号 (u32::MAX は外す) は、
+        // 読むときの user namespace の地図で外の番号に
+        if let Node::LoginUid(pid) = self.node {
+            if leader(pid)?.pid != proc::current().pid {
+                return Err(-EPERM);
+            }
+            if off != 0 {
+                return Err(crate::why::inval());
+            }
+            let v = kstrtou32(&b[..b.len().min(34)])?;
+            let uid = if v == u32::MAX { v } else { crate::ns::take_uid(v)? };
+            crate::audit::set_loginuid(uid)?;
+            return Ok(b.len());
+        }
         // /proc/PID/attr/current と exec: AppArmor の change_profile (自分のものだけ: Linux も current でなければ EACCES)
         if let Node::Attr(pid, _, k) = self.node {
             if leader(pid)?.pid != proc::current().pid {
@@ -838,7 +884,7 @@ impl Inode for ProcInode {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..) | Node::Attr(..)) {
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_)) {
             return Ok(());
         }
         Err(-EACCES)
@@ -956,6 +1002,8 @@ impl Inode for ProcInode {
             (Node::Pid(p), "fdinfo") => Node::FdInfoDir(p),
             (Node::Pid(p), "ns") => Node::NsDir(p),
             (Node::Pid(p), "attr") => Node::AttrDir(p, false),
+            (Node::Pid(p), "loginuid") => Node::LoginUid(p),
+            (Node::Pid(p), "sessionid") => Node::SessionId(p),
             (Node::AttrDir(p, false), "apparmor") => Node::AttrDir(p, true),
             (Node::AttrDir(p, a), _) => Node::Attr(p, a, ATTRS.iter().position(|x| *x == name).ok_or(-ENOENT)? as u8),
             (Node::Pid(p), "task") => Node::TaskDir(p),
@@ -1090,6 +1138,8 @@ impl Inode for ProcInode {
                 add("fdinfo".into(), Node::FdInfoDir(p));
                 add("ns".into(), Node::NsDir(p));
                 add("attr".into(), Node::AttrDir(p, false));
+                add("loginuid".into(), Node::LoginUid(p));
+                add("sessionid".into(), Node::SessionId(p));
             }
             Node::AttrDir(p, a) => {
                 for (k, n) in ATTRS.iter().enumerate() {

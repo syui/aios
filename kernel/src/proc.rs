@@ -335,6 +335,8 @@ pub struct Proc {
     /// set_robust_list の頭 (struct robust_list_head のユーザーの番地。0 はなし)。終わるときと exec で
     /// futex::exit_robust_list がたどる。fork の子は 0 から (Linux の futex_init_task)
     pub robust_list: usize,
+    /// システムコールの監査の入れもの (audit.rs の Ctx: audit を一度でも on にしたあとに作ったスレッドだけ)
+    pub audit: Option<alloc::boxed::Box<crate::audit::Ctx>>,
     /// はじめて走るとき (forkret)、大きなロックを放してから自分の tid を書く場所 (CLONE_CHILD_SETTID。Linux の
     /// schedule_tail と同じ。fork の子では書くと COW になるので、前は親の clone が大きなロックを持ったまま写していた)
     set_child_tid: usize,
@@ -461,6 +463,7 @@ impl Proc {
         fallible: 0,
         clear_tid: 0,
         robust_list: 0,
+        audit: None,
         set_child_tid: 0,
         vfork_parent: 0,
         exec_takeover: None,
@@ -1874,6 +1877,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     child.cred = cred;
     child.comm = parent.comm;
+    child.audit = crate::audit::alloc();
     child.spec_ssb = parent.spec_ssb;
     child.thread = thread;
     if thread {
