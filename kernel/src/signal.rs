@@ -131,6 +131,11 @@ pub struct PosixTimer {
     pub deadline: u64,
     pub interval: u64,
     pub overrun: i32,
+    /// CPU の時計のタイマ (Linux の posix-cpu-timers): その時計と、鳴る CPU 時間 (ns、0 なら止まっている) と間隔 (ns)。
+    /// 見るのは tick ごと (Linux も tick ごと)
+    pub cpu: Option<crate::timer::Clock>,
+    pub cpu_deadline: u64,
+    pub cpu_interval: u64,
 }
 
 /// 落ちたプロセスの知らせ (シリアルにも出る) は 5 秒に 10 こまで (Linux の printk_ratelimit: 5 * HZ に 10)。ロボットの子のように、
@@ -992,6 +997,19 @@ pub fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
     const SIGEV_SIGNAL: i32 = 0;
     const SIGEV_NONE: i32 = 1;
     const SIGEV_THREAD_ID: i32 = 4;
+    const EOPNOTSUPP: i64 = 95;
+    const CAP_WAKE_ALARM: u32 = 35;
+    // 時計 (Linux の clockid_to_kclock): 知らないものは EINVAL、タイマのない時計 (MONOTONIC_RAW、REALTIME_COARSE、
+    // MONOTONIC_COARSE、fd の時計) は EOPNOTSUPP。CPU の時計がいないもの、ALARM の時計は CAP_WAKE_ALARM がなければ
+    // EPERM は、sigevent を見たあと (Linux の kc->timer_create)
+    let clk = clock as i32;
+    match clk {
+        0..=3 | 7..=9 | 11 => {}
+        4..=6 => return Err(-EOPNOTSUPP),
+        c if c < 0 && c & 7 == 3 => return Err(-EOPNOTSUPP),
+        c if c < 0 => {}
+        _ => return Err(crate::why::inval()),
+    }
     let (mut signo, mut notify, mut tid) = (SIGALRM, SIGEV_SIGNAL, 0u32);
     let mut value = 0u64;
     if sev != 0 {
@@ -1006,12 +1024,17 @@ pub fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
             return Err(crate::why::inval());
         }
     }
+    let c = crate::timer::clock_of(clk, false)?;
+    if matches!(clk, 8 | 9) && !crate::cred::current().capable(CAP_WAKE_ALARM) {
+        return Err(-EPERM);
+    }
+    let cpu = matches!(c, crate::timer::Clock::Cpu { .. }).then_some(c);
     let leader = proc::current_leader();
     let id = (0..).find(|i| !leader.timers.iter().any(|t| t.id == *i)).unwrap();
     if value == 0 && sev == 0 {
         value = id as u64;
     }
-    leader.timers.push(PosixTimer { id, realtime: clock == 0, signo, notify, tid, value, deadline: 0, interval: 0, overrun: 0 });
+    leader.timers.push(PosixTimer { id, realtime: c == crate::timer::Clock::Real, signo, notify, tid, value, deadline: 0, interval: 0, overrun: 0, cpu, cpu_deadline: 0, cpu_interval: 0 });
     out(idp, &id.to_le_bytes())?;
     Ok(0)
 }
@@ -1028,6 +1051,20 @@ pub fn timer_settime(id: i32, flags: u64, new: usize, old: usize) -> R {
     let interval = read_timespec(new)?;
     let value = read_timespec(new + 16)?;
     let t = timer_of(id)?;
+    // CPU の時計: その時計の ns で覚える (相手がもういなければ 0 から)
+    if let Some(c) = t.cpu {
+        let now = crate::timer::clock_ns(c).unwrap_or(0);
+        t.cpu_interval = interval;
+        t.cpu_deadline = if value == 0 {
+            0
+        } else if flags & TIMER_ABSTIME != 0 {
+            value.max(1)
+        } else {
+            now.saturating_add(value)
+        };
+        t.overrun = 0;
+        return Ok(0);
+    }
     t.interval = ns_to_ticks(interval);
     t.deadline = if value == 0 {
         0
@@ -1043,9 +1080,15 @@ pub fn timer_settime(id: i32, flags: u64, new: usize, old: usize) -> R {
 
 pub fn timer_gettime(id: i32, cur: usize) -> R {
     let t = *timer_of(id)?;
-    let left = if t.deadline == 0 { 0 } else { ticks_to_ns(t.deadline.saturating_sub(crate::timer::ticks())) };
+    let (left, interval) = match t.cpu {
+        Some(c) => {
+            let now = crate::timer::clock_ns(c).unwrap_or(0);
+            (if t.cpu_deadline == 0 { 0 } else { t.cpu_deadline.saturating_sub(now).max(1) }, t.cpu_interval)
+        }
+        None => (if t.deadline == 0 { 0 } else { ticks_to_ns(t.deadline.saturating_sub(crate::timer::ticks())) }, ticks_to_ns(t.interval)),
+    };
     let mut b = [0u8; 32];
-    b[..16].copy_from_slice(&timespec(ticks_to_ns(t.interval)));
+    b[..16].copy_from_slice(&timespec(interval));
     b[16..].copy_from_slice(&timespec(left));
     out(cur, &b)?;
     Ok(0)
@@ -1073,6 +1116,24 @@ pub fn tick(now: u64) {
         }
         let mut fire: Vec<PosixTimer> = Vec::new();
         for t in p.timers.iter_mut() {
+            // CPU の時計: その時計が期限をこえたら (もういない相手のものは鳴らない)
+            if let Some(c) = t.cpu {
+                if t.cpu_deadline == 0 {
+                    continue;
+                }
+                let Ok(v) = crate::timer::clock_ns(c) else { continue };
+                if v >= t.cpu_deadline {
+                    fire.push(*t);
+                    t.cpu_deadline = if t.cpu_interval == 0 {
+                        0
+                    } else {
+                        let missed = (v - t.cpu_deadline) / t.cpu_interval;
+                        t.overrun = missed.min(i32::MAX as u64) as i32;
+                        t.cpu_deadline + (missed + 1) * t.cpu_interval
+                    };
+                }
+                continue;
+            }
             if t.deadline != 0 && t.deadline <= now {
                 fire.push(*t);
                 t.deadline = if t.interval == 0 { 0 } else { now + t.interval };

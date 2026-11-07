@@ -103,6 +103,87 @@ pub fn epoch_ns() -> u64 {
     BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + uptime_ns()
 }
 
+// ---- 時計 (clock_gettime / clock_getres / timer_create の clockid: Linux の posix_clocks と posix-cpu-timers) ----
+
+/// 1 tick の ns (Linux の TICK_NSEC)。aios のタイマは tick の境めで鳴るので、壁と起動からの時計の細かさはこれ
+pub const TICK_NS: u64 = 1_000_000_000 / HZ;
+
+/// clockid の中身
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Clock {
+    /// 壁の時計 (REALTIME 0、REALTIME_COARSE 5、REALTIME_ALARM 8、TAI 11: TAI と UTC の差は 0)
+    Real,
+    /// 起動からの時計 (MONOTONIC 1、MONOTONIC_RAW 4、MONOTONIC_COARSE 6、BOOTTIME 7、BOOTTIME_ALARM 9: 眠らないので同じ)
+    Mono,
+    /// CPU の時計: スレッドのものか (でなければプロセス)、本当の番号 (tid か tgid)、PROF (0) / VIRT (1) / SCHED (2)
+    Cpu { thread: bool, pid: u32, which: u8 },
+}
+
+/// clockid をほどく (Linux の clockid_to_kclock と pid_for_clock)。PROCESS_CPUTIME_ID (2) と THREAD_CPUTIME_ID (3) は
+/// 自分、負のものは CPU の時計 (~pid << 3 | スレッド 4 | which) で、pid 0 は自分。スレッドの時計は同じスレッド
+/// グループのものだけ、プロセスの時計はスレッドグループの代表 (gettime なら自分のスレッドの番号も)。知らない時計、
+/// いないもの、which が 3 (と fd の時計) は EINVAL
+pub fn clock_of(clk: i32, gettime: bool) -> Result<Clock, i64> {
+    const EINVAL: i64 = 22;
+    let me = crate::proc::current();
+    match clk {
+        0 | 5 | 8 | 11 => Ok(Clock::Real),
+        1 | 4 | 6 | 7 | 9 => Ok(Clock::Mono),
+        2 => Ok(Clock::Cpu { thread: false, pid: me.tgid, which: 2 }),
+        3 => Ok(Clock::Cpu { thread: true, pid: me.pid, which: 2 }),
+        c if c < 0 => {
+            let which = (c & 3) as u8;
+            let thread = c & 4 != 0;
+            if which == 3 {
+                return Err(-EINVAL);
+            }
+            let upid = !(c >> 3) as u32;
+            if upid == 0 {
+                return Ok(Clock::Cpu { thread, pid: if thread { me.pid } else { me.tgid }, which });
+            }
+            let g = crate::ns::to_global(upid).ok_or(-EINVAL)?;
+            if thread {
+                let t = crate::proc::find_thread(g).ok_or(-EINVAL)?;
+                if t.tgid != me.tgid {
+                    return Err(-EINVAL);
+                }
+                return Ok(Clock::Cpu { thread, pid: g, which });
+            }
+            if gettime && g == me.pid {
+                return Ok(Clock::Cpu { thread, pid: me.tgid, which });
+            }
+            crate::proc::find_leader_any(g).ok_or(-EINVAL)?;
+            Ok(Clock::Cpu { thread, pid: g, which })
+        }
+        _ => Err(-EINVAL),
+    }
+}
+
+/// 時計のいまの値 (ns)。CPU の時計: SCHED と PROF は走った時間、VIRT はユーザーモードの tick。もういなければ EINVAL
+pub fn clock_ns(c: Clock) -> Result<u64, i64> {
+    const EINVAL: i64 = 22;
+    Ok(match c {
+        Clock::Real => epoch_ns(),
+        Clock::Mono => uptime_ns(),
+        Clock::Cpu { thread: true, pid, which } => {
+            let t = crate::proc::find_thread(pid).ok_or(-EINVAL)?;
+            if which == 1 { t.utime * TICK_NS } else { crate::proc::cpu_ns(t) }
+        }
+        Clock::Cpu { thread: false, pid, which } => {
+            crate::proc::find_leader_any(pid).ok_or(-EINVAL)?;
+            if which == 1 { crate::proc::group_utime(pid) * TICK_NS } else { crate::proc::group_cpu_ns(pid) }
+        }
+    })
+}
+
+/// 時計の細かさ (ns): CPU の SCHED は 1、ほかは tick (Linux も高精度タイマがなければ tick)
+pub fn clock_res(c: Clock) -> u64 {
+    match c {
+        Clock::Cpu { which: 2, .. } => 1,
+        _ => TICK_NS,
+    }
+}
+
 /// 起動してからの tick (HZ 分の 1 秒)。割り込みの回数ではなく、カウンタ (CNTVCT) から計算する。
 /// 割り込みは遅れたりまとまったりする (Mac の HVF では特に) ので、数えると時計が遅れる
 pub fn ticks() -> u64 {

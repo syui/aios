@@ -1905,6 +1905,31 @@ begin_new_exec、task_dump_owner、__ptrace_may_access)。dumpable は持ちも�
 プログラム、setuid のもの)、`fs.suid_dumpable` 2) は Linux 7.4-rc1 と同じ (82 行)。fsuid はまだない (setfsuid は euid を
 返すだけ) ので、setfsuid で dumpable が変わるところはまだ。
 
+### CPU の時計 (clock_gettime、clock_getres、timer_create)
+
+前の aios は clock_gettime の CPU の時計にも起動からの時間を返し (glibc の `clock()` もまちがう)、知らない時計も 0、
+clock_getres はいつも 1 ns、timer_create は時計を見ずに壁の時間で鳴らしていた。いまは Linux の posix-timers と
+posix-cpu-timers と同じ:
+
+- CPU 時間: スレッドが走った時間を ns で足す (proc.rs の `cpu_ns`: スケジューラが走らせはじめた時刻 `ran_at` から、
+  もどってくるまで。ユーザーもカーネルも: Linux の sum_exec_runtime)。終わったスレッドの分は代表の `cpu_dead_ns` へ
+- 時計 (timer.rs の `clock_of`): 0 REALTIME、5 REALTIME_COARSE、8 REALTIME_ALARM、11 TAI は壁、1 MONOTONIC、
+  4 MONOTONIC_RAW、6 MONOTONIC_COARSE、7 BOOTTIME、9 BOOTTIME_ALARM は起動から、2 PROCESS_CPUTIME_ID と
+  3 THREAD_CPUTIME_ID は自分の CPU 時間。負のもの (`clock_getcpuclockid` と `pthread_getcpuclockid`: ~pid << 3 |
+  スレッド 4 | SCHED 2 など) はその pid の CPU 時間で、pid 0 は自分。スレッドの時計は同じスレッドグループのものだけ、
+  プロセスの時計は代表 (ゾンビも、回収されるまで)。終わったスレッド、回収したプロセス、which 3、fd の時計、知らない
+  番号 (10、12 から) は EINVAL。PROF と SCHED は走った時間、VIRT はユーザーモードの tick
+- clock_getres: CPU の時計 (SCHED) は 1 ns、ほかは 1 tick (10 ms: aios のタイマは tick の境めで鳴る。Linux も高精度
+  タイマがなければ tick)
+- 大きなロックなしの速い道は、壁・起動から・自分のスレッドの CPU の時計まで (ほかはふつうの道)。vDSO は 0、1、4〜7 だけ
+- timer_create: MONOTONIC_RAW と COARSE、fd の時計は EOPNOTSUPP、知らない時計は EINVAL、ALARM は CAP_WAKE_ALARM
+  がなければ EPERM。CPU の時計のタイマは、その時計の ns で期限を覚え、tick ごとに見て鳴らす (Linux も tick ごと)。
+  くり返しは、こえた分の回数を overrun に
+- まだのもの: clock_nanosleep の CPU の時計、getrusage と times と /proc/PID/stat の utime / stime (いまも tick)
+
+`test/cpuclock.c` (時計ごとの答え、CPU を使ったぶんだけ進むか、眠っていれば進まないか、ほかのスレッドと子と回収した
+ものの時計、CPU の時計のタイマ) は Linux 7.4-rc1 と同じ (47 行。ALARM の時計は RTC があるかしだいなので見ない)。
+
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 
 `test/ldiff.sh [--root] [--linux VER] [--fresh] NAME [ARG...]` は、出すだけのテスト (test/NAME.c) を作って (test/bin/NAME)、

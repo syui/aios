@@ -359,6 +359,13 @@ pub struct Proc {
     pub execed: bool,
     /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
     pub utime: u64,
+    /// CPU で走った時間 (ns: ユーザーもカーネルも。Linux の sum_exec_runtime)。スケジューラが走らせるたびに足す。
+    /// CLOCK_THREAD_CPUTIME_ID と CPU の時計 (timer.rs の clock_ns)
+    pub cpu_ns: u64,
+    /// いま走りはじめた時刻 (uptime の ns。走っていなければ 0)
+    pub ran_at: u64,
+    /// 代表スレッドだけ: 終わったスレッドの cpu_ns (CLOCK_PROCESS_CPUTIME_ID に足す)
+    pub cpu_dead_ns: u64,
     /// 最近走った tick (走るたびに 1 足し、1 秒ごとに半分にする)。少ないものから走らせる
     pub recent: u32,
     /// 走らせた回数 (/proc/threads。調べもの用)
@@ -474,6 +481,9 @@ impl Proc {
         cont_report: false,
         execed: false,
         utime: 0,
+        cpu_ns: 0,
+        ran_at: 0,
+        cpu_dead_ns: 0,
         start: 0,
         pid_ns: None,
         vpid: 0,
@@ -1333,7 +1343,14 @@ pub fn scheduler() -> ! {
                 }
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
                 crate::smp::dev_wait(2, t0);
+                p.ran_at = crate::timer::uptime_ns().max(1);
                 swtch(sched_ctx(), &p.context);
+                // 走った時間を足す (終わったスレッドは、終わるときに代表へわたして ran_at を 0 にしている)
+                let q = &mut procs()[i];
+                if q.ran_at != 0 {
+                    q.cpu_ns += crate::timer::uptime_ns().saturating_sub(q.ran_at);
+                    q.ran_at = 0;
+                }
                 set_cur(None);
                 ON_CPU[crate::smp::id()].store(0, Relaxed);
                 // 終わったスレッドのページ表はほかの CPU が片付けるかもしれないので、外しておく。生きているものは
@@ -1687,8 +1704,11 @@ fn exit_status(status: i32) -> ! {
     if p.thread {
         // 使った時間は代表スレッドに持たせる
         let t = core::mem::take(&mut p.utime);
+        let c = cpu_ns(p);
+        (p.cpu_ns, p.ran_at) = (0, 0);
         if let Some(l) = find(p.tgid) {
             l.utime += t;
+            l.cpu_dead_ns += c;
         }
         let p = current();
         p.files = None;
@@ -2148,6 +2168,18 @@ pub fn yield_voluntary() {
 }
 
 /// スレッドグループ全体の utime (tick)
+/// スレッドが CPU で走った時間 (ns)。いま走っていれば、走りはじめてからの分も
+pub fn cpu_ns(p: &Proc) -> u64 {
+    let ran = p.ran_at;
+    p.cpu_ns + if ran != 0 { crate::timer::uptime_ns().saturating_sub(ran) } else { 0 }
+}
+
+/// プロセス (スレッドグループ) が CPU で走った時間 (ns): 生きているスレッドと、終わったスレッドの分
+pub fn group_cpu_ns(tgid: u32) -> u64 {
+    let dead = find_leader_any(tgid).map_or(0, |l| l.cpu_dead_ns);
+    dead + live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| cpu_ns(p)).sum::<u64>()
+}
+
 pub fn group_utime(tgid: u32) -> u64 {
     live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
 }

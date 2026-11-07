@@ -668,7 +668,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         NANOSLEEP => sys_nanosleep(1, 0, a[0] as usize, a[1] as usize),
         CLOCK_NANOSLEEP => sys_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
         CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
-        CLOCK_GETRES => sys_clock_getres(a[1] as usize),
+        CLOCK_GETRES => sys_clock_getres(a[0], a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
         UNAME => sys_uname(a[0] as usize),
         SETHOSTNAME => sys_sethostname(a[0] as usize, a[1] as usize),
@@ -932,9 +932,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         GETEUID => p.cred.euid as i64,
         GETGID => p.cred.gid as i64,
         GETEGID => p.cred.egid as i64,
-        CLOCK_GETTIME => {
+        // 自分のスレッドの CPU の時計 (3) まで。プロセスやほかのものの CPU の時計、知らない時計はふつうの道へ
+        CLOCK_GETTIME if matches!(a[0], 0 | 1 | 3..=7 | 11) => {
             let ns = match a[0] {
-                CLOCK_REALTIME | CLOCK_REALTIME_COARSE => timer::epoch_ns(),
+                CLOCK_REALTIME | CLOCK_REALTIME_COARSE | 11 => timer::epoch_ns(),
+                3 => proc::cpu_ns(p),
                 _ => timer::uptime_ns(),
             };
             if !p.pt().copy_out_nofault(a[1] as usize, &timespec(ns)) {
@@ -1084,18 +1086,18 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     true
 }
 
+/// clock_gettime: 時計は timer::clock_of (知らないもの、いない CPU の時計は EINVAL)
 fn sys_clock_gettime(clk: u64, ts: usize) -> R {
-    let ns = match clk {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => timer::epoch_ns(),
-        _ => timer::uptime_ns(),
-    };
+    let ns = timer::clock_ns(timer::clock_of(clk as i32, true)?)?;
     out(ts, &timespec(ns))?;
     Ok(0)
 }
 
-fn sys_clock_getres(ts: usize) -> R {
+/// clock_getres: 壁と起動からの時計は tick、CPU の時計 (SCHED) は 1 ns。ts は NULL でもよい
+fn sys_clock_getres(clk: u64, ts: usize) -> R {
+    let c = timer::clock_of(clk as i32, false)?;
     if ts != 0 {
-        out(ts, &timespec(1))?;
+        out(ts, &timespec(timer::clock_res(c)))?;
     }
     Ok(0)
 }
