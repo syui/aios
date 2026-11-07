@@ -1877,7 +1877,6 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     child.cred = cred;
     child.comm = parent.comm;
-    child.audit = crate::audit::alloc();
     child.spec_ssb = parent.spec_ssb;
     child.thread = thread;
     if thread {
@@ -1891,6 +1890,8 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             kid_link(l, slot_of(child));
         }
     }
+    // 監査の入れもの (TASK の組のルールは子の pid と cred で見る)
+    child.audit = crate::audit::alloc(child);
     unsafe {
         fp_save(&mut child.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) child.tpidr);

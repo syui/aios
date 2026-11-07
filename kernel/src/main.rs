@@ -6,6 +6,7 @@ extern crate alloc;
 mod aiproc;
 mod apparmor;
 mod audit;
+mod auditfilter;
 mod securityfs;
 mod efirt;
 mod efivarfs;

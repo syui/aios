@@ -906,7 +906,8 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     let p = proc::current();
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
     // AppArmor のプロファイルのついたものも (決まりを見るのはふつうの道だけ)
-    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.apparmor.is_some() {
+    // 監査のシステムコールのルールがあれば、入れもののあるスレッドも (入口と出口でルールを見る)
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.apparmor.is_some() || (p.audit.is_some() && crate::audit::slow()) {
         return false;
     }
     let r = match nr {

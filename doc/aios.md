@@ -969,13 +969,25 @@ Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や au
   (1327: 引数の 128 バイトまで。はじめて出すときに作り、exec しても変わらない: Linux と同じ)、EOE (1320: kmsg には
   出さない) を出す。ユーザーの記録 (AUDIT_USER_*) と TTY_SET はスレッドのことではないので出さない
 
+- ルール (kernel/src/auditfilter.rs: auditctl -a / -d / -l の AUDIT_ADD_RULE / DEL_RULE / LIST_RULES と struct
+  audit_rule_data)。組は USER (ユーザーの記録の種類で捨てる)、TASK (fork したスレッドに入れものを作らない・いつも出す)、
+  EXIT (システムコールの出口: 番号のマスク、pid uid gid loginuid sessionid arch exit success a0〜a3 perm exe key などで
+  合わせ、先に合ったものの ALWAYS / NEVER と key)、EXCLUDE (その種類の記録を出さない)。まちがったもの (古い ENTRY の
+  組、知らない欄や比べかた、key の長さ、WATCH / DIR / EXE の道) は EINVAL、WATCH の親や DIR や EXE の親がなければ
+  ENOENT、同じものは EEXIST、ないものを消すと ENOENT。足す・消すたびに `op=add_rule key="..." list=4 res=1`。Linux と
+  同じくせ: 値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで) は見ない (audit_field_valid が値を入れる前の 0 を見て
+  いる)、PREPEND は覚えるときに消えるので、つけたままでは消せない。マスクの上の 16 ビット (クラス) は arm64 の番号に
+  ひろげる。システムコールのルールがあれば、入れもののあるスレッドは大きなロックなしの道 (getpid など) も入口と出口を
+  通る
+
 test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。test/loginuid.c (root で) は
-loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で読んでくらべて同じ (115 行)。kmsg のかぎりがあるので、ところどころで
+loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で読んでくらべて同じ (115 行)。test/auditrules.c
+(root で) はルールを足す・消す・一覧、まちがったもの、USER と EXCLUDE と EXIT のフィルタをくらべて同じ (181 行)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
-AUDIT も入る (select)。のこり: ルール (auditctl -a、システムコールの監査のフィルタ: AUDIT_ADD_RULE / DEL_RULE /
-MAKE_EQUIV は EOPNOTSUPP。ルールができたら、大きなロックなしの道のシステムコールも入口と出口を通す)、PATH と CWD と
-EXECVE の記録、終わるとき (exit_group) の記録、/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、
-backlog (記録はすぐ出すので行列がない)。
+AUDIT も入る (select)。のこり: PATH と CWD と EXECVE の記録 (と、名前で合わせるルール: WATCH、DIR、INODE、
+OBJ_UID、FILETYPE など。いまは合わない)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、終わるとき
+(exit_group) の記録、/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので
+行列がない)。
 
 ### ファイアウォール (nftables)
 

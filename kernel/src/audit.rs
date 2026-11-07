@@ -26,8 +26,10 @@
 // - loginuid と sessionid (/proc/PID/loginuid と sessionid、記録の auid= ses=): 書けるのは自分だけ (set_loginuid)
 // - システムコールの入れもの (Ctx: audit を一度 on にしたあとに作ったスレッド): そのスレッドのことの記録 (log_task) を
 //   出したシステムコールは、出口で SYSCALL、PROCTITLE、EOE も (Linux 7.4 は記録が出ると dummy をやめる)
-// - のこり: ルール (auditctl -a、システムコールのフィルタ。AUDIT_ADD_RULE / DEL_RULE / MAKE_EQUIV は EOPNOTSUPP)、
-//   PATH と CWD の記録、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)
+// - ルール (auditfilter.rs: AUDIT_ADD_RULE / DEL_RULE / LIST_RULES): USER の組はユーザーの記録を、EXCLUDE の組は記録の
+//   種類を、EXIT の組はシステムコールの出口で、TASK の組は fork で入れものを作るかを決める
+// - のこり: PATH と CWD の記録 (名前で合わせるルール)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、TTY の入力の記録 (TTY_SET は
+//   覚えるだけ)、backlog (記録はすぐ出すので行列がない)
 use crate::cell::Bkl;
 use crate::netlink::{self, NetlinkRef};
 use crate::proc;
@@ -189,13 +191,24 @@ pub fn init() {
 
 /// 記録を出す (audit_log_start(NULL, ...) から audit_log_end): body は "audit(...): " のうしろ。受け口の中ならあとで
 pub fn log(typ: u16, body: &str) {
+    if excluded(typ) {
+        return;
+    }
     let ns = crate::timer::epoch_ns();
     put(typ, ns, SERIAL.fetch_add(1, Relaxed), body);
+}
+
+/// EXCLUDE の組のルールで出さない種類か (audit_log_start の audit_filter: 時刻と番号をつける前に)
+fn excluded(typ: u16) -> bool {
+    (crate::smp::holding() || crate::smp::online() <= 1) && !crate::auditfilter::filter(typ, crate::auditfilter::EXCLUDE)
 }
 
 /// いまのスレッドのことの記録 (audit_log_start(audit_context(), ...)): システムコールの中なら、その時刻と番号で、
 /// そのシステムコールの終わりに SYSCALL の記録も出す (auditsc_get_stamp と「dummy をやめる」)
 pub fn log_task(typ: u16, body: &str) {
+    if excluded(typ) {
+        return;
+    }
     let locked = crate::smp::holding() || crate::smp::online() <= 1;
     let stamp = match proc::try_current().and_then(|p| p.audit.as_mut()).filter(|_| locked) {
         Some(c) => {
@@ -204,8 +217,8 @@ pub fn log_task(typ: u16, body: &str) {
                 if c.serial == 0 {
                     c.serial = SERIAL.fetch_add(1, Relaxed);
                 }
-                if !c.prio {
-                    (c.prio, c.record) = (true, true);
+                if c.prio == 0 {
+                    (c.prio, c.record) = (1, true);
                 }
                 Some((c.ctime, c.serial))
             } else {
@@ -216,7 +229,10 @@ pub fn log_task(typ: u16, body: &str) {
     };
     match stamp {
         Some((ns, serial)) => put(typ, ns, serial, body),
-        None => log(typ, body),
+        None => {
+            let ns = crate::timer::epoch_ns();
+            put(typ, ns, SERIAL.fetch_add(1, Relaxed), body);
+        }
     }
 }
 
@@ -454,9 +470,13 @@ pub struct Ctx {
     in_syscall: bool,
     /// 出口で出すものがない (ルールがなく、まだ記録もない)
     dummy: bool,
-    /// 出口で出す (AUDIT_STATE_RECORD) と、それを決めたか (prio)
+    /// 出口で出す (AUDIT_STATE_RECORD) と、それを決めたものの強さ (0 はまだ、1 は記録が出た、ほかはルールの prio)
     record: bool,
-    prio: bool,
+    prio: u64,
+    /// TASK の組の ALWAYS で、いつも出すスレッド (state が AUDIT_STATE_RECORD)
+    always: bool,
+    /// 合ったルールの key (SYSCALL の記録の key=)
+    key: Option<String>,
     major: u64,
     argv: [u64; 4],
     /// 入口の時刻と、記録の番号 (0 はまだ)
@@ -466,12 +486,36 @@ pub struct Ctx {
     proctitle: Option<Vec<u8>>,
 }
 
-/// fork で作るスレッドの入れもの (audit_alloc: audit を一度も on にしていなければ作らない)
-pub fn alloc() -> Option<alloc::boxed::Box<Ctx>> {
+/// fork で作るスレッドの入れもの (audit_alloc: audit を一度も on にしていなければ作らない。TASK の組で NEVER に合えば
+/// 作らず、ALWAYS に合えばいつも出すものに)
+pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<Ctx>> {
     if !EVER.load(Relaxed) {
         return None;
     }
-    Some(alloc::boxed::Box::new(Ctx { in_syscall: false, dummy: true, record: false, prio: false, major: 0, argv: [0; 4], ctime: 0, serial: 0, proctitle: None }))
+    let hit = crate::auditfilter::filter_task(child);
+    if hit.as_ref().is_some_and(|h| !h.record) {
+        return None;
+    }
+    let always = hit.is_some();
+    Some(alloc::boxed::Box::new(Ctx {
+        in_syscall: false,
+        dummy: true,
+        record: always,
+        prio: if always { u64::MAX } else { 0 },
+        always,
+        key: hit.and_then(|h| h.key),
+        major: 0,
+        argv: [0; 4],
+        ctime: 0,
+        serial: 0,
+        proctitle: None,
+    }))
+}
+
+/// 大きなロックなしの道 (syscall::fast) を通らないか: システムコールのルールがあるとき、入れもののあるスレッドは
+/// みな入口と出口を通す
+pub fn slow() -> bool {
+    crate::auditfilter::N_RULES.load(Relaxed) != 0
 }
 
 /// システムコールの入口 (__audit_syscall_entry): audit が on なら、番号と引数と時刻を覚える
@@ -479,47 +523,87 @@ pub fn syscall_entry(nr: u64, a: &[u64; 6]) {
     if st().enabled == OFF {
         return;
     }
-    let Some(c) = proc::current().audit.as_mut() else { return };
-    // ルールはまだないので、いつも記録が出るまで dummy (audit_n_rules が 0)
-    c.dummy = true;
+    let auditd = st().pid;
+    let p = proc::current();
+    let tgid = p.tgid;
+    let Some(c) = p.audit.as_mut() else { return };
+    // システムコールのルールがなければ、記録が出るまで dummy (audit_n_rules)。あれば auditd のものは見ない
+    c.dummy = crate::auditfilter::N_RULES.load(Relaxed) == 0;
+    if !c.dummy && !c.always {
+        c.prio = 0;
+        if auditd != 0 && auditd == tgid {
+            return;
+        }
+    }
     c.major = nr;
     c.argv = [a[0], a[1], a[2], a[3]];
     c.in_syscall = true;
-    c.record = false;
+    c.record = c.always;
     c.ctime = crate::timer::epoch_ns() / 1_000_000 * 1_000_000;
 }
 
 /// システムコールの出口 (__audit_syscall_exit): 記録を出すことになっていれば出し、入れものを空にする
 pub fn syscall_exit(ret: i64) {
-    let Some(c) = proc::current().audit.as_mut() else { return };
-    let emit = c.in_syscall && !c.dummy && c.record;
+    let auditd = st().pid;
+    let p = proc::current();
+    let Some(c) = p.audit.as_mut() else { return };
+    let check = c.in_syscall && !c.dummy;
     c.in_syscall = false;
-    if emit {
-        log_exit(ret);
+    if check {
+        // EXIT の組のルール (audit_filter_syscall: auditd のものは見ない)。合えば、NEVER なら出さない
+        if auditd == 0 || auditd != p.tgid {
+            let success = !(-4095..0).contains(&ret);
+            let sys = crate::auditfilter::Sys { major: c.major, argv: c.argv, ret: Some((success, fixup(ret))), prio: c.prio };
+            if let Some(hit) = crate::auditfilter::filter_syscall(p, &sys) {
+                let c = p.audit.as_mut().unwrap();
+                c.record = hit.record;
+                c.prio = hit.prio;
+                if hit.key.is_some() {
+                    c.key = hit.key;
+                }
+            }
+        }
+        if p.audit.as_ref().is_some_and(|c| c.record) {
+            log_exit(ret);
+        }
     }
-    let Some(c) = proc::current().audit.as_mut() else { return };
+    // audit_reset_context (dummy なら番号などはそのまま)
+    let Some(c) = p.audit.as_mut() else { return };
     if !c.dummy {
-        (c.record, c.prio, c.serial, c.ctime, c.major, c.argv) = (false, false, 0, 0, 0, [0; 4]);
+        (c.record, c.serial, c.ctime, c.major, c.argv) = (c.always, 0, 0, 0, [0; 4]);
+        c.prio = if c.always { u64::MAX } else { 0 };
+        if !c.always {
+            c.key = None;
+        }
     }
 }
 
-/// audit_log_exit: SYSCALL、PROCTITLE、EOE (同じ時刻と番号で)
-fn log_exit(ret: i64) {
+/// audit_return_fixup: ERESTART* は EINTR に
+fn fixup(ret: i64) -> i64 {
     const ERESTARTSYS: i64 = 512;
     const ERESTART_RESTARTBLOCK: i64 = 516;
     const ENOIOCTLCMD: i64 = 515;
     const EINTR: i64 = 4;
-    let code = if (-ERESTART_RESTARTBLOCK..=-ERESTARTSYS).contains(&ret) && ret != -ENOIOCTLCMD { -EINTR } else { ret };
+    if (-ERESTART_RESTARTBLOCK..=-ERESTARTSYS).contains(&ret) && ret != -ENOIOCTLCMD { -EINTR } else { ret }
+}
+
+/// audit_log_exit: SYSCALL、PROCTITLE、EOE (同じ時刻と番号で)
+fn log_exit(ret: i64) {
+    // SYSCALL を出さない種類なら、ほかも出さない
+    if excluded(AUDIT_SYSCALL) {
+        return;
+    }
+    let code = fixup(ret);
     let success = !(-4095..0).contains(&ret);
-    let (major, argv, ns, serial) = {
+    let (major, argv, ns, serial, key) = {
         let c = proc::current().audit.as_mut().unwrap();
         if c.serial == 0 {
             c.serial = SERIAL.fetch_add(1, Relaxed);
         }
-        (c.major, c.argv, c.ctime, c.serial)
+        (c.major, c.argv, c.ctime, c.serial, c.key.clone())
     };
     let body = format!(
-        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items=0{} key=(null)",
+        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items=0{} key={}",
         crate::seccomp::AUDIT_ARCH_AARCH64,
         major,
         if success { "yes" } else { "no" },
@@ -528,11 +612,16 @@ fn log_exit(ret: i64) {
         argv[1],
         argv[2],
         argv[3],
-        task_info()
+        task_info(),
+        key.map_or("(null)".into(), |k| untrusted(k.as_bytes()))
     );
     put(AUDIT_SYSCALL, ns, serial, &body);
-    put(AUDIT_PROCTITLE, ns, serial, &format!("proctitle={}", proctitle()));
-    put(AUDIT_EOE, ns, serial, "");
+    if !excluded(AUDIT_PROCTITLE) {
+        put(AUDIT_PROCTITLE, ns, serial, &format!("proctitle={}", proctitle()));
+    }
+    if !excluded(AUDIT_EOE) {
+        put(AUDIT_EOE, ns, serial, "");
+    }
 }
 
 /// PROCTITLE の中身: 引数の場所の 128 バイトまで、終わりの表示できない文字を落として (audit_proctitle_rtrim)。
@@ -759,18 +848,32 @@ fn receive(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool, o
         }
         AUDIT_ADD_RULE | AUDIT_DEL_RULE => {
             // struct audit_rule_data (1040 バイト) より短いものは EINVAL。固定なら EPERM (残す)
-            if data.len() < 1040 {
+            if data.len() < crate::auditfilter::DATA {
                 return -EINVAL;
             }
+            let op = if typ == AUDIT_ADD_RULE { "add_rule" } else { "remove_rule" };
             if st().enabled == LOCKED {
-                let op = if typ == AUDIT_ADD_RULE { "add_rule" } else { "remove_rule" };
                 log_task(AUDIT_CONFIG_CHANGE, &format!("{} op={} audit_enabled={} res=0", recv_head(), op, LOCKED));
                 return -EPERM;
             }
-            -EOPNOTSUPP
+            // audit_rule_change: 読めなければそのエラー (残さない)。足す・消すの答えは残す (audit_log_rule_change)
+            let rule = match crate::auditfilter::parse(data) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let (listnr, key) = (rule.listnr, rule.key.clone());
+            let r = if typ == AUDIT_ADD_RULE { crate::auditfilter::add(rule) } else { crate::auditfilter::del(&rule) };
+            if st().enabled != OFF {
+                let k = key.map_or("(null)".into(), |k| untrusted(k.as_bytes()));
+                log_task(AUDIT_CONFIG_CHANGE, &format!("{}{} op={} key={} list={} res={}", session(), subj(), op, k, listnr, r.is_ok() as u32));
+            }
+            r.err().unwrap_or(0)
         }
         AUDIT_LIST_RULES => {
-            // ルールはないので NLMSG_DONE だけ
+            // 組の順にルールを 1 つずつ (NLM_F_MULTI)、おわりに NLMSG_DONE
+            for d in crate::auditfilter::list() {
+                reply(out, AUDIT_LIST_RULES, NLM_F_MULTI, seq, &d);
+            }
             reply(out, NLMSG_DONE, NLM_F_MULTI, seq, &[]);
             0
         }
@@ -780,6 +883,7 @@ fn receive(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool, o
             }
             0
         }
+        // ツリーのルールの名前をつけかえる (audit_tag_tree): まだない
         AUDIT_MAKE_EQUIV => -EOPNOTSUPP,
         AUDIT_SIGNAL_INFO => {
             let s = st();
@@ -823,6 +927,10 @@ fn receive(n: &NetlinkRef, msg: &[u8], me: u32, cap_ack: bool, ack: &mut bool, o
 /// ユーザーの記録 (audit が off なら AUDIT_USER_AVC だけ)
 fn user_msg(typ: u16, data: &[u8]) {
     if (st().enabled == OFF && typ != AUDIT_USER_AVC) || data.len() < 2 {
+        return;
+    }
+    // USER の組のルール (NEVER に合えば捨てる)
+    if !crate::auditfilter::filter(typ, crate::auditfilter::USER) {
         return;
     }
     let body = if typ != AUDIT_USER_TTY {
