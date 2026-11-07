@@ -28,7 +28,8 @@
 //   出したシステムコールは、出口で SYSCALL、PROCTITLE、EOE も (Linux 7.4 は記録が出ると dummy をやめる)
 // - ルール (auditfilter.rs: AUDIT_ADD_RULE / DEL_RULE / LIST_RULES): USER の組はユーザーの記録を、EXCLUDE の組は記録の
 //   種類を、EXIT の組はシステムコールの出口で、TASK の組は fork で入れものを作るかを決める
-// - のこり: PATH と CWD の記録 (名前で合わせるルール)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、TTY の入力の記録 (TTY_SET は
+// - パスの名前 (getname / inode / child: sysfile::audit_pre と audit_post が呼ぶ): 出口で CWD、名前ごとの PATH、EXECVE
+// - のこり: 名前を集めないシステムコール、DIR のルール、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、TTY の入力の記録 (TTY_SET は
 //   覚えるだけ)、backlog (記録はすぐ出すので行列がない)
 use crate::cell::Bkl;
 use crate::netlink::{self, NetlinkRef};
@@ -76,6 +77,9 @@ const AUDIT_GET_FEATURE: u16 = 1019;
 const AUDIT_USER_AVC: u16 = 1107;
 const AUDIT_USER_TTY: u16 = 1124;
 const AUDIT_SYSCALL: u16 = 1300;
+const AUDIT_PATH: u16 = 1302;
+const AUDIT_CWD: u16 = 1307;
+const AUDIT_EXECVE: u16 = 1309;
 const AUDIT_EOE: u16 = 1320;
 const AUDIT_PROCTITLE: u16 = 1327;
 const AUDIT_CONFIG_CHANGE: u16 = 1305;
@@ -484,6 +488,176 @@ pub struct Ctx {
     serial: u32,
     /// PROCTITLE の中身 (はじめて出すときに作り、このスレッドのあいだ使う: exec しても変わらない。Linux と同じ)
     proctitle: Option<Vec<u8>>,
+    /// このシステムコールで集めたパスの名前 (audit_names) と、はじめて集めたときのいまのディレクトリ (CWD の記録)
+    names: Vec<Name>,
+    pwd: Option<String>,
+    /// execve がうまくいった (EXECVE の記録: 新しいプログラムの引数)
+    execve: bool,
+}
+
+/// 名前の種類 (AUDIT_TYPE_*)
+#[derive(Clone, Copy, PartialEq)]
+pub enum NameType {
+    Unknown,
+    Normal,
+    Parent,
+    Delete,
+    Create,
+}
+
+/// 集めた名前 1 つ (struct audit_names)
+struct Name {
+    /// ユーザーが書いた名前 (getname のもの)
+    name: Option<String>,
+    /// 記録に出す長さ (None は全部 = AUDIT_NAME_FULL。親の名前は親の部分だけ)
+    len: Option<usize>,
+    typ: NameType,
+    inode: Option<crate::auditfilter::NameInfo>,
+}
+
+/// inode の見え方 (audit_copy_inode: そのときの mode や持ち主)
+fn info(i: &crate::vfs::InodeRef) -> crate::auditfilter::NameInfo {
+    let m = i.meta();
+    let id = i.id();
+    let dev = crate::vfs::decode_dev(crate::vfs::st_dev(id.0));
+    let rdev = if matches!(m.mode & 0o170000, 0o020000 | 0o060000) { ((m.rdev >> 8) as u32 & 0xfff, (m.rdev & 0xff) as u32) } else { (0, 0) };
+    crate::auditfilter::NameInfo { id, ino: m.ino, dev, rdev, mode: m.mode, uid: m.uid, gid: m.gid }
+}
+
+/// parent_len: パスの親の部分の長さ (終わりの / は飛ばし、親の / までふくめる)
+fn parent_len(path: &str) -> usize {
+    let b = path.as_bytes();
+    if b.is_empty() {
+        return 0;
+    }
+    let mut p = b.len() - 1;
+    while b[p] == b'/' && p > 0 {
+        p -= 1;
+    }
+    while b[p] != b'/' && p > 0 {
+        p -= 1;
+    }
+    if b[p] == b'/' { p + 1 } else { p }
+}
+
+/// audit_compare_dname_path: path (の親の部分のあと、終わりの / をのぞく) が dname なら true
+fn dname_is(dname: &str, path: &str, parentlen: Option<usize>) -> bool {
+    if path.len() < dname.len() {
+        return false;
+    }
+    let pl = parentlen.unwrap_or_else(|| parent_len(path));
+    let rest = path[pl.min(path.len())..].trim_end_matches('/');
+    rest == dname
+}
+
+/// いま名前を集めているか (システムコールの中で、dummy でない: Linux の getname は !audit_dummy_context のときだけ)
+pub fn collecting() -> bool {
+    proc::current().audit.as_ref().is_some_and(|c| c.in_syscall && !c.dummy)
+}
+
+fn names_ctx() -> Option<&'static mut Ctx> {
+    proc::current().audit.as_deref_mut().filter(|c| c.in_syscall && !c.dummy)
+}
+
+/// audit_alloc_name: 名前を足す (はじめてならいまのディレクトリを覚える)
+fn alloc_name(c: &mut Ctx, typ: NameType) -> usize {
+    c.names.push(Name { name: None, len: None, typ, inode: None });
+    if c.pwd.is_none() {
+        c.pwd = Some(format!("/{}", proc::current().files().cwd));
+    }
+    c.names.len() - 1
+}
+
+/// __audit_getname: ユーザーの名前を足す (番号を返す: Linux の filename の aname)
+pub fn getname(path: &str) -> Option<usize> {
+    let c = names_ctx()?;
+    let i = alloc_name(c, NameType::Unknown);
+    c.names[i].name = Some(String::from(path));
+    Some(i)
+}
+
+/// __audit_inode: 名前 (an) の inode を覚える。parent なら親のディレクトリとして (名前は親の部分だけ出す)
+pub fn inode(an: Option<usize>, name: Option<&str>, ino: &crate::vfs::InodeRef, parent: bool) {
+    let Some(c) = names_ctx() else { return };
+    let ok_type = |t: NameType| if parent { t == NameType::Parent || t == NameType::Unknown } else { t != NameType::Parent };
+    let inf = info(ino);
+    let mut at = an.filter(|&i| i < c.names.len() && ok_type(c.names[i].typ));
+    // ほかの名前で、同じ inode のもの (うしろから)
+    if at.is_none() {
+        at = c.names.iter().rposition(|n| n.inode.as_ref().is_some_and(|x| x.id == inf.id) && ok_type(n.typ));
+    }
+    let i = match at {
+        Some(i) => i,
+        None => {
+            let i = alloc_name(c, NameType::Unknown);
+            c.names[i].name = name.map(String::from).or_else(|| an.and_then(|a| c.names.get(a).and_then(|n| n.name.clone())));
+            i
+        }
+    };
+    let n = &mut c.names[i];
+    if parent {
+        n.len = Some(n.name.as_deref().map_or(0, parent_len));
+        if n.name.is_none() {
+            n.len = None;
+        }
+        n.typ = NameType::Parent;
+    } else {
+        n.len = None;
+        n.typ = NameType::Normal;
+    }
+    n.inode = Some(inf);
+}
+
+/// __audit_inode_child: 作る・消すもの (dir の中の dname)。親の名前があればそれを親に、子の名前がなければ親の名前で足す
+pub fn child(dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::InodeRef>, typ: NameType) {
+    let Some(c) = names_ctx() else { return };
+    let did = dir.id();
+    let (mut parent, mut kid) = (None::<usize>, None::<usize>);
+    for i in 0..c.names.len() {
+        let Some(name) = c.names[i].name.clone() else { continue };
+        let n = &c.names[i];
+        if parent.is_none() && matches!(n.typ, NameType::Parent | NameType::Unknown) && n.inode.as_ref().is_some_and(|x| x.id == did) && dname_is(dname, &name, n.len) {
+            c.names[i].typ = NameType::Parent;
+            parent = Some(i);
+            if kid.is_some() {
+                break;
+            }
+            continue;
+        }
+        // 子の名前は、親が見つかっていればその親の長さで切って比べる
+        let plen = parent.and_then(|pi| c.names[pi].len);
+        if kid.is_none() && (n.typ == typ || n.typ == NameType::Unknown) && (dname == name || dname_is(dname, &name, plen)) {
+            if c.names[i].typ == NameType::Unknown {
+                c.names[i].typ = typ;
+            }
+            kid = Some(i);
+            if parent.is_some() {
+                break;
+            }
+        }
+    }
+    if parent.is_none() {
+        let i = alloc_name(c, NameType::Parent);
+        c.names[i].inode = Some(info(dir));
+    }
+    let k = match kid {
+        Some(k) => k,
+        None => {
+            let k = alloc_name(c, typ);
+            if let Some(pi) = parent {
+                c.names[k].name = c.names[pi].name.clone();
+            }
+            k
+        }
+    };
+    c.names[k].inode = ino.map(info);
+}
+
+/// execve がうまくいった (__audit_bprm: EXECVE の記録を出す)
+pub fn execve() {
+    if let Some(c) = names_ctx() {
+        c.execve = true;
+    }
 }
 
 /// fork で作るスレッドの入れもの (audit_alloc: audit を一度も on にしていなければ作らない。TASK の組で NEVER に合えば
@@ -509,6 +683,9 @@ pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<Ctx>> {
         ctime: 0,
         serial: 0,
         proctitle: None,
+        names: Vec::new(),
+        pwd: None,
+        execve: false,
     }))
 }
 
@@ -553,14 +730,15 @@ pub fn syscall_exit(ret: i64) {
         // EXIT の組のルール (audit_filter_syscall: auditd のものは見ない)。合えば、NEVER なら出さない
         if auditd == 0 || auditd != p.tgid {
             let success = !(-4095..0).contains(&ret);
-            let sys = crate::auditfilter::Sys { major: c.major, argv: c.argv, ret: Some((success, fixup(ret))), prio: c.prio };
+            let names: Vec<crate::auditfilter::NameInfo> = c.names.iter().filter_map(|n| n.inode.clone()).collect();
+            let mut sys = crate::auditfilter::Sys { major: c.major, argv: c.argv, ret: Some((success, fixup(ret))), prio: c.prio, names: &names };
+            // システムコールのルール、それから名前ごとに名前のルール (audit_filter_syscall と audit_filter_inodes)
             if let Some(hit) = crate::auditfilter::filter_syscall(p, &sys) {
-                let c = p.audit.as_mut().unwrap();
-                c.record = hit.record;
-                c.prio = hit.prio;
-                if hit.key.is_some() {
-                    c.key = hit.key;
-                }
+                sys.prio = hit.prio;
+                apply(p, hit);
+            }
+            if let Some(hit) = crate::auditfilter::filter_inodes(p, &sys) {
+                apply(p, hit);
             }
         }
         if p.audit.as_ref().is_some_and(|c| c.record) {
@@ -571,10 +749,22 @@ pub fn syscall_exit(ret: i64) {
     let Some(c) = p.audit.as_mut() else { return };
     if !c.dummy {
         (c.record, c.serial, c.ctime, c.major, c.argv) = (c.always, 0, 0, 0, [0; 4]);
+        c.names.clear();
+        (c.pwd, c.execve) = (None, false);
         c.prio = if c.always { u64::MAX } else { 0 };
         if !c.always {
             c.key = None;
         }
+    }
+}
+
+/// 合ったルールの答えを入れものに (current_state、prio、key)
+fn apply(p: &mut proc::Proc, hit: crate::auditfilter::Hit) {
+    let c = p.audit.as_mut().unwrap();
+    c.record = hit.record;
+    c.prio = hit.prio;
+    if hit.key.is_some() {
+        c.key = hit.key;
     }
 }
 
@@ -595,15 +785,15 @@ fn log_exit(ret: i64) {
     }
     let code = fixup(ret);
     let success = !(-4095..0).contains(&ret);
-    let (major, argv, ns, serial, key) = {
+    let (major, argv, ns, serial, key, items) = {
         let c = proc::current().audit.as_mut().unwrap();
         if c.serial == 0 {
             c.serial = SERIAL.fetch_add(1, Relaxed);
         }
-        (c.major, c.argv, c.ctime, c.serial, c.key.clone())
+        (c.major, c.argv, c.ctime, c.serial, c.key.clone(), c.names.len())
     };
     let body = format!(
-        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items=0{} key={}",
+        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items={}{} key={}",
         crate::seccomp::AUDIT_ARCH_AARCH64,
         major,
         if success { "yes" } else { "no" },
@@ -612,16 +802,86 @@ fn log_exit(ret: i64) {
         argv[1],
         argv[2],
         argv[3],
+        items,
         task_info(),
         key.map_or("(null)".into(), |k| untrusted(k.as_bytes()))
     );
     put(AUDIT_SYSCALL, ns, serial, &body);
+    let c = proc::current().audit.as_ref().unwrap();
+    // EXECVE (show_special): 新しいプログラムの引数
+    if c.execve && !excluded(AUDIT_EXECVE) {
+        put(AUDIT_EXECVE, ns, serial, &execve_args());
+    }
+    // CWD と PATH (名前ごと)
+    let c = proc::current().audit.as_ref().unwrap();
+    if let Some(pwd) = c.pwd.as_deref()
+        && !excluded(AUDIT_CWD)
+    {
+        put(AUDIT_CWD, ns, serial, &format!("cwd={}", untrusted(pwd.as_bytes())));
+    }
+    let lines: Vec<String> = c.names.iter().enumerate().map(|(i, n)| path_line(i, n, c.pwd.as_deref())).collect();
+    for l in lines {
+        if !excluded(AUDIT_PATH) {
+            put(AUDIT_PATH, ns, serial, &l);
+        }
+    }
     if !excluded(AUDIT_PROCTITLE) {
         put(AUDIT_PROCTITLE, ns, serial, &format!("proctitle={}", proctitle()));
     }
     if !excluded(AUDIT_EOE) {
         put(AUDIT_EOE, ns, serial, "");
     }
+}
+
+/// PATH の記録 1 つ (audit_log_name)
+fn path_line(i: usize, n: &Name, pwd: Option<&str>) -> String {
+    let name = match (n.name.as_deref(), n.len) {
+        (None, _) => "(null)".into(),
+        (Some(s), None) => untrusted(s.as_bytes()),
+        // 相対パスの親は、いまのディレクトリ
+        (Some(_), Some(0)) => pwd.map_or("(null)".into(), |p| untrusted(p.as_bytes())),
+        (Some(s), Some(l)) => untrusted(&s.as_bytes()[..l.min(s.len())]),
+    };
+    let mut l = format!("item={} name={}", i, name);
+    if let Some(x) = &n.inode {
+        l.push_str(&format!(
+            " inode={} dev={:02x}:{:02x} mode=0{:o} ouid={} ogid={} rdev={:02x}:{:02x}",
+            x.ino, x.dev.0, x.dev.1, x.mode, x.uid, x.gid, x.rdev.0, x.rdev.1
+        ));
+    }
+    let t = match n.typ {
+        NameType::Normal => "NORMAL",
+        NameType::Parent => "PARENT",
+        NameType::Delete => "DELETE",
+        NameType::Create => "CREATE",
+        NameType::Unknown => "UNKNOWN",
+    };
+    l.push_str(&format!(" nametype={} cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0", t));
+    l
+}
+
+/// EXECVE の記録 (audit_log_execve_info): argc と、引数ごとに a0= (空白などがあれば 16 進)
+fn execve_args() -> String {
+    let p = proc::current();
+    let args = p.mm.as_ref().and_then(|_| {
+        let (a, e, _) = p.mm().args;
+        if a == 0 || e <= a {
+            return None;
+        }
+        let mut b = alloc::vec![0u8; e - a];
+        let pt = &mut p.mm().pt;
+        let _h = pt.hold();
+        pt.copy_in(&mut b, a)?;
+        Some(b)
+    });
+    let args = args.unwrap_or_default();
+    let list: Vec<&[u8]> = args.strip_suffix(&[0]).unwrap_or(&args).split(|&c| c == 0).collect();
+    let list = if args.is_empty() { Vec::new() } else { list };
+    let mut s = format!("argc={}", list.len());
+    for (i, a) in list.iter().enumerate() {
+        s.push_str(&format!(" a{}={}", i, untrusted(a)));
+    }
+    s
 }
 
 /// PROCTITLE の中身: 引数の場所の 128 バイトまで、終わりの表示できない文字を落として (audit_proctitle_rtrim)。

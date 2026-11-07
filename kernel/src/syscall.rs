@@ -27,7 +27,7 @@ const EOPNOTSUPP: i64 = 95;
 // システムコールの番号 (nr::READ など) と名前 (name。/proc/bkl と strace で見せる)
 macro_rules! nrs {
     ($($name:ident = $n:literal,)*) => {
-        mod nr {
+        pub mod nr {
             $(pub const $name: u64 = $n;)*
         }
         /// 番号から名前 (大文字。知らない番号なら None)
@@ -440,6 +440,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     if p.audit.is_some() {
         crate::audit::syscall_entry(nr, &a);
     }
+    // 監査が名前を集めているなら、パスの名前と親やあるものを前に引く (sysfile::audit_pre)
+    let plan = if p.audit.is_some() && crate::audit::collecting() { sysfile::audit_pre(nr, &a) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -712,6 +714,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
     if proc::current().audit.is_some() {
+        if let Some(plan) = plan {
+            sysfile::audit_post(plan, &r);
+        }
         crate::audit::syscall_exit(r.unwrap_or_else(|e| e));
     }
     strace(nr, &a, r);

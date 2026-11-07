@@ -3894,3 +3894,141 @@ pub fn inotify_add_watch(fd: u64, pathp: usize, mask: u32) -> R {
     let path = user_str(pathp)?;
     inotify::add_watch(fd, &path, mask)
 }
+
+// ---- 監査の名前 (audit.rs の getname / inode / child: Linux の getname、audit_inode、audit_inode_child) ----
+// audit がシステムコールの名前を集めているとき (ルールがあるときなど) だけ、syscall::dispatch がシステムコールの
+// 前 (audit_pre) とあと (audit_post) に呼ぶ。名前は Linux と同じ順に: ユーザーの名前 (getname)、親のディレクトリ
+// (PARENT: 作る・消すもの)、ある inode (NORMAL)、作る (CREATE)・消す (DELETE) もの。前に引き、あとで作ったものを足す
+
+/// 前に引いたもの (あとで足す)
+pub enum AuditPlan {
+    /// open (O_CREAT でなかったものを作るなら、その親と名前)
+    Open { an: Option<usize>, creat: Option<(InodeRef, String)> },
+    /// 作るもの (mkdirat、mknodat、symlinkat、linkat、rename の行き先): 親と名前
+    Create { dir: InodeRef, name: String },
+    Exec,
+}
+
+fn audit_parent(dirfd: i64, path: &str) -> Option<vfs::Parent> {
+    last_at_dead(dirfd, path).ok().filter(|p| p.last == vfs::Last::Norm)
+}
+
+fn audit_lookup(dirfd: i64, path: &str, follow: bool) -> Option<InodeRef> {
+    at_path(dirfd, path, if follow { 0 } else { AT_SYMLINK_NOFOLLOW }).ok()
+}
+
+/// ある名前 (filename_lookup の audit_inode)
+fn audit_normal(dirfd: i64, pathp: u64, follow: bool) -> Option<AuditPlan> {
+    let path = user_str(pathp as usize).ok()?;
+    let an = crate::audit::getname(&path);
+    if let Some(i) = audit_lookup(dirfd, &path, follow) {
+        crate::audit::inode(an, None, &i, false);
+    }
+    None
+}
+
+/// 作るものの親 (filename_parentat の audit_inode(PARENT))
+fn audit_create(dirfd: i64, pathp: u64) -> Option<AuditPlan> {
+    let path = user_str(pathp as usize).ok()?;
+    let an = crate::audit::getname(&path);
+    let p = audit_parent(dirfd, &path)?;
+    crate::audit::inode(an, None, &p.dir, true);
+    Some(AuditPlan::Create { dir: p.dir, name: p.name })
+}
+
+/// システムコールの前: 名前を足し、親やあるものを引く
+pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
+    use crate::audit::NameType;
+    use crate::syscall::nr::*;
+    let int = |v: u64| v as i32 as i64;
+    match nr {
+        OPENAT => {
+            let path = user_str(a[1] as usize).ok()?;
+            let an = crate::audit::getname(&path);
+            // O_CREAT でまだないなら、あとで親と作ったものを
+            let creat = (a[2] & O_CREAT != 0).then(|| audit_parent(int(a[0]), &path)).flatten().filter(|p| p.dir.lookup(&p.name).is_err()).map(|p| (p.dir, p.name));
+            Some(AuditPlan::Open { an, creat })
+        }
+        NEWFSTATAT | STATX => {
+            let flags = if nr == STATX { a[2] } else { a[3] };
+            if flags & AT_EMPTY_PATH != 0 && user_str(a[1] as usize).is_ok_and(|p| p.is_empty()) {
+                return None;
+            }
+            audit_normal(int(a[0]), a[1], flags & AT_SYMLINK_NOFOLLOW == 0)
+        }
+        READLINKAT => audit_normal(int(a[0]), a[1], false),
+        FCHMODAT | FACCESSAT => audit_normal(int(a[0]), a[1], true),
+        FCHMODAT2 | FACCESSAT2 => audit_normal(int(a[0]), a[1], a[3] & AT_SYMLINK_NOFOLLOW == 0),
+        FCHOWNAT => audit_normal(int(a[0]), a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0),
+        TRUNCATE | CHDIR | CHROOT => audit_normal(AT_FDCWD, a[0], true),
+        EXECVE => {
+            audit_normal(AT_FDCWD, a[0], true);
+            Some(AuditPlan::Exec)
+        }
+        MKDIRAT | MKNODAT => audit_create(int(a[0]), a[1]),
+        SYMLINKAT => {
+            // 中身の名前も (getname だけ: 引かない)
+            let target = user_str(a[0] as usize).ok()?;
+            crate::audit::getname(&target);
+            audit_create(int(a[1]), a[2])
+        }
+        LINKAT => {
+            audit_normal(int(a[0]), a[1], a[4] & AT_SYMLINK_FOLLOW != 0);
+            audit_create(int(a[2]), a[3])
+        }
+        UNLINKAT => {
+            let path = user_str(a[1] as usize).ok()?;
+            let an = crate::audit::getname(&path);
+            let p = audit_parent(int(a[0]), &path)?;
+            crate::audit::inode(an, None, &p.dir, true);
+            // may_delete: 消すもの
+            if let Ok(v) = p.dir.lookup(&p.name) {
+                crate::audit::child(&p.dir, &p.name, Some(&v), NameType::Delete);
+            }
+            None
+        }
+        RENAMEAT | RENAMEAT2 => {
+            let (op, np) = (user_str(a[1] as usize).ok()?, user_str(a[3] as usize).ok()?);
+            let (oa, na) = (crate::audit::getname(&op), crate::audit::getname(&np));
+            let o = audit_parent(int(a[0]), &op)?;
+            let n = audit_parent(int(a[2]), &np)?;
+            crate::audit::inode(oa, None, &o.dir, true);
+            crate::audit::inode(na, None, &n.dir, true);
+            // may_delete (元) と、行き先があれば may_delete、なければ may_create
+            if let Ok(m) = o.dir.lookup(&o.name) {
+                crate::audit::child(&o.dir, &o.name, Some(&m), NameType::Delete);
+            }
+            match n.dir.lookup(&n.name) {
+                Ok(t) => crate::audit::child(&n.dir, &n.name, Some(&t), NameType::Delete),
+                Err(_) => crate::audit::child(&n.dir, &n.name, None, NameType::Create),
+            }
+            Some(AuditPlan::Create { dir: n.dir, name: n.name })
+        }
+        _ => None,
+    }
+}
+
+/// システムコールのあと: 作ったもの (fsnotify_create などの audit_inode_child)、開いたもの (do_open の audit_inode)
+pub fn audit_post(plan: AuditPlan, r: &Result<i64, i64>) {
+    use crate::audit::NameType;
+    let Ok(v) = r else { return };
+    match plan {
+        AuditPlan::Open { an, creat } => {
+            let Ok(f) = file_of(*v as u64) else { return };
+            let Kind::Inode(i, _) = &f.borrow().kind else { return };
+            match creat {
+                Some((dir, name)) => {
+                    crate::audit::inode(an, None, &dir, true);
+                    crate::audit::child(&dir, &name, Some(i), NameType::Create);
+                }
+                None => crate::audit::inode(an, None, i, false),
+            }
+        }
+        AuditPlan::Create { dir, name } => {
+            if let Ok(i) = dir.lookup(&name) {
+                crate::audit::child(&dir, &name, Some(&i), NameType::Create);
+            }
+        }
+        AuditPlan::Exec => crate::audit::execve(),
+    }
+}

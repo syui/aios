@@ -982,12 +982,26 @@ Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や au
 
 test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。test/loginuid.c (root で) は
 loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で読んでくらべて同じ (115 行)。test/auditrules.c
-(root で) はルールを足す・消す・一覧、まちがったもの、USER と EXCLUDE と EXIT のフィルタをくらべて同じ (181 行)。kmsg のかぎりがあるので、ところどころで
+(root で) はルールを足す・消す・一覧、まちがったもの、USER と EXCLUDE と EXIT のフィルタをくらべて同じ (181 行)。
+
+- パスの名前 (Linux の getname、audit_inode、audit_inode_child): 名前を集めているとき (ルールがあるか、記録が出たあと)、
+  パスを取るシステムコールの名前を Linux と同じ順に覚えて、出口で CWD (`cwd="/tmp/ap"`) と名前ごとの PATH (`item=0
+  name="/tmp/ap/" inode=... dev=... mode=040755 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 ...`) を、execve なら
+  EXECVE (`argc=3 a0="prog" a1="--exec" a2=74776F20776F726473`: 空白などがあれば 16 進) も。open で作る (親の PARENT と
+  CREATE)、ある・読む (NORMAL)、ない (UNKNOWN: inode なし)、相対パスの親は いまのディレクトリ、mkdirat (あれば PARENT
+  だけ)、symlinkat (中身の名前が UNKNOWN、親、CREATE)、linkat (元の NORMAL、親、CREATE)、renameat2 (親 2 つ、元の DELETE、
+  行き先の CREATE。上書きなら行き先の DELETE も)、unlinkat (親と DELETE)、chmod や chown は変える前の mode と持ち主。
+  syscall::dispatch がシステムコールの前とあとに sysfile::audit_pre / audit_post を呼ぶ (名前を集めているときだけ)
+- 名前で合わせるルール: WATCH (auditctl -w FILE -p wa) は名前の inode がそのファイルのもの (いまあるもの、なければ
+  前に見たもの: 消す・動かすシステムコールでも合う)、INODE、DEVMAJOR、OBJ_UID、FILETYPE も名前で。perm の w は
+  ディレクトリを変えるもの (mkdir、unlink、rename など) もふくむ (Linux の write のクラス)
+
+test/auditpath.c (root で) は子のパスのシステムコールと WATCH の記録をくらべて同じ (174 行)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
-AUDIT も入る (select)。のこり: PATH と CWD と EXECVE の記録 (と、名前で合わせるルール: WATCH、DIR、INODE、
-OBJ_UID、FILETYPE など。いまは合わない)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、終わるとき
-(exit_group) の記録、/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので
-行列がない)。
+AUDIT も入る (select)。のこり: 名前を集めるシステムコールは上のものと faccessat、chdir、chroot、truncate、execve
+だけ (openat2、mknodat の中身、utimensat、xattr、mount などはまだ)、動的なプログラムの ld.so の名前、DIR のルール (ディレクトリ
+の下みな)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、終わるとき (exit_group) の記録、
+/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)。
 
 ### ファイアウォール (nftables)
 

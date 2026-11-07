@@ -14,8 +14,10 @@
 //   ひろげる
 // - 同じルール (組、flags、action、欄、マスク) は EEXIST、ないものを消すと ENOENT。PREPEND (0x10) は前に入れて、
 //   覚えるときは消す (なので PREPEND をつけたままでは消せない: Linux と同じ)。EXIT の組は先に合ったものから
-// - のこり: PATH の名前を見るもの (WATCH、DIR、INODE、DEVMAJOR、OBJ_UID、FILETYPE、PERM の open 以外) はまだ合わない、
-//   LSM のラベル (AppArmor の SUBJ_ROLE) も合わない
+// - 名前で合わせるもの (WATCH、INODE): システムコールで集めた名前 (audit.rs の PATH) ごとに (audit_filter_inodes)。
+//   WATCH はそのパスにいまある inode (なければ前に見たもの: 消した・動かしたシステムコールでも合う。Linux は消える前に
+//   合わせてから watch を外す)。DEVMAJOR、DEVMINOR、OBJ_UID、OBJ_GID、FILETYPE もシステムコールの名前で
+// - のこり: DIR (ディレクトリの下みな: Linux の audit_tree) と LSM のラベル (AppArmor の SUBJ_ROLE) はまだ合わない
 use crate::cell::Bkl;
 use crate::proc::Proc;
 use alloc::string::String;
@@ -162,6 +164,20 @@ pub struct Rule {
     tree: Option<String>,
     /// EXE の道と、足したときにあったもの (ファイルシステム, inode)
     exe: Option<(usize, u64)>,
+    /// WATCH のファイルの、最後に見た inode (audit_watch の dev と ino)
+    watch_id: Option<(usize, u64)>,
+}
+
+/// システムコールで集めた名前の inode (audit_names のうちルールが見るもの)
+#[derive(Clone)]
+pub struct NameInfo {
+    pub id: (usize, u64),
+    pub ino: u64,
+    pub dev: (u32, u32),
+    pub rdev: (u32, u32),
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 static RULES: Bkl<[Vec<Rule>; 8]> = Bkl::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
@@ -179,7 +195,8 @@ fn rules() -> &'static mut [Vec<Rule>; 8] {
 const DIR_WRITE: &[u32] = &[33, 34, 35, 36, 37, 38, 276];
 const CHATTR: &[u32] = &[52, 55, 5, 463, 6, 7, 14, 466, 15, 16, 54, 53, 452, 37, 469];
 const READ: &[u32] = &[60, 443, 11, 465, 12, 13, 8, 464, 9, 10, 78, 468, 80, 79, 291];
-const WRITE: &[u32] = &[89, 224, 60, 443, 45, 46, 200, 47];
+/// write は dir_write もふくむ (asm-generic/audit_write.h が audit_dir_write.h を include する)
+const WRITE: &[u32] = &[33, 34, 35, 36, 37, 38, 276, 89, 224, 60, 443, 45, 46, 200, 47];
 const SIGNAL: &[u32] = &[129, 131, 130];
 
 /// クラスの番号 (AUDIT_CLASS_*: 奇数は 32bit のもので、aios にはない)
@@ -253,7 +270,7 @@ pub fn parse(d: &[u8]) -> Result<Rule, i64> {
             mask[nr as usize / 32] |= 1 << (nr % 32);
         }
     }
-    let mut r = Rule { listnr, flags: flags & PREPEND, legacy: false, action, fields: Vec::new(), mask, key: None, prio: u64::MAX, by_name: false, watch: None, tree: None, exe: None };
+    let mut r = Rule { listnr, flags: flags & PREPEND, legacy: false, action, fields: Vec::new(), mask, key: None, prio: u64::MAX, by_name: false, watch: None, tree: None, exe: None, watch_id: None };
     let buf = &d[DATA..];
     let mut at = 0usize;
     // audit_unpack_string: 0 や残りより長いものは EINVAL
@@ -372,7 +389,7 @@ pub fn add(mut r: Rule) -> Result<(), i64> {
         return Err(-EEXIST);
     }
     if let Some(p) = &r.watch {
-        parent_child(p)?;
+        r.watch_id = parent_child(p)?;
     }
     if let Some(p) = &r.tree {
         crate::vfs::resolve("", p, false)?;
@@ -511,12 +528,23 @@ pub fn filter(msgtype: u16, listnr: u32) -> bool {
 }
 
 /// 出口のフィルタに渡すもの
-pub struct Sys {
+pub struct Sys<'a> {
     pub major: u64,
     pub argv: [u64; 4],
     /// (成功か, 返した値) (なければ終わるとき)
     pub ret: Option<(bool, i64)>,
     pub prio: u64,
+    /// 集めた名前 (inode のあるもの)
+    pub names: &'a [NameInfo],
+}
+
+/// WATCH のファイルの inode: いまあるもの (覚えなおす)、なければ前に見たもの
+fn watch_id(r: &mut Rule) -> Option<(usize, u64)> {
+    let p = r.watch.as_deref()?;
+    if let Ok(i) = crate::vfs::resolve("", p, false) {
+        r.watch_id = Some(i.id());
+    }
+    r.watch_id
 }
 
 /// 合ったルールの答え: 出すか (ALWAYS) と、key と prio
@@ -536,9 +564,25 @@ fn match_perm(s: &Sys, mask: u32) -> bool {
     }
 }
 
-/// audit_field_compare (プロセスの id どうし。ファイルのものは名前がないので合わない)
-fn field_compare(p: &Proc, f: &Field) -> bool {
+/// audit_field_compare (プロセスの id どうしと、プロセスとファイル (名前) の id)
+fn field_compare(p: &Proc, f: &Field, s: Option<&Sys>, name: Option<&NameInfo>) -> bool {
     let c = &p.cred;
+    // 1〜9: プロセスの id とファイルの持ち主
+    let obj = match f.val {
+        1 => Some((c.uid, true)),
+        2 => Some((c.gid, false)),
+        3 => Some((c.euid, true)),
+        4 => Some((c.egid, false)),
+        5 => Some((c.loginuid, true)),
+        6 => Some((c.suid, true)),
+        7 => Some((c.sgid, false)),
+        8 => Some((c.euid, true)),
+        9 => Some((c.egid, false)),
+        _ => None,
+    };
+    if let Some((id, uid)) = obj {
+        return any_name(s, name, |n| idcmp(id, f.op, if uid { n.uid } else { n.gid }));
+    }
     let (l, r) = match f.val {
         10 => (c.uid, c.loginuid),
         11 => (c.uid, c.euid),
@@ -559,8 +603,16 @@ fn field_compare(p: &Proc, f: &Field) -> bool {
     idcmp(l, f.op, r)
 }
 
-/// audit_filter_rules: ルール 1 つ (s がなければ fork のとき: TASK の組)
-fn rule_matches(p: &Proc, r: &Rule, s: Option<&Sys>) -> bool {
+/// 名前 (name があればそれ、なければシステムコールの名前のどれか) に合うか
+fn any_name(s: Option<&Sys>, name: Option<&NameInfo>, f: impl Fn(&NameInfo) -> bool) -> bool {
+    match name {
+        Some(n) => f(n),
+        None => s.is_some_and(|s| s.names.iter().any(f)),
+    }
+}
+
+/// audit_filter_rules: ルール 1 つ (s がなければ fork のとき: TASK の組。name は名前のルールのとき)
+fn rule_matches(p: &Proc, r: &Rule, s: Option<&Sys>, name: Option<&NameInfo>, watch: Option<(usize, u64)>) -> bool {
     if s.is_some_and(|s| r.prio <= s.prio) {
         return false;
     }
@@ -592,8 +644,15 @@ fn rule_matches(p: &Proc, r: &Rule, s: Option<&Sys>) -> bool {
             F_ARG0..=F_ARG3 => s.is_some_and(|s| cmp(s.argv[(f.typ - F_ARG0) as usize] as u32, f.op, f.val)),
             F_FILTERKEY => true,
             F_PERM => s.is_some_and(|s| match_perm(s, f.val)) != (f.op == Op::Ne),
-            F_FILETYPE => f.op == Op::Ne,
-            F_FIELD_COMPARE => field_compare(p, f),
+            F_FILETYPE => s.is_some_and(|s| s.names.iter().any(|n| n.mode & 0o170000 == f.val)) != (f.op == Op::Ne),
+            F_FIELD_COMPARE => field_compare(p, f, s, name),
+            F_INODE => any_name(s, name, |n| cmp(n.ino as u32, f.op, f.val)),
+            F_DEVMAJOR => any_name(s, name, |n| cmp(n.dev.0, f.op, f.val) || cmp(n.rdev.0, f.op, f.val)),
+            F_DEVMINOR => any_name(s, name, |n| cmp(n.dev.1, f.op, f.val) || cmp(n.rdev.1, f.op, f.val)),
+            F_OBJ_UID => any_name(s, name, |n| idcmp(n.uid, f.op, f.val)),
+            F_OBJ_GID => any_name(s, name, |n| idcmp(n.gid, f.op, f.val)),
+            // audit_watch_compare: 名前の inode が WATCH のファイル
+            F_WATCH => name.is_some_and(|n| watch == Some(n.id)),
             // 名前やソケットの番地、LSM のラベルを見るもの: まだ合わない
             _ => false,
         };
@@ -612,17 +671,46 @@ pub fn filter_syscall(p: &Proc, s: &Sys) -> Option<Hit> {
         if nr > 0xffff_ffff || word >= 64 || r.mask[word] & 1 << (nr % 32) == 0 {
             continue;
         }
-        if rule_matches(p, r, Some(s)) {
+        if rule_matches(p, r, Some(s), None, None) {
             return Some(Hit { record: r.action == ALWAYS, key: r.key.clone(), prio: r.prio });
         }
     }
     None
 }
 
+/// 名前ごとに名前のルール (audit_filter_inodes: WATCH と = の INODE)。名前ごとに先に合ったもの
+pub fn filter_inodes(p: &Proc, s: &Sys) -> Option<Hit> {
+    let nr = s.major;
+    let word = (nr / 32) as usize;
+    if nr > 0xffff_ffff || word >= 64 {
+        return None;
+    }
+    let mut prio = s.prio;
+    let mut last = None;
+    for n in s.names {
+        for r in rules()[EXIT as usize].iter_mut().filter(|r| r.by_name) {
+            if r.mask[word] & 1 << (nr % 32) == 0 {
+                continue;
+            }
+            let w = watch_id(r);
+            let sys = Sys { major: s.major, argv: s.argv, ret: s.ret, prio, names: s.names };
+            if rule_matches(p, r, Some(&sys), Some(n), w) {
+                prio = r.prio;
+                last = Some(Hit { record: r.action == ALWAYS, key: r.key.clone(), prio: r.prio });
+                break;
+            }
+        }
+        if last.is_some() {
+            break;
+        }
+    }
+    last
+}
+
 /// fork したスレッド (audit_filter_task): TASK の組で先に合ったもの
 pub fn filter_task(child: &Proc) -> Option<Hit> {
     for r in rules()[TASK as usize].iter() {
-        if rule_matches(child, r, None) {
+        if rule_matches(child, r, None, None, None) {
             return Some(Hit { record: r.action == ALWAYS, key: if r.action == ALWAYS { r.key.clone() } else { None }, prio: r.prio });
         }
     }
