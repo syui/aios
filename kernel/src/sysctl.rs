@@ -9,6 +9,7 @@
 //   /proc/sys/fs/inotify/max_queued_events   inotify にためておくできごとの数
 //   /proc/sys/fs/inotify/max_user_watches    1 つの inotify の watch の数
 //   /proc/sys/fs/nr_open                     読むだけ (開けるファイルの数の上限)
+//   /proc/sys/fs/suid_dumpable               uid や gid を変えたプロセスの dumpable (0、1、2: Linux と同じ)
 //   /proc/sys/vm/min_free_kbytes             空きがこれを割ったら swap へ回収する (その 4 倍まで)
 //   /proc/sys/net/netfilter/nf_conntrack_*   conntrack の数、上限、時間切れ、tcp_loose など (conntrack.rs)
 //   /proc/sys/net/ipv6/conf/*/                口ごとの IPv6 の値 (addrconf::CONF)、net/ipv4/ping_group_range
@@ -25,6 +26,9 @@ use crate::spinlock::SpinLock;
 pub static INOTIFY_MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
 /// 1 つの inotify の watch の数
 pub static INOTIFY_MAX_WATCHES: AtomicUsize = AtomicUsize::new(8192);
+/// euid や egid を変えた・setuid のものを exec した・読めないものを exec したプロセスの dumpable (0 作らない、1 作る、
+/// 2 root の権利で。Linux の fs.suid_dumpable: 既定 0)
+pub static SUID_DUMPABLE: AtomicUsize = AtomicUsize::new(0);
 /// タイムスライス (tick)。走りはじめてからタイマの割り込みがこれだけ来たら、ほかに順番をゆずる
 pub static SCHED_TIMESLICE_TICKS: AtomicUsize = AtomicUsize::new(1);
 /// 起こされたもの (あまり CPU を使っていない) が、走っているもの (使っている) に割りこむか
@@ -146,6 +150,7 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/nr_open", get: || format!("{}", crate::proc::NOFILE), set: None },
+    Entry { path: "fs/suid_dumpable", get: || format!("{}", SUID_DUMPABLE.load(Ordering::Relaxed)), set: Some(|s| Ok(SUID_DUMPABLE.store(num(s, 0, 2)?, Ordering::Relaxed))) },
     Entry {
         path: "vm/min_free_kbytes",
         get: || format!("{}", MIN_FREE_PAGES.load(Ordering::Relaxed) * crate::memlayout::PGSIZE / 1024),

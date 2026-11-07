@@ -126,6 +126,12 @@ pub trait Inode {
         false
     }
 
+    /// mode と持ち主のほかに、そのファイルシステムが許しを決める (Linux の inode_operations の permission)。None なら
+    /// ふつうに mode で (cred::check)。procfs の /proc/PID/fd (自分のプロセスなら入れる) と fdinfo (ptrace で見られる人だけ)
+    fn permission(&self, _m: &Meta, _want: u32) -> Option<Result<(), i64>> {
+        None
+    }
+
     /// write の長さを分けずに 1 回の write_at で受けとる (Linux の simple_write_to_buffer で中身をみな読むもの:
     /// AppArmor の .load。ふつうは 64 KiB ずつ)
     fn whole_write(&self) -> bool {
@@ -910,6 +916,15 @@ fn normal_into(out: &mut String, cwd: &str, path: &str, simple: bool) -> bool {
 
 /// path をたどって (正規化済みパス, inode) を返す。
 /// 途中のリンクは常に、最後のリンクは follow のときだけたどる
+/// ino (属性 m) に want (R/W/X) ができるか: ファイルシステムの許し (Inode::permission) か、mode と持ち主で
+/// (Linux の inode_permission)
+pub fn may(ino: &InodeRef, m: &Meta, cred: &crate::cred::Cred, want: u32) -> Result<(), i64> {
+    match ino.permission(m, want) {
+        Some(r) => r,
+        None => cred.check(m, want),
+    }
+}
+
 pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
     lookup_by(cwd, path, follow, |w, i| (w.to_string(), i.clone()))
 }
@@ -1544,7 +1559,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                 return Err(crate::why::at(-ENOTDIR, &walked, ""));
             }
             // ディレクトリを通るには x が要る
-            cred.check(&m, crate::cred::X).map_err(|e| crate::why::at(e, &walked, ""))?;
+            may(&cur, &m, cred, crate::cred::X).map_err(|e| crate::why::at(e, &walked, ""))?;
             if m.mode & 0o111 != 0o111 {
                 t.gates.push(Gate { mode: m.mode, uid: m.uid, gid: m.gid });
             }
@@ -1876,7 +1891,7 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
             return Err(crate::why::at(-ENOTDIR, &w, ""));
         }
         // ディレクトリを通るには x が要る (. と .. も。Linux と同じ)
-        cred.check(&m, crate::cred::X).map_err(|e| crate::why::at(e, &w, ""))?;
+        may(&cur, &m, cred, crate::cred::X).map_err(|e| crate::why::at(e, &w, ""))?;
         if c == "." {
             continue;
         }

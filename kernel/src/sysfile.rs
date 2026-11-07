@@ -1406,7 +1406,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
     if want & PW != 0 && ino.immutable() {
         return Err(-vfs::EPERM);
     }
-    cred::current().check(&ino.meta(), want)?;
+    vfs::may(&ino, &ino.meta(), cred::current(), want)?;
     // AppArmor (file_open): 開く口の許しをパスで
     {
         let m = ino.meta();

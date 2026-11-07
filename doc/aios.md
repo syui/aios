@@ -299,6 +299,7 @@ Linux と同じ場所と形。書けるのは root。値の表は kernel/src/sys
 | `fs.inotify.max_queued_events` | inotify にためておくできごとの数 (こえたら IN_Q_OVERFLOW) |
 | `fs.inotify.max_user_watches` | 1 つの inotify の watch の数 |
 | `fs.nr_open` | 読むだけ (開けるファイルの数の上限) |
+| `fs.suid_dumpable` | euid や egid を変えたプロセスの dumpable (0、1、2。既定 0: 「dumpable と /proc/PID の持ち主」) |
 | `vm.min_free_kbytes` | 空きがこれを割ったら swap へ回収する (その 4 倍になるまで) |
 
 ```sh
@@ -1872,13 +1873,36 @@ kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。
   番号のグループへ) と siginfo (si_signo がちがえば EINVAL、ほかのプロセスへはカーネルの si_code (0 以上と SI_TKILL) は
   EPERM)。info がなければ THREAD は SI_TKILL、ほかは SI_USER。pidfd のかわりの PIDFD_SELF_THREAD (-10000) と
   PIDFD_SELF_THREAD_GROUP (-10001)。pidfd でない fd は EBADF (前は EINVAL)
-- ついでに足したもの: `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)` (持ちもの (mm) ごと、fork で引き継ぎ、exec で 1。setuid の
-  プログラムで id が変われば 0)。epoll に poll のできないもの (ディレクトリ、ext4 や tmpfs のふつうのファイル、/dev/null と
+- ついでに足したもの: `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)` (持ちもの (mm) ごと、fork で引き継ぎ。いつ変わるかは
+  下の「dumpable と /proc/PID の持ち主」)。epoll に poll のできないもの (ディレクトリ、ext4 や tmpfs のふつうのファイル、/dev/null と
   /dev/zero、ブロックデバイス) を入れるのは EPERM (前の aios は入れて、いつも読める・書けると答えていた)
 
 `test/pidfdinfo.c` (176 行: fdinfo を 13 種類の fd で、PIDFD_GET_INFO を自分・子 (動いている、ゾンビ、片づけたあと)・
 スレッドと 4 つの大きさで、pidfd_getfd、pidfd_send_signal の flags と siginfo) は Linux 7.4-rc1 と 1 バイトもちがわない。
 番号 (pid、ino、mnt_id) と uid はじかに出さず、あてはまるかを出す。
+
+### dumpable と /proc/PID の持ち主
+
+root から uid を変えたプロセスの中を、もとの人が見たり書いたりできないようにするしくみ (Linux の commit_creds、
+begin_new_exec、task_dump_owner、__ptrace_may_access)。dumpable は持ちもの (mm) ごと (CLONE_VM の相手と分けあう)。
+
+- 変わるとき: euid か egid が変わると (setuid、setresuid、setreuid と gid のもの。capability も aios では euid で決まる)
+  `fs.suid_dumpable` (既定 0) に。setgroups や、同じ値への set*id、ruid と suid だけの変更では変わらない。exec では 1 に
+  もどるが、exec の前の euid と uid (egid と gid) がちがう、プログラムかインタプリタ (ld.so) が読めない (Linux の
+  would_dump)、setuid / setgid で euid / egid が変わったときは `fs.suid_dumpable`。`PR_SET_DUMPABLE` は 0 と 1 だけ
+- /proc/PID の持ち主: そのプロセスの euid と egid。dumpable が 1 でなければ root (dr-xr-xr-x のディレクトリ: /proc/PID、
+  task、fdinfo はそのまま)。なので uid を変えたあとは、自分の loginuid や uid_map を書けず、environ (0400) を読めない
+  (`prctl(PR_SET_DUMPABLE, 1)` でもどる)。/proc/PID/fd は root のものになっても自分のプロセスなら入れる
+  (proc_fd_permission)
+- ほかのプロセスの environ、maps、cwd、root、exe、fd、fdinfo、ns の口と pidfd_getfd: 自分の euid と egid が相手の 3 つの
+  uid と gid とみな同じで、相手が dumpable なときだけ (でなければ CAP_SYS_PTRACE)。それから landlock と AppArmor の ptrace。
+  maps、environ、fdinfo/N は開くときに見る (Linux と同じ。前の aios は読むときに見て、maps は uid を見ていなかった)
+- ついでに Linux とそろえたもの: environ と stack は 0400、comm は 0644 で書ける (同じスレッドグループから。はじめの
+  15 バイト)、fd/N のリンクの mode は開いた口しだい (読めれば r-x、書ければ -wx)
+
+`test/dumpable.c` (root で: 自分の資格を変える、変わらない・もどすだけのとき、ほかのプロセスから、exec のあと (読めない
+プログラム、setuid のもの)、`fs.suid_dumpable` 2) は Linux 7.4-rc1 と同じ (82 行)。fsuid はまだない (setfsuid は euid を
+返すだけ) ので、setfsuid で dumpable が変わるところはまだ。
 
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 

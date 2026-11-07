@@ -176,8 +176,18 @@ fn set(f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
     let p = proc::current();
     let mut c = p.cred.clone();
     f(&mut c)?;
+    changed(p, &c);
     p.cred = c;
     Ok(0)
+}
+
+/// 資格を new に変える前に (Linux の commit_creds): euid か egid が変わるなら (aios では capability も euid で決まる)、
+/// dumpable を fs.suid_dumpable (既定 0) に。もとの人が /proc/PID の中や ptrace で、権利の変わったプロセスを見られない
+/// ように (持ちもの (mm) のないカーネルのスレッドはそのまま)
+pub fn changed(p: &mut proc::Proc, new: &Cred) {
+    if (new.euid != p.cred.euid || new.egid != p.cred.egid) && p.mm.is_some() {
+        p.mm().dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    }
 }
 
 /// -1 は「変えない」

@@ -407,7 +407,6 @@ impl ProcInode {
             }
             Node::Stat(pid) => stat_line(leader_any(pid)?),
             Node::Maps(pid) => {
-                mm_access(pid, false)?;
                 let pt = &leader(pid)?.mm().pt;
                 let _h = pt.hold();
                 pt.maps_text()
@@ -457,17 +456,16 @@ impl ProcInode {
                     _ => format!("{}\0", p.comm()),
                 }
             }
-            // 見るのは ptrace で READ できる人だけ (Linux の proc_fdinfo_permission)
+            // 見るのは ptrace で READ できる人だけ (開くときに: permission)
             Node::FdInfo(pid, n) => {
-                mm_access(pid, true)?;
                 let p = leader(pid)?;
                 let fd = p.files().fds.get(n).and_then(|f| f.as_ref()).ok_or(-ENOENT)?;
                 let (f, cloexec) = (fd.file.clone(), fd.cloexec);
                 let s = f.borrow().fdinfo(cloexec);
                 s
             }
+            // 開くときに mm_access (permission)
             Node::Environ(pid) => {
-                mm_access(pid, true)?;
                 let p = leader(pid)?;
                 let (_, e, end) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
                 String::from_utf8_lossy(&user_bytes(p, e, end).unwrap_or_default()).into_owned()
@@ -674,34 +672,42 @@ fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     }
 }
 
-/// Linux の ptrace_may_access (proc_fd_access_allowed、mm_access、ns の口、lock_trace) のうち AppArmor の ptrace の
-/// 決まり: 自分のプロセスは見ない。read は PTRACE_MODE_READ (だめなら EACCES)、でなければ ATTACH (EPERM)
-fn aa_ptrace(pid: u32, read: bool) -> Result<(), i64> {
-    let p = leader(pid)?;
+/// Linux の __ptrace_may_access (PTRACE_MODE_FSCREDS: proc_fd_access_allowed、mm_access、ns の口、fdinfo、lock_trace):
+/// 自分のプロセスはよい。ほかは、自分の fs の id (aios は euid / egid) が相手の uid・euid・suid と gid・egid・sgid に
+/// みな同じで、相手が dumpable (1) か、でなければ CAP_SYS_PTRACE。それから landlock と AppArmor の ptrace の決まり
+/// (read なら READ、でなければ ATTACH)。だめなら Err (呼ぶ側が EACCES か EPERM に)
+fn ptrace_may(pid: u32, read: bool) -> Result<(), ()> {
+    let p = leader(pid).map_err(|_| ())?;
     if p.tgid == proc::current().tgid {
         return Ok(());
     }
-    // landlock (hook_ptrace_access_check): 相手が自分の層の中でなければ
-    crate::landlock::check_ptrace(crate::cred::current().landlock.as_ref(), p.cred.landlock.as_ref()).map_err(|_| if read { -EACCES } else { -EPERM })?;
-    crate::apparmor::may_ptrace(&p.cred, read).map_err(|_| if read { -EACCES } else { -EPERM })
+    let (c, tc) = (crate::cred::current(), &p.cred);
+    let ids = c.euid == tc.uid && c.euid == tc.euid && c.euid == tc.suid && c.egid == tc.gid && c.egid == tc.egid && c.egid == tc.sgid;
+    if !ids && !c.capable(crate::cred::CAP_SYS_PTRACE) {
+        return Err(());
+    }
+    if crate::pidfd::dumpable(p) != 1 && !c.capable(crate::cred::CAP_SYS_PTRACE) {
+        return Err(());
+    }
+    crate::landlock::check_ptrace(c.landlock.as_ref(), tc.landlock.as_ref()).map_err(|_| ())?;
+    crate::apparmor::may_ptrace(tc, read).map_err(|_| ())
 }
 
-/// mm_access (environ と maps を開く: Linux の may_access_mm): 自分か、ptrace_may_access (ids なら uid が合うか
-/// CAP_SYS_PTRACE、それから AppArmor の ptrace の read) か、perfmon_capable (CAP_PERFMON か CAP_SYS_ADMIN)。
-/// だめなら EACCES。maps は (前から) uid を見ない
-fn mm_access(pid: u32, ids: bool) -> Result<(), i64> {
-    use crate::cred::{CAP_PERFMON, CAP_SYS_ADMIN, CAP_SYS_PTRACE};
-    let p = leader(pid)?;
-    if p.tgid == proc::current().tgid {
+/// ptrace_may の答えを errno に: read は EACCES、ATTACH (lock_trace) は EPERM
+fn aa_ptrace(pid: u32, read: bool) -> Result<(), i64> {
+    leader(pid)?;
+    ptrace_may(pid, read).map_err(|_| if read { -EACCES } else { -EPERM })
+}
+
+/// mm_access (environ と maps を開く: Linux の may_access_mm): 自分か、ptrace_may_access (READ) か、perfmon_capable
+/// (CAP_PERFMON か CAP_SYS_ADMIN)。だめなら EACCES
+fn mm_access(pid: u32) -> Result<(), i64> {
+    use crate::cred::{CAP_PERFMON, CAP_SYS_ADMIN};
+    leader(pid)?;
+    if ptrace_may(pid, true).is_ok() {
         return Ok(());
     }
     let c = crate::cred::current();
-    if (!ids || c.euid == p.cred.uid || c.capable(CAP_SYS_PTRACE))
-        && crate::landlock::check_ptrace(c.landlock.as_ref(), p.cred.landlock.as_ref()).is_ok()
-        && crate::apparmor::may_ptrace(&p.cred, true).is_ok()
-    {
-        return Ok(());
-    }
     if c.capable(CAP_PERFMON) || c.capable(CAP_SYS_ADMIN) {
         return Ok(());
     }
@@ -736,6 +742,22 @@ impl Inode for ProcInode {
         (self.fs, self.ino())
     }
 
+    fn permission(&self, m: &Meta, want: u32) -> Option<Result<(), i64>> {
+        let c = crate::cred::current();
+        match self.node {
+            // /proc/PID/fd: mode で入れなくても、自分のプロセスなら (Linux の proc_fd_permission: dumpable でなくなって
+            // root のものになっても、自分の fd は見られる)
+            Node::FdDir(pid) => Some(if leader(pid).is_ok_and(|p| p.tgid == proc::current().tgid) { Ok(()) } else { c.check(m, want) }),
+            // /proc/PID/fdinfo: ptrace で見られる人だけ、それから mode で (Linux の proc_fdinfo_permission)
+            Node::FdInfoDir(pid) => Some(aa_ptrace(pid, true).and_then(|_| c.check(m, want))),
+            // 開くときに mode と、ptrace で読めるか (Linux は open で見る: proc_maps_open と environ_open の mm_access、
+            // seq_fdinfo_open。開いたあとで相手が変わっても、読むのはそのまま)
+            Node::Maps(pid) | Node::Environ(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
+            Node::FdInfo(pid, _) => Some(c.check(m, want).and_then(|_| aa_ptrace(pid, true))),
+            _ => None,
+        }
+    }
+
     fn magic_link(&self) -> Option<(String, InodeRef)> {
         let Node::Fd(pid, n) = self.node else { return None };
         // AppArmor で見られなければ、ふつうのリンクとして (readlink が EACCES にする)
@@ -753,11 +775,6 @@ impl Inode for ProcInode {
     }
 
     fn meta(&self) -> Meta {
-        let (uid, gid) = match self.node {
-            // root と wheel の人が書ける (aiproc::allowed。書くときにも確かめる)。aibox の中の aish (sudo が効かない) も -w で
-            Node::AiCtl => (0, crate::aiproc::WHEEL),
-            _ => self.pid().and_then(|p| leader(p).ok()).map_or((0, 0), |p| (p.cred.euid, p.cred.egid)),
-        };
         let mode = match self.node {
             Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir | Node::AiStackDir => S_IFDIR | 0o555,
             Node::AiCtl => S_IFREG | 0o664,
@@ -770,10 +787,29 @@ impl Inode for ProcInode {
             Node::Attr(_, _, k) if ATTRS[k as usize] != "prev" => S_IFREG | 0o666,
             Node::NsLink(..) => S_IFLNK | 0o777,
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
-            Node::Fd(..) => S_IFLNK | 0o700,
-            Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) => S_IFREG | 0o644,
+            // 開いた口しだい: 読めれば r-x、書ければ -wx (Linux の tid_fd_update_inode)
+            Node::Fd(pid, n) => {
+                let f = leader(pid).ok().and_then(|p| p.files().get(n as u64).cloned());
+                // いま使っているもの (/proc/self/fd を getdents している、その fd など) は借りられない: 読む口として
+                let (r, w) = f.map_or((false, false), |f| f.try_borrow().map_or((true, false), |f| (f.readable(), f.writable())));
+                S_IFLNK | (if r { 0o500 } else { 0 }) | (if w { 0o300 } else { 0 })
+            }
+            Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) | Node::Comm(_) => S_IFREG | 0o644,
+            Node::TaskFile(_, _, 2) => S_IFREG | 0o644,
+            // 持ち主だけが読む (Linux の S_IRUSR のもの)
+            Node::Environ(_) | Node::Stack(_) => S_IFREG | 0o400,
             Node::NetConntrack => S_IFREG | 0o440,
             _ => S_IFREG | 0o444,
+        };
+        // 持ち主: そのプロセスの euid と egid。dumpable が 1 でなければ root のもの (dr-xr-xr-x のディレクトリはのぞく:
+        // Linux の task_dump_owner。uid や gid を変えたプロセスの loginuid や environ などを、もとの人が開けないように)
+        let (uid, gid) = match self.node {
+            // root と wheel の人が書ける (aiproc::allowed。書くときにも確かめる)。aibox の中の aish (sudo が効かない) も -w で
+            Node::AiCtl => (0, crate::aiproc::WHEEL),
+            _ => match self.pid().and_then(|p| leader(p).ok()) {
+                Some(p) if mode == S_IFDIR | 0o555 || crate::pidfd::dumpable(p) == 1 => (p.cred.euid, p.cred.egid),
+                _ => (0, 0),
+            },
         };
         let now = crate::timer::epoch_ns();
         // /proc/PID/fd/N のリンクは大きさ 64 (Linux の proc_fd_instantiate。libapparmor の path_from_fd などは lstat の
@@ -805,6 +841,19 @@ impl Inode for ProcInode {
     }
 
     fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
+        // /proc/PID/comm と task/TID/comm (comm_write): 同じスレッドグループのものだけ (ほかは EINVAL)。はじめの 15 バイト
+        // まで (改行もそのまま: Linux と同じ)
+        if let Node::Comm(pid) | Node::TaskFile(pid, _, 2) = self.node {
+            let t = match self.node {
+                Node::TaskFile(_, tid, _) => thread(pid, tid)?,
+                _ => leader(pid)?,
+            };
+            if t.tgid != proc::current().tgid {
+                return Err(crate::why::inval());
+            }
+            t.set_comm(&b[..b.len().min(15)]);
+            return Ok(b.len());
+        }
         // /proc/PID/loginuid (proc_loginuid_write): 自分のものだけ、はじめから 1 度に。番号 (u32::MAX は外す) は、
         // 読むときの user namespace の地図で外の番号に
         if let Node::LoginUid(pid) = self.node {
@@ -884,7 +933,7 @@ impl Inode for ProcInode {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_)) {
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2)) {
             return Ok(());
         }
         Err(-EACCES)

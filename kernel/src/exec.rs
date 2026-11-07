@@ -69,6 +69,9 @@ pub struct Image {
     pub args: (usize, usize, usize),
     /// AppArmor: この exec でつくプロファイル (apparmor::exec_transition)
     pub apparmor: crate::apparmor::Exec,
+    /// プログラムかインタプリタ (ld.so) が、exec した人に読めない: dumpable を fs.suid_dumpable に (Linux の would_dump。
+    /// 読めないものの中身を、/proc/PID/mem や core で見られないように)
+    pub nondump: bool,
 }
 
 /// "#!" の後ろの 1 行を (インタプリタ, 引数) に分ける。
@@ -150,6 +153,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
+    let mut nondump = !crate::cred::current().may(&m, crate::cred::R, false);
     let mut pt = PageTable::new().ok_or(-ENOMEM)?;
     let main = load_elf(&mut pt, &ino, size, PIE_BASE, &exe)?;
     let brk = main.end;
@@ -159,7 +163,9 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
             let (ipath, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
             crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
             aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &ipath, iino.meta().uid);
-            let isize = iino.meta().size as usize;
+            let im = iino.meta();
+            nondump |= !crate::cred::current().may(&im, crate::cred::R, false);
+            let isize = im.size as usize;
             let i = load_elf(&mut pt, &iino, isize, INTERP_BASE, &ipath)?;
             if i.interp.is_some() {
                 return Err(-ENOEXEC);
@@ -259,7 +265,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, apparmor: aa })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, apparmor: aa, nondump })
 }
 
 

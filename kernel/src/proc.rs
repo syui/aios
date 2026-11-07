@@ -1980,6 +1980,11 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
 
 /// execve の続き: 読みこんだプログラムに p を入れかえる (他のスレッドは消える)
 fn finish_exec(p: &mut Proc, img: Image, path: &str) {
+    // dumpable (Linux の begin_new_exec): ふつうは 1 にもどる。読めないプログラムか、exec の前の euid と uid (egid と gid)
+    // がちがえば fs.suid_dumpable。setuid / setgid で euid / egid が変わっても (下の commit_creds)
+    let suid_dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    let mut dumpable = if img.nondump || p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid { suid_dumpable } else { 1 };
+    let (old_euid, old_egid) = (p.cred.euid, p.cred.egid);
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
     // (砂場の中から sudo で外へ出られないように)
     if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
@@ -2017,9 +2022,10 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
-    if p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid {
-        p.mm().dumpable = 0;
+    if p.cred.euid != old_euid || p.cred.egid != old_egid {
+        dumpable = suid_dumpable;
     }
+    p.mm().dumpable = dumpable;
     if fatal {
         crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
     }
