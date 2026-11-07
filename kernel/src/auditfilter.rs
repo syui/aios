@@ -4,9 +4,9 @@
 // - 組: USER (0: ユーザーの記録を捨てるか)、TASK (1: fork したスレッドに入れものを作るか)、EXIT (4: システムコールの
 //   出口で記録するか)、EXCLUDE (5: その種類の記録を出さないか)、FS (6)、URING_EXIT (7)。ENTRY (2) は古いので EINVAL
 // - action は NEVER (0) か ALWAYS (2)。欄は 64 まで、比べかたは = != < > <= >= & &=。bit の比べかたは引数などだけ、
-//   MSGTYPE は USER と EXCLUDE だけ。値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで) は Linux と同じく見ない
-//   (audit_field_valid は値を入れる前の 0 を見ている)。LOGINUID = 4294967295 は LOGINUID_SET = 0 に (古い形。一覧では
-//   もとの形で返す)
+//   MSGTYPE は USER と EXCLUDE だけ。値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT の
+//   ビットだけ、FIELD_COMPARE は 25 まで、SADDR_FAM は AF_MAX より下) も見る (Linux は見ない: aios がえらんだちがい
+//   audit-field-value)。LOGINUID = 4294967295 は LOGINUID_SET = 0 に (古い形。一覧ではもとの形で返す)
 // - 文字 (key、WATCH、DIR、EXE、LSM のラベル) はうしろの buf から順に。key は 256 まで。WATCH は / で始まり / で
 //   終わらない、EXIT の組だけ、= だけ (親のディレクトリがなければ足すときに ENOENT)。DIR は / で始まる (なければ
 //   ENOENT)。EXE は / で始まり / で終わらない (親がなければ ENOENT)
@@ -230,8 +230,8 @@ fn w(d: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(d[i * 4..i * 4 + 4].try_into().unwrap())
 }
 
-/// audit_field_valid: 組と、種類と比べかた (値は見ない: Linux は 0 を見ている)
-fn field_valid(listnr: u32, typ: u32, op: Op) -> Result<(), i64> {
+/// audit_field_valid: 組と、種類と比べかたと、値の決まり
+fn field_valid(listnr: u32, typ: u32, op: Op, val: u32) -> Result<(), i64> {
     match typ {
         F_MSGTYPE if listnr != EXCLUDE && listnr != USER => return Err(-EINVAL),
         F_FSTYPE if listnr != FS => return Err(-EINVAL),
@@ -243,16 +243,26 @@ fn field_valid(listnr: u32, typ: u32, op: Op) -> Result<(), i64> {
     }
     let bit = matches!(op, Op::BitMask | Op::BitTest);
     let eq_only = !matches!(op, Op::Eq | Op::Ne);
-    match typ {
-        F_ARG0..=F_ARG3 | F_PERS | F_DEVMINOR => Ok(()),
-        F_UID..=F_FSGID | F_LOGINUID | F_OBJ_UID | F_OBJ_GID | F_PID | F_MSGTYPE | F_PPID | F_DEVMAJOR | F_EXIT | F_SUCCESS | F_INODE | F_SESSIONID | 16 | 17 | 22 | 23 | F_SADDR_FAM => {
-            if bit { Err(-EINVAL) } else { Ok(()) }
-        }
-        13..=15 | 19..=21 | F_WATCH | F_DIR | F_FILTERKEY | F_LOGINUID_SET | F_ARCH | F_FSTYPE | F_PERM | F_FILETYPE | F_FIELD_COMPARE | F_EXE => {
-            if eq_only { Err(-EINVAL) } else { Ok(()) }
-        }
-        _ => Err(-EINVAL),
-    }
+    let ok_op = match typ {
+        F_ARG0..=F_ARG3 | F_PERS | F_DEVMINOR => true,
+        F_UID..=F_FSGID | F_LOGINUID | F_OBJ_UID | F_OBJ_GID | F_PID | F_MSGTYPE | F_PPID | F_DEVMAJOR | F_EXIT | F_SUCCESS | F_INODE | F_SESSIONID | 16 | 17 | 22 | 23 | F_SADDR_FAM => !bit,
+        13..=15 | 19..=21 | F_WATCH | F_DIR | F_FILTERKEY | F_LOGINUID_SET | F_ARCH | F_FSTYPE | F_PERM | F_FILETYPE | F_FIELD_COMPARE | F_EXE => !eq_only,
+        _ => false,
+    };
+    // 値の決まり (Linux の audit_field_valid のおしまい)。aios がえらんだちがい (audit-field-value): Linux はここで値を
+    // 入れる前の f->val (0) を見るので、どれも通る。まちがった値のルールは何にも合わない (FILETYPE、PERM) か、合わせる
+    // たびに WARN になる (FIELD_COMPARE) ので、足すときに EINVAL で知らせる
+    const MAX_FIELD_COMPARE: u32 = 25;
+    const AF_MAX: u32 = 46;
+    let ok_val = match typ {
+        F_LOGINUID_SET => val <= 1,
+        F_PERM => val & !15 == 0,
+        F_FILETYPE => val & !0o170000 == 0,
+        F_FIELD_COMPARE => val <= MAX_FIELD_COMPARE,
+        F_SADDR_FAM => val < AF_MAX,
+        _ => true,
+    };
+    if ok_op && ok_val { Ok(()) } else { Err(-EINVAL) }
 }
 
 /// struct audit_rule_data (d は 1040 バイトより長い) をルールに
@@ -302,7 +312,7 @@ pub fn parse(d: &[u8]) -> Result<Rule, i64> {
         if typ == F_LOGINUID && val == UNSET {
             (typ, val, r.legacy) = (F_LOGINUID_SET, 0, true);
         }
-        field_valid(listnr, typ, op)?;
+        field_valid(listnr, typ, op, val)?;
         let mut s = None;
         match typ {
             F_LOGINUID | F_UID..=F_FSUID | F_OBJ_UID => {

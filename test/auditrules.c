@@ -1,7 +1,8 @@
 // audit のルール (Linux の kernel/auditfilter.c と auditsc.c の exit のフィルタ): AUDIT_ADD_RULE / DEL_RULE /
 // LIST_RULES を struct audit_rule_data で (auditctl -a / -d / -l と同じもの)。まちがったルール (古い ENTRY の組、
 // 知らない組と action、多すぎる欄、知らない欄と比べかた、MSGTYPE は user と exclude だけ、bit の比べかたは引数だけ、
-// LOGINUID_SET は 0 か 1、key の長さ、WATCH と DIR と EXE の道) は EINVAL、親のディレクトリがなければ ENOENT、同じもの
+// key の長さ、WATCH と DIR と EXE の道) は EINVAL、値の決まり (LOGINUID_SET は 0 か 1、PERM、FILETYPE、FIELD_COMPARE、
+// SADDR_FAM: aios がえらんだちがい audit-field-value。Linux では aios をまねる)、親のディレクトリがなければ ENOENT、同じもの
 // は EEXIST、ないものを消すと ENOENT。組ごとの一覧 (PREPEND は前に)、組の印のビット (クラス) は Linux のクラスに。
 // ふるまい: user の組の NEVER (その種類のユーザーの記録を捨てる)、exclude の組 (その種類の記録を出さない)、exit の組
 // (合うシステムコールの出口で SYSCALL と PROCTITLE と EOE、key=。PREPEND の NEVER が先に合えば出さない)。設定の記録
@@ -242,6 +243,66 @@ static void send_rule(int s, int type, const char *what) {
     replies(s, 300, what);
 }
 
+// /proc/sys/kernel/ostype が aios か (aios がえらんだちがいを、Linux ではまねる)
+static int on_aios(void) {
+    char b[16] = "";
+    int fd = open("/proc/sys/kernel/ostype", O_RDONLY);
+    if (fd >= 0) {
+        if (read(fd, b, sizeof b - 1) < 0)
+            b[0] = 0;
+        close(fd);
+    }
+    return !strncmp(b, "aios", 4);
+}
+
+// R を送って、答えの errno (0 は ok、-1 は答えがない)
+static int send_err(int s, int type) {
+    req(s, type, NLM_F_ACK, R, sizeof *R + R->buflen);
+    int err = -1;
+    while (err < 0) {
+        struct pollfd p = {s, POLLIN, 0};
+        if (poll(&p, 1, 300) <= 0)
+            break;
+        long n = recv(s, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0)
+            break;
+        for (struct nlmsghdr *h = (void *)buf; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n))
+            if (h->nlmsg_type == NLMSG_ERROR)
+                err = -((struct nlmsgerr *)NLMSG_DATA(h))->error;
+    }
+    return err;
+}
+
+// 組 READLOG に来た記録を出さずに捨てる
+static void drain(int fd) {
+    for (;;) {
+        struct pollfd p = {fd, POLLIN, 0};
+        if (poll(&p, 1, 300) <= 0 || recv(fd, buf, sizeof buf, MSG_DONTWAIT) <= 0)
+            break;
+    }
+}
+
+// chosen audit-field-value: aios は EINVAL。Linux で通ったら消して EINVAL とまねる。Linux も EINVAL なら (直った) そう出す
+// (aios の答えとちがうので、表を見なおす)。値の決まりの中のもの ((ok) とつけたもの) は、どちらも足して消す
+static void chosen_value(int s, const char *what) {
+    int e = send_err(s, AUDIT_ADD_RULE);
+    int ok = strstr(what, "(ok)") != NULL;
+    if (e == 0) {
+        int d = send_err(s, AUDIT_DEL_RULE);
+        if (ok)
+            printf("  %s: ok, del %s\n", what, en(d));
+        else if (on_aios())
+            printf("  %s: ok (aios should say EINVAL)\n", what);
+        else
+            printf("  %s: EINVAL [chosen audit-field-value]%s\n", what, d ? " (del failed)" : "");
+    } else if (e == EINVAL && !ok && on_aios())
+        printf("  %s: EINVAL [chosen audit-field-value]\n", what);
+    else if (e == EINVAL && !ok)
+        printf("  %s: EINVAL (Linux too: see the chosen table)\n", what);
+    else
+        printf("  %s: %s\n", what, e < 0 ? "no answer" : en(e));
+}
+
 static void add(int s, const char *what) {
     send_rule(s, AUDIT_ADD_RULE, what);
 }
@@ -362,9 +423,6 @@ int main(void) {
     field(999, AUDIT_EQUAL, 1);
     add(s, "field 999");
     rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
-    field(AUDIT_LOGINUID_SET, AUDIT_EQUAL, 2);
-    add(s, "loginuid_set 2");
-    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
     field(AUDIT_ARCH, AUDIT_LESS_THAN, 1);
     add(s, "arch <");
     rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
@@ -408,12 +466,34 @@ int main(void) {
     str(AUDIT_EXE, AUDIT_EQUAL, "/nonexistent-auditrules/x");
     add(s, "exe no parent");
     rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
-    field(AUDIT_PERM, AUDIT_EQUAL, 16);
-    add(s, "perm 16");
-    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
     field(AUDIT_FSTYPE, AUDIT_EQUAL, 1);
     add(s, "fstype on exit");
     records("records (invalid)");
+
+    // aios がえらんだちがい (audit-field-value): 値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT
+    // のビットだけ、FIELD_COMPARE は AUDIT_MAX_FIELD_COMPARE まで、SADDR_FAM は AF_MAX より下) を aios は見て EINVAL。
+    // Linux の audit_field_valid は値を入れる前の 0 を見るので通る (FIELD_COMPARE は合わせるときに WARN になるので、
+    // 見られない USER の組で): Linux では、通ったら消して aios の答えをまね、出た記録は捨てる
+    printf("chosen audit-field-value:\n");
+    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    field(AUDIT_LOGINUID_SET, AUDIT_EQUAL, 2);
+    chosen_value(s, "loginuid_set 2");
+    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    field(AUDIT_LOGINUID_SET, AUDIT_NOT_EQUAL, 1);
+    chosen_value(s, "loginuid_set != 1 (ok)");
+    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    field(AUDIT_PERM, AUDIT_EQUAL, 16);
+    chosen_value(s, "perm 16");
+    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    field(AUDIT_FILETYPE, AUDIT_EQUAL, S_IFREG | 1);
+    chosen_value(s, "filetype S_IFREG|1");
+    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    field(AUDIT_SADDR_FAM, AUDIT_EQUAL, 999);
+    chosen_value(s, "saddr_fam 999");
+    rule(AUDIT_FILTER_USER, AUDIT_NEVER);
+    field(AUDIT_FIELD_COMPARE, AUDIT_EQUAL, 99);
+    chosen_value(s, "field_compare 99 (user)");
+    drain(m);
 
     // ルールを足す
     r_getpid();
@@ -490,17 +570,11 @@ int main(void) {
     send_rule(s, AUDIT_DEL_RULE, "del legacy");
     records("records (del)");
     list(s, "list (after del)");
-    // のこったもの (PREPEND は覚えるときに消えるので、つけずに。値を見ずに足されたもの) を消す
+    // のこったもの (PREPEND は覚えるときに消えるので、つけずに) を消す
     rule(AUDIT_FILTER_EXIT, AUDIT_NEVER);
     sys(SYS_getpid);
     field(AUDIT_ARG0, AUDIT_EQUAL, 99);
     send_rule(s, AUDIT_DEL_RULE, "del never (without prepend)");
-    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
-    field(AUDIT_LOGINUID_SET, AUDIT_EQUAL, 2);
-    send_rule(s, AUDIT_DEL_RULE, "del loginuid_set 2");
-    rule(AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
-    field(AUDIT_PERM, AUDIT_EQUAL, 16);
-    send_rule(s, AUDIT_DEL_RULE, "del perm 16");
     records("records (cleanup)");
     list(s, "list (clean)");
     child_pid = fork();

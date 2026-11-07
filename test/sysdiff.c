@@ -298,6 +298,7 @@ static const struct {
     {"recvmmsg-timeout", "recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (時間切れで、受けたものがあればその数、なければ EAGAIN)。Linux は datagram を受けたあとにしか見ないので、vlen より少なければいつまでも待つ (recvmmsg(2) の BUGS)。ロボットは recvmmsg を使わない (test/chosen.c がたしかめる)"},
     {"send-notconn", "一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ書くと ENOTCONN (POSIX。AF_UNIX の stream は Linux でも ENOTCONN)。Linux は EPIPE と SIGPIPE (send(2) の BUGS)"},
     {"apparmor-inet", "AppArmor の network_v9 の af_inet を名のり、ip= と port= の決まりを効かせる (Ubuntu のカーネルの読みかたで、特権の port、deny の決まり、自分の番地の条件のない peer の決まりのまちがいはなおして)。Linux 7.3 は af_inet を名のらないので、apparmor_parser が番地を落として (inet, type) の決まりに広げる。ロボットは AppArmor を見ない (test/apparmor.c がたしかめる)"},
+    {"audit-field-value", "audit のルールの値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT のビットだけ、FIELD_COMPARE は AUDIT_MAX_FIELD_COMPARE まで、SADDR_FAM は AF_MAX より下) を見て EINVAL。Linux の audit_field_valid は値を入れる前の 0 (f->val) を見るので、みな通る (FIELD_COMPARE の大きな番号は合わせるたびに WARN)。ロボットは audit を見ない (test/auditrules.c がたしかめる)"},
 };
 
 // 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)

@@ -975,15 +975,16 @@ Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や au
   EXIT (システムコールの出口: 番号のマスク、pid uid gid loginuid sessionid arch exit success a0〜a3 perm exe key などで
   合わせ、先に合ったものの ALWAYS / NEVER と key)、EXCLUDE (その種類の記録を出さない)。まちがったもの (古い ENTRY の
   組、知らない欄や比べかた、key の長さ、WATCH / DIR / EXE の道) は EINVAL、WATCH の親や DIR や EXE の親がなければ
-  ENOENT、同じものは EEXIST、ないものを消すと ENOENT。足す・消すたびに `op=add_rule key="..." list=4 res=1`。Linux と
-  同じくせ: 値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで) は見ない (audit_field_valid が値を入れる前の 0 を見て
-  いる)、PREPEND は覚えるときに消えるので、つけたままでは消せない。マスクの上の 16 ビット (クラス) は arm64 の番号に
+  ENOENT、同じものは EEXIST、ないものを消すと ENOENT。足す・消すたびに `op=add_rule key="..." list=4 res=1`。値の決まり
+  (LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE、FIELD_COMPARE、SADDR_FAM) も見て EINVAL (Linux は見ない:
+  aios がえらんだちがい audit-field-value)。Linux と同じくせ: PREPEND は覚えるときに消えるので、つけたままでは消せない。マスクの上の 16 ビット (クラス) は arm64 の番号に
   ひろげる。システムコールのルールがあれば、入れもののあるスレッドは大きなロックなしの道 (getpid など) も入口と出口を
   通る
 
 test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。test/loginuid.c (root で) は
 loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で読んでくらべて同じ (115 行)。test/auditrules.c
-(root で) はルールを足す・消す・一覧、まちがったもの、USER と EXCLUDE と EXIT のフィルタをくらべて同じ (181 行)。
+(root で) はルールを足す・消す・一覧、まちがったもの、値の決まり (Linux では aios をまねる)、USER と EXCLUDE と
+EXIT のフィルタをくらべて同じ (172 行)。
 
 - パスの名前 (Linux の getname、audit_inode、audit_inode_child): 名前を集めているとき (ルールがあるか、記録が出たあと)、
   パスを取るシステムコールの名前を Linux と同じ順に覚えて、出口で CWD (`cwd="/tmp/ap"`) と名前ごとの PATH (`item=0
@@ -2604,6 +2605,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | recvmmsg-timeout | recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (ソケットの SO_RCVTIMEO と早いほう)。時間切れで、受けたものがあればその数、なければ EAGAIN。待つのは Linux と同じく 1 つずつ (MSG_WAITFORONE なら 2 つ目から待たない)、残りの時間を timeout に書きもどすのも同じ | datagram を受けたあとにしか timeout を見ない。vlen より少なければシグナルが来るまで待つ (timeout 0.3 秒で 1 つも来なくても) | timeout を渡すのは、そこまでで返ってほしいから。recvmmsg(2) の BUGS にある。前の aios は timeout を見ず、2 つ目からいつも待たなかった (Linux とちがう)。test/chosen.c が 3 つのうち 2 つで確かめる |
 | send-notconn | 一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ send / write すると ENOTCONN (SIGPIPE はなし)。つないだあとで閉じられたものは Linux と同じ EPIPE と SIGPIPE | どちらも EPIPE と SIGPIPE (sk_stream_wait_connect) | POSIX は、つながっていないソケットは ENOTCONN、もうつながっていないものは EPIPE と分けている。Linux でも AF_UNIX の stream は ENOTCONN で、TCP だけがちがう (send(2) の BUGS)。FreeBSD も ENOTCONN。つないでいないソケットに書くまちがいで、プロセスが SIGPIPE で落ちない。ロボットは Linux で、EPIPE のとき TCP_INFO の送った segment の数 (tcpi_segs_out。dport と同じく、connect にしくじるか AF_UNSPEC で切ると 0 にもどる) が 0 なら ENOTCONN にしてまねる。test/chosen.c も確かめる |
 | apparmor-inet | AppArmor の network_v9 の af_inet を名のり、`network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の番地の決まりを効かせる (読みかたは apparmor_parser の決まりの形と Ubuntu のカーネルの af_inet.c と同じ。特権の port、deny の決まり、自分の番地の条件のない peer の決まりの 3 つは、Ubuntu の読みかたのまちがいをなおした: 上の「AF_INET」) | af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) の決まりにする (allow は広く許し、deny は広く止める)。af_inet.c は番地を記録に書くだけ | 書いた決まりのとおりに効く (書いたよりも多く許さない、多く止めない)。パーサも Ubuntu のカーネルもこの決まりを持っていて、Linux の本体にまだ入っていないだけ。ロボットは AppArmor を見ないので、test/apparmor.c が両方でたしかめる (aios は番地の答え、Linux は広がった決まりの答えと、features に af_inet がないこと) |
+| audit-field-value | audit のルールの値の決まりを見て EINVAL: LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT のビットだけ、FIELD_COMPARE は AUDIT_MAX_FIELD_COMPARE まで、SADDR_FAM は AF_MAX より下 | 値をたしかめるところ (audit_field_valid) が、値を入れる前の f->val (0) を見るので、どれも通る。FIELD_COMPARE の知らない番号は、そのルールを合わせるたびに WARN (カーネルのスタックを kmsg に) | Linux のコードが書いてあるとおりのふるまい (値をたしかめるつもりのコードが効いていない)。root がまちがって足したルールが黙って何にも合わない (FILETYPE、PERM) か、カーネルの WARN を出しつづける (FIELD_COMPARE) のを、足すときに知らせる。test/auditrules.c が Linux ではこれをまねてくらべる |
 
 #### 手本の Linux のまちがい
 
