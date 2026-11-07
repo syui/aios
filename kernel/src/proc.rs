@@ -1991,6 +1991,7 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     p.cred.suid = p.cred.euid;
     p.cred.sgid = p.cred.egid;
     p.set_comm(path.rsplit('/').next().unwrap_or(path).as_bytes());
+    crate::audit::exec_done(p);
     // 他のスレッドは消える
     for t in p.siblings() {
         kill_proc(t);

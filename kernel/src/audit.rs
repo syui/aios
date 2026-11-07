@@ -488,7 +488,7 @@ pub struct Ctx {
     /// 入口の時刻と、記録の番号 (0 はまだ)
     ctime: u64,
     serial: u32,
-    /// PROCTITLE の中身 (はじめて出すときに作り、このスレッドのあいだ使う: exec しても変わらない。Linux と同じ)
+    /// PROCTITLE の中身 (はじめて出すときに作り、exec するまで使う: Linux と同じ)
     proctitle: Option<Vec<u8>>,
     /// このシステムコールで集めたパスの名前 (audit_names) と、はじめて集めたときのいまのディレクトリ (CWD の記録)
     names: Vec<Name>,
@@ -692,6 +692,13 @@ pub fn task_exit() {
     }
     if p.audit.as_ref().is_some_and(|c| c.record) {
         log_exit(None);
+    }
+}
+
+/// exec したスレッド: PROCTITLE の覚えを捨てる (新しいプログラムの引数で作りなおす。Linux も exec のあとは新しいもの)
+pub fn exec_done(p: &mut proc::Proc) {
+    if let Some(c) = p.audit.as_mut() {
+        c.proctitle = None;
     }
 }
 

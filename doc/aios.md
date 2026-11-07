@@ -966,7 +966,7 @@ Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や au
   なら、システムコールの入口で番号と引数 4 つと時刻を覚え、そのあいだにそのスレッドのことの記録 (設定の変更、
   AUDIT_LOGIN、組の出入り、AppArmor など) が出れば、それらと同じ時刻と番号で、出口に SYSCALL (1300: `arch=c00000b7
   syscall=64 success=yes exit=4 a0=... items=0 ppid=... auid=... comm=... exe=... subj=... key=(null)`)、PROCTITLE
-  (1327: 引数の 128 バイトまで。はじめて出すときに作り、exec しても変わらない: Linux と同じ)、EOE (1320: kmsg には
+  (1327: 引数の 128 バイトまで。はじめて出すときに作り、exec したら作りなおす: Linux と同じ)、EOE (1320: kmsg には
   出さない) を出す。ユーザーの記録 (AUDIT_USER_*) と TTY_SET はスレッドのことではないので出さない
 
 - ルール (kernel/src/auditfilter.rs: auditctl -a / -d / -l の AUDIT_ADD_RULE / DEL_RULE / LIST_RULES と struct
@@ -1006,7 +1006,8 @@ loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で
   ところをシグナルで殺されたものは、Linux と同じく EINTR で出口を通るので `success=no exit=-4`
 
 test/auditpath.c (root で) は子のパスのシステムコールと WATCH の記録をくらべて同じ (174 行)。test/auditdir.c (root で)
-は DIR、ほかのパスのシステムコール、exit_group、殺されたときの記録をくらべて同じ (149 行)。kmsg のかぎりがあるので、ところどころで
+は DIR、ほかのパスのシステムコール、exit_group、殺されたときの記録をくらべて同じ (149 行)。test/auditexec.c (root で) は、
+記録を出したあとに exec したスレッドの PROCTITLE が新しいプログラムのものになるのを確かめて同じ (24 行)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
 AUDIT も入る (select)。のこり: xattr、mount、execveat、name_to_handle_at などの名前、動的なプログラムの ld.so の名前、
 AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、/proc/PID/task/TID/loginuid、TTY の入力の記録

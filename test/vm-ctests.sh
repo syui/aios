@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor audit auditdir auditpath auditrules bigunmap chosen clone3 closerange cpuid cpuvuln createrace ctev ctnl dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
+TESTS="apparmor audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuid cpuvuln createrace ctev ctnl dad6 dev dirents efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -79,7 +79,7 @@ run)
     # ctev も root で (conntrack -E。conntrack-tools と nftables のパッケージがいる)
     ctev) cmd="sudo -n ./$t" ;;
     # audit も root で (AUDIT_SET で auditd になる。uid を変えた子)
-    audit | auditdir | auditpath | auditrules | loginuid) cmd="sudo -n ./$t" ;;
+    audit | auditdir | auditexec | auditpath | auditrules | loginuid) cmd="sudo -n ./$t" ;;
     # temp6 も root で (use_tempaddr を書き、raw の ICMPv6 で RS を送る)
     temp6) cmd="sudo -n ./$t" ;;
     # rtnladdr も root で (ip addr を足して消す)
