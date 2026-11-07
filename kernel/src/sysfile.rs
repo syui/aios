@@ -3898,14 +3898,15 @@ pub fn inotify_add_watch(fd: u64, pathp: usize, mask: u32) -> R {
 // ---- 監査の名前 (audit.rs の getname / inode / child: Linux の getname、audit_inode、audit_inode_child) ----
 // audit がシステムコールの名前を集めているとき (ルールがあるときなど) だけ、syscall::dispatch がシステムコールの
 // 前 (audit_pre) とあと (audit_post) に呼ぶ。名前は Linux と同じ順に: ユーザーの名前 (getname)、親のディレクトリ
-// (PARENT: 作る・消すもの)、ある inode (NORMAL)、作る (CREATE)・消す (DELETE) もの。前に引き、あとで作ったものを足す
+// (PARENT: 作る・消すもの)、ある inode (NORMAL)、作る (CREATE)・消す (DELETE) もの。前に引き、あとで作ったものを足す。
+// それぞれの本当のパスも (DIR のルール)
 
 /// 前に引いたもの (あとで足す)
 pub enum AuditPlan {
-    /// open (O_CREAT でなかったものを作るなら、その親と名前)
-    Open { an: Option<usize>, creat: Option<(InodeRef, String)> },
-    /// 作るもの (mkdirat、mknodat、symlinkat、linkat、rename の行き先): 親と名前
-    Create { dir: InodeRef, name: String },
+    /// open (O_CREAT でなかったものを作るなら、その親と名前と親のパス)
+    Open { an: Option<usize>, creat: Option<(InodeRef, String, String)> },
+    /// 作るもの (mkdirat、mknodat、symlinkat、linkat、rename の行き先): 親と名前と親のパス
+    Create { dir: InodeRef, name: String, dir_path: String },
     Exec,
 }
 
@@ -3913,16 +3914,34 @@ fn audit_parent(dirfd: i64, path: &str) -> Option<vfs::Parent> {
     last_at_dead(dirfd, path).ok().filter(|p| p.last == vfs::Last::Norm)
 }
 
-fn audit_lookup(dirfd: i64, path: &str, follow: bool) -> Option<InodeRef> {
-    at_path(dirfd, path, if follow { 0 } else { AT_SYMLINK_NOFOLLOW }).ok()
+/// 親のパス (Parent の full から)
+fn parent_path(p: &vfs::Parent) -> String {
+    alloc::format!("/{}", dir_of(&p.full))
+}
+
+/// dirfd + path を引いて (本当のパス, inode)
+fn audit_lookup(dirfd: i64, path: &str, follow: bool) -> Option<(String, InodeRef)> {
+    match base_ino(dirfd, path).ok()? {
+        Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow).ok(),
+        None => vfs::lookup(&proc::current().files().cwd.clone(), path, follow).ok(),
+    }
 }
 
 /// ある名前 (filename_lookup の audit_inode)
 fn audit_normal(dirfd: i64, pathp: u64, follow: bool) -> Option<AuditPlan> {
     let path = user_str(pathp as usize).ok()?;
     let an = crate::audit::getname(&path);
-    if let Some(i) = audit_lookup(dirfd, &path, follow) {
-        crate::audit::inode(an, None, &i, false);
+    if let Some((full, i)) = audit_lookup(dirfd, &path, follow) {
+        crate::audit::inode(an, None, &i, false, &full);
+    }
+    None
+}
+
+/// fd のもの (audit_file: 名前なし)
+fn audit_fd(fd: u64) -> Option<AuditPlan> {
+    let f = file_of(fd).ok()?;
+    if let Kind::Inode(i, p) = &f.borrow().kind {
+        crate::audit::inode(None, None, i, false, p);
     }
     None
 }
@@ -3932,22 +3951,43 @@ fn audit_create(dirfd: i64, pathp: u64) -> Option<AuditPlan> {
     let path = user_str(pathp as usize).ok()?;
     let an = crate::audit::getname(&path);
     let p = audit_parent(dirfd, &path)?;
-    crate::audit::inode(an, None, &p.dir, true);
-    Some(AuditPlan::Create { dir: p.dir, name: p.name })
+    let dir_path = parent_path(&p);
+    crate::audit::inode(an, None, &p.dir, true, &dir_path);
+    Some(AuditPlan::Create { dir: p.dir, name: p.name, dir_path })
+}
+
+/// open と openat2 (O_CREAT でまだないなら、あとで親と作ったものを)
+fn audit_open(dirfd: i64, pathp: u64, flags: u64) -> Option<AuditPlan> {
+    let path = user_str(pathp as usize).ok()?;
+    let an = crate::audit::getname(&path);
+    let creat = (flags & O_CREAT != 0)
+        .then(|| audit_parent(dirfd, &path))
+        .flatten()
+        .filter(|p| p.dir.lookup(&p.name).is_err())
+        .map(|p| {
+            let dp = parent_path(&p);
+            (p.dir, p.name, dp)
+        });
+    Some(AuditPlan::Open { an, creat })
 }
 
 /// システムコールの前: 名前を足し、親やあるものを引く
 pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
     use crate::audit::NameType;
     use crate::syscall::nr::*;
+    const IN_DONT_FOLLOW: u64 = 0x0200_0000;
     let int = |v: u64| v as i32 as i64;
     match nr {
-        OPENAT => {
-            let path = user_str(a[1] as usize).ok()?;
-            let an = crate::audit::getname(&path);
-            // O_CREAT でまだないなら、あとで親と作ったものを
-            let creat = (a[2] & O_CREAT != 0).then(|| audit_parent(int(a[0]), &path)).flatten().filter(|p| p.dir.lookup(&p.name).is_err()).map(|p| (p.dir, p.name));
-            Some(AuditPlan::Open { an, creat })
+        OPENAT => audit_open(int(a[0]), a[1], a[2]),
+        OPENAT2 => {
+            // open_how (flags、mode、resolve) は読めたものを記録に (__audit_openat2_how)
+            let mut how = [0u8; 24];
+            if a[3] < 24 || proc::current().pt().copy_in(&mut how, a[2] as usize).is_none() {
+                return None;
+            }
+            let w = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap());
+            crate::audit::openat2(w(0), w(1), w(2));
+            audit_open(int(a[0]), a[1], w(0))
         }
         NEWFSTATAT | STATX => {
             let flags = if nr == STATX { a[2] } else { a[3] };
@@ -3960,7 +4000,11 @@ pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
         FCHMODAT | FACCESSAT => audit_normal(int(a[0]), a[1], true),
         FCHMODAT2 | FACCESSAT2 => audit_normal(int(a[0]), a[1], a[3] & AT_SYMLINK_NOFOLLOW == 0),
         FCHOWNAT => audit_normal(int(a[0]), a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0),
-        TRUNCATE | CHDIR | CHROOT => audit_normal(AT_FDCWD, a[0], true),
+        // パスがなければ fd のもの (名前は集めない)
+        UTIMENSAT if a[1] != 0 => audit_normal(int(a[0]), a[1], a[3] & AT_SYMLINK_NOFOLLOW == 0),
+        INOTIFY_ADD_WATCH => audit_normal(AT_FDCWD, a[1], a[2] & IN_DONT_FOLLOW == 0),
+        TRUNCATE | CHDIR | CHROOT | STATFS => audit_normal(AT_FDCWD, a[0], true),
+        FCHMOD | FCHOWN => audit_fd(a[0]),
         EXECVE => {
             audit_normal(AT_FDCWD, a[0], true);
             Some(AuditPlan::Exec)
@@ -3980,10 +4024,11 @@ pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
             let path = user_str(a[1] as usize).ok()?;
             let an = crate::audit::getname(&path);
             let p = audit_parent(int(a[0]), &path)?;
-            crate::audit::inode(an, None, &p.dir, true);
+            let dp = parent_path(&p);
+            crate::audit::inode(an, None, &p.dir, true, &dp);
             // may_delete: 消すもの
             if let Ok(v) = p.dir.lookup(&p.name) {
-                crate::audit::child(&p.dir, &p.name, Some(&v), NameType::Delete);
+                crate::audit::child(&p.dir, &p.name, Some(&v), NameType::Delete, &dp);
             }
             None
         }
@@ -3992,17 +4037,18 @@ pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
             let (oa, na) = (crate::audit::getname(&op), crate::audit::getname(&np));
             let o = audit_parent(int(a[0]), &op)?;
             let n = audit_parent(int(a[2]), &np)?;
-            crate::audit::inode(oa, None, &o.dir, true);
-            crate::audit::inode(na, None, &n.dir, true);
+            let (opath, npath) = (parent_path(&o), parent_path(&n));
+            crate::audit::inode(oa, None, &o.dir, true, &opath);
+            crate::audit::inode(na, None, &n.dir, true, &npath);
             // may_delete (元) と、行き先があれば may_delete、なければ may_create
             if let Ok(m) = o.dir.lookup(&o.name) {
-                crate::audit::child(&o.dir, &o.name, Some(&m), NameType::Delete);
+                crate::audit::child(&o.dir, &o.name, Some(&m), NameType::Delete, &opath);
             }
             match n.dir.lookup(&n.name) {
-                Ok(t) => crate::audit::child(&n.dir, &n.name, Some(&t), NameType::Delete),
-                Err(_) => crate::audit::child(&n.dir, &n.name, None, NameType::Create),
+                Ok(t) => crate::audit::child(&n.dir, &n.name, Some(&t), NameType::Delete, &npath),
+                Err(_) => crate::audit::child(&n.dir, &n.name, None, NameType::Create, &npath),
             }
-            Some(AuditPlan::Create { dir: n.dir, name: n.name })
+            Some(AuditPlan::Create { dir: n.dir, name: n.name, dir_path: npath })
         }
         _ => None,
     }
@@ -4015,18 +4061,18 @@ pub fn audit_post(plan: AuditPlan, r: &Result<i64, i64>) {
     match plan {
         AuditPlan::Open { an, creat } => {
             let Ok(f) = file_of(*v as u64) else { return };
-            let Kind::Inode(i, _) = &f.borrow().kind else { return };
+            let Kind::Inode(i, p) = &f.borrow().kind else { return };
             match creat {
-                Some((dir, name)) => {
-                    crate::audit::inode(an, None, &dir, true);
-                    crate::audit::child(&dir, &name, Some(i), NameType::Create);
+                Some((dir, name, dp)) => {
+                    crate::audit::inode(an, None, &dir, true, &dp);
+                    crate::audit::child(&dir, &name, Some(i), NameType::Create, &dp);
                 }
-                None => crate::audit::inode(an, None, i, false),
+                None => crate::audit::inode(an, None, i, false, p),
             }
         }
-        AuditPlan::Create { dir, name } => {
+        AuditPlan::Create { dir, name, dir_path } => {
             if let Ok(i) = dir.lookup(&name) {
-                crate::audit::child(&dir, &name, Some(&i), NameType::Create);
+                crate::audit::child(&dir, &name, Some(&i), NameType::Create, &dir_path);
             }
         }
         AuditPlan::Exec => crate::audit::execve(),

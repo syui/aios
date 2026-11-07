@@ -1674,6 +1674,10 @@ pub fn exit(code: i32) -> ! {
 fn exit_status(status: i32) -> ! {
     let p = current();
     crate::trace::exit(p.pid, status as i64);
+    // 監査: exit や exit_group の中なら、その記録 (__audit_free)
+    if p.audit.is_some() {
+        crate::audit::task_exit();
+    }
     crate::ns::init_exited(p);
     // 持ったまま終わる robust futex に OWNER_DIED (Linux の futex_exit_release は mm_release の clear_child_tid より先)
     crate::futex::exit_robust_list();

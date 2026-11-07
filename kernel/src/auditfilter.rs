@@ -17,9 +17,13 @@
 // - 名前で合わせるもの (WATCH、INODE): システムコールで集めた名前 (audit.rs の PATH) ごとに (audit_filter_inodes)。
 //   WATCH はそのパスにいまある inode (なければ前に見たもの: 消した・動かしたシステムコールでも合う。Linux は消える前に
 //   合わせてから watch を外す)。DEVMAJOR、DEVMINOR、OBJ_UID、OBJ_GID、FILETYPE もシステムコールの名前で
-// - のこり: DIR (ディレクトリの下みな: Linux の audit_tree) と LSM のラベル (AppArmor の SUBJ_ROLE) はまだ合わない
+// - DIR (auditctl -w DIR: Linux の audit_tree): たどって引いた名前 (NORMAL と PARENT) のどれかが、木の根かその下に
+//   あれば合う (Linux は木の根とその下のマウントの根に印をつけ、名前の親をたどって印を探す)。作る・消すもの (CREATE と
+//   DELETE) は、それ自身が木の根のときだけ
+// - のこり: LSM のラベル (AppArmor の SUBJ_ROLE) はまだ合わない
 use crate::cell::Bkl;
 use crate::proc::Proc;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -166,6 +170,8 @@ pub struct Rule {
     exe: Option<(usize, u64)>,
     /// WATCH のファイルの、最後に見た inode (audit_watch の dev と ino)
     watch_id: Option<(usize, u64)>,
+    /// DIR の木の根の本当のパス
+    tree_path: Option<String>,
 }
 
 /// システムコールで集めた名前の inode (audit_names のうちルールが見るもの)
@@ -178,6 +184,9 @@ pub struct NameInfo {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    /// 本当のパス (/ から) と、たどって引いたものか (DIR のルール)
+    pub path: String,
+    pub walked: bool,
 }
 
 static RULES: Bkl<[Vec<Rule>; 8]> = Bkl::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
@@ -270,7 +279,7 @@ pub fn parse(d: &[u8]) -> Result<Rule, i64> {
             mask[nr as usize / 32] |= 1 << (nr % 32);
         }
     }
-    let mut r = Rule { listnr, flags: flags & PREPEND, legacy: false, action, fields: Vec::new(), mask, key: None, prio: u64::MAX, by_name: false, watch: None, tree: None, exe: None, watch_id: None };
+    let mut r = Rule { listnr, flags: flags & PREPEND, legacy: false, action, fields: Vec::new(), mask, key: None, prio: u64::MAX, by_name: false, watch: None, tree: None, exe: None, watch_id: None, tree_path: None };
     let buf = &d[DATA..];
     let mut at = 0usize;
     // audit_unpack_string: 0 や残りより長いものは EINVAL
@@ -391,8 +400,10 @@ pub fn add(mut r: Rule) -> Result<(), i64> {
     if let Some(p) = &r.watch {
         r.watch_id = parent_child(p)?;
     }
-    if let Some(p) = &r.tree {
-        crate::vfs::resolve("", p, false)?;
+    if let Some(p) = r.tree.clone() {
+        // 木の根の本当のパス
+        let (canon, _) = crate::vfs::lookup("", &p, false)?;
+        r.tree_path = Some(format!("/{}", canon));
     }
     let prepend = r.flags & PREPEND != 0;
     if r.listnr == EXIT || r.listnr == URING_EXIT {
@@ -603,6 +614,14 @@ fn field_compare(p: &Proc, f: &Field, s: Option<&Sys>, name: Option<&NameInfo>) 
     idcmp(l, f.op, r)
 }
 
+/// 名前が木 (根のパス t) の中か: たどったものはその親のどれかが根、作る・消すものはそれ自身が根
+fn in_tree(n: &NameInfo, t: &str) -> bool {
+    if !n.walked {
+        return n.path == t;
+    }
+    n.path == t || t == "/" || n.path.strip_prefix(t).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// 名前 (name があればそれ、なければシステムコールの名前のどれか) に合うか
 fn any_name(s: Option<&Sys>, name: Option<&NameInfo>, f: impl Fn(&NameInfo) -> bool) -> bool {
     match name {
@@ -653,6 +672,8 @@ fn rule_matches(p: &Proc, r: &Rule, s: Option<&Sys>, name: Option<&NameInfo>, wa
             F_OBJ_GID => any_name(s, name, |n| idcmp(n.gid, f.op, f.val)),
             // audit_watch_compare: 名前の inode が WATCH のファイル
             F_WATCH => name.is_some_and(|n| watch == Some(n.id)),
+            // match_tree_refs: 名前のどれかが木の中
+            F_DIR => s.is_some_and(|s| r.tree_path.as_deref().is_some_and(|t| s.names.iter().any(|n| in_tree(n, t)))),
             // 名前やソケットの番地、LSM のラベルを見るもの: まだ合わない
             _ => false,
         };

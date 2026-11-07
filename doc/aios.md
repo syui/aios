@@ -996,12 +996,21 @@ loginuid と sessionid、AUDIT_LOGIN、SYSCALL などの記録を組 READLOG で
   前に見たもの: 消す・動かすシステムコールでも合う)、INODE、DEVMAJOR、OBJ_UID、FILETYPE も名前で。perm の w は
   ディレクトリを変えるもの (mkdir、unlink、rename など) もふくむ (Linux の write のクラス)
 
-test/auditpath.c (root で) は子のパスのシステムコールと WATCH の記録をくらべて同じ (174 行)。kmsg のかぎりがあるので、ところどころで
+- DIR (auditctl -w DIR -p wa: Linux の audit_tree): たどって引いた名前 (NORMAL と PARENT) のどれかが木の根かその下に
+  あれば合う (木の中で作る・chmod・mkdir、深いところ、木の外へ動かす、木の根そのもの)。木の外のもの、読むだけのもの
+  (perm) は合わない
+- ほかのパスのシステムコールの名前: openat2 (OPENAT2 の記録 `oflag=0101 mode=0644 resolve=0x0` も)、mknodat、
+  utimensat (パスがなければ名前なし)、faccessat、faccessat2、chdir、chroot、statfs、inotify_add_watch、fchmod と fchown
+  (fd のもの: `name=(null)` の PATH)。CWD は、いまの根から見たパス (chroot したあとならその中: Linux の d_path)
+- 終わるとき (__audit_free): exit や exit_group の中なら、そのルールを見て記録を出す (success と exit はない)。待っている
+  ところをシグナルで殺されたものは、Linux と同じく EINTR で出口を通るので `success=no exit=-4`
+
+test/auditpath.c (root で) は子のパスのシステムコールと WATCH の記録をくらべて同じ (174 行)。test/auditdir.c (root で)
+は DIR、ほかのパスのシステムコール、exit_group、殺されたときの記録をくらべて同じ (149 行)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
-AUDIT も入る (select)。のこり: 名前を集めるシステムコールは上のものと faccessat、chdir、chroot、truncate、execve
-だけ (openat2、mknodat の中身、utimensat、xattr、mount などはまだ)、動的なプログラムの ld.so の名前、DIR のルール (ディレクトリ
-の下みな)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、終わるとき (exit_group) の記録、
-/proc/PID/task/TID/loginuid、TTY の入力の記録 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)。
+AUDIT も入る (select)。のこり: xattr、mount、execveat、name_to_handle_at などの名前、動的なプログラムの ld.so の名前、
+AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、/proc/PID/task/TID/loginuid、TTY の入力の記録
+(TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)。
 
 ### ファイアウォール (nftables)
 

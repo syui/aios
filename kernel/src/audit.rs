@@ -28,8 +28,9 @@
 //   出したシステムコールは、出口で SYSCALL、PROCTITLE、EOE も (Linux 7.4 は記録が出ると dummy をやめる)
 // - ルール (auditfilter.rs: AUDIT_ADD_RULE / DEL_RULE / LIST_RULES): USER の組はユーザーの記録を、EXCLUDE の組は記録の
 //   種類を、EXIT の組はシステムコールの出口で、TASK の組は fork で入れものを作るかを決める
-// - パスの名前 (getname / inode / child: sysfile::audit_pre と audit_post が呼ぶ): 出口で CWD、名前ごとの PATH、EXECVE
-// - のこり: 名前を集めないシステムコール、DIR のルール、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、TTY の入力の記録 (TTY_SET は
+// - パスの名前 (getname / inode / child: sysfile::audit_pre と audit_post が呼ぶ): 出口で CWD (いまの根から見たパス)、
+//   名前ごとの PATH、EXECVE、OPENAT2。終わるとき (task_exit: exit や exit_group の中) も記録を (success と exit なし)
+// - のこり: 名前を集めないシステムコール (xattr、mount など)、AUDIT_MAKE_EQUIV (EOPNOTSUPP)、TTY の入力の記録 (TTY_SET は
 //   覚えるだけ)、backlog (記録はすぐ出すので行列がない)
 use crate::cell::Bkl;
 use crate::netlink::{self, NetlinkRef};
@@ -82,6 +83,7 @@ const AUDIT_CWD: u16 = 1307;
 const AUDIT_EXECVE: u16 = 1309;
 const AUDIT_EOE: u16 = 1320;
 const AUDIT_PROCTITLE: u16 = 1327;
+const AUDIT_OPENAT2: u16 = 1337;
 const AUDIT_CONFIG_CHANGE: u16 = 1305;
 const AUDIT_FEATURE_CHANGE: u16 = 1328;
 const AUDIT_REPLACE: u16 = 1329;
@@ -493,6 +495,8 @@ pub struct Ctx {
     pwd: Option<String>,
     /// execve がうまくいった (EXECVE の記録: 新しいプログラムの引数)
     execve: bool,
+    /// openat2 の open_how (OPENAT2 の記録: flags、mode、resolve)
+    openat2: Option<(u64, u64, u64)>,
 }
 
 /// 名前の種類 (AUDIT_TYPE_*)
@@ -515,13 +519,15 @@ struct Name {
     inode: Option<crate::auditfilter::NameInfo>,
 }
 
-/// inode の見え方 (audit_copy_inode: そのときの mode や持ち主)
-fn info(i: &crate::vfs::InodeRef) -> crate::auditfilter::NameInfo {
+/// inode の見え方 (audit_copy_inode: そのときの mode や持ち主)。path はその本当のパス (/ から)、walked はたどって
+/// 引いたもの (audit_inode の handle_path: DIR のルールは、その親のどれかが木の根なら合う)
+fn info(i: &crate::vfs::InodeRef, path: &str, walked: bool) -> crate::auditfilter::NameInfo {
     let m = i.meta();
     let id = i.id();
     let dev = crate::vfs::decode_dev(crate::vfs::st_dev(id.0));
     let rdev = if matches!(m.mode & 0o170000, 0o020000 | 0o060000) { ((m.rdev >> 8) as u32 & 0xfff, (m.rdev & 0xff) as u32) } else { (0, 0) };
-    crate::auditfilter::NameInfo { id, ino: m.ino, dev, rdev, mode: m.mode, uid: m.uid, gid: m.gid }
+    let path = format!("/{}", path.trim_start_matches('/'));
+    crate::auditfilter::NameInfo { id, ino: m.ino, dev, rdev, mode: m.mode, uid: m.uid, gid: m.gid, path, walked }
 }
 
 /// parent_len: パスの親の部分の長さ (終わりの / は飛ばし、親の / までふくめる)
@@ -576,14 +582,15 @@ pub fn getname(path: &str) -> Option<usize> {
     Some(i)
 }
 
-/// __audit_inode: 名前 (an) の inode を覚える。parent なら親のディレクトリとして (名前は親の部分だけ出す)
-pub fn inode(an: Option<usize>, name: Option<&str>, ino: &crate::vfs::InodeRef, parent: bool) {
+/// __audit_inode: 名前 (an) の inode を覚える。parent なら親のディレクトリとして (名前は親の部分だけ出す)。
+/// an も name もなければ (audit_file: fd のもの) 名前なしで足す。path はその inode の本当のパス
+pub fn inode(an: Option<usize>, name: Option<&str>, ino: &crate::vfs::InodeRef, parent: bool, path: &str) {
     let Some(c) = names_ctx() else { return };
     let ok_type = |t: NameType| if parent { t == NameType::Parent || t == NameType::Unknown } else { t != NameType::Parent };
-    let inf = info(ino);
+    let inf = info(ino, path, true);
     let mut at = an.filter(|&i| i < c.names.len() && ok_type(c.names[i].typ));
-    // ほかの名前で、同じ inode のもの (うしろから)
-    if at.is_none() {
+    // ほかの名前で、同じ inode のもの (うしろから。名前のないものは見ない)
+    if at.is_none() && (an.is_some() || name.is_some()) {
         at = c.names.iter().rposition(|n| n.inode.as_ref().is_some_and(|x| x.id == inf.id) && ok_type(n.typ));
     }
     let i = match at {
@@ -608,8 +615,9 @@ pub fn inode(an: Option<usize>, name: Option<&str>, ino: &crate::vfs::InodeRef, 
     n.inode = Some(inf);
 }
 
-/// __audit_inode_child: 作る・消すもの (dir の中の dname)。親の名前があればそれを親に、子の名前がなければ親の名前で足す
-pub fn child(dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::InodeRef>, typ: NameType) {
+/// __audit_inode_child: 作る・消すもの (dir の中の dname)。親の名前があればそれを親に、子の名前がなければ親の名前で足す。
+/// dir_path は親の本当のパス
+pub fn child(dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::InodeRef>, typ: NameType, dir_path: &str) {
     let Some(c) = names_ctx() else { return };
     let did = dir.id();
     let (mut parent, mut kid) = (None::<usize>, None::<usize>);
@@ -638,7 +646,7 @@ pub fn child(dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::I
     }
     if parent.is_none() {
         let i = alloc_name(c, NameType::Parent);
-        c.names[i].inode = Some(info(dir));
+        c.names[i].inode = Some(info(dir, dir_path, false));
     }
     let k = match kid {
         Some(k) => k,
@@ -650,7 +658,41 @@ pub fn child(dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::I
             k
         }
     };
-    c.names[k].inode = ino.map(info);
+    let child_path = format!("{}/{}", dir_path.trim_end_matches('/'), dname);
+    c.names[k].inode = ino.map(|i| info(i, &child_path, false));
+}
+
+/// openat2 の open_how (__audit_openat2_how: OPENAT2 の記録)
+pub fn openat2(flags: u64, mode: u64, resolve: u64) {
+    if let Some(c) = names_ctx() {
+        c.openat2 = Some((flags, mode, resolve));
+    }
+}
+
+/// 終わるとき (__audit_free: do_exit)。システムコールの中 (exit や exit_group) なら、そのルールを見て、出すことに
+/// なれば記録を (success と exit はない)
+pub fn task_exit() {
+    let p = proc::current();
+    let Some(c) = p.audit.as_mut() else { return };
+    if c.dummy || !c.in_syscall {
+        return;
+    }
+    c.in_syscall = false;
+    let auditd = st().pid;
+    if auditd == 0 || auditd != p.tgid {
+        let names: Vec<crate::auditfilter::NameInfo> = c.names.iter().filter_map(|n| n.inode.clone()).collect();
+        let mut sys = crate::auditfilter::Sys { major: c.major, argv: c.argv, ret: None, prio: c.prio, names: &names };
+        if let Some(hit) = crate::auditfilter::filter_syscall(p, &sys) {
+            sys.prio = hit.prio;
+            apply(p, hit);
+        }
+        if let Some(hit) = crate::auditfilter::filter_inodes(p, &sys) {
+            apply(p, hit);
+        }
+    }
+    if p.audit.as_ref().is_some_and(|c| c.record) {
+        log_exit(None);
+    }
 }
 
 /// execve がうまくいった (__audit_bprm: EXECVE の記録を出す)
@@ -686,6 +728,7 @@ pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<Ctx>> {
         names: Vec::new(),
         pwd: None,
         execve: false,
+        openat2: None,
     }))
 }
 
@@ -742,7 +785,7 @@ pub fn syscall_exit(ret: i64) {
             }
         }
         if p.audit.as_ref().is_some_and(|c| c.record) {
-            log_exit(ret);
+            log_exit(Some(ret));
         }
     }
     // audit_reset_context (dummy なら番号などはそのまま)
@@ -750,7 +793,7 @@ pub fn syscall_exit(ret: i64) {
     if !c.dummy {
         (c.record, c.serial, c.ctime, c.major, c.argv) = (c.always, 0, 0, 0, [0; 4]);
         c.names.clear();
-        (c.pwd, c.execve) = (None, false);
+        (c.pwd, c.execve, c.openat2) = (None, false, None);
         c.prio = if c.always { u64::MAX } else { 0 };
         if !c.always {
             c.key = None;
@@ -778,13 +821,13 @@ fn fixup(ret: i64) -> i64 {
 }
 
 /// audit_log_exit: SYSCALL、PROCTITLE、EOE (同じ時刻と番号で)
-fn log_exit(ret: i64) {
+fn log_exit(ret: Option<i64>) {
     // SYSCALL を出さない種類なら、ほかも出さない
     if excluded(AUDIT_SYSCALL) {
         return;
     }
-    let code = fixup(ret);
-    let success = !(-4095..0).contains(&ret);
+    // 返した値 (終わるとき (exit_group) にはない)
+    let result = ret.map_or(String::new(), |r| format!(" success={} exit={}", if (-4095..0).contains(&r) { "no" } else { "yes" }, fixup(r)));
     let (major, argv, ns, serial, key, items) = {
         let c = proc::current().audit.as_mut().unwrap();
         if c.serial == 0 {
@@ -793,11 +836,10 @@ fn log_exit(ret: i64) {
         (c.major, c.argv, c.ctime, c.serial, c.key.clone(), c.names.len())
     };
     let body = format!(
-        "arch={:x} syscall={} success={} exit={} a0={:x} a1={:x} a2={:x} a3={:x} items={}{} key={}",
+        "arch={:x} syscall={}{} a0={:x} a1={:x} a2={:x} a3={:x} items={}{} key={}",
         crate::seccomp::AUDIT_ARCH_AARCH64,
         major,
-        if success { "yes" } else { "no" },
-        code,
+        result,
         argv[0],
         argv[1],
         argv[2],
@@ -808,18 +850,27 @@ fn log_exit(ret: i64) {
     );
     put(AUDIT_SYSCALL, ns, serial, &body);
     let c = proc::current().audit.as_ref().unwrap();
-    // EXECVE (show_special): 新しいプログラムの引数
+    // EXECVE と OPENAT2 (show_special)
     if c.execve && !excluded(AUDIT_EXECVE) {
         put(AUDIT_EXECVE, ns, serial, &execve_args());
     }
+    let c = proc::current().audit.as_ref().unwrap();
+    if let Some((f, m, r)) = c.openat2
+        && !excluded(AUDIT_OPENAT2)
+    {
+        put(AUDIT_OPENAT2, ns, serial, &format!("oflag=0{:o} mode=0{:o} resolve=0x{:x}", f, m, r));
+    }
     // CWD と PATH (名前ごと)
     let c = proc::current().audit.as_ref().unwrap();
-    if let Some(pwd) = c.pwd.as_deref()
+    // いまのディレクトリは、いまの根から見たパスで (d_path: chroot したあとなら、その中のパス)
+    let pwd = c.pwd.as_deref().map(seen_from_root);
+    if let Some(pwd) = pwd.as_deref()
         && !excluded(AUDIT_CWD)
     {
         put(AUDIT_CWD, ns, serial, &format!("cwd={}", untrusted(pwd.as_bytes())));
     }
-    let lines: Vec<String> = c.names.iter().enumerate().map(|(i, n)| path_line(i, n, c.pwd.as_deref())).collect();
+    let c = proc::current().audit.as_ref().unwrap();
+    let lines: Vec<String> = c.names.iter().enumerate().map(|(i, n)| path_line(i, n, pwd.as_deref())).collect();
     for l in lines {
         if !excluded(AUDIT_PATH) {
             put(AUDIT_PATH, ns, serial, &l);
@@ -830,6 +881,19 @@ fn log_exit(ret: i64) {
     }
     if !excluded(AUDIT_EOE) {
         put(AUDIT_EOE, ns, serial, "");
+    }
+}
+
+/// 本当のパスを、いまのプロセスの根 (chroot) から見たパスに
+fn seen_from_root(path: &str) -> String {
+    let root = format!("/{}", proc::current().files().root.trim_start_matches('/'));
+    if root == "/" || !path.starts_with(&root) {
+        return String::from(path);
+    }
+    match &path[root.len()..] {
+        "" => "/".into(),
+        rest if rest.starts_with('/') => rest.into(),
+        _ => String::from(path),
     }
 }
 
