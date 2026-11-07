@@ -7,10 +7,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -19,6 +21,7 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
@@ -493,6 +496,50 @@ static void zero_range(int tmpfs) {
     rm(".ch-zr");
 }
 
+static long long mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+static volatile unsigned long spin_sink;
+
+static void timerfd_cputime(void) {
+    // CPU の時計の timerfd: aios は作れて、眠っているあいだは来ず、CPU を 30 ms 使ったら読める。Linux は EINVAL
+    // (timerfd_create(2) の BUGS: timer_create はできる)
+    int fd = timerfd_create(CLOCK_PROCESS_CPUTIME_ID, TFD_NONBLOCK);
+    int e = errno;
+    char got[160];
+    if (fd < 0) {
+        snprintf(got, sizeof got, "timerfd_create(CLOCK_PROCESS_CPUTIME_ID) = -1 %s", strerror(e));
+        check("timerfd-cputime", 0, e == EINVAL, got);
+        return;
+    }
+    struct itimerspec its = {{0, 0}, {0, 30000000}};
+    timerfd_settime(fd, 0, &its, NULL);
+    struct timespec sl = {0, 100000000};
+    nanosleep(&sl, NULL);
+    uint64_t n = 0;
+    long r1 = read(fd, &n, 8);
+    int e1 = errno;
+    struct pollfd p = {fd, POLLIN, 0};
+    long long start = mono_ns();
+    int ready = 0;
+    while (mono_ns() - start < 2000000000LL) {
+        if (poll(&p, 1, 0) == 1) {
+            ready = 1;
+            break;
+        }
+        for (int i = 0; i < 10000; i++)
+            spin_sink += i;
+    }
+    long r2 = read(fd, &n, 8);
+    snprintf(got, sizeof got, "after 100 ms asleep: %s, after spinning: %s, read %ld ticks %llu", r1 < 0 ? strerror(e1) : "readable",
+             ready ? "readable" : "not readable", r2, (unsigned long long)n);
+    check("timerfd-cputime", r1 < 0 && e1 == EAGAIN && ready && r2 == 8 && n == 1, 0, got);
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     struct utsname u;
     on_aios = uname(&u) == 0 && !strcmp(u.sysname, "aios");
@@ -517,6 +564,7 @@ int main(int argc, char **argv) {
             lock_deadlock();
             recvmmsg_timeout();
             send_notconn();
+            timerfd_cputime();
         }
     }
     if (!on_aios)

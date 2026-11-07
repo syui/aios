@@ -1,7 +1,10 @@
 // timerfd (timerfd_create / timerfd_settime / timerfd_gettime)。決めた時刻に読めるようになる fd。
 // read で、前に読んでから何回期限が来たか (u64) が返る。interval があればくりかえす。
 // 期限が来たかは、読むとき・poll のとき・タイマの割り込み (tick、cpu0 で 1/100 秒ごと) に見る。
-// 時刻はみな起動からの ns (CLOCK_MONOTONIC) で覚える。CLOCK_REALTIME の絶対時刻は、決めたときに直す
+// 時刻はみな起動からの ns (CLOCK_MONOTONIC) で覚える。CLOCK_REALTIME の絶対時刻は、決めたときに直す。
+// CPU の時計 (CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID: 作ったプロセスかスレッドのもの) は、その時計の ns で
+// 覚えて tick ごとに見る: aios がえらんだちがい (timerfd-cputime)。Linux は EINVAL (timerfd_create(2) の BUGS:
+// timer_create はできるのに)。シグナルなしで、epoll などで CPU を使いすぎたことを待てる
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::proc;
@@ -24,6 +27,8 @@ const TFD_NONBLOCK: u64 = 0o4000;
 
 pub struct TimerFd {
     realtime: bool,
+    /// CPU の時計なら、その時計 (next と interval はその ns)
+    cpu: Option<crate::timer::Clock>,
     /// 作ったときの時計と、さいごの settime の印 (TFD_TIMER_ABSTIME と TFD_TIMER_CANCEL_ON_SET。/proc/PID/fdinfo)
     clockid: u8,
     settime_flags: u8,
@@ -53,9 +58,17 @@ fn now() -> u64 {
     crate::timer::uptime_ns()
 }
 
+/// そのタイマの時計のいま (CPU の時計の相手がもういなければ None: もう鳴らない)
+fn now_of(t: &TimerFd) -> Option<u64> {
+    match t.cpu {
+        Some(c) => crate::timer::clock_ns(c).ok(),
+        None => Some(now()),
+    }
+}
+
 /// 期限が来ていたら ticks を増やして次の期限へ。増えたら true
 fn update(t: &mut TimerFd) -> bool {
-    let n = now();
+    let Some(n) = now_of(t) else { return false };
     if t.next == 0 || n < t.next {
         return false;
     }
@@ -77,10 +90,22 @@ fn wake(t: &TimerRef) {
 }
 
 pub fn create(clock: u64, flags: u64) -> Result<i64, i64> {
-    if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM) || flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
+    const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+    const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+    const CAP_WAKE_ALARM: u32 = 35;
+    const EPERM: i64 = 1;
+    if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID)
+        || flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0
+    {
         return Err(crate::why::inval());
     }
-    let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), clockid: clock as u8, settime_flags: 0, next: 0, interval: 0, ticks: 0, generation: 0 }));
+    // ALARM の時計は CAP_WAKE_ALARM (Linux と同じ)
+    if matches!(clock, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM) && !crate::cred::current().capable(CAP_WAKE_ALARM) {
+        return Err(-EPERM);
+    }
+    // aios がえらんだちがい (timerfd-cputime): CPU の時計 (作ったプロセスかスレッドのもの)
+    let cpu = matches!(clock, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID).then(|| crate::timer::clock_of(clock as i32, false)).transpose()?;
+    let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), cpu, clockid: clock as u8, settime_flags: 0, next: 0, interval: 0, ticks: 0, generation: 0 }));
     let fl = file::O_RDWR | if flags & TFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
     let fd = proc::current().files().add(file::new(Kind::TimerFd(t), fl), flags & TFD_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
@@ -116,7 +141,8 @@ fn current_spec(t: &mut TimerFd) -> [u8; 32] {
     let mut b = [0u8; 32];
     put_ts(&mut b[0..16], t.interval);
     if t.next != 0 {
-        put_ts(&mut b[16..32], t.next.saturating_sub(now()).max(1));
+        let n = now_of(t).unwrap_or(0);
+        put_ts(&mut b[16..32], t.next.saturating_sub(n).max(1));
     }
     b
 }
@@ -153,11 +179,11 @@ pub fn settime(fd: u64, flags: u64, new: usize, old: usize) -> Result<i64, i64> 
         tm.next = if value == 0 {
             0
         } else if flags & TFD_TIMER_ABSTIME != 0 {
-            // 絶対時刻: REALTIME なら今の差で起動からの時刻に直す (過ぎていれば今)
+            // 絶対時刻: REALTIME なら今の差で起動からの時刻に直す (過ぎていれば今)。CPU の時計はそのまま
             let base = if tm.realtime { crate::timer::epoch_ns().saturating_sub(now()) } else { 0 };
             value.saturating_sub(base).max(1)
         } else {
-            now().saturating_add(value)
+            now_of(&tm).unwrap_or(0).saturating_add(value)
         };
         tm.generation += 1;
     }
@@ -199,8 +225,9 @@ pub fn read(t: &TimerRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> 
         if nonblock {
             return Err(-EAGAIN);
         }
-        // 期限 (tick) まで眠る。止まっているタイマなら settime を待つ
-        let d = if deadline == 0 { 0 } else { deadline.div_ceil(1_000_000_000 / crate::timer::HZ).max(1) };
+        // 期限 (tick) まで眠る。止まっているタイマなら settime を待つ。CPU の時計は壁の時刻では来ないので、tick が起こす
+        let cpu = t.borrow().cpu.is_some();
+        let d = if deadline == 0 || cpu { 0 } else { deadline.div_ceil(1_000_000_000 / crate::timer::HZ).max(1) };
         proc::sleep_until(chan(t), d)?;
     }
 }

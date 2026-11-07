@@ -2631,6 +2631,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | send-notconn | 一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ send / write すると ENOTCONN (SIGPIPE はなし)。つないだあとで閉じられたものは Linux と同じ EPIPE と SIGPIPE | どちらも EPIPE と SIGPIPE (sk_stream_wait_connect) | POSIX は、つながっていないソケットは ENOTCONN、もうつながっていないものは EPIPE と分けている。Linux でも AF_UNIX の stream は ENOTCONN で、TCP だけがちがう (send(2) の BUGS)。FreeBSD も ENOTCONN。つないでいないソケットに書くまちがいで、プロセスが SIGPIPE で落ちない。ロボットは Linux で、EPIPE のとき TCP_INFO の送った segment の数 (tcpi_segs_out。dport と同じく、connect にしくじるか AF_UNSPEC で切ると 0 にもどる) が 0 なら ENOTCONN にしてまねる。test/chosen.c も確かめる |
 | apparmor-inet | AppArmor の network_v9 の af_inet を名のり、`network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の番地の決まりを効かせる (読みかたは apparmor_parser の決まりの形と Ubuntu のカーネルの af_inet.c と同じ。特権の port、deny の決まり、自分の番地の条件のない peer の決まりの 3 つは、Ubuntu の読みかたのまちがいをなおした: 上の「AF_INET」) | af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) の決まりにする (allow は広く許し、deny は広く止める)。af_inet.c は番地を記録に書くだけ | 書いた決まりのとおりに効く (書いたよりも多く許さない、多く止めない)。パーサも Ubuntu のカーネルもこの決まりを持っていて、Linux の本体にまだ入っていないだけ。ロボットは AppArmor を見ないので、test/apparmor.c が両方でたしかめる (aios は番地の答え、Linux は広がった決まりの答えと、features に af_inet がないこと) |
 | audit-field-value | audit のルールの値の決まりを見て EINVAL: LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT のビットだけ、FIELD_COMPARE は AUDIT_MAX_FIELD_COMPARE まで、SADDR_FAM は AF_MAX より下 | 値をたしかめるところ (audit_field_valid) が、値を入れる前の f->val (0) を見るので、どれも通る。FIELD_COMPARE の知らない番号は、そのルールを合わせるたびに WARN (カーネルのスタックを kmsg に) | Linux のコードが書いてあるとおりのふるまい (値をたしかめるつもりのコードが効いていない)。root がまちがって足したルールが黙って何にも合わない (FILETYPE、PERM) か、カーネルの WARN を出しつづける (FIELD_COMPARE) のを、足すときに知らせる。test/auditrules.c が Linux ではこれをまねてくらべる |
+| timerfd-cputime | timerfd_create で CPU の時計 (CLOCK_PROCESS_CPUTIME_ID、CLOCK_THREAD_CPUTIME_ID: 作ったプロセスかスレッドのもの) もとれる。その CPU 時間が期限をこえたら読める (tick ごとに見る。期限とのこりはその時計の ns) | EINVAL (timerfd_create(2) の BUGS: timer_create では CPU の時計のタイマを作れるのに) | CPU を使いすぎたことを、シグナルなしで epoll などといっしょに待てる (シグナルのハンドラはライブラリの中で使いにくい)。同じ時計を timer_create と timerfd で分ける理由がない |
 
 #### 手本の Linux のまちがい
 
@@ -2658,7 +2659,7 @@ AppArmor のように Linux の本体の外 (Ubuntu のカーネル、apparmor-n
 |---|---|---|---|
 | recvmmsg で、受けたあとのエラー | 次の呼び出しで返すが、そのあいだの ICMP などで上書きされる (recvmmsg(2) の BUGS) | 捨てる (そこまでの数を返す) | ソケットにとっておいて、次に必ず返す |
 | mmap でファイルの終わりの先 (同じページ) に書いたもの | ページキャッシュに残り、あとの写しに見える (書き出しまで。mmap(2) の BUGS) | 書き出すとき (msync、munmap、終わり、sync) に 0 にするので、munmap のあとの写しには見えない。ほかのプロセスが写しているあいだは見える | 新しく写すときにも終わりの先を 0 に (POSIX) |
-| timerfd の時計 | CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID は EINVAL (timer_create はできる。timerfd_create(2) の BUGS) | Linux と同じ | 使えるように |
+| timerfd の時計 | CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID は EINVAL (timer_create はできる。timerfd_create(2) の BUGS) | 使える (上の表の timerfd-cputime) | (した) |
 | execveat(fd, "", AT_EMPTY_PATH) の #! スクリプト | fd が close-on-exec なら ENOENT なので、fd がスクリプトにもれる (execveat(2) の BUGS) | まだ見ていない | |
 | fcntl のロックと CLONE_FILES | ファイルの表を分けあうプロセスどうしで、ない行きどまりを EDEADLK にすることがある (fcntl_locking(2) の BUGS) | まだ見ていない | |
 | RLIMIT_CPU | SIGXCPU のハンドラがあると、やわらかい上限を 1 秒ずつ上げる (getrlimit(2) の BUGS) | まだ見ていない | |
