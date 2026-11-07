@@ -10,7 +10,6 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
@@ -1310,9 +1309,7 @@ pub fn query(q: &[u8]) -> Result<String, i64> {
     Ok(format!("allow 0x{:08x}\ndeny 0x{:08x}\naudit 0x{:08x}\nquiet 0x{:08x}\n", perms.allow, perms.deny, perms.audit, perms.quiet))
 }
 
-// ---- 記録 (Linux の audit と同じ形を kmsg へ。dmesg に出る) ----
-
-static SERIAL: AtomicU64 = AtomicU64::new(1);
+// ---- 記録 (audit.rs の AUDIT_AVC: auditd がいればそこへ、いなければ kmsg へ。dmesg に出る) ----
 
 /// audit_log_untrustedstring: 引用符でかこむ。空白や " や 7bit の外の文字があれば 16 進で
 fn untrusted(s: &str) -> String {
@@ -1323,10 +1320,22 @@ fn untrusted(s: &str) -> String {
     }
 }
 
-/// "audit: type=1400 audit(秒.ミリ秒:番号): apparmor=..." の頭
+/// 記録の頭 (apparmor="...")。"audit: type=1400 audit(秒.ミリ秒:番号): " は audit::log がつける
 fn audit_head(kind: &str) -> String {
-    let ns = crate::timer::epoch_ns();
-    format!("audit: type=1400 audit({}.{:03}:{}): apparmor=\"{}\"", ns / 1_000_000_000, ns / 1_000_000 % 1000, SERIAL.fetch_add(1, Relaxed), kind)
+    format!("apparmor=\"{}\"", kind)
+}
+
+/// 記録を出す (type=1400)
+fn audit_emit(s: &str) {
+    crate::audit::log(crate::audit::AUDIT_AVC, s);
+}
+
+/// いまのプロセスのラベルの文字 (security_lsmprop_to_secctx: 記録の subj=)。AppArmor が切られていれば None
+pub fn secctx() -> Option<String> {
+    if off() {
+        return None;
+    }
+    Some(String::from(label_text(current_label().as_ref()).trim_end()))
 }
 
 /// 終わりの pid と comm
@@ -1350,7 +1359,7 @@ fn audit_status(op: &str, name: Option<&str>, info: Option<&str>, error: i64) {
         s.push_str(&format!(" name={}", untrusted(n)));
     }
     s.push_str(&audit_tail());
-    crate::println!("{}", s);
+    audit_emit(&s);
 }
 
 // ---- プロセスについたプロファイル (cred の apparmor。fork で受けつぐ) ----
@@ -1629,7 +1638,7 @@ fn audit_file(p: &Profile, perms: &Perms, op: &str, request: u32, name: &str, ta
     if let Some(t) = target {
         s.push_str(&format!(" target={}", untrusted(t)));
     }
-    crate::println!("{}", s);
+    audit_emit(&s);
     match kind {
         "KILLED" => {
             let me = crate::proc::current();
@@ -1703,7 +1712,7 @@ pub fn capable(c: &crate::cred::Cred, cap: u32, audit: bool) -> bool {
     s.push_str(&audit_tail());
     let name = crate::cred::CAP_NAMES.get(cap as usize).copied().unwrap_or("?");
     s.push_str(&format!(" capability={}  capname={}", cap, untrusted(name)));
-    crate::println!("{}", s);
+    audit_emit(&s);
     if kind == "KILLED" {
         let me = crate::proc::current();
         crate::signal::send_thread(me, p.signal as i32, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
@@ -2045,7 +2054,7 @@ fn change_hat(hats: &[&str], token: u64, test: bool) -> Result<(), i64> {
         // 決まりのないプロセスには入る hat がない (Linux も EPERM と記録)
         let mut s = format!("{} operation=\"{}\" class=\"file\" info=\"unconfined can not change_hat\" error={} profile={}", audit_head("DENIED"), OP_CHANGE_HAT, -EPERM, untrusted("unconfined"));
         s.push_str(&audit_tail());
-        crate::println!("{}", s);
+        audit_emit(&s);
         return Err(-EPERM);
     };
     let c = &mut crate::proc::current().cred;
@@ -2168,7 +2177,7 @@ pub fn attr_write(which: &str, b: &[u8]) -> Result<usize, i64> {
             let me = current_profile().map_or("unconfined".into(), |p| p.name.clone());
             let mut s = format!("{} operation=\"setprocattr\" info=\"{}\" error=-22 profile={}", audit_head("DENIED"), which, untrusted(&me));
             s.push_str(&audit_tail());
-            crate::println!("{}", s);
+            audit_emit(&s);
             return Err(-EINVAL);
         }
     }
@@ -2318,7 +2327,7 @@ fn net_check_perms(p: &Profile, mut perms: Perms, info: Option<&str>, op: &str, 
             }
         }
         s.push_str(&x.post);
-        crate::println!("{}", s);
+        audit_emit(&s);
     })
 }
 
@@ -2931,7 +2940,7 @@ fn signal_perm(p: &Profile, peer: &str, request: u32, sig: i32) -> Result<(), i6
             m => s.push_str(&format!(" signal=rtmin+{}", m - 128)),
         }
         s.push_str(&format!(" peer={}", untrusted(peer)));
-        crate::println!("{}", s);
+        audit_emit(&s);
     })
 }
 
@@ -2991,7 +3000,7 @@ fn ptrace_audit(p: &Profile, kind: &str, req: u32, denied: u32, peer: &str, erro
         }
     }
     s.push_str(&format!(" peer={}", untrusted(peer)));
-    crate::println!("{}", s);
+    audit_emit(&s);
 }
 
 /// aa_may_ptrace: いまのプロセス (追う人) が tracee (資格情報) を見る (read) か追う (trace) か。追う人の決まりで相手に
@@ -3088,7 +3097,7 @@ fn mount_audit(p: &Profile, kind: &str, op: &str, info: Option<&str>, error: i64
     if let Some(d) = data {
         s.push_str(&format!(" options={}", untrusted(d)));
     }
-    crate::println!("{}", s);
+    audit_emit(&s);
 }
 
 /// do_match_mnt: (どこでしくじったか (0 は合った), 許し)

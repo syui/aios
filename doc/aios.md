@@ -800,7 +800,8 @@ AF_UNIX の bind)、消す (unlink、rmdir)、rename (前は読んで消す、�
 書くロックは w も)。ディレクトリは名前の終わりに / をつけて見る。enforce なら EACCES と DENIED、complain なら許して ALLOWED、
 audit をつけたものは AUDIT、deny したものは complain でも止めて記録しない、kill なら SIGKILL (またはプロファイルの
 signal)。記録は Linux の dmesg と同じ形 (`audit: type=1400 audit(...): apparmor="DENIED" operation="open" class="file"
-profile=... name=... pid=... comm=... requested_mask="r" denied_mask="r" fsuid=... ouid=...`) で kmsg に。
+profile=... name=... pid=... comm=... requested_mask="r" denied_mask="r" fsuid=... ouid=...`) で、audit の記録の口
+(下の「監査 (NETLINK_AUDIT)」: auditd がいなければ kmsg) に。
 プロファイルのついたプロセスは、大きなロックなしの道 (syscall::fast) を通らない。
 
 capability: aios では root (euid 0) がみなの capability を持つが、root かどうかで決めていたところは、みな Linux と同じ
@@ -926,6 +927,41 @@ apparmor.service と同じく Before=sysinit.target で、aios の init は Befo
 から使う AX_CHECK_COMPILE_FLAG はパッケージに入れた。カーネルのほうでは /proc/PID/fd/N のリンクの大きさを Linux と同じ 64 に
 した (0 だと、libapparmor の path_from_fd が lstat の大きさから readlink を始めて足りなければ倍にするので、0 のまま回り
 つづけ、--write-cache が止まっていた)。
+
+### 監査 (NETLINK_AUDIT)
+
+Linux の kernel/audit.c と同じ口 (kernel/src/audit.rs)。auditctl -s や auditd が NETLINK_AUDIT (9) のソケットで監査の
+設定を読み書きし、login や sudo (PAM の pam_unix など) がユーザーの記録を送る。記録はみな 1 つの番号の数えで
+`audit(秒.ミリ秒:番号): ...` の形になり、auditd がいればそのソケットへ、いなければ kmsg へ `audit: type=N ...` (dmesg で
+見える)。AppArmor の記録 (type=1400) もここを通る。
+
+- 設定 (AUDIT_GET、AUDIT_SET、FEATURE、LIST_RULES、SIGNAL_INFO、TTY_GET / TTY_SET) は CAP_AUDIT_CONTROL、ユーザーの記録
+  (AUDIT_USER と 1100〜1199、2100〜2999) は CAP_AUDIT_WRITE がいる (なければ EPERM)。user namespace の中からは
+  ECONNREFUSED (Linux と同じく、PAM が「audit がない」と思ってログインを止めないように)、古い AUDIT_LIST / ADD / DEL は
+  EOPNOTSUPP、知らないものは EINVAL
+- AUDIT_SET は enabled (0、1、2 は固定)、failure (0 だまる、1 printk、2 panic)、pid、rate_limit、backlog_limit、
+  backlog_wait_time の順。変えたものは AUDIT_CONFIG_CHANGE (1305: `op=set audit_rate_limit=100 old=0 auid=... ses=...
+  subj=unconfined res=1`) に残るが、残すのは audit が on のときだけ (on にしたときは前が off なので残らず、off にしたときは
+  残る)。mask が LOST だけなら、なくした数を 0 にしてその数を ACK のエラーの欄で返す (Linux の古い形)
+- auditd になるのは AUDIT_SET の pid に自分の pid を入れたもの (ほかの pid は EINVAL、いる auditd をほかのものに変えるのは
+  EEXIST、やめられるのは auditd だけで EACCES)。名乗るたびに、いまの auditd に AUDIT_REPLACE (1329) を送ってつながりを
+  たしかめる。auditd への記録の nlmsg_len は中身だけの長さ (頭の 16 バイトを数えない Linux の古い形)、組
+  AUDIT_NLGRP_READLOG (1: 入るのは CAP_AUDIT_READ。journald が読むもの) へはふつうの長さで写す。組は 32 まで入れる
+  (netlink_kernel_create が 32 より少ない組の数を 32 にする。NETLINK_NETFILTER も同じ)。組に入る・出るのも記録に
+  (AUDIT_EVENT_LISTENER 1335: `nl-mcgrp=1 op=connect res=1`。出るのは NETLINK_DROP_MEMBERSHIP と閉じるとき)
+- ユーザーの記録は audit が off なら捨てる (AUDIT_USER_AVC だけは off でも残す)。1 バイトしかなければ EINVAL、終わりの
+  1 バイトは NUL にする (`msg='hello audi'`: Linux と同じく送った文字の終わりが 1 つ消える。ふつうは NUL をつけて送る)
+- AUDIT_SIGNAL_INFO は auditd に SIGTERM / SIGHUP / SIGUSR1 / SIGUSR2 を送った最後のもの (uid、pid、AppArmor のラベル)
+- 答え (GET など) は ACK のあと (Linux は答えを別のスレッドから送る)。受け口の中で出た記録も ACK のあと (Linux は kauditd が
+  行列から送る): auditd をやめた (pid=0) 記録は kmsg に、いる auditd を変えようとした EEXIST の記録は ACK のあとで auditd に
+- kmsg へは 5 秒に 10 こまで (printk_ratelimit: こえたものは捨て、次の窓のはじめに `kauditd_printk_skb: N callbacks
+  suppressed`)。AppArmor の記録がたくさん出ても dmesg があふれない
+
+test/audit.c (root で) は、上のものをみな Linux 7.4-rc1 とくらべて同じ (152 行)。kmsg のかぎりがあるので、ところどころで
+5 秒待つ。手本の Linux は AppArmor を入れると
+AUDIT も入る (select)。のこり: ルール (auditctl -a、システムコールの監査: AUDIT_ADD_RULE / DEL_RULE / MAKE_EQUIV は
+EOPNOTSUPP)、loginuid と session (/proc/PID/loginuid: 記録ではいつも 4294967295)、TTY の入力の記録 (TTY_SET は覚えるだけ)、
+backlog (記録はすぐ出すので行列がない)。
 
 ### ファイアウォール (nftables)
 

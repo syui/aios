@@ -2,9 +2,9 @@
 // (Linux の net/netlink/af_netlink.c と同じ形と答え)。NETLINK_ROUTE の口とアドレスの一覧 (rtnetlink.c の
 // RTM_GETLINK と RTM_GETADDR: musl や glibc の getifaddrs と if_nameindex、node の os.networkInterfaces())、道の表
 // (RTM_GETROUTE: ip route get、Firefox の NetlinkService がつながっているかを見る。下の「道の表」) と、
-// NETLINK_NETFILTER の nftables (nftables.rs。doc/aios.md の「ファイアウォール (nftables)」)。
+// NETLINK_NETFILTER の nftables (nftables.rs。doc/aios.md の「ファイアウォール (nftables)」)、NETLINK_AUDIT (audit.rs)。
 //
-// - socket(AF_NETLINK, SOCK_RAW か SOCK_DGRAM, NETLINK_ROUTE か NETLINK_NETFILTER)。ほかの型は ESOCKTNOSUPPORT、
+// - socket(AF_NETLINK, SOCK_RAW か SOCK_DGRAM, NETLINK_ROUTE、NETLINK_AUDIT か NETLINK_NETFILTER)。ほかの型は ESOCKTNOSUPPORT、
 //   ほかの protocol は EPROTONOSUPPORT (Linux でその機能を入れずに作ったときと同じ)
 // - ACK (netlink_ack): しくじりでなければいつも NLM_F_CAPPED。NETLINK_EXT_ACK なら、しくじりのわけと属性の場所
 //   (NLMSGERR_ATTR_MSG と NLMSGERR_ATTR_OFFS) を足して NLM_F_ACK_TLVS
@@ -175,7 +175,7 @@ pub fn create(typ: u64, protocol: u64) -> Result<NetlinkRef, i64> {
         return Err(-ESOCKTNOSUPPORT);
     }
     let protocol = protocol as u32;
-    if protocol >= MAX_LINKS || (protocol != NETLINK_ROUTE && protocol != crate::nftables::NETLINK_NETFILTER) {
+    if protocol >= MAX_LINKS || !matches!(protocol, NETLINK_ROUTE | crate::audit::NETLINK_AUDIT | crate::nftables::NETLINK_NETFILTER) {
         return Err(-EPROTONOSUPPORT);
     }
     let n = Rc::new(RefCell::new(Netlink::default()));
@@ -209,6 +209,12 @@ impl Drop for Netlink {
             // 持ち主の表を消す (NETLINK_URELEASE)
             if self.protocol == crate::nftables::NETLINK_NETFILTER {
                 crate::nftables::release(self.portid);
+            }
+        }
+        // 入っていた NETLINK_AUDIT の組から出たことを記録に (netlink_release の netlink_unbind)
+        if self.protocol == crate::audit::NETLINK_AUDIT {
+            for g in (0..64).filter(|g| self.groups & 1 << g != 0) {
+                crate::audit::multicast(g + 1, "disconnect", true);
             }
         }
     }
@@ -262,13 +268,24 @@ fn sockaddr_of(pid: u32, groups: u32) -> [u8; 12] {
 }
 
 /// bind (netlink_bind: 名前を確かめ、もうポートがあれば同じものだけ、0 なら自分で決める。multicast の組に入るのは、
-/// NETLINK_ROUTE ならだれでも (NL_CFG_F_NONROOT_RECV)。組は 32 までなのでみな)
+/// NETLINK_ROUTE ならだれでも (NL_CFG_F_NONROOT_RECV)。組は 32 までなのでみな。NETLINK_AUDIT の組に入るのは
+/// CAP_AUDIT_READ (audit_multicast_bind: 入ったことは記録に)
 pub fn bind(n: &NetlinkRef, a: &[u8]) -> R {
     let (pid, groups) = sockaddr(a)?;
     let (bound, cur, protocol) = {
         let s = n.borrow();
         (s.bound, s.portid, s.protocol)
     };
+    let audit = protocol == crate::audit::NETLINK_AUDIT;
+    if audit && groups != 0 {
+        if bound && pid != cur {
+            return Err(crate::why::inval());
+        }
+        if !proc::current().cred.capable(crate::cred::CAP_AUDIT_READ) {
+            crate::audit::multicast(groups.trailing_zeros() + 1, "connect", false);
+            return Err(-EPERM);
+        }
+    }
     if bound {
         if pid != cur {
             return Err(crate::why::inval());
@@ -281,8 +298,15 @@ pub fn bind(n: &NetlinkRef, a: &[u8]) -> R {
         }
         insert(n, pid);
     }
-    let mut s = n.borrow_mut();
-    s.groups = (s.groups & !0xffff_ffff) | groups as u64;
+    {
+        let mut s = n.borrow_mut();
+        s.groups = (s.groups & !0xffff_ffff) | groups as u64;
+    }
+    if audit {
+        for g in (0..32).filter(|g| groups & 1 << g != 0) {
+            crate::audit::multicast(g + 1, "connect", true);
+        }
+    }
     Ok(0)
 }
 
@@ -379,9 +403,16 @@ pub fn notify_proto(protocol: u32, group: u32, msg: Vec<u8>) {
     }
 }
 
+/// カーネルからポート portid のソケットへ (netlink_unicast)。そのポートがなければ false
+pub fn unicast(protocol: u32, portid: u32, msg: Vec<u8>) -> bool {
+    let Some(peer) = ports().get(&(protocol, portid)).and_then(|w| w.upgrade()) else { return false };
+    deliver(&peer, 0, 0, msg);
+    true
+}
+
 /// 受ける行列に入れて起こす (読んで待つ人と、poll / epoll で待つ人。入れ物があふれたら捨てる: Linux は ENOBUFS を
 /// 次に返す)。group は multicast の組のビット (recvmsg の nl_groups)
-fn deliver(n: &NetlinkRef, from: u32, group: u32, d: Vec<u8>) {
+pub fn deliver(n: &NetlinkRef, from: u32, group: u32, d: Vec<u8>) {
     {
         let mut s = n.borrow_mut();
         let used: usize = s.rq.iter().map(|x| x.2.len()).sum();
@@ -493,17 +524,30 @@ pub fn setsockopt(n: &NetlinkRef, level: u64, opt: u64, val: &[u8]) -> R {
             let v = int()?;
             match opt {
                 NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
-                    // 組の数: NETLINK_ROUTE は RTNLGRP_MAX、NETLINK_NETFILTER は NFNLGRP_MAX (9: NFNLGRP_NFTRACE)
-                    let max = if n.borrow().protocol == 12 { 9 } else { RTNLGRP_MAX };
+                    // 組の数: NETLINK_ROUTE は RTNLGRP_MAX。ほかは 32 (netlink_kernel_create は 32 より少ない組の数を
+                    // 32 にする: NETLINK_NETFILTER の NFNLGRP_MAX 9 も NETLINK_AUDIT の AUDIT_NLGRP_MAX 1 も)
+                    let protocol = n.borrow().protocol;
+                    let audit = protocol == crate::audit::NETLINK_AUDIT;
+                    let max = if protocol == NETLINK_ROUTE { RTNLGRP_MAX } else { 32 };
                     if v == 0 || v > max {
                         return Err(crate::why::inval());
                     }
+                    // NETLINK_AUDIT の組に入るのは CAP_AUDIT_READ。入った・出たことは記録に (出たのは、出てから)
+                    if audit && opt == NETLINK_ADD_MEMBERSHIP && !proc::current().cred.capable(crate::cred::CAP_AUDIT_READ) {
+                        crate::audit::multicast(v, "connect", false);
+                        return Err(-EPERM);
+                    }
                     autobind(n);
-                    let mut s = n.borrow_mut();
-                    if opt == NETLINK_ADD_MEMBERSHIP {
-                        s.groups |= 1 << (v - 1);
-                    } else {
-                        s.groups &= !(1 << (v - 1));
+                    {
+                        let mut s = n.borrow_mut();
+                        if opt == NETLINK_ADD_MEMBERSHIP {
+                            s.groups |= 1 << (v - 1);
+                        } else {
+                            s.groups &= !(1 << (v - 1));
+                        }
+                    }
+                    if audit {
+                        crate::audit::multicast(v, if opt == NETLINK_ADD_MEMBERSHIP { "connect" } else { "disconnect" }, true);
                     }
                 }
                 NETLINK_PKTINFO | NETLINK_BROADCAST_ERROR | NETLINK_NO_ENOBUFS | NETLINK_LISTEN_ALL_NSID | NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK => {
@@ -625,6 +669,11 @@ pub fn ack(req: &[u8], err: i64, cap_ack: bool, ext_ack: bool, off: Option<usize
 fn rcv(n: &NetlinkRef, data: &[u8], me: u32) -> Vec<Vec<u8>> {
     let cap_ack = n.borrow().opts & (1 << NETLINK_CAP_ACK) != 0;
     let strict = n.borrow().opts & (1 << NETLINK_GET_STRICT_CHK) != 0;
+    // 監査 (audit.rs: 答えと ACK の順があるので、みな自分でとどける)
+    if n.borrow().protocol == crate::audit::NETLINK_AUDIT {
+        crate::audit::rcv(n, data, me, cap_ack);
+        return Vec::new();
+    }
     // nftables (nfnetlink の nf_tables)
     if n.borrow().protocol == crate::nftables::NETLINK_NETFILTER {
         let ext_ack = n.borrow().opts & (1 << NETLINK_EXT_ACK) != 0;

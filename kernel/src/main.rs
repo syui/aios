@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod aiproc;
 mod apparmor;
+mod audit;
 mod securityfs;
 mod efirt;
 mod efivarfs;
@@ -152,6 +153,7 @@ pub extern "C" fn kmain() -> ! {
         }
     }
     rand::summary();
+    audit::init();
     fs::init();
     if !parts::off(parts::Part::Net) {
         net::init();

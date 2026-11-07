@@ -34,7 +34,10 @@ pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_MKNOD: u32 = 27;
+pub const CAP_AUDIT_WRITE: u32 = 29;
+pub const CAP_AUDIT_CONTROL: u32 = 30;
 pub const CAP_MAC_ADMIN: u32 = 33;
+pub const CAP_AUDIT_READ: u32 = 37;
 pub const CAP_PERFMON: u32 = 38;
 /// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)
 pub const CAP_NAMES: [&str; 41] = [
@@ -66,10 +69,12 @@ pub struct Cred {
     /// change_hat で hat に入る前のプロファイルと、帰るときに合わせる token (Linux の aa_task_ctx。exec で消える)
     pub aa_prev: Option<crate::apparmor::Label>,
     pub aa_token: u64,
+    /// AUDIT_TTY_SET の設定 (Linux は signal_struct の audit_tty: fork で受けつぎ、exec でも消えない。audit.rs)
+    pub audit_tty: u32,
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0 };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0 };
 
     pub fn in_group(&self, gid: u32) -> bool {
         self.egid == gid || self.groups.contains(&gid)
