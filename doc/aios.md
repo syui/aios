@@ -1925,10 +1925,21 @@ posix-cpu-timers と同じ:
 - timer_create: MONOTONIC_RAW と COARSE、fd の時計は EOPNOTSUPP、知らない時計は EINVAL、ALARM は CAP_WAKE_ALARM
   がなければ EPERM。CPU の時計のタイマは、その時計の ns で期限を覚え、tick ごとに見て鳴らす (Linux も tick ごと)。
   くり返しは、こえた分の回数を overrun に
-- まだのもの: clock_nanosleep の CPU の時計、getrusage と times と /proc/PID/stat の utime / stime (いまも tick)
+- clock_nanosleep: 眠れない時計 (THREAD_CPUTIME_ID、MONOTONIC_RAW、COARSE、fd の時計) は EOPNOTSUPP、知らない時計は
+  EINVAL、それから timespec を見る (読めなければ EFAULT、秒が負か ns が 10 億からは EINVAL: nanosleep も)。プロセスの
+  CPU の時計 (2 と負のもの) は、その CPU 時間になるまで tick ごとに見て眠る (自分のスレッドの時計は EINVAL)
+- ユーザーとカーネルの時間 (proc.rs の `sys_ns`): EL0 からの例外のうち、大きなロックの道と割り込みの入口から出口まで
+  (スケジューラの切りかえでも閉じる) をカーネルの時間に、走った時間ののこりをユーザーの時間にする (Linux の
+  VIRT_CPU_ACCOUNTING_GEN のように出入りで)。大きなロックなしの速い道 (getpid などのシステムコール、ページフォルト)
+  は測らずユーザーの時間に入る: QEMU (TCG) では時計を読むのに 200 ns ほどかかり、そこでも測ると getppid が 4 割
+  遅くなった。前の tick で数えるやりかたは、カーネルの中では割り込みを止めているので、カーネルの時間もユーザーのものに
+  見えていた (stime はいつも 0)。getrusage の ru_utime / ru_stime (SELF、THREAD、CHILDREN)、times の tms_*、
+  /proc/PID/stat と task/TID/stat の utime / stime / cutime / cstime はこれから。子の分は回収するときに親へ (子が回収した
+  孫の分も: Linux の wait_task_zombie)。ほかの rusage の欄 (maxrss、ページフォルトの数、切りかえの数) はまだ 0
 
 `test/cpuclock.c` (時計ごとの答え、CPU を使ったぶんだけ進むか、眠っていれば進まないか、ほかのスレッドと子と回収した
-ものの時計、CPU の時計のタイマ) は Linux 7.4-rc1 と同じ (47 行。ALARM の時計は RTC があるかしだいなので見ない)。
+ものの時計、CPU の時計のタイマ) は Linux 7.4-rc1 と同じ (47 行。ALARM の時計は RTC があるかしだいなので見ない)。 `test/cputime.c` (clock_nanosleep の時計ごとの答えとプロセスの CPU の時計で眠ること、ユーザーで回したときと
+/dev/zero を読んだときの utime / stime、子の時間) も同じ (34 行)。
 
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 

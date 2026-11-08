@@ -405,7 +405,7 @@ impl ProcInode {
                 }
                 s
             }
-            Node::Stat(pid) => stat_line(leader_any(pid)?),
+            Node::Stat(pid) => stat_line(leader_any(pid)?, true),
             Node::Maps(pid) => {
                 let pt = &leader(pid)?.mm().pt;
                 let _h = pt.hold();
@@ -526,7 +526,7 @@ impl ProcInode {
                 match k {
                     // 1 つ目の欄はスレッドの番号
                     0 => {
-                        let line = stat_line(t);
+                        let line = stat_line(t, false);
                         format!("{}{}", crate::ns::local_or_0(tid), &line[line.find(' ').unwrap_or(0)..])
                     }
                     1 => format!(
@@ -620,11 +620,16 @@ fn mem_of(p: &Proc) -> (usize, usize) {
     }
 }
 
-fn stat_line(p: &Proc) -> String {
+/// /proc/PID/stat の 1 行 (whole ならスレッドグループの時間、でなければそのスレッドの: task/TID/stat)。utime と stime は
+/// ユーザーとカーネルで走った時間、cutime と cstime は回収した子の (tick = 1/100 秒)
+fn stat_line(p: &Proc, whole: bool) -> String {
     let (tty_nr, tpgid) = crate::tty::of_session(p.sid).map_or((0, -1), |(rdev, pg)| (rdev, pg as i64));
     let threads = proc::threads_of(p.tgid).len();
+    let (u, sy) = proc::user_sys_ns(p, !whole);
+    let (cu, cs) = crate::syscall::children_user_sys(p.tgid);
+    let tick = crate::timer::TICK_NS;
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} {} 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {}",
+        "{} ({}) {} {} {} {} {} {} {} 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {}",
         crate::ns::local_or_0(p.tgid),
         p.comm(),
         state_char(p),
@@ -635,8 +640,10 @@ fn stat_line(p: &Proc) -> String {
         tpgid,
         // flags: カーネルのスレッドは PF_KTHREAD (ps や top がこれで見分ける)
         if p.kthread { 0x0020_0000 } else { 0 },
-        proc::group_utime(p.tgid),
-        p.cutime,
+        u / tick,
+        sy / tick,
+        cu / tick,
+        cs / tick,
         threads,
         p.start,
         mem_of(p).0,

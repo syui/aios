@@ -184,6 +184,11 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         }
         claimed = Some(raw);
     }
+    // ここからカーネルの時間 (proc の sys_ns)。速い道は上でもどっている
+    let from_user = kind == EL0_SYNC || kind == EL0_IRQ;
+    if from_user {
+        proc::kernel_enter();
+    }
     let t0 = crate::smp::lock();
     // ロックを持っていた時間を、原因ごとに数える (/proc/bkl)。svc の番号は handle が x0 を書く前に。
     // 時計を読むのは、測る回 (smp::SAMPLE のくじ) の取ったときと終わりの 2 回だけ (取った時刻と放す時刻にも使う)
@@ -206,6 +211,9 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     crate::smp::account(cause, t1.saturating_sub(t0), slept, t1);
     crate::smp::unlock_at(t1);
     crate::vm::free_deferred();
+    if from_user {
+        proc::kernel_leave();
+    }
 }
 
 /// EL0 の MRS で ID レジスタ (op0 = 3, op1 = 0, CRn = 0) を読んだものに、Linux と同じく答える

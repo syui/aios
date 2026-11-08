@@ -159,7 +159,7 @@ pub fn clock_of(clk: i32, gettime: bool) -> Result<Clock, i64> {
     }
 }
 
-/// 時計のいまの値 (ns)。CPU の時計: SCHED と PROF は走った時間、VIRT はユーザーモードの tick。もういなければ EINVAL
+/// 時計のいまの値 (ns)。CPU の時計: SCHED と PROF は走った時間、VIRT はユーザーで走った時間。もういなければ EINVAL
 pub fn clock_ns(c: Clock) -> Result<u64, i64> {
     const EINVAL: i64 = 22;
     Ok(match c {
@@ -167,11 +167,11 @@ pub fn clock_ns(c: Clock) -> Result<u64, i64> {
         Clock::Mono => uptime_ns(),
         Clock::Cpu { thread: true, pid, which } => {
             let t = crate::proc::find_thread(pid).ok_or(-EINVAL)?;
-            if which == 1 { t.utime * TICK_NS } else { crate::proc::cpu_ns(t) }
+            if which == 1 { crate::proc::user_sys_ns(t, true).0 } else { crate::proc::cpu_ns(t) }
         }
         Clock::Cpu { thread: false, pid, which } => {
-            crate::proc::find_leader_any(pid).ok_or(-EINVAL)?;
-            if which == 1 { crate::proc::group_utime(pid) * TICK_NS } else { crate::proc::group_cpu_ns(pid) }
+            let l = crate::proc::find_leader_any(pid).ok_or(-EINVAL)?;
+            if which == 1 { crate::proc::user_sys_ns(l, false).0 } else { crate::proc::group_cpu_ns(pid) }
         }
     })
 }

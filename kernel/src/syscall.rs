@@ -666,7 +666,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             _ => Err(crate::why::inval()),
         },
         NANOSLEEP => sys_nanosleep(1, 0, a[0] as usize, a[1] as usize),
-        CLOCK_NANOSLEEP => sys_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
+        CLOCK_NANOSLEEP => sys_clock_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
         CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
         CLOCK_GETRES => sys_clock_getres(a[0], a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
@@ -1537,19 +1537,66 @@ fn sys_getrandom(buf: usize, len: usize, flags: u32) -> R {
     Ok(done as i64)
 }
 
-fn read_timespec(va: usize) -> Result<u64, i64> {
+/// timespec を読んで、正しいか (秒が負でなく、ns が 10 億より下: Linux の timespec64_valid。でなければ EINVAL)
+fn read_valid_timespec(va: usize) -> Result<u64, i64> {
     let mut ts = [0u8; 16];
     proc::current().pt().copy_in(&mut ts, va).ok_or(-EFAULT)?;
-    let sec = u64::from_le_bytes(ts[..8].try_into().unwrap());
-    let nsec = u64::from_le_bytes(ts[8..].try_into().unwrap());
-    Ok(sec.saturating_mul(1_000_000_000).saturating_add(nsec))
+    let sec = i64::from_le_bytes(ts[..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(crate::why::inval());
+    }
+    Ok((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
 }
 
-/// nanosleep / clock_nanosleep。シグナルで起こされたら残りを rem に書いて EINTR
+/// clock_nanosleep (Linux の posix-timers の clock_nanosleep): 知らない時計は EINVAL、眠れない時計 (THREAD_CPUTIME_ID、
+/// MONOTONIC_RAW、COARSE、fd の時計) は EOPNOTSUPP、それから timespec (EFAULT、EINVAL)。CPU の時計は、その CPU 時間に
+/// なるまで tick ごとに見て眠る (自分のスレッドの時計は EINVAL: 眠っているあいだは進まない)
+fn sys_clock_nanosleep(clock: u64, flags: u64, req: usize, rem: usize) -> R {
+    const TIMER_ABSTIME: u64 = 1;
+    const EOPNOTSUPP: i64 = 95;
+    let clk = clock as i32;
+    match clk {
+        0..=2 | 7..=9 | 11 => {}
+        3..=6 => return Err(-EOPNOTSUPP),
+        c if c < 0 && c & 7 == 3 => return Err(-EOPNOTSUPP),
+        c if c < 0 => {}
+        _ => return Err(crate::why::inval()),
+    }
+    if clk != 2 && clk >= 0 {
+        read_valid_timespec(req)?;
+        return sys_nanosleep(clock, flags, req, rem);
+    }
+    let want = read_valid_timespec(req)?;
+    let c = timer::clock_of(clk, false)?;
+    let me = proc::current();
+    if let timer::Clock::Cpu { thread: true, pid, .. } = c {
+        if pid == me.pid {
+            return Err(crate::why::inval());
+        }
+    }
+    let now = timer::clock_ns(c)?;
+    let target = if flags & TIMER_ABSTIME != 0 { want } else { now.saturating_add(want) };
+    loop {
+        // 相手がいなくなったら起きる
+        let Ok(v) = timer::clock_ns(c) else { return Ok(0) };
+        if v >= target {
+            return Ok(0);
+        }
+        if let Err(e) = proc::sleep_until(0, timer::ticks() + 1) {
+            if rem != 0 && flags & TIMER_ABSTIME == 0 {
+                out(rem, &timespec(target.saturating_sub(timer::clock_ns(c).unwrap_or(target))))?;
+            }
+            return Err(e);
+        }
+    }
+}
+
+/// nanosleep / clock_nanosleep (壁と起動からの時計)。シグナルで起こされたら残りを rem に書いて EINTR
 fn sys_nanosleep(clock: u64, flags: u64, req: usize, rem: usize) -> R {
     const TIMER_ABSTIME: u64 = 1;
-    let want = read_timespec(req)?;
-    let now_ns = || if clock == CLOCK_REALTIME { timer::epoch_ns() } else { timer::uptime_ns() };
+    let want = read_valid_timespec(req)?;
+    let now_ns = || if matches!(clock as i32, 0 | 8 | 11) { timer::epoch_ns() } else { timer::uptime_ns() };
     let rel = if flags & TIMER_ABSTIME != 0 { want.saturating_sub(now_ns()) } else { want };
     let until = timer::ticks_after(rel);
     while timer::ticks() < until {
@@ -1705,41 +1752,49 @@ fn sys_wait4(pid: i64, status: usize, options: u64) -> R {
     Ok(pid as i64)
 }
 
-/// tick を timeval (秒, マイクロ秒) に
-fn tick_timeval(t: u64) -> [u8; 16] {
-    let us = t * (1_000_000 / timer::HZ);
+/// ns を timeval (秒, マイクロ秒) に
+fn ns_timeval(ns: u64) -> [u8; 16] {
+    let us = ns / 1000;
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
     b[8..].copy_from_slice(&(us % 1_000_000).to_le_bytes());
     b
 }
 
-/// getrusage: 使った CPU 時間。カーネルの中の時間 (stime) は数えていないので 0
+/// 回収した子の (ユーザー, カーネル) の時間 (ns)
+pub fn children_user_sys(tgid: u32) -> (u64, u64) {
+    proc::find_leader_any(tgid).map_or((0, 0), |l| (l.child_cpu_ns - l.child_sys_ns.min(l.child_cpu_ns), l.child_sys_ns.min(l.child_cpu_ns)))
+}
+
+/// getrusage: 使った CPU 時間 (ru_utime はユーザー、ru_stime はカーネル: proc の cpu_ns と sys_ns)。ほかの欄はまだ 0
 fn sys_getrusage(who: i64, buf: usize) -> R {
     const RUSAGE_SELF: i64 = 0;
     const RUSAGE_CHILDREN: i64 = -1;
     const RUSAGE_THREAD: i64 = 1;
     let me = proc::current();
-    let t = match who {
-        RUSAGE_SELF => proc::group_utime(me.tgid),
-        RUSAGE_CHILDREN => proc::find_leader(me.tgid).map_or(0, |l| l.cutime),
-        RUSAGE_THREAD => me.utime,
+    let (u, s) = match who {
+        RUSAGE_SELF => proc::user_sys_ns(me, false),
+        RUSAGE_CHILDREN => children_user_sys(me.tgid),
+        RUSAGE_THREAD => proc::user_sys_ns(me, true),
         _ => return Err(crate::why::inval()),
     };
     let mut b = [0u8; 144];
-    b[..16].copy_from_slice(&tick_timeval(t));
+    b[..16].copy_from_slice(&ns_timeval(u));
+    b[16..32].copy_from_slice(&ns_timeval(s));
     out(buf, &b)?;
     Ok(0)
 }
 
-/// times: struct tms (utime, stime, cutime, cstime。単位は tick = 1/100 秒)。起動からの tick を返す
+/// times: struct tms (utime, stime, cutime, cstime。単位は tick = 1/100 秒: USER_HZ)。起動からの tick を返す
 fn sys_times(buf: usize) -> R {
     if buf != 0 {
         let me = proc::current();
-        let c = proc::find_leader(me.tgid).map_or(0, |l| l.cutime);
+        let (u, s) = proc::user_sys_ns(me, false);
+        let (cu, cs) = children_user_sys(me.tgid);
         let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&proc::group_utime(me.tgid).to_le_bytes());
-        b[16..24].copy_from_slice(&c.to_le_bytes());
+        for (i, v) in [u, s, cu, cs].into_iter().enumerate() {
+            b[i * 8..i * 8 + 8].copy_from_slice(&(v / timer::TICK_NS).to_le_bytes());
+        }
         out(buf, &b)?;
     }
     Ok(timer::ticks() as i64)

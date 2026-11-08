@@ -366,6 +366,16 @@ pub struct Proc {
     pub ran_at: u64,
     /// 代表スレッドだけ: 終わったスレッドの cpu_ns (CLOCK_PROCESS_CPUTIME_ID に足す)
     pub cpu_dead_ns: u64,
+    /// cpu_ns のうちカーネルで走った時間 (ns: Linux の stime。utime は cpu_ns - sys_ns)。EL0 からの例外の入口から、EL0 に
+    /// もどるか切りかわるまで (trap.rs の kernel_enter / kernel_leave)
+    pub sys_ns: u64,
+    /// いまカーネルで走りはじめた時刻 (uptime の ns。ユーザーで走っているか、走っていなければ 0)
+    pub kern_at: u64,
+    /// 代表スレッドだけ: 終わったスレッドの sys_ns
+    pub sys_dead_ns: u64,
+    /// 代表スレッドだけ: 回収した子 (とその子孫) の走った時間とカーネルの時間 (ns: RUSAGE_CHILDREN、tms_cutime / cstime)
+    pub child_cpu_ns: u64,
+    pub child_sys_ns: u64,
     /// 最近走った tick (走るたびに 1 足し、1 秒ごとに半分にする)。少ないものから走らせる
     pub recent: u32,
     /// 走らせた回数 (/proc/threads。調べもの用)
@@ -484,6 +494,11 @@ impl Proc {
         cpu_ns: 0,
         ran_at: 0,
         cpu_dead_ns: 0,
+        sys_ns: 0,
+        kern_at: 0,
+        sys_dead_ns: 0,
+        child_cpu_ns: 0,
+        child_sys_ns: 0,
         start: 0,
         pid_ns: None,
         vpid: 0,
@@ -1211,6 +1226,8 @@ extern "C" fn forkret_unlock() {
     crate::smp::unlock();
     crate::vm::free_deferred();
     set_child_tid();
+    // はじめてユーザーへ: 走りはじめ (スケジューラ) からのカーネルの時間を閉じる
+    kernel_leave();
 }
 
 /// CLONE_CHILD_SETTID: はじめてユーザーへ戻る前に、自分の tid を書く (大きなロックなしで)。fork の子のそのページは
@@ -1343,13 +1360,20 @@ pub fn scheduler() -> ! {
                 }
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
                 crate::smp::dev_wait(2, t0);
-                p.ran_at = crate::timer::uptime_ns().max(1);
+                // 切りかえはいつもカーネルの中なので、走りはじめはカーネルの時間から
+                let t = crate::timer::uptime_ns().max(1);
+                (p.ran_at, p.kern_at) = (t, t);
                 swtch(sched_ctx(), &p.context);
-                // 走った時間を足す (終わったスレッドは、終わるときに代表へわたして ran_at を 0 にしている)
+                // 走った時間とカーネルの時間を足す (終わったスレッドは、終わるときに代表へわたして 0 にしている)
                 let q = &mut procs()[i];
+                let now = crate::timer::uptime_ns();
                 if q.ran_at != 0 {
-                    q.cpu_ns += crate::timer::uptime_ns().saturating_sub(q.ran_at);
+                    q.cpu_ns += now.saturating_sub(q.ran_at);
                     q.ran_at = 0;
+                }
+                if q.kern_at != 0 {
+                    q.sys_ns += now.saturating_sub(q.kern_at);
+                    q.kern_at = 0;
                 }
                 set_cur(None);
                 ON_CPU[crate::smp::id()].store(0, Relaxed);
@@ -1704,11 +1728,12 @@ fn exit_status(status: i32) -> ! {
     if p.thread {
         // 使った時間は代表スレッドに持たせる
         let t = core::mem::take(&mut p.utime);
-        let c = cpu_ns(p);
-        (p.cpu_ns, p.ran_at) = (0, 0);
+        let (c, s) = (cpu_ns(p), sys_ns(p));
+        (p.cpu_ns, p.ran_at, p.sys_ns, p.kern_at) = (0, 0, 0, 0);
         if let Some(l) = find(p.tgid) {
             l.utime += t;
             l.cpu_dead_ns += c;
+            l.sys_dead_ns += s;
         }
         let p = current();
         p.files = None;
@@ -2113,8 +2138,13 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 if !keep {
                     let _p = crate::prof::span("proc:reap");
                     let t = c.utime + c.cutime;
+                    // 子の走った時間 (Linux の wait_task_zombie: 子の分と、子が回収した孫の分)
+                    let (u, s) = user_sys_ns(c, false);
+                    let (cc, cs) = (u + s + c.child_cpu_ns, s + c.child_sys_ns);
                     free_slot(c);
                     procs()[leader].cutime += t;
+                    procs()[leader].child_cpu_ns += cc;
+                    procs()[leader].child_sys_ns += cs;
                 }
                 return Ok(r);
             }
@@ -2180,8 +2210,44 @@ pub fn group_cpu_ns(tgid: u32) -> u64 {
     dead + live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| cpu_ns(p)).sum::<u64>()
 }
 
-pub fn group_utime(tgid: u32) -> u64 {
-    live().filter(|p| p.state != State::Unused && p.tgid == tgid).map(|p| p.utime).sum()
+/// EL0 からの例外 (大きなロックの道と割り込み) の入口: ここからカーネルの時間 (sys_ns)。大きなロックなしの速い道
+/// (getpid などのシステムコール、ページフォルト) は数えない (ユーザーの時間に入る): 短く、QEMU (TCG) では時計を
+/// 読むのに 200 ns ほどかかり、getppid が 4 割遅くなったので。Linux の VIRT_CPU_ACCOUNTING_GEN のように出入りで測る
+pub fn kernel_enter() {
+    if let Some(p) = try_current() {
+        p.kern_at = crate::timer::uptime_ns().max(1);
+    }
+}
+
+/// EL0 へもどる (例外の出口、新しいスレッドのはじめ): カーネルにいた時間を sys_ns に
+pub fn kernel_leave() {
+    if let Some(p) = try_current() {
+        if p.kern_at != 0 {
+            p.sys_ns += crate::timer::uptime_ns().saturating_sub(p.kern_at);
+            p.kern_at = 0;
+        }
+    }
+}
+
+/// スレッドがカーネルで走った時間 (ns)。いまカーネルで走っていれば、その分も
+pub fn sys_ns(p: &Proc) -> u64 {
+    let k = p.kern_at;
+    p.sys_ns + if k != 0 && p.ran_at != 0 { crate::timer::uptime_ns().saturating_sub(k) } else { 0 }
+}
+
+/// (ユーザーの時間, カーネルの時間) ns。スレッドか (でなければスレッドグループの、終わったスレッドの分も)
+pub fn user_sys_ns(p: &Proc, thread: bool) -> (u64, u64) {
+    let (cpu, sys) = if thread {
+        (cpu_ns(p), sys_ns(p))
+    } else {
+        let tgid = p.tgid;
+        let l = find_leader_any(tgid);
+        let (dc, ds) = l.map_or((0, 0), |l| (l.cpu_dead_ns, l.sys_dead_ns));
+        let (c, s) = live().filter(|q| q.state != State::Unused && q.tgid == tgid).fold((0, 0), |(c, s), q| (c + cpu_ns(q), s + sys_ns(q)));
+        (dc + c, ds + s)
+    };
+    let sys = sys.min(cpu);
+    (cpu - sys, sys)
 }
 
 /// pidfd のようす (Linux の pidfd_poll): (終わった, 片づけられた)。thread なら PIDFD_THREAD の pidfd で、pid はそのスレッドの
