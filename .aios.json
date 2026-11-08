@@ -1,7 +1,7 @@
 {
   "branch": "main",
   "arch": "aarch64",
-  "updated": "2026-11-06",
+  "updated": "2026-11-08",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -66,7 +66,7 @@
         "xkeyboard-config": "2.48", "zig": "0.17.1", "zlib": "1.4",
 
         "ncurses": "6.6", "libevent": "2.1.13",
-        "zsh": "5.9.2", "vim": "9.2.1302", "tmux": "3.8", "openssh": "10.6p1", "jq": "1.8.2",
+        "zsh": "5.9.2", "vim": "9.2.1302", "tmux": "3.8", "openssh": "10.6p2", "jq": "1.8.2",
         "libunwind": "0.16.0", "nodejs": "26.13.0", "cargo": "1.99.1", "less": "710",
 
         "procps-ng": "4.0.7", "gawk": "5.4.1", "libarchive": "3.8.11", "gzip": "1.15", "xz": "5.8.4",

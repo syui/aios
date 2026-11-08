@@ -2,9 +2,10 @@
 #   鍵は ed25519、暗号は chacha20-poly1305 と aes-ctr、鍵の交換は mlkem768x25519 / sntrup761x25519 /
 #   curve25519 (どれも openssh の中のもの)。RSA と ECDSA の鍵は使えない。
 #   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
+#   10.6p2: CVE-2026-123158 (*sshole: musl の crypt() の短い答えとパスワードの欄が合ってしまい、パスワードなしで入れた)
 pkgname=openssh
-pkgver=10.6p1
-pkgrel=4
+pkgver=10.6p2
+pkgrel=1
 pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
 arch=('aarch64')
 url='https://www.openssh.com/portable.html'
@@ -12,13 +13,17 @@ license=('SSH-OpenSSH')
 backup=(etc/ssh/ssh_config etc/ssh/sshd_config)
 source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz"
         sshd.service sshdgenkeys.service)
-sha256sums=('a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39'
+sha256sums=('9ae44872090cf2f06b3cf9ff147e7f16f309671340763ed2f99248398ae29d5b'
             'SKIP'
             'SKIP')
 
 prepare() {
   rm -rf "openssh-$pkgver"
   tar -xzf "openssh-$pkgver.tar.gz"
+  # 10.6p2 の auth-passwd.c は free を使うのに <stdlib.h> を入れていない (glibc ではほかのヘッダから入る。musl と
+  # Zig の clang では暗黙の宣言でしくじる)
+  grep -q '<stdlib.h>' "openssh-$pkgver/auth-passwd.c" ||
+    sed -i 's|^#include <stdio.h>$|#include <stdio.h>\n#include <stdlib.h>|' "openssh-$pkgver/auth-passwd.c"
 }
 
 build() {
