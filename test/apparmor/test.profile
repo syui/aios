@@ -66,6 +66,8 @@ profile aacap {
 # ネットワーク (network_v8): inet の stream はみな、inet の dgram は作る・bind・名前だけ、unix は dgram だけ
 profile aanet {
   /proc/*/attr/current r,
+  # 開いたソケットを持ったまま aacap (ネットワークの決まりがない) に移る (aa_sock_file_perm をたしかめる)
+  change_profile -> aacap,
   network inet stream,
   network (create, bind, getattr) inet dgram,
   network unix dgram,

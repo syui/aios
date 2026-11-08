@@ -472,6 +472,18 @@ fn aa_create(domain: u64, t: u64, protocol: u64) -> Result<(), i64> {
 
 /// ソケットへの op (getsockname、getpeername、shutdown、sockopt、listen、accept、bind。inet は sendmsg と recvmsg も:
 /// what は AF_INET の番地の見かた。相手の名前は確かめて記録に)。AF_UNIX の送る・受けるは unix.rs (unix_may_send) で見る
+/// AppArmor の aa_sock_file_perm (ソケットを read / write の口で: file.rs の aa_sock_file)。ソケットのことだけで見る
+/// (相手の番地は見ない: aa_label_sk_perm)
+pub fn aa_file(f: &FileRef, request: u32) -> Result<(), i64> {
+    let s = match &f.borrow().kind {
+        Kind::Unix(u) => Sock::Unix(f.clone(), u.clone()),
+        Kind::Inet(u) => Sock::Inet(f.clone(), u.clone()),
+        Kind::Socket(s) => Sock::Smol(s.clone()),
+        _ => return Ok(()),
+    };
+    aa_sk(&s, "file_perm", request, InetOp::Sk)
+}
+
 fn aa_sk(s: &Sock, op: &str, request: u32, what: InetOp) -> Result<(), i64> {
     if !crate::apparmor::confined() {
         return Ok(());

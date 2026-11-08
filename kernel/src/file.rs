@@ -155,6 +155,9 @@ pub struct OpenFile {
     /// recvmmsg、read) か SO_ERROR で返して消す。aios がえらんだちがい (recvmmsg-error): Linux はソケットの sk_err に書く
     /// ので、次の send や ICMP のエラーや SO_ERROR が持っていき、受けとる側に返らないことがある (recvmmsg(2) の BUGS)
     pub recv_err: i64,
+    /// 開いた (作った) プロセスの AppArmor のラベル (決まりがなければ None: Linux の aa_file_ctx の label)。ソケットを
+    /// ほかのラベルのプロセスが読み書きするときに見なおす (aa_sock_file)
+    pub aa_label: Option<crate::apparmor::Label>,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
@@ -179,7 +182,7 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
     }
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0, recv_err: 0 }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0, recv_err: 0, aa_label: crate::cred::current().apparmor.clone() }))
 }
 
 /// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
@@ -585,6 +588,21 @@ pub fn read_sleepable(ino: &InodeRef, off: usize, dst: &mut [u8]) -> Result<usiz
         }
     }
     crate::vm::read_cached(ino, off, dst)
+}
+
+/// AppArmor (Linux の aa_file_perm のソケットの道: __file_sock_perm と aa_sock_file_perm): 決まりのついたプロセスが、
+/// ほかのラベルで開いたソケットを read / write するときは、いまの決まりの network (unix) の決まりで見なおす (読むのは
+/// receive、書くのは send)。開いたのが決まりのないプロセス (わたされたもの) か、同じラベルなら見ない。
+/// read / write / readv / writev の入口 (sysfile.rs の verify_area、Linux の rw_verify_area の security_file_permission) から
+pub fn aa_sock_file(f: &FileRef, write: bool) -> Result<(), i64> {
+    let need = {
+        let b = f.borrow();
+        matches!(b.kind, Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_)) && crate::apparmor::file_needs_revalidation(b.aa_label.as_ref())
+    };
+    if !need {
+        return Ok(());
+    }
+    crate::socket::aa_file(f, if write { crate::apparmor::MAY_SEND } else { crate::apparmor::MAY_RECEIVE })
 }
 
 pub fn write_opt(f: &FileRef, src: &[u8], dontwait: bool) -> Result<usize, i64> {

@@ -875,11 +875,15 @@ umount はマウントの根でなければ EINVAL のあと。aios に pivot_ro
 network、signal、ptrace、mount の記録の形は、Linux 7.3.1 で同じことをして dmesg (klogctl) に出たものとくらべた
 (shutdown の operation は "socket_shutdown"、AF_UNIX には path= を出さない、など)。
 
+ほかのラベルで開いたソケットを read / write / readv / writev するときは、いまのプロファイルの network の決まりで
+見なおす (Linux の aa_sock_file_perm: 読むのは receive、書くのは send、operation は "file_perm"。たとえば change_profile
+のまえに開いたソケット)。開いたのが決まりのないプロセスなら、わたされたものとして見ない (__file_is_delegated)。入口は
+rw_verify_area にあたる sysfile.rs の verify_area (test/apparmor.c の net-file-*)。
+
 Linux とちがうところ (まだないもの): complain で exec の許しがないとき、Linux は学ぶための空のプロファイルに移るが、
 aios はいまのプロファイルのまま (complain で、ない hat に change_hat したときも、Linux は学ぶための hat を作って入るが、
 aios は記録して ENOENT)。xattr でつけるプロファイル (aios に拡張属性がない) はつかない。名前空間、重ねる (stack)、
-rlimit、dbus、io_uring、userns、mqueue の決まりはまだで、features でも名のらない (ソケットのラベルが変わったときの見なおし
-(aa_sock_file_perm) もまだ)。network_v9 の af_inet のラベルの条件 (label= と peer=(label=)) はまだ見ない (区切りだけたどる。Ubuntu も)。capability の
+rlimit、dbus、io_uring、userns、mqueue の決まりはまだで、features でも名のらない。network_v9 の af_inet のラベルの条件 (label= と peer=(label=)) はまだ見ない (区切りだけたどる。Ubuntu も)。capability の
 DFA の決まり (caps/extended) も名のらない (apparmor_parser は古い 64 ビットの組で作る)。mprotect と、exec のときに開いた
 ままのファイルを見なおすこともまだ。
 

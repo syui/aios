@@ -1398,6 +1398,19 @@ pub fn confined() -> bool {
     crate::cred::current().apparmor.is_some() && current_profile().is_some()
 }
 
+/// 開いたラベルが flabel のファイルを、いまのプロセスが使うときに見なおすか (Linux の aa_file_perm の速い道の逆):
+/// いまが決まりのないもの、開いたのが決まりのないもの (わたされたもの: __file_is_delegated)、同じラベルなら見ない
+pub fn file_needs_revalidation(flabel: Option<&Label>) -> bool {
+    if !confined() {
+        return false;
+    }
+    let Some(fl) = flabel else { return false };
+    if fl.profile().is_none_or(|p| p.mode == Mode::Unconfined) {
+        return false;
+    }
+    crate::cred::current().apparmor.as_ref() != Some(fl)
+}
+
 /// ラベルの見せ方 (/proc/PID/attr/current、aa_getprocattr): "name (mode)\n"、unconfined は "unconfined\n"
 pub fn label_text(l: Option<&Label>) -> String {
     match l.and_then(|l| l.profile()).filter(|_| !off()) {

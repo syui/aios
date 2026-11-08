@@ -413,6 +413,9 @@ static int mntchild(void) {
 
 // aanet の中で (argv[1] が net): ソケットの決まり。1 行に「名前 答え」
 static int netchild(void) {
+  // 決まりのないうちに作ったもの (わたされたもの: あとでどの決まりでも使える)
+  int pre[2] = {-1, -1};
+  socketpair(AF_UNIX, SOCK_STREAM, 0, pre);
   if (puts_("/proc/self/attr/current", "changeprofile aanet"))
     return 2;
 #define N(name, v) printf("%s %d\n", name, v)
@@ -459,6 +462,14 @@ static int netchild(void) {
   N("net-unix-dgrampair", e(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)));
   N("net-unix-dgram-send", e(write(sv[0], "x", 1) == 1 ? 0 : -1));
   N("net-unix-dgram-recv", e(read(sv[1], b, sizeof b) == 1 ? 0 : -1));
+  // aanet が開いたソケットを持ったまま aacap (ネットワークの決まりがない) に移る: read / write はいまの決まりで見なおす
+  // (Linux の aa_file_perm と aa_sock_file_perm: 開いたラベルとちがえば)。決まりのないうちに作ったものはそのまま
+  fcntl(k, F_SETFL, O_NONBLOCK);
+  N("net-change-aacap", e(puts_("/proc/self/attr/current", "changeprofile aacap")));
+  N("net-file-write", e(write(c, "y", 1) == 1 ? 0 : -1));
+  N("net-file-read", e(read(k, b, sizeof b) >= 0 ? 0 : -1));
+  N("net-file-unix-write", e(write(sv[0], "z", 1) == 1 ? 0 : -1));
+  N("net-file-delegated", e(write(pre[0], "p", 1) == 1 ? 0 : -1));
   fflush(stdout);
 #undef N
   return 0;
@@ -794,7 +805,8 @@ static const char *want_net[] = {
     "net-tcp-send 0", "net-tcp-recv 0", "net-udp-create 0", "net-udp-bind 0", "net-udp-name 0", "net-udp-send 13",
     "net-udp-recv 13", "net-udp-setopt 13", "net-udp-getopt 13", "net-udp-shutdown 13", "net-udp-peername 107",
     "net-inet6 13", "net-netlink 13", "net-unix-stream 13", "net-unix-streampair 13", "net-unix-dgrampair 0",
-    "net-unix-dgram-send 0", "net-unix-dgram-recv 0",
+    "net-unix-dgram-send 0", "net-unix-dgram-recv 0", "net-change-aacap 0", "net-file-write 13", "net-file-read 13",
+    "net-file-unix-write 13", "net-file-delegated 0",
 };
 
 // aacap: chown のほかの root の力はない (capget にも chown だけ)。complain なら記録して通す

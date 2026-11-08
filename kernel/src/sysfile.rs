@@ -332,13 +332,16 @@ fn whole(f: &FileRef) -> bool {
 }
 
 /// Linux の rw_verify_area: 位置のあるもの (ファイル、ディレクトリ) の位置 + 長さが i64 をこえるなら EINVAL
-/// (ext4 のディレクトリを読み終えると位置は i64::MAX)。読み書きの口のしらべ (EBADF) のあと、中身の前に
-fn verify_area(f: &FileRef, len: usize) -> Result<(), i64> {
-    let b = f.borrow();
-    if matches!(b.kind, Kind::Inode(..)) && (b.offset as i64).checked_add(len.min(i64::MAX as usize) as i64).is_none() {
-        return Err(crate::why::inval());
+/// (ext4 のディレクトリを読み終えると位置は i64::MAX)。読み書きの口のしらべ (EBADF) のあと、中身の前に。それから
+/// security_file_permission (いまは AppArmor のソケットの見なおし: file.rs の aa_sock_file)
+fn verify_area(f: &FileRef, len: usize, write: bool) -> Result<(), i64> {
+    {
+        let b = f.borrow();
+        if matches!(b.kind, Kind::Inode(..)) && (b.offset as i64).checked_add(len.min(i64::MAX as usize) as i64).is_none() {
+            return Err(crate::why::inval());
+        }
     }
-    Ok(())
+    file::aa_sock_file(f, write)
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
@@ -534,7 +537,7 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: u
     const EAGAIN: i64 = 11;
     let f = file_of(fd)?;
     if f.borrow().readable() {
-        verify_area(&f, len)?;
+        verify_area(&f, len, false)?;
     }
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_readv(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0 || dontwait);
@@ -610,7 +613,7 @@ pub fn write(fd: u64, buf: usize, len: usize) -> R {
 fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>) -> R {
     let f = file_of(fd)?;
     if f.borrow().writable() {
-        verify_area(&f, len)?;
+        verify_area(&f, len, true)?;
     }
     if let Some(u) = unix_of(&f) {
         return crate::socket::unix_writev(&f, &u, &[(buf, len)], flags & RWF_NOWAIT != 0, flags & RWF_NOSIGNAL != 0);
@@ -885,7 +888,7 @@ fn readv2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     if total == 0 {
         return Ok(0);
     }
-    verify_area(&f, total)?;
+    verify_area(&f, total, false)?;
     rwf_check(&f, flags, false)?;
     // AF_UNIX のソケットは、入れ物みなで 1 回受ける (dgram の 1 つのメッセージ)
     if let Some(u) = unix_of(&f) {
@@ -927,7 +930,7 @@ fn writev2(fd: u64, iov: usize, cnt: usize, flags: u32) -> R {
     if total == 0 {
         return Ok(0);
     }
-    verify_area(&f, total)?;
+    verify_area(&f, total, true)?;
     rwf_check(&f, flags, true)?;
     // AF_UNIX のソケットは、入れ物みなを 1 回で送る (dgram の 1 つのメッセージ)
     if let Some(u) = unix_of(&f) {
