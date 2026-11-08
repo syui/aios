@@ -717,7 +717,7 @@ bench smp の map-file (1 MiB のファイルを読むだけで MAP_PRIVATE に�
 ページフォルトが 1 回に 0.6 回ほど 33〜48 µs だった。フォルトのほとんど (fault-around で 16 ページずつ) はもうロックなしの
 fast_fault だが、mmap がいつも先へ写す (mmap_next) ので 2 MiB ごとにまだ L3 のテーブルがなく、テーブルを作るのはロックの道
 だった。bench のロックの表のいちばん上の pwrite64 (1 回 100〜200 µs) は、smpbench がはじめに 1 MiB のファイルを書いて伸ばす
-ところで、測っているループの外 (ext4 で伸ばす書きこみ。todo.json の ext4-extend-write)。
+ところで、測っているループの外 (ext4 で伸ばす書きこみ。todo.json の bkl-file)。
 
 munmap: スレッドで分けていない表の、自分だけの (MAP_PRIVATE の) ファイルの写しも、まるごと外すならロックなしの
 fast_unmap で外す。ページキャッシュのページは参照を返すだけで、無名のときと同じ (PTE を消し、TLB を消し、ページを返す)。
@@ -727,7 +727,7 @@ fast_unmap で外す。ページキャッシュのページは参照を返すだ
 drop_unmapped が捨てる。一部だけ外す (領域を分けると Rc を写す)、共有、スワップへ出したページのあるところ、あずけたものが
 1024 をこえたときは、いままでどおりロックの道。フォルト: fast_fault が途中のテーブルを作る (walk_fast: 0 にしたページを
 compare-exchange でつなぎ、同じ表のスレッドに負けたら返す。テーブルは表を捨てるまで返さないので、つないだものはそのまま
-使える)。ファイルの mmap は、inode の Rc を写すのでロックの道のまま (todo.json の file-mmap-fast)。
+使える)。ファイルの mmap は、inode の Rc を写すのでロックの道のまま (todo.json の bkl-file)。
 
 test/fastmap.c に、ファイルの写しの munmap (まるごと、一部、書いた写し、無名の領域とならぶもの、穴の 0 のページを外して
 からファイルに書いて写しなおす、3000 回、消したファイルの写しを外すと inode が片づく (statvfs の f_ffree がもどる)) を足した。
