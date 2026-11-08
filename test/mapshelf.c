@@ -43,7 +43,8 @@ int main(int argc, char **argv) {
             close(fd);
           continue;
         }
-        if (q[0] != q[PG - 1])
+        // 中身はいつもどれかの版のページ (みな同じ英小文字)。返したページを写していれば、ほかのものが見える
+        if (q[0] != q[PG - 1] || q[0] < 'a' || q[0] > 'z' || q[PG / 2] != q[0])
           bad++;
         munmap(q, PG);
         if (mode == 'd')
