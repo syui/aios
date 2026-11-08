@@ -430,11 +430,11 @@ impl ProcInode {
                     crate::ns::show_uid(c.uid),
                     crate::ns::show_uid(c.euid),
                     crate::ns::show_uid(c.suid),
-                    crate::ns::show_uid(c.euid),
+                    crate::ns::show_uid(c.fsuid),
                     crate::ns::show_gid(c.gid),
                     crate::ns::show_gid(c.egid),
                     crate::ns::show_gid(c.sgid),
-                    crate::ns::show_gid(c.egid),
+                    crate::ns::show_gid(c.fsgid),
                     vsize / 1024,
                     rss * 4,
                     threads,
@@ -680,7 +680,7 @@ fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
 }
 
 /// Linux の __ptrace_may_access (PTRACE_MODE_FSCREDS: proc_fd_access_allowed、mm_access、ns の口、fdinfo、lock_trace):
-/// 自分のプロセスはよい。ほかは、自分の fs の id (aios は euid / egid) が相手の uid・euid・suid と gid・egid・sgid に
+/// 自分のプロセスはよい。ほかは、自分の fs の id (fsuid / fsgid) が相手の uid・euid・suid と gid・egid・sgid に
 /// みな同じで、相手が dumpable (1) か、でなければ CAP_SYS_PTRACE。それから landlock と AppArmor の ptrace の決まり
 /// (read なら READ、でなければ ATTACH)。だめなら Err (呼ぶ側が EACCES か EPERM に)
 fn ptrace_may(pid: u32, read: bool) -> Result<(), ()> {
@@ -689,7 +689,7 @@ fn ptrace_may(pid: u32, read: bool) -> Result<(), ()> {
         return Ok(());
     }
     let (c, tc) = (crate::cred::current(), &p.cred);
-    let ids = c.euid == tc.uid && c.euid == tc.euid && c.euid == tc.suid && c.egid == tc.gid && c.egid == tc.egid && c.egid == tc.sgid;
+    let ids = c.fsuid == tc.uid && c.fsuid == tc.euid && c.fsuid == tc.suid && c.fsgid == tc.gid && c.fsgid == tc.egid && c.fsgid == tc.sgid;
     if !ids && !c.capable(crate::cred::CAP_SYS_PTRACE) {
         return Err(());
     }

@@ -39,6 +39,8 @@ pub const CAP_AUDIT_CONTROL: u32 = 30;
 pub const CAP_MAC_ADMIN: u32 = 33;
 pub const CAP_AUDIT_READ: u32 = 37;
 pub const CAP_PERFMON: u32 = 38;
+/// ファイルの capability (Linux の CAP_FS_SET: fsuid が 0 でなくなると effective から外れるもの)
+pub const FS_CAPS: [u32; 8] = [CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD, 32];
 /// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)
 pub const CAP_NAMES: [&str; 41] = [
     "chown", "dac_override", "dac_read_search", "fowner", "fsetid", "kill", "setgid", "setuid", "setpcap", "linux_immutable", "net_bind_service", "net_broadcast", "net_admin", "net_raw",
@@ -54,6 +56,15 @@ pub struct Cred {
     pub gid: u32,
     pub egid: u32,
     pub sgid: u32,
+    /// ファイルの許しと作るものの持ち主に使う id (Linux の fsuid / fsgid)。set*uid / set*gid で euid / egid に、setfsuid /
+    /// setfsgid で変わる
+    pub fsuid: u32,
+    pub fsgid: u32,
+    /// capability (aios では root がみな持つ) のうち、permitted があるか (uid・euid・suid のどれかが 0 のあいだ: Linux の
+    /// cap_emulate_setxuid)、ファイルのもの (FS_CAPS) が effective にあるか (fsuid を 0 からほかにすると外れ、0 にもどすと
+    /// permitted から入る。euid が 0 からほかになると外れ、0 にもどると入る。exec で euid が 0 なら入る)
+    pub cap_perm: bool,
+    pub fs_caps: bool,
     pub groups: Vec<u32>,
     /// prctl(PR_SET_NO_NEW_PRIVS): exec で setuid / setgid のビットを見ない。外せない
     pub no_new_privs: bool,
@@ -78,21 +89,28 @@ pub struct Cred {
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
 
+    /// gid の組にいるか (Linux の in_group_p: fsgid と、ほかの組)
     pub fn in_group(&self, gid: u32) -> bool {
-        self.egid == gid || self.groups.contains(&gid)
+        self.fsgid == gid || self.groups.contains(&gid)
+    }
+
+    /// その capability が effective にあるか: ファイルのもの (FS_CAPS) は fs_caps、ほかは euid が 0 (aios では root が
+    /// みな持つ)
+    fn has_cap(&self, cap: u32) -> bool {
+        if FS_CAPS.contains(&cap) { self.fs_caps } else { self.euid == 0 }
     }
 
     /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても AppArmor のプロファイルが
     /// 許さなければ持たない (記録する: apparmor::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
     pub fn capable(&self, cap: u32) -> bool {
-        self.euid == 0 && self.lsm_capable(cap, true)
+        self.has_cap(cap) && self.lsm_capable(cap, true)
     }
 
     /// capable と同じだが記録しない (ns_capable_noaudit: できなければほかのやりかたに回るもの)
     pub fn capable_noaudit(&self, cap: u32) -> bool {
-        self.euid == 0 && self.lsm_capable(cap, false)
+        self.has_cap(cap) && self.lsm_capable(cap, false)
     }
 
     /// commoncap が許したあとの LSM (security_capable): landlock の CAPABILITY_USE、それから AppArmor (CONFIG_LSM の順)
@@ -104,7 +122,7 @@ impl Cred {
     /// generic_permission と同じ順: まず mode のビットで、足りなければ root は CAP_DAC_READ_SEARCH (読む、ディレクトリを
     /// たどる) か CAP_DAC_OVERRIDE (実行はどこかに x がなければできない。ディレクトリは別)
     pub fn may(&self, m: &Meta, want: u32, real: bool) -> bool {
-        let (uid, gid) = if real { (self.uid, self.gid) } else { (self.euid, self.egid) };
+        let (uid, gid) = if real { (self.uid, self.gid) } else { (self.fsuid, self.fsgid) };
         let bits = if m.uid == uid {
             (m.mode >> 6) & 7
         } else if gid == m.gid || self.groups.contains(&m.gid) {
@@ -115,7 +133,9 @@ impl Cred {
         if bits & want == want {
             return true;
         }
-        if uid != 0 {
+        // access(2) は実の id で、実の uid が 0 なら capability がある (Linux の access_override_creds)。ふつうは effective の
+        // ファイルの capability (fsuid を 0 でなくすと外れる)
+        if if real { uid != 0 } else { !self.fs_caps } {
             return false;
         }
         let cap = |c: u32| self.lsm_capable(c, true);
@@ -139,8 +159,8 @@ impl Cred {
 
     /// may の答えを決めた組: 0 持ち主、1 グループ、2 ほか、3 root (why.rs)
     pub fn class(&self, m: &Meta, real: bool) -> u8 {
-        let (uid, gid) = if real { (self.uid, self.gid) } else { (self.euid, self.egid) };
-        if uid == 0 {
+        let (uid, gid) = if real { (self.uid, self.gid) } else { (self.fsuid, self.fsgid) };
+        if if real { uid == 0 } else { self.fs_caps } {
             3
         } else if m.uid == uid {
             0
@@ -153,7 +173,7 @@ impl Cred {
 
     /// 持ち主か CAP_FOWNER か (inode_owner_or_capable)
     pub fn owns(&self, m: &Meta) -> bool {
-        self.euid == m.uid || self.capable(CAP_FOWNER)
+        self.fsuid == m.uid || self.capable(CAP_FOWNER)
     }
 }
 
@@ -172,20 +192,41 @@ pub fn current() -> &'static Cred {
 
 type Res = Result<i64, i64>;
 
-fn set(f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
+/// set*uid (uid が true) / set*gid の資格を f で変える (Linux の __sys_set*uid と commit_creds): uid のものは fsuid を euid
+/// に、capability を uid にあわせる (cap_emulate_setxuid)。gid のものは fsgid を egid に
+fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
     let p = proc::current();
     let mut c = p.cred.clone();
     f(&mut c)?;
+    if uid {
+        let o = &p.cred;
+        c.fsuid = c.euid;
+        let (had, has) = (o.uid == 0 || o.euid == 0 || o.suid == 0, c.uid == 0 || c.euid == 0 || c.suid == 0);
+        // uid・euid・suid がみな 0 でなくなった: permitted も effective も空に
+        if had && !has {
+            (c.cap_perm, c.fs_caps) = (false, false);
+        }
+        // euid が 0 からほかへ: effective を空に。ほかから 0 へ: effective を permitted に
+        if o.euid == 0 && c.euid != 0 {
+            c.fs_caps = false;
+        }
+        if o.euid != 0 && c.euid == 0 {
+            c.fs_caps = c.cap_perm;
+        }
+    } else {
+        c.fsgid = c.egid;
+    }
     changed(p, &c);
     p.cred = c;
     Ok(0)
 }
 
-/// 資格を new に変える前に (Linux の commit_creds): euid か egid が変わるなら (aios では capability も euid で決まる)、
-/// dumpable を fs.suid_dumpable (既定 0) に。もとの人が /proc/PID の中や ptrace で、権利の変わったプロセスを見られない
-/// ように (持ちもの (mm) のないカーネルのスレッドはそのまま)
+/// 資格を new に変える前に (Linux の commit_creds): euid、egid、fsuid、fsgid のどれかが変わるなら (aios では capability も
+/// euid で決まる)、dumpable を fs.suid_dumpable (既定 0) に。もとの人が /proc/PID の中や ptrace で、権利の変わったプロセスを
+/// 見られないように (持ちもの (mm) のないカーネルのスレッドはそのまま)
 pub fn changed(p: &mut proc::Proc, new: &Cred) {
-    if (new.euid != p.cred.euid || new.egid != p.cred.egid) && p.mm.is_some() {
+    let o = &p.cred;
+    if (new.euid != o.euid || new.egid != o.egid || new.fsuid != o.fsuid || new.fsgid != o.fsgid) && p.mm.is_some() {
         p.mm().dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     }
 }
@@ -197,7 +238,7 @@ fn arg(v: u64) -> Option<u32> {
 
 pub fn setuid(uid: u64) -> Res {
     let u = crate::ns::take_uid(uid as u32)?;
-    set(|c| {
+    set_ids(true, |c| {
         if c.capable(CAP_SETUID) {
             (c.uid, c.euid, c.suid) = (u, u, u);
         } else if u == c.uid || u == c.suid {
@@ -211,7 +252,7 @@ pub fn setuid(uid: u64) -> Res {
 
 pub fn setgid(gid: u64) -> Res {
     let g = crate::ns::take_gid(gid as u32)?;
-    set(|c| {
+    set_ids(false, |c| {
         if c.capable(CAP_SETGID) {
             (c.gid, c.egid, c.sgid) = (g, g, g);
         } else if g == c.gid || g == c.sgid {
@@ -240,12 +281,16 @@ pub fn setresgid(r: u64, e: u64, s: u64) -> Res {
     setresgid_out(take_g(r)?, take_g(e)?, take_g(s)?)
 }
 
-/// 外の番号で
+/// 外の番号で。何も変わらなければ (euid は fsuid とも同じなら) 何もしない (Linux の __sys_setresuid)
 fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
-    set(|c| {
+    let (r, e, s) = (arg(r), arg(e), arg(s));
+    let o = &proc::current().cred;
+    if r.is_none_or(|v| v == o.uid) && e.is_none_or(|v| v == o.euid && v == o.fsuid) && s.is_none_or(|v| v == o.suid) {
+        return Ok(0);
+    }
+    set_ids(true, |c| {
         // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresuid)
         let ok = |v: u32| v == c.uid || v == c.euid || v == c.suid;
-        let (r, e, s) = (arg(r), arg(e), arg(s));
         if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETUID) {
             return Err(-EPERM);
         }
@@ -263,10 +308,14 @@ fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
 }
 
 fn setresgid_out(r: u64, e: u64, s: u64) -> Res {
-    set(|c| {
+    let (r, e, s) = (arg(r), arg(e), arg(s));
+    let o = &proc::current().cred;
+    if r.is_none_or(|v| v == o.gid) && e.is_none_or(|v| v == o.egid && v == o.fsgid) && s.is_none_or(|v| v == o.sgid) {
+        return Ok(0);
+    }
+    set_ids(false, |c| {
         // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresgid)
         let ok = |v: u32| v == c.gid || v == c.egid || v == c.sgid;
-        let (r, e, s) = (arg(r), arg(e), arg(s));
         if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETGID) {
             return Err(-EPERM);
         }
@@ -283,27 +332,54 @@ fn setresgid_out(r: u64, e: u64, s: u64) -> Res {
     })
 }
 
-/// setreuid(r, e): 実 uid を変えたとき (または e が実 uid と違うとき) は suid = 新しい euid
+/// setreuid(r, e) (Linux の __sys_setreuid): 実 uid はいまの uid か euid へ、euid は 3 つのどれかへ (でなければ
+/// CAP_SETUID)。実 uid を変えたとき (または e が前の実 uid と違うとき) は suid = 新しい euid
 pub fn setreuid(r: u64, e: u64) -> Res {
-    let (r, e) = (take_u(r)?, take_u(e)?);
-    let old = proc::current().cred.clone();
-    setresuid_out(r, e, u64::MAX)?;
-    let c = &mut proc::current().cred;
-    if arg(r).is_some() || arg(e).is_some_and(|v| v != old.uid) {
-        c.suid = c.euid;
-    }
-    Ok(0)
+    let (r, e) = (arg(take_u(r)?), arg(take_u(e)?));
+    set_ids(true, |c| {
+        let old = c.clone();
+        let cap = || old.capable(CAP_SETUID);
+        if let Some(v) = r {
+            if v != old.uid && v != old.euid && !cap() {
+                return Err(-EPERM);
+            }
+            c.uid = v;
+        }
+        if let Some(v) = e {
+            if v != old.uid && v != old.euid && v != old.suid && !cap() {
+                return Err(-EPERM);
+            }
+            c.euid = v;
+        }
+        if r.is_some() || e.is_some_and(|v| v != old.uid) {
+            c.suid = c.euid;
+        }
+        Ok(())
+    })
 }
 
 pub fn setregid(r: u64, e: u64) -> Res {
-    let (r, e) = (take_g(r)?, take_g(e)?);
-    let old = proc::current().cred.clone();
-    setresgid_out(r, e, u64::MAX)?;
-    let c = &mut proc::current().cred;
-    if arg(r).is_some() || arg(e).is_some_and(|v| v != old.gid) {
-        c.sgid = c.egid;
-    }
-    Ok(0)
+    let (r, e) = (arg(take_g(r)?), arg(take_g(e)?));
+    set_ids(false, |c| {
+        let old = c.clone();
+        let cap = || old.capable(CAP_SETGID);
+        if let Some(v) = r {
+            if v != old.gid && v != old.egid && !cap() {
+                return Err(-EPERM);
+            }
+            c.gid = v;
+        }
+        if let Some(v) = e {
+            if v != old.gid && v != old.egid && v != old.sgid && !cap() {
+                return Err(-EPERM);
+            }
+            c.egid = v;
+        }
+        if r.is_some() || e.is_some_and(|v| v != old.gid) {
+            c.sgid = c.egid;
+        }
+        Ok(())
+    })
 }
 
 fn out(va: usize, b: &[u8]) -> Result<(), i64> {
@@ -359,11 +435,50 @@ pub fn setgroups(size: usize, list: usize) -> Res {
     Ok(0)
 }
 
-/// setfsuid/setfsgid: fs 用の id は euid と同じとして、前の値を返す
-pub fn setfsuid(_uid: u64) -> Res {
-    Ok(proc::current().cred.euid as i64)
+/// setfsuid (Linux の __sys_setfsuid): いつも前の fsuid を返す。-1 (と namespace で見えない番号) は変えずに問うだけ。
+/// uid・euid・suid・fsuid のどれかへか、CAP_SETUID なら変える (ちがえば dumpable も)。fsuid を 0 からほかにすると
+/// ファイルの capability が外れ、0 にもどすと permitted から入る (cap_task_fix_setuid の LSM_SETID_FS)
+pub fn setfsuid(uid: u64) -> Res {
+    let p = proc::current();
+    let old = p.cred.fsuid;
+    let ret = crate::ns::show_uid(old) as i64;
+    if uid as u32 == u32::MAX {
+        return Ok(ret);
+    }
+    let Ok(u) = crate::ns::take_uid(uid as u32) else { return Ok(ret) };
+    let o = &p.cred;
+    if u == old || !(u == o.uid || u == o.euid || u == o.suid || o.capable(CAP_SETUID)) {
+        return Ok(ret);
+    }
+    let mut c = p.cred.clone();
+    c.fsuid = u;
+    if old == 0 && u != 0 {
+        c.fs_caps = false;
+    }
+    if old != 0 && u == 0 {
+        c.fs_caps = c.cap_perm;
+    }
+    changed(p, &c);
+    p.cred = c;
+    Ok(ret)
 }
 
-pub fn setfsgid(_gid: u64) -> Res {
-    Ok(proc::current().cred.egid as i64)
+/// setfsgid (Linux の __sys_setfsgid): setfsuid と同じく、gid・egid・sgid・fsgid のどれかへか CAP_SETGID なら
+pub fn setfsgid(gid: u64) -> Res {
+    let p = proc::current();
+    let old = p.cred.fsgid;
+    let ret = crate::ns::show_gid(old) as i64;
+    if gid as u32 == u32::MAX {
+        return Ok(ret);
+    }
+    let Ok(g) = crate::ns::take_gid(gid as u32) else { return Ok(ret) };
+    let o = &p.cred;
+    if g == old || !(g == o.gid || g == o.egid || g == o.sgid || o.capable(CAP_SETGID)) {
+        return Ok(ret);
+    }
+    let mut c = p.cred.clone();
+    c.fsgid = g;
+    changed(p, &c);
+    p.cred = c;
+    Ok(ret)
 }

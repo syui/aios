@@ -948,12 +948,12 @@ impl Raw {
         let uid = u16_at(&self.0, 2) as u32 | (u16_at(&self.0, 120) as u32) << 16;
         Meta { mode: self.mode(), uid, gid: self.gid(), ..Meta::default() }
     }
-    /// 作ったものの持ち主 (Linux の inode_init_owner): 作るプロセスの euid と egid。setgid のディレクトリの下なら
+    /// 作ったものの持ち主 (Linux の inode_init_owner): 作るプロセスの fsuid と fsgid。setgid のディレクトリの下なら
     /// そのグループで、ディレクトリなら setgid も受けつぐ。sysfile の own_new は、もう同じなら書きなおさない
     fn init_owner(&mut self, parent: &Raw) {
         let c = crate::cred::current();
         let sgid = parent.mode() & crate::cred::S_ISGID != 0;
-        let (uid, gid) = (c.euid, if sgid { parent.gid() } else { c.egid });
+        let (uid, gid) = (c.fsuid, if sgid { parent.gid() } else { c.fsgid });
         put16(&mut self.0, 2, uid as u16);
         put16(&mut self.0, 120, (uid >> 16) as u16);
         put16(&mut self.0, 24, gid as u16);
@@ -3902,7 +3902,7 @@ impl ExtFs {
             }
             // sticky なディレクトリでは、持ち主 (ファイルかディレクトリ) だけ。ほかは CAP_FOWNER を見るふつうの道で (sysfile の sticky_ok)
             let dm = dr.perm_meta();
-            if dm.mode & crate::cred::S_ISVTX != 0 && c.euid != dm.uid && r.perm_meta().uid != c.euid {
+            if dm.mode & crate::cred::S_ISVTX != 0 && c.fsuid != dm.uid && r.perm_meta().uid != c.fsuid {
                 return FastUnlink::No;
             }
             {

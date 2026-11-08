@@ -1425,9 +1425,9 @@ impl Profile {
     }
 }
 
-/// プロセスの fsuid (aios では euid)
+/// プロセスの fsuid
 fn fsuid() -> u32 {
-    crate::cred::current().euid
+    crate::cred::current().fsuid
 }
 
 /// パスの名前: 頭に /、ディレクトリなら終わりにも / (aa_path_name の PATH_IS_DIR)

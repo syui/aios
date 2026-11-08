@@ -429,8 +429,8 @@ fn new_sock(typ: u8) -> UnixRef {
         has_file: true,
         net: crate::ns::net().unwrap_or(0),
         ino,
-        uid: c.euid,
-        gid: c.egid,
+        uid: c.fsuid,
+        gid: c.fsgid,
         mode: 0o777,
         mtime: crate::timer::coarse_epoch_ns(),
         ctime: crate::timer::coarse_epoch_ns(),
@@ -2286,7 +2286,7 @@ pub fn owner(u: &UnixRef) -> u32 {
 pub fn chmod(u: &UnixRef, mode: u32) -> R {
     let c = proc::current_cred_ref();
     let mut s = u.borrow_mut();
-    if c.euid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
+    if c.fsuid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
         return Err(-EPERM);
     }
     s.mode = mode & 0o7777;

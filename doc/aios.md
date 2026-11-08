@@ -1902,8 +1902,28 @@ begin_new_exec、task_dump_owner、__ptrace_may_access)。dumpable は持ちも�
   15 バイト)、fd/N のリンクの mode は開いた口しだい (読めれば r-x、書ければ -wx)
 
 `test/dumpable.c` (root で: 自分の資格を変える、変わらない・もどすだけのとき、ほかのプロセスから、exec のあと (読めない
-プログラム、setuid のもの)、`fs.suid_dumpable` 2) は Linux 7.4-rc1 と同じ (82 行)。fsuid はまだない (setfsuid は euid を
-返すだけ) ので、setfsuid で dumpable が変わるところはまだ。
+プログラム、setuid のもの)、`fs.suid_dumpable` 2) は Linux 7.4-rc1 と同じ (82 行)。
+
+### fsuid と fsgid
+
+ファイルの許しと、作るものの持ち主に使う id (Linux の fsuid / fsgid。cred.rs)。前の aios は euid と egid を使い、setfsuid は
+euid を返すだけだった。
+
+- set*uid / set*gid で euid / egid にそろう (何も変わらない setresuid / setresgid は、Linux と同じく何もしない: euid が
+  fsuid とちがえばそろえる)。setreuid の実 uid は、いまの uid か euid へだけ (前の aios は suid へも許していた)。exec でも euid / egid に。setfsuid / setfsgid は、uid・euid・suid・fsuid (gid のもの) の
+  どれかへか、CAP_SETUID (CAP_SETGID) なら変える。答えはいつも前の値で、-1 と namespace で見えない番号は問うだけ
+- ファイルの capability (CAP_CHOWN、DAC_OVERRIDE、DAC_READ_SEARCH、FOWNER、FSETID、LINUX_IMMUTABLE、MKNOD、MAC_OVERRIDE:
+  Linux の CAP_FS_SET) は Cred の `fs_caps` で: fsuid を 0 からほかにすると外れ、0 にもどすと permitted (`cap_perm`: uid・
+  euid・suid のどれかが 0 のあいだ) から入る (euid が 1000 でも)。euid が 0 からほかになると外れ、0 にもどると permitted に。
+  exec で euid が 0 なら入る。ほかの capability はいままでどおり euid が 0 か。Linux と同じくせ: euid が 0 のまま
+  setresuid で fsuid を 0 にもどしても、外れたファイルの capability はもどらない
+- fsuid / fsgid で見るもの: ファイルの許し (generic_permission。access(2) は実の id)、組 (in_group_p は fsgid)、作るもの
+  (ファイル、ディレクトリ、ソケット、パイプ、memfd) の持ち主、sticky、chown / chmod / utimes / O_NOATIME / FS_IOC_SETFLAGS
+  の持ち主、AppArmor の owner、ほかのプロセスの /proc の口 (PTRACE_MODE_FSCREDS)、/proc/PID/status の Uid / Gid の 4 つめ、
+  PIDFD_GET_INFO、audit の fsuid= fsgid= とルールの FSUID / FSGID / 比べかた。変われば dumpable も (commit_creds)
+
+`test/fsuid.c` (root で: root の setfsuid と setfsgid、そのあとの許しと持ち主、外れた capability が setresuid でもどらない
+こと、exec、euid 1000 から fsuid 0 にしたとき、ふつうの人、dumpable) は Linux 7.4-rc1 と同じ (55 行)。
 
 ### CPU の時計 (clock_gettime、clock_getres、timer_create)
 

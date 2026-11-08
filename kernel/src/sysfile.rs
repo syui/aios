@@ -291,21 +291,21 @@ fn parent_writable(c: &Cred, parent: &InodeRef) -> Result<(), i64> {
 /// sticky なディレクトリでは、消す/動かすのは持ち主 (ファイルかディレクトリ) か CAP_FOWNER だけ (Linux の __check_sticky)
 fn sticky_ok(c: &Cred, parent: &InodeRef, name: &str) -> Result<(), i64> {
     let pm = parent.meta();
-    if pm.mode & cred::S_ISVTX == 0 || c.euid == pm.uid {
+    if pm.mode & cred::S_ISVTX == 0 || c.fsuid == pm.uid {
         return Ok(());
     }
     let child = parent.lookup(name)?;
-    if child.meta().uid == c.euid || c.capable(cred::CAP_FOWNER) { Ok(()) } else { Err(-cred::EPERM) }
+    if child.meta().uid == c.fsuid || c.capable(cred::CAP_FOWNER) { Ok(()) } else { Err(-cred::EPERM) }
 }
 
 /// 作ったものの持ち主を決める (setgid のディレクトリの下ならそのグループ)。ext4 は作るときに決めている
 /// (Linux の inode_init_owner) ので、もう同じなら inode を書きなおさない
 fn own_new(c: &Cred, parent: &InodeRef, ino: &InodeRef) -> Result<(), i64> {
     let pm = parent.meta();
-    let gid = if pm.mode & cred::S_ISGID != 0 { pm.gid } else { c.egid };
+    let gid = if pm.mode & cred::S_ISGID != 0 { pm.gid } else { c.fsgid };
     let m = ino.meta();
-    if m.uid != c.euid || m.gid != gid {
-        ino.set_owner(Some(c.euid), Some(gid))?;
+    if m.uid != c.fsuid || m.gid != gid {
+        ino.set_owner(Some(c.fsuid), Some(gid))?;
     }
     if pm.mode & cred::S_ISGID != 0 && m.is_dir() && m.mode & cred::S_ISGID == 0 {
         ino.set_mode(m.mode | cred::S_ISGID)?;
@@ -1364,7 +1364,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
                 crate::landlock::check_fs(&full, crate::landlock::WRITE_FILE)?;
             }
             // AppArmor: 作る (mknod) と、開く (Linux の may_o_create と file_open)
-            let me = cred::current().euid;
+            let me = cred::current().fsuid;
             crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, me)?;
             crate::apparmor::open_perm(&full, flags as u32, false, me)?;
             let c = cred::current();
@@ -1691,7 +1691,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
-    crate::apparmor::path_perm(crate::apparmor::OP_MKDIR, &full, crate::apparmor::MAY_CREATE, true, cred::current().euid)?;
+    crate::apparmor::path_perm(crate::apparmor::OP_MKDIR, &full, crate::apparmor::MAY_CREATE, true, cred::current().fsuid)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     // setuid と setgid は落とす (Linux の vfs_mkdir は S_IRWXUGO と S_ISVTX だけ。setgid は親が setgid なら own_new が)
@@ -1743,7 +1743,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     vfs::check_writable(&full)?;
     let mode = mode as u32;
     crate::landlock::check_parent(&full, crate::landlock::make_right_dev(mode, dev))?;
-    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().euid)?;
+    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
         vfs::S_IFCHR => NewNode::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
@@ -1778,7 +1778,7 @@ pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String, S
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_SOCK)?;
     // AppArmor: AF_UNIX の bind は mknod (Linux の unix_bind も vfs_mknod)
-    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().euid)?;
+    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !umask(), NewNode::Sock)?;
@@ -1877,7 +1877,7 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
-    crate::apparmor::path_perm(crate::apparmor::OP_SYMLINK, &full, crate::apparmor::MAY_CREATE, false, cred::current().euid)?;
+    crate::apparmor::path_perm(crate::apparmor::OP_SYMLINK, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
@@ -2100,7 +2100,7 @@ pub fn memfd_create(name: usize, flags: u64) -> R {
         F_SEAL_SEAL
     };
     let c = crate::cred::current();
-    let ino = crate::tmpfs::anon_file(c.euid, c.egid, seals);
+    let ino = crate::tmpfs::anon_file(c.fsuid, c.fsgid, seals);
     let f = file::new(Kind::Inode(ino, alloc::format!("/memfd:{} (deleted)", name)), file::O_RDWR);
     let fd = proc::current().files().add(f, flags & MFD_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
@@ -2256,7 +2256,7 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
     if let Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) = &f.borrow().kind {
         use core::sync::atomic::Ordering::Relaxed;
         let c = cred::current();
-        if c.euid != p.uid.load(Relaxed) && !c.capable(cred::CAP_FOWNER) {
+        if c.fsuid != p.uid.load(Relaxed) && !c.capable(cred::CAP_FOWNER) {
             return Err(-cred::EPERM);
         }
         p.perm.store(mode as u32 & 0o7777, Relaxed);
@@ -2337,7 +2337,7 @@ fn chown_mode(c: &Cred, (cur_uid, cur_gid, mode): (u32, u32, u32), uid: Option<u
     if !dir && mode & cred::S_ISGID != 0 && (mode & 0o010 != 0 || !(c.in_group(cur_gid) || c.capable(cred::CAP_FSETID))) {
         kill |= cred::S_ISGID;
     }
-    let own = c.euid == cur_uid;
+    let own = c.fsuid == cur_uid;
     if uid.is_some_and(|u| !(own && u == cur_uid) && !c.capable(cred::CAP_CHOWN)) {
         return Err(-cred::EPERM);
     }
@@ -2631,14 +2631,14 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             let (owner, odirect) = match &f.kind {
                 Kind::Inode(i, _) => (Some(i.meta().uid), i.meta().mode & S_IFMT == vfs::S_IFREG),
                 Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (Some(p.uid.load(core::sync::atomic::Ordering::Relaxed)), true),
-                Kind::Socket(_) => (Some(cred::current().euid), false),
+                Kind::Socket(_) => (Some(cred::current().fsuid), false),
                 Kind::Unix(u) => (Some(crate::unix::owner(u)), false),
                 Kind::Inet(u) => (Some(crate::inet::owner(u)), false),
                 // eventfd などの名前のない inode は root のもの
                 _ => (None, false),
             };
             let c = cred::current();
-            if arg & O_NOATIME != 0 && f.flags & O_NOATIME == 0 && owner != Some(c.euid) && !c.capable(cred::CAP_FOWNER) {
+            if arg & O_NOATIME != 0 && f.flags & O_NOATIME == 0 && owner != Some(c.fsuid) && !c.capable(cred::CAP_FOWNER) {
                 return Err(-cred::EPERM);
             }
             if arg & O_DIRECT != 0 && !odirect {
@@ -2834,7 +2834,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
         let new = u32::from_le_bytes(v);
         let c = cred::current();
-        if c.euid != ino.meta().uid && !c.capable(cred::CAP_FOWNER) {
+        if c.fsuid != ino.meta().uid && !c.capable(cred::CAP_FOWNER) {
             return Err(-vfs::EPERM);
         }
         const FS_APPEND_FL: u32 = 0x20;

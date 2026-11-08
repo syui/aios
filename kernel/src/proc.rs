@@ -2029,7 +2029,7 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     // がちがえば fs.suid_dumpable。setuid / setgid で euid / egid が変わっても (下の commit_creds)
     let suid_dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let mut dumpable = if img.nondump || p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid { suid_dumpable } else { 1 };
-    let (old_euid, old_egid) = (p.cred.euid, p.cred.egid);
+    let (old_euid, old_egid, old_fsuid, old_fsgid) = (p.cred.euid, p.cred.egid, p.cred.fsuid, p.cred.fsgid);
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
     // (砂場の中から sudo で外へ出られないように)
     if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
@@ -2040,6 +2040,12 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     }
     p.cred.suid = p.cred.euid;
     p.cred.sgid = p.cred.egid;
+    // fs の id は euid と egid に、capability は作りなおす (Linux の cap_bprm_creds_from_file: root (uid か euid が 0) は
+    // permitted がみな、euid が 0 なら effective も。ほかは空)
+    p.cred.fsuid = p.cred.euid;
+    p.cred.fsgid = p.cred.egid;
+    p.cred.cap_perm = p.cred.uid == 0 || p.cred.euid == 0;
+    p.cred.fs_caps = p.cred.euid == 0;
     p.set_comm(path.rsplit('/').next().unwrap_or(path).as_bytes());
     crate::audit::exec_done(p);
     // 他のスレッドは消える
@@ -2067,7 +2073,7 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
-    if p.cred.euid != old_euid || p.cred.egid != old_egid {
+    if p.cred.euid != old_euid || p.cred.egid != old_egid || p.cred.fsuid != old_fsuid || p.cred.fsgid != old_fsgid {
         dumpable = suid_dumpable;
     }
     p.mm().dumpable = dumpable;

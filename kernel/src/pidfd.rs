@@ -173,11 +173,11 @@ fn info(pid: u32, _thread: bool, usize: usize, arg: usize) -> Result<i64, i64> {
                 put(&mut k, 64, cm);
                 got |= INFO_COREDUMP;
             }
-            // 番号と資格情報はいつも (fs の id は aios では euid と egid)
+            // 番号と資格情報はいつも
             let c = &t.cred;
             let uid = |u: u32| crate::ns::show_uid(u);
             let gid = |g: u32| crate::ns::show_gid(g);
-            for (o, v) in [(28, uid(c.uid)), (32, gid(c.gid)), (36, uid(c.euid)), (40, gid(c.egid)), (44, uid(c.suid)), (48, gid(c.sgid)), (52, uid(c.euid)), (56, gid(c.egid))] {
+            for (o, v) in [(28, uid(c.uid)), (32, gid(c.gid)), (36, uid(c.euid)), (40, gid(c.egid)), (44, uid(c.suid)), (48, gid(c.sgid)), (52, uid(c.fsuid)), (56, gid(c.fsgid))] {
                 put(&mut k, o, v);
             }
             got |= INFO_CREDS;

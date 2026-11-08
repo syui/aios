@@ -618,7 +618,7 @@ pub fn ll_kind(u: &InetRef) -> (Option<bool>, bool) {
 pub fn create(typ: u64, protocol: u64) -> InetRef {
     let tcp = typ == 1;
     let c = proc::current_cred_ref();
-    new_sock_as(tcp, if protocol != 0 { protocol as u8 } else if tcp { 6 } else { 17 }, c.euid, c.egid, crate::ns::net().unwrap_or(0))
+    new_sock_as(tcp, if protocol != 0 { protocol as u8 } else if tcp { 6 } else { 17 }, c.fsuid, c.fsgid, crate::ns::net().unwrap_or(0))
 }
 
 /// socket(AF_INET6, ...): IPV6_V6ONLY ははじめ 0 (net.ipv6.bindv6only)
@@ -5224,7 +5224,7 @@ pub fn owner(u: &InetRef) -> u32 {
 pub fn chmod(u: &InetRef, mode: u32) -> R {
     let c = proc::current_cred_ref();
     let mut s = u.borrow_mut();
-    if c.euid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
+    if c.fsuid != s.uid && !c.capable(crate::cred::CAP_FOWNER) {
         return Err(-EPERM);
     }
     s.mode = mode & 0o7777;
