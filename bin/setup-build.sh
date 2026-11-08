@@ -2,7 +2,6 @@
 # このマシン (Debian / Ubuntu) に、aios を作る道具をそろえる。足りないものだけ入れるので、何度動かしてもよい
 #   bin/setup-build.sh            ビルド (bin/mkpkg.sh, pkg/*/*/PKGBUILD)、ディスク (bin/mkdisk.sh)、VM (bin/run.sh) の道具
 #   bin/setup-build.sh --firefox  それに firefox を作る道具 (cbindgen、libclang、nodejs) も
-# クラウドの環境では、セットアップスクリプトから呼ぶ (セッションが変わると入れたものは消えるので)
 #
 # 入れるもの:
 #   apt:    clang-20 llvm-20 lld (llvm のビルドの途中の道具、ffmpeg の nm と strip)、cmake ninja-build pkg-config、

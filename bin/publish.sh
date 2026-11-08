@@ -1,5 +1,5 @@
 #!/bin/sh
-# main に push したあとに、配るところをそろえる (push するたびに。Claude もこれを動かす):
+# main に push したあとに、配るところをそろえる (push するたびに):
 #   1. GitHub の CI (.github/workflows/unix.yml) がこのコミットのディスクを作って起動を確かめ、リリース latest
 #      (タイトル aios) に置くのを待ち、git.syui.ai の ai/os の latest にも同じものを置く (bin/gitea.sh mirror)。
 #      CI が動かないコミット (paths-ignore: ドキュメント、todo.json など) なら、CI の走った一番新しいコミットのうち、

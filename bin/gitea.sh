@@ -15,14 +15,9 @@
 #                        Cloudflare をとおると 502 になる (31 MB はとおり、279 MB はだめだった) ので、サーバーの上で
 #                        GITEA_URL=http://127.0.0.1:3000 bin/gitea.sh model ai.gguf のように Gitea へじかに
 #
-# 秘密鍵は環境の setup script で鍵の束 (/root/.gnupg) に取りこんでおく:
-#   gpg --batch --import <<'EOF'
-#   -----BEGIN PGP PRIVATE KEY BLOCK-----
-#   ...
-#   EOF
-# 名前とメールはその鍵の uid から。鍵がいくつかあれば GPG_SIGNER (指紋か uid のメール) で選ぶ。
-# 認証は git.syui.ai への通信に環境の API 認証情報がつくのにまかせる
-# (GITEA_TOKEN があればそれを使う。ユーザーは GITEA_USER、既定 ai.syui.ai)。トークンはディスクに書かない
+# 署名は gpg の鍵の束にある秘密鍵で。名前とメールはその鍵の uid から。鍵がいくつかあれば GPG_SIGNER (指紋か
+# uid のメール) で選ぶ。認証は GITEA_TOKEN (ユーザーは GITEA_USER、既定 ai.syui.ai)。なければ git.syui.ai への
+# 通信につく認証にまかせる。トークンはディスクに書かない
 set -e
 # model の FILE は、呼んだところからのパス
 here=$(pwd)
@@ -31,12 +26,12 @@ host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
 # git に認証のヘッダを渡す (コマンドラインの -c なので、設定ファイルにもログにも残らない)。
-# トークンがなければ何もしない設定 (プロキシが認証をつける)
+# トークンがなければ何もしない設定 (ほかでつく認証にまかせる)
 auth() {
   if [ -n "$GITEA_TOKEN" ]; then
     printf 'http.%s/.extraheader=Authorization: Basic %s' "$host" "$(printf '%s:%s' "$user" "$GITEA_TOKEN" | base64 | tr -d '\n')"
@@ -45,8 +40,8 @@ auth() {
   fi
 }
 
-# push の前のやりとり (push.negotiate) はしない: この環境の git の設定 (~/.gitconfig) では true で、git.syui.ai はその
-# 答えに packfile を返すので、毎回 "fatal: expected 'acknowledgments', received 'packfile'" となり、あきらめてから送っていた
+# push の前のやりとり (push.negotiate) はしない: git の設定で true になっていると、git.syui.ai はその答えに packfile を
+# 返すので、毎回 "fatal: expected 'acknowledgments', received 'packfile'" となり、あきらめてから送っていた
 git_push() {
   git -c "$(auth)" -c push.negotiate=false push "$@"
 }
@@ -57,7 +52,7 @@ find_key() {
   fpr=$(printf '%s\n' "$list" | awk -F: '/^fpr:/ {print $10; exit}')
   uid=$(printf '%s\n' "$list" | awk -F: '/^uid:/ {print $10; exit}')
   if [ -z "$fpr" ] || [ -z "$uid" ]; then
-    echo "gpg の鍵の束に秘密鍵がありません (環境の setup script で gpg --import してください)" >&2
+    echo "gpg の鍵の束に秘密鍵がありません (gpg --import してください)" >&2
     return 1
   fi
 }
@@ -75,7 +70,7 @@ use_identity() {
   identity
   git -C "$1" config user.name "$name"
   git -C "$1" config user.email "$mail"
-  # この環境の git は SSH の鍵で署名する設定 (gpg.format=ssh) なので、GPG に戻す
+  # git の設定が SSH の鍵で署名する (gpg.format=ssh) こともあるので、GPG に戻す
   git -C "$1" config gpg.format openpgp
   git -C "$1" config user.signingkey "$fpr"
   git -C "$1" config commit.gpgsign true
@@ -89,8 +84,8 @@ case "$1" in
     git config aish.mirror "$host/ai/os.git"
     ;;
   os)
-    # main ブランチにいればそれを、ほかのブランチ (Claude の作業ブランチなど) にいれば GitHub の main (先に
-    # git push origin HEAD:main したもの) を送る。手元の古い main ブランチを送らないように
+    # main ブランチにいればそれを、ほかのブランチにいれば GitHub の main (先に git push origin HEAD:main したもの)
+    # を送る。手元の古い main ブランチを送らないように
     if [ "$(git rev-parse --abbrev-ref HEAD)" = main ]; then
       ref=main
     else
@@ -104,7 +99,7 @@ case "$1" in
     identity
     echo "commits by $name <$mail>, signed with $fpr" >&2
     # ai/repo の写し (build/airepo。aish-pkg の push が ai/repo とくらべるのにも使う) から送る。あれば変わったところだけを
-    # 取る (前は送るたびに ai/repo をまるごと (いま 540 MB) clone していて何分もかかり、プロキシに切られることもあった)。
+    # 取る (前は送るたびに ai/repo をまるごと (いま 540 MB) clone していて何分もかかっていた)。
     # 送るのも、写しにないもの (作りなおしたパッケージ) だけ
     dir=$PWD/build/airepo
     if [ -d "$dir/.git" ]; then
@@ -203,7 +198,7 @@ case "$1" in
       sha=$(git rev-parse HEAD)
     fi
     # タグをつけるコミットが ai/os にないと、リリースを作れない (404)。前の latest を消すまえに見る (消してから
-    # しくじると latest がなくなる。syui が ai/os にじかにコミットして main がずれ、gitea.sh os がしくじったときなど)
+    # しくじると latest がなくなる。ai/os にじかにコミットされて main がずれ、gitea.sh os がしくじったときなど)
     call "$api/git/commits/$sha" > /dev/null 2>&1 || { echo "ai/os: $sha is not in ai/os (push main first: bin/gitea.sh os); the release $tag is left as is" >&2; exit 1; }
     # 前の latest (リリースとタグ) を消す。前の名前の unix-latest がのこっていれば、それも
     for t in $tag unix-latest; do
