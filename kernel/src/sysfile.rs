@@ -20,7 +20,7 @@ const ENOTTY: i64 = 25;
 const ERANGE: i64 = 34;
 const ENOTEMPTY: i64 = 39;
 
-const AT_FDCWD: i64 = -100;
+pub const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_SYMLINK_FOLLOW: u64 = 0x400;
@@ -3923,6 +3923,35 @@ fn parent_path(p: &vfs::Parent) -> String {
 }
 
 /// dirfd + path を引いて (本当のパス, inode)
+/// execveat の開くもの (Linux の do_open_execat の do_file_open): 名前が空なら fd そのもの (O_PATH も。ふつうのファイルで
+/// なければ exec のたしかめで EACCES)、ほかは dirfd から。follow でなければ終わりのシンボリックリンクは ELOOP
+pub fn exec_open(dirfd: i64, path: &str, follow: bool) -> Result<(String, InodeRef), i64> {
+    const ELOOP: i64 = 40;
+    const EACCES: i64 = 13;
+    let (p, i) = if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            let cwd = proc::current().files().cwd.clone();
+            (cwd.clone(), vfs::resolve("", &cwd, true)?)
+        } else {
+            let f = file_of(dirfd as u64)?;
+            let b = f.borrow();
+            match &b.kind {
+                Kind::Inode(i, p) => (p.clone(), i.clone()),
+                _ => return Err(-EACCES),
+            }
+        }
+    } else {
+        match base_ino(dirfd, path)? {
+            Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow)?,
+            None => vfs::lookup(&proc::current().files().cwd.clone(), path, follow)?,
+        }
+    };
+    if !follow && i.meta().mode & vfs::S_IFMT == vfs::S_IFLNK {
+        return Err(-ELOOP);
+    }
+    Ok((p, i))
+}
+
 fn audit_lookup(dirfd: i64, path: &str, follow: bool) -> Option<(String, InodeRef)> {
     match base_ino(dirfd, path).ok()? {
         Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow).ok(),
@@ -4010,6 +4039,20 @@ pub fn audit_pre(nr: u64, a: &[u64; 6]) -> Option<AuditPlan> {
         FCHMOD | FCHOWN => audit_fd(a[0]),
         EXECVE => {
             audit_normal(AT_FDCWD, a[0], true);
+            Some(AuditPlan::Exec)
+        }
+        EXECVEAT => {
+            // 名前が空 (AT_EMPTY_PATH) なら "" の名前に fd のもの
+            if a[4] & AT_EMPTY_PATH != 0 && user_str(a[1] as usize).is_ok_and(|p| p.is_empty()) {
+                let an = crate::audit::getname("");
+                if let Ok(f) = file_of(a[0]) {
+                    if let Kind::Inode(i, p) = &f.borrow().kind {
+                        crate::audit::inode(an, None, i, false, p);
+                    }
+                }
+            } else {
+                audit_normal(int(a[0]), a[1], a[4] & AT_SYMLINK_NOFOLLOW == 0);
+            }
             Some(AuditPlan::Exec)
         }
         MKDIRAT | MKNODAT => audit_create(int(a[0]), a[1]),

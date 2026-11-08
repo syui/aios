@@ -259,6 +259,7 @@ nrs! {
     MEMFD_CREATE = 279,
     MEMBARRIER = 283,
     RSEQ = 293,
+    EXECVEAT = 281,
     CLOSE_RANGE = 436,
     OPENAT2 = 437,
     FACCESSAT2 = 439,
@@ -563,6 +564,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         CLONE3 => sys_clone3(a[0] as usize, a[1] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
+        EXECVEAT => sys_execveat(a[0] as i32 as i64, a[1] as usize, a[2] as usize, a[3] as usize, a[4]),
         WAIT4 => crate::ns::arg_pid(int(a[0])).map_err(|_| -10).and_then(|p| sys_wait4(p, a[1] as usize, a[2])),
         GETRUSAGE => sys_getrusage(int(a[0]), a[1] as usize),
         TIMES => sys_times(a[0] as usize),
@@ -838,6 +840,7 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
     let path_arg = match n.as_str() {
         // execve がうまくいったあとは、もう新しいプログラムのメモリなので読まない
         "execve" if r.is_err() => Some(0),
+        "execveat" if r.is_err() => Some(1),
         "chdir" | "truncate" | "statfs" | "acct" | "swapon" => Some(0),
         "openat" | "openat2" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
         _ => None,
@@ -858,7 +861,7 @@ pub fn path_arg(nr: u64) -> Option<usize> {
     use nr::*;
     Some(match nr {
         CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 | SETXATTR | LSETXATTR | GETXATTR | LGETXATTR | LISTXATTR | LLISTXATTR => 0,
-        OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT => 1,
+        OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT | EXECVEAT => 1,
         SYMLINKAT => 2,
         LINKAT => 3,
         _ => return None,
@@ -1736,6 +1739,41 @@ fn sys_execve(path: usize, argv: usize, envp: usize) -> R {
     let argv = copy_in_strv(argv)?;
     let envp = copy_in_strv(envp)?;
     proc::execve(&path, &argv, &envp)?;
+    Ok(0)
+}
+
+/// execveat (Linux の do_execveat_common と alloc_bprm): dirfd からの名前、AT_EMPTY_PATH なら fd そのもの (O_PATH も)、
+/// AT_SYMLINK_NOFOLLOW なら終わりのシンボリックリンクは ELOOP、AT_EXECVE_CHECK ならたしかめるだけ (0)。fd からの名前は
+/// /dev/fd/N か /dev/fd/N/NAME になる (#! のインタプリタにわたす名前と AT_EXECFN。fd が O_CLOEXEC なら #! は ENOENT)
+fn sys_execveat(dirfd: i64, path: usize, argv: usize, envp: usize, flags: u64) -> R {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_EXECVE_CHECK: u64 = 0x10000;
+    let path = proc::current().pt().copy_in_str(path, 4096).ok_or(-EFAULT)?;
+    let path = String::from_utf8(path).map_err(|_| -ENOENT)?;
+    // 名前を写すところ (getname_uflags): 空は AT_EMPTY_PATH のときだけ。flags のたしかめは開くところ (do_open_execat)
+    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return Err(-ENOENT);
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_EXECVE_CHECK) != 0 {
+        return Err(crate::why::inval());
+    }
+    let (exe, ino) = crate::sysfile::exec_open(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    let from_fd = dirfd != crate::sysfile::AT_FDCWD && !path.starts_with('/');
+    let filename = match (from_fd, path.is_empty()) {
+        (false, _) => path.clone(),
+        (true, true) => alloc::format!("/dev/fd/{}", dirfd),
+        (true, false) => alloc::format!("/dev/fd/{}/{}", dirfd, path),
+    };
+    let inaccessible = from_fd && proc::current().files().fds.get(dirfd as usize).and_then(|f| f.as_ref()).is_some_and(|f| f.cloexec);
+    if flags & AT_EXECVE_CHECK != 0 {
+        crate::exec::check(&exe, &ino)?;
+        return Ok(0);
+    }
+    let argv = copy_in_strv(argv)?;
+    let envp = copy_in_strv(envp)?;
+    let t = crate::exec::Target { exe, ino, filename, inaccessible, comm_from_file: from_fd && path.is_empty() };
+    proc::execve_target(t, &argv, &envp)?;
     Ok(0)
 }
 

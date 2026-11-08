@@ -1013,9 +1013,12 @@ EXIT のフィルタをくらべて同じ (172 行)。
 
 test/auditpath.c (root で) は子のパスのシステムコールと WATCH の記録をくらべて同じ (174 行)。test/auditdir.c (root で)
 は DIR、ほかのパスのシステムコール、exit_group、殺されたときの記録をくらべて同じ (149 行)。test/auditexec.c (root で) は、
-記録を出したあとに exec したスレッドの PROCTITLE が新しいプログラムのものになるのを確かめて同じ (24 行)。kmsg のかぎりがあるので、ところどころで
+記録を出したあとに exec したスレッドの PROCTITLE が新しいプログラムのものになるのを確かめて同じ (24 行)。
+test/auditexecat.c (root で) は exec の名前をくらべて同じ (111 行): #! のインタプリタと動的なプログラムの ld.so
+(PT_INTERP) も PATH に足す (Linux の open_exec。ない ld.so は名前だけの UNKNOWN)、execveat の dirfd からの名前と
+AT_EMPTY_PATH の `name=""`、EXECVE の引数のスクリプトの名前 (/dev/fd/N/NAME)。kmsg のかぎりがあるので、ところどころで
 5 秒待つ。手本の Linux は AppArmor を入れると
-AUDIT も入る (select)。のこり: xattr、mount、execveat、name_to_handle_at などの名前、動的なプログラムの ld.so の名前、
+AUDIT も入る (select)。のこり: xattr、mount、name_to_handle_at などの名前、
 AUDIT_MAKE_EQUIV (EOPNOTSUPP)、AppArmor のラベルのルール (SUBJ_ROLE)、/proc/PID/task/TID/loginuid、TTY の入力の記録
 (TTY_SET は覚えるだけ)、backlog (記録はすぐ出すので行列がない)。
 
@@ -1929,6 +1932,27 @@ euid を返すだけだった。
 `test/fsuid.c` (root で: root の setfsuid と setfsgid、そのあとの許しと持ち主、外れた capability が setresuid でもどらない
 こと、exec、euid 1000 から fsuid 0 にしたとき、ふつうの人、dumpable) は Linux 7.4-rc1 と同じ (55 行)。
 
+### execveat
+
+前の aios は execveat がなく ENOSYS だった (glibc の fexecve は /proc/self/fd/N の execve にもどる)。いまは Linux の
+do_execveat_common と同じ (syscall.rs の `sys_execveat`、sysfile.rs の `exec_open`、exec.rs の `Target`):
+
+- 名前を写すところで、空の名前は AT_EMPTY_PATH のときだけ (ほかは ENOENT)、それから flags (AT_SYMLINK_NOFOLLOW、
+  AT_EMPTY_PATH、AT_EXECVE_CHECK のほかは EINVAL)、それから開く: dirfd からの名前 (EBADF、ENOTDIR)、空なら fd
+  そのもの (O_PATH も。ふつうのファイルでなければ EACCES)、AT_SYMLINK_NOFOLLOW なら終わりのシンボリックリンクは ELOOP。
+  引数と環境を写すのは開いたあと (読めなければ EFAULT)
+- fd からの名前 (dirfd が AT_FDCWD でなく、名前が / で始まらない) は /dev/fd/N か /dev/fd/N/NAME になる
+  (bprm->filename: AT_EXECFN と、#! のインタプリタにわたすスクリプトの名前)。dirfd が O_CLOEXEC なら、exec の
+  あとは開けないので #! のスクリプトは ENOENT。comm はその名前の終わりの部分で、名前が空ならファイルの名前
+  (Linux の comm_from_dentry)。execve でも AT_EXECFN ははじめの名前のまま (前は #! のインタプリタの名前だった)
+- AT_EXECVE_CHECK (Linux 6.14): Landlock、ふつうのファイルで x があるか、AppArmor の移りかたまでをたしかめて 0 (中は
+  見ないので、スクリプトも 0)
+- #! のインタプリタと PT_INTERP の ld.so は cwd から開き (Linux の open_exec)、audit の PATH に名前を足す。ld.so を開けない
+  ときの答えは、前の ENOENT だけでなく、開けなかったわけ (Linux と同じ)
+
+`test/execveat.c` (23 の場合: 名前と fd と flags、まちがいの答え、exec したあとの comm と AT_EXECFN と引数) は
+Linux 7.4-rc1 と同じ (46 行)。
+
 ### CPU の時計 (clock_gettime、clock_getres、timer_create)
 
 前の aios は clock_gettime の CPU の時計にも起動からの時間を返し (glibc の `clock()` もまちがう)、知らない時計も 0、
@@ -2696,7 +2720,7 @@ AppArmor のように Linux の本体の外 (Ubuntu のカーネル、apparmor-n
 | recvmmsg で、受けたあとのエラー | 次の呼び出しで返すが、そのあいだの ICMP などで上書きされる (recvmmsg(2) の BUGS) | とっておいて次の受けとりでかならず返す (上の表の recvmmsg-error) | (した) |
 | mmap でファイルの終わりの先 (同じページ) に書いたもの | ページキャッシュに残り、あとの写しに見える (書き出しまで。mmap(2) の BUGS) | 書き出すとき (msync、munmap、終わり、sync) に 0 にするので、munmap のあとの写しには見えない。ほかのプロセスが写しているあいだは見える | 新しく写すときにも終わりの先を 0 に (POSIX) |
 | timerfd の時計 | CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID は EINVAL (timer_create はできる。timerfd_create(2) の BUGS) | 使える (上の表の timerfd-cputime) | (した) |
-| execveat(fd, "", AT_EMPTY_PATH) の #! スクリプト | fd が close-on-exec なら ENOENT なので、fd がスクリプトにもれる (execveat(2) の BUGS) | まだ見ていない | |
+| execveat(fd, "", AT_EMPTY_PATH) の #! スクリプト | fd が close-on-exec なら ENOENT なので、fd がスクリプトにもれる (execveat(2) の BUGS) | Linux と同じ (test/execveat.c) | インタプリタが /dev/fd/N を開くので、もらさないと動かない。そのまま |
 | fcntl のロックと CLONE_FILES | ファイルの表を分けあうプロセスどうしで、ない行きどまりを EDEADLK にすることがある (fcntl_locking(2) の BUGS) | まだ見ていない | |
 | RLIMIT_CPU | SIGXCPU のハンドラがあると、やわらかい上限を 1 秒ずつ上げる (getrlimit(2) の BUGS) | まだ見ていない | |
 | AppArmor の AF_UNSPEC の connect | 7.3 は見ない。apparmor-next は connect の許しを見る (bind の AF_UNSPEC の長さも確かめる) | 7.3 と同じ | Linux の次の版に入ったら合わせる |

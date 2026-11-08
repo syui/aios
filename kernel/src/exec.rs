@@ -115,22 +115,75 @@ fn read_file(ino: &crate::vfs::InodeRef, off: usize, buf: &mut [u8]) -> Result<u
     if ino.page_cacheable() { crate::vm::read_cached(ino, off, buf) } else { ino.read_at(off, buf) }
 }
 
-pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
-    exec_depth(path, argv, envp, 0, None)
+/// exec するもの (Linux の linux_binprm の file と filename): 開いたプログラム (本当のパスと inode) と、見せる名前
+/// (bprm->filename。execveat の fd からなら /dev/fd/N か /dev/fd/N/NAME: #! のインタプリタにわたす名前、AT_EXECFN、comm)
+pub struct Target {
+    pub exe: String,
+    pub ino: crate::vfs::InodeRef,
+    pub filename: String,
+    /// O_CLOEXEC の fd からの名前: exec のあとは開けないので、#! のスクリプトは ENOENT (BINPRM_FLAGS_PATH_INACCESSIBLE)
+    pub inaccessible: bool,
+    /// 名前が空 (AT_EMPTY_PATH の fd): comm はファイルの名前から (Linux の comm_from_dentry。/dev/fd/N の N にしない)
+    pub comm_from_file: bool,
 }
 
-/// aa: はじめのプログラムで決めた AppArmor の答え (#! のインタプリタへもちこむ: Linux もスクリプトのパスで 1 度だけ)
-fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: Option<crate::apparmor::Exec>) -> Result<Image, i64> {
-    let cwd = crate::proc::current_cwd();
-    let (exe, ino) = crate::vfs::lookup(&cwd, path, true)?;
-    crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
+impl Target {
+    /// cwd からの名前 (execve)
+    pub fn path(path: &str) -> Result<Target, i64> {
+        let (exe, ino) = crate::vfs::lookup(&crate::proc::current_cwd(), path, true)?;
+        Ok(Target { exe, ino, filename: String::from(path), inaccessible: false, comm_from_file: false })
+    }
+
+    /// 新しいプログラムの comm (Linux の begin_new_exec: filename の終わりの部分か、ファイルの名前)
+    pub fn comm(&self) -> &str {
+        let n = if self.comm_from_file { &self.exe } else { &self.filename };
+        n.rsplit('/').next().unwrap_or(n)
+    }
+}
+
+pub fn exec(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
+    exec_target(Target::path(path)?, argv, envp)
+}
+
+pub fn exec_target(t: Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Image, i64> {
+    let execfn = t.filename.clone();
+    exec_depth(t, &execfn, argv, envp, 0, None)
+}
+
+/// exec する前のたしかめ (Linux の do_open_execat の may_open と、security_bprm_creds_for_exec まで): Landlock の EXECUTE、
+/// ふつうのファイルで x がある、AppArmor の移りかた。execveat の AT_EXECVE_CHECK はここまでで 0
+pub fn check(exe: &str, ino: &crate::vfs::InodeRef) -> Result<crate::apparmor::Exec, i64> {
+    crate::landlock::check_fs(exe, crate::landlock::EXECUTE)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
+    crate::apparmor::exec_transition(exe, m.uid)
+}
+
+/// インタプリタ (#! の 1 行めか PT_INTERP) を cwd から開く (Linux の open_exec)。audit の名前も (ないものは名前だけ)
+fn open_interp(cwd: &str, path: &str) -> Result<(String, crate::vfs::InodeRef), i64> {
+    let an = crate::audit::getname(path);
+    let (p, i) = crate::vfs::lookup(cwd, path, true)?;
+    crate::audit::inode(an, None, &i, false, &p);
+    Ok((p, i))
+}
+
+/// t.filename は bprm->interp (#! のスクリプトにわたす名前)、execfn は AT_EXECFN (はじめの名前のまま)。
+/// aa: はじめのプログラムで決めた AppArmor の答え (#! のインタプリタへもちこむ: Linux もスクリプトのパスで 1 度だけ)
+fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: Option<crate::apparmor::Exec>) -> Result<Image, i64> {
+    let cwd = crate::proc::current_cwd();
+    let (exe, ino) = (t.exe, t.ino);
+    let m = ino.meta();
     let mut aa = match aa {
-        Some(a) => a,
-        None => crate::apparmor::exec_transition(&exe, m.uid)?,
+        Some(a) => {
+            crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
+            if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
+                return Err(-EACCES);
+            }
+            a
+        }
+        None => check(&exe, &ino)?,
     };
     // #! で始まるスクリプトは、書かれたインタプリタにスクリプトのパスを渡して動かす
     let mut head = [0u8; 256];
@@ -141,12 +194,18 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
             return Err(-ELOOP);
         }
         let (interp, arg) = parse_shebang(&head[2..n]).ok_or(-ENOEXEC)?;
+        // O_CLOEXEC の fd からの名前は、インタプリタが開けない (Linux の load_script)
+        if t.inaccessible {
+            return Err(-ENOENT);
+        }
         let interp_s = core::str::from_utf8(&interp).map_err(|_| -ENOEXEC)?;
         let mut nargv = alloc::vec![interp.clone()];
         nargv.extend(arg);
-        nargv.push(path.as_bytes().to_vec());
+        nargv.push(t.filename.as_bytes().to_vec());
         nargv.extend(argv.iter().skip(1).cloned());
-        return exec_depth(interp_s, &nargv, envp, depth + 1, Some(aa));
+        let (ie, ii) = open_interp(&cwd, interp_s)?;
+        let next = Target { exe: ie, ino: ii, filename: String::from(interp_s), inaccessible: false, comm_from_file: false };
+        return exec_depth(next, execfn, &nargv, envp, depth + 1, Some(aa));
     }
     // AppArmor: 新しいプロファイルでこのプログラムを写せるか (だめなら exec のあと SIGSEGV: Linux と同じ)
     aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &exe, m.uid);
@@ -160,7 +219,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     // 動的リンク: インタプリタ (ld.so) も読み、そちらから始める
     let (entry, interp_base) = match &main.interp {
         Some(ip) => {
-            let (ipath, iino) = crate::vfs::lookup(&cwd, ip, true).map_err(|_| -ENOENT)?;
+            let (ipath, iino) = open_interp(&cwd, ip)?;
             crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
             aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &ipath, iino.meta().uid);
             let im = iino.meta();
@@ -177,7 +236,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     let (phdr_va, phentsize, phnum) = (main.phdr_va, main.phentsize, main.phnum);
 
     // 引数と環境の文字列、ポインタの並び (argc, argv, envp, auxv) の分を足す
-    let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1 + 16;
+    let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1 + 16;
     let ptrs_size = (argv.len() + envp.len() + 3 + 2 * 32) * 8;
     if strs > ARG_MAX {
         return Err(-E2BIG);
@@ -194,7 +253,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     // 低いほうから続けて置く (setproctitle などは argv と envp の文字列が続いて並ぶものとして、その終わりを数える)。
     // その下に AT_RANDOM の 16 バイト、さらに下に (argc, argv, envp, auxv) の並び。
     // 全部をカーネルの中で組んでから、1 回で写す (8 バイトずつ写すと、そのたびにページ表を引くので)
-    let total: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + path.len() + 1;
+    let total: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1;
     if total + 8 > ARG_MAX {
         return Err(-E2BIG);
     }
@@ -213,7 +272,7 @@ fn exec_depth(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: 
     let mut img = crate::heap::try_vec(USER_STACK_TOP - sp, true)?;
     let mut at = base;
     let mut ptrs = Vec::with_capacity(argc + envc + 1);
-    for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&path.as_bytes().to_vec())) {
+    for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&execfn.as_bytes().to_vec())) {
         ptrs.push(at);
         img[at - sp..at - sp + s.len()].copy_from_slice(s);
         at += s.len() + 1;

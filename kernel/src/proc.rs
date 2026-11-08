@@ -342,7 +342,7 @@ pub struct Proc {
     set_child_tid: usize,
     /// CLONE_VFORK で作られた子: exec か終わりまで待っている親の pid (なければ 0)
     pub vfork_parent: u32,
-    /// 代表でないスレッドが execve した (代表スレッドに置く): 読みこんだプログラムとパス。
+    /// 代表でないスレッドが execve した (代表スレッドに置く): 読みこんだプログラムと新しい comm。
     /// 代表スレッドが check_killed でそれになって続ける (Linux と同じく PID はそのまま、親から見て終わらない)
     exec_takeover: Option<(Image, String)>,
     /// fork の前半: 大きなロックの外 (syscall::fast) で PTE を写しておいた表。その例外の中で clone が使うか、
@@ -1828,9 +1828,9 @@ pub fn check_killed() {
 fn killed_now() {
     let p = current();
     // 他のスレッドが execve した: このスレッド (代表) がそのプログラムになって続ける (SIGKILL が来ていなければ)
-    if let Some((img, path)) = p.exec_takeover.take().filter(|_| p.group_exit.is_none()) {
+    if let Some((img, comm)) = p.exec_takeover.take().filter(|_| p.group_exit.is_none()) {
         p.killed = false;
-        finish_exec(p, img, &path);
+        finish_exec(p, img, &comm);
         p.no_restart = true;
         return;
     }
@@ -2002,14 +2002,20 @@ fn vfork_done(p: &mut Proc) {
 }
 
 pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
-    let img = exec::exec(path, argv, envp)?;
+    execve_target(exec::Target::path(path)?, argv, envp)
+}
+
+/// execve と execveat: 開いたプログラム (t) に入れかわる。comm は t.comm()
+pub fn execve_target(t: exec::Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64> {
+    let comm = String::from(t.comm());
+    let img = exec::exec_target(t, argv, envp)?;
     let p = current();
     // 代表でないスレッドが execve した (zig cc -MM は働き手のスレッドから clang に execve する):
     // Linux では他のスレッドが消えて、このスレッドが代表の PID で新しいプログラムになる。ここでは読みこんだものを
     // 代表スレッドにわたして、代表スレッドがそれになる (親から見て、プロセスは終わらずに execve したように見える)
     if p.thread {
         if let Some(l) = find(p.tgid).filter(|l| l.state != State::Zombie && !l.killed) {
-            l.exec_takeover = Some((img, String::from(path)));
+            l.exec_takeover = Some((img, comm));
             for t in p.siblings() {
                 kill_proc(t);
             }
@@ -2019,12 +2025,12 @@ pub fn execve(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), i64>
             return Ok(());
         }
     }
-    finish_exec(p, img, path);
+    finish_exec(p, img, &comm);
     Ok(())
 }
 
-/// execve の続き: 読みこんだプログラムに p を入れかえる (他のスレッドは消える)
-fn finish_exec(p: &mut Proc, img: Image, path: &str) {
+/// execve の続き: 読みこんだプログラムに p を入れかえる (他のスレッドは消える)。comm は新しい名前
+fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     // dumpable (Linux の begin_new_exec): ふつうは 1 にもどる。読めないプログラムか、exec の前の euid と uid (egid と gid)
     // がちがえば fs.suid_dumpable。setuid / setgid で euid / egid が変わっても (下の commit_creds)
     let suid_dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
@@ -2046,7 +2052,7 @@ fn finish_exec(p: &mut Proc, img: Image, path: &str) {
     p.cred.fsgid = p.cred.egid;
     p.cred.cap_perm = p.cred.uid == 0 || p.cred.euid == 0;
     p.cred.fs_caps = p.cred.euid == 0;
-    p.set_comm(path.rsplit('/').next().unwrap_or(path).as_bytes());
+    p.set_comm(comm.as_bytes());
     crate::audit::exec_done(p);
     // 他のスレッドは消える
     for t in p.siblings() {
