@@ -300,6 +300,7 @@ static const struct {
     {"apparmor-inet", "AppArmor の network_v9 の af_inet を名のり、ip= と port= の決まりを効かせる (Ubuntu のカーネルの読みかたで、特権の port、deny の決まり、自分の番地の条件のない peer の決まりのまちがいはなおして)。Linux 7.3 は af_inet を名のらないので、apparmor_parser が番地を落として (inet, type) の決まりに広げる。ロボットは AppArmor を見ない (test/apparmor.c がたしかめる)"},
     {"audit-field-value", "audit のルールの値の決まり (LOGINUID_SET は 0 か 1、PERM は 15 まで、FILETYPE は S_IFMT のビットだけ、FIELD_COMPARE は AUDIT_MAX_FIELD_COMPARE まで、SADDR_FAM は AF_MAX より下) を見て EINVAL。Linux の audit_field_valid は値を入れる前の 0 (f->val) を見るので、みな通る (FIELD_COMPARE の大きな番号は合わせるたびに WARN)。ロボットは audit を見ない (test/auditrules.c がたしかめる)"},
     {"timerfd-cputime", "timerfd_create は CPU の時計 (CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID: 作ったプロセスかスレッドのもの) もとれて、その CPU 時間が期限をこえたら読める (tick ごとに見る)。Linux は EINVAL (timerfd_create(2) の BUGS: timer_create はできるのに)。ロボットは timerfd を使わない (test/chosen.c がたしかめる)"},
+    {"recvmmsg-error", "recvmmsg が 1 つ目より後でしくじったときのエラーを、ソケットのエラーとは別にとっておき、次の受けとり (recv、recvmsg、recvmmsg、read) か SO_ERROR でかならず返す (それまで POLLERR)。Linux は sk_err に書くので、次の send (送らずにそのエラー) や ICMP のエラーや SO_ERROR が持っていき、受けとる側に返らないことがある (recvmmsg(2) の BUGS)。ロボットは recvmmsg を使わない (test/chosen.c がたしかめる)"},
 };
 
 // 手本の Linux のまちがい (直るまで、Linux の側でただして答えにする。見つけた版と、どう直るべきかも)

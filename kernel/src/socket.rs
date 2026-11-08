@@ -1083,7 +1083,19 @@ pub fn sendto(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, alen: us
     }
 }
 
+/// recvmmsg がとっておいたエラー (file の recv_err) があれば、それを返して消す (fd がおかしければ、ふつうの道が答える)
+fn take_recv_err(fd: u64) -> Result<(), i64> {
+    if let Ok(f) = fd_file(fd) {
+        let mut b = f.borrow_mut();
+        if b.recv_err != 0 {
+            return Err(core::mem::take(&mut b.recv_err));
+        }
+    }
+    Ok(())
+}
+
 pub fn recvfrom(fd: u64, buf: usize, len: usize, flags: u64, addr: usize, lenp: usize) -> R {
+    take_recv_err(fd)?;
     let iov = [(buf, len.min(MAX_RW))];
     if let Some((f, n)) = crate::netlink::of_fd(fd) {
         let (k, _, from) = nl_recv(&f, &n, &iov, flags)?;
@@ -1165,6 +1177,26 @@ pub fn getpeername(fd: u64, addr: usize, lenp: usize) -> R {
 pub fn getsockopt(fd: u64, level: u64, opt: u64, val: usize, lenp: usize) -> R {
     const SOL_SOCKET: u64 = 1;
     const SO_TYPE: u64 = 3;
+    const SO_ERROR: u64 = 4;
+    // SO_ERROR: recvmmsg がとっておいたエラーが先 (読むと消える)
+    if level == SOL_SOCKET && opt == SO_ERROR
+        && let Ok(f) = fd_file(fd)
+        && f.borrow().recv_err != 0
+    {
+        let pt = proc::current().pt();
+        let mut l = [0u8; 4];
+        pt.copy_in(&mut l, lenp).ok_or(-EFAULT)?;
+        let len = i32::from_le_bytes(l);
+        if len < 0 {
+            return Err(crate::why::inval());
+        }
+        let e = core::mem::take(&mut f.borrow_mut().recv_err);
+        let v = ((-e) as i32).to_le_bytes();
+        let k = (len as usize).min(4);
+        pt.copy_out(val, &v[..k]).ok_or(-EFAULT)?;
+        pt.copy_out(lenp, &(k as u32).to_le_bytes()).ok_or(-EFAULT)?;
+        return Ok(0);
+    }
     if let Some((_, n)) = crate::netlink::of_fd(fd) {
         let v = crate::netlink::getsockopt(&n, level, opt)?;
         let pt = proc::current().pt();
@@ -1372,7 +1404,16 @@ pub fn mmsg(fd: u64, vec: usize, vlen: usize, flags: u64, send: bool, timeout: u
                 done += 1;
             }
             Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
+            // aios がえらんだちがい (recvmmsg-error): 受けたあとのエラーはソケットのエラーとは別にとっておき、次の受けとりで
+            // かならず返す (Linux は sk_err に書くので、次の send や ICMP のエラーが持っていく)。EAGAIN はとっておかない
+            Err(e) => {
+                if !send && e != -EAGAIN
+                    && let Ok(f) = fd_file(fd)
+                {
+                    f.borrow_mut().recv_err = e;
+                }
+                break;
+            }
         }
         if deadline.is_some_and(|d| crate::timer::ticks() >= d) {
             break;
@@ -1424,6 +1465,7 @@ fn put_cmsgs(list: &[(i32, i32, Vec<u8>)], space: Option<usize>) -> (Vec<(usize,
 }
 
 pub fn recvmsg(fd: u64, msg: usize, flags: u64) -> R {
+    take_recv_err(fd)?;
     if let Some((f, n)) = crate::netlink::of_fd(fd) {
         let m = read_msghdr(msg)?;
         let (k, mflags, from) = nl_recv(&f, &n, &m.iov, flags)?;

@@ -151,6 +151,10 @@ pub struct OpenFile {
     /// landlock: 開いたときに許されなかった TRUNCATE と IOCTL_DEV (デバイスだけ)。あとの ftruncate と ioctl はこれで
     /// 決める (Linux の landlock_file の allowed_access。渡された fd でも、層のないプロセスでも同じ)
     pub ll_deny: u32,
+    /// ソケット: recvmmsg が 1 つ目より後でしくじったときのエラー (負の errno、0 はなし)。次の受けとり (recv、recvmsg、
+    /// recvmmsg、read) か SO_ERROR で返して消す。aios がえらんだちがい (recvmmsg-error): Linux はソケットの sk_err に書く
+    /// ので、次の send や ICMP のエラーや SO_ERROR が持っていき、受けとる側に返らないことがある (recvmmsg(2) の BUGS)
+    pub recv_err: i64,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
@@ -175,7 +179,7 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
     }
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0 }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0, recv_err: 0 }))
 }
 
 /// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
@@ -506,9 +510,13 @@ pub fn write(f: &FileRef, src: &[u8]) -> Result<usize, i64> {
 /// dontwait なら O_NONBLOCK がなくても待たない (recv/send の MSG_DONTWAIT)
 pub fn read_opt(f: &FileRef, dst: &mut [u8], dontwait: bool) -> Result<usize, i64> {
     let stream = {
-        let b = f.borrow();
+        let mut b = f.borrow_mut();
         if !b.readable() {
             return Err(-EBADF);
+        }
+        // recvmmsg がとっておいたエラー (recv_err)
+        if b.recv_err != 0 {
+            return Err(core::mem::take(&mut b.recv_err));
         }
         b.stream()
     };
@@ -1027,6 +1035,11 @@ impl OpenFile {
         })
     }
 
+    /// recvmmsg がとっておいたエラーがあれば POLLERR (Linux の sock_poll の sk_err)
+    fn recv_err_mask(&self) -> u32 {
+        if self.recv_err != 0 { crate::unix::POLLERR } else { 0 }
+    }
+
     /// poll 用: (読める, 書ける, 閉じた/エラー)
     pub fn readiness(&self) -> (bool, bool, bool) {
         match &self.kind {
@@ -1048,12 +1061,12 @@ impl OpenFile {
             Kind::Netlink(n) => crate::netlink::readiness(n),
             Kind::Unix(u) => {
                 use crate::unix::*;
-                let m = poll_mask(u);
+                let m = poll_mask(u) | self.recv_err_mask();
                 (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
             }
             Kind::Inet(u) => {
                 use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT};
-                let m = crate::inet::poll_mask(u);
+                let m = crate::inet::poll_mask(u) | self.recv_err_mask();
                 (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
             }
             Kind::EventFd(e) => crate::epoll::readiness(e),
@@ -1078,8 +1091,8 @@ impl OpenFile {
     pub fn poll_mask(&self) -> Option<u32> {
         use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
         Some(match &self.kind {
-            Kind::Unix(u) => crate::unix::poll_mask(u),
-            Kind::Inet(u) => crate::inet::poll_mask(u),
+            Kind::Unix(u) => crate::unix::poll_mask(u) | self.recv_err_mask(),
+            Kind::Inet(u) => crate::inet::poll_mask(u) | self.recv_err_mask(),
             // Linux の pipe_poll: 読む口は中身があれば IN、書く口がなければ HUP。書く口は箱があれば OUT、読む口が
             // なければ ERR
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {

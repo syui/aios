@@ -5,6 +5,7 @@
 //   ./chosen DIR...   DIR ごとに (ext4 のホームと tmpfs の /tmp)
 // 1 行に ok NAME、SAME NAME (Linux だけ)、FAIL NAME。おしまいに chosen failed: N
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -496,6 +497,50 @@ static void zero_range(int tmpfs) {
     rm(".ch-zr");
 }
 
+static void recvmmsg_error(void) {
+    // UDP の loopback で 2 つ受けるつもりで、2 つめの入れ物を読めないところにした recvmmsg: 1 つ受けて 1 を返し、2 つめは
+    // EFAULT。aios は recvmmsg のエラーをソケットのエラーとは別にとっておき、次の受けとりで返す: そのあいだの send は
+    // ふつうに送れて、次の recv が EFAULT。Linux は EFAULT を sk_err に書くので、次の send が持っていき (送らずに EFAULT)、
+    // 受けとる側には返らない (ICMP のエラーや SO_ERROR でも上書き・消える。recvmmsg(2) の BUGS)
+    int s = socket(AF_INET, SOCK_DGRAM, 0), t = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)}, b = a;
+    socklen_t al = sizeof a;
+    bind(s, (struct sockaddr *)&a, sizeof a);
+    getsockname(s, (struct sockaddr *)&a, &al);
+    bind(t, (struct sockaddr *)&b, sizeof b);
+    al = sizeof b;
+    getsockname(t, (struct sockaddr *)&b, &al);
+    sendto(t, "one", 3, 0, (struct sockaddr *)&a, sizeof a);
+    sendto(t, "two", 3, 0, (struct sockaddr *)&a, sizeof a);
+    struct timespec sl = {0, 50000000};
+    nanosleep(&sl, NULL);
+    char b0[16];
+    struct iovec iv[2] = {{b0, sizeof b0}, {(void *)8, 16}};
+    struct mmsghdr mv[2];
+    memset(mv, 0, sizeof mv);
+    mv[0].msg_hdr.msg_iov = &iv[0];
+    mv[0].msg_hdr.msg_iovlen = 1;
+    mv[1].msg_hdr.msg_iov = &iv[1];
+    mv[1].msg_hdr.msg_iovlen = 1;
+    int n = recvmmsg(s, mv, 2, MSG_DONTWAIT, NULL);
+    long sr = sendto(s, "x", 1, 0, (struct sockaddr *)&b, sizeof b);
+    int es = errno;
+    char rb[16];
+    long r[2];
+    int e[2];
+    for (int k = 0; k < 2; k++) {
+        r[k] = recv(s, rb, sizeof rb, MSG_DONTWAIT);
+        e[k] = errno;
+    }
+    close(s);
+    close(t);
+    char got[240];
+    snprintf(got, sizeof got, "recvmmsg = %d, then send = %ld %s, recv = %ld %s, %ld %s", n, sr, sr < 0 ? strerror(es) : "", r[0],
+             r[0] < 0 ? strerror(e[0]) : "", r[1], r[1] < 0 ? strerror(e[1]) : "");
+    check("recvmmsg-error", n == 1 && sr == 1 && r[0] < 0 && e[0] == EFAULT && r[1] < 0 && e[1] == EAGAIN,
+          n == 1 && sr < 0 && es == EFAULT && r[0] < 0 && e[0] == EAGAIN, got);
+}
+
 static long long mono_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -565,6 +610,7 @@ int main(int argc, char **argv) {
             recvmmsg_timeout();
             send_notconn();
             timerfd_cputime();
+            recvmmsg_error();
         }
     }
     if (!on_aios)
