@@ -131,6 +131,8 @@ pub fn lock() -> u64 {
     };
     c.since.store(now, Ordering::Relaxed);
     c.weight.store(w, Ordering::Relaxed);
+    crate::heap::quar_check("lock");
+    crate::vm::DROPPED_UNMAPPED[me - 1].store(0, Ordering::Relaxed);
     now
 }
 
@@ -182,6 +184,7 @@ pub fn timed_now() -> u64 {
 
 /// unlock と同じ。now は読んだばかりの時刻 (trap.rs: 時計をもう一度読まない)
 pub fn unlock_at(now: u64) {
+    crate::heap::quar_check("unlock");
     let mut now = Some(now);
     loop {
         let woke = drain_wakes();

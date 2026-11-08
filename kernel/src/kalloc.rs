@@ -313,11 +313,82 @@ pub fn take_contiguous(bytes: usize) -> Option<*mut u8> {
     k.drain(nhot);
     let got = k.take_run(n).map(page_of);
     NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+    drop(k);
+    if let Some(p) = got.filter(|_| POISON.load(Ordering::Relaxed)) {
+        for i in 0..n {
+            poison_check(unsafe { p.add(i * PGSIZE) }, "contiguous");
+        }
+    }
     got
+}
+
+/// page poison (調べもの用。/proc/ai/ctl に page poison on): 返したページを 0xa5 で埋め、頭に返した人の呼び出しとしるしを
+/// 書く。出すときにしるしのあるページが変わっていれば (返したあとに書いた人) 知らせ、put で数が 0 のページをさらに放そうと
+/// すれば、返さずに知らせる (最近返した 4096 のページの、返した人も)
+pub static POISON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const POISON_PAGE: u8 = 0xa5;
+const POISON_MAGIC: u64 = 0x504f_4953_4f4e_4544;
+static POISON_REPORTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 調べもの用: 最近返したページと、返した人 (put で数が 0 のページを見つけたときに、先に返した人を出す)
+const RING: usize = 4096;
+struct FreeRing {
+    at: usize,
+    ents: [(usize, [usize; 6]); RING],
+}
+static FREE_RING: crate::spinlock::SpinLock<FreeRing> = crate::spinlock::SpinLock::new(FreeRing { at: 0, ents: [(0, [0; 6]); RING] });
+
+fn ring_note(page: *mut u8) {
+    let bt = crate::heap::backtrace();
+    let mut r = FREE_RING.lock();
+    let i = r.at % RING;
+    r.ents[i] = (page as usize, bt);
+    r.at += 1;
+}
+
+fn ring_find(page: *mut u8) -> Option<[usize; 6]> {
+    let r = FREE_RING.lock();
+    let n = r.at.min(RING);
+    (1..=n).map(|k| r.ents[(r.at - k) % RING]).find(|e| e.0 == page as usize).map(|e| e.1)
+}
+
+/// 返したページを埋めて、頭の 48 バイトに返した人の呼び出し、つぎの 8 バイトにしるしを書く
+fn poison_page(page: *mut u8) {
+    unsafe { core::ptr::write_bytes(page, POISON_PAGE, PGSIZE) };
+    let bt = crate::heap::backtrace();
+    for (k, a) in bt.iter().enumerate() {
+        unsafe { *(page.add(8 * k) as *mut usize) = *a };
+    }
+    unsafe { *(page.add(48) as *mut u64) = POISON_MAGIC };
+}
+
+/// 出すページが、返したときのしるしのままか (返したあとに書いた人がいないか)
+fn poison_check(page: *mut u8, how: &str) {
+    let d = unsafe { core::slice::from_raw_parts(page, PGSIZE) };
+    if u64::from_le_bytes(d[48..56].try_into().unwrap()) != POISON_MAGIC {
+        // しるしのないもの (poison の前に返したもの、take_contiguous の続きの頭など) は見ない
+        return;
+    }
+    if let Some(i) = (56..PGSIZE).find(|&i| d[i] != POISON_PAGE) {
+        if POISON_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+            let w = i & !7;
+            let word = u64::from_le_bytes(d[w..w + 8].try_into().unwrap());
+            let mut freed = [0usize; 6];
+            for (k, f) in freed.iter_mut().enumerate() {
+                *f = usize::from_le_bytes(d[8 * k..8 * k + 8].try_into().unwrap());
+            }
+            let n = (56..PGSIZE).filter(|&j| d[j] != POISON_PAGE).count();
+            crate::println!("kalloc: write after free ({}): page {:#x} at +{} word {:#x} ({} bytes changed); freed by {:x?}; now by {:x?}", how, page as usize, i, word, n, freed, crate::heap::backtrace());
+        }
+    }
 }
 
 /// 仮想アドレス (KBASE 側) のページを返す
 pub fn free(page: *mut u8) {
+    if POISON.load(Ordering::Relaxed) {
+        poison_page(page);
+        ring_note(page);
+    }
     ref_slot(page).store(0, Ordering::Relaxed);
     let i = idx_of(page);
     let mut k = KMEM.lock();
@@ -373,6 +444,9 @@ pub fn alloc_dirty() -> Option<*mut u8> {
     NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
     drop(k);
     let page = page_of(i);
+    if POISON.load(Ordering::Relaxed) {
+        poison_check(page, "alloc");
+    }
     ref_slot(page).store(1, Ordering::Relaxed);
     Some(page)
 }
@@ -385,7 +459,16 @@ pub fn get(page: *mut u8) {
 /// 共有をやめる。誰も使わなくなったら返す
 pub fn put(page: *mut u8) {
     // 最後の 1 人なら返す (fetch_sub の前の値が 1 以下)
-    if ref_slot(page).fetch_sub(1, Ordering::AcqRel) <= 1 {
+    let prev = ref_slot(page).fetch_sub(1, Ordering::AcqRel);
+    if prev == 0 && POISON.load(Ordering::Relaxed) {
+        // 調べもの用: 数が 0 のページ (返したもの、ヒープのもの) をさらに放そうとした。返さずに知らせる
+        ref_slot(page).fetch_add(1, Ordering::AcqRel);
+        if POISON_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::println!("kalloc: put of a page with no references: {:#x} by {:x?}; freed before by {:x?}", page as usize, crate::heap::backtrace(), ring_find(page));
+        }
+        return;
+    }
+    if prev <= 1 {
         free(page);
     }
 }

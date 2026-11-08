@@ -1078,8 +1078,15 @@ pub fn drop_unmapped() {
         (core::mem::take(&mut u.vmas), core::mem::take(&mut u.ranges))
     };
     release_shared_ranges(&ranges);
+    if crate::heap::POISON.load(Ordering::Relaxed) {
+        let files = vmas.iter().filter(|v| matches!(v.back, Backing::File { .. })).count();
+        DROPPED_UNMAPPED[crate::smp::id()].fetch_add(files, Ordering::Relaxed);
+    }
     drop(vmas);
 }
+
+/// 調べもの用: この CPU が大きなロックを持つあいだに drop_unmapped が捨てたファイルの領域の数 (heap::quar_check が見る)
+pub static DROPPED_UNMAPPED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// 外したページを少しずつまとめて返す (Linux の mmu_gather)。PTE を 0 にしたページを GATHER 枚ためたら、TLB を消して、
 /// ほかの CPU が使い終わるのを待ってから返す。ヒープを使わない (外すページの数だけの Vec は、何 GiB もの領域では

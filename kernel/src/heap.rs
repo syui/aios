@@ -32,13 +32,138 @@ struct Site {
 static SITE: SpinLock<[Site; SITES]> = SpinLock::new([Site { at: [0; DEPTH], bytes: 0, count: 0 }; SITES]);
 pub static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// heap poison (調べもの用。/proc/ai/ctl に heap poison on): 返したブロックの中身を POISON_BYTE で埋める。返したものを
+/// あとで読むと 0x6b6b… の番地で落ちるので、古いものを持っているのはだれかがわかる (Linux の slub_debug=P)
+pub static POISON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 埋めたブロックの終わりの 8 バイト (poison_check は、これのあるものだけ見る: poison を途中で on にしても、その前に
+/// 返したものをまちがえない)
+const POISON_MAGIC: u64 = 0x6b6b_4652_4545_446b;
+static UAF_REPORTS: AtomicUsize = AtomicUsize::new(0);
+
+/// 調べもの用のとりおき (/proc/ai/ctl に heap quarantine SIZE。0 で切る): poison のあいだ、中身が SIZE バイトのブロックは
+/// 返さずに埋めてとりおき (QUAR_N こまで。あふれたら古いものから返す)、大きなロックを取ったとき・放すときに頭の 16 バイト
+/// (Rc なら strong と weak の数) が変わっていないかを見る。返したあとに書いた人を、そのロックを持っていたものとして
+/// つかまえる (放すときに見つかれば、そのロックを持っていたシステムコール。取るときなら、ロックの外で書かれた)
+static QUAR_SIZE: AtomicUsize = AtomicUsize::new(0);
+const QUAR_N: usize = 2048;
+
+pub fn quarantine(size: usize) {
+    QUAR_SIZE.store(round(size), Relaxed);
+}
+struct Quar {
+    at: usize,
+    blocks: [usize; QUAR_N],
+    freed: [[usize; DEPTH]; QUAR_N],
+}
+static QUAR: crate::spinlock::SpinLock<Quar> = crate::spinlock::SpinLock::new(Quar { at: 0, blocks: [0; QUAR_N], freed: [[0; DEPTH]; QUAR_N] });
+
+/// とりおきに入れる。いっぱいなら古いものを返す (TLSF へ)
+fn quar_put(p: *mut u8, layout: Layout) -> bool {
+    let qs = QUAR_SIZE.load(Relaxed);
+    if qs == 0 || round(layout.size()) != qs || !POISON.load(Relaxed) {
+        return false;
+    }
+    let bt = callers_from(0);
+    let old = {
+        let mut q = QUAR.lock();
+        let i = q.at % QUAR_N;
+        let old = q.blocks[i];
+        q.blocks[i] = p as usize;
+        q.freed[i] = bt;
+        q.at += 1;
+        old
+    };
+    if old != 0 {
+        unsafe {
+            let b = (old as *mut u8).sub(HDR);
+            let mut h = HEAP.lock();
+            let size = tlsf::block_size(b);
+            USED.store(USED.load(Relaxed) - size, Relaxed);
+            h.free(b);
+        }
+    }
+    true
+}
+
+/// とりおきの頭 16 バイトを見る。tag はいま見ているところ (lock / unlock)
+#[inline]
+pub fn quar_check(tag: &str) {
+    if QUAR_SIZE.load(Relaxed) != 0 {
+        quar_scan(tag);
+    }
+}
+
+#[cold]
+fn quar_scan(tag: &str) {
+    let q = QUAR.lock();
+    for i in 0..QUAR_N {
+        let p = q.blocks[i];
+        if p == 0 {
+            continue;
+        }
+        let (a, b) = unsafe { (*(p as *const u64), *((p + 8) as *const u64)) };
+        if a != 0x6b6b_6b6b_6b6b_6b6b || b != 0x6b6b_6b6b_6b6b_6b6b {
+            if UAF_REPORTS.fetch_add(1, Relaxed) < 8 {
+                let me = crate::proc::cur_index().map(|_| crate::proc::current());
+                let (pid, sys) = me.as_ref().map_or((0, (0, 0, 0)), |p| (p.pid, p.last_sys));
+                let comm = me.as_ref().map(|p| p.comm).unwrap_or([0; 16]);
+                // openat なら、そのパス (いまのプロセスのメモリから)
+                let path = if sys.0 == 56 && me.is_some() { crate::syscall::user_str(sys.2 as usize, 120) } else { alloc::string::String::new() };
+                let du = crate::vm::DROPPED_UNMAPPED[crate::smp::id()].load(Relaxed);
+                crate::println!("heap: quarantine hit at {} on cpu {}: block {:#x} words {:#x} {:#x}; pid {} ({}) last syscall {:?} path {:?}; unmapped file vmas dropped in this hold {}; freed by {:x?}", tag, crate::smp::id(), p, a, b, pid, core::str::from_utf8(&comm).unwrap_or("?").trim_end_matches('\0'), sys, path, du, q.freed[i]);
+            }
+            unsafe {
+                *(p as *mut u64) = 0x6b6b_6b6b_6b6b_6b6b;
+                *((p + 8) as *mut u64) = 0x6b6b_6b6b_6b6b_6b6b;
+            }
+        }
+    }
+}
+
+/// 置き場から取りなおすブロック (中身の頭 p、中身の大きさ size) が、返したときのしるしのままか。ちがえば、どこがどう
+/// 変わったかと、返した人 (+16 に書いた呼び出し) を出す (返したあとに書いた人: 古い Rc の数など)
+fn poison_check(p: *mut u8, size: usize) {
+    // 埋めたときの終わりのしるしのあるものだけ (呼び出しを書いたので、64 + 8 バイトから)
+    if size < 72 || unsafe { *(p.add(size - 8) as *const u64) } != POISON_MAGIC {
+        return;
+    }
+    let d = unsafe { core::slice::from_raw_parts(p, size - 8) };
+    let bt_end = 16 + 8 * DEPTH;
+    for (i, &b) in d.iter().enumerate() {
+        if (16..bt_end).contains(&i) || b == POISON_BYTE {
+            continue;
+        }
+        if UAF_REPORTS.fetch_add(1, Relaxed) < 8 {
+            let w = i & !7;
+            let word = if w + 8 <= size { u64::from_le_bytes(d[w..w + 8].try_into().unwrap()) } else { 0 };
+            let mut freed = [0usize; DEPTH];
+            for (k, f) in freed.iter_mut().enumerate() {
+                *f = usize::from_le_bytes(d[16 + 8 * k..24 + 8 * k].try_into().unwrap());
+            }
+            crate::println!("heap: write after free: block {:#x} size {} at +{} word {:#x}; freed by {:x?}; now by {:x?}", p as usize, size, i, word, freed, callers());
+        }
+        return;
+    }
+}
+pub const POISON_BYTE: u8 = 0x6b;
+
+/// 呼び出し 6 段 (調べもの用: kalloc の page poison が、返した人を覚える)
+pub fn backtrace() -> [usize; DEPTH] {
+    callers()
+}
+
 /// 呼び出し (alloc 自身の 2 段は飛ばす)
 fn callers() -> [usize; DEPTH] {
+    callers_from(2)
+}
+
+#[inline(never)]
+fn callers_from(skip0: usize) -> [usize; DEPTH] {
     let mut at = [0; DEPTH];
     let mut fp: usize;
     unsafe { core::arch::asm!("mov {}, x29", out(reg) fp) };
     let mut i = 0;
-    let mut skip = 2;
+    let mut skip = skip0;
     while i < DEPTH && fp != 0 && fp % 16 == 0 && fp >= crate::memlayout::KBASE {
         let (next, lr) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
         if lr == 0 {
@@ -295,7 +420,11 @@ fn pcpu_take(need: usize) -> Option<*mut u8> {
     }
     pc.n[c] = (n - 1) as u8;
     bytes.store(bytes.load(Relaxed) - need, Relaxed);
-    Some(unsafe { pc.blocks[c][n - 1].add(HDR) })
+    let p = unsafe { pc.blocks[c][n - 1].add(HDR) };
+    if POISON.load(Relaxed) {
+        poison_check(p, need - HDR);
+    }
+    Some(p)
 }
 
 /// 返された need バイトのブロック (ヘッダの頭) を置き場に。いっぱいなら false (TLSF に返す)
@@ -565,6 +694,22 @@ unsafe impl GlobalAlloc for Kernel {
 
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         unsafe {
+            if POISON.load(Relaxed) {
+                // 置き場の大きさ (round) まで埋め、+16 に返した人の呼び出しを書く (poison_check が見る)
+                let n = round(layout.size().max(1));
+                core::ptr::write_bytes(p, POISON_BYTE, n);
+                if quar_put(p, layout) {
+                    return;
+                }
+                if n >= 72 {
+                    // 返した人は近いところから (落とした関数がわかるように)。終わりにしるし
+                    let at = callers_from(0);
+                    for (k, a) in at.iter().enumerate() {
+                        *(p.add(16 + 8 * k) as *mut usize) = *a;
+                    }
+                    *(p.add(n - 8) as *mut u64) = POISON_MAGIC;
+                }
+            }
             let b = p.sub(HDR);
             // 小さいものは CPU ごとの置き場へ (予備のもの、取ったところの番号のあるもの (heap trace) はロックの道で)
             if !TRACE.load(Relaxed) && !in_reserve(b) && *(b as *const usize).add(1) == 0 && pcpu_put(b, round(layout.size().max(1)) + HDR) {

@@ -1657,6 +1657,25 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
 大きさごとのかたまりの数は `/proc/buddyinfo` (Linux と同じ形) と `/proc/ai/mem` の `ram.blocks` (aish の `mem` は、いちばん
 大きな続いた空きとその数)。
 
+### メモリこわれを調べる道具 (heap / page poison、とりおき)
+
+ときどきカーネルのヒープがこわれる (todo.json の mem-corrupt-stress) のを調べるために足した道具。ふだんは切ってあり、
+/proc/ai/ctl に書くと入る (root で。切っているあいだは、返す・出すたびに atomic を 1 つ読むだけ):
+
+- `heap poison on|off`: 返したブロックを 0x6b で埋め (返したものを読むと 0x6b6b… の番地で落ちる)、72 バイトからの
+  ものには +16 に返した人の呼び出し 6 段と、終わりにしるしを書く。CPU ごとの置き場から出すときに、しるしのあるものが
+  変わっていれば `heap: write after free: block … at +N word …; freed by …` (+0 が 1 つ減っていれば、返した Rc を
+  あとで落とした人がいる)
+- `heap quarantine SIZE`: poison のあいだ、中身が SIZE バイトのブロックを返さずにとりおき (2048 こ)、大きなロックを取る
+  とき・放すときに頭の 16 バイトを見る。`heap: quarantine hit at unlock … pid … last syscall … path …` なら、そのロックを
+  持っていたシステムコールが書いた (lock なら、ロックの外で書かれた)。0 で切る
+- `page poison on|off`: 返したページを 0xa5 で埋め、頭に返した人と、しるしを書く。出すときに変わっていれば
+  `kalloc: write after free`、数が 0 のページをさらに put しようとすれば返さずに `kalloc: put of a page with no
+  references`、そのページを先に返した人も (最近返した 4096 のページの記録から)
+
+呼び出しの番地は `aarch64-linux-gnu-addr2line -e build/aish-vm/kernels/work -f -C -i ADDR` で関数に (インラインに
+なったものは、外の関数になる)。
+
 ### 速さを測る (bench と /proc/ai/prof)
 
 速さは **測る → 記録する → くらべる → いちばん遅いところを見つけて直す → また測る** のくりかえしで上げる。そのための道具:
