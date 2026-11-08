@@ -116,6 +116,12 @@ static int writer(int w, int secs) {
   rng ^= (uint64_t)(w + 1) * 0x9e3779b97f4a7c15ull;
   snprintf(p, sizeof p, "%s/w%d", dir, w);
   mkdir(p, 0755);
+  // 前に走ったときの残り (再起動のたしかめで残したもの、スナップショットでない VM のディスク) を消してから。覚えている
+  // 形はみな「ない」から始まるので、残っていると、混んでいて一度もさわらなかった名前が「消したのにある」になる
+  for (int k = 0; k < MAXF; k++) {
+    path(p, sizeof p, w, k);
+    unlink(p);
+  }
   time_t end = time(NULL) + secs;
   long ops = 0;
   while (time(NULL) < end) {
