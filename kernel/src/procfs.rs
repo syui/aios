@@ -459,8 +459,7 @@ impl ProcInode {
             // 見るのは ptrace で READ できる人だけ (開くときに: permission)
             Node::FdInfo(pid, n) => {
                 let p = leader(pid)?;
-                let fd = p.files().fds.get(n).and_then(|f| f.as_ref()).ok_or(-ENOENT)?;
-                let (f, cloexec) = (fd.file.clone(), fd.cloexec);
+                let (f, cloexec) = p.files().get_other(n as u64).ok_or(-ENOENT)?;
                 let s = f.borrow().fdinfo(cloexec);
                 s
             }
@@ -660,7 +659,7 @@ fn stat_line(p: &Proc, whole: bool) -> String {
 /// fd の向こう側の名前 (readlink /proc/PID/fd/N)
 fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
     let p = leader(pid)?;
-    let f = p.files().get(n as u64).cloned().ok_or(-ENOENT)?;
+    let (f, _) = p.files().get_other(n as u64).ok_or(-ENOENT)?;
     let f = f.borrow();
     Ok(f.describe())
 }
@@ -733,7 +732,7 @@ pub fn fd_link_file(cwd: &str, path: &str) -> Option<crate::file::FileRef> {
         if let Some(pi) = ino.as_any().downcast_ref::<ProcInode>() {
             let Node::Fd(pid, n) = pi.node else { return None };
             aa_ptrace(pid, true).ok()?;
-            let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
+            let (f, _) = leader(pid).ok()?.files().get_other(n as u64)?;
             let named = matches!(f.borrow().kind, crate::file::Kind::Inode(..));
             return (!named).then_some(f);
         }
@@ -769,7 +768,7 @@ impl Inode for ProcInode {
         let Node::Fd(pid, n) = self.node else { return None };
         // AppArmor で見られなければ、ふつうのリンクとして (readlink が EACCES にする)
         aa_ptrace(pid, true).ok()?;
-        let f = leader(pid).ok()?.files().get(n as u64).cloned()?;
+        let (f, _) = leader(pid).ok()?.files().get_other(n as u64)?;
         let f = f.borrow();
         match &f.kind {
             crate::file::Kind::Inode(ino, path) => Some((path.clone(), ino.clone())),
@@ -796,7 +795,7 @@ impl Inode for ProcInode {
             Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
             // 開いた口しだい: 読めれば r-x、書ければ -wx (Linux の tid_fd_update_inode)
             Node::Fd(pid, n) => {
-                let f = leader(pid).ok().and_then(|p| p.files().get(n as u64).cloned());
+                let f = leader(pid).ok().and_then(|p| p.files().get_other(n as u64)).map(|(f, _)| f);
                 // いま使っているもの (/proc/self/fd を getdents している、その fd など) は借りられない: 読む口として
                 let (r, w) = f.map_or((false, false), |f| f.try_borrow().map_or((true, false), |f| (f.readable(), f.writable())));
                 S_IFLNK | (if r { 0o500 } else { 0 }) | (if w { 0o300 } else { 0 })
@@ -1379,9 +1378,10 @@ fn stacks_text(tgid: u32) -> alloc::string::String {
     if let Some(l) = proc::find_leader(tgid)
         && let Some(files) = l.files.as_ref()
     {
-        for (n, fd) in files.get().fds.iter().enumerate() {
-            if let Some(fd) = fd {
-                let _ = writeln!(out, "fd {} {}", n, fd_state(&fd.file.borrow()));
+        let t = files.get();
+        for n in 0..t.fds.len() {
+            if let Some((f, _)) = t.get_other(n as u64) {
+                let _ = writeln!(out, "fd {} {}", n, fd_state(&f.borrow()));
             }
         }
     }

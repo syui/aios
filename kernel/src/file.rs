@@ -480,6 +480,13 @@ struct Shelved {
     epoch: u64,
 }
 
+impl Shelf {
+    /// 棚のロック (ほかのプロセスの表を読むとき: proc::Files::get_other)
+    pub fn hold(&self) -> impl Sized + '_ {
+        self.0.lock()
+    }
+}
+
 /// fork や exec で表を写すとき、棚は空から (しまったものは、その表のもの)
 impl Clone for Shelf {
     fn clone(&self) -> Self {
@@ -687,8 +694,9 @@ pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
         return None;
     }
     let mut shelf = t.shelf.0.lock();
-    // reuse は棚のロックの中でもう一度 (ファイルを消すとき、shelf_forget がこのロックの中で落とす)
-    if shelf.len() >= SHELF_MAX || !unsafe { (*slot.as_ref()?.file.as_ptr()).reuse } {
+    // reuse と、自分だけが持っていることは棚のロックの中でもう一度 (ファイルを消すとき、shelf_forget がこのロックの中で
+    // 落とす。ほかのプロセスの表を読む procfs や pidfd_getfd は、このロックの中で写す: Files::get_other)
+    if shelf.len() >= SHELF_MAX || !unsafe { (*slot.as_ref()?.file.as_ptr()).reuse } || Rc::strong_count(&slot.as_ref()?.file) != 1 {
         drop(shelf);
         note(6);
         return None;

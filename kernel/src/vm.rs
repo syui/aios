@@ -1879,12 +1879,16 @@ impl PageTable {
     }
 
     /// addr で領域を 2 つに分ける (addr が領域の中なら)
+    /// addr で領域を 2 つに分ける (addr が領域の始めなら何もしない)。分けるときだけ Vma を写す: 大きなロックなしの
+    /// munmap (fast_unmap) も呼ぶので、分けない領域の Rc (ファイルの inode、名前) の数にさわらない (前は分けなくても
+    /// 写して落としていた。ほかの CPU が大きなロックの中で同じ数を変えると片方が消え、まだ持っている inode が返った:
+    /// todo の mem-corrupt-stress)。fast_unmap が分けるのは名前のない無名の領域 (Rc を持たない) だけ
     fn split(&mut self, addr: usize) {
-        let Some((start, v)) = self.find(addr).map(|(s, v)| (s, v.clone())) else { return };
+        let Some(start) = self.find(addr).map(|(s, _)| s) else { return };
         if start == addr {
             return;
         }
-        let mut hi = v.clone();
+        let mut hi = self.vmas[&start].clone();
         match &mut hi.back {
             Backing::File { off, .. } | Backing::Pages { off, .. } => *off += addr - start,
             Backing::Anon => {}

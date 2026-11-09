@@ -241,7 +241,7 @@ pub fn getfd(pidfd: i64, fd: i64, flags: u64) -> Result<i64, i64> {
     if t.state == crate::proc::State::Zombie || t.files.is_none() {
         return Err(-ESRCH);
     }
-    let f = if fd < 0 { None } else { t.files().get(fd as u64).cloned() };
+    let f = if fd < 0 { None } else { t.files().get_other(fd as u64).map(|(f, _)| f) };
     let f = f.ok_or(-EBADF)?;
     let n = crate::proc::current().files().add(f, true, 0).ok_or(-24)?;
     Ok(n as i64)

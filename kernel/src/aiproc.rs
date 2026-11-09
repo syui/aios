@@ -75,9 +75,10 @@ pub fn fds_json(tgid: u32) -> Result<String, i64> {
     let l = crate::proc::find_leader(tgid).ok_or(-2)?;
     let files = l.files.as_ref().ok_or(-2)?;
     let mut out = String::new();
-    for (i, f) in files.get().fds.iter().enumerate() {
-        let Some(f) = f else { continue };
-        let Ok(of) = f.file.try_borrow() else {
+    let t = files.get();
+    for i in 0..t.fds.len() {
+        let Some((f, _)) = t.get_other(i as u64) else { continue };
+        let Ok(of) = f.try_borrow() else {
             out.push_str(&format!("{{\"fd\":{},\"busy\":true}}\n", i));
             continue;
         };
@@ -421,9 +422,10 @@ fn wait_json(p: &mut proc::Proc) -> alloc::string::String {
         let Some(keys) = p.poll_keys.clone() else { return "{\"poll\":\"any\"}".into() };
         let mut fds = alloc::vec::Vec::new();
         if let Some(files) = p.files.as_ref() {
-            for (i, f) in files.get().fds.iter().enumerate() {
-                let Some(f) = f else { continue };
-                let Ok(of) = f.file.try_borrow() else { continue };
+            let t = files.get();
+            for i in 0..t.fds.len() {
+                let Some((f, _)) = t.get_other(i as u64) else { continue };
+                let Ok(of) = f.try_borrow() else { continue };
                 if of.poll_keys().is_some_and(|k| k.iter().any(|k| keys.contains(k))) {
                     fds.push(alloc::format!("{}", i));
                 }

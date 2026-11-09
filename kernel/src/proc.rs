@@ -232,6 +232,13 @@ impl Files {
         self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
     }
 
+    /// ほかのプロセスの表から写す (procfs、pidfd_getfd)。持ち主は大きなロックなしで fd を置いたり棚へしまったり
+    /// (file::fast_open、fast_close) するので、棚のロックの中で
+    pub fn get_other(&self, fd: u64) -> Option<(FileRef, bool)> {
+        let _s = self.shelf.hold();
+        self.fds.get(fd as usize)?.as_ref().map(|f| (f.file.clone(), f.cloexec))
+    }
+
     /// minfd 以上で空いている一番小さい fd に置く
     pub fn add(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
         let i = (minfd..self.nofile).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
