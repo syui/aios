@@ -756,7 +756,11 @@ pub fn init() {
     set_addrs(&mut iface, None);
     let mut sockets = SocketSet::new(Vec::new());
     let dhcp = sockets.add(dhcpv4::Socket::new());
-    crate::irq::enable(dev.virtio.mmio.irq);
+    // 割り込み (Linux の request_irq) と、ときどき (5 tick ごと) 回すもの: smoltcp の poll (TCP の再送など) と、inet の
+    // SYN のやりなおし・FIN_WAIT2 / TIME_WAIT の終わり (Linux では TCP がそれぞれ回す timer_list)
+    crate::irq::request(dev.virtio.mmio.irq, |_| intr());
+    crate::timer::every(5, poll);
+    crate::timer::every(5, crate::inet::tick);
     println!("net: {} (dhcp)", mac);
     *NET.get() = Some(Net { iface, sockets, dev, orphans: Vec::new(), dhcp: Some(dhcp), lease: None, v6gen: crate::addrconf::generation() });
     poll();
@@ -947,10 +951,6 @@ fn dhcp_event(n: &mut Net) {
 #[track_caller]
 pub fn get() -> Option<&'static mut Net> {
     NET.get().as_mut()
-}
-
-pub fn irq() -> Option<u32> {
-    get().map(|n| n.dev.virtio.mmio.irq)
 }
 
 /// ソケットを待っている人が眠る channel

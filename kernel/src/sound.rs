@@ -404,7 +404,9 @@ pub fn init() -> bool {
     }
     let rates: Vec<u32> = (0..RATES.len()).filter(|&i| s.rates & 1 << i != 0).map(|i| RATES[i]).collect();
     println!("virtio-snd: output stream {}, {}-{} channels, {:?} Hz (/dev/snd/pcmC0D0p)", s.stream, s.channels_min, s.channels_max.min(2), rates);
-    crate::irq::enable(s.mmio.irq);
+    crate::irq::request(s.mmio.irq, |id| {
+        intr(id);
+    });
     *SND.get() = Some(s);
     true
 }

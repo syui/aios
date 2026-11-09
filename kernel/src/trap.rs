@@ -397,10 +397,8 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                 irq::IPI => {}
                 id if id == crate::uart::irq() => crate::uart::intr(),
                 irq::SPURIOUS => return,
-                id if Some(id) == crate::net::irq() => crate::net::intr(),
-                id if crate::input::intr(id) => {}
-                id if crate::sound::intr(id) => {}
-                id if crate::virtio_blk::intr(id) => {}
+                // 装置のもの (net、input、sound、virtio-blk ...: それぞれが起こすときに irq::request で置いた)
+                id if irq::handle(id) => {}
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);

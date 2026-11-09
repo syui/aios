@@ -169,7 +169,7 @@ print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 # core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
 # 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
-CORE_USES_EXTRA_MAX = 11
+CORE_USES_EXTRA_MAX = 10
 # フック (入り口) の向こうへ移したものと、その入り口。core はもう名前で呼ばない (入り口を呼ぶ。つなぐのは main.rs)。
 # ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
 # tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)

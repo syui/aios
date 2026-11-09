@@ -236,15 +236,35 @@ pub fn tick() {
     if now / HZ != prev / HZ {
         crate::proc::decay_recent();
     }
-    crate::timerfd::tick();
-    // ディスクの要求が終わっているのに割り込みが来ていなければ (眠って待つ人を起こす)
-    crate::virtio_blk::poll();
     crate::signal::tick(now);
-    // TCP の再送などのため、ときどき (5 tick ごと) 回す
-    if now / 5 != prev / 5 {
-        crate::net::poll();
-        // TCP の SYN のやりなおし、FIN_WAIT2 / TIME_WAIT の終わり
-        crate::inet::tick();
+    // 置いたもの (timerfd の期限、割り込みの来なかったディスクの要求、5 tick ごとの TCP の再送など)
+    for (p, f) in &EVERY {
+        let f = f.load(Ordering::Acquire);
+        if f == 0 {
+            break;
+        }
+        // 1 は割り込みのたびに (tick が進んでいなくても)
+        let p = p.load(Ordering::Relaxed);
+        if p <= 1 || now / p != prev / p {
+            // SAFETY: every が fn() だけを置く
+            let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f) };
+            f();
+        }
     }
     rearm();
+}
+
+/// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: timerfd の期限、割り込みの来なかった
+/// ディスクの要求、TCP の再送など)。(何 tick ごとか, 呼ぶもの)。置いた順に呼ぶ。起動のとき (や modprobe のとき) に every で
+const NR_EVERY: usize = 8;
+static EVERY: [(AtomicU64, core::sync::atomic::AtomicUsize); NR_EVERY] = [const { (AtomicU64::new(0), core::sync::atomic::AtomicUsize::new(0)) }; NR_EVERY];
+static EVERY_LOCK: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
+
+/// period tick ごとに f を呼ぶ (1 なら tick ごと)
+pub fn every(period: u64, f: fn()) {
+    let g = EVERY_LOCK.lock();
+    let Some((p, h)) = EVERY.iter().find(|e| e.1.load(Ordering::Relaxed) == 0) else { panic!("timer: more than {} tick hooks", NR_EVERY) };
+    p.store(period, Ordering::Relaxed);
+    h.store(f as usize, Ordering::Release);
+    drop(g);
 }

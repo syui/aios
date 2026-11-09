@@ -369,6 +369,10 @@ kalloc (reserve: Linux の memblock_reserve) へ渡す (dtb と kalloc は UEFI 
 main.rs が register_trace・register_prof・register_fail でつなぐ。止まっているあいだは、それぞれの場所で ON (debug.rs の
 TRACE_ON・PROF_ON・FAIL_ON。それぞれが /proc/ai/ctl で立てる) を 1 回見るだけで、前と同じ重さ。しくじったわけをためるもの
 (whylog) は why.rs の入り口 (done、fast_missing) から (main.rs の register_log)。/proc/ai の JSON の文字列 (esc) も debug.rs。
+装置の割り込みと時計も登録の表: 装置は起こすとき (起動のときか modprobe のとき) に irq::request (Linux の request_irq) で
+割り込みの番号と呼ぶものを置き、trap.rs は表を引くだけ (タイマ、IPI、uart のほかは名前を知らない)。tick ごとに回すもの
+(timerfd の期限、割り込みの来なかったディスクの要求、5 tick ごとの smoltcp の poll と TCP の再送) は timer::every で置き、
+timer.rs は置いた順に呼ぶ (Linux では装置やプロトコルがそれぞれ回す timer_list)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

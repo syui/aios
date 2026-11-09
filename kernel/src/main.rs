@@ -163,6 +163,8 @@ pub extern "C" fn kmain() -> ! {
     irq::init();
     irq::enable_ipi();
     timer::init();
+    // timerfd の期限 (tick ごと。Linux では timerfd ごとの hrtimer)
+    timer::every(1, timerfd::tick);
     vdso::init();
     uart::init();
     // 乱数: 起動のときのもと (UEFI がくれたもの、DTB の rng-seed、CPU の RNDR) と、乱数の装置 (virtio-rng かラズパイのもの)。

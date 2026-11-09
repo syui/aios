@@ -75,7 +75,9 @@ pub fn init() {
             d.post(i);
         }
         d.q.notify(&d.mmio);
-        crate::irq::enable(d.mmio.irq);
+        crate::irq::request(d.mmio.irq, |id| {
+            intr(id);
+        });
         println!("input: /dev/input/event{} {}", devs().len(), d.name);
         devs().push(d);
     }

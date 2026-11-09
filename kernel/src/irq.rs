@@ -12,6 +12,7 @@
 use crate::dtb;
 use crate::memlayout::p2v;
 use crate::mmio;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const SPURIOUS: u32 = 1023;
 pub const TIMER: u32 = 27;
@@ -218,6 +219,38 @@ pub fn from_dt(compatible: &str) -> Option<u32> {
             Some(64 + bank * 32 + n)
         }
     }
+}
+
+/// 装置の割り込みの表 (Linux の request_irq: 番号と、来たときに呼ぶもの)。装置を起こすとき (起動のときか、modprobe の
+/// とき) に request で置く。タイマ、IPI、uart は trap.rs が自分で見る (いつもある core のもの)。番号 0 (IPI) は空き
+const NR_ACTIONS: usize = 16;
+static ACTIONS: [(AtomicU32, AtomicUsize); NR_ACTIONS] = [const { (AtomicU32::new(0), AtomicUsize::new(0)) }; NR_ACTIONS];
+/// 置くほうだけ (同時に modprobe されても同じところに置かないように)。割り込みのほうはロックなしで読む
+static REQUEST: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
+
+/// 割り込み id が来たら handler(id) を呼ぶようにして、割り込みを有効にする (同じ番号なら置きかえる)
+pub fn request(id: u32, handler: fn(u32)) {
+    assert!(id != 0, "irq: request of 0");
+    let g = REQUEST.lock();
+    let slot = ACTIONS.iter().find(|a| a.0.load(Ordering::Relaxed) == id).or_else(|| ACTIONS.iter().find(|a| a.0.load(Ordering::Relaxed) == 0));
+    let Some((n, h)) = slot else { panic!("irq: more than {} handlers", NR_ACTIONS) };
+    h.store(handler as usize, Ordering::Relaxed);
+    n.store(id, Ordering::Release);
+    drop(g);
+    enable(id);
+}
+
+/// 割り込み id に置いたものを呼ぶ (なければ false: trap.rs が知らない割り込みとして出す)
+pub fn handle(id: u32) -> bool {
+    for (n, h) in &ACTIONS {
+        if n.load(Ordering::Acquire) == id {
+            // SAFETY: request が fn(u32) だけを置く
+            let f: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(h.load(Ordering::Relaxed)) };
+            f(id);
+            return true;
+        }
+    }
+    false
 }
 
 pub fn enable(id: u32) {

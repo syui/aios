@@ -59,7 +59,11 @@ pub fn init() -> bool {
     let seg_max = if feats & F_SEG_MAX != 0 { mmio.config32(12) as usize } else { 1 };
     let segs = seg_max.clamp(1, size - 2);
     println!("virtio-blk: {} MiB, {} segments a request", capacity * SECTOR as u64 / (1024 * 1024), segs);
-    crate::irq::enable(mmio.irq);
+    crate::irq::request(mmio.irq, |id| {
+        intr(id);
+    });
+    // ディスクの要求が終わっているのに割り込みが来ていなければ (眠って待つ人を起こす): tick ごとに見とどける
+    crate::timer::every(1, poll);
     *DISK.get() = Some(Disk { mmio, q, capacity, segs, busy: false, done: core::ptr::null_mut() });
     true
 }
