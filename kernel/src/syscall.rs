@@ -478,7 +478,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     let plan = if p.audit.is_some() && !crate::security::audit_dummy_context() { sysfile::audit_pre(nr, &a) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
-        FLOCK => sysfile::flock(a[0], a[1]),
         CLOSE_RANGE => sysfile::close_range(a[0], a[1], a[2]),
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),

@@ -20,6 +20,39 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+/// core の入り口 (file::FileLocks。main.rs が file::register_locks で置く)
+pub struct Locks;
+pub static OPS: Locks = Locks;
+
+impl crate::file::FileLocks for Locks {
+    fn release_file(&self, file: usize) {
+        release_file(file)
+    }
+    fn release_posix(&self, files: usize, f: &OpenFile) {
+        release_posix(files, f)
+    }
+    fn release_owner(&self, files: usize) {
+        release_owner(files)
+    }
+    fn fcntl(&self, f: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, i64> {
+        fcntl(f, files, cmd, arg)
+    }
+}
+
+/// flock (main.rs が syscall::register で置く。Linux の COND_SYSCALL(flock))
+pub const SYSCALLS: &[u64] = &[crate::syscall::nr::FLOCK];
+
+pub fn sys(_n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    let (fd, op) = (a[0], a[1]);
+    // LSM (file_lock。AppArmor): LOCK_SH と LOCK_UN は k、LOCK_EX (F_WRLCK) は w も
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    if matches!(op & !LOCK_NB, 1 | 2 | 8) {
+        crate::sysfile::lsm_fd(crate::security::PathOp::Lock { write: op & !LOCK_NB == LOCK_EX }, fd)?;
+    }
+    flock(fd, op)
+}
+
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
@@ -83,7 +116,7 @@ fn chan() -> usize {
 }
 
 /// 開いたファイルのロックの鍵。ないもの (ロックのかけられないもの) はない
-pub fn key(f: &OpenFile) -> Option<Key> {
+fn key(f: &OpenFile) -> Option<Key> {
     Some(match &f.kind {
         Kind::Inode(i, _) => i.id(),
         Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (usize::MAX, Rc::as_ptr(p) as usize as u64),
@@ -98,7 +131,7 @@ fn ptr_of(f: &OpenFile) -> usize {
 }
 
 /// 開いたファイルの最後の参照が閉じられた: その flock のロックと OFD ロックを外す
-pub fn release_file(file: usize) {
+fn release_file(file: usize) {
     let mut changed = false;
     for (_, v) in flocks().iter_mut() {
         let n = v.len();
@@ -116,8 +149,9 @@ pub fn release_file(file: usize) {
     }
 }
 
-/// プロセス (ファイルの表 files) が、鍵 key のファイルの fd を 1 つ閉じた: そのファイルの POSIX のロックをみな外す
-pub fn release_posix(files: usize, key: Key) {
+/// プロセス (ファイルの表 files) が、f の fd を 1 つ閉じた: そのファイルの POSIX のロックをみな外す
+fn release_posix(files: usize, f: &OpenFile) {
+    let Some(key) = key(f) else { return };
     if let Some(v) = recs().get_mut(&key) {
         let n = v.len();
         v.retain(|r| r.owner != Owner::Posix(files));
@@ -129,7 +163,7 @@ pub fn release_posix(files: usize, key: Key) {
 }
 
 /// プロセスのファイルの表がなくなる (終わり): その POSIX のロックをみな外す
-pub fn release_owner(files: usize) {
+fn release_owner(files: usize) {
     let mut changed = false;
     for (_, v) in recs().iter_mut() {
         let n = v.len();
@@ -206,7 +240,7 @@ fn deadlock(me: Owner, mut blocker: Owner) -> bool {
 
 /// fcntl の F_GETLK (5) / F_SETLK (6) / F_SETLKW (7) と F_OFD_GETLK (36) / F_OFD_SETLK (37) / F_OFD_SETLKW (38)。
 /// files はプロセスのファイルの表 (POSIX の持ち主)、arg はユーザーの struct flock
-pub fn fcntl(file: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, i64> {
+fn fcntl(file: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, i64> {
     let mut buf = [0u8; 32];
     proc::current().pt().copy_in(&mut buf, arg).ok_or(-EFAULT)?;
     let l_type = i16::from_le_bytes([buf[0], buf[1]]);
@@ -356,7 +390,7 @@ fn apply(key: Key, owner: Owner, pid: u32, typ: i16, start: i64, end: i64) {
 
 /// flock(fd, op): LOCK_SH / LOCK_EX / LOCK_UN (| LOCK_NB)。Linux の順: LOCK_MAND は何もしないで 0、op がだめなら EINVAL、
 /// fd がないか O_PATH なら EBADF (fdget は O_PATH をとばす)、読みも書きもできない口 (O_ACCMODE が 3) は EBADF (LOCK_UN はよい)
-pub fn flock(fd: u64, op: u64) -> Result<i64, i64> {
+fn flock(fd: u64, op: u64) -> Result<i64, i64> {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
     const LOCK_NB: u64 = 4;

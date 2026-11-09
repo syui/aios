@@ -161,6 +161,9 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(epoll::SYSCALLS, epoll::sys);
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
     syscall::register(inotify::SYSCALLS, inotify::sys);
+    // ファイルのロック (Linux の CONFIG_FILE_LOCKING): flock と、fcntl のロック・閉じたときに外すもの (file::FileLocks)
+    file::register_locks(&locks::OPS);
+    syscall::register(locks::SYSCALLS, locks::sys);
     // splice、tee、sendfile、copy_file_range と、大きなロックなしの splice
     syscall::register(splice::SYSCALLS, splice::sys);
     syscall::register_fast_splice(splice::fast);

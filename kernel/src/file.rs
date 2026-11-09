@@ -83,6 +83,37 @@ pub fn register_fast_rw_sock(f: FastRw) {
     FAST_RW_SOCK.set(Some(f));
 }
 
+/// ファイルのロック (Linux の CONFIG_FILE_LOCKING: fs/locks.c)。main.rs が register_locks で locks.rs をつなぐ。つないで
+/// いなければ、外すものはなにもせず、fcntl のロック (F_GETLK など) は EINVAL (Linux のないときと同じ。flock は locks.rs が
+/// syscall::register で置くので ENOSYS)
+pub trait FileLocks: Sync {
+    /// 開いたものの最後の参照が閉じた (file は OpenFile の場所): その flock と OFD ロックを外す
+    fn release_file(&self, _file: usize) {}
+    /// プロセス (ファイルの表 files) が f の fd を 1 つ閉じた: そのファイルの、そのプロセスの POSIX のロックをみな外す
+    fn release_posix(&self, _files: usize, _f: &OpenFile) {}
+    /// プロセスのファイルの表がなくなる: その POSIX のロックをみな外す
+    fn release_owner(&self, _files: usize) {}
+    /// fcntl の F_GETLK・F_SETLK・F_SETLKW と OFD のもの
+    fn fcntl(&self, _f: &FileRef, _files: usize, _cmd: u64, _arg: usize) -> Result<i64, i64> {
+        Err(-EINVAL)
+    }
+}
+
+struct NoLocks;
+
+impl FileLocks for NoLocks {}
+
+static LOCKS: crate::cell::Early<&'static dyn FileLocks> = crate::cell::Early::new(&NoLocks);
+
+/// 起動のとき (main.rs) にファイルのロックをつなぐ
+pub fn register_locks(l: &'static dyn FileLocks) {
+    LOCKS.set(l);
+}
+
+pub fn locks() -> &'static dyn FileLocks {
+    LOCKS.val()
+}
+
 /// poll のビット (Linux と同じ値)
 pub const POLLIN: u32 = 0x1;
 pub const POLLOUT: u32 = 0x4;
@@ -1542,7 +1573,7 @@ impl Drop for OpenFile {
     fn drop(&mut self) {
         reuse_off(self);
         // flock のロックと OFD ロックは OpenFile ごと (その場所で見分ける): 最後の参照が閉じたら外す
-        crate::locks::release_file(self as *const OpenFile as usize);
+        locks().release_file(self as *const OpenFile as usize);
         match &self.kind {
             Kind::Ops(o) => o.release(),
             Kind::PidFd(pid) => crate::pidfd::closed(*pid),

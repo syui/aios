@@ -260,7 +260,7 @@ fn lsm_at(op: PathOp, dirfd: i64, pathp: usize, flags: u64) -> Result<(), i64> {
 
 /// LSM: fd の開いているファイルを、そのパスの決まりで (パイプやソケットなど名前のないものは見ない: Linux も
 /// path_mediated_fs でないもの)
-fn lsm_fd(op: PathOp, fd: u64) -> Result<(), i64> {
+pub fn lsm_fd(op: PathOp, fd: u64) -> Result<(), i64> {
     if !crate::security::path_mediated() {
         return Ok(());
     }
@@ -2588,7 +2588,7 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
                 proc::current().pt().copy_in(&mut t, arg as usize).ok_or(-EFAULT)?;
                 lsm_file(PathOp::Lock { write: i16::from_le_bytes(t) == 1 }, &f)?;
             }
-            crate::locks::fcntl(&f, files, cmd, arg as usize)
+            file::locks().fcntl(&f, files, cmd, arg as usize)
         }
         F_GETPIPE_SZ | F_SETPIPE_SZ => match &entry.file.borrow().kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
@@ -3165,17 +3165,6 @@ pub fn verify_pos(pos: i64, len: usize) -> Result<(), i64> {
 pub fn sigpipe() {
     let info = crate::signal::SigInfo::from(crate::signal::SI_KERNEL);
     crate::signal::send_thread(proc::current(), crate::signal::SIGPIPE, info);
-}
-
-/// flock(fd, op): locks.rs
-pub fn flock(fd: u64, op: u64) -> R {
-    // LSM (file_lock。AppArmor): LOCK_SH と LOCK_UN は k、LOCK_EX (F_WRLCK) は w も
-    const LOCK_EX: u64 = 2;
-    const LOCK_NB: u64 = 4;
-    if matches!(op & !LOCK_NB, 1 | 2 | 8) {
-        lsm_fd(PathOp::Lock { write: op & !LOCK_NB == LOCK_EX }, fd)?;
-    }
-    crate::locks::flock(fd, op)
 }
 
 /// close_range(first, last, flags): まとめて閉じる (Linux 7.4 の fs/file.c と同じ)。first と last は unsigned int。

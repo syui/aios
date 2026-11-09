@@ -139,7 +139,7 @@ pub struct Files {
 impl Drop for Files {
     fn drop(&mut self) {
         // プロセス (スレッドの組) の終わり: その POSIX のレコードロックをみな外す
-        crate::locks::release_owner(self as *const Files as usize);
+        crate::file::locks().release_owner(self as *const Files as usize);
     }
 }
 
@@ -217,10 +217,8 @@ impl Files {
             core::mem::replace(&mut self.fds[i], v)
         };
         // fd を閉じた (上書きも): そのファイルの、このプロセスの POSIX のレコードロックはみな外れる (locks.rs)
-        if let Some(fd) = &old
-            && let Some(k) = crate::locks::key(&fd.file.borrow())
-        {
-            crate::locks::release_posix(self as *const Files as usize, k);
+        if let Some(fd) = &old {
+            crate::file::locks().release_posix(self as *const Files as usize, &fd.file.borrow());
         }
         // 閉じたあとの片づけ (AF_UNIX なら、送られている途中の輪が残ったかもしれない: file.rs から unix.rs の gc。
         // システムコールの終わりに)
