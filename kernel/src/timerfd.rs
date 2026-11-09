@@ -107,15 +107,15 @@ pub fn create(clock: u64, flags: u64) -> Result<i64, i64> {
     let cpu = matches!(clock, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID).then(|| crate::timer::clock_of(clock as i32, false)).transpose()?;
     let t = Rc::new(RefCell::new(TimerFd { realtime: matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_ALARM), cpu, clockid: clock as u8, settime_flags: 0, next: 0, interval: 0, ticks: 0, generation: 0 }));
     let fl = file::O_RDWR | if flags & TFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
-    let fd = proc::current().files().add(file::new(Kind::TimerFd(t), fl), flags & TFD_CLOEXEC != 0, 0).ok_or(-24)?;
+    let fd = proc::current().files().add(file::new(Kind::Ops(Rc::new(TimerFile(t))), fl), flags & TFD_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
 }
 
 fn timer_of(fd: u64) -> Result<TimerRef, i64> {
     let f = proc::current().files().get(fd).cloned().ok_or(-EBADF)?;
     let k = f.borrow();
-    match &k.kind {
-        Kind::TimerFd(t) => Ok(t.clone()),
+    match k.kind.ops::<TimerFile>() {
+        Some(t) => Ok(t.0.clone()),
         _ => Err(crate::why::inval()),
     }
 }
@@ -275,5 +275,38 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
         TIMERFD_SETTIME => settime(a[0], a[1], a[2] as usize, a[3] as usize),
         TIMERFD_GETTIME => gettime(a[0], a[1] as usize),
         _ => Err(-38),
+    }
+}
+
+/// timerfd の fd の中身 (file::Kind::Ops。Linux の timerfd_fops)
+pub struct TimerFile(pub TimerRef);
+
+impl file::FileOps for TimerFile {
+    fn describe(&self) -> alloc::string::String {
+        "anon_inode:[timerfd]".into()
+    }
+    fn class(&self) -> usize {
+        8
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn write(&self, _src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(crate::why::inval())
+    }
+    fn fdinfo(&self) -> alloc::string::String {
+        fdinfo(&self.0)
+    }
+    fn event_gen(&self) -> u64 {
+        generation(&self.0)
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness(&self.0)
+    }
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(alloc::vec![chan(&self.0)])
     }
 }

@@ -2792,7 +2792,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Some(p.borrow().len()),
             Kind::Unix(u) => Some(crate::unix::inq(u)?),
             Kind::Socket(s) => Some(s.borrow().available()),
-            Kind::Inotify(n) => Some(inotify::pending(n)),
+            Kind::Ops(o) => o.fionread(),
             // ふつうのファイルは大きさ - 位置 (終わりより先なら負: Linux の do_vfs_ioctl)
             Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => {
                 let n = ino.meta().size as i64 - f.offset as i64;

@@ -139,8 +139,8 @@ impl Epoll {
 fn epoll_of(fd: i64) -> Result<EpollRef, i64> {
     let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
     let b = f.borrow();
-    match &b.kind {
-        Kind::Epoll(e) => Ok(e.clone()),
+    match b.kind.ops::<EpollFile>() {
+        Some(e) => Ok(e.0.clone()),
         _ => Err(crate::why::inval()),
     }
 }
@@ -150,7 +150,7 @@ pub fn create1(flags: u64) -> Result<i64, i64> {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(crate::why::inval());
     }
-    let f = file::new(Kind::Epoll(Rc::new(RefCell::new(Epoll::default()))), file::O_RDWR);
+    let f = file::new(Kind::Ops(Rc::new(EpollFile(Rc::new(RefCell::new(Epoll::default()))))), file::O_RDWR);
     let fd = proc::current().files().add(f, flags & EPOLL_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
 }
@@ -182,7 +182,7 @@ pub fn ctl(epfd: i64, op: u64, fd: i64, ev: usize) -> Result<i64, i64> {
     if !pollable(&target.borrow()) {
         return Err(-EPERM);
     }
-    if matches!(target.borrow().kind, Kind::Epoll(ref e) if Rc::ptr_eq(e, &ep)) {
+    if target.borrow().kind.ops::<EpollFile>().is_some_and(|e| Rc::ptr_eq(&e.0, &ep)) {
         return Err(-ELOOP);
     }
     let (events, data) = if op == EPOLL_CTL_DEL {
@@ -328,7 +328,7 @@ pub fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     }
     let e = Rc::new(RefCell::new(EventFd { count: initval & 0xffff_ffff, semaphore: flags & EFD_SEMAPHORE != 0, id: EVENTFD_IDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed), generation: 0 }));
     let fl = file::O_RDWR | if flags & EFD_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
-    let fd = proc::current().files().add(file::new(Kind::EventFd(e), fl), flags & EFD_CLOEXEC != 0, 0).ok_or(-24)?;
+    let fd = proc::current().files().add(file::new(Kind::Ops(Rc::new(EventFdFile(e))), fl), flags & EFD_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
 }
 
@@ -413,5 +413,59 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
         EPOLL_PWAIT => crate::signal::wait_mask(a[4] as usize).and_then(|_| pwait(int(a[0]), a[1] as usize, int(a[2]), ms_to_ns(int(a[3])))),
         EPOLL_PWAIT2 => crate::signal::wait_mask(a[4] as usize).and_then(|_| pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize)),
         _ => Err(-38),
+    }
+}
+
+/// epoll の fd の中身 (file::Kind::Ops。Linux の eventpoll_fops)
+pub struct EpollFile(pub EpollRef);
+
+impl file::FileOps for EpollFile {
+    fn describe(&self) -> alloc::string::String {
+        "anon_inode:[eventpoll]".into()
+    }
+    fn fdinfo(&self) -> alloc::string::String {
+        fdinfo(&self.0)
+    }
+    fn debug_state(&self) -> Option<alloc::string::String> {
+        Some(alloc::format!("epoll{}", self.0.borrow().debug()))
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        (self.0.borrow_mut().readable(), false, false)
+    }
+}
+
+/// eventfd の fd の中身 (file::Kind::Ops。Linux の eventfd_fops)
+pub struct EventFdFile(pub EventFdRef);
+
+impl file::FileOps for EventFdFile {
+    fn describe(&self) -> alloc::string::String {
+        "anon_inode:[eventfd]".into()
+    }
+    fn class(&self) -> usize {
+        5
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn write(&self, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+        write(&self.0, src, nonblock)
+    }
+    fn fdinfo(&self) -> alloc::string::String {
+        eventfd_fdinfo(&self.0)
+    }
+    fn event_gen(&self) -> u64 {
+        generation(&self.0)
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(count(&self.0))
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness(&self.0)
+    }
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(alloc::vec![chan(&self.0)])
     }
 }

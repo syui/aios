@@ -173,10 +173,12 @@ CORE_USES_EXTRA_MAX = 3
 # フック (入り口) の向こうへ移したものと、その入り口。core はもう名前で呼ばない (入り口を呼ぶ。つなぐのは main.rs)。
 # ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
 # tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)、vm.rs (Linux の swap.h: スワップの区画)、
-# vfs.rs (Linux の register_filesystem: 装置のないファイルシステム)、syscall.rs (Linux の COND_SYSCALL: システムコールの表)
+# vfs.rs (Linux の register_filesystem: 装置のないファイルシステム)、syscall.rs (Linux の COND_SYSCALL: システムコールの表)、
+# file.rs の FileOps (Linux の file_operations: 開いたものの中身)
 BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
                 "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs",
-                "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs"}
+                "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs",
+                "epoll": "file.rs (FileOps) and syscall.rs", "timerfd": "file.rs (FileOps) and syscall.rs"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

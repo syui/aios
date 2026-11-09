@@ -390,6 +390,9 @@ sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる
 システムコールも、なくても動くところ (epoll と eventfd、timerfd、inotify の init1 と rm_watch、socket、module) のものは
 それぞれのファイルにあり、main.rs が syscall::register で番号ごとに置く (Linux の COND_SYSCALL: 置いていなければ、ない
 システムコールとして ENOSYS)。装置とソケットの mmap (画面、音の再生の口、TCP のソケット: Linux の f_op->mmap) は file.rs。
+開いたものの中身は、なくても動くところのもの (epoll、eventfd、timerfd、inotify) から順に file::Kind::Ops (FileOps: Linux の
+file_operations) へ移している: それぞれが FileOps (読み書き、readiness、poll の印、fdinfo、/proc/PID/fd の名前 ...) を書き、
+file.rs はその関数で呼ぶ。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

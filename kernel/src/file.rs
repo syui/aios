@@ -49,12 +49,9 @@ pub enum Kind {
     Inet(crate::inet::InetRef),
     /// AF_NETLINK (netlink.rs)
     Netlink(crate::netlink::NetlinkRef),
-    Epoll(crate::epoll::EpollRef),
-    EventFd(crate::epoll::EventFdRef),
-    /// timerfd_create で作ったもの (期限が来ると読める)
-    TimerFd(crate::timerfd::TimerRef),
-    /// inotify_init1 で作ったもの (できごとが読める)
-    Inotify(crate::inotify::InotifyRef),
+    /// なくても動くところのもの (epoll、eventfd、timerfd、inotify ...): 中身とその操作 (Linux の file の private_data と
+    /// f_op。file.rs は FileOps の関数で呼び、名前で呼ばない)
+    Ops(Rc<dyn FileOps>),
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
     /// seccomp の user notification の listener (SECCOMP_FILTER_FLAG_NEW_LISTENER。知らせが来ると読める)
@@ -88,6 +85,80 @@ pub fn release_deferred(force: bool) {
     crate::unix::gc_check(force);
 }
 
+/// 開いたものの中身の操作 (Linux の file_operations: Kind::Ops)。それぞれ、何も書かなければ名前のない inode
+/// (anon_inode) のふるまい
+pub trait FileOps: core::any::Any {
+    /// /proc/PID/fd/N の readlink
+    fn describe(&self) -> String;
+    /// CLASSES の番号
+    fn class(&self) -> usize {
+        CLASSES.len() - 1
+    }
+    /// 待つかもしれないもの (読み書きは read と write で。O_NONBLOCK を見る)
+    fn stream(&self) -> bool {
+        false
+    }
+    fn read(&self, _dst: &mut [u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(-EBADF)
+    }
+    fn write(&self, _src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(-EBADF)
+    }
+    fn stat(&self) -> Stat {
+        Stat::dev(0o600, 0)
+    }
+    /// マウント (OpenFile::mount)
+    fn mount(&self) -> (u64, bool) {
+        (vfs::ANON_MNT, false)
+    }
+    /// /proc/PID/fdinfo/N に足すもの
+    fn fdinfo(&self) -> String {
+        String::new()
+    }
+    /// 状態が変わるたびに増える数 (epoll の EPOLLET 用)
+    fn event_gen(&self) -> u64 {
+        0
+    }
+    /// 調べるための様子 (/proc/PID/stack の fd の一覧)。None なら「名前 r?w?h?」
+    fn debug_state(&self) -> Option<String> {
+        None
+    }
+    /// 読まれずに残っているもの (/proc/ai/fd)
+    fn pending(&self) -> Option<u64> {
+        None
+    }
+    /// FIONREAD
+    fn fionread(&self) -> Option<usize> {
+        None
+    }
+    /// (読める, 書ける, 切れた)
+    fn readiness(&self) -> (bool, bool, bool) {
+        (true, true, false)
+    }
+    /// poll のビット (None なら readiness の 3 つで)
+    fn poll_mask(&self) -> Option<u32> {
+        None
+    }
+    /// poll で待つときの印 (None はわからない)
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        None
+    }
+    /// ロック (flock、fcntl) がかけられるか
+    fn lockable(&self) -> bool {
+        false
+    }
+}
+
+impl Kind {
+    /// Kind::Ops の中身が T なら、その Rc (それぞれが fd から自分のものを取りだす: Linux の file->private_data)
+    pub fn ops<T: FileOps>(&self) -> Option<Rc<T>> {
+        match self {
+            Kind::Ops(o) => (o.clone() as Rc<dyn core::any::Any>).downcast::<T>().ok(),
+            _ => None,
+        }
+    }
+}
+
 /// 開いたものの種類の名前 (Kind::class の番号。/proc/bkl が fd のシステムコールを分ける)
 pub const CLASSES: [&str; 10] = ["file", "proc", "pipe", "unix", "inet", "eventfd", "tty", "dev", "timerfd", "other"];
 
@@ -110,11 +181,10 @@ impl Kind {
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => 2,
             Kind::Unix(_) => 3,
             Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) => 4,
-            Kind::EventFd(_) => 5,
             Kind::Tty(_) | Kind::PtyMaster(_) => 6,
             Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm => 7,
-            Kind::TimerFd(_) => 8,
-            Kind::Epoll(_) | Kind::Inotify(_) | Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 9,
+            Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 9,
+            Kind::Ops(o) => o.class(),
         }
     }
 
@@ -636,9 +706,7 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         Kind::Inet(u) => crate::inet::read(u, dst, nonblock),
         Kind::Socket(s) => s.borrow_mut().read(dst),
         Kind::Netlink(n) => crate::netlink::read(n, dst, nonblock),
-        Kind::EventFd(e) => crate::epoll::read(e, dst, nonblock),
-        Kind::TimerFd(t) => crate::timerfd::read(t, dst, nonblock),
-        Kind::Inotify(n) => crate::inotify::read(n, dst, nonblock),
+        Kind::Ops(o) => o.read(dst, nonblock),
         Kind::Input(n) => crate::input::read(*n, dst, nonblock),
         _ => Err(-EBADF),
     }
@@ -661,8 +729,7 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         Kind::Inet(u) => crate::inet::write(u, src, nonblock),
         Kind::Socket(s) => s.borrow_mut().write(src),
         Kind::Netlink(n) => crate::netlink::write(n, src),
-        Kind::EventFd(e) => crate::epoll::write(e, src, nonblock),
-        Kind::TimerFd(_) => Err(crate::why::inval()),
+        Kind::Ops(o) => o.write(src, nonblock),
         _ => Err(-EBADF),
     }
 }
@@ -840,7 +907,8 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Input(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) | Kind::Input(_) => self.kind.clone(),
+            Kind::Ops(o) if o.stream() => self.kind.clone(),
             _ => return None,
         };
         Some((k, self.flags & O_NONBLOCK != 0))
@@ -929,7 +997,8 @@ impl OpenFile {
             // 使いまわさないので番号そのもの)
             Kind::PidFd(pid) => Stat { dev: vfs::encode_dev(vfs::PIDFS_DEV), ino: *pid as u64, ..Stat::dev(0o600, 0) },
             // 名前のない inode (anon_inode)
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
+            Kind::Landlock(_) | Kind::SeccompNotify(_) => Stat::dev(0o600, 0),
+            Kind::Ops(o) => o.stat(),
         }
     }
 
@@ -955,7 +1024,8 @@ impl OpenFile {
             Kind::PidFd(_) => (vfs::PIDFS_MNT, false),
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => (vfs::PIPE_MNT, false),
             Kind::Socket(_) | Kind::Netlink(_) | Kind::Unix(_) | Kind::Inet(_) => (vfs::SOCK_MNT, false),
-            Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => (vfs::ANON_MNT, false),
+            Kind::Landlock(_) | Kind::SeccompNotify(_) => (vfs::ANON_MNT, false),
+            Kind::Ops(o) => o.mount(),
             // デバイスは /dev のノードのあるところ
             _ => vfs::mount_of(self.describe().trim_start_matches('/')),
         }
@@ -968,10 +1038,7 @@ impl OpenFile {
         let mut s = alloc::format!("pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n", self.offset, flags, self.mount().0, self.stat().ino);
         match &self.kind {
             Kind::PidFd(pid) => s.push_str(&crate::pidfd::fdinfo(*pid, self.flags & PIDFD_THREAD != 0)),
-            Kind::EventFd(e) => s.push_str(&crate::epoll::eventfd_fdinfo(e)),
-            Kind::TimerFd(t) => s.push_str(&crate::timerfd::fdinfo(t)),
-            Kind::Epoll(e) => s.push_str(&crate::epoll::fdinfo(e)),
-            Kind::Inotify(n) => s.push_str(&crate::inotify::fdinfo(n)),
+            Kind::Ops(o) => s.push_str(&o.fdinfo()),
             Kind::Unix(u) => s.push_str(&alloc::format!("scm_fds: {}\n", crate::unix::scm_fds(u))),
             _ => {}
         }
@@ -982,9 +1049,7 @@ impl OpenFile {
     pub fn event_gen(&self) -> u64 {
         match &self.kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().generation,
-            Kind::EventFd(e) => crate::epoll::generation(e),
-            Kind::TimerFd(t) => crate::timerfd::generation(t),
-            Kind::Inotify(n) => crate::inotify::generation(n),
+            Kind::Ops(o) => o.event_gen(),
             Kind::Tty(t) | Kind::PtyMaster(t) => t.borrow().generation.get(),
             Kind::Socket(_) => crate::net::generation(),
             Kind::Netlink(n) => crate::netlink::generation(n),
@@ -1012,10 +1077,7 @@ impl OpenFile {
             Kind::Netlink(n) => crate::netlink::describe(n),
             Kind::Unix(u) => crate::unix::describe(u),
             Kind::Inet(u) => crate::inet::describe(u),
-            Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
-            Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
-            Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
-            Kind::Inotify(_) => "anon_inode:inotify".into(),
+            Kind::Ops(o) => o.describe(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
             Kind::SeccompNotify(_) => "anon_inode:seccomp notify".into(),
             Kind::Landlock(_) => "anon_inode:[landlock-ruleset]".into(),
@@ -1034,7 +1096,7 @@ impl OpenFile {
                 let p = p.borrow();
                 alloc::format!("{} {} len={} r={} w={}", self.describe(), rw, p.len(), p.readers, p.writers)
             }
-            Kind::Epoll(e) => alloc::format!("epoll{}", e.borrow().debug()),
+            Kind::Ops(o) => o.debug_state().unwrap_or_else(|| alloc::format!("{} {}", self.describe(), rw)),
             _ => alloc::format!("{} {}", self.describe(), rw),
         }
     }
@@ -1048,8 +1110,7 @@ impl OpenFile {
             Kind::Inet(u) => crate::inet::pending(u),
             Kind::Socket(s) => s.borrow().available() as u64,
             Kind::Netlink(n) => crate::netlink::pending(n),
-            Kind::EventFd(e) => crate::epoll::count(e),
-            Kind::Inotify(n) => crate::inotify::pending(n) as u64,
+            Kind::Ops(o) => return o.pending(),
             _ => return None,
         })
     }
@@ -1088,15 +1149,12 @@ impl OpenFile {
                 let m = crate::inet::poll_mask(u) | self.recv_err_mask();
                 (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
             }
-            Kind::EventFd(e) => crate::epoll::readiness(e),
-            Kind::TimerFd(t) => crate::timerfd::readiness(t),
-            Kind::Inotify(n) => crate::inotify::readiness(n),
             // 終わったら読める、片づけられたら POLLHUP も (PIDFD_THREAD のものは O_EXCL の印: そのスレッドを見る)
             Kind::PidFd(pid) => {
                 let (exited, reaped) = proc::pidfd_state(*pid, self.flags & PIDFD_THREAD != 0);
                 (exited, false, reaped)
             }
-            Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
+            Kind::Ops(o) => o.readiness(),
             Kind::SeccompNotify(l) => l.readiness(),
             Kind::Input(n) => (crate::input::readable(*n), false, false),
             Kind::SndPcm => crate::sound::readiness(),
@@ -1136,6 +1194,7 @@ impl OpenFile {
                 m
             }
             Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM,
+            Kind::Ops(o) => return o.poll_mask(),
             _ => return None,
         })
     }
@@ -1147,11 +1206,8 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
             Kind::Unix(u) => crate::unix::poll_keys(u),
             Kind::Inet(u) => crate::inet::poll_keys(u),
-            Kind::TimerFd(t) => alloc::vec![crate::timerfd::chan(t)],
             // eventfd、inotify、TCP / UDP のソケット (ネットワークで何か変わると net::poll が net::chan() を起こす)。
             // 印がないと、どこかのパイプに書くたびに起こされる (Firefox の gmain が 1 秒に何百回も起きていた)
-            Kind::EventFd(e) => alloc::vec![crate::epoll::chan(e)],
-            Kind::Inotify(n) => alloc::vec![crate::inotify::chan(n)],
             Kind::Socket(_) => alloc::vec![crate::net::chan()],
             Kind::Netlink(n) => alloc::vec![crate::netlink::chan(n)],
             Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
@@ -1161,6 +1217,7 @@ impl OpenFile {
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
             Kind::SndCtl => alloc::vec![],
             Kind::SndPcm => alloc::vec![crate::sound::chan()],
+            Kind::Ops(o) => return o.poll_keys(),
             _ => return None,
         })
     }

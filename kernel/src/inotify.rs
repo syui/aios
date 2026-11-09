@@ -146,15 +146,15 @@ pub fn init1(flags: u64) -> Result<i64, i64> {
     l.retain(|w| w.strong_count() > 0);
     l.push(Rc::downgrade(&n));
     let fl = file::O_RDONLY | if flags & IN_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 };
-    let fd = proc::current().files().add(file::new(Kind::Inotify(n), fl), flags & IN_CLOEXEC != 0, 0).ok_or(-24)?;
+    let fd = proc::current().files().add(file::new(Kind::Ops(Rc::new(InotifyFile(n))), fl), flags & IN_CLOEXEC != 0, 0).ok_or(-24)?;
     Ok(fd as i64)
 }
 
 fn of_fd(fd: u64) -> Result<InotifyRef, i64> {
     let f = proc::current().files().get(fd).cloned().ok_or(-EBADF)?;
     let f = f.borrow();
-    match &f.kind {
-        Kind::Inotify(n) => Ok(n.clone()),
+    match f.kind.ops::<InotifyFile>() {
+        Some(n) => Ok(n.0.clone()),
         _ => Err(crate::why::inval()),
     }
 }
@@ -424,5 +424,38 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
         INOTIFY_INIT1 => init1(a[0]),
         INOTIFY_RM_WATCH => rm_watch(a[0], a[1] as i32),
         _ => Err(-38),
+    }
+}
+
+/// inotify の fd の中身 (file::Kind::Ops。Linux の inotify_fops)
+pub struct InotifyFile(pub InotifyRef);
+
+impl file::FileOps for InotifyFile {
+    fn describe(&self) -> alloc::string::String {
+        "anon_inode:inotify".into()
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn fdinfo(&self) -> alloc::string::String {
+        fdinfo(&self.0)
+    }
+    fn event_gen(&self) -> u64 {
+        generation(&self.0)
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(pending(&self.0) as u64)
+    }
+    fn fionread(&self) -> Option<usize> {
+        Some(pending(&self.0))
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness(&self.0)
+    }
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(alloc::vec![chan(&self.0)])
     }
 }
