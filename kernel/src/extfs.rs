@@ -4601,7 +4601,7 @@ impl Inode for ExtInode {
             // IN_MODIFY を見張っているもの (ふつうの道ができごとを出す) や RWF_DONTCACHE があるときはしない
             if let (Ok(_), Some(sec)) = (&r, quiet)
                 && !crate::proc::dontcache_on()
-                && !crate::inotify::modify_watched()
+                && !crate::vfs::notify::modify_watched()
             {
                 crate::vm::write_permit(id, sec);
             }

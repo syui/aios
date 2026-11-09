@@ -159,6 +159,8 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(epoll::SYSCALLS, epoll::sys);
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
     syscall::register(inotify::SYSCALLS, inotify::sys);
+    // ファイルの出来事の知らせ (Linux の fsnotify: vfs::notify) を inotify へ
+    vfs::notify::register(&inotify::OPS);
     syscall::register(socket::SYSCALLS, socket::sys);
     syscall::register(module::SYSCALLS, module::sys);
     // 調べもの (Linux の Kernel hacking: tracepoint と fault-inject、aios の prof) と、しくじったわけをためるもの (whylog)。
@@ -191,6 +193,8 @@ pub extern "C" fn kmain() -> ! {
     vfs::register_filesystem("sysfs", || Ok(sysfs::new_root()));
     vfs::register_filesystem("securityfs", || Ok(securityfs::new_root()));
     vfs::register_filesystem("efivarfs", efivarfs::new_root);
+    // /dev/stdin や /proc/self/fd/N で、名前のないものを開くとき [quirk tty-root-fdlink] (proc の magic link)
+    sysfile::register_fd_link(procfs::fd_link_file);
     // ルート: ディスクがあれば (block::mount_root: Linux の mount_root)、なければ initramfs
     fs::init(block::mount_root());
     if !parts::off(parts::Part::Net) {

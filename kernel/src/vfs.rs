@@ -2026,3 +2026,103 @@ pub fn mkdir_p(path: &str, mode: u32) -> Result<InodeRef, i64> {
     }
     Ok(cur)
 }
+
+// ---- 出来事の知らせ (Linux の fsnotify: fs/notify/fsnotify.c と include/linux/fsnotify.h) ----
+/// ファイルの出来事 (作る、消す、書く、開く、閉じる、属性、名前を変える) を、見張るもの (inotify.rs) へ渡す入り口。core は
+/// ここを呼び、inotify を名前で呼ばない (main.rs が register でつなぐ。つないでいなければ何もしない)。番号は Linux の
+/// inotify と同じ (fsnotify の FS_* も同じ値)
+pub mod notify {
+    use super::InodeRef;
+    use core::sync::atomic::AtomicUsize;
+
+    pub const IN_ACCESS: u32 = 0x1;
+    pub const IN_MODIFY: u32 = 0x2;
+    pub const IN_ATTRIB: u32 = 0x4;
+    pub const IN_CLOSE_WRITE: u32 = 0x8;
+    pub const IN_CLOSE_NOWRITE: u32 = 0x10;
+    pub const IN_OPEN: u32 = 0x20;
+    pub const IN_MOVED_FROM: u32 = 0x40;
+    pub const IN_MOVED_TO: u32 = 0x80;
+    pub const IN_CREATE: u32 = 0x100;
+    pub const IN_DELETE: u32 = 0x200;
+    pub const IN_DELETE_SELF: u32 = 0x400;
+    pub const IN_MOVE_SELF: u32 = 0x800;
+    pub const IN_ISDIR: u32 = 0x4000_0000;
+
+    /// IN_ACCESS を待つ見張りの数 (0 でなければ、大きなロックなしの read はしない: file::fast_read_file)。数えるのは inotify
+    pub static ACCESS_WATCHED: AtomicUsize = AtomicUsize::new(0);
+    /// 作る・消すのできごと (IN_CREATE、IN_DELETE、IN_ATTRIB、IN_DELETE_SELF) を待つ見張りの数 (0 でなければ、大きなロック
+    /// なしの作る・消す (fastdir.rs) はしない: できごとはふつうの道が出す)
+    pub static NAME_WATCHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// 見張るもの (inotify.rs)
+    pub trait Notify: Sync {
+        /// 見張っているものがあるか
+        fn active(&self) -> bool {
+            false
+        }
+        /// ディレクトリの中の name で起きたこと (作る、消す、名前を変える)
+        fn dir_event(&self, _dir: &InodeRef, _name: &str, _mask: u32, _cookie: u32) {}
+        /// inode そのものに起きたこと
+        fn self_event(&self, _ino: &InodeRef, _mask: u32) {}
+        /// 開いたファイルに起きたこと (path は開いたときのパス、先頭 / なし)
+        fn file_event(&self, _path: &str, _ino: &InodeRef, _mask: u32) {}
+        /// inode がなくなった
+        fn gone(&self, _ino: &InodeRef) {}
+        /// rename の MOVED_FROM と MOVED_TO をつなぐ番号
+        fn cookie(&self) -> u32 {
+            0
+        }
+        /// IN_MODIFY を待っているものがあるか (ext4 が大きなロックなしの pwrite を許すまえに)
+        fn modify_watched(&self) -> bool {
+            false
+        }
+        /// inotify_add_watch (パスは sysfile.rs がユーザーから)
+        fn add_watch(&self, _fd: u64, _path: &str, _mask: u32) -> Result<i64, i64> {
+            Err(-38)
+        }
+    }
+
+    struct NoNotify;
+
+    impl Notify for NoNotify {}
+
+    static NOTIFY: crate::cell::Early<&'static dyn Notify> = crate::cell::Early::new(&NoNotify);
+
+    /// 起動のとき (main.rs) に見張るものをつなぐ
+    pub fn register(n: &'static dyn Notify) {
+        NOTIFY.set(n);
+    }
+
+    pub fn active() -> bool {
+        NOTIFY.val().active()
+    }
+
+    pub fn dir_event(dir: &InodeRef, name: &str, mask: u32, cookie: u32) {
+        NOTIFY.val().dir_event(dir, name, mask, cookie);
+    }
+
+    pub fn self_event(ino: &InodeRef, mask: u32) {
+        NOTIFY.val().self_event(ino, mask);
+    }
+
+    pub fn file_event(path: &str, ino: &InodeRef, mask: u32) {
+        NOTIFY.val().file_event(path, ino, mask);
+    }
+
+    pub fn gone(ino: &InodeRef) {
+        NOTIFY.val().gone(ino);
+    }
+
+    pub fn cookie() -> u32 {
+        NOTIFY.val().cookie()
+    }
+
+    pub fn modify_watched() -> bool {
+        NOTIFY.val().modify_watched()
+    }
+
+    pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
+        NOTIFY.val().add_watch(fd, path, mask)
+    }
+}

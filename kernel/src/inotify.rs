@@ -20,18 +20,8 @@ const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const ENOSPC: i64 = 28;
 
-pub const IN_ACCESS: u32 = 0x1;
-pub const IN_MODIFY: u32 = 0x2;
-pub const IN_ATTRIB: u32 = 0x4;
-pub const IN_CLOSE_WRITE: u32 = 0x8;
-pub const IN_CLOSE_NOWRITE: u32 = 0x10;
-pub const IN_OPEN: u32 = 0x20;
-pub const IN_MOVED_FROM: u32 = 0x40;
-pub const IN_MOVED_TO: u32 = 0x80;
-pub const IN_CREATE: u32 = 0x100;
-pub const IN_DELETE: u32 = 0x200;
-pub const IN_DELETE_SELF: u32 = 0x400;
-pub const IN_MOVE_SELF: u32 = 0x800;
+// できごとの番号と見張りの数は core の入り口 (vfs::notify。Linux の fsnotify) のもの
+pub use crate::vfs::notify::{ACCESS_WATCHED, IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_ISDIR, IN_MODIFY, IN_OPEN, NAME_WATCHED};
 const IN_ALL_EVENTS: u32 = 0xfff;
 const IN_Q_OVERFLOW: u32 = 0x4000;
 const IN_IGNORED: u32 = 0x8000;
@@ -40,7 +30,6 @@ const IN_DONT_FOLLOW: u32 = 0x0200_0000;
 const IN_EXCL_UNLINK: u32 = 0x0400_0000;
 const IN_MASK_CREATE: u32 = 0x1000_0000;
 const IN_MASK_ADD: u32 = 0x2000_0000;
-pub const IN_ISDIR: u32 = 0x4000_0000;
 const IN_ONESHOT: u32 = 0x8000_0000;
 
 const IN_NONBLOCK: u64 = 0o4000;
@@ -83,13 +72,6 @@ pub fn fdinfo(n: &InotifyRef) -> alloc::string::String {
 pub static INOTIFY_MAX_QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(16384);
 /// 1 つの inotify の watch の数
 pub static INOTIFY_MAX_WATCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(8192);
-
-/// IN_ACCESS を待つ見張りの数 (0 でなければ、大きなロックなしの read はしない: file::fast_read_file)
-pub static ACCESS_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// 作る・消すのできごと (IN_CREATE、IN_DELETE、IN_ATTRIB、IN_DELETE_SELF) を待つ見張りの数 (0 でなければ、大きなロックなしの
-/// 作る・消す (fastdir.rs) はしない: できごとはふつうの道が出す)
-pub static NAME_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 const NAME_BITS: u32 = IN_CREATE | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF;
 const OPEN_BITS: u32 = IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
@@ -457,5 +439,37 @@ impl file::FileOps for InotifyFile {
     }
     fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
         Some(alloc::vec![chan(&self.0)])
+    }
+}
+
+/// core の入り口 (vfs::notify) につなぐもの (main.rs)
+pub struct Ops;
+
+pub static OPS: Ops = Ops;
+
+impl crate::vfs::notify::Notify for Ops {
+    fn active(&self) -> bool {
+        active()
+    }
+    fn dir_event(&self, dir: &InodeRef, name: &str, mask: u32, cookie: u32) {
+        dir_event(dir, name, mask, cookie);
+    }
+    fn self_event(&self, ino: &InodeRef, mask: u32) {
+        self_event(ino, mask);
+    }
+    fn file_event(&self, path: &str, ino: &InodeRef, mask: u32) {
+        file_event(path, ino, mask);
+    }
+    fn gone(&self, ino: &InodeRef) {
+        gone(ino);
+    }
+    fn cookie(&self) -> u32 {
+        cookie()
+    }
+    fn modify_watched(&self) -> bool {
+        modify_watched()
+    }
+    fn add_watch(&self, fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
+        add_watch(fd, path, mask)
     }
 }

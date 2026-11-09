@@ -730,7 +730,7 @@ fn read_inode_file(f: &FileRef, ino: &InodeRef, path: &str, dst: &mut [u8]) -> R
     if let Ok(n) = r
         && n > 0
     {
-        crate::inotify::file_event(path, ino, crate::inotify::IN_ACCESS);
+        crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_ACCESS);
     }
     r
 }
@@ -959,7 +959,7 @@ impl OpenFile {
                 let n = if ino.page_cacheable() { crate::vm::read_cached(ino, self.offset, dst)? } else { ino.read_at(self.offset, dst)? };
                 self.offset += n;
                 if n > 0 {
-                    crate::inotify::file_event(path, ino, crate::inotify::IN_ACCESS);
+                    crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_ACCESS);
                 }
                 Ok(n)
             }
@@ -1010,7 +1010,7 @@ impl OpenFile {
                 vfs::drop_privs(ino)?;
                 let n = ino.write_at(self.offset, src)?;
                 self.offset += n;
-                crate::inotify::file_event(path, ino, crate::inotify::IN_MODIFY);
+                crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_MODIFY);
                 Ok(n)
             }
             Kind::Ops(o) if o.seekable() => {
@@ -1522,8 +1522,8 @@ impl Drop for OpenFile {
             Kind::Ops(o) => o.release(),
             Kind::PidFd(pid) => crate::pidfd::closed(*pid),
             Kind::Inode(ino, path) => {
-                let ev = if self.writable() { crate::inotify::IN_CLOSE_WRITE } else { crate::inotify::IN_CLOSE_NOWRITE };
-                crate::inotify::file_event(path, ino, ev);
+                let ev = if self.writable() { crate::vfs::notify::IN_CLOSE_WRITE } else { crate::vfs::notify::IN_CLOSE_NOWRITE };
+                crate::vfs::notify::file_event(path, ino, ev);
                 ino.released();
             }
             Kind::PipeRead(p) => {
@@ -1837,7 +1837,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
     if len == 0 || len > MAX {
         return Err(1);
     }
-    if crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+    if crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return Err(2);
     }
     let files = me.files.as_ref().ok_or(3usize)?;
@@ -1866,7 +1866,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
 /// あるとき。オフセットを動かさないので、fd の表をほかのスレッドと分けていても (門を通って) 読める
 pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
     const MAX: usize = 256 * 1024;
-    if len == 0 || len > MAX || off < 0 || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+    if len == 0 || len > MAX || off < 0 || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return None;
     }
     let files = me.files.as_ref()?;
@@ -1955,7 +1955,7 @@ pub fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_
             // ino.meta() は見ない: inode の中身は大きなロックで守られている (ほかの CPU が書いているかもしれない)。
             // ページキャッシュにはふつうのファイルのページしか入らない (vm::read_cached と mmap) ので、ディレクトリなどは
             // with_cached が None でふつうの道へ (fast_pread と同じ)
-            if !ino.page_cacheable() || crate::inotify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            if !ino.page_cacheable() || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
                 return None;
             }
             // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)

@@ -180,7 +180,8 @@ BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp":
                 "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs",
                 "epoll": "file.rs (FileOps) and syscall.rs", "timerfd": "file.rs (FileOps) and syscall.rs",
                 "block": "file.rs (FileOps, register_blkdev)", "gpu": "file.rs (FileOps, register_chrdev)", "input": "file.rs (FileOps, register_chrdev)",
-                "sound": "file.rs (FileOps, register_chrdev)"}
+                "sound": "file.rs (FileOps, register_chrdev)", "inotify": "vfs.rs (notify) and syscall.rs", "efivarfs": "vfs.rs (register_filesystem)",
+                "procfs": "vfs.rs (register_filesystem) and sysfile.rs (register_fd_link)"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

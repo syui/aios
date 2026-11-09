@@ -52,7 +52,7 @@ fn usable(me: &Proc) -> Option<&'static alloc::rc::Rc<crate::extfs::ExtFs>> {
 /// 作る・消すのできごとを待つ見張りも、読むだけのマウントもない (ext4 のロックの中でもう一度見る: inotify::add_watch と
 /// vfs::mount_ro は、印を立ててから ext4 のロックを取って、いま書きかえているものが終わるのを待つ)
 fn watch_free() -> bool {
-    crate::inotify::NAME_WATCHED.load(Relaxed) == 0 && file::OPEN_WATCHED.load(Relaxed) == 0 && !crate::vfs::RO_MOUNTED.load(Relaxed)
+    crate::vfs::notify::NAME_WATCHED.load(Relaxed) == 0 && file::OPEN_WATCHED.load(Relaxed) == 0 && !crate::vfs::RO_MOUNTED.load(Relaxed)
 }
 
 /// ユーザーのパスを buf に写して、(親のディレクトリの部分の長さ, 最後の名前) に分ける (/name の親は /、name の親は

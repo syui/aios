@@ -395,7 +395,9 @@ file_operations) へ移している: それぞれが FileOps (読み書き、rea
 file.rs はその関数で呼ぶ。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。装置 (ディスクと区画、
 画面、キーボードやマウス、音) も FileOps で (位置のあるもの、ioctl、mmap、release ...)、/dev のノードの番号から開くものは、
 装置が起こすときに file::register_chrdev (画面 29、input 13、音 116) と register_blkdev (区画) で置く (Linux の
-register_chrdev、register_blkdev)。
+register_chrdev、register_blkdev)。ファイルの出来事 (作る、消す、書く、開く、閉じる、属性、名前を変える) の知らせは、
+core が vfs::notify (Linux の fsnotify) を呼び、main.rs がつないだ inotify へ渡す。/dev/stdin や /proc/self/fd/N で
+名前のないものを開くところ (quirk tty-root-fdlink) は、main.rs が sysfile::register_fd_link で procfs.rs のものを置く。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

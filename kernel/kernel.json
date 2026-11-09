@@ -92,7 +92,7 @@
   {"name": "virtio_blk", "type": "extra", "src": "src/virtio_blk.rs", "what": "virtio-blk。要求は 1 度に 1 つ"},
   {"name": "virtio_net", "type": "extra", "src": "src/virtio_net.rs", "what": "virtio-net。受信用に 16 個のバッファを置いておき、送信は空いた記述子を使う"},
   {"name": "virtio_rng", "type": "extra", "src": "src/virtio_rng.rs", "what": "virtio-rng: ホストの乱数を rand の池へ (起こしたときと、60 秒ごと)", "off": "起こさない (乱数のもとは rng-seed、EFI、RNDR だけ)"},
-  {"name": "tty-root-fdlink", "type": "quirk", "src": ["src/sysfile.rs", "src/procfs.rs"], "cause": "aios の端末は root のもの", "what": "/dev/stdin や /proc/self/fd/N の名前のないもの (パイプ、ソケット、端末) は、開きなおさずにそのものを返す (Linux はパイプと端末を開きなおす)", "until": "端末 (pty) をログインした人のものにしたら", "test": "test/vm-check.sh (proc-self-fd)", "off": "手当てをしない: /dev/stdin や /proc/self/fd/N の名前のないものを、名前で開きなおす"},
+  {"name": "tty-root-fdlink", "type": "quirk", "src": ["src/sysfile.rs", "src/procfs.rs", "src/main.rs"], "cause": "aios の端末は root のもの", "what": "/dev/stdin や /proc/self/fd/N の名前のないもの (パイプ、ソケット、端末) は、開きなおさずにそのものを返す (Linux はパイプと端末を開きなおす)", "until": "端末 (pty) をログインした人のものにしたら", "test": "test/vm-check.sh (proc-self-fd)", "off": "手当てをしない: /dev/stdin や /proc/self/fd/N の名前のないものを、名前で開きなおす"},
   {"name": "sound-min-period", "type": "quirk", "src": ["src/sound.rs"], "cause": "カーネルの tick (10 ms) と、QEMU が音を取りにくる間隔 (10 ms)", "what": "音の周期の最短を 20 ms にする (短いと cpal のバッファが 10 ms になり、10 ms ごとにアンダーランする)", "until": "tick を細かくして、本物の音の装置で短い周期が間に合うようになったら", "test": "", "off": "手当てをしない: 周期の最短を決めない"},
   {"name": "qemu-uart-burst", "type": "quirk", "src": ["src/uart.rs"], "cause": "QEMU の PL011 は FIFO がいっぱいにならない (TXFF が立たない)", "what": "1 回に FIFO へ出すのは 32 文字まで、残りは送信の割り込みで (本物の PL011 は TXFF で止まる)", "until": "QEMU の FIFO が本物と同じく 32 文字でいっぱいになるなら", "test": "", "off": "手当てをしない: 1 回に出す文字の数を決めない"}
 ]

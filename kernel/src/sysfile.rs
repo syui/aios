@@ -2,7 +2,8 @@
 use crate::file::{self, FileRef, Kind, Pipe, Stat, EBADF, EINVAL};
 use crate::cred::{self, Cred, R as PR, W as PW, X as PX};
 use crate::fs;
-use crate::inotify;
+// ファイルの出来事の知らせ (Linux の fsnotify: inotify は vfs::notify の向こう)
+use crate::vfs::notify as inotify;
 use crate::proc::{self, Fd};
 use crate::security::PathOp;
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
@@ -1504,7 +1505,15 @@ fn fd_link(path: &str) -> Option<file::FileRef> {
     if !(path.starts_with("/dev/") || path.starts_with("/proc/")) || crate::parts::off(crate::parts::Part::TtyRootFdlink) {
         return None;
     }
-    crate::procfs::fd_link_file("", path)
+    FD_LINK.val().and_then(|f| f("", path))
+}
+
+/// /proc/PID/fd/N をたどって開いているものを返すもの (procfs.rs の fd_link_file: main.rs が register_fd_link で置く。Linux では
+/// proc の magic link の get_link)
+static FD_LINK: crate::cell::Early<Option<fn(&str, &str) -> Option<file::FileRef>>> = crate::cell::Early::new(None);
+
+pub fn register_fd_link(f: fn(&str, &str) -> Option<file::FileRef>) {
+    FD_LINK.set(Some(f));
 }
 
 pub fn fstat(fd: u64, st: usize) -> R {
@@ -2759,8 +2768,9 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         if c.fsuid != ino.meta().uid && !c.capable(cred::CAP_FOWNER) {
             return Err(-vfs::EPERM);
         }
+        const FS_IMMUTABLE_FL: u32 = 0x10;
         const FS_APPEND_FL: u32 = 0x20;
-        if (old ^ new) & (crate::efivarfs::FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 && !c.capable(cred::CAP_LINUX_IMMUTABLE) {
+        if (old ^ new) & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 && !c.capable(cred::CAP_LINUX_IMMUTABLE) {
             return Err(-vfs::EPERM);
         }
         ino.set_fs_flags(new)?;
