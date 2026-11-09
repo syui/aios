@@ -755,7 +755,7 @@ pub fn aios_sync(root: &Path) -> Result<Vec<String>, String> {
     let json: Value = serde_json::from_str(&text).map_err(|e| format!(".aios.json: {}", e))?;
     let pkg = root.join("pkg");
     let own: Vec<String> = fs::read_to_string(pkg.join(FILE)).ok().and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok()).unwrap_or_default().iter().filter(|r| r["skip"] == "aios").filter_map(|r| r["name"].as_str().map(String::from)).collect();
-    const KINDS: [&str; 4] = ["rust", "c", "plugin", "desktop"];
+    const KINDS: [&str; 3] = ["rust", "c", "desktop"];
     let mut changed = vec![];
     // いまあるもの: (グループ, 種類, 名前) → 版
     let mut have: Vec<(String, String, String, String)> = vec![];

@@ -11,7 +11,7 @@
 #   sys:      aios の様子 (まとめ、プロセス、カーネルのメッセージ、ログ、BKL、strace)
 #   claude:   見つからなかったコマンドの行を Claude に   local: claude が答えなかったら、このマシンの AI (llama-server) に
 #   vm:       開発のマシンで aios の VM を動かす、C を中で試す、2 つのカーネルをくらべる、壊れたコミットを探す
-#   powerline: powerline のプロンプト ([plugin] リポジトリの aish-powerline)
+#   powerline: powerline のプロンプト (~/.aishrc の plugin aish-powerline で読む)
 [workspace]
 resolver = "2"
 members = ["plugin", "complete", "suggest", "highlight", "time", "pick", "edit", "wait", "fetch", "git", "map", "fix", "sys", "pkg", "claude", "local", "vm", "powerline"]
