@@ -1328,17 +1328,20 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         }
         Err((parent, name, full)) => {
             vfs::check_writable(&full)?;
-            // LSM: 作る (mknod) と、開く (landlock の MAKE_REG と WRITE_FILE、AppArmor: Linux の may_o_create と file_open)
-            crate::security::may_o_create(&full, flags as u32)?;
+            // Linux の may_o_create の順: LSM の作る (security_path_mknod: landlock の MAKE_REG、AppArmor の create)、それから
+            // 親の許可 (DAC)
+            crate::security::path_mknod(&full, vfs::S_IFREG | (mode as u32 & 0o7777), 0)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
             vfs::remember_new(&full, &parent, &name, &ino);
             inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
+            // 作ったばかりのものは mode に関係なく開ける (DAC)。LSM の開く (security_file_open: landlock の READ_FILE /
+            // WRITE_FILE、AppArmor の open) は作ったあとに: だめなら作ったものは残る (Linux と同じ)。返すのは開いたファイルに
+            // 覚えるもの (lsm_deny)
+            let lsm_deny = crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: false, ouid: ino.meta().uid, how: crate::security::How::Created, dev: false })?;
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
-            // 作ったばかりのものは、mode に関係なく開ける (LSM が開いたファイルに覚えるもの: lsm_deny)
-            let lsm_deny = crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: false, ouid: 0, how: crate::security::How::Created, dev: false })?;
             let f = file::new(Kind::Inode(ino, full), file_flags(flags));
             f.borrow_mut().lsm_deny = lsm_deny;
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
@@ -1858,10 +1861,9 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
     }
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
-    // LSM (砂場): 作るところの MAKE_*。それから (security_path_link) ほかのディレクトリのものをつなぐなら、両方に REFER も
-    // (landlock)、新しい名前と、つなぐ元の組 (AppArmor の profile_path_link)
+    // LSM (security_path_link): 作るところの MAKE_* と、ほかのディレクトリのものをつなぐなら両方に REFER (landlock)、
+    // 新しい名前と、つなぐ元の組 (AppArmor の profile_path_link)
     {
-        crate::security::path_link_make(&full, ino.meta().mode)?;
         let src = old_path(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
         crate::security::path_link(&src, &full, &ino)?;
     }

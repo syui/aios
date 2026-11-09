@@ -820,7 +820,7 @@ pub fn get_robust_list(pid: i32, head_ptr: usize, len_ptr: usize) -> Result<i64,
         if t.tgid != me.tgid {
             let (c, tc) = (&me.cred, &t.cred);
             let ids = [tc.uid, tc.euid, tc.suid].iter().all(|&u| u == c.uid) && [tc.gid, tc.egid, tc.sgid].iter().all(|&g| g == c.gid);
-            if !(ids || c.capable(crate::cred::CAP_SYS_PTRACE)) || crate::security::ptrace_access_check_exclusive(tc, crate::security::PTRACE_MODE_READ).is_err() {
+            if !(ids || c.capable(crate::cred::CAP_SYS_PTRACE)) || crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_READ).is_err() {
                 return Err(-EPERM);
             }
         }

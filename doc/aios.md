@@ -357,8 +357,11 @@ seccomp、audit、auditfilter、debug.rs の trace、prof、fail、why.rs の wh
 audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。namespace (ns) は Linux と
 同じく core (pid、uid、ホスト名の読みかえと mount の namespace。LSM は作るときだけ見る: security::namespace_init)。LSM が
 プロセスやファイルに持たせるもの (AppArmor のラベル、landlock の層、開いたときに覚えたもの) は、core の中立の名前の欄
-(Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。いまの aios の順が Linux と
-ちがうところ (すでにあるファイルを開くときは AppArmor が先、など) は、フックに「aios の順」と書いてある。
+(Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。フックの順も、見る
+ときも Linux と同じ (landlock が先、はじめの Err が勝つ。O_CREAT は作る前に security::path_mknod、開くのは作ったあとに
+security::file_open: 開けなくても作ったものは残る。test/llorder.c)。大きなロックなしの道が seccomp と landlock の有無を
+見るのは、Cred ではなく Proc::cred_work (Linux の TIF_SECCOMP と同じく atomic な印: TSYNC がほかのスレッドの cred を
+書くのと競らない)。
 Linux で持ち主のところにある値やつなぎは、aios でも持ち主に置く: /proc/sys の値 (fs.suid_dumpable は exec.rs、
 kernel.sched_* は proc.rs、vm.min_free_kbytes は kalloc.rs、fs.inotify.* は inotify.rs) は持ち主が持ち、sysctl.rs は名前と
 置き場を結ぶ表だけ (Linux の sysctl の表と同じ)。UEFI から起動したときのコマンドラインとランタイムサービスの RAM は、

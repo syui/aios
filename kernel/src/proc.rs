@@ -276,6 +276,10 @@ impl FpState {
     const ZERO: Self = Self { q: [0; 32], fpcr: 0, fpsr: 0 };
 }
 
+/// Proc::cred_work の印
+pub const CRED_SECCOMP: u8 = 1;
+pub const CRED_SANDBOX: u8 = 2;
+
 pub struct Proc {
     pub state: State,
     /// 走っている (最後に走った) CPU
@@ -315,6 +319,10 @@ pub struct Proc {
     autoreap: bool,
     /// ユーザーとグループ
     pub cred: crate::cred::Cred,
+    /// cred の seccomp と landlock の層 (sandbox) があるかの印 (CRED_SECCOMP、CRED_SANDBOX)。この 2 つはほかのスレッドが
+    /// 書くことがある (TSYNC) ので、大きなロックなしの道 (syscall::fast、file::fast_open、fastdir) は cred を読まずにこれを
+    /// 見る (Linux の TIF_SECCOMP と同じく atomic に立てる)。cred のそれを書いたら sync_cred_work で
+    pub cred_work: core::sync::atomic::AtomicU8,
     /// プログラムの名前 (/proc/PID/stat や ps に出る。最大 15 バイト)
     pub comm: [u8; 16],
     /// 投機的なストアの追いこし (SSB) の印 (prctl の PR_SET_SPECULATION_CTRL: cpuvuln::SSB_*)。fork で受けつぐ
@@ -470,6 +478,7 @@ impl Proc {
         timers: Vec::new(),
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
+        cred_work: core::sync::atomic::AtomicU8::new(0),
         comm: [0; 16],
         spec_ssb: 0,
         trace_mark: 0,
@@ -603,6 +612,18 @@ impl Proc {
     }
 
     /// 同じスレッドグループの他の Proc (リーダーも)
+    /// cred の seccomp と sandbox を書いたあと (大きなロックの中で): cred_work をそれに合わせる
+    pub fn sync_cred_work(&self) {
+        let w = if self.cred.seccomp.is_some() { CRED_SECCOMP } else { 0 } | if self.cred.sandbox.is_some() { CRED_SANDBOX } else { 0 };
+        self.cred_work.store(w, core::sync::atomic::Ordering::Release);
+    }
+
+    /// cred_work の印 (大きなロックなしの道から)
+    #[inline]
+    pub fn has_cred_work(&self, bit: u8) -> bool {
+        self.cred_work.load(core::sync::atomic::Ordering::Acquire) & bit != 0
+    }
+
     pub fn siblings(&self) -> impl Iterator<Item = &'static mut Proc> {
         let (tgid, pid) = (self.tgid, self.pid);
         live().filter(move |p| p.state != State::Unused && p.tgid == tgid && p.pid != pid)
@@ -1866,6 +1887,7 @@ pub fn unshare(flags: u64) -> Result<i64, i64> {
     let mut cred = p.cred.clone();
     crate::ns::renew(&mut cred, flags)?;
     p.cred = cred;
+    p.sync_cred_work();
     if flags & CLONE_FILES != 0 {
         let f = Shared::new(p.files().clone());
         p.files = Some(f);
@@ -1929,6 +1951,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.vpid = ns.alloc();
     }
     child.cred = cred;
+    child.sync_cred_work();
     child.comm = parent.comm;
     child.spec_ssb = parent.spec_ssb;
     child.thread = thread;

@@ -2,8 +2,8 @@
 // LSM は Lsm を実装した static (Linux の DEFINE_LSM) を持ち、main.rs が起動のときに register でつなぐ (security_init)。
 // LSM が書かないフックは既定のまま: その LSM を入れずに作った Linux と同じ (許す)。
 // 呼ぶ順は Linux の CONFIG_LSM="landlock,apparmor" と同じ: 重ねる LSM (landlock) が先、ラベルを持つ LSM (AppArmor。Linux の
-// LSM_FLAG_EXCLUSIVE) があと。だめと言った LSM で止め、あとの LSM は呼ばない (call_int_hook)。いまの aios の順がこれと
-// ちがうところは、そのフックに「aios の順」と書く (Linux に合わせるのは別のコミットで)。
+// LSM_FLAG_EXCLUSIVE) があと。だめと言った LSM で止め、あとの LSM は呼ばない (call_int_hook)。どのフックもこの順 (前に
+// あった「aios の順」は 2026-11-09 に Linux に合わせた)。
 // aios.off= で切った LSM もつないだまま: 切ったかは LSM がフックの中で見る (動かしたまま入れなおせるように)
 use crate::cell::Early;
 use crate::cred::Cred;
@@ -57,7 +57,7 @@ pub struct FileOpen<'a> {
 pub enum How {
     /// すでにあるファイルを開く (path は開くもの)
     Open,
-    /// O_CREAT で作ったばかりのものを開く (作る前のたしかめは may_o_create)
+    /// O_CREAT で作ったばかりのものを開く (作る前のたしかめは path_mknod: Linux の may_o_create)。path は作ったもの、ouid はその持ち主
     Created,
     /// O_TMPFILE (path はディレクトリ)
     Tmpfile,
@@ -145,10 +145,6 @@ pub trait Lsm {
     fn file_open(&self, _o: &FileOpen) -> Result<u32, i64> {
         Ok(0)
     }
-    /// aios: O_CREAT で作る前 (Linux の may_o_create の security_path_mknod と、作ったあとの security_file_open)
-    fn may_o_create(&self, _full: &str, _flags: u32) -> Result<(), i64> {
-        Ok(())
-    }
     /// aios: パスの名前で決める決まりが、いまのプロセスにあるか (そのときだけ core が名前を引きなおす)
     fn path_mediated(&self) -> bool {
         false
@@ -167,10 +163,6 @@ pub trait Lsm {
     }
     /// Linux の path_unlink と path_rmdir。消すもの (dir の name) は、要る LSM だけが引く
     fn path_unlink(&self, _full: &str, _dir: &InodeRef, _name: &str, _rmdir: bool) -> Result<(), i64> {
-        Ok(())
-    }
-    /// aios: link で作る名前 (つなぐ元を引く前: Linux は security_path_link のなかで)
-    fn path_link_make(&self, _full: &str, _mode: u32) -> Result<(), i64> {
         Ok(())
     }
     fn path_link(&self, _src: &str, _full: &str, _ino: &InodeRef) -> Result<(), i64> {
@@ -251,12 +243,6 @@ pub fn capable(c: &Cred, cap: u32, audit: bool) -> bool {
     (c.label.is_none() && c.sandbox.is_none()) || lsms().iter().all(|l| l.capable(c, cap, audit))
 }
 
-/// aios の順: 重ねる LSM (landlock) だけに聞く capable (ns.rs の namespace を作る・ホスト名を変える。Linux の ns_capable は
-/// みなに聞く)
-pub fn capable_stacked(c: &Cred, cap: u32) -> bool {
-    STACKED.val().capable(c, cap, true)
-}
-
 /// security_capget: root に見せる capability を、それぞれの LSM がせばめる
 pub fn capget(c: &Cred) -> u64 {
     lsms().iter().fold(u64::MAX, |m, l| m & l.capget(c))
@@ -284,11 +270,6 @@ pub fn namespace_init(c: &Cred, flags: u64) -> Result<(), i64> {
         l.namespace_init(c, flags)?;
     }
     Ok(())
-}
-
-/// aios の順: ラベルを持つ LSM だけ (get_robust_list。Linux の ptrace_may_access は landlock も見る)
-pub fn ptrace_access_check_exclusive(child: &Cred, mode: u32) -> Result<(), i64> {
-    EXCLUSIVE.val().ptrace_access_check(child, mode)
 }
 
 /// security_bprm_creds_for_exec: はじめはいまのラベル (prepare_exec_creds)。LSM が変える
@@ -332,19 +313,14 @@ pub fn file_permission(f: &FileRef, write: bool) -> Result<(), i64> {
     Ok(())
 }
 
-/// security_file_open。返すのは開いたファイルに覚えるビット (OpenFile の lsm_deny)。aios の順: ラベルを持つ LSM が先
-/// (Linux の CONFIG_LSM では landlock が先)
+/// security_file_open。返すのは開いたファイルに覚えるビット (OpenFile の lsm_deny)。O_CREAT で作ったものも、作ったあとに
+/// (Linux の do_open: 開けなくても作ったものは残る)
 pub fn file_open(o: &FileOpen) -> Result<u32, i64> {
-    let x = EXCLUSIVE.val().file_open(o)?;
-    Ok(x | STACKED.val().file_open(o)?)
-}
-
-/// O_CREAT で作る前
-pub fn may_o_create(full: &str, flags: u32) -> Result<(), i64> {
+    let mut x = 0;
     for l in lsms() {
-        l.may_o_create(full, flags)?;
+        x |= l.file_open(o)?;
     }
-    Ok(())
+    Ok(x)
 }
 
 /// パスの名前で決める決まりが、いまのプロセスにあるか
@@ -389,14 +365,6 @@ pub fn path_symlink(full: &str) -> Result<(), i64> {
 pub fn path_unlink(full: &str, dir: &InodeRef, name: &str, rmdir: bool) -> Result<(), i64> {
     for l in lsms() {
         l.path_unlink(full, dir, name, rmdir)?;
-    }
-    Ok(())
-}
-
-/// link で作る名前 (aios の順: つなぐ元を引く前。mode はつなぐもの)
-pub fn path_link_make(full: &str, mode: u32) -> Result<(), i64> {
-    for l in lsms() {
-        l.path_link_make(full, mode)?;
     }
     Ok(())
 }

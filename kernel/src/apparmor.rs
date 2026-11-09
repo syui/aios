@@ -3323,17 +3323,13 @@ impl crate::security::Lsm for AppArmor {
         sock_file(f, write)
     }
 
-    /// すでにあるファイルを開くときだけ (作るときは may_o_create、exec は bprm_creds_for_exec で見る。O_TMPFILE は見ない)
+    /// すでにあるファイルと、O_CREAT で作ったばかりのものを開くとき (Linux の apparmor_file_open。作るのは path_mknod で見た。
+    /// exec は bprm_creds_for_exec で見る。O_TMPFILE は見ない)
     fn file_open(&self, o: &FileOpen) -> Result<u32, i64> {
-        if o.how == How::Open {
+        if o.how == How::Open || o.how == How::Created {
             open_perm(o.path, o.flags, o.dir, o.ouid)?;
         }
         Ok(0)
-    }
-
-    fn may_o_create(&self, full: &str, flags: u32) -> Result<(), i64> {
-        path_perm(OP_MKNOD, full, MAY_CREATE, false, fsuid())?;
-        open_perm(full, flags, false, fsuid())
     }
 
     fn path_mediated(&self) -> bool {

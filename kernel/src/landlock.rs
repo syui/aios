@@ -557,12 +557,14 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
     if flags & TSYNC != 0 {
         for t in p.siblings() {
             t.cred.sandbox = new.clone();
+            t.sync_cred_work();
             if nnp {
                 t.cred.no_new_privs = true;
             }
         }
     }
     p.cred.sandbox = new;
+    p.sync_cred_work();
     if flags & NO_NEW_PRIVS != 0 {
         p.cred.no_new_privs = true;
     }
@@ -633,8 +635,13 @@ impl crate::security::Lsm for Landlock {
                 check_fs(o.path, MAKE_REG | rw)?;
                 Ok(denied_fs(o.path, TRUNCATE) as u32)
             }
-            // 作ったばかりのものは、mode に関係なく開ける
-            How::Created => Ok(denied_fs(o.path, TRUNCATE) as u32),
+            // 作ったばかりのもの (Linux の hook_file_open: 作ったものも開く口のとおり READ_FILE / WRITE_FILE。作るのは
+            // path_mknod の MAKE_REG で見た。作ったものは切りつめないので TRUNCATE は見ない)
+            How::Created => {
+                let a = (if acc != O_WRONLY { READ_FILE } else { 0 }) | (if acc != O_RDONLY { WRITE_FILE } else { 0 });
+                check_fs(o.path, a)?;
+                Ok(denied_fs(o.path, TRUNCATE) as u32)
+            }
             // ディレクトリは READ_DIR、ほか (デバイスも) は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE
             How::Open => {
                 let a = if o.dir {
@@ -649,14 +656,6 @@ impl crate::security::Lsm for Landlock {
     }
 
     /// O_CREAT で作る前: 親に MAKE_REG、書く口なら WRITE_FILE も
-    fn may_o_create(&self, full: &str, flags: u32) -> Result<(), i64> {
-        check_parent(full, MAKE_REG)?;
-        if flags & crate::file::O_ACCMODE != crate::file::O_RDONLY {
-            check_fs(full, WRITE_FILE)?;
-        }
-        Ok(())
-    }
-
     fn path_mkdir(&self, full: &str) -> Result<(), i64> {
         check_parent(full, MAKE_DIR)
     }
@@ -673,13 +672,10 @@ impl crate::security::Lsm for Landlock {
         check_parent(full, if rmdir { REMOVE_DIR } else { REMOVE_FILE })
     }
 
-    /// link: 作るところの MAKE_* (つなぐ元を引く前)
-    fn path_link_make(&self, full: &str, mode: u32) -> Result<(), i64> {
-        check_parent(full, make_right(mode))
-    }
-
-    /// link: ほかのディレクトリのものをつなぐなら、両方に REFER も
-    fn path_link(&self, src: &str, full: &str, _ino: &crate::vfs::InodeRef) -> Result<(), i64> {
+    /// link (Linux の hook_path_link): 作るところの MAKE_* (つなぐものの種類で)。ほかのディレクトリのものをつなぐなら、
+    /// 両方に REFER も
+    fn path_link(&self, src: &str, full: &str, ino: &crate::vfs::InodeRef) -> Result<(), i64> {
+        check_parent(full, make_right(ino.meta().mode))?;
         if dir_of(src) != dir_of(full) {
             check_parent(src, REFER)?;
             check_parent(full, REFER)?;

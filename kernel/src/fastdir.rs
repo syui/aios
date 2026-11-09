@@ -83,7 +83,7 @@ fn root_fs() -> Option<&'static dyn FastFs> {
 
 /// どちらにも要るもの (ロックの外で見られるもの)。だめなら None
 fn usable(me: &Proc) -> Option<&'static dyn FastFs> {
-    if crate::debug::FAIL_ON.load(Relaxed) || me.cred.sandbox.is_some() || !watch_free() {
+    if crate::debug::FAIL_ON.load(Relaxed) || me.has_cred_work(crate::proc::CRED_SANDBOX) || !watch_free() {
         return None;
     }
     if !me.files.as_ref()?.private() {

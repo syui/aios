@@ -537,7 +537,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
     let acc = flags & O_ACCMODE as u64;
-    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.sandbox.is_some() || OPEN_WATCHED.load(Relaxed) != 0 {
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.has_cred_work(proc::CRED_SANDBOX) || OPEN_WATCHED.load(Relaxed) != 0 {
         note(5);
         return None;
     }

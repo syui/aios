@@ -130,11 +130,13 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         c.ns.user = Some(Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) }));
     }
     if flags & !CLONE_NEWUSER & SUPPORTED != 0 {
-        if c.ns.user.is_none() && !c.no_new_privs && !c.capable(crate::cred::CAP_SYS_ADMIN) {
-            return Err(-EPERM);
-        }
-        // ユーザーの namespace の中 (CAP_SYS_ADMIN を持つ) でも、LSM (landlock の CAPABILITY_USE) は効く
-        if !crate::security::capable_stacked(c, crate::cred::CAP_SYS_ADMIN) {
+        // Linux の ns_capable(CAP_SYS_ADMIN): capability と LSM みな (landlock の CAPABILITY_USE、AppArmor の capability)。
+        // ユーザーの namespace の中 (CAP_SYS_ADMIN を持つ) と no_new_privs のときも、LSM は聞く
+        if c.ns.user.is_none() && !c.no_new_privs {
+            if !c.capable(crate::cred::CAP_SYS_ADMIN) {
+                return Err(-EPERM);
+            }
+        } else if !crate::security::capable(c, crate::cred::CAP_SYS_ADMIN, true) {
             return Err(-EPERM);
         }
         crate::security::namespace_init(c, flags & !CLONE_NEWUSER)?;
@@ -191,8 +193,8 @@ pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
     b[..name.len()].copy_from_slice(name);
     let c = &crate::proc::current().cred;
     match &c.ns.uts {
-        // 自分の UTS (CAP_SYS_ADMIN を持つ) でも、LSM (landlock の CAPABILITY_USE) は効く
-        Some(_) if check && !crate::security::capable_stacked(c, crate::cred::CAP_SYS_ADMIN) => return Err(-EPERM),
+        // 自分の UTS (CAP_SYS_ADMIN を持つ) でも、LSM はみな聞く (Linux の ns_capable: landlock の CAPABILITY_USE、AppArmor)
+        Some(_) if check && !crate::security::capable(c, crate::cred::CAP_SYS_ADMIN, true) => return Err(-EPERM),
         Some(u) => *u.name.borrow_mut() = (b, name.len()),
         None => {
             if check && !c.capable(crate::cred::CAP_SYS_ADMIN) {

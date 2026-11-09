@@ -666,10 +666,12 @@ fn install(strict: bool, prog: Option<Vec<Insn>>, flags: u64) -> Result<i64, i64
     }
     let p = proc::current();
     p.cred.seccomp = Some(new as crate::security::Blob);
+    p.sync_cred_work();
     if tsync {
         let s = p.cred.seccomp.clone();
         for t in p.siblings() {
             t.cred.seccomp = s.clone();
+            t.sync_cred_work();
         }
     }
     Ok(fd)
