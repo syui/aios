@@ -155,6 +155,12 @@ pub extern "C" fn kmain() -> ! {
     security::register_audit(&audit::OPS);
     // スワップ (Linux の CONFIG_SWAP)。回収は vm.rs (vmscan)、区画とスロットは swap.rs
     vm::register_swap(&swap::OPS);
+    // なくても動くところが持つシステムコール (Linux の COND_SYSCALL: syscall.rs の表に。置かなければ ENOSYS)
+    syscall::register(epoll::SYSCALLS, epoll::sys);
+    syscall::register(timerfd::SYSCALLS, timerfd::sys);
+    syscall::register(inotify::SYSCALLS, inotify::sys);
+    syscall::register(socket::SYSCALLS, socket::sys);
+    syscall::register(module::SYSCALLS, module::sys);
     // 調べもの (Linux の Kernel hacking: tracepoint と fault-inject、aios の prof) と、しくじったわけをためるもの (whylog)。
     // core は debug.rs と why.rs の入り口を呼び、ここでつなぐ (止まっているあいだは ON を見るだけ)
     debug::register_trace(&trace::OPS);

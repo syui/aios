@@ -261,3 +261,19 @@ pub fn tick() {
         wake(&t);
     }
 }
+
+/// システムコール (main.rs が syscall::register で置く。Linux の fs/timerfd.c)
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[TIMERFD_CREATE, TIMERFD_SETTIME, TIMERFD_GETTIME]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    match n {
+        TIMERFD_CREATE => create(a[0], a[1]),
+        TIMERFD_SETTIME => settime(a[0], a[1], a[2] as usize, a[3] as usize),
+        TIMERFD_GETTIME => gettime(a[0], a[1] as usize),
+        _ => Err(-38),
+    }
+}

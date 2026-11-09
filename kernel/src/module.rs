@@ -82,3 +82,40 @@ pub fn proc_modules() -> String {
     }
     s
 }
+
+/// システムコール (main.rs が syscall::register で置く。Linux の kernel/module/main.c)
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[INIT_MODULE, FINIT_MODULE, DELETE_MODULE]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    match n {
+        INIT_MODULE => sys_init_module(a[0] as usize, a[1] as usize),
+        FINIT_MODULE => sys_finit_module(a[0]),
+        DELETE_MODULE => sys_delete_module(a[0] as usize),
+        _ => Err(-38),
+    }
+}
+
+/// init_module(image, len, params): 札 (module.rs) をメモリで
+fn sys_init_module(image: usize, len: usize) -> Result<i64, i64> {
+    let mut img = alloc::vec![0u8; len.min(4096)];
+    crate::proc::current().pt().copy_in(&mut img, image).ok_or(-14)?;
+    crate::module::load(&img)
+}
+
+/// finit_module(fd, params, flags): 札のファイル (/usr/lib/modules/NAME.ko) を読む
+fn sys_finit_module(fd: u64) -> Result<i64, i64> {
+    let f = crate::proc::current().files().get(fd).cloned().ok_or(-9)?;
+    let mut img = alloc::vec![0u8; 4096];
+    let n = f.borrow_mut().read(&mut img)?;
+    img.truncate(n);
+    crate::module::load(&img)
+}
+
+fn sys_delete_module(name: usize) -> Result<i64, i64> {
+    let name = crate::proc::current().pt().copy_in_str(name, 64).ok_or(-14)?;
+    crate::module::unload(core::str::from_utf8(&name).map_err(|_| crate::why::inval())?)
+}

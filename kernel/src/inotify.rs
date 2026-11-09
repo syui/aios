@@ -410,3 +410,19 @@ pub fn generation(n: &InotifyRef) -> u64 {
 pub fn pending(n: &InotifyRef) -> usize {
     n.borrow().queue.iter().map(|e| e.len()).sum()
 }
+
+/// システムコール (main.rs が syscall::register で置く。Linux の fs/notify/inotify/inotify_user.c)。inotify_add_watch は
+/// パスをたどるので sysfile.rs
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[INOTIFY_INIT1, INOTIFY_RM_WATCH]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    match n {
+        INOTIFY_INIT1 => init1(a[0]),
+        INOTIFY_RM_WATCH => rm_watch(a[0], a[1] as i32),
+        _ => Err(-38),
+    }
+}

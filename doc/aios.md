@@ -387,6 +387,9 @@ release_deferred から (Linux の fput から f_op->release)。
 ディスクのルート (root の区画の ext2 / ext4 と FAT の boot の区画) は block::mount_root (Linux の init/do_mounts.c の
 mount_root) が読んで fs::init にわたす。/dev の装置のノードは、装置を見つけたもの (block の区画、modprobe で起こした gpu・
 sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる前なら覚えておいて、できたときに作る)。
+システムコールも、なくても動くところ (epoll と eventfd、timerfd、inotify の init1 と rm_watch、socket、module) のものは
+それぞれのファイルにあり、main.rs が syscall::register で番号ごとに置く (Linux の COND_SYSCALL: 置いていなければ、ない
+システムコールとして ENOSYS)。装置とソケットの mmap (画面、音の再生の口、TCP のソケット: Linux の f_op->mmap) は file.rs。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

@@ -1665,6 +1665,42 @@ pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {
     me.files.as_ref().is_some_and(|files| files.private() && files.get().get(fd).is_none())
 }
 
+/// 装置やソケットの mmap (Linux の f_op->mmap: syscall.rs の mmap から)。画面 (/dev/fb0) はフレームバッファのページを
+/// そのまま、音の再生の口はリングバッファのページ、TCP のソケットはページのない写し (Linux の tcp_mmap: 書くもの、
+/// 実行するものは EPERM。さわると SIGBUS。Linux は getsockopt の TCP_ZEROCOPY_RECEIVE で受けたものをここに入れる)。
+/// 写せない種類は None (ENODEV)
+pub fn mmap_dev(kind: &Kind, fr: &FileRef, off: usize, len: usize, prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+    use crate::vm::Backing;
+    const ENODEV: i64 = 19;
+    Some(match kind {
+        Kind::Fb => (|| {
+            let g = crate::gpu::get().ok_or(-ENODEV)?;
+            if off + len > crate::vm::pg_up(g.size()) {
+                return Err(crate::why::inval());
+            }
+            Ok(Backing::Pages { pages: g.pages.clone(), off, hold: None })
+        })(),
+        Kind::SndPcm => crate::sound::mmap_pages(off, len).map(|pages| Backing::Pages { pages, off, hold: None }),
+        Kind::Inet(u) if u.borrow().tcp => {
+            const PROT_WRITE: u64 = 2;
+            const PROT_EXEC: u64 = 4;
+            const EPERM: i64 = 1;
+            if prot & (PROT_WRITE | PROT_EXEC) != 0 {
+                Err(-EPERM)
+            } else {
+                Ok(Backing::Pages { pages: Rc::new(alloc::vec::Vec::new()), off, hold: Some(fr.clone()) })
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// 大きなロックなしのソケット (AF_UNIX) の read / write (syscall::fast。unix.rs の fast_rw)
+#[inline]
+pub fn fast_rw_sock(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) -> Option<i64> {
+    crate::unix::fast_rw(me, fd, va, len, write)
+}
+
 /// 大きなロックなしの /dev/null・/dev/zero・/dev/urandom の read / write (syscall::fast)。書くものは捨てるだけ
 /// (ユーザーのメモリも読まない。Linux と同じ)、/dev/null は読むと 0、/dev/zero は 0 で埋める (/dev/urandom の
 /// 読みはふつうの道)。開いたファイルの種類と読み書きの口はあとで変わらないので、借りずに見る

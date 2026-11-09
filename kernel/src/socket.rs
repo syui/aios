@@ -1690,3 +1690,34 @@ Udp: 0 0 0 0 0 0 0 0 0\n",
         estab
     )
 }
+
+/// システムコール (main.rs が syscall::register で置く。Linux の net/socket.c)
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[SOCKET, SOCKETPAIR, BIND, LISTEN, ACCEPT, ACCEPT4, CONNECT, GETSOCKNAME, GETPEERNAME, SENDTO, RECVFROM, SETSOCKOPT, GETSOCKOPT, SHUTDOWN, SENDMSG, RECVMSG, RECVMMSG, SENDMMSG]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    match n {
+        SOCKET => socket(a[0], a[1], a[2]),
+        SOCKETPAIR => socketpair(a[0], a[1], a[2], a[3] as usize),
+        BIND => bind(a[0], a[1] as usize, a[2] as usize),
+        LISTEN => listen(a[0], a[1]),
+        ACCEPT => accept(a[0], a[1] as usize, a[2] as usize, 0),
+        ACCEPT4 => accept(a[0], a[1] as usize, a[2] as usize, a[3]),
+        CONNECT => connect(a[0], a[1] as usize, a[2] as usize),
+        GETSOCKNAME => getsockname(a[0], a[1] as usize, a[2] as usize),
+        GETPEERNAME => getpeername(a[0], a[1] as usize, a[2] as usize),
+        SENDTO => sendto(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
+        RECVFROM => recvfrom(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
+        SETSOCKOPT => setsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
+        GETSOCKOPT => getsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
+        SHUTDOWN => shutdown(a[0], a[1]),
+        SENDMSG => sendmsg(a[0], a[1] as usize, a[2]),
+        RECVMSG => recvmsg(a[0], a[1] as usize, a[2]),
+        RECVMMSG => mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false, a[4] as usize),
+        SENDMMSG => mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true, 0),
+        _ => Err(-38),
+    }
+}

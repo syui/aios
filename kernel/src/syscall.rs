@@ -4,7 +4,6 @@ use crate::cell::Bkl;
 use crate::cred;
 use crate::proc;
 use crate::signal::{self, Restart};
-use crate::socket;
 use crate::sysfile;
 use crate::timer;
 use crate::trap::TrapFrame;
@@ -363,6 +362,30 @@ fn int(v: u64) -> i64 {
     v as i32 as i64
 }
 
+// ---- なくても動くところが持つシステムコール (Linux の COND_SYSCALL) ----
+// epoll と eventfd、timerfd、inotify (init1 と rm_watch)、socket、module のシステムコールは、それぞれのファイルにあり、main.rs
+// が起動のときに register で番号ごとに置く (Linux では入れずに作ると sys_ni_syscall で ENOSYS: ここも置いていなければ、
+// ないシステムコールとして ENOSYS)。切ったところ (aios.off=) は、ここより前に part_of が ENOSYS にする
+
+/// 番号ごとに呼ぶもの: (番号, 引数) から答え
+pub type Handler = fn(u64, &[u64; 6]) -> Result<i64, i64>;
+const NR_TABLE: usize = 512;
+static HANDLERS: [core::sync::atomic::AtomicUsize; NR_TABLE] = [const { core::sync::atomic::AtomicUsize::new(0) }; NR_TABLE];
+
+/// 番号 nrs のシステムコールを h で (起動のとき: main.rs)
+pub fn register(nrs: &[u64], h: Handler) {
+    for &n in nrs {
+        HANDLERS[n as usize].store(h as usize, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[inline]
+fn handler(nr: u64) -> Option<Handler> {
+    let h = HANDLERS.get(nr as usize)?.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: register が Handler だけを置く
+    (h != 0).then(|| unsafe { core::mem::transmute::<usize, Handler>(h) })
+}
+
 /// システムコールを動かす。待ちが割り込まれて EINTR になったら、その情報を返す
 pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
@@ -452,17 +475,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
-        EVENTFD2 => crate::epoll::eventfd2(a[0], a[1]),
-        TIMERFD_CREATE => crate::timerfd::create(a[0], a[1]),
-        TIMERFD_SETTIME => crate::timerfd::settime(a[0], a[1], a[2] as usize, a[3] as usize),
-        TIMERFD_GETTIME => crate::timerfd::gettime(a[0], a[1] as usize),
-        INOTIFY_INIT1 => crate::inotify::init1(a[0]),
         INOTIFY_ADD_WATCH => sysfile::inotify_add_watch(a[0], a[1] as usize, a[2] as u32),
-        INOTIFY_RM_WATCH => crate::inotify::rm_watch(a[0], a[1] as i32),
-        EPOLL_CREATE1 => crate::epoll::create1(a[0]),
-        EPOLL_CTL => crate::epoll::ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
-        EPOLL_PWAIT => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait(int(a[0]), a[1] as usize, int(a[2]), crate::epoll::ms_to_ns(int(a[3])))),
-        EPOLL_PWAIT2 => signal::wait_mask(a[4] as usize).and_then(|_| crate::epoll::pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize)),
         // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
@@ -526,24 +539,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FSTAT => sysfile::fstat(a[0], a[1] as usize),
         PPOLL => signal::wait_mask(a[3] as usize).and_then(|_| sysfile::ppoll(a[0] as usize, a[1] as usize, a[2] as usize)),
         PSELECT6 => signal::pselect_mask(a[5] as usize).and_then(signal::wait_mask).and_then(|_| sysfile::pselect6(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
-        SOCKET => socket::socket(a[0], a[1], a[2]),
-        SOCKETPAIR => socket::socketpair(a[0], a[1], a[2], a[3] as usize),
-        BIND => socket::bind(a[0], a[1] as usize, a[2] as usize),
-        LISTEN => socket::listen(a[0], a[1]),
-        ACCEPT => socket::accept(a[0], a[1] as usize, a[2] as usize, 0),
-        ACCEPT4 => socket::accept(a[0], a[1] as usize, a[2] as usize, a[3]),
-        CONNECT => socket::connect(a[0], a[1] as usize, a[2] as usize),
-        GETSOCKNAME => socket::getsockname(a[0], a[1] as usize, a[2] as usize),
-        GETPEERNAME => socket::getpeername(a[0], a[1] as usize, a[2] as usize),
-        SENDTO => socket::sendto(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
-        RECVFROM => socket::recvfrom(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize, a[5] as usize),
-        SETSOCKOPT => socket::setsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
-        GETSOCKOPT => socket::getsockopt(a[0], a[1], a[2], a[3] as usize, a[4] as usize),
-        SHUTDOWN => socket::shutdown(a[0], a[1]),
-        SENDMSG => socket::sendmsg(a[0], a[1] as usize, a[2]),
-        RECVMSG => socket::recvmsg(a[0], a[1] as usize, a[2]),
-        RECVMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false, a[4] as usize),
-        SENDMMSG => socket::mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true, 0),
         // I/O の優先度はない (どれも同じ)。聞かれたら IOPRIO_CLASS_NONE
         IOPRIO_SET => Ok(0),
         IOPRIO_GET => Ok(0),
@@ -676,9 +671,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         UNAME => sys_uname(a[0] as usize),
         SETHOSTNAME => sys_sethostname(a[0] as usize, a[1] as usize),
         REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
-        INIT_MODULE => sys_init_module(a[0] as usize, a[1] as usize),
-        FINIT_MODULE => sys_finit_module(a[0]),
-        DELETE_MODULE => sys_delete_module(a[0] as usize),
         SYSINFO => sys_sysinfo(a[0] as usize),
         GETRLIMIT => sys_prlimit(a[0], 0, a[1] as usize),
         PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
@@ -704,15 +696,19 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
         // io_uring はない (libuv などは ENOSYS を見て、ふつうのシステムコールで動く)
         IO_URING_SETUP | IO_URING_ENTER | IO_URING_REGISTER => Err(-ENOSYS),
-        n => {
-            // 番号ごとに起動して最初の 1 回だけ (glibc の pthread_create の clone3 のように、毎回呼ぶものがある)
-            if unknown_first(n) {
-                let p = proc::current();
-                println!("syscall: unknown {} by {} (pid {}; ENOSYS, shown once per number)", n, p.comm(), p.pid);
+        // なくても動くところ (epoll と eventfd、timerfd、inotify、socket、module) が持つもの (register で置いたもの)
+        n => match handler(n) {
+            Some(h) => h(n, &a),
+            None => {
+                // 番号ごとに起動して最初の 1 回だけ (glibc の pthread_create の clone3 のように、毎回呼ぶものがある)
+                if unknown_first(n) {
+                    let p = proc::current();
+                    println!("syscall: unknown {} by {} (pid {}; ENOSYS, shown once per number)", n, p.comm(), p.pid);
+                }
+                crate::why::note(crate::why::Code::NoSys, -ENOSYS, n);
+                Err(-ENOSYS)
             }
-            crate::why::note(crate::why::Code::NoSys, -ENOSYS, n);
-            Err(-ENOSYS)
-        }
+        },
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
     crate::debug::trace_sys_exit(nr, r.unwrap_or_else(|e| e));
@@ -1070,7 +1066,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         },
         // パイプの読み書きで、眠らず起こさずにすむもの (file::Pipe::fast_rw)
         READ | WRITE => match crate::file::Pipe::fast_rw(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE)
-            .or_else(|| crate::unix::fast_rw(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
+            .or_else(|| crate::file::fast_rw_sock(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
             .or_else(|| if nr == READ { crate::file::fast_read_file(p, a[0], a[1] as usize, a[2] as usize) } else { None })
             .or_else(|| crate::file::fast_dev(p, a[0], a[1] as usize, a[2] as usize, nr == WRITE))
         {
@@ -1276,27 +1272,11 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                 path = Some(p.clone());
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
-            // 画面 (/dev/fb0): フレームバッファのページをそのまま
-            crate::file::Kind::Fb => {
-                let g = crate::gpu::get().ok_or(-ENODEV)?;
-                if off + len > pg_up(g.size()) {
-                    return Err(crate::why::inval());
-                }
-                Backing::Pages { pages: g.pages.clone(), off, hold: None }
-            }
-            // 音の再生の口: リングバッファのページ
-            crate::file::Kind::SndPcm => Backing::Pages { pages: crate::sound::mmap_pages(off, len)?, off, hold: None },
-            // TCP のソケット (Linux の tcp_mmap: 書くもの、実行するものは EPERM。ページはなく、さわると SIGBUS。
-            // Linux は getsockopt の TCP_ZEROCOPY_RECEIVE で受けたものをここに入れる)
-            crate::file::Kind::Inet(u) if u.borrow().tcp => {
-                const PROT_EXEC: u64 = 4;
-                const EPERM: i64 = 1;
-                if prot & (PROT_WRITE | PROT_EXEC) != 0 {
-                    return Err(-EPERM);
-                }
-                Backing::Pages { pages: alloc::rc::Rc::new(alloc::vec::Vec::new()), off, hold: Some(fr.clone()) }
-            }
-            _ => return Err(-ENODEV),
+            // 装置やソケット (画面、音の再生の口、TCP のソケット: file.rs の mmap_dev。Linux の f_op->mmap)。ほかは ENODEV
+            k => match crate::file::mmap_dev(k, &fr, off, len, prot) {
+                Some(b) => b?,
+                None => return Err(-ENODEV),
+            },
         }
     } else {
         if len == 0 {
@@ -1940,27 +1920,6 @@ fn sys_waitid(idtype: u64, id: i64, info: usize, options: u64, rusage: usize) ->
 }
 
 /// 電源を切る / 再起動する (PSCI)
-/// init_module(image, len, params): 札 (module.rs) をメモリで
-fn sys_init_module(image: usize, len: usize) -> R {
-    let mut img = alloc::vec![0u8; len.min(4096)];
-    proc::current().pt().copy_in(&mut img, image).ok_or(-EFAULT)?;
-    crate::module::load(&img)
-}
-
-/// finit_module(fd, params, flags): 札のファイル (/usr/lib/modules/NAME.ko) を読む
-fn sys_finit_module(fd: u64) -> R {
-    let f = proc::current().files().get(fd).cloned().ok_or(-9)?;
-    let mut img = alloc::vec![0u8; 4096];
-    let n = f.borrow_mut().read(&mut img)?;
-    img.truncate(n);
-    crate::module::load(&img)
-}
-
-fn sys_delete_module(name: usize) -> R {
-    let name = proc::current().pt().copy_in_str(name, 64).ok_or(-EFAULT)?;
-    crate::module::unload(core::str::from_utf8(&name).map_err(|_| crate::why::inval())?)
-}
-
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     if !proc::current().cred.capable(cred::CAP_SYS_BOOT) {
         return Err(-(cred::EPERM));

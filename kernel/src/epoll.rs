@@ -395,3 +395,23 @@ pub fn readiness(e: &EventFdRef) -> (bool, bool, bool) {
     let ev = e.borrow();
     (ev.count > 0, ev.count < u64::MAX - 1, false)
 }
+
+/// システムコール (main.rs が syscall::register で置く。Linux の fs/eventpoll.c と fs/eventfd.c)
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[EVENTFD2, EPOLL_CREATE1, EPOLL_CTL, EPOLL_PWAIT, EPOLL_PWAIT2]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    // C の int 引数: 下位 32bit を符号拡張する
+    let int = |v: u64| v as i32 as i64;
+    match n {
+        EVENTFD2 => eventfd2(a[0], a[1]),
+        EPOLL_CREATE1 => create1(a[0]),
+        EPOLL_CTL => ctl(int(a[0]), a[1], int(a[2]), a[3] as usize),
+        EPOLL_PWAIT => crate::signal::wait_mask(a[4] as usize).and_then(|_| pwait(int(a[0]), a[1] as usize, int(a[2]), ms_to_ns(int(a[3])))),
+        EPOLL_PWAIT2 => crate::signal::wait_mask(a[4] as usize).and_then(|_| pwait2(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize)),
+        _ => Err(-38),
+    }
+}
