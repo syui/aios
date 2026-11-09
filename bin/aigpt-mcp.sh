@@ -2,13 +2,25 @@
 cd "$(dirname "$0")/.."
 PATH=$HOME/.local/bin:$PATH
 signers="$GPG_SIG"
+signed() {
+  st=$(env ${1:+"GNUPGHOME=$1"} git -C "$src" log -1 --format=%G?)
+  fpr=$(env ${1:+"GNUPGHOME=$1"} git -C "$src" log -1 --format=%GP)
+  case $st in G | U) ;; *) fpr= ;; esac
+  case " $signers " in *" ${fpr:-none} "*) return 0 ;; esac
+  return 1
+}
 fetch() {
   src=$(mktemp -d "${TMPDIR:-/tmp}/aigpt-mcp-$1.XXXXXX") || return 1
   git clone -q --depth 1 --filter=blob:none --no-checkout "https://git.syui.ai/ai/$1" "$src" || { rm -rf "$src"; return 1; }
-  st=$(git -C "$src" log -1 --format=%G?)
-  fpr=$(git -C "$src" log -1 --format=%GP)
-  case $st in G | U) ;; *) fpr= ;; esac
-  case " $signers " in *" ${fpr:-none} "*) return 0 ;; esac
+  signed && return 0
+  if [ "$st" = E ] && keys=$(mktemp -d "${TMPDIR:-/tmp}/aigpt-mcp-keys.XXXXXX"); then
+    curl -fsSL https://git.syui.ai/ai.syui.ai.gpg | gpg --homedir "$keys" --batch -q --import > /dev/null 2>&1
+    signed "$keys"
+    r=$?
+    gpgconf --homedir "$keys" --kill all > /dev/null 2>&1
+    rm -rf "$keys"
+    [ $r = 0 ] && return 0
+  fi
   echo "aigpt-mcp.sh: ai/$1 $(git -C "$src" rev-parse --short HEAD) is not signed by ai (%G? = $st${fpr:+, $fpr}; signers: $signers)" >&2
   rm -rf "$src"
   return 1
