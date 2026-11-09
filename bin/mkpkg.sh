@@ -1,19 +1,8 @@
 #!/bin/bash
-# PKGBUILD から pacman と同じ形のパッケージ (NAME-VER-REL-ARCH.pkg.tar.zst) を作る小さな makepkg
-#   bin/mkpkg.sh pkg/rust/NAME [pkg/c/NAME pkg/shell/NAME ...]
-#   pkg/KIND/NAME は repo/aarch64/KIND/ に置く (rust: 本体、c: C の拡張、shell: aish の拡張、desktop: デスクトップ)
-#   (PKGDEST で変えられる)。リポジトリの db は bin/mkrepo.sh
-# Arch の上なら本物の makepkg でも同じものができる: cd pkg/rust/NAME && CARCH=aarch64 makepkg
-#
-# できること: source の git+URL (#tag= #commit= #branch=)、http(s)、PKGBUILD の横のファイル、
-#   sha256sums (SKIP 以外は確かめる)、pkgver()、prepare()、build()、package()、
-#   install= (入れたあとなどに aipkg が動かす post_install などの関数。パッケージの .INSTALL になる)。
-#   check() や分割パッケージ、アーカイブの展開はしない (prepare() で tar xf する)
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 CARCH=aarch64
 PKGDEST=${PKGDEST:-}
-# 作った人: PACKAGER がなければ git の user.name と user.email (makepkg の PACKAGER と同じ形)
 if [ -z "$PACKAGER" ]; then
   name=$(git -C "$root" config user.name 2>/dev/null)
   mail=$(git -C "$root" config user.email 2>/dev/null)
@@ -22,12 +11,10 @@ if [ -z "$PACKAGER" ]; then
 fi
 export CARCH PACKAGER
 
-# sha256 FILE: (Mac なら shasum)
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
 
-# fetch_git DIR URL FRAGMENT: DIR に URL の指定された版だけを取ってくる
 fetch_git() {
   local dir=$1 url=$2 frag=$3 ref
   case $frag in
@@ -39,8 +26,6 @@ fetch_git() {
   esac
   case $ref in
     HEAD|refs/heads/*)
-      # pkgver() が git rev-list --count で版を作る (0.0.1.r32.gf9cc881) ので、履歴はみな取る (ファイルの中身は
-      # 使うものだけ)。--depth 1 では数がいつも 1 で、版のくらべがハッシュの字の順になっていた
       [ -f "$dir/.git/shallow" ] && rm -rf "$dir"
       [ -d "$dir/.git" ] || git init -q "$dir"
       git -C "$dir" fetch -q --filter=blob:none "$url" "$ref" ;;
@@ -48,11 +33,9 @@ fetch_git() {
       [ -d "$dir/.git" ] || git init -q "$dir"
       git -C "$dir" fetch -q --depth 1 "$url" "$ref" ;;
   esac
-  # prepare() の変更は毎回やりなおす
   git -C "$dir" checkout -q --force FETCH_HEAD
 }
 
-# pkginfo KEY VALUE...: 空でない値ごとに "KEY = VALUE" の行
 pkginfo() {
   local k=$1 v
   shift
@@ -64,7 +47,6 @@ pkginfo() {
 
 make_one() (
   startdir=$(cd "$1" && pwd)
-  # pkg/KIND/NAME → repo/aarch64/KIND (rust, c, shell, desktop)
   dest=$PKGDEST
   if [ -z "$dest" ]; then
     kind=$(basename "$(dirname "$startdir")")
@@ -72,14 +54,12 @@ make_one() (
   fi
   mkdir -p "$dest"
   cd "$startdir"
-  # shellcheck disable=SC1091
   source ./PKGBUILD
   work=$root/build/makepkg/$pkgname
   srcdir=$work/src
   pkgdir=$work/pkg
   export startdir srcdir pkgdir
   mkdir -p "$srcdir"
-  # 前に作ったときのもの (c_deps や zig_env を使わなくなったら残らないように)
   rm -f "$srcdir/.c_deps" "$srcdir/.toolchain"
 
   i=0
@@ -101,8 +81,6 @@ make_one() (
       *://*)
         [ -n "$name" ] || name=${src##*/}
         if [ ! -f "$srcdir/$name" ]; then
-          # 配布元やプロキシーが途中で切ることがある (Connection reset by peer で gawk、iproute2、libdrm の 3 つが落ちた)。
-          # ftp.gnu.org がまるごとつながらないときは、GNU のミラーの入口 ftpmirror.gnu.org から (sha256 は下で確かめる)
           curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 -o "$srcdir/$name.part" "$src" || {
             case $src in https://ftp.gnu.org/gnu/*) ;; *) exit 1 ;; esac
             echo "==> $pkgname: ftp.gnu.org failed, trying ftpmirror.gnu.org" >&2
@@ -146,9 +124,6 @@ make_one() (
   pkgarch=$CARCH
   [ "${arch[*]}" = any ] && pkgarch=any
   size=$(du -sb --apparent-size "$pkgdir" | cut -f1)
-  # 作るときに広げたライブラリ (pkg/c/zig.sh の c_deps が書きとめた NAME=VER-REL)。静的にリンクしたものは
-  # この中に入っているので、aish の pkg_check が、それより新しくなったら rebuild に出す。
-  # 作った Zig (zig_env が書く zig=ZIG_VERSION-ZIG_REL) も。いまの zig.sh とちがえば、これも rebuild に
   cdeps=()
   for f in "$srcdir/.c_deps" "$srcdir/.toolchain"; do
     if [ -f "$f" ]; then
@@ -176,11 +151,9 @@ make_one() (
     pkginfo makedepend "${cdeps[@]}"
   } > "$pkgdir/.PKGINFO"
 
-  # 同じパッケージの古い版は消す
   rm -f "$dest/$pkgname"-[0-9]*-[0-9]*-"$pkgarch".pkg.tar.zst
   out=$dest/$pkgname-$fullver-$pkgarch.pkg.tar.zst
   cd "$pkgdir"
-  # .PKGINFO を先頭に、持ち主は root で
   mapfile -t top < <(LC_ALL=C ls -A | grep -vx '.PKGINFO')
   tar --numeric-owner --owner=0 --group=0 -cf - .PKGINFO "${top[@]}" | zstd -q -T0 -19 -f -o "$out"
   echo "==> made ${out#"$root"/}"
