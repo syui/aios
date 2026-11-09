@@ -1,23 +1,44 @@
 #!/bin/sh
 cd "$(dirname "$0")/.."
 PATH=$HOME/.local/bin:$PATH
+signers="466554110F5881784365F04A924183B3813D5C25 F33093BEA3A4BEA4521901A17CBAC5071C3EB395"
+fetch() {
+  src=$(mktemp -d "${TMPDIR:-/tmp}/aigpt-mcp-$1.XXXXXX") || return 1
+  git clone -q --depth 1 --filter=blob:none --no-checkout "https://git.syui.ai/ai/$1" "$src" || { rm -rf "$src"; return 1; }
+  st=$(git -C "$src" log -1 --format=%G?)
+  fpr=$(git -C "$src" log -1 --format=%GP)
+  case $st in G | U) ;; *) fpr= ;; esac
+  case " $signers " in *" ${fpr:-none} "*) return 0 ;; esac
+  echo "aigpt-mcp.sh: ai/$1 $(git -C "$src" rev-parse --short HEAD) is not signed by ai (%G? = $st${fpr:+, $fpr}; signers: $signers)" >&2
+  rm -rf "$src"
+  return 1
+}
 install() {
   host=$(rustc -vV | sed -n 's/^host: //p')
-  cargo install -q --locked --git "https://git.syui.ai/ai/$1" "$2" --root "$HOME/.local" --target "$host"
+  fetch "$1" || return 1
+  git -C "$src" reset -q --hard &&
+    cargo install -q --locked --path "$src" --root "$HOME/.local" --target "$host"
+  r=$?
+  rm -rf "$src"
+  return $r
 }
 if [ "$1" = --build ]; then
-  command -v aigpt > /dev/null || install gpt aigpt >&2 || exit 1
+  command -v aigpt > /dev/null || install gpt >&2 || exit 1
   cfg=${XDG_CONFIG_HOME:-$HOME/.config}/ai.syui.log
   if [ ! -f "$cfg/config.json" ]; then
+    fetch log || exit 1
     mkdir -p "$cfg" &&
-      curl -fsSL https://git.syui.ai/ai/log/raw/branch/main/public/config.json -o "$cfg/config.json.part" &&
-      mv "$cfg/config.json.part" "$cfg/config.json" || exit 1
+      git -C "$src" show HEAD:public/config.json > "$cfg/config.json.part" &&
+      mv "$cfg/config.json.part" "$cfg/config.json"
+    r=$?
+    rm -rf "$src"
+    [ $r = 0 ] || exit 1
   fi
   aigpt read-core > /dev/null 2>&1 || aigpt pull >&2 || exit 1
-  if ! command -v ailog > /dev/null && ! pgrep -f 'cargo install .*ai/log ailog' > /dev/null; then
-    (trap '' HUP; install log ailog && echo "ailog: ok") > /tmp/ailog-install.log 2>&1 &
+  if ! command -v ailog > /dev/null && ! pgrep -f 'aigpt-mcp-log\.' > /dev/null; then
+    (trap '' HUP; install log && echo "ailog: ok") > /tmp/ailog-install.log 2>&1 &
   fi
   exit
 fi
-command -v aigpt > /dev/null || install gpt aigpt >&2 || exit 1
+command -v aigpt > /dev/null || install gpt >&2 || exit 1
 exec aigpt server
