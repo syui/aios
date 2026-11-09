@@ -18,23 +18,14 @@
 // /etc/sysctl.d/*.conf を読んでここに書く (aios apply の sysctl)
 use alloc::format;
 use alloc::string::{String, ToString};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 use crate::spinlock::SpinLock;
 
-
-/// inotify にためておくできごとの数。こえたら IN_Q_OVERFLOW
-pub static INOTIFY_MAX_QUEUED: AtomicUsize = AtomicUsize::new(16384);
-/// 1 つの inotify の watch の数
-pub static INOTIFY_MAX_WATCHES: AtomicUsize = AtomicUsize::new(8192);
-/// euid や egid を変えた・setuid のものを exec した・読めないものを exec したプロセスの dumpable (0 作らない、1 作る、
-/// 2 root の権利で。Linux の fs.suid_dumpable: 既定 0)
-pub static SUID_DUMPABLE: AtomicUsize = AtomicUsize::new(0);
-/// タイムスライス (tick)。走りはじめてからタイマの割り込みがこれだけ来たら、ほかに順番をゆずる
-pub static SCHED_TIMESLICE_TICKS: AtomicUsize = AtomicUsize::new(1);
-/// 起こされたもの (あまり CPU を使っていない) が、走っているもの (使っている) に割りこむか
-pub static SCHED_WAKEUP_PREEMPT: AtomicUsize = AtomicUsize::new(1);
-/// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで
-pub static MIN_FREE_PAGES: AtomicUsize = AtomicUsize::new(1024);
+// 値そのものは持ち主のところに (Linux の sysctl の表と同じく、ここは名前とその値の置き場を結ぶだけ)
+use crate::exec::SUID_DUMPABLE;
+use crate::inotify::{INOTIFY_MAX_QUEUED, INOTIFY_MAX_WATCHES};
+use crate::kalloc::MIN_FREE_PAGES;
+use crate::proc::{SCHED_TIMESLICE_TICKS, SCHED_WAKEUP_PREEMPT};
 
 pub struct Entry {
     /// /proc/sys の下のパス

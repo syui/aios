@@ -7,6 +7,10 @@ use crate::vm::{pg_down, pg_up, Backing, PageTable, PROT_EXEC, PROT_READ, PROT_R
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// euid や egid を変えた・setuid のものを exec した・読めないものを exec したプロセスの dumpable (0 作らない、1 作る、
+/// 2 root の権利で。Linux の fs.suid_dumpable: 既定 0。/proc/sys は sysctl.rs)
+pub static SUID_DUMPABLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 pub const USER_STACK_TOP: usize = 0x40_0000_0000;
 /// スタックの領域 (RLIMIT_STACK と同じ 8 MiB。触れたところだけページを作る)
 const USER_STACK_SIZE: usize = 8 * 1024 * 1024;

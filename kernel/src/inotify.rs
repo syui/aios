@@ -79,6 +79,11 @@ pub fn fdinfo(n: &InotifyRef) -> alloc::string::String {
     s
 }
 
+/// ためておくできごとの数。こえたら IN_Q_OVERFLOW (/proc/sys は sysctl.rs)
+pub static INOTIFY_MAX_QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(16384);
+/// 1 つの inotify の watch の数
+pub static INOTIFY_MAX_WATCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(8192);
+
 /// IN_ACCESS を待つ見張りの数 (0 でなければ、大きなロックなしの read はしない: file::fast_read_file)
 pub static ACCESS_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -174,7 +179,7 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     if old.is_some() && mask & IN_MASK_CREATE != 0 {
         return Err(-EEXIST);
     }
-    if old.is_none() && n.borrow().watches.len() >= crate::sysctl::INOTIFY_MAX_WATCHES.load(core::sync::atomic::Ordering::Relaxed) {
+    if old.is_none() && n.borrow().watches.len() >= INOTIFY_MAX_WATCHES.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(-ENOSPC);
     }
     let new = match old {
@@ -239,7 +244,7 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
         if b.queue.back() == Some(&ev) {
             return;
         }
-        if b.queue.len() >= crate::sysctl::INOTIFY_MAX_QUEUED.load(core::sync::atomic::Ordering::Relaxed) {
+        if b.queue.len() >= INOTIFY_MAX_QUEUED.load(core::sync::atomic::Ordering::Relaxed) {
             // あふれた: 最後に 1 つだけ IN_Q_OVERFLOW (wd は -1)
             let mut o = Vec::with_capacity(16);
             o.extend_from_slice(&(-1i32).to_le_bytes());

@@ -320,7 +320,7 @@ fn reclaim_file(want: usize, exclude: usize) -> usize {
 /// ユーザーへ戻る前に: 空きが少なければ回収しておく
 pub fn balance() {
     let free = crate::kalloc::nfree();
-    let low = crate::sysctl::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let low = crate::kalloc::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
     if free < low {
         reclaim(low * 4 - free, 0);
     }

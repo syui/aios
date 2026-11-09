@@ -1,5 +1,5 @@
 // 切れるところ (カーネルの実験のため): 起動の引数 aios.off=NAME,NAME (kernel.json の off のあるもの: extra と quirk と、
-// core の ns (新しく作れなくするだけ)) で、
+// core の ns と vdso (新しく作れなくする・写さないだけ)) で、
 // それがないカーネルのように起こす。システムコールは ENOSYS (Linux でそれを入れずに作ったときと同じ)、装置は起こさない、
 // quirk は手当てをしない。どれを切れて、切るとどうなるかは kernel.json の off (test/kernel-json.py が NAMES とくらべる)。
 // 起動のときに「parts: off NAME ...」と出す。aish の box (aish-vm) が、切って起こしてテストを動かし、切らないときとくらべる。

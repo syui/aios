@@ -59,7 +59,7 @@ pub fn on_fault() -> bool {
     if crate::fail::take_page_hit() {
         return me == 1;
     }
-    if crate::kalloc::nfree() >= crate::sysctl::MIN_FREE_PAGES.load(Relaxed) {
+    if crate::kalloc::nfree() >= crate::kalloc::MIN_FREE_PAGES.load(Relaxed) {
         return true;
     }
     if let Some(v) = dying() {

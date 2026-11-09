@@ -161,6 +161,17 @@ pub fn runtime() -> &'static Runtime {
     RT.get()
 }
 
+/// kalloc::init の前に: ランタイムサービスの RAM (キャッシュできるもの。ファームウェアがあとも使う) を kalloc によけてもらう
+/// (Linux の efi_init の reserve_regions が memblock_reserve を呼ぶのと同じ向き: kalloc は UEFI を知らない)
+pub fn reserve_runtime() {
+    let rt = RT.get();
+    for d in &rt.map[..rt.n] {
+        if d[3] & MEM_WB != 0 {
+            crate::kalloc::reserve(d[1] as usize, d[2] as usize * crate::memlayout::PGSIZE);
+        }
+    }
+}
+
 /// 設定テーブルの GUID: ACPI 2.0 (8868e871-e4f1-11d3-bc22-0080c73c8881)、ACPI (eb9d2d30-2d88-11d3-9a16-0090273fc14d)、
 /// SMBIOS 3 (f2fd1544-9794-4a2c-992e-e5bbcf20e394)、SMBIOS (eb9d2d31-2d88-11d3-9a16-0090273fc14d)
 const ACPI20_GUID: [u8; 16] = [0x71, 0xe8, 0x68, 0x88, 0xf1, 0xe4, 0xd3, 0x11, 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81];

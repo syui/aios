@@ -110,6 +110,8 @@ pub extern "C" fn kmain() -> ! {
     unsafe { core::arch::asm!("msr tpidr_el1, xzr") };
     // 出力の場所 (UART) は DTB で決まるので、何よりも先に DTB を読む
     let has_dtb = dtb::init();
+    // UEFI から起動したなら、そのコマンドライン (EFI スタブの efi.rs が覚えたもの) を DTB の bootargs より先に
+    dtb::set_cmdline(efi::cmdline());
     uart::early_init();
     println!();
     println!("aios {} (aarch64)", env!("AIOS_RELEASE"));
@@ -129,6 +131,8 @@ pub extern "C" fn kmain() -> ! {
             memlayout::set_ram(base as usize, size as usize);
         }
     }
+    // UEFI のランタイムサービスの RAM はよけて (Linux の efi_init と memblock)
+    efi::reserve_runtime();
     let early = kalloc::init(heap::boot_extra());
     heap::init(early);
     println!("kalloc: {} pages free", kalloc::nfree());

@@ -234,6 +234,20 @@ impl Kmem {
     }
 }
 
+/// buddy に積まない物理メモリの範囲の数の上限 (UEFI のランタイムの領域: efi.rs の RT_MAX と同じ)
+const RESV_MAX: usize = 64;
+/// buddy に積まない物理メモリ (物理アドレス, バイト数)。init の前に置く (Linux の memblock_reserve: efi.rs の reserve_runtime が
+/// UEFI のランタイムサービスの RAM を。kalloc はファームウェアを知らない)
+static RESV: crate::cell::Early<([(usize, usize); RESV_MAX], usize)> = crate::cell::Early::new(([(0, 0); RESV_MAX], 0));
+
+/// init の前に: [pa, pa + len) を buddy に積まない
+pub fn reserve(pa: usize, len: usize) {
+    let (r, n) = RESV.get_mut();
+    assert!(*n < RESV_MAX, "kalloc: too many reserved ranges");
+    r[*n] = (pa, len);
+    *n += 1;
+}
+
 /// 起動のとき (heap::init の前に)。early バイトをカーネルのすぐうしろから先に切り出して返し (起動のときのヒープの区画:
 /// Linux の memblock のように buddy を作る前に。前のアロケータと同じ場所になる)、残りを buddy に積む
 pub fn init(early: usize) -> Option<*mut u8> {
@@ -243,13 +257,12 @@ pub fn init(early: usize) -> Option<*mut u8> {
     let mut k = KMEM.lock();
     let mut lo = idx_of(pg_round_up(&raw const __kernel_end as usize) as *mut u8);
     let hi = ((phystop() - ram_base()) / PGSIZE).min(MAX_PAGES);
-    // UEFI のランタイムサービスの RAM (ファームウェアがあとも使う。efirt.rs) はよける: ページの番号 [a, b) を順に
-    let mut resv = [(0usize, 0usize); crate::efi::RT_MAX];
+    // よけるところ (reserve: UEFI のランタイムサービスの RAM など。ファームウェアがあとも使う) はよける: ページの番号 [a, b) を順に
+    let mut resv = [(0usize, 0usize); RESV_MAX];
     let mut nr = 0;
-    let rt = crate::efi::runtime();
-    for d in &rt.map[..rt.n] {
-        let (pa, len) = (d[1] as usize, d[2] as usize * PGSIZE);
-        if d[3] & crate::efi::MEM_WB == 0 || pa + len <= ram_base() || pa >= ram_base() + hi * PGSIZE {
+    let (given, ng) = RESV.val();
+    for &(pa, len) in &given[..ng] {
+        if pa + len <= ram_base() || pa >= ram_base() + hi * PGSIZE {
             continue;
         }
         let a = (pa.max(ram_base()) - ram_base()) / PGSIZE;
@@ -481,7 +494,7 @@ pub fn refs(page: *mut u8) -> u16 {
 /// page cycle (/proc/ai/ctl): 空いているページを (MIN_FREE_PAGES だけ残して) みな取ってから、取った順に返す。RAM を
 /// ひととおり使ったあとの様子を作る (返ったページから続いたものが作れるか: heap の grow)。回したページの数
 pub fn cycle() -> usize {
-    let keep = crate::sysctl::MIN_FREE_PAGES.load(Ordering::Relaxed);
+    let keep = MIN_FREE_PAGES.load(Ordering::Relaxed);
     let mut head: *mut usize = ptr::null_mut();
     let mut n = 0;
     while nfree() > keep {
@@ -497,6 +510,9 @@ pub fn cycle() -> usize {
     }
     n
 }
+
+/// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで (Linux の vm.min_free_kbytes。/proc/sys は sysctl.rs)
+pub static MIN_FREE_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1024);
 
 /// 空いているページの数 (KMEM を変えたあとに書く: システムコールのたびに swap::balance が読むので、ロックを取らずに)
 static NFREE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);

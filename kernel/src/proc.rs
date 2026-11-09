@@ -1574,6 +1574,11 @@ fn wake_list(head: usize, l: fn(&mut Proc) -> &mut Link, f: impl Fn(&Proc) -> bo
     n
 }
 
+/// タイムスライス (tick)。走りはじめてからタイマの割り込みがこれだけ来たら、ほかに順番をゆずる (/proc/sys は sysctl.rs)
+pub static SCHED_TIMESLICE_TICKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+/// 起こされたもの (あまり CPU を使っていない) が、走っているもの (使っている) に割りこむか
+pub static SCHED_WAKEUP_PREEMPT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
 /// CPU ごとの「EL0 へ戻るときにゆずる」印 (起こされたものを、タイムスライスの終わりまで待たせない)
 static RESCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -1582,7 +1587,7 @@ static RESCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// 割りこめる。sysctl kernel.sched_wakeup_preempt で止められる
 fn preempt(woken: u32, running: u32, cpu: usize) {
     use core::sync::atomic::Ordering;
-    if crate::sysctl::SCHED_WAKEUP_PREEMPT.load(Ordering::Relaxed) == 0 || running < woken.saturating_add(2) {
+    if SCHED_WAKEUP_PREEMPT.load(Ordering::Relaxed) == 0 || running < woken.saturating_add(2) {
         return;
     }
     RESCHED.fetch_or(1 << cpu, Ordering::AcqRel);
@@ -2033,7 +2038,7 @@ pub fn execve_target(t: exec::Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Res
 fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     // dumpable (Linux の begin_new_exec): ふつうは 1 にもどる。読めないプログラムか、exec の前の euid と uid (egid と gid)
     // がちがえば fs.suid_dumpable。setuid / setgid で euid / egid が変わっても (下の commit_creds)
-    let suid_dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    let suid_dumpable = crate::exec::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let mut dumpable = if img.nondump || p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid { suid_dumpable } else { 1 };
     let (old_euid, old_egid, old_fsuid, old_fsgid) = (p.cred.euid, p.cred.egid, p.cred.fsuid, p.cred.fsgid);
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
@@ -2199,7 +2204,7 @@ pub fn account_tick() {
 
 /// タイマの割り込みから: いま動いているものがタイムスライスを使いきったか (ゆずるか)
 pub fn slice_expired() -> bool {
-    let ticks = crate::sysctl::SCHED_TIMESLICE_TICKS.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    let ticks = SCHED_TIMESLICE_TICKS.load(core::sync::atomic::Ordering::Relaxed) as u32;
     cur().is_some_and(|i| procs()[i].slice >= ticks)
 }
 

@@ -338,7 +338,7 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 | type | 中身 | 1 行 |
 |---|---|---|
-| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what (測れるものは bench。切れるものは off: ns だけで、新しく作れなくするだけ) |
+| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what (測れるものは bench。切れるものは off: ns と vdso だけで、新しく作れなくする・写さないだけ) |
 | `extra` | Linux の口 (syscall、/proc、ioctl、ファイルシステム)、aios の機能、ドライバ。なくてもカーネルは動く | 1 つのファイル: name、src、what (切れるものは off、測れるものは bench) |
 | `quirk` | ある機械やプログラムのつごうで入れた手当て (Linux の quirk と同じ考え)。外せる条件 (`until`) がある | 1 つの手当て: name、src (いくつものファイル)、cause、what、until、test、off |
 
@@ -357,6 +357,12 @@ audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp �
 プロセスやファイルに持たせるもの (AppArmor のラベル、landlock の層、開いたときに覚えたもの) は、core の中立の名前の欄
 (Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。いまの aios の順が Linux と
 ちがうところ (すでにあるファイルを開くときは AppArmor が先、など) は、フックに「aios の順」と書いてある。
+Linux で持ち主のところにある値やつなぎは、aios でも持ち主に置く: /proc/sys の値 (fs.suid_dumpable は exec.rs、
+kernel.sched_* は proc.rs、vm.min_free_kbytes は kalloc.rs、fs.inotify.* は inotify.rs) は持ち主が持ち、sysctl.rs は名前と
+置き場を結ぶ表だけ (Linux の sysctl の表と同じ)。UEFI から起動したときのコマンドラインとランタイムサービスの RAM は、
+EFI スタブ (efi.rs) が覚えたものを main.rs が dtb (set_cmdline: Linux の EFI スタブが /chosen/bootargs に書くのと同じ役) と
+kalloc (reserve: Linux の memblock_reserve) へ渡す (dtb と kalloc は UEFI を知らない)。vDSO は Linux の arm64 と同じく core
+(exec が写し、signal がシグナルから戻る入口に使う。off はそのまま)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 
@@ -1622,7 +1628,7 @@ Linux より弱いところ (KPTI、BHB のループ、ファームウェアの�
 
 ### カーネルの砂場 (aios.off= と aish の box)
 
-`off` のあるもの (extra と quirk と、core の ns) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる
+`off` のあるもの (extra と quirk と、core の ns と vdso) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる
 (kernel/src/parts.rs。システムコールはそれを入れずに作った Linux と同じ ENOSYS、装置は起こさない、quirk は手当てをしない。
 切るとどうなるかはそれぞれの `off`)。起動のときに `parts: off NAME ...` と出る。切ってもほかが動くか、quirk がまだ要るかを
 確かめるのは aish の `box` (aish-vm): 切って VM (`-snapshot`) を起こし、CI と同じテスト (vm-check と vm-ctests) を動かして、

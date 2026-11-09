@@ -136,7 +136,7 @@ pub fn mem_json() -> String {
         pg,
         crate::memlayout::ram_size() / pg,
         crate::kalloc::nfree(),
-        crate::sysctl::MIN_FREE_PAGES.load(Relaxed),
+        crate::kalloc::MIN_FREE_PAGES.load(Relaxed),
         blocks.iter().map(|n| format!("{}", n)).collect::<alloc::vec::Vec<_>>().join(","),
         hot,
         hsize,

@@ -228,7 +228,7 @@ fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
 pub fn changed(p: &mut proc::Proc, new: &Cred) {
     let o = &p.cred;
     if (new.euid != o.euid || new.egid != o.egid || new.fsuid != o.fsuid || new.fsgid != o.fsgid) && p.mm.is_some() {
-        p.mm().dumpable = crate::sysctl::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+        p.mm().dumpable = crate::exec::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     }
 }
 
