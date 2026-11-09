@@ -218,7 +218,7 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
         }
         "raw" => raw_dump(num()?),
         "pcmiss" => crate::vm::MISS_LOG.store(arg != "off", core::sync::atomic::Ordering::Relaxed),
-        "strace" => crate::syscall::strace_set(arg.as_bytes()),
+        "strace" => crate::trace::strace_set(arg.as_bytes()),
         "bkl" if arg == "reset" => crate::lockstat::reset(),
         "bkl" if arg == "selftest" => crate::cell::selftest(),
         "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),

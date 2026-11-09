@@ -243,30 +243,43 @@ pub struct Ops;
 
 pub static OPS: Ops = Ops;
 
-/// 区画のノード (major, minor) なら区画を引く (ない装置は ENXIO)。名前は区画の名前
-fn source(t: crate::vm::SwapTarget, name: String) -> Result<(Source, String), i64> {
-    match t {
-        crate::vm::SwapTarget::Dev(ma, mi) => {
+/// swapon と swapoff (main.rs が syscall::register で置く。Linux の COND_SYSCALL(swapon))
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[SWAPON, SWAPOFF]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    let (src, name) = source(a[0] as usize)?;
+    if n == crate::syscall::nr::SWAPON { on(src, name) } else { off(&src) }.map(|_| 0)
+}
+
+/// swapon / swapoff の path: ブロックデバイスのノード (区画を引く。ない装置は ENXIO。名前は区画の名前) か、ふつうの
+/// ファイル (名前はパス)
+fn source(pathp: usize) -> Result<(Source, String), i64> {
+    use crate::cred;
+    use crate::vfs;
+    if !cred::current().capable(cred::CAP_SYS_ADMIN) {
+        return Err(-cred::EPERM);
+    }
+    let path = crate::sysfile::user_str(pathp)?;
+    let ino = crate::sysfile::at(crate::sysfile::AT_FDCWD, pathp, 0)?;
+    match ino.meta().mode & vfs::S_IFMT {
+        vfs::S_IFBLK => {
+            let (ma, mi) = crate::fs::dev_of(&ino).ok_or_else(|| crate::why::inval())?;
             let p = block::part_of_dev(ma, mi).ok_or(-6)?;
             let n = block::part_name(&p);
             Ok((Source::Part(p), n))
         }
-        crate::vm::SwapTarget::File(i) => Ok((Source::File(i), name)),
+        vfs::S_IFREG => {
+            let name = if path.starts_with('/') { path } else { alloc::format!("/{}/{}", crate::proc::current().files().cwd, path).replace("//", "/") };
+            Ok((Source::File(ino), name))
+        }
+        _ => Err(crate::why::inval()),
     }
 }
 
 impl crate::vm::Swap for Ops {
-    fn on(&self, t: crate::vm::SwapTarget, name: String) -> Result<(), i64> {
-        let (src, name) = source(t, name)?;
-        on(src, name)
-    }
-    fn off(&self, t: &crate::vm::SwapTarget) -> Result<(), i64> {
-        let src = match t {
-            crate::vm::SwapTarget::Dev(ma, mi) => Source::Part(block::part_of_dev(*ma, *mi).ok_or(-6)?),
-            crate::vm::SwapTarget::File(i) => Source::File(i.clone()),
-        };
-        off(&src)
-    }
     fn alloc(&self) -> Option<Slot> {
         alloc()
     }

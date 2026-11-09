@@ -9,9 +9,7 @@ type R = Result<i64, i64>;
 const EFAULT: i64 = 14;
 const EPERM: i64 = 1;
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::put_user as out;
 
 pub const SYSCALLS: &[u64] = {
     use crate::syscall::nr::*;

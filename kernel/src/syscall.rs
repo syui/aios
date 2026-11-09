@@ -307,56 +307,6 @@ fn part_of(nr: u64) -> Option<crate::parts::Part> {
     })
 }
 
-/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll、futex、syscall)
-fn sys_span(nr: u64) -> Option<&'static str> {
-    use nr::*;
-    Some(match nr {
-        OPENAT => "sysfile:openat",
-        CLOSE => "sysfile:close",
-        READ => "sysfile:read",
-        WRITE => "sysfile:write",
-        PREAD64 => "sysfile:pread64",
-        PWRITE64 => "sysfile:pwrite64",
-        LSEEK => "sysfile:lseek",
-        NEWFSTATAT => "sysfile:newfstatat",
-        FSTAT => "sysfile:fstat",
-        STATX => "sysfile:statx",
-        FACCESSAT | FACCESSAT2 => "sysfile:faccessat",
-        READLINKAT => "sysfile:readlinkat",
-        GETDENTS64 => "sysfile:getdents64",
-        MKDIRAT => "sysfile:mkdirat",
-        UNLINKAT => "sysfile:unlinkat",
-        RENAMEAT | RENAMEAT2 => "sysfile:renameat",
-        SYMLINKAT => "sysfile:symlinkat",
-        LINKAT => "sysfile:linkat",
-        TRUNCATE | FTRUNCATE => "sysfile:truncate",
-        FALLOCATE => "sysfile:fallocate",
-        FSYNC | FDATASYNC | SYNC | SYNCFS => "sysfile:fsync",
-        FCHMODAT | FCHMODAT2 => "sysfile:fchmodat",
-        UTIMENSAT => "sysfile:utimensat",
-        PPOLL | PSELECT6 => "sysfile:poll",
-        SOCKET => "socket:socket",
-        SOCKETPAIR => "socket:socketpair",
-        BIND => "socket:bind",
-        LISTEN => "socket:listen",
-        ACCEPT | ACCEPT4 => "socket:accept",
-        CONNECT => "socket:connect",
-        SENDTO => "socket:sendto",
-        RECVFROM => "socket:recvfrom",
-        SENDMSG => "socket:sendmsg",
-        RECVMSG => "socket:recvmsg",
-        SHUTDOWN => "socket:shutdown",
-        SETSOCKOPT | GETSOCKOPT => "socket:sockopt",
-        EPOLL_CTL => "epoll:ctl",
-        EPOLL_PWAIT | EPOLL_PWAIT2 => "epoll:wait",
-        FUTEX => "futex:futex",
-        FUTEX_WAITV => "futex:waitv",
-        CLONE | CLONE3 => "syscall:clone",
-        WAIT4 => "syscall:wait4",
-        _ => return None,
-    })
-}
-
 /// C の int 引数: 下位 32bit を符号拡張する
 fn int(v: u64) -> i64 {
     v as i32 as i64
@@ -405,7 +355,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     p.orig_x0 = a[0];
     p.last_sys = (nr, a[0], a[1]);
     p.why.clear();
-    count(nr);
+    crate::debug::count_sys(nr);
     // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
     crate::oom::check();
     // seccomp: かかっていれば、フィルタの答えにしたがう (security::seccomp_permit_syscall。s は写して持つ: user notification
@@ -417,7 +367,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             crate::security::Permit::Errno(e) => {
                 tf.x[0] = e as u64;
                 crate::debug::trace_sys_exit(nr, e);
-                strace(nr, &a, Err(e));
+                crate::debug::strace(nr, &a, Err(e));
                 crate::why::note(crate::why::Code::Seccomp, e, 0);
                 crate::why::done(nr, e, &a);
                 return None;
@@ -436,7 +386,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             crate::security::Permit::Return(v) => {
                 tf.x[0] = v as u64;
                 crate::debug::trace_sys_exit(nr, v);
-                strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
+                crate::debug::strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
                 return None;
             }
             // listener を待つあいだにシグナルで割りこまれた: Linux の ERESTARTSYS (RESTART_BEFORE_RECV で受ける前なら
@@ -454,7 +404,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     {
         tf.x[0] = (-ENOSYS) as u64;
         crate::debug::trace_sys_exit(nr, -ENOSYS);
-        strace(nr, &a, Err(-ENOSYS));
+        crate::debug::strace(nr, &a, Err(-ENOSYS));
         crate::why::note(crate::why::Code::PartOff, -ENOSYS, 0);
         crate::why::done(nr, -ENOSYS, &a);
         return None;
@@ -463,19 +413,19 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     if let Some(e) = crate::debug::should_fail_syscall(nr) {
         tf.x[0] = (-e) as u64;
         crate::debug::trace_sys_exit(nr, -e);
-        strace(nr, &a, Err(-e));
+        crate::debug::strace(nr, &a, Err(-e));
         crate::why::note(crate::why::Code::Injected, -e, 0);
         crate::why::done(nr, -e, &a);
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
-    let _p = if crate::debug::PROF_ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::debug::span) } else { None };
+    let _p = crate::debug::sys_span(nr);
     // 監査 (audit_syscall_entry: 入れもののあるスレッドだけ)
     if p.audit.is_some() {
         crate::security::audit_syscall_entry(nr, &a);
     }
-    // 監査が名前を集めているなら、パスの名前と親やあるものを前に引く (sysfile::audit_pre)
-    let plan = if p.audit.is_some() && !crate::security::audit_dummy_context() { sysfile::audit_pre(nr, &a) } else { None };
+    // 監査が名前を集めているなら、パスの名前と親やあるものを前に引く (audit.rs の audit_pre)
+    let plan = if p.audit.is_some() && !crate::security::audit_dummy_context() { crate::security::audit_names_pre(nr, &a) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         CLOSE_RANGE => sysfile::close_range(a[0], a[1], a[2]),
@@ -490,8 +440,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         OPENAT2 => sysfile::openat2(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
         MKNODAT => sysfile::mknodat(int(a[0]), a[1] as usize, a[2], a[3]),
-        SWAPON => sysfile::swapon(a[0] as usize),
-        SWAPOFF => sysfile::swapoff(a[0] as usize),
         MKDIRAT => sysfile::mkdirat(int(a[0]), a[1] as usize, a[2]),
         UNLINKAT => sysfile::unlinkat(int(a[0]), a[1] as usize, a[2]),
         SYMLINKAT => sysfile::symlinkat(a[0] as usize, int(a[1]), a[2] as usize),
@@ -704,11 +652,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     crate::debug::trace_sys_exit(nr, r.unwrap_or_else(|e| e));
     if proc::current().audit.is_some() {
         if let Some(plan) = plan {
-            sysfile::audit_post(plan, &r);
+            crate::security::audit_names_post(plan, &r);
         }
         crate::security::audit_syscall_exit(r.unwrap_or_else(|e| e));
     }
-    strace(nr, &a, r);
+    crate::debug::strace(nr, &a, r);
     // しくじったわけ (whylog.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
     if let Err(e) = r
         && nr != RSEQ
@@ -726,122 +674,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
 }
 
 const EINTR_: i64 = 4;
-
-/// /proc/sysstat: スレッドごと (名前と番号) の、システムコールの回数 (空回りを探す調べもの用)。
-/// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える。
-/// 数えるのは一度読まれてから (ふだんは数えない: 表を引くのが重く、pid ごとに増えつづけるので)。
-/// 表が COUNTS_MAX をこえたら、新しいものは数えない
-static COUNTS: Bkl<alloc::collections::BTreeMap<([u8; 16], u32, u64), u64>> = Bkl::new(alloc::collections::BTreeMap::new());
-static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
-
-static COUNTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-const COUNTS_MAX: usize = 4096;
-
-fn count(nr: u64) {
-    if !COUNTING.load(core::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    // スレッドの名前 (pthread_setname_np) ごと
-    let p = proc::current();
-    let m = COUNTS.get();
-    if let Some(n) = m.get_mut(&(p.comm, p.pid, nr)) {
-        *n += 1;
-    } else if m.len() < COUNTS_MAX {
-        m.insert((p.comm, p.pid, nr), 1);
-    }
-}
-
-/// 数えたものを多い順に (読むと 0 にもどる)
-pub fn sysstat() -> alloc::string::String {
-    use core::fmt::Write;
-    use core::sync::atomic::Ordering;
-    let m = core::mem::take(COUNTS.get());
-    if !COUNTING.swap(true, Ordering::Relaxed) {
-        return "(数えはじめました。もう一度読むと、そのあいだの回数が出ます)\n".into();
-    }
-    let mut v: alloc::vec::Vec<_> = m.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
-    let mut s = alloc::string::String::new();
-    for ((comm, tid, nr), n) in v.into_iter().take(40) {
-        let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
-        let _ = writeln!(s, "{:>10} {:>4} {:>5} {}", n, nr, tid, core::str::from_utf8(&comm[..len]).unwrap_or("?"));
-    }
-    for (nr, c) in FAST.iter().enumerate() {
-        let n = c.swap(0, Ordering::Relaxed);
-        if n > 1000 {
-            let _ = writeln!(s, "{:>10} {:>4} (fast)", n, nr);
-        }
-    }
-    s
-}
-
-/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを kmsg に出す (調べもの用。dmesg と aish-sys の strace で読む)。
-/// 名前の頭に + をつけると、うまくいったものも出す。名前は , で区切っていくつも書ける
-static STRACE: Bkl<[u8; 16]> = Bkl::new([0; 16]);
-
-pub fn strace_set(name: &[u8]) {
-    let n = name.iter().position(|&c| c == b'\n' || c == 0).unwrap_or(name.len()).min(15);
-    let s = STRACE.get();
-    s.fill(0);
-    s[..n].copy_from_slice(&name[..n]);
-}
-
-pub fn strace_get() -> alloc::string::String {
-    let s = &*STRACE.get();
-    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
-    alloc::format!("{}\n", core::str::from_utf8(&s[..n]).unwrap_or(""))
-}
-
-/// いまのプロセスを strace で見ているか (見るなら、うまくいったものも出すか)
-fn strace_on() -> Option<bool> {
-    let s = &*STRACE.get();
-    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
-    if n == 0 {
-        return None;
-    }
-    let all = s[0] == b'+';
-    let name = if all { &s[1..n] } else { &s[..n] };
-    let p = proc::current_leader();
-    name.split(|&c| c == b',').any(|n| !n.is_empty() && p.comm.starts_with(n)).then_some(all)
-}
-
-/// 名前が書かれていなければ (ふだん) なにもしない。それを見るところだけ呼ぶ側に
-#[inline]
-fn strace(nr: u64, a: &[u64], r: R) {
-    if STRACE.get()[0] != 0 {
-        strace_named(nr, a, r);
-    }
-}
-
-#[cold]
-fn strace_named(nr: u64, a: &[u64], r: R) {
-    let Some(all) = strace_on() else { return };
-    let e = r.unwrap_or_else(|e| e);
-    // EAGAIN / EINTR / ETIMEDOUT はよくあるので出さない
-    if !all && (r.is_ok() || matches!(-e, 11 | 4 | 110)) {
-        return;
-    }
-    let p = proc::current_leader();
-    let n = name(nr).map_or(alloc::format!("{}", nr), |n| n.to_ascii_lowercase());
-    // パスをとる引数は名前で (番地では何を開いたかわからない)
-    let path_arg = match n.as_str() {
-        // execve がうまくいったあとは、もう新しいプログラムのメモリなので読まない
-        "execve" if r.is_err() => Some(0),
-        "execveat" if r.is_err() => Some(1),
-        "chdir" | "truncate" | "statfs" | "acct" | "swapon" => Some(0),
-        "openat" | "openat2" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
-        _ => None,
-    };
-    let arg = |i: usize| match path_arg {
-        Some(k) if k == i => alloc::format!("{:?}", user_str(a[i] as usize, 96)),
-        _ => alloc::format!("{:#x}", a[i]),
-    };
-    // 大きな値 (mmap の番地など) は 16 進で
-    let ret = if e >= 0x10000 { alloc::format!("{:#x}", e) } else { alloc::format!("{}", e) };
-    let line = alloc::format!("strace [{} {}] t={} {}({}, {}, {}) = {}\n", p.pid, proc::current().pid, crate::timer::ticks(), n, arg(0), arg(1), arg(2), ret);
-    // kmsg にだけ (シリアルの端末にまざらないように。aish-sys の strace と dmesg が読む)
-    crate::kmsg::push(&line);
-}
 
 /// strace で見せるためのユーザーの文字列 (NUL まで、max バイトまで。読めなければ "?")
 pub fn user_str(va: usize, max: usize) -> alloc::string::String {
@@ -862,9 +694,7 @@ pub fn user_str(va: usize, max: usize) -> alloc::string::String {
 
 type R = Result<i64, i64>;
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::put_user as out;
 
 fn timespec(ns: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -1055,11 +885,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     };
     tf.x[0] = r as u64;
     // /proc/sysstat を読みはじめてから、速い道で終わったものだけ数える
-    if COUNTING.load(core::sync::atomic::Ordering::Relaxed)
-        && let Some(c) = FAST.get(nr as usize)
-    {
-        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
+    crate::debug::count_fast(nr);
     crate::debug::trace_sys_fast(nr, a[0], r);
     true
 }

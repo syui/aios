@@ -639,7 +639,7 @@ static PROCS: Raw<[Proc; NPROC]> = Raw::new([const { Proc::UNUSED }; NPROC]);
 static CURRENT: PerCpu<Option<usize>> = PerCpu::new([None; crate::smp::MAXCPU]);
 static SCHEDULER: PerCpu<Context> = PerCpu::new([Context::ZERO; crate::smp::MAXCPU]);
 
-fn cur() -> Option<usize> {
+pub fn cur() -> Option<usize> {
     *CURRENT.get()
 }
 
@@ -717,7 +717,7 @@ static NEXT_PID: Bkl<u32> = Bkl::new(1);
 /// 表は大きなロックが守る。ロックなしで触ってよいのは、いまのスレッドの Proc (current()) のうち、そのスレッドの
 /// ほかにはロックを持っても変えないところ (fd の表を持つ Rc、アドレス空間、資格情報を読むなど: syscall::fast)。
 /// Proc ごとに守り手がちがうので Bkl にはしない (Bkl にすると、速い道の current() がみな unlocked に出る)
-fn procs() -> &'static mut [Proc; NPROC] {
+pub fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *PROCS.ptr() }
 }
 
@@ -982,6 +982,15 @@ static ON_CPU: [core::sync::atomic::AtomicUsize; crate::smp::MAXCPU] = [const { 
 /// 使っている Proc (Unused でないもの)
 pub fn live() -> impl Iterator<Item = &'static mut Proc> {
     live_from(0).map(|i| &mut procs()[i]).filter(|p| p.state != State::Unused)
+}
+
+/// いまのプロセスのユーザーのメモリへ写す・から写す (Linux の copy_to_user と copy_from_user)。写せなければ EFAULT
+pub fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
+    current().pt().copy_out(va, b).ok_or(-14)
+}
+
+pub fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
+    current().pt().copy_in(b, va).ok_or(-14)
 }
 
 pub fn current() -> &'static mut Proc {
@@ -1617,26 +1626,6 @@ fn preempt(woken: u32, running: u32, cpu: usize) {
 pub fn take_resched() -> bool {
     let bit = 1 << crate::smp::id();
     RESCHED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 && RESCHED.fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
-}
-
-/// Ctrl-P: プロセスの一覧 (デバッグ用)
-pub fn dump() {
-    println!();
-    for (i, p) in procs().iter().enumerate() {
-        if p.state == State::Unused {
-            continue;
-        }
-        let st = match p.state {
-            State::Runnable => "runnable",
-            State::Running => "running",
-            State::Sleeping => "sleeping",
-            State::Zombie => "zombie",
-            State::Unused => "unused",
-        };
-        let tf = p.tf_ref();
-        println!("[{}] pid {} tgid {} ppid {} {} chan {:#x} wake_at {} pc {:#x} x8 {} x0 {:#x}", i, p.pid, p.tgid, p.ppid, st, p.chan, p.wake_at, tf.elr, tf.x[8], tf.x[0]);
-    }
-    println!("ticks {} current {:?}", crate::timer::ticks(), cur());
 }
 
 static POLL: u8 = 0;
@@ -2433,47 +2422,6 @@ pub fn fp_snapshot() -> FpState {
 
 pub fn fp_restore(f: &FpState) {
     unsafe { fp_load(f) };
-}
-
-pub fn threads_text() -> alloc::string::String {
-    let mut out = alloc::format!("ticks {}\n  PID  TGID ST CHAN             SYSCALL ARG0             ARG1                 WAKE     RUNS NAME\n", crate::timer::ticks());
-    for p in live() {
-        if p.state == State::Unused {
-            continue;
-        }
-        let st = match p.state {
-            State::Running | State::Runnable => 'R',
-            State::Sleeping if p.nointr => 'D',
-            State::Sleeping => 'S',
-            State::Zombie => 'Z',
-            State::Unused => 'X',
-        };
-        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
-        out.push_str(&alloc::format!(
-            "{:5} {:5} {}  {:16x} {:7} {:16x} {:16x} {:8} {:8} {}\n",
-            p.pid,
-            p.tgid,
-            st,
-            p.chan,
-            p.last_sys.0,
-            p.last_sys.1,
-            p.last_sys.2,
-            p.wake_at,
-            p.nrun,
-            core::str::from_utf8(&p.comm[..n]).unwrap_or("?")
-        ));
-        // poll / select で眠っているなら、見張っている印 (パイプは pipe:[N] の N と同じ)。* は何でも
-        if p.state == State::Sleeping && p.chan == poll_chan() {
-            match &p.poll_keys {
-                None => out.push_str("      poll *\n"),
-                Some(k) => {
-                    let ks: Vec<alloc::string::String> = k.iter().take(16).map(|k| alloc::format!("{}", k & 0xffffff)).collect();
-                    out.push_str(&alloc::format!("      poll {}\n", ks.join(" ")));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// いまのプロセスが io_sleepable の中か (プロセスがなければ false)

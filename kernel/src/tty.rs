@@ -836,9 +836,7 @@ const TIOCGPTN: u64 = 0x80045430;
 const TIOCSPTLCK: u64 = 0x40045431;
 const TIOCSIG: u64 = 0x40045436;
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::put_user as out;
 
 fn inp<const N: usize>(va: usize) -> Result<[u8; N], i64> {
     let mut b = [0u8; N];

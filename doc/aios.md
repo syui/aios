@@ -1060,7 +1060,7 @@ EXIT のフィルタをくらべて同じ (172 行)。
   CREATE)、ある・読む (NORMAL)、ない (UNKNOWN: inode なし)、相対パスの親は いまのディレクトリ、mkdirat (あれば PARENT
   だけ)、symlinkat (中身の名前が UNKNOWN、親、CREATE)、linkat (元の NORMAL、親、CREATE)、renameat2 (親 2 つ、元の DELETE、
   行き先の CREATE。上書きなら行き先の DELETE も)、unlinkat (親と DELETE)、chmod や chown は変える前の mode と持ち主。
-  syscall::dispatch がシステムコールの前とあとに sysfile::audit_pre / audit_post を呼ぶ (名前を集めているときだけ)
+  syscall::dispatch がシステムコールの前とあとに security::audit_names_pre / audit_names_post (audit.rs の audit_pre / audit_post) を呼ぶ (名前を集めているときだけ)
 - 名前で合わせるルール: WATCH (auditctl -w FILE -p wa) は名前の inode がそのファイルのもの (いまあるもの、なければ
   前に見たもの: 消す・動かすシステムコールでも合う)、INODE、DEVMAJOR、OBJ_UID、FILETYPE も名前で。perm の w は
   ディレクトリを変えるもの (mkdir、unlink、rename など) もふくむ (Linux の write のクラス)

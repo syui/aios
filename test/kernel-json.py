@@ -98,7 +98,7 @@ for e in entries:
         err("%s: bench %s is not a file" % (e.get("name"), b.split()[0]))
 spans = set()
 for s in sources:
-    # 注釈 (// から) はのぞく。syscall.rs の sys_span は、システムコールの番号ごとの区間の名前の表
+    # 注釈 (// から) はのぞく。prof.rs の sys_span は、システムコールの番号ごとの区間の名前の表
     code = "\n".join(l.split("//")[0] for l in text[s].split("\n"))
     spans.update(re.findall(r'(?:prof|debug)::span\("([^"]+)"\)', code))
     m = re.search(r"fn sys_span\(.*?\n\}\n", code, re.S)
@@ -176,7 +176,7 @@ CORE_USES_EXTRA_MAX = 0
 # vfs.rs (Linux の register_filesystem: 装置のないファイルシステム)、syscall.rs (Linux の COND_SYSCALL: システムコールの表)、
 # file.rs の FileOps (Linux の file_operations: 開いたものの中身)。見せるだけのもの (lockstat) は extra の procfs と aiproc から
 BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
-                "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs",
+                "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs and syscall.rs",
                 "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs",
                 "epoll": "file.rs (FileOps) and syscall.rs", "timerfd": "file.rs (FileOps) and syscall.rs",
                 "block": "file.rs (FileOps, register_blkdev)", "gpu": "file.rs (FileOps, register_chrdev)", "input": "file.rs (FileOps, register_chrdev)",
@@ -187,7 +187,7 @@ BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp":
                 "socket": "file.rs (FileOps) and syscall.rs", "netlink": "file.rs (FileOps)", "netif": "file.rs (FileOps::ioctl)",
                 "net": "file.rs (FileOps) and timer.rs (every)", "splice": "syscall.rs (register, register_fast_splice)",
                 "lockstat": "aiproc.rs and procfs.rs (only extra calls it)", "locks": "file.rs (FileLocks) and syscall.rs",
-                "posix_timers": "syscall.rs and timer.rs (every)", "lsm_syscalls": "syscall.rs"}
+                "posix_timers": "syscall.rs and timer.rs (every)", "lsm_syscalls": "syscall.rs", "sysrq": "debug.rs (sysrq)"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

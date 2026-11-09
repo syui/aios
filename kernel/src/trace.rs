@@ -4,7 +4,8 @@
 // 始まるプロセスのシステムコールとフォルトだけ。切りかえ・眠り・起こし・割り込み・ディスクはみな)、trace off で止め、
 // trace clear で空にする。止まっているあいだは、それぞれの場所で ON を 1 回見るだけ。
 // 読むと 1 行 1 つの JSON: はじめの行が様子 (on、filter、events、dropped、names: tid → 名前)、あとは出来事 (t、c、p、k ...)。
-// 読みはじめ (位置 0) で 1 度作り、続きはそれを切って返す (読むたびに作りなおさない)
+// 読みはじめ (位置 0) で 1 度作り、続きはそれを切って返す (読むたびに作りなおさない)。
+// /proc/strace (しくじったシステムコールを kmsg に) と /proc/sysstat (スレッドごとのシステムコールの回数) もここ
 use crate::cell::Bkl;
 use crate::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
@@ -246,6 +247,17 @@ pub struct Ops;
 pub static OPS: Ops = Ops;
 
 impl crate::debug::Tracer for Ops {
+    fn strace(&self, nr: u64, a: &[u64], r: Result<i64, i64>) {
+        strace(nr, a, r);
+    }
+    fn count(&self, nr: u64) {
+        count(nr);
+    }
+    fn count_fast(&self, nr: u64) {
+        if let Some(c) = FAST.get(nr as usize) {
+            c.fetch_add(1, Relaxed);
+        }
+    }
     fn sys_enter(&self, nr: u64, a0: u64) {
         sys_enter(nr, a0);
     }
@@ -385,4 +397,111 @@ fn comm_str(c: &[u8; 16]) -> &str {
 
 fn sysname(nr: u16) -> String {
     crate::syscall::name(nr as u64).map_or_else(|| alloc::format!("{}", nr), |n| n.to_ascii_lowercase())
+}
+
+// ---- /proc/sysstat と /proc/strace (システムコールの回数と、しくじったものを kmsg に) ----
+
+/// /proc/sysstat: スレッドごと (名前と番号) の、システムコールの回数 (空回りを探す調べもの用)。
+/// 大きなロックの中で数える。fast の道 (getpid、clock_gettime など) は番号ごとに別に数える。
+/// 数えるのは一度読まれてから (ふだんは数えない: 表を引くのが重く、pid ごとに増えつづけるので)。
+/// 表が COUNTS_MAX をこえたら、新しいものは数えない
+static COUNTS: crate::cell::Bkl<alloc::collections::BTreeMap<([u8; 16], u32, u64), u64>> = crate::cell::Bkl::new(alloc::collections::BTreeMap::new());
+static FAST: [core::sync::atomic::AtomicU64; 512] = [const { core::sync::atomic::AtomicU64::new(0) }; 512];
+
+const COUNTS_MAX: usize = 4096;
+
+fn count(nr: u64) {
+    // スレッドの名前 (pthread_setname_np) ごと
+    let p = crate::proc::current();
+    let m = COUNTS.get();
+    if let Some(n) = m.get_mut(&(p.comm, p.pid, nr)) {
+        *n += 1;
+    } else if m.len() < COUNTS_MAX {
+        m.insert((p.comm, p.pid, nr), 1);
+    }
+}
+
+/// 数えたものを多い順に (読むと 0 にもどる)
+pub fn sysstat() -> alloc::string::String {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    let m = core::mem::take(COUNTS.get());
+    if !crate::debug::COUNT_ON.swap(true, Ordering::Relaxed) {
+        return "(数えはじめました。もう一度読むと、そのあいだの回数が出ます)\n".into();
+    }
+    let mut v: alloc::vec::Vec<_> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut s = alloc::string::String::new();
+    for ((comm, tid, nr), n) in v.into_iter().take(40) {
+        let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let _ = writeln!(s, "{:>10} {:>4} {:>5} {}", n, nr, tid, core::str::from_utf8(&comm[..len]).unwrap_or("?"));
+    }
+    for (nr, c) in FAST.iter().enumerate() {
+        let n = c.swap(0, Ordering::Relaxed);
+        if n > 1000 {
+            let _ = writeln!(s, "{:>10} {:>4} (fast)", n, nr);
+        }
+    }
+    s
+}
+
+/// /proc/strace に書いた名前で始まるプロセスの、失敗したシステムコールを kmsg に出す (調べもの用。dmesg と aish-sys の strace で読む)。
+/// 名前の頭に + をつけると、うまくいったものも出す。名前は , で区切っていくつも書ける
+static STRACE: crate::cell::Bkl<[u8; 16]> = crate::cell::Bkl::new([0; 16]);
+
+pub fn strace_set(name: &[u8]) {
+    let n = name.iter().position(|&c| c == b'\n' || c == 0).unwrap_or(name.len()).min(15);
+    let s = STRACE.get();
+    s.fill(0);
+    s[..n].copy_from_slice(&name[..n]);
+    crate::debug::STRACE_ON.store(n != 0, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn strace_get() -> alloc::string::String {
+    let s = &*STRACE.get();
+    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
+    alloc::format!("{}\n", core::str::from_utf8(&s[..n]).unwrap_or(""))
+}
+
+/// いまのプロセスを strace で見ているか (見るなら、うまくいったものも出すか)
+fn strace_on() -> Option<bool> {
+    let s = &*STRACE.get();
+    let n = s.iter().position(|&c| c == 0).unwrap_or(16);
+    if n == 0 {
+        return None;
+    }
+    let all = s[0] == b'+';
+    let name = if all { &s[1..n] } else { &s[..n] };
+    let p = crate::proc::current_leader();
+    name.split(|&c| c == b',').any(|n| !n.is_empty() && p.comm.starts_with(n)).then_some(all)
+}
+
+/// 名前が書かれているあいだ (debug::STRACE_ON) だけ呼ばれる
+fn strace(nr: u64, a: &[u64], r: Result<i64, i64>) {
+    let Some(all) = strace_on() else { return };
+    let e = r.unwrap_or_else(|e| e);
+    // EAGAIN / EINTR / ETIMEDOUT はよくあるので出さない
+    if !all && (r.is_ok() || matches!(-e, 11 | 4 | 110)) {
+        return;
+    }
+    let p = crate::proc::current_leader();
+    let n = crate::syscall::name(nr).map_or(alloc::format!("{}", nr), |n| n.to_ascii_lowercase());
+    // パスをとる引数は名前で (番地では何を開いたかわからない)
+    let path_arg = match n.as_str() {
+        // execve がうまくいったあとは、もう新しいプログラムのメモリなので読まない
+        "execve" if r.is_err() => Some(0),
+        "execveat" if r.is_err() => Some(1),
+        "chdir" | "truncate" | "statfs" | "acct" | "swapon" => Some(0),
+        "openat" | "openat2" | "newfstatat" | "readlinkat" | "faccessat" | "faccessat2" | "unlinkat" | "mkdirat" | "mknodat" | "fchmodat" | "fchownat" | "utimensat" | "statx" | "renameat" | "renameat2" | "linkat" | "inotify_add_watch" => Some(1),
+        _ => None,
+    };
+    let arg = |i: usize| match path_arg {
+        Some(k) if k == i => alloc::format!("{:?}", crate::syscall::user_str(a[i] as usize, 96)),
+        _ => alloc::format!("{:#x}", a[i]),
+    };
+    // 大きな値 (mmap の番地など) は 16 進で
+    let ret = if e >= 0x10000 { alloc::format!("{:#x}", e) } else { alloc::format!("{}", e) };
+    let line = alloc::format!("strace [{} {}] t={} {}({}, {}, {}) = {}\n", p.pid, crate::proc::current().pid, crate::timer::ticks(), n, arg(0), arg(1), arg(2), ret);
+    // kmsg にだけ (シリアルの端末にまざらないように。aish-sys の strace と dmesg が読む)
+    crate::kmsg::push(&line);
 }

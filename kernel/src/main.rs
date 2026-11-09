@@ -69,6 +69,7 @@ mod procfs;
 mod ns;
 mod seccomp;
 mod sysfs;
+mod sysrq;
 mod rand;
 mod signal;
 mod socket;
@@ -159,6 +160,7 @@ pub extern "C" fn kmain() -> ! {
     security::register_audit(&audit::OPS);
     // スワップ (Linux の CONFIG_SWAP)。回収は vm.rs (vmscan)、区画とスロットは swap.rs
     vm::register_swap(&swap::OPS);
+    syscall::register(swap::SYSCALLS, swap::sys);
     // なくても動くところが持つシステムコール (Linux の COND_SYSCALL: syscall.rs の表に。置かなければ ENOSYS)
     syscall::register(epoll::SYSCALLS, epoll::sys);
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
@@ -185,6 +187,7 @@ pub extern "C" fn kmain() -> ! {
     debug::register_prof(&prof::OPS);
     debug::register_fail(&fail::OPS);
     why::register_log(&whylog::OPS);
+    debug::register_sysrq(sysrq::handle);
 
     irq::init();
     irq::enable_ipi();

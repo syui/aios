@@ -383,9 +383,7 @@ pub fn setregid(r: u64, e: u64) -> Res {
     })
 }
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::put_user as out;
 
 pub fn getresuid(r: usize, e: usize, s: usize) -> Res {
     let c = proc::current().cred.clone();

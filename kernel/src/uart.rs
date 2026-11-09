@@ -160,10 +160,9 @@ fn rx() {
             return;
         }
         let c = mmio::r32(reg(DR)) as u8;
-        // Ctrl-] : 固まって見えるときのために、すべてのスレッドの状態をじかに出す
-        // (シェルが動かなくても、カーネルが生きていれば出る。Linux の SysRq のかわり)
+        // Ctrl-] : 固まって見えるときのために、すべてのスレッドの状態をじかに出す (SysRq の t)
         if c == 0x1d {
-            crate::println!("\n{}", crate::proc::threads_text());
+            crate::debug::sysrq(b't');
             continue;
         }
         crate::console::intr(c);

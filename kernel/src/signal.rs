@@ -623,9 +623,7 @@ fn restart(p: &Proc, tf: &mut TrapFrame) {
 
 // ---- システムコール ----
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::put_user as out;
 
 fn read_u64(va: usize) -> Result<u64, i64> {
     let mut b = [0u8; 8];

@@ -343,7 +343,7 @@ impl ProcInode {
                 )
             }
             Node::Swaps => crate::swap::proc_swaps(),
-            Node::Threads => proc::threads_text(),
+            Node::Threads => crate::sysrq::threads_text(),
             Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFail | Node::AiFw | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStack(t) => crate::aiproc::ai_stack(t).ok_or(-ENOENT)?,
             Node::AiThreads => crate::aiproc::ai_threads(),
@@ -360,10 +360,10 @@ impl ProcInode {
             Node::AiFw => crate::nftables::ai_json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::AiWhy => crate::whylog::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
-            Node::Strace => crate::syscall::strace_get(),
+            Node::Strace => crate::trace::strace_get(),
             Node::Bkl => crate::lockstat::text(),
             Node::Kmsg => crate::kmsg::text(),
-            Node::Sysstat => crate::syscall::sysstat(),
+            Node::Sysstat => crate::trace::sysstat(),
             Node::Modules => crate::module::proc_modules(),
             Node::Route => crate::netif::proc_route(),
             Node::NetDev => {
@@ -917,7 +917,7 @@ impl Inode for ProcInode {
                 crate::aiproc::raw_dump(tid);
                 return Ok(b.len());
             }
-            crate::syscall::strace_set(b);
+            crate::trace::strace_set(b);
             return Ok(b.len());
         }
         // /proc/ai/ctl: 調べもののスイッチ (root。aiproc::ctl)

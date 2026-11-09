@@ -571,6 +571,12 @@ pub trait Audit {
         false
     }
     fn syscall_exit(&self, _ret: i64) {}
+    /// システムコールの前: パスの名前を集め、親やあるものを引く (名前を集めているときだけ。返したものを names_post に)
+    fn names_pre(&self, _nr: u64, _a: &[u64; 6]) -> Option<Box<dyn Any>> {
+        None
+    }
+    /// システムコールのあと: 作ったもの、開いたもの
+    fn names_post(&self, _plan: Box<dyn Any>, _r: &Result<i64, i64>) {}
     /// シグナルを送る (auditd に送られるもの: AUDIT_SIGNAL_INFO)
     fn signal_info(&self, _tgid: u32, _sig: i32) {}
     /// ユーザーの名前を足す (番号を返す)
@@ -616,6 +622,15 @@ pub fn audit_syscall_entry(nr: u64, a: &[u64; 6]) {
 }
 
 /// audit_dummy_context: いま名前を集めていない
+/// システムコールの前とあとの名前 (Linux の namei.c が getname、audit_inode を呼ぶところ。aios は前にまとめて引く)
+pub fn audit_names_pre(nr: u64, a: &[u64; 6]) -> Option<Box<dyn Any>> {
+    AUDIT.val().names_pre(nr, a)
+}
+
+pub fn audit_names_post(plan: Box<dyn Any>, r: &Result<i64, i64>) {
+    AUDIT.val().names_post(plan, r)
+}
+
 pub fn audit_dummy_context() -> bool {
     !AUDIT.val().collecting()
 }

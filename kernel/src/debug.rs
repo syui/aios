@@ -47,6 +47,11 @@ pub trait Tracer: Sync {
     /// 名前が変わった (exec、prctl の PR_SET_NAME)
     fn names_changed(&self) {}
     fn exit(&self, _tid: u32, _code: i64) {}
+    /// /proc/strace: STRACE_ON のときだけ (システムコールの終わり)
+    fn strace(&self, _nr: u64, _a: &[u64], _r: Result<i64, i64>) {}
+    /// /proc/sysstat: COUNT_ON のときだけ (大きなロックの道と、近道で終わったもの)
+    fn count(&self, _nr: u64) {}
+    fn count_fast(&self, _nr: u64) {}
 }
 
 struct NoTrace;
@@ -132,6 +137,32 @@ pub fn trace_exit(tid: u32, code: i64) {
     }
 }
 
+/// /proc/strace に名前が書かれているか、/proc/sysstat を読みはじめたか (trace.rs が立てる)
+pub static STRACE_ON: AtomicBool = AtomicBool::new(false);
+pub static COUNT_ON: AtomicBool = AtomicBool::new(false);
+
+/// システムコールの終わり (r が答え): /proc/strace に名前が書かれていれば
+#[inline]
+pub fn strace(nr: u64, a: &[u64], r: Result<i64, i64>) {
+    if STRACE_ON.load(Relaxed) {
+        TRACER.val().strace(nr, a, r);
+    }
+}
+
+#[inline]
+pub fn count_sys(nr: u64) {
+    if COUNT_ON.load(Relaxed) {
+        TRACER.val().count(nr);
+    }
+}
+
+#[inline]
+pub fn count_fast(nr: u64) {
+    if COUNT_ON.load(Relaxed) {
+        TRACER.val().count_fast(nr);
+    }
+}
+
 // ---- prof: 区間ごとの回数と時間 (/proc/ai/prof。prof.rs) ----
 
 /// 数えているか (prof.rs が立てる)
@@ -153,6 +184,10 @@ pub trait Profiler: Sync {
     }
     /// CPU に戻った (off_cpu が返したもの)
     fn on_cpu(&self, _t0: u64) {}
+    /// システムコール nr の区間の名前 (なければ None: 数えない)
+    fn sys_name(&self, _nr: u64) -> Option<&'static str> {
+        None
+    }
 }
 
 struct NoProf;
@@ -181,6 +216,16 @@ pub fn span(name: &'static str) -> Option<Span> {
         return None;
     }
     PROFILER.val().begin(name).map(Span)
+}
+
+/// システムコール nr の区間 (prof.rs の表の名前で)
+#[inline]
+pub fn sys_span(nr: u64) -> Option<Span> {
+    if !PROF_ON.load(Relaxed) {
+        return None;
+    }
+    let p = PROFILER.val();
+    p.sys_name(nr).and_then(|n| p.begin(n)).map(Span)
 }
 
 pub fn prof_thread_start(i: usize) {
@@ -266,4 +311,20 @@ static PAGE_HIT: AtomicBool = AtomicBool::new(false);
 
 pub fn fail_page_hit() -> bool {
     PAGE_HIT.swap(false, Relaxed)
+}
+
+// ---- SysRq (Linux の CONFIG_MAGIC_SYSRQ: handle_sysrq。sysrq.rs) ----
+
+static SYSRQ: Early<Option<fn(u8)>> = Early::new(None);
+
+/// 起動のとき (main.rs) に sysrq.rs をつなぐ
+pub fn register_sysrq(f: fn(u8)) {
+    SYSRQ.set(Some(f));
+}
+
+/// シリアルの Ctrl-P (p) と Ctrl-] (t) から
+pub fn sysrq(key: u8) {
+    if let Some(f) = SYSRQ.val() {
+        f(key);
+    }
 }

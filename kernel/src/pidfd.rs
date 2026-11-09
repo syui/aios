@@ -120,9 +120,7 @@ pub fn dumpable(t: &crate::proc::Proc) -> u8 {
     t.mm.as_ref().map_or(1, |m| m.get().dumpable)
 }
 
-fn copy_in(va: usize, b: &mut [u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_in(b, va).ok_or(-EFAULT)
-}
+use crate::proc::get_user as copy_in;
 
 /// pidfd の ioctl。PIDFD_GET_INFO (_IOWR(0xFF, 11, ...) で大きさは 64 から) だけ。ほかは ENOTTY (namespace の fd を
 /// 返すもの (PIDFD_GET_*_NAMESPACE) と FS_IOC_GETVERSION は、まだない)

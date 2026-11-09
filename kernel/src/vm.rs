@@ -1260,20 +1260,6 @@ pub trait Swap: Sync {
     fn totals(&self) -> (usize, usize) {
         (0, 0)
     }
-    /// swapon (つないでいなければ ENOSYS: Linux の CONFIG_SWAP なし)。name はファイルのときのパス
-    fn on(&self, _t: SwapTarget, _name: alloc::string::String) -> Result<(), i64> {
-        Err(-38)
-    }
-    /// swapoff
-    fn off(&self, _t: &SwapTarget) -> Result<(), i64> {
-        Err(-38)
-    }
-}
-
-/// swapon と swapoff にわたすもの (sysfile.rs がパスから決める): ブロックデバイスのノード (major, minor) か、ふつうのファイル
-pub enum SwapTarget {
-    Dev(u32, u32),
-    File(InodeRef),
 }
 
 struct NoSwap;
@@ -1312,16 +1298,6 @@ mod swap {
     pub fn area_of(slot: Slot) -> usize {
         (slot >> 32) as usize
     }
-}
-
-/// swapon: t (名前は name) をスワップに使う
-pub fn swapon(t: SwapTarget, name: alloc::string::String) -> Result<(), i64> {
-    SWAP.val().on(t, name)
-}
-
-/// swapoff
-pub fn swapoff(t: &SwapTarget) -> Result<(), i64> {
-    SWAP.val().off(t)
 }
 
 /// スワップの (全体のページ数, 空いているページ数) (sysinfo、/proc/meminfo。Linux の si_swapinfo)

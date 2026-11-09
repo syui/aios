@@ -4,7 +4,6 @@
 use crate::security::{lsms, LSM_CTX, LSM_FLAG_SINGLE, LSM_ID_CAPABILITY};
 
 const E2BIG: i64 = 7;
-const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EOPNOTSUPP: i64 = 95;
 
@@ -23,13 +22,7 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
     }
 }
 
-fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_in(b, va).ok_or(-EFAULT)
-}
-
-fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
+use crate::proc::{get_user, put_user};
 
 fn get_u32(va: usize) -> Result<u32, i64> {
     let mut b = [0u8; 4];

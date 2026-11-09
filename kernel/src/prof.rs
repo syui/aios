@@ -147,6 +147,9 @@ pub struct Ops;
 pub static OPS: Ops = Ops;
 
 impl crate::debug::Profiler for Ops {
+    fn sys_name(&self, nr: u64) -> Option<&'static str> {
+        sys_span(nr)
+    }
     fn begin(&self, name: &'static str) -> Option<[u64; 4]> {
         let s = core::mem::ManuallyDrop::new(span(name)?);
         Some([s.slot as u64, s.t0, s.outer, s.outer_slot as u64])
@@ -234,4 +237,54 @@ pub fn json() -> alloc::string::String {
         ));
     }
     out
+}
+
+/// 調べもの (prof): システムコールの区間の名前 (kernel.json の sysfile、socket、epoll、futex、syscall)
+fn sys_span(nr: u64) -> Option<&'static str> {
+    use crate::syscall::nr::*;
+    Some(match nr {
+        OPENAT => "sysfile:openat",
+        CLOSE => "sysfile:close",
+        READ => "sysfile:read",
+        WRITE => "sysfile:write",
+        PREAD64 => "sysfile:pread64",
+        PWRITE64 => "sysfile:pwrite64",
+        LSEEK => "sysfile:lseek",
+        NEWFSTATAT => "sysfile:newfstatat",
+        FSTAT => "sysfile:fstat",
+        STATX => "sysfile:statx",
+        FACCESSAT | FACCESSAT2 => "sysfile:faccessat",
+        READLINKAT => "sysfile:readlinkat",
+        GETDENTS64 => "sysfile:getdents64",
+        MKDIRAT => "sysfile:mkdirat",
+        UNLINKAT => "sysfile:unlinkat",
+        RENAMEAT | RENAMEAT2 => "sysfile:renameat",
+        SYMLINKAT => "sysfile:symlinkat",
+        LINKAT => "sysfile:linkat",
+        TRUNCATE | FTRUNCATE => "sysfile:truncate",
+        FALLOCATE => "sysfile:fallocate",
+        FSYNC | FDATASYNC | SYNC | SYNCFS => "sysfile:fsync",
+        FCHMODAT | FCHMODAT2 => "sysfile:fchmodat",
+        UTIMENSAT => "sysfile:utimensat",
+        PPOLL | PSELECT6 => "sysfile:poll",
+        SOCKET => "socket:socket",
+        SOCKETPAIR => "socket:socketpair",
+        BIND => "socket:bind",
+        LISTEN => "socket:listen",
+        ACCEPT | ACCEPT4 => "socket:accept",
+        CONNECT => "socket:connect",
+        SENDTO => "socket:sendto",
+        RECVFROM => "socket:recvfrom",
+        SENDMSG => "socket:sendmsg",
+        RECVMSG => "socket:recvmsg",
+        SHUTDOWN => "socket:shutdown",
+        SETSOCKOPT | GETSOCKOPT => "socket:sockopt",
+        EPOLL_CTL => "epoll:ctl",
+        EPOLL_PWAIT | EPOLL_PWAIT2 => "epoll:wait",
+        FUTEX => "futex:futex",
+        FUTEX_WAITV => "futex:waitv",
+        CLONE | CLONE3 => "syscall:clone",
+        WAIT4 => "syscall:wait4",
+        _ => return None,
+    })
 }
