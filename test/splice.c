@@ -1,6 +1,6 @@
 // splice と pread のテスト (カーネル): aios の中で動かす
 // (zig cc -target aarch64-linux-musl -O2 -static -o splice-test test/splice.c -lpthread)。
-// 大きなロックなしの道 (file.rs の fast_splice、fast_pread) とふつうの道で、中身とオフセットが同じか:
+// 大きなロックなしの道 (splice.rs の fast_splice、file.rs の fast_pread) とふつうの道で、中身とオフセットが同じか:
 // ファイル → パイプ (off_in あり・なし)、パイプ → /dev/null、いくつものスレッドから同時の pread
 #define _GNU_SOURCE
 #include <fcntl.h>

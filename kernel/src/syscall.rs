@@ -379,6 +379,14 @@ pub fn register(nrs: &[u64], h: Handler) {
     }
 }
 
+/// 大きなロックなしの splice (fast から。None ならふつうの道へ)。main.rs が splice.rs の fast を置く
+type FastHandler = fn(&proc::Proc, &[u64; 6]) -> Option<i64>;
+static FAST_SPLICE: crate::cell::Early<Option<FastHandler>> = crate::cell::Early::new(None);
+
+pub fn register_fast_splice(f: FastHandler) {
+    FAST_SPLICE.set(Some(f));
+}
+
 #[inline]
 fn handler(nr: u64) -> Option<Handler> {
     let h = HANDLERS.get(nr as usize)?.load(core::sync::atomic::Ordering::Acquire);
@@ -523,8 +531,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             Ok(0)
         }
         FSYNC | FDATASYNC | SYNCFS => sysfile::fsync(a[0], nr == SYNCFS),
-        SENDFILE => sysfile::sendfile(a[0], a[1], a[2] as usize, a[3] as usize),
-        COPY_FILE_RANGE => sysfile::copy_file_range(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         CLOSE => sysfile::close(a[0]),
         PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
         GETDENTS64 => sysfile::getdents64(a[0], a[1] as usize, a[2] as usize),
@@ -545,8 +551,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         LISTXATTR | LLISTXATTR | FLISTXATTR => Ok(0),
         GETXATTR | LGETXATTR | FGETXATTR => Err(-ENODATA),
         SETXATTR | LSETXATTR | FSETXATTR => Err(-EOPNOTSUPP),
-        SPLICE => sysfile::splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
-        TEE => sysfile::tee(a[0], a[1], a[2] as usize, a[3]),
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
         FADVISE64 => sysfile::fadvise(a[0], a[1] as i64, a[2] as i64, a[3]),
         READAHEAD => Ok(0),
@@ -1047,7 +1051,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             Some(r) => r,
             None => return false,
         },
-        SPLICE => match crate::file::fast_splice(p, a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]) {
+        SPLICE => match FAST_SPLICE.val().and_then(|f| f(p, &a)) {
             Some(r) => r,
             None => return false,
         },

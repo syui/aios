@@ -174,7 +174,7 @@ CORE_USES_EXTRA_MAX = 0
 # ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
 # tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)、vm.rs (Linux の swap.h: スワップの区画)、
 # vfs.rs (Linux の register_filesystem: 装置のないファイルシステム)、syscall.rs (Linux の COND_SYSCALL: システムコールの表)、
-# file.rs の FileOps (Linux の file_operations: 開いたものの中身)
+# file.rs の FileOps (Linux の file_operations: 開いたものの中身)。見せるだけのもの (lockstat) は extra の procfs と aiproc から
 BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
                 "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs",
                 "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs",
@@ -185,7 +185,8 @@ BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp":
                 "extfs": "fastdir.rs (FastFs), vm.rs (register_shrinker) and fs.rs (DiskRoot from block::mount_root)",
                 "unix": "file.rs (FileOps, register_release_deferred, register_fast_rw_sock)", "inet": "file.rs (FileOps)",
                 "socket": "file.rs (FileOps) and syscall.rs", "netlink": "file.rs (FileOps)", "netif": "file.rs (FileOps::ioctl)",
-                "net": "file.rs (FileOps) and timer.rs (every)"}
+                "net": "file.rs (FileOps) and timer.rs (every)", "splice": "syscall.rs (register, register_fast_splice)",
+                "lockstat": "aiproc.rs and procfs.rs (only extra calls it)"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

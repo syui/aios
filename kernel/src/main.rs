@@ -71,6 +71,7 @@ mod rand;
 mod signal;
 mod socket;
 mod spinlock;
+mod splice;
 mod cell;
 mod statc;
 mod swap;
@@ -160,6 +161,9 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(epoll::SYSCALLS, epoll::sys);
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
     syscall::register(inotify::SYSCALLS, inotify::sys);
+    // splice、tee、sendfile、copy_file_range と、大きなロックなしの splice
+    syscall::register(splice::SYSCALLS, splice::sys);
+    syscall::register_fast_splice(splice::fast);
     // ファイルの出来事の知らせ (Linux の fsnotify: vfs::notify) を inotify へ
     vfs::notify::register(&inotify::OPS);
     // AF_UNIX: fd を閉じたあとの gc (システムコールの終わり) と、大きなロックなしの read / write (syscall::fast)
