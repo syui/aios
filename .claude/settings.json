@@ -1,5 +1,11 @@
 {
   "enabledMcpjsonServers": ["aish", "aigpt"],
+  "permissions": {
+    "allow": [
+      "Bash(sh bin/publish.sh)",
+      "Bash(sh bin/publish.sh *)"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {
