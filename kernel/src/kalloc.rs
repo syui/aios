@@ -491,26 +491,6 @@ pub fn refs(page: *mut u8) -> u16 {
     ref_slot(page).load(Ordering::Acquire)
 }
 
-/// page cycle (/proc/ai/ctl): 空いているページを (MIN_FREE_PAGES だけ残して) みな取ってから、取った順に返す。RAM を
-/// ひととおり使ったあとの様子を作る (返ったページから続いたものが作れるか: heap の grow)。回したページの数
-pub fn cycle() -> usize {
-    let keep = MIN_FREE_PAGES.load(Ordering::Relaxed);
-    let mut head: *mut usize = ptr::null_mut();
-    let mut n = 0;
-    while nfree() > keep {
-        let Some(p) = alloc_dirty() else { break };
-        unsafe { *(p as *mut usize) = head as usize };
-        head = p as *mut usize;
-        n += 1;
-    }
-    while !head.is_null() {
-        let next = unsafe { *head } as *mut usize;
-        put(head as *mut u8);
-        head = next;
-    }
-    n
-}
-
 /// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで (Linux の vm.min_free_kbytes。/proc/sys は sysctl.rs)
 pub static MIN_FREE_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1024);
 
@@ -525,17 +505,6 @@ pub fn nfree() -> usize {
 pub fn orders() -> ([usize; MAX_ORDER + 1], usize) {
     let k = KMEM.lock();
     (k.counts, k.nhot)
-}
-
-/// /proc/buddyinfo (Linux と同じ形。ゾーンは 1 つ)
-pub fn buddyinfo() -> alloc::string::String {
-    let (c, _) = orders();
-    let mut s = alloc::string::String::from("Node 0, zone   Normal ");
-    for n in c {
-        s.push_str(&alloc::format!("{:6} ", n));
-    }
-    s.push('\n');
-    s
 }
 
 /// page check (/proc/ai/ctl): 空きの決まりを確かめて kmsg に (page: check ok / FAILED)。リストのかたまりが境目に

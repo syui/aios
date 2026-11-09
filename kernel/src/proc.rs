@@ -417,7 +417,7 @@ pub struct Proc {
     /// PID の namespace (ns.rs。None ははじめのもの) と、その中の番号
     pub pid_ns: Option<alloc::rc::Rc<crate::ns::Pid>>,
     pub vpid: u32,
-    chan: usize,
+    pub chan: usize,
     /// 最後に呼んだシステムコールの番号と最初の 2 つの引数 (/proc/threads で見る)
     pub last_sys: (u64, u64, u64),
     /// いまのシステムコールがしくじったわけ (why.rs。/proc/ai/why)
@@ -432,7 +432,7 @@ pub struct Proc {
     /// 最後に落ちたときの sp (調べもの用)
     pub last_sp: u64,
     /// この tick になったら起こす (0 なら無し)
-    wake_at: u64,
+    pub wake_at: u64,
     /// ソケットの受けとりで眠るときの締め切り (tick、0 なら無し。recvmmsg の timeout: socket::mmsg がおく)
     pub recv_deadline: u64,
     /// 眠りの待ち行列のつなぎ (chan のもの、期限つきのもの)
@@ -446,7 +446,7 @@ pub struct Proc {
     /// 親 (代表スレッド) の子の並びのつなぎ (Linux の sibling と real_parent)
     sib: Sib,
     /// poll で眠っているとき、起こしてほしいものの印 (None は何でも)
-    poll_keys: Option<Vec<usize>>,
+    pub poll_keys: Option<Vec<usize>>,
     context: Context,
     tpidr: u64,
     fp: FpState,
@@ -574,7 +574,7 @@ impl Proc {
         KSTACKS.ptr() as usize + (self.slot() + 1) * KSTACK_SIZE
     }
 
-    fn tf_ref(&self) -> &TrapFrame {
+    pub fn tf_ref(&self) -> &TrapFrame {
         unsafe { &*((self.kstack_top() - size_of::<TrapFrame>()) as *const TrapFrame) }
     }
 
@@ -982,7 +982,7 @@ fn make_runnable(p: &mut Proc) {
 static ON_CPU: [core::sync::atomic::AtomicUsize; crate::smp::MAXCPU] = [const { core::sync::atomic::AtomicUsize::new(0) }; crate::smp::MAXCPU];
 
 /// 使っている Proc (Unused でないもの)
-fn live() -> impl Iterator<Item = &'static mut Proc> {
+pub fn live() -> impl Iterator<Item = &'static mut Proc> {
     live_from(0).map(|i| &mut procs()[i]).filter(|p| p.state != State::Unused)
 }
 
@@ -1669,42 +1669,9 @@ pub fn poll_wake(key: usize) {
     wake_chan(chan, |p| p.poll_keys.as_ref().is_none_or(|k| k.contains(&key)));
 }
 
-/// 調べもの用 (/proc/strace に "kick PID"): tgid の futex で眠っているスレッドをみな起こす。
-/// futex はわけもなく起きてよい (待つ側が値を見なおす) ので、起こしが消えて眠りつづけているのかを確かめられる
-pub fn futex_kick(tgid: u32) -> usize {
-    crate::futex::kick(tgid)
-}
-
 /// tid のスレッドが chan で眠っていれば起こす (futex: 待つものはみな同じ chan で眠り、起こすものを選ぶ)
 pub fn wake_tid(tid: u32, chan: usize) -> bool {
     wake_chan(chan, |p| p.pid == tid) > 0
-}
-
-/// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
-/// 外で .eh_frame を使って呼び出しの並びをたどるため (フレームポインタのないプログラム)
-pub fn raw_dump(tid: u32) {
-    let Some(p) = find(tid).filter(|p| p.mm.is_some()) else { return };
-    let tf = p.tf_ref();
-    crate::println!("raw regs pc {:x} sp {:x}", tf.elr, tf.sp_el0);
-    for i in 0..31 {
-        crate::println!("raw x{} {:x}", i, tf.x[i]);
-    }
-    let pt = p.pt();
-    // ほかのプロセスの表を読む (大きなロックなしの mmap / munmap とすれちがう: vm::PageTable::hold)
-    let _h = pt.hold();
-    let sp = tf.sp_el0 as usize;
-    let mut b = [0u8; 64];
-    for off in (0..32 * 1024).step_by(64) {
-        if pt.copy_in(&mut b, sp + off).is_none() {
-            break;
-        }
-        let mut line = alloc::string::String::with_capacity(140);
-        for x in b {
-            line.push_str(&alloc::format!("{:02x}", x));
-        }
-        crate::println!("raw m {:x} {}", sp + off, line);
-    }
-    crate::println!("raw end");
 }
 
 /// タイマから: 期限の来た Proc を起こす
@@ -2468,295 +2435,6 @@ pub fn fp_snapshot() -> FpState {
 
 pub fn fp_restore(f: &FpState) {
     unsafe { fp_load(f) };
-}
-
-/// /proc/threads: すべてのスレッドの pid、tgid、状態、待っているもの、最後のシステムコール (調べもの用)
-/// /proc/PID/stack (調べもの用): プロセスのスレッドごとに、EL0 の pc と lr、フレームポインタをたどった戻り先、
-/// それからスタック (sp から 32 KiB) の中で写したファイル (実行できるところ) を指す値を「ファイル+位置」で
-pub fn stacks_text(tgid: u32) -> alloc::string::String {
-    use core::fmt::Write;
-    let mut out = alloc::string::String::new();
-    for i in 0..NPROC {
-        let p = &procs()[i];
-        if p.state == State::Unused || p.state == State::Zombie || p.tgid != tgid {
-            continue;
-        }
-        let tf = p.tf_ref();
-        let (pc, lr, fp, sp) = (tf.elr, tf.x[30], tf.x[29], tf.sp_el0);
-        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
-        let st = match p.state {
-            State::Running => "run",
-            State::Runnable => "ready",
-            State::Sleeping => "sleep",
-            _ => "other",
-        };
-        let _ = writeln!(out, "thread {} {} sys {} chan {:x} {} utime {}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan, st, p.utime);
-        let pt = p.pt();
-        let _h = pt.hold();
-        let name = |pt: &mut crate::vm::PageTable, va: u64| -> Option<alloc::string::String> {
-            let (_, v) = pt.find(va as usize)?;
-            if v.prot & 4 == 0 {
-                return None;
-            }
-            let (f, off) = pt.name_at(va as usize)?;
-            Some(alloc::format!("{}+{:#x}", f.rsplit('/').next().unwrap_or(&f), off))
-        };
-        // futex で待っているなら、そのアドレスと、待つときの値と、いまの値
-        if p.last_sys.0 == 98 && p.state == State::Sleeping {
-            let mut w = [0u8; 4];
-            let now = pt.copy_in(&mut w, tf.x[0] as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
-            let _ = writeln!(out, "  futex {:#x} op {} val {} now {}", tf.x[0], tf.x[1], tf.x[2] as u32, now);
-        }
-        for (what, va) in [("pc", pc), ("lr", lr)] {
-            let _ = writeln!(out, "  {} {:#x} {}", what, va, name(pt, va).unwrap_or_default());
-        }
-        // フレームポインタ: [fp] = 前の fp、[fp + 8] = 戻り先
-        let mut f = fp;
-        for _ in 0..48 {
-            if f == 0 || f & 7 != 0 {
-                break;
-            }
-            let mut b = [0u8; 16];
-            if pt.copy_in(&mut b, f as usize).is_none() {
-                break;
-            }
-            let next = u64::from_le_bytes(b[..8].try_into().unwrap());
-            let ret = u64::from_le_bytes(b[8..].try_into().unwrap());
-            let _ = writeln!(out, "  fp {:#x} {}", ret, name(pt, ret).unwrap_or_default());
-            if next <= f {
-                break;
-            }
-            f = next;
-        }
-        // スタックの中の、コードを指す値
-        let mut buf = alloc::vec![0u8; 32 * 1024];
-        let mut got = 0;
-        while got < buf.len() {
-            let chunk = 4096 - ((sp as usize + got) & 4095);
-            let chunk = chunk.min(buf.len() - got);
-            if pt.copy_in(&mut buf[got..got + chunk], sp as usize + got).is_none() {
-                break;
-            }
-            got += chunk;
-        }
-        // フレームの記録 ([前の fp, 戻り先]) をスタックの中から探してたどる (fp を使わない libc の中で
-        // 眠っていても、その上の呼び出しの並びがわかる)。いちばん下から、4 つ以上つながるもの
-        let word = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-        let (lo, hi) = (sp, sp + got as u64);
-        let rec = |pt: &mut crate::vm::PageTable, off: usize| -> Option<(usize, u64)> {
-            let next = word(off);
-            let ret = word(off + 8);
-            (next > lo + off as u64 && next < hi && next & 7 == 0 && name(pt, ret).is_some()).then(|| ((next - lo) as usize, ret))
-        };
-        let mut off = 0;
-        while off + 16 <= got {
-            let mut chain = alloc::vec::Vec::new();
-            let mut o = off;
-            while o + 16 <= got && chain.len() < 64 {
-                let Some((next, ret)) = rec(pt, o) else { break };
-                chain.push(ret);
-                o = next;
-            }
-            if chain.len() >= 4 {
-                for ret in chain {
-                    let _ = writeln!(out, "  chain {:#x} {}", ret, name(pt, ret).unwrap_or_default());
-                }
-                break;
-            }
-            off += 8;
-        }
-        let mut shown = 0;
-        for w in buf[..got].chunks_exact(8) {
-            let va = u64::from_le_bytes(w.try_into().unwrap());
-            if let Some(nm) = name(pt, va) {
-                let _ = writeln!(out, "  scan {:#x} {}", va, nm);
-                shown += 1;
-                if shown >= 80 {
-                    break;
-                }
-            }
-        }
-    }
-    for (tid, a, op, n) in crate::syscall::futex_wakes(tgid) {
-        let _ = writeln!(out, "wake by {} {:#x} op {} woke {}", tid, a, op, n);
-    }
-    // 開いている fd の様子 (ソケットに残っているバイト、epoll の見張り)
-    if let Some(l) = find_leader(tgid)
-        && let Some(files) = l.files.as_ref()
-    {
-        for (n, fd) in files.get().fds.iter().enumerate() {
-            if let Some(fd) = fd {
-                let _ = writeln!(out, "fd {} {}", n, fd.file.borrow().debug_state());
-            }
-        }
-    }
-    out
-}
-
-/// /proc/ai/threads: すべてのスレッドを 1 行 1 つの JSON で (AI が読む。aish-sys の threads と hang)。
-/// 眠っていれば何を待っているか: futex (アドレス、待つ値、いまの値)、poll / select / epoll (見張っている fd)、
-/// ほか (channel)。slept_s は眠りつづけている秒
-pub fn ai_threads() -> alloc::string::String {
-    use crate::debug::esc;
-    let mut out = alloc::string::String::new();
-    let now = crate::timer::ticks();
-    let hz = crate::timer::HZ;
-    for p in live() {
-        if p.state == State::Unused {
-            continue;
-        }
-        let st = match p.state {
-            State::Running => "run",
-            State::Runnable => "ready",
-            State::Sleeping => "sleep",
-            State::Zombie => "zombie",
-            State::Unused => "unused",
-        };
-        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
-        let sys = crate::syscall::name(p.last_sys.0).map_or(alloc::format!("{}", p.last_sys.0), |x| x.to_ascii_lowercase());
-        let mut line = alloc::format!(
-            "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"state\":\"{}\",\"sys\":\"{}\",\"args\":[{},{}],\"runs\":{},\"utime_s\":{:.2}",
-            p.pid,
-            p.tgid,
-            esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
-            st,
-            sys,
-            p.last_sys.1,
-            p.last_sys.2,
-            p.nrun,
-            p.utime as f64 / hz as f64
-        );
-        if p.state == State::Sleeping {
-            line.push_str(&alloc::format!(",\"slept_s\":{:.2}", now.saturating_sub(p.slept_at) as f64 / hz as f64));
-            if p.wake_at != 0 {
-                line.push_str(&alloc::format!(",\"timeout_s\":{:.2}", p.wake_at.saturating_sub(now) as f64 / hz as f64));
-            }
-            line.push_str(",\"wait\":");
-            line.push_str(&wait_json(p));
-        }
-        line.push_str("}\n");
-        out.push_str(&line);
-    }
-    out
-}
-
-/// /proc/ai/stack/TID: スレッドの EL0 のレジスタ、スタック (sp から 64 KiB まで、写っているところ)、
-/// 写しているファイルの地図を 1 行の JSON で。aish-sys がファイルの .eh_frame で呼び出しの並びをたどる
-/// (フレームポインタのないプログラムや、CFI のない libc の中で眠っていても)。走っているスレッドの値は、
-/// 最後に例外が来たときのもの
-pub fn ai_stack(tid: u32) -> Option<alloc::string::String> {
-    use crate::debug::esc;
-    let p = find(tid)?;
-    if p.state == State::Unused || p.state == State::Zombie {
-        return None;
-    }
-    let tf = p.tf_ref();
-    let (pc, sp) = (tf.elr, tf.sp_el0);
-    let x: alloc::vec::Vec<alloc::string::String> = (0..31).map(|i| alloc::format!("{}", tf.x[i])).collect();
-    let pt = p.pt();
-    let _h = pt.hold();
-    let mut hex = alloc::string::String::new();
-    let mut page = [0u8; 4096];
-    let mut va = sp as usize;
-    // ページの境目までずつ (スタックの終わりで写っていなくなったらやめる)
-    while va < sp as usize + 64 * 1024 {
-        let n = 4096 - (va & 4095);
-        if pt.copy_in(&mut page[..n], va).is_none() {
-            break;
-        }
-        for b in &page[..n] {
-            hex.push_str(&alloc::format!("{:02x}", b));
-        }
-        va += n;
-    }
-    let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
-    let maps: alloc::vec::Vec<alloc::string::String> = pt
-        .maps_text()
-        .lines()
-        .filter_map(|l| {
-            // 開始-終わり 権限 オフセット 00:00 0 パス (ファイルを写しているものだけ)
-            let f: alloc::vec::Vec<&str> = l.split_whitespace().collect();
-            let path = f.get(5)?;
-            let (lo, hi) = f[0].split_once('-')?;
-            Some(alloc::format!("[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]", lo, hi, f[2], f[1], esc(path)))
-        })
-        .collect();
-    Some(alloc::format!(
-        "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"pc\":{},\"sp\":{},\"x\":[{}],\"stack\":\"{}\",\"maps\":[{}]}}\n",
-        p.pid,
-        p.tgid,
-        esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
-        pc,
-        sp,
-        x.join(","),
-        hex,
-        maps.join(",")
-    ))
-}
-
-/// /proc/ai/stack の中のスレッド (すべて)
-pub fn all_tids() -> alloc::vec::Vec<u32> {
-    live().filter(|p| p.state != State::Unused && p.state != State::Zombie).map(|p| p.pid).collect()
-}
-
-/// 眠っている p が待っているもの (JSON)
-fn wait_json(p: &mut Proc) -> alloc::string::String {
-    // futex: x0 がアドレス、x2 が待つ値
-    if p.last_sys.0 == 98 && p.chan != poll_chan() {
-        let tf = p.tf_ref();
-        let (addr, val) = (tf.x[0], tf.x[2] as u32);
-        let mut w = [0u8; 4];
-        let pt = p.pt();
-        let _h = pt.hold();
-        let now = pt.copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
-        return alloc::format!("{{\"futex\":{},\"val\":{},\"now\":{}}}", addr, val, now);
-    }
-    if p.chan == poll_chan() && (p.last_sys.0 == 73 || p.last_sys.0 == 72) {
-        // ppoll: 渡された struct pollfd (fd、events) をそのまま。pselect6: 読む fd の集まり (書く方は覚えていない)。
-        // 何を待っているか (want: POLLIN 1 / POLLOUT 4 ...) がわかるので、aiwatch が「起こしが消えた」を見分けられる
-        let (a0, a1) = (p.last_sys.1 as usize, p.last_sys.2 as usize);
-        let (mut fds, mut want) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
-        let _h = p.pt().hold();
-        if p.last_sys.0 == 73 && a1 <= 1024 {
-            let mut raw = alloc::vec![0u8; a1 * 8];
-            if p.pt().copy_in(&mut raw, a0).is_some() {
-                for e in raw.chunks_exact(8) {
-                    let fd = i32::from_le_bytes(e[0..4].try_into().unwrap());
-                    if fd >= 0 {
-                        fds.push(alloc::format!("{}", fd));
-                        want.push(alloc::format!("{}", i16::from_le_bytes(e[4..6].try_into().unwrap())));
-                    }
-                }
-            }
-        } else if p.last_sys.0 == 72 && a0 <= 1024 && a1 != 0 {
-            let mut set = alloc::vec![0u8; a0.div_ceil(64) * 8];
-            if p.pt().copy_in(&mut set, a1).is_some() {
-                for i in 0..a0 {
-                    if set[i / 8] & (1 << (i % 8)) != 0 {
-                        fds.push(alloc::format!("{}", i));
-                        want.push("1".into());
-                    }
-                }
-            }
-        }
-        return alloc::format!("{{\"poll\":[{}],\"want\":[{}]}}", fds.join(","), want.join(","));
-    }
-    if p.chan == poll_chan() {
-        // epoll など: 印 (poll_keys) を、そのプロセスの fd に戻す (want はわからない。epoll は true)
-        let Some(keys) = p.poll_keys.clone() else { return "{\"poll\":\"any\"}".into() };
-        let mut fds = alloc::vec::Vec::new();
-        if let Some(files) = p.files.as_ref() {
-            for (i, f) in files.get().fds.iter().enumerate() {
-                let Some(f) = f else { continue };
-                let Ok(of) = f.file.try_borrow() else { continue };
-                if of.poll_keys().is_some_and(|k| k.iter().any(|k| keys.contains(k))) {
-                    fds.push(alloc::format!("{}", i));
-                }
-            }
-        }
-        return alloc::format!("{{\"poll\":[{}],\"epoll\":{}}}", fds.join(","), p.last_sys.0 == 22);
-    }
-    alloc::format!("{{\"chan\":{}}}", p.chan)
 }
 
 pub fn threads_text() -> alloc::string::String {

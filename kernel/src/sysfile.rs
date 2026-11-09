@@ -3709,12 +3709,6 @@ pub fn close_range(first: u64, last: u64, flags: u64) -> R {
     Ok(0)
 }
 
-/// inotify_add_watch(fd, path, mask) (inotify.rs)
-pub fn inotify_add_watch(fd: u64, pathp: usize, mask: u32) -> R {
-    let path = user_str(pathp)?;
-    inotify::add_watch(fd, &path, mask)
-}
-
 // ---- 監査の名前 (audit.rs の getname / inode / child: Linux の getname、audit_inode、audit_inode_child) ----
 // audit がシステムコールの名前を集めているとき (ルールがあるときなど) だけ、syscall::dispatch がシステムコールの
 // 前 (audit_pre) とあと (audit_post) に呼ぶ。名前は Linux と同じ順に: ユーザーの名前 (getname)、親のディレクトリ

@@ -1,12 +1,12 @@
 // /proc/ai: AI (aish の MCP のツール) が読むための、カーネルの中の様子。どれも 1 行 1 つの JSON。
 // 読み書きできるのは root と wheel の人だけ (allowed)。
 //   threads   すべてのスレッド: 状態、最後のシステムコール、眠っていれば何を (futex / 見張っている fd / channel)、
-//             どれだけ (slept_s) 待っているか (proc::ai_threads)
+//             どれだけ (slept_s) 待っているか (ai_threads)
 //   prof      区間 (part:what) ごとの回数と時間と、part (kernel.json の名前) ごとの割合 (prof.rs。ctl に prof on で数える)
 //   kernel    kernel/kernel.json: ファイルごとの core (起動して /init が動くのに要るもの) と extra、quirk (ある機械や
 //             プログラムのつごうで入れた手当て。cause と until つき) の一覧。だれでも読める
-//   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap::stats_json)
-//   bkl       大きなロックの統計 (smp::stats_json)。ctl に bkl reset で 0 から
+//   heap      カーネルのヒープ: 使っている、いちばん多かった、空きのいちばん大きなかたまり、取れなかった回数 (heap_json)
+//   bkl       大きなロックの統計 (lockstat::json)。ctl に bkl reset で 0 から
 //   mem       メモリの中: RAM の空き、カーネルのヒープとスタック、ページキャッシュ (ファイルごとも)、MAP_SHARED の
 //             ページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス (mem_json)
 //   fs        ファイルシステムの中: マウントごとの様子 (ext4 のブロックキャッシュ、ジャーナル、inode の覚え。tmpfs の
@@ -19,7 +19,7 @@
 //   trace     カーネルの中の出来事の記録 (trace.rs): システムコールの入りと出、スレッドの切りかえ、眠りと起こし、
 //             割り込み、ディスクの読み書き、ページフォルト、exec と exit。ctl の trace on で始める。aish の trace
 //   fd/PID    そのプロセスの fd: 何か、読める・書ける・閉じた、読まれずに残っているもの
-//   stack/TID スレッドのレジスタ、スタック (sp から 64 KiB まで、16 進)、ファイルを写している地図 (proc::ai_stack)。
+//   stack/TID スレッドのレジスタ、スタック (sp から 64 KiB まで、16 進)、ファイルを写している地図 (ai_stack)。
 //             aish-sys がファイルの .eh_frame でたどる
 //   ctl       調べもののスイッチ (書く。読むと書けるものの一覧):
 //               kick PID      その PID の futex で眠っているスレッドをみな起こす (起こしが消えたのかを確かめる。
@@ -38,7 +38,7 @@
 //               page cycle    空いている物理ページを (少し残して) みな取ってから返す (RAM をひととおり使ったあとの様子)
 //               page check    物理ページの空き (buddy: kalloc.rs) の決まりを確かめて kmsg に (page: check ok / FAILED)
 //               prof on|off   カーネルの中の区間 (debug::span と prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
-//               lockbench     スピンロック、ヒープ、大きなロック、時計、物理ページの 1 回の時間を kmsg に (spinlock::bench)
+//               lockbench     スピンロック、ヒープ、大きなロック、時計、物理ページの 1 回の時間を kmsg に (lockstat.rs)
 //               fail pid N|name NAME sys NR|all ERRNO [TIMES]  そのプロセスのシステムコール (番号か名前か、みな) を、
 //                             動かさずに -ERRNO に (TIMES 回。既定 1)。fail ... heap [TIMES] はカーネルのヒープの alloc を
 //                             耐えるところで (ENOMEM)、fail ... oom [TIMES] は耐えないところで (予備と oom.rs)、
@@ -54,6 +54,8 @@
 use alloc::format;
 use alloc::string::String;
 use crate::debug::esc;
+use crate::proc::{self, State};
+use crate::{heap, kalloc};
 
 /// wheel (sudo できる人。aiosd と同じ)。/proc/ai/ctl は root:wheel の 0664
 pub const WHEEL: u32 = 10;
@@ -211,17 +213,17 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
     let num = || arg.parse::<u32>().map_err(|_| crate::why::inval());
     match cmd {
         "kick" => {
-            let n = crate::proc::futex_kick(num()?);
+            let n = crate::futex::kick(num()?);
             crate::println!("futex kick {}: woke {}", arg, n);
         }
-        "raw" => crate::proc::raw_dump(num()?),
+        "raw" => raw_dump(num()?),
         "pcmiss" => crate::vm::MISS_LOG.store(arg != "off", core::sync::atomic::Ordering::Relaxed),
         "strace" => crate::syscall::strace_set(arg.as_bytes()),
-        "bkl" if arg == "reset" => crate::smp::stats_reset(),
+        "bkl" if arg == "reset" => crate::lockstat::reset(),
         "bkl" if arg == "selftest" => crate::cell::selftest(),
         "heap" if arg == "trace on" || arg == "trace off" => crate::heap::trace(arg == "trace on"),
         "heap" if arg.starts_with("hog ") => {
-            crate::heap::hog(arg[4..].trim().parse::<usize>().map_err(|_| crate::why::inval())?);
+            heap_hog(arg[4..].trim().parse::<usize>().map_err(|_| crate::why::inval())?);
         }
         "heap" if arg == "check" => crate::heap::check(),
         "heap" if arg == "poison on" || arg == "poison off" => crate::heap::POISON.store(arg == "poison on", core::sync::atomic::Ordering::Relaxed),
@@ -229,13 +231,13 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
             crate::heap::quarantine(arg[11..].trim().parse::<usize>().map_err(|_| crate::why::inval())?);
         }
         "page" if arg == "cycle" => {
-            let n = crate::kalloc::cycle();
+            let n = page_cycle();
             crate::println!("page cycle: {} pages taken and given back ({} free)", n, crate::kalloc::nfree());
         }
         "page" if arg == "check" => crate::kalloc::check(),
         "page" if arg == "poison on" || arg == "poison off" => crate::kalloc::POISON.store(arg == "poison on", core::sync::atomic::Ordering::Relaxed),
         "prof" if arg == "on" || arg == "off" => crate::prof::set(arg == "on"),
-        "lockbench" => crate::spinlock::bench(),
+        "lockbench" => crate::lockstat::run(),
         "trace" => crate::trace::ctl(arg)?,
         "fail" => crate::fail::ctl(arg)?,
         "fw" => {
@@ -265,3 +267,261 @@ pub fn ctl(b: &[u8]) -> Result<(), i64> {
     }
     Ok(())
 }
+
+/// /proc/ai/threads: すべてのスレッドを 1 行 1 つの JSON で (AI が読む。aish-sys の threads と hang)。
+/// 眠っていれば何を待っているか: futex (アドレス、待つ値、いまの値)、poll / select / epoll (見張っている fd)、
+/// ほか (channel)。slept_s は眠りつづけている秒
+pub fn ai_threads() -> alloc::string::String {
+    use crate::debug::esc;
+    let mut out = alloc::string::String::new();
+    let now = crate::timer::ticks();
+    let hz = crate::timer::HZ;
+    for p in proc::live() {
+        if p.state == State::Unused {
+            continue;
+        }
+        let st = match p.state {
+            State::Running => "run",
+            State::Runnable => "ready",
+            State::Sleeping => "sleep",
+            State::Zombie => "zombie",
+            State::Unused => "unused",
+        };
+        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let sys = crate::syscall::name(p.last_sys.0).map_or(alloc::format!("{}", p.last_sys.0), |x| x.to_ascii_lowercase());
+        let mut line = alloc::format!(
+            "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"state\":\"{}\",\"sys\":\"{}\",\"args\":[{},{}],\"runs\":{},\"utime_s\":{:.2}",
+            p.pid,
+            p.tgid,
+            esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
+            st,
+            sys,
+            p.last_sys.1,
+            p.last_sys.2,
+            p.nrun,
+            p.utime as f64 / hz as f64
+        );
+        if p.state == State::Sleeping {
+            line.push_str(&alloc::format!(",\"slept_s\":{:.2}", now.saturating_sub(p.slept_at) as f64 / hz as f64));
+            if p.wake_at != 0 {
+                line.push_str(&alloc::format!(",\"timeout_s\":{:.2}", p.wake_at.saturating_sub(now) as f64 / hz as f64));
+            }
+            line.push_str(",\"wait\":");
+            line.push_str(&wait_json(p));
+        }
+        line.push_str("}\n");
+        out.push_str(&line);
+    }
+    out
+}
+
+/// /proc/ai/stack/TID: スレッドの EL0 のレジスタ、スタック (sp から 64 KiB まで、写っているところ)、
+/// 写しているファイルの地図を 1 行の JSON で。aish-sys がファイルの .eh_frame で呼び出しの並びをたどる
+/// (フレームポインタのないプログラムや、CFI のない libc の中で眠っていても)。走っているスレッドの値は、
+/// 最後に例外が来たときのもの
+pub fn ai_stack(tid: u32) -> Option<alloc::string::String> {
+    use crate::debug::esc;
+    let p = proc::find_any(tid)?;
+    if p.state == State::Unused || p.state == State::Zombie {
+        return None;
+    }
+    let tf = p.tf_ref();
+    let (pc, sp) = (tf.elr, tf.sp_el0);
+    let x: alloc::vec::Vec<alloc::string::String> = (0..31).map(|i| alloc::format!("{}", tf.x[i])).collect();
+    let pt = p.pt();
+    let _h = pt.hold();
+    let mut hex = alloc::string::String::new();
+    let mut page = [0u8; 4096];
+    let mut va = sp as usize;
+    // ページの境目までずつ (スタックの終わりで写っていなくなったらやめる)
+    while va < sp as usize + 64 * 1024 {
+        let n = 4096 - (va & 4095);
+        if pt.copy_in(&mut page[..n], va).is_none() {
+            break;
+        }
+        for b in &page[..n] {
+            hex.push_str(&alloc::format!("{:02x}", b));
+        }
+        va += n;
+    }
+    let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+    let maps: alloc::vec::Vec<alloc::string::String> = pt
+        .maps_text()
+        .lines()
+        .filter_map(|l| {
+            // 開始-終わり 権限 オフセット 00:00 0 パス (ファイルを写しているものだけ)
+            let f: alloc::vec::Vec<&str> = l.split_whitespace().collect();
+            let path = f.get(5)?;
+            let (lo, hi) = f[0].split_once('-')?;
+            Some(alloc::format!("[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]", lo, hi, f[2], f[1], esc(path)))
+        })
+        .collect();
+    Some(alloc::format!(
+        "{{\"tid\":{},\"pid\":{},\"name\":\"{}\",\"pc\":{},\"sp\":{},\"x\":[{}],\"stack\":\"{}\",\"maps\":[{}]}}\n",
+        p.pid,
+        p.tgid,
+        esc(core::str::from_utf8(&p.comm[..n]).unwrap_or("?")),
+        pc,
+        sp,
+        x.join(","),
+        hex,
+        maps.join(",")
+    ))
+}
+
+/// /proc/ai/stack の中のスレッド (すべて)
+pub fn all_tids() -> alloc::vec::Vec<u32> {
+    proc::live().filter(|p| p.state != State::Unused && p.state != State::Zombie).map(|p| p.pid).collect()
+}
+
+/// 眠っている p が待っているもの (JSON)
+fn wait_json(p: &mut proc::Proc) -> alloc::string::String {
+    // futex: x0 がアドレス、x2 が待つ値
+    if p.last_sys.0 == 98 && p.chan != proc::poll_chan() {
+        let tf = p.tf_ref();
+        let (addr, val) = (tf.x[0], tf.x[2] as u32);
+        let mut w = [0u8; 4];
+        let pt = p.pt();
+        let _h = pt.hold();
+        let now = pt.copy_in(&mut w, addr as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
+        return alloc::format!("{{\"futex\":{},\"val\":{},\"now\":{}}}", addr, val, now);
+    }
+    if p.chan == proc::poll_chan() && (p.last_sys.0 == 73 || p.last_sys.0 == 72) {
+        // ppoll: 渡された struct pollfd (fd、events) をそのまま。pselect6: 読む fd の集まり (書く方は覚えていない)。
+        // 何を待っているか (want: POLLIN 1 / POLLOUT 4 ...) がわかるので、aiwatch が「起こしが消えた」を見分けられる
+        let (a0, a1) = (p.last_sys.1 as usize, p.last_sys.2 as usize);
+        let (mut fds, mut want) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        let _h = p.pt().hold();
+        if p.last_sys.0 == 73 && a1 <= 1024 {
+            let mut raw = alloc::vec![0u8; a1 * 8];
+            if p.pt().copy_in(&mut raw, a0).is_some() {
+                for e in raw.chunks_exact(8) {
+                    let fd = i32::from_le_bytes(e[0..4].try_into().unwrap());
+                    if fd >= 0 {
+                        fds.push(alloc::format!("{}", fd));
+                        want.push(alloc::format!("{}", i16::from_le_bytes(e[4..6].try_into().unwrap())));
+                    }
+                }
+            }
+        } else if p.last_sys.0 == 72 && a0 <= 1024 && a1 != 0 {
+            let mut set = alloc::vec![0u8; a0.div_ceil(64) * 8];
+            if p.pt().copy_in(&mut set, a1).is_some() {
+                for i in 0..a0 {
+                    if set[i / 8] & (1 << (i % 8)) != 0 {
+                        fds.push(alloc::format!("{}", i));
+                        want.push("1".into());
+                    }
+                }
+            }
+        }
+        return alloc::format!("{{\"poll\":[{}],\"want\":[{}]}}", fds.join(","), want.join(","));
+    }
+    if p.chan == proc::poll_chan() {
+        // epoll など: 印 (poll_keys) を、そのプロセスの fd に戻す (want はわからない。epoll は true)
+        let Some(keys) = p.poll_keys.clone() else { return "{\"poll\":\"any\"}".into() };
+        let mut fds = alloc::vec::Vec::new();
+        if let Some(files) = p.files.as_ref() {
+            for (i, f) in files.get().fds.iter().enumerate() {
+                let Some(f) = f else { continue };
+                let Ok(of) = f.file.try_borrow() else { continue };
+                if of.poll_keys().is_some_and(|k| k.iter().any(|k| keys.contains(k))) {
+                    fds.push(alloc::format!("{}", i));
+                }
+            }
+        }
+        return alloc::format!("{{\"poll\":[{}],\"epoll\":{}}}", fds.join(","), p.last_sys.0 == 22);
+    }
+    alloc::format!("{{\"chan\":{}}}", p.chan)
+}
+
+/// 調べもの用 (/proc/strace に "raw TID"): スレッドの EL0 のレジスタとスタック (sp から 32 KiB) をシリアルに出す。
+/// 外で .eh_frame を使って呼び出しの並びをたどるため (フレームポインタのないプログラム)
+pub fn raw_dump(tid: u32) {
+    let Some(p) = proc::find_any(tid).filter(|p| p.mm.is_some()) else { return };
+    let tf = p.tf_ref();
+    crate::println!("raw regs pc {:x} sp {:x}", tf.elr, tf.sp_el0);
+    for i in 0..31 {
+        crate::println!("raw x{} {:x}", i, tf.x[i]);
+    }
+    let pt = p.pt();
+    // ほかのプロセスの表を読む (大きなロックなしの mmap / munmap とすれちがう: vm::PageTable::hold)
+    let _h = pt.hold();
+    let sp = tf.sp_el0 as usize;
+    let mut b = [0u8; 64];
+    for off in (0..32 * 1024).step_by(64) {
+        if pt.copy_in(&mut b, sp + off).is_none() {
+            break;
+        }
+        let mut line = alloc::string::String::with_capacity(140);
+        for x in b {
+            line.push_str(&alloc::format!("{:02x}", x));
+        }
+        crate::println!("raw m {:x} {}", sp + off, line);
+    }
+    crate::println!("raw end");
+}
+
+/// /proc/ai/heap: 1 行の JSON
+pub fn heap_json() -> alloc::string::String {
+    let (size, used, peak, n, big, _, fails) = heap::stats();
+    let (grown, reclaims, reserve_used, emergencies) = heap::stats_more();
+    let mut s = alloc::format!(
+        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{},\"cached\":{}}}\n",
+        size,
+        used,
+        peak,
+        n,
+        big,
+        fails,
+        grown,
+        reclaims,
+        reserve_used,
+        emergencies,
+        crate::oom::kills(),
+        heap::cached()
+    );
+    heap::sites_json(&mut s);
+    s
+}
+
+/// heap hog N (/proc/ai/ctl): N MiB をわざと取って持っておく (足す・捨てる・ENOMEM の道を試すため。0 で返す)。取れた MiB
+static HOG: crate::spinlock::SpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> = crate::spinlock::SpinLock::new(alloc::vec::Vec::new());
+
+fn heap_hog(mib: usize) -> usize {
+    let mut old = core::mem::take(&mut *HOG.lock());
+    old.clear();
+    let mut v = old;
+    while v.len() < mib {
+        // 1 MiB ずつ (耐えるところとして: 足して捨ててもなければ ENOMEM で止まる。予備は使わない)
+        match heap::try_vec(1 << 20, true) {
+            Ok(b) => v.push(b),
+            Err(_) => break,
+        }
+    }
+    let got = v.len();
+    *HOG.lock() = v;
+    crate::println!("heap: hog {} MiB (used {} of {})", got, heap::used(), heap::size());
+    got
+}
+
+
+/// page cycle (/proc/ai/ctl): 空いているページを (MIN_FREE_PAGES だけ残して) みな取ってから、取った順に返す。RAM を
+/// ひととおり使ったあとの様子を作る (返ったページから続いたものが作れるか: heap の grow)。回したページの数
+fn page_cycle() -> usize {
+    let keep = kalloc::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let mut head: *mut usize = core::ptr::null_mut();
+    let mut n = 0;
+    while kalloc::nfree() > keep {
+        let Some(p) = kalloc::alloc_dirty() else { break };
+        unsafe { *(p as *mut usize) = head as usize };
+        head = p as *mut usize;
+        n += 1;
+    }
+    while !head.is_null() {
+        let next = unsafe { *head } as *mut usize;
+        kalloc::put(head as *mut u8);
+        head = next;
+    }
+    n
+}
+

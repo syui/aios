@@ -205,7 +205,7 @@ impl SysInode {
             }
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
-            Node::Vuln(i) => crate::cpuvuln::show(crate::cpuvuln::FILES[i as usize]),
+            Node::Vuln(i) => crate::cpuvuln::show(VULN_FILES[i as usize]),
             Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
             Node::EfiFile(0) => "64\n".into(),
             // 設定テーブルの ACPI と SMBIOS (Linux の systab_show の順)
@@ -307,7 +307,7 @@ impl Inode for SysInode {
             Node::Devices if name == "system" => Node::System,
             Node::System if name == "cpu" => Node::Cpu,
             Node::Cpu if name == "vulnerabilities" => Node::Vulns,
-            Node::Vulns => Node::Vuln(pos(&crate::cpuvuln::FILES)?),
+            Node::Vulns => Node::Vuln(pos(&VULN_FILES)?),
             Node::Cpu => match pos(&CPU_FILES) {
                 Ok(i) => Node::CpuFile(i),
                 Err(_) => {
@@ -410,7 +410,7 @@ impl Inode for SysInode {
                 add("vulnerabilities".into(), Node::Vulns);
             }
             Node::Vulns => {
-                for (i, f) in crate::cpuvuln::FILES.iter().enumerate() {
+                for (i, f) in VULN_FILES.iter().enumerate() {
                     add((*f).into(), Node::Vuln(i as u8));
                 }
             }
@@ -452,3 +452,26 @@ impl Inode for SysInode {
         crate::tmpfs::statfs_bytes(SYSFS_MAGIC, 4096, 0, 0, 0, 0)
     }
 }
+
+/// /sys/devices/system/cpu/vulnerabilities/ のファイル (Linux 7.3 の drivers/base/cpu.c の順)
+const VULN_FILES: [&str; 19] = [
+    "meltdown",
+    "spectre_v1",
+    "spectre_v2",
+    "spec_store_bypass",
+    "l1tf",
+    "mds",
+    "tsx_async_abort",
+    "itlb_multihit",
+    "srbds",
+    "mmio_stale_data",
+    "retbleed",
+    "spec_rstack_overflow",
+    "gather_data_sampling",
+    "reg_file_data_sampling",
+    "ghostwrite",
+    "old_microcode",
+    "indirect_target_selection",
+    "tsa",
+    "vmscape",
+];

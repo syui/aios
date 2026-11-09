@@ -1192,23 +1192,6 @@ impl OpenFile {
         }
     }
 
-    /// 調べるための様子 (/proc/PID/stack の fd の一覧)
-    pub fn debug_state(&self) -> String {
-        let (r, w, h) = self.readiness();
-        let rw = alloc::format!("r{}w{}h{}", r as u8, w as u8, h as u8);
-        match &self.kind {
-            Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
-                let p = p.borrow();
-                alloc::format!("{} {} len={} r={} w={}", self.describe(), rw, p.len(), p.readers, p.writers)
-            }
-            Kind::Ops(o) => {
-                let desc = self.describe();
-                o.debug_state(&desc, &rw).unwrap_or_else(|| alloc::format!("{} {}", desc, rw))
-            }
-            _ => alloc::format!("{} {}", self.describe(), rw),
-        }
-    }
-
     /// 読まれずに残っているもの (/proc/ai/fd): パイプと socketpair はバイト、TCP / UDP は届いている分、
     /// eventfd は数、inotify はバイト。ないもの (ふつうのファイルなど) は None
     pub fn pending(&self) -> Option<u64> {
@@ -1744,8 +1727,8 @@ impl Drop for PageQueue {
 pub struct Pipe {
     data: PageQueue,
     pub cap: usize,
-    readers: usize,
-    writers: usize,
+    pub readers: usize,
+    pub writers: usize,
     /// FIFO が読み/書きで開かれた回数 (相手がすぐ閉じても、来たことはわかる)
     r_opened: u64,
     w_opened: u64,

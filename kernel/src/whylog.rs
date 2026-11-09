@@ -96,7 +96,7 @@ fn done(nr: u64, e: i64, a: &[u64]) {
     // わけを書いたところがパスを知らなければ (許可を見るところなど)、プログラムがたのんだパスを
     if note.plen == 0
         && (note.nlen == 0 || note.code == Code::Where)
-        && let Some(i) = crate::syscall::path_arg(nr)
+        && let Some(i) = path_arg(nr)
         && let Some(&va) = a.get(i)
     {
         let asked = crate::syscall::user_str(va as usize, PATH);
@@ -315,4 +315,16 @@ pub fn text(uid: Option<u32>) -> String {
         s.push_str("}\n");
     }
     s
+}
+
+/// システムコールのパスの引数の番号 (わけにパスがなければ、プログラムがたのんだパスをつける)
+fn path_arg(nr: u64) -> Option<usize> {
+    use crate::syscall::nr::*;
+    Some(match nr {
+        CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 | SETXATTR | LSETXATTR | GETXATTR | LGETXATTR | LISTXATTR | LLISTXATTR => 0,
+        OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT | EXECVEAT => 1,
+        SYMLINKAT => 2,
+        LINKAT => 3,
+        _ => return None,
+    })
 }

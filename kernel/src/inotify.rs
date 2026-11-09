@@ -393,17 +393,20 @@ pub fn pending(n: &InotifyRef) -> usize {
     n.borrow().queue.iter().map(|e| e.len()).sum()
 }
 
-/// システムコール (main.rs が syscall::register で置く。Linux の fs/notify/inotify/inotify_user.c)。inotify_add_watch は
-/// パスをたどるので sysfile.rs
+/// システムコール (main.rs が syscall::register で置く。Linux の fs/notify/inotify/inotify_user.c)
 pub const SYSCALLS: &[u64] = {
     use crate::syscall::nr::*;
-    &[INOTIFY_INIT1, INOTIFY_RM_WATCH]
+    &[INOTIFY_INIT1, INOTIFY_ADD_WATCH, INOTIFY_RM_WATCH]
 };
 
 pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
     use crate::syscall::nr::*;
     match n {
         INOTIFY_INIT1 => init1(a[0]),
+        INOTIFY_ADD_WATCH => {
+            let b = crate::proc::current().pt().copy_in_str(a[1] as usize, 4096).ok_or(-14)?; // EFAULT
+            add_watch(a[0], &alloc::string::String::from_utf8(b).map_err(|_| -2)?, a[2] as u32) // ENOENT
+        }
         INOTIFY_RM_WATCH => rm_watch(a[0], a[1] as i32),
         _ => Err(-38),
     }
@@ -468,8 +471,5 @@ impl crate::vfs::notify::Notify for Ops {
     }
     fn modify_watched(&self) -> bool {
         modify_watched()
-    }
-    fn add_watch(&self, fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
-        add_watch(fd, path, mask)
     }
 }

@@ -345,10 +345,10 @@ impl ProcInode {
             Node::Swaps => crate::swap::proc_swaps(),
             Node::Threads => proc::threads_text(),
             Node::AiThreads | Node::AiBkl | Node::AiHeap | Node::AiProf | Node::AiCtl | Node::AiMem | Node::AiFs | Node::AiTrace | Node::AiFail | Node::AiFw | Node::AiFd(_) | Node::AiStack(_) if !crate::aiproc::allowed() => return Err(-EACCES),
-            Node::AiStack(t) => proc::ai_stack(t).ok_or(-ENOENT)?,
-            Node::AiThreads => proc::ai_threads(),
-            Node::AiBkl => crate::smp::stats_json(),
-            Node::AiHeap => crate::heap::stats_json(),
+            Node::AiStack(t) => crate::aiproc::ai_stack(t).ok_or(-ENOENT)?,
+            Node::AiThreads => crate::aiproc::ai_threads(),
+            Node::AiBkl => crate::lockstat::json(),
+            Node::AiHeap => crate::aiproc::heap_json(),
             Node::AiProf => crate::prof::json(),
             Node::AiCtl => crate::aiproc::CTL_HELP.into(),
             Node::AiKernel => include_str!("../kernel.json").into(),
@@ -361,7 +361,7 @@ impl ProcInode {
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
             Node::AiWhy => crate::whylog::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
             Node::Strace => crate::syscall::strace_get(),
-            Node::Bkl => crate::smp::stats(),
+            Node::Bkl => crate::lockstat::text(),
             Node::Kmsg => crate::kmsg::text(),
             Node::Sysstat => crate::syscall::sysstat(),
             Node::Modules => crate::module::proc_modules(),
@@ -413,7 +413,7 @@ impl ProcInode {
             }
             Node::Stack(pid) => {
                 aa_ptrace(pid, false)?;
-                proc::stacks_text(leader(pid)?.tgid)
+                stacks_text(leader(pid)?.tgid)
             }
             Node::Status(pid) => {
                 let p = leader_any(pid)?;
@@ -442,7 +442,7 @@ impl ProcInode {
                     crate::landlock::layers(c),
                     crate::seccomp::mode(c).0,
                     crate::seccomp::mode(c).1,
-                    crate::cpuvuln::status(p.spec_ssb)
+                    spec_status(p.spec_ssb)
                 )
             }
             Node::Cmdline(pid) => {
@@ -477,7 +477,7 @@ impl ProcInode {
             }
             Node::StatAll => stat_all(),
             Node::Diskstats => crate::block::proc_diskstats(),
-            Node::Buddyinfo => crate::kalloc::buddyinfo(),
+            Node::Buddyinfo => buddyinfo(),
             Node::Vmstat => {
                 use core::sync::atomic::Ordering::Relaxed;
                 // ページ (4 KiB) の数と、Linux の vmstat が読む数え (ないものは 0)
@@ -901,9 +901,9 @@ impl Inode for ProcInode {
         }
         // /proc/strace: root が名前を書くと、その名前のプロセスの失敗したシステムコールを出す (空で止める)
         if self.node == Node::Strace && crate::cred::current().euid == 0 {
-            // "kick PID": その PID の futex で眠っているスレッドを起こす (調べもの用。proc::futex_kick)
+            // "kick PID": その PID の futex で眠っているスレッドを起こす (調べもの用。futex::kick)
             if let Some(pid) = b.strip_prefix(b"kick ").and_then(|r| core::str::from_utf8(r).ok()).and_then(|r| r.trim().parse::<u32>().ok()) {
-                let n = crate::proc::futex_kick(pid);
+                let n = crate::futex::kick(pid);
                 crate::println!("futex kick {}: woke {}", pid, n);
                 return Ok(b.len());
             }
@@ -912,9 +912,9 @@ impl Inode for ProcInode {
                 crate::vm::MISS_LOG.store(on, core::sync::atomic::Ordering::Relaxed);
                 return Ok(b.len());
             }
-            // "raw TID": そのスレッドのレジスタとスタックをシリアルに (proc::raw_dump)
+            // "raw TID": そのスレッドのレジスタとスタックをシリアルに (aiproc::raw_dump)
             if let Some(tid) = b.strip_prefix(b"raw ").and_then(|r| core::str::from_utf8(r).ok()).and_then(|r| r.trim().parse::<u32>().ok()) {
-                crate::proc::raw_dump(tid);
+                crate::aiproc::raw_dump(tid);
                 return Ok(b.len());
             }
             crate::syscall::strace_set(b);
@@ -927,7 +927,7 @@ impl Inode for ProcInode {
         }
         // /proc/bkl: 書くと (root) 大きなロックの統計を 0 から数えなおす
         if self.node == Node::Bkl && crate::cred::current().euid == 0 {
-            crate::smp::stats_reset();
+            crate::lockstat::reset();
             return Ok(b.len());
         }
         Err(-EACCES)
@@ -1015,7 +1015,7 @@ impl Inode for ProcInode {
             (Node::AiDir, "stack") => Node::AiStackDir,
             (Node::AiStackDir, _) => {
                 let t = num.ok_or(-ENOENT)?;
-                if !proc::all_tids().contains(&t) {
+                if !crate::aiproc::all_tids().contains(&t) {
                     return Err(-ENOENT);
                 }
                 Node::AiStack(t)
@@ -1144,7 +1144,7 @@ impl Inode for ProcInode {
             }
             Node::AiFdDir | Node::AiStackDir if !crate::aiproc::allowed() => return Err(-EACCES),
             Node::AiStackDir => {
-                for t in proc::all_tids() {
+                for t in crate::aiproc::all_tids() {
                     add(format!("{}", t), Node::AiStack(t));
                 }
             }
@@ -1265,3 +1265,169 @@ impl Inode for ProcInode {
         crate::tmpfs::statfs_bytes(PROC_SUPER_MAGIC, 4096, 0, 0, 0, 0)
     }
 }
+
+/// /proc/threads: すべてのスレッドの pid、tgid、状態、待っているもの、最後のシステムコール (調べもの用)
+/// /proc/PID/stack (調べもの用): プロセスのスレッドごとに、EL0 の pc と lr、フレームポインタをたどった戻り先、
+/// それからスタック (sp から 32 KiB) の中で写したファイル (実行できるところ) を指す値を「ファイル+位置」で
+fn stacks_text(tgid: u32) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::new();
+    for p in proc::live() {
+        if p.state == State::Zombie || p.tgid != tgid {
+            continue;
+        }
+        let tf = p.tf_ref();
+        let (pc, lr, fp, sp) = (tf.elr, tf.x[30], tf.x[29], tf.sp_el0);
+        let n = p.comm.iter().position(|&c| c == 0).unwrap_or(16);
+        let st = match p.state {
+            State::Running => "run",
+            State::Runnable => "ready",
+            State::Sleeping => "sleep",
+            _ => "other",
+        };
+        let _ = writeln!(out, "thread {} {} sys {} chan {:x} {} utime {}", p.pid, core::str::from_utf8(&p.comm[..n]).unwrap_or("?"), p.last_sys.0, p.chan, st, p.utime);
+        let pt = p.pt();
+        let _h = pt.hold();
+        let name = |pt: &mut crate::vm::PageTable, va: u64| -> Option<alloc::string::String> {
+            let (_, v) = pt.find(va as usize)?;
+            if v.prot & 4 == 0 {
+                return None;
+            }
+            let (f, off) = pt.name_at(va as usize)?;
+            Some(alloc::format!("{}+{:#x}", f.rsplit('/').next().unwrap_or(&f), off))
+        };
+        // futex で待っているなら、そのアドレスと、待つときの値と、いまの値
+        if p.last_sys.0 == 98 && p.state == State::Sleeping {
+            let mut w = [0u8; 4];
+            let now = pt.copy_in(&mut w, tf.x[0] as usize).map(|_| u32::from_le_bytes(w) as i64).unwrap_or(-1);
+            let _ = writeln!(out, "  futex {:#x} op {} val {} now {}", tf.x[0], tf.x[1], tf.x[2] as u32, now);
+        }
+        for (what, va) in [("pc", pc), ("lr", lr)] {
+            let _ = writeln!(out, "  {} {:#x} {}", what, va, name(pt, va).unwrap_or_default());
+        }
+        // フレームポインタ: [fp] = 前の fp、[fp + 8] = 戻り先
+        let mut f = fp;
+        for _ in 0..48 {
+            if f == 0 || f & 7 != 0 {
+                break;
+            }
+            let mut b = [0u8; 16];
+            if pt.copy_in(&mut b, f as usize).is_none() {
+                break;
+            }
+            let next = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let ret = u64::from_le_bytes(b[8..].try_into().unwrap());
+            let _ = writeln!(out, "  fp {:#x} {}", ret, name(pt, ret).unwrap_or_default());
+            if next <= f {
+                break;
+            }
+            f = next;
+        }
+        // スタックの中の、コードを指す値
+        let mut buf = alloc::vec![0u8; 32 * 1024];
+        let mut got = 0;
+        while got < buf.len() {
+            let chunk = 4096 - ((sp as usize + got) & 4095);
+            let chunk = chunk.min(buf.len() - got);
+            if pt.copy_in(&mut buf[got..got + chunk], sp as usize + got).is_none() {
+                break;
+            }
+            got += chunk;
+        }
+        // フレームの記録 ([前の fp, 戻り先]) をスタックの中から探してたどる (fp を使わない libc の中で
+        // 眠っていても、その上の呼び出しの並びがわかる)。いちばん下から、4 つ以上つながるもの
+        let word = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let (lo, hi) = (sp, sp + got as u64);
+        let rec = |pt: &mut crate::vm::PageTable, off: usize| -> Option<(usize, u64)> {
+            let next = word(off);
+            let ret = word(off + 8);
+            (next > lo + off as u64 && next < hi && next & 7 == 0 && name(pt, ret).is_some()).then(|| ((next - lo) as usize, ret))
+        };
+        let mut off = 0;
+        while off + 16 <= got {
+            let mut chain = alloc::vec::Vec::new();
+            let mut o = off;
+            while o + 16 <= got && chain.len() < 64 {
+                let Some((next, ret)) = rec(pt, o) else { break };
+                chain.push(ret);
+                o = next;
+            }
+            if chain.len() >= 4 {
+                for ret in chain {
+                    let _ = writeln!(out, "  chain {:#x} {}", ret, name(pt, ret).unwrap_or_default());
+                }
+                break;
+            }
+            off += 8;
+        }
+        let mut shown = 0;
+        for w in buf[..got].chunks_exact(8) {
+            let va = u64::from_le_bytes(w.try_into().unwrap());
+            if let Some(nm) = name(pt, va) {
+                let _ = writeln!(out, "  scan {:#x} {}", va, nm);
+                shown += 1;
+                if shown >= 80 {
+                    break;
+                }
+            }
+        }
+    }
+    for (tid, a, op, n) in crate::syscall::futex_wakes(tgid) {
+        let _ = writeln!(out, "wake by {} {:#x} op {} woke {}", tid, a, op, n);
+    }
+    // 開いている fd の様子 (ソケットに残っているバイト、epoll の見張り)
+    if let Some(l) = proc::find_leader(tgid)
+        && let Some(files) = l.files.as_ref()
+    {
+        for (n, fd) in files.get().fds.iter().enumerate() {
+            if let Some(fd) = fd {
+                let _ = writeln!(out, "fd {} {}", n, fd_state(&fd.file.borrow()));
+            }
+        }
+    }
+    out
+}
+
+
+/// 調べるための fd の様子 (/proc/PID/stack の fd の一覧)
+fn fd_state(f: &crate::file::OpenFile) -> String {
+    let (r, w, h) = f.readiness();
+    let rw = alloc::format!("r{}w{}h{}", r as u8, w as u8, h as u8);
+    match &f.kind {
+        crate::file::Kind::PipeRead(p) | crate::file::Kind::PipeWrite(p) | crate::file::Kind::PipeRw(p) => {
+            let p = p.borrow();
+            alloc::format!("{} {} len={} r={} w={}", f.describe(), rw, p.len(), p.readers, p.writers)
+        }
+        crate::file::Kind::Ops(o) => {
+            let desc = f.describe();
+            o.debug_state(&desc, &rw).unwrap_or_else(|| alloc::format!("{} {}", desc, rw))
+        }
+        _ => alloc::format!("{} {}", f.describe(), rw),
+    }
+}
+
+/// /proc/buddyinfo (Linux と同じ形。ゾーンは 1 つ)
+fn buddyinfo() -> alloc::string::String {
+    let (c, _) = crate::kalloc::orders();
+    let mut s = alloc::string::String::from("Node 0, zone   Normal ");
+    for n in c {
+        s.push_str(&alloc::format!("{:6} ", n));
+    }
+    s.push('\n');
+    s
+}
+
+/// /proc/PID/status の Speculation_Store_Bypass と SpeculationIndirectBranch (fs/proc/array.c の task_seccomp)
+fn spec_status(ssb: u8) -> String {
+    let ssb_s = match crate::cpuvuln::prctl_get(crate::cpuvuln::PR_SPEC_STORE_BYPASS, ssb) {
+        Ok(crate::cpuvuln::PR_SPEC_NOT_AFFECTED) => "not vulnerable",
+        Ok(v) if v == crate::cpuvuln::PR_SPEC_PRCTL | crate::cpuvuln::PR_SPEC_FORCE_DISABLE as i64 => "thread force mitigated",
+        Ok(v) if v == crate::cpuvuln::PR_SPEC_PRCTL | crate::cpuvuln::PR_SPEC_DISABLE as i64 => "thread mitigated",
+        Ok(v) if v == crate::cpuvuln::PR_SPEC_PRCTL | crate::cpuvuln::PR_SPEC_ENABLE as i64 => "thread vulnerable",
+        Ok(v) if v == crate::cpuvuln::PR_SPEC_DISABLE as i64 => "globally mitigated",
+        _ => "vulnerable",
+    };
+    // arm64 は PR_SPEC_INDIRECT_BRANCH を ENODEV で答えるので unknown
+    alloc::format!("Speculation_Store_Bypass:\t{}\nSpeculationIndirectBranch:\tunknown\n", ssb_s)
+}
+

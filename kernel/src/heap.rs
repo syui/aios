@@ -231,8 +231,11 @@ pub fn trace(on: bool) {
     TRACE.store(on, Relaxed);
 }
 
-/// /proc/ai/heap に足す: いま持っているバイトの多い場所 20 (1 行 1 つ)
-fn sites_json(out: &mut alloc::string::String) {
+/// /proc/ai/heap に足す: heap trace on のあいだ、いま持っているバイトの多い場所 20 (1 行 1 つ)
+pub fn sites_json(out: &mut alloc::string::String) {
+    if !TRACE.load(Relaxed) {
+        return;
+    }
     let mut top: [(usize, usize, [usize; DEPTH]); 20] = [(0, 0, [0; DEPTH]); 20];
     {
         let t = SITE.lock();
@@ -269,30 +272,6 @@ pub fn used() -> usize {
 pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
     let (n, big, free) = HEAP.lock().stats();
     (size(), USED.load(Relaxed), PEAK.load(Relaxed), n, big, free, FAILS.load(Relaxed))
-}
-
-/// /proc/ai/heap: 1 行の JSON
-pub fn stats_json() -> alloc::string::String {
-    let (n, big, _) = HEAP.lock().stats();
-    let mut s = alloc::format!(
-        "{{\"size\":{},\"used\":{},\"peak\":{},\"free_blocks\":{},\"largest_free\":{},\"fails\":{},\"grown\":{},\"reclaims\":{},\"reserve_used\":{},\"emergencies\":{},\"oom_kills\":{},\"cached\":{}}}\n",
-        size(),
-        USED.load(Relaxed),
-        PEAK.load(Relaxed),
-        n,
-        big,
-        FAILS.load(Relaxed),
-        GROWN.load(Relaxed),
-        RECLAIMS.load(Relaxed),
-        RESERVE_USED.load(Relaxed),
-        EMERGENCIES.load(Relaxed),
-        crate::oom::kills(),
-        cached()
-    );
-    if TRACE.load(Relaxed) {
-        sites_json(&mut s);
-    }
-    s
 }
 
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
@@ -574,25 +553,6 @@ pub fn stats_more() -> (usize, usize, usize, usize) {
     (GROWN.load(Relaxed), RECLAIMS.load(Relaxed), RESERVE_USED.load(Relaxed), EMERGENCIES.load(Relaxed))
 }
 
-/// heap hog N (/proc/ai/ctl): N MiB をわざと取って持っておく (足す・捨てる・ENOMEM の道を試すため。0 で返す)。取れた MiB
-static HOG: SpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> = SpinLock::new(alloc::vec::Vec::new());
-
-pub fn hog(mib: usize) -> usize {
-    let mut old = core::mem::take(&mut *HOG.lock());
-    old.clear();
-    let mut v = old;
-    while v.len() < mib {
-        // 1 MiB ずつ (耐えるところとして: 足して捨ててもなければ ENOMEM で止まる。予備は使わない)
-        match try_vec(1 << 20, true) {
-            Ok(b) => v.push(b),
-            Err(_) => break,
-        }
-    }
-    let got = v.len();
-    *HOG.lock() = v;
-    crate::println!("heap: hog {} MiB (used {} of {})", got, USED.load(Relaxed), size());
-    got
-}
 
 // ---- 耐えるところ ----
 

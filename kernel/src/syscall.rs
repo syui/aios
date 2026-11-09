@@ -475,7 +475,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         DUP => sysfile::dup(a[0]),
         DUP3 => sysfile::dup3(a[0], a[1], a[2]),
         FCNTL => sysfile::fcntl(a[0], a[1], a[2]),
-        INOTIFY_ADD_WATCH => sysfile::inotify_add_watch(a[0], a[1] as usize, a[2] as u32),
         // 要求番号は unsigned int (musl は int を符号拡張して渡してくる)
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
@@ -851,18 +850,6 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
     let line = alloc::format!("strace [{} {}] t={} {}({}, {}, {}) = {}\n", p.pid, proc::current().pid, crate::timer::ticks(), n, arg(0), arg(1), arg(2), ret);
     // kmsg にだけ (シリアルの端末にまざらないように。aish-sys の strace と dmesg が読む)
     crate::kmsg::push(&line);
-}
-
-/// システムコールのパスの引数の番号 (whylog.rs: わけにパスがなければ、プログラムがたのんだパスをつける)
-pub fn path_arg(nr: u64) -> Option<usize> {
-    use nr::*;
-    Some(match nr {
-        CHDIR | CHROOT | TRUNCATE | STATFS | EXECVE | SWAPON | UMOUNT2 | SETXATTR | LSETXATTR | GETXATTR | LGETXATTR | LISTXATTR | LLISTXATTR => 0,
-        OPENAT | OPENAT2 | MKDIRAT | MKNODAT | UNLINKAT | RENAMEAT | RENAMEAT2 | FACCESSAT | FACCESSAT2 | FCHMODAT | FCHMODAT2 | FCHOWNAT | NEWFSTATAT | STATX | UTIMENSAT | READLINKAT | INOTIFY_ADD_WATCH | MOUNT | EXECVEAT => 1,
-        SYMLINKAT => 2,
-        LINKAT => 3,
-        _ => return None,
-    })
 }
 
 /// strace で見せるためのユーザーの文字列 (NUL まで、max バイトまで。読めなければ "?")

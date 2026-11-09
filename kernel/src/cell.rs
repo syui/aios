@@ -173,10 +173,10 @@ impl<T> Once<T> {
 
 /// BKL を持たずに触った場所 (はじめの SITES こ) と、その回数
 const SITES: usize = 32;
-static SITE: [AtomicPtr<Location<'static>>; SITES] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SITES];
-static HITS: [AtomicUsize; SITES] = [const { AtomicUsize::new(0) }; SITES];
+pub static SITE: [AtomicPtr<Location<'static>>; SITES] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SITES];
+pub static HITS: [AtomicUsize; SITES] = [const { AtomicUsize::new(0) }; SITES];
 /// 表に入らなかった回数
-static MORE: AtomicUsize = AtomicUsize::new(0);
+pub static MORE: AtomicUsize = AtomicUsize::new(0);
 
 #[cold]
 #[inline(never)]
@@ -224,26 +224,4 @@ pub fn selftest() {
         !p.is_null() && unsafe { &*p }.file().ends_with("cell.rs") && n.load(Ordering::Relaxed) > 0
     });
     println!("bkl: selftest {}", if ok { "ok" } else { "FAILED" });
-}
-
-/// /proc/bkl の終わりに: BKL を持たずに触った場所と回数 (なければ空。selftest のものは出さない)
-pub fn unlocked_text() -> alloc::string::String {
-    use core::fmt::Write;
-    let mut s = alloc::string::String::new();
-    for (site, n) in SITE.iter().zip(&HITS) {
-        let p = site.load(Ordering::Acquire);
-        if p.is_null() {
-            break;
-        }
-        let at = unsafe { &*p };
-        if at.file().ends_with("cell.rs") {
-            continue;
-        }
-        let _ = writeln!(s, "unlocked {}:{} {}", at.file(), at.line(), n.load(Ordering::Relaxed));
-    }
-    let more = MORE.load(Ordering::Relaxed);
-    if more > 0 {
-        let _ = writeln!(s, "unlocked (more places) {}", more);
-    }
-    s
 }

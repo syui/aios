@@ -38,6 +38,7 @@ mod extfs;
 mod fastdir;
 mod file;
 mod locks;
+mod lockstat;
 mod fs;
 mod futex;
 mod irq;

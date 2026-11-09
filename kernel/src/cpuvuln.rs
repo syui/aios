@@ -166,30 +166,7 @@ pub fn get() -> &'static Vuln {
     VULN.get()
 }
 
-/// /sys/devices/system/cpu/vulnerabilities/ のファイル (Linux 7.3 の drivers/base/cpu.c の順)
-pub const FILES: [&str; 19] = [
-    "meltdown",
-    "spectre_v1",
-    "spectre_v2",
-    "spec_store_bypass",
-    "l1tf",
-    "mds",
-    "tsx_async_abort",
-    "itlb_multihit",
-    "srbds",
-    "mmio_stale_data",
-    "retbleed",
-    "spec_rstack_overflow",
-    "gather_data_sampling",
-    "reg_file_data_sampling",
-    "ghostwrite",
-    "old_microcode",
-    "indirect_target_selection",
-    "tsa",
-    "vmscape",
-];
-
-/// ファイルの中身 (Linux の cpu_show_* と同じ書き方)
+/// /sys/devices/system/cpu/vulnerabilities/NAME の中身 (Linux の cpu_show_* と同じ書き方。ファイルの一覧は sysfs.rs)
 pub fn show(name: &str) -> String {
     let v = get();
     let s = match name {
@@ -232,13 +209,13 @@ pub const SSB_FORCE: u8 = 2;
 /// exec まで止める (PR_SPEC_DISABLE_NOEXEC)
 pub const SSB_NOEXEC: u8 = 4;
 
-const PR_SPEC_STORE_BYPASS: u64 = 0;
-const PR_SPEC_NOT_AFFECTED: i64 = 0;
-const PR_SPEC_PRCTL: i64 = 1;
-const PR_SPEC_ENABLE: u64 = 2;
-const PR_SPEC_DISABLE: u64 = 4;
-const PR_SPEC_FORCE_DISABLE: u64 = 8;
-const PR_SPEC_DISABLE_NOEXEC: u64 = 16;
+pub const PR_SPEC_STORE_BYPASS: u64 = 0;
+pub const PR_SPEC_NOT_AFFECTED: i64 = 0;
+pub const PR_SPEC_PRCTL: i64 = 1;
+pub const PR_SPEC_ENABLE: u64 = 2;
+pub const PR_SPEC_DISABLE: u64 = 4;
+pub const PR_SPEC_FORCE_DISABLE: u64 = 8;
+pub const PR_SPEC_DISABLE_NOEXEC: u64 = 16;
 /// SPSR (PSTATE) の SSBS
 const PSR_SSBS: u64 = 1 << 12;
 
@@ -312,18 +289,4 @@ pub fn prctl_set(which: u64, ctrl: u64, ssb: u8) -> Result<u8, i64> {
         _ => return Err(-ERANGE),
     }
     Ok(s)
-}
-
-/// /proc/PID/status の Speculation_Store_Bypass と SpeculationIndirectBranch (fs/proc/array.c の task_seccomp)
-pub fn status(ssb: u8) -> String {
-    let ssb_s = match prctl_get(PR_SPEC_STORE_BYPASS, ssb) {
-        Ok(PR_SPEC_NOT_AFFECTED) => "not vulnerable",
-        Ok(v) if v == PR_SPEC_PRCTL | PR_SPEC_FORCE_DISABLE as i64 => "thread force mitigated",
-        Ok(v) if v == PR_SPEC_PRCTL | PR_SPEC_DISABLE as i64 => "thread mitigated",
-        Ok(v) if v == PR_SPEC_PRCTL | PR_SPEC_ENABLE as i64 => "thread vulnerable",
-        Ok(v) if v == PR_SPEC_DISABLE as i64 => "globally mitigated",
-        _ => "vulnerable",
-    };
-    // arm64 は PR_SPEC_INDIRECT_BRANCH を ENODEV で答えるので unknown
-    alloc::format!("Speculation_Store_Bypass:\t{}\nSpeculationIndirectBranch:\tunknown\n", ssb_s)
 }

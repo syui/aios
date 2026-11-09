@@ -469,18 +469,18 @@ const NSYS: usize = 512;
 /// の片方だけが測られる
 pub const SAMPLE: u64 = 8;
 
-struct CpuStat {
+pub struct CpuStat {
     /// ロックを待っていた時間 (ns)
-    wait: AtomicU64,
+    pub wait: AtomicU64,
     /// ロックを持っていた時間 (ns。SAMPLE のぶん、見つもり)
-    hold: AtomicU64,
-    locks: AtomicU64,
+    pub hold: AtomicU64,
+    pub locks: AtomicU64,
     /// いま持ちはじめた時刻 (測らない回は 0)
-    since: AtomicU64,
+    pub since: AtomicU64,
     /// いま持っている分を測っているなら、その重み (1 か SAMPLE)。0 は測っていない
-    weight: AtomicU64,
+    pub weight: AtomicU64,
     /// くじ (xorshift の種)
-    dice: AtomicU64,
+    pub dice: AtomicU64,
 }
 
 /// くじを引く: SAMPLE 回に 1 回ほどあたる (上の 3 ビットが 0)
@@ -498,20 +498,20 @@ fn draw(c: &CpuStat) -> bool {
     x >> (64 - SAMPLE.trailing_zeros()) == 0
 }
 
-struct Stats {
-    cpu: [CpuStat; MAXCPU],
+pub struct Stats {
+    pub cpu: [CpuStat; MAXCPU],
     /// システムコールの番号ごとの (回数, ロックを持っていた時間)。途中で眠ったものは、眠るまでと起きてからの分
-    sys: [(AtomicU64, AtomicU64); NSYS],
-    fault: (AtomicU64, AtomicU64),
-    irq: (AtomicU64, AtomicU64),
+    pub sys: [(AtomicU64, AtomicU64); NSYS],
+    pub fault: (AtomicU64, AtomicU64),
+    pub irq: (AtomicU64, AtomicU64),
     /// カーネルのスレッド (proc::kthread) が 1 回まわるあいだ
-    kthread: (AtomicU64, AtomicU64),
+    pub kthread: (AtomicU64, AtomicU64),
     /// syscall::FD_SYS のシステムコールの、fd の開いたものの種類 (file::CLASSES) ごとの (回数, 時間)。sys には数えない
-    fd: [[(AtomicU64, AtomicU64); NCLASS]; NFD],
+    pub fd: [[(AtomicU64, AtomicU64); NCLASS]; NFD],
     /// 途中で眠ったので数えなかったもの
-    slept: AtomicU64,
+    pub slept: AtomicU64,
     /// 数えはじめた時刻 (書くと 0 からやりなおす)
-    start: AtomicU64,
+    pub start: AtomicU64,
 }
 
 const Z: AtomicU64 = AtomicU64::new(0);
@@ -521,7 +521,7 @@ fn add(a: &AtomicU64, v: u64) {
     a.store(a.load(Ordering::Relaxed) + v, Ordering::Relaxed);
 }
 
-static STATS: Stats = Stats {
+pub static STATS: Stats = Stats {
     cpu: [const { CpuStat { wait: Z, hold: Z, locks: Z, since: Z, weight: Z, dice: AtomicU64::new(0x9e37_79b9_7f4a_7c15) } }; MAXCPU],
     sys: [const { (Z, Z) }; NSYS],
     fault: (Z, Z),
@@ -587,36 +587,6 @@ fn index_of(cause: &Cause) -> u64 {
         Cause::Irq => NSYS as u64 + 1,
         Cause::Kthread => (NSYS + 2 + NFD * NCLASS) as u64,
     }
-}
-
-/// 持っていた時間の長いもの (名前, 回数, 時間) の多い順。fd のシステムコールは「read pipe」のように種類ごと
-/// (途中で眠ったものは、眠るまでと起きてからの分)
-fn hold_rows() -> alloc::vec::Vec<(alloc::string::String, u64, u64)> {
-    use alloc::format;
-    let mut rows = alloc::vec::Vec::new();
-    let sys_name = |i: u64| crate::syscall::name(i).map_or(format!("sys{}", i), |x| x.to_ascii_lowercase());
-    for (i, (n, t)) in STATS.sys.iter().enumerate() {
-        let n = n.load(Ordering::Relaxed);
-        if n > 0 {
-            rows.push((sys_name(i as u64), n, t.load(Ordering::Relaxed)));
-        }
-    }
-    for (j, by) in STATS.fd.iter().enumerate() {
-        for (k, (n, t)) in by.iter().enumerate() {
-            let n = n.load(Ordering::Relaxed);
-            if n > 0 {
-                rows.push((format!("{} {}", sys_name(crate::syscall::FD_SYS[j]), crate::file::CLASSES[k]), n, t.load(Ordering::Relaxed)));
-            }
-        }
-    }
-    for (name, slot) in [("(page fault)", &STATS.fault), ("(irq)", &STATS.irq), ("(kernel thread)", &STATS.kthread)] {
-        let n = slot.0.load(Ordering::Relaxed);
-        if n > 0 {
-            rows.push((name.into(), n, slot.1.load(Ordering::Relaxed)));
-        }
-    }
-    rows.sort_by_key(|r| core::cmp::Reverse(r.2));
-    rows
 }
 
 /// CPU ごとの、いまロックを持って動いている区間 (始まった時刻, 原因の番号, 重み)。途中で眠るシステムコールも、
@@ -685,149 +655,6 @@ pub static UNIX_FAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub fn dev_wait(i: usize, t0: u64) {
     DEV_WAIT[i].0.fetch_add(1, Ordering::Relaxed);
     DEV_WAIT[i].1.fetch_add(crate::timer::uptime_ns().saturating_sub(t0), Ordering::Relaxed);
-}
-
-/// 数えなおす (/proc/bkl に書く)
-pub fn stats_reset() {
-    for (n, t) in DEV_WAIT.iter().chain(crate::vm::FAULT_KIND.iter()) {
-        n.store(0, Ordering::Relaxed);
-        t.store(0, Ordering::Relaxed);
-    }
-    for c in &STATS.cpu {
-        c.wait.store(0, Ordering::Relaxed);
-        c.hold.store(0, Ordering::Relaxed);
-        c.locks.store(0, Ordering::Relaxed);
-    }
-    for (n, t) in STATS.sys.iter().chain([&STATS.fault, &STATS.irq, &STATS.kthread]).chain(STATS.fd.iter().flatten()) {
-        n.store(0, Ordering::Relaxed);
-        t.store(0, Ordering::Relaxed);
-    }
-    STATS.slept.store(0, Ordering::Relaxed);
-    FAST_FAULTS.store(0, Ordering::Relaxed);
-    PREEMPTS.store(0, Ordering::Relaxed);
-    for c in crate::file::FAST_RW.iter().chain(crate::fastdir::FAST_NS.iter()).chain(FS_WAIT.iter()) {
-        c.store(0, Ordering::Relaxed);
-    }
-    STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
-}
-
-/// /proc/ai/bkl: /proc/bkl と同じものを 1 行の JSON で (AI が読む)
-pub fn stats_json() -> alloc::string::String {
-    use alloc::format;
-    use alloc::string::String;
-    use alloc::vec::Vec;
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let span = crate::timer::uptime_ns().saturating_sub(STATS.start.load(Ordering::Relaxed)).max(1);
-    let pct = |ns: u64| ns as f64 * 100.0 / span as f64;
-    let (mut tw, mut th) = (0, 0);
-    let mut cpus = Vec::new();
-    for c in STATS.cpu.iter().take(online()) {
-        let (w, h) = (c.wait.load(Ordering::Relaxed), c.hold.load(Ordering::Relaxed));
-        tw += w;
-        th += h;
-        cpus.push(format!("{{\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"locks\":{}}}", pct(w), pct(h), c.locks.load(Ordering::Relaxed)));
-    }
-    let rows = hold_rows();
-    let top: Vec<String> = rows.iter().take(25).map(|(name, n, t)| format!("{{\"name\":\"{}\",\"n\":{},\"ms\":{:.1},\"avg_us\":{:.1}}}", name, n, ms(*t), *t as f64 / 1e3 / *n as f64)).collect();
-    let dev: Vec<String> = ["disk", "gpu", "sched", "wake_to_run"].iter().enumerate().map(|(i, name)| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", name, DEV_WAIT[i].0.load(Ordering::Relaxed), ms(DEV_WAIT[i].1.load(Ordering::Relaxed)))).collect();
-    let kinds = ["", "perm", "shared_file", "kernel_page", "swap", "page_cache", "anon_new", "file_new", "cow_copy", "page_cache_miss", "around"];
-    let faults: Vec<String> = crate::vm::FAULT_KIND.iter().enumerate().skip(1).map(|(i, (n, t))| format!("\"{}\":{{\"n\":{},\"ms\":{:.1}}}", kinds[i], n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed)))).collect();
-    let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    format!(
-        "{{\"span_s\":{:.2},\"wait_pct\":{:.1},\"hold_pct\":{:.1},\"cpus\":[{}],\"top\":[{}],\"dev\":{{{}}},\"faults\":{{{}}},\"fast_pipe\":{{\"ok\":{},\"table_busy\":{}}},\"fast_faults\":{},\"slept\":{},\"hold_sample\":{}}}\n",
-        span as f64 / 1e9,
-        pct(tw),
-        pct(th),
-        cpus.join(","),
-        top.join(","),
-        dev.join(","),
-        faults.join(","),
-        fr[0],
-        fr[3],
-        FAST_FAULTS.load(Ordering::Relaxed),
-        STATS.slept.load(Ordering::Relaxed),
-        SAMPLE
-    )
-}
-
-/// /proc/bkl
-pub fn stats() -> alloc::string::String {
-    use alloc::format;
-    use alloc::string::String;
-    use alloc::vec::Vec;
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let span = crate::timer::uptime_ns().saturating_sub(STATS.start.load(Ordering::Relaxed)).max(1);
-    let pct = |ns: u64| ns as f64 * 100.0 / span as f64;
-    let mut s = String::new();
-    s.push_str(&format!("# 大きなロック (BKL)。{:.1} 秒のあいだ (echo > /proc/bkl で数えなおす)。hold は {} 回に 1 回ほど測って {} 倍した見つもり (待ったものはいつも)
-", span as f64 / 1e9, SAMPLE, SAMPLE));
-    s.push_str("cpu      wait (待った)          hold (持っていた)        locks
-");
-    let (mut tw, mut th) = (0, 0);
-    for (i, c) in STATS.cpu.iter().enumerate().take(online()) {
-        let (w, h) = (c.wait.load(Ordering::Relaxed), c.hold.load(Ordering::Relaxed));
-        tw += w;
-        th += h;
-        s.push_str(&format!("{:<4} {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%  {:>10}
-", i, ms(w), pct(w), ms(h), pct(h), c.locks.load(Ordering::Relaxed)));
-    }
-    s.push_str(&format!("all  {:>10.1} ms {:>5.1}%  {:>10.1} ms {:>5.1}%   (1 CPU = 100%)
-
-", ms(tw), pct(tw), ms(th), pct(th)));
-    let rows = hold_rows();
-    s.push_str("hold の長いもの            回数       合計       平均
-");
-    for (name, n, t) in rows.iter().take(25) {
-        s.push_str(&format!("{:<20} {:>10} {:>9.1} ms {:>8.1} us
-", name, n, ms(*t), *t as f64 / 1e3 / *n as f64));
-    }
-    for (i, name) in ["ディスク", "画面", "スケジューラ", "起こされてから走るまで"].iter().enumerate() {
-        let (n, t) = (DEV_WAIT[i].0.load(Ordering::Relaxed), DEV_WAIT[i].1.load(Ordering::Relaxed));
-        s.push_str(&format!("デバイスを待った ({}): {} 回 {:.1} ms\n", name, n, ms(t)));
-    }
-    s.push_str("ページフォルトの種類 (回数 / ms):");
-    for (i, (n, t)) in crate::vm::FAULT_KIND.iter().enumerate().skip(1) {
-        s.push_str(&format!(" {}:{}/{:.1}", i, n.load(Ordering::Relaxed), ms(t.load(Ordering::Relaxed))));
-    }
-    s.push('\n');
-    let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ディスクを眠って待った読み: {} 回 (大きなロックを放して)、書かれたのでやりなおした読み: {} 回\n", DISK_SLEPT.load(Ordering::Relaxed), crate::file::IO_RETRIES.load(Ordering::Relaxed)));
-    let (paths, missing) = crate::vfs::paths_len();
-    s.push_str(&format!("パスの覚え: {} 個 (うちないもの {})、覚えから答えた {} 回\n", paths, missing, crate::vfs::PATHS_HIT.load(Ordering::Relaxed)));
-    s.push_str(&format!("ロックなしの stat (statc.rs): {} 回 (ふつうの道へ {})\n", crate::statc::HITS.load(Ordering::Relaxed), crate::statc::MISSES.load(Ordering::Relaxed)));
-    let uf: Vec<u64> = UNIX_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("AF_UNIX のロックなしの読み書き: 読んだ {} 書いた {} (ふつうの道へ {})\n", uf[0], uf[1], uf[2]));
-    s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}、空で終わりか EAGAIN を返した {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[7], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
-    let fo: Vec<u64> = crate::file::FAST_OPEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ロックなしの open / close (file の棚): 棚から開いた {} 新しく開いた {} ない (ENOENT) と答えた {} 棚にしまった {} (ふつうの道へ: statc にない {} 棚になく新しくも開けない {} 開けない形 {} しまえない {})\n", fo[0], fo[7], fo[1], fo[2], fo[3], fo[4], fo[5], fo[6]));
-    let ns: Vec<u64> = crate::fastdir::FAST_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let fw = [FS_WAIT[0].load(Ordering::Relaxed), FS_WAIT[1].load(Ordering::Relaxed)];
-    s.push_str(&format!("ロックなしの作る・消す (fastdir、ext4 のロックで): 作った {} 消した {} (ふつうの道へ: 形 {} 親が statc にない {} ext4 が断った {})。ext4 のロックを待った {} 回 {:.1} ms\n", ns[0], ns[1], ns[2], ns[3], ns[4], fw[0], fw[1] as f64 / 1e6));
-    let wf: Vec<u64> = crate::vm::WRITE_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));
-    let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさ {} IN_ACCESS の見張り {} fd の表を分けている {} 開いたファイルを分けている {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
-    s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
-", STATS.slept.load(Ordering::Relaxed), FAST_FAULTS.load(Ordering::Relaxed), PREEMPTS.load(Ordering::Relaxed)));
-    // BKL が守るもの (cell::Bkl) を、BKL を持たずに触った場所 (あってはいけない。test/vm-check.sh が見る)
-    s.push_str(&crate::cell::unlocked_text());
-    s
-}
-
-/// lockbench (spinlock::bench): 放して取りなおす 1 回の時間 (ns、10 万回の平均)。持って呼ぶ
-pub fn bench_bkl() -> f64 {
-    let n = 100_000u64;
-    let cnt = || {
-        let c: u64;
-        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c) };
-        c
-    };
-    let t0 = cnt();
-    for _ in 0..n {
-        unlock();
-        lock();
-    }
-    (cnt() - t0) as f64 * 1e9 / crate::timer::freq() as f64 / n as f64
 }
 
 /// この CPU がロックを持っているか

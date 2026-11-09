@@ -2077,10 +2077,6 @@ pub mod notify {
         fn modify_watched(&self) -> bool {
             false
         }
-        /// inotify_add_watch (パスは sysfile.rs がユーザーから)
-        fn add_watch(&self, _fd: u64, _path: &str, _mask: u32) -> Result<i64, i64> {
-            Err(-38)
-        }
     }
 
     struct NoNotify;
@@ -2120,9 +2116,5 @@ pub mod notify {
 
     pub fn modify_watched() -> bool {
         NOTIFY.val().modify_watched()
-    }
-
-    pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
-        NOTIFY.val().add_watch(fd, path, mask)
     }
 }

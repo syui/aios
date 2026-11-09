@@ -1774,7 +1774,7 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
   unix:* (send、recv、deliver)、file:pipe_*、proc:wakeup、それと vfs / extfs / vm / block / jbd2
 
 kernel.json の `bench` のあるもの (vfs、extfs、inet、socket、unix と spinlock、heap、smp、mem) は、その速さを測るものがある。spinlock、
-heap、smp、mem は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/spinlock.rs) で、スピンロックを取って放す、ヒープから取って返す、
+heap、smp、mem は lockbench (`echo lockbench > /proc/ai/ctl`。kernel/src/lockstat.rs) で、スピンロックを取って放す、ヒープから取って返す、
 大きなロックを放して取りなおす、時計を読む (uptime_ns)、物理ページを 1 枚取って返す・1024 枚取ってから返す (kalloc) の 1 回の ns
 (10 万回の平均)、64 KiB の memcpy (src が 1 バイトずれたものも) と 4 KiB を 0 にする memset (mem.S) の 1 回の ns を kmsg に出す。aish の `bench` はこれも 5 回動かして、まんなかを `lock` に出す (`against` があれば、それもくらべる)。
 2 行めの trapbench (kernel/src/trap.rs の bench) は、システムコール 1 回のうちベクタの asm (レジスタを積んでおろす、eret) の

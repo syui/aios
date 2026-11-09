@@ -100,12 +100,12 @@ trap_ret:
 // ベクタの並び: [EL1t, EL1h, EL0 64bit, EL0 32bit] x [sync, irq, fiq, serror]
 const EL1H_SYNC: u64 = 4;
 const EL1H_IRQ: u64 = 5;
-const EL0_SYNC: u64 = 8;
+pub const EL0_SYNC: u64 = 8;
 const EL0_IRQ: u64 = 9;
 
 const EC_UNKNOWN: u64 = 0x00;
 const EC_SYS64: u64 = 0x18;
-const EC_SVC64: u64 = 0x15;
+pub const EC_SVC64: u64 = 0x15;
 const EC_IABT_LOW: u64 = 0x20;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_BRK64: u64 = 0x3c;
@@ -128,7 +128,7 @@ pub fn init() {
 
 /// 例外の理由。1 つの例外で 1 度だけ読んで渡す (QEMU の TCG では ESR_EL1 / FAR_EL1 を読むたびに、HCR_EL2 の
 /// TRVM を確かめる関数を呼ぶ: 1 回 20 ns ほど。システムコールで 6 回読んでいた)
-fn esr() -> u64 {
+pub fn esr() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) v) };
     v
@@ -152,7 +152,7 @@ pub fn intr_off() {
 /// 例外の入口: 大きなロックを取ってから処理し、戻る前に放す (smp.rs)。
 /// EL1 の割り込みはスケジューラが割り込みを待っているとき (ロックを放している) だけ来る
 #[unsafe(no_mangle)]
-extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
+pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if kind == EL1H_SYNC {
         return handle(tf, kind, None, esr());
     }
@@ -414,84 +414,4 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
         }
         _ => panic!("unexpected exception kind {} elr={:#x}", kind, tf.elr),
     }
-}
-
-/// lockbench (/proc/ai/ctl) の 2 行め: システムコール 1 回の、ベクタの asm (レジスタを積んでおろす、eret) のほかの重さ (ns)。
-/// 偽の TrapFrame で trap_handler をそのまま呼ぶ: 速い道 (getppid、ロックなし)、大きなロックを取る道 (umask)。
-/// その中から dispatch だけ (umask)、ユーザーへ戻るまえ (resched、killed、signal) だけ。ゆれるので 7 回まわして速いもの
-pub fn bench() {
-    use core::hint::black_box;
-    let n = 10_000u64;
-    let cnt = || {
-        let c: u64;
-        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c) };
-        c
-    };
-    let ns = |t: u64| t as f64 * 1e9 / crate::timer::freq() as f64 / n as f64;
-    let esr0 = esr();
-    // trap_handler は svc を esr で見分ける
-    unsafe { core::arch::asm!("msr esr_el1, {}", in(reg) EC_SVC64 << 26 | 1 << 25) };
-    let umask = crate::proc::current().files().umask;
-    let mut tf = TrapFrame::zeroed();
-    let sys = |tf: &mut TrapFrame, nr: u64| {
-        tf.x[8] = nr;
-        tf.x[0] = umask as u64;
-    };
-    const GETPPID: u64 = 173;
-    const UMASK: u64 = 166;
-    let mut best = [f64::MAX; 6];
-    for _ in 0..7 {
-        let t0 = cnt();
-        for _ in 0..n {
-            black_box(esr());
-        }
-        best[4] = best[4].min(ns(cnt() - t0));
-        let t0 = cnt();
-        for _ in 0..n {
-            black_box(crate::smp::id());
-        }
-        best[5] = best[5].min(ns(cnt() - t0));
-        // trap_handler は自分でロックを取るので、いったん放す
-        crate::smp::unlock();
-        let t0 = cnt();
-        for _ in 0..n {
-            sys(&mut tf, GETPPID);
-            trap_handler(black_box(&mut tf), EL0_SYNC);
-        }
-        best[0] = best[0].min(ns(cnt() - t0));
-        let t0 = cnt();
-        for _ in 0..n {
-            sys(&mut tf, UMASK);
-            trap_handler(black_box(&mut tf), EL0_SYNC);
-        }
-        best[1] = best[1].min(ns(cnt() - t0));
-        crate::smp::lock();
-        let t0 = cnt();
-        for _ in 0..n {
-            sys(&mut tf, UMASK);
-            black_box(syscall::dispatch(black_box(&mut tf)));
-        }
-        best[2] = best[2].min(ns(cnt() - t0));
-        let t0 = cnt();
-        for _ in 0..n {
-            if proc::take_resched() {
-                proc::yield_now();
-            }
-            proc::check_killed();
-            signal::deliver(black_box(&mut tf), None);
-        }
-        best[3] = best[3].min(ns(cnt() - t0));
-    }
-    crate::proc::current().files().umask = umask;
-    unsafe { core::arch::asm!("msr esr_el1, {}", in(reg) esr0) };
-    crate::println!(
-        "trapbench: getppid (fast) {:.1} ns, umask (BKL) {:.1} ns, dispatch {:.1} ns, exit {:.1} ns, mrs esr {:.1} ns, cpu id {:.1} ns (hold timed 1 in {})",
-        best[0],
-        best[1],
-        best[2],
-        best[3],
-        best[4],
-        best[5],
-        crate::smp::SAMPLE
-    );
 }
