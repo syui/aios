@@ -233,15 +233,15 @@ pub fn landlock(access: u64, net: bool, what: &str) -> i64 {
     -crate::cred::EACCES
 }
 
-/// landlock の scope か permission が止めた (抽象 unix ソケット、シグナル、ptrace、namespace、capability)。what は
-/// 止めたこと。EPERM を返す
+/// landlock の scope か permission (抽象 unix ソケット、シグナル、ptrace、namespace、capability: EPERM)、または REFER
+/// (ディレクトリをまたいでつなぐ・移す: EXDEV。Linux の current_check_refer_path) が止めた。what は止めたこと。errno を返す
 #[cold]
-pub fn landlock_scope(what: &str) -> i64 {
+pub fn landlock_scope(errno: i64, what: &str) -> i64 {
     if let Some(n) = me() {
-        *n = Note { code: Code::Landlock, errno: crate::cred::EPERM as u16, want: 2, ..NONE };
+        *n = Note { code: Code::Landlock, errno: errno as u16, want: 2, ..NONE };
         n.plen = copy(&mut n.path, what);
     }
-    -crate::cred::EPERM
+    -errno
 }
 
 /// ファイアウォールが、いまのシステムコールのパケットを落とした (nfhook.rs の道から)。errno は返すときに決まる

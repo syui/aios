@@ -359,7 +359,8 @@ audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp �
 プロセスやファイルに持たせるもの (AppArmor のラベル、landlock の層、開いたときに覚えたもの) は、core の中立の名前の欄
 (Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。フックの順も、見る
 ときも Linux と同じ (landlock が先、はじめの Err が勝つ。O_CREAT は作る前に security::path_mknod、開くのは作ったあとに
-security::file_open: 開けなくても作ったものは残る。test/llorder.c)。大きなロックなしの道が seccomp と landlock の有無を
+security::file_open: 開けなくても作ったものは残る。link と rename でディレクトリをまたぐのは、MAKE_* や REMOVE_* が
+なければ EACCES、REFER がないか移したものの権利が先でふえる (Linux の no_more_access) なら EXDEV。test/llorder.c)。大きなロックなしの道が seccomp と landlock の有無を
 見るのは、Cred ではなく Proc::cred_work (Linux の TIF_SECCOMP と同じく atomic な印: TSYNC がほかのスレッドの cred を
 書くのと競らない)。
 Linux で持ち主のところにある値やつなぎは、aios でも持ち主に置く: /proc/sys の値 (fs.suid_dumpable は exec.rs、

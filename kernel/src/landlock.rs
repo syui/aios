@@ -239,7 +239,7 @@ fn same_layer(client: &Domain, server: Option<&Domain>, i: usize) -> bool {
 /// hook_unix_may_send)。だめなら -EPERM
 pub fn check_scope_unix(other: Option<&Domain>) -> Result<(), i64> {
     match domain() {
-        Some(d) if scoped(&d, other, SCOPE_UNIX) => Err(crate::why::landlock_scope("connecting to an abstract unix socket outside its domain")),
+        Some(d) if scoped(&d, other, SCOPE_UNIX) => Err(crate::why::landlock_scope(crate::cred::EPERM, "connecting to an abstract unix socket outside its domain")),
         _ => Ok(()),
     }
 }
@@ -247,7 +247,7 @@ pub fn check_scope_unix(other: Option<&Domain>) -> Result<(), i64> {
 /// target にシグナルを送る (Linux の hook_task_kill。同じスレッドグループは呼ぶほうで外す)。だめなら -EPERM
 pub fn check_scope_signal(target: Option<&Domain>) -> Result<(), i64> {
     match domain() {
-        Some(d) if scoped(&d, target, SCOPE_SIGNAL) => Err(crate::why::landlock_scope("signaling a process outside its domain")),
+        Some(d) if scoped(&d, target, SCOPE_SIGNAL) => Err(crate::why::landlock_scope(crate::cred::EPERM, "signaling a process outside its domain")),
         _ => Ok(()),
     }
 }
@@ -259,7 +259,7 @@ pub fn check_ptrace(tracer: Option<&Domain>, tracee: Option<&Domain>) -> Result<
     if tracee.map(view).is_some_and(|c| c.len() > top && Rc::ptr_eq(&c[top], &p[top])) {
         return Ok(());
     }
-    Err(crate::why::landlock_scope("tracing a process outside its domain"))
+    Err(crate::why::landlock_scope(crate::cred::EPERM, "tracing a process outside its domain"))
 }
 
 /// 名前のある unix ソケット path (先頭 / なし) に、つなぐ・送る (Linux の hook_unix_find)。相手 (作ったプロセスの層が
@@ -352,7 +352,7 @@ pub fn cap_ok(c: &crate::cred::Cred, cap: u32) -> bool {
 pub fn check_ns(c: &crate::cred::Cred, flags: u64) -> Result<(), i64> {
     let want = flags & CLONE_NS_ALL;
     match &c.sandbox {
-        Some(d) if want != 0 && view(d).iter().any(|r| r.perms & PERM_NS != 0 && want & !r.ns != 0) => Err(crate::why::landlock_scope("creating a namespace")),
+        Some(d) if want != 0 && view(d).iter().any(|r| r.perms & PERM_NS != 0 && want & !r.ns != 0) => Err(crate::why::landlock_scope(crate::cred::EPERM, "creating a namespace")),
         _ => Ok(()),
     }
 }
@@ -587,6 +587,28 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
+fn is_dir(mode: u32) -> bool {
+    mode & crate::vfs::S_IFMT == crate::vfs::S_IFDIR
+}
+
+/// ディレクトリをまたいでつなぐ・移す (Linux の current_check_refer_path。MAKE_* や REMOVE_* は呼ぶ前に見た: 足りなければ
+/// そちらの EACCES が先)。両方の親に REFER、そして old (dir はディレクトリか) を new の親へ移しても権利がふえない: どの層
+/// でも、old に止められていたものは new の親でも止められる (Linux の no_more_access。ディレクトリでないものはファイルの
+/// 権利だけくらべる)。入れかえ (exchange は new にあったもの) なら逆も。だめなら EXDEV
+fn check_refer(old: &str, dir: bool, new: &str, exchange: Option<bool>) -> Result<(), i64> {
+    let Some(d) = domain() else { return Ok(()) };
+    for r in view(&d) {
+        let gains = |child: &str, dir: bool, to: &str| {
+            let m = if dir { FS_ALL } else { FS_FILE };
+            r.denied_fs(child, m) & !r.denied_fs(dir_of(to), m) != 0
+        };
+        if r.denied_fs(dir_of(old), REFER) | r.denied_fs(dir_of(new), REFER) != 0 || gains(old, dir, new) || exchange.is_some_and(|t| gains(new, t, old)) {
+            return Err(crate::why::landlock_scope(crate::vfs::EXDEV, "linking or renaming across directories (refer)"));
+        }
+    }
+    Ok(())
+}
+
 impl crate::security::Lsm for Landlock {
     fn id(&self) -> (&'static str, u64) {
         ("landlock", crate::security::LSM_ID_LANDLOCK)
@@ -675,10 +697,10 @@ impl crate::security::Lsm for Landlock {
     /// link (Linux の hook_path_link): 作るところの MAKE_* (つなぐものの種類で)。ほかのディレクトリのものをつなぐなら、
     /// 両方に REFER も
     fn path_link(&self, src: &str, full: &str, ino: &crate::vfs::InodeRef) -> Result<(), i64> {
-        check_parent(full, make_right(ino.meta().mode))?;
+        let mode = ino.meta().mode;
+        check_parent(full, make_right(mode))?;
         if dir_of(src) != dir_of(full) {
-            check_parent(src, REFER)?;
-            check_parent(full, REFER)?;
+            check_refer(src, is_dir(mode), full, None)?;
         }
         Ok(())
     }
@@ -686,7 +708,7 @@ impl crate::security::Lsm for Landlock {
     /// rename: 元を消して、先に作る (先にあるものは消す)。入れかえなら、それも元のところへ作る。ディレクトリを
     /// またぐなら両方に REFER も
     fn path_rename(&self, r: &crate::security::Rename) -> Result<(), i64> {
-        let kind = |m: u32| if m & crate::vfs::S_IFMT == crate::vfs::S_IFDIR { REMOVE_DIR } else { REMOVE_FILE };
+        let kind = |m: u32| if is_dir(m) { REMOVE_DIR } else { REMOVE_FILE };
         let mode = r.moving.meta().mode;
         check_parent(r.old, kind(mode))?;
         check_parent(r.new, make_right(mode))?;
@@ -697,8 +719,7 @@ impl crate::security::Lsm for Landlock {
             }
         }
         if dir_of(r.old) != dir_of(r.new) {
-            check_parent(r.old, REFER)?;
-            check_parent(r.new, REFER)?;
+            check_refer(r.old, is_dir(mode), r.new, r.target.filter(|_| r.exchange).map(|t| is_dir(t.meta().mode)))?;
         }
         Ok(())
     }

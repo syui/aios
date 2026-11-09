@@ -1,6 +1,8 @@
 // landlock と Linux の順 (LSM のフックの順を Linux に合わせたところ。test/ldiff.sh llorder で Linux とくらべる)
 //   O_CREAT: 作る (MAKE_REG) は作る前に、開く (READ_FILE / WRITE_FILE) は作ったあとに見る。開けなくても作ったものは残る
 //   link: 同じディレクトリなら MAKE_REG だけ、ほかのディレクトリへは REFER も (なければ EXDEV)
+//   rename と link でディレクトリをまたぐ: MAKE_* / REMOVE_* がなければ EACCES、REFER がないか、移したものの権利が
+//   先でふえるなら EXDEV (Linux の no_more_access。入れかえなら逆も)
 //   get_robust_list: 砂場の中から外のプロセスのものは読めない (ptrace_may_access に landlock も)
 // それぞれ fork した子で砂場をかける (層が重ならないように)。出すのは 0 か errno の名前と、作ったものがあるか
 #define _GNU_SOURCE
@@ -129,6 +131,35 @@ static void links(void) {
   printf("link other dir (no make): %s\n", err(link(s, t)));
 }
 
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE 2
+#endif
+
+static void move(const char *label, const char *from, const char *to, int how) {
+  char s[128], t[128];
+  path(s, from);
+  path(t, to);
+  long r = how < 0 ? link(s, t) : syscall(SYS_renameat2, AT_FDCWD, s, AT_FDCWD, t, how);
+  printf("%s: %s\n", label, err(r));
+}
+
+// d1: 作る・消す・REFER。d2: それと READ_FILE。d3: 作る・消すだけ (REFER なし)。a: なにもなし
+static void refer(void) {
+  const unsigned long long mv = LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REFER;
+  const char *d[] = {"d1", "d2", "d3"};
+  unsigned long long al[] = {mv, mv | LANDLOCK_ACCESS_FS_READ_FILE, mv & ~LANDLOCK_ACCESS_FS_REFER};
+  sandbox(mv | LANDLOCK_ACCESS_FS_READ_FILE, d, al, 3);
+  move("rename same dir", "d1/r1", "d1/r1b", 0);
+  move("rename no make", "d1/r1b", "a/r1", 0);
+  move("rename no refer", "d1/r1b", "d3/r1", 0);
+  move("rename gains read", "d1/r1b", "d2/r1", 0);
+  move("rename loses read", "d2/r2", "d1/r2", 0);
+  move("link gains read", "d1/r1b", "d2/l1", -1);
+  move("link loses read", "d2/r4", "d1/l2", -1);
+  move("exchange one gains", "d1/r3", "d2/r4", RENAME_EXCHANGE);
+  move("exchange same rights", "d1/r1b", "d1/r3", RENAME_EXCHANGE);
+}
+
 // get_robust_list: 砂場の中から、砂場の外の親のものを
 static void robust(void) {
   const char *d[] = {"a"};
@@ -143,19 +174,23 @@ static void robust(void) {
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   snprintf(base, sizeof base, "/tmp/llorder.%d", getpid());
-  const char *dirs[] = {"", "/a", "/b", "/c1", "/c2", "/c3"};
+  const char *dirs[] = {"", "/a", "/b", "/c1", "/c2", "/c3", "/d1", "/d2", "/d3"};
   for (unsigned i = 0; i < sizeof dirs / sizeof *dirs; i++) {
     char p[128];
     snprintf(p, sizeof p, "%s%s", base, dirs[i]);
     mkdir(p, 0700);
   }
-  char x[128];
-  path(x, "c1/x");
-  close(open(x, O_CREAT | O_WRONLY, 0600));
+  const char *files[] = {"c1/x", "d1/r1", "d2/r2", "d1/r3", "d2/r4"};
+  for (unsigned i = 0; i < sizeof files / sizeof *files; i++) {
+    char x[128];
+    path(x, files[i]);
+    close(open(x, O_CREAT | O_WRONLY, 0600));
+  }
   run(make_only);
   run(make_write);
   run(no_make);
   run(links);
+  run(refer);
   run(robust);
   return 0;
 }
