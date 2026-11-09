@@ -4578,6 +4578,15 @@ impl Inode for ExtInode {
         true
     }
 
+    /// 同じ inode の新しい ExtInode (数は帳簿の中で: ExtInode::counted) と、いまの Meta (覚えか、キャッシュにある inode の
+    /// ブロックから。ディスクを読むなら None)。作る・消すの fastdir と同じく ext4 のロックをいっしょに持って
+    // [lockless]
+    fn fast_dup(&self) -> Option<(InodeRef, Meta)> {
+        let _e = fs_lock_shared();
+        let m = crate::proc::noio(|| self.fs.meta_now(self.ino))?;
+        Some((ExtInode::make(&self.fs, self.ino), m))
+    }
+
     fn path_cacheable(&self) -> bool {
         true
     }

@@ -813,10 +813,45 @@ fn cached_page(key: &FileKey, ver: (u64, u64), exec: bool) -> Option<*mut u8> {
 }
 
 /// ファイルの版 (更新時刻と大きさ)
+/// 大きなロックなしの mmap (syscall::fast) の、ふつうのファイルの写し (MAP_PRIVATE、MAP_FIXED でないもの): fd の表も
+/// アドレス空間も自分だけで、ファイルシステムが同じ inode の新しい InodeRef を作れる (Inode::fast_dup: ext4) とき。領域には
+/// その新しい InodeRef と新しい名前を入れる (開いたファイルの Rc は写さない: 大きなロックなしで、分けている Rc の数を
+/// 変えないため)。読めない口、ふつうのファイルでないもの、場所がないものなどは None (ふつうの道がエラーを返す)。
+/// LSM の mmap_file (AppArmor) は、syscall::fast がラベルのあるプロセスをふつうの道へ回すので見なくてよい (landlock に
+/// mmap のフックはない: Linux と同じ)
+// [lockless]
+pub fn fast_mmap_file(me: &crate::proc::Proc, fd: u64, len: usize, prot: u64, off: usize) -> Option<i64> {
+    use crate::file::{Kind, O_ACCMODE, O_PATH, O_RDONLY, O_RDWR};
+    let files = me.files.as_ref().filter(|f| f.private())?;
+    let m = me.mm.as_ref().filter(|m| m.private())?.get();
+    let t = files.get();
+    let fr = &t.fds.get(fd as usize)?.as_ref()?.file;
+    // 表は自分だけなので、借りずに読む (ほかの大きなロックなしの道と同じ)
+    let of = unsafe { &*fr.as_ptr() };
+    let acc = of.flags & O_ACCMODE;
+    if of.flags & O_PATH != 0 || (acc != O_RDONLY && acc != O_RDWR) {
+        return None;
+    }
+    let Kind::Inode(ino, path) = &of.kind else { return None };
+    let (dup, meta) = ino.fast_dup()?;
+    if meta.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG {
+        return None;
+    }
+    // lockless-ok: 新しい Rc<str> (まだだれも持っていない)
+    let name: alloc::rc::Rc<str> = alloc::rc::Rc::from(path.as_str());
+    let len = pg_up(len);
+    // ファイルの終わりはふれたときの大きさで見る (sys_mmap と同じく fend は終わりなし)
+    let back = Backing::File { ino: dup, off, fend: usize::MAX, ver: meta_ver(&meta) };
+    let va = m.pt.fast_map_with(m.mmap_next, len, (prot & 7) as u8, back, Some(name)).ok()?;
+    m.mmap_next = va + len;
+    Some(va as i64)
+}
+
 pub fn file_ver(ino: &InodeRef) -> (u64, u64) {
     meta_ver(&ino.meta())
 }
 
+// [lockless]
 pub fn meta_ver(m: &crate::vfs::Meta) -> (u64, u64) {
     (m.mtime, m.size)
 }
@@ -3008,8 +3043,15 @@ impl PageTable {
     /// だけで、それとは fast_enter ですれちがう。場所がない (ENOMEM) か、だれかが変えている途中なら None (ふつうの道へ)
     // [lockless]
     pub fn fast_map(&mut self, hint: usize, len: usize, prot: u8) -> Option<usize> {
+        self.fast_map_with(hint, len, prot, Backing::Anon, None).ok()
+    }
+
+    /// fast_map の、写すもの (back) と名前のあるもの (vm::fast_mmap_file のファイルの写し)。back と name の Rc は、
+    /// だれとも分けていない新しいものだけ (動かして領域に入れる)。できなければ返す (呼んだほうが落とす)
+    // [lockless]
+    pub fn fast_map_with(&mut self, hint: usize, len: usize, prot: u8, back: Backing, name: Option<alloc::rc::Rc<str>>) -> Result<usize, (Backing, Option<alloc::rc::Rc<str>>)> {
         if !self.fast_enter() {
-            return None;
+            return Err((back, name));
         }
         let va = self.free_area(hint, len);
         let r = match va.checked_add(len) {
@@ -3017,10 +3059,10 @@ impl PageTable {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
                 self.last_end = end;
-                self.vmas.insert(va, Vma { end, prot, shared: false, back: Backing::Anon, name: None });
-                Some(va)
+                self.vmas.insert(va, Vma { end, prot, shared: false, back, name });
+                Ok(va)
             }
-            _ => None,
+            _ => Err((back, name)),
         };
         self.fast_leave();
         r

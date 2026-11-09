@@ -124,6 +124,14 @@ pub trait Inode {
         false
     }
 
+    /// 大きなロックなしの mmap (vm::fast_mmap_file) から: 同じファイルをさす新しい InodeRef と、いまの Meta。返す Rc は
+    /// だれとも分けていない新しいもの (大きなロックなしの道で、分けている Rc の数を変えないため)。作れなければ None
+    /// (ふつうの道で)。ext4 だけ (tmpfs の inode はそれ 1 つしかない)
+    // [lockless]
+    fn fast_dup(&self) -> Option<(InodeRef, Meta)> {
+        None
+    }
+
     fn path_cacheable(&self) -> bool {
         false
     }

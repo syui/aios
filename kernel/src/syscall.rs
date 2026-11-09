@@ -816,6 +816,21 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             m.mmap_next = va + len;
             va as i64
         }
+        // ふつうのファイルの写し (MAP_PRIVATE、MAP_FIXED でないもの): ext4 なら同じ inode の新しい InodeRef で
+        // (vm::fast_mmap_file)。できなければふつうの道 (エラーもそこで)
+        MMAP if a[3] & !(MAP_PRIVATE | MAP_NORESERVE) == 0
+            && a[3] & MAP_PRIVATE != 0
+            && a[2] & !7 == 0
+            && a[5] % 4096 == 0
+            && a[1] != 0
+            && a[1] <= crate::vm::MAXVA as u64
+            && (a[4] as i32) >= 0 =>
+        {
+            match crate::vm::fast_mmap_file(p, a[4] as i32 as u64, a[1] as usize, a[2], a[5] as usize) {
+                Some(r) => r,
+                None => return false,
+            }
+        }
         MUNMAP if a[0] & 0xfff == 0 && a[1] != 0 && a[0] < crate::vm::MAXVA as u64 && a[1] <= crate::vm::MAXVA as u64 => {
             let Some(m) = p.mm.as_ref().filter(|m| m.private()) else { return false };
             match m.get().pt.fast_unmap(a[0] as usize, a[0] as usize + pg_up(a[1] as usize)) {
