@@ -1782,8 +1782,6 @@ fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
 
 // ---- 大きなロックなしの read / write ----
 
-/// fast_rw の数 (/proc/bkl): 書いた、読んだ、ふつうの道へ
-pub static FAST: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// 大きなロックなしの read / write (syscall::fast): つないだ SOCK_STREAM の、fd も資格情報も MSG_OOB もないバイトで、
 /// 眠らずにすむときだけ。ほかは None (ふつうの道へ: 送れる余地がない、読むものが SO_RCVLOWAT より少ない、SO_PASSCRED、
@@ -1791,7 +1789,7 @@ pub static FAST: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomi
 pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     let r = fast_rw_inner(me, fd, buf, len, write);
-    FAST[if r.is_none() { 2 } else { write as usize }].fetch_add(1, Relaxed);
+    crate::smp::UNIX_FAST[if r.is_none() { 2 } else { write as usize }].fetch_add(1, Relaxed);
     r
 }
 

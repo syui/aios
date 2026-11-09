@@ -484,7 +484,7 @@ fn containing(l: &[Mount], path: &str, before: usize) -> Option<usize> {
 fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
     if ro {
         RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
-        drop(crate::extfs::fs_lock());
+        drop(crate::smp::fs_lock());
     }
     let (target, dir) = lookup("", path, true)?;
     if !dir.meta().is_dir() {
@@ -553,7 +553,7 @@ pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
     let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
     if ro {
         RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
-        drop(crate::extfs::fs_lock());
+        drop(crate::smp::fs_lock());
     }
     m.ro = ro;
     drop(l);

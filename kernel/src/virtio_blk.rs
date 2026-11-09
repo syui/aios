@@ -78,8 +78,6 @@ fn disk() -> &'static mut Disk {
     DISK.get().as_mut().expect("no disk")
 }
 
-/// 眠って待った読みの数 (/proc/bkl)
-pub static SLEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// 出ている要求が終わっていれば、印をつけて起こす (大きなロックを持って)。終わったものがあれば true
 fn complete(d: &mut Disk) -> bool {
@@ -171,7 +169,7 @@ fn rw_segs(sector: u64, segs: &[(*mut u8, usize)], write: bool, sleep: bool) -> 
     }
     crate::smp::dev_wait(0, t0);
     if sleep {
-        SLEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::smp::DISK_SLEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     if !sleep {
         d.mmio.ack();

@@ -198,7 +198,7 @@ pub fn add_watch(fd: u64, path: &str, mask: u32) -> Result<i64, i64> {
     }
     // いま大きなロックなしで作っている・消しているもの (fastdir.rs) が終わるのを待つ (ext4 のロック): あとから来るものは、
     // ロックを取ってから数を見るので、ふつうの道へ行く
-    drop(crate::extfs::fs_lock());
+    drop(crate::smp::fs_lock());
     let mut n = n.borrow_mut();
     if let Some(w) = n.watches.iter_mut().find(|w| w.id == id) {
         count(w.mask, false);

@@ -222,11 +222,10 @@ impl Files {
         {
             crate::locks::release_posix(self as *const Files as usize, k);
         }
-        // ソケットなら、送られている途中の輪が残ったかもしれない (unix.rs の gc。システムコールの終わりに)
-        if let Some(fd) = &old
-            && matches!(fd.file.borrow().kind, crate::file::Kind::Unix(_))
-        {
-            crate::unix::closed();
+        // 閉じたあとの片づけ (AF_UNIX なら、送られている途中の輪が残ったかもしれない: file.rs から unix.rs の gc。
+        // システムコールの終わりに)
+        if let Some(fd) = &old {
+            crate::file::closed(&fd.file.borrow().kind);
         }
         old
     }
@@ -1430,13 +1429,13 @@ fn sched() {
     let seg = crate::smp::seg_pause();
     let off = crate::debug::prof_off_cpu();
     // ext4 のロックは眠るあいだ手放す (大きなロックと同じく、ほかがそのあいだに ext4 に入れるように)
-    let fs = crate::extfs::fs_unlock_for_sleep();
+    let fs = crate::smp::fs_unlock_for_sleep();
     unsafe {
         fp_save(&mut p.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) p.tpidr);
         swtch(&mut p.context, sched_ctx());
     }
-    crate::extfs::fs_relock_after_sleep(fs);
+    crate::smp::fs_relock_after_sleep(fs);
     crate::debug::prof_on_cpu(off);
     crate::smp::seg_resume(seg);
 }
@@ -1758,7 +1757,7 @@ fn exit_status(status: i32) -> ! {
     drop(_p);
     let _p = crate::debug::span("proc:exit_files");
     p.files = None;
-    crate::unix::gc_check(true);
+    crate::file::release_deferred(true);
     p.timers.clear();
     drop(_p);
     // アドレス空間はここで捨てる (Linux の exit_mm と同じ)。前は親が wait するまでゾンビが持っていたので、OOM で

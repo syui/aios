@@ -20,195 +20,9 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // ---- ext4 のロック ----
-// 大きなロック (smp.rs) のほかに、ext4 の中 (ExtFs の Shared と ACell、ブロックのキャッシュ、ExtInode の数と Rc<ExtFs> の数) を守る。
-// 読み書きロック: ext4 に入るところ (ExtInode の Inode の関数、ExtFs の外から呼ぶ関数) は、ひとりで持つ (fs_lock)。
-// 大きなロックなしの作る・消す (fastdir.rs) と、ExtInode を落とすところ (数を減らすだけのとき) は、いっしょに持つ
-// (fs_lock_shared): ちがうディレクトリなら同時に動く (Linux はディレクトリごとの i_rwsem と、グループごとのロック)。
-// いっしょに持つものどうしは、ディレクトリごとのロック (DIR_LOCKS)、inode とブロックを取る・返すロック (ALLOC)、
-// 帳簿のロック (BOOK、META_BOOK、NAME_BOOK: ExtFs の Shared をさわるあいだだけ) で分ける。ひとりで持とうとするものは、いっしょに持つものが
-// みな出るのを待ち、待っているあいだは新しくいっしょには入れない (ひとりで持つ道が待ちつづけないように)。
-// ひとりで持つのはスレッド (proc の番号。スケジューラの中は CPU) で、重ねて取れる。眠るとき (proc::sched) は手放し、
-// 起きたらまた取る (大きなロックと同じく、眠っているあいだにほかが ext4 を変えてよい: with_block の wgen がそれを見る)。
-// いっしょに持つのは CPU ごとに数える (カーネルは割り込みを止めて動き、いっしょに持ったまま眠らない) ので、重ねて取れる
-// (ひとりで持っているものが、いっしょにと頼めば、重ねて取ったことに)。いっしょに持ったまま、ひとりで持とうとしては
-// いけない (panic)。
+// ロックそのもの (fs_lock、fs_lock_shared。眠るときに手放す) は smp.rs (大きなロックのとなり: core)。ここはその中の分け方
 // 取る順は 大きなロック → ext4 のロック → DIR_LOCKS → ALLOC → BOOK → META_BOOK → NAME_BOOK → fd の表ごとのスピンロック
-static FS_OWNER: AtomicUsize = AtomicUsize::new(0);
-/// 重ねて取った数 (持ち主だけが書く)
-static FS_DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// いっしょに持っている CPU の数
-static FS_READERS: AtomicUsize = AtomicUsize::new(0);
-/// ひとりで持とうとして待っているものの数
-static FS_WANT: AtomicUsize = AtomicUsize::new(0);
-/// CPU ごとの、いっしょに持っている重ねた数 (その CPU だけが書く)
-static FS_SHARED: [AtomicUsize; crate::smp::MAXCPU] = [const { AtomicUsize::new(0) }; crate::smp::MAXCPU];
-/// 待った回数と時間 (ns。SAMPLE 回に 1 回測った見つもり) (/proc/bkl)
-pub static FS_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-fn fs_me() -> usize {
-    crate::proc::cur_index().unwrap_or(crate::proc::NPROC + crate::smp::id()) + 1
-}
-
-/// ext4 のロックを持っているしるし (落とすと放す)。true はいっしょに
-pub struct FsGuard(bool);
-
-/// ひとりで持つ
-pub fn fs_lock() -> FsGuard {
-    let me = fs_me();
-    if FS_OWNER.load(Ordering::Relaxed) == me {
-        FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-        return FsGuard(false);
-    }
-    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
-        panic!("extfs: the ext4 lock is wanted alone while this CPU holds it shared");
-    }
-    fs_acquire(me);
-    FS_DEPTH.store(1, Ordering::Relaxed);
-    FsGuard(false)
-}
-
-/// いっしょに持つ (fastdir の作る・消すと、ExtInode を落とすところ)。ひとりで持っていれば、それを重ねて
-pub fn fs_lock_shared() -> FsGuard {
-    if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
-        FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-        return FsGuard(false);
-    }
-    let c = &FS_SHARED[crate::smp::id()];
-    let n = c.load(Ordering::Relaxed);
-    if n == 0 {
-        fs_acquire_shared();
-    }
-    c.store(n + 1, Ordering::Relaxed);
-    FsGuard(true)
-}
-
-/// 待ちはじめ: 回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
-/// 時計を読むのが重く、ロックを持つ時間が伸びる)
-fn wait_begin() -> u64 {
-    let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % crate::smp::SAMPLE == 0;
-    if timed { crate::timer::uptime_ns().max(1) } else { 0 }
-}
-
-fn wait_end(t0: u64) {
-    if t0 != 0 {
-        FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * crate::smp::SAMPLE, Ordering::Relaxed);
-    }
-}
-
-fn wfe() {
-    // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
-    unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-}
-
-fn sev() {
-    unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
-}
-
-fn fs_acquire(me: usize) {
-    let mut t0 = None;
-    if FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-        t0 = Some(wait_begin());
-        FS_WANT.fetch_add(1, Ordering::SeqCst);
-        loop {
-            wfe();
-            if FS_OWNER.load(Ordering::Relaxed) == 0 && FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                break;
-            }
-        }
-        FS_WANT.fetch_sub(1, Ordering::SeqCst);
-    }
-    // いっしょに持っているものが出るのを待つ (FS_OWNER を立てたので、新しくは入らない。入りかけたものは FS_OWNER を見て出る)
-    while FS_READERS.load(Ordering::SeqCst) != 0 {
-        if t0.is_none() {
-            t0 = Some(wait_begin());
-        }
-        wfe();
-    }
-    if let Some(t) = t0 {
-        wait_end(t);
-    }
-}
-
-fn fs_acquire_shared() {
-    let mut t0 = None;
-    loop {
-        if FS_OWNER.load(Ordering::SeqCst) == 0 && FS_WANT.load(Ordering::SeqCst) == 0 {
-            FS_READERS.fetch_add(1, Ordering::SeqCst);
-            if FS_OWNER.load(Ordering::SeqCst) == 0 {
-                break;
-            }
-            // ひとりで持とうとするものが先だった
-            FS_READERS.fetch_sub(1, Ordering::SeqCst);
-            sev();
-        }
-        if t0.is_none() {
-            t0 = Some(wait_begin());
-        }
-        wfe();
-    }
-    if let Some(t) = t0 {
-        wait_end(t);
-    }
-}
-
-fn fs_release() {
-    FS_DEPTH.store(0, Ordering::Relaxed);
-    FS_OWNER.store(0, Ordering::Release);
-    sev();
-}
-
-impl Drop for FsGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            let c = &FS_SHARED[crate::smp::id()];
-            let n = c.load(Ordering::Relaxed);
-            c.store(n - 1, Ordering::Relaxed);
-            if n == 1 {
-                FS_READERS.fetch_sub(1, Ordering::Release);
-                sev();
-            }
-            return;
-        }
-        let d = FS_DEPTH.load(Ordering::Relaxed);
-        if d > 1 {
-            FS_DEPTH.store(d - 1, Ordering::Relaxed);
-        } else {
-            fs_release();
-        }
-    }
-}
-
-/// 眠る前 (proc::sched): いまのスレッドが ext4 のロックを持っていれば手放し、重ねた数を返す (0 なら持っていない)
-pub fn fs_unlock_for_sleep() -> usize {
-    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
-        panic!("extfs: sleeping while holding the ext4 lock shared");
-    }
-    if FS_OWNER.load(Ordering::Relaxed) != fs_me() {
-        return 0;
-    }
-    let d = FS_DEPTH.load(Ordering::Relaxed);
-    fs_release();
-    d
-}
-
-/// 起きたあと: fs_unlock_for_sleep が手放したものを取りなおす
-pub fn fs_relock_after_sleep(d: usize) {
-    if d > 0 {
-        fs_acquire(fs_me());
-        FS_DEPTH.store(d, Ordering::Relaxed);
-    }
-}
-
-/// システムコールや例外から戻るとき: ext4 のロックを持ったままなら、取ったところと放すところの組がこわれている
-/// (そのままでは ext4 に入るものがみな止まる)
-pub fn fs_check_released() {
-    if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
-        panic!("extfs: the ext4 lock is still held on the way out (depth {})", FS_DEPTH.load(Ordering::Relaxed));
-    }
-    if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 {
-        panic!("extfs: the ext4 lock is still held shared on the way out");
-    }
-}
+use crate::smp::{fs_lock, fs_lock_shared};
 
 /// いっしょに持つものどうしの、ディレクトリごとのロック (dir の inode の番号で分ける。同じ箱のほかのディレクトリとは
 /// 1 つずつ): そのディレクトリのブロックと inode を、なめてから書きかえるまで
@@ -249,7 +63,7 @@ impl BookLock {
 
     fn take(&'static self) -> BookGuard {
         let c = crate::smp::id();
-        if FS_SHARED[c].load(Ordering::Relaxed) == 0 {
+        if !crate::smp::fs_shared_here() {
             return BookGuard(None);
         }
         let me = c + 1;
@@ -292,7 +106,7 @@ impl Drop for BookGuard {
 /// この CPU が ext4 のロックをいっしょに持っている (そのあいだは、ブロックのキャッシュの表に足したり捨てたりしない:
 /// 足すのはディスクを読むとき、捨てるのはブロックを返すときで、どちらもひとりで持つときだけ)
 fn shared_here() -> bool {
-    FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0
+    crate::smp::fs_shared_here()
 }
 
 
@@ -1245,7 +1059,7 @@ impl ExtFs {
     /// 3.4 GB のモデルの、しばらく触れていないところ) は、ここで捨てないと空かない。この CPU が ext4 のロックを
     /// いっしょに持っているとき (ひとりで持てない) と、キャッシュをさわっている途中なら何もしない。捨てた数
     pub fn shrink(&self, n: usize) -> usize {
-        if FS_SHARED[crate::smp::id()].load(Ordering::Relaxed) != 0 && FS_OWNER.load(Ordering::Relaxed) != fs_me() {
+        if crate::smp::fs_shared_here() && !crate::smp::fs_owned_here() {
             return 0;
         }
         let _e = fs_lock();

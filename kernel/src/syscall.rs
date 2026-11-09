@@ -730,7 +730,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         crate::why::done(nr, e, &a);
     }
     // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
-    crate::unix::gc_check(false);
+    crate::file::release_deferred(false);
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let (restartable, always) = match nr {
         FUTEX => crate::futex::restart_kind(a[1], a[3] as usize),

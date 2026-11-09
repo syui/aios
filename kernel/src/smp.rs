@@ -201,6 +201,206 @@ pub fn unlock_at(now: u64) {
     }
 }
 
+// ---- ファイルシステムのロック (いまは ext4: extfs.rs が使う) ----
+// 大きなロック (上) のほかに、ext4 の中 (ExtFs の Shared と ACell、ブロックのキャッシュ、ExtInode の数と Rc<ExtFs> の数) を守る。
+// 読み書きロック: ext4 に入るところ (ExtInode の Inode の関数、ExtFs の外から呼ぶ関数) は、ひとりで持つ (fs_lock)。
+// 大きなロックなしの作る・消す (fastdir.rs) と、ExtInode を落とすところ (数を減らすだけのとき) は、いっしょに持つ
+// (fs_lock_shared): ちがうディレクトリなら同時に動く (Linux はディレクトリごとの i_rwsem と、グループごとのロック)。
+// いっしょに持つものどうしは、ディレクトリごとのロック (DIR_LOCKS)、inode とブロックを取る・返すロック (ALLOC)、
+// 帳簿のロック (BOOK、META_BOOK、NAME_BOOK: ExtFs の Shared をさわるあいだだけ) で分ける。ひとりで持とうとするものは、いっしょに持つものが
+// みな出るのを待ち、待っているあいだは新しくいっしょには入れない (ひとりで持つ道が待ちつづけないように)。
+// ひとりで持つのはスレッド (proc の番号。スケジューラの中は CPU) で、重ねて取れる。眠るとき (proc::sched) は手放し、
+// 起きたらまた取る (大きなロックと同じく、眠っているあいだにほかが ext4 を変えてよい: with_block の wgen がそれを見る)。
+// いっしょに持つのは CPU ごとに数える (カーネルは割り込みを止めて動き、いっしょに持ったまま眠らない) ので、重ねて取れる
+// (ひとりで持っているものが、いっしょにと頼めば、重ねて取ったことに)。いっしょに持ったまま、ひとりで持とうとしては
+// いけない (panic)。
+static FS_OWNER: AtomicUsize = AtomicUsize::new(0);
+/// 重ねて取った数 (持ち主だけが書く)
+static FS_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// いっしょに持っている CPU の数
+static FS_READERS: AtomicUsize = AtomicUsize::new(0);
+/// ひとりで持とうとして待っているものの数
+static FS_WANT: AtomicUsize = AtomicUsize::new(0);
+/// CPU ごとの、いっしょに持っている重ねた数 (その CPU だけが書く)
+static FS_SHARED: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU];
+/// 待った回数と時間 (ns。SAMPLE 回に 1 回測った見つもり) (/proc/bkl)
+pub static FS_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn fs_me() -> usize {
+    crate::proc::cur_index().unwrap_or(crate::proc::NPROC + id()) + 1
+}
+
+/// ext4 のロックを持っているしるし (落とすと放す)。true はいっしょに
+pub struct FsGuard(bool);
+
+/// ひとりで持つ
+pub fn fs_lock() -> FsGuard {
+    let me = fs_me();
+    if FS_OWNER.load(Ordering::Relaxed) == me {
+        FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        return FsGuard(false);
+    }
+    if FS_SHARED[id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: the ext4 lock is wanted alone while this CPU holds it shared");
+    }
+    fs_acquire(me);
+    FS_DEPTH.store(1, Ordering::Relaxed);
+    FsGuard(false)
+}
+
+/// いっしょに持つ (fastdir の作る・消すと、ExtInode を落とすところ)。ひとりで持っていれば、それを重ねて
+pub fn fs_lock_shared() -> FsGuard {
+    if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
+        FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        return FsGuard(false);
+    }
+    let c = &FS_SHARED[id()];
+    let n = c.load(Ordering::Relaxed);
+    if n == 0 {
+        fs_acquire_shared();
+    }
+    c.store(n + 1, Ordering::Relaxed);
+    FsGuard(true)
+}
+
+/// 待ちはじめ: 回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
+/// 時計を読むのが重く、ロックを持つ時間が伸びる)
+fn wait_begin() -> u64 {
+    let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % SAMPLE == 0;
+    if timed { crate::timer::uptime_ns().max(1) } else { 0 }
+}
+
+fn wait_end(t0: u64) {
+    if t0 != 0 {
+        FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * SAMPLE, Ordering::Relaxed);
+    }
+}
+
+fn wfe() {
+    // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
+    unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+}
+
+fn sev() {
+    unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
+}
+
+fn fs_acquire(me: usize) {
+    let mut t0 = None;
+    if FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        t0 = Some(wait_begin());
+        FS_WANT.fetch_add(1, Ordering::SeqCst);
+        loop {
+            wfe();
+            if FS_OWNER.load(Ordering::Relaxed) == 0 && FS_OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                break;
+            }
+        }
+        FS_WANT.fetch_sub(1, Ordering::SeqCst);
+    }
+    // いっしょに持っているものが出るのを待つ (FS_OWNER を立てたので、新しくは入らない。入りかけたものは FS_OWNER を見て出る)
+    while FS_READERS.load(Ordering::SeqCst) != 0 {
+        if t0.is_none() {
+            t0 = Some(wait_begin());
+        }
+        wfe();
+    }
+    if let Some(t) = t0 {
+        wait_end(t);
+    }
+}
+
+fn fs_acquire_shared() {
+    let mut t0 = None;
+    loop {
+        if FS_OWNER.load(Ordering::SeqCst) == 0 && FS_WANT.load(Ordering::SeqCst) == 0 {
+            FS_READERS.fetch_add(1, Ordering::SeqCst);
+            if FS_OWNER.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            // ひとりで持とうとするものが先だった
+            FS_READERS.fetch_sub(1, Ordering::SeqCst);
+            sev();
+        }
+        if t0.is_none() {
+            t0 = Some(wait_begin());
+        }
+        wfe();
+    }
+    if let Some(t) = t0 {
+        wait_end(t);
+    }
+}
+
+fn fs_release() {
+    FS_DEPTH.store(0, Ordering::Relaxed);
+    FS_OWNER.store(0, Ordering::Release);
+    sev();
+}
+
+impl Drop for FsGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let c = &FS_SHARED[id()];
+            let n = c.load(Ordering::Relaxed);
+            c.store(n - 1, Ordering::Relaxed);
+            if n == 1 {
+                FS_READERS.fetch_sub(1, Ordering::Release);
+                sev();
+            }
+            return;
+        }
+        let d = FS_DEPTH.load(Ordering::Relaxed);
+        if d > 1 {
+            FS_DEPTH.store(d - 1, Ordering::Relaxed);
+        } else {
+            fs_release();
+        }
+    }
+}
+
+/// 眠る前 (proc::sched): いまのスレッドが ext4 のロックを持っていれば手放し、重ねた数を返す (0 なら持っていない)
+pub fn fs_unlock_for_sleep() -> usize {
+    if FS_SHARED[id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: sleeping while holding the ext4 lock shared");
+    }
+    if FS_OWNER.load(Ordering::Relaxed) != fs_me() {
+        return 0;
+    }
+    let d = FS_DEPTH.load(Ordering::Relaxed);
+    fs_release();
+    d
+}
+
+/// 起きたあと: fs_unlock_for_sleep が手放したものを取りなおす
+pub fn fs_relock_after_sleep(d: usize) {
+    if d > 0 {
+        fs_acquire(fs_me());
+        FS_DEPTH.store(d, Ordering::Relaxed);
+    }
+}
+
+/// システムコールや例外から戻るとき: ext4 のロックを持ったままなら、取ったところと放すところの組がこわれている
+/// (そのままでは ext4 に入るものがみな止まる)
+pub fn fs_check_released() {
+    if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
+        panic!("extfs: the ext4 lock is still held on the way out (depth {})", FS_DEPTH.load(Ordering::Relaxed));
+    }
+    if FS_SHARED[id()].load(Ordering::Relaxed) != 0 {
+        panic!("extfs: the ext4 lock is still held shared on the way out");
+    }
+}
+
+/// この CPU が、ファイルシステムのロックをいっしょに持っている
+pub fn fs_shared_here() -> bool {
+    FS_SHARED[id()].load(Ordering::Relaxed) != 0
+}
+
+/// いまのスレッドが、ファイルシステムのロックをひとりで持っている
+pub fn fs_owned_here() -> bool {
+    FS_OWNER.load(Ordering::Relaxed) == fs_me()
+}
+
 // ---- 大きなロックなしの道からの「起こす」 ----
 // パイプの読み書きの速い道 (file::Pipe::fast_rw) は、眠っている人や待っている人がいても進めて、起こすのは
 // ここに頼む。大きなロックが空いていればその場で取って起こし、だれかが持っていれば、その CPU が放すときに起こす
@@ -476,6 +676,10 @@ pub fn account(cause: Cause, ns: u64, slept: bool, now: u64) {
 /// 2 はスケジューラが次を選んでページ表を載せるまで (ロックを持ったまま)。3 は起こされてから走りだすまで (待ち時間)。
 /// 大きなロックを持ったまま待つものがどれだけあるかを /proc/bkl で見るため
 pub static DEV_WAIT: [(AtomicU64, AtomicU64); 4] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 4];
+/// ディスク (virtio-blk) を眠って待った読みの数。数えるのは装置 (Linux の vm_event の数と同じく、数は core に置く)
+pub static DISK_SLEPT: AtomicU64 = AtomicU64::new(0);
+/// AF_UNIX の大きなロックなしの read / write (unix.rs の fast_rw) の数: 書いた、読んだ、ふつうの道へ
+pub static UNIX_FAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// DEV_WAIT に 1 回分を足す
 pub fn dev_wait(i: usize, t0: u64) {
@@ -501,7 +705,7 @@ pub fn stats_reset() {
     STATS.slept.store(0, Ordering::Relaxed);
     FAST_FAULTS.store(0, Ordering::Relaxed);
     PREEMPTS.store(0, Ordering::Relaxed);
-    for c in crate::file::FAST_RW.iter().chain(crate::fastdir::FAST_NS.iter()).chain(crate::extfs::FS_WAIT.iter()) {
+    for c in crate::file::FAST_RW.iter().chain(crate::fastdir::FAST_NS.iter()).chain(FS_WAIT.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     STATS.start.store(crate::timer::uptime_ns(), Ordering::Relaxed);
@@ -587,17 +791,17 @@ pub fn stats() -> alloc::string::String {
     }
     s.push('\n');
     let fr: Vec<u64> = crate::file::FAST_RW.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ディスクを眠って待った読み: {} 回 (大きなロックを放して)、書かれたのでやりなおした読み: {} 回\n", crate::virtio_blk::SLEPT.load(Ordering::Relaxed), crate::file::IO_RETRIES.load(Ordering::Relaxed)));
+    s.push_str(&format!("ディスクを眠って待った読み: {} 回 (大きなロックを放して)、書かれたのでやりなおした読み: {} 回\n", DISK_SLEPT.load(Ordering::Relaxed), crate::file::IO_RETRIES.load(Ordering::Relaxed)));
     let (paths, missing) = crate::vfs::paths_len();
     s.push_str(&format!("パスの覚え: {} 個 (うちないもの {})、覚えから答えた {} 回\n", paths, missing, crate::vfs::PATHS_HIT.load(Ordering::Relaxed)));
     s.push_str(&format!("ロックなしの stat (statc.rs): {} 回 (ふつうの道へ {})\n", crate::statc::HITS.load(Ordering::Relaxed), crate::statc::MISSES.load(Ordering::Relaxed)));
-    let uf: Vec<u64> = crate::unix::FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let uf: Vec<u64> = UNIX_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("AF_UNIX のロックなしの読み書き: 読んだ {} 書いた {} (ふつうの道へ {})\n", uf[0], uf[1], uf[2]));
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}、空で終わりか EAGAIN を返した {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[7], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     let fo: Vec<u64> = crate::file::FAST_OPEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ロックなしの open / close (file の棚): 棚から開いた {} 新しく開いた {} ない (ENOENT) と答えた {} 棚にしまった {} (ふつうの道へ: statc にない {} 棚になく新しくも開けない {} 開けない形 {} しまえない {})\n", fo[0], fo[7], fo[1], fo[2], fo[3], fo[4], fo[5], fo[6]));
     let ns: Vec<u64> = crate::fastdir::FAST_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let fw = [crate::extfs::FS_WAIT[0].load(Ordering::Relaxed), crate::extfs::FS_WAIT[1].load(Ordering::Relaxed)];
+    let fw = [FS_WAIT[0].load(Ordering::Relaxed), FS_WAIT[1].load(Ordering::Relaxed)];
     s.push_str(&format!("ロックなしの作る・消す (fastdir、ext4 のロックで): 作った {} 消した {} (ふつうの道へ: 形 {} 親が statc にない {} ext4 が断った {})。ext4 のロックを待った {} 回 {:.1} ms\n", ns[0], ns[1], ns[2], ns[3], ns[4], fw[0], fw[1] as f64 / 1e6));
     let wf: Vec<u64> = crate::vm::WRITE_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));

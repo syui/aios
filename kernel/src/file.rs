@@ -73,6 +73,21 @@ pub enum Kind {
     Landlock(Rc<dyn core::any::Any>),
 }
 
+/// fd を閉じた (Linux の fput から f_op->release のところ)。AF_UNIX なら、送られている途中のソケットの輪が残ったかも
+/// しれないので、unix.rs の gc に知らせる (片づけるのはシステムコールの終わり: release_deferred)
+pub fn closed(k: &Kind) {
+    if let Kind::Unix(_) = k {
+        crate::unix::closed();
+    }
+}
+
+/// システムコールの終わり (と、プロセスが終わって fd の表を落としたとき: force) に、閉じたあとの片づけ (AF_UNIX の gc:
+/// aios がえらんだちがい unix-gc-now)
+#[inline]
+pub fn release_deferred(force: bool) {
+    crate::unix::gc_check(force);
+}
+
 /// 開いたものの種類の名前 (Kind::class の番号。/proc/bkl が fd のシステムコールを分ける)
 pub const CLASSES: [&str; 10] = ["file", "proc", "pipe", "unix", "inet", "eventfd", "tty", "dev", "timerfd", "other"];
 

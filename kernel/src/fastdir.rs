@@ -117,7 +117,7 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
     // 作る前の (親, 名前) の箱の版 (作ったあとに statc::learn_new で、新しい名前を表に書くかどうか)
     let before = crate::statc::box_ver(crate::statc::name_box((fs.fs_id(), dir), crate::vfs::name_hash(name)));
     let ino = {
-        let _e = crate::extfs::fs_lock_shared();
+        let _e = crate::smp::fs_lock_shared();
         if !watch_free() { None } else { fs.fast_create(dir as u32, name, mode, &me.cred) }
     };
     let Some((ino, st, ver)) = ino else {
@@ -164,7 +164,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
     let dir = crate::statc::parent_dir(me, parent, base)?;
     // 開くのも fd に置くのも ext4 のロックの中で (ふつうの道の unlink は、ひとりで持つそのロックの中で、棚と表のものから
     // 印を落とす: file::shelf_forget)
-    let _e = crate::extfs::fs_lock_shared();
+    let _e = crate::smp::fs_lock_shared();
     if !watch_free() {
         return None;
     }
@@ -182,7 +182,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
 /// から読むのと同じ)。だめなら None (ふつうの道へ)
 pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
     let fs = crate::extfs::ExtFs::root_fs()?;
-    let _e = crate::extfs::fs_lock_shared();
+    let _e = crate::smp::fs_lock_shared();
     fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
 
@@ -190,7 +190,7 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
 /// いまもその inode をさすかは、呼ぶ側が読んだあとで表の版を見なおして確かめる (statc::now_stat)
 pub fn cached_stat(ino: u64) -> Option<file::Stat> {
     let fs = crate::extfs::ExtFs::root_fs()?;
-    let _e = crate::extfs::fs_lock_shared();
+    let _e = crate::smp::fs_lock_shared();
     fs.cached_meta(ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
 
@@ -204,7 +204,7 @@ pub fn root_fs_id() -> Option<usize> {
 /// 版))。引けなければ None (ふつうの道へ)
 pub fn lookup_name(me: &Proc, dir: u64, name: &str) -> Option<Option<(u64, file::Stat, u64)>> {
     let fs = crate::extfs::ExtFs::root_fs()?;
-    let _e = crate::extfs::fs_lock_shared();
+    let _e = crate::smp::fs_lock_shared();
     fs.fast_lookup(dir as u32, name, &me.cred).map(|r| r.map(|(ino, m, ver)| (ino as u64, file::Stat::of_meta(&m, fs.fs_id()), ver)))
 }
 
@@ -231,12 +231,12 @@ pub fn fast_unlink(me: &Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i6
     };
     use crate::extfs::FastUnlink;
     let mut done = {
-        let _e = crate::extfs::fs_lock_shared();
+        let _e = crate::smp::fs_lock_shared();
         if watch_free() { fs.fast_unlink(dir as u32, name, &me.cred) } else { FastUnlink::No }
     };
     // リンクがいくつもあるか、中身のブロックがあるもの: ext4 のロックをひとりで持って
     if done == FastUnlink::Alone {
-        let _e = crate::extfs::fs_lock();
+        let _e = crate::smp::fs_lock();
         done = if watch_free() { fs.fast_unlink(dir as u32, name, &me.cred) } else { FastUnlink::No };
     }
     if done != FastUnlink::Done {

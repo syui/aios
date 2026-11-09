@@ -377,6 +377,11 @@ timer.rs は置いた順に呼ぶ (Linux では装置やプロトコルがそれ
 (reclaim、balance) で、スワップの区画とスロット (swap.rs: Linux の swapfile.c) は vm.rs の入り口 (vm::Swap。Linux の
 include/linux/swap.h が CONFIG_SWAP なしでは何もしないのと同じ) の向こう (main.rs の register_swap)。ファイルシステムの
 キャッシュ (ext4 のブロック) は、ルートの ext4 がマウントしたときに vm::register_shrinker で置く (Linux の shrinker)。
+ext4 のロック (眠るときに手放す読み書きロック: fs_lock、fs_lock_shared) は、大きなロックと同じくスケジューラが眠るときに
+手放すので、大きなロックのとなり (smp.rs) に置く (中の分け方は extfs.rs)。/proc/bkl に出す数 (ディスクを眠って待った読み、
+AF_UNIX のロックなしの読み書き) も smp.rs に置き、装置やソケットが数える (Linux の vm_event の数と同じ)。CPU のぜい弱性
+(cpuvuln) は Linux の arm64 の proton-pack.c と同じく core。fd を閉じたあとの片づけ (AF_UNIX の gc) は file.rs の closed と
+release_deferred から (Linux の fput から f_op->release)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 
