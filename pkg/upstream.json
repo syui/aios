@@ -6,7 +6,6 @@
   {"name":"ailog","skip":"aios"},
   {"name":"aimg","skip":"aios"},
   {"name":"aimodel","skip":"aios"},
-  {"name":"aish-powerline","skip":"aios"},
   {"name":"aiterm","skip":"aios"},
   {"name":"aiwm","skip":"aios"},
   {"from":"arch:alsa-lib","name":"alsa-lib","nvchecker":{"git":"https://github.com/alsa-project/alsa-lib","prefix":"v","source":"git"}},

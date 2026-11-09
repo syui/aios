@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const KINDS: [&str; 4] = ["rust", "c", "plugin", "desktop"];
+pub const KINDS: [&str; 3] = ["rust", "c", "desktop"];
 
 /// 確かめた印
 pub fn stamp(root: &Path, file: &str) -> PathBuf {

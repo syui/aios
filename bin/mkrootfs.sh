@@ -21,7 +21,7 @@ trap 'rm -rf "$tmp"' EXIT
 [ -n "$remote" ] && echo "rootfs: packages from $top"
 
 kind_of() {
-  for k in rust c plugin desktop; do
+  for k in rust c desktop; do
     [ -f "pkg/$k/$1/PKGBUILD" ] && { echo "$k"; return 0; }
   done
   return 1
