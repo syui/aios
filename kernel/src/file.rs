@@ -41,16 +41,8 @@ pub enum Kind {
     PipeWrite(Rc<PipeCell>),
     /// O_RDWR で開いた FIFO (読み書き両方の口)
     PipeRw(Rc<PipeCell>),
-    /// AF_INET の ICMP (ping) と raw (smoltcp: socket.rs)
-    Socket(crate::socket::SockRef),
-    /// AF_UNIX のソケット (socketpair も: unix.rs)
-    Unix(crate::unix::UnixRef),
-    /// AF_INET の TCP と UDP (inet.rs)
-    Inet(crate::inet::InetRef),
-    /// AF_NETLINK (netlink.rs)
-    Netlink(crate::netlink::NetlinkRef),
-    /// なくても動くところのもの (epoll、eventfd、timerfd、inotify、装置: ディスクと区画、画面、キーボードやマウス、音 ...):
-    /// 中身とその操作 (Linux の file の private_data と f_op。file.rs は FileOps の関数で呼び、名前で呼ばない)
+    /// なくても動くところのもの (epoll、eventfd、timerfd、inotify、装置: ディスクと区画、画面、キーボードやマウス、音、
+    /// ソケット: AF_UNIX、AF_INET の TCP と UDP と ICMP と raw、AF_NETLINK ...): 中身とその操作 (Linux の file の private_data と f_op。file.rs は FileOps の関数で呼び、名前で呼ばない)
     Ops(Rc<dyn FileOps>),
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
@@ -63,17 +55,41 @@ pub enum Kind {
 /// fd を閉じた (Linux の fput から f_op->release のところ)。AF_UNIX なら、送られている途中のソケットの輪が残ったかも
 /// しれないので、unix.rs の gc に知らせる (片づけるのはシステムコールの終わり: release_deferred)
 pub fn closed(k: &Kind) {
-    if let Kind::Unix(_) = k {
-        crate::unix::closed();
+    if let Kind::Ops(o) = k {
+        o.on_close();
     }
 }
 
 /// システムコールの終わり (と、プロセスが終わって fd の表を落としたとき: force) に、閉じたあとの片づけ (AF_UNIX の gc:
-/// aios がえらんだちがい unix-gc-now)
+/// aios がえらんだちがい unix-gc-now。main.rs が register_release_deferred で unix.rs の gc_check を置く)
 #[inline]
 pub fn release_deferred(force: bool) {
-    crate::unix::gc_check(force);
+    if let Some(f) = RELEASE_DEFERRED.val() {
+        f(force);
+    }
 }
+
+static RELEASE_DEFERRED: crate::cell::Early<Option<fn(bool)>> = crate::cell::Early::new(None);
+
+pub fn register_release_deferred(f: fn(bool)) {
+    RELEASE_DEFERRED.set(Some(f));
+}
+
+/// 大きなロックなしのソケットの read / write (syscall::fast: main.rs が register_fast_rw_sock で unix.rs の fast_rw を置く)
+type FastRw = fn(&proc::Proc, u64, usize, usize, bool) -> Option<i64>;
+static FAST_RW_SOCK: crate::cell::Early<Option<FastRw>> = crate::cell::Early::new(None);
+
+pub fn register_fast_rw_sock(f: FastRw) {
+    FAST_RW_SOCK.set(Some(f));
+}
+
+/// poll のビット (Linux と同じ値)
+pub const POLLIN: u32 = 0x1;
+pub const POLLOUT: u32 = 0x4;
+pub const POLLERR: u32 = 0x8;
+pub const POLLHUP: u32 = 0x10;
+pub const POLLRDNORM: u32 = 0x40;
+pub const POLLWRNORM: u32 = 0x100;
 
 /// 開いたものの中身の操作 (Linux の file_operations: Kind::Ops)。それぞれ、何も書かなければ名前のない inode
 /// (anon_inode) のふるまい
@@ -109,16 +125,16 @@ pub trait FileOps: core::any::Any {
     fn event_gen(&self) -> u64 {
         0
     }
-    /// 調べるための様子 (/proc/PID/stack の fd の一覧)。None なら「名前 r?w?h?」
-    fn debug_state(&self) -> Option<String> {
+    /// 調べるための様子 (/proc/PID/stack の fd の一覧。desc は名前、rw は「r?w?h?」)。None なら「名前 r?w?h?」
+    fn debug_state(&self, _desc: &str, _rw: &str) -> Option<String> {
         None
     }
     /// 読まれずに残っているもの (/proc/ai/fd)
     fn pending(&self) -> Option<u64> {
         None
     }
-    /// FIONREAD
-    fn fionread(&self) -> Option<usize> {
+    /// FIONREAD (None なら端末の ioctl へ)
+    fn fionread(&self) -> Option<Result<usize, i64>> {
         None
     }
     /// (読める, 書ける, 切れた)
@@ -178,6 +194,63 @@ pub trait FileOps: core::any::Any {
     }
     /// 閉じた (最後の OpenFile が落ちた: Linux の f_op->release)
     fn release(&self) {}
+
+    // ---- ソケットのもの (Linux の struct socket と proto_ops。ほかは何もしない) ----
+
+    /// readiness を poll_mask から (読める: IN|HUP|ERR、書ける: OUT、切れた: HUP|ERR。recvmmsg のエラーも ERR に)
+    fn mask_readiness(&self) -> bool {
+        false
+    }
+    /// fd を閉じた (OpenFile がまだあっても: close のたびに)
+    fn on_close(&self) {}
+    /// poll / select が見ている (on) / やめた (大きなロックなしの read/write が起こしを頼むように)
+    fn watch(&self, _on: bool) {}
+    /// epoll に登録した
+    fn mark_epolled(&self) {}
+    /// いま中身があるか (パイプとソケット。ほかの流れはあるものとして)
+    fn has_data(&self) -> bool {
+        true
+    }
+    /// read で取りだした分だけを埋める (0 で埋めておかなくてよい)
+    fn exact_read(&self) -> bool {
+        false
+    }
+    /// 読み手のいない EPIPE の SIGPIPE は自分で (MSG_NOSIGNAL を見る)
+    fn own_sigpipe(&self) -> bool {
+        false
+    }
+    /// read と readv (入れ物みなで 1 回受ける: dgram の 1 つのメッセージ)
+    fn readv(&self, _f: &FileRef, _iov: &[(usize, usize)], _nowait: bool) -> Option<Result<i64, i64>> {
+        None
+    }
+    /// write と writev (入れ物みなを 1 回で送る)
+    fn writev(&self, _f: &FileRef, _iov: &[(usize, usize)], _nowait: bool, _nosignal: bool) -> Option<Result<i64, i64>> {
+        None
+    }
+    /// fchmod (sockfs の inode)
+    fn chmod(&self, _mode: u32) -> Option<Result<i64, i64>> {
+        None
+    }
+    /// 持ち主 (F_SETFL の O_NOATIME)
+    fn owner(&self) -> Option<u32> {
+        None
+    }
+    /// (持ち主, グループ, 許可) (sockfs の inode: fchown、utimensat)
+    fn owner_mode(&self) -> Option<(u32, u32, u32)> {
+        None
+    }
+    fn set_owner_mode(&self, _uid: Option<u32>, _gid: Option<u32>, _mode: u32) {}
+    fn touch(&self, _mtime: Option<u64>) {}
+    /// O_NONBLOCK が変わった (FIONBIO、F_SETFL)
+    fn set_nonblock(&self, _on: bool) {}
+    /// splice で位置のないものとして読む (TCP / UDP: Linux の tcp_splice_read と copy_splice_read)
+    fn splice_stream(&self) -> bool {
+        false
+    }
+    /// splice でパイプへ (Linux の sock_splice_read)
+    fn splice_to_pipe(&self, _f: &FileRef, _pos: i64, _p: &Rc<PipeCell>, _len: usize, _nonblock: bool) -> Option<Result<usize, i64>> {
+        None
+    }
 }
 
 /// 装置のノードのあるマウント (FileOps::mount: /dev の下の path)
@@ -230,6 +303,14 @@ impl Kind {
         }
     }
 
+    /// Kind::Ops の中身が T なら、それを借りて (Rc を写さない: 大きなロックなしの道からも)
+    pub fn ops_ref<T: FileOps>(&self) -> Option<&T> {
+        match self {
+            Kind::Ops(o) => (&**o as &dyn core::any::Any).downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+
     /// Kind::Ops の中身が T なら、その Rc (それぞれが fd から自分のものを取りだす: Linux の file->private_data)
     pub fn ops<T: FileOps>(&self) -> Option<Rc<T>> {
         match self {
@@ -259,8 +340,6 @@ impl Kind {
                 if top == "proc" || top == "sys" { 1 } else { 0 }
             }
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => 2,
-            Kind::Unix(_) => 3,
-            Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) => 4,
             Kind::Tty(_) | Kind::PtyMaster(_) => 6,
             Kind::Null | Kind::Zero | Kind::Random => 7,
             Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 9,
@@ -779,10 +858,6 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         Kind::Tty(t) => tty::read(t, dst, nonblock),
         Kind::PtyMaster(t) => tty::master_read(t, dst, nonblock),
         Kind::PipeRead(p) | Kind::PipeRw(p) => Pipe::read_ex(p, dst, false, nonblock),
-        Kind::Unix(u) => crate::unix::read(u, dst, nonblock),
-        Kind::Inet(u) => crate::inet::read(u, dst, nonblock),
-        Kind::Socket(s) => s.borrow_mut().read(dst),
-        Kind::Netlink(n) => crate::netlink::read(n, dst, nonblock),
         Kind::Ops(o) => o.read(dst, nonblock),
         _ => Err(-EBADF),
     }
@@ -801,10 +876,6 @@ fn write_stream(k: &Kind, src: &[u8], nonblock: bool) -> Result<usize, i64> {
             }
             Ok(n)
         }
-        Kind::Unix(u) => crate::unix::write(u, src, nonblock),
-        Kind::Inet(u) => crate::inet::write(u, src, nonblock),
-        Kind::Socket(s) => s.borrow_mut().write(src),
-        Kind::Netlink(n) => crate::netlink::write(n, src),
         Kind::Ops(o) => o.write(src, nonblock),
         _ => Err(-EBADF),
     }
@@ -978,7 +1049,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => self.kind.clone(),
             Kind::Ops(o) if o.stream() => self.kind.clone(),
             _ => return None,
         };
@@ -1044,10 +1115,6 @@ impl OpenFile {
                 use core::sync::atomic::Ordering::Relaxed;
                 Stat { dev: vfs::encode_dev(vfs::PIPE_DEV), ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
             }
-            Kind::Socket(_) => Stat { dev: vfs::encode_dev(vfs::SOCK_DEV), ..Stat::dev(0o140000 | 0o777, 0) },
-            Kind::Netlink(n) => Stat { dev: vfs::encode_dev(vfs::SOCK_DEV), ino: crate::netlink::ino(n), ..Stat::dev(0o140000 | 0o777, 0) },
-            Kind::Unix(u) => crate::unix::stat(u),
-            Kind::Inet(u) => crate::inet::stat(u),
             // pidfd はプロセス (スレッド) ごとの inode (Linux の pidfs: 同じものを指す pidfd は同じ ino。aios の pid は
             // 使いまわさないので番号そのもの)
             Kind::PidFd(pid) => Stat { dev: vfs::encode_dev(vfs::PIDFS_DEV), ino: *pid as u64, ..Stat::dev(0o600, 0) },
@@ -1078,7 +1145,6 @@ impl OpenFile {
             Kind::Inode(_, path) => vfs::mount_of(path.trim_start_matches('/')),
             Kind::PidFd(_) => (vfs::PIDFS_MNT, false),
             Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) => (vfs::PIPE_MNT, false),
-            Kind::Socket(_) | Kind::Netlink(_) | Kind::Unix(_) | Kind::Inet(_) => (vfs::SOCK_MNT, false),
             Kind::Landlock(_) | Kind::SeccompNotify(_) => (vfs::ANON_MNT, false),
             Kind::Ops(o) => o.mount(),
             // デバイスは /dev のノードのあるところ
@@ -1094,7 +1160,6 @@ impl OpenFile {
         match &self.kind {
             Kind::PidFd(pid) => s.push_str(&crate::pidfd::fdinfo(*pid, self.flags & PIDFD_THREAD != 0)),
             Kind::Ops(o) => s.push_str(&o.fdinfo()),
-            Kind::Unix(u) => s.push_str(&alloc::format!("scm_fds: {}\n", crate::unix::scm_fds(u))),
             _ => {}
         }
         s
@@ -1106,10 +1171,6 @@ impl OpenFile {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow().generation,
             Kind::Ops(o) => o.event_gen(),
             Kind::Tty(t) | Kind::PtyMaster(t) => t.borrow().generation.get(),
-            Kind::Socket(_) => crate::net::generation(),
-            Kind::Netlink(n) => crate::netlink::generation(n),
-            Kind::Unix(u) => u.borrow().generation,
-            Kind::Inet(u) => u.borrow().generation + crate::net::generation(),
             _ => 0,
         }
     }
@@ -1124,10 +1185,6 @@ impl OpenFile {
             Kind::Random => "/dev/urandom".into(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
-            Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
-            Kind::Netlink(n) => crate::netlink::describe(n),
-            Kind::Unix(u) => crate::unix::describe(u),
-            Kind::Inet(u) => crate::inet::describe(u),
             Kind::Ops(o) => o.describe(),
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
             Kind::SeccompNotify(_) => "anon_inode:seccomp notify".into(),
@@ -1140,13 +1197,14 @@ impl OpenFile {
         let (r, w, h) = self.readiness();
         let rw = alloc::format!("r{}w{}h{}", r as u8, w as u8, h as u8);
         match &self.kind {
-            Kind::Unix(u) => alloc::format!("{} {} {}", self.describe(), rw, crate::unix::debug(u)),
-            Kind::Inet(u) => alloc::format!("{} {} {}", self.describe(), rw, crate::inet::debug(u)),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 let p = p.borrow();
                 alloc::format!("{} {} len={} r={} w={}", self.describe(), rw, p.len(), p.readers, p.writers)
             }
-            Kind::Ops(o) => o.debug_state().unwrap_or_else(|| alloc::format!("{} {}", self.describe(), rw)),
+            Kind::Ops(o) => {
+                let desc = self.describe();
+                o.debug_state(&desc, &rw).unwrap_or_else(|| alloc::format!("{} {}", desc, rw))
+            }
             _ => alloc::format!("{} {}", self.describe(), rw),
         }
     }
@@ -1156,10 +1214,6 @@ impl OpenFile {
     pub fn pending(&self) -> Option<u64> {
         Some(match &self.kind {
             Kind::PipeRead(p) | Kind::PipeRw(p) => p.borrow().len() as u64,
-            Kind::Unix(u) => crate::unix::pending(u),
-            Kind::Inet(u) => crate::inet::pending(u),
-            Kind::Socket(s) => s.borrow().available() as u64,
-            Kind::Netlink(n) => crate::netlink::pending(n),
             Kind::Ops(o) => return o.pending(),
             _ => return None,
         })
@@ -1167,7 +1221,7 @@ impl OpenFile {
 
     /// recvmmsg がとっておいたエラーがあれば POLLERR (Linux の sock_poll の sk_err)
     fn recv_err_mask(&self) -> u32 {
-        if self.recv_err != 0 { crate::unix::POLLERR } else { 0 }
+        if self.recv_err != 0 { POLLERR } else { 0 }
     }
 
     /// poll 用: (読める, 書ける, 閉じた/エラー)
@@ -1187,16 +1241,9 @@ impl OpenFile {
                 let p = p.borrow();
                 (p.len() > 0, !p.full(), false)
             }
-            Kind::Socket(s) => s.borrow().readiness(),
-            Kind::Netlink(n) => crate::netlink::readiness(n),
-            Kind::Unix(u) => {
-                use crate::unix::*;
-                let m = poll_mask(u) | self.recv_err_mask();
-                (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
-            }
-            Kind::Inet(u) => {
-                use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT};
-                let m = crate::inet::poll_mask(u) | self.recv_err_mask();
+            // ソケット (AF_UNIX、TCP / UDP) は poll のビットから
+            Kind::Ops(o) if o.mask_readiness() => {
+                let m = o.poll_mask().unwrap_or(0) | self.recv_err_mask();
                 (m & (POLLIN | POLLHUP | POLLERR) != 0, m & POLLOUT != 0, m & (POLLHUP | POLLERR) != 0)
             }
             // 終わったら読める、片づけられたら POLLHUP も (PIDFD_THREAD のものは O_EXCL の印: そのスレッドを見る)
@@ -1214,10 +1261,9 @@ impl OpenFile {
     /// AF_UNIX のソケット、パイプ、いつでも読み書きできるもの (Linux の DEFAULT_POLLMASK) だけ。ほかは None
     /// (readiness の 3 つで)
     pub fn poll_mask(&self) -> Option<u32> {
-        use crate::unix::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
         Some(match &self.kind {
-            Kind::Unix(u) => crate::unix::poll_mask(u) | self.recv_err_mask(),
-            Kind::Inet(u) => crate::inet::poll_mask(u) | self.recv_err_mask(),
+            // ソケット (AF_UNIX、TCP / UDP: recvmmsg がとっておいたエラーも)
+            Kind::Ops(o) if o.mask_readiness() => o.poll_mask().unwrap_or(0) | self.recv_err_mask(),
             // Linux の pipe_poll: 読む口は中身があれば IN、書く口がなければ HUP。書く口は箱があれば OUT、読む口が
             // なければ ERR
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
@@ -1252,12 +1298,8 @@ impl OpenFile {
         Some(match &self.kind {
             Kind::Tty(t) | Kind::PtyMaster(t) => alloc::vec![t.borrow().poll_key()],
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::vec![Rc::as_ptr(p) as usize],
-            Kind::Unix(u) => crate::unix::poll_keys(u),
-            Kind::Inet(u) => crate::inet::poll_keys(u),
-            // eventfd、inotify、TCP / UDP のソケット (ネットワークで何か変わると net::poll が net::chan() を起こす)。
-            // 印がないと、どこかのパイプに書くたびに起こされる (Firefox の gmain が 1 秒に何百回も起きていた)
-            Kind::Socket(_) => alloc::vec![crate::net::chan()],
-            Kind::Netlink(n) => alloc::vec![crate::netlink::chan(n)],
+            // eventfd、inotify、ソケット (FileOps::poll_keys)。印がないと、どこかのパイプに書くたびに起こされる (Firefox の
+            // gmain が 1 秒に何百回も起きていた)
             Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
             Kind::SeccompNotify(l) => alloc::vec![l.chan()],
             // いつでも読み書きできる (待たない)
@@ -1545,8 +1587,6 @@ impl Drop for OpenFile {
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::poll_wake(Rc::as_ptr(p) as usize);
             }
-            Kind::Unix(u) => crate::unix::release(u),
-            Kind::Inet(u) => crate::inet::release(u),
             Kind::Tty(t) if matches!(t.borrow().dev, tty::Dev::Pty(_)) => tty::close_slave(t),
             Kind::PtyMaster(t) => tty::close_master(t),
             _ => {}
@@ -1771,27 +1811,16 @@ pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {
 /// 実行するものは EPERM。さわると SIGBUS。Linux は getsockopt の TCP_ZEROCOPY_RECEIVE で受けたものをここに入れる)。
 /// 写せない種類は None (ENODEV)
 pub fn mmap_dev(kind: &Kind, fr: &FileRef, off: usize, len: usize, prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
-    use crate::vm::Backing;
-    Some(match kind {
-        Kind::Ops(o) => return o.mmap(fr, off, len, prot),
-        Kind::Inet(u) if u.borrow().tcp => {
-            const PROT_WRITE: u64 = 2;
-            const PROT_EXEC: u64 = 4;
-            const EPERM: i64 = 1;
-            if prot & (PROT_WRITE | PROT_EXEC) != 0 {
-                Err(-EPERM)
-            } else {
-                Ok(Backing::Pages { pages: Rc::new(alloc::vec::Vec::new()), off, hold: Some(fr.clone()) })
-            }
-        }
-        _ => return None,
-    })
+    match kind {
+        Kind::Ops(o) => o.mmap(fr, off, len, prot),
+        _ => None,
+    }
 }
 
 /// 大きなロックなしのソケット (AF_UNIX) の read / write (syscall::fast。unix.rs の fast_rw)
 #[inline]
 pub fn fast_rw_sock(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) -> Option<i64> {
-    crate::unix::fast_rw(me, fd, va, len, write)
+    FAST_RW_SOCK.val()?(me, fd, va, len, write)
 }
 
 /// 大きなロックなしの /dev/null・/dev/zero・/dev/urandom の read / write (syscall::fast)。書くものは捨てるだけ
@@ -2034,7 +2063,7 @@ pub fn wake_key(key: usize) {
 /// poll / select が待っているあいだ、見ているパイプに印をつける (watchers)。大きなロックなしの read/write
 /// (fast_rw) は、印のあるパイプでは起こしを頼む。readiness を見る前につけること
 /// AF_UNIX のソケットも (unix::fast_rw)
-pub struct PollWatch(Vec<Rc<PipeCell>>, Vec<crate::unix::UnixRef>);
+pub struct PollWatch(Vec<Rc<PipeCell>>, Vec<Rc<dyn FileOps>>);
 
 impl PollWatch {
     pub fn new<'a>(files: impl Iterator<Item = &'a FileRef>) -> Self {
@@ -2045,9 +2074,9 @@ impl PollWatch {
                     p.borrow_mut().watchers += 1;
                     v.push(p.clone());
                 }
-                Kind::Unix(u) => {
-                    u.borrow_mut().watchers += 1;
-                    us.push(u.clone());
+                Kind::Ops(o) => {
+                    o.watch(true);
+                    us.push(o.clone());
                 }
                 _ => {}
             }
@@ -2061,8 +2090,8 @@ impl Drop for PollWatch {
         for p in &self.0 {
             p.borrow_mut().watchers -= 1;
         }
-        for u in &self.1 {
-            u.borrow_mut().watchers -= 1;
+        for o in &self.1 {
+            o.watch(false);
         }
     }
 }
@@ -2071,7 +2100,7 @@ impl Drop for PollWatch {
 pub fn mark_epolled(f: &FileRef) {
     match &f.borrow().kind {
         Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.borrow_mut().epolled = true,
-        Kind::Unix(u) => u.borrow_mut().epolled = true,
+        Kind::Ops(o) => o.mark_epolled(),
         _ => {}
     }
 }

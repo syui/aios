@@ -427,7 +427,7 @@ impl file::FileOps for EpollFile {
     fn fdinfo(&self) -> alloc::string::String {
         fdinfo(&self.0)
     }
-    fn debug_state(&self) -> Option<alloc::string::String> {
+    fn debug_state(&self, _desc: &str, _rw: &str) -> Option<alloc::string::String> {
         Some(alloc::format!("epoll{}", self.0.borrow().debug()))
     }
     fn readiness(&self) -> (bool, bool, bool) {

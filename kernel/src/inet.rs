@@ -633,7 +633,7 @@ pub fn family(u: &InetRef) -> u16 {
 }
 
 pub fn file_of(u: InetRef, flags: u64) -> FileRef {
-    file::new(Kind::Inet(u), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
+    file::new(Kind::Ops(Rc::new(InetFile(u))), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
 }
 
 // ---- AppArmor (af_inet.c。v9 の決まりなら番地まで見る (apparmor.rs の inet_perm)。番地は記録にも) ----
@@ -5865,4 +5865,120 @@ fn ext_accept(u: &InetRef) {
     ext_listen(u);
     u.borrow_mut().acceptq.push_back(c);
     notify(u);
+}
+
+/// AF_INET の TCP と UDP のソケットの fd の中身 (file::Kind::Ops。Linux の socket_file_ops と inet_stream_ops)
+pub struct InetFile(pub InetRef);
+
+impl file::FileOps for InetFile {
+    fn describe(&self) -> alloc::string::String {
+        describe(&self.0)
+    }
+    fn class(&self) -> usize {
+        4
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn write(&self, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+        write(&self.0, src, nonblock)
+    }
+    fn stat(&self) -> Stat {
+        stat(&self.0)
+    }
+    fn mount(&self) -> (u64, bool) {
+        (crate::vfs::SOCK_MNT, false)
+    }
+    fn event_gen(&self) -> u64 {
+        self.0.borrow().generation + crate::net::generation()
+    }
+    fn debug_state(&self, desc: &str, rw: &str) -> Option<alloc::string::String> {
+        Some(alloc::format!("{} {} {}", desc, rw, debug(&self.0)))
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(pending(&self.0))
+    }
+    fn mask_readiness(&self) -> bool {
+        true
+    }
+    fn poll_mask(&self) -> Option<u32> {
+        Some(poll_mask(&self.0))
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(poll_keys(&self.0))
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn nowait(&self) -> bool {
+        true
+    }
+    fn release(&self) {
+        release(&self.0);
+    }
+    fn has_data(&self) -> bool {
+        pending(&self.0) > 0
+    }
+    fn own_sigpipe(&self) -> bool {
+        true
+    }
+    fn splice_stream(&self) -> bool {
+        true
+    }
+    fn readv(&self, f: &file::FileRef, iov: &[(usize, usize)], nowait: bool) -> Option<Result<i64, i64>> {
+        Some(crate::socket::inet_readv(f, &self.0, iov, nowait))
+    }
+    fn writev(&self, f: &file::FileRef, iov: &[(usize, usize)], nowait: bool, nosignal: bool) -> Option<Result<i64, i64>> {
+        Some(crate::socket::inet_writev(f, &self.0, iov, nowait, nosignal))
+    }
+    fn chmod(&self, mode: u32) -> Option<Result<i64, i64>> {
+        Some(chmod(&self.0, mode))
+    }
+    fn owner(&self) -> Option<u32> {
+        Some(owner(&self.0))
+    }
+    fn owner_mode(&self) -> Option<(u32, u32, u32)> {
+        Some(owner_mode(&self.0))
+    }
+    fn set_owner_mode(&self, uid: Option<u32>, gid: Option<u32>, mode: u32) {
+        set_owner_mode(&self.0, uid, gid, mode);
+    }
+    fn touch(&self, mtime: Option<u64>) {
+        touch(&self.0, mtime);
+    }
+    /// ネットワークのインターフェース (ip、networkd) と、SIOCOUTQ、SIOCATMARK、FIONREAD (Linux の tcp_ioctl と udp_ioctl)
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        const SIOCOUTQ: u64 = 0x5411;
+        const SIOCATMARK: u64 = 0x8905;
+        const FIONREAD: u64 = 0x541b;
+        let out = |b: &[u8]| crate::proc::current().pt().copy_out(arg, b).ok_or(-14).map(|_| 0);
+        if crate::netif::handles(req) {
+            return Some(crate::netif::ioctl(req, arg));
+        }
+        let v = match req {
+            SIOCOUTQ => outq(&self.0),
+            SIOCATMARK => atmark(&self.0),
+            FIONREAD => inq(&self.0),
+            _ => return None,
+        };
+        Some(v.and_then(|v| out(&v.to_le_bytes())))
+    }
+    /// TCP のソケット (Linux の tcp_mmap: 書くもの、実行するものは EPERM。ページはなく、さわると SIGBUS。Linux は
+    /// getsockopt の TCP_ZEROCOPY_RECEIVE で受けたものをここに入れる)
+    fn mmap(&self, fr: &file::FileRef, off: usize, _len: usize, prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        if !self.0.borrow().tcp {
+            return None;
+        }
+        const PROT_WRITE: u64 = 2;
+        const PROT_EXEC: u64 = 4;
+        const EPERM: i64 = 1;
+        Some(if prot & (PROT_WRITE | PROT_EXEC) != 0 {
+            Err(-EPERM)
+        } else {
+            Ok(crate::vm::Backing::Pages { pages: Rc::new(Vec::new()), off, hold: Some(fr.clone()) })
+        })
+    }
 }

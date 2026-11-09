@@ -3256,10 +3256,10 @@ fn path_op(op: PathOp) -> (&'static str, u32) {
 /// send)。開いたのが決まりのないプロセス (わたされたもの) か、同じラベルなら見ない。read / write / readv / writev の入口
 /// (sysfile.rs の verify_area、Linux の rw_verify_area の security_file_permission) から
 fn sock_file(f: &FileRef, write: bool) -> Result<(), i64> {
-    use crate::file::Kind;
     let need = {
         let b = f.borrow();
-        matches!(b.kind, Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_)) && file_needs_revalidation(b.label.as_ref())
+        (b.kind.ops_ref::<crate::unix::UnixFile>().is_some() || b.kind.ops_ref::<crate::inet::InetFile>().is_some() || b.kind.ops_ref::<crate::socket::SockFile>().is_some())
+            && file_needs_revalidation(b.label.as_ref())
     };
     if !need {
         return Ok(());

@@ -344,8 +344,9 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 quirk のところには、ソースに札 `[quirk NAME]` をつける。`python3 test/kernel-json.py` (CI でも) が、kernel/src の .rs が
 みなちょうど 1 度ずつ core か extra にあるか、quirk の札と一覧がそろっているかを見て、数 (core と extra の行) と、core が
-extra を使っているところを出す (core を小さくするときの目じるし。そのファイルの数は `CORE_USES_EXTRA_MAX` より増やさず、
-減ったら下げる: todo.json の core-extra)。core が extra に寄りかからないように、1 つのものの「いつも要るところ」と「なくても
+extra を使っているところを出す。core は extra を名前で呼ばない (`CORE_USES_EXTRA_MAX` は 0: 2026-11-09 に 25 から
+0 にした)。extra が要るときは、core に入り口 (フック、登録の表、FileOps のような操作の表) を作り、main.rs (か、その
+extra が起きるとき) でつなぐ。core が extra に寄りかからないように、1 つのものの「いつも要るところ」と「なくても
 動くところ」を分けることがある: しくじったわけは、書くほう (why、core: EINVAL を返すところはみな `why::inval()`) と、ためて
 /proc/ai/why で見せるほう (whylog、extra)。セキュリティの部品 (LSM) は、core が名前で呼ばずに `security.rs` (Linux の
 security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
@@ -389,10 +390,12 @@ mount_root) が読んで fs::init にわたす。/dev の装置のノードは�
 sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる前なら覚えておいて、できたときに作る)。
 システムコールも、なくても動くところ (epoll と eventfd、timerfd、inotify の init1 と rm_watch、socket、module) のものは
 それぞれのファイルにあり、main.rs が syscall::register で番号ごとに置く (Linux の COND_SYSCALL: 置いていなければ、ない
-システムコールとして ENOSYS)。装置とソケットの mmap (画面、音の再生の口、TCP のソケット: Linux の f_op->mmap) は file.rs。
-開いたものの中身は、なくても動くところのもの (epoll、eventfd、timerfd、inotify) から順に file::Kind::Ops (FileOps: Linux の
-file_operations) へ移している: それぞれが FileOps (読み書き、readiness、poll の印、fdinfo、/proc/PID/fd の名前 ...) を書き、
-file.rs はその関数で呼ぶ。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。装置 (ディスクと区画、
+システムコールとして ENOSYS)。開いたものの中身は、core のもの (ファイル、パイプ、端末、/dev/null など、pidfd) のほかは
+file::Kind::Ops (FileOps: Linux の file_operations) で、それぞれ (epoll、eventfd、timerfd、inotify、装置、ソケット: AF_UNIX、
+TCP と UDP、ICMP と raw、netlink) が FileOps (読み書き、readiness、poll の印、fdinfo、/proc/PID/fd の名前、ioctl、mmap、
+release、ソケットの readv と writev、持ち主と許可、splice ...) を書き、file.rs と sysfile.rs はその関数で呼ぶ。AF_UNIX の
+fd を閉じたあとの gc (システムコールの終わり) と大きなロックなしの read / write は、main.rs が file::register_release_deferred と
+register_fast_rw_sock で unix.rs のものを置く。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。装置 (ディスクと区画、
 画面、キーボードやマウス、音) も FileOps で (位置のあるもの、ioctl、mmap、release ...)、/dev のノードの番号から開くものは、
 装置が起こすときに file::register_chrdev (画面 29、input 13、音 116) と register_blkdev (区画) で置く (Linux の
 register_chrdev、register_blkdev)。ファイルの出来事 (作る、消す、書く、開く、閉じる、属性、名前を変える) の知らせは、

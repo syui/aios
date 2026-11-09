@@ -475,11 +475,17 @@ fn aa_create(domain: u64, t: u64, protocol: u64) -> Result<(), i64> {
 /// AppArmor の aa_sock_file_perm (ソケットを read / write の口で: file.rs の aa_sock_file)。ソケットのことだけで見る
 /// (相手の番地は見ない: aa_label_sk_perm)
 pub fn aa_file(f: &FileRef, request: u32) -> Result<(), i64> {
-    let s = match &f.borrow().kind {
-        Kind::Unix(u) => Sock::Unix(f.clone(), u.clone()),
-        Kind::Inet(u) => Sock::Inet(f.clone(), u.clone()),
-        Kind::Socket(s) => Sock::Smol(s.clone()),
-        _ => return Ok(()),
+    let s = {
+        let k = &f.borrow().kind;
+        if let Some(u) = k.ops_ref::<crate::unix::UnixFile>() {
+            Sock::Unix(f.clone(), u.0.clone())
+        } else if let Some(u) = k.ops_ref::<crate::inet::InetFile>() {
+            Sock::Inet(f.clone(), u.0.clone())
+        } else if let Some(s) = k.ops_ref::<SockFile>() {
+            Sock::Smol(s.0.clone())
+        } else {
+            return Ok(());
+        }
     };
     aa_sk(&s, "file_perm", request, InetOp::Sk)
 }
@@ -559,12 +565,18 @@ fn aa_inet(u: &InetRef, op: &str, request: u32, what: InetOp) -> Result<(), i64>
 /// fd のソケット (ない fd は EBADF、ソケットでなければ ENOTSOCK)
 fn sock(fd: u64) -> Result<Sock, i64> {
     let f = fd_file(fd)?;
-    let k = match &f.borrow().kind {
-        Kind::Unix(u) => Ok(Ok(u.clone())),
-        Kind::Inet(u) => Ok(Err(Ok(u.clone()))),
-        Kind::Socket(s) => Ok(Err(Err(s.clone()))),
-        _ => Err(-ENOTSOCK),
-    }?;
+    let k = {
+        let k = &f.borrow().kind;
+        if let Some(u) = k.ops_ref::<crate::unix::UnixFile>() {
+            Ok(u.0.clone())
+        } else if let Some(u) = k.ops_ref::<crate::inet::InetFile>() {
+            Err(Ok(u.0.clone()))
+        } else if let Some(s) = k.ops_ref::<SockFile>() {
+            Err(Err(s.0.clone()))
+        } else {
+            return Err(-ENOTSOCK);
+        }
+    };
     Ok(match k {
         Ok(u) => Sock::Unix(f, u),
         Err(Ok(u)) => Sock::Inet(f, u),
@@ -754,7 +766,7 @@ fn sock_args(domain: u64, typ: u64) -> Result<(u64, u64, u64), i64> {
 fn add_fd(s: Socket, cloexec: bool) -> R {
     let rc = Rc::new(RefCell::new(s));
     rc.borrow_mut().ino = Rc::as_ptr(&rc) as usize & 0xffffff;
-    let f: FileRef = file::new(Kind::Socket(rc), 2);
+    let f: FileRef = file::new(Kind::Ops(Rc::new(SockFile(rc))), 2);
     let fd = proc::current().files().add(f, cloexec, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
@@ -1719,5 +1731,62 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
         RECVMMSG => mmsg(a[0], a[1] as usize, a[2] as usize, a[3], false, a[4] as usize),
         SENDMMSG => mmsg(a[0], a[1] as usize, a[2] as usize, a[3], true, 0),
         _ => Err(-38),
+    }
+}
+
+/// AF_INET の ICMP (ping) と raw のソケット (smoltcp) の fd の中身 (file::Kind::Ops)
+pub struct SockFile(pub SockRef);
+
+impl file::FileOps for SockFile {
+    fn describe(&self) -> alloc::string::String {
+        alloc::format!("socket:[{}]", Rc::as_ptr(&self.0) as usize & 0xffffff)
+    }
+    fn class(&self) -> usize {
+        4
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], _nonblock: bool) -> Result<usize, i64> {
+        self.0.borrow_mut().read(dst)
+    }
+    fn write(&self, src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        self.0.borrow_mut().write(src)
+    }
+    fn stat(&self) -> file::Stat {
+        file::Stat { dev: crate::vfs::encode_dev(crate::vfs::SOCK_DEV), ..file::Stat::dev(0o140000 | 0o777, 0) }
+    }
+    fn mount(&self) -> (u64, bool) {
+        (crate::vfs::SOCK_MNT, false)
+    }
+    fn event_gen(&self) -> u64 {
+        crate::net::generation()
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(self.0.borrow().available() as u64)
+    }
+    fn fionread(&self) -> Option<Result<usize, i64>> {
+        Some(Ok(self.0.borrow().available()))
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        self.0.borrow().readiness()
+    }
+    /// ネットワークで何か変わると net::poll が net::chan() を起こす
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(vec![crate::net::chan()])
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    /// sockfs の inode: 開いた人のもの
+    fn owner(&self) -> Option<u32> {
+        Some(crate::cred::current().fsuid)
+    }
+    fn set_nonblock(&self, on: bool) {
+        self.0.borrow_mut().nonblock = on;
+    }
+    /// ネットワークのインターフェース (ip、networkd)
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        crate::netif::handles(req).then(|| crate::netif::ioctl(req, arg))
     }
 }

@@ -431,8 +431,8 @@ impl file::FileOps for InotifyFile {
     fn pending(&self) -> Option<u64> {
         Some(pending(&self.0) as u64)
     }
-    fn fionread(&self) -> Option<usize> {
-        Some(pending(&self.0))
+    fn fionread(&self) -> Option<Result<usize, i64>> {
+        Some(Ok(pending(&self.0)))
     }
     fn readiness(&self) -> (bool, bool, bool) {
         readiness(&self.0)

@@ -188,16 +188,13 @@ pub fn create(typ: u64, protocol: u64) -> Result<NetlinkRef, i64> {
 }
 
 pub fn file_of(n: NetlinkRef, flags: u64) -> FileRef {
-    file::new(Kind::Netlink(n), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
+    file::new(Kind::Ops(Rc::new(NetlinkFile(n))), file::O_RDWR | if flags & 0o4000 != 0 { file::O_NONBLOCK } else { 0 })
 }
 
 /// fd が netlink のソケットなら
 pub fn of_fd(fd: u64) -> Option<(FileRef, NetlinkRef)> {
     let f = proc::current().files().get(fd)?.clone();
-    let n = match &f.borrow().kind {
-        Kind::Netlink(n) => n.clone(),
-        _ => return None,
-    };
+    let n = f.borrow().kind.ops_ref::<NetlinkFile>()?.0.clone();
     Some((f, n))
 }
 
@@ -3219,4 +3216,46 @@ pub fn proc_ipv6_route() -> alloc::string::String {
         s.push_str(&alloc::format!("{:032x} {:02x} {:032x} {:02x} {:032x} {:08x} {:08x} {:08x} {:08x} {:>8}\n", r.dst, r.len, 0, 0, r.gw, r.metric, 1, 0, r.rtf, dev));
     }
     s
+}
+
+/// AF_NETLINK のソケットの fd の中身 (file::Kind::Ops)
+pub struct NetlinkFile(pub NetlinkRef);
+
+impl file::FileOps for NetlinkFile {
+    fn describe(&self) -> alloc::string::String {
+        describe(&self.0)
+    }
+    fn class(&self) -> usize {
+        4
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn write(&self, src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        write(&self.0, src)
+    }
+    fn stat(&self) -> file::Stat {
+        file::Stat { dev: crate::vfs::encode_dev(crate::vfs::SOCK_DEV), ino: ino(&self.0), ..file::Stat::dev(0o140000 | 0o777, 0) }
+    }
+    fn mount(&self) -> (u64, bool) {
+        (crate::vfs::SOCK_MNT, false)
+    }
+    fn event_gen(&self) -> u64 {
+        generation(&self.0)
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(pending(&self.0))
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness(&self.0)
+    }
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(alloc::vec![chan(&self.0)])
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
 }

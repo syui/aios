@@ -161,6 +161,9 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(inotify::SYSCALLS, inotify::sys);
     // ファイルの出来事の知らせ (Linux の fsnotify: vfs::notify) を inotify へ
     vfs::notify::register(&inotify::OPS);
+    // AF_UNIX: fd を閉じたあとの gc (システムコールの終わり) と、大きなロックなしの read / write (syscall::fast)
+    file::register_release_deferred(unix::gc_check);
+    file::register_fast_rw_sock(unix::fast_rw);
     syscall::register(socket::SYSCALLS, socket::sys);
     syscall::register(module::SYSCALLS, module::sys);
     // 調べもの (Linux の Kernel hacking: tracepoint と fault-inject、aios の prof) と、しくじったわけをためるもの (whylog)。

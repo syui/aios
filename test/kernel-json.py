@@ -167,9 +167,9 @@ for s, (n, k) in sorted(files.items()):
             uses[n] = used
 print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %d" % (count["core"], lines["core"], count["extra"], lines["extra"], len(quirks)))
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
-# core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
-# 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
-CORE_USES_EXTRA_MAX = 2
+# core は extra を名前で呼ばない (core は、なくてもカーネルが動く extra に寄りかからない。2026-11-09 に 25 から 0 に)。
+# extra が要るときは core に入り口を作って main.rs でつなぐ (下の BEHIND_HOOKS のように)
+CORE_USES_EXTRA_MAX = 0
 # フック (入り口) の向こうへ移したものと、その入り口。core はもう名前で呼ばない (入り口を呼ぶ。つなぐのは main.rs)。
 # ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
 # tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)、vm.rs (Linux の swap.h: スワップの区画)、
@@ -182,13 +182,16 @@ BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp":
                 "block": "file.rs (FileOps, register_blkdev)", "gpu": "file.rs (FileOps, register_chrdev)", "input": "file.rs (FileOps, register_chrdev)",
                 "sound": "file.rs (FileOps, register_chrdev)", "inotify": "vfs.rs (notify) and syscall.rs", "efivarfs": "vfs.rs (register_filesystem)",
                 "procfs": "vfs.rs (register_filesystem) and sysfile.rs (register_fd_link)",
-                "extfs": "fastdir.rs (FastFs), vm.rs (register_shrinker) and fs.rs (DiskRoot from block::mount_root)"}
+                "extfs": "fastdir.rs (FastFs), vm.rs (register_shrinker) and fs.rs (DiskRoot from block::mount_root)",
+                "unix": "file.rs (FileOps, register_release_deferred, register_fast_rw_sock)", "inet": "file.rs (FileOps)",
+                "socket": "file.rs (FileOps) and syscall.rs", "netlink": "file.rs (FileOps)", "netif": "file.rs (FileOps::ioctl)",
+                "net": "file.rs (FileOps) and timer.rs (every)"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:
         err("%s uses %s: call it through %s" % (n, " ".join(back), " ".join(sorted(set(BEHIND_HOOKS[x] for x in back)))))
 if len(uses) > CORE_USES_EXTRA_MAX:
-    err("core uses extra in %d files, more than %d: keep core off extra (%s)" % (len(uses), CORE_USES_EXTRA_MAX, " ".join(uses)))
+    err("core uses extra in %d files, more than %d: keep core off extra (%s): add an entry point in core and connect it in main.rs" % (len(uses), CORE_USES_EXTRA_MAX, " ".join(uses)))
 elif len(uses) < CORE_USES_EXTRA_MAX:
     err("core uses extra in %d files, fewer than %d: lower CORE_USES_EXTRA_MAX in test/kernel-json.py" % (len(uses), CORE_USES_EXTRA_MAX))
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))

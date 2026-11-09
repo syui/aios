@@ -136,7 +136,7 @@ struct Msg {
 
 impl Msg {
     fn new(data: Vec<u8>, fds: Vec<FileRef>, cred: Option<Cred>, sender: &UnixRef, truesize: usize) -> Msg {
-        let unix = fds.iter().filter(|f| matches!(f.borrow().kind, Kind::Unix(_))).count();
+        let unix = fds.iter().filter(|f| f.borrow().kind.ops_ref::<UnixFile>().is_some()).count();
         *INFLIGHT.get() += unix;
         Msg { id: next_id(), data, used: 0, fds, cred, sender: Some(sender.clone()), truesize, peeked: false, unix }
     }
@@ -682,7 +682,7 @@ pub fn create(typ: u64, protocol: u64) -> Result<UnixRef, i64> {
 }
 
 pub fn file_of(u: UnixRef, flags: u64) -> FileRef {
-    file::new(Kind::Unix(u), file::O_RDWR | if flags & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 })
+    file::new(Kind::Ops(alloc::rc::Rc::new(UnixFile(u))), file::O_RDWR | if flags & SOCK_NONBLOCK != 0 { file::O_NONBLOCK } else { 0 })
 }
 
 /// socketpair: 向かい合わせにつなぐ (どちらの SO_PEERCRED も自分)
@@ -1803,7 +1803,7 @@ fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) 
     let f = files.get().get(fd)?;
     // ほかのプロセスが大きなロックの中で借りているかもしれないので、借りずに見る (口の種類はあとで変わらない)
     let of = unsafe { &*f.as_ptr() };
-    let Kind::Unix(u) = &of.kind else { return None };
+    let Some(UnixFile(u)) = of.kind.ops_ref::<UnixFile>() else { return None };
     if write { fast_send(me, u, buf, len) } else { fast_recv(me, u, buf, len) }
 }
 
@@ -2019,7 +2019,7 @@ fn gc() {
         let mut scan = |q: &VecDeque<Msg>| {
             for m in q {
                 for f in &m.fds {
-                    if let Kind::Unix(t) = &f.borrow().kind {
+                    if let Some(UnixFile(t)) = f.borrow().kind.ops_ref::<UnixFile>() {
                         v.push((Rc::as_ptr(f) as usize, t.clone()));
                     }
                 }
@@ -2041,7 +2041,7 @@ fn gc() {
         let mut scan = |q: &VecDeque<Msg>| {
             for m in q {
                 for f in &m.fds {
-                    if let Kind::Unix(t) = &f.borrow().kind {
+                    if let Some(UnixFile(t)) = f.borrow().kind.ops_ref::<UnixFile>() {
                         let e = refs.entry(Rc::as_ptr(f) as usize).or_insert((0, Rc::strong_count(f), t.clone()));
                         e.0 += 1;
                     }
@@ -2663,4 +2663,179 @@ pub fn scm_out(r: &mut Recv, opts: (bool, bool, bool), space: Option<usize>, clo
         left -= step;
     }
     out
+}
+
+// ---- splice でパイプへ (sysfile.rs から FileOps::splice_to_pipe で) ----
+
+/// AF_UNIX のソケットからパイプへ (Linux の sock_splice_read)。位置は 0 でなければ ESPIPE。stream は
+/// unix_stream_splice_read: ソケットか splice の NONBLOCK なら待たず、メッセージごとにパイプの箱を分けて、あいた箱に
+/// 入る分だけ (先に MSG_PEEK で見て数える)。dgram と seqpacket は copy_splice_read (sock_read_iter): ソケットの
+/// O_NONBLOCK だけを見て、メッセージ 1 つを、あいた箱 × 4 KiB に入る分だけ (のこりは捨てる)。届いた fd は閉じる
+pub fn splice_to_pipe(f: &file::FileRef, u: &UnixRef, pos: i64, p: &alloc::rc::Rc<file::PipeCell>, len: usize, nonblock: bool) -> Result<usize, i64> {
+    const PG: usize = crate::memlayout::PGSIZE;
+    const MSG_PEEK: u64 = 0x2;
+    // Linux の MAX_RW_COUNT: 1 回の読み書きの上限 (INT_MAX をページでそろえたもの)
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    if pos != 0 {
+        return Err(-file::ESPIPE);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let free = {
+        let pp = p.borrow();
+        pp.slots().saturating_sub(pp.used_slots())
+    };
+    let room = len.min(free * PG).min(MAX_RW_COUNT);
+    let sock_nb = f.borrow().flags & file::O_NONBLOCK != 0;
+    let r = if u.borrow().typ == SOCK_STREAM {
+        let nb = sock_nb || nonblock;
+        let peek = recv(u, room, MSG_PEEK | MSG_PARTS, nb)?;
+        // 箱に入る分: メッセージごとに、その長さの 4 KiB の箱
+        let (mut fit, mut left) = (0, free);
+        for &n in &peek.parts {
+            let need = n.div_ceil(PG);
+            if need > left {
+                fit += left * PG;
+                break;
+            }
+            fit += n;
+            left -= need;
+        }
+        if fit == 0 {
+            return Ok(0);
+        }
+        recv(u, fit, MSG_PARTS, nb)?
+    } else {
+        recv(u, room, MSG_PARTS, sock_nb)?
+    };
+    let mut done = 0;
+    let mut at = 0;
+    for &n in &r.parts {
+        done += file::Pipe::splice_in(p, 0, &r.data[at..at + n]);
+        at += n;
+    }
+    Ok(done)
+}
+
+/// AF_UNIX のソケットの fd の中身 (file::Kind::Ops。socketpair も。Linux の socket_file_ops と unix_stream_ops)
+pub struct UnixFile(pub UnixRef);
+
+impl file::FileOps for UnixFile {
+    fn describe(&self) -> alloc::string::String {
+        describe(&self.0)
+    }
+    fn class(&self) -> usize {
+        3
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(&self.0, dst, nonblock)
+    }
+    fn write(&self, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+        write(&self.0, src, nonblock)
+    }
+    fn stat(&self) -> Stat {
+        stat(&self.0)
+    }
+    fn mount(&self) -> (u64, bool) {
+        (crate::vfs::SOCK_MNT, false)
+    }
+    fn fdinfo(&self) -> alloc::string::String {
+        alloc::format!("scm_fds: {}\n", scm_fds(&self.0))
+    }
+    fn event_gen(&self) -> u64 {
+        self.0.borrow().generation
+    }
+    fn debug_state(&self, desc: &str, rw: &str) -> Option<alloc::string::String> {
+        Some(alloc::format!("{} {} {}", desc, rw, debug(&self.0)))
+    }
+    fn pending(&self) -> Option<u64> {
+        Some(pending(&self.0))
+    }
+    fn fionread(&self) -> Option<Result<usize, i64>> {
+        Some(inq(&self.0))
+    }
+    fn mask_readiness(&self) -> bool {
+        true
+    }
+    fn poll_mask(&self) -> Option<u32> {
+        Some(poll_mask(&self.0))
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(poll_keys(&self.0))
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn nowait(&self) -> bool {
+        true
+    }
+    fn release(&self) {
+        release(&self.0);
+    }
+    fn on_close(&self) {
+        closed();
+    }
+    fn watch(&self, on: bool) {
+        let mut b = self.0.borrow_mut();
+        if on {
+            b.watchers += 1;
+        } else {
+            b.watchers -= 1;
+        }
+    }
+    fn mark_epolled(&self) {
+        self.0.borrow_mut().epolled = true;
+    }
+    fn has_data(&self) -> bool {
+        pending(&self.0) > 0
+    }
+    fn exact_read(&self) -> bool {
+        true
+    }
+    fn own_sigpipe(&self) -> bool {
+        true
+    }
+    fn readv(&self, f: &file::FileRef, iov: &[(usize, usize)], nowait: bool) -> Option<Result<i64, i64>> {
+        Some(crate::socket::unix_readv(f, &self.0, iov, nowait))
+    }
+    fn writev(&self, f: &file::FileRef, iov: &[(usize, usize)], nowait: bool, nosignal: bool) -> Option<Result<i64, i64>> {
+        Some(crate::socket::unix_writev(f, &self.0, iov, nowait, nosignal))
+    }
+    fn chmod(&self, mode: u32) -> Option<Result<i64, i64>> {
+        Some(chmod(&self.0, mode))
+    }
+    fn owner(&self) -> Option<u32> {
+        Some(owner(&self.0))
+    }
+    fn owner_mode(&self) -> Option<(u32, u32, u32)> {
+        Some(owner_mode(&self.0))
+    }
+    fn set_owner_mode(&self, uid: Option<u32>, gid: Option<u32>, mode: u32) {
+        set_owner_mode(&self.0, uid, gid, mode);
+    }
+    fn touch(&self, mtime: Option<u64>) {
+        touch(&self.0, mtime);
+    }
+    /// ネットワークのインターフェース (ip、networkd) と、SIOCOUTQ (送って読まれていない大きさ)、SIOCATMARK (MSG_OOB の印か)
+    /// (Linux の unix_ioctl)
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        const SIOCOUTQ: u64 = 0x5411;
+        const SIOCATMARK: u64 = 0x8905;
+        let out = |b: &[u8]| crate::proc::current().pt().copy_out(arg, b).ok_or(-14).map(|_| 0);
+        if crate::netif::handles(req) {
+            return Some(crate::netif::ioctl(req, arg));
+        }
+        match req {
+            SIOCOUTQ => Some(out(&(outq(&self.0) as i32).to_le_bytes())),
+            SIOCATMARK => Some(atmark(&self.0).and_then(|m| out(&(m as i32).to_le_bytes()))),
+            _ => None,
+        }
+    }
+    fn splice_to_pipe(&self, f: &file::FileRef, pos: i64, p: &Rc<file::PipeCell>, len: usize, nonblock: bool) -> Option<Result<usize, i64>> {
+        Some(splice_to_pipe(f, &self.0, pos, p, len, nonblock))
+    }
 }
