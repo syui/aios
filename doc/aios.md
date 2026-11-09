@@ -398,6 +398,8 @@ file.rs はその関数で呼ぶ。fd から自分のものを取りだすとき
 register_chrdev、register_blkdev)。ファイルの出来事 (作る、消す、書く、開く、閉じる、属性、名前を変える) の知らせは、
 core が vfs::notify (Linux の fsnotify) を呼び、main.rs がつないだ inotify へ渡す。/dev/stdin や /proc/self/fd/N で
 名前のないものを開くところ (quirk tty-root-fdlink) は、main.rs が sysfile::register_fd_link で procfs.rs のものを置く。
+大きなロックなしの作る・消す・開く・stat (fastdir.rs) は、fastdir::FastFs の入り口 (fast_create、fast_unlink、fast_open、
+fast_lookup ...: Linux の RCU-walk が i_op を呼ぶところ) を呼び、ルートの ext4 がマウントしたときにつなぐ。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

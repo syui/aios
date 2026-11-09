@@ -38,15 +38,58 @@ const O_TRUNC: u64 = 0o1000;
 const O_LARGEFILE: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
 
+/// ロックなしの作る・消す・開く・stat の相手 (ルートの ext4: extfs.rs がルートをマウントしたときに register でつなぐ。
+/// Linux の RCU-walk と、そこから呼ぶファイルシステムの i_op にあたる)。ext4 の中は ext4 のロックをいっしょに持って
+pub trait FastFs {
+    /// vfs の id の 1 つめ (このファイルシステムの番号)
+    fn fs_id(&self) -> usize;
+    /// dir に name を作る (作ったもの、その stat、inode の版)。できなければ None (ふつうの道へ)
+    fn fast_create(&self, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(crate::vfs::InodeRef, file::Stat, u64)>;
+    /// dir の name を消す
+    fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink;
+    /// 覚えている inode の様子
+    fn cached_meta(&self, ino: u32) -> Option<crate::vfs::Meta>;
+    /// dir の name が ino をさすことを dir のロックの中で確かめて、その様子
+    fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<crate::vfs::Meta>;
+    /// dir の name を引く (ないなら Some(None)、あれば Some((inode の番号, 様子, 版)))
+    fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, crate::vfs::Meta, u64)>>;
+    /// dir の name (ino) を開く
+    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<crate::vfs::InodeRef>;
+}
+
+/// FastFs::fast_unlink の答え
+#[derive(Clone, Copy, PartialEq)]
+pub enum FastUnlink {
+    /// 消した
+    Done,
+    /// ふつうの道へ (何も変えていない)
+    No,
+    /// ext4 のロックをひとりで持ちなおせば消せる (何も変えていない)
+    Alone,
+}
+
+static ROOT: crate::cell::Once<&'static dyn FastFs> = crate::cell::Once::new();
+
+/// ルートの ext4 をつなぐ (extfs.rs: ルートをマウントしたとき)
+pub fn register(fs: &'static dyn FastFs) {
+    if ROOT.get().is_none() {
+        ROOT.set(fs);
+    }
+}
+
+fn root_fs() -> Option<&'static dyn FastFs> {
+    ROOT.get().copied()
+}
+
 /// どちらにも要るもの (ロックの外で見られるもの)。だめなら None
-fn usable(me: &Proc) -> Option<&'static alloc::rc::Rc<crate::extfs::ExtFs>> {
+fn usable(me: &Proc) -> Option<&'static dyn FastFs> {
     if crate::debug::FAIL_ON.load(Relaxed) || me.cred.sandbox.is_some() || !watch_free() {
         return None;
     }
     if !me.files.as_ref()?.private() {
         return None;
     }
-    crate::extfs::ExtFs::root_fs()
+    root_fs()
 }
 
 /// 作る・消すのできごとを待つ見張りも、読むだけのマウントもない (ext4 のロックの中でもう一度見る: inotify::add_watch と
@@ -181,7 +224,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
 /// dir の名前 name がいまも ino をさしていれば、ext4 の inode の覚えからいまの stat (Linux の stat が dentry の先の inode
 /// から読むのと同じ)。だめなら None (ふつうの道へ)
 pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
-    let fs = crate::extfs::ExtFs::root_fs()?;
+    let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();
     fs.fast_meta(dir as u32, name, ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
@@ -189,21 +232,21 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
 /// 表の答えの stat が古いもの (inode を書いたあと) を、ext4 の inode の覚え (metas) から (覚えになければ None)。名前が
 /// いまもその inode をさすかは、呼ぶ側が読んだあとで表の版を見なおして確かめる (statc::now_stat)
 pub fn cached_stat(ino: u64) -> Option<file::Stat> {
-    let fs = crate::extfs::ExtFs::root_fs()?;
+    let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();
     fs.cached_meta(ino as u32).map(|m| file::Stat::of_meta(&m, fs.fs_id()))
 }
 
 /// ルートの ext4 の vfs の id の 1 つめ (statc が (ディレクトリ, 名前) の箱を引くため)
 pub fn root_fs_id() -> Option<usize> {
-    crate::extfs::ExtFs::root_fs().map(|fs| fs.fs_id())
+    root_fs().map(|fs| fs.fs_id())
 }
 
 /// 表にない名前を 1 つ引く (statc::learn_lookup: 親のディレクトリ dir は表で確かめたもの): ext4 のロック (いっしょに) と
 /// dir のロックの中で (ExtFs::fast_lookup)、ないなら Some(None)、あれば Some((inode の番号, stat, 読む前に取った inode の
 /// 版))。引けなければ None (ふつうの道へ)
 pub fn lookup_name(me: &Proc, dir: u64, name: &str) -> Option<Option<(u64, file::Stat, u64)>> {
-    let fs = crate::extfs::ExtFs::root_fs()?;
+    let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();
     fs.fast_lookup(dir as u32, name, &me.cred).map(|r| r.map(|(ino, m, ver)| (ino as u64, file::Stat::of_meta(&m, fs.fs_id()), ver)))
 }
@@ -229,7 +272,6 @@ pub fn fast_unlink(me: &Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i6
         note(3);
         return None;
     };
-    use crate::extfs::FastUnlink;
     let mut done = {
         let _e = crate::smp::fs_lock_shared();
         if watch_free() { fs.fast_unlink(dir as u32, name, &me.cred) } else { FastUnlink::No }

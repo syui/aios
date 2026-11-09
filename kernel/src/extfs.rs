@@ -1034,6 +1034,10 @@ impl ExtFs {
         // 大きなロックなしの作る・消す (fastdir.rs) が使う ext4 (ルートのもの。いまマウントできる ext4 はこれだけ)
         if ROOT_FS.get().is_none() {
             ROOT_FS.set(self.clone());
+            // 大きなロックなしの作る・消す・開く・stat (fastdir.rs) の相手
+            if let Some(fs) = ROOT_FS.get() {
+                crate::fastdir::register(fs);
+            }
             // メモリが足りないときに、だれも写していない古いブロックを捨てる (Linux の super_block の shrinker)
             crate::vm::register_shrinker(|n| {
                 if let Some(fs) = ExtFs::root_fs() {
@@ -3850,15 +3854,31 @@ impl ExtFs {
 
 }
 
-/// ExtFs::fast_unlink の答え
-#[derive(Clone, Copy, PartialEq)]
-pub enum FastUnlink {
-    /// 消した
-    Done,
-    /// ふつうの道へ (何も変えていない)
-    No,
-    /// ext4 のロックをひとりで持ちなおせば消せる (何も変えていない)
-    Alone,
+pub use crate::fastdir::FastUnlink;
+
+/// ロックなしの作る・消す・開く・stat (fastdir.rs) の相手 (ルートの ext4)
+impl crate::fastdir::FastFs for Rc<ExtFs> {
+    fn fs_id(&self) -> usize {
+        ExtFs::fs_id(self)
+    }
+    fn fast_create(&self, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(InodeRef, crate::file::Stat, u64)> {
+        ExtFs::fast_create(self, dir, name, mode, c)
+    }
+    fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink {
+        ExtFs::fast_unlink(self, dir, name, c)
+    }
+    fn cached_meta(&self, ino: u32) -> Option<Meta> {
+        ExtFs::cached_meta(self, ino)
+    }
+    fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<Meta> {
+        ExtFs::fast_meta(self, dir, name, ino)
+    }
+    fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, Meta, u64)>> {
+        ExtFs::fast_lookup(self, dir, name, c)
+    }
+    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
+        ExtFs::fast_open(self, dir, name, ino, perm, c)
+    }
 }
 
 impl ExtFs {
