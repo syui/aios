@@ -4,7 +4,8 @@
 //   しくじるところ (cred の許し、vfs のパスをたどるところ、seccomp、landlock、fail、切ったところ ...) が note で、いまの
 //   スレッドのいまのシステムコールのわけを書く (Proc の why。システムコールのはじめに clear で消す)。パスは at で足す。
 //   EINVAL を返すところはみな `Err(why::inval())` なので、core のファイルもこれを使う: ここは Proc の why に書くだけで、
-//   ためておく輪と /proc/ai/why (読むほう) は whylog.rs (extra)。出口 (syscall::dispatch) で whylog::done が輪に入れる
+//   ためておく輪と /proc/ai/why (読むほう) は whylog.rs (extra)。出口 (syscall::dispatch) で done が、main.rs のつないだ
+//   whylog に渡して輪に入れる (つないでいなければ何もしない: core は whylog を名前で呼ばない)
 
 /// わけにつけるパスの長さ (長いものは前を切る: 終わりのほうがわけに近い)
 pub const PATH: usize = 120;
@@ -62,7 +63,7 @@ pub struct Note {
     pub want: u8,
     pub plen: u8,
     pub nlen: u8,
-    /// path は、わけを書いたところではなく、プログラムがたのんだパス (システムコールの引数。whylog::done がつけた)
+    /// path は、わけを書いたところではなく、プログラムがたのんだパス (システムコールの引数。whylog がためるときにつけた)
     pub asked: bool,
     /// Perm: そのものの mode・uid・gid と、呼んだ人の (実効の) uid・gid。ほかでは num に数
     pub mode: u32,
@@ -97,6 +98,49 @@ pub fn copy<const L: usize>(dst: &mut [u8; L], s: &str) -> u8 {
     }
     dst[..b.len()].copy_from_slice(b);
     b.len() as u8
+}
+
+/// わけをためて見せるもの (whylog.rs)。main.rs が register_log でつなぐ
+pub trait Log: Sync {
+    /// システムコールの出口で errno (負の数) を返すとき (a はその引数)
+    fn done(&self, _nr: u64, _e: i64, _a: &[u64]) {}
+    /// 大きなロックなしの stat (statc.rs) が「ない」と答えた (path は畳んだパス、先頭 / なし)
+    fn fast_missing(&self, _p: &crate::proc::Proc, _nr: u64, _path: &str) {}
+    /// 大きなロックなしの stat や open が、ディレクトリ dir (畳んだパス) で name を引いて、なかった
+    fn fast_missing_at(&self, _p: &crate::proc::Proc, _nr: u64, _dir: &str, _name: &str) {}
+}
+
+struct NoLog;
+
+impl Log for NoLog {}
+
+static LOG: crate::cell::Early<&'static dyn Log> = crate::cell::Early::new(&NoLog);
+
+/// 起動のとき (main.rs) に whylog をつなぐ
+pub fn register_log(l: &'static dyn Log) {
+    LOG.set(l);
+}
+
+/// システムコールの出口で errno (負の数) を返すとき (syscall::dispatch。a はその引数)
+#[inline]
+pub fn done(nr: u64, e: i64, a: &[u64]) {
+    // ためないもの: EAGAIN、EINTR、ETIMEDOUT と、割りこまれてやりなおすもの (ERESTARTSYS など、512 から)
+    if matches!(-e, 11 | 4 | 110) || -e >= 512 {
+        return;
+    }
+    LOG.val().done(nr, e, a);
+}
+
+/// 大きなロックなしの stat (statc.rs) が「ない」と答えた: ふつうの道の missing_cached と同じわけを残す
+#[cold]
+pub fn fast_missing(p: &crate::proc::Proc, nr: u64, path: &str) {
+    LOG.val().fast_missing(p, nr, path);
+}
+
+/// 大きなロックなしの stat や open が、ディレクトリ dir で name を引いて、なかった: ふつうの道がたどって見つけなかった
+/// とき (at) と同じわけ
+pub fn fast_missing_at(p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
+    LOG.val().fast_missing_at(p, nr, dir, name);
 }
 
 fn me() -> Option<&'static mut Note> {

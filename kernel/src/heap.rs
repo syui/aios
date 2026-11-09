@@ -638,14 +638,14 @@ unsafe impl GlobalAlloc for Kernel {
         let need = round(layout.size().max(1)) + HDR;
         // CPU ごとの置き場から (heap trace と、わざとしくじらせるあいだは通らない)
         if !TRACE.load(Relaxed)
-            && !crate::fail::armed()
+            && !crate::debug::fail_armed()
             && let Some(p) = pcpu_take(need)
         {
             return p;
         }
         let fallible = crate::proc::in_fallible();
         // わざと取れなかったことに (/proc/ai/ctl の fail ... heap|oom。fail.rs): ふつうの道も遅い道もなしで下へ
-        let struck = crate::fail::heap(fallible);
+        let struck = crate::debug::should_failslab(fallible);
         if !struck {
             let p = unsafe { take(need) };
             if !p.is_null() {

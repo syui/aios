@@ -60,18 +60,27 @@ fn probe(nr: u64, e: i64) -> bool {
     (matches!(nr, 79 | 291 | 48 | 439 | 78) && matches!(-e, 2 | 20)) || (nr == 29 && -e == 25) || (nr == 78 && -e == 22) || (matches!(nr, 25 | 57) && -e == 9) || (matches!(nr, 8..=10) && -e == 61)
 }
 
-/// システムコールの出口で errno (負の数) を返すとき (syscall::dispatch。a はその引数)
-#[inline]
-pub fn done(nr: u64, e: i64, a: &[u64]) {
-    // EAGAIN、EINTR、ETIMEDOUT と、割りこまれてやりなおすもの (ERESTARTSYS など、512 から)
-    if matches!(-e, 11 | 4 | 110) || -e >= 512 {
-        return;
+/// core の入り口 (why.rs の done、fast_missing、fast_missing_at) につなぐもの (main.rs)
+pub struct Ops;
+
+pub static OPS: Ops = Ops;
+
+impl crate::why::Log for Ops {
+    fn done(&self, nr: u64, e: i64, a: &[u64]) {
+        done(nr, e, a);
     }
-    done_slow(nr, e, a);
+    fn fast_missing(&self, p: &crate::proc::Proc, nr: u64, path: &str) {
+        fast_missing(p, nr, path);
+    }
+    fn fast_missing_at(&self, p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
+        fast_missing_at(p, nr, dir, name);
+    }
 }
 
+/// システムコールの出口で errno (負の数) を返すとき (syscall::dispatch から why::done。a はその引数。ためないもの
+/// (EAGAIN など) は why::done が先に分ける)
 #[cold]
-fn done_slow(nr: u64, e: i64, a: &[u64]) {
+fn done(nr: u64, e: i64, a: &[u64]) {
     if crate::parts::off(crate::parts::Part::Aiproc) {
         return;
     }

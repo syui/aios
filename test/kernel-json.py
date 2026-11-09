@@ -90,7 +90,7 @@ for e in entries:
     if "off" in e and not e["off"]:
         err("%s: off is empty" % e.get("name"))
 
-# bench (速さを測るもの) のファイルがあるか。prof の区間 (prof::span("part:what")) の part が kernel.json の名前か
+# bench (速さを測るもの) のファイルがあるか。prof の区間 (core は debug::span("part:what")、extra は prof::span でも) の part が kernel.json の名前か
 repo = os.path.join(root, "..")
 for e in entries:
     b = e.get("bench")
@@ -100,7 +100,7 @@ spans = set()
 for s in sources:
     # 注釈 (// から) はのぞく。syscall.rs の sys_span は、システムコールの番号ごとの区間の名前の表
     code = "\n".join(l.split("//")[0] for l in text[s].split("\n"))
-    spans.update(re.findall(r'prof::span\("([^"]+)"\)', code))
+    spans.update(re.findall(r'(?:prof|debug)::span\("([^"]+)"\)', code))
     m = re.search(r"fn sys_span\(.*?\n\}\n", code, re.S)
     if m:
         spans.update(re.findall(r'=> "([^"]+)"', m.group(0)))
@@ -169,14 +169,16 @@ print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 # core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
 # 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
-CORE_USES_EXTRA_MAX = 15
-# LSM のフック (kernel/src/security.rs: Linux の security.c) の向こうへ移したもの。core はもう名前で呼ばない
-# (security:: のフックを呼ぶ。つなぐのは main.rs)。ひとつ移したら足す
-BEHIND_HOOKS = ["apparmor", "landlock", "seccomp", "audit", "auditfilter"]
+CORE_USES_EXTRA_MAX = 11
+# フック (入り口) の向こうへ移したものと、その入り口。core はもう名前で呼ばない (入り口を呼ぶ。つなぐのは main.rs)。
+# ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
+# tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)
+BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
+                "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:
-        err("%s uses %s: call it through security.rs (LSM hooks)" % (n, " ".join(back)))
+        err("%s uses %s: call it through %s" % (n, " ".join(back), " ".join(sorted(set(BEHIND_HOOKS[x] for x in back)))))
 if len(uses) > CORE_USES_EXTRA_MAX:
     err("core uses extra in %d files, more than %d: keep core off extra (%s)" % (len(uses), CORE_USES_EXTRA_MAX, " ".join(uses)))
 elif len(uses) < CORE_USES_EXTRA_MAX:

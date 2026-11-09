@@ -3532,7 +3532,7 @@ fn rule_text(r: &Rule) -> String {
 }
 
 fn esc(s: &str) -> String {
-    crate::aiproc::esc(s)
+    crate::debug::esc(s)
 }
 
 /// /proc/ai/fw: まとめ、基の鎖、決まり (当たった数と短い式)、落としたもの、conntrack、さいごの trace (1 行 1 つの JSON)

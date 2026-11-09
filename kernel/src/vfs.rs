@@ -931,7 +931,7 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
 
 /// lookup の答えを f (たどったパス, inode) で。パスのいらないもの (resolve) は、覚えのパスを写さない
 fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef) -> T) -> Result<T, i64> {
-    let _p = crate::prof::span("vfs:lookup");
+    let _p = crate::debug::span("vfs:lookup");
     if path.is_empty() {
         return Err(-ENOENT);
     }
@@ -1481,7 +1481,7 @@ pub fn path_of_id(id: (usize, u64)) -> Option<String> {
 
 /// /proc/ai/fs の mounts: はじめの namespace のマウント (ルートも) と、それぞれのファイルシステムの中の様子 (fs_stats)
 pub fn mounts_json() -> String {
-    let esc = crate::aiproc::esc;
+    let esc = crate::debug::esc;
     let stats = |i: Option<&InodeRef>| i.and_then(|i| i.fs_stats()).unwrap_or_else(|| String::from("null"));
     let (src, ty) = ROOT_INFO.get().clone();
     let root = ROOT.get().clone();
@@ -1544,7 +1544,7 @@ fn found(r: Resolved) -> Result<(String, InodeRef), i64> {
 /// t: 答えを覚えてよいか (だめなら ok を false に) と、通ったディレクトリ (lookup の PATHS)、そのうちだれでもは通れないもの
 fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t: &mut Trace) -> Result<(String, InodeRef), i64> {
     // 覚え (PATHS) になかったもの。vfs:lookup との回数の差が、覚えから答えた数
-    let _p = crate::prof::span("vfs:walk");
+    let _p = crate::debug::span("vfs:walk");
     let cred = crate::cred::current();
     // ルートからリンクをたどらずに来たあいだだけ、途中のディレクトリを t.prefixes に (覚えてよいもの)
     let mut direct = start.is_none();
@@ -1855,7 +1855,7 @@ fn chain(path: &str) -> Result<Vec<Step>, i64> {
 ///   NO_XDEV: マウントをまたぐもの (入るのも、.. で出るのも、ほかのマウントへのリンクも) は EXDEV
 /// 最後の名前だけがなければ Missing (O_CREAT が作るところ)。答えは覚えない (lookup の PATHS は使わない)
 pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resolve: u64, creat: bool) -> Result<Resolved, i64> {
-    let _p = crate::prof::span("vfs:resolve");
+    let _p = crate::debug::span("vfs:resolve");
     let beneath = resolve & RESOLVE_BENEATH != 0;
     let in_root = resolve & RESOLVE_IN_ROOT != 0;
     let no_xdev = resolve & RESOLVE_NO_XDEV != 0;

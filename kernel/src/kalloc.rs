@@ -444,7 +444,7 @@ pub fn zero_page(page: *mut u8) {
 /// 前に使った人のデータが残っているので、書いていないところをユーザーに見せないこと)
 pub fn alloc_dirty() -> Option<*mut u8> {
     // わざと取れないことに (/proc/ai/ctl の fail ... page。fail.rs)
-    if crate::fail::page() {
+    if crate::debug::should_fail_alloc_page() {
         return None;
     }
     let mut k = KMEM.lock();

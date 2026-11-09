@@ -27,6 +27,7 @@ mod tty;
 mod block;
 mod cred;
 mod security;
+mod debug;
 mod crypto;
 mod dtb;
 mod efi;
@@ -152,6 +153,12 @@ pub extern "C" fn kmain() -> ! {
     security::register_seccomp(&seccomp::OPS);
     // audit (LSM ではない: Linux の CONFIG_AUDITSYSCALL)。起動の記録 (audit::init) はいままでどおりあとで
     security::register_audit(&audit::OPS);
+    // 調べもの (Linux の Kernel hacking: tracepoint と fault-inject、aios の prof) と、しくじったわけをためるもの (whylog)。
+    // core は debug.rs と why.rs の入り口を呼び、ここでつなぐ (止まっているあいだは ON を見るだけ)
+    debug::register_trace(&trace::OPS);
+    debug::register_prof(&prof::OPS);
+    debug::register_fail(&fail::OPS);
+    why::register_log(&whylog::OPS);
 
     irq::init();
     irq::enable_ipi();

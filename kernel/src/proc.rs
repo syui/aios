@@ -575,9 +575,9 @@ impl Proc {
         let n = name.iter().position(|&c| c == 0).unwrap_or(name.len()).min(15);
         self.comm = [0; 16];
         self.comm[..n].copy_from_slice(&name[..n]);
-        crate::trace::name(self.pid, &self.comm);
+        crate::debug::trace_name(self.pid, &self.comm);
         // 代表の名前が変わったかもしれない: trace の絞りの覚えを古くする
-        crate::trace::names_changed();
+        crate::debug::trace_names_changed();
     }
 
     pub fn comm(&self) -> &str {
@@ -1165,7 +1165,7 @@ fn alloc_proc() -> Option<&'static mut Proc> {
         },
     };
     let i = slot_of(p);
-    crate::prof::thread_start(i);
+    crate::debug::prof_thread_start(i);
     LIVE.get()[i / 64] |= 1u64 << (i % 64);
     p.pid = *NEXT_PID.get();
     *NEXT_PID.get() += 1;
@@ -1338,7 +1338,7 @@ pub fn scheduler() -> ! {
             let p = &mut procs()[i];
             p.state = State::Running;
             p.nrun += 1;
-            crate::trace::switch(p.pid, &p.comm);
+            crate::debug::trace_switch(p.pid, &p.comm);
             if p.woken_ns != 0 {
                 crate::smp::dev_wait(3, p.woken_ns);
                 p.woken_ns = 0;
@@ -1428,7 +1428,7 @@ fn sched() {
     crate::smp::SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let p = current();
     let seg = crate::smp::seg_pause();
-    let off = crate::prof::off_cpu();
+    let off = crate::debug::prof_off_cpu();
     // ext4 のロックは眠るあいだ手放す (大きなロックと同じく、ほかがそのあいだに ext4 に入れるように)
     let fs = crate::extfs::fs_unlock_for_sleep();
     unsafe {
@@ -1437,7 +1437,7 @@ fn sched() {
         swtch(&mut p.context, sched_ctx());
     }
     crate::extfs::fs_relock_after_sleep(fs);
-    crate::prof::on_cpu(off);
+    crate::debug::prof_on_cpu(off);
     crate::smp::seg_resume(seg);
 }
 
@@ -1462,7 +1462,7 @@ pub fn sleep_nointr(chan: usize) {
     p.nointr = true;
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
-    crate::trace::sleep(chan);
+    crate::debug::trace_sleep(chan);
     wq_enter();
     sched();
     wq_exit();
@@ -1484,7 +1484,7 @@ pub fn sleep_killable(chan: usize) -> Result<(), i64> {
     p.killable = true;
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
-    crate::trace::sleep(chan);
+    crate::debug::trace_sleep(chan);
     wq_enter();
     sched();
     wq_exit();
@@ -1503,7 +1503,7 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     p.wake_at = deadline;
     p.state = State::Sleeping;
     p.slept_at = crate::timer::ticks();
-    crate::trace::sleep(chan);
+    crate::debug::trace_sleep(chan);
     wq_enter();
     sched();
     wq_exit();
@@ -1528,7 +1528,7 @@ pub fn recv_deadline(d: u64) -> u64 {
 
 /// chan で眠っている Proc を起こし、起こした数を返す
 pub fn wakeup(chan: usize) -> usize {
-    let _p = crate::prof::span("proc:wakeup");
+    let _p = crate::debug::span("proc:wakeup");
     wake_chan(chan, |_| true)
 }
 
@@ -1550,7 +1550,7 @@ fn wake_list(head: usize, l: fn(&mut Proc) -> &mut Link, f: impl Fn(&Proc) -> bo
         if p.state == State::Sleeping && f(p) {
             make_runnable(p);
             p.woken_ns = crate::timer::uptime_ns();
-            crate::trace::wake(p.pid, p.chan);
+            crate::debug::trace_wake(p.pid, p.chan);
             woken = woken.min(p.recent);
             n += 1;
         }
@@ -1719,7 +1719,7 @@ pub fn exit(code: i32) -> ! {
 
 fn exit_status(status: i32) -> ! {
     let p = current();
-    crate::trace::exit(p.pid, status as i64);
+    crate::debug::trace_exit(p.pid, status as i64);
     // 監査: exit や exit_group の中なら、その記録 (__audit_free)
     if p.audit.is_some() {
         crate::security::audit_free();
@@ -1753,10 +1753,10 @@ fn exit_status(status: i32) -> ! {
     if p.tgid == 1 {
         panic!("init exited with status {}", status);
     }
-    let _p = crate::prof::span("proc:exit_kids");
+    let _p = crate::debug::span("proc:exit_kids");
     reparent_kids(slot_of(p));
     drop(_p);
-    let _p = crate::prof::span("proc:exit_files");
+    let _p = crate::debug::span("proc:exit_files");
     p.files = None;
     crate::unix::gc_check(true);
     p.timers.clear();
@@ -1766,14 +1766,14 @@ fn exit_status(status: i32) -> ! {
     // /proc/PID/stat と status の大きさは 0 になる (Linux と同じ)。外してから捨てる (exec と同じ。もうユーザーの
     // アドレスには触らない)。ほかのスレッドがまだ使っていれば、捨てるのは最後のスレッド。自分だけの表なら、ページを
     // 返すのは、この CPU が大きなロックを放してから (vm::PageTable::release_deferred)
-    let _p = crate::prof::span("proc:exit_mm");
+    let _p = crate::debug::span("proc:exit_mm");
     crate::vm::deactivate();
     if let Some(m) = p.mm.as_ref().filter(|m| m.private()) {
         m.get().pt.release_deferred();
     }
     p.mm = None;
     drop(_p);
-    let _p = crate::prof::span("proc:exit_notify");
+    let _p = crate::debug::span("proc:exit_notify");
     p.xstatus = p.group_exit.unwrap_or(status);
     p.state = State::Zombie;
     // 親は子の並びのつなぎから (表を探さない)。init を起こすのは、ゾンビの子をわたしたときだけ (reparent_kids)
@@ -1893,7 +1893,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     let mm = if flags & CLONE_VM != 0 {
         parent.mm.clone().unwrap()
     } else {
-        let _p = crate::prof::span("proc:fork_pt");
+        let _p = crate::debug::span("proc:fork_pt");
         let pre = parent.prefork.take();
         let m = parent.mm();
         let pt = match pre {
@@ -1906,10 +1906,10 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
     } else {
-        let _p = crate::prof::span("proc:fork_files");
+        let _p = crate::debug::span("proc:fork_files");
         Shared::new(parent.files().clone())
     };
-    let _p = crate::prof::span("proc:fork_slot");
+    let _p = crate::debug::span("proc:fork_slot");
     let child = alloc_proc().ok_or(-EAGAIN)?;
     child.mm = Some(mm);
     child.files = Some(files);
@@ -1977,7 +1977,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     let chan = vfork_chan(child);
     drop(_p);
-    let _p = crate::prof::span("proc:fork_run");
+    let _p = crate::debug::span("proc:fork_run");
     make_runnable(child);
     crate::smp::wake_idle();
     drop(_p);
@@ -2153,7 +2153,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             if c.state == State::Zombie && options & WEXITED != 0 {
                 let r = (crate::ns::to_local(c.pid).unwrap_or(c.pid), c.xstatus);
                 if !keep {
-                    let _p = crate::prof::span("proc:reap");
+                    let _p = crate::debug::span("proc:reap");
                     let t = c.utime + c.cutime;
                     // 子の走った時間 (Linux の wait_task_zombie: 子の分と、子が回収した孫の分)
                     let (u, s) = user_sys_ns(c, false);
@@ -2575,7 +2575,7 @@ pub fn stacks_text(tgid: u32) -> alloc::string::String {
 /// 眠っていれば何を待っているか: futex (アドレス、待つ値、いまの値)、poll / select / epoll (見張っている fd)、
 /// ほか (channel)。slept_s は眠りつづけている秒
 pub fn ai_threads() -> alloc::string::String {
-    use crate::aiproc::esc;
+    use crate::debug::esc;
     let mut out = alloc::string::String::new();
     let now = crate::timer::ticks();
     let hz = crate::timer::HZ;
@@ -2623,7 +2623,7 @@ pub fn ai_threads() -> alloc::string::String {
 /// (フレームポインタのないプログラムや、CFI のない libc の中で眠っていても)。走っているスレッドの値は、
 /// 最後に例外が来たときのもの
 pub fn ai_stack(tid: u32) -> Option<alloc::string::String> {
-    use crate::aiproc::esc;
+    use crate::debug::esc;
     let p = find(tid)?;
     if p.state == State::Unused || p.state == State::Zombie {
         return None;

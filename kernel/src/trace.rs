@@ -10,12 +10,12 @@ use crate::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+// 記録しているか (core の入り口 debug.rs が持つ: core はここを名前で呼ばない)
+use crate::debug::TRACE_ON as ON;
 
 /// 覚える出来事の数 (1 つ 24 バイト: 8192 で 192 KiB)
 const N: usize = 8192;
-
-pub static ON: AtomicBool = AtomicBool::new(false);
 
 /// 出来事の種類
 #[derive(Clone, Copy, PartialEq)]
@@ -240,6 +240,47 @@ pub fn exit(tid: u32, code: i64) {
     }
 }
 
+/// core の入り口 (debug.rs) につなぐもの (main.rs)
+pub struct Ops;
+
+pub static OPS: Ops = Ops;
+
+impl crate::debug::Tracer for Ops {
+    fn sys_enter(&self, nr: u64, a0: u64) {
+        sys_enter(nr, a0);
+    }
+    fn sys_exit(&self, nr: u64, r: i64) {
+        sys_exit(nr, r);
+    }
+    fn sys_fast(&self, nr: u64, a0: u64, r: i64) {
+        sys_fast(nr, a0, r);
+    }
+    fn switch(&self, tid: u32, comm: &[u8; 16]) {
+        switch(tid, comm);
+    }
+    fn sleep(&self, chan: usize) {
+        sleep(chan);
+    }
+    fn wake(&self, tid: u32, chan: usize) {
+        wake(tid, chan);
+    }
+    fn irq(&self, n: u32) {
+        irq(n);
+    }
+    fn fault(&self, va: usize, write: bool) {
+        fault(va, write);
+    }
+    fn name(&self, tid: u32, comm: &[u8; 16]) {
+        name(tid, comm);
+    }
+    fn names_changed(&self) {
+        names_changed();
+    }
+    fn exit(&self, tid: u32, code: i64) {
+        exit(tid, code);
+    }
+}
+
 // ---- ctl と /proc/ai/trace ----
 
 /// trace on [NAME] / off / clear
@@ -305,13 +346,13 @@ pub fn json() -> String {
     };
     let names: Vec<String> = {
         let n = NAMES.lock();
-        n.iter().map(|(t, c)| format!("\"{}\":\"{}\"", t, crate::aiproc::esc(comm_str(c)))).collect()
+        n.iter().map(|(t, c)| format!("\"{}\":\"{}\"", t, crate::debug::esc(comm_str(c)))).collect()
     };
     let mut s = String::with_capacity(evs.len() * 72 + 1024);
     s.push_str(&format!(
         "{{\"on\":{},\"filter\":\"{}\",\"events\":{},\"dropped\":{},\"names\":{{{}}}}}\n",
         ON.load(Relaxed),
-        crate::aiproc::esc(&filter_str()),
+        crate::debug::esc(&filter_str()),
         len,
         dropped,
         names.join(",")

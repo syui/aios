@@ -5,12 +5,13 @@
 //   name  区間ごとの count、total_us (中の区間も、眠っていた時間もふくむ)、self_us (中の区間と眠っていた時間をのぞいた、
 //         そこだけで CPU を使った時間)、wait_us (そこで眠っていた時間: 相手やディスクを待った)、avg_us (total_us / count)。
 //         total_us の多い順。part の行にも wait_us (pct は CPU の時間 self_us だけで)
-// 区間は let _p = crate::prof::span("part:what"); から、その変数の終わりまで。中の区間の時間は、スレッドごとの数え
+// 区間は let _p = crate::debug::span("part:what"); (core。debug.rs の入り口から。extra は crate::prof::span でも) から、
+// その変数の終わりまで。中の区間の時間は、スレッドごとの数え
 // (CHILD) で引く。眠っていた時間 (proc.rs の sched で CPU を手放してから戻るまで) は、いちばん内側の開いている区間
 // (INNER) の wait に足し、CHILD にも足して self からのぞく。数えていないときは、区間の始めに atomic を 1 つ読むだけ
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-
-pub static ON: AtomicBool = AtomicBool::new(false);
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+// 数えているか (core の入り口 debug.rs が持つ: core はここを名前で呼ばない)
+use crate::debug::PROF_ON as ON;
 
 /// 区間の名前の数の上限 (システムコールの区間もあるので多めに。2 のべき)
 const N: usize = 256;
@@ -138,6 +139,30 @@ fn slot_of(name: &'static str) -> Option<usize> {
         i = (i + 1) % N;
     }
     None
+}
+
+/// core の入り口 (debug.rs) につなぐもの (main.rs)。区間 (Span) は debug.rs の Span に [slot, t0, outer, outer_slot] で
+pub struct Ops;
+
+pub static OPS: Ops = Ops;
+
+impl crate::debug::Profiler for Ops {
+    fn begin(&self, name: &'static str) -> Option<[u64; 4]> {
+        let s = core::mem::ManuallyDrop::new(span(name)?);
+        Some([s.slot as u64, s.t0, s.outer, s.outer_slot as u64])
+    }
+    fn end(&self, s: &[u64; 4]) {
+        drop(Span { slot: s[0] as usize, t0: s[1], outer: s[2], outer_slot: s[3] as usize });
+    }
+    fn thread_start(&self, i: usize) {
+        thread_start(i);
+    }
+    fn off_cpu(&self) -> u64 {
+        off_cpu()
+    }
+    fn on_cpu(&self, t0: u64) {
+        on_cpu(t0);
+    }
 }
 
 /// prof on (0 から数えはじめる) / prof off

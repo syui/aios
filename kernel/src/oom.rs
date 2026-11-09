@@ -56,7 +56,7 @@ fn emergency() {
 /// 殺す (init はやりなおす)。ほかが返したあとなら、だれも殺さずにやりなおす
 pub fn on_fault() -> bool {
     let me = crate::proc::current().tgid;
-    if crate::fail::take_page_hit() {
+    if crate::debug::fail_page_hit() {
         return me == 1;
     }
     if crate::kalloc::nfree() >= crate::kalloc::MIN_FREE_PAGES.load(Relaxed) {

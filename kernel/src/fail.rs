@@ -12,10 +12,9 @@
 // out of memory で殺されてカーネルは続く。heap は、耐えるところ (read の入れ物など) が ENOMEM を返して続くのを、
 // oom は、耐えないところ (Vec::push など) が予備から渡されて oom.rs が空けるのを確かめる (heap.rs の「足りないとき」)
 use crate::spinlock::SpinLock;
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
-
-/// 決まりがあるか (それぞれの場所は、まずこれだけ見る)
-pub static ON: AtomicBool = AtomicBool::new(false);
+use core::sync::atomic::Ordering::Relaxed;
+// 決まりがあるか (それぞれの場所は、まずこれだけ見る。core の入り口 debug.rs が持つ: core はここを名前で呼ばない)
+use crate::debug::FAIL_ON as ON;
 
 #[derive(Clone, Copy, PartialEq)]
 enum What {
@@ -78,12 +77,6 @@ fn take(what: What) -> Option<Rule> {
     Some(*r)
 }
 
-/// わざとしくじらせる決まりがあるか (ヒープの CPU ごとの置き場は、あるあいだ通らない: heap.rs)
-#[inline]
-pub fn armed() -> bool {
-    ON.load(Relaxed)
-}
-
 /// システムコール nr をしくじらせるなら、その errno (正の数)
 #[inline]
 pub fn syscall(nr: u64) -> Option<i64> {
@@ -111,20 +104,26 @@ pub fn heap(fallible: bool) -> bool {
     take(if fallible { What::Heap } else { What::Oom }).is_some()
 }
 
-/// 物理ページの alloc をしくじらせるか
+/// 物理ページの alloc をしくじらせるか (しくじらせたことは debug.rs が覚えて oom::on_fault に見せる)
 pub fn page() -> bool {
-    let hit = ON.load(Relaxed) && take(What::Page).is_some();
-    if hit {
-        PAGE_HIT.store(true, Relaxed);
-    }
-    hit
+    ON.load(Relaxed) && take(What::Page).is_some()
 }
 
-/// page がしくじらせた (oom::on_fault が見て下ろす: わざと取れなくしたのなら、メモリは足りているので殺す相手を選ばない)
-static PAGE_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// core の入り口 (debug.rs) につなぐもの (main.rs)
+pub struct Ops;
 
-pub fn take_page_hit() -> bool {
-    PAGE_HIT.swap(false, Relaxed)
+pub static OPS: Ops = Ops;
+
+impl crate::debug::FaultInject for Ops {
+    fn syscall(&self, nr: u64) -> Option<i64> {
+        syscall(nr)
+    }
+    fn heap(&self, fallible: bool) -> bool {
+        heap(fallible)
+    }
+    fn page(&self) -> bool {
+        page()
+    }
 }
 
 /// /proc/ai/ctl の fail ...
@@ -177,7 +176,7 @@ pub fn json() -> alloc::string::String {
     let n = r.name.iter().position(|&c| c == 0).unwrap_or(16);
     let target = match r.pid {
         Some(p) => format!("\"pid\":{}", p),
-        None => format!("\"name\":\"{}\"", crate::aiproc::esc(core::str::from_utf8(&r.name[..n]).unwrap_or("?"))),
+        None => format!("\"name\":\"{}\"", crate::debug::esc(core::str::from_utf8(&r.name[..n]).unwrap_or("?"))),
     };
     let what = match r.what {
         What::Sys => format!(

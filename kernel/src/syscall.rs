@@ -369,7 +369,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     // 引数は 6 つ (x0〜x5)。tf.x を 31 ぜんぶ写すと、それだけでシステムコールごとに 248 バイト
     let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
     let nr = tf.x[8];
-    crate::trace::sys_enter(nr, a[0]);
+    crate::debug::trace_sys_enter(nr, a[0]);
     let p = proc::current();
     p.orig_x0 = a[0];
     p.last_sys = (nr, a[0], a[1]);
@@ -385,16 +385,16 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             crate::security::Permit::Allow => {}
             crate::security::Permit::Errno(e) => {
                 tf.x[0] = e as u64;
-                crate::trace::sys_exit(nr, e);
+                crate::debug::trace_sys_exit(nr, e);
                 strace(nr, &a, Err(e));
                 crate::why::note(crate::why::Code::Seccomp, e, 0);
-                crate::whylog::done(nr, e, &a);
+                crate::why::done(nr, e, &a);
                 return None;
             }
             crate::security::Permit::Trap(errno) => {
                 signal::force_sigsys(nr, tf.elr, errno);
                 tf.x[0] = (-ENOSYS) as u64;
-                crate::trace::sys_exit(nr, -ENOSYS);
+                crate::debug::trace_sys_exit(nr, -ENOSYS);
                 return None;
             }
             crate::security::Permit::Kill => {
@@ -404,7 +404,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             // user notification: listener が答えた値で返す (CONTINUE ならそのままシステムコールを: Allow)
             crate::security::Permit::Return(v) => {
                 tf.x[0] = v as u64;
-                crate::trace::sys_exit(nr, v);
+                crate::debug::trace_sys_exit(nr, v);
                 strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
                 return None;
             }
@@ -412,7 +412,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             // ERESTARTNOINTR)
             crate::security::Permit::Interrupted { always } => {
                 tf.x[0] = (-EINTR_) as u64;
-                crate::trace::sys_exit(nr, -EINTR_);
+                crate::debug::trace_sys_exit(nr, -EINTR_);
                 return Some(Restart { restartable: true, always });
             }
         }
@@ -422,23 +422,23 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         && crate::parts::off(p)
     {
         tf.x[0] = (-ENOSYS) as u64;
-        crate::trace::sys_exit(nr, -ENOSYS);
+        crate::debug::trace_sys_exit(nr, -ENOSYS);
         strace(nr, &a, Err(-ENOSYS));
         crate::why::note(crate::why::Code::PartOff, -ENOSYS, 0);
-        crate::whylog::done(nr, -ENOSYS, &a);
+        crate::why::done(nr, -ENOSYS, &a);
         return None;
     }
     // わざとしくじらせる (/proc/ai/ctl の fail。fail.rs): 決まりに合えば、動かさずにその errno
-    if let Some(e) = crate::fail::syscall(nr) {
+    if let Some(e) = crate::debug::should_fail_syscall(nr) {
         tf.x[0] = (-e) as u64;
-        crate::trace::sys_exit(nr, -e);
+        crate::debug::trace_sys_exit(nr, -e);
         strace(nr, &a, Err(-e));
         crate::why::note(crate::why::Code::Injected, -e, 0);
-        crate::whylog::done(nr, -e, &a);
+        crate::why::done(nr, -e, &a);
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
-    let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::prof::span) } else { None };
+    let _p = if crate::debug::PROF_ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::debug::span) } else { None };
     // 監査 (audit_syscall_entry: 入れもののあるスレッドだけ)
     if p.audit.is_some() {
         crate::security::audit_syscall_entry(nr, &a);
@@ -715,7 +715,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
-    crate::trace::sys_exit(nr, r.unwrap_or_else(|e| e));
+    crate::debug::trace_sys_exit(nr, r.unwrap_or_else(|e| e));
     if proc::current().audit.is_some() {
         if let Some(plan) = plan {
             sysfile::audit_post(plan, &r);
@@ -727,7 +727,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     if let Err(e) = r
         && nr != RSEQ
     {
-        crate::whylog::done(nr, e, &a);
+        crate::why::done(nr, e, &a);
     }
     // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
     crate::unix::gc_check(false);
@@ -1086,7 +1086,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     {
         c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    crate::trace::sys_fast(nr, a[0], r);
+    crate::debug::trace_sys_fast(nr, a[0], r);
     true
 }
 

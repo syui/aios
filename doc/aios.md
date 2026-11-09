@@ -350,7 +350,8 @@ extra を使っているところを出す (core を小さくするときの目�
 /proc/ai/why で見せるほう (whylog、extra)。セキュリティの部品 (LSM) は、core が名前で呼ばずに `security.rs` (Linux の
 security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
 AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
-test/kernel-json.py の `BEHIND_HOOKS` に書き、core がまた名前で呼べば落ちる (いまは apparmor、landlock、seccomp、audit、auditfilter)。seccomp と audit は LSM ではない
+test/kernel-json.py の `BEHIND_HOOKS` に入り口といっしょに書き、core がまた名前で呼べば落ちる (いまは security.rs の apparmor、landlock、
+seccomp、audit、auditfilter、debug.rs の trace、prof、fail、why.rs の whylog)。seccomp と audit は LSM ではない
 (Linux も): security.rs の中の別の入り口 (Linux の include/linux/seccomp.h と audit.h: seccomp_permit_syscall、
 audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。namespace (ns) は Linux と
 同じく core (pid、uid、ホスト名の読みかえと mount の namespace。LSM は作るときだけ見る: security::namespace_init)。LSM が
@@ -363,6 +364,11 @@ kernel.sched_* は proc.rs、vm.min_free_kbytes は kalloc.rs、fs.inotify.* は
 EFI スタブ (efi.rs) が覚えたものを main.rs が dtb (set_cmdline: Linux の EFI スタブが /chosen/bootargs に書くのと同じ役) と
 kalloc (reserve: Linux の memblock_reserve) へ渡す (dtb と kalloc は UEFI を知らない)。vDSO は Linux の arm64 と同じく core
 (exec が写し、signal がシグナルから戻る入口に使う。off はそのまま)。
+調べもの (Linux の Kernel hacking にあたるもの) も同じ形: core は trace・prof・fail を名前で呼ばずに `debug.rs` の入り口
+(Linux の tracepoint.h の trace_*() と fault-inject.h の should_fail*() にあたる trace_switch、span、should_failslab など) を呼び、
+main.rs が register_trace・register_prof・register_fail でつなぐ。止まっているあいだは、それぞれの場所で ON (debug.rs の
+TRACE_ON・PROF_ON・FAIL_ON。それぞれが /proc/ai/ctl で立てる) を 1 回見るだけで、前と同じ重さ。しくじったわけをためるもの
+(whylog) は why.rs の入り口 (done、fast_missing) から (main.rs の register_log)。/proc/ai の JSON の文字列 (esc) も debug.rs。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

@@ -287,7 +287,7 @@ pub fn page_cache_json() -> alloc::string::String {
     let mut list = Vec::new();
     for ((fs, ino), n) in files {
         let size = PRIV.lock().vers.get(&(fs, ino)).map_or(0, |v| v.1);
-        let name = crate::vfs::path_of_id((fs, ino)).map_or(alloc::string::String::new(), |p| format!(",\"name\":\"{}\"", crate::aiproc::esc(&p)));
+        let name = crate::vfs::path_of_id((fs, ino)).map_or(alloc::string::String::new(), |p| format!(",\"name\":\"{}\"", crate::debug::esc(&p)));
         list.push(format!("{{\"fs\":{},\"ino\":{},\"pages\":{},\"size\":{}{}}}", fs, ino, n, size, name));
     }
     let (miss, ns) = (FAULT_KIND[9].0.load(Ordering::Relaxed), FAULT_KIND[9].1.load(Ordering::Relaxed));
@@ -693,7 +693,7 @@ fn make_room() -> bool {
 /// ページキャッシュを通して読む (大きなロックを持って。ino は page_cacheable なもの)。ふつうのファイルでなければ
 /// そのまま read_at。読んだページは表に残るので、次からは read_fast (ロックなし) で読める
 pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
-    let _p = crate::prof::span("vm:read_cached");
+    let _p = crate::debug::span("vm:read_cached");
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG {
         return ino.read_at(off, buf);
@@ -1831,7 +1831,7 @@ impl PageTable {
 
     /// [start, end) の領域とページを外す
     pub fn unmap(&mut self, start: usize, end: usize) {
-        let _p = crate::prof::span("vm:unmap");
+        let _p = crate::debug::span("vm:unmap");
         let (s, e) = (pg_down(start), pg_up(end));
         if s < e {
             self.note(b'u', s, e, 0);
@@ -2132,7 +2132,7 @@ impl PageTable {
 
     /// ユーザーが va で write / exec しようとして止まった
     pub fn fault(&mut self, va: usize, write: bool, exec: bool) -> Result<(), FaultErr> {
-        crate::trace::fault(va, write);
+        crate::debug::trace_fault(va, write);
         let (_, v) = self.find(va).ok_or(FaultErr::NoMap)?;
         let ok = if write {
             v.prot & PROT_WRITE != 0
@@ -2150,7 +2150,7 @@ impl PageTable {
     /// ファイルを読むフォルトで page_va を写したあと: まど (around) の、まだ何もない PTE に、キャッシュにあるページを
     /// 書きこみ禁止で (Linux の do_fault_around。ファイルの終わりより先は写さない)。大きなロックを持って (mutating の中)
     fn map_around(&mut self, start: usize, back: &Backing, prot: u8, page_va: usize, pte: *mut u64) {
-        let _p = crate::prof::span("vm:around");
+        let _p = crate::debug::span("vm:around");
         let Backing::File { ino, off, fend, .. } = back else { return };
         let end = self.find(page_va).map_or(page_va + PGSIZE, |(_, v)| v.end);
         let (lo, hi) = around(start, end, *fend, page_va);
@@ -2178,7 +2178,7 @@ impl PageTable {
     /// MAP_SHARED のファイルを読むフォルトの fault-around (map_around と同じまど): 写しの表にあるか、ファイルシステムの
     /// キャッシュにあるページだけを、写しの表に入れて (書いたものは書けるように、まだなら書きこみ禁止で)
     fn map_around_shared(&mut self, start: usize, back: &Backing, prot: u8, page_va: usize, pte: *mut u64) {
-        let _p = crate::prof::span("vm:around");
+        let _p = crate::debug::span("vm:around");
         let Backing::File { ino, off, fend, .. } = back else { return };
         let end = self.find(page_va).map_or(page_va + PGSIZE, |(_, v)| v.end);
         let (lo, hi) = around(start, end, *fend, page_va);
@@ -2228,7 +2228,7 @@ impl PageTable {
     fn fault_page(&mut self, va: usize, write: bool, force: bool) -> Result<(), FaultErr> {
         // 時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックの統計と同じ。TCG では時計を読むのが重く、
         // いくつもの CPU が同時に読むと 1 つずつになる: timer の粗い時計)
-        let _p = crate::prof::span("vm:fault");
+        let _p = crate::debug::span("vm:fault");
         let timed = crate::smp::draw_here();
         let t0 = if timed { crate::timer::uptime_ns() } else { 0 };
         let mut kind = 0usize;

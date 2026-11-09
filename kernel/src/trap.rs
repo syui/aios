@@ -390,7 +390,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
         EL1H_IRQ | EL0_IRQ => {
             let raw = claimed.unwrap_or_else(irq::claim);
             let id = raw & 0x3ff;
-            crate::trace::irq(id);
+            crate::debug::trace_irq(id);
             match id {
                 timer::IRQ => timer::tick(),
                 // ほかの CPU から: EL0 へ戻る前に、殺されたか、シグナルが来たかを見るだけ

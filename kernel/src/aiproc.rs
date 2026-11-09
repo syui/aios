@@ -37,7 +37,7 @@
 //               heap hog N    N MiB をわざと取って持っておく (足りなくなったときの道: 足す、捨てる、ENOMEM。0 で返す)
 //               page cycle    空いている物理ページを (少し残して) みな取ってから返す (RAM をひととおり使ったあとの様子)
 //               page check    物理ページの空き (buddy: kalloc.rs) の決まりを確かめて kmsg に (page: check ok / FAILED)
-//               prof on|off   カーネルの中の区間 (prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
+//               prof on|off   カーネルの中の区間 (debug::span と prof::span) ごとの回数と時間を 0 から数える。/proc/ai/prof で読む
 //               lockbench     スピンロック、ヒープ、大きなロック、時計、物理ページの 1 回の時間を kmsg に (spinlock::bench)
 //               fail pid N|name NAME sys NR|all ERRNO [TIMES]  そのプロセスのシステムコール (番号か名前か、みな) を、
 //                             動かさずに -ERRNO に (TIMES 回。既定 1)。fail ... heap [TIMES] はカーネルのヒープの alloc を
@@ -53,6 +53,7 @@
 //                             sysrq-trigger の c と同じ)
 use alloc::format;
 use alloc::string::String;
+use crate::debug::esc;
 
 /// wheel (sudo できる人。aiosd と同じ)。/proc/ai/ctl は root:wheel の 0664
 pub const WHEEL: u32 = 10;
@@ -65,20 +66,6 @@ pub const WHEEL: u32 = 10;
 pub fn allowed() -> bool {
     let c = crate::proc::current_cred_ref();
     (c.euid == 0 || c.in_group(WHEEL)) && c.ns.user.is_none()
-}
-
-/// JSON の文字列の中身にする (" と \ と制御文字)
-pub fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
 }
 
 /// /proc/ai/fd/PID
