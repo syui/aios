@@ -336,7 +336,7 @@ pub struct Proc {
     /// futex::exit_robust_list がたどる。fork の子は 0 から (Linux の futex_init_task)
     pub robust_list: usize,
     /// システムコールの監査の入れもの (audit.rs の Ctx: audit を一度でも on にしたあとに作ったスレッドだけ)
-    pub audit: Option<alloc::boxed::Box<crate::audit::Ctx>>,
+    pub audit: Option<alloc::boxed::Box<dyn core::any::Any>>,
     /// はじめて走るとき (forkret)、大きなロックを放してから自分の tid を書く場所 (CLONE_CHILD_SETTID。Linux の
     /// schedule_tail と同じ。fork の子では書くと COW になるので、前は親の clone が大きなロックを持ったまま写していた)
     set_child_tid: usize,
@@ -1717,7 +1717,7 @@ fn exit_status(status: i32) -> ! {
     crate::trace::exit(p.pid, status as i64);
     // 監査: exit や exit_group の中なら、その記録 (__audit_free)
     if p.audit.is_some() {
-        crate::audit::task_exit();
+        crate::security::audit_free();
     }
     crate::ns::init_exited(p);
     // 持ったまま終わる robust futex に OWNER_DIED (Linux の futex_exit_release は mm_release の clear_child_tid より先)
@@ -1940,7 +1940,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         }
     }
     // 監査の入れもの (TASK の組のルールは子の pid と cred で見る)
-    child.audit = crate::audit::alloc(child);
+    child.audit = crate::security::audit_alloc(child);
     unsafe {
         fp_save(&mut child.fp);
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) child.tpidr);
@@ -2053,7 +2053,7 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     p.cred.cap_perm = p.cred.uid == 0 || p.cred.euid == 0;
     p.cred.fs_caps = p.cred.euid == 0;
     p.set_comm(comm.as_bytes());
-    crate::audit::exec_done(p);
+    crate::security::audit_proctitle_free(p);
     // 他のスレッドは消える
     for t in p.siblings() {
         kill_proc(t);

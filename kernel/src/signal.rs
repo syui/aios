@@ -283,7 +283,7 @@ pub fn send_chld(parent: &Proc, info: SigInfo) {
 /// (AppArmor の signal の決まりで、だめなら EACCES))
 fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     // audit が見る (auditd に送られるもの: AUDIT_SIGNAL_INFO)
-    crate::audit::signal_info(target.tgid, sig);
+    crate::security::audit_signal_info(target.tgid, sig);
     let me = proc::current();
     let (a, b) = (&me.cred, &target.cred);
     if !(a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)) {

@@ -170,9 +170,9 @@ fn open_exec(path: &str) -> Result<(), i64> {
 
 /// インタプリタ (#! の 1 行めか PT_INTERP) を cwd から開く (Linux の open_exec)。audit の名前も (ないものは名前だけ)
 fn open_interp(cwd: &str, path: &str) -> Result<(String, crate::vfs::InodeRef), i64> {
-    let an = crate::audit::getname(path);
+    let an = crate::security::audit_getname(path);
     let (p, i) = crate::vfs::lookup(cwd, path, true)?;
-    crate::audit::inode(an, None, &i, false, &p);
+    crate::security::audit_inode(an, None, &i, false, &p);
     Ok((p, i))
 }
 

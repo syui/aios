@@ -146,6 +146,8 @@ pub extern "C" fn kmain() -> ! {
     security::register(&apparmor::LSM);
     // seccomp (LSM ではない: Linux の CONFIG_SECCOMP)。切ったもの (aios.off=seccomp) もつなぐ (切るのはシステムコールだけ)
     security::register_seccomp(&seccomp::OPS);
+    // audit (LSM ではない: Linux の CONFIG_AUDITSYSCALL)。起動の記録 (audit::init) はいままでどおりあとで
+    security::register_audit(&audit::OPS);
 
     irq::init();
     irq::enable_ipi();

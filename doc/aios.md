@@ -350,8 +350,9 @@ extra を使っているところを出す (core を小さくするときの目�
 /proc/ai/why で見せるほう (whylog、extra)。セキュリティの部品 (LSM) は、core が名前で呼ばずに `security.rs` (Linux の
 security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
 AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
-test/kernel-json.py の `BEHIND_HOOKS` に書き、core がまた名前で呼べば落ちる (いまは apparmor、landlock、seccomp)。seccomp は LSM ではない (Linux も): security.rs の
-中の別の入り口 (Linux の include/linux/seccomp.h: seccomp_permit_syscall など) で、main.rs が register_seccomp でつなぐ。LSM が
+test/kernel-json.py の `BEHIND_HOOKS` に書き、core がまた名前で呼べば落ちる (いまは apparmor、landlock、seccomp、audit、auditfilter)。seccomp と audit は LSM ではない
+(Linux も): security.rs の中の別の入り口 (Linux の include/linux/seccomp.h と audit.h: seccomp_permit_syscall、
+audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。LSM が
 プロセスやファイルに持たせるもの (AppArmor のラベル、landlock の層、開いたときに覚えたもの) は、core の中立の名前の欄
 (Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。いまの aios の順が Linux と
 ちがうところ (すでにあるファイルを開くときは AppArmor が先、など) は、フックに「aios の順」と書いてある。

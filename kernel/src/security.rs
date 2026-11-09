@@ -10,11 +10,13 @@ use crate::cred::Cred;
 use crate::file::FileRef;
 use crate::proc::Proc;
 use crate::vfs::InodeRef;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::AtomicU32;
 
 const E2BIG: i64 = 7;
 const EFAULT: i64 = 14;
@@ -680,4 +682,122 @@ pub fn prctl_set_seccomp(mode: u64, prog: usize) -> Result<i64, i64> {
 /// seccomp(2)
 pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
     SECCOMP.val().syscall(op, flags, args)
+}
+
+// ---- audit (Linux の kernel/audit.c と auditsc.c、include/linux/audit.h)。LSM ではない (Linux も): 入り口だけをここに
+// 置き、audit.rs が register_audit でつなぐ。入っていなければ Linux の !CONFIG_AUDITSYSCALL と同じ (なにもしない) ----
+
+/// 名前の種類 (AUDIT_TYPE_*: PATH の記録の nametype=)
+#[derive(Clone, Copy, PartialEq)]
+pub enum NameType {
+    Unknown,
+    Normal,
+    Parent,
+    Delete,
+    Create,
+}
+
+/// システムコールのルールの数 (Linux の audit_n_rules: USER、EXCLUDE、FS の組のほかのルール)。0 でなければ、入れものの
+/// あるスレッドはみな入口と出口を通る (syscall::fast を使わない)。auditfilter が足し引きする
+pub static AUDIT_N_RULES: AtomicU32 = AtomicU32::new(0);
+
+/// audit (Linux の CONFIG_AUDITSYSCALL)。既定は入れずに作った Linux と同じ (なにもしない)。スレッドの入れもの (Proc の
+/// audit) の中は audit だけが知る
+pub trait Audit {
+    /// fork で作るスレッドの入れもの
+    fn alloc(&self, _child: &Proc) -> Option<Box<dyn Any>> {
+        None
+    }
+    /// いまのスレッドが終わる
+    fn free(&self) {}
+    /// exec したスレッド p: PROCTITLE の覚えを捨てる
+    fn proctitle_free(&self, _p: &mut Proc) {}
+    fn syscall_entry(&self, _nr: u64, _a: &[u64; 6]) {}
+    /// いま名前を集めているか (Linux の !audit_dummy_context)
+    fn collecting(&self) -> bool {
+        false
+    }
+    fn syscall_exit(&self, _ret: i64) {}
+    /// シグナルを送る (auditd に送られるもの: AUDIT_SIGNAL_INFO)
+    fn signal_info(&self, _tgid: u32, _sig: i32) {}
+    /// ユーザーの名前を足す (番号を返す)
+    fn getname(&self, _path: &str) -> Option<usize> {
+        None
+    }
+    fn inode(&self, _an: Option<usize>, _name: Option<&str>, _ino: &InodeRef, _parent: bool, _path: &str) {}
+    fn inode_child(&self, _dir: &InodeRef, _dname: &str, _ino: Option<&InodeRef>, _typ: NameType, _dir_path: &str) {}
+    fn openat2_how(&self, _flags: u64, _mode: u64, _resolve: u64) {}
+    /// execve がうまくいった
+    fn bprm(&self) {}
+}
+
+struct NoAudit;
+
+impl Audit for NoAudit {}
+
+static AUDIT: Early<&'static dyn Audit> = Early::new(&NoAudit);
+
+/// 起動のとき (main.rs) に audit をつなぐ
+pub fn register_audit(a: &'static dyn Audit) {
+    AUDIT.set(a);
+}
+
+/// audit_alloc: fork で作るスレッドの入れもの
+pub fn audit_alloc(child: &Proc) -> Option<Box<dyn Any>> {
+    AUDIT.val().alloc(child)
+}
+
+/// audit_free: いまのスレッドが終わる (do_exit)
+pub fn audit_free() {
+    AUDIT.val().free();
+}
+
+/// exec したスレッド p の PROCTITLE の覚えを捨てる (__audit_bprm のうち)
+pub fn audit_proctitle_free(p: &mut Proc) {
+    AUDIT.val().proctitle_free(p);
+}
+
+/// audit_syscall_entry
+pub fn audit_syscall_entry(nr: u64, a: &[u64; 6]) {
+    AUDIT.val().syscall_entry(nr, a);
+}
+
+/// audit_dummy_context: いま名前を集めていない
+pub fn audit_dummy_context() -> bool {
+    !AUDIT.val().collecting()
+}
+
+/// audit_syscall_exit
+pub fn audit_syscall_exit(ret: i64) {
+    AUDIT.val().syscall_exit(ret);
+}
+
+/// audit_signal_info
+pub fn audit_signal_info(tgid: u32, sig: i32) {
+    AUDIT.val().signal_info(tgid, sig);
+}
+
+/// audit_getname
+pub fn audit_getname(path: &str) -> Option<usize> {
+    AUDIT.val().getname(path)
+}
+
+/// audit_inode (an の名前の inode。parent なら親のディレクトリとして)
+pub fn audit_inode(an: Option<usize>, name: Option<&str>, ino: &InodeRef, parent: bool, path: &str) {
+    AUDIT.val().inode(an, name, ino, parent, path);
+}
+
+/// audit_inode_child
+pub fn audit_inode_child(dir: &InodeRef, dname: &str, ino: Option<&InodeRef>, typ: NameType, dir_path: &str) {
+    AUDIT.val().inode_child(dir, dname, ino, typ, dir_path);
+}
+
+/// audit_openat2_how
+pub fn audit_openat2_how(flags: u64, mode: u64, resolve: u64) {
+    AUDIT.val().openat2_how(flags, mode, resolve);
+}
+
+/// audit_bprm: execve がうまくいった (EXECVE の記録)
+pub fn audit_bprm() {
+    AUDIT.val().bprm();
 }

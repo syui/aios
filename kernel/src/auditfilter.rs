@@ -26,7 +26,7 @@ use crate::proc::Proc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::Ordering::Relaxed;
 
 const EINVAL: i64 = 22;
 const ENOENT: i64 = 2;
@@ -190,8 +190,6 @@ pub struct NameInfo {
 }
 
 static RULES: Bkl<[Vec<Rule>; 8]> = Bkl::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
-/// システムコールのルールの数 (audit_n_rules: USER、EXCLUDE、FS のほか)
-pub static N_RULES: AtomicU32 = AtomicU32::new(0);
 /// EXIT の組の順 (prio_low は後ろに足すもの、prio_high は前に足すもの)
 static PRIO: Bkl<(u64, u64)> = Bkl::new((u64::MAX / 2, u64::MAX / 2 - 1));
 
@@ -428,7 +426,7 @@ pub fn add(mut r: Rule) -> Result<(), i64> {
     }
     r.flags = 0;
     if counts(r.listnr) {
-        N_RULES.fetch_add(1, Relaxed);
+        crate::security::AUDIT_N_RULES.fetch_add(1, Relaxed);
     }
     if prepend {
         list.insert(0, r);
@@ -444,7 +442,7 @@ pub fn del(r: &Rule) -> Result<(), i64> {
     let i = list.iter().position(|e| same(e, r)).ok_or(-ENOENT)?;
     let e = list.remove(i);
     if counts(e.listnr) {
-        N_RULES.fetch_sub(1, Relaxed);
+        crate::security::AUDIT_N_RULES.fetch_sub(1, Relaxed);
     }
     Ok(())
 }

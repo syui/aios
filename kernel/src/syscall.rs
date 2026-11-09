@@ -441,10 +441,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     let _p = if crate::prof::ON.load(core::sync::atomic::Ordering::Relaxed) { sys_span(nr).and_then(crate::prof::span) } else { None };
     // 監査 (audit_syscall_entry: 入れもののあるスレッドだけ)
     if p.audit.is_some() {
-        crate::audit::syscall_entry(nr, &a);
+        crate::security::audit_syscall_entry(nr, &a);
     }
     // 監査が名前を集めているなら、パスの名前と親やあるものを前に引く (sysfile::audit_pre)
-    let plan = if p.audit.is_some() && crate::audit::collecting() { sysfile::audit_pre(nr, &a) } else { None };
+    let plan = if p.audit.is_some() && !crate::security::audit_dummy_context() { sysfile::audit_pre(nr, &a) } else { None };
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         FLOCK => sysfile::flock(a[0], a[1]),
@@ -720,7 +720,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         if let Some(plan) = plan {
             sysfile::audit_post(plan, &r);
         }
-        crate::audit::syscall_exit(r.unwrap_or_else(|e| e));
+        crate::security::audit_syscall_exit(r.unwrap_or_else(|e| e));
     }
     strace(nr, &a, r);
     // しくじったわけ (whylog.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
@@ -916,7 +916,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
     // LSM のラベルのついたもの (AppArmor のプロファイル) も (決まりを見るのはふつうの道だけ)
     // 監査のシステムコールのルールがあれば、入れもののあるスレッドも (入口と出口でルールを見る)
-    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.label.is_some() || (p.audit.is_some() && crate::audit::slow()) {
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.label.is_some() || (p.audit.is_some() && crate::security::AUDIT_N_RULES.load(core::sync::atomic::Ordering::Relaxed) != 0) {
         return false;
     }
     let r = match nr {

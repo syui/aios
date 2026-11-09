@@ -216,7 +216,7 @@ pub fn log_task(typ: u16, body: &str) {
         return;
     }
     let locked = crate::smp::holding() || crate::smp::online() <= 1;
-    let stamp = match proc::try_current().and_then(|p| p.audit.as_mut()).filter(|_| locked) {
+    let stamp = match proc::try_current().and_then(|p| ctx_mut(&mut p.audit)).filter(|_| locked) {
         Some(c) => {
             c.dummy = false;
             if c.in_syscall {
@@ -499,15 +499,8 @@ pub struct Ctx {
     openat2: Option<(u64, u64, u64)>,
 }
 
-/// 名前の種類 (AUDIT_TYPE_*)
-#[derive(Clone, Copy, PartialEq)]
-pub enum NameType {
-    Unknown,
-    Normal,
-    Parent,
-    Delete,
-    Create,
-}
+/// 名前の種類 (AUDIT_TYPE_*: security.rs)
+pub use crate::security::NameType;
 
 /// 集めた名前 1 つ (struct audit_names)
 struct Name {
@@ -556,13 +549,22 @@ fn dname_is(dname: &str, path: &str, parentlen: Option<usize>) -> bool {
     rest == dname
 }
 
+/// スレッドの入れもの (Proc の audit の中。core は中を知らない)
+fn ctx(a: &Option<alloc::boxed::Box<dyn core::any::Any>>) -> Option<&Ctx> {
+    a.as_deref().map(|b| b.downcast_ref::<Ctx>().expect("audit: ctx"))
+}
+
+fn ctx_mut(a: &mut Option<alloc::boxed::Box<dyn core::any::Any>>) -> Option<&mut Ctx> {
+    a.as_deref_mut().map(|b| b.downcast_mut::<Ctx>().expect("audit: ctx"))
+}
+
 /// いま名前を集めているか (システムコールの中で、dummy でない: Linux の getname は !audit_dummy_context のときだけ)
 pub fn collecting() -> bool {
-    proc::current().audit.as_ref().is_some_and(|c| c.in_syscall && !c.dummy)
+    ctx(&proc::current().audit).is_some_and(|c| c.in_syscall && !c.dummy)
 }
 
 fn names_ctx() -> Option<&'static mut Ctx> {
-    proc::current().audit.as_deref_mut().filter(|c| c.in_syscall && !c.dummy)
+    ctx_mut(&mut proc::current().audit).filter(|c| c.in_syscall && !c.dummy)
 }
 
 /// audit_alloc_name: 名前を足す (はじめてならいまのディレクトリを覚える)
@@ -673,7 +675,7 @@ pub fn openat2(flags: u64, mode: u64, resolve: u64) {
 /// なれば記録を (success と exit はない)
 pub fn task_exit() {
     let p = proc::current();
-    let Some(c) = p.audit.as_mut() else { return };
+    let Some(c) = ctx_mut(&mut p.audit) else { return };
     if c.dummy || !c.in_syscall {
         return;
     }
@@ -690,14 +692,14 @@ pub fn task_exit() {
             apply(p, hit);
         }
     }
-    if p.audit.as_ref().is_some_and(|c| c.record) {
+    if ctx(&p.audit).is_some_and(|c| c.record) {
         log_exit(None);
     }
 }
 
 /// exec したスレッド: PROCTITLE の覚えを捨てる (新しいプログラムの引数で作りなおす。Linux も exec のあとは新しいもの)
 pub fn exec_done(p: &mut proc::Proc) {
-    if let Some(c) = p.audit.as_mut() {
+    if let Some(c) = ctx_mut(&mut p.audit) {
         c.proctitle = None;
     }
 }
@@ -711,7 +713,7 @@ pub fn execve() {
 
 /// fork で作るスレッドの入れもの (audit_alloc: audit を一度も on にしていなければ作らない。TASK の組で NEVER に合えば
 /// 作らず、ALWAYS に合えばいつも出すものに)
-pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<Ctx>> {
+pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<dyn core::any::Any>> {
     if !EVER.load(Relaxed) {
         return None;
     }
@@ -736,13 +738,7 @@ pub fn alloc(child: &proc::Proc) -> Option<alloc::boxed::Box<Ctx>> {
         pwd: None,
         execve: false,
         openat2: None,
-    }))
-}
-
-/// 大きなロックなしの道 (syscall::fast) を通らないか: システムコールのルールがあるとき、入れもののあるスレッドは
-/// みな入口と出口を通す
-pub fn slow() -> bool {
-    crate::auditfilter::N_RULES.load(Relaxed) != 0
+    }) as alloc::boxed::Box<dyn core::any::Any>)
 }
 
 /// システムコールの入口 (__audit_syscall_entry): audit が on なら、番号と引数と時刻を覚える
@@ -753,9 +749,9 @@ pub fn syscall_entry(nr: u64, a: &[u64; 6]) {
     let auditd = st().pid;
     let p = proc::current();
     let tgid = p.tgid;
-    let Some(c) = p.audit.as_mut() else { return };
+    let Some(c) = ctx_mut(&mut p.audit) else { return };
     // システムコールのルールがなければ、記録が出るまで dummy (audit_n_rules)。あれば auditd のものは見ない
-    c.dummy = crate::auditfilter::N_RULES.load(Relaxed) == 0;
+    c.dummy = crate::security::AUDIT_N_RULES.load(Relaxed) == 0;
     if !c.dummy && !c.always {
         c.prio = 0;
         if auditd != 0 && auditd == tgid {
@@ -773,7 +769,7 @@ pub fn syscall_entry(nr: u64, a: &[u64; 6]) {
 pub fn syscall_exit(ret: i64) {
     let auditd = st().pid;
     let p = proc::current();
-    let Some(c) = p.audit.as_mut() else { return };
+    let Some(c) = ctx_mut(&mut p.audit) else { return };
     let check = c.in_syscall && !c.dummy;
     c.in_syscall = false;
     if check {
@@ -791,12 +787,12 @@ pub fn syscall_exit(ret: i64) {
                 apply(p, hit);
             }
         }
-        if p.audit.as_ref().is_some_and(|c| c.record) {
+        if ctx(&p.audit).is_some_and(|c| c.record) {
             log_exit(Some(ret));
         }
     }
     // audit_reset_context (dummy なら番号などはそのまま)
-    let Some(c) = p.audit.as_mut() else { return };
+    let Some(c) = ctx_mut(&mut p.audit) else { return };
     if !c.dummy {
         (c.record, c.serial, c.ctime, c.major, c.argv) = (c.always, 0, 0, 0, [0; 4]);
         c.names.clear();
@@ -810,7 +806,7 @@ pub fn syscall_exit(ret: i64) {
 
 /// 合ったルールの答えを入れものに (current_state、prio、key)
 fn apply(p: &mut proc::Proc, hit: crate::auditfilter::Hit) {
-    let c = p.audit.as_mut().unwrap();
+    let c = ctx_mut(&mut p.audit).unwrap();
     c.record = hit.record;
     c.prio = hit.prio;
     if hit.key.is_some() {
@@ -836,7 +832,7 @@ fn log_exit(ret: Option<i64>) {
     // 返した値 (終わるとき (exit_group) にはない)
     let result = ret.map_or(String::new(), |r| format!(" success={} exit={}", if (-4095..0).contains(&r) { "no" } else { "yes" }, fixup(r)));
     let (major, argv, ns, serial, key, items) = {
-        let c = proc::current().audit.as_mut().unwrap();
+        let c = ctx_mut(&mut proc::current().audit).unwrap();
         if c.serial == 0 {
             c.serial = SERIAL.fetch_add(1, Relaxed);
         }
@@ -856,19 +852,19 @@ fn log_exit(ret: Option<i64>) {
         key.map_or("(null)".into(), |k| untrusted(k.as_bytes()))
     );
     put(AUDIT_SYSCALL, ns, serial, &body);
-    let c = proc::current().audit.as_ref().unwrap();
+    let c = ctx(&proc::current().audit).unwrap();
     // EXECVE と OPENAT2 (show_special)
     if c.execve && !excluded(AUDIT_EXECVE) {
         put(AUDIT_EXECVE, ns, serial, &execve_args());
     }
-    let c = proc::current().audit.as_ref().unwrap();
+    let c = ctx(&proc::current().audit).unwrap();
     if let Some((f, m, r)) = c.openat2
         && !excluded(AUDIT_OPENAT2)
     {
         put(AUDIT_OPENAT2, ns, serial, &format!("oflag=0{:o} mode=0{:o} resolve=0x{:x}", f, m, r));
     }
     // CWD と PATH (名前ごと)
-    let c = proc::current().audit.as_ref().unwrap();
+    let c = ctx(&proc::current().audit).unwrap();
     // いまのディレクトリは、いまの根から見たパスで (d_path: chroot したあとなら、その中のパス)
     let pwd = c.pwd.as_deref().map(seen_from_root);
     if let Some(pwd) = pwd.as_deref()
@@ -876,7 +872,7 @@ fn log_exit(ret: Option<i64>) {
     {
         put(AUDIT_CWD, ns, serial, &format!("cwd={}", untrusted(pwd.as_bytes())));
     }
-    let c = proc::current().audit.as_ref().unwrap();
+    let c = ctx(&proc::current().audit).unwrap();
     let lines: Vec<String> = c.names.iter().enumerate().map(|(i, n)| path_line(i, n, pwd.as_deref())).collect();
     for l in lines {
         if !excluded(AUDIT_PATH) {
@@ -960,7 +956,7 @@ fn execve_args() -> String {
 fn proctitle() -> String {
     const MAX: usize = 128;
     let p = proc::current();
-    if p.audit.as_ref().is_some_and(|c| c.proctitle.is_none()) {
+    if ctx(&p.audit).is_some_and(|c| c.proctitle.is_none()) {
         let b = p.mm.as_ref().and_then(|_| {
             let (a, e, _) = p.mm().args;
             if a == 0 || e <= a {
@@ -981,11 +977,11 @@ fn proctitle() -> String {
                 b.clear();
             }
             if !b.is_empty() {
-                p.audit.as_mut().unwrap().proctitle = Some(b);
+                ctx_mut(&mut p.audit).unwrap().proctitle = Some(b);
             }
         }
     }
-    match p.audit.as_ref().and_then(|c| c.proctitle.as_ref()) {
+    match ctx(&p.audit).and_then(|c| c.proctitle.as_ref()) {
         Some(b) => untrusted(b),
         None => untrusted(b"(null)"),
     }
@@ -1428,4 +1424,60 @@ fn feature_change(name: &str, old: u32, new: u32, old_lock: u32, new_lock: u32, 
         res as u32
     );
     log_task(AUDIT_FEATURE_CHANGE, &body);
+}
+
+// ---- audit の入り口 (security.rs: Linux の include/linux/audit.h。LSM ではない) ----
+
+/// audit (main.rs が register_audit でつなぐ)
+pub struct Ops;
+pub static OPS: Ops = Ops;
+
+impl crate::security::Audit for Ops {
+    fn alloc(&self, child: &proc::Proc) -> Option<alloc::boxed::Box<dyn core::any::Any>> {
+        alloc(child)
+    }
+
+    fn free(&self) {
+        task_exit();
+    }
+
+    fn proctitle_free(&self, p: &mut proc::Proc) {
+        exec_done(p);
+    }
+
+    fn syscall_entry(&self, nr: u64, a: &[u64; 6]) {
+        syscall_entry(nr, a);
+    }
+
+    fn collecting(&self) -> bool {
+        collecting()
+    }
+
+    fn syscall_exit(&self, ret: i64) {
+        syscall_exit(ret);
+    }
+
+    fn signal_info(&self, tgid: u32, sig: i32) {
+        signal_info(tgid, sig);
+    }
+
+    fn getname(&self, path: &str) -> Option<usize> {
+        getname(path)
+    }
+
+    fn inode(&self, an: Option<usize>, name: Option<&str>, ino: &crate::vfs::InodeRef, parent: bool, path: &str) {
+        inode(an, name, ino, parent, path);
+    }
+
+    fn inode_child(&self, dir: &crate::vfs::InodeRef, dname: &str, ino: Option<&crate::vfs::InodeRef>, typ: NameType, dir_path: &str) {
+        child(dir, dname, ino, typ, dir_path);
+    }
+
+    fn openat2_how(&self, flags: u64, mode: u64, resolve: u64) {
+        openat2(flags, mode, resolve);
+    }
+
+    fn bprm(&self) {
+        execve();
+    }
 }
