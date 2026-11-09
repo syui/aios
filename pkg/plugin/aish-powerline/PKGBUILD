@@ -1,4 +1,4 @@
-# aish-powerline: aish の powerline のプロンプト (aish のプラグイン。[shell] リポジトリ)
+# aish-powerline: aish の powerline のプロンプト (aish のプラグイン。[plugin] リポジトリ)
 #   ap -S aish-powerline してから、~/.aishrc (見本は /usr/share/aish/aishrc.example) に
 #   plugin aish-powerline
 #   アイコンと区切りは aifont (Nerd Font と同じ位置) の文字。端末のフォントが要る

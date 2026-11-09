@@ -1,11 +1,11 @@
 {
   "branch": "main",
   "arch": "aarch64",
-  "updated": "2026-11-08",
+  "updated": "2026-11-09",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
-    "shell":   { "lang": "Rust",  "prefix": "/usr/lib/aish/plugins" },
+    "plugin":  { "lang": "Rust",  "prefix": "/usr/lib/aish/plugins" },
     "desktop": { "lang": "Rust",  "prefix": "/usr" },
 
     "npm":     { "lang": "JS/TS",  "prefix": "/usr/local", "via": "npm install -g / pnpm add -g" },
@@ -43,7 +43,7 @@
     "aios": {
       "rust":    { "aiboot": "0.0.1", "aikernel": "0.0.1", "base": "0.0.1", "aigpt": "0.0.1", "ailog": "0.0.1", "aimg": "0.0.1" },
       "c":       { "base-devel": "0.0.1", "aimodel": "0.0.1" },
-      "shell":   { "aish-powerline": "0.0.1" },
+      "plugin":  { "aish-powerline": "0.0.1" },
       "desktop": { "aifont": "0.0.1", "aiterm": "0.0.1", "aiwm": "0.0.1" }
     },
 

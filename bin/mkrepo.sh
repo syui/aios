@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
-[ $# -gt 0 ] || set -- "$root/repo/aarch64/rust" "$root/repo/aarch64/c" "$root/repo/aarch64/shell" "$root/repo/aarch64/desktop"
+[ $# -gt 0 ] || set -- "$root/repo/aarch64/rust" "$root/repo/aarch64/c" "$root/repo/aarch64/plugin" "$root/repo/aarch64/desktop"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
