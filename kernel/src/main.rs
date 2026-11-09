@@ -91,6 +91,7 @@ mod virtio_rng;
 mod vdso;
 mod vm;
 mod why;
+mod whylog;
 
 use core::panic::PanicInfo;
 

@@ -10,7 +10,8 @@
 # part:what (part は kernel.json の名前。/proc/ai/prof が part ごとに足す)
 # aios がえらんだちがい (Linux とちがうふるまいを、えらんでとったもの): test/sysdiff.c の chosen の名前は、doc/aios.md の
 # 表と、カーネルのソースの「aios がえらんだちがい (名前)」にもあること (Linux に合わせようとして消さないように)
-# 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく)
+# 終わりの番号はくいちがいの数。おしまいに数と、core が extra を使っているところ (いまはまだ多い。減らしていく。
+# CORE_USES_EXTRA_MAX より増えれば落ちる)
 import json
 import os
 import re
@@ -166,6 +167,13 @@ for s, (n, k) in sorted(files.items()):
             uses[n] = used
 print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %d" % (count["core"], lines["core"], count["extra"], lines["extra"], len(quirks)))
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
+# core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
+# 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
+CORE_USES_EXTRA_MAX = 21
+if len(uses) > CORE_USES_EXTRA_MAX:
+    err("core uses extra in %d files, more than %d: keep core off extra (%s)" % (len(uses), CORE_USES_EXTRA_MAX, " ".join(uses)))
+elif len(uses) < CORE_USES_EXTRA_MAX:
+    err("core uses extra in %d files, fewer than %d: lower CORE_USES_EXTRA_MAX in test/kernel-json.py" % (len(uses), CORE_USES_EXTRA_MAX))
 print("aios.off= can turn off %d: %s" % (len(switch), " ".join(switch)))
 print("prof spans in %d parts: %s; bench for %s" % (len({s.split(':')[0] for s in spans}), " ".join(sorted({s.split(':')[0] for s in spans})), " ".join(e["name"] for e in entries if "bench" in e)))
 # static mut (だれが守るのかを書いていない。BKL を外した道が触っても、Rust のコンパイラは何も言わない) は増やさない:

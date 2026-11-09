@@ -9,7 +9,7 @@
 //   gates を通れれば、ロックを取らずにそれを struct stat か struct statx にして返す (C の stat は newfstatat、Rust の
 //   std::fs::metadata は statx)。ちがえば (と、表にないもの、書いている途中のもの) ふつうの道へ。
 //   「ない」(ENOENT) も覚える (シェルの PATH さがし、ライブラリや locale のファイルさがし: いちばん多い stat)。答えるときは
-//   ふつうの道と同じわけ (missing_cached) を /proc/ai/why に残す (why::fast_missing。取るのは輪のロックだけ)。
+//   ふつうの道と同じわけ (missing_cached) を /proc/ai/why に残す (whylog::fast_missing。取るのは輪のロックだけ)。
 //   大きなロックなしの O_CREAT (fastdir.rs) が作ったファイルは learn_new が、親の答えに 1 つ足して書く。
 //   答えの stat が古い (inode を書いて版が進んだ) だけなら、名前と inode の番号は正しいので、ext4 が親のディレクトリの
 //   ロックの中で名前を確かめて、inode の覚えからいまの stat を読む (now_stat。Linux の stat も、dentry の先の inode から
@@ -486,9 +486,9 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
 pub fn missing(p: &Proc, nr: u64, key: &[u8], looked: bool) -> i64 {
     let key = core::str::from_utf8(key).unwrap_or("?");
     match key.rfind('/') {
-        _ if !looked => crate::why::fast_missing(p, nr, key),
-        Some(c) => crate::why::fast_missing_at(p, nr, &key[..c], &key[c + 1..]),
-        None => crate::why::fast_missing_at(p, nr, "", key),
+        _ if !looked => crate::whylog::fast_missing(p, nr, key),
+        Some(c) => crate::whylog::fast_missing_at(p, nr, &key[..c], &key[c + 1..]),
+        None => crate::whylog::fast_missing_at(p, nr, "", key),
     }
     -ENOENT
 }

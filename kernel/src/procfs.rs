@@ -120,7 +120,7 @@ enum Node {
     AiFail,
     AiFdDir,
     AiFd(u32),
-    /// /proc/ai/why: しくじったシステムコールのわけ (why.rs)
+    /// /proc/ai/why: しくじったシステムコールのわけ (whylog.rs)
     AiWhy,
     /// /proc/ai/fw (ファイアウォールの様子: nftables::ai_json)
     AiFw,
@@ -359,7 +359,7 @@ impl ProcInode {
             Node::AiFail => crate::fail::json(),
             Node::AiFw => crate::nftables::ai_json(),
             Node::AiFd(p) => crate::aiproc::fds_json(p)?,
-            Node::AiWhy => crate::why::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
+            Node::AiWhy => crate::whylog::text(if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }),
             Node::Strace => crate::syscall::strace_get(),
             Node::Bkl => crate::smp::stats(),
             Node::Kmsg => crate::kmsg::text(),
@@ -835,7 +835,7 @@ impl Inode for ProcInode {
         }
         // /proc/ai/why も大きい: 同じように
         if self.node == Node::AiWhy {
-            return Ok(crate::why::read_at(off, buf, if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }));
+            return Ok(crate::whylog::read_at(off, buf, if crate::aiproc::allowed() { None } else { Some(crate::cred::current().uid) }));
         }
         let s = self.content()?;
         let b = s.as_bytes();

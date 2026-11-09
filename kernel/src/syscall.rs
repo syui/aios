@@ -384,7 +384,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 crate::trace::sys_exit(nr, e);
                 strace(nr, &a, Err(e));
                 crate::why::note(crate::why::Code::Seccomp, e, 0);
-                crate::why::done(nr, e, &a);
+                crate::whylog::done(nr, e, &a);
                 return None;
             }
             crate::seccomp::Verdict::Trap(errno) => {
@@ -423,7 +423,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         crate::trace::sys_exit(nr, -ENOSYS);
         strace(nr, &a, Err(-ENOSYS));
         crate::why::note(crate::why::Code::PartOff, -ENOSYS, 0);
-        crate::why::done(nr, -ENOSYS, &a);
+        crate::whylog::done(nr, -ENOSYS, &a);
         return None;
     }
     // わざとしくじらせる (/proc/ai/ctl の fail。fail.rs): 決まりに合えば、動かさずにその errno
@@ -432,7 +432,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         crate::trace::sys_exit(nr, -e);
         strace(nr, &a, Err(-e));
         crate::why::note(crate::why::Code::Injected, -e, 0);
-        crate::why::done(nr, -e, &a);
+        crate::whylog::done(nr, -e, &a);
         return None;
     }
     // 調べもの (prof on): ファイルのシステムコールは sysfile:NAME の区間に (中の vfs、extfs などの時間は引かれる)
@@ -722,11 +722,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         crate::audit::syscall_exit(r.unwrap_or_else(|e| e));
     }
     strace(nr, &a, r);
-    // しくじったわけ (why.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
+    // しくじったわけ (whylog.rs)。rseq は glibc が起動のたびに呼んで ENOSYS を見るだけなので入れない
     if let Err(e) = r
         && nr != RSEQ
     {
-        crate::why::done(nr, e, &a);
+        crate::whylog::done(nr, e, &a);
     }
     // ソケットを閉じたなら、送られている途中の輪を片づける (unix.rs の gc)
     crate::unix::gc_check(false);
@@ -856,7 +856,7 @@ fn strace_named(nr: u64, a: &[u64], r: R) {
     crate::kmsg::push(&line);
 }
 
-/// システムコールのパスの引数の番号 (why.rs: わけにパスがなければ、プログラムがたのんだパスをつける)
+/// システムコールのパスの引数の番号 (whylog.rs: わけにパスがなければ、プログラムがたのんだパスをつける)
 pub fn path_arg(nr: u64) -> Option<usize> {
     use nr::*;
     Some(match nr {
