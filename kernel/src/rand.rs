@@ -36,6 +36,7 @@ type Source = fn(&mut [u8]) -> usize;
 static SOURCE: SpinLock<Option<Source>> = SpinLock::new(None);
 const RESEED_NS: u64 = 60_000_000_000;
 
+// [lockless]
 fn counter() -> u64 {
     let c: u64;
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack, preserves_flags)) };
@@ -46,6 +47,7 @@ fn counter() -> u64 {
 static RNDR: AtomicU8 = AtomicU8::new(0);
 
 /// CPU の乱数 (FEAT_RNG の RNDRRS: 読むたびに種をまきなおしたもの)。ないか、しくじりつづけたら None
+// [lockless]
 fn cpu_random() -> Option<u64> {
     if RNDR.load(Ordering::Relaxed) == 0 {
         let isar0: u64;
@@ -67,6 +69,7 @@ fn cpu_random() -> Option<u64> {
 }
 
 /// 数えるもとを池に入れる
+// [lockless]
 fn credit(s: &mut State, data: &[u8]) {
     s.pool.update(data);
     s.credit = s.credit.saturating_add(data.len() as u32 * 8);
@@ -83,6 +86,7 @@ fn note(s: &mut State, from: &'static str, len: usize) {
 }
 
 /// 池から鍵を作り、池はそこから作った次の鍵で始めなおす (Linux の extract_entropy と crng_reseed)
+// [lockless]
 fn reseed(s: &mut State) {
     // RNDR があればそれを、なければ時計のカウンタを 32 バイトと、0 / 1 (次の池の鍵か、ChaCha20 の鍵か)
     let mut block = [0u8; 40];
@@ -119,6 +123,7 @@ static BATCH: crate::cell::PerCpu<Batch> = crate::cell::PerCpu::new([const { Bat
 /// fill() は呼ぶたびに鍵を進めて ChaCha20 のブロックを作る (TCG では重く、時計も読む) ので、64 バイトずつ作っておき、
 /// 渡したところは消す。鍵を作りなおしたら捨てる。カーネルは割り込みを止めて動き、この中で眠らないので、CPU ごとの
 /// ものを取りあうことはない
+// [lockless]
 pub fn u32() -> u32 {
     let b = BATCH.get();
     let g = GEN.load(Ordering::Relaxed);
@@ -160,16 +165,19 @@ pub fn init() {
     boot(&mut STATE.lock());
 }
 
+// [lockless]
 fn boot(s: &mut State) {
     if s.seeded {
         return;
     }
     s.seeded = true;
     s.pool.update(&counter().to_le_bytes());
+    // lockless-ok: seeded になるまでの 1 度 (起動のとき: まだほかの CPU もプロセスもない)
     crate::dtb::take_seed("rng-seed", |b| {
         credit(s, b);
         note(s, "rng-seed", b.len());
     });
+    // lockless-ok: 上と同じ (起動のときの 1 度)
     crate::dtb::take_seed("kaslr-seed", |b| s.pool.update(b));
     let mut b = [0u8; 32];
     if b.chunks_exact_mut(8).all(|c| cpu_random().map(|v| c.copy_from_slice(&v.to_le_bytes())).is_some()) {
@@ -232,6 +240,7 @@ pub struct Stream {
     pos: usize,
 }
 
+// [lockless]
 pub fn stream() -> Stream {
     refresh();
     let mut buf = [0u8; 64];
@@ -249,6 +258,7 @@ pub fn stream() -> Stream {
 }
 
 impl Stream {
+    // [lockless]
     pub fn fill(&mut self, dst: &mut [u8]) {
         let mut off = 0;
         while off < dst.len() {
@@ -275,6 +285,7 @@ impl Drop for Stream {
 }
 
 /// dst を乱数で満たす
+// [lockless]
 pub fn fill(dst: &mut [u8]) {
     stream().fill(dst);
 }

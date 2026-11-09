@@ -281,6 +281,7 @@ pub struct Maps {
     pub setgroups_deny: bool,
 }
 
+// [lockless]
 fn inside(map: &Option<Vec<(u32, u32, u32)>>, out: u32) -> u32 {
     map.iter().flatten().find(|&&(_, o, n)| out >= o && out - o < n).map_or(OVERFLOW, |&(i, o, _)| i + (out - o))
 }
@@ -290,6 +291,7 @@ fn outside(map: &Option<Vec<(u32, u32, u32)>>, ins: u32) -> Option<u32> {
 }
 
 /// いまのプロセスから見た uid (外の番号 u を中の番号に)
+// [lockless]
 pub fn show_uid(u: u32) -> u32 {
     match &crate::proc::current_cred_ref().ns.user {
         Some(n) => inside(&n.maps.borrow().uid, u),
@@ -305,6 +307,7 @@ pub fn show_uid_raw(u: u32) -> u32 {
     }
 }
 
+// [lockless]
 pub fn show_gid(g: u32) -> u32 {
     match &crate::proc::current_cred_ref().ns.user {
         Some(n) => inside(&n.maps.borrow().gid, g),

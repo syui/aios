@@ -335,6 +335,7 @@ impl Kind {
     }
 
     /// Kind::Ops の中身が T なら、それを借りて (Rc を写さない: 大きなロックなしの道からも)
+    // [lockless]
     pub fn ops_ref<T: FileOps>(&self) -> Option<&T> {
         match self {
             Kind::Ops(o) => (&**o as &dyn core::any::Any).downcast_ref::<T>(),
@@ -560,6 +561,7 @@ pub static OPEN_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 /// [6] しまえない (分けている、ロック、棚がいっぱい)。[7] 棚になく、ext4 の名前と inode から新しく開いた。/proc/bkl に出す
 pub static FAST_OPEN: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
+// [lockless]
 fn note(i: usize) {
     FAST_OPEN[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
@@ -679,6 +681,7 @@ pub fn fast_install(t: &mut proc::Files, fd: usize, file: FileRef, cloexec: bool
 /// 大きなロックなしの close (syscall::fast): 閉じる fd が、自分だけが持っている棚にしまってよいファイル (OpenFile::reuse) で、
 /// ロック (flock / OFD、この表の POSIX のロック) も IN_OPEN / IN_CLOSE の見張りもなければ、表から外して棚に。
 /// OpenFile は落とさないので、落とすときの後片づけ (ロックを外す、IN_CLOSE) はいらない。ほかは None (ふつうの道へ)
+// [lockless]
 pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     let files = me.files.as_ref()?;
@@ -943,6 +946,7 @@ impl Stat {
     }
 
     /// fs はファイルシステムの番号 (InodeRef::id の .0。st_dev になる)
+    // [lockless]
     pub fn of_meta(m: &vfs::Meta, fs: usize) -> Stat {
         Stat {
             dev: vfs::st_dev(fs),
@@ -970,6 +974,7 @@ impl Stat {
         ma << 20 | mi
     }
 
+    // [lockless]
     pub fn to_bytes(&self) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..8].copy_from_slice(&self.dev.to_le_bytes());
@@ -996,6 +1001,7 @@ impl Stat {
     /// 頼まれていなければ、その 2 つは出さない (Linux の fill_mg_cmtime)。mnt はそのものがあるマウント (番号、その根か:
     /// vfs::mount_of)。stx_mnt_id はいつも (STATX_MNT_ID_UNIQUE を頼まれればその番号で)、根なら STATX_ATTR_MOUNT_ROOT
     /// (Linux の vfs_statx_path)
+    // [lockless]
     pub fn to_statx(&self, mask: u32, mg: bool, mnt: (u64, bool)) -> [u8; 256] {
         const MTIME: u32 = 0x40;
         const CTIME: u32 = 0x80;
@@ -1040,11 +1046,13 @@ impl Stat {
 
 impl OpenFile {
     /// 読める口か (O_RDONLY か O_RDWR。Linux の FMODE_READ: O_PATH と、O_ACCMODE (3) で開いたもの (ioctl だけ) は読めない)
+    // [lockless]
     pub fn readable(&self) -> bool {
         self.flags & O_PATH == 0 && matches!(self.flags & O_ACCMODE, O_RDONLY | O_RDWR)
     }
 
     /// 書ける口か (O_WRONLY か O_RDWR)
+    // [lockless]
     pub fn writable(&self) -> bool {
         self.flags & O_PATH == 0 && matches!(self.flags & O_ACCMODE, O_WRONLY | O_RDWR)
     }
@@ -1648,6 +1656,7 @@ impl PageQueue {
     }
 
     /// 新しい箱のページ (書いたところしか読まないので、0 にしなくてよい)
+    // [lockless]
     pub fn page(&mut self) -> Option<*mut u8> {
         self.spare.take().or_else(crate::kalloc::alloc_dirty)
     }
@@ -1663,6 +1672,7 @@ impl PageQueue {
 
     /// 箱が slots こまでのパイプに n バイトを write したら、いま入るバイト数。merge は前の箱に足してよいか
     /// (write の初めだけ)
+    // [lockless]
     fn write_room(&self, n: usize, slots: usize, merge: bool) -> usize {
         let free = slots.saturating_sub(self.pages.len());
         let chars = n % PGSIZE;
@@ -1672,6 +1682,7 @@ impl PageQueue {
 
     /// write の 1 回分: 入るだけ入れて (write_room と同じだけ)、入れたバイト数。ページがとれなければ、何も入れて
     /// いなければ ENOMEM
+    // [lockless]
     fn push_write(&mut self, src: &[u8], slots: usize, merge: bool) -> Result<usize, i64> {
         let mut done = 0;
         let chars = src.len() % PGSIZE;
@@ -1779,6 +1790,7 @@ pub struct Pipe {
 /// 大きなロックなしの read (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部あるとき。
 /// fd の表をほかのスレッドと、開いたファイル (オフセット) をほかの fd やプロセスと分けていない、
 /// IN_ACCESS を待つ inotify の見張りがない、ときだけ。ほかは None でふつうの道へ
+// [lockless]
 pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
     let r = fast_read_file_inner(me, fd, va, len);
     FAST_READ[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1789,6 +1801,7 @@ pub fn fast_read_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option
 /// 大きさをページキャッシュが知っているときの SEEK_END。fd の表と開いたファイルをだれとも分けていないときだけ
 /// (fast_read_file と同じ。Linux も分けていなければ f_pos_lock を取らない)。位置だけを変えるので、ディレクトリでも同じ
 /// (消した ext4 のディレクトリは s_maxbytes までなので、4 TiB より先はふつうの道で)。ほかは None でふつうの道へ
+// [lockless]
 pub fn fast_lseek(me: &proc::Proc, fd: u64, off: i64, whence: u64) -> Option<i64> {
     let files = me.files.as_ref()?;
     if !files.private() {
@@ -1815,6 +1828,7 @@ pub fn fast_lseek(me: &proc::Proc, fd: u64, off: i64, whence: u64) -> Option<i64
 }
 
 /// 開いていない fd の close (EBADF) を大きなロックなしで: fd の表をだれとも分けていないときだけ見る
+// [lockless]
 pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {
     me.files.as_ref().is_some_and(|files| files.private() && files.get().get(fd).is_none())
 }
@@ -1832,6 +1846,7 @@ pub fn mmap_dev(kind: &Kind, fr: &FileRef, off: usize, len: usize, prot: u64) ->
 
 /// 大きなロックなしのソケット (AF_UNIX) の read / write (syscall::fast。unix.rs の fast_rw)
 #[inline]
+// [lockless]
 pub fn fast_rw_sock(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) -> Option<i64> {
     FAST_RW_SOCK.val()?(me, fd, va, len, write)
 }
@@ -1839,6 +1854,7 @@ pub fn fast_rw_sock(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool
 /// 大きなロックなしの /dev/null・/dev/zero・/dev/urandom の read / write (syscall::fast)。書くものは捨てるだけ
 /// (ユーザーのメモリも読まない。Linux と同じ)、/dev/null は読むと 0、/dev/zero は 0 で埋める (/dev/urandom の
 /// 読みはふつうの道)。開いたファイルの種類と読み書きの口はあとで変わらないので、借りずに見る
+// [lockless]
 pub fn fast_dev(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) -> Option<i64> {
     let files = me.files.as_ref()?;
     let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
@@ -1874,6 +1890,7 @@ pub fn fast_dev(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) ->
 }
 
 /// fast_read_file の中身。Err はふつうの道へ行ったわけ (FAST_READ の番号)
+// [lockless]
 fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Result<i64, usize> {
     const MAX: usize = 256 * 1024;
     if len == 0 || len > MAX {
@@ -1906,6 +1923,7 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
 
 /// 大きなロックなしの pread64 (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部
 /// あるとき。オフセットを動かさないので、fd の表をほかのスレッドと分けていても (門を通って) 読める
+// [lockless]
 pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
     const MAX: usize = 256 * 1024;
     if len == 0 || len > MAX || off < 0 || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
@@ -1930,6 +1948,7 @@ pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> 
 /// 大きなロックなしの pwrite64 (syscall::fast): ext4 のファイルの、ページキャッシュにある (ブロックのキャッシュのページ
 /// そのもの) ところを、大きさを変えずに、inode の変わらない秒のうちに書きかえるだけのもの (vm::write_fast)。
 /// O_DSYNC / O_SYNC / O_DIRECT で開いたもの、ほかはふつうの道へ (Linux と同じ順でエラーにする)
+// [lockless]
 pub fn fast_pwrite(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
     const MAX: usize = 256 * 1024;
     const O_DSYNC: u32 = 0o10000;
@@ -2093,21 +2112,25 @@ impl Pipe {
     }
 
     /// 箱の数 (Linux の max_usage: パイプの大きさ / 4KiB)
+    // [lockless]
     pub fn slots(&self) -> usize {
         (self.cap / PGSIZE).max(1)
     }
 
     /// 使っている箱の数
+    // [lockless]
     pub fn used_slots(&self) -> usize {
         self.data.pages.len()
     }
 
     /// 箱がみなうまっている (Linux の pipe_full。write は端数を前の箱に足せるときのほか、入らない)
+    // [lockless]
     pub fn full(&self) -> bool {
         self.used_slots() >= self.slots()
     }
 
     /// n バイトの write (の初め) が、いま入るバイト数
+    // [lockless]
     pub fn write_room(&self, n: usize) -> usize {
         self.data.write_room(n, self.slots(), true)
     }
@@ -2162,6 +2185,7 @@ impl Pipe {
     /// ふつうの道へ: fd の表をほかのスレッドが変えている途中、読むのに中身がない、書くのに全部は入らない・
     /// 読み手がいない、ユーザーのメモリが写っていない (ページフォルトになる)。
     /// 眠っている人や poll / epoll で待っている人がいれば、起こすのは大きなロックを持つ CPU に頼む (smp::defer_wake)
+    // [lockless]
     pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
         let r = Pipe::fast_rw_inner(me, fd, buf, len, write);
         FAST_RW[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2169,6 +2193,7 @@ impl Pipe {
     }
 
     /// うまくいけば Ok、ふつうの道へ行くなら Err(わけ: FAST_RW の番号)
+    // [lockless]
     fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Result<i64, usize> {
         if len == 0 || len > PIPE_SIZE {
             return Err(2);

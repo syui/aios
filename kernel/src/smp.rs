@@ -77,12 +77,14 @@ pub fn kick(cpu: usize) {
 }
 
 /// いまの CPU の番号 (0 から)
+// [lockless]
 pub fn id() -> usize {
     let v: usize;
     unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) v) };
     v
 }
 
+// [lockless]
 pub fn online() -> usize {
     ONLINE.load(Ordering::Acquire)
 }
@@ -226,6 +228,7 @@ static FS_SHARED: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU
 /// 待った回数と時間 (ns。SAMPLE 回に 1 回測った見つもり) (/proc/bkl)
 pub static FS_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+// [lockless]
 fn fs_me() -> usize {
     crate::proc::cur_index().unwrap_or(crate::proc::NPROC + id()) + 1
 }
@@ -249,6 +252,7 @@ pub fn fs_lock() -> FsGuard {
 }
 
 /// いっしょに持つ (fastdir の作る・消すと、ExtInode を落とすところ)。ひとりで持っていれば、それを重ねて
+// [lockless]
 pub fn fs_lock_shared() -> FsGuard {
     if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
         FS_DEPTH.store(FS_DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
@@ -265,22 +269,26 @@ pub fn fs_lock_shared() -> FsGuard {
 
 /// 待ちはじめ: 回数はいつも、時間は SAMPLE 回に 1 回だけ時計で測って SAMPLE 倍 (大きなロックと同じ: TCG では取ったあとに
 /// 時計を読むのが重く、ロックを持つ時間が伸びる)
+// [lockless]
 fn wait_begin() -> u64 {
     let timed = FS_WAIT[0].fetch_add(1, Ordering::Relaxed) % SAMPLE == 0;
     if timed { crate::timer::uptime_ns().max(1) } else { 0 }
 }
 
+// [lockless]
 fn wait_end(t0: u64) {
     if t0 != 0 {
         FS_WAIT[1].fetch_add((crate::timer::uptime_ns() - t0) * SAMPLE, Ordering::Relaxed);
     }
 }
 
+// [lockless]
 fn wfe() {
     // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
     unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
 }
 
+// [lockless]
 fn sev() {
     unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
 }
@@ -310,6 +318,7 @@ fn fs_acquire(me: usize) {
     }
 }
 
+// [lockless]
 fn fs_acquire_shared() {
     let mut t0 = None;
     loop {
@@ -382,6 +391,7 @@ pub fn fs_relock_after_sleep(d: usize) {
 
 /// システムコールや例外から戻るとき: ext4 のロックを持ったままなら、取ったところと放すところの組がこわれている
 /// (そのままでは ext4 に入るものがみな止まる)
+// [lockless]
 pub fn fs_check_released() {
     if FS_OWNER.load(Ordering::Relaxed) == fs_me() {
         panic!("extfs: the ext4 lock is still held on the way out (depth {})", FS_DEPTH.load(Ordering::Relaxed));
@@ -392,6 +402,7 @@ pub fn fs_check_released() {
 }
 
 /// この CPU が、ファイルシステムのロックをいっしょに持っている
+// [lockless]
 pub fn fs_shared_here() -> bool {
     FS_SHARED[id()].load(Ordering::Relaxed) != 0
 }
@@ -411,6 +422,7 @@ static PENDING: crate::spinlock::SpinLock<([usize; NPENDING], usize)> = crate::s
 static PENDING_N: AtomicUsize = AtomicUsize::new(0);
 
 /// key (パイプ) で待っているものを起こしてもらう。大きなロックを持たずに呼ぶ
+// [lockless]
 pub fn defer_wake(key: usize) {
     let queued = {
         let mut p = PENDING.lock();
@@ -428,13 +440,18 @@ pub fn defer_wake(key: usize) {
     };
     if !queued {
         // いっぱい: 待って取って、自分で
+        // lockless-ok: ここで大きなロックを取る (起こすのはその中で)
         lock();
+        // lockless-ok: 大きなロックの中
         crate::file::wake_key(key);
+        // lockless-ok: 取ったものを放す
         unlock();
         return;
     }
     core::sync::atomic::fence(Ordering::SeqCst);
+    // lockless-ok: 空いていれば大きなロックを取って放す (放すときに頼んだものを起こす: unlock_at)
     if try_lock() {
+        // lockless-ok: 取ったものを放す
         unlock();
     }
 }
@@ -517,6 +534,7 @@ pub struct Stats {
 const Z: AtomicU64 = AtomicU64::new(0);
 /// STATS の数に足す。書くのは大きなロックを持っているものだけ (stats_reset も) なので、読んで書くだけでいい
 /// (fetch_add の ldxr/stxr の輪より軽い)
+// [lockless]
 fn add(a: &AtomicU64, v: u64) {
     a.store(a.load(Ordering::Relaxed) + v, Ordering::Relaxed);
 }

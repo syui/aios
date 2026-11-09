@@ -44,8 +44,10 @@ pub trait FastFs {
     /// vfs の id の 1 つめ (このファイルシステムの番号)
     fn fs_id(&self) -> usize;
     /// dir に name を作る (作ったもの、その stat、inode の版)。できなければ None (ふつうの道へ)
+    // [lockless]
     fn fast_create(&self, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(crate::vfs::InodeRef, file::Stat, u64)>;
     /// dir の name を消す
+    // [lockless]
     fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink;
     /// 覚えている inode の様子
     fn cached_meta(&self, ino: u32) -> Option<crate::vfs::Meta>;
@@ -54,6 +56,7 @@ pub trait FastFs {
     /// dir の name を引く (ないなら Some(None)、あれば Some((inode の番号, 様子, 版)))
     fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, crate::vfs::Meta, u64)>>;
     /// dir の name (ino) を開く
+    // [lockless]
     fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<crate::vfs::InodeRef>;
 }
 
@@ -77,11 +80,13 @@ pub fn register(fs: &'static dyn FastFs) {
     }
 }
 
+// [lockless]
 fn root_fs() -> Option<&'static dyn FastFs> {
     ROOT.get().copied()
 }
 
 /// どちらにも要るもの (ロックの外で見られるもの)。だめなら None
+// [lockless]
 fn usable(me: &Proc) -> Option<&'static dyn FastFs> {
     if crate::debug::FAIL_ON.load(Relaxed) || me.has_cred_work(crate::proc::CRED_SANDBOX) || !watch_free() {
         return None;
@@ -94,6 +99,7 @@ fn usable(me: &Proc) -> Option<&'static dyn FastFs> {
 
 /// 作る・消すのできごとを待つ見張りも、読むだけのマウントもない (ext4 のロックの中でもう一度見る: inotify::add_watch と
 /// vfs::mount_ro は、印を立ててから ext4 のロックを取って、いま書きかえているものが終わるのを待つ)
+// [lockless]
 fn watch_free() -> bool {
     crate::vfs::notify::NAME_WATCHED.load(Relaxed) == 0 && file::OPEN_WATCHED.load(Relaxed) == 0 && !crate::vfs::RO_MOUNTED.load(Relaxed)
 }
@@ -223,6 +229,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
 /// 大きなロックなしの stat で、表の答えの stat が古いもの (inode を書いたあと。名前と inode の番号は正しい): ディレクトリ
 /// dir の名前 name がいまも ino をさしていれば、ext4 の inode の覚えからいまの stat (Linux の stat が dentry の先の inode
 /// から読むのと同じ)。だめなら None (ふつうの道へ)
+// [lockless]
 pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
     let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();
@@ -231,6 +238,7 @@ pub fn fresh_stat(dir: u64, name: &str, ino: u64) -> Option<file::Stat> {
 
 /// 表の答えの stat が古いもの (inode を書いたあと) を、ext4 の inode の覚え (metas) から (覚えになければ None)。名前が
 /// いまもその inode をさすかは、呼ぶ側が読んだあとで表の版を見なおして確かめる (statc::now_stat)
+// [lockless]
 pub fn cached_stat(ino: u64) -> Option<file::Stat> {
     let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();
@@ -238,6 +246,7 @@ pub fn cached_stat(ino: u64) -> Option<file::Stat> {
 }
 
 /// ルートの ext4 の vfs の id の 1 つめ (statc が (ディレクトリ, 名前) の箱を引くため)
+// [lockless]
 pub fn root_fs_id() -> Option<usize> {
     root_fs().map(|fs| fs.fs_id())
 }
@@ -245,6 +254,7 @@ pub fn root_fs_id() -> Option<usize> {
 /// 表にない名前を 1 つ引く (statc::learn_lookup: 親のディレクトリ dir は表で確かめたもの): ext4 のロック (いっしょに) と
 /// dir のロックの中で (ExtFs::fast_lookup)、ないなら Some(None)、あれば Some((inode の番号, stat, 読む前に取った inode の
 /// 版))。引けなければ None (ふつうの道へ)
+// [lockless]
 pub fn lookup_name(me: &Proc, dir: u64, name: &str) -> Option<Option<(u64, file::Stat, u64)>> {
     let fs = root_fs()?;
     let _e = crate::smp::fs_lock_shared();

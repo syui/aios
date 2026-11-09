@@ -58,6 +58,7 @@ impl<T> Shared<T> {
         unsafe { &mut *self.0.get() }
     }
     /// ほかに持っている人がいない (ほかのスレッドと分けていない)
+    // [lockless]
     pub fn private(&self) -> bool {
         Rc::strong_count(&self.0) == 1
     }
@@ -549,15 +550,18 @@ impl Proc {
         fp: FpState::ZERO,
     };
 
+    // [lockless]
     pub fn mm(&self) -> &mut Mm {
         self.mm.as_ref().expect("proc without mm").get()
     }
 
+    // [lockless]
     pub fn pt(&self) -> &mut PageTable {
         &mut self.mm().pt
     }
 
     /// スレッドグループの代表 (スレッドでない) か
+    // [lockless]
     pub fn is_leader(&self) -> bool {
         !self.thread && self.pid == self.tgid
     }
@@ -567,6 +571,7 @@ impl Proc {
     }
 
     /// futex の channel を作るための、アドレス空間ごとの値
+    // [lockless]
     pub fn mm_id(&self) -> usize {
         self.mm.as_ref().map_or(0, |m| m.id())
     }
@@ -625,6 +630,7 @@ impl Proc {
 
     /// cred_work の印 (大きなロックなしの道から)
     #[inline]
+    // [lockless]
     pub fn has_cred_work(&self, bit: u8) -> bool {
         self.cred_work.load(core::sync::atomic::Ordering::Acquire) & bit != 0
     }
@@ -646,11 +652,13 @@ static PROCS: Raw<[Proc; NPROC]> = Raw::new([const { Proc::UNUSED }; NPROC]);
 static CURRENT: PerCpu<Option<usize>> = PerCpu::new([None; crate::smp::MAXCPU]);
 static SCHEDULER: PerCpu<Context> = PerCpu::new([Context::ZERO; crate::smp::MAXCPU]);
 
+// [lockless]
 pub fn cur() -> Option<usize> {
     *CURRENT.get()
 }
 
 /// いまのスレッドの表の番号 (0..NPROC。起動のときやアイドルなら None。prof.rs がスレッドごとに数えるのに)
+// [lockless]
 pub fn cur_index() -> Option<usize> {
     cur()
 }
@@ -679,6 +687,7 @@ pub fn in_fallible() -> bool {
     cur().is_some_and(|i| procs()[i].fallible > 0)
 }
 
+// [lockless]
 pub fn fallible_enter() {
     if let Some(i) = cur() {
         procs()[i].fallible += 1;
@@ -724,6 +733,7 @@ static NEXT_PID: Bkl<u32> = Bkl::new(1);
 /// 表は大きなロックが守る。ロックなしで触ってよいのは、いまのスレッドの Proc (current()) のうち、そのスレッドの
 /// ほかにはロックを持っても変えないところ (fd の表を持つ Rc、アドレス空間、資格情報を読むなど: syscall::fast)。
 /// Proc ごとに守り手がちがうので Bkl にはしない (Bkl にすると、速い道の current() がみな unlocked に出る)
+// [lockless]
 pub fn procs() -> &'static mut [Proc; NPROC] {
     unsafe { &mut *PROCS.ptr() }
 }
@@ -1000,18 +1010,21 @@ pub fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
     current().pt().copy_in(b, va).ok_or(-14)
 }
 
+// [lockless]
 pub fn current() -> &'static mut Proc {
     let i = cur().expect("no current proc");
     &mut procs()[i]
 }
 
 /// いまのスレッド (起動のときやアイドルなら None)
+// [lockless]
 pub fn try_current() -> Option<&'static mut Proc> {
     cur().map(|i| &mut procs()[i])
 }
 
 /// いまのプロセスの資格情報。まだプロセスがなければ root
 /// いまのプロセスの資格情報を写さずに (起動中でまだプロセスがなければ root)
+// [lockless]
 pub fn current_cred_ref() -> &'static crate::cred::Cred {
     // だれも書かない (Cred は Rc を持つので Sync でなく、ただの static にはできない。ROOT の Rc はみな None)
     static ROOT: crate::cell::Early<crate::cred::Cred> = crate::cell::Early::new(crate::cred::Cred::ROOT);
@@ -2199,6 +2212,7 @@ pub fn yield_voluntary() {
 
 /// スレッドグループ全体の utime (tick)
 /// スレッドが CPU で走った時間 (ns)。いま走っていれば、走りはじめてからの分も
+// [lockless]
 pub fn cpu_ns(p: &Proc) -> u64 {
     let ran = p.ran_at;
     p.cpu_ns + if ran != 0 { crate::timer::uptime_ns().saturating_sub(ran) } else { 0 }
@@ -2213,6 +2227,7 @@ pub fn group_cpu_ns(tgid: u32) -> u64 {
 /// EL0 からの例外 (大きなロックの道と割り込み) の入口: ここからカーネルの時間 (sys_ns)。大きなロックなしの速い道
 /// (getpid などのシステムコール、ページフォルト) は数えない (ユーザーの時間に入る): 短く、QEMU (TCG) では時計を
 /// 読むのに 200 ns ほどかかり、getppid が 4 割遅くなったので。Linux の VIRT_CPU_ACCOUNTING_GEN のように出入りで測る
+// [lockless]
 pub fn kernel_enter() {
     if let Some(p) = try_current() {
         p.kern_at = crate::timer::uptime_ns().max(1);
@@ -2220,6 +2235,7 @@ pub fn kernel_enter() {
 }
 
 /// EL0 へもどる (例外の出口、新しいスレッドのはじめ): カーネルにいた時間を sys_ns に
+// [lockless]
 pub fn kernel_leave() {
     if let Some(p) = try_current() {
         if p.kern_at != 0 {
@@ -2432,6 +2448,7 @@ pub fn fp_restore(f: &FpState) {
 }
 
 /// いまのプロセスが io_sleepable の中か (プロセスがなければ false)
+// [lockless]
 pub fn io_sleep_ok() -> bool {
     cur().is_some_and(|i| procs()[i].io_sleep > 0)
 }
@@ -2469,10 +2486,12 @@ pub fn flush_sleep_restore(n: u32) {
 }
 
 /// いまのプロセスは noio の中か: ディスクを読まない (キャッシュになければ EAGAIN。preadv2 の RWF_NOWAIT)
+// [lockless]
 pub fn noio_on() -> bool {
     cur().is_some_and(|i| procs()[i].noio > 0)
 }
 
+// [lockless]
 pub fn noio<R>(f: impl FnOnce() -> R) -> R {
     current().noio += 1;
     let r = f();

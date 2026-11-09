@@ -35,6 +35,7 @@ impl<T> SpinLock<T> {
     }
 
     /// 取れたら Some (取れなければ待たない。println のように、どこからでも呼ばれるところ用)
+    // [lockless]
     pub fn try_lock(&self) -> Option<Guard<'_, T>> {
         let daif = intr_save();
         if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
@@ -70,6 +71,7 @@ impl<T> Drop for Guard<'_, T> {
 const DAIF_I: u64 = 1 << 7;
 
 /// IRQ を止める (もう止まっていれば何もしない)。前の DAIF を返す
+// [lockless]
 fn intr_save() -> u64 {
     let daif: u64;
     unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
@@ -80,6 +82,7 @@ fn intr_save() -> u64 {
 }
 
 /// intr_save の前に戻す: 開いていたときだけ開ける (ロックの中で DAIF は変えないこと)
+// [lockless]
 fn intr_restore(daif: u64) {
     if daif & DAIF_I == 0 {
         unsafe { core::arch::asm!("msr daifclr, #2") };

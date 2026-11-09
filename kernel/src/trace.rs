@@ -253,6 +253,7 @@ impl crate::debug::Tracer for Ops {
     fn count(&self, nr: u64) {
         count(nr);
     }
+    // [lockless]
     fn count_fast(&self, nr: u64) {
         if let Some(c) = FAST.get(nr as usize) {
             c.fetch_add(1, Relaxed);
@@ -264,6 +265,7 @@ impl crate::debug::Tracer for Ops {
     fn sys_exit(&self, nr: u64, r: i64) {
         sys_exit(nr, r);
     }
+    // [lockless]
     fn sys_fast(&self, nr: u64, a0: u64, r: i64) {
         sys_fast(nr, a0, r);
     }

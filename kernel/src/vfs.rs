@@ -113,11 +113,13 @@ pub trait Inode {
     fn page_written(&self, _foff: usize, _touch: bool) -> Result<(), i64> {
         Ok(())
     }
+    // [lockless]
     fn page_cacheable(&self) -> bool {
         false
     }
     /// パスの答えを覚えてよいか (名前が勝手に変わらないもの: ext4、tmpfs)。名前や属性を変えるときは dir_changed を呼ぶこと
     /// 中身 (meta) が変わるたびに statc::ino_bump を呼ぶので、大きなロックなしの stat (statc.rs) が答えてよい
+    // [lockless]
     fn fast_stat(&self) -> bool {
         false
     }
@@ -308,6 +310,7 @@ pub fn set_fs_dev(fs: usize, major: u32, minor: u32) {
 }
 
 /// ファイルシステム fs (InodeRef::id の .0) の (major, minor)
+// [lockless]
 pub fn fs_dev(fs: usize) -> (u32, u32) {
     match FS_DEV.get(fs).map_or(0, |a| a.load(core::sync::atomic::Ordering::Relaxed)) {
         0 => (0, ANON_MINOR + fs as u32),
@@ -316,17 +319,20 @@ pub fn fs_dev(fs: usize) -> (u32, u32) {
 }
 
 /// (major, minor) を stat の st_dev の形に (Linux の new_encode_dev。glibc の makedev と同じ)
+// [lockless]
 pub fn encode_dev(d: (u32, u32)) -> u64 {
     let (ma, mi) = (d.0 as u64, d.1 as u64);
     (mi & 0xff) | (ma << 8) | ((mi & !0xff) << 12)
 }
 
 /// stat の st_dev の形を (major, minor) に
+// [lockless]
 pub fn decode_dev(d: u64) -> (u32, u32) {
     ((((d >> 32) & 0xffff_f000) | ((d >> 8) & 0xfff)) as u32, (((d >> 12) & 0xffff_ff00) | (d & 0xff)) as u32)
 }
 
 /// ファイルシステム fs のものの st_dev
+// [lockless]
 pub fn st_dev(fs: usize) -> u64 {
     encode_dev(fs_dev(fs))
 }
@@ -381,6 +387,7 @@ fn new_mnt_id() -> u32 {
 }
 
 /// statx の STATX_MNT_ID_UNIQUE の番号 (Linux は 2^31 + 1 から: MNT_UNIQUE_ID_OFFSET)
+// [lockless]
 pub fn unique_mnt_id(id: u64) -> u64 {
     (1u64 << 31) + id
 }
@@ -517,6 +524,7 @@ fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype:
 static MOUNT_AT: [core::sync::atomic::AtomicU64; 32] = [const { core::sync::atomic::AtomicU64::new(0) }; 32];
 static MOUNT_MANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// [lockless]
 fn mount_key(id: (usize, u64)) -> u64 {
     id.1 | (id.0 as u64) << 48
 }
@@ -526,6 +534,7 @@ fn mount_key(id: (usize, u64)) -> u64 {
 static ROOT_FS_MNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// ROOT_FS_MNT (0 はわからない: ふつうの道へ)
+// [lockless]
 pub fn root_fs_mount() -> u64 {
     ROOT_FS_MNT.load(core::sync::atomic::Ordering::SeqCst)
 }
@@ -547,6 +556,7 @@ fn mount_at_refresh() {
 }
 
 /// id のディレクトリが、はじめのマウントの namespace でマウント先か (大きなロックなしで。かもしれないなら true)
+// [lockless]
 pub fn is_mount_at(id: (usize, u64)) -> bool {
     use core::sync::atomic::Ordering::SeqCst;
     let k = mount_key(id);
@@ -1275,6 +1285,7 @@ fn gen_bump(dir: (usize, u64), name: u64) {
 }
 
 /// 名前の印 (FNV-1a)
+// [lockless]
 pub fn name_hash(name: &str) -> u64 {
     let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
     if h == ATTR { 0 } else { h }

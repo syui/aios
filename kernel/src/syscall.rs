@@ -696,6 +696,7 @@ type R = Result<i64, i64>;
 
 use crate::proc::put_user as out;
 
+// [lockless]
 fn timespec(ns: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
@@ -711,6 +712,7 @@ const CLOCK_REALTIME_COARSE: u64 = 5;
 /// シグナルや kill はほかの CPU から割り込み (IPI) で来るので、ここでは見なくてよい。
 /// 大きなロックで守られているもの (ファイルシステムの RefCell: ext4 の inode の覚えなど) は借りないこと: ほかの CPU が
 /// ロックを持って書いていれば "already borrowed" で止まる (前の fast_splice。test/vm-check.sh の fast-smp)
+// [lockless]
 pub fn fast(tf: &mut TrapFrame) -> bool {
     use nr::*;
     // すべてのシステムコールがまずここを通るので、写すのは引数 (x0〜x5) と番号だけ
@@ -1116,6 +1118,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     Ok(va as i64)
 }
 
+// [lockless]
 fn prot_bits(prot: u64) -> u8 {
     (prot & 7) as u8
 }

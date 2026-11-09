@@ -34,15 +34,18 @@ const MAX_PAGES: usize = crate::memlayout::MAX_RAM / PGSIZE;
 /// ページごとの、使っている人の数。大きなロックなしのページフォルト (vm.rs fast_fault) からも触るので atomic
 static REFS: [AtomicU16; MAX_PAGES] = [const { AtomicU16::new(0) }; MAX_PAGES];
 
+// [lockless]
 fn ref_slot(page: *mut u8) -> &'static AtomicU16 {
     &REFS[(v2p(page as usize) - ram_base()) / PGSIZE]
 }
 
 /// ページの番号 (RAM の先頭から)
+// [lockless]
 fn idx_of(page: *mut u8) -> usize {
     (v2p(page as usize) - ram_base()) / PGSIZE
 }
 
+// [lockless]
 fn page_of(i: usize) -> *mut u8 {
     p2v(ram_base() + i * PGSIZE) as *mut u8
 }
@@ -351,6 +354,7 @@ struct FreeRing {
 }
 static FREE_RING: crate::spinlock::SpinLock<FreeRing> = crate::spinlock::SpinLock::new(FreeRing { at: 0, ents: [(0, [0; 6]); RING] });
 
+// [lockless]
 fn ring_note(page: *mut u8) {
     let bt = crate::heap::backtrace();
     let mut r = FREE_RING.lock();
@@ -359,6 +363,7 @@ fn ring_note(page: *mut u8) {
     r.at += 1;
 }
 
+// [lockless]
 fn ring_find(page: *mut u8) -> Option<[usize; 6]> {
     let r = FREE_RING.lock();
     let n = r.at.min(RING);
@@ -366,6 +371,7 @@ fn ring_find(page: *mut u8) -> Option<[usize; 6]> {
 }
 
 /// 返したページを埋めて、頭の 48 バイトに返した人の呼び出し、つぎの 8 バイトにしるしを書く
+// [lockless]
 fn poison_page(page: *mut u8) {
     unsafe { core::ptr::write_bytes(page, POISON_PAGE, PGSIZE) };
     let bt = crate::heap::backtrace();
@@ -376,6 +382,7 @@ fn poison_page(page: *mut u8) {
 }
 
 /// 出すページが、返したときのしるしのままか (返したあとに書いた人がいないか)
+// [lockless]
 fn poison_check(page: *mut u8, how: &str) {
     let d = unsafe { core::slice::from_raw_parts(page, PGSIZE) };
     if u64::from_le_bytes(d[48..56].try_into().unwrap()) != POISON_MAGIC {
@@ -397,6 +404,7 @@ fn poison_check(page: *mut u8, how: &str) {
 }
 
 /// 仮想アドレス (KBASE 側) のページを返す
+// [lockless]
 pub fn free(page: *mut u8) {
     if POISON.load(Ordering::Relaxed) {
         poison_page(page);
@@ -415,6 +423,7 @@ pub fn free(page: *mut u8) {
 }
 
 /// 0 埋めしたページを 1 枚。なければ None
+// [lockless]
 pub fn alloc() -> Option<*mut u8> {
     let page = alloc_dirty()?;
     zero_page(page);
@@ -423,6 +432,7 @@ pub fn alloc() -> Option<*mut u8> {
 
 /// ページを 0 にする。DC ZVA (1 命令で 64 バイトなど) が使えればそれで: QEMU の TCG ではホストの
 /// memset 1 回になり、8 バイトずつ書くより何十倍も速い (本物の CPU でも速い。Linux の clear_page と同じ)
+// [lockless]
 pub fn zero_page(page: *mut u8) {
     let dczid: u64;
     unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid) };
@@ -442,6 +452,7 @@ pub fn zero_page(page: *mut u8) {
 
 /// 中身を 0 にしないページ (すぐに全部書きこむところ用: ディスクのブロックのキャッシュ、パイプの中身。
 /// 前に使った人のデータが残っているので、書いていないところをユーザーに見せないこと)
+// [lockless]
 pub fn alloc_dirty() -> Option<*mut u8> {
     // わざと取れないことに (/proc/ai/ctl の fail ... page。fail.rs)
     if crate::debug::should_fail_alloc_page() {
@@ -470,6 +481,7 @@ pub fn get(page: *mut u8) {
 }
 
 /// 共有をやめる。誰も使わなくなったら返す
+// [lockless]
 pub fn put(page: *mut u8) {
     // 最後の 1 人なら返す (fetch_sub の前の値が 1 以下)
     let prev = ref_slot(page).fetch_sub(1, Ordering::AcqRel);
@@ -487,6 +499,7 @@ pub fn put(page: *mut u8) {
 }
 
 /// 何人で使っているか
+// [lockless]
 pub fn refs(page: *mut u8) -> u16 {
     ref_slot(page).load(Ordering::Acquire)
 }

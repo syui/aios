@@ -58,6 +58,7 @@ impl Journal {
         self.seq
     }
 
+    // [lockless]
     pub fn capacity(&self) -> usize {
         (self.maxlen - self.first) as usize
     }

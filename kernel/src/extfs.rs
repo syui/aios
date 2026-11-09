@@ -28,6 +28,7 @@ use crate::smp::{fs_lock, fs_lock_shared};
 /// 1 つずつ): そのディレクトリのブロックと inode を、なめてから書きかえるまで
 static DIR_LOCKS: [crate::spinlock::SpinLock<()>; 64] = [const { crate::spinlock::SpinLock::new(()) }; 64];
 
+// [lockless]
 fn dir_lock(dir: u32) -> crate::spinlock::Guard<'static, ()> {
     DIR_LOCKS[dir as usize % DIR_LOCKS.len()].lock()
 }
@@ -84,6 +85,7 @@ impl BookLock {
     }
 }
 
+// [lockless]
 fn book() -> BookGuard {
     BOOK.take()
 }
@@ -105,6 +107,7 @@ impl Drop for BookGuard {
 
 /// この CPU が ext4 のロックをいっしょに持っている (そのあいだは、ブロックのキャッシュの表に足したり捨てたりしない:
 /// 足すのはディスクを読むとき、捨てるのはブロックを返すときで、どちらもひとりで持つときだけ)
+// [lockless]
 fn shared_here() -> bool {
     crate::smp::fs_shared_here()
 }
@@ -186,9 +189,11 @@ impl ACell {
     fn set(&self, v: u64) {
         self.0.store(v, Ordering::Relaxed)
     }
+    // [lockless]
     fn inc(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
+    // [lockless]
     fn dec(&self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -215,6 +220,7 @@ const READ_AHEAD: usize = 32;
 /// noio (RWF_NOWAIT) でキャッシュになかったときの答え
 const NOIO_EAGAIN: i64 = 11;
 
+// [lockless]
 fn cache_limit(bsize: usize) -> usize {
     CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
 }
@@ -258,19 +264,24 @@ const EXT_INIT_MAX_LEN: u32 = 32768;
 const DIR_TAIL: usize = 12;
 const DIR_TAIL_FT: u8 = 0xde;
 
+// [lockless]
 fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
+// [lockless]
 fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
+// [lockless]
 fn put16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
 }
+// [lockless]
 fn put32(b: &mut [u8], o: usize, v: u32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+// [lockless]
 fn now_secs() -> u32 {
     (crate::timer::coarse_epoch_ns() / 1_000_000_000) as u32
 }
@@ -298,6 +309,7 @@ static CRC_TABLE: [u32; 256] = crc_table();
 /// CRC32C (ext4 と jbd2 のチェックサム。はじめと終わりで反転はしない)。CPU に CRC32 の命令があれば
 /// (ARMv8.1 からは必ず。ラズパイ 3/4 の A53/A72、QEMU、Apple の CPU にもある) 8 バイトずつ、なければ表で 1 バイトずつ
 /// (表では 1 バイトに命令が 5 つほど: QEMU の TCG で 4 KiB のブロックに 100 us ほど)
+// [lockless]
 fn crc32c(crc: u32, data: &[u8]) -> u32 {
     if hw_crc() {
         unsafe { crc32c_hw(crc, data) }
@@ -306,6 +318,7 @@ fn crc32c(crc: u32, data: &[u8]) -> u32 {
     }
 }
 
+// [lockless]
 fn crc32c_table(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc = CRC_TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
@@ -314,6 +327,7 @@ fn crc32c_table(mut crc: u32, data: &[u8]) -> u32 {
 }
 
 #[target_feature(enable = "crc")]
+// [lockless]
 unsafe fn crc32c_hw(mut crc: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::{__crc32cb, __crc32cd};
     // 8 バイトにそろったところは u64 で (リトルエンディアンなので、バイトの順に読むのと同じ)
@@ -334,6 +348,7 @@ unsafe fn crc32c_hw(mut crc: u32, data: &[u8]) -> u32 {
 /// 表と同じ答えになるかも 1 度だけ確かめる (ずれたら ext4 のチェックサムがみなこわれるので)
 static HW_CRC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+// [lockless]
 fn hw_crc() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     match HW_CRC.load(Relaxed) {
@@ -374,6 +389,7 @@ impl Ranges {
     }
 
     /// [s, e) を足す (重なるもの、となりあうものとはひとつに)
+    // [lockless]
     fn insert_range(&mut self, mut s: u64, mut e: u64) {
         if let Some((&ps, &pe)) = self.0.range(..=s).next_back()
             && pe >= s
@@ -419,6 +435,7 @@ impl Ranges {
     }
 
     /// [lo, hi) の中のものを、はじめと終わりの次で
+    // [lockless]
     fn within(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
         let first = self.0.range(..=lo).next_back().map(|(&s, _)| s).unwrap_or(lo);
         self.0.range(first..hi).filter_map(move |(&s, &e)| (e > lo).then_some((s.max(lo), e.min(hi))))
@@ -443,6 +460,7 @@ impl Cache {
     /// 捨てられないものは後ろへ回す (また古くなったら見る)。64 こ見て捨てられなければあきらめる (表は上限をこえて
     /// ふくらむ: 写されているページはページキャッシュ (vm.rs) のもので、そちらが手放せば捨てられる)。
     /// order には forget したものも残っているので、map にないものはとばす
+    // [lockless]
     fn evict_one(&mut self) -> bool {
         let mut tries = 0;
         while let Some(x) = self.order.pop_front() {
@@ -465,6 +483,7 @@ impl Cache {
 
     /// 表から外したブロック b のページを返す。ページは参照で持つ (写しているところがまだ見ているかもしれない)。
     /// 眠って書く書き出しがそのブロックを書いているとちゅうなら、書き終わるまで返さない (wb_held)
+    // [lockless]
     fn release_page(&mut self, b: u64, p: *mut u8) {
         if self.writeback.contains(b) {
             self.wb_held.push(p);
@@ -474,6 +493,7 @@ impl Cache {
     }
 
     /// まだディスクに書いていない (dirty、data) か、いま書いている (writeback) ブロック: 捨てない
+    // [lockless]
     fn busy(&self, b: u64) -> bool {
         self.dirty.contains(&b) || self.data.contains(&b) || self.writeback.contains(b)
     }
@@ -481,6 +501,7 @@ impl Cache {
     /// ブロック b を覚えから外す (放したブロックなど)。order からはここでは外さない: order は覚えているブロック
     /// みな (16384 まで) なので、外すたびになめると大きなファイルを消すのがブロックの数 × 16384 になる
     /// (16 MiB で 6700 万回)。残ったものが覚えている数の 4 倍をこえたら、まとめて作りなおす (ならして 1 つあたり O(1))
+    // [lockless]
     fn forget(&mut self, b: u64) {
         let Some(p) = self.map.remove(&b) else { return };
         self.release_page(b, p);
@@ -489,6 +510,7 @@ impl Cache {
 
     /// [start, end) のブロックをみな覚えから外す (forget を 1 つずつするのと同じ。order を作りなおすのは終わりに 1 度:
     /// 大きなファイルを消すと、1 つずつでは何度も作りなおした)
+    // [lockless]
     fn forget_range(&mut self, start: u64, end: u64) {
         // 範囲のものを木からまとめて抜く (1 つずつ remove して木をたどりなおさない)
         let gone: Vec<(u64, *mut u8)> = self.map.extract_if(start..end, |_, _| true).collect();
@@ -501,6 +523,7 @@ impl Cache {
     /// order が覚えている数の 4 倍をこえたら、まとめて作りなおす (forget から。前は 2 倍で、大きなファイルを消すと
     /// extent ごとに覚えている数が半分になって、何度も作りなおした: 64 MiB で 12 ms)。残っている古いものは evict_one が
     /// とばす
+    // [lockless]
     fn tidy_order(&mut self) {
         if self.order.len() > 4 * self.map.len() + 4096 {
             // 外したあとにまた入ったものは 2 度ある: 古いほうを残す
@@ -633,6 +656,7 @@ const METAS_MAX: usize = 8192;
 const NAMES_MAX: usize = 65536; // 1 つ 100 バイトくらいで 6 MiB ほど
 
 /// ディスク上の inode r (番号 ino) を meta() の答えに
+// [lockless]
 fn meta_of(ino: u32, r: &Raw, bsize: usize) -> Meta {
     let b = &r.0;
     let uid = u16_at(b, 2) as u32 | (u16_at(b, 120) as u32) << 16;
@@ -679,6 +703,7 @@ impl Names {
         }
     }
 
+    // [lockless]
     fn forget(&mut self, dir: u32) {
         if let Some(m) = self.dirs.remove(&dir) {
             self.len -= m.len();
@@ -704,30 +729,37 @@ type Entry = (u64, usize, usize, Option<(usize, usize)>);
 struct Raw(Vec<u8>);
 
 impl Raw {
+    // [lockless]
     fn mode(&self) -> u32 {
         u16_at(&self.0, 0) as u32
     }
+    // [lockless]
     fn size(&self) -> u64 {
         let lo = u32_at(&self.0, 4) as u64;
         if self.mode() & S_IFMT == S_IFREG { lo | (u32_at(&self.0, 108) as u64) << 32 } else { lo }
     }
+    // [lockless]
     fn set_size(&mut self, s: u64) {
         put32(&mut self.0, 4, s as u32);
         if self.mode() & S_IFMT == S_IFREG {
             put32(&mut self.0, 108, (s >> 32) as u32);
         }
     }
+    // [lockless]
     fn links(&self) -> u16 {
         u16_at(&self.0, 26)
     }
+    // [lockless]
     fn set_links(&mut self, n: u16) {
         put16(&mut self.0, 26, n);
     }
     /// 512 バイト単位の使用量
+    // [lockless]
     fn blocks512(&self, bsize: usize) -> u64 {
         let v = u32_at(&self.0, 28) as u64 | (u16_at(&self.0, 0x74) as u64) << 32;
         if self.flags() & HUGE_FILE_FL != 0 { v * (bsize / 512) as u64 } else { v }
     }
+    // [lockless]
     fn add_blocks512(&mut self, delta: i64, bsize: usize) {
         let v = (self.blocks512(bsize) as i64 + delta).max(0) as u64;
         put32(&mut self.0, 28, v as u32);
@@ -735,35 +767,44 @@ impl Raw {
         let f = self.flags() & !HUGE_FILE_FL;
         put32(&mut self.0, 32, f);
     }
+    // [lockless]
     fn flags(&self) -> u32 {
         u32_at(&self.0, 32)
     }
+    // [lockless]
     fn set_flags(&mut self, f: u32) {
         put32(&mut self.0, 32, f);
     }
+    // [lockless]
     fn block(&self, i: usize) -> u32 {
         u32_at(&self.0, 40 + i * 4)
     }
+    // [lockless]
     fn set_block(&mut self, i: usize, v: u32) {
         put32(&mut self.0, 40 + i * 4, v);
     }
     /// i_block (60 バイト): extents の根
+    // [lockless]
     fn iblock(&mut self) -> &mut [u8] {
         &mut self.0[40..100]
     }
+    // [lockless]
     fn gen_no(&self) -> u32 {
         u32_at(&self.0, 0x64)
     }
+    // [lockless]
     fn gid(&self) -> u32 {
         u16_at(&self.0, 24) as u32 | (u16_at(&self.0, 122) as u32) << 16
     }
     /// 許しを決めるもの (mode、uid、gid) だけの Meta (大きなロックなしの作る・消すが、ext4 のロックの中で見る)
+    // [lockless]
     fn perm_meta(&self) -> Meta {
         let uid = u16_at(&self.0, 2) as u32 | (u16_at(&self.0, 120) as u32) << 16;
         Meta { mode: self.mode(), uid, gid: self.gid(), ..Meta::default() }
     }
     /// 作ったものの持ち主 (Linux の inode_init_owner): 作るプロセスの fsuid と fsgid。setgid のディレクトリの下なら
     /// そのグループで、ディレクトリなら setgid も受けつぐ。sysfile の own_new は、もう同じなら書きなおさない
+    // [lockless]
     fn init_owner(&mut self, parent: &Raw) {
         let c = crate::cred::current();
         let sgid = parent.mode() & crate::cred::S_ISGID != 0;
@@ -777,6 +818,7 @@ impl Raw {
             put16(&mut self.0, 0, (mode | crate::cred::S_ISGID) as u16);
         }
     }
+    // [lockless]
     fn touch(&mut self) {
         let t = now_secs();
         put32(&mut self.0, 12, t); // ctime
@@ -785,6 +827,7 @@ impl Raw {
 }
 
 /// ビットマップ d の start から n ビットを 0 に (はしは 1 ビットずつ、まん中は 1 バイトずつ: Linux の bitmap_clear)
+// [lockless]
 fn clear_bits(d: &mut [u8], start: usize, n: usize) {
     let (mut bit, end) = (start, start + n);
     while bit < end && bit % 8 != 0 {
@@ -802,6 +845,7 @@ fn clear_bits(d: &mut [u8], start: usize, n: usize) {
 
 /// ビットマップ d の start..n で最初の 0 のビット。64 ビットずつ見る (Linux の find_next_zero_bit。1 ビットずつだと、
 /// 使っている inode が多いグループで作るたびに何千回もまわる)
+// [lockless]
 fn first_zero(d: &[u8], start: u32, n: u32) -> Option<u32> {
     let mut bit = start;
     while bit < n {
@@ -823,6 +867,7 @@ fn first_zero(d: &[u8], start: u32, n: u32) -> Option<u32> {
 }
 
 /// ビットマップ d の start..n で最初の 1 のビット (なければ n)。first_zero の逆
+// [lockless]
 fn first_one(d: &[u8], start: u32, n: u32) -> u32 {
     let mut bit = start;
     while bit < n {
@@ -845,6 +890,7 @@ fn first_one(d: &[u8], start: u32, n: u32) -> u32 {
 
 /// ビットマップ d の start..n で、空いていて held (はじめと終わりの次。並んでいて重ならない) でもないつづき:
 /// want こつづいた最初のもの (はじめ, 長さ)。なければ見つかったうちでいちばん長いもの
+// [lockless]
 fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)]) -> Option<(u32, u32)> {
     let mut best: Option<(u32, u32)> = None;
     let mut from = start;
@@ -869,6 +915,7 @@ fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)]) -> Opt
     best
 }
 
+// [lockless]
 fn ftype(mode: u32) -> u8 {
     match mode & S_IFMT {
         S_IFREG => 1,
@@ -881,15 +928,18 @@ fn ftype(mode: u32) -> u8 {
     }
 }
 
+// [lockless]
 fn rec_len_for(name_len: usize) -> usize {
     (8 + name_len + 3) & !3
 }
 
+// [lockless]
 fn is_fast_symlink(r: &Raw) -> bool {
     r.mode() & S_IFMT == S_IFLNK && r.size() < 60 && r.flags() & EXTENTS_FL == 0 && u32_at(&r.0, 28) == 0
 }
 
 /// 3, 5, 7 のべき乗か
+// [lockless]
 fn is_power_of(mut n: u32, b: u32) -> bool {
     while n > 1 && n % b == 0 {
         n /= b;
@@ -1049,6 +1099,7 @@ impl ExtFs {
     }
 
     /// vfs の id の 1 つめ (このファイルシステムの番号)
+    // [lockless]
     pub fn fs_id(&self) -> usize {
         self.fs
     }
@@ -1130,6 +1181,7 @@ impl ExtFs {
 
     // ---- ブロック ----
 
+    // [lockless]
     fn with_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         if shared_here() {
             // いっしょに持っているあいだは表が変わらないので、帳簿のロックなしで引く (なければ読まない: 作る・消すは
@@ -1149,6 +1201,8 @@ impl ExtFs {
             // 読むだけの道 (proc::io_sleepable) で、書く操作の中でなければ、ディスクを眠って待つ
             None if self.writing.get() == 0 && crate::proc::io_sleep_ok() => {
                 drop(c);
+                // lockless-ok: 大きなロックなしの道 (fastdir、statc) は ext4 のロックをいっしょに持つ (shared_here) ので上で
+                // もどる。ディスクを待って眠るのは大きなロックの道だけ
                 return self.with_block_sleep(b, f);
             }
             None => {
@@ -1218,12 +1272,14 @@ impl ExtFs {
 
     /// ディスクから読まずに、b のページを用意する (中身はゼロ。すでにキャッシュにあればそのまま)。
     /// 新しく作ったブロックや、ブロックまるごと書きかえるときに (読んでもすぐ上書きするので)
+    // [lockless]
     fn with_block_new<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         self.with_block_new_adopt(b, None, f)
     }
 
     /// with_block_new で、ファイル ino のブロック lb としてとるとき (adopt): そこを写しているところが穴の 0 のページを
     /// 持っていれば (vm::adopt_hole)、そのページをこのブロックのページにする (写している人にそのまま映る)
+    // [lockless]
     fn with_block_new_adopt<T>(&self, b: u64, adopt: Option<(u32, u64)>, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         let adopted = match adopt {
             Some((ino, lb)) if self.bsize == PGSIZE => crate::vm::adopt_hole((self.fs, ino as u64), lb as usize),
@@ -1346,6 +1402,7 @@ impl ExtFs {
         }
     }
 
+    // [lockless]
     fn cached(&self, b: u64) -> bool {
         if shared_here() {
             return self.shared_lookup(b).is_some();
@@ -1355,15 +1412,18 @@ impl ExtFs {
 
     /// いっしょに持っているあいだの、キャッシュの表の引き (表はひとりで持つものだけが変える。ほかの CPU が帳簿の中で
     /// 書く Cache のほかの欄にはさわらない)
+    // [lockless]
     fn shared_lookup(&self, b: u64) -> Option<*mut u8> {
         unsafe { (*core::ptr::addr_of!((*self.cache.0.as_ptr()).map)).get(&b).copied() }
     }
 
+    // [lockless]
     fn read_block(&self, b: u64) -> Result<Vec<u8>, i64> {
         self.with_block(b, |d| d.to_vec())
     }
 
     /// メタデータのブロックを書きかえる (ディスクへは flush でジャーナルを通して)
+    // [lockless]
     fn modify_block<T>(&self, b: u64, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         let r = self.with_block(b, f)?;
         let mut c = self.cache.borrow_mut();
@@ -1402,6 +1462,7 @@ impl ExtFs {
     }
 
     /// modify_data_block_as で、fresh なら ino のブロック lb として (写しの穴のページを引きとる: with_block_new_adopt)
+    // [lockless]
     fn modify_data_block_adopt<T>(&self, b: u64, fresh: bool, adopt: Option<(u32, u64)>, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
         let r = if fresh { self.with_block_new_adopt(b, adopt, f)? } else { self.with_block(b, f)? };
         let mut c = self.cache.borrow_mut();
@@ -1434,15 +1495,18 @@ impl ExtFs {
 
     // ---- スーパーブロックとグループディスクリプタ ----
 
+    // [lockless]
     fn sb_u64(&self, lo: usize, hi: usize) -> u64 {
         let sb = self.sb.borrow();
         u32_at(&sb, lo) as u64 | if self.desc_size >= 64 { (u32_at(&sb, hi) as u64) << 32 } else { 0 }
     }
 
+    // [lockless]
     fn blocks_count(&self) -> u64 {
         self.sb_u64(4, 0x150)
     }
 
+    // [lockless]
     fn sb_add_free_blocks(&self, delta: i64) {
         let v = (self.sb_u64(12, 0x158) as i64 + delta) as u64;
         let mut sb = self.sb.borrow_mut();
@@ -1454,6 +1518,7 @@ impl ExtFs {
         self.adirty.borrow_mut().sb = true;
     }
 
+    // [lockless]
     fn sb_add_free_inodes(&self, delta: i64) {
         let mut sb = self.sb.borrow_mut();
         let v = (u32_at(&sb, 16) as i64 + delta) as u32;
@@ -1532,11 +1597,13 @@ impl ExtFs {
         Ok(())
     }
 
+    // [lockless]
     fn gd_off(&self, g: u32) -> usize {
         g as usize * self.desc_size
     }
 
     /// lo (と 64bit なら hi) の 32 ビットの組
+    // [lockless]
     fn gd_blk(&self, g: u32, lo: usize, hi: usize) -> u64 {
         let get = |d: &[u8]| {
             let o = self.gd_off(g);
@@ -1551,12 +1618,14 @@ impl ExtFs {
     }
 
     /// lo (と 64bit なら hi) の 16 ビットの組
+    // [lockless]
     fn gd_cnt(&self, g: u32, lo: usize, hi: usize) -> u32 {
         let d = self.gdt.borrow();
         let o = self.gd_off(g);
         u16_at(&d, o + lo) as u32 | if self.desc_size >= 64 { (u16_at(&d, o + hi) as u32) << 16 } else { 0 }
     }
 
+    // [lockless]
     fn gd_set_cnt(&self, g: u32, lo: usize, hi: usize, v: u32) {
         let mut d = self.gdt.borrow_mut();
         let o = self.gd_off(g);
@@ -1568,23 +1637,29 @@ impl ExtFs {
         self.adirty.borrow_mut().gd.insert(g);
     }
 
+    // [lockless]
     fn gd_add_cnt(&self, g: u32, lo: usize, hi: usize, delta: i32) {
         let v = (self.gd_cnt(g, lo, hi) as i64 + delta as i64).max(0) as u32;
         self.gd_set_cnt(g, lo, hi, v);
     }
 
+    // [lockless]
     fn block_bitmap(&self, g: u32) -> u64 {
         self.gd_blk(g, 0x0, 0x20)
     }
+    // [lockless]
     fn inode_bitmap(&self, g: u32) -> u64 {
         self.gd_blk(g, 0x4, 0x24)
     }
+    // [lockless]
     fn inode_table(&self, g: u32) -> u64 {
         self.gd_blk(g, 0x8, 0x28)
     }
+    // [lockless]
     fn gd_flags(&self, g: u32) -> u16 {
         u16_at(&self.gdt.borrow(), self.gd_off(g) + 0x12)
     }
+    // [lockless]
     fn gd_clear_flag(&self, g: u32, f: u16) {
         let mut d = self.gdt.borrow_mut();
         let o = self.gd_off(g) + 0x12;
@@ -1594,20 +1669,24 @@ impl ExtFs {
         self.adirty.borrow_mut().gd.insert(g);
     }
 
+    // [lockless]
     fn group_start(&self, g: u32) -> u64 {
         self.first_data_block + g as u64 * self.bpg as u64
     }
 
     /// このグループにある (または最後のグループで足りない) ブロック数
+    // [lockless]
     fn blocks_in_group(&self, g: u32) -> u32 {
         (self.blocks_count() - self.group_start(g)).min(self.bpg as u64) as u32
     }
 
+    // [lockless]
     fn has_super(&self, g: u32) -> bool {
         !self.sparse_super || g <= 1 || is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
     }
 
     /// 未初期化 (BLOCK_UNINIT) のグループのブロックビットマップを作る
+    // [lockless]
     fn init_block_bitmap(&self, g: u32) -> Result<(), i64> {
         let start = self.group_start(g);
         let n = self.blocks_in_group(g);
@@ -1657,6 +1736,7 @@ impl ExtFs {
     }
 
     /// ビットマップ bm の中で、start から n 個のうち空いているビットを 1 つ取る。held (はじめと終わりの次) のものはとばす
+    // [lockless]
     fn take_in(&self, bm: u64, start: u32, n: u32, held: &[(u32, u32)]) -> Result<Option<u32>, i64> {
         self.modify_block(bm, |d| {
             let mut from = start;
@@ -1676,6 +1756,7 @@ impl ExtFs {
 
     /// グループ g (はじめ gs、n ブロック) の、放したことがまだコミットされていないブロック (グループの中のビットで。
     /// はじめの順に並べ、重なるものはまとめる)
+    // [lockless]
     fn held_in(&self, gs: u64, n: u32) -> Vec<(u32, u32)> {
         let c = self.cache.borrow();
         if c.freed.is_empty() && c.freed_wb.is_empty() {
@@ -1696,6 +1777,7 @@ impl ExtFs {
 
     /// goal のそば (同じグループの goal 以降、なければ他のグループ) にブロックを 1 つ取る。
     /// 放したことがまだコミットされていないブロック (Cache::freed) は、ほかに空きがないときだけ
+    // [lockless]
     fn alloc_block(&self, goal: u64) -> Result<u64, i64> {
         self.alloc_block_run(goal, 1)
     }
@@ -1705,6 +1787,7 @@ impl ExtFs {
     /// mballoc がファイルの大きさにあわせた長さの空きをさがす (ext4_mb_normalize_request) のと同じ。前は goal のあとの
     /// いちばん近い空きをとったので、すき間の 1 ブロックの穴をひろい歩いて、書き足した 16 MiB のファイルが 47 の extent に
     /// なった。空きの数が want より少ないグループは見ない。見るビットマップは RUN_GROUPS こまで
+    // [lockless]
     fn alloc_block_run(&self, goal: u64, want: u32) -> Result<u64, i64> {
         let goal = goal.clamp(self.first_data_block, self.blocks_count() - 1);
         let gg = ((goal - self.first_data_block) / self.bpg as u64) as u32;
@@ -1784,12 +1867,14 @@ impl ExtFs {
     }
 
     /// グループ g のビットマップで bit を使っている印にして、とる (free_run で見つけたもの)
+    // [lockless]
     fn take_bit(&self, g: u32, bit: u32) -> Result<u64, i64> {
         self.modify_block(self.block_bitmap(g), |d| d[(bit / 8) as usize] |= 1 << (bit % 8))?;
         self.took(g, bit)
     }
 
     /// ビットマップで印をつけたグループ g の bit のブロックを、とったことにする (数とキャッシュ)
+    // [lockless]
     fn took(&self, g: u32, bit: u32) -> Result<u64, i64> {
         self.gd_add_cnt(g, 0xc, 0x2c, -1);
         self.sb_add_free_blocks(-1);
@@ -1809,6 +1894,7 @@ impl ExtFs {
     /// となりあう [start, start + n) を放す (free_block を n 回するのと同じこと)。ビットマップ、グループの数、スーパー
     /// ブロックの数は、グループごとに 1 度だけ書きかえ、キャッシュは覚えているブロックだけ外す (Linux の ext4_free_blocks
     /// も extent 1 つを 1 度に)。前は 1 ブロックごとにみな書きかえたので、64 MiB のファイルを消すと大きなロックを 0.1 秒持った
+    // [lockless]
     fn free_blocks(&self, start: u64, n: u64) -> Result<(), i64> {
         let end = start + n;
         let mut b = start;
@@ -1834,6 +1920,7 @@ impl ExtFs {
         Ok(())
     }
 
+    // [lockless]
     fn free_block(&self, b: u64) -> Result<(), i64> {
         let rel = b - self.first_data_block;
         let (g, bit) = ((rel / self.bpg as u64) as u32, (rel % self.bpg as u64) as usize);
@@ -1873,6 +1960,7 @@ impl ExtFs {
 
     /// 大きなロックなしの作る道 (fast_create): alloc_inode が選ぶ (グループ, ビット) を、何も書きかえずに。初期化して
     /// いないグループか、キャッシュにないビットマップに当たれば None (ふつうの道へ)
+    // [lockless]
     fn pick_inode(&self, goal_group: u32) -> Option<(u32, u32)> {
         let first_ino = u32_at(&self.sb.borrow(), 84).max(11);
         for k in 0..self.groups {
@@ -1895,6 +1983,7 @@ impl ExtFs {
     }
 
     /// グループ g のビット bit の inode を取った (ビットマップはもう立てた): 数を直して番号を返す
+    // [lockless]
     fn inode_taken(&self, g: u32, bit: u32, dir: bool) -> u32 {
         self.gd_add_cnt(g, 0xe, 0x2e, -1);
         if dir {
@@ -1914,6 +2003,7 @@ impl ExtFs {
         ino
     }
 
+    // [lockless]
     fn free_inode(&self, ino: u32, dir: bool) -> Result<(), i64> {
         if dir {
             self.forget_names(ino);
@@ -1934,10 +2024,12 @@ impl ExtFs {
 
     // ---- チェックサム (metadata_csum) ----
 
+    // [lockless]
     fn inode_seed(&self, ino: u32, generation: u32) -> u32 {
         crc32c(crc32c(self.csum_seed, &ino.to_le_bytes()), &generation.to_le_bytes())
     }
 
+    // [lockless]
     fn set_inode_csum(&self, ino: u32, r: &mut Raw) {
         if !self.csum {
             return;
@@ -1955,6 +2047,7 @@ impl ExtFs {
     }
 
     /// extent ブロックの末尾 (12 + 12 * max の位置) のチェックサム
+    // [lockless]
     fn set_extent_csum(&self, ino: u32, generation: u32, d: &mut [u8]) {
         if !self.csum {
             return;
@@ -2390,18 +2483,21 @@ impl ExtFs {
 
     // ---- inode ----
 
+    // [lockless]
     fn inode_loc(&self, ino: u32) -> (u64, usize) {
         let (g, idx) = ((ino - 1) / self.ipg, (ino - 1) % self.ipg);
         let byte = idx as usize * self.inode_size;
         (self.inode_table(g) + (byte / self.bsize) as u64, byte % self.bsize)
     }
 
+    // [lockless]
     fn read_inode(&self, ino: u32) -> Result<Raw, i64> {
         let (b, off) = self.inode_loc(ino);
         let isz = self.inode_size;
         self.with_block(b, |d| Raw(d[off..off + isz].to_vec()))
     }
 
+    // [lockless]
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
         // meta() の覚えを、書いたものに入れかえる (Linux のメモリの inode と同じく、書いたあとに読みなおして解かない: 作った
         // ばかりのファイルの stat や fstat が、inode のブロックを引いて解いていた)。ExtInode の覚えと、大きなロックなしの
@@ -2415,18 +2511,21 @@ impl ExtFs {
         }
         self.meta_ver.inc();
         crate::statc::ino_bump((self.fs, ino as u64));
+        // lockless-ok: r は inode のバイトの写し (Rc ではない)
         let mut r = r.clone();
         self.set_inode_csum(ino, &mut r);
         let (b, off) = self.inode_loc(ino);
         self.modify_block(b, |d| d[off..off + r.0.len()].copy_from_slice(&r.0))
     }
 
+    // [lockless]
     fn group_of(&self, ino: u32) -> u32 {
         (ino - 1) / self.ipg
     }
 
     /// ファイルの lb 番目のブロックの場所。alloc なら無いところを作る (0 は穴)。未初期化のブロック (fallocate で
     /// とったもの) は 0 として読むので 0、alloc なら初期化ずみにして (中身は 0) その場所
+    // [lockless]
     fn map(&self, ino: u32, r: &mut Raw, lb: u64, alloc: bool) -> Result<u64, i64> {
         if r.flags() & EXTENTS_FL != 0 {
             let (p, _, uninit) = self.ext_lookup(r, lb)?;
@@ -2461,6 +2560,7 @@ impl ExtFs {
 
     // ---- 直接/間接ブロック (ext2) ----
 
+    // [lockless]
     fn bmap(&self, ino: u32, r: &mut Raw, fb: u64, alloc: bool) -> Result<u64, i64> {
         let n = (self.bsize / 4) as u64;
         let goal = self.group_start(self.group_of(ino));
@@ -2508,6 +2608,7 @@ impl ExtFs {
     }
 
     /// keep 番目以降のブロックを外す
+    // [lockless]
     fn trunc_blocks(&self, ino: u32, r: &mut Raw, keep: u64) -> Result<(), i64> {
         if r.flags() & EXTENTS_FL != 0 {
             return self.ext_truncate(ino, r, keep);
@@ -2534,6 +2635,7 @@ impl ExtFs {
     }
 
     /// blk (level 段の間接ブロック、first から先を受け持つ) を keep に合わせて切る。全部外したら true
+    // [lockless]
     fn trunc_level(&self, r: &mut Raw, blk: u32, level: u32, first: u64, keep: u64) -> Result<bool, i64> {
         let n = (self.bsize / 4) as u64;
         if blk == 0 {
@@ -2565,20 +2667,24 @@ impl ExtFs {
     // 葉: (block u32, len u16, start_hi u16, start_lo u32)。len > 32768 は未初期化 (0 として読む)
     // 索引: (block u32, leaf_lo u32, leaf_hi u16, unused u16)
 
+    // [lockless]
     fn ext_leaf_start(e: &[u8]) -> u64 {
         u32_at(e, 8) as u64 | (u16_at(e, 6) as u64) << 32
     }
 
+    // [lockless]
     fn ext_index_child(e: &[u8]) -> u64 {
         u32_at(e, 4) as u64 | (u16_at(e, 8) as u64) << 32
     }
 
     /// lb の物理ブロック (無い・未初期化なら 0)
+    // [lockless]
     fn ext_find(&self, r: &Raw, lb: u64) -> Result<u64, i64> {
         self.ext_run(r, lb).map(|(p, _)| p)
     }
 
     /// lb の物理ブロックと、そこから同じ extent でつづくブロックの数 (lb を含む)。無い・未初期化なら (0, 1)
+    // [lockless]
     fn ext_run(&self, r: &Raw, lb: u64) -> Result<(u64, u64), i64> {
         let (p, n, uninit) = self.ext_lookup(r, lb)?;
         Ok(if uninit { (0, 1) } else { (p, n) })
@@ -2595,11 +2701,13 @@ impl ExtFs {
 
     /// lb の (物理ブロック, そこから同じ extent でつづくブロックの数 (lb を含む), 未初期化か)。無ければ (0, 1, false)。
     /// 木の節はブロックキャッシュの中でそのまま読む (写さない)
+    // [lockless]
     fn ext_lookup(&self, r: &Raw, lb: u64) -> Result<(u64, u64, bool), i64> {
         enum Step {
             Found(u64, u64, bool),
             Child(u64),
         }
+        // [lockless]
         fn step(node: &[u8], lb: u64) -> Result<Step, i64> {
             if u16_at(node, 0) != EXT_MAGIC {
                 return Err(-EIO);
@@ -2665,6 +2773,7 @@ impl ExtFs {
         Ok(None)
     }
 
+    // [lockless]
     fn ext_init_root(r: &mut Raw) {
         let ib = r.iblock();
         ib.fill(0);
@@ -2675,6 +2784,7 @@ impl ExtFs {
 
     /// 葉 (node) で lb → pb (raw は長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの) を、前の同じ種類の extent に
     /// つなげられるならつなげる (長さは初期化ずみ 32768、未初期化 32767 まで)
+    // [lockless]
     fn leaf_merge(node: &mut [u8], lb: u32, pb: u64, raw: u32) -> bool {
         let split = |raw: u32| if raw > EXT_INIT_MAX_LEN { (raw - EXT_INIT_MAX_LEN, true) } else { (raw, false) };
         let (cnt, uninit) = split(raw);
@@ -2693,6 +2803,7 @@ impl ExtFs {
     }
 
     /// 12 バイトの要素をキー (先頭の u32) の順に差し込む。入らなければ false
+    // [lockless]
     fn node_put(node: &mut [u8], ent: &[u8; 12]) -> bool {
         let n = u16_at(node, 2) as usize;
         if n >= u16_at(node, 4) as usize {
@@ -2707,6 +2818,7 @@ impl ExtFs {
     }
 
     /// raw_len は長さ (未初期化なら EXT_INIT_MAX_LEN を足したもの)
+    // [lockless]
     fn leaf_ent(lb: u32, pb: u64, raw_len: u32) -> [u8; 12] {
         let mut e = [0u8; 12];
         put32(&mut e, 0, lb);
@@ -2716,6 +2828,7 @@ impl ExtFs {
         e
     }
 
+    // [lockless]
     fn index_ent(key: u32, child: u64) -> [u8; 12] {
         let mut e = [0u8; 12];
         put32(&mut e, 0, key);
@@ -2725,6 +2838,7 @@ impl ExtFs {
     }
 
     /// 新しい (空の) ノードブロック
+    // [lockless]
     fn new_node(&self, ino: u32, r: &mut Raw, depth: u16) -> Result<(u64, Vec<u8>), i64> {
         let b = self.alloc_block(self.group_start(self.group_of(ino)))?;
         r.add_blocks512((self.bsize / 512) as i64, self.bsize);
@@ -2735,6 +2849,7 @@ impl ExtFs {
         Ok((b, d))
     }
 
+    // [lockless]
     fn write_node(&self, ino: u32, generation: u32, b: u64, node: &[u8]) -> Result<(), i64> {
         self.modify_block(b, |d| {
             d[..node.len()].copy_from_slice(node);
@@ -2743,6 +2858,7 @@ impl ExtFs {
     }
 
     /// node に ent を入れる。あふれたら半分を新しいブロックへ分けて (キー, ブロック) を返す
+    // [lockless]
     fn put_or_split(&self, ino: u32, r: &mut Raw, node: &mut [u8], ent: &[u8; 12]) -> Result<Option<(u32, u64)>, i64> {
         if ExtFs::node_put(node, ent) {
             return Ok(None);
@@ -2768,6 +2884,7 @@ impl ExtFs {
 
     /// node (深さ depth) の下に lb → pb (raw は長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの。その範囲はまだ
     /// どこにもないこと) を入れる。node が分かれたら (キー, 新しいブロック)
+    // [lockless]
     fn insert_rec(&self, ino: u32, r: &mut Raw, node: &mut [u8], lb: u32, pb: u64, raw: u32) -> Result<Option<(u32, u64)>, i64> {
         if u16_at(node, 0) != EXT_MAGIC {
             return Err(-EIO);
@@ -2794,12 +2911,14 @@ impl ExtFs {
     }
 
     /// lb → pb を extents に足す
+    // [lockless]
     fn ext_insert(&self, ino: u32, r: &mut Raw, lb: u32, pb: u64) -> Result<(), i64> {
         self.ext_insert_run(ino, r, lb, pb, 1)
     }
 
     /// lb → pb から raw (長さ。未初期化なら EXT_INIT_MAX_LEN を足したもの) を extents に足す。根があふれたら中身を
     /// 新しいブロックへ下ろして 1 段深くする
+    // [lockless]
     fn ext_insert_run(&self, ino: u32, r: &mut Raw, lb: u32, pb: u64, raw: u32) -> Result<(), i64> {
         if self.ext_extend_leaf(ino, r, lb, pb, raw)? {
             return Ok(());
@@ -2830,6 +2949,7 @@ impl ExtFs {
     /// かえて true。チェックサムは写すときに (Cache::lazy_csum)。前は insert_rec が葉の 4 KiB を写して書きもどし、
     /// そのたびに crc32c を計算したので、葉のあるファイルの書き足しが 1 回 15 µs 長かった。索引のキーを変えるもの
     /// (いちばん左より前) や、のばせないものは false (ふつうの道で)
+    // [lockless]
     fn ext_extend_leaf(&self, ino: u32, r: &Raw, lb: u32, pb: u64, raw: u32) -> Result<bool, i64> {
         let root = &r.0[40..100];
         if u16_at(root, 0) != EXT_MAGIC || u16_at(root, 6) == 0 {
@@ -2860,6 +2980,7 @@ impl ExtFs {
     }
 
     /// 葉/索引のノードを keep に合わせて切る。空になったら true
+    // [lockless]
     fn ext_trunc_node(&self, ino: u32, generation: u32, r: &mut Raw, node: &mut Vec<u8>, keep: u64) -> Result<bool, i64> {
         let n = u16_at(node, 2) as usize;
         let depth = u16_at(node, 6);
@@ -2910,6 +3031,7 @@ impl ExtFs {
     /// 2 つに分かれる: ノードに入りきらなければ、いちばん後ろの extent を again へ (論理ブロック, 物理ブロック, raw の
     /// 長さ) 出して、あとで入れなおす。索引のキーは子の最初に合わせる (e2fsck が見る)。空になったら true
     #[allow(clippy::too_many_arguments)]
+    // [lockless]
     fn ext_remove_node(&self, ino: u32, generation: u32, r: &mut Raw, node: &mut [u8], from: u64, to: u64, free: bool, again: &mut Vec<(u32, u64, u32)>) -> Result<bool, i64> {
         if u16_at(node, 0) != EXT_MAGIC {
             return Err(-EIO);
@@ -2980,6 +3102,7 @@ impl ExtFs {
     }
 
     /// 論理ブロック [from, to) を extent の木から外す (free ならブロックも返す)
+    // [lockless]
     fn ext_remove(&self, ino: u32, r: &mut Raw, from: u64, to: u64, free: bool) -> Result<(), i64> {
         let generation = r.gen_no();
         let mut root = r.0[40..100].to_vec();
@@ -2997,6 +3120,7 @@ impl ExtFs {
 
     /// 未初期化のブロック lb (場所 pb) を初期化ずみにする (中身は 0): そこへ書くとき。Linux の
     /// ext4_ext_convert_to_initialized と同じく、未初期化の extent は前・このブロック・後ろに分かれる
+    // [lockless]
     fn ext_convert(&self, ino: u32, r: &mut Raw, lb: u64, pb: u64) -> Result<(), i64> {
         self.ext_remove(ino, r, lb, lb + 1, false)?;
         if let Err(e) = self.ext_insert_run(ino, r, lb as u32, pb, 1) {
@@ -3089,6 +3213,7 @@ impl ExtFs {
         Ok(())
     }
 
+    // [lockless]
     fn ext_truncate(&self, ino: u32, r: &mut Raw, keep: u64) -> Result<(), i64> {
         let generation = r.gen_no();
         let mut root = r.0[40..100].to_vec();
@@ -3250,6 +3375,7 @@ impl ExtFs {
 
     /// dir (その inode r) の項目を順に (末尾の偽エントリは除く) f(ブロック番号, ブロック, 位置, 同じブロックの前の項目の
     /// 位置) に。f が Some を返したらそこで終わる。dir_entries とちがい、名前の文字列を作らない (作る・消すたびに引く)
+    // [lockless]
     fn scan_dir<T>(&self, ino: u32, mut r: Raw, mut f: impl FnMut(u64, &[u8], usize, Option<usize>) -> Option<T>) -> Result<Option<T>, i64> {
         let nblocks = r.size().div_ceil(self.bsize as u64);
         for fb in 0..nblocks {
@@ -3294,6 +3420,7 @@ impl ExtFs {
     }
 
     /// dir の名前のキャッシュを捨てる
+    // [lockless]
     fn forget_names(&self, dir: u32) {
         let mut n = self.names.borrow_mut();
         self.names_gen.inc();
@@ -3304,6 +3431,7 @@ impl ExtFs {
     /// 捨てる (前はディレクトリのブロックを書きかえるたびに、そのディレクトリの分をみな捨てていた: 作ったり消したりする
     /// たびに、ほかの名前の引きが索引か全部のブロックをなめなおした。Linux の dcache も名前ごと)。探している途中のもの
     /// (find) が古い答えを入れないように、版を進めるのは借りているあいだに
+    // [lockless]
     fn name_gone(&self, dir: u32, name: &str) {
         let mut n = self.names.borrow_mut();
         self.names_gen.inc();
@@ -3345,6 +3473,7 @@ impl ExtFs {
     }
 
     /// ディレクトリのブロック b の中の name の inode
+    // [lockless]
     pub(super) fn block_find(&self, b: u64, name: &[u8]) -> Result<Option<u32>, i64> {
         self.with_block(b, |d| {
             let mut o = 0;
@@ -3363,6 +3492,7 @@ impl ExtFs {
     }
 
     /// ディレクトリのブロックを書きかえる。チェックサムは写すときに (settle_csum)
+    // [lockless]
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
         self.modify_block(b, f)?;
         if self.csum {
@@ -3377,6 +3507,7 @@ impl ExtFs {
     }
 
     /// 空のディレクトリブロック (metadata_csum なら末尾に偽エントリ)
+    // [lockless]
     fn init_dir_block(&self, d: &mut [u8]) {
         d.fill(0);
         let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
@@ -3403,6 +3534,7 @@ impl ExtFs {
     /// 作るところ (create_node) が、名前を足す前に 1 度だけなめる (Linux の ext4_add_entry がすき間を探すのと同じ 1 回):
     /// name がもうあれば EEXIST、なければ入るすき間 (ブロック, 位置, rec_len, 使っている長さ)。入るところがなければ None
     /// (add_entry_in がブロックを足す)。索引つきなら dx_find で確かめるだけ (すき間は dx_add_entry が葉で探す)
+    // [lockless]
     fn new_slot(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<Slot>, i64> {
         // 索引つきなら、ハッシュの入る葉のすき間 (なければ None: add_entry_in が葉を分ける)
         if r.flags() & INDEX_FL != 0 {
@@ -3414,6 +3546,7 @@ impl ExtFs {
         }
         let need = rec_len_for(name.len());
         let mut fit = None;
+        // lockless-ok: r は inode のバイトの写し (Rc ではない)
         let dup = self.scan_dir(dir, r.clone(), |b, d, o, _| {
             let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
             if i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes() {
@@ -3429,6 +3562,7 @@ impl ExtFs {
     }
 
     /// dir (inode r) に name を足す。slot は new_slot で見つけたすき間 (Some(None) はすき間がない)。None ならここで探す
+    // [lockless]
     fn add_entry_in(&self, dir: u32, mut r: Raw, name: &str, ino: u32, mode: u32, slot: Option<Option<Slot>>) -> Result<(), i64> {
         if name.len() > 255 {
             return Err(-ENAMETOOLONG);
@@ -3450,6 +3584,7 @@ impl ExtFs {
         // 既存のすき間を探す
         let fit = match slot {
             Some(s) => s,
+            // lockless-ok: r は inode のバイトの写し (Rc ではない)
             None => self.scan_dir(dir, r.clone(), |b, d, o, _| {
                 let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
                 let used = if i == 0 { 0 } else { rec_len_for(nl.min(rl - 8)) };
@@ -3525,6 +3660,7 @@ impl ExtFs {
 
     /// ディレクトリ dir (inode r) の name の項目: (inode, 場所)。消すところ (unlink_node、fast_unlink) は、これで引いて
     /// remove_at で消す (前は引くのと消すので 2 度なめていた)。索引つきなら葉を 1 つだけ (決められなければ全部)
+    // [lockless]
     fn entry_at(&self, dir: u32, r: &Raw, name: &str) -> Result<Option<(u32, Entry)>, i64> {
         if r.flags() & INDEX_FL != 0 && name != "." && name != ".." {
             match self.dx_entry_at(dir, name) {
@@ -3532,6 +3668,7 @@ impl ExtFs {
                 res => return res,
             }
         }
+        // lockless-ok: r は inode のバイトの写し (Rc ではない)
         self.scan_dir(dir, r.clone(), |b, d, o, prev| {
             let (i, rl, nl) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize);
             (i != 0 && nl <= rl - 8 && &d[o + 8..o + 8 + nl] == name.as_bytes()).then(|| (i, (b, o, rl, prev.map(|p| (p, u16_at(d, p + 4) as usize)))))
@@ -3539,6 +3676,7 @@ impl ExtFs {
     }
 
     /// entry_at で見つけた項目 (name) を消す (前のものがあれば吸収させる)
+    // [lockless]
     fn remove_at(&self, dir: u32, mut r: Raw, (b, o, rl, prev): Entry, name: &str) -> Result<(), i64> {
         let done = self.modify_dir_block(dir, r.gen_no(), b, |d| match prev {
             // 前のものに吸収させる
@@ -3552,6 +3690,7 @@ impl ExtFs {
     }
 
     /// 中身が変わったので時刻を進める
+    // [lockless]
     fn dir_changed(&self, dir: u32) -> Result<(), i64> {
         let mut r = self.read_inode(dir)?;
         r.touch();
@@ -3576,6 +3715,7 @@ impl ExtFs {
     }
 
     /// リンクが 0 になった inode を片付ける
+    // [lockless]
     fn release(&self, ino: u32, r: &mut Raw) -> Result<(), i64> {
         // ブロックを放す: 眠って待っている読みはやりなおす
         self.wgen.inc();
@@ -3590,6 +3730,7 @@ impl ExtFs {
     }
 
     /// 作るものの inode の中身 (create_node と fast_create): mode (種類のビットこみ)、持ち主 (pr は親)、時刻、generation
+    // [lockless]
     fn new_raw(&self, mode: u32, pr: &Raw) -> Raw {
         let mut r = Raw(vec![0; self.inode_size]);
         put16(&mut r.0, 0, mode as u16);
@@ -3607,6 +3748,7 @@ impl ExtFs {
 
     /// maybe_flush が書き出すころか。大きなロックなしの作る・消すは書き出さない (ディスクを待つのは大きなロックの中の仕事):
     /// そうなら、ふつうの道に任せる (そちらが書き出す)
+    // [lockless]
     fn flush_due(&self) -> bool {
         let data_limit = (cache_limit(self.bsize) / 4).max(512);
         let due = |j: &Option<jbd2::Journal>, c: &Cache| {
@@ -3627,6 +3769,7 @@ impl ExtFs {
 
     /// 大きなロックなしの書きかえ (fast_create、fast_unlink) の中: write_op と同じく、眠って待っている読みに知らせ、
     /// この中の読みは眠らせない (noio なので、キャッシュになければ EAGAIN)。書き出しはしない
+    // [lockless]
     fn fast_write<T>(&self, f: impl FnOnce() -> T) -> T {
         self.wgen.inc();
         self.writing.inc();
@@ -3642,6 +3785,7 @@ impl ExtFs {
     /// 呼んだ人が書けて通れる)、どれかがだめなら何も変えずに None (ふつうの道へ。しくじりのわけもそちらで)。
     /// 答えは (inode, その stat, statc の inode の版)。stat と版は、inode を書いてから名前を足す前に (まだだれも引けず、
     /// 書けないあいだに) 取る: statc::learn_new が、ext4 のロックをひとりで取って meta を引かずにすむように
+    // [lockless]
     pub fn fast_create(self: &Rc<Self>, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(InodeRef, crate::file::Stat, u64)> {
         if self.ro || name.len() > 255 || name.is_empty() || name == "." || name == ".." || self.flush_due() {
             return None;
@@ -3702,6 +3846,7 @@ impl ExtFs {
     /// ふつうの道 (unlink_node) と同じ書きかたで、同じ答えになるときだけ (fast_create と同じく、書きかえる前にみな確かめる)。
     /// だれも使っていない (開いている fd、パスの覚え、棚、mmap のどれも ExtInode を持っていない) ものだけ: 使っているものは
     /// ふつうの道が、パスの覚えを捨ててから (forget_path) 消す
+    // [lockless]
     pub fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink {
         if self.ro || name.is_empty() || name == "." || name == ".." || self.flush_due() {
             return FastUnlink::No;
@@ -3766,11 +3911,13 @@ impl ExtFs {
     }
 
     /// ino の meta() の覚え (metas。inode を書くたびに入れかわる) があればそれ。ext4 のロックの中で (いっしょにでもよい)
+    // [lockless]
     pub fn cached_meta(&self, ino: u32) -> Option<Meta> {
         self.metas.borrow().get(&ino).copied()
     }
 
     /// ino の Meta: meta() の覚え (metas) にあればそれ (inode を書くたびに入れかわる)、なければ inode から (覚えには入れない)
+    // [lockless]
     fn meta_now(&self, ino: u32) -> Option<Meta> {
         let cached = self.metas.borrow().get(&ino).copied();
         cached.or_else(|| self.read_inode(ino).ok().map(|r| meta_of(ino, &r, self.bsize)))
@@ -3778,6 +3925,7 @@ impl ExtFs {
 
     /// ディレクトリ dir の名前 name が ino をさしていれば Some (名前の覚えになければ、ディレクトリのブロックから。覚えの
     /// 帳簿のロックは、ブロックを読む前に放す)。ディレクトリのロックと noio の中で
+    // [lockless]
     fn names_ino(&self, dir: u32, name: &str, ino: u32) -> Option<()> {
         let cached = self.names.borrow().get(dir, name);
         let child = match cached {
@@ -3790,6 +3938,7 @@ impl ExtFs {
     /// 大きなロックなしの stat の、表の stat が古いもの (inode を書いたあと: fastdir::fresh_stat): ディレクトリ dir の名前
     /// name がいまも ino をさしていれば、いまの Meta (meta() が答えるものと同じ覚え)。fast_open と同じく、ディレクトリの
     /// ロックの中で引くので、消すものとすれちがわない (消えて別のファイルに使われた inode の stat は答えない)
+    // [lockless]
     pub fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<Meta> {
         let _d = dir_lock(dir);
         crate::proc::noio(|| {
@@ -3805,6 +3954,7 @@ impl ExtFs {
     /// Some(None)、あれば Some((inode の番号, いまの Meta, Meta を読む前に取った statc の inode の版))。名前の覚えになければ
     /// ディレクトリのブロックから。読むブロックがみなキャッシュにあるときだけ。ディレクトリのロックの中で引くので、作る・
     /// 消すものとすれちがわない (ふつうの道で作る・消す・名前を変えるものは、ext4 のロックをひとりで持つ)
+    // [lockless]
     pub fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, Meta, u64)>> {
         let _d = dir_lock(dir);
         crate::proc::noio(|| {
@@ -3829,6 +3979,7 @@ impl ExtFs {
     /// 答える)。読むブロックがみなキャッシュにあるときだけ。
     /// ディレクトリのロックの中で引いて数えるので、消すものとすれちがわない (fast_unlink は同じロックの中で、だれも使って
     /// いないことを確かめてから消す。ふつうの道の unlink と rename は、ひとりで持つ ext4 のロックの中)
+    // [lockless]
     pub fn fast_open(self: &Rc<Self>, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
         let write = perm & crate::cred::W != 0;
         if write && self.ro {
@@ -3858,24 +4009,31 @@ pub use crate::fastdir::FastUnlink;
 
 /// ロックなしの作る・消す・開く・stat (fastdir.rs) の相手 (ルートの ext4)
 impl crate::fastdir::FastFs for Rc<ExtFs> {
+    // [lockless]
     fn fs_id(&self) -> usize {
         ExtFs::fs_id(self)
     }
+    // [lockless]
     fn fast_create(&self, dir: u32, name: &str, mode: u32, c: &crate::cred::Cred) -> Option<(InodeRef, crate::file::Stat, u64)> {
         ExtFs::fast_create(self, dir, name, mode, c)
     }
+    // [lockless]
     fn fast_unlink(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> FastUnlink {
         ExtFs::fast_unlink(self, dir, name, c)
     }
+    // [lockless]
     fn cached_meta(&self, ino: u32) -> Option<Meta> {
         ExtFs::cached_meta(self, ino)
     }
+    // [lockless]
     fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<Meta> {
         ExtFs::fast_meta(self, dir, name, ino)
     }
+    // [lockless]
     fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, Meta, u64)>> {
         ExtFs::fast_lookup(self, dir, name, c)
     }
+    // [lockless]
     fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
         ExtFs::fast_open(self, dir, name, ino, perm, c)
     }
@@ -3884,6 +4042,7 @@ impl crate::fastdir::FastFs for Rc<ExtFs> {
 impl ExtFs {
     /// release (消したファイルの後片づけ) が読むブロックがみなキャッシュにあるか: inode のビットマップと、中身のブロックの
     /// ビットマップ。中身は extents の根 (inode の中) にあるものだけ (索引のある木や、ext2 の間接ブロックはふつうの道へ)
+    // [lockless]
     fn release_cached(&self, ino: u32, r: &Raw) -> bool {
         if !self.cached(self.inode_bitmap(self.group_of(ino))) {
             return false;
@@ -3999,14 +4158,18 @@ impl ExtInode {
 
 impl ExtInode {
     /// 作るたびに数え、Drop で減らす
+    // [lockless]
     fn make(fs: &Rc<ExtFs>, ino: u32) -> InodeRef {
+        // lockless-ok: 新しい Rc (まだだれも持っていない)
         Rc::new(ExtInode::counted(fs, ino))
     }
 
+    // [lockless]
     fn counted(fs: &Rc<ExtFs>, ino: u32) -> ExtInode {
         // Rc<ExtFs> の数も帳簿の中で (いっしょに持つものも数を変える: fast_create と ExtInode の Drop)
         let _b = book();
         *fs.users.borrow_mut().entry(ino).or_insert(0) += 1;
+        // lockless-ok: Rc<ExtFs> の数を変えるのは、みな帳簿 (book) の中か ext4 のロックをひとりで持って (ExtInode の Drop)
         ExtInode { fs: ManuallyDrop::new(fs.clone()), ino, meta: Cell::new(None) }
     }
 
@@ -4410,6 +4573,7 @@ impl Inode for ExtInode {
         }
     }
 
+    // [lockless]
     fn fast_stat(&self) -> bool {
         true
     }
@@ -4418,6 +4582,7 @@ impl Inode for ExtInode {
         true
     }
 
+    // [lockless]
     fn page_cacheable(&self) -> bool {
         true
     }

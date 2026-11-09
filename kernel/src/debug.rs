@@ -34,6 +34,7 @@ pub trait Tracer: Sync {
     fn sys_enter(&self, _nr: u64, _a0: u64) {}
     fn sys_exit(&self, _nr: u64, _r: i64) {}
     /// 大きなロックなしの道 (syscall::fast) で終わったもの: 入りと出をいっしょに
+    // [lockless]
     fn sys_fast(&self, _nr: u64, _a0: u64, _r: i64) {}
     /// この CPU が tid を走らせる
     fn switch(&self, _tid: u32, _comm: &[u8; 16]) {}
@@ -51,6 +52,7 @@ pub trait Tracer: Sync {
     fn strace(&self, _nr: u64, _a: &[u64], _r: Result<i64, i64>) {}
     /// /proc/sysstat: COUNT_ON のときだけ (大きなロックの道と、近道で終わったもの)
     fn count(&self, _nr: u64) {}
+    // [lockless]
     fn count_fast(&self, _nr: u64) {}
 }
 
@@ -81,6 +83,7 @@ pub fn trace_sys_exit(nr: u64, r: i64) {
 }
 
 #[inline]
+// [lockless]
 pub fn trace_sys_fast(nr: u64, a0: u64, r: i64) {
     if TRACE_ON.load(Relaxed) {
         TRACER.val().sys_fast(nr, a0, r);
@@ -157,6 +160,7 @@ pub fn count_sys(nr: u64) {
 }
 
 #[inline]
+// [lockless]
 pub fn count_fast(nr: u64) {
     if COUNT_ON.load(Relaxed) {
         TRACER.val().count_fast(nr);
@@ -297,6 +301,7 @@ pub fn should_failslab(fallible: bool) -> bool {
 }
 
 /// 物理ページの alloc をしくじらせるか (Linux の should_fail_alloc_page)
+// [lockless]
 pub fn should_fail_alloc_page() -> bool {
     let hit = FAIL_ON.load(Relaxed) && FAULT.val().page();
     if hit {

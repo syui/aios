@@ -131,6 +131,7 @@ fn my_slot() -> usize {
 /// 「ここにはだれもいない」と知るため。待つ側は数を増やしてから値を読む。ハッシュがぶつかれば、ふつうの道へ行くだけ
 static SLEEPERS: [AtomicUsize; 1024] = [const { AtomicUsize::new(0) }; 1024];
 
+// [lockless]
 pub fn sleepers(mm: usize, uaddr: usize) -> &'static AtomicUsize {
     let h = mm ^ (uaddr << 1) ^ 1;
     &SLEEPERS[(h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize]

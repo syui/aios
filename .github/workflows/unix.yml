@@ -46,6 +46,10 @@ jobs:
         # カーネルの地図 (kernel/kernel.json: ファイルごとの core と extra、quirk の一覧) とソースがそろっているか
         run: python3 test/kernel-json.py
 
+      - name: lockless
+        # 大きなロックなしで動く道 ([lockless] の印) が Rc の数を変えず、印のない関数を呼ばないか
+        run: python3 test/lockless.py
+
       - name: .aios.json
         # リポジトリの見取り図 (.aios.json) が本物 (PKGBUILD の版と組、base の入れるプラグイン) とそろっているか
         run: python3 test/aios-json.py

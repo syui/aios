@@ -54,6 +54,7 @@ impl<T> Early<T> {
     }
 
     #[inline]
+    // [lockless]
     pub fn get(&self) -> &T {
         unsafe { &*self.0.get() }
     }
@@ -77,6 +78,7 @@ impl<T> Early<T> {
 
 impl<T: Copy> Early<T> {
     #[inline]
+    // [lockless]
     pub fn val(&self) -> T {
         *self.get()
     }
@@ -101,12 +103,14 @@ impl<T> PerCpu<T> {
     /// この CPU の分
     #[inline]
     #[allow(clippy::mut_from_ref)]
+    // [lockless]
     pub fn get(&self) -> &mut T {
         unsafe { &mut *self.ptr() }
     }
 
     /// この CPU の分の番地 (切りかえのアセンブリに渡すもの)
     #[inline]
+    // [lockless]
     pub fn ptr(&self) -> *mut T {
         #[cfg(debug_assertions)]
         {
@@ -134,6 +138,7 @@ impl<T> Raw<T> {
     }
 
     #[inline]
+    // [lockless]
     pub const fn ptr(&self) -> *mut T {
         self.0.get()
     }
@@ -156,6 +161,7 @@ impl<T> Once<T> {
 
     /// 入っていれば中身
     #[inline]
+    // [lockless]
     pub fn get(&self) -> Option<&T> {
         if self.state.load(Ordering::Acquire) == 2 { Some(unsafe { (*self.v.get()).assume_init_ref() }) } else { None }
     }

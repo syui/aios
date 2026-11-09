@@ -5,11 +5,13 @@
 /// "expand 32-byte k"
 const CONST: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
+// [lockless]
 fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 /// ChaCha20 の状態 (16 語): 定数 4 語、鍵 8 語、数え (12 語め)、nonce 3 語
+// [lockless]
 pub fn chacha_state(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u32; 16] {
     let mut s = [0u32; 16];
     s[..4].copy_from_slice(&CONST);
@@ -23,6 +25,7 @@ pub fn chacha_state(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u32; 16]
     s
 }
 
+// [lockless]
 fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     x[a] = x[a].wrapping_add(x[b]);
     x[d] = (x[d] ^ x[a]).rotate_left(16);
@@ -35,6 +38,7 @@ fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 }
 
 /// ChaCha20 の 1 ブロック (64 バイト) を out に。数え (12 語め) を 1 進める (13 語めへのくり上げは呼ぶ側)
+// [lockless]
 pub fn chacha20_block(s: &mut [u32; 16], out: &mut [u8; 64]) {
     let mut x = *s;
     for _ in 0..10 {
@@ -70,6 +74,7 @@ const PERM: [[usize; 16]; 10] = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
 ];
 
+// [lockless]
 fn g(v: &mut [u32; 16], (a, b, c, d): (usize, usize, usize, usize), x: u32, y: u32) {
     v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
     v[d] = (v[d] ^ v[a]).rotate_right(16);
@@ -105,6 +110,7 @@ impl Blake2s {
         Blake2s { h, t: 0, buf, n: if key.is_empty() { 0 } else { 64 } }
     }
 
+    // [lockless]
     pub fn update(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
             if self.n == 64 {
@@ -119,6 +125,7 @@ impl Blake2s {
         }
     }
 
+    // [lockless]
     pub fn finish(mut self) -> [u8; 32] {
         self.t += self.n as u64;
         self.buf[self.n..].fill(0);
@@ -130,6 +137,7 @@ impl Blake2s {
         out
     }
 
+    // [lockless]
     fn compress(&mut self, last: bool) {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
@@ -169,6 +177,7 @@ impl Drop for Blake2s {
 }
 
 /// 鍵つきの BLAKE2s を 1 度で
+// [lockless]
 pub fn blake2s(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     let mut h = Blake2s::new(key);
     h.update(data);
@@ -176,6 +185,7 @@ pub fn blake2s(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 }
 
 /// 0 で消す (使い終わった鍵など。最適化で書くのを省かれないように volatile で)
+// [lockless]
 pub fn wipe(b: &mut [u8]) {
     for x in b.iter_mut() {
         unsafe { core::ptr::write_volatile(x, 0) };
@@ -183,6 +193,7 @@ pub fn wipe(b: &mut [u8]) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+// [lockless]
 pub fn wipe32(b: &mut [u32]) {
     for x in b.iter_mut() {
         unsafe { core::ptr::write_volatile(x, 0) };

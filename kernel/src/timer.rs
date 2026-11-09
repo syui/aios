@@ -8,6 +8,7 @@ pub const HZ: u64 = 100;
 /// 前の割り込みのときの tick (cpu0 だけが使う)
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+// [lockless]
 pub fn freq() -> u64 {
     let f: u64;
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f) };
@@ -45,6 +46,7 @@ static NS_PER_TICK: AtomicU64 = AtomicU64::new(0);
 
 /// 起動してからの時間 (ns)。割りきれる周波数なら掛け算 1 つ (答えは割り算と同じ): 大きなロックの数えで、システムコールの
 /// たびに 2 度読む (TCG では cntfrq の読みと 3 つの割り算が重い)
+// [lockless]
 pub fn uptime_ns() -> u64 {
     let cnt: u64;
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
@@ -73,16 +75,19 @@ static COARSE: AtomicU64 = AtomicU64::new(0);
 static FLOOR: AtomicU64 = AtomicU64::new(0);
 
 /// tick の時刻 (起動からの ns)。時計を読まない。tick 1 つ (10 ms) ほど遅れる
+// [lockless]
 pub fn coarse_uptime_ns() -> u64 {
     COARSE.load(Ordering::Relaxed)
 }
 
 /// 粗い時計の UNIX ns: ファイルの時刻に (細かい時計でつけたものより前にはならない)
+// [lockless]
 pub fn coarse_epoch_ns() -> u64 {
     (BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + coarse_uptime_ns()).max(FLOOR.load(Ordering::Relaxed))
 }
 
 /// 粗い時計の tick (ticks() と同じ数え方。時計を読まない)
+// [lockless]
 pub fn coarse_ticks() -> u64 {
     coarse_uptime_ns() / (1_000_000_000 / HZ)
 }
@@ -99,6 +104,7 @@ pub fn boot_epoch() -> u64 {
     BOOT_EPOCH.load(Ordering::Relaxed)
 }
 
+// [lockless]
 pub fn epoch_ns() -> u64 {
     BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + uptime_ns()
 }

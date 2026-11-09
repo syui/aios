@@ -79,20 +79,24 @@ fn mnt_word(m: Option<(u64, bool)>) -> u64 {
 }
 
 /// st_dev の形 (encode_dev) とカーネルの形 (major << 20 | minor) を行き来する
+// [lockless]
 fn kdev(d: u64) -> u64 {
     let (ma, mi) = crate::vfs::decode_dev(d);
     ((ma as u64) << 20 | mi as u64) & 0xffff_ffff
 }
 
+// [lockless]
 fn udev(k: u64) -> u64 {
     crate::vfs::encode_dev(((k >> 20) as u32, (k & 0xfffff) as u32))
 }
 
 /// Stat を表の 8 語に
+// [lockless]
 fn stat_words(st: &Stat) -> [u64; 8] {
     [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, kdev(st.rdev) << 32 | kdev(st.dev), st.size, st.blocks, st.mtime, st.ctime]
 }
 
+// [lockless]
 fn words_stat(w: &[u64]) -> Stat {
     Stat { dev: udev(w[3] & 0xffff_ffff), ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: udev(w[3] >> 32), size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] }
 }
@@ -115,26 +119,31 @@ pub static MISSES: AtomicU64 = AtomicU64::new(0);
 
 const _: () = assert!(WORDS == 64);
 
+// [lockless]
 fn box_of(id: (usize, u64)) -> usize {
     ((id.1 ^ (id.0 as u64).rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize % BOXES
 }
 
 /// (dir, name) の箱 (name は vfs::name_hash)
+// [lockless]
 pub fn name_box(dir: (usize, u64), name: u64) -> usize {
     ((dir.1 ^ (dir.0 as u64).rotate_left(40) ^ name.rotate_left(21)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize % NAME_BOXES
 }
 
 /// ディレクトリ dir の中の名前 name (vfs::name_hash) が変わった (vfs::name_changed)
+// [lockless]
 pub fn name_bump(dir: (usize, u64), name: u64) {
     NAMES[name_box(dir, name)].fetch_add(1, Release);
 }
 
 /// inode id の中身 (大きさ、時刻、許可、リンクの数 ...) が変わった (extfs の write_inode)
+// [lockless]
 pub fn ino_bump(id: (usize, u64)) {
     INOS[box_of(id)].fetch_add(1, Release);
 }
 
 /// id の inode の箱の版 (inode を書くたびに増える: ino_bump)。vm::write_fast の許しがまだ新しいか
+// [lockless]
 pub fn ino_ver(id: (usize, u64)) -> u64 {
     INOS[box_of(id)].load(Acquire)
 }
@@ -151,6 +160,7 @@ pub fn epoch_bump() {
 
 /// cwd と path をつないで畳む (先頭の / なし、vfs の normal_into と同じ形)。.. のあるもの、. だけ、/ か /. で終わるもの、
 /// 長すぎるものは None (ふつうの道へ)
+// [lockless]
 fn normalize(cwd: &[u8], path: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
     if path == b"." || (path.len() > 1 && (path.ends_with(b"/") || path.ends_with(b"/."))) {
         return None;
@@ -180,6 +190,7 @@ fn normalize(cwd: &[u8], path: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
     Some(n)
 }
 
+// [lockless]
 fn hash(p: &[u8], follow: bool) -> usize {
     let h = p.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ follow as u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
     // 終わりでよく混ぜる (FNV-1a のままビットを取ると、最後の 1 文字だけちがうパス: w0 w1 w2、file1 file2 ... がみな同じ
@@ -210,6 +221,7 @@ fn slot_for(set: usize, key: &[u8], follow: bool) -> &'static [AtomicU64; 64] {
     &TABLE[set * WAYS + w].0
 }
 
+// [lockless]
 fn words(p: &[u8]) -> impl Iterator<Item = u64> + '_ {
     p.chunks(8).map(|c| {
         let mut w = [0u8; 8];
@@ -220,6 +232,7 @@ fn words(p: &[u8]) -> impl Iterator<Item = u64> + '_ {
 
 /// このプロセスで使えるか (はじめのマウントの namespace、chroot なし、fd の表を自分だけで)。cwd を返す。
 /// ユーザーの namespace の中も使わない (struct stat の uid と gid は、中の番号に読みかえて書くので)
+// [lockless]
 fn usable(p: &Proc) -> Option<&str> {
     if p.cred.ns.mnt.is_some() || p.cred.ns.user.is_some() {
         return None;
@@ -340,6 +353,7 @@ pub fn learn_new(parent: &[u8], name: &str, dir: (usize, u64), before: u64, id: 
 /// ((dir, name) の箱と、その版 want) を足したもの。箱がいまも want で、全体の版がいまも epoch (引く前に読んだもの) の
 /// ときだけ。found は (inode, stat, inode の版)、None なら「ない」。親の答えがいまも正しければ、親がリンクを
 /// たどらずに着いたものか (書けなくても)。でなければ None
+// [lockless]
 fn learn_under(parent: &[u8], name: &str, follow: bool, dir: (usize, u64), want: u64, epoch: u64, found: Option<((usize, u64), Stat, u64)>) -> Option<bool> {
     let len = parent.len() + (!parent.is_empty()) as usize + name.len();
     if len > PATH {
@@ -404,6 +418,7 @@ fn learn_under(parent: &[u8], name: &str, follow: bool, dir: (usize, u64), want:
 /// lookup_slow が、親の i_rwsem をいっしょに持って ->lookup を呼び、dentry を作るのと同じ: fastdir::lookup_name)。
 /// ないなら「ない」、あればその stat。リンクをたどるもの、マウント先 (かぶせたものの根がほんとうの答え)、
 /// 引けないもの (名前が長すぎる、読むブロックがキャッシュにない、許しがない ...) は None (ふつうの道へ)
+// [lockless]
 fn learn_lookup(p: &Proc, key: &[u8], follow: bool, base: Option<(usize, u64)>) -> Option<Answer> {
     let (parent, name) = match key.iter().rposition(|&b| b == b'/') {
         Some(c) => (&key[..c], &key[c + 1..]),
@@ -433,6 +448,7 @@ fn learn_lookup(p: &Proc, key: &[u8], follow: bool, base: Option<(usize, u64)>) 
 }
 
 /// ユーザーの path (NUL で終わる文字) を buf に写す (写っているページだけ。なければ None)
+// [lockless]
 pub(crate) fn user_path(p: &Proc, va: usize, buf: &mut [u8; 256]) -> Option<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -467,6 +483,7 @@ const STATX: u64 = 291;
 const ENOENT: i64 = 2;
 
 /// syscall::fast の newfstatat: 表にあって、いまも正しければ答える (0 か -ENOENT)。でなければ None (ふつうの道へ)
+// [lockless]
 pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Option<i64> {
     let mut norm = [0u8; PATH];
     let r = if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
@@ -483,6 +500,7 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
 
 /// 「ない」と答える: ふつうの道と同じわけを /proc/ai/why に (looked なら、いまディレクトリで引いたもの: ふつうの道が
 /// たどって見つけなかったときと同じ。でなければ覚えにあった「ない」)
+// [lockless]
 pub fn missing(p: &Proc, nr: u64, key: &[u8], looked: bool) -> i64 {
     let key = core::str::from_utf8(key).unwrap_or("?");
     match key.rfind('/') {
@@ -495,6 +513,7 @@ pub fn missing(p: &Proc, nr: u64, key: &[u8], looked: bool) -> i64 {
 
 /// syscall::fast の statx。ふつうの道 (sysfile::statx) が EINVAL にするもの (mask の予約のビット、SYNC の 2 つとも、
 /// 知らないフラグ) と AT_EMPTY_PATH、NULL のパスは、ふつうの道へ
+// [lockless]
 pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> Option<i64> {
     const AT_STATX_SYNC_TYPE: u64 = 0x6000;
     let r = if mask & 0x8000_0000 != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE || flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 || pathp == 0 {
@@ -525,6 +544,7 @@ pub fn open_now(p: &Proc, key: &[u8], st: Stat, base: Option<(usize, u64)>) -> O
 /// をさすことを ext4 が親のディレクトリのロックの中で確かめて読む (fastdir::fresh_stat)。どちらも表の stat を書きなおす
 /// (読む前に取った inode の版で: そのあとに書かれれば、次はまた古い)。base は開いているディレクトリから引いたときの
 /// (そのパスの長さ, inode の番号: dir_base)。読めなければ None (ふつうの道へ)
+// [lockless]
 fn now_stat(p: &Proc, key: &[u8], follow: bool, st: Stat, fresh: bool, base: Option<(usize, u64)>) -> Option<Stat> {
     if fresh {
         return Some(st);
@@ -554,6 +574,7 @@ fn now_stat(p: &Proc, key: &[u8], follow: bool, st: Stat, fresh: bool, base: Opt
 
 /// 表の場所 s が seq のときから書きなおされておらず、全体の版と、通ったところ ((ディレクトリ, 名前) の箱) の版が
 /// いまも同じか (now_stat が inode の覚えを読んだあとに)
+// [lockless]
 fn trail_ok(s: &[AtomicU64; 64], seq: u64) -> bool {
     core::sync::atomic::fence(Acquire);
     let ndirs = ((s[SHAPE].load(Relaxed) >> 24 & 0xff) as usize).min(DIRS_MAX);
@@ -567,6 +588,7 @@ fn trail_ok(s: &[AtomicU64; 64], seq: u64) -> bool {
 
 /// key の答えの stat を、いまの inode のもの (st と、読む前に取った inode の箱 ib の版 ver) に書きなおす (ほかの印は
 /// そのまま)。書いている人がいれば書かない。そのあいだに場所がほかの鍵に使われていれば何もしない
+// [lockless]
 fn refresh(key: &[u8], follow: bool, ib: usize, ver: u64, st: &Stat) {
     let Some(s) = slot_of(hash(key, follow), key, follow) else { return };
     let seq = s[SEQ].load(Relaxed);
@@ -587,6 +609,7 @@ fn refresh(key: &[u8], follow: bool, ib: usize, ver: u64, st: &Stat) {
 
 /// 表で引いたものの親 (畳んだパス parent) のディレクトリの inode の番号: 開いているディレクトリから引いたもので、その
 /// ディレクトリが親なら、もう確かめた番号 (base)。ほかは表で (dir_of)
+// [lockless]
 pub fn parent_dir(p: &Proc, parent: &[u8], base: Option<(usize, u64)>) -> Option<u64> {
     match base {
         Some((len, ino)) if len == parent.len() => Some(ino),
@@ -637,10 +660,12 @@ pub fn seen_take(tid: u32, pathp: usize) -> bool {
 }
 
 /// 全体の版 (マウントやルートが変わると増える: epoch_bump)。file の棚 (Shelf) が、しまったときの版とくらべる
+// [lockless]
 pub fn epoch() -> u64 {
     EPOCH.load(Acquire)
 }
 
+// [lockless]
 fn count(r: Option<i64>) -> Option<i64> {
     if r.is_some() { &HITS } else { &MISSES }.fetch_add(1, Relaxed);
     r
@@ -648,6 +673,7 @@ fn count(r: Option<i64>) -> Option<i64> {
 
 /// 表から答えを探す: (答え, norm に畳んだパスの長さ, 開いているディレクトリから引いたならそのディレクトリ (dir_base))。
 /// 表にないか、古いか、通れないかもしれなければ None。ino なら inode の中身の版も (でなければ、古いかは答えの fresh に)
+// [lockless]
 fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize, Option<(usize, u64)>)> {
     // しくじらせる決まり (fail.rs) があれば、それを通すためにふつうの道へ
     if crate::debug::FAIL_ON.load(Relaxed) {
@@ -679,6 +705,7 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
 /// 開いているディレクトリ dirfd (fstatat や openat の) の、畳んだパスを out に (その長さと inode の番号): ext4 の
 /// ディレクトリで、そのパスがいまも表でその inode をさすときだけ (開いたあとで名前を変えたり、上にかぶせたりしていれば、ふつうの道が inode からたどる)。
 /// fd の表は自分だけのもの (usable): 見ているあいだにだれも変えない。OpenFile の kind は作ったときのまま
+// [lockless]
 fn dir_base(p: &Proc, dirfd: i64, out: &mut [u8; PATH]) -> Option<(usize, u64)> {
     let t = p.files.as_ref()?.get();
     let fd = t.fds.get(usize::try_from(dirfd).ok()?)?.as_ref()?;
@@ -719,6 +746,7 @@ pub fn dir_lookup(p: &Proc, dirfd: i64, dpath: &[u8], norm: &mut [u8; PATH]) -> 
 /// 大きなロックなしの open (fastdir::fast_open): 表で引いたファイルの親 (畳んだパス key) のディレクトリが、表にあって
 /// いまも正しく、呼んだ人が途中を通れれば、その inode の番号 (許しや、いまもディレクトリかは、呼ぶ側が ext4 のロックの
 /// 中で inode から読む)
+// [lockless]
 pub fn dir_of(p: &Proc, key: &[u8]) -> Option<u64> {
     match check(p, key, true, false)? {
         Answer::Found(st, ..) if st.mode & 0o170000 == 0o040000 => Some(st.ino),
@@ -728,6 +756,7 @@ pub fn dir_of(p: &Proc, key: &[u8]) -> Option<u64> {
 
 /// key (畳んだパス) の答えが表にあって、いまも正しく、呼んだ人が途中を通れれば、その答え。ino なら inode の中身の版も見る
 /// (でなければ、同じかを答えの fresh に)
+// [lockless]
 fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
     let len = key.len();
     let s = slot_of(hash(key, follow), key, follow)?;

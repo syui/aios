@@ -98,6 +98,7 @@ impl Cred {
 
     /// その capability が effective にあるか: ファイルのもの (FS_CAPS) は fs_caps、ほかは euid が 0 (aios では root が
     /// みな持つ)
+    // [lockless]
     fn has_cap(&self, cap: u32) -> bool {
         if FS_CAPS.contains(&cap) { self.fs_caps } else { self.euid == 0 }
     }
@@ -105,6 +106,7 @@ impl Cred {
     /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても LSM (AppArmor のプロファイル
     /// など) が許さなければ持たない (記録する: security::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを:
     /// Linux と同じ順)
+    // [lockless]
     pub fn capable(&self, cap: u32) -> bool {
         self.has_cap(cap) && self.lsm_capable(cap, true)
     }
@@ -115,6 +117,7 @@ impl Cred {
     }
 
     /// commoncap が許したあとの LSM (security_capable: landlock の CAPABILITY_USE、それから AppArmor。CONFIG_LSM の順)
+    // [lockless]
     fn lsm_capable(&self, cap: u32, audit: bool) -> bool {
         crate::security::capable(self, cap, audit)
     }
@@ -122,6 +125,7 @@ impl Cred {
     /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)。Linux の
     /// generic_permission と同じ順: まず mode のビットで、足りなければ root は CAP_DAC_READ_SEARCH (読む、ディレクトリを
     /// たどる) か CAP_DAC_OVERRIDE (実行はどこかに x がなければできない。ディレクトリは別)
+    // [lockless]
     pub fn may(&self, m: &Meta, want: u32, real: bool) -> bool {
         let (uid, gid) = if real { (self.uid, self.gid) } else { (self.fsuid, self.fsgid) };
         let bits = if m.uid == uid {

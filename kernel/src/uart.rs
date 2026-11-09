@@ -71,6 +71,7 @@ pub fn tx_chan() -> usize {
 
 /// 割り込みのうち、大きなロックなしで片づくもの: 送信だけなら輪から次を出して true。
 /// 受信があるか、空くのを待っている write を起こすなら false (intr へ)
+// [lockless]
 pub fn intr_fast() -> bool {
     let mis = mmio::r32(reg(MIS));
     if mis & (INT_RX | INT_RT) != 0 {
@@ -98,6 +99,7 @@ pub fn tx_push(b: &[u8]) {
 static BASE: crate::cell::Early<usize> = crate::cell::Early::new(0);
 static IRQ: crate::cell::Early<u32> = crate::cell::Early::new(33);
 
+// [lockless]
 fn reg(off: usize) -> usize {
     BASE.val() + off
 }

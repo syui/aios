@@ -69,9 +69,11 @@ impl crate::why::Log for Ops {
     fn done(&self, nr: u64, e: i64, a: &[u64]) {
         done(nr, e, a);
     }
+    // [lockless]
     fn fast_missing(&self, p: &crate::proc::Proc, nr: u64, path: &str) {
         fast_missing(p, nr, path);
     }
+    // [lockless]
     fn fast_missing_at(&self, p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
         fast_missing_at(p, nr, dir, name);
     }

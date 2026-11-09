@@ -142,7 +142,9 @@ impl Msg {
     }
 
     /// fd も資格情報もない stream のバイト (fast_rw)。INFLIGHT にさわらない
+    // [lockless]
     fn plain(data: Vec<u8>, sender: &UnixRef, truesize: usize) -> Msg {
+        // lockless-ok: UnixRef は Arc (数は atomic)。fd も cred も持たない
         Msg { id: next_id(), data, used: 0, fds: Vec::new(), cred: None, sender: Some(sender.clone()), truesize, peeked: false, unix: 0 }
     }
 
@@ -342,6 +344,7 @@ fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
 }
 
+// [lockless]
 fn key(u: &UnixRef) -> usize {
     Arc::as_ptr(u) as usize
 }
@@ -350,6 +353,7 @@ fn is(w: &Weak<UnixCell>, u: &UnixRef) -> bool {
     core::ptr::eq(w.as_ptr(), Arc::as_ptr(u))
 }
 
+// [lockless]
 fn same(a: &Option<UnixRef>, b: &UnixRef) -> bool {
     a.as_ref().is_some_and(|x| Arc::ptr_eq(x, b))
 }
@@ -548,6 +552,7 @@ fn aa_may_send(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
 
 /// kmalloc の頭の大きさ h のときの truesize: 中身は 64 にそろえて skb_shared_info (320) を足し、640 までは小さな頭の
 /// 箱、8192 までは 2 のべきの箱、そのうえはページの 2 のべき。それに struct sk_buff (256)
+// [lockless]
 fn head_truesize(h: usize) -> usize {
     let sz = h.div_ceil(64) * 64 + 320;
     let a = if sz <= 640 {
@@ -567,11 +572,13 @@ fn dgram_truesize(len: usize) -> usize {
 }
 
 /// stream の 1 つのメッセージの長さの上限 (sndbuf の半分 - 64、頭 (3776) とページ (32 KiB) まで)
+// [lockless]
 fn stream_chunk(sndbuf: usize, left: usize) -> usize {
     left.min((sndbuf / 2).saturating_sub(64).max(1)).min(3776 + 32768)
 }
 
 /// stream の size バイトのメッセージ: 3776 をこえる分はページ
+// [lockless]
 fn stream_truesize(size: usize) -> usize {
     let data = size.min(size.saturating_sub(3776).div_ceil(4096) * 4096);
     head_truesize(size - data) + data.div_ceil(4096) * 4096
@@ -1786,6 +1793,7 @@ fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
 /// 大きなロックなしの read / write (syscall::fast): つないだ SOCK_STREAM の、fd も資格情報も MSG_OOB もないバイトで、
 /// 眠らずにすむときだけ。ほかは None (ふつうの道へ: 送れる余地がない、読むものが SO_RCVLOWAT より少ない、SO_PASSCRED、
 /// 相手がまだ accept されていない、閉じた、エラーがある、ユーザーのメモリが写っていない ...)。答えはふつうの道と同じ
+// [lockless]
 pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     let r = fast_rw_inner(me, fd, buf, len, write);
@@ -1793,6 +1801,7 @@ pub fn fast_rw(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) ->
     r
 }
 
+// [lockless]
 fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) -> Option<i64> {
     if len == 0 || len > 3776 + 32768 || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -1808,10 +1817,12 @@ fn fast_rw_inner(me: &proc::Proc, fd: u64, buf: usize, len: usize, write: bool) 
 }
 
 /// 起こしを頼むか (眠っている人、poll の人、epoll)
+// [lockless]
 fn waited(s: &Unix) -> bool {
     s.sleepers > 0 || s.watchers > 0 || s.epolled
 }
 
+// [lockless]
 fn fast_send(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64> {
     // 写すのはロックの前に (ページがなければ、何も変えずにふつうの道へ)
     let mut data = crate::heap::try_vec(len, false).ok()?;
@@ -1825,6 +1836,7 @@ fn fast_send(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64
         if s.typ != SOCK_STREAM || s.state != State::Established || s.err != 0 || s.shutdown & SEND != 0 || s.passcred || s.wmem >= s.sndbuf || stream_chunk(s.sndbuf, len) != len {
             return None;
         }
+        // lockless-ok: UnixRef は Arc (数は atomic)
         let peer = s.peer.clone()?;
         let ts = stream_truesize(len);
         s.wmem += ts;
@@ -1860,6 +1872,7 @@ fn fast_send(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64
     Some(len as i64)
 }
 
+// [lockless]
 fn fast_recv(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64> {
     let mut tmp = crate::heap::try_vec(len, false).ok()?;
     let (gone, n) = {

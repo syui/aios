@@ -29,15 +29,18 @@ unsafe extern "C" {
 }
 
 /// RAM の先頭 (物理)
+// [lockless]
 pub fn ram_base() -> usize {
     unsafe { core::ptr::read_volatile(&raw const boot_ram_base) as usize }
 }
 
 /// 物理アドレスを仮想アドレスに (RAM とその前後 1 GiB のデバイス)
+// [lockless]
 pub fn p2v(pa: usize) -> usize {
     pa.wrapping_sub(ram_base()).wrapping_add(KBASE + GIB)
 }
 
+// [lockless]
 pub fn v2p(va: usize) -> usize {
     va.wrapping_sub(KBASE + GIB).wrapping_add(ram_base())
 }
@@ -45,6 +48,7 @@ pub fn v2p(va: usize) -> usize {
 /// RAM の終わり。DTB の /memory から決める (なければ 512 MiB)
 static PHYSTOP: crate::cell::Early<usize> = crate::cell::Early::new(0);
 
+// [lockless]
 pub fn phystop() -> usize {
     match PHYSTOP.val() {
         0 => ram_base() + 512 * 1024 * 1024,
@@ -53,6 +57,7 @@ pub fn phystop() -> usize {
 }
 
 /// 使える RAM の大きさ
+// [lockless]
 pub fn ram_size() -> usize {
     phystop() - ram_base()
 }

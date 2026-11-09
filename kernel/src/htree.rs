@@ -234,12 +234,14 @@ struct Dx {
 }
 
 impl Dx {
+    // [lockless]
     fn limit(&self) -> usize {
         u16_at(&self.data, self.off) as usize
     }
     fn count(&self) -> usize {
         u16_at(&self.data, self.off + 2) as usize
     }
+    // [lockless]
     fn set_count(&mut self, n: usize) {
         put16(&mut self.data, self.off + 2, n as u16);
     }
@@ -248,6 +250,7 @@ impl Dx {
         let o = self.off + i * 8;
         (if i == 0 { 0 } else { u32_at(&self.data, o) }, u32_at(&self.data, o + 4))
     }
+    // [lockless]
     fn set(&mut self, i: usize, hash: u32, blk: u32) {
         let o = self.off + i * 8;
         if i > 0 {
@@ -267,6 +270,7 @@ impl Dx {
         at
     }
     /// at の次に入れる (空きがあること)
+    // [lockless]
     fn insert_after(&mut self, at: usize, hash: u32, blk: u32) {
         let n = self.count();
         for i in (at + 1..n).rev() {
@@ -279,11 +283,13 @@ impl Dx {
 }
 
 impl ExtFs {
+    // [lockless]
     fn dx_limit(&self, off: usize) -> usize {
         (self.bsize - off) / 8 - if self.csum { 1 } else { 0 }
     }
 
     /// 索引のブロックのチェックサム (count / limit の後ろの dx_tail)
+    // [lockless]
     fn dx_write(&self, dir: u32, generation: u32, dx: &mut Dx) -> Result<(), i64> {
         if self.csum {
             let t = dx.off + dx.limit() * 8;
@@ -295,11 +301,13 @@ impl ExtFs {
                 put32(&mut dx.data, t + 4, c);
             }
         }
+        // lockless-ok: ブロックのバイト (Vec<u8>)
         let data = dx.data.clone();
         self.modify_block(dx.pb, |d| d.copy_from_slice(&data))
     }
 
     /// dx_node の空のブロック (偽のエントリ 1 つで、ディレクトリとして読むと空)
+    // [lockless]
     fn dx_new_node(&self, dir: u32, r: &mut Raw) -> Result<(u32, Dx), i64> {
         let lb = (r.size() / self.bsize as u64) as u32;
         let pb = self.map(dir, r, lb as u64, true)?;
@@ -313,6 +321,7 @@ impl ExtFs {
     }
 
     /// 根を読んで、名前のハッシュを求める関数と、根から葉への道を返す
+    // [lockless]
     fn dx_descend(&self, dir: u32, r: &mut Raw, name: &str) -> Result<(Hasher, u32, Vec<(Dx, usize)>), i64> {
         let root_pb = self.map(dir, r, 0, false)?;
         let rdata = self.read_block(root_pb)?;
@@ -388,6 +397,7 @@ impl ExtFs {
 
     /// 名前の項目: (inode, 場所 (葉の物理ブロック, 位置, rec_len, 前の項目)。extfs の entry_at と同じ形: remove_at が消せる)。
     /// Ok(None) はない、Err(EAGAIN) は索引では決められない
+    // [lockless]
     pub(super) fn dx_entry_at(&self, dir: u32, name: &str) -> Result<Option<(u32, Entry)>, i64> {
         let Some((pb, _)) = self.dx_locate(dir, name)? else { return Ok(None) };
         let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
@@ -409,6 +419,7 @@ impl ExtFs {
     }
 
     /// 名前の入っている葉 (物理ブロック) と inode
+    // [lockless]
     fn dx_locate(&self, dir: u32, name: &str) -> Result<Option<(u64, u32)>, i64> {
         let mut r = self.read_inode(dir)?;
         let Ok((_, hash, path)) = self.dx_descend(dir, &mut r, name) else { return Err(-EAGAIN) };
@@ -437,6 +448,7 @@ impl ExtFs {
     /// 索引つきのディレクトリに name を足すすき間 (Linux の ext4_dx_add_entry が葉を分けずに入れるところ: ハッシュの
     /// 入る葉の中)。もうあれば EEXIST、葉にすき間がなければ Ok(None) (分けるのは dx_add_entry)、Err(EAGAIN) は索引では
     /// 決められない。大きなロックなしの create (fast_create) は、すき間があるときだけ 1 つのブロックを書きかえる
+    // [lockless]
     pub(super) fn dx_new_slot(&self, dir: u32, name: &str) -> Result<Option<Slot>, i64> {
         let mut r = self.read_inode(dir)?;
         let Ok((_, hash, path)) = self.dx_descend(dir, &mut r, name) else { return Err(-EAGAIN) };
@@ -484,6 +496,7 @@ impl ExtFs {
 
     /// 1 ブロックのディレクトリがいっぱいになったら、索引つきに変える (Linux の make_indexed_dir と同じ)。
     /// ブロック 0 を根にし、名前はぜんぶ新しいブロック 1 (葉) へ移す。変えたら true
+    // [lockless]
     pub(super) fn make_indexed(&self, dir: u32, r: &mut Raw) -> Result<bool, i64> {
         const COMPAT_DIR_INDEX: u32 = 0x20;
         let (compat, def_hash) = {
@@ -532,6 +545,7 @@ impl ExtFs {
     }
 
     /// 索引つきのディレクトリに名前を足す
+    // [lockless]
     pub(super) fn dx_add_entry(&self, dir: u32, r: &mut Raw, name: &str, ino: u32, mode: u32) -> Result<(), i64> {
         let generation = r.gen_no();
         let (hasher, hash, path) = self.dx_descend(dir, r, name)?;
@@ -578,6 +592,7 @@ impl ExtFs {
     }
 
     /// 索引に (hash, blk) を足す。path は根から、(ブロック, 入口の位置)
+    // [lockless]
     fn dx_insert(&self, dir: u32, r: &mut Raw, generation: u32, mut path: Vec<(Dx, usize)>, hash: u32, blk: u32) -> Result<(), i64> {
         let depth = path.len();
         let (mut node, at) = path.pop().unwrap();
@@ -632,6 +647,7 @@ impl ExtFs {
     }
 
     /// 葉のブロックの名前 (inode 0 と末尾の偽エントリは除く)
+    // [lockless]
     fn leaf_entries(&self, pb: u64) -> Result<Vec<DirEnt>, i64> {
         self.with_block(pb, |d| {
             let mut out = vec![];
@@ -651,6 +667,7 @@ impl ExtFs {
     }
 
     /// 葉のブロックを ents で書きなおす
+    // [lockless]
     fn leaf_write(&self, dir: u32, generation: u32, pb: u64, ents: &[DirEnt]) -> Result<(), i64> {
         let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };
         self.modify_dir_block(dir, generation, pb, |d| {
@@ -669,6 +686,7 @@ impl ExtFs {
     }
 
     /// 葉のすき間に入れる。入らなければ false
+    // [lockless]
     fn leaf_insert(&self, dir: u32, generation: u32, pb: u64, e: &DirEnt) -> Result<bool, i64> {
         let need = rec_len_for(e.name.len());
         let end = if self.csum { self.bsize - DIR_TAIL } else { self.bsize };

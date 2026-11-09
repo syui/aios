@@ -105,8 +105,10 @@ pub trait Log: Sync {
     /// システムコールの出口で errno (負の数) を返すとき (a はその引数)
     fn done(&self, _nr: u64, _e: i64, _a: &[u64]) {}
     /// 大きなロックなしの stat (statc.rs) が「ない」と答えた (path は畳んだパス、先頭 / なし)
+    // [lockless]
     fn fast_missing(&self, _p: &crate::proc::Proc, _nr: u64, _path: &str) {}
     /// 大きなロックなしの stat や open が、ディレクトリ dir (畳んだパス) で name を引いて、なかった
+    // [lockless]
     fn fast_missing_at(&self, _p: &crate::proc::Proc, _nr: u64, _dir: &str, _name: &str) {}
 }
 
@@ -133,12 +135,14 @@ pub fn done(nr: u64, e: i64, a: &[u64]) {
 
 /// 大きなロックなしの stat (statc.rs) が「ない」と答えた: ふつうの道の missing_cached と同じわけを残す
 #[cold]
+// [lockless]
 pub fn fast_missing(p: &crate::proc::Proc, nr: u64, path: &str) {
     LOG.val().fast_missing(p, nr, path);
 }
 
 /// 大きなロックなしの stat や open が、ディレクトリ dir で name を引いて、なかった: ふつうの道がたどって見つけなかった
 /// とき (at) と同じわけ
+// [lockless]
 pub fn fast_missing_at(p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
     LOG.val().fast_missing_at(p, nr, dir, name);
 }

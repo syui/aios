@@ -31,6 +31,7 @@ pub fn sys(n: u64, a: &[u64; 6]) -> R {
 }
 
 /// 大きなロックなしの splice (syscall::fast から。main.rs が register_fast_splice で置く)
+// [lockless]
 pub fn fast(me: &proc::Proc, a: &[u64; 6]) -> Option<i64> {
     fast_splice(me, a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5])
 }
@@ -538,6 +539,7 @@ fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
 ///   入れることはしない)。オフセットは off_in (ユーザーのメモリ) か、だれとも分けていない開いたファイルの
 /// ほかは None でふつうの道へ (flags のまちがい、O_PATH、読めない口・書けない口、ふつうのファイルでないものも、
 /// ふつうの道が Linux の順でエラーにする)
+// [lockless]
 fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> Option<i64> {
     if len == 0 || off_out != 0 || flags & !0x0f != 0 {
         return None;
@@ -653,6 +655,7 @@ impl Pipe {
     /// splice で、ファイルの位置 pos から len バイトまでを入れるとき (Linux の filemap_splice_read と
     /// shmem_file_splice_read): 長さはあいた箱 × 4KiB まで、ファイルの 1 ページの中のかけらごとに箱ひとつ。
     /// 入るバイト数
+    // [lockless]
     pub fn splice_room(&self, pos: u64, len: usize) -> usize {
         let free = self.slots().saturating_sub(self.used_slots());
         let mut len = len.min(free * PGSIZE);
@@ -941,6 +944,7 @@ impl Pipe {
 
 impl PageQueue {
     /// splice で入れるかけら (ファイルの 1 ページの中のもの。空でなく 4KiB まで) を、足さない箱ひとつに
+    // [lockless]
     fn push_piece(&mut self, src: &[u8]) -> Result<(), i64> {
         let p = self.page().ok_or(-12i64)?; // ENOMEM
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len()) };

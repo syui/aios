@@ -59,10 +59,12 @@ pub const PROT_WRITE: u8 = 2;
 pub const PROT_EXEC: u8 = 4;
 pub const PROT_RW: u8 = PROT_READ | PROT_WRITE;
 
+// [lockless]
 pub const fn pg_down(a: usize) -> usize {
     a & !(PGSIZE - 1)
 }
 
+// [lockless]
 pub const fn pg_up(a: usize) -> usize {
     (a + PGSIZE - 1) & !(PGSIZE - 1)
 }
@@ -85,10 +87,12 @@ struct Cached {
 static SHARED_FILE: Bkl<BTreeMap<FileKey, Cached>> = Bkl::new(BTreeMap::new());
 
 #[track_caller]
+// [lockless]
 fn shared_file() -> &'static mut BTreeMap<FileKey, Cached> {
     SHARED_FILE.get()
 }
 
+// [lockless]
 fn file_key(ino: &InodeRef, off: usize) -> FileKey {
     let (fs, i) = ino.id();
     (fs, i, off / PGSIZE)
@@ -123,6 +127,7 @@ fn write_back(key: &FileKey, c: &Cached) {
 
 /// ファイルシステムが id のページ index のブロックをとる: 写しの表が穴の 0 のページを持っていれば、それをそのまま
 /// ブロックのページにしてもらう (参照をひとつ足して返す。写している人のページがそのままブロックになるので、書いたものが映る)
+// [lockless]
 pub fn adopt_hole(id: (usize, u64), index: usize) -> Option<*mut u8> {
     let c = shared_file().get_mut(&(id.0, id.1, index))?;
     if !c.hole {
@@ -216,6 +221,7 @@ impl PageCache {
     }
 
     /// ファイル id のページをみな外す (参照は呼んだほうが返す)
+    // [lockless]
     fn remove_file(&mut self, id: (usize, u64), freed: &mut Vec<*mut u8>) {
         // そのファイルのページを木からまとめて抜く (1 つずつ remove すると、大きなファイルで木を何万回もたどる)
         freed.extend(self.pages.extract_if((id.0, id.1, 0)..=(id.0, id.1, usize::MAX), |_, _| true).map(|(_, p)| p.page));
@@ -383,6 +389,7 @@ static CHANGES: AtomicUsize = AtomicUsize::new(0);
 /// ファイル (id) の中身が変わる (書く、切りつめる): 表にあるそのファイルのページを捨てる。
 /// 写しているところは自分の参照を持っているのでそのまま (MAP_PRIVATE で、写したあとの変更が見えるかは決まっていない)。
 /// 更新時刻は秒までなので、版 (ver) だけでは同じ秒の同じ大きさの書きかえを見分けられない
+// [lockless]
 pub fn file_changed(id: (usize, u64)) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
     let mut freed = Vec::new();
@@ -422,6 +429,7 @@ const WRITTEN_AGE: u64 = 5 * crate::timer::HZ;
 /// いる途中のものが終わるのを待つ。取る順は WRITE_LOCKS → PRIV
 static WRITE_LOCKS: [SpinLock<()>; 64] = [const { SpinLock::new(()) }; 64];
 
+// [lockless]
 fn write_lock(id: (usize, u64)) -> crate::spinlock::Guard<'static, ()> {
     WRITE_LOCKS[(id.0.wrapping_mul(31) ^ id.1 as usize) % WRITE_LOCKS.len()].lock()
 }
@@ -457,6 +465,7 @@ pub fn write_permits_revoke() {
 /// 大きさの中で、ページがみな表にあるときだけ。書いたページは written の列に入れ、ファイルシステムが書き出す前に
 /// 受けとる (take_written)。Linux の generic_perform_write と同じく、ページキャッシュに書くだけ (書き出しはあとで)。
 /// ほかは None でふつうの道へ (書きかけでやめたら、そこまでのページも列に入れてから: ふつうの道がもう一度書く)
+// [lockless]
 pub fn write_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: usize) -> Option<usize> {
     let end = off.checked_add(len)?;
     // ユーザーのところが写っていなければ、ページにさわる前にふつうの道へ (フォルトで写す)
@@ -734,6 +743,7 @@ pub fn read_cached(ino: &InodeRef, off: usize, buf: &mut [u8]) -> Result<usize, 
 }
 
 /// ページキャッシュが記録しているファイル id の大きさ (大きなロックなしの lseek の SEEK_END。read_fast と同じもの)
+// [lockless]
 pub fn cached_size(id: (usize, u64)) -> Option<u64> {
     PRIV.lock().vers.get(&id).map(|v| v.1)
 }
@@ -741,6 +751,7 @@ pub fn cached_size(id: (usize, u64)) -> Option<u64> {
 /// 大きなロックなしで、ページキャッシュから読む (syscall::fast の read)。ファイル id の off から len バイトの
 /// ページが全部表にあり、ユーザーのページも写っているときだけ Some(読んだ数)。表にあるページはいまの中身で
 /// (書けばその場で書きかわる (file_written) か捨てる (file_changed))、記録した大きさもいまの大きさ
+// [lockless]
 pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: usize) -> Option<usize> {
     let c = PRIV.lock();
     let size = c.vers.get(&id)?.1 as usize;
@@ -766,6 +777,7 @@ pub fn read_fast(pt: &PageTable, id: (usize, u64), off: usize, va: usize, len: u
 /// 大きなロックなしで、ページキャッシュの off から len バイト (ファイルの終わりまで) を f に渡す
 /// (syscall::fast の splice: ファイル → パイプ)。ページが全部表にあるときだけ、表のロックを持ったまま
 /// f(ページの切れはしの並び) を呼ぶ。f が false なら None。ファイルの終わりより先なら Some(0)
+// [lockless]
 pub fn with_cached(id: (usize, u64), off: usize, len: usize, f: impl FnOnce(&[&[u8]]) -> bool) -> Option<usize> {
     let c = PRIV.lock();
     let size = c.vers.get(&id)?.1 as usize;
@@ -788,6 +800,7 @@ pub fn with_cached(id: (usize, u64), off: usize, len: usize, f: impl FnOnce(&[&[
 
 /// 表にある、版が ver のページ (参照をひとつ足して)。exec (実行できるように写す) なら命令キャッシュもあわせて。
 /// ロックなしでも呼べる
+// [lockless]
 fn cached_page(key: &FileKey, ver: (u64, u64), exec: bool) -> Option<*mut u8> {
     let mut c = PRIV.lock();
     let p = c.get_mut(key, ver)?;
@@ -1213,15 +1226,18 @@ impl Drop for Mutating {
     }
 }
 
+// [lockless]
 fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * (3 - level))) & 0x1ff
 }
 
+// [lockless]
 fn table_at(e: u64) -> *mut u64 {
     p2v((e & PTE_ADDR) as usize) as *mut u64
 }
 
 /// ページを持っている PTE か (PROT_NONE で無効にしてあるものも)
+// [lockless]
 fn has_page(e: u64) -> bool {
     e & PTE_VALID != 0 || e & PTE_PROTNONE != 0
 }
@@ -1420,6 +1436,7 @@ pub fn balance() {
 
 
 /// スワップへ追い出したページの PTE か
+// [lockless]
 fn is_swap(e: u64) -> bool {
     e & PTE_VALID == 0 && e & PTE_SWAP != 0
 }
@@ -1428,12 +1445,14 @@ fn swap_pte(slot: Slot) -> u64 {
     (slot << 12) & PTE_ADDR | PTE_SWAP
 }
 
+// [lockless]
 fn slot_of(e: u64) -> Slot {
     (e & PTE_ADDR) >> 12
 }
 
 /// カーネルが書いたところを命令として実行できるように: データキャッシュを PoU まで書き出し、
 /// 命令キャッシュを (すべての CPU で) 消す。QEMU の TCG では要らないが、本物の CPU (HVF) では要る
+// [lockless]
 pub fn sync_icache(kva: usize, len: usize) {
     let ctr: u64;
     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr) };
@@ -1467,6 +1486,7 @@ pub fn sync_icache(kva: usize, len: usize) {
     unsafe { core::arch::asm!("isb") };
 }
 
+// [lockless]
 fn page_of(e: u64) -> *mut u8 {
     table_at(e) as *mut u8
 }
@@ -1474,11 +1494,13 @@ fn page_of(e: u64) -> *mut u8 {
 /// prot の、書けないほう (まだ書いていない共有のファイルのページ、ページキャッシュのページ、COW の前)。
 /// PROT_WRITE だけの領域も読める (arm64 の Linux と同じ: 書けるページは読める) ので、READ を足してから WRITE を外す
 /// (外すだけだと PROT_NONE になり、読むたびにフォルトして止まらない)
+// [lockless]
 fn ro(prot: u8) -> u8 {
     (if prot & PROT_WRITE != 0 { prot | PROT_READ } else { prot }) & !PROT_WRITE
 }
 
 /// pa のページを prot で。cow なら書けるはずでも読み取り専用にして印をつける
+// [lockless]
 fn make_pte(pa: u64, prot: u8, cow: bool) -> u64 {
     if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
         return pa | PTE_PROTNONE;
@@ -1497,6 +1519,7 @@ fn make_pte(pa: u64, prot: u8, cow: bool) -> u64 {
 }
 
 /// 共有のぐあいを見て PTE を作りなおす (private で他と共有していれば COW)
+// [lockless]
 fn remake_pte(e: u64, prot: u8, shared_vma: bool) -> u64 {
     let pa = e & PTE_ADDR;
     let cow = !shared_vma && kalloc::refs(page_of(e)) > 1;
@@ -1516,6 +1539,7 @@ const FAULT_AROUND: usize = 16;
 
 /// fault-around のまど: page_va をふくむ FAULT_AROUND ページの境目のまど (同じ PTE の表の中) を、領域 [start, end) と、
 /// ファイルのページがまるごと写せるところ (fend の前) に切ったもの
+// [lockless]
 fn around(start: usize, end: usize, fend: usize, page_va: usize) -> (usize, usize) {
     let w = FAULT_AROUND * PGSIZE;
     let lo = (page_va & !(w - 1)).max(start);
@@ -1524,12 +1548,14 @@ fn around(start: usize, end: usize, fend: usize, page_va: usize) -> (usize, usiz
 }
 
 // TLB はすべての CPU に (inner shareable) 消す: 同じアドレス空間のスレッドがほかの CPU で動いているかも
+// [lockless]
 fn flush_va(va: usize) {
     unsafe {
         core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) (va >> 12) as u64);
     }
 }
 
+// [lockless]
 fn flush_all() {
     unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
@@ -1555,6 +1581,7 @@ pub fn calibrate_tlbi() {
 
 /// 消した (無効にした) ページの TLB を消す: 少なければ 1 つずつ、多ければ全部。
 /// 全部消す (vmalle1is) はすべての CPU のすべてのプロセスの TLB を捨てるので、小さな munmap のたびにはしない
+// [lockless]
 fn flush_pages(vas: &[usize]) {
     if vas.is_empty() {
         return;
@@ -1581,11 +1608,13 @@ fn flush_pages(vas: &[usize]) {
 static ACTIVE_ROOT: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// root を載せているのがこの CPU だけ (かどこにもない) か。大きなロックを持って呼ぶこと (持たないなら flush_va_unlocked)
+// [lockless]
 fn local_ok(root: usize) -> bool {
     let me = crate::smp::id();
     (0..crate::smp::online()).all(|c| c == me || ACTIVE_ROOT[c].load(Ordering::Relaxed) != root)
 }
 
+// [lockless]
 fn flush_va_in(root: usize, va: usize) {
     if local_ok(root) {
         unsafe { core::arch::asm!("dsb nshst", "tlbi vaae1, {}", "dsb nsh", "isb", in(reg) (va >> 12) as u64) };
@@ -1608,11 +1637,13 @@ fn flush_changed(root: usize, va: usize, old: u64) {
 /// 大きなロックなしで PTE を変えたあと (fast_fault): local_ok を、PTE を書いてから見る。載せる CPU (activate) は
 /// ACTIVE_ROOT を書いてから TLB を消し (dsb) て表を読むので、ここで載せていないと見えた CPU は新しい PTE を読む。
 /// 外す CPU (deactivate) は、ACTIVE_ROOT を 0 にしてから TLB を消すまで、ユーザーのアドレスに触らない
+// [lockless]
 fn flush_va_unlocked(root: usize, va: usize) {
     fence(Ordering::SeqCst);
     flush_va_in(root, va);
 }
 
+// [lockless]
 fn flush_pages_in(root: usize, vas: &[usize]) {
     if vas.is_empty() {
         return;
@@ -1631,6 +1662,7 @@ fn flush_pages_in(root: usize, vas: &[usize]) {
     }
 }
 
+// [lockless]
 fn flush_all_in(root: usize) {
     if local_ok(root) {
         unsafe { core::arch::asm!("dsb nshst", "tlbi vmalle1", "dsb nsh", "isb") };
@@ -1689,11 +1721,13 @@ impl PageTable {
     }
 
     /// TTBR0 に載せる物理アドレス
+    // [lockless]
     pub fn root_pa(&self) -> usize {
         v2p(self.root as usize)
     }
 
     /// L3 の PTE へのポインタ。alloc なら途中のテーブルを作る
+    // [lockless]
     fn walk(&self, va: usize, alloc: bool) -> Option<*mut u64> {
         if va >= MAXVA {
             return None;
@@ -1722,6 +1756,7 @@ impl PageTable {
     /// walk (alloc) の、大きなロックなしのもの (fast_fault): 途中のテーブルがなければ作って compare-exchange でつなぐ
     /// (同じ表のスレッドが同時に作れば、負けたほうは返す)。テーブルは表を捨てるまで返さない (free_level) ので、
     /// つないだものはそのまま使える。大きなロックを持って表を変えるもの (mutating) とは fast_users ですれちがう
+    // [lockless]
     fn walk_fast(&self, va: usize) -> Option<*mut u64> {
         if va >= MAXVA {
             return None;
@@ -1759,6 +1794,7 @@ impl PageTable {
     /// たどる CPU を待ってから)。PTE があるのは領域の中だけなので、領域のかからないまどのテーブルは空 (念のため中を見て、
     /// 空でなければ残す)。前はテーブルを表を捨てるまで返さず、mmap はいつも先へ写すので、mmap と munmap をくりかえす
     /// プロセスは 2 MiB ごとにテーブルをふやしていた
+    // [lockless]
     fn unlink_tables(&mut self, start: usize, end: usize) -> Vec<*mut u8> {
         const L3_SPAN: usize = 1 << 21;
         // つぎの mmap が来る 2 MiB のテーブルはとっておく。前にとっておいたものが、もうそこでなければ見なおす
@@ -1771,6 +1807,7 @@ impl PageTable {
         freed
     }
 
+    // [lockless]
     fn unlink_tables_in(&self, start: usize, end: usize, keep: usize) -> Vec<*mut u8> {
         const L3_SPAN: usize = 1 << 21;
         const L2_SPAN: usize = 1 << 30;
@@ -1818,6 +1855,7 @@ impl PageTable {
     }
 
     /// each_pte と同じだが、スワップへ追い出したページの PTE も
+    // [lockless]
     fn each_entry(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
         self.each_slot(start, end, |va, pte| {
             let e = unsafe { *pte };
@@ -1831,6 +1869,7 @@ impl PageTable {
     /// その中は並びのまま見る (ページごとに上から 4 段たどると、Firefox の大きな munmap が 1 回 0.5 ms かかった)。
     /// テーブルのないところは飛ばす: L2 のテーブルがなければ 1 GiB を、L3 のがなければ 2 MiB をまとめて (JS や wasm の
     /// 何 GiB もの予約を外すとき、2 MiB ずつたどらない)
+    // [lockless]
     fn each_slot(&self, start: usize, end: usize, mut f: impl FnMut(usize, *mut u64)) {
         let mut va = pg_down(start);
         while va < end && va < MAXVA {
@@ -1867,12 +1906,14 @@ impl PageTable {
     // ---- 領域 ----
 
     /// va を含む領域 (先頭, 領域)
+    // [lockless]
     pub fn find(&self, va: usize) -> Option<(usize, &Vma)> {
         self.vmas.range(..=va).next_back().filter(|(_, v)| va < v.end).map(|(&s, v)| (s, v))
     }
 
     /// [start, end) にかかる領域。領域は重ならないので、start より前に始まるものは start にかかりうる最後の 1 つだけ
     /// (Linux の vma_find。頭から見ていたら、領域が何千もある Firefox で munmap のたびに 60 µs かかっていた)
+    // [lockless]
     fn vmas_in(&self, start: usize, end: usize) -> impl Iterator<Item = (&usize, &Vma)> {
         let from = self.vmas.range(..=start).next_back().filter(|(_, v)| v.end > start).map_or(start, |(&s, _)| s);
         self.vmas.range(from.min(end)..end)
@@ -1883,11 +1924,13 @@ impl PageTable {
     /// munmap (fast_unmap) も呼ぶので、分けない領域の Rc (ファイルの inode、名前) の数にさわらない (前は分けなくても
     /// 写して落としていた。ほかの CPU が大きなロックの中で同じ数を変えると片方が消え、まだ持っている inode が返った:
     /// todo の mem-corrupt-stress)。fast_unmap が分けるのは名前のない無名の領域 (Rc を持たない) だけ
+    // [lockless]
     fn split(&mut self, addr: usize) {
         let Some(start) = self.find(addr).map(|(s, _)| s) else { return };
         if start == addr {
             return;
         }
+        // lockless-ok: fast_unmap が分けるのは Rc を持たない名前のない無名の領域だけ (plain のたしかめ)。ほかは大きなロックの中
         let mut hi = self.vmas[&start].clone();
         match &mut hi.back {
             Backing::File { off, .. } | Backing::Pages { off, .. } => *off += addr - start,
@@ -1899,6 +1942,7 @@ impl PageTable {
 
     /// [start, end) に写しているファイルのページの、写しの表での鍵の範囲 (領域ごとに 1 つ。MAP_SHARED のものと、
     /// MAP_PRIVATE の穴の 0 のページ)。release_shared_ranges で、表にあるものだけを返す
+    // [lockless]
     fn shared_ranges(&self, start: usize, end: usize) -> Vec<(FileKey, FileKey)> {
         let mut ranges = Vec::new();
         for (&s, v) in self.vmas_in(start, end) {
@@ -2294,6 +2338,7 @@ impl PageTable {
     /// 次に mmap に渡せる、hint 以上で len のすき間。上の端 (MAXVA) までになければ、MMAP_BASE からさがしなおす
     /// (mmap と munmap をくりかえすプログラムが、外したところを使えないまま上の端に着いて ENOMEM にならないように。
     /// Linux はいつも空いているところからさがす)。どこにもなければ MAXVA より先 (map が断る)
+    // [lockless]
     pub fn free_area(&self, hint: usize, len: usize) -> usize {
         let va = self.gap_from(hint, len);
         if va.checked_add(len).is_some_and(|e| e <= MAXVA) || hint <= crate::proc::MMAP_BASE {
@@ -2303,11 +2348,13 @@ impl PageTable {
     }
 
     /// [start, end) に領域がかかっているか
+    // [lockless]
     pub fn overlaps(&self, start: usize, end: usize) -> bool {
         self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start)
     }
 
     /// hint 以上で len の、はじめのすき間
+    // [lockless]
     fn gap_from(&self, hint: usize, len: usize) -> usize {
         let mut va = hint;
         // hint より前の領域は、hint にかかりうる最後の 1 つ (領域は重ならない) から見ればよい
@@ -2679,6 +2726,7 @@ impl PageTable {
 
     /// 大きなロックなしで、もう写っていて書けるページにだけ書く (clock_gettime などの速い道)。
     /// ページが写っていない・書けないなら false (ロックを取ってふつうの道で)
+    // [lockless]
     pub fn copy_out_nofault(&self, dst: usize, src: &[u8]) -> bool {
         self.fast_users.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -2731,6 +2779,7 @@ impl PageTable {
     /// それ以外 (ファイル、スワップ、共有、テーブルがない、だれかが表を変えている途中) は false で、
     /// 呼んだほうが大きなロックを取ってふつうの道 (fault) へ。
     /// 同じ表のほかのスレッドと同時に走ってよい: PTE は compare-exchange で、負けたら false (やりなおし)
+    // [lockless]
     pub fn fast_fault(&self, va: usize, write: bool, exec: bool) -> bool {
         if va >= MAXVA {
             return false;
@@ -2748,6 +2797,7 @@ impl PageTable {
     }
 
     /// (片づいたか, あとで手放すページ)
+    // [lockless]
     fn fast_fault_inner(&self, va: usize, write: bool, exec: bool) -> (bool, Option<*mut u8>) {
         use core::sync::atomic::AtomicU64;
         let Some((start, v)) = self.find(va) else { return (false, None) };
@@ -2837,6 +2887,7 @@ impl PageTable {
     /// fast_fault の fault-around (map_around と同じまど): まだ何もない PTE に、ページキャッシュに同じ版があるページを
     /// compare-exchange で (負けたら参照を返して次へ)。表のロックは 1 回で、まどのページを木の 1 回の range で引く
     /// (ページごとに引くと、いくつものプロセスが同時に起動するとき表のロックで並ぶ)
+    // [lockless]
     fn map_around_fast(&self, start: usize, v: &Vma, page_va: usize, pte: *mut u64) {
         use core::sync::atomic::AtomicU64;
         let Backing::File { ino, off, fend, ver } = &v.back else { return };
@@ -2885,6 +2936,7 @@ impl PageTable {
     }
 
     /// 大きなロックなしで、もう写っているページからだけ読む (futex の速い道)。写っていなければ false
+    // [lockless]
     pub fn copy_in_nofault(&self, src: usize, dst: &mut [u8]) -> bool {
         self.fast_users.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -2911,6 +2963,7 @@ impl PageTable {
     /// ほかの領域があれば ENOMEM (sys_mremap と extend と同じ答え)。伸ばせるもの (表を変える) と、だれかが表を変えている
     /// 途中なら None (ふつうの道へ)。Firefox はページを読みこむたびに、1 ページの領域を 2 ページにできるかを何万回も
     /// たずねる (みな ENOMEM)。表は fast_fault と同じく、変える人がいないときだけ読む
+    // [lockless]
     pub fn fast_mremap_fail(&self, old: usize, old_end: usize, new_end: usize) -> Option<i64> {
         const EFAULT: i64 = 14;
         const ENOMEM: i64 = 12;
@@ -2933,6 +2986,7 @@ impl PageTable {
     /// 大きなロックなしで表を変えはじめる (fast_map、fast_unmap): fast_users に入ってから mutators を見る (fast_fault と
     /// 同じ: 大きなロックを持って変える側 (mutating、hold) は mutators を増やしてから fast_users が 0 になるのを待つ)。
     /// だれかが変えている途中なら入らずに false
+    // [lockless]
     fn fast_enter(&self) -> bool {
         self.fast_users.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -2943,6 +2997,7 @@ impl PageTable {
         false
     }
 
+    // [lockless]
     fn fast_leave(&self) {
         self.fast_users.fetch_sub(1, Ordering::SeqCst);
     }
@@ -2951,6 +3006,7 @@ impl PageTable {
     /// ところに作る (sys_mmap の MAP_FIXED でないものと同じ場所と答え)。スレッドで分けていない表だけ (呼ぶほうが見る):
     /// 同じ表をいっしょに変えうるのは、大きなロックを持ってほかから来るもの (回収のスワップ、procfs: mutating か hold)
     /// だけで、それとは fast_enter ですれちがう。場所がない (ENOMEM) か、だれかが変えている途中なら None (ふつうの道へ)
+    // [lockless]
     pub fn fast_map(&mut self, hint: usize, len: usize, prot: u8) -> Option<usize> {
         if !self.fast_enter() {
             return None;
@@ -2977,6 +3033,7 @@ impl PageTable {
     /// TLB を消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce で fast_users を
     /// 待つが、ここでは自分がそれ)。ページキャッシュのページも参照を返すだけ。できないものと、だれかが変えている途中なら
     /// None (ふつうの道へ)
+    // [lockless]
     pub fn fast_unmap(&mut self, start: usize, end: usize) -> Option<()> {
         let (start, end) = (pg_down(start), pg_up(end));
         if start >= end || end > MAXVA || !self.fast_enter() {
@@ -3050,6 +3107,7 @@ impl PageTable {
     }
 
     /// 大きなロックなしで、va から len バイトがみな写っているか (読める) だけを見る (write_fast が、ページを書きかえる前に)
+    // [lockless]
     pub fn readable_nofault(&self, va: usize, len: usize) -> bool {
         self.fast_users.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -3066,6 +3124,7 @@ impl PageTable {
     }
 
     /// PTE を消した (TLB も消した) あと、ページを手放す前に: ロックなしで書いている CPU を待つ
+    // [lockless]
     fn quiesce(&self) {
         fence(Ordering::SeqCst);
         while self.fast_users.load(Ordering::SeqCst) != 0 {
@@ -3088,6 +3147,7 @@ impl PageTable {
     }
 
     /// 領域ごとの (先頭, 終わり, prot, 共有か) (fork が PTE を写すときに見るもの)
+    // [lockless]
     fn areas(&self) -> Vec<(usize, usize, u8, bool)> {
         self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
     }
@@ -3095,6 +3155,7 @@ impl PageTable {
     /// fork: areas の PTE を new へ写す (private の領域は両方とも COW に)。TLB は呼ぶほうが消す。unlocked (大きなロック
     /// の外) なら、スワップへ出したページ (swap.rs は大きなロックの中) にあたったらやめる。しくじったら false (それまでに
     /// 写したものは new を捨てれば返る)
+    // [lockless]
     fn copy_ptes(&self, new: &PageTable, areas: &[(usize, usize, u8, bool)], unlocked: bool) -> bool {
         for &(s, e, prot, shared) in areas {
             let mut fail = false;
@@ -3109,6 +3170,7 @@ impl PageTable {
                         return;
                     }
                     // スワップのスロットも共有する (先に読み戻した方が自分のページを作る)
+                    // lockless-ok: unlocked (prefork) ならスワップのものは上で fail。ここは大きなロックの中だけ
                     swap::dup(slot_of(*pte));
                 } else {
                     kalloc::get(page_of(*pte));
@@ -3121,6 +3183,7 @@ impl PageTable {
                     Some(np) => *np = *pte,
                     None => {
                         if swapped {
+                            // lockless-ok: swapped は大きなロックの中だけ (上と同じ)
                             swap::free(slot_of(*pte));
                         } else {
                             kalloc::put(page_of(*pte));
@@ -3141,6 +3204,7 @@ impl PageTable {
     /// 半分ほどが PTE を写す時間だった (4 つの CPU で 1 回 75 µs ほど)。表を変えている人 (mutators) がいる、スワップへ出した
     /// ページがある、メモリが足りないときは None (大きなロックの中の fork で)。そのあいだに大きなロックを持ってこの表を
     /// 変えたり読んだりするもの (スワップの追い出し、/proc) は、fast_users が 0 になるのを待つ (quiesce)
+    // [lockless]
     pub fn prefork(&mut self) -> Option<Prefork> {
         if !self.fast_enter() {
             return None;
@@ -3425,6 +3489,7 @@ static DEFERRED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// この CPU が大きなロックを放したところで (ユーザーへ戻る、新しい子が走りだす、暇で眠る): exit で外した表を返す
 #[inline]
+// [lockless]
 pub fn free_deferred() {
     let a = &DEFERRED[crate::smp::id()];
     if a.load(Ordering::Relaxed) != 0 {
@@ -3438,6 +3503,7 @@ pub fn free_deferred() {
 /// table (level 段目) から下を返す: 写っているページとスワップのスロットと、テーブルそのもの。unlocked なら大きなロックを
 /// 持たずに呼ばれている: ページは kalloc (スピンロックと atomic) だけで返せるが、スワップのスロット (swap.rs は大きなロックの中)
 /// を返すときだけ取る
+// [lockless]
 fn free_level(table: *mut u64, level: usize, unlocked: bool) {
     for i in 0..512 {
         let e = unsafe { *table.add(i) };
@@ -3449,10 +3515,13 @@ fn free_level(table: *mut u64, level: usize, unlocked: bool) {
             kalloc::put(page_of(e));
         } else if is_swap(e) {
             if unlocked {
+                // lockless-ok: ここで大きなロックを取る (スワップのスロットは大きなロックの中で)
                 crate::smp::lock();
             }
+            // lockless-ok: スワップのスロットは大きなロックを取ってから
             swap::free(slot_of(e));
             if unlocked {
+                // lockless-ok: 取ったものを放す
                 crate::smp::unlock();
             }
         }

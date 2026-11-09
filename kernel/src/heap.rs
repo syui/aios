@@ -148,16 +148,19 @@ fn poison_check(p: *mut u8, size: usize) {
 pub const POISON_BYTE: u8 = 0x6b;
 
 /// 呼び出し 6 段 (調べもの用: kalloc の page poison が、返した人を覚える)
+// [lockless]
 pub fn backtrace() -> [usize; DEPTH] {
     callers()
 }
 
 /// 呼び出し (alloc 自身の 2 段は飛ばす)
+// [lockless]
 fn callers() -> [usize; DEPTH] {
     callers_from(2)
 }
 
 #[inline(never)]
+// [lockless]
 fn callers_from(skip0: usize) -> [usize; DEPTH] {
     let mut at = [0; DEPTH];
     let mut fp: usize;
@@ -560,6 +563,7 @@ pub fn stats_more() -> (usize, usize, usize, usize) {
 /// だけに短く (その中のほかの alloc も null になる)。深さはスレッドごと (proc の fallible)
 pub struct Fallible(());
 
+// [lockless]
 pub fn fallible() -> Fallible {
     crate::proc::fallible_enter();
     Fallible(())
@@ -573,6 +577,7 @@ impl Drop for Fallible {
 
 /// n バイトの Vec。取れなければ Err(-ENOMEM) (panic しない)。zero なら 0 で埋め、でなければ中身は決まっていない
 /// (すぐ全部書くところ用)
+// [lockless]
 pub fn try_vec(n: usize, zero: bool) -> Result<alloc::vec::Vec<u8>, i64> {
     const ENOMEM: i64 = 12;
     let mut v = alloc::vec::Vec::new();
