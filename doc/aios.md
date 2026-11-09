@@ -349,10 +349,13 @@ extra を使っているところを出す。core は extra を名前で呼ば�
 extra が起きるとき) でつなぐ。core が extra に寄りかからないように、1 つのものの「いつも要るところ」と「なくても
 動くところ」を分けることがある: しくじったわけは、書くほう (why、core: EINVAL を返すところはみな `why::inval()`) と、ためて
 /proc/ai/why で見せるほう (whylog、extra)。セキュリティの部品 (LSM) は、core が名前で呼ばずに `security.rs` (Linux の
-security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
+security.c) のフックを呼び (lsm_* のシステムコールは extra の lsm_syscalls.rs: Linux の security/lsm_syscalls.c)、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
 AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
-test/kernel-json.py の `BEHIND_HOOKS` に入り口といっしょに書き、core がまた名前で呼べば落ちる (いまは security.rs の apparmor、landlock、
-seccomp、audit、auditfilter、debug.rs の trace、prof、fail、why.rs の whylog、vm.rs の swap)。seccomp と audit は LSM ではない
+test/kernel-json.py の `BEHIND_HOOKS` に入り口といっしょに書き、core がまた名前で呼べば落ちる (security.rs の apparmor、landlock、
+seccomp、audit、auditfilter、debug.rs の trace、prof、fail、sysrq、why.rs の whylog、vm.rs の swap、file.rs の FileOps の
+装置やソケットと FileLocks の locks、syscall.rs の表 (Linux の COND_SYSCALL) の epoll、timerfd、inotify、splice、
+posix_timers、lsm_syscalls など)。見せるだけのもの (/proc、/proc/ai、/sys の中身: Linux の fs/proc や lock_stat) は、数える
+のは core、見せ方は extra (procfs、aiproc、sysfs、lockstat) に置く。seccomp と audit は LSM ではない
 (Linux も): security.rs の中の別の入り口 (Linux の include/linux/seccomp.h と audit.h: seccomp_permit_syscall、
 audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。namespace (ns) は Linux と
 同じく core (pid、uid、ホスト名の読みかえと mount の namespace。LSM は作るときだけ見る: security::namespace_init)。LSM が
