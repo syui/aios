@@ -1,5 +1,5 @@
 // パッケージを作って (build)、ai/repo に送る (push)
-//   repo/aarch64/{rust,c,shell,desktop}/ が ai/repo の aarch64/ の写し + ここで作ったもの。
+//   repo/aarch64/{rust,c,plugin,desktop}/ が ai/repo の aarch64/ の写し + ここで作ったもの。
 //   build: なければ ai/repo からそろえ、bin/mkpkg.sh で作って、同じパッケージの古い版を外し、aios.db を作りなおす
 //   fetch: 重いもの (pkg/ci.json) は GitHub の CI が作ってリリースに置くので、それを取ってきて build と同じく置く
 //   push:  ai/repo の最新とくらべて、変わるもの (足す・上げる) を見せてから bin/gitea.sh repo (署名つきの 1 コミット)。
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const AIREPO: &str = "https://git.syui.ai/ai/repo.git";
-const KINDS: [&str; 4] = ["rust", "c", "shell", "desktop"];
+const KINDS: [&str; 4] = ["rust", "c", "plugin", "desktop"];
 
 fn sh(cmd: &mut Command) -> Result<(), String> {
     let st = cmd.status().map_err(|e| e.to_string())?;

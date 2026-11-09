@@ -1,4 +1,4 @@
-// aish-powerline: powerline のプロンプト ([shell] リポジトリ)
+// aish-powerline: powerline のプロンプト ([plugin] リポジトリ)
 //   ~/.aishrc に: plugin aish-powerline
 // アイコンと区切りは aifont (Nerd Font と同じ位置) の文字。端末のフォントが要る
 // ユーザーの色: ふつうは黄、ssh でつないでいるときは水色。git のディレクトリではブランチも出す

@@ -66,6 +66,9 @@ case "$1" in
     ;;
   repo)
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
+    if [ -d repo/aarch64/shell ] && [ ! -e repo/aarch64/plugin ]; then
+      mv repo/aarch64/shell repo/aarch64/plugin
+    fi
     identity
     echo "commits by $name <$mail>, signed with $fpr" >&2
     dir=$PWD/build/airepo
@@ -81,7 +84,7 @@ case "$1" in
     trap 'rm -rf "$tmp"' EXIT
     g() { GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" git "$@"; }
     g read-tree "$(g ls-tree "$base" | awk -F '\t' '$2 != "aarch64" && $2 != "aarch64-c"' | g mktree)"
-    for d in rust c shell desktop; do
+    for d in rust c plugin desktop; do
       [ -f "repo/aarch64/$d/aios.db" ] || continue
       (cd repo && GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" GIT_WORK_TREE=. git add -f -- aarch64/$d/*.pkg.tar.zst "aarch64/$d/aios.db" "aarch64/$d/aios.db.tar.gz")
     done
