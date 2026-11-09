@@ -180,7 +180,13 @@ pub extern "C" fn kmain() -> ! {
     }
     rand::summary();
     audit::init();
-    fs::init();
+    // 装置のないファイルシステム (Linux の register_filesystem: mount(2) と、起動のときの /proc や /sys が引く)
+    vfs::register_filesystem("proc", || Ok(procfs::new_root()));
+    vfs::register_filesystem("sysfs", || Ok(sysfs::new_root()));
+    vfs::register_filesystem("securityfs", || Ok(securityfs::new_root()));
+    vfs::register_filesystem("efivarfs", efivarfs::new_root);
+    // ルート: ディスクがあれば (block::mount_root: Linux の mount_root)、なければ initramfs
+    fs::init(block::mount_root());
     if !parts::off(parts::Part::Net) {
         net::init();
     }

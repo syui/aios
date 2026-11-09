@@ -60,7 +60,6 @@ pub fn load(image: &[u8]) -> Result<i64, i64> {
         return Err(-ENODEV);
     }
     m.loaded = true;
-    crate::fs::add_device_nodes();
     Ok(0)
 }
 

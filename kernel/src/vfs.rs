@@ -413,6 +413,20 @@ pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
     n
 }
 
+/// 装置のないファイルシステムの種類 (Linux の file_system_type と register_filesystem: proc、sysfs、securityfs、efivarfs)。
+/// 名前と、マウントするときに根を作るもの。main.rs が起動のときに置く (mount(2) と起動のときの /proc や /sys がここを引く)
+static FILESYSTEMS: crate::spinlock::SpinLock<alloc::vec::Vec<(&'static str, fn() -> Result<InodeRef, i64>)>> = crate::spinlock::SpinLock::new(alloc::vec::Vec::new());
+
+pub fn register_filesystem(name: &'static str, mount: fn() -> Result<InodeRef, i64>) {
+    FILESYSTEMS.lock().push((name, mount));
+}
+
+/// 種類が name のファイルシステムの根を新しく作る (知らない種類は ENODEV)
+pub fn mount_nodev(name: &str) -> Result<InodeRef, i64> {
+    let f = FILESYSTEMS.lock().iter().find(|(n, _)| *n == name).map(|&(_, f)| f).ok_or(-ENODEV)?;
+    f()
+}
+
 /// dir (すでにあるディレクトリ) の上に fs の根をかぶせる (いまの表に)
 pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result<(), i64> {
     mount_ro(path, fsroot, source, fstype, false)

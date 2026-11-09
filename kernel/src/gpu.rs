@@ -137,6 +137,15 @@ impl Gpu {
 
 /// 見つかったら画面を用意して true
 pub fn init() -> bool {
+    if !probe_init() {
+        return false;
+    }
+    // /dev/fb0 (Linux の devtmpfs: 装置を見つけたものがノードを置く)
+    crate::fs::add_dev("fb0", 0o666, false, 29, 0);
+    true
+}
+
+fn probe_init() -> bool {
     let Some((mmio, _)) = virtio::probe(DEVICE_GPU, 0) else { return false };
     let Some(q) = Queue::new(&mmio, 0, 64) else { return false };
     virtio::ready(&mmio);

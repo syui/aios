@@ -1,40 +1,44 @@
 // 起動時にルートファイルシステムを組み立てる
-use crate::extfs::ExtFs;
 use crate::initrd;
 use crate::tmpfs::{self, TmpInode};
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
+use alloc::string::String;
 
-/// ディスクに ext2 があればそれを、なければ initramfs を展開した tmpfs をルートにする
-pub fn init() {
-    if crate::block::init() {
-        match ExtFs::mount() {
-            Ok(fs) => {
-                println!("fs: root is {} on {}", fs.kind(), crate::block::name());
-                let kind = fs.kind();
-                vfs::set_root(fs.root(), &crate::block::name(), kind);
-                // /dev と /tmp はメモリ上に
-                for d in ["dev", "tmp", "run"] {
-                    if vfs::mkdir_p(d, 0o755).is_ok() {
-                        let _ = vfs::mount(d, tmpfs::new_root(), "tmpfs", "tmpfs");
-                    }
-                }
-                let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\nsecurityfs /sys/kernel/security securityfs rw 0 0\n", crate::block::name(), kind);
-                // FAT の boot の区画 (ESP / ラズパイの boot) を /boot に
-                if let Some(p) = crate::block::boot() {
-                    match crate::vfat::FatFs::mount(p) {
-                        Ok(b) if vfs::mkdir_p("boot", 0o755).is_ok() && vfs::mount("boot", b.root(), &crate::block::part_name(&p), "vfat").is_ok() => {
-                            println!("fs: /boot is {} on {}", b.kind(), crate::block::part_name(&p));
-                            mtab.push_str(&alloc::format!("{} /boot vfat rw 0 0\n", crate::block::part_name(&p)));
-                        }
-                        Ok(_) => {}
-                        Err(e) => println!("fs: boot partition not usable ({})", e),
-                    }
-                }
-                setup_dirs(&mtab);
-                return;
+/// ディスクから見つけたルート (block::mount_root。Linux の init/do_mounts.c の mount_root): ext2 / ext4 の根と、その装置の
+/// 名前と種類の名前。boot は FAT の boot の区画 (ESP / ラズパイの boot) をマウントしようとした答え (根、装置の名前、種類)
+pub struct DiskRoot {
+    pub root: InodeRef,
+    pub dev: String,
+    pub kind: &'static str,
+    pub boot: Option<Result<(InodeRef, String, &'static str), &'static str>>,
+}
+
+/// ルートを組み立てる: ディスクのルート (main.rs が block::mount_root で見つけたもの) があればそれを、なければ initramfs を
+/// 展開した tmpfs をルートにする
+pub fn init(disk: Option<DiskRoot>) {
+    if let Some(d) = disk {
+        println!("fs: root is {} on {}", d.kind, d.dev);
+        vfs::set_root(d.root, &d.dev, d.kind);
+        // /dev と /tmp はメモリ上に
+        for dir in ["dev", "tmp", "run"] {
+            if vfs::mkdir_p(dir, 0o755).is_ok() {
+                let _ = vfs::mount(dir, tmpfs::new_root(), "tmpfs", "tmpfs");
             }
-            Err(e) => println!("fs: disk not usable ({}), using initramfs", e),
         }
+        let mut mtab = alloc::format!("{} / {} rw 0 0\ntmpfs /dev tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\nsecurityfs /sys/kernel/security securityfs rw 0 0\n", d.dev, d.kind);
+        // FAT の boot の区画を /boot に
+        match d.boot {
+            Some(Ok((b, dev, kind))) => {
+                if vfs::mkdir_p("boot", 0o755).is_ok() && vfs::mount("boot", b, &dev, "vfat").is_ok() {
+                    println!("fs: /boot is {} on {}", kind, dev);
+                    mtab.push_str(&alloc::format!("{} /boot vfat rw 0 0\n", dev));
+                }
+            }
+            None => {}
+            Some(Err(e)) => println!("fs: boot partition not usable ({})", e),
+        }
+        setup_dirs(&mtab);
+        return;
     }
     println!("fs: root is tmpfs from initramfs");
     let root = tmpfs::new_root();
@@ -49,25 +53,33 @@ pub fn init() {
     setup_dirs("tmpfs / tmpfs rw 0 0\nproc /proc proc rw 0 0\n");
 }
 
-/// モジュール (module.rs) が見つけた装置の /dev のノード: 画面 (/dev/fb0) とキーボードやマウス、音 (/dev/snd)
-pub fn add_device_nodes() {
-    let Ok(dev) = vfs::mkdir_p("dev", 0o755) else { return };
-    if crate::gpu::get().is_some() {
-        let _ = dev.create("fb0", 0o666, NewNode::Dev(29, 0));
-    }
-    if crate::sound::present() {
-        if let Ok(d) = vfs::mkdir_p("dev/snd", 0o755) {
-            let _ = d.create("controlC0", 0o666, NewNode::Dev(116, 0));
-            let _ = d.create("pcmC0D0p", 0o666, NewNode::Dev(116, 16));
+/// 装置のノード (Linux の devtmpfs: 装置を見つけたもの (block、gpu、sound、input) が add_dev で置く)。/dev ができる前
+/// (起動のとき) なら覚えておいて setup_dirs で作り、あと (modprobe) ならすぐに作る。(/dev の下のパス, mode, ブロックか, major, minor)
+static DEV_NODES: crate::spinlock::SpinLock<Option<alloc::vec::Vec<(String, u32, bool, u32, u32)>>> = crate::spinlock::SpinLock::new(Some(alloc::vec::Vec::new()));
+
+/// /dev/PATH に装置のノードを (blk ならブロックデバイス)。同じ名前で番号か種類がちがうものがあれば作りなおす
+pub fn add_dev(path: &str, mode: u32, blk: bool, ma: u32, mi: u32) {
+    {
+        let mut g = DEV_NODES.lock();
+        if let Some(l) = g.as_mut() {
+            l.push((String::from(path), mode, blk, ma, mi));
+            return;
         }
     }
-    if crate::input::count() > 0 {
-        if let Ok(d) = vfs::mkdir_p("dev/input", 0o755) {
-            for n in 0..crate::input::count() {
-                let _ = d.create(&alloc::format!("event{}", n), 0o666, NewNode::Dev(13, 64 + n as u32));
-            }
+    make_dev(path, mode, blk, ma, mi);
+}
+
+fn make_dev(path: &str, mode: u32, blk: bool, ma: u32, mi: u32) {
+    let (dir, name) = path.rsplit_once('/').map_or(("dev".into(), path), |(d, n)| (alloc::format!("dev/{}", d), n));
+    let Ok(d) = vfs::mkdir_p(&dir, 0o755) else { return };
+    let ty = if blk { vfs::S_IFBLK } else { vfs::S_IFCHR };
+    if let Ok(old) = d.lookup(name) {
+        if old.meta().rdev == ((ma as u64) << 8 | mi as u64) && old.meta().mode & S_IFMT == ty {
+            return;
         }
+        let _ = d.unlink(name, false);
     }
+    let _ = d.create(name, mode, if blk { NewNode::Blk(ma, mi) } else { NewNode::Dev(ma, mi) });
 }
 
 fn setup_dirs(mtab: &str) {
@@ -91,19 +103,10 @@ fn setup_dirs(mtab: &str) {
         }
     }
 
-    // ディスクと区画 (/dev/vda, /dev/vda1, ...)
-    for p in crate::block::parts() {
-        let (ma, mi) = crate::block::dev_of_part(&p);
-        let name = crate::block::part_name(&p);
-        let name = name.trim_start_matches("/dev/");
-        // 前の起動で作ったもの (ディスクのルート) が違う番号なら作りなおす
-        if let Ok(old) = dev.lookup(name) {
-            if old.meta().rdev == ((ma as u64) << 8 | mi as u64) && old.meta().mode & S_IFMT == vfs::S_IFBLK {
-                continue;
-            }
-            let _ = dev.unlink(name, false);
-        }
-        let _ = dev.create(name, 0o660, NewNode::Blk(ma, mi));
+    // 起動のときに見つけた装置 (ディスクと区画 /dev/vda、/dev/vda1 ...: add_dev)。ここからあとはすぐに作る
+    let pending = DEV_NODES.lock().take().unwrap_or_default();
+    for (path, mode, blk, ma, mi) in pending {
+        make_dev(&path, mode, blk, ma, mi);
     }
     // 疑似端末の子の口 (/dev/pts/N) は ptmx を開くたびにここへ作る
     let _ = vfs::mkdir_p("dev/pts", 0o755);
@@ -121,15 +124,22 @@ fn setup_dirs(mtab: &str) {
     if let Ok(vtmp) = vfs::mkdir_p("var/tmp", 0o1777) {
         let _ = vtmp.set_mode(0o1777);
     }
-    if vfs::mkdir_p("proc", 0o555).is_ok() {
-        let _ = vfs::mount("proc", crate::procfs::new_root(), "proc", "proc");
+    // 装置のないファイルシステム (main.rs が vfs::register_filesystem で置いたもの)
+    if vfs::mkdir_p("proc", 0o555).is_ok()
+        && let Ok(r) = vfs::mount_nodev("proc")
+    {
+        let _ = vfs::mount("proc", r, "proc", "proc");
     }
     if vfs::mkdir_p("sys", 0o555).is_ok() {
-        let _ = vfs::mount("sys", crate::sysfs::new_root(), "sysfs", "sysfs");
+        if let Ok(r) = vfs::mount_nodev("sysfs") {
+            let _ = vfs::mount("sys", r, "sysfs", "sysfs");
+        }
         // securityfs (Linux では init がかぶせる。libapparmor は /proc/mounts の securityfs から apparmor/ をさがす)
-        let _ = vfs::mount("sys/kernel/security", crate::securityfs::new_root(), "securityfs", "securityfs");
+        if let Ok(r) = vfs::mount_nodev("securityfs") {
+            let _ = vfs::mount("sys/kernel/security", r, "securityfs", "securityfs");
+        }
         // efivarfs (Linux では systemd がかぶせる)。UEFI から起動していなければない
-        if let Ok(efi) = crate::efivarfs::new_root() {
+        if let Ok(efi) = vfs::mount_nodev("efivarfs") {
             let _ = vfs::mount("sys/firmware/efi/efivars", efi, "efivarfs", "efivarfs");
         }
     }

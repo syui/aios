@@ -2879,7 +2879,6 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     const MS_BIND: u64 = 4096;
     const MS_MOVE: u64 = 8192;
     const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
-    const ENODEV: i64 = 19;
     let cwd = proc::current().files().cwd.clone();
     let target = user_str(targetp)?;
     // Linux の do_mount と path_mount の順: マウント先をたどり (ENOENT)、LSM (security_sb_mount)、それから may_mount (EPERM)
@@ -2920,11 +2919,8 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
                 r.set_mode(0o1777)?;
                 r
             }
-            "proc" => crate::procfs::new_root(),
-            "sysfs" => crate::sysfs::new_root(),
-            "securityfs" => crate::securityfs::new_root(),
-            "efivarfs" => crate::efivarfs::new_root()?,
-            _ => return Err(-ENODEV),
+            // 装置のないもの (proc、sysfs、securityfs、efivarfs: vfs::register_filesystem で置いたもの。知らなければ ENODEV)
+            t => vfs::mount_nodev(t)?,
         };
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
         (root, source, fstype)

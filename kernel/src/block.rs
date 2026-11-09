@@ -39,6 +39,28 @@ static PARTS: Early<alloc::vec::Vec<Part>> = Early::new(alloc::vec::Vec::new());
 const VD_MAJOR: u32 = 254;
 const MMC_MAJOR: u32 = 179;
 
+/// ディスクのルート (起動のとき: main.rs から fs::init へ。Linux の init/do_mounts.c の mount_root): ディスクを起こし、区画の
+/// ノード (/dev/vda、/dev/vda1 ...) を置き (fs::add_dev)、root の区画の ext2 / ext4 と、FAT の boot の区画を読む
+pub fn mount_root() -> Option<crate::fs::DiskRoot> {
+    if !init() {
+        return None;
+    }
+    for p in parts() {
+        let (ma, mi) = dev_of_part(&p);
+        crate::fs::add_dev(part_name(&p).trim_start_matches("/dev/"), 0o660, true, ma, mi);
+    }
+    match crate::extfs::ExtFs::mount() {
+        Ok(fs) => {
+            let boot = boot().map(|p| crate::vfat::FatFs::mount(p).map(|b| (b.root(), part_name(&p), b.kind())));
+            Some(crate::fs::DiskRoot { root: fs.root(), dev: name(), kind: fs.kind(), boot })
+        }
+        Err(e) => {
+            println!("fs: disk not usable ({}), using initramfs", e);
+            None
+        }
+    }
+}
+
 pub fn parts() -> alloc::vec::Vec<Part> {
     PARTS.get().clone()
 }

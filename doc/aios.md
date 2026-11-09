@@ -382,6 +382,11 @@ ext4 のロック (眠るときに手放す読み書きロック: fs_lock、fs_l
 AF_UNIX のロックなしの読み書き) も smp.rs に置き、装置やソケットが数える (Linux の vm_event の数と同じ)。CPU のぜい弱性
 (cpuvuln) は Linux の arm64 の proton-pack.c と同じく core。fd を閉じたあとの片づけ (AF_UNIX の gc) は file.rs の closed と
 release_deferred から (Linux の fput から f_op->release)。
+ファイルシステムも登録の表: 装置のないもの (proc、sysfs、securityfs、efivarfs) は main.rs が vfs::register_filesystem で
+置き (Linux の register_filesystem)、mount(2) と起動のときの /proc や /sys は vfs::mount_nodev で引く (知らない種類は ENODEV)。
+ディスクのルート (root の区画の ext2 / ext4 と FAT の boot の区画) は block::mount_root (Linux の init/do_mounts.c の
+mount_root) が読んで fs::init にわたす。/dev の装置のノードは、装置を見つけたもの (block の区画、modprobe で起こした gpu・
+sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる前なら覚えておいて、できたときに作る)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

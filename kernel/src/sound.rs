@@ -408,6 +408,9 @@ pub fn init() -> bool {
         intr(id);
     });
     *SND.get() = Some(s);
+    // /dev/snd の制御と再生の口 (Linux の devtmpfs: 装置を見つけたものがノードを置く)
+    crate::fs::add_dev("snd/controlC0", 0o666, false, 116, 0);
+    crate::fs::add_dev("snd/pcmC0D0p", 0o666, false, 116, 16);
     true
 }
 

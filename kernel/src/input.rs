@@ -79,6 +79,8 @@ pub fn init() {
             intr(id);
         });
         println!("input: /dev/input/event{} {}", devs().len(), d.name);
+        // /dev/input/eventN (Linux の devtmpfs: 装置を見つけたものがノードを置く)
+        crate::fs::add_dev(&alloc::format!("input/event{}", devs().len()), 0o666, false, 13, 64 + devs().len() as u32);
         devs().push(d);
     }
 }
