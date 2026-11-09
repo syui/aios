@@ -11,6 +11,7 @@
 // (Linux も受け手がなければそう)
 use crate::cred::Cred;
 use crate::proc;
+use crate::syscall::AUDIT_ARCH_AARCH64;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -49,8 +50,6 @@ const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_ACTION_FULL: u32 = 0xffff_0000;
 const RET_DATA: u32 = 0x0000_ffff;
 
-/// seccomp_data の arch (AUDIT_ARCH_AARCH64)
-pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 /// seccomp_data の大きさ (nr 4、arch 4、instruction_pointer 8、args 8 × 6)
 const DATA_LEN: u32 = 64;
 const MAX_INSNS: usize = 4096;
@@ -81,11 +80,16 @@ pub struct Filter {
     restart_before_recv: bool,
 }
 
-pub type Seccomp = Rc<State>;
+type Seccomp = Rc<State>;
+
+/// c にかかっているもの (Cred の seccomp の中。core は中を知らない: security::Blob)
+fn state(c: &Cred) -> Option<&State> {
+    c.seccomp.as_ref().map(|b| b.downcast_ref::<State>().expect("seccomp: state"))
+}
 
 /// /proc/PID/status の Seccomp: (0 なし、1 strict、2 filter) と Seccomp_filters:
 pub fn mode(c: &Cred) -> (u64, usize) {
-    match &c.seccomp {
+    match state(c) {
         None => (MODE_DISABLED, 0),
         Some(s) if s.strict => (MODE_STRICT, s.filters.len()),
         Some(s) => (MODE_FILTER, s.filters.len()),
@@ -200,12 +204,12 @@ fn wake_listener(f: &Rc<Filter>) {
 
 /// そのフィルタをかけているスレッドの数 (Linux の users: 回収されるまでのゾンビもふくむ)。0 なら listener は POLLHUP
 fn users(f: &Rc<Filter>) -> usize {
-    proc::count_live(|c| c.seccomp.as_ref().is_some_and(|s| s.filters.iter().any(|x| Rc::ptr_eq(x, f))))
+    proc::count_live(|c| state(c).is_some_and(|s| s.filters.iter().any(|x| Rc::ptr_eq(x, f))))
 }
 
 /// スレッドの Proc が片づけられる (proc::free_slot): そのフィルタの listener を起こす (使う人がいなくなったかも)
 pub fn released(c: &Cred) {
-    if let Some(s) = &c.seccomp {
+    if let Some(s) = state(c) {
         for f in s.filters.iter().filter(|f| f.notif.borrow().is_some()) {
             wake_listener(f);
         }
@@ -283,7 +287,7 @@ pub fn readiness(l: &Listener) -> (bool, bool, bool) {
 }
 
 /// listener の ioctl (Linux の seccomp_notify_ioctl)。l は fd の OpenFile を借りずに写したもの (RECV は眠る)
-pub fn ioctl(l: &Rc<Listener>, req: u64, arg: usize) -> Result<i64, i64> {
+pub fn ioctl(l: &Listener, req: u64, arg: usize) -> Result<i64, i64> {
     let f = &l.0;
     match req {
         IOCTL_NOTIF_RECV => recv(f, arg),
@@ -623,7 +627,7 @@ fn read_prog(addr: usize) -> Result<Vec<Insn>, i64> {
 }
 
 /// 今のもの (なければ空) に足した新しい State
-fn add(old: &Option<Seccomp>, strict: bool, prog: Option<Rc<Filter>>) -> Result<Seccomp, i64> {
+fn add(old: Option<&State>, strict: bool, prog: Option<Rc<Filter>>) -> Result<Seccomp, i64> {
     let (s0, mut f) = match old {
         Some(s) => (s.strict, s.filters.clone()),
         None => (false, Vec::new()),
@@ -651,17 +655,17 @@ fn install(strict: bool, prog: Option<Vec<Insn>>, flags: u64) -> Result<i64, i64
         Rc::new(Filter { prog, notif: RefCell::new(notif), wait_killable: flags & FLAG_WAIT_KILLABLE_RECV != 0, restart_before_recv: flags & FLAG_RESTART_BEFORE_RECV != 0 })
     });
     // 上のフィルタにもう listener があれば EBUSY (Linux の has_duplicate_listener)
-    if listener && p.cred.seccomp.as_ref().is_some_and(|s| s.filters.iter().any(|x| x.notif.borrow().as_ref().is_some_and(|n| !n.closed))) {
+    if listener && state(&p.cred).is_some_and(|s| s.filters.iter().any(|x| x.notif.borrow().as_ref().is_some_and(|n| !n.closed))) {
         return Err(-EBUSY);
     }
-    let new = add(&p.cred.seccomp, strict, prog.clone())?;
+    let new = add(state(&p.cred), strict, prog.clone())?;
     let mut fd = 0;
     if let Some(f) = prog.as_ref().filter(|_| listener) {
         let file = crate::file::new(crate::file::Kind::SeccompNotify(Rc::new(Listener(f.clone()))), crate::file::O_RDWR);
         fd = p.files().add(file, true, 0).ok_or(-24)? as i64;
     }
     let p = proc::current();
-    p.cred.seccomp = Some(new);
+    p.cred.seccomp = Some(new as crate::security::Blob);
     if tsync {
         let s = p.cred.seccomp.clone();
         for t in p.siblings() {
@@ -723,5 +727,60 @@ pub fn prctl_set(mode: u64, prog: usize) -> Result<i64, i64> {
         MODE_STRICT => install(true, None, 0),
         MODE_FILTER => install(false, Some(read_prog(prog)?), 0),
         _ => Err(crate::why::inval()),
+    }
+}
+
+// ---- seccomp の入り口 (security.rs: Linux の include/linux/seccomp.h。LSM ではない) ----
+
+/// listener の fd の中身 (security::Listener)
+impl crate::security::Listener for Listener {
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness(self)
+    }
+
+    fn chan(&self) -> usize {
+        listener_chan(self)
+    }
+
+    fn ioctl(&self, req: u64, arg: usize) -> Result<i64, i64> {
+        ioctl(self, req, arg)
+    }
+}
+
+/// seccomp (main.rs が register_seccomp でつなぐ)
+pub struct Ops;
+pub static OPS: Ops = Ops;
+
+impl crate::security::Seccomp for Ops {
+    /// フィルタの答え。user notification なら listener に知らせて答えを待つ (CONTINUE ならシステムコールをする)
+    fn permit(&self, s: &crate::security::Blob, nr: u64, a: &[u64; 6], pc: u64) -> crate::security::Permit {
+        use crate::security::Permit;
+        match check(s.downcast_ref::<State>().expect("seccomp: state"), nr, a, pc) {
+            Verdict::Allow => Permit::Allow,
+            Verdict::Errno(e) => Permit::Errno(e),
+            Verdict::Trap(errno) => Permit::Trap(errno),
+            Verdict::Kill => Permit::Kill,
+            Verdict::Notify(f, data) => match notify(&f, data) {
+                Notified::Continue => Permit::Allow,
+                Notified::Return(v) => Permit::Return(v),
+                Notified::Interrupted { always } => Permit::Interrupted { always },
+            },
+        }
+    }
+
+    fn release(&self, c: &Cred) {
+        released(c);
+    }
+
+    fn mode(&self, c: &Cred) -> i64 {
+        mode(c).0 as i64
+    }
+
+    fn prctl_set(&self, mode: u64, prog: usize) -> Result<i64, i64> {
+        prctl_set(mode, prog)
+    }
+
+    fn syscall(&self, op: u64, flags: u64, args: usize) -> Result<i64, i64> {
+        sys_seccomp(op, flags, args)
     }
 }

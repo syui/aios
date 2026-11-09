@@ -2722,7 +2722,7 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         _ => None,
     };
     if let Some(l) = listener {
-        return crate::seccomp::ioctl(&l, req, arg);
+        return l.ioctl(req, arg);
     }
     if let Kind::Input(n) = f.borrow().kind {
         return crate::input::ioctl(n, req, arg);

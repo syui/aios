@@ -664,7 +664,7 @@ fn rule_matches(p: &Proc, r: &Rule, s: Option<&Sys>, name: Option<&NameInfo>, wa
             F_FSGID => idcmp(c.fsgid, f.op, f.val),
             F_SESSIONID => cmp(c.sessionid, f.op, f.val),
             F_PERS => cmp(0, f.op, f.val),
-            F_ARCH => s.is_some() && cmp(crate::seccomp::AUDIT_ARCH_AARCH64, f.op, f.val),
+            F_ARCH => s.is_some() && cmp(crate::syscall::AUDIT_ARCH_AARCH64, f.op, f.val),
             F_EXIT => s.and_then(|s| s.ret).is_some_and(|(_, code)| cmp(code as u32, f.op, f.val)),
             F_SUCCESS => s.and_then(|s| s.ret).is_some_and(|(ok, _)| {
                 // return_valid は 1 が成功、2 がしくじり

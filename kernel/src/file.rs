@@ -58,7 +58,7 @@ pub enum Kind {
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
     /// seccomp の user notification の listener (SECCOMP_FILTER_FLAG_NEW_LISTENER。知らせが来ると読める)
-    SeccompNotify(Rc<crate::seccomp::Listener>),
+    SeccompNotify(Rc<dyn crate::security::Listener>),
     /// ディスクか区画 (/dev/vda2 など)。セクタに合わないところは読んでから書く
     Block(crate::block::Part),
     /// 画面 (/dev/fb0、virtio-gpu)
@@ -1082,7 +1082,7 @@ impl OpenFile {
                 (exited, false, reaped)
             }
             Kind::Epoll(e) => (e.borrow_mut().readable(), false, false),
-            Kind::SeccompNotify(l) => crate::seccomp::readiness(l),
+            Kind::SeccompNotify(l) => l.readiness(),
             Kind::Input(n) => (crate::input::readable(*n), false, false),
             Kind::SndPcm => crate::sound::readiness(),
             _ => (true, true, false),
@@ -1140,7 +1140,7 @@ impl OpenFile {
             Kind::Socket(_) => alloc::vec![crate::net::chan()],
             Kind::Netlink(n) => alloc::vec![crate::netlink::chan(n)],
             Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
-            Kind::SeccompNotify(l) => alloc::vec![crate::seccomp::listener_chan(l)],
+            Kind::SeccompNotify(l) => alloc::vec![l.chan()],
             // いつでも読み書きできる (待たない)
             Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
             Kind::Input(n) => alloc::vec![crate::input::chan(*n)],

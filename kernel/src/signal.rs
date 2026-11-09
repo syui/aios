@@ -403,7 +403,7 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
             put(&mut b, 4, &i.timerid.to_le_bytes());
             put(&mut b, 16, &i.addr.to_le_bytes());
             put(&mut b, 24, &i.status.to_le_bytes());
-            put(&mut b, 28, &crate::seccomp::AUDIT_ARCH_AARCH64.to_le_bytes());
+            put(&mut b, 28, &crate::syscall::AUDIT_ARCH_AARCH64.to_le_bytes());
         }
         SIGCHLD => {
             put(&mut b, 16, &crate::ns::local_or_0(i.pid).to_le_bytes());

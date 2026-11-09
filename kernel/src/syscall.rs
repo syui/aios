@@ -269,6 +269,9 @@ nrs! {
     LSM_LIST_MODULES = 461,
 }
 
+/// システムコールのアーキテクチャ (Linux の syscall_get_arch: seccomp_data の arch、SIGSYS の si_arch、audit の記録の arch=)
+pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
 /// 1 つめの引数が fd のシステムコールで、/proc/bkl がその fd の開いたものの種類 (file::CLASSES) ごとに分けて数えるもの
 /// (read がパイプか、ソケットか、ファイルかで、ロックを分ける場所がちがう)
 pub const FD_SYS: [u64; 15] = [
@@ -374,12 +377,13 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     count(nr);
     // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
     crate::oom::check();
-    // seccomp: かかっていれば、フィルタの答えにしたがう
+    // seccomp: かかっていれば、フィルタの答えにしたがう (security::seccomp_permit_syscall。s は写して持つ: user notification
+    // で眠るあいだに、ほかのスレッドの TSYNC で入れかわっても消えないように)
     if let Some(s) = p.cred.seccomp.clone() {
         let args = [a[0], a[1], a[2], a[3], a[4], a[5]];
-        match crate::seccomp::check(&s, nr, &args, tf.elr) {
-            crate::seccomp::Verdict::Allow => {}
-            crate::seccomp::Verdict::Errno(e) => {
+        match crate::security::seccomp_permit_syscall(&s, nr, &args, tf.elr) {
+            crate::security::Permit::Allow => {}
+            crate::security::Permit::Errno(e) => {
                 tf.x[0] = e as u64;
                 crate::trace::sys_exit(nr, e);
                 strace(nr, &a, Err(e));
@@ -387,32 +391,30 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
                 crate::whylog::done(nr, e, &a);
                 return None;
             }
-            crate::seccomp::Verdict::Trap(errno) => {
+            crate::security::Permit::Trap(errno) => {
                 signal::force_sigsys(nr, tf.elr, errno);
                 tf.x[0] = (-ENOSYS) as u64;
                 crate::trace::sys_exit(nr, -ENOSYS);
                 return None;
             }
-            crate::seccomp::Verdict::Kill => {
+            crate::security::Permit::Kill => {
                 println!("seccomp: pid {} killed at syscall {}", proc::current().pid, nr);
                 proc::die(signal::SIGSYS);
             }
-            // user notification: listener の答えを待つ。CONTINUE ならそのままシステムコールを
-            crate::seccomp::Verdict::Notify(f, data) => match crate::seccomp::notify(&f, data) {
-                crate::seccomp::Notified::Continue => {}
-                crate::seccomp::Notified::Return(v) => {
-                    tf.x[0] = v as u64;
-                    crate::trace::sys_exit(nr, v);
-                    strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
-                    return None;
-                }
-                // シグナルで割りこまれた: Linux の ERESTARTSYS (RESTART_BEFORE_RECV で受ける前なら ERESTARTNOINTR)
-                crate::seccomp::Notified::Interrupted { always } => {
-                    tf.x[0] = (-EINTR_) as u64;
-                    crate::trace::sys_exit(nr, -EINTR_);
-                    return Some(Restart { restartable: true, always });
-                }
-            },
+            // user notification: listener が答えた値で返す (CONTINUE ならそのままシステムコールを: Allow)
+            crate::security::Permit::Return(v) => {
+                tf.x[0] = v as u64;
+                crate::trace::sys_exit(nr, v);
+                strace(nr, &a, if v < 0 && v > -4096 { Err(v) } else { Ok(v) });
+                return None;
+            }
+            // listener を待つあいだにシグナルで割りこまれた: Linux の ERESTARTSYS (RESTART_BEFORE_RECV で受ける前なら
+            // ERESTARTNOINTR)
+            crate::security::Permit::Interrupted { always } => {
+                tf.x[0] = (-EINTR_) as u64;
+                crate::trace::sys_exit(nr, -EINTR_);
+                return Some(Restart { restartable: true, always });
+            }
         }
     }
     // 切ったところ (aios.off=。parts.rs) のシステムコールは、それを入れずに作った Linux と同じ ENOSYS
@@ -572,7 +574,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PIDFD_OPEN => crate::ns::arg_pid(int(a[0])).and_then(|p| sys_pidfd_open(p, a[1])),
         // LSM のシステムコール (landlock_*: security::lsm_syscall)
         LANDLOCK_CREATE_RULESET | LANDLOCK_ADD_RULE | LANDLOCK_RESTRICT_SELF => crate::security::lsm_syscall(nr, &a),
-        SECCOMP => crate::seccomp::sys_seccomp(a[0], a[1], a[2] as usize),
+        SECCOMP => crate::security::sys_seccomp(a[0], a[1], a[2] as usize),
         PIDFD_SEND_SIGNAL => crate::pidfd::send_signal(int(a[0]), int(a[1]) as i32, a[2] as usize, a[3] as u32 as u64),
         PIDFD_GETFD => crate::pidfd::getfd(int(a[0]), int(a[1]), a[2] as u32 as u64),
         KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),
@@ -2027,10 +2029,10 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             p.cred.no_new_privs = true;
         }
         PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
-        PR_GET_SECCOMP => return Ok(crate::seccomp::mode(&p.cred).0 as i64),
+        PR_GET_SECCOMP => return Ok(crate::security::prctl_get_seccomp(&p.cred)),
         // seccomp を切っていれば (aios.off=seccomp)、入れずに作った Linux と同じ EINVAL
         PR_SET_SECCOMP if crate::parts::off(crate::parts::Part::Seccomp) => return Err(crate::why::inval()),
-        PR_SET_SECCOMP => return crate::seccomp::prctl_set(arg as u64, arg3),
+        PR_SET_SECCOMP => return crate::security::prctl_set_seccomp(arg as u64, arg3),
         PR_SET_NAME => {
             let mut b = [0u8; 16];
             p.pt().copy_in(&mut b[..15], arg).ok_or(-14)?;

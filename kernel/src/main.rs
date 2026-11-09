@@ -144,6 +144,8 @@ pub extern "C" fn kmain() -> ! {
     // 切ったもの (aios.off=) もつなぐ: 動かしたまま入れなおせるように、切ったかはそれぞれがフックの中で見る
     security::register(&landlock::LSM);
     security::register(&apparmor::LSM);
+    // seccomp (LSM ではない: Linux の CONFIG_SECCOMP)。切ったもの (aios.off=seccomp) もつなぐ (切るのはシステムコールだけ)
+    security::register_seccomp(&seccomp::OPS);
 
     irq::init();
     irq::enable_ipi();

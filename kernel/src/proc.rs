@@ -728,7 +728,7 @@ pub fn drop_prefork() {
 fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     // seccomp の listener に、フィルタを使う人が減ったことを (使う人がいなくなれば POLLHUP)
-    crate::seccomp::released(&p.cred);
+    crate::security::seccomp_filter_release(&p.cred);
     // pidfd があれば、終わったときの status を (PIDFD_GET_INFO の PIDFD_INFO_EXIT)
     crate::pidfd::reaped(p.pid, p.xstatus);
     let i = slot_of(p);

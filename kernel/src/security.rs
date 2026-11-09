@@ -588,3 +588,96 @@ pub fn lsm_set_self_attr(attr: u32, ctx: usize, size: u32, flags: u32) -> Result
     l.setselfattr(attr, &b[LSM_CTX..LSM_CTX + ctx_len as usize])?;
     Ok(0)
 }
+
+// ---- seccomp (Linux の kernel/seccomp.c と include/linux/seccomp.h)。LSM ではない (Linux も): 入り口だけをここに
+// 置き、seccomp.rs が register_seccomp でつなぐ。入っていなければ Linux の !CONFIG_SECCOMP と同じ ----
+
+/// seccomp のフィルタが決めたこと (Linux の __secure_computing の答え。user notification の listener の答えも)
+pub enum Permit {
+    /// システムコールをする
+    Allow,
+    /// この errno で返す (SECCOMP_RET_ERRNO)
+    Errno(i64),
+    /// SIGSYS を送る (SECCOMP_RET_TRAP。値は si_errno)
+    Trap(u16),
+    /// プロセスを止める (SECCOMP_RET_KILL_*)
+    Kill,
+    /// listener の答えの値で返す (システムコールはしない)
+    Return(i64),
+    /// listener を待つあいだにシグナルで割りこまれた (always ならハンドラのあとでもいつもやりなおす)
+    Interrupted { always: bool },
+}
+
+/// seccomp (Linux の CONFIG_SECCOMP)。既定は入れずに作った Linux と同じ
+pub trait Seccomp {
+    /// s (Cred の seccomp) のフィルタで nr を見る (pc はシステムコールの場所)。user notification なら答えを待つ
+    /// (眠る: s は呼ぶほうが写して持つ。ほかのスレッドの TSYNC で Cred の seccomp が入れかわっても消えないように)
+    fn permit(&self, _s: &Blob, _nr: u64, _a: &[u64; 6], _pc: u64) -> Permit {
+        Permit::Allow
+    }
+    /// スレッドの Proc を片づける (listener を起こす: 使う人がいなくなれば POLLHUP)
+    fn release(&self, _c: &Cred) {}
+    /// prctl(PR_GET_SECCOMP)
+    fn mode(&self, _c: &Cred) -> i64 {
+        0
+    }
+    /// prctl(PR_SET_SECCOMP)
+    fn prctl_set(&self, _mode: u64, _prog: usize) -> Result<i64, i64> {
+        Err(-EINVAL)
+    }
+    /// seccomp(2)
+    fn syscall(&self, _op: u64, _flags: u64, _args: usize) -> Result<i64, i64> {
+        Err(-ENOSYS)
+    }
+}
+
+/// listener の fd (anon_inode:seccomp notify。file::Kind::SeccompNotify) の中身。さいごの参照を閉じると、中が待っている
+/// ものを起こす (Drop)
+pub trait Listener {
+    /// poll: (読める, 書ける, POLLHUP)
+    fn readiness(&self) -> (bool, bool, bool);
+    /// poll と NOTIF_RECV が眠る chan
+    fn chan(&self) -> usize;
+    /// ioctl (NOTIF_RECV は眠る: 呼ぶほうは OpenFile を借りずに Rc を写して持つ)
+    fn ioctl(&self, req: u64, arg: usize) -> Result<i64, i64>;
+}
+
+struct NoSeccomp;
+
+impl Seccomp for NoSeccomp {}
+
+static SECCOMP: Early<&'static dyn Seccomp> = Early::new(&NoSeccomp);
+
+/// 起動のとき (main.rs) に seccomp をつなぐ。aios.off=seccomp でもつなぐ (切るのはシステムコールだけ: core の part_of)
+pub fn register_seccomp(s: &'static dyn Seccomp) {
+    SECCOMP.set(s);
+}
+
+/// seccomp_permit_syscall (Linux 7.4 の secure_computing): Cred の seccomp があるときだけ呼ぶ
+#[inline]
+pub fn seccomp_permit_syscall(s: &Blob, nr: u64, a: &[u64; 6], pc: u64) -> Permit {
+    SECCOMP.val().permit(s, nr, a, pc)
+}
+
+/// seccomp_filter_release: スレッドの Proc を片づける
+#[inline]
+pub fn seccomp_filter_release(c: &Cred) {
+    if c.seccomp.is_some() {
+        SECCOMP.val().release(c);
+    }
+}
+
+/// prctl_get_seccomp
+pub fn prctl_get_seccomp(c: &Cred) -> i64 {
+    SECCOMP.val().mode(c)
+}
+
+/// prctl_set_seccomp
+pub fn prctl_set_seccomp(mode: u64, prog: usize) -> Result<i64, i64> {
+    SECCOMP.val().prctl_set(mode, prog)
+}
+
+/// seccomp(2)
+pub fn sys_seccomp(op: u64, flags: u64, args: usize) -> Result<i64, i64> {
+    SECCOMP.val().syscall(op, flags, args)
+}

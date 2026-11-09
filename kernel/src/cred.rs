@@ -71,8 +71,8 @@ pub struct Cred {
     /// 砂場の LSM (landlock) の層。中はその LSM だけが知る。fork で受けつぐ。is_some なら、file::fast_open と fastdir
     /// (大きなロックのない open と作る・消す) を使わない
     pub sandbox: Option<crate::security::Blob>,
-    /// seccomp のフィルタ (かかっているもの)
-    pub seccomp: Option<crate::seccomp::Seccomp>,
+    /// seccomp のフィルタ (かかっているもの。中は seccomp だけが知る: security::Blob)。syscall::fast は is_some を見る
+    pub seccomp: Option<crate::security::Blob>,
     /// namespace (ns.rs)
     pub ns: crate::ns::Ns,
     /// LSM のラベル (AppArmor のプロファイルの名前。なければ unconfined)。fork で受けつぐ。syscall::fast は is_some を見る

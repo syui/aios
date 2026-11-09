@@ -844,7 +844,7 @@ fn log_exit(ret: Option<i64>) {
     };
     let body = format!(
         "arch={:x} syscall={}{} a0={:x} a1={:x} a2={:x} a3={:x} items={}{} key={}",
-        crate::seccomp::AUDIT_ARCH_AARCH64,
+        crate::syscall::AUDIT_ARCH_AARCH64,
         major,
         result,
         argv[0],
