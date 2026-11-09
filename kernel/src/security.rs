@@ -123,6 +123,10 @@ pub trait Lsm {
     fn ptrace_access_check(&self, _child: &Cred, _mode: u32) -> Result<(), i64> {
         Ok(())
     }
+    /// namespace を作る (flags は CLONE_NEW*)
+    fn namespace_init(&self, _c: &Cred, _flags: u64) -> Result<(), i64> {
+        Ok(())
+    }
     fn bprm_creds_for_exec(&self, _b: &mut Bprm, _exe: &str, _ouid: u32) -> Result<(), i64> {
         Ok(())
     }
@@ -247,6 +251,12 @@ pub fn capable(c: &Cred, cap: u32, audit: bool) -> bool {
     (c.label.is_none() && c.sandbox.is_none()) || lsms().iter().all(|l| l.capable(c, cap, audit))
 }
 
+/// aios の順: 重ねる LSM (landlock) だけに聞く capable (ns.rs の namespace を作る・ホスト名を変える。Linux の ns_capable は
+/// みなに聞く)
+pub fn capable_stacked(c: &Cred, cap: u32) -> bool {
+    STACKED.val().capable(c, cap, true)
+}
+
 /// security_capget: root に見せる capability を、それぞれの LSM がせばめる
 pub fn capget(c: &Cred) -> u64 {
     lsms().iter().fold(u64::MAX, |m, l| m & l.capget(c))
@@ -264,6 +274,14 @@ pub fn task_kill(target: &Proc, sig: i32) -> Result<(), i64> {
 pub fn ptrace_access_check(child: &Cred, mode: u32) -> Result<(), i64> {
     for l in lsms() {
         l.ptrace_access_check(child, mode)?;
+    }
+    Ok(())
+}
+
+/// security_namespace_init: c が flags (CLONE_NEW*) の namespace を作る
+pub fn namespace_init(c: &Cred, flags: u64) -> Result<(), i64> {
+    for l in lsms() {
+        l.namespace_init(c, flags)?;
     }
     Ok(())
 }

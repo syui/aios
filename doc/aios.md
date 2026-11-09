@@ -338,7 +338,7 @@ Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cac
 
 | type | 中身 | 1 行 |
 |---|---|---|
-| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what (測れるものは bench) |
+| `core` | 起動して /init が動き、シリアルに書けるのに要るもの。いつも小さくしていく | 1 つのファイル: name、src、what (測れるものは bench。切れるものは off: ns だけで、新しく作れなくするだけ) |
 | `extra` | Linux の口 (syscall、/proc、ioctl、ファイルシステム)、aios の機能、ドライバ。なくてもカーネルは動く | 1 つのファイル: name、src、what (切れるものは off、測れるものは bench) |
 | `quirk` | ある機械やプログラムのつごうで入れた手当て (Linux の quirk と同じ考え)。外せる条件 (`until`) がある | 1 つの手当て: name、src (いくつものファイル)、cause、what、until、test、off |
 
@@ -352,7 +352,8 @@ security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動
 AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
 test/kernel-json.py の `BEHIND_HOOKS` に書き、core がまた名前で呼べば落ちる (いまは apparmor、landlock、seccomp、audit、auditfilter)。seccomp と audit は LSM ではない
 (Linux も): security.rs の中の別の入り口 (Linux の include/linux/seccomp.h と audit.h: seccomp_permit_syscall、
-audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。LSM が
+audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。namespace (ns) は Linux と
+同じく core (pid、uid、ホスト名の読みかえと mount の namespace。LSM は作るときだけ見る: security::namespace_init)。LSM が
 プロセスやファイルに持たせるもの (AppArmor のラベル、landlock の層、開いたときに覚えたもの) は、core の中立の名前の欄
 (Cred の label・label_ctx・sandbox、OpenFile の label・lsm_deny) に入れ、中はその LSM だけが知る。いまの aios の順が Linux と
 ちがうところ (すでにあるファイルを開くときは AppArmor が先、など) は、フックに「aios の順」と書いてある。
@@ -1621,7 +1622,7 @@ Linux より弱いところ (KPTI、BHB のループ、ファームウェアの�
 
 ### カーネルの砂場 (aios.off= と aish の box)
 
-`off` のあるもの (extra と quirk) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる
+`off` のあるもの (extra と quirk と、core の ns) は、起動の引数 `aios.off=NAME,NAME` で切って、それがないカーネルのように起こせる
 (kernel/src/parts.rs。システムコールはそれを入れずに作った Linux と同じ ENOSYS、装置は起こさない、quirk は手当てをしない。
 切るとどうなるかはそれぞれの `off`)。起動のときに `parts: off NAME ...` と出る。切ってもほかが動くか、quirk がまだ要るかを
 確かめるのは aish の `box` (aish-vm): 切って VM (`-snapshot`) を起こし、CI と同じテスト (vm-check と vm-ctests) を動かして、

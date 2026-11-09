@@ -125,19 +125,19 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         if !crate::proc::current_root().is_empty() {
             return Err(-EPERM);
         }
-        // landlock の NAMESPACE_USE (Linux の hook_namespace_init)
-        crate::landlock::check_ns(c, CLONE_NEWUSER)?;
+        // LSM (landlock の NAMESPACE_USE: Linux の security_namespace_init)
+        crate::security::namespace_init(c, CLONE_NEWUSER)?;
         c.ns.user = Some(Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) }));
     }
     if flags & !CLONE_NEWUSER & SUPPORTED != 0 {
         if c.ns.user.is_none() && !c.no_new_privs && !c.capable(crate::cred::CAP_SYS_ADMIN) {
             return Err(-EPERM);
         }
-        // ユーザーの namespace の中 (CAP_SYS_ADMIN を持つ) でも、landlock の CAPABILITY_USE は効く
-        if !crate::landlock::cap_ok(c, crate::cred::CAP_SYS_ADMIN) {
+        // ユーザーの namespace の中 (CAP_SYS_ADMIN を持つ) でも、LSM (landlock の CAPABILITY_USE) は効く
+        if !crate::security::capable_stacked(c, crate::cred::CAP_SYS_ADMIN) {
             return Err(-EPERM);
         }
-        crate::landlock::check_ns(c, flags & !CLONE_NEWUSER)?;
+        crate::security::namespace_init(c, flags & !CLONE_NEWUSER)?;
     }
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
@@ -191,8 +191,8 @@ pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
     b[..name.len()].copy_from_slice(name);
     let c = &crate::proc::current().cred;
     match &c.ns.uts {
-        // 自分の UTS (CAP_SYS_ADMIN を持つ) でも、landlock の CAPABILITY_USE は効く
-        Some(_) if check && !crate::landlock::cap_ok(c, crate::cred::CAP_SYS_ADMIN) => return Err(-EPERM),
+        // 自分の UTS (CAP_SYS_ADMIN を持つ) でも、LSM (landlock の CAPABILITY_USE) は効く
+        Some(_) if check && !crate::security::capable_stacked(c, crate::cred::CAP_SYS_ADMIN) => return Err(-EPERM),
         Some(u) => *u.name.borrow_mut() = (b, name.len()),
         None => {
             if check && !c.capable(crate::cred::CAP_SYS_ADMIN) {

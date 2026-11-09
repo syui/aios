@@ -611,6 +611,11 @@ impl crate::security::Lsm for Landlock {
         check_ptrace(crate::cred::current().sandbox.as_ref(), child.sandbox.as_ref())
     }
 
+    /// hook_namespace_init: NAMESPACE_USE
+    fn namespace_init(&self, c: &crate::cred::Cred, flags: u64) -> Result<(), i64> {
+        check_ns(c, flags)
+    }
+
     /// hook_file_open: 開く道ごとの権利。返すのは開いたファイルに覚える、許されなかった TRUNCATE と IOCTL_DEV
     fn file_open(&self, o: &crate::security::FileOpen) -> Result<u32, i64> {
         use crate::file::{O_ACCMODE, O_RDONLY, O_WRONLY};
