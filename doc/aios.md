@@ -1742,6 +1742,13 @@ VM の起動が 8 秒おそくなった)。起動のときのヒープの区画�
 呼び出しの番地は `aarch64-linux-gnu-addr2line -e build/aish-vm/kernels/work -f -C -i ADDR` で関数に (インラインに
 なったものは、外の関数になる)。
 
+見つけたもの (2026-11-09、mem-corrupt-stress): 大きなロックなしの munmap (vm::PageTable::fast_unmap) が呼ぶ split が、
+分けない領域の Vma も写して落とし、ファイルの inode と名前の Rc の数を大きなロックなしで変えていた。Rc の数は atomic で
+ないので、ほかの CPU が大きなロックの中で同じ数を変えると片方が消え、まだ持っている人のいる inode が返る。heap poison
+では「write after free: … size 240 at +0 word 0x6b6b6b6b6b6b6b6a」(返した TmpInode の strong を、あとで落とした人が
+1 つ減らした) になる。test/rcrace.c (写して外す子と、開いて閉じる子を同じファイルで) がこれを出す。大きなロックなしの
+道では Rc を写さない・落とさない (動かすだけ)。
+
 ### 速さを測る (bench と /proc/ai/prof)
 
 速さは **測る → 記録する → くらべる → いちばん遅いところを見つけて直す → また測る** のくりかえしで上げる。そのための道具:
