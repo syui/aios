@@ -6,8 +6,8 @@
 #                                  AIOS_KERNEL=FILE でそのカーネルを。ほかの AIOS_* も run.sh へ)。--kernel . は作業中の
 #                                  ソースから、COMMIT はそのコミットから (build/aish-vm/wt で) カーネルを作って起こす
 #                                  (aish の vm start kernel= と同じ作りかたと置き場 build/aish-vm/kernels。動いていれば
-#                                  止めてから)。--snapshot はディスクに書き残さない、--off は kernel.json の extra や quirk を
-#                                  切る (aios.off=)。aish がつながらないときも、これだけで作業中のカーネルをためせる
+#                                  止めてから)。--snapshot はディスクに書き残さない、--off は kernel.json の off のある
+#                                  もの (extra、quirk と core の ns) を切る (aios.off=)。aish がつながらないときも、これだけで作業中のカーネルをためせる
 #   test/vm.py run 'CMD' [-t SEC]  シリアルの端末で動かし、出力を出して、同じ終わりの番号で終わる (何行でもよい)
 #   test/vm.py bg 'CMD'            中でうしろで動かしてすぐ答える ({"job": ID})。長いもの (ap -S firefox など) のあいだも run が使える
 #   test/vm.py job [ID] [-w SEC] [--kill]
