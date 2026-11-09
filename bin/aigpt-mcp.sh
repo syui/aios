@@ -1,7 +1,7 @@
 #!/bin/sh
 cd "$(dirname "$0")/.."
 PATH=$HOME/.local/bin:$PATH
-signers="466554110F5881784365F04A924183B3813D5C25 F33093BEA3A4BEA4521901A17CBAC5071C3EB395"
+signers="$GPG_SIG"
 fetch() {
   src=$(mktemp -d "${TMPDIR:-/tmp}/aigpt-mcp-$1.XXXXXX") || return 1
   git clone -q --depth 1 --filter=blob:none --no-checkout "https://git.syui.ai/ai/$1" "$src" || { rm -rf "$src"; return 1; }
