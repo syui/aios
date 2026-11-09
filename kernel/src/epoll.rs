@@ -168,7 +168,8 @@ fn pollable(f: &file::OpenFile) -> bool {
             let magic = u64::from_le_bytes(ino.statfs()[0..8].try_into().unwrap());
             magic == PROC_MAGIC || magic == SYSFS_MAGIC
         }
-        Kind::Null | Kind::Zero | Kind::Block(_) | Kind::Landlock(_) => false,
+        Kind::Null | Kind::Zero | Kind::Landlock(_) => false,
+        Kind::Ops(o) => o.pollable(),
         _ => true,
     }
 }

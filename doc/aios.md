@@ -392,7 +392,10 @@ sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる
 システムコールとして ENOSYS)。装置とソケットの mmap (画面、音の再生の口、TCP のソケット: Linux の f_op->mmap) は file.rs。
 開いたものの中身は、なくても動くところのもの (epoll、eventfd、timerfd、inotify) から順に file::Kind::Ops (FileOps: Linux の
 file_operations) へ移している: それぞれが FileOps (読み書き、readiness、poll の印、fdinfo、/proc/PID/fd の名前 ...) を書き、
-file.rs はその関数で呼ぶ。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。
+file.rs はその関数で呼ぶ。fd から自分のものを取りだすときは Kind::ops (Linux の file->private_data)。装置 (ディスクと区画、
+画面、キーボードやマウス、音) も FileOps で (位置のあるもの、ioctl、mmap、release ...)、/dev のノードの番号から開くものは、
+装置が起こすときに file::register_chrdev (画面 29、input 13、音 116) と register_blkdev (区画) で置く (Linux の
+register_chrdev、register_blkdev)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

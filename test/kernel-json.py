@@ -178,7 +178,9 @@ CORE_USES_EXTRA_MAX = 3
 BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
                 "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs",
                 "sysfs": "vfs.rs", "securityfs": "vfs.rs", "module": "syscall.rs",
-                "epoll": "file.rs (FileOps) and syscall.rs", "timerfd": "file.rs (FileOps) and syscall.rs"}
+                "epoll": "file.rs (FileOps) and syscall.rs", "timerfd": "file.rs (FileOps) and syscall.rs",
+                "block": "file.rs (FileOps, register_blkdev)", "gpu": "file.rs (FileOps, register_chrdev)", "input": "file.rs (FileOps, register_chrdev)",
+                "sound": "file.rs (FileOps, register_chrdev)"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

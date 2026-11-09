@@ -49,23 +49,13 @@ pub enum Kind {
     Inet(crate::inet::InetRef),
     /// AF_NETLINK (netlink.rs)
     Netlink(crate::netlink::NetlinkRef),
-    /// なくても動くところのもの (epoll、eventfd、timerfd、inotify ...): 中身とその操作 (Linux の file の private_data と
-    /// f_op。file.rs は FileOps の関数で呼び、名前で呼ばない)
+    /// なくても動くところのもの (epoll、eventfd、timerfd、inotify、装置: ディスクと区画、画面、キーボードやマウス、音 ...):
+    /// 中身とその操作 (Linux の file の private_data と f_op。file.rs は FileOps の関数で呼び、名前で呼ばない)
     Ops(Rc<dyn FileOps>),
     /// pidfd_open で開いたプロセス (終わると読める)
     PidFd(u32),
     /// seccomp の user notification の listener (SECCOMP_FILTER_FLAG_NEW_LISTENER。知らせが来ると読める)
     SeccompNotify(Rc<dyn crate::security::Listener>),
-    /// ディスクか区画 (/dev/vda2 など)。セクタに合わないところは読んでから書く
-    Block(crate::block::Part),
-    /// 画面 (/dev/fb0、virtio-gpu)
-    Fb,
-    /// キーボードやマウス (/dev/input/eventN、virtio-input)
-    Input(usize),
-    /// 音のカードの制御の口 (/dev/snd/controlC0、virtio-sound)
-    SndCtl,
-    /// 音の再生の口 (/dev/snd/pcmC0D0p)
-    SndPcm,
     /// landlock_create_ruleset の決まりの束 (中は landlock だけが知る)
     Landlock(Rc<dyn core::any::Any>),
 }
@@ -147,9 +137,99 @@ pub trait FileOps: core::any::Any {
     fn lockable(&self) -> bool {
         false
     }
+    /// open で開いたもの (装置。F_GETFL に O_LARGEFILE を見せる)
+    fn opened(&self) -> bool {
+        false
+    }
+    /// 位置のあるもの (pread、pwrite、lseek、sendfile の位置: Linux の FMODE_LSEEK と FMODE_PREAD。待つことがなく、頼まれた
+    /// 分を最後まで運ぶ): read_at、write_at、size で
+    fn seekable(&self) -> bool {
+        false
+    }
+    /// splice の位置と sync_file_range (Linux の FMODE_PREAD / FMODE_PWRITE のうち、ディスク)
+    fn positional(&self) -> bool {
+        false
+    }
+    /// RWF_NOWAIT で待たずに読み書きできる
+    fn nowait(&self) -> bool {
+        false
+    }
+    fn read_at(&self, _pos: usize, _dst: &mut [u8]) -> Result<usize, i64> {
+        Err(-ESPIPE)
+    }
+    fn write_at(&self, _pos: usize, _src: &[u8]) -> Result<usize, i64> {
+        Err(-ESPIPE)
+    }
+    /// 大きさ (lseek の SEEK_END。None は ESPIPE)
+    fn size(&self) -> Option<i64> {
+        None
+    }
+    /// epoll に入れられるか (Linux の f_op->poll があるもの)
+    fn pollable(&self) -> bool {
+        true
+    }
+    /// ioctl (None ならふつうのもの: FIONREAD、端末 ...)。nonblock は O_NONBLOCK
+    fn ioctl(&self, _req: u64, _arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        None
+    }
+    /// mmap (None は写せない: ENODEV)
+    fn mmap(&self, _fr: &FileRef, _off: usize, _len: usize, _prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        None
+    }
+    /// 閉じた (最後の OpenFile が落ちた: Linux の f_op->release)
+    fn release(&self) {}
+}
+
+/// 装置のノードのあるマウント (FileOps::mount: /dev の下の path)
+pub fn dev_mount(path: &str) -> (u64, bool) {
+    vfs::mount_of(path.trim_start_matches('/'))
+}
+
+/// 文字デバイスの番号から開くもの (Linux の register_chrdev): (major, 開くもの)。開くものは minor と open の flags から
+/// Kind (その minor がなければ None: ENXIO)。装置が起こすとき (modprobe) に置く
+type ChrOpen = fn(u32, u32) -> Option<Result<Kind, i64>>;
+static CHRDEVS: crate::spinlock::SpinLock<alloc::vec::Vec<(u32, ChrOpen)>> = crate::spinlock::SpinLock::new(alloc::vec::Vec::new());
+
+pub fn register_chrdev(major: u32, open: ChrOpen) {
+    let mut l = CHRDEVS.lock();
+    l.retain(|(m, _)| *m != major);
+    l.push((major, open));
+}
+
+/// ブロックデバイスの番号から開くもの (Linux の register_blkdev: block.rs が置く)。なければ ENXIO
+static BLKDEV: crate::spinlock::SpinLock<Option<fn(u32, u32) -> Option<Kind>>> = crate::spinlock::SpinLock::new(None);
+
+pub fn register_blkdev(open: fn(u32, u32) -> Option<Kind>) {
+    *BLKDEV.lock() = Some(open);
+}
+
+/// ブロックデバイスのノード (major, minor) を開く
+pub fn open_blkdev(major: u32, minor: u32) -> Result<Kind, i64> {
+    const ENXIO: i64 = 6;
+    let open = (*BLKDEV.lock()).ok_or(-ENXIO)?;
+    open(major, minor).ok_or(-ENXIO)
 }
 
 impl Kind {
+    /// 位置のあるもの (ふつうのファイル、/dev/null と /dev/zero と乱数、ディスクと画面: pread、pwrite、lseek、sendfile の
+    /// 位置。待つことがなく、頼まれた分を最後まで運ぶ)
+    pub fn seekable(&self) -> bool {
+        match self {
+            Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random => true,
+            Kind::Ops(o) => o.seekable(),
+            _ => false,
+        }
+    }
+
+    /// splice の位置と sync_file_range のできるもの (ふつうのファイルとディスク)
+    pub fn positional(&self) -> bool {
+        match self {
+            Kind::Inode(..) => true,
+            Kind::Ops(o) => o.positional(),
+            _ => false,
+        }
+    }
+
     /// Kind::Ops の中身が T なら、その Rc (それぞれが fd から自分のものを取りだす: Linux の file->private_data)
     pub fn ops<T: FileOps>(&self) -> Option<Rc<T>> {
         match self {
@@ -182,7 +262,7 @@ impl Kind {
             Kind::Unix(_) => 3,
             Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) => 4,
             Kind::Tty(_) | Kind::PtyMaster(_) => 6,
-            Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm => 7,
+            Kind::Null | Kind::Zero | Kind::Random => 7,
             Kind::PidFd(_) | Kind::Landlock(_) | Kind::SeccompNotify(_) => 9,
             Kind::Ops(o) => o.class(),
         }
@@ -195,13 +275,6 @@ impl Kind {
             (1, 3) => return Ok(Kind::Null),
             (1, 5) => return Ok(Kind::Zero),
             (1, 8) | (1, 9) => return Ok(Kind::Random),
-            (29, 0) if crate::gpu::get().is_some() => return Ok(Kind::Fb),
-            (13, n) if n >= 64 && ((n - 64) as usize) < crate::input::count() => return Ok(Kind::Input((n - 64) as usize)),
-            (116, 0) if crate::sound::present() => return Ok(Kind::SndCtl),
-            (116, 16) if crate::sound::present() => {
-                crate::sound::open_pcm()?;
-                return Ok(Kind::SndPcm);
-            }
             (5, 0) => {
                 let t = tty::controlling().ok_or(-ENXIO)?;
                 tty::ref_slave(&t);
@@ -210,7 +283,11 @@ impl Kind {
             (5, 1) => tty::console(),
             (5, 2) => return Ok(Kind::PtyMaster(tty::open_ptmx()?)),
             (136, n) => tty::open_slave(n as usize)?,
-            _ => return Err(-ENXIO),
+            // 装置 (画面、キーボードやマウス、音 ...: register_chrdev で置いたもの)
+            _ => {
+                let open = CHRDEVS.lock().iter().find(|(m, _)| *m == major).map(|&(_, f)| f);
+                return open.and_then(|f| f(minor, flags)).unwrap_or(Err(-ENXIO));
+            }
         };
         if flags & O_NOCTTY == 0 {
             tty::maybe_acquire(&tty);
@@ -707,7 +784,6 @@ fn read_stream(k: &Kind, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         Kind::Socket(s) => s.borrow_mut().read(dst),
         Kind::Netlink(n) => crate::netlink::read(n, dst, nonblock),
         Kind::Ops(o) => o.read(dst, nonblock),
-        Kind::Input(n) => crate::input::read(*n, dst, nonblock),
         _ => Err(-EBADF),
     }
 }
@@ -887,13 +963,8 @@ impl OpenFile {
                 }
                 Ok(n)
             }
-            Kind::Block(p) => {
-                let n = blk_read(p, self.offset, dst)?;
-                self.offset += n;
-                Ok(n)
-            }
-            Kind::Fb => {
-                let n = crate::gpu::read(self.offset, dst);
+            Kind::Ops(o) if o.seekable() => {
+                let n = o.read_at(self.offset, dst)?;
                 self.offset += n;
                 Ok(n)
             }
@@ -907,7 +978,7 @@ impl OpenFile {
     /// 待つかもしれないもの (端末、パイプ、ソケット) なら、その中身の写しと O_NONBLOCK
     fn stream(&self) -> Option<(Kind, bool)> {
         let k = match &self.kind {
-            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) | Kind::Input(_) => self.kind.clone(),
+            Kind::Tty(_) | Kind::PtyMaster(_) | Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_) | Kind::Netlink(_) => self.kind.clone(),
             Kind::Ops(o) if o.stream() => self.kind.clone(),
             _ => return None,
         };
@@ -942,17 +1013,9 @@ impl OpenFile {
                 crate::inotify::file_event(path, ino, crate::inotify::IN_MODIFY);
                 Ok(n)
             }
-            Kind::Block(p) => {
-                let n = blk_write(p, self.offset, src)?;
+            Kind::Ops(o) if o.seekable() => {
+                let n = o.write_at(self.offset, src)?;
                 self.offset += n;
-                Ok(n)
-            }
-            Kind::Fb => {
-                let n = crate::gpu::write(self.offset, src);
-                self.offset += n;
-                if n == 0 && !src.is_empty() {
-                    return Err(-28); // ENOSPC (画面の終わり)
-                }
                 Ok(n)
             }
             Kind::PipeRead(_) => Err(-EBADF),
@@ -963,7 +1026,7 @@ impl OpenFile {
 
     pub fn stat(&self) -> Stat {
         // デバイスは /dev のノードと同じ ino を見せる (musl の ttyname はそれを比べる)
-        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm) {
+        if matches!(self.kind, Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random) || matches!(&self.kind, Kind::Ops(o) if o.opened()) {
             if let Ok(i) = vfs::resolve("", &self.describe(), true) {
                 return Stat::of_inode(&i);
             }
@@ -974,15 +1037,7 @@ impl OpenFile {
             Kind::Null => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 3),
             Kind::Zero => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 5),
             Kind::Random => Stat::dev(vfs::S_IFCHR | 0o666, (1 << 8) | 9),
-            Kind::Fb => Stat::dev(vfs::S_IFCHR | 0o666, 29 << 8),
-            Kind::Input(n) => Stat::dev(vfs::S_IFCHR | 0o666, 13 << 8 | (64 + *n as u64)),
-            Kind::SndCtl => Stat::dev(vfs::S_IFCHR | 0o666, 116 << 8),
-            Kind::SndPcm => Stat::dev(vfs::S_IFCHR | 0o666, 116 << 8 | 16),
             Kind::Inode(ino, _) => Stat::of_inode(ino),
-            Kind::Block(p) => {
-                let (ma, mi) = crate::block::dev_of_part(p);
-                Stat::dev(vfs::S_IFBLK | 0o660, ((ma as u64) << 8) | mi as u64)
-            }
             // ino はパイプごとにちがう番号 (/proc/PID/fd の pipe:[N] と同じ)。diff <(a) <(b) などは
             // dev と ino が同じなら同じファイルとみなす
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
@@ -1012,7 +1067,7 @@ impl OpenFile {
         if self.flags & O_PATH != 0 {
             return self.flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW);
         }
-        let opened = matches!(self.kind, Kind::Inode(..) | Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb | Kind::Input(_) | Kind::SndCtl | Kind::SndPcm);
+        let opened = matches!(self.kind, Kind::Inode(..) | Kind::Tty(_) | Kind::PtyMaster(_) | Kind::Null | Kind::Zero | Kind::Random) || matches!(&self.kind, Kind::Ops(o) if o.opened());
         self.flags | if opened { O_LARGEFILE } else { 0 }
     }
 
@@ -1067,10 +1122,6 @@ impl OpenFile {
             Kind::Null => "/dev/null".into(),
             Kind::Zero => "/dev/zero".into(),
             Kind::Random => "/dev/urandom".into(),
-            Kind::Fb => "/dev/fb0".into(),
-            Kind::Input(n) => alloc::format!("/dev/input/event{}", n),
-            Kind::SndCtl => "/dev/snd/controlC0".into(),
-            Kind::SndPcm => "/dev/snd/pcmC0D0p".into(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Socket(s) => alloc::format!("socket:[{}]", Rc::as_ptr(s) as usize & 0xffffff),
@@ -1081,7 +1132,6 @@ impl OpenFile {
             Kind::PidFd(_) => "anon_inode:[pidfd]".into(),
             Kind::SeccompNotify(_) => "anon_inode:seccomp notify".into(),
             Kind::Landlock(_) => "anon_inode:[landlock-ruleset]".into(),
-            Kind::Block(p) => crate::block::part_name(p),
         }
     }
 
@@ -1156,8 +1206,6 @@ impl OpenFile {
             }
             Kind::Ops(o) => o.readiness(),
             Kind::SeccompNotify(l) => l.readiness(),
-            Kind::Input(n) => (crate::input::readable(*n), false, false),
-            Kind::SndPcm => crate::sound::readiness(),
             _ => (true, true, false),
         }
     }
@@ -1193,7 +1241,7 @@ impl OpenFile {
                 }
                 m
             }
-            Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM,
+            Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random => POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM,
             Kind::Ops(o) => return o.poll_mask(),
             _ => return None,
         })
@@ -1213,10 +1261,7 @@ impl OpenFile {
             Kind::PidFd(_) => alloc::vec![proc::pidfd_key()],
             Kind::SeccompNotify(l) => alloc::vec![l.chan()],
             // いつでも読み書きできる (待たない)
-            Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) | Kind::Block(_) | Kind::Fb => alloc::vec![],
-            Kind::Input(n) => alloc::vec![crate::input::chan(*n)],
-            Kind::SndCtl => alloc::vec![],
-            Kind::SndPcm => alloc::vec![crate::sound::chan()],
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Inode(..) => alloc::vec![],
             Kind::Ops(o) => return o.poll_keys(),
             _ => return None,
         })
@@ -1263,8 +1308,7 @@ impl OpenFile {
         let size = match &self.kind {
             Kind::Inode(ino, _) => ino.meta().size as i64,
             Kind::Null | Kind::Zero | Kind::Random => 0,
-            Kind::Block(p) => blk_size(p) as i64,
-            Kind::Fb => crate::gpu::get().map_or(0, |g| g.size()) as i64,
+            Kind::Ops(o) => o.size().ok_or(-ESPIPE)?,
             _ => return Err(-ESPIPE),
         };
         const SEEK_DATA: u32 = 3;
@@ -1475,7 +1519,7 @@ impl Drop for OpenFile {
         // flock のロックと OFD ロックは OpenFile ごと (その場所で見分ける): 最後の参照が閉じたら外す
         crate::locks::release_file(self as *const OpenFile as usize);
         match &self.kind {
-            Kind::SndPcm => crate::sound::close_pcm(),
+            Kind::Ops(o) => o.release(),
             Kind::PidFd(pid) => crate::pidfd::closed(*pid),
             Kind::Inode(ino, path) => {
                 let ev = if self.writable() { crate::inotify::IN_CLOSE_WRITE } else { crate::inotify::IN_CLOSE_NOWRITE };
@@ -1728,16 +1772,8 @@ pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {
 /// 写せない種類は None (ENODEV)
 pub fn mmap_dev(kind: &Kind, fr: &FileRef, off: usize, len: usize, prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
     use crate::vm::Backing;
-    const ENODEV: i64 = 19;
     Some(match kind {
-        Kind::Fb => (|| {
-            let g = crate::gpu::get().ok_or(-ENODEV)?;
-            if off + len > crate::vm::pg_up(g.size()) {
-                return Err(crate::why::inval());
-            }
-            Ok(Backing::Pages { pages: g.pages.clone(), off, hold: None })
-        })(),
-        Kind::SndPcm => crate::sound::mmap_pages(off, len).map(|pages| Backing::Pages { pages, off, hold: None }),
+        Kind::Ops(o) => return o.mmap(fr, off, len, prot),
         Kind::Inet(u) if u.borrow().tcp => {
             const PROT_WRITE: u64 = 2;
             const PROT_EXEC: u64 = 4;
@@ -2652,21 +2688,11 @@ impl Pipe {
 
 // ---- ブロックデバイス ----
 
-const SECTOR: usize = crate::block::SECTOR;
-/// 1 回の読み書きの大きさ
-const BLK_CHUNK: usize = 64 * 1024;
-
-/// 区画のバイト数
-pub fn blk_size(p: &crate::block::Part) -> usize {
-    p.len as usize * SECTOR
-}
-
 /// pread の、ふつうのファイル (sysfile が、借りずに読む) でないもの: ディスクと画面は pos から、/dev/null と
 /// /dev/zero と乱数は位置によらない。開いたファイルの位置は動かさない。位置のないものは ESPIPE
 pub fn pread_dev(f: &FileRef, pos: usize, dst: &mut [u8]) -> Result<usize, i64> {
     match &f.borrow().kind {
-        Kind::Block(p) => blk_read(p, pos, dst),
-        Kind::Fb => Ok(crate::gpu::read(pos, dst)),
+        Kind::Ops(o) if o.seekable() => o.read_at(pos, dst),
         Kind::Null => Ok(0),
         Kind::Zero => {
             dst.fill(0);
@@ -2683,11 +2709,7 @@ pub fn pread_dev(f: &FileRef, pos: usize, dst: &mut [u8]) -> Result<usize, i64> 
 /// pwrite の、ふつうのファイルでないもの (pread_dev と同じ)
 pub fn pwrite_dev(f: &FileRef, pos: usize, src: &[u8]) -> Result<usize, i64> {
     match &f.borrow().kind {
-        Kind::Block(p) => blk_write(p, pos, src),
-        Kind::Fb => {
-            let n = crate::gpu::write(pos, src);
-            if n == 0 && !src.is_empty() { Err(-28) } else { Ok(n) }
-        }
+        Kind::Ops(o) if o.seekable() => o.write_at(pos, src),
         Kind::Null | Kind::Zero => Ok(src.len()),
         Kind::Random => {
             crate::rand::mix(src);
@@ -2697,50 +2719,3 @@ pub fn pwrite_dev(f: &FileRef, pos: usize, src: &[u8]) -> Result<usize, i64> {
     }
 }
 
-fn blk_read(p: &crate::block::Part, off: usize, dst: &mut [u8]) -> Result<usize, i64> {
-    let n = dst.len().min(blk_size(p).saturating_sub(off));
-    let mut sec = [0u8; SECTOR];
-    let mut done = 0;
-    while done < n {
-        let pos = off + done;
-        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
-        if skip == 0 && n - done >= SECTOR {
-            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
-            crate::block::read_part(p, s, &mut dst[done..done + len])?;
-            done += len;
-        } else {
-            crate::block::read_part(p, s, &mut sec)?;
-            let len = (SECTOR - skip).min(n - done);
-            dst[done..done + len].copy_from_slice(&sec[skip..skip + len]);
-            done += len;
-        }
-    }
-    Ok(n)
-}
-
-fn blk_write(p: &crate::block::Part, off: usize, src: &[u8]) -> Result<usize, i64> {
-    const ENOSPC: i64 = 28;
-    let n = src.len().min(blk_size(p).saturating_sub(off));
-    if n == 0 && !src.is_empty() {
-        return Err(-ENOSPC);
-    }
-    let mut sec = [0u8; SECTOR];
-    let mut done = 0;
-    while done < n {
-        let pos = off + done;
-        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
-        if skip == 0 && n - done >= SECTOR {
-            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
-            crate::block::write_part(p, s, &src[done..done + len])?;
-            done += len;
-        } else {
-            // セクタの一部: 読んでから書く
-            crate::block::read_part(p, s, &mut sec)?;
-            let len = (SECTOR - skip).min(n - done);
-            sec[skip..skip + len].copy_from_slice(&src[done..done + len]);
-            crate::block::write_part(p, s, &sec)?;
-            done += len;
-        }
-    }
-    Ok(n)
-}

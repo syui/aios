@@ -81,6 +81,8 @@ pub fn init() {
         println!("input: /dev/input/event{} {}", devs().len(), d.name);
         // /dev/input/eventN (Linux の devtmpfs: 装置を見つけたものがノードを置く)
         crate::fs::add_dev(&alloc::format!("input/event{}", devs().len()), 0o666, false, 13, 64 + devs().len() as u32);
+        // それを開くもの (Linux の register_chrdev: evdev の major 13、minor 64 から)
+        crate::file::register_chrdev(13, |mi, _| (mi >= 64 && ((mi - 64) as usize) < count()).then(|| Ok(crate::file::Kind::Ops(alloc::rc::Rc::new(InputFile((mi - 64) as usize))))));
         devs().push(d);
     }
 }
@@ -197,5 +199,44 @@ pub fn ioctl(n: usize, req: u64, arg: usize) -> Result<i64, i64> {
             out(&b).map(|_| 0)
         }
         _ => Err(-ENOTTY),
+    }
+}
+
+/// 開いたキーボードやマウス (/dev/input/eventN: file::Kind::Ops。Linux の evdev_fops)
+pub struct InputFile(pub usize);
+
+impl crate::file::FileOps for InputFile {
+    fn describe(&self) -> String {
+        alloc::format!("/dev/input/event{}", self.0)
+    }
+    fn class(&self) -> usize {
+        7
+    }
+    fn opened(&self) -> bool {
+        true
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        read(self.0, dst, nonblock)
+    }
+    fn stat(&self) -> crate::file::Stat {
+        crate::file::Stat::dev(crate::vfs::S_IFCHR | 0o666, 13 << 8 | (64 + self.0 as u64))
+    }
+    fn mount(&self) -> (u64, bool) {
+        crate::file::dev_mount(&self.describe())
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        (readable(self.0), false, false)
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(alloc::vec![chan(self.0)])
+    }
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        Some(ioctl(self.0, req, arg))
     }
 }

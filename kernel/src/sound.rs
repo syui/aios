@@ -411,6 +411,17 @@ pub fn init() -> bool {
     // /dev/snd の制御と再生の口 (Linux の devtmpfs: 装置を見つけたものがノードを置く)
     crate::fs::add_dev("snd/controlC0", 0o666, false, 116, 0);
     crate::fs::add_dev("snd/pcmC0D0p", 0o666, false, 116, 16);
+    // それを開くもの (Linux の register_chrdev: ALSA の major 116)
+    crate::file::register_chrdev(116, |mi, _| {
+        if !present() {
+            return None;
+        }
+        match mi {
+            0 => Some(Ok(crate::file::Kind::Ops(Rc::new(SndCtlFile)))),
+            16 => Some(open_pcm().map(|_| crate::file::Kind::Ops(Rc::new(SndPcmFile)) as crate::file::Kind)),
+            _ => None,
+        }
+    });
     true
 }
 
@@ -1094,5 +1105,76 @@ pub fn ctl_ioctl(req: u64, arg: usize) -> Result<i64, i64> {
         // POWER_STATE: D0
         0xd1 => out(&0u32.to_le_bytes()).map(|_| 0),
         _ => Err(-ENOTTY),
+    }
+}
+
+/// 開いた音のカードの制御の口 (/dev/snd/controlC0: file::Kind::Ops)
+pub struct SndCtlFile;
+
+impl crate::file::FileOps for SndCtlFile {
+    fn describe(&self) -> alloc::string::String {
+        "/dev/snd/controlC0".into()
+    }
+    fn class(&self) -> usize {
+        7
+    }
+    fn opened(&self) -> bool {
+        true
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn stat(&self) -> crate::file::Stat {
+        crate::file::Stat::dev(crate::vfs::S_IFCHR | 0o666, 116 << 8)
+    }
+    fn mount(&self) -> (u64, bool) {
+        crate::file::dev_mount(&self.describe())
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(alloc::vec![])
+    }
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        Some(ctl_ioctl(req, arg))
+    }
+}
+
+/// 開いた音の再生の口 (/dev/snd/pcmC0D0p: file::Kind::Ops)
+pub struct SndPcmFile;
+
+impl crate::file::FileOps for SndPcmFile {
+    fn describe(&self) -> alloc::string::String {
+        "/dev/snd/pcmC0D0p".into()
+    }
+    fn class(&self) -> usize {
+        7
+    }
+    fn opened(&self) -> bool {
+        true
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn stat(&self) -> crate::file::Stat {
+        crate::file::Stat::dev(crate::vfs::S_IFCHR | 0o666, 116 << 8 | 16)
+    }
+    fn mount(&self) -> (u64, bool) {
+        crate::file::dev_mount(&self.describe())
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        readiness()
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(alloc::vec![chan()])
+    }
+    /// DRAIN と WRITEI は待つことがある
+    fn ioctl(&self, req: u64, arg: usize, nonblock: bool) -> Option<Result<i64, i64>> {
+        Some(pcm_ioctl(req, arg, nonblock))
+    }
+    /// リングバッファのページ
+    fn mmap(&self, _fr: &crate::file::FileRef, off: usize, len: usize, _prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        Some(mmap_pages(off, len).map(|pages| crate::vm::Backing::Pages { pages, off, hold: None }))
+    }
+    fn release(&self) {
+        close_pcm();
     }
 }

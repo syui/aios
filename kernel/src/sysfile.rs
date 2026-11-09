@@ -330,7 +330,7 @@ fn uninit(n: usize) -> Result<Vec<u8>, i64> {
 /// 待つことのないもの (ふつうのファイル、/dev/zero など、ディスク): 頼まれた分を最後まで運ぶ (Linux と同じ)。
 /// パイプや端末やソケットは、1 回分 (届いている分) だけ
 fn whole(f: &FileRef) -> bool {
-    matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb)
+    f.borrow().kind.seekable()
 }
 
 /// Linux の rw_verify_area: 位置のあるもの (ファイル、ディレクトリ) の位置 + 長さが i64 をこえるなら EINVAL
@@ -395,7 +395,8 @@ fn rwf_check(f: &FileRef, flags: u32, write: bool) -> Result<(), i64> {
     if flags & RWF_NOWAIT != 0 {
         let ok = match &b.kind {
             Kind::Inode(..) => reg && cached,
-            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) => true,
+            Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::PipeRw(_) | Kind::Unix(_) | Kind::Inet(_) | Kind::Null | Kind::Zero | Kind::Random => true,
+            Kind::Ops(o) => o.nowait(),
             _ => false,
         };
         if !ok {
@@ -560,7 +561,7 @@ fn read_flags(fd: u64, buf: usize, len: usize, flags: u32, dontwait: bool, ra: u
     // パイプなどから取り出したものは戻せないので、中身があるなら、入れ物にさわれるかを先に確かめる (さわれなければ
     // EFAULT で、中身はそのまま。空なら read のとおり EAGAIN か待つ)。aios がえらんだちがい (pipe-fault): さわれる分は
     // みな取り出してその数を返す。Linux はパイプの箱ごとに写し、途中でさわれなくなった箱は写した分も数えず残す
-    let stream = !matches!(f.borrow().kind, Kind::Inode(..) | Kind::Null | Kind::Zero | Kind::Random | Kind::Block(_) | Kind::Fb);
+    let stream = !f.borrow().kind.seekable();
     let mut done = 0;
     loop {
         let want = (len - done).min(CHUNK);
@@ -699,7 +700,7 @@ fn positional(fd: u64, off: i64, write: bool) -> Result<FileRef, i64> {
         if off < 0 {
             return Err(crate::why::inval());
         }
-        if !matches!(b.kind, Kind::Inode(..) | Kind::Block(_) | Kind::Fb | Kind::Null | Kind::Zero | Kind::Random) {
+        if !b.kind.seekable() {
             return Err(-file::ESPIPE);
         }
         if !(if write { b.writable() } else { b.readable() }) {
@@ -833,7 +834,7 @@ pub fn fsync(fd: u64, fs: bool) -> R {
         if b.flags & file::O_PATH != 0 {
             return Err(-EBADF);
         }
-        if !fs && !matches!(b.kind, Kind::Inode(..) | Kind::Block(_)) {
+        if !fs && !b.kind.positional() {
             return Err(crate::why::inval());
         }
     }
@@ -1424,7 +1425,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         }
         vfs::S_IFBLK => {
             let (ma, mi) = fs::dev_of(&ino).unwrap();
-            Some(Kind::Block(crate::block::part_of_dev(ma, mi).ok_or(-6)?))
+            Some(file::open_blkdev(ma, mi)?)
         }
         vfs::S_IFIFO => {
             let p = fifo_pipe(&ino);
@@ -2691,21 +2692,16 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if matches!(f.borrow().kind, Kind::Socket(_) | Kind::Inet(_) | Kind::Unix(_)) && crate::netif::handles(req) {
         return crate::netif::ioctl(req, arg);
     }
-    if let Kind::Block(p) = &f.borrow().kind {
-        // BLKGETSIZE64 (バイト数)、BLKGETSIZE (セクタ数)、BLKSSZGET / BLKBSZGET (セクタの大きさ)
-        const BLKGETSIZE: u64 = 0x1260;
-        const BLKSSZGET: u64 = 0x1268;
-        const BLKBSZGET: u64 = 0x80081270;
-        const BLKGETSIZE64: u64 = 0x80081272;
-        return match req {
-            BLKGETSIZE64 => out(arg, &(file::blk_size(p) as u64).to_le_bytes()).map(|_| 0),
-            BLKGETSIZE => out(arg, &p.len.to_le_bytes()).map(|_| 0),
-            BLKSSZGET | BLKBSZGET => out(arg, &(crate::block::SECTOR as u32).to_le_bytes()).map(|_| 0),
-            _ => Err(-ENOTTY),
-        };
-    }
-    if matches!(f.borrow().kind, Kind::Fb) {
-        return crate::gpu::ioctl(req, arg);
+    // 装置 (ディスク、画面、キーボードやマウス、音 ...: FileOps の ioctl。Linux の f_op->unlocked_ioctl)。音の DRAIN と
+    // WRITEI は待つことがあるので、OpenFile を借りたままにしない
+    let ops = match &f.borrow().kind {
+        Kind::Ops(o) => Some((o.clone(), f.borrow().flags & crate::file::O_NONBLOCK != 0)),
+        _ => None,
+    };
+    if let Some((o, nonblock)) = ops
+        && let Some(r) = o.ioctl(req, arg, nonblock)
+    {
+        return r;
     }
     // pidfd (PIDFD_GET_INFO: pidfd.rs)
     let pidfd = match &f.borrow().kind {
@@ -2722,19 +2718,6 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     };
     if let Some(l) = listener {
         return l.ioctl(req, arg);
-    }
-    if let Kind::Input(n) = f.borrow().kind {
-        return crate::input::ioctl(n, req, arg);
-    }
-    // 音 (ALSA の形)。DRAIN と WRITEI は待つことがあるので、OpenFile を借りたままにしない
-    let snd = match f.borrow().kind {
-        Kind::SndCtl => Some(false),
-        Kind::SndPcm => Some(true),
-        _ => None,
-    };
-    if let Some(pcm) = snd {
-        let nonblock = f.borrow().flags & crate::file::O_NONBLOCK != 0;
-        return if pcm { crate::sound::pcm_ioctl(req, arg, nonblock) } else { crate::sound::ctl_ioctl(req, arg) };
     }
     // AF_UNIX のソケット (Linux の unix_ioctl): SIOCOUTQ は送って読まれていない大きさ、SIOCATMARK は MSG_OOB の印か
     const SIOCOUTQ: u64 = 0x5411;
@@ -3254,7 +3237,7 @@ pub fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize
     }
     let nb = |f: &FileRef| flags & SPLICE_F_NONBLOCK != 0 || f.borrow().flags & file::O_NONBLOCK != 0;
     // 位置をわたせるのは、位置のあるものだけ (Linux の FMODE_PREAD / FMODE_PWRITE)
-    let positional = |f: &FileRef| matches!(f.borrow().kind, Kind::Inode(..) | Kind::Block(_));
+    let positional = |f: &FileRef| f.borrow().kind.positional();
     match (pin, pout) {
         (Some(a), Some(b)) => {
             if alloc::rc::Rc::ptr_eq(&a, &b) {
@@ -3634,7 +3617,7 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
     if !fi.borrow().readable() {
         return Err(-EBADF);
     }
-    let seekable = matches!(fi.borrow().kind, Kind::Inode(..) | Kind::Block(_) | Kind::Fb | Kind::Null | Kind::Zero | Kind::Random);
+    let seekable = fi.borrow().kind.seekable();
     let pos = match ppos.as_deref() {
         Some(_) if !seekable => return Err(-file::ESPIPE),
         Some(&p) => p,

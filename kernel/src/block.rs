@@ -42,6 +42,8 @@ const MMC_MAJOR: u32 = 179;
 /// ディスクのルート (起動のとき: main.rs から fs::init へ。Linux の init/do_mounts.c の mount_root): ディスクを起こし、区画の
 /// ノード (/dev/vda、/dev/vda1 ...) を置き (fs::add_dev)、root の区画の ext2 / ext4 と、FAT の boot の区画を読む
 pub fn mount_root() -> Option<crate::fs::DiskRoot> {
+    // ブロックデバイスのノードを開くもの (Linux の register_blkdev)
+    crate::file::register_blkdev(|ma, mi| part_of_dev(ma, mi).map(|p| crate::file::Kind::Ops(alloc::rc::Rc::new(BlockFile(p)))));
     if !init() {
         return None;
     }
@@ -465,4 +467,131 @@ pub fn init() -> bool {
         BOOT.set(Some(b));
     }
     true
+}
+
+// ---- 開いたディスクや区画 (file::Kind::Ops。Linux の def_blk_fops)。セクタに合わないところは読んでから書く ----
+
+/// 1 回の読み書きの大きさ
+const BLK_CHUNK: usize = 64 * 1024;
+
+/// 区画のバイト数
+pub fn blk_size(p: &Part) -> usize {
+    p.len as usize * SECTOR
+}
+
+
+fn blk_read(p: &Part, off: usize, dst: &mut [u8]) -> Result<usize, i64> {
+    let n = dst.len().min(blk_size(p).saturating_sub(off));
+    let mut sec = [0u8; SECTOR];
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
+        if skip == 0 && n - done >= SECTOR {
+            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
+            read_part(p, s, &mut dst[done..done + len])?;
+            done += len;
+        } else {
+            read_part(p, s, &mut sec)?;
+            let len = (SECTOR - skip).min(n - done);
+            dst[done..done + len].copy_from_slice(&sec[skip..skip + len]);
+            done += len;
+        }
+    }
+    Ok(n)
+}
+
+fn blk_write(p: &Part, off: usize, src: &[u8]) -> Result<usize, i64> {
+    const ENOSPC: i64 = 28;
+    let n = src.len().min(blk_size(p).saturating_sub(off));
+    if n == 0 && !src.is_empty() {
+        return Err(-ENOSPC);
+    }
+    let mut sec = [0u8; SECTOR];
+    let mut done = 0;
+    while done < n {
+        let pos = off + done;
+        let (s, skip) = ((pos / SECTOR) as u64, pos % SECTOR);
+        if skip == 0 && n - done >= SECTOR {
+            let len = ((n - done) / SECTOR * SECTOR).min(BLK_CHUNK);
+            write_part(p, s, &src[done..done + len])?;
+            done += len;
+        } else {
+            // セクタの一部: 読んでから書く
+            read_part(p, s, &mut sec)?;
+            let len = (SECTOR - skip).min(n - done);
+            sec[skip..skip + len].copy_from_slice(&src[done..done + len]);
+            write_part(p, s, &sec)?;
+            done += len;
+        }
+    }
+    Ok(n)
+}
+
+/// 開いたディスクや区画 (/dev/vda2 など)
+pub struct BlockFile(pub Part);
+
+impl crate::file::FileOps for BlockFile {
+    fn describe(&self) -> String {
+        part_name(&self.0)
+    }
+    fn class(&self) -> usize {
+        7
+    }
+    fn opened(&self) -> bool {
+        true
+    }
+    fn seekable(&self) -> bool {
+        true
+    }
+    fn positional(&self) -> bool {
+        true
+    }
+    fn nowait(&self) -> bool {
+        true
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn pollable(&self) -> bool {
+        false
+    }
+    fn read_at(&self, pos: usize, dst: &mut [u8]) -> Result<usize, i64> {
+        blk_read(&self.0, pos, dst)
+    }
+    fn write_at(&self, pos: usize, src: &[u8]) -> Result<usize, i64> {
+        blk_write(&self.0, pos, src)
+    }
+    fn size(&self) -> Option<i64> {
+        Some(blk_size(&self.0) as i64)
+    }
+    fn stat(&self) -> crate::file::Stat {
+        let (ma, mi) = dev_of_part(&self.0);
+        crate::file::Stat::dev(crate::vfs::S_IFBLK | 0o660, ((ma as u64) << 8) | mi as u64)
+    }
+    fn mount(&self) -> (u64, bool) {
+        crate::file::dev_mount(&self.describe())
+    }
+    fn poll_mask(&self) -> Option<u32> {
+        // POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM (いつでも読み書きできる)
+        Some(0x1 | 0x4 | 0x40 | 0x100)
+    }
+    fn poll_keys(&self) -> Option<alloc::vec::Vec<usize>> {
+        Some(alloc::vec![])
+    }
+    /// BLKGETSIZE64 (バイト数)、BLKGETSIZE (セクタ数)、BLKSSZGET / BLKBSZGET (セクタの大きさ)
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        const BLKGETSIZE: u64 = 0x1260;
+        const BLKSSZGET: u64 = 0x1268;
+        const BLKBSZGET: u64 = 0x80081270;
+        const BLKGETSIZE64: u64 = 0x80081272;
+        const ENOTTY: i64 = 25;
+        let out = |b: &[u8]| crate::proc::current().pt().copy_out(arg, b).ok_or(-14).map(|_| 0);
+        Some(match req {
+            BLKGETSIZE64 => out(&(blk_size(&self.0) as u64).to_le_bytes()),
+            BLKGETSIZE => out(&self.0.len.to_le_bytes()),
+            BLKSSZGET | BLKBSZGET => out(&(SECTOR as u32).to_le_bytes()),
+            _ => Err(-ENOTTY),
+        })
+    }
 }

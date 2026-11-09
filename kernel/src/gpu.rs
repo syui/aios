@@ -140,8 +140,9 @@ pub fn init() -> bool {
     if !probe_init() {
         return false;
     }
-    // /dev/fb0 (Linux の devtmpfs: 装置を見つけたものがノードを置く)
+    // /dev/fb0 (Linux の devtmpfs: 装置を見つけたものがノードを置く) と、それを開くもの (Linux の register_chrdev)
     crate::fs::add_dev("fb0", 0o666, false, 29, 0);
+    crate::file::register_chrdev(29, |mi, _| (mi == 0 && get().is_some()).then(|| Ok(crate::file::Kind::Ops(Rc::new(FbFile)))));
     true
 }
 
@@ -318,5 +319,59 @@ pub fn ioctl(req: u64, arg: usize) -> Result<i64, i64> {
         }
         FBIOBLANK | FBIO_WAITFORVSYNC => Ok(0),
         _ => Err(-ENOTTY),
+    }
+}
+
+/// 開いた画面 (/dev/fb0: file::Kind::Ops。Linux の fb_fops)
+pub struct FbFile;
+
+impl crate::file::FileOps for FbFile {
+    fn describe(&self) -> alloc::string::String {
+        "/dev/fb0".into()
+    }
+    fn class(&self) -> usize {
+        7
+    }
+    fn opened(&self) -> bool {
+        true
+    }
+    fn seekable(&self) -> bool {
+        true
+    }
+    fn lockable(&self) -> bool {
+        true
+    }
+    fn read_at(&self, pos: usize, dst: &mut [u8]) -> Result<usize, i64> {
+        Ok(read(pos, dst))
+    }
+    /// 画面の終わりは ENOSPC
+    fn write_at(&self, pos: usize, src: &[u8]) -> Result<usize, i64> {
+        let n = write(pos, src);
+        if n == 0 && !src.is_empty() { Err(-28) } else { Ok(n) }
+    }
+    fn size(&self) -> Option<i64> {
+        Some(get().map_or(0, |g| g.size()) as i64)
+    }
+    fn stat(&self) -> crate::file::Stat {
+        crate::file::Stat::dev(crate::vfs::S_IFCHR | 0o666, 29 << 8)
+    }
+    fn mount(&self) -> (u64, bool) {
+        crate::file::dev_mount(&self.describe())
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(alloc::vec![])
+    }
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        Some(ioctl(req, arg))
+    }
+    /// フレームバッファのページをそのまま
+    fn mmap(&self, _fr: &crate::file::FileRef, off: usize, len: usize, _prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        Some((|| {
+            let g = get().ok_or(-19)?;
+            if off + len > crate::vm::pg_up(g.size()) {
+                return Err(crate::why::inval());
+            }
+            Ok(crate::vm::Backing::Pages { pages: g.pages.clone(), off, hold: None })
+        })())
     }
 }
