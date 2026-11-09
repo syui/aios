@@ -38,6 +38,7 @@ mod extfs;
 mod fastdir;
 mod file;
 mod locks;
+mod lsm_syscalls;
 mod lockstat;
 mod fs;
 mod futex;
@@ -60,6 +61,7 @@ mod conntrack;
 mod ctnetlink;
 mod parts;
 mod pidfd;
+mod posix_timers;
 mod proc;
 mod sd;
 mod smp;
@@ -164,6 +166,9 @@ pub extern "C" fn kmain() -> ! {
     // ファイルのロック (Linux の CONFIG_FILE_LOCKING): flock と、fcntl のロック・閉じたときに外すもの (file::FileLocks)
     file::register_locks(&locks::OPS);
     syscall::register(locks::SYSCALLS, locks::sys);
+    // LSM のシステムコール (lsm_*: Linux の security/lsm_syscalls.c、landlock_*: security/landlock/syscalls.c)
+    syscall::register(lsm_syscalls::SYSCALLS, lsm_syscalls::sys);
+    syscall::register(landlock::SYSCALLS, landlock::sys);
     // splice、tee、sendfile、copy_file_range と、大きなロックなしの splice
     syscall::register(splice::SYSCALLS, splice::sys);
     syscall::register_fast_splice(splice::fast);
@@ -184,7 +189,9 @@ pub extern "C" fn kmain() -> ! {
     irq::init();
     irq::enable_ipi();
     timer::init();
-    // timerfd の期限 (tick ごと。Linux では timerfd ごとの hrtimer)
+    // itimer と POSIX タイマー (Linux の CONFIG_POSIX_TIMERS)、timerfd の期限 (tick ごと。Linux ではそれぞれの hrtimer)
+    syscall::register(posix_timers::SYSCALLS, posix_timers::sys);
+    timer::every(1, posix_timers::tick);
     timer::every(1, timerfd::tick);
     vdso::init();
     uart::init();

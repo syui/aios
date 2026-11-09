@@ -738,13 +738,21 @@ impl crate::security::Lsm for Landlock {
         check_file_ioctl(f.borrow().lsm_deny, req)
     }
 
-    /// landlock_create_ruleset (444)、landlock_add_rule (445)、landlock_restrict_self (446)
-    fn syscall(&self, nr: u64, a: &[u64; 6]) -> Option<Result<i64, i64>> {
-        match nr {
-            444 => Some(create_ruleset(a[0] as usize, a[1] as usize, a[2])),
-            445 => Some(add_rule(a[0], a[1], a[2] as usize, a[3])),
-            446 => Some(restrict_self(a[0], a[1])),
-            _ => None,
-        }
+}
+
+/// landlock_create_ruleset、landlock_add_rule、landlock_restrict_self (Linux の security/landlock/syscalls.c。main.rs が
+/// syscall::register で置く)
+pub const SYSCALLS: &[u64] = {
+    use crate::syscall::nr::*;
+    &[LANDLOCK_CREATE_RULESET, LANDLOCK_ADD_RULE, LANDLOCK_RESTRICT_SELF]
+};
+
+pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    use crate::syscall::nr::*;
+    match n {
+        LANDLOCK_CREATE_RULESET => create_ruleset(a[0] as usize, a[1] as usize, a[2]),
+        LANDLOCK_ADD_RULE => add_rule(a[0], a[1], a[2] as usize, a[3]),
+        LANDLOCK_RESTRICT_SELF => restrict_self(a[0], a[1]),
+        _ => Err(-38),
     }
 }

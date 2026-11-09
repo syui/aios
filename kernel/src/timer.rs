@@ -236,7 +236,6 @@ pub fn tick() {
     if now / HZ != prev / HZ {
         crate::proc::decay_recent();
     }
-    crate::signal::tick(now);
     // 置いたもの (timerfd の期限、割り込みの来なかったディスクの要求、5 tick ごとの TCP の再送など)
     for (p, f) in &EVERY {
         let f = f.load(Ordering::Acquire);
@@ -254,7 +253,7 @@ pub fn tick() {
     rearm();
 }
 
-/// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: timerfd の期限、割り込みの来なかった
+/// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: itimer と POSIX タイマー、timerfd の期限、割り込みの来なかった
 /// ディスクの要求、TCP の再送など)。(何 tick ごとか, 呼ぶもの)。置いた順に呼ぶ。起動のとき (や modprobe のとき) に every で
 const NR_EVERY: usize = 8;
 static EVERY: [(AtomicU64, core::sync::atomic::AtomicUsize); NR_EVERY] = [const { (AtomicU64::new(0), core::sync::atomic::AtomicUsize::new(0)) }; NR_EVERY];

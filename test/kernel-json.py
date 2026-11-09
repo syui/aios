@@ -186,7 +186,8 @@ BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp":
                 "unix": "file.rs (FileOps, register_release_deferred, register_fast_rw_sock)", "inet": "file.rs (FileOps)",
                 "socket": "file.rs (FileOps) and syscall.rs", "netlink": "file.rs (FileOps)", "netif": "file.rs (FileOps::ioctl)",
                 "net": "file.rs (FileOps) and timer.rs (every)", "splice": "syscall.rs (register, register_fast_splice)",
-                "lockstat": "aiproc.rs and procfs.rs (only extra calls it)", "locks": "file.rs (FileLocks) and syscall.rs"}
+                "lockstat": "aiproc.rs and procfs.rs (only extra calls it)", "locks": "file.rs (FileLocks) and syscall.rs",
+                "posix_timers": "syscall.rs and timer.rs (every)", "lsm_syscalls": "syscall.rs"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

@@ -486,9 +486,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
         FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
-        LSM_GET_SELF_ATTR => crate::security::lsm_get_self_attr(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as u32),
-        LSM_SET_SELF_ATTR => crate::security::lsm_set_self_attr(a[0] as u32, a[1] as usize, a[2] as u32, a[3] as u32),
-        LSM_LIST_MODULES => crate::security::lsm_list_modules(a[0] as usize, a[1] as usize, a[2] as u32),
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         OPENAT2 => sysfile::openat2(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
@@ -569,8 +566,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         TIMES => sys_times(a[0] as usize),
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
         PIDFD_OPEN => crate::ns::arg_pid(int(a[0])).and_then(|p| sys_pidfd_open(p, a[1])),
-        // LSM のシステムコール (landlock_*: security::lsm_syscall)
-        LANDLOCK_CREATE_RULESET | LANDLOCK_ADD_RULE | LANDLOCK_RESTRICT_SELF => crate::security::lsm_syscall(nr, &a),
         SECCOMP => crate::security::sys_seccomp(a[0], a[1], a[2] as usize),
         PIDFD_SEND_SIGNAL => crate::pidfd::send_signal(int(a[0]), int(a[1]) as i32, a[2] as usize, a[3] as u32 as u64),
         PIDFD_GETFD => crate::pidfd::getfd(int(a[0]), int(a[1]), a[2] as u32 as u64),
@@ -584,13 +579,6 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         RT_SIGPENDING => signal::rt_sigpending(a[0] as usize),
         RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(a[0] as usize, a[1] as usize, a[2] as usize),
         RT_SIGRETURN => signal::rt_sigreturn(tf),
-        SETITIMER => signal::setitimer(a[0], a[1] as usize, a[2] as usize),
-        GETITIMER => signal::getitimer(a[0], a[1] as usize),
-        TIMER_CREATE => signal::timer_create(a[0], a[1] as usize, a[2] as usize),
-        TIMER_SETTIME => signal::timer_settime(a[0] as i32, a[1], a[2] as usize, a[3] as usize),
-        TIMER_GETTIME => signal::timer_gettime(a[0] as i32, a[1] as usize),
-        TIMER_GETOVERRUN => signal::timer_getoverrun(a[0] as i32),
-        TIMER_DELETE => signal::timer_delete(a[0] as i32),
         SET_TID_ADDRESS => {
             let p = proc::current();
             p.clear_tid = a[0] as usize;

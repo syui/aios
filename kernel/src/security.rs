@@ -18,8 +18,6 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::AtomicU32;
 
-const E2BIG: i64 = 7;
-const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 const EOPNOTSUPP: i64 = 95;
@@ -92,9 +90,9 @@ pub const LSM_ID_LANDLOCK: u64 = 110;
 pub const LSM_ATTR_CURRENT: u32 = 100;
 pub const LSM_ATTR_EXEC: u32 = 101;
 pub const LSM_ATTR_PREV: u32 = 104;
-const LSM_FLAG_SINGLE: u32 = 1;
+pub const LSM_FLAG_SINGLE: u32 = 1;
 /// struct lsm_ctx の頭 (id、flags、len、ctx_len。どれも u64)
-const LSM_CTX: usize = 32;
+pub const LSM_CTX: usize = 32;
 pub const PTRACE_MODE_READ: u32 = 0x01;
 pub const PTRACE_MODE_ATTACH: u32 = 0x02;
 
@@ -199,10 +197,6 @@ pub trait Lsm {
     fn setselfattr(&self, _attr: u32, _value: &[u8]) -> Result<(), i64> {
         Err(-EOPNOTSUPP)
     }
-    /// LSM のシステムコール (landlock_*: Linux の security/landlock/syscalls.c)。その LSM のものでなければ None
-    fn syscall(&self, _nr: u64, _a: &[u64; 6]) -> Option<Result<i64, i64>> {
-        None
-    }
 }
 
 /// まだつないでいないところ
@@ -232,7 +226,7 @@ pub fn register(l: &'static dyn Lsm) {
 
 /// CONFIG_LSM の順 (capability は cred.rs の has_cap でいつも先)
 #[inline]
-fn lsms() -> [&'static dyn Lsm; 2] {
+pub fn lsms() -> [&'static dyn Lsm; 2] {
     [STACKED.val(), EXCLUSIVE.val()]
 }
 
@@ -417,16 +411,6 @@ pub fn file_ioctl(f: &FileRef, req: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// LSM のシステムコール (landlock_*)。答える LSM がなければ ENOSYS (Linux の COND_SYSCALL)
-pub fn lsm_syscall(nr: u64, a: &[u64; 6]) -> Result<i64, i64> {
-    for l in lsms() {
-        if let Some(r) = l.syscall(nr, a) {
-            return r;
-        }
-    }
-    Err(-ENOSYS)
-}
-
 /// security_sb_mount
 pub fn sb_mount(name: &str, dev: Option<&str>, fstype: Option<&str>, flags: u64, data: Option<&str>) -> Result<(), i64> {
     for l in lsms() {
@@ -458,123 +442,6 @@ pub fn path_name(full: &str, dir: bool) -> String {
     } else {
         format!("/{}", full)
     }
-}
-
-// ---- LSM のシステムコール (Linux 6.8 から: security/lsm_syscalls.c と security.c。libapparmor は /proc/self/attr より先に使う) ----
-
-fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_in(b, va).ok_or(-EFAULT)
-}
-
-fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
-
-fn get_u32(va: usize) -> Result<u32, i64> {
-    let mut b = [0u8; 4];
-    get_user(va, &mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-/// lsm_list_modules(ids, size, flags): 動いている LSM の番号 (/sys/kernel/security/lsm と同じ順)
-pub fn lsm_list_modules(ids: usize, size: usize, flags: u32) -> Result<i64, i64> {
-    if flags != 0 {
-        return Err(-EINVAL);
-    }
-    let have = get_u32(size)?;
-    let mut v = alloc::vec![LSM_ID_CAPABILITY];
-    for l in lsms() {
-        if l.enabled() {
-            v.push(l.id().1);
-        }
-    }
-    let total = (v.len() * 8) as u32;
-    put_user(size, &total.to_le_bytes())?;
-    if have < total {
-        return Err(-E2BIG);
-    }
-    for (i, id) in v.iter().enumerate() {
-        put_user(ids + i * 8, &id.to_le_bytes())?;
-    }
-    Ok(v.len() as i64)
-}
-
-/// lsm_get_self_attr(attr, ctx, size, flags): いまのプロセスの current / exec / prev を struct lsm_ctx で (答えるのは
-/// ラベルを持つ LSM: 中身は /proc/self/attr と同じ「名前 (モード)」の改行なし)。ctx が 0 か size が足りなければ、要る
-/// 大きさを size に書く (足りなければ E2BIG)。flags の LSM_FLAG_SINGLE なら ctx の id の LSM だけ。答えた LSM の数を返す
-pub fn lsm_get_self_attr(attr: u32, ctx: usize, size: usize, flags: u32) -> Result<i64, i64> {
-    if attr == 0 || size == 0 {
-        return Err(-EINVAL);
-    }
-    let left = get_u32(size)?;
-    let mut single = None;
-    if flags != 0 {
-        if flags != LSM_FLAG_SINGLE || ctx == 0 {
-            return Err(-EINVAL);
-        }
-        let mut b = [0u8; 8];
-        get_user(ctx, &mut b)?;
-        let id = u64::from_le_bytes(b);
-        if id == 0 {
-            return Err(-EINVAL);
-        }
-        single = Some(id);
-    }
-    let (mut total, mut count, mut toobig) = (0u32, 0i64, false);
-    for l in lsms() {
-        let id = l.id().1;
-        if !l.enabled() || single.is_some_and(|s| s != id) {
-            continue;
-        }
-        let Some(text) = l.getselfattr(attr)? else { continue };
-        let v = text.as_bytes();
-        // lsm_fill_user_ctx: 頭と中身を 8 バイトにそろえて
-        let len = (LSM_CTX + v.len()).div_ceil(8) * 8;
-        if len as u32 > left {
-            toobig = true;
-        } else {
-            if ctx != 0 {
-                let mut b = alloc::vec![0u8; len];
-                for (i, x) in [id, 0, len as u64, v.len() as u64].iter().enumerate() {
-                    b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
-                }
-                b[LSM_CTX..LSM_CTX + v.len()].copy_from_slice(v);
-                put_user(ctx, &b)?;
-            }
-            count += 1;
-        }
-        total += len as u32;
-    }
-    put_user(size, &total.to_le_bytes())?;
-    if toobig {
-        return Err(-E2BIG);
-    }
-    if count == 0 {
-        return Err(-EOPNOTSUPP);
-    }
-    Ok(count)
-}
-
-/// lsm_set_self_attr(attr, ctx, size, flags): ctx の id の LSM に current か exec を書く (AppArmor なら
-/// /proc/self/attr に書くのと同じ "changeprofile NAME" など)
-pub fn lsm_set_self_attr(attr: u32, ctx: usize, size: u32, flags: u32) -> Result<i64, i64> {
-    if flags != 0 || (size as usize) < LSM_CTX {
-        return Err(-EINVAL);
-    }
-    if size > 4096 {
-        return Err(-E2BIG);
-    }
-    let mut b = alloc::vec![0u8; size as usize];
-    get_user(ctx, &mut b)?;
-    let field = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-    let (id, len, ctx_len) = (field(0), field(2), field(3));
-    let need = (LSM_CTX as u64).checked_add(ctx_len);
-    if (size as u64) < len || need.is_none_or(|n| len < n) {
-        return Err(-EINVAL);
-    }
-    let Some(l) = lsms().into_iter().find(|l| l.enabled() && l.id().1 == id) else { return Err(-EOPNOTSUPP) };
-    l.setselfattr(attr, &b[LSM_CTX..LSM_CTX + ctx_len as usize])?;
-    Ok(0)
 }
 
 // ---- seccomp (Linux の kernel/seccomp.c と include/linux/seccomp.h)。LSM ではない (Linux も): 入り口だけをここに
