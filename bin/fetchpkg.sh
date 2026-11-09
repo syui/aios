@@ -20,6 +20,7 @@ for name in "$@"; do
   done
   [ -n "$d" ] || { echo "fetchpkg: $name is not in ai/repo ($kind)" >&2; exit 1; }
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
+  case $file in '' | */* | .*) echo "fetchpkg: $name: bad file name in aios.db: $file" >&2; exit 1 ;; esac
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
     echo "fetchpkg: $file"

@@ -13,11 +13,14 @@ if [ "$(id -u)" != 0 ]; then
   command -v fakeroot >/dev/null || { echo "root か fakeroot が必要です" >&2; exit 1; }
   exec fakeroot "$0" "$@"
 fi
-suid=$(find rootfs -type f -perm -4000)
-sgid=$(find rootfs -type f -perm -2000)
+suid=$(mktemp)
+sgid=$(mktemp)
+find rootfs -type f -perm -4000 -print0 > "$suid"
+find rootfs -type f -perm -2000 -print0 > "$sgid"
 chown -R 0:0 rootfs
-[ -z "$suid" ] || chmod u+s $suid
-[ -z "$sgid" ] || chmod g+s $sgid
+xargs -0 -r chmod u+s < "$suid"
+xargs -0 -r chmod g+s < "$sgid"
+rm -f "$suid" "$sgid"
 
 put() {
   if [ $(($2 % 2048)) = 0 ]; then

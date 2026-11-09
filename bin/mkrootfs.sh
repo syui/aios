@@ -54,6 +54,7 @@ fetch() {
     return 0
   fi
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
+  case $file in '' | */* | .*) echo "rootfs: $1: bad file name in aios.db: $file" >&2; exit 1 ;; esac
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
     echo "fetch: $file"
