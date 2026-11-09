@@ -1,16 +1,4 @@
 #!/bin/sh
-# パッケージから rootfs/ を作る。カーネルはビルド時に rootfs/ を initramfs として埋め込む
-#   bin/mkrootfs.sh                  base (init, sh, aipkg, ... と /etc) とその依存 (coreutils など)
-#   bin/mkrootfs.sh grep sed ...     pkg/rust/NAME のパッケージも入れる
-#   bin/mkrootfs.sh all              pkg/rust/ のパッケージをぜんぶ入れる (C の拡張 pkg/c/ は入れない)
-#   bin/mkrootfs.sh -r all           ビルドしないで、ai/repo (AIOS_SERVER) のパッケージを取ってきて使う
-#                                    (Mac など、Linux のビルドの道具がないところで。curl と zstd が要る)
-#   AIOS_BUILD="base aikernel" bin/mkrootfs.sh -r all
-#                                    -r でも、AIOS_BUILD のパッケージはここのソースからビルドする (リリース用)
-# base はこのリポジトリの user/ と etc/ から毎回作りなおす。ほかのパッケージは
-# repo/aarch64/KIND/NAME-*.pkg.tar.zst を使い、なければ bin/mkpkg.sh で作る。
-# KIND は pkg/KIND/NAME のあるところ (rust、c、shell、desktop)。依存が c のもの (ca-certificates) でもよい
-# 入れたものは aipkg と同じ形で /var/lib/aipkg/local に記録するので、aipkg -Q で見え、-Syu で上がる
 set -e
 cd "$(dirname "$0")/.."
 
@@ -20,10 +8,8 @@ if [ "$1" = -r ]; then
   shift
 fi
 server=${AIOS_SERVER:-https://git.syui.ai/ai/repo/raw/branch/main/aarch64/rust}
-# ほかの種類 (c など) は server の rust を KIND にかえたところ
 top=${server%/rust}
 
-# sha256sum がなければ (Mac) shasum で
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
@@ -34,7 +20,6 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 [ -n "$remote" ] && echo "rootfs: packages from $top"
 
-# kind_of NAME: pkg/KIND/NAME/PKGBUILD のある KIND
 kind_of() {
   for k in rust c shell desktop; do
     [ -f "pkg/$k/$1/PKGBUILD" ] && { echo "$k"; return 0; }
@@ -42,7 +27,6 @@ kind_of() {
   return 1
 }
 
-# db KIND: -r のとき、その種類の aios.db (desc の tar.gz) を $tmp/db-KIND に広げる (はじめの一度だけ)
 db() {
   [ -d "$tmp/db-$1" ] && return 0
   mkdir "$tmp/db-$1"
@@ -50,15 +34,11 @@ db() {
   tar -xzf "$tmp/aios-$1.db" -C "$tmp/db-$1"
 }
 
-# built NAME: -r でも、ここでビルドするパッケージか (AIOS_BUILD)
 built() {
   case " $AIOS_BUILD " in *" $1 "*) return 0 ;; esac
   return 1
 }
 
-# fetch NAME KIND: aios.db にある NAME のパッケージを repo/aarch64/KIND に取ってくる (チェックサムを確かめる)
-#   aios.db に無ければ f を空にして戻る (install がここのソースからビルドする)。
-#   pkg/rust/ に足したばかりでまだ ai/repo に出していないもの、ほかのリポジトリへ移したものなど
 fetch() {
   d=
   f=
@@ -74,6 +54,7 @@ fetch() {
     return 0
   fi
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
+  case $file in '' | */* | .*) echo "rootfs: $1: bad file name in aios.db: $file" >&2; exit 1 ;; esac
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
     echo "fetch: $file"
@@ -89,7 +70,6 @@ fetch() {
   f=$repo/$file
 }
 
-# register FILE: 入れたパッケージを aipkg の記録 (desc と files) に書く
 register() {
   info=$(zstd -dcq "$1" | tar -xOf - .PKGINFO)
   name=$(printf '%s\n' "$info" | sed -n 's/^pkgname = //p')
@@ -110,7 +90,6 @@ register() {
       v["REASON"] = "0\n"
       for (k in v) if (k != "BACKUP") printf "%%%s%%\n%s\n", k, v[k]
     }' > "$dir/desc"
-  # 設定ファイルは「パス<TAB>sha256」で (aipkg が更新のときに手で変えたかを比べる)
   backup=$(printf '%s\n' "$info" | sed -n 's/^backup = //p')
   if [ -n "$backup" ]; then
     echo '%BACKUP%' >> "$dir/desc"
@@ -122,9 +101,6 @@ register() {
   { echo '%FILES%'; zstd -dcq "$1" | tar -tf - | grep -v '^\.'; echo; } > "$dir/files"
 }
 
-# install NAME: パッケージ (と depends) を rootfs に入れる。入れたものは done に覚える
-#   入れたものが provides / replaces で引きうける名前 (libarchive の tar、gawk の awk) も done に足す
-#   (all で pkg/rust/ をぜんぶ入れるときに、置きかえられた uutils の tar や awk を入れない)
 done=" "
 install() {
   case "$done" in *" $1 "*) return 0 ;; esac
@@ -148,7 +124,6 @@ install() {
   for p in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^\(provides\|replaces\) = //p' | sed 's/[<>=].*//'); do
     case "$done" in *" $p "*) ;; *) done="$done$p " ;; esac
   done
-  # depends (版の条件 >= などは見ない)
   for d in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^depend = //p' | sed 's/[<>=].*//'); do
     install "$d"
   done

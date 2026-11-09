@@ -1,34 +1,44 @@
 #!/bin/sh
-# Claude Code から aigpt (アイの記憶: core・memory・feed・os) を使う (.mcp.json)。aigpt server を起こす
-#   入っている aigpt (aios の /usr/bin/aigpt、Mac など) があれば、それをそのまま
-#   なければ: git.syui.ai の ai/gpt をこのマシン向けにビルドして ~/.local/bin に入れる
-# 標準出力は MCP が使うので、ビルドの出力は標準エラーへ
 cd "$(dirname "$0")/.."
 PATH=$HOME/.local/bin:$PATH
-# このリポジトリの .cargo/config.toml はカーネル向け (aarch64-unknown-none-softfloat) なので、--target でこのマシン向けに
+signers="$GPG_SIG"
+fetch() {
+  src=$(mktemp -d "${TMPDIR:-/tmp}/aigpt-mcp-$1.XXXXXX") || return 1
+  git clone -q --depth 1 --filter=blob:none --no-checkout "https://git.syui.ai/ai/$1" "$src" || { rm -rf "$src"; return 1; }
+  st=$(git -C "$src" log -1 --format=%G?)
+  fpr=$(git -C "$src" log -1 --format=%GP)
+  case $st in G | U) ;; *) fpr= ;; esac
+  case " $signers " in *" ${fpr:-none} "*) return 0 ;; esac
+  echo "aigpt-mcp.sh: ai/$1 $(git -C "$src" rev-parse --short HEAD) is not signed by ai (%G? = $st${fpr:+, $fpr}; signers: $signers)" >&2
+  rm -rf "$src"
+  return 1
+}
 install() {
   host=$(rustc -vV | sed -n 's/^host: //p')
-  cargo install -q --locked --git "https://git.syui.ai/ai/$1" "$2" --root "$HOME/.local" --target "$host"
+  fetch "$1" || return 1
+  git -C "$src" reset -q --hard &&
+    cargo install -q --locked --path "$src" --root "$HOME/.local" --target "$host"
+  r=$?
+  rm -rf "$src"
+  return $r
 }
-# bin/aigpt-mcp.sh --build: aigpt を入れ、config.json (ailog と同じ $cfg/ai.syui.log/) を ai/log から置き、記憶を
-#   PDS から取ってくる。PDS へ書く (aigpt sync) ための ailog も入れる
 if [ "$1" = --build ]; then
-  command -v aigpt > /dev/null || install gpt aigpt >&2 || exit 1
+  command -v aigpt > /dev/null || install gpt >&2 || exit 1
   cfg=${XDG_CONFIG_HOME:-$HOME/.config}/ai.syui.log
-  # とちゅうで切れたものを config.json と思わないように、.part に取ってから名前を変える
   if [ ! -f "$cfg/config.json" ]; then
+    fetch log || exit 1
     mkdir -p "$cfg" &&
-      curl -fsSL https://git.syui.ai/ai/log/raw/branch/main/public/config.json -o "$cfg/config.json.part" &&
-      mv "$cfg/config.json.part" "$cfg/config.json" || exit 1
+      git -C "$src" show HEAD:public/config.json > "$cfg/config.json.part" &&
+      mv "$cfg/config.json.part" "$cfg/config.json"
+    r=$?
+    rm -rf "$src"
+    [ $r = 0 ] || exit 1
   fi
-  # 記憶がまだないときだけ。ローカルで消して sync していないものを、PDS から戻さないように
   aigpt read-core > /dev/null 2>&1 || aigpt pull >&2 || exit 1
-  # ailog は大きい (1 分ほど) ので、うしろで (nohup と同じく HUP を無視。終わりは /tmp/ailog-install.log)。
-  # 何度も呼ばれることがあるので、ビルドの途中ならもう 1 つは始めない
-  if ! command -v ailog > /dev/null && ! pgrep -f 'cargo install .*ai/log ailog' > /dev/null; then
-    (trap '' HUP; install log ailog && echo "ailog: ok") > /tmp/ailog-install.log 2>&1 &
+  if ! command -v ailog > /dev/null && ! pgrep -f 'aigpt-mcp-log\.' > /dev/null; then
+    (trap '' HUP; install log && echo "ailog: ok") > /tmp/ailog-install.log 2>&1 &
   fi
   exit
 fi
-command -v aigpt > /dev/null || install gpt aigpt >&2 || exit 1
+command -v aigpt > /dev/null || install gpt >&2 || exit 1
 exec aigpt server

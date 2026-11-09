@@ -1,10 +1,7 @@
 #!/bin/sh
-# ai/repo のパッケージを repo/aarch64/KIND に取ってくる (チェックサムを確かめる。もうあるものはとばす)
-#   bin/fetchpkg.sh KIND NAME...
-# ソースからビルドせずに、ビルドに要るほかのパッケージ (c_deps の gtk3 など) をそろえるため。CI の firefox で使う
 set -e
 cd "$(dirname "$0")/.."
-[ $# -ge 2 ] || { sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ $# -ge 2 ] || { echo "usage: bin/fetchpkg.sh KIND NAME..." >&2; exit 1; }
 kind=$1
 shift
 top=https://git.syui.ai/ai/repo/raw/branch/main/aarch64
@@ -23,6 +20,7 @@ for name in "$@"; do
   done
   [ -n "$d" ] || { echo "fetchpkg: $name is not in ai/repo ($kind)" >&2; exit 1; }
   file=$(sed -n '/^%FILENAME%$/{n;p;}' "$d/desc")
+  case $file in '' | */* | .*) echo "fetchpkg: $name: bad file name in aios.db: $file" >&2; exit 1 ;; esac
   sum=$(sed -n '/^%SHA256SUM%$/{n;p;}' "$d/desc")
   if [ ! -f "$repo/$file" ]; then
     echo "fetchpkg: $file"

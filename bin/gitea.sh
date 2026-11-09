@@ -1,37 +1,16 @@
 #!/bin/sh
-# git.syui.ai (gitea) へ push する
-#   bin/gitea.sh id      gpg の鍵の束にある秘密鍵で、このリポジトリのコミットの名前・メール・署名を決める
-#                        (aish の git ツールがくらべるミラー aish.mirror も ai/os に)
-#   bin/gitea.sh os      このリポジトリの main ブランチを ai/os へ (main ブランチにいなければ GitHub の main を)
-#   bin/gitea.sh repo    repo/aarch64 (rust/ c/ shell/ desktop/ のパッケージと aios.db) を ai/repo の main の aarch64/ へ
-#                        (署名つきのコミット。歴史は残さず、いつも 1 コミットにして force push する。ai/repo の写し
-#                        build/airepo から: 変わったものだけ取ってきて、変わったものだけ送る)
-#   bin/gitea.sh release ディスクのイメージ (aios-aarch64.img.zst) を作り、ai/os のリリース latest (タイトル aios) に
-#                        置きかえる (AIOS_RELEASE_REMOTE=1 でパッケージを ai/repo から取って作る)
-#   bin/gitea.sh mirror  GitHub のリリース latest (CI が作って起動をたしかめたもの) をそのまま ai/os の latest に
-#                        (作らないので速い。版とコミットも GitHub のもの)
-#   bin/gitea.sh model FILE...  モデル (GGUF。ai.gguf、ai-origin.gguf など) を ai/os のリリース model に置く
-#                        (同じ名前のものは置きかえる)。aimodel が確かめる FILE.sha256 もいっしょに。大きいものは
-#                        Cloudflare をとおると 502 になる (31 MB はとおり、279 MB はだめだった) ので、サーバーの上で
-#                        GITEA_URL=http://127.0.0.1:3000 bin/gitea.sh model ai.gguf のように Gitea へじかに
-#
-# 署名は gpg の鍵の束にある秘密鍵で。名前とメールはその鍵の uid から。鍵がいくつかあれば GPG_SIGNER (指紋か
-# uid のメール) で選ぶ。認証は GITEA_TOKEN (ユーザーは GITEA_USER、既定 ai.syui.ai)。なければ git.syui.ai への
-# 通信につく認証にまかせる。トークンはディスクに書かない
 set -e
-# model の FILE は、呼んだところからのパス
 here=$(pwd)
 cd "$(dirname "$0")/.."
 host=https://git.syui.ai
 user=${GITEA_USER:-ai.syui.ai}
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  echo "usage: bin/gitea.sh id | os | repo | release | mirror | model FILE..." >&2
+  echo "  env: GITEA_TOKEN GITEA_USER GITEA_URL GPG_SIGNER AIOS_RELEASE_REMOTE AIOS_RELEASE_SWAP AIOS_RELEASE_SIZE" >&2
   exit 1
 }
 
-# git に認証のヘッダを渡す (コマンドラインの -c なので、設定ファイルにもログにも残らない)。
-# トークンがなければ何もしない設定 (ほかでつく認証にまかせる)
 auth() {
   if [ -n "$GITEA_TOKEN" ]; then
     printf 'http.%s/.extraheader=Authorization: Basic %s' "$host" "$(printf '%s:%s' "$user" "$GITEA_TOKEN" | base64 | tr -d '\n')"
@@ -40,13 +19,10 @@ auth() {
   fi
 }
 
-# push の前のやりとり (push.negotiate) はしない: git の設定で true になっていると、git.syui.ai はその答えに packfile を
-# 返すので、毎回 "fatal: expected 'acknowledgments', received 'packfile'" となり、あきらめてから送っていた
 git_push() {
   git -c "$(auth)" -c push.negotiate=false push "$@"
 }
 
-# 鍵の束から署名に使う秘密鍵を選ぶ: fpr (指紋) と uid ("名前 <メール>")。なければ失敗
 find_key() {
   list=$(gpg --batch --with-colons --list-secret-keys ${GPG_SIGNER:+"$GPG_SIGNER"} 2>/dev/null) || true
   fpr=$(printf '%s\n' "$list" | awk -F: '/^fpr:/ {print $10; exit}')
@@ -57,7 +33,6 @@ find_key() {
   fi
 }
 
-# その鍵の持ち主: name と mail (と find_key の fpr)
 identity() {
   find_key
   name=${uid% <*}
@@ -65,12 +40,10 @@ identity() {
   mail=${mail%>}
 }
 
-# 引数のリポジトリのコミットを、その鍵の持ち主の名前と署名にする
 use_identity() {
   identity
   git -C "$1" config user.name "$name"
   git -C "$1" config user.email "$mail"
-  # git の設定が SSH の鍵で署名する (gpg.format=ssh) こともあるので、GPG に戻す
   git -C "$1" config gpg.format openpgp
   git -C "$1" config user.signingkey "$fpr"
   git -C "$1" config commit.gpgsign true
@@ -80,12 +53,9 @@ use_identity() {
 case "$1" in
   id)
     use_identity .
-    # aish の git ツールが、GitHub (origin) といっしょに ai/os とも進み・おくれをくらべるように
     git config aish.mirror "$host/ai/os.git"
     ;;
   os)
-    # main ブランチにいればそれを、ほかのブランチにいれば GitHub の main (先に git push origin HEAD:main したもの)
-    # を送る。手元の古い main ブランチを送らないように
     if [ "$(git rev-parse --abbrev-ref HEAD)" = main ]; then
       ref=main
     else
@@ -98,9 +68,6 @@ case "$1" in
     [ -f repo/aarch64/rust/aios.db ] || { echo "repo/aarch64/rust/aios.db がありません (bin/mkrepo.sh で作る)" >&2; exit 1; }
     identity
     echo "commits by $name <$mail>, signed with $fpr" >&2
-    # ai/repo の写し (build/airepo。aish-pkg の push が ai/repo とくらべるのにも使う) から送る。あれば変わったところだけを
-    # 取る (前は送るたびに ai/repo をまるごと (いま 540 MB) clone していて何分もかかっていた)。
-    # 送るのも、写しにないもの (作りなおしたパッケージ) だけ
     dir=$PWD/build/airepo
     if [ -d "$dir/.git" ]; then
       git -C "$dir" -c "$(auth)" fetch -q --depth 1 "$host/ai/repo.git" main
@@ -112,8 +79,6 @@ case "$1" in
     fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    # 写しのファイルにはさわらず、別の index で: ai/repo の木 (x86_64/ や aios.gpg もそのまま) の aarch64/ を、この
-    # リポジトリの repo/aarch64 (rust/ c/ shell/ desktop/) にする。前の置き場所 aarch64-c/ は消す
     g() { GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" git "$@"; }
     g read-tree "$(g ls-tree "$base" | awk -F '\t' '$2 != "aarch64" && $2 != "aarch64-c"' | g mktree)"
     for d in rust c shell desktop; do
@@ -121,23 +86,18 @@ case "$1" in
       (cd repo && GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/index" GIT_WORK_TREE=. git add -f -- aarch64/$d/*.pkg.tar.zst "aarch64/$d/aios.db" "aarch64/$d/aios.db.tar.gz")
     done
     tree=$(g write-tree)
-    # 中身が同じでも、前の歴史が残っていれば (親のあるコミット) まとめる
     if [ "$tree" = "$(g rev-parse "$base^{tree}")" ] && ! g cat-file -p "$base" | grep -q '^parent '; then
       echo "ai/repo: no change"
       exit 0
     fi
     changes=$(g diff-index --cached --name-status "$base" | sed 's/^/  /')
     commit() { g -c gpg.format=openpgp -c user.name="$name" -c user.email="$mail" commit-tree -S"$fpr" "$@"; }
-    # git.syui.ai の前の Cloudflare は 1 回に 100 MB までしか受けない (こえると 413)。新しいパッケージがそれより多ければ、
-    # 先にそれだけを、前の aios.db のまま前のパッケージも消さずに (aipkg から見て前のままの形で) いくつかに分けて送り、
-    # さいごにまるごと送る (そのときは、もう送ったものは送らない)
     limit=$((80 * 1024 * 1024))
     batch= size=0 total=0 n=0
     for p in $(g diff-index --cached --diff-filter=AM --name-only "$base" -- '*.pkg.tar.zst'); do
       total=$((total + $(g cat-file -s ":$p")))
     done
     if [ "$total" -gt "$limit" ]; then
-      # 分けて送るものの木は別の index で (g の index はさいごのまるごとの木)
       gs() { GIT_DIR="$dir/.git" GIT_INDEX_FILE="$tmp/step" git "$@"; }
       step() {
         n=$((n + 1))
@@ -157,21 +117,14 @@ case "$1" in
       done
       [ "$size" -gt 0 ] && step
     fi
-    # 歴史は残さない: いまのファイルだけの 1 コミット (親なし) で main を置きかえる。パッケージは圧縮したバイナリで
-    # 差分がとれず、作りなおすたびに積もるので (配る場所なので、要るのはいまのパッケージだけ。aipkg からは何も変わらない)
     new=$(commit -m "aarch64: update packages" -m "$changes" "$tree")
     (cd "$dir" && git_push -q --force "$host/ai/repo.git" "$new:refs/heads/main")
-    # 写しも送ったものに (書きかわるのは変わったファイルだけ)。前のコミットのものは、ふくらまないように捨てる
-    # (ばらばらのものだけ。clone したときの pack はそのまま。gc で詰めなおすと、このディスクでは何分もかかる)
     git -C "$dir" reset -q --hard "$new"
     git -C "$dir" reflog expire --expire=now --all
     git -C "$dir" prune --expire=now
     echo "ai/repo: pushed $(git -C "$dir" rev-parse --short "$new") (history squashed)"
     ;;
   release | mirror)
-    # ディスクのイメージ (GitHub の .github/workflows/unix.yml と同じ作り方) を ai/os のリリース latest に
-    # 置きかえる。rootfs はこのリポジトリと repo/aarch64 のパッケージから作る (AIOS_SERVER から取るなら -r)。
-    # mirror は作らずに GitHub の latest をそのまま。ノートの 1 行目が版 ( - vVER)
     api=$host/api/v1/repos/ai/os
     tag=latest img=aios-aarch64.img.zst
     hdr=
@@ -182,7 +135,6 @@ case "$1" in
     if [ "$1" = mirror ]; then
       gh=https://github.com/syui/aios/releases/download/$tag/$img
       info=$(curl -fsS https://api.github.com/repos/syui/aios/releases/tags/$tag)
-      # 版はノートの 1 行目 " - vVER"
       ver=$(printf '%s' "$info" | python3 -c 'import json,re,sys; m=re.search(r"^\s*-\s*v(\S+)", json.load(sys.stdin)["body"], re.M); print(m.group(1) if m else "")')
       [ -n "$ver" ] || { echo "ai/os: no version ( - vVER) in the notes of the GitHub release $tag" >&2; exit 1; }
       sha=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_commitish"])')
@@ -190,17 +142,12 @@ case "$1" in
       zstd -t -q "$tmp/$img"
     else
       bin/mkrootfs.sh ${AIOS_RELEASE_REMOTE:+-r} all > "$tmp/rootfs.log" 2>&1 || { tail "$tmp/rootfs.log" >&2; exit 1; }
-      # 8G (空きはゼロなので .zst は小さいまま。zstd -d は sparse に書くので、ホストのディスクは使ったぶんだけ)。
-      # スワップ 1G は cargo のビルドのため
       SWAP=${AIOS_RELEASE_SWAP:-1G} bin/mkdisk.sh "${AIOS_RELEASE_SIZE:-8G}"
       zstd -q -19 -T0 -f aios.img -o "$tmp/$img"
       ver=$(ls repo/aarch64/rust/aikernel-*.pkg.tar.zst | sed 's|.*/aikernel-||; s|-aarch64.pkg.tar.zst||')
       sha=$(git rev-parse HEAD)
     fi
-    # タグをつけるコミットが ai/os にないと、リリースを作れない (404)。前の latest を消すまえに見る (消してから
-    # しくじると latest がなくなる。ai/os にじかにコミットされて main がずれ、gitea.sh os がしくじったときなど)
     call "$api/git/commits/$sha" > /dev/null 2>&1 || { echo "ai/os: $sha is not in ai/os (push main first: bin/gitea.sh os); the release $tag is left as is" >&2; exit 1; }
-    # 前の latest (リリースとタグ) を消す。前の名前の unix-latest がのこっていれば、それも
     for t in $tag unix-latest; do
       old=$(call "$api/releases/tags/$t" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null) || true
       [ -n "$old" ] && call -X DELETE "$api/releases/$old" > /dev/null
@@ -216,24 +163,18 @@ case "$1" in
     echo "  $host/ai/os/releases/download/$tag/$img"
     ;;
   model)
-    # モデルは大きいので git (ai/repo) には入れず、ai/os のリリース model に置く (publish が作りなおすのは latest だけ)。
-    # aimodel は NAME.sha256 (sha256sum の形) で、変わったかを見て、取ったものも確かめる。新しいものは new-NAME で
-    # 上げてから前のものを消して名前を変えるので、NAME がないあいだはほとんどない (NAME.sha256 がないあいだに
-    # aimodel pull すると、しくじって何も変えない)
     shift
     [ $# -gt 0 ] || usage
     for f in "$@"; do
       case $f in /*) ;; *) f=$here/$f ;; esac
       [ -f "$f" ] || { echo "ai/os: $f: no such file" >&2; exit 1; }
     done
-    # GITEA_URL: Gitea へじかに (Cloudflare をとおさずに) 送るとき
     api=${GITEA_URL:-$host}/api/v1/repos/ai/os
     tag=model
     hdr=
     [ -n "$GITEA_TOKEN" ] && hdr="Authorization: token $GITEA_TOKEN"
     call() { curl -fsS ${hdr:+-H "$hdr"} "$@"; }
     jid() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
-    # いま置いてあるものの id (なければ空)
     asset() {
       call "$api/releases/$id/assets" | python3 -c 'import json,sys
 print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == sys.argv[1]), ""))' "$1"
@@ -256,7 +197,6 @@ print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == sys.argv[
       echo "ai/os: $name ($(du -h "$f" | cut -f1), sha256 $sum)"
       old=$(asset "new-$name")
       [ -z "$old" ] || call -X DELETE "$api/releases/$id/assets/$old" > /dev/null
-      # 大きいので、送っているようすを出す
       curl -fS --progress-bar ${hdr:+-H "$hdr"} -X POST -F "attachment=@$f" -o "$tmp/up.json" "$api/releases/$id/assets?name=new-$name"
       new=$(jid < "$tmp/up.json")
       for n in "$name.sha256" "$name"; do
