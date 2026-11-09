@@ -347,7 +347,12 @@ quirk のところには、ソースに札 `[quirk NAME]` をつける。`python
 extra を使っているところを出す (core を小さくするときの目じるし。そのファイルの数は `CORE_USES_EXTRA_MAX` より増やさず、
 減ったら下げる: todo.json の core-extra)。core が extra に寄りかからないように、1 つのものの「いつも要るところ」と「なくても
 動くところ」を分けることがある: しくじったわけは、書くほう (why、core: EINVAL を返すところはみな `why::inval()`) と、ためて
-/proc/ai/why で見せるほう (whylog、extra)。リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
+/proc/ai/why で見せるほう (whylog、extra)。セキュリティの部品 (LSM) は、core が名前で呼ばずに `security.rs` (Linux の
+security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
+AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
+test/kernel-json.py の `BEHIND_HOOKS` に書き、core がまた名前で呼べば落ちる (いまは apparmor)。いまの aios の順が Linux と
+ちがうところ (すでにあるファイルを開くときは AppArmor が先、など) は、フックに「aios の順」と書いてある。
+リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 
 ### だれが守るか (kernel/src/cell.rs)

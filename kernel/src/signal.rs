@@ -279,8 +279,8 @@ pub fn send_chld(parent: &Proc, info: SigInfo) {
 }
 
 /// 送り主が送ってよいか (Linux の check_kill_permission: uid が合うか CAP_KILL、でなければ EPERM。それから
-/// security_task_kill: landlock の scope (相手が層の外なら EPERM。同じスレッドグループはよい)、AppArmor の signal の決まりで、
-/// だめなら EACCES)
+/// security_task_kill: landlock の scope (相手が層の外なら EPERM。同じスレッドグループはよい)、それから LSM のフック
+/// (AppArmor の signal の決まりで、だめなら EACCES))
 fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     // audit が見る (auditd に送られるもの: AUDIT_SIGNAL_INFO)
     crate::audit::signal_info(target.tgid, sig);
@@ -292,7 +292,7 @@ fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     if a.landlock.is_some() && me.tgid != target.tgid {
         crate::landlock::check_scope_signal(b.landlock.as_ref())?;
     }
-    crate::apparmor::may_signal(b, sig)
+    crate::security::task_kill(target, sig)
 }
 
 /// 例外など、今のスレッドに必ず届けるもの (ブロックや無視は外す)

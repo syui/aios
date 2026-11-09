@@ -2070,11 +2070,11 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     }
     p.altstack = AltStack::NONE;
     p.timers.clear();
-    // AppArmor: exec で決まったプロファイルに (onexec は使いおわり、change_hat の前と token も消える)。新しいプロファイルでプログラムを写せなければ、
-    // Linux と同じく戻れないところの先で SIGSEGV (apparmor::exec_map_ok)
-    p.cred.apparmor = img.apparmor.label.clone();
-    (p.cred.aa_onexec, p.cred.aa_prev, p.cred.aa_token) = (None, None, 0);
-    let fatal = img.apparmor.fatal;
+    // LSM: exec で決まったラベルに (AppArmor の onexec は使いおわり、change_hat の前と token も消える: bprm_committed_creds)。
+    // 新しいラベルでプログラムを写せなければ、Linux と同じく戻れないところの先で SIGSEGV (security::bprm_mmap_file)
+    p.cred.label = img.bprm.label.clone();
+    crate::security::bprm_committed_creds(&mut p.cred);
+    let fatal = img.bprm.fatal;
     // 前のプログラムの robust futex (Linux の futex_exec_release: 前のアドレス空間で、外す前に)
     crate::futex::exit_robust_list();
     let old = p.mm.take();

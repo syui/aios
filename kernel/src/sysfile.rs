@@ -4,6 +4,7 @@ use crate::cred::{self, Cred, R as PR, W as PW, X as PX};
 use crate::fs;
 use crate::inotify;
 use crate::proc::{self, Fd};
+use crate::security::PathOp;
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 use alloc::string::String;
 use alloc::vec;
@@ -245,34 +246,35 @@ fn writable_fd(fd: u64) -> Result<(), i64> {
     }
 }
 
-/// AppArmor: dirfd と pathp のものを、パスの決まりで (プロファイルのついたプロセスだけ、名前を引く)
-fn aa_at(op: &str, dirfd: i64, pathp: usize, flags: u64, request: u32) -> Result<(), i64> {
-    if !crate::apparmor::confined() {
+/// LSM (パスの名前で決めるもの: AppArmor): dirfd と pathp のものを、パスの決まりで (決まりのついたプロセスだけ、
+/// 名前を引く: security::path_mediated)
+fn lsm_at(op: PathOp, dirfd: i64, pathp: usize, flags: u64) -> Result<(), i64> {
+    if !crate::security::path_mediated() {
         return Ok(());
     }
     let full = old_path(dirfd, pathp, flags)?;
     let m = at(dirfd, pathp, flags)?.meta();
-    crate::apparmor::path_perm(op, &full, request, m.is_dir(), m.uid)
+    crate::security::path_perm(op, &full, m.is_dir(), m.uid)
 }
 
-/// AppArmor: fd の開いているファイルを、そのパスの決まりで (パイプやソケットなど名前のないものは見ない: Linux も
+/// LSM: fd の開いているファイルを、そのパスの決まりで (パイプやソケットなど名前のないものは見ない: Linux も
 /// path_mediated_fs でないもの)
-fn aa_fd(op: &str, fd: u64, request: u32) -> Result<(), i64> {
-    if !crate::apparmor::confined() {
+fn lsm_fd(op: PathOp, fd: u64) -> Result<(), i64> {
+    if !crate::security::path_mediated() {
         return Ok(());
     }
-    aa_file(op, &file_of(fd)?, request)
+    lsm_file(op, &file_of(fd)?)
 }
 
-/// aa_fd と同じ (開いたファイルから)
-fn aa_file(op: &str, f: &FileRef, request: u32) -> Result<(), i64> {
-    if !crate::apparmor::confined() {
+/// lsm_fd と同じ (開いたファイルから)
+fn lsm_file(op: PathOp, f: &FileRef) -> Result<(), i64> {
+    if !crate::security::path_mediated() {
         return Ok(());
     }
     match &f.borrow().kind {
         Kind::Inode(i, p) => {
             let m = i.meta();
-            crate::apparmor::path_perm(op, p, request, m.is_dir(), m.uid)
+            crate::security::path_perm(op, p, m.is_dir(), m.uid)
         }
         _ => Ok(()),
     }
@@ -333,7 +335,7 @@ fn whole(f: &FileRef) -> bool {
 
 /// Linux の rw_verify_area: 位置のあるもの (ファイル、ディレクトリ) の位置 + 長さが i64 をこえるなら EINVAL
 /// (ext4 のディレクトリを読み終えると位置は i64::MAX)。読み書きの口のしらべ (EBADF) のあと、中身の前に。それから
-/// security_file_permission (いまは AppArmor のソケットの見なおし: file.rs の aa_sock_file)
+/// security_file_permission (いまは AppArmor のソケットの見なおし)
 fn verify_area(f: &FileRef, len: usize, write: bool) -> Result<(), i64> {
     {
         let b = f.borrow();
@@ -341,7 +343,7 @@ fn verify_area(f: &FileRef, len: usize, write: bool) -> Result<(), i64> {
             return Err(crate::why::inval());
         }
     }
-    file::aa_sock_file(f, write)
+    crate::security::file_permission(f, write)
 }
 
 pub fn read(fd: u64, buf: usize, len: usize) -> R {
@@ -1366,10 +1368,8 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
             if flags as u32 & file::O_ACCMODE != file::O_RDONLY {
                 crate::landlock::check_fs(&full, crate::landlock::WRITE_FILE)?;
             }
-            // AppArmor: 作る (mknod) と、開く (Linux の may_o_create と file_open)
-            let me = cred::current().fsuid;
-            crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, me)?;
-            crate::apparmor::open_perm(&full, flags as u32, false, me)?;
+            // LSM (AppArmor): 作る (mknod) と、開く (Linux の may_o_create と file_open)
+            crate::security::may_o_create(&full, flags as u32)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
@@ -1410,10 +1410,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         return Err(-vfs::EPERM);
     }
     vfs::may(&ino, &ino.meta(), cred::current(), want)?;
-    // AppArmor (file_open): 開く口の許しをパスで
+    // LSM (security_file_open): 開く口の許しをパスで
     {
         let m = ino.meta();
-        crate::apparmor::open_perm(&full, flags as u32, m.is_dir(), m.uid)?;
+        crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: m.is_dir(), ouid: m.uid })?;
     }
     // 砂場: ディレクトリは READ_DIR、ほか (デバイスも) は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE。あとで使う
     // TRUNCATE と (デバイスなら) IOCTL_DEV の許しを開いたファイルに覚える (Linux の hook_file_open)
@@ -1527,7 +1527,7 @@ fn fd_link(path: &str) -> Option<file::FileRef> {
 
 pub fn fstat(fd: u64, st: usize) -> R {
     let f = file_of(fd)?;
-    aa_fd(crate::apparmor::OP_GETATTR, fd, crate::apparmor::MAY_GETATTR)?;
+    lsm_fd(PathOp::Getattr, fd)?;
     let s = f.borrow().stat();
     out(st, &s.to_bytes())?;
     Ok(0)
@@ -1552,7 +1552,7 @@ pub fn newfstatat(dirfd: i64, pathp: usize, st: usize, flags: u64) -> R {
         }
         r => r?,
     };
-    aa_at(crate::apparmor::OP_GETATTR, dirfd, pathp, flags, crate::apparmor::MAY_GETATTR)?;
+    lsm_at(PathOp::Getattr, dirfd, pathp, flags)?;
     let s = Stat::of_inode(&ino);
     out(st, &s.to_bytes())?;
     if learn && ino.fast_stat() {
@@ -1613,7 +1613,7 @@ pub fn statx(dirfd: i64, pathp: usize, flags: u64, mask: u32, buf: usize) -> R {
             }
             r => r?,
         };
-        aa_at(crate::apparmor::OP_GETATTR, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW, crate::apparmor::MAY_GETATTR)?;
+        lsm_at(PathOp::Getattr, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
         let (s, mg) = (Stat::of_inode(&i), mgtime(&i));
         out(buf, &s.to_statx(mask, mg, vfs::mount_of(&full)))?;
         if learn && i.fast_stat() {
@@ -1694,7 +1694,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
-    crate::apparmor::path_perm(crate::apparmor::OP_MKDIR, &full, crate::apparmor::MAY_CREATE, true, cred::current().fsuid)?;
+    crate::security::path_mkdir(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     // setuid と setgid は落とす (Linux の vfs_mkdir は S_IRWXUGO と S_ISVTX だけ。setgid は親が setgid なら own_new が)
@@ -1746,7 +1746,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     vfs::check_writable(&full)?;
     let mode = mode as u32;
     crate::landlock::check_parent(&full, crate::landlock::make_right_dev(mode, dev))?;
-    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
+    crate::security::path_mknod(&full, mode, dev)?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
         vfs::S_IFCHR => NewNode::Dev((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32),
@@ -1780,8 +1780,8 @@ pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String, S
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_SOCK)?;
-    // AppArmor: AF_UNIX の bind は mknod (Linux の unix_bind も vfs_mknod)
-    crate::apparmor::path_perm(crate::apparmor::OP_MKNOD, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
+    // LSM: AF_UNIX の bind は mknod (Linux の unix_bind も vfs_mknod)
+    crate::security::path_mknod(&full, vfs::S_IFSOCK, 0)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !umask(), NewNode::Sock)?;
@@ -1835,13 +1835,8 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     }
     let (parent, name, full) = (p.dir, p.name, p.full);
     crate::landlock::check_parent(&full, if flags & AT_REMOVEDIR != 0 { crate::landlock::REMOVE_DIR } else { crate::landlock::REMOVE_FILE })?;
-    // AppArmor: 消すものの持ち主で (common_perm_rm)
-    if crate::apparmor::confined()
-        && let Ok(v) = parent.lookup(&name)
-    {
-        let rm = flags & AT_REMOVEDIR != 0;
-        crate::apparmor::path_perm(if rm { crate::apparmor::OP_RMDIR } else { crate::apparmor::OP_UNLINK }, &full, crate::apparmor::MAY_DELETE, rm, v.meta().uid)?;
-    }
+    // LSM: 消すものの持ち主で (要る LSM だけが引く: AppArmor の common_perm_rm)
+    crate::security::path_unlink(&full, &parent, &name, flags & AT_REMOVEDIR != 0)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     sticky_ok(&c, &parent, &name)?;
@@ -1880,7 +1875,7 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
-    crate::apparmor::path_perm(crate::apparmor::OP_SYMLINK, &full, crate::apparmor::MAY_CREATE, false, cred::current().fsuid)?;
+    crate::security::path_symlink(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
@@ -1920,10 +1915,8 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
             check_parent(&src, REFER)?;
             check_parent(&full, REFER)?;
         }
-        // AppArmor: 新しい名前と、つなぐ元の組 (profile_path_link)
-        if crate::apparmor::confined() {
-            crate::apparmor::link_perm(&full, &src, ino.meta().uid)?;
-        }
+        // LSM (security_path_link): 新しい名前と、つなぐ元の組 (AppArmor の profile_path_link)
+        crate::security::path_link(&src, &full, &ino)?;
     }
     parent_writable(&cred::current(), &parent)?;
     parent.link(&name, &ino)?;
@@ -2011,15 +2004,8 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
             check_parent(&ofull, REFER)?;
             check_parent(&nfull, REFER)?;
         }
-        // AppArmor (apparmor_path_rename): 入れかえなら先のものも、元のものも、「読んで消す」と「作って書く」
-        let mm = moving.meta();
-        if flags & RENAME_EXCHANGE != 0
-            && let Some(r) = &target
-        {
-            let rm = r.meta();
-            crate::apparmor::rename_perm(&nfull, &ofull, rm.is_dir(), rm.uid)?;
-        }
-        crate::apparmor::rename_perm(&ofull, &nfull, mm.is_dir(), mm.uid)?;
+        // LSM (security_path_rename。AppArmor: 入れかえなら先のものも、元のものも、「読んで消す」と「作って書く」)
+        crate::security::path_rename(&crate::security::Rename { old: &ofull, new: &nfull, moving: &moving, target: target.as_ref(), exchange: flags & RENAME_EXCHANGE != 0 })?;
     }
     // Linux の vfs_rename と同じ順: 元を消せるか (親に書けて sticky も)、先に作れるか (あれば消せるか、種類が合うか)
     let c = cred::current();
@@ -2129,7 +2115,7 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     writable_fd(fd)?;
     // landlock: 開いたときの TRUNCATE の許しで (Linux の hook_file_truncate)
     crate::landlock::check_file_truncate(f.borrow().ll_deny)?;
-    aa_fd(crate::apparmor::OP_TRUNC, fd, crate::apparmor::MAY_WRITE | crate::apparmor::MAY_SETATTR)?;
+    lsm_fd(PathOp::Truncate, fd)?;
     vfs::drop_privs(&ino)?;
     // ftruncate(2) は大きさが変わらなくても時刻を変える (Linux の do_truncate が ATTR_MTIME | ATTR_CTIME を渡す。
     // truncate(2) は渡さないので、tmpfs は大きさが変わらなければ変えない: tmpfs::truncate)
@@ -2221,7 +2207,7 @@ pub fn truncate(pathp: usize, len: i64) -> R {
         return Err(-ETXTBSY);
     }
     crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
-    crate::apparmor::path_perm(crate::apparmor::OP_TRUNC, &full, crate::apparmor::MAY_WRITE | crate::apparmor::MAY_SETATTR, false, ino.meta().uid)?;
+    crate::security::path_truncate(&full, ino.meta().uid)?;
     vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;
     inotify::self_event(&ino, inotify::IN_MODIFY);
@@ -2266,7 +2252,7 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
         return Ok(0);
     }
     writable_fd(fd)?;
-    aa_fd(crate::apparmor::OP_CHMOD, fd, crate::apparmor::MAY_CHMOD)?;
+    lsm_fd(PathOp::Chmod, fd)?;
     chmod(&inode_of(fd)?, mode)?;
     attrib_fd(fd);
     Ok(0)
@@ -2274,7 +2260,7 @@ pub fn fchmod(fd: u64, mode: u64) -> R {
 
 pub fn fchmodat(dirfd: i64, pathp: usize, mode: u64) -> R {
     writable_at(dirfd, pathp, 0)?;
-    aa_at(crate::apparmor::OP_CHMOD, dirfd, pathp, 0, crate::apparmor::MAY_CHMOD)?;
+    lsm_at(PathOp::Chmod, dirfd, pathp, 0)?;
     chmod(&at(dirfd, pathp, 0)?, mode)?;
     attrib_at(dirfd, pathp);
     Ok(0)
@@ -2295,7 +2281,7 @@ pub fn fchmodat2(dirfd: i64, pathp: usize, mode: u64, flags: u64) -> R {
         return Err(-95); // EOPNOTSUPP
     }
     writable_at(dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
-    aa_at(crate::apparmor::OP_CHMOD, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW, crate::apparmor::MAY_CHMOD)?;
+    lsm_at(PathOp::Chmod, dirfd, pathp, flags & AT_SYMLINK_NOFOLLOW)?;
     chmod(&ino, mode)?;
     attrib_at(dirfd, pathp);
     Ok(0)
@@ -2407,7 +2393,7 @@ fn chown_fd(fd: u64, uid: u64, gid: u64, opath_ok: bool) -> R {
         return Ok(0);
     }
     writable_fd(fd)?;
-    aa_fd(crate::apparmor::OP_CHOWN, fd, crate::apparmor::MAY_CHOWN)?;
+    lsm_fd(PathOp::Chown, fd)?;
     let ino = inode_of(fd)?;
     chown(&ino, uid, gid)?;
     attrib_fd(fd);
@@ -2432,7 +2418,7 @@ pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
         return chown(&vfs::resolve("", &cwd, true)?, uid, gid);
     }
     writable_at(dirfd, pathp, flags)?;
-    aa_at(crate::apparmor::OP_CHOWN, dirfd, pathp, flags, crate::apparmor::MAY_CHOWN)?;
+    lsm_at(PathOp::Chown, dirfd, pathp, flags)?;
     chown(&at(dirfd, pathp, flags)?, uid, gid)?;
     attrib_at(dirfd, pathp);
     Ok(0)
@@ -2670,12 +2656,11 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         5..=7 | 36..=38 => {
             let f = entry.file.clone();
             let files = p as *const proc::Files as usize;
-            // AppArmor (file_lock): F_SETLK* と F_OFD_SETLK* は k、書くロック (F_WRLCK) は w も
-            if crate::apparmor::confined() && !matches!(cmd, 5 | 36) {
+            // LSM (file_lock。AppArmor): F_SETLK* と F_OFD_SETLK* は k、書くロック (F_WRLCK) は w も
+            if crate::security::path_mediated() && !matches!(cmd, 5 | 36) {
                 let mut t = [0u8; 2];
                 proc::current().pt().copy_in(&mut t, arg as usize).ok_or(-EFAULT)?;
-                let w = if i16::from_le_bytes(t) == 1 { crate::apparmor::MAY_WRITE } else { 0 };
-                aa_file(crate::apparmor::OP_FLOCK, &f, crate::apparmor::MAY_LOCK | w)?;
+                lsm_file(PathOp::Lock { write: i16::from_le_bytes(t) == 1 }, &f)?;
             }
             crate::locks::fcntl(&f, files, cmd, arg as usize)
         }
@@ -2946,9 +2931,9 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     const ENODEV: i64 = 19;
     let cwd = proc::current().files().cwd.clone();
     let target = user_str(targetp)?;
-    // Linux の do_mount と path_mount の順: マウント先をたどり (ENOENT)、AppArmor (security_sb_mount)、それから may_mount (EPERM)
+    // Linux の do_mount と path_mount の順: マウント先をたどり (ENOENT)、LSM (security_sb_mount)、それから may_mount (EPERM)
     let (tfull, tdir) = vfs::lookup(&cwd, &target, true)?;
-    aa_mount(srcp, typep, datap, flags, &tfull, tdir.meta().is_dir())?;
+    lsm_mount(srcp, typep, datap, flags, &tfull, tdir.meta().is_dir())?;
     may_mount()?;
     if flags & MS_PROPAGATION != 0 {
         return Ok(0);
@@ -3002,28 +2987,29 @@ pub fn umount2(targetp: usize, _flags: u64) -> R {
     may_mount()?;
     let cwd = proc::current().files().cwd.clone();
     let (full, _) = vfs::lookup(&cwd, &user_str(targetp)?, true)?;
-    // AppArmor (security_sb_umount): マウントの根でなければ (EINVAL) のあと、外す前に
-    if crate::apparmor::confined() {
+    // LSM (security_sb_umount。AppArmor): マウントの根でなければ (EINVAL) のあと、外す前に
+    if crate::security::path_mediated() {
         if !vfs::mounted(&full) {
             return Err(crate::why::inval());
         }
-        crate::apparmor::umount_perm(&crate::apparmor::path_name(&full, true))?;
+        crate::security::sb_umount(&crate::security::path_name(&full, true))?;
     }
     vfs::umount(&full)?;
     Ok(0)
 }
 
-/// AppArmor の mount (apparmor_sb_mount: 決まりのあるプロセスだけ)。remount、bind、伝わり方、move、新しいマウントの
-/// どれかで、見るものとフラグを分ける (aa_remount、aa_bind_mount、aa_mount_change_type、aa_move_mount_old、aa_new_mount)
-fn aa_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir: bool) -> Result<(), i64> {
-    use crate::apparmor as aa;
+/// LSM の mount (security_sb_mount。AppArmor の apparmor_sb_mount: 決まりのあるプロセスだけ)。remount、bind、伝わり方、
+/// move、新しいマウントのどれかで、見るものとフラグを分ける (aa_remount、aa_bind_mount、aa_mount_change_type、
+/// aa_move_mount_old、aa_new_mount)
+fn lsm_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir: bool) -> Result<(), i64> {
+    use crate::security as lsm;
     const MS_REMOUNT: u64 = 32;
     const MS_BIND: u64 = 1 << 12;
     const MS_MOVE: u64 = 1 << 13;
     const MS_REC: u64 = 1 << 14;
     const MS_SILENT: u64 = 1 << 15;
     const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
-    if !aa::confined() {
+    if !lsm::path_mediated() {
         return Ok(());
     }
     let mut flags = flags;
@@ -3032,25 +3018,25 @@ fn aa_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir
     }
     // AA_MS_IGNORE_MASK (MS_KERNMOUNT MS_NOSEC MS_BORN MS_ACTIVE)
     flags &= !((1 << 22) | (1 << 28) | (1 << 29) | (1 << 30));
-    let name = aa::path_name(full, dir);
+    let name = lsm::path_name(full, dir);
     let opt = |p: usize| if p != 0 { user_str(p).map(Some) } else { Ok(None) };
     let cwd = proc::current().files().cwd.clone();
     if flags & MS_REMOUNT != 0 {
         let data = opt(datap)?;
-        aa::mount_perm(&name, None, None, flags, data.as_deref())
+        lsm::sb_mount(&name, None, None, flags, data.as_deref())
     } else if flags & MS_BIND != 0 {
         let src = opt(srcp)?.filter(|s| !s.is_empty()).ok_or_else(|| crate::why::inval())?;
         let flags = flags & (MS_REC | MS_BIND);
         match vfs::lookup(&cwd, &src, true) {
-            Ok((sfull, s)) => aa::mount_perm(&name, Some(&aa::path_name(&sfull, s.meta().is_dir())), None, flags, None),
-            Err(e) => Err(aa::mount_error(flags, e)),
+            Ok((sfull, s)) => lsm::sb_mount(&name, Some(&lsm::path_name(&sfull, s.meta().is_dir())), None, flags, None),
+            Err(e) => Err(lsm::sb_mount_error(flags, e)),
         }
     } else if flags & MS_PROPAGATION != 0 {
-        aa::mount_perm(&name, None, None, flags & (MS_REC | MS_SILENT | MS_PROPAGATION), None)
+        lsm::sb_mount(&name, None, None, flags & (MS_REC | MS_SILENT | MS_PROPAGATION), None)
     } else if flags & MS_MOVE != 0 {
         let src = opt(srcp)?.filter(|s| !s.is_empty()).ok_or_else(|| crate::why::inval())?;
         let (sfull, s) = vfs::lookup(&cwd, &src, true)?;
-        aa::mount_perm(&name, Some(&aa::path_name(&sfull, s.meta().is_dir())), None, MS_MOVE, None)
+        lsm::sb_mount(&name, Some(&lsm::path_name(&sfull, s.meta().is_dir())), None, MS_MOVE, None)
     } else {
         // 知らない fs の種類は ENODEV (get_fs_type)。aios の fs にデバイスの要るもの (FS_REQUIRES_DEV) やバイナリの
         // データのものはない
@@ -3060,7 +3046,7 @@ fn aa_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, dir
         }
         let dev = opt(srcp)?;
         let data = opt(datap)?;
-        aa::mount_perm(&name, dev.as_deref(), fstype.as_deref(), flags, data.as_deref())
+        lsm::sb_mount(&name, dev.as_deref(), fstype.as_deref(), flags, data.as_deref())
     }
 }
 
@@ -3846,12 +3832,11 @@ pub fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
 
 /// flock(fd, op): locks.rs
 pub fn flock(fd: u64, op: u64) -> R {
-    // AppArmor (file_lock): LOCK_SH と LOCK_UN は k、LOCK_EX (F_WRLCK) は w も
+    // LSM (file_lock。AppArmor): LOCK_SH と LOCK_UN は k、LOCK_EX (F_WRLCK) は w も
     const LOCK_EX: u64 = 2;
     const LOCK_NB: u64 = 4;
     if matches!(op & !LOCK_NB, 1 | 2 | 8) {
-        let w = if op & !LOCK_NB == LOCK_EX { crate::apparmor::MAY_WRITE } else { 0 };
-        aa_fd(crate::apparmor::OP_FLOCK, fd, crate::apparmor::MAY_LOCK | w)?;
+        lsm_fd(PathOp::Lock { write: op & !LOCK_NB == LOCK_EX }, fd)?;
     }
     crate::locks::flock(fd, op)
 }

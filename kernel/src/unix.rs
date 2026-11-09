@@ -236,7 +236,7 @@ pub struct Unix {
     pub epolled: bool,
     /// AppArmor: 作ったプロセスのラベル (受けた口は listen しているもののラベル: Linux の aa_sk_ctx)。相手の側の決まりを
     /// 見るのに使う
-    pub label: Option<crate::apparmor::Label>,
+    pub label: Option<crate::security::Label>,
     /// landlock: ソケットの fd を作ったプロセスの層 (Linux の sk_socket->file->f_cred。accept されるまでの口にはない)。
     /// RESOLVE_UNIX と抽象名前空間の scope で、つなぐほうが同じ層の中かを見る
     pub ll: Option<crate::landlock::Domain>,

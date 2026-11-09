@@ -74,12 +74,11 @@ pub struct Cred {
     pub seccomp: Option<crate::seccomp::Seccomp>,
     /// namespace (ns.rs)
     pub ns: crate::ns::Ns,
-    /// AppArmor のプロファイル (なければ unconfined) と、次の exec でつけるもの (/proc/self/attr/exec。apparmor.rs)
-    pub apparmor: Option<crate::apparmor::Label>,
-    pub aa_onexec: Option<crate::apparmor::Label>,
-    /// change_hat で hat に入る前のプロファイルと、帰るときに合わせる token (Linux の aa_task_ctx。exec で消える)
-    pub aa_prev: Option<crate::apparmor::Label>,
-    pub aa_token: u64,
+    /// LSM のラベル (AppArmor のプロファイルの名前。なければ unconfined)。fork で受けつぐ。syscall::fast は is_some を見る
+    pub label: Option<crate::security::Label>,
+    /// ラベルを持つ LSM のもの (AppArmor の onexec、change_hat の前のプロファイルと token: Linux の aa_task_ctx)。中は
+    /// その LSM だけが知る。exec で消える (security::bprm_committed_creds)
+    pub label_ctx: Option<crate::security::Blob>,
     /// AUDIT_TTY_SET の設定 (Linux は signal_struct の audit_tty: fork で受けつぎ、exec でも消えない。audit.rs)
     pub audit_tty: u32,
     /// ログインした人と、そのセッションの番号 (/proc/PID/loginuid と sessionid。audit の記録の auid= ses=)。
@@ -89,7 +88,7 @@ pub struct Cred {
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, apparmor: None, aa_onexec: None, aa_prev: None, aa_token: 0, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, label: None, label_ctx: None, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
 
     /// gid の組にいるか (Linux の in_group_p: fsgid と、ほかの組)
     pub fn in_group(&self, gid: u32) -> bool {
@@ -102,8 +101,9 @@ impl Cred {
         if FS_CAPS.contains(&cap) { self.fs_caps } else { self.euid == 0 }
     }
 
-    /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても AppArmor のプロファイルが
-    /// 許さなければ持たない (記録する: apparmor::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
+    /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても LSM (AppArmor のプロファイル
+    /// など) が許さなければ持たない (記録する: security::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを:
+    /// Linux と同じ順)
     pub fn capable(&self, cap: u32) -> bool {
         self.has_cap(cap) && self.lsm_capable(cap, true)
     }
@@ -113,9 +113,10 @@ impl Cred {
         self.has_cap(cap) && self.lsm_capable(cap, false)
     }
 
-    /// commoncap が許したあとの LSM (security_capable): landlock の CAPABILITY_USE、それから AppArmor (CONFIG_LSM の順)
+    /// commoncap が許したあとの LSM (security_capable): landlock の CAPABILITY_USE、それから security::capable
+    /// (CONFIG_LSM の順)
     fn lsm_capable(&self, cap: u32, audit: bool) -> bool {
-        crate::landlock::cap_ok(self, cap) && crate::apparmor::capable(self, cap, audit)
+        crate::landlock::cap_ok(self, cap) && crate::security::capable(self, cap, audit)
     }
 
     /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)。Linux の

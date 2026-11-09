@@ -26,6 +26,7 @@ mod console;
 mod tty;
 mod block;
 mod cred;
+mod security;
 mod crypto;
 mod dtb;
 mod efi;
@@ -139,6 +140,10 @@ pub extern "C" fn kmain() -> ! {
     dtb::summary();
     // 実験のために切ったところ (aios.off=)
     parts::init();
+    // LSM をつなぐ (Linux の security_init と CONFIG_LSM="landlock,apparmor": capability は cred.rs の has_cap でいつも先)。
+    // 切ったもの (aios.off=) もつなぐ: 動かしたまま入れなおせるように、切ったかはそれぞれがフックの中で見る
+    security::register(&landlock::LSM);
+    security::register(&apparmor::LSM);
 
     irq::init();
     irq::enable_ipi();

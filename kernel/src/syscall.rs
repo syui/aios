@@ -465,9 +465,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         IOCTL => sysfile::ioctl(a[0], a[1] & 0xffff_ffff, a[2] as usize),
         FACCESSAT => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], 0),
         FACCESSAT2 => sysfile::faccessat(int(a[0]), a[1] as usize, a[2], a[3]),
-        LSM_GET_SELF_ATTR => crate::apparmor::lsm_get_self_attr(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as u32),
-        LSM_SET_SELF_ATTR => crate::apparmor::lsm_set_self_attr(a[0] as u32, a[1] as usize, a[2] as u32, a[3] as u32),
-        LSM_LIST_MODULES => crate::apparmor::lsm_list_modules(a[0] as usize, a[1] as usize, a[2] as u32),
+        LSM_GET_SELF_ATTR => crate::security::lsm_get_self_attr(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as u32),
+        LSM_SET_SELF_ATTR => crate::security::lsm_set_self_attr(a[0] as u32, a[1] as usize, a[2] as u32, a[3] as u32),
+        LSM_LIST_MODULES => crate::security::lsm_list_modules(a[0] as usize, a[1] as usize, a[2] as u32),
         CHDIR => sysfile::chdir(a[0] as usize),
         OPENAT => sysfile::openat(int(a[0]), a[1] as usize, a[2], a[3]),
         OPENAT2 => sysfile::openat2(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize),
@@ -913,9 +913,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     let nr = tf.x[8];
     let p = proc::current();
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
-    // AppArmor のプロファイルのついたものも (決まりを見るのはふつうの道だけ)
+    // LSM のラベルのついたもの (AppArmor のプロファイル) も (決まりを見るのはふつうの道だけ)
     // 監査のシステムコールのルールがあれば、入れもののあるスレッドも (入口と出口でルールを見る)
-    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.apparmor.is_some() || (p.audit.is_some() && crate::audit::slow()) {
+    if p.cred.seccomp.is_some() || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.label.is_some() || (p.audit.is_some() && crate::audit::slow()) {
         return false;
     }
     let r = match nr {
@@ -1270,8 +1270,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             // ふつうのファイルだけ (ディレクトリやパイプは ENODEV: Linux に mmap がない)。fend は MAX: ファイルの終わりは
             // 触れたときの大きさで見る (その先のページは SIGBUS。vm.rs)
             crate::file::Kind::Inode(ino, p) if ino.meta().mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG => {
-                // AppArmor: 実行して写すなら m (common_mmap)
-                crate::apparmor::mmap_perm(crate::apparmor::OP_FMMAP, p, prot, flags & MAP_SHARED == 0, ino.meta().uid)?;
+                // LSM (AppArmor): 実行して写すなら m (security_mmap_file)
+                crate::security::mmap_file(p, prot, flags & MAP_SHARED == 0, ino.meta().uid)?;
                 path = Some(p.clone());
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
@@ -1485,9 +1485,10 @@ fn sys_capget(hdr: usize, data: usize) -> R {
     }
     // v1 は 1 組、v2 と v3 は 2 組の {effective, permitted, inheritable}
     let n = if ver == 0x1998_0330 { 1 } else { 2 };
-    // root はみな (CAP_LAST_CAP の 40 まで: 上の組は 0x1ff)。AppArmor のプロファイルがあれば、その caps.allow だけ (apparmor_capget)
+    // root はみな (CAP_LAST_CAP の 40 まで: 上の組は 0x1ff)。LSM のラベル (AppArmor のプロファイル) があれば、その LSM が
+    // 許すものだけ (security_capget)
     let c = crate::cred::current();
-    let all: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::apparmor::caps_of(c) } else { 0 };
+    let all: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::security::capget(c) } else { 0 };
     let mut out = alloc::vec::Vec::new();
     for i in 0..n {
         let w = (all >> (32 * i)) as u32;

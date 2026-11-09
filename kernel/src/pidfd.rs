@@ -214,7 +214,7 @@ fn info(pid: u32, _thread: bool, usize: usize, arg: usize) -> Result<i64, i64> {
 
 /// いまのプロセスが t を ptrace で ATTACH できるか (Linux の __ptrace_may_access の PTRACE_MODE_ATTACH_REALCREDS):
 /// 同じスレッドグループか、実の uid と gid が相手の 3 つの id とみな同じで、相手が dumpable (でなければ CAP_SYS_PTRACE)。
-/// それから landlock と AppArmor の ptrace の決まり
+/// それから landlock と LSM (AppArmor) の ptrace の決まり (security_ptrace_access_check)
 fn may_attach(t: &crate::proc::Proc) -> Result<(), i64> {
     let me = crate::proc::current();
     if me.tgid == t.tgid {
@@ -229,7 +229,7 @@ fn may_attach(t: &crate::proc::Proc) -> Result<(), i64> {
         return Err(-EPERM);
     }
     crate::landlock::check_ptrace(c.landlock.as_ref(), tc.landlock.as_ref())?;
-    crate::apparmor::may_ptrace(tc, false).map_err(|_| -EPERM)
+    crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_ATTACH).map_err(|_| -EPERM)
 }
 
 /// pidfd_getfd(pidfd, fd, flags): pidfd の指すものの fd を写して、いまのプロセスの fd (close-on-exec) に

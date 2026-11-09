@@ -67,8 +67,8 @@ pub struct Image {
     pub exe_id: (usize, u64),
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)。/proc/PID/cmdline と environ はここを読む
     pub args: (usize, usize, usize),
-    /// AppArmor: この exec でつくプロファイル (apparmor::exec_transition)
-    pub apparmor: crate::apparmor::Exec,
+    /// LSM が exec で決めたこと (ラベル、AT_SECURE、写せなければ SIGSEGV: security::Bprm)
+    pub bprm: crate::security::Bprm,
     /// プログラムかインタプリタ (ld.so) が、exec した人に読めない: dumpable を fs.suid_dumpable に (Linux の would_dump。
     /// 読めないものの中身を、/proc/PID/mem や core で見られないように)
     pub nondump: bool,
@@ -151,14 +151,14 @@ pub fn exec_target(t: Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Imag
 }
 
 /// exec する前のたしかめ (Linux の do_open_execat の may_open と、security_bprm_creds_for_exec まで): Landlock の EXECUTE、
-/// ふつうのファイルで x がある、AppArmor の移りかた。execveat の AT_EXECVE_CHECK はここまでで 0
-pub fn check(exe: &str, ino: &crate::vfs::InodeRef) -> Result<crate::apparmor::Exec, i64> {
+/// ふつうのファイルで x がある、LSM の移りかた (AppArmor のプロファイル)。execveat の AT_EXECVE_CHECK はここまでで 0
+pub fn check(exe: &str, ino: &crate::vfs::InodeRef) -> Result<crate::security::Bprm, i64> {
     crate::landlock::check_fs(exe, crate::landlock::EXECUTE)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
-    crate::apparmor::exec_transition(exe, m.uid)
+    crate::security::bprm_creds_for_exec(exe, m.uid)
 }
 
 /// インタプリタ (#! の 1 行めか PT_INTERP) を cwd から開く (Linux の open_exec)。audit の名前も (ないものは名前だけ)
@@ -170,18 +170,18 @@ fn open_interp(cwd: &str, path: &str) -> Result<(String, crate::vfs::InodeRef), 
 }
 
 /// t.filename は bprm->interp (#! のスクリプトにわたす名前)、execfn は AT_EXECFN (はじめの名前のまま)。
-/// aa: はじめのプログラムで決めた AppArmor の答え (#! のインタプリタへもちこむ: Linux もスクリプトのパスで 1 度だけ)
-fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, aa: Option<crate::apparmor::Exec>) -> Result<Image, i64> {
+/// bprm: はじめのプログラムで LSM が決めた答え (#! のインタプリタへもちこむ: Linux もスクリプトのパスで 1 度だけ)
+fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize, bprm: Option<crate::security::Bprm>) -> Result<Image, i64> {
     let cwd = crate::proc::current_cwd();
     let (exe, ino) = (t.exe, t.ino);
     let m = ino.meta();
-    let mut aa = match aa {
-        Some(a) => {
+    let mut bprm = match bprm {
+        Some(b) => {
             crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
             if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
                 return Err(-EACCES);
             }
-            a
+            b
         }
         None => check(&exe, &ino)?,
     };
@@ -205,10 +205,10 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
         nargv.extend(argv.iter().skip(1).cloned());
         let (ie, ii) = open_interp(&cwd, interp_s)?;
         let next = Target { exe: ie, ino: ii, filename: String::from(interp_s), inaccessible: false, comm_from_file: false };
-        return exec_depth(next, execfn, &nargv, envp, depth + 1, Some(aa));
+        return exec_depth(next, execfn, &nargv, envp, depth + 1, Some(bprm));
     }
-    // AppArmor: 新しいプロファイルでこのプログラムを写せるか (だめなら exec のあと SIGSEGV: Linux と同じ)
-    aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &exe, m.uid);
+    // LSM: 新しいラベルでこのプログラムを写せるか (だめなら exec のあと SIGSEGV: Linux と同じ)
+    bprm.fatal |= !crate::security::bprm_mmap_file(&bprm, &exe, m.uid);
     let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
     let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
     let size = m.size as usize;
@@ -221,7 +221,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
         Some(ip) => {
             let (ipath, iino) = open_interp(&cwd, ip)?;
             crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
-            aa.fatal |= !crate::apparmor::exec_map_ok(&aa, &ipath, iino.meta().uid);
+            bprm.fatal |= !crate::security::bprm_mmap_file(&bprm, &ipath, iino.meta().uid);
             let im = iino.meta();
             nondump |= !crate::cred::current().may(&im, crate::cred::R, false);
             let isize = im.size as usize;
@@ -297,8 +297,8 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
         (AT_GID, 0),
         (AT_EGID, 0),
         (AT_CLKTCK, crate::timer::HZ),
-        // AppArmor の Px など (環境を消す移りかた) なら 1: ld.so が LD_* を見ない
-        (AT_SECURE, aa.secure as u64),
+        // LSM が環境を消す移りかた (AppArmor の Px など) なら 1: ld.so が LD_* を見ない
+        (AT_SECURE, bprm.secure as u64),
         (AT_RANDOM, random as u64),
         (AT_EXECFN, execfn as u64),
         if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
@@ -324,7 +324,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, apparmor: aa, nondump })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, bprm, nondump })
 }
 
 

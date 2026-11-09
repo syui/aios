@@ -5,6 +5,11 @@
 // (match.c。表は big endian) で、パスを通してたどりついた状態の許しを見る。名のる版は v5〜v7 (features。許しを DFA の
 // accept の表にうめこんだ古い形で、policy_compat.c と同じく読むときに許しの表へ移す)。名前空間 (:ns:) はまだない
 use crate::cell::Bkl;
+use crate::cred::Cred;
+use crate::file::FileRef;
+use crate::proc::Proc;
+use crate::security::{path_name, Bprm, FileOpen, Label, PathOp, Rename};
+use crate::vfs::InodeRef;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -1362,13 +1367,10 @@ fn audit_status(op: &str, name: Option<&str>, info: Option<&str>, error: i64) {
     audit_emit(&s);
 }
 
-// ---- プロセスについたプロファイル (cred の apparmor。fork で受けつぐ) ----
+// ---- プロセスについたプロファイル (cred の label。fork で受けつぐ) ----
 
-/// プロセスのラベル: プロファイルの名前。使うたびに名前で引く (入れかえれば新しいものに、外されれば unconfined に:
-/// Linux の proxy と同じ)
-#[derive(Clone, PartialEq)]
-pub struct Label(alloc::sync::Arc<str>);
-
+/// プロセスのラベル (security::Label): プロファイルの名前。使うたびに名前で引く (入れかえれば新しいものに、外されれば
+/// unconfined に: Linux の proxy と同じ)
 impl Label {
     fn of(p: &Profile) -> Label {
         Label(alloc::sync::Arc::from(p.name.as_str()))
@@ -1377,6 +1379,26 @@ impl Label {
     pub fn profile(&self) -> Option<Rc<Profile>> {
         find(&self.0)
     }
+}
+
+/// プロセスの AppArmor のもの (Linux の aa_task_ctx): 次の exec でつけるもの (/proc/self/attr/exec)、change_hat で hat に
+/// 入る前のプロファイルと、帰るときに合わせる token。cred の label_ctx に入れる (exec で消える: bprm_committed_creds)。
+/// fork した子と Rc を分けあうので、中は変えずに、いつも新しいものに入れかえる
+#[derive(Clone, Default)]
+struct TaskCtx {
+    onexec: Option<Label>,
+    prev: Option<Label>,
+    token: u64,
+}
+
+/// c の TaskCtx (なければ空)
+fn task(c: &Cred) -> TaskCtx {
+    c.label_ctx.as_ref().map(|b| b.downcast_ref::<TaskCtx>().expect("apparmor: label_ctx").clone()).unwrap_or_default()
+}
+
+/// c の TaskCtx を t に入れかえる (空なら None)
+fn set_task(c: &mut Cred, t: TaskCtx) {
+    c.label_ctx = if t.onexec.is_none() && t.prev.is_none() && t.token == 0 { None } else { Some(Rc::new(t)) };
 }
 
 fn off() -> bool {
@@ -1388,14 +1410,14 @@ pub fn current_profile() -> Option<Rc<Profile>> {
     if off() {
         return None;
     }
-    let l = crate::cred::current().apparmor.as_ref()?;
+    let l = crate::cred::current().label.as_ref()?;
     l.profile().filter(|p| p.mode != Mode::Unconfined)
 }
 
 /// 決まりのついたプロセスか (重いこと (inode を引くなど) をする前に。大きなロックの中で)
 #[inline]
 pub fn confined() -> bool {
-    crate::cred::current().apparmor.is_some() && current_profile().is_some()
+    crate::cred::current().label.is_some() && current_profile().is_some()
 }
 
 /// 開いたラベルが flabel のファイルを、いまのプロセスが使うときに見なおすか (Linux の aa_file_perm の速い道の逆):
@@ -1408,7 +1430,7 @@ pub fn file_needs_revalidation(flabel: Option<&Label>) -> bool {
     if fl.profile().is_none_or(|p| p.mode == Mode::Unconfined) {
         return false;
     }
-    crate::cred::current().apparmor.as_ref() != Some(fl)
+    crate::cred::current().label.as_ref() != Some(fl)
 }
 
 /// ラベルの見せ方 (/proc/PID/attr/current、aa_getprocattr): "name (mode)\n"、unconfined は "unconfined\n"
@@ -1441,18 +1463,6 @@ impl Profile {
 /// プロセスの fsuid
 fn fsuid() -> u32 {
     crate::cred::current().fsuid
-}
-
-/// パスの名前: 頭に /、ディレクトリなら終わりにも / (aa_path_name の PATH_IS_DIR)
-pub fn path_name(full: &str, dir: bool) -> String {
-    let full = full.trim_matches('/');
-    if full.is_empty() {
-        "/".into()
-    } else if dir {
-        format!("/{}/", full)
-    } else {
-        format!("/{}", full)
-    }
 }
 
 // 操作の名前 (audit.h の OP_*)
@@ -1673,10 +1683,10 @@ static CAP_CACHE: Bkl<(u32, [u64; 41])> = Bkl::new((0, [0; 41]));
 /// c (root) が cap を使ってよいか (aa_capable の古い形: プロファイルの caps.allow)。だめなら DENIED を記録して false
 /// (complain なら許して ALLOWED)。audit が false なら記録しない (noaudit。complain だけ "optional: no audit" で記録)
 pub fn capable(c: &crate::cred::Cred, cap: u32, audit: bool) -> bool {
-    if off() || c.apparmor.is_none() {
+    if off() || c.label.is_none() {
         return true;
     }
-    let Some(p) = c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined) else { return true };
+    let Some(p) = c.label.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined) else { return true };
     let bit = 1u64 << cap.min(63);
     let error = if p.caps.allow & bit != 0 { 0 } else { -EPERM };
     let mut info = None;
@@ -1735,7 +1745,7 @@ pub fn capable(c: &crate::cred::Cred, cap: u32, audit: bool) -> bool {
 
 /// capget に見せる capability (apparmor_capget: プロファイルのある root は、その caps.allow だけ)
 pub fn caps_of(c: &crate::cred::Cred) -> u64 {
-    match c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
+    match c.label.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined && !off()) {
         Some(p) if p.mode != Mode::Complain => p.caps.allow,
         _ => u64::MAX,
     }
@@ -1743,21 +1753,12 @@ pub fn caps_of(c: &crate::cred::Cred) -> u64 {
 
 // ---- exec で次のプロファイル (domain.c) ----
 
-/// exec の答え: 次のラベル (None は unconfined) と、AT_SECURE にするか (環境を消す Px など)。fatal は、新しい
-/// プロファイルでプログラムを写せない (exec_map_ok): exec のあと SIGSEGV
-#[derive(Clone, Default)]
-pub struct Exec {
-    pub label: Option<Label>,
-    pub secure: bool,
-    pub fatal: bool,
-}
-
 /// exec で写すプログラム (と ld.so) を、新しいプロファイルで r と m が許されるか。Linux は、開いたとき (前の
 /// ラベル) とラベルがちがえば binfmt_elf の mmap で見なおし (aa_file_perm)、だめなら戻れないところの先で SIGSEGV。
 /// 同じラベル (ix)、行き先が unconfined、前が unconfined (開いたファイルはわたされたもの: __file_is_delegated) は
 /// 見ない。だめなら記録して false
-pub fn exec_map_ok(e: &Exec, full: &str, ouid: u32) -> bool {
-    if off() || e.label == crate::cred::current().apparmor || current_profile().is_none() {
+pub fn exec_map_ok(e: &Bprm, full: &str, ouid: u32) -> bool {
+    if off() || e.label == crate::cred::current().label || current_profile().is_none() {
         return true;
     }
     let Some(p) = e.label.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined) else { return true };
@@ -1894,16 +1895,17 @@ fn label_name(l: &Option<Label>) -> String {
     l.as_ref().map_or("unconfined".into(), |l| String::from(&*l.0))
 }
 
-/// exec (apparmor_bprm_creds_for_exec): full (頭の / のないパス) を動かすときの次のラベル。onexec が先
-pub fn exec_transition(full: &str, ouid: u32) -> Result<Exec, i64> {
+/// exec (apparmor_bprm_creds_for_exec): full (頭の / のないパス) を動かすときの次のラベル (None は unconfined) と、
+/// AT_SECURE にするか (環境を消す Px など)。onexec が先
+pub fn exec_transition(full: &str, ouid: u32) -> Result<Bprm, i64> {
     let c = crate::cred::current();
     if off() {
-        return Ok(Exec { label: c.apparmor.clone(), ..Default::default() });
+        return Ok(Bprm { label: c.label.clone(), ..Default::default() });
     }
     let name = path_name(full, false);
-    let cur = c.apparmor.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined);
+    let cur = c.label.as_ref().and_then(|l| l.profile()).filter(|p| p.mode != Mode::Unconfined);
     let mut secure = false;
-    let new = if let Some(on) = c.aa_onexec.clone() {
+    let new = if let Some(on) = task(c).onexec {
         // change_onexec: 決まりがついていれば、このプログラムで onexec が許され、その組で行き先が許されること
         if let Some(p) = &cur {
             let (st, mut perms) = p.file_perms(p.file_start(), name.as_bytes(), fsuid() == ouid);
@@ -1976,7 +1978,7 @@ pub fn exec_transition(full: &str, ouid: u32) -> Result<Exec, i64> {
         }
         return Err(-EPERM);
     }
-    Ok(Exec { label: new, secure, fatal: false })
+    Ok(Bprm { label: new, secure, fatal: false })
 }
 
 /// change_profile_perms: p のファイルの決まりで、start から target の名前をたどって request が許されるか
@@ -2020,14 +2022,16 @@ pub fn change_profile(name: &str, onexec: bool) -> Result<(), i64> {
     }
     let c = &mut crate::proc::current().cred;
     if onexec {
-        c.aa_onexec = Some(Label::of(&target));
+        let mut t = task(c);
+        t.onexec = Some(Label::of(&target));
+        set_task(c, t);
         return Ok(());
     }
     // no_new_privs: 決まりのついたプロセスはほかのプロファイルへは移れない (記録しない: Linux と同じ)
     if c.no_new_privs && cur.as_ref().is_some_and(|p| p.name != target.name) {
         return Err(-EPERM);
     }
-    c.apparmor = Some(Label::of(&target));
+    c.label = Some(Label::of(&target));
     Ok(())
 }
 
@@ -2071,18 +2075,19 @@ fn change_hat(hats: &[&str], token: u64, test: bool) -> Result<(), i64> {
         return Err(-EPERM);
     };
     let c = &mut crate::proc::current().cred;
+    let mut t = task(c);
     if hats.is_empty() {
         // 帰る。前がなければ何もしない
-        let Some(prev) = c.aa_prev.clone().filter(|_| !test) else { return Ok(()) };
+        let Some(prev) = t.prev.clone().filter(|_| !test) else { return Ok(()) };
         // no_new_privs: ほかのプロファイルへはもどれない (記録しない)
         if c.no_new_privs {
             return Err(-EPERM);
         }
-        if c.aa_token != token {
+        if t.token != token {
             return hat_kill(&p, &prev.0);
         }
-        c.apparmor = Some(prev);
-        (c.aa_prev, c.aa_onexec, c.aa_token) = (None, None, 0);
+        c.label = Some(prev);
+        set_task(c, TaskCtx::default());
         return Ok(());
     }
     let root = if p.is_hat() { p.name.rsplit_once("//").and_then(|(up, _)| find(up)) } else { Some(p.clone()) };
@@ -2113,13 +2118,14 @@ fn change_hat(hats: &[&str], token: u64, test: bool) -> Result<(), i64> {
         return Ok(());
     }
     // aa_set_current_hat: はじめて入るなら前のプロファイルと token を覚える
-    match c.aa_prev {
-        None => (c.aa_prev, c.aa_token) = (c.apparmor.clone(), token),
-        Some(_) if c.aa_token == token => {}
+    match t.prev {
+        None => (t.prev, t.token) = (c.label.clone(), token),
+        Some(_) if t.token == token => {}
         Some(_) => return hat_kill(&p, &hat.name),
     }
-    c.apparmor = Some(Label::of(&hat));
-    c.aa_onexec = None;
+    c.label = Some(Label::of(&hat));
+    t.onexec = None;
+    set_task(c, t);
     Ok(())
 }
 
@@ -2147,11 +2153,12 @@ fn set_hat(arg: &str, more: Option<&[u8]>, test: bool) -> Result<(), i64> {
 
 /// /proc/PID/attr/{current,exec,prev} (と attr/apparmor/ の同じもの) を読む。ないもの (exec を決めていない、hat の中で
 /// ないときの prev) は EINVAL
-pub fn attr_read(c: &crate::cred::Cred, which: &str) -> Result<String, i64> {
+pub fn attr_read(c: &Cred, which: &str) -> Result<String, i64> {
+    let t = task(c);
     match which {
-        "current" => Ok(label_text(c.apparmor.as_ref())),
-        "exec" if c.aa_onexec.is_some() => Ok(label_text(c.aa_onexec.as_ref())),
-        "prev" if c.aa_prev.is_some() => Ok(label_text(c.aa_prev.as_ref())),
+        "current" => Ok(label_text(c.label.as_ref())),
+        "exec" if t.onexec.is_some() => Ok(label_text(t.onexec.as_ref())),
+        "prev" if t.prev.is_some() => Ok(label_text(t.prev.as_ref())),
         _ => Err(-EINVAL),
     }
 }
@@ -2819,7 +2826,7 @@ pub fn current_label() -> Option<Label> {
     if off() {
         return None;
     }
-    crate::cred::current().apparmor.clone()
+    crate::cred::current().label.clone()
 }
 
 /// AF_UNIX の番地の記録 (audit_unix_addr): なし、パス、"@抽象名" (制御文字があれば 16 進)
@@ -2964,11 +2971,11 @@ pub fn may_signal(target: &crate::cred::Cred, sig: i32) -> Result<(), i64> {
         return Ok(());
     }
     let me = crate::cred::current();
-    if me.apparmor.is_none() && target.apparmor.is_none() {
+    if me.label.is_none() && target.label.is_none() {
         return Ok(());
     }
-    let (sname, sp) = label_profile(me.apparmor.as_ref());
-    let (tname, tp) = label_profile(target.apparmor.as_ref());
+    let (sname, sp) = label_profile(me.label.as_ref());
+    let (tname, tp) = label_profile(target.label.as_ref());
     let a = sp.map_or(Ok(()), |p| signal_perm(&p, &tname, MAY_WRITE, sig));
     let b = tp.map_or(Ok(()), |p| signal_perm(&p, &sname, MAY_READ, sig));
     xcheck(a, b)
@@ -3024,12 +3031,12 @@ pub fn may_ptrace(tracee: &crate::cred::Cred, read: bool) -> Result<(), i64> {
         return Ok(());
     }
     let me = crate::cred::current();
-    if me.apparmor.is_none() && tracee.apparmor.is_none() {
+    if me.label.is_none() && tracee.label.is_none() {
         return Ok(());
     }
     let request = if read { MAY_READ } else { MAY_WRITE };
-    let (mname, mp) = label_profile(me.apparmor.as_ref());
-    let (tname, tp) = label_profile(tracee.apparmor.as_ref());
+    let (mname, mp) = label_profile(me.label.as_ref());
+    let (tname, tp) = label_profile(tracee.label.as_ref());
     let a = match &mp {
         None => Ok(()),
         Some(p) if p.policy.start[CLASS_PTRACE] != DFA_NOMATCH => ptrace_perm(p, &tname, request),
@@ -3199,149 +3206,6 @@ pub fn umount_perm(name: &str) -> Result<(), i64> {
     check_perms(&perms, MAY_UMOUNT, &|kind, _, _, error| mount_audit(&p, kind, "umount", None, error, Some(name), None, None, 0, None))
 }
 
-// ---- LSM のシステムコール (Linux 6.8 から: security/lsm_syscalls.c と security.c。libapparmor は /proc/self/attr より先に使う) ----
-
-const LSM_ID_CAPABILITY: u64 = 100;
-const LSM_ID_APPARMOR: u64 = 104;
-const LSM_ID_LANDLOCK: u64 = 110;
-const LSM_ATTR_CURRENT: u32 = 100;
-const LSM_ATTR_EXEC: u32 = 101;
-const LSM_ATTR_PREV: u32 = 104;
-const LSM_FLAG_SINGLE: u32 = 1;
-const E2BIG: i64 = 7;
-const EFAULT: i64 = 14;
-/// struct lsm_ctx の頭 (id、flags、len、ctx_len。どれも u64)
-const LSM_CTX: usize = 32;
-
-fn get_user(va: usize, b: &mut [u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_in(b, va).ok_or(-EFAULT)
-}
-
-fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
-    crate::proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
-
-fn get_u32(va: usize) -> Result<u32, i64> {
-    let mut b = [0u8; 4];
-    get_user(va, &mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-/// lsm_list_modules(ids, size, flags): 動いている LSM の番号 (/sys/kernel/security/lsm と同じ順)
-pub fn lsm_list_modules(ids: usize, size: usize, flags: u32) -> Result<i64, i64> {
-    if flags != 0 {
-        return Err(-EINVAL);
-    }
-    let have = get_u32(size)?;
-    let mut v = alloc::vec![LSM_ID_CAPABILITY];
-    if !crate::parts::off(crate::parts::Part::Landlock) {
-        v.push(LSM_ID_LANDLOCK);
-    }
-    if !off() {
-        v.push(LSM_ID_APPARMOR);
-    }
-    let total = (v.len() * 8) as u32;
-    put_user(size, &total.to_le_bytes())?;
-    if have < total {
-        return Err(-E2BIG);
-    }
-    for (i, id) in v.iter().enumerate() {
-        put_user(ids + i * 8, &id.to_le_bytes())?;
-    }
-    Ok(v.len() as i64)
-}
-
-/// lsm_get_self_attr(attr, ctx, size, flags): いまのプロセスの current / exec / prev を struct lsm_ctx で (答えるのは
-/// AppArmor だけ: 中身は /proc/self/attr と同じ「名前 (モード)」の改行なし)。ctx が 0 か size が足りなければ、要る大きさを
-/// size に書く (足りなければ E2BIG)。flags の LSM_FLAG_SINGLE なら ctx の id の LSM だけ。答えた LSM の数を返す
-pub fn lsm_get_self_attr(attr: u32, ctx: usize, size: usize, flags: u32) -> Result<i64, i64> {
-    if attr == 0 || size == 0 {
-        return Err(-EINVAL);
-    }
-    let left = get_u32(size)?;
-    let mut single = None;
-    if flags != 0 {
-        if flags != LSM_FLAG_SINGLE || ctx == 0 {
-            return Err(-EINVAL);
-        }
-        let mut b = [0u8; 8];
-        get_user(ctx, &mut b)?;
-        let id = u64::from_le_bytes(b);
-        if id == 0 {
-            return Err(-EINVAL);
-        }
-        single = Some(id);
-    }
-    let (mut total, mut count, mut toobig) = (0u32, 0i64, false);
-    if !off() && single.is_none_or(|id| id == LSM_ID_APPARMOR) {
-        let c = crate::cred::current();
-        // 決まりのないものは unconfined。exec と prev は、なければ ENOENT (apparmor_getselfattr)
-        let label = match attr {
-            LSM_ATTR_CURRENT => Some(c.apparmor.as_ref()),
-            LSM_ATTR_EXEC => Some(Some(c.aa_onexec.as_ref().ok_or(-ENOENT)?)),
-            LSM_ATTR_PREV => Some(Some(c.aa_prev.as_ref().ok_or(-ENOENT)?)),
-            _ => None,
-        };
-        if let Some(l) = label {
-            let text = label_text(l);
-            let v = text.trim_end_matches('\n').as_bytes();
-            // lsm_fill_user_ctx: 頭と中身を 8 バイトにそろえて
-            let len = (LSM_CTX + v.len()).div_ceil(8) * 8;
-            if len as u32 > left {
-                toobig = true;
-            } else {
-                if ctx != 0 {
-                    let mut b = alloc::vec![0u8; len];
-                    for (i, x) in [LSM_ID_APPARMOR, 0, len as u64, v.len() as u64].iter().enumerate() {
-                        b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
-                    }
-                    b[LSM_CTX..LSM_CTX + v.len()].copy_from_slice(v);
-                    put_user(ctx, &b)?;
-                }
-                count += 1;
-            }
-            total += len as u32;
-        }
-    }
-    put_user(size, &total.to_le_bytes())?;
-    if toobig {
-        return Err(-E2BIG);
-    }
-    if count == 0 {
-        return Err(-EOPNOTSUPP);
-    }
-    Ok(count)
-}
-
-/// lsm_set_self_attr(attr, ctx, size, flags): ctx の id の LSM に current か exec を書く (AppArmor なら
-/// /proc/self/attr に書くのと同じ "changeprofile NAME" など)
-pub fn lsm_set_self_attr(attr: u32, ctx: usize, size: u32, flags: u32) -> Result<i64, i64> {
-    if flags != 0 || (size as usize) < LSM_CTX {
-        return Err(-EINVAL);
-    }
-    if size > 4096 {
-        return Err(-E2BIG);
-    }
-    let mut b = alloc::vec![0u8; size as usize];
-    get_user(ctx, &mut b)?;
-    let field = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-    let (id, len, ctx_len) = (field(0), field(2), field(3));
-    let need = (LSM_CTX as u64).checked_add(ctx_len);
-    if (size as u64) < len || need.is_none_or(|n| len < n) {
-        return Err(-EINVAL);
-    }
-    if id != LSM_ID_APPARMOR || off() {
-        return Err(-EOPNOTSUPP);
-    }
-    let which = match attr {
-        LSM_ATTR_CURRENT => "current",
-        LSM_ATTR_EXEC => "exec",
-        _ => return Err(-EOPNOTSUPP),
-    };
-    attr_write(which, &b[LSM_CTX..LSM_CTX + ctx_len as usize])?;
-    Ok(0)
-}
-
 // ---- features (apparmor_parser が読んで、それに合う形のバイナリを作る) ----
 
 /// 名のること (パス, 中身)。ディレクトリはパスの頭から。中身には改行を足して見せる
@@ -3373,3 +3237,191 @@ pub const FEATURES: &[(&str, &str)] = &[
     ("signal/mask", SIG_MASK),
 ];
 
+
+// ---- LSM のフック (security.rs: Linux の security/apparmor/lsm.c の apparmor_hooks) ----
+
+/// PathOp (core が名前を引いて渡すもの) の操作の名前とほしい許し
+fn path_op(op: PathOp) -> (&'static str, u32) {
+    match op {
+        PathOp::Getattr => (OP_GETATTR, MAY_GETATTR),
+        PathOp::Chmod => (OP_CHMOD, MAY_CHMOD),
+        PathOp::Chown => (OP_CHOWN, MAY_CHOWN),
+        PathOp::Truncate => (OP_TRUNC, MAY_WRITE | MAY_SETATTR),
+        PathOp::Lock { write } => (OP_FLOCK, MAY_LOCK | if write { MAY_WRITE } else { 0 }),
+    }
+}
+
+/// Linux の aa_file_perm のソケットの道 (__file_sock_perm と aa_sock_file_perm): 決まりのついたプロセスが、ほかのラベルで
+/// 開いたソケットを read / write するときは、いまの決まりの network (unix) の決まりで見なおす (読むのは receive、書くのは
+/// send)。開いたのが決まりのないプロセス (わたされたもの) か、同じラベルなら見ない。read / write / readv / writev の入口
+/// (sysfile.rs の verify_area、Linux の rw_verify_area の security_file_permission) から
+fn sock_file(f: &FileRef, write: bool) -> Result<(), i64> {
+    use crate::file::Kind;
+    let need = {
+        let b = f.borrow();
+        matches!(b.kind, Kind::Unix(_) | Kind::Inet(_) | Kind::Socket(_)) && file_needs_revalidation(b.label.as_ref())
+    };
+    if !need {
+        return Ok(());
+    }
+    crate::socket::aa_file(f, if write { MAY_SEND } else { MAY_RECEIVE })
+}
+
+/// LSM としての AppArmor (Linux の DEFINE_LSM(apparmor)。ラベルを持つ LSM: LSM_FLAG_EXCLUSIVE)。切ってあっても
+/// つないだまま: 切ったかは、それぞれの決まりの中 (off) で見る
+pub struct AppArmor;
+pub static LSM: AppArmor = AppArmor;
+
+impl crate::security::Lsm for AppArmor {
+    fn id(&self) -> (&'static str, u64) {
+        ("apparmor", crate::security::LSM_ID_APPARMOR)
+    }
+
+    fn enabled(&self) -> bool {
+        !off()
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn capable(&self, c: &Cred, cap: u32, audit: bool) -> bool {
+        capable(c, cap, audit)
+    }
+
+    fn capget(&self, c: &Cred) -> u64 {
+        caps_of(c)
+    }
+
+    fn task_kill(&self, target: &Proc, sig: i32) -> Result<(), i64> {
+        may_signal(&target.cred, sig)
+    }
+
+    fn ptrace_access_check(&self, child: &Cred, mode: u32) -> Result<(), i64> {
+        may_ptrace(child, mode & crate::security::PTRACE_MODE_READ != 0)
+    }
+
+    fn bprm_creds_for_exec(&self, b: &mut Bprm, exe: &str, ouid: u32) -> Result<(), i64> {
+        *b = exec_transition(exe, ouid)?;
+        Ok(())
+    }
+
+    fn bprm_mmap_file(&self, b: &Bprm, full: &str, ouid: u32) -> bool {
+        exec_map_ok(b, full, ouid)
+    }
+
+    /// exec で onexec は使いおわり、change_hat の前と token も消える (aa_clear_task_ctx_trans。切ってあっても)
+    fn bprm_committed_creds(&self, c: &mut Cred) {
+        c.label_ctx = None;
+    }
+
+    fn mmap_file(&self, full: &str, prot: u64, private: bool, ouid: u32) -> Result<(), i64> {
+        mmap_perm(OP_FMMAP, full, prot, private, ouid)
+    }
+
+    fn file_permission(&self, f: &FileRef, write: bool) -> Result<(), i64> {
+        sock_file(f, write)
+    }
+
+    fn file_open(&self, o: &FileOpen) -> Result<u32, i64> {
+        open_perm(o.path, o.flags, o.dir, o.ouid)?;
+        Ok(0)
+    }
+
+    fn may_o_create(&self, full: &str, flags: u32) -> Result<(), i64> {
+        path_perm(OP_MKNOD, full, MAY_CREATE, false, fsuid())?;
+        open_perm(full, flags, false, fsuid())
+    }
+
+    fn path_mediated(&self) -> bool {
+        confined()
+    }
+
+    fn path_perm(&self, op: PathOp, full: &str, dir: bool, ouid: u32) -> Result<(), i64> {
+        let (name, request) = path_op(op);
+        path_perm(name, full, request, dir, ouid)
+    }
+
+    fn path_mkdir(&self, full: &str) -> Result<(), i64> {
+        path_perm(OP_MKDIR, full, MAY_CREATE, true, fsuid())
+    }
+
+    fn path_mknod(&self, full: &str, _mode: u32, _dev: u64) -> Result<(), i64> {
+        path_perm(OP_MKNOD, full, MAY_CREATE, false, fsuid())
+    }
+
+    fn path_symlink(&self, full: &str) -> Result<(), i64> {
+        path_perm(OP_SYMLINK, full, MAY_CREATE, false, fsuid())
+    }
+
+    /// 消すものの持ち主で (common_perm_rm。決まりのついたプロセスだけ、名前を引く)
+    fn path_unlink(&self, full: &str, dir: &InodeRef, name: &str, rmdir: bool) -> Result<(), i64> {
+        if confined()
+            && let Ok(v) = dir.lookup(name)
+        {
+            path_perm(if rmdir { OP_RMDIR } else { OP_UNLINK }, full, MAY_DELETE, rmdir, v.meta().uid)?;
+        }
+        Ok(())
+    }
+
+    /// 新しい名前と、つなぐ元の組 (profile_path_link)
+    fn path_link(&self, src: &str, full: &str, ino: &InodeRef) -> Result<(), i64> {
+        if !confined() {
+            return Ok(());
+        }
+        link_perm(full, src, ino.meta().uid)
+    }
+
+    /// apparmor_path_rename: 入れかえなら先のものも、元のものも、「読んで消す」と「作って書く」
+    fn path_rename(&self, r: &Rename) -> Result<(), i64> {
+        let mm = r.moving.meta();
+        if r.exchange
+            && let Some(t) = r.target
+        {
+            let tm = t.meta();
+            rename_perm(r.new, r.old, tm.is_dir(), tm.uid)?;
+        }
+        rename_perm(r.old, r.new, mm.is_dir(), mm.uid)
+    }
+
+    fn path_truncate(&self, full: &str, ouid: u32) -> Result<(), i64> {
+        path_perm(OP_TRUNC, full, MAY_WRITE | MAY_SETATTR, false, ouid)
+    }
+
+    fn sb_mount(&self, name: &str, dev: Option<&str>, fstype: Option<&str>, flags: u64, data: Option<&str>) -> Result<(), i64> {
+        mount_perm(name, dev, fstype, flags, data)
+    }
+
+    fn sb_mount_error(&self, flags: u64, e: i64) -> i64 {
+        mount_error(flags, e)
+    }
+
+    fn sb_umount(&self, name: &str) -> Result<(), i64> {
+        umount_perm(name)
+    }
+
+    /// lsm_get_self_attr: current / exec / prev の「名前 (モード)」 (改行なし)。決まりのないものは unconfined。exec と
+    /// prev は、なければ ENOENT (apparmor_getselfattr)
+    fn getselfattr(&self, attr: u32) -> Result<Option<String>, i64> {
+        let c = crate::cred::current();
+        let t = task(c);
+        let l = match attr {
+            crate::security::LSM_ATTR_CURRENT => c.label.as_ref(),
+            crate::security::LSM_ATTR_EXEC => Some(t.onexec.as_ref().ok_or(-ENOENT)?),
+            crate::security::LSM_ATTR_PREV => Some(t.prev.as_ref().ok_or(-ENOENT)?),
+            _ => return Ok(None),
+        };
+        Ok(Some(label_text(l).trim_end_matches('\n').into()))
+    }
+
+    /// lsm_set_self_attr: /proc/self/attr の current か exec に書くのと同じ
+    fn setselfattr(&self, attr: u32, value: &[u8]) -> Result<(), i64> {
+        let which = match attr {
+            crate::security::LSM_ATTR_CURRENT => "current",
+            crate::security::LSM_ATTR_EXEC => "exec",
+            _ => return Err(-EOPNOTSUPP),
+        };
+        attr_write(which, value)?;
+        Ok(())
+    }
+}

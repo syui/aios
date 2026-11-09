@@ -31,7 +31,7 @@
   "kernel": {
     "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "cell", "kalloc", "heap", "oom", "tlsf", "mem", "vm", "trap", "irq", "timer", "smp", "dtb",
               "uart", "console", "kmsg", "tty", "proc", "signal", "pidfd", "syscall", "exec", "file", "locks", "futex", "sysfile", "vfs", "statc", "fastdir", "fs", "tmpfs",
-              "initrd", "cred", "crypto", "rand", "parts", "why"],
+              "initrd", "cred", "security", "crypto", "rand", "parts", "why"],
     "extra": ["aiproc", "apparmor", "bcm2835_rng", "block", "cpuvuln", "efi", "efirt", "efivarfs", "epoll", "extfs", "gpu", "htree", "inet", "inotify", "input", "jbd2", "landlock",
               "module", "net", "addrconf", "netif", "netlink", "nftables", "nfhook", "conntrack", "ctnetlink", "audit", "auditfilter", "ns", "procfs", "prof", "fail", "trace", "whylog", "sd", "seccomp", "securityfs", "socket", "sound", "swap", "sysctl", "sysfs",
               "timerfd", "unix", "vdso", "vfat", "virtio", "virtio_blk", "virtio_net", "virtio_rng"],

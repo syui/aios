@@ -806,7 +806,7 @@ fn handle_futex_death(uaddr: usize, pi: bool, pending_op: bool) -> Result<(), ()
 
 /// get_robust_list(pid, head_ptr, len_ptr): pid (0 は自分) のスレッドの robust list の頭と大きさ (24)。
 /// ほかのプロセスのものは ptrace で読めるときだけ (Linux の PTRACE_MODE_READ_REALCREDS: 本当の uid と gid が
-/// あいての uid、euid、suid と gid、egid、sgid にみな合うか、CAP_SYS_PTRACE。それから AppArmor の ptrace の read)。
+/// あいての uid、euid、suid と gid、egid、sgid にみな合うか、CAP_SYS_PTRACE。それから LSM (AppArmor) の ptrace の read)。
 /// だめなら EPERM、いなければ ESRCH
 pub fn get_robust_list(pid: i32, head_ptr: usize, len_ptr: usize) -> Result<i64, i64> {
     const ESRCH: i64 = 3;
@@ -820,7 +820,7 @@ pub fn get_robust_list(pid: i32, head_ptr: usize, len_ptr: usize) -> Result<i64,
         if t.tgid != me.tgid {
             let (c, tc) = (&me.cred, &t.cred);
             let ids = [tc.uid, tc.euid, tc.suid].iter().all(|&u| u == c.uid) && [tc.gid, tc.egid, tc.sgid].iter().all(|&g| g == c.gid);
-            if !(ids || c.capable(crate::cred::CAP_SYS_PTRACE)) || crate::apparmor::may_ptrace(tc, true).is_err() {
+            if !(ids || c.capable(crate::cred::CAP_SYS_PTRACE)) || crate::security::ptrace_access_check_exclusive(tc, crate::security::PTRACE_MODE_READ).is_err() {
                 return Err(-EPERM);
             }
         }

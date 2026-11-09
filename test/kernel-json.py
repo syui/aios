@@ -170,6 +170,13 @@ print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n
 # core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
 # 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
 CORE_USES_EXTRA_MAX = 21
+# LSM のフック (kernel/src/security.rs: Linux の security.c) の向こうへ移したもの。core はもう名前で呼ばない
+# (security:: のフックを呼ぶ。つなぐのは main.rs)。ひとつ移したら足す
+BEHIND_HOOKS = ["apparmor"]
+for n, u in uses.items():
+    back = [x for x in u if x in BEHIND_HOOKS]
+    if back:
+        err("%s uses %s: call it through security.rs (LSM hooks)" % (n, " ".join(back)))
 if len(uses) > CORE_USES_EXTRA_MAX:
     err("core uses extra in %d files, more than %d: keep core off extra (%s)" % (len(uses), CORE_USES_EXTRA_MAX, " ".join(uses)))
 elif len(uses) < CORE_USES_EXTRA_MAX:

@@ -562,3 +562,18 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
 pub fn layers(c: &crate::cred::Cred) -> usize {
     c.landlock.as_ref().map_or(0, |d| d.len())
 }
+
+/// LSM としての landlock (security.rs: Linux の DEFINE_LSM(landlock))。いまは名前と番号だけ (lsm_list_modules)。
+/// フックは次のコミットで
+pub struct Landlock;
+pub static LSM: Landlock = Landlock;
+
+impl crate::security::Lsm for Landlock {
+    fn id(&self) -> (&'static str, u64) {
+        ("landlock", crate::security::LSM_ID_LANDLOCK)
+    }
+
+    fn enabled(&self) -> bool {
+        !crate::parts::off(crate::parts::Part::Landlock)
+    }
+}
