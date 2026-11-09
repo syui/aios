@@ -514,7 +514,7 @@ pub fn cycle() -> usize {
 /// 空きがこれ (ページ) を割ったら回収する (4 MiB)。回収はこの 4 倍になるまで (Linux の vm.min_free_kbytes。/proc/sys は sysctl.rs)
 pub static MIN_FREE_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1024);
 
-/// 空いているページの数 (KMEM を変えたあとに書く: システムコールのたびに swap::balance が読むので、ロックを取らずに)
+/// 空いているページの数 (KMEM を変えたあとに書く: システムコールのたびに vm::balance が読むので、ロックを取らずに)
 static NFREE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 pub fn nfree() -> usize {

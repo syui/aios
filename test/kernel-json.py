@@ -169,12 +169,12 @@ print("kernel.json: core %d files (%d lines), extra %d files (%d lines), quirk %
 print("core uses extra in %d files: %s" % (len(uses), "; ".join("%s → %s" % (n, " ".join(u)) for n, u in uses.items())))
 # core が extra を使っているファイルは増やさない (core は、なくてもカーネルが動く extra に寄りかからない。1 つずつ
 # 減らしていく: todo.json の core-extra)。減ったら CORE_USES_EXTRA_MAX も下げる (ちがえば落ちる: 戻らないように)
-CORE_USES_EXTRA_MAX = 10
+CORE_USES_EXTRA_MAX = 9
 # フック (入り口) の向こうへ移したものと、その入り口。core はもう名前で呼ばない (入り口を呼ぶ。つなぐのは main.rs)。
 # ひとつ移したら足す: security.rs (Linux の security.c: LSM と seccomp と audit)、debug.rs (Linux の Kernel hacking:
-# tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)
+# tracepoint と fault-inject、aios の prof)、why.rs (しくじったわけをためるもの)、vm.rs (Linux の swap.h: スワップの区画)
 BEHIND_HOOKS = {"apparmor": "security.rs", "landlock": "security.rs", "seccomp": "security.rs", "audit": "security.rs", "auditfilter": "security.rs",
-                "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs"}
+                "trace": "debug.rs", "prof": "debug.rs", "fail": "debug.rs", "whylog": "why.rs", "swap": "vm.rs"}
 for n, u in uses.items():
     back = [x for x in u if x in BEHIND_HOOKS]
     if back:

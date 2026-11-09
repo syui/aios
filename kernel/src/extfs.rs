@@ -1220,6 +1220,12 @@ impl ExtFs {
         // 大きなロックなしの作る・消す (fastdir.rs) が使う ext4 (ルートのもの。いまマウントできる ext4 はこれだけ)
         if ROOT_FS.get().is_none() {
             ROOT_FS.set(self.clone());
+            // メモリが足りないときに、だれも写していない古いブロックを捨てる (Linux の super_block の shrinker)
+            crate::vm::register_shrinker(|n| {
+                if let Some(fs) = ExtFs::root_fs() {
+                    fs.shrink(n);
+                }
+            });
         }
         ExtInode::make(self, ROOT_INO)
     }
@@ -1234,7 +1240,7 @@ impl ExtFs {
         ROOT_FS.get()
     }
 
-    /// メモリが足りないとき (swap::reclaim): だれも写していない、書いていない古いブロックを n こまで捨てる。ふだんは
+    /// メモリが足りないとき (vm::reclaim の shrinker): だれも写していない、書いていない古いブロックを n こまで捨てる。ふだんは
     /// キャッシュが上限をこえたときに 1 つずつ捨てるだけなので、写しの表やページキャッシュが手放したページ (写していた
     /// 3.4 GB のモデルの、しばらく触れていないところ) は、ここで捨てないと空かない。この CPU が ext4 のロックを
     /// いっしょに持っているとき (ひとりで持てない) と、キャッシュをさわっている途中なら何もしない。捨てた数

@@ -1685,9 +1685,9 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     Ok(0)
 }
 
-/// swapon / swapoff の path: ブロックデバイスのノードの区画か、ふつうのファイル。と、その名前
-fn swap_source(pathp: usize) -> Result<(crate::swap::Source, String), i64> {
-    use crate::swap::Source;
+/// swapon / swapoff の path: ブロックデバイスのノード (区画は swap.rs が引く) か、ふつうのファイル。と、その名前
+fn swap_source(pathp: usize) -> Result<(crate::vm::SwapTarget, String), i64> {
+    use crate::vm::SwapTarget;
     if !cred::current().capable(cred::CAP_SYS_ADMIN) {
         return Err(-cred::EPERM);
     }
@@ -1696,12 +1696,11 @@ fn swap_source(pathp: usize) -> Result<(crate::swap::Source, String), i64> {
     match ino.meta().mode & S_IFMT {
         vfs::S_IFBLK => {
             let (ma, mi) = fs::dev_of(&ino).ok_or_else(|| crate::why::inval())?;
-            let p = crate::block::part_of_dev(ma, mi).ok_or(-6)?;
-            Ok((Source::Part(p), crate::block::part_name(&p)))
+            Ok((SwapTarget::Dev(ma, mi), path))
         }
         vfs::S_IFREG => {
             let name = if path.starts_with('/') { path } else { alloc::format!("/{}/{}", proc::current().files().cwd, path).replace("//", "/") };
-            Ok((Source::File(ino), name))
+            Ok((SwapTarget::File(ino), name))
         }
         _ => Err(crate::why::inval()),
     }
@@ -1709,12 +1708,12 @@ fn swap_source(pathp: usize) -> Result<(crate::swap::Source, String), i64> {
 
 pub fn swapon(pathp: usize) -> R {
     let (src, name) = swap_source(pathp)?;
-    crate::swap::on(src, name).map(|_| 0)
+    crate::vm::swapon(src, name).map(|_| 0)
 }
 
 pub fn swapoff(pathp: usize) -> R {
     let (src, _) = swap_source(pathp)?;
-    crate::swap::off(&src).map(|_| 0)
+    crate::vm::swapoff(&src).map(|_| 0)
 }
 
 pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {

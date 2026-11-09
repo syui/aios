@@ -351,7 +351,7 @@ extra を使っているところを出す (core を小さくするときの目�
 security.c と lsm_syscalls.c) のフックを呼び、LSM は main.rs が起動のときにつなぐ (Linux の CONFIG_LSM の順: landlock、
 AppArmor。aios.off= で切ったものもつないだまま、切ったかは LSM がフックの中で見る)。フックの向こうへ移したものは
 test/kernel-json.py の `BEHIND_HOOKS` に入り口といっしょに書き、core がまた名前で呼べば落ちる (いまは security.rs の apparmor、landlock、
-seccomp、audit、auditfilter、debug.rs の trace、prof、fail、why.rs の whylog)。seccomp と audit は LSM ではない
+seccomp、audit、auditfilter、debug.rs の trace、prof、fail、why.rs の whylog、vm.rs の swap)。seccomp と audit は LSM ではない
 (Linux も): security.rs の中の別の入り口 (Linux の include/linux/seccomp.h と audit.h: seccomp_permit_syscall、
 audit_syscall_entry、audit_getname など) で、main.rs が register_seccomp と register_audit でつなぐ。namespace (ns) は Linux と
 同じく core (pid、uid、ホスト名の読みかえと mount の namespace。LSM は作るときだけ見る: security::namespace_init)。LSM が
@@ -373,6 +373,10 @@ TRACE_ON・PROF_ON・FAIL_ON。それぞれが /proc/ai/ctl で立てる) を 1 
 割り込みの番号と呼ぶものを置き、trap.rs は表を引くだけ (タイマ、IPI、uart のほかは名前を知らない)。tick ごとに回すもの
 (timerfd の期限、割り込みの来なかったディスクの要求、5 tick ごとの smoltcp の poll と TCP の再送) は timer::every で置き、
 timer.rs は置いた順に呼ぶ (Linux では装置やプロトコルがそれぞれ回す timer_list)。
+メモリの回収 (ページキャッシュ、写しているファイルのページ、スワップへ追い出す: Linux の vmscan.c) は core の vm.rs
+(reclaim、balance) で、スワップの区画とスロット (swap.rs: Linux の swapfile.c) は vm.rs の入り口 (vm::Swap。Linux の
+include/linux/swap.h が CONFIG_SWAP なしでは何もしないのと同じ) の向こう (main.rs の register_swap)。ファイルシステムの
+キャッシュ (ext4 のブロック) は、ルートの ext4 がマウントしたときに vm::register_shrinker で置く (Linux の shrinker)。
 リポジトリの `.aios.json` の `kernel` は、この一覧の名前を
 type ごとに並べたもの (`core`、`extra`、`quirk`。同じスクリプトがそろっているかを見る)。
 

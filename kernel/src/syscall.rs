@@ -1162,7 +1162,7 @@ fn sys_sysinfo(buf: usize) -> R {
     b[0..8].copy_from_slice(&(timer::uptime_ns() / 1_000_000_000).to_le_bytes());
     b[32..40].copy_from_slice(&(ram_size() as u64).to_le_bytes());
     b[40..48].copy_from_slice(&((crate::kalloc::nfree() * PGSIZE) as u64).to_le_bytes());
-    let (st, sf) = crate::swap::totals();
+    let (st, sf) = crate::vm::swap_totals();
     b[56..64].copy_from_slice(&((st * PGSIZE) as u64).to_le_bytes());
     b[64..72].copy_from_slice(&((sf * PGSIZE) as u64).to_le_bytes());
     b[80..82].copy_from_slice(&(proc::nprocs() as u16).to_le_bytes());

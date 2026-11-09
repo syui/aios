@@ -8,8 +8,9 @@
 // (Linux と同じ。穴のない、mkswap したファイル。使っている間は書きかえさせない)。
 // 追い出したページの PTE はスロットの番号を持つ (vm.rs)。fork で共有されるので、スロットごとに参照の数を持つ。
 //
-// 回収 (reclaim) は、ユーザーへ戻る前に空きが LOW を割っていたら HIGH まで、と、
-// ページが作れなかったときに BATCH 枚。どのページを追い出すかは各ページ表の clock (vm.rs)。
+// 回収 (reclaim: ページキャッシュ、写しているファイルのページ、そしてここへ追い出す) は vm.rs (Linux の vmscan.c と同じく
+// core)。ここはスワップの区画とスロットだけ (Linux の swapfile.c、page_io.c)。vm.rs の入り口 (vm::Swap) から呼ばれる
+// (main.rs の vm::register_swap)。どのページを追い出すかは各ページ表の clock (vm.rs)。
 // ディスクへの書き込みは大きなロックを持ったまま待つので、書いている間にほかの CPU が同じページに触れても、
 // フォールトしてロックを待つだけ (書き終わってからスワップから読み戻す)。
 use crate::cell::Bkl;
@@ -20,17 +21,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub const MAX_AREAS: usize = 4;
-// 空きが LOW を割ったら回収する (既定 4 MiB)、回収するときは、空きが HIGH (LOW の 4 倍) になるまで。
-// LOW は /proc/sys/vm/min_free_kbytes (sysctl.rs) で変えられる
-/// ページが作れなかったときに回収する数
-pub const BATCH: usize = 256;
 
 const EPERM: i64 = 1;
 const ENOMEM: i64 = 12;
 const EBUSY: i64 = 16;
 
-/// スロットの番号: 区画の番号 << 32 | 区画の中のページ
-pub type Slot = u64;
+/// スロットの番号 (区画の番号 << 32 | 区画の中のページ。vm.rs の Slot: PTE に入れる)
+pub use crate::vm::Slot;
 
 const BAD: u16 = u16::MAX;
 
@@ -68,10 +65,6 @@ fn areas() -> &'static mut [Option<Area>; MAX_AREAS] {
 
 fn area(slot: Slot) -> Option<&'static mut Area> {
     areas().get_mut((slot >> 32) as usize)?.as_mut()
-}
-
-pub fn area_of(slot: Slot) -> usize {
-    (slot >> 32) as usize
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -240,89 +233,60 @@ pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
     block::write_part(&a.part, sector_of(a, slot), buf)
 }
 
-/// 次に回収をはじめるページ表 (順番に回す)
-static HAND: Bkl<usize> = Bkl::new(0);
-
-/// want 枚くらいをスワップへ追い出して空ける。ページ表のルートが exclude のものは触らない。
-/// 空けた数を返す
-pub fn reclaim(want: usize, exclude: usize) -> usize {
-    // まずだれも写していないページキャッシュから (読みなおせばよいので、スワップより安い)
-    let mut cached = crate::vm::shrink_cache(want);
-    if cached >= want {
-        return cached;
-    }
-    // 次に、写しているファイルのページで、しばらく触れていないものを外して捨てる (これも読みなおせばよい。
-    // Linux もスワップより先にファイルのページを捨てる)
-    cached += reclaim_file(want - cached, exclude);
-    if cached >= want {
-        return cached;
-    }
-    let want = want - cached;
-    if !areas().iter().flatten().any(|a| !a.draining && a.used < a.size) {
-        return cached;
-    }
-    let mut pts = Vec::new();
-    crate::proc::each_pagetable(|pt| {
-        if pt.id() != exclude {
-            pts.push(pt as *mut crate::vm::PageTable);
-        }
-    });
-    if pts.is_empty() {
-        return cached;
-    }
-    let mut freed = 0;
-    // 1 周目は AF を落とすだけのことが多いので、何周か
-    for _ in 0..3 {
-        for k in 0..pts.len() {
-            let hand = *HAND.get();
-            let p: *mut crate::vm::PageTable = pts[(hand + k) % pts.len()];
-            let pt = unsafe { &mut *p };
-            // 1 つのアドレス空間から取りすぎないよう、少しずつ
-            freed += pt.swap_out((want - freed).min(BATCH));
-            if freed >= want {
-                *HAND.get() = hand + k + 1;
-                return cached + freed;
-            }
-        }
-        *HAND.get() += 1;
-    }
-    cached + freed
+/// 追い出す余地があるか (swapoff の途中でない区画に空きがある)
+pub fn has_room() -> bool {
+    areas().iter().flatten().any(|a| !a.draining && a.used < a.size)
 }
 
-/// 写しているファイルのページを外して空ける (PageTable::reclaim_file を順に。AF を落とすだけのことが多いので何周か)。
-/// 空いた数 (空きのページの数のふえた分)
-fn reclaim_file(want: usize, exclude: usize) -> usize {
-    let before = crate::kalloc::nfree();
-    let mut pts = Vec::new();
-    crate::proc::each_pagetable(|pt| {
-        if pt.id() != exclude {
-            pts.push(pt as *mut crate::vm::PageTable);
+/// core の入り口 (vm::Swap) につなぐもの (main.rs)
+pub struct Ops;
+
+pub static OPS: Ops = Ops;
+
+/// 区画のノード (major, minor) なら区画を引く (ない装置は ENXIO)。名前は区画の名前
+fn source(t: crate::vm::SwapTarget, name: String) -> Result<(Source, String), i64> {
+    match t {
+        crate::vm::SwapTarget::Dev(ma, mi) => {
+            let p = block::part_of_dev(ma, mi).ok_or(-6)?;
+            let n = block::part_name(&p);
+            Ok((Source::Part(p), n))
         }
-    });
-    for _ in 0..3 {
-        for &p in &pts {
-            let pt = unsafe { &mut *p };
-            pt.reclaim_file(want.min(BATCH));
-        }
-        // 外したページキャッシュのページは、だれも写していなければ捨てられる。どちらの表も手放したページは、
-        // ext4 のブロックのキャッシュがまだ持っているので、そこからも
-        crate::vm::shrink_cache(want);
-        if let Some(fs) = crate::extfs::ExtFs::root_fs() {
-            fs.shrink(want);
-        }
-        if crate::kalloc::nfree().saturating_sub(before) >= want {
-            break;
-        }
+        crate::vm::SwapTarget::File(i) => Ok((Source::File(i), name)),
     }
-    crate::kalloc::nfree().saturating_sub(before)
 }
 
-/// ユーザーへ戻る前に: 空きが少なければ回収しておく
-pub fn balance() {
-    let free = crate::kalloc::nfree();
-    let low = crate::kalloc::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
-    if free < low {
-        reclaim(low * 4 - free, 0);
+impl crate::vm::Swap for Ops {
+    fn on(&self, t: crate::vm::SwapTarget, name: String) -> Result<(), i64> {
+        let (src, name) = source(t, name)?;
+        on(src, name)
+    }
+    fn off(&self, t: &crate::vm::SwapTarget) -> Result<(), i64> {
+        let src = match t {
+            crate::vm::SwapTarget::Dev(ma, mi) => Source::Part(block::part_of_dev(*ma, *mi).ok_or(-6)?),
+            crate::vm::SwapTarget::File(i) => Source::File(i.clone()),
+        };
+        off(&src)
+    }
+    fn alloc(&self) -> Option<Slot> {
+        alloc()
+    }
+    fn dup(&self, slot: Slot) {
+        dup(slot);
+    }
+    fn free(&self, slot: Slot) {
+        free(slot);
+    }
+    fn read(&self, slot: Slot, page: *mut u8) -> Result<(), i64> {
+        read(slot, page)
+    }
+    fn write(&self, slot: Slot, page: *const u8) -> Result<(), i64> {
+        write(slot, page)
+    }
+    fn has_room(&self) -> bool {
+        has_room()
+    }
+    fn totals(&self) -> (usize, usize) {
+        totals()
     }
 }
 

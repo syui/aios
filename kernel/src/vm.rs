@@ -31,7 +31,6 @@
 use crate::cell::Bkl;
 use crate::kalloc;
 use crate::spinlock::SpinLock;
-use crate::swap;
 use crate::memlayout::{p2v, v2p, PGSIZE};
 use crate::vfs::InodeRef;
 use alloc::collections::BTreeMap;
@@ -1227,16 +1226,233 @@ fn has_page(e: u64) -> bool {
     e & PTE_VALID != 0 || e & PTE_PROTNONE != 0
 }
 
+// ---- スワップの入り口 (Linux の include/linux/swap.h: CONFIG_SWAP がなければ何もしない) ----
+// スワップの区画とスロット (swap.rs) は、ここの Swap を通して呼ぶ (main.rs の register_swap)。回収 (reclaim、balance) は
+// ここ (Linux の vmscan.c と同じく core): ページキャッシュ、写しているファイルのページ、ファイルシステムのキャッシュ
+// (shrinker)、それでも足りなければスワップへ追い出す
+
+/// スロットの番号 (Linux の swp_entry_t): 区画の番号 << 32 | 区画の中のページ。追い出したページの PTE に入れる
+pub type Slot = u64;
+
+/// スワップの区画とスロット (swap.rs)
+pub trait Swap: Sync {
+    /// 空いているスロットを 1 つ (参照 1)。どこにもなければ None
+    fn alloc(&self) -> Option<Slot> {
+        None
+    }
+    /// スロットを共有する人が増える (fork)
+    fn dup(&self, _slot: Slot) {}
+    /// スロットの共有をやめる
+    fn free(&self, _slot: Slot) {}
+    /// スロットからページ (カーネルの仮想アドレス) へ読む
+    fn read(&self, _slot: Slot, _page: *mut u8) -> Result<(), i64> {
+        Err(-5)
+    }
+    /// ページをスロットへ書く
+    fn write(&self, _slot: Slot, _page: *const u8) -> Result<(), i64> {
+        Err(-5)
+    }
+    /// 追い出す余地があるか
+    fn has_room(&self) -> bool {
+        false
+    }
+    /// (全体のページ数, 空いているページ数)
+    fn totals(&self) -> (usize, usize) {
+        (0, 0)
+    }
+    /// swapon (つないでいなければ ENOSYS: Linux の CONFIG_SWAP なし)。name はファイルのときのパス
+    fn on(&self, _t: SwapTarget, _name: alloc::string::String) -> Result<(), i64> {
+        Err(-38)
+    }
+    /// swapoff
+    fn off(&self, _t: &SwapTarget) -> Result<(), i64> {
+        Err(-38)
+    }
+}
+
+/// swapon と swapoff にわたすもの (sysfile.rs がパスから決める): ブロックデバイスのノード (major, minor) か、ふつうのファイル
+pub enum SwapTarget {
+    Dev(u32, u32),
+    File(InodeRef),
+}
+
+struct NoSwap;
+
+impl Swap for NoSwap {}
+
+static SWAP: crate::cell::Early<&'static dyn Swap> = crate::cell::Early::new(&NoSwap);
+
+/// 起動のとき (main.rs) にスワップをつなぐ。aios.off=swap でもつなぐ (切るのは swapon と swapoff だけ)
+pub fn register_swap(s: &'static dyn Swap) {
+    SWAP.set(s);
+}
+
+/// ここの中から呼ぶ名前 (swap::alloc() など)
+mod swap {
+    use super::{Slot, SWAP};
+    pub fn alloc() -> Option<Slot> {
+        SWAP.val().alloc()
+    }
+    pub fn dup(slot: Slot) {
+        SWAP.val().dup(slot);
+    }
+    pub fn free(slot: Slot) {
+        SWAP.val().free(slot);
+    }
+    pub fn read(slot: Slot, page: *mut u8) -> Result<(), i64> {
+        SWAP.val().read(slot, page)
+    }
+    pub fn write(slot: Slot, page: *const u8) -> Result<(), i64> {
+        SWAP.val().write(slot, page)
+    }
+    pub fn has_room() -> bool {
+        SWAP.val().has_room()
+    }
+    /// スロットの区画の番号 (Linux の swp_type)
+    pub fn area_of(slot: Slot) -> usize {
+        (slot >> 32) as usize
+    }
+}
+
+/// swapon: t (名前は name) をスワップに使う
+pub fn swapon(t: SwapTarget, name: alloc::string::String) -> Result<(), i64> {
+    SWAP.val().on(t, name)
+}
+
+/// swapoff
+pub fn swapoff(t: &SwapTarget) -> Result<(), i64> {
+    SWAP.val().off(t)
+}
+
+/// スワップの (全体のページ数, 空いているページ数) (sysinfo、/proc/meminfo。Linux の si_swapinfo)
+pub fn swap_totals() -> (usize, usize) {
+    SWAP.val().totals()
+}
+
+/// ページが作れなかったときに回収する数。空きが LOW (kalloc::MIN_FREE_PAGES。/proc/sys/vm/min_free_kbytes) を割ったら、
+/// 回収するときは空きが HIGH (LOW の 4 倍) になるまで (balance)
+pub const RECLAIM_BATCH: usize = 256;
+
+/// ファイルシステムなどのキャッシュを捨てるもの (Linux の register_shrinker): 回収のときに n 枚くらいを目安に呼ぶ。
+/// マウントしたときに置く (extfs のルート)
+const NR_SHRINKERS: usize = 4;
+static SHRINKERS: [AtomicUsize; NR_SHRINKERS] = [const { AtomicUsize::new(0) }; NR_SHRINKERS];
+static SHRINKERS_LOCK: SpinLock<()> = SpinLock::new(());
+
+pub fn register_shrinker(f: fn(usize)) {
+    let g = SHRINKERS_LOCK.lock();
+    let Some(s) = SHRINKERS.iter().find(|s| s.load(Ordering::Relaxed) == 0) else { panic!("vm: more than {} shrinkers", NR_SHRINKERS) };
+    s.store(f as usize, Ordering::Release);
+    drop(g);
+}
+
+fn shrink_all(n: usize) {
+    for s in &SHRINKERS {
+        let f = s.load(Ordering::Acquire);
+        if f == 0 {
+            break;
+        }
+        // SAFETY: register_shrinker が fn(usize) だけを置く
+        let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(f) };
+        f(n);
+    }
+}
+
+/// 次に回収をはじめるページ表 (順番に回す)
+static HAND: Bkl<usize> = Bkl::new(0);
+
+/// want 枚くらいを空ける (Linux の vmscan.c: ページキャッシュ、写しているファイルのページ、それでも足りなければスワップへ
+/// 追い出す)。ページ表のルートが exclude のものは触らない。空けた数を返す
+pub fn reclaim(want: usize, exclude: usize) -> usize {
+    // まずだれも写していないページキャッシュから (読みなおせばよいので、スワップより安い)
+    let mut cached = shrink_cache(want);
+    if cached >= want {
+        return cached;
+    }
+    // 次に、写しているファイルのページで、しばらく触れていないものを外して捨てる (これも読みなおせばよい。
+    // Linux もスワップより先にファイルのページを捨てる)
+    cached += reclaim_file(want - cached, exclude);
+    if cached >= want {
+        return cached;
+    }
+    let want = want - cached;
+    if !swap::has_room() {
+        return cached;
+    }
+    let mut pts = Vec::new();
+    crate::proc::each_pagetable(|pt| {
+        if pt.id() != exclude {
+            pts.push(pt as *mut PageTable);
+        }
+    });
+    if pts.is_empty() {
+        return cached;
+    }
+    let mut freed = 0;
+    // 1 周目は AF を落とすだけのことが多いので、何周か
+    for _ in 0..3 {
+        for k in 0..pts.len() {
+            let hand = *HAND.get();
+            let p: *mut PageTable = pts[(hand + k) % pts.len()];
+            let pt = unsafe { &mut *p };
+            // 1 つのアドレス空間から取りすぎないよう、少しずつ
+            freed += pt.swap_out((want - freed).min(RECLAIM_BATCH));
+            if freed >= want {
+                *HAND.get() = hand + k + 1;
+                return cached + freed;
+            }
+        }
+        *HAND.get() += 1;
+    }
+    cached + freed
+}
+
+/// 写しているファイルのページを外して空ける (PageTable::reclaim_file を順に。AF を落とすだけのことが多いので何周か)。
+/// 空いた数 (空きのページの数のふえた分)
+fn reclaim_file(want: usize, exclude: usize) -> usize {
+    let before = crate::kalloc::nfree();
+    let mut pts = Vec::new();
+    crate::proc::each_pagetable(|pt| {
+        if pt.id() != exclude {
+            pts.push(pt as *mut PageTable);
+        }
+    });
+    for _ in 0..3 {
+        for &p in &pts {
+            let pt = unsafe { &mut *p };
+            pt.reclaim_file(want.min(RECLAIM_BATCH));
+        }
+        // 外したページキャッシュのページは、だれも写していなければ捨てられる。どちらの表も手放したページは、
+        // ファイルシステムのキャッシュ (ext4 のブロックのキャッシュ) がまだ持っているので、そこからも (shrinker)
+        shrink_cache(want);
+        shrink_all(want);
+        if crate::kalloc::nfree().saturating_sub(before) >= want {
+            break;
+        }
+    }
+    crate::kalloc::nfree().saturating_sub(before)
+}
+
+/// ユーザーへ戻る前に: 空きが少なければ回収しておく
+pub fn balance() {
+    let free = crate::kalloc::nfree();
+    let low = crate::kalloc::MIN_FREE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    if free < low {
+        reclaim(low * 4 - free, 0);
+    }
+}
+
+
 /// スワップへ追い出したページの PTE か
 fn is_swap(e: u64) -> bool {
     e & PTE_VALID == 0 && e & PTE_SWAP != 0
 }
 
-fn swap_pte(slot: swap::Slot) -> u64 {
+fn swap_pte(slot: Slot) -> u64 {
     (slot << 12) & PTE_ADDR | PTE_SWAP
 }
 
-fn slot_of(e: u64) -> swap::Slot {
+fn slot_of(e: u64) -> Slot {
     (e & PTE_ADDR) >> 12
 }
 
@@ -1667,7 +1883,7 @@ impl PageTable {
     /// (自分のページ表は借りられているので触らない)
     fn alloc_page(&self) -> Option<*mut u8> {
         kalloc::alloc().or_else(|| {
-            swap::reclaim(swap::BATCH, self.root as usize);
+            reclaim(RECLAIM_BATCH, self.root as usize);
             kalloc::alloc()
         })
     }

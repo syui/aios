@@ -286,7 +286,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
         }
         EL0_SYNC => {
             // 空きが少なければ、使っていないページをスワップへ
-            crate::swap::balance();
+            crate::vm::balance();
             match esr >> 26 {
                 EC_SVC64 => {
                     let intr = syscall::dispatch(tf);
@@ -316,7 +316,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         // 足りなければ自分のページもスワップへ追い出して、もう一度
-                        if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::swap::reclaim(crate::swap::BATCH, 0) > 0 {
+                        if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::vm::reclaim(crate::vm::RECLAIM_BATCH, 0) > 0 {
                             r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         }
                         // それでもなければ、いちばん大きいものを殺して空ける (oom::on_fault)。殺したのが自分でなければ、
