@@ -228,7 +228,6 @@ fn may_attach(t: &crate::proc::Proc) -> Result<(), i64> {
     if dumpable(t) != 1 && !c.capable(crate::cred::CAP_SYS_PTRACE) {
         return Err(-EPERM);
     }
-    crate::landlock::check_ptrace(c.landlock.as_ref(), tc.landlock.as_ref())?;
     crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_ATTACH).map_err(|_| -EPERM)
 }
 

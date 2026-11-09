@@ -439,7 +439,7 @@ fn new_sock(typ: u8) -> UnixRef {
         watchers: 0,
         epolled: false,
         label: crate::apparmor::current_label(),
-        ll: crate::cred::current().landlock.clone(),
+        ll: crate::cred::current().sandbox.clone(),
         protocol: 0,
         fs_path: None,
     }));
@@ -519,7 +519,7 @@ fn aa_connect(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
 /// landlock の scope (hook_unix_stream_connect と hook_unix_may_send): 抽象名前空間の名前のソケットで、作ったプロセスが
 /// 自分の層の外なら EPERM。もうつないでいる相手はよい
 fn ll_scope(u: &UnixRef, other: &UnixRef) -> Result<(), i64> {
-    if crate::cred::current().landlock.is_none() || same(&u.borrow().peer, other) {
+    if crate::cred::current().sandbox.is_none() || same(&u.borrow().peer, other) {
         return Ok(());
     }
     let (abs, dom) = {
@@ -616,7 +616,7 @@ fn find_other(a: &[u8], typ: u8, net: u64) -> Result<UnixRef, i64> {
             return Err(-EPROTOTYPE);
         }
         // landlock (security_unix_find): 相手を作ったプロセスが同じ層の中でなければ、パスの RESOLVE_UNIX
-        if crate::cred::current().landlock.is_some() {
+        if crate::cred::current().sandbox.is_some() {
             let other = s.borrow().ll.clone();
             crate::landlock::check_resolve_unix(&full, other.as_ref())?;
         }
@@ -927,7 +927,7 @@ pub fn accept(f: &FileRef, u: &UnixRef) -> Result<UnixRef, i64> {
                 {
                     let mut es = e.borrow_mut();
                     es.has_file = true;
-                    es.ll = crate::cred::current().landlock.clone();
+                    es.ll = crate::cred::current().sandbox.clone();
                 }
                 notify(u);
                 return Ok(e);

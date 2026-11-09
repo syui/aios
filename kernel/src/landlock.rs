@@ -13,7 +13,7 @@
 //
 // 止めるもの:
 //   ファイル    開く・作る・消す・つなぐ・切りつめる (パスで)。開いたときに TRUNCATE と IOCTL_DEV (デバイスだけ) の
-//               許しを OpenFile に覚え (ll_deny)、あとの ftruncate と ioctl はそれで決める (渡された fd でも同じ)
+//               許しを OpenFile に覚え (lsm_deny)、あとの ftruncate と ioctl はそれで決める (渡された fd でも同じ)
 //   名前のある unix ソケットにつなぐ・送る (RESOLVE_UNIX)。相手のソケットを作ったプロセスが同じ層の中なら許す
 //   ネットワーク TCP の bind / connect、UDP の bind / connect / sendto (名前のないソケットは autobind なので、ポート 0 の
 //               BIND_UDP も要る)
@@ -107,8 +107,17 @@ pub struct Ruleset {
 
 pub type RulesetRef = Rc<RefCell<Ruleset>>;
 
-/// かかっている層 (古いものから)。Cred に入り、fork で引き継ぐ
-pub type Domain = Rc<Vec<Rc<Ruleset>>>;
+/// かかっている層 (古いものから。中は Layers)。Cred の sandbox に入り、fork で引き継ぐ。core は中を知らない
+/// (security::Blob)
+pub type Domain = crate::security::Blob;
+
+/// 層の並び (Domain の中)
+type Layers = Vec<Rc<Ruleset>>;
+
+/// Domain の中の層 (ほかの型のものは入らない)
+fn view(d: &Domain) -> &Layers {
+    d.downcast_ref::<Layers>().expect("landlock: sandbox")
+}
 
 /// path が base の下か (base 自身も)
 fn beneath(path: &str, base: &str) -> bool {
@@ -134,20 +143,20 @@ impl Ruleset {
 }
 
 fn domain() -> Option<Domain> {
-    crate::cred::current().landlock.clone()
+    crate::cred::current().sandbox.clone()
 }
 
 /// path (先頭 / なし、リンクをたどったあと) に access ができるか。できなければ -EACCES
 pub fn check_fs(path: &str, access: u64) -> Result<(), i64> {
     match domain() {
-        Some(d) if d.iter().any(|r| r.denied_fs(path, access) != 0) => Err(crate::why::landlock(access, false, path)),
+        Some(d) if view(&d).iter().any(|r| r.denied_fs(path, access) != 0) => Err(crate::why::landlock(access, false, path)),
         _ => Ok(()),
     }
 }
 
 /// path の access のうち、どれかの層が止めるもの (開いたときに覚える TRUNCATE と IOCTL_DEV: Linux の hook_file_open)
 pub fn denied_fs(path: &str, access: u64) -> u64 {
-    domain().map_or(0, |d| d.iter().fold(0, |m, r| m | r.denied_fs(path, access)))
+    domain().map_or(0, |d| view(&d).iter().fold(0, |m, r| m | r.denied_fs(path, access)))
 }
 
 /// path に作る・消す (access は MAKE_* / REMOVE_*): 親ディレクトリでくらべる
@@ -195,12 +204,12 @@ pub fn masked_ioctl(req: u64) -> bool {
     )
 }
 
-/// 開いたときに覚えた許し (OpenFile の ll_deny) で、ftruncate ができるか
+/// 開いたときに覚えた許し (OpenFile の lsm_deny) で、ftruncate ができるか
 pub fn check_file_truncate(deny: u32) -> Result<(), i64> {
     if deny as u64 & TRUNCATE != 0 { Err(crate::why::landlock(TRUNCATE, false, "an opened file")) } else { Ok(()) }
 }
 
-/// 開いたときに覚えた許し (OpenFile の ll_deny) で、デバイスに ioctl ができるか
+/// 開いたときに覚えた許し (OpenFile の lsm_deny) で、デバイスに ioctl ができるか
 pub fn check_file_ioctl(deny: u32, req: u64) -> Result<(), i64> {
     if deny as u64 & IOCTL_DEV != 0 && !masked_ioctl(req) { Err(crate::why::landlock(IOCTL_DEV, false, "an opened device")) } else { Ok(()) }
 }
@@ -210,6 +219,7 @@ pub fn check_file_ioctl(deny: u32, req: u64) -> Result<(), i64> {
 /// client の層のうち scope を見張るものが、server の外を指すか (Linux の domain_is_scoped)。server の層より上の段で
 /// 見張っていれば外、下の段は同じ層かどうか
 fn scoped(client: &Domain, server: Option<&Domain>, scope: u64) -> bool {
+    let (client, server) = (view(client), server.map(view));
     let sn = server.map_or(0, |s| s.len());
     for i in (0..client.len()).rev() {
         if client[i].scoped & scope == 0 {
@@ -222,7 +232,7 @@ fn scoped(client: &Domain, server: Option<&Domain>, scope: u64) -> bool {
 
 /// client の i 段めが server と同じ層か
 fn same_layer(client: &Domain, server: Option<&Domain>, i: usize) -> bool {
-    server.is_some_and(|s| i < s.len() && Rc::ptr_eq(&client[i], &s[i]))
+    server.map(view).is_some_and(|s| i < s.len() && Rc::ptr_eq(&view(client)[i], &s[i]))
 }
 
 /// 抽象名前空間の unix ソケット (作ったプロセスの層が other) につなぐ・送る (Linux の hook_unix_stream_connect と
@@ -244,9 +254,9 @@ pub fn check_scope_signal(target: Option<&Domain>) -> Result<(), i64> {
 
 /// tracee を ptrace する (Linux の domain_ptrace: 追う人の層が、相手の層の下になければ EPERM)
 pub fn check_ptrace(tracer: Option<&Domain>, tracee: Option<&Domain>) -> Result<(), i64> {
-    let Some(p) = tracer else { return Ok(()) };
+    let Some(p) = tracer.map(view) else { return Ok(()) };
     let top = p.len() - 1;
-    if tracee.is_some_and(|c| c.len() > top && Rc::ptr_eq(&c[top], &p[top])) {
+    if tracee.map(view).is_some_and(|c| c.len() > top && Rc::ptr_eq(&c[top], &p[top])) {
         return Ok(());
     }
     Err(crate::why::landlock_scope("tracing a process outside its domain"))
@@ -256,7 +266,7 @@ pub fn check_ptrace(tracer: Option<&Domain>, tracee: Option<&Domain>) -> Result<
 /// other) と同じ層は見ない。ほかの層はパスの決まりの RESOLVE_UNIX で
 pub fn check_resolve_unix(path: &str, other: Option<&Domain>) -> Result<(), i64> {
     let Some(d) = domain() else { return Ok(()) };
-    for (i, r) in d.iter().enumerate() {
+    for (i, r) in view(&d).iter().enumerate() {
         if r.fs & RESOLVE_UNIX != 0 && !same_layer(&d, other, i) && r.denied_fs(path, RESOLVE_UNIX) != 0 {
             return Err(crate::why::landlock(RESOLVE_UNIX, false, path));
         }
@@ -274,6 +284,7 @@ const AF_INET6: u16 = 10;
 /// SEND_UDP) ができるか (Linux の current_check_access_socket)。connecting は connect (AF_UNSPEC はつながりを切るだけ)
 pub fn check_socket(fam: u16, addr: &[u8], access: u64, connecting: bool) -> Result<(), i64> {
     let Some(d) = domain() else { return Ok(()) };
+    let d = view(&d);
     if d.iter().all(|r| r.net & access == 0) {
         return Ok(());
     }
@@ -334,14 +345,14 @@ pub fn check_autobind_udp(fam: u16, bound: bool) -> Result<(), i64> {
 
 /// c (の層) が capability cap を使えるか (Linux の hook_capable: commoncap が許したあとで、だめなら止めるだけ)
 pub fn cap_ok(c: &crate::cred::Cred, cap: u32) -> bool {
-    c.landlock.as_ref().is_none_or(|d| d.iter().all(|r| r.perms & PERM_CAP == 0 || (cap < 64 && r.caps & (1 << cap) != 0)))
+    c.sandbox.as_ref().is_none_or(|d| view(d).iter().all(|r| r.perms & PERM_CAP == 0 || (cap < 64 && r.caps & (1 << cap) != 0)))
 }
 
 /// c (の層) が flags (CLONE_NEW*) の namespace をみな作れるか (Linux の hook_namespace_init)。だめなら -EPERM
 pub fn check_ns(c: &crate::cred::Cred, flags: u64) -> Result<(), i64> {
     let want = flags & CLONE_NS_ALL;
-    match &c.landlock {
-        Some(d) if want != 0 && d.iter().any(|r| r.perms & PERM_NS != 0 && want & !r.ns != 0) => Err(crate::why::landlock_scope("creating a namespace")),
+    match &c.sandbox {
+        Some(d) if want != 0 && view(d).iter().any(|r| r.perms & PERM_NS != 0 && want & !r.ns != 0) => Err(crate::why::landlock_scope("creating a namespace")),
         _ => Ok(()),
     }
 }
@@ -358,7 +369,7 @@ fn ruleset_of(fd: u64) -> Result<RulesetRef, i64> {
     let f = crate::proc::current().files().get(fd).cloned().ok_or(-EBADF)?;
     let f = f.borrow();
     match &f.kind {
-        crate::file::Kind::Landlock(r) => Ok(r.clone()),
+        crate::file::Kind::Landlock(r) => r.clone().downcast::<RefCell<Ruleset>>().map_err(|_| -EBADFD),
         _ => Err(-EBADFD),
     }
 }
@@ -531,27 +542,27 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
     }
     let only_log = fd as i32 == -1 && flags & !TSYNC == LOG_SUBDOMAINS_OFF;
     let new = if only_log {
-        p.cred.landlock.clone()
+        p.cred.sandbox.clone()
     } else {
         let r = ruleset_of(fd)?;
-        let mut layers: Vec<Rc<Ruleset>> = p.cred.landlock.as_ref().map(|d| d.as_ref().clone()).unwrap_or_default();
+        let mut layers: Layers = p.cred.sandbox.as_ref().map(|d| view(d).clone()).unwrap_or_default();
         if layers.len() >= 16 {
             return Err(-E2BIG); // Linux と同じく 16 層まで
         }
         layers.push(Rc::new(r.borrow().clone()));
-        Some(Rc::new(layers))
+        Some(Rc::new(layers) as Domain)
     };
     // TSYNC: ほかのスレッドにも同じ層 (と、呼んだスレッドが no_new_privs なら no_new_privs も: Linux の tsync)
     let nnp = flags & NO_NEW_PRIVS != 0 || p.cred.no_new_privs;
     if flags & TSYNC != 0 {
         for t in p.siblings() {
-            t.cred.landlock = new.clone();
+            t.cred.sandbox = new.clone();
             if nnp {
                 t.cred.no_new_privs = true;
             }
         }
     }
-    p.cred.landlock = new;
+    p.cred.sandbox = new;
     if flags & NO_NEW_PRIVS != 0 {
         p.cred.no_new_privs = true;
     }
@@ -560,13 +571,19 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
 
 /// /proc/PID/status の Landlock: かかっている層の数
 pub fn layers(c: &crate::cred::Cred) -> usize {
-    c.landlock.as_ref().map_or(0, |d| d.len())
+    c.sandbox.as_ref().map_or(0, |d| view(d).len())
 }
 
-/// LSM としての landlock (security.rs: Linux の DEFINE_LSM(landlock))。いまは名前と番号だけ (lsm_list_modules)。
-/// フックは次のコミットで
+/// LSM としての landlock (security.rs: Linux の DEFINE_LSM(landlock) と security/landlock の hook_*)。重ねる LSM
+/// (ラベルは持たない)。切ってあってもつないだまま: 切るのはシステムコールだけ (core の part_of)、かかっている層は
+/// いつも効く
 pub struct Landlock;
 pub static LSM: Landlock = Landlock;
+
+/// path の親ディレクトリ (先頭 / なし)
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(d, _)| d)
+}
 
 impl crate::security::Lsm for Landlock {
     fn id(&self) -> (&'static str, u64) {
@@ -575,5 +592,137 @@ impl crate::security::Lsm for Landlock {
 
     fn enabled(&self) -> bool {
         !crate::parts::off(crate::parts::Part::Landlock)
+    }
+
+    fn capable(&self, c: &crate::cred::Cred, cap: u32, _audit: bool) -> bool {
+        cap_ok(c, cap)
+    }
+
+    /// hook_task_kill: 層のある送り主が、ほかのスレッドグループの層の外の相手へ送るのは EPERM
+    fn task_kill(&self, target: &crate::proc::Proc, _sig: i32) -> Result<(), i64> {
+        let me = crate::proc::current();
+        if me.cred.sandbox.is_some() && me.tgid != target.tgid {
+            check_scope_signal(target.cred.sandbox.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn ptrace_access_check(&self, child: &crate::cred::Cred, _mode: u32) -> Result<(), i64> {
+        check_ptrace(crate::cred::current().sandbox.as_ref(), child.sandbox.as_ref())
+    }
+
+    /// hook_file_open: 開く道ごとの権利。返すのは開いたファイルに覚える、許されなかった TRUNCATE と IOCTL_DEV
+    fn file_open(&self, o: &crate::security::FileOpen) -> Result<u32, i64> {
+        use crate::file::{O_ACCMODE, O_RDONLY, O_WRONLY};
+        use crate::security::How;
+        const O_TRUNC: u32 = 0o1000;
+        let acc = o.flags & O_ACCMODE;
+        match o.how {
+            How::Exec => {
+                check_fs(o.path, EXECUTE)?;
+                Ok(0)
+            }
+            // そのディレクトリの下にふつうのファイルを作り、読み書きする
+            How::Tmpfile => {
+                let rw = if acc == O_WRONLY { WRITE_FILE } else { READ_FILE | WRITE_FILE };
+                check_fs(o.path, MAKE_REG | rw)?;
+                Ok(denied_fs(o.path, TRUNCATE) as u32)
+            }
+            // 作ったばかりのものは、mode に関係なく開ける
+            How::Created => Ok(denied_fs(o.path, TRUNCATE) as u32),
+            // ディレクトリは READ_DIR、ほか (デバイスも) は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE
+            How::Open => {
+                let a = if o.dir {
+                    READ_DIR
+                } else {
+                    (if acc != O_WRONLY { READ_FILE } else { 0 }) | (if acc != O_RDONLY { WRITE_FILE } else { 0 }) | (if o.flags & O_TRUNC != 0 { TRUNCATE } else { 0 })
+                };
+                check_fs(o.path, a)?;
+                Ok(denied_fs(o.path, TRUNCATE | if o.dev { IOCTL_DEV } else { 0 }) as u32)
+            }
+        }
+    }
+
+    /// O_CREAT で作る前: 親に MAKE_REG、書く口なら WRITE_FILE も
+    fn may_o_create(&self, full: &str, flags: u32) -> Result<(), i64> {
+        check_parent(full, MAKE_REG)?;
+        if flags & crate::file::O_ACCMODE != crate::file::O_RDONLY {
+            check_fs(full, WRITE_FILE)?;
+        }
+        Ok(())
+    }
+
+    fn path_mkdir(&self, full: &str) -> Result<(), i64> {
+        check_parent(full, MAKE_DIR)
+    }
+
+    fn path_mknod(&self, full: &str, mode: u32, dev: u64) -> Result<(), i64> {
+        check_parent(full, make_right_dev(mode, dev))
+    }
+
+    fn path_symlink(&self, full: &str) -> Result<(), i64> {
+        check_parent(full, MAKE_SYM)
+    }
+
+    fn path_unlink(&self, full: &str, _dir: &crate::vfs::InodeRef, _name: &str, rmdir: bool) -> Result<(), i64> {
+        check_parent(full, if rmdir { REMOVE_DIR } else { REMOVE_FILE })
+    }
+
+    /// link: 作るところの MAKE_* (つなぐ元を引く前)
+    fn path_link_make(&self, full: &str, mode: u32) -> Result<(), i64> {
+        check_parent(full, make_right(mode))
+    }
+
+    /// link: ほかのディレクトリのものをつなぐなら、両方に REFER も
+    fn path_link(&self, src: &str, full: &str, _ino: &crate::vfs::InodeRef) -> Result<(), i64> {
+        if dir_of(src) != dir_of(full) {
+            check_parent(src, REFER)?;
+            check_parent(full, REFER)?;
+        }
+        Ok(())
+    }
+
+    /// rename: 元を消して、先に作る (先にあるものは消す)。入れかえなら、それも元のところへ作る。ディレクトリを
+    /// またぐなら両方に REFER も
+    fn path_rename(&self, r: &crate::security::Rename) -> Result<(), i64> {
+        let kind = |m: u32| if m & crate::vfs::S_IFMT == crate::vfs::S_IFDIR { REMOVE_DIR } else { REMOVE_FILE };
+        let mode = r.moving.meta().mode;
+        check_parent(r.old, kind(mode))?;
+        check_parent(r.new, make_right(mode))?;
+        if let Some(t) = r.target {
+            check_parent(r.new, kind(t.meta().mode))?;
+            if r.exchange {
+                check_parent(r.old, make_right(t.meta().mode))?;
+            }
+        }
+        if dir_of(r.old) != dir_of(r.new) {
+            check_parent(r.old, REFER)?;
+            check_parent(r.new, REFER)?;
+        }
+        Ok(())
+    }
+
+    fn path_truncate(&self, full: &str, _ouid: u32) -> Result<(), i64> {
+        check_fs(full, TRUNCATE)
+    }
+
+    /// hook_file_truncate: 開いたときの TRUNCATE の許しで
+    fn file_truncate(&self, f: &crate::file::FileRef) -> Result<(), i64> {
+        check_file_truncate(f.borrow().lsm_deny)
+    }
+
+    /// hook_file_ioctl: デバイスの ioctl は、開いたときの IOCTL_DEV の許しで (fd の印などはいつもよい)
+    fn file_ioctl(&self, f: &crate::file::FileRef, req: u64) -> Result<(), i64> {
+        check_file_ioctl(f.borrow().lsm_deny, req)
+    }
+
+    /// landlock_create_ruleset (444)、landlock_add_rule (445)、landlock_restrict_self (446)
+    fn syscall(&self, nr: u64, a: &[u64; 6]) -> Option<Result<i64, i64>> {
+        match nr {
+            444 => Some(create_ruleset(a[0] as usize, a[1] as usize, a[2])),
+            445 => Some(add_rule(a[0], a[1], a[2] as usize, a[3])),
+            446 => Some(restrict_self(a[0], a[1])),
+            _ => None,
+        }
     }
 }

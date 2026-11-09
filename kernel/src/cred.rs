@@ -68,8 +68,9 @@ pub struct Cred {
     pub groups: Vec<u32>,
     /// prctl(PR_SET_NO_NEW_PRIVS): exec で setuid / setgid のビットを見ない。外せない
     pub no_new_privs: bool,
-    /// landlock の砂場 (かかっている層)
-    pub landlock: Option<crate::landlock::Domain>,
+    /// 砂場の LSM (landlock) の層。中はその LSM だけが知る。fork で受けつぐ。is_some なら、file::fast_open と fastdir
+    /// (大きなロックのない open と作る・消す) を使わない
+    pub sandbox: Option<crate::security::Blob>,
     /// seccomp のフィルタ (かかっているもの)
     pub seccomp: Option<crate::seccomp::Seccomp>,
     /// namespace (ns.rs)
@@ -88,7 +89,7 @@ pub struct Cred {
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, landlock: None, seccomp: None, ns: crate::ns::Ns::INIT, label: None, label_ctx: None, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, sandbox: None, seccomp: None, ns: crate::ns::Ns::INIT, label: None, label_ctx: None, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
 
     /// gid の組にいるか (Linux の in_group_p: fsgid と、ほかの組)
     pub fn in_group(&self, gid: u32) -> bool {
@@ -113,10 +114,9 @@ impl Cred {
         self.has_cap(cap) && self.lsm_capable(cap, false)
     }
 
-    /// commoncap が許したあとの LSM (security_capable): landlock の CAPABILITY_USE、それから security::capable
-    /// (CONFIG_LSM の順)
+    /// commoncap が許したあとの LSM (security_capable: landlock の CAPABILITY_USE、それから AppArmor。CONFIG_LSM の順)
     fn lsm_capable(&self, cap: u32, audit: bool) -> bool {
-        crate::landlock::cap_ok(self, cap) && crate::security::capable(self, cap, audit)
+        crate::security::capable(self, cap, audit)
     }
 
     /// meta に want (R/W/X の組み合わせ) ができるか。real なら実 uid/gid で (access(2) 用)。Linux の

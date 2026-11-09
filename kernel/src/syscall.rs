@@ -570,10 +570,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         TIMES => sys_times(a[0] as usize),
         WAITID => sys_waitid(a[0], int(a[1]), a[2] as usize, a[3], a[4] as usize),
         PIDFD_OPEN => crate::ns::arg_pid(int(a[0])).and_then(|p| sys_pidfd_open(p, a[1])),
-        LANDLOCK_CREATE_RULESET => crate::landlock::create_ruleset(a[0] as usize, a[1] as usize, a[2]),
+        // LSM のシステムコール (landlock_*: security::lsm_syscall)
+        LANDLOCK_CREATE_RULESET | LANDLOCK_ADD_RULE | LANDLOCK_RESTRICT_SELF => crate::security::lsm_syscall(nr, &a),
         SECCOMP => crate::seccomp::sys_seccomp(a[0], a[1], a[2] as usize),
-        LANDLOCK_ADD_RULE => crate::landlock::add_rule(a[0], a[1], a[2] as usize, a[3]),
-        LANDLOCK_RESTRICT_SELF => crate::landlock::restrict_self(a[0], a[1]),
         PIDFD_SEND_SIGNAL => crate::pidfd::send_signal(int(a[0]), int(a[1]) as i32, a[2] as usize, a[3] as u32 as u64),
         PIDFD_GETFD => crate::pidfd::getfd(int(a[0]), int(a[1]), a[2] as u32 as u64),
         KILL => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::kill(p, a[1] as i32)),

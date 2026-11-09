@@ -40,7 +40,7 @@ const O_CLOEXEC: u64 = 0o2000000;
 
 /// どちらにも要るもの (ロックの外で見られるもの)。だめなら None
 fn usable(me: &Proc) -> Option<&'static alloc::rc::Rc<crate::extfs::ExtFs>> {
-    if crate::fail::ON.load(Relaxed) || me.cred.landlock.is_some() || !watch_free() {
+    if crate::fail::ON.load(Relaxed) || me.cred.sandbox.is_some() || !watch_free() {
         return None;
     }
     if !me.files.as_ref()?.private() {

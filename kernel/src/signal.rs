@@ -289,9 +289,6 @@ fn can_signal(target: &Proc, sig: i32) -> Result<(), i64> {
     if !(a.euid == b.suid || a.euid == b.uid || a.uid == b.suid || a.uid == b.uid || a.capable(crate::cred::CAP_KILL)) {
         return Err(-EPERM);
     }
-    if a.landlock.is_some() && me.tgid != target.tgid {
-        crate::landlock::check_scope_signal(b.landlock.as_ref())?;
-    }
     crate::security::task_kill(target, sig)
 }
 

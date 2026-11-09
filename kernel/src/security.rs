@@ -19,6 +19,7 @@ use core::any::Any;
 const E2BIG: i64 = 7;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
+const ENOSYS: i64 = 38;
 const EOPNOTSUPP: i64 = 95;
 
 /// LSM がプロセスに持たせるもの (Linux の cred->security のその LSM の場所)。中はその LSM だけが知る。core は写す、
@@ -39,12 +40,27 @@ pub struct Bprm {
     pub fatal: bool,
 }
 
-/// security_file_open に見せるもの (aios は開く前に見る)
+/// security_file_open に見せるもの (aios は開く前に見る)。dev: デバイス (文字か塊) を開く
 pub struct FileOpen<'a> {
     pub path: &'a str,
     pub flags: u32,
     pub dir: bool,
     pub ouid: u32,
+    pub how: How,
+    pub dev: bool,
+}
+
+/// どこから開くか (Linux の security_file_open はみな同じ口: aios はそれぞれの道の場所で呼ぶ)
+#[derive(Clone, Copy, PartialEq)]
+pub enum How {
+    /// すでにあるファイルを開く (path は開くもの)
+    Open,
+    /// O_CREAT で作ったばかりのものを開く (作る前のたしかめは may_o_create)
+    Created,
+    /// O_TMPFILE (path はディレクトリ)
+    Tmpfile,
+    /// exec するプログラム (#! のインタプリタと ld.so も)
+    Exec,
 }
 
 /// security_path_rename に見せるもの
@@ -147,6 +163,10 @@ pub trait Lsm {
     fn path_unlink(&self, _full: &str, _dir: &InodeRef, _name: &str, _rmdir: bool) -> Result<(), i64> {
         Ok(())
     }
+    /// aios: link で作る名前 (つなぐ元を引く前: Linux は security_path_link のなかで)
+    fn path_link_make(&self, _full: &str, _mode: u32) -> Result<(), i64> {
+        Ok(())
+    }
     fn path_link(&self, _src: &str, _full: &str, _ino: &InodeRef) -> Result<(), i64> {
         Ok(())
     }
@@ -154,6 +174,14 @@ pub trait Lsm {
         Ok(())
     }
     fn path_truncate(&self, _full: &str, _ouid: u32) -> Result<(), i64> {
+        Ok(())
+    }
+    /// 開いたファイル (OpenFile の lsm_deny が 0 でないもの) を ftruncate する
+    fn file_truncate(&self, _f: &FileRef) -> Result<(), i64> {
+        Ok(())
+    }
+    /// 開いたファイル (OpenFile の lsm_deny が 0 でないもの) に ioctl する
+    fn file_ioctl(&self, _f: &FileRef, _req: u64) -> Result<(), i64> {
         Ok(())
     }
     fn sb_mount(&self, _name: &str, _dev: Option<&str>, _fstype: Option<&str>, _flags: u64, _data: Option<&str>) -> Result<(), i64> {
@@ -172,6 +200,10 @@ pub trait Lsm {
     }
     fn setselfattr(&self, _attr: u32, _value: &[u8]) -> Result<(), i64> {
         Err(-EOPNOTSUPP)
+    }
+    /// LSM のシステムコール (landlock_*: Linux の security/landlock/syscalls.c)。その LSM のものでなければ None
+    fn syscall(&self, _nr: u64, _a: &[u64; 6]) -> Option<Result<i64, i64>> {
+        None
     }
 }
 
@@ -207,10 +239,10 @@ fn lsms() -> [&'static dyn Lsm; 2] {
 }
 
 /// security_capable: commoncap (Cred::has_cap) が許したあと。だめと言った LSM で止まる (あとの LSM は記録もしない)。
-/// ラベルのない cred は聞かない (どの LSM も許す)
+/// ラベルも砂場もない cred は聞かない (どの LSM も許す)
 #[inline]
 pub fn capable(c: &Cred, cap: u32, audit: bool) -> bool {
-    c.label.is_none() || lsms().iter().all(|l| l.capable(c, cap, audit))
+    (c.label.is_none() && c.sandbox.is_none()) || lsms().iter().all(|l| l.capable(c, cap, audit))
 }
 
 /// security_capget: root に見せる capability を、それぞれの LSM がせばめる
@@ -280,7 +312,8 @@ pub fn file_permission(f: &FileRef, write: bool) -> Result<(), i64> {
     Ok(())
 }
 
-/// security_file_open。aios の順: ラベルを持つ LSM が先 (Linux の CONFIG_LSM では landlock が先)
+/// security_file_open。返すのは開いたファイルに覚えるビット (OpenFile の lsm_deny)。aios の順: ラベルを持つ LSM が先
+/// (Linux の CONFIG_LSM では landlock が先)
 pub fn file_open(o: &FileOpen) -> Result<u32, i64> {
     let x = EXCLUSIVE.val().file_open(o)?;
     Ok(x | STACKED.val().file_open(o)?)
@@ -340,6 +373,14 @@ pub fn path_unlink(full: &str, dir: &InodeRef, name: &str, rmdir: bool) -> Resul
     Ok(())
 }
 
+/// link で作る名前 (aios の順: つなぐ元を引く前。mode はつなぐもの)
+pub fn path_link_make(full: &str, mode: u32) -> Result<(), i64> {
+    for l in lsms() {
+        l.path_link_make(full, mode)?;
+    }
+    Ok(())
+}
+
 /// security_path_link
 pub fn path_link(src: &str, full: &str, ino: &InodeRef) -> Result<(), i64> {
     for l in lsms() {
@@ -362,6 +403,40 @@ pub fn path_truncate(full: &str, ouid: u32) -> Result<(), i64> {
         l.path_truncate(full, ouid)?;
     }
     Ok(())
+}
+
+/// security_file_truncate。開いたときに覚えたものがなければ見ない
+#[inline]
+pub fn file_truncate(f: &FileRef) -> Result<(), i64> {
+    if f.borrow().lsm_deny == 0 {
+        return Ok(());
+    }
+    for l in lsms() {
+        l.file_truncate(f)?;
+    }
+    Ok(())
+}
+
+/// security_file_ioctl。開いたときに覚えたものがなければ見ない
+#[inline]
+pub fn file_ioctl(f: &FileRef, req: u64) -> Result<(), i64> {
+    if f.borrow().lsm_deny == 0 {
+        return Ok(());
+    }
+    for l in lsms() {
+        l.file_ioctl(f, req)?;
+    }
+    Ok(())
+}
+
+/// LSM のシステムコール (landlock_*)。答える LSM がなければ ENOSYS (Linux の COND_SYSCALL)
+pub fn lsm_syscall(nr: u64, a: &[u64; 6]) -> Result<i64, i64> {
+    for l in lsms() {
+        if let Some(r) = l.syscall(nr, a) {
+            return r;
+        }
+    }
+    Err(-ENOSYS)
 }
 
 /// security_sb_mount

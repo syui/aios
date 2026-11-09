@@ -696,7 +696,7 @@ fn ptrace_may(pid: u32, read: bool) -> Result<(), ()> {
     if crate::pidfd::dumpable(p) != 1 && !c.capable(crate::cred::CAP_SYS_PTRACE) {
         return Err(());
     }
-    crate::landlock::check_ptrace(c.landlock.as_ref(), tc.landlock.as_ref()).map_err(|_| ())?;
+    crate::landlock::check_ptrace(c.sandbox.as_ref(), tc.sandbox.as_ref()).map_err(|_| ())?;
     crate::apparmor::may_ptrace(tc, read).map_err(|_| ())
 }
 

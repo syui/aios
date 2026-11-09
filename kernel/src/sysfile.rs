@@ -1203,18 +1203,13 @@ fn open_tmpfile(full: String, dir: InodeRef, flags: u64, mode: u64) -> R {
     vfs::check_writable(&full)?;
     let c = cred::current();
     parent_writable(&c, &dir)?;
-    // 砂場: そのディレクトリの下にふつうのファイルを作り、読み書きする
-    {
-        use crate::landlock::*;
-        let rw = if flags as u32 & file::O_ACCMODE == file::O_WRONLY { WRITE_FILE } else { READ_FILE | WRITE_FILE };
-        check_fs(&full, MAKE_REG | rw)?;
-    }
-    let ll_deny = crate::landlock::denied_fs(&full, crate::landlock::TRUNCATE) as u32;
+    // LSM (砂場): そのディレクトリの下にふつうのファイルを作り、読み書きする。開いたファイルに覚えるもの (lsm_deny) も
+    let lsm_deny = crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: true, ouid: 0, how: crate::security::How::Tmpfile, dev: false })?;
     let ino = dir.tmpfile(mode as u32 & 0o7777 & !umask(), flags & O_EXCL == 0)?;
     own_new(&c, &dir, &ino)?;
     let name = alloc::format!("{}/#{} (deleted)", full, ino.meta().ino);
     let f = file::new(Kind::Inode(ino, name), file_flags(flags));
-    f.borrow_mut().ll_deny = ll_deny;
+    f.borrow_mut().lsm_deny = lsm_deny;
     let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     Ok(fd as i64)
 }
@@ -1364,11 +1359,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         }
         Err((parent, name, full)) => {
             vfs::check_writable(&full)?;
-            crate::landlock::check_parent(&full, crate::landlock::MAKE_REG)?;
-            if flags as u32 & file::O_ACCMODE != file::O_RDONLY {
-                crate::landlock::check_fs(&full, crate::landlock::WRITE_FILE)?;
-            }
-            // LSM (AppArmor): 作る (mknod) と、開く (Linux の may_o_create と file_open)
+            // LSM: 作る (mknod) と、開く (landlock の MAKE_REG と WRITE_FILE、AppArmor: Linux の may_o_create と file_open)
             crate::security::may_o_create(&full, flags as u32)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
@@ -1377,10 +1368,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
             vfs::remember_new(&full, &parent, &name, &ino);
             inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
-            // 作ったばかりのものは、mode に関係なく開ける
-            let ll_deny = crate::landlock::denied_fs(&full, crate::landlock::TRUNCATE) as u32;
+            // 作ったばかりのものは、mode に関係なく開ける (LSM が開いたファイルに覚えるもの: lsm_deny)
+            let lsm_deny = crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: false, ouid: 0, how: crate::security::How::Created, dev: false })?;
             let f = file::new(Kind::Inode(ino, full), file_flags(flags));
-            f.borrow_mut().ll_deny = ll_deny;
+            f.borrow_mut().lsm_deny = lsm_deny;
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
             return Ok(fd as i64);
         }
@@ -1410,23 +1401,13 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         return Err(-vfs::EPERM);
     }
     vfs::may(&ino, &ino.meta(), cred::current(), want)?;
-    // LSM (security_file_open): 開く口の許しをパスで
-    {
+    // LSM (security_file_open): 開く口の許しをパスで (AppArmor、それから landlock: ディレクトリは READ_DIR、ほか (デバイスも)
+    // は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE)。あとで使う TRUNCATE と (デバイスなら) IOCTL_DEV の許しを、開いた
+    // ファイルに覚える (lsm_deny: Linux の hook_file_open)
+    let lsm_deny = {
         let m = ino.meta();
-        crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: m.is_dir(), ouid: m.uid })?;
-    }
-    // 砂場: ディレクトリは READ_DIR、ほか (デバイスも) は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE。あとで使う
-    // TRUNCATE と (デバイスなら) IOCTL_DEV の許しを開いたファイルに覚える (Linux の hook_file_open)
-    let ll_deny = {
-        use crate::landlock::*;
-        let a = if ino.meta().is_dir() {
-            READ_DIR
-        } else {
-            (if want & PR != 0 { READ_FILE } else { 0 }) | (if accmode != file::O_RDONLY { WRITE_FILE } else { 0 }) | (if flags & O_TRUNC != 0 { TRUNCATE } else { 0 })
-        };
-        check_fs(&full, a)?;
-        let dev = matches!(ino.meta().mode & S_IFMT, vfs::S_IFCHR | vfs::S_IFBLK);
-        denied_fs(&full, TRUNCATE | if dev { IOCTL_DEV } else { 0 }) as u32
+        let dev = matches!(m.mode & S_IFMT, vfs::S_IFCHR | vfs::S_IFBLK);
+        crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: m.is_dir(), ouid: m.uid, how: crate::security::How::Open, dev })?
     };
     let kind = match ino.meta().mode & S_IFMT {
         // ディレクトリは読むだけ (O_TRUNC も書くことになる: Linux の may_open)
@@ -1478,10 +1459,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         inotify::file_event(&full, &ino, inotify::IN_OPEN);
     }
     // 閉じたら棚にしまってよいもの (file::Shelf): ext4 のふつうのファイルを、読むだけの口でほかの印なしに
-    let reuse = kind.is_none() && flags & !SIMPLE_OPEN == 0 && ino.meta().mode & S_IFMT == vfs::S_IFREG && ino.fast_stat() && ll_deny == 0;
+    let reuse = kind.is_none() && flags & !SIMPLE_OPEN == 0 && ino.meta().mode & S_IFMT == vfs::S_IFREG && ino.fast_stat() && lsm_deny == 0;
     let kind = kind.unwrap_or(Kind::Inode(ino, full));
     let f = file::new(kind, file_flags(flags));
-    f.borrow_mut().ll_deny = ll_deny;
+    f.borrow_mut().lsm_deny = lsm_deny;
     if reuse {
         file::reuse_on(&f);
     }
@@ -1693,7 +1674,6 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     }
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
-    crate::landlock::check_parent(&full, crate::landlock::MAKE_DIR)?;
     crate::security::path_mkdir(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
@@ -1745,7 +1725,6 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
     let mode = mode as u32;
-    crate::landlock::check_parent(&full, crate::landlock::make_right_dev(mode, dev))?;
     crate::security::path_mknod(&full, mode, dev)?;
     let node = match mode & S_IFMT {
         vfs::S_IFIFO => NewNode::Fifo,
@@ -1779,7 +1758,6 @@ pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String, S
     new_name(&p).map_err(|e| if e == -EEXIST { -EADDRINUSE } else { e })?;
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
-    crate::landlock::check_parent(&full, crate::landlock::MAKE_SOCK)?;
     // LSM: AF_UNIX の bind は mknod (Linux の unix_bind も vfs_mknod)
     crate::security::path_mknod(&full, vfs::S_IFSOCK, 0)?;
     let c = cred::current();
@@ -1834,8 +1812,7 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
         });
     }
     let (parent, name, full) = (p.dir, p.name, p.full);
-    crate::landlock::check_parent(&full, if flags & AT_REMOVEDIR != 0 { crate::landlock::REMOVE_DIR } else { crate::landlock::REMOVE_FILE })?;
-    // LSM: 消すものの持ち主で (要る LSM だけが引く: AppArmor の common_perm_rm)
+    // LSM: landlock の REMOVE_DIR か REMOVE_FILE、AppArmor は消すものの持ち主で (要る LSM だけが引く: common_perm_rm)
     crate::security::path_unlink(&full, &parent, &name, flags & AT_REMOVEDIR != 0)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
@@ -1874,7 +1851,6 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     new_name(&p)?;
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
-    crate::landlock::check_parent(&full, crate::landlock::MAKE_SYM)?;
     crate::security::path_symlink(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
@@ -1906,16 +1882,11 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
     }
     let (parent, name, full) = (p.dir, p.name, p.full);
     vfs::check_writable(&full)?;
-    // 砂場: 作るところの MAKE_*。ほかのディレクトリのものをつなぐなら、両方に REFER も
+    // LSM (砂場): 作るところの MAKE_*。それから (security_path_link) ほかのディレクトリのものをつなぐなら、両方に REFER も
+    // (landlock)、新しい名前と、つなぐ元の組 (AppArmor の profile_path_link)
     {
-        use crate::landlock::*;
-        check_parent(&full, make_right(ino.meta().mode))?;
+        crate::security::path_link_make(&full, ino.meta().mode)?;
         let src = old_path(olddir, oldp, follow | (flags & AT_EMPTY_PATH))?;
-        if dir_of(&src) != dir_of(&full) {
-            check_parent(&src, REFER)?;
-            check_parent(&full, REFER)?;
-        }
-        // LSM (security_path_link): 新しい名前と、つなぐ元の組 (AppArmor の profile_path_link)
         crate::security::path_link(&src, &full, &ino)?;
     }
     parent_writable(&cred::current(), &parent)?;
@@ -1984,29 +1955,11 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         return Ok(0);
     }
     let (op, oname, ofull, np, nname, nfull) = (o.dir, o.name, o.full, n.dir, n.name, n.full);
-    // 砂場: 元を消して、先に作る (先にあるものは消す)。ディレクトリをまたぐなら両方に REFER も。名前は引いたもの
+    // LSM (security_path_rename): landlock は元を消して、先に作る (先にあるものは消す。ディレクトリをまたぐなら両方に
+    // REFER も)、AppArmor は入れかえなら先のものも、元のものも、「読んで消す」と「作って書く」。名前は引いたもの
     // (moving、target) を使う (Linux の do_renameat2 も 1 度引いた dentry で: 前はここと、下の上書きされたものを見る
     // ところで、同じ名前を 4 度引きなおしていた)
-    {
-        use crate::landlock::*;
-        let kind = |m: u32| if m & S_IFMT == vfs::S_IFDIR { REMOVE_DIR } else { REMOVE_FILE };
-        let mode = moving.meta().mode;
-        check_parent(&ofull, kind(mode))?;
-        check_parent(&nfull, make_right(mode))?;
-        if let Some(r) = &target {
-            check_parent(&nfull, kind(r.meta().mode))?;
-            // 入れかえなら、それも元のところへ作る
-            if flags & RENAME_EXCHANGE != 0 {
-                check_parent(&ofull, make_right(r.meta().mode))?;
-            }
-        }
-        if dir_of(&ofull) != dir_of(&nfull) {
-            check_parent(&ofull, REFER)?;
-            check_parent(&nfull, REFER)?;
-        }
-        // LSM (security_path_rename。AppArmor: 入れかえなら先のものも、元のものも、「読んで消す」と「作って書く」)
-        crate::security::path_rename(&crate::security::Rename { old: &ofull, new: &nfull, moving: &moving, target: target.as_ref(), exchange: flags & RENAME_EXCHANGE != 0 })?;
-    }
+    crate::security::path_rename(&crate::security::Rename { old: &ofull, new: &nfull, moving: &moving, target: target.as_ref(), exchange: flags & RENAME_EXCHANGE != 0 })?;
     // Linux の vfs_rename と同じ順: 元を消せるか (親に書けて sticky も)、先に作れるか (あれば消せるか、種類が合うか)
     let c = cred::current();
     parent_writable(&c, &op)?;
@@ -2113,8 +2066,8 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
         return Err(crate::why::inval());
     }
     writable_fd(fd)?;
-    // landlock: 開いたときの TRUNCATE の許しで (Linux の hook_file_truncate)
-    crate::landlock::check_file_truncate(f.borrow().ll_deny)?;
+    // LSM (security_file_truncate): 開いたときに覚えた許しで (landlock の TRUNCATE)
+    crate::security::file_truncate(&f)?;
     lsm_fd(PathOp::Truncate, fd)?;
     vfs::drop_privs(&ino)?;
     // ftruncate(2) は大きさが変わらなくても時刻を変える (Linux の do_truncate が ATTR_MTIME | ATTR_CTIME を渡す。
@@ -2206,7 +2159,6 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     if proc::executing(ino.id()) {
         return Err(-ETXTBSY);
     }
-    crate::landlock::check_fs(&full, crate::landlock::TRUNCATE)?;
     crate::security::path_truncate(&full, ino.meta().uid)?;
     vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;
@@ -2713,8 +2665,8 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if f.borrow().flags & file::O_PATH != 0 {
         return Err(-EBADF);
     }
-    // landlock: デバイスの ioctl は、開いたときの IOCTL_DEV の許しで (fd の印などはいつもよい: Linux の hook_file_ioctl)
-    crate::landlock::check_file_ioctl(f.borrow().ll_deny, req)?;
+    // LSM (security_file_ioctl): landlock は、デバイスの ioctl を開いたときの IOCTL_DEV の許しで (fd の印などはいつもよい)
+    crate::security::file_ioctl(&f, req)?;
     // FIOCLEX / FIONCLEX: どの fd でも close-on-exec を立てる / 外す (Linux の do_vfs_ioctl。fcntl の F_SETFD と同じ。
     // 前はデバイスやソケットで ENOTTY: CPython の os.set_inheritable は fcntl にまわっていた)
     const FIOCLEX: u64 = 0x5451;
@@ -2895,7 +2847,7 @@ pub fn chdir(pathp: usize) -> R {
 pub fn chroot(pathp: usize) -> R {
     let path = user_str(pathp)?;
     // 砂場の中からは、見える根を変えられない (Linux の landlock と同じ)
-    if !cred::current().capable(cred::CAP_SYS_CHROOT) || cred::current().landlock.is_some() {
+    if !cred::current().capable(cred::CAP_SYS_CHROOT) || cred::current().sandbox.is_some() {
         return Err(-cred::EPERM);
     }
     let files = proc::current().files();
@@ -2913,7 +2865,7 @@ pub fn chroot(pathp: usize) -> R {
 fn may_mount() -> Result<(), i64> {
     let c = cred::current();
     let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id()));
-    if c.landlock.is_some() || !((c.ns.user.is_none() && c.capable(cred::CAP_SYS_ADMIN)) || own) {
+    if c.sandbox.is_some() || !((c.ns.user.is_none() && c.capable(cred::CAP_SYS_ADMIN)) || own) {
         return Err(-cred::EPERM);
     }
     Ok(())

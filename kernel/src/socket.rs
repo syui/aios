@@ -519,7 +519,7 @@ fn smol_name(s: &Socket) -> Vec<u8> {
 /// (apparmor_socket_sendmsg: TCP の MSG_FASTOPEN で名前があれば、つなぐのも見る)
 fn lsm_send(u: &InetRef, flags: u64, to: Option<&[u8]>) -> Result<(), i64> {
     const MSG_FASTOPEN: u64 = 0x2000_0000;
-    if crate::cred::current().landlock.is_some() {
+    if crate::cred::current().sandbox.is_some() {
         use crate::landlock::*;
         match crate::inet::ll_kind(u) {
             (Some(true), _) => {

@@ -69,8 +69,8 @@ pub enum Kind {
     SndCtl,
     /// 音の再生の口 (/dev/snd/pcmC0D0p)
     SndPcm,
-    /// landlock_create_ruleset の決まりの束
-    Landlock(crate::landlock::RulesetRef),
+    /// landlock_create_ruleset の決まりの束 (中は landlock だけが知る)
+    Landlock(Rc<dyn core::any::Any>),
 }
 
 /// 開いたものの種類の名前 (Kind::class の番号。/proc/bkl が fd のシステムコールを分ける)
@@ -148,9 +148,10 @@ pub struct OpenFile {
     pub reuse: bool,
     /// flock か OFD ロックを置いたことがある (閉じるときに外す): 棚にはしまわない
     pub locked: bool,
-    /// landlock: 開いたときに許されなかった TRUNCATE と IOCTL_DEV (デバイスだけ)。あとの ftruncate と ioctl はこれで
-    /// 決める (Linux の landlock_file の allowed_access。渡された fd でも、層のないプロセスでも同じ)
-    pub ll_deny: u32,
+    /// LSM (landlock) が開いたときに覚えたもの: 許されなかった TRUNCATE と IOCTL_DEV (デバイスだけ)。あとの ftruncate と
+    /// ioctl はこれで決める (security::file_truncate と file_ioctl。Linux の landlock_file の allowed_access。渡された fd
+    /// でも、層のないプロセスでも同じ)。0 でなければ棚にしまわない
+    pub lsm_deny: u32,
     /// ソケット: recvmmsg が 1 つ目より後でしくじったときのエラー (負の errno、0 はなし)。次の受けとり (recv、recvmsg、
     /// recvmmsg、read) か SO_ERROR で返して消す。aios がえらんだちがい (recvmmsg-error): Linux はソケットの sk_err に書く
     /// ので、次の send や ICMP のエラーや SO_ERROR が持っていき、受けとる側に返らないことがある (recvmmsg(2) の BUGS)
@@ -182,7 +183,7 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
     }
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, ll_deny: 0, recv_err: 0, label: crate::cred::current().label.clone() }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, lsm_deny: 0, recv_err: 0, label: crate::cred::current().label.clone() }))
 }
 
 /// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
@@ -295,7 +296,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
     let acc = flags & O_ACCMODE as u64;
-    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.landlock.is_some() || OPEN_WATCHED.load(Relaxed) != 0 {
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.cred.sandbox.is_some() || OPEN_WATCHED.load(Relaxed) != 0 {
         note(5);
         return None;
     }

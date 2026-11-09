@@ -153,12 +153,19 @@ pub fn exec_target(t: Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Imag
 /// exec する前のたしかめ (Linux の do_open_execat の may_open と、security_bprm_creds_for_exec まで): Landlock の EXECUTE、
 /// ふつうのファイルで x がある、LSM の移りかた (AppArmor のプロファイル)。execveat の AT_EXECVE_CHECK はここまでで 0
 pub fn check(exe: &str, ino: &crate::vfs::InodeRef) -> Result<crate::security::Bprm, i64> {
-    crate::landlock::check_fs(exe, crate::landlock::EXECUTE)?;
+    open_exec(exe)?;
     let m = ino.meta();
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
     crate::security::bprm_creds_for_exec(exe, m.uid)
+}
+
+/// exec で開くもの (プログラム、#! のインタプリタ、ld.so) の LSM のたしかめ (Linux の do_open_execat の
+/// security_file_open: landlock の EXECUTE)
+fn open_exec(path: &str) -> Result<(), i64> {
+    crate::security::file_open(&crate::security::FileOpen { path, flags: 0, dir: false, ouid: 0, how: crate::security::How::Exec, dev: false })?;
+    Ok(())
 }
 
 /// インタプリタ (#! の 1 行めか PT_INTERP) を cwd から開く (Linux の open_exec)。audit の名前も (ないものは名前だけ)
@@ -177,7 +184,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let m = ino.meta();
     let mut bprm = match bprm {
         Some(b) => {
-            crate::landlock::check_fs(&exe, crate::landlock::EXECUTE)?;
+            open_exec(&exe)?;
             if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
                 return Err(-EACCES);
             }
@@ -220,7 +227,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let (entry, interp_base) = match &main.interp {
         Some(ip) => {
             let (ipath, iino) = open_interp(&cwd, ip)?;
-            crate::landlock::check_fs(&ipath, crate::landlock::EXECUTE)?;
+            open_exec(&ipath)?;
             bprm.fatal |= !crate::security::bprm_mmap_file(&bprm, &ipath, iino.meta().uid);
             let im = iino.meta();
             nondump |= !crate::cred::current().may(&im, crate::cred::R, false);

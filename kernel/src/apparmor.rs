@@ -8,7 +8,7 @@ use crate::cell::Bkl;
 use crate::cred::Cred;
 use crate::file::FileRef;
 use crate::proc::Proc;
-use crate::security::{path_name, Bprm, FileOpen, Label, PathOp, Rename};
+use crate::security::{path_name, Bprm, FileOpen, How, Label, PathOp, Rename};
 use crate::vfs::InodeRef;
 use alloc::format;
 use alloc::rc::Rc;
@@ -3323,8 +3323,11 @@ impl crate::security::Lsm for AppArmor {
         sock_file(f, write)
     }
 
+    /// すでにあるファイルを開くときだけ (作るときは may_o_create、exec は bprm_creds_for_exec で見る。O_TMPFILE は見ない)
     fn file_open(&self, o: &FileOpen) -> Result<u32, i64> {
-        open_perm(o.path, o.flags, o.dir, o.ouid)?;
+        if o.how == How::Open {
+            open_perm(o.path, o.flags, o.dir, o.ouid)?;
+        }
         Ok(0)
     }
 
