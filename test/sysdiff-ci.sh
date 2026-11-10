@@ -63,6 +63,15 @@ run)
   for s in $SETS; do
     fs=${s%%:*} rest=${s#*:}
     ops=${rest%%:*} cases=${rest#*:}
+    # 前の組の TCP の TIME_WAIT (60 秒) が消えるのを待つ (70 秒まで)。手本の Linux は組ごとに新しい VM で作る: のこって
+    # いると、乱数の口がそれとぶつかって TCP の bind が EADDRINUSE になる (Linux でも同じ。tmp 30 の case 9 の op 18:
+    # UDP がもらった口へ TCP を bind する。todo の sysdiff-bind-flake)
+    w=0
+    while [ $w -lt 70 ] && grep -q ' 06 ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; do
+      sleep 1
+      w=$((w + 1))
+    done
+    [ $w -gt 0 ] && echo "sysdiff-ci: waited $w s for TIME_WAIT to go"
     if [ "$fs" = tmp ]; then work=/tmp/sd; else work=$HOME/sd; fi
     mkdir -p "$work"
     ./sysdiff -n "$ops" "$work" "$cases" > "$fs-$ops.out" 2> "$fs-$ops.err"

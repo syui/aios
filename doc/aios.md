@@ -2818,6 +2818,12 @@ aios は閉じたときに片づけ (相手はすぐ EOF)、Linux 7.3 はほか�
 いっしょに置くので、sysdiff.c を変えて答えを作りなおし忘れると、CI はくらべる前に止まる。CI の gcc (glibc) で作ったもの
 と aish の zig (musl) で作ったものの Linux の答えは、同じだった。
 
+CI でときどき tmpfs 30 op の case 9 だけがちがった (op 18 の bind が Linux は 0、aios は EADDRINUSE: op 0 の UDP のソケットが
+もらった乱数の口へ、TCP のソケットを bind する。TCP と UDP は表が別なので、ふつうは 0)。その口を TCP の TIME_WAIT (60 秒)
+が使っていると EADDRINUSE になるのは Linux も同じ (TIME_WAIT を 14000 こ作ってから case 9 を 20 回: aios は 11 回、
+Linux 7.4 は 7 回)。ちがいは環境で、手本の Linux は組ごとに新しい VM で作るが、CI の aios は 3 つの組を 1 つの VM で
+つづけてまわすので、前の組の TIME_WAIT がのこっていた。組のあいだで、TIME_WAIT が消えるのを待つ (70 秒まで)。
+
 #### aios がえらんだちがい
 
 Linux に合わせるのは最初の手本で、Linux よりよい道があれば、そちらをえらぶ。えらんだところは test/sysdiff.c の `chosen` に
