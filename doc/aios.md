@@ -2536,8 +2536,11 @@ aios のほうが 1.3 倍ほど速く、カーネルにいる時間は Linux の
 見つけたもの: (1) /proc/stat の system がいつも 0 で、カーネルにいた時間が idle に入っていた (tick で、タイマの割りこみが
 来たときにスレッドがいたかを数えていたが、カーネルは割りこみを止めて走る)。スレッドの cpu_ns と sys_ns を足すところで
 CPU ごとにも足し (proc::RUN_NS、SYS_NS)、いま走っているものの分も入れて user、system、idle を出す。(2) xargs (uutils
-findutils 0.11.0。上流の main も) は -P を受けとるが「NOT IMPLEMENTED」で、1 つずつ動かす: xargs -P 4 で 4 つの
-sleep 1 に 4.1 秒。ビルドで xargs -P を使うと、並ばない。
+findutils 0.11.0。上流の main も) は -P を受けとるが「NOT IMPLEMENTED」で、1 つずつ動かしていた: xargs -P 4 で 4 つの
+sleep 1 に 4.1 秒。pkg/rust/findutils の xargs-max-procs.patch で、GNU と同じく max-procs こまで並べる (どれかが終わるのを
+waitpid で待って次を。0 は上限なし。255 で終わるか殺されたものがあれば、走っているものを待ってから 124 / 125 で止める。
+配布元のテストに 3 つ足して、みな通る)。aios の中で 4 つの sleep 1 は 1.1 秒、zig cc のビルドを xargs -P 4 で回すと
+151 → 53 秒。
 
 ファイルを写したところのページフォルト (Firefox の起動で 6 万回、大きなロックを持つ時間の 2.5 秒) をしらべると、大きなロック
 なしの道 (fast_fault) のほうが、ロックの道より遅かった (MAP_PRIVATE で 1 ページ 40 µs)。PTE を書くたびに、すべての CPU の
