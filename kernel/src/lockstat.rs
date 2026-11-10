@@ -152,6 +152,8 @@ pub fn text() -> alloc::string::String {
     s.push_str(&format!("ロックなしの作る・消す (fastdir、ext4 のロックで): 作った {} 消した {} (ふつうの道へ: 形 {} 親が statc にない {} ext4 が断った {})。ext4 のロックを待った {} 回 {:.1} ms\n", ns[0], ns[1], ns[2], ns[3], ns[4], fw[0], fw[1] as f64 / 1e6));
     let wf: Vec<u64> = crate::vm::WRITE_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));
+    let fa: Vec<u64> = crate::file::FAST_WRITE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("ファイルのロックなしの書きたし (ExtFs::fast_append、ext4 のロックで): {} (ふつうの道へ: ファイルの形 {} 書き出すころ {} extent がつづかない {} 見張りかほか {})\n", fa[0], fa[1], fa[2], fa[3], fa[4]));
     let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさ {} IN_ACCESS の見張り {} fd の表を分けている {} 開いたファイルを分けている {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})

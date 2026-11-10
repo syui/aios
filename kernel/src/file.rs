@@ -556,6 +556,37 @@ fn reuse_off(of: &mut OpenFile) {
 /// inotify.rs の count)
 pub static OPEN_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// 大きなロックなしの書きたし (fast_write_file と ExtFs::fast_append) の数: [0] 書いた、ふつうの道へ: [1] ファイルの形
+/// (大きさの終わりでない、ふつうのファイルでない、フラグ、inode がキャッシュにない)、[2] 書き出すころ、[3] 最後の extent の
+/// つづきにならない・ブロックがキャッシュにない (append_fits)、[4] 見張りか copy-append のあいだ、ほか。/proc/bkl に出す
+pub static FAST_WRITE: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// 大きなロックの中で O_APPEND の終わりを読んでから書くもの (splice.rs の copy-append) の数。0 でなければ大きなロックなしの
+/// 書きたし (Inode::fast_append) はふつうの道へ (読んだ終わりのあとに書きたされると、その上に書いてしまう)
+pub static SLOW_APPENDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// SLOW_APPENDS を持つしるし (落とすと引く)。足してから ext4 のロックをひとりで取って放し、いま書きたしているものが
+/// 出るのを待つ (書きたしは ext4 のロックをいっしょに持ってから数を見る)。O_APPEND の終わりを読む前に
+pub struct SlowAppend(());
+
+impl SlowAppend {
+    pub fn new() -> SlowAppend {
+        SLOW_APPENDS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        drop(crate::smp::fs_lock());
+        SlowAppend(())
+    }
+}
+
+impl Drop for SlowAppend {
+    fn drop(&mut self) {
+        SLOW_APPENDS.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// IN_MODIFY を待つ見張りの数 (大きなロックなしの書きたし fast_write_file は、0 でなければふつうの道へ: できごとを出す。
+/// inotify.rs の count)
+pub static MODIFY_WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// 大きなロックなしの open / close の数: [0] 棚から開いた、[1] ない (ENOENT) と答えた、[2] 棚にしまった、
 /// ふつうの道へ: [3] statc の表にない・古い、[4] 棚になく、新しくも開けない、[5] 開けない形 (フラグ、fd の表、見張り)、
 /// [6] しまえない (分けている、ロック、棚がいっぱい)。[7] 棚になく、ext4 の名前と inode から新しく開いた。/proc/bkl に出す
@@ -1121,12 +1152,21 @@ impl OpenFile {
                 if src.is_empty() {
                     return Ok(0);
                 }
-                if append.unwrap_or(self.flags & O_APPEND != 0) {
+                let append = append.unwrap_or(self.flags & O_APPEND != 0);
+                if append {
                     self.offset = ino.meta().size as usize;
                 }
                 vfs::write_sealed(ino, self.offset, src.len())?;
                 vfs::drop_privs(ino)?;
-                let n = ino.write_at(self.offset, src)?;
+                // O_APPEND の書きはじめはファイルシステムが書くときに決める (大きなロックなしの書きたしが、そのあいだに
+                // 終わりを伸ばしているかもしれない)
+                let n = if append {
+                    let (n, at) = ino.write_append(src)?;
+                    self.offset = at;
+                    n
+                } else {
+                    ino.write_at(self.offset, src)?
+                };
                 self.offset += n;
                 crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_MODIFY);
                 Ok(n)
@@ -1969,6 +2009,41 @@ pub fn fast_pwrite(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) ->
         return None;
     }
     crate::vm::write_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)
+}
+
+/// 大きなロックなしの write (syscall::fast): ふつうのファイルの終わりへの書きたし (Inode::fast_append: ext4 の、最後の
+/// extent がそのまま伸びるもの)。fd の表が自分だけで、開いたファイルを持っているのが自分だけ (dup も fork もしていない:
+/// 位置を変えるので)、1 バイトから FAST_WRITE_MAX まで。中身はロックを取る前にカーネルの入れ物に写す (ページが写って
+/// いなければふつうの道へ)。O_DSYNC / O_SYNC / O_DIRECT、開いたときの LSM のラベルのあるもの (file_permission)、IN_MODIFY
+/// の見張りがあるとき (ふつうの道ができごとを出す)、わざとしくじらせる決まりのあるとき (fail.rs) は、ふつうの道へ
+// [lockless]
+pub fn fast_write_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
+    const FAST_WRITE_MAX: usize = 64 * 1024;
+    const O_DSYNC: u32 = 0o10000;
+    const O_DIRECT: u32 = 0o200000;
+    if len == 0 || len > FAST_WRITE_MAX || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) || MODIFY_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let files = me.files.as_ref().filter(|f| f.private())?;
+    let f = files.get().get(fd)?;
+    if Rc::strong_count(f) != 1 {
+        return None;
+    }
+    // 表も開いたファイルも自分だけなので、借りずに見て、位置を書く (ほかの大きなロックなしの道と同じ)
+    let of = unsafe { &mut *f.as_ptr() };
+    if !of.writable() || of.flags & (O_PATH | O_DSYNC | O_DIRECT) != 0 || of.label.is_some() {
+        return None;
+    }
+    let Kind::Inode(ino, _) = &of.kind else { return None };
+    let mut data = crate::heap::try_vec(len, false).ok()?;
+    if !me.pt().copy_in_nofault(va, &mut data) {
+        return None;
+    }
+    let off = if of.flags & O_APPEND != 0 { None } else { Some(of.offset) };
+    let (n, end) = ino.fast_append(off, &data)?;
+    FAST_WRITE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    of.offset = end;
+    Some(n as i64)
 }
 
 /// パイプ (key はその PipeCell の場所) で眠っているもの、poll / epoll で待っているものを起こす (大きなロックを持って)

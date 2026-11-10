@@ -266,6 +266,7 @@ static TOTAL: AtomicUsize = AtomicUsize::new(HEAP_SIZE);
 pub fn size() -> usize {
     TOTAL.load(Relaxed)
 }
+// [lockless]
 pub fn used() -> usize {
     USED.load(Relaxed)
 }

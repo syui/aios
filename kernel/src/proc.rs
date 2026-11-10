@@ -2500,6 +2500,7 @@ pub fn noio<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// 同じく dontcache の中か: 新しく読んだものをキャッシュに残さない (RWF_DONTCACHE。前からあったものは残る)
+// [lockless]
 pub fn dontcache_on() -> bool {
     cur().is_some_and(|i| procs()[i].dontcache > 0)
 }

@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
+TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -40,6 +40,9 @@ run)
     chosen | mmapcoh | rlock | pwfast | opencache | createrace | orphan) cmd="./$t $HOME /tmp" ;;
     # rcrace (大きなロックなしの munmap と open / close が同じ inode の Rc の数をさわらない) は 10 秒、tmpfs で
     rcrace) cmd="./$t 10 /tmp" ;;
+    # appendrace (大きなロックなしの書きたし: 同じファイルと自分のファイルに書きたし、読む子がこわれを探す) は 5 秒ずつ、
+    # ext4 (ホーム) と tmpfs (/tmp) で
+    appendrace) cmd="./$t 5 $HOME /tmp" ;;
     # mountinfo (マウントの番号と st_dev のそろい方) も ext4 (ホーム) と tmpfs (/tmp) で
     mountinfo) cmd="./$t $HOME /tmp" ;;
     # statc (大きなロックなしの stat) は ext4 (ホーム) と tmpfs (/tmp) で。root でも (見る人をほかの人にして)

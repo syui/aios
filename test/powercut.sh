@@ -1,7 +1,8 @@
 #!/bin/sh
 # 書き出しのとちゅうで電源を抜いても ext4 がこわれないか (このマシンで。e2fsck と QEMU がいる)。
 #   test/powercut.sh [KERNEL] [N]   KERNEL (既定は aios.img のもの) で N 回 (既定 6):
-#   aios.img (前の名前 disk.img でも) の写しで起こし、test/bin/flushrace (sh test/vm-ctests.sh build で作る) を回して、起こしてから 7 秒、8 秒 ...
+#   aios.img (前の名前 disk.img でも) の写しで起こし、test/bin/flushrace (sh test/vm-ctests.sh build で作る。AIOS_POWERCUT_LOAD で
+#   ほかのものも) を回して、起こしてから 7 秒、8 秒 ...
 #   たったところで QEMU を SIGKILL する (test/vm.py stop は中で poweroff するので、電源を抜くことにならない)。
 #   書き終わっていない要求は書かれない。ディスクはおそくする (AIOS_DISK_OPTS、既定 throttling.iops-write=200) ので、
 #   書き出しのとちゅうで切れる。そのあと外からルートの区画を e2fsck -fy して、直したものが orphan の片づけと
@@ -11,6 +12,14 @@ cd "$(dirname "$0")/.." || exit 1
 k=${1:-}
 n=${2:-6}
 export AIOS_DISK_OPTS=${AIOS_DISK_OPTS:-throttling.iops-write=200}
+# 回すもの (AIOS_POWERCUT_LOAD): flushrace (既定: fsync と sync が眠って書くあいだの読み書き) か
+# appendrace (大きなロックなしの書きたし: test/appendrace.c)
+load=${AIOS_POWERCUT_LOAD:-flushrace}
+case $load in
+appendrace) run='mkdir -p ~/ar && /tmp/appendrace 60 ~/ar > /tmp/fr.out 2>&1' ;;
+flushrace) run='/tmp/flushrace -t 60 ~/fr > /tmp/fr.out 2>&1' ;;
+*) echo "powercut: unknown load $load" >&2; exit 1 ;;
+esac
 d=build/powercut
 src=aios.img
 [ -f $src ] || src=disk.img
@@ -26,8 +35,8 @@ while [ $i -le $n ]; do
   if ! AIOS_DISK=$d/aios.img AIOS_KERNEL=$k timeout 120 python3 test/vm.py start --www test > $d/start.log 2>&1; then
     echo "FAIL $i (start)"; fail=$((fail + 1)); python3 test/vm.py stop > /dev/null 2>&1; i=$((i + 1)); continue
   fi
-  python3 test/vm.py run 'fetch http://10.0.2.2:8000/bin/flushrace > /tmp/flushrace && chmod +x /tmp/flushrace' -t 30 > /dev/null 2>&1
-  python3 test/vm.py bg '/tmp/flushrace -t 60 ~/fr > /tmp/fr.out 2>&1' > /dev/null 2>&1
+  python3 test/vm.py run "fetch http://10.0.2.2:8000/bin/$load > /tmp/$load && chmod +x /tmp/$load" -t 30 > /dev/null 2>&1
+  python3 test/vm.py bg "$run" > /dev/null 2>&1
   sleep $((i + 6))
   # 電源を抜く
   q=$(pgrep -f "file=$d/aios.img")

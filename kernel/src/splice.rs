@@ -91,11 +91,13 @@ fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, fl
             }
             let mut pos = at_out.unwrap_or(fo.borrow().offset as i64);
             // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへも書く。位置がなければ write と同じく
-            // 終わりに足す
+            // 終わりに足す (書きおわるまで、大きなロックなしの書きたしを止めて: file::SlowAppend)
+            let mut _slow = None;
             if at_out.is_none()
                 && fo.borrow().flags & file::O_APPEND != 0
                 && let Some((io, _)) = inode_path(&fo)
             {
+                _slow = Some(file::SlowAppend::new());
                 pos = io.meta().size as i64;
             }
             verify_pos(pos, len)?;
@@ -324,7 +326,9 @@ fn copy_file_range(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: 
     // aios がえらんだちがい (copy-append): O_APPEND で開いたものへも写せる。位置をわたされたらそこへ (pwrite-append と
     // 同じ)、わたされなければ write と同じく終わりへ足す。Linux は EBADF (sendfile は EINVAL) で、写す人は read と
     // write でやりなおす。doc/aios.md の「aios がえらんだちがい」
+    let mut _slow = None;
     if fo.borrow().flags & file::O_APPEND != 0 && off_out == 0 {
+        _slow = Some(file::SlowAppend::new());
         pos_out = io.meta().size as i64;
     }
     let count = len as u64;
@@ -400,9 +404,14 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
     if !fo.borrow().writable() {
         return Err(-EBADF);
     }
-    // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへは、write と同じく終わりに足す
+    // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへは、write と同じく終わりに足す (書きおわるまで、
+    // 大きなロックなしの書きたしを止めて: file::SlowAppend)
+    let mut _slow = None;
     let out_pos = match &fo.borrow().kind {
-        Kind::Inode(io, _) if fo.borrow().flags & file::O_APPEND != 0 => io.meta().size as i64,
+        Kind::Inode(io, _) if fo.borrow().flags & file::O_APPEND != 0 => {
+            _slow = Some(file::SlowAppend::new());
+            io.meta().size as i64
+        }
         _ => fo.borrow().offset as i64,
     };
     // 両方のファイルの大きさの上限 (s_maxbytes) をこえるなら EOVERFLOW (読みはじめがもうこえているとき)、

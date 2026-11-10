@@ -213,6 +213,7 @@ impl PageCache {
     }
 
     /// ページを外したあとに: ファイルのページがもうなければ、版も
+    // [lockless]
     fn forget_if_empty(&mut self, id: (usize, u64)) {
         if self.pages.range((id.0, id.1, 0)..=(id.0, id.1, usize::MAX)).next().is_none() {
             self.vers.remove(&id);
@@ -232,6 +233,7 @@ impl PageCache {
 
 impl PrivPage {
     /// だれも写していない (参照が表 (とファイルシステム) だけ)
+    // [lockless]
     fn idle(&self) -> bool {
         kalloc::refs(self.page) <= 1 + self.owned as u16
     }
@@ -243,6 +245,7 @@ unsafe impl Send for PrivPage {}
 /// 表の大きさの目安: メモリの 1/4 (少なくとも 64 MiB)。Firefox の libxul (170 MB) のように、写されたままで
 /// 捨てられないページが多くても、読みなおしを繰りかえさないように。メモリが足りなくなったら、
 /// こことは別にスワップの側から捨てる (swap.rs)
+// [lockless]
 fn priv_max() -> usize {
     // 表は 1 枚につきヒープを 100 バイトほど使う (BTreeMap)。ヒープは決まった大きさなので、その 1/4 まで
     // (メモリの多いマシンでも、表がヒープを使いきらないように: 2 GiB で 340 MB ほど)
@@ -253,6 +256,7 @@ fn priv_max() -> usize {
 const PRIV_ENTRY_BYTES: usize = 96;
 
 /// ヒープがこれより混んでいたら、表に入れない (読んだページはそのまま使う)
+// [lockless]
 fn heap_crowded() -> bool {
     crate::heap::used() > crate::heap::size() / 4 * 3
 }
@@ -336,6 +340,7 @@ pub fn uncache(ino: &InodeRef, off: usize, len: usize) {
 }
 
 /// だれも写していないページを捨てる (n 枚まで)。捨てた数
+// [lockless]
 pub fn shrink_cache(n: usize) -> usize {
     let mut freed = Vec::new();
     {
@@ -403,6 +408,7 @@ pub fn file_changed(id: (usize, u64)) {
 
 /// ファイルシステムが id に書く前に (file_written とくみで。表にあるそのファイルのページが、みなファイルシステムの
 /// ページそのもの (owned) で、その場で書きかえるとき: ext4)。いま読みこんでいるものは表に入れない
+// [lockless]
 pub fn file_writing(id: (usize, u64)) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
     // 大きなロックなしの pwrite は、書きおわる (write_permit) まで待たせる: 同じところへの書きこみが、まざらないように
@@ -443,6 +449,7 @@ pub fn write_permit(id: (usize, u64), sec: u64) {
     }
 }
 
+// [lockless]
 pub fn write_permit_drop(id: (usize, u64)) {
     let _w = write_lock(id);
     let mut c = PRIV.lock();
@@ -608,6 +615,7 @@ pub fn take_written(fs: usize) -> Vec<(u64, usize, *mut u8)> {
 /// (その場で書きかわった)、版を ver (書いたあとの更新時刻と大きさ) に。pages (書いたページの (番号, ファイルシステムの
 /// ページ)。参照をひとつずつ持ったもの) も表に入れる: Linux と同じく、書いたものはページキャッシュにある (書いて
 /// すぐ読むとき、ファイルシステムを引きなおさない)。表がいっぱいか、RWF_DONTCACHE なら入れない
+// [lockless]
 pub fn file_written(id: (usize, u64), ver: (u64, u64), first: usize, last: usize, pages: Vec<(usize, *mut u8)>) {
     CHANGES.fetch_add(1, Ordering::SeqCst);
     // その場で書きかえただけ (書いたページはどれも、もう表にあるファイルシステムのページそのもので、版も同じ。
@@ -685,6 +693,7 @@ pub fn file_written(id: (usize, u64), ver: (u64, u64), first: usize, last: usize
 }
 
 /// 表に入れる前に: 上限をこえていたら、だれも写していないものを捨てる。ヒープが混んでいて入れられなければ false
+// [lockless]
 fn make_room() -> bool {
     let max = priv_max();
     if PRIV.lock().pages.len() >= max.max(NEXT_SHRINK.load(Ordering::Relaxed)) {

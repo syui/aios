@@ -41,7 +41,7 @@ EXTERNAL = {
     "div_ceil", "trailing_zeros", "leading_zeros", "count_ones", "rotate_left", "wrapping_mul", "pow", "abs", "signum",
     "add", "sub", "set", "replace", "or_else", "or", "and", "xor", "not", "neg", "index", "index_mut", "write_bytes",
     "read_volatile", "write_volatile", "spin_loop", "fence", "from_raw_parts", "from_raw_parts_mut", "get_unchecked",
-    "is_null", "null_mut", "null", "offset", "byte_add", "collect", "sort", "sort_by", "sort_by_key", "dedup", "split_off", "clone", "uninit", "zeroed", "into_iter", "extend_from_slice",
+    "is_null", "null_mut", "null", "offset", "byte_add", "collect", "sort", "sort_by", "sort_by_key", "dedup", "split_off", "clone", "uninit", "zeroed", "into_iter", "extend_from_slice", "upgrade", "downgrade",
 }
 # Rc と Weak の数を変えるもの
 RC_OPS = re.compile(r"\.clone\(\)|\bRc::new\(|\bRc::clone\(|\bRc::downgrade\(|\.upgrade\(\)|\bWeak::new\(")

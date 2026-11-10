@@ -76,7 +76,7 @@ pub static INOTIFY_MAX_WATCHES: core::sync::atomic::AtomicUsize = core::sync::at
 const NAME_BITS: u32 = IN_CREATE | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF;
 const OPEN_BITS: u32 = IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
 
-/// 見張り 1 つ (mask) のぶん、ACCESS_WATCHED、NAME_WATCHED、file::OPEN_WATCHED を足す (add) か引く。前は「一度でも置かれた」の
+/// 見張り 1 つ (mask) のぶん、ACCESS_WATCHED、NAME_WATCHED、file::OPEN_WATCHED、file::MODIFY_WATCHED を足す (add) か引く。前は「一度でも置かれた」の
 /// 印で、見張りを外しても inotify を閉じても、大きなロックなしの道は切れたままだった (先に inotify を使ったテストのあとで、
 /// test/createrace.c の fast-path が落ちた)。足すのは見張りを置く前、引くのは外したあと。数なので、大きなロックの外で
 /// inotify が捨てられても (Drop) よい
@@ -94,6 +94,7 @@ fn count(mask: u32, add: bool) {
     f(&ACCESS_WATCHED, IN_ACCESS);
     f(&NAME_WATCHED, NAME_BITS);
     f(&crate::file::OPEN_WATCHED, OPEN_BITS);
+    f(&crate::file::MODIFY_WATCHED, IN_MODIFY);
 }
 
 impl Drop for Inotify {

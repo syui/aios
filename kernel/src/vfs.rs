@@ -94,6 +94,12 @@ pub trait Inode {
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64>;
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64>;
+    /// O_APPEND の write: いまの終わりから書く。答えは (書いた数, 書きはじめ)。大きなロックなしで書きたせるもの (ext4 の
+    /// fast_append) は、終わりを読むのと書くのを、書きたしと同じロックの中で (Linux の generic_write_checks は i_rwsem の中)
+    fn write_append(&self, buf: &[u8]) -> Result<(usize, usize), i64> {
+        let off = self.meta().size as usize;
+        self.write_at(off, buf).map(|n| (n, off))
+    }
     /// read をページキャッシュ (vm.rs) を通してよいか: 中身が変わるときにかならず vm::file_changed を呼ぶ
     /// ファイルシステム (ext4) のもの。procfs のように読むたびに作るものは false
     /// posix_fadvise の DONTNEED: off から len バイト (0 なら終わりまで) の、まだ書いていないキャッシュを外す
@@ -129,6 +135,14 @@ pub trait Inode {
     /// (ふつうの道で)。ext4 だけ (tmpfs の inode はそれ 1 つしかない)
     // [lockless]
     fn fast_dup(&self) -> Option<(InodeRef, Meta)> {
+        None
+    }
+
+    /// 大きなロックなしの write (file::fast_write_file) から: off (None は O_APPEND: いまの終わり) がファイルの終わりのとき、
+    /// buf を書きたす。(書いた数, 書いたあとの位置)。ふつうの道と同じ答えになるときだけ (ext4 だけ)。ほかは None
+    /// (なにも変えずに: ふつうの道が書く)
+    // [lockless]
+    fn fast_append(&self, _off: Option<usize>, _buf: &[u8]) -> Option<(usize, usize)> {
         None
     }
 

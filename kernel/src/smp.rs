@@ -676,6 +676,7 @@ pub fn dev_wait(i: usize, t0: u64) {
 }
 
 /// この CPU がロックを持っているか
+// [lockless]
 pub fn holding() -> bool {
     BKL.load(Ordering::Relaxed) == id() + 1
 }

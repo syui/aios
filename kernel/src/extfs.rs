@@ -105,11 +105,29 @@ impl Drop for BookGuard {
     }
 }
 
-/// この CPU が ext4 のロックをいっしょに持っている (そのあいだは、ブロックのキャッシュの表に足したり捨てたりしない:
-/// 足すのはディスクを読むとき、捨てるのはブロックを返すときで、どちらもひとりで持つときだけ)
+/// この CPU が ext4 のロックをいっしょに持っている (そのあいだは、ブロックのキャッシュの表から捨てない。足すのは
+/// 大きなロックなしの書きたし (fast_append) が新しくとったブロックだけで、map_edit の中で)
 // [lockless]
 fn shared_here() -> bool {
     crate::smp::fs_shared_here()
+}
+
+/// いっしょに持つものが、ブロックのキャッシュの表 (Cache::map) を帳簿のロックなしで引いている数 (shared_lookup) と、
+/// 表を変えている印 (map_edit)。表は BTreeMap なので、変えているあいだに引くと、外した節をたどる
+static MAP_READERS: AtomicUsize = AtomicUsize::new(0);
+static MAP_EDIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// いっしょに持っているあいだに表を変える (fast_append の新しいブロック。帳簿のロック BOOK の中で: 変えるのは 1 人):
+/// 引いている人が出るのを待ち、終わるまで新しく引かせない
+// [lockless]
+fn map_edit<T>(f: impl FnOnce() -> T) -> T {
+    MAP_EDIT.store(true, Ordering::SeqCst);
+    while MAP_READERS.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
+    let r = f();
+    MAP_EDIT.store(false, Ordering::SeqCst);
+    r
 }
 
 
@@ -260,6 +278,8 @@ const BG_BLOCK_UNINIT: u16 = 0x2;
 
 const EXT_MAGIC: u16 = 0xf30a;
 const EXT_INIT_MAX_LEN: u32 = 32768;
+/// 大きなロックなしの書きたし (ExtFs::fast_append) の 1 回の長さの上限 (ふつうの道が 1 度に写す CHUNK と同じ)
+const FAST_APPEND_MAX: usize = 64 * 1024;
 /// ディレクトリブロックの末尾にある、チェックサム用の偽のエントリ
 const DIR_TAIL: usize = 12;
 const DIR_TAIL_FT: u8 = 0xde;
@@ -889,9 +909,11 @@ fn first_one(d: &[u8], start: u32, n: u32) -> u32 {
 }
 
 /// ビットマップ d の start..n で、空いていて held (はじめと終わりの次。並んでいて重ならない) でもないつづき:
-/// want こつづいた最初のもの (はじめ, 長さ)。なければ見つかったうちでいちばん長いもの
+/// want こつづいた最初のもの (はじめ, 長さ)。なければ見つかったうちでいちばん長いもの。align なら、はじめが want の
+/// 倍のところだけ (Linux の mballoc の buddy が 2 のべきの大きさを、そのべきにそろえてとるのと同じ: ほかのファイルの
+/// extent のすぐあとから取ると、そのファイルの次の 1 ブロックを取ってしまい、書きたしのたびにとりあいになる)
 // [lockless]
-fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)]) -> Option<(u32, u32)> {
+fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)], align: bool) -> Option<(u32, u32)> {
     let mut best: Option<(u32, u32)> = None;
     let mut from = start;
     while let Some(bit) = first_zero(d, from, n) {
@@ -899,6 +921,10 @@ fn free_run(d: &[u8], start: u32, n: u32, want: u32, held: &[(u32, u32)]) -> Opt
         let i = held.partition_point(|&(s, _)| s <= bit);
         if i > 0 && bit < held[i - 1].1 {
             from = held[i - 1].1;
+            continue;
+        }
+        if align && bit % want != 0 {
+            from = bit.next_multiple_of(want);
             continue;
         }
         // つづきは、次の使っているビットか、次の held のはじめまで (want こあればそこまで見ればよい)
@@ -1281,10 +1307,15 @@ impl ExtFs {
     /// 持っていれば (vm::adopt_hole)、そのページをこのブロックのページにする (写している人にそのまま映る)
     // [lockless]
     fn with_block_new_adopt<T>(&self, b: u64, adopt: Option<(u32, u64)>, f: impl FnOnce(&mut [u8]) -> T) -> Result<T, i64> {
+        // 写しの表は大きなロックのもの。大きなロックなしの書きたし (fast_append) がとるのは終わりの先のブロックだけで、
+        // 終わりの先は写せない (SIGBUS。切りつめたところは drop_file_pages が外す) ので、引きとる穴のページはない
         let adopted = match adopt {
-            Some((ino, lb)) if self.bsize == PGSIZE => crate::vm::adopt_hole((self.fs, ino as u64), lb as usize),
+            Some((ino, lb)) if self.bsize == PGSIZE && crate::smp::holding() => crate::vm::adopt_hole((self.fs, ino as u64), lb as usize),
             _ => None,
         };
+        // いっしょに持っているとき (fast_append の新しいブロック) は、表に足すのを map_edit の中で。捨てない (ほかの CPU が
+        // 引いたページを使っているかもしれない: 表が大きくなりすぎたぶんは、ひとりで持つものが次に足すときに捨てる)
+        let shared = shared_here();
         let mut c = self.cache.borrow_mut();
         let have = c.map.get(&b).copied();
         let page = match (have, adopted) {
@@ -1298,16 +1329,20 @@ impl ExtFs {
             }
             (Some(p), None) => p,
             (None, None) => {
-                if c.map.len() >= cache_limit(self.bsize) {
+                if !shared && c.map.len() >= cache_limit(self.bsize) {
                     c.evict_one();
                 }
                 // kalloc::alloc が 0 にしたページ
                 let p = match kalloc::alloc() {
                     Some(p) => p,
-                    None if c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
+                    None if !shared && c.evict_one() => kalloc::alloc().ok_or(-ENOSPC)?,
                     None => return Err(-ENOSPC),
                 };
-                c.map.insert(b, p);
+                if shared {
+                    map_edit(|| c.map.insert(b, p));
+                } else {
+                    c.map.insert(b, p);
+                }
                 c.order.push_back(b);
                 p
             }
@@ -1326,6 +1361,7 @@ impl ExtFs {
     /// ファイル ino を size から upto まで伸ばす: 終わりのブロックの、size からそのブロックの終わり (upto まで) を 0 に
     /// (キャッシュにあるときだけ: 写しで終わりの先に書いたものを消す。Linux の pagecache_isize_extended。キャッシュに
     /// なければ、ディスクの上はもう 0: 切りつめと書き出しが 0 にしている)
+    // [lockless]
     fn zero_gap(&self, ino: u32, r: &mut Raw, size: usize, upto: usize) {
         let bs = self.bsize;
         if size % bs == 0 || upto <= size {
@@ -1414,7 +1450,20 @@ impl ExtFs {
     /// 書く Cache のほかの欄にはさわらない)
     // [lockless]
     fn shared_lookup(&self, b: u64) -> Option<*mut u8> {
-        unsafe { (*core::ptr::addr_of!((*self.cache.0.as_ptr()).map)).get(&b).copied() }
+        // 表を変えている (map_edit) あいだは待つ。数を足してから印を見る (map_edit は印を立ててから数を見る)
+        loop {
+            MAP_READERS.fetch_add(1, Ordering::SeqCst);
+            if !MAP_EDIT.load(Ordering::SeqCst) {
+                break;
+            }
+            MAP_READERS.fetch_sub(1, Ordering::SeqCst);
+            while MAP_EDIT.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+        let p = unsafe { (*core::ptr::addr_of!((*self.cache.0.as_ptr()).map)).get(&b).copied() };
+        MAP_READERS.fetch_sub(1, Ordering::SeqCst);
+        p
     }
 
     // [lockless]
@@ -1792,6 +1841,8 @@ impl ExtFs {
         let goal = goal.clamp(self.first_data_block, self.blocks_count() - 1);
         let gg = ((goal - self.first_data_block) / self.bpg as u64) as u32;
         if want > 1 {
+            // 2 のべき (書きたすファイルの大きさにあわせたもの) なら、そのべきにそろえたところから
+            let align = want.is_power_of_two() && want <= self.bpg;
             let gbit = (goal - self.group_start(gg)) as u32;
             let mut best: Option<(u32, u32, u32)> = None;
             let mut looked = 0;
@@ -1810,17 +1861,17 @@ impl ExtFs {
                 let bm = self.block_bitmap(g);
                 let found = self.with_block(bm, |d| {
                     if k > 0 {
-                        return free_run(d, 0, n, want, &held);
+                        return free_run(d, 0, n, want, &held, align);
                     }
                     // goal そのものが空いていれば、それ (いまの extent がそのまま伸びる)
-                    if let Some(r) = free_run(d, gbit, (gbit + 1).min(n), 1, &held) {
+                    if let Some(r) = free_run(d, gbit, (gbit + 1).min(n), 1, &held, false) {
                         return Some((r.0, want));
                     }
-                    let a = free_run(d, gbit, n, want, &held);
+                    let a = free_run(d, gbit, n, want, &held, align);
                     if a.is_some_and(|a| a.1 >= want) || gbit == 0 {
                         return a;
                     }
-                    let b = free_run(d, 0, gbit, want, &held);
+                    let b = free_run(d, 0, gbit, want, &held, align);
                     if b.is_some_and(|b| a.is_none_or(|a| b.1 > a.1)) { b } else { a }
                 })?;
                 match found {
@@ -1882,8 +1933,18 @@ impl ExtFs {
         let b = self.group_start(g) + bit as u64;
         // 新しいブロックはゼロから (ディスクの古い中身は読まない)。ファイルの中身に使うなら
         // write_data が中身のブロックに付けかえる。先読みで覚えていた古い中身があれば捨ててから (with_block_new は
-        // 覚えていないブロックに 0 のページをとる: 0 にするのは kalloc::alloc の 1 度だけ)
-        self.cache.borrow_mut().forget(b);
+        // 覚えていないブロックに 0 のページをとる: 0 にするのは kalloc::alloc の 1 度だけ)。いっしょに持っているときは
+        // map_edit の中で (空いていたブロックなので、ほかの CPU はそのページを使っていない)
+        {
+            let mut c = self.cache.borrow_mut();
+            if shared_here() {
+                if c.map.contains_key(&b) {
+                    map_edit(|| c.forget(b));
+                }
+            } else {
+                c.forget(b);
+            }
+        }
         self.with_block_new(b, |_| ())?;
         let mut c = self.cache.borrow_mut();
         c.data.remove(&b);
@@ -2543,7 +2604,7 @@ impl ExtFs {
             // くらいつづいた空きをさがす (書き足していくファイルは、extent が 2 倍ずつ長いものになる)
             let goal = match lb.checked_sub(1).map(|l| self.ext_find(r, l)) {
                 Some(Ok(prev)) if prev != 0 => prev + 1,
-                _ => self.group_start(self.group_of(ino)),
+                _ => self.file_goal(ino),
             };
             let b = self.alloc_block_run(goal, (lb + 1).next_power_of_two().min(RUN_MAX) as u32)?;
             let per = (self.bsize / 512) as i64;
@@ -2556,6 +2617,19 @@ impl ExtFs {
             return Ok(b);
         }
         self.bmap(ino, r, lb, alloc)
+    }
+
+    /// ファイルのはじめのブロックの goal: inode のグループの中を 16 に分けた、プロセスごとのところ (Linux の
+    /// ext4_inode_to_goal_block の colour。Linux は delalloc なら書き出すときにまとめてとるので colour なし、aios は
+    /// delalloc がないので nodelalloc と同じ)。同じディレクトリのファイルに、いくつものプロセスが同時に書きたしても、
+    /// たがいの extent のすぐあとをとりあって細切れにならない (大きなロックなしの書きたし fast_append は、最後の extent が
+    /// そのまま伸びるときだけ)
+    // [lockless]
+    fn file_goal(&self, ino: u32) -> u64 {
+        let start = self.group_start(self.group_of(ino));
+        let last = self.blocks_count() - 1;
+        let span = if start + self.bpg as u64 <= last { self.bpg as u64 } else { last - start };
+        start + crate::proc::try_current().map_or(0, |p| p.pid as u64) % 16 * (span / 16)
     }
 
     // ---- 直接/間接ブロック (ext2) ----
@@ -3305,6 +3379,7 @@ impl ExtFs {
 
     /// pages があれば、書いたブロックの (ファイルのブロックの番号, ブロック, ページ) を入れる (参照をひとつ足して:
     /// ページキャッシュに入れる。vm::file_written)
+    // [lockless]
     fn write_data(&self, ino: u32, r: &mut Raw, off: usize, buf: &[u8], mut pages: Option<&mut Vec<(u64, u64, *mut u8)>>) -> Result<usize, i64> {
         let mut done = 0;
         // 終わりの先から書く: 終わりとのあいだ (終わりのブロックの中) を 0 に (写しで書いたものがあれば消える)
@@ -3777,6 +3852,159 @@ impl ExtFs {
         self.writing.dec();
         self.wgen.inc();
         r
+    }
+
+    /// 大きなロックなしの write の書きたし (file::fast_write_file。ext4 のロックをいっしょに持って): ふつうのファイル ino の
+    /// 終わり (off が None なら O_APPEND で、いまの終わり。Some ならそれが終わりのときだけ) から buf を書く。ふつうの道
+    /// (ExtInode::write_at の write_data と write_inode) と同じ書きかたで、同じ答えになるときだけ。書きかえる前にみな確かめ
+    /// (append_fits: 最後の extent のすぐあとが空いていて extent がそのまま伸びる、読むブロックがみなキャッシュにある。
+    /// ほかに、ふつうのファイルで setuid / setgid がない、書き出すころでない、スワップファイルでない)、どれかがだめなら
+    /// 何も変えずに None (ふつうの道へ)。答えは (書いた数, 書いたあとの位置)。同じ inode の書きたしは 1 つずつ (dir_lock を
+    /// inode の番号で: Linux の i_rwsem)。ブロックをとるところは ALLOC の中で (fast_create の inode と同じ)
+    // [lockless]
+    pub fn fast_append(&self, ino: u32, off: Option<usize>, buf: &[u8]) -> Option<(usize, usize)> {
+        let refuse = |i: usize| -> Option<(usize, usize)> {
+            crate::file::FAST_WRITE[i].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        if self.ro || buf.is_empty() || buf.len() > FAST_APPEND_MAX || self.bsize != PGSIZE || !self.extents {
+            return refuse(4);
+        }
+        if self.flush_due() {
+            return refuse(2);
+        }
+        let _i = dir_lock(ino);
+        let id = (self.fs, ino as u64);
+        let Some(r) = crate::proc::noio(|| self.read_inode(ino).ok()) else { return refuse(1) };
+        let size = r.size() as usize;
+        let off = off.unwrap_or(size);
+        if r.mode() & S_IFMT != S_IFREG || r.mode() & 0o6000 != 0 || r.links() == 0 || off != size || r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) != 0 || r.flags() & EXTENTS_FL == 0 || !self.cached(self.inode_loc(ino).0) || self.swapfiles.borrow().contains(&ino) {
+            return refuse(1);
+        }
+        // ふつうの道の write_at と同じく、書く前に: 大きなロックなしの pwrite (vm::write_fast) の許しを落とし、ページ
+        // キャッシュに書きかわることを知らせる
+        crate::vm::file_writing(id);
+        let done = crate::proc::noio(|| {
+            let a = ALLOC.take();
+            let Some((g, gbit, k)) = self.append_fits(&r, off, buf.len()) else {
+                crate::file::FAST_WRITE[3].fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            // ここから書きかえる (読むブロックはみなキャッシュにあり、とるブロックは空いているので、しくじらない)
+            self.fast_write(|| {
+                // lockless-ok: r は inode のバイトの写し (Rc ではない)
+                let mut r = r.clone();
+                // ブロックをとるところ (ビットマップと数) だけ ALLOC の中で (fast_create の inode と同じ)。とったブロックは
+                // ゼロのページでキャッシュにある (took)。map と同じく、i_blocks を足して最後の extent を伸ばす。あとは
+                // この inode だけのもの (dir_lock) なので、ほかの書きたしや作る・消すといっしょに進む
+                let nb = (off as u64).div_ceil(self.bsize as u64);
+                let per = (self.bsize / 512) as i64;
+                let mut took = Ok(());
+                for i in 0..k {
+                    took = self.take_bit(g, gbit + i).and_then(|b| {
+                        r.add_blocks512(per, self.bsize);
+                        self.ext_insert(ino, &mut r, (nb + i as u64) as u32, b)
+                    });
+                    if took.is_err() {
+                        break;
+                    }
+                }
+                drop(a);
+                // しくじっても inode は書く (とったブロックと伸ばした extent をそろえる)
+                let n = took.map_err(|e| ("taking blocks", e)).and_then(|_| self.write_data(ino, &mut r, off, buf, None).map_err(|e| ("writing data", e)));
+                match (n, self.write_inode(ino, &r)) {
+                    (Ok(n), Ok(())) if n > 0 => Some((n, meta_of(ino, &r, self.bsize))),
+                    (n, w) => {
+                        let (at, e) = match (n, w) {
+                            (Err(x), _) => x,
+                            (_, Err(e)) => ("writing the inode", e),
+                            _ => ("writing data", 0),
+                        };
+                        println!("extfs: fast append to inode {} broke off {} ({})", ino, at, e);
+                        None
+                    }
+                }
+            })
+        });
+        // 書いたところ (前の終わりから): ページキャッシュの印と版 (write_at の file_written と同じ。ページは写さない)
+        let end = off + done.as_ref().map_or(0, |d| d.0);
+        let ver = done.as_ref().map_or_else(|| crate::vm::meta_ver(&meta_of(ino, &r, self.bsize)), |d| crate::vm::meta_ver(&d.1));
+        crate::vm::file_written(id, ver, off / PGSIZE, end.max(off + 1).div_ceil(PGSIZE) - 1, Vec::new());
+        done.map(|(n, _)| (n, off + n))
+    }
+
+    /// fast_append の確かめ (ALLOC と noio の中で。何も変えない): r (いまの大きさが off) の終わりから len バイト書くのに、
+    /// 最後の extent (木が深ければ、いちばん後ろの葉の。たどる索引と葉がキャッシュにあること) が初期化ずみで終わりの
+    /// ブロックで終わり、そのまま伸ばせて (32768 まで)、すぐあとの物理ブロックが同じグループでみな空いていて、放した
+    /// ばかり (held) でなく、そのビットマップと、書きはじめのブロック (ブロックの途中から書くなら) がキャッシュにあること。
+    /// write_data の map がとる goal (前のブロックの隣) がみな空いているので、ほかを探さない (ほかのグループのビットマップを
+    /// 読まない)。extent は根か葉の上でその場で伸びる (ext_insert: 葉なら ext_extend_leaf。新しい葉や索引はとらない)。
+    /// 未初期化の extent、先にとってあるブロック、空のファイル (extent がない) はふつうの道
+    /// 答えは、とるブロックのグループと、その中のはじめのビットと、数 (0 なら終わりのブロックの中だけ)
+    // [lockless]
+    fn append_fits(&self, r: &Raw, off: usize, len: usize) -> Option<(u32, u32, u32)> {
+        let bs = self.bsize as u64;
+        let root = &r.0[40..100];
+        let (n, depth) = (u16_at(root, 2) as usize, u16_at(root, 6));
+        if u16_at(root, 0) != EXT_MAGIC || n == 0 || n > 4 || depth > 4 {
+            return None;
+        }
+        // 最後の extent: 根から、いちばん後ろの子をたどった葉の、いちばん後ろのもの (書きたすところはどのキーよりもあと
+        // なので、ext_extend_leaf が伸ばす葉と同じ)。たどるブロックはみなキャッシュにあること
+        let mut e = [0u8; 12];
+        e.copy_from_slice(&root[12 + (n - 1) * 12..24 + (n - 1) * 12]);
+        for level in (0..depth).rev() {
+            let b = ExtFs::ext_index_child(&e);
+            if !self.cached(b) {
+                return None;
+            }
+            let last = self.with_block(b, |d| {
+                let m = u16_at(d, 2) as usize;
+                (u16_at(d, 0) == EXT_MAGIC && u16_at(d, 6) == level && m > 0).then(|| {
+                    let mut x = [0u8; 12];
+                    x.copy_from_slice(&d[12 + (m - 1) * 12..24 + (m - 1) * 12]);
+                    x
+                })
+            });
+            match last {
+                Ok(Some(x)) => e = x,
+                _ => return None,
+            }
+        }
+        let e = &e[..];
+        let (eb, elen) = (u32_at(e, 0) as u64, u16_at(e, 4) as u32);
+        if elen == 0 || elen > EXT_INIT_MAX_LEN {
+            return None;
+        }
+        let start = ExtFs::ext_leaf_start(e);
+        let nblocks = (off as u64).div_ceil(bs);
+        if eb + elen as u64 != nblocks {
+            return None;
+        }
+        if off as u64 % bs != 0 && !self.cached(start + elen as u64 - 1) {
+            return None;
+        }
+        let end_fb = (off + len - 1) as u64 / bs;
+        let k = (end_fb + 1).saturating_sub(nblocks) as u32;
+        if k == 0 {
+            return Some((0, 0, 0));
+        }
+        let goal = start + elen as u64;
+        if elen + k > EXT_INIT_MAX_LEN || goal < self.first_data_block || goal + k as u64 > self.blocks_count() {
+            return None;
+        }
+        let g = ((goal - self.first_data_block) / self.bpg as u64) as u32;
+        let (gs, gn) = (self.group_start(g), self.blocks_in_group(g));
+        let gbit = (goal - gs) as u32;
+        if gbit + k > gn || self.gd_cnt(g, 0xc, 0x2c) < k || self.gd_flags(g) & BG_BLOCK_UNINIT != 0 {
+            return None;
+        }
+        let bm = self.block_bitmap(g);
+        if !self.cached(bm) || self.held_in(gs, gn).iter().any(|&(s, e)| s <= gbit + k && gbit <= e) {
+            return None;
+        }
+        let free = self.with_block(bm, |d| (gbit..gbit + k).all(|b| d[(b / 8) as usize] & (1 << (b % 8)) == 0)).ok()?;
+        free.then_some((g, gbit, k))
     }
 
     /// 大きなロックなしの O_CREAT の openat (fastdir.rs。ext4 のロックを持って): ディレクトリ dir に name を、mode (umask の
@@ -4524,6 +4752,83 @@ impl ExtInode {
         }
         Ok(())
     }
+
+    /// write_at と write_append (off が None: 書きはじめは ext4 のロックの中で読んだ終わり。Linux の generic_write_checks が
+    /// i_rwsem の中で O_APPEND の位置を決めるのと同じ)。答えは (書いた数, 書きはじめ)
+    fn write_impl(&self, off: Option<usize>, buf: &[u8]) -> Result<(usize, usize), i64> {
+        let _e = fs_lock();
+        let _p = crate::prof::span("extfs:write");
+        // 中身が変わる。ブロックが 1 ページなら、ページキャッシュ (vm.rs) のページはブロックのキャッシュのページそのもので、
+        // その場で書きかわる: そのまま版をあたらしくし、書いたページも入れる (Linux と同じく、書いたものはページキャッシュに
+        // ある)。でなければ (読んだ写し)、書く前と後に捨てる (書いているあいだに読まれたものも)
+        let id = self.id();
+        let in_place = self.fs.bsize == PGSIZE;
+        if in_place {
+            crate::vm::file_writing(id);
+        } else {
+            crate::vm::file_changed(id);
+        }
+        let mut pages = Vec::new();
+        let mut size0 = 0;
+        // 書いたあとの inode が、この秒のうちの書きかえで変わらないもの (時刻は秒まで、setuid / setgid なし) なら、その秒
+        let mut quiet = None;
+        // 書きはじめ (O_APPEND なら、ext4 のロックの中で読んだ終わり: 大きなロックなしの書きたしとかさならない)
+        let mut at = off.unwrap_or(0);
+        let r = self.not_swapfile().and_then(|_| self.write_op(|| {
+            let mut r = self.raw()?;
+            match r.mode() & S_IFMT {
+                S_IFREG => {}
+                S_IFDIR => return Err(-EISDIR),
+                _ => return Err(crate::why::inval()),
+            }
+            size0 = r.size() as usize;
+            at = off.unwrap_or(size0);
+            let before = r.clone();
+            let res = self.fs.write_data(self.ino, &mut r, at, buf, in_place.then_some(&mut pages));
+            // inode が 1 バイトも変わらなければ (同じ秒の中で、大きさもブロックの場所も変わらない書きかえ) 書かない:
+            // 書くと inode のブロックをジャーナルに入れ、meta の覚え (と stat の覚え、statc.rs) を捨てて読みなおすことになる。
+            // Linux も時刻が変わったときだけ inode を書く (file_update_time、inode_needs_update_time)
+            if r.0 != before.0 {
+                self.fs.write_inode(self.ino, &r)?;
+            }
+            let (ctime, mtime) = (u32_at(&r.0, 12), u32_at(&r.0, 16));
+            if res.is_ok() && r.mode() & 0o6000 == 0 && r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) == 0 && ctime == mtime {
+                quiet = Some(mtime as u64);
+            }
+            res
+        }));
+        if in_place {
+            // まだブロックのキャッシュのページそのものか (書いたあとの flush のあいだに捨てられていないか)
+            let pages: Vec<(usize, *mut u8)> = {
+                let c = self.fs.cache.borrow();
+                pages
+                    .into_iter()
+                    .filter_map(|(lb, b, p)| {
+                        if c.map.get(&b) == Some(&p) {
+                            Some((lb as usize, p))
+                        } else {
+                            kalloc::put(p);
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            // 書きかわったところ: 終わりの先から書いたなら、もとの終わりから (zero_gap が 0 にする)
+            let (first, end) = (at.min(size0) / PGSIZE, (at + buf.len()).div_ceil(PGSIZE));
+            crate::vm::file_written(id, crate::vm::meta_ver(&self.meta()), first, end.saturating_sub(1), pages);
+            // この秒のうちに、いまの大きさの中を書きかえるだけなら、大きなロックなしで書いてよい (vm::write_fast)。
+            // IN_MODIFY を見張っているもの (ふつうの道ができごとを出す) や RWF_DONTCACHE があるときはしない
+            if let (Ok(_), Some(sec)) = (&r, quiet)
+                && !crate::proc::dontcache_on()
+                && !crate::vfs::notify::modify_watched()
+            {
+                crate::vm::write_permit(id, sec);
+            }
+        } else {
+            crate::vm::file_changed(id);
+        }
+        r.map(|n| (n, at))
+    }
 }
 
 impl Inode for ExtInode {
@@ -4585,6 +4890,20 @@ impl Inode for ExtInode {
         let _e = fs_lock_shared();
         let m = crate::proc::noio(|| self.fs.meta_now(self.ino))?;
         Some((ExtInode::make(&self.fs, self.ino), m))
+    }
+
+    /// 書きたし (ExtFs::fast_append)。作る・消すの fastdir と同じく ext4 のロックをいっしょに持って。IN_MODIFY の見張りの
+    /// 数と、終わりを読んでから書くもの (file::SlowAppend) の数はロックを取ってから見る (どちらも数を足してから ext4 の
+    /// ロックをひとりで取り、いっしょに持っているものが終わるのを待つ: あとから来るものはふつうの道へ)。O_APPEND の
+    /// write のふつうの道は、ext4 のロックの中で終わりを読む (write_append) ので、かさならない
+    // [lockless]
+    fn fast_append(&self, off: Option<usize>, buf: &[u8]) -> Option<(usize, usize)> {
+        let _e = fs_lock_shared();
+        if crate::file::MODIFY_WATCHED.load(Ordering::SeqCst) != 0 || crate::file::SLOW_APPENDS.load(Ordering::SeqCst) != 0 {
+            crate::file::FAST_WRITE[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.fs.fast_append(self.ino, off, buf)
     }
 
     fn path_cacheable(&self) -> bool {
@@ -4734,75 +5053,11 @@ impl Inode for ExtInode {
     }
 
     fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, i64> {
-        let _e = fs_lock();
-        let _p = crate::prof::span("extfs:write");
-        // 中身が変わる。ブロックが 1 ページなら、ページキャッシュ (vm.rs) のページはブロックのキャッシュのページそのもので、
-        // その場で書きかわる: そのまま版をあたらしくし、書いたページも入れる (Linux と同じく、書いたものはページキャッシュに
-        // ある)。でなければ (読んだ写し)、書く前と後に捨てる (書いているあいだに読まれたものも)
-        let id = self.id();
-        let in_place = self.fs.bsize == PGSIZE;
-        if in_place {
-            crate::vm::file_writing(id);
-        } else {
-            crate::vm::file_changed(id);
-        }
-        let mut pages = Vec::new();
-        let mut size0 = 0;
-        // 書いたあとの inode が、この秒のうちの書きかえで変わらないもの (時刻は秒まで、setuid / setgid なし) なら、その秒
-        let mut quiet = None;
-        let r = self.not_swapfile().and_then(|_| self.write_op(|| {
-            let mut r = self.raw()?;
-            match r.mode() & S_IFMT {
-                S_IFREG => {}
-                S_IFDIR => return Err(-EISDIR),
-                _ => return Err(crate::why::inval()),
-            }
-            size0 = r.size() as usize;
-            let before = r.clone();
-            let res = self.fs.write_data(self.ino, &mut r, off, buf, in_place.then_some(&mut pages));
-            // inode が 1 バイトも変わらなければ (同じ秒の中で、大きさもブロックの場所も変わらない書きかえ) 書かない:
-            // 書くと inode のブロックをジャーナルに入れ、meta の覚え (と stat の覚え、statc.rs) を捨てて読みなおすことになる。
-            // Linux も時刻が変わったときだけ inode を書く (file_update_time、inode_needs_update_time)
-            if r.0 != before.0 {
-                self.fs.write_inode(self.ino, &r)?;
-            }
-            let (ctime, mtime) = (u32_at(&r.0, 12), u32_at(&r.0, 16));
-            if res.is_ok() && r.mode() & 0o6000 == 0 && r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) == 0 && ctime == mtime {
-                quiet = Some(mtime as u64);
-            }
-            res
-        }));
-        if in_place {
-            // まだブロックのキャッシュのページそのものか (書いたあとの flush のあいだに捨てられていないか)
-            let pages: Vec<(usize, *mut u8)> = {
-                let c = self.fs.cache.borrow();
-                pages
-                    .into_iter()
-                    .filter_map(|(lb, b, p)| {
-                        if c.map.get(&b) == Some(&p) {
-                            Some((lb as usize, p))
-                        } else {
-                            kalloc::put(p);
-                            None
-                        }
-                    })
-                    .collect()
-            };
-            // 書きかわったところ: 終わりの先から書いたなら、もとの終わりから (zero_gap が 0 にする)
-            let (first, end) = (off.min(size0) / PGSIZE, (off + buf.len()).div_ceil(PGSIZE));
-            crate::vm::file_written(id, crate::vm::meta_ver(&self.meta()), first, end.saturating_sub(1), pages);
-            // この秒のうちに、いまの大きさの中を書きかえるだけなら、大きなロックなしで書いてよい (vm::write_fast)。
-            // IN_MODIFY を見張っているもの (ふつうの道ができごとを出す) や RWF_DONTCACHE があるときはしない
-            if let (Ok(_), Some(sec)) = (&r, quiet)
-                && !crate::proc::dontcache_on()
-                && !crate::vfs::notify::modify_watched()
-            {
-                crate::vm::write_permit(id, sec);
-            }
-        } else {
-            crate::vm::file_changed(id);
-        }
-        r
+        self.write_impl(Some(off), buf).map(|(n, _)| n)
+    }
+
+    fn write_append(&self, buf: &[u8]) -> Result<(usize, usize), i64> {
+        self.write_impl(None, buf)
     }
 
     fn fallocate(&self, mode: u32, off: u64, len: u64, modified: &dyn Fn() -> Result<(), i64>) -> Result<(), i64> {
