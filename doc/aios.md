@@ -1653,14 +1653,14 @@ UEFI から起動したとき (aiboot、systemd-boot、ファームウェアか�
 `/sys/devices/system/cpu/vulnerabilities/` に Linux 7.3 と同じ 19 のファイル (meltdown、spectre_v1、spectre_v2、
 spec_store_bypass と、x86 などのもの) を出す (kernel/src/cpuvuln.rs)。「当たるか」は Linux の arm64 と同じ決め方
 (proton-pack.c と cpufeature.c): MIDR の安全なものの表、ID レジスタ (CSV2、CSV3、SSBS、ECBHB)、ファームウェアへの
-問いあわせ (SMCCC 1.1 の ARCH_FEATURES で ARCH_WORKAROUND_1 / 2。PSCI と同じ hvc / smc)。「対策」は aios がしている
-ものだけを書く:
+問いあわせ (SMCCC 1.1 の ARCH_FEATURES で ARCH_WORKAROUND_1 / 2 / 3。PSCI と同じ hvc / smc)、CLRBHB (ID_AA64ISAR2)。
+「対策」は aios がしているものだけを書く:
 
 | ファイル | aios | Linux |
 |---|---|---|
 | meltdown | 当たれば Vulnerable (KPTI をしない) | KPTI で Mitigation: PTI |
 | spectre_v1 | Mitigation: __user pointer sanitization (ユーザーのポインタはユーザーのページ表を引いてから、カーネルの写しで読み書きする: vm.rs の copy_in / copy_out) | 同じ文 (uaccess のマスク) |
-| spectre_v2 | CSV2 か安全な表のものは Not affected。ほかは Vulnerable (ファームウェアの WORKAROUND_1 を呼ばない)。BHB はハードウェア (ECBHB) だけ | ファームウェアと BHB のループ / CLEARBHB / WORKAROUND_3 |
+| spectre_v2 | CSV2 か安全な表のものは Not affected。ほかはファームウェアの WORKAROUND_1 があれば Branch predictor hardening (ユーザーのアドレス空間を載せかえるときと、ユーザーからカーネルのアドレスで落ちたとき: 命令のフォルト、PC のそろい、ブレークポイント、ステップ、割りこみ)、なければ Vulnerable。Spectre-BHB (v2 が Vulnerable でないとき) は、ユーザーから入るベクタ (trap.rs の 5 とおりのベクタから起動のときに選ぶ) で、ハードウェア (ECBHB) / CLRBHB の命令 / CPU ごとの回数のループ (A76 は 24、A710 と V1 は 32 など) / ファームウェアの WORKAROUND_3 | 同じ (proton-pack.c と entry.S の __bp_harden_el1_vectors) |
 | spec_store_bypass | SSBS があれば Linux と同じ「prctl で」: カーネルは SSBS を落として動き (SCTLR_EL1.DSSBS = 0)、ユーザーはふだん立てて、prctl で止めたスレッドだけ落とす。SSBS がなければ Vulnerable | SSBS がなければファームウェアの WORKAROUND_2 |
 
 prctl の PR_GET/SET_SPECULATION_CTRL (PR_SPEC_STORE_BYPASS: ENABLE、DISABLE、FORCE_DISABLE、DISABLE_NOEXEC。
@@ -1668,10 +1668,15 @@ prctl の PR_GET/SET_SPECULATION_CTRL (PR_SPEC_STORE_BYPASS: ENABLE、DISABLE、
 `SpeculationIndirectBranch` も Linux と同じ。印はスレッドごとで fork で受けつぎ、DISABLE_NOEXEC は exec で外れ、
 PSTATE.SSBS はスケジューラが切りかえのたびに印から決めなおす (Linux の __switch_to と同じ)。sigreturn も SSBS を残す。
 AT_HWCAP と /proc/cpuinfo に ssbs を出し、EL0 の MRS で読む ID_AA64PFR1 も SSBS の欄だけ見せる。
-QEMU の cortex-a72 と max で、aios と Linux 7.3.1 の答えがみな同じ (`test/cpuvuln.c`: 出すだけのテストなので、
-`LINUX_CPU=cortex-a72 test/linux-vm.sh exec latest ...` の出力とくらべる。cortex-a72 は spectre_v2 と
-spec_store_bypass が Vulnerable、max は `Mitigation: CSV2, but not BHB` と `... disabled via prctl`)。
-Linux より弱いところ (KPTI、BHB のループ、ファームウェアの手当て) は、その CPU で動かすときに足す。
+QEMU の cortex-a72、cortex-a76、cortex-a710、neoverse-n1、neoverse-v1、max で、aios と Linux 7.4-rc2 の答えがみな同じ
+(`test/cpuvuln.c` の 41 行: 出すだけのテストなので、`AIOS_CPU=...` の aios と `LINUX_CPU=... test/linux-vm.sh exec ...`
+の出力とくらべる。cortex-a72 は spectre_v2 と spec_store_bypass が Vulnerable (QEMU にファームウェアの手当てがない)、
+A76 などは `Mitigation: CSV2, BHB` (ループ)、max は `Mitigation: CSV2, but not BHB`)。手本の Linux (test/linux.config) は
+tinyconfig から作るので、Spectre-BHB の手当て (CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY) と KPTI
+(CONFIG_UNMAP_KERNEL_AT_EL0) が切れていて、前は A76 でも `but not BHB` だった: ふつうの配布の Linux と同じく入れた。
+Linux より弱いところは KPTI だけ (Meltdown に当たる A75 などで動かすときに足す。QEMU には当たる CPU で Linux が起きる
+ものがない)。ファームウェアの手当て (WORKAROUND_1 / 3) は、QEMU にファームウェアがないので、その機械 (ラズパイ 4 の
+A72 など) でたしかめる。
 
 ### カーネルの砂場 (aios.off= と aish の box)
 
