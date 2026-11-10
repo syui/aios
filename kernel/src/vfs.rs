@@ -791,8 +791,20 @@ static FLUSHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// 書き出しのスレッドへの頼み (もう 1 回まわす)
 static FLUSH_WANTED: Bkl<bool> = Bkl::new(false);
 
+// [lockless]
 fn flusher_chan() -> usize {
     &FLUSHER as *const _ as usize
+}
+
+/// 大きなロックなしの道が書き出しを頼んだ印 (FLUSH_WANTED は大きなロックのもの)
+static FLUSH_WANTED_FAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 大きなロックなしの道から、書き出しのスレッドを起こす (smp::defer_wake: 次に大きなロックを放すものが起こす。眠って
+/// いれば次の回を始める。書いている途中なら、印を見て、その回のあとに眠らずにもう 1 回)
+// [lockless]
+pub fn kick_flusher_lockless() {
+    FLUSH_WANTED_FAST.store(true, core::sync::atomic::Ordering::SeqCst);
+    crate::smp::defer_wake(flusher_chan());
 }
 
 /// 書き出しのスレッドが始めた回と、終えた回の数 (balance_dirty が待つ)
@@ -866,6 +878,7 @@ extern "C" fn flusher() -> ! {
     use core::sync::atomic::Ordering::Relaxed;
     loop {
         *FLUSH_WANTED.get() = false;
+        FLUSH_WANTED_FAST.store(false, core::sync::atomic::Ordering::SeqCst);
         FLUSH_PASSES.get().0 += 1;
         // 1 回ぶんの、大きなロックを持っていた時間を /proc/bkl の (kernel thread) に (trap.rs の例外 1 つと同じ数え方)
         let t0 = crate::smp::timed_now();
@@ -878,7 +891,7 @@ extern "C" fn flusher() -> ! {
         FLUSH_PASSES.get().1 += 1;
         crate::proc::wakeup(flush_done_chan());
         // 書いているあいだに頼まれていれば、すぐもう 1 回
-        if !*FLUSH_WANTED.get() {
+        if !*FLUSH_WANTED.get() && !FLUSH_WANTED_FAST.load(core::sync::atomic::Ordering::SeqCst) {
             let _ = crate::proc::sleep_until(flusher_chan(), crate::timer::ticks() + 5 * crate::timer::HZ);
         }
     }

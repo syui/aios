@@ -324,6 +324,7 @@ pub fn init(early: usize) -> Option<*mut u8> {
 /// なければ None
 pub fn take_contiguous(bytes: usize) -> Option<*mut u8> {
     let n = pg_round_up(bytes) / PGSIZE;
+    drain_pcp();
     let mut k = KMEM.lock();
     let nhot = k.nhot;
     k.drain(nhot);
@@ -403,6 +404,46 @@ fn poison_check(page: *mut u8, how: &str) {
     }
 }
 
+// ---- CPU ごとの 1 枚ずつのページ (Linux の per-cpu のリスト pcp) ----
+// 1 枚ずつ取る・返すのは、まず自分の CPU の列で (列のロックはほかの CPU とまず重ならない)。列が空なら KMEM から
+// PCP_BATCH 枚まとめて取り、いっぱいならまとめて返す。前は 1 枚ごとに KMEM を取り、4 つの CPU がファイルに書きたす
+// (ブロックのキャッシュのページを取って、切りつめで返す) と、半分以上の回で KMEM に並んでいた
+const PCP_MAX: usize = 64;
+const PCP_BATCH: usize = 32;
+
+struct Pcp {
+    n: usize,
+    pages: [u32; PCP_MAX],
+}
+
+#[repr(align(64))]
+struct CpuPages(SpinLock<Pcp>, core::sync::atomic::AtomicUsize);
+
+static PCP: [CpuPages; crate::smp::MAXCPU] = [const { CpuPages(SpinLock::new(Pcp { n: 0, pages: [0; PCP_MAX] }), core::sync::atomic::AtomicUsize::new(0)) }; crate::smp::MAXCPU];
+
+/// CPU ごとの列のページをみな KMEM の HOT へ (足りないとき、続いたものを取るとき、page check の前)
+// [lockless]
+fn drain_pcp() {
+    for c in &PCP {
+        let mut p = c.0.lock();
+        if p.n == 0 {
+            continue;
+        }
+        let mut k = KMEM.lock();
+        for j in 0..p.n {
+            if k.nhot == HOT_MAX {
+                k.drain(HOT_MAX / 2);
+            }
+            let n = k.nhot;
+            k.hot[n] = p.pages[j];
+            k.nhot += 1;
+        }
+        NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+        p.n = 0;
+        c.1.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 仮想アドレス (KBASE 側) のページを返す
 // [lockless]
 pub fn free(page: *mut u8) {
@@ -412,14 +453,28 @@ pub fn free(page: *mut u8) {
     }
     ref_slot(page).store(0, Ordering::Relaxed);
     let i = idx_of(page);
-    let mut k = KMEM.lock();
-    if k.nhot == HOT_MAX {
-        k.drain(HOT_MAX / 2);
+    let c = &PCP[crate::smp::id()];
+    let mut p = c.0.lock();
+    if p.n == PCP_MAX {
+        // いっぱい: 古いほう (列の頭) から PCP_BATCH 枚を KMEM の HOT へ
+        let mut k = KMEM.lock();
+        for j in 0..PCP_BATCH {
+            if k.nhot == HOT_MAX {
+                k.drain(HOT_MAX / 2);
+            }
+            let n = k.nhot;
+            k.hot[n] = p.pages[j];
+            k.nhot += 1;
+        }
+        NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+        drop(k);
+        p.pages.copy_within(PCP_BATCH..PCP_MAX, 0);
+        p.n -= PCP_BATCH;
     }
-    let n = k.nhot;
-    k.hot[n] = i as u32;
-    k.nhot += 1;
-    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+    let n = p.n;
+    p.pages[n] = i as u32;
+    p.n += 1;
+    c.1.store(p.n, Ordering::Relaxed);
 }
 
 /// 0 埋めしたページを 1 枚。なければ None
@@ -458,21 +513,51 @@ pub fn alloc_dirty() -> Option<*mut u8> {
     if crate::debug::should_fail_alloc_page() {
         return None;
     }
-    let mut k = KMEM.lock();
-    let i = if k.nhot > 0 {
-        k.nhot -= 1;
-        k.hot[k.nhot] as usize
-    } else {
-        k.take(0)?
+    let i = match alloc_pcp() {
+        Some(i) => i,
+        // どこにもない: ほかの CPU の列にあるものも KMEM へもどしてから
+        None => {
+            drain_pcp();
+            alloc_pcp()?
+        }
     };
-    NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
-    drop(k);
     let page = page_of(i);
     if POISON.load(Ordering::Relaxed) {
         poison_check(page, "alloc");
     }
     ref_slot(page).store(1, Ordering::Relaxed);
     Some(page)
+}
+
+/// 自分の CPU の列から 1 枚 (空なら KMEM から PCP_BATCH 枚まで足してから)。ページの番号
+// [lockless]
+fn alloc_pcp() -> Option<usize> {
+    let c = &PCP[crate::smp::id()];
+    let mut p = c.0.lock();
+    if p.n == 0 {
+        let mut k = KMEM.lock();
+        while p.n < PCP_BATCH {
+            let i = if k.nhot > 0 {
+                k.nhot -= 1;
+                k.hot[k.nhot] as usize
+            } else {
+                match k.take(0) {
+                    Some(i) => i,
+                    None => break,
+                }
+            };
+            let n = p.n;
+            p.pages[n] = i as u32;
+            p.n += 1;
+        }
+        NFREE.store(k.nbuddy + k.nhot, Ordering::Relaxed);
+        if p.n == 0 {
+            return None;
+        }
+    }
+    p.n -= 1;
+    c.1.store(p.n, Ordering::Relaxed);
+    Some(p.pages[p.n] as usize)
 }
 
 /// 共有する人が増える
@@ -511,7 +596,7 @@ pub static MIN_FREE_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic:
 static NFREE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 pub fn nfree() -> usize {
-    NFREE.load(Ordering::Relaxed)
+    NFREE.load(Ordering::Relaxed) + PCP.iter().map(|c| c.1.load(Ordering::Relaxed)).sum::<usize>()
 }
 
 /// 大きさ (2^k ページ) ごとの空いているかたまりの数 (HOT のものは入れない: Linux の per-cpu のものと同じ) と HOT の枚数
@@ -524,6 +609,8 @@ pub fn orders() -> ([usize; MAX_ORDER + 1], usize) {
 /// そろい、範囲の中で、重ならず、まとめ残しがなく (buddy が同じ大きさで空いていない)、数があい、中のページの参照の
 /// 数が 0。HOT のページも。ロックを持ったまま、空きのページをみな見る
 pub fn check() {
+    // CPU ごとの列のページも見るように、KMEM の HOT へもどしてから
+    drain_pcp();
     let r = {
         let k = KMEM.lock();
         check_locked(&k)

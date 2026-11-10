@@ -283,13 +283,13 @@ fn wait_end(t0: u64) {
 }
 
 // [lockless]
-fn wfe() {
+pub fn wfe() {
     // 放す側が sev で起こす (大きなロックと同じ。回りつづけると TCG では持っている CPU まで遅くなる)
     unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
 }
 
 // [lockless]
-fn sev() {
+pub fn sev() {
     unsafe { core::arch::asm!("dsb ish", "sev", options(nostack)) };
 }
 
