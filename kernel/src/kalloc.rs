@@ -595,6 +595,7 @@ pub static MIN_FREE_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic:
 /// 空いているページの数 (KMEM を変えたあとに書く: システムコールのたびに vm::balance が読むので、ロックを取らずに)
 static NFREE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+// [lockless]
 pub fn nfree() -> usize {
     NFREE.load(Ordering::Relaxed) + PCP.iter().map(|c| c.1.load(Ordering::Relaxed)).sum::<usize>()
 }

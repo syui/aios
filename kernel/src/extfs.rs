@@ -325,7 +325,7 @@ mod jbd2;
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
-/// 覚えておくブロックの数の上限 (RAM の 1/8 まで)
+/// 覚えておくブロックの数: いつも覚えてよい数 (RAM の 1/8 まで)。書いていない中身の上限 (dirty_base の 1/4) もこれから
 const CACHE_BLOCKS: usize = 16384;
 /// alloc_block_run がさがす、つづいた空きの長さの上限 (ブロック。4 KiB なら 8 MiB: Linux の mballoc の上限と同じ)
 const RUN_MAX: u64 = 2048;
@@ -337,8 +337,23 @@ const READ_AHEAD: usize = 32;
 const NOIO_EAGAIN: i64 = 11;
 
 // [lockless]
-fn cache_limit(bsize: usize) -> usize {
+fn dirty_base(bsize: usize) -> usize {
     CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
+}
+
+/// 覚えておくブロックの数の上限: RAM の半分まで (Linux のページキャッシュのように、空いたメモリを使う。前は 64 MiB までで、
+/// tar で展開したばかりの木 (zig の 2 万のファイル) を cp -r すると、中身をみなディスクから読みなおしていた)。メモリが
+/// 足りなくなれば vm::reclaim の shrinker が捨てる
+// [lockless]
+fn cache_limit(bsize: usize) -> usize {
+    (crate::memlayout::ram_size() / 2 / bsize).max(dirty_base(bsize))
+}
+
+/// ブロックを 1 つ足す前に、古いものを 1 つ捨てるか: 上限か、dirty_base をこえていて空きのページが RAM の 1/16 を割った
+/// とき (ほかのもの (パイプ、ソケット、ページ表) のために空きを残す: それらは足りなくても回収しない)
+// [lockless]
+fn cache_full(len: usize, bsize: usize) -> bool {
+    len >= cache_limit(bsize) || (len >= dirty_base(bsize) && crate::kalloc::nfree() < crate::memlayout::ram_size() / 16 / crate::memlayout::PGSIZE)
 }
 const EROFS: i64 = 30;
 const EFBIG: i64 = 27;
@@ -1385,7 +1400,7 @@ impl ExtFs {
             }
             None => {
                 c.misses += 1;
-                if c.map.len() >= cache_limit(self.bsize) {
+                if cache_full(c.map.len(), self.bsize) {
                     c.evict_one();
                 }
                 // ページがなければ、書き終わったブロックを捨てて作る (ディスクから全部読むので 0 にしない)
@@ -1436,7 +1451,7 @@ impl ExtFs {
                 q
             }
             None => {
-                if c.map.len() >= cache_limit(self.bsize) {
+                if cache_full(c.map.len(), self.bsize) {
                     c.evict_one();
                 }
                 c.map.insert(b, p);
@@ -1488,7 +1503,7 @@ impl ExtFs {
             }
             (Some(p), None) => p,
             (None, None) => {
-                if !shared && c.map.len() >= cache_limit(self.bsize) {
+                if !shared && cache_full(c.map.len(), self.bsize) {
                     c.evict_one();
                 }
                 // kalloc::alloc が 0 にしたページ
@@ -1559,7 +1574,7 @@ impl ExtFs {
                 continue;
             }
             // 上限をこえていたら 1 つ捨てる (捨てられなくても先読みは続ける: 写されているページで上限をこえているとき)
-            if c.map.len() >= cache_limit(self.bsize) {
+            if cache_full(c.map.len(), self.bsize) {
                 c.evict_one();
             }
             let Some(p) = kalloc::alloc_dirty() else { break };
@@ -2438,14 +2453,14 @@ impl ExtFs {
     /// システムコールの終わりで待たせる (vfs::balance_dirty。Linux の balance_dirty_pages)。ここで書くのは、スレッドが
     /// まだいない (起動のとちゅう) ときと、それでも 3 倍までたまったとき (ジャーナルに入りきらないほどためない)。
     /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
-    /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身はキャッシュの 1/4 までためる
+    /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身は dirty_base の 1/4 までためる
     fn maybe_flush(&self) -> Result<(), i64> {
         self.take_fast_writes();
         let limit = match self.journal.borrow().as_ref() {
             Some(j) => (j.capacity() / 4).min(512),
             None => 512,
         };
-        let data_limit = (cache_limit(self.bsize) / 4).max(512);
+        let data_limit = (dirty_base(self.bsize) / 4).max(512);
         let (meta, data) = {
             let c = self.cache.borrow();
             (c.dirty.len(), c.data.len())
@@ -4123,7 +4138,7 @@ impl ExtFs {
     /// 書いた人を待たせるところの手前)
     // [lockless]
     fn dirty_level(&self) -> u8 {
-        let data_limit = (cache_limit(self.bsize) / 4).max(512);
+        let data_limit = (dirty_base(self.bsize) / 4).max(512);
         let level = |j: &Option<jbd2::Journal>, c: &Cache| {
             let limit = match j.as_ref() {
                 Some(j) => (j.capacity() / 4).min(512),
