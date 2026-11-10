@@ -4240,15 +4240,21 @@ impl ExtFs {
         let done = crate::proc::noio(|| {
             // extent の木をたどるのは inode だけのもの (ALLOC の外で)。ブロックが空いているかとビットマップは ALLOC の中で
             // (書きたしが終わりのブロックの中だけなら ALLOC はいらない)
-            let plan = self.append_fits(&r, off, buf.len()).filter(|f| f.2 as usize == want);
+            let plan = self.append_fits(ino, &r, off, buf.len()).filter(|f| f.2 as usize == want);
             // このファイルの先取りのはじめからなら、ALLOC なしで (箱は dir_lock(ino) の中)
             let slot = self.resv_slot(ino);
-            let mine = plan.is_some_and(|(g, gbit, k)| {
+            let mine = plan.is_some_and(|(g, gbit, k, first)| {
                 let rv = slot.get();
-                k > 0 && rv.ino == ino && rv.start == self.group_start(g) + gbit as u64 && rv.end - rv.start >= k as u64
+                k > 0 && !first && rv.ino == ino && rv.start == self.group_start(g) + gbit as u64 && rv.end - rv.start >= k as u64
             });
             let a = plan.filter(|f| f.2 > 0 && !mine).map(|_| ALLOC.take());
-            let Some((g, gbit, k)) = plan.filter(|&(g, gbit, k)| k == 0 || mine || self.goal_free(g, gbit, k)) else {
+            // 空のファイルのはじめのブロックは、goal からつづいて空いたところをさがす (first_free)。ほかは goal がみな空いていること
+            let plan = plan.and_then(|(g, gbit, k, first)| match () {
+                _ if k == 0 || mine => Some((g, gbit, k, false)),
+                _ if first => self.first_free(g, gbit, k).map(|(g, b)| (g, b, k, true)),
+                _ => self.goal_free(g, gbit, k).then_some((g, gbit, k, false)),
+            });
+            let Some((g, gbit, k, first)) = plan else {
                 drop(a);
                 pages.iter().for_each(|&p| kalloc::free(p));
                 crate::file::FAST_WRITE[3].fetch_add(1, Ordering::Relaxed);
@@ -4270,8 +4276,10 @@ impl ExtFs {
                     slot.set(Resv { start: rv.start + k as u64, ..rv });
                     Ok(rv.start)
                 } else {
-                    // 書く分のあとにつづく空きも先取りして (グループの空きの数の中で)、前の先取り (この箱のもの) は返す
-                    let extra = self.free_after(g, gbit + k, RESV_BLOCKS.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k)));
+                    // 書く分のあとにつづく空きも先取りして (グループの空きの数の中で)、前の先取り (この箱のもの) は返す。
+                    // 空のファイルへのはじめての書きこみはしない (ふつうの道と同じ: 1 度しか書かないファイル (cp や tar の
+                    // 小さなもの) の先取りは、消しても次の書き出しまで返らない。2 回目の書きたしから)
+                    let extra = if first { 0 } else { self.free_after(g, gbit + k, RESV_BLOCKS.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k))) };
                     let b = self.take_bits(g, gbit, k + extra);
                     if let Ok(b) = b {
                         let old = slot.get();
@@ -4311,10 +4319,20 @@ impl ExtFs {
                 }
             })
         });
-        // 書いたところ (前の終わりから): ページキャッシュの印と版 (write_at の file_written と同じ。ページは写さない)
+        // 書いたところ (前の終わりから): ページキャッシュの印と版 (write_at の file_written と同じ)。新しくとったブロックの
+        // ページは、ふつうの道と同じくページキャッシュの表にも入れる (参照を 1 つ足して: 表が持つ。入れなければ、書いて
+        // すぐ読むもの (cp の元、リンクするオブジェクト) が大きなロックの道で読みなおす)。ext4 のロックをいっしょに持って
+        // いるので、そのあいだブロックのキャッシュから捨てられない
         let end = off + done.as_ref().map_or(0, |d| d.0);
         let ver = done.as_ref().map_or_else(|| crate::vm::meta_ver(&meta_of(ino, &r, self.bsize)), |d| crate::vm::meta_ver(&d.1));
-        crate::vm::file_written(id, ver, off / PGSIZE, end.max(off + 1).div_ceil(PGSIZE) - 1, Vec::new());
+        let mut fresh = Vec::new();
+        if done.is_some() && fresh.try_reserve(pages.len()).is_ok() {
+            for (i, &p) in pages.iter().enumerate() {
+                kalloc::get(p);
+                fresh.push((nb as usize + i, p));
+            }
+        }
+        crate::vm::file_written(id, ver, off / PGSIZE, end.max(off + 1).div_ceil(PGSIZE) - 1, fresh);
         done.map(|(n, _)| (n, off + n))
     }
 
@@ -4324,14 +4342,28 @@ impl ExtFs {
     /// ばかり (held) でなく、そのビットマップと、書きはじめのブロック (ブロックの途中から書くなら) がキャッシュにあること。
     /// write_data の map がとる goal (前のブロックの隣) がみな空いているので、ほかを探さない (ほかのグループのビットマップを
     /// 読まない)。extent は根か葉の上でその場で伸びる (ext_insert: 葉なら ext_extend_leaf。新しい葉や索引はとらない)。
-    /// 未初期化の extent、先にとってあるブロック、空のファイル (extent がない) はふつうの道。
-    /// 答えは、とるブロックのグループと、その中のはじめのビットと、数 (0 なら終わりのブロックの中だけ)。ここは inode の
-    /// ものだけ (dir_lock の中)。ブロックが空いているか (goal_free) は ALLOC の中で
+    /// 未初期化の extent、先にとってあるブロックはふつうの道。空のファイル (extent がまだない: cp や tar が作ったばかりの
+    /// ファイルへのはじめての write) は、ふつうの道の map と同じく file_goal (プロセスごとのところ) をはじめとして、同じ
+    /// グループの中でつづいて空いたところに (first が true: ALLOC の中で first_free がさがす)。extent は根に 1 つ足す。
+    /// 答えは、とるブロックのグループと、その中のはじめのビット (first なら、さがしはじめるところ) と、数 (0 なら終わりの
+    /// ブロックの中だけ) と first。ここは inode のものだけ (dir_lock の中)。ブロックが空いているか (goal_free) は ALLOC の中で
     // [lockless]
-    fn append_fits(&self, r: &Raw, off: usize, len: usize) -> Option<(u32, u32, u32)> {
+    fn append_fits(&self, ino: u32, r: &Raw, off: usize, len: usize) -> Option<(u32, u32, u32, bool)> {
         let bs = self.bsize as u64;
         let root = &r.0[40..100];
         let (n, depth) = (u16_at(root, 2) as usize, u16_at(root, 6));
+        if u16_at(root, 0) == EXT_MAGIC && n == 0 && depth == 0 && u16_at(root, 4) > 0 {
+            if off != 0 || r.size() != 0 || r.blocks512(self.bsize) != 0 {
+                return None;
+            }
+            let k = (len as u64).div_ceil(bs) as u32;
+            let goal = self.file_goal(ino);
+            if k == 0 || k > EXT_INIT_MAX_LEN || goal < self.first_data_block || goal >= self.blocks_count() {
+                return None;
+            }
+            let g = ((goal - self.first_data_block) / self.bpg as u64) as u32;
+            return Some((g, (goal - self.group_start(g)) as u32, k, true));
+        }
         if u16_at(root, 0) != EXT_MAGIC || n == 0 || n > 4 || depth > 4 {
             return None;
         }
@@ -4373,7 +4405,7 @@ impl ExtFs {
         let end_fb = (off + len - 1) as u64 / bs;
         let k = (end_fb + 1).saturating_sub(nblocks) as u32;
         if k == 0 {
-            return Some((0, 0, 0));
+            return Some((0, 0, 0, false));
         }
         let goal = start + elen as u64;
         if elen + k > EXT_INIT_MAX_LEN || goal < self.first_data_block || goal + k as u64 > self.blocks_count() {
@@ -4381,7 +4413,37 @@ impl ExtFs {
         }
         let g = ((goal - self.first_data_block) / self.bpg as u64) as u32;
         let gbit = (goal - self.group_start(g)) as u32;
-        (gbit + k <= self.blocks_in_group(g)).then_some((g, gbit, k))
+        (gbit + k <= self.blocks_in_group(g)).then_some((g, gbit, k, false))
+    }
+
+    /// 空のファイルのはじめのブロック (append_fits の first): ふつうの道の alloc_block_run と同じ順に、goal のグループ gg の
+    /// from から (そのあとグループのはじめから from まで)、それから次のグループ (RUN_GROUPS こまで) のはじめから、k こ
+    /// つづいて空いたところ (放したばかり (held) でないもの) をさがす (ALLOC の中で。何も変えない)。答えはグループと、その
+    /// 中のはじめのビット。空きの数が足りないグループはとばし、ビットマップが初期化されていないかキャッシュにないグループに
+    /// 来たらやめる (None: ふつうの道が読んでさがす)
+    // [lockless]
+    fn first_free(&self, gg: u32, from: u32, k: u32) -> Option<(u32, u32)> {
+        for i in 0..RUN_GROUPS.min(self.groups) {
+            let g = (gg + i) % self.groups;
+            if self.gd_cnt(g, 0xc, 0x2c) < k {
+                continue;
+            }
+            let bm = self.block_bitmap(g);
+            if self.gd_flags(g) & BG_BLOCK_UNINIT != 0 || !self.cached(bm) {
+                return None;
+            }
+            let n = self.blocks_in_group(g);
+            let held = self.held_in(self.group_start(g), n);
+            let start = if i == 0 { from.min(n) } else { 0 };
+            let found = self
+                .with_block(bm, |d| free_run(d, start, n, k, &held, false).filter(|&(_, l)| l >= k).or_else(|| free_run(d, 0, start, k, &held, false).filter(|&(_, l)| l >= k)))
+                .ok()
+                .flatten();
+            if let Some((b, _)) = found {
+                return Some((g, b));
+            }
+        }
+        None
     }
 
     /// append_fits の goal から k ブロックが、とれるか (ALLOC の中で。何も変えない): グループの空きの数が足り、ビット
