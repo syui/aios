@@ -85,13 +85,19 @@ fn root_fs() -> Option<&'static dyn FastFs> {
     ROOT.get().copied()
 }
 
-/// どちらにも要るもの (ロックの外で見られるもの)。だめなら None
+/// 作る・消すに要るもの (ロックの外で見られるもの)。だめなら None
 // [lockless]
 fn usable(me: &Proc) -> Option<&'static dyn FastFs> {
-    if crate::debug::FAIL_ON.load(Relaxed) || me.has_cred_work(crate::proc::CRED_SANDBOX) || !watch_free() {
+    if !me.files.as_ref()?.private() {
         return None;
     }
-    if !me.files.as_ref()?.private() {
+    usable_any(me)
+}
+
+/// 開くのに要るもの (fd の表はほかのスレッドと分けていてもよい: file::fast_open が門を通って見る)
+// [lockless]
+fn usable_any(me: &Proc) -> Option<&'static dyn FastFs> {
+    if crate::debug::FAIL_ON.load(Relaxed) || me.has_cred_work(crate::proc::CRED_SANDBOX) || !watch_free() {
         return None;
     }
     root_fs()
@@ -192,8 +198,8 @@ pub fn fast_create(me: &Proc, dirfd: i64, pathp: usize, flags: u64, mode: u64) -
 /// ExtFs::fast_open)、ふつうの道の open_found と同じ OpenFile (パスは key。読むだけの口なら、閉じたら棚にしまってよい印
 /// つき) を fd に置く。Linux の open が dcache と inode だけで開くのと同じ。だめなら None (ふつうの道へ)。base は開いている
 /// ディレクトリから引いたときのそのディレクトリ (statc::parent_dir)
-pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], ino: u64, flags: u64, base: Option<(usize, u64)>) -> Option<i64> {
-    let fs = usable(me)?;
+pub fn fast_open(me: &Proc, slot: file::Slot, key: &[u8], ino: u64, flags: u64, base: Option<(usize, u64)>) -> Option<i64> {
+    let fs = usable_any(me)?;
     let perm = match flags & O_ACCMODE {
         0 => crate::cred::R,
         1 => crate::cred::W,
@@ -222,7 +228,7 @@ pub fn fast_open(me: &Proc, t: &mut crate::proc::Files, fd: usize, key: &[u8], i
     if !write {
         file::reuse_on(&f);
     }
-    file::fast_install(t, fd, f, flags & O_CLOEXEC != 0);
+    let fd = file::place(slot, f, flags & O_CLOEXEC != 0);
     Some(fd as i64)
 }
 

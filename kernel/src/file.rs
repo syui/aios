@@ -467,12 +467,86 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
 /// 中だけ: ファイルを消して inode のリンクが 0 になったとき (extfs の unlink_node: 消したファイルの場所がすぐ返るように)、
 /// umount、IN_OPEN / IN_CLOSE の見張りを置くとき、exec と exit (表といっしょに)。マウントが変わったあとのものは
 /// (statc の版がちがう) 使わない
-pub struct Shelf(crate::spinlock::SpinLock<Vec<Shelved>>);
+/// 2 つめは、大きなロックなしの open がとっておいた fd の番号 (+1。0 は空き。棚のロックの中で変える: Slot)
+pub struct Shelf(crate::spinlock::SpinLock<Vec<Shelved>>, [core::sync::atomic::AtomicUsize; RESERVE_MAX]);
+
+/// 1 つの表で同時にとっておける fd の数 (ほかのスレッドの大きなロックなしの open が開いている途中のもの。こえればふつうの道へ)
+const RESERVE_MAX: usize = 4;
 
 impl Default for Shelf {
     fn default() -> Self {
-        Self(crate::spinlock::SpinLock::new(Vec::new()))
+        Self(crate::spinlock::SpinLock::new(Vec::new()), [const { core::sync::atomic::AtomicUsize::new(0) }; RESERVE_MAX])
     }
+}
+
+impl Shelf {
+    /// fd がほかのスレッドの大きなロックなしの open にとっておかれている (Linux の、alloc_fd したが fd_install していない
+    /// もの)。ふつうの道 (proc::Files の add、put_at) は門の中で見る: add はとばし、dup2 などは EBUSY
+    pub fn reserved(&self, fd: usize) -> bool {
+        self.1.iter().any(|r| r.load(core::sync::atomic::Ordering::Relaxed) == fd + 1)
+    }
+}
+
+/// 大きなロックなしの open がとっておいた fd (reserve。Linux の alloc_fd)。置くのは place (fd_install)。置かずに落とせば返す。
+/// とっておくのと置くのは、それぞれ門の中で (ほかのスレッドと表を分けているとき)。あいだ (ext4 で引いて開く) は門の外:
+/// ほかのスレッドの close や dup2 (ふつうの道) を待たせない。とっておいた fd には、ふつうの道は置かない
+pub struct Slot {
+    files: *const proc::Shared<proc::Files>,
+    k: usize,
+    pub fd: usize,
+}
+
+impl Drop for Slot {
+    // [lockless]
+    fn drop(&mut self) {
+        let t = unsafe { (*self.files).get() };
+        let _l = t.shelf.0.lock();
+        t.shelf.1[self.k].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// いちばん小さい空いた fd (nofile まで。表を伸ばすのはふつうの道で) をとっておく
+pub fn reserve(files: &proc::Shared<proc::Files>) -> Option<Slot> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let t = files.get();
+    let _g = if files.private() { None } else { Some(t.gate.read()?) };
+    let _l = t.shelf.0.lock();
+    let k = t.shelf.1.iter().position(|r| r.load(Relaxed) == 0)?;
+    let fd = (0..t.fds.len().min(t.nofile)).find(|&i| t.fds[i].is_none() && !t.shelf.reserved(i))?;
+    t.shelf.1[k].store(fd + 1, Relaxed);
+    Some(Slot { files, k, fd })
+}
+
+/// とっておいた fd に置く (棚のロックの中で: 呼ぶ人が門と棚のロックを持っている)。fd を返す
+fn place_locked(fds: &mut [Option<proc::Fd>], shelf: &Shelf, slot: Slot, file: FileRef, cloexec: bool) -> usize {
+    let fd = slot.fd;
+    fds[fd] = Some(proc::Fd { file, cloexec });
+    shelf.1[slot.k].store(0, core::sync::atomic::Ordering::Relaxed);
+    core::mem::forget(slot);
+    fd
+}
+
+/// 門に入る (ほかのスレッドと表を分けているとき)。表を変えている人 (大きなロックの中の close、dup2 など。すぐ終わる) が
+/// いれば、終わるのを待つ (とっておいた fd に置くのは、やめられない)
+fn gate_wait(files: &proc::Shared<proc::Files>) -> Option<crate::proc::GateRead<'_>> {
+    if files.private() {
+        return None;
+    }
+    loop {
+        if let Some(g) = files.get().gate.read() {
+            return Some(g);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// 大きなロックなしの open (fastdir::fast_open) が新しく開いたファイルを、とっておいた fd に置く。fd を返す
+pub fn place(slot: Slot, file: FileRef, cloexec: bool) -> usize {
+    let files = unsafe { &*slot.files };
+    let _g = gate_wait(files);
+    let t = files.get();
+    let _l = t.shelf.0.lock();
+    place_locked(&mut t.fds, &t.shelf, slot, file, cloexec)
 }
 
 struct Shelved {
@@ -612,11 +686,8 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         note(5);
         return None;
     }
+    // fd の表はほかのスレッドと分けていてもよい: 表と cwd を見るところ (statc と、fd をとっておく・置くところ) は門の中で
     let files = me.files.as_ref()?;
-    if !files.private() {
-        note(5);
-        return None;
-    }
     let mut norm = [0u8; crate::statc::PATH];
     let Some((ans, len)) = crate::statc::open_lookup(me, dirfd, pathp, &mut norm) else {
         note(3);
@@ -656,16 +727,15 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, perm, false) {
         return pass(5);
     }
-    let t = files.get();
-    // いちばん小さい空いた fd (表を伸ばすのはふつうの道で)
-    let Some(fd) = (0..t.fds.len().min(t.nofile)).find(|&i| t.fds[i].is_none()) else {
+    // いちばん小さい空いた fd をとっておく (表を伸ばすのはふつうの道で)
+    let Some(slot) = reserve(files) else {
         return pass(5);
     };
     let key = &norm[..len];
     // 書く口は棚を見ない (棚は読むだけの口のもの)。stat が古いとき (inode を書いたあと) も: 棚から出すときの許しは、この
     // stat で確かめたもの。どちらもふつうの道は覚えなおしてよいので、seen_set はしない
     if acc != O_RDONLY as u64 || !fresh {
-        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags, base) {
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, slot, key, st.ino, flags, base) {
             note(7);
             return Some(fd);
         }
@@ -674,7 +744,9 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     }
     let want = (flags & O_LARGEFILE) as u32;
     let epoch = crate::statc::epoch();
-    // 表に置くのも棚のロックの中で (大きなロックの中の shelf_forget が、表と棚をいっしょに見る)
+    // 表に置くのも棚のロックの中で (大きなロックの中の shelf_forget が、表と棚をいっしょに見る)。門は棚のロックの前に
+    let gate = gate_wait(files);
+    let t = files.get();
     let mut shelf = t.shelf.0.lock();
     let i = shelf.iter().position(|s| {
         let of = unsafe { &*s.file.as_ptr() };
@@ -682,8 +754,9 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     });
     let Some(i) = i else {
         drop(shelf);
+        drop(gate);
         // 棚になければ、ext4 の名前と inode から新しく (Linux の open と同じく。パスは表の鍵: リンクをたどらずに着いたもの)
-        if plain && let Some(fd) = crate::fastdir::fast_open(me, t, fd, key, st.ino, flags, base) {
+        if plain && let Some(fd) = crate::fastdir::fast_open(me, slot, key, st.ino, flags, base) {
             note(7);
             return Some(fd);
         }
@@ -695,8 +768,9 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     of.offset = 0;
     of.dirents = None;
     of.reading = false;
-    t.fds[fd] = Some(proc::Fd { file, cloexec: flags & O_CLOEXEC != 0 });
+    let fd = place_locked(&mut t.fds, &t.shelf, slot, file, flags & O_CLOEXEC != 0);
     drop(shelf);
+    drop(gate);
     SHELVED.fetch_sub(1, Relaxed);
     note(0);
     Some(fd as i64)

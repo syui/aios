@@ -599,6 +599,21 @@ fsbench の open-close (作ったファイルを開いて閉じる) が、10/21 
 reopen-shelf が 0 of 200 で落ちた。いまは 1 度目から、覚えたあとに書きなおしたファイルで確かめる)。statc の表は 4096 から 8192 (4 MiB) に: fsbench の 1000 のファイルと
 ないもの 1000 で 3000 ほどになると、組の 4 つからあふれた 16% がふつうの道 (50 µs) へ行っていた。
 
+スレッドのあるプロセス (fd の表と cwd をほかのスレッドと分けている) は、大きなロックなしの stat も open もしていなかった
+(rg -j4 は 2 万のファイルをみな大きなロックの中で開き、1 回 66 µs)。いまは表と cwd を見るところだけ門 (proc::Gate) を
+通る: statc が cwd を読んでパスを畳み、開いているディレクトリを引くところ (そのあと ext4 で引くあいだは門の外)、それから fd を
+置くところ。fd は Linux の alloc_fd と fd_install と同じく 2 つに分けた: 門の中でいちばん小さい空いた fd をとっておき
+(`file::reserve`。表ごとに 4 つまで)、ext4 で開いてから、また門の中でそこへ置く (`file::place`)。とっておいた fd は、ふつうの道の
+add (open、dup、F_DUPFD、ソケットなど) がとばし、dup2 / dup3 は Linux と同じく EBUSY。cwd と root を変える chdir、fchdir、
+chroot は門を通す (`proc::Files::set_cwd`)。ふつうの道の open が空いた fd を選ぶのも門の中で (前は門の外で選んでから置いて
+いたので、同じときに速い道が同じ fd に置くと、片方のファイルを閉じてしまった。test/cwdrace.c で見つけた)。opendir
+(O_DIRECTORY の openat) の答えも statc に覚えさせる: rg や find はディレクトリを opendir してから中のファイルを開くので、
+はじめて開くファイルも、親のディレクトリが表にあれば ext4 で名前を 1 つ引いて大きなロックなしで開ける (statc::learn_lookup。
+Linux の lookup_slow)。test/cwdrace.c が、4 つのスレッドが cwd からの名前で開いて読み、stat するあいだに、もう 1 つのスレッドが
+2 つのディレクトリを chdir で行き来して dup2 と close をしても、開いたものの中身と inode がどちらかのファイルのもので、fd が
+重ならず、残らないかを見る (Linux 7.4 でも通る)。rg -c (zig の 2 万のファイル) は -j4 で 1.80 → 0.97 秒、-j1 で
+4.26 → 1.94 秒 (同じ VM の Linux 7.4 は 1.15 と 3.44 秒)。
+
 はじめての open-close は 55 µs から 23 µs に、fsbench の open-close は 62 µs から 22〜24 µs に (Linux 7.3 は 23.6 µs)。
 書く口で開くものがパスの覚えを引かなくなったので、write-4k も 120 µs から 92〜126 µs に (Linux は 140 µs)。答えは
 test/openfast.c (リンクのディレクトリを通ったものの /proc/self/fd、許し、ETXTBSY、置きかえと消したもの。どれも 2 回目は
@@ -611,7 +626,7 @@ CPU 4 つで同時に。開いたものはいつも同じファイルの中身) 
 開いたものがパスの覚えに入らなくなると、開いているディレクトリからの fstatat (find、ls -l、rm -r、fts の引きかた) が
 パスの覚えを引けなくなって、fsbench の stat-at が 12〜24 µs から 51〜62 µs になった (Linux 7.3 は 11.6 µs)。statc の表は
 いまのディレクトリか絶対のパスからのものしか引かなかったので、開いているディレクトリ (dirfd) のパスをつないで引くように
-した (`statc::dir_base`): fd の表を自分だけで使っているときに、その OpenFile のパスがいまも表でそのディレクトリの inode
+した (`statc::dir_base`): fd の表を門の中で見て (スレッドで分けていれば)、その OpenFile のパスがいまも表でそのディレクトリの inode
 をさすときだけ (開いたあとで名前を変えて、前の名前に別のディレクトリを作っても、前のほうを引く)。openat の dirfd も同じ。
 
 もう 1 つは、書いたあとの stat。表は stat まるごとを覚えているので、inode を書いて版が進むと古くなり、ふつうの道へ行って
@@ -2295,8 +2310,8 @@ struct stat か struct statx にして返す (C の stat は newfstatat、aish �
 版は、vfs が名前やディレクトリの属性を変えるたびと、ext4 が inode を書くたび (write_inode。meta の覚えを捨てるところと同じ) に
 進み、マウントでみな古くなる。ある答えは ext4 のファイルだけ (tmpfs や /proc は中身が変わっても印が変わらない。「ない」は
 パスの覚えにあれば、どのファイルシステムでも)、はじめのマウントの
-namespace、chroot なし、fd の表 (cwd) を自分だけで使うプロセス (スレッドがいれば、ほかのスレッドが chdir するかもしれない)、
-ユーザーの namespace の外 (uid が読みかわる) だけで、/dev と /proc のパス、..、開いているディレクトリからのもの、`fail` の
+namespace、chroot なし、ユーザーの namespace の外 (uid が読みかわる) だけで (fd の表 (cwd もそこ) をスレッドで分けていれば、
+cwd を読むあいだだけ門 (proc::Gate) を通る。chdir、fchdir、chroot は門を通して変える: proc::Files::set_cwd)、/dev と /proc のパス、..、開いているディレクトリからのもの、`fail` の
 決まりがあるときはふつうの道へ。test/statc.c が、変える人と見る人を別の CPU にして (chmod、時刻、大きさ、リンクの数、名前を
 変えてもどす、消して作りなおす、リンクの付けかえ、途中のディレクトリの取りかえ、だれでもは通れないディレクトリを root が
 覚えてから uid 65534 が引く、止めずに変えつづけるあいだ、chdir、ユーザーの namespace の中と外。stat と statx の両方で) 古い答えが出ないかを確かめる

@@ -4,7 +4,7 @@ use crate::cred::{self, Cred, R as PR, W as PW, X as PX};
 use crate::fs;
 // ファイルの出来事の知らせ (Linux の fsnotify: inotify は vfs::notify の向こう)
 use crate::vfs::notify as inotify;
-use crate::proc::{self, Fd};
+use crate::proc;
 use crate::security::PathOp;
 use crate::vfs::{self, InodeRef, NewNode, S_IFMT};
 use alloc::string::String;
@@ -1106,8 +1106,10 @@ pub fn openat(dirfd: i64, pathp: usize, flags: u64, mode: u64) -> R {
         return open_tmpfile(full, dir, flags, mode);
     }
     // 大きなロックなしの open (file::fast_open) が引けるように、読むだけで開くものの答えを statc に覚えさせる
-    // (newfstatat と同じく、開いているディレクトリからのものは覚えない。「ない」も)
-    let learn = flags & !SIMPLE_OPEN == 0 && (dirfd == AT_FDCWD || path.starts_with('/'));
+    // (newfstatat と同じく、開いているディレクトリからのものは覚えない。「ない」も)。O_DIRECTORY (opendir) のものも:
+    // その中のファイルを、はじめて開くときに大きなロックなしで引ける (statc::learn_lookup は親のディレクトリが表にいる。
+    // rg や find はディレクトリを opendir して、その中を開く)
+    let learn = flags & !(SIMPLE_OPEN | O_DIRECTORY) == 0 && (dirfd == AT_FDCWD || path.starts_with('/'));
     let found = match lookup(follow) {
         Err(e) if e == -ENOENT && learn => {
             crate::statc::learn_missing(&path, true);
@@ -2480,7 +2482,7 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
         return Err(-EBADF);
     }
     let f = file_of(old)?;
-    proc::current().files().set(new, Some(Fd { file: f, cloexec: flags & O_CLOEXEC != 0 }));
+    proc::current().files().put_at(new, f, flags & O_CLOEXEC != 0)?;
     Ok(new as i64)
 }
 
@@ -2738,7 +2740,7 @@ pub fn chdir(pathp: usize) -> R {
         return Err(-ENOTDIR);
     }
     cred::current().check(&ino.meta(), PX)?;
-    files.cwd = full;
+    files.set_cwd(full);
     Ok(0)
 }
 
@@ -2754,7 +2756,7 @@ pub fn chroot(pathp: usize) -> R {
     if !ino.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    files.root = full;
+    files.set_root(full);
     Ok(0)
 }
 
@@ -2903,7 +2905,7 @@ pub fn fchdir(fd: u64) -> R {
         Kind::Inode(i, p) if i.meta().is_dir() => p.clone(),
         _ => return Err(-ENOTDIR),
     };
-    proc::current().files().cwd = path;
+    proc::current().files().set_cwd(path);
     Ok(0)
 }
 

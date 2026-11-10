@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots posrace procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
+TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdrace dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots posrace procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -52,6 +52,8 @@ run)
     # openfast と openrace (棚にないファイルの大きなロックなしの open) は ext4 (ホーム) で。openrace は 5 秒
     openfast) cmd="./$t $HOME" ;;
     openrace) cmd="./$t $HOME 5" ;;
+    # cwdrace (fd の表をスレッドで分けたときの大きなロックなしの open と stat、chdir と dup2 といっしょに) も ext4 で 3 秒
+    cwdrace) cmd="./$t $HOME 3" ;;
     # efivarfs は root で (UEFI の変数を作る・消す・chattr。UEFI から起動していなければ何もしない)
     efivarfs) cmd="sudo -n ./$t" ;;
     # nftables も root で (nft のパッケージがなければ何もしない。出すだけのテスト: 手本の Linux とくらべるのは外で)

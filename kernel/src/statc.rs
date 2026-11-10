@@ -22,8 +22,8 @@
 // 表の 1 つは AtomicU64 の並び (seqlock: 書く側は seq を CAS で奇数にしてから書いて偶数に (取れなければ、ほかの人が書いている
 // ので書かない: 覚えなので、なくてもよい)。読む側は前後で
 // seq を見て、ちがえばふつうの道へ)。Rc にも RefCell にもヒープにもさわらない。
-// どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していなくて、fd の表 (cwd) を自分だけで
-// 使っているもの (スレッドがいれば、ほかのスレッドが chdir するかもしれない)。ある答えは ext4 のファイルだけ (tmpfs や /proc
+// どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していないもの (fd の表 (cwd もそこ) を
+// ほかのスレッドと分けていれば、門を通って読む: ほかのスレッドの chdir は、読み終わるのを待つ)。ある答えは ext4 のファイルだけ (tmpfs や /proc
 // は、中身が変わっても印が変わらない)。「ない」はパスの覚えにあるもの (名前が変われば、どのファイルシステムでも vfs が
 // その名前の版を進める)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
 use crate::file::Stat;
@@ -230,22 +230,34 @@ fn words(p: &[u8]) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
-/// このプロセスで使えるか (はじめのマウントの namespace、chroot なし、fd の表を自分だけで)。cwd を返す。
-/// ユーザーの namespace の中も使わない (struct stat の uid と gid は、中の番号に読みかえて書くので)
+/// このプロセスで使えるか (はじめのマウントの namespace、chroot なし)。cwd を返す。fd の表 (cwd もそこにある) をほかの
+/// スレッドと分けていれば、門を通って (Cwd を落とすまで、ほかのスレッドは chdir や close で表を変えられない:
+/// proc::Files::set_cwd)。ユーザーの namespace の中も使わない (struct stat の uid と gid は、中の番号に読みかえて書くので)
 // [lockless]
-fn usable(p: &Proc) -> Option<&str> {
+fn usable(p: &Proc) -> Option<Cwd<'_>> {
     if p.cred.ns.mnt.is_some() || p.cred.ns.user.is_some() {
         return None;
     }
     let files = p.files.as_ref()?;
-    if !files.private() {
-        return None;
-    }
     let f = files.get();
+    let gate = if files.private() { None } else { Some(f.gate.read()?) };
     if !f.root.is_empty() {
         return None;
     }
-    Some(f.cwd.as_str())
+    Some(Cwd { cwd: f.cwd.as_str(), _gate: gate })
+}
+
+/// いまのディレクトリと、それを読んでいるあいだの門 (usable)
+struct Cwd<'a> {
+    cwd: &'a str,
+    _gate: Option<crate::proc::GateRead<'a>>,
+}
+
+impl Cwd<'_> {
+    // [lockless]
+    fn as_bytes(&self) -> &[u8] {
+        self.cwd.as_bytes()
+    }
 }
 
 /// ふつうの道の newfstatat か statx が答えた (大きなロックの中): 表に書く。mg は sysfile の mgtime
@@ -698,13 +710,16 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
         let (blen, dir) = dir_base(p, dirfd, &mut buf)?;
         (normalize(&buf[..blen], path, norm)?, Some((blen, dir)))
     };
+    // cwd と fd の表はもう見ない (門を出る: ほかのスレッドの chdir や close を、ext4 で引くあいだ待たせない)
+    drop(cwd);
     // 表になければ (古ければ)、親のディレクトリから名前を 1 つ引いて (learn_lookup)
     check(p, &norm[..len], follow, ino).or_else(|| learn_lookup(p, &norm[..len], follow, base)).map(|a| (a, len, base))
 }
 
 /// 開いているディレクトリ dirfd (fstatat や openat の) の、畳んだパスを out に (その長さと inode の番号): ext4 の
 /// ディレクトリで、そのパスがいまも表でその inode をさすときだけ (開いたあとで名前を変えたり、上にかぶせたりしていれば、ふつうの道が inode からたどる)。
-/// fd の表は自分だけのもの (usable): 見ているあいだにだれも変えない。OpenFile の kind は作ったときのまま
+/// fd の表は usable の門の中で読む (自分だけのものか、ほかのスレッドが変えられない): 見ているあいだにだれも変えない。
+/// OpenFile の kind は作ったときのまま
 // [lockless]
 fn dir_base(p: &Proc, dirfd: i64, out: &mut [u8; PATH]) -> Option<(usize, u64)> {
     let t = p.files.as_ref()?.get();
@@ -737,6 +752,7 @@ pub fn dir_lookup(p: &Proc, dirfd: i64, dpath: &[u8], norm: &mut [u8; PATH]) -> 
     }
     let cwd = usable(p)?;
     let len = normalize(cwd.as_bytes(), dpath, norm)?;
+    drop(cwd);
     match check(p, &norm[..len], true, false)? {
         Answer::Found(st, ..) if st.mode & 0o170000 == 0o040000 => Some((st.ino, len)),
         _ => None,

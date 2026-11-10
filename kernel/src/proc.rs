@@ -128,7 +128,8 @@ pub struct Files {
     pub nofile: usize,
     /// 作るファイルの mode から外すもの (umask。fork で受けつぐ。Linux の fs_struct と同じくスレッドで共有)
     pub umask: u32,
-    /// 大きなロックなしの read / write (file::Pipe::fast_rw) が、ほかのスレッドと分けている表を見るための門
+    /// 大きなロックなしの read / write (file::Pipe::fast_rw)、stat、open が、ほかのスレッドと分けている表 (fds と cwd、
+    /// root) を見るための門
     pub gate: Gate,
     /// 閉じたふつうのファイルの棚 (file::Shelf。大きなロックなしの open / close が使う。fork と exec では受けつがない)
     pub shelf: crate::file::Shelf,
@@ -233,6 +234,25 @@ impl Files {
         self.fds.get(fd as usize)?.as_ref().map(|f| &f.file)
     }
 
+    /// いまのディレクトリを変える (chdir、fchdir。大きなロックの中で)。ほかのスレッドが大きなロックなしの stat や open
+    /// (statc::usable) で読んでいるあいだは待つ (前のものは門の外で落とす)
+    pub fn set_cwd(&mut self, cwd: String) {
+        let old = {
+            let _w = self.gate.write();
+            core::mem::replace(&mut self.cwd, cwd)
+        };
+        drop(old);
+    }
+
+    /// chroot のルートを変える (set_cwd と同じく門を通して)
+    pub fn set_root(&mut self, root: String) {
+        let old = {
+            let _w = self.gate.write();
+            core::mem::replace(&mut self.root, root)
+        };
+        drop(old);
+    }
+
     /// ほかのプロセスの表から写す (procfs、pidfd_getfd)。持ち主は大きなロックなしで fd を置いたり棚へしまったり
     /// (file::fast_open、fast_close) するので、棚のロックの中で
     pub fn get_other(&self, fd: u64) -> Option<(FileRef, bool)> {
@@ -240,17 +260,24 @@ impl Files {
         self.fds.get(fd as usize)?.as_ref().map(|f| (f.file.clone(), f.cloexec))
     }
 
-    /// minfd 以上で空いている一番小さい fd に置く
+    /// minfd 以上で空いている一番小さい fd に置く。空きは門の中で選び、ほかのスレッドの大きなロックなしの open がとっておいた
+    /// fd (file::reserve) はとばす
     pub fn add(&mut self, file: FileRef, cloexec: bool, minfd: usize) -> Option<usize> {
-        let i = (minfd..self.nofile).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()))?;
+        let _w = self.gate.write();
+        let i = (minfd..self.nofile).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none()) && !self.shelf.reserved(i))?;
         self.set(i, Some(Fd { file, cloexec }));
         Some(i)
     }
 
     /// fd i に置く (あったものは閉じる: dup2 と同じ。Linux の replace_fd: RLIMIT_NOFILE をこえれば EBADF)
+    /// ほかのスレッドの大きなロックなしの open がとっておいた fd (まだ置いていない) なら EBUSY (Linux の do_dup2 と同じ)
     pub fn put_at(&mut self, i: usize, file: FileRef, cloexec: bool) -> Result<usize, i64> {
         if i >= self.nofile {
             return Err(-9);
+        }
+        let _w = self.gate.write();
+        if self.shelf.reserved(i) {
+            return Err(-16);
         }
         self.set(i, Some(Fd { file, cloexec }));
         Ok(i)
