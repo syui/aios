@@ -3305,6 +3305,8 @@ impl PageTable {
                 in(reg) self.root_pa(),
             );
         }
+        // ほかのアドレス空間へ: Spectre v2 のファームウェアの手当て (Linux の switch_mm の arm64_apply_bp_hardening)
+        crate::cpuvuln::bp_harden();
     }
 
     /// 領域の大きさの合計 (/proc の VmSize)

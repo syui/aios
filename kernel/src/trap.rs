@@ -15,6 +15,10 @@ impl TrapFrame {
     }
 }
 
+// ベクタは 5 とおり (cpuvuln.rs が起動のときに選ぶ: Linux の __bp_harden_el1_vectors と同じく、ユーザー (EL0) から
+// 入るところにだけ Spectre-BHB の手当てを、最初の間接分岐より前に): 手当てなし、分岐の履歴を消すループ (回数は
+// cpuvuln::BHB_K)、CLRBHB の命令、ファームウェアの SMCCC_ARCH_WORKAROUND_3 (hvc / smc)。x0 と x1 は先に置いてあるので
+// 使ってよい。ファームウェアは x0〜x3 を変えるので、x2 と x3 も置いてから呼び、あとでもどす
 core::arch::global_asm!(
     r#"
 .macro VENTRY kind
@@ -25,10 +29,41 @@ core::arch::global_asm!(
     b       trap_common
 .endm
 
-.section .text
+.macro VENTRY_BHB kind, how
+    .balign 0x80
+    sub     sp, sp, #272
+    stp     x0, x1, [sp, #0]
+    .if \how == 1
+    adrp    x0, {bhb_k}
+    ldr     w0, [x0, :lo12:{bhb_k}]
+1:
+    b       . + 4
+    subs    w0, w0, #1
+    b.ne    1b
+    dsb     nsh
+    isb
+    .elseif \how == 2
+    hint    #22
+    isb
+    .else
+    stp     x2, x3, [sp, #16]
+    movz    w0, #0x3fff
+    movk    w0, #0x8000, lsl #16
+    .if \how == 3
+    hvc     #0
+    .else
+    smc     #0
+    .endif
+    ldp     x2, x3, [sp, #16]
+    .endif
+    mov     x1, #\kind
+    b       trap_common
+.endm
+
+.macro VTABLE name, how
 .balign 0x800
-.global vectors
-vectors:
+.global \name
+\name:
     VENTRY 0
     VENTRY 1
     VENTRY 2
@@ -37,6 +72,7 @@ vectors:
     VENTRY 5
     VENTRY 6
     VENTRY 7
+    .if \how == 0
     VENTRY 8
     VENTRY 9
     VENTRY 10
@@ -45,6 +81,24 @@ vectors:
     VENTRY 13
     VENTRY 14
     VENTRY 15
+    .else
+    VENTRY_BHB 8, \how
+    VENTRY_BHB 9, \how
+    VENTRY_BHB 10, \how
+    VENTRY_BHB 11, \how
+    VENTRY_BHB 12, \how
+    VENTRY_BHB 13, \how
+    VENTRY_BHB 14, \how
+    VENTRY_BHB 15, \how
+    .endif
+.endm
+
+.section .text
+    VTABLE vectors, 0
+    VTABLE vectors_bhb_loop, 1
+    VTABLE vectors_bhb_insn, 2
+    VTABLE vectors_bhb_hvc, 3
+    VTABLE vectors_bhb_smc, 4
 
 trap_common:
     stp     x2, x3, [sp, #16]
@@ -94,7 +148,8 @@ trap_ret:
     ldp     x0, x1, [sp, #0]
     add     sp, sp, #272
     eret
-"#
+"#,
+    bhb_k = sym crate::cpuvuln::BHB_K,
 );
 
 // ベクタの並び: [EL1t, EL1h, EL0 64bit, EL0 32bit] x [sync, irq, fiq, serror]
@@ -102,6 +157,7 @@ const EL1H_SYNC: u64 = 4;
 const EL1H_IRQ: u64 = 5;
 pub const EL0_SYNC: u64 = 8;
 const EL0_IRQ: u64 = 9;
+const EL0_FIQ: u64 = 10;
 
 const EC_UNKNOWN: u64 = 0x00;
 const EC_SYS64: u64 = 0x18;
@@ -112,16 +168,31 @@ const EC_BRK64: u64 = 0x3c;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_SP_ALIGN: u64 = 0x26;
 const EC_FP: u64 = 0x2c;
+const EC_BREAKPT_LOW: u64 = 0x30;
+const EC_SOFTSTP_LOW: u64 = 0x32;
 
+/// この CPU のベクタ (VBAR_EL1) を置く。Spectre-BHB の手当てのあるものは cpuvuln.rs が起動のときに選ぶ (選んだあとに
+/// もう 1 度呼ぶ。ほかの CPU は起きるときに)
 pub fn init() {
     unsafe extern "C" {
         static vectors: u8;
+        static vectors_bhb_loop: u8;
+        static vectors_bhb_insn: u8;
+        static vectors_bhb_hvc: u8;
+        static vectors_bhb_smc: u8;
     }
+    let v = match crate::cpuvuln::bhb_how() {
+        crate::cpuvuln::BHB_LOOP => &raw const vectors_bhb_loop,
+        crate::cpuvuln::BHB_INSN => &raw const vectors_bhb_insn,
+        crate::cpuvuln::BHB_FW_HVC => &raw const vectors_bhb_hvc,
+        crate::cpuvuln::BHB_FW_SMC => &raw const vectors_bhb_smc,
+        _ => &raw const vectors,
+    };
     unsafe {
         core::arch::asm!(
             "msr vbar_el1, {}",
             "isb",
-            in(reg) &raw const vectors,
+            in(reg) v,
         );
     }
 }
@@ -157,6 +228,20 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         return handle(tf, kind, None, esr());
     }
     let esr = if kind == EL0_SYNC { esr() } else { 0 };
+    // Spectre v2 のファームウェアの手当て (cpuvuln.rs): ユーザーからカーネルのアドレス (ビット 55) で落ちたとき、
+    // 割りこみを開ける前に分岐予測をきれいにする (Linux の el0_ia、el0_pc、el0_breakpt、el0_softstp、el0_interrupt)
+    if (kind == EL0_SYNC || kind == EL0_IRQ || kind == EL0_FIQ) && crate::cpuvuln::bp_fw_on() {
+        let kernel = |a: u64| a & (1 << 55) != 0;
+        let hit = match (kind, esr >> 26) {
+            (EL0_SYNC, EC_IABT_LOW) => kernel(far()),
+            (EL0_SYNC, EC_PC_ALIGN | EC_BREAKPT_LOW | EC_SOFTSTP_LOW) => kernel(tf.elr),
+            (EL0_SYNC, _) => false,
+            _ => kernel(tf.elr),
+        };
+        if hit {
+            crate::cpuvuln::bp_harden();
+        }
+    }
     // 自分のことを読むだけのシステムコールと、自分だけの無名の領域のページフォルトはロックなしで (smp.rs)
     if kind == EL0_SYNC {
         let ec = esr >> 26;

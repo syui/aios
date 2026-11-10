@@ -10,13 +10,21 @@
 //   meltdown           当たれば Vulnerable (aios は KPTI をしない)
 //   spectre_v1         Mitigation: __user pointer sanitization (aios はユーザーのポインタをじかにたどらない:
 //                      ユーザーのページ表を引いてから、カーネルの写しで読み書きする。vm.rs の copy_in / copy_out)
-//   spectre_v2         CSV2 か安全な表のものは Not affected (BHB に当たれば CSV2)。ファームウェアの手当て
-//                      (WORKAROUND_1) を呼ばないので、ほかは Vulnerable。BHB はハードウェア (ECBHB) だけ
+//   spectre_v2         CSV2 か安全な表のものは Not affected (BHB に当たれば CSV2)。ほかはファームウェアの手当て
+//                      (WORKAROUND_1) があれば Branch predictor hardening: Linux と同じく、ユーザーのアドレス空間を
+//                      載せかえるとき (vm::PageTable::activate) と、ユーザーからカーネルのアドレスで落ちたとき (命令の
+//                      フォルト、PC のそろい、ブレークポイント、ステップ、カーネルのアドレスでの割り込み: trap.rs) に呼ぶ。
+//                      なければ Vulnerable。
+//                      Spectre-BHB (v2 が Vulnerable でないときだけ: Linux の「BHB だけ手当てしても意味がない」): ユーザー
+//                      から入るときのベクタ (trap.rs) で、分岐の履歴を消す。ハードウェア (ECBHB) なら何もしない、CLRBHB
+//                      の命令があればそれ、CPU ごとの回数 (Linux の spectre_bhb_loop_affected) のループ、ファームウェア
+//                      (WORKAROUND_3。そのときは WORKAROUND_1 を呼ばない: ベクタのものがかわりになる) の順
 //   spec_store_bypass  SSBS があれば Linux と同じ「prctl で」: カーネルは SSBS を落として動き (SCTLR_EL1.DSSBS = 0)、
 //                      ユーザーはふだん SSBS を立てて (速く)、prctl で止めたスレッドだけ落とす。切りかえのたびに
 //                      スレッドの印から決めなおす。SSBS がなく、ファームウェアの手当て (WORKAROUND_2) だけなら Vulnerable
 //   ほか (x86 のもの)   Not affected
 use alloc::string::String;
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum State {
@@ -52,6 +60,27 @@ const KRYO_2XX_GOLD: (u32, u32) = (0x51, 0x800);
 const KRYO_2XX_SILVER: (u32, u32) = (0x51, 0x801);
 const KRYO_3XX_SILVER: (u32, u32) = (0x51, 0x803);
 const KRYO_4XX_SILVER: (u32, u32) = (0x51, 0x805);
+const A76: (u32, u32) = (0x41, 0xd0b);
+const N1: (u32, u32) = (0x41, 0xd0c);
+const A77: (u32, u32) = (0x41, 0xd0d);
+const A76AE: (u32, u32) = (0x41, 0xd0e);
+const V1: (u32, u32) = (0x41, 0xd40);
+const A78: (u32, u32) = (0x41, 0xd41);
+const A78AE: (u32, u32) = (0x41, 0xd42);
+const X1: (u32, u32) = (0x41, 0xd44);
+const A710: (u32, u32) = (0x41, 0xd47);
+const X2: (u32, u32) = (0x41, 0xd48);
+const N2: (u32, u32) = (0x41, 0xd49);
+const A78C: (u32, u32) = (0x41, 0xd4b);
+const X1C: (u32, u32) = (0x41, 0xd4c);
+const A715: (u32, u32) = (0x41, 0xd4d);
+const X3: (u32, u32) = (0x41, 0xd4e);
+const V2: (u32, u32) = (0x41, 0xd4f);
+const A720: (u32, u32) = (0x41, 0xd81);
+const A720AE: (u32, u32) = (0x41, 0xd89);
+const KRYO_4XX_GOLD: (u32, u32) = (0x51, 0x804);
+const HIP09: (u32, u32) = (0x48, 0xd02);
+const AMPERE1: (u32, u32) = (0xc0, 0xac3);
 
 /// Meltdown に当たらないもの (kpti_safe_list)
 const KPTI_SAFE: [(u32, u32); 15] = [THUNDERX2, BRCM_VULCAN, BRAHMA_B53, A35, A53, A55, A57, A72, A73, TSV110, CARMEL, KRYO_2XX_GOLD, KRYO_2XX_SILVER, KRYO_3XX_SILVER, KRYO_4XX_SILVER];
@@ -62,11 +91,52 @@ const V4_SAFE: [(u32, u32); 6] = [A35, A53, A55, BRAHMA_B53, KRYO_3XX_SILVER, KR
 /// Spectre-BHB に当たらないもの (spectre_bhb_safe_list)
 const BHB_SAFE: [(u32, u32); 9] = [A35, A53, A55, A510, A520, BRAHMA_B53, KRYO_2XX_SILVER, KRYO_3XX_SILVER, KRYO_4XX_SILVER];
 
+/// Spectre-BHB の、分岐の履歴を消すループの回数 (Linux 7.4 の spectre_bhb_loop_affected の表)
+const BHB_K132: [(u32, u32); 2] = [X3, V2];
+const BHB_K38: [(u32, u32); 3] = [A715, A720, A720AE];
+const BHB_K32: [(u32, u32); 10] = [A78, A78AE, A78C, X1, X1C, A710, X2, N2, V1, TSV110];
+const BHB_K24: [(u32, u32); 6] = [A76, A76AE, A77, N1, KRYO_4XX_GOLD, HIP09];
+const BHB_K11: [(u32, u32); 1] = [AMPERE1];
+const BHB_K8: [(u32, u32); 2] = [A72, A57];
+
+fn bhb_loop_k(me: (u32, u32)) -> u32 {
+    let is = |list: &[(u32, u32)]| list.contains(&me);
+    if is(&BHB_K132) {
+        132
+    } else if is(&BHB_K38) {
+        38
+    } else if is(&BHB_K32) {
+        32
+    } else if is(&BHB_K24) {
+        24
+    } else if is(&BHB_K11) {
+        11
+    } else if is(&BHB_K8) {
+        8
+    } else {
+        0
+    }
+}
+
+/// ユーザーから入るときの Spectre-BHB の手当て (trap.rs がベクタを選ぶ)
+pub const BHB_NONE: u8 = 0;
+pub const BHB_LOOP: u8 = 1;
+pub const BHB_INSN: u8 = 2;
+pub const BHB_FW_HVC: u8 = 3;
+pub const BHB_FW_SMC: u8 = 4;
+static BHB_HOW: AtomicU8 = AtomicU8::new(BHB_NONE);
+/// ループの回数 (trap.rs のベクタが読む)
+#[unsafe(no_mangle)]
+pub static BHB_K: AtomicU32 = AtomicU32::new(0);
+/// Spectre v2 のファームウェアの手当て (ARCH_WORKAROUND_1) を呼ぶ道: 0 呼ばない、1 hvc、2 smc
+static BP_FW: AtomicU8 = AtomicU8::new(0);
+
 // SMCCC
 const SMCCC_VERSION: u32 = 0x8000_0000;
 const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
 const WORKAROUND_1: u32 = 0x8000_8000;
 const WORKAROUND_2: u32 = 0x8000_7fff;
+const WORKAROUND_3: u32 = 0x8000_3fff;
 const PSCI_VERSION: u32 = 0x8400_0000;
 const PSCI_FEATURES: u32 = 0x8400_000a;
 const RET_SUCCESS: i64 = 0;
@@ -114,12 +184,14 @@ fn field(v: u64, shift: u32) -> u64 {
 
 /// 起動のとき (DTB のあと、ほかの CPU を起こす前): CPU 0 を見て決める (aios はみな同じ CPU とみなす)
 pub fn init() {
-    let (midr, pfr0, pfr1, mmfr1): (u64, u64, u64, u64);
+    let (midr, pfr0, pfr1, mmfr1, isar2): (u64, u64, u64, u64, u64);
     unsafe {
         core::arch::asm!("mrs {}, midr_el1", out(reg) midr);
         core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0);
         core::arch::asm!("mrs {}, id_aa64pfr1_el1", out(reg) pfr1);
         core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1);
+        // ID_AA64ISAR2_EL1 (S3_0_C0_C6_2。古いアセンブラは名前を知らない)
+        core::arch::asm!("mrs {}, s3_0_c0_c6_2", out(reg) isar2);
     }
     let me = (((midr >> 24) & 0xff) as u32, ((midr >> 4) & 0xfff) as u32);
     let is = |list: &[(u32, u32)]| list.contains(&me);
@@ -128,23 +200,40 @@ pub fn init() {
     let csv3 = field(pfr0, 60);
     let ssbs = field(pfr1, 4) >= 1;
     let ecbhb = field(mmfr1, 60) >= 1;
+    let clrbhb = field(isar2, 28) >= 1;
+    let conduit = match crate::dtb::psci_method() {
+        Some("hvc") => 1,
+        Some("smc") => 2,
+        _ => 0,
+    };
     let meltdown = if is(&KPTI_SAFE) || csv3 >= 1 { State::Unaffected } else { State::Vulnerable };
-    let v2 = if csv2 >= 1 || is(&V2_SAFE) {
-        State::Unaffected
+    let v2 = if csv2 >= 1 || is(&V2_SAFE) { State::Unaffected } else { firmware(WORKAROUND_1, smccc) };
+    // Spectre-BHB: 当たるもの (CSV2_3 でも安全な表でもない) は、v2 が Vulnerable なら手当てしない (Linux と同じ)。
+    // ハードウェア (ECBHB)、CLRBHB、ループ、ファームウェア (WORKAROUND_3) の順
+    let k = bhb_loop_k(me);
+    let (bhb, how) = if csv2 == 3 || is(&BHB_SAFE) {
+        (State::Unaffected, BHB_NONE)
+    } else if v2 == State::Vulnerable {
+        (State::Vulnerable, BHB_NONE)
+    } else if ecbhb {
+        (State::Mitigated, BHB_NONE)
+    } else if clrbhb {
+        (State::Mitigated, BHB_INSN)
+    } else if k > 0 {
+        (State::Mitigated, BHB_LOOP)
+    } else if conduit != 0 && firmware(WORKAROUND_3, smccc) == State::Mitigated {
+        (State::Mitigated, if conduit == 1 { BHB_FW_HVC } else { BHB_FW_SMC })
     } else {
-        match firmware(WORKAROUND_1, smccc) {
-            State::Unaffected => State::Unaffected,
-            // あっても aios は呼ばない
-            _ => State::Vulnerable,
-        }
+        (State::Vulnerable, BHB_NONE)
     };
-    let bhb = if csv2 == 3 || is(&BHB_SAFE) {
-        State::Unaffected
-    } else if v2 != State::Vulnerable && ecbhb {
-        State::Mitigated
-    } else {
-        State::Vulnerable
-    };
+    BHB_K.store(k, Ordering::Relaxed);
+    BHB_HOW.store(how, Ordering::Relaxed);
+    // v2 をファームウェアで手当てする (ベクタで WORKAROUND_3 を呼ぶなら、そちらがかわり)
+    if v2 == State::Mitigated && how != BHB_FW_HVC && how != BHB_FW_SMC {
+        BP_FW.store(conduit, Ordering::Relaxed);
+    }
+    // この CPU のベクタを選びなおす (ほかの CPU は起きるときに trap::init で)
+    crate::trap::init();
     let v4 = if is(&V4_SAFE) {
         State::Unaffected
     } else if ssbs {
@@ -164,6 +253,26 @@ pub fn init() {
 
 pub fn get() -> &'static Vuln {
     VULN.get()
+}
+
+/// ユーザーから入るときの Spectre-BHB の手当て (BHB_*)
+pub fn bhb_how() -> u8 {
+    BHB_HOW.load(Ordering::Relaxed)
+}
+
+/// Spectre v2 のファームウェアの手当てを呼ぶか (trap.rs が、ユーザーからカーネルのアドレスで落ちたときに見る)
+pub fn bp_fw_on() -> bool {
+    BP_FW.load(Ordering::Relaxed) != 0
+}
+
+/// Spectre v2 のファームウェアの手当て (SMCCC_ARCH_WORKAROUND_1: 分岐予測をきれいにする)。手当てがなければ何もしない
+/// (Linux の arm64_apply_bp_hardening)。SMCCC 1.1 は x4 からあとを変えない
+pub fn bp_harden() {
+    match BP_FW.load(Ordering::Relaxed) {
+        1 => unsafe { core::arch::asm!("hvc #0", inout("x0") WORKAROUND_1 as u64 => _, out("x1") _, out("x2") _, out("x3") _, options(nostack)) },
+        2 => unsafe { core::arch::asm!("smc #0", inout("x0") WORKAROUND_1 as u64 => _, out("x1") _, out("x2") _, out("x3") _, options(nostack)) },
+        _ => {}
+    }
 }
 
 /// /sys/devices/system/cpu/vulnerabilities/NAME の中身 (Linux の cpu_show_* と同じ書き方。ファイルの一覧は sysfs.rs)
