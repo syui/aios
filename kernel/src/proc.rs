@@ -993,6 +993,25 @@ fn make_runnable(p: &mut Proc) {
     }
 }
 
+/// CPU c の (走っていた時間, カーネルにいた時間) (ns。/proc/stat: RUN_NS と SYS_NS に、いま走っているスレッドの
+/// 走りはじめからの分も)
+pub fn cpu_times(c: usize) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = c.min(MAXCPU - 1);
+    let (mut run, mut sys) = (RUN_NS[c].load(Relaxed), SYS_NS[c].load(Relaxed));
+    if let Some(i) = ON_CPU[c].load(Relaxed).checked_sub(1) {
+        let p = &procs()[i];
+        let now = crate::timer::uptime_ns();
+        if p.ran_at != 0 {
+            run += now.saturating_sub(p.ran_at);
+        }
+        if p.kern_at != 0 {
+            sys += now.saturating_sub(p.kern_at);
+        }
+    }
+    (run, sys)
+}
+
 /// CPU ごとの、いま走らせている Proc の添字 + 1 (0 は何も)。起こしたものにゆずらせる相手を、Proc をみな見ずに選ぶ
 static ON_CPU: [core::sync::atomic::AtomicUsize; crate::smp::MAXCPU] = [const { core::sync::atomic::AtomicUsize::new(0) }; crate::smp::MAXCPU];
 
@@ -1335,8 +1354,12 @@ pub fn decay_recent() {
 
 const MAXCPU: usize = 16;
 
-/// CPU ごとの、プロセスが走っていた tick (/proc/stat。残りは休んでいた)
-pub static BUSY: [core::sync::atomic::AtomicU64; MAXCPU] = [const { core::sync::atomic::AtomicU64::new(0) }; MAXCPU];
+/// CPU ごとの、スレッドが走っていた時間と、そのうちカーネルにいた時間 (ns。/proc/stat の user と system: スレッドの
+/// cpu_ns と sys_ns を足すところで、その CPU にも。いま走っているものの分は cpu_times が足す)。前は tick で、タイマの
+/// 割りこみが来たときにスレッドがいたかを数えたが、カーネルは割りこみを止めて走るので、カーネルにいた時間が休んで
+/// いたことになっていた
+pub static RUN_NS: [core::sync::atomic::AtomicU64; MAXCPU] = [const { core::sync::atomic::AtomicU64::new(0) }; MAXCPU];
+pub static SYS_NS: [core::sync::atomic::AtomicU64; MAXCPU] = [const { core::sync::atomic::AtomicU64::new(0) }; MAXCPU];
 
 /// load average (1, 5, 15 分。Linux と同じ 11 ビットの固定小数点、5 秒ごとに指数で平均)
 pub static LOAD: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
@@ -1414,12 +1437,15 @@ pub fn scheduler() -> ! {
                 // 走った時間とカーネルの時間を足す (終わったスレッドは、終わるときに代表へわたして 0 にしている)
                 let q = &mut procs()[i];
                 let now = crate::timer::uptime_ns();
+                let c = crate::smp::id().min(MAXCPU - 1);
                 if q.ran_at != 0 {
                     q.cpu_ns += now.saturating_sub(q.ran_at);
+                    RUN_NS[c].fetch_add(now.saturating_sub(q.ran_at), Relaxed);
                     q.ran_at = 0;
                 }
                 if q.kern_at != 0 {
                     q.sys_ns += now.saturating_sub(q.kern_at);
+                    SYS_NS[c].fetch_add(now.saturating_sub(q.kern_at), Relaxed);
                     q.kern_at = 0;
                 }
                 set_cur(None);
@@ -2188,9 +2214,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
 /// タイマの割り込みから: いま動いているプロセスに 1 tick つける。
 /// カーネルの中では割り込みを止めているので、動いていたのはユーザーモード
 pub fn account_tick() {
-    let c = crate::smp::id().min(MAXCPU - 1);
     if let Some(i) = cur() {
-        BUSY[c].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let p = &mut procs()[i];
         p.utime += 1;
         p.recent = p.recent.saturating_add(1);
@@ -2239,7 +2263,9 @@ pub fn kernel_enter() {
 pub fn kernel_leave() {
     if let Some(p) = try_current() {
         if p.kern_at != 0 {
-            p.sys_ns += crate::timer::uptime_ns().saturating_sub(p.kern_at);
+            let d = crate::timer::uptime_ns().saturating_sub(p.kern_at);
+            p.sys_ns += d;
+            SYS_NS[crate::smp::id().min(MAXCPU - 1)].fetch_add(d, core::sync::atomic::Ordering::Relaxed);
             p.kern_at = 0;
         }
     }

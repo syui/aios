@@ -559,16 +559,26 @@ fn user_bytes(p: &mut Proc, start: usize, end: usize) -> Option<Vec<u8>> {
     Some(b)
 }
 
-/// /proc/stat: CPU ごとの時間 (tick。user と idle だけ数える)、起動した時刻、作ったプロセスの数など
+/// /proc/stat: CPU ごとの時間 (USER_HZ の tick: user、system、idle。スレッドが走った時間と、そのうちカーネルにいた
+/// 時間を ns で数えたもの: proc::RUN_NS と SYS_NS)、起動した時刻、作ったプロセスの数など
 fn stat_all() -> String {
-    use core::sync::atomic::Ordering::Relaxed;
     let now = crate::timer::ticks();
+    let tick = 1_000_000_000 / crate::timer::HZ;
     let n = crate::smp::online();
-    let busy: Vec<u64> = (0..n).map(|c| proc::BUSY[c].load(Relaxed).min(now)).collect();
-    let line = |name: &str, u: u64, idle: u64| format!("{} {} 0 0 {} 0 0 0 0 0 0\n", name, u, idle);
-    let mut s = line("cpu", busy.iter().sum(), busy.iter().map(|b| now - b).sum());
-    for (c, b) in busy.iter().enumerate() {
-        s += &line(&format!("cpu{}", c), *b, now - b);
+    // (user, system, idle)
+    let cpus: Vec<(u64, u64, u64)> = (0..n)
+        .map(|c| {
+            let (run, sys) = proc::cpu_times(c);
+            let run = (run / tick).min(now);
+            let sys = (sys / tick).min(run);
+            (run - sys, sys, now - run)
+        })
+        .collect();
+    let line = |name: &str, (u, sy, idle): (u64, u64, u64)| format!("{} {} 0 {} {} 0 0 0 0 0 0\n", name, u, sy, idle);
+    let sum = cpus.iter().fold((0, 0, 0), |a, c| (a.0 + c.0, a.1 + c.1, a.2 + c.2));
+    let mut s = line("cpu", sum);
+    for (c, t) in cpus.iter().enumerate() {
+        s += &line(&format!("cpu{}", c), *t);
     }
     let boot = (crate::timer::epoch_ns() / 1_000_000_000).saturating_sub(now / crate::timer::HZ);
     let blocked = 0;
