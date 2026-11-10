@@ -1,14 +1,25 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/findutils)
+# xargs-max-procs.patch: xargs の -P (いくつかを並べて動かす)。配布元はオプションを受けとるだけで「NOT IMPLEMENTED」
+# (0.11.0 と main)。GNU と同じく、max-procs こ走っていれば、どれかが終わるのを待って次を (0 は上限なし)。255 で
+# 終わるか殺されたものがあれば、走っているものを待ってから止める。テスト (tests/test_xargs.rs) も。配布元に出すまで
 pkgname=findutils
 pkgver=0.11.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Rust implementation of GNU findutils: find, xargs (uutils)'
 arch=('aarch64')
 url='https://github.com/uutils/findutils'
 license=('MIT')
 makedepends=('git' 'rustup' 'aarch64-linux-gnu-gcc')
-source=("git+https://github.com/uutils/findutils#tag=$pkgver")
-sha256sums=('SKIP')
+source=("git+https://github.com/uutils/findutils#tag=$pkgver"
+        xargs-max-procs.patch)
+sha256sums=('SKIP'
+            '5b1a424c43e7e101c8f20db18de6a47216449357894758d90cfaecd9c87e9716')
+
+prepare() {
+  cd findutils
+  git checkout -- .
+  patch -p1 < "$srcdir/xargs-max-procs.patch"
+}
 
 build() {
   . "$startdir/../cross.sh"

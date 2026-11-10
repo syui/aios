@@ -1,0 +1,439 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 54cb21b..c03cfb1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,7 +22,7 @@ argmax = "0.4.0"
+ chrono = "0.4.45"
+ clap = { version = "4.6", features = ["env"] }
+ faccess = "0.2.4"
+-nix = { version = "0.31", features = ["fs", "user"] }
++nix = { version = "0.31", features = ["fs", "user", "process", "signal"] }
+ onig = { version = "6.5", default-features = false }
+ parse_datetime = "0.17.0"
+ regex = "1.12"
+diff --git a/src/xargs/mod.rs b/src/xargs/mod.rs
+index 8347dd3..d88e258 100644
+--- a/src/xargs/mod.rs
++++ b/src/xargs/mod.rs
+@@ -49,6 +49,7 @@ struct Options {
+     replace: Option<String>,
+     verbose: bool,
+     eof_delimiter: Option<String>,
++    max_procs: usize,
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -461,7 +462,7 @@ impl CommandBuilder<'_> {
+         Ok(())
+     }
+ 
+-    fn execute(self) -> Result<CommandResult, CommandExecutionError> {
++    fn command(&self) -> Command {
+         let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
+             ExecAction::Command(args) => (&args[0], &args[1..]),
+             ExecAction::Echo => (OsStr::new("echo"), &[]),
+@@ -502,36 +503,14 @@ impl CommandBuilder<'_> {
+             eprintln!("{command:?}");
+         }
+ 
++        command
++    }
++
++    fn execute(self) -> Result<CommandResult, CommandExecutionError> {
+         match &self.options.action {
+-            ExecAction::Command(_) => match command.status() {
+-                Ok(status) => {
+-                    if status.success() {
+-                        Ok(CommandResult::Success)
+-                    } else if let Some(err) = status.code() {
+-                        if err == 255 {
+-                            Err(CommandExecutionError::UrgentlyFailed)
+-                        } else {
+-                            Ok(CommandResult::Failure)
+-                        }
+-                    } else {
+-                        #[cfg(unix)]
+-                        {
+-                            use std::os::unix::process::ExitStatusExt;
+-                            if let Some(signal) = status.signal() {
+-                                Err(CommandExecutionError::Killed { signal })
+-                            } else {
+-                                Err(CommandExecutionError::Unknown)
+-                            }
+-                        }
+-
+-                        #[cfg(not(unix))]
+-                        Err(CommandExecutionError::Unknown)
+-                    }
+-                }
+-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+-                    Err(CommandExecutionError::NotFound)
+-                }
+-                Err(e) => Err(CommandExecutionError::CannotRun(e)),
++            ExecAction::Command(_) => match self.command().status() {
++                Ok(status) => status_result(status),
++                Err(e) => Err(spawn_error(e)),
+             },
+             ExecAction::Echo => {
+                 println!(
+@@ -546,6 +525,161 @@ impl CommandBuilder<'_> {
+             }
+         }
+     }
++
++    /// Start the command without waiting for it (`-P`). `echo` runs right away.
++    #[cfg(unix)]
++    fn spawn(self) -> Result<Spawned, CommandExecutionError> {
++        match &self.options.action {
++            ExecAction::Command(_) => self
++                .command()
++                .spawn()
++                .map(Spawned::Child)
++                .map_err(spawn_error),
++            ExecAction::Echo => self.execute().map(Spawned::Done),
++        }
++    }
++}
++
++#[cfg(unix)]
++enum Spawned {
++    Child(std::process::Child),
++    Done(CommandResult),
++}
++
++fn spawn_error(e: io::Error) -> CommandExecutionError {
++    if e.kind() == io::ErrorKind::NotFound {
++        CommandExecutionError::NotFound
++    } else {
++        CommandExecutionError::CannotRun(e)
++    }
++}
++
++fn code_result(code: i32) -> Result<CommandResult, CommandExecutionError> {
++    match code {
++        0 => Ok(CommandResult::Success),
++        255 => Err(CommandExecutionError::UrgentlyFailed),
++        _ => Ok(CommandResult::Failure),
++    }
++}
++
++fn status_result(status: std::process::ExitStatus) -> Result<CommandResult, CommandExecutionError> {
++    if let Some(code) = status.code() {
++        return code_result(code);
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::process::ExitStatusExt;
++        if let Some(signal) = status.signal() {
++            return Err(CommandExecutionError::Killed { signal });
++        }
++    }
++    Err(CommandExecutionError::Unknown)
++}
++
++/// The commands running at the same time (`-P max-procs`, as in GNU xargs: while `max` are
++/// running, wait for any one of them to finish before starting the next; 0 means no limit).
++/// With 1 (the default) each command is waited for before more input is read, as before.
++struct Running {
++    max: usize,
++    #[cfg(unix)]
++    children: Vec<std::process::Child>,
++}
++
++impl Running {
++    fn new(max: usize) -> Self {
++        Self {
++            max,
++            #[cfg(unix)]
++            children: Vec::new(),
++        }
++    }
++
++    fn run(
++        &mut self,
++        builder: CommandBuilder,
++        result: &mut CommandResult,
++    ) -> Result<(), XargsError> {
++        #[cfg(unix)]
++        if self.max != 1 {
++            while self.max != 0 && self.children.len() >= self.max {
++                self.reap_one(result)?;
++            }
++            match builder.spawn() {
++                Ok(Spawned::Child(c)) => self.children.push(c),
++                Ok(Spawned::Done(r)) => result.combine(r),
++                Err(e) => {
++                    self.wait_all();
++                    return Err(e.into());
++                }
++            }
++            return Ok(());
++        }
++        result.combine(builder.execute()?);
++        Ok(())
++    }
++
++    /// Wait for every command that is still running.
++    fn finish(&mut self, result: &mut CommandResult) -> Result<(), XargsError> {
++        #[cfg(unix)]
++        while !self.children.is_empty() {
++            self.reap_one(result)?;
++        }
++        let _ = result;
++        Ok(())
++    }
++
++    /// Wait for whichever running command finishes first. If it failed so that xargs stops
++    /// (exit status 255, killed by a signal), wait for the others too before returning the error.
++    #[cfg(unix)]
++    // The `Child` that is dropped here has already been reaped by `waitpid`.
++    #[allow(clippy::zombie_processes)]
++    fn reap_one(&mut self, result: &mut CommandResult) -> Result<(), XargsError> {
++        use nix::errno::Errno;
++        use nix::sys::wait::{waitpid, WaitStatus};
++        use nix::unistd::Pid;
++        loop {
++            let (pid, r) = match waitpid(Pid::from_raw(-1), None) {
++                Ok(WaitStatus::Exited(pid, code)) => (pid, code_result(code)),
++                Ok(WaitStatus::Signaled(pid, signal, _)) => (
++                    pid,
++                    Err(CommandExecutionError::Killed {
++                        signal: signal as i32,
++                    }),
++                ),
++                Ok(_) | Err(Errno::EINTR) => continue,
++                Err(e) => {
++                    self.children.clear();
++                    return Err(XargsError::Io(io::Error::from(e)));
++                }
++            };
++            // Already reaped: dropping the `Child` does not wait for it again.
++            let Some(i) = self
++                .children
++                .iter()
++                .position(|c| c.id() == pid.as_raw() as u32)
++            else {
++                continue;
++            };
++            self.children.swap_remove(i);
++            return match r {
++                Ok(r) => {
++                    result.combine(r);
++                    Ok(())
++                }
++                Err(e) => {
++                    self.wait_all();
++                    Err(e.into())
++                }
++            };
++        }
++    }
++
++    #[cfg(unix)]
++    fn wait_all(&mut self) {
++        for mut c in self.children.drain(..) {
++            let _ = c.wait();
++        }
++    }
+ }
+ 
+ trait ArgumentReader {
+@@ -851,6 +985,7 @@ struct InputProcessOptions {
+     max_args: Option<usize>,
+     max_lines: Option<usize>,
+     no_run_if_empty: bool,
++    max_procs: usize,
+ }
+ 
+ impl InputProcessOptions {
+@@ -859,12 +994,14 @@ impl InputProcessOptions {
+         max_args: Option<usize>,
+         max_lines: Option<usize>,
+         no_run_if_empty: bool,
++        max_procs: usize,
+     ) -> Self {
+         Self {
+             exit_if_pass_char_limit,
+             max_args,
+             max_lines,
+             no_run_if_empty,
++            max_procs,
+         }
+     }
+ }
+@@ -877,31 +1014,42 @@ fn process_input(
+     let mut current_builder = CommandBuilder::new(builder_options);
+     let mut have_pending_command = false;
+     let mut result = CommandResult::Success;
++    let mut running = Running::new(options.max_procs);
++
++    let r = (|| {
++        while let Some(arg) = args.next()? {
++            if let Err(ExhaustedCommandSpace { arg, out_of_chars }) = current_builder.add_arg(arg) {
++                if out_of_chars
++                    && options.exit_if_pass_char_limit
++                    && (options.max_args.is_some() || options.max_lines.is_some())
++                {
++                    return Err(XargsError::ArgumentTooLarge);
++                }
++                let full =
++                    std::mem::replace(&mut current_builder, CommandBuilder::new(builder_options));
++                if have_pending_command {
++                    running.run(full, &mut result)?;
++                }
+ 
+-    while let Some(arg) = args.next()? {
+-        if let Err(ExhaustedCommandSpace { arg, out_of_chars }) = current_builder.add_arg(arg) {
+-            if out_of_chars
+-                && options.exit_if_pass_char_limit
+-                && (options.max_args.is_some() || options.max_lines.is_some())
+-            {
+-                return Err(XargsError::ArgumentTooLarge);
+-            }
+-            if have_pending_command {
+-                result.combine(current_builder.execute()?);
++                if let Err(ExhaustedCommandSpace { .. }) = current_builder.add_arg(arg) {
++                    return Err(XargsError::ArgumentTooLarge);
++                }
+             }
+ 
+-            current_builder = CommandBuilder::new(builder_options);
+-            if let Err(ExhaustedCommandSpace { .. }) = current_builder.add_arg(arg) {
+-                return Err(XargsError::ArgumentTooLarge);
+-            }
++            have_pending_command = true;
+         }
+ 
+-        have_pending_command = true;
+-    }
+-
+-    if !options.no_run_if_empty || have_pending_command {
+-        result.combine(current_builder.execute()?);
+-    }
++        if !options.no_run_if_empty || have_pending_command {
++            let last =
++                std::mem::replace(&mut current_builder, CommandBuilder::new(builder_options));
++            running.run(last, &mut result)?;
++        }
++        Ok(())
++    })();
++    // Whatever happened, do not leave commands running behind us.
++    let done = running.finish(&mut result);
++    r?;
++    done?;
+ 
+     Ok(result)
+ }
+@@ -1011,6 +1159,7 @@ fn normalize_options(options: Options, matches: &clap::ArgMatches) -> Options {
+         replace,
+         verbose: options.verbose,
+         eof_delimiter,
++        max_procs: options.max_procs,
+     }
+ }
+ 
+@@ -1083,7 +1232,7 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+             Arg::new(options::MAX_PROCS)
+                 .short('P')
+                 .long(options::MAX_PROCS)
+-                .help("Run up to this many commands in parallel [NOT IMPLEMENTED]")
++                .help("Run up to this many commands in parallel (0: as many as possible)")
+                 .value_parser(clap::value_parser!(usize)),
+         )
+         .arg(
+@@ -1215,6 +1364,10 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+                     .map_or_else(|| "{}".to_string(), std::borrow::ToOwned::to_owned)
+             })
+         }),
++        max_procs: matches
++            .get_one::<usize>(options::MAX_PROCS)
++            .copied()
++            .unwrap_or(1),
+     };
+ 
+     let options = normalize_options(options, &matches);
+@@ -1278,6 +1431,7 @@ fn do_xargs(args: &[&str]) -> Result<CommandResult, XargsError> {
+             options.max_args,
+             options.max_lines,
+             options.no_run_if_empty || options.replace.is_some(),
++            options.max_procs,
+         ),
+     )?;
+     Ok(result)
+diff --git a/tests/test_xargs.rs b/tests/test_xargs.rs
+index 064c5ee..255df53 100644
+--- a/tests/test_xargs.rs
++++ b/tests/test_xargs.rs
+@@ -676,3 +676,72 @@ fn xargs_replace_unterminated_quote() {
+         .stderr_contains("Error: Unterminated quote:")
+         .no_stdout();
+ }
++
++#[cfg(unix)]
++#[test]
++fn xargs_max_procs_runs_in_parallel() {
++    // Four one-second sleeps, four at a time: about one second, not four.
++    let start = std::time::Instant::now();
++    ucmd()
++        .args(&["-P", "4", "-n", "1", "sleep"])
++        .pipe_in("1 1 1 1")
++        .succeeds()
++        .no_output();
++    assert!(start.elapsed() < std::time::Duration::from_secs(3));
++
++    // 0 means as many as possible.
++    let start = std::time::Instant::now();
++    ucmd()
++        .args(&["-P", "0", "-n", "1", "sleep"])
++        .pipe_in("1 1 1 1 1 1")
++        .succeeds()
++        .no_output();
++    assert!(start.elapsed() < std::time::Duration::from_secs(3));
++}
++
++#[cfg(unix)]
++#[test]
++fn xargs_max_procs_failure() {
++    let result = ucmd()
++        .args(&[
++            "-P",
++            "2",
++            "-n1",
++            &path_to_testing_commandline(),
++            "-",
++            "--no_print_cwd",
++            "--exit_with_failure",
++        ])
++        .pipe_in("a b c")
++        .run();
++    result.code_is(123);
++    result.no_stderr();
++    // Every command ran, in some order.
++    for arg in ["a", "b", "c"] {
++        assert!(result
++            .stdout_str()
++            .contains(&format!("--exit_with_failure\n{arg}\n")));
++    }
++}
++
++#[cfg(unix)]
++#[test]
++fn xargs_max_procs_urgent_failure() {
++    let result = ucmd()
++        .args(&[
++            "-P",
++            "2",
++            "-n1",
++            &path_to_testing_commandline(),
++            "-",
++            "--no_print_cwd",
++            "--exit_with_urgent_failure",
++        ])
++        .pipe_in("a b")
++        .run();
++    result.code_is(124);
++    assert!(
++        !result.stderr_str().is_empty(),
++        "stderr should not be empty"
++    );
++}
