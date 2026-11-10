@@ -4,6 +4,8 @@
 //   exec ARG...     /prog を ARG... で (テストのプログラム。/work と /tmp はだれでも書ける)
 //   rootexec ARG... exec と同じだが root のまま (AppArmor のプロファイルを読みこむ test/apparmor.c)
 // securityfs は /sys/kernel/security に (あれば)
+// /now があれば (ホストの時刻: 1970 年からの秒)、時計をそれに合わせる (この Linux は RTC を読まないので 1970 年から始まる。
+// ファイルの時刻が未来になると、make は警告し、zig cc はキャッシュを信じずに毎回 libc を作りなおす)
 // 出力は /work/out.txt、エラーは /work/err.txt、終わりの番号は /work/status。それから電源を切る
 // ループバック (lo、127.0.0.1) は起こしておく (ロボットの AF_INET。aios はいつも 127.0.0.1/8 を持つ)
 #define _GNU_SOURCE
@@ -18,6 +20,7 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -48,6 +51,15 @@ static void lo_up(void) {
 }
 
 int main(void) {
+    FILE *now = fopen("/now", "r");
+    long sec;
+    if (now && fscanf(now, "%ld", &sec) == 1) {
+        struct timeval tv = {sec, 0};
+        if (settimeofday(&tv, NULL) < 0)
+            perror("init: settimeofday");
+    }
+    if (now)
+        fclose(now);
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     mount("securityfs", "/sys/kernel/security", "securityfs", 0, NULL);
