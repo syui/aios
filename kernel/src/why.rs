@@ -110,6 +110,9 @@ pub trait Log: Sync {
     /// 大きなロックなしの stat や open が、ディレクトリ dir (畳んだパス) で name を引いて、なかった
     // [lockless]
     fn fast_missing_at(&self, _p: &crate::proc::Proc, _nr: u64, _dir: &str, _name: &str) {}
+    /// 大きなロックなしの readlinkat が、シンボリックリンクでないと答えた (path はたのんだパス)
+    // [lockless]
+    fn fast_not_link(&self, _p: &crate::proc::Proc, _nr: u64, _path: &str) {}
 }
 
 struct NoLog;
@@ -145,6 +148,13 @@ pub fn fast_missing(p: &crate::proc::Proc, nr: u64, path: &str) {
 // [lockless]
 pub fn fast_missing_at(p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
     LOG.val().fast_missing_at(p, nr, dir, name);
+}
+
+/// 大きなロックなしの readlinkat (statc.rs) が、シンボリックリンクでないと答えた: ふつうの道の not_link と同じわけ
+#[cold]
+// [lockless]
+pub fn fast_not_link(p: &crate::proc::Proc, nr: u64, path: &str) {
+    LOG.val().fast_not_link(p, nr, path);
 }
 
 fn me() -> Option<&'static mut Note> {

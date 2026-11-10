@@ -613,6 +613,13 @@ Linux の lookup_slow)。test/cwdrace.c が、4 つのスレッドが cwd から
 2 つのディレクトリを chdir で行き来して dup2 と close をしても、開いたものの中身と inode がどちらかのファイルのもので、fd が
 重ならず、残らないかを見る (Linux 7.4 でも通る)。rg -c (zig の 2 万のファイル) は -j4 で 1.80 → 0.97 秒、-j1 で
 4.26 → 1.94 秒 (同じ VM の Linux 7.4 は 1.15 と 3.44 秒)。
+rg が開くたびに呼ぶもの (Rust の std の fcntl(F_SETFD)、musl の realpath がパスの段ごとに呼ぶ readlinkat と getcwd) も
+速い道で: fcntl の F_GETFD、F_SETFD、F_GETFL (ファイルだけ) は fd の表の印と開いたファイルの口を見るだけ (表をスレッドで
+分けていれば門の中で)、getcwd は cwd を写すだけ (chroot の中はふつうの道)、readlinkat は statc の表で、シンボリックリンク
+でなければ EINVAL、なければ ENOENT (リンクの中身はふつうの道で。わけはふつうの道と同じものを /proc/ai/why に:
+why::fast_not_link)。rg -j4 の大きなロックの中の fcntl は 2 万回 → 168 回。のこりは close (2 万回、9 µs: 表をスレッドで
+分けていると、ほかのスレッドのふつうの道が同じ OpenFile を写しているかもしれず、棚にしまえない)、opendir (O_DIRECTORY の
+openat。1800 回)、getdents64。
 
 はじめての open-close は 55 µs から 23 µs に、fsbench の open-close は 62 µs から 22〜24 µs に (Linux 7.3 は 23.6 µs)。
 書く口で開くものがパスの覚えを引かなくなったので、write-4k も 120 µs から 92〜126 µs に (Linux は 140 µs)。答えは

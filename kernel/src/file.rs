@@ -1943,6 +1943,61 @@ pub fn fast_lseek(me: &proc::Proc, fd: u64, off: i64, whence: u64) -> Option<i64
     Some(new)
 }
 
+/// 大きなロックなしの fcntl の F_GETFD、F_SETFD、F_GETFL (syscall::fast。Rust の std は開くたびに F_SETFD を呼ぶ):
+/// fd の表の印 (FD_CLOEXEC) と、開いたファイルの口を見るだけ (Linux も files->file_lock と、ロックなしの f_flags)。
+/// ほかのスレッドと表を分けていれば門を通る (見ているあいだ、ふつうの道は fd を閉じたり置きかえたりしない)。F_GETFL は
+/// ファイル (Kind::Inode) だけ (ソケットなどの O_LARGEFILE は FileOps に聞くので、ふつうの道で)。開いていない fd、ほかの
+/// cmd はふつうの道へ
+// [lockless]
+pub fn fast_fcntl(me: &proc::Proc, fd: u64, cmd: u64, arg: u64) -> Option<i64> {
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const FD_CLOEXEC: u64 = 1;
+    const O_LARGEFILE: u32 = 0o400000;
+    if !matches!(cmd, F_GETFD | F_SETFD | F_GETFL) || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let files = me.files.as_ref()?;
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let slot = files.get().fds.get_mut(fd as usize)?.as_mut()?;
+    match cmd {
+        F_GETFD => Some(if slot.cloexec { FD_CLOEXEC as i64 } else { 0 }),
+        F_SETFD => {
+            slot.cloexec = arg & FD_CLOEXEC != 0;
+            Some(0)
+        }
+        _ => {
+            // 借りずに (ほかのプロセスと分けている OpenFile かもしれない。口の印を読むだけ)
+            let of = unsafe { &*slot.file.as_ptr() };
+            if !matches!(of.kind, Kind::Inode(..)) || of.flags & O_PATH != 0 {
+                return None;
+            }
+            Some((of.flags | O_LARGEFILE) as i64)
+        }
+    }
+}
+
+/// 大きなロックなしの getcwd (syscall::fast): "/" と fd の表の cwd と NUL を写す (表をほかのスレッドと分けていれば門の
+/// 中で読む: chdir は門を通して変える)。chroot の中 (ルートからのパスに読みかえる)、入れ物が小さい (ERANGE)、写せない
+/// ページはふつうの道へ
+// [lockless]
+pub fn fast_getcwd(me: &proc::Proc, buf: usize, len: usize) -> Option<i64> {
+    let files = me.files.as_ref()?;
+    let _gate = if files.private() { None } else { Some(files.get().gate.read()?) };
+    let t = files.get();
+    if !t.root.is_empty() {
+        return None;
+    }
+    let cwd = t.cwd.as_bytes();
+    let n = cwd.len() + 2;
+    if n > len {
+        return None;
+    }
+    let pt = me.pt();
+    (pt.copy_out_nofault(buf, b"/") && pt.copy_out_nofault(buf + 1, cwd) && pt.copy_out_nofault(buf + 1 + cwd.len(), &[0])).then_some(n as i64)
+}
+
 /// 開いていない fd の close (EBADF) を大きなロックなしで: fd の表をだれとも分けていないときだけ見る
 // [lockless]
 pub fn fast_close_badf(me: &proc::Proc, fd: u64) -> bool {

@@ -510,6 +510,29 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
     count(r)
 }
 
+/// syscall::fast の readlinkat: 表で、パス (最後のリンクはたどらない) がシンボリックリンクでないものなら EINVAL、ないなら
+/// ENOENT (ふつうの道と同じわけを /proc/ai/why に)。リンクなら、中身を読むのはふつうの道で。大きさが 0 か int をこえる
+/// もの (パスを見る前に EINVAL)、空のパス (dirfd そのもの) もふつうの道へ。musl の realpath はパスの段ごとに readlink する
+// [lockless]
+pub fn lookup_readlink(p: &Proc, dirfd: i64, pathp: usize, len: usize) -> Option<i64> {
+    const READLINKAT: u64 = 78;
+    if len == 0 || len > i32::MAX as usize {
+        return None;
+    }
+    let mut norm = [0u8; PATH];
+    let r = find(p, dirfd, pathp, false, false, &mut norm).and_then(|(a, len, _)| match a {
+        Answer::Found(s, ..) if s.mode & 0o170000 == 0o120000 => None,
+        Answer::Found(..) => {
+            let mut raw = [0u8; 256];
+            let n = user_path(p, pathp, &mut raw).unwrap_or(0);
+            crate::why::fast_not_link(p, READLINKAT, core::str::from_utf8(&raw[..n]).unwrap_or("?"));
+            Some(-22)
+        }
+        Answer::Missing(looked) => Some(missing(p, READLINKAT, &norm[..len], looked)),
+    });
+    count(r)
+}
+
 /// 「ない」と答える: ふつうの道と同じわけを /proc/ai/why に (looked なら、いまディレクトリで引いたもの: ふつうの道が
 /// たどって見つけなかったときと同じ。でなければ覚えにあった「ない」)
 // [lockless]

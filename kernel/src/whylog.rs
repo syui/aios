@@ -77,6 +77,10 @@ impl crate::why::Log for Ops {
     fn fast_missing_at(&self, p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
         fast_missing_at(p, nr, dir, name);
     }
+    // [lockless]
+    fn fast_not_link(&self, p: &crate::proc::Proc, nr: u64, path: &str) {
+        fast_not_link(p, nr, path);
+    }
 }
 
 /// システムコールの出口で errno (負の数) を返すとき (syscall::dispatch から why::done。a はその引数。ためないもの
@@ -135,6 +139,17 @@ pub fn fast_missing_at(p: &crate::proc::Proc, nr: u64, dir: &str, name: &str) {
     note.nlen = copy(&mut note.name, name);
     let ent = Ent { ns: crate::timer::uptime_ns(), tgid: p.tgid as u32, tid: p.pid as u32, uid: p.cred.uid, nr: nr as u16, errno: 2, comm: p.comm, note };
     push(probe(nr, -2), ent);
+}
+
+/// 大きなロックなしの readlinkat が、シンボリックリンクでないと答えた: ふつうの道の not_link と同じわけ (EINVAL)
+pub fn fast_not_link(p: &crate::proc::Proc, nr: u64, path: &str) {
+    if crate::parts::off(crate::parts::Part::Aiproc) {
+        return;
+    }
+    let mut note = Note { code: Code::NotLink, errno: 22, asked: true, ..NONE };
+    note.plen = copy(&mut note.path, path);
+    let ent = Ent { ns: crate::timer::uptime_ns(), tgid: p.tgid as u32, tid: p.pid as u32, uid: p.cred.uid, nr: nr as u16, errno: 22, comm: p.comm, note };
+    push(probe(nr, -22), ent);
 }
 
 fn push(probe: bool, ent: Ent) {
