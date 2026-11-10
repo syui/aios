@@ -681,8 +681,11 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     const O_LARGEFILE: u64 = 0o400000;
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
+    const O_DIRECTORY: u64 = 0o40000;
     let acc = flags & O_ACCMODE as u64;
-    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64) != 0 || acc == O_ACCMODE as u64 || me.has_cred_work(proc::CRED_SANDBOX) || OPEN_WATCHED.load(Relaxed) != 0 {
+    // O_DIRECTORY (opendir) は読むだけの口で、ディレクトリなら (ほかはふつうの道が EISDIR や ENOTDIR を)
+    let dir = flags & O_DIRECTORY != 0;
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64 | O_DIRECTORY) != 0 || acc == O_ACCMODE as u64 || (dir && acc != O_RDONLY as u64) || me.has_cred_work(proc::CRED_SANDBOX) || OPEN_WATCHED.load(Relaxed) != 0 {
         note(5);
         return None;
     }
@@ -724,7 +727,7 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         O_WRONLY => crate::cred::W,
         _ => crate::cred::R | crate::cred::W,
     };
-    if st.mode & S_IFMT != vfs::S_IFREG || !me.cred.may(&m, perm, false) {
+    if st.mode & S_IFMT != if dir { vfs::S_IFDIR } else { vfs::S_IFREG } || !me.cred.may(&m, perm, false) {
         return pass(5);
     }
     // いちばん小さい空いた fd をとっておく (表を伸ばすのはふつうの道で)
@@ -733,8 +736,8 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     };
     let key = &norm[..len];
     // 書く口は棚を見ない (棚は読むだけの口のもの)。stat が古いとき (inode を書いたあと) も: 棚から出すときの許しは、この
-    // stat で確かめたもの。どちらもふつうの道は覚えなおしてよいので、seen_set はしない
-    if acc != O_RDONLY as u64 || !fresh {
+    // stat で確かめたもの。どちらもふつうの道は覚えなおしてよいので、seen_set はしない。ディレクトリも (棚はふつうのファイルのもの)
+    if acc != O_RDONLY as u64 || !fresh || dir {
         if plain && let Some(fd) = crate::fastdir::fast_open(me, slot, key, st.ino, flags, base) {
             note(7);
             return Some(fd);

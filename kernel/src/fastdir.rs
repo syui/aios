@@ -55,9 +55,9 @@ pub trait FastFs {
     fn fast_meta(&self, dir: u32, name: &str, ino: u32) -> Option<crate::vfs::Meta>;
     /// dir の name を引く (ないなら Some(None)、あれば Some((inode の番号, 様子, 版)))
     fn fast_lookup(&self, dir: u32, name: &str, c: &crate::cred::Cred) -> Option<Option<(u32, crate::vfs::Meta, u64)>>;
-    /// dir の name (ino) を開く
+    /// dir の name (ino) を開く (want_dir ならディレクトリを、でなければふつうのファイルを)
     // [lockless]
-    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<crate::vfs::InodeRef>;
+    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, want_dir: bool, c: &crate::cred::Cred) -> Option<crate::vfs::InodeRef>;
 }
 
 /// FastFs::fast_unlink の答え
@@ -223,9 +223,12 @@ pub fn fast_open(me: &Proc, slot: file::Slot, key: &[u8], ino: u64, flags: u64, 
     if !watch_free() {
         return None;
     }
-    let ino = fs.fast_open(dir as u32, name, ino as u32, perm, &me.cred)?;
+    // O_DIRECTORY (opendir) はディレクトリを (呼ぶ側の file::fast_open が、表でディレクトリと確かめたもの)
+    let want_dir = flags & 0o40000 != 0;
+    let ino = fs.fast_open(dir as u32, name, ino as u32, perm, want_dir, &me.cred)?;
     let f = file::new(Kind::Inode(ino, alloc::string::String::from(path)), crate::sysfile::file_flags(flags));
-    if !write {
+    // 閉じたら棚にしまってよいのは、読むだけの口のふつうのファイル (ふつうの道の open_found と同じ)
+    if !write && !want_dir {
         file::reuse_on(&f);
     }
     let fd = file::place(slot, f, flags & O_CLOEXEC != 0);

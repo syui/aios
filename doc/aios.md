@@ -617,9 +617,11 @@ rg が開くたびに呼ぶもの (Rust の std の fcntl(F_SETFD)、musl の re
 速い道で: fcntl の F_GETFD、F_SETFD、F_GETFL (ファイルだけ) は fd の表の印と開いたファイルの口を見るだけ (表をスレッドで
 分けていれば門の中で)、getcwd は cwd を写すだけ (chroot の中はふつうの道)、readlinkat は statc の表で、シンボリックリンク
 でなければ EINVAL、なければ ENOENT (リンクの中身はふつうの道で。わけはふつうの道と同じものを /proc/ai/why に:
-why::fast_not_link)。rg -j4 の大きなロックの中の fcntl は 2 万回 → 168 回。のこりは close (2 万回、9 µs: 表をスレッドで
-分けていると、ほかのスレッドのふつうの道が同じ OpenFile を写しているかもしれず、棚にしまえない)、opendir (O_DIRECTORY の
-openat。1800 回)、getdents64。
+why::fast_not_link)。rg -j4 の大きなロックの中の fcntl は 2 万回 → 168 回。opendir (O_DIRECTORY の openat) も、表が
+ディレクトリと答えれば大きなロックなしで開く (`ExtFs::fast_open` の want_dir: 読むだけの口で、ext4 の中で、いまもその
+inode をさすディレクトリで、読めること。棚にはしまわない。test/openfast.c の opendir)。rg -j4 は 0.98 → 0.76 秒。のこりは
+close (2 万回、8 µs: 表をスレッドで分けていると、ほかのスレッドのふつうの道が同じ OpenFile を写しているかもしれず、棚に
+しまえない) と getdents64。
 
 はじめての open-close は 55 µs から 23 µs に、fsbench の open-close は 62 µs から 22〜24 µs に (Linux 7.3 は 23.6 µs)。
 書く口で開くものがパスの覚えを引かなくなったので、write-4k も 120 µs から 92〜126 µs に (Linux は 140 µs)。答えは

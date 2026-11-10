@@ -11,6 +11,9 @@
 //   fresh     書いたあと (inode の版が進んだあと) の stat は、いまの大きさと時刻 (fstat と同じ)
 //   lookup    はじめて引く名前 (表にない): ないものは ENOENT、あるものは fstat と同じ。通れないディレクトリの下は
 //             EACCES。マウント先 (/tmp、/dev、/run、/proc、/sys) は、かぶせたものの根 (下の ext4 のディレクトリではない)
+//   opendir   O_DIRECTORY で開いたディレクトリ (3 回: 2 回目からはロックなしの道) の fstat、getdents、fchdir と getcwd、
+//             /proc/self/fd。ふつうのファイルは ENOTDIR、書く口は EISDIR、読めないディレクトリは EACCES (root でなければ)、
+//             消したら ENOENT
 // openfast DIR
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static int fails;
@@ -210,6 +214,56 @@ int main(int argc, char **argv) {
         if (r != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev) fails++;
       }
     }
+  }
+  // opendir: O_DIRECTORY で開く
+  {
+    mkdir("od", 0755);
+    close(open("od/a", O_CREAT | O_WRONLY, 0644));
+    close(open("od/b", O_CREAT | O_WRONLY, 0644));
+    struct stat a, b;
+    stat("od", &a);
+    char od[PATH_MAX];
+    snprintf(od, sizeof od, "%s/od", d);
+    for (int k = 0; k < 3; k++) {
+      int fd = open("od", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (fd < 0) { printf("FAIL opendir (%d): %s\n", k, strerror(errno)); fails++; continue; }
+      int ok = fstat(fd, &b) == 0 && b.st_ino == a.st_ino && S_ISDIR(b.st_mode);
+      // 中の名前: . .. a b
+      char buf[4096];
+      int n = 0, seen = 0;
+      long r;
+      while ((r = syscall(61, fd, buf, sizeof buf)) > 0)
+        for (long o = 0; o < r;) {
+          unsigned short reclen = *(unsigned short *)(buf + o + 16);
+          const char *name = buf + o + 19;
+          n++;
+          if (!strcmp(name, "a")) seen |= 1;
+          if (!strcmp(name, "b")) seen |= 2;
+          o += reclen;
+        }
+      ok = ok && n == 4 && seen == 3;
+      snprintf(fdp, sizeof fdp, "/proc/self/fd/%d", fd);
+      ssize_t l = readlink(fdp, got, sizeof got - 1);
+      got[l > 0 ? l : 0] = 0;
+      ok = ok && !strcmp(got, od);
+      char cwd[PATH_MAX];
+      ok = ok && fchdir(fd) == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, od) && chdir(d) == 0;
+      close(fd);
+      printf("%s opendir (%d): %d names, fd path %s\n", ok ? "ok  " : "FAIL", k, n, got);
+      if (!ok) fails++;
+    }
+    for (int k = 0; k < 2; k++) expect("O_DIRECTORY on a file", op("od/a", O_RDONLY | O_DIRECTORY), -ENOTDIR);
+    for (int k = 0; k < 2; k++) expect("O_DIRECTORY for writing", op("od", O_WRONLY | O_DIRECTORY), -EISDIR);
+    if (geteuid() != 0) {
+      chmod("od", 0311);
+      for (int k = 0; k < 2; k++) expect("opendir without read", op("od", O_RDONLY | O_DIRECTORY), -EACCES);
+      chmod("od", 0755);
+      for (int k = 0; k < 2; k++) expect("opendir with read again", op("od", O_RDONLY | O_DIRECTORY), 0);
+    }
+    unlink("od/a");
+    unlink("od/b");
+    rmdir("od");
+    for (int k = 0; k < 2; k++) expect("opendir after rmdir", op("od", O_RDONLY | O_DIRECTORY), -ENOENT);
   }
   printf("openfast: %s (%d failed)\n", fails ? "BAD" : "ok", fails);
   return fails != 0;

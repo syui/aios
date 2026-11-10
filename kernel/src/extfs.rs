@@ -4593,15 +4593,15 @@ impl ExtFs {
     }
 
     /// 大きなロックなしの open (fastdir::fast_open): ディレクトリ dir の名前 name がいまも ino をさす、リンクのあるふつうの
-    /// ファイルで、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
+    /// ファイル (want_dir なら、読むだけの口で開くディレクトリ: opendir) で、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
     /// 読むだけのファイルシステムでも、変えられない・足すだけ (IMMUTABLE / APPEND) のものでもないこと (どれもふつうの道が
     /// 答える)。読むブロックがみなキャッシュにあるときだけ。
     /// ディレクトリのロックの中で引いて数えるので、消すものとすれちがわない (fast_unlink は同じロックの中で、だれも使って
     /// いないことを確かめてから消す。ふつうの道の unlink と rename は、ひとりで持つ ext4 のロックの中)
     // [lockless]
-    pub fn fast_open(self: &Rc<Self>, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
+    pub fn fast_open(self: &Rc<Self>, dir: u32, name: &str, ino: u32, perm: u32, want_dir: bool, c: &crate::cred::Cred) -> Option<InodeRef> {
         let write = perm & crate::cred::W != 0;
-        if write && self.ro {
+        if (write && self.ro) || (write && want_dir) {
             return None;
         }
         let _d = dir_lock(dir);
@@ -4612,7 +4612,7 @@ impl ExtFs {
             }
             self.names_ino(dir, name, ino)?;
             let m = self.meta_now(ino)?;
-            if m.mode & S_IFMT != S_IFREG || m.nlink == 0 || !c.may(&m, perm, false) {
+            if m.mode & S_IFMT != if want_dir { S_IFDIR } else { S_IFREG } || m.nlink == 0 || !c.may(&m, perm, false) {
                 return None;
             }
             if write && self.read_inode(ino).ok()?.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 {
@@ -4653,8 +4653,8 @@ impl crate::fastdir::FastFs for Rc<ExtFs> {
         ExtFs::fast_lookup(self, dir, name, c)
     }
     // [lockless]
-    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, c: &crate::cred::Cred) -> Option<InodeRef> {
-        ExtFs::fast_open(self, dir, name, ino, perm, c)
+    fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, want_dir: bool, c: &crate::cred::Cred) -> Option<InodeRef> {
+        ExtFs::fast_open(self, dir, name, ino, perm, want_dir, c)
     }
 }
 
