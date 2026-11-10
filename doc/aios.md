@@ -2268,6 +2268,12 @@ strace・oom・fail・unix の gc の「なにもしない」の確かめが関�
 (current_leader。getpgid(0) など)。getpgid(0) と getsid(0) は getppid と同じく速い道で答える (Linux も rcu_read_lock だけ)。
 lseek の SEEK_SET / SEEK_CUR (と、ページキャッシュが大きさを知っている SEEK_END) と、開いていない fd の close (EBADF) も、
 fd の表と開いたファイルをだれとも分けていなければ速い道で (pread と同じ。Linux も分けていなければ f_pos_lock を取らない)。
+ふつうのファイルの read は、fd の表をほかのスレッドと分けていても (門を通って)、fork で開いたファイルを分けていても速い道で:
+開いたファイルの位置の札 (file::pos_fast。Linux の f_pos_lock) を取って読み、位置を使うふつうの道 (read、write、readv、
+writev、lseek、getdents64、preadv2 / pwritev2、sendfile、splice、copy_file_range のうち、ふつうのファイルとディレクトリ:
+syscall::pos_guard。Linux の fdget_pos) は、札を持つ速い道が終わるのを待ち、終わるまで速い道に位置を使わせない (速い道は
+眠らないのですぐ終わる。ふつうの道が持っていれば、速い道はふつうの道へ)。test/posrace.c が、スレッドとプロセスで同じ fd を
+読んで、どのブロックもちょうど 1 回ずつ読めるかを見る (Linux 7.4 の splice は札を取らないので、そこだけはこわれないかだけ)。
 (5) ext4 の inode の meta (stat、lseek の大きさ) を、使うたびに metas の木 (BTreeMap) から引いていた。いまは ExtInode が
 自分の meta を覚え、どれかの inode を書く (write_inode) たびに進む版 (meta_ver) が同じあいだはそれを使う (Linux の struct inode
 の i_size などと同じに、開いたファイルの fstat は読むだけ)。(6) 開いているディレクトリからの fstatat が、当たっていても String を

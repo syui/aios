@@ -345,6 +345,25 @@ fn handler(nr: u64) -> Option<Handler> {
 }
 
 /// システムコールを動かす。待ちが割り込まれて EINTR になったら、その情報を返す
+/// 開いたファイルの位置 (offset) を使うシステムコール (Linux の fdget_pos を使うもの: read、write、readv、writev、
+/// lseek、getdents64、preadv2 と pwritev2 (位置 -1)、sendfile、splice、copy_file_range (位置なし)) の fd が、ふつうの
+/// ファイルかディレクトリ (Linux の FMODE_ATOMIC_POS) なら、その位置の札 (file::pos_slow)。パイプやソケットでは
+/// 取らない (長く眠ることがあるので)
+fn pos_guard(nr: u64, a: &[u64; 6]) -> [Option<crate::file::PosSlow>; 2] {
+    use nr::*;
+    let fds = match nr {
+        READ | WRITE | READV | WRITEV | LSEEK | GETDENTS64 | PREADV2 | PWRITEV2 => [Some(a[0]), None],
+        SENDFILE => [Some(a[0]), Some(a[1])],
+        SPLICE | COPY_FILE_RANGE => [Some(a[0]), Some(a[2])],
+        _ => return [None, None],
+    };
+    let Some(files) = proc::current().files.as_ref() else { return [None, None] };
+    fds.map(|fd| {
+        let f = files.get().get(fd?)?;
+        matches!(f.borrow().kind, crate::file::Kind::Inode(..)).then(|| crate::file::pos_slow(f))
+    })
+}
+
 pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
     // 引数は 6 つ (x0〜x5)。tf.x を 31 ぜんぶ写すと、それだけでシステムコールごとに 248 バイト
@@ -426,6 +445,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     }
     // 監査が名前を集めているなら、パスの名前と親やあるものを前に引く (audit.rs の audit_pre)
     let plan = if p.audit.is_some() && !crate::security::audit_dummy_context() { crate::security::audit_names_pre(nr, &a) } else { None };
+    // 開いたファイルの位置を使うもの (Linux の fdget_pos): 終わるまで、大きなロックなしの read などに位置を使わせない
+    let _pos = pos_guard(nr, &a);
     let r = match tf.x[8] {
         GETCWD => sysfile::getcwd(a[0] as usize, a[1] as usize),
         CLOSE_RANGE => sysfile::close_range(a[0], a[1], a[2]),

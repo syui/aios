@@ -545,12 +545,12 @@ fn tee(fd_in: u64, fd_out: u64, len: usize, flags: u64) -> R {
 /// 2 回 splice する。眠らずにすむものだけ:
 ///   パイプ → /dev/null: パイプのロックだけで捨てる (中身があるとき)
 ///   ext4 のファイル → パイプ: 読むところがページキャッシュに全部あり、パイプに全部入るとき (半分だけ
-///   入れることはしない)。オフセットは off_in (ユーザーのメモリ) か、だれとも分けていない開いたファイルの
+///   入れることはしない)。オフセットは off_in (ユーザーのメモリ) か、開いたファイルの (位置の札を取れたとき)
 /// ほかは None でふつうの道へ (flags のまちがい、O_PATH、読めない口・書けない口、ふつうのファイルでないものも、
 /// ふつうの道が Linux の順でエラーにする)
 // [lockless]
 fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, flags: u64) -> Option<i64> {
-    if len == 0 || off_out != 0 || flags & !0x0f != 0 {
+    if len == 0 || off_out != 0 || flags & !0x0f != 0 || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let len = len.min(64 * 1024);
@@ -590,8 +590,9 @@ fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out:
             if !ino.page_cacheable() || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
                 return None;
             }
-            // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (だれとも分けていないとき)
-            let off = if off_in != 0 {
+            // オフセット: off_in があればそこ (あとで書きもどす)、なければ開いたファイルの (位置の札 file::pos_fast を
+            // 取れたとき。ほかの人が位置を使っている途中ならふつうの道へ)
+            let (off, _slot) = if off_in != 0 {
                 let mut b = [0u8; 8];
                 if !me.pt().copy_in_nofault(off_in, &mut b) {
                     return None;
@@ -600,12 +601,10 @@ fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out:
                 if o < 0 {
                     return None;
                 }
-                o as usize
+                (o as usize, None)
             } else {
-                if !private || Rc::strong_count(fi) != 1 {
-                    return None;
-                }
-                ofi.offset
+                let slot = crate::file::pos_fast(fi)?;
+                (ofi.offset, Some(slot))
             };
             // 読み手がいない (EPIPE と SIGPIPE) か箱がない (待つか EAGAIN) なら、ファイルの終わりでもふつうの道
             // (Linux の wait_for_space は読む前)

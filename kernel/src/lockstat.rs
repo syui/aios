@@ -155,7 +155,7 @@ pub fn text() -> alloc::string::String {
     let fa: Vec<u64> = crate::file::FAST_WRITE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの書きたし (ExtFs::fast_append、ext4 のロックで): {} (ふつうの道へ: ファイルの形 {} 書き出すころ {} extent がつづかない {} 見張りかほか {})\n", fa[0], fa[1], fa[2], fa[3], fa[4]));
     let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさ {} IN_ACCESS の見張り {} fd の表を分けている {} 開いたファイルを分けている {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
+    s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさか fail {} IN_ACCESS の見張り {} fd の表を変えている途中 {} 位置を使っている途中 {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})
 ", smp::STATS.slept.load(Ordering::Relaxed), smp::FAST_FAULTS.load(Ordering::Relaxed), smp::PREEMPTS.load(Ordering::Relaxed)));
     // BKL が守るもの (cell::Bkl) を、BKL を持たずに触った場所 (あってはいけない。test/vm-check.sh が見る)

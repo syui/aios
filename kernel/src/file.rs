@@ -1672,8 +1672,8 @@ pub const PIPE_SIZE: usize = 64 * 1024;
 /// もののうち空のパイプで終わり (0) か EAGAIN を返したもの。/proc/bkl に出す
 pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
 /// 大きなロックなしのファイルの read (fast_read_file) の数: [0] うまくいったもの、ほかはふつうの道へ行ったわけ
-/// (1 大きさ、2 IN_ACCESS の見張り、3 fd の表を分けている、4 開いたファイルを分けている、5 ext4 のファイルでない、
-/// 6 ページキャッシュにない)。/proc/bkl に出す
+/// (1 大きさか、わざとしくじらせる決まりがある、2 IN_ACCESS の見張り、3 fd の表をほかのスレッドが変えている途中、4 ほかの人がその開いたファイルの
+/// 位置を使っている途中 (pos_slow)、5 ext4 のファイルでない、6 ページキャッシュにない)。/proc/bkl に出す
 pub static FAST_READ: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
@@ -1851,6 +1851,8 @@ pub fn fast_lseek(me: &proc::Proc, fd: u64, off: i64, whence: u64) -> Option<i64
     if Rc::strong_count(f) != 1 {
         return None;
     }
+    // ほかのプロセスが pidfd_getfd で写したばかりかもしれない: 位置の札を持って
+    let _pos = pos_fast(f)?;
     let of = unsafe { &mut *f.as_ptr() };
     let Kind::Inode(ino, _) = &of.kind else { return None };
     if of.flags & O_PATH != 0 || !ino.page_cacheable() {
@@ -1933,21 +1935,21 @@ pub fn fast_dev(me: &proc::Proc, fd: u64, va: usize, len: usize, write: bool) ->
 // [lockless]
 fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Result<i64, usize> {
     const MAX: usize = 256 * 1024;
-    if len == 0 || len > MAX {
+    // わざとしくじらせる決まり (fail.rs) があるあいだは通らない (ふつうの道で決まりが効くように)
+    if len == 0 || len > MAX || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(1);
     }
     if crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return Err(2);
     }
     let files = me.files.as_ref().ok_or(3usize)?;
-    if !files.private() {
-        return Err(3);
-    }
+    // ほかのスレッドと分けている表は門を通って見る (見ているあいだ、fd は閉じられず、表も動かない)
+    let _gate = if files.private() { None } else { Some(files.get().gate.read().ok_or(3usize)?) };
     let f = files.get().get(fd).ok_or(5usize)?;
-    if Rc::strong_count(f) != 1 {
-        return Err(4);
-    }
-    // この fd の開いたファイルは、このスレッドのほかにだれも持っていない (借りずに見て、オフセットを進める)
+    // 開いたファイルの位置の札 (Linux の f_pos_lock): ほかの CPU がこの開いたファイルの位置を使っている途中
+    // (ほかのスレッドや、fork で分けたプロセスの read、lseek など) ならふつうの道へ
+    let _pos = pos_fast(f).ok_or(4usize)?;
+    // ほかのプロセスが大きなロックの中で借りているかもしれないので、借りずに見る (位置は札を持つ人だけが使う)
     let of = unsafe { &mut *f.as_ptr() };
     if !of.readable() {
         return Err(5);
@@ -1961,12 +1963,87 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
     Ok(n as i64)
 }
 
+/// 開いたファイルの位置 (offset) の札 (Linux の f_pos_lock と fdget_pos)。開いたファイルの場所のハッシュで選ぶ。
+/// 大きなロックなしの read (fast_read_file) は fast を取ってから slow を見て、0 でなければやめる (ふつうの道へ)。
+/// 位置を使うシステムコール (syscall::dispatch の pos_guard: read、write、lseek、getdents64 など) は、ふつうの
+/// ファイルとディレクトリなら slow を増やしてから fast が空くのを待つ (大きなロックなしの read は眠らず、すぐ終わる)。
+/// どちらかがかならず相手に気づくので (proc::Gate と同じ形)、同じ開いたファイルの位置を 2 人が同時に進めない。
+/// ふつうの道どうしは大きなロックと read_inode_file の reading で順に。ハッシュがぶつかれば、ふつうの道へ行くだけ
+#[repr(align(64))]
+struct PosSlot {
+    fast: core::sync::atomic::AtomicBool,
+    slow: core::sync::atomic::AtomicU32,
+}
+
+static POS: [PosSlot; 64] = [const { PosSlot { fast: core::sync::atomic::AtomicBool::new(false), slow: core::sync::atomic::AtomicU32::new(0) } }; 64];
+
+// [lockless]
+fn pos_slot(f: &FileRef) -> &'static PosSlot {
+    let a = Rc::as_ptr(f) as usize;
+    &POS[((a >> 6) ^ (a >> 12)) % POS.len()]
+}
+
+/// 位置を使うシステムコールのあいだ (落とすと slow を戻す)
+pub struct PosSlow(&'static PosSlot);
+
+impl Drop for PosSlow {
+    fn drop(&mut self) {
+        self.0.slow.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 位置を使うシステムコール (大きなロックの中) のはじめに: 終わるまで、大きなロックなしの read にこの開いたファイルを
+/// 読ませない
+pub fn pos_slow(f: &FileRef) -> PosSlow {
+    use core::sync::atomic::{Ordering::SeqCst, fence};
+    let s = pos_slot(f);
+    s.slow.fetch_add(1, SeqCst);
+    fence(SeqCst);
+    while s.fast.load(SeqCst) {
+        core::hint::spin_loop();
+    }
+    PosSlow(s)
+}
+
+/// 大きなロックなしの read が位置を使っているあいだ (落とすと fast を戻す)
+pub struct PosFast(&'static PosSlot);
+
+impl Drop for PosFast {
+    // [lockless]
+    fn drop(&mut self) {
+        self.0.fast.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// 大きなロックなしの道 (read、splice、lseek、write) が開いたファイルの位置を使う前に。取れなければ None (ふつうの道へ)
+// [lockless]
+pub fn pos_fast(f: &FileRef) -> Option<PosFast> {
+    use core::sync::atomic::{Ordering::{Relaxed, Release, SeqCst}, fence};
+    let s = pos_slot(f);
+    // ほかの大きなロックなしの道が持っているなら、少し待つ (すぐ終わる。ふつうの道へ行くと、そのあいだほかの人も
+    // みなふつうの道へ行き、行列になる)。ふつうの道が持っていれば待たない (眠るかもしれない)
+    let mut spins = 0;
+    while s.fast.compare_exchange_weak(false, true, SeqCst, Relaxed).is_err() {
+        spins += 1;
+        if spins > 4096 || s.slow.load(Relaxed) != 0 {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    fence(SeqCst);
+    if s.slow.load(SeqCst) != 0 {
+        s.fast.store(false, Release);
+        return None;
+    }
+    Some(PosFast(s))
+}
+
 /// 大きなロックなしの pread64 (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部
 /// あるとき。オフセットを動かさないので、fd の表をほかのスレッドと分けていても (門を通って) 読める
 // [lockless]
 pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> Option<i64> {
     const MAX: usize = 256 * 1024;
-    if len == 0 || len > MAX || off < 0 || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+    if len == 0 || len > MAX || off < 0 || crate::vfs::notify::ACCESS_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let files = me.files.as_ref()?;
@@ -2029,7 +2106,9 @@ pub fn fast_write_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Optio
     if Rc::strong_count(f) != 1 {
         return None;
     }
-    // 表も開いたファイルも自分だけなので、借りずに見て、位置を書く (ほかの大きなロックなしの道と同じ)
+    // 表も開いたファイルも自分だけなので、借りずに見て、位置を書く (ほかの大きなロックなしの道と同じ。ほかのプロセスが
+    // pidfd_getfd で写したばかりかもしれないので、位置の札を持って)
+    let _pos = pos_fast(f)?;
     let of = unsafe { &mut *f.as_ptr() };
     if !of.writable() || of.flags & (O_PATH | O_DSYNC | O_DIRECT) != 0 || of.label.is_some() {
         return None;

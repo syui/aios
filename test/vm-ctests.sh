@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
+TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange cpuclock cpuid cputime cpuvuln createrace ctev ctnl dad6 dev dirents dumpable efivarfs epoll exec-thread fastmap flushrace forkcow frag6 fsrace fsuid fsx futex futexrace inet6 inet6net inetsock inotify landlock-eexist landlockabi loginuid mld6 mldrep6 mmapcoh mnt mountinfo mremap ndsilence netlink nftables nfteval nfteval6 nftsk ns onlink6 opencache openat2 openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pmtu6 pipeslots posrace procmaps procwait pwfast random rcrace rdnss6 recverr6 rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify sigtramp sleeps splice statc statcache sysctl6 temp6 unixrace unixsock userns"
 
 case $1 in
 build)
@@ -36,8 +36,8 @@ run)
     fsx) cmd="./$t --suite $HOME /tmp" ;;
     # chosen (aios がえらんだちがい)、mmapcoh (ファイルのページは 1 枚)、rlock (ファイルのロック) も ext4 と tmpfs で
     # pwfast (大きなロックなしの pwrite)、opencache (閉じたファイルの棚)、createrace (大きなロックなしの作る・消す)、
-    # orphan (消したファイルが片づくか) も
-    chosen | mmapcoh | rlock | pwfast | opencache | createrace | orphan) cmd="./$t $HOME /tmp" ;;
+    # orphan (消したファイルが片づくか)、posrace (位置を使う read をいくつものスレッドとプロセスで) も
+    chosen | mmapcoh | rlock | pwfast | opencache | createrace | orphan | posrace) cmd="./$t $HOME /tmp" ;;
     # rcrace (大きなロックなしの munmap と open / close が同じ inode の Rc の数をさわらない) は 10 秒、tmpfs で
     rcrace) cmd="./$t 10 /tmp" ;;
     # appendrace (大きなロックなしの書きたし: 同じファイルと自分のファイルに書きたし、読む子がこわれを探す) は 5 秒ずつ、
