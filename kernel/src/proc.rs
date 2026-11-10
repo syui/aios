@@ -1379,6 +1379,12 @@ pub fn nr_running() -> usize {
     live().filter(|p| matches!(p.state, State::Running | State::Runnable)).count()
 }
 
+/// シグナルでは起こさない眠り (ディスクの要求の終わりを待つ: sleep_nointr。ps の D) のスレッドの数 (/proc/stat の
+/// procs_blocked)
+pub fn nr_blocked() -> usize {
+    live().filter(|p| p.state == State::Sleeping && p.nointr).count()
+}
+
 fn calc_load() {
     use core::sync::atomic::Ordering::Relaxed;
     const FIXED_1: u64 = 1 << 11;

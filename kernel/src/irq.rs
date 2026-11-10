@@ -15,6 +15,17 @@ use crate::mmio;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const SPURIOUS: u32 = 1023;
+
+/// 割りこみの番号 (GIC の INTID、0〜1019) ごとに来た数 (/proc/stat の intr。Linux の kstat_irqs)
+pub static COUNTS: [core::sync::atomic::AtomicU64; SPURIOUS as usize] = [const { core::sync::atomic::AtomicU64::new(0) }; SPURIOUS as usize];
+
+/// claim の答えを数える (SPURIOUS は数えない)
+// [lockless]
+pub fn count(raw: u32) {
+    if let Some(c) = COUNTS.get((raw & 0x3ff) as usize) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
 pub const TIMER: u32 = 27;
 /// CPU から CPU への割り込み (GIC の SGI 0、BCM2836 のメールボックス 0)
 pub const IPI: u32 = 0;

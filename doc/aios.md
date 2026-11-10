@@ -2535,7 +2535,9 @@ aios のほうが 1.3 倍ほど速く、カーネルにいる時間は Linux の
 コンパイルが減るところ (ロックを待っているのではない: 大きなロックを待ったのは 4%、ext4 のロックはほぼ 0)。はかるうちに
 見つけたもの: (1) /proc/stat の system がいつも 0 で、カーネルにいた時間が idle に入っていた (tick で、タイマの割りこみが
 来たときにスレッドがいたかを数えていたが、カーネルは割りこみを止めて走る)。スレッドの cpu_ns と sys_ns を足すところで
-CPU ごとにも足し (proc::RUN_NS、SYS_NS)、いま走っているものの分も入れて user、system、idle を出す。(2) xargs (uutils
+CPU ごとにも足し (proc::RUN_NS、SYS_NS)、いま走っているものの分も入れて user、system、idle を出す。intr (割りこみの
+番号ごとの数: irq::COUNTS)、ctxt (切りかえの数)、procs_blocked (シグナルで起きない眠り: ps の D) もいつも 0 だったので、
+数えて出す。(2) xargs (uutils
 findutils 0.11.0。上流の main も) は -P を受けとるが「NOT IMPLEMENTED」で、1 つずつ動かしていた: xargs -P 4 で 4 つの
 sleep 1 に 4.1 秒。pkg/rust/findutils の xargs-max-procs.patch で、GNU と同じく max-procs こまで並べる (どれかが終わるのを
 waitpid で待って次を。0 は上限なし。255 で終わるか殺されたものがあれば、走っているものを待ってから 124 / 125 で止める。
@@ -2788,8 +2790,10 @@ inet_connection_sock.c と同じ考え)。Linux とちがうところが大事�
 時刻の表 (SYN のやりなおしと TIME_WAIT の終わりを時刻の順に。tick は時刻の来たものだけを見る)、fd のないものの表。だから
 TIME_WAIT やつながりがいくつあっても、socket、connect、accept、close の手間は変わらない。見えるふるまいは Linux に合わせた: ポートの表と bind の決まり (SO_REUSEADDR / SO_REUSEPORT、
 Linux の inet_bind_conflict と udp_lib_lport_inuse)、空いたポート 32768〜60999、1024 より下は root だけ、TIME_WAIT と
-閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る。/proc/net/sockstat では Linux と同じく tw に数え、閉じて終わって
-いないものは orphan)。listen の行列があふれたら SYN を落とし (syncookies なし)、
+閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る。行は Linux の get_timewait4_sock と同じく、タイマは 3 と
+のこりの時間 (USER_HZ の tick)、数は 3。ソケットの番地の欄は Linux 7.4 と同じく root でも 0、rto と ssthresh も Linux の
+はじめの値 (listen とつなぎかけは 1 秒、つながれば 200 ms、slow start のまま -1)。/proc/net/sockstat では Linux と同じく
+tw に数え、閉じて終わっていないものは orphan)。listen の行列があふれたら SYN を落とし (syncookies なし)、
 つなぐほうは SYN_SENT のまま 1、2、4 ... 秒でやりなおす (TCP_SYNCNT の 6 回で ETIMEDOUT)。自分につなぐ、urgent (MSG_OOB と
 SIOCATMARK と SO_OOBINLINE)、FIN と RST の状態の移りかた (閉じた相手に送ると RST、shutdown(SHUT_RD) のあとに来たデータでも
 RST: RFC 1122)、SO_LINGER 0 の RST、MSG_MORE と TCP_CORK、入れ物の大きさ (Linux 7.3 で測った: つながると SO_SNDBUF は

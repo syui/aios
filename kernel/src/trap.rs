@@ -263,6 +263,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     let mut claimed = None;
     if kind == EL1H_IRQ || kind == EL0_IRQ {
         let raw = irq::claim();
+        irq::count(raw);
         if raw & 0x3ff == crate::uart::irq() && crate::uart::intr_fast() {
             irq::complete(raw);
             return;

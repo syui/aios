@@ -5310,10 +5310,33 @@ fn proc_net_of(want_tcp: bool, v6: bool) -> String {
         let inode = if s.has_file { s.ino } else { 0 };
         // Linux の tw (TIME_WAIT と fd のない FIN_WAIT2) は持ち主を覚えていない
         let uid = if is_tw(&s) { 0 } else { s.uid };
-        let line = if want_tcp {
-            let rx = if s.state == St::Listen { s.acceptq.len() as u32 } else { s.rcv_nxt.wrapping_sub(s.copied_seq) };
+        let line = if want_tcp && is_tw(&s) {
+            // Linux の get_timewait4_sock: 待ち行列は 0、タイマは 3 (TIME_WAIT) とのこりの時間 (USER_HZ の tick)、
+            // 数は 3、ほかの欄はない。ソケットの番地 (%pK) は Linux 7.4 では root でも 0
+            let left = s.expires.saturating_sub(ticks()) * 100 / crate::timer::HZ;
             alloc::format!(
-                "{:4}: {}:{:04X} {}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5}        0 {} 1 0000000000000000 100 0 0 10 0\n",
+                "{:4}: {}:{:04X} {}:{:04X} {:02X} 00000000:00000000 03:{:08X} 00000000     0        0 0 3 0\n",
+                i,
+                hex_l,
+                s.sport,
+                hex_r,
+                s.dport,
+                s.state as u8,
+                left
+            )
+        } else if want_tcp {
+            let rx = if s.state == St::Listen { s.acceptq.len() as u32 } else { s.rcv_nxt.wrapping_sub(s.copied_seq) };
+            // get_tcp4_sock のおわりの欄: 数、番地 (0)、rto と ato (USER_HZ の tick)、quick と pingpong、cwnd、ssthresh。
+            // listen とつなぎかけ (SYN) の rto ははじめの 1 秒 (TCP_TIMEOUT_INIT)、つながれば TCP_RTO_MIN の 200 ms
+            // (aios がもう 1 度送るまでの時間も同じ)。ssthresh は listen なら Fast Open の待ち行列の長さ (0)、
+            // ほかははじめの slow start のまま (-1: aios は輻輳の窓を持たない)
+            let (rto, ssthresh) = match s.state {
+                St::Listen => (100, 0),
+                St::SynSent | St::SynRecv => (100, -1),
+                _ => (20, -1),
+            };
+            alloc::format!(
+                "{:4}: {}:{:04X} {}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5}        0 {} 1 0 {} 0 0 10 {}\n",
                 i,
                 hex_l,
                 s.sport,
@@ -5323,11 +5346,13 @@ fn proc_net_of(want_tcp: bool, v6: bool) -> String {
                 0,
                 rx,
                 uid,
-                inode
+                inode,
+                rto,
+                ssthresh
             )
         } else {
             alloc::format!(
-                "{:5}: {}:{:04X} {}:{:04X} {:02X} 00000000:{:08X} 00:00000000 00000000 {:5}        0 {} 2 0000000000000000 0\n",
+                "{:5}: {}:{:04X} {}:{:04X} {:02X} 00000000:{:08X} 00:00000000 00000000 {:5}        0 {} 2 0 0\n",
                 i,
                 hex_l,
                 s.sport,

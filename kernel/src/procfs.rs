@@ -581,9 +581,19 @@ fn stat_all() -> String {
         s += &line(&format!("cpu{}", c), *t);
     }
     let boot = (crate::timer::epoch_ns() / 1_000_000_000).saturating_sub(now / crate::timer::HZ);
-    let blocked = 0;
+    // 割りこみ: みなの数と、番号 (GIC の INTID) ごとの数 (Linux は irq の番号ごと。最後に来た番号まで)
+    let irqs: Vec<u64> = crate::irq::COUNTS.iter().map(|c| c.load(core::sync::atomic::Ordering::Relaxed)).collect();
+    let last = irqs.iter().rposition(|&n| n != 0).map_or(0, |i| i + 1);
+    let mut intr = format!("intr {}", irqs.iter().sum::<u64>());
+    for n in &irqs[..last] {
+        intr += &format!(" {}", n);
+    }
+    // ディスクを待って眠っているもの (ps の D: sleep_nointr)
+    let blocked = proc::nr_blocked();
     s += &format!(
-        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
+        "{}\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked {}\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",
+        intr,
+        crate::smp::SWITCHES.load(core::sync::atomic::Ordering::Relaxed),
         boot,
         proc::last_pid(),
         proc::nr_running(),
