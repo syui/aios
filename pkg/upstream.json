@@ -14,6 +14,7 @@
   {"from":"gnome","name":"atk","nvchecker":{"regex":"atk-([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)\\.tar","source":"regex","url":"https://download.gnome.org/sources/atk/cache.json"}},
   {"name":"base","skip":"aios"},
   {"name":"base-devel","skip":"aios"},
+  {"from":"arch:blender","name":"blender","nvchecker":{"git":"https://projects.blender.org/blender/blender","prefix":"v","source":"git"}},
   {"from":"pkgbuild","git":"https://github.com/google/brotli.git","name":"brotli","tag":"^v([0-9]+\\.[0-9]+\\.[0-9]+)$"},
   {"from":"pkgbuild","name":"bzip2","nvchecker":{"join":true,"regex":"bzip2-([0-9.]+)\\.tar\\.gz","source":"regex","url":"https://sourceware.org/pub/bzip2/"}},
   {"from":"pkgbuild","name":"ca-certificates","nvchecker":{"join":true,"regex":"cacert-([0-9]{4})-([0-9]{2})-([0-9]{2})\\.pem","source":"regex","url":"https://curl.se/docs/caextract.html"}},
