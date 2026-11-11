@@ -50,6 +50,13 @@ prepare() {
   # Blender は Linux の aarch64 で ARMv8.2-A + dotprod + fp16 + LSE (Cortex-A76、Neoverse N1、Apple M から) を
   # 使う。zig cc は -march=armv8.2-a+... を読めないので、zig の書きかたの -mcpu にする (同じ命令になる)
   sed -i 's/-march=armv8.2-a+dotprod+fp16+lse/-mcpu=generic+v8_2a+dotprod+fullfp16+lse/' build_files/cmake/macros.cmake
+  # Cycles の StackAllocator (BVH を作るときの小さな vector の置き場をスタックに) はスタックを使わない。Zig の
+  # libc++ (LLVM 22) の vector は、大きくなるときに allocator のコピー (__split_buffer が値で持つ) から取り、
+  # 前のものをそのコピーで返す。StackAllocator はコピーどうしで相手のスタックのメモリを返せないので、
+  # スタックのメモリを MEM_delete_void に渡して止まっていた ("Attempt to use C-style MEM_delete_void on a
+  # pointer created with CPP-style MEM_new or new"、BVHBuild::create_leaf_node)
+  sed -i 's/^\(  StackAllocator(.*) : pointer_(0), use_stack_(\)true)/\1false)/' intern/cycles/util/stack_allocator.h
+  [ "$(grep -c 'use_stack_(true)' intern/cycles/util/stack_allocator.h)" = 0 ]
   # oiiotool (テストだけで使う) は OpenImageIO のパッケージに入れていないので、あるときだけ見る
   sed -i 's/^get_target_property(OPENIMAGEIO_TOOL OpenImageIO::oiiotool LOCATION)/if(TARGET OpenImageIO::oiiotool)\n  &\nendif()/' \
     build_files/cmake/platform/dependency_targets.cmake
@@ -81,9 +88,11 @@ PC
   command -v qemu-aarch64 >/dev/null && emu="qemu-aarch64;-L;$root"
   rm -rf build
   # -g0: Zig はデバッグ情報を入れるのが既定 (Blender だと何十 GB になる)
+  # RUNPATH /opt/c/lib: musl は /usr/local/lib を先に見るので、qemu-aarch64 で動かすとき (pkg_test) に
+  # ビルドするマシンの libpython3.13.so を拾わないように (python のパッケージと同じ)
   cmake -S "blender-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
     -DCMAKE_CROSSCOMPILING_EMULATOR="$emu" \
-    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-g0 -DCMAKE_CXX_FLAGS=-g0 \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_RPATH="$PREFIX/lib" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-g0 -DCMAKE_CXX_FLAGS=-g0 \
     -DWITH_LIBS_PRECOMPILED=OFF -DWITH_INSTALL_PORTABLE=OFF -DWITH_STRICT_BUILD_OPTIONS=OFF \
     -DWITH_BUILDINFO=OFF -DWITH_LINKER_LLD=OFF -DWITH_LINKER_MOLD=OFF \
     -DPYTHON_VERSION=3.13 -DPYTHON_INCLUDE_DIR="$SYSROOT/include/python3.13" \
