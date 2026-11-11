@@ -6,8 +6,8 @@
 #   ディスクは 15GB ほど、時間は 4 コアで数時間
 #   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
 pkgname=firefox
-pkgver=159.0.1
-pkgrel=2
+pkgver=160.0
+pkgrel=1
 pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
 arch=('aarch64')
 license=('MPL-2.0')
@@ -24,7 +24,7 @@ source=("https://archive.mozilla.org/pub/firefox/releases/$pkgver/source/firefox
         aios-configure.patch
         wayland-without-dbus.patch
         aios-prefs.js)
-sha256sums=('b5fe407199685f8bddf3b2c81feb8b805429e6f3d307c9430f53456f85b6e063'
+sha256sums=('2b23d2bf6716ea16b45c10aa5c275c78a1d7ff50ad53150809ab27424c58fd81'
             SKIP SKIP SKIP SKIP SKIP SKIP)
 
 # ビルドするマシンの LLVM (clang-20 / llvm-20 があればそれ)
