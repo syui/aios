@@ -6,7 +6,8 @@
 #   ビルドの途中で Blender の道具 (makesdna、makesrna、datatoc、shader_tool、msgfmt) を動かすので、
 #   qemu-aarch64 で動かす (prepare() のパッチ)。wayland-scanner はビルドするマシンのもの
 #   入れないもの (aios にまだないもの): USD / Hydra / MaterialX、OpenVDB、Embree、OSL、OpenImageDenoise、
-#   Alembic、音 (OpenAL、PulseAudio、PipeWire、JACK、SDL、libsndfile)、X11、Vulkan、FFTW (海と流体)、GMP、
+#   Alembic、音 (audaspace: 出口の OpenAL、PulseAudio、PipeWire、JACK、SDL がまだなく、Python のつなぎは NumPy
+#   が要る。libsndfile も)、X11、Vulkan、FFTW (海と流体)、GMP、
 #   Manifold、Jolt、Draco、KTX、WebP、OpenJPEG、Potrace、libharu、NumPy、XR、GPU の Cycles (CUDA ...)、
 #   モーショントラッキング (libmv: Ceres と Abseil が要る)
 #   ビルドには cmake、ninja、qemu-aarch64、wayland-scanner が要る。4 コアで数時間
@@ -102,7 +103,7 @@ PC
     -DWITH_MOD_OCEANSIM=OFF -DWITH_MOD_FLUID=OFF -DWITH_GMP=OFF -DWITH_MANIFOLD=OFF -DWITH_JOLT=OFF \
     -DWITH_DRACO=OFF -DWITH_MESHOPTIMIZER=OFF -DWITH_KTX=OFF -DWITH_IMAGE_WEBP=OFF -DWITH_IMAGE_OPENJPEG=OFF \
     -DWITH_LIBMV=OFF -DWITH_POTRACE=OFF -DWITH_HARU=OFF -DWITH_PUGIXML=OFF -DWITH_OPENTIMELINEIO=OFF -DWITH_INPUT_NDOF=OFF \
-    -DWITH_OPENAL=OFF -DWITH_PULSEAUDIO=OFF -DWITH_PIPEWIRE=OFF -DWITH_JACK=OFF -DWITH_SDL=OFF \
+    -DWITH_AUDASPACE=OFF -DWITH_OPENAL=OFF -DWITH_PULSEAUDIO=OFF -DWITH_PIPEWIRE=OFF -DWITH_JACK=OFF -DWITH_SDL=OFF \
     -DWITH_TBB_MALLOC_PROXY=OFF -DWITH_MEM_JEMALLOC=OFF -DWITH_GTESTS=OFF \
     -Dpystring_INCLUDE_DIR="$SYSROOT/include/pystring"
   ninja -C build
