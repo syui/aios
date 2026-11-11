@@ -865,6 +865,8 @@ impl Wm {
 
     fn request(&mut self, cid: usize, mut m: Msg) {
         let serial_now = self.serial;
+        // configure を送りかえす窓がある (xdg_toplevel の set_maximized など)
+        let mut resend = false;
         let c = self.clients.get_mut(&cid).unwrap();
         let Some(obj) = c.objs.get(&m.id).map(kind) else {
             // 消したばかりのものへの要求は捨てる
@@ -1227,11 +1229,23 @@ impl Wm {
                     }
                 }
             }
+            (K::Toplevel(sid), 9..=12) => {
+                // set_maximized (9)、unset_maximized (10)、set_fullscreen (11)、unset_fullscreen (12): 並べかたは aiwm が
+                // 決めるので変えないが、xdg-shell の決まりどおり、いまの大きさと状態の configure を送りかえす (Blender は
+                // 最大化をたのんだあと、その答えの configure を待つ。来なければ自分で決めた大きさ (画面いっぱい) のまま描く)
+                if let Some(s) = c.surfaces.get_mut(&sid) {
+                    s.sent = None;
+                    resend = true;
+                }
+            }
             (K::Toplevel(_), _) => {}
             #[allow(unreachable_patterns)]
             _ => {
                 eprintln!("aiwm: client {}: unknown request {} on {}", cid, m.op, m.id);
             }
+        }
+        if resend {
+            self.relayout();
         }
     }
 
