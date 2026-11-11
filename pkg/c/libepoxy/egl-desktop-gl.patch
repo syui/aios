@@ -1,0 +1,54 @@
+--- libepoxy-1.5.10/src/dispatch_common.c
++++ libepoxy-1.5.10/src/dispatch_common.c
+@@ -660,11 +660,15 @@
+     return epoxy_conservative_glx_dlsym(name, true);
+ }
+ 
+-static void
+-epoxy_load_gl(void)
++#if PLATFORM_HAS_EGL
++static EGLenum epoxy_egl_get_current_gl_context_api(void);
++#endif
++
++static bool
++epoxy_load_gl(bool exit_if_fails)
+ {
+     if (api.gl_handle)
+-	return;
++	return true;
+ 
+ #if defined(_WIN32) || defined(__APPLE__)
+     get_dlopen_handle(&api.gl_handle, OPENGL_LIB, true, true);
+@@ -683,6 +687,8 @@
+ #endif
+ 
+     if (!api.gl_handle) {
++        if (!exit_if_fails)
++            return false;
+ #if defined(OPENGL_LIB)
+         fprintf(stderr, "Couldn't open %s or %s\n", GLX_LIB, OPENGL_LIB);
+ #else
+@@ -692,12 +698,22 @@
+     }
+ 
+ #endif
++    return true;
+ }
+ 
+ void *
+ epoxy_gl_dlsym(const char *name)
+ {
+-    epoxy_load_gl();
++#if PLATFORM_HAS_EGL && !defined(_WIN32) && !defined(__APPLE__)
++    /* Desktop GL through EGL with no libGL.so.1 or libOpenGL.so.0 (Mesa built
++     * without GLX and without glvnd): EGL gives every GL function, the core
++     * ones too (EGL_KHR_get_all_proc_addresses, which Mesa has).
++     */
++    if (!epoxy_load_gl(false) && !epoxy_current_context_is_glx() &&
++        epoxy_egl_get_current_gl_context_api() == EGL_OPENGL_API)
++        return eglGetProcAddress(name);
++#endif
++    epoxy_load_gl(true);
+ 
+     return do_dlsym(&api.gl_handle, name, true);
+ }

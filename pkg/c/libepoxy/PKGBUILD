@@ -3,19 +3,25 @@
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=libepoxy
 pkgver=1.5.10
-pkgrel=4
+pkgrel=5
 pkgdesc='Library handling OpenGL function pointer management (shared, for aios; EGL, no GLX)'
 arch=('aarch64')
 license=('MIT')
 depends=('musl')
+# egl-desktop-gl.patch: aios の Mesa には libGL.so.1 も libOpenGL.so.0 もない (GLX と glvnd なし) ので、EGL で
+#   デスクトップの OpenGL (Blender など) を使うときは、GL の関数をみな eglGetProcAddress から取る (Mesa は
+#   EGL_KHR_get_all_proc_addresses があるので、GL 1.x の関数も取れる)。もとは libGL を開けずに abort していた
 # EGL のヘッダー (Khronos) を使う。EGL そのもの (libEGL) は動くときに dlopen で探す (Mesa があれば)
 makedepends=('meson' 'ninja' 'qemu-user')
-source=("https://download.gnome.org/sources/libepoxy/${pkgver%.*}/libepoxy-$pkgver.tar.xz")
-sha256sums=('072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623')
+source=("https://download.gnome.org/sources/libepoxy/${pkgver%.*}/libepoxy-$pkgver.tar.xz"
+        'egl-desktop-gl.patch')
+sha256sums=('072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623'
+            '26bb7cccd9ec881c225a7c8bab58d76b856dd9f0e1081f44c480d07024efdec3')
 
 prepare() {
   rm -rf "libepoxy-$pkgver"
   tar -xf "${source[0]##*/}"
+  patch -d "libepoxy-$pkgver" -p1 < egl-desktop-gl.patch
 }
 
 build() {

@@ -1,0 +1,38 @@
+# brotli: Brotli の圧縮と展開の C のライブラリ (shared and static, for aios)
+#   FreeType が WOFF2 のフォント (Blender 5.3 の UI のフォントは .woff2) を読むのに使う。道具 (brotli) は入れない。
+#   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
+pkgname=brotli
+pkgver=1.2.1
+pkgrel=1
+pkgdesc='Generic-purpose lossless compression algorithm: libbrotlienc, libbrotlidec (shared and static, for aios)'
+arch=('aarch64')
+url='https://github.com/google/brotli'
+license=('MIT')
+depends=('musl')
+makedepends=('cmake' 'ninja')
+source=("brotli::git+https://github.com/google/brotli.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build build-static
+  cmake -S brotli -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=ON -DBROTLI_BUILD_TOOLS=OFF -DBUILD_TESTING=OFF
+  ninja -C build
+  # 静的なもの (libbrotlidec.a ...) も
+  cmake -S brotli -B build-static -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DBROTLI_BUILD_TOOLS=OFF -DBUILD_TESTING=OFF
+  ninja -C build-static
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build-static
+  DESTDIR="$pkgdir" cmake --install build
+  # man3 の名前 (encode.h.3、types.h.3 ...) がほかとぶつかりそうなので入れない
+  rm -rf "$pkgdir/opt/c/share/man"
+  install -Dm644 brotli/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

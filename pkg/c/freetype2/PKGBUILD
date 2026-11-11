@@ -1,13 +1,14 @@
 # freetype2: Font rasterization library (shared, for aios)
+#   brotli は WOFF2 のフォントを読むため (Blender 5.3 の UI のフォントは .woff2)
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=freetype2
 pkgver=2.15.0
-pkgrel=4
+pkgrel=5
 pkgdesc='Font rasterization library (shared, for aios)'
 arch=('aarch64')
 license=('FTL OR GPL-2.0-or-later')
-depends=('musl' 'zlib' 'libpng')
+depends=('musl' 'zlib' 'libpng' 'brotli')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://download.savannah.gnu.org/releases/freetype/freetype-$pkgver.tar.xz")
 sha256sums=('93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5')
@@ -20,10 +21,10 @@ prepare() {
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  meson_cross zlib libpng
+  meson_cross zlib libpng brotli
   cd "freetype-$pkgver"
   meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
-    -Dharfbuzz=disabled -Dpng=enabled -Dzlib=enabled -Dbrotli=disabled -Dbzip2=disabled
+    -Dharfbuzz=disabled -Dpng=enabled -Dzlib=enabled -Dbrotli=enabled -Dbzip2=disabled
   ninja -C build
 }
 
