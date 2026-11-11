@@ -1,0 +1,32 @@
+# imath: ベクトル、行列、half (16 ビットの小数) などの C++ の数のライブラリ (static, for aios)
+#   OpenEXR、OpenColorIO、OpenImageIO、Blender が使う。C++ のライブラリは静的に作る (Zig の libc++ は、それを
+#   使うプログラムや共有ライブラリのひとつひとつの中に入るので、C++ の型を共有ライブラリのあいだでやりとりしない
+#   ように、Blender にまとめてリンクする)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake で
+#   クロスビルドする。/opt/c に入る。Python のモジュールは入れない
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=imath
+pkgver=3.2.3
+pkgrel=1
+pkgdesc='C++ library of 2D and 3D vector, matrix, and math operations, with the half type (static, for aios)'
+arch=('aarch64')
+url='https://github.com/AcademySoftwareFoundation/Imath'
+license=('BSD-3-Clause')
+makedepends=('cmake' 'ninja')
+source=("Imath::git+https://github.com/AcademySoftwareFoundation/Imath.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  cmake -S Imath -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DPYTHON=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 Imath/LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

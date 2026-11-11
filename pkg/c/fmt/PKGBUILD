@@ -1,0 +1,30 @@
+# fmt: C++ の書式つきの出力 (std::format のもと) のライブラリ (static, for aios)
+#   OpenImageIO と Blender が使う。C++ のライブラリは静的に (imath の PKGBUILD を見て)。pkg/c/zig.sh の
+#   cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=fmt
+pkgver=12.1.0
+pkgrel=1
+pkgdesc='Open-source formatting library for C++ (static, for aios)'
+arch=('aarch64')
+url='https://fmt.dev/'
+license=('MIT')
+makedepends=('cmake' 'ninja')
+source=("fmt::git+https://github.com/fmtlib/fmt.git#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  cmake -S fmt -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 fmt/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

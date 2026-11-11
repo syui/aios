@@ -1,0 +1,36 @@
+# openexr: OpenEXR の画像 (HDR、レイヤー、深さ) を読み書きする C++ / C のライブラリ (static, for aios)
+#   OpenImageIO と Blender (EXR の読み書き、マルチレイヤー) が使う。C++ のライブラリは静的に (imath の PKGBUILD を
+#   見て)。圧縮は libdeflate と HTJ2K (openjph)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake
+#   でクロスビルドする。/opt/c に入る。道具 (exrinfo ...)、Python のモジュール、例は入れない
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=openexr
+pkgver=3.4.18
+pkgrel=1
+pkgdesc='High dynamic-range image file format library (static, for aios)'
+arch=('aarch64')
+url='https://openexr.com/'
+license=('BSD-3-Clause')
+depends=('imath' 'openjph' 'libdeflate' 'zlib')
+makedepends=('cmake' 'ninja')
+source=("openexr::git+https://github.com/AcademySoftwareFoundation/openexr.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross imath openjph libdeflate zlib
+  rm -rf build
+  cmake -S openexr -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DOPENEXR_BUILD_BOTH_STATIC_SHARED=OFF \
+    -DBUILD_TESTING=OFF -DOPENEXR_BUILD_PYTHON=OFF -DOPENEXR_BUILD_TOOLS=OFF -DOPENEXR_INSTALL_TOOLS=OFF \
+    -DOPENEXR_BUILD_EXAMPLES=OFF -DOPENEXR_BUILD_DOCS=OFF \
+    -DOPENEXR_FORCE_INTERNAL_DEFLATE=OFF -DOPENEXR_FORCE_INTERNAL_OPENJPH=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  rm -rf "$pkgdir/opt/c/share/doc"
+  install -Dm644 openexr/LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

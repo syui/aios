@@ -1,0 +1,35 @@
+# minizip-ng: zip を読み書きする C のライブラリ (static, for aios)
+#   OpenColorIO (.ocioz: 色の設定を zip にまとめたもの) が使う。zlib の deflate だけ (暗号、bzip2、LZMA、ZSTD は
+#   入れない。Blender の作りかたと同じ)。zlib の contrib の minizip と名前がぶつからないように、互換の名前
+#   (MZ_COMPAT) にはしない: libminizip-ng.a と minizip-ng/mz*.h。pkg/c/zig.sh の cmake_cross で、
+#   Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=minizip-ng
+pkgver=4.2.2
+pkgrel=1
+pkgdesc='Fork of the popular zip manipulation library found in the zlib distribution (static, for aios)'
+arch=('aarch64')
+url='https://github.com/zlib-ng/minizip-ng'
+license=('Zlib')
+depends=('zlib')
+makedepends=('cmake' 'ninja')
+source=("minizip-ng::git+https://github.com/zlib-ng/minizip-ng.git#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross zlib
+  rm -rf build
+  cmake -S minizip-ng -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DMZ_COMPAT=OFF \
+    -DMZ_FETCH_LIBS=OFF -DMZ_LIBCOMP=OFF -DMZ_PKCRYPT=OFF -DMZ_WZAES=OFF -DMZ_OPENSSL=OFF -DMZ_SIGNING=OFF \
+    -DMZ_PPMD=OFF -DMZ_LZMA=OFF -DMZ_ZSTD=OFF -DMZ_BZIP2=OFF -DMZ_ICONV=OFF -DMZ_ZLIB=ON -DMZ_ZLIB_FLAVOR=zlib
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 minizip-ng/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,39 @@
+# opencolorio: 色の管理 (色空間の変換、ビューとディスプレイ、LUT) の C++ のライブラリ (static, for aios)
+#   Blender (色の管理のすべて: Filmic / AgX、表示の変換を GPU のシェーダーに) と OpenImageIO (かならず要る) が
+#   使う。C++ のライブラリは静的に (imath の PKGBUILD を見て)。依存 (yaml-cpp、pystring、minizip-ng、expat、Imath) は
+#   自分でダウンロードせず (OCIO_INSTALL_EXT_PACKAGES=NONE)、aios のパッケージを使う。Linux の aarch64 では SSE を
+#   NEON に読みかえない (Blender と同じ)。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake で
+#   クロスビルドする。/opt/c に入る。道具 (ociocheck ...)、Python のモジュール、GPU のテストは入れない
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=opencolorio
+pkgver=2.5.2
+pkgrel=1
+pkgdesc='Color management framework for visual effects and animation (static, for aios)'
+arch=('aarch64')
+url='https://opencolorio.org/'
+license=('BSD-3-Clause')
+depends=('expat' 'yaml-cpp' 'pystring' 'minizip-ng' 'imath' 'zlib')
+makedepends=('cmake' 'ninja')
+source=("OpenColorIO::git+https://github.com/AcademySoftwareFoundation/OpenColorIO.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross expat yaml-cpp pystring minizip-ng imath zlib
+  rm -rf build
+  # pystring は <pystring.h> で読む (pystring_ROOT がないとき、Findpystring は include/pystring を見ない)
+  cmake -S OpenColorIO -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DOCIO_INSTALL_EXT_PACKAGES=NONE \
+    -DOCIO_BUILD_APPS=OFF -DOCIO_BUILD_PYTHON=OFF -DOCIO_BUILD_NUKE=OFF -DOCIO_BUILD_OPENFX=OFF \
+    -DOCIO_BUILD_JAVA=OFF -DOCIO_BUILD_DOCS=OFF -DOCIO_BUILD_TESTS=OFF -DOCIO_BUILD_GPU_TESTS=OFF \
+    -DOCIO_USE_SIMD=OFF -Dpystring_INCLUDE_DIR="$SYSROOT/include/pystring"
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  rm -rf "$pkgdir/opt/c/share/doc"
+  install -Dm644 OpenColorIO/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

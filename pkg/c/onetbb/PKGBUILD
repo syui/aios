@@ -1,0 +1,36 @@
+# onetbb: oneAPI Threading Building Blocks (C++ の並列のしくみ: parallel_for、タスク、並行のコンテナ) (static, for aios)
+#   OpenSubdiv と Blender (Cycles、ジオメトリノード、こまかい並列) が使う。C++ のライブラリは静的に
+#   (imath の PKGBUILD を見て。oneTBB は共有ライブラリをすすめているが、Blender の中で 1 つだけなら静的でもよい)。
+#   tbbmalloc (速い malloc) も静的に。malloc を取りかえる tbbmalloc_proxy と hwloc は入れない。
+#   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=onetbb
+pkgver=2022.3.0
+pkgrel=1
+pkgdesc='oneAPI Threading Building Blocks: C++ library for parallel programming (static, for aios)'
+arch=('aarch64')
+url='https://github.com/uxlfoundation/oneTBB'
+license=('Apache-2.0')
+makedepends=('cmake' 'ninja')
+source=("oneTBB::git+https://github.com/uxlfoundation/oneTBB.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  # TBB_STRICT=OFF: 警告をエラーにしない (新しい clang の警告で止まらないように)
+  cmake -S oneTBB -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DTBB_STRICT=OFF \
+    -DTBB_TEST=OFF -DTBB_EXAMPLES=OFF -DTBBMALLOC_BUILD=ON -DTBBMALLOC_PROXY_BUILD=OFF \
+    -DTBB_DISABLE_HWLOC_AUTOMATIC_SEARCH=ON
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  rm -rf "$pkgdir$PREFIX/share/doc"
+  install -Dm644 oneTBB/LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
+}

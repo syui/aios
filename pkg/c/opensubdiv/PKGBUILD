@@ -1,0 +1,40 @@
+# opensubdiv: Pixar の細分割曲面 (Catmull-Clark、Loop) の C++ のライブラリ (static, for aios)
+#   Blender のサブディビジョンサーフェス (モディファイアと GPU での細分割) が使う。C++ のライブラリは静的に
+#   (imath の PKGBUILD を見て)。CPU の並列は TBB。Blender は osdGPU の GLSL のシェーダーのもとを使う (評価は
+#   Blender の GPU のしくみ) ので OpenGL も入れるが、OpenSubdiv は自分の GL のローダー (glLoader) を使うので、
+#   ビルドに要るのは GL のヘッダーだけ (mesa のもの。libGL.so はリンクしない)。pkg/c/zig.sh の cmake_cross で、
+#   Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る。例、チュートリアル、テストは入れない
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=opensubdiv
+pkgver=3.7.0
+pkgrel=1
+pkgdesc='Pixar subdivision surface library (static, for aios)'
+arch=('aarch64')
+url='https://graphics.pixar.com/opensubdiv/'
+license=('LicenseRef-TOST-1.0')
+depends=('onetbb')
+makedepends=('cmake' 'ninja' 'mesa')
+source=("OpenSubdiv::git+https://github.com/PixarAnimationStudios/OpenSubdiv.git#tag=v${pkgver//./_}")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross onetbb mesa
+  rm -rf build
+  # FindOpenGL を通すために、GL のライブラリには libEGL.so を見せる (OpenSubdiv は GL をリンクしない)
+  cmake -S OpenSubdiv -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNO_LIB=OFF \
+    -DNO_EXAMPLES=ON -DNO_TUTORIALS=ON -DNO_REGRESSION=ON -DNO_PTEX=ON -DNO_DOC=ON -DNO_OMP=ON \
+    -DNO_TBB=OFF -DNO_CUDA=ON -DNO_OPENCL=ON -DNO_CLEW=ON -DNO_OPENGL=OFF -DNO_METAL=ON -DNO_DX=ON \
+    -DNO_TESTS=ON -DNO_GLTESTS=ON -DNO_GLEW=ON -DNO_GLFW=ON -DNO_GLFW_X11=ON \
+    -DOpenGL_GL_PREFERENCE=LEGACY -DOPENGL_gl_LIBRARY="$SYSROOT/lib/libEGL.so" \
+    -DOPENGL_INCLUDE_DIR="$SYSROOT/include"
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 OpenSubdiv/LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
+}

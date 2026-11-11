@@ -1,0 +1,29 @@
+# pystring: Python の str のメソッド (split、strip、replace ...) を C++ の std::string で (static, for aios)
+#   OpenColorIO が使う。ソースは pystring.cpp ひとつ (cmake も make install もない) なので、Zig (aarch64-linux-musl)
+#   で直に作って libpystring.a と pystring/pystring.h を /opt/c に入れる (OpenColorIO の Findpystring が探す形)
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=pystring
+pkgver=1.1.3
+pkgrel=1
+pkgdesc='C++ functions matching the interface and behavior of Python string methods (static, for aios)'
+arch=('aarch64')
+url='https://github.com/imageworks/pystring'
+license=('BSD-3-Clause')
+source=("pystring::git+https://github.com/imageworks/pystring.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cd pystring
+  $CXX -O2 -fPIC -c pystring.cpp -o pystring.o
+  rm -f libpystring.a
+  $AR rcs libpystring.a pystring.o
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  install -Dm644 pystring/libpystring.a "$pkgdir$PREFIX/lib/libpystring.a"
+  install -Dm644 pystring/pystring.h "$pkgdir$PREFIX/include/pystring/pystring.h"
+  install -Dm644 pystring/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

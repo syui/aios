@@ -1,0 +1,32 @@
+# openjph: JPEG 2000 Part 15 (HTJ2K) の C++ のライブラリ (static, for aios)
+#   OpenEXR (HTJ2K の圧縮) と OpenImageIO が使う。C++ のライブラリは静的に (imath の PKGBUILD を見て)。
+#   pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。/opt/c に入る。
+#   道具 (ojph_compress / ojph_expand) と TIFF は入れない
+#   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
+pkgname=openjph
+pkgver=0.25.3
+pkgrel=1
+pkgdesc='Open-source implementation of JPEG2000 Part-15 (HTJ2K) (static, for aios)'
+arch=('aarch64')
+url='https://github.com/aous72/OpenJPH'
+license=('BSD-2-Clause')
+makedepends=('cmake' 'ninja')
+source=("OpenJPH::git+https://github.com/aous72/OpenJPH.git#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  cmake -S OpenJPH -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
+    -DOJPH_BUILD_TESTS=OFF -DOJPH_ENABLE_TIFF_SUPPORT=OFF -DOJPH_BUILD_EXECUTABLES=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 OpenJPH/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
