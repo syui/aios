@@ -1455,6 +1455,9 @@ pub fn scheduler() -> ! {
                 set_cur(Some(i));
                 ON_CPU[crate::smp::id()].store(i + 1, Relaxed);
                 p.pt().activate_lazy();
+                // このプロセスの表を、大きなロックの持ち主の表に (smp.rs の BKL_PT。スレッドで分けた表のロックなしの
+                // mmap / munmap は、そのあいだ入らない)
+                crate::smp::set_user_pt(p.pt() as *const crate::vm::PageTable as usize);
                 fp_load(&p.fp);
                 // ユーザーに戻るときの PSTATE.SSBS は、切りかえのたびにスレッドの印から (Linux の __switch_to)
                 if !p.kthread {
@@ -1467,6 +1470,7 @@ pub fn scheduler() -> ! {
                 let t = crate::timer::uptime_ns().max(1);
                 (p.ran_at, p.kern_at) = (t, t);
                 swtch(sched_ctx(), &p.context);
+                crate::smp::set_user_pt(0);
                 // 走った時間とカーネルの時間を足す (終わったスレッドは、終わるときに代表へわたして 0 にしている)
                 let q = &mut procs()[i];
                 let now = crate::timer::uptime_ns();
@@ -1825,6 +1829,7 @@ fn exit_status(status: i32) -> ! {
         m.get().pt.release_deferred();
     }
     p.mm = None;
+    crate::smp::set_user_pt(0);
     drop(_p);
     let _p = crate::debug::span("proc:exit_notify");
     p.xstatus = p.group_exit.unwrap_or(status);
@@ -2147,6 +2152,7 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
         crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
     }
     p.pt().activate();
+    crate::smp::set_user_pt(p.pt() as *const crate::vm::PageTable as usize);
     // 前のアドレス空間 (fork した写し) のページを返すのも、exit と同じく大きなロックを放してから
     if let Some(m) = old.as_ref().filter(|m| m.private()) {
         m.get().pt.release_deferred();

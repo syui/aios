@@ -825,8 +825,10 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
         }
         // 自分だけの無名の mmap (MAP_FIXED でないもの) と、自分だけの無名とファイルの写し (MAP_PRIVATE。ファイルはまるごと)
-        // の munmap。スレッドで分けていない表だけ (vm::PageTable::fast_map、fast_unmap)。ファイルの mmap、共有、MAP_FIXED、
-        // スワップへ出したページのあるところ、知らない印や prot は、ふつうの道 (sys_mmap、sys_munmap) へ
+        // の munmap (vm::PageTable::fast_map、fast_unmap)。スレッドで分けた表は、ロックなしの読みと大きなロックを持った
+        // 同じ表のスレッドがいないときだけ、ひとりで変える (fast_map_threads、fast_unmap の threads: write_enter)。
+        // ファイルの mmap、共有、MAP_FIXED、スワップへ出したページのあるところ、知らない印や prot は、ふつうの道
+        // (sys_mmap、sys_munmap) へ
         MMAP if a[3] & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK) == 0
             && a[3] & (MAP_PRIVATE | MAP_ANONYMOUS) == MAP_PRIVATE | MAP_ANONYMOUS
             && a[2] & !7 == 0
@@ -834,12 +836,18 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             && a[1] != 0
             && a[1] <= crate::vm::MAXVA as u64 =>
         {
-            let Some(m) = p.mm.as_ref().filter(|m| m.private()) else { return false };
-            let m = m.get();
+            let Some(mm) = p.mm.as_ref() else { return false };
+            let m = mm.get();
             let len = pg_up(a[1] as usize);
-            let Some(va) = m.pt.fast_map(m.mmap_next, len, prot_bits(a[2])) else { return false };
-            m.mmap_next = va + len;
-            va as i64
+            if mm.private() {
+                let Some(va) = m.pt.fast_map(m.mmap_next, len, prot_bits(a[2])) else { return false };
+                m.mmap_next = va + len;
+                va as i64
+            } else {
+                let next = core::ptr::addr_of_mut!(m.mmap_next);
+                let Some(va) = m.pt.fast_map_threads(next, len, prot_bits(a[2])) else { return false };
+                va as i64
+            }
         }
         // ふつうのファイルの写し (MAP_PRIVATE、MAP_FIXED でないもの): ext4 なら同じ inode の新しい InodeRef で
         // (vm::fast_mmap_file)。できなければふつうの道 (エラーもそこで)
@@ -857,8 +865,8 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
         }
         MUNMAP if a[0] & 0xfff == 0 && a[1] != 0 && a[0] < crate::vm::MAXVA as u64 && a[1] <= crate::vm::MAXVA as u64 => {
-            let Some(m) = p.mm.as_ref().filter(|m| m.private()) else { return false };
-            match m.get().pt.fast_unmap(a[0] as usize, a[0] as usize + pg_up(a[1] as usize)) {
+            let Some(m) = p.mm.as_ref() else { return false };
+            match m.get().pt.fast_unmap(a[0] as usize, a[0] as usize + pg_up(a[1] as usize), !m.private()) {
                 Some(()) => 0,
                 None => return false,
             }

@@ -847,6 +847,44 @@ munmap を 20000 回、ファイルの写し 5000 回、スレッドがいると
 0 か書いたものか SIGSEGV しか見えない) は Linux 7.4-rc1 と同じ。1 MiB を 20000 回のあとの MemFree のへりは 40080 kB から
 4 kB (とっておいた 1 つ)。bench smp の mmap と mmap-busy は前とゆれの中で同じ。
 
+### スレッドで分けた表の無名の mmap / munmap も大きなロックの外へ
+
+Blender 5.3 の EEVEE を llvmpipe で動かすと、Blender と llvmpipe のスレッドが musl の malloc の 120 KiB の mmap と munmap を
+くりかえし、/proc/ai/bkl で 4 つの CPU がそれぞれ 60% ほど大きなロックを待っていた (munmap 48 万回、ロックの中で 1 回
+120 µs。シェーダーを作るスレッドは時間の 9 割ほどがカーネルの中)。ロックなしの mmap / munmap は、表をだれとも分けていない
+プロセスだけだった。スレッドがいると、ほかのスレッドが同じ表を同時に読む: ロックなしのフォルト (fast_fault) と
+copy_*_nofault は領域の木 (vmas) と PTE を、大きなロックを持ったスレッドは fault や user_pa で vmas を読み、物理アドレスを
+引いてユーザーのページに直に書く。そこでページを返すと、返したページに書いてしまう。
+
+スレッドで分けた表は、ロックなしで変える人がひとりで変える (vm::PageTable::write_enter。fast_map_threads と
+fast_unmap の threads):
+- fast_users に入って mutators を見る (大きなロックを持って変える・読む側の mutating と hold とは、いままでどおり)。
+- fwriter を compare-exchange で立てる。ほかのロックなしの書き手とは、立てたほうだけが入る。
+- 立ててから smp::bkl_pt を見る。大きなロックを持っている CPU が、プロセスの中で使っている表 (smp.rs の BKL_PT) で、
+  スケジューラがプロセスへ切りかえるとき (set_user_pt)、大きなロックを取ったとき (lock、try_lock) に置き、放すときと
+  スケジューラにもどったとき、exit で 0 にする (exec では新しい表に)。大きなロックの側は置いてから fwriter を見て、
+  ロックなしの書き手が終わるのを待つ (vm::wait_writer。書き手は割り込みを止めて走り、眠らず、大きなロックを取らない)。
+  どちらかがかならず相手を見るので、同じ表のスレッドが大きなロックを持って vmas を読んだり、引いた物理アドレスに
+  書いたりしているあいだに、ほかのスレッドがロックなしで領域を外してページを返すことはない。gpu.rs のように途中で
+  大きなロックを放して取りなおしても、lock が置きなおす。
+- ロックなしで読む人 (read_enter: fast_fault、copy_in / copy_out_nofault、readable_nofault、fast_mremap_fail) は、
+  fwriter が立っていれば入らずに待つ。書き手は、もう入っている人が出るのを待つ (fast_users が 1)。
+
+これで変えているあいだ、この表をたどる人はほかにいないので、PTE を消して TLB を消せば、ページもテーブルもすぐに返せる
+(自分だけの表と同じ道: unmap_fast_inner、map_free)。mmap_next もそのあいだに読み書きする。
+
+はじめは munmap と mmap の半分ほどが大きなロックの道へ回った。だれかひとりが大きなロックの道で表を変える (mutating) と、
+そのあいだのロックなしのフォルトと書き手もすぐに大きなロックの道へ行き、こんどはそれが mutators や BKL_PT でほかを止める
+行列が続いていた (/proc/bkl のフォルト 80 万回)。fast_fault と write_enter は、大きなロックの側が終わるのを 1 度だけ
+(500 µs まで: vm::spin_until) 待ってからやりなおす。眠るまま mutating を持つもの (ディスクを読むフォルト) には、待ちきって
+からふつうの道へ。
+
+新しい test/threadmap.c (4 つのスレッドが 120 KiB を作って印を書いて外すのを 2000 回ずつ、作っては外す領域にほかの
+スレッドがカーネルを書かせる (pipe からの read) と読ませる (pipe への write) あいだに、新しい領域の印がこわれないか、
+自分の領域に書くスレッドとほかのスレッドの作って外すのがまざる、/proc/self/maps を読みつづける) は、aios でも
+Linux 7.4-rc1 でも 0 failed。churn の 8000 回の munmap と mmap で大きなロックを取ったのは、前のカーネルの 8000 と
+8000 から 0〜22 と 0〜20 に。threadmap 全体で sys の時間は 19.9 秒から 4.5 秒、かかった時間は 8.3 秒から 7.4 秒。
+
 ### AppArmor (Linux と同じプロファイル)
 
 AppArmor のプロファイル (文字で書いた決まり) は、Linux と同じく apparmor_parser がバイナリにして

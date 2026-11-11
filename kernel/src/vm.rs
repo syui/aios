@@ -1244,6 +1244,9 @@ pub struct PageTable {
     /// 大きなロックを持ってこの表 (領域か PTE) を変えている途中の数。0 でないあいだ fast_fault は
     /// ふつうの道 (大きなロック) へ回る。変える側は増やしてから quiesce する (Mutating)
     mutators: AtomicUsize,
+    /// スレッドで分けた表を、大きなロックなしで変えている途中 (1。write_enter): そのあいだ、ほかのロックなしで読む人
+    /// (read_enter) は入らずに待ち、この表のスレッドが大きなロックを取ったとき (smp::own_user_pt) も待つ
+    fwriter: AtomicUsize,
     /// clock の針 (次にスワップへ追い出すページを探しはじめる va)
     clock: usize,
     /// reclaim_file の針 (次に外す、写したファイルのページを探しはじめる va)
@@ -1739,7 +1742,7 @@ impl PageTable {
     pub fn new() -> Option<Self> {
         let root = kalloc::alloc()? as *mut u64;
         TABLES.fetch_add(1, Ordering::Relaxed);
-        Some(Self { root, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new(), last_end: 0, kept: usize::MAX })
+        Some(Self { root, vmas: BTreeMap::new(), fast_users: AtomicUsize::new(0), mutators: AtomicUsize::new(0), fwriter: AtomicUsize::new(0), clock: 0, fclock: 0, hist: alloc::collections::VecDeque::new(), last_end: 0, kept: usize::MAX })
     }
 
     /// exit で (大きなロックを持って、自分だけの表に。このあとすぐ捨てること): ページとテーブルを返すのは、この CPU が
@@ -2772,8 +2775,7 @@ impl PageTable {
     /// ページが写っていない・書けないなら false (ロックを取ってふつうの道で)
     // [lockless]
     pub fn copy_out_nofault(&self, dst: usize, src: &[u8]) -> bool {
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        self.read_enter();
         let mut pas = [(0usize, 0usize); 2];
         let mut n = 0;
         let mut ok = true;
@@ -2828,16 +2830,28 @@ impl PageTable {
         if va >= MAXVA {
             return false;
         }
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        let (ok, put) = if self.mutators.load(Ordering::SeqCst) == 0 { self.fast_fault_inner(va, write, exec) } else { (false, None) };
-        self.fast_users.fetch_sub(1, Ordering::SeqCst);
-        if let Some(old) = put {
-            // 写しとった元のページを手放す。ロックなしで元のページを読んでいる CPU がいなくなってから
-            self.quiesce();
-            kalloc::put(old);
+        let mut waited = false;
+        loop {
+            self.read_enter();
+            if self.mutators.load(Ordering::SeqCst) == 0 {
+                let (ok, put) = self.fast_fault_inner(va, write, exec);
+                self.fast_users.fetch_sub(1, Ordering::SeqCst);
+                if let Some(old) = put {
+                    // 写しとった元のページを手放す。ロックなしで元のページを読んでいる CPU がいなくなってから
+                    self.quiesce();
+                    kalloc::put(old);
+                }
+                return ok;
+            }
+            self.fast_users.fetch_sub(1, Ordering::SeqCst);
+            // だれかが大きなロックを持って変えている途中: すぐに大きなロックの道へ行くと、こんどは自分が mutating で
+            // ほかのスレッドのロックなしのフォルトを止め、行列がつづく (スレッドが多いと、ほとんどのフォルトがそうなった)。
+            // しばらく (SPIN_NS まで) 終わるのを待ってからやりなおす
+            if waited || !spin_until(|| self.mutators.load(Ordering::SeqCst) == 0) {
+                return false;
+            }
+            waited = true;
         }
-        ok
     }
 
     /// (片づいたか, あとで手放すページ)
@@ -2982,8 +2996,7 @@ impl PageTable {
     /// 大きなロックなしで、もう写っているページからだけ読む (futex の速い道)。写っていなければ false
     // [lockless]
     pub fn copy_in_nofault(&self, src: usize, dst: &mut [u8]) -> bool {
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        self.read_enter();
         let mut ok = true;
         let (mut va, mut done) = (src, 0);
         while done < dst.len() {
@@ -3011,8 +3024,7 @@ impl PageTable {
     pub fn fast_mremap_fail(&self, old: usize, old_end: usize, new_end: usize) -> Option<i64> {
         const EFAULT: i64 = 14;
         const ENOMEM: i64 = 12;
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        self.read_enter();
         let r = if self.mutators.load(Ordering::SeqCst) != 0 {
             None
         } else {
@@ -3032,8 +3044,7 @@ impl PageTable {
     /// だれかが変えている途中なら入らずに false
     // [lockless]
     fn fast_enter(&self) -> bool {
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        self.read_enter();
         if self.mutators.load(Ordering::SeqCst) == 0 {
             return true;
         }
@@ -3043,6 +3054,78 @@ impl PageTable {
 
     // [lockless]
     fn fast_leave(&self) {
+        self.fast_users.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// 大きなロックなしでこの表を読みはじめる (fast_users に入る)。スレッドで分けた表をだれかがロックなしで変えている
+    /// 途中 (fwriter) なら、入らずに終わるのを待ってから (変える人は、すでに入っている人が出るのを待つだけ)
+    // [lockless]
+    fn read_enter(&self) {
+        loop {
+            self.fast_users.fetch_add(1, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            if self.fwriter.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            self.fast_users.fetch_sub(1, Ordering::SeqCst);
+            while self.fwriter.load(Ordering::SeqCst) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// スレッドで分けた表を、大きなロックなしで変えはじめる (fast_map、fast_unmap の threads)。ひとりで変える:
+    ///   - fast_users に入ってから mutators を見る (大きなロックを持って変える・読む側 (mutating、hold) とは fast_enter と
+    ///     同じくすれちがう)
+    ///   - fwriter を立てる (ほかのロックなしの書き手とは、立てられたほうだけが入る。負けたら出て、終わるのを待ってから
+    ///     やりなおす)
+    ///   - 立ててから、この表のスレッドが大きなロックを持っていないか (smp::bkl_pt) を見る。持っていれば下りて、ふつうの
+    ///     道へ (大きなロックの側は bkl_pt を置いてから fwriter を見て待つ: どちらかがかならず相手を見る)。大きなロックの
+    ///     側が読む領域の木や、物理アドレスを引いて書いているユーザーのページを、ここで外して返さないため
+    ///   - ほかのロックなしで読む人 (read_enter: fast_fault、copy_*_nofault ...) がみな出るのを待つ (新しく来た人は
+    ///     fwriter を見て待つ)
+    /// これで、変えているあいだ、この表をたどる人はほかにいない (PTE を消して TLB を消せば、ページもテーブルもすぐに
+    /// 返せる: 自分だけの表と同じ)。だれかが大きなロックで変えている途中か、大きなロックを持っていれば false
+    // [lockless]
+    fn write_enter(&self) -> bool {
+        let me = self as *const PageTable as usize;
+        // 大きなロックの側が終わるのを待つのは 1 度だけ (fast_fault と同じく、すぐにふつうの道へ行くと行列がつづく)
+        let mut waited = false;
+        loop {
+            if !self.fast_enter() {
+                if waited || !spin_until(|| self.mutators.load(Ordering::SeqCst) == 0) {
+                    return false;
+                }
+                waited = true;
+                continue;
+            }
+            if self.fwriter.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                // ほかのスレッドがロックなしで変えている途中 (すぐ終わる)
+                self.fast_leave();
+                while self.fwriter.load(Ordering::SeqCst) != 0 {
+                    core::hint::spin_loop();
+                }
+                continue;
+            }
+            fence(Ordering::SeqCst);
+            if crate::smp::bkl_pt() == me {
+                self.write_leave();
+                if waited || !spin_until(|| crate::smp::bkl_pt() != me) {
+                    return false;
+                }
+                waited = true;
+                continue;
+            }
+            while self.fast_users.load(Ordering::SeqCst) != 1 {
+                core::hint::spin_loop();
+            }
+            return true;
+        }
+    }
+
+    // [lockless]
+    fn write_leave(&self) {
+        self.fwriter.store(0, Ordering::SeqCst);
         self.fast_users.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -3062,8 +3145,33 @@ impl PageTable {
         if !self.fast_enter() {
             return Err((back, name));
         }
+        let r = self.map_free(hint, len, prot, back, name);
+        self.fast_leave();
+        r
+    }
+
+    /// fast_map の、スレッドで分けた表のもの (write_enter でひとりで変える)。next は Mm::mmap_next: 探しはじめる場所を読み、
+    /// 作った領域の終わりを書く (どちらも、ひとりで変えているあいだに)
+    // [lockless]
+    pub fn fast_map_threads(&mut self, next: *mut usize, len: usize, prot: u8) -> Option<usize> {
+        if !self.write_enter() {
+            return None;
+        }
+        let hint = unsafe { next.read_volatile() };
+        let r = self.map_free(hint, len, prot, Backing::Anon, None).ok();
+        if let Some(va) = r {
+            unsafe { next.write_volatile(va + len) };
+        }
+        self.write_leave();
+        r
+    }
+
+    /// hint から空いているところに、len バイトの自分だけの (MAP_PRIVATE の) 領域を作る (fast_map のなかみ。呼ぶほうが
+    /// fast_enter か write_enter で入っている)
+    // [lockless]
+    fn map_free(&mut self, hint: usize, len: usize, prot: u8, back: Backing, name: Option<alloc::rc::Rc<str>>) -> Result<usize, (Backing, Option<alloc::rc::Rc<str>>)> {
         let va = self.free_area(hint, len);
-        let r = match va.checked_add(len) {
+        match va.checked_add(len) {
             Some(end) if end <= MAXVA && len != 0 => {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
@@ -3072,24 +3180,35 @@ impl PageTable {
                 Ok(va)
             }
             _ => Err((back, name)),
-        };
-        self.fast_leave();
-        r
+        }
     }
 
     /// 大きなロックなしの munmap (syscall::fast): [start, end) にかかる領域がみな自分だけの (MAP_PRIVATE の) 無名か
     /// ファイルの写しで、スワップへ出したページがないとき (共有のページとスワップのスロットは大きなロックで守っている)。
     /// ファイルの写しと名前のある領域は、まるごと外すときだけ (分けると Rc を写すことになる)。外した Rc と写しの表の鍵は
-    /// drop_unmapped にまかせる。スレッドで分けていない表だけ (fast_map と同じ)。ほかのスレッドがいないので、PTE を消して
-    /// TLB を消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce で fast_users を
-    /// 待つが、ここでは自分がそれ)。ページキャッシュのページも参照を返すだけ。できないものと、だれかが変えている途中なら
-    /// None (ふつうの道へ)
+    /// drop_unmapped にまかせる。threads でなければスレッドで分けていない表だけ (fast_map と同じ)。ほかのスレッドがいない
+    /// ので、PTE を消して TLB を消したら、ロックなしでページを読む CPU は待たずに手放せる (unmap_inner の Gather は quiesce
+    /// で fast_users を待つが、ここでは自分がそれ)。ページキャッシュのページも参照を返すだけ。できないものと、だれかが変えている途中なら
+    /// None (ふつうの道へ)。threads: スレッドで分けた表 (write_enter でひとりで変える。ほかのスレッドのロックなしの読み
+    /// と、大きなロックを持ったこの表のスレッドがいないので、PTE を消して TLB を消せば、ページもテーブルもすぐに返せる)
     // [lockless]
-    pub fn fast_unmap(&mut self, start: usize, end: usize) -> Option<()> {
+    pub fn fast_unmap(&mut self, start: usize, end: usize, threads: bool) -> Option<()> {
         let (start, end) = (pg_down(start), pg_up(end));
-        if start >= end || end > MAXVA || !self.fast_enter() {
+        if start >= end || end > MAXVA || !(if threads { self.write_enter() } else { self.fast_enter() }) {
             return None;
         }
+        let r = self.unmap_fast_inner(start, end);
+        if threads {
+            self.write_leave();
+        } else {
+            self.fast_leave();
+        }
+        r
+    }
+
+    /// fast_unmap のなかみ (呼ぶほうが fast_enter か write_enter で入っている)
+    // [lockless]
+    fn unmap_fast_inner(&mut self, start: usize, end: usize) -> Option<()> {
         let whole = |s: usize, v: &Vma| s >= start && v.end <= end;
         let plain = self.vmas_in(start, end).all(|(&s, v)| {
             !v.shared
@@ -3104,7 +3223,6 @@ impl PageTable {
             self.each_entry(start, end, |_, pte| swapped |= is_swap(unsafe { *pte }));
         }
         if !plain || swapped {
-            self.fast_leave();
             return None;
         }
         self.note(b'u', start, end, 0);
@@ -3153,15 +3271,13 @@ impl PageTable {
                 u.ranges.extend(ranges);
             }
         }
-        self.fast_leave();
         Some(())
     }
 
     /// 大きなロックなしで、va から len バイトがみな写っているか (読める) だけを見る (write_fast が、ページを書きかえる前に)
     // [lockless]
     pub fn readable_nofault(&self, va: usize, len: usize) -> bool {
-        self.fast_users.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        self.read_enter();
         let end = va.saturating_add(len);
         let mut ok = end <= MAXVA;
         let mut v = va & !(PGSIZE - 1);
@@ -3550,6 +3666,41 @@ pub fn free_deferred() {
         if root != 0 {
             free_level(root as *mut u64, 1, true);
         }
+    }
+}
+
+/// ロックなしの道が、大きなロックの側 (mutating、同じ表のスレッドが持つ大きなロック) が終わるのを待つ長さの上限
+const SPIN_NS: u64 = 500_000;
+
+/// cond が真になるまで回って待つ (SPIN_NS まで。時計は 64 回に 1 回だけ読む: TCG では読むのが重い)。こえたら false
+// [lockless]
+fn spin_until(mut cond: impl FnMut() -> bool) -> bool {
+    let mut deadline = 0;
+    let mut i = 0u32;
+    loop {
+        if cond() {
+            return true;
+        }
+        core::hint::spin_loop();
+        i = i.wrapping_add(1);
+        if i % 64 == 0 {
+            let now = crate::timer::uptime_ns();
+            if deadline == 0 {
+                deadline = now + SPIN_NS;
+            } else if now > deadline {
+                return false;
+            }
+        }
+    }
+}
+
+/// 大きなロックを取った CPU が、プロセスの中でこの表 (pt はアドレス) を使う前に (smp::own_user_pt): この表をロックなしで
+/// 変えている途中のスレッド (PageTable::write_enter) が終わるのを待つ。書き手は割り込みを止めて走り、眠らず、大きな
+/// ロックも取らないので、すぐ終わる
+pub fn wait_writer(pt: usize) {
+    let pt = unsafe { &*(pt as *const PageTable) };
+    while pt.fwriter.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
     }
 }
 

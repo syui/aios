@@ -98,6 +98,38 @@ static BKL: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static SERVING: AtomicUsize = AtomicUsize::new(0);
 
+/// CPU ごとの、いま走らせているプロセスのページ表 (vm::PageTable のアドレス。スケジューラの中や眠っているあいだは 0)。
+/// スケジューラがプロセスへ切りかえるときに置き、もどったときに 0 にする (set_user_pt)
+static USER_PT: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU];
+/// 大きなロックを持っている CPU が、プロセスの中で使っているページ表 (USER_PT。なければ 0)。スレッドで分けた表の大きな
+/// ロックなしの mmap / munmap (vm::PageTable::write_enter) は、これが自分の表なら入らない。大きなロックの側は、これを
+/// 置いてから、その表のロックなしの書き手が終わるのを待つ (vm::wait_writer)。どちらかがかならず相手を見る (SeqCst)。
+/// これで、同じ表のスレッドが大きなロックを持って領域の木 (vmas) やページ表を読んだり、物理アドレスを引いてユーザーの
+/// ページに書いたりしているあいだに、ほかのスレッドがロックなしで領域を外してページを返すことはない
+static BKL_PT: AtomicUsize = AtomicUsize::new(0);
+
+/// 大きなロックの持ち主がいまのプロセスの表を使う: BKL_PT を置いて、その表のロックなしの書き手を待つ
+fn own_user_pt() {
+    let pt = USER_PT[id()].load(Ordering::Relaxed);
+    BKL_PT.store(pt, Ordering::SeqCst);
+    if pt != 0 {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        crate::vm::wait_writer(pt);
+    }
+}
+
+/// スケジューラがプロセスへ切りかえる (pt はその表のアドレス) / もどった (0)。大きなロックを持って呼ぶ
+pub fn set_user_pt(pt: usize) {
+    USER_PT[id()].store(pt, Ordering::Relaxed);
+    own_user_pt();
+}
+
+/// 大きなロックを持っている CPU が、いまプロセスの中で使っている表 (vm::PageTable::write_enter が見る)
+// [lockless]
+pub fn bkl_pt() -> usize {
+    BKL_PT.load(Ordering::SeqCst)
+}
+
 /// 取る。取った時刻 (ns) を返す (trap.rs が、持っていた時間を数えるのに時計を読みなおさないため)。測らない回は 0。
 /// 時計を読むのはくじにあたったときだけ (SAMPLE。待ったものも)
 pub fn lock() -> u64 {
@@ -135,6 +167,7 @@ pub fn lock() -> u64 {
     c.weight.store(w, Ordering::Relaxed);
     crate::heap::quar_check("lock");
     crate::vm::DROPPED_UNMAPPED[me - 1].store(0, Ordering::Relaxed);
+    own_user_pt();
     now
 }
 
@@ -151,6 +184,7 @@ fn try_lock() -> bool {
     let w = if draw(c) { SAMPLE } else { 0 };
     c.since.store(if w != 0 { crate::timer::uptime_ns() } else { 0 }, Ordering::Relaxed);
     c.weight.store(w, Ordering::Relaxed);
+    own_user_pt();
     true
 }
 
@@ -161,6 +195,7 @@ fn release(now: u64) {
     if w != 0 {
         add(&c.hold, now.saturating_sub(c.since.load(Ordering::Relaxed)) * w);
     }
+    BKL_PT.store(0, Ordering::SeqCst);
     BKL.store(0, Ordering::Relaxed);
     // SERVING を書くのは持っているものだけなので、読んで書くだけでいい
     SERVING.store(SERVING.load(Ordering::Relaxed) + 1, Ordering::Release);
