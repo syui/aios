@@ -3,8 +3,8 @@
 # git の Rust の部品 (libgitcore、Git 3.0 からは必須) は aarch64-unknown-linux-musl で作ってつなぐ
 # (Rust の std が使う _Unwind_* は Zig の libunwind)
 pkgname=git
-pkgver=2.56.0
-pkgrel=9
+pkgver=2.56.1
+pkgrel=1
 pkgdesc='Distributed version control system (static, https via curl + mbedTLS)'
 arch=('aarch64')
 url='https://git-scm.com'
@@ -13,7 +13,7 @@ depends=('ca-certificates')
 makedepends=('rustup')
 backup=(etc/gitconfig)
 source=("https://mirrors.edge.kernel.org/pub/software/scm/git/git-$pkgver.tar.xz")
-sha256sums=('26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3')
+sha256sums=('f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f')
 
 prepare() {
   rm -rf "git-$pkgver"
