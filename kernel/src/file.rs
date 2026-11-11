@@ -672,7 +672,7 @@ fn note(i: usize) {
 }
 
 /// 大きなロックなしの openat (syscall::fast): O_RDONLY か O_WRONLY か O_RDWR (と O_CLOEXEC / O_LARGEFILE / O_NOCTTY)
-/// だけで、絶対のパスか、いまのディレクトリか開いているディレクトリ (statc の dir_base) からのもの。statc の表が
+/// だけで (O_NOFOLLOW は「ない」の答えだけ: git は .gitignore をディレクトリごとに O_NOFOLLOW で開く)、絶対のパスか、いまのディレクトリか開いているディレクトリ (statc の dir_base) からのもの。statc の表が
 /// 「ない」と答えれば ENOENT (ふつうの道と同じわけを /proc/ai/why に)、ふつうのファイルで呼んだ人が読めて (書けて)、
 /// 読むだけの口で、同じパスと inode と口のものが棚にあれば、それを置く。棚になく (書く口はいつも)、リンクをたどらずに
 /// 着くものなら、ext4 の名前と inode から新しく開く (fastdir::fast_open)。ほかは None (ふつうの道へ)
@@ -682,17 +682,19 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;
     const O_DIRECTORY: u64 = 0o40000;
+    const O_NOFOLLOW: u64 = 0o100000;
     let acc = flags & O_ACCMODE as u64;
+    let nofollow = flags & O_NOFOLLOW != 0;
     // O_DIRECTORY (opendir) は読むだけの口で、ディレクトリなら (ほかはふつうの道が EISDIR や ENOTDIR を)
     let dir = flags & O_DIRECTORY != 0;
-    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64 | O_DIRECTORY) != 0 || acc == O_ACCMODE as u64 || (dir && acc != O_RDONLY as u64) || me.has_cred_work(proc::CRED_SANDBOX) || OPEN_WATCHED.load(Relaxed) != 0 {
+    if flags & !(O_ACCMODE as u64 | O_LARGEFILE | O_CLOEXEC | O_NOCTTY as u64 | O_DIRECTORY | O_NOFOLLOW) != 0 || acc == O_ACCMODE as u64 || (dir && acc != O_RDONLY as u64) || me.has_cred_work(proc::CRED_SANDBOX) || OPEN_WATCHED.load(Relaxed) != 0 {
         note(5);
         return None;
     }
     // fd の表はほかのスレッドと分けていてもよい: 表と cwd を見るところ (statc と、fd をとっておく・置くところ) は門の中で
     let files = me.files.as_ref()?;
     let mut norm = [0u8; crate::statc::PATH];
-    let Some((ans, len)) = crate::statc::open_lookup(me, dirfd, pathp, &mut norm) else {
+    let Some((ans, len)) = crate::statc::open_lookup(me, dirfd, pathp, !nofollow, &mut norm) else {
         note(3);
         return None;
     };
@@ -700,6 +702,11 @@ pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Optio
         crate::statc::Open::Missing(looked) => {
             note(1);
             return Some(crate::statc::missing(me, OPENAT, &norm[..len], looked));
+        }
+        // O_NOFOLLOW であるもの (リンクなら ELOOP、ほかは開いた口の flags に残す) は、ふつうの道で
+        crate::statc::Open::Found(..) if nofollow => {
+            note(5);
+            return None;
         }
         crate::statc::Open::Found(st, plain, fresh, base) => (st, plain, fresh, base),
     };
@@ -1689,6 +1696,7 @@ impl OpenFile {
     }
 }
 
+// [lockless]
 fn dtype(mode: u32) -> u8 {
     match mode & S_IFMT {
         0o010000 => 1,  // DT_FIFO
@@ -2168,6 +2176,76 @@ pub fn pos_fast(f: &FileRef) -> Option<PosFast> {
         return None;
     }
     Some(PosFast(s))
+}
+
+/// 大きなロックなしの getdents64 の数: [0] 答えた、ふつうの道へ: [1] 口の形 (O_PATH、ルートの ext4 でない、IN_ACCESS の
+/// 見張り、fail)、[2] ext4 が読めない (ハッシュの順に読まない、キャッシュにない、消した、ディレクトリでない)、[3] 位置を
+/// 使っている途中、[4] はじめの項目が入らない (EINVAL) かユーザーのページが写っていない。/proc/bkl に出す
+pub static FAST_DENTS: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// 大きなロックなしの getdents64 (syscall::fast): ルートの ext4 のディレクトリを、ふつうの道 (OpenFile::getdents) と
+/// 同じ位置と並び (ハッシュの順。d_off は次の項目の位置、終わりは i64::MAX) で。開いた口の位置の札を取って (ほかの人が
+/// この口の位置を使っていればふつうの道へ)、写せたぶんだけ位置を進める。git status、du、rg はディレクトリごとに 2 度
+/// ずつ呼ぶ (2 度目は 0 で終わり)。ふつうの道の覚え (OpenFile の dirents) にはさわらない: 位置はハッシュなので、どちらで
+/// 読みついでも同じ並び
+// [lockless]
+pub fn fast_getdents(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
+    let r = fast_getdents_inner(me, fd, va, len);
+    FAST_DENTS[r.err().unwrap_or(0)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    r.ok()
+}
+
+/// fast_getdents の中身。Err はふつうの道へ行ったわけ (FAST_DENTS の番号)
+// [lockless]
+fn fast_getdents_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Result<i64, usize> {
+    use core::sync::atomic::Ordering::Relaxed;
+    const END: u64 = i64::MAX as u64;
+    if len == 0 || crate::debug::FAIL_ON.load(Relaxed) || crate::vfs::notify::ACCESS_WATCHED.load(Relaxed) != 0 {
+        return Err(1);
+    }
+    let files = me.files.as_ref().ok_or(1usize)?;
+    // ほかのスレッドと分けている表は門を通って見る (見ているあいだ、fd は閉じられず、表も動かない)
+    let _gate = if files.private() { None } else { Some(files.get().gate.read().ok_or(1usize)?) };
+    let f = files.get().get(fd).ok_or(1usize)?;
+    let _pos = pos_fast(f).ok_or(3usize)?;
+    // ほかのプロセスが大きなロックの中で借りているかもしれないので、借りずに見る (位置は札を持つ人だけが使う)
+    let of = unsafe { &mut *f.as_ptr() };
+    if of.flags & O_PATH != 0 {
+        return Err(1);
+    }
+    let Kind::Inode(ino, _) = &of.kind else { return Err(1) };
+    let (fs, dir) = ino.id();
+    let pos = of.offset as u64;
+    let mut names = Vec::new();
+    let list = crate::fastdir::readdir(fs, dir, pos, len, &mut names).ok_or(2usize)?;
+    let mut out: Vec<u8> = Vec::with_capacity(len.min(32 * 1024));
+    // 終わりまで返したら位置は終わり
+    let mut next_pos = END;
+    for (k, &(_, ino, mode, at, nlen)) in list.iter().enumerate() {
+        let name = &names[at as usize..at as usize + nlen as usize];
+        let next = list.get(k + 1).map_or(END, |e| e.0);
+        let reclen = (19 + name.len() + 1 + 7) & !7;
+        if out.len() + reclen > len {
+            if out.is_empty() {
+                return Err(4);
+            }
+            next_pos = list[k].0;
+            break;
+        }
+        let start = out.len();
+        out.extend_from_slice(&(ino as u64).to_le_bytes());
+        out.extend_from_slice(&(next as i64).to_le_bytes());
+        out.extend_from_slice(&(reclen as u16).to_le_bytes());
+        out.push(dtype(mode));
+        out.extend_from_slice(name);
+        out.resize(start + reclen, 0);
+    }
+    if !out.is_empty() && !me.pt().copy_out_nofault(va, &out) {
+        return Err(4);
+    }
+    // 読み終えていれば (位置がもう終わりでも) 終わりに
+    of.offset = next_pos as usize;
+    Ok(out.len() as i64)
 }
 
 /// 大きなロックなしの pread64 (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部

@@ -3792,6 +3792,7 @@ impl ExtFs {
     }
 
     /// ディレクトリの項目の種類 (ft) から mode の種類。書かれていなければ inode を読む
+    // [lockless]
     fn mode_of_ft(&self, ino: u32, ft: u8) -> u32 {
         match ft {
             1 => S_IFREG,
@@ -3879,6 +3880,9 @@ impl ExtFs {
     /// ディレクトリのブロックを書きかえる。チェックサムは写すときに (settle_csum)
     // [lockless]
     fn modify_dir_block(&self, dir: u32, generation: u32, b: u64, f: impl FnOnce(&mut [u8])) -> Result<(), i64> {
+        // ディレクトリの中身が変わる: inode の版を進める (大きなロックなしの getdents64 の並びの覚え DIR_LISTS が古くなる。
+        // .. を書きかえるだけの set_dotdot のように、inode を書かないものもある)
+        crate::statc::ino_bump((self.fs, dir as u64));
         self.modify_block(b, f)?;
         if self.csum {
             self.cache.borrow_mut().lazy_csum.insert(b, (dir, generation, Later::Dir));
@@ -4654,6 +4658,42 @@ impl ExtFs {
         })
     }
 
+    /// 大きなロックなしの getdents64 (fastdir::readdir): ディレクトリ dir の項目を、ふつうの道 (readdir_cookies) と同じ
+    /// 位置と並び (ハッシュの順) で、位置 pos から先を (位置, inode, 種類 (mode)、名前の始まり, 名前の長さ) に。名前は
+    /// names に続けて書く。linux_dirent64 で max バイトに入るぶんと、入らなかったはじめの 1 つ (次の位置) まで。
+    /// 名前の多いディレクトリの並びは覚えておく (DIR_LISTS)。pos が終わり (i64::MAX) なら読まない。開いた口はもうあるので、許しは見ない (Linux の getdents
+    /// も)。消したディレクトリ (nlink 0: ふつうの道が ENOENT)、ディレクトリでないもの (ENOTDIR)、ハッシュの順に読まない
+    /// もの、名前が UTF-8 でないもの、読むブロックがキャッシュにないものは None。ディレクトリのロックの中で読むので、
+    /// 作る・消すものとすれちがわない (ふつうの道で作る・消す・名前を変えるものは、ext4 のロックをひとりで持つ)
+    // [lockless]
+    pub fn fast_readdir(&self, dir: u32, pos: u64, max: usize, names: &mut Vec<u8>) -> Option<Vec<(u64, u32, u32, u32, u8)>> {
+        let _d = dir_lock(dir);
+        crate::proc::noio(|| {
+            let dm = self.meta_now(dir)?;
+            if dm.mode & S_IFMT != S_IFDIR || dm.nlink == 0 {
+                return None;
+            }
+            if pos >= i64::MAX as u64 {
+                return Some(Vec::new());
+            }
+            // 版はディレクトリのロックの中で読む (変えるものは、このロックか ext4 のロックをひとりで持つ)
+            let key = (self.fs, dir, crate::statc::ino_ver((self.fs, dir as u64)));
+            let raw = match dir_list_take(key, pos, max, names) {
+                Some(raw) => raw,
+                None => {
+                    let mut all = Vec::new();
+                    let v = self.readdir_hashed_raw(dir, &mut all).ok()??;
+                    let raw = window(&v, &all, pos, max, names);
+                    if v.len() > DIR_LIST_MIN {
+                        dir_list_put(key, v, all);
+                    }
+                    raw
+                }
+            };
+            Some(raw.into_iter().map(|(p, ino, ft, at, len)| (p, ino, self.mode_of_ft(ino, ft), at, len)).collect())
+        })
+    }
+
     /// 大きなロックなしの open (fastdir::fast_open): ディレクトリ dir の名前 name がいまも ino をさす、リンクのあるふつうの
     /// ファイル (want_dir なら、読むだけの口で開くディレクトリ: opendir) で、呼んだ人が dir を通れて ino に perm (cred の R / W) が許されていれば、その ExtInode (数えて)。書くなら、
     /// 読むだけのファイルシステムでも、変えられない・足すだけ (IMMUTABLE / APPEND) のものでもないこと (どれもふつうの道が
@@ -4688,6 +4728,63 @@ impl ExtFs {
 
 pub use crate::fastdir::FastUnlink;
 
+/// 大きなロックなしの getdents64 が読んだディレクトリの並びの覚え (ExtFs::fast_readdir)。musl の readdir はバッファが
+/// 2 KiB なので、大きなディレクトリは何度も呼ぶ: 呼ぶたびにみなのハッシュを作りなおすと、名前の数の 2 乗になる (5000 の
+/// 名前で 80 回)。(ファイルシステム, ディレクトリ, その inode の版) で引く: ディレクトリのブロックを変えると
+/// modify_dir_block が版を進める。名前が DIR_LIST_MIN より多いものだけ、DIR_LISTS こまで (古いものから入れかえる)
+struct DirList {
+    key: (usize, u32, u64),
+    list: Vec<htree::RawHashed>,
+    names: Vec<u8>,
+}
+
+const DIR_LISTS: usize = 8;
+const DIR_LIST_MIN: usize = 64;
+static DIR_LIST: crate::spinlock::SpinLock<([Option<DirList>; DIR_LISTS], usize)> = crate::spinlock::SpinLock::new(([const { None }; DIR_LISTS], 0));
+
+/// 覚えに key のものがあれば、位置 pos からの窓 (window)
+// [lockless]
+fn dir_list_take(key: (usize, u32, u64), pos: u64, max: usize, names: &mut Vec<u8>) -> Option<Vec<htree::RawHashed>> {
+    let d = DIR_LIST.lock();
+    let l = d.0.iter().flatten().find(|l| l.key == key)?;
+    Some(window(&l.list, &l.names, pos, max, names))
+}
+
+/// 覚える (同じディレクトリの古いものがあればそこに、なければ順に入れかえる)。捨てる並びは錠の外で落とす
+// [lockless]
+fn dir_list_put(key: (usize, u32, u64), list: Vec<htree::RawHashed>, names: Vec<u8>) {
+    let old = {
+        let mut d = DIR_LIST.lock();
+        let i = match d.0.iter().position(|l| l.as_ref().is_some_and(|l| (l.key.0, l.key.1) == (key.0, key.1))) {
+            Some(i) => i,
+            None => {
+                let i = d.1;
+                d.1 = (i + 1) % DIR_LISTS;
+                i
+            }
+        };
+        d.0[i].replace(DirList { key, list, names })
+    };
+    drop(old);
+}
+
+/// 並び list (名前は all) の位置 pos から、linux_dirent64 で max バイトに入るぶんと、入らなかったはじめの 1 つ。
+/// 名前は names に写して、その始まりで
+// [lockless]
+fn window(list: &[htree::RawHashed], all: &[u8], pos: u64, max: usize, names: &mut Vec<u8>) -> Vec<htree::RawHashed> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for &(p, ino, ft, at, len) in &list[list.partition_point(|e| e.0 < pos)..] {
+        out.push((p, ino, ft, names.len() as u32, len));
+        names.extend_from_slice(&all[at as usize..at as usize + len as usize]);
+        used += (19 + len as usize + 1 + 7) & !7;
+        if used > max {
+            break;
+        }
+    }
+    out
+}
+
 /// ロックなしの作る・消す・開く・stat (fastdir.rs) の相手 (ルートの ext4)
 impl crate::fastdir::FastFs for Rc<ExtFs> {
     // [lockless]
@@ -4717,6 +4814,10 @@ impl crate::fastdir::FastFs for Rc<ExtFs> {
     // [lockless]
     fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, want_dir: bool, c: &crate::cred::Cred) -> Option<InodeRef> {
         ExtFs::fast_open(self, dir, name, ino, perm, want_dir, c)
+    }
+    // [lockless]
+    fn fast_readdir(&self, dir: u32, pos: u64, max: usize, names: &mut Vec<u8>) -> Option<Vec<(u64, u32, u32, u32, u8)>> {
+        ExtFs::fast_readdir(self, dir, pos, max, names)
     }
 }
 

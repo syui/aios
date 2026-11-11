@@ -58,6 +58,10 @@ pub trait FastFs {
     /// dir の name (ino) を開く (want_dir ならディレクトリを、でなければふつうのファイルを)
     // [lockless]
     fn fast_open(&self, dir: u32, name: &str, ino: u32, perm: u32, want_dir: bool, c: &crate::cred::Cred) -> Option<crate::vfs::InodeRef>;
+    /// dir の位置 pos から先の項目 ((位置, inode, mode, 名前の始まり, 名前の長さ)、名前は names に。max バイトに入るぶんと、
+    /// 入らなかったはじめの 1 つ)
+    // [lockless]
+    fn fast_readdir(&self, dir: u32, pos: u64, max: usize, names: &mut alloc::vec::Vec<u8>) -> Option<alloc::vec::Vec<(u64, u32, u32, u32, u8)>>;
 }
 
 /// FastFs::fast_unlink の答え
@@ -258,6 +262,17 @@ pub fn cached_stat(ino: u64) -> Option<file::Stat> {
 // [lockless]
 pub fn root_fs_id() -> Option<usize> {
     root_fs().map(|fs| fs.fs_id())
+}
+
+/// 大きなロックなしの getdents64 (file::fast_getdents): ルートの ext4 (fs がその番号) のディレクトリ dir の、位置 pos
+/// から先の項目 ((位置, inode, mode, 名前の始まり, 名前の長さ)。名前は names に続けて。linux_dirent64 で max バイトに
+/// 入るぶんと、入らなかったはじめの 1 つ)。ext4 のロック (いっしょに) と dir のロックの中で (ExtFs::fast_readdir)。
+/// 読めなければ None (ふつうの道へ)
+// [lockless]
+pub fn readdir(fs: usize, dir: u64, pos: u64, max: usize, names: &mut alloc::vec::Vec<u8>) -> Option<alloc::vec::Vec<(u64, u32, u32, u32, u8)>> {
+    let root = root_fs().filter(|r| r.fs_id() == fs)?;
+    let _e = crate::smp::fs_lock_shared();
+    root.fast_readdir(u32::try_from(dir).ok()?, pos, max, names)
 }
 
 /// 表にない名前を 1 つ引く (statc::learn_lookup: 親のディレクトリ dir は表で確かめたもの): ext4 のロック (いっしょに) と

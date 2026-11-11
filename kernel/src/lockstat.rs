@@ -141,7 +141,7 @@ pub fn text() -> alloc::string::String {
     s.push_str(&format!("ディスクを眠って待った読み: {} 回 (大きなロックを放して)、書かれたのでやりなおした読み: {} 回\n", smp::DISK_SLEPT.load(Ordering::Relaxed), crate::file::IO_RETRIES.load(Ordering::Relaxed)));
     let (paths, missing) = crate::vfs::paths_len();
     s.push_str(&format!("パスの覚え: {} 個 (うちないもの {})、覚えから答えた {} 回\n", paths, missing, crate::vfs::PATHS_HIT.load(Ordering::Relaxed)));
-    s.push_str(&format!("ロックなしの stat (statc.rs): {} 回 (ふつうの道へ {})\n", crate::statc::HITS.load(Ordering::Relaxed), crate::statc::MISSES.load(Ordering::Relaxed)));
+    s.push_str(&format!("ロックなしの stat (statc.rs): {} 回 (ふつうの道へ {}、表 {})\n", crate::statc::HITS.load(Ordering::Relaxed), crate::statc::MISSES.load(Ordering::Relaxed), crate::statc::slots()));
     let uf: Vec<u64> = smp::UNIX_FAST.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("AF_UNIX のロックなしの読み書き: 読んだ {} 書いた {} (ふつうの道へ {})\n", uf[0], uf[1], uf[2]));
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}、空で終わりか EAGAIN を返した {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[7], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
@@ -154,6 +154,8 @@ pub fn text() -> alloc::string::String {
     s.push_str(&format!("ファイルのロックなしの pwrite (vm::write_fast): {} (ふつうの道へ: 許しがない・古い {} 大きさの外かキャッシュにない {} ユーザーのページが写っていない {} 書いたページがたまった {})\n", wf[0], wf[1], wf[2], wf[3], wf[4]));
     let fa: Vec<u64> = crate::file::FAST_WRITE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの書きたし (ExtFs::fast_append、ext4 のロックで): {} (ふつうの道へ: ファイルの形 {} 書き出すころ {} extent がつづかない {} 見張りかほか {})\n", fa[0], fa[1], fa[2], fa[3], fa[4]));
+    let gd: Vec<u64> = crate::file::FAST_DENTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("ディレクトリのロックなしの getdents64: {} (ふつうの道へ: 口の形 {} ext4 が読めない {} 位置を使っている途中 {} 入らないか写せない {})\n", gd[0], gd[1], gd[2], gd[3], gd[4]));
     let fd: Vec<u64> = crate::file::FAST_READ.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ファイルのロックなしの read: {} (ふつうの道へ: 大きさか fail {} IN_ACCESS の見張り {} fd の表を変えている途中 {} 位置を使っている途中 {} ext4 のファイルでない {} キャッシュにない {})\n", fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6]));
     s.push_str(&format!("(途中で眠ったもの: {}。ロックなしで片づけたページフォルト: {}。起こされたものにゆずらせた数: {})

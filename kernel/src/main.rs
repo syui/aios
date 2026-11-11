@@ -141,6 +141,8 @@ pub extern "C" fn kmain() -> ! {
     efi::reserve_runtime();
     let early = kalloc::init(heap::boot_extra());
     heap::init(early);
+    // 大きなロックなしの stat の表の大きさを RAM から (ほかの CPU とユーザーの前に)
+    statc::init();
     println!("kalloc: {} pages free", kalloc::nfree());
     // UEFI のランタイムサービス (efivarfs が使う)
     efirt::init();

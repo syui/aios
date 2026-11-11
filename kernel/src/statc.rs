@@ -25,19 +25,22 @@
 // どのプロセスでも使えるわけではない: はじめのマウントの namespace で、chroot していないもの (fd の表 (cwd もそこ) を
 // ほかのスレッドと分けていれば、門を通って読む: ほかのスレッドの chdir は、読み終わるのを待つ)。ある答えは ext4 のファイルだけ (tmpfs や /proc
 // は、中身が変わっても印が変わらない)。「ない」はパスの覚えにあるもの (名前が変われば、どのファイルシステムでも vfs が
-// その名前の版を進める)。パスは 192 バイトまで、.. のあるもの、/ で終わるものはふつうの道へ
+// その名前の版を進める)。パスは 192 バイトまで、.. のあるものはふつうの道へ。/ で終わるもの (name/) と . で終わるもの
+// (. や name/.) は、最後の名前をたどったディレクトリの答えだけ (Tail)
 use crate::file::Stat;
 use crate::proc::Proc;
-use core::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 
 /// 表の数 (1 つ 512 バイト: 4 MiB。64 語をみな使う)。WAYS こずつの組に分け、パスのハッシュで組を選び、組の中の
 /// どれにでも入れる (前は 1024 で、1 つの場所に 1 つだけ: 1000 のファイルを順に stat すると、同じ場所になったものが
 /// 追い出しあって、2 回目も 4 割しか当たらなかった。Linux の dcache は、ぶつかっても追い出さない)。4096 のときは、
 /// 1000 のファイルとないもの 1000 (fsbench) で 3000 ほどになると、組の 4 つからあふれたものが 16% ほど追い出され、
-/// それを開くとふつうの道 (50 us) へ行っていた
+/// それを開くとふつうの道 (50 us) へ行っていた。RAM の多い機械では、起動のときに大きな表に取りかえる (init)
 const N: usize = 8192;
 const WAYS: usize = 4;
 const SETS: usize = N / WAYS;
+/// init が取る表の上限 (32 MiB)
+const MAX_N: usize = 65536;
 /// inode の版の箱の数
 const BOXES: usize = 4096;
 /// (ディレクトリ, 名前) の版の箱の数 (番号は 16 ビット: DIR0 の語の上。512 KiB)
@@ -106,12 +109,51 @@ struct Slot([AtomicU64; 64]);
 
 const Z: AtomicU64 = AtomicU64::new(0);
 static TABLE: [Slot; N] = [const { Slot([Z; 64]) }; N];
+/// init が取った大きな表 (null なら TABLE) と、その組の数 (TAB より先に書く)
+static TAB: AtomicPtr<Slot> = AtomicPtr::new(core::ptr::null_mut());
+static TAB_SETS: AtomicUsize = AtomicUsize::new(SETS);
 /// 組ごとの、次に追い出す番 (書く人 (大きなロックの中の learn と、ロックなしで作ったファイルの learn_new) がいっしょに
 /// 進めても、追い出すものが同じになるだけ)
-static NEXT: [core::sync::atomic::AtomicU8; SETS] = [const { core::sync::atomic::AtomicU8::new(0) }; SETS];
+static NEXT: [core::sync::atomic::AtomicU8; MAX_N / WAYS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_N / WAYS];
 static NAMES: [AtomicU64; NAME_BOXES] = [Z; NAME_BOXES];
 static INOS: [AtomicU64; BOXES] = [Z; BOXES];
 static EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// 起動のとき (kalloc のあと、ほかの CPU とユーザーのプログラムの前): 表の大きさを RAM から決める (Linux の dcache の
+/// ハッシュ表も alloc_large_system_hash で RAM から)。RAM 64 KiB に 1 つ (2 の累乗に切り下げ。2 GiB で 32768: 16 MiB)、
+/// MAX_N まで。N より大きくならなければ、取れなければ、TABLE のまま。zig の木 (2 万のファイル) の du は、8192 では
+/// 3 割がふつうの道へ行っていた
+pub fn init() {
+    let want = (crate::memlayout::ram_size() / (64 * 1024)).clamp(1, MAX_N);
+    let n = 1usize << want.ilog2();
+    if n <= N {
+        return;
+    }
+    let bytes = n * core::mem::size_of::<Slot>();
+    let Some(p) = crate::kalloc::take_contiguous(bytes) else { return };
+    // SAFETY: take_contiguous の続いた bytes (だれも使っていない)。0 は空き (seq 0) の表
+    unsafe { core::ptr::write_bytes(p, 0, bytes) };
+    TAB_SETS.store(n / WAYS, Relaxed);
+    TAB.store(p as *mut Slot, Release);
+    crate::println!("statc: {} paths ({} MiB)", n, bytes >> 20);
+}
+
+/// いまの表 (TABLE か、init が取ったもの)
+// [lockless]
+fn table() -> &'static [Slot] {
+    let p = TAB.load(Acquire);
+    if p.is_null() {
+        &TABLE
+    } else {
+        // SAFETY: init が 0 にしてから置いたもので、返さない
+        unsafe { core::slice::from_raw_parts(p, TAB_SETS.load(Relaxed) * WAYS) }
+    }
+}
+
+/// 表の数 (/proc/bkl に)
+pub fn slots() -> usize {
+    table().len()
+}
 
 /// 答えた数と、ふつうの道へ行った数 (/proc/bkl)
 pub static HITS: AtomicU64 = AtomicU64::new(0);
@@ -158,13 +200,30 @@ pub fn epoch_bump() {
     EPOCH.fetch_add(1, Release);
 }
 
-/// cwd と path をつないで畳む (先頭の / なし、vfs の normal_into と同じ形)。.. のあるもの、. だけ、/ か /. で終わるもの、
-/// 長すぎるものは None (ふつうの道へ)
+/// パスの終わり。name/ と . (. か name/.) は、最後の名前がディレクトリでなければならず (でなければ ENOTDIR)、リンクなら
+/// たどる (Linux の LOOKUP_DIRECTORY | LOOKUP_FOLLOW)。. はそのディレクトリを通る (Linux の link_path_walk は、最後の名前を
+/// 引く前にもいまのディレクトリで may_lookup): 呼んだ人がそこを通れなければ EACCES。git は opendir を name/ で、
+/// いちばん上を . で呼ぶ (ディレクトリの数だけ)
+#[derive(Clone, Copy, PartialEq)]
+enum Tail {
+    Name,
+    Slash,
+    Dot,
+}
+
+/// cwd と path をつないで畳む (先頭の / なし、vfs の normal_into と同じ形) と、パスの終わり。.. のあるもの、長すぎるものは
+/// None (ふつうの道へ)
 // [lockless]
-fn normalize(cwd: &[u8], path: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
-    if path == b"." || (path.len() > 1 && (path.ends_with(b"/") || path.ends_with(b"/."))) {
-        return None;
+fn normalize(cwd: &[u8], path: &[u8], out: &mut [u8; PATH]) -> Option<(usize, Tail)> {
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
     }
+    let tail = match path[..end].rsplit(|&b| b == b'/').next() {
+        Some(b".") => Tail::Dot,
+        _ if end < path.len() => Tail::Slash,
+        _ => Tail::Name,
+    };
     let base: &[u8] = if path.first() == Some(&b'/') { b"" } else { cwd };
     let mut n = 0;
     for part in [base, path] {
@@ -187,7 +246,7 @@ fn normalize(cwd: &[u8], path: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
             }
         }
     }
-    Some(n)
+    Some((n, tail))
 }
 
 // [lockless]
@@ -196,12 +255,13 @@ fn hash(p: &[u8], follow: bool) -> usize {
     // 終わりでよく混ぜる (FNV-1a のままビットを取ると、最後の 1 文字だけちがうパス: w0 w1 w2、file1 file2 ... がみな同じ
     // 場所になり、たがいに追い出しあっていた)
     let h = (h ^ (h >> 31)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    (h ^ (h >> 29)) as usize % SETS
+    (h ^ (h >> 29)) as usize % (table().len() / WAYS)
 }
 
 /// 組の中で key (と follow) のものが入っている場所 (seq で守らずに見るだけ: 答えるまえに check が確かめなおす)
 fn slot_of(set: usize, key: &[u8], follow: bool) -> Option<&'static [AtomicU64; 64]> {
-    (0..WAYS).map(|w| &TABLE[set * WAYS + w].0).find(|s| {
+    let t = table();
+    (0..WAYS).map(|w| &t[set * WAYS + w].0).find(|s| {
         let shape = s[SHAPE].load(Relaxed);
         s[SEQ].load(Relaxed) != 0 && (shape & 0xffff) as usize == key.len() && (shape >> 16 & 1 != 0) == follow && words(key).enumerate().all(|(i, w)| s[PATH0 + i].load(Relaxed) == w)
     })
@@ -213,12 +273,13 @@ fn slot_for(set: usize, key: &[u8], follow: bool) -> &'static [AtomicU64; 64] {
         return s;
     }
     let epoch = EPOCH.load(Relaxed);
-    if let Some(s) = (0..WAYS).map(|w| &TABLE[set * WAYS + w].0).find(|s| s[SEQ].load(Relaxed) == 0 || s[EPOCH_W].load(Relaxed) != epoch) {
+    let t = table();
+    if let Some(s) = (0..WAYS).map(|w| &t[set * WAYS + w].0).find(|s| s[SEQ].load(Relaxed) == 0 || s[EPOCH_W].load(Relaxed) != epoch) {
         return s;
     }
     let w = NEXT[set].load(Relaxed) as usize % WAYS;
     NEXT[set].store(((w + 1) % WAYS) as u8, Relaxed);
-    &TABLE[set * WAYS + w].0
+    &t[set * WAYS + w].0
 }
 
 // [lockless]
@@ -282,8 +343,13 @@ fn write(path: &str, follow: bool, found: Option<(&crate::vfs::InodeRef, bool)>)
     let p = crate::proc::current();
     let Some(cwd) = usable(p) else { return };
     let mut norm = [0u8; PATH];
-    let Some(len) = normalize(cwd.as_bytes(), path.as_bytes(), &mut norm) else { return };
+    let Some((len, tail)) = normalize(cwd.as_bytes(), path.as_bytes(), &mut norm) else { return };
     let key = &norm[..len];
+    // name/ と . の答えは、たどったディレクトリ (ふつうの道はほかを ENOTDIR に)
+    let follow = follow || tail != Tail::Name;
+    if tail != Tail::Name && found.is_some_and(|(ino, _)| Stat::of_inode(ino).mode & 0o170000 != 0o040000) {
+        return;
+    }
     // 通ったディレクトリは名前の数より少なくならない (/ も入る)。入りきらないものは、パスの覚えを引く前にやめる
     if key.iter().filter(|&&b| b == b'/').count() + 1 > DIRS_MAX {
         return;
@@ -502,7 +568,7 @@ pub fn lookup(p: &Proc, dirfd: i64, pathp: usize, st: usize, flags: u64) -> Opti
         None
     } else {
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
+        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base, follow)| match a {
             Answer::Found(s, _, _, fresh, _) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(st, &s.to_bytes()).then_some(0)),
             Answer::Missing(looked) => Some(missing(p, NEWFSTATAT, &norm[..len], looked)),
         })
@@ -520,7 +586,7 @@ pub fn lookup_readlink(p: &Proc, dirfd: i64, pathp: usize, len: usize) -> Option
         return None;
     }
     let mut norm = [0u8; PATH];
-    let r = find(p, dirfd, pathp, false, false, &mut norm).and_then(|(a, len, _)| match a {
+    let r = find(p, dirfd, pathp, false, false, &mut norm).and_then(|(a, len, ..)| match a {
         Answer::Found(s, ..) if s.mode & 0o170000 == 0o120000 => None,
         Answer::Found(..) => {
             let mut raw = [0u8; 256];
@@ -556,7 +622,7 @@ pub fn lookup_statx(p: &Proc, dirfd: i64, pathp: usize, flags: u64, mask: u32, b
     } else {
         let mut norm = [0u8; PATH];
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base)| match a {
+        find(p, dirfd, pathp, follow, false, &mut norm).and_then(|(a, len, base, follow)| match a {
             // マウントがわからなければ (bind で同じファイルシステムがいくつにも見えているなど) ふつうの道へ
             Answer::Found(_, _, _, _, 0) => None,
             Answer::Found(s, mg, _, fresh, mnt) => now_stat(p, &norm[..len], follow, s, fresh, base).and_then(|s| p.pt().copy_out_nofault(buf, &s.to_statx(mask, mg, (mnt & !(1 << 63), mnt >> 63 != 0))).then_some(0)),
@@ -661,10 +727,11 @@ pub enum Open {
     Missing(bool),
 }
 
-/// file::fast_open: path (dirfd からの、リンクをたどる) が表にあって、通ったところがいまも同じで、呼んだ人が途中を
-/// 通れれば、その答えと norm に畳んだパスの長さ。でなければ None (ふつうの道へ)。stat の数 (HITS / MISSES) には入れない
-pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, norm: &mut [u8; PATH]) -> Option<(Open, usize)> {
-    find(p, dirfd, pathp, true, false, norm).map(|(a, len, base)| {
+/// file::fast_open: path (dirfd からの、follow なら最後のリンクをたどる: O_NOFOLLOW でなければ) が表にあって、通ったところが
+/// いまも同じで、呼んだ人が途中を通れれば、その答えと norm に畳んだパスの長さ。でなければ None (ふつうの道へ)。stat の数
+/// (HITS / MISSES) には入れない
+pub fn open_lookup(p: &Proc, dirfd: i64, pathp: usize, follow: bool, norm: &mut [u8; PATH]) -> Option<(Open, usize)> {
+    find(p, dirfd, pathp, follow, false, norm).map(|(a, len, base, _)| {
         let a = match a {
             Answer::Found(s, _, plain, fresh, _) => Open::Found(s, plain, fresh, base),
             Answer::Missing(looked) => Open::Missing(looked),
@@ -706,10 +773,11 @@ fn count(r: Option<i64>) -> Option<i64> {
     r
 }
 
-/// 表から答えを探す: (答え, norm に畳んだパスの長さ, 開いているディレクトリから引いたならそのディレクトリ (dir_base))。
-/// 表にないか、古いか、通れないかもしれなければ None。ino なら inode の中身の版も (でなければ、古いかは答えの fresh に)
+/// 表から答えを探す: (答え, norm に畳んだパスの長さ, 開いているディレクトリから引いたならそのディレクトリ (dir_base),
+/// 最後のリンクをたどったか (name/ と . はたどる))。表にないか、古いか、通れないかもしれなければ None。ino なら inode の
+/// 中身の版も (でなければ、古いかは答えの fresh に)
 // [lockless]
-fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize, Option<(usize, u64)>)> {
+fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut [u8; PATH]) -> Option<(Answer, usize, Option<(usize, u64)>, bool)> {
     // しくじらせる決まり (fail.rs) があれば、それを通すためにふつうの道へ
     if crate::debug::FAIL_ON.load(Relaxed) {
         return None;
@@ -726,7 +794,7 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
     }
     let cwd = usable(p)?;
     // 開いているディレクトリからのものは、そのディレクトリのパスから (dir_base)。絶対のパスは dirfd を見ない
-    let (len, base) = if dirfd == AT_FDCWD || path[0] == b'/' {
+    let ((len, tail), base) = if dirfd == AT_FDCWD || path[0] == b'/' {
         (normalize(cwd.as_bytes(), path, norm)?, None)
     } else {
         let mut buf = [0u8; PATH];
@@ -735,8 +803,20 @@ fn find(p: &Proc, dirfd: i64, pathp: usize, follow: bool, ino: bool, norm: &mut 
     };
     // cwd と fd の表はもう見ない (門を出る: ほかのスレッドの chdir や close を、ext4 で引くあいだ待たせない)
     drop(cwd);
+    let follow = follow || tail != Tail::Name;
     // 表になければ (古ければ)、親のディレクトリから名前を 1 つ引いて (learn_lookup)
-    check(p, &norm[..len], follow, ino).or_else(|| learn_lookup(p, &norm[..len], follow, base)).map(|a| (a, len, base))
+    let a = check(p, &norm[..len], follow, ino).or_else(|| learn_lookup(p, &norm[..len], follow, base))?;
+    // name/ と . は、ディレクトリでなければふつうの道 (ENOTDIR) へ。. は、呼んだ人がそこを通れるときだけ (でなければ
+    // ふつうの道が EACCES)
+    if tail != Tail::Name
+        && let Answer::Found(st, ..) = &a
+    {
+        let m = crate::vfs::Meta { mode: st.mode, uid: st.uid, gid: st.gid, ..crate::vfs::Meta::default() };
+        if st.mode & 0o170000 != 0o040000 || (tail == Tail::Dot && !p.cred.may(&m, crate::cred::X, false)) {
+            return None;
+        }
+    }
+    Some((a, len, base, follow))
 }
 
 /// 開いているディレクトリ dirfd (fstatat や openat の) の、畳んだパスを out に (その長さと inode の番号): ext4 の
@@ -774,7 +854,7 @@ pub fn dir_lookup(p: &Proc, dirfd: i64, dpath: &[u8], norm: &mut [u8; PATH]) -> 
         return None;
     }
     let cwd = usable(p)?;
-    let len = normalize(cwd.as_bytes(), dpath, norm)?;
+    let (len, _) = normalize(cwd.as_bytes(), dpath, norm)?;
     drop(cwd);
     match check(p, &norm[..len], true, false)? {
         Answer::Found(st, ..) if st.mode & 0o170000 == 0o040000 => Some((st.ino, len)),

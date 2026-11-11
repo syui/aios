@@ -28,6 +28,7 @@ impl Hasher {
         dirhash(n, self.version, self.unsigned, &self.seed)
     }
     /// (ハッシュ, 小さいハッシュ)
+    // [lockless]
     fn hash2(&self, n: &[u8]) -> (u32, u32) {
         dirhash2(n, self.version, self.unsigned, &self.seed)
     }
@@ -35,6 +36,7 @@ impl Hasher {
 
 // ---- ハッシュ (Linux の fs/ext4/hash.c と同じ) ----
 
+// [lockless]
 fn dx_hack_hash(name: &[u8], signed: bool) -> u32 {
     let (mut hash0, mut hash1) = (0x12a3fe2du32, 0x37abe8f9u32);
     for &c in name {
@@ -50,6 +52,7 @@ fn dx_hack_hash(name: &[u8], signed: bool) -> u32 {
 }
 
 /// 名前を num 個の u32 に詰める (足りないところは長さから作った値)
+// [lockless]
 fn str2hashbuf(msg: &[u8], num: usize, signed: bool) -> [u32; 8] {
     let len = msg.len();
     let mut pad = (len as u32) | ((len as u32) << 8);
@@ -81,6 +84,7 @@ fn str2hashbuf(msg: &[u8], num: usize, signed: bool) -> [u32; 8] {
     out
 }
 
+// [lockless]
 fn half_md4(buf: &mut [u32; 4], inp: &[u32; 8]) {
     let f = |x: u32, y: u32, z: u32| z ^ (x & (y ^ z));
     let g = |x: u32, y: u32, z: u32| (x & y).wrapping_add((x ^ y) & z);
@@ -123,6 +127,7 @@ fn half_md4(buf: &mut [u32; 4], inp: &[u32; 8]) {
     buf[3] = buf[3].wrapping_add(d);
 }
 
+// [lockless]
 fn tea(buf: &mut [u32; 4], inp: &[u32; 8]) {
     let (mut sum, mut b0, mut b1) = (0u32, buf[0], buf[1]);
     let (a, b, c, d) = (inp[0], inp[1], inp[2], inp[3]);
@@ -141,6 +146,7 @@ pub fn dirhash(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> u32
 }
 
 /// (ハッシュ, 小さいハッシュ) (Linux の ext4fs_dirhash の hash と minor_hash。readdir の並びと位置に使う)
+// [lockless]
 pub fn dirhash2(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> (u32, u32) {
     let mut buf = if seed.iter().any(|&s| s != 0) { *seed } else { [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476] };
     let signed = !unsigned;
@@ -182,11 +188,11 @@ pub fn dirhash2(name: &[u8], version: u8, unsigned: bool, seed: &[u32; 4]) -> (u
 type Hashed = (u64, u32, String, u8);
 
 impl ExtFs {
-    /// dir をハッシュの順に。位置の順に並べて。この読み方をしないディレクトリ (dir_index がない、索引なしで
-    /// 2 ブロック以上、知らないハッシュ) は None (ブロックの順に)
-    pub(super) fn readdir_hashed(&self, dir: u32) -> Result<Option<Vec<Hashed>>, i64> {
+    /// readdir_hashed の読み方: ハッシュのしかたと、索引があるか。この読み方をしないディレクトリ (dir_index がない、
+    /// 索引なしで 2 ブロック以上、知らないハッシュ) は None
+    // [lockless]
+    fn hashed_order(&self, dir: u32, r: &mut Raw) -> Result<Option<(Hasher, bool)>, i64> {
         const COMPAT_DIR_INDEX: u32 = 0x20;
-        let mut r = self.read_inode(dir)?;
         let (compat, def, seed, sflags) = {
             let sb = self.sb.borrow();
             (u32_at(&sb, 0x5c), sb[0xfc], [u32_at(&sb, 0xec), u32_at(&sb, 0xf0), u32_at(&sb, 0xf4), u32_at(&sb, 0xf8)], u32_at(&sb, 0x160))
@@ -196,29 +202,71 @@ impl ExtFs {
             return Ok(None);
         }
         // 索引があれば根に書かれたもの、なければ superblock の s_def_hash_version (3 から 5 は unsigned の版)
-        let version = if indexed { self.read_block(self.map(dir, &mut r, 0, false)?)?[0x1c] } else { def };
+        let version = if indexed { self.with_block(self.map(dir, r, 0, false)?, |d| d[0x1c])? } else { def };
         let (version, unsigned) = if version <= DX_HASH_TEA { (version, sflags & FLAGS_UNSIGNED_HASH != 0) } else { (version - 3, true) };
         if version > DX_HASH_TEA {
             return Ok(None);
         }
-        let h = Hasher { version, unsigned, seed };
-        let pos = |(major, minor): (u32, u32)| (((major >> 1) as u64) << 32) | minor as u64;
+        Ok(Some((Hasher { version, unsigned, seed }, indexed)))
+    }
+
+    /// dir をハッシュの順に。位置の順に並べて。この読み方をしないディレクトリは None (ブロックの順に)
+    pub(super) fn readdir_hashed(&self, dir: u32) -> Result<Option<Vec<Hashed>>, i64> {
+        let mut r = self.read_inode(dir)?;
+        let Some((h, indexed)) = self.hashed_order(dir, &mut r)? else { return Ok(None) };
         let mut v: Vec<Hashed> = self
             .dir_entries(dir)?
             .into_iter()
             .filter(|e| e.2 != 0)
-            .map(|e| {
-                // 索引のあるディレクトリの . と .. は、ハッシュ 0 と 2 (いちばん先)
-                let p = match (indexed, e.4.as_str()) {
-                    (true, ".") => 0,
-                    (true, "..") => pos((2, 0)),
-                    _ => pos(h.hash2(e.4.as_bytes())),
-                };
-                (p, e.2, e.4, e.5)
-            })
+            .map(|e| (hashed_pos(&h, indexed, e.4.as_bytes()), e.2, e.4, e.5))
             .collect();
         v.sort_by_key(|e| e.0);
         Ok(Some(v))
+    }
+
+    /// 大きなロックなしの getdents64 (ExtFs::fast_readdir): readdir_hashed と同じ (位置, inode, ft, 名前の始まり, 名前の
+    /// 長さ) を位置の順に。名前は names に続けて書く (名前ごとに文字列を作らない)。この読み方をしないディレクトリと、
+    /// 名前が UTF-8 でないもの (readdir_hashed は置きかえた文字の名前とそのハッシュで答える) は None
+    // [lockless]
+    pub(super) fn readdir_hashed_raw(&self, dir: u32, names: &mut Vec<u8>) -> Result<Option<Vec<RawHashed>>, i64> {
+        let mut r = self.read_inode(dir)?;
+        let Some((h, indexed)) = self.hashed_order(dir, &mut r)? else { return Ok(None) };
+        let mut v = Vec::new();
+        let mut odd = false;
+        // lockless-ok: r は inode のバイトの写し (Rc ではない)
+        self.scan_dir(dir, r.clone(), |_, d, o, _| {
+            let (i, rl, nl, ft) = (u32_at(d, o), u16_at(d, o + 4) as usize, d[o + 6] as usize, d[o + 7]);
+            if i == 0 {
+                return None;
+            }
+            let name = &d[o + 8..o + 8 + nl.min(rl - 8)];
+            if core::str::from_utf8(name).is_err() {
+                odd = true;
+                return Some(());
+            }
+            v.push((hashed_pos(&h, indexed, name), i, ft, names.len() as u32, name.len() as u8));
+            names.extend_from_slice(name);
+            None
+        })?;
+        if odd {
+            return Ok(None);
+        }
+        v.sort_by_key(|e| e.0);
+        Ok(Some(v))
+    }
+}
+
+/// readdir_hashed_raw の 1 つ: (位置, inode, ft, 名前の始まり, 名前の長さ)
+pub type RawHashed = (u64, u32, u8, u32, u8);
+
+/// 名前の読む位置: (ハッシュ >> 1) << 32 | 小さいハッシュ。索引のあるディレクトリの . と .. は、ハッシュ 0 と 2 (いちばん先)
+// [lockless]
+fn hashed_pos(h: &Hasher, indexed: bool, name: &[u8]) -> u64 {
+    let pos = |(major, minor): (u32, u32)| (((major >> 1) as u64) << 32) | minor as u64;
+    match (indexed, name) {
+        (true, b".") => 0,
+        (true, b"..") => pos((2, 0)),
+        _ => pos(h.hash2(name)),
     }
 }
 

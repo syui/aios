@@ -916,6 +916,11 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             }
             None => return false,
         },
+        // ルートの ext4 のディレクトリを読む getdents64 (file::fast_getdents)
+        GETDENTS64 => match crate::file::fast_getdents(p, a[0], a[1] as usize, a[2] as usize) {
+            Some(r) => r,
+            None => return false,
+        },
         // ページキャッシュに書くだけの pwrite64 (vm::write_fast)
         PWRITE64 => match crate::file::fast_pwrite(p, a[0], a[1] as usize, a[2] as usize, a[3] as i64) {
             Some(r) => r,
