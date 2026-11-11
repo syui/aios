@@ -1,0 +1,114 @@
+# blender: 3D のモデリング、アニメーション、レンダリング (Cycles と EEVEE)、合成、動画の編集 (for aios)
+#   Zig (aarch64-linux-musl) と cmake でクロスビルドする。窓は Wayland (aiwm)、絵は OpenGL (Mesa の llvmpipe)。
+#   C++ のライブラリ (OpenImageIO、OpenColorIO、OpenEXR、oneTBB、OpenSubdiv、fmt ...) は静的なものを 1 つに
+#   まとめる (Zig の libc++ は、それを使うものひとつひとつの中に入るので)。Python は aios の python (3.13、
+#   /opt/c/lib/python3.13) を使い、Blender の中には入れない。/opt/c に入る (bin/blender、share/blender/5.3)
+#   ビルドの途中で Blender の道具 (makesdna、makesrna、datatoc、shader_tool、msgfmt) を動かすので、
+#   qemu-aarch64 で動かす (prepare() のパッチ)。wayland-scanner はビルドするマシンのもの
+#   入れないもの (aios にまだないもの): USD / Hydra / MaterialX、OpenVDB、Embree、OSL、OpenImageDenoise、
+#   Alembic、音 (OpenAL、PulseAudio、PipeWire、JACK、SDL、libsndfile)、X11、Vulkan、FFTW (海と流体)、GMP、
+#   Manifold、Jolt、Draco、KTX、WebP、OpenJPEG、Potrace、libharu、NumPy、XR、GPU の Cycles (CUDA ...)、
+#   モーショントラッキング (libmv: Ceres と Abseil が要る)
+#   ビルドには cmake、ninja、qemu-aarch64、wayland-scanner が要る。4 コアで数時間
+pkgname=blender
+pkgver=5.3.0
+pkgrel=1
+_eigen=8a1083e9bf41b91fdea6546681f806154efdc25a
+_sse2neon=227cc413fb2d50b2a10073087be96b59d5364aea
+pkgdesc='Free and open source 3D creation suite (Wayland and OpenGL, for aios)'
+arch=('aarch64')
+url='https://www.blender.org/'
+license=('GPL-3.0-or-later')
+depends=('musl' 'python' 'zlib' 'zstd' 'libpng' 'libjpeg-turbo' 'libtiff' 'libdeflate' 'freetype2' 'harfbuzz'
+         'fribidi' 'libepoxy' 'mesa' 'wayland' 'libxkbcommon' 'ffmpeg' 'expat')
+makedepends=('cmake' 'ninja' 'qemu-user' 'wayland' 'wayland-protocols' 'imath' 'openjph' 'openexr' 'fmt'
+             'yaml-cpp' 'pystring' 'minizip-ng' 'opencolorio' 'openimageio' 'onetbb' 'opensubdiv')
+# Eigen (行列) と sse2neon (SSE を NEON に) はヘッダーだけ。版は Blender 5.3 の build_environment と同じ commit
+source=("https://download.blender.org/source/blender-$pkgver.tar.xz"
+        "eigen::git+https://gitlab.com/libeigen/eigen.git#commit=$_eigen"
+        "sse2neon::git+https://github.com/DLTcollab/sse2neon.git#commit=$_sse2neon")
+# blender.org は md5 だけ (blender-5.3.0.tar.xz.md5sum: 981f210e8d38a89df03a9def9cbc8ddf)。それと合うことを見た
+sha256sums=('a8faedaef3e8bcf1465ec3f672733b94854ff75b8c1755dcf43424af8bcacab2' 'SKIP' 'SKIP')
+
+_deps=(zlib zstd brotli libpng libjpeg-turbo libtiff libdeflate xz freetype2 harfbuzz fribidi libepoxy mesa wayland
+       wayland-protocols libxkbcommon ffmpeg expat python libffi bzip2 ncurses
+       imath openjph openexr fmt yaml-cpp pystring minizip-ng opencolorio openimageio onetbb opensubdiv)
+
+prepare() {
+  rm -rf "blender-$pkgver"
+  tar -xf "blender-$pkgver.tar.xz"
+  cd "blender-$pkgver"
+  # ビルドの途中で動かす Blender の道具に、クロスビルドの emulator (qemu-aarch64) をつける。
+  # cmake は COMMAND が "$<TARGET_FILE:...>" のときは自分ではつけない (aios の上でビルドするときは空)
+  sed -i 's/"\$<TARGET_FILE:\(datatoc\|shader_tool\|msgfmt\|makesdna\|makesrna\)>"/${CMAKE_CROSSCOMPILING_EMULATOR} &/' \
+    build_files/cmake/macros.cmake source/blender/makesdna/intern/CMakeLists.txt \
+    source/blender/makesrna/intern/CMakeLists.txt
+  # wayland-scanner はビルドするマシンのもの (-DWAYLAND_SCANNER)。pkg-config (sysroot の aios 用のもの) で上書きしない
+  sed -i 's/^\( *\)pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)/\1if(NOT WAYLAND_SCANNER)\n\1  &\n\1endif()/' \
+    build_files/cmake/platform/platform_unix.cmake
+  # Blender は Linux の aarch64 で ARMv8.2-A + dotprod + fp16 + LSE (Cortex-A76、Neoverse N1、Apple M から) を
+  # 使う。zig cc は -march=armv8.2-a+... を読めないので、zig の書きかたの -mcpu にする (同じ命令になる)
+  sed -i 's/-march=armv8.2-a+dotprod+fp16+lse/-mcpu=generic+v8_2a+dotprod+fullfp16+lse/' build_files/cmake/macros.cmake
+  # oiiotool (テストだけで使う) は OpenImageIO のパッケージに入れていないので、あるときだけ見る
+  sed -i 's/^get_target_property(OPENIMAGEIO_TOOL OpenImageIO::oiiotool LOCATION)/if(TARGET OpenImageIO::oiiotool)\n  &\nendif()/' \
+    build_files/cmake/platform/dependency_targets.cmake
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross "${_deps[@]}"
+  local root=$srcdir/sysroot
+  # Eigen を sysroot に入れる (Eigen3Config.cmake を作るため。ヘッダーだけ)
+  rm -rf build-eigen
+  cmake -S eigen -B build-eigen -G Ninja -DCMAKE_INSTALL_PREFIX="$SYSROOT" -DBUILD_TESTING=OFF \
+    -DEIGEN_BUILD_DOC=OFF -DEIGEN_BUILD_PKGCONFIG=OFF -DEIGEN_BUILD_TESTING=OFF -DEIGEN_BUILD_BLAS=OFF \
+    -DEIGEN_BUILD_LAPACK=OFF >/dev/null
+  cmake --install build-eigen >/dev/null
+  install -Dm644 sse2neon/sse2neon.h "$SYSROOT/include/sse2neon.h"
+  # Blender は pkg-config で wayland-scanner をさがす。aios の wayland には scanner がないので、ビルドするマシンの
+  # wayland-scanner をさす .pc を sysroot に置く
+  local scanner
+  scanner=$(command -v wayland-scanner)
+  cat > "$SYSROOT/lib/pkgconfig/wayland-scanner.pc" <<PC
+wayland_scanner=$scanner
+Name: Wayland Scanner
+Description: Wayland scanner of the build machine
+Version: $("$scanner" --version 2>&1 | sed 's/.* //')
+PC
+  local emu=
+  command -v qemu-aarch64 >/dev/null && emu="qemu-aarch64;-L;$root"
+  rm -rf build
+  # -g0: Zig はデバッグ情報を入れるのが既定 (Blender だと何十 GB になる)
+  cmake -S "blender-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_CROSSCOMPILING_EMULATOR="$emu" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-g0 -DCMAKE_CXX_FLAGS=-g0 \
+    -DWITH_LIBS_PRECOMPILED=OFF -DWITH_INSTALL_PORTABLE=OFF -DWITH_STRICT_BUILD_OPTIONS=OFF \
+    -DWITH_BUILDINFO=OFF -DWITH_LINKER_LLD=OFF -DWITH_LINKER_MOLD=OFF \
+    -DPYTHON_VERSION=3.13 -DPYTHON_INCLUDE_DIR="$SYSROOT/include/python3.13" \
+    -DPYTHON_INCLUDE_CONFIG_DIR="$SYSROOT/include/python3.13" -DPYTHON_LIBRARY="$SYSROOT/lib/libpython3.13.so" \
+    -DPYTHON_LIBPATH="$SYSROOT/lib" -DWITH_PYTHON_INSTALL=OFF -DWITH_PYTHON_NUMPY=OFF -DWITH_PYTHON_INSTALL_NUMPY=OFF \
+    -DWITH_PYTHON_INSTALL_ZSTANDARD=OFF \
+    -DWITH_GHOST_X11=OFF -DWITH_GHOST_XDND=OFF -DWITH_X11_XINPUT=OFF -DWITH_X11_XFIXES=OFF \
+    -DWITH_GHOST_WAYLAND=ON -DWITH_GHOST_WAYLAND_DYNLOAD=OFF -DWITH_GHOST_WAYLAND_LIBDECOR=OFF \
+    -DWITH_GHOST_DBUS=OFF -DWAYLAND_SCANNER="$scanner" \
+    -DWITH_OPENGL_BACKEND=ON -DWITH_VULKAN_BACKEND=OFF -DWITH_SYSTEM_FREETYPE=ON \
+    -DWITH_FRIBIDI=ON -DWITH_HARFBUZZ=ON -DWITH_CODEC_FFMPEG=ON -DWITH_CODEC_SNDFILE=OFF \
+    -DWITH_OPENSUBDIV=ON -DWITH_OPENCOLORIO=ON -DWITH_CYCLES=ON -DWITH_CYCLES_OSL=OFF -DWITH_CYCLES_EMBREE=OFF \
+    -DWITH_CYCLES_PATH_GUIDING=OFF -DWITH_CYCLES_DEVICE_CUDA=OFF -DWITH_CYCLES_DEVICE_OPTIX=OFF \
+    -DWITH_CYCLES_DEVICE_HIP=OFF -DWITH_CYCLES_DEVICE_METAL=OFF -DWITH_CYCLES_DEVICE_ONEAPI=OFF \
+    -DWITH_EMBREE=OFF -DWITH_OPENIMAGEDENOISE=OFF -DWITH_OPENVDB=OFF -DWITH_NANOVDB=OFF -DWITH_USD=OFF \
+    -DWITH_HYDRA=OFF -DWITH_MATERIALX=OFF -DWITH_ALEMBIC=OFF -DWITH_XR_OPENXR=OFF -DWITH_FFTW3=OFF \
+    -DWITH_MOD_OCEANSIM=OFF -DWITH_MOD_FLUID=OFF -DWITH_GMP=OFF -DWITH_MANIFOLD=OFF -DWITH_JOLT=OFF \
+    -DWITH_DRACO=OFF -DWITH_MESHOPTIMIZER=OFF -DWITH_KTX=OFF -DWITH_IMAGE_WEBP=OFF -DWITH_IMAGE_OPENJPEG=OFF \
+    -DWITH_LIBMV=OFF -DWITH_POTRACE=OFF -DWITH_HARU=OFF -DWITH_PUGIXML=OFF -DWITH_OPENTIMELINEIO=OFF -DWITH_INPUT_NDOF=OFF \
+    -DWITH_OPENAL=OFF -DWITH_PULSEAUDIO=OFF -DWITH_PIPEWIRE=OFF -DWITH_JACK=OFF -DWITH_SDL=OFF \
+    -DWITH_TBB_MALLOC_PROXY=OFF -DWITH_MEM_JEMALLOC=OFF -DWITH_GTESTS=OFF \
+    -Dpystring_INCLUDE_DIR="$SYSROOT/include/pystring"
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 "blender-$pkgver/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
