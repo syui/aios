@@ -1,0 +1,63 @@
+# python: CPython 3.13 (共有ライブラリ libpython3.13.so と python3)。Blender 5.3 (3.13 を使う) と、aios で Python を
+#   動かすため。Zig (aarch64-linux-musl) で configure のクロスビルドをする。ビルドの途中で動かす python は、このマシンの
+#   python3.13 (--with-build-python。同じ 3.13 であること)。/opt/c に入る
+#   入れないもの: _ssl と _hashlib (aios に OpenSSL がない。hashlib は Python の中の HACL* の sha2 / sha3 / blake2 / md5)、
+#   sqlite3、tkinter、readline、gdbm、uuid。テストと IDLE と turtledemo も入れない
+pkgname=python
+pkgver=3.13.18
+pkgrel=1
+pkgdesc='The Python programming language (CPython 3.13, shared libpython, for aios)'
+arch=('aarch64')
+url='https://www.python.org/'
+license=('PSF-2.0')
+depends=('musl' 'zlib' 'libffi' 'bzip2' 'xz' 'ncurses' 'expat')
+makedepends=('python3.13')
+# 署名 (Python-3.13.18.tar.xz.asc) は 3.13 のリリースの係 (Thomas Wouters、7169605F62C751356D054A26A821E680E5FA6305) のもの
+source=("https://www.python.org/ftp/python/$pkgver/Python-$pkgver.tar.xz")
+sha256sums=('abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68')
+
+_pyver=${pkgver%.*}
+
+prepare() {
+  rm -rf "Python-$pkgver"
+  tar -xJf "Python-$pkgver.tar.xz"
+  # zig のリンカは -h NAME を読めない (-soname だけ)
+  sed -i -e 's/-Wl,-h\$(INSTSONAME)/-Wl,-soname,$(INSTSONAME)/' -e 's/-Wl,-h\$@/-Wl,-soname,$@/' "Python-$pkgver/Makefile.pre.in"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib libffi bzip2 xz ncurses expat
+  cd "Python-$pkgver"
+  # 共有ライブラリと、それを使う python3 なので動的にリンクする (zig の musl は静的が既定)。
+  # クロスなので、動かして確かめるものは答えを渡す (Linux の /dev/ptmx はあり、/dev/ptc はない。musl の getaddrinfo は
+  # 正しい)。zig は __DATE__ と __TIME__ をエラーにする (-Wdate-time。sys.version に作った日を出す getbuildinfo.c)
+  # LDFLAGS は make のときにも読まれるので export する (zig_env の -static を残さない)。python3 は自分の
+  # libpython3.13.so を /opt/c/lib から読む (RUNPATH: musl は /usr/local/lib を先に見るので、そこにほかの
+  # libpython があってもまちがえない)
+  export LDFLAGS="-dynamic -Wl,-s -Wl,-rpath,$PREFIX/lib -L$SYSROOT/lib" CFLAGS="-O2 -fPIC -Wno-date-time"
+  ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no ac_cv_buggy_getaddrinfo=no \
+    ./configure --host=aarch64-linux-musl --build="$(uname -m)-linux-gnu" --prefix="$PREFIX" \
+    --with-build-python="${PYTHON_FOR_BUILD:-python$_pyver}" \
+    --enable-shared --without-ensurepip --with-system-expat --disable-test-modules \
+    --without-readline --with-openssl=/nonexistent
+  # libpython3.so (安定 ABI の小さな包み: libpython3.13.so だけをつなぐ) は作らない (zig cc はオブジェクトのない共有
+  # ライブラリのリンクを、このマシンの ld に渡してしまう)
+  make PY3LIBRARY=
+}
+
+package() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib libffi bzip2 xz ncurses expat
+  export LDFLAGS="-dynamic -Wl,-s -Wl,-rpath,$PREFIX/lib -L$SYSROOT/lib" CFLAGS="-O2 -fPIC -Wno-date-time"
+  cd "Python-$pkgver"
+  make DESTDIR="$pkgdir" PY3LIBRARY= install
+  local lib=$pkgdir$PREFIX/lib/python$_pyver
+  rm -rf "$lib/test" "$lib/idlelib" "$lib/tkinter" "$lib/turtledemo"
+  find "$lib" -type d -name tests -path '*/lib2to3/*' -prune -exec rm -rf {} + 2>/dev/null || true
+  # python と pip の名前 (python3 は make install が作る)
+  ln -sf python3 "$pkgdir$PREFIX/bin/python"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,37 @@
+# libjpeg-turbo: JPEG を読み書きするライブラリ (libjpeg の API と TurboJPEG。NEON で速く) (shared and static, for aios)
+#   OpenImageIO と libtiff、Blender が使う。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake で
+#   クロスビルドする。/opt/c に入る。道具 (cjpeg、djpeg ...) は入れない
+pkgname=libjpeg-turbo
+pkgver=3.2.1
+pkgrel=1
+pkgdesc='JPEG image codec with SIMD acceleration: libjpeg and libturbojpeg (shared and static, for aios)'
+arch=('aarch64')
+url='https://libjpeg-turbo.org/'
+license=('IJG' 'BSD-3-Clause' 'Zlib')
+depends=('musl')
+makedepends=('cmake' 'ninja')
+source=("https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$pkgver/libjpeg-turbo-$pkgver.tar.gz")
+sha256sums=('c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f')
+
+prepare() {
+  rm -rf "libjpeg-turbo-$pkgver"
+  tar -xf "libjpeg-turbo-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  # 静的なもの (libjpeg.a) は、共有ライブラリの中にもリンクできるように位置によらないコードに
+  cmake -S "libjpeg-turbo-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DWITH_JAVA=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  rm -rf "$pkgdir/opt/c/bin" "$pkgdir/opt/c/share/man" "$pkgdir/opt/c/share/doc"
+  install -Dm644 "libjpeg-turbo-$pkgver/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

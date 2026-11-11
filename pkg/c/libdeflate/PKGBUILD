@@ -1,0 +1,36 @@
+# libdeflate: DEFLATE、zlib、gzip を速く圧縮・展開するライブラリ (shared and static, for aios)
+#   OpenEXR と libtiff が使う。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。
+#   /opt/c に入る。道具 (libdeflate-gzip) は入れない
+pkgname=libdeflate
+pkgver=1.26
+pkgrel=1
+pkgdesc='Heavily optimized library for DEFLATE, zlib and gzip compression (shared and static, for aios)'
+arch=('aarch64')
+url='https://github.com/ebiggers/libdeflate'
+license=('MIT')
+depends=('musl')
+makedepends=('cmake' 'ninja')
+source=("https://github.com/ebiggers/libdeflate/releases/download/v$pkgver/libdeflate-$pkgver.tar.gz")
+sha256sums=('125856d4656e0feab660f94842f835923410c9281fedbcee64598c918da42b5a')
+
+prepare() {
+  rm -rf "libdeflate-$pkgver"
+  tar -xf "libdeflate-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross
+  rm -rf build
+  cmake -S "libdeflate-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DLIBDEFLATE_BUILD_SHARED_LIB=ON -DLIBDEFLATE_BUILD_STATIC_LIB=ON \
+    -DLIBDEFLATE_BUILD_GZIP=OFF -DLIBDEFLATE_BUILD_TESTS=OFF
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 "libdeflate-$pkgver/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

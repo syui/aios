@@ -1,0 +1,48 @@
+# libtiff: TIFF の画像を読み書きするライブラリ (shared and static, for aios)
+#   OpenImageIO (TIFF はかならず要る) が使う。圧縮は zlib、libdeflate、JPEG、LZMA、ZSTD。WebP、JBIG、LERC、C++ の
+#   libtiffxx と道具は入れない。pkg/c/zig.sh の cmake_cross で、Zig (aarch64-linux-musl) と cmake でクロスビルドする。
+#   /opt/c に入る
+pkgname=libtiff
+pkgver=4.7.2
+pkgrel=1
+pkgdesc='Library for reading and writing TIFF image files (shared and static, for aios)'
+arch=('aarch64')
+url='https://libtiff.gitlab.io/libtiff/'
+license=('libtiff')
+depends=('musl' 'zlib' 'libjpeg-turbo' 'libdeflate' 'zstd' 'xz')
+makedepends=('cmake' 'ninja')
+source=("https://download.osgeo.org/libtiff/tiff-$pkgver.tar.xz")
+sha256sums=('4996f0c4f93094719b1ca5c6279b20e588773ba8a247533e486416fb662ddb88')
+
+prepare() {
+  rm -rf "tiff-$pkgver"
+  tar -xf "tiff-$pkgver.tar.xz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  cmake_cross zlib libjpeg-turbo libdeflate zstd xz
+  rm -rf build build-static
+  # libtiff.map には Windows だけの名前 (TIFFOpenW) もある。lld は、ない名前を map に書くとエラーにするので許す
+  cmake -S "tiff-$pkgver" -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=ON -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--undefined-version \
+    -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-contrib=OFF -Dtiff-docs=OFF -Dtiff-opengl=OFF -Dtiff-cxx=OFF \
+    -Dzlib=ON -Dlibdeflate=ON -Djpeg=ON -Dlzma=ON -Dzstd=ON -Dwebp=OFF -Djbig=OFF -Dlerc=OFF -Dpixarlog=ON
+  ninja -C build
+  # 静的なもの (libtiff.a) も (Blender のように、ほかの静的なライブラリといっしょにリンクするもののため)
+  cmake -S "tiff-$pkgver" -B build-static -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
+    -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-contrib=OFF -Dtiff-docs=OFF -Dtiff-opengl=OFF -Dtiff-cxx=OFF \
+    -Dzlib=ON -Dlibdeflate=ON -Djpeg=ON -Dlzma=ON -Dzstd=ON -Dwebp=OFF -Djbig=OFF -Dlerc=OFF -Dpixarlog=ON
+  ninja -C build-static
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build-static
+  DESTDIR="$pkgdir" cmake --install build
+  rm -rf "$pkgdir/opt/c/share/doc" "$pkgdir/opt/c/share/man"
+  install -Dm644 "tiff-$pkgver/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

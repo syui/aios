@@ -2,7 +2,7 @@
 #   Zig (aarch64-linux-musl) でクロスビルドして /opt/c に入る。コマンドは静的に
 pkgname=bzip2
 pkgver=1.0.8
-pkgrel=4
+pkgrel=5
 pkgdesc='A high-quality data compression program (static, for aios)'
 arch=('aarch64')
 url='https://sourceware.org/bzip2/'
@@ -21,7 +21,8 @@ build() {
   . "$startdir/../zig.sh"
   zig_env
   cd "bzip2-$pkgver"
-  make CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS="$CFLAGS -D_FILE_OFFSET_BITS=64" LDFLAGS="$LDFLAGS" libbz2.a bzip2 bzip2recover
+  # libbz2.a は位置によらないコードに (-fPIC: Python の _bz2 のような共有ライブラリの中にもリンクする)
+  make CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS="$CFLAGS -fPIC -D_FILE_OFFSET_BITS=64" LDFLAGS="$LDFLAGS" libbz2.a bzip2 bzip2recover
 }
 
 package() {
