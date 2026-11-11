@@ -27,17 +27,19 @@ makedepends=('cmake' 'ninja' 'qemu-user' 'wayland' 'wayland-protocols' 'imath' '
 # Eigen (行列) と sse2neon (SSE を NEON に) はヘッダーだけ。版は Blender 5.3 の build_environment と同じ commit
 source=("https://download.blender.org/source/blender-$pkgver.tar.xz"
         "eigen::git+https://gitlab.com/libeigen/eigen.git#commit=$_eigen"
-        "sse2neon::git+https://github.com/DLTcollab/sse2neon.git#commit=$_sse2neon")
+        "sse2neon::git+https://github.com/DLTcollab/sse2neon.git#commit=$_sse2neon"
+        'no-vulkan-default.patch')
 # blender.org は md5 だけ (blender-5.3.0.tar.xz.md5sum: 981f210e8d38a89df03a9def9cbc8ddf)。それと合うことを見た
-sha256sums=('a8faedaef3e8bcf1465ec3f672733b94854ff75b8c1755dcf43424af8bcacab2' 'SKIP' 'SKIP')
+sha256sums=('a8faedaef3e8bcf1465ec3f672733b94854ff75b8c1755dcf43424af8bcacab2' 'SKIP' 'SKIP'
+            '85291f8131afcc2c38eda6dda51c5b4a3bf159474f37db77d67f8d52b22496e5')
 
-_deps=(zlib zstd brotli libpng libjpeg-turbo libtiff libdeflate xz freetype2 harfbuzz fribidi libepoxy mesa wayland
-       wayland-protocols libxkbcommon ffmpeg expat python libffi bzip2 ncurses
-       imath openjph openexr fmt yaml-cpp pystring minizip-ng opencolorio openimageio onetbb opensubdiv)
 
 prepare() {
   rm -rf "blender-$pkgver"
   tar -xf "blender-$pkgver.tar.xz"
+  # no-vulkan-default.patch: Vulkan なしで作ったので、Linux の既定の設定 (Vulkan) で GPU を選ばない (選ぶと
+  # かならず OpenGL にもどり、起動のたびに "Failed to load using Vulkan" と出る)
+  patch -p0 < no-vulkan-default.patch
   cd "blender-$pkgver"
   # ビルドの途中で動かす Blender の道具に、クロスビルドの emulator (qemu-aarch64) をつける。
   # cmake は COMMAND が "$<TARGET_FILE:...>" のときは自分ではつけない (aios の上でビルドするときは空)
@@ -65,7 +67,8 @@ prepare() {
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  cmake_cross "${_deps[@]}"
+  # 1 行に (CI の pkg.yml はこの行から ai/repo で取ってくるパッケージを読む)
+  cmake_cross zlib zstd brotli libpng libjpeg-turbo libtiff libdeflate xz freetype2 harfbuzz fribidi libepoxy mesa wayland wayland-protocols libxkbcommon ffmpeg expat python libffi bzip2 ncurses imath openjph openexr fmt yaml-cpp pystring minizip-ng opencolorio openimageio onetbb opensubdiv
   local root=$srcdir/sysroot
   # Eigen を sysroot に入れる (Eigen3Config.cmake を作るため。ヘッダーだけ)
   rm -rf build-eigen

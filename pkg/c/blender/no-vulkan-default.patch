@@ -1,0 +1,16 @@
+--- blender-5.3.0/source/blender/windowmanager/intern/wm_files.cc
++++ blender-5.3.0/source/blender/windowmanager/intern/wm_files.cc
+@@ -516,6 +516,13 @@
+     return;
+   }
+ 
++#ifndef WITH_VULKAN_BACKEND
++  /* Built without Vulkan: the default preference on Linux (Vulkan) would always fall back to
++   * OpenGL and show the "Failed to load using Vulkan" alert at every start. */
++  if (U.gpu_backend == USER_GPU_BACKEND_VULKAN) {
++    return;
++  }
++#endif
+   GPU_backend_type_selection_set_override(GPUBackendType(U.gpu_backend));
+ }
+ 
