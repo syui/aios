@@ -1,5 +1,6 @@
 # image: aios のパッケージから、distroless のような小さな container image (OCI) を作り、docker run でたしかめて
-# ghcr.io に置く (ghcr.io/syui/aios-static, aios-cc, aios-node。タグは中心のパッケージの版と latest)
+# ghcr.io に置く (ghcr.io/syui/aios-static, aios-cc, aios-node。タグは中心のパッケージの版と latest)。
+# ghcr.io/syui/aios は builder (base をまるごと: docker build の FROM にして ap -Sy で足す。image/example/Dockerfile)
 #   作りかたは ap image (user/src/lib/oci.rs)、中身は image/*.json (パッケージ、要るファイル、config)。
 #   ELF の要るもの (PT_INTERP、DT_NEEDED) をたどって、使うファイルだけを入れる。シェルもパッケージマネージャもない。
 #   docker を使わずに作るので、同じパッケージからは、いつどこで (aios の中でも) 作っても同じ digest になる
@@ -16,6 +17,7 @@ on:
     paths:
     - 'image/**'
     - 'user/src/lib/oci.rs'
+    - 'user/src/lib/ocistore.rs'
     - 'user/src/bin/aipkg.rs'
     - 'etc/aipkg.conf'
     - '.github/workflows/image.yml'
@@ -110,6 +112,14 @@ jobs:
           musl-gcc -O2 -o out/hello-musl out/hello.c
           readelf -l out/hello-musl | grep -o 'interpreter: [^]]*'
           docker run --rm -v "$PWD/out/hello-musl:/hello:ro" aios-cc:ci /hello
+
+          # aios (builder): base がまるごと入っていて、ap が入れたものを知っている (/var/lib/aipkg/local)。/bin/sh は aish
+          docker run --rm aios:ci sh -c 'cat /etc/os-release | head -1; ap -Q | wc -l; ap -Qo /usr/bin/ap'
+          # 多段の docker build: builder で ap -Sy cargo と cargo build、aios-static に入れて動かす (image/example/Dockerfile)
+          docker build -t aios-example:ci --build-arg AIOS=aios:ci --build-arg AIOS_STATIC=aios-static:ci image/example
+          docker run --rm aios-example:ci | tee out/example.log
+          grep -qx 'Hello, world!' out/example.log
+          docker images 'aios-example'
 
       - name: Push
         if: github.ref == 'refs/heads/main'

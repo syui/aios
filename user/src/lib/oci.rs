@@ -10,6 +10,9 @@
 //             /etc/ld-musl-aarch64.path、なければ /lib:/usr/local/lib:/usr/lib) で要るライブラリもいっしょに。
 //             ディレクトリなら中をみな、リンクはその先も
 //   config    OCI の config (Entrypoint、Cmd、User、WorkingDir、Env ...)
+//   install   true ならパッケージをまるごと入れ、aipkg と同じ入れた記録 (/var/lib/aipkg/local/NAME-VER の desc、files、
+//             install) をそのパッケージの層に書く (土台の層は作らない: base パッケージが /etc や /tmp を持つ)。
+//             image/aios.json (builder: docker build の FROM にして ap -Sy で足す)
 // 層: はじめは aios の土台 (/etc/passwd と group: root、nobody、nonroot 65532、/etc/os-release、/tmp、/home/nonroot、/root、
 // /lib → usr/lib)、あとはパッケージごとに 1 層 (依存が先。同じパッケージの同じファイルなら、ほかの image と同じ層)。
 // 入れたファイルのパッケージの usr/share/licenses も入れる。どのパッケージのどの版かは、層と image の annotation
@@ -20,7 +23,7 @@
 // パッケージは /etc/aipkg.conf (--conf) の Server から取る。置き場は $XDG_CACHE_HOME/aipkg か ~/.cache/aipkg
 // (/var/cache/aipkg にチェックサムの合うものがあれば、それを使う)。root でなくてよい
 use crate::ocistore::{self, Ref};
-use crate::{dep_name, die, fetch_any, fetch_any_to, get, list, parse_conf, parse_desc, provider, sha256_file, tar_reader, Desc, CACHE, CONF, DB_FILE};
+use crate::{dep_name, die, fetch_any, fetch_any_to, get, list, parse_conf, parse_desc, parse_pkginfo, provider, sha256_file, tar_reader, write_desc, Desc, CACHE, CONF, DB_FILE};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,15 +129,31 @@ fn closure(pkgs: &[String], sync: &BTreeMap<String, (usize, Desc)>) -> Vec<Strin
 }
 
 /// パッケージを root に広げ、中のものを meta に (ファイルの中身だけを書く。持ち主と mode は meta に)
-fn extract(path: &str, root: &str, layer: usize, meta: &mut BTreeMap<String, Meta>) -> io::Result<()> {
+/// パッケージの .PKGINFO と .INSTALL の中身、ファイルの並び (aipkg の local の files と同じ: ディレクトリは / で終わる)
+#[derive(Default)]
+struct Pkg {
+    info: String,
+    install: Option<String>,
+    files: Vec<String>,
+}
+
+fn extract(path: &str, root: &str, layer: usize, meta: &mut BTreeMap<String, Meta>) -> io::Result<Pkg> {
     let f = fs::File::open(path)?;
     let mut ar = tar::Archive::new(tar_reader(Box::new(io::BufReader::with_capacity(256 * 1024, f))));
+    let mut pkg = Pkg::default();
     for e in ar.entries()? {
         let mut e = e?;
         let p = norm(&e.path()?.to_string_lossy());
+        if p == ".PKGINFO" || p == ".INSTALL" {
+            let mut t = String::new();
+            e.read_to_string(&mut t)?;
+            if p == ".PKGINFO" { pkg.info = t } else { pkg.install = Some(t) }
+            continue;
+        }
         if p.is_empty() || p.starts_with('.') {
             continue;
         }
+        pkg.files.push(if e.header().entry_type().is_dir() { format!("{}/", p) } else { p.clone() });
         let h = e.header();
         let (mode, mtime) = (h.mode().unwrap_or(0o644) & 0o7777, h.mtime().unwrap_or(0));
         let kind = match h.entry_type() {
@@ -162,7 +181,7 @@ fn extract(path: &str, root: &str, layer: usize, meta: &mut BTreeMap<String, Met
             meta.insert(p, Meta { kind, mode, mtime, layer });
         }
     }
-    Ok(())
+    Ok(pkg)
 }
 
 impl Image {
@@ -458,6 +477,8 @@ pub fn main(args: &[String]) {
     let strs = |k: &str| -> Vec<String> { d[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
     let name = d["name"].as_str().unwrap_or_else(|| die(format!("{}: no name", def))).to_string();
     let (pkgs, files) = (strs("packages"), strs("files"));
+    // install: パッケージをまるごと入れて、入れたことを記録する (builder: その中で ap -S が使える)
+    let install = d["install"].as_bool().unwrap_or(false);
     if pkgs.is_empty() {
         die(format!("{}: no packages", def));
     }
@@ -488,6 +509,7 @@ pub fn main(args: &[String]) {
     // 取ってきて広げる (層 1 から: パッケージの順)
     let mut meta: BTreeMap<String, Meta> = BTreeMap::new();
     let mut built = 0u64;
+    let mut infos: Vec<Pkg> = vec![];
     for (k, n) in order.iter().enumerate() {
         let (ri, desc) = &sync[n];
         let (file, want) = (get(desc, "FILENAME"), get(desc, "SHA256SUM"));
@@ -508,14 +530,14 @@ pub fn main(args: &[String]) {
             }
             mine
         };
-        extract(&path, &root, k + 1, &mut meta).unwrap_or_else(|e| die(format!("{}: {}", file, e)));
+        infos.push(extract(&path, &root, k + 1, &mut meta).unwrap_or_else(|e| die(format!("{}: {}", file, e))));
     }
 
     // 土台 (層 0): ユーザー、os-release、/tmp、家、/lib → usr/lib (aios のローダーは /lib/ld-musl-aarch64.so.1)。
     // 時刻は 0 (どの image でも同じ層: 分けあえる)
     let dir = |mode| Meta { kind: Kind::Dir, mode, mtime: 0, layer: 0 };
     let file = Meta { kind: Kind::File, mode: 0o644, mtime: 0, layer: 0 };
-    let mut base: Vec<(String, Meta, Option<String>)> = vec![
+    let mut base: Vec<(String, Meta, Option<String>)> = if install { vec![] } else { vec![
         ("etc".into(), dir(0o755), None),
         ("etc/group".into(), file.clone(), Some("root:x:0:\ntty:x:5:\nnobody:x:65534:\nnonroot:x:65532:\n".into())),
         ("etc/os-release".into(), file.clone(), Some("NAME=\"aios\"\nID=aios\nPRETTY_NAME=\"aios (distroless)\"\nHOME_URL=\"https://git.syui.ai/ai/os\"\n".into())),
@@ -531,7 +553,7 @@ pub fn main(args: &[String]) {
         ("tmp".into(), dir(0o1777), None),
         ("usr".into(), dir(0o755), None),
         ("usr/lib".into(), dir(0o755), None),
-    ];
+    ] };
     for (p, m, _) in &base {
         if !meta.contains_key(p) || p == "lib" {
             meta.insert(p.clone(), m.clone());
@@ -540,6 +562,10 @@ pub fn main(args: &[String]) {
 
     // 入れるものを選ぶ
     let mut img = Image { root: root.clone(), meta, want: BTreeSet::new(), seen: BTreeSet::new() };
+    // install: パッケージをまるごと (ap -S で入れたのと同じ根)
+    if install {
+        img.want = img.meta.keys().cloned().collect();
+    }
     for f in &files {
         img.add(f, "files");
     }
@@ -572,6 +598,42 @@ pub fn main(args: &[String]) {
         layers[l].push((p.clone(), m, None));
     }
     layers[0].append(&mut base);
+    // install: 入れたことの記録 (aipkg の /var/lib/aipkg/local/NAME-VER の desc、files、install) を、そのパッケージの層に。
+    // aipkg の install と同じ形 (INSTALLDATE は image の時刻、REASON は packages に書いたものが 0、依存は 1、BACKUP は
+    // 「パス<TAB>sha256」)。これで image の中の ap -S は、入っているものを入れなおさない
+    if install {
+        for (k, (n, pk)) in order.iter().zip(&infos).enumerate() {
+            let l = k + 1;
+            let mut d = parse_pkginfo(&pk.info);
+            let ver = get(&d, "VERSION").to_string();
+            d.insert("INSTALLDATE".into(), vec![built.to_string()]);
+            d.insert("REASON".into(), vec![if pkgs.contains(n) { "0" } else { "1" }.to_string()]);
+            let backup: Vec<String> = list(&d, "BACKUP").iter().filter_map(|b| sha256_file(&format!("{}/{}", root, b)).ok().map(|h| format!("{}\t{}", b, h))).collect();
+            d.remove("BACKUP");
+            if !backup.is_empty() {
+                d.insert("BACKUP".into(), backup);
+            }
+            let mut fl = Desc::new();
+            fl.insert("FILES".into(), pk.files.clone());
+            let dir = format!("var/lib/aipkg/local/{}-{}", n, ver);
+            let file = |data: String| (Meta { kind: Kind::File, mode: 0o644, mtime: built, layer: l }, Some(data));
+            let mut add = vec![(format!("{}/desc", dir), file(write_desc(&d))), (format!("{}/files", dir), file(write_desc(&fl)))];
+            if let Some(i) = &pk.install {
+                add.push((format!("{}/install", dir), file(i.clone())));
+            }
+            let mut q = dir.clone();
+            while !q.is_empty() {
+                if !layers[l].iter().any(|(x, _, _)| *x == q) {
+                    let dm = img.meta.get(&q).filter(|m| matches!(m.kind, Kind::Dir)).cloned().unwrap_or(Meta { kind: Kind::Dir, mode: 0o755, mtime: built, layer: l });
+                    layers[l].push((q.clone(), dm, None));
+                }
+                q = parent(&q).to_string();
+            }
+            for (p, (m, data)) in add {
+                layers[l].push((p, m, data));
+            }
+        }
+    }
     for l in layers.iter_mut() {
         l.sort_by(|a, b| a.0.cmp(&b.0));
         l.dedup_by(|a, b| a.0 == b.0);

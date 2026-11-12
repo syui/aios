@@ -367,6 +367,27 @@ ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアー�
 | aios-static | base と CA 証明書。静的なバイナリに | 116 KB |
 | aios-cc | + musl (ld-musl と libc.so)、libgcc_s。musl で動的にリンクしたものに | 597 KB |
 | aios-node | + node 26.13.1 (Entrypoint)。npm もシェルもない | 51.5 MB |
+| aios | builder: base をまるごと (aish、ap、coreutils、zsh、sudo など 15 のパッケージ)。`/bin/sh` は aish | 36.7 MB |
+
+builder (image/aios.json の `"install": true`) は、パッケージをまるごと入れて、aipkg と同じ入れた記録
+(`/var/lib/aipkg/local/NAME-VER` の desc・files・install) をそのパッケージの層に書く。なので image の中の `ap -Q` は
+入っているものを知っていて、`ap -Sy NAME` は足すだけ (`--needed` なら入っているものは飛ばす)。docker build の FROM に:
+
+```dockerfile
+FROM ghcr.io/syui/aios AS builder
+RUN ap -Sy cargo                                   # pacman と同じく、はじめに -y
+WORKDIR /src
+COPY . .
+RUN . /etc/profile.d/cargo.sh && cargo build --release   # RUN はログインしないので、リンカの設定を読む
+
+FROM ghcr.io/syui/aios-static                      # base-devel なしなら rust-lld で静的。cc (base-devel) なら aios-cc
+COPY --from=builder /src/target/release/serve /usr/local/bin/serve
+USER 65532:65532
+CMD ["serve"]
+```
+
+CI は image/example/Dockerfile (cargo init の Hello, world! を同じ形で) を、その場で作った image で docker build して
+動かす。arm64 だけ (x86 の docker では `--platform linux/arm64` と qemu)。
 
 CI (.github/workflows/image.yml、arm64 の Ubuntu) が、ap をビルドして image/*.json を 2 回作り (1 バイトもちがわないか)、
 docker run でためして (node の版・nonroot・https、シェルがないこと、static に静的な hello、cc に musl の hello)、
