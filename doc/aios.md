@@ -2212,12 +2212,40 @@ posix-cpu-timers と同じ:
 GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD128、major 226) が要る。順番は:
 
 1. 調べる (2026-11-12): Linux の VM で virgl を動かし、Mesa と libdrm が使う ioctl と /sys をとる (`test/drm-linux.sh`)
-2. カーネルの DRM (extra) と virtio-gpu の 3D (VIRGL の capset、3D の資源、SUBMIT_3D、fence)
+2. カーネルの DRM (drm.rs、extra) と virtio-gpu の 3D (2026-11-12): render の口 (renderD128) で、Mesa が virgl で描ける
 3. Mesa の virgl: pkg/c/mesa に virgl と GBM を入れた (`-Dgallium-drivers=llvmpipe,virgl`、`-Dgbm=enabled`)。
    /dev/dri がなければ、いままでどおり llvmpipe で描く
-4. たしかめ: `test/egldraw.c` (EGL の surfaceless と GLES2 で 64x64 に描いて読み返す。ドライバによらず同じ答え) と kmscube
-5. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
-6. 本物の機械
+4. たしかめ: `test/egldraw.c` (EGL の surfaceless と GLES2 で 64x64 に描いて読み返す。ドライバによらず同じ答え) と
+   `test/drmrender.c` (render の口の ioctl の答え。Linux と同じ 18 行)
+5. KMS (card0 の MODE_*: 画面に出す。kmscube、aiwm を DRM の上で) と PRIME (dma-buf: Wayland でほかのプロセスへ)
+6. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
+7. 本物の機械
+
+ためすには、ホストに画面 (X か Wayland。なければ Xvfb) を用意して、GL のある画面で起こす: `AIOS_DISPLAY=sdl,gl=on`
+(bin/run.sh は画面に gl=on などがあれば virtio-gpu-gl-device にする)。中で `sudo modprobe virtio_gpu` と `ap -S mesa`。
+`DISPLAY=:99 AIOS_DISPLAY=sdl,gl=on test/vm.py start --kernel . --www DIR` のあと、egldraw の renderer が
+`virgl (LLVMPIPE (...))` (このマシンに GPU がなければ、ホストも llvmpipe で描く) になり、0 failed。
+
+aios の作り (drm.rs):
+
+- virtio-gpu が VIRTIO_GPU_F_VIRGL を持っていれば、起こすときに capset (GET_CAPSET_INFO) を聞き、/dev/dri/card0 と
+  renderD128 を置く (2D だけのときは置かない: Mesa は llvmpipe のまま)。/sys は sysfs.rs の add_chrdev (Linux の
+  device_create のうち、libdrm が読むところ: /sys/dev/char/226:N、/sys/class/drm/NAME、/sys/devices/platform/ADDR.virtio_mmio
+  の uevent と subsystem、drm/NAME の uevent と dev)
+- 開くたびにコンテキストの番号を決め、はじめて使うときに CTX_CREATE (名前はプロセスの名前)。閉じたら、ハンドルを
+  コンテキストから外して CTX_DESTROY
+- BO (GEM のもの) はカーネルのページ。RESOURCE_CREATE で RESOURCE_CREATE_3D と ATTACH_BACKING と CTX_ATTACH_RESOURCE。
+  mmap はそのページをそのまま (vm::Backing::Pages)。GEM_CLOSE やファイルを閉じて落ちた BO は、写しがなくなってから
+  RESOURCE_UNREF してページを返す (reap)
+- 命令はどれもホストが答えるまで待つ。SUBMIT_3D と TRANSFER には fence の印をつけるので、答えはホストが描き終えた
+  とき。だから sync_file はいつも「終わった」、WAIT は待たない。長い SUBMIT_3D は大きなロックを放して待つ。キュー
+  (と要求・応答のページ) は gpu.rs の SEND が守る (/dev/fb0 の 2D の命令もいっしょに)
+
+Linux とのちがい (いまは): KMS はない (card0 の MODE_* と KMS の cap は EOPNOTSUPP。render だけのドライバと同じ答え)。
+PRIME と syncobj もない (DRM_CAP_PRIME と SYNCOBJ は 0、その ioctl は EOPNOTSUPP。Linux 6.18 の virtio_gpu はどちらもある)。
+Linux は命令を出してすぐ返り、fence が終わりを知らせる (aios はホストが終えるまで待つ: CPU と GPU が並んで動かないので、
+たくさん出すものは遅い)。/dev/dri は 0666 (Linux は udev が video / render のグループに)。MAP_PRIVATE の mmap も断らない
+(Linux は EINVAL)
 
 `test/drm-linux.sh [OUT]` は Alpine (aarch64、musl) の linux-virt と Mesa を APKINDEX から依存を解いて tar で広げ (apk も
 install のスクリプトも動かさない)、aios の Mesa (virgl) を /opt/c に入れて、QEMU の virtio-gpu-gl-device で起こす
@@ -2248,7 +2276,8 @@ Linux の答え (Linux 6.18 virt、Mesa 26.2.6、QEMU 8.2。このマシンに G
   GETCONNECTOR 0xa7、GETPROPERTY 0xaa、GETPROPBLOB 0xac、PAGE_FLIP 0xb0、CREATE_DUMB 0xb2、MAP_DUMB 0xb3、
   GETPLANERESOURCES 0xb5、GETPLANE 0xb6、ADDFB2 0xb8、OBJ_GETPROPERTIES 0xb9)
 - 速さ: kmscube (20 枚) は virgl で 26〜57 fps、VM の中の llvmpipe で 9〜11 fps (ホストの込みぐあいでゆれる)
-- aios (いまは /dev/dri がない) の egldraw は llvmpipe で描いて同じ答え
+- aios でも egldraw は `virgl (LLVMPIPE (...))` で 0 failed (30 回つづけても、4 つならべても。メモリも減らない)。
+  test/drmrender.c の答えは Linux と同じ (18 行)。/dev/dri のない aios では llvmpipe で描いて同じ答え
 
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 

@@ -28,6 +28,7 @@ mod block;
 mod cred;
 mod security;
 mod debug;
+mod drm;
 mod crypto;
 mod dtb;
 mod efi;

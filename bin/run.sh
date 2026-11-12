@@ -111,9 +111,12 @@ if [ -n "$AIOS_DISPLAY" ]; then
   if [ "$disp" = 1 ]; then
     if [ "$(uname -s)" = Darwin ]; then disp=cocoa; else disp=gtk; fi
   fi
-  set -- "$@" -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device
+  # 画面に GL があれば (-display sdl,gl=on など) 3D のある virtio-gpu (virgl: ホストの GPU で描く。/dev/dri ができる)
+  gpu=virtio-gpu-device
+  case $disp in *gl=on* | *gl=es* | *gl=core*) gpu=virtio-gpu-gl-device ;; esac
+  set -- "$@" -device $gpu -device virtio-keyboard-device -device virtio-tablet-device
   out="-display $disp -serial mon:stdio"
-  echo "display: $disp (virtio-gpu, keyboard, tablet)" >&2
+  echo "display: $disp ($gpu, keyboard, tablet)" >&2
   snd=${AIOS_SOUND:-}
   if [ -z "$snd" ]; then
     if [ "$(uname -s)" = Darwin ]; then snd=coreaudio

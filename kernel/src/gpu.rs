@@ -6,6 +6,10 @@
 // 知らせる。そのときにデバイスへ写して (TRANSFER_TO_HOST_2D) 画面を描きなおす (RESOURCE_FLUSH)。
 // FBIO_DAMAGE (aios だけ) は変わった四角 (x, y, w, h) だけを送る (写しなおさない。aiwm が使う)。
 // 形は XRGB8888 (メモリの並びは B, G, R, X)。要求は virtio-blk と同じく、出して終わるまで待つ
+//
+// 3D (VIRTIO_GPU_F_VIRGL: QEMU の virtio-gpu-gl-device) があれば、capset (Mesa の virgl が読むホストの GL の力) を
+// 起こすときに聞いておき、drm.rs (/dev/dri) が 3D の命令 (CTX_CREATE、RESOURCE_CREATE_3D、SUBMIT_3D ...) を call で送る。
+// 資源の番号は 1 が画面、3D のものは 2 から (Linux の virtio_gpu_resource_id_get と同じく、使い終わったものもまた使う)
 use crate::cell::Bkl;
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
@@ -20,8 +24,16 @@ const SET_SCANOUT: u32 = 0x0103;
 const RESOURCE_FLUSH: u32 = 0x0104;
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
-const RESP_OK_NODATA: u32 = 0x1100;
+const GET_CAPSET_INFO: u32 = 0x0108;
+pub const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_CAPSET_INFO: u32 = 0x1102;
+/// VIRTIO_GPU_F_VIRGL: 3D (virgl) の命令が使える
+const F_VIRGL: u64 = 1;
+/// 要求の頭の flags: この要求が終わったら (ホストが描き終えたら) 答える
+pub const FLAG_FENCE: u32 = 1;
+/// キューの入れ物の数 (QEMU の control queue は 256): 3D の命令の中身 (Mesa は 256 KiB まで) をページごとに渡す
+const QUEUE_MAX: usize = 256;
 /// B8G8R8X8 (XRGB8888)
 const FORMAT_XRGB: u32 = 2;
 const RESOURCE: u32 = 1;
@@ -38,21 +50,25 @@ pub struct Gpu {
     /// 要求と応答に使うページ
     req: *mut u8,
     resp: *mut u8,
+    /// 3D (virgl) が使える
+    pub virgl: bool,
+    /// capset (id, いちばん新しい版, 大きさ): GET_CAPSET_INFO の答え
+    pub capsets: Vec<(u32, u32, u32)>,
+    /// 1 本目の virtio-mmio の口の物理番地 (/sys/devices/platform/ADDR.virtio_mmio)
+    pub pa: usize,
 }
 
 static GPU: Bkl<Option<Gpu>> = Bkl::new(None);
 
-/// 画面へ送る (TRANSFER と FLUSH) あいだのロック。デバイスが終わるまで回って待つので、大きなロックは放して
-/// これだけを持つ (システムコールの中は割り込みが止まっているので、途中で放しても横取りされない)
+/// キュー (と要求・応答のページ) のロック: 要求をひとつ出して答えを待つあいだ持つ。デバイスが終わるまで回って待つので、
+/// 長くかかるもの (画面へ送る、3D の命令) は大きなロックを放して (unlocked) これだけを持つ (システムコールの中は割り込みが
+/// 止まっているので、途中で放しても横取りされない)
 static SEND: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
 
-/// 大きなロックを放して、SEND を持って f (画面へ送る)。終わったら大きなロックを取りなおす
-fn unlocked<R>(f: impl FnOnce() -> R) -> R {
+/// 大きなロックを放して f (デバイスへ送る: call が SEND を持つ)。終わったら大きなロックを取りなおす
+pub fn unlocked<R>(f: impl FnOnce() -> R) -> R {
     crate::smp::unlock();
-    let r = {
-        let _s = SEND.lock();
-        f()
-    };
+    let r = f();
     crate::smp::lock();
     r
 }
@@ -68,6 +84,15 @@ fn hdr(typ: u32) -> [u8; 24] {
     h
 }
 
+/// 3D の要求の頭 (virtio_gpu_ctrl_hdr): 型、flags、fence_id、ctx_id
+pub fn hdr3d(typ: u32, flags: u32, fence: u64, ctx: u32) -> Vec<u8> {
+    let mut h = hdr(typ).to_vec();
+    h[4..8].copy_from_slice(&flags.to_le_bytes());
+    h[8..16].copy_from_slice(&fence.to_le_bytes());
+    h[16..20].copy_from_slice(&ctx.to_le_bytes());
+    h
+}
+
 fn put(b: &mut Vec<u8>, v: u32) {
     b.extend_from_slice(&v.to_le_bytes());
 }
@@ -75,6 +100,17 @@ fn put(b: &mut Vec<u8>, v: u32) {
 impl Gpu {
     /// 要求 (req) と、ページの並び (extra、デバイスが読む) を送り、応答の型を返す
     fn cmd(&mut self, req: &[u8], extra: &[*mut u8], extra_len: usize, resp_len: usize) -> u32 {
+        let mut r = [0u8; 4];
+        self.call(req, extra, extra_len, resp_len, &mut r)
+    }
+
+    /// 要求を出して、答え (resp_len バイト) の頭を out に写す。答えの型を返す (送れなければ 0)。
+    /// SEND を持って (ほかの CPU の要求と混ざらない)、デバイスが答えるまで回って待つ
+    pub fn call(&mut self, req: &[u8], extra: &[*mut u8], extra_len: usize, resp_len: usize, out: &mut [u8]) -> u32 {
+        if req.len() > PGSIZE || resp_len > PGSIZE || extra.len() + 2 > self.q.size {
+            return 0;
+        }
+        let _s = SEND.lock();
         unsafe {
             core::ptr::copy_nonoverlapping(req.as_ptr(), self.req, req.len());
             core::ptr::write_bytes(self.resp, 0, resp_len);
@@ -98,7 +134,10 @@ impl Gpu {
         }
         crate::smp::dev_wait(1, t0);
         self.mmio.ack();
-        unsafe { u32::from_le_bytes(core::slice::from_raw_parts(self.resp, 4).try_into().unwrap()) }
+        let r = unsafe { core::slice::from_raw_parts(self.resp, resp_len) };
+        let n = out.len().min(resp_len);
+        out[..n].copy_from_slice(&r[..n]);
+        u32::from_le_bytes(r[..4].try_into().unwrap())
     }
 
     /// (x, y, w, h) の範囲を画面へ
@@ -143,20 +182,39 @@ pub fn init() -> bool {
     // /dev/fb0 (Linux の devtmpfs: 装置を見つけたものがノードを置く) と、それを開くもの (Linux の register_chrdev)
     crate::fs::add_dev("fb0", 0o666, false, 29, 0);
     crate::file::register_chrdev(29, |mi, _| (mi == 0 && get().is_some()).then(|| Ok(crate::file::Kind::Ops(Rc::new(FbFile)))));
+    // 3D があれば /dev/dri (drm.rs。Linux はいつも置くが、aios は 2D だけのときは置かない: Mesa は llvmpipe のまま)
+    if let Some(g) = get().filter(|g| g.virgl) {
+        crate::drm::init(g.pa);
+    }
     true
 }
 
 fn probe_init() -> bool {
-    let Some((mmio, _)) = virtio::probe(DEVICE_GPU, 0) else { return false };
-    let Some(q) = Queue::new(&mmio, 0, 64) else { return false };
+    let Some((mmio, feats)) = virtio::probe(DEVICE_GPU, F_VIRGL) else { return false };
+    let Some(q) = Queue::new(&mmio, 0, Queue::max(&mmio, 0).min(QUEUE_MAX)) else { return false };
     virtio::ready(&mmio);
     let (Some(req), Some(resp)) = (kalloc::alloc(), kalloc::alloc()) else { return false };
-    let mut g = Gpu { mmio, q, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp };
+    let pa = v2p(mmio.base);
+    let mut g = Gpu { mmio, q, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp, virgl: feats & F_VIRGL != 0, capsets: Vec::new(), pa };
+
+    // 3D の capset (virtio_gpu_config の num_capsets は 12 バイト目): Linux の virtio_gpu_get_capsets
+    if g.virgl {
+        for i in 0..g.mmio.config32(12) {
+            let mut q = hdr(GET_CAPSET_INFO).to_vec();
+            put(&mut q, i);
+            put(&mut q, 0);
+            let mut r = [0u8; 40];
+            if g.call(&q, &[], 0, 40, &mut r) == RESP_OK_CAPSET_INFO {
+                let u = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
+                g.capsets.push((u(24), u(28), u(32)));
+            }
+        }
+    }
 
     // 画面の大きさ (なければ 1280x800)
     let (mut w, mut h) = (1280, 800);
-    if g.cmd(&hdr(GET_DISPLAY_INFO), &[], 0, 24 + 16 * 24) == RESP_OK_DISPLAY_INFO {
-        let r = unsafe { core::slice::from_raw_parts(g.resp, 48) };
+    let mut r = [0u8; 48];
+    if g.call(&hdr(GET_DISPLAY_INFO), &[], 0, 24 + 16 * 24, &mut r) == RESP_OK_DISPLAY_INFO {
         let u = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
         if u(24 + 16) != 0 && u(24 + 8) > 0 && u(24 + 12) > 0 {
             (w, h) = (u(24 + 8), u(24 + 12));
@@ -220,7 +278,11 @@ fn probe_init() -> bool {
         return false;
     }
     g.flush_all();
-    println!("virtio-gpu: {}x{} (/dev/fb0)", w, h);
+    if g.virgl {
+        println!("virtio-gpu: {}x{} (/dev/fb0), 3D: virgl, capsets {:?}", w, h, g.capsets);
+    } else {
+        println!("virtio-gpu: {}x{} (/dev/fb0)", w, h);
+    }
     *GPU.get() = Some(g);
     true
 }

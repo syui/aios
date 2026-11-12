@@ -11,6 +11,11 @@
 //   /sys/firmware/efi/{fw_platform_size,systab}      UEFI から起動したとき (arm64 の Linux と同じもの。systab は root だけ)
 //   /sys/firmware/efi/efivars                        efivarfs をかぶせるところ (efivarfs.rs)
 //   /sys/module/apparmor/parameters/enabled          Y (aios.off=apparmor なら N。libapparmor の aa_is_enabled が読む)
+//   /sys/dev/char/MA:MI、/sys/class/CLASS/NAME       ドライバが add_chrdev で置いた文字デバイス (DRM の card0 と renderD128:
+//                                                    libdrm の drmGetDevices2 が読む)。どちらも次へのリンク:
+//   /sys/devices/platform/PARENT/{uevent,subsystem}  それをつなぐ装置 (a003e00.virtio_mmio: DTB の名前と、Linux と同じ uevent)
+//   /sys/devices/platform/PARENT/CLASS/NAME/{uevent,dev,device,subsystem}
+//   /sys/bus/platform                                subsystem のリンクの先 (中は空)
 // 大きさはセクタ (512 バイト)、stat は /proc/diskstats の 4 列目からの 11 列と同じ
 use crate::vfs::*;
 use alloc::format;
@@ -67,6 +72,80 @@ enum Node {
     Efi,
     EfiFile(u8),
     EfiVars,
+    /// /sys/dev、/sys/dev/char と、その中のリンク (CHRDEVS の番号)
+    Dev,
+    DevChar,
+    DevCharLink(u8),
+    /// /sys/bus と /sys/bus/platform
+    Bus,
+    BusPlatform,
+    /// /sys/devices/platform と、その中の装置 (その装置をつなぐ CHRDEVS のはじめの番号)
+    Platform,
+    PlatDev(u8),
+    PlatUevent(u8),
+    PlatSubsys(u8),
+    /// 装置の下の CLASS のディレクトリ (その CLASS のはじめの番号)
+    PlatClass(u8),
+    /// 文字デバイスのディレクトリと、その中のもの
+    Chr(u8),
+    ChrUevent(u8),
+    ChrDev(u8),
+    ChrDevice(u8),
+    ChrSubsys(u8),
+    /// /sys/class/CLASS (その CLASS のはじめの番号) と、その中のリンク
+    ClassOf(u8),
+    ClassLink(u8),
+}
+
+/// ドライバが置く文字デバイス (Linux の device_create のうち、プログラムが読むところ)
+#[derive(Clone)]
+pub struct ChrDev {
+    pub major: u32,
+    pub minor: u32,
+    /// card0
+    pub name: String,
+    /// /dev の下の名前 (dri/card0)
+    pub devname: String,
+    /// uevent の DEVTYPE (drm_minor)
+    pub devtype: &'static str,
+    /// /sys/class の下の名前 (drm)
+    pub class: &'static str,
+    /// つなぐ装置の名前 (a003e00.virtio_mmio) と、その uevent
+    pub parent: String,
+    pub parent_uevent: String,
+}
+
+static CHRDEVS: crate::spinlock::SpinLock<Vec<ChrDev>> = crate::spinlock::SpinLock::new(Vec::new());
+
+/// 文字デバイスを /sys に (同じ major:minor があれば置きかえる)
+pub fn add_chrdev(d: ChrDev) {
+    let mut l = CHRDEVS.lock();
+    if let Some(o) = l.iter_mut().find(|o| o.major == d.major && o.minor == d.minor) {
+        *o = d;
+    } else if l.len() < 32 {
+        l.push(d);
+    }
+}
+
+fn chrdevs() -> Vec<ChrDev> {
+    CHRDEVS.lock().clone()
+}
+
+fn chrdev(i: u8) -> Result<ChrDev, i64> {
+    CHRDEVS.lock().get(i as usize).cloned().ok_or(-ENOENT)
+}
+
+/// i の装置 (または CLASS) を持つはじめの番号か
+fn first_parent(l: &[ChrDev], i: usize) -> bool {
+    !l[..i].iter().any(|o| o.parent == l[i].parent)
+}
+
+fn first_class(l: &[ChrDev], i: usize) -> bool {
+    !l[..i].iter().any(|o| o.class == l[i].class)
+}
+
+fn first_class_in(l: &[ChrDev], i: usize) -> bool {
+    !l[..i].iter().any(|o| o.parent == l[i].parent && o.class == l[i].class)
 }
 
 pub struct SysInode {
@@ -137,6 +216,23 @@ impl SysInode {
             Node::CpuOnline(n) => 0x3_0000 + ((n as u64) << 4) + 1,
             Node::Vulns => 19,
             Node::Vuln(i) => 0x500 + i as u64,
+            Node::Dev => 20,
+            Node::DevChar => 21,
+            Node::Bus => 22,
+            Node::BusPlatform => 23,
+            Node::Platform => 24,
+            Node::DevCharLink(i) => 0x6_0000 + ((i as u64) << 5),
+            Node::PlatDev(i) => 0x6_0000 + ((i as u64) << 5) + 1,
+            Node::PlatUevent(i) => 0x6_0000 + ((i as u64) << 5) + 2,
+            Node::PlatSubsys(i) => 0x6_0000 + ((i as u64) << 5) + 3,
+            Node::PlatClass(i) => 0x6_0000 + ((i as u64) << 5) + 4,
+            Node::Chr(i) => 0x6_0000 + ((i as u64) << 5) + 5,
+            Node::ChrUevent(i) => 0x6_0000 + ((i as u64) << 5) + 6,
+            Node::ChrDev(i) => 0x6_0000 + ((i as u64) << 5) + 7,
+            Node::ChrDevice(i) => 0x6_0000 + ((i as u64) << 5) + 8,
+            Node::ChrSubsys(i) => 0x6_0000 + ((i as u64) << 5) + 9,
+            Node::ClassOf(i) => 0x6_0000 + ((i as u64) << 5) + 10,
+            Node::ClassLink(i) => 0x6_0000 + ((i as u64) << 5) + 11,
         }
     }
 
@@ -144,7 +240,71 @@ impl SysInode {
         matches!(
             self.node,
             Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars
+                | Node::Dev | Node::DevChar | Node::Bus | Node::BusPlatform | Node::Platform | Node::PlatDev(_) | Node::PlatClass(_) | Node::Chr(_) | Node::ClassOf(_)
         )
+    }
+
+    /// 親のディレクトリ (/sys は /sys)
+    fn parent(&self) -> Node {
+        let l = || chrdevs();
+        match self.node {
+            Node::Root | Node::Block | Node::Class | Node::Devices | Node::Kernel | Node::Module | Node::Firmware | Node::Dev | Node::Bus => Node::Root,
+            Node::Disk => Node::Block,
+            Node::DiskFile(_) | Node::Queue | Node::Part(_) => Node::Disk,
+            Node::QueueFile(_) => Node::Queue,
+            Node::PartFile(n, _) => Node::Part(n),
+            Node::ClassNet | Node::ClassOf(_) => Node::Class,
+            Node::Net(_) => Node::ClassNet,
+            Node::NetFile(n, _) | Node::NetStats(n) => Node::Net(n),
+            Node::NetStat(n, _) => Node::NetStats(n),
+            Node::System | Node::Platform => Node::Devices,
+            Node::Cpu => Node::System,
+            Node::CpuFile(_) | Node::CpuN(_) | Node::Vulns => Node::Cpu,
+            Node::CpuOnline(n) => Node::CpuN(n),
+            Node::Vuln(_) => Node::Vulns,
+            Node::Security => Node::Kernel,
+            Node::ModAa => Node::Module,
+            Node::ModAaParams => Node::ModAa,
+            Node::ModAaEnabled => Node::ModAaParams,
+            Node::Efi => Node::Firmware,
+            Node::EfiFile(_) | Node::EfiVars => Node::Efi,
+            Node::DevChar => Node::Dev,
+            Node::DevCharLink(_) => Node::DevChar,
+            Node::BusPlatform => Node::Bus,
+            Node::PlatDev(_) => Node::Platform,
+            Node::PlatUevent(i) | Node::PlatSubsys(i) => Node::PlatDev(i),
+            Node::PlatClass(i) => {
+                let l = l();
+                let p = l.get(i as usize).map(|d| d.parent.clone());
+                Node::PlatDev((0..l.len()).find(|&j| first_parent(&l, j) && Some(&l[j].parent) == p.as_ref()).unwrap_or(0) as u8)
+            }
+            Node::Chr(i) => {
+                let l = l();
+                let c = l.get(i as usize).map(|d| (d.parent.clone(), d.class));
+                Node::PlatClass((0..l.len()).find(|&j| first_class_in(&l, j) && Some((l[j].parent.clone(), l[j].class)) == c).unwrap_or(0) as u8)
+            }
+            Node::ChrUevent(i) | Node::ChrDev(i) | Node::ChrDevice(i) | Node::ChrSubsys(i) => Node::Chr(i),
+            Node::ClassLink(i) => {
+                let l = l();
+                let c = l.get(i as usize).map(|d| d.class);
+                Node::ClassOf((0..l.len()).find(|&j| first_class(&l, j) && Some(l[j].class) == c).unwrap_or(0) as u8)
+            }
+        }
+    }
+
+    /// シンボリックリンクの先 (リンクでなければ None)
+    fn link(&self) -> Option<String> {
+        let d = match self.node {
+            Node::DevCharLink(i) | Node::PlatSubsys(i) | Node::ChrDevice(i) | Node::ChrSubsys(i) | Node::ClassLink(i) => chrdev(i).ok()?,
+            _ => return None,
+        };
+        Some(match self.node {
+            Node::DevCharLink(_) => format!("../../devices/platform/{}/{}/{}", d.parent, d.class, d.name),
+            Node::PlatSubsys(_) => "../../../bus/platform".into(),
+            Node::ChrDevice(_) => format!("../../../{}", d.parent),
+            Node::ChrSubsys(_) => format!("../../../../../class/{}", d.class),
+            _ => format!("../../devices/platform/{}/{}/{}", d.parent, d.class, d.name),
+        })
     }
 
     fn content(&self) -> Result<String, i64> {
@@ -203,6 +363,15 @@ impl SysInode {
                 };
                 format!("{}\n", v)
             }
+            Node::PlatUevent(i) => chrdev(i)?.parent_uevent,
+            Node::ChrUevent(i) => {
+                let d = chrdev(i)?;
+                format!("MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE={}\n", d.major, d.minor, d.devname, d.devtype)
+            }
+            Node::ChrDev(i) => {
+                let d = chrdev(i)?;
+                format!("{}:{}\n", d.major, d.minor)
+            }
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
             Node::Vuln(i) => crate::cpuvuln::show(VULN_FILES[i as usize]),
@@ -237,13 +406,22 @@ impl Inode for SysInode {
     }
 
     fn meta(&self) -> Meta {
+        let link = self.link();
         let mode = match self.node {
             _ if self.is_dir() => S_IFDIR | 0o555,
+            _ if link.is_some() => S_IFLNK | 0o777,
             Node::EfiFile(1) => S_IFREG | 0o400,
+            // uevent は root が書ける (Linux と同じ形。書いても何もしない)
+            Node::PlatUevent(_) | Node::ChrUevent(_) => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
         };
+        let size = match &link {
+            _ if self.is_dir() => 0,
+            Some(l) => l.len() as u64,
+            None => 4096,
+        };
         let now = crate::timer::epoch_ns();
-        Meta { ino: self.ino(), mode, nlink: 1, uid: 0, gid: 0, size: if self.is_dir() { 0 } else { 4096 }, rdev: 0, blocks: 0, mtime: now, ctime: now }
+        Meta { ino: self.ino(), mode, nlink: 1, uid: 0, gid: 0, size, rdev: 0, blocks: 0, mtime: now, ctime: now }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
@@ -257,8 +435,12 @@ impl Inode for SysInode {
         Ok(n)
     }
 
-    fn write_at(&self, _: usize, _: &[u8]) -> Result<usize, i64> {
-        Err(-EACCES)
+    fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+        match self.node {
+            // uevent に書くと Linux はその装置のできごとをもう一度出す (udev の trigger)。aios には udev がないので受けとるだけ
+            Node::PlatUevent(_) | Node::ChrUevent(_) => Ok(b.len()),
+            _ => Err(-EACCES),
+        }
     }
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
@@ -266,21 +448,68 @@ impl Inode for SysInode {
     }
 
     fn readlink(&self) -> Result<String, i64> {
-        Err(crate::why::inval())
+        self.link().ok_or_else(crate::why::inval)
     }
 
     fn lookup(&self, name: &str) -> Result<InodeRef, i64> {
         let pos = |list: &[&str]| list.iter().position(|x| *x == name).map(|i| i as u8).ok_or(-ENOENT);
         let node = match self.node {
+            // リンク (/sys/dev/char/MA:MI など) の .. を、たどるところで引く
+            _ if self.is_dir() && name == "." => self.node,
+            _ if self.is_dir() && name == ".." => self.parent(),
             Node::Root => match name {
                 "block" => Node::Block,
+                "bus" => Node::Bus,
                 "class" => Node::Class,
+                "dev" => Node::Dev,
                 "devices" => Node::Devices,
                 "kernel" => Node::Kernel,
                 "module" => Node::Module,
                 "firmware" => Node::Firmware,
                 _ => return Err(-ENOENT),
             },
+            Node::Dev if name == "char" => Node::DevChar,
+            Node::DevChar => {
+                let l = chrdevs();
+                let i = l.iter().position(|d| format!("{}:{}", d.major, d.minor) == name).ok_or(-ENOENT)?;
+                Node::DevCharLink(i as u8)
+            }
+            Node::Bus if name == "platform" => Node::BusPlatform,
+            Node::Devices if name == "platform" && !chrdevs().is_empty() => Node::Platform,
+            Node::Platform => {
+                let l = chrdevs();
+                let i = (0..l.len()).find(|&i| first_parent(&l, i) && l[i].parent == name).ok_or(-ENOENT)?;
+                Node::PlatDev(i as u8)
+            }
+            Node::PlatDev(i) => match name {
+                "uevent" => Node::PlatUevent(i),
+                "subsystem" => Node::PlatSubsys(i),
+                _ => {
+                    let l = chrdevs();
+                    let p = &l.get(i as usize).ok_or(-ENOENT)?.parent;
+                    let j = (0..l.len()).find(|&j| first_class_in(&l, j) && &l[j].parent == p && l[j].class == name).ok_or(-ENOENT)?;
+                    Node::PlatClass(j as u8)
+                }
+            },
+            Node::PlatClass(i) => {
+                let l = chrdevs();
+                let c = l.get(i as usize).ok_or(-ENOENT)?;
+                let j = l.iter().position(|d| d.parent == c.parent && d.class == c.class && d.name == name).ok_or(-ENOENT)?;
+                Node::Chr(j as u8)
+            }
+            Node::Chr(i) => match name {
+                "uevent" => Node::ChrUevent(i),
+                "dev" => Node::ChrDev(i),
+                "device" => Node::ChrDevice(i),
+                "subsystem" => Node::ChrSubsys(i),
+                _ => return Err(-ENOENT),
+            },
+            Node::ClassOf(i) => {
+                let l = chrdevs();
+                let c = l.get(i as usize).ok_or(-ENOENT)?.class;
+                let j = l.iter().position(|d| d.class == c && d.name == name).ok_or(-ENOENT)?;
+                Node::ClassLink(j as u8)
+            }
             Node::Firmware if name == "efi" && crate::efirt::available() => Node::Efi,
             Node::Efi if name == "efivars" => Node::EfiVars,
             Node::Efi => Node::EfiFile(pos(&EFI_FILES)?),
@@ -300,6 +529,11 @@ impl Inode for SysInode {
             Node::Queue => Node::QueueFile(pos(&QUEUE_FILES)?),
             Node::Part(n) => Node::PartFile(n, pos(&PART_FILES)?),
             Node::Class if name == "net" => Node::ClassNet,
+            Node::Class => {
+                let l = chrdevs();
+                let i = (0..l.len()).find(|&i| first_class(&l, i) && l[i].class == name).ok_or(-ENOENT)?;
+                Node::ClassOf(i as u8)
+            }
             Node::ClassNet => Node::Net(pos(&NETS)?),
             Node::Net(n) if name == "statistics" => Node::NetStats(n),
             Node::Net(n) => Node::NetFile(n, pos(&NET_FILES)?),
@@ -334,7 +568,9 @@ impl Inode for SysInode {
         match self.node {
             Node::Root => {
                 add("block".into(), Node::Block);
+                add("bus".into(), Node::Bus);
                 add("class".into(), Node::Class);
+                add("dev".into(), Node::Dev);
                 add("devices".into(), Node::Devices);
                 add("kernel".into(), Node::Kernel);
                 add("module".into(), Node::Module);
@@ -381,7 +617,58 @@ impl Inode for SysInode {
                     add((*f).into(), Node::PartFile(n, i as u8));
                 }
             }
-            Node::Class => add("net".into(), Node::ClassNet),
+            Node::Class => {
+                let l = chrdevs();
+                for i in (0..l.len()).filter(|&i| first_class(&l, i)) {
+                    add(l[i].class.into(), Node::ClassOf(i as u8));
+                }
+                add("net".into(), Node::ClassNet);
+            }
+            Node::ClassOf(i) => {
+                let l = chrdevs();
+                let c = l.get(i as usize).map(|d| d.class);
+                for (j, d) in l.iter().enumerate().filter(|(_, d)| Some(d.class) == c) {
+                    add(d.name.clone(), Node::ClassLink(j as u8));
+                }
+            }
+            Node::Dev => add("char".into(), Node::DevChar),
+            Node::DevChar => {
+                for (i, d) in chrdevs().iter().enumerate() {
+                    add(format!("{}:{}", d.major, d.minor), Node::DevCharLink(i as u8));
+                }
+            }
+            Node::Bus => add("platform".into(), Node::BusPlatform),
+            Node::BusPlatform => {}
+            Node::Platform => {
+                let l = chrdevs();
+                for i in (0..l.len()).filter(|&i| first_parent(&l, i)) {
+                    add(l[i].parent.clone(), Node::PlatDev(i as u8));
+                }
+            }
+            Node::PlatDev(i) => {
+                let l = chrdevs();
+                if let Some(p) = l.get(i as usize).map(|d| d.parent.clone()) {
+                    for j in (0..l.len()).filter(|&j| first_class_in(&l, j) && l[j].parent == p) {
+                        add(l[j].class.into(), Node::PlatClass(j as u8));
+                    }
+                }
+                add("subsystem".into(), Node::PlatSubsys(i));
+                add("uevent".into(), Node::PlatUevent(i));
+            }
+            Node::PlatClass(i) => {
+                let l = chrdevs();
+                if let Some(c) = l.get(i as usize).cloned() {
+                    for (j, d) in l.iter().enumerate().filter(|(_, d)| d.parent == c.parent && d.class == c.class) {
+                        add(d.name.clone(), Node::Chr(j as u8));
+                    }
+                }
+            }
+            Node::Chr(i) => {
+                add("dev".into(), Node::ChrDev(i));
+                add("device".into(), Node::ChrDevice(i));
+                add("subsystem".into(), Node::ChrSubsys(i));
+                add("uevent".into(), Node::ChrUevent(i));
+            }
             Node::ClassNet => {
                 for (i, n) in NETS.iter().enumerate() {
                     add((*n).into(), Node::Net(i as u8));
@@ -398,7 +685,12 @@ impl Inode for SysInode {
                     add((*f).into(), Node::NetStat(n, i as u8));
                 }
             }
-            Node::Devices => add("system".into(), Node::System),
+            Node::Devices => {
+                if !chrdevs().is_empty() {
+                    add("platform".into(), Node::Platform);
+                }
+                add("system".into(), Node::System);
+            }
             Node::System => add("cpu".into(), Node::Cpu),
             Node::Cpu => {
                 for (i, f) in CPU_FILES.iter().enumerate() {

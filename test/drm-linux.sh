@@ -4,7 +4,8 @@
 #   test/drm-linux.sh [OUT]      既定 build/drm-linux。OUT/t/ に NAME.st (strace) と NAME.out、sys-*.txt、dmesg.txt
 # 動かすもの: drmdevice (libdrm のデバイスさがし: /sys)、modetest (KMS の問い合わせ)、kmscube (Alpine の Mesa: llvmpipe と
 # dumb buffer で KMS)、aios の Mesa (repo/aarch64/c の mesa と依存を /opt/c に) で egldraw (test/egldraw.c: 画面なしに
-# virgl で描いて読み返す。LIBGL_ALWAYS_SOFTWARE=1 で llvmpipe も)、eglinfo、kmscube (virgl で描いて KMS に出す)
+# virgl で描いて読み返す。LIBGL_ALWAYS_SOFTWARE=1 で llvmpipe も)、eglinfo、kmscube (virgl で描いて KMS に出す)、
+# drmrender (test/drmrender.c: render の口の ioctl の答え。aios の VM の答えとくらべる)
 # 要るもの: qemu-system-aarch64 (virtio-gpu-gl-device)、xvfb-run (QEMU の SDL の GL で virglrenderer に描かせる。この
 # マシンに GPU がなければホストの llvmpipe で: 速さは見られない)、bsdtar、curl、python3、zig (build/zig)
 # Alpine のパッケージは APKINDEX から依存を解いて、tar で広げるだけ (apk も install のスクリプトも動かさない)。
@@ -71,6 +72,7 @@ cp -a aios/opt/c/lib/*.so* aios/opt/c/lib/gbm rootfs/opt/c/lib/
 ln -sf /lib/ld-musl-aarch64.so.1 rootfs/opt/c/lib/libc.so
 "$top"/build/zig/zig-*/zig cc -target aarch64-linux-musl -O2 -I aios/opt/c/include -o rootfs/usr/local/bin/egldraw \
   "$top"/test/egldraw.c -L aios/opt/c/lib -lEGL -lGLESv2 -Wl,--allow-shlib-undefined -Wl,-rpath,/opt/c/lib
+"$top"/build/zig/zig-*/zig cc -target aarch64-linux-musl -O2 -static -o rootfs/usr/local/bin/drmrender "$top"/test/drmrender.c
 
 # 3. init: virtio のモジュールを依存の順に読み、集めたものを 2 つめのディスク (tar) に書く
 cat > rootfs/init <<EOF
@@ -98,6 +100,7 @@ for d in /sys/class/drm/* /sys/class/drm/card0/device /sys/class/drm/renderD128/
 ST="strace -f -v -s 512 -yy -X verbose"
 A="env LD_LIBRARY_PATH=/opt/c/lib"
 run() { name=$1; shift; echo "== $name"; $ST -o $name.st "$@" > $name.out 2>&1; tail -n 3 $name.out; }
+run drmrender drmrender
 run drmdevice drmdevice
 run modetest modetest -M virtio_gpu -c -e -p
 run kmscube-llvmpipe timeout 90 kmscube -c 20
@@ -121,6 +124,6 @@ xvfb-run -a -s "-screen 0 1280x800x24" qemu-system-aarch64 -M virt -cpu cortex-a
   -serial file:serial.log -monitor none -no-reboot -nic none
 rm -rf t
 tar -xf out.img
-grep -E '^== |^FAIL |egldraw:|renderer:|Rendered|\[drm\] features' serial.log || true
+grep -E '^== |^FAIL |egldraw:|drmrender:|renderer:|Rendered|\[drm\] features' serial.log || true
 grep -h -E 'renderer|fps|devices' t/*.out || true
 echo "drm-linux: $out/t"
