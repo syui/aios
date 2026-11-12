@@ -49,11 +49,22 @@ fn dev(rest: &[&str]) -> std::io::Result<String> {
     netif::names()?.into_iter().next().ok_or_else(|| bad("no interface"))
 }
 
-/// n は並びの番号 (カーネルの番号が聞けなかったとき)
+/// n は並びの番号 (カーネルの番号が聞けなかったとき)。lo (分けた NET の中では lo だけが見える) は lo らしく
 fn header(i: &netif::If, n: usize) {
-    let flags = if i.up { "BROADCAST,MULTICAST,UP,LOWER_UP" } else { "BROADCAST,MULTICAST" };
+    let lo = i.name == "lo";
+    let flags = match (lo, i.up) {
+        (true, true) => "LOOPBACK,UP,LOWER_UP",
+        (true, false) => "LOOPBACK",
+        (false, true) => "BROADCAST,MULTICAST,UP,LOWER_UP",
+        (false, false) => "BROADCAST,MULTICAST",
+    };
     let n = if i.index > 0 { i.index as usize } else { n };
-    println!("{}: {}: <{}> mtu {} state {}", n, i.name, flags, i.mtu, if i.up { "UP" } else { "DOWN" });
+    let state = if lo && i.up { "UNKNOWN" } else if i.up { "UP" } else { "DOWN" };
+    println!("{}: {}: <{}> mtu {} state {}", n, i.name, flags, i.mtu, state);
+    if lo {
+        println!("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00");
+        return;
+    }
     let m = i.mac;
     println!("    link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} brd ff:ff:ff:ff:ff:ff", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
@@ -64,7 +75,9 @@ fn addr(rest: &[&str]) -> std::io::Result<()> {
             for (k, n) in netif::names()?.iter().enumerate() {
                 let i = netif::get(n)?;
                 header(&i, k + 1);
-                if let Some(a) = i.addr {
+                if let Some(a) = i.addr.filter(|_| i.name == "lo") {
+                    println!("    inet {}/{} scope host lo", fmt(a), i.prefix);
+                } else if let Some(a) = i.addr {
                     let m = netif::mask(i.prefix);
                     let brd = [a[0] | !m[0], a[1] | !m[1], a[2] | !m[2], a[3] | !m[3]];
                     let how = if i.dhcp { "dynamic " } else { "" };

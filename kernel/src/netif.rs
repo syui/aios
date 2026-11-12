@@ -1,8 +1,11 @@
 // ネットワークのインターフェースの ioctl (Linux と同じ番号と形。ソケットの fd に)
 //   見る:   SIOCGIFCONF (一覧) SIOCGIFFLAGS SIOCGIFADDR SIOCGIFNETMASK SIOCGIFBRDADDR
 //           SIOCGIFHWADDR (MAC) SIOCGIFMTU SIOCGIFINDEX SIOCGIFNAME (番号から名前: if_indextoname)
+//           SIOCGIFTXQLEN (どちらも 1000)
 //   変える: SIOCSIFADDR (0.0.0.0 なら DHCP にもどす) SIOCSIFNETMASK
 //           SIOCADDRT SIOCDELRT (デフォルトのゲートウェイだけ)  ← root だけ
+//           SIOCSIFFLAGS (分けた NET の lo の UP / DOWN だけ。はじめの NET の口は、いまと同じでなければ EOPNOTSUPP)
+// 分けた NET の中 (ns.rs) は lo だけ: はじめ DOWN で番地なし、UP にすると 127.0.0.1/8 (netns)
 // struct ifreq は 名前 16 バイト + 中身 (sockaddr など) 24 バイト。インターフェースは lo (番号 1) と eth0 (2: netlink と
 // /sys/class/net と同じ。Linux と同じ番号)。SIOCGIFCONF は eth0 だけ (aios の ip と networkd は、はじめのものを eth0 と
 // みなす。lo は名前で聞ける)
@@ -15,6 +18,8 @@ const SIOCGIFNAME: u64 = 0x8910;
 const SIOCDELRT: u64 = 0x890c;
 const SIOCGIFCONF: u64 = 0x8912;
 const SIOCGIFFLAGS: u64 = 0x8913;
+const SIOCSIFFLAGS: u64 = 0x8914;
+const SIOCGIFTXQLEN: u64 = 0x8942;
 const SIOCGIFADDR: u64 = 0x8915;
 const SIOCSIFADDR: u64 = 0x8916;
 const SIOCGIFBRDADDR: u64 = 0x8919;
@@ -29,6 +34,7 @@ const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const ENOTTY: i64 = 25;
 const EADDRNOTAVAIL: i64 = 99;
+const EOPNOTSUPP: i64 = 95;
 
 const AF_INET: u16 = 2;
 const ARPHRD_ETHER: u16 = 1;
@@ -46,7 +52,21 @@ type R = Result<i64, i64>;
 pub fn handles(req: u64) -> bool {
     matches!(
         req,
-        SIOCADDRT | SIOCDELRT | SIOCGIFNAME | SIOCGIFCONF | SIOCGIFFLAGS | SIOCGIFADDR | SIOCSIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCSIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX
+        SIOCADDRT
+            | SIOCDELRT
+            | SIOCGIFNAME
+            | SIOCGIFCONF
+            | SIOCGIFFLAGS
+            | SIOCSIFFLAGS
+            | SIOCGIFADDR
+            | SIOCSIFADDR
+            | SIOCGIFBRDADDR
+            | SIOCGIFNETMASK
+            | SIOCSIFNETMASK
+            | SIOCGIFMTU
+            | SIOCGIFHWADDR
+            | SIOCGIFINDEX
+            | SIOCGIFTXQLEN
     )
 }
 
@@ -95,11 +115,15 @@ pub fn ioctl(req: u64, arg: usize) -> R {
         let mut r = [0u8; IFREQ];
         copy_in(&mut r, arg)?;
         let index = i32::from_le_bytes(r[16..20].try_into().unwrap());
-        let Some(l) = crate::netlink::links().into_iter().find(|l| l.index == index) else { return Err(-ENODEV) };
+        let Some(l) = crate::netlink::view_links().into_iter().find(|l| l.index == index) else { return Err(-ENODEV) };
         r[..16].fill(0);
         r[..l.name.len()].copy_from_slice(l.name.as_bytes());
         copy_out(arg, &r)?;
         return Ok(0);
+    }
+    // 分けた NET の中: 口は lo だけ
+    if let Some(st) = crate::ns::net_lo() {
+        return netns(req, arg, st);
     }
     if net::get().is_none() {
         return Err(-ENODEV);
@@ -184,6 +208,11 @@ pub fn ioctl(req: u64, arg: usize) -> R {
         }
         SIOCGIFMTU => r[16..20].copy_from_slice(&1500i32.to_le_bytes()),
         SIOCGIFINDEX => r[16..20].copy_from_slice(&crate::netlink::ETH_INDEX.to_le_bytes()),
+        SIOCGIFTXQLEN => r[16..20].copy_from_slice(&1000i32.to_le_bytes()),
+        SIOCSIFFLAGS => {
+            root()?;
+            return same_flags(&r);
+        }
         SIOCSIFADDR => {
             root()?;
             net::set_addr(addr_of(&r[16..32]), None);
@@ -217,9 +246,14 @@ fn lo(req: u64, arg: usize, mut r: [u8; IFREQ]) -> R {
         }
         SIOCGIFMTU => r[16..20].copy_from_slice(&65536i32.to_le_bytes()),
         SIOCGIFINDEX => r[16..20].copy_from_slice(&crate::netlink::LO_INDEX.to_le_bytes()),
+        SIOCGIFTXQLEN => r[16..20].copy_from_slice(&1000i32.to_le_bytes()),
         SIOCSIFADDR | SIOCSIFNETMASK => {
             root()?;
             return Err(crate::why::inval());
+        }
+        SIOCSIFFLAGS => {
+            root()?;
+            return same_flags(&r);
         }
         _ => return Err(-ENOTTY),
     }
@@ -227,12 +261,71 @@ fn lo(req: u64, arg: usize, mut r: [u8; IFREQ]) -> R {
     Ok(0)
 }
 
-/// /proc/net/route (Linux と同じ形。アドレスは 16 進で、メモリの並びのまま)
+/// はじめの NET の口の SIOCSIFFLAGS: UP のままならよい、DOWN にはできない (aios の口はいつも UP)
+fn same_flags(r: &[u8; IFREQ]) -> R {
+    let f = u16::from_le_bytes([r[16], r[17]]);
+    if f & IFF_UP != 0 { Ok(0) } else { Err(-EOPNOTSUPP) }
+}
+
+/// 分けた NET の中の ioctl: 口は lo だけ (ほかは ENODEV)。番地 (127.0.0.1/8) は一度 UP にしてから、SIOCSIFFLAGS で
+/// UP / DOWN、SIOCGIFCONF は番地のある口 (lo)、道は変えられない
+fn netns(req: u64, arg: usize, st: crate::ns::Lo) -> R {
+    if req == SIOCGIFCONF {
+        let mut c = [0u8; 16];
+        copy_in(&mut c, arg)?;
+        let len = i32::from_le_bytes(c[0..4].try_into().unwrap()) as usize;
+        let buf = u64::from_le_bytes(c[8..16].try_into().unwrap()) as usize;
+        let mut n = 0;
+        if st.has_v4() {
+            if buf != 0 && len >= IFREQ {
+                let mut r = [0u8; IFREQ];
+                r[..2].copy_from_slice(b"lo");
+                r[16..32].copy_from_slice(&sockaddr(Ipv4Address::new(127, 0, 0, 1)));
+                copy_out(buf, &r)?;
+                n = IFREQ;
+            } else if buf == 0 {
+                n = IFREQ;
+            }
+        }
+        copy_out(arg, &(n as i32).to_le_bytes())?;
+        return Ok(0);
+    }
+    if req == SIOCADDRT || req == SIOCDELRT {
+        return Err(if crate::ns::net_admin() { -EOPNOTSUPP } else { -EPERM });
+    }
+    if !handles(req) {
+        return Err(-ENOTTY);
+    }
+    let mut r = [0u8; IFREQ];
+    copy_in(&mut r, arg)?;
+    let name_len = r[..16].iter().position(|&b| b == 0).unwrap_or(16);
+    if &r[..name_len] != b"lo" {
+        return Err(-ENODEV);
+    }
+    match req {
+        SIOCGIFFLAGS => {
+            let f: u16 = if st == crate::ns::Lo::Up { crate::netlink::LO_FLAGS } else { 0x8 };
+            r[16..18].copy_from_slice(&f.to_le_bytes());
+            copy_out(arg, &r)?;
+            Ok(0)
+        }
+        SIOCSIFFLAGS => {
+            let f = u16::from_le_bytes([r[16], r[17]]);
+            crate::ns::set_lo(f & IFF_UP != 0)?;
+            Ok(0)
+        }
+        SIOCGIFADDR | SIOCGIFNETMASK | SIOCGIFBRDADDR if !st.has_v4() => Err(-EADDRNOTAVAIL),
+        SIOCSIFADDR | SIOCSIFNETMASK => Err(if crate::ns::net_admin() { -EOPNOTSUPP } else { -EPERM }),
+        _ => lo(req, arg, r),
+    }
+}
+
+/// /proc/net/route (Linux と同じ形。アドレスは 16 進で、メモリの並びのまま)。分けた NET の中は見出しだけ (main の表は空)
 pub fn proc_route() -> alloc::string::String {
     use alloc::format;
     let hex = |a: Ipv4Address| format!("{:08X}", u32::from_le_bytes(a.octets()));
     let mut s = alloc::string::String::from("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
-    if let Some(c) = net::cidr() {
+    if let Some(c) = net::cidr().filter(|_| crate::ns::net().is_none()) {
         if let Some(g) = net::gateway() {
             s += &format!("{}\t{}\t{}\t0003\t0\t0\t0\t{}\t0\t0\t0\n", net::IFNAME, hex(Ipv4Address::UNSPECIFIED), hex(g), hex(Ipv4Address::UNSPECIFIED));
         }

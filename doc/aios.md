@@ -325,7 +325,8 @@ sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release
 
 - 読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、`/tmp`、`/dev` と `-w` の下だけ
 - `-W PATH` は `-w` と同じだが、なければだまって飛ばす (`~/.cargo` のように入れたら使うもの。`-w` はなければ知らせる)
-- `--no-net` で TCP はどこへもつなげない。`-n PORT` でその口だけ
+- `--no-net` で NET の namespace を分ける: 中には lo だけ (aibox が UP にする) で、中どうしの 127.0.0.1 はつながり、外へは
+  TCP も UDP もとどかない。`-n PORT` は NET を分けずに、landlock で TCP をその口だけに
 - 子にも引き継がれ、外せない。中で aibox を重ねると、もっと狭くなるだけ。`sudo` (setuid) は効かない
 - かかっているかは `/proc/self/status` の `NoNewPrivs` と `Landlock` (層の数)
 
@@ -400,7 +401,7 @@ ap image pull NAME... / ap image ls / ap image rm NAME...                       
 - 動かしかた: ユーザーの namespace で外の自分を image の User (の uid と gid。名前は image の /etc/passwd と group) に、
   マウントの namespace で根を自分の上に bind して読むだけに、/tmp は空の tmpfs、/dev は空の tmpfs に外の null zero full
   random urandom tty をファイルの bind で、/etc/hosts と /etc/resolv.conf は外のもの、家 (/etc/passwd の) が空のディレクトリ
-  なら tmpfs、`-b HOST:PATH[:ro]`。PID と UTS (ホスト名は image の名前)、`--no-net` なら NET も分けて、中の 1 番に /proc を
+  なら tmpfs、`-b HOST:PATH[:ro]`。PID と UTS (ホスト名は image の名前)、`--no-net` なら NET も分けて (lo だけ)、中の 1 番に /proc を
   マウントし、chroot、WorkingDir へ。書けるのは /tmp、/dev、家、`-b` (:ro でないもの) だけ (landlock。読むだけの根は
   EROFS)。seccomp はいつもの (aibox の DEFAULT_DENY) に chroot も (chroot だけの container なので、中で chroot できると
   外の / へ出られる)。環境は image の Env と PATH・HOME・HOSTNAME・TERM、`-e K=V` (`-e K` は外の値)。`-u USER[:GROUP]`、
@@ -415,8 +416,23 @@ ap image pull NAME... / ap image ls / ap image rm NAME...                       
   (ネットワークしだい)、2 回めからは `node -e 0` まで 0.6〜0.8 秒、Alpine の `true` は 0.01 秒。node は nonroot (65532) の
   中の pid 1、/proc には自分だけ、/etc に書くと EROFS。Alpine 3.22 (public.ecr.aws) の busybox の sh、ps、id も動き、
   `exit 7` は 7、SIGTERM は 143
-- まだ: `--no-net` の NET の namespace でも、netlink と ioctl と /proc/net には eth0 が見える (つながりは切れている。
-  todo の netns-view)、overlay がないので根は読むだけ (書くのは /tmp、家、-b)
+- まだ: overlay がないので根は読むだけ (書くのは /tmp、家、-b)
+
+### 分けた NET の中から見えるもの (2026-11-12)
+
+Linux の新しい netns と同じに: 口は lo だけで、はじめは DOWN (`flags 0x8`、operstate DOWN、qdisc noop、番地も道も近所も
+ない)。127.0.0.1 へは ENETUNREACH、bind は EADDRNOTAVAIL、[::1] は EADDRNOTAVAIL。SIOCSIFFLAGS か RTM_NEWLINK (ip link
+set lo up) で UP にすると 127.0.0.1/8 と ::1/128、local の表の道 (127.0.0.0/8、127.0.0.1、broadcast) と ::1/128 ができる。
+DOWN にもどすと ::1 と broadcast は消え、127.0.0.1/8 と local の道は残る (inetdev は番地を消さない)。見えるのは netlink
+(RTM_GETLINK・GETADDR・GETROUTE・GETNEIGH・GETMULTICAST、ip route get)、getifaddrs と if_nameindex、ioctl (SIOCGIFCONF、
+FLAGS、ADDR、INDEX、NAME、TXQLEN)、/proc/net (dev、route、if_inet6、ipv6_route は木の根の null の道も、arp は見出しだけ)。
+はじめの NET の知らせ (口・番地・道の変わり) は、ほかの NET の netlink のソケットには送らない。変えてよいのは、その NET を
+作れた人 (ユーザーの namespace の中か no_new_privs: Linux の ns_capable(CAP_NET_ADMIN))。中で変えられるのは lo の
+UP / DOWN だけ (番地や道を足すのは EOPNOTSUPP: aios の番地と道の表はまだ 1 つ)。`test/ldiff.sh netnsview` が Linux 7.4 と
+111 行まるごと同じ (手本の Linux の sit0 は見ない)。aibox の `--no-net` は lo を UP にしてから CMD を動かす。
+
+あわせて足したもの (はじめの NET でも): SIOCGIFTXQLEN (lo も eth0 も 1000)、SIOCSIFFLAGS (root。UP のままならよく、DOWN には
+できない: EOPNOTSUPP)、RTM_NEWLINK (同じ)、/proc/net/arp (IPv4 の近所。flags は ATF_COM と ATF_PERM)
 
 つぎは npm のある node、atproto や gitea のような本物のサービスの image、x86_64。
 

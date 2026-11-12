@@ -1,8 +1,8 @@
 // aibox: コマンドを砂場 (landlock と seccomp) の中で動かす
 //   aibox [-w PATH]... [-W PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...
 //   読む・動かすのはどこでも。書く (作る・消す・名前を変える) のは、いまのディレクトリ、/tmp、/dev と -w の下だけ。
-//   --no-net でネットワークを分ける (NET の namespace: 中どうしの 127.0.0.1 の TCP のほかは、TCP も UDP も
-//   どこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
+//   --no-net でネットワークを分ける (NET の namespace: 中には lo だけ。aibox が UP にする。中どうしの 127.0.0.1 の
+//   ほかは、TCP も UDP もどこへもとどかない)。-n PORT でその口だけつなげる (TCP だけ。--no-net がなくても、-n があればそれだけ)。
 //   ホスト名も分ける (UTS の namespace。中で変えても外には見えない)。プロセスの番号も分ける (PID の namespace:
 //   CMD は中の 1 番で、外のプロセスは見えず kill もできない。aibox は外で待って、CMD の終わりかたで終わる)。
 //   --tmp で /tmp を自分だけのもの (空の tmpfs) にする (マウントの namespace。外の /tmp は見えず、中で作ったものは
@@ -46,6 +46,26 @@ fn enter_userns() -> std::io::Result<()> {
     std::fs::write("/proc/self/setgroups", "deny")?;
     std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid))?;
     Ok(())
+}
+
+/// 分けた NET の lo を UP に (新しい NET の lo ははじめ DOWN: Linux と同じ。中どうしの 127.0.0.1 のため。ip link set lo up)
+fn lo_up() {
+    unsafe {
+        let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if s < 0 {
+            return;
+        }
+        let mut q: libc::ifreq = std::mem::zeroed();
+        q.ifr_name[0] = b'l' as libc::c_char;
+        q.ifr_name[1] = b'o' as libc::c_char;
+        if libc::ioctl(s, libc::SIOCGIFFLAGS as _, &mut q) == 0 {
+            q.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            if libc::ioctl(s, libc::SIOCSIFFLAGS as _, &q) != 0 {
+                eprintln!("aibox: lo up: {}", std::io::Error::last_os_error());
+            }
+        }
+        libc::close(s);
+    }
 }
 
 fn usage() -> ! {
@@ -177,7 +197,9 @@ fn main() {
             std::process::exit(1);
         }
     }
-    match landlock::restrict(&write, ports.as_deref()) {
+    // --no-net (ポートなし) は NET の namespace で分けるだけ (中は lo だけなので外へはとどかない)。landlock の TCP は
+    // -n PORT のときだけ (でないと中どうしの 127.0.0.1 の bind も connect も止まる)
+    match landlock::restrict(&write, ports.as_deref().filter(|p| !p.is_empty())) {
         Ok(missing) => {
             for m in missing.iter().filter(|m| !quiet.contains(m)) {
                 eprintln!("aibox: {}: not found (not writable)", m);
@@ -204,6 +226,9 @@ fn main() {
     if unsafe { libc::unshare(ns) } != 0 {
         eprintln!("aibox: unshare: {}", std::io::Error::last_os_error());
         std::process::exit(1);
+    }
+    if ns & libc::CLONE_NEWNET != 0 {
+        lo_up();
     }
     // システムコールをしぼる (landlock が no_new_privs をつけたあとで)
     if let Err(e) = seccomp::restrict(&deny, &kill) {
@@ -490,6 +515,9 @@ fn run_image(o: &Image, args: &[String], ports: Option<&[u16]>, deny: &[u32], ki
     if unsafe { libc::unshare(ns) } != 0 {
         fail(format!("unshare: {}", std::io::Error::last_os_error()));
     }
+    if ns & libc::CLONE_NEWNET != 0 {
+        lo_up();
+    }
     unsafe { libc::sethostname(host.as_ptr().cast(), host.len()) };
     let child = unsafe { libc::fork() };
     if child < 0 {
@@ -507,7 +535,7 @@ fn run_image(o: &Image, args: &[String], ports: Option<&[u16]>, deny: &[u32], ki
         if unsafe { libc::chdir(w.as_ptr()) } != 0 {
             fail(format!("{}: {}", workdir, std::io::Error::last_os_error()));
         }
-        match landlock::restrict(&write, ports) {
+        match landlock::restrict(&write, ports.filter(|p| !p.is_empty())) {
             Ok(missing) => {
                 if verbose {
                     eprintln!("aibox: write {}", write.iter().filter(|w| !missing.contains(w)).cloned().collect::<Vec<_>>().join(" "));

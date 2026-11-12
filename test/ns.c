@@ -12,7 +12,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dirent.h>
@@ -55,18 +57,23 @@ static struct sockaddr_in in4(const char *ip, int port) { struct sockaddr_in a; 
 static int tcp_listen(const char *ip, int port) { int s = socket(AF_INET, SOCK_STREAM, 0); struct sockaddr_in a = in4(ip, port); int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); if (bind(s, (void *)&a, sizeof a) || listen(s, 4)) return -1; return s; }
 static int tcp_connect(const char *ip, int port) { int s = socket(AF_INET, SOCK_STREAM, 0); struct sockaddr_in a = in4(ip, port); return connect(s, (void *)&a, sizeof a) ? -errno : s; }
 static int enter_net(void) { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); return unshare(CLONE_NEWNET); }
+/* 新しい NET の lo ははじめ DOWN (Linux と同じ)。ip link set lo up のかわり */
+static int lo_up(void) {
+  int s = socket(AF_INET, SOCK_DGRAM, 0); struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo");
+  int r = ioctl(s, SIOCGIFFLAGS, &q) || (q.ifr_flags |= IFF_UP, ioctl(s, SIOCSIFFLAGS, &q)); close(s); return r;
+}
 
 static int net_noprivs(void) { return getuid() != 0 && unshare(CLONE_NEWNET) == -1 && errno == EPERM ? 0 : 1; }
 /* 外で 127.0.0.1:7301 を待つ。中からはつながらない */
 static int net_no_outside_lo(void) {
   int l = tcp_listen("127.0.0.1", 7301); if (l < 0) return 2;
-  if (enter_net()) return 3;
+  if (enter_net() || lo_up()) return 3;
   int r = tcp_connect("127.0.0.1", 7301);
   return r == -ECONNREFUSED ? 0 : 4;
 }
 /* 中どうしはつながる。名前は AF_INET の 127.0.0.1 */
 static int net_inside(void) {
-  if (enter_net()) return 2;
+  if (enter_net() || lo_up()) return 2;
   int l = tcp_listen("127.0.0.1", 7302); if (l < 0) return 3;
   /* 外にも同じポートがあっても、中では別 (EADDRINUSE にならない) */
   pid_t p = fork();
@@ -93,7 +100,7 @@ static int net_no_eth(void) {
 static int net_inside_udp(void) {
   int out = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in o = in4("127.0.0.1", 7304);
   if (bind(out, (void *)&o, sizeof o)) return 2;
-  if (enter_net()) return 3;
+  if (enter_net() || lo_up()) return 3;
   int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
   struct sockaddr_in in = in4("127.0.0.1", 7304);
   if (bind(a, (void *)&in, sizeof in)) return 4;
@@ -115,6 +122,16 @@ static int net_abstract(void) {
   if (enter_net()) return 3;
   int c = socket(AF_UNIX, SOCK_STREAM, 0);
   return connect(c, (void *)&a, len) == -1 ? 0 : 4;
+}
+/* lo ははじめ DOWN: 127.0.0.1 へは ENETUNREACH、bind は EADDRNOTAVAIL。UP にするとつながる (Linux と同じ) */
+static int net_lo_down(void) {
+  if (enter_net()) return 2;
+  if (tcp_connect("127.0.0.1", 7305) != -ENETUNREACH) return 3;
+  int s = socket(AF_INET, SOCK_STREAM, 0); struct sockaddr_in a = in4("127.0.0.1", 7305);
+  if (bind(s, (void *)&a, sizeof a) != -1 || errno != EADDRNOTAVAIL) return 4;
+  if (lo_up()) return 5;
+  if (bind(s, (void *)&a, sizeof a)) return 6;
+  return tcp_connect("127.0.0.1", 7306) == -ECONNREFUSED ? 0 : 7;
 }
 static int net_link(void) { char before[64], after[64]; link_of("/proc/self/ns/net", before); if (enter_net()) return 2; link_of("/proc/self/ns/net", after); return strcmp(before, after) && !strncmp(after, "net:[", 5) ? 0 : 3; }
 
@@ -182,6 +199,7 @@ int main(void) {
   CHECK("net-inside-udp", child(net_inside_udp) == 0);
   CHECK("net-abstract-unix", child(net_abstract) == 0);
   CHECK("net-ns-link", child(net_link) == 0);
+  CHECK("net-lo-starts-down", child(net_lo_down) == 0);
   CHECK("pid-needs-no-new-privs", child(pid_noprivs) == 0);
   CHECK("pid-first-child-is-1", child(pid_first) == 0);
   CHECK("pid-clone", child(pid_clone) == 0);

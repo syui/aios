@@ -1,8 +1,9 @@
 // namespace: プロセスから見える世界を分ける (Linux と同じ CLONE_NEW* と unshare)
 //   UTS  ホスト名 (uname の nodename、sethostname)
-//   NET  ネットワーク: 中から見えるのは自分の 127.0.0.1 だけ。TCP は中どうしでだけつながる (unix.rs の inet:
-//        smoltcp はひとつなので、中の TCP は unix ソケットのしくみで「namespace の番号とポート」の名前につなぐ)。
-//        UDP と ICMP はどこへも送れない (ENETUNREACH)。抽象名前空間の unix ソケット (@...) も分かれる (Linux と同じ)
+//   NET  ネットワーク: 中にあるのは lo だけ (Linux の新しい netns と同じ)。lo ははじめ DOWN で番地も道もなく
+//        (127.0.0.1 へは ENETUNREACH、bind は EADDRNOTAVAIL)、SIOCSIFFLAGS か RTM_NEWLINK で UP にすると 127.0.0.1/8 と
+//        ::1 ができる (DOWN にもどすと ::1 は消え、127.0.0.1 は残る)。netlink、ioctl、/proc/net に見えるのもそれだけ。
+//        TCP と UDP は中どうしでだけ。外へはどこへも送れない (ENETUNREACH)。抽象名前空間の unix ソケット (@...) も分かれる
 //   PID  プロセスの番号: 中では 1 から数え、中のプロセスだけが見える (getpid、kill、wait、/proc ...)。
 //        unshare(CLONE_NEWPID) はそのあとに作る子から (Linux と同じ)。中の 1 番が終わると中のみなが終わる。
 //        入れ子 (中でさらに作る) はできない (EINVAL)。外 (はじめの namespace) からは、みな本当の番号で見える
@@ -44,9 +45,68 @@ pub struct Uts {
     pub name: RefCell<([u8; 64], usize)>,
 }
 
-/// NET: 番号だけ (中のソケットは番号で分ける)
+/// NET: 番号 (中のソケットは番号で分ける) と lo の様子 (lo_state)
 pub struct Net {
     pub id: u64,
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        LO.get().remove(&self.id);
+    }
+}
+
+/// 分けた NET の lo: New ははじめ (DOWN、番地なし)、Up、Down は UP のあと DOWN (127.0.0.1/8 と local の道は残る)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lo {
+    New,
+    Up,
+    Down,
+}
+
+impl Lo {
+    /// 127.0.0.1/8 があるか (Linux の inetdev は DOWN にしても番地を消さない)
+    pub fn has_v4(self) -> bool {
+        self != Lo::New
+    }
+}
+
+static LO: Bkl<alloc::collections::BTreeMap<u64, Lo>> = Bkl::new(alloc::collections::BTreeMap::new());
+
+/// NET の番号 netns (0 ははじめのもの: lo はいつも UP) の lo の様子
+pub fn lo_state(netns: u64) -> Lo {
+    if netns == 0 { Lo::Up } else { LO.get().get(&netns).copied().unwrap_or(Lo::New) }
+}
+
+/// いまのプロセスが分けた NET の中なら、その lo の様子
+pub fn net_lo() -> Option<Lo> {
+    net().map(lo_state)
+}
+
+/// 分けた NET の中の口を変えてよいか (Linux の ns_capable(net->user_ns, CAP_NET_ADMIN)。aios は、その NET を作れた人:
+/// ユーザーの namespace の中か no_new_privs。LSM は聞く)。はじめの NET は root (CAP_NET_ADMIN)
+pub fn net_admin() -> bool {
+    let c = &crate::proc::current().cred;
+    match &c.ns.net {
+        Some(_) => (c.ns.user.is_some() || c.no_new_privs) && crate::security::capable(c, crate::cred::CAP_NET_ADMIN, true),
+        None => c.capable(crate::cred::CAP_NET_ADMIN),
+    }
+}
+
+/// いまのプロセスの NET の lo を UP / DOWN に (分けた NET の中だけ。はじめの NET の lo は変えられない)
+pub fn set_lo(up: bool) -> Result<(), i64> {
+    let id = net().ok_or(-95)?; // EOPNOTSUPP
+    if !net_admin() {
+        return Err(-EPERM);
+    }
+    let now = lo_state(id);
+    let next = match (up, now) {
+        (true, _) => Lo::Up,
+        (false, Lo::New) => Lo::New,
+        (false, _) => Lo::Down,
+    };
+    LO.get().insert(id, next);
+    Ok(())
 }
 
 /// PID: 中の番号を配る

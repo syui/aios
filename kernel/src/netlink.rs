@@ -157,6 +157,9 @@ pub struct Netlink {
     ino: usize,
     /// 受ける行列が変わった数 (poll の覚え)
     generation: u64,
+    /// 作ったときの NET (0 ははじめのもの)。カーネルからの組への知らせ (口・番地・道の変わり、conntrack) は、はじめの
+    /// NET のことなので、ほかの NET のソケットには送らない (Linux の netlink は NET ごと)
+    net: u64,
 }
 
 pub type NetlinkRef = Rc<RefCell<Netlink>>;
@@ -183,6 +186,7 @@ pub fn create(typ: u64, protocol: u64) -> Result<NetlinkRef, i64> {
         let mut s = n.borrow_mut();
         (s.protocol, s.typ, s.rcvbuf, s.sndbuf) = (protocol, typ, BUF_DEFAULT, BUF_DEFAULT);
         s.ino = Rc::as_ptr(&n) as usize & 0xffffff;
+        s.net = crate::ns::net().unwrap_or(0);
     }
     Ok(n)
 }
@@ -383,7 +387,7 @@ pub fn notify(group: u32, msg: Vec<u8>) {
 /// 組 group に入っているソケットがあるか (nfnetlink_has_listeners)
 pub fn has_listeners(protocol: u32, group: u32) -> bool {
     let bit = 1u64 << (group - 1);
-    ports().iter().filter(|(k, _)| k.0 == protocol).filter_map(|(_, w)| w.upgrade()).any(|n| n.borrow().groups & bit != 0)
+    ports().iter().filter(|(k, _)| k.0 == protocol).filter_map(|(_, w)| w.upgrade()).any(|n| n.borrow().groups & bit != 0 && n.borrow().net == 0)
 }
 
 /// notify のほかの protocol のもの (NETLINK_NETFILTER の ctnetlink の知らせ)
@@ -393,7 +397,7 @@ pub fn notify_proto(protocol: u32, group: u32, msg: Vec<u8>) {
         .iter()
         .filter(|(k, _)| k.0 == protocol)
         .filter_map(|(_, w)| w.upgrade())
-        .filter(|n| n.borrow().groups & bit != 0)
+        .filter(|n| n.borrow().groups & bit != 0 && n.borrow().net == 0)
         .collect();
     for n in members {
         deliver(&n, 0, if group <= 32 { bit as u32 } else { 0 }, msg.clone());
@@ -729,8 +733,13 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         return 0;
     }
     let kind = (typ - RTM_BASE) & 3;
-    if kind != 2 && !proc::current().cred.capable(crate::cred::CAP_NET_ADMIN) {
+    // 変えるものは CAP_NET_ADMIN (分けた NET の中は、それを作れた人: ns::net_admin)
+    if kind != 2 && !crate::ns::net_admin() {
         return -EPERM;
+    }
+    // 分けた NET の中で変えられるのは lo の UP / DOWN だけ (番地や道は、aios ではまだ NET ごとにない)
+    if kind != 2 && typ != RTM_NEWLINK && crate::ns::net().is_some() {
+        return -EOPNOTSUPP;
     }
     let seq = u32::from_le_bytes(msg[8..12].try_into().unwrap());
     let family = body[0];
@@ -738,7 +747,7 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         (RTM_GETLINK, true) => {
             let mut d = Vec::new();
             if family != AF_BRIDGE {
-                for l in links() {
+                for l in view_links() {
                     put_link(&mut d, &l, NLM_F_MULTI, seq, me);
                 }
             }
@@ -755,7 +764,7 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
             if index <= 0 && name.is_none() {
                 return crate::why::inval();
             }
-            let Some(l) = links().into_iter().find(|l| if index > 0 { l.index == index } else { Some(l.name) == name.as_deref() }) else { return -ENODEV };
+            let Some(l) = view_links().into_iter().find(|l| if index > 0 { l.index == index } else { Some(l.name) == name.as_deref() }) else { return -ENODEV };
             let mut d = Vec::new();
             put_link(&mut d, &l, 0, seq, me);
             out.push(d);
@@ -764,12 +773,12 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         (RTM_GETADDR, true) => {
             let mut d = Vec::new();
             if family != AF_INET6 {
-                for a in addrs() {
+                for a in view_addrs() {
                     put_addr(&mut d, &a, NLM_F_MULTI, seq, me);
                 }
             }
             if family != AF_INET {
-                for a in addrs6() {
+                for a in view_addrs6() {
                     put_addr6(&mut d, &a, RTM_NEWADDR, NLM_F_MULTI, seq, me);
                 }
             }
@@ -787,6 +796,8 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
             dump_routes(body, strict, family == AF_INET6, seq, me, out);
             0
         }
+        // 分けた NET の中の ip route get: lo が UP で 127.0.0.0/8 か ::1 のときだけ道がある
+        (RTM_GETROUTE, false) if crate::ns::net().is_some() && !netns_route_ok(body, family) => -ENETUNREACH,
         (RTM_GETROUTE, false) if family == AF_INET6 => get_route6(body, seq, me, out),
         (RTM_GETROUTE, false) if family == AF_INET => get_route(body, strict, seq, me, out),
         (RTM_NEWROUTE | RTM_DELROUTE, _) if family == AF_INET => change_route(body, typ == RTM_NEWROUTE, nlflags, seq, me),
@@ -795,12 +806,19 @@ fn route_msg(msg: &[u8], typ: u16, dump: bool, nlflags: u16, me: u32, strict: bo
         (RTM_NEWADDR, _) if family == AF_INET => new_addr4(body, nlflags, seq, me),
         (RTM_DELADDR, _) if family == AF_INET => del_addr4(body, seq, me),
         (RTM_DELADDR, _) if family == AF_INET6 => del_addr6(body),
+        // 分けた NET の中には近所 (ARP、NDP) がない
+        (RTM_GETNEIGH, true) if crate::ns::net().is_some() => {
+            done(out, Vec::new(), seq, me);
+            0
+        }
+        (RTM_GETNEIGH, false) if crate::ns::net().is_some() => -ENOENT,
         (RTM_GETNEIGH, true) => {
             dump_neigh(body, family, strict, seq, me, out);
             0
         }
         (RTM_GETNEIGH, false) => get_neigh(body, seq, me, out),
         (RTM_GETMULTICAST, true) if matches!(family, AF_INET | AF_INET6 | AF_PACKET) => dump_mcast(body, family, strict, seq, me, out),
+        (RTM_NEWLINK, _) => new_link(body),
         _ => -EOPNOTSUPP,
     }
 }
@@ -858,6 +876,8 @@ pub const LO_FLAGS: u16 = 0x49;
 pub const ETH_FLAGS: u16 = 0x1043;
 /// IFF_LOWER_UP (netlink の ifi_flags だけ)
 const IFF_LOWER_UP: u32 = 0x10000;
+const IFF_UP: u32 = 0x1;
+const IFF_LOOPBACK: u32 = 0x8;
 
 /// 口の並び: lo と、ネットワークの装置があれば eth0
 pub fn links() -> Vec<Link> {
@@ -866,6 +886,111 @@ pub fn links() -> Vec<Link> {
         v.push(Link { index: ETH_INDEX, name: crate::net::IFNAME, typ: 1, flags: ETH_FLAGS as u32 | IFF_LOWER_UP, mtu: 1500, addr: crate::net::mac().unwrap_or_default(), brd: [0xff; 6], stats: crate::net::stats(false) });
     }
     v
+}
+
+/// いまのプロセスから見える口 (Linux の dev_net)。分けた NET の中は、その NET の lo だけ: はじめは DOWN
+/// (IFF_LOOPBACK だけ)、UP にしたら LO_FLAGS。数は 0 から (aios の lo の数は NET ごとにない)
+pub fn view_links() -> Vec<Link> {
+    match crate::ns::net_lo() {
+        None => links(),
+        Some(st) => {
+            let flags = if st == crate::ns::Lo::Up { LO_FLAGS as u32 | IFF_LOWER_UP } else { IFF_LOOPBACK };
+            alloc::vec![Link { index: LO_INDEX, name: "lo", typ: 772, flags, mtu: 65536, addr: [0; 6], brd: [0; 6], stats: [0; 4] }]
+        }
+    }
+}
+
+/// いまのプロセスから見える IPv4 の番地。分けた NET の中は、lo を一度 UP にしたあとの 127.0.0.1/8 だけ (Linux の
+/// inetdev は DOWN にしても番地を消さない)
+pub fn view_addrs() -> Vec<Addr> {
+    match crate::ns::net_lo() {
+        None => addrs(),
+        Some(st) if st.has_v4() => addrs().into_iter().filter(|a| a.index == LO_INDEX && a.addr == [127, 0, 0, 1]).take(1).collect(),
+        Some(_) => Vec::new(),
+    }
+}
+
+/// いまのプロセスから見える IPv6 の番地。分けた NET の中は、lo が UP のときの ::1 だけ (DOWN で消える: addrconf_ifdown)
+pub fn view_addrs6() -> Vec<Addr6> {
+    match crate::ns::net_lo() {
+        None => addrs6(),
+        Some(crate::ns::Lo::Up) => addrs6().into_iter().filter(|a| a.index == LO_INDEX && a.addr == 1).take(1).collect(),
+        Some(_) => Vec::new(),
+    }
+}
+
+/// いまのプロセスから見える IPv4 の道。分けた NET の中は、lo の番地の local の道 (と UP なら broadcast) だけ
+fn view_routes() -> Vec<Route> {
+    let Some(st) = crate::ns::net_lo() else { return routes() };
+    let a = view_addrs();
+    let mut v: Vec<Route> = Vec::new();
+    for x in &a {
+        for r in ifa_routes(&a, x) {
+            if !v.contains(&r) && (st == crate::ns::Lo::Up || r.typ != RTN_BROADCAST) {
+                v.push(r);
+            }
+        }
+    }
+    v.sort_by_key(|r| (r.dst, 32 - r.len, 255 - r.table));
+    v
+}
+
+/// いまのプロセスから見える IPv6 の道。分けた NET の中は、lo が UP のときの ::1/128 の local の道だけ
+fn view_routes6() -> Vec<Route6> {
+    match crate::ns::net_lo() {
+        None => routes6(),
+        Some(crate::ns::Lo::Up) => routes6().into_iter().filter(|r| r.oif == LO_INDEX && r.dst == 1).collect(),
+        Some(_) => Vec::new(),
+    }
+}
+
+/// 分けた NET の中の RTM_GETROUTE (ip route get): lo が UP で、あて先が 127.0.0.0/8 か ::1 のときだけ道がある
+fn netns_route_ok(body: &[u8], family: u8) -> bool {
+    if crate::ns::net_lo() != Some(crate::ns::Lo::Up) || body.len() < 12 {
+        return false;
+    }
+    let a = attrs_of(&body[12..]);
+    match (family, a.get(&RTA_DST)) {
+        (AF_INET, Some(d)) if d.len() == 4 => d[0] == 127,
+        (AF_INET6, Some(d)) if d.len() == 16 => u128::from_be_bytes((*d).try_into().unwrap()) == 1,
+        _ => false,
+    }
+}
+
+/// RTM_NEWLINK (ip link set DEV up / down: Linux の do_setlink の flags だけ)。分けた NET の中の lo は UP / DOWN に
+/// できる。はじめの NET の口は変えられない (いまと同じなら何もせず、ちがえば EOPNOTSUPP)。名前のほかの属性
+/// (mtu など) と、ない口 (作る: NLM_F_CREATE も) は EOPNOTSUPP と ENODEV
+fn new_link(body: &[u8]) -> i64 {
+    if body.len() < 16 {
+        return crate::why::inval();
+    }
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    let flags = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let change = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let mut name = None;
+    for (&k, v) in attrs_of(&body[16..]).iter() {
+        match k {
+            IFLA_IFNAME => name = Some(String::from_utf8_lossy(v.split(|&c| c == 0).next().unwrap_or(&[])).into_owned()),
+            _ => return -EOPNOTSUPP,
+        }
+    }
+    let Some(l) = view_links().into_iter().find(|l| if index > 0 { l.index == index } else { name.as_deref() == Some(l.name) }) else { return -ENODEV };
+    // ifi_change が 0 なら ifi_flags をそのまま (rtnl_dev_combine_flags)。どちらも 0 なら変えない
+    if flags == 0 && change == 0 {
+        return 0;
+    }
+    let change = if change == 0 { u32::MAX } else { change };
+    if change & IFF_UP == 0 {
+        return 0;
+    }
+    let up = flags & IFF_UP != 0;
+    if crate::ns::net().is_some() {
+        return match crate::ns::set_lo(up) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+    if (l.flags & IFF_UP != 0) == up { 0 } else { -EOPNOTSUPP }
 }
 
 /// IPv4 の口の設定 (IFLA_INET_CONF: ipv4_devconf の 33 の値。IPV4_DEVCONF_FORWARDING から)。Linux 7.4 の lo と eth0
@@ -969,8 +1094,9 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     p.extend_from_slice(&0u32.to_le_bytes());
     attr_str(&mut p, IFLA_IFNAME, l.name);
     attr_u32(&mut p, IFLA_TXQLEN, 1000);
-    // IF_OPER_UNKNOWN (lo) と IF_OPER_UP
-    attr(&mut p, IFLA_OPERSTATE, &[if lo { 0 } else { 6 }]);
+    // IF_OPER_UNKNOWN (lo)、IF_OPER_DOWN (DOWN の lo: 分けた NET のはじめ) と IF_OPER_UP
+    let up = l.flags & IFF_UP != 0;
+    attr(&mut p, IFLA_OPERSTATE, &[if lo && up { 0 } else if lo { 2 } else { 6 }]);
     attr(&mut p, IFLA_LINKMODE, &[0]);
     // lo はほかの名前空間へ動かせない
     attr(&mut p, IFLA_NETNS_IMMUTABLE, &[lo as u8]);
@@ -1017,7 +1143,7 @@ fn put_link(out: &mut Vec<u8>, l: &Link, flags: u16, seq: u32, me: u32) {
     if !lo {
         attr(&mut p, IFLA_PERM_ADDRESS, &l.addr);
     }
-    attr_str(&mut p, IFLA_QDISC, if lo { "noqueue" } else { "pfifo_fast" });
+    attr_str(&mut p, IFLA_QDISC, if lo && up { "noqueue" } else if lo { "noop" } else { "pfifo_fast" });
     attr(&mut p, IFLA_AF_SPEC, &link_af(lo));
     // struct rtnl_link_ifmap (mem_start、mem_end、base_addr、irq、dma、port): virtio-net も 0
     attr(&mut p, IFLA_MAP, &[0u8; 32]);
@@ -1138,13 +1264,15 @@ fn dump_mcast(body: &[u8], family: u8, strict: bool, seq: u32, me: u32, out: &mu
         }
         index = i32::from_le_bytes(body[4..8].try_into().unwrap());
     }
-    let links = links();
+    let links = view_links();
     if index != 0 && !links.iter().any(|l| l.index == index) {
         return -ENODEV;
     }
+    // 分けた NET の DOWN の lo は、どの組にも入っていない (ip_mc_up は UP のとき)
+    let down = crate::ns::net_lo().is_some_and(|s| s != crate::ns::Lo::Up);
     let fl = NLM_F_MULTI | if index != 0 { NLM_F_DUMP_FILTERED } else { 0 };
     let mut d = Vec::new();
-    for l in links.iter().filter(|l| index == 0 || l.index == index) {
+    for l in links.iter().filter(|l| (index == 0 || l.index == index) && !down) {
         let eth = l.index == ETH_INDEX;
         let hdr = (family, l.index, RTM_GETMULTICAST, fl, seq, me);
         match family {
@@ -1739,7 +1867,7 @@ fn dump_routes(body: &[u8], strict: bool, v6: bool, seq: u32, me: u32, out: &mut
                     RTA_TABLE => table = u32_of(Some(v)),
                     RTA_OIF => {
                         dev = u32_of(Some(v)) as i32;
-                        if !links().iter().any(|l| l.index == dev) {
+                        if !view_links().iter().any(|l| l.index == dev) {
                             return Err(-ENODEV);
                         }
                     }
@@ -1769,7 +1897,7 @@ fn dump_routes(body: &[u8], strict: bool, v6: bool, seq: u32, me: u32, out: &mut
         };
         // IPv6 (inet6_dump_fib: IPV6_MULTIPLE_TABLES のない Linux は表が 1 つ)
         if v6 {
-            for r in routes6() {
+            for r in view_routes6() {
                 if (rtype != 0 && r.typ != rtype) || (proto != 0 && r.proto != proto) || (dev != 0 && r.oif != dev) {
                     continue;
                 }
@@ -1778,7 +1906,7 @@ fn dump_routes(body: &[u8], strict: bool, v6: bool, seq: u32, me: u32, out: &mut
             done_with(out, d, seq, me, answer, 0);
             return;
         }
-        let rs = routes();
+        let rs = view_routes();
         for &t in tables {
             for r in rs.iter().filter(|r| r.table == t) {
                 if (rtype != 0 && r.typ != rtype) || (proto != 0 && r.proto != proto) || (dev != 0 && r.oif != dev) {
@@ -3201,7 +3329,7 @@ fn get_route6(body: &[u8], seq: u32, me: u32, out: &mut Vec<Vec<u8>>) -> i64 {
 /// /proc/net/if_inet6 (if6_seq_show: 番地、口の番号、prefix の長さ、scope、flags の下の 8 ビット、名前)
 pub fn proc_if_inet6() -> alloc::string::String {
     let mut s = alloc::string::String::new();
-    for a in addrs6() {
+    for a in view_addrs6() {
         let dev = if a.index == LO_INDEX { "lo" } else { crate::net::IFNAME };
         s.push_str(&alloc::format!("{:032x} {:02x} {:02x} {:02x} {:02x} {:>8}\n", a.addr, a.index, a.prefix, crate::addrconf::scope_of(a.addr), a.flags as u8, dev));
     }
@@ -3211,9 +3339,30 @@ pub fn proc_if_inet6() -> alloc::string::String {
 /// /proc/net/ipv6_route (ipv6_route_native_seq_show: あて先、長さ、送り元、長さ、次、metric、refcnt、use、flags、口)
 pub fn proc_ipv6_route() -> alloc::string::String {
     let mut s = alloc::string::String::new();
-    for r in routes6() {
+    for r in view_routes6() {
         let dev = if r.oif == LO_INDEX { "lo" } else { crate::net::IFNAME };
         s.push_str(&alloc::format!("{:032x} {:02x} {:032x} {:02x} {:032x} {:08x} {:08x} {:08x} {:08x} {:>8}\n", r.dst, r.len, 0, 0, r.gw, r.metric, 1, 0, r.rtf, dev));
+    }
+    // 分けた NET には既定の道がないので、木の根の null の道 (ip6_null_entry: RTF_REJECT | RTF_NONEXTHOP、metric -1) が見える
+    if crate::ns::net().is_some() {
+        s.push_str(&alloc::format!("{:032x} 00 {:032x} 00 {:032x} ffffffff 00000001 00000000 00200200 {:>8}\n", 0, 0, 0, "lo"));
+    }
+    s
+}
+
+/// /proc/net/arp (arp_seq_show: IPv4 の近所。NUD_NOARP のものは出さない。flags は ATF_COM (0x2) と ATF_PERM (0x4))。
+/// 分けた NET の中は見出しだけ
+pub fn proc_arp() -> alloc::string::String {
+    let mut s = alloc::string::String::from("IP address       HW type     Flags       HW address            Mask     Device\n");
+    if crate::ns::net().is_some() {
+        return s;
+    }
+    for e in NEIGH.get().iter().filter(|e| !e.v6 && e.state & NUD_NOARP == 0) {
+        let ip = e.ip as u32;
+        let addr = alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+        let flags = if e.state & NUD_PERMANENT != 0 { 0x6 } else if e.state & NUD_VALID != 0 { 0x2 } else { 0 };
+        let mac = e.mac.iter().map(|b| alloc::format!("{:02x}", b)).collect::<Vec<_>>().join(":");
+        s.push_str(&alloc::format!("{:<16} 0x{:<10x}0x{:<10x}{:<17}     {:<8} {}\n", addr, 1, flags, mac, "*", crate::net::IFNAME));
     }
     s
 }

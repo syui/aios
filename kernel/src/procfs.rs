@@ -143,7 +143,7 @@ const ATTRS: [&str; 3] = ["current", "exec", "prev"];
 
 /// IPv6 と raw のもの: tcp6、udp6、sockstat6、if_inet6 は中身を作る (inet.rs の AF_INET6)。raw はまだ見出しだけ
 /// (なければ netstat がないと言って止まる)
-const NET_STUBS: [(&str, &str); 7] = [
+const NET_STUBS: [(&str, &str); 8] = [
     ("sockstat6", "TCP6: inuse 0\nUDP6: inuse 0\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n"),
     ("tcp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"),
     ("udp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"),
@@ -153,6 +153,8 @@ const NET_STUBS: [(&str, &str); 7] = [
     // (netlink.rs が作る)
     ("if_inet6", ""),
     ("ipv6_route", ""),
+    // IPv4 の近所 (arp_seq_show: netlink.rs が作る)
+    ("arp", ""),
 ];
 
 /// プロセス pid のスレッド tid (終わったものはなし)
@@ -368,8 +370,13 @@ impl ProcInode {
             Node::Route => crate::netif::proc_route(),
             Node::NetDev => {
                 let mut s = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+                // 分けた NET の中は lo だけ (数は 0 から: aios の lo の数は NET ごとにない)
+                let netns = crate::ns::net().is_some();
                 for (name, lo) in [("lo", true), ("eth0", false)] {
-                    let c = crate::net::stats(lo);
+                    if netns && !lo {
+                        continue;
+                    }
+                    let c = if netns { [0; 4] } else { crate::net::stats(lo) };
                     s += &format!("{:>6}: {:>8} {:>7}    0    0    0     0          0         0 {:>8} {:>7}    0    0    0     0       0          0\n", name, c[0], c[1], c[2], c[3]);
                 }
                 s
@@ -385,6 +392,7 @@ impl ProcInode {
                 "udp6" => crate::inet::proc_net6(false),
                 "if_inet6" => crate::netlink::proc_if_inet6(),
                 "ipv6_route" => crate::netlink::proc_ipv6_route(),
+                "arp" => crate::netlink::proc_arp(),
                 "sockstat6" => {
                     let c = crate::inet::counts();
                     alloc::format!("TCP6: inuse {}\nUDP6: inuse {}\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n", c.inuse6, c.udp6)

@@ -683,9 +683,10 @@ fn eth() -> u32 {
     u32::from_be_bytes(net::addr().octets())
 }
 
-/// aios の中のアドレスか (Linux の RTN_LOCAL: 127.0.0.0/8 と、分けていない NET の eth0 のアドレス)
+/// aios の中のアドレスか (Linux の RTN_LOCAL: 127.0.0.0/8 と、分けていない NET の eth0 のアドレス)。分けた NET の
+/// 127.0.0.0/8 は、lo を一度 UP にして番地ができてから
 fn is_local(a: u32, netns: u64) -> bool {
-    a >> 24 == 127 || (netns == 0 && net::is_eth_addr(a))
+    (a >> 24 == 127 && crate::ns::lo_state(netns).has_v4()) || (netns == 0 && net::is_eth_addr(a))
 }
 
 fn is_multicast(a: u32) -> bool {
@@ -704,6 +705,10 @@ fn is_broadcast(a: u32) -> bool {
 /// あて先へのみち (Linux の ip_route_output): (あて先, 送り元, aios の中か)。あて先 0.0.0.0 は自分 (送り元か
 /// 127.0.0.1)。外へ出られなければ ENETUNREACH
 fn route(netns: u64, daddr: u32, saddr: u32) -> Result<(u32, u32, bool), i64> {
+    // 分けた NET の lo が UP でなければ道がない (127.0.0.1 へも)
+    if netns != 0 && crate::ns::lo_state(netns) != crate::ns::Lo::Up {
+        return Err(-ENETUNREACH);
+    }
     if daddr == 0 {
         let d = if saddr != 0 { saddr } else { LOOPBACK };
         return Ok((d, if saddr != 0 { saddr } else { LOOPBACK }, true));
@@ -762,8 +767,11 @@ fn v6_needs_scope(a: u128) -> bool {
     a >> 118 == 0x3fa || (v6_multicast(a) && matches!((a >> 112) & 0xf, 1 | 2))
 }
 
-/// aios の中の IPv6 のアドレスか (::1 と eth0 のもの)
-fn is_local6(a: u128) -> bool {
+/// aios の中の IPv6 のアドレスか (::1 と eth0 のもの)。分けた NET は lo が UP のときの ::1 だけ
+fn is_local6(a: u128, netns: u64) -> bool {
+    if netns != 0 {
+        return a == LOOPBACK6 && crate::ns::lo_state(netns) == crate::ns::Lo::Up;
+    }
     a == LOOPBACK6 || crate::addrconf::is_mine(a)
 }
 
@@ -774,7 +782,11 @@ fn route6(netns: u64, daddr: u128, saddr: u128, scope: u32, prefs: u32) -> Resul
     if v6_needs_scope(daddr) && scope != 0 && scope != crate::netlink::ETH_INDEX as u32 {
         return Err(-ENETUNREACH);
     }
-    if daddr == LOOPBACK6 || (netns == 0 && is_local6(daddr)) {
+    // 分けた NET の lo が UP でなければ ::1 はない (送り元を選べない: Linux は EADDRNOTAVAIL)
+    if netns != 0 && daddr == LOOPBACK6 && !is_local6(daddr, netns) {
+        return Err(-EADDRNOTAVAIL);
+    }
+    if daddr == LOOPBACK6 || (netns == 0 && is_local6(daddr, netns)) {
         return Ok((daddr, if saddr != 0 { saddr } else { daddr }, true));
     }
     if netns != 0 || crate::addrconf::lookup(daddr).is_none() {
@@ -1143,7 +1155,7 @@ fn bind6(u: &InetRef, a: &[u8]) -> R {
                 return Err(-ENODEV);
             }
         }
-        if !v6_multicast(addr) && !(is_local6(addr) || freebind) {
+        if !v6_multicast(addr) && !(is_local6(addr, netns) || freebind) {
             return Err(-EADDRNOTAVAIL);
         }
         LOOPBACK4_IPV6
