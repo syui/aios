@@ -634,6 +634,17 @@ pub fn main(args: &[String]) {
             }
         }
     }
+    // install: /etc/resolv.conf は aios の OS では /proc/net/pnp (DHCP の DNS) へのリンク。container では docker や podman が
+    // ファイルとして bind する (リンクの先がないと runc が起こせない) ので、空のふつうのファイルに (Docker の init の層と
+    // 同じ。中身はじかに書く: リンクをたどると、作るマシンの /proc/net/pnp が入る)
+    if install {
+        for l in layers.iter_mut() {
+            for e in l.iter_mut().filter(|e| e.0 == "etc/resolv.conf" && matches!(e.1.kind, Kind::Link(_))) {
+                e.1 = Meta { kind: Kind::File, mode: 0o644, mtime: e.1.mtime, layer: e.1.layer };
+                e.2 = Some(String::new());
+            }
+        }
+    }
     for l in layers.iter_mut() {
         l.sort_by(|a, b| a.0.cmp(&b.0));
         l.dedup_by(|a, b| a.0 == b.0);

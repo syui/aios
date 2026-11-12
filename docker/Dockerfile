@@ -2,7 +2,7 @@
 #   docker compose -f docker/compose.yml up -d --build      → http://127.0.0.1:8080/
 # image は digest で固める (タグは動くが、digest の中身は変わらない。aios の image は同じパッケージからいつも同じ
 # digest になる)。新しくするときは digest を書きかえる: skopeo inspect docker://ghcr.io/syui/aios:latest | jq -r .Digest
-ARG AIOS=ghcr.io/syui/aios:0.0.1.r940.g4d08978@sha256:c080733fcd305fc5bd17f4a091ad76a7e901438d986622e851e880df1677f19f
+ARG AIOS=ghcr.io/syui/aios:0.0.1.r940.g4d08978@sha256:6a7211ad895a5873fa2dc096ff9b9950223a35e49d7473d41b28cb4161b2cdea
 ARG AIOS_STATIC=ghcr.io/syui/aios-static:20261105@sha256:36dff69a6dcc7564ba5e968d913c39d887a0c0ccd26a00a141a02e56c36fc861
 
 FROM ${AIOS} AS builder
