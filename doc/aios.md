@@ -331,6 +331,60 @@ sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release
 
 Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cache -W ~/.cargo -w /proc/ai/ctl -- aish --mcp` で起きる (`/proc/ai/ctl` は下の調べもののスイッチ)。アイの記憶 (aigpt、`ap -S aigpt`) は `aibox -W ~/.cache -W ~/.config/ai.syui.log -- aigpt server` (書くのは記憶と feed の既読だけ。managed-mcp.json があると `aigpt setup` の `claude mcp add` は効かないので、ここに置く)。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
 
+## container image (ap image)
+
+Google の distroless と同じ考えで、動かすものと、それが使うものだけの image を作る。ちがいは、Debian の .deb からではなく
+aios のパッケージから切り出すこと (`ap image`、user/src/lib/oci.rs)。image は「aios のパッケージの一部」なので、OS と同じ版・同じ CVE の見はりのまま
+(`ap -Syu` で新しくなったものが、次の image に入る)。
+
+```sh
+ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアーカイブ (docker load、skopeo)、ほかはそのディレクトリ
+```
+
+- DEF (image/*.json): `name`、`description`、`packages` (依存もたどる)、`files` (要るもの)、`config` (OCI の config:
+  Entrypoint、User、Env など)。files がディレクトリならその下ぜんぶ
+- ELF をたどる: files の ELF の PT_INTERP (/lib/ld-musl-aarch64.so.1)、DT_NEEDED を RPATH・RUNPATH ($ORIGIN)、
+  /etc/ld-musl-aarch64.path、/lib:/usr/local/lib:/usr/lib の順にさがして入れる (musl の libc・libpthread・libm などの名前は
+  ld-musl 自身なのでさがさない)。シンボリックリンクはたどった先と両方。見つからなければ止まる
+- 層: はじめに base (/etc/passwd と group の root・nobody・nonroot (65532)、os-release の ID=aios、/tmp 1777、
+  /home/nonroot 700、/root 700、/lib → usr/lib)、つぎにパッケージごとに 1 層 (依存が先)。使ったパッケージのライセンス
+  (/usr/share/licenses/NAME) も入る。層は image のあいだで同じものになる (base と ca-certificates は 3 つとも、musl と
+  libunwind は cc と node で)。ディレクトリの持ち主と mode ははじめに入れたパッケージのもの (setuid と setgid は落とす)
+- 同じものから同じ digest: 時刻はパッケージの BUILDDATE の新しいもの (base は 0)、持ち主は 0 (nonroot の家だけ 65532)、
+  名前の順、gzip の時刻は 0。docker も root も要らない。x86_64 の Linux で作ったものと aios の中で作ったものは 1 バイトも
+  ちがわない (2026-11-12、aios-node.tar の sha256 が同じ)
+- 注: manifest の annotations に `ai.syui.aios.packages` (入れたパッケージと版)、層には `ai.syui.aios.package`、config の
+  Labels と annotations に org.opencontainers.image.* (source は github.com/syui/aios: ghcr.io がリポジトリにつなぐ)
+- パッケージは `$XDG_CACHE_HOME/aipkg` (なければ ~/.cache/aipkg) に取って、/var/cache/aipkg に同じ sha256 のものがあれば
+  それを使う。同期データベースはいつも取りなおす (取れないリポジトリは知らせて飛ばす)
+- 版 (タグ) は packages の 1 つめの版 (pkgrel と epoch をのぞく)
+
+| image | 中身 | 大きさ (gzip) |
+|---|---|---|
+| aios-static | base と CA 証明書。静的なバイナリに | 116 KB |
+| aios-cc | + musl (ld-musl と libc.so)、libgcc_s。musl で動的にリンクしたものに | 597 KB |
+| aios-node | + node 26.13.1 (Entrypoint)。npm もシェルもない | 51.5 MB |
+
+CI (.github/workflows/image.yml、arm64 の Ubuntu) が、ap をビルドして image/*.json を 2 回作り (1 バイトもちがわないか)、
+docker run でためして (node の版・nonroot・https、シェルがないこと、static に静的な hello、cc に musl の hello)、
+`ghcr.io/syui/aios-static`、`aios-cc`、`aios-node` に版と latest で置く (skopeo で、digest を変えずに。同じ digest がもう
+あれば置かない)。1 日 1 回作るので、ai/repo のパッケージが新しくなれば image も新しくなる。
+
+```sh
+docker run --rm ghcr.io/syui/aios-node:26.13.1 -e 'console.log(process.version)'
+```
+
+aios の中でためすには、層を順にひろげて chroot で動かす (2026-11-12: node が nonroot で動き、https も 200):
+
+```sh
+ap image -o node.tar node.json && mkdir x root && tar xf node.tar -C x
+for d in $(LAYERS); do sudo tar xzpf x/blobs/sha256/$d -C root; done   # LAYERS は manifest の layers の digest の順
+sudo chroot --userspec=65532:65532 root /opt/c/bin/node -e 'console.log(process.version)'
+```
+
+つぎは aibox で image をそのまま動かす (層をひろげて、namespace と landlock の中で)、npm のある node、atproto や gitea の
+ような本物のサービスの image、x86_64。
+
 ## カーネルの地図 (kernel/kernel.json)
 
 カーネルのファイルと手当てを、AI が先に読んで見通せるように 3 つに分けた一覧 (1 行に 1 つ)。

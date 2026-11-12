@@ -1,0 +1,12 @@
+{
+  "name": "aios-node",
+  "description": "aios の Node.js (musl) と、node が使うもの (musl、libgcc_s、CA 証明書) だけ。シェルはない",
+  "packages": ["nodejs", "ca-certificates"],
+  "files": ["/opt/c/bin/node", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"],
+  "config": {
+    "Entrypoint": ["/opt/c/bin/node"],
+    "User": "65532:65532",
+    "WorkingDir": "/home/nonroot",
+    "Env": ["PATH=/opt/c/bin:/usr/local/bin:/usr/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"]
+  }
+}

@@ -13,6 +13,9 @@ on:
     - '**.md'
     - '.claude/**'
     - '.github/workflows/pkg.yml'
+    # container image (image.yml が作る。OS のイメージには入らない)
+    - '.github/workflows/image.yml'
+    - 'image/**'
     - 'pkg/ci.json'
     - 'pkg/c/**'
     - 'pkg/rust/uv/**'

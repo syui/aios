@@ -1,0 +1,138 @@
+# image: aios のパッケージから、distroless のような小さな container image (OCI) を作り、docker run でたしかめて
+# ghcr.io に置く (ghcr.io/syui/aios-static, aios-cc, aios-node。タグは中心のパッケージの版と latest)
+#   作りかたは ap image (user/src/lib/oci.rs)、中身は image/*.json (パッケージ、要るファイル、config)。
+#   ELF の要るもの (PT_INTERP、DT_NEEDED) をたどって、使うファイルだけを入れる。シェルもパッケージマネージャもない。
+#   docker を使わずに作るので、同じパッケージからは、いつどこで (aios の中でも) 作っても同じ digest になる
+#   動くとき: 1 日 1 回 (ai/repo のパッケージが新しくなっていれば、新しい digest)、image/ と ap image を変えた push、手で。
+#   ghcr.io にもう同じ digest があれば push しない
+name: image
+
+on:
+  schedule:
+  - cron: '41 4 * * *'
+  push:
+    branches:
+    - main
+    paths:
+    - 'image/**'
+    - 'user/src/lib/oci.rs'
+    - 'user/src/bin/aipkg.rs'
+    - 'etc/aipkg.conf'
+    - '.github/workflows/image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Image
+    # arm64 の Linux: aios (aarch64) の image をそのまま docker run できる
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          # skopeo: OCI のアーカイブを docker と ghcr.io へ (digest を変えずに)。musl-tools: aios-cc をためす musl の動的なバイナリ
+          sudo apt-get install -y --no-install-recommends build-essential curl skopeo musl-tools
+          # arm64 の Ubuntu では、ふつうの gcc が aarch64-linux-gnu-gcc (ring の C の部分に。user/.cargo/config.toml)
+          command -v aarch64-linux-gnu-gcc
+
+      - name: Install Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Build ap
+        # aios の aipkg (ap) そのもの (aarch64 の musl の静的なバイナリ。この arm64 の Linux でそのまま動く)
+        run: cd user && cargo build --release --bin aipkg
+
+      - name: Build images
+        run: |
+          ap=user/target/aarch64-unknown-linux-musl/release/aipkg
+          mkdir -p out
+          for f in image/*.json; do
+            n=$(basename "$f" .json)
+            "$ap" image --conf etc/aipkg.conf -o "out/$n.tar" "$f" | tee "out/$n.log"
+            # もう一度作って、1 バイトもちがわないか (パッケージはキャッシュから)
+            "$ap" image --conf etc/aipkg.conf -o "out/$n.again.tar" "$f" > /dev/null
+            cmp "out/$n.tar" "out/$n.again.tar"
+            rm "out/$n.again.tar"
+            # image: NAME:VER sha256:DIGEST (OUT)
+            awk '/^image: /{print $2, $3}' "out/$n.log" > "out/$n.ref"
+          done
+          ls -l out
+
+      - name: Test with docker
+        run: |
+          # OCI のアーカイブを docker のふつうの形 (docker-archive) にして docker load
+          # (skopeo の docker-daemon: は古い API の版で話すので、新しい Docker にはことわられる)
+          for f in out/*.ref; do
+            n=$(basename "$f" .ref)
+            skopeo copy -q "oci-archive:out/$n.tar" "docker-archive:out/$n.docker.tar:aios-$n:ci"
+            docker load -i "out/$n.docker.tar"
+          done
+          docker images 'aios-*'
+
+          # node: 版、nonroot (65532)、書けるところ、CA 証明書、https
+          docker run --rm aios-node:ci -e '
+            const os = require("os"), fs = require("fs"), tls = require("tls");
+            console.log(process.version, process.arch, os.userInfo().username, process.getuid(), os.homedir(), process.cwd());
+            console.log(fs.readFileSync("/etc/os-release", "utf8").split("\n")[0], "certs", tls.rootCertificates.length);
+            fs.writeFileSync("/tmp/x", "ok"); fs.writeFileSync(os.homedir() + "/x", "ok");
+            if (process.getuid() !== 65532) process.exit(1);
+            require("https").get("https://registry.npmjs.org/", r => { console.log("https", r.statusCode); process.exit(r.statusCode === 200 ? 0 : 1) })
+              .on("error", e => { console.error(e.message); process.exit(1) });'
+          # シェルはない
+          if docker run --rm --entrypoint /bin/sh aios-node:ci -c true; then echo "aios-node has a shell"; exit 1; fi
+
+          printf '#include <stdio.h>\nint main(void) { puts("hello from aios"); return 0; }\n' > out/hello.c
+          # static: 静的なバイナリ
+          gcc -static -O2 -o out/hello-static out/hello.c
+          docker run --rm -v "$PWD/out/hello-static:/hello:ro" aios-static:ci /hello
+          # cc: musl で動的にリンクしたバイナリ (/lib/ld-musl-aarch64.so.1 と libc.so)
+          musl-gcc -O2 -o out/hello-musl out/hello.c
+          readelf -l out/hello-musl | grep -o 'interpreter: [^]]*'
+          docker run --rm -v "$PWD/out/hello-musl:/hello:ro" aios-cc:ci /hello
+
+      - name: Push
+        if: github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$TOKEN" | skopeo login ghcr.io -u "$ACTOR" --password-stdin
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          for f in out/*.ref; do
+            n=$(basename "$f" .ref)
+            read -r ref digest < "$f"
+            name=${ref%%:*}
+            ver=${ref#*:}
+            for tag in "$ver" latest; do
+              dst=ghcr.io/$owner/$name:$tag
+              # いまの manifest の digest (無ければ空)
+              have=$(skopeo inspect --raw "docker://$dst" 2>/dev/null | sha256sum | cut -d' ' -f1)
+              if [ "sha256:$have" = "$digest" ]; then
+                echo "$dst: up to date ($digest)"
+              else
+                skopeo copy --preserve-digests "oci-archive:out/$n.tar" "docker://$dst"
+              fi
+            done
+            echo "- \`ghcr.io/$owner/$name:$ver\` \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          done

@@ -1,0 +1,11 @@
+{
+  "name": "aios-cc",
+  "description": "aios-static に musl (ld-musl と libc.so) と libgcc_s。musl で動的にリンクしたバイナリに",
+  "packages": ["musl", "libunwind", "ca-certificates"],
+  "files": ["/lib/ld-musl-aarch64.so.1", "/etc/ld-musl-aarch64.path", "/opt/c/lib/libgcc_s.so.1", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"],
+  "config": {
+    "User": "65532:65532",
+    "WorkingDir": "/home/nonroot",
+    "Env": ["PATH=/usr/local/bin:/usr/bin:/opt/c/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"]
+  }
+}
