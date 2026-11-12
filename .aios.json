@@ -32,7 +32,7 @@
     "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "cell", "kalloc", "heap", "oom", "tlsf", "mem", "vm", "trap", "irq", "timer", "smp", "dtb",
               "uart", "console", "kmsg", "tty", "proc", "signal", "pidfd", "syscall", "exec", "vdso", "cpuvuln", "file", "futex", "sysfile", "vfs", "statc", "fastdir", "fs", "tmpfs",
               "initrd", "cred", "security", "ns", "crypto", "rand", "parts", "why", "debug"],
-    "extra": ["aiproc", "apparmor", "bcm2835_rng", "block", "efi", "efirt", "efivarfs", "epoll", "extfs", "gpu", "drm", "htree", "inet", "inotify", "locks", "input", "jbd2", "landlock", "lsm_syscalls",
+    "extra": ["aiproc", "apparmor", "bcm2835_rng", "block", "efi", "efirt", "efivarfs", "epoll", "extfs", "gpu", "drm", "kms", "edid", "htree", "inet", "inotify", "locks", "input", "jbd2", "landlock", "lsm_syscalls",
               "module", "net", "addrconf", "netif", "netlink", "nftables", "nfhook", "conntrack", "ctnetlink", "audit", "auditfilter", "procfs", "lockstat", "prof", "fail", "trace", "whylog", "sd", "seccomp", "securityfs", "socket", "splice", "sound", "swap", "sysctl", "sysfs", "sysrq",
               "posix_timers", "timerfd", "unix", "vfat", "virtio", "virtio_blk", "virtio_net", "virtio_rng"],
     "quirk": ["tty-root-fdlink", "sound-min-period", "qemu-uart-burst"]

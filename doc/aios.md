@@ -2217,9 +2217,11 @@ GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD12
    /dev/dri がなければ、いままでどおり llvmpipe で描く
 4. たしかめ: `test/egldraw.c` (EGL の surfaceless と GLES2 で 64x64 に描いて読み返す。ドライバによらず同じ答え) と
    `test/drmrender.c` (render の口の ioctl の答え。Linux と同じ 18 行)
-5. KMS (card0 の MODE_*: 画面に出す。kmscube、aiwm を DRM の上で) と PRIME (dma-buf: Wayland でほかのプロセスへ)
-6. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
-7. 本物の機械
+5. KMS (kms.rs と edid.rs、2026-11-12): card0 で画面に出す。PRIME (dma-buf) も。kmscube が virgl でも llvmpipe でも回る。
+   `test/drmkms.c` (KMS の ioctl の答え) は Linux と同じ 35 行、modetest の出力もまるごと同じ
+6. atomic (DRM_CLIENT_CAP_ATOMIC: Wayland の compositor の多くが使う) とカーソル、aiwm を DRM の上で
+7. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
+8. 本物の機械
 
 ためすには、ホストに画面 (X か Wayland。なければ Xvfb) を用意して、GL のある画面で起こす: `AIOS_DISPLAY=sdl,gl=on`
 (bin/run.sh は画面に gl=on などがあれば virtio-gpu-gl-device にする)。中で `sudo modprobe virtio_gpu` と `ap -S mesa`。
@@ -2240,9 +2242,20 @@ aios の作り (drm.rs):
 - 命令はどれもホストが答えるまで待つ。SUBMIT_3D と TRANSFER には fence の印をつけるので、答えはホストが描き終えた
   とき。だから sync_file はいつも「終わった」、WAIT は待たない。長い SUBMIT_3D は大きなロックを放して待つ。キュー
   (と要求・応答のページ) は gpu.rs の SEND が守る (/dev/fb0 の 2D の命令もいっしょに)
+- KMS (kms.rs): Linux 6.18 の virtio_gpu と同じ番号のもの (plane 33 と 34、crtc 37、connector 38、encoder 39、EDID の
+  blob 40、/dev/fb0 の framebuffer 41、プロパティ 1〜36)。はじめは /dev/fb0 を映していて、card0 の最後のファイルを
+  閉じると /dev/fb0 にもどす (drm_lastclose)。SETCRTC と PAGE_FLIP は SET_SCANOUT と RESOURCE_FLUSH (dumb の BO は
+  TRANSFER_TO_HOST_2D も)。flip のできごと (FLIP_COMPLETE、vblank はないので数は 0) はファイルの列に入れ、read で読む。
+  master は card0 をはじめに開いたもの、GET_MAGIC と AUTH_MAGIC、SET_MASTER と DROP_MASTER も Linux と同じきまり
+- モード (edid.rs): GET_EDID で聞いた EDID から、Linux の drm_edid.c と同じ順で (詳しいタイミング、CVT、標準、確立、
+  CTA の VIC と 59.94 Hz の兄弟)、同じものをまとめ、たしかめて、ならべる。QEMU の EDID から Linux と同じ 26 こ。
+  表 (DMT、確立タイミング、CTA の VIC) は Linux の drm_edid.c から写した
+- PRIME: PRIME_HANDLE_TO_FD で BO を dma-buf の fd に (mmap、lseek の SEEK_END で大きさ、DMA_BUF_IOCTL_SYNC)、
+  PRIME_FD_TO_HANDLE でもどす。Mesa の GBM は PRIME がないと virgl の画面でも dumb で作ってしまう (gbm_dri.c)
 
-Linux とのちがい (いまは): KMS はない (card0 の MODE_* と KMS の cap は EOPNOTSUPP。render だけのドライバと同じ答え)。
-PRIME と syncobj もない (DRM_CAP_PRIME と SYNCOBJ は 0、その ioctl は EOPNOTSUPP。Linux 6.18 の virtio_gpu はどちらもある)。
+Linux とのちがい (いまは): atomic はない (DRM_CLIENT_CAP_ATOMIC と ATOMIC は EOPNOTSUPP: atomic のないドライバの答え)。
+カーソルもない (CURSOR は ENXIO、cursor plane の SETPLANE は EINVAL)。syncobj もない (DRM_CAP_SYNCOBJ は 0、その ioctl は
+EOPNOTSUPP。Linux 6.18 の virtio_gpu はある)。画面の大きさが変わったときのできごと (hotplug) もまだ。
 Linux は命令を出してすぐ返り、fence が終わりを知らせる (aios はホストが終えるまで待つ: CPU と GPU が並んで動かないので、
 たくさん出すものは遅い)。/dev/dri は 0666 (Linux は udev が video / render のグループに)。MAP_PRIVATE の mmap も断らない
 (Linux は EINVAL)
@@ -2278,6 +2291,10 @@ Linux の答え (Linux 6.18 virt、Mesa 26.2.6、QEMU 8.2。このマシンに G
 - 速さ: kmscube (20 枚) は virgl で 26〜57 fps、VM の中の llvmpipe で 9〜11 fps (ホストの込みぐあいでゆれる)
 - aios でも egldraw は `virgl (LLVMPIPE (...))` で 0 failed (30 回つづけても、4 つならべても。メモリも減らない)。
   test/drmrender.c の答えは Linux と同じ (18 行)。/dev/dri のない aios では llvmpipe で描いて同じ答え
+- aios の KMS: test/drmkms.c は Linux と同じ 35 行、`modetest -M virtio_gpu -c -e -p` の出力もまるごと同じ。kmscube は
+  virgl で 84〜86 fps (3000 枚)、`GBM_ALWAYS_SOFTWARE=1 LIBGL_ALWAYS_SOFTWARE=1` の llvmpipe と dumb で 10.5 fps。
+  終わると /dev/fb0 の画面にもどる。Alpine の kmscube と modetest は、aios の /opt/c の Mesa と libdrm で動かす
+  (`LD_LIBRARY_PATH=/opt/c/lib:DIR`、DIR に libc.musl-aarch64.so.1 → /lib/ld-musl-aarch64.so.1)
 
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 

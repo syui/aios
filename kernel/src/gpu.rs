@@ -19,12 +19,16 @@ use alloc::vec::Vec;
 
 const DEVICE_GPU: u32 = 16;
 const GET_DISPLAY_INFO: u32 = 0x0100;
-const RESOURCE_CREATE_2D: u32 = 0x0101;
+pub const RESOURCE_CREATE_2D: u32 = 0x0101;
 const SET_SCANOUT: u32 = 0x0103;
 const RESOURCE_FLUSH: u32 = 0x0104;
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const GET_CAPSET_INFO: u32 = 0x0108;
+const GET_EDID: u32 = 0x010a;
+const RESP_OK_EDID: u32 = 0x1104;
+/// VIRTIO_GPU_F_EDID: 画面の EDID を聞ける
+const F_EDID: u64 = 1 << 1;
 pub const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_CAPSET_INFO: u32 = 0x1102;
@@ -35,7 +39,7 @@ pub const FLAG_FENCE: u32 = 1;
 /// キューの入れ物の数 (QEMU の control queue は 256): 3D の命令の中身 (Mesa は 256 KiB まで) をページごとに渡す
 const QUEUE_MAX: usize = 256;
 /// B8G8R8X8 (XRGB8888)
-const FORMAT_XRGB: u32 = 2;
+pub const FORMAT_XRGB: u32 = 2;
 const RESOURCE: u32 = 1;
 /// 1 ページに入る ATTACH_BACKING の項目 (addr u64, len u32, pad u32)
 const ENTRIES_PER_PAGE: usize = PGSIZE / 16;
@@ -56,6 +60,9 @@ pub struct Gpu {
     pub capsets: Vec<(u32, u32, u32)>,
     /// 1 本目の virtio-mmio の口の物理番地 (/sys/devices/platform/ADDR.virtio_mmio)
     pub pa: usize,
+    /// 画面 0 の EDID (GET_EDID。なければ空) と、GET_DISPLAY_INFO の大きさ (なければ 0)
+    pub edid: Vec<u8>,
+    pub info: (u32, u32),
 }
 
 static GPU: Bkl<Option<Gpu>> = Bkl::new(None);
@@ -169,6 +176,37 @@ impl Gpu {
         self.flush(0, 0, w, h);
     }
 
+    /// 画面 0 に資源 res の (x, y, w, h) を映す (SET_SCANOUT。res が 0 なら消す)。/dev/fb0 は資源 1
+    pub fn scanout(&mut self, res: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
+        let mut s = hdr(SET_SCANOUT).to_vec();
+        for v in [x, y, w, h, 0, res] {
+            put(&mut s, v);
+        }
+        self.cmd(&s, &[], 0, 24) == RESP_OK_NODATA
+    }
+
+    /// 資源 res の (x, y, w, h) を画面に (RESOURCE_FLUSH。いま映しているものでなければホストは何もしない)
+    pub fn flush_res(&mut self, res: u32, x: u32, y: u32, w: u32, h: u32) {
+        let mut f = hdr(RESOURCE_FLUSH).to_vec();
+        for v in [x, y, w, h, res, 0] {
+            put(&mut f, v);
+        }
+        self.cmd(&f, &[], 0, 24);
+    }
+
+    /// ゲストのページからホストの 2D の資源へ写す (TRANSFER_TO_HOST_2D: off はページの中のはじまり)
+    pub fn transfer_2d(&mut self, res: u32, x: u32, y: u32, w: u32, h: u32, off: u64) {
+        let mut t = hdr(TRANSFER_TO_HOST_2D).to_vec();
+        for v in [x, y, w, h] {
+            put(&mut t, v);
+        }
+        t.extend_from_slice(&off.to_le_bytes());
+        put(&mut t, res);
+        put(&mut t, 0);
+        self.cmd(&t, &[], 0, 24);
+    }
+
+
     pub fn size(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }
@@ -190,12 +228,12 @@ pub fn init() -> bool {
 }
 
 fn probe_init() -> bool {
-    let Some((mmio, feats)) = virtio::probe(DEVICE_GPU, F_VIRGL) else { return false };
+    let Some((mmio, feats)) = virtio::probe(DEVICE_GPU, F_VIRGL | F_EDID) else { return false };
     let Some(q) = Queue::new(&mmio, 0, Queue::max(&mmio, 0).min(QUEUE_MAX)) else { return false };
     virtio::ready(&mmio);
     let (Some(req), Some(resp)) = (kalloc::alloc(), kalloc::alloc()) else { return false };
     let pa = v2p(mmio.base);
-    let mut g = Gpu { mmio, q, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp, virgl: feats & F_VIRGL != 0, capsets: Vec::new(), pa };
+    let mut g = Gpu { mmio, q, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp, virgl: feats & F_VIRGL != 0, capsets: Vec::new(), pa, edid: Vec::new(), info: (0, 0) };
 
     // 3D の capset (virtio_gpu_config の num_capsets は 12 バイト目): Linux の virtio_gpu_get_capsets
     if g.virgl {
@@ -218,6 +256,20 @@ fn probe_init() -> bool {
         let u = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
         if u(24 + 16) != 0 && u(24 + 8) > 0 && u(24 + 12) > 0 {
             (w, h) = (u(24 + 8), u(24 + 12));
+            g.info = (w, h);
+        }
+    }
+    // 画面 0 の EDID (virtio_gpu_get_edid: 答えは大きさ u32、padding、EDID 1024 バイト)
+    if feats & F_EDID != 0 {
+        let mut q = hdr(GET_EDID).to_vec();
+        put(&mut q, 0);
+        put(&mut q, 0);
+        let mut r = alloc::vec![0u8; 24 + 8 + 1024];
+        if g.call(&q, &[], 0, r.len(), &mut r) == RESP_OK_EDID {
+            let n = (u32::from_le_bytes(r[24..28].try_into().unwrap()) as usize).min(1024);
+            // はじめのブロックと、その 126 バイト目の数の拡張まで (Linux の drm_edid_read_custom はブロックごとに読む)
+            let n = if n >= 128 { n.min((1 + r[32 + 126] as usize) * 128) } else { n };
+            g.edid = r[32..32 + n].to_vec();
         }
     }
     g.width = w;

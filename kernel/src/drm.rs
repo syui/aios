@@ -10,14 +10,17 @@
 // 命令はどれも、ホストが終えて答えるまで待つ (SUBMIT_3D には fence の印をつけるので、答えはホストが描き終えたとき)。
 // だから印 (sync_file) はいつも「もう終わった」で、WAIT は待たない (Linux は待たずに返して、あとで fence で知らせる:
 // 速さはちがうが、見える答えは同じ)。長い SUBMIT_3D は大きなロックを放して待つ (gpu::unlocked)。
-// 画面に出す KMS (card0 の MODE_*) と PRIME (dma-buf) と syncobj はまだ: render だけのドライバ (Linux の
-// DRIVER_MODESET のないもの) と同じ答え (KMS の ioctl と cap は EOPNOTSUPP、DRM_CAP_PRIME は 0)
+// 画面に出す KMS (card0 の MODE_*) は kms.rs。card0 をはじめに開いたファイルが master (Linux の drm_master_open)、
+// GET_MAGIC と AUTH_MAGIC、SET_MASTER と DROP_MASTER も Linux と同じ。KMS のできごと (page flip) はファイルの列に入り、
+// read で読む (poll で POLLIN)。PRIME (dma-buf: BO を fd にして、ほかのプロセスや GBM へ) は Linux と同じ答え (DRM_CAP_PRIME は
+// import と export の 3。dma-buf の fd は mmap と DMA_BUF_IOCTL_SYNC。同じファイルにもどせば同じハンドル)。syncobj はまだ
+// (DRM_CAP_SYNCOBJ は 0、その ioctl は EOPNOTSUPP)
 use crate::cell::Bkl;
 use crate::file::{self, FileOps, FileRef, Kind};
 use crate::gpu;
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -32,6 +35,7 @@ const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
+const EBUSY: i64 = 16;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
@@ -72,21 +76,30 @@ const NR_RESOURCE_CREATE_BLOB: u32 = 0x4a;
 const NR_CONTEXT_INIT: u32 = 0x4b;
 const NR_PRIME_HANDLE_TO_FD: u32 = 0x2d;
 const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
-const NR_SYNCOBJ_FIRST: u32 = 0xbf;
-const NR_SYNCOBJ_LAST: u32 = 0xcf;
+const NR_GET_MAGIC: u32 = 0x02;
+const NR_MODESET_CTL: u32 = 0x08;
+const NR_AUTH_MAGIC: u32 = 0x11;
+const NR_SET_MASTER: u32 = 0x1e;
+const NR_DROP_MASTER: u32 = 0x1f;
+const NR_WAIT_VBLANK: u32 = 0x3a;
+const NR_CRTC_GET_SEQUENCE: u32 = 0x3b;
+const NR_CRTC_QUEUE_SEQUENCE: u32 = 0x3c;
 const COMMAND_BASE: u32 = 0x40;
 const COMMAND_END: u32 = 0xa0;
 
 /// mmap のオフセットの始まり (Linux の DRM_FILE_PAGE_OFFSET_START: 4 GiB)
 const OFFSET_START: u64 = 1 << 32;
 
-/// GPU のメモリ (GEM のもの)。ハンドルの表 (ファイルごと) が持ち、命令を出しているあいだは EXECBUFFER も持つ
-struct Bo {
+/// GPU のメモリ (GEM のもの)。ハンドルの表 (ファイルごと) が持ち、命令を出しているあいだは EXECBUFFER も、
+/// framebuffer (kms.rs) も持つ
+pub struct Bo {
     /// ホストの資源の番号
-    res: u32,
+    pub res: u32,
     pages: Rc<Vec<*mut u8>>,
     /// mmap のオフセット (MAP ではじめて決める。0 はまだ)
     off: Cell<u64>,
+    /// dumb (CREATE_DUMB: ホストの 2D の資源。映すときにゲストのページから写す)
+    pub dumb: bool,
 }
 
 impl Bo {
@@ -115,9 +128,29 @@ struct Dev {
     caps: Vec<(u32, u32, Vec<u8>)>,
     /// 落ちた BO (資源の番号、ページ)
     dead: Vec<(u32, Rc<Vec<*mut u8>>)>,
+    /// master のファイル (card0 をはじめに開いたもの)
+    master: Option<u32>,
+    /// 開いている DRM のファイルの数 (0 になったら /dev/fb0 にもどす) と、次のファイルの番号
+    open: u32,
+    next_id: u32,
+    /// GET_MAGIC の番号 (1 から) と、その番号のファイル
+    magics: BTreeMap<u32, u32>,
+    authed: Vec<u32>,
 }
 
-static DEV: Bkl<Dev> = Bkl::new(Dev { res: Vec::new(), ctx: Vec::new(), next_off: OFFSET_START, fence: 0, caps: Vec::new(), dead: Vec::new() });
+static DEV: Bkl<Dev> = Bkl::new(Dev {
+    res: Vec::new(),
+    ctx: Vec::new(),
+    next_off: OFFSET_START,
+    fence: 0,
+    caps: Vec::new(),
+    dead: Vec::new(),
+    master: None,
+    open: 0,
+    next_id: 1,
+    magics: BTreeMap::new(),
+    authed: Vec::new(),
+});
 
 /// いちばん小さい空いた番号 (min から。Linux の ida_alloc)
 fn id_alloc(used: &mut Vec<u32>, min: u32) -> u32 {
@@ -164,6 +197,58 @@ fn send(req: &[u8]) -> Result<(), i64> {
     Ok(())
 }
 
+/// BO を作る: size バイトのページ、create (資源の番号から作る命令) をホストへ、ページの並びを ATTACH_BACKING
+/// (Linux の virtio_gpu_object_create)
+fn alloc_bo(size: usize, dumb: bool, create: impl FnOnce(u32) -> Vec<u8>) -> Result<Rc<Bo>, i64> {
+    let g = gpu()?;
+    let n = size.div_ceil(PGSIZE);
+    // 1 ページに 256 項目の並びを、キューに入るだけ
+    if n.div_ceil(PGSIZE / 16) + 2 > 256 {
+        return Err(-ENOMEM);
+    }
+    let mut pages = Vec::with_capacity(n);
+    for _ in 0..n {
+        match kalloc::alloc() {
+            Some(p) => pages.push(p),
+            None => {
+                for p in pages {
+                    kalloc::put(p);
+                }
+                return Err(-ENOMEM);
+            }
+        }
+    }
+    let res = id_alloc(&mut DEV.get().res, 2);
+    let _ = send(&create(res));
+    // ページの並びをホストへ (ATTACH_BACKING: 項目は addr u64、len u32、padding u32)
+    let mut lists = Vec::new();
+    for chunk in pages.chunks(PGSIZE / 16) {
+        let Some(l) = kalloc::alloc() else { break };
+        let b = unsafe { core::slice::from_raw_parts_mut(l, PGSIZE) };
+        for (k, &p) in chunk.iter().enumerate() {
+            set64(b, k * 16, v2p(p as usize) as u64);
+            set32(b, k * 16 + 8, PGSIZE as u32);
+        }
+        lists.push(l);
+    }
+    let bo = Rc::new(Bo { res, pages: Rc::new(pages), off: Cell::new(0), dumb });
+    if lists.len() != n.div_ceil(PGSIZE / 16) {
+        for l in lists {
+            kalloc::put(l);
+        }
+        return Err(-ENOMEM);
+    }
+    let mut q = gpu::hdr3d(RESOURCE_ATTACH_BACKING, 0, 0, 0);
+    put32(&mut q, res);
+    put32(&mut q, n as u32);
+    let mut r = [0u8; 24];
+    g.call(&q, &lists, n * 16, 24, &mut r);
+    for l in lists {
+        kalloc::put(l);
+    }
+    Ok(bo)
+}
+
 /// 落ちた BO のうち、写しもないものをホストから外してページを返す (Linux の virtio_gpu_cleanup_object)
 fn reap() {
     let d = DEV.get();
@@ -208,12 +293,19 @@ pub fn init(pa: usize) {
         });
     }
     file::register_chrdev(MAJOR, |mi, _| (mi == 0 || mi == RENDER).then(|| Ok(Kind::Ops(Rc::new(DrmFile::new(mi))))));
+    if let Some(g) = gpu::get() {
+        crate::kms::init(g);
+    }
     println!("drm: /dev/dri/card0 and renderD128 (virtio_gpu: virgl)");
 }
 
 /// 開いた DRM の口 (Linux の drm_file)
 pub struct DrmFile {
     minor: u32,
+    /// ファイルの番号 (framebuffer の持ち主、master)
+    id: u32,
+    /// 開いたプロセス (SET_MASTER: 前に master だったファイルを、同じプロセスがまた master にするとき)
+    tgid: u32,
     st: Bkl<State>,
 }
 
@@ -223,20 +315,147 @@ struct State {
     ctx_made: bool,
     /// GEM のハンドル (1 から)
     handles: BTreeMap<u32, Rc<Bo>>,
+    /// KMS のできごと (page flip) と、まだ入れられるバイト (Linux の event_space: 4096)、増える数 (epoll の EPOLLET)
+    events: VecDeque<Vec<u8>>,
+    space: usize,
+    egen: u64,
+    /// SET_CLIENT_CAP: UNIVERSAL_PLANES、ASPECT_RATIO、STEREO_3D
+    universal: bool,
+    aspect: bool,
+    stereo: bool,
+    /// master だったことがある
+    was_master: bool,
+    /// DRM_AUTH の ioctl (PRIME) を使える: master か、CAP_SYS_ADMIN で開いたか、AUTH_MAGIC で認められた (drm_file の authenticated)
+    authed: bool,
 }
 
 impl DrmFile {
     fn new(minor: u32) -> DrmFile {
-        let ctx = id_alloc(&mut DEV.get().ctx, 1);
-        DrmFile { minor, st: Bkl::new(State { ctx, ctx_made: false, handles: BTreeMap::new() }) }
+        let d = DEV.get();
+        let ctx = id_alloc(&mut d.ctx, 1);
+        let id = d.next_id;
+        d.next_id += 1;
+        d.open += 1;
+        // card0 をはじめに開いたものが master (drm_master_open)
+        let was_master = minor < RENDER && d.master.is_none();
+        if was_master {
+            d.master = Some(id);
+        }
+        let authed = was_master || crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN);
+        let st = State { ctx, ctx_made: false, handles: BTreeMap::new(), events: VecDeque::new(), space: 4096, egen: 0, universal: false, aspect: false, stereo: false, was_master, authed };
+        DrmFile { minor, id, tgid: crate::proc::current().tgid, st: Bkl::new(st) }
     }
 
     fn render(&self) -> bool {
         self.minor >= RENDER
     }
 
-    fn bo(&self, h: u32) -> Option<Rc<Bo>> {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// いまの master か
+    pub fn master(&self) -> bool {
+        DEV.get().master == Some(self.id)
+    }
+
+    pub fn universal_planes(&self) -> bool {
+        self.st.get().universal
+    }
+
+    pub fn aspect_ratio(&self) -> bool {
+        self.st.get().aspect
+    }
+
+    pub fn bo(&self, h: u32) -> Option<Rc<Bo>> {
         self.st.get().handles.get(&h).cloned()
+    }
+
+    /// BO に新しいハンドルを (いちばん小さい空いた番号: Linux の idr_alloc。コンテキストにもつなぐ)
+    pub fn new_handle(&self, bo: Rc<Bo>) -> u32 {
+        self.ctx_resource(CTX_ATTACH_RESOURCE, bo.res);
+        let st = self.st.get();
+        let mut h = 1;
+        while st.handles.contains_key(&h) {
+            h += 1;
+        }
+        st.handles.insert(h, bo);
+        h
+    }
+
+    /// mmap のオフセット (MAP と MAP_DUMB)
+    pub fn map_offset(&self, h: u32) -> Result<u64, i64> {
+        let bo = self.bo(h).ok_or(-ENOENT)?;
+        if bo.off.get() == 0 {
+            let d = DEV.get();
+            bo.off.set(d.next_off);
+            d.next_off += bo.size() as u64;
+        }
+        Ok(bo.off.get())
+    }
+
+    /// GEM_CLOSE と DESTROY_DUMB: ハンドルを外す (ないものは EINVAL)
+    pub fn gem_close(&self, h: u32) -> Result<(), i64> {
+        let bo = self.st.get().handles.remove(&h).ok_or(-EINVAL)?;
+        self.ctx_resource(CTX_DETACH_RESOURCE, bo.res);
+        Ok(())
+    }
+
+    /// CREATE_DUMB: 2D の資源 (B8G8R8X8) と BO。ハンドルを返す
+    pub fn create_dumb(&self, w: u32, h: u32, size: usize) -> Result<u32, i64> {
+        if gpu()?.virgl {
+            self.context()?;
+        }
+        let bo = alloc_bo(size, true, |res| {
+            let mut q = gpu::hdr3d(gpu::RESOURCE_CREATE_2D, 0, 0, 0);
+            for v in [res, gpu::FORMAT_XRGB, w, h] {
+                put32(&mut q, v);
+            }
+            q
+        })?;
+        Ok(self.new_handle(bo))
+    }
+
+    /// できごとを入れる余地があるか
+    pub fn event_room(&self, n: usize) -> bool {
+        self.st.get().space >= n
+    }
+
+    /// できごとを入れて、待っているものを起こす
+    pub fn push_event(&self, e: &[u8]) {
+        let st = self.st.get();
+        st.space = st.space.saturating_sub(e.len());
+        st.events.push_back(e.to_vec());
+        st.egen += 1;
+        crate::proc::wakeup(self.chan());
+    }
+
+    fn chan(&self) -> usize {
+        self as *const DrmFile as usize
+    }
+
+    /// read: できごとを、入るだけまるごと (はじめのものが入らなければ 0)。なければ待つ (O_NONBLOCK なら EAGAIN)
+    fn read_events(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        loop {
+            let st = self.st.get();
+            if !st.events.is_empty() {
+                let mut n = 0;
+                while let Some(e) = st.events.front() {
+                    if e.len() > dst.len() - n {
+                        break;
+                    }
+                    dst[n..n + e.len()].copy_from_slice(e);
+                    n += e.len();
+                    st.space += e.len();
+                    st.events.pop_front();
+                }
+                return Ok(n);
+            }
+            if nonblock {
+                return Err(-11);
+            }
+            crate::proc::sleep(self.chan())?;
+        }
     }
 
     /// ホストにこのファイルのコンテキストを作る (はじめて使うとき。名前はプロセスの名前: Linux と同じ)
@@ -294,19 +513,35 @@ impl DrmFile {
             NR_GET_CAPS => (24, RW, true),
             NR_RESOURCE_CREATE_BLOB => (48, RW, true),
             NR_CONTEXT_INIT => (16, RW, true),
-            // PRIME (dma-buf) と syncobj はまだ (GET_CAP で 0 と答えるもの): Linux の、その力のないドライバと同じ EOPNOTSUPP
-            NR_PRIME_HANDLE_TO_FD | NR_PRIME_FD_TO_HANDLE | NR_SYNCOBJ_FIRST..=NR_SYNCOBJ_LAST => return Err(-EOPNOTSUPP),
-            // KMS: 画面を出すことはまだできない (render だけのドライバの答え)。render の口では EACCES
-            n if n >= COMMAND_END => (0, 0, false),
-            // ほかの core の ioctl (GET_MAGIC、AUTH_MAGIC、SET_MASTER、GEM_FLINK、昔のもの ...) は render の口では使えない
+            NR_GET_MAGIC => (4, 2, false),
+            NR_AUTH_MAGIC => (4, W, false),
+            NR_SET_MASTER | NR_DROP_MASTER => (0, 0, false),
+            NR_MODESET_CTL => (8, W, false),
+            NR_WAIT_VBLANK | NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => (24, RW, false),
+            NR_PRIME_HANDLE_TO_FD | NR_PRIME_FD_TO_HANDLE => (12, RW, true),
+            // syncobj はまだ (GET_CAP で 0 と答えるもの): Linux の、その力のないドライバと同じ EOPNOTSUPP
+            0xbf..=0xc5 | 0xca..=0xcd | 0xcf => return Err(-EOPNOTSUPP),
+            // KMS (kms.rs): render の口では使えない
+            n if n >= COMMAND_END => match crate::kms::spec(n) {
+                Some((size, dir, _)) => (size, dir, false),
+                None if self.render() => return Err(-EACCES),
+                None => return Err(-EINVAL),
+            },
+            // ほかの core の ioctl (GEM_FLINK、SET_VERSION、昔のもの ...) は render の口では使えない
             n if n < COMMAND_BASE && self.render() => return Err(-EACCES),
             _ => return Err(-EINVAL),
         };
         if !render_ok && self.render() {
             return Err(-EACCES);
         }
-        if nr >= COMMAND_END {
-            return Err(-EOPNOTSUPP);
+        // DRM_AUTH のもの (PRIME)
+        if matches!(nr, NR_PRIME_HANDLE_TO_FD | NR_PRIME_FD_TO_HANDLE) && !self.authenticated() {
+            return Err(-EACCES);
+        }
+        // master だけのもの (DRM_MASTER)
+        let master_only = matches!(nr, NR_AUTH_MAGIC) || (nr >= COMMAND_END && crate::kms::spec(nr).is_some_and(|s| s.2));
+        if master_only && !self.master() {
+            return Err(-EACCES);
         }
         // 写すのは、ユーザーの番号とカーネルの形のどちらも、その向きのとき (Linux の drm_ioctl)
         let dir_in = req & (1 << 30) != 0 && kdir & W != 0;
@@ -331,15 +566,48 @@ impl DrmFile {
                 set64(a, 0, 0);
                 Ok(())
             }
-            NR_GEM_CLOSE => {
-                let h = le32(a, 0);
-                let bo = self.st.get().handles.remove(&h).ok_or(-EINVAL)?;
-                self.ctx_resource(CTX_DETACH_RESOURCE, bo.res);
+            NR_GEM_CLOSE => self.gem_close(le32(a, 0)),
+            NR_GET_CAP => get_cap(a),
+            NR_SET_CLIENT_CAP => self.set_client_cap(le64(a, 0), le64(a, 8)),
+            NR_GET_MAGIC => {
+                // このファイルの番号 (はじめて聞いたときに決める。drm_getmagic)
+                let d = DEV.get();
+                let m = match d.magics.iter().find(|(_, f)| **f == self.id) {
+                    Some((&m, _)) => m,
+                    None => {
+                        let mut m = 1;
+                        while d.magics.contains_key(&m) {
+                            m += 1;
+                        }
+                        d.magics.insert(m, self.id);
+                        m
+                    }
+                };
+                set32(a, 0, m);
                 Ok(())
             }
-            NR_GET_CAP => get_cap(a),
-            // KMS のない (render だけの) ドライバには、決められる cap がない
-            NR_SET_CLIENT_CAP => Err(-EOPNOTSUPP),
+            NR_AUTH_MAGIC => {
+                let d = DEV.get();
+                let f = d.magics.remove(&le32(a, 0)).ok_or(-EINVAL)?;
+                d.authed.push(f);
+                Ok(())
+            }
+            NR_PRIME_HANDLE_TO_FD => self.prime_export(a),
+            NR_PRIME_FD_TO_HANDLE => self.prime_import(a),
+            NR_SET_MASTER => self.set_master(),
+            NR_DROP_MASTER => {
+                self.master_perm()?;
+                let d = DEV.get();
+                if d.master != Some(self.id) {
+                    return Err(-EINVAL);
+                }
+                d.master = None;
+                Ok(())
+            }
+            // 昔の vblank の設定: KMS のドライバは何もしない
+            NR_MODESET_CTL => Ok(()),
+            // vblank はない (virtio_gpu は drm_vblank_init をしない)
+            NR_WAIT_VBLANK | NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => Err(-EOPNOTSUPP),
             NR_GETPARAM => getparam(a),
             NR_GET_CAPS => get_caps(a),
             NR_RESOURCE_CREATE => self.resource_create(a),
@@ -351,13 +619,7 @@ impl DrmFile {
                 Ok(())
             }
             NR_MAP => {
-                let bo = self.bo(le32(a, 8)).ok_or(-ENOENT)?;
-                if bo.off.get() == 0 {
-                    let d = DEV.get();
-                    bo.off.set(d.next_off);
-                    d.next_off += bo.size() as u64;
-                }
-                set64(a, 0, bo.off.get());
+                set64(a, 0, self.map_offset(le32(a, 8))?);
                 Ok(())
             }
             NR_EXECBUFFER => self.execbuffer(a),
@@ -367,81 +629,121 @@ impl DrmFile {
                 // 命令はホストが終えてから返るので、待つものはない (NOWAIT でも EBUSY にならない)。flags は見ない (Linux 6.18 も)
                 self.bo(le32(a, 0)).map(|_| ()).ok_or(-ENOENT)
             }
+            n if n >= COMMAND_END => crate::kms::ioctl(self, n, a),
             // blob の資源と、capset をえらんで作るコンテキストは、デバイスにない (RESOURCE_BLOB、CONTEXT_INIT が 0)
             _ => Err(-EINVAL),
         }
     }
 
+    /// SET_CLIENT_CAP (drm_setclientcap)
+    fn set_client_cap(&self, cap: u64, v: u64) -> Result<(), i64> {
+        let st = self.st.get();
+        match cap {
+            // STEREO_3D、UNIVERSAL_PLANES、ASPECT_RATIO
+            1 | 2 | 4 if v > 1 => Err(-EINVAL),
+            1 => {
+                st.stereo = v == 1;
+                Ok(())
+            }
+            2 => {
+                st.universal = v == 1;
+                Ok(())
+            }
+            4 => {
+                st.aspect = v == 1;
+                Ok(())
+            }
+            // ATOMIC と CURSOR_PLANE_HOTSPOT: atomic のないドライバ
+            3 | 6 => Err(-EOPNOTSUPP),
+            // WRITEBACK_CONNECTORS は atomic のときだけ
+            _ => Err(-EINVAL),
+        }
+    }
+
+    /// master をかえてよいか (drm_master_check_perm: 前に master だったファイルを同じプロセスが、か CAP_SYS_ADMIN)
+    fn master_perm(&self) -> Result<(), i64> {
+        if self.st.get().was_master && crate::proc::current().tgid == self.tgid {
+            return Ok(());
+        }
+        if !crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN) {
+            return Err(-EACCES);
+        }
+        Ok(())
+    }
+
+    /// SET_MASTER (drm_setmaster_ioctl)
+    fn set_master(&self) -> Result<(), i64> {
+        self.master_perm()?;
+        let d = DEV.get();
+        if d.master == Some(self.id) {
+            return Ok(());
+        }
+        if d.master.is_some() {
+            return Err(-EBUSY);
+        }
+        d.master = Some(self.id);
+        let st = self.st.get();
+        st.was_master = true;
+        st.authed = true;
+        Ok(())
+    }
+
+    /// DRM_AUTH: render の口か、認められた card0 のファイル
+    fn authenticated(&self) -> bool {
+        self.render() || self.st.get().authed || DEV.get().authed.contains(&self.id)
+    }
+
+    /// PRIME_HANDLE_TO_FD (drm_prime_handle): handle、flags (DRM_CLOEXEC、DRM_RDWR)、fd (答え)
+    fn prime_export(&self, a: &mut [u8]) -> Result<(), i64> {
+        const CLOEXEC: u32 = 0o2000000;
+        const RDWR: u32 = 2;
+        let flags = le32(a, 4);
+        if flags & !(CLOEXEC | RDWR) != 0 {
+            return Err(-EINVAL);
+        }
+        let bo = self.bo(le32(a, 0)).ok_or(-ENOENT)?;
+        let fl = if flags & RDWR != 0 { file::O_RDWR } else { file::O_RDONLY };
+        let f = file::new(Kind::Ops(Rc::new(DmaBuf { bo, name: core::cell::RefCell::new(String::new()) })), fl);
+        let fd = crate::proc::current().files().add(f, flags & CLOEXEC != 0, 0).ok_or(-EMFILE)?;
+        set32(a, 8, fd as u32);
+        Ok(())
+    }
+
+    /// PRIME_FD_TO_HANDLE: この装置の dma-buf なら、このファイルのハンドル (もうあれば同じもの)
+    fn prime_import(&self, a: &mut [u8]) -> Result<(), i64> {
+        let fd = le32(a, 8) as i32;
+        let f = crate::proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
+        let d = f.borrow().kind.ops::<DmaBuf>().ok_or(-EINVAL)?;
+        let st = self.st.get();
+        let h = match st.handles.iter().find(|(_, b)| Rc::ptr_eq(b, &d.bo)) {
+            Some((&h, _)) => h,
+            None => self.new_handle(d.bo.clone()),
+        };
+        set32(a, 0, h);
+        Ok(())
+    }
+
     /// RESOURCE_CREATE (drm_virtgpu_resource_create): target, format, bind, width, height, depth, array_size, last_level,
     /// nr_samples, flags, bo_handle (答え), res_handle (答え), size, stride
     fn resource_create(&self, a: &mut [u8]) -> Result<(), i64> {
-        let g = gpu()?;
         let ctx = self.context()?;
         let size = match le32(a, 48) as usize {
             0 => PGSIZE,
             n => n,
         };
-        let n = size.div_ceil(PGSIZE);
-        // 1 ページに 256 項目の並びを、キューに入るだけ
-        if n.div_ceil(PGSIZE / 16) + 2 > 256 {
-            return Err(-ENOMEM);
-        }
-        let mut pages = Vec::with_capacity(n);
-        for _ in 0..n {
-            match kalloc::alloc() {
-                Some(p) => pages.push(p),
-                None => {
-                    for p in pages {
-                        kalloc::put(p);
-                    }
-                    return Err(-ENOMEM);
-                }
+        let bo = alloc_bo(size, false, |res| {
+            let mut q = gpu::hdr3d(RESOURCE_CREATE_3D, 0, 0, ctx);
+            put32(&mut q, res);
+            for i in 0..9 {
+                put32(&mut q, le32(a, i * 4));
             }
-        }
-        let res = id_alloc(&mut DEV.get().res, 2);
-        let mut q = gpu::hdr3d(RESOURCE_CREATE_3D, 0, 0, ctx);
-        put32(&mut q, res);
-        for i in 0..9 {
-            put32(&mut q, le32(a, i * 4));
-        }
-        // flags と padding
-        put32(&mut q, le32(a, 36));
-        put32(&mut q, 0);
-        let _ = send(&q);
-        // ページの並びをホストへ (ATTACH_BACKING: 項目は addr u64、len u32、padding u32)
-        let mut lists = Vec::new();
-        for chunk in pages.chunks(PGSIZE / 16) {
-            let Some(l) = kalloc::alloc() else { break };
-            let b = unsafe { core::slice::from_raw_parts_mut(l, PGSIZE) };
-            for (k, &p) in chunk.iter().enumerate() {
-                set64(b, k * 16, v2p(p as usize) as u64);
-                set32(b, k * 16 + 8, PGSIZE as u32);
-            }
-            lists.push(l);
-        }
-        let bo = Rc::new(Bo { res, pages: Rc::new(pages), off: Cell::new(0) });
-        if lists.len() != n.div_ceil(PGSIZE / 16) {
-            for l in lists {
-                kalloc::put(l);
-            }
-            return Err(-ENOMEM);
-        }
-        let mut q = gpu::hdr3d(RESOURCE_ATTACH_BACKING, 0, 0, 0);
-        put32(&mut q, res);
-        put32(&mut q, n as u32);
-        let mut r = [0u8; 24];
-        g.call(&q, &lists, n * 16, 24, &mut r);
-        for l in lists {
-            kalloc::put(l);
-        }
-        self.ctx_resource(CTX_ATTACH_RESOURCE, res);
-        // ハンドルはいちばん小さい空いた番号 (1 から: Linux の idr_alloc)
-        let st = self.st.get();
-        let mut h = 1;
-        while st.handles.contains_key(&h) {
-            h += 1;
-        }
-        st.handles.insert(h, bo);
+            // flags と padding
+            put32(&mut q, le32(a, 36));
+            put32(&mut q, 0);
+            q
+        })?;
+        let res = bo.res;
+        let h = self.new_handle(bo);
         set32(a, 40, h);
         set32(a, 44, res);
         Ok(())
@@ -575,12 +877,26 @@ impl DrmFile {
             self.ctx_resource(CTX_DETACH_RESOURCE, bo.res);
         }
         drop(handles);
+        // 映していた framebuffer をとめ、ユーザーの blob を消す (drm_fb_release)
+        crate::kms::file_closed(self.id);
         let st = self.st.get();
         if st.ctx_made {
             let _ = send(&gpu::hdr3d(CTX_DESTROY, 0, 0, st.ctx));
         }
-        id_free(&mut DEV.get().ctx, st.ctx);
+        let d = DEV.get();
+        id_free(&mut d.ctx, st.ctx);
+        if d.master == Some(self.id) {
+            d.master = None;
+        }
+        d.magics.retain(|_, f| *f != self.id);
+        d.authed.retain(|&f| f != self.id);
+        d.open -= 1;
+        let last = d.open == 0;
         reap();
+        // 最後のファイル: /dev/fb0 にもどす (drm_lastclose)
+        if last {
+            crate::kms::lastclose();
+        }
     }
 }
 
@@ -600,17 +916,20 @@ fn version(a: &mut [u8]) -> Result<(), i64> {
     Ok(())
 }
 
-/// GET_CAP (drm_get_cap): render だけのドライバのもの (KMS の cap は EOPNOTSUPP)
+/// GET_CAP (drm_getcap): はじめに 0 を入れ、core のものと KMS のもの (kms::cap)。知らないものは EINVAL
 fn get_cap(a: &mut [u8]) -> Result<(), i64> {
     const TIMESTAMP_MONOTONIC: u64 = 6;
     const PRIME: u64 = 5;
     const SYNCOBJ: u64 = 0x13;
     const SYNCOBJ_TIMELINE: u64 = 0x14;
+    set64(a, 8, 0);
     let v = match le64(a, 0) {
         TIMESTAMP_MONOTONIC => 1,
-        // dma-buf (PRIME) はまだ: import も export もない
-        PRIME | SYNCOBJ | SYNCOBJ_TIMELINE => 0,
-        _ => return Err(-EOPNOTSUPP),
+        // DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT
+        PRIME => 3,
+        // syncobj はまだ
+        SYNCOBJ | SYNCOBJ_TIMELINE => 0,
+        c => crate::kms::cap(c)?,
     };
     set64(a, 8, v);
     Ok(())
@@ -680,8 +999,28 @@ impl FileOps for DrmFile {
     fn mount(&self) -> (u64, bool) {
         file::dev_mount(&self.describe())
     }
+    fn stream(&self) -> bool {
+        true
+    }
+    /// KMS のできごと (drm_read)
+    fn read(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+        self.read_events(dst, nonblock)
+    }
+    fn write(&self, _src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(-EINVAL)
+    }
+    fn pollable(&self) -> bool {
+        true
+    }
+    /// できごとがあれば読める (drm_poll: POLLIN だけ)
+    fn readiness(&self) -> (bool, bool, bool) {
+        (!self.st.get().events.is_empty(), false, false)
+    }
+    fn event_gen(&self) -> u64 {
+        self.st.get().egen
+    }
     fn poll_keys(&self) -> Option<Vec<usize>> {
-        Some(vec![])
+        Some(vec![self.chan()])
     }
     fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
         Some(self.do_ioctl(req, arg))
@@ -699,6 +1038,76 @@ impl FileOps for DrmFile {
     }
     fn release(&self) {
         self.close();
+    }
+}
+
+/// dma-buf (PRIME_HANDLE_TO_FD の fd: Linux の dma_buf)。BO のページを mmap で見せ、lseek の SEEK_END で大きさ
+pub struct DmaBuf {
+    bo: Rc<Bo>,
+    /// DMA_BUF_SET_NAME の名前 (/proc/PID/fdinfo の name)
+    name: core::cell::RefCell<String>,
+}
+
+impl FileOps for DmaBuf {
+    fn describe(&self) -> String {
+        "/dmabuf:".into()
+    }
+    fn seekable(&self) -> bool {
+        true
+    }
+    fn size(&self) -> Option<i64> {
+        Some(self.bo.size() as i64)
+    }
+    fn read_at(&self, _pos: usize, _dst: &mut [u8]) -> Result<usize, i64> {
+        Err(-EINVAL)
+    }
+    fn write_at(&self, _pos: usize, _src: &[u8]) -> Result<usize, i64> {
+        Err(-EINVAL)
+    }
+    fn fdinfo(&self) -> String {
+        format!("size:\t{}\ncount:\t1\nexp_name:\tvirtio_gpu\nname:\t{}\n", self.bo.size(), self.name.borrow())
+    }
+    fn pollable(&self) -> bool {
+        true
+    }
+    /// 命令はみな終わっているので、いつも読み書きできる (暗黙の fence を待たない)
+    fn readiness(&self) -> (bool, bool, bool) {
+        (true, true, false)
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(vec![])
+    }
+    fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
+        const SYNC: u64 = 0x4008_6200;
+        const SET_NAME_A: u64 = 0x4004_6201;
+        const SET_NAME_B: u64 = 0x4008_6201;
+        Some((|| match req {
+            // DMA_BUF_IOCTL_SYNC: flags は READ / WRITE (どちらか要る) と END だけ
+            SYNC => {
+                let mut b = [0u8; 8];
+                crate::proc::current().pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
+                let f = u64::from_le_bytes(b);
+                if f & !7 != 0 || f & 3 == 0 {
+                    return Err(-EINVAL);
+                }
+                Ok(0)
+            }
+            SET_NAME_A | SET_NAME_B => {
+                let n = crate::proc::current().pt().copy_in_str(arg, 32).ok_or(-EFAULT)?;
+                *self.name.borrow_mut() = String::from_utf8_lossy(&n).into_owned();
+                Ok(0)
+            }
+            _ => Err(-ENOTTY),
+        })())
+    }
+    /// BO のページをそのまま (dma_buf_mmap: 大きさをこえれば EINVAL)
+    fn mmap(&self, fr: &FileRef, off: usize, len: usize, _prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        Some((|| {
+            if off.checked_add(len).is_none_or(|e| e > crate::vm::pg_up(self.bo.size())) {
+                return Err(-EINVAL);
+            }
+            Ok(crate::vm::Backing::Pages { pages: self.bo.pages.clone(), off, hold: Some(fr.clone()) })
+        })())
     }
 }
 

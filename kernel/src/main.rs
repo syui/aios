@@ -19,6 +19,7 @@ mod boot;
 mod mmio;
 #[macro_use]
 mod uart;
+mod kms;
 mod kmsg;
 mod landlock;
 mod timerfd;
@@ -29,6 +30,7 @@ mod cred;
 mod security;
 mod debug;
 mod drm;
+mod edid;
 mod crypto;
 mod dtb;
 mod efi;
