@@ -1,0 +1,25 @@
+services:
+  aios:
+    image: ghcr.io/syui/aios-cc:latest
+    command: ["serve"]
+    restart: always
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 512m
+    sysctls:
+      net.mptcp.enabled: "0"
+      net.ipv4.conf.all.send_redirects: "0"
+      net.ipv4.conf.default.send_redirects: "0"
+      net.ipv4.conf.all.accept_redirects: "0"
+      net.ipv4.conf.default.accept_redirects: "0"
+      net.ipv4.conf.all.secure_redirects: "0"
+      net.ipv4.conf.default.secure_redirects: "0"
+      net.ipv4.conf.all.accept_source_route: "0"
+      net.ipv4.conf.default.accept_source_route: "0"
+      net.ipv4.ping_group_range: "1 0"
+      net.ipv4.ip_forward: "0"
