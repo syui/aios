@@ -1,6 +1,7 @@
 # image: aios のパッケージから、distroless のような小さな container image (OCI) を作り、docker run でたしかめて
 # ghcr.io に置く (ghcr.io/syui/aios-static, aios-cc, aios-node。タグは中心のパッケージの版と latest)。
-# ghcr.io/syui/aios は builder (base をまるごと: docker build の FROM にして ap -Sy で足す。image/example/Dockerfile)
+# ghcr.io/syui/aios は builder (base をまるごと: docker build の FROM にして ap -Sy で足す)。docker/ の見本 (Dockerfile と
+# compose.yml) をその場で作った image で docker build して、compose の守りのまま起こしてたしかめる
 #   作りかたは ap image (user/src/lib/oci.rs)、中身は image/*.json (パッケージ、要るファイル、config)。
 #   ELF の要るもの (PT_INTERP、DT_NEEDED) をたどって、使うファイルだけを入れる。シェルもパッケージマネージャもない。
 #   docker を使わずに作るので、同じパッケージからは、いつどこで (aios の中でも) 作っても同じ digest になる
@@ -16,6 +17,7 @@ on:
     - main
     paths:
     - 'image/**'
+    - 'docker/**'
     - 'user/src/lib/oci.rs'
     - 'user/src/lib/ocistore.rs'
     - 'user/src/bin/aipkg.rs'
@@ -85,12 +87,14 @@ jobs:
         run: |
           # OCI のアーカイブを docker のふつうの形 (docker-archive) にして docker load
           # (skopeo の docker-daemon: は古い API の版で話すので、新しい Docker にはことわられる)
+          # 名前は image の名前 (aios、aios-static ...) に :ci
           for f in out/*.ref; do
             n=$(basename "$f" .ref)
-            skopeo copy -q "oci-archive:out/$n.tar" "docker-archive:out/$n.docker.tar:aios-$n:ci"
+            read -r ref digest < "$f"
+            skopeo copy -q "oci-archive:out/$n.tar" "docker-archive:out/$n.docker.tar:${ref%%:*}:ci"
             docker load -i "out/$n.docker.tar"
           done
-          docker images 'aios-*'
+          docker images 'aios*'
 
           # node: 版、nonroot (65532)、書けるところ、CA 証明書、https
           docker run --rm aios-node:ci -e '
@@ -115,11 +119,35 @@ jobs:
 
           # aios (builder): base がまるごと入っていて、ap が入れたものを知っている (/var/lib/aipkg/local)。/bin/sh は aish
           docker run --rm aios:ci sh -c 'cat /etc/os-release | head -1; ap -Q | wc -l; ap -Qo /usr/bin/ap'
-          # 多段の docker build: builder で ap -Sy cargo と cargo build、aios-static に入れて動かす (image/example/Dockerfile)
-          docker build -t aios-example:ci --build-arg AIOS=aios:ci --build-arg AIOS_STATIC=aios-static:ci image/example
-          docker run --rm aios-example:ci | tee out/example.log
-          grep -qx 'Hello, world!' out/example.log
-          docker images 'aios-example'
+
+      - name: Test docker/ (Dockerfile and compose.yml)
+        run: |
+          # 多段の docker build: builder (aios) で ap -Sy cargo と cargo build --locked、aios-static に入れる。
+          # image はその場で作ったもの (Dockerfile の digest のかわりに)
+          docker build -t aios-serve:local --build-arg AIOS=aios:ci --build-arg AIOS_STATIC=aios-static:ci docker
+          docker images aios-serve
+          # compose の守りのまま起こし (読むだけの根、cap なし、no-new-privileges、65532、init、sysctls)、healthy を待つ
+          docker compose -f docker/compose.yml up -d --no-build
+          cid=$(docker compose -f docker/compose.yml ps -q aios)
+          st=
+          for i in $(seq 1 30); do
+            st=$(docker inspect -f '{{.State.Health.Status}}' "$cid")
+            [ "$st" = healthy ] && break
+            sleep 2
+          done
+          docker compose -f docker/compose.yml logs
+          echo "health: $st"
+          [ "$st" = healthy ]
+          curl -fsS http://127.0.0.1:8080/ | tee out/serve.log
+          grep -qx 'hello from aios' out/serve.log
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/)" = 405 ]
+          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}} sec={{.HostConfig.SecurityOpt}} init={{.HostConfig.Init}}' "$cid" | tee out/inspect.log
+          grep -q 'user=65532:65532 ro=true cap_drop=\[ALL\]' out/inspect.log
+          grep -q 'no-new-privileges:true' out/inspect.log
+          # 中の serve は 65532 で、PID 1 は init (tini)
+          docker top "$cid" -o user,pid,args
+          docker top "$cid" -o user,args | grep -q '^65532 .*serve'
+          docker compose -f docker/compose.yml down
 
       - name: Push
         if: github.ref == 'refs/heads/main'

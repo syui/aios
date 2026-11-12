@@ -1,0 +1,5 @@
+# build の context に入れないもの (image に入れない: 秘密、作ったもの、git)
+*
+!Cargo.toml
+!Cargo.lock
+!src/

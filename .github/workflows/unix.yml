@@ -16,6 +16,7 @@ on:
     # container image (image.yml が作る。OS のイメージには入らない)
     - '.github/workflows/image.yml'
     - 'image/**'
+    - 'docker/**'
     - 'pkg/ci.json'
     - 'pkg/c/**'
     - 'pkg/rust/uv/**'

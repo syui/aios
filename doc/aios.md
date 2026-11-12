@@ -371,23 +371,28 @@ ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアー�
 
 builder (image/aios.json の `"install": true`) は、パッケージをまるごと入れて、aipkg と同じ入れた記録
 (`/var/lib/aipkg/local/NAME-VER` の desc・files・install) をそのパッケージの層に書く。なので image の中の `ap -Q` は
-入っているものを知っていて、`ap -Sy NAME` は足すだけ (`--needed` なら入っているものは飛ばす)。docker build の FROM に:
+入っているものを知っていて、`ap -Sy NAME` は足すだけ (`--needed` なら入っているものは飛ばす)。docker build の FROM にして
+使う。見本は docker/ (Dockerfile、compose.yml、.dockerignore と、std だけの小さな HTTP サーバー serve):
 
-```dockerfile
-FROM ghcr.io/syui/aios AS builder
-RUN ap -Sy cargo                                   # pacman と同じく、はじめに -y
-WORKDIR /src
-COPY . .
-RUN . /etc/profile.d/cargo.sh && cargo build --release   # RUN はログインしないので、リンカの設定を読む
-
-FROM ghcr.io/syui/aios-static                      # base-devel なしなら rust-lld で静的。cc (base-devel) なら aios-cc
-COPY --from=builder /src/target/release/serve /usr/local/bin/serve
-USER 65532:65532
-CMD ["serve"]
+```bash
+docker compose -f docker/compose.yml up -d --build
 ```
 
-CI は image/example/Dockerfile (cargo init の Hello, world! を同じ形で) を、その場で作った image で docker build して
-動かす。arm64 だけ (x86 の docker では `--platform linux/arm64` と qemu)。
+- Dockerfile: `FROM ghcr.io/syui/aios` (builder) で `ap -Sy cargo` (pacman と同じく、はじめに -y)、要るもの
+  (Cargo.toml、Cargo.lock、src) だけを COPY、`. /etc/profile.d/cargo.sh && cargo build --release --locked` (RUN はログイン
+  しないシェルなので、リンカの設定を読む。base-devel がなければ rust-lld で静的)、`FROM ghcr.io/syui/aios-static` に
+  COPY --from して `USER 65532:65532`、`ENTRYPOINT` は絶対パス。FROM の image は tag と digest で固める (aios の image は
+  同じパッケージからいつも同じ digest)。.dockerignore は入れるものだけを書く (`*` のあとに `!Cargo.toml` など)
+- compose.yml: `read_only` と /tmp の tmpfs (noexec、nosuid、nodev)、`cap_drop: ALL`、`no-new-privileges`、
+  `user: 65532:65532`、`init: true` (tini: SIGTERM を渡し、ゾンビを片づける)、`ipc: private`、pids・mem (swap なし)・cpus・
+  nofile・core の上限、手元だけに出す ports (`127.0.0.1:8080`)、ログの上限、`serve --check` の healthcheck (distroless に
+  curl も sh もない)、コンテナの NET の namespace の sysctls (redirect と source route を受けない、ping_group_range、
+  ip_forward。net.mptcp.enabled は MPTCP のないカーネルでは消す)
+- serve: 読み書きは 5 秒で切る、頭は 8 KiB まで、同時に 64 まで (ほかは 503)、GET と HEAD のほかは 405、nosniff と no-store
+
+CI (image.yml) は、その場で作った aios と aios-static で docker/ を docker build し、compose の守りのまま起こして、healthy、
+curl、405、`docker inspect` (65532、読むだけ、cap なし、no-new-privileges)、`docker top` (中は 65532) をたしかめる。
+arm64 だけ (x86 の docker では `--platform linux/arm64` と qemu)。
 
 CI (.github/workflows/image.yml、arm64 の Ubuntu) が、ap をビルドして image/*.json を 2 回作り (1 バイトもちがわないか)、
 docker run でためして (node の版・nonroot・https、シェルがないこと、static に静的な hello、cc に musl の hello)、

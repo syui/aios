@@ -1,0 +1,17 @@
+# aios の docker の見本: 小さな HTTP サーバー (std だけ。依存なし)。docker/Dockerfile が aios の builder で作り、
+# aios-static (distroless) に入れる
+[package]
+name = "serve"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# aios のリポジトリの workspace には入れない (ひとりで作る見本)
+[workspace]

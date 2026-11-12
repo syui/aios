@@ -1,16 +1,53 @@
+# serve (docker/Dockerfile) を、できるだけ小さな権限で動かす
+#   docker compose -f docker/compose.yml up -d --build
+#   curl http://127.0.0.1:8080/
+# 動かすほうの image は distroless の aios-static (シェルも ap もない) で、serve は静的なバイナリ
 services:
   aios:
-    image: ghcr.io/syui/aios-cc:latest
-    command: ["serve"]
-    restart: always
+    build: .
+    image: aios-serve:local
+    restart: unless-stopped
+    # PID 1 を docker の init (tini) に: SIGTERM を serve へ渡し (docker stop で 10 秒待たない)、ゾンビを片づける
+    init: true
+    stop_grace_period: 5s
     user: "65532:65532"
     read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    pids_limit: 512
-    mem_limit: 512m
+    ipc: private
+    pids_limit: 128
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+      core: 0
+    environment:
+      ADDR: 0.0.0.0:8080
+    # 出すのは手元だけ (外へは前にリバースプロキシを置いて TLS で)
+    ports:
+      - "127.0.0.1:8080:8080"
+    # distroless に curl も sh もないので、serve 自身が聞く
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/serve", "--check"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+      start_interval: 2s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # コンテナの NET の namespace の中のもの (外のホストには効かない)。net.mptcp.enabled は MPTCP のないカーネルでは
+    # ないので、そのときは消す (コンテナが起きない)
     sysctls:
       net.mptcp.enabled: "0"
       net.ipv4.conf.all.send_redirects: "0"
@@ -23,3 +60,7 @@ services:
       net.ipv4.conf.default.accept_source_route: "0"
       net.ipv4.ping_group_range: "1 0"
       net.ipv4.ip_forward: "0"
+      net.ipv6.conf.all.accept_redirects: "0"
+      net.ipv6.conf.default.accept_redirects: "0"
+      net.ipv6.conf.all.accept_source_route: "0"
+      net.ipv6.conf.default.accept_source_route: "0"
