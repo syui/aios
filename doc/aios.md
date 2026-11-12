@@ -2206,6 +2206,50 @@ posix-cpu-timers と同じ:
 ものの時計、CPU の時計のタイマ) は Linux 7.4-rc1 と同じ (47 行。ALARM の時計は RTC があるかしだいなので見ない)。 `test/cputime.c` (clock_nanosleep の時計ごとの答えとプロセスの CPU の時計で眠ること、ユーザーで回したときと
 /dev/zero を読んだときの utime / stime、子の時間) も同じ (34 行)。
 
+### GPU の道 (DRM と virtio-gpu の 3D)
+
+いまの aios の画面は virtio-gpu の 2D (gpu.rs、/dev/fb0) だけで、GL と Vulkan は CPU で描く (Mesa の llvmpipe と lavapipe)。
+GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD128、major 226) が要る。順番は:
+
+1. 調べる (2026-11-12): Linux の VM で virgl を動かし、Mesa と libdrm が使う ioctl と /sys をとる (`test/drm-linux.sh`)
+2. カーネルの DRM (extra) と virtio-gpu の 3D (VIRGL の capset、3D の資源、SUBMIT_3D、fence)
+3. Mesa の virgl: pkg/c/mesa に virgl と GBM を入れた (`-Dgallium-drivers=llvmpipe,virgl`、`-Dgbm=enabled`)。
+   /dev/dri がなければ、いままでどおり llvmpipe で描く
+4. たしかめ: `test/egldraw.c` (EGL の surfaceless と GLES2 で 64x64 に描いて読み返す。ドライバによらず同じ答え) と kmscube
+5. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
+6. 本物の機械
+
+`test/drm-linux.sh [OUT]` は Alpine (aarch64、musl) の linux-virt と Mesa を APKINDEX から依存を解いて tar で広げ (apk も
+install のスクリプトも動かさない)、aios の Mesa (virgl) を /opt/c に入れて、QEMU の virtio-gpu-gl-device で起こす
+(xvfb-run と `-display sdl,gl=on`: ホストの virglrenderer が GL で描く)。drmdevice、modetest、kmscube、egldraw、eglinfo を
+strace して、OUT/t/ に NAME.st と NAME.out、/sys と dmesg を集める。気をつけること: QEMU の virtio-mmio はふつう legacy で
+見せるが、Linux の virtio_gpu は VERSION_1 がないと何も言わずに断る (`-global virtio-mmio.force-legacy=false`。aios の
+bin/run.sh も同じ)。Alpine の aarch64 の Mesa には virgl がない (`virtio_gpu: driver missing`)。
+
+Linux の答え (Linux 6.18 virt、Mesa 26.2.6、QEMU 8.2。このマシンに GPU はなく、ホストも llvmpipe で描く):
+
+- dmesg: `[drm] features: +virgl +edid -resource_blob -host_visible`、`-context_init`、画面 1 つ、capset 2 つ (VIRGL: 1 版
+  308 バイト、VIRGL2: 2 版 1384 バイト)、fbdev のまね (fb0)
+- ノード: /dev/dri/card0 (226:0)、/dev/dri/renderD128 (226:128)。Mesa は /dev/udmabuf と /dev/dri/card128 も見るが、なくてよい
+- /sys: libdrm の drmGetDevices2 は /sys/dev/char/226:N/uevent (MAJOR、MINOR、DEVNAME=dri/card0、DEVTYPE=drm_minor)、
+  device/uevent (DRIVER=virtio-mmio、OF_NAME=virtio_mmio、OF_FULLNAME=/virtio_mmio@a003e00、OF_COMPATIBLE_0=virtio,mmio、
+  OF_COMPATIBLE_N=1、MODALIAS)、device/subsystem (→ bus/platform)、device/drm/ を読む (device/vendor と device/device は
+  PCI だけ)。/sys/class/drm/ には card0、renderD128、card0-Virtual-1 (connector_id、dpms、edid、enabled、modes、status)、version
+- DRM の ioctl: VERSION、GET_CAP (PRIME は 3)、GEM_CLOSE、SET_CLIENT_CAP、GET_UNIQUE
+- virtio-gpu の ioctl: GETPARAM (1〜7: 3D_FEATURES、CAPSET_QUERY_FIX、RESOURCE_BLOB、HOST_VISIBLE、CROSS_DEVICE、
+  CONTEXT_INIT、SUPPORTED_CAPSET_IDs)、GET_CAPS (VIRGL2)、RESOURCE_CREATE、MAP (答えのオフセットで DRM の fd を
+  MAP_SHARED で mmap)、EXECBUFFER (out fence の sync_file を ppoll して閉じる)、WAIT
+- KMS: MODE_GETRESOURCES、GETCONNECTOR、GETENCODER、SETCRTC、ADDFB2 (GEM の handle のまま。PRIME なし)、PAGE_FLIP と
+  card0 の read (flip のできごと)。modetest は GETPLANERESOURCES、GETPLANE、OBJ_GETPROPERTIES、GETPROPERTY、GETPROPBLOB、
+  GETCRTC も。llvmpipe で KMS に出すときは CREATE_DUMB、MAP_DUMB と mmap
+- ioctl の番号 (type は 'd'): 0x00〜0x3f は DRM の core (VERSION 0x00、GET_UNIQUE 0x01、GEM_CLOSE 0x09、GET_CAP 0x0c、
+  SET_CLIENT_CAP 0x0d)、0x40 からドライバ (virtio-gpu: MAP 0x41、EXECBUFFER 0x42、GETPARAM 0x43、RESOURCE_CREATE 0x44、
+  WAIT 0x48、GET_CAPS 0x49)、0xa0 から KMS (GETRESOURCES 0xa0、GETCRTC 0xa1、SETCRTC 0xa2、GETENCODER 0xa6、
+  GETCONNECTOR 0xa7、GETPROPERTY 0xaa、GETPROPBLOB 0xac、PAGE_FLIP 0xb0、CREATE_DUMB 0xb2、MAP_DUMB 0xb3、
+  GETPLANERESOURCES 0xb5、GETPLANE 0xb6、ADDFB2 0xb8、OBJ_GETPROPERTIES 0xb9)
+- 速さ: kmscube (20 枚) は virgl で 26〜57 fps、VM の中の llvmpipe で 9〜11 fps (ホストの込みぐあいでゆれる)
+- aios (いまは /dev/dri がない) の egldraw は llvmpipe で描いて同じ答え
+
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 
 `test/ldiff.sh [--root] [--linux VER] [--fresh] NAME [ARG...]` は、出すだけのテスト (test/NAME.c) を作って (test/bin/NAME)、
