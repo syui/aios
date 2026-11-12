@@ -108,6 +108,49 @@ static USER_PT: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU];
 /// ページに書いたりしているあいだに、ほかのスレッドがロックなしで領域を外してページを返すことはない
 static BKL_PT: AtomicUsize = AtomicUsize::new(0);
 
+/// CPU ごとの、いま走らせているプロセスの fd の表 (proc::Shared<Files> の id。スケジューラの中や眠っているあいだは 0)。
+/// USER_PT と同じところで置く (set_user_files。exec や unshare で表が入れかわったときも)
+static USER_FILES: [AtomicUsize; MAXCPU] = [const { AtomicUsize::new(0) }; MAXCPU];
+/// 大きなロックを持っている CPU の fd の表 (USER_FILES)。スレッドで分けた表の大きなロックなしの close
+/// (file::fast_close_shared) は、表の箱 (FILES_WRITING) に印を立ててから、これが自分の表なら入らない。大きなロックの側は、
+/// これを置いてから、その箱の印が消えるのを待つ。大きなロックの中で表を読む人 (file_of で OpenFile を写す) は門を
+/// 通らないので、同じ表のスレッドが大きなロックを持っているあいだは、ロックなしで fd を外さない
+static BKL_FILES: AtomicUsize = AtomicUsize::new(0);
+/// fd の表のロックなしの close が表を変えている印 (表の id のハッシュの箱。ぶつかれば、ほかの表の大きなロックの側が
+/// 少し待つだけ)
+pub static FILES_WRITING: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+
+/// fd の表 (id) の箱
+// [lockless]
+pub fn files_box(files: usize) -> &'static AtomicUsize {
+    &FILES_WRITING[((files >> 6) ^ (files >> 12)) % FILES_WRITING.len()]
+}
+
+/// 大きなロックの持ち主がいまのプロセスの fd の表を使う: BKL_FILES を置いて、その表のロックなしの close を待つ
+fn own_user_files() {
+    let f = USER_FILES[id()].load(Ordering::Relaxed);
+    BKL_FILES.store(f, Ordering::SeqCst);
+    if f != 0 {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let b = files_box(f);
+        while b.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// スケジューラがプロセスへ切りかえる・もどった (0)、exec や unshare で fd の表が入れかわった。大きなロックを持って呼ぶ
+pub fn set_user_files(files: usize) {
+    USER_FILES[id()].store(files, Ordering::Relaxed);
+    own_user_files();
+}
+
+/// 大きなロックを持っている CPU が、いま使っている fd の表 (file::fast_close_shared が見る)
+// [lockless]
+pub fn bkl_files() -> usize {
+    BKL_FILES.load(Ordering::SeqCst)
+}
+
 /// 大きなロックの持ち主がいまのプロセスの表を使う: BKL_PT を置いて、その表のロックなしの書き手を待つ
 fn own_user_pt() {
     let pt = USER_PT[id()].load(Ordering::Relaxed);
@@ -168,6 +211,7 @@ pub fn lock() -> u64 {
     crate::heap::quar_check("lock");
     crate::vm::DROPPED_UNMAPPED[me - 1].store(0, Ordering::Relaxed);
     own_user_pt();
+    own_user_files();
     now
 }
 
@@ -185,6 +229,7 @@ fn try_lock() -> bool {
     c.since.store(if w != 0 { crate::timer::uptime_ns() } else { 0 }, Ordering::Relaxed);
     c.weight.store(w, Ordering::Relaxed);
     own_user_pt();
+    own_user_files();
     true
 }
 
@@ -196,6 +241,7 @@ fn release(now: u64) {
         add(&c.hold, now.saturating_sub(c.since.load(Ordering::Relaxed)) * w);
     }
     BKL_PT.store(0, Ordering::SeqCst);
+    BKL_FILES.store(0, Ordering::SeqCst);
     BKL.store(0, Ordering::Relaxed);
     // SERVING を書くのは持っているものだけなので、読んで書くだけでいい
     SERVING.store(SERVING.load(Ordering::Relaxed) + 1, Ordering::Release);

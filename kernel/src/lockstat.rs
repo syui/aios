@@ -147,6 +147,8 @@ pub fn text() -> alloc::string::String {
     s.push_str(&format!("パイプのロックなしの読み書き: {} (うち起こしを頼んだ {}、空で終わりか EAGAIN を返した {}。ふつうの道へ: 大きさ {} 表を変えている途中 {} パイプでない {} ページ {} いっぱい {} 空き {} 空 {} 写せない {})\n", fr[0], fr[6], fr[7], fr[2], fr[3], fr[4], fr[5], fr[8], fr[9], fr[10], fr[11]));
     let fo: Vec<u64> = crate::file::FAST_OPEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     s.push_str(&format!("ロックなしの open / close (file の棚): 棚から開いた {} 新しく開いた {} ない (ENOENT) と答えた {} 棚にしまった {} (ふつうの道へ: statc にない {} 棚になく新しくも開けない {} 開けない形 {} しまえない {})\n", fo[0], fo[7], fo[1], fo[2], fo[3], fo[4], fo[5], fo[6]));
+    let cs: Vec<u64> = crate::file::FAST_CLOSE_SHARED.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!("スレッドで分けた表のロックなしの close: {} (ふつうの道へ: 同じ表のスレッドが大きなロック {} 表を変えている途中 {} 閉じられない形 {} 落とすのを待つものがいっぱい {})\n", cs[0], cs[1], cs[2], cs[3], cs[4]));
     let ns: Vec<u64> = crate::fastdir::FAST_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let fw = [smp::FS_WAIT[0].load(Ordering::Relaxed), smp::FS_WAIT[1].load(Ordering::Relaxed)];
     s.push_str(&format!("ロックなしの作る・消す (fastdir、ext4 のロックで): 作った {} 消した {} (ふつうの道へ: 形 {} 親が statc にない {} ext4 が断った {})。ext4 のロックを待った {} 回 {:.1} ms\n", ns[0], ns[1], ns[2], ns[3], ns[4], fw[0], fw[1] as f64 / 1e6));

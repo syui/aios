@@ -800,8 +800,11 @@ pub fn fast_install(t: &mut proc::Files, fd: usize, file: FileRef, cloexec: bool
 pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
     let files = me.files.as_ref()?;
-    if !files.private() || OPEN_WATCHED.load(Relaxed) != 0 || crate::debug::FAIL_ON.load(Relaxed) {
+    if OPEN_WATCHED.load(Relaxed) != 0 || crate::debug::FAIL_ON.load(Relaxed) {
         return None;
+    }
+    if !files.private() {
+        return fast_close_shared(files, fd);
     }
     let t = files.get();
     let slot = t.fds.get_mut(fd as usize)?;
@@ -825,6 +828,105 @@ pub fn fast_close(me: &proc::Proc, fd: u64) -> Option<i64> {
     SHELVED.fetch_add(1, Relaxed);
     note(2);
     Some(0)
+}
+
+/// スレッドで分けた表の大きなロックなしの close の数: [0] 閉じた、ふつうの道へ: [1] 同じ表のスレッドが大きなロックを
+/// 持っている、[2] ほかの人が表を変えている途中、[3] 閉じられない形 (読むだけの口のふつうのファイルでない、ロック、
+/// 開いていない fd)、[4] 落とすのを待つものがたまった。/proc/bkl に出す
+pub static FAST_CLOSE_SHARED: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// スレッドで分けた表から大きなロックなしで外した OpenFile (Linux の fput の task_work と delayed_fput)。Rc の数は
+/// 大きなロックの中でしか変えないので、ここに移して (数は変えずに)、次に大きなロックを取ったシステムコールのはじめに
+/// 落とす (drop_closed)。外したときから、だれも表から引けないので、落とすのが遅れて見えるのは、ファイルの後片づけ
+/// (消したファイルの場所が返る) が少しあとになることだけ (IN_CLOSE の見張りがあれば、はじめから閉じない)
+static CLOSED: crate::spinlock::SpinLock<Closed> = crate::spinlock::SpinLock::new(Closed(Vec::new()));
+
+/// CLOSED の中身。ほかの CPU へ渡る Rc だが、Rc の数を変える (落とす) のは大きなロックの中の drop_closed だけで、
+/// 入れる側 (fast_close_shared) は表から移すだけ (数を変えない)
+struct Closed(Vec<FileRef>);
+// SAFETY: 上のとおり、Rc の数は大きなロックの中でしか変えない
+unsafe impl Send for Closed {}
+static CLOSED_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// 落とすのを待つものの上限 (大きなロックを取らずに close しつづけても、これ以上はためない)
+const CLOSED_MAX: usize = 256;
+
+/// スレッドで分けた表の close (fast_close から): 読むだけの口の ext4 のふつうのファイル (reuse の印) を、表から外して
+/// CLOSED に移す。表を読む人とは:
+/// - 大きなロックの中で読む人 (同じ表のスレッド。file_of で OpenFile を写す: 門を通らない) とは、表の箱
+///   (smp::FILES_WRITING) に印を立ててから、大きなロックの持ち主の表 (smp::bkl_files) が自分の表なら入らない。大きなロックの
+///   側は、持ち主の表を置いてから箱の印が消えるのを待つ (vm::PageTable::write_enter と同じ形)
+/// - 大きなロックなしで読む人 (門の users) とは、門を書く側で通って (proc::Gate::try_write: 変える人は 1 人ずつ。大きな
+///   ロックの中の set や、ほかのプロセスの表に置く seccomp の addfd とも)、見ている人がいなくなるのを待つ
+/// - ほかのプロセスの表を読む人 (procfs、pidfd_getfd: Files::get_other) とは、棚のロックの中で外す
+// [lockless]
+fn fast_close_shared(files: &proc::Shared<proc::Files>, fd: u64) -> Option<i64> {
+    use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let note = |i: usize| {
+        FAST_CLOSE_SHARED[i].fetch_add(1, Relaxed);
+        None
+    };
+    if CLOSED_N.load(Relaxed) >= CLOSED_MAX {
+        return note(4);
+    }
+    let id = files.id();
+    let b = crate::smp::files_box(id);
+    b.fetch_add(1, SeqCst);
+    core::sync::atomic::fence(SeqCst);
+    // 同じ表のスレッドが大きなロックを持っていれば、印を下ろして、放すのを少し待って (vm::spin_until) 1 度だけやりなおす
+    // (rg -j4 は、ほかのスレッドがはじめて開くファイルで大きなロックを持つあいだに閉じることが多い。すぐふつうの道へ
+    // 行くと、その大きなロックに並ぶ)
+    if crate::smp::bkl_files() == id {
+        b.fetch_sub(1, SeqCst);
+        if !crate::vm::spin_until(|| crate::smp::bkl_files() != id) {
+            return note(1);
+        }
+        b.fetch_add(1, SeqCst);
+        core::sync::atomic::fence(SeqCst);
+    }
+    let r = if crate::smp::bkl_files() == id {
+        note(1)
+    } else {
+        let t = files.get();
+        match t.gate.try_write() {
+            None => note(2),
+            Some(w) => {
+                let taken = {
+                    let _s = t.shelf.0.lock();
+                    let slot = t.fds.get_mut(fd as usize);
+                    // 借りずに見る (ほかのスレッドが大きなロックなしで読んでいたかもしれないが、もう門の外)
+                    let ok = slot.as_ref().and_then(|s| s.as_ref()).is_some_and(|s| {
+                        let of = unsafe { &*s.file.as_ptr() };
+                        of.reuse && !of.locked && !t.posix_locked
+                    });
+                    if ok { slot.and_then(|s| s.take()) } else { None }
+                };
+                drop(w);
+                match taken {
+                    Some(f) => {
+                        CLOSED.lock().0.push(f.file);
+                        CLOSED_N.fetch_add(1, Relaxed);
+                        FAST_CLOSE_SHARED[0].fetch_add(1, Relaxed);
+                        Some(0)
+                    }
+                    None => note(3),
+                }
+            }
+        }
+    };
+    b.fetch_sub(1, SeqCst);
+    r
+}
+
+/// 大きなロックの中で (システムコールのはじめ): fast_close_shared が外した OpenFile を落とす (最後の参照なら、そこで
+/// 閉じたあとの片づけ)。落とすのは CLOSED のロックの外で
+pub fn drop_closed() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if CLOSED_N.load(Relaxed) == 0 {
+        return;
+    }
+    let v = core::mem::take(&mut CLOSED.lock().0);
+    CLOSED_N.fetch_sub(v.len(), Relaxed);
+    drop(v);
 }
 
 /// 大きなロックの中で: 棚から、which が真のものを捨てる (みなの表の)。捨てた OpenFile はそこで落ちる。open_too なら、

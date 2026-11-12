@@ -148,11 +148,14 @@ impl Drop for Files {
 /// 表を大きなロックなしで見ている数 (users) と、変えている数 (mutators)。見る側は users を増やしてから
 /// mutators を見て、0 でなければやめる。変える側 (大きなロックの中) は mutators を増やしてから users が 0 に
 /// なるのを待つ。どちらかがかならず相手に気づくので、見ているあいだに fd が閉じられて OpenFile が消えたり、
-/// 表が伸びて場所が変わったりしない (vm.rs の fast_fault と同じ形)
+/// 表が伸びて場所が変わったりしない (vm.rs の fast_fault と同じ形)。変える人は 1 人ずつ (writer: 持っている CPU + 1。
+/// 大きなロックの中の set と add は入れ子で取る)。大きなロックの外で変えるのは、スレッドで分けた表の close
+/// (file::fast_close_shared) だけ
 #[derive(Default)]
 pub struct Gate {
     users: core::sync::atomic::AtomicUsize,
     mutators: core::sync::atomic::AtomicUsize,
+    writer: core::sync::atomic::AtomicUsize,
 }
 
 impl Clone for Gate {
@@ -162,12 +165,17 @@ impl Clone for Gate {
     }
 }
 
-/// 変えているあいだ (落とすと mutators を戻す)
-pub struct GateWrite(*const Gate);
+/// 変えているあいだ (落とすと mutators を戻し、取ったなら writer を放す)
+pub struct GateWrite(*const Gate, bool);
 
 impl Drop for GateWrite {
+    // [lockless]
     fn drop(&mut self) {
-        unsafe { (*self.0).mutators.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) };
+        let g = unsafe { &*self.0 };
+        g.mutators.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        if self.1 {
+            g.writer.store(0, core::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -181,15 +189,42 @@ impl Drop for GateRead<'_> {
 }
 
 impl Gate {
-    /// 変える (大きなロックの中で)。見ている人がいなくなるまで待つ
+    /// 変える (大きなロックの中で)。ほかに変えている人 (大きなロックの外の close) がいれば終わるのを待ち、見ている人が
+    /// いなくなるまで待つ
     fn write(&self) -> GateWrite {
+        use core::sync::atomic::Ordering::{Acquire, Relaxed};
+        let me = crate::smp::id() + 1;
+        let took = self.writer.load(Relaxed) != me;
+        if took {
+            while self.writer.compare_exchange(0, me, Acquire, Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
+        }
+        self.enter_write(took)
+    }
+
+    /// 大きなロックの外で変える (file::fast_close_shared)。ほかに変えている人がいれば、終わるのを少し待つ (vm::spin_until:
+    /// ほかのスレッドの close はすぐ終わる)。待ちきれなければ None (ふつうの道へ)。見ている人がいなくなるまで待つ (すぐ
+    /// 終わる。見ている人は眠らない)
+    // [lockless]
+    pub fn try_write(&self) -> Option<GateWrite> {
+        use core::sync::atomic::Ordering::{Acquire, Relaxed};
+        let me = crate::smp::id() + 1;
+        if !crate::vm::spin_until(|| self.writer.compare_exchange(0, me, Acquire, Relaxed).is_ok()) {
+            return None;
+        }
+        Some(self.enter_write(true))
+    }
+
+    // [lockless]
+    fn enter_write(&self, took: bool) -> GateWrite {
         use core::sync::atomic::{Ordering::SeqCst, fence};
         self.mutators.fetch_add(1, SeqCst);
         fence(SeqCst);
         while self.users.load(SeqCst) != 0 {
             core::hint::spin_loop();
         }
-        GateWrite(self)
+        GateWrite(self, took)
     }
 
     /// 大きなロックなしで見る。だれかが変えている途中なら None (ふつうの道へ)
@@ -1458,6 +1493,7 @@ pub fn scheduler() -> ! {
                 // このプロセスの表を、大きなロックの持ち主の表に (smp.rs の BKL_PT。スレッドで分けた表のロックなしの
                 // mmap / munmap は、そのあいだ入らない)
                 crate::smp::set_user_pt(p.pt() as *const crate::vm::PageTable as usize);
+                crate::smp::set_user_files(p.files.as_ref().map_or(0, |f| f.id()));
                 fp_load(&p.fp);
                 // ユーザーに戻るときの PSTATE.SSBS は、切りかえのたびにスレッドの印から (Linux の __switch_to)
                 if !p.kthread {
@@ -1471,6 +1507,7 @@ pub fn scheduler() -> ! {
                 (p.ran_at, p.kern_at) = (t, t);
                 swtch(sched_ctx(), &p.context);
                 crate::smp::set_user_pt(0);
+                crate::smp::set_user_files(0);
                 // 走った時間とカーネルの時間を足す (終わったスレッドは、終わるときに代表へわたして 0 にしている)
                 let q = &mut procs()[i];
                 let now = crate::timer::uptime_ns();
@@ -1799,6 +1836,7 @@ fn exit_status(status: i32) -> ! {
         }
         let p = current();
         p.files = None;
+        crate::smp::set_user_files(0);
         p.state = State::Zombie;
         sched();
         unreachable!("zombie thread ran");
@@ -1815,6 +1853,7 @@ fn exit_status(status: i32) -> ! {
     drop(_p);
     let _p = crate::debug::span("proc:exit_files");
     p.files = None;
+    crate::smp::set_user_files(0);
     crate::file::release_deferred(true);
     p.timers.clear();
     drop(_p);
@@ -1928,6 +1967,7 @@ pub fn unshare(flags: u64) -> Result<i64, i64> {
     p.sync_cred_work();
     if flags & CLONE_FILES != 0 {
         let f = Shared::new(p.files().clone());
+        crate::smp::set_user_files(f.id());
         p.files = Some(f);
     }
     Ok(0)
@@ -2161,8 +2201,9 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     // vfork の子: 親のメモリを離れたので、親は動ける
     vfork_done(p);
     // files を他と共有していたなら切り離す
-    let files = p.files().clone();
-    p.files = Some(Shared::new(files));
+    let files = Shared::new(p.files().clone());
+    crate::smp::set_user_files(files.id());
+    p.files = Some(files);
     // 大きい番号から閉じる (Linux 7.4 の close_cloexec_files)
     for f in p.files().fds.iter_mut().rev() {
         if f.as_ref().is_some_and(|f| f.cloexec) {

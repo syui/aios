@@ -3673,8 +3673,9 @@ pub fn free_deferred() {
 const SPIN_NS: u64 = 500_000;
 
 /// cond が真になるまで回って待つ (SPIN_NS まで。時計は 64 回に 1 回だけ読む: TCG では読むのが重い)。こえたら false
+/// (file::fast_close_shared も使う)
 // [lockless]
-fn spin_until(mut cond: impl FnMut() -> bool) -> bool {
+pub fn spin_until(mut cond: impl FnMut() -> bool) -> bool {
     let mut deadline = 0;
     let mut i = 0u32;
     loop {

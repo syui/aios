@@ -377,6 +377,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     crate::debug::count_sys(nr);
     // ヒープが予備にまで手をつけていれば、ここ (安全なところ) で空ける (oom.rs)
     crate::oom::check();
+    // スレッドで分けた表から大きなロックなしで閉じたもの (file::fast_close_shared) を落とす (Linux の fput の task_work)
+    crate::file::drop_closed();
     // seccomp: かかっていれば、フィルタの答えにしたがう (security::seccomp_permit_syscall。s は写して持つ: user notification
     // で眠るあいだに、ほかのスレッドの TSYNC で入れかわっても消えないように)
     if let Some(s) = p.cred.seccomp.clone() {

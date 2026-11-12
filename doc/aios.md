@@ -649,6 +649,23 @@ modify_dir_block が版を進める: .. を書きかえるだけで inode を書
 (あるとふつうの道だけで読む) をつけたときとバイトまで同じかを見る (ホストの Linux でも通る)。git status は 0.072 → 0.040 秒 (大きなロックを
 持つのは 19 ms: close と page fault)。
 
+それから、スレッドで表を分けたプロセスの close も大きなロックの外へ (`file::fast_close_shared`)。rg -j4 は 2 万のファイルを
+閉じるのにみな大きなロックを取っていた (棚は自分だけの表のもの)。表から fd を外すときに気をつけるのは、表を読む 3 種類の人:
+(1) 大きなロックの中で同じ表を読む人 (同じ表のスレッドの file_of: 門を通らずに OpenFile を写す) とは、mmap と同じ形で
+すれちがわない: close する側は表の箱 (`smp::FILES_WRITING`) に印を立ててから、大きなロックの持ち主の表 (`smp::bkl_files`。
+スケジューラが USER_PT といっしょに置き、exec と unshare で入れかえる) が自分の表なら、放すのを少し (500 µs まで) 待って
+1 度だけやりなおす。大きなロックを取る側は、持ち主の表を置いてから箱の印が消えるのを待つ。(2) 大きなロックなしで読む人
+(門の users) とは、門を書く側で通る (`proc::Gate::try_write`。変える人は 1 人ずつ: 大きなロックの中の set と add も、
+ほかのプロセスの表に置く seccomp の addfd も、この印を取る)。(3) ほかのプロセスの表を読む procfs と pidfd_getfd
+(Files::get_other) とは、棚のロックの中で外す。外した OpenFile は Rc の数を変えずに CLOSED に移し、次に大きなロックを
+取ったシステムコールのはじめに落とす (`file::drop_closed`。Linux の fput の task_work と delayed_fput)。読むだけの口の
+ext4 のふつうのファイル (reuse の印) で、ロックがなく、IN_OPEN / IN_CLOSE の見張りがないものだけ (書く口は閉じるときに
+IN_CLOSE_WRITE や書くものの数が要る)。test/closeshared.c が、閉じたあとの EBADF、/proc/self/fd、いちばん小さい fd の
+使いなおし、4 つのスレッドの開いて読んで閉じるのと dup2・fstat・fork、閉じては開きなおす fd を読むほかのスレッド、閉じて
+消したファイルの場所がもどることを見る (ホストの Linux でも通る)。rg -j4 の大きなロックの close は 2 万回 → 1579 回
+(のこりはディレクトリ)、大きなロックを待った時間は 680 → 114 ms、はじめての rg は 1.05 → 0.97〜1.01 秒 (Linux 7.4 は
+0.96 秒)、2 度目は 0.85 → 0.81 秒。
+
 はじめての open-close は 55 µs から 23 µs に、fsbench の open-close は 62 µs から 22〜24 µs に (Linux 7.3 は 23.6 µs)。
 書く口で開くものがパスの覚えを引かなくなったので、write-4k も 120 µs から 92〜126 µs に (Linux は 140 µs)。答えは
 test/openfast.c (リンクのディレクトリを通ったものの /proc/self/fd、許し、ETXTBSY、置きかえと消したもの。どれも 2 回目は
