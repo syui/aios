@@ -1145,7 +1145,8 @@ fn create_target(mut p: vfs::Parent, follow: bool) -> Result<Found, i64> {
         }
         p.alive()?;
         p.name_ok()?;
-        let link = match p.dir.lookup(&p.name) {
+        // あるものは、かぶせてあればその上のもの (ファイルの bind マウント: /etc/hosts などを O_CREAT で開いても下に書かない)
+        let link = match p.dir.lookup(&p.name).map(vfs::cross) {
             Ok(c) if follow && c.meta().mode & S_IFMT == vfs::S_IFLNK => c.readlink()?,
             Ok(c) => return Ok(Ok((p.full, c))),
             Err(e) if e == -ENOENT => return Ok(Err((p.dir, p.name, p.full))),
@@ -1363,6 +1364,13 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
     if ino.meta().is_dir() && (accmode != file::O_RDONLY || flags & O_TRUNC != 0) {
         return Err(-EISDIR);
     }
+    // ふつうのファイルを書く口で (O_TRUNC も)。Linux の順: O_TRUNC なら許可を見る前に読むだけのマウントか (do_open の
+    // mnt_want_write: EROFS)、許可 (may_open)、動かしているプログラムか (ETXTBSY) と読むだけのマウントか (EROFS:
+    // do_dentry_open の file_get_write_access)、それから LSM (security_file_open)。デバイスや FIFO はかまわない
+    let reg_write = ino.meta().mode & S_IFMT == vfs::S_IFREG && (accmode != file::O_RDONLY || flags & O_TRUNC != 0);
+    if reg_write && flags & O_TRUNC != 0 {
+        vfs::check_writable(&full)?;
+    }
     let want = match accmode {
         file::O_RDONLY => PR,
         file::O_WRONLY => PW,
@@ -1373,6 +1381,12 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         return Err(-vfs::EPERM);
     }
     vfs::may(&ino, &ino.meta(), cred::current(), want)?;
+    if reg_write {
+        if proc::executing(ino.id()) {
+            return Err(-ETXTBSY);
+        }
+        vfs::check_writable(&full)?;
+    }
     // LSM (security_file_open): 開く口の許しをパスで (AppArmor、それから landlock: ディレクトリは READ_DIR、ほか (デバイスも)
     // は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE)。あとで使う TRUNCATE と (デバイスなら) IOCTL_DEV の許しを、開いた
     // ファイルに覚える (lsm_deny: Linux の hook_file_open)
@@ -1410,14 +1424,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
         vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
-            // ふつうのファイルを書くために開く: 読むだけのマウントの下なら EROFS (デバイスはかまわない)。
-            // 動かしているプログラムなら ETXTBSY (Linux の get_write_access)
-            if accmode != file::O_RDONLY || flags & O_TRUNC != 0 {
-                vfs::check_writable(&full)?;
-                if proc::executing(ino.id()) {
-                    return Err(-ETXTBSY);
-                }
-            }
+            // (書く口なら EROFS と ETXTBSY は上で見た: reg_write)
             // O_TRUNC は O_RDONLY でも切りつめる (書く許可は上で確かめた。Linux の do_open と同じ)
             if flags & O_TRUNC != 0 {
                 vfs::drop_privs(&ino)?;
@@ -2744,11 +2751,16 @@ pub fn chdir(pathp: usize) -> R {
     Ok(0)
 }
 
-/// chroot(path): このプロセス (と子) の / を path にする。root だけ
+/// chroot(path): このプロセス (と子) の / を path にする。root か、ユーザーの namespace の中 (Linux の
+/// ns_capable(current_user_ns(), CAP_SYS_CHROOT): unshare -r chroot DIR。中の setuid は効かず、外の自分のファイルの
+/// 見えかたが変わるだけ。LSM は聞く)
 pub fn chroot(pathp: usize) -> R {
     let path = user_str(pathp)?;
-    // 砂場の中からは、見える根を変えられない (Linux の landlock と同じ)
-    if !cred::current().capable(cred::CAP_SYS_CHROOT) || cred::current().sandbox.is_some() {
+    let c = cred::current();
+    let may = if c.ns.user.is_some() { crate::security::capable(c, cred::CAP_SYS_CHROOT, true) } else { c.capable(cred::CAP_SYS_CHROOT) };
+    // 砂場 (landlock) の中でもできる (Linux の landlock は chroot を見ない: 書けるところは inode で決まるので変わらない)。
+    // aibox --image は seccomp で止める (chroot だけの container の外へ出られないように)
+    if !may {
         return Err(-cred::EPERM);
     }
     let files = proc::current().files();
@@ -2772,7 +2784,7 @@ fn may_mount() -> Result<(), i64> {
     Ok(())
 }
 
-/// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリ)。
+/// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリとファイル)。
 /// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。MS_RDONLY で読むだけ
 /// (MS_REMOUNT で付けなおせる)。移す (MS_MOVE) はない
 pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize) -> R {
@@ -2800,25 +2812,30 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
         return Ok(0);
     }
     let (full, dir) = vfs::lookup(&cwd, &target, true)?;
-    if !dir.meta().is_dir() {
-        return Err(-ENOTDIR);
-    }
     if flags & MS_BIND != 0 {
         let src = user_str(srcp)?;
         let (sfull, s) = vfs::lookup(&cwd, &src, true)?;
-        if !s.meta().is_dir() {
-            return Err(crate::why::inval());
+        // ディレクトリにはディレクトリを、ファイル (デバイスなども) にはファイルを (Linux の graft_tree: ちがえば ENOTDIR)。
+        // ファイルの bind は、そのファイルの inode にかぶせる (ハードリンクのほかの名前からも同じに見える)
+        if s.meta().is_dir() != dir.meta().is_dir() {
+            return Err(-ENOTDIR);
         }
         vfs::mount_bind(&full, s, &sfull, flags & MS_RDONLY != 0)?;
         return Ok(0);
     }
+    if !dir.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
     let (root, source, fstype) = {
         let fstype = user_str(typep)?;
         let root = match fstype.as_str() {
-            // /tmp と同じく、だれでも作れて他人のものは消せない (Linux の tmpfs の既定)
+            // /tmp と同じく、だれでも作れて他人のものは消せない (Linux の tmpfs の既定)。持ち主はマウントした人
+            // (Linux の shmem_init_fs_context: current_fsuid / fsgid。ユーザーの namespace の中では中の自分に見える)
             "tmpfs" => {
                 let r: InodeRef = crate::tmpfs::new_root();
                 r.set_mode(0o1777)?;
+                let c = cred::current();
+                r.set_owner(Some(c.fsuid), Some(c.fsgid))?;
                 r
             }
             // 装置のないもの (proc、sysfs、securityfs、efivarfs: vfs::register_filesystem で置いたもの。知らなければ ENODEV)

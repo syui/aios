@@ -61,10 +61,11 @@ fn read_body_to(r: &mut impl BufRead, headers: &[(String, String)], out: &mut dy
     }
 }
 
-type Headers = Vec<(String, String)>;
+pub type Headers = Vec<(String, String)>;
 
-/// 要求を送って、応答の頭まで読む。(status, headers, 中身の読み手)。from > 0 なら Range: bytes=from-
-fn send(url: &Url, stream: Box<dyn ReadWrite>, from: u64) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>)> {
+/// 要求を送って、応答の頭まで読む。(status, headers, 中身の読み手)。from > 0 なら Range: bytes=from-。
+/// extra はほかのヘッダー (Accept があれば */* のかわりに)
+fn send(url: &Url, stream: Box<dyn ReadWrite>, from: u64, extra: &[(String, String)]) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>)> {
     let mut r = BufReader::new(stream);
     let host = if (url.scheme, url.port) == ("http", 80) || (url.scheme, url.port) == ("https", 443) {
         url.host.to_string()
@@ -72,10 +73,17 @@ fn send(url: &Url, stream: Box<dyn ReadWrite>, from: u64) -> io::Result<(u16, He
         format!("{}:{}", url.host, url.port)
     };
     let range = if from > 0 { format!("Range: bytes={}-\r\n", from) } else { String::new() };
+    let mut more = String::new();
+    if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+        more.push_str("Accept: */*\r\n");
+    }
+    for (k, v) in extra {
+        more.push_str(&format!("{}: {}\r\n", k, v));
+    }
     write!(
         r.get_mut(),
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: aipkg/0.1 (aios)\r\nAccept: */*\r\n{}Connection: close\r\n\r\n",
-        url.path, host, range
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: aipkg/0.1 (aios)\r\n{}{}Connection: close\r\n\r\n",
+        url.path, host, more, range
     )?;
     r.get_mut().flush()?;
     let mut status = String::new();
@@ -184,9 +192,11 @@ fn base64(b: &[u8]) -> String {
     out
 }
 
-/// url を開いて (リダイレクトをたどって) 応答の頭まで。https は tls で包む
-fn open(url: &str, tls: Option<Connector>, from: u64) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>, String)> {
+/// url を開いて (リダイレクトをたどって) 応答の頭まで。https は tls で包む。extra のヘッダーは、ほかのホストへ
+/// リダイレクトしたら Authorization を落とす (registry の blob は CDN へ行く: そこへ鍵を見せない)
+fn open(url: &str, tls: Option<Connector>, from: u64, extra: &[(String, String)]) -> io::Result<(u16, Headers, BufReader<Box<dyn ReadWrite>>, String)> {
     let mut url = url.to_string();
+    let mut extra = extra.to_vec();
     for _ in 0..5 {
         let u = parse_url(&url)?;
         let stream: Box<dyn ReadWrite> = match u.scheme {
@@ -196,11 +206,15 @@ fn open(url: &str, tls: Option<Connector>, from: u64) -> io::Result<(u16, Header
                 None => return Err(io::Error::other("https is not supported")),
             },
         };
-        let (code, headers, r) = send(&u, stream, from)?;
+        let (code, headers, r) = send(&u, stream, from, &extra)?;
         if matches!(code, 301 | 302 | 303 | 307 | 308) {
             let loc = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
             let loc = loc.ok_or_else(|| io::Error::other("redirect without location"))?;
-            url = if loc.starts_with("http") { loc } else { format!("{}://{}:{}{}", u.scheme, u.host, u.port, loc) };
+            let next = if loc.starts_with("http") { loc } else { format!("{}://{}:{}{}", u.scheme, u.host, u.port, loc) };
+            if parse_url(&next).map_or(true, |n| (n.scheme, n.host, n.port) != (u.scheme, u.host, u.port)) {
+                extra.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+            }
+            url = next;
             continue;
         }
         return Ok((code, headers, r, url));
@@ -208,9 +222,18 @@ fn open(url: &str, tls: Option<Connector>, from: u64) -> io::Result<(u16, Header
     Err(io::Error::other("too many redirects"))
 }
 
+/// ヘッダーをつけて GET し、(status, headers, 中身) を返す (200 でなくても。registry の 401 の WWW-Authenticate を見る)
+#[allow(dead_code)]
+pub fn get_with(url: &str, tls: Option<Connector>, extra: &[(String, String)]) -> io::Result<(u16, Headers, Vec<u8>)> {
+    let (code, headers, mut r, _) = open(url, tls, 0, extra)?;
+    let mut body = Vec::new();
+    read_body_to(&mut r, &headers, &mut body)?;
+    Ok((code, headers, body))
+}
+
 /// url を GET して中身を返す (小さいもの用。大きいものは download)
 pub fn get(url: &str, tls: Option<Connector>) -> io::Result<Vec<u8>> {
-    let (code, headers, mut r, url) = open(url, tls, 0)?;
+    let (code, headers, mut r, url) = open(url, tls, 0, &[])?;
     if code != 200 {
         return Err(io::Error::other(format!("{}: HTTP {}", url, code)));
     }
@@ -243,12 +266,17 @@ impl<W: Write> Write for Count<'_, W> {
 /// url を path へ、メモリにためずに書く。途中は path.part に置き、切れたら続きから (Range) 取りなおす。
 /// 進むたびに progress(書けたバイト数, 全体のバイト数 (わからなければ 0)) を呼ぶ
 pub fn download(url: &str, tls: Option<Connector>, path: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+    download_with(url, tls, &[], path, progress)
+}
+
+/// download と同じだが、ヘッダーをつけて (registry の blob: Authorization)
+pub fn download_with(url: &str, tls: Option<Connector>, extra: &[(String, String)], path: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
     use std::fs::{self, OpenOptions};
     let part = format!("{}.part", path);
     let mut last = io::Error::other("download failed");
     for _ in 0..5 {
         let have = fs::metadata(&part).map_or(0, |m| m.len());
-        let (code, headers, mut r, u) = match open(url, tls, have) {
+        let (code, headers, mut r, u) = match open(url, tls, have, extra) {
             Ok(x) => x,
             Err(e) => {
                 last = e;

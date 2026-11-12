@@ -19,6 +19,7 @@
 // OUT が .tar なら OCI archive (docker load、skopeo copy oci-archive:)、ほかは OCI layout のディレクトリ。既定は NAME.tar。
 // パッケージは /etc/aipkg.conf (--conf) の Server から取る。置き場は $XDG_CACHE_HOME/aipkg か ~/.cache/aipkg
 // (/var/cache/aipkg にチェックサムの合うものがあれば、それを使う)。root でなくてよい
+use crate::ocistore::{self, Ref};
 use crate::{dep_name, die, fetch_any, fetch_any_to, get, list, parse_conf, parse_desc, provider, sha256_file, tar_reader, Desc, CACHE, CONF, DB_FILE};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -423,6 +424,25 @@ fn archive(dir: &str, out: &str, t: u64) -> io::Result<()> {
 }
 
 pub fn main(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("pull") => {
+            if args.len() < 2 {
+                die("usage: ap image pull NAME...");
+            }
+            for a in &args[1..] {
+                pull(a).unwrap_or_else(|e| die(format!("pull {}: {}", a, e)));
+            }
+            return;
+        }
+        Some("ls") => return ls(),
+        Some("rm") => {
+            if args.len() < 2 {
+                die("usage: ap image rm NAME...");
+            }
+            return rm(&args[1..]);
+        }
+        _ => {}
+    }
     let (mut conf, mut out, mut def) = (CONF.to_string(), None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -648,4 +668,194 @@ pub fn main(args: &[String]) {
     }
     let _ = fs::remove_dir_all(&work);
     println!("image: {}:{} sha256:{} ({})", name, version, md, out);
+}
+
+// ---- registry (ap image pull) ----
+// OCI の distribution の API (GET /v2/NAME/manifests/TAG と /v2/NAME/blobs/DIGEST) で、名前のない人として
+// (401 なら WWW-Authenticate の Bearer の realm から token を取る: ghcr.io も Docker Hub も)。index (いくつもの CPU の
+// もの) なら linux/arm64 のものを。blob は sha256 をたしかめてから置き場 (ocistore) へ
+
+const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
+
+struct Registry {
+    base: String,
+    auth: Option<String>,
+}
+
+fn header<'a>(h: &'a crate::http::Headers, k: &str) -> Option<&'a str> {
+    h.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str())
+}
+
+/// Bearer realm="...",service="...",scope="..." の組
+fn auth_params(www: &str) -> Option<BTreeMap<String, String>> {
+    let rest = www.strip_prefix("Bearer ").or_else(|| www.strip_prefix("bearer "))?;
+    let mut out = BTreeMap::new();
+    let mut s = rest.trim();
+    while !s.is_empty() {
+        let (k, v) = s.split_once('=')?;
+        let v = v.trim_start();
+        let (val, next) = if let Some(q) = v.strip_prefix('"') {
+            let end = q.find('"')?;
+            (&q[..end], &q[end + 1..])
+        } else {
+            let end = v.find(',').unwrap_or(v.len());
+            (&v[..end], &v[end..])
+        };
+        out.insert(k.trim().to_ascii_lowercase(), val.to_string());
+        s = next.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
+    }
+    Some(out)
+}
+
+impl Registry {
+    fn headers(&self, accept: &str) -> Vec<(String, String)> {
+        let mut h = vec![("Accept".to_string(), accept.to_string())];
+        if let Some(a) = &self.auth {
+            h.push(("Authorization".to_string(), a.clone()));
+        }
+        h
+    }
+
+    fn get(&mut self, path: &str, accept: &str) -> io::Result<(u16, crate::http::Headers, Vec<u8>)> {
+        let url = format!("{}{}", self.base, path);
+        let (code, h, b) = crate::http::get_with(&url, Some(crate::tls::connect), &self.headers(accept))?;
+        if code == 401 && self.auth.is_none() {
+            let www = header(&h, "www-authenticate").ok_or_else(|| io::Error::other("401 without WWW-Authenticate"))?.to_string();
+            self.login(&www)?;
+            return self.get(path, accept);
+        }
+        Ok((code, h, b))
+    }
+
+    /// 名前のない人の token (pull だけ)
+    fn login(&mut self, www: &str) -> io::Result<()> {
+        let p = auth_params(www).ok_or_else(|| io::Error::other(format!("unsupported auth: {}", www)))?;
+        let realm = p.get("realm").ok_or_else(|| io::Error::other("no realm"))?;
+        let mut q = vec![];
+        for k in ["service", "scope"] {
+            if let Some(v) = p.get(k) {
+                q.push(format!("{}={}", k, v.replace(' ', "%20")));
+            }
+        }
+        let url = if q.is_empty() { realm.clone() } else { format!("{}{}{}", realm, if realm.contains('?') { '&' } else { '?' }, q.join("&")) };
+        let b = crate::http::get(&url, Some(crate::tls::connect))?;
+        let v: Value = serde_json::from_slice(&b).map_err(|e| io::Error::other(format!("token: {}", e)))?;
+        let t = v["token"].as_str().or_else(|| v["access_token"].as_str()).ok_or_else(|| io::Error::other("token: none"))?;
+        self.auth = Some(format!("Bearer {}", t));
+        Ok(())
+    }
+
+    /// manifest (か index) を取る: (中身, mediaType, digest)。digest で取るものは中身の sha256 とくらべる
+    fn manifest(&mut self, reference: &str) -> io::Result<(Vec<u8>, String, String)> {
+        let (code, h, b) = self.get(&format!("/manifests/{}", reference), ACCEPT)?;
+        if code != 200 {
+            return Err(io::Error::other(format!("manifest {}: HTTP {} {}", reference, code, String::from_utf8_lossy(&b[..b.len().min(200)]).trim())));
+        }
+        let digest = format!("sha256:{}", ocistore::sha256(&b));
+        if reference.starts_with("sha256:") && reference != digest {
+            return Err(io::Error::other(format!("manifest {}: sha256 mismatch ({})", reference, digest)));
+        }
+        let v: Value = serde_json::from_slice(&b).map_err(|e| io::Error::other(format!("manifest: {}", e)))?;
+        let media = v["mediaType"].as_str().map(String::from).or_else(|| header(&h, "content-type").map(|c| c.split(';').next().unwrap_or("").trim().to_string())).unwrap_or_default();
+        Ok((b, media, digest))
+    }
+}
+
+/// ap image pull NAME: 置き場に入れて、名前をつける
+fn pull(name: &str) -> io::Result<()> {
+    let r = Ref::parse(name);
+    let st = ocistore::store();
+    let mut reg = Registry { base: format!("https://{}/v2/{}", r.host(), r.repo), auth: None };
+    println!("pull: {}", r.full());
+    let (body, media, top) = reg.manifest(&r.tag)?;
+    st.put(&body)?;
+    let top_desc = json!({"mediaType": media, "digest": top, "size": body.len()});
+    let v: Value = serde_json::from_slice(&body).map_err(|e| io::Error::other(e.to_string()))?;
+    let (m, md) = if ocistore::is_index(&v, &media) {
+        let d = ocistore::pick(&v).ok_or_else(|| io::Error::other("no linux/arm64 image"))?;
+        let d = d["digest"].as_str().ok_or_else(|| io::Error::other("no digest"))?.to_string();
+        let (b, _, got) = reg.manifest(&d)?;
+        st.put(&b)?;
+        (serde_json::from_slice::<Value>(&b).map_err(|e| io::Error::other(e.to_string()))?, got)
+    } else {
+        (v, top.clone())
+    };
+    let mut blobs = vec![m["config"].clone()];
+    blobs.extend(m["layers"].as_array().cloned().unwrap_or_default());
+    let n = blobs.len();
+    for (i, b) in blobs.iter().enumerate() {
+        let d = b["digest"].as_str().ok_or_else(|| io::Error::other("blob without digest"))?;
+        let size = b["size"].as_u64().unwrap_or(0);
+        if st.has(d) {
+            continue;
+        }
+        let what = if i == 0 { "config".to_string() } else { format!("layer {}/{}", i, n - 1) };
+        println!("pull: {} {} ({} KiB)", what, &d[..19.min(d.len())], size / 1024);
+        let dst = st.blob(d)?;
+        fs::create_dir_all(dst.parent().unwrap())?;
+        let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
+        crate::http::download_with(&format!("{}/blobs/{}", reg.base, d), Some(crate::tls::connect), &reg.headers("*/*"), tmp.to_str().unwrap(), &mut |_, _| {})?;
+        st.put_file(&tmp, d)?;
+    }
+    st.tag(&r.full(), top_desc)?;
+    println!("pulled: {} {}{}", r.full(), md, if md != top { format!(" (index {})", top) } else { String::new() });
+    Ok(())
+}
+
+/// ap image ls: 置き場の名前と digest と層の大きさ
+fn ls() {
+    let st = ocistore::store();
+    for (name, d) in ocistore::list(&st) {
+        let size = ocistore::manifest(&st, &json!({"digest": d})).ok().map(|(m, _)| m["layers"].as_array().map_or(0, |l| l.iter().filter_map(|x| x["size"].as_u64()).sum::<u64>()));
+        let size = size.map_or("?".to_string(), |s| format!("{:.1} MB", s as f64 / 1e6));
+        println!("{:<50} {} {}", name, &d[7..19.min(d.len())], size);
+    }
+}
+
+/// ap image rm NAME...: 名前を消し、どの名前からも使われなくなった blob と、ひろげた根を消す
+fn rm(names: &[String]) {
+    let st = ocistore::store();
+    for n in names {
+        let full = Ref::parse(n).full();
+        let name = if st.find(n).is_some() { n.clone() } else { full };
+        let Some(_) = st.find(&name) else { die(format!("rm: {}: no such image", n)) };
+        let mut idx = st.index();
+        if let Some(list) = idx["manifests"].as_array_mut() {
+            list.retain(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str() != Some(name.as_str()));
+        }
+        fs::write(st.dir.join("index.json"), serde_json::to_vec(&idx).unwrap()).unwrap_or_else(|e| die(e));
+        println!("untagged: {}", name);
+    }
+    // のこった名前から届く blob
+    let mut keep: BTreeSet<String> = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    for (_, d) in ocistore::list(&st) {
+        keep.insert(d.clone());
+        if let Ok(v) = st.read_json(&d) {
+            for m in v["manifests"].as_array().into_iter().flatten() {
+                keep.extend(m["digest"].as_str().map(String::from));
+            }
+        }
+        if let Ok((m, md)) = ocistore::manifest(&st, &json!({"digest": d})) {
+            keep.insert(md.clone());
+            roots.insert(md[7..].to_string());
+            keep.extend(m["config"]["digest"].as_str().map(String::from));
+            keep.extend(m["layers"].as_array().into_iter().flatten().filter_map(|l| l["digest"].as_str().map(String::from)));
+        }
+    }
+    let mut freed = 0u64;
+    for e in fs::read_dir(st.dir.join("blobs/sha256")).into_iter().flatten().flatten() {
+        let d = format!("sha256:{}", e.file_name().to_string_lossy());
+        if !keep.contains(&d) {
+            freed += e.metadata().map_or(0, |m| m.len());
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    for e in fs::read_dir(ocistore::base().join("rootfs")).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        if !roots.contains(&n) {
+            let _ = ocistore::remove_all(&e.path());
+        }
+    }
+    println!("freed {:.1} MB", freed as f64 / 1e6);
 }

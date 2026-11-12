@@ -117,13 +117,14 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     if crate::parts::off(crate::parts::Part::Ns) {
         return Err(crate::why::inval());
     }
-    // ユーザーの namespace はだれでも作れる (先に作る。中ではほかの namespace も作れる)。入れ子と chroot の中はだめ
+    // ユーザーの namespace はだれでも作れる (先に作る。中ではほかの namespace も作れる)。chroot の中と入れ子はだめ
+    // (chroot が先: Linux の create_user_ns は入れ子を許すので、chroot の中なら EPERM)
     if flags & CLONE_NEWUSER != 0 {
-        if c.ns.user.is_some() {
-            return Err(crate::why::inval());
-        }
         if !crate::proc::current_root().is_empty() {
             return Err(-EPERM);
+        }
+        if c.ns.user.is_some() {
+            return Err(crate::why::inval());
         }
         // LSM (landlock の NAMESPACE_USE: Linux の security_namespace_init)
         crate::security::namespace_init(c, CLONE_NEWUSER)?;

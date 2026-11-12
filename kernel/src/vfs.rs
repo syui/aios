@@ -485,10 +485,13 @@ impl Drop for MountNs {
 }
 
 pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+    if !resolve("", path, true)?.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
     mount_at(path, fsroot, "/", source, fstype, ro)
 }
 
-/// bind マウント (MS_BIND): src (先頭 / なし、たどったあと) のディレクトリ root を path に。mountinfo の root の欄と、
+/// bind マウント (MS_BIND): src (先頭 / なし、たどったあと) の root (ディレクトリかファイル。path も同じ種類) を path に。mountinfo の root の欄と、
 /// もと・種類は、src をふくむマウントのもの (Linux と同じ。前の aios は もと が "/src"、種類が "none" だった)
 pub fn mount_bind(path: &str, root: InodeRef, src: &str, ro: bool) -> Result<(), i64> {
     let (root_path, source, fstype) = {
@@ -530,9 +533,6 @@ fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype:
         drop(crate::smp::fs_lock());
     }
     let (target, dir) = lookup("", path, true)?;
-    if !dir.meta().is_dir() {
-        return Err(-ENOTDIR);
-    }
     current_mnt().list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro });
     // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
     mount_at_refresh();
@@ -898,7 +898,7 @@ extern "C" fn flusher() -> ! {
 }
 
 /// マウント先ならかぶせたものの根に置きかえる
-fn cross(mut i: InodeRef) -> InodeRef {
+pub fn cross(mut i: InodeRef) -> InodeRef {
     let ns = current_mnt();
     let l = ns.list.borrow();
     if l.is_empty() {

@@ -11,6 +11,7 @@
 //   aipkg -Qu [NAME...]        入っているもののうち、同期データベース (ap -Sy) に新しい版があるもの (名前 版 -> 新しい版)
 //   -S --needed で、同じ版が入っているものは飛ばす
 //   aipkg image [--conf FILE] [-o OUT] DEF.json   パッケージから最小の container image (OCI) を作る (src/lib/oci.rs)
+//   aipkg image pull NAME... / ls / rm NAME...      registry の image を置き場 (~/.cache/aios/images) に (aibox --image が動かす)
 //
 // 設定は /etc/aipkg.conf (pacman.conf と同じ書き方で、[repo] と Server を読む)。
 // どのリポジトリも、Server のところの db は aios.db (aarch64/rust/aios.db, aarch64/c/aios.db)。
@@ -23,6 +24,8 @@ mod meter;
 mod tls;
 #[path = "../lib/oci.rs"]
 mod oci;
+#[path = "../lib/ocistore.rs"]
+mod ocistore;
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1040,7 +1043,7 @@ fn main() {
         return;
     }
     let Some(op) = args.first().filter(|a| a.starts_with('-') && !a.starts_with("--")) else {
-        eprintln!("usage: aipkg -S|-Sy|-Syu|-Ss|-Si|-U|-R|-Q|-Qi|-Ql|-Qo [targets] | image [--conf FILE] [-o OUT] DEF.json");
+        eprintln!("usage: aipkg -S|-Sy|-Syu|-Ss|-Si|-U|-R|-Q|-Qi|-Ql|-Qo [targets] | image [--conf FILE] [-o OUT] DEF.json | image pull|ls|rm NAME");
         exit(1);
     };
     let flags: BTreeSet<char> = op[1..].chars().collect();

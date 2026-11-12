@@ -329,6 +329,8 @@ sudo aios tune kernel.sched_timeslice_ms=10,50 --apply -- 'cargo build --release
 - 子にも引き継がれ、外せない。中で aibox を重ねると、もっと狭くなるだけ。`sudo` (setuid) は効かない
 - かかっているかは `/proc/self/status` の `NoNewPrivs` と `Landlock` (層の数)
 
+container image を動かすのは `aibox --image` (下の「container image」)。
+
 Claude の使う aish (`/etc/claude-code/managed-mcp.json`) は `aibox -W ~/.cache -W ~/.cargo -w /proc/ai/ctl -- aish --mcp` で起きる (`/proc/ai/ctl` は下の調べもののスイッチ)。アイの記憶 (aigpt、`ap -S aigpt`) は `aibox -W ~/.cache -W ~/.config/ai.syui.log -- aigpt server` (書くのは記憶と feed の既読だけ。managed-mcp.json があると `aigpt setup` の `claude mcp add` は効かないので、ここに置く)。Claude が動かすものはみな、Claude を起こしたディレクトリの中にしか書けない。root のする操作は `aios do` (aiosd が wheel の人かを見る) を通す。
 
 ## container image (ap image)
@@ -374,16 +376,49 @@ docker run でためして (node の版・nonroot・https、シェルがない�
 docker run --rm ghcr.io/syui/aios-node:26.13.1 -e 'console.log(process.version)'
 ```
 
-aios の中でためすには、層を順にひろげて chroot で動かす (2026-11-12: node が nonroot で動き、https も 200):
+### aios の上で動かす (aibox --image)
+
+docker も root もいらない。`aibox [OPTION]... --image IMAGE [ARG]...` (IMAGE のあとはみな image へ。docker run と同じ):
 
 ```sh
-ap image -o node.tar node.json && mkdir x root && tar xf node.tar -C x
-for d in $(LAYERS); do sudo tar xzpf x/blobs/sha256/$d -C root; done   # LAYERS は manifest の layers の digest の順
-sudo chroot --userspec=65532:65532 root /opt/c/bin/node -e 'console.log(process.version)'
+aibox --image ghcr.io/syui/aios-node:26.13.1 -e 'console.log(process.version)'   # なければ ap image pull で取る
+aibox -b ~/app:/app:ro -e NODE_ENV=production --image ghcr.io/syui/aios-node:26.13.1 /app/main.js
+aibox --image public.ecr.aws/docker/library/alpine:3.22 sh                         # よその image も (arm64 のもの)
+aibox --image ./node.tar                                                          # ap image -o で作ったもの
+ap image pull NAME... / ap image ls / ap image rm NAME...                         # 置き場 (~/.cache/aios/images)
 ```
 
-つぎは aibox で image をそのまま動かす (層をひろげて、namespace と landlock の中で)、npm のある node、atproto や gitea の
-ような本物のサービスの image、x86_64。
+- 置き場は OCI の image layout (`~/.cache/aios/images`: blobs/sha256 と index.json。名前は ref.name)。`ap image pull` は
+  registry の API で、名前のない人として (401 なら WWW-Authenticate の Bearer の token。ghcr.io も Docker Hub も
+  public.ecr.aws も)。index なら linux/arm64 のもの。blob は sha256 をたしかめてから置く。blob のリダイレクト (CDN) には
+  鍵を見せない (http.rs: ほかのホストへ行くとき Authorization を落とす)。アーカイブ (パスは / ./ ../ で始めるか .tar で
+  終わる) は置き場に入れて `localhost/TITLE:VER` の名前に。`ap image rm` は名前を消し、どの名前も使わない blob とひろげた
+  根を消す
+- 根: 層を `~/.cache/aios/rootfs/HEX` (manifest の sha256) に一度だけひろげる (自分のもの。whiteout も。層のパスが
+  リンクを通るときは根の中でたどる。setuid、デバイス、FIFO は入れない)。proc、dev、tmp、etc/hosts、etc/resolv.conf、
+  WorkingDir を作っておく (Docker の init の層と同じ)
+- 動かしかた: ユーザーの namespace で外の自分を image の User (の uid と gid。名前は image の /etc/passwd と group) に、
+  マウントの namespace で根を自分の上に bind して読むだけに、/tmp は空の tmpfs、/dev は空の tmpfs に外の null zero full
+  random urandom tty をファイルの bind で、/etc/hosts と /etc/resolv.conf は外のもの、家 (/etc/passwd の) が空のディレクトリ
+  なら tmpfs、`-b HOST:PATH[:ro]`。PID と UTS (ホスト名は image の名前)、`--no-net` なら NET も分けて、中の 1 番に /proc を
+  マウントし、chroot、WorkingDir へ。書けるのは /tmp、/dev、家、`-b` (:ro でないもの) だけ (landlock。読むだけの根は
+  EROFS)。seccomp はいつもの (aibox の DEFAULT_DENY) に chroot も (chroot だけの container なので、中で chroot できると
+  外の / へ出られる)。環境は image の Env と PATH・HOME・HOSTNAME・TERM、`-e K=V` (`-e K` は外の値)。`-u USER[:GROUP]`、
+  `--entrypoint CMD`。終わりの番号とシグナルは中のものと同じ (SIGTERM なら 143)
+- カーネルで足したもの (どれも Linux と同じに。`test/ldiff.sh container` が Linux 7.4 と 54 行まるごと同じ):
+  ユーザーの namespace の中の chroot (Linux の ns_capable(CAP_SYS_CHROOT): `unshare -r chroot DIR`)、ファイルの bind
+  マウント (ファイルにはファイルを、ちがえば ENOTDIR。O_CREAT で開いてもかぶせた上のものに書く)、mount(2) の tmpfs の
+  持ち主はマウントした人 (中では中の自分)、chroot の中の unshare(CLONE_NEWUSER) は EPERM (入れ子より先)、書く口の open の
+  順 (O_TRUNC なら許可より先に EROFS、許可、ETXTBSY、EROFS、それから LSM: 前は landlock の EACCES が EROFS より先だった)、
+  landlock の中の chroot (Linux の landlock は chroot を見ない)
+- はかったもの (2026-11-12、aios の VM): `ghcr.io/syui/aios-node:26.13.1` を pull して (54 MB) ひろげて動かすまで 10〜25 秒
+  (ネットワークしだい)、2 回めからは `node -e 0` まで 0.6〜0.8 秒、Alpine の `true` は 0.01 秒。node は nonroot (65532) の
+  中の pid 1、/proc には自分だけ、/etc に書くと EROFS。Alpine 3.22 (public.ecr.aws) の busybox の sh、ps、id も動き、
+  `exit 7` は 7、SIGTERM は 143
+- まだ: `--no-net` の NET の namespace でも、netlink と ioctl と /proc/net には eth0 が見える (つながりは切れている。
+  todo の netns-view)、overlay がないので根は読むだけ (書くのは /tmp、家、-b)
+
+つぎは npm のある node、atproto や gitea のような本物のサービスの image、x86_64。
 
 ## カーネルの地図 (kernel/kernel.json)
 
