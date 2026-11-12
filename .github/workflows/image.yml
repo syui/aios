@@ -146,7 +146,7 @@ jobs:
           grep -q 'no-new-privileges:true' out/inspect.log
           # 中の serve は 65532 で、PID 1 は init (tini)
           docker top "$cid" -o user,pid,args
-          docker top "$cid" -o user,args | grep -q '^65532 .*serve'
+          docker top "$cid" -o user,pid,args | grep -q '^65532 .*serve'
           docker compose -f docker/compose.yml down
 
       - name: Push
