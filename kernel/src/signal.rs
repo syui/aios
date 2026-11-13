@@ -238,11 +238,93 @@ pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
     if t.sig_mask & b == 0 && ignored(t, sig) {
         return;
     }
+    // もう来ているなら、はじめのものの情報を残す (Linux の legacy_queue: ふつうのシグナルは 2 つめを捨てる)
+    if t.sig_pending & b == 0 {
+        t.sig_info[sig as usize] = info;
+    }
     t.sig_pending |= b;
-    t.sig_info[sig as usize] = info;
+    GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if t.sig_mask & b == 0 || t.sigwait & b != 0 {
         proc::interrupt(t);
+    } else {
+        // ブロックしたまま来たもの: signalfd を読む・待つもの (read、poll、epoll) を起こす
+        proc::wakeup(fd_chan(t.tgid));
     }
+}
+
+/// シグナルが来るたびに進む版 (signalfd の epoll の event_gen)
+pub static GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static FD_CHAN: u8 = 0;
+
+/// プロセス (tgid) にブロックしたシグナルが来るのを待つチャンネル (signalfd。ほかのものとぶつかっても、起きた側が
+/// 見なおすだけ)
+pub fn fd_chan(tgid: u32) -> usize {
+    (&raw const FD_CHAN as usize) ^ ((tgid as usize) << 16)
+}
+
+/// いまのスレッドに来ている mask のシグナルを 1 つとり出す (番号の小さいものから。signalfd の read)
+pub fn take(mask: u64) -> Option<(i32, SigInfo)> {
+    let p = proc::current();
+    let hit = p.sig_pending & mask & !UNBLOCKABLE;
+    if hit == 0 {
+        return None;
+    }
+    let sig = hit.trailing_zeros() as i32 + 1;
+    p.sig_pending &= !bit(sig);
+    Some((sig, p.sig_info[sig as usize]))
+}
+
+/// いまのスレッドに mask のシグナルが来ているか
+pub fn pending_in(mask: u64) -> bool {
+    proc::current().sig_pending & mask & !UNBLOCKABLE != 0
+}
+
+/// signalfd の read の形 (struct signalfd_siginfo、128 バイト)。どの欄を埋めるかは Linux の signalfd_copyinfo と
+/// siginfo_layout と同じく si_code で決める: カーネルの出すもの (0 < code < SI_KERNEL) はシグナルごと、SI_TIMER は
+/// タイマー、ほかの負のもの (sigqueue、tgkill など) は pid・uid と値、のこり (kill) は pid と uid
+pub fn signalfd_info(sig: i32, i: &SigInfo) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    put(&mut b, 0, &(sig as u32).to_le_bytes());
+    put(&mut b, 8, &i.code.to_le_bytes());
+    let pid = crate::ns::local_or_0(i.pid).to_le_bytes();
+    match i.code {
+        c if c > SI_USER && c < SI_KERNEL => match sig {
+            SIGCHLD => {
+                put(&mut b, 12, &pid);
+                put(&mut b, 16, &i.uid.to_le_bytes());
+                put(&mut b, 40, &i.status.to_le_bytes());
+            }
+            // seccomp の TRAP: si_errno (timerid に)、ssi_syscall、ssi_call_addr、ssi_arch
+            SIGSYS => {
+                put(&mut b, 4, &i.timerid.to_le_bytes());
+                put(&mut b, 84, &i.status.to_le_bytes());
+                put(&mut b, 88, &i.addr.to_le_bytes());
+                put(&mut b, 96, &crate::syscall::AUDIT_ARCH_AARCH64.to_le_bytes());
+            }
+            SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => put(&mut b, 72, &i.addr.to_le_bytes()),
+            _ => {
+                put(&mut b, 12, &pid);
+                put(&mut b, 16, &i.uid.to_le_bytes());
+            }
+        },
+        SI_TIMER => {
+            put(&mut b, 24, &i.timerid.to_le_bytes());
+            put(&mut b, 44, &(i.value as i32).to_le_bytes());
+            put(&mut b, 48, &i.value.to_le_bytes());
+        }
+        c if c < 0 => {
+            put(&mut b, 12, &pid);
+            put(&mut b, 16, &i.uid.to_le_bytes());
+            put(&mut b, 44, &(i.value as i32).to_le_bytes());
+            put(&mut b, 48, &i.value.to_le_bytes());
+        }
+        _ => {
+            put(&mut b, 12, &pid);
+            put(&mut b, 16, &i.uid.to_le_bytes());
+        }
+    }
+    b
 }
 
 /// seccomp の TRAP: 自分のスレッドに SIGSYS を送る。ブロックか無視していたら受け取れないので終わる (Linux と同じ)
@@ -869,6 +951,45 @@ fn vec_of(t: u32) -> Vec<u32> {
 /// Linux の do_send_specific の順: スレッドがいなければ ESRCH、シグナルの番号 (EINVAL)、許可 (EPERM)。
 /// 番号が 0 以下なのは syscall.rs が先に EINVAL にする
 pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
+    send_specific(tgid, tid, sig, SigInfo::from(SI_TKILL))
+}
+
+/// rt_sigqueueinfo (tgid が 0: pid のプロセスへ) と rt_tgsigqueueinfo (tgid の中のスレッド pid へ)。siginfo_t を
+/// ユーザーから読む (si_signo は sig にする)。カーネルの印 (si_code が 0 以上と SI_TKILL) を名のれるのは、自分の
+/// スレッドへだけ (EPERM。Linux の do_rt_sigqueueinfo)。番号は送るほうの PID の namespace のもの
+pub fn rt_sigqueueinfo(tgid: i64, pid: i64, sig: i32, uinfo: usize) -> R {
+    let mut b = [0u8; 128];
+    proc::current().pt().copy_in(&mut b, uinfo).ok_or(-EFAULT)?;
+    if tgid != 0 && (tgid <= 0 || pid <= 0) {
+        return Err(crate::why::inval());
+    }
+    let w = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let code = w(8);
+    let me = proc::current().pid;
+    let target = if pid > 0 { crate::ns::to_global(pid as u32) } else { None };
+    if (code >= 0 || code == SI_TKILL) && target != Some(me) {
+        return Err(-EPERM);
+    }
+    let value = u64::from_le_bytes(b[24..32].try_into().unwrap());
+    let info = match code {
+        SI_TIMER => SigInfo { code, timerid: w(16), value, ..SigInfo::ZERO },
+        c if c > SI_USER && c < SI_KERNEL => match sig {
+            SIGCHLD => SigInfo { code, pid: crate::ns::to_global(w(16) as u32).unwrap_or(0), uid: w(20) as u32, status: w(24), ..SigInfo::ZERO },
+            SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => SigInfo { code, addr: u64::from_le_bytes(b[16..24].try_into().unwrap()), ..SigInfo::ZERO },
+            SIGSYS => SigInfo { code, timerid: w(4), addr: u64::from_le_bytes(b[16..24].try_into().unwrap()), status: w(24), ..SigInfo::ZERO },
+            _ => SigInfo { code, pid: crate::ns::to_global(w(16) as u32).unwrap_or(0), uid: w(20) as u32, ..SigInfo::ZERO },
+        },
+        _ => SigInfo { code, pid: crate::ns::to_global(w(16) as u32).unwrap_or(0), uid: w(20) as u32, value, ..SigInfo::ZERO },
+    };
+    let target = target.ok_or(-ESRCH)?;
+    if tgid != 0 {
+        let g = crate::ns::to_global(tgid as u32).ok_or(-ESRCH)?;
+        return send_specific(g, target, sig, info);
+    }
+    send_pid_info(target, false, sig, info)
+}
+
+fn send_specific(tgid: u32, tid: u32, sig: i32, info: SigInfo) -> R {
     let t = proc::find_thread(tid).ok_or(-ESRCH)?;
     if tgid != 0 && t.tgid != tgid {
         return Err(-ESRCH);
@@ -878,7 +999,7 @@ pub fn tgkill(tgid: u32, tid: u32, sig: i32) -> R {
     }
     can_signal(t, sig)?;
     if sig != 0 {
-        send_thread(t, sig, SigInfo::from(SI_TKILL));
+        send_thread(t, sig, info);
     }
     Ok(0)
 }

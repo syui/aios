@@ -32,7 +32,7 @@
     "/opt/c/bin/dropuser",
     "/opt/c/bin/vacuumdb",
     "/opt/c/bin/reindexdb",
-    "/usr/bin/sh",
+    "/bin/sh",
     "/usr/bin/aish",
     "/usr/bin/coreutils",
     "/usr/bin/mkdir",

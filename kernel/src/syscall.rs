@@ -110,6 +110,7 @@ nrs! {
     SENDFILE = 71,
     PSELECT6 = 72,
     PPOLL = 73,
+    SIGNALFD4 = 74,
     SPLICE = 76,
     TEE = 77,
     READLINKAT = 78,
@@ -156,6 +157,7 @@ nrs! {
     RT_SIGPROCMASK = 135,
     RT_SIGPENDING = 136,
     RT_SIGTIMEDWAIT = 137,
+    RT_SIGQUEUEINFO = 138,
     RT_SIGRETURN = 139,
     REBOOT = 142,
     SETREGID = 143,
@@ -233,6 +235,7 @@ nrs! {
     MBIND = 235,
     GET_MEMPOLICY = 236,
     SET_MEMPOLICY = 237,
+    RT_TGSIGQUEUEINFO = 240,
     ACCEPT4 = 242,
     WAIT4 = 260,
     WAITID = 95,
@@ -549,6 +552,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         RT_SIGSUSPEND => signal::rt_sigsuspend(a[0] as usize),
         RT_SIGPENDING => signal::rt_sigpending(a[0] as usize),
         RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(a[0] as usize, a[1] as usize, a[2] as usize),
+        // sigqueue (値つきのシグナル)。番号は送るほうの PID の namespace のもの
+        RT_SIGQUEUEINFO => signal::rt_sigqueueinfo(0, int(a[0]), a[1] as i32, a[2] as usize),
+        RT_TGSIGQUEUEINFO => signal::rt_sigqueueinfo(int(a[0]), int(a[1]), a[2] as i32, a[3] as usize),
         RT_SIGRETURN => signal::rt_sigreturn(tf),
         SET_TID_ADDRESS => {
             let p = proc::current();

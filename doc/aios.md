@@ -500,7 +500,18 @@ Postgres といっしょに起こして表 (device_tokens) ができたかを見
 - postgresql (pkg/c/postgresql、PostgreSQL 18.7): 拡張を dlopen で読むので musl に動的に (zlib、zstd、OpenSSL。contrib も:
   bsky が pg_trgm を使う)。18 の tar には bison と flex の出力がないので作るマシンのものを、タイムゾーンの表は作るマシンの
   zic で。まだ: aios のカーネルに System V の共有メモリ (shmget、shmat) がないので、aios の上では postgres が起きない
-  (Postgres はいつも小さな SysV の共有メモリをとる)。docker (Linux) の上では動く
+  (Postgres はいつも小さな SysV の共有メモリをとる)。docker (Linux) の上では動く。ラッチが使う signalfd は足した (下)
+
+signalfd (2026-11-13、kernel/src/signalfd.rs、extra): signalfd4 で、ブロックしたシグナルを fd から struct signalfd_siginfo
+(128 バイト) として読む。欄は Linux の signalfd_copyinfo と同じく si_code で決める (kill は pid と uid、sigqueue や tgkill は
+値も、SIGCHLD は status、POSIX タイマーは tid と値)。read はいくつかをまとめて読み、なければ待つ (O_NONBLOCK なら EAGAIN、
+ほかのシグナルのハンドラが動けば EINTR)。poll と epoll は、待つスレッドに mask のシグナルが来ていれば読める (ブロックした
+まま来たシグナルは signal.rs の send_thread がプロセスのチャンネルを起こす)。signalfd4 に signalfd の fd をわたすと mask を
+変える。fdinfo は sigmask。PostgreSQL 17 / 18 はラッチ (epoll) で SIGURG をこれで待つ (なければ initdb の bootstrap が
+「signalfd() failed」で止まった)。いっしょに rt_sigqueueinfo と rt_tgsigqueueinfo (sigqueue: 値つきのシグナル。カーネルの
+印を名のれるのは自分へだけ) を足し、もう来ているふつうのシグナルをもう一度送ったときは、はじめのものの情報を残す (Linux の
+legacy_queue。前は上書きした)。test/signalfd.c は手本の Linux と 47 行同じ。ちがい: Linux はスレッドに来たもの (tgkill) を
+プロセスに来たもの (kill、sigqueue) より先に読むが、aios はスレッドごとの 1 つの組なので番号の小さいものから
 
 /proc/PID/smaps (2026-11-13、kernel/src/vm.rs の smaps_text): maps の行ごとに Linux と同じ形 (名前は 16 文字、数は 8 文字の
 右よせと kB) で Size、Rss、Pss、Pss_Dirty、Shared_Clean / Shared_Dirty、Private_Clean / Private_Dirty、Referenced、
@@ -653,10 +664,10 @@ release_deferred から (Linux の fput から f_op->release)。
 ディスクのルート (root の区画の ext2 / ext4 と FAT の boot の区画) は block::mount_root (Linux の init/do_mounts.c の
 mount_root) が読んで fs::init にわたす。/dev の装置のノードは、装置を見つけたもの (block の区画、modprobe で起こした gpu・
 sound・input) が fs::add_dev で置く (Linux の devtmpfs。/dev ができる前なら覚えておいて、できたときに作る)。
-システムコールも、なくても動くところ (epoll と eventfd、timerfd、inotify の init1 と rm_watch、socket、module) のものは
+システムコールも、なくても動くところ (epoll と eventfd、timerfd、signalfd、inotify の init1 と rm_watch、socket、module) のものは
 それぞれのファイルにあり、main.rs が syscall::register で番号ごとに置く (Linux の COND_SYSCALL: 置いていなければ、ない
 システムコールとして ENOSYS)。開いたものの中身は、core のもの (ファイル、パイプ、端末、/dev/null など、pidfd) のほかは
-file::Kind::Ops (FileOps: Linux の file_operations) で、それぞれ (epoll、eventfd、timerfd、inotify、装置、ソケット: AF_UNIX、
+file::Kind::Ops (FileOps: Linux の file_operations) で、それぞれ (epoll、eventfd、timerfd、signalfd、inotify、装置、ソケット: AF_UNIX、
 TCP と UDP、ICMP と raw、netlink) が FileOps (読み書き、readiness、poll の印、fdinfo、/proc/PID/fd の名前、ioctl、mmap、
 release、ソケットの readv と writev、持ち主と許可、splice ...) を書き、file.rs と sysfile.rs はその関数で呼ぶ。AF_UNIX の
 fd を閉じたあとの gc (システムコールの終わり) と大きなロックなしの read / write は、main.rs が file::register_release_deferred と
