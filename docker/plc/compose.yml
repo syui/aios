@@ -1,0 +1,55 @@
+services:
+  database:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PLC_DB_PASSWORD:?set PLC_DB_PASSWORD}
+      POSTGRES_DB: plc
+    volumes:
+      - plc-db:/var/lib/postgresql
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 128m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "plc"]
+      interval: 5s
+      retries: 20
+
+  plc:
+    image: aios-plc:local
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    environment:
+      ENABLE_MIGRATIONS: "true"
+      DB_CREDS_JSON: '{"username":"postgres","password":"${PLC_DB_PASSWORD}","host":"database","port":"5432","database":"plc"}'
+      DB_MIGRATE_CREDS_JSON: '{"username":"postgres","password":"${PLC_DB_PASSWORD}","host":"database","port":"5432","database":"plc"}'
+    ports:
+      - "127.0.0.1:2582:3000"
+    healthcheck:
+      test: ["CMD", "/opt/c/bin/node", "-e", "fetch('http://127.0.0.1:3000/_health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    depends_on:
+      database:
+        condition: service_healthy
+
+volumes:
+  plc-db:
