@@ -97,3 +97,7 @@ set -e; (false && true); echo after
 set -e; i=0; (( i++ )); echo after	
 set -e; while false; do :; done; echo after	after
 trap 'echo err' ERR; for f in /nonexist-dir/*; do [ -e "$f" ] && :; done; echo after	after
+set -a; AX=1; env | grep ^AX=	AX=1
+set -a; set +a; BX=2; env | grep -c ^BX=	0
+set -o allexport; CX=3; read DX <<< 4; env | grep "^[CD]X=" | sort	CX=3|DX=4
+set -a; f() { local LX=5; env | grep -c ^LX=; }; f	1

@@ -87,6 +87,8 @@ pub struct Shell {
     pub status: i32,
     pub pid: i32,
     pub errexit: bool,
+    /// set -a (allexport): 入れた変数をみな export する (POSIX)
+    pub allexport: bool,
     /// set -u: 決めていない変数を使ったらしくじる
     pub nounset: bool,
     pub xtrace: bool,
@@ -193,6 +195,7 @@ impl Shell {
                 pid
             },
             errexit: false,
+            allexport: false,
             nounset: false,
             xtrace: false,
             flow: Flow::None,
@@ -384,7 +387,8 @@ impl Shell {
         let k = &self.deref(k).to_string();
         self.arrays.remove(k);
         self.assoc.remove(k);
-        if std::env::var_os(k).is_some() {
+        if std::env::var_os(k).is_some() || self.allexport {
+            self.vars.remove(k);
             unsafe { std::env::set_var(k, v) };
         } else {
             self.vars.insert(k.to_string(), v.to_string());
@@ -2422,6 +2426,7 @@ impl Shell {
                         i += 1;
                         match a.get(i).map(|s| s.as_str()) {
                             Some("errexit") => self.errexit = on,
+                            Some("allexport") => self.allexport = on,
                             Some("xtrace") => self.xtrace = on,
                             Some("nounset") => self.nounset = on,
                             Some("pipefail") => unsafe { jobs::PIPEFAIL = on },
@@ -2429,16 +2434,17 @@ impl Shell {
                             None => {
                                 // set -o だけ: 今の様子
                                 let p = unsafe { jobs::PIPEFAIL };
-                                for (n, v) in [("errexit", self.errexit), ("nounset", self.nounset), ("pipefail", p), ("xtrace", self.xtrace)] {
+                                for (n, v) in [("allexport", self.allexport), ("errexit", self.errexit), ("nounset", self.nounset), ("pipefail", p), ("xtrace", self.xtrace)] {
                                     println!("{:<15}{}", n, if v { "on" } else { "off" });
                                 }
                             }
                         }
                     }
                     'e' => self.errexit = on,
+                    'a' => self.allexport = on,
                     'x' => self.xtrace = on,
                     'u' => self.nounset = on,
-                    'f' | 'h' | 'm' | 'b' | 'C' | 'v' | 'n' | 'B' | 'H' | 'T' | 'E' | 'P' | 'a' | 'k' | 't' => {}
+                    'f' | 'h' | 'm' | 'b' | 'C' | 'v' | 'n' | 'B' | 'H' | 'T' | 'E' | 'P' | 'k' | 't' => {}
                     _ => {
                         eprintln!("set: -{}: invalid option", c);
                         return 2;

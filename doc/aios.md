@@ -481,6 +481,13 @@ docker compose build && docker compose up -d                      # envs/ と co
   /docker-entrypoint-initdb.d が空だと、entrypoint の for の中の `[ -e "$f" ] && ...` の番号 1 が for の番号になり、aish は
   for のあとで終わっていた。POSIX、dash、bash と同じく、複合コマンド (for、case、if、{ } など。サブシェルと (( )) のほか)
   の終わりの番号では -e と ERR の trap を見ないように直した (中のコマンドでもう見ている。test/aish-bash.txt)
+- aios の上でも動く (2026-11-13、test/at-aios.sh。VM は AIOS_MEM=6G): database (aios-postgres。ai/at と同じ init.sql の
+  plc、bgs、carstore、bsky)、redis (aios-redis)、plc (did-method-plc を aios の上で pnpm でビルドし、aios-node で) を
+  aibox --image で起こし、PDS (atproto の pds-service を aios の上でビルド: モノレポ全体の pnpm install が 24 分、
+  better-sqlite3 は aios の node-gyp で。deploy は 249 MB) も aios-node で起こす。アカウントを作ると PDS が plc に DID を
+  作り (Postgres に入る)、投稿、getRecord、listRecords、repo の CAR まで通る。ここで見つけて直したもの: plc の SetLatch を
+  epoll で待つ signalfd の起こし、aibox --image の中の uname (65532 だけの割りあて)、うしろのジョブの tcsetattr
+  (SIGTTOU)、aish の set -a (allexport: POSIX どおり入れた変数を export する。前は何もしなかった)
 - まだ: arm64 だけ (ai/at の本番の at は x86_64)
 
 ai の chat と courier (git.syui.ai の ai/chat、ai/courier。ai/at の compose.yml の chat と courier) は docker/ai/NAME/Dockerfile
