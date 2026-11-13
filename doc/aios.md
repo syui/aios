@@ -453,6 +453,11 @@ docker compose build && docker compose up -d                      # envs/ と co
 - CI: image.yml は did-method-plc を作り、Postgres といっしょに起こして DID を作って document をたしかめる
   (aios-plc は 199 MB)。bluesky.yml は upstream の固めた commit で 6 つをみな作り、中で better-sqlite3 (pds) と
   sharp (bsky) とバイナリが動くかを見る
+  2026-11-13 に 6 つとも通った (image の大きさ: pds 324 MB、bsky 318 MB、ozone 265 MB、bsync 214 MB、plc 202 MB、
+  ozone (web) 627 MB、social-app 127 MB、jetstream 58 MB、relay 40 MB)。pds の better-sqlite3 (sqlite 3.53.0) は
+  Node 26 のできあいがなく、builder の node-gyp と zig の c++ でビルドしたもの。そのために、aios の make の既定の
+  CXX を g++ に (前は make をビルドしたときの zig c++ が焼きこまれていて、base-devel の包みを通らなかった) し、
+  base-devel の cc / c++ が node-gyp の -Wl,--exclude-libs を外すようにした
 - aios の VM でも did-method-plc を pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを変える
   まで通った
 - まだ: arm64 だけ (ai/at の本番の at は x86_64)。aios に Postgres と redis のパッケージはない (compose は
