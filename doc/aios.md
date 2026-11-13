@@ -445,9 +445,10 @@ did-method-plc と social-app は repo の固めた版、ozone (upstream は yar
 import している) で、`nodeLinker: hoisted` は pnpm-workspace.yaml に書く (pnpm 12 は `pnpm run` の前に設定とちがう
 node_modules を入れなおすので、`--shamefully-hoist` などのコマンドの引数は build のときにはきかない)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
 もの (relay の sqlite は使えない。ai/at の本番は Postgres)。social-app は devEngines の Node 24 (glibc のもの) を取って
-こないように、ビルドのときだけ onFail を warn にして aios の Node 26 で。compose.yml の sysctl は IPv4 と同じく IPv6 も
-redirect、source route、RA、forwarding を切り、外へつながない database、redis、plc、bsync は IPv6 そのものを切る
-(disable_ipv6。lo の ::1 もなくなる。ほかは外の名前 (plc.${host}、bgs.${host}、public.api.bsky.app など) へつなぐので残す)。compose.yml の envs/、configs/、data/、
+こないように、ビルドのときだけ onFail を warn にして aios の Node 26 で。compose.yml の IPv6 の sysctl (redirect、source route、RA、
+forwarding を切る。外へつながない database、redis、plc、bsync は disable_ipv6 で IPv6 そのものも) はコメントにしてある:
+Docker 26.0.2 からは IPv4 だけのネットワーク (ここの default と edge) につないだ eth0 は IPv6 なし (残るのは lo の ::1 だけ)。
+ネットワークに IPv6 を入れるときに外す。compose.yml の envs/、configs/、data/、
 repos/ は ai/at と同じ置き場 (repos/NAME を context に、Dockerfile は ../../NAME/Dockerfile):
 
 ```bash
@@ -457,7 +458,7 @@ docker compose build && docker compose up -d                      # envs/ と co
 ```
 
 - CI: image.yml は did-method-plc を作り、Postgres といっしょに (sysctl は compose.yml のものを docker compose config から。
-  IPv6 なし) 起こして DID を作って document をたしかめる (aios-plc は 199 MB)。bluesky.yml は upstream の固めた commit で 6 つをみな作り、中で better-sqlite3 (pds) と
+  eth0 に IPv6 がないことも見る) 起こして DID を作って document をたしかめる (aios-plc は 199 MB)。bluesky.yml は upstream の固めた commit で 6 つをみな作り、中で better-sqlite3 (pds) と
   sharp (bsky) とバイナリが動くかを見る
   2026-11-13 に 6 つとも通った (pnpm にそろえたあと。image の大きさ: pds 324 MB、bsky 318 MB、ozone 265 MB、bsync 214 MB、
   plc 202 MB、ozone (web) 605 MB、social-app 127 MB、jetstream 58 MB、relay 40 MB)。pds の better-sqlite3 (sqlite 3.53.0) は
