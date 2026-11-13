@@ -1,0 +1,18 @@
+ARG AIOS=ghcr.io/syui/aios:0.0.1.r955.gfb57887@sha256:27e143fb3a8869a9832197b564e4d2d2b12556ef1c77ce029c90b36858c2e315
+ARG AIOS_STATIC=ghcr.io/syui/aios-static:20261105@sha256:6039d9e67630100421bcb1b1b0e769df59fe251ce34237b07896e3da9e878231
+
+FROM ${AIOS} AS build
+RUN ap -Sy --noconfirm cargo base-devel openssl protobuf
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY proto ./proto
+COPY src ./src
+RUN cargo build --release --locked
+
+FROM ${AIOS_STATIC}
+COPY --from=build /app/target/release/courier /usr/local/bin/courier
+USER 65532:65532
+EXPOSE 3300
+ENTRYPOINT []
+CMD ["/usr/local/bin/courier"]

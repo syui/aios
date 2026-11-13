@@ -1,0 +1,49 @@
+# redis: キーと値のデータベース (redis-server、redis-cli、redis-benchmark と、redis-sentinel、redis-check-aof、
+#   redis-check-rdb のリンク)。ai/at の compose の redis (bsky の appview が使う) を aios の image で動かすため。
+#   Zig (aarch64-linux-musl) でクロスビルドした静的なバイナリ。malloc は libc (jemalloc はクロスの configure が重い。
+#   Alpine の redis も MALLOC=libc)、TLS は OpenSSL (openssl のパッケージの静的なライブラリ: BUILD_TLS=yes)。
+#   モジュール (RedisJSON、RediSearch など: BUILD_WITH_MODULES) は入れない
+pkgname=redis
+pkgver=8.10.3
+pkgrel=1
+pkgdesc='An in-memory database that persists on disk (static, for aios)'
+arch=('aarch64')
+url='https://redis.io'
+license=('AGPL-3.0-only OR SSPL-1.0 OR LicenseRef-RSALv2')
+_latest_url=https://download.redis.io/releases/
+_latest_regex='redis-([0-9]+[.][0-9]+[.][0-9]+)[.]tar[.]gz'
+# sha256 は redis-hashes (github.com/redis/redis-hashes の README) のものと同じ
+source=("https://download.redis.io/releases/redis-$pkgver.tar.gz")
+sha256sums=('edde778f6bdee7581e42fc139ca9e07e2822212092f7501f99989656e3629d02')
+
+prepare() {
+  rm -rf "redis-$pkgver"
+  tar -xzf "redis-$pkgver.tar.gz"
+}
+
+build() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps openssl
+  cd "redis-$pkgver"
+  # uname は作るマシンのもの (x86_64 なら deps の lua などに -m のフラグを足すので、aios のものに)
+  make uname_S=Linux uname_M=aarch64 CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" \
+    MALLOC=libc BUILD_TLS=yes USE_SYSTEMD=no OPTIMIZATION=-O2 \
+    CFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS" -j"$(nproc)"
+}
+
+package() {
+  cd "redis-$pkgver"
+  local b
+  for b in redis-server redis-cli redis-benchmark; do
+    install -Dm755 "src/$b" "$pkgdir/opt/c/bin/$b"
+  done
+  # make install と同じく、ほかは redis-server へのリンク (名前で動きを変える)
+  for b in redis-sentinel redis-check-aof redis-check-rdb; do
+    ln -s redis-server "$pkgdir/opt/c/bin/$b"
+  done
+  install -Dm644 redis.conf "$pkgdir/etc/redis/redis.conf"
+  install -Dm644 sentinel.conf "$pkgdir/etc/redis/sentinel.conf"
+  install -Dm644 LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
+  install -Dm644 REDISCONTRIBUTIONS.txt "$pkgdir/usr/share/licenses/$pkgname/REDISCONTRIBUTIONS.txt"
+}

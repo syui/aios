@@ -1,0 +1,55 @@
+# postgresql: PostgreSQL 18 (postgres、initdb、pg_ctl、psql、pg_dump など、libpq.so、contrib の拡張)。ai/at の compose の
+#   database (plc、pds、bsky、bgs、ozone、bsync、courier の Postgres) を aios の image で動かすため。bsky は contrib の
+#   pg_trgm を使う。Zig (aarch64-linux-musl) でクロスビルドする。postgres は拡張 (plpgsql も) を dlopen で読むので
+#   動的にリンクする (python と同じ。libpq.so は /opt/c/lib から: RUNPATH)。TLS は OpenSSL (静的なライブラリなので
+#   中に入る)、圧縮は zlib と zstd。入れないもの: readline (psql の行の編集)、ICU (照合順序は libc と組みこみのもの)、
+#   LLVM の JIT、文書。18 のリリースの tar には bison と flex の出力がないので、作るマシンの bison、flex、perl を使う。
+#   タイムゾーンの表は、作るマシンの zic で書く (ZIC: 中の zic は aios のもので、ここでは動かない)
+pkgname=postgresql
+pkgver=18.7
+pkgrel=1
+pkgdesc='Sophisticated object-relational DBMS (server, client tools, libpq and contrib, for aios)'
+arch=('aarch64')
+url='https://www.postgresql.org/'
+license=('PostgreSQL')
+depends=('musl')
+_latest_url=https://ftp.postgresql.org/pub/source/
+_latest_regex='v(18[.][0-9]+)/'
+# sha256 は ftp.postgresql.org の postgresql-18.7.tar.bz2.sha256 と同じ
+source=("https://ftp.postgresql.org/pub/source/v$pkgver/postgresql-$pkgver.tar.bz2")
+sha256sums=('441dfae4280cae3e0425e5f876f80559fb0731c140f1aae22b3e5a54d0411bfd')
+
+prepare() {
+  rm -rf "postgresql-$pkgver"
+  tar -xjf "postgresql-$pkgver.tar.bz2"
+}
+
+_env() {
+  . "$startdir/../zig.sh"
+  zig_env
+  c_deps zlib zstd openssl
+  export LDFLAGS="-dynamic -Wl,-s -Wl,-rpath,$PREFIX/lib -L$SYSROOT/lib" CFLAGS="-O2 -fPIC"
+  _zic=$(command -v zic || echo /usr/sbin/zic)
+}
+
+build() {
+  _env
+  local b
+  for b in bison flex perl; do
+    command -v "$b" >/dev/null || { echo "postgresql: $b がありません (作るマシンに要る)" >&2; return 1; }
+  done
+  cd "postgresql-$pkgver"
+  ./configure --host=aarch64-linux-musl --build="$(uname -m)-linux-gnu" --prefix="$PREFIX" \
+    --sysconfdir=/etc/postgresql --with-ssl=openssl --with-zstd \
+    --without-readline --without-icu --without-llvm
+  make -j"$(nproc)" ZIC="$_zic"
+  make -C contrib -j"$(nproc)"
+}
+
+package() {
+  _env
+  cd "postgresql-$pkgver"
+  make DESTDIR="$pkgdir" ZIC="$_zic" install
+  make -C contrib DESTDIR="$pkgdir" install
+  install -Dm644 COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/COPYRIGHT"
+}

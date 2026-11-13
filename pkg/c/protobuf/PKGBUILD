@@ -1,0 +1,27 @@
+# protobuf: Protocol Buffers のコンパイラ (protoc) と、よく使う型の .proto (google/protobuf/*.proto)。自分でビルドしない:
+#   公式の linux-aarch_64 のもの (github の protocolbuffers/protobuf のリリース。protoc は静的なバイナリ) を /opt/c に
+#   入れる (go と同じ考え。C++ のライブラリ (libprotobuf) は入れない)。Rust の prost-build (ai/courier の build.rs) が
+#   ビルドのときに呼ぶ。PROTOC がなくても PATH の protoc を探す
+pkgname=protobuf
+pkgver=36.2
+pkgrel=1
+pkgdesc='Protocol Buffers compiler (protoc) and well-known type definitions (official static linux-aarch_64 build, for aios)'
+arch=('aarch64')
+url='https://protobuf.dev'
+license=('BSD-3-Clause')
+source=("https://github.com/protocolbuffers/protobuf/releases/download/v$pkgver/protoc-$pkgver-linux-aarch_64.zip"
+        "LICENSE-$pkgver::https://raw.githubusercontent.com/protocolbuffers/protobuf/v$pkgver/LICENSE")
+sha256sums=('8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a'
+            '6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d')
+
+package() {
+  rm -rf protoc
+  mkdir protoc
+  bsdtar -xf "protoc-$pkgver-linux-aarch_64.zip" -C protoc
+  install -Dm755 protoc/bin/protoc "$pkgdir/opt/c/bin/protoc"
+  install -d "$pkgdir/opt/c/include"
+  cp -r protoc/include/google "$pkgdir/opt/c/include/"
+  find "$pkgdir/opt/c/include/google" -type d -exec chmod 755 {} +
+  find "$pkgdir/opt/c/include/google" -type f -exec chmod 644 {} +
+  install -Dm644 "LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
