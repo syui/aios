@@ -805,6 +805,12 @@ impl Inode for ProcInode {
             // seq_fdinfo_open。開いたあとで相手が変わっても、読むのはそのまま)
             Node::Maps(pid) | Node::Smaps(pid) | Node::Environ(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
             Node::FdInfo(pid, _) => Some(c.check(m, want).and_then(|_| aa_ptrace(pid, true))),
+            // UTS ごとの sysctl (kernel/uname): その UTS で CAP_SYS_ADMIN を持てば持ち主のビットで (Linux の
+            // net_ctl_permission と同じ考え。中に root の割りあてのないユーザーの namespace (aibox --image の 65532) でも、
+            // sethostname できる人は書ける)
+            Node::Sys(i) if crate::sysctl::TABLE[i as usize].uts_scoped() && crate::ns::uts_admin() => {
+                Some(if want & !((m.mode >> 6) & 7) == 0 { Ok(()) } else { c.check(m, want) })
+            }
             _ => None,
         }
     }

@@ -37,19 +37,22 @@ static void get(const char *p, char *buf, size_t n) {
   if (nl) *nl = 0;
 }
 
-static int newuts(void) {
+// 中の番号 inner に自分を割りあてたユーザーの namespace と UTS を作る (root なら UTS だけ)
+static int newuts_as(int inner) {
   if (unshare(CLONE_NEWUTS) == 0) return 0;
   char map[64];
   uid_t uid = getuid();
   gid_t gid = getgid();
   if (unshare(CLONE_NEWUSER | CLONE_NEWUTS) < 0) return -1;
-  snprintf(map, sizeof map, "0 %d 1\n", (int)uid);
+  snprintf(map, sizeof map, "%d %d 1\n", inner, (int)uid);
   put("/proc/self/uid_map", map);
   put("/proc/self/setgroups", "deny");
-  snprintf(map, sizeof map, "0 %d 1\n", (int)gid);
+  snprintf(map, sizeof map, "%d %d 1\n", inner, (int)gid);
   put("/proc/self/gid_map", map);
   return 0;
 }
+
+static int newuts(void) { return newuts_as(0); }
 
 static int is_linux(void) {
   struct utsname u;
@@ -114,6 +117,20 @@ int main(void) {
     CHECK("read-back", r[3] == '1');
     CHECK("fork-inherits", r[4] == '1');
     CHECK("newuts-inherits", r[5] == '1');
+  }
+  // 中に root の割りあてがない (aibox --image のように image の 65532 だけ) ユーザーの namespace でも、自分の UTS の
+  // uname は書ける (sethostname できる人)
+  pid = fork();
+  if (pid == 0) {
+    if (newuts_as(65532) < 0) _exit(2);
+    _exit(put("/proc/sys/kernel/uname", "linux") == 0 && is_linux() ? 0 : 1);
+  }
+  int st;
+  waitpid(pid, &st, 0);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 2) {
+    printf("ok uname-nonroot-map (skipped: unshare)\n");
+  } else {
+    CHECK("nonroot-map-set-linux", WIFEXITED(st) && WEXITSTATUS(st) == 0);
   }
   uname(&u);
   get("/proc/sys/kernel/uname", mode, sizeof mode);
