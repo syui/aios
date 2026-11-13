@@ -441,7 +441,9 @@ ai/at の Dockerfile と compose.yml (と hardening.yml) を土台に、ビル�
 aios-node (libstdc++ 入り) と aios-static。node のものは `ENTRYPOINT []` と CMD の node (ai/at の compose の
 `command: node ...` がそのまま使える)。ai/at と同じく node 26 と pnpm にそろえる (atproto は corepack の pnpm、
 did-method-plc と social-app は repo の固めた版、ozone (upstream は yarn 4) と relay の admin UI (npm) は aios の pnpm で
-`pnpm import` してから: lockfile の版は固めたまま)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
+`pnpm import` してから: lockfile の版は固めたまま)。ozone は yarn の node-modules と同じならべ方 (package.json にない uuid を
+import している) で、`nodeLinker: hoisted` は pnpm-workspace.yaml に書く (pnpm 12 は `pnpm run` の前に設定とちがう
+node_modules を入れなおすので、`--shamefully-hoist` などのコマンドの引数は build のときにはきかない)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
 もの (relay の sqlite は使えない。ai/at の本番は Postgres)。social-app は devEngines の Node 24 (glibc のもの) を取って
 こないように、ビルドのときだけ onFail を warn にして aios の Node 26 で。compose.yml の envs/、configs/、data/、
 repos/ は ai/at と同じ置き場 (repos/NAME を context に、Dockerfile は ../../NAME/Dockerfile):
@@ -455,8 +457,8 @@ docker compose build && docker compose up -d                      # envs/ と co
 - CI: image.yml は did-method-plc を作り、Postgres といっしょに起こして DID を作って document をたしかめる
   (aios-plc は 199 MB)。bluesky.yml は upstream の固めた commit で 6 つをみな作り、中で better-sqlite3 (pds) と
   sharp (bsky) とバイナリが動くかを見る
-  2026-11-13 に 6 つとも通った (image の大きさ: pds 324 MB、bsky 318 MB、ozone 265 MB、bsync 214 MB、plc 202 MB、
-  ozone (web) 627 MB、social-app 127 MB、jetstream 58 MB、relay 40 MB)。pds の better-sqlite3 (sqlite 3.53.0) は
+  2026-11-13 に 6 つとも通った (pnpm にそろえたあと。image の大きさ: pds 324 MB、bsky 318 MB、ozone 265 MB、bsync 214 MB、
+  plc 202 MB、ozone (web) 605 MB、social-app 127 MB、jetstream 58 MB、relay 40 MB)。pds の better-sqlite3 (sqlite 3.53.0) は
   Node 26 のできあいがなく、builder の node-gyp と zig の c++ でビルドしたもの。そのために、aios の make の既定の
   CXX を g++ に (前は make をビルドしたときの zig c++ が焼きこまれていて、base-devel の包みを通らなかった) し、
   base-devel の cc / c++ が node-gyp の -Wl,--exclude-libs を外すようにした
