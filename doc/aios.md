@@ -435,6 +435,21 @@ PID の namespace の中のゾンビの番号 (waitid(WNOWAIT) で待ったあ�
 aibox の中の gitea は git を呼べなかった。test/pidnswait.c が 18 行同じ)。CI は名前つきボリュームと --read-only、cap なしで
 起こして、ユーザーを作り、git push とフック、API の commits までたしかめる。
 
+atproto の DID PLC (did-method-plc) の見本は docker/plc (Dockerfile と compose.yml)。builder で `ap -Sy nodejs` と
+pnpm 11.11.0、upstream の packages/server/Dockerfile と同じ手順で install と build (upstream も Alpine の musl で作る)、
+動かすのは aios-node (199 MB)。compose は postgres:18-alpine と plc (init、65532、読むだけの根、cap なし、/_health の
+healthcheck。パスワードは PLC_DB_PASSWORD)。ai/at の docker/plc/Dockerfile と同じく、did-method-plc のリポジトリを
+context にして作る:
+
+```bash
+docker build -t aios-plc:local -f docker/plc/Dockerfile PATH/TO/did-method-plc
+PLC_DB_PASSWORD=... docker compose -f docker/plc/compose.yml up -d
+```
+
+CI は did-method-plc を固めた commit で取って作り、Postgres といっしょに起こして healthy、@did-plc/lib で DID を作って
+document をたしかめる。aios の VM でも、pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを
+変えるまで通った (2026-11-13)。
+
 ほかのものが前提にする C と C++ のライブラリ (2026-11-13):
 
 - openssl (pkg/c/openssl、OpenSSL 4.1.0): 静的な libssl.a と libcrypto.a、ヘッダー、pkg-config、静的な openssl を /opt/c に
