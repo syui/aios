@@ -23,7 +23,7 @@ RUN echo "EXPO_PUBLIC_ENV=$EXPO_PUBLIC_ENV" >> .env && \
   echo "EXPO_PUBLIC_BUNDLE_IDENTIFIER=$EXPO_PUBLIC_BUNDLE_IDENTIFIER" >> .env && \
   echo "EXPO_PUBLIC_BUNDLE_DATE=$(date -u +%y%m%d%H)" >> .env && \
   echo "EXPO_PUBLIC_SENTRY_DSN=$EXPO_PUBLIC_SENTRY_DSN" >> .env
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm intl:build 2>&1 | tee i18n.log && ! grep -q "invalid syntax" i18n.log
 RUN SENTRY_RELEASE="xyz.blueskyweb.app@${EXPO_PUBLIC_RELEASE_VERSION:-unset}" SENTRY_DIST=$EXPO_PUBLIC_BUNDLE_IDENTIFIER pnpm build-web
 

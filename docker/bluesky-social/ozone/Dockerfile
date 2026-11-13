@@ -6,9 +6,9 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN ap -Sy --noconfirm nodejs base-devel python && npm install -g corepack && corepack enable
 WORKDIR /usr/src/ozone
 COPY package.json yarn.lock .yarnrc.yml ./
-RUN yarn
+RUN printf 'supportedArchitectures:\n  libc:\n    - musl\n' >> .yarnrc.yml && yarn
 COPY . .
-RUN yarn build
+RUN printf 'supportedArchitectures:\n  libc:\n    - musl\n' >> .yarnrc.yml && yarn build
 RUN rm -rf node_modules .next/cache
 RUN mv service/package.json package.json && mv service/yarn.lock yarn.lock
 RUN yarn

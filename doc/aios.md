@@ -435,20 +435,28 @@ PID の namespace の中のゾンビの番号 (waitid(WNOWAIT) で待ったあ�
 aibox の中の gitea は git を呼べなかった。test/pidnswait.c が 18 行同じ)。CI は名前つきボリュームと --read-only、cap なしで
 起こして、ユーザーを作り、git push とフック、API の commits までたしかめる。
 
-atproto の DID PLC (did-method-plc) の見本は docker/plc (Dockerfile と compose.yml)。builder で `ap -Sy nodejs` と
-pnpm 11.11.0、upstream の packages/server/Dockerfile と同じ手順で install と build (upstream も Alpine の musl で作る)、
-動かすのは aios-node (199 MB)。compose は postgres:18-alpine と plc (init、65532、読むだけの根、cap なし、/_health の
-healthcheck。パスワードは PLC_DB_PASSWORD)。ai/at の docker/plc/Dockerfile と同じく、did-method-plc のリポジトリを
-context にして作る:
+atproto のサービス (bluesky-social) を aios の image で動かす準備は docker/bluesky-social (2026-11-13)。公式の GitHub の
+名前にそろえて NAME/Dockerfile (atproto、did-method-plc、indigo、jetstream、ozone、social-app) と compose.yml。
+ai/at の Dockerfile と compose.yml (と hardening.yml) を土台に、ビルドは builder (ghcr.io/syui/aios)、動かすのは
+aios-node (libstdc++ 入り) と aios-static。node のものは `ENTRYPOINT []` と CMD の node (ai/at の compose の
+`command: node ...` がそのまま使える)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
+もの (relay の sqlite は使えない。ai/at の本番は Postgres)。social-app は devEngines の Node 24 (glibc のもの) を取って
+こないように、ビルドのときだけ onFail を warn にして aios の Node 26 で。compose.yml の envs/、configs/、data/、
+repos/ は ai/at と同じ置き場 (repos/NAME を context に、Dockerfile は ../../NAME/Dockerfile):
 
 ```bash
-docker build -t aios-plc:local -f docker/plc/Dockerfile PATH/TO/did-method-plc
-PLC_DB_PASSWORD=... docker compose -f docker/plc/compose.yml up -d
+cd docker/bluesky-social
+git clone https://github.com/bluesky-social/atproto repos/atproto   # ほかも同じ (did-method-plc は did-method-plc/did-method-plc)
+docker compose build && docker compose up -d                      # envs/ と configs/ は ai/at のもの
 ```
 
-CI は did-method-plc を固めた commit で取って作り、Postgres といっしょに起こして healthy、@did-plc/lib で DID を作って
-document をたしかめる。aios の VM でも、pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを
-変えるまで通った (2026-11-13)。
+- CI: image.yml は did-method-plc を作り、Postgres といっしょに起こして DID を作って document をたしかめる
+  (aios-plc は 199 MB)。bluesky.yml は upstream の固めた commit で 6 つをみな作り、中で better-sqlite3 (pds) と
+  sharp (bsky) とバイナリが動くかを見る
+- aios の VM でも did-method-plc を pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを変える
+  まで通った
+- まだ: arm64 だけ (ai/at の本番の at は x86_64)。aios に Postgres と redis のパッケージはない (compose は
+  postgres:18-alpine と redis:alpine)
 
 ほかのものが前提にする C と C++ のライブラリ (2026-11-13):
 
@@ -456,6 +464,8 @@ document をたしかめる。aios の VM でも、pnpm install と tsc の buil
   (OPENSSLDIR は /etc/ssl)。Rust の native-tls / openssl-sys (reqwest の既定: ai/chat、ai/courier) は、builder で
   `ap -Sy cargo base-devel openssl` すれば静的にリンクし、できたものは OpenSSL を持ち歩かない (aios-static で動く)。
   ai/chat をクロスで作り、aios の VM で /xrpc/_health まで。s_server と s_client は TLS 1.3 (X25519MLKEM768)
+- go (pkg/c/go、Go 1.27.4): 公式の linux-arm64 (静的) を /opt/c/go に。GOTOOLCHAIN=local。aios の VM で net/http を
+  使うものを CGO_ENABLED=0 でビルドして動く
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

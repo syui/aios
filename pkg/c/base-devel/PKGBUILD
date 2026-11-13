@@ -6,7 +6,7 @@
 # 作ったものは /opt/c に入れる (./configure --prefix=/opt/c)。/etc/profile が /opt/c/bin を PATH に足す
 pkgname=base-devel
 pkgver=0.0.1
-pkgrel=9
+pkgrel=10
 pkgdesc='Tools to build C on aios (zig as cc, c++, ar, ranlib; make, patch)'
 arch=('any')
 url='https://github.com/syui/aios'
@@ -26,11 +26,12 @@ package() {
 link=-static
 rustc= static=
 # --target= は外す (cc crate などが Rust の名前 aarch64-unknown-linux-musl で渡すが、zig は知らない。
-# 下で -target aarch64-linux-musl を渡す)。rustc がリンカとして渡す --fix-cortex-a53-843419 も zig は知らない
+# 下で -target aarch64-linux-musl を渡す)。rustc がリンカとして渡す --fix-cortex-a53-843419 も zig は知らない。
+# node-gyp が共有ライブラリ (.node) に渡す --exclude-libs (静的なアーカイブの記号を外に見せない印) も zig は知らない
 for a in "\$@"; do
   shift
   case "\$a" in
-    --target=*|-Wl,--fix-cortex-a53-843419) continue ;;
+    --target=*|-Wl,--fix-cortex-a53-843419|-Wl,--exclude-libs,*|-Wl,--exclude-libs=*) continue ;;
     -dynamic|-shared) link= ;;
     -nodefaultlibs) rustc=1 ;;
     -static|-static-pie) static=1 ;;
