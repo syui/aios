@@ -1,17 +1,26 @@
+x-sysctls: &sysctls
+  net.mptcp.enabled: "0"
+  net.ipv4.conf.all.send_redirects: "0"
+  net.ipv4.conf.default.send_redirects: "0"
+  net.ipv4.conf.all.accept_redirects: "0"
+  net.ipv4.conf.default.accept_redirects: "0"
+  net.ipv4.conf.all.secure_redirects: "0"
+  net.ipv4.conf.default.secure_redirects: "0"
+  net.ipv4.conf.all.accept_source_route: "0"
+  net.ipv4.conf.default.accept_source_route: "0"
+  net.ipv4.ping_group_range: "1 0"
+  net.ipv4.ip_forward: "0"
+  net.ipv4.ip_unprivileged_port_start: "1024"
+  net.ipv6.conf.all.accept_redirects: "0"
+  net.ipv6.conf.default.accept_redirects: "0"
+  net.ipv6.conf.all.accept_source_route: "0"
+  net.ipv6.conf.default.accept_source_route: "0"
+  net.ipv6.conf.all.accept_ra: "0"
+  net.ipv6.conf.default.accept_ra: "0"
+  net.ipv6.conf.all.forwarding: "0"
+
 x-hardening: &hardening
-  sysctls:
-    net.mptcp.enabled: "0"
-    net.ipv4.conf.all.send_redirects: "0"
-    net.ipv4.conf.default.send_redirects: "0"
-    net.ipv4.conf.all.accept_redirects: "0"
-    net.ipv4.conf.default.accept_redirects: "0"
-    net.ipv4.conf.all.secure_redirects: "0"
-    net.ipv4.conf.default.secure_redirects: "0"
-    net.ipv4.conf.all.accept_source_route: "0"
-    net.ipv4.conf.default.accept_source_route: "0"
-    net.ipv4.ping_group_range: "1 0"
-    net.ipv4.ip_forward: "0"
-    net.ipv4.ip_unprivileged_port_start: "1024"
+  sysctls: *sysctls
   security_opt:
     - no-new-privileges:true
   pids_limit: 512
@@ -25,6 +34,12 @@ x-hardening: &hardening
     - AUDIT_WRITE
     - NET_BIND_SERVICE
     - FSETID
+
+x-no-ipv6: &no-ipv6
+  sysctls:
+    <<: *sysctls
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
 
 x-ro: &ro
   read_only: true
@@ -43,7 +58,7 @@ x-edge-app: &edge-app
 
 services:
   database:
-    <<: *hardening
+    <<: [*no-ipv6, *hardening]
     image: postgres:18-alpine
     restart: always
     env_file:
@@ -61,7 +76,7 @@ services:
       retries: 20
 
   redis:
-    <<: [*hardening, *ro]
+    <<: [*no-ipv6, *hardening, *ro]
     image: redis:alpine
     restart: always
     volumes:
@@ -73,7 +88,7 @@ services:
       retries: 5
 
   plc:
-    <<: *edge-app
+    <<: [*no-ipv6, *edge-app]
     image: aios-plc:local
     build:
       context: ./repos/did-method-plc/
@@ -143,7 +158,7 @@ services:
         condition: service_healthy
 
   bsync:
-    <<: *app
+    <<: [*no-ipv6, *app]
     image: aios-bsync:local
     build:
       context: ./repos/atproto/

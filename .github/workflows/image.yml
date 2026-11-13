@@ -203,10 +203,16 @@ jobs:
           # Postgres と、守りのまま (読むだけの根、cap なし、no-new-privileges、65532) の plc
           pw="ci-$(openssl rand -hex 8)"
           creds="{\"username\":\"postgres\",\"password\":\"$pw\",\"host\":\"database\",\"port\":\"5432\",\"database\":\"plc\"}"
+          # sysctl は compose.yml と同じもの (database と plc は IPv6 を切る)
+          c=docker/bluesky-social
+          mkdir -p $c/envs && for f in postgres plc pds bsky bsync bgs social-app ozone jetstream; do : > $c/envs/$f; done
+          sysctls() { docker compose -f $c/compose.yml config --format json | jq -r --arg s "$1" '.services[$s].sysctls | to_entries[] | "--sysctl=\(.key)=\(.value)"'; }
+          sysctls database | tee out/plc-sysctls.log
+          grep -qx -- '--sysctl=net.ipv6.conf.all.disable_ipv6=1' out/plc-sysctls.log
           docker network create plc-ci
-          docker run -d --name database --network plc-ci -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc postgres:18-alpine
+          docker run -d --name database --network plc-ci $(sysctls database) -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc postgres:18-alpine
           for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d plc && break; sleep 2; done
-          docker run -d --name plc --network plc-ci -p 127.0.0.1:2582:3000 --init --read-only --tmpfs /tmp \
+          docker run -d --name plc --network plc-ci $(sysctls plc) -p 127.0.0.1:2582:3000 --init --read-only --tmpfs /tmp \
             --cap-drop ALL --security-opt no-new-privileges \
             -e ENABLE_MIGRATIONS=true -e DB_CREDS_JSON="$creds" -e DB_MIGRATE_CREDS_JSON="$creds" aios-plc:local
           ok=
@@ -227,6 +233,8 @@ jobs:
             const data = await c.getDocumentData(did);
             console.log(did, JSON.stringify(data));
             if (!did.startsWith("did:plc:") || data.alsoKnownAs[0] !== "at://ci.example.com") process.exit(1);'
+          docker exec plc node -e 'const f = (i) => require("fs").readFileSync(`/proc/sys/net/ipv6/conf/${i}/disable_ipv6`, "utf8").trim(); const v6 = Object.values(require("os").networkInterfaces()).flat().filter((a) => a.family === "IPv6"); console.log("disable_ipv6", f("all"), f("lo"), "ipv6", v6.length); if (f("all") !== "1" || f("lo") !== "1" || v6.length) process.exit(1)'
+          docker exec database cat /proc/sys/net/ipv6/conf/all/disable_ipv6 | grep -qx 1
           docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}' plc | tee out/plc-inspect.log
           grep -q 'user=65532:65532 ro=true cap_drop=\[ALL\]' out/plc-inspect.log
           docker rm -f plc database
