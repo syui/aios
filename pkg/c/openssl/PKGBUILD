@@ -9,7 +9,7 @@
 #   作るのに perl が要る (Configure と、アセンブリを書き出す perlasm)
 pkgname=openssl
 pkgver=4.1.0
-pkgrel=1
+pkgrel=2
 _latest_url=https://openssl-library.org/source/
 _latest_regex='openssl-([0-9]+[.][0-9]+[.][0-9]+)[.]tar[.]gz'
 pkgdesc='TLS and general-purpose cryptography library and the openssl tool (static, for aios)'
@@ -31,9 +31,11 @@ build() {
   zig_env
   cd "openssl-$pkgver"
   # linux-aarch64 (アセンブリの速い道もそのまま。Zig の clang で組む)。no-shared: 静的だけ、no-module: provider も
-  # 中に、no-docs と no-tests: 文書とテストは作らない。CC などは Zig (CFLAGS と LDFLAGS も環境から: openssl は -static)
+  # 中に、no-docs と no-tests: 文書とテストは作らない。CC などは Zig (CFLAGS と LDFLAGS も環境から: openssl は -static)。
+  # -fPIC: 静的なライブラリを PIE (aios の cargo が作る、musl に動的にリンクしたもの) にもつなげるように (Alpine の
+  # openssl-libs-static と同じ。no-shared だと OpenSSL は PIC にしない: R_AARCH64_ABS64 cannot be used against local symbol)
   ./Configure linux-aarch64 --prefix="$PREFIX" --libdir=lib --openssldir=/etc/ssl \
-    no-shared no-module no-docs no-tests \
+    no-shared no-module no-docs no-tests -fPIC \
     CC="$CC" AR="$AR" RANLIB="$RANLIB"
   make -j"$(nproc)"
 }
