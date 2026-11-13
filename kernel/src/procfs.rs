@@ -129,6 +129,9 @@ enum Node {
     /// /proc/ai/stack と stack/TID (スレッドの番号)
     AiStackDir,
     AiStack(u32),
+    /// /proc/sysvipc と、その中の shm (System V の共有メモリの一覧: shm.rs。ipcs が読む)
+    SysvipcDir,
+    SysvipcShm,
 }
 
 pub struct ProcInode {
@@ -284,6 +287,8 @@ impl ProcInode {
             Node::AiFw => 55,
             Node::AiStackDir => 45,
             Node::AiStack(t) => (t as u64) << 16 | 31,
+            Node::SysvipcDir => 56,
+            Node::SysvipcShm => 57,
         }
     }
 
@@ -493,6 +498,7 @@ impl ProcInode {
             Node::StatAll => stat_all(),
             Node::Diskstats => crate::block::proc_diskstats(),
             Node::Buddyinfo => buddyinfo(),
+            Node::SysvipcShm => crate::shm::proc_text(),
             Node::Vmstat => {
                 use core::sync::atomic::Ordering::Relaxed;
                 // ページ (4 KiB) の数と、Linux の vmstat が読む数え (ないものは 0)
@@ -821,7 +827,7 @@ impl Inode for ProcInode {
 
     fn meta(&self) -> Meta {
         let mode = match self.node {
-            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir | Node::AiStackDir => S_IFDIR | 0o555,
+            Node::Root | Node::Pid(_) | Node::NetDir | Node::SysvipcDir | Node::SysDir(..) | Node::AiDir | Node::AiFdDir | Node::AiStackDir => S_IFDIR | 0o555,
             Node::AiCtl => S_IFREG | 0o664,
             Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable() => S_IFREG | 0o644,
             Node::FdDir(_) => S_IFDIR | 0o500,
@@ -1037,6 +1043,8 @@ impl Inode for ProcInode {
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
             (Node::Root, "net") => Node::NetDir,
+            (Node::Root, "sysvipc") => Node::SysvipcDir,
+            (Node::SysvipcDir, "shm") => Node::SysvipcShm,
             (Node::Root, "ai") if !crate::parts::off(crate::parts::Part::Aiproc) => Node::AiDir,
             (Node::AiDir, "threads") => Node::AiThreads,
             (Node::AiDir, "bkl") => Node::AiBkl,
@@ -1156,6 +1164,7 @@ impl Inode for ProcInode {
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
                 add("net".into(), Node::NetDir);
+                add("sysvipc".into(), Node::SysvipcDir);
                 if !crate::parts::off(crate::parts::Part::Aiproc) {
                     add("ai".into(), Node::AiDir);
                 }
@@ -1194,6 +1203,7 @@ impl Inode for ProcInode {
                     add(format!("{}", p.tgid), Node::AiFd(p.tgid));
                 }
             }
+            Node::SysvipcDir => add("shm".into(), Node::SysvipcShm),
             Node::NetDir => {
                 add("pnp".into(), Node::Pnp);
                 add("route".into(), Node::Route);

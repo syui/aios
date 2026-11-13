@@ -24,6 +24,7 @@ mod kmsg;
 mod landlock;
 mod timerfd;
 mod signalfd;
+mod shm;
 mod console;
 mod tty;
 mod block;
@@ -171,6 +172,7 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(epoll::SYSCALLS, epoll::sys);
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
     syscall::register(signalfd::SYSCALLS, signalfd::sys);
+    syscall::register(shm::SYSCALLS, shm::sys);
     syscall::register(inotify::SYSCALLS, inotify::sys);
     // ファイルのロック (Linux の CONFIG_FILE_LOCKING): flock と、fcntl のロック・閉じたときに外すもの (file::FileLocks)
     file::register_locks(&locks::OPS);

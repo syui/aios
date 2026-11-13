@@ -236,6 +236,11 @@ nrs! {
     GET_MEMPOLICY = 236,
     SET_MEMPOLICY = 237,
     RT_TGSIGQUEUEINFO = 240,
+    // System V の共有メモリ (shm.rs)
+    SHMGET = 194,
+    SHMCTL = 195,
+    SHMAT = 196,
+    SHMDT = 197,
     ACCEPT4 = 242,
     WAIT4 = 260,
     WAITID = 95,

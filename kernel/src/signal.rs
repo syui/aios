@@ -247,8 +247,9 @@ pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
     if t.sig_mask & b == 0 || t.sigwait & b != 0 {
         proc::interrupt(t);
     } else {
-        // ブロックしたまま来たもの: signalfd を読む・待つもの (read、poll、epoll) を起こす
+        // ブロックしたまま来たもの: signalfd を読む・待つもの (read は wakeup、poll と epoll は poll_wake) を起こす
         proc::wakeup(fd_chan(t.tgid));
+        proc::poll_wake(fd_chan(t.tgid));
     }
 }
 

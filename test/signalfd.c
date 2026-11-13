@@ -179,6 +179,31 @@ int main(void) {
            s[0].ssi_pid == (unsigned)c ? "child" : "other", s[0].ssi_status);
   waitpid(c, NULL, 0);
 
+  // ほかのプロセスからの kill で、epoll_wait と poll (どちらも時間切れなし) が起きる (PostgreSQL のラッチ: SetLatch が
+  // 寝ているプロセスに SIGURG を送る)。起きなければ 2 秒の時間切れのあとで見つける (slow)
+  for (int k = 0; k < 2; k++) {
+    struct timespec a0, a1;
+    clock_gettime(CLOCK_MONOTONIC, &a0);
+    c = fork();
+    if (c == 0) {
+      usleep(50000);
+      kill(getppid(), SIGURG);
+      _exit(0);
+    }
+    if (k == 0) {
+      n = epoll_wait(ep, out, 1, 2000);
+      clock_gettime(CLOCK_MONOTONIC, &a1);
+      printf("epoll woken by kill %d %s\n", n, a1.tv_sec - a0.tv_sec < 1 ? "fast" : "slow");
+    } else {
+      p.revents = 0;
+      n = poll(&p, 1, 2000);
+      clock_gettime(CLOCK_MONOTONIC, &a1);
+      printf("poll woken by kill %d revents %x %s\n", n, p.revents, a1.tv_sec - a0.tv_sec < 1 ? "fast" : "slow");
+    }
+    waitpid(c, NULL, 0);
+    rd(fd, s, 4);
+  }
+
   // POSIX タイマー (SI_TIMER)
   struct sigevent ev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGRTMIN, .sigev_value.sival_ptr = (void *)99};
   timer_t t;

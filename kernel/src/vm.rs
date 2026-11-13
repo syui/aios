@@ -2352,6 +2352,11 @@ impl PageTable {
         }
     }
 
+    /// 領域を頭の番地の順に (頭と領域)。SysV の共有メモリ (shm.rs) が、かたまりを写した領域を数える (shm_nattch)
+    pub fn vmas_iter(&self) -> impl Iterator<Item = (usize, &Vma)> {
+        self.vmas.iter().map(|(&s, v)| (s, v))
+    }
+
     /// /proc/PID/maps (Linux と同じ形)。パスは / から (中では先頭の / なしで持っている。
     /// VLC などは自分の行の最初の / から先を自分のディレクトリと見る)
     pub fn maps_text(&self) -> alloc::string::String {

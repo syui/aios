@@ -4,10 +4,12 @@
 #   動的にリンクする (python と同じ。libpq.so は /opt/c/lib から: RUNPATH)。TLS は OpenSSL (静的なライブラリなので
 #   中に入る)、圧縮は zlib と zstd。入れないもの: readline (psql の行の編集)、ICU (照合順序は libc と組みこみのもの)、
 #   LLVM の JIT、文書。18 のリリースの tar には bison と flex の出力がないので、作るマシンの bison、flex、perl を使う。
-#   タイムゾーンの表は、作るマシンの zic で書く (ZIC: 中の zic は aios のもので、ここでは動かない)
+#   タイムゾーンの表は、作るマシンの zic で書く (ZIC: 中の zic は aios のもので、ここでは動かない)。
+#   postgres は自分の関数 (palloc など) を拡張に見せる (--export-dynamic)。configure はクロスでは試せず「なし」にするので、
+#   make に LDFLAGS_EX_BE でわたす (なければ initdb が dict_snowball.so で palloc0: symbol not found)
 pkgname=postgresql
 pkgver=18.7
-pkgrel=1
+pkgrel=2
 pkgdesc='Sophisticated object-relational DBMS (server, client tools, libpq and contrib, for aios)'
 arch=('aarch64')
 url='https://www.postgresql.org/'
@@ -42,14 +44,14 @@ build() {
   ./configure --host=aarch64-linux-musl --build="$(uname -m)-linux-gnu" --prefix="$PREFIX" \
     --sysconfdir=/etc/postgresql --with-ssl=openssl --with-zstd \
     --without-readline --without-icu --without-llvm
-  make -j"$(nproc)" ZIC="$_zic"
+  make -j"$(nproc)" ZIC="$_zic" LDFLAGS_EX_BE=-Wl,--export-dynamic
   make -C contrib -j"$(nproc)"
 }
 
 package() {
   _env
   cd "postgresql-$pkgver"
-  make DESTDIR="$pkgdir" ZIC="$_zic" install
+  make DESTDIR="$pkgdir" ZIC="$_zic" LDFLAGS_EX_BE=-Wl,--export-dynamic install
   make -C contrib DESTDIR="$pkgdir" install
   install -Dm644 COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/COPYRIGHT"
 }

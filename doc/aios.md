@@ -499,18 +499,35 @@ Postgres といっしょに起こして表 (device_tokens) ができたかを見
   バグのたしかめ) ので、smaps を足した (下)
 - postgresql (pkg/c/postgresql、PostgreSQL 18.7): 拡張を dlopen で読むので musl に動的に (zlib、zstd、OpenSSL。contrib も:
   bsky が pg_trgm を使う)。18 の tar には bison と flex の出力がないので作るマシンのものを、タイムゾーンの表は作るマシンの
-  zic で。まだ: aios のカーネルに System V の共有メモリ (shmget、shmat) がないので、aios の上では postgres が起きない
-  (Postgres はいつも小さな SysV の共有メモリをとる)。docker (Linux) の上では動く。ラッチが使う signalfd は足した (下)
+  zic で。postgres は自分の関数を拡張に見せる (--export-dynamic) が、configure はクロスでは試せずに落とすので make に
+  LDFLAGS_EX_BE でわたす (18.7-2。なければ initdb が dict_snowball.so で palloc0: symbol not found)。aios の上でも動く
+  (2026-11-13): initdb、pg_ctl start / stop、psql (Unix ソケットと TCP の scram)、CREATE DATABASE、pg_trgm、起こし
+  なおし。カーネルに足したもの: signalfd (ラッチが SIGURG を待つ) と System V の共有メモリ (データのディレクトリの印)。
+  どちらも下
+
+System V の共有メモリ (2026-11-13、kernel/src/shm.rs、extra): shmget、shmat、shmdt、shmctl (IPC_STAT、IPC_SET、
+IPC_RMID、IPC_INFO、SHM_INFO、SHM_STAT、SHM_LOCK) と /proc/sysvipc/shm (ipcs が読む)。Linux の ipc/shm.c と同じ答えと
+順 (鍵がなければ ENOENT、IPC_CREAT | IPC_EXCL で EEXIST、大きさが足りなければ EINVAL、許しは ipcperms、番号は seq << 15 |
+位置で位置は回して配る)。中身は名前のない tmpfs のファイル (memfd と同じ) で、shmat はそれを MAP_SHARED で写す
+(/proc/PID/maps では /SYSV%08x (deleted))。shm_nattch は、そのファイルを写した領域をみなのアドレス空間で数える (fork で
+増え、shmdt・munmap・exec・終わりで減り、munmap で領域が分かれれば増える: Linux の shm_open / shm_close と同じ。ファイルの
+参照の数は、触れたページの数も入るので使わない)。shmdt は addr から始まるかたまりの写しを、分かれたものもみな外す。
+つないだまま IPC_RMID すると SHM_DEST がつき鍵は IPC_PRIVATE に (番号ではまだ見え、つなげる)、表は弱い参照だけを持ち、
+さいごの写しが外れると中身が消える。ちがい: Linux は fork と終わりでも shm_lpid と shm_dtime を変える (aios は shmat と
+shmdt でだけ)。IPC の namespace はまだない (表は 1 つ)。test/shm.c は手本の Linux (test/linux.config に CONFIG_SYSVIPC を
+足した) と 58 行同じ。PostgreSQL は、いつも小さなかたまりをとり、前の postmaster がまだつないでいるかを shm_nattch で見る
 
 signalfd (2026-11-13、kernel/src/signalfd.rs、extra): signalfd4 で、ブロックしたシグナルを fd から struct signalfd_siginfo
 (128 バイト) として読む。欄は Linux の signalfd_copyinfo と同じく si_code で決める (kill は pid と uid、sigqueue や tgkill は
 値も、SIGCHLD は status、POSIX タイマーは tid と値)。read はいくつかをまとめて読み、なければ待つ (O_NONBLOCK なら EAGAIN、
 ほかのシグナルのハンドラが動けば EINTR)。poll と epoll は、待つスレッドに mask のシグナルが来ていれば読める (ブロックした
-まま来たシグナルは signal.rs の send_thread がプロセスのチャンネルを起こす)。signalfd4 に signalfd の fd をわたすと mask を
+まま来たシグナルは signal.rs の send_thread がプロセスのチャンネルを、read には wakeup で、poll と epoll には poll_wake で
+起こす。はじめは wakeup だけで、epoll で眠る PostgreSQL の io worker や checkpointer がほかのプロセスの SetLatch で起きず、
+psql が認証で止まった。test/signalfd.c は、ほかのプロセスからの kill で epoll と poll がすぐ起きるかも見る)。signalfd4 に signalfd の fd をわたすと mask を
 変える。fdinfo は sigmask。PostgreSQL 17 / 18 はラッチ (epoll) で SIGURG をこれで待つ (なければ initdb の bootstrap が
 「signalfd() failed」で止まった)。いっしょに rt_sigqueueinfo と rt_tgsigqueueinfo (sigqueue: 値つきのシグナル。カーネルの
 印を名のれるのは自分へだけ) を足し、もう来ているふつうのシグナルをもう一度送ったときは、はじめのものの情報を残す (Linux の
-legacy_queue。前は上書きした)。test/signalfd.c は手本の Linux と 47 行同じ。ちがい: Linux はスレッドに来たもの (tgkill) を
+legacy_queue。前は上書きした)。test/signalfd.c は手本の Linux と 49 行同じ。ちがい: Linux はスレッドに来たもの (tgkill) を
 プロセスに来たもの (kill、sigqueue) より先に読むが、aios はスレッドごとの 1 つの組なので番号の小さいものから
 
 /proc/PID/smaps (2026-11-13、kernel/src/vm.rs の smaps_text): maps の行ごとに Linux と同じ形 (名前は 16 文字、数は 8 文字の
