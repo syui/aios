@@ -2062,7 +2062,9 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     }
     let tid = child.pid;
     if flags & CLONE_PARENT_SETTID != 0 {
-        parent.pt().copy_out(ptid, &tid.to_le_bytes());
+        // 親から見た番号 (clone の返す値と同じ。PID の namespace の中なら中の番号)
+        let seen = crate::ns::child_seen(child);
+        parent.pt().copy_out(ptid, &seen.to_le_bytes());
     }
     if flags & CLONE_CHILD_SETTID != 0 {
         child.set_child_tid = ctid;

@@ -280,15 +280,26 @@ pub fn to_local(g: u32) -> Option<u32> {
     same(&t.pid_ns, &v).then_some(t.vpid)
 }
 
+/// 親 (いまのプロセス) から見た、作ったばかりの子の番号 (まだ走らせていないので to_local では見つからない)
+pub fn child_seen(child: &crate::proc::Proc) -> u32 {
+    match crate::proc::current().pid_ns.clone() {
+        Some(v) if same(&child.pid_ns, &v) => child.vpid,
+        _ => child.pid,
+    }
+}
+
 /// 見えなければ 0 (getppid など)
 pub fn local_or_0(g: u32) -> u32 {
     to_local(g).unwrap_or(0)
 }
 
-/// いまのプロセスから見た番号 l の、本当の番号 (なければ None)
+/// いまのプロセスから見た番号 l の、本当の番号 (なければ None)。終わって回収されていないもの (ゾンビ) も: Linux の
+/// struct pid は回収されるまで残る (waitid(WNOWAIT) で待ったあとの wait4(pid)、kill(ゾンビ, 0)、/proc/PID)。
+/// 前はゾンビを見ず、Go の os/exec (pidfd がないとき: waitid(P_PID, WNOWAIT) → wait4(pid)) が PID の namespace の中で
+/// ECHILD になった (aibox --image の gitea が git を待てなかった)。中の番号は使いまわさないので、同じ番号はひとつだけ
 pub fn to_global(l: u32) -> Option<u32> {
     let Some(v) = crate::proc::current().pid_ns.clone() else { return Some(l) };
-    crate::proc::find_where(|p| same(&p.pid_ns, &v) && p.vpid == l).map(|p| p.pid)
+    crate::proc::live().find(|p| p.state != crate::proc::State::Unused && same(&p.pid_ns, &v) && p.vpid == l).map(|p| p.pid)
 }
 
 /// システムコールの引数の pid (0 と -1 はそのまま、負は pgid)。見えなければ ESRCH

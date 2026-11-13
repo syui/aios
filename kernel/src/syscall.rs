@@ -528,7 +528,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
         UNSHARE => proc::unshare(a[0]),
-        CLONE => proc::clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
+        CLONE => sys_clone(a[0], a[1] as usize, a[2] as usize, a[3], a[4] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         CLONE3 => sys_clone3(a[0] as usize, a[1] as usize).map(|t| crate::ns::to_local(t).unwrap_or(t) as i64),
         EXECVE => sys_execve(a[0] as usize, a[1] as usize, a[2] as usize),
         EXECVEAT => sys_execveat(a[0] as i32 as i64, a[1] as usize, a[2] as usize, a[3] as usize, a[4]),
@@ -1528,13 +1528,41 @@ fn unknown_first(n: u64) -> bool {
     first
 }
 
+const CLONE_PIDFD: u64 = 0x1000;
+const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+const CLONE_DETACHED: u64 = 0x40_0000;
+
+/// clone(flags, stack, parent_tid, tls, child_tid)。CLONE_PIDFD なら子を指す pidfd を parent_tid に書く (Linux の
+/// kernel_clone: 同じ場所に書く CLONE_PARENT_SETTID と、CLONE_DETACHED とはいっしょにできない: EINVAL)。
+/// Go の os/exec はこれで子を作って waitid(P_PIDFD) で待つ (前は pidfd を書かず、Go は pidfd を使わない道にしていた)
+fn sys_clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
+    if flags & CLONE_PIDFD == 0 {
+        return proc::clone(flags, stack, ptid, tls, ctid);
+    }
+    if flags & (CLONE_PARENT_SETTID | CLONE_DETACHED) != 0 {
+        return Err(crate::why::inval());
+    }
+    clone_pidfd(flags, stack, ptid, tls, ctid, ptid)
+}
+
+/// clone して、子の pidfd (O_RDWR | O_CLOEXEC。CLONE_THREAD なら PIDFD_THREAD) の番号を at に書く。書けない場所なら
+/// 子を作らずに EFAULT (Linux は子を走らせる前に put_user する)。fd は子が親の表を写したあとで足すので、子の表には
+/// 入らない (CLONE_FILES なら同じ表なので見える。Linux と同じ)。vfork なら子が exec するか終わってから書く
+fn clone_pidfd(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, at: usize) -> Result<u32, i64> {
+    proc::current().pt().copy_out(at, &(-1i32).to_le_bytes()).ok_or(-EFAULT)?;
+    let tid = proc::clone(flags & !CLONE_PIDFD, stack, ptid, tls, ctid)?;
+    let fd = pidfd_install(tid, flags & 0x1_0000 != 0, false)?;
+    proc::current().pt().copy_out(at, &fd.to_le_bytes()).ok_or(-EFAULT)?;
+    Ok(tid)
+}
+
 /// clone3(args, size): struct clone_args (u64 の並び: flags pidfd child_tid parent_tid exit_signal stack stack_size tls
 /// set_tid set_tid_size cgroup) を読んで clone と同じことを。glibc は pthread_create で先にこれを試す。
-/// stack はいちばん下の番地で、子の sp は stack + stack_size。pidfd、set_tid、cgroup はないので EINVAL
+/// stack はいちばん下の番地で、子の sp は stack + stack_size。CLONE_PIDFD なら pidfd の場所に子の pidfd を書く
+/// (parent_tid と同じ場所で CLONE_PARENT_SETTID もなら EINVAL)。set_tid と cgroup はないので EINVAL
 fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
     const EINVAL: i64 = 22;
     const E2BIG: i64 = 7;
-    const CLONE_PIDFD: u64 = 0x1000;
     const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
     // 版 0 は 64 バイト (tls まで)。知らない後ろのものは 0 でなければならない (Linux と同じ)
     if size < 64 {
@@ -1551,13 +1579,19 @@ fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
         return Err(if size > 88 && b[88..].iter().any(|&x| x != 0) { -E2BIG } else { -EINVAL });
     }
     let (flags, exit_signal, stack, stack_size, tls) = (f(0), f(4), f(5) as usize, f(6) as usize, f(7));
-    if flags & (CLONE_PIDFD | CLONE_INTO_CGROUP) != 0 || flags & 0xff != 0 || exit_signal > 64 {
+    if flags & CLONE_INTO_CGROUP != 0 || flags & 0xff != 0 || exit_signal > 64 {
+        return Err(crate::why::inval());
+    }
+    if flags & CLONE_PIDFD != 0 && (flags & CLONE_DETACHED != 0 || (flags & CLONE_PARENT_SETTID != 0 && f(1) == f(3))) {
         return Err(crate::why::inval());
     }
     if (stack == 0) != (stack_size == 0) {
         return Err(crate::why::inval());
     }
     let sp = if stack != 0 { stack + stack_size } else { 0 };
+    if flags & CLONE_PIDFD != 0 {
+        return clone_pidfd(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize, f(1) as usize);
+    }
     proc::clone(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize)
 }
 
