@@ -3,6 +3,8 @@
 # Docs: https://gh.io/actions-lockfile
 version: 'v0.0.3'
 workflows:
+    '.github/workflows/bluesky.yml':
+        - 'actions/checkout@v7.0.1'
     '.github/workflows/image.yml':
         - 'actions/checkout@v7.0.1'
     '.github/workflows/pkg.yml':

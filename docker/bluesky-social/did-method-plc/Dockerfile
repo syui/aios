@@ -1,5 +1,5 @@
-ARG AIOS=ghcr.io/syui/aios:0.0.1.r948.g3e76cb7@sha256:ddd41dd1a4e47b6c87eb9f30cd9dff2c76375cf9cadc7e42cd7f0fc78df784ee
-ARG AIOS_NODE=ghcr.io/syui/aios-node:26.13.1@sha256:9767cd25ed8a4cce342ccdaf13199dadfccd14e5578935f88a5ce1ed6c5726ec
+ARG AIOS=ghcr.io/syui/aios:0.0.1.r955.gfb57887@sha256:27e143fb3a8869a9832197b564e4d2d2b12556ef1c77ce029c90b36858c2e315
+ARG AIOS_NODE=ghcr.io/syui/aios-node:26.13.1@sha256:a0337d11bae69a2250392bfa8fc46f8447cc7a34445dfd25c8ba5428fbfedd3e
 
 FROM ${AIOS} AS build
 RUN ap -Sy --noconfirm nodejs && npm install -g pnpm@11.11.0

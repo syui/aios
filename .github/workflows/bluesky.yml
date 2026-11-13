@@ -1,0 +1,102 @@
+# bluesky: docker/bluesky-social (atproto、did-method-plc、indigo、jetstream、ozone、social-app) の Dockerfile が
+# aios の image (builder の ghcr.io/syui/aios、動かす aios-node と aios-static) で作れるかを、upstream の固めた
+# commit でたしかめる (ai/at の compose.yml が使うものと同じ image)。作るだけで、どこにも置かない
+#   動くとき: docker/bluesky-social と、このファイルを変えた push、手で
+name: bluesky
+
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - 'docker/bluesky-social/**'
+    - '.github/workflows/bluesky.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bluesky
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: atproto
+            url: https://github.com/bluesky-social/atproto
+            commit: 51c7e2e3657c8720b436351a9bc5559f386a8834
+          - name: did-method-plc
+            url: https://github.com/did-method-plc/did-method-plc
+            commit: 29f1a70ee9f6f80a25946cac103b2f745e371334
+          - name: indigo
+            url: https://github.com/bluesky-social/indigo
+            commit: 42946cbf2164b43a0d5782f23dc96069a3552f29
+          - name: jetstream
+            url: https://github.com/bluesky-social/jetstream
+            commit: c9cbd1b3e6604b27bcb32cad08801b9806d4705a
+          - name: ozone
+            url: https://github.com/bluesky-social/ozone
+            commit: cb2e4c10f52b45f96603a98f56a79211a2435e97
+          - name: social-app
+            url: https://github.com/bluesky-social/social-app
+            commit: 2ce37d03eb1edc0211e44846a38c406c2ad29fcb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Source
+        run: |
+          git init -q src
+          git -C src fetch -q --depth 1 "${{ matrix.url }}" "${{ matrix.commit }}"
+          git -C src checkout -q FETCH_HEAD
+          git -C src log --oneline -1
+
+      - name: Build
+        run: |
+          f=docker/bluesky-social/${{ matrix.name }}/Dockerfile
+          if [ "${{ matrix.name }}" = atproto ]; then
+            for t in pds bsky bsync ozone; do
+              docker build -t "aios-$t:ci" --target "$t" -f "$f" src
+            done
+          else
+            docker build -t "aios-${{ matrix.name }}:ci" -f "$f" src
+          fi
+          docker images 'aios-*'
+
+      - name: Smoke
+        run: |
+          # 中で動くか (サービスは起こさず、要るもの: native のモジュール、バイナリ)
+          case "${{ matrix.name }}" in
+          atproto)
+            # pnpm の node_modules はじかに書いたものしか見えないので、@atproto/pds と @atproto/bsky から探す
+            docker run --rm aios-pds:ci node -e 'const r = require("module").createRequire(require.resolve("@atproto/pds")); const D = r("better-sqlite3"); console.log("pds", new D(":memory:").prepare("select sqlite_version() v").get())'
+            docker run --rm aios-bsky:ci node -e 'const r = require("module").createRequire(require.resolve("@atproto/bsky")); r("sharp")({create:{width:8,height:8,channels:3,background:"red"}}).png().toBuffer().then(b => console.log("bsky sharp", b.length))'
+            docker run --rm aios-bsync:ci node -e 'console.log("bsync", process.version)'
+            docker run --rm aios-ozone:ci node -e 'console.log("ozone", process.version)'
+            ;;
+          did-method-plc)
+            docker run --rm aios-did-method-plc:ci node -e 'import("@did-plc/server").then(m => console.log("plc", typeof m.PlcServer))'
+            ;;
+          indigo)
+            docker run --rm aios-indigo:ci /relay --help | head -5
+            ;;
+          jetstream)
+            docker run --rm aios-jetstream:ci --help | head -5
+            ;;
+          ozone)
+            docker run --rm aios-ozone:ci node -e 'console.log("ozone-web", process.version)'
+            ;;
+          social-app)
+            docker run --rm aios-social-app:ci /usr/bin/bskyweb --help | head -5
+            ;;
+          esac
+          docker inspect -f '{{.Config.User}}' "$(docker images -q 'aios-*' | head -1)"

@@ -1,0 +1,253 @@
+x-hardening: &hardening
+  sysctls:
+    net.mptcp.enabled: "0"
+    net.ipv4.conf.all.send_redirects: "0"
+    net.ipv4.conf.default.send_redirects: "0"
+    net.ipv4.conf.all.accept_redirects: "0"
+    net.ipv4.conf.default.accept_redirects: "0"
+    net.ipv4.conf.all.secure_redirects: "0"
+    net.ipv4.conf.default.secure_redirects: "0"
+    net.ipv4.conf.all.accept_source_route: "0"
+    net.ipv4.conf.default.accept_source_route: "0"
+    net.ipv4.ping_group_range: "1 0"
+    net.ipv4.ip_forward: "0"
+    net.ipv4.ip_unprivileged_port_start: "1024"
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 512
+  mem_limit: 1536m
+  cap_drop:
+    - NET_RAW
+    - MKNOD
+    - SYS_CHROOT
+    - SETFCAP
+    - SETPCAP
+    - AUDIT_WRITE
+    - NET_BIND_SERVICE
+    - FSETID
+
+x-ro: &ro
+  read_only: true
+  tmpfs:
+    - /tmp
+
+x-app: &app
+  <<: [*hardening, *ro]
+  user: "10001:10001"
+  cap_drop: [ALL]
+  init: true
+
+x-edge-app: &edge-app
+  <<: *app
+  networks: [default, edge]
+
+services:
+  database:
+    <<: *hardening
+    image: postgres:18-alpine
+    restart: always
+    env_file:
+      - ./envs/postgres
+    volumes:
+      - ./configs/postgres/init/:/docker-entrypoint-initdb.d/
+      - ./data/postgres/:/var/lib/postgresql/
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    healthcheck:
+      test: "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"
+      interval: 5s
+      retries: 20
+
+  redis:
+    <<: [*hardening, *ro]
+    image: redis:alpine
+    restart: always
+    volumes:
+      - ./data/redis/:/data/
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+
+  plc:
+    <<: *edge-app
+    image: aios-plc:local
+    build:
+      context: ./repos/did-method-plc/
+      dockerfile: ../../did-method-plc/Dockerfile
+    ports:
+      - 2582:3000
+    restart: always
+    env_file:
+      - ./envs/plc
+    depends_on:
+      database:
+        condition: service_healthy
+
+  pds:
+    <<: *edge-app
+    image: aios-pds:local
+    build:
+      context: ./repos/atproto/
+      dockerfile: ../../atproto/Dockerfile
+      target: pds
+    ports:
+      - 2583:3000
+    restart: always
+    env_file:
+      - ./envs/pds
+    volumes:
+      - ./data/pds/:/data/
+    command: node --enable-source-maps index.ts
+    depends_on:
+      database:
+        condition: service_healthy
+
+  bsky:
+    <<: *edge-app
+    image: aios-bsky:local
+    build:
+      context: ./repos/atproto/
+      dockerfile: ../../atproto/Dockerfile
+      target: bsky
+    ports:
+      - 2584:2584
+    restart: always
+    env_file:
+      - ./envs/bsky
+    volumes:
+      - ./data/bsky/:/data/
+    command: node --enable-source-maps api.ts
+    depends_on:
+      bsky-dataplane:
+        condition: service_started
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  bsky-dataplane:
+    <<: *app
+    image: aios-bsky:local
+    restart: always
+    env_file:
+      - ./envs/bsky
+    volumes:
+      - ./data/bsky/:/data/
+    command: node --enable-source-maps dataplane.ts
+    depends_on:
+      database:
+        condition: service_healthy
+
+  bsync:
+    <<: *app
+    image: aios-bsync:local
+    build:
+      context: ./repos/atproto/
+      dockerfile: ../../atproto/Dockerfile
+      target: bsync
+    restart: always
+    env_file:
+      - ./envs/bsync
+    command: node --enable-source-maps index.ts
+    depends_on:
+      database:
+        condition: service_healthy
+
+  bgs:
+    <<: *edge-app
+    image: aios-relay:local
+    build:
+      context: ./repos/indigo/
+      dockerfile: ../../indigo/Dockerfile
+    ports:
+      - 2470:2470
+    restart: always
+    env_file:
+      - ./envs/bgs
+    volumes:
+      - ./data/bgs/:/data/
+    depends_on:
+      database:
+        condition: service_healthy
+
+  social-app:
+    <<: *edge-app
+    image: aios-social-app:local
+    build:
+      context: ./repos/social-app/
+      dockerfile: ../../social-app/Dockerfile
+    ports:
+      - 8100:8100
+    restart: always
+    env_file:
+      - ./envs/social-app
+    command: /usr/bin/bskyweb serve
+
+  ozone:
+    <<: *edge-app
+    image: aios-ozone:local
+    build:
+      context: ./repos/atproto/
+      dockerfile: ../../atproto/Dockerfile
+      target: ozone
+    ports:
+      - 2585:3000
+    restart: always
+    command: node --enable-source-maps api.ts
+    volumes:
+      - ./data/ozone/:/data/
+    env_file:
+      - ./envs/ozone
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/xrpc/_health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 5s
+      retries: 20
+    depends_on:
+      database:
+        condition: service_healthy
+
+  ozone-web:
+    <<: *edge-app
+    image: aios-ozone-web:local
+    build:
+      context: ./repos/ozone/
+      dockerfile: ../../ozone/Dockerfile
+    ports:
+      - 2586:3000
+    restart: always
+    tmpfs:
+      - /tmp
+      - /usr/src/ozone/.next/cache:uid=10001,gid=10001
+    volumes:
+      - ./data/ozone/:/data/
+    env_file:
+      - ./envs/ozone
+    depends_on:
+      database:
+        condition: service_healthy
+
+  jetstream:
+    <<: [*hardening, *ro]
+    image: aios-jetstream:local
+    build:
+      context: ./repos/jetstream/
+      dockerfile: ../../jetstream/Dockerfile
+    cap_drop: [ALL]
+    networks: [default, edge]
+    ports:
+      - 6008:6008
+    volumes:
+      - ./data/jetstream:/data
+    restart: always
+    env_file:
+      - ./envs/jetstream
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 10.19.0.0/24
