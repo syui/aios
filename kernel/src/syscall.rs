@@ -119,6 +119,7 @@ nrs! {
     SYNC = 81,
     FSYNC = 82,
     FDATASYNC = 83,
+    SYNC_FILE_RANGE = 84,
     SYNCFS = 267,
     UTIMENSAT = 88,
     EXIT = 93,
@@ -506,6 +507,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             Ok(0)
         }
         FSYNC | FDATASYNC | SYNCFS => sysfile::fsync(a[0], nr == SYNCFS),
+        SYNC_FILE_RANGE => sysfile::sync_file_range(a[0], a[1] as i64, a[2] as i64, a[3] as u32 as u64),
         CLOSE => sysfile::close(a[0]),
         PIPE2 => sysfile::pipe2(a[0] as usize, a[1]),
         GETDENTS64 => sysfile::getdents64(a[0], a[1] as usize, a[2] as usize),
@@ -702,7 +704,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     // SA_RESTART でやり直してよいもの (Linux で ERESTARTSYS を返すもの)
     let (restartable, always) = match nr {
         FUTEX => crate::futex::restart_kind(a[1], a[3] as usize),
-        _ => (matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX_WAITV | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT), false),
+        // IOCTL: 端末の SIGTTOU (tty.rs の check_change) で止まって続けたら、やりなおす
+        _ => (matches!(nr, READ | WRITE | READV | WRITEV | OPENAT | WAIT4 | WAITID | FUTEX_WAITV | ACCEPT | ACCEPT4 | RECVFROM | SENDTO | RECVMSG | SENDMSG | CONNECT | IOCTL), false),
     };
     (r == Err(-EINTR_)).then_some(Restart { restartable, always })
 }

@@ -207,13 +207,89 @@ pub fn blocked_or_ignored(p: &Proc, sig: i32) -> bool {
 
 /// いま受け取れるシグナルがあるか (sleep を中断する)
 pub fn deliverable(p: &Proc) -> bool {
-    p.sig_pending & !p.sig_mask != 0
+    (p.sig_pending | p.sig_shared) & !p.sig_mask != 0
+}
+
+/// フォールトなど、来たら先に受けとるもの (Linux の SYNCHRONOUS_MASK)
+const SYNCHRONOUS: u64 = bit(SIGSEGV) | bit(SIGBUS) | bit(SIGILL) | bit(SIGTRAP) | bit(SIGFPE) | bit(SIGSYS);
+
+/// 来ているもののうち allowed の中で次に受けとるものを取り出す (Linux の dequeue_signal と next_signal): スレッドに
+/// 来たもの (sig_pending) をプロセスに来たもの (sig_shared) より先に。それぞれの中では同期のもの (フォールト) を先に、
+/// あとは番号の小さいものから
+fn dequeue(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
+    for shared in [false, true] {
+        let set = if shared { p.sig_shared } else { p.sig_pending } & allowed;
+        if set != 0 {
+            let s = if set & SYNCHRONOUS != 0 { set & SYNCHRONOUS } else { set };
+            let sig = s.trailing_zeros() as i32 + 1;
+            return Some(if shared {
+                p.sig_shared &= !bit(sig);
+                (sig, p.sig_shared_info[sig as usize])
+            } else {
+                p.sig_pending &= !bit(sig);
+                (sig, p.sig_info[sig as usize])
+            });
+        }
+    }
+    None
+}
+
+/// 終わるスレッド from が預かっていた、プロセスに来たシグナルを to (代表) に。どちらにもあるものは to のものを残す
+pub fn hand_over(from: &mut Proc, to: &mut Proc) {
+    let move_ = from.sig_shared & !to.sig_shared;
+    for sig in 1..NSIG as i32 {
+        if move_ & bit(sig) != 0 {
+            to.sig_shared_info[sig as usize] = from.sig_shared_info[sig as usize];
+        }
+    }
+    to.sig_shared |= move_;
+    from.sig_shared = 0;
+    if move_ & !to.sig_mask != 0 {
+        proc::interrupt(to);
+    } else if move_ != 0 {
+        proc::wakeup(fd_chan(to.tgid));
+        proc::poll_wake(fd_chan(to.tgid));
+    }
+}
+
+/// たまっている sig を捨てる (スレッドに来たものもプロセスに来たものも)
+fn discard(p: &mut Proc, mask: u64) {
+    p.sig_pending &= !mask;
+    p.sig_shared &= !mask;
+}
+
+/// /proc/PID/status のシグナルの行 (SigQ、SigPnd、ShdPnd、SigBlk、SigIgn、SigCgt: Linux の task_sig)。leader は見る
+/// スレッド、shared はスレッドグループのみなのプロセスに来たもの。SigQ の上限は getrlimit と同じく決めない (最大)
+pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String {
+    let (mut ign, mut cgt) = (0u64, 0u64);
+    for sig in 1..NSIG as i32 {
+        match action(p, sig).handler {
+            SIG_DFL => {}
+            SIG_IGN => ign |= bit(sig),
+            _ => cgt |= bit(sig),
+        }
+    }
+    alloc::format!(
+        "SigQ:\t{}/{}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n",
+        queued,
+        u64::MAX,
+        p.sig_pending,
+        shared,
+        p.sig_mask,
+        ign,
+        cgt
+    )
 }
 
 // ---- 送る ----
 
 /// スレッド t に送る
 pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
+    queue(t, sig, info, false);
+}
+
+/// t にためる (shared ならプロセスに来たものとして: send_group が選んだスレッドに預ける)
+fn queue(t: &mut Proc, sig: i32, info: SigInfo, shared: bool) {
     // カーネルのスレッド (proc::kthread) は受けとらない (Linux の kthread と同じ: 送れるが何も起きない)
     if t.kthread {
         return;
@@ -231,18 +307,26 @@ pub fn send_thread(t: &mut Proc, sig: i32, info: SigInfo) {
     if sig == SIGCONT {
         continue_group(t.tgid);
     } else if bit(sig) & STOP_MASK != 0 {
-        t.sig_pending &= !bit(SIGCONT);
+        discard(t, bit(SIGCONT));
     }
     let b = bit(sig);
     // ブロックされていない無視されるシグナルは捨てる
     if t.sig_mask & b == 0 && ignored(t, sig) {
         return;
     }
-    // もう来ているなら、はじめのものの情報を残す (Linux の legacy_queue: ふつうのシグナルは 2 つめを捨てる)
-    if t.sig_pending & b == 0 {
-        t.sig_info[sig as usize] = info;
+    // もう来ているなら、はじめのものの情報を残す (Linux の legacy_queue: ふつうのシグナルは 2 つめを捨てる)。スレッドに
+    // 来たものとプロセスに来たものは別にたまる
+    if shared {
+        if t.sig_shared & b == 0 {
+            t.sig_shared_info[sig as usize] = info;
+        }
+        t.sig_shared |= b;
+    } else {
+        if t.sig_pending & b == 0 {
+            t.sig_info[sig as usize] = info;
+        }
+        t.sig_pending |= b;
     }
-    t.sig_pending |= b;
     GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if t.sig_mask & b == 0 || t.sigwait & b != 0 {
         proc::interrupt(t);
@@ -266,19 +350,13 @@ pub fn fd_chan(tgid: u32) -> usize {
 
 /// いまのスレッドに来ている mask のシグナルを 1 つとり出す (番号の小さいものから。signalfd の read)
 pub fn take(mask: u64) -> Option<(i32, SigInfo)> {
-    let p = proc::current();
-    let hit = p.sig_pending & mask & !UNBLOCKABLE;
-    if hit == 0 {
-        return None;
-    }
-    let sig = hit.trailing_zeros() as i32 + 1;
-    p.sig_pending &= !bit(sig);
-    Some((sig, p.sig_info[sig as usize]))
+    dequeue(proc::current(), mask & !UNBLOCKABLE)
 }
 
 /// いまのスレッドに mask のシグナルが来ているか
 pub fn pending_in(mask: u64) -> bool {
-    proc::current().sig_pending & mask & !UNBLOCKABLE != 0
+    let p = proc::current();
+    (p.sig_pending | p.sig_shared) & mask & !UNBLOCKABLE != 0
 }
 
 /// signalfd の read の形 (struct signalfd_siginfo、128 バイト)。どの欄を埋めるかは Linux の signalfd_copyinfo と
@@ -347,7 +425,8 @@ pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
         return Err(-ESRCH);
     }
     let pick = threads.iter().position(|t| t.pid == tgid && t.sig_mask & b == 0).or_else(|| threads.iter().position(|t| t.sig_mask & b == 0)).unwrap_or(0);
-    send_thread(threads.swap_remove(pick), sig, info);
+    // プロセスに来たもの (Linux の shared_pending): 選んだスレッドに預け、スレッドに来たものよりあとで受けとる
+    queue(threads.swap_remove(pick), sig, info, true);
     Ok(())
 }
 
@@ -435,7 +514,7 @@ fn stop_group(tgid: u32, sig: i32) {
 /// 止まっているスレッドグループを動かす (SIGCONT)
 fn continue_group(tgid: u32) {
     for th in proc::threads_of(tgid) {
-        th.sig_pending &= !STOP_MASK;
+        discard(th, STOP_MASK);
     }
     let Some(l) = proc::find_leader(tgid) else { return };
     if !l.stopped {
@@ -576,7 +655,7 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
 #[inline]
 pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let p = proc::current();
-    if p.sig_pending & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() {
+    if (p.sig_pending | p.sig_shared) & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() {
         return;
     }
     deliver_now(tf, interrupted);
@@ -591,13 +670,7 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let interrupted = if core::mem::take(&mut p.no_restart) { None } else { interrupted };
     let mut handled = false;
     loop {
-        let ready = p.sig_pending & !p.sig_mask;
-        if ready == 0 {
-            break;
-        }
-        let sig = ready.trailing_zeros() as i32 + 1;
-        p.sig_pending &= !bit(sig);
-        let info = p.sig_info[sig as usize];
+        let Some((sig, info)) = dequeue(p, !p.sig_mask) else { break };
         let a = action(p, sig);
         match a.handler {
             SIG_IGN => continue,
@@ -730,9 +803,11 @@ pub fn rt_sigaction(sig: usize, act: usize, oact: usize) -> R {
         p.pt().copy_in(&mut b, act).ok_or(-EFAULT)?;
         let v = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
         table[sig] = SigAction { handler: v(0), flags: v(1), restorer: v(2), mask: v(3) & !UNBLOCKABLE };
-        // 無視になったものは、たまっていても捨てる
+        // 無視になったものは、たまっていても捨てる (Linux と同じく、スレッドグループのみなの分も)
         if ignored(p, sig as i32) {
-            p.sig_pending &= !bit(sig as i32);
+            for t in proc::threads_of(p.tgid) {
+                discard(t, bit(sig as i32));
+            }
         }
     }
     if oact != 0 {
@@ -769,7 +844,7 @@ pub fn rt_sigprocmask(how: u64, set: usize, oset: usize) -> R {
 
 pub fn rt_sigpending(set: usize) -> R {
     let p = proc::current();
-    out(set, &(p.sig_pending & p.sig_mask).to_le_bytes())?;
+    out(set, &((p.sig_pending | p.sig_shared) & p.sig_mask).to_le_bytes())?;
     Ok(0)
 }
 
@@ -820,12 +895,9 @@ pub fn rt_sigtimedwait(set: usize, info: usize, timeout: usize) -> R {
     };
     loop {
         let p = proc::current();
-        let hit = p.sig_pending & set;
-        if hit != 0 {
-            let sig = hit.trailing_zeros() as i32 + 1;
-            p.sig_pending &= !bit(sig);
+        if let Some((sig, si)) = dequeue(p, set) {
             if info != 0 {
-                out(info, &siginfo_bytes(sig, &p.sig_info[sig as usize]))?;
+                out(info, &siginfo_bytes(sig, &si))?;
             }
             return Ok(sig as i64);
         }

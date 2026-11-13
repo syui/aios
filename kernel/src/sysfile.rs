@@ -814,6 +814,34 @@ pub fn fsync(fd: u64, fs: bool) -> R {
     Ok(0)
 }
 
+/// sync_file_range(fd, offset, nbytes, flags) (Linux の fs/sync.c)。書き出しを頼む (SYNC_FILE_RANGE_WRITE) なら、aios は
+/// fsync と同じく、みなを書いて待つ (範囲は見ない。WAIT_BEFORE と WAIT_AFTER だけなら何もしない)。Linux の順: fd
+/// (O_PATH も EBADF)、flags、範囲 (負か、あふれれば EINVAL。nbytes 0 は終わりまで)、ふつうのファイル・ディレクトリ・
+/// ディスクでなければ (パイプ、ソケット、/dev/null など) ESPIPE。PostgreSQL の initdb と checkpointer が使う
+pub fn sync_file_range(fd: u64, off: i64, n: i64, flags: u64) -> R {
+    const ESPIPE: i64 = 29;
+    const WAIT_BEFORE: u64 = 1;
+    const WRITE: u64 = 2;
+    const WAIT_AFTER: u64 = 4;
+    let f = file_of(fd)?;
+    if f.borrow().flags & file::O_PATH != 0 {
+        return Err(-EBADF);
+    }
+    if flags & !(WAIT_BEFORE | WRITE | WAIT_AFTER) != 0 {
+        return Err(crate::why::inval());
+    }
+    if off < 0 || off.checked_add(n).is_none_or(|e| e < 0 || e < off) {
+        return Err(crate::why::inval());
+    }
+    if !f.borrow().kind.positional() {
+        return Err(-ESPIPE);
+    }
+    if flags & WRITE != 0 {
+        vfs::sync_all_wait();
+    }
+    Ok(0)
+}
+
 fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
     if cnt > 1024 {
         return Err(crate::why::inval());

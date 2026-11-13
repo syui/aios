@@ -64,6 +64,8 @@ int main(void) {
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     mount("securityfs", "/sys/kernel/security", "securityfs", 0, NULL);
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+    mkdir("/dev/pts", 0755);
+    mount("devpts", "/dev/pts", "devpts", 0, "ptmxmode=0666,mode=0620");
     mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777");
     lo_up();
     if (mount("/dev/vda", "/work", "ext4", 0, NULL) < 0) {

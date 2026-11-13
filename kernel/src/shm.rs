@@ -7,7 +7,8 @@
 // (もう shmget で見つからない)、表は弱い参照だけを持ち、さいごの写しが外れたときに中身が消える (表の行は次に表を見る
 // ときに消す)。
 // PostgreSQL は、いつも小さなかたまりをとる (データのディレクトリの印: 前の postmaster がまだつないでいるかを shm_nattch で
-// 見る)。IPC の namespace はまだないので、表は 1 つ (CLONE_NEWIPC は Linux の入っていないものと同じく何もしない)
+// 見る)。表は IPC の namespace ごと (CLONE_NEWIPC: 番号も 0 から。namespace がなくなれば、その表のかたまりも消える:
+// つないでいる写しは外れるまで残る。Linux の shm_exit_ns と同じ)
 use crate::cell::Bkl;
 use crate::proc;
 use crate::vfs::{Inode, InodeRef};
@@ -108,12 +109,20 @@ struct Table {
     segs: BTreeMap<usize, Seg>,
     last_idx: i64,
     seq: u16,
+    /// この表の IPC の namespace (はじめからあるものは None)。なくなったら表ごと捨てる
+    ns: Option<Weak<crate::ns::Ipc>>,
 }
 
-static TABLE: Bkl<Table> = Bkl::new(Table { segs: BTreeMap::new(), last_idx: -1, seq: 0 });
+/// IPC の namespace の番号ごとの表
+static TABLES: Bkl<BTreeMap<u64, Table>> = Bkl::new(BTreeMap::new());
 
+/// いまのプロセスの IPC の namespace の表
 fn table() -> &'static mut Table {
-    let t = TABLE.get();
+    let all = TABLES.get();
+    // なくなった namespace の表 (かたまりの中身は、つないでいる写しが外れたときに消える)
+    all.retain(|_, t| t.ns.as_ref().is_none_or(|w| w.strong_count() > 0));
+    let (id, ns) = crate::ns::ipc();
+    let t = all.entry(id).or_insert_with(|| Table { segs: BTreeMap::new(), last_idx: -1, seq: 0, ns });
     // IPC_RMID したもので、もうだれもつないでいないもの
     t.segs.retain(|_, s| !matches!(&s.ino, Hold::Dest(_)) || s.nattch() > 0);
     t

@@ -368,6 +368,11 @@ pub struct Proc {
     pub sigacts: Option<Shared<SigTable>>,
     /// たまっているシグナルと、ブロックしているシグナル (ビット sig-1)
     pub sig_pending: u64,
+    /// プロセスに送られてこのスレッドが預かっているもの (kill、sigqueue: Linux の shared_pending)。sig_pending (スレッドに
+    /// 来たもの: tgkill、フォールト) とは別にたまり (同じシグナルが両方に 1 つずつ)、スレッドに来たものを先に受けとる。
+    /// /proc/PID/status の ShdPnd
+    pub sig_shared: u64,
+    pub sig_shared_info: [SigInfo; NSIG],
     pub sig_mask: u64,
     pub sig_info: [SigInfo; NSIG],
     /// sigsuspend で一時的に変える前のマスク
@@ -534,8 +539,10 @@ impl Proc {
         group_exit: None,
         sigacts: None,
         sig_pending: 0,
+        sig_shared: 0,
         sig_mask: 0,
         sig_info: [SigInfo::ZERO; NSIG],
+        sig_shared_info: [SigInfo::ZERO; NSIG],
         saved_mask: None,
         sigwait: 0,
         altstack: AltStack::NONE,
@@ -1833,6 +1840,8 @@ fn exit_status(status: i32) -> ! {
             l.utime += t;
             l.cpu_dead_ns += c;
             l.sys_dead_ns += s;
+            // プロセスに来て預かっていたシグナルは代表に (Linux の shared_pending はプロセスのもの)
+            crate::signal::hand_over(p, l);
         }
         let p = current();
         p.files = None;

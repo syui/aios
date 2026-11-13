@@ -525,8 +525,9 @@ IPC_RMID、IPC_INFO、SHM_INFO、SHM_STAT、SHM_LOCK) と /proc/sysvipc/shm (ipc
 参照の数は、触れたページの数も入るので使わない)。shmdt は addr から始まるかたまりの写しを、分かれたものもみな外す。
 つないだまま IPC_RMID すると SHM_DEST がつき鍵は IPC_PRIVATE に (番号ではまだ見え、つなげる)、表は弱い参照だけを持ち、
 さいごの写しが外れると中身が消える。ちがい: Linux は fork と終わりでも shm_lpid と shm_dtime を変える (aios は shmat と
-shmdt でだけ)。IPC の namespace はまだない (表は 1 つ)。test/shm.c は手本の Linux (test/linux.config に CONFIG_SYSVIPC を
-足した) と 58 行同じ。PostgreSQL は、いつも小さなかたまりをとり、前の postmaster がまだつないでいるかを shm_nattch で見る
+shmdt でだけ)。表は IPC の namespace ごと (CLONE_NEWIPC: 新しい namespace では鍵も番号も別で、番号は 0 から。
+namespace がなくなれば、そこのかたまりも消える。/proc/PID/ns/ipc。aibox --image は docker と同じくコンテナごとに分ける)。
+test/shm.c は手本の Linux (test/linux.config に CONFIG_SYSVIPC を足した) と 58 行同じ、test/ipcns.c (CONFIG_IPC_NS) は 13 行同じ。PostgreSQL は、いつも小さなかたまりをとり、前の postmaster がまだつないでいるかを shm_nattch で見る
 
 signalfd (2026-11-13、kernel/src/signalfd.rs、extra): signalfd4 で、ブロックしたシグナルを fd から struct signalfd_siginfo
 (128 バイト) として読む。欄は Linux の signalfd_copyinfo と同じく si_code で決める (kill は pid と uid、sigqueue や tgkill は
@@ -538,8 +539,21 @@ psql が認証で止まった。test/signalfd.c は、ほかのプロセスか�
 変える。fdinfo は sigmask。PostgreSQL 17 / 18 はラッチ (epoll) で SIGURG をこれで待つ (なければ initdb の bootstrap が
 「signalfd() failed」で止まった)。いっしょに rt_sigqueueinfo と rt_tgsigqueueinfo (sigqueue: 値つきのシグナル。カーネルの
 印を名のれるのは自分へだけ) を足し、もう来ているふつうのシグナルをもう一度送ったときは、はじめのものの情報を残す (Linux の
-legacy_queue。前は上書きした)。test/signalfd.c は手本の Linux と 49 行同じ。ちがい: Linux はスレッドに来たもの (tgkill) を
-プロセスに来たもの (kill、sigqueue) より先に読むが、aios はスレッドごとの 1 つの組なので番号の小さいものから
+legacy_queue。前は上書きした)。test/signalfd.c は手本の Linux と 49 行同じ。
+
+シグナルの「スレッドに来たもの」と「プロセスに来たもの」(2026-11-13、kernel/src/signal.rs): Linux の pending と shared_pending と
+同じく別にためる (proc.rs の sig_pending と sig_shared、それぞれの siginfo。プロセスに来たものは send_group が選んだスレッドに
+預け、スレッドが終われば代表へ)。同じふつうのシグナルが両方に 1 つずつたまり、受けとる順 (ハンドラ、signalfd、sigtimedwait)
+はスレッドに来たものが先、その中ではフォールトのもの (SIGSEGV など: Linux の SYNCHRONOUS_MASK) が先、あとは番号の小さい
+ものから (Linux の dequeue_signal と next_signal)。/proc/PID/status に SigQ、SigPnd、ShdPnd、SigBlk、SigIgn、SigCgt。
+test/sigstatus.c は手本の Linux と 10 行同じ (前は 1 つの組で、番号の小さいものから読んでいた)
+
+端末のジョブ制御 (2026-11-13、kernel/src/tty.rs の check_change): 端末の前にいないグループ (うしろのジョブ) が設定を変える
+(TCSETS*、TCFLSH、TCXONC、TCSBRK、TIOCSPGRP) と SIGTTOU で止める。SIGTTOU を無視かブロックしていれば通る。前に出して
+続ければ ioctl をやりなおす (Linux の tty_check_change と ERESTARTSYS)。前はとめず、うしろで動かした pnpm (node) が端末を
+cooked にして、前の aish には Enter が C-j (cd のピッカー) に見えていた。test/ttou.c は手本の Linux (CONFIG_UNIX98_PTYS と
+/dev/pts を足した) と 12 行同じ。sync_file_range (Linux の fs/sync.c の答えと順。書き出しは fsync と同じくみな:
+PostgreSQL の initdb と checkpointer が使う) も足した (test/syncrange.c が 20 行同じ)
 
 /proc/PID/smaps (2026-11-13、kernel/src/vm.rs の smaps_text): maps の行ごとに Linux と同じ形 (名前は 16 文字、数は 8 文字の
 右よせと kB) で Size、Rss、Pss、Pss_Dirty、Shared_Clean / Shared_Dirty、Private_Clean / Private_Dirty、Referenced、

@@ -848,7 +848,27 @@ fn in_u32(va: usize) -> Result<u32, i64> {
     Ok(u32::from_le_bytes(inp::<4>(va)?))
 }
 
+/// 端末の設定を変えるもの (TCSETS*、TCFLSH、TCXONC、TCSBRK、TIOCSPGRP) を、端末の前にいないグループ (うしろの
+/// ジョブ) がしようとしたら SIGTTOU で止める (Linux の tty_check_change)。SIGTTOU をブロックか無視していればよい。
+/// 止まって続けたら、ioctl はやりなおす (syscall.rs: ERESTARTSYS と同じ)。前は止めず、うしろの node が端末を cooked
+/// にして、前のシェル (aish) には Enter が C-j に見えた
+fn check_change(tty: &TtyRef) -> Result<(), i64> {
+    let me = proc::current();
+    let (session, pgrp) = {
+        let t = tty.borrow();
+        (t.session, t.pgrp)
+    };
+    if session == me.sid && pgrp != 0 && me.pgid != pgrp && !signal::blocked_or_ignored(me, signal::SIGTTOU) {
+        send(me.pgid, signal::SIGTTOU);
+        return Err(-EINTR);
+    }
+    Ok(())
+}
+
 pub fn ioctl(tty: &TtyRef, master: bool, req: u64, arg: usize) -> Result<i64, i64> {
+    if !master && matches!(req, TCSETS | TCSETSW | TCSETSF | TCFLSH | TCXONC | TCSBRK | TIOCSPGRP) {
+        check_change(tty)?;
+    }
     match req {
         TCGETS => {
             let b = tty.borrow().t.to_bytes();

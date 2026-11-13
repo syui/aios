@@ -22,6 +22,7 @@ pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_NEWPID: u64 = 0x2000_0000;
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 
 const EPERM: i64 = 1;
 
@@ -31,6 +32,7 @@ pub const INIT_NET: u64 = 4026531840;
 pub const INIT_PID: u64 = 4026531836;
 pub const INIT_MNT: u64 = 4026531841;
 pub const INIT_USER: u64 = 4026531837;
+pub const INIT_IPC: u64 = 4026531839;
 
 static NEXT_ID: Bkl<u64> = Bkl::new(4026532000);
 
@@ -44,6 +46,11 @@ pub struct Uts {
     pub id: u64,
     pub name: RefCell<([u8; 64], usize)>,
     pub uname: core::cell::Cell<Uname>,
+}
+
+/// IPC: 番号だけ (System V の共有メモリ (shm.rs) の表は番号ごと。なくなったら、そこのかたまりも消える)
+pub struct Ipc {
+    pub id: u64,
 }
 
 /// NET: 番号 (中のソケットは番号で分ける) と lo の様子 (lo_state)
@@ -134,10 +141,11 @@ pub struct Ns {
     pub mnt: Option<Rc<crate::vfs::MountNs>>,
     /// ユーザー (下の「ユーザーの namespace」)
     pub user: Option<Rc<User>>,
+    pub ipc: Option<Rc<Ipc>>,
 }
 
 impl Ns {
-    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None, user: None };
+    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None, user: None, ipc: None };
 
     pub fn user_id(&self) -> u64 {
         self.user.as_ref().map_or(INIT_USER, |u| u.id)
@@ -159,6 +167,16 @@ impl Ns {
     pub fn net_id(&self) -> u64 {
         self.net.as_ref().map_or(INIT_NET, |n| n.id)
     }
+
+    pub fn ipc_id(&self) -> u64 {
+        self.ipc.as_ref().map_or(INIT_IPC, |n| n.id)
+    }
+}
+
+/// いまのプロセスの IPC の namespace (番号と、なくなったかを見るための弱い参照。はじめからあるものは None)
+pub fn ipc() -> (u64, Option<alloc::rc::Weak<Ipc>>) {
+    let n = &crate::proc::current().cred.ns;
+    (n.ipc_id(), n.ipc.as_ref().map(Rc::downgrade))
 }
 
 /// いまのプロセスが分けた NET の中なら、その番号
@@ -167,7 +185,7 @@ pub fn net() -> Option<u64> {
 }
 
 /// flags の CLONE_NEW* のうち、扱えるもの
-pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER;
+pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWIPC;
 
 /// cred の namespace を flags のぶん新しくする (clone の子と unshare)
 pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
@@ -209,6 +227,9 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     }
     if flags & CLONE_NEWNET != 0 {
         c.ns.net = Some(Rc::new(Net { id: next_id() }));
+    }
+    if flags & CLONE_NEWIPC != 0 {
+        c.ns.ipc = Some(Rc::new(Ipc { id: next_id() }));
     }
     if flags & CLONE_NEWNS != 0 {
         c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));

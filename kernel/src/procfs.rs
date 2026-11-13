@@ -439,10 +439,15 @@ impl ProcInode {
             Node::Status(pid) => {
                 let p = leader_any(pid)?;
                 let c = &p.cred;
-                let threads = proc::threads_of(p.tgid).len();
+                let ths = proc::threads_of(p.tgid);
+                let threads = ths.len();
+                // プロセスに来たもの (Linux の shared_pending) は、どのスレッドが持っていてもまとめて ShdPnd に
+                let shared = ths.iter().fold(0, |a, t| a | t.sig_shared);
+                let queued = ths.iter().map(|t| t.sig_pending.count_ones() + t.sig_shared.count_ones()).sum::<u32>();
+                let sig = crate::signal::status_text(p, shared, queued);
                 let (vsize, rss) = mem_of(p);
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nNoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n{}NoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
                     p.comm(),
                     state_name(p),
                     crate::ns::local_or_0(p.tgid),
@@ -459,6 +464,7 @@ impl ProcInode {
                     vsize / 1024,
                     rss * 4,
                     threads,
+                    sig,
                     c.no_new_privs as u8,
                     crate::landlock::layers(c),
                     crate::seccomp::mode(c).0,
@@ -711,7 +717,7 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 6] = ["mnt", "net", "pid", "pid_for_children", "user", "uts"];
+const NS_KINDS: [&str; 7] = ["ipc", "mnt", "net", "pid", "pid_for_children", "user", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
@@ -719,6 +725,7 @@ fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
         "user" => c.ns.user_id(),
         "net" => c.ns.net_id(),
         "pid_for_children" => c.ns.pid_children_id(),
+        "ipc" => c.ns.ipc_id(),
         _ => c.ns.uts_id(),
     }
 }

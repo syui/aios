@@ -110,12 +110,10 @@ int main(void) {
   syscall(SYS_tgkill, getpid(), gettid(), SIGURG);
   union sigval v = {.sival_ptr = (void *)4242};
   sigqueue(getpid(), SIGUSR1, v);
-  // 並ぶ順は番号順で出す (Linux はスレッドに来たもの (tgkill) を先に、aios は番号の小さいものから)
+  // 読む順: スレッドに来たもの (tgkill の SIGURG) を、プロセスに来たもの (sigqueue の SIGUSR1) より先に (番号は大きくても)
   n = rd(fd, s, 4);
   printf("read %d\n", n);
-  for (int k = 0; k < 2; k++)
-    for (int i = 0; i < n; i++)
-      if ((int)s[i].ssi_signo == (k ? SIGURG : SIGUSR1)) show(k ? "tgkill" : "sigqueue", &s[i]);
+  for (int i = 0; i < n; i++) show(s[i].ssi_signo == SIGUSR1 ? "sigqueue" : "tgkill", &s[i]);
   // ほかのプロセスに SI_QUEUE より上の印 (SI_USER など) を名のって送れない。自分には送れる
   siginfo_t si;
   memset(&si, 0, sizeof si);

@@ -25,7 +25,7 @@
 //   ユーザーの namespace で自分を image の User (の uid と gid) に見せ、マウントの namespace で image の根を読むだけにして
 //   chroot する。/tmp と /dev は空の tmpfs (/dev は null zero full random urandom tty だけ)、/proc はこの中のもの、
 //   /etc/hosts と /etc/resolv.conf は外のもの、家 (/etc/passwd の) が空のディレクトリなら tmpfs。-b で外のパスを中へ
-//   (:ro で読むだけ)。書けるのは /tmp、/dev、家、-b のところだけ (landlock)。PID と UTS (ホスト名は image の名前) も分け、
+//   (:ro で読むだけ)。書けるのは /tmp、/dev、家、-b のところだけ (landlock)。PID と UTS (ホスト名は image の名前) と IPC も分け、
 //   システムコールも同じようにしぼる。IMAGE のあとはみな ARG (docker run と同じ): image の Cmd のかわり (Entrypoint のあとに)。
 //   中の uname は linux の形 (sysname Linux、release 7.4.0-aios-...: /proc/sys/kernel/uname。image は Linux のための
 //   もので、glibc を静的につないだものは release の版を見る)。--uname aios で aios の形のまま
@@ -518,8 +518,9 @@ fn run_image(o: &Image, args: &[String], ports: Option<&[u16]>, deny: &[u32], ki
     }
     need(mount(None, &root, None, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY), "root (ro)");
 
-    // PID と UTS (と --no-net なら NET) を分けて、子が中の 1 番になる
-    let mut ns = libc::CLONE_NEWPID | libc::CLONE_NEWUTS;
+    // PID と UTS と IPC (System V の共有メモリ: docker と同じく、コンテナごとに) (と --no-net なら NET) を分けて、
+    // 子が中の 1 番になる
+    let mut ns = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
     if ports.is_some_and(|p| p.is_empty()) {
         ns |= libc::CLONE_NEWNET;
     }
