@@ -372,7 +372,9 @@ pub struct Proc {
     /// 来たもの: tgkill、フォールト) とは別にたまり (同じシグナルが両方に 1 つずつ)、スレッドに来たものを先に受けとる。
     /// /proc/PID/status の ShdPnd
     pub sig_shared: u64,
-    pub sig_shared_info: [SigInfo; NSIG],
+    /// sig_shared の siginfo (はじめてプロセスに来たときにヒープに。表 (NPROC) に 2.6 KiB ずつ持つと、カーネルが
+    /// 64 MiB をこえて UEFI の起動で置き場をとれなかった)
+    pub sig_shared_info: Option<alloc::boxed::Box<[SigInfo; NSIG]>>,
     pub sig_mask: u64,
     pub sig_info: [SigInfo; NSIG],
     /// sigsuspend で一時的に変える前のマスク
@@ -542,7 +544,7 @@ impl Proc {
         sig_shared: 0,
         sig_mask: 0,
         sig_info: [SigInfo::ZERO; NSIG],
-        sig_shared_info: [SigInfo::ZERO; NSIG],
+        sig_shared_info: None,
         saved_mask: None,
         sigwait: 0,
         altstack: AltStack::NONE,

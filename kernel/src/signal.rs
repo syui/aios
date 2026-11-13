@@ -224,7 +224,7 @@ fn dequeue(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
             let sig = s.trailing_zeros() as i32 + 1;
             return Some(if shared {
                 p.sig_shared &= !bit(sig);
-                (sig, p.sig_shared_info[sig as usize])
+                (sig, p.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]))
             } else {
                 p.sig_pending &= !bit(sig);
                 (sig, p.sig_info[sig as usize])
@@ -239,7 +239,8 @@ pub fn hand_over(from: &mut Proc, to: &mut Proc) {
     let move_ = from.sig_shared & !to.sig_shared;
     for sig in 1..NSIG as i32 {
         if move_ & bit(sig) != 0 {
-            to.sig_shared_info[sig as usize] = from.sig_shared_info[sig as usize];
+            let i = from.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]);
+            to.sig_shared_info.get_or_insert_with(|| alloc::boxed::Box::new([SigInfo::ZERO; NSIG]))[sig as usize] = i;
         }
     }
     to.sig_shared |= move_;
@@ -318,7 +319,7 @@ fn queue(t: &mut Proc, sig: i32, info: SigInfo, shared: bool) {
     // 来たものとプロセスに来たものは別にたまる
     if shared {
         if t.sig_shared & b == 0 {
-            t.sig_shared_info[sig as usize] = info;
+            t.sig_shared_info.get_or_insert_with(|| alloc::boxed::Box::new([SigInfo::ZERO; NSIG]))[sig as usize] = info;
         }
         t.sig_shared |= b;
     } else {
