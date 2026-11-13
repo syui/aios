@@ -1,0 +1,24 @@
+# gitea: 自分で持つ git のホスティング。自分でビルドしない: 公式の linux-arm64 の静的なバイナリ (Go。sqlite も入り) を
+#   (sha256 を確かめて) /opt/c/bin/gitea に入れる (nodejs と同じ形)。うごくときに git を使う (aios の git パッケージ)。
+#   container image は image/gitea.json (ghcr.io/syui/aios-gitea)。版は dl.gitea.com の version.json を pkg_check が見る
+pkgname=gitea
+pkgver=28.3.0
+pkgrel=1
+_latest_url=https://dl.gitea.com/gitea/version.json
+_latest_regex='"version":"([0-9]+[.][0-9]+[.][0-9]+)"'
+pkgdesc='Git with a cup of tea: self-hosted Git service (official static linux-arm64 binary, for aios)'
+arch=('aarch64')
+url='https://about.gitea.com'
+license=('MIT')
+depends=('git')
+source=("https://dl.gitea.com/gitea/$pkgver/gitea-$pkgver-linux-arm64.xz"
+        "gitea-$pkgver-LICENSE::https://raw.githubusercontent.com/go-gitea/gitea/v$pkgver/LICENSE")
+sha256sums=('c11d54a5e07ad47e5f84aa4e169d6645542fdea56943fd7e1176602db0c5a076'
+            'ed2f10a9d78b8c6c9ef33f1420d0eb266981891caf2f15d630553f02dc60d3ae')
+
+package() {
+  install -d "$pkgdir/opt/c/bin"
+  xz -dc "gitea-$pkgver-linux-arm64.xz" > "$pkgdir/opt/c/bin/gitea"
+  chmod 755 "$pkgdir/opt/c/bin/gitea"
+  install -Dm644 "gitea-$pkgver-LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
