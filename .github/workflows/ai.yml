@@ -1,0 +1,97 @@
+# ai: docker/ai (chat、courier) の Dockerfile が aios の image (builder の ghcr.io/syui/aios、動かす aios-static) で
+# 作れて動くかを、git.syui.ai の固めた commit でたしかめる (ai/at の compose.yml が使うもの)。作るだけで、どこにも置かない
+#   chat: /xrpc/_health。courier: Postgres といっしょに起こして /xrpc/_health と、表ができたか
+#   動くとき: docker/ai と、このファイルを変えた push、手で
+name: ai
+
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - 'docker/ai/**'
+    - '.github/workflows/ai.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: chat
+            url: https://git.syui.ai/ai/chat
+            commit: 67783eca04dcd9735a12f651b89271f8c1b434b5
+            bin: aichat
+          - name: courier
+            url: https://git.syui.ai/ai/courier
+            commit: 7c9cb758effb11476237e2a66524d7bcd39ae073
+            bin: courier
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Source
+        run: |
+          git init -q src
+          git -C src fetch -q --depth 1 "${{ matrix.url }}" "${{ matrix.commit }}"
+          git -C src checkout -q FETCH_HEAD
+          git -C src log --oneline -1
+
+      - name: Build
+        run: |
+          docker build -t "aios-${{ matrix.name }}:ci" -f "docker/ai/${{ matrix.name }}/Dockerfile" src
+          docker images "aios-${{ matrix.name }}"
+          # 静的なバイナリ (aios-static に libc も OpenSSL もない)
+          docker create --name bin "aios-${{ matrix.name }}:ci"
+          docker cp "bin:/usr/local/bin/${{ matrix.bin }}" "out-${{ matrix.bin }}"
+          docker rm bin
+          file "out-${{ matrix.bin }}" | tee file.log
+          grep -q 'statically linked' file.log
+
+      - name: Smoke
+        run: |
+          # 守りのまま (読むだけの根、cap なし、no-new-privileges、65532)
+          run="docker run -d --read-only --cap-drop ALL --security-opt no-new-privileges"
+          health() {
+            ok=
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:$1/xrpc/_health"; then ok=1; break; fi
+              sleep 1
+            done
+            echo
+            docker logs "$2" 2>&1 | tail -20
+            [ -n "$ok" ]
+          }
+          case "${{ matrix.name }}" in
+          chat)
+            $run --name chat -p 127.0.0.1:3100:3100 -v chat-data:/data aios-chat:ci
+            health 3100 chat
+            docker exec chat /usr/local/bin/aichat --version
+            ;;
+          courier)
+            pw="ci-$(openssl rand -hex 8)"
+            docker network create ai-ci
+            docker run -d --name database --network ai-ci -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=courier postgres:18-alpine
+            for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d courier && break; sleep 2; done
+            $run --name courier --network ai-ci -p 127.0.0.1:3300:3300 \
+              -e COURIER_DB_POSTGRES_URL="postgres://postgres:$pw@database/courier" -e COURIER_API_KEY="ci-$(openssl rand -hex 8)" aios-courier:ci
+            health 3300 courier
+            docker exec database psql -U postgres -d courier -Atc '\dt' | tee tables.log
+            grep -q device_tokens tables.log
+            ;;
+          esac
+          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}' "${{ matrix.name }}" | tee inspect.log
+          grep -q 'user=65532:65532 ro=true cap_drop=\[ALL\]' inspect.log
