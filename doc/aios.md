@@ -435,6 +435,18 @@ PID の namespace の中のゾンビの番号 (waitid(WNOWAIT) で待ったあ�
 aibox の中の gitea は git を呼べなかった。test/pidnswait.c が 18 行同じ)。CI は名前つきボリュームと --read-only、cap なしで
 起こして、ユーザーを作り、git push とフック、API の commits までたしかめる。
 
+ほかのものが前提にする C と C++ のライブラリ (2026-11-13):
+
+- openssl (pkg/c/openssl、OpenSSL 4.1.0): 静的な libssl.a と libcrypto.a、ヘッダー、pkg-config、静的な openssl を /opt/c に
+  (OPENSSLDIR は /etc/ssl)。Rust の native-tls / openssl-sys (reqwest の既定: ai/chat、ai/courier) は、builder で
+  `ap -Sy cargo base-devel openssl` すれば静的にリンクし、できたものは OpenSSL を持ち歩かない (aios-static で動く)。
+  ai/chat をクロスで作り、aios の VM で /xrpc/_health まで。s_server と s_client は TLS 1.3 (X25519MLKEM768)
+- gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
+  作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
+  libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
+  linuxmusl 用の C++ のモジュールがそのまま動く: aios の VM で better-sqlite3 13.1.1 (sqlite 3.54.1) と sharp
+  (libvips 8.18.7、PNG を JPEG に縮める)、musl の g++ で作った C++ (例外、スレッド、thread_local、random_device)
+
 CI (.github/workflows/image.yml、arm64 の Ubuntu) が、ap をビルドして image/*.json を 2 回作り (1 バイトもちがわないか)、
 docker run でためして (node の版・nonroot・https、シェルがないこと、static に静的な hello、cc に musl の hello)、
 `ghcr.io/syui/aios-static`、`aios-cc`、`aios-node`、`aios-gitea` に版と latest で置く (skopeo で、digest を変えずに。同じ digest がもう

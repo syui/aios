@@ -1,0 +1,111 @@
+# gcc-libs: GNU の C++ の標準ライブラリ (libstdc++.so.6) を、GCC のソースから musl 用に作る。
+#   npm の linuxmusl 用の C++ のモジュール (better-sqlite3、sharp など。ふつう Alpine で作られている) や、musl の
+#   gcc で作った C++ のプログラムが要るもの。aios のほかの C++ は Zig (LLVM の libc++ を静的に) なので、これは要らない。
+#   libgcc_s.so.1 は libunwind のパッケージのもの (LLVM の libunwind) を使い、GCC のものは入れない
+#   (musl のローダーは記号の版を見ない。Alpine と同じく --disable-symvers で版なし)。
+#   作りかた (このマシンで、ほかのものは入れない): binutils (aarch64-linux-musl の as と ld) → musl のヘッダーと crt と
+#   libc.so (musl のパッケージと同じ版とパッチ。aarch64-linux-gnu-gcc で) を sysroot に → GCC のクロス (C と C++) と
+#   libgcc と libstdc++-v3。GMP、MPFR、MPC は GCC の中で (contrib/download_prerequisites と同じ版)。
+#   設定は Alpine の gcc と同じもの (default-pie、default-ssp、armv8-a、lp64、symvers なし)
+pkgname=gcc-libs
+pkgver=16.2.0
+pkgrel=1
+_binutils=2.47
+_musl=1.2.6
+_gmp=6.3.0
+_mpfr=4.2.2
+_mpc=1.3.1
+_latest_url=https://gcc.gnu.org/pub/gcc/releases/
+_latest_regex='gcc-([0-9]+[.][0-9]+[.][0-9]+)/'
+pkgdesc='GNU C++ standard library (libstdc++.so.6) built from GCC for musl (for aios)'
+arch=('aarch64')
+url='https://gcc.gnu.org'
+license=('GPL-3.0-or-later WITH GCC-exception-3.1')
+depends=('musl' 'libunwind')
+makedepends=('aarch64-linux-gnu-gcc')
+source=("https://gcc.gnu.org/pub/gcc/releases/gcc-$pkgver/gcc-$pkgver.tar.xz"
+        "https://ftp.gnu.org/gnu/binutils/binutils-$_binutils.tar.xz"
+        "https://musl.libc.org/releases/musl-$_musl.tar.gz"
+        "https://gcc.gnu.org/pub/gcc/infrastructure/gmp-$_gmp.tar.bz2"
+        "https://gcc.gnu.org/pub/gcc/infrastructure/mpfr-$_mpfr.tar.bz2"
+        "https://gcc.gnu.org/pub/gcc/infrastructure/mpc-$_mpc.tar.gz")
+sha256sums=('e6738e29597f733270731aa90600f37ffdc045079dfc27ec7e8192cc81085c3e'
+            '154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff'
+            'd585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a'
+            'ac28211a7cfb609bae2e2c8d6058d66c8fe96434f740cf6fe2e47b000d1c20cb'
+            '9ad62c7dc910303cd384ff8f1f4767a655124980bb6d8650fe62c815a231bb7b'
+            'ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8')
+
+_t=aarch64-linux-musl
+
+prepare() {
+  rm -rf "gcc-$pkgver" "binutils-$_binutils" "musl-$_musl" build-binutils build-gcc tools sysroot inst
+  tar -xJf "gcc-$pkgver.tar.xz"
+  tar -xJf "binutils-$_binutils.tar.xz"
+  tar -xzf "musl-$_musl.tar.gz"
+  cd "gcc-$pkgver"
+  tar -xjf "../gmp-$_gmp.tar.bz2" && mv "gmp-$_gmp" gmp
+  tar -xjf "../mpfr-$_mpfr.tar.bz2" && mv "mpfr-$_mpfr" mpfr
+  tar -xzf "../mpc-$_mpc.tar.gz" && mv "mpc-$_mpc" mpc
+  # musl のパッケージと同じパッチ
+  cd "../musl-$_musl"
+  local p
+  for p in "$startdir"/../musl/*.patch; do
+    patch -p1 < "$p"
+  done
+}
+
+build() {
+  local tools=$srcdir/tools sysroot=$srcdir/sysroot j
+  j=$(nproc)
+  export PATH=$tools/bin:$PATH
+  # -g なし (GCC の既定は -g -O2: このマシンの道具も中のライブラリも、デバッグ情報で数 GB になる。入れるものは strip する)
+  export CFLAGS="-O2" CXXFLAGS="-O2" CFLAGS_FOR_TARGET="-O2" CXXFLAGS_FOR_TARGET="-O2"
+  command -v aarch64-linux-gnu-gcc >/dev/null || { echo "gcc-libs: aarch64-linux-gnu-gcc がありません (musl を作るのに)" >&2; return 1; }
+
+  # 1. binutils
+  mkdir -p "$srcdir/build-binutils"
+  cd "$srcdir/build-binutils"
+  "../binutils-$_binutils/configure" --target=$_t --prefix="$tools" --with-sysroot="$sysroot" \
+    --disable-nls --disable-werror --disable-gdb --disable-gdbserver --disable-gprof --disable-gprofng \
+    --disable-sim --disable-multilib --enable-deterministic-archives
+  make -j"$j"
+  make install
+
+  # 2. musl (ヘッダー、crt、libc.so) を sysroot の /usr に
+  cd "$srcdir/musl-$_musl"
+  CC=aarch64-linux-gnu-gcc CROSS_COMPILE=aarch64-linux-gnu- CFLAGS="-O2" \
+    ./configure --target=$_t --prefix=/usr --syslibdir=/usr/lib
+  make -j"$j"
+  make DESTDIR="$sysroot" install
+
+  # 3. GCC (C と C++) と、libgcc、libstdc++-v3
+  mkdir -p "$srcdir/build-gcc"
+  cd "$srcdir/build-gcc"
+  "../gcc-$pkgver/configure" --target=$_t --prefix="$tools" --with-sysroot="$sysroot" \
+    --with-native-system-header-dir=/usr/include --enable-languages=c,c++ \
+    --disable-multilib --disable-nls --disable-bootstrap --disable-werror \
+    --enable-shared --enable-threads=posix --enable-tls --enable-__cxa_atexit \
+    --enable-default-pie --enable-default-ssp --with-arch=armv8-a --with-abi=lp64 \
+    --disable-symvers --disable-libstdcxx-pch --enable-libstdcxx-time=yes \
+    --disable-libsanitizer --disable-libgomp --disable-libitm --disable-libssp --disable-libquadmath \
+    --disable-libvtv --disable-libatomic --disable-libcc1 --disable-fixed-point --without-isl --without-zstd
+  make -j"$j" all-gcc
+  make -j"$j" all-target-libgcc
+  make -j"$j" all-target-libstdc++-v3
+}
+
+package() {
+  local tools=$srcdir/tools lib so
+  export PATH=$tools/bin:$PATH
+  cd "$srcdir/build-gcc"
+  make DESTDIR="$srcdir/inst" install-target-libstdc++-v3
+  # 64 ビットなので lib64 に入る
+  lib=$srcdir/inst$tools/$_t/lib64
+  so=$(cd "$lib" && ls libstdc++.so.6.*[0-9] | head -1)
+  install -Dm755 "$lib/$so" "$pkgdir/opt/c/lib/$so"
+  $_t-strip --strip-unneeded "$pkgdir/opt/c/lib/$so"
+  ln -s "$so" "$pkgdir/opt/c/lib/libstdc++.so.6"
+  install -Dm644 "$srcdir/gcc-$pkgver/COPYING3" "$pkgdir/usr/share/licenses/$pkgname/COPYING3"
+  install -Dm644 "$srcdir/gcc-$pkgver/COPYING.RUNTIME" "$pkgdir/usr/share/licenses/$pkgname/COPYING.RUNTIME"
+}
