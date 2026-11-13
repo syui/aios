@@ -1,6 +1,5 @@
 {
   "name": "aios",
-  "description": "aios の土台 (base: aish、ap、coreutils、zsh など) をまるごと入れたもの。docker build の FROM にして ap -S で足せる (builder)",
   "packages": ["base"],
   "install": true,
   "config": {

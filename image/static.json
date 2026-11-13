@@ -1,6 +1,5 @@
 {
   "name": "aios-static",
-  "description": "aios の最小の image: ユーザー (root と nonroot 65532)、/tmp、CA 証明書だけ。静的なバイナリに",
   "packages": ["ca-certificates"],
   "files": ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"],
   "config": {

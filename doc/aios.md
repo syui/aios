@@ -344,7 +344,7 @@ aios のパッケージから切り出すこと (`ap image`、user/src/lib/oci.r
 ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアーカイブ (docker load、skopeo)、ほかはそのディレクトリ
 ```
 
-- DEF (image/*.json): `name`、`description`、`packages` (依存もたどる)、`files` (要るもの)、`config` (OCI の config:
+- DEF (image/*.json): `name`、`packages` (依存もたどる)、`files` (要るもの)、`config` (OCI の config:
   Entrypoint、User、Env など)。files がディレクトリならその下ぜんぶ
 - ELF をたどる: files の ELF の PT_INTERP (/lib/ld-musl-aarch64.so.1)、DT_NEEDED を RPATH・RUNPATH ($ORIGIN)、
   /etc/ld-musl-aarch64.path、/lib:/usr/local/lib:/usr/lib の順にさがして入れる (musl の libc・libpthread・libm などの名前は
