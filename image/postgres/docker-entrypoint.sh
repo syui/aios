@@ -20,6 +20,7 @@ if [ "$1" = postgres ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
 	initdb --username="$user" --pwfile="$pw" --auth-local=trust --auth-host="$auth" --encoding=UTF8 --locale=C.UTF-8 -D "$PGDATA" $POSTGRES_INITDB_ARGS
 	rm -f "$pw"
 	printf 'host all all all %s\n' "$auth" >> "$PGDATA/pg_hba.conf"
+	printf "listen_addresses = '*'\n" >> "$PGDATA/postgresql.conf"
 	pg_ctl -D "$PGDATA" -o "-c listen_addresses= -c unix_socket_directories=/tmp" -w start
 	if [ "$db" != postgres ]; then
 		psql -v ON_ERROR_STOP=1 -h /tmp -U "$user" -d postgres -c "CREATE DATABASE \"$db\""
