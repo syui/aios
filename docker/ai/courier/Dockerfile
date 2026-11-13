@@ -8,7 +8,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY proto ./proto
 COPY src ./src
-RUN cargo build --release --locked
+RUN . /etc/profile.d/cargo.sh && export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld && unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS && cargo build --release --locked
 
 FROM ${AIOS_STATIC}
 COPY --from=build /app/target/release/courier /usr/local/bin/courier
