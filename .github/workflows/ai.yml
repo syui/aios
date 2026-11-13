@@ -1,5 +1,7 @@
-# ai: docker/ai (chat、courier) の Dockerfile が aios の image (builder の ghcr.io/syui/aios、動かす aios-static) で
-# 作れて動くかを、git.syui.ai の固めた commit でたしかめる (ai/at の compose.yml が使うもの)。作るだけで、どこにも置かない
+# ai: docker/ai (chat、courier) の Dockerfile が aios の image (builder の ghcr.io/syui/aios、動かす aios-cc) で
+# 作れて動くかを、git.syui.ai の固めた commit でたしかめる (ai/at の compose.yml が使うもの)。作るだけで、どこにも置かない。
+# cargo は aios の決まり (/etc/profile.d/cargo.sh: base-devel の cc で musl に動的にリンク) で、動かすのは aios-cc (musl と
+# libgcc_s: distroless の cc と同じところ)。OpenSSL と sqlite は中に静的に入る
 #   chat: /xrpc/_health。courier: Postgres といっしょに起こして /xrpc/_health と、表ができたか
 #   動くとき: docker/ai と、このファイルを変えた push、手で
 name: ai
@@ -54,12 +56,14 @@ jobs:
         run: |
           docker build -t "aios-${{ matrix.name }}:ci" -f "docker/ai/${{ matrix.name }}/Dockerfile" src
           docker images "aios-${{ matrix.name }}"
-          # 静的なバイナリ (aios-static に libc も OpenSSL もない)
+          # musl に動的にリンクしたもので、使うライブラリは aios-cc にあるもの (musl の libc と libgcc_s) だけ (OpenSSL は中に)
           docker create --name bin "aios-${{ matrix.name }}:ci"
           docker cp "bin:/usr/local/bin/${{ matrix.bin }}" "out-${{ matrix.bin }}"
           docker rm bin
           file "out-${{ matrix.bin }}" | tee file.log
-          grep -q 'statically linked' file.log
+          grep -q 'ld-musl-aarch64.so.1' file.log
+          readelf -d "out-${{ matrix.bin }}" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort | tee needed.log
+          ! grep -vx -e libc.so -e libgcc_s.so.1 needed.log
 
       - name: Smoke
         run: |
