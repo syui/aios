@@ -365,9 +365,6 @@ fn stat_bytes(s: &Seg) -> [u8; 112] {
     b
 }
 
-fn out(va: usize, b: &[u8]) -> Result<(), i64> {
-    proc::current().pt().copy_out(va, b).ok_or(-EFAULT)
-}
 
 fn max_idx(t: &Table) -> i64 {
     t.segs.keys().next_back().map_or(0, |&i| i as i64)
@@ -387,7 +384,7 @@ fn shmctl(id: i64, cmd: i64, buf: usize) -> Result<i64, i64> {
             for (i, v) in [SHMMAX, SHMMIN as u64, SHMMNI as u64, SHMMNI as u64, SHMALL].iter().enumerate() {
                 b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
-            out(buf, &b)?;
+            proc::put_user(buf, &b)?;
             Ok(max_idx(t))
         }
         SHM_INFO => {
@@ -398,7 +395,7 @@ fn shmctl(id: i64, cmd: i64, buf: usize) -> Result<i64, i64> {
             b[0..4].copy_from_slice(&(t.segs.len() as i32).to_le_bytes());
             b[8..16].copy_from_slice(&tot.to_le_bytes());
             b[16..24].copy_from_slice(&rss.to_le_bytes());
-            out(buf, &b)?;
+            proc::put_user(buf, &b)?;
             Ok(max_idx(t))
         }
         // 位置で見る (ipcs)。答えは番号
@@ -407,7 +404,7 @@ fn shmctl(id: i64, cmd: i64, buf: usize) -> Result<i64, i64> {
             if cmd == SHM_STAT && !perms(s, 0o444) {
                 return Err(-EACCES);
             }
-            out(buf, &stat_bytes(s))?;
+            proc::put_user(buf, &stat_bytes(s))?;
             Ok(s.id(id as usize) as i64)
         }
         IPC_STAT => {
@@ -416,7 +413,7 @@ fn shmctl(id: i64, cmd: i64, buf: usize) -> Result<i64, i64> {
             if !perms(s, 0o444) {
                 return Err(-EACCES);
             }
-            out(buf, &stat_bytes(s))?;
+            proc::put_user(buf, &stat_bytes(s))?;
             Ok(0)
         }
         IPC_SET => {
