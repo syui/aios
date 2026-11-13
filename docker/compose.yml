@@ -1,13 +1,8 @@
-# serve (docker/Dockerfile) を、できるだけ小さな権限で動かす
-#   docker compose -f docker/compose.yml up -d --build
-#   curl http://127.0.0.1:8080/
-# 動かすほうの image は distroless の aios-static (シェルも ap もない) で、serve は静的なバイナリ
 services:
   aios:
     build: .
     image: aios-serve:local
     restart: unless-stopped
-    # PID 1 を docker の init (tini) に: SIGTERM を serve へ渡し (docker stop で 10 秒待たない)、ゾンビを片づける
     init: true
     stop_grace_period: 5s
     user: "65532:65532"
@@ -30,10 +25,8 @@ services:
       core: 0
     environment:
       ADDR: 0.0.0.0:8080
-    # 出すのは手元だけ (外へは前にリバースプロキシを置いて TLS で)
     ports:
       - "127.0.0.1:8080:8080"
-    # distroless に curl も sh もないので、serve 自身が聞く
     healthcheck:
       test: ["CMD", "/usr/local/bin/serve", "--check"]
       interval: 30s
@@ -46,8 +39,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # コンテナの NET の namespace の中のもの (外のホストには効かない)。net.mptcp.enabled は MPTCP のないカーネルでは
-    # ないので、そのときは消す (コンテナが起きない)
     sysctls:
       net.mptcp.enabled: "0"
       net.ipv4.conf.all.send_redirects: "0"
