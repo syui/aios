@@ -1,0 +1,46 @@
+{
+  "name": "aios-gitea",
+  "packages": ["gitea", "git", "ca-certificates", "base", "coreutils"],
+  "files": [
+    "/opt/c/bin/gitea",
+    "/opt/c/bin/git",
+    "/opt/c/bin/git-upload-pack",
+    "/opt/c/bin/git-receive-pack",
+    "/opt/c/bin/git-upload-archive",
+    "/opt/c/libexec/git-core/git",
+    "/opt/c/libexec/git-core/git-remote-http",
+    "/opt/c/libexec/git-core/git-remote-https",
+    "/opt/c/share/git-core/templates",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/cert.pem",
+    "/usr/bin/sh",
+    "/usr/bin/env",
+    "/usr/bin/cat",
+    "/usr/bin/basename",
+    "/usr/bin/dirname",
+    "/usr/bin/test",
+    "/usr/bin/["
+  ],
+  "add": [{"from": "gitea/app.ini", "to": "/var/lib/gitea/custom/conf/app.ini", "owner": "65532:65532", "mode": "0640"}],
+  "dirs": [
+    {"path": "/var/lib/gitea", "mode": "0750", "owner": "65532:65532"},
+    {"path": "/var/lib/gitea/custom", "mode": "0750", "owner": "65532:65532"},
+    {"path": "/var/lib/gitea/custom/conf", "mode": "0750", "owner": "65532:65532"}
+  ],
+  "config": {
+    "Entrypoint": ["/opt/c/bin/gitea"],
+    "Cmd": ["web"],
+    "User": "65532:65532",
+    "WorkingDir": "/var/lib/gitea",
+    "Env": [
+      "PATH=/opt/c/bin:/usr/bin",
+      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+      "GITEA_WORK_DIR=/var/lib/gitea",
+      "GITEA_CUSTOM=/var/lib/gitea/custom",
+      "HOME=/var/lib/gitea/git",
+      "GITEA__repository__SCRIPT_TYPE=sh"
+    ],
+    "ExposedPorts": {"3000/tcp": {}, "2222/tcp": {}},
+    "Volumes": {"/var/lib/gitea": {}}
+  }
+}

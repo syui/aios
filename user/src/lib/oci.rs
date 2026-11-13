@@ -11,8 +11,12 @@
 //             ディレクトリなら中をみな、リンクはその先も
 //   config    OCI の config (Entrypoint、Cmd、User、WorkingDir、Env ...)
 //   add       自分のファイル: [{"from": DEF のところからのパス, "to": image の中のパス}] (ファイル、ディレクトリ、リンク)。
-//             いちばん上の層に入れ、ELF なら要るライブラリを packages からたどる (静的なものは何も足さない)
+//             いちばん上の層に入れ、ELF なら要るライブラリを packages からたどる (静的なものは何も足さない)。
+//             "owner": "UID:GID" と "mode": "0640" で、写したものみなの持ち主と mode を (Dockerfile の COPY --chown --chmod)
 //   version   タグ (なければ packages のはじめのものの版。packages がなければ latest)
+//   dirs      持ち主と mode を決めたディレクトリ: [{"path": "/var/lib/gitea", "mode": "0750", "owner": "65532:65532"}]
+//             (いちばん上の層に、空で)。docker の名前つきボリュームは、はじめにこの持ち主を写すので、nonroot のサービス
+//             がそのまま書ける (データの置き場)
 //   install   true ならパッケージをまるごと入れ、aipkg と同じ入れた記録 (/var/lib/aipkg/local/NAME-VER の desc、files、
 //             install) をそのパッケージの層に書く (土台の層は作らない: base パッケージが /etc や /tmp を持つ)。
 //             image/aios.json (builder: docker build の FROM にして ap -Sy で足す)
@@ -384,7 +388,7 @@ impl<W: Write> Write for Hash<W> {
 }
 
 /// 層 (gzip の tar) を blobs に書く: (digest, 大きさ, diff_id)
-fn write_layer(blobs: &str, entries: &[(String, Meta, Option<String>)], root: &str) -> io::Result<(String, u64, String)> {
+fn write_layer(blobs: &str, entries: &[(String, Meta, Option<String>)], root: &str, owners: &BTreeMap<String, (u64, u64)>) -> io::Result<(String, u64, String)> {
     let tmp = format!("{}/layer.tmp", blobs);
     let file = Hash { w: fs::File::create(&tmp)?, h: Sha256::new(), n: 0 };
     let gz = flate2::GzBuilder::new().mtime(0).write(file, flate2::Compression::default());
@@ -393,9 +397,9 @@ fn write_layer(blobs: &str, entries: &[(String, Meta, Option<String>)], root: &s
         let mut h = tar::Header::new_gnu();
         h.set_mode(m.mode);
         h.set_mtime(m.mtime);
-        let id = if p == "home/nonroot" { NONROOT as u64 } else { 0 };
-        h.set_uid(id);
-        h.set_gid(id);
+        let (uid, gid) = owners.get(p).copied().unwrap_or((0, 0));
+        h.set_uid(uid);
+        h.set_gid(gid);
         match &m.kind {
             Kind::Dir => {
                 h.set_entry_type(tar::EntryType::Directory);
@@ -525,7 +529,18 @@ pub fn main(args: &[String]) {
     // add: 自分のファイル ([{"from": DEF のところからのパス, "to": image の中のパス}])。いちばん上の層に入れ、ELF なら
     // 要るライブラリを packages からたどる
     let def_dir = std::path::Path::new(&def).parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let adds: Vec<(std::path::PathBuf, String)> = d["add"]
+    let owner_of = |v: &Value, what: &str| -> Option<(u32, u32)> {
+        let o = v.as_str()?;
+        let (u, g) = o.split_once(':').unwrap_or((o, o));
+        match (u.parse(), g.parse()) {
+            (Ok(u), Ok(g)) => Some((u, g)),
+            _ => die(format!("{}: {}: bad owner {}", def, what, o)),
+        }
+    };
+    let mode_of = |v: &Value, what: &str| -> Option<u32> {
+        v.as_str().map(|m| u32::from_str_radix(m, 8).map(|m| m & 0o7777).unwrap_or_else(|_| die(format!("{}: {}: bad mode {}", def, what, m))))
+    };
+    let adds: Vec<(std::path::PathBuf, String, Option<(u32, u32)>, Option<u32>)> = d["add"]
         .as_array()
         .into_iter()
         .flatten()
@@ -534,10 +549,21 @@ pub fn main(args: &[String]) {
             if !to.starts_with('/') {
                 die(format!("{}: add: {} is not an absolute path", def, to));
             }
-            (def_dir.join(from), to.to_string())
+            (def_dir.join(from), to.to_string(), owner_of(&a["owner"], "add"), mode_of(&a["mode"], "add"))
         })
         .collect();
-    if pkgs.is_empty() && adds.is_empty() {
+    // dirs: 持ち主と mode を決めた空のディレクトリ (いちばん上の層に)
+    let dirs: Vec<(String, u32, u32, u32)> = d["dirs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|x| {
+            let Some(path) = x["path"].as_str().filter(|p| p.starts_with('/') && norm(p) != "") else { die(format!("{}: dirs needs an absolute path", def)) };
+            let (u, g) = owner_of(&x["owner"], "dirs").unwrap_or((0, 0));
+            (norm(path), mode_of(&x["mode"], "dirs").unwrap_or(0o755), u, g)
+        })
+        .collect();
+    if pkgs.is_empty() && adds.is_empty() && dirs.is_empty() {
         die(format!("{}: no packages", def));
     }
     let repos = parse_conf(&conf);
@@ -597,8 +623,18 @@ pub fn main(args: &[String]) {
     // add (層は packages のあと)。持ち主は 0、mode は実行できるものは 0755、ほかは 0644 (作ったマシンの umask に
     // よらない)、時刻は built
     let add_layer = order.len() + 1;
-    for (from, to) in &adds {
-        copy_add(from, &norm(to), &root, add_layer, built, &mut meta).unwrap_or_else(|e| die(format!("add {}: {}", from.display(), e)));
+    for (from, to, _, mode) in &adds {
+        let to = norm(to);
+        copy_add(from, &to, &root, add_layer, built, &mut meta).unwrap_or_else(|e| die(format!("add {}: {}", from.display(), e)));
+        // mode: 写したものみな (リンクはそのまま)
+        if let Some(mode) = mode {
+            let sub = format!("{}/", to);
+            for (_, m) in meta.range_mut(to.clone()..).take_while(|(p, _)| p.starts_with(&to)).filter(|(p, _)| **p == to || p.starts_with(&sub)) {
+                if !matches!(m.kind, Kind::Link(_)) {
+                    m.mode = *mode;
+                }
+            }
+        }
     }
 
     // 土台 (層 0): ユーザー、os-release、/tmp、家、/lib → usr/lib (aios のローダーは /lib/ld-musl-aarch64.so.1)。
@@ -637,7 +673,7 @@ pub fn main(args: &[String]) {
     for f in &files {
         img.add(f, "files");
     }
-    for (_, to) in &adds {
+    for (_, to, _, _) in &adds {
         img.add(to, "add");
     }
     // 入れたファイルのパッケージの usr/share/licenses
@@ -669,6 +705,29 @@ pub fn main(args: &[String]) {
         layers[l].push((p.clone(), m, None));
     }
     layers[0].append(&mut base);
+    // 持ち主: nonroot の家と dirs のもの (ほかは 0)
+    let mut owners: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    owners.insert("home/nonroot".into(), (NONROOT as u64, NONROOT as u64));
+    for (_, to, owner, _) in &adds {
+        let Some((u, g)) = owner else { continue };
+        let to = norm(to);
+        for p in layers[add_layer].iter().map(|(p, _, _)| p).filter(|p| **p == to || p.starts_with(&format!("{}/", to))) {
+            owners.insert(p.clone(), (*u as u64, *g as u64));
+        }
+    }
+    for (p, mode, uid, gid) in &dirs {
+        let mut q = parent(p).to_string();
+        while !q.is_empty() {
+            if !base_paths.contains(&q) && !layers[add_layer].iter().any(|(x, _, _)| *x == q) {
+                let dm = img.meta.get(&q).filter(|m| matches!(m.kind, Kind::Dir)).cloned().unwrap_or(Meta { kind: Kind::Dir, mode: 0o755, mtime: built, layer: add_layer });
+                layers[add_layer].push((q.clone(), dm, None));
+            }
+            q = parent(&q).to_string();
+        }
+        layers[add_layer].retain(|(x, _, _)| x != p);
+        layers[add_layer].push((p.clone(), Meta { kind: Kind::Dir, mode: *mode, mtime: built, layer: add_layer }, None));
+        owners.insert(p.clone(), (*uid as u64, *gid as u64));
+    }
     // install: 入れたことの記録 (aipkg の /var/lib/aipkg/local/NAME-VER の desc、files、install) を、そのパッケージの層に。
     // aipkg の install と同じ形 (INSTALLDATE は image の時刻、REASON は packages に書いたものが 0、依存は 1、BACKUP は
     // 「パス<TAB>sha256」)。これで image の中の ap -S は、入っているものを入れなおさない
@@ -738,7 +797,7 @@ pub fn main(args: &[String]) {
         } else {
             format!("{} {}", order[k - 1], get(&sync[&order[k - 1]].1, "VERSION"))
         };
-        let (digest, size, diff) = write_layer(&blobs, l, &root).unwrap_or_else(|e| die(format!("image: layer {}: {}", what, e)));
+        let (digest, size, diff) = write_layer(&blobs, l, &root, &owners).unwrap_or_else(|e| die(format!("image: layer {}: {}", what, e)));
         let mut desc = json!({"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": format!("sha256:{}", digest), "size": size});
         if k > 0 && k != add_layer {
             desc["annotations"] = json!({"ai.syui.aios.package": what});

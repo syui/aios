@@ -347,7 +347,10 @@ ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアー�
 - DEF (image/*.json): `name`、`packages` (依存もたどる)、`files` (要るもの)、`config` (OCI の config:
   Entrypoint、User、Env など)。files がディレクトリならその下ぜんぶ。`add` は自分でビルドしたもの
   (`[{"from": "target/release/serve", "to": "/usr/local/bin/serve"}]`。from は DEF のところから) をいちばん上の層に入れ、
-  ELF なら要るライブラリを packages からたどる。`version` はタグ (なければ packages のはじめのものの版)。時刻は
+  ELF なら要るライブラリを packages からたどる (`"owner": "65532:65532"` と `"mode": "0640"` で、写したものの持ち主と
+  mode を: Dockerfile の COPY --chown --chmod)。`dirs` は持ち主と mode を決めた空のディレクトリ
+  (`[{"path": "/var/lib/gitea", "mode": "0750", "owner": "65532:65532"}]`。docker の名前つきボリュームは、はじめにこれを
+  写すので、nonroot のサービスがそのまま書ける)。`version` はタグ (なければ packages のはじめのものの版)。時刻は
   `SOURCE_DATE_EPOCH` があればそれ
 - ELF をたどる: files の ELF の PT_INTERP (/lib/ld-musl-aarch64.so.1)、DT_NEEDED を RPATH・RUNPATH ($ORIGIN)、
   /etc/ld-musl-aarch64.path、/lib:/usr/local/lib:/usr/lib の順にさがして入れる (musl の libc・libpthread・libm などの名前は
@@ -371,6 +374,7 @@ ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアー�
 | aios-cc | + musl (ld-musl と libc.so)、libgcc_s。musl で動的にリンクしたものに | 597 KB |
 | aios-node | + node 26.13.1 (Entrypoint)。npm もシェルもない | 51.5 MB |
 | aios | builder: base をまるごと (aish、ap、coreutils、zsh、sudo など 15 のパッケージ)。`/bin/sh` は aish | 36.7 MB |
+| aios-gitea | + gitea 28.3.0、git (http も)、フックが使う sh (aish)・env・cat・basename・dirname・test | 51.2 MB |
 
 builder (image/aios.json の `"install": true`) は、パッケージをまるごと入れて、aipkg と同じ入れた記録
 (`/var/lib/aipkg/local/NAME-VER` の desc・files・install) をそのパッケージの層に書く。なので image の中の `ap -Q` は
@@ -409,9 +413,31 @@ CI (image.yml) は、その場で作った aios と aios-static で docker/ を 
 curl、405、`docker inspect` (65532、読むだけ、cap なし、no-new-privileges)、`docker top` (中は 65532) をたしかめる。
 arm64 だけ (x86 の docker では `--platform linux/arm64` と qemu)。
 
+gitea (image/gitea.json): Entrypoint は `gitea`、Cmd は `web`、データはみな /var/lib/gitea (ボリューム。65532 の 0750、
+HOME も中の git/)。gitea web は `GITEA__` の環境変数を読まない (公式の image は起こす前にシェルで app.ini にしている) ので、
+はじめに 1 度 `gitea config edit-ini --apply-env` で app.ini に入れる。gitea はリポジトリのフック (pre-receive など) を
+シェルの台本で書くので、sh と env・cat などだけは入れ、はじめの app.ini (`[repository] SCRIPT_TYPE = sh`、65532 の 0640) を
+置いておく (ブラウザのインストールの画面でも、そのまま push できる):
+
+```bash
+docker volume create gitea
+docker run --rm -v gitea:/var/lib/gitea -e GITEA__security__INSTALL_LOCK=true -e GITEA__database__DB_TYPE=sqlite3 \
+  ghcr.io/syui/aios-gitea --config /var/lib/gitea/custom/conf/app.ini config edit-ini --apply-env --in-place
+docker run -d -p 127.0.0.1:3000:3000 -v gitea:/var/lib/gitea --read-only --tmpfs /tmp --cap-drop ALL \
+  --security-opt no-new-privileges ghcr.io/syui/aios-gitea
+```
+
+aios の上では `aibox -b ~/gitea:/var/lib/gitea --image ghcr.io/syui/aios-gitea` (bind は image の中身をかくすので、
+~/gitea/custom/conf は先に作る)。2026-11-13 に aios の VM で、web、sqlite、HTTP の push (フックは image の中の aish)、
+clone まで通った。このとき直したカーネル (どれも Linux 7.4 と同じに): vDSO の版の表 (Go は DT_VERDEF があるつもりで読み、
+gitea は起きてすぐ落ちていた。test/vdso.c)、古いほうの clone の CLONE_PIDFD (pidfd を parent_tid に書く。clone3 も)、
+PID の namespace の中のゾンビの番号 (waitid(WNOWAIT) で待ったあとの wait4(pid) が ECHILD: Go の os/exec が子を待てず、
+aibox の中の gitea は git を呼べなかった。test/pidnswait.c が 18 行同じ)。CI は名前つきボリュームと --read-only、cap なしで
+起こして、ユーザーを作り、git push とフック、API の commits までたしかめる。
+
 CI (.github/workflows/image.yml、arm64 の Ubuntu) が、ap をビルドして image/*.json を 2 回作り (1 バイトもちがわないか)、
 docker run でためして (node の版・nonroot・https、シェルがないこと、static に静的な hello、cc に musl の hello)、
-`ghcr.io/syui/aios-static`、`aios-cc`、`aios-node` に版と latest で置く (skopeo で、digest を変えずに。同じ digest がもう
+`ghcr.io/syui/aios-static`、`aios-cc`、`aios-node`、`aios-gitea` に版と latest で置く (skopeo で、digest を変えずに。同じ digest がもう
 あれば置かない)。1 日 1 回作るので、ai/repo のパッケージが新しくなれば image も新しくなる。
 
 ```sh

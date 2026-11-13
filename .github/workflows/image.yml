@@ -149,6 +149,41 @@ jobs:
           docker top "$cid" -o user,pid,args | grep -q '^65532 .*serve'
           docker compose -f docker/compose.yml down
 
+      - name: Test gitea
+        run: |
+          # 名前つきボリュームには image の /var/lib/gitea (65532 の持ち主と、SCRIPT_TYPE = sh のはじめの app.ini) が写る。
+          # gitea web は GITEA__ の環境変数を読まないので、はじめに config edit-ini で app.ini に入れる
+          docker volume create gitea-ci
+          docker run --rm -v gitea-ci:/var/lib/gitea \
+            -e GITEA__security__INSTALL_LOCK=true -e GITEA__database__DB_TYPE=sqlite3 \
+            -e GITEA__repository__ENABLE_PUSH_CREATE_USER=true \
+            aios-gitea:ci --config /var/lib/gitea/custom/conf/app.ini config edit-ini --apply-env --in-place
+          # 読むだけの根、cap なし、no-new-privileges、65532 で
+          docker run -d --name gitea-ci -p 127.0.0.1:3000:3000 -v gitea-ci:/var/lib/gitea \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges aios-gitea:ci
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/v1/version; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs gitea-ci 2>&1 | tail -20
+          [ -n "$ok" ]
+          docker exec gitea-ci gitea admin user create --username ci --password 'ci-pass-1234' \
+            --email ci@example.com --admin --must-change-password=false
+          # git の push: フック (pre-receive、post-receive) は image の中の sh (aish) と env と cat などで動く
+          git init -q -b main out/hello
+          echo hello > out/hello/README
+          git -C out/hello add README
+          git -C out/hello -c user.name=ci -c user.email=ci@example.com commit -qm first
+          git -C out/hello push http://ci:ci-pass-1234@127.0.0.1:3000/ci/hello.git main
+          docker logs gitea-ci 2>&1 | grep -E 'hook/(pre|post)-receive/ci/hello.* 200 OK'
+          curl -fsS -u ci:ci-pass-1234 http://127.0.0.1:3000/api/v1/repos/ci/hello/commits | tee out/commits.json
+          grep -q "$(git -C out/hello rev-parse HEAD)" out/commits.json
+          # シェルとして使えるのは sh だけで、パッケージの道具はない
+          if docker exec gitea-ci ap -V 2>/dev/null; then echo "aios-gitea has ap"; exit 1; fi
+          docker rm -f gitea-ci
+          docker volume rm gitea-ci
+
       - name: Push
         if: github.ref == 'refs/heads/main'
         env:
