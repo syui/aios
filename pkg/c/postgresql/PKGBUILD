@@ -12,7 +12,7 @@ pkgdesc='Sophisticated object-relational DBMS (server, client tools, libpq and c
 arch=('aarch64')
 url='https://www.postgresql.org/'
 license=('PostgreSQL')
-depends=('musl')
+depends=('musl' 'zlib' 'zstd')
 _latest_url=https://ftp.postgresql.org/pub/source/
 _latest_regex='v(18[.][0-9]+)/'
 # sha256 は ftp.postgresql.org の postgresql-18.7.tar.bz2.sha256 と同じ

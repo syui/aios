@@ -191,6 +191,58 @@ jobs:
           docker rm -f gitea-ci
           docker volume rm gitea-ci
 
+      - name: Test redis
+        run: |
+          # 守りのまま (読むだけの根、cap なし、no-new-privileges、65532)。データは名前つきボリューム (image の /data が写る)
+          docker volume create redis-ci
+          docker run -d --name redis-ci --network host -v redis-ci:/data --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges aios-redis:ci redis-server --protected-mode no --port 6390
+          for i in $(seq 1 20); do docker exec redis-ci redis-cli -p 6390 ping 2>/dev/null | grep -q PONG && break; sleep 1; done
+          docker exec redis-ci redis-cli -p 6390 set k aios
+          [ "$(docker exec redis-ci redis-cli -p 6390 get k)" = aios ]
+          # fork した子が書く (BGSAVE)。起きるときの arm64 のたしかめ (/proc/self/smaps) も通っている
+          docker exec redis-ci redis-cli -p 6390 bgsave
+          for i in $(seq 1 20); do docker exec redis-ci redis-cli -p 6390 info persistence | grep -q 'rdb_bgsave_in_progress:0' && break; sleep 1; done
+          docker exec redis-ci redis-cli -p 6390 info persistence | grep 'rdb_last_bgsave_status:ok'
+          docker logs redis-ci 2>&1 | tail -5
+          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}}' redis-ci
+          docker rm -f redis-ci
+          docker volume rm redis-ci
+
+      - name: Test postgres
+        run: |
+          # 公式の postgres と同じ約束: POSTGRES_USER / PASSWORD / DB、/docker-entrypoint-initdb.d の .sql (ai/at の
+          # configs/postgres/init/init.sql と同じく DB を作る)、PGDATA は /var/lib/postgresql/18/docker
+          mkdir -p out/pginit
+          printf 'CREATE DATABASE plc;\nCREATE DATABASE bsky;\n' > out/pginit/init.sql
+          pw="ci-$(openssl rand -hex 8)"
+          docker volume create pg-ci
+          docker run -d --name pg-ci -p 127.0.0.1:5439:5432 -v pg-ci:/var/lib/postgresql -v "$PWD/out/pginit:/docker-entrypoint-initdb.d:ro" \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=ci \
+            --read-only --tmpfs /tmp --tmpfs /run/postgresql --cap-drop ALL --security-opt no-new-privileges aios-postgres:ci
+          ok=
+          for i in $(seq 1 30); do
+            if docker exec pg-ci pg_isready -U postgres -d ci; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs pg-ci 2>&1 | tail -20
+          [ -n "$ok" ]
+          # 外から (TCP、scram-sha-256 のパスワード) つないで、init.sql の DB と pg_trgm (bsky が使う contrib)
+          docker run --rm --network host -e PGPASSWORD="$pw" aios-postgres:ci psql -h 127.0.0.1 -p 5439 -U postgres -d ci -Atc \
+            "SELECT datname FROM pg_database WHERE datname IN ('plc','bsky','ci') ORDER BY 1" | tee out/pgdbs.log
+          [ "$(cat out/pgdbs.log | tr '\n' ' ')" = "bsky ci plc " ]
+          docker run --rm --network host -e PGPASSWORD="$pw" aios-postgres:ci psql -h 127.0.0.1 -p 5439 -U postgres -d bsky -Atc \
+            "CREATE EXTENSION pg_trgm; SELECT similarity('aios', 'aios-postgres') > 0"
+          # パスワードがちがえばつながらない
+          if docker run --rm --network host -e PGPASSWORD=wrong aios-postgres:ci psql -h 127.0.0.1 -p 5439 -U postgres -d ci -c 'select 1'; then exit 1; fi
+          # 起こしなおしても init はしない (PG_VERSION がある)
+          docker restart pg-ci
+          for i in $(seq 1 30); do docker exec pg-ci pg_isready -U postgres -d ci && break; sleep 2; done
+          docker logs pg-ci 2>&1 | grep -c 'init process complete' | grep -qx 1
+          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}}' pg-ci
+          docker rm -f pg-ci
+          docker volume rm pg-ci
+
       - name: Test plc (docker/bluesky-social/did-method-plc)
         run: |
           # atproto の DID PLC (did-method-plc)。builder (aios) で pnpm の install と build、aios-node で動かす

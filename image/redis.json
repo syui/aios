@@ -1,0 +1,19 @@
+{
+  "name": "aios-redis",
+  "packages": ["redis"],
+  "files": [
+    "/opt/c/bin/redis-server",
+    "/opt/c/bin/redis-cli"
+  ],
+  "dirs": [
+    {"path": "/data", "mode": "0750", "owner": "65532:65532"}
+  ],
+  "config": {
+    "Cmd": ["redis-server", "--protected-mode", "no"],
+    "User": "65532:65532",
+    "WorkingDir": "/data",
+    "Env": ["PATH=/opt/c/bin:/usr/bin"],
+    "ExposedPorts": {"6379/tcp": {}},
+    "Volumes": {"/data": {}}
+  }
+}

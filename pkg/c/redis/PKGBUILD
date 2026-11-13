@@ -26,6 +26,8 @@ build() {
   zig_env
   c_deps openssl
   cd "redis-$pkgver"
+  # 版の git の sha (src/mkreleasehdr.sh) を、まわりのリポジトリ (aios) から拾わない (00000000 に)
+  export GIT_CEILING_DIRECTORIES=$srcdir
   # uname は作るマシンのもの (x86_64 なら deps の lua などに -m のフラグを足すので、aios のものに)。
   # zig cc は -O のないもの (deps の一部) に UBSan を入れる (__ubsan_handle_* がなくてつながらない): base-devel の cc と同じく切る
   # 本体だけ (all は試験のモジュール (module_tests) まで作り、それは作るマシンの gcc でつなごうとする)

@@ -1,0 +1,61 @@
+{
+  "name": "aios-postgres",
+  "packages": ["postgresql", "zlib", "zstd", "musl", "base", "coreutils"],
+  "files": [
+    "/lib/ld-musl-aarch64.so.1",
+    "/etc/ld-musl-aarch64.path",
+    "/opt/c/lib/libpq.so.5",
+    "/opt/c/lib/libpq.so.5.18",
+    "/opt/c/lib/libz.so.1",
+    "/opt/c/lib/libz.so.1.4",
+    "/opt/c/lib/libzstd.so.1",
+    "/opt/c/lib/libzstd.so.1.5.7",
+    "/opt/c/lib/postgresql",
+    "/opt/c/share/postgresql",
+    "/opt/c/bin/postgres",
+    "/opt/c/bin/initdb",
+    "/opt/c/bin/pg_ctl",
+    "/opt/c/bin/psql",
+    "/opt/c/bin/pg_isready",
+    "/opt/c/bin/pg_dump",
+    "/opt/c/bin/pg_dumpall",
+    "/opt/c/bin/pg_restore",
+    "/opt/c/bin/pg_basebackup",
+    "/opt/c/bin/pg_upgrade",
+    "/opt/c/bin/pg_controldata",
+    "/opt/c/bin/pg_resetwal",
+    "/opt/c/bin/pg_checksums",
+    "/opt/c/bin/pg_rewind",
+    "/opt/c/bin/createdb",
+    "/opt/c/bin/dropdb",
+    "/opt/c/bin/createuser",
+    "/opt/c/bin/dropuser",
+    "/opt/c/bin/vacuumdb",
+    "/opt/c/bin/reindexdb",
+    "/usr/bin/sh",
+    "/usr/bin/aish",
+    "/usr/bin/coreutils",
+    "/usr/bin/mkdir",
+    "/usr/bin/chmod",
+    "/usr/bin/rm"
+  ],
+  "add": [{"from": "postgres/docker-entrypoint.sh", "to": "/usr/local/bin/docker-entrypoint.sh", "mode": "0755"}],
+  "dirs": [
+    {"path": "/var/lib/postgresql", "mode": "0750", "owner": "65532:65532"},
+    {"path": "/docker-entrypoint-initdb.d", "mode": "0755", "owner": "0:0"}
+  ],
+  "config": {
+    "Entrypoint": ["/usr/local/bin/docker-entrypoint.sh"],
+    "Cmd": ["postgres"],
+    "User": "65532:65532",
+    "WorkingDir": "/var/lib/postgresql",
+    "Env": [
+      "PATH=/opt/c/bin:/usr/bin",
+      "PGDATA=/var/lib/postgresql/18/docker",
+      "LANG=C.UTF-8"
+    ],
+    "ExposedPorts": {"5432/tcp": {}},
+    "Volumes": {"/var/lib/postgresql": {}},
+    "StopSignal": "SIGINT"
+  }
+}
