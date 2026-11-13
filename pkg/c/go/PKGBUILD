@@ -1,0 +1,31 @@
+# go: Go の道具 (go、gofmt と標準ライブラリ)。自分でビルドしない: 公式の linux-arm64 のもの (go.dev/dl、sha256 を
+#   確かめる。go と gofmt と pkg/tool の道具は静的なバイナリ) を /opt/c/go (GOROOT) に入れ、/opt/c/bin から指す。
+#   indigo の relay、jetstream、social-app の bskyweb を aios の builder で作るのに。CGO_ENABLED=0 なら静的な
+#   バイナリになる (aios-static で動く)。GOTOOLCHAIN=local (go.mod の toolchain で別の Go を取ってこない) は
+#   /opt/c/go/go.env に。テスト (test/ と testdata) と、arm64 でない .syso は入れない
+pkgname=go
+pkgver=1.27.4
+pkgrel=1
+_latest_url='https://go.dev/dl/?mode=json'
+_latest_regex='"version": "go([0-9]+[.][0-9]+[.][0-9]+)"'
+pkgdesc='The Go programming language toolchain (official static linux-arm64 build, for aios)'
+arch=('aarch64')
+url='https://go.dev'
+license=('BSD-3-Clause')
+source=("https://go.dev/dl/go$pkgver.linux-arm64.tar.gz")
+sha256sums=('3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92')
+
+package() {
+  install -d "$pkgdir/opt/c" "$pkgdir/opt/c/bin"
+  tar -xzf "go$pkgver.linux-arm64.tar.gz" -C "$pkgdir/opt/c" --exclude=go/test
+  # テストのデータ (ほかの CPU の ELF など) と、arm64 でない race と boringcrypto の .syso は入れない
+  find "$pkgdir/opt/c/go" -type d -name testdata -prune -exec rm -rf {} +
+  find "$pkgdir/opt/c/go/src/runtime/race" -name '*.syso' ! -name 'race_linux_arm64.syso' -delete
+  rm -rf "$pkgdir/opt/c/go/src/runtime/race/internal/amd64v1" "$pkgdir/opt/c/go/src/runtime/race/internal/amd64v3"
+  rm -f "$pkgdir/opt/c/go/src/crypto/internal/boring/syso/goboringcrypto_linux_amd64.syso"
+  sed -i 's/^GOTOOLCHAIN=auto$/GOTOOLCHAIN=local/' "$pkgdir/opt/c/go/go.env"
+  grep -qx GOTOOLCHAIN=local "$pkgdir/opt/c/go/go.env"
+  ln -s ../go/bin/go "$pkgdir/opt/c/bin/go"
+  ln -s ../go/bin/gofmt "$pkgdir/opt/c/bin/gofmt"
+  install -Dm644 "$pkgdir/opt/c/go/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -191,30 +191,32 @@ jobs:
           docker rm -f gitea-ci
           docker volume rm gitea-ci
 
-      - name: Test plc (docker/plc)
+      - name: Test plc (docker/bluesky-social/did-method-plc)
         run: |
           # atproto の DID PLC (did-method-plc)。builder (aios) で pnpm の install と build、aios-node で動かす
           git clone -q https://github.com/did-method-plc/did-method-plc out/plc
           git -C out/plc checkout -q 29f1a70ee9f6f80a25946cac103b2f745e371334
-          args="--build-arg AIOS=aios:ci --build-arg AIOS_NODE=aios-node:ci -f docker/plc/Dockerfile out/plc"
+          args="--build-arg AIOS=aios:ci --build-arg AIOS_NODE=aios-node:ci -f docker/bluesky-social/did-method-plc/Dockerfile out/plc"
           docker build -t aios-plc:local $args
           docker build -t aios-plc-build:local --target build $args
           docker images aios-plc
-          # Postgres といっしょに compose の守りのまま (読むだけの根、cap なし、65532) 起こし、healthy を待つ
-          export PLC_DB_PASSWORD="ci-$(openssl rand -hex 8)"
-          docker compose -f docker/plc/compose.yml up -d
-          cid=$(docker compose -f docker/plc/compose.yml ps -q plc)
-          st=
-          for i in $(seq 1 60); do
-            st=$(docker inspect -f '{{.State.Health.Status}}' "$cid")
-            [ "$st" = healthy ] && break
+          # Postgres と、守りのまま (読むだけの根、cap なし、no-new-privileges、65532) の plc
+          pw="ci-$(openssl rand -hex 8)"
+          creds="{\"username\":\"postgres\",\"password\":\"$pw\",\"host\":\"database\",\"port\":\"5432\",\"database\":\"plc\"}"
+          docker network create plc-ci
+          docker run -d --name database --network plc-ci -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc postgres:18-alpine
+          for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d plc && break; sleep 2; done
+          docker run -d --name plc --network plc-ci -p 127.0.0.1:2582:3000 --init --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e ENABLE_MIGRATIONS=true -e DB_CREDS_JSON="$creds" -e DB_MIGRATE_CREDS_JSON="$creds" aios-plc:local
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:2582/_health; then ok=1; break; fi
             sleep 2
           done
-          docker compose -f docker/plc/compose.yml logs plc | tail -20
-          echo "health: $st"
-          [ "$st" = healthy ]
-          curl -fsS http://127.0.0.1:2582/_health
           echo
+          docker logs plc 2>&1 | tail -20
+          [ -n "$ok" ]
           # DID を作って (genesis の op に署名して送り)、もどってきた document をたしかめる
           docker run --rm --network host -w /app/packages/server aios-plc-build:local node --input-type=module -e '
             import { Client } from "@did-plc/lib";
@@ -225,9 +227,10 @@ jobs:
             const data = await c.getDocumentData(did);
             console.log(did, JSON.stringify(data));
             if (!did.startsWith("did:plc:") || data.alsoKnownAs[0] !== "at://ci.example.com") process.exit(1);'
-          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}' "$cid" | tee out/plc-inspect.log
+          docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}' plc | tee out/plc-inspect.log
           grep -q 'user=65532:65532 ro=true cap_drop=\[ALL\]' out/plc-inspect.log
-          docker compose -f docker/plc/compose.yml down -v
+          docker rm -f plc database
+          docker network rm plc-ci
 
       - name: Push
         if: github.ref == 'refs/heads/main'

@@ -1,7 +1,7 @@
 {
   "name": "aios-node",
-  "packages": ["nodejs", "ca-certificates"],
-  "files": ["/opt/c/bin/node", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"],
+  "packages": ["nodejs", "ca-certificates", "gcc-libs"],
+  "files": ["/opt/c/bin/node", "/opt/c/lib/libstdc++.so.6", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"],
   "config": {
     "Entrypoint": ["/opt/c/bin/node"],
     "User": "65532:65532",

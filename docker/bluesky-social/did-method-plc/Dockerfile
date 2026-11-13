@@ -18,4 +18,5 @@ WORKDIR /app/packages/server/service
 USER 65532:65532
 ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
-CMD ["--enable-source-maps", "--import=@did-plc/server/telemetry", "index.js"]
+ENTRYPOINT []
+CMD ["node", "--enable-source-maps", "--import=@did-plc/server/telemetry", "index.js"]
