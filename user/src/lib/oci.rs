@@ -168,8 +168,10 @@ fn extract(path: &str, root: &str, layer: usize, meta: &mut BTreeMap<String, Met
             tar::EntryType::Directory => Kind::Dir,
             tar::EntryType::Symlink => Kind::Link(e.link_name()?.map(|l| l.to_string_lossy().to_string()).unwrap_or_default()),
             tar::EntryType::Link => {
-                // ハードリンク: 先のファイルの写し
+                // ハードリンク: 先のファイルの写し (親のディレクトリが、まだ別の名前でしか出てきていないこともある:
+                // postgresql のタイムゾーンの表は、Asia/X が Etc/Y へのハードリンク)
                 let to = norm(&e.link_name()?.map(|l| l.to_string_lossy().to_string()).unwrap_or_default());
+                fs::create_dir_all(format!("{}/{}", root, parent(&p)))?;
                 fs::copy(format!("{}/{}", root, to), format!("{}/{}", root, p))?;
                 Kind::File
             }
