@@ -2333,6 +2333,12 @@ posix-cpu-timers と同じ:
 - clock_getres: CPU の時計 (SCHED) は 1 ns、ほかは 1 tick (10 ms: aios のタイマは tick の境めで鳴る。Linux も高精度
   タイマがなければ tick)
 - 大きなロックなしの速い道は、壁・起動から・自分のスレッドの CPU の時計まで (ほかはふつうの道)。vDSO は 0、1、4〜7 だけ
+- vDSO (kernel/src/vdso.rs) は Linux の arm64 のものと同じ形: soname `linux-vdso.so.1`、DT_HASH と DT_GNU_HASH、
+  版の表 (DT_VERDEF と DT_VERSYM: 名前はみな `LINUX_2.6.39`)、`__kernel_clock_getres` (いつもシステムコール)
+  `__kernel_rt_sigreturn` `__kernel_gettimeofday` (tz があればシステムコール) `__kernel_clock_gettime`。Go の runtime は
+  版の表があるつもりで読むので、前 (clock_gettime だけで版の表なし) は Go のプログラム (gitea) が起きてすぐ番地 0x2 で
+  落ちていた。`__kernel_getrandom` (Linux 6.11 からの vgetrandom) はまだない (glibc と Go はシステムコールの getrandom
+  にする)。test/vdso.c (Go と同じ読み方) が Linux 7.4 と getrandom の 2 行のほかは同じ
 - timer_create: MONOTONIC_RAW と COARSE、fd の時計は EOPNOTSUPP、知らない時計は EINVAL、ALARM は CAP_WAKE_ALARM
   がなければ EPERM。CPU の時計のタイマは、その時計の ns で期限を覚え、tick ごとに見て鳴らす (Linux も tick ごと)。
   くり返しは、こえた分の回数を overrun に
