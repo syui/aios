@@ -177,8 +177,15 @@ jobs:
           git -C out/hello -c user.name=ci -c user.email=ci@example.com commit -qm first
           git -C out/hello push http://ci:ci-pass-1234@127.0.0.1:3000/ci/hello.git main
           docker logs gitea-ci 2>&1 | grep -E 'hook/(pre|post)-receive/ci/hello.* 200 OK'
-          curl -fsS -u ci:ci-pass-1234 http://127.0.0.1:3000/api/v1/repos/ci/hello/commits | tee out/commits.json
-          grep -q "$(git -C out/hello rev-parse HEAD)" out/commits.json
+          # push のあとの記録 (リポジトリが空でなくなる) は gitea のうしろの queue で。それまで commits は 409
+          head=$(git -C out/hello rev-parse HEAD)
+          for i in $(seq 1 30); do
+            curl -fsS -u ci:ci-pass-1234 http://127.0.0.1:3000/api/v1/repos/ci/hello/commits > out/commits.json 2>/dev/null &&
+              grep -q "$head" out/commits.json && break
+            sleep 1
+          done
+          cat out/commits.json
+          grep -q "$head" out/commits.json
           # シェルとして使えるのは sh だけで、パッケージの道具はない
           if docker exec gitea-ci ap -V 2>/dev/null; then echo "aios-gitea has ap"; exit 1; fi
           docker rm -f gitea-ci
