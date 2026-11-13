@@ -472,6 +472,15 @@ docker compose build && docker compose up -d                      # envs/ と co
 - まだ: arm64 だけ (ai/at の本番の at は x86_64)。aios に Postgres と redis のパッケージはない (compose は
   postgres:18-alpine と redis:alpine)
 
+ai の chat と courier (git.syui.ai の ai/chat、ai/courier。ai/at の compose.yml の chat と courier) は docker/ai/NAME/Dockerfile
+(2026-11-13)。builder (ghcr.io/syui/aios) で `ap -Sy cargo base-devel openssl` (courier は protobuf も) と
+`. /etc/profile.d/cargo.sh && OPENSSL_STATIC=1 cargo build --release --locked`、動かすのは aios-cc (musl と libgcc_s と CA:
+upstream の gcr.io/distroless/cc-debian13 と同じところ)。aios の cargo は musl に動的にリンクするのが決まりで (proc-macro と
+build script もそれで作る。rust-lld では proc-macro の共有ライブラリをつなげない)、OpenSSL (openssl のパッケージは -fPIC の
+静的なライブラリ) と sqlite (rusqlite の bundled) は中に入る。CI (ai.yml) は固めた commit で作り、使うライブラリが libc.so
+(と libgcc_s.so.1) だけか、守りのまま (読むだけの根、cap なし、no-new-privileges、65532) 起こして /xrpc/_health、courier は
+Postgres といっしょに起こして表 (device_tokens) ができたかを見る。aios-chat は 14 MB
+
 ほかのものが前提にする C と C++ のライブラリ (2026-11-13):
 
 - openssl (pkg/c/openssl、OpenSSL 4.1.0): 静的な libssl.a と libcrypto.a、ヘッダー、pkg-config、静的な openssl を /opt/c に
