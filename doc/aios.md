@@ -477,7 +477,10 @@ docker compose build && docker compose up -d                      # envs/ と co
   alpine の Postgres で作ったデータ (uid 70) を使うときも chown -R。どちらも PostgreSQL 18 と musl)。image.yml は
   compose.yml そのもの (image だけその場で作ったもの) で database と redis を docker compose up --wait し、init.sql の DB、
   TCP の scram (まちがったパスワードは断る)、redis の BGSAVE が data/redis に書けること、65532・読むだけの根・cap なしを
-  たしかめる。plc のテストの Postgres も aios-postgres
+  たしかめる。plc のテストの Postgres も aios-postgres。ここで aish (image の /bin/sh) の set -e のちがいが出た:
+  /docker-entrypoint-initdb.d が空だと、entrypoint の for の中の `[ -e "$f" ] && ...` の番号 1 が for の番号になり、aish は
+  for のあとで終わっていた。POSIX、dash、bash と同じく、複合コマンド (for、case、if、{ } など。サブシェルと (( )) のほか)
+  の終わりの番号では -e と ERR の trap を見ないように直した (中のコマンドでもう見ている。test/aish-bash.txt)
 - まだ: arm64 だけ (ai/at の本番の at は x86_64)
 
 ai の chat と courier (git.syui.ai の ai/chat、ai/courier。ai/at の compose.yml の chat と courier) は docker/ai/NAME/Dockerfile

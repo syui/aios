@@ -300,7 +300,8 @@ jobs:
           docker network create plc-ci
           docker run -d --name database --network plc-ci "${db_sysctls[@]}" -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc \
             --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges aios-postgres:ci
-          for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d plc && break; sleep 2; done
+          for i in $(seq 1 30); do docker exec database pg_isready -h 127.0.0.1 -U postgres -d plc && break; sleep 2; done
+          docker logs database 2>&1 | tail -5
           docker run -d --name plc --network plc-ci "${plc_sysctls[@]}" -p 127.0.0.1:2582:3000 --init --read-only --tmpfs /tmp \
             --cap-drop ALL --security-opt no-new-privileges \
             -e ENABLE_MIGRATIONS=true -e DB_CREDS_JSON="$creds" -e DB_MIGRATE_CREDS_JSON="$creds" aios-plc:local

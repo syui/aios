@@ -577,10 +577,16 @@ impl Shell {
             st = (st == 0) as i32;
         }
         self.status = st;
-        if st != 0 && last && !p.neg && self.cond == 0 && self.flow == Flow::None {
+        // 複合コマンド (if、for、case、{ } など。サブシェルのほか) の終わりの番号では -e と ERR を見ない: 中のコマンドで
+        // もう見ている (POSIX: -e を見ないところ (&& の前など) のしくじりが複合コマンドの番号になっても、-e は効かない。
+        // dash と bash も同じ。前は for の中の `[ -e "$f" ] && ...` が空のディレクトリで 1 になり、for のあとで終わっていた:
+        // aios-postgres の entrypoint が /docker-entrypoint-initdb.d が空のときに止まった)
+        // (( 式 )) はコマンドと同じ (bash: 0 なら -e で終わる)
+        let compound = p.cmds.len() == 1 && matches!(&p.cmds[0], Cmd::Compound(c, _) if !matches!(**c, Compound::Subshell(_) | Compound::Arith(_)));
+        if st != 0 && last && !p.neg && !compound && self.cond == 0 && self.flow == Flow::None {
             trap::take_err();
         }
-        if self.errexit && st != 0 && last && !p.neg && self.cond == 0 && self.flow == Flow::None {
+        if self.errexit && st != 0 && last && !p.neg && !compound && self.cond == 0 && self.flow == Flow::None {
             exit_shell(st);
         }
         st

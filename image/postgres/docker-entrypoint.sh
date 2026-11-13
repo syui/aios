@@ -29,7 +29,7 @@ if [ "$1" = postgres ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
 		case "$f" in
 		*.sh) echo "postgres: running $f"; . "$f" ;;
 		*.sql) echo "postgres: running $f"; psql -v ON_ERROR_STOP=1 -h /tmp -U "$user" -d "$db" -f "$f" ;;
-		*) [ -e "$f" ] && echo "postgres: ignoring $f" ;;
+		*) if [ -e "$f" ]; then echo "postgres: ignoring $f"; fi ;;
 		esac
 	done
 	pg_ctl -D "$PGDATA" -m fast -w stop
