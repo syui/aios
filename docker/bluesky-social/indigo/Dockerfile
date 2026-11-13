@@ -10,10 +10,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -tags timetzdata -o /relay ./cmd/relay
 
 FROM ${AIOS} AS web
-RUN ap -Sy --noconfirm nodejs
+RUN ap -Sy --noconfirm nodejs pnpm
 WORKDIR /app
 COPY cmd/relay/relay-admin-ui/ ./
-RUN npm ci && npm run build
+RUN pnpm import && pnpm install --frozen-lockfile --config.node-linker=hoisted && pnpm run build
 
 FROM ${AIOS_STATIC}
 COPY --from=build --chown=65532:65532 /empty /data/relay

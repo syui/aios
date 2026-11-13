@@ -439,7 +439,9 @@ atproto のサービス (bluesky-social) を aios の image で動かす準備�
 名前にそろえて NAME/Dockerfile (atproto、did-method-plc、indigo、jetstream、ozone、social-app) と compose.yml。
 ai/at の Dockerfile と compose.yml (と hardening.yml) を土台に、ビルドは builder (ghcr.io/syui/aios)、動かすのは
 aios-node (libstdc++ 入り) と aios-static。node のものは `ENTRYPOINT []` と CMD の node (ai/at の compose の
-`command: node ...` がそのまま使える)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
+`command: node ...` がそのまま使える)。ai/at と同じく node 26 と pnpm にそろえる (atproto は corepack の pnpm、
+did-method-plc と social-app は repo の固めた版、ozone (upstream は yarn 4) と relay の admin UI (npm) は aios の pnpm で
+`pnpm import` してから: lockfile の版は固めたまま)。Go のもの (relay、jetstream、bskyweb) は aios の go で CGO_ENABLED=0 の静的な
 もの (relay の sqlite は使えない。ai/at の本番は Postgres)。social-app は devEngines の Node 24 (glibc のもの) を取って
 こないように、ビルドのときだけ onFail を warn にして aios の Node 26 で。compose.yml の envs/、configs/、data/、
 repos/ は ai/at と同じ置き場 (repos/NAME を context に、Dockerfile は ../../NAME/Dockerfile):
