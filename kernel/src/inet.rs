@@ -1563,6 +1563,12 @@ fn syn(u: &InetRef, in_call: bool) {
     }
     l.borrow_mut().acceptq.push_back(c);
     notify(&l);
+    // 外 (eth0) からも受ける待ち (0.0.0.0 などに bind したもの: ext_listen) の accept は、ネットワークの知らせ
+    // (net::chan) で眠っている。中どうしのつなぎが来たら、そちらも起こす (でないと、ほかのスレッドで accept して
+    // 眠っているもの (Rust の std や node のサーバー) が起きない)
+    if l.borrow().ext_listen.is_some() {
+        proc::wakeup(net::chan());
+    }
     notify(u);
 }
 

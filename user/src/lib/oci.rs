@@ -10,6 +10,9 @@
 //             /etc/ld-musl-aarch64.path、なければ /lib:/usr/local/lib:/usr/lib) で要るライブラリもいっしょに。
 //             ディレクトリなら中をみな、リンクはその先も
 //   config    OCI の config (Entrypoint、Cmd、User、WorkingDir、Env ...)
+//   add       自分のファイル: [{"from": DEF のところからのパス, "to": image の中のパス}] (ファイル、ディレクトリ、リンク)。
+//             いちばん上の層に入れ、ELF なら要るライブラリを packages からたどる (静的なものは何も足さない)
+//   version   タグ (なければ packages のはじめのものの版。packages がなければ latest)
 //   install   true ならパッケージをまるごと入れ、aipkg と同じ入れた記録 (/var/lib/aipkg/local/NAME-VER の desc、files、
 //             install) をそのパッケージの層に書く (土台の層は作らない: base パッケージが /etc や /tmp を持つ)。
 //             image/aios.json (builder: docker build の FROM にして ap -Sy で足す)
@@ -17,7 +20,8 @@
 // /lib → usr/lib)、あとはパッケージごとに 1 層 (依存が先。同じパッケージの同じファイルなら、ほかの image と同じ層)。
 // 入れたファイルのパッケージの usr/share/licenses も入れる。どのパッケージのどの版かは、層と image の annotation
 // (ai.syui.aios.package、ai.syui.aios.packages) に書く (image から、どのパッケージのどの版かがわかる)。
-// 時刻はパッケージのもの (土台は 0、image はパッケージのいちばん新しい BUILDDATE)、持ち主は 0 (nonroot の家だけ 65532)、
+// 時刻はパッケージのもの (土台は 0、image はパッケージのいちばん新しい BUILDDATE。SOURCE_DATE_EPOCH があればそれ)、
+// 持ち主は 0 (nonroot の家だけ 65532)、
 // 名前の順、gzip に時刻を入れない: 同じパッケージからはいつも同じ digest。
 // OUT が .tar なら OCI archive (docker load、skopeo copy oci-archive:)、ほかは OCI layout のディレクトリ。既定は NAME.tar。
 // パッケージは /etc/aipkg.conf (--conf) の Server から取る。置き場は $XDG_CACHE_HOME/aipkg か ~/.cache/aipkg
@@ -182,6 +186,45 @@ fn extract(path: &str, root: &str, layer: usize, meta: &mut BTreeMap<String, Met
         }
     }
     Ok(pkg)
+}
+
+/// add の from (ファイル、ディレクトリ、リンク) を根の to へ写し、meta に (層は layer)
+fn copy_add(from: &std::path::Path, to: &str, root: &str, layer: usize, mtime: u64, meta: &mut BTreeMap<String, Meta>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let m = fs::symlink_metadata(from)?;
+    let dst = format!("{}/{}", root, to);
+    // とちゅうのディレクトリ (パッケージになければ、この層に)
+    let mut q = parent(to).to_string();
+    while !q.is_empty() {
+        fs::create_dir_all(format!("{}/{}", root, q))?;
+        meta.entry(q.clone()).or_insert(Meta { kind: Kind::Dir, mode: 0o755, mtime, layer });
+        q = parent(&q).to_string();
+    }
+    if let Some(p) = std::path::Path::new(&dst).parent() {
+        fs::create_dir_all(p)?;
+    }
+    // 根の中の同じところにあるもの (パッケージのもの) は置きかえる
+    if let Ok(old) = fs::symlink_metadata(&dst)
+        && !(old.is_dir() && m.is_dir())
+    {
+        if old.is_dir() { fs::remove_dir_all(&dst)? } else { fs::remove_file(&dst)? }
+    }
+    if m.file_type().is_symlink() {
+        meta.insert(to.to_string(), Meta { kind: Kind::Link(fs::read_link(from)?.to_string_lossy().to_string()), mode: 0o777, mtime, layer });
+    } else if m.is_dir() {
+        fs::create_dir_all(&dst)?;
+        meta.insert(to.to_string(), Meta { kind: Kind::Dir, mode: 0o755, mtime, layer });
+        let mut names: Vec<_> = fs::read_dir(from)?.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for n in names {
+            copy_add(&from.join(&n), &format!("{}/{}", to, n.to_string_lossy()), root, layer, mtime, meta)?;
+        }
+    } else {
+        fs::copy(from, &dst)?;
+        let mode = if m.permissions().mode() & 0o111 != 0 { 0o755 } else { 0o644 };
+        meta.insert(to.to_string(), Meta { kind: Kind::File, mode, mtime, layer });
+    }
+    Ok(())
 }
 
 impl Image {
@@ -479,7 +522,22 @@ pub fn main(args: &[String]) {
     let (pkgs, files) = (strs("packages"), strs("files"));
     // install: パッケージをまるごと入れて、入れたことを記録する (builder: その中で ap -S が使える)
     let install = d["install"].as_bool().unwrap_or(false);
-    if pkgs.is_empty() {
+    // add: 自分のファイル ([{"from": DEF のところからのパス, "to": image の中のパス}])。いちばん上の層に入れ、ELF なら
+    // 要るライブラリを packages からたどる
+    let def_dir = std::path::Path::new(&def).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let adds: Vec<(std::path::PathBuf, String)> = d["add"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| {
+            let (Some(from), Some(to)) = (a["from"].as_str(), a["to"].as_str()) else { die(format!("{}: add needs from and to", def)) };
+            if !to.starts_with('/') {
+                die(format!("{}: add: {} is not an absolute path", def, to));
+            }
+            (def_dir.join(from), to.to_string())
+        })
+        .collect();
+    if pkgs.is_empty() && adds.is_empty() {
         die(format!("{}: no packages", def));
     }
     let repos = parse_conf(&conf);
@@ -532,6 +590,16 @@ pub fn main(args: &[String]) {
         };
         infos.push(extract(&path, &root, k + 1, &mut meta).unwrap_or_else(|e| die(format!("{}: {}", file, e))));
     }
+    // 時刻: SOURCE_DATE_EPOCH があればそれ (reproducible-builds.org と同じ)
+    if let Some(t) = std::env::var("SOURCE_DATE_EPOCH").ok().and_then(|v| v.parse().ok()) {
+        built = t;
+    }
+    // add (層は packages のあと)。持ち主は 0、mode は実行できるものは 0755、ほかは 0644 (作ったマシンの umask に
+    // よらない)、時刻は built
+    let add_layer = order.len() + 1;
+    for (from, to) in &adds {
+        copy_add(from, &norm(to), &root, add_layer, built, &mut meta).unwrap_or_else(|e| die(format!("add {}: {}", from.display(), e)));
+    }
 
     // 土台 (層 0): ユーザー、os-release、/tmp、家、/lib → usr/lib (aios のローダーは /lib/ld-musl-aarch64.so.1)。
     // 時刻は 0 (どの image でも同じ層: 分けあえる)
@@ -569,6 +637,9 @@ pub fn main(args: &[String]) {
     for f in &files {
         img.add(f, "files");
     }
+    for (_, to) in &adds {
+        img.add(to, "add");
+    }
     // 入れたファイルのパッケージの usr/share/licenses
     let used: BTreeSet<usize> = img.want.iter().filter_map(|p| img.meta.get(p).map(|m| m.layer)).collect();
     for (k, n) in order.iter().enumerate() {
@@ -579,7 +650,7 @@ pub fn main(args: &[String]) {
     }
 
     // 層ごとに: 入れるものと、その親のディレクトリ (土台にあるものは土台に)
-    let mut layers: Vec<Vec<(String, Meta, Option<String>)>> = vec![vec![]; order.len() + 1];
+    let mut layers: Vec<Vec<(String, Meta, Option<String>)>> = vec![vec![]; order.len() + 2];
     let base_paths: BTreeSet<String> = base.iter().map(|(p, _, _)| p.clone()).collect();
     for p in &img.want {
         if base_paths.contains(p) {
@@ -660,10 +731,16 @@ pub fn main(args: &[String]) {
         if l.is_empty() {
             continue;
         }
-        let what = if k == 0 { "aios base (users, os-release, /tmp)".to_string() } else { format!("{} {}", order[k - 1], get(&sync[&order[k - 1]].1, "VERSION")) };
+        let what = if k == 0 {
+            "aios base (users, os-release, /tmp)".to_string()
+        } else if k == add_layer {
+            "add".to_string()
+        } else {
+            format!("{} {}", order[k - 1], get(&sync[&order[k - 1]].1, "VERSION"))
+        };
         let (digest, size, diff) = write_layer(&blobs, l, &root).unwrap_or_else(|e| die(format!("image: layer {}: {}", what, e)));
         let mut desc = json!({"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": format!("sha256:{}", digest), "size": size});
-        if k > 0 {
+        if k > 0 && k != add_layer {
             desc["annotations"] = json!({"ai.syui.aios.package": what});
             names.push(what.replace(' ', "="));
         }
@@ -672,8 +749,15 @@ pub fn main(args: &[String]) {
         diffs.push(format!("sha256:{}", diff));
         history.push(json!({"created": created, "created_by": format!("ap image: {}", what)}));
     }
-    let version = get(&sync[&provider(&sync, &pkgs[0])].1, "VERSION").rsplit_once('-').map_or("", |(v, _)| v).to_string();
-    let version = version.split_once(':').map_or(version.as_str(), |(_, v)| v).to_string();
+    // 版 (タグ): DEF の version か、packages のはじめのものの版 (pkgrel と epoch をのぞく)
+    let version = match d["version"].as_str() {
+        Some(v) => v.to_string(),
+        None if pkgs.is_empty() => "latest".to_string(),
+        None => {
+            let v = get(&sync[&provider(&sync, &pkgs[0])].1, "VERSION").rsplit_once('-').map_or("", |(v, _)| v).to_string();
+            v.split_once(':').map_or(v.as_str(), |(_, v)| v).to_string()
+        }
+    };
     // 中身の名前と出どころ (docker inspect の Labels。ghcr.io は source でリポジトリにつなぐ)。DEF の config.Labels が勝つ
     let source = "https://github.com/syui/aios";
     let about = d.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();

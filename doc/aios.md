@@ -345,7 +345,10 @@ ap image [--conf FILE] [-o OUT] DEF.json   # OUT が .tar なら OCI のアー�
 ```
 
 - DEF (image/*.json): `name`、`packages` (依存もたどる)、`files` (要るもの)、`config` (OCI の config:
-  Entrypoint、User、Env など)。files がディレクトリならその下ぜんぶ
+  Entrypoint、User、Env など)。files がディレクトリならその下ぜんぶ。`add` は自分でビルドしたもの
+  (`[{"from": "target/release/serve", "to": "/usr/local/bin/serve"}]`。from は DEF のところから) をいちばん上の層に入れ、
+  ELF なら要るライブラリを packages からたどる。`version` はタグ (なければ packages のはじめのものの版)。時刻は
+  `SOURCE_DATE_EPOCH` があればそれ
 - ELF をたどる: files の ELF の PT_INTERP (/lib/ld-musl-aarch64.so.1)、DT_NEEDED を RPATH・RUNPATH ($ORIGIN)、
   /etc/ld-musl-aarch64.path、/lib:/usr/local/lib:/usr/lib の順にさがして入れる (musl の libc・libpthread・libm などの名前は
   ld-musl 自身なのでさがさない)。シンボリックリンクはたどった先と両方。見つからなければ止まる
@@ -389,6 +392,18 @@ docker compose -f docker/compose.yml up -d --build
   curl も sh もない)、コンテナの NET の namespace の sysctls (redirect と source route を受けない、ping_group_range、
   ip_forward。net.mptcp.enabled は MPTCP のないカーネルでは消す)
 - serve: 読み書きは 5 秒で切る、頭は 8 KiB まで、同時に 64 まで (ほかは 503)、GET と HEAD のほかは 405、nosniff と no-store
+
+docker なしで aios の上だけで作るなら docker/serve.json (add):
+
+```bash
+cd docker && cargo build --release && ap image -o serve.tar serve.json && aibox --image ./serve.tar
+```
+
+serve は静的なら 223 KB の image (土台と add の層だけ)。cargo が base-devel の cc で動的にリンクしたら、ELF をたどって
+musl の libc.so と libgcc_s が入る (packages の musl と libunwind から)。2026-11-13 に aios の VM でたしかめた
+(`aibox --image ./serve.tar` の serve に 127.0.0.1 と 10.0.2.15 から GET して 200)。このとき、0.0.0.0 で待つサーバーの
+ほかのスレッドで眠っている accept が、中どうしのつなぎで起きないのを直した (外からも受ける待ちはネットワークの知らせで
+眠っていた。Rust の std や node のサーバーの形。test/anybind.c が Linux 7.4 と 46 行同じ)。
 
 CI (image.yml) は、その場で作った aios と aios-static で docker/ を docker build し、compose の守りのまま起こして、healthy、
 curl、405、`docker inspect` (65532、読むだけ、cap なし、no-new-privileges)、`docker top` (中は 65532) をたしかめる。

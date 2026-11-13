@@ -1,0 +1,12 @@
+{
+  "name": "serve",
+  "version": "0.1.0",
+  "packages": ["musl", "libunwind"],
+  "add": [{"from": "target/release/serve", "to": "/usr/local/bin/serve"}],
+  "config": {
+    "Entrypoint": ["/usr/local/bin/serve"],
+    "User": "65532:65532",
+    "WorkingDir": "/home/nonroot",
+    "ExposedPorts": {"8080/tcp": {}}
+  }
+}
