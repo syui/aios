@@ -16,6 +16,9 @@
 //   mixrace   4 つのプロセスが同時に、中身のあるファイルとハードリンクのあるファイルを作って消す。終わったら空で、
 //             空いている inode とブロックの数 (statfs) がはじめと同じ
 //   inotify   IN_CREATE と IN_DELETE の見張りを置いたディレクトリでは、作った数と消した数だけできごとが来る
+//   otherns   ほかのマウントの namespace (コンテナ: unshare して、ディレクトリを読むだけに bind しなおす) の中では作ると
+//             EROFS。そのあいだも、こちらの namespace では作って消せて、aios ならロックなしの道を通る (読むだけのマウントが
+//             あるあいだはふつうの道だが、見るのははじめの namespace のものだけ)。unshare やマウントができなければ飛ばす
 // aios なら /proc/bkl の「作った」「消した」の数が増えたか (ロックなしの道を通ったか) も見る。Linux でも同じに通る。
 // 1 行に ok NAME か FAIL NAME、おしまいに createrace: N failed
 //   createrace [DIR...]   DIR (既定 /tmp) ごとに、その下に cr-PID を作って
@@ -29,7 +32,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -392,6 +397,70 @@ static void inotify_case(void) {
   rmdir(d);
 }
 
+static int write_file(const char *p, const char *s) {
+  int fd = open(p, O_WRONLY);
+  if (fd < 0) return -1;
+  int ok = write(fd, s, strlen(s)) == (ssize_t)strlen(s);
+  close(fd);
+  return ok ? 0 : -1;
+}
+
+static void otherns(int ext4) {
+  const char *d = at(2, "ons");
+  mkdir(d, 0755);
+  int up[2], down[2];
+  if (pipe(up) < 0 || pipe(down) < 0) {
+    CHECK("otherns", 0);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(up[0]);
+    close(down[1]);
+    char r = 'm';
+    if (unshare(CLONE_NEWNS) < 0) {
+      char map[64];
+      uid_t uid = getuid();
+      gid_t gid = getgid();
+      if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) {
+        r = 's';
+        goto out;
+      }
+      snprintf(map, sizeof map, "0 %d 1\n", (int)uid);
+      write_file("/proc/self/uid_map", map);
+      write_file("/proc/self/setgroups", "deny");
+      snprintf(map, sizeof map, "0 %d 1\n", (int)gid);
+      write_file("/proc/self/gid_map", map);
+    }
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0 || mount(d, d, NULL, MS_BIND, NULL) < 0 || mount(NULL, d, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) goto out;
+    r = touch(at(3, "ons/in")) == -EROFS ? 'r' : 'w';
+  out:
+    if (write(up[1], &r, 1) != 1) _exit(1);
+    // こちらが終わるまで namespace (と読むだけのマウント) を残す
+    if (read(down[0], &r, 1) < 0) _exit(1);
+    _exit(0);
+  }
+  close(up[1]);
+  close(down[0]);
+  char r = 0;
+  if (read(up[0], &r, 1) != 1) r = 0;
+  if (r == 's' || r == 'm') {
+    printf("ok %s otherns (skipped: %s)\n", label, r == 's' ? "unshare" : "mount");
+  } else {
+    CHECK("otherns-erofs", r == 'r');
+    long c0 = fast_count("作った"), u0 = fast_count("消した");
+    int ok = 1;
+    for (int i = 0; i < 20; i++) ok &= touch(at(3, "ons/f%d", i)) == 0 && unlink(at(3, "ons/f%d", i)) == 0;
+    long c1 = fast_count("作った"), u1 = fast_count("消した");
+    CHECK("otherns-write", ok);
+    if (ext4 && c0 >= 0) CHECK("otherns-fast-path", c1 > c0 && u1 > u0);
+  }
+  close(down[1]);
+  waitpid(pid, NULL, 0);
+  close(up[0]);
+  rmdir(d);
+}
+
 int main(int argc, char **argv) {
   const char *dirs_def[] = {"/tmp"};
   const char **dirs = argc > 1 ? (const char **)argv + 1 : dirs_def;
@@ -419,6 +488,7 @@ int main(int argc, char **argv) {
     long c1 = fast_count("作った"), u1 = fast_count("消した");
     // aios の ext4 なら、ロックなしの道を通ったはず (inotify の見張りを置くと、それからはふつうの道)
     if (ext4 && c0 >= 0) CHECK("fast-path", c1 > c0 && u1 > u0);
+    otherns(ext4);
     inotify_case();
     rmdir(base);
   }

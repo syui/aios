@@ -461,26 +461,31 @@ pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result
     mount_ro(path, fsroot, source, fstype, false)
 }
 
-/// どこかの表に読むだけのマウントがある (大きなロックなしの作る・消す (fastdir.rs) は、あるあいだはふつうの道で:
-/// EROFS を決める check_writable はマウントの表を見る)。置くときは印を立ててから ext4 のロックを取る。外したとき、
-/// remount で書けるようにしたとき、namespace が消えたときに数えなおす (前は一度立つと立ったままで、test/mountinfo.c の
-/// あとの test/createrace.c が速い道を使えなかった)
+/// はじめのマウントの namespace の表に読むだけのマウントがある (大きなロックなしの開く・作る・消す (fastdir.rs) は、ある
+/// あいだはふつうの道で: EROFS を決める check_writable はマウントの表を見る)。速い道を使うのは、はじめの namespace で
+/// chroot していないプロセスだけ (statc::usable) なので、ほかの namespace (aibox --image の読むだけの根など) の ro は
+/// 見ない (前はどの表のものでも立ち、コンテナが動いているあいだは外のプロセスも速い道を使えなかった)。置くときは印を
+/// 立ててから ext4 のロックを取る。外したとき、remount で書けるようにしたときに数えなおす (前は一度立つと立ったままで、
+/// test/mountinfo.c のあとの test/createrace.c が速い道を使えなかった)
 pub static RO_MOUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// RO_MOUNTED を数えなおす (生きている表のどれかに ro のマウントがあるか)
+/// RO_MOUNTED を数えなおす (はじめの namespace の表に ro のマウントがあるか)
 fn ro_refresh() {
-    let mut tables = alloc::vec![init_mnt()];
-    tables.extend(ALL_MNT.get().iter().filter_map(|w| w.upgrade()));
-    let any = tables.iter().any(|t| t.list.try_borrow().map_or(true, |l| l.iter().any(|m| m.ro)));
+    let any = init_mnt().list.try_borrow().map_or(true, |l| l.iter().any(|m| m.ro));
     RO_MOUNTED.store(any, core::sync::atomic::Ordering::SeqCst);
 }
 
-impl Drop for MountNs {
-    fn drop(&mut self) {
-        // この表の ro のマウントがなくなる (ALL_MNT のこれはもう upgrade できない)
-        if self.list.get_mut().iter().any(|m| m.ro) {
-            ro_refresh();
-        }
+/// ns がはじめのマウントの namespace の表か
+fn is_init_mnt(ns: &Rc<MountNs>) -> bool {
+    Rc::ptr_eq(ns, &init_mnt())
+}
+
+/// はじめの namespace の表に ro のマウントを置く前に: 印を立ててから ext4 のロックを取って、いま速い道で書きかえて
+/// いるものが終わるのを待つ
+fn ro_mark(ns: &Rc<MountNs>) {
+    if is_init_mnt(ns) {
+        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
+        drop(crate::smp::fs_lock());
     }
 }
 
@@ -528,12 +533,12 @@ fn containing(l: &[Mount], path: &str, before: usize) -> Option<usize> {
 }
 
 fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+    let ns = current_mnt();
     if ro {
-        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
-        drop(crate::smp::fs_lock());
+        ro_mark(&ns);
     }
     let (target, dir) = lookup("", path, true)?;
-    current_mnt().list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro });
+    ns.list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro });
     // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
     mount_at_refresh();
     names_changed();
@@ -598,8 +603,7 @@ pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
     let mut l = ns.list.borrow_mut();
     let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
     if ro {
-        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
-        drop(crate::smp::fs_lock());
+        ro_mark(&ns);
     }
     m.ro = ro;
     drop(l);
