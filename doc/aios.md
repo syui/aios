@@ -476,7 +476,9 @@ docker compose build && docker compose up -d                      # envs/ と co
 
 - openssl (pkg/c/openssl、OpenSSL 4.1.0): 静的な libssl.a と libcrypto.a、ヘッダー、pkg-config、静的な openssl を /opt/c に
   (OPENSSLDIR は /etc/ssl)。Rust の native-tls / openssl-sys (reqwest の既定: ai/chat、ai/courier) は、builder で
-  `ap -Sy cargo base-devel openssl` すれば静的にリンクし、できたものは OpenSSL を持ち歩かない (aios-static で動く)。
+  `ap -Sy cargo base-devel openssl` と `. /etc/profile.d/cargo.sh && OPENSSL_STATIC=1 cargo build` で OpenSSL を中に
+  静的に入れる (cargo.sh は musl への動的リンクが既定: OPENSSL_STATIC がないと openssl-sys は libssl.so を探して止まる)。
+  できたものは musl の libc と libgcc_s だけを使い、aios-cc で動く (docker/ai と ai.yml)。
   ai/chat をクロスで作り、aios の VM で /xrpc/_health まで。s_server と s_client は TLS 1.3 (X25519MLKEM768)
 - go (pkg/c/go、Go 1.27.4): 公式の linux-arm64 (静的) を /opt/c/go に。GOTOOLCHAIN=local。aios の VM で net/http を
   使うものを CGO_ENABLED=0 でビルドして動く

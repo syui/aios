@@ -6,7 +6,7 @@ RUN ap -Sy --noconfirm cargo base-devel openssl && mkdir /empty
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN . /etc/profile.d/cargo.sh && cargo build --release --locked
+RUN . /etc/profile.d/cargo.sh && OPENSSL_STATIC=1 cargo build --release --locked
 
 FROM ${AIOS_CC}
 COPY --from=build --chown=65532:65532 /empty /data

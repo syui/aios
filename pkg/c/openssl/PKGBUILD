@@ -2,8 +2,9 @@
 #   ものがある (Rust の native-tls / openssl-sys: reqwest の既定、ai/chat と ai/courier。Python の ssl など)。
 #   暗号は自作しない方針なので、版とチェックサムを固定して上流のものを入れる。
 #   静的なライブラリ (libssl.a、libcrypto.a) とヘッダー、pkg-config と cmake のファイル、静的な openssl を /opt/c に。
-#   静的なものしかないので、openssl-sys は何も言わなくても静的にリンクする (できたものは OpenSSL を持ち歩かない:
-#   distroless の aios-static でも動く)。legacy などの provider もライブラリの中に (no-module)。
+#   静的なものしかないので、openssl-sys には OPENSSL_STATIC=1 で静的にリンクさせる (aios の cargo は動的リンクが既定
+#   (cargo.sh) で、openssl-sys はそのとき libssl.so を探して見つからずに止まる)。できたものは OpenSSL を持ち歩かない。
+#   legacy などの provider もライブラリの中に (no-module)。
 #   設定と CA は /etc/ssl (OPENSSLDIR): CA は ca-certificates の /etc/ssl/cert.pem と /etc/ssl/certs
 #   作るのに perl が要る (Configure と、アセンブリを書き出す perlasm)
 pkgname=openssl

@@ -8,7 +8,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY proto ./proto
 COPY src ./src
-RUN . /etc/profile.d/cargo.sh && cargo build --release --locked
+RUN . /etc/profile.d/cargo.sh && OPENSSL_STATIC=1 cargo build --release --locked
 
 FROM ${AIOS_CC}
 COPY --from=build /app/target/release/courier /usr/local/bin/courier
