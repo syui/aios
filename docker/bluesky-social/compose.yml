@@ -59,8 +59,9 @@ x-edge-app: &edge-app
 services:
   database:
     <<: [*no-ipv6, *hardening]
-    image: postgres:18-alpine
+    image: ghcr.io/syui/aios-postgres:18.7@sha256:c2ba1514ab54943af4836197ba54679af394f2bbc2eeecbc347048031a82d5f8
     restart: always
+    cap_drop: [ALL]
     env_file:
       - ./envs/postgres
     volumes:
@@ -69,7 +70,6 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-      - /run/postgresql
     healthcheck:
       test: "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"
       interval: 5s
@@ -77,8 +77,9 @@ services:
 
   redis:
     <<: [*no-ipv6, *hardening, *ro]
-    image: redis:alpine
+    image: ghcr.io/syui/aios-redis:8.10.3@sha256:74e449387bd62defaa928d5b8d894ad1b4404ddd0125e4be292e26dcd61e1dfd
     restart: always
+    cap_drop: [ALL]
     volumes:
       - ./data/redis/:/data/
     healthcheck:

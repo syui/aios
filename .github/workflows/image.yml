@@ -243,6 +243,40 @@ jobs:
           docker rm -f pg-ci
           docker volume rm pg-ci
 
+      - name: Test compose database and redis (docker/bluesky-social)
+        run: |
+          # compose.yml のまま (守り、env_file、configs と data の置き場、healthcheck) で、image だけここで作ったものに
+          c=docker/bluesky-social
+          pw="ci-$(openssl rand -hex 8)"
+          mkdir -p $c/envs $c/configs/postgres/init $c/data/postgres $c/data/redis
+          for f in plc pds bsky bsync bgs social-app ozone jetstream; do : > $c/envs/$f; done
+          printf 'POSTGRES_USER=pg\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=healthcheck\n' "$pw" > $c/envs/postgres
+          printf 'CREATE DATABASE pds;\nCREATE DATABASE bsky;\n' > $c/configs/postgres/init/init.sql
+          # 中は 65532 で動く (root で起きて chown しない) ので、data の置き場は 65532 のものに
+          sudo chown 65532:65532 $c/data/postgres $c/data/redis
+          printf 'services:\n  database:\n    image: aios-postgres:ci\n  redis:\n    image: aios-redis:ci\n' > out/compose-ci.yml
+          dc() { docker compose -f $c/compose.yml -f out/compose-ci.yml "$@"; }
+          dc up -d --wait database redis || { dc logs database redis | tail -40; exit 1; }
+          dc ps
+          # healthcheck は Unix ソケットなので、初めの (TCP なしの) あいだも通る。TCP で待つ
+          for i in $(seq 1 30); do dc exec -T database pg_isready -h 127.0.0.1 -U pg -d healthcheck && break; sleep 2; done
+          dc exec -T -e PGPASSWORD="$pw" database psql -h 127.0.0.1 -U pg -d pds -Atc \
+            "SELECT datname FROM pg_database WHERE datname IN ('pds','bsky','healthcheck') ORDER BY 1" | tee out/compose-dbs.log
+          [ "$(tr '\n' ' ' < out/compose-dbs.log)" = "bsky healthcheck pds " ]
+          if dc exec -T -e PGPASSWORD=wrong database psql -h 127.0.0.1 -U pg -d pds -c 'select 1'; then exit 1; fi
+          dc exec -T redis redis-cli set k aios
+          [ "$(dc exec -T redis redis-cli get k)" = aios ]
+          dc exec -T redis redis-cli bgsave
+          for i in $(seq 1 20); do dc exec -T redis redis-cli info persistence | grep -q 'rdb_bgsave_in_progress:0' && break; sleep 1; done
+          dc exec -T redis redis-cli info persistence | grep 'rdb_last_bgsave_status:ok'
+          sudo ls -ln $c/data/redis/dump.rdb $c/data/postgres/18/docker/PG_VERSION
+          for s in database redis; do
+            docker inspect -f "$s user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}" "$(dc ps -q $s)" | tee -a out/compose-inspect.log
+          done
+          [ "$(grep -c 'user=65532:65532 ro=true cap_drop=\[ALL\]' out/compose-inspect.log)" = 2 ]
+          dc down
+          sudo rm -rf $c/data $c/configs $c/envs
+
       - name: Test plc (docker/bluesky-social/did-method-plc)
         run: |
           # atproto の DID PLC (did-method-plc)。builder (aios) で pnpm の install と build、aios-node で動かす
@@ -264,7 +298,8 @@ jobs:
           printf '%s\n' "${db_sysctls[@]}" | tee out/plc-sysctls.log
           grep -qx -- '--sysctl=net.ipv4.conf.all.accept_redirects=0' out/plc-sysctls.log
           docker network create plc-ci
-          docker run -d --name database --network plc-ci "${db_sysctls[@]}" -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc postgres:18-alpine
+          docker run -d --name database --network plc-ci "${db_sysctls[@]}" -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=plc \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges aios-postgres:ci
           for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d plc && break; sleep 2; done
           docker run -d --name plc --network plc-ci "${plc_sysctls[@]}" -p 127.0.0.1:2582:3000 --init --read-only --tmpfs /tmp \
             --cap-drop ALL --security-opt no-new-privileges \
@@ -288,7 +323,7 @@ jobs:
             console.log(did, JSON.stringify(data));
             if (!did.startsWith("did:plc:") || data.alsoKnownAs[0] !== "at://ci.example.com") process.exit(1);'
           docker exec plc node -e 'const f = (i, k) => require("fs").readFileSync(`/proc/sys/net/ipv6/conf/${i}/${k}`, "utf8").trim(); for (const i of ["all", "default", "lo", "eth0"]) console.log(i, ["disable_ipv6", "accept_ra", "accept_redirects", "accept_source_route", "forwarding"].map((k) => `${k}=${f(i, k)}`).join(" ")); const v6 = Object.entries(require("os").networkInterfaces()).filter(([n]) => n !== "lo").flatMap(([, a]) => a).filter((a) => a.family === "IPv6"); console.log("ipv6 (lo のほか)", v6.length); if (f("eth0", "disable_ipv6") !== "1" || v6.length) process.exit(1)'
-          docker exec database cat /proc/sys/net/ipv6/conf/eth0/disable_ipv6 | grep -qx 1
+          docker exec database coreutils cat /proc/sys/net/ipv6/conf/eth0/disable_ipv6 | grep -qx 1
           docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}' plc | tee out/plc-inspect.log
           grep -q 'user=65532:65532 ro=true cap_drop=\[ALL\]' out/plc-inspect.log
           docker rm -f plc database

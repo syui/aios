@@ -456,6 +456,8 @@ repos/ は ai/at と同じ置き場 (repos/NAME を context に、Dockerfile は
 ```bash
 cd docker/bluesky-social
 git clone https://github.com/bluesky-social/atproto repos/atproto   # ほかも同じ (did-method-plc は did-method-plc/did-method-plc)
+mkdir -p data/postgres data/redis
+sudo chown -R 65532:65532 data/postgres data/redis                 # database と redis は 65532 で動く
 docker compose build && docker compose up -d                      # envs/ と configs/ は ai/at のもの
 ```
 
@@ -469,8 +471,14 @@ docker compose build && docker compose up -d                      # envs/ と co
   base-devel の cc / c++ が node-gyp の -Wl,--exclude-libs を外すようにした
 - aios の VM でも did-method-plc を pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを変える
   まで通った
-- まだ: arm64 だけ (ai/at の本番の at は x86_64)。aios に Postgres と redis のパッケージはない (compose は
-  postgres:18-alpine と redis:alpine)
+- database と redis は aios の image (ghcr.io/syui/aios-postgres、aios-redis。digest で固める。2026-11-13)。公式の
+  postgres:18-alpine と redis:alpine は root で起きて data を chown してから下りるが、aios のものははじめから 65532 で、
+  cap もいらない (compose は cap_drop: ALL)。そのかわり data/postgres と data/redis は 65532 のものにしておく (公式の
+  alpine の Postgres で作ったデータ (uid 70) を使うときも chown -R。どちらも PostgreSQL 18 と musl)。image.yml は
+  compose.yml そのもの (image だけその場で作ったもの) で database と redis を docker compose up --wait し、init.sql の DB、
+  TCP の scram (まちがったパスワードは断る)、redis の BGSAVE が data/redis に書けること、65532・読むだけの根・cap なしを
+  たしかめる。plc のテストの Postgres も aios-postgres
+- まだ: arm64 だけ (ai/at の本番の at は x86_64)
 
 ai の chat と courier (git.syui.ai の ai/chat、ai/courier。ai/at の compose.yml の chat と courier) は docker/ai/NAME/Dockerfile
 (2026-11-13)。builder (ghcr.io/syui/aios) で `ap -Sy cargo base-devel openssl` (courier は protobuf も) と
