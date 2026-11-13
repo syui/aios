@@ -5,11 +5,11 @@ FROM ${AIOS} AS build
 RUN ap -Sy --noconfirm nodejs pnpm base-devel python
 WORKDIR /usr/src/ozone
 COPY . .
-RUN printf 'allowBuilds:\n  esbuild: true\n  unrs-resolver: true\n  sharp: true\n  protobufjs: true\n  core-js: false\n  cypress: false\n' > pnpm-workspace.yaml
-RUN node -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync("package.json"));delete p.packageManager;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' && pnpm import && pnpm install --frozen-lockfile --shamefully-hoist
+RUN printf 'nodeLinker: hoisted\nallowBuilds:\n  esbuild: true\n  unrs-resolver: true\n  sharp: true\n  protobufjs: true\n  core-js: false\n  cypress: false\n' > pnpm-workspace.yaml
+RUN node -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync("package.json"));delete p.packageManager;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' && pnpm import && pnpm install --frozen-lockfile
 RUN pnpm build
 RUN rm -rf node_modules .next/cache pnpm-lock.yaml yarn.lock && mv service/package.json package.json && mv service/yarn.lock yarn.lock
-RUN node -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync("package.json"));delete p.packageManager;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' && pnpm import && pnpm install --prod --frozen-lockfile --shamefully-hoist
+RUN node -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync("package.json"));delete p.packageManager;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' && pnpm import && pnpm install --prod --frozen-lockfile
 
 FROM ${AIOS_NODE}
 WORKDIR /usr/src/ozone

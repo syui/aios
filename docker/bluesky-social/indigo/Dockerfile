@@ -13,7 +13,7 @@ FROM ${AIOS} AS web
 RUN ap -Sy --noconfirm nodejs pnpm
 WORKDIR /app
 COPY cmd/relay/relay-admin-ui/ ./
-RUN pnpm import && pnpm install --frozen-lockfile --config.node-linker=hoisted && pnpm run build
+RUN pnpm import && pnpm install --frozen-lockfile && pnpm run build
 
 FROM ${AIOS_STATIC}
 COPY --from=build --chown=65532:65532 /empty /data/relay
