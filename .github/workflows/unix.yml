@@ -204,6 +204,14 @@ jobs:
 
           exit: `sudo poweroff`
           NOTES
+          # GITHUB_TOKEN は .github/workflows を書きかえられない。main がこのコミットより先にあって、ワークフローの
+          # ファイルがちがうと、このコミットに latest の tag を作るのが 403 (Resource not accessible by integration) に
+          # なる (古いコミットのやりなおし。2026-11-12 にこれでリリースが消えたままになった)。消す前に気づいて止まる
+          git fetch -q origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ] && ! git diff --quiet "$GITHUB_SHA" origin/main -- .github/workflows; then
+            echo "::error::main ($(git rev-parse --short origin/main)) の .github/workflows がこのコミットとちがうので、GITHUB_TOKEN ではこのコミットに latest の tag を作れない。main で unix.yml を動かす (workflow_dispatch)"
+            exit 1
+          fi
           # 前の名前 (unix-latest) のリリースがのこっていれば、それも消す
           for t in latest unix-latest; do gh release delete "$t" --yes --cleanup-tag || true; done
           # GitHub の Latest の印はこれに (linux ブランチの release linux は --latest=false で取らない)
