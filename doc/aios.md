@@ -3215,7 +3215,8 @@ inet_connection_sock.c と同じ考え)。Linux とちがうところが大事�
 (eth0) の相手にだけ使う。表も端から探さない: ポートの表 (ポートごとに bind した順の番号で)、listen しているものだけの表、
 時刻の表 (SYN のやりなおしと TIME_WAIT の終わりを時刻の順に。tick は時刻の来たものだけを見る)、fd のないものの表。だから
 TIME_WAIT やつながりがいくつあっても、socket、connect、accept、close の手間は変わらない。見えるふるまいは Linux に合わせた: ポートの表と bind の決まり (SO_REUSEADDR / SO_REUSEPORT、
-Linux の inet_bind_conflict と udp_lib_lport_inuse)、空いたポート 32768〜60999、1024 より下は root だけ、TIME_WAIT と
+Linux の inet_bind_conflict と udp_lib_lport_inuse)、空いたポート 32768〜60999 (TCP は bind(0) と listen が奇数、connect が
+偶数を先に: 閉じたばかりのポートへの connect が自分につながらない。test/portparity.c)、1024 より下は root だけ、TIME_WAIT と
 閉じたあとの FIN_WAIT2 は 60 秒 (/proc/net/tcp にも出る。行は Linux の get_timewait4_sock と同じく、タイマは 3 と
 のこりの時間 (USER_HZ の tick)、数は 3。ソケットの番地の欄は Linux 7.4 と同じく root でも 0、rto と ssthresh も Linux の
 はじめの値 (listen とつなぎかけは 1 秒、つながれば 200 ms、slow start のまま -1)。/proc/net/sockstat では Linux と同じく

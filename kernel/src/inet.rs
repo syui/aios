@@ -1012,8 +1012,16 @@ fn conflicts(me: &Me, u: &InetRef, port: u16) -> bool {
     false
 }
 
-/// ポートを取る (Linux の get_port: 0 なら空いているものを。ぶつかれば EADDRINUSE)
+/// ポートを取る (Linux の get_port: 0 なら空いているものを。ぶつかれば EADDRINUSE)。bind と listen から
 fn get_port(u: &InetRef, snum: u16) -> Result<(), i64> {
+    get_port_for(u, snum, false)
+}
+
+/// 空いているポートを選ぶ。Linux と同じく TCP は bind (と listen) が奇数を先に (inet_csk_find_open_port)、connect が
+/// 偶数を先に (__inet_hash_connect: ip_local_port_range の下の端 32768 と同じ偶奇) 見る。でないと、bind(0) で取って閉じた
+/// ばかりのポートへの connect が、たまたま同じポートを自分に選んで自分につながる (self-connect: CI の test/inetsock.c の
+/// 「connect to a closed port」が 28232 回に 1 回ほど通らなかった)。UDP は偶奇を見ない (udp_lib_get_port)
+fn get_port_for(u: &InetRef, snum: u16, connect: bool) -> Result<(), i64> {
     let me = me_of(&u.borrow());
     if snum != 0 {
         if conflicts(&me, u, snum) {
@@ -1028,14 +1036,23 @@ fn get_port(u: &InetRef, snum: u16) -> Result<(), i64> {
     let mut r = [0u8; 4];
     crate::rand::fill(&mut r);
     let start = u32::from_le_bytes(r) % range;
-    for i in 0..range {
-        let p = PORT_LO + ((start + i) % range) as u16;
-        if port_free(me.net, me.tcp, p) {
+    let found = if me.tcp {
+        // PORT_LO は偶数、range も偶数: 半分ずつ。はじめの偶奇 (connect は偶数、bind は奇数)、それからもう一方
+        let half = range / 2;
+        let first = if connect { 0 } else { 1 };
+        [first, first ^ 1].into_iter().find_map(|par| {
+            (0..half).map(|i| PORT_LO + (((start / 2 + i) % half) * 2 + par) as u16).find(|&p| port_free(me.net, true, p))
+        })
+    } else {
+        (0..range).map(|i| PORT_LO + ((start + i) % range) as u16).find(|&p| port_free(me.net, false, p))
+    };
+    match found {
+        Some(p) => {
             hash_port(u, p);
-            return Ok(());
+            Ok(())
         }
+        None => Err(-EADDRINUSE),
     }
-    Err(-EADDRINUSE)
 }
 
 /// 自分で bind する (Linux の inet_autobind: UDP の送る前と connect の前)
@@ -1956,7 +1973,7 @@ fn tcp_v4_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
     }
     // ポート (Linux の inet_hash_connect: なければ空いているもの、あれば 4 つ組がほかと同じでないこと)
     let r = if u.borrow().num == 0 {
-        get_port(u, 0).map_err(|_| -EADDRNOTAVAIL)
+        get_port_for(u, 0, true).map_err(|_| -EADDRNOTAVAIL)
     } else {
         let (s1, p1) = {
             let s = u.borrow();
@@ -2044,7 +2061,7 @@ fn tcp_v6_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
         s.err = 0;
     }
     let r = if u.borrow().num == 0 {
-        get_port(u, 0).map_err(|_| -EADDRNOTAVAIL)
+        get_port_for(u, 0, true).map_err(|_| -EADDRNOTAVAIL)
     } else {
         let p1 = u.borrow().num;
         if tuple_used(u, LOOPBACK4_IPV6, p1, LOOPBACK4_IPV6, dport) { Err(-EADDRNOTAVAIL) } else { Ok(()) }
