@@ -35,9 +35,23 @@ pub struct Entry {
     set: Option<fn(&str) -> Result<(), i64>>,
 }
 
+/// root でなくても、自分の UTS の namespace (を作った人: CAP_SYS_ADMIN) なら書けるもの (ns::uts_admin)。aios が足した
+/// kernel/uname だけ (aibox --image が、中の UTS を linux の形にする)。Linux の /proc/sys は本当の root だけが書ける
+const UTS_ADMIN: &[&str] = &["kernel/uname"];
+
 impl Entry {
     pub fn writable(&self) -> bool {
         self.set.is_some()
+    }
+
+    /// UTS の namespace ごとの値で、その namespace を作った人も書けるもの (UTS_ADMIN)
+    pub fn uts_scoped(&self) -> bool {
+        UTS_ADMIN.contains(&self.path)
+    }
+
+    /// いまのプロセスがこれを書いてよいか (root か、UTS_ADMIN のものを自分の UTS で)
+    pub fn may_write(&self) -> bool {
+        self.writable() && (crate::cred::current().euid == 0 || self.uts_scoped() && crate::ns::uts_admin())
     }
 
     pub fn read(&self) -> String {
@@ -121,8 +135,23 @@ fn num(s: &str, lo: usize, hi: usize) -> Result<usize, i64> {
 
 pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/hostname", get: crate::syscall::hostname, set: Some(|s| crate::syscall::set_hostname(s.as_bytes())) },
-    Entry { path: "kernel/ostype", get: || "aios".to_string(), set: None },
-    Entry { path: "kernel/osrelease", get: || env!("AIOS_RELEASE").to_string(), set: None },
+    Entry { path: "kernel/ostype", get: || crate::ns::sysname().to_string(), set: None },
+    Entry { path: "kernel/osrelease", get: crate::ns::release, set: None },
+    Entry {
+        path: "kernel/uname",
+        get: || match crate::ns::uname() {
+            crate::ns::Uname::Aios => "aios".to_string(),
+            crate::ns::Uname::Linux => "linux".to_string(),
+        },
+        set: Some(|s| {
+            crate::ns::set_uname(match s.trim() {
+                "aios" => crate::ns::Uname::Aios,
+                "linux" => crate::ns::Uname::Linux,
+                _ => return Err(crate::why::inval()),
+            });
+            Ok(())
+        }),
+    },
     Entry {
         path: "kernel/sched_timeslice_ms",
         get: || format!("{}", SCHED_TIMESLICE_TICKS.load(Ordering::Relaxed) as u64 * 1000 / crate::timer::HZ),

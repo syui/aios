@@ -17,7 +17,7 @@
 //   /etc/claude-code/managed-mcp.json は aish --mcp をこれで起こす (Claude が動かすものはみな砂場の中)。
 //   root のする操作は aios do (aiosd が wheel の人かを見てする) を通す
 //
-//   aibox [-b HOST:PATH[:ro]]... [-e K[=V]]... [-u USER] [--entrypoint CMD] [--no-net] [-n PORT]... [-v] --image IMAGE [ARG]...
+//   aibox [-b HOST:PATH[:ro]]... [-e K[=V]]... [-u USER] [--entrypoint CMD] [--uname aios|linux] [--no-net] [-n PORT]... [-v] --image IMAGE [ARG]...
 //   container image (OCI) をそのまま動かす (docker run のかわり。root も docker もいらない)。IMAGE は
 //   ap image -o X.tar で作ったもの (OCI のアーカイブ。置き場に入れる)、OCI layout のディレクトリ (パスは / ./ ../ で
 //   始めるか .tar で終わる)、置き場の名前
@@ -26,7 +26,9 @@
 //   chroot する。/tmp と /dev は空の tmpfs (/dev は null zero full random urandom tty だけ)、/proc はこの中のもの、
 //   /etc/hosts と /etc/resolv.conf は外のもの、家 (/etc/passwd の) が空のディレクトリなら tmpfs。-b で外のパスを中へ
 //   (:ro で読むだけ)。書けるのは /tmp、/dev、家、-b のところだけ (landlock)。PID と UTS (ホスト名は image の名前) も分け、
-//   システムコールも同じようにしぼる。IMAGE のあとはみな ARG (docker run と同じ): image の Cmd のかわり (Entrypoint のあとに)
+//   システムコールも同じようにしぼる。IMAGE のあとはみな ARG (docker run と同じ): image の Cmd のかわり (Entrypoint のあとに)。
+//   中の uname は linux の形 (sysname Linux、release 7.4.0-aios-...: /proc/sys/kernel/uname。image は Linux のための
+//   もので、glibc を静的につないだものは release の版を見る)。--uname aios で aios の形のまま
 #[path = "../lib/landlock.rs"]
 mod landlock;
 #[path = "../lib/ocistore.rs"]
@@ -70,7 +72,7 @@ fn lo_up() {
 
 fn usage() -> ! {
     eprintln!("usage: aibox [-w PATH]... [-W PATH]... [-n PORT]... [--no-net] [--tmp] [--root] [--deny SYSCALL,...] [--kill SYSCALL,...] [-v] [--] CMD [ARG]...");
-    eprintln!("       aibox [-b HOST:PATH[:ro]]... [-e K[=V]]... [-u USER] [--entrypoint CMD] [--no-net] [-n PORT]... [-v] --image IMAGE [ARG]...");
+    eprintln!("       aibox [-b HOST:PATH[:ro]]... [-e K[=V]]... [-u USER] [--entrypoint CMD] [--uname aios|linux] [--no-net] [-n PORT]... [-v] --image IMAGE [ARG]...");
     std::process::exit(2);
 }
 
@@ -118,7 +120,7 @@ fn main() {
                 host_only = true;
                 as_root = true;
             }
-            o @ ("--image" | "-b" | "-e" | "-u" | "--entrypoint") => {
+            o @ ("--image" | "-b" | "-e" | "-u" | "--entrypoint" | "--uname") => {
                 i += 1;
                 let v = args.get(i).cloned().unwrap_or_else(|| usage());
                 match o {
@@ -146,6 +148,13 @@ fn main() {
                     }
                     "-e" => img.env.push(v),
                     "-u" => img.user = Some(v),
+                    "--uname" => {
+                        if !matches!(v.as_str(), "aios" | "linux") {
+                            eprintln!("aibox: --uname {}: aios or linux", v);
+                            std::process::exit(2);
+                        }
+                        img.uname = Some(v);
+                    }
                     _ => img.entrypoint = Some(v),
                 }
             }
@@ -307,6 +316,8 @@ struct Image {
     env: Vec<String>,
     user: Option<String>,
     entrypoint: Option<String>,
+    /// 中の uname の形 (aios か linux。既定は linux)
+    uname: Option<String>,
 }
 
 fn fail(what: impl std::fmt::Display) -> ! {
@@ -519,6 +530,11 @@ fn run_image(o: &Image, args: &[String], ports: Option<&[u16]>, deny: &[u32], ki
         lo_up();
     }
     unsafe { libc::sethostname(host.as_ptr().cast(), host.len()) };
+    // uname の形 (分けた UTS のもの。中のものはみな受けつぐ)
+    let uname = o.uname.as_deref().unwrap_or("linux");
+    if let Err(e) = std::fs::write("/proc/sys/kernel/uname", uname) {
+        eprintln!("aibox: uname {}: {}", uname, e);
+    }
     let child = unsafe { libc::fork() };
     if child < 0 {
         fail(format!("fork: {}", std::io::Error::last_os_error()));

@@ -39,10 +39,11 @@ fn next_id() -> u64 {
     *NEXT_ID.get()
 }
 
-/// UTS: ホスト名
+/// UTS: ホスト名と、uname の形 (Uname: aios か linux)
 pub struct Uts {
     pub id: u64,
     pub name: RefCell<([u8; 64], usize)>,
+    pub uname: core::cell::Cell<Uname>,
 }
 
 /// NET: 番号 (中のソケットは番号で分ける) と lo の様子 (lo_state)
@@ -204,7 +205,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     }
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
-        c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name) }));
+        c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name), uname: core::cell::Cell::new(current_uname(c)) }));
     }
     if flags & CLONE_NEWNET != 0 {
         c.ns.net = Some(Rc::new(Net { id: next_id() }));
@@ -265,6 +266,89 @@ pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
         }
     }
     Ok(())
+}
+
+// ---- uname の形 ----
+
+/// aios が手本にしている Linux の版 (test/linux-vm.sh の mainline、7.4)。linux の形の uname の release の頭と、vDSO の
+/// 「Linux」の注釈 (glibc が起きるときに読む) に出す。手本を上げたらここも
+pub const LINUX_VERSION: (u32, u32, u32) = (7, 4, 0);
+
+/// uname (と /proc/sys/kernel/ostype、osrelease、/proc/version) の形。UTS の namespace ごとに持ち、新しい UTS は親のものを
+/// 受けつぐ。/proc/sys/kernel/uname で切りかえる (書けるのはホスト名と同じ人)。
+///   Aios (既定): sysname は aios、release は aios の版 (AIOS_RELEASE)
+///   Linux: sysname は Linux、release は 7.4.0-aios-AIOS_RELEASE (手本の Linux の版が頭)。Linux のためのプログラムが
+///     Linux だと思って動くように: glibc を静的につないだもの (公式の protoc など) は release の版を見て、3.7.0 より古いと
+///     「FATAL: kernel too old」で止まる。config.guess などは uname -s で Linux を見る。aibox --image は中をこれにする
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Uname {
+    Aios,
+    Linux,
+}
+
+static UNAME: Bkl<Uname> = Bkl::new(Uname::Aios);
+
+fn current_uname(c: &crate::cred::Cred) -> Uname {
+    match &c.ns.uts {
+        Some(u) => u.uname.get(),
+        None => *UNAME.get(),
+    }
+}
+
+/// いまのプロセスから見た uname の形
+pub fn uname() -> Uname {
+    current_uname(&crate::proc::current().cred)
+}
+
+/// uname の形を変える (いまのプロセスの UTS の)。許しは呼ぶほう (sysctl の書き手) で見る (ホスト名と同じ)
+pub fn set_uname(u: Uname) {
+    match &crate::proc::current().cred.ns.uts {
+        Some(x) => x.uname.set(u),
+        None => *UNAME.get() = u,
+    }
+}
+
+/// いまのプロセスが自分の UTS の namespace の中で、それを変えてよいか (set_hostname の自分の UTS と同じ: CAP_SYS_ADMIN を
+/// 持つものとして、LSM に聞く)
+pub fn uts_admin() -> bool {
+    let c = &crate::proc::current().cred;
+    c.ns.uts.is_some() && crate::security::capable(c, crate::cred::CAP_SYS_ADMIN, true)
+}
+
+/// UTS の namespace ごとの /proc/sys の値 (kernel/uname) の持ち主に見せるもの: 自分の UTS の中なら、いまのユーザーの
+/// namespace の root (の外の番号。地図になければ 0)、ほかは root
+pub fn uts_owner() -> (u32, u32) {
+    if crate::proc::current_cred_ref().ns.uts.is_none() {
+        return (0, 0);
+    }
+    (take_uid(0).unwrap_or(0), take_gid(0).unwrap_or(0))
+}
+
+/// uname の sysname (/proc/sys/kernel/ostype)
+pub fn sysname() -> &'static str {
+    match uname() {
+        Uname::Aios => "aios",
+        Uname::Linux => "Linux",
+    }
+}
+
+/// uname の release (/proc/sys/kernel/osrelease)
+pub fn release() -> alloc::string::String {
+    match uname() {
+        Uname::Aios => env!("AIOS_RELEASE").into(),
+        Uname::Linux => {
+            let (a, b, c) = LINUX_VERSION;
+            alloc::format!("{}.{}.{}-aios-{}", a, b, c, env!("AIOS_RELEASE"))
+        }
+    }
+}
+
+/// uname の version
+pub fn version() -> &'static str {
+    match uname() {
+        Uname::Aios => "#1 aios",
+        Uname::Linux => "#1 SMP aios",
+    }
 }
 
 // ---- PID の番号の読みかえ ----

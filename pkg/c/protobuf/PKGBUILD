@@ -1,7 +1,9 @@
 # protobuf: Protocol Buffers のコンパイラ (protoc) と、よく使う型の .proto (google/protobuf/*.proto)。自分でビルドしない:
 #   公式の linux-aarch_64 のもの (github の protocolbuffers/protobuf のリリース。protoc は静的なバイナリ) を /opt/c に
 #   入れる (go と同じ考え。C++ のライブラリ (libprotobuf) は入れない)。Rust の prost-build (ai/courier の build.rs) が
-#   ビルドのときに呼ぶ。PROTOC がなくても PATH の protoc を探す
+#   ビルドのときに呼ぶ。PROTOC がなくても PATH の protoc を探す。protoc は glibc を静的につないだものなので、uname が
+#   Linux の版でないと「FATAL: kernel too old」で止まる: aios では uname を linux の形にして動かす
+#   (/proc/sys/kernel/uname。aibox --image の中は既定で linux。pkg_test の VM も _uname=linux を見てそうする)
 pkgname=protobuf
 pkgver=36.2
 pkgrel=1
@@ -9,6 +11,7 @@ pkgdesc='Protocol Buffers compiler (protoc) and well-known type definitions (off
 arch=('aarch64')
 url='https://protobuf.dev'
 license=('BSD-3-Clause')
+_uname=linux
 source=("https://github.com/protocolbuffers/protobuf/releases/download/v$pkgver/protoc-$pkgver-linux-aarch_64.zip"
         "LICENSE-$pkgver::https://raw.githubusercontent.com/protocolbuffers/protobuf/v$pkgver/LICENSE")
 sha256sums=('8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a'

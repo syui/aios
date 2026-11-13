@@ -516,7 +516,10 @@ impl ProcInode {
                 let total = proc::nr_threads();
                 format!("{} {} {} {}/{} {}\n", f(0), f(1), f(2), proc::nr_running(), total, proc::last_pid())
             }
-            Node::Version => format!("aios version {} (rustc) #1 SMP\n", env!("AIOS_RELEASE")),
+            Node::Version => match crate::ns::uname() {
+                crate::ns::Uname::Aios => format!("aios version {} (rustc) #1 SMP\n", crate::ns::release()),
+                crate::ns::Uname::Linux => format!("Linux version {} (rustc) {}\n", crate::ns::release(), crate::ns::version()),
+            },
             Node::Comm(pid) => format!("{}\n", leader_any(pid)?.comm()),
             // 改行なし (Linux の proc_loginuid_read と proc_sessionid_read)
             Node::LoginUid(pid) => format!("{}", crate::ns::show_uid_raw(leader(pid)?.cred.loginuid)),
@@ -840,6 +843,9 @@ impl Inode for ProcInode {
         let (uid, gid) = match self.node {
             // root と wheel の人が書ける (aiproc::allowed。書くときにも確かめる)。aibox の中の aish (sudo が効かない) も -w で
             Node::AiCtl => (0, crate::aiproc::WHEEL),
+            // 自分の UTS の namespace の中から見ると、その namespace の root のもの (Linux が net の sysctl を、netns の
+            // ユーザーの namespace の root のものに見せるのと同じ: set_ownership)
+            Node::Sys(i) if crate::sysctl::TABLE[i as usize].uts_scoped() => crate::ns::uts_owner(),
             _ => match self.pid().and_then(|p| leader(p).ok()) {
                 Some(p) if mode == S_IFDIR | 0o555 || crate::pidfd::dumpable(p) == 1 => (p.cred.euid, p.cred.egid),
                 _ => (0, 0),
@@ -920,8 +926,7 @@ impl Inode for ProcInode {
         }
         // /proc/sys/...: root が値を書く
         if let Node::Sys(i) = self.node
-            && crate::sysctl::TABLE[i as usize].writable()
-            && crate::cred::current().euid == 0
+            && crate::sysctl::TABLE[i as usize].may_write()
         {
             crate::sysctl::TABLE[i as usize].write(b)?;
             return Ok(b.len());
@@ -962,8 +967,8 @@ impl Inode for ProcInode {
 
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // > /proc/strace (O_TRUNC) は受けつける
-        let sys = matches!(self.node, Node::Sys(i) if crate::sysctl::TABLE[i as usize].writable());
-        if (sys || matches!(self.node, Node::Strace | Node::Bkl)) && crate::cred::current().euid == 0 || (self.node == Node::AiCtl && crate::aiproc::allowed()) {
+        let sys = matches!(self.node, Node::Sys(i) if crate::sysctl::TABLE[i as usize].may_write());
+        if sys || matches!(self.node, Node::Strace | Node::Bkl) && crate::cred::current().euid == 0 || (self.node == Node::AiCtl && crate::aiproc::allowed()) {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)

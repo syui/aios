@@ -70,7 +70,8 @@ pkg_update。
   (`not_out`。new には入れない)。PKGBUILD のない npm で入れるもの (`.aios.json` の pkg.linux.npm に人が書く。いまはない) は、
   npm の registry の dist-tags の latest と (`pkg_edit` は `.aios.json` の版を書きかえる。`@SCOPE/NAME` の名前でよい)。PKGBUILD
   に `_npm=NAME` と書いたもの (claude と pnpm) は、パッケージの版が npm の NAME の版で、`_latest_url` の dist-tags とくらべる
-  (post_install がその版を入れるので、ap -Syu で新しい claude-code が来る)
+  (post_install がその版を入れるので、ap -Syu で新しい claude-code が来る)。`_uname=linux` と書いたもの (glibc を静的に
+  つないだ公式のバイナリ: protobuf の protoc) は、`pkg_test` の VM で uname を linux の形にして動かす (下の「uname の形」)
 - `pkg_edit`: PKGBUILD の pkgver・pkgrel・sha256sums と `.aios.json` を書きかえる。source が 404 か 410
   ならやりなおさずにすぐしくじる。`rebuild: true` なら pkgrel を 1 つ上げるだけ
 - `pkg_build`: bin/mkpkg.sh で `repo/aarch64/KIND/` に作り、aios.db を作りなおす。前の版にあったライブラリ (SONAME と *.so*
@@ -291,7 +292,8 @@ Linux と同じ場所と形。書けるのは root。値の表は kernel/src/sys
 | 名前 | |
 |---|---|
 | `kernel.hostname` | uname の nodename (sethostname と同じ) |
-| `kernel.ostype` `kernel.osrelease` | 読むだけ |
+| `kernel.ostype` `kernel.osrelease` | 読むだけ。uname の sysname と release (下の `kernel.uname` で変わる) |
+| `kernel.uname` | uname の形 (aios が足したもの)。`aios` (既定: sysname aios、release は aios の版) か `linux` (sysname Linux、release `7.4.0-aios-<aios の版>`、/proc/version も Linux の形)。UTS の namespace ごとで、新しい UTS は親のものを受けつぐ。書けるのは root と、自分で分けた UTS の中の人 (そのときは中の root のものに見える: Linux の netns の sysctl と同じ考え)。glibc を静的につないだ Linux のプログラム (公式の protoc など) は release の版を見て、3.7.0 より古いと「FATAL: kernel too old」で止まるので、それを動かすところを linux に。aibox --image の中は既定で linux (`--uname aios` でそのまま)。起動のときから: /etc/sysctl.d に `kernel.uname = linux`。test/uname.c |
 | `kernel.sched_timeslice_ms` | ほかに順番をゆずるまで走る長さ (既定 10 = 1 tick。10 ms の倍数に切り上げ、1 秒まで)。長くすると切りかえが減り、短いほど返事が速い |
 | `kernel.sched_wakeup_preempt` | 1 (既定) なら、起こされたもの (音、入力、aiwm など、ふだん眠っているもの) が、CPU を使い続けているものに割りこむ。眠っている CPU がなければ、走っているもののうち一番使っているものの CPU に IPI を送ってゆずらせる。0 ならタイムスライスの終わりまで待つ |
 | `kernel.random.entropy_avail` `kernel.random.poolsize` | 読むだけ。乱数のもとのビット (256 なら ready) と 256。乱数 (getrandom、/dev/urandom) は Linux と同じ作りで、もと (DTB の rng-seed、EFI_RNG_PROTOCOL、CPU の RNDR、virtio-rng) を BLAKE2s の池にまぜ、ChaCha20 で鍵を消しながら出す (kernel/src/rand.rs)。起動のときの `rand: ready (ChaCha20) from ...` に、どこからもらったかが出る |
@@ -514,6 +516,8 @@ ap image pull NAME... / ap image ls / ap image rm NAME...                       
 - 根: 層を `~/.cache/aios/rootfs/HEX` (manifest の sha256) に一度だけひろげる (自分のもの。whiteout も。層のパスが
   リンクを通るときは根の中でたどる。setuid、デバイス、FIFO は入れない)。proc、dev、tmp、etc/hosts、etc/resolv.conf、
   WorkingDir を作っておく (Docker の init の層と同じ)
+- uname は linux の形 (sysname Linux、release `7.4.0-aios-...`: image は Linux のためのもの。glibc を静的につないだものは
+  release の版を見る)。`--uname aios` で aios の形のまま
 - 動かしかた: ユーザーの namespace で外の自分を image の User (の uid と gid。名前は image の /etc/passwd と group) に、
   マウントの namespace で根を自分の上に bind して読むだけに、/tmp は空の tmpfs、/dev は空の tmpfs に外の null zero full
   random urandom tty をファイルの bind で、/etc/hosts と /etc/resolv.conf は外のもの、家 (/etc/passwd の) が空のディレクトリ
@@ -2417,7 +2421,9 @@ posix-cpu-timers と同じ:
   `__kernel_rt_sigreturn` `__kernel_gettimeofday` (tz があればシステムコール) `__kernel_clock_gettime`。Go の runtime は
   版の表があるつもりで読むので、前 (clock_gettime だけで版の表なし) は Go のプログラム (gitea) が起きてすぐ番地 0x2 で
   落ちていた。`__kernel_getrandom` (Linux 6.11 からの vgetrandom) はまだない (glibc と Go はシステムコールの getrandom
-  にする)。test/vdso.c (Go と同じ読み方) が Linux 7.4 と getrandom の 2 行のほかは同じ
+  にする)。PT_NOTE の「Linux」の注釈 (種類 0) に手本の Linux の版 (LINUX_VERSION_CODE、7.4.0: ns::LINUX_VERSION) も
+  (動的にリンクした glibc は起きるときにここからカーネルの版を読む)。test/vdso.c (Go と同じ読み方) が Linux 7.4 と
+  getrandom の 2 行のほかは同じ (`note Linux 7.4` も同じ)
 - timer_create: MONOTONIC_RAW と COARSE、fd の時計は EOPNOTSUPP、知らない時計は EINVAL、ALARM は CAP_WAKE_ALARM
   がなければ EPERM。CPU の時計のタイマは、その時計の ns で期限を覚え、tick ごとに見て鳴らす (Linux も tick ごと)。
   くり返しは、こえた分の回数を overrun に

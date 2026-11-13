@@ -120,16 +120,28 @@ pub fn sigtramp() -> Option<u64> {
     Some((VDSO_VA + TEXT + code_off(&raw const vdso_sigtramp)) as u64)
 }
 
-/// ELF の中の場所 (Linux の vDSO と同じものを: soname、DT_HASH と DT_GNU_HASH、版の表)
+/// ELF の中の場所 (Linux の vDSO と同じものを: soname、DT_HASH と DT_GNU_HASH、版の表、Linux の版の注釈)
 const PHOFF: usize = 64;
-const DYNSYM: usize = 0xc0;
-const DYNSTR: usize = 0x160;
-const HASH: usize = 0x1e0;
-const GNU_HASH: usize = 0x200;
-const VERSYM: usize = 0x230;
-const VERDEF: usize = 0x240;
-const DYNAMIC: usize = 0x280;
+const DYNSYM: usize = 0x100;
+const DYNSTR: usize = 0x1a0;
+const HASH: usize = 0x220;
+const GNU_HASH: usize = 0x240;
+const VERSYM: usize = 0x270;
+const VERDEF: usize = 0x280;
+const DYNAMIC: usize = 0x2c0;
+const NOTE: usize = 0x370;
 const TEXT: usize = 0x400;
+/// PT_NOTE の大きさ: Elf64_Nhdr (12) と名前 "Linux\0" (4 にそろえて 8) と版 (4)
+const NOTE_SIZE: usize = 24;
+
+/// Linux の vDSO の注釈 (名前 "Linux"、種類 0) に書く版 (LINUX_VERSION_CODE: major << 16 | minor << 8 | patch)。aios が
+/// 手本にしている Linux の版 (ns::LINUX_VERSION)。動的にリンクした glibc は起きるときにここからカーネルの版を読み
+/// (なければ uname -r)、glibc の下限 (3.7.0 など) より古ければ「FATAL: kernel too old」で止まる。静的にリンクした glibc
+/// は注釈を見ずに uname -r だけを見る (uname の形を linux にする: ns::Uname)
+const LINUX_VERSION_CODE: u32 = {
+    let (a, b, c) = crate::ns::LINUX_VERSION;
+    a << 16 | b << 8 | if c > 255 { 255 } else { c }
+};
 
 /// soname と、名前の版 (Linux の arm64 の vDSO のもの。Go は __kernel_clock_gettime をこの版で探し、版の表
 /// (DT_VERDEF) がないと番地 0x2 を読んで落ちる)
@@ -196,9 +208,9 @@ pub fn init() {
     put64(p, 32, PHOFF as u64);
     put16(p, 52, 64); // ehsize
     put16(p, 54, 56); // phentsize
-    put16(p, 56, 2); // phnum
+    put16(p, 56, 3); // phnum
     put16(p, 58, 64); // shentsize (セクションは無し)
-    // PT_LOAD (ページまるごと、R+X) と PT_DYNAMIC
+    // PT_LOAD (ページまるごと、R+X) と PT_DYNAMIC と PT_NOTE (Linux と同じ並び)
     let ph = |p: &mut [u8], i: usize, ty: u32, flags: u32, off: usize, size: usize| {
         let o = PHOFF + i * 56;
         put32(p, o, ty);
@@ -208,9 +220,20 @@ pub fn init() {
         put64(p, o + 24, off as u64);
         put64(p, o + 32, size as u64);
         put64(p, o + 40, size as u64);
-        put64(p, o + 48, if ty == 1 { PGSIZE as u64 } else { 8 });
+        put64(p, o + 48, match ty {
+            1 => PGSIZE as u64,
+            4 => 4,
+            _ => 8,
+        });
     };
     ph(p, 0, 1, 5, 0, PGSIZE);
+    // 注釈: Linux の版 (arch/arm64/kernel/vdso/note.S の ELFNOTE_START(Linux, 0, "a") と LINUX_VERSION_CODE)
+    put32(p, NOTE, 6); // n_namesz ("Linux\0")
+    put32(p, NOTE + 4, 4); // n_descsz
+    put32(p, NOTE + 8, 0); // n_type
+    p[NOTE + 12..NOTE + 18].copy_from_slice(b"Linux\0");
+    put32(p, NOTE + 20, LINUX_VERSION_CODE);
+    ph(p, 2, 4, 4, NOTE, NOTE_SIZE);
 
     // 文字列 (0 は空)
     let mut strsz = 1;
@@ -294,9 +317,9 @@ pub fn init() {
     }
     ph(p, 1, 2, 4, DYNAMIC, dynv.len() * 16);
     // 場所が重なっていないか (足したときに)
-    debug_assert!(PHOFF + 2 * 56 <= DYNSYM && DYNSYM + n * 24 <= DYNSTR && DYNSTR + strsz <= HASH);
+    debug_assert!(PHOFF + 3 * 56 <= DYNSYM && DYNSYM + n * 24 <= DYNSTR && DYNSTR + strsz <= HASH);
     debug_assert!(HASH + (3 + n) * 4 <= GNU_HASH && GNU_HASH + 28 + (n - 1) * 4 <= VERSYM && VERSYM + n * 2 <= VERDEF);
-    debug_assert!(VERDEF + 56 <= DYNAMIC && DYNAMIC + dynv.len() * 16 <= TEXT && vvar_off + 16 <= PGSIZE);
+    debug_assert!(VERDEF + 56 <= DYNAMIC && DYNAMIC + dynv.len() * 16 <= NOTE && NOTE + NOTE_SIZE <= TEXT && vvar_off + 16 <= PGSIZE);
     // vvar
     put64(p, vvar_off, crate::timer::freq());
     put64(p, vvar_off + 8, crate::timer::boot_epoch());

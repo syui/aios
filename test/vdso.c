@@ -1,7 +1,9 @@
 // vDSO (AT_SYSINFO_EHDR) を、Go の runtime (vdso_linux.go) と musl と同じやり方で読んで、中身を出す。
 // Go は DT_VERDEF があるつもりで版の表を読む (なければ番地 0x2 を読んで SIGSEGV。gitea が起きなかった)。
 // 名前と版 (LINUX_2.6.39)、版の表 (verdef と versym)、soname、それで見つけた __kernel_clock_gettime を呼ぶ
-// (Linux 7.4 には __kernel_getrandom (vgetrandom) もある。aios にはまだなく、glibc と Go はシステムコールの getrandom にする)
+// (Linux 7.4 には __kernel_getrandom (vgetrandom) もある。aios にはまだなく、glibc と Go はシステムコールの getrandom にする)。
+// PT_NOTE の「Linux」の注釈 (種類 0) の版も (glibc は起きるときにここからカーネルの版を読み、古ければ kernel too old で止まる。
+// aios は手本の Linux の版を書く)
 // test/ldiff.sh vdso で Linux とくらべる
 #include <elf.h>
 #include <stdint.h>
@@ -49,7 +51,7 @@ int main(void) {
   printf("magic %d class %d type %d machine %d\n", memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0, eh->e_ident[EI_CLASS], eh->e_type, eh->e_machine);
   Elf64_Phdr *ph = (void *)(base + eh->e_phoff);
   uintptr_t load = 0;
-  int found = 0;
+  int found = 0, linux_note = 0;
   Elf64_Dyn *dyn = NULL;
   for (int i = 0; i < eh->e_phnum; i++) {
     if (ph[i].p_type == PT_LOAD && !found) {
@@ -57,8 +59,23 @@ int main(void) {
       load = base + ph[i].p_offset - ph[i].p_vaddr;
     }
     if (ph[i].p_type == PT_DYNAMIC) dyn = (void *)(base + ph[i].p_offset);
+    // 注釈 (Elf64_Nhdr、名前と中身は 4 にそろえる)。glibc の _dl_discover_osversion と同じ読み方
+    if (ph[i].p_type == PT_NOTE) {
+      char *n = (char *)(base + ph[i].p_offset), *end = n + ph[i].p_filesz;
+      while (n + sizeof(Elf64_Nhdr) <= end) {
+        Elf64_Nhdr *h = (void *)n;
+        char *name = n + sizeof *h, *desc = name + ((h->n_namesz + 3) & ~3);
+        if (h->n_namesz == 6 && h->n_type == 0 && h->n_descsz == 4 && memcmp(name, "Linux", 6) == 0) {
+          uint32_t v = *(uint32_t *)desc;
+          printf("note Linux %u.%u\n", v >> 16, (v >> 8) & 0xff);
+          linux_note = v >= (3 << 16 | 7 << 8);
+        }
+        n = desc + ((h->n_descsz + 3) & ~3);
+      }
+    }
   }
   printf("load %d dynamic %d\n", found, dyn != NULL);
+  bad |= !linux_note;
   if (!found || !dyn) return 1;
   const char *str = NULL;
   Elf64_Sym *sym = NULL;

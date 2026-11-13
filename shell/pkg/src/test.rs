@@ -355,7 +355,15 @@ pub fn test(root: &Path, name: &str, vm: bool) -> Result<Value, String> {
     }
     // aios の VM の中で (ap -S で入れて、bin/ のものを aios のカーネルの上で)
     if vm {
-        let c = crate::vmtest::check(root, name, &bins, &host_runs);
+        // PKGBUILD の _uname=linux: glibc を静的につないだもの (公式の protoc など) は、uname が Linux の版でないと
+        // 「kernel too old」で止まる。aios の VM では uname を linux の形 (/proc/sys/kernel/uname) にして動かす
+        let linux = crate::up::pkgbuilds(&root.join("pkg"))
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, p)| fs::read_to_string(p).ok())
+            .and_then(|t| crate::up::scalar(&t, "_uname"))
+            .is_some_and(|u| u == "linux");
+        let c = crate::vmtest::check(root, name, &bins, &host_runs, linux);
         ok &= c["ok"] == true;
         checks.push(c);
     }

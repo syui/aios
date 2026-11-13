@@ -84,8 +84,9 @@ fn script(bins: &[PathBuf]) -> String {
     )
 }
 
-/// 確かめる。host は、このマシンの run で動かしたもの ({bin, status, out})
-pub fn check(root: &Path, name: &str, bins: &[PathBuf], host: &[Value]) -> Value {
+/// 確かめる。host は、このマシンの run で動かしたもの ({bin, status, out})。linux なら uname を linux の形にして動かす
+/// (PKGBUILD の _uname=linux。終わったら aios にもどす)
+pub fn check(root: &Path, name: &str, bins: &[PathBuf], host: &[Value], linux: bool) -> Value {
     let fail = |e: String| json!({ "check": "vm", "ok": false, "error": e });
     let how = match ready(root) {
         Ok(h) => h,
@@ -105,7 +106,11 @@ pub fn check(root: &Path, name: &str, bins: &[PathBuf], host: &[Value]) -> Value
     if bins.is_empty() {
         return json!({ "check": "vm", "ok": true, "how": how, "note": "installed with ap -S; no programs in bin/" });
     }
-    let text = match bg(root, &script(bins), Duration::from_secs(600)) {
+    let mut run = script(bins);
+    if linux {
+        run = format!("echo linux | sudo tee /proc/sys/kernel/uname > /dev/null\n{}echo aios | sudo tee /proc/sys/kernel/uname > /dev/null\n", run);
+    }
+    let text = match bg(root, &run, Duration::from_secs(600)) {
         Ok((_, t)) => t,
         Err(e) => return fail(format!("running the programs in aios: {}", e)),
     };
@@ -116,7 +121,11 @@ pub fn check(root: &Path, name: &str, bins: &[PathBuf], host: &[Value]) -> Value
         runs.push(json!({ "bin": b.trim_start_matches('/'), "status": st.parse::<i64>().ok(), "out": first }));
     }
     let (runs, differ, ok) = compare(runs, host, bins.len());
-    json!({ "check": "vm", "ok": ok, "how": how, "bins": runs, "differ": differ })
+    let mut c = json!({ "check": "vm", "ok": ok, "how": how, "bins": runs, "differ": differ });
+    if linux {
+        c["uname"] = json!("linux");
+    }
+    c
 }
 
 /// aios で動かしたもの (runs) を、このマシンで動かしたもの (host) とくらべる: (ran をつけた runs, このマシンで動いたのに

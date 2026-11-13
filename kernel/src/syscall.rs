@@ -1013,7 +1013,8 @@ pub fn set_hostname(name: &[u8]) -> Result<(), i64> {
 fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
     let (hb, hl) = crate::ns::hostname();
-    let fields: [&[u8]; 6] = [b"aios", &hb[..hl], env!("AIOS_RELEASE").as_bytes(), b"#1 aios", b"aarch64", b""];
+    let release = crate::ns::release();
+    let fields: [&[u8]; 6] = [crate::ns::sysname().as_bytes(), &hb[..hl], release.as_bytes(), crate::ns::version().as_bytes(), b"aarch64", b""];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
         u[i * FIELD..i * FIELD + f.len()].copy_from_slice(f);
