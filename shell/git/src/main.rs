@@ -3,11 +3,14 @@
 //        署名 (GPG か SSH か、どの鍵か) とコミットした人。設定 (user.email、user.signingkey、gpg.format) と
 //        ちがうもの、remote のほうが進んでいるものは problems に
 //   ci   push したコミットの GitHub Actions を待つ (1 回に 50 秒まで)。落ちたらどの job のどの step か
+//   ship git のたしかめ → push (とミラー) → publish か CI 待ち (ship.rs)
 // クラウドの環境の git は Claude の名前と SSH の鍵で署名する設定なので、気づかずに push すると署名しなおして
 // force push することになる (2026-10-30)。push の前にこれで見る
 use aish_plugin::{Spec, Tool, Value, error, json, s};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod ship;
 
 const GIT: &str = r#"{"type":"object","properties":{
 "dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
@@ -44,11 +47,17 @@ fn main() {
                 desc: "push したコミット (既定 HEAD) の GitHub Actions の run を、終わるまで待つ (1 回に 50 秒まで。まだなら running: true なのでもう一度)。run ごとに結果とかかった時間、落ちたものはどの job のどの step か。{done, ok}",
                 input: CI,
             },
+            Tool {
+                name: "ship",
+                desc: "いまのブランチを送り出す: git のたしかめ (署名、コミットした人、remote が進んでいないか) と publish の元の変えたままのファイル → push (origin のいまのブランチと git config aish.ship.push の refspec) → aish.ship.after のコマンド (ミラーなど) → 最後の release から aish.ship.paths の下が変わっていれば aish.ship.publish をうしろで (CI もそこで待つ)、でなければ CI を待つ。1 回に 50 秒まで。まだなら running: true なのでもう一度呼ぶと続き (落ちたらどこか)。check: true なら送らずにたしかめだけ。{done, ok}",
+                input: ship::SHIP,
+            },
         ],
     };
     aish_plugin::run(spec, |ev, v| match ev {
         "tool" if s(v, "name") == "git" => state(v),
         "tool" if s(v, "name") == "ci" => ci(v),
+        "tool" if s(v, "name") == "ship" => ship::ship(v),
         "tool" => error(format!("{}: no such tool", s(v, "name"))),
         _ => json!({}),
     });

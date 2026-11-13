@@ -15,6 +15,10 @@ command -v meson >/dev/null || pip install -q --break-system-packages meson >/de
 rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl aarch64-unknown-uefi >/dev/null 2>&1 || true
 [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ] && git fetch -q --unshallow origin || true
 bin/gitea.sh id || true
+git config --replace-all aish.ship.push HEAD:main
+git config --replace-all aish.ship.after "sh bin/gitea.sh os"
+git config aish.ship.publish "sh bin/publish.sh"
+git config aish.ship.paths "kernel/ user/ shell/"
 bin/aish-mcp.sh --build
 bin/aigpt-mcp.sh --build || echo "aigpt-mcp.sh --build: failed" >&2
 nohup bin/setup-build.sh > /tmp/setup-build.log 2>&1 &
