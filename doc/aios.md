@@ -491,6 +491,24 @@ Postgres といっしょに起こして表 (device_tokens) ができたかを見
   ai/chat をクロスで作り、aios の VM で /xrpc/_health まで。s_server と s_client は TLS 1.3 (X25519MLKEM768)
 - go (pkg/c/go、Go 1.27.4): 公式の linux-arm64 (静的) を /opt/c/go に。GOTOOLCHAIN=local。aios の VM で net/http を
   使うものを CGO_ENABLED=0 でビルドして動く
+- protobuf (pkg/c/protobuf、protoc 36.2): 公式の linux-aarch_64 の protoc (glibc を静的につないだもの: aios では uname を
+  linux の形にして動かす。PKGBUILD の `_uname=linux`) とよく使う型の .proto を /opt/c に。ai/courier の prost-build が使う
+- redis (pkg/c/redis、Redis 8.10.3): Zig で静的に (MALLOC=libc、TLS は OpenSSL、モジュールなし)。ai/at は使っていない
+  (compose.yml の redis は bsky が depends_on するだけ) が、使えるように。aios の VM で PING、SET / GET、BGSAVE (fork)、
+  redis-benchmark まで。起きるときに fork した子の /proc/self/smaps の Shared_Dirty を見る (arm64 の古いカーネルの
+  バグのたしかめ) ので、smaps を足した (下)
+- postgresql (pkg/c/postgresql、PostgreSQL 18.7): 拡張を dlopen で読むので musl に動的に (zlib、zstd、OpenSSL。contrib も:
+  bsky が pg_trgm を使う)。18 の tar には bison と flex の出力がないので作るマシンのものを、タイムゾーンの表は作るマシンの
+  zic で。まだ: aios のカーネルに System V の共有メモリ (shmget、shmat) がないので、aios の上では postgres が起きない
+  (Postgres はいつも小さな SysV の共有メモリをとる)。docker (Linux) の上では動く
+
+/proc/PID/smaps (2026-11-13、kernel/src/vm.rs の smaps_text): maps の行ごとに Linux と同じ形 (名前は 16 文字、数は 8 文字の
+右よせと kB) で Size、Rss、Pss、Pss_Dirty、Shared_Clean / Shared_Dirty、Private_Clean / Private_Dirty、Referenced、
+Anonymous、Swap と SwapPss、THPeligible、VmFlags。何人で写しているかは kalloc の参照の数 (ファイルのページはページキャッシュの
+1 を引く)、Pss は Linux と同じく 12 ビットの端数で足す。KSM、LazyFree、透明な大きいページ、hugetlb、Locked は aios にないので 0。
+test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のページを fork した子が読む) は、Linux 7.4 と Referenced の 1 行
+のほかは同じ: Linux は fork のとき子の PTE を old にする (pte_mkold) が、aios は AF をハードウェアで立てない (TCR.HA なし)
+ので、old にすると子が触るたびにフォルトになる。aios の子は AF のまま (Referenced がそのぶん多い)
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
@@ -1005,7 +1023,7 @@ mmap (待ち 88%: munmap 1 回 10 µs、mmap 4 µs) と、領域を何千も持�
 持ってほかから来るもの (メモリが足りないときの回収のスワップとファイルのページ、procfs、oom) だけ。それとはロックなしの
 ページフォールトと同じ形ですれちがう: ロックなしの側は fast_users を増やしてから mutators を見て、0 でなければふつうの道へ。
 大きなロックの側は mutators を増やしてから fast_users が 0 になるのを待つ。表を変えるメソッドはもとから中でこれをとっていたが、
-ほかのプロセスの表を読むだけのもの (/proc/PID/maps、cmdline、stat、status、/proc/ai のプロセスの一覧、oom の大きさくらべ、
+ほかのプロセスの表を読むだけのもの (/proc/PID/maps と smaps、cmdline、stat、status、/proc/ai のプロセスの一覧、oom の大きさくらべ、
 スタックや待っている futex の出力) はとっていなかったので、読むあいだ `hold` で止める。munmap は PTE を消してから、表を
 載せている CPU を見て TLB を消し (ほかに載せている CPU がなければ自分の分だけ)、ページを返す。ほかのスレッドがいないので、
 ロックなしで読む CPU を待つ (quiesce) ことはいらない (自分がそれなので、待てば止まる)。

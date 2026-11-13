@@ -6,6 +6,7 @@
 //   /proc/PID/cmdline   引数 (NUL で区切る。プロセスのメモリの argv の文字列から)
 //   /proc/PID/environ   環境 (同じく。自分のものか root だけ)
 //   /proc/PID/statm     メモリ (ページ): size resident shared text lib data dt
+//   /proc/PID/smaps     maps の行ごとに、ページの数 (Rss、Pss、Shared / Private の Clean / Dirty、Swap など: vm.rs の smaps_text)
 //   /proc/PID/cwd       -> カレントディレクトリ
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
@@ -79,6 +80,7 @@ enum Node {
     RootLink(u32),
     Exe(u32),
     Maps(u32),
+    Smaps(u32),
     Stack(u32),
     FdDir(u32),
     Fd(u32, usize),
@@ -246,6 +248,7 @@ impl ProcInode {
             Node::RootLink(p) => (p as u64) << 16 | 13,
             Node::Exe(p) => (p as u64) << 16 | 7,
             Node::Maps(p) => (p as u64) << 16 | 8,
+            Node::Smaps(p) => (p as u64) << 16 | 29,
             Node::Stack(p) => (p as u64) << 16 | 9,
             Node::FdDir(p) => (p as u64) << 16 | 6,
             Node::Fd(p, n) => (p as u64) << 16 | (0x100 + n as u64),
@@ -286,7 +289,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) => Some(p),
             _ => None,
         }
     }
@@ -418,6 +421,11 @@ impl ProcInode {
                 let pt = &leader(pid)?.mm().pt;
                 let _h = pt.hold();
                 pt.maps_text()
+            }
+            Node::Smaps(pid) => {
+                let pt = &leader(pid)?.mm().pt;
+                let _h = pt.hold();
+                pt.smaps_text()
             }
             Node::Stack(pid) => {
                 aa_ptrace(pid, false)?;
@@ -789,7 +797,7 @@ impl Inode for ProcInode {
             Node::FdInfoDir(pid) => Some(aa_ptrace(pid, true).and_then(|_| c.check(m, want))),
             // 開くときに mode と、ptrace で読めるか (Linux は open で見る: proc_maps_open と environ_open の mm_access、
             // seq_fdinfo_open。開いたあとで相手が変わっても、読むのはそのまま)
-            Node::Maps(pid) | Node::Environ(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
+            Node::Maps(pid) | Node::Smaps(pid) | Node::Environ(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
             Node::FdInfo(pid, _) => Some(c.check(m, want).and_then(|_| aa_ptrace(pid, true))),
             _ => None,
         }
@@ -1085,6 +1093,7 @@ impl Inode for ProcInode {
             (Node::Pid(p), "root") => Node::RootLink(p),
             (Node::Pid(p), "exe") => Node::Exe(p),
             (Node::Pid(p), "maps") => Node::Maps(p),
+            (Node::Pid(p), "smaps") => Node::Smaps(p),
             (Node::Pid(p), "stack") => Node::Stack(p),
             (Node::Pid(p), "fd") => Node::FdDir(p),
             (Node::Pid(p), "fdinfo") => Node::FdInfoDir(p),
@@ -1221,6 +1230,7 @@ impl Inode for ProcInode {
                 add("root".into(), Node::RootLink(p));
                 add("exe".into(), Node::Exe(p));
                 add("maps".into(), Node::Maps(p));
+                add("smaps".into(), Node::Smaps(p));
                 add("stack".into(), Node::Stack(p));
                 add("fd".into(), Node::FdDir(p));
                 add("fdinfo".into(), Node::FdInfoDir(p));

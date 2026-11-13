@@ -2371,6 +2371,118 @@ impl PageTable {
         out
     }
 
+    /// /proc/PID/smaps (Linux の fs/proc/task_mmu.c の show_smap と同じ形): maps の行のあとに、領域のページの数を kB で。
+    /// 何人で写しているか (mapcount) は kalloc の参照の数 (ファイルのページは、ページキャッシュ (shared_file) の 1 を
+    /// 引く)。2 以上なら Shared、1 なら Private。Pss は 1 ページを写している数で割ったもの (Linux と同じく 12 ビットの端数を
+    /// もって足す)。dirty は、無名のページ (と、ファイルを写した領域で COW したページ) はいつも、ファイルのページは
+    /// キャッシュの dirty か書ける PTE。Referenced は PTE の AF。スワップに出したものは Swap と SwapPss。
+    /// ページを持たないもの (/dev/fb0 などの Pages: Linux の VM_PFNMAP) は 0。透明な大きいページ、KSM、hugetlb、mlock、
+    /// MADV_FREE で捨てられるページ (aios の MADV_FREE は何もしない) は aios にないので 0。redis は起きるとき、fork した子で
+    /// 書いた無名のページの Shared_Dirty を見て (arm64 の古いカーネルのバグを調べる)、読めなければ起きない
+    pub fn smaps_text(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut out = alloc::string::String::new();
+        let maps = self.maps_text();
+        for ((&s, v), line) in self.vmas.iter().zip(maps.lines()) {
+            // (Rss、Shared_Clean、Shared_Dirty、Private_Clean、Private_Dirty、Referenced、Anonymous、Swap) はバイト、
+            // pss と pss_dirty は 12 ビットの端数つき
+            let (mut rss, mut sc, mut sd, mut pc, mut pd, mut rf, mut anon, mut swap) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut pss, mut pss_dirty) = (0u64, 0u64);
+            if !matches!(v.back, Backing::Pages { .. }) {
+                self.each_entry(s, v.end, |va, pte| {
+                    let e = unsafe { *pte };
+                    let pg = PGSIZE as u64;
+                    if is_swap(e) {
+                        swap += pg;
+                        return;
+                    }
+                    let page = page_of(e);
+                    let cached = match &v.back {
+                        Backing::File { ino, off, .. } => shared_file().get(&file_key(ino, off + (va - s))).filter(|c| c.page == page).map(|c| c.dirty),
+                        _ => None,
+                    };
+                    let refs = kalloc::refs(page) as u64;
+                    let (mapcount, dirty) = match cached {
+                        Some(d) => (refs.saturating_sub(1).max(1), d || e & PTE_RDONLY == 0),
+                        None => (refs.max(1), true),
+                    };
+                    rss += pg;
+                    if cached.is_none() {
+                        anon += pg;
+                    }
+                    if e & PTE_AF != 0 {
+                        rf += pg;
+                    }
+                    let share = (pg << 12) / mapcount;
+                    pss += share;
+                    if dirty {
+                        pss_dirty += share;
+                    }
+                    match (mapcount >= 2, dirty) {
+                        (true, true) => sd += pg,
+                        (true, false) => sc += pg,
+                        (false, true) => pd += pg,
+                        (false, false) => pc += pg,
+                    }
+                });
+            }
+            out.push_str(line);
+            out.push('\n');
+            let kb = |b: u64| b >> 10;
+            let rows: [(&str, u64); 22] = [
+                ("Size:", kb((v.end - s) as u64)),
+                ("KernelPageSize:", 4),
+                ("MMUPageSize:", 4),
+                ("Rss:", kb(rss)),
+                ("Pss:", pss >> 22),
+                ("Pss_Dirty:", pss_dirty >> 22),
+                ("Shared_Clean:", kb(sc)),
+                ("Shared_Dirty:", kb(sd)),
+                ("Private_Clean:", kb(pc)),
+                ("Private_Dirty:", kb(pd)),
+                ("Referenced:", kb(rf)),
+                ("Anonymous:", kb(anon)),
+                ("KSM:", 0),
+                ("LazyFree:", 0),
+                ("AnonHugePages:", 0),
+                ("ShmemPmdMapped:", 0),
+                ("FilePmdMapped:", 0),
+                ("Shared_Hugetlb:", 0),
+                ("Private_Hugetlb:", 0),
+                ("Swap:", kb(swap)),
+                ("SwapPss:", kb(swap)),
+                ("Locked:", 0),
+            ];
+            for (k, n) in rows {
+                let _ = writeln!(out, "{:<16}{:>8} kB", k, n);
+            }
+            let _ = writeln!(out, "{:<16}{:>8}", "THPeligible:", 0);
+            // VmFlags (Linux の show_smap_vma_flags と同じ 2 文字。aios の領域から分かるもの)
+            let mut f = alloc::string::String::from("VmFlags: ");
+            let w = v.prot & PROT_WRITE != 0;
+            for (on, name) in [
+                (v.prot & PROT_READ != 0, "rd"),
+                (w, "wr"),
+                (v.prot & PROT_EXEC != 0, "ex"),
+                (v.shared, "sh"),
+                (true, "mr"),
+                (!v.shared || w, "mw"),
+                (true, "me"),
+                (v.shared, "ms"),
+                (matches!(v.back, Backing::Pages { .. }), "pf"),
+                (!v.shared && w, "ac"),
+            ] {
+                if on {
+                    f.push_str(name);
+                    f.push(' ');
+                }
+            }
+            out.push_str(&f);
+            out.push('\n');
+        }
+        out
+    }
+
     /// start から始まる領域の終わりを new_end まで伸ばす (その先が空いているときだけ。mremap)
     pub fn extend(&mut self, start: usize, new_end: usize) -> Option<()> {
         let _m = self.mutating();
