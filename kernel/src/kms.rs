@@ -11,9 +11,15 @@
 //   PAGE_FLIP     framebuffer をかえて、終わったら FLIP_COMPLETE のできごと (read で読む。vblank はないので数は 0)
 // 映す命令もホストが終えるまで待つ (drm.rs と同じ)。はじめは /dev/fb0 を映していて (fb 41)、card0 の最後のファイルを
 // 閉じると /dev/fb0 にもどす (Linux の fbdev の restore)。master は card0 をはじめに開いたファイル。
-// まだ: atomic (DRM_CLIENT_CAP_ATOMIC は EOPNOTSUPP: atomic のないドライバの答え)、カーソル (CURSOR は ENXIO、cursor
-// plane の SETPLANE は EINVAL)、vblank (WAIT_VBLANK は EOPNOTSUPP: virtio_gpu と同じ)、lease、画面の大きさがかわったときの
-// できごと (hotplug)
+//   atomic        MODE_ATOMIC (drm_atomic_uapi.c と drm_atomic_helper.c と virtio_gpu の atomic_check): いまの状態の写しに
+//                 プロパティをあて、たしかめてから映す。atomic のプロパティ (SRC_*、CRTC_*、FB_ID、IN_FENCE_FD、OUT_FENCE_PTR、
+//                 CRTC_ID、FB_DAMAGE_CLIPS、ACTIVE、MODE_ID: 番号 9〜23) は DRM_CLIENT_CAP_ATOMIC を言ったファイルにだけ見える。
+//                 カーソルの plane は、仮想の GPU なので CURSOR_PLANE_HOTSPOT を言わない atomic のファイルには見せない。
+//                 OUT_FENCE_PTR は終わった sync_file (映す命令はホストが終えるまで待つので)
+//   cursor        カーソルの plane (AR24、拡大なし、どこへでも) を virtio-gpu のカーソルのキューへ (UPDATE_CURSOR / MOVE_CURSOR)。
+//                 古い MODE_CURSOR と CURSOR2 は BO から framebuffer を作って plane に (drm_mode_cursor_universal)
+// まだ: vblank (WAIT_VBLANK は EOPNOTSUPP: virtio_gpu と同じ)、lease、画面の大きさがかわったときのできごと (hotplug)、
+// IN_FENCE_FD は -1 と終わった sync_file だけ
 use crate::drm::{Bo, DrmFile};
 use crate::edid::{self, Mode};
 use crate::cell::Bkl;
@@ -23,7 +29,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const ENOENT: i64 = 2;
-const ENXIO: i64 = 6;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
@@ -65,6 +70,9 @@ const P_IMMUTABLE: u32 = 1 << 2;
 const P_ENUM: u32 = 1 << 3;
 const P_BLOB: u32 = 1 << 4;
 const P_SIGNED_RANGE: u32 = 2 << 6;
+const P_OBJECT: u32 = 1 << 6;
+/// atomic を言ったファイルにだけ見えるもの
+const P_ATOMIC: u32 = 0x8000_0000;
 
 struct Prop {
     id: u32,
@@ -75,13 +83,32 @@ struct Prop {
 }
 
 const I32_MIN: u64 = i32::MIN as i64 as u64;
-const PROPS: [Prop; 9] = [
+const I32_MAX: u64 = i32::MAX as u64;
+const U32_MAX: u64 = u32::MAX as u64;
+const NEG1: u64 = -1i64 as u64;
+const PROPS: [Prop; 24] = [
     Prop { id: 1, name: "EDID", flags: P_BLOB | P_IMMUTABLE, values: &[], enums: &[] },
     Prop { id: 2, name: "DPMS", flags: P_ENUM, values: &[0, 1, 2, 3], enums: &[(0, "On"), (1, "Standby"), (2, "Suspend"), (3, "Off")] },
     Prop { id: 4, name: "TILE", flags: P_BLOB | P_IMMUTABLE, values: &[], enums: &[] },
     Prop { id: 5, name: "link-status", flags: P_ENUM, values: &[0, 1], enums: &[(0, "Good"), (1, "Bad")] },
     Prop { id: 6, name: "non-desktop", flags: P_RANGE | P_IMMUTABLE, values: &[0, 1], enums: &[] },
     Prop { id: 8, name: "type", flags: P_ENUM | P_IMMUTABLE, values: &[0, 1, 2], enums: &[(0, "Overlay"), (1, "Primary"), (2, "Cursor")] },
+    // atomic のもの (drm_mode_create_standard_properties の順)
+    Prop { id: 9, name: "SRC_X", flags: P_ATOMIC | P_RANGE, values: &[0, U32_MAX], enums: &[] },
+    Prop { id: 10, name: "SRC_Y", flags: P_ATOMIC | P_RANGE, values: &[0, U32_MAX], enums: &[] },
+    Prop { id: 11, name: "SRC_W", flags: P_ATOMIC | P_RANGE, values: &[0, U32_MAX], enums: &[] },
+    Prop { id: 12, name: "SRC_H", flags: P_ATOMIC | P_RANGE, values: &[0, U32_MAX], enums: &[] },
+    Prop { id: 13, name: "CRTC_X", flags: P_ATOMIC | P_SIGNED_RANGE, values: &[I32_MIN, I32_MAX], enums: &[] },
+    Prop { id: 14, name: "CRTC_Y", flags: P_ATOMIC | P_SIGNED_RANGE, values: &[I32_MIN, I32_MAX], enums: &[] },
+    Prop { id: 15, name: "CRTC_W", flags: P_ATOMIC | P_RANGE, values: &[0, I32_MAX], enums: &[] },
+    Prop { id: 16, name: "CRTC_H", flags: P_ATOMIC | P_RANGE, values: &[0, I32_MAX], enums: &[] },
+    Prop { id: 17, name: "FB_ID", flags: P_ATOMIC | P_OBJECT, values: &[OBJ_FB as u64], enums: &[] },
+    Prop { id: 18, name: "IN_FENCE_FD", flags: P_ATOMIC | P_SIGNED_RANGE, values: &[NEG1, I32_MAX], enums: &[] },
+    Prop { id: 19, name: "OUT_FENCE_PTR", flags: P_ATOMIC | P_RANGE, values: &[0, u64::MAX], enums: &[] },
+    Prop { id: 20, name: "CRTC_ID", flags: P_ATOMIC | P_OBJECT, values: &[OBJ_CRTC as u64], enums: &[] },
+    Prop { id: 21, name: "FB_DAMAGE_CLIPS", flags: P_ATOMIC | P_BLOB, values: &[], enums: &[] },
+    Prop { id: 22, name: "ACTIVE", flags: P_ATOMIC | P_RANGE, values: &[0, 1], enums: &[] },
+    Prop { id: 23, name: "MODE_ID", flags: P_ATOMIC | P_BLOB, values: &[], enums: &[] },
     Prop { id: 24, name: "VRR_ENABLED", flags: P_RANGE, values: &[0, 1], enums: &[] },
     Prop { id: 35, name: "HOTSPOT_X", flags: P_SIGNED_RANGE, values: &[I32_MIN, i32::MAX as u64], enums: &[] },
     Prop { id: 36, name: "HOTSPOT_Y", flags: P_SIGNED_RANGE, values: &[I32_MIN, i32::MAX as u64], enums: &[] },
@@ -116,10 +143,29 @@ struct Kms {
     link: u64,
     vrr: u64,
     hotspot: (u64, u64),
+    /// CRTC の ACTIVE (atomic。DPMS の On と Off もこれをかえる: drm_atomic_helper_connector_dpms)、MODE_ID の blob
+    /// (いまのモードのもの。0 はモードなし)、connector がつながっている CRTC (0 か CRTC)
+    active: bool,
+    mode_blob: u32,
+    conn_crtc: u32,
+    /// カーソルの plane と、古い MODE_CURSOR の MOVE で覚えた位置 (crtc->cursor_x / cursor_y)
+    cur: Cursor,
+    cur_pos: (i32, i32),
     fbs: BTreeMap<u32, Fb>,
     /// ユーザーの blob (CREATEPROPBLOB: 作ったファイル、中身)
     blobs: BTreeMap<u32, (u32, Vec<u8>)>,
     seq: u64,
+}
+
+/// カーソルの plane: framebuffer (0 は消えている)、CRTC の中の四角、framebuffer の中の四角 (16.16)
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Cursor {
+    fb: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    src: [u32; 4],
 }
 
 static KMS: Bkl<Option<Kms>> = Bkl::new(None);
@@ -192,6 +238,15 @@ pub fn init(g: &crate::gpu::Gpu) {
     let mut fbs = BTreeMap::new();
     fbs.insert(FBDEV, Fb { owner: 0, seq: 0, w: g.width, h: g.height, format: XRGB8888, pitch: g.width * 4, offset: 0, bo: None });
     let mode = modes.first().copied().filter(|m| m.hd as u32 <= g.width && m.vd as u32 <= g.height);
+    // はじめのモードの MODE_ID の blob (Linux の fbdev がモードを決めたときに作るもの。カーネルの持ちもの)
+    let mut blobs = BTreeMap::new();
+    let mode_blob = match &mode {
+        Some(m) => {
+            blobs.insert(FIRST_ID, (0, m.to_user(true).to_vec()));
+            FIRST_ID
+        }
+        None => 0,
+    };
     *KMS.get() = Some(Kms {
         modes,
         edid: g.edid.clone(),
@@ -205,8 +260,13 @@ pub fn init(g: &crate::gpu::Gpu) {
         link: 0,
         vrr: 0,
         hotspot: (0, 0),
+        active: mode.is_some(),
+        mode_blob,
+        conn_crtc: if mode.is_some() { CRTC } else { 0 },
+        cur: Cursor::default(),
+        cur_pos: (0, 0),
         fbs,
-        blobs: BTreeMap::new(),
+        blobs,
         seq: 0,
     });
 }
@@ -259,13 +319,7 @@ pub fn ioctl(f: &DrmFile, nr: u32, a: &mut [u8]) -> Result<(), i64> {
         0xa0 => getresources(k, f, a),
         0xa1 => getcrtc(k, f, a),
         0xa2 => setcrtc(k, a),
-        // カーソルはまだ (Linux の、カーソルのない CRTC の答え)
-        0xa3 | 0xbb => {
-            if le32(a, 4) != CRTC {
-                return Err(-ENOENT);
-            }
-            Err(-ENXIO)
-        }
+        0xa3 | 0xbb => cursor_legacy(k, f, a, nr == 0xbb),
         0xa4 | 0xa5 => {
             if le32(a, 0) != CRTC {
                 return Err(-ENOENT);
@@ -282,7 +336,7 @@ pub fn ioctl(f: &DrmFile, nr: u32, a: &mut [u8]) -> Result<(), i64> {
         0xaa => getproperty(a),
         0xab => {
             let (v, p, o) = (le64(a, 0), le32(a, 8), le32(a, 12));
-            setprop(k, o, OBJ_CONNECTOR, p, v)
+            setprop(k, f, o, OBJ_CONNECTOR, p, v)
         }
         0xac => getpropblob(k, a),
         0xad => getfb(k, f, a),
@@ -297,7 +351,13 @@ pub fn ioctl(f: &DrmFile, nr: u32, a: &mut [u8]) -> Result<(), i64> {
         }
         0xb4 => f.gem_close(le32(a, 0)),
         0xb5 => {
-            let ids: &[u32] = if f.universal_planes() { &[PLANE_PRIMARY, PLANE_CURSOR] } else { &[] };
+            let ids: &[u32] = if !f.universal_planes() {
+                &[]
+            } else if !cursor_visible(f) {
+                &[PLANE_PRIMARY]
+            } else {
+                &[PLANE_PRIMARY, PLANE_CURSOR]
+            };
             put_ids(le64(a, 0), le32(a, 8), ids)?;
             set32(a, 8, ids.len() as u32);
             Ok(())
@@ -307,15 +367,14 @@ pub fn ioctl(f: &DrmFile, nr: u32, a: &mut [u8]) -> Result<(), i64> {
         0xb8 => addfb2(k, f, a),
         0xb9 => {
             let (id, typ) = (le32(a, 20), le32(a, 24));
-            let props = obj_props(k, id, typ)?;
+            let props = obj_props(k, id, typ, f.atomic())?;
             put_props(a, 0, 8, 16, &props)
         }
         0xba => {
             let (v, p, o, t) = (le64(a, 0), le32(a, 8), le32(a, 12), le32(a, 16));
-            setprop(k, o, t, p, v)
+            setprop(k, f, o, t, p, v)
         }
-        // atomic のないドライバ
-        0xbc => Err(-EOPNOTSUPP),
+        0xbc => atomic(k, f, a),
         0xbd => {
             let len = le32(a, 8) as usize;
             if len == 0 || len > i32::MAX as usize - 64 {
@@ -335,7 +394,11 @@ pub fn ioctl(f: &DrmFile, nr: u32, a: &mut [u8]) -> Result<(), i64> {
                 None => Err(-ENOENT),
                 Some((o, _)) if *o != f.id() => Err(-EPERM),
                 Some(_) => {
-                    k.blobs.remove(&id);
+                    // 使っている (MODE_ID) ものは、ファイルの持ちものでなくなるだけ (Linux は参照を持っている)
+                    if let Some(b) = k.blobs.get_mut(&id) {
+                        b.0 = 0;
+                    }
+                    gc_blobs(k);
                     Ok(())
                 }
             }
@@ -416,7 +479,7 @@ fn present(k: &Kms, dirty: Option<(u32, u32, u32, u32)>) {
         g.scanout(0, 0, 0, 0, 0);
         return;
     };
-    if k.dpms != 0 {
+    if !k.active {
         g.scanout(0, 0, 0, 0, 0);
         return;
     }
@@ -508,10 +571,19 @@ fn setcrtc(k: &mut Kms, a: &mut [u8]) -> Result<(), i64> {
             return Err(-EINVAL);
         }
     }
+    // モードが変われば、新しい MODE_ID の blob (drm_atomic_set_mode_for_crtc)
+    if mode != k.mode {
+        k.mode_blob = match &mode {
+            Some(m) => kernel_blob(k, m.to_user(true).to_vec()),
+            None => 0,
+        };
+    }
     k.mode = mode;
     k.fb = fb;
     k.x = if mode.is_some() { x } else { 0 };
     k.y = if mode.is_some() { y } else { 0 };
+    k.active = mode.is_some();
+    k.conn_crtc = if mode.is_some() { CRTC } else { 0 };
     if mode.is_some() {
         k.dpms = 0;
     }
@@ -522,8 +594,22 @@ fn setcrtc(k: &mut Kms, a: &mut [u8]) -> Result<(), i64> {
 
 /// 手放した framebuffer (CLOSEFB) で、もう映していないものを落とす
 fn gc(k: &mut Kms) {
-    let cur = k.fb;
-    k.fbs.retain(|&id, fb| id == FBDEV || fb.owner != 0 || id == cur);
+    let (cur, cursor) = (k.fb, k.cur.fb);
+    k.fbs.retain(|&id, fb| id == FBDEV || fb.owner != 0 || id == cur || id == cursor);
+    gc_blobs(k);
+}
+
+/// カーネルの持ちもの (owner 0) の blob で、もう MODE_ID に使っていないものを落とす (Linux は参照の数で)
+fn gc_blobs(k: &mut Kms) {
+    let used = k.mode_blob;
+    k.blobs.retain(|&id, b| b.0 != 0 || id == used);
+}
+
+/// カーネルの blob を作る (MODE_ID: モードを変えたとき)
+fn kernel_blob(k: &mut Kms, data: Vec<u8>) -> u32 {
+    let id = new_id(k);
+    k.blobs.insert(id, (0, data));
+    id
 }
 
 fn getencoder(k: &Kms, a: &mut [u8]) -> Result<(), i64> {
@@ -563,12 +649,13 @@ fn getconnector(k: &Kms, f: &DrmFile, a: &mut [u8]) -> Result<(), i64> {
     }
     set32(a, 32, list.len() as u32);
     set32(a, 44, if enabled(k) { ENCODER } else { 0 });
-    let props = obj_props(k, CONNECTOR, OBJ_CONNECTOR)?;
+    let props = obj_props(k, CONNECTOR, OBJ_CONNECTOR, f.atomic())?;
     put_props(a, 16, 24, 36, &props)
 }
 
-/// オブジェクトのプロパティ (番号, 値)。ないものは ENOENT、プロパティを持たないもの (encoder、framebuffer、blob ...) は EINVAL
-fn obj_props(k: &Kms, id: u32, typ: u32) -> Result<Vec<(u32, u64)>, i64> {
+/// オブジェクトのプロパティ (番号, 値)。ないものは ENOENT、プロパティを持たないもの (encoder、framebuffer、blob ...) は EINVAL。
+/// atomic のファイルには atomic のものも (Linux の drm_mode_object_get_properties: DRM_MODE_PROP_ATOMIC は atomic のときだけ)
+fn obj_props(k: &Kms, id: u32, typ: u32, atomic: bool) -> Result<Vec<(u32, u64)>, i64> {
     let t = match id {
         PLANE_PRIMARY | PLANE_CURSOR => OBJ_PLANE,
         CRTC => OBJ_CRTC,
@@ -583,11 +670,32 @@ fn obj_props(k: &Kms, id: u32, typ: u32) -> Result<Vec<(u32, u64)>, i64> {
     if typ != 0 && typ != t {
         return Err(-ENOENT);
     }
+    let edid = if k.edid.is_empty() { 0 } else { EDID_BLOB as u64 };
+    // plane の atomic のもの: FB_ID、IN_FENCE_FD、CRTC_ID、CRTC_X/Y/W/H、SRC_X/Y/W/H (drm_plane_create の順)
+    let plane = |p: &PlaneSt| {
+        vec![
+            (17, p.fb as u64),
+            (18, NEG1),
+            (20, p.crtc as u64),
+            (13, p.dst.0 as i64 as u64),
+            (14, p.dst.1 as i64 as u64),
+            (15, p.dst.2 as u64),
+            (16, p.dst.3 as u64),
+            (9, p.src[0] as u64),
+            (10, p.src[1] as u64),
+            (11, p.src[2] as u64),
+            (12, p.src[3] as u64),
+        ]
+    };
     Ok(match id {
+        PLANE_PRIMARY if atomic => [vec![(8, 1)], plane(&primary_state(k)), vec![(21, 0)]].concat(),
+        PLANE_CURSOR if atomic => [vec![(8, 2)], plane(&cursor_state(k)), vec![(35, k.hotspot.0), (36, k.hotspot.1)]].concat(),
+        CRTC if atomic => vec![(22, k.active as u64), (23, k.mode_blob as u64), (19, 0), (24, k.vrr)],
+        CONNECTOR if atomic => vec![(2, k.dpms), (5, k.link), (6, 0), (4, 0), (20, k.conn_crtc as u64), (1, edid)],
         PLANE_PRIMARY => vec![(8, 1)],
         PLANE_CURSOR => vec![(8, 2), (35, k.hotspot.0), (36, k.hotspot.1)],
         CRTC => vec![(24, k.vrr)],
-        CONNECTOR => vec![(2, k.dpms), (5, k.link), (6, 0), (4, 0), (1, if k.edid.is_empty() { 0 } else { EDID_BLOB as u64 })],
+        CONNECTOR => vec![(2, k.dpms), (5, k.link), (6, 0), (4, 0), (1, edid)],
         _ => return Err(-EINVAL),
     })
 }
@@ -629,18 +737,28 @@ fn getproperty(a: &mut [u8]) -> Result<(), i64> {
     Ok(())
 }
 
-/// プロパティを変える (drm_mode_obj_set_property_ioctl と、atomic のドライバの set_property_atomic)
-fn setprop(k: &mut Kms, obj: u32, typ: u32, prop: u32, v: u64) -> Result<(), i64> {
-    let props = obj_props(k, obj, typ)?;
+/// プロパティを変える (drm_mode_obj_set_property_ioctl と、atomic のドライバの set_property_atomic: atomic のプロパティは
+/// それだけの atomic のコミットで。モードを変えてもよい)
+fn setprop(k: &mut Kms, f: &DrmFile, obj: u32, typ: u32, prop: u32, v: u64) -> Result<(), i64> {
+    let props = obj_props(k, obj, typ, true)?;
     if !props.iter().any(|p| p.0 == prop) {
         return Err(-EINVAL);
     }
+    if PROPS.iter().any(|p| p.id == prop && p.flags & P_ATOMIC != 0) {
+        let mut s = St::now(k);
+        let mut incl = false;
+        s.set(k, f, obj, prop, v, &mut incl)?;
+        return commit(k, f, s, ALLOW_MODESET, 0, incl);
+    }
     match (obj, prop) {
-        // DPMS: On のほかは Off。とまる・映すをかえる
+        // DPMS: On のほかは Off。とまる・映すをかえる (atomic のドライバでは CRTC の ACTIVE)
         (CONNECTOR, 2) => {
             let d = if v == 0 { 0 } else { 3 };
             if d != k.dpms {
                 k.dpms = d;
+                if k.mode.is_some() {
+                    k.active = d == 0;
+                }
                 present(k, None);
             }
             Ok(())
@@ -794,10 +912,15 @@ fn rmfb(k: &mut Kms, f: &DrmFile, id: u32, remove: bool) -> Result<(), i64> {
         Some(fb) if fb.owner == f.id() && fb.owner != 0 => {}
         _ => return Err(-ENOENT),
     }
-    // 映していれば primary plane を外す (atomic_remove_fb: CRTC は動いたまま、画面は消える)
+    // 映していれば primary plane を外す (atomic_remove_fb: CRTC は動いたまま、画面は消える)。カーソルも
     if remove && k.fb == id {
         k.fb = 0;
         present(k, None);
+    }
+    if remove && k.cur.fb == id {
+        let old = k.cur;
+        k.cur = Cursor::default();
+        cursor_update(k, old);
     }
     if let Some(fb) = k.fbs.get_mut(&id) {
         fb.owner = 0;
@@ -934,9 +1057,13 @@ fn getplane(k: &Kms, a: &mut [u8]) -> Result<(), i64> {
         PLANE_CURSOR => ARGB8888,
         _ => return Err(-ENOENT),
     };
-    let on = id == PLANE_PRIMARY && active(k);
-    set32(a, 4, if on { CRTC } else { 0 });
-    set32(a, 8, if on { k.fb } else { 0 });
+    let (crtc, fb) = match id {
+        PLANE_PRIMARY if active(k) => (CRTC, k.fb),
+        PLANE_CURSOR if k.cur.fb != 0 => (CRTC, k.cur.fb),
+        _ => (0, 0),
+    };
+    set32(a, 4, crtc);
+    set32(a, 8, fb);
     set32(a, 12, 1);
     set32(a, 16, 0);
     if le32(a, 20) >= 1 {
@@ -993,20 +1120,45 @@ pub fn file_closed(id: u32) {
             k.fb = 0;
             present(k, None);
         }
+        if k.cur.fb == i {
+            let old = k.cur;
+            k.cur = Cursor::default();
+            cursor_update(k, old);
+        }
         k.fbs.remove(&i);
     }
-    k.blobs.retain(|_, b| b.0 != id);
+    // ファイルの blob: MODE_ID に使っているものはカーネルのものに
+    for b in k.blobs.values_mut() {
+        if b.0 == id {
+            b.0 = 0;
+        }
+    }
+    gc_blobs(k);
 }
 
 /// 最後の DRM のファイルを閉じた (Linux の drm_lastclose → fbdev の restore): /dev/fb0 を、はじめのモードで映す
 pub fn lastclose() {
     let Some(k) = KMS.get().as_mut() else { return };
     let Some(g) = crate::gpu::get() else { return };
-    k.mode = k.modes.first().copied().filter(|m| m.hd as u32 <= g.width && m.vd as u32 <= g.height);
+    let mode = k.modes.first().copied().filter(|m| m.hd as u32 <= g.width && m.vd as u32 <= g.height);
+    if mode != k.mode {
+        k.mode_blob = match &mode {
+            Some(m) => kernel_blob(k, m.to_user(true).to_vec()),
+            None => 0,
+        };
+    }
+    k.mode = mode;
     k.fb = if k.mode.is_some() { FBDEV } else { 0 };
     k.x = 0;
     k.y = 0;
     k.dpms = 0;
+    k.active = k.mode.is_some();
+    k.conn_crtc = if k.mode.is_some() { CRTC } else { 0 };
+    k.hotspot = (0, 0);
+    // ほかの plane (カーソル) は消す (drm_client_modeset_commit)
+    let old = k.cur;
+    k.cur = Cursor::default();
+    cursor_update(k, old);
     present(k, None);
     gc(k);
 }
@@ -1026,4 +1178,462 @@ pub fn cap(c: u64) -> Result<u64, i64> {
         0x12 => 1,
         _ => return Err(-EINVAL),
     })
+}
+
+// ---- atomic (drm_atomic_uapi.c、drm_atomic.c、drm_atomic_helper.c と virtio_gpu の atomic_check) ----
+
+const EVENT: u32 = 1;
+const ASYNC: u32 = 2;
+const TEST_ONLY: u32 = 0x100;
+const NONBLOCK: u32 = 0x200;
+const ALLOW_MODESET: u32 = 0x400;
+/// DRM_MODE_PROP_EXTENDED_TYPE (OBJECT と SIGNED_RANGE はこの中の数)
+const P_EXT: u32 = 0xffc0;
+
+/// plane の状態 (atomic のプロパティの形): framebuffer、CRTC、framebuffer の中の四角 (16.16)、CRTC の中の四角
+#[derive(Clone, Copy, Default, PartialEq)]
+struct PlaneSt {
+    fb: u32,
+    crtc: u32,
+    src: [u32; 4],
+    dst: (i32, i32, u32, u32),
+}
+
+/// primary はいつも CRTC 全体を大きさをかえずに (virtio_gpu_plane_atomic_check)。framebuffer の中の左上だけ選べる
+fn primary_state(k: &Kms) -> PlaneSt {
+    match k.mode {
+        Some(m) if k.fb != 0 => {
+            let (w, h) = (m.hd as u32, m.vd as u32);
+            PlaneSt { fb: k.fb, crtc: CRTC, src: [k.x << 16, k.y << 16, w << 16, h << 16], dst: (0, 0, w, h) }
+        }
+        _ => PlaneSt::default(),
+    }
+}
+
+/// カーソルの plane (消したあとも、atomic で決めた位置と大きさは残る: Linux の plane_state)
+fn cursor_state(k: &Kms) -> PlaneSt {
+    let c = &k.cur;
+    PlaneSt { fb: c.fb, crtc: if c.fb != 0 { CRTC } else { 0 }, src: c.src, dst: (c.x, c.y, c.w, c.h) }
+}
+
+/// カーソルの plane を見せるか: 仮想の GPU (virtio_gpu は DRIVER_CURSOR_HOTSPOT) では、atomic のファイルは
+/// CURSOR_PLANE_HOTSPOT を言ったときだけ (drm_plane の「Disable the cursor plane on atomic contexts with virtualized drivers」)
+fn cursor_visible(f: &DrmFile) -> bool {
+    !f.atomic() || f.cursor_hotspot()
+}
+
+/// コミットする状態 (drm_atomic_state: いまの状態の写しにプロパティをあてたもの)
+#[derive(Clone)]
+struct St {
+    active: bool,
+    mode_blob: u32,
+    conn_crtc: u32,
+    vrr: u64,
+    link: u64,
+    p: [PlaneSt; 2],
+    hot: (u64, u64),
+    fence_ptr: u64,
+}
+
+impl St {
+    fn now(k: &Kms) -> St {
+        St { active: k.active, mode_blob: k.mode_blob, conn_crtc: k.conn_crtc, vrr: k.vrr, link: k.link, p: [primary_state(k), cursor_state(k)], hot: k.hotspot, fence_ptr: 0 }
+    }
+
+    /// 1 つのプロパティ (drm_atomic_set_property)。incl は CRTC がこの状態に入ったか (できごとを出せるか)
+    fn set(&mut self, k: &Kms, f: &DrmFile, obj: u32, prop: u32, v: u64, incl: &mut bool) -> Result<(), i64> {
+        // プロパティのないオブジェクト (encoder、framebuffer、blob) とないものは ENOENT
+        let props = obj_props(k, obj, 0, true).map_err(|_| -ENOENT)?;
+        if obj == PLANE_CURSOR && !cursor_visible(f) {
+            return Err(-ENOENT);
+        }
+        if !props.iter().any(|p| p.0 == prop) {
+            return Err(-ENOENT);
+        }
+        let p = PROPS.iter().find(|p| p.id == prop).ok_or(-ENOENT)?;
+        if !value_ok(k, p, v) {
+            return Err(-EINVAL);
+        }
+        match obj {
+            PLANE_PRIMARY | PLANE_CURSOR => {
+                let i = (obj == PLANE_CURSOR) as usize;
+                // plane の状態をとると、いまつながっている CRTC も入る (drm_atomic_get_plane_state)
+                if self.p[i].crtc != 0 {
+                    *incl = true;
+                }
+                let pl = &mut self.p[i];
+                match prop {
+                    17 => pl.fb = v as u32,
+                    20 => {
+                        pl.crtc = v as u32;
+                        *incl |= v != 0;
+                    }
+                    13 => pl.dst.0 = v as i64 as i32,
+                    14 => pl.dst.1 = v as i64 as i32,
+                    15 => pl.dst.2 = v as u32,
+                    16 => pl.dst.3 = v as u32,
+                    9..=12 => pl.src[(prop - 9) as usize] = v as u32,
+                    // -1 か、終わった sync_file
+                    18 if v as i64 != -1 && !sync_file_ok(v as i64 as i32) => return Err(-EINVAL),
+                    18 | 21 => {}
+                    35 => self.hot.0 = v,
+                    36 => self.hot.1 = v,
+                    _ => return Err(-EINVAL),
+                }
+            }
+            CRTC => {
+                *incl = true;
+                match prop {
+                    22 => self.active = v != 0,
+                    23 => {
+                        // モードの blob は drm_mode_modeinfo の大きさで、正しいモード (drm_atomic_set_mode_prop_for_crtc)
+                        if v != 0 {
+                            let b = &k.blobs.get(&(v as u32)).ok_or(-EINVAL)?.1;
+                            if b.len() != 68 {
+                                return Err(-EINVAL);
+                            }
+                            Mode::from_user(b)?;
+                        }
+                        self.mode_blob = v as u32;
+                    }
+                    19 => self.fence_ptr = v,
+                    24 => self.vrr = (v != 0) as u64,
+                    _ => return Err(-EINVAL),
+                }
+            }
+            CONNECTOR => {
+                if self.conn_crtc != 0 {
+                    *incl = true;
+                }
+                match prop {
+                    20 => {
+                        self.conn_crtc = v as u32;
+                        *incl |= v != 0;
+                    }
+                    // DPMS は古い道だけ (drm_atomic_connector_set_property)
+                    2 => return Err(-EINVAL),
+                    // link-status: Good からはユーザーが下げられない
+                    5 => {
+                        if self.link != 0 {
+                            self.link = v;
+                        }
+                    }
+                    _ => return Err(-EINVAL),
+                }
+            }
+            _ => return Err(-ENOENT),
+        }
+        Ok(())
+    }
+
+    /// MODE_ID のモード
+    fn mode(&self, k: &Kms) -> Option<Mode> {
+        if self.mode_blob == k.mode_blob {
+            return k.mode;
+        }
+        k.blobs.get(&self.mode_blob).and_then(|b| Mode::from_user(&b.1).ok())
+    }
+}
+
+/// プロパティの値としてよいか (drm_property_change_valid_get)
+fn value_ok(k: &Kms, p: &Prop, v: u64) -> bool {
+    if p.flags & P_IMMUTABLE != 0 {
+        return false;
+    }
+    if p.flags & P_RANGE != 0 {
+        return v >= p.values[0] && v <= p.values[1];
+    }
+    if p.flags & P_EXT == P_SIGNED_RANGE {
+        return v as i64 >= p.values[0] as i64 && v as i64 <= p.values[1] as i64;
+    }
+    if p.flags & P_ENUM != 0 {
+        return p.values.contains(&v);
+    }
+    if p.flags & P_BLOB != 0 {
+        return v == 0 || k.blobs.contains_key(&(v as u32)) || (v == EDID_BLOB as u64 && !k.edid.is_empty());
+    }
+    if p.flags & P_EXT == P_OBJECT {
+        return v == 0 || (p.values[0] == OBJ_FB as u64 && k.fbs.contains_key(&(v as u32))) || (p.values[0] == OBJ_CRTC as u64 && v == CRTC as u64);
+    }
+    false
+}
+
+/// たしかめる (drm_atomic_check_only: plane、CRTC と connector、ドライバ)
+fn check(k: &Kms, s: &St, allow_modeset: bool) -> Result<(), i64> {
+    let mode = s.mode(k);
+    // plane: CRTC と framebuffer はいっしょに、形、framebuffer の中の四角 (drm_atomic_plane_check)
+    for (i, p) in s.p.iter().enumerate() {
+        if (p.crtc != 0) != (p.fb != 0) {
+            return Err(-EINVAL);
+        }
+        if p.fb == 0 {
+            continue;
+        }
+        let fb = k.fbs.get(&p.fb).ok_or(-EINVAL)?;
+        if fb.format != if i == 0 { XRGB8888 } else { ARGB8888 } {
+            return Err(-EINVAL);
+        }
+        let (fw, fh) = ((fb.w as u64) << 16, (fb.h as u64) << 16);
+        let [sx, sy, sw, sh] = p.src.map(|v| v as u64);
+        if sw > fw || sx > fw - sw || sh > fh || sy > fh - sh {
+            return Err(-ENOSPC);
+        }
+    }
+    // CRTC: ACTIVE にはモードが、モードのある CRTC には connector がいる (drm_atomic_helper_check_modeset)
+    let enable = mode.is_some();
+    if s.active && !enable {
+        return Err(-EINVAL);
+    }
+    if enable != (s.conn_crtc == CRTC) {
+        return Err(-EINVAL);
+    }
+    if let Some(m) = &mode {
+        if s.mode_blob != k.mode_blob && !mode_ok(m) {
+            return Err(-EINVAL);
+        }
+    }
+    // plane と CRTC: 拡大はしない (ERANGE)、primary は CRTC 全体 (drm_atomic_helper_check_plane_state)
+    for (i, p) in s.p.iter().enumerate() {
+        if p.fb == 0 {
+            continue;
+        }
+        let Some(m) = &mode else { return Err(-EINVAL) };
+        if p.src[2] >> 16 != p.dst.2 || p.src[3] >> 16 != p.dst.3 || p.src[2] & 0xffff != 0 || p.src[3] & 0xffff != 0 {
+            return Err(-ERANGE);
+        }
+        if i == 0 && (p.dst.0 != 0 || p.dst.1 != 0 || p.dst.2 != m.hd as u32 || p.dst.3 != m.vd as u32) {
+            return Err(-EINVAL);
+        }
+    }
+    // モードのある CRTC には primary がいる (drm_atomic_helper_check_crtc_primary_plane)
+    if enable && s.p[0].fb == 0 {
+        return Err(-EINVAL);
+    }
+    // モードを変えるもの (drm_atomic_crtc_needs_modeset) は ALLOW_MODESET がいる
+    if (mode != k.mode || s.active != k.active || s.conn_crtc != k.conn_crtc) && !allow_modeset {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+/// コミット: できごとと OUT_FENCE_PTR を用意して (prepare_signaling)、たしかめ、TEST_ONLY でなければ映す
+fn commit(k: &mut Kms, f: &DrmFile, s: St, flags: u32, user: u64, incl: bool) -> Result<(), i64> {
+    let test = flags & TEST_ONLY != 0;
+    // できごとを待つのに、それを出す CRTC がない
+    if flags & EVENT != 0 && !incl {
+        return Err(-EINVAL);
+    }
+    if flags & EVENT != 0 && !test && !f.event_room(32) {
+        return Err(-ENOMEM);
+    }
+    let mut fence = None;
+    if s.fence_ptr != 0 && !test {
+        let fd = sync_file_fd()?;
+        if copy_out(s.fence_ptr, &(fd as i32).to_le_bytes()).is_err() {
+            let _ = crate::sysfile::close(fd as u64);
+            return Err(-EFAULT);
+        }
+        fence = Some(fd);
+    }
+    if let Err(e) = check(k, &s, flags & ALLOW_MODESET != 0) {
+        if let Some(fd) = fence {
+            let _ = crate::sysfile::close(fd as u64);
+        }
+        return Err(e);
+    }
+    if test {
+        return Ok(());
+    }
+    apply(k, s);
+    if flags & EVENT != 0 {
+        // drm_event_vblank の FLIP_COMPLETE (page_flip と同じ形)
+        let now = crate::timer::uptime_ns();
+        let mut e = [0u8; 32];
+        set32(&mut e, 0, 2);
+        set32(&mut e, 4, 32);
+        set64(&mut e, 8, user);
+        set32(&mut e, 16, (now / 1_000_000_000) as u32);
+        set32(&mut e, 20, (now % 1_000_000_000 / 1000) as u32);
+        set32(&mut e, 28, CRTC);
+        f.push_event(&e);
+    }
+    Ok(())
+}
+
+/// たしかめた状態を映す (drm_atomic_helper_commit。映す命令はホストが終えるまで待つので、終わってから返る)
+fn apply(k: &mut Kms, s: St) {
+    let mode = s.mode(k);
+    let modeset = mode != k.mode || s.active != k.active || s.conn_crtc != k.conn_crtc;
+    let (old_primary, old_cur) = (primary_state(k), k.cur);
+    k.mode = mode;
+    k.mode_blob = s.mode_blob;
+    k.active = s.active;
+    k.conn_crtc = s.conn_crtc;
+    k.vrr = s.vrr;
+    k.link = s.link;
+    // DPMS は ACTIVE についていく (drm_atomic_helper_update_legacy_modeset_state)
+    if modeset {
+        k.dpms = if s.active { 0 } else { 3 };
+    }
+    let p = s.p[0];
+    k.fb = p.fb;
+    k.x = p.src[0] >> 16;
+    k.y = p.src[1] >> 16;
+    let c = s.p[1];
+    k.cur = Cursor { fb: c.fb, x: c.dst.0, y: c.dst.1, w: c.dst.2, h: c.dst.3, src: c.src };
+    k.hotspot = s.hot;
+    if modeset || primary_state(k) != old_primary {
+        present(k, None);
+    }
+    cursor_update(k, old_cur);
+    gc(k);
+}
+
+/// MODE_ATOMIC (drm_mode_atomic_ioctl)
+fn atomic(k: &mut Kms, f: &DrmFile, a: &mut [u8]) -> Result<(), i64> {
+    const FLAGS: u32 = EVENT | ASYNC | TEST_ONLY | NONBLOCK | ALLOW_MODESET;
+    let (flags, nobj) = (le32(a, 0), le32(a, 4));
+    let (objs, counts, props, vals, reserved, user) = (le64(a, 8), le64(a, 16), le64(a, 24), le64(a, 32), le64(a, 40), le64(a, 48));
+    if !f.atomic() {
+        return Err(-EINVAL);
+    }
+    if flags & !FLAGS != 0 || reserved != 0 {
+        return Err(-EINVAL);
+    }
+    // 待たずに替えること (async page flip) はできない
+    if flags & ASYNC != 0 {
+        return Err(-EINVAL);
+    }
+    if flags & TEST_ONLY != 0 && flags & EVENT != 0 {
+        return Err(-EINVAL);
+    }
+    let mut s = St::now(k);
+    let mut incl = false;
+    let mut at = 0u64;
+    for i in 0..nobj as u64 {
+        let mut b = [0u8; 4];
+        copy_in(objs + i * 4, &mut b)?;
+        let obj = u32::from_le_bytes(b);
+        copy_in(counts + i * 4, &mut b)?;
+        let n = u32::from_le_bytes(b);
+        obj_props(k, obj, 0, true).map_err(|_| -ENOENT)?;
+        for _ in 0..n {
+            let mut pb = [0u8; 4];
+            let mut vb = [0u8; 8];
+            copy_in(props + at * 4, &mut pb)?;
+            copy_in(vals + at * 8, &mut vb)?;
+            at += 1;
+            s.set(k, f, obj, u32::from_le_bytes(pb), u64::from_le_bytes(vb), &mut incl)?;
+        }
+    }
+    commit(k, f, s, flags, user, incl)
+}
+
+/// カーソルをホストへ (virtio_gpu_cursor_plane_update): 絵がかわれば資源を写して UPDATE_CURSOR、位置だけなら MOVE_CURSOR
+fn cursor_update(k: &Kms, old: Cursor) {
+    let Some(g) = crate::gpu::get() else { return };
+    let c = k.cur;
+    if c.fb != old.fb {
+        let mut res = 0;
+        if let Some(fb) = k.fbs.get(&c.fb)
+            && let Some(bo) = &fb.bo
+        {
+            if bo.dumb {
+                g.transfer_2d(bo.res, 0, 0, c.w.min(fb.w), c.h.min(fb.h), fb.offset as u64);
+            }
+            res = bo.res;
+        }
+        g.cursor(true, res, c.x, c.y, (k.hotspot.0 as u32, k.hotspot.1 as u32));
+    } else if c.fb != 0 && (c.x, c.y) != (old.x, old.y) {
+        g.cursor(false, 0, c.x, c.y, (0, 0));
+    }
+}
+
+/// MODE_CURSOR と CURSOR2 (drm_mode_cursor_common と drm_mode_cursor_universal): BO から AR24 の framebuffer を作って
+/// カーソルの plane に。BO がなければ消す。MOVE がなければ前の位置
+fn cursor_legacy(k: &mut Kms, f: &DrmFile, a: &mut [u8], v2: bool) -> Result<(), i64> {
+    const BO: u32 = 1;
+    const MOVE: u32 = 2;
+    let flags = le32(a, 0);
+    if flags == 0 || flags & !(BO | MOVE) != 0 {
+        return Err(-EINVAL);
+    }
+    if le32(a, 4) != CRTC {
+        return Err(-ENOENT);
+    }
+    let (x, y, w, h, handle) = (le32(a, 8) as i32, le32(a, 12) as i32, le32(a, 16), le32(a, 20), le32(a, 24));
+    let hot = if v2 { (le32(a, 28) as i32 as i64 as u64, le32(a, 32) as i32 as i64 as u64) } else { (0, 0) };
+    let mut s = St::now(k);
+    let mut fb = s.p[1].fb;
+    let mut made = None;
+    if flags & BO != 0 {
+        fb = 0;
+        if handle != 0 {
+            // virtio_gpu の fb_create は BO の大きさを見ない (Linux と同じ答え)
+            let bo = f.bo(handle).ok_or(-EINVAL)?;
+            if w == 0 || h == 0 || w > edid::MAX || h > edid::MAX {
+                return Err(-EINVAL);
+            }
+            let id = new_id(k);
+            k.seq += 1;
+            k.fbs.insert(id, Fb { owner: 0, seq: k.seq, w, h, format: ARGB8888, pitch: w * 4, offset: 0, bo: Some(bo) });
+            made = Some(id);
+            fb = id;
+            s.hot = hot;
+        }
+    }
+    let (cx, cy) = if flags & MOVE != 0 { (x, y) } else { k.cur_pos };
+    s.p[1] = match fb {
+        0 => PlaneSt::default(),
+        id => {
+            let (w, h) = (k.fbs[&id].w, k.fbs[&id].h);
+            PlaneSt { fb: id, crtc: CRTC, src: [0, 0, w << 16, h << 16], dst: (cx, cy, w, h) }
+        }
+    };
+    if let Err(e) = check(k, &s, false) {
+        if let Some(id) = made {
+            k.fbs.remove(&id);
+        }
+        return Err(e);
+    }
+    apply(k, s);
+    if flags & MOVE != 0 {
+        k.cur_pos = (x, y);
+    }
+    Ok(())
+}
+
+/// 終わった fence の sync_file (OUT_FENCE_PTR: 映す命令はホストが終えるまで待つので、返るときには終わっている)
+struct SyncFile;
+
+impl crate::file::FileOps for SyncFile {
+    fn describe(&self) -> alloc::string::String {
+        "anon_inode:sync_file".into()
+    }
+    fn class(&self) -> usize {
+        9
+    }
+    fn stream(&self) -> bool {
+        true
+    }
+    fn read(&self, _dst: &mut [u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(-EINVAL)
+    }
+    fn write(&self, _src: &[u8], _nonblock: bool) -> Result<usize, i64> {
+        Err(-EINVAL)
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        (true, false, false)
+    }
+}
+
+/// sync_file を開く (O_CLOEXEC: Linux の sync_file_get_fd)
+fn sync_file_fd() -> Result<usize, i64> {
+    let file = crate::file::new(crate::file::Kind::Ops(Rc::new(SyncFile)), 0);
+    crate::proc::current().files().add(file, true, 0).ok_or(-24)
+}
+
+/// fd が sync_file か (IN_FENCE_FD)
+fn sync_file_ok(fd: i32) -> bool {
+    fd >= 0 && crate::proc::current().files().get(fd as u64).is_some_and(|f| f.borrow().describe() == "anon_inode:sync_file")
 }

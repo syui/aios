@@ -23,6 +23,9 @@ pub const RESOURCE_CREATE_2D: u32 = 0x0101;
 const SET_SCANOUT: u32 = 0x0103;
 const RESOURCE_FLUSH: u32 = 0x0104;
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
+/// カーソルのキュー (cursorq: virtqueue 1) の命令: 絵をかえる、動かすだけ
+const UPDATE_CURSOR: u32 = 0x0300;
+const MOVE_CURSOR: u32 = 0x0301;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const GET_CAPSET_INFO: u32 = 0x0108;
 const GET_EDID: u32 = 0x010a;
@@ -47,6 +50,9 @@ const ENTRIES_PER_PAGE: usize = PGSIZE / 16;
 pub struct Gpu {
     mmio: Mmio,
     q: Queue,
+    /// カーソルのキュー (Linux の virtio_gpu の cursorq) と、命令を置くページ
+    cq: Option<Queue>,
+    creq: *mut u8,
     pub width: u32,
     pub height: u32,
     /// フレームバッファのページ (カーネルの仮想アドレス)。並びの順に画面の上から
@@ -207,6 +213,29 @@ impl Gpu {
     }
 
 
+    /// カーソル (virtio_gpu_cursor_plane_update の cursor ping): update なら絵を資源 res (0 で消す) と hotspot にかえて
+    /// (x, y) へ、でなければ動かすだけ。答えは待たない (Linux も cursorq の答えは見ない) が、デバイスが受けとるまで回る
+    pub fn cursor(&mut self, update: bool, res: u32, x: i32, y: i32, hot: (u32, u32)) {
+        let Some(cq) = self.cq.as_mut() else { return };
+        let mut c = hdr(if update { UPDATE_CURSOR } else { MOVE_CURSOR }).to_vec();
+        for v in [0, x as u32, y as u32, 0, res, hot.0, hot.1, 0] {
+            put(&mut c, v);
+        }
+        let _s = SEND.lock();
+        unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), self.creq, c.len()) };
+        *cq.desc(0) = virtio::Desc { addr: v2p(self.creq as usize) as u64, len: c.len() as u32, flags: 0, next: 0 };
+        cq.push(0);
+        cq.notify(&self.mmio);
+        let t0 = crate::timer::uptime_ns();
+        while cq.pop_used().is_none() {
+            if crate::timer::uptime_ns() - t0 > 1_000_000_000 {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        self.mmio.ack();
+    }
+
     pub fn size(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }
@@ -230,10 +259,11 @@ pub fn init() -> bool {
 fn probe_init() -> bool {
     let Some((mmio, feats)) = virtio::probe(DEVICE_GPU, F_VIRGL | F_EDID) else { return false };
     let Some(q) = Queue::new(&mmio, 0, Queue::max(&mmio, 0).min(QUEUE_MAX)) else { return false };
+    let cq = Queue::new(&mmio, 1, Queue::max(&mmio, 1).min(16));
     virtio::ready(&mmio);
-    let (Some(req), Some(resp)) = (kalloc::alloc(), kalloc::alloc()) else { return false };
+    let (Some(req), Some(resp), Some(creq)) = (kalloc::alloc(), kalloc::alloc(), kalloc::alloc()) else { return false };
     let pa = v2p(mmio.base);
-    let mut g = Gpu { mmio, q, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp, virgl: feats & F_VIRGL != 0, capsets: Vec::new(), pa, edid: Vec::new(), info: (0, 0) };
+    let mut g = Gpu { mmio, q, cq, creq, width: 0, height: 0, pages: Rc::new(Vec::new()), req, resp, virgl: feats & F_VIRGL != 0, capsets: Vec::new(), pa, edid: Vec::new(), info: (0, 0) };
 
     // 3D の capset (virtio_gpu_config の num_capsets は 12 バイト目): Linux の virtio_gpu_get_capsets
     if g.virgl {

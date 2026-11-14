@@ -319,10 +319,13 @@ struct State {
     events: VecDeque<Vec<u8>>,
     space: usize,
     egen: u64,
-    /// SET_CLIENT_CAP: UNIVERSAL_PLANES、ASPECT_RATIO、STEREO_3D
+    /// SET_CLIENT_CAP: UNIVERSAL_PLANES、ASPECT_RATIO、STEREO_3D、ATOMIC、WRITEBACK_CONNECTORS、CURSOR_PLANE_HOTSPOT
     universal: bool,
     aspect: bool,
     stereo: bool,
+    atomic: bool,
+    writeback: bool,
+    hotspot: bool,
     /// master だったことがある
     was_master: bool,
     /// DRM_AUTH の ioctl (PRIME) を使える: master か、CAP_SYS_ADMIN で開いたか、AUTH_MAGIC で認められた (drm_file の authenticated)
@@ -342,7 +345,7 @@ impl DrmFile {
             d.master = Some(id);
         }
         let authed = was_master || crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN);
-        let st = State { ctx, ctx_made: false, handles: BTreeMap::new(), events: VecDeque::new(), space: 4096, egen: 0, universal: false, aspect: false, stereo: false, was_master, authed };
+        let st = State { ctx, ctx_made: false, handles: BTreeMap::new(), events: VecDeque::new(), space: 4096, egen: 0, universal: false, aspect: false, stereo: false, atomic: false, writeback: false, hotspot: false, was_master, authed };
         DrmFile { minor, id, tgid: crate::proc::current().tgid, st: Bkl::new(st) }
     }
 
@@ -365,6 +368,16 @@ impl DrmFile {
 
     pub fn aspect_ratio(&self) -> bool {
         self.st.get().aspect
+    }
+
+    /// DRM_CLIENT_CAP_ATOMIC を言った (atomic のプロパティが見え、MODE_ATOMIC が使える)
+    pub fn atomic(&self) -> bool {
+        self.st.get().atomic
+    }
+
+    /// DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT を言った (仮想の GPU のカーソルの plane は、言わない atomic のファイルには見せない)
+    pub fn cursor_hotspot(&self) -> bool {
+        self.st.get().hotspot
     }
 
     pub fn bo(&self, h: u32) -> Option<Rc<Bo>> {
@@ -653,9 +666,30 @@ impl DrmFile {
                 st.aspect = v == 1;
                 Ok(())
             }
-            // ATOMIC と CURSOR_PLANE_HOTSPOT: atomic のないドライバ
-            3 | 6 => Err(-EOPNOTSUPP),
-            // WRITEBACK_CONNECTORS は atomic のときだけ
+            // ATOMIC: 0 から 2。universal planes と aspect ratio もいっしょに (Linux の drm_setclientcap。Xorg の
+            // modesetting は atomic をまちがって使うので、名前が X で始まるものの 1 は断る)
+            3 => {
+                if crate::proc::current().comm().starts_with('X') && v == 1 {
+                    return Err(-EOPNOTSUPP);
+                }
+                if v > 2 {
+                    return Err(-EINVAL);
+                }
+                st.atomic = v != 0;
+                st.universal = v != 0;
+                st.aspect = v != 0;
+                Ok(())
+            }
+            // WRITEBACK_CONNECTORS (aios には writeback の connector はない) と CURSOR_PLANE_HOTSPOT は atomic のときだけ
+            5 | 6 if !st.atomic || v > 1 => Err(-EINVAL),
+            5 => {
+                st.writeback = v == 1;
+                Ok(())
+            }
+            6 => {
+                st.hotspot = v == 1;
+                Ok(())
+            }
             _ => Err(-EINVAL),
         }
     }

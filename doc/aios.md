@@ -2582,7 +2582,8 @@ GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD12
    `test/drmrender.c` (render の口の ioctl の答え。Linux と同じ 18 行)
 5. KMS (kms.rs と edid.rs、2026-11-12): card0 で画面に出す。PRIME (dma-buf) も。kmscube が virgl でも llvmpipe でも回る。
    `test/drmkms.c` (KMS の ioctl の答え) は Linux と同じ 35 行、modetest の出力もまるごと同じ
-6. atomic (DRM_CLIENT_CAP_ATOMIC: Wayland の compositor の多くが使う) とカーソル、aiwm を DRM の上で
+6. atomic (DRM_CLIENT_CAP_ATOMIC: Wayland の compositor の多くが使う) とカーソル (2026-11-14): `test/drmatomic.c` は
+   Linux と同じ 39 行。のこりは aiwm を DRM の上で
 7. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
 8. 本物の機械
 
@@ -2615,9 +2616,22 @@ aios の作り (drm.rs):
   表 (DMT、確立タイミング、CTA の VIC) は Linux の drm_edid.c から写した
 - PRIME: PRIME_HANDLE_TO_FD で BO を dma-buf の fd に (mmap、lseek の SEEK_END で大きさ、DMA_BUF_IOCTL_SYNC)、
   PRIME_FD_TO_HANDLE でもどす。Mesa の GBM は PRIME がないと virgl の画面でも dumb で作ってしまう (gbm_dri.c)
+- atomic (kms.rs、Linux の drm_atomic_uapi.c と drm_atomic_helper.c と virtio_gpu の atomic_check): SET_CLIENT_CAP の
+  ATOMIC (1 と 2。universal plane と aspect ratio もいっしょに) を言ったファイルにだけ、atomic のプロパティ (SRC_*、
+  CRTC_*、FB_ID、IN_FENCE_FD、OUT_FENCE_PTR、CRTC_ID、FB_DAMAGE_CLIPS、ACTIVE、MODE_ID: 番号 9〜23) が見える。MODE_ATOMIC は
+  いまの状態の写しにプロパティをあて、たしかめ (オブジェクトとプロパティがあるか、変えられるか、値の範囲、拡大しない、
+  SRC が framebuffer の中か、crtc なしの plane に fb はない、モードを変えるなら ALLOW_MODESET)、TEST_ONLY でなければ
+  映す。エラーの番号も Linux と同じ (ENOENT、EINVAL、ERANGE、ENOSPC)。MODE_ID はモードの blob (CREATEPROPBLOB で
+  作る。カーネルが作ったものは使わなくなれば消す)、ACTIVE 0 は画面を消し、DPMS も ACTIVE についていく。PAGE_FLIP_EVENT
+  は crtc があるときだけ。OUT_FENCE_PTR は sync_file の fd を返す (映す命令はホストが終えるまで待つので、いつも
+  「終わった」: poll は POLLIN)
+- カーソル: plane 34 (AR24、拡大なし、画面の外にはみ出してよい) を virtio-gpu のカーソルのキュー (virtqueue 1) へ
+  (UPDATE_CURSOR と MOVE_CURSOR、ホットスポットも)。仮想の GPU なので、atomic のファイルには CURSOR_PLANE_HOTSPOT
+  (HOTSPOT_X と HOTSPOT_Y) を言ったときだけ見せる (Linux と同じ)。古い MODE_CURSOR と MODE_CURSOR2 は BO から
+  framebuffer を作って plane に (drm_mode_cursor_universal)
 
-Linux とのちがい (いまは): atomic はない (DRM_CLIENT_CAP_ATOMIC と ATOMIC は EOPNOTSUPP: atomic のないドライバの答え)。
-カーソルもない (CURSOR は ENXIO、cursor plane の SETPLANE は EINVAL)。syncobj もない (DRM_CAP_SYNCOBJ は 0、その ioctl は
+Linux とのちがい (いまは): IN_FENCE_FD は -1 と終わった sync_file だけ。FB_DAMAGE_CLIPS は受けとるが、いつも画面ぜんぶを
+写す。syncobj もない (DRM_CAP_SYNCOBJ は 0、その ioctl は
 EOPNOTSUPP。Linux 6.18 の virtio_gpu はある)。画面の大きさが変わったときのできごと (hotplug) もまだ。
 Linux は命令を出してすぐ返り、fence が終わりを知らせる (aios はホストが終えるまで待つ: CPU と GPU が並んで動かないので、
 たくさん出すものは遅い)。/dev/dri は 0666 (Linux は udev が video / render のグループに)。MAP_PRIVATE の mmap も断らない
