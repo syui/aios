@@ -1,5 +1,5 @@
 // aiwm: aios のタイル型 Wayland コンポジタ (sway の小さな親戚)
-//   画面 (/dev/fb0) とキーボード・マウス (/dev/input/event*) を持ち、
+//   画面 (/dev/dri/card0 の KMS、なければ /dev/fb0: lib/fb.rs) とキーボード・マウス (/dev/input/event*) を持ち、
 //   $XDG_RUNTIME_DIR/wayland-0 で Wayland のクライアント (aiterm など) を待つ。
 //   窓は横に並べる (sway の splith)。設定は ~/.config/aiwm/config か /etc/aiwm/config (sway と同じ書き方)
 //
@@ -422,7 +422,7 @@ fn main() {
         return;
     }
     let fb = fb::Fb::open().unwrap_or_else(|e| {
-        eprintln!("aiwm: /dev/fb0: {} (sudo modprobe virtio_gpu、窓は AIOS_DISPLAY=1)", e);
+        eprintln!("aiwm: /dev/dri/card0, /dev/fb0: {} (sudo modprobe virtio_gpu、窓は AIOS_DISPLAY=1)", e);
         exit(1)
     });
     let inputs = input::Inputs::open();
@@ -479,7 +479,11 @@ fn main() {
     if let Some((_, Some(cmd))) = wm.config.bar.clone() {
         wm.status_fd = wm.spawn_status(&cmd);
     }
-    eprintln!("aiwm: {}x{}, WAYLAND_DISPLAY={}/wayland-0", w, h, dir);
+    // カーソルを画面の側 (DRM の cursor plane) に出せれば、その絵を渡す (動かしても下の窓を描きなおさない)
+    if wm.fb.hw_cursor() {
+        wm.fb.set_cursor(&cursor_image(), CURSOR_W as usize, CURSOR_H as usize, (0, 0));
+    }
+    eprintln!("aiwm: {}x{} ({}), WAYLAND_DISPLAY={}/wayland-0", w, h, wm.fb.kind(), dir);
     for cmd in wm.config.autostart.clone() {
         wm.spawn(&cmd);
     }
@@ -1923,9 +1927,13 @@ impl Wm {
 
     fn pointer_moved(&mut self, old: (i32, i32)) {
         self.ptr_shown = true;
-        // カーソルの絵のまわりだけ (いちばん長い行は 10 画素)
-        self.mark_rect(Rect { x: old.0 - 1, y: old.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
-        self.mark_rect(Rect { x: self.ptr.0 - 1, y: self.ptr.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
+        if self.fb.hw_cursor() {
+            self.fb.move_cursor(self.ptr.0, self.ptr.1);
+        } else {
+            // カーソルの絵のまわりだけ (いちばん長い行は 10 画素)
+            self.mark_rect(Rect { x: old.0 - 1, y: old.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
+            self.mark_rect(Rect { x: self.ptr.0 - 1, y: self.ptr.1 - 1, w: CURSOR_W + 2, h: CURSOR_H + 2 });
+        }
         if let Some((w, dx, dy)) = self.drag {
             let (fw, _) = self.float_size(w);
             let x = (self.ptr.0 - dx).clamp(-fw + 32, self.width() - 32);
@@ -2128,7 +2136,7 @@ impl Wm {
             let px = unsafe { std::slice::from_raw_parts_mut(self.fb.pixels().as_mut_ptr(), self.fb.pixels().len()) };
             draw_tree(px, stride, c, w.surface, ox, oy, clip, 0);
         }
-        if self.ptr_shown {
+        if self.ptr_shown && !self.fb.hw_cursor() {
             self.draw_cursor(y0, y1);
         }
         self.fb.present_rect(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
@@ -2401,6 +2409,21 @@ fn combo_name(mods: u32, code: u16) -> String {
         _ => "?",
     });
     s
+}
+
+/// CURSOR を ARGB の絵に (CURSOR_W x CURSOR_H。# は黒、. は白、ほかは透明)
+fn cursor_image() -> Vec<u32> {
+    let mut img = vec![0u32; (CURSOR_W * CURSOR_H) as usize];
+    for (y, row) in CURSOR.iter().enumerate() {
+        for (x, ch) in row.bytes().enumerate().take(CURSOR_W as usize) {
+            img[y * CURSOR_W as usize + x] = match ch {
+                b'#' => 0xff00_0000,
+                b'.' => 0xffff_ffff,
+                _ => 0,
+            };
+        }
+    }
+    img
 }
 
 const CURSOR_H: i32 = 17;

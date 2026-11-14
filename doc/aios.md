@@ -2583,7 +2583,8 @@ GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD12
 5. KMS (kms.rs と edid.rs、2026-11-12): card0 で画面に出す。PRIME (dma-buf) も。kmscube が virgl でも llvmpipe でも回る。
    `test/drmkms.c` (KMS の ioctl の答え) は Linux と同じ 35 行、modetest の出力もまるごと同じ
 6. atomic (DRM_CLIENT_CAP_ATOMIC: Wayland の compositor の多くが使う) とカーソル (2026-11-14): `test/drmatomic.c` は
-   Linux と同じ 39 行。のこりは aiwm を DRM の上で
+   Linux と同じ 39 行。aiwm も DRM の上で (atomic で映し、カーソルは cursor plane)。3D のない virtio-gpu でも
+   Linux と同じく /dev/dri を置く (`LINUX_GPU=2d test/drm-linux.sh` の答えと同じ)
 7. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
 8. 本物の機械
 
@@ -2594,8 +2595,11 @@ GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD12
 
 aios の作り (drm.rs):
 
-- virtio-gpu が VIRTIO_GPU_F_VIRGL を持っていれば、起こすときに capset (GET_CAPSET_INFO) を聞き、/dev/dri/card0 と
-  renderD128 を置く (2D だけのときは置かない: Mesa は llvmpipe のまま)。/sys は sysfs.rs の add_chrdev (Linux の
+- virtio-gpu があれば /dev/dri/card0 と renderD128 を置く。VIRTIO_GPU_F_VIRGL を持っていれば、起こすときに capset
+  (GET_CAPSET_INFO) を聞く。3D がなければ render の口は Linux の virtio_gpu の 2D のきまり (コンテキストは作らない、
+  GETPARAM の 3D_FEATURES は 0、GET_CAPS と EXECBUFFER と TRANSFER_FROM_HOST は ENOSYS、RESOURCE_CREATE は 2D の形だけで
+  RESOURCE_CREATE_2D、TRANSFER_TO_HOST は TRANSFER_TO_HOST_2D)。Mesa の virgl はそこであきらめて llvmpipe で描く
+  (`MESA-EGL: warning: DRI2: failed to create screen` も Linux と同じに出る)。/sys は sysfs.rs の add_chrdev (Linux の
   device_create のうち、libdrm が読むところ: /sys/dev/char/226:N、/sys/class/drm/NAME、/sys/devices/platform/ADDR.virtio_mmio
   の uevent と subsystem、drm/NAME の uevent と dev)
 - 開くたびにコンテキストの番号を決め、はじめて使うときに CTX_CREATE (名前はプロセスの名前)。閉じたら、ハンドルを
@@ -2672,6 +2676,19 @@ Linux の答え (Linux 6.18 virt、Mesa 26.2.6、QEMU 8.2。このマシンに G
   virgl で 84〜86 fps (3000 枚)、`GBM_ALWAYS_SOFTWARE=1 LIBGL_ALWAYS_SOFTWARE=1` の llvmpipe と dumb で 10.5 fps。
   終わると /dev/fb0 の画面にもどる。Alpine の kmscube と modetest は、aios の /opt/c の Mesa と libdrm で動かす
   (`LD_LIBRARY_PATH=/opt/c/lib:DIR`、DIR に libc.musl-aarch64.so.1 → /lib/ld-musl-aarch64.so.1)
+- atomic とカーソル: test/drmatomic.c は Linux と同じ 39 行 (virgl でも 2D でも)
+- 3D のない virtio-gpu (`LINUX_GPU=2d test/drm-linux.sh build/drm-linux-2d`: virtio-gpu-device): Linux も card0 と
+  renderD128 を置く (`[drm] features: -virgl +edid`、capset 0)。drmkms と drmatomic の答えは virgl のときと同じ、drmrender は
+  GETPARAM の 3D_FEATURES 0、GET_CAPS と EXECBUFFER は ENOSYS、RESOURCE_CREATE (buffer) は EINVAL。egldraw は llvmpipe で
+  0 failed。aios も 4 つとも同じ答え
+
+aiwm (desktop/src/lib/fb.rs): /dev/dri/card0 が開けて master になれれば、DRM の KMS で描く (`aiwm: 1280x800 (drm)`)。
+DRM_CLIENT_CAP_ATOMIC と CURSOR_PLANE_HOTSPOT を言い、つながった connector の PREFERRED のモードで画面ぜんぶの dumb の
+BO (XR24) を primary plane に MODE_ATOMIC (ALLOW_MODESET) で映す。描いたところは DIRTYFB (四角 1 つ)。カーソルは
+64x64 の AR24 の dumb を cursor plane に置き、ポインタが動けば CRTC_X と CRTC_Y だけの atomic (virtio-gpu の MOVE_CURSOR)
+なので、下の窓を描きなおさない (/dev/fb0 のときは絵に描いて、まわりを描きなおしていた)。card0 がない、atomic がない
+(古いカーネル)、master になれないときは、いままでどおり /dev/fb0 (AIWM_FBDEV=1 でもそう)。aiwm が終わると card0 の
+最後のファイルが閉じて /dev/fb0 の画面にもどる。QEMU の screendump には cursor plane は写らない (Linux でも同じ)
 
 ### 出すだけのテストの答えあわせ (test/ldiff.sh)
 
