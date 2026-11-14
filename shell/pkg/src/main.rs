@@ -13,6 +13,7 @@
 //   pkg_scan   repo/aarch64 のパッケージみなを、動かさずに pkg_test の copies と needs で
 //   pkg_rebuild いくつものパッケージを順に edit rebuild → build → test (と push)。えらび方と順は batch.rs
 //   pkg_update  新しい版の出たものをまとめて edit → build → test (と push)。update.rs
+//   pkg_image  docker/ などの ghcr.io の image のタグと digest を、ghcr.io のいちばん新しいものとくらべて書きかえる (image.rs)
 //   pkg_push   ai/repo とくらべて、変わるものを bin/gitea.sh repo で送る (署名つきの 1 コミット)
 //   M-p        pkg_check を画面に出す (キーを押すと消える)
 // edit と build と push は長いので、うしろで動かす (自分を aish-pkg edit / build / push で起こす)。もういちど呼ぶと様子か結果
@@ -24,6 +25,7 @@
 mod batch;
 mod elf;
 mod embed;
+mod image;
 mod report;
 mod repo;
 mod test;
@@ -37,6 +39,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+const IMAGE: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見る image だけ (aios-node や syui/aios-node。既定: みな)"},"files":{"type":"array","items":{"type":"string"},"description":"見るファイル (既定: git の docker/ image/ .github/workflows/ のもの)"},"update":{"type":"boolean","description":"古いもの (old、moved) を、いちばん新しいタグと digest に書きかえる"},"pin":{"type":"boolean","description":"update のとき、digest のないもの (unpinned) にも digest をつける"},"dir":{"type":"string"}}}"#;
 const CHECK: &str = r#"{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"description":"見るパッケージ (なければ全部)"},"all":{"type":"boolean","description":"全部の一覧 (build/aish-pkg/pkg.json: name type src now latest) を返す (既定: 新しい版があるものとしくじったものだけ)"},"refresh":{"type":"boolean","description":"どこを見るか (pkg/upstream.json) を PKGBUILD と Arch の .nvchecker.toml から作りなおす"},"daily":{"type":"boolean","description":"見に行かずに、CI が毎日作る報告 (GitHub のリリース pkg-updates の updates.json) を読む (すぐ答える。いつ作ったものか、いつから遅れているか (since) も)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで。みなを見ると 1 分ほど)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string","description":"aios のリポジトリ (既定: いまのディレクトリから上へ探す)"}}}"#;
 const BUILD: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める (孫の make や zig まで)"},"dir":{"type":"string"}},"required":["name"]}"#;
 const TEST: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"パッケージ"},"vm":{"type":"boolean","description":"aios の VM (-snapshot で repo/ を出したもの。動いていなければ起こし、終わっても止めない) にも ap -S で入れて、bin/ のものを aios のカーネルの上で動かす (このマシンの qemu-user で動いたものが aios で動かなければしくじり)"},"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定 30000、50000 まで)"},"stop":{"type":"boolean","description":"動いているものを止める"},"dir":{"type":"string"}},"required":["name"]}"#;
@@ -63,6 +66,7 @@ fn main() {
             Tool { name: "pkg_scan", desc: "repo/aarch64 のパッケージみな (names があればそれだけ) を、動かさずに pkg_test の copies と needs で確かめる: COPY で写したライブラリのデータが 1 つの場所に重なったプログラム (古い Zig の libc.so でリンクしたもの。affected を rebuild に) と、depends にない NEEDED (unresolved。それのあるパッケージも)。Zig を上げたときなどに。うしろで動く (みなで 1 分ほど)", input: SCAN },
             Tool { name: "pkg_rebuild", desc: "いくつものパッケージを順に作りなおす: pkgrel を上げ (pkg_edit rebuild)、pkg_build、pkg_test。names がなければ pkg_check の rebuild のもの (unrecorded なら Zig を書きとめる前に作ったものも)。c_deps で使うものを先に。pkgrel はいまの版がもう ai/repo にあるときだけ上げ、もう作りなおしたもの (pkg_test を通っているか送ってあり、古いライブラリもちがう Zig もない) は飛ばす (もういちど動かしても 2 つ上がらない。pkg_test でしくじったものは同じ版で作りなおす)。CI が作るもの (pkg/ci.json) は飛ばす。しくじったものは飛ばして続け (fail_fast で止める)、push ならみな通ったら pkg_push。dry で順だけ。うしろで動く (進みぐあいは log、くわしくは build-NAME.log / test-NAME.log)。あとで PKGBUILD をコミットして unix に", input: REBUILD },
             Tool { name: "pkg_update", desc: "新しい版の出たものをまとめて上げる: names がなければ pkg_check の new のもの (daily なら CI の毎日の報告の new を、いま見なおして)。タグだけで tarball がまだないものと、見られなかったものは飛ばす。npm で入れるもの (.aios.json の pkg.linux.npm) はその版を書きかえるだけ、CI が作るもの (pkg/ci.json) は PKGBUILD を上げるだけ (main に push すると pkg.yml が作る。そのあと pkg_fetch)。ほかは pkg_edit で上げ、それを中に入れているもの (静的なライブラリ) といっしょに pkg_rebuild と同じく作って確かめる (c_deps で使うものを先に)。push ならみな通ったら pkg_push。dry で何をどう上げるかだけ。うしろで動く。さいごに、コミットして main に push するファイル (files) と次にすること (next)", input: UPDATE },
+            Tool { name: "pkg_image", desc: "リポジトリの中の ghcr.io の image (docker/ の Dockerfile と compose.yml、image/、.github/workflows/。ghcr.io/OWNER/NAME:TAG@sha256:DIGEST) を、ghcr.io のいちばん新しいもの (latest と同じ digest のタグ) とくらべる: ok、old (タグが古い)、moved (同じタグで digest がちがう)、unpinned (digest がない)。update で old と moved を新しいタグと digest に書きかえる (pin で unpinned にも digest を)。image を出しなおしたあと (image.yml) に。書きかえたらコミットして push", input: IMAGE },
             Tool { name: "pkg_push", desc: "repo/aarch64 を ai/repo (git.syui.ai) に送る (bin/gitea.sh repo。署名つきの 1 コミット)。先に ai/repo とくらべて変わるもの (new / 上がる) を出す。pkg_test を通っていないものや、ai/repo のほうが新しいもの (消える・下がる) があれば止まる (force で送る)。うしろで動く", input: PUSH },
             Tool { name: "pkg_edit", desc: "PKGBUILD の pkgver を配布元の最新 (か ver) にし、pkgrel を 1 に、sha256sums を取ってきたもので書きかえ、.aios.json の版と updated も変える。rebuild なら pkgrel を 1 つ上げるだけ (pkg_check の rebuild)。うしろで動くので、終わっていなければ running (大きな tarball や遅い配布元でも。もういちど呼ぶと続きを待つ)", input: EDIT },
         ],
@@ -86,6 +90,7 @@ fn main() {
                     argv.extend(names);
                     job(&mut jobs, &root, "check", &argv, a)
                 }
+                "pkg_image" => image::image(&root, a),
                 "pkg_edit" => {
                     let n = s(a, "name");
                     // npm の @SCOPE/NAME (.aios.json の pkg.linux.npm) は / をゆるす (ログの名前では _ に)

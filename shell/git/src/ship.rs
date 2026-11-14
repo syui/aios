@@ -138,8 +138,11 @@ pub fn ship(v: &Value) -> Value {
                     let mut text = format!("{}: publish {} ({})\n", short, if code == 0 { "done" } else { "failed" }, log);
                     text.push_str(&tail(&log, if code == 0 { 3 } else { 8 }));
                     // CI が落ちた・取り消された: どれか
+                    if txt.contains("uncommitted changes in its sources") {
+                        text.push_str("  the release is out; the packages were not: commit the changes and ship again (it publishes the new commit)\n");
+                    }
                     if txt.contains("CI did not pass") {
-                        text.push_str(&s(&ci(&json!({ "args": { "dir": top, "sha": head, "wait_ms": 0 }, "pwd": top })), "text").to_string());
+                        text.push_str(s(&ci(&json!({ "args": { "dir": top, "sha": head, "wait_ms": 0 }, "pwd": top })), "text"));
                         if txt.contains("completed cancelled") {
                             text.push_str("  the CI run was cancelled (a newer push?): ship again from the newest commit\n");
                         }
@@ -151,7 +154,15 @@ pub fn ship(v: &Value) -> Value {
                     return json!({ "text": format!("{}: publish ended without a result ({})\n{}", short, log, tail(&log, 8)), "done": true, "ok": false });
                 }
                 if t0.elapsed() + Duration::from_secs(3) > wait {
-                    return json!({ "text": format!("{}: publishing ({}s, {})\n{}", short, st["started"].as_u64().map_or(0, |t0| now().saturating_sub(t0)), log, tail(&log, 2)), "done": false, "running": true });
+                    let mut text = format!("{}: publishing ({}s, {})\n{}", short, st["started"].as_u64().map_or(0, |t0| now().saturating_sub(t0)), log, tail(&log, 2));
+                    // publish はさいごに作業中の変更を見て、あれば base を作らずに止まる (2026-11-14、publish の
+                    // あいだに shell/ と user/ を書きかえていて止まった)
+                    let c = cfg(&top);
+                    let dirty: Vec<String> = git(&top, &["status", "--porcelain=v1"]).unwrap_or_default().lines().map(|l| l.get(3..).unwrap_or("").to_string()).filter(|f| under(&c.paths, f)).collect();
+                    if !dirty.is_empty() {
+                        text.push_str(&format!("  warning: uncommitted changes under {} ({}): the publish will stop before the packages; stash them until it ends\n", c.paths.join(" "), dirty.iter().take(5).cloned().collect::<Vec<_>>().join(" ")));
+                    }
+                    return json!({ "text": text, "done": false, "running": true });
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }

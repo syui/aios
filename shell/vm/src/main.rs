@@ -14,6 +14,8 @@
 //           カーネルを、linux で Linux の VM とくらべ、record で bench/KIND.jsonl に記録する (bench.rs)
 //   sysdiff Linux と答えあわせ (test/sysdiff.c): 種から決まるシステムコールの並びを、手本の Linux (既定は最新の
 //           安定版を QEMU で) と VM の aios で動かしてくらべ、ちがいをまとめて小さくする (sysdiff.rs)
+//   ldiff   出すだけのテスト (test/NAME.c) を手本の Linux と VM の aios で動かしてくらべる (test/ldiff.sh) を、うしろで
+//           いくつでも。答えだけ (ldiff.rs)
 // カーネルの選び方 (kernel、a、b): ファイルのパス / "." (作業中のソースから作る) / git のコミット (別の作業場所
 //   build/aish-vm/wt で作る)。どれも AIOS_INITRD=none (ルートはディスク) で build/aish-vm/target (wt は target-wt) に作り、
 //   build/aish-vm/kernels/ にとっておく (同じコミットは作りなおさない)
@@ -22,6 +24,7 @@
 // aios.img を使うと壊れるので、同時には動かさない
 // リポジトリは dir か、いまのディレクトリから上にたどって test/vm.py があるところ、なければ $AIOS_SRC
 mod bench;
+mod ldiff;
 mod sysdiff;
 
 use aish_plugin::{Spec, Tool, Value, error, json, s};
@@ -36,6 +39,7 @@ const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","descrip
 const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の off のあるもの: extra、quirk と core の ns・vdso。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BENCH: &str = r#"{"type":"object","properties":{"kind":{"type":"string","description":"fs (既定: ファイルまわり、test/fsbench.c)、net (ループバックの TCP / UDP / AF_UNIX とパイプ、test/netbench.c)、smp (いくつもの CPU でいっしょに: op ごとに 1 つのプロセスと CPU の数だけのプロセスで、伸びと /proc/ai/bkl。test/smpbench.c)"},"kernel":{"type":"string","description":"測るカーネル (パス / . / git のコミット。既定 .)"},"against":{"type":"string","description":"くらべる aios のカーネル (あれば。たとえば HEAD)。op ごとに、kernel の時間が against の何倍か"},"linux":{"type":"boolean","description":"同じプログラムを Linux (test/linux-vm.sh の latest) の VM でも動かし、op ごとに aios の時間が Linux の何倍か (VM はどちらも cortex-a72、smp 個の CPU、2 GiB)"},"record":{"type":"boolean","description":"結果を bench/KIND.jsonl (1 行 1 回の記録。リポジトリに入れる) に足し、bench/KIND.md (表) を作りなおす。ops、off、against なしで"},"show":{"type":"boolean","description":"測らずに、記録のいちばん新しいものと、その前からの変わりかた、Linux との比"},"smp":{"type":"integer","description":"VM の CPU の数 (既定 1、kind smp は 4。Linux も同じ)"},"ops":{"type":"array","items":{"type":"string"},"description":"net: 測る op だけ (pipe_rr futex_rr unix_rr tcp_rr udp_rr tcp_rr_epoll unix_local tcp_local udp_local unix_stream tcp_stream tcp_stream_4k tcp_connect)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 3。まんなかを使う)"},"scale":{"type":"integer","description":"量 (既定 1)"},"off":{"type":"array","items":{"type":"string"},"description":"切って測る extra や quirk (起動の引数 aios.off=)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const SYSDIFF: &str = r#"{"type":"object","properties":{"seeds":{"type":"integer","description":"いくつの種 (既定 300)"},"from":{"type":"integer","description":"はじめの種 (既定 1)"},"ops":{"type":"integer","description":"種ごとの op の数 (既定 30、200 まで)"},"kernel":{"type":"string","description":"aios のカーネル (パス / . / git のコミット。既定 .)"},"fs":{"type":"string","description":"動かすところ: home (ホームの ext4。既定) か tmp (tmpfs)。Linux も同じ種類のところで"},"base":{"type":"string","description":"手本の Linux: latest (既定。kernel.org の最新の安定版を test/linux-vm.sh が arm64 で作り (版ごとに一度、数分)、QEMU で起こした中で nobody で動かす)、版 (7.2.11 など)、host (このマシンのカーネル)"},"linux":{"type":"string","description":"Linux の答えのファイル (ほかの Linux、たとえば aios(main) で cc -O2 -o sysdiff test/sysdiff.c して sysdiff -n OPS DIR FROM-TO > FILE としたもの)。なければ base の Linux で動かす (縮めるのはいつも base で)"},"shrink":{"type":"integer","description":"縮めるちがいの数 (多いものから。既定 12、0 で縮めない)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const LDIFF: &str = r#"{"type":"object","properties":{"tests":{"type":"array","items":{"type":"string"},"description":"くらべるテスト: \"NAME ARG...\" (test/NAME.c。引数の @home は ext4 のところ: Linux は /work、aios はホーム)。続けて動かす"},"name":{"type":"string","description":"tests のかわりに 1 つ"},"args":{"type":"array","items":{"type":"string"},"description":"name の引数"},"linux_only":{"type":"boolean","description":"aios では動かさず、手本の Linux の出力と終わりの番号だけ (VM は要らない)"},"root":{"type":"boolean","description":"Linux は root、aios は sudo -n で"},"net":{"type":"boolean","description":"手本の Linux に virtio-net をつなぐ"},"linux":{"type":"string","description":"手本の Linux の版 (既定 mainline。latest や 7.3.4 も)"},"fresh":{"type":"boolean","description":"とっておいた Linux の答えを使わずに動かしなおす"},"kernel":{"type":"string","description":"はじめに、このカーネル (パス / . / git のコミット) で VM を起こしなおす (test/ を出して、-snapshot で)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
 
 fn main() {
@@ -50,6 +54,7 @@ fn main() {
             "box" => job_box(&root, &a),
             "bench" => bench::job(&root, &a),
             "sysdiff" => sysdiff::job(&root, &a),
+            "ldiff" => ldiff::job(&root, &a),
             _ => Err(format!("{}: unknown", cmd)),
         };
         match r {
@@ -72,6 +77,7 @@ fn main() {
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
             Tool { name: "bench", desc: "速さを測って記録し、くらべる。kind fs (既定): ファイルまわり (test/fsbench.c: create、stat、open、4 KiB の書き読み、readdir、rename、unlink、mkdir、16 MiB の書き読み、fsync など)。kind net: ループバック (test/netbench.c: パイプ、AF_UNIX、TCP、UDP の 1 バイトの往復を 2 つのプロセスと 1 つのプロセスで、futex で起こしあう 2 つのスレッドの往復、epoll で待つ往復、64 KiB と 4 KiB の流しこみ、connect)。kind smp: いくつもの CPU でいっしょに (test/smpbench.c: getppid、umask、futex、stat、open、4 KiB の読み書き、作って消す、パイプ、AF_UNIX、mmap、fork を、1 つのプロセスと CPU の数だけのプロセス (それぞれ自分のファイルなど) で。伸び (1 つのときの何倍まわせたか) を Linux とくらべ、op ごとに /proc/ai/bkl の大きなロックを待った割合と長く持ったシステムコール)。VM (-snapshot、smp 個の CPU) で n 回動かして op ごとの µs (流しこみは MB/s) のまんなかと、prof をつけた回で part (kernel.json の名前) ごとの CPU の時間の割合 (どこがボトルネックか。眠って待った時間は wait_us) と、時間の多い区間 (net は op ごと)。lock は lockbench の 5 回のまんなか。against で 2 つの aios のカーネルを、linux で同じプログラムを Linux の VM (cortex-a72) でくらべる。record で bench/KIND.jsonl に記録を足して bench/KIND.md の表を作りなおす (いつも、前の記録からの変わりかたも出す)。show で測らずに記録を見る。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
             Tool { name: "sysdiff", desc: "Linux と答えあわせ (test/sysdiff.c): 種から決まるシステムコールの並び (open、read、write、stat、mkdir、rename、link、symlink、chmod、access、getdents、dup、fcntl、pipe など。fd は前の op が開けたもの) を、手本の Linux (既定は kernel.org の最新の安定版を作って QEMU で。base: host でこのマシンのもの。どれも nobody で) と VM (-snapshot) の aios で動かし、case ごとに最初にちがう行をくらべる。ちがいは (op、Linux の答え、aios の答え) でまとめ、多いものから、op を減らしても同じちがいが同じ op で出るいちばん小さな並び (SEED:I,J,...) に縮める。aios がえらんだちがい (test/sysdiff.c の chosen、doc/aios.md) は Linux でもそのふるまいをまねて答えにし、chosen に何 case で使ったかを分けて出す (手本の Linux のまちがい (linux_bugs) も、Linux の側でただして同じように)。答えはアーキテクチャによらない形 (フラグは名前、stat は種類と許可と数)。結果は build/aish-vm/sysdiff/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: SYSDIFF },
+            Tool { name: "ldiff", desc: "出すだけのテスト (test/NAME.c) を、手本の Linux (既定 mainline を QEMU で。答えはとっておく) と動いている aios の VM (test/ を出しているもの。なければ kernel で起こす) で動かし、出力をくらべる (test/ldiff.sh)。tests にいくつでも。テストごとに same、differ (diff -u の頭: --- Linux、+++ aios)、error だけを返す。手本の Linux に足りない機能は note に。linux_only で Linux の出力だけ (作るテストの答えを先に見る)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: LDIFF },
             Tool { name: "box", desc: "カーネルの砂場: kernel.json の off のあるもの (extra、quirk と core の ns・vdso) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
@@ -88,6 +94,7 @@ fn main() {
                 "box" => job(&mut jobs, &root, "box", a),
                 "bench" => job(&mut jobs, &root, "bench", a),
                 "sysdiff" => job(&mut jobs, &root, "sysdiff", a),
+                "ldiff" => job(&mut jobs, &root, "ldiff", a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -390,12 +397,60 @@ fn try_(root: &Path, a: &Value) -> Value {
 // ---- うしろで動かすもの ----
 
 /// うしろで動いているもの (自分を aish-vm start / ab / bisect で起こしたもの)。出力は build/aish-vm/KEY.log
+/// うしろで動いているもの (自分を aish-vm KEY で起こしたもの)。出力は build/aish-vm/KEY.log、pid は KEY.pid。
+/// aish やこのプラグインが入れかわっても (aish-mcp.sh --build のたびに入れかわる)、次に呼ばれたときに KEY.pid から
+/// 引きついで続きを待つ (前は忘れてしまい、もういちど呼ぶと同じ仕事をもう 1 つ起こした。ldiff の 2 つめが VM を
+/// 起こしなおし、1 つめのテストの VM を止めた。2026-11-13。aish-pkg の job と同じ)
 struct Job {
-    child: std::process::Child,
+    /// 自分で起こした子。入れかわる前に起こしたもの (pid だけわかる) は None
+    child: Option<std::process::Child>,
+    pid: i32,
     log: PathBuf,
     t0: Instant,
     /// 最後に様子を見たとき
     polled: Instant,
+}
+
+impl Job {
+    /// 終わったら Some(終わりの番号。引きついだものは None (わからない))
+    fn done(&mut self) -> Option<Option<std::process::ExitStatus>> {
+        match &mut self.child {
+            Some(c) => match c.try_wait() {
+                Ok(None) => None,
+                Ok(st) => Some(st),
+                Err(_) => Some(None),
+            },
+            None => (!alive(self.pid)).then_some(None),
+        }
+    }
+}
+
+/// pid が動いているか (終わって親に拾われていないもの (ゾンビ) は、終わったとみる)
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid)).is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')))
+}
+
+/// 前のプラグインが起こした key のもの。動いていれば、aish-vm KEY のときだけ (pid が別のものに使われていないか。
+/// 引数の JSON は wait_ms などで変わるので見ない)。終わっていても KEY.pid が残っていれば、答えをまだ渡していないので
+/// 引きつぐ (答えは log の終わりの JSON)。ただし終わってから 5 分より前のものは、新しく始める
+fn adopt(dir: &Path, key: &str) -> Option<Job> {
+    let pidf = dir.join(format!("{}.pid", key));
+    let pid: i32 = std::fs::read_to_string(&pidf).ok()?.trim().parse().ok().filter(|p| *p > 1)?;
+    let log = dir.join(format!("{}.log", key));
+    let age = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    let stale = if alive(pid) {
+        let cmd = std::fs::read(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
+        let mut words = cmd.split(|&b| b == 0).map(|w| String::from_utf8_lossy(w).into_owned());
+        !(words.next().is_some_and(|exe| exe.ends_with("aish-vm")) && words.next().as_deref() == Some(key))
+    } else {
+        age(&log).is_none_or(|a| a > Duration::from_secs(300))
+    };
+    if stale {
+        let _ = std::fs::remove_file(&pidf);
+        return None;
+    }
+    let t0 = age(&pidf).and_then(|e| Instant::now().checked_sub(e)).unwrap_or_else(Instant::now);
+    Some(Job { child: None, pid, log, t0, polled: Instant::now() })
 }
 
 /// 自分のバイナリ (うしろの仕事はこれを KEY 引数で起こす)。ビルドしなおされて古いものが消えていれば (/proc/self/exe が
@@ -414,13 +469,20 @@ fn self_exe() -> Result<PathBuf, String> {
 
 /// key のものがなければ起こし、wait_ms まで待つ。終わったら最後の行の JSON (と途中の行)
 fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Value {
+    let dir = root.join("build/aish-vm");
+    let pidf = dir.join(format!("{}.pid", key));
     // running と答えたまま見に来なかったもの (5 分より前) が終わっていたら、続きではなく新しく始める
     // (前の start の結果を、あとの start に返してしまわないように)
-    if jobs.get_mut(key).is_some_and(|j| j.polled.elapsed() > Duration::from_secs(300) && matches!(j.child.try_wait(), Ok(Some(_)))) {
+    if jobs.get_mut(key).is_some_and(|j| j.polled.elapsed() > Duration::from_secs(300) && j.done().is_some()) {
         jobs.remove(key);
+        let _ = std::fs::remove_file(&pidf);
+    }
+    if !jobs.contains_key(key)
+        && let Some(j) = adopt(&dir, key)
+    {
+        jobs.insert(key.to_string(), j);
     }
     if !jobs.contains_key(key) {
-        let dir = root.join("build/aish-vm");
         let _ = std::fs::create_dir_all(&dir);
         let log = dir.join(format!("{}.log", key));
         let exe = match self_exe() {
@@ -430,7 +492,11 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Va
         let Ok(out) = std::fs::File::create(&log) else { return error(format!("{}: cannot start", log.display())) };
         let Ok(err) = out.try_clone() else { return error("cannot start") };
         match Command::new(exe).args([key, &a.to_string()]).current_dir(root).env("AIOS_SRC", root).stdin(Stdio::null()).stdout(out).stderr(err).spawn() {
-            Ok(c) => jobs.insert(key.to_string(), Job { child: c, log, t0: Instant::now(), polled: Instant::now() }),
+            Ok(c) => {
+                let pid = c.id() as i32;
+                let _ = std::fs::write(&pidf, format!("{}\n", pid));
+                jobs.insert(key.to_string(), Job { child: Some(c), pid, log, t0: Instant::now(), polled: Instant::now() })
+            }
             Err(e) => return error(e),
         };
     }
@@ -439,24 +505,33 @@ fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &Value) -> Va
     let j = jobs.get_mut(key).unwrap();
     j.polled = Instant::now();
     let status = loop {
-        match j.child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(200)),
-            _ => break None,
+        match j.done() {
+            Some(st) => break Some(st),
+            None if Instant::now() < end => std::thread::sleep(Duration::from_millis(200)),
+            None => break None,
         }
     };
     let text = std::fs::read_to_string(&j.log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(12)..].join("\n");
     let ms = j.t0.elapsed().as_millis() as u64;
+    let adopted = j.child.is_none();
     let Some(st) = status else {
-        return json!({ "running": true, "ms": ms, "log": tail, "hint": "call again to wait more" });
+        let mut r = json!({ "running": true, "ms": ms, "log": tail, "hint": "call again to wait more" });
+        if adopted {
+            r["adopted"] = json!(format!("started before aish-vm was restarted (pid {}); its arguments may differ from this call", j.pid));
+        }
+        return r;
     };
     let log = j.log.display().to_string();
     jobs.remove(key);
+    let _ = std::fs::remove_file(&pidf);
     let mut r = lines.iter().rev().find_map(|l| aish_plugin::parse(l)).unwrap_or_else(|| json!({}));
-    if !st.success() && r.get("error").is_none() {
-        r["error"] = json!(format!("exit {}", st));
+    match st {
+        Some(st) if !st.success() && r.get("error").is_none() => r["error"] = json!(format!("exit {}", st)),
+        // 引きついだもの: 終わりの番号はわからないので、答えの行がなければしくじったとみる
+        None if r.as_object().is_none_or(|o| o.is_empty()) => r["error"] = json!("ended without an answer (stopped, or the machine restarted)"),
+        _ => {}
     }
     r["ms"] = json!(ms);
     r["log"] = json!(log);
@@ -890,6 +965,27 @@ fn spread(v: &[f64]) -> (f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopt_jobs() {
+        let dir = std::env::temp_dir().join(format!("aish-vm-adopt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 動いているが aish-vm KEY ではないもの (このテスト): 引きつがず、KEY.pid を消す
+        std::fs::write(dir.join("ldiff.pid"), format!("{}\n", std::process::id())).unwrap();
+        assert!(adopt(&dir, "ldiff").is_none());
+        assert!(!dir.join("ldiff.pid").exists());
+        // 終わったもの (log が新しい): 答えを渡すために引きつぐ
+        let mut c = Command::new("true").spawn().unwrap();
+        let pid = c.id() as i32;
+        c.wait().unwrap();
+        std::fs::write(dir.join("start.pid"), format!("{}\n", pid)).unwrap();
+        std::fs::write(dir.join("start.log"), "{\"ok\":true}\n").unwrap();
+        let mut j = adopt(&dir, "start").unwrap();
+        assert!(j.child.is_none() && j.pid == pid && j.done().is_some());
+        // pid がないもの
+        assert!(adopt(&dir, "box").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn lockbench_lines() {

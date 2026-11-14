@@ -1,6 +1,6 @@
 #!/bin/sh
 # 出すだけのテスト (test/NAME.c) を、手本の Linux と aios の VM で動かして、出力をくらべる (答えあわせを 1 つの口で)
-#   test/ldiff.sh [--root] [--net] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] NAME [ARG...]
+#   test/ldiff.sh [--root] [--net] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] [--linux-only] NAME [ARG...]
 #     1. test/NAME.c を aarch64 の静的なもの (test/bin/NAME) に作る (なければ、.c のほうが新しければ)
 #     2. 手本の Linux (test/linux-vm.sh exec VER。既定は mainline) で動かす。答えは build/linux-answers/ にとっておき、
 #        プログラムと引数と Linux の版と test/linux.config が同じなら、もう一度は動かさない (--fresh で動かしなおす)
@@ -10,6 +10,7 @@
 #   --root: Linux は rootexec、aios は sudo -n で (test/apparmor.c のようなもの)
 #   --net: 手本の Linux に virtio-net をつなぐ (ip=dhcp で 10.0.2.15/24、ゲートウェイ 10.0.2.2: aios の VM と同じ。
 #     test/route.c)
+#   --linux-only: aios では動かさず、手本の Linux の出力と終わりの番号だけ (VM は要らない。作るテストの答えを先に見る)
 #   引数の @home は ext4 のところ: Linux は /work、aios はホーム ($HOME) に読みかえる (test/chosen.c @home /tmp など)
 #     5. 手本の Linux に足りない機能 (aios にはある) を知らせる: test/features.c を両方で動かしてくらべる。テストが使う
 #        機能が手本の Linux になければ、ENOSYS や EINVAL がテストの答えにかくれて同じに見えることがある (そのときは
@@ -19,7 +20,7 @@
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
-root= ver=mainline fresh= kernel= net=
+root= ver=mainline fresh= kernel= net= lonly=
 while :; do
   case "$1" in
   --root) root=1; shift ;;
@@ -27,11 +28,12 @@ while :; do
   --kernel) kernel=$2; shift 2 ;;
   --linux) ver=$2; shift 2 ;;
   --fresh) fresh=1; shift ;;
+  --linux-only) lonly=1; shift ;;
   *) break ;;
   esac
 done
 name=$1
-[ -n "$name" ] || { sed -n '2,18p' "$0" >&2; exit 2; }
+[ -n "$name" ] || { sed -n '2,19p' "$0" >&2; exit 2; }
 shift
 src=test/$name.c bin=test/bin/$name
 [ -f "$src" ] || { echo "ldiff: no $src" >&2; exit 2; }
@@ -43,14 +45,16 @@ if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
 fi
 
 # aios の VM は動いているか (test/ を http で見せているもの)
-if [ -n "$kernel" ]; then
-  python3 test/vm.py start --kernel "$kernel" --snapshot --www test >/dev/null || { echo "ldiff: the VM did not come up" >&2; exit 2; }
+if [ -z "$lonly" ]; then
+  if [ -n "$kernel" ]; then
+    python3 test/vm.py start --kernel "$kernel" --snapshot --www test >/dev/null || { echo "ldiff: the VM did not come up" >&2; exit 2; }
+  fi
+  st=$(python3 test/vm.py status 2>/dev/null || true)
+  case "$st" in
+  *'"ready": true'*'"www": "'"$top"/test'"'*) ;;
+  *) echo "ldiff: no aios VM with test/ served; start one: test/vm.py start --kernel . --snapshot --www test (or ldiff --kernel .)" >&2; exit 2 ;;
+  esac
 fi
-st=$(python3 test/vm.py status 2>/dev/null || true)
-case "$st" in
-*'"ready": true'*'"www": "'"$top"/test'"'*) ;;
-*) echo "ldiff: no aios VM with test/ served; start one: test/vm.py start --kernel . --snapshot --www test (or ldiff --kernel .)" >&2; exit 2 ;;
-esac
 
 # Linux の答え: とっておいたものか、動かす (うしろで)
 v=$(sh test/linux-vm.sh version "$ver")
@@ -75,6 +79,15 @@ else
     mv "$ans.tmp" "$ans.out"
   ) &
   lpid=$!
+fi
+
+if [ -n "$lonly" ]; then
+  [ -z "$lpid" ] || wait "$lpid" || true
+  [ -s "$ans.out" ] || { echo "ldiff: Linux gave no output:" >&2; tail -5 "$ans.err" >&2; exit 2; }
+  cp "$ans.out" "$lout"
+  cat "$lout"
+  echo "linux only: Linux $v exit $(cat "$ans.st" 2>/dev/null || echo '?')"
+  exit 0
 fi
 
 # aios で (うしろの job: 長いテストでも run の時間切れにならないように)
