@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # 対話する aish のテスト (test/aish.sh から): python3 test/aish-tty.py AISH PLUGINS
 #   端末 (pty) につないでキーを打ち、出てくるもの (色のエスケープ) を見る: aish-highlight の色、Tab の補完
-#   (aish-complete)、履歴の続きのグレー (aish-suggest) と → で決める、aish-time の終了コード、履歴のファイル。
+#   (aish-complete)、履歴の続きのグレー (aish-suggest) と → で決める、aish-time の終了コード、履歴のファイル、
+#   うしろのジョブが端末の設定を変えたときに raw にもどすこと。
 #   aish -c と MCP のテストではためせない、人が打つときの顔。tmux なしで CI でも動く
 import fcntl, os, pty, select, shutil, struct, sys, tempfile, termios, time
 
@@ -70,13 +71,30 @@ check('right arrow takes the suggestion', expect('\r\nhello-aish\r\n') and expec
 # 人が打つときも配列は bash と同じ (0 から、$a は最初の要素)
 key('a=(x y z); echo "[$a ${a[1]}]"\r')
 check('arrays as bash', expect('\r\n[x y]\r\n') and expect('ready$ '))
+# うしろのジョブが端末の設定を変えても (SIGTTOU を無視して stty で、Enter が \n になり、行でまとめて読むように)、
+# aish はキーを待ちながら見なおして raw にもどす
+key('(trap "" TTOU; sleep 0.3; stty icrnl icanon echo </dev/tty) &\r')
+check('background stty', expect('ready$ '))
+time.sleep(1.5)
+key('echo after-stty\r')
+check('raw again after a background stty', expect('\r\nafter-stty\r\n') and expect('ready$ '))
 # aish-time: しくじったときの終了コード
 key('false\r')
 check('time shows exit', expect('\x1b[31mexit 1') and expect('ready$ '))
 # exit だけなら前のコマンド (false) の 1 で終わる (bash と同じ)
 key('exit 0\r')
-_, st = os.waitpid(pid, 0)
-check('exit', os.waitstatus_to_exitcode(st) == 0)
+# 終わらなければ (Enter が届かないなど) 5 秒で止めて FAIL に
+end, st = time.time() + 5, None
+while st is None and time.time() < end:
+    p, s = os.waitpid(pid, os.WNOHANG)
+    if p:
+        st = s
+    else:
+        time.sleep(0.1)
+if st is None:
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+check('exit', st is not None and os.waitstatus_to_exitcode(st) == 0)
 hist = open(home + '/.aish_history').read() if os.path.exists(home + '/.aish_history') else ''
 check('history file', 'echo hello-aish' in hist and 'false' in hist)
 shutil.rmtree(work, ignore_errors=True)

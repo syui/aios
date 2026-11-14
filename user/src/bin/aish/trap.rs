@@ -42,6 +42,12 @@ const SIGS: &[(&str, i32)] = &[
     ("WINCH", 28),
 ];
 
+/// trap "" で無視しているシグナル。子に渡すときも無視のまま (exec でも SIG_IGN は残る。POSIX と bash と同じ。
+/// 前は子でみな既定に戻し、trap "" TTOU のうしろの stty が SIGTTOU で止まった)
+pub fn ignored(sig: i32) -> bool {
+    traps().get(&sig).is_some_and(|c| c.is_empty())
+}
+
 fn traps() -> &'static mut BTreeMap<i32, String> {
     unsafe { &mut *(&raw mut TRAPS) }
 }

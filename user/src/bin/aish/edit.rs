@@ -131,7 +131,28 @@ fn term_cols() -> usize {
     if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 { ws.ws_col as usize } else { 80 }
 }
 
+/// 編集している (端末を raw にしている) あいだ
+static EDITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 編集しているとき、キーを待ちながら端末の設定を見なおす間 (ms)
+const RECHECK_MS: i32 = 500;
+
 fn read_byte() -> Option<u8> {
+    if EDITING.load(std::sync::atomic::Ordering::Relaxed) {
+        // キーを待つあいだに、うしろのジョブが端末の設定を変えたら (SIGTTOU を無視して stty sane など)、raw にもどす。
+        // そのままだと Enter が \n (C-j) になり、行がまとめて届き、打った字が二重に出る (readline も同じに見なおす。
+        // aios の VM で、うしろの pnpm が端末を戻して Enter で cd の一覧が出た。2026-11-13)
+        let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        loop {
+            match unsafe { libc::poll(&mut p, 1, RECHECK_MS) } {
+                0 => {
+                    keep_raw();
+                }
+                n if n > 0 => break,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
+    }
     let mut c = 0u8;
     loop {
         let n = unsafe { libc::read(0, &mut c as *mut u8 as *mut libc::c_void, 1) };
@@ -232,13 +253,29 @@ fn raw_mode() -> Option<libc::termios> {
     if unsafe { libc::tcgetattr(0, &mut old) } != 0 {
         return None;
     }
-    let mut raw = old;
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-    raw.c_iflag &= !(libc::ICRNL | libc::IXON);
-    raw.c_cc[libc::VMIN] = 1;
-    raw.c_cc[libc::VTIME] = 0;
-    unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &raw) };
+    unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &raw_of(old)) };
     Some(old)
+}
+
+fn raw_of(mut t: libc::termios) -> libc::termios {
+    t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+    t.c_iflag &= !(libc::ICRNL | libc::IXON);
+    t.c_cc[libc::VMIN] = 1;
+    t.c_cc[libc::VTIME] = 0;
+    t
+}
+
+/// raw でなくなっていれば、raw にもどす (もどしたら true)
+fn keep_raw() -> bool {
+    let mut now: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut now) } != 0 || is_raw(&now) {
+        return false;
+    }
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw_of(now)) == 0 }
+}
+
+fn is_raw(t: &libc::termios) -> bool {
+    t.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN) == 0 && t.c_iflag & (libc::ICRNL | libc::IXON) == 0 && t.c_cc[libc::VMIN] == 1 && t.c_cc[libc::VTIME] == 0
 }
 
 fn print_flush(s: &str) {
@@ -345,7 +382,9 @@ impl Editor {
                 Err(_) => Input::Interrupt,
             };
         };
+        EDITING.store(true, std::sync::atomic::Ordering::Relaxed);
         let r = self.edit(prompt, ctx, pl);
+        EDITING.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &old) };
         r
     }

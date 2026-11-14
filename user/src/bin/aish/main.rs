@@ -1210,7 +1210,9 @@ impl Shell {
                     // Rust は SIGPIPE を、シェルは SIGINT/SIGQUIT (と止めるシグナル) を無視するが、
                     // 子には既定の動作で渡す
                     for sig in [libc::SIGPIPE, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
-                        libc::signal(sig, libc::SIG_DFL);
+                        if !trap::ignored(sig) {
+                            libc::signal(sig, libc::SIG_DFL);
+                        }
                     }
                     if prev_read >= 0 {
                         libc::dup2(prev_read, 0);
@@ -1368,7 +1370,9 @@ impl Shell {
                 libc::dup2(theirs, to);
                 libc::close(theirs);
                 for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
-                    libc::signal(sig, libc::SIG_DFL);
+                    if !trap::ignored(sig) {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
                 }
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 jobs::INTERACTIVE = false;
@@ -1419,7 +1423,9 @@ impl Shell {
                 libc::dup2(fds[1], 1);
                 libc::close(fds[1]);
                 for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
-                    libc::signal(sig, libc::SIG_DFL);
+                    if !trap::ignored(sig) {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
                 }
                 jobs::INTERACTIVE = false;
             }
