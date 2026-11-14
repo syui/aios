@@ -798,7 +798,11 @@ MAP_SHARED) と `sync` / `syncfs` / `fsync` / `fdatasync` を回すもの 2 つ�
 `test/powercut.sh [KERNEL] [N]`: おそくしたディスク (`throttling.iops-write=200`) で flushrace を回しているとちゅうに
 QEMU を SIGKILL して (`test/vm.py stop` は `poweroff` するので、電源を抜くことにならない)、外から e2fsck -fy。
 放したブロックの決まりの前は 6 回のうち 4 回 invalid extent node、いまは 12 回ともこわれていない (ジャーナルを書く
-とちゅうで切れたものは、再生してから)。
+とちゅうで切れたものは、再生してから)。2026-11-14: 12 回に 1 回ほど、e2fsck が「needs_recovery flag is clear, but
+journal has data」と言った (こわれてはいない: 再生すればよい)。コミットのとき、ジャーナルの頭 (jbd2 のスーパーブロックの
+s_start) を書いてから ext4 のスーパーブロックに回復の印を立てていたので、そのあいだで切れたもの。印を先に立てる順にした
+(切れても「印があってジャーナルが空」: e2fsck も aios のマウントもだまって印を消す。Linux はマウントしているあいだずっと
+印を立てておく)。
 `test/fsyncstall.c` は、`fsync` を回すあいだに別のプロセスのシステムコール (大きなロックを取る `uname`) が何 ms
 止まったかを測る。おそいディスクのまねは `AIOS_DISK_OPTS=throttling.iops-write=N bin/run.sh` (QEMU のドライブの引数に足す)。
 1 秒に 50 回書けるディスクで 10 秒: 前は `uname` が 109 回しか通らなかった (いちばん長く止まったのは 374 ms) のが、

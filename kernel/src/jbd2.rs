@@ -440,11 +440,14 @@ impl ExtFs {
             self.jwrite_blocks(j, start, &out, sleep)?;
             self.jwrite(j, start + out.len() as u32, &commit, sleep)?;
         }
-        // ここでトランザクションは確かになる: ジャーナルの頭を指し、回復の印を立てる
+        // ここでトランザクションは確かになる: 回復の印を立ててから、ジャーナルの頭を指す。逆の順だと、そのあいだで電源が
+        // 切れたとき、ジャーナルに中身があるのに印がない (e2fsck: needs_recovery flag is clear, but journal has data。
+        // 2026-11-14 の test/powercut.sh で 18 回に 2 回)。この順なら、切れても「印があってジャーナルが空」で、e2fsck も
+        // aios のマウントもだまって印を消す (Linux はマウントしているあいだずっと印を立てておく)
+        self.set_recover(true, sleep)?;
         put_be32(&mut j.sb, 0x1c, j.first);
         put_be32(&mut j.sb, 0x18, seq);
         self.write_jsb(j, sleep)?;
-        self.set_recover(true, sleep)?;
         Ok(true)
     }
 
