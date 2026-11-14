@@ -249,8 +249,9 @@ pub fn init() -> bool {
     // /dev/fb0 (Linux の devtmpfs: 装置を見つけたものがノードを置く) と、それを開くもの (Linux の register_chrdev)
     crate::fs::add_dev("fb0", 0o666, false, 29, 0);
     crate::file::register_chrdev(29, |mi, _| (mi == 0 && get().is_some()).then(|| Ok(crate::file::Kind::Ops(Rc::new(FbFile)))));
-    // 3D があれば /dev/dri (drm.rs。Linux はいつも置くが、aios は 2D だけのときは置かない: Mesa は llvmpipe のまま)
-    if let Some(g) = get().filter(|g| g.virgl) {
+    // /dev/dri (drm.rs)。Linux と同じく 3D (virgl) がなくても置く: KMS は同じ、render の口は 2D のきまり (Mesa は virgl を
+    // あきらめて llvmpipe に)
+    if let Some(g) = get() {
         crate::drm::init(g.pa);
     }
     true

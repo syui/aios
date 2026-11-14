@@ -7,6 +7,8 @@
 # virgl で描いて読み返す。LIBGL_ALWAYS_SOFTWARE=1 で llvmpipe も)、eglinfo、kmscube (virgl で描いて KMS に出す)、
 # drmrender と drmkms と drmatomic (test/drmrender.c、test/drmkms.c、test/drmatomic.c: render の口と KMS と atomic の ioctl の
 # 答え。aios の VM の答えとくらべる)
+#   LINUX_GPU=2d test/drm-linux.sh build/drm-linux-2d   3D のない virtio-gpu-device (QEMU のふつうの画面) で同じものを
+#                                                     (Linux はこのときも card0 と renderD128 を置く。Mesa は llvmpipe へ)
 # 要るもの: qemu-system-aarch64 (virtio-gpu-gl-device)、xvfb-run (QEMU の SDL の GL で virglrenderer に描かせる。この
 # マシンに GPU がなければホストの llvmpipe で: 速さは見られない)、bsdtar、curl、python3、zig (build/zig)
 # Alpine のパッケージは APKINDEX から依存を解いて、tar で広げるだけ (apk も install のスクリプトも動かさない)。
@@ -122,9 +124,11 @@ bsdtar --format newc -cf - -C rootfs . | gzip -1 > initramfs.gz
 dd if=/dev/zero of=out.img bs=1M count=64 2>/dev/null
 
 # 4. 起こす (aarch64 の TCG なので数分)
+gpu="-device virtio-gpu-gl-device -display sdl,gl=on"
+[ "${LINUX_GPU:-}" = 2d ] && gpu="-device virtio-gpu-device -display none"
 xvfb-run -a -s "-screen 0 1280x800x24" qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 2 -m 3G \
   -global virtio-mmio.force-legacy=false -kernel rootfs/boot/vmlinuz-virt -initrd initramfs.gz \
-  -append "console=ttyAMA0 rdinit=/init" -device virtio-gpu-gl-device -display sdl,gl=on \
+  -append "console=ttyAMA0 rdinit=/init" $gpu \
   -drive file=out.img,format=raw,if=none,id=o -device virtio-blk-device,drive=o \
   -serial file:serial.log -monitor none -no-reboot -nic none
 rm -rf t

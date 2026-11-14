@@ -1,6 +1,6 @@
 // DRM (Linux の drivers/gpu/drm): GPU に描かせる口。/dev/dri/card0 と /dev/dri/renderD128 (major 226、minor 0 と 128)
 //
-// いまは virtio-gpu の 3D (virgl: QEMU の virtio-gpu-gl-device) があるときだけ置く。Mesa の virgl は renderD128 を開いて、
+// virtio-gpu があれば置く (Linux と同じ)。3D (virgl: QEMU の virtio-gpu-gl-device) があれば、Mesa の virgl は renderD128 を開いて、
 //   GETPARAM と GET_CAPS     ホストの力 (capset: ホストの GL が何をできるか) を聞く
 //   RESOURCE_CREATE          GPU のメモリ (BO: GEM のもの) を作る。中身はカーネルのページで、ホストにも渡す (ATTACH_BACKING)
 //   MAP と mmap              BO のページをそのままユーザーに見せる (MAP の答えのオフセットで DRM の fd を mmap)
@@ -10,6 +10,10 @@
 // 命令はどれも、ホストが終えて答えるまで待つ (SUBMIT_3D には fence の印をつけるので、答えはホストが描き終えたとき)。
 // だから印 (sync_file) はいつも「もう終わった」で、WAIT は待たない (Linux は待たずに返して、あとで fence で知らせる:
 // 速さはちがうが、見える答えは同じ)。長い SUBMIT_3D は大きなロックを放して待つ (gpu::unlocked)。
+// 3D のない virtio-gpu (QEMU のふつうの virtio-gpu-device) では Linux の virtio_gpu の 2D のきまり: コンテキストは作らず、
+// GETPARAM の 3D_FEATURES は 0、GET_CAPS と EXECBUFFER と TRANSFER_FROM_HOST は ENOSYS、RESOURCE_CREATE は 2D の形 (target 2、
+// depth・array_size・last_level・nr_samples が 1 まで) だけで RESOURCE_CREATE_2D、TRANSFER_TO_HOST は TRANSFER_TO_HOST_2D
+// (stride は見ない)。Mesa の virgl はここであきらめて llvmpipe で描く (test/drm-linux.sh の LINUX_GPU=2d の答え)
 // 画面に出す KMS (card0 の MODE_*) は kms.rs。card0 をはじめに開いたファイルが master (Linux の drm_master_open)、
 // GET_MAGIC と AUTH_MAGIC、SET_MASTER と DROP_MASTER も Linux と同じ。KMS のできごと (page flip) はファイルの列に入り、
 // read で読む (poll で POLLIN)。PRIME (dma-buf: BO を fd にして、ほかのプロセスや GBM へ) は Linux と同じ答え (DRM_CAP_PRIME は
@@ -41,6 +45,7 @@ const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
+const ENOSYS: i64 = 38;
 const EOPNOTSUPP: i64 = 95;
 
 // virtio-gpu の 3D の命令 (virtio_gpu.h)
@@ -296,7 +301,8 @@ pub fn init(pa: usize) {
     if let Some(g) = gpu::get() {
         crate::kms::init(g);
     }
-    println!("drm: /dev/dri/card0 and renderD128 (virtio_gpu: virgl)");
+    let virgl = gpu::get().is_some_and(|g| g.virgl);
+    println!("drm: /dev/dri/card0 and renderD128 (virtio_gpu: {})", if virgl { "virgl" } else { "2D" });
 }
 
 /// 開いた DRM の口 (Linux の drm_file)
@@ -760,11 +766,30 @@ impl DrmFile {
     /// RESOURCE_CREATE (drm_virtgpu_resource_create): target, format, bind, width, height, depth, array_size, last_level,
     /// nr_samples, flags, bo_handle (答え), res_handle (答え), size, stride
     fn resource_create(&self, a: &mut [u8]) -> Result<(), i64> {
-        let ctx = self.context()?;
         let size = match le32(a, 48) as usize {
             0 => PGSIZE,
             n => n,
         };
+        // 3D がなければ 2D の資源だけ (virtio_gpu_resource_create_ioctl: target 2 = PIPE_TEXTURE_2D)
+        if !gpu()?.virgl {
+            if le32(a, 20) > 1 || le32(a, 32) > 1 || le32(a, 28) > 1 || le32(a, 0) != 2 || le32(a, 24) > 1 {
+                return Err(-EINVAL);
+            }
+            let (format, w, h) = (le32(a, 4), le32(a, 12), le32(a, 16));
+            let bo = alloc_bo(size, false, |res| {
+                let mut q = gpu::hdr3d(gpu::RESOURCE_CREATE_2D, 0, 0, 0);
+                for v in [res, format, w, h] {
+                    put32(&mut q, v);
+                }
+                q
+            })?;
+            let res = bo.res;
+            let h = self.new_handle(bo);
+            set32(a, 40, h);
+            set32(a, 44, res);
+            return Ok(());
+        }
+        let ctx = self.context()?;
         let bo = alloc_bo(size, false, |res| {
             let mut q = gpu::hdr3d(RESOURCE_CREATE_3D, 0, 0, ctx);
             put32(&mut q, res);
@@ -789,6 +814,10 @@ impl DrmFile {
         const FENCE_FD_IN: u32 = 1;
         const FENCE_FD_OUT: u32 = 2;
         const RING_IDX: u32 = 4;
+        // 3D がなければ何も見ずに ENOSYS (virtio_gpu_execbuffer_ioctl)
+        if !gpu()?.virgl {
+            return Err(-ENOSYS);
+        }
         let flags = le32(a, 0);
         let size = le32(a, 4) as usize;
         let (cmd, handles, nh) = (le64(a, 8) as usize, le64(a, 16) as usize, le32(a, 24) as usize);
@@ -881,6 +910,15 @@ impl DrmFile {
     /// TRANSFER_FROM_HOST / TO_HOST (drm_virtgpu_3d_transfer_*): bo_handle, box (x, y, z, w, h, d), level, offset, stride,
     /// layer_stride。blob でない資源では stride と layer_stride は 0 (Linux と同じく、ほかは EINVAL)
     fn transfer(&self, a: &mut [u8], typ: u32) -> Result<(), i64> {
+        // 3D がなければ、ホストからは読めない (ENOSYS)。ホストへは TRANSFER_TO_HOST_2D (box の x, y, w, h と offset)
+        if !gpu()?.virgl {
+            if typ == TRANSFER_FROM_HOST_3D {
+                return Err(-ENOSYS);
+            }
+            let bo = self.bo(le32(a, 0)).ok_or(-ENOENT)?;
+            gpu()?.transfer_2d(bo.res, le32(a, 4), le32(a, 8), le32(a, 16), le32(a, 20), le32(a, 32) as u64);
+            return Ok(());
+        }
         let ctx = self.context()?;
         let bo = self.bo(le32(a, 0)).ok_or(-ENOENT)?;
         if le32(a, 36) != 0 || le32(a, 40) != 0 {
@@ -994,7 +1032,7 @@ fn get_caps(a: &mut [u8]) -> Result<(), i64> {
     let g = gpu()?;
     let (id, ver, addr, size) = (le32(a, 0), le32(a, 4), le64(a, 8) as usize, le32(a, 16) as usize);
     if g.capsets.is_empty() {
-        return Err(-38);
+        return Err(-ENOSYS);
     }
     if size == 0 {
         return Err(-EINVAL);
