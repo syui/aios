@@ -11,6 +11,7 @@
 //   /sys/firmware/efi/{fw_platform_size,systab}      UEFI から起動したとき (arm64 の Linux と同じもの。systab は root だけ)
 //   /sys/firmware/efi/efivars                        efivarfs をかぶせるところ (efivarfs.rs)
 //   /sys/firmware/acpi/tables/SIG                    ACPI で起こしたとき、表そのもの (同じ名前がいくつかなら SSDT1、SSDT2。root だけ)
+//   /sys/firmware/acpi/{pm_profile,hotplug/}         Linux と同じ (hotplug/force_remove、container・pci_root・processor/enabled)
 //   /sys/module/apparmor/parameters/enabled          Y (aios.off=apparmor なら N。libapparmor の aa_is_enabled が読む)
 //   /sys/dev/char/MA:MI、/sys/class/CLASS/NAME       ドライバが add_chrdev で置いた文字デバイス (DRM の card0 と renderD128:
 //                                                    libdrm の drmGetDevices2 が読む)。どちらも次へのリンク:
@@ -35,6 +36,11 @@ const NET_FILES: [&str; 7] = ["address", "mtu", "operstate", "carrier", "ifindex
 const NET_STATS: [&str; 8] = ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"];
 const CPU_FILES: [&str; 3] = ["online", "possible", "present"];
 const EFI_FILES: [&str; 2] = ["fw_platform_size", "systab"];
+/// /sys/firmware/acpi/hotplug の下 (Linux の container、pci_root、processor のドライバのもの) と、その enabled
+/// (Linux の既定: container は 0、ほかは 1。root が 0 か 1 を書ける。aios はそのまま覚えるだけ)
+const ACPI_HOTPLUG: [&str; 3] = ["container", "pci_root", "processor"];
+static HOTPLUG_ON: [core::sync::atomic::AtomicBool; 3] =
+    [core::sync::atomic::AtomicBool::new(false), core::sync::atomic::AtomicBool::new(true), core::sync::atomic::AtomicBool::new(true)];
 /// ネットワークのインターフェース: eth0 と lo (番号は netlink と ioctl の SIOCGIFINDEX と同じ: lo 1、eth0 2)
 const NETS: [&str; 2] = ["eth0", "lo"];
 
@@ -83,6 +89,9 @@ enum Node {
     /// /sys/firmware/acpi/hotplug と force_remove (Linux はもう 1 にできない: 0 だけ)
     AcpiHotplug,
     AcpiForceRemove,
+    /// hotplug/container、pci_root、processor (Linux の acpi_sysfs_add_hotplug_profile: ドライバの名前) と enabled
+    AcpiHp(u8),
+    AcpiHpEnabled(u8),
     /// /sys/dev、/sys/dev/char と、その中のリンク (CHRDEVS の番号)
     Dev,
     DevChar,
@@ -220,6 +229,8 @@ impl SysInode {
             Node::AcpiPmProfile => 29,
             Node::AcpiHotplug => 30,
             Node::AcpiForceRemove => 31,
+            Node::AcpiHp(i) => 0x780 + 2 * i as u64,
+            Node::AcpiHpEnabled(i) => 0x781 + 2 * i as u64,
             Node::EfiFile(i) => 0x400 + i as u64,
             Node::DiskFile(i) => 0x100 + i as u64,
             Node::QueueFile(i) => 0x200 + i as u64,
@@ -257,7 +268,7 @@ impl SysInode {
     fn is_dir(&self) -> bool {
         matches!(
             self.node,
-            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug
+            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug | Node::AcpiHp(_)
                 | Node::Dev | Node::DevChar | Node::Bus | Node::BusPlatform | Node::Platform | Node::PlatDev(_) | Node::PlatClass(_) | Node::Chr(_) | Node::ClassOf(_)
         )
     }
@@ -286,7 +297,8 @@ impl SysInode {
             Node::ModAaEnabled => Node::ModAaParams,
             Node::Efi | Node::Acpi => Node::Firmware,
             Node::AcpiTables | Node::AcpiPmProfile | Node::AcpiHotplug => Node::Acpi,
-            Node::AcpiForceRemove => Node::AcpiHotplug,
+            Node::AcpiForceRemove | Node::AcpiHp(_) => Node::AcpiHotplug,
+            Node::AcpiHpEnabled(i) => Node::AcpiHp(i),
             Node::AcpiTable(_) | Node::AcpiSub(_) => Node::AcpiTables,
             Node::EfiFile(_) | Node::EfiVars => Node::Efi,
             Node::DevChar => Node::Dev,
@@ -401,6 +413,7 @@ impl SysInode {
             // FADT の Preferred_PM_Profile (Linux の acpi_show_profile)
             Node::AcpiPmProfile => format!("{}\n", crate::acpi::pm_profile()),
             Node::AcpiForceRemove => "0\n".into(),
+            Node::AcpiHpEnabled(i) => format!("{}\n", HOTPLUG_ON[i as usize].load(core::sync::atomic::Ordering::Relaxed) as u8),
             // 設定テーブルの ACPI と SMBIOS (Linux の systab_show の順)
             Node::EfiFile(_) => {
                 if !crate::cred::current().capable(crate::cred::CAP_DAC_READ_SEARCH) {
@@ -432,11 +445,12 @@ impl Inode for SysInode {
     fn meta(&self) -> Meta {
         let link = self.link();
         let mode = match self.node {
-            _ if self.is_dir() => S_IFDIR | 0o555,
+            // Linux の /sys のディレクトリは 0755 (kobject のディレクトリ。/proc は 0555)
+            _ if self.is_dir() => S_IFDIR | 0o755,
             _ if link.is_some() => S_IFLNK | 0o777,
             Node::EfiFile(1) | Node::AcpiTable(_) => S_IFREG | 0o400,
             // uevent は root が書ける (Linux と同じ形。書いても何もしない)
-            Node::PlatUevent(_) | Node::ChrUevent(_) | Node::AcpiForceRemove => S_IFREG | 0o644,
+            Node::PlatUevent(_) | Node::ChrUevent(_) | Node::AcpiForceRemove | Node::AcpiHpEnabled(_) => S_IFREG | 0o644,
             _ => S_IFREG | 0o444,
         };
         let size = match &link {
@@ -477,6 +491,14 @@ impl Inode for SysInode {
             // uevent に書くと Linux はその装置のできごとをもう一度出す (udev の trigger)。aios には udev がないので受けとるだけ
             Node::PlatUevent(_) | Node::ChrUevent(_) => Ok(b.len()),
             // Linux の force_remove_store: 0 (false) だけ受けとる
+            // Linux の hotplug_enabled_store: kstrtouint (10 進。終わりの改行はよい)、0 でなければ有効
+            Node::AcpiHpEnabled(i) => match core::str::from_utf8(b).ok().map(|s| s.strip_suffix('\n').unwrap_or(s)).map(|s| s.strip_prefix('+').unwrap_or(s)).and_then(|s| s.parse::<u32>().ok()) {
+                Some(v) => {
+                    HOTPLUG_ON[i as usize].store(v != 0, core::sync::atomic::Ordering::Relaxed);
+                    Ok(b.len())
+                }
+                None => Err(-EINVAL),
+            },
             Node::AcpiForceRemove => match core::str::from_utf8(b).map(|s| s.trim()) {
                 Ok("0" | "n" | "N" | "no" | "off" | "false") => Ok(b.len()),
                 _ => Err(-EINVAL),
@@ -560,6 +582,8 @@ impl Inode for SysInode {
             Node::Acpi if name == "pm_profile" => Node::AcpiPmProfile,
             Node::Acpi if name == "hotplug" => Node::AcpiHotplug,
             Node::AcpiHotplug if name == "force_remove" => Node::AcpiForceRemove,
+            Node::AcpiHotplug => Node::AcpiHp(pos(&ACPI_HOTPLUG)?),
+            Node::AcpiHp(i) if name == "enabled" => Node::AcpiHpEnabled(i),
             Node::AcpiTables if name == "data" => Node::AcpiSub(0),
             Node::AcpiTables if name == "dynamic" => Node::AcpiSub(1),
             Node::AcpiTables => Node::AcpiTable(crate::acpi::sysfs_tables().iter().position(|(n, _)| n == name).ok_or(-ENOENT)? as u8),
@@ -639,7 +663,13 @@ impl Inode for SysInode {
                 add("pm_profile".into(), Node::AcpiPmProfile);
                 add("tables".into(), Node::AcpiTables);
             }
-            Node::AcpiHotplug => add("force_remove".into(), Node::AcpiForceRemove),
+            Node::AcpiHotplug => {
+                for (i, n) in ACPI_HOTPLUG.iter().enumerate() {
+                    add((*n).into(), Node::AcpiHp(i as u8));
+                }
+                add("force_remove".into(), Node::AcpiForceRemove);
+            }
+            Node::AcpiHp(i) => add("enabled".into(), Node::AcpiHpEnabled(i)),
             Node::AcpiSub(_) => {}
             Node::AcpiTables => {
                 add("data".into(), Node::AcpiSub(0));

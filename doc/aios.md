@@ -2097,12 +2097,16 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
   ので、QEMU の表 (OEM が BOCHS) のときだけ virt の決まった場所
 - /sys/firmware/acpi/ は Linux 7.4 と同じ形: `tables/` (XSDT が指す表と DSDT。名前は表の名前で、同じ名前が
   いくつかなら SSDT1、SSDT2。中身はそのままのバイトで root だけ: 0400)、`tables/data/` と `tables/dynamic/` (空)、
-  `pm_profile` (FADT の Preferred_PM_Profile)、`hotplug/force_remove` (0。1 を書くと EINVAL)
+  `pm_profile` (FADT の Preferred_PM_Profile)、`hotplug/force_remove` (0。1 を書くと EINVAL)、`hotplug/container`、
+  `pci_root`、`processor` の `enabled` (Linux の既定の 0、1、1。root が数を書ける。数でなければ EINVAL)。
+  /sys のディレクトリはみな 0755 (Linux の kobject と同じ。前は 0555)。test/acpi.c の 40 行は、同じ QEMU で ACPI で
+  起こした手本の Linux 7.4-rc2 と同じ (2026-11-14)
 - 確かめかた: `test/acpi-boot.sh [KERNEL]` (aios.img の写しの ESP の /Image をかえて、QEMU の `virt,acpi=on` と AAVMF
   で起こす。AIOS_GIC=3、AIOS_SMP、AIOS_ACPI_CMD でプロンプトでコマンド)、`AIOS_ACPI=on bin/run.sh` (UEFI で起こすとき。
   CI の Boot test も aavmf、edk2 に acpi を足した)、`test/acpi.c` (/sys/firmware/acpi のならびと表の頭、force_remove。
   aios は test/acpi-boot.sh、手本の Linux は `LINUX_EFI=1 LINUX_ACPI=1 test/linux-vm.sh rootexec`。test/linux.config に
-  CONFIG_ACPI)。QEMU の GICv2 と GICv3、CPU 2 と 4 で、プロンプト、ext4 のルート、DHCP、swap まで
+  CONFIG_ACPI と、QEMU の DSDT の PCIe のホストブリッジの領域を読むための CONFIG_PCI)。QEMU の GICv2 と GICv3、
+  CPU 2 と 4 で、プロンプト、ext4 のルート、DHCP、swap まで
 - まだ: ほんものの UEFI の機械 (RTC を EFI の GetTime で、PCIe (MCFG)、virtio でない機器、Method の _CRS)。
   virtio-blk は 1 台だけ見る (はじめのもの)
 

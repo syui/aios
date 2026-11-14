@@ -1,5 +1,6 @@
 // ACPI で起こしたときの /sys/firmware/acpi (Linux の drivers/acpi/sysfs.c): ならび (名前の順)、種類と許可、表の頭
-// (名前、長さ、版、OEM。root で)、pm_profile と hotplug/force_remove、force_remove に 1 を書くと EINVAL、0 はよい。
+// (名前、長さ、版、OEM。root で)、pm_profile と hotplug/force_remove と hotplug/NAME/enabled、force_remove に 1 を
+// 書くと EINVAL、0 はよい。enabled は 0 と 1 (数でなければ EINVAL)。
 // root でなければ表は EACCES。aios は test/acpi-boot.sh (UEFI と QEMU の acpi=on)、Linux は
 // LINUX_EFI=1 LINUX_ACPI=1 test/linux-vm.sh rootexec で (aarch64-linux-gnu-gcc -O2 -static -o acpi test/acpi.c)
 #include <dirent.h>
@@ -99,12 +100,23 @@ int main(void) {
   walk("/sys/firmware/acpi", 0);
   show("/sys/firmware/acpi/pm_profile");
   show("/sys/firmware/acpi/hotplug/force_remove");
+  const char *hp[] = {"container", "pci_root", "processor"};
+  for (unsigned i = 0; i < sizeof hp / sizeof *hp; i++) {
+    char p[128];
+    snprintf(p, sizeof p, "/sys/firmware/acpi/hotplug/%s/enabled", hp[i]);
+    show(p);
+  }
   const char *names[] = {"APIC", "DSDT", "FACP", "GTDT", "MCFG", "SPCR"};
   for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
     table(names[i]);
   if (getuid() == 0) {
     put("/sys/firmware/acpi/hotplug/force_remove", "1");
     put("/sys/firmware/acpi/hotplug/force_remove", "0");
+    put("/sys/firmware/acpi/hotplug/container/enabled", "x");
+    put("/sys/firmware/acpi/hotplug/container/enabled", "0");
+    show("/sys/firmware/acpi/hotplug/container/enabled");
+    put("/sys/firmware/acpi/hotplug/container/enabled", "1");
+    show("/sys/firmware/acpi/hotplug/container/enabled");
   }
   return 0;
 }

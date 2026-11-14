@@ -138,6 +138,10 @@ pub fn ship(v: &Value) -> Value {
                     let mut text = format!("{}: publish {} ({})\n", short, if code == 0 { "done" } else { "failed" }, log);
                     text.push_str(&tail(&log, if code == 0 { 3 } else { 8 }));
                     // CI が落ちた・取り消された: どれか
+                    // GitHub が CI をまだ始めていなかった (push のすぐあと): もう一度 ship すれば publish からやりなおす
+                    if txt.contains("GitHub did not start it (yet)") {
+                        text.push_str("  the CI run had not started yet (GitHub was slow): call ship again to publish again\n");
+                    }
                     if txt.contains("uncommitted changes in its sources") {
                         text.push_str("  the release is out; the packages were not: commit the changes and ship again (it publishes the new commit)\n");
                     }
