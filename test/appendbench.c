@@ -1,7 +1,7 @@
 // 伸ばす書きこみ (ファイルの終わりに 4 KiB ずつ) の 1 回の µs: 1 つのプロセスと P つのプロセス (それぞれ自分のファイル。
 // 8 MiB で ftruncate して 0 から)。P つのときは、合わせて 1 回あたり (伸びは 1 つのときの何倍まわせたか)。aios と Linux
 // (test/linux-vm.sh exec) で同じものを動かしてくらべる。doc/aios.md の「ファイルの終わりへの書きたし」
-//   ./appendbench [DIR] [P]
+//   ./appendbench [DIR] [P] [MS]   (MS: 1 つと P つのそれぞれを動かす長さ。既定 300。ゆれが大きいときは 2000 など)
 //   aarch64-linux-gnu-gcc -O2 -static -o appendbench test/appendbench.c
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -31,7 +31,7 @@ static long run(const char *dir, int id, double ms) {
 int main(int argc, char **argv) {
   const char *dir = argc > 1 ? argv[1] : ".";
   int P = argc > 2 ? atoi(argv[2]) : 4;
-  double ms = 300;
+  double ms = argc > 3 ? atof(argv[3]) : 300;
   long n1 = run(dir, 0, ms);
   printf("append-4k procs 1: %.2f us\n", ms * 1000 / n1);
   int pipefd[2];

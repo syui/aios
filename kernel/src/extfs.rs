@@ -684,12 +684,27 @@ impl Cache {
         self.tidy_order();
     }
 
+    /// 放したブロック [start, end) を覚えから外す: 書き出さない (印を消す。data に残すと、flush がディスクの古い中身を
+    /// 読んで書き戻す) し、表のページも捨てる。覚えているものだけ
+    // [lockless]
+    fn forget_blocks(&mut self, start: u64, end: u64) {
+        self.dirty.extract_if(start..end, |_| true).for_each(drop);
+        self.data.extract_if(start..end, |_| true).for_each(drop);
+        self.lazy_csum.extract_if(start..end, |_, _| true).for_each(drop);
+        self.forget_range(start, end);
+    }
+
     /// [start, end) のブロックをみな覚えから外す (forget を 1 つずつするのと同じ。order を作りなおすのは終わりに 1 度:
     /// 大きなファイルを消すと、1 つずつでは何度も作りなおした)
     // [lockless]
     fn forget_range(&mut self, start: u64, end: u64) {
-        // 範囲のものを木からまとめて抜く (1 つずつ remove して木をたどりなおさない)
-        let gone: Vec<(u64, *mut u8)> = self.map.extract_if(start..end, |_, _| true).collect();
+        // 範囲のものを木からまとめて抜く (1 つずつ remove して木をたどりなおさない)。いっしょに持っているときは map_edit の
+        // 中で (表はロックなしで引かれる)
+        let gone: Vec<(u64, *mut u8)> = if shared_here() {
+            map_edit(|| self.map.extract_if(start..end, |_, _| true).collect())
+        } else {
+            self.map.extract_if(start..end, |_, _| true).collect()
+        };
         for (b, p) in gone {
             self.release_page(b, p);
         }
@@ -742,6 +757,12 @@ struct Cache {
     /// Some のあいだは、外したページを返さずにためる (切りつめ: ext4 のロックを放してから返す。8 MiB で 2048 枚を返す
     /// あいだ、ほかの CPU の大きなロックなしの書きたしが ext4 のロックを待っていた)
     defer_put: Option<Vec<*mut u8>>,
+    /// true のあいだ (切りつめ: ext4 のロックをひとりで持つところ) は、放したブロックのキャッシュを片づけずに forget_later に
+    /// ためる (drain_forgets が、ロックを放してから、いっしょに持って少しずつ。8 MiB の切りつめで、片づけが ext4 のロックを
+    /// ひとりで持つあいだの 8 割 (1 回 1.8 ms) だった)。放したブロックはコミットまでだれも取らないので、flush のはじめに
+    /// 残りを片づければ、新しい持ち主のページや印を消すことはない
+    defer_forget: bool,
+    forget_later: Vec<(u64, u64)>,
     /// 眠って書いた書き出しの数と、ほかの書き出しのとちゅうだったので回って書かなかった数 (/proc/ai/fs)
     slept_flushes: u64,
     skipped_flushes: u64,
@@ -1213,6 +1234,8 @@ impl ExtFs {
                 writeback: Ranges::default(),
                 wb_held: Vec::new(),
                 defer_put: None,
+                defer_forget: false,
+                forget_later: Vec::new(),
                 slept_flushes: 0,
                 skipped_flushes: 0,
                 freed: Ranges::default(),
@@ -2273,13 +2296,14 @@ impl ExtFs {
             b += run;
         }
         let mut c = self.cache.borrow_mut();
-        // 捨てたブロックは書き出さない (free_block と同じ)。覚えているものだけ
-        c.dirty.extract_if(start..end, |_| true).for_each(drop);
-        c.data.extract_if(start..end, |_| true).for_each(drop);
-        c.lazy_csum.extract_if(start..end, |_, _| true).for_each(drop);
-        c.forget_range(start, end);
         // 放したことがコミットされるまで、また取らない (alloc_block)
         c.freed.insert_range(start, end);
+        // 切りつめのあいだ: キャッシュの片づけは、ext4 のロックを放してから (drain_forgets)
+        if c.defer_forget {
+            c.forget_later.push((start, end));
+            return Ok(());
+        }
+        c.forget_blocks(start, end);
         Ok(())
     }
 
@@ -2515,6 +2539,23 @@ impl ExtFs {
         }
     }
 
+    /// 切りつめでためた、放したブロックのキャッシュの片づけ (forget_later)。いっしょに持っているときは BOOK を 64 ブロック
+    /// ずつ取りなおす (ロックなしの書きたしは 1 回ごとに BOOK を取る: 長く持つと止まる)。flush のはじめにも (放した
+    /// ブロックはコミットのあとにまた取れる: その前に片づける)
+    fn drain_forgets(&self) {
+        const CHUNK: u64 = 64;
+        loop {
+            let Some((s, e)) = self.cache.borrow_mut().forget_later.pop() else { break };
+            let _p = crate::prof::span("extfs:forget");
+            let mut b = s;
+            while b < e {
+                let k = (e - b).min(CHUNK);
+                self.cache.borrow_mut().forget_blocks(b, b + k);
+                b += k;
+            }
+        }
+    }
+
     pub fn flush(&self) -> Result<(), i64> {
         // 眠って書いてよいところ (proc::flush_sleepable: fsync、sync) か。その印はここで取る: 中で呼ぶ書き出し
         // (MAP_SHARED のページを書くときの maybe_flush など) は眠らせない
@@ -2537,6 +2578,8 @@ impl ExtFs {
             }
             crate::proc::sleep_nointr(self.flush_chan());
         }
+        // 切りつめで放したブロックのキャッシュの片づけが残っていれば先に (コミットのあと、放したブロックはまた取れる)
+        self.drain_forgets();
         // 先取りはコミットに入れない (どのファイルのものでもないブロックが、ビットマップで使っていることにならないように)
         self.unreserve_all();
         self.flush_kicked.store(false, Ordering::Relaxed);
@@ -5313,7 +5356,11 @@ impl ExtInode {
         let _p = crate::prof::span("extfs:truncate");
         // 中身が変わる: ページキャッシュ (vm.rs) にある分を、前と後に捨てる
         crate::vm::file_changed(self.id());
-        self.fs.cache.borrow_mut().defer_put = Some(Vec::new());
+        {
+            let mut c = self.fs.cache.borrow_mut();
+            c.defer_put = Some(Vec::new());
+            c.defer_forget = true;
+        }
         let r = (|| -> Result<(), i64> {
         self.not_swapfile()?;
         self.write_op(|| {
@@ -5344,7 +5391,9 @@ impl ExtInode {
         })
         })();
         crate::vm::file_changed(self.id());
-        let pages = self.fs.cache.borrow_mut().defer_put.take().unwrap_or_default();
+        let mut c = self.fs.cache.borrow_mut();
+        c.defer_forget = false;
+        let pages = c.defer_put.take().unwrap_or_default();
         (r, pages)
     }
 
@@ -5720,9 +5769,18 @@ impl Inode for ExtInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), i64> {
+        // ページキャッシュ (vm.rs) のこのファイルのページは、ext4 のロックを取る前にいちど捨てておく (8 MiB で 2048 枚を表から
+        // 抜くのに 0.9 ms: ロックの中でしていたとき、切りつめのあいだの 8 割)。ロックの中の file_changed はそのまま (書きこみの
+        // 許しを取り消し、ロックなしで写しているものを待ち、そのあいだに入ったものだけを捨てる)
+        crate::vm::file_changed(self.id());
         let (r, pages) = self.truncate_locked(len);
         // 外したブロックのキャッシュのページは、ext4 のロックを放してから返す
         pages.into_iter().for_each(kalloc::put);
+        // 外したブロックのキャッシュの片づけも、ロックをいっしょに持って (ロックなしの書きたしを止めない)
+        {
+            let _e = fs_lock_shared();
+            self.fs.drain_forgets();
+        }
         r
     }
 
