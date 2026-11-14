@@ -2077,6 +2077,35 @@ UEFI から起動したとき (aiboot、systemd-boot、ファームウェアか�
   ctests でも sudo で)。手本の Linux の設定 (test/linux.config) に CONFIG_EFI と
   CONFIG_EFIVAR_FS を入れた (-kernel でじかに起こすときは使わない。sysdiff の答えは入れる前と同じ)
 
+### ACPI (UEFI の機械で DTB なしに起こす)
+
+UEFI の機械はふつう DTB をわたさず ACPI の表だけをわたす (QEMU の virt も `acpi=on` ならそう)。2026-11-14 から、
+DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と arch/arm64/kernel/acpi.c の、起動に要るところ):
+
+- EFI スタブ (kernel/src/efi.rs) は、DTB がなく ACPI 2.0 の RSDP があれば進む (`aios: no device tree; using ACPI`)。
+  RAM の大きさと使えないところは、ExitBootServices のときの EFI のメモリマップから (Linux の efi_init と
+  reserve_regions): RAM の範囲と、そのうちのすき間、Reserved、ACPI Reclaim と NVS、MMIO、ランタイムを kalloc がよける
+  (ACPI の表はあとも読めるように残る)
+- kernel/src/acpi.rs (core) が、UART より先に RSDP → XSDT → MADT (GICD と版、GICv2 の CPU インターフェイス、GICv3 の
+  再配布器、使える CPU の MPIDR)、SPCR (PL011 か SBSA の generic UART の番地と割り込み)、FADT (ARM_BOOT_ARCH: PSCI と
+  hvc / smc、DSDT)、DSDT と SSDT の AML のうち Device の Name(_HID)、_UID、Name(_CRS) (Memory32Fixed、DWord / QWord の
+  Memory、Extended Interrupt) を読み、決まった大きさの表に写す。AML はインタプリタなしで名前だけをたどる (静的な表なら
+  これで足りる。Method(_CRS) は読まない)
+- dtb.rs の口 (reg_of、irq_cell、each_virtio、each_cpu、psci_method) は、DTB がなければ acpi.rs に聞く (Linux の
+  fwnode のように)。compatible と _HID の対応は Linux のドライバの acpi_match_table と同じ (arm,pl011 は SPCR か ARMH0011、
+  virtio,mmio は LNRO0005、arm,pl061 は ARMH0061)。GIC は MADT から。PL031 は ACPI に書かれない (Linux は EFI の GetTime)
+  ので、QEMU の表 (OEM が BOCHS) のときだけ virt の決まった場所
+- /sys/firmware/acpi/ は Linux 7.4 と同じ形: `tables/` (XSDT が指す表と DSDT。名前は表の名前で、同じ名前が
+  いくつかなら SSDT1、SSDT2。中身はそのままのバイトで root だけ: 0400)、`tables/data/` と `tables/dynamic/` (空)、
+  `pm_profile` (FADT の Preferred_PM_Profile)、`hotplug/force_remove` (0。1 を書くと EINVAL)
+- 確かめかた: `test/acpi-boot.sh [KERNEL]` (aios.img の写しの ESP の /Image をかえて、QEMU の `virt,acpi=on` と AAVMF
+  で起こす。AIOS_GIC=3、AIOS_SMP、AIOS_ACPI_CMD でプロンプトでコマンド)、`AIOS_ACPI=on bin/run.sh` (UEFI で起こすとき。
+  CI の Boot test も aavmf、edk2 に acpi を足した)、`test/acpi.c` (/sys/firmware/acpi のならびと表の頭、force_remove。
+  aios は test/acpi-boot.sh、手本の Linux は `LINUX_EFI=1 LINUX_ACPI=1 test/linux-vm.sh rootexec`。test/linux.config に
+  CONFIG_ACPI)。QEMU の GICv2 と GICv3、CPU 2 と 4 で、プロンプト、ext4 のルート、DHCP、swap まで
+- まだ: ほんものの UEFI の機械 (RTC を EFI の GetTime で、PCIe (MCFG)、virtio でない機器、Method の _CRS)。
+  virtio-blk は 1 台だけ見る (はじめのもの)
+
 ### CPU のぜい弱性 (/sys/devices/system/cpu/vulnerabilities、SSBS)
 
 `/sys/devices/system/cpu/vulnerabilities/` に Linux 7.3 と同じ 19 のファイル (meltdown、spectre_v1、spectre_v2、

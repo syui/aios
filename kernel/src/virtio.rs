@@ -93,7 +93,7 @@ pub fn probe(device_id: u32, wanted: u64) -> Option<(Mmio, u64)> {
 /// virtio-mmio の口 (物理番地, GIC の INTID): DTB があればそこに書かれたもの、なければ qemu virt の決まった場所。番地の順
 fn slots() -> alloc::vec::Vec<(usize, u32)> {
     let mut slots = alloc::vec::Vec::new();
-    if crate::dtb::present() {
+    if crate::dtb::described() {
         crate::dtb::each_virtio(|base, spi| slots.push((base as usize, 32 + spi)));
         slots.sort();
     } else {
@@ -159,7 +159,7 @@ pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)>
 /// 見えている virtio の装置 (「ID@番地」の並び。モジュールが装置を見つけられないときに出す)
 pub fn list() -> alloc::string::String {
     let mut slots = alloc::vec::Vec::new();
-    if crate::dtb::present() {
+    if crate::dtb::described() {
         crate::dtb::each_virtio(|base, _| slots.push(base as usize));
         slots.sort();
     } else {

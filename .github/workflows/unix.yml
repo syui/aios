@@ -120,16 +120,20 @@ jobs:
           done
           echo "c023444108b7a132fdebf70c4765cd2dd9af2a9ff7d001a743aaabe87c20a458  build/edk2-aarch64-code.fd.bz2" | sha256sum -c
           bunzip2 -f build/edk2-aarch64-code.fd.bz2
-          for fw in aavmf edk2; do
+          # acpi: AAVMF で DTB をわたさず ACPI の表だけで (UEFI の機械と同じ。カーネルの acpi.rs が MADT、SPCR、FADT、DSDT を読む)
+          for fw in aavmf edk2 acpi; do
             code=
             [ $fw = edk2 ] && code=$PWD/build/edk2-aarch64-code.fd
+            acpi=
+            [ $fw = acpi ] && acpi=on
             # 変数はファームウェアごとに作りなおす
             rm -f build/efivars.fd
-            AIOS_GIC=3 AIOS_EFI_CODE=$code bin/run.sh < /dev/null > boot.log 2>&1 &
+            AIOS_GIC=3 AIOS_EFI_CODE=$code AIOS_ACPI=$acpi bin/run.sh < /dev/null > boot.log 2>&1 &
             ok=
             for i in $(seq 1 150); do
               if grep -q '^aios init:' boot.log && grep -q '^swap: /dev/vda3' boot.log; then
                 ok=1
+                [ $fw = acpi ] && ! grep -q '^acpi: RSDP' boot.log && ok=
                 break
               fi
               grep -q 'Synchronous Exception' boot.log && break

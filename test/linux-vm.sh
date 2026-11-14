@@ -17,7 +17,8 @@
 # LINUX_FILES="NAME=FILE ..." で exec / rootexec の initramfs に /NAME を足す (実行できるものは実行できるまま。
 # test/nftables.c の /nft など)
 # LINUX_EFI=1 なら QEMU の UEFI のファームウェア (AAVMF / edk2。bin/run.sh と同じものを探す。変数はそのたびに
-# まっさらなもの) から -kernel を起こす (UEFI のランタイムサービスと efivarfs: test/efivarfs.c)
+# まっさらなもの) から -kernel を起こす (UEFI のランタイムサービスと efivarfs: test/efivarfs.c)。LINUX_ACPI=1 も
+# あれば ACPI を入れて (DTB なし。UEFI の機械と同じ: test/acpi.c と aios の test/acpi-boot.sh)
 # LINUX_NET=P1,P2 なら virtio-net を QEMU のユーザーネットワークにつなぎ (ip=dhcp で 10.0.2.15)、ホストの
 # 127.0.0.1:P1 を中の TCP 7001 へ、P2 を UDP 7002 へ (aios の bin/run.sh の AIOS_FWD と同じ。test/nfteval.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
@@ -186,8 +187,9 @@ boot() {
     else
       truncate -s "$(wc -c < "$efi_code")" "$tmp/vars.fd"
     fi
-    # ACPI を切ると、ファームウェアは QEMU の DTB を渡す (aios と同じ)
+    # ACPI を切ると、ファームウェアは QEMU の DTB を渡す (aios と同じ)。LINUX_ACPI=1 なら ACPI の表だけ
     machine=virt,acpi=off
+    [ -n "${LINUX_ACPI:-}" ] && machine=virt,acpi=on
     set -- -drive if=pflash,format=raw,readonly=on,file="$efi_code" -drive if=pflash,format=raw,file="$tmp/vars.fd"
   fi
   append="console=ttyAMA0 rdinit=/init quiet"

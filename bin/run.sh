@@ -143,8 +143,9 @@ if [ -n "$uefi" ]; then
       dd if=/dev/zero of="$vars" bs=1 count=0 seek="$(wc -c < "$uefi" | tr -d ' ')" 2>/dev/null
     fi
   fi
-  echo "boot: UEFI ($uefi) from $disk" >&2
-  qemu-system-aarch64 -machine "$machine,acpi=off" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-2G}" $out "$@" \
+  # AIOS_ACPI=on: DTB をわたさず ACPI の表で (UEFI の機械と同じ。カーネルの acpi.rs)
+  echo "boot: UEFI ($uefi) from $disk${AIOS_ACPI:+, acpi=$AIOS_ACPI}" >&2
+  qemu-system-aarch64 -machine "$machine,acpi=${AIOS_ACPI:-off}" $cpu -smp "${AIOS_SMP:-4}" -m "${AIOS_MEM:-2G}" $out "$@" \
     -drive if=pflash,format=raw,readonly=on,file="$uefi" -drive if=pflash,format=raw,file="$vars"
   exit
 fi

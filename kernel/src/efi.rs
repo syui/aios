@@ -161,6 +161,103 @@ pub fn runtime() -> &'static Runtime {
     RT.get()
 }
 
+/// DTB なしで (ACPI で) 起こしたとき、RAM の大きさと使えないところは EFI のメモリマップから (Linux の
+/// efi_init と reserve_regions)。ExitBootServices のときのマップの RAM の範囲 [lo, hi) と、そのうちの使えないところ
+/// (すき間、Reserved、ACPI Reclaim と NVS、MMIO、ランタイム): kalloc がよける
+pub const MEM_MAX: usize = 48;
+
+#[derive(Clone, Copy)]
+pub struct Mem {
+    pub lo: u64,
+    pub hi: u64,
+    pub n: usize,
+    pub hole: [[u64; 2]; MEM_MAX],
+}
+
+#[unsafe(link_section = ".data")]
+static MEM: crate::cell::Early<Mem> = crate::cell::Early::new(Mem { lo: 0, hi: 0, n: 0, hole: [[0; 2]; MEM_MAX] });
+
+pub fn memory() -> Option<(u64, u64)> {
+    let m = MEM.get();
+    (m.hi > m.lo).then_some((m.lo, m.hi - m.lo))
+}
+
+/// kalloc::init の前に (DTB なしのときだけ): 使えないところを kalloc によける
+pub fn reserve_firmware() {
+    let m = MEM.get();
+    for h in &m.hole[..m.n] {
+        crate::kalloc::reserve(h[0] as usize, (h[1] - h[0]) as usize);
+    }
+}
+
+/// ExitBootServices のあとのマップから MEM を作る。使える種類: LoaderCode / Data、BootServicesCode / Data、Conventional
+unsafe fn save_memory(buf: usize, map_size: usize, desc_size: usize) {
+    unsafe {
+        let m = MEM.get_mut();
+        let n = map_size / desc_size;
+        let desc = |i: usize| {
+            let d = buf + i * desc_size;
+            (read_volatile(d as *const u32), rd64(d + 8) as u64, rd64(d + 8) as u64 + rd64(d + 24) as u64 * 4096)
+        };
+        // RAM の範囲: RAM の種類 (1..=10 と 14: Persistent)
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for i in 0..n {
+            let (ty, a, b) = desc(i);
+            if (1..=10).contains(&ty) || ty == 14 {
+                lo = lo.min(a);
+                hi = hi.max(b);
+            }
+        }
+        if lo >= hi {
+            return;
+        }
+        // 番地の順に (マップはふつう並んでいるが、決まりではない): 次に小さいものを選びながら、すき間と使えないものを穴に
+        fn hole(m: &mut Mem, hs: u64, he: u64) -> bool {
+            if he <= hs {
+                return true;
+            }
+            if m.n > 0 && m.hole[m.n - 1][1] >= hs {
+                m.hole[m.n - 1][1] = m.hole[m.n - 1][1].max(he);
+            } else if m.n < MEM_MAX {
+                m.hole[m.n] = [hs, he];
+                m.n += 1;
+            } else {
+                return false;
+            }
+            true
+        }
+        let mut cur = lo;
+        let mut prev: Option<u64> = None;
+        loop {
+            let mut best: Option<(u32, u64, u64)> = None;
+            for i in 0..n {
+                let (ty, a, b) = desc(i);
+                if prev.is_some_and(|p| a <= p) || a >= hi || b <= lo {
+                    continue;
+                }
+                if best.is_none_or(|(_, x, _)| a < x) {
+                    best = Some((ty, a, b));
+                }
+            }
+            let Some((ty, a, b)) = best else { break };
+            prev = Some(a);
+            let usable = matches!(ty, 1 | 2 | 3 | 4 | 7);
+            // 穴が多すぎれば、そこから上は使わない
+            if !hole(m, cur, a) {
+                hi = cur;
+                break;
+            }
+            if !usable && !hole(m, a.max(cur), b) {
+                hi = a.max(cur);
+                break;
+            }
+            cur = cur.max(b);
+        }
+        m.lo = lo;
+        m.hi = hi;
+    }
+}
+
 /// kalloc::init の前に: ランタイムサービスの RAM (キャッシュできるもの。ファームウェアがあとも使う) を kalloc によけてもらう
 /// (Linux の efi_init の reserve_regions が memblock_reserve を呼ぶのと同じ向き: kalloc は UEFI を知らない)
 pub fn reserve_runtime() {
@@ -391,11 +488,19 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
                 dtb = rd64(e + 16);
             }
         }
-        if dtb == 0 {
-            say(st, b"aios: no device tree from the firmware\n");
+        // DTB がなければ ACPI の表 (ACPI 2.0 の RSDP) で起こす (UEFI の機械: kmain の acpi::init が読む)
+        let mut acpi = false;
+        for i in 0..n {
+            acpi |= guid_eq(tables + i * 24, &ACPI20_GUID);
+        }
+        if dtb == 0 && !acpi {
+            say(st, b"aios: no device tree or ACPI tables from the firmware\n");
             return EFI_LOAD_ERROR;
         }
-        let dtb_size = u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize;
+        if dtb == 0 {
+            say(st, b"aios: no device tree; using ACPI\n");
+        }
+        let dtb_size = if dtb == 0 { 0 } else { u32::from_be(read_volatile((dtb + 4) as *const u32)) as usize };
         save_options(image, bs, st);
         save_seed(bs, st);
         save_runtime(st);
@@ -459,6 +564,9 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
             return EFI_LOAD_ERROR;
         }
         save_runtime_map(buf, map_size, desc_size);
+        if dtb == 0 {
+            save_memory(buf, map_size, desc_size);
+        }
         // もうファームウェアのブートサービスは使えない (ランタイムサービスは efirt.rs が呼ぶ)
         efi_enter(dest, base, size, dtb, dtb_size)
     }

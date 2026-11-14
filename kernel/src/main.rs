@@ -19,6 +19,7 @@ mod boot;
 mod mmio;
 #[macro_use]
 mod uart;
+mod acpi;
 mod kms;
 mod kmsg;
 mod landlock;
@@ -121,6 +122,8 @@ pub extern "C" fn kmain() -> ! {
     unsafe { core::arch::asm!("msr tpidr_el1, xzr") };
     // 出力の場所 (UART) は DTB で決まるので、何よりも先に DTB を読む
     let has_dtb = dtb::init();
+    // DTB がなければ ACPI の表 (UEFI の機械。UART も SPCR から)
+    let has_acpi = !has_dtb && acpi::init(efi::runtime().acpi20);
     // UEFI から起動したなら、そのコマンドライン (EFI スタブの efi.rs が覚えたもの) を DTB の bootargs より先に
     dtb::set_cmdline(efi::cmdline());
     uart::early_init();
@@ -142,8 +145,16 @@ pub extern "C" fn kmain() -> ! {
             memlayout::set_ram(base as usize, size as usize);
         }
     }
-    // UEFI のランタイムサービスの RAM はよけて (Linux の efi_init と memblock)
-    efi::reserve_runtime();
+    if has_acpi {
+        // RAM は EFI のメモリマップから。使えないところ (ACPI の表、ランタイムサービス、すき間) はよける
+        if let Some((base, size)) = efi::memory() {
+            memlayout::set_ram(base as usize, size as usize);
+        }
+        efi::reserve_firmware();
+    } else {
+        // UEFI のランタイムサービスの RAM はよけて (Linux の efi_init と memblock)
+        efi::reserve_runtime();
+    }
     let early = kalloc::init(heap::boot_extra());
     heap::init(early);
     // 大きなロックなしの stat の表の大きさを RAM から (ほかの CPU とユーザーの前に)

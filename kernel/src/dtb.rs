@@ -94,6 +94,11 @@ pub fn present() -> bool {
     !blob().is_empty()
 }
 
+/// 機器のことが DTB か ACPI に書いてあるか (なければ QEMU virt の決まった場所を使う)
+pub fn described() -> bool {
+    present() || crate::acpi::present()
+}
+
 const DEPTH: usize = 16;
 
 /// たどっている途中の 1 段 (そのノードの子のための #address-cells / #size-cells と ranges)
@@ -274,17 +279,26 @@ pub fn scan<T>(mut f: impl FnMut(&Node) -> Option<T>) -> Option<T> {
 
 /// compatible が c で、使えるようになっている最初のノードの reg[i]
 pub fn reg_of(c: &str, i: usize) -> Option<(u64, u64)> {
+    if !present() {
+        return crate::acpi::reg_of(c, i);
+    }
     scan(|n| (n.is_compatible(c) && n.enabled()).then(|| n.reg(i)).flatten())
 }
 
 /// reg_of と同じだが、status が disabled のノードも (UEFI はファームウェアが使う RTC を
 /// disabled にして渡す。読むだけなら使える)
 pub fn reg_of_any(c: &str, i: usize) -> Option<(u64, u64)> {
+    if !present() {
+        return crate::acpi::reg_of(c, i);
+    }
     scan(|n| n.is_compatible(c).then(|| n.reg(i)).flatten())
 }
 
 /// compatible が c のノードの interrupts の i 番目のセル
 pub fn irq_cell(c: &str, i: usize) -> Option<u32> {
+    if !present() {
+        return crate::acpi::irq_cell(c, i);
+    }
     scan(|n| (n.is_compatible(c) && n.enabled()).then(|| n.interrupt_cell(i)).flatten())
 }
 
@@ -314,16 +328,19 @@ pub fn arg(key: &str) -> Option<&'static str> {
     bootargs()?.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// PSCI の呼び方 ("hvc" / "smc")。DTB がなければ qemu virt の hvc
+/// PSCI の呼び方 ("hvc" / "smc")。DTB がなければ ACPI の FADT、それもなければ qemu virt の hvc
 pub fn psci_method() -> Option<&'static str> {
     if !present() {
-        return Some("hvc");
+        return if crate::acpi::present() { crate::acpi::psci_method() } else { Some("hvc") };
     }
     scan(|n| (n.is_compatible("arm,psci") || n.is_compatible("arm,psci-0.2") || n.is_compatible("arm,psci-1.0")).then(|| n.str("method")).flatten())
 }
 
 /// CPU ごとに f(MPIDR の値, 起こし方 ("psci" / "spin-table"), spin-table の cpu-release-addr)
 pub fn each_cpu(mut f: impl FnMut(u64, Option<&'static str>, Option<u64>)) {
+    if !present() {
+        return crate::acpi::each_cpu(f);
+    }
     scan::<()>(|n| {
         if n.str("device_type") == Some("cpu") && n.enabled() {
             let mpidr = n.reg(0).map_or(0, |(a, _)| a);
@@ -341,6 +358,9 @@ pub fn model() -> &'static str {
 
 /// virtio,mmio のノードを見る (base, SPI の番号)
 pub fn each_virtio(mut f: impl FnMut(u64, u32)) {
+    if !present() {
+        return crate::acpi::each_virtio(f);
+    }
     scan(|n| {
         if n.is_compatible("virtio,mmio") && n.enabled() {
             if let (Some((base, _)), Some(spi)) = (n.reg(0), n.interrupt_cell(1)) {
@@ -354,7 +374,11 @@ pub fn each_virtio(mut f: impl FnMut(u64, u32)) {
 /// 起動のときに見つけたものを出す
 pub fn summary() {
     if !present() {
-        println!("dtb: none (using QEMU virt defaults)");
+        if crate::acpi::present() {
+            crate::acpi::summary();
+        } else {
+            println!("dtb: none (using QEMU virt defaults)");
+        }
         return;
     }
     print!("dtb: {} bytes, {}", blob().len(), model());

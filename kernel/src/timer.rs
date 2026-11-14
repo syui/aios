@@ -29,7 +29,14 @@ fn rearm() {
 static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
-    let rtc = if crate::dtb::present() { crate::dtb::reg_of_any("arm,pl031", 0).map(|(a, _)| a as usize) } else { Some(0x0901_0000) };
+    // ACPI は PL031 を書かない (Linux は EFI の GetTime): QEMU の表 (OEM が BOCHS) なら virt の決まった場所
+    let rtc = if crate::dtb::present() {
+        crate::dtb::reg_of_any("arm,pl031", 0).map(|(a, _)| a as usize)
+    } else if crate::acpi::present() {
+        crate::acpi::is_qemu().then_some(0x0901_0000)
+    } else {
+        Some(0x0901_0000)
+    };
     let epoch = match rtc {
         Some(pa) => crate::mmio::r32(crate::memlayout::p2v(pa)) as u64,
         None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),
