@@ -242,6 +242,8 @@ nrs! {
     FALLOCATE = 47,
     SETPRIORITY = 140,
     GETPRIORITY = 141,
+    SCHED_SETATTR = 274,
+    SCHED_GETATTR = 275,
     MPROTECT = 226,
     MSYNC = 227,
     MINCORE = 232,
@@ -545,9 +547,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
         FADVISE64 => sysfile::fadvise(a[0], a[1] as i64, a[2] as i64, a[3]),
         READAHEAD => Ok(0),
-        // 優先度 (nice) はまだ持たない: いつも 0 (システムコールの返り値は Linux と同じく 20 - nice)、変えるのは受けつけるだけ
-        GETPRIORITY => Ok(20),
-        SETPRIORITY => Ok(0),
+        // nice (返り値は Linux と同じく 20 - nice)
+        GETPRIORITY => sys_getpriority(a[0] as i32, a[1] as i32),
+        SETPRIORITY => sys_setpriority(a[0] as i32, a[1] as i32, a[2] as i32),
 
         EXIT => proc::exit(a[0] as i32 & 0xff),
         EXIT_GROUP => proc::exit_group(a[0] as i32 & 0xff),
@@ -637,15 +639,15 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
         // スケジューラはひとつ (SCHED_OTHER、優先度 0) だけ。CPU を選ぶこともしない (どれでも動く)
         SCHED_SETAFFINITY => Ok(0),
-        SCHED_GETSCHEDULER => Ok(0),
-        SCHED_GETPARAM => out(a[1] as usize, &0i32.to_le_bytes()).map(|_| 0),
-        SCHED_SETPARAM => Ok(0),
-        // SCHED_OTHER / BATCH / IDLE はそのまま (同じに扱う)。実時間 (FIFO / RR) はできない
-        SCHED_SETSCHEDULER => match a[1] & 0xff {
-            0 | 3 | 5 => Ok(0),
-            1 | 2 => Err(-1),
-            _ => Err(crate::why::inval()),
-        },
+        SCHED_GETSCHEDULER if (a[0] as i32) < 0 => Err(crate::why::inval()),
+        SCHED_GETSCHEDULER => sched_target(a[0] as i32).map(|t| t.policy as i64 | if t.reset_on_fork { SCHED_RESET_ON_FORK } else { 0 }),
+        SCHED_GETPARAM if a[1] == 0 || (a[0] as i32) < 0 => Err(crate::why::inval()),
+        SCHED_GETPARAM => sched_target(a[0] as i32).and_then(|t| out(a[1] as usize, &(t.rt_priority as i32).to_le_bytes())).map(|_| 0),
+        SCHED_SETPARAM => do_sched_setscheduler(a[0] as i32, -1, a[1] as usize),
+        SCHED_SETSCHEDULER if (a[1] as i32) < 0 => Err(crate::why::inval()),
+        SCHED_SETSCHEDULER => do_sched_setscheduler(a[0] as i32, a[1] as i32, a[2] as usize),
+        SCHED_SETATTR => sys_sched_setattr(a[0] as i32, a[1] as usize, a[2] as u32),
+        SCHED_GETATTR => sys_sched_getattr(a[0] as i32, a[1] as usize, a[2] as u32, a[3] as u32),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => match a[0] {
             1 | 2 => Ok(if nr == SCHED_GET_PRIORITY_MAX { 99 } else { 1 }),
             0 | 3 | 5 => Ok(0),
@@ -1234,6 +1236,247 @@ fn sys_sysinfo(buf: usize) -> R {
     b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
     out(buf, &b)?;
     Ok(0)
+}
+
+// ---- nice とスケジューラの決まり (Linux の kernel/sys.c の setpriority と kernel/sched/syscalls.c) ----
+
+const RLIMIT_NICE: usize = 13;
+const SCHED_RESET_ON_FORK: i64 = 0x4000_0000;
+
+/// getpriority / setpriority の相手 (which: PRIO_PROCESS 0、PRIO_PGRP 1、PRIO_USER 2)。PRIO_PROCESS はスレッド
+/// (who は TID、0 は自分)、PRIO_PGRP はグループのスレッドみな (0 は自分のグループ)、PRIO_USER は実 uid が who (0 は自分の)
+/// で、いまの PID の namespace から見えるスレッドみな
+fn prio_targets(which: i32, who: i32) -> Result<Vec<&'static mut proc::Proc>, i64> {
+    let me = proc::current();
+    Ok(match which {
+        0 => {
+            let t = if who == 0 { Some(me.pid) } else { crate::ns::arg_pid(who as i64).ok().filter(|&g| g > 0).map(|g| g as u32) };
+            t.and_then(proc::find_thread).into_iter().collect()
+        }
+        1 => {
+            let pg = if who == 0 { Some(me.pgid) } else { crate::ns::arg_pid(who as i64).ok().filter(|&g| g > 0).map(|g| g as u32) };
+            match pg {
+                Some(pg) => proc::live().filter(|p| p.state != proc::State::Unused && p.state != proc::State::Zombie && p.pgid == pg).collect(),
+                None => Vec::new(),
+            }
+        }
+        2 => {
+            let uid = if who == 0 { Some(me.cred.uid) } else { crate::ns::take_uid(who as u32).ok() };
+            match uid {
+                Some(u) => proc::live()
+                    .filter(|p| p.state != proc::State::Unused && p.state != proc::State::Zombie && !p.kthread && p.cred.uid == u && crate::ns::to_local(p.pid).is_some())
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
+        _ => return Err(crate::why::inval()),
+    })
+}
+
+/// getpriority: 相手のうちいちばん高い (20 - nice の大きい) もの。いなければ ESRCH
+fn sys_getpriority(which: i32, who: i32) -> R {
+    prio_targets(which, who)?.iter().map(|p| 20 - p.nice as i64).max().ok_or(-3)
+}
+
+/// p の nice を nice まで上げてよいか (Linux の is_nice_reduction: 20 - nice が RLIMIT_NICE の中)
+fn nice_reduction_ok(p: &proc::Proc, nice: i32) -> bool {
+    (20 - nice) as u64 <= proc::rlimit(p, RLIMIT_NICE)[0]
+}
+
+/// setpriority (Linux の set_one_prio を相手ごとに): nice は -20..19 にまるめる。相手の実 uid か実効 uid が自分の実効
+/// uid でなく CAP_SYS_NICE もなければ EPERM、nice を下げる (優先度を上げる) のは RLIMIT_NICE の中か CAP_SYS_NICE (でなければ
+/// EACCES)。だれかに変えられれば 0、相手がいなければ ESRCH、だめなら最後のエラー
+fn sys_setpriority(which: i32, who: i32, nice: i32) -> R {
+    let nice = nice.clamp(-20, 19);
+    let me = &proc::current().cred;
+    let mut r = Err(-3);
+    for p in prio_targets(which, who)? {
+        if p.cred.uid != me.euid && p.cred.euid != me.euid && !me.capable(crate::cred::CAP_SYS_NICE) {
+            r = Err(-EPERM);
+            continue;
+        }
+        if nice < p.nice as i32 && !nice_reduction_ok(p, nice) && !me.capable(crate::cred::CAP_SYS_NICE) {
+            r = Err(-13);
+            continue;
+        }
+        if r == Err(-3) {
+            r = Ok(0);
+        }
+        p.nice = nice as i8;
+    }
+    r
+}
+
+/// sched_* の相手 (Linux の find_process_by_pid: 0 は自分、ほかは TID)
+fn sched_target(pid: i32) -> Result<&'static mut proc::Proc, i64> {
+    if pid == 0 {
+        return Ok(proc::current());
+    }
+    crate::ns::arg_pid(pid as i64).ok().filter(|&g| g > 0).and_then(|g| proc::find_thread(g as u32)).ok_or(-3)
+}
+
+/// struct sched_attr (Linux の SCHED_ATTR_SIZE_VER1: 56 バイト)。policy -1 は変えない (SETPARAM_POLICY)
+struct SchedAttr {
+    policy: i32,
+    flags: u64,
+    nice: i32,
+    prio: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+}
+
+/// 決まりを変える (Linux の __sched_setscheduler と user_check_sched_setscheduler)
+fn sched_set(p: &mut proc::Proc, a: &SchedAttr) -> R {
+    const SCHED_FLAG_ALL: u64 = 0x7f;
+    const SCHED_FLAG_SUGOV: u64 = 0x1000_0000;
+    const SCHED_FLAG_UTIL_CLAMP: u64 = 0x60;
+    let (policy, reset) = if a.policy < 0 {
+        (p.policy as i32, p.reset_on_fork)
+    } else {
+        if !matches!(a.policy, 0 | 1 | 2 | 3 | 5 | 6) {
+            return Err(crate::why::inval());
+        }
+        (a.policy, a.flags & 1 != 0)
+    };
+    if a.flags & !(SCHED_FLAG_ALL | SCHED_FLAG_SUGOV) != 0 || a.prio > 99 {
+        return Err(crate::why::inval());
+    }
+    let rt = matches!(policy, 1 | 2);
+    let dl_bad = policy == 6 && (a.deadline == 0 || a.runtime < 1024 || a.deadline < a.runtime || (a.period != 0 && a.period < a.deadline));
+    if dl_bad || rt != (a.prio != 0) {
+        return Err(crate::why::inval());
+    }
+    // 許し (なければ CAP_SYS_NICE)
+    let me = &proc::current().cred;
+    let fair = matches!(policy, 0 | 3);
+    let mut need = false;
+    if fair && a.nice < p.nice as i32 && !nice_reduction_ok(p, a.nice) {
+        need = true;
+    }
+    if rt {
+        let rtprio = proc::rlimit(p, 14)[0];
+        if (policy != p.policy as i32 && rtprio == 0) || (a.prio > p.rt_priority as u32 && a.prio as u64 > rtprio) {
+            need = true;
+        }
+    }
+    if policy == 6 || (p.policy == 5 && policy != 5 && !nice_reduction_ok(p, p.nice as i32)) {
+        need = true;
+    }
+    if me.euid != p.cred.euid && me.euid != p.cred.uid {
+        need = true;
+    }
+    if p.reset_on_fork && !reset {
+        need = true;
+    }
+    if need && !me.capable(crate::cred::CAP_SYS_NICE) {
+        return Err(-EPERM);
+    }
+    if a.flags & SCHED_FLAG_SUGOV != 0 {
+        return Err(crate::why::inval());
+    }
+    if a.flags & SCHED_FLAG_UTIL_CLAMP != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    p.policy = policy as u8;
+    p.reset_on_fork = reset;
+    if fair {
+        p.nice = a.nice as i8;
+        p.slice_ns = if a.runtime != 0 { a.runtime.clamp(100_000, 100_000_000) } else { 0 };
+    }
+    p.rt_priority = a.prio as u8;
+    Ok(0)
+}
+
+/// sched_setscheduler と sched_setparam (Linux の do_sched_setscheduler と _sched_setscheduler: param がないか pid が
+/// 負なら EINVAL、読めなければ EFAULT、いなければ ESRCH。nice と slice はそのまま。policy の SCHED_RESET_ON_FORK の印)
+fn do_sched_setscheduler(pid: i32, policy: i32, param: usize) -> R {
+    if param == 0 || pid < 0 {
+        return Err(crate::why::inval());
+    }
+    let mut b = [0u8; 4];
+    proc::current().pt().copy_in(&mut b, param).ok_or(-EFAULT)?;
+    let p = sched_target(pid)?;
+    let mut flags = 0;
+    let mut policy = policy;
+    if policy >= 0 && policy as i64 & SCHED_RESET_ON_FORK != 0 {
+        flags |= 1;
+        policy &= !(SCHED_RESET_ON_FORK as i32);
+    }
+    let a = SchedAttr { policy, flags, nice: p.nice as i32, prio: i32::from_le_bytes(b) as u32, runtime: p.slice_ns, deadline: 0, period: 0 };
+    sched_set(p, &a)
+}
+
+/// sched_setattr (Linux と同じ順: uattr がないか pid が負か flags があれば EINVAL、大きさが 48 より小さいか 4096 より
+/// 大きいか、知らないところ (56 から先) が 0 でなければ 56 を書いて E2BIG、大きさ 0 は 48、nice は -20..19 にまるめる)
+fn sys_sched_setattr(pid: i32, uattr: usize, flags: u32) -> R {
+    const KEEP_POLICY: u64 = 0x08;
+    const KEEP_PARAMS: u64 = 0x10;
+    if uattr == 0 || pid < 0 || flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let pt = proc::current().pt();
+    let mut sz = [0u8; 4];
+    pt.copy_in(&mut sz, uattr).ok_or(-EFAULT)?;
+    let mut size = u32::from_le_bytes(sz) as usize;
+    if size == 0 {
+        size = 48;
+    }
+    let too_big = |pt: &mut crate::vm::PageTable| {
+        let _ = pt.copy_out(uattr, &56u32.to_le_bytes());
+        Err(-7)
+    };
+    if !(48..=4096).contains(&size) {
+        return too_big(pt);
+    }
+    let mut b = alloc::vec![0u8; size.max(56)];
+    pt.copy_in(&mut b[..size], uattr).ok_or(-EFAULT)?;
+    if b[56..size.max(56)].iter().any(|&x| x != 0) {
+        return too_big(pt);
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let mut a = SchedAttr { policy: u32_at(4) as i32, flags: u64_at(8), nice: (u32_at(16) as i32).clamp(-20, 19), prio: u32_at(20), runtime: u64_at(24), deadline: u64_at(32), period: u64_at(40) };
+    if a.flags & 0x60 != 0 && size < 56 {
+        return Err(crate::why::inval());
+    }
+    if a.policy < 0 {
+        return Err(crate::why::inval());
+    }
+    if a.flags & KEEP_POLICY != 0 {
+        a.policy = -1;
+    }
+    let p = sched_target(pid)?;
+    if a.flags & KEEP_PARAMS != 0 {
+        a.nice = p.nice as i32;
+        a.prio = p.rt_priority as u32;
+        a.runtime = p.slice_ns;
+    }
+    sched_set(p, &a)
+}
+
+/// sched_getattr (Linux と同じ順: uattr がないか pid が負か、大きさが 48 より小さいか 4096 より大きいか、flags があれば
+/// EINVAL。いなければ ESRCH。大きさ (56 と usize の小さいほう) を書いて、そこまで写す。SCHED_OTHER などは nice と
+/// slice (sched_runtime)、FIFO / RR は優先度。uclamp は手本の Linux の設定にないので 0)
+fn sys_sched_getattr(pid: i32, uattr: usize, usize_: u32, flags: u32) -> R {
+    if uattr == 0 || pid < 0 || !(48..=4096).contains(&usize_) || flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let p = sched_target(pid)?;
+    let size = (usize_ as usize).min(56);
+    let mut b = [0u8; 56];
+    b[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&(p.policy as u32).to_le_bytes());
+    b[8..16].copy_from_slice(&(p.reset_on_fork as u64).to_le_bytes());
+    match p.policy {
+        1 | 2 => b[20..24].copy_from_slice(&(p.rt_priority as u32).to_le_bytes()),
+        6 => {}
+        _ => {
+            b[16..20].copy_from_slice(&(p.nice as i32).to_le_bytes());
+            b[24..32].copy_from_slice(&proc::slice_ns(p).to_le_bytes());
+        }
+    }
+    out(uattr, &b[..size]).map(|_| 0)
 }
 
 fn sys_sched_getaffinity(len: usize, mask: usize) -> R {

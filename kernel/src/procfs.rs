@@ -764,8 +764,6 @@ fn sched_text(p: &Proc) -> String {
     let ns = |n: &str, v: u64| format!("{:<45}:{:>14}.{:06}\n", n, v / 1_000_000, v % 1_000_000);
     let int = |n: &str, v: i64| format!("{:<45}:{:>21}\n", n, v);
     let run = proc::cpu_ns(p);
-    let cpus = crate::smp::online().clamp(1, 8) as u64;
-    let factor = 1 + (63 - cpus.leading_zeros() as u64);
     let t0 = crate::timer::uptime_ns();
     let delta = crate::timer::uptime_ns() - t0;
     s += &ns("se.exec_start", if p.ran_at != 0 { p.ran_at } else { crate::timer::uptime_ns() });
@@ -775,15 +773,15 @@ fn sched_text(p: &Proc) -> String {
     s += &int("nr_switches", (p.nvcsw + p.nivcsw) as i64);
     s += &int("nr_voluntary_switches", p.nvcsw as i64);
     s += &int("nr_involuntary_switches", p.nivcsw as i64);
-    s += &int("se.load.weight", 1_048_576);
+    s += &int("se.load.weight", (proc::weight(p) as i64) << 10);
     for n in ["se.avg.load_sum", "se.avg.runnable_sum", "se.avg.util_sum", "se.avg.load_avg", "se.avg.runnable_avg", "se.avg.util_avg"] {
         s += &int(n, 0);
     }
     s += &int("se.avg.last_update_time", crate::timer::uptime_ns() as i64);
     s += &int("se.avg.util_est", 0);
-    s += &int("policy", 0);
-    s += &int("prio", 120);
-    s += &int("se.slice", (700_000 * factor) as i64);
+    s += &int("policy", p.policy as i64);
+    s += &int("prio", proc::kprio(p) as i64);
+    s += &int("se.slice", proc::slice_ns(p) as i64);
     s += &int("clock-delta", delta as i64);
     s
 }
@@ -923,7 +921,7 @@ fn stat_line(p: &Proc, whole: bool) -> String {
     let (cu, cs) = crate::syscall::children_user_sys(p.tgid);
     let tick = crate::timer::TICK_NS;
     let mut s = format!(
-        "{} ({}) {} {} {} {} {} {} {} 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {}",
+        "{} ({}) {} {} {} {} {} {} {} 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {}",
         crate::ns::local_or_0(p.tgid),
         p.comm(),
         state_char(p),
@@ -938,14 +936,20 @@ fn stat_line(p: &Proc, whole: bool) -> String {
         sy / tick,
         cu / tick,
         cs / tick,
+        proc::kprio(p) - 100,
+        p.nice,
         threads,
         p.start,
         mem_of(p).0,
         mem_of(p).1
     );
-    // 残り (rsslim から exit_code まで) は 0
-    for _ in 25..=52 {
-        s.push_str(" 0");
+    // 残り (rsslim から exit_code まで) は 0。rt_priority (40) と policy (41) だけ
+    for i in 25..=52 {
+        match i {
+            40 => s.push_str(&format!(" {}", p.rt_priority)),
+            41 => s.push_str(&format!(" {}", p.policy)),
+            _ => s.push_str(" 0"),
+        }
     }
     s.push('\n');
     s

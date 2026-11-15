@@ -461,6 +461,17 @@ pub struct Proc {
     pub capbset_dropped: u64,
     /// PR_MCE_KILL (0 既定、1 遅く、2 はやく: Linux の PF_MCE_PROCESS と PF_MCE_EARLY)。aios は覚えて見せるだけ
     pub mce_kill: u8,
+    /// nice (-20..19) とスケジューラの決まり (Linux の task の static_prio と policy: スレッドごと。fork とスレッドで
+    /// 受けつぐ)。policy は 0 SCHED_OTHER、1 FIFO、2 RR、3 BATCH、5 IDLE、6 DEADLINE。aios は FIFO / RR / DEADLINE も
+    /// CFS のように回す (覚えて答えるだけ)。rt_priority は FIFO / RR の優先度。reset_on_fork は SCHED_RESET_ON_FORK、
+    /// slice_ns は sched_setattr の sched_runtime (0 は既定: /proc/PID/sched の se.slice)
+    pub nice: i8,
+    pub policy: u8,
+    pub rt_priority: u8,
+    pub reset_on_fork: bool,
+    pub slice_ns: u64,
+    /// recent に足す tick の端数 (1/1024: nice の重み)
+    vfrac: u32,
     /// CPU をゆずった数: 眠った (自分から) と、走れるままゆずった (Linux の nvcsw と nivcsw: /proc/PID/sched)
     pub nvcsw: u64,
     pub nivcsw: u64,
@@ -631,6 +642,12 @@ impl Proc {
         oom_score_adj: 0,
         oom_score_adj_min: 0,
         personality: 0,
+        nice: 0,
+        policy: 0,
+        rt_priority: 0,
+        reset_on_fork: false,
+        slice_ns: 0,
+        vfrac: 0,
         timer_slack_ns: 50_000,
         default_slack_ns: 50_000,
         sysno: -1,
@@ -2232,6 +2249,23 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     child.capbset_dropped = parent.capbset_dropped;
     child.mce_kill = parent.mce_kill;
     child.personality = parent.personality;
+    // nice と決まりは受けつぐ。SCHED_RESET_ON_FORK なら、実時間は SCHED_OTHER に、負の nice は 0 に、slice は既定に
+    // (Linux の sched_fork)
+    child.nice = parent.nice;
+    child.policy = parent.policy;
+    child.rt_priority = parent.rt_priority;
+    child.slice_ns = parent.slice_ns;
+    child.reset_on_fork = false;
+    if parent.reset_on_fork {
+        if matches!(parent.policy, 1 | 2 | 6) {
+            child.policy = 0;
+            child.nice = 0;
+            child.rt_priority = 0;
+        } else if parent.nice < 0 {
+            child.nice = 0;
+        }
+        child.slice_ns = 0;
+    }
     child.timer_slack_ns = parent.timer_slack_ns;
     child.default_slack_ns = parent.timer_slack_ns;
     child.thread = thread;
@@ -2506,9 +2540,41 @@ pub fn account_tick() {
     if let Some(i) = cur() {
         let p = &mut procs()[i];
         p.utime += 1;
-        p.recent = p.recent.saturating_add(1);
+        // nice の重みで (Linux の CFS の vruntime: 走った時間 × 1024 / 重み)。nice 0 は 1 tick で 1
+        p.vfrac += (1 << 20) / weight(p);
+        p.recent = p.recent.saturating_add(p.vfrac >> 10);
+        p.vfrac &= 1023;
         p.slice = p.slice.saturating_add(1);
     }
+}
+
+/// nice ごとの重み (Linux の sched_prio_to_weight: nice 0 が 1024、1 ちがうと 1.25 倍ほど)
+const NICE_WEIGHT: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
+    70, 56, 45, 36, 29, 23, 18, 15,
+];
+
+/// スレッドの重み (SCHED_IDLE は 3: Linux の WEIGHT_IDLEPRIO)
+pub fn weight(p: &Proc) -> u32 {
+    if p.policy == 5 { 3 } else { NICE_WEIGHT[(p.nice as i32 + 20).clamp(0, 39) as usize] }
+}
+
+/// Linux の task_prio の元 (p->prio): SCHED_OTHER などは 120 + nice、FIFO / RR は 99 - rt_priority、DEADLINE は -1
+pub fn kprio(p: &Proc) -> i32 {
+    match p.policy {
+        1 | 2 => 99 - p.rt_priority as i32,
+        6 => -1,
+        _ => 120 + p.nice as i32,
+    }
+}
+
+/// SCHED_OTHER の slice (ns): sched_setattr で決めたものか、Linux の既定 (0.7 ms × (1 + log2 CPU の数 (8 まで)))
+pub fn slice_ns(p: &Proc) -> u64 {
+    if p.slice_ns != 0 {
+        return p.slice_ns;
+    }
+    let cpus = crate::smp::online().clamp(1, 8) as u64;
+    700_000 * (1 + (63 - cpus.leading_zeros() as u64))
 }
 
 /// タイマの割り込みから: いま動いているものがタイムスライスを使いきったか (ゆずるか)

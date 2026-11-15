@@ -656,10 +656,19 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
 - mincore (test/mincore.c、Linux と 7 行同じ): 前はいつもみな 1。PTE にページのあるものと、ファイルの写しでページキャッシュ
   にあるもの (写しの表か、Inode::resident: tmpfs は持っているページ、ext4 はブロックのキャッシュにあるもの) が 1。書けない
   ほかの人のファイルの写しはみな 1 (Linux の can_do_mincore)。すきまはそこまで書いて ENOMEM
+- nice とスケジューラの決まり (test/nice.c、Linux と 11 行同じ): getpriority と setpriority (前はいつも 20 と 0) を Linux の
+  set_one_prio と同じに (PRIO_PROCESS / PGRP / USER、nice は -20..19 にまるめ、ほかの人のものは EPERM、nice を下げるのは
+  RLIMIT_NICE の中か CAP_SYS_NICE (でなければ EACCES))、sched_setscheduler・sched_setparam・sched_getscheduler・
+  sched_getparam・sched_setattr・sched_getattr (Linux の __sched_setscheduler と同じたしかめ: FIFO / RR は RLIMIT_RTPRIO か
+  CAP_SYS_NICE、SCHED_IDLE から戻るのは RLIMIT_NICE の中、SCHED_RESET_ON_FORK、sched_attr の大きさ (E2BIG と 56 の書き
+  もどし)、sched_runtime は SCHED_OTHER の slice)。Proc::nice・policy・rt_priority・reset_on_fork・slice_ns (スレッドごと、
+  fork とスレッドで受けつぐ)。スケジューラは nice の重み (Linux の sched_prio_to_weight。SCHED_IDLE は 3) で recent を
+  進める (CFS の vruntime と同じ考え): CPU より多い忙しいループで nice 0 と nice 19 は 2435 対 40 tick (Linux の重みは
+  1024 対 15)。FIFO / RR / DEADLINE は覚えて答えるだけで、回し方は CFS のまま。/proc/PID/stat の priority・nice・
+  rt_priority・policy と /proc/PID/sched の se.load.weight・policy・prio・se.slice も
 - のこり (Linux にあって aios で ENOSYS): removexattr の 3 つと *xattrat (aios は xattr をまだ持たない: list は 0、get は
   ENODATA、set は EOPNOTSUPP)、settimeofday・clock_settime・adjtimex・clock_adjtime、syslog (dmesg)、ptrace、SysV の msg と
-  sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、sched_setattr・sched_getattr
-  (と nice: getpriority はいつも 20)、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
+  sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
   futex_requeue、mseal、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
