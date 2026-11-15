@@ -1215,6 +1215,8 @@ pub struct Vma {
     pub back: Backing,
     /// 写したファイルのパス (/proc/PID/maps と、落ちたときの知らせ)
     pub name: Option<alloc::rc::Rc<str>>,
+    /// fork した子には中身を写さない (0 のページから: Linux の VM_WIPEONFORK。MAP_DROPPABLE)
+    pub wipe: bool,
 }
 
 /// ページフォールトの結果
@@ -2104,7 +2106,7 @@ impl PageTable {
         self.unmap_inner(start, end);
         self.note(b'm', start, end, prot);
         self.last_end = end;
-        self.vmas.insert(start, Vma { end, prot, shared, back, name: None });
+        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
@@ -2269,7 +2271,7 @@ impl PageTable {
             match self.vmas.get_mut(&start) {
                 Some(v) if v.end == old_end => v.end = new_end,
                 _ => {
-                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None });
+                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false });
                 }
             }
         } else if new_end < old_end {
@@ -3503,7 +3505,7 @@ impl PageTable {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
                 self.last_end = end;
-                self.vmas.insert(va, Vma { end, prot, shared: false, back, name });
+                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false });
                 Ok(va)
             }
             _ => Err((back, name)),
@@ -3640,10 +3642,18 @@ impl PageTable {
         Some(new)
     }
 
-    /// 領域ごとの (先頭, 終わり, prot, 共有か) (fork が PTE を写すときに見るもの)
+    /// 領域ごとの (先頭, 終わり, prot, 共有か) (fork が PTE を写すときに見るもの)。fork でこわす領域 (wipe) は入れない:
+    /// 子は 0 のページから
     // [lockless]
     fn areas(&self) -> Vec<(usize, usize, u8, bool)> {
-        self.vmas.iter().map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
+        self.vmas.iter().filter(|(_, v)| !v.wipe).map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
+    }
+
+    /// start から始まる領域を、fork した子に中身を写さないものに (MAP_DROPPABLE)
+    pub fn set_wipe(&mut self, start: usize) {
+        if let Some(v) = self.vmas.get_mut(&start) {
+            v.wipe = true;
+        }
     }
 
     /// fork: areas の PTE を new へ写す (private の領域は両方とも COW に)。TLB は呼ぶほうが消す。unlocked (大きなロック

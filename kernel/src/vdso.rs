@@ -33,6 +33,39 @@ vdso_getres:
 vdso_sigtramp:
     mov     x8, #139            // rt_sigreturn
     svc     #0
+// ssize_t __kernel_getrandom(void *buf, size_t len, unsigned flags, void *state, size_t state_len) (Linux の
+// lib/vdso/getrandom.c): (NULL, 0, 0, params, ~0) なら状態の大きさと mmap の prot と flags を書いて 0。状態がページを
+// またげば -EFAULT。ほかは getrandom のシステムコール (Linux は状態の ChaCha20 で作るが、aios はいつもカーネルで:
+// 答えは同じく乱数、速さはシステムコールのもの)
+.global vdso_getrandom
+vdso_getrandom:
+    cmn     x4, #1
+    b.ne    1f
+    cbnz    x0, 1f
+    cbnz    x1, 1f
+    cbnz    w2, 1f
+    mov     w9, #144            // size_of_opaque_state (Linux の struct vgetrandom_state)
+    str     w9, [x3]
+    mov     w9, #3              // PROT_READ | PROT_WRITE
+    str     w9, [x3, #4]
+    mov     w9, #0x28           // MAP_DROPPABLE | MAP_ANONYMOUS
+    str     w9, [x3, #8]
+    mov     x9, #12
+2:  str     wzr, [x3, x9]       // reserved[13]
+    add     x9, x9, #4
+    cmp     x9, #64
+    b.lo    2b
+    mov     x0, #0
+    ret
+1:  and     x9, x3, #0xfff
+    add     x9, x9, #144
+    cmp     x9, #0x1000
+    b.hi    3f
+    mov     x8, #278            // getrandom
+    svc     #0
+    ret
+3:  mov     x0, #-14            // EFAULT
+    ret
 // int __kernel_gettimeofday(struct timeval *tv, struct timezone *tz): tz があればシステムコール
 .global vdso_gettimeofday
 vdso_gettimeofday:
@@ -102,6 +135,7 @@ unsafe extern "C" {
     static vdso_code_end: u8;
     static vdso_getres: u8;
     static vdso_sigtramp: u8;
+    static vdso_getrandom: u8;
     static vdso_gettimeofday: u8;
     static vdso_clock_gettime: u8;
     static vdso_now: u8;
@@ -124,12 +158,12 @@ pub fn sigtramp() -> Option<u64> {
 const PHOFF: usize = 64;
 const DYNSYM: usize = 0x100;
 const DYNSTR: usize = 0x1a0;
-const HASH: usize = 0x220;
-const GNU_HASH: usize = 0x240;
-const VERSYM: usize = 0x270;
-const VERDEF: usize = 0x280;
-const DYNAMIC: usize = 0x2c0;
-const NOTE: usize = 0x370;
+const HASH: usize = 0x230;
+const GNU_HASH: usize = 0x258;
+const VERSYM: usize = 0x288;
+const VERDEF: usize = 0x298;
+const DYNAMIC: usize = 0x2d0;
+const NOTE: usize = 0x380;
 const TEXT: usize = 0x400;
 /// PT_NOTE の大きさ: Elf64_Nhdr (12) と名前 "Linux\0" (4 にそろえて 8) と版 (4)
 const NOTE_SIZE: usize = 24;
@@ -240,16 +274,18 @@ pub fn init() {
     let soname = add_str(p, &mut strsz, SONAME);
     let version = add_str(p, &mut strsz, VERSION);
     // シンボル: 0 番は空、1 番から (名前、場所、大きさ、種類: 2 FUNC、0 NOTYPE)
-    let (getres, sigtramp, gtod, cgt, now) = (
+    let (getres, sigtramp, getrandom, gtod, cgt, now) = (
         code_off(&raw const vdso_getres),
         code_off(&raw const vdso_sigtramp),
+        code_off(&raw const vdso_getrandom),
         code_off(&raw const vdso_gettimeofday),
         code_off(&raw const vdso_clock_gettime),
         code_off(&raw const vdso_now),
     );
-    let syms: [(&[u8], usize, usize, u8); 4] = [
+    let syms: [(&[u8], usize, usize, u8); 5] = [
         (b"__kernel_clock_getres", getres, sigtramp - getres, 2),
-        (b"__kernel_rt_sigreturn", sigtramp, gtod - sigtramp, 0),
+        (b"__kernel_rt_sigreturn", sigtramp, getrandom - sigtramp, 0),
+        (b"__kernel_getrandom", getrandom, gtod - getrandom, 2),
         (b"__kernel_gettimeofday", gtod, cgt - gtod, 2),
         (b"__kernel_clock_gettime", cgt, now - cgt, 2),
     ];

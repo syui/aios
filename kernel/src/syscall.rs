@@ -1182,6 +1182,7 @@ const MAP_SHARED: u64 = 0x1;
 const MAP_PRIVATE: u64 = 0x2;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_DROPPABLE: u64 = 0x08;
 const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x2_0000;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
@@ -1198,13 +1199,16 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     }
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
     let mut path: Option<alloc::string::String> = None;
+    // 写しかたの型 (Linux の MAP_TYPE: 1 MAP_SHARED、2 MAP_PRIVATE、3 MAP_SHARED_VALIDATE (ファイルだけ)、8 MAP_DROPPABLE
+    // (無名だけ: fork した子では 0、Linux はメモリが足りなければ捨てる。aios は捨てない))。ほかは EINVAL
+    let kind = flags & 0xf;
     let back = if flags & MAP_ANONYMOUS == 0 {
         let fr = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
         let f = fr.borrow();
         if f.flags & crate::file::O_PATH != 0 {
             return Err(-EBADF);
         }
-        if len == 0 {
+        if len == 0 || !matches!(kind, 1..=3) {
             return Err(crate::why::inval());
         }
         let mode = f.flags & crate::file::O_ACCMODE;
@@ -1231,7 +1235,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             },
         }
     } else {
-        if len == 0 {
+        if len == 0 || !matches!(kind, 1 | 2 | MAP_DROPPABLE) {
             return Err(crate::why::inval());
         }
         Backing::Anon
@@ -1260,6 +1264,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     m.pt.map(va, va + len, prot_bits(prot), shared, back).ok_or(-ENOMEM)?;
     if let Some(p) = path {
         m.pt.set_name(va, &p);
+    }
+    if kind == MAP_DROPPABLE {
+        m.pt.set_wipe(va);
     }
     Ok(va as i64)
 }

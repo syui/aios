@@ -613,8 +613,7 @@ test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のペ�
   ページは、ファイルシステムと写しの両方が参照を持つので、pagemap の exclusive (写しているのが 1 つ) がずれることがある
 - task/TID: Linux と同じ 36 の名前 (スレッドごとのものは stat、status、comm、syscall、sched、personality。ほかはプロセスのもの)。
   test/procpid.c は /proc/self (41) と task/TID (36) のならびと種類と許可が Linux 7.4 と同じ (stack は手本にないので見ない)
-- まだ: cgroup、io、wchan、schedstat、coredump_filter、timers など (手本の Linux の設定にもない)、vDSO の
-  __kernel_getrandom (Linux 7.4 にはある: test/vdso.c の 2 行)
+- まだ: cgroup、io、wchan、schedstat、coredump_filter、timers など (手本の Linux の設定にもない)
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
@@ -2592,10 +2591,15 @@ posix-cpu-timers と同じ:
   版の表 (DT_VERDEF と DT_VERSYM: 名前はみな `LINUX_2.6.39`)、`__kernel_clock_getres` (いつもシステムコール)
   `__kernel_rt_sigreturn` `__kernel_gettimeofday` (tz があればシステムコール) `__kernel_clock_gettime`。Go の runtime は
   版の表があるつもりで読むので、前 (clock_gettime だけで版の表なし) は Go のプログラム (gitea) が起きてすぐ番地 0x2 で
-  落ちていた。`__kernel_getrandom` (Linux 6.11 からの vgetrandom) はまだない (glibc と Go はシステムコールの getrandom
-  にする)。PT_NOTE の「Linux」の注釈 (種類 0) に手本の Linux の版 (LINUX_VERSION_CODE、7.4.0: ns::LINUX_VERSION) も
+  落ちていた。`__kernel_getrandom` (Linux 6.11 からの vgetrandom、2026-11-15): (NULL, 0, 0, params, ~0) で状態の大きさ
+  (144) と mmap の prot (読み書き) と flags (MAP_DROPPABLE | MAP_ANONYMOUS) を返し、状態がページをまたげば -EFAULT。
+  乱数は Linux は状態の ChaCha20 で vDSO の中で作るが、aios はいつも getrandom のシステムコールで (答えは同じく乱数、
+  速さはシステムコールのもの)。glibc 2.41 からがこれを使う。mmap に MAP_DROPPABLE (型 8: 無名だけ、fork した子では
+  0 のページから (VM_WIPEONFORK)。Linux はメモリが足りなければ捨てるが、aios は捨てない) と、型のたしかめ (MAP_SHARED、
+  MAP_PRIVATE、ファイルの MAP_SHARED_VALIDATE、無名の MAP_DROPPABLE のほかは EINVAL: 前は見ていなかった) を足した。
+  test/vgetrandom.c が Linux 7.4 と 8 行同じ。PT_NOTE の「Linux」の注釈 (種類 0) に手本の Linux の版 (LINUX_VERSION_CODE、7.4.0: ns::LINUX_VERSION) も
   (動的にリンクした glibc は起きるときにここからカーネルの版を読む)。test/vdso.c (Go と同じ読み方) が Linux 7.4 と
-  getrandom の 2 行のほかは同じ (`note Linux 7.4` も同じ)
+  36 行同じ (`note Linux 7.4` も)。vDSO の値は、すぐ前の読むだけのページ ([vvar]) に
 - timer_create: MONOTONIC_RAW と COARSE、fd の時計は EOPNOTSUPP、知らない時計は EINVAL、ALARM は CAP_WAKE_ALARM
   がなければ EPERM。CPU の時計のタイマは、その時計の ns で期限を覚え、tick ごとに見て鳴らす (Linux も tick ごと)。
   くり返しは、こえた分の回数を overrun に
