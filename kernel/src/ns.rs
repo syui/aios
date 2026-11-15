@@ -455,6 +455,8 @@ pub struct User {
 pub struct Maps {
     pub uid: Option<Vec<(u32, u32, u32)>>,
     pub gid: Option<Vec<(u32, u32, u32)>>,
+    /// projid_map (ディスクの割りあての project id: aios は使わない。覚えて見せるだけ)
+    pub projid: Option<Vec<(u32, u32, u32)>>,
     pub setgroups_deny: bool,
 }
 
@@ -549,6 +551,40 @@ pub fn write_map(u: &Option<Rc<User>>, gid: bool, text: &[u8]) -> Result<(), i64
         return Err(-EPERM);
     }
     *slot = Some(lines);
+    Ok(())
+}
+
+/// /proc/PID/projid_map: init のものは 0 0 4294967295、作った namespace のものは書くまで空
+pub fn projid_text(u: &Option<Rc<User>>) -> alloc::string::String {
+    let Some(u) = u else { return "         0          0 4294967295\n".into() };
+    u.maps.borrow().projid.iter().flatten().map(|(i, o, n)| alloc::format!("{:>10} {:>10} {:>10}\n", i, o, n)).collect()
+}
+
+/// projid_map を書く (Linux の proc_projid_map_write と map_write: ケーパビリティは要らない。書く人はその namespace か
+/// 親の中。1 度だけ (init のものはもうあるので EPERM))
+pub fn write_projid(u: &Option<Rc<User>>, text: &[u8]) -> Result<(), i64> {
+    let u = u.as_ref().ok_or(-EPERM)?;
+    let me = crate::proc::current_cred_ref();
+    if !me.ns.user.as_ref().is_none_or(|n| Rc::ptr_eq(n, u)) {
+        return Err(-EPERM);
+    }
+    let text = core::str::from_utf8(text).map_err(|_| crate::why::inval())?;
+    let mut lines = Vec::new();
+    for l in text.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<u32> = l.split_whitespace().map(|x| x.parse().map_err(|_| crate::why::inval())).collect::<Result<_, i64>>()?;
+        if f.len() != 3 || f[2] == 0 || f[0].checked_add(f[2]).is_none() || f[1].checked_add(f[2]).is_none() {
+            return Err(crate::why::inval());
+        }
+        lines.push((f[0], f[1], f[2]));
+    }
+    if lines.is_empty() || lines.len() > 5 {
+        return Err(crate::why::inval());
+    }
+    let mut m = u.maps.borrow_mut();
+    if m.projid.is_some() {
+        return Err(-EPERM);
+    }
+    m.projid = Some(lines);
     Ok(())
 }
 

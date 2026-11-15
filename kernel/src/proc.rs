@@ -125,6 +125,8 @@ pub struct Mm {
     pub exe: String,
     /// 動かしているプログラム (ELF) の inode (書くために開くと ETXTBSY: executing)
     pub exe_id: (usize, u64),
+    /// exec で積んだ auxv (型と値の並び。AT_NULL まで: /proc/PID/auxv。Linux の mm->saved_auxv)
+    pub auxv: Vec<u64>,
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
     pub args: (usize, usize, usize),
     /// PR_GET_DUMPABLE / PR_SET_DUMPABLE (0 作らない、1 作る、2 root の権利で)。exec で 1 (setuid / setgid のもので
@@ -442,6 +444,11 @@ pub struct Proc {
     /// ときの親の値)。aios のタイマーはゆとりを使わない (覚えて返すだけ)
     pub timer_slack_ns: u64,
     pub default_slack_ns: u64,
+    /// いま入っているシステムコールの番号 (ユーザーからほかの入り方で入ったなら -1: trap.rs。/proc/PID/syscall)
+    pub sysno: i64,
+    /// CPU をゆずった数: 眠った (自分から) と、走れるままゆずった (Linux の nvcsw と nivcsw: /proc/PID/sched)
+    pub nvcsw: u64,
+    pub nivcsw: u64,
     pub timers: Vec<PosixTimer>,
     /// 親が SIGCHLD を無視しているので、終わったらすぐ片付ける
     autoreap: bool,
@@ -611,6 +618,9 @@ impl Proc {
         personality: 0,
         timer_slack_ns: 50_000,
         default_slack_ns: 50_000,
+        sysno: -1,
+        nvcsw: 0,
+        nivcsw: 0,
         timers: Vec::new(),
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
@@ -747,7 +757,7 @@ impl Proc {
         if (img.setuid.is_some() || img.setgid.is_some()) && !self.cred.no_new_privs && self.cred.ns.user.is_none() {
             self.personality &= !PER_CLEAR_ON_SETID;
         }
-        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1 }));
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -1460,7 +1470,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1 }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new() }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -1695,6 +1705,11 @@ fn sched() {
     debug_assert!(crate::smp::holding(), "sched without the big kernel lock");
     crate::smp::SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let p = current();
+    if p.state == State::Runnable {
+        p.nivcsw += 1;
+    } else {
+        p.nvcsw += 1;
+    }
     let seg = crate::smp::seg_pause();
     let off = crate::debug::prof_off_cpu();
     // ext4 のロックは眠るあいだ手放す (大きなロックと同じく、ほかがそのあいだに ext4 に入れるように)
@@ -2123,7 +2138,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             None => m.pt.fork(),
         };
         let pt = pt.ok_or(-ENOMEM)?;
-        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone() })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()

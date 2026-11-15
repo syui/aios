@@ -236,6 +236,10 @@ pub trait Inode {
     fn magic_link(&self) -> Option<(String, InodeRef)> {
         None
     }
+    /// リンクをたどってよいか (readlink はできても、たどるのは別の決まり: /proc/PID/map_files は CAP_SYS_ADMIN)
+    fn may_follow(&self) -> Result<(), i64> {
+        Ok(())
+    }
     /// memfd の封 (F_GET_SEALS の F_SEAL_*)。封のないファイルは None
     fn seals(&self) -> Option<u32> {
         None
@@ -1644,6 +1648,7 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
             if nm.mode & S_IFMT == S_IFLNK && (!last || follow) {
                 // リンクの中身が変わるのは消して作りなおすとき (names_changed) なので、たどった答えも覚えてよい。
                 // 魔法のリンク (/proc/self/fd/N) は覚えない
+                next.may_follow()?;
                 if let Some((p, ino)) = next.magic_link() {
                     t.ok = false;
                     if last {
@@ -2011,6 +2016,7 @@ pub fn lookup_resolve(start: (InodeRef, String), path: &str, follow: bool, resol
             if links > 40 {
                 return Err(crate::why::at(-ELOOP, &w, &c));
             }
+            next.may_follow()?;
             if let Some((p, ino)) = next.magic_link() {
                 if no_magic {
                     return Err(-ELOOP);

@@ -4,13 +4,15 @@
 // 読み取り専用で写す (場所は auxv の AT_SYSINFO_EHDR で渡す)。musl は静的リンクでも
 // これを見つけて __kernel_clock_gettime (LINUX_2.6.39) を呼ぶ (Rust の Instant::now も)。
 // 中身はタイマのカウンタ (CNTVCT_EL0、CNTKCTL_EL1 で EL0 から読めるようにする) と、
-// 同じページの終わりにある vvar (周波数、起動したときの UNIX 秒) から時刻を計算する。
+// すぐ前のページ (VVAR_VA: Linux と同じく読むだけの [vvar]) の周波数と起動したときの UNIX 秒から時刻を計算する。
 // 知らない時計は svc でふつうのシステムコールにする。計算は timer.rs と同じ。
 use crate::kalloc;
 use crate::memlayout::PGSIZE;
 
 /// ユーザー空間での場所 (スタックの領域の下)
 pub const VDSO_VA: usize = 0x3f_0000_0000;
+/// vvar (vDSO が読む値) のページ: vDSO のすぐ前 (Linux の [vvar] と同じく読むだけ。/proc/PID/maps の名前)
+pub const VVAR_VA: usize = VDSO_VA - PGSIZE;
 
 core::arch::global_asm!(
     r#"
@@ -76,7 +78,9 @@ vdso_clock_gettime:
 // 起動からの秒 (x13) と ns (x14)、起動したときの UNIX 秒 (x12)。x9 から x15 だけを使う
 .global vdso_now
 vdso_now:
-    adr     x9, vdso_vvar
+    adr     x9, vdso_now
+    and     x9, x9, #0xfffffffffffff000
+    sub     x9, x9, #0x1000         // vDSO のすぐ前のページ (vvar)
     isb
     mrs     x10, cntvct_el0
     ldr     x11, [x9]           // 周波数
@@ -88,9 +92,6 @@ vdso_now:
     mul     x14, x14, x15
     udiv    x14, x14, x11       // ns = 余り * 1e9 / f
     ret
-.balign 8
-vdso_vvar:
-    .quad   0, 0
 .global vdso_code_end
 vdso_code_end:
 "#
@@ -99,7 +100,6 @@ vdso_code_end:
 unsafe extern "C" {
     static vdso_code_start: u8;
     static vdso_code_end: u8;
-    static vdso_vvar: u8;
     static vdso_getres: u8;
     static vdso_sigtramp: u8;
     static vdso_gettimeofday: u8;
@@ -149,6 +149,7 @@ const SONAME: &[u8] = b"linux-vdso.so.1";
 const VERSION: &[u8] = b"LINUX_2.6.39";
 
 static PAGE: crate::cell::Early<*mut u8> = crate::cell::Early::new(core::ptr::null_mut());
+static VVAR: crate::cell::Early<*mut u8> = crate::cell::Early::new(core::ptr::null_mut());
 
 fn put16(p: &mut [u8], o: usize, v: u16) {
     p[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -195,7 +196,6 @@ pub fn init() {
     let (start, end) = (&raw const vdso_code_start as usize, &raw const vdso_code_end as usize);
     let code = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
     p[TEXT..TEXT + code.len()].copy_from_slice(code);
-    let vvar_off = TEXT + code_off(&raw const vdso_vvar);
 
     // ELF ヘッダ
     p[0..4].copy_from_slice(b"\x7fELF");
@@ -319,10 +319,14 @@ pub fn init() {
     // 場所が重なっていないか (足したときに)
     debug_assert!(PHOFF + 3 * 56 <= DYNSYM && DYNSYM + n * 24 <= DYNSTR && DYNSTR + strsz <= HASH);
     debug_assert!(HASH + (3 + n) * 4 <= GNU_HASH && GNU_HASH + 28 + (n - 1) * 4 <= VERSYM && VERSYM + n * 2 <= VERDEF);
-    debug_assert!(VERDEF + 56 <= DYNAMIC && DYNAMIC + dynv.len() * 16 <= NOTE && NOTE + NOTE_SIZE <= TEXT && vvar_off + 16 <= PGSIZE);
-    // vvar
-    put64(p, vvar_off, crate::timer::freq());
-    put64(p, vvar_off + 8, crate::timer::boot_epoch());
+    debug_assert!(VERDEF + 56 <= DYNAMIC && DYNAMIC + dynv.len() * 16 <= NOTE && NOTE + NOTE_SIZE <= TEXT && TEXT + code.len() <= PGSIZE);
+    // vvar のページ: 周波数と起動したときの UNIX 秒
+    let vvar = kalloc::alloc().expect("vdso: no vvar page");
+    let v = unsafe { core::slice::from_raw_parts_mut(vvar, PGSIZE) };
+    v.fill(0);
+    put64(v, 0, crate::timer::freq());
+    put64(v, 8, crate::timer::boot_epoch());
+    VVAR.set(vvar);
     // 命令として読めるように、キャッシュを掃き出す
     let mut a = page as usize;
     while a < page as usize + PGSIZE {
@@ -339,6 +343,8 @@ pub fn map(pt: &mut crate::vm::PageTable) -> Option<()> {
     if page.is_null() {
         return Some(());
     }
+    pt.map(VVAR_VA, VDSO_VA, crate::vm::PROT_READ, false, crate::vm::Backing::Anon)?;
+    pt.install(VVAR_VA, VVAR.val(), crate::vm::PROT_READ)?;
     pt.map(VDSO_VA, VDSO_VA + PGSIZE, crate::vm::PROT_READ | crate::vm::PROT_EXEC, false, crate::vm::Backing::Anon)?;
     pt.install(VDSO_VA, page, crate::vm::PROT_READ | crate::vm::PROT_EXEC)
 }

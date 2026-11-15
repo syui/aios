@@ -52,6 +52,12 @@ const AT_GID: u64 = 13;
 const AT_EGID: u64 = 14;
 const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
+const AT_FLAGS: u64 = 8;
+const AT_PLATFORM: u64 = 15;
+const AT_HWCAP3: u64 = 29;
+const AT_MINSIGSTKSZ: u64 = 51;
+/// AT_PLATFORM の文字 (arm64 の ELF_PLATFORM)
+const PLATFORM: &[u8] = b"aarch64";
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 const AT_SYSINFO_EHDR: u64 = 33;
@@ -73,6 +79,8 @@ pub struct Image {
     pub args: (usize, usize, usize),
     /// LSM が exec で決めたこと (ラベル、AT_SECURE、写せなければ SIGSEGV: security::Bprm)
     pub bprm: crate::security::Bprm,
+    /// 積んだ auxv (Mm::auxv へ)
+    pub auxv: Vec<u64>,
     /// プログラムかインタプリタ (ld.so) が、exec した人に読めない: dumpable を fs.suid_dumpable に (Linux の would_dump。
     /// 読めないものの中身を、/proc/PID/mem や core で見られないように)
     pub nondump: bool,
@@ -247,7 +255,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let (phdr_va, phentsize, phnum) = (main.phdr_va, main.phentsize, main.phnum);
 
     // 引数と環境の文字列、ポインタの並び (argc, argv, envp, auxv) の分を足す
-    let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1 + 16;
+    let strs: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1 + 16 + PLATFORM.len() + 1;
     let ptrs_size = (argv.len() + envp.len() + 3 + 2 * 32) * 8;
     if strs > ARG_MAX {
         return Err(-E2BIG);
@@ -273,7 +281,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let random = base - 16;
     // auxv の数 (下の並びの型もこれで、ずれないように。前は AT_HWCAP2 を足して 18 になったのにここが 17 のままで、
     // おしまいの AT_NULL が AT_RANDOM の 16 バイトに重なり、そのほとんどを 0 にしていた: glibc のスタックの番人も)
-    const NAUXV: usize = 18;
+    const NAUXV: usize = 22;
     let words = 1 + argc + 1 + envc + 1 + NAUXV * 2;
     let sp = (random - words * 8) & !15;
     if sp < USER_STACK_TOP - ARG_MAX {
@@ -283,38 +291,51 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let mut img = crate::heap::try_vec(USER_STACK_TOP - sp, true)?;
     let mut at = base;
     let mut ptrs = Vec::with_capacity(argc + envc + 1);
-    for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&execfn.as_bytes().to_vec())) {
+    for s in argv.iter().chain(envp.iter()).chain(core::iter::once(&execfn.as_bytes().to_vec())).chain(core::iter::once(&PLATFORM.to_vec())) {
         ptrs.push(at);
         img[at - sp..at - sp + s.len()].copy_from_slice(s);
         at += s.len() + 1;
     }
     let execfn = ptrs[argc + envc];
+    let platform = ptrs[argc + envc + 1];
     let env_start = base + argv.iter().map(|s| s.len() + 1).sum::<usize>();
     let args = (base, env_start, env_start + envp.iter().map(|s| s.len() + 1).sum::<usize>());
     crate::rand::fill(&mut img[random - sp..random - sp + 16]);
 
     let hw = hwcaps();
+    // exec のあとの id (proc::finish_exec と同じ: setuid / setgid は no_new_privs でもユーザーの namespace の中でもないとき)。
+    // 見せるのはその人のユーザーの namespace の番号 (Linux の from_kuid_munged)
+    let c = crate::cred::current();
+    let keep = c.no_new_privs || c.ns.user.is_some();
+    let euid = setuid.filter(|_| !keep).unwrap_or(c.euid);
+    let egid = setgid.filter(|_| !keep).unwrap_or(c.egid);
+    // Linux の create_elf_tables と同じ順 (arm64 の ARCH_DLINFO が先: AT_SYSINFO_EHDR と AT_MINSIGSTKSZ)
     let auxv: [(u64, u64); NAUXV] = [
+        if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
+        (AT_MINSIGSTKSZ, crate::signal::MINSIGSTKSZ as u64),
+        (AT_HWCAP, hw.0),
+        (AT_PAGESZ, PGSIZE as u64),
+        (AT_CLKTCK, crate::timer::HZ),
         (AT_PHDR, phdr_va as u64),
         (AT_PHENT, phentsize as u64),
         (AT_PHNUM, phnum as u64),
-        (AT_HWCAP, hw.0),
-        (AT_HWCAP2, hw.1),
-        (AT_PAGESZ, PGSIZE as u64),
         (AT_BASE, interp_base as u64),
+        (AT_FLAGS, 0),
         (AT_ENTRY, main.entry as u64),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
-        (AT_CLKTCK, crate::timer::HZ),
+        (AT_UID, crate::ns::show_uid(c.uid) as u64),
+        (AT_EUID, crate::ns::show_uid(euid) as u64),
+        (AT_GID, crate::ns::show_gid(c.gid) as u64),
+        (AT_EGID, crate::ns::show_gid(egid) as u64),
         // LSM が環境を消す移りかた (AppArmor の Px など) なら 1: ld.so が LD_* を見ない
         (AT_SECURE, bprm.secure as u64),
         (AT_RANDOM, random as u64),
+        (AT_HWCAP2, hw.1),
+        (AT_HWCAP3, 0),
         (AT_EXECFN, execfn as u64),
-        if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
+        (AT_PLATFORM, platform as u64),
         (AT_NULL, 0),
     ];
+    let saved: Vec<u64> = auxv.iter().flat_map(|&(k, v)| [k, v]).collect();
     let mut w = 0;
     let mut put = |v: u64| {
         img[w..w + 8].copy_from_slice(&v.to_le_bytes());
@@ -335,7 +356,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, bprm, nondump })
+    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, bprm, nondump, auxv: saved })
 }
 
 

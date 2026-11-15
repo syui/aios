@@ -228,6 +228,10 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         return handle(tf, kind, None, esr());
     }
     let esr = if kind == EL0_SYNC { esr() } else { 0 };
+    // いま入っているシステムコールの番号 (ほかの入り方は -1: Linux の regs->syscallno。/proc/PID/syscall)
+    if kind == EL0_SYNC || kind == EL0_IRQ || kind == EL0_FIQ {
+        proc::current().sysno = if kind == EL0_SYNC && esr >> 26 == EC_SVC64 { tf.x[8] as i64 } else { -1 };
+    }
     // Spectre v2 のファームウェアの手当て (cpuvuln.rs): ユーザーからカーネルのアドレス (ビット 55) で落ちたとき、
     // 割りこみを開ける前に分岐予測をきれいにする (Linux の el0_ia、el0_pc、el0_breakpt、el0_softstp、el0_interrupt)
     if (kind == EL0_SYNC || kind == EL0_IRQ || kind == EL0_FIQ) && crate::cpuvuln::bp_fw_on() {

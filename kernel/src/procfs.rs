@@ -26,6 +26,9 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 const EACCES: i64 = 13;
+const EIO: i64 = 5;
+const ERANGE: i64 = 34;
+const CAP_SYS_TIME: u32 = 25;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -97,7 +100,8 @@ enum Node {
     MountInfo(u32),
     /// /proc/PID/uid_map、gid_map、setgroups (ユーザーの namespace の地図。0 uid、1 gid、2 setgroups)
     IdMap(u32, u8),
-    /// /proc/PID/task (スレッドの一覧)、task/TID、その中の stat / status / comm (0 1 2)。番号は本当のもの
+    /// /proc/PID/task (スレッドの一覧)、task/TID、その中のスレッドごとのもの (TASK_FILES の番号: stat status comm
+    /// syscall sched personality)。番号は本当のもの。ほかの名前はプロセスのもの (Linux の tid_base_stuff と同じ並び)
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
@@ -110,6 +114,23 @@ enum Node {
     OomScore(u32),
     OomAdj(u32),
     OomScoreAdj(u32),
+    /// /proc/PID/auxv (exec で積んだもの)、syscall (いまのシステムコール)、sched (走った数と時間)、smaps_rollup、
+    /// mountstats、timens_offsets、clear_refs
+    Auxv(u32),
+    Syscall(u32),
+    Sched(u32),
+    SmapsRollup(u32),
+    Mountstats(u32),
+    TimensOffsets(u32),
+    ClearRefs(u32),
+    /// /proc/net (self/net へのリンク: Linux と同じ)
+    NetLink,
+    /// /proc/PID/mem (ほかのプロセスのメモリを読み書き: 番地がファイルの位置)、pagemap (ページごとの 8 バイト)
+    Mem(u32),
+    Pagemap(u32),
+    /// /proc/PID/map_files と、その中のリンク (ファイルを写した領域の はじめ-終わり)
+    MapFilesDir(u32),
+    MapFile(u32, usize, usize),
     /// /proc/PID/loginuid と sessionid (ログインした人とそのセッション: audit.rs)
     LoginUid(u32),
     SessionId(u32),
@@ -155,6 +176,13 @@ pub fn new_root() -> InodeRef {
 
 /// /proc/PID/attr の中 (LSM の属性: AppArmor が使うもの)
 const ATTRS: [&str; 3] = ["current", "exec", "prev"];
+/// task/TID の中のスレッドごとのもの (Node::TaskFile の番号)
+const TASK_FILES: [&str; 6] = ["stat", "status", "comm", "syscall", "sched", "personality"];
+/// task/TID の中のプロセスのもの (Linux の tid_base_stuff のうち、スレッドごとでないもの)
+const TASK_SHARED: [&str; 30] = [
+    "fd", "fdinfo", "ns", "net", "environ", "auxv", "limits", "cmdline", "statm", "maps", "mem", "cwd", "root", "exe", "mounts", "mountinfo", "clear_refs", "smaps",
+    "smaps_rollup", "pagemap", "attr", "oom_score", "oom_adj", "oom_score_adj", "loginuid", "sessionid", "uid_map", "gid_map", "projid_map", "setgroups",
+];
 
 /// IPv6 と raw のもの: tcp6、udp6、sockstat6、if_inet6 は中身を作る (inet.rs の AF_INET6)。raw はまだ見出しだけ
 /// (なければ netstat がないと言って止まる)
@@ -298,11 +326,23 @@ impl ProcInode {
             Node::OomScore(p) => (p as u64) << 16 | 0x63,
             Node::OomAdj(p) => (p as u64) << 16 | 0x64,
             Node::OomScoreAdj(p) => (p as u64) << 16 | 0x65,
+            Node::Auxv(p) => (p as u64) << 16 | 0x66,
+            Node::Syscall(p) => (p as u64) << 16 | 0x67,
+            Node::Sched(p) => (p as u64) << 16 | 0x68,
+            Node::SmapsRollup(p) => (p as u64) << 16 | 0x69,
+            Node::Mountstats(p) => (p as u64) << 16 | 0x6a,
+            Node::TimensOffsets(p) => (p as u64) << 16 | 0x6b,
+            Node::ClearRefs(p) => (p as u64) << 16 | 0x6c,
+            Node::NetLink => 58,
+            Node::Mem(p) => (p as u64) << 16 | 0x6d,
+            Node::Pagemap(p) => (p as u64) << 16 | 0x6e,
+            Node::MapFilesDir(p) => (p as u64) << 16 | 0x6f,
+            Node::MapFile(p, s, _) => 1 << 62 | (p as u64) << 32 | (s as u64 >> 12) & 0xffff_ffff,
             Node::SessionId(p) => (p as u64) << 16 | 28,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
             Node::TaskDir(p) => (p as u64) << 16 | 20,
             Node::Task(_, t) => (t as u64) << 16 | 21,
-            Node::TaskFile(_, t, k) => (t as u64) << 16 | (22 + k as u64),
+            Node::TaskFile(_, t, k) => (t as u64) << 16 | (0x80 + k as u64),
             Node::AttrDir(p, a) => (p as u64) << 16 | (0x30 + a as u64),
             Node::Attr(p, a, k) => (p as u64) << 16 | (0x32 + 4 * a as u64 + k as u64),
             Node::NsLink(p, k) => (p as u64) << 16 | (0x40 + k as u64),
@@ -331,7 +371,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) | Node::Auxv(p) | Node::Syscall(p) | Node::Sched(p) | Node::SmapsRollup(p) | Node::Mountstats(p) | Node::TimensOffsets(p) | Node::ClearRefs(p) | Node::Mem(p) | Node::Pagemap(p) | Node::MapFilesDir(p) | Node::MapFile(p, ..) => Some(p),
             _ => None,
         }
     }
@@ -460,14 +500,18 @@ impl ProcInode {
             }
             Node::Stat(pid) => stat_line(leader_any(pid)?, true),
             Node::Maps(pid) => {
-                let pt = &leader(pid)?.mm().pt;
+                let p = leader(pid)?;
+                let n = map_names(p);
+                let pt = &p.mm().pt;
                 let _h = pt.hold();
-                pt.maps_text()
+                pt.maps_text_named(n)
             }
             Node::Smaps(pid) => {
-                let pt = &leader(pid)?.mm().pt;
+                let p = leader(pid)?;
+                let n = map_names(p);
+                let pt = &p.mm().pt;
                 let _h = pt.hold();
-                pt.smaps_text()
+                pt.smaps_text(n)
             }
             Node::Stack(pid) => {
                 aa_ptrace(pid, false)?;
@@ -599,6 +643,29 @@ impl ProcInode {
                 format!("{}\n", if adj == 1000 { 15 } else { adj * 17 / 1000 })
             }
             Node::OomScoreAdj(pid) => format!("{}\n", proc::oom_adj(leader_any(pid)?).0),
+            // 開くときに mm_access (permission)。中身はバイトの並びなので read_at で (ここは来ない)
+            Node::Auxv(_) => String::new(),
+            Node::Syscall(pid) => {
+                aa_ptrace(pid, false)?;
+                syscall_text(leader(pid)?)
+            }
+            Node::Sched(pid) => sched_text(leader_any(pid)?),
+            Node::SmapsRollup(pid) => {
+                let pt = &leader(pid)?.mm().pt;
+                let _h = pt.hold();
+                pt.smaps_rollup_text()
+            }
+            // mounts の行の device、場所、種類を (Linux の show_vfsstat: nfs などの数はない)
+            Node::Mountstats(pid) => crate::vfs::mounts_text_of(leader(pid)?.cred.ns.mnt.clone())
+                .lines()
+                .map(|l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    format!("device {} mounted on {} with fstype {}\n", f.first().unwrap_or(&""), f.get(1).unwrap_or(&""), f.get(2).unwrap_or(&""))
+                })
+                .collect(),
+            // 時間の namespace はない: init のもの (ずれ 0)
+            Node::TimensOffsets(_) => format!("{:<10} {:>10} {:>9}\n{:<10} {:>10} {:>9}\n", "monotonic", 0, 0, "boottime", 0, 0),
+            Node::ClearRefs(_) => return Err(crate::why::inval()),
             // 改行なし (Linux の proc_loginuid_read と proc_sessionid_read)
             Node::LoginUid(pid) => format!("{}", crate::ns::show_uid_raw(leader(pid)?.cred.loginuid)),
             Node::SessionId(pid) => format!("{}", leader(pid)?.cred.sessionid),
@@ -625,15 +692,94 @@ impl ProcInode {
                         crate::ns::local_or_0(tid),
                         crate::ns::local_or_0(t.ppid)
                     ),
-                    _ => format!("{}\n", t.comm()),
+                    2 => format!("{}\n", t.comm()),
+                    3 => {
+                        aa_ptrace(pid, false)?;
+                        syscall_text(t)
+                    }
+                    4 => sched_text(t),
+                    _ => {
+                        aa_ptrace(pid, false)?;
+                        format!("{:08x}\n", t.personality)
+                    }
                 }
             }
             Node::IdMap(pid, 2) => crate::ns::setgroups_text(&leader(pid)?.cred.ns.user).into(),
+            Node::IdMap(pid, 3) => crate::ns::projid_text(&leader(pid)?.cred.ns.user),
             Node::Attr(pid, _, k) => crate::apparmor::attr_read(&leader(pid)?.cred, ATTRS[k as usize])?,
             Node::IdMap(pid, k) => crate::ns::map_text(&leader(pid)?.cred.ns.user, k == 1),
             _ => return Err(-EISDIR),
         })
     }
+}
+
+/// maps の [heap]、[stack]、[vdso] の手がかり (カーネルのスレッドは なし)
+fn map_names(p: &mut Proc) -> crate::vm::MapNames {
+    if p.kthread || p.mm.is_none() {
+        return crate::vm::MapNames::default();
+    }
+    let m = p.mm();
+    let on = !crate::parts::off(crate::parts::Part::Vdso);
+    let (vdso, vvar) = if on { (crate::vdso::VDSO_VA, crate::vdso::VVAR_VA) } else { (0, 0) };
+    crate::vm::MapNames { start_brk: m.heap_start, brk: m.brk, start_stack: crate::exec::USER_STACK_TOP - 1, vdso, vvar }
+}
+
+/// map_files の名前 "はじめ-終わり" (16 進。0 でない数の頭の 0 はだめ: Linux の dname_to_vma_addr)
+fn map_file_name(name: &str) -> Option<(usize, usize)> {
+    let (a, b) = name.split_once('-')?;
+    let ok = |x: &str| !x.is_empty() && !(x.len() > 1 && x.starts_with('0')) && x.bytes().all(|c| c.is_ascii_hexdigit());
+    if !ok(a) || !ok(b) {
+        return None;
+    }
+    Some((usize::from_str_radix(a, 16).ok()?, usize::from_str_radix(b, 16).ok()?))
+}
+
+/// /proc/PID/syscall (Linux の proc_pid_syscall): 走れるもの (自分でない) は running。システムコールの中なら番号と引数 6 つ
+/// (はじめのものは入ったときの x0) と sp と pc、ほかの入り方なら -1 と sp と pc
+fn syscall_text(t: &mut Proc) -> String {
+    let me = proc::current().pid == t.pid;
+    if !me && matches!(t.state, State::Runnable | State::Running) {
+        return "running\n".into();
+    }
+    let (nr, orig) = (t.sysno, t.orig_x0);
+    let tf = t.tf_ref();
+    if nr < 0 {
+        format!("{} {:#x} {:#x}\n", nr, tf.sp_el0, tf.elr)
+    } else {
+        format!("{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n", nr, orig, tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5], tf.sp_el0, tf.elr)
+    }
+}
+
+/// /proc/PID/sched (Linux の proc_sched_show_task と同じ名前と形: 名前は 45 の左寄せ、数は 21、時間は ms の小数 6 けた)。
+/// aios が数えていない平均 (se.avg.*) は 0、重みは nice 0 のもの、slice は Linux の既定 (0.7 ms × (1 + log2 CPU))
+fn sched_text(p: &Proc) -> String {
+    let mut s = format!("{} ({}, #threads: {})\n", p.comm(), crate::ns::local_or_0(p.pid), proc::threads_of(p.tgid).len());
+    s += "-------------------------------------------------------------------\n";
+    let ns = |n: &str, v: u64| format!("{:<45}:{:>14}.{:06}\n", n, v / 1_000_000, v % 1_000_000);
+    let int = |n: &str, v: i64| format!("{:<45}:{:>21}\n", n, v);
+    let run = proc::cpu_ns(p);
+    let cpus = crate::smp::online().clamp(1, 8) as u64;
+    let factor = 1 + (63 - cpus.leading_zeros() as u64);
+    let t0 = crate::timer::uptime_ns();
+    let delta = crate::timer::uptime_ns() - t0;
+    s += &ns("se.exec_start", if p.ran_at != 0 { p.ran_at } else { crate::timer::uptime_ns() });
+    s += &ns("se.vruntime", run);
+    s += &ns("se.sum_exec_runtime", run);
+    s += &int("se.nr_migrations", 0);
+    s += &int("nr_switches", (p.nvcsw + p.nivcsw) as i64);
+    s += &int("nr_voluntary_switches", p.nvcsw as i64);
+    s += &int("nr_involuntary_switches", p.nivcsw as i64);
+    s += &int("se.load.weight", 1_048_576);
+    for n in ["se.avg.load_sum", "se.avg.runnable_sum", "se.avg.util_sum", "se.avg.load_avg", "se.avg.runnable_avg", "se.avg.util_avg"] {
+        s += &int(n, 0);
+    }
+    s += &int("se.avg.last_update_time", crate::timer::uptime_ns() as i64);
+    s += &int("se.avg.util_est", 0);
+    s += &int("policy", 0);
+    s += &int("prio", 120);
+    s += &int("se.slice", (700_000 * factor) as i64);
+    s += &int("clock-delta", delta as i64);
+    s
 }
 
 /// /proc/PID/limits (Linux の proc_pid_limits と同じ形: 名前 25、ソフトとハード 20、単位 10 の左寄せ)
@@ -902,7 +1048,9 @@ impl Inode for ProcInode {
             Node::FdInfoDir(pid) => Some(aa_ptrace(pid, true).and_then(|_| c.check(m, want))),
             // 開くときに mode と、ptrace で読めるか (Linux は open で見る: proc_maps_open と environ_open の mm_access、
             // seq_fdinfo_open。開いたあとで相手が変わっても、読むのはそのまま)
-            Node::Maps(pid) | Node::Smaps(pid) | Node::Environ(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
+            Node::Maps(pid) | Node::Smaps(pid) | Node::SmapsRollup(pid) | Node::Environ(pid) | Node::Auxv(pid) | Node::Pagemap(pid) => Some(c.check(m, want).and_then(|_| mm_access(pid))),
+            // mem は ptrace の ATTACH ができる人だけ (proc_mem_open の mm_access: EACCES)
+            Node::Mem(pid) => Some(c.check(m, want).and_then(|_| ptrace_may(pid, false).map_err(|_| -EACCES))),
             Node::FdInfo(pid, _) => Some(c.check(m, want).and_then(|_| aa_ptrace(pid, true))),
             // UTS ごとの sysctl (kernel/uname): その UTS で CAP_SYS_ADMIN を持てば持ち主のビットで (Linux の
             // net_ctl_permission と同じ考え。中に root の割りあてのないユーザーの namespace (aibox --image の 65532) でも、
@@ -914,7 +1062,22 @@ impl Inode for ProcInode {
         }
     }
 
+    /// map_files のリンクをたどるのは CAP_SYS_ADMIN だけ (proc_map_files_get_link: checkpoint_restore_ns_capable)
+    fn may_follow(&self) -> Result<(), i64> {
+        if matches!(self.node, Node::MapFile(..)) && !crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN) {
+            return Err(-EPERM);
+        }
+        Ok(())
+    }
+
     fn magic_link(&self) -> Option<(String, InodeRef)> {
+        // map_files: 写しているファイルそのもの (消したものも)
+        if let Node::MapFile(pid, s, e) = self.node {
+            let l = leader(pid).ok()?;
+            let pt = &l.mm().pt;
+            let _h = pt.hold();
+            return pt.file_maps().into_iter().find(|m| m.0 == s && m.1 == e).map(|m| (m.4, m.5));
+        }
         let Node::Fd(pid, n) = self.node else { return None };
         // AppArmor で見られなければ、ふつうのリンクとして (readlink が EACCES にする)
         aa_ptrace(pid, true).ok()?;
@@ -942,7 +1105,22 @@ impl Inode for ProcInode {
             // だれでも開けるが、書けるのは自分のものだけ (write_at)。prev は読むだけ
             Node::Attr(_, _, k) if ATTRS[k as usize] != "prev" => S_IFREG | 0o666,
             Node::NsLink(..) => S_IFLNK | 0o777,
-            Node::SelfLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
+            Node::SelfLink | Node::NetLink | Node::Cwd(_) | Node::RootLink(_) | Node::Exe(_) => S_IFLNK | 0o777,
+            Node::Auxv(_) | Node::Syscall(_) | Node::Mountstats(_) | Node::Pagemap(_) => S_IFREG | 0o400,
+            Node::Mem(_) => S_IFREG | 0o600,
+            Node::MapFilesDir(_) => S_IFDIR | 0o500,
+            // 写しの開き方しだい: 読めれば r、書ければ w (proc_map_files_instantiate)
+            Node::MapFile(pid, s, e) => {
+                let rw = leader(pid).ok().and_then(|l| {
+                    let pt = &l.mm().pt;
+                    let _h = pt.hold();
+                    pt.file_maps().iter().find(|m| m.0 == s && m.1 == e).map(|m| (m.2, m.3))
+                });
+                let (r, w) = rw.unwrap_or((false, false));
+                S_IFLNK | if r { 0o400 } else { 0 } | if w { 0o200 } else { 0 }
+            }
+            Node::ClearRefs(_) => S_IFREG | 0o200,
+            Node::Sched(_) | Node::TimensOffsets(_) => S_IFREG | 0o644,
             // 開いた口しだい: 読めれば r-x、書ければ -wx (Linux の tid_fd_update_inode)
             Node::Fd(pid, n) => {
                 let f = leader(pid).ok().and_then(|p| p.files().get_other(n as u64)).map(|(f, _)| f);
@@ -953,7 +1131,8 @@ impl Inode for ProcInode {
             Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) | Node::Comm(_) | Node::OomAdj(_) | Node::OomScoreAdj(_) => S_IFREG | 0o644,
             Node::TimerSlack(_) => S_IFREG | 0o666,
             Node::Personality(_) => S_IFREG | 0o400,
-            Node::TaskFile(_, _, 2) => S_IFREG | 0o644,
+            Node::TaskFile(_, _, 2 | 4) => S_IFREG | 0o644,
+            Node::TaskFile(_, _, 3 | 5) => S_IFREG | 0o400,
             // 持ち主だけが読む (Linux の S_IRUSR のもの)
             Node::Environ(_) | Node::Stack(_) => S_IFREG | 0o400,
             Node::NetConntrack => S_IFREG | 0o440,
@@ -980,6 +1159,53 @@ impl Inode for ProcInode {
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+        // /proc/PID/mem (mem_rw): 位置は番地。読めたところまで。はじめから読めなければ EIO。カーネルのスレッドは 0
+        if let Node::Mem(pid) = self.node {
+            let p = leader(pid)?;
+            let Some(mm) = p.mm.as_ref().filter(|_| !p.kthread) else { return Ok(0) };
+            let pt = &mut mm.get().pt;
+            let _h = pt.hold();
+            let n = pt.read_remote(off, buf);
+            return if n == 0 && !buf.is_empty() { Err(-EIO) } else { Ok(n) };
+        }
+        // /proc/PID/pagemap (pagemap_read): 位置と大きさは 8 の倍数 (でなければ EINVAL)。位置 / 8 がページの番号。番地の
+        // 上の 8 ビットはタグとして外す (arm64 の untagged_addr_remote)。ユーザーの番地の終わりから先は読めない (0)
+        if let Node::Pagemap(pid) = self.node {
+            if off % 8 != 0 || buf.len() % 8 != 0 {
+                return Err(crate::why::inval());
+            }
+            let p = leader(pid)?;
+            let Some(mm) = p.mm.as_ref().filter(|_| !p.kthread) else { return Ok(0) };
+            let pt = &mm.get().pt;
+            let _h = pt.hold();
+            let show = crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN);
+            let vpn = off / 8;
+            if vpn > usize::MAX >> 12 {
+                return Ok(0);
+            }
+            let start = (vpn << 12) & ((1 << 56) - 1);
+            let mut n = 0;
+            while n < buf.len() {
+                let va = start + n / 8 * crate::memlayout::PGSIZE;
+                if va >= crate::vm::MAXVA {
+                    break;
+                }
+                buf[n..n + 8].copy_from_slice(&pt.pagemap_entry(va, show).to_le_bytes());
+                n += 8;
+            }
+            return Ok(n);
+        }
+        // /proc/PID/auxv: 型と値の 8 バイトずつ (AT_NULL まで: Linux の auxv_read)
+        if let Node::Auxv(pid) = self.node {
+            let p = leader(pid)?;
+            let b: Vec<u8> = p.mm.as_ref().map_or(Vec::new(), |m| m.get().auxv.iter().flat_map(|v| v.to_le_bytes()).collect());
+            if off >= b.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(b.len() - off);
+            buf[..n].copy_from_slice(&b[off..off + n]);
+            return Ok(n);
+        }
         // /proc/ai/trace は大きい (8192 の出来事): 読みはじめで 1 度作って、続きはそれを切って返す
         if self.node == Node::AiTrace {
             if !crate::aiproc::allowed() {
@@ -1004,7 +1230,7 @@ impl Inode for ProcInode {
     fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
         // 0 バイト (writes_empty で来る): Linux の書き手が数として読むもの (oom_score_adj、oom_adj、timerslack_ns、loginuid:
         // EINVAL) と comm (空の名前に) だけ書き手へ。ほか (/proc/sys は proc_dointvec と同じく) 何もせず 0
-        if b.is_empty() && !matches!(self.node, Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2)) {
+        if b.is_empty() && !matches!(self.node, Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::ClearRefs(_) | Node::TimensOffsets(_)) {
             return Ok(0);
         }
         // /proc/PID/comm と task/TID/comm (comm_write): 同じスレッドグループのものだけ (ほかは EINVAL)。はじめの 15 バイト
@@ -1064,6 +1290,72 @@ impl Inode for ProcInode {
                 crate::println!("{} ({}): /proc/{}/oom_adj is deprecated, please use /proc/{}/oom_score_adj instead.", me.comm(), me.pid, t.tgid, t.tgid);
             }
             proc::set_oom_adj(t, adj as i16, (!legacy && cap).then_some(adj as i16));
+            return Ok(b.len());
+        }
+        // /proc/PID/mem: 書ける領域に書けたところまで (はじめから書けなければ EIO)
+        if let Node::Mem(pid) = self.node {
+            let p = leader(pid)?;
+            let Some(mm) = p.mm.as_ref().filter(|_| !p.kthread) else { return Ok(0) };
+            let pt = &mut mm.get().pt;
+            let _h = pt.hold();
+            let n = pt.write_remote(off, b);
+            return if n == 0 { Err(-EIO) } else { Ok(n) };
+        }
+        // /proc/PID/clear_refs (clear_refs_write): 1〜5 (10 進、前後の空白はよい)。aios は参照の印 (AF) も最大の RSS も
+        // 見せていないので、受けつけるだけ
+        if let Node::ClearRefs(pid) = self.node {
+            let s = core::str::from_utf8(&b[..b.len().min(12)]).map_err(|_| crate::why::inval())?.trim();
+            let v: i32 = s.parse().map_err(|_| crate::why::inval())?;
+            if !(1..=5).contains(&v) {
+                return Err(crate::why::inval());
+            }
+            leader(pid)?;
+            return Ok(b.len());
+        }
+        // /proc/PID/sched (proc_sched_set_task): 書くと数えなおす (aios は受けつけるだけ)
+        if let Node::Sched(pid) | Node::TaskFile(pid, _, 4) = self.node {
+            leader(pid)?;
+            return Ok(b.len());
+        }
+        // /proc/PID/timens_offsets (timens_offsets_write、proc_timens_set_offset): "名前か番号 秒 ナノ秒" の行。読めなければ
+        // EINVAL、CAP_SYS_TIME がなければ EPERM、時計の外は ERANGE。時間の namespace はないので、どれも init のもの
+        // (もう決まっている: EACCES)
+        if let Node::TimensOffsets(pid) = self.node {
+            if off != 0 || b.len() >= 4096 {
+                return Err(crate::why::inval());
+            }
+            let s = core::str::from_utf8(b).map_err(|_| crate::why::inval())?;
+            let mut offs = Vec::new();
+            for l in s.split('\n').filter(|l| !l.is_empty()).take(2) {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                let (sec, ns) = match (f.get(1).and_then(|x| x.parse::<i64>().ok()), f.get(2).and_then(|x| x.parse::<u64>().ok())) {
+                    (Some(a), Some(b)) if f.len() >= 3 && b < 1_000_000_000 => (a, b),
+                    _ => return Err(crate::why::inval()),
+                };
+                if !matches!(f[0], "monotonic" | "1" | "boottime" | "7") {
+                    return Err(crate::why::inval());
+                }
+                offs.push((sec, ns));
+            }
+            if offs.is_empty() {
+                return Err(crate::why::inval());
+            }
+            leader(pid)?;
+            if !crate::cred::current().capable(CAP_SYS_TIME) {
+                return Err(-EPERM);
+            }
+            let now = (crate::timer::uptime_ns() / 1_000_000_000) as i64;
+            const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+            for (sec, _) in offs {
+                if !(-KTIME_SEC_MAX..=KTIME_SEC_MAX).contains(&sec) || !(0..=KTIME_SEC_MAX / 2).contains(&now.saturating_add(sec)) {
+                    return Err(-ERANGE);
+                }
+            }
+            return Err(-EACCES);
+        }
+        // /proc/PID/projid_map (ケーパビリティは要らない: ns::write_projid)
+        if let Node::IdMap(pid, 3) = self.node {
+            crate::ns::write_projid(&leader(pid)?.cred.ns.user, b)?;
             return Ok(b.len());
         }
         // /proc/PID/timerslack_ns (proc_pid_set_timer_slack_ns): 10 進。自分でなければ CAP_SYS_NICE。0 は fork したときの値
@@ -1145,7 +1437,7 @@ impl Inode for ProcInode {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_)) {
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::ClearRefs(_) | Node::Sched(_) | Node::TaskFile(_, _, 4) | Node::TimensOffsets(_)) {
             return Ok(());
         }
         Err(-EACCES)
@@ -1153,11 +1445,18 @@ impl Inode for ProcInode {
 
     fn readlink(&self) -> Result<String, i64> {
         // ほかのプロセスの exe cwd root fd ns を見るのは、AppArmor の ptrace の read も (proc_fd_access_allowed)
-        if let Node::Cwd(pid) | Node::RootLink(pid) | Node::Exe(pid) | Node::Fd(pid, _) | Node::NsLink(pid, _) = self.node {
+        if let Node::Cwd(pid) | Node::RootLink(pid) | Node::Exe(pid) | Node::Fd(pid, _) | Node::NsLink(pid, _) | Node::MapFile(pid, ..) = self.node {
             aa_ptrace(pid, true)?;
         }
         match self.node {
             Node::SelfLink => Ok(format!("{}", crate::ns::local_or_0(proc::current().tgid))),
+            Node::NetLink => Ok("self/net".into()),
+            Node::MapFile(pid, s, e) => {
+                let l = leader(pid)?;
+                let pt = &l.mm().pt;
+                let _h = pt.hold();
+                pt.file_maps().into_iter().find(|m| m.0 == s && m.1 == e).map(|m| m.4).ok_or(-ENOENT)
+            }
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),
             // chroot していれば、その場所 (pidof はこれが自分と同じものだけ探す)
             Node::RootLink(pid) => Ok(format!("/{}", leader(pid)?.files().root)),
@@ -1201,7 +1500,7 @@ impl Inode for ProcInode {
             (Node::Root, "kmsg") => Node::Kmsg,
             (Node::Root, "sysstat") => Node::Sysstat,
             (Node::Root, "modules") => Node::Modules,
-            (Node::Root, "net") => Node::NetDir,
+            (Node::Root, "net") => Node::NetLink,
             (Node::Root, "sysvipc") => Node::SysvipcDir,
             (Node::SysvipcDir, "shm") => Node::SysvipcShm,
             (Node::Root, "ai") if !crate::parts::off(crate::parts::Part::Aiproc) => Node::AiDir,
@@ -1273,6 +1572,31 @@ impl Inode for ProcInode {
             (Node::Pid(p), "oom_score") => Node::OomScore(p),
             (Node::Pid(p), "oom_adj") => Node::OomAdj(p),
             (Node::Pid(p), "oom_score_adj") => Node::OomScoreAdj(p),
+            (Node::Pid(p), "auxv") => Node::Auxv(p),
+            (Node::Pid(p), "syscall") => Node::Syscall(p),
+            (Node::Pid(p), "sched") => Node::Sched(p),
+            (Node::Pid(p), "smaps_rollup") => Node::SmapsRollup(p),
+            (Node::Pid(p), "mountstats") => Node::Mountstats(p),
+            (Node::Pid(p), "timens_offsets") => Node::TimensOffsets(p),
+            (Node::Pid(p), "clear_refs") => Node::ClearRefs(p),
+            (Node::Pid(p), "projid_map") => Node::IdMap(p, 3),
+            (Node::Pid(p), "mem") => Node::Mem(p),
+            (Node::Pid(p), "pagemap") => Node::Pagemap(p),
+            (Node::Pid(p), "map_files") => Node::MapFilesDir(p),
+            // はじめ-終わり (16 進。頭に 0 はつけない: Linux の dname_to_vma_addr)、ちょうどその領域があるときだけ
+            (Node::MapFilesDir(p), _) => {
+                aa_ptrace(p, true)?;
+                let (s, e) = map_file_name(name).ok_or(-ENOENT)?;
+                let l = leader(p)?;
+                let pt = &l.mm().pt;
+                let _h = pt.hold();
+                pt.file_maps().iter().find(|m| m.0 == s && m.1 == e).ok_or(-ENOENT)?;
+                Node::MapFile(p, s, e)
+            }
+            (Node::Pid(p), "net") => {
+                leader(p)?;
+                Node::NetDir
+            }
             (Node::Pid(p), "sessionid") => Node::SessionId(p),
             (Node::AttrDir(p, false), "apparmor") => Node::AttrDir(p, true),
             (Node::AttrDir(p, a), _) => Node::Attr(p, a, ATTRS.iter().position(|x| *x == name).ok_or(-ENOENT)? as u8),
@@ -1282,9 +1606,9 @@ impl Inode for ProcInode {
                 thread(p, tid)?;
                 Node::Task(p, tid)
             }
-            (Node::Task(p, t), "stat") => Node::TaskFile(p, t, 0),
-            (Node::Task(p, t), "status") => Node::TaskFile(p, t, 1),
-            (Node::Task(p, t), "comm") => Node::TaskFile(p, t, 2),
+            (Node::Task(p, t), n) if TASK_FILES.contains(&n) => Node::TaskFile(p, t, TASK_FILES.iter().position(|x| *x == n).unwrap() as u8),
+            // ほかはプロセスのもの (スレッドの中にないもの: task、map_files、mountstats、timens_offsets、timerslack_ns)
+            (Node::Task(p, _), n) if TASK_SHARED.contains(&n) => return ProcInode { fs: self.fs, node: Node::Pid(p) }.lookup(n),
             (Node::NsDir(p), n) => Node::NsLink(p, NS_KINDS.iter().position(|k| *k == n).ok_or(-ENOENT)? as u8),
             (Node::FdDir(p), _) => {
                 let n = num.ok_or(-ENOENT)? as usize;
@@ -1328,7 +1652,7 @@ impl Inode for ProcInode {
                 add("kmsg".into(), Node::Kmsg);
                 add("sysstat".into(), Node::Sysstat);
                 add("modules".into(), Node::Modules);
-                add("net".into(), Node::NetDir);
+                add("net".into(), Node::NetLink);
                 add("sysvipc".into(), Node::SysvipcDir);
                 if !crate::parts::off(crate::parts::Part::Aiproc) {
                     add("ai".into(), Node::AiDir);
@@ -1419,6 +1743,28 @@ impl Inode for ProcInode {
                 add("oom_score".into(), Node::OomScore(p));
                 add("oom_adj".into(), Node::OomAdj(p));
                 add("oom_score_adj".into(), Node::OomScoreAdj(p));
+                add("auxv".into(), Node::Auxv(p));
+                add("syscall".into(), Node::Syscall(p));
+                add("sched".into(), Node::Sched(p));
+                add("smaps_rollup".into(), Node::SmapsRollup(p));
+                add("mountstats".into(), Node::Mountstats(p));
+                add("timens_offsets".into(), Node::TimensOffsets(p));
+                add("clear_refs".into(), Node::ClearRefs(p));
+                add("projid_map".into(), Node::IdMap(p, 3));
+                add("net".into(), Node::NetDir);
+                add("mem".into(), Node::Mem(p));
+                add("pagemap".into(), Node::Pagemap(p));
+                add("map_files".into(), Node::MapFilesDir(p));
+            }
+            // ptrace で読める人だけ (proc_map_files_readdir: EACCES)
+            Node::MapFilesDir(p) => {
+                aa_ptrace(p, true)?;
+                let l = leader(p)?;
+                let pt = &l.mm().pt;
+                let _h = pt.hold();
+                for (s, e, ..) in pt.file_maps() {
+                    add(format!("{:x}-{:x}", s, e), Node::MapFile(p, s, e));
+                }
             }
             Node::AttrDir(p, a) => {
                 for (k, n) in ATTRS.iter().enumerate() {
@@ -1435,8 +1781,16 @@ impl Inode for ProcInode {
                 }
             }
             Node::Task(p, t) => {
-                for (i, n) in ["stat", "status", "comm"].iter().enumerate() {
+                for (i, n) in TASK_FILES.iter().enumerate() {
                     add((*n).into(), Node::TaskFile(p, t, i as u8));
+                }
+                let pd = ProcInode { fs: self.fs, node: Node::Pid(p) };
+                for n in TASK_SHARED {
+                    if let Ok(i) = pd.lookup(n)
+                        && let Some(c) = i.as_any().downcast_ref::<ProcInode>()
+                    {
+                        add(n.into(), c.node);
+                    }
                 }
             }
             Node::NsDir(p) => {

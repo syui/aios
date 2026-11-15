@@ -594,6 +594,27 @@ test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のペ�
   (持っているページ + oom_score_adj × 全部のページ / 1000) のいちばん大きいものを選び、-1000 は選ばない (Linux はスワップに
   出したページとページ表も足す)。長さ 0 の write は Linux と同じく書き手まで (EINVAL: vfs の writes_empty)。
   test/procknobs.c は Linux 7.4 と 15 行同じ
+- 見せるもの (procfs.rs): auxv (exec で積んだものを Mm に。auxv そのものも Linux の create_elf_tables と同じ順と中身に
+  した: AT_SYSINFO_EHDR と AT_MINSIGSTKSZ が先、AT_FLAGS、AT_HWCAP3、AT_PLATFORM ("aarch64")。前は AT_UID、AT_EUID、AT_GID、
+  AT_EGID がいつも 0 だった)、syscall (いま入っているシステムコールの番号と引数と sp と pc。trap.rs が入るたびに印をつける。
+  ほかの入り方は -1、走れるものは running)、sched (Linux と同じ名前と形。切りかわりの数は自分から (眠った) と、走れるまま
+  ゆずったものを数えるようにした。PELT の平均はないので 0)、smaps_rollup (Pss_Anon と Pss_File も)、mountstats、projid_map
+  (ケーパビリティなしで 1 度だけ書ける)、timens_offsets (時間の namespace はないので init のもの: 書けば EPERM か EACCES)、
+  clear_refs (1〜5 を受けつけるだけ)、/proc/PID/net (/proc/net は Linux と同じく self/net へのリンクに)。test/procfiles.c は
+  Linux 7.4 と 21 行同じ
+- maps (vm.rs の maps_text_named): ファイルを写した領域に major:minor と inode の番号 (前は 00:00 0)、名前の前を 73 けた目まで
+  そろえ (seq_pad)、[heap] (brk の範囲)、[stack]、[vvar]、[vdso]。vDSO の値 (周波数と起動したときの秒) は、Linux と同じく
+  vDSO のすぐ前の読むだけのページ ([vvar]) に分けた (前は vDSO のコードと同じ r-x のページの終わり)
+- mem (FOLL_FORCE なし: 手本の Linux は PROC_MEM_NO_FORCE。領域の許しのとおり読み書きし、書けない写しと PROT_NONE と写って
+  いないところは EIO、ページの終わりをまたぐ読みは読めたところまで。開くのは ptrace の ATTACH ができる人: EACCES)、pagemap
+  (8 バイトの倍数、present、swapped、file、exclusive、PFN は CAP_SYS_ADMIN だけ。番地の上の 8 ビットはタグとして外す)、
+  map_files (ファイルを写した領域の はじめ-終わり。readlink はだれでも、たどって開くのは CAP_SYS_ADMIN (vfs の may_follow:
+  EPERM)、root がたどると写しているファイルそのもの)。test/procmem.c は Linux 7.4 と 12 行同じ。ちがい: aios の tmpfs の
+  ページは、ファイルシステムと写しの両方が参照を持つので、pagemap の exclusive (写しているのが 1 つ) がずれることがある
+- task/TID: Linux と同じ 36 の名前 (スレッドごとのものは stat、status、comm、syscall、sched、personality。ほかはプロセスのもの)。
+  test/procpid.c は /proc/self (41) と task/TID (36) のならびと種類と許可が Linux 7.4 と同じ (stack は手本にないので見ない)
+- まだ: cgroup、io、wchan、schedstat、coredump_filter、timers など (手本の Linux の設定にもない)、vDSO の
+  __kernel_getrandom (Linux 7.4 にはある: test/vdso.c の 2 行)
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

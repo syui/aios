@@ -548,6 +548,9 @@ const UC_MCONTEXT: usize = 176;
 const MC_RESERVED: usize = 288;
 const RESERVED: usize = 4096;
 const FRAME: usize = FRAME_INFO + UC_MCONTEXT + MC_RESERVED + RESERVED + 16;
+/// シグナルを受けるのに要るスタック (auxv の AT_MINSIGSTKSZ: Linux の signal_minsigstksz と同じく、枠 + frame_record の
+/// 16 + そろえの 16)
+pub const MINSIGSTKSZ: usize = FRAME + 16 + 16;
 const FPSIMD_MAGIC: u32 = 0x4650_8001;
 const FPSIMD_SIZE: usize = 528;
 

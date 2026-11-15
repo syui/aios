@@ -2360,20 +2360,47 @@ impl PageTable {
     /// /proc/PID/maps (Linux と同じ形)。パスは / から (中では先頭の / なしで持っている。
     /// VLC などは自分の行の最初の / から先を自分のディレクトリと見る)
     pub fn maps_text(&self) -> alloc::string::String {
+        self.maps_text_named(MapNames::default())
+    }
+
+    /// /proc/PID/maps (Linux の show_map_vma と同じ形): ファイルを写した領域は major:minor と inode の番号、名前の前は
+    /// 73 けた目までそろえる。名前のない領域は n の [heap] (brk の範囲にかかるもの)、[stack] (はじめのスタックの番地を
+    /// ふくむもの)、[vdso]
+    pub fn maps_text_named(&self, n: MapNames) -> alloc::string::String {
         let mut out = alloc::string::String::new();
         for (&s, v) in self.vmas.iter() {
-            let off = match &v.back {
-                Backing::File { off, .. } => *off,
-                _ => 0,
-            };
-            let r = if v.prot & PROT_READ != 0 { 'r' } else { '-' };
-            let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
-            let x = if v.prot & PROT_EXEC != 0 { 'x' } else { '-' };
-            let p = if v.shared { 's' } else { 'p' };
-            let name = v.name.as_deref().map_or(alloc::string::String::new(), |n| alloc::format!("/{}", n.trim_start_matches('/')));
-            out.push_str(&alloc::format!("{:08x}-{:08x} {}{}{}{} {:08x} 00:00 0 {}\n", s, v.end, r, w, x, p, off, name));
+            out.push_str(&self.map_line(s, v, n));
+            out.push('\n');
         }
         out
+    }
+
+    fn map_line(&self, s: usize, v: &Vma, n: MapNames) -> alloc::string::String {
+        let (off, dev, ino) = match &v.back {
+            Backing::File { off, ino, .. } => (*off, crate::vfs::fs_dev(ino.id().0), ino.meta().ino),
+            _ => (0, (0, 0), 0),
+        };
+        let r = if v.prot & PROT_READ != 0 { 'r' } else { '-' };
+        let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
+        let x = if v.prot & PROT_EXEC != 0 { 'x' } else { '-' };
+        let p = if v.shared { 's' } else { 'p' };
+        let name = match v.name.as_deref() {
+            Some(f) => alloc::format!("/{}", f.trim_start_matches('/')),
+            None if s < n.brk && v.end > n.start_brk => "[heap]".into(),
+            None if s <= n.start_stack && v.end >= n.start_stack && n.start_stack != 0 => "[stack]".into(),
+            None if s == n.vdso && n.vdso != 0 => "[vdso]".into(),
+            None if s == n.vvar && n.vvar != 0 => "[vvar]".into(),
+            None => alloc::string::String::new(),
+        };
+        let mut l = alloc::format!("{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {} ", s, v.end, r, w, x, p, off, dev.0, dev.1, ino);
+        if !name.is_empty() {
+            while l.len() < 72 {
+                l.push(' ');
+            }
+            l.push(' ');
+            l.push_str(&name);
+        }
+        l
     }
 
     /// /proc/PID/smaps (Linux の fs/proc/task_mmu.c の show_smap と同じ形): maps の行のあとに、領域のページの数を kB で。
@@ -2384,10 +2411,193 @@ impl PageTable {
     /// ページを持たないもの (/dev/fb0 などの Pages: Linux の VM_PFNMAP) は 0。透明な大きいページ、KSM、hugetlb、mlock、
     /// MADV_FREE で捨てられるページ (aios の MADV_FREE は何もしない) は aios にないので 0。redis は起きるとき、fork した子で
     /// 書いた無名のページの Shared_Dirty を見て (arm64 の古いカーネルのバグを調べる)、読めなければ起きない
-    pub fn smaps_text(&self) -> alloc::string::String {
+    /// /proc/PID/smaps_rollup (Linux の show_smaps_rollup): はじめの領域のはじめから終わりの領域の終わりまでを 1 行目
+    /// (---p 00000000 00:00 0 と [rollup])、smaps の数をみな足したもの。Pss は無名 / ファイル / 共有メモリに分ける
+    /// (aios はページキャッシュにないものを無名、あるものをファイル。共有メモリの分はない)
+    pub fn smaps_rollup_text(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let (first, last) = match (self.vmas.keys().next(), self.vmas.values().last()) {
+            (Some(&s), Some(v)) => (s, v.end),
+            _ => return alloc::string::String::new(),
+        };
+        // (rss, sc, sd, pc, pd, rf, anon, swap) はバイト、(pss, pss_dirty, pss_anon, pss_file) は 12 ビットの端数つき
+        let mut t = [0u64; 12];
+        for (&s, v) in &self.vmas {
+            if matches!(v.back, Backing::Pages { .. }) {
+                continue;
+            }
+            self.each_entry(s, v.end, |va, pte| {
+                let e = unsafe { *pte };
+                let pg = PGSIZE as u64;
+                if is_swap(e) {
+                    t[7] += pg;
+                    return;
+                }
+                let page = page_of(e);
+                let cached = match &v.back {
+                    Backing::File { ino, off, .. } => shared_file().get(&file_key(ino, off + (va - s))).filter(|c| c.page == page).map(|c| c.dirty),
+                    _ => None,
+                };
+                let refs = kalloc::refs(page) as u64;
+                let (mapcount, dirty) = match cached {
+                    Some(d) => (refs.saturating_sub(1).max(1), d || e & PTE_RDONLY == 0),
+                    None => (refs.max(1), true),
+                };
+                t[0] += pg;
+                if cached.is_none() {
+                    t[6] += pg;
+                }
+                if e & PTE_AF != 0 {
+                    t[5] += pg;
+                }
+                let share = (pg << 12) / mapcount;
+                t[8] += share;
+                if dirty {
+                    t[9] += share;
+                }
+                t[if cached.is_none() { 10 } else { 11 }] += share;
+                match (mapcount >= 2, dirty) {
+                    (true, true) => t[2] += pg,
+                    (true, false) => t[1] += pg,
+                    (false, true) => t[4] += pg,
+                    (false, false) => t[3] += pg,
+                }
+            });
+        }
+        let mut out = alloc::format!("{:08x}-{:08x} ---p 00000000 00:00 0 ", first, last);
+        while out.len() < 73 {
+            out.push(' ');
+        }
+        out.push_str("[rollup]\n");
+        let kb = |b: u64| b >> 10;
+        let rows: [(&str, u64); 22] = [
+            ("Rss:", kb(t[0])),
+            ("Pss:", t[8] >> 22),
+            ("Pss_Dirty:", t[9] >> 22),
+            ("Pss_Anon:", t[10] >> 22),
+            ("Pss_File:", t[11] >> 22),
+            ("Pss_Shmem:", 0),
+            ("Shared_Clean:", kb(t[1])),
+            ("Shared_Dirty:", kb(t[2])),
+            ("Private_Clean:", kb(t[3])),
+            ("Private_Dirty:", kb(t[4])),
+            ("Referenced:", kb(t[5])),
+            ("Anonymous:", kb(t[6])),
+            ("KSM:", 0),
+            ("LazyFree:", 0),
+            ("AnonHugePages:", 0),
+            ("ShmemPmdMapped:", 0),
+            ("FilePmdMapped:", 0),
+            ("Shared_Hugetlb:", 0),
+            ("Private_Hugetlb:", 0),
+            ("Swap:", kb(t[7])),
+            ("SwapPss:", kb(t[7])),
+            ("Locked:", 0),
+        ];
+        for (k, n) in rows {
+            let _ = writeln!(out, "{:<16}{:>8} kB", k, n);
+        }
+        out
+    }
+
+    /// /proc/PID/mem (Linux の access_remote_vm。FOLL_FORCE なし: 手本の Linux の PROC_MEM_NO_FORCE と同じ): 領域の許しの
+    /// とおり、読めるところだけ読み、書けるところだけ書く。止まったところまでのバイト数
+    pub fn read_remote(&mut self, mut va: usize, buf: &mut [u8]) -> usize {
+        let mut done = 0;
+        while done < buf.len() {
+            if !self.find(va).is_some_and(|(_, v)| v.prot & PROT_READ != 0) {
+                break;
+            }
+            let Some(pa) = self.user_pa(va, false, false) else { break };
+            let n = (PGSIZE - (va & (PGSIZE - 1))).min(buf.len() - done);
+            unsafe { core::ptr::copy_nonoverlapping(p2v(pa) as *const u8, buf[done..].as_mut_ptr(), n) };
+            done += n;
+            va += n;
+        }
+        done
+    }
+
+    pub fn write_remote(&mut self, mut va: usize, buf: &[u8]) -> usize {
+        let mut done = 0;
+        while done < buf.len() {
+            if !self.find(va).is_some_and(|(_, v)| v.prot & PROT_WRITE != 0) {
+                break;
+            }
+            let Some(pa) = self.user_pa(va, true, false) else { break };
+            let n = (PGSIZE - (va & (PGSIZE - 1))).min(buf.len() - done);
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf[done..].as_ptr(), p2v(pa) as *mut u8, n);
+                sync_icache(p2v(pa), n);
+            }
+            done += n;
+            va += n;
+        }
+        done
+    }
+
+    /// /proc/PID/pagemap の 1 ページの 8 バイト (Linux の pte_to_pagemap_entry): 63 present、62 swapped、61 file (ページ
+    /// キャッシュのページか共有の無名)、56 exclusive (写しているのが 1 つだけ)、PFN は show_pfn のときだけ (CAP_SYS_ADMIN)
+    pub fn pagemap_entry(&self, va: usize, show_pfn: bool) -> u64 {
+        let Some((s, v)) = self.find(va) else { return 0 };
+        if matches!(v.back, Backing::Pages { .. }) {
+            return 0;
+        }
+        let mut out = 0u64;
+        let va = va & !(PGSIZE - 1);
+        self.each_entry(va, va + PGSIZE, |_, pte| {
+            let e = unsafe { *pte };
+            if is_swap(e) {
+                out = 1 << 62;
+                return;
+            }
+            let page = page_of(e);
+            let cached = match &v.back {
+                Backing::File { ino, off, .. } => shared_file().get(&file_key(ino, off + (va - s))).is_some_and(|c| c.page == page),
+                _ => false,
+            };
+            let refs = kalloc::refs(page) as u64;
+            let mapcount = if cached { refs.saturating_sub(1) } else { refs };
+            out = 1 << 63;
+            // ファイルのページ: ページキャッシュのものか、ファイルの領域でまだ写していない (書けない PTE の) もの (aios は
+            // ページキャッシュを持たないファイル (tmpfs) の私有の写しを、はじめから自分のページに読む)
+            let file_page = cached || (matches!(v.back, Backing::File { .. }) && e & PTE_RDONLY != 0);
+            // ページキャッシュにないファイルのページ (tmpfs のもの) も、ファイルシステムが 1 つ持っている
+            let mapcount = if file_page && !cached { refs.saturating_sub(1).max(1) } else { mapcount };
+            if file_page || v.shared {
+                out |= 1 << 61;
+            }
+            if mapcount == 1 {
+                out |= 1 << 56;
+            }
+            if show_pfn {
+                out |= ((e & PTE_ADDR) >> 12) & ((1 << 55) - 1);
+            }
+        });
+        out
+    }
+
+    /// ファイルを写した領域 (/proc/PID/map_files): (はじめ, 終わり, 読める, 書ける (共有で書ける), パス, inode)
+    pub fn file_maps(&self) -> Vec<(usize, usize, bool, bool, alloc::string::String, InodeRef)> {
+        self.vmas
+            .iter()
+            .filter_map(|(&s, v)| match &v.back {
+                Backing::File { ino, .. } => Some((
+                    s,
+                    v.end,
+                    v.prot & PROT_READ != 0,
+                    v.shared && v.prot & PROT_WRITE != 0,
+                    v.name.as_deref().map_or(alloc::string::String::new(), |n| alloc::format!("/{}", n.trim_start_matches('/'))),
+                    ino.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn smaps_text(&self, names: MapNames) -> alloc::string::String {
         use core::fmt::Write;
         let mut out = alloc::string::String::new();
-        let maps = self.maps_text();
+        let maps = self.maps_text_named(names);
         for ((&s, v), line) in self.vmas.iter().zip(maps.lines()) {
             // (Rss、Shared_Clean、Shared_Dirty、Private_Clean、Private_Dirty、Referenced、Anonymous、Swap) はバイト、
             // pss と pss_dirty は 12 ビットの端数つき
@@ -3754,6 +3964,17 @@ impl Drop for PageTable {
         free_level(self.root, 1, false);
         release_shared_ranges(&files);
     }
+}
+
+/// maps の名前のない領域の名前の手がかり (Linux の get_vma_name: [heap] は brk の範囲、[stack] ははじめのスタック、
+/// [vdso])。0 はなし。exec と vDSO を知っている procfs が渡す
+#[derive(Clone, Copy, Default)]
+pub struct MapNames {
+    pub start_brk: usize,
+    pub brk: usize,
+    pub start_stack: usize,
+    pub vdso: usize,
+    pub vvar: usize,
 }
 
 /// ページ表のテーブルのページの数 (根もふくむ。/proc/meminfo の PageTables)
