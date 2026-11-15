@@ -123,6 +123,11 @@ pub trait Inode {
     fn page_cacheable(&self) -> bool {
         false
     }
+    /// 長さ 0 の write も write_at に渡す (Linux の proc のファイルは 0 バイトでも書き手が呼ばれ、数として読めなければ
+    /// EINVAL。ふつうのファイルは generic_write_checks で何もせず 0)
+    fn writes_empty(&self) -> bool {
+        false
+    }
     /// パスの答えを覚えてよいか (名前が勝手に変わらないもの: ext4、tmpfs)。名前や属性を変えるときは dir_changed を呼ぶこと
     /// 中身 (meta) が変わるたびに statc::ino_bump を呼ぶので、大きなロックなしの stat (statc.rs) が答えてよい
     // [lockless]

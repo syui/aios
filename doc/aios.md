@@ -569,6 +569,31 @@ Anonymous、Swap と SwapPss、THPeligible、VmFlags。何人で写している�
 test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のページを fork した子が読む) は、Linux 7.4 と Referenced の 1 行
 のほかは同じ: Linux は fork のとき子の PTE を old にする (pte_mkold) が、aios は AF をハードウェアで立てない (TCR.HA なし)
 ので、old にすると子が触るたびにフォルトになる。aios の子は AF のまま (Referenced がそのぶん多い)
+
+/proc/PID の Linux にあって aios になかったもの (2026-11-15、todo.json の proc-pid。手本の Linux の test/linux.config では
+/proc/self に 41 こ、aios は 24 こだった。cgroup、io、wchan などは手本の Linux にもない) を、下のしくみから順に:
+
+- rlimit (proc.rs の rlimit / set_rlimit、syscall.rs の do_prlimit): 16 の表をスレッドグループで 1 つ (代表スレッドに。変えた
+  ときだけヒープに)。はじめは Linux の INIT_RLIMITS (STACK 8 MiB、CORE 0、NOFILE 1024:4096、MEMLOCK 8 MiB、MSGQUEUE 819200、
+  NPROC と SIGPENDING はメモリのページ / 32 / 2)。fork と exec で受けつぐ。getrlimit、setrlimit (前はなかった)、prlimit64
+  (前は pid を見なかった: Linux の順で new の EFAULT、ESRCH、同じ人か CAP_SYS_RESOURCE (EPERM)、ない番号とソフト > ハード
+  (EINVAL)、NOFILE の nr_open (1048576) より上 (EPERM)、ハードを上げる (EPERM)、old の EFAULT は変えたあと)。
+  /proc/PID/limits は Linux と同じ形。/proc/PID/status の SigQ の上限は SIGPENDING。守るのは NOFILE (fd の表。65536 まで)
+  だけで、ほか (FSIZE の SIGXFSZ、CPU の SIGXCPU、NPROC の fork、AS、STACK など) は覚えて見せるだけ。aios の init は
+  systemd の DefaultLimitNOFILE と同じ 1024:524288 にする。test/rlimit.c は Linux 7.4 と 52 行同じ
+- personality (前はシステムコールがなかった): スレッドごと、fork で受けつぐ、exec で READ_IMPLIES_EXEC を外す (arm64 の
+  SET_PERSONALITY)、setuid / setgid の exec で PER_CLEAR_ON_SETID を外す。PER_LINUX32 は CPU に 32 ビットの EL0 があれば
+  受けつける (ID_AA64PFR0_EL1: Linux の system_supports_32bit_el0。QEMU の cortex-a72 と max はある)。uname は COMPAT のない
+  Linux と同じく aarch64 のまま。覚えて返すだけ (ADDR_NO_RANDOMIZE などの効きめはない)。/proc/PID/personality (0400、ptrace の
+  ATTACH)
+- タイマーのゆとり: prctl の PR_SET_TIMERSLACK / PR_GET_TIMERSLACK と /proc/PID/timerslack_ns (0666、ほかのプロセスは
+  CAP_SYS_NICE)。はじめ 50000 ns、0 は fork したときの値にもどす。aios のタイマーは使わない
+- oom_score_adj (-1000..1000) と下限 (Linux の signal->oom_score_adj と _min): /proc/PID/oom_score_adj、oom_adj (-17..15。
+  1000 / 17 倍、はじめて書くと kmsg に deprecated)、oom_score ((1000 + badness × 1000 / 全部のページ) × 2 / 3)。下限より
+  下げるのは CAP_SYS_RESOURCE (EACCES)、それを持つ人が書くと下限もその値。OOM のとき (oom.rs) も Linux と同じく badness
+  (持っているページ + oom_score_adj × 全部のページ / 1000) のいちばん大きいものを選び、-1000 は選ばない (Linux はスワップに
+  出したページとページ表も足す)。長さ 0 の write は Linux と同じく書き手まで (EINVAL: vfs の writes_empty)。
+  test/procknobs.c は Linux 7.4 と 15 行同じ
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

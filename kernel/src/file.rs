@@ -1335,7 +1335,7 @@ impl OpenFile {
             Kind::Inode(ino, path) => {
                 // 0 バイトは何もしない (終わりのずっと先にいても伸ばさない。O_APPEND でも動かない: Linux の
                 // generic_write_checks)
-                if src.is_empty() {
+                if src.is_empty() && !ino.writes_empty() {
                     return Ok(0);
                 }
                 let append = append.unwrap_or(self.flags & O_APPEND != 0);

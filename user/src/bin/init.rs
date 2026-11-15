@@ -406,6 +406,10 @@ fn main() {
         eprintln!("init: must be run as pid 1");
         std::process::exit(1);
     }
+    // 開けるファイルの数: systemd の DefaultLimitNOFILE と同じ 1024:524288 (カーネルのはじめは Linux と同じ 1024:4096。
+    // 多く開くもの (Go のランタイムなど) はソフトをハードまで上げる)。サービスもログインもこれを受けつぐ
+    let nofile = libc::rlimit { rlim_cur: 1024, rlim_max: 524288 };
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) };
     // ホスト名: /etc/hostname をカーネルに (uname の nodename。aios apply の host.name も変える)
     if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
         let h = h.trim();

@@ -20,6 +20,45 @@ pub const NPROC: usize = 512;
 pub const NOFILE: usize = 65536;
 /// はじめのソフトの上限 (Linux と同じ 1024。setrlimit で NOFILE まで上げられる)
 pub const NOFILE_SOFT: usize = 1024;
+
+/// rlimit の種類の数と番号 (Linux の RLIM_NLIMITS と RLIMIT_*)
+pub const RLIM_NLIMITS: usize = 16;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIMIT_SIGPENDING: usize = 11;
+/// RLIMIT_NOFILE のハードの上限の上限 (Linux の fs.nr_open の既定 1024 * 1024)。fd の表はそれでも NOFILE まで
+pub const NR_OPEN: u64 = 1024 * 1024;
+
+/// Linux の max_threads (set_max_threads): メモリのページ / (8 * THREAD_SIZE / PAGE_SIZE)、20 から FUTEX_TID_MASK まで。
+/// THREAD_SIZE は arm64 の 16 KiB
+fn max_threads() -> u64 {
+    let pg = crate::memlayout::PGSIZE as u64;
+    (crate::memlayout::ram_size() as u64 / pg / (8 * 16384 / pg)).clamp(20, 0x3fff_ffff)
+}
+
+/// はじめの rlimit: Linux の INIT_RLIMITS ([ソフト, ハード])。NPROC と SIGPENDING は fork_init と同じく max_threads / 2
+pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
+    const INF: u64 = RLIM_INFINITY;
+    let half = max_threads() / 2;
+    [
+        [INF, INF],              // CPU
+        [INF, INF],              // FSIZE
+        [INF, INF],              // DATA
+        [8 << 20, INF],          // STACK (_STK_LIM)
+        [0, INF],                // CORE
+        [INF, INF],              // RSS
+        [half, half],            // NPROC
+        [1024, 4096],            // NOFILE (INR_OPEN_CUR、INR_OPEN_MAX)
+        [8 << 20, 8 << 20],      // MEMLOCK (MLOCK_LIMIT)
+        [INF, INF],              // AS
+        [INF, INF],              // LOCKS
+        [half, half],            // SIGPENDING
+        [819200, 819200],        // MSGQUEUE (MQ_BYTES_MAX)
+        [0, 0],                  // NICE
+        [0, 0],                  // RTPRIO
+        [INF, INF],              // RTTIME
+    ]
+}
 const KSTACK_SIZE: usize = 16 * 1024;
 
 /// カーネルのスタックの全部のバイト (/proc/ai/mem)
@@ -389,6 +428,20 @@ pub struct Proc {
     pub orig_x0: u64,
     /// setitimer の (期限, 間隔) と POSIX タイマー (代表スレッドに置く)
     pub itimer: (u64, u64),
+    /// rlimit (Linux の signal_struct の rlim: スレッドグループで 1 つ。代表スレッドに置く: rlimit / set_rlimit)。
+    /// None ならはじめの値 (default_rlimits)。表 (NPROC) に 256 バイトずつ持たないように、変えたときにヒープに
+    pub rlim: Option<alloc::boxed::Box<[[u64; 2]; RLIM_NLIMITS]>>,
+    /// OOM のときの選ばれやすさ (-1000..1000) とその下限 (CAP_SYS_RESOURCE なしで下げられるところ。Linux の
+    /// signal->oom_score_adj と oom_score_adj_min: 代表スレッドに置く。fork で受けつぐ。oom.rs と /proc/PID/oom_score_adj)
+    pub oom_score_adj: i16,
+    pub oom_score_adj_min: i16,
+    /// personality (Linux の task->personality: スレッドごと。fork で受けつぐ。aios は覚えて返すだけ: personality と
+    /// /proc/PID/personality)
+    pub personality: u32,
+    /// タイマーのゆとり (ns: prctl の PR_SET_TIMERSLACK と /proc/PID/timerslack_ns) と、0 にしたときにもどす値 (fork した
+    /// ときの親の値)。aios のタイマーはゆとりを使わない (覚えて返すだけ)
+    pub timer_slack_ns: u64,
+    pub default_slack_ns: u64,
     pub timers: Vec<PosixTimer>,
     /// 親が SIGCHLD を無視しているので、終わったらすぐ片付ける
     autoreap: bool,
@@ -552,6 +605,12 @@ impl Proc {
         sid: 0,
         orig_x0: 0,
         itimer: (0, 0),
+        rlim: None,
+        oom_score_adj: 0,
+        oom_score_adj_min: 0,
+        personality: 0,
+        timer_slack_ns: 50_000,
+        default_slack_ns: 50_000,
         timers: Vec::new(),
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
@@ -680,6 +739,14 @@ impl Proc {
 
     fn load_image(&mut self, img: Image) {
         self.execed = true;
+        // personality: arm64 の SET_PERSONALITY は READ_IMPLIES_EXEC を外す。setuid / setgid で人が変わるときは
+        // PER_CLEAR_ON_SETID も (Linux の bprm->per_clear)
+        const READ_IMPLIES_EXEC: u32 = 0x040_0000;
+        const PER_CLEAR_ON_SETID: u32 = READ_IMPLIES_EXEC | 0x004_0000 | 0x020_0000 | 0x010_0000;
+        self.personality &= !READ_IMPLIES_EXEC;
+        if (img.setuid.is_some() || img.setgid.is_some()) && !self.cred.no_new_privs && self.cred.ns.user.is_none() {
+            self.personality &= !PER_CLEAR_ON_SETID;
+        }
         self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1 }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
@@ -1092,6 +1159,51 @@ pub fn live() -> impl Iterator<Item = &'static mut Proc> {
 }
 
 /// いまのプロセスのユーザーのメモリへ写す・から写す (Linux の copy_to_user と copy_from_user)。写せなければ EFAULT
+/// p のスレッドグループの rlimit r ([ソフト, ハード]: 代表スレッドの表。代表がゾンビでも)
+pub fn rlimit(p: &Proc, r: usize) -> [u64; 2] {
+    let l = if p.thread { find_leader_any(p.tgid) } else { None };
+    let t = l.map_or(&p.rlim, |l| &l.rlim);
+    t.as_ref().map_or_else(|| default_rlimits()[r], |t| t[r])
+}
+
+/// p のスレッドグループの (oom_score_adj, oom_score_adj_min)
+pub fn oom_adj(p: &Proc) -> (i16, i16) {
+    let l = if p.thread { find_leader_any(p.tgid) } else { None };
+    let l: &Proc = l.map_or(p, |l| &*l);
+    (l.oom_score_adj, l.oom_score_adj_min)
+}
+
+/// p のスレッドグループの oom_score_adj (と min) を変える
+pub fn set_oom_adj(p: &mut Proc, adj: i16, min: Option<i16>) {
+    let l = if p.thread { find_leader_any(p.tgid) } else { None };
+    let l = match l {
+        Some(l) => l,
+        None => p,
+    };
+    l.oom_score_adj = adj;
+    if let Some(m) = min {
+        l.oom_score_adj_min = m;
+    }
+}
+
+/// p のスレッドグループの rlimit r を変える。NOFILE のソフトは fd の表の上限 (Files::nofile。NOFILE まで) にも
+pub fn set_rlimit(p: &mut Proc, r: usize, v: [u64; 2]) {
+    if r == RLIMIT_NOFILE
+        && let Some(f) = p.files.as_ref()
+    {
+        f.get().nofile = v[0].min(NOFILE as u64) as usize;
+    }
+    let l = match p.thread {
+        true => find_leader_any(p.tgid),
+        false => None,
+    };
+    let l = match l {
+        Some(l) => l,
+        None => p,
+    };
+    l.rlim.get_or_insert_with(|| alloc::boxed::Box::new(default_rlimits()))[r] = v;
+}
+
 pub fn put_user(va: usize, b: &[u8]) -> Result<(), i64> {
     current().pt().copy_out(va, b).ok_or(-14)
 }
@@ -2043,6 +2155,21 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     child.sync_cred_work();
     child.comm = parent.comm;
     child.spec_ssb = parent.spec_ssb;
+    // rlimit と oom_score_adj はプロセスが受けつぐ (Linux の copy_signal)。スレッドは代表のものを使う
+    if !thread {
+        let l = if parent.thread { find_leader_any(parent.tgid) } else { None };
+        let l: &Proc = match l {
+            Some(l) => l,
+            None => parent,
+        };
+        child.rlim = l.rlim.clone();
+        child.oom_score_adj = l.oom_score_adj;
+        child.oom_score_adj_min = l.oom_score_adj_min;
+    }
+    // personality とタイマーのゆとりはスレッドごと (copy_process: ゆとりの既定は親のいまの値)
+    child.personality = parent.personality;
+    child.timer_slack_ns = parent.timer_slack_ns;
+    child.default_slack_ns = parent.timer_slack_ns;
     child.thread = thread;
     if thread {
         child.tgid = parent.tgid;

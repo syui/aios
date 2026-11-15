@@ -7,6 +7,7 @@
 //   /proc/PID/environ   環境 (同じく。自分のものか root だけ)
 //   /proc/PID/statm     メモリ (ページ): size resident shared text lib data dt
 //   /proc/PID/smaps     maps の行ごとに、ページの数 (Rss、Pss、Shared / Private の Clean / Dirty、Swap など: vm.rs の smaps_text)
+//   /proc/PID/limits    rlimit の表 (Linux と同じ形)
 //   /proc/PID/cwd       -> カレントディレクトリ
 //   /proc/PID/fd/N      -> 開いているもの (ttyname はこれを読む)
 //   /proc/mounts, /proc/uptime, /proc/meminfo, /proc/cmdline (カーネルのコマンドライン), /proc/cpuinfo
@@ -100,6 +101,15 @@ enum Node {
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
+    /// /proc/PID/limits (rlimit の表: Linux の proc_pid_limits)
+    Limits(u32),
+    /// /proc/PID/personality (%08x。ptrace の ATTACH ができる人だけ)、timerslack_ns (タイマーのゆとり)
+    Personality(u32),
+    TimerSlack(u32),
+    /// /proc/PID/oom_score (選ばれやすさ 0..2000 の 2/3: oom::score)、oom_adj (昔の -17..15)、oom_score_adj (-1000..1000)
+    OomScore(u32),
+    OomAdj(u32),
+    OomScoreAdj(u32),
     /// /proc/PID/loginuid と sessionid (ログインした人とそのセッション: audit.rs)
     LoginUid(u32),
     SessionId(u32),
@@ -172,6 +182,27 @@ fn leader(pid: u32) -> Result<&'static mut Proc, i64> {
 }
 
 /// kstrtou32 (10 進): 頭の + と、終わりの改行 1 つはよい。数字がない・ほかの文字は EINVAL、大きすぎれば ERANGE
+/// oom_adj を書いて Linux と同じく 1 度だけ kmsg に知らせた
+static OOM_ADJ_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Linux の kstrtoint (基数 0: 0x は 16 進、0 で始まれば 8 進。+ と - をつけられる。i32 におさまらなければ None)
+fn kstrtoint(s: &str) -> Option<i32> {
+    let (neg, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()?
+    } else if s.len() > 1 && s.starts_with('0') {
+        u64::from_str_radix(&s[1..], 8).ok()?
+    } else {
+        s.parse::<u64>().ok()?
+    };
+    let v = if neg { -(v as i128) } else { v as i128 };
+    i32::try_from(v).ok()
+}
+
 fn kstrtou32(b: &[u8]) -> Result<u32, i64> {
     const ERANGE: i64 = 34;
     let b = b.strip_prefix(b"+").unwrap_or(b);
@@ -261,6 +292,12 @@ impl ProcInode {
             Node::PidMounts(p) => (p as u64) << 16 | 15,
             Node::MountInfo(p) => (p as u64) << 16 | 26,
             Node::LoginUid(p) => (p as u64) << 16 | 27,
+            Node::Limits(p) => (p as u64) << 16 | 0x60,
+            Node::Personality(p) => (p as u64) << 16 | 0x61,
+            Node::TimerSlack(p) => (p as u64) << 16 | 0x62,
+            Node::OomScore(p) => (p as u64) << 16 | 0x63,
+            Node::OomAdj(p) => (p as u64) << 16 | 0x64,
+            Node::OomScoreAdj(p) => (p as u64) << 16 | 0x65,
             Node::SessionId(p) => (p as u64) << 16 | 28,
             Node::IdMap(p, k) => (p as u64) << 16 | (16 + k as u64),
             Node::TaskDir(p) => (p as u64) << 16 | 20,
@@ -294,7 +331,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) => Some(p),
             _ => None,
         }
     }
@@ -541,6 +578,27 @@ impl ProcInode {
                 crate::ns::Uname::Linux => format!("Linux version {} (rustc) {}\n", crate::ns::release(), crate::ns::version()),
             },
             Node::Comm(pid) => format!("{}\n", leader_any(pid)?.comm()),
+            Node::Limits(pid) => limits_text(leader_any(pid)?),
+            // lock_trace (ptrace の ATTACH: できなければ EPERM)
+            Node::Personality(pid) => {
+                aa_ptrace(pid, false)?;
+                format!("{:08x}\n", leader(pid)?.personality)
+            }
+            // 自分 (代表スレッド) でなければ CAP_SYS_NICE (proc_pid_timerslack_ns_show)
+            Node::TimerSlack(pid) => {
+                let p = leader(pid)?;
+                if p.pid != proc::current().pid && !crate::cred::current().capable(crate::cred::CAP_SYS_NICE) {
+                    return Err(-EPERM);
+                }
+                format!("{}\n", p.timer_slack_ns)
+            }
+            Node::OomScore(pid) => format!("{}\n", crate::oom::score(leader_any(pid)?)),
+            // oom_score_adj を -17..15 に (1000 は 15)
+            Node::OomAdj(pid) => {
+                let adj = proc::oom_adj(leader_any(pid)?).0 as i32;
+                format!("{}\n", if adj == 1000 { 15 } else { adj * 17 / 1000 })
+            }
+            Node::OomScoreAdj(pid) => format!("{}\n", proc::oom_adj(leader_any(pid)?).0),
             // 改行なし (Linux の proc_loginuid_read と proc_sessionid_read)
             Node::LoginUid(pid) => format!("{}", crate::ns::show_uid_raw(leader(pid)?.cred.loginuid)),
             Node::SessionId(pid) => format!("{}", leader(pid)?.cred.sessionid),
@@ -576,6 +634,40 @@ impl ProcInode {
             _ => return Err(-EISDIR),
         })
     }
+}
+
+/// /proc/PID/limits (Linux の proc_pid_limits と同じ形: 名前 25、ソフトとハード 20、単位 10 の左寄せ)
+fn limits_text(p: &Proc) -> String {
+    const NAMES: [(&str, &str); proc::RLIM_NLIMITS] = [
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max resident set", "bytes"),
+        ("Max processes", "processes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max address space", "bytes"),
+        ("Max file locks", "locks"),
+        ("Max pending signals", "signals"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    let f = |x: u64| if x == proc::RLIM_INFINITY { "unlimited".to_string() } else { x.to_string() };
+    let mut s = format!("{:<25} {:<20} {:<20} {:<10}\n", "Limit", "Soft Limit", "Hard Limit", "Units");
+    for (i, (name, unit)) in NAMES.iter().enumerate() {
+        let v = proc::rlimit(p, i);
+        s += &format!("{:<25} {:<20} {:<20} ", name, f(v[0]), f(v[1]));
+        if unit.is_empty() {
+            s.push('\n');
+        } else {
+            s += &format!("{:<10}\n", unit);
+        }
+    }
+    s
 }
 
 /// プロセスのメモリの [start, end) (引数や環境の文字列。64 KiB まで)
@@ -858,7 +950,9 @@ impl Inode for ProcInode {
                 let (r, w) = f.map_or((false, false), |f| f.try_borrow().map_or((true, false), |f| (f.readable(), f.writable())));
                 S_IFLNK | (if r { 0o500 } else { 0 }) | (if w { 0o300 } else { 0 })
             }
-            Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) | Node::Comm(_) => S_IFREG | 0o644,
+            Node::Strace | Node::Bkl | Node::IdMap(..) | Node::LoginUid(_) | Node::Comm(_) | Node::OomAdj(_) | Node::OomScoreAdj(_) => S_IFREG | 0o644,
+            Node::TimerSlack(_) => S_IFREG | 0o666,
+            Node::Personality(_) => S_IFREG | 0o400,
             Node::TaskFile(_, _, 2) => S_IFREG | 0o644,
             // 持ち主だけが読む (Linux の S_IRUSR のもの)
             Node::Environ(_) | Node::Stack(_) => S_IFREG | 0o400,
@@ -908,6 +1002,11 @@ impl Inode for ProcInode {
     }
 
     fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
+        // 0 バイト (writes_empty で来る): Linux の書き手が数として読むもの (oom_score_adj、oom_adj、timerslack_ns、loginuid:
+        // EINVAL) と comm (空の名前に) だけ書き手へ。ほか (/proc/sys は proc_dointvec と同じく) 何もせず 0
+        if b.is_empty() && !matches!(self.node, Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2)) {
+            return Ok(0);
+        }
         // /proc/PID/comm と task/TID/comm (comm_write): 同じスレッドグループのものだけ (ほかは EINVAL)。はじめの 15 バイト
         // まで (改行もそのまま: Linux と同じ)
         if let Node::Comm(pid) | Node::TaskFile(pid, _, 2) = self.node {
@@ -933,6 +1032,49 @@ impl Inode for ProcInode {
             let v = kstrtou32(&b[..b.len().min(34)])?;
             let uid = if v == u32::MAX { v } else { crate::ns::take_uid(v)? };
             crate::audit::set_loginuid(uid)?;
+            return Ok(b.len());
+        }
+        // /proc/PID/oom_score_adj と oom_adj (oom_score_adj_write、oom_adj_write、__set_oom_adj): はじめの 12 バイトを
+        // 前後の空白を除いて kstrtoint (0x と 0 の基数も)。-1000..1000 (oom_adj は -17..15 を 1000 / 17 倍、15 は 1000) の外は
+        // EINVAL。下限 (oom_adj は今の値) より下げるのは CAP_SYS_RESOURCE だけ (EACCES)。それを持つ人が oom_score_adj を
+        // 書くと下限もその値に
+        if let Node::OomScoreAdj(pid) | Node::OomAdj(pid) = self.node {
+            let legacy = matches!(self.node, Node::OomAdj(_));
+            let s = core::str::from_utf8(&b[..b.len().min(12)]).map_err(|_| crate::why::inval())?.trim();
+            let v = kstrtoint(s).ok_or_else(crate::why::inval)?;
+            let adj = if legacy {
+                if !(-17..=15).contains(&v) {
+                    return Err(crate::why::inval());
+                }
+                if v == 15 { 1000 } else { v * 1000 / 17 }
+            } else {
+                if !(-1000..=1000).contains(&v) {
+                    return Err(crate::why::inval());
+                }
+                v
+            };
+            let t = leader(pid)?;
+            let (cur, min) = proc::oom_adj(t);
+            let cap = crate::cred::current().capable(crate::cred::CAP_SYS_RESOURCE);
+            if (adj as i16) < if legacy { cur } else { min } && !cap {
+                return Err(-EACCES);
+            }
+            if legacy && !OOM_ADJ_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                let me = proc::current();
+                crate::println!("{} ({}): /proc/{}/oom_adj is deprecated, please use /proc/{}/oom_score_adj instead.", me.comm(), me.pid, t.tgid, t.tgid);
+            }
+            proc::set_oom_adj(t, adj as i16, (!legacy && cap).then_some(adj as i16));
+            return Ok(b.len());
+        }
+        // /proc/PID/timerslack_ns (proc_pid_set_timer_slack_ns): 10 進。自分でなければ CAP_SYS_NICE。0 は fork したときの値
+        if let Node::TimerSlack(pid) = self.node {
+            let s = core::str::from_utf8(b).map_err(|_| crate::why::inval())?;
+            let v = s.strip_suffix('\n').unwrap_or(s).parse::<u64>().map_err(|_| crate::why::inval())?;
+            let t = leader(pid)?;
+            if t.pid != proc::current().pid && !crate::cred::current().capable(crate::cred::CAP_SYS_NICE) {
+                return Err(-EPERM);
+            }
+            t.timer_slack_ns = if v == 0 { t.default_slack_ns } else { v };
             return Ok(b.len());
         }
         // /proc/PID/attr/current と exec: AppArmor の change_profile (自分のものだけ: Linux も current でなければ EACCES)
@@ -992,6 +1134,10 @@ impl Inode for ProcInode {
         Err(-EACCES)
     }
 
+    fn writes_empty(&self) -> bool {
+        true
+    }
+
     fn truncate(&self, _: usize) -> Result<(), i64> {
         // > /proc/strace (O_TRUNC) は受けつける
         let sys = matches!(self.node, Node::Sys(i) if crate::sysctl::TABLE[i as usize].may_write());
@@ -999,7 +1145,7 @@ impl Inode for ProcInode {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2)) {
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_)) {
             return Ok(());
         }
         Err(-EACCES)
@@ -1121,6 +1267,12 @@ impl Inode for ProcInode {
             (Node::Pid(p), "ns") => Node::NsDir(p),
             (Node::Pid(p), "attr") => Node::AttrDir(p, false),
             (Node::Pid(p), "loginuid") => Node::LoginUid(p),
+            (Node::Pid(p), "limits") => Node::Limits(p),
+            (Node::Pid(p), "personality") => Node::Personality(p),
+            (Node::Pid(p), "timerslack_ns") => Node::TimerSlack(p),
+            (Node::Pid(p), "oom_score") => Node::OomScore(p),
+            (Node::Pid(p), "oom_adj") => Node::OomAdj(p),
+            (Node::Pid(p), "oom_score_adj") => Node::OomScoreAdj(p),
             (Node::Pid(p), "sessionid") => Node::SessionId(p),
             (Node::AttrDir(p, false), "apparmor") => Node::AttrDir(p, true),
             (Node::AttrDir(p, a), _) => Node::Attr(p, a, ATTRS.iter().position(|x| *x == name).ok_or(-ENOENT)? as u8),
@@ -1261,6 +1413,12 @@ impl Inode for ProcInode {
                 add("attr".into(), Node::AttrDir(p, false));
                 add("loginuid".into(), Node::LoginUid(p));
                 add("sessionid".into(), Node::SessionId(p));
+                add("limits".into(), Node::Limits(p));
+                add("personality".into(), Node::Personality(p));
+                add("timerslack_ns".into(), Node::TimerSlack(p));
+                add("oom_score".into(), Node::OomScore(p));
+                add("oom_adj".into(), Node::OomAdj(p));
+                add("oom_score_adj".into(), Node::OomScoreAdj(p));
             }
             Node::AttrDir(p, a) => {
                 for (k, n) in ATTRS.iter().enumerate() {

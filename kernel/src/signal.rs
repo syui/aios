@@ -260,7 +260,7 @@ fn discard(p: &mut Proc, mask: u64) {
 }
 
 /// /proc/PID/status のシグナルの行 (SigQ、SigPnd、ShdPnd、SigBlk、SigIgn、SigCgt: Linux の task_sig)。leader は見る
-/// スレッド、shared はスレッドグループのみなのプロセスに来たもの。SigQ の上限は getrlimit と同じく決めない (最大)
+/// スレッド、shared はスレッドグループのみなのプロセスに来たもの。SigQ の上限は RLIMIT_SIGPENDING のソフト (Linux と同じ)
 pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String {
     let (mut ign, mut cgt) = (0u64, 0u64);
     for sig in 1..NSIG as i32 {
@@ -273,7 +273,7 @@ pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String 
     alloc::format!(
         "SigQ:\t{}/{}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n",
         queued,
-        u64::MAX,
+        crate::proc::rlimit(p, crate::proc::RLIMIT_SIGPENDING)[0],
         p.sig_pending,
         shared,
         p.sig_mask,

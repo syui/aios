@@ -12,7 +12,9 @@ use crate::memlayout::PGSIZE;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
+const ESRCH: i64 = 3;
 const E2BIG: i64 = 7;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -187,6 +189,8 @@ nrs! {
     SETHOSTNAME = 161,
     UNSHARE = 97,
     GETRLIMIT = 163,
+    SETRLIMIT = 164,
+    PERSONALITY = 92,
     UMASK = 166,
     GETTIMEOFDAY = 169,
     GETPID = 172,
@@ -646,8 +650,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETHOSTNAME => sys_sethostname(a[0] as usize, a[1] as usize),
         REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
         SYSINFO => sys_sysinfo(a[0] as usize),
-        GETRLIMIT => sys_prlimit(a[0], 0, a[1] as usize),
-        PRLIMIT64 => sys_prlimit(a[1], a[2] as usize, a[3] as usize),
+        GETRLIMIT => sys_getrlimit(a[0] as u32, a[1] as usize),
+        SETRLIMIT => sys_setrlimit(a[0] as u32, a[1] as usize),
+        PERSONALITY => sys_personality(a[0] as u32),
+        PRLIMIT64 => sys_prlimit(a[0] as i32, a[1] as u32, a[2] as usize, a[3] as usize),
 
         BRK => Ok(sys_brk(a[0] as usize)),
         MMAP => sys_mmap(a[0] as usize, a[1] as usize, a[2], a[3], int(a[4]), a[5] as usize),
@@ -1062,38 +1068,99 @@ fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
     Ok(8)
 }
 
-/// getrlimit / prlimit64 (自分のプロセスだけ)。変えられるのは RLIMIT_NOFILE のソフトの上限
-fn sys_prlimit(resource: u64, new: usize, old: usize) -> R {
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NOFILE: u64 = 7;
-    const INF: u64 = u64::MAX;
-    const EPERM: i64 = 1;
-    let files = proc::current().files();
-    // 先に今の値 (old) を読んでから変える
-    let (cur, max) = match resource {
-        RLIMIT_STACK => (8 * 1024 * 1024, INF),
-        RLIMIT_NOFILE => (files.nofile as u64, proc::NOFILE as u64),
-        _ => (INF, INF),
-    };
-    if new != 0 && resource == RLIMIT_NOFILE {
-        let mut b = [0u8; 16];
-        proc::current().pt().copy_in(&mut b, new).ok_or(-EFAULT)?;
-        let ncur = u64::from_le_bytes(b[..8].try_into().unwrap());
-        let nmax = u64::from_le_bytes(b[8..].try_into().unwrap());
-        if ncur > nmax {
+/// rlimit を読み、new があれば変える (Linux の do_prlimit): ない番号は EINVAL、ソフトがハードより上は EINVAL、NOFILE の
+/// ハードが nr_open より上は EPERM、ハードを上げるのは CAP_SYS_RESOURCE (init の user namespace で) だけ。前の値を返す。
+/// 守るのは NOFILE (fd の表) だけ。ほかは覚えて見せるだけ (FSIZE の SIGXFSZ、CPU の SIGXCPU、NPROC の fork などはまだ)
+fn do_prlimit(t: &mut proc::Proc, resource: u32, new: Option<[u64; 2]>) -> Result<[u64; 2], i64> {
+    let r = resource as usize;
+    if r >= proc::RLIM_NLIMITS {
+        return Err(crate::why::inval());
+    }
+    if let Some(v) = new {
+        if v[0] > v[1] {
             return Err(crate::why::inval());
         }
-        // ハードの上限は上げられない (RLIM_INFINITY は上限そのものとみなす)
-        if nmax != INF && nmax > proc::NOFILE as u64 && nmax > max {
+        if r == proc::RLIMIT_NOFILE && v[1] > proc::NR_OPEN {
             return Err(-EPERM);
         }
-        files.nofile = ncur.min(proc::NOFILE as u64).max(3) as usize;
     }
+    let old = proc::rlimit(t, r);
+    if let Some(v) = new {
+        if v[1] > old[1] && !cred::current().capable(cred::CAP_SYS_RESOURCE) {
+            return Err(-EPERM);
+        }
+        proc::set_rlimit(t, r, v);
+    }
+    Ok(old)
+}
+
+/// personality (arm64_personality): 0xffffffff は読むだけ。PER_LINUX32 は CPU に 32 ビットの EL0 がなければ EINVAL
+/// (ID_AA64PFR0_EL1 の EL0 が 2: Linux の system_supports_32bit_el0。aios は 32 ビットのプログラムを動かさないが、印は
+/// 覚える。uname は COMPAT のない Linux と同じく aarch64 のまま)。前の値を返す
+fn sys_personality(per: u32) -> R {
+    const PER_LINUX32: u32 = 0x0008;
+    if per & 0xff == PER_LINUX32 {
+        let pfr0: u64;
+        unsafe { core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0) };
+        if pfr0 & 0xf != 2 {
+            return Err(crate::why::inval());
+        }
+    }
+    let p = proc::current();
+    let old = p.personality;
+    if per != u32::MAX {
+        p.personality = per;
+    }
+    Ok(old as i64)
+}
+
+fn rlim_bytes(v: [u64; 2]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&v[0].to_le_bytes());
+    b[8..].copy_from_slice(&v[1].to_le_bytes());
+    b
+}
+
+fn get_rlim(va: usize) -> Result<[u64; 2], i64> {
+    let mut b = [0u8; 16];
+    proc::get_user(va, &mut b)?;
+    Ok([u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap())])
+}
+
+fn sys_getrlimit(resource: u32, old: usize) -> R {
+    let v = do_prlimit(proc::current(), resource, None)?;
+    out(old, &rlim_bytes(v))?;
+    Ok(0)
+}
+
+fn sys_setrlimit(resource: u32, new: usize) -> R {
+    let v = get_rlim(new)?;
+    do_prlimit(proc::current(), resource, Some(v))?;
+    Ok(0)
+}
+
+/// prlimit64 (Linux の順: new を読む (EFAULT)、pid (0 は自分。ESRCH)、check_prlimit_permission (自分のスレッドでなければ、
+/// uid と euid と suid が呼んだ人の uid、gid と egid と sgid が gid か、CAP_SYS_RESOURCE。でなければ EPERM)、do_prlimit、
+/// old を書く (EFAULT でも new は変わったまま))
+fn sys_prlimit(pid: i32, resource: u32, new: usize, old: usize) -> R {
+    let nv = if new != 0 { Some(get_rlim(new)?) } else { None };
+    let me = proc::current();
+    let t = if pid == 0 {
+        me
+    } else {
+        let g = crate::ns::to_global(pid as u32).filter(|_| pid > 0).ok_or(-ESRCH)?;
+        proc::find_thread(g).ok_or(-ESRCH)?
+    };
+    if t.pid != proc::current().pid {
+        let (c, tc) = (cred::current(), &t.cred);
+        let same = c.uid == tc.euid && c.uid == tc.suid && c.uid == tc.uid && c.gid == tc.egid && c.gid == tc.sgid && c.gid == tc.gid;
+        if !same && !c.capable(cred::CAP_SYS_RESOURCE) {
+            return Err(-EPERM);
+        }
+    }
+    let v = do_prlimit(t, resource, nv)?;
     if old != 0 {
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&cur.to_le_bytes());
-        b[8..].copy_from_slice(&max.to_le_bytes());
-        out(old, &b)?;
+        out(old, &rlim_bytes(v))?;
     }
     Ok(0)
 }
@@ -1877,7 +1944,8 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
     }
 }
 
-/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)、dumpable。
+/// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)、dumpable、
+/// タイマーのゆとり (PR_SET/GET_TIMERSLACK)。
 /// ほかは何もしない
 fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_SPECULATION_CTRL: u64 = 52;
@@ -1890,8 +1958,13 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_NO_NEW_PRIVS: u64 = 39;
     const PR_GET_DUMPABLE: u64 = 3;
     const PR_SET_DUMPABLE: u64 = 4;
+    const PR_GET_TIMERSLACK: u64 = 30;
+    const PR_SET_TIMERSLACK: u64 = 29;
     let p = proc::current();
     match op {
+        // タイマーのゆとり: 0 なら fork したときの値にもどす (Linux の prctl。aios のタイマーは使わない)
+        PR_SET_TIMERSLACK => p.timer_slack_ns = if arg == 0 { p.default_slack_ns } else { arg as u64 },
+        PR_GET_TIMERSLACK => return Ok(p.timer_slack_ns as i64),
         // 持ちもの (mm) の dumpable (pidfd.rs: PIDFD_GET_INFO の coredump の印、pidfd_getfd の許し)。つけられるのは 0 と 1
         PR_GET_DUMPABLE => return Ok(p.mm().dumpable as i64),
         PR_SET_DUMPABLE => {
