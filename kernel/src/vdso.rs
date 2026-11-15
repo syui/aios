@@ -74,8 +74,18 @@ vdso_gettimeofday:
     mov     x16, x30
     bl      vdso_now
     mov     x30, x16
-    add     x13, x13, x12
-    mov     x15, #1000
+    tbnz    x12, #63, 8f        // 壁の時計の差が負: システムコールで
+    lsr     x15, x12, #30       // 差の秒
+    add     x13, x13, x15
+    and     x12, x12, #0x3fffffff   // 差の ns
+    add     x14, x14, x12
+    movz    x15, #0xca00
+    movk    x15, #0x3b9a, lsl #16   // 1e9
+    cmp     x14, x15
+    b.lo    6f
+    sub     x14, x14, x15
+    add     x13, x13, #1
+6:  mov     x15, #1000
     udiv    x14, x14, x15       // µs
     stp     x13, x14, [x0]
 7:  mov     x0, #0
@@ -101,14 +111,24 @@ vdso_clock_gettime:
     b.eq    1f
     cmp     x0, #5
     b.ne    2f
-1:  add     x13, x13, x12
+1:  tbnz    x12, #63, 9f        // 壁の時計の差が負: システムコールで
+    lsr     x15, x12, #30       // 差の秒
+    add     x13, x13, x15
+    and     x12, x12, #0x3fffffff   // 差の ns
+    add     x14, x14, x12
+    movz    x15, #0xca00
+    movk    x15, #0x3b9a, lsl #16   // 1e9
+    cmp     x14, x15
+    b.lo    2f
+    sub     x14, x14, x15
+    add     x13, x13, #1
 2:  stp     x13, x14, [x1]
     mov     x0, #0
     ret
 9:  mov     x8, #113            // clock_gettime
     svc     #0
     ret
-// 起動からの秒 (x13) と ns (x14)、起動したときの UNIX 秒 (x12)。x9 から x15 だけを使う
+// 起動からの秒 (x13) と ns (x14)、壁の時計との差 (x12: 秒 << 30 | ns、負なら最上位のビット)。x9 から x15 だけを使う
 .global vdso_now
 vdso_now:
     adr     x9, vdso_now
@@ -117,7 +137,7 @@ vdso_now:
     isb
     mrs     x10, cntvct_el0
     ldr     x11, [x9]           // 周波数
-    ldr     x12, [x9, #8]       // 起動したときの UNIX 秒
+    ldr     x12, [x9, #8]       // 壁の時計との差 (秒 << 30 | ns)
     udiv    x13, x10, x11       // 秒 = cnt / f
     msub    x14, x13, x11, x10  // 余り
     movz    x15, #0xca00
@@ -191,6 +211,21 @@ fn put16(p: &mut [u8], o: usize, v: u16) {
 fn put32(p: &mut [u8], o: usize, v: u32) {
     p[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
+/// vvar の 8 バイト目: 壁の時計と起動からの時計の差を、秒 (上の 34 ビット) と ns (下の 30 ビット) にして 1 語で (読む
+/// 途中で変わっても、ちぐはぐにならない)。差が負なら最上位のビットだけ (vDSO はシステムコールへ)
+fn pack_real(off: u64) -> u64 {
+    if (off as i64) < 0 { 1 << 63 } else { (off / 1_000_000_000) << 30 | off % 1_000_000_000 }
+}
+
+/// 壁の時計を合わせたとき (timer::set_realtime): vvar の差を書きかえる (どのプロセスも同じページを写している)
+pub fn set_real_off(off: u64) {
+    let v = VVAR.val();
+    if v.is_null() {
+        return;
+    }
+    unsafe { core::ptr::write_volatile(v.add(8) as *mut u64, pack_real(off)) };
+}
+
 fn put64(p: &mut [u8], o: usize, v: u64) {
     p[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
@@ -361,7 +396,7 @@ pub fn init() {
     let v = unsafe { core::slice::from_raw_parts_mut(vvar, PGSIZE) };
     v.fill(0);
     put64(v, 0, crate::timer::freq());
-    put64(v, 8, crate::timer::boot_epoch());
+    put64(v, 8, pack_real(crate::timer::real_off()));
     VVAR.set(vvar);
     // 命令として読めるように、キャッシュを掃き出す
     let mut a = page as usize;

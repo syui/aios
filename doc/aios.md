@@ -666,8 +666,17 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   進める (CFS の vruntime と同じ考え): CPU より多い忙しいループで nice 0 と nice 19 は 2435 対 40 tick (Linux の重みは
   1024 対 15)。FIFO / RR / DEADLINE は覚えて答えるだけで、回し方は CFS のまま。/proc/PID/stat の priority・nice・
   rt_priority・policy と /proc/PID/sched の se.load.weight・policy・prio・se.slice も
+- 時計を合わせる (test/settime.c、Linux と root でない形 9 行、root の形 15 行同じ): settimeofday、clock_settime、adjtimex、
+  clock_adjtime と gettimeofday の tz。Linux と同じ順 (時刻がおかしければ EINVAL、それから CAP_SYS_TIME: tz だけでも
+  EPERM、tz は ±15 時間、合わせられるのは CLOCK_REALTIME だけ、CPU の時計は EPERM か EINVAL、clock_adjtime のほかの時計は
+  EOPNOTSUPP)。壁の時計は timer::REAL_OFF (起動からの時計との差、ns) になり、set_realtime で変える (細かい時刻の床も同じ
+  だけ動かす)。vDSO の vvar も差を 1 語 (秒 << 30 | ns) で持ち、合わせればどのプロセスの vDSO もすぐ見る (差が負なら
+  システムコールへ)。adjtimex は Linux の ntp.c の値を覚えて答える (status は STA_UNSYNC から、maxerror は 1 秒ごとに
+  500 増え、時計を合わせると ntp_clear、答えは TIME_ERROR (5) か TIME_OK)。ADJ_SETOFFSET は時計を動かす。周波数や
+  オフセットで時計の進みを変えること (slew)、TAI の差を CLOCK_TAI に足すこと、壁の時計で決めたタイマーを合わせなおす
+  こと (clock_was_set) はまだ
 - のこり (Linux にあって aios で ENOSYS): removexattr の 3 つと *xattrat (aios は xattr をまだ持たない: list は 0、get は
-  ENODATA、set は EOPNOTSUPP)、settimeofday・clock_settime・adjtimex・clock_adjtime、syslog (dmesg)、ptrace、SysV の msg と
+  ENODATA、set は EOPNOTSUPP)、syslog (dmesg)、ptrace、SysV の msg と
   sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
   futex_requeue、mseal、file_getattr・file_setattr、listns など

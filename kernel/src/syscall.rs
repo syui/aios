@@ -243,6 +243,10 @@ nrs! {
     SETPRIORITY = 140,
     GETPRIORITY = 141,
     SCHED_SETATTR = 274,
+    CLOCK_SETTIME = 112,
+    SETTIMEOFDAY = 170,
+    ADJTIMEX = 171,
+    CLOCK_ADJTIME = 266,
     SCHED_GETATTR = 275,
     MPROTECT = 226,
     MSYNC = 227,
@@ -657,7 +661,11 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLOCK_NANOSLEEP => sys_clock_nanosleep(a[0], a[1], a[2] as usize, a[3] as usize),
         CLOCK_GETTIME => sys_clock_gettime(a[0], a[1] as usize),
         CLOCK_GETRES => sys_clock_getres(a[0], a[1] as usize),
-        GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
+        GETTIMEOFDAY => sys_gettimeofday(a[0] as usize, a[1] as usize),
+        SETTIMEOFDAY => sys_settimeofday(a[0] as usize, a[1] as usize),
+        CLOCK_SETTIME => sys_clock_settime(a[0] as i32, a[1] as usize),
+        ADJTIMEX => sys_adjtimex(a[0] as usize),
+        CLOCK_ADJTIME => sys_clock_adjtime(a[0] as i32, a[1] as usize),
         UNAME => sys_uname(a[0] as usize),
         SETHOSTNAME => sys_set_uts(a[0] as usize, a[1], false),
         SETDOMAINNAME => sys_set_uts(a[0] as usize, a[1], true),
@@ -1049,7 +1057,7 @@ fn sys_clock_getres(clk: u64, ts: usize) -> R {
     Ok(0)
 }
 
-fn sys_gettimeofday(tv: usize) -> R {
+fn sys_gettimeofday(tv: usize, tz: usize) -> R {
     if tv != 0 {
         let ns = timer::epoch_ns();
         let mut b = [0u8; 16];
@@ -1057,7 +1065,292 @@ fn sys_gettimeofday(tv: usize) -> R {
         b[8..].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
         out(tv, &b)?;
     }
+    if tz != 0 {
+        let (w, d) = sys_tz();
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&w.to_le_bytes());
+        b[4..].copy_from_slice(&d.to_le_bytes());
+        out(tz, &b)?;
+    }
     Ok(0)
+}
+
+// ---- 時計を合わせる (Linux の kernel/time/time.c、posix-timers.c、ntp.c) ----
+
+const CAP_SYS_TIME: u32 = 25;
+
+/// settimeofday の tz (Linux の sys_tz: 分 (西へ) と夏時間の種類)。はじめは 0 0
+static SYS_TZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn sys_tz() -> (i32, i32) {
+    let v = SYS_TZ.load(core::sync::atomic::Ordering::Relaxed);
+    (v as u32 as i32, (v >> 32) as u32 as i32)
+}
+
+/// 時計を合わせる (Linux の do_sys_settimeofday64): 時刻がおかしければ EINVAL (秒が負、ns が 1 秒以上、遠すぎる先)、
+/// CAP_SYS_TIME がなければ EPERM (tz だけでも)、tz の分が ±15 時間の外なら EINVAL
+fn do_settime(ts: Option<(i64, i64)>, tz: Option<(i32, i32)>) -> R {
+    const TIME_SETTOD_SEC_MAX: i64 = 9_223_372_036 - 946_080_000;
+    if let Some((s, ns)) = ts {
+        if s < 0 || !(0..1_000_000_000).contains(&ns) || s >= TIME_SETTOD_SEC_MAX {
+            return Err(crate::why::inval());
+        }
+    }
+    if !proc::current().cred.capable(CAP_SYS_TIME) {
+        return Err(-EPERM);
+    }
+    if let Some((w, d)) = tz {
+        if !(-15 * 60..=15 * 60).contains(&w) {
+            return Err(crate::why::inval());
+        }
+        SYS_TZ.store(w as u32 as u64 | (d as u32 as u64) << 32, core::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some((s, ns)) = ts {
+        timer::set_realtime(s as u64 * 1_000_000_000 + ns as u64);
+        ntp_clear();
+    }
+    Ok(0)
+}
+
+/// 時計を合わせたら NTP の状態を消す (Linux の ntp_clear: 合わせていないことに)
+fn ntp_clear() {
+    let n = NTP.get();
+    n.status |= 0x40;
+    n.maxerror = 16_000_000;
+    n.esterror = 16_000_000;
+    n.adjust = 0;
+    n.offset = 0;
+}
+
+/// settimeofday (読めなければ EFAULT、µs が 0..1e6 の外か秒が負なら EINVAL)
+fn sys_settimeofday(tv: usize, tz: usize) -> R {
+    let pt = proc::current().pt();
+    let ts = if tv != 0 {
+        let mut b = [0u8; 16];
+        pt.copy_in(&mut b, tv).ok_or(-EFAULT)?;
+        let s = i64::from_le_bytes(b[..8].try_into().unwrap());
+        let us = i64::from_le_bytes(b[8..].try_into().unwrap());
+        if s < 0 || !(0..1_000_000).contains(&us) {
+            return Err(crate::why::inval());
+        }
+        Some((s, us * 1000))
+    } else {
+        None
+    };
+    let z = if tz != 0 {
+        let mut b = [0u8; 8];
+        pt.copy_in(&mut b, tz).ok_or(-EFAULT)?;
+        Some((i32::from_le_bytes(b[..4].try_into().unwrap()), i32::from_le_bytes(b[4..].try_into().unwrap())))
+    } else {
+        None
+    };
+    do_settime(ts, z)
+}
+
+/// clock_settime: 合わせられるのは CLOCK_REALTIME だけ (ほかの時計は EINVAL。CPU の時計は Linux と同じく、いなければ
+/// EINVAL、いれば EPERM)。読めなければ EFAULT
+fn sys_clock_settime(clk: i32, tp: usize) -> R {
+    if clk > 0 {
+        return Err(crate::why::inval());
+    }
+    let mut b = [0u8; 16];
+    proc::current().pt().copy_in(&mut b, tp).ok_or(-EFAULT)?;
+    if clk < 0 {
+        return if clk & 7 == 3 || timer::clock_of(clk, false).is_err() { Err(crate::why::inval()) } else { Err(-EPERM) };
+    }
+    do_settime(Some((i64::from_le_bytes(b[..8].try_into().unwrap()), i64::from_le_bytes(b[8..].try_into().unwrap()))), None)
+}
+
+/// NTP の値 (Linux の ntp.c の time_status、time_maxerror、time_esterror、time_constant、time_freq、time_offset、
+/// tick_usec、time_tai)。aios は覚えて答えるだけで、時計の進みは変えない (ADJ_SETOFFSET だけは時計を動かす)。
+/// maxerror は Linux と同じく 1 秒ごとに 500 µs ずつ増え、16 秒で STA_UNSYNC にもどる
+struct Ntp {
+    status: i32,
+    maxerror: i64,
+    maxerror_at: u64,
+    esterror: i64,
+    constant: i64,
+    freq: i64,
+    offset: i64,
+    tick: i64,
+    tai: i32,
+    adjust: i64,
+}
+
+static NTP: crate::cell::Bkl<Ntp> =
+    crate::cell::Bkl::new(Ntp { status: 0x40, maxerror: 16_000_000, maxerror_at: 0, esterror: 16_000_000, constant: 2, freq: 0, offset: 0, tick: 10_000, tai: 0, adjust: 0 });
+
+/// adjtimex の中身 (Linux の do_adjtimex): b は struct __kernel_timex (208 バイト)。答えは時計の状態 (TIME_OK 0、
+/// TIME_ERROR 5: 合わせていない)
+fn do_adjtimex(b: &mut [u8; 208]) -> R {
+    const ADJ_OFFSET: u32 = 0x1;
+    const ADJ_FREQUENCY: u32 = 0x2;
+    const ADJ_MAXERROR: u32 = 0x4;
+    const ADJ_ESTERROR: u32 = 0x8;
+    const ADJ_STATUS: u32 = 0x10;
+    const ADJ_TIMECONST: u32 = 0x20;
+    const ADJ_TAI: u32 = 0x80;
+    const ADJ_SETOFFSET: u32 = 0x100;
+    const ADJ_MICRO: u32 = 0x1000;
+    const ADJ_NANO: u32 = 0x2000;
+    const ADJ_TICK: u32 = 0x4000;
+    const ADJ_ADJTIME: u32 = 0x8000;
+    const ADJ_OFFSET_READONLY: u32 = 0x2000;
+    const STA_PLL: i32 = 0x1;
+    const STA_UNSYNC: i32 = 0x40;
+    const STA_CLOCKERR: i32 = 0x1000;
+    const STA_NANO: i32 = 0x2000;
+    const STA_RONLY: i32 = 0xff00;
+    const NTP_PHASE_LIMIT: i64 = 16_000_000;
+    const MAXFREQ_PPM: i64 = 32_768_000;
+    let g64 = |b: &[u8; 208], o: usize| i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let modes = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let cap = || proc::current().cred.capable(CAP_SYS_TIME);
+    // たしかめ (Linux の timekeeping_validate_timex)
+    if modes & ADJ_ADJTIME != 0 {
+        if modes & ADJ_OFFSET == 0 {
+            return Err(crate::why::inval());
+        }
+        if modes & ADJ_OFFSET_READONLY == 0 && !cap() {
+            return Err(-EPERM);
+        }
+    } else {
+        if modes != 0 && !cap() {
+            return Err(-EPERM);
+        }
+        if modes & ADJ_TICK != 0 && !(9000..=11000).contains(&g64(b, 88)) {
+            return Err(crate::why::inval());
+        }
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        if !cap() {
+            return Err(-EPERM);
+        }
+        let frac = g64(b, 80);
+        if frac < 0 || frac >= if modes & ADJ_NANO != 0 { 1_000_000_000 } else { 1_000_000 } {
+            return Err(crate::why::inval());
+        }
+    }
+    if modes & ADJ_FREQUENCY != 0 {
+        let f = g64(b, 16);
+        if f.checked_mul(65_536_000).is_none() {
+            return Err(crate::why::inval());
+        }
+    }
+    let n = NTP.get();
+    // maxerror は 1 秒ごとに 500 µs 増える (Linux の second_overflow)
+    let now_s = timer::uptime_ns() / 1_000_000_000;
+    if n.maxerror_at == 0 {
+        n.maxerror_at = now_s;
+    }
+    n.maxerror = (n.maxerror + 500 * (now_s - n.maxerror_at) as i64).min(NTP_PHASE_LIMIT);
+    n.maxerror_at = now_s;
+    if n.maxerror >= NTP_PHASE_LIMIT {
+        n.status |= STA_UNSYNC;
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        let (s, frac) = (g64(b, 72), g64(b, 80));
+        let delta = s as i128 * 1_000_000_000 + if modes & ADJ_NANO != 0 { frac } else { frac * 1000 } as i128;
+        let now = timer::epoch_ns() as i128 + delta;
+        if now < 0 {
+            return Err(crate::why::inval());
+        }
+        timer::set_realtime(now as u64);
+        ntp_clear();
+    }
+    let offset_out;
+    if modes & ADJ_ADJTIME != 0 {
+        offset_out = n.adjust;
+        if modes & ADJ_OFFSET_READONLY == 0 {
+            n.adjust = g64(b, 8);
+        }
+    } else {
+        if modes & ADJ_STATUS != 0 {
+            let st = i32::from_le_bytes(b[40..44].try_into().unwrap());
+            n.status = (n.status & STA_RONLY) | (st & !STA_RONLY);
+        }
+        if modes & ADJ_NANO != 0 {
+            n.status |= STA_NANO;
+        }
+        if modes & ADJ_MICRO != 0 {
+            n.status &= !STA_NANO;
+        }
+        if modes & ADJ_FREQUENCY != 0 {
+            n.freq = g64(b, 16).clamp(-MAXFREQ_PPM, MAXFREQ_PPM);
+        }
+        if modes & ADJ_MAXERROR != 0 {
+            n.maxerror = g64(b, 24).clamp(0, NTP_PHASE_LIMIT);
+        }
+        if modes & ADJ_ESTERROR != 0 {
+            n.esterror = g64(b, 32).clamp(0, NTP_PHASE_LIMIT);
+        }
+        if modes & ADJ_TIMECONST != 0 {
+            let mut c = g64(b, 48).clamp(0, 10);
+            if n.status & STA_NANO == 0 {
+                c += 4;
+            }
+            n.constant = c.clamp(0, 10);
+        }
+        if modes & ADJ_TAI != 0 {
+            let c = g64(b, 48);
+            if (0..=10_000_000).contains(&c) {
+                n.tai = c as i32;
+            }
+        }
+        if modes & ADJ_OFFSET != 0 && n.status & STA_PLL != 0 {
+            n.offset = g64(b, 8);
+        }
+        if modes & ADJ_TICK != 0 {
+            n.tick = g64(b, 88);
+        }
+        offset_out = if n.status & STA_PLL != 0 { n.offset } else { 0 };
+    }
+    let result = if n.status & (STA_UNSYNC | STA_CLOCKERR) != 0 { 5 } else { 0 };
+    let now = timer::epoch_ns();
+    let put = |b: &mut [u8; 208], o: usize, v: i64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    put(b, 8, offset_out);
+    put(b, 16, n.freq);
+    put(b, 24, n.maxerror);
+    put(b, 32, n.esterror);
+    b[40..44].copy_from_slice(&n.status.to_le_bytes());
+    put(b, 48, n.constant);
+    put(b, 56, 1);
+    put(b, 64, MAXFREQ_PPM);
+    put(b, 72, (now / 1_000_000_000) as i64);
+    put(b, 80, if n.status & STA_NANO != 0 { (now % 1_000_000_000) as i64 } else { (now % 1_000_000_000 / 1000) as i64 });
+    put(b, 88, n.tick);
+    for o in [96, 104, 120, 128, 136, 144, 152] {
+        put(b, o, 0);
+    }
+    b[112..116].copy_from_slice(&0i32.to_le_bytes());
+    b[160..164].copy_from_slice(&n.tai.to_le_bytes());
+    Ok(result)
+}
+
+/// adjtimex (読めなければ EFAULT。答えはエラーでも書きもどす: Linux と同じ)
+fn sys_adjtimex(p: usize) -> R {
+    let mut b = [0u8; 208];
+    let pt = proc::current().pt();
+    pt.copy_in(&mut b, p).ok_or(-EFAULT)?;
+    let r = do_adjtimex(&mut b);
+    out(p, &b)?;
+    r
+}
+
+/// clock_adjtime: CLOCK_REALTIME は adjtimex と同じ。ほかのある時計は EOPNOTSUPP、知らない時計は EINVAL。書きもどすのは
+/// うまくいったときだけ
+fn sys_clock_adjtime(clk: i32, p: usize) -> R {
+    let mut b = [0u8; 208];
+    proc::current().pt().copy_in(&mut b, p).ok_or(-EFAULT)?;
+    match clk {
+        0 => {}
+        1..=9 | 11 => return Err(-EOPNOTSUPP),
+        c if c < 0 && c & 7 != 3 => return Err(-EOPNOTSUPP),
+        _ => return Err(crate::why::inval()),
+    }
+    let r = do_adjtimex(&mut b)?;
+    out(p, &b)?;
+    Ok(r)
 }
 
 /// uname の nodename (sethostname で変わる。init が起動のときに /etc/hostname を入れる)

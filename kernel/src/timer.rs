@@ -23,10 +23,11 @@ fn rearm() {
     }
 }
 
-/// 起動したときの時刻 (UNIX 秒)。PL031 RTC があればそこから、なければ (ラズパイには
-/// RTC がない) カーネルを作った時刻から始める。
-/// UEFI から起動すると DTB の PL031 は disabled (ファームウェアの時計) だが、読むだけなのでそれも使う
-static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// 壁の時計と起動からの時計の差 (ns: CLOCK_REALTIME = これ + 起動からの時間。Linux の tk の offs_real)。はじめは起動した
+/// ときの時刻: PL031 RTC があればそこから、なければ (ラズパイには RTC がない) カーネルを作った時刻から。
+/// UEFI から起動すると DTB の PL031 は disabled (ファームウェアの時計) だが、読むだけなのでそれも使う。
+/// settimeofday、clock_settime、adjtimex の ADJ_SETOFFSET で変わる (set_realtime。負にもなりうるので足すのは wrapping)
+static REAL_OFF: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     // ACPI は PL031 を書かない (Linux は EFI の GetTime): QEMU の表 (OEM が BOCHS) なら virt の決まった場所
@@ -41,7 +42,7 @@ pub fn init() {
         Some(pa) => crate::mmio::r32(crate::memlayout::p2v(pa)) as u64,
         None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),
     };
-    BOOT_EPOCH.store(epoch.saturating_sub(uptime_ns() / 1_000_000_000), Ordering::Relaxed);
+    REAL_OFF.store((epoch * 1_000_000_000).saturating_sub(uptime_ns()), Ordering::Relaxed);
     COARSE.fetch_max(uptime_ns(), Ordering::Relaxed);
     crate::irq::enable(IRQ);
     crate::vdso::allow_counter();
@@ -90,7 +91,7 @@ pub fn coarse_uptime_ns() -> u64 {
 /// 粗い時計の UNIX ns: ファイルの時刻に (細かい時計でつけたものより前にはならない)
 // [lockless]
 pub fn coarse_epoch_ns() -> u64 {
-    (BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + coarse_uptime_ns()).max(FLOOR.load(Ordering::Relaxed))
+    REAL_OFF.load(Ordering::Relaxed).wrapping_add(coarse_uptime_ns()).max(FLOOR.load(Ordering::Relaxed))
 }
 
 /// 粗い時計の tick (ticks() と同じ数え方。時計を読まない)
@@ -106,14 +107,25 @@ pub fn stamp_ns() -> u64 {
     t
 }
 
-/// 起動したときの UNIX 秒 (vDSO の vvar に入れる)
-pub fn boot_epoch() -> u64 {
-    BOOT_EPOCH.load(Ordering::Relaxed)
+/// 壁の時計と起動からの時計の差 (ns。vDSO の vvar に入れる)
+pub fn real_off() -> u64 {
+    REAL_OFF.load(Ordering::Relaxed)
 }
 
 // [lockless]
 pub fn epoch_ns() -> u64 {
-    BOOT_EPOCH.load(Ordering::Relaxed) * 1_000_000_000 + uptime_ns()
+    REAL_OFF.load(Ordering::Relaxed).wrapping_add(uptime_ns())
+}
+
+/// 壁の時計を ns (UNIX) に合わせる (Linux の do_settimeofday64)。細かい時計でつけた時刻の床も同じだけ動かす (Linux の
+/// multigrain の床は起動からの時計で持つので、壁の時計を戻すといっしょに戻る)。vDSO の vvar にも。壁の時計で決めた
+/// タイマー (TIMER_ABSTIME の CLOCK_REALTIME の眠り、timerfd の CANCEL_ON_SET) はまだ合わせなおさない
+pub fn set_realtime(ns: u64) {
+    let new = ns.wrapping_sub(uptime_ns());
+    let old = REAL_OFF.swap(new, Ordering::SeqCst);
+    let delta = new.wrapping_sub(old);
+    let _ = FLOOR.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| Some(if f == 0 { 0 } else { f.wrapping_add(delta) }));
+    crate::vdso::set_real_off(new);
 }
 
 // ---- 時計 (clock_gettime / clock_getres / timer_create の clockid: Linux の posix_clocks と posix-cpu-timers) ----
