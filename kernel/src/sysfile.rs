@@ -3246,3 +3246,235 @@ pub fn exec_open(dirfd: i64, path: &str, follow: bool) -> Result<(String, InodeR
     }
     Ok((p, i))
 }
+
+// ---- 拡張属性 (Linux の fs/xattr.c と commoncap の inode_setxattr / removexattr) ----
+
+const XATTR_SIZE_MAX: usize = 65536;
+const XATTR_LIST_MAX: usize = 65536;
+const E2BIG: i64 = 7;
+const XA_ENODATA: i64 = 61;
+const CAP_SETFCAP: u32 = 31;
+
+/// 名前を写す (Linux の import_xattr_name: 0 バイトと 256 バイト以上は ERANGE、読めなければ EFAULT)
+fn xattr_name(p: usize) -> Result<String, i64> {
+    let pt = proc::current().pt();
+    match pt.copy_in_str(p, 255) {
+        Some(b) if !b.is_empty() => Ok(String::from_utf8_lossy(&b).into_owned()),
+        Some(_) => Err(-ERANGE),
+        None => {
+            let mut b = [0u8; 1];
+            if pt.copy_in(&mut b, p).is_none() { Err(-EFAULT) } else { Err(-ERANGE) }
+        }
+    }
+}
+
+/// Linux の xattr_permission: 書くなら変えられないファイル (chattr +i / +a) は EPERM。security.* と system.* は VFS では
+/// 見ない。trusted.* は CAP_SYS_ADMIN (なければ書くのは EPERM、読むのは ENODATA)。user.* はふつうのファイルとディレクトリ
+/// だけ (ほかは EPERM / ENODATA)、sticky なディレクトリに書くのは持ち主か CAP_FOWNER。それから inode の許し (EACCES)
+fn xattr_permission(ino: &InodeRef, name: &str, write: bool) -> Result<(), i64> {
+    let c = cred::current();
+    let m = ino.meta();
+    if write && (ino.immutable() || ino.fs_flags().is_ok_and(|f| f & 0x20 != 0)) {
+        return Err(-cred::EPERM);
+    }
+    if name.starts_with("security.") || name.starts_with("system.") {
+        return Ok(());
+    }
+    if name.starts_with("trusted.") {
+        if !c.capable(cred::CAP_SYS_ADMIN) {
+            return Err(if write { -cred::EPERM } else { -XA_ENODATA });
+        }
+        return Ok(());
+    }
+    if name.starts_with("user.") {
+        let t = m.mode & S_IFMT;
+        if t != vfs::S_IFREG && t != vfs::S_IFDIR {
+            return Err(if write { -cred::EPERM } else { -XA_ENODATA });
+        }
+        if t == vfs::S_IFDIR && m.mode & 0o1000 != 0 && write && m.uid != c.fsuid && !c.capable(cred::CAP_FOWNER) {
+            return Err(-cred::EPERM);
+        }
+    }
+    if !c.may(&m, if write { PW } else { PR }, false) {
+        return Err(-13);
+    }
+    Ok(())
+}
+
+/// security.* を変える・消す許し (commoncap): security.capability は CAP_SETFCAP、ほかは CAP_SYS_ADMIN
+fn xattr_security(name: &str) -> Result<(), i64> {
+    if !name.starts_with("security.") {
+        return Ok(());
+    }
+    let cap = if name == "security.capability" { CAP_SETFCAP } else { cred::CAP_SYS_ADMIN };
+    if !cred::current().capable(cap) {
+        return Err(-cred::EPERM);
+    }
+    Ok(())
+}
+
+/// xattr のシステムコールの相手: fd があればそれ (O_PATH や開いていないものは EBADF)、なければ dirfd と path (flags の
+/// AT_SYMLINK_NOFOLLOW と AT_EMPTY_PATH)。write なら読むだけのマウントは EROFS
+fn xattr_target(fd: Option<u64>, dirfd: i64, pathp: usize, flags: u64, write: bool) -> Result<InodeRef, i64> {
+    match fd {
+        Some(fd) => {
+            let f = file_of(fd)?;
+            if f.borrow().flags & file::O_PATH != 0 {
+                return Err(-EBADF);
+            }
+            if write {
+                writable_fd(fd)?;
+            }
+            inode_of(fd)
+        }
+        None => {
+            let ino = at(dirfd, pathp, flags)?;
+            if write {
+                writable_at(dirfd, pathp, flags)?;
+            }
+            Ok(ino)
+        }
+    }
+}
+
+/// 拡張属性が変わった (inotify の IN_ATTRIB)
+fn xattr_changed(fd: Option<u64>, dirfd: i64, pathp: usize) {
+    match fd {
+        Some(fd) => attrib_fd(fd),
+        None => attrib_at(dirfd, pathp),
+    }
+}
+
+/// setxattr、lsetxattr、fsetxattr、setxattrat (Linux と同じ順: flags、名前、大きさ (65536 をこえれば E2BIG)、値を写す、
+/// それから相手、security.capability の形 (EINVAL) と CAP_SETFCAP、xattr_permission、security.* の許し、ファイルシステム)
+pub fn setxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep: usize, value: usize, size: usize, flags: u64) -> R {
+    if flags & !3 != 0 {
+        return Err(crate::why::inval());
+    }
+    let name = xattr_name(namep)?;
+    if size > XATTR_SIZE_MAX {
+        return Err(-E2BIG);
+    }
+    let mut v = alloc::vec![0u8; size];
+    if size != 0 {
+        proc::current().pt().copy_in(&mut v, value).ok_or(-EFAULT)?;
+    }
+    let ino = xattr_target(fd, dirfd, pathp, at_flags, true)?;
+    if name == "security.capability" && size != 0 {
+        // vfs_caps の形 (Linux の validheader: 版 1 は 12 バイト、版 2 は 20、版 3 は 24)
+        let rev = if size >= 4 { u32::from_le_bytes(v[..4].try_into().unwrap()) & 0xff00_0000 } else { 0 };
+        if !matches!((size, rev), (12, 0x0100_0000) | (20, 0x0200_0000) | (24, 0x0300_0000)) {
+            return Err(crate::why::inval());
+        }
+    }
+    xattr_permission(&ino, &name, true)?;
+    xattr_security(&name)?;
+    ino.setxattr(&name, Some(&v), flags as u32)?;
+    xattr_changed(fd, dirfd, pathp);
+    Ok(0)
+}
+
+/// getxattr、lgetxattr、fgetxattr、getxattrat (大きさ 0 は値の大きさ、小さければ ERANGE、65536 より大きい buf は 65536 に)
+pub fn getxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep: usize, value: usize, size: usize) -> R {
+    let name = xattr_name(namep)?;
+    let ino = xattr_target(fd, dirfd, pathp, at_flags, false)?;
+    xattr_permission(&ino, &name, false)?;
+    let v = ino.getxattr(&name)?;
+    if size == 0 {
+        return Ok(v.len() as i64);
+    }
+    let room = size.min(XATTR_SIZE_MAX);
+    if v.len() > room {
+        return Err(if room >= XATTR_SIZE_MAX { -E2BIG } else { -ERANGE });
+    }
+    out(value, &v)?;
+    Ok(v.len() as i64)
+}
+
+/// listxattr、llistxattr、flistxattr、listxattrat: 名前を 0 で区切って。trusted.* は CAP_SYS_ADMIN のときだけ
+pub fn listxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, list: usize, size: usize) -> R {
+    let ino = xattr_target(fd, dirfd, pathp, at_flags, false)?;
+    let admin = cred::current().capable_noaudit(cred::CAP_SYS_ADMIN);
+    let mut b = Vec::new();
+    for n in ino.listxattr()? {
+        if n.starts_with("trusted.") && !admin {
+            continue;
+        }
+        b.extend_from_slice(n.as_bytes());
+        b.push(0);
+    }
+    if size == 0 {
+        return Ok(b.len() as i64);
+    }
+    let room = size.min(XATTR_LIST_MAX);
+    if b.len() > room {
+        return Err(if room >= XATTR_LIST_MAX { -E2BIG } else { -ERANGE });
+    }
+    out(list, &b)?;
+    Ok(b.len() as i64)
+}
+
+/// removexattr、lremovexattr、fremovexattr、removexattrat (なければ ENODATA)
+pub fn removexattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep: usize) -> R {
+    let name = xattr_name(namep)?;
+    let ino = xattr_target(fd, dirfd, pathp, at_flags, true)?;
+    xattr_permission(&ino, &name, true)?;
+    xattr_security(&name)?;
+    ino.setxattr(&name, None, 2)?;
+    xattr_changed(fd, dirfd, pathp);
+    Ok(0)
+}
+
+/// *xattrat の相手: AT_SYMLINK_NOFOLLOW と AT_EMPTY_PATH のほかは EINVAL。パスが空で AT_EMPTY_PATH で dirfd が 0 以上
+/// なら fd として (Linux の path_setxattrat)
+fn xattrat_fd(dirfd: i64, pathp: usize, at_flags: u64) -> Result<Option<u64>, i64> {
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(crate::why::inval());
+    }
+    if at_flags & AT_EMPTY_PATH != 0 && dirfd >= 0 && (pathp == 0 || user_str(pathp).is_ok_and(|s| s.is_empty())) {
+        return Ok(Some(dirfd as u64));
+    }
+    Ok(None)
+}
+
+/// struct xattr_args (value、size、flags: 16 バイト) を写す (大きさが 16 より小さければ EINVAL、4096 より大きければ
+/// E2BIG、知らないところが 0 でなければ E2BIG)
+fn xattr_args(p: usize, usize_: usize) -> Result<(usize, usize, u64), i64> {
+    if usize_ < 16 {
+        return Err(crate::why::inval());
+    }
+    if usize_ > 4096 {
+        return Err(-E2BIG);
+    }
+    let mut b = alloc::vec![0u8; usize_];
+    proc::current().pt().copy_in(&mut b, p).ok_or(-EFAULT)?;
+    if b[16..].iter().any(|&x| x != 0) {
+        return Err(-E2BIG);
+    }
+    Ok((u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize, u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize, u32::from_le_bytes(b[12..16].try_into().unwrap()) as u64))
+}
+
+pub fn setxattrat(dirfd: i64, pathp: usize, at_flags: u64, namep: usize, args: usize, usize_: usize) -> R {
+    let fd = xattrat_fd(dirfd, pathp, at_flags)?;
+    let (value, size, flags) = xattr_args(args, usize_)?;
+    setxattr(fd, dirfd, pathp, at_flags, namep, value, size, flags)
+}
+
+pub fn getxattrat(dirfd: i64, pathp: usize, at_flags: u64, namep: usize, args: usize, usize_: usize) -> R {
+    let fd = xattrat_fd(dirfd, pathp, at_flags)?;
+    let (value, size, flags) = xattr_args(args, usize_)?;
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    getxattr(fd, dirfd, pathp, at_flags, namep, value, size)
+}
+
+pub fn listxattrat(dirfd: i64, pathp: usize, at_flags: u64, list: usize, size: usize) -> R {
+    let fd = xattrat_fd(dirfd, pathp, at_flags)?;
+    listxattr(fd, dirfd, pathp, at_flags, list, size)
+}
+
+pub fn removexattrat(dirfd: i64, pathp: usize, at_flags: u64, namep: usize) -> R {
+    let fd = xattrat_fd(dirfd, pathp, at_flags)?;
+    removexattr(fd, dirfd, pathp, at_flags, namep)
+}

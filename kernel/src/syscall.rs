@@ -22,7 +22,6 @@ const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EBADF: i64 = 9;
 const ENOSYS: i64 = 38;
-const ENODATA: i64 = 61;
 const EOPNOTSUPP: i64 = 95;
 
 // システムコールの番号 (nr::READ など) と名前 (name。/proc/bkl と strace で見せる)
@@ -57,6 +56,13 @@ nrs! {
     LISTXATTR = 11,
     LLISTXATTR = 12,
     FLISTXATTR = 13,
+    REMOVEXATTR = 14,
+    LREMOVEXATTR = 15,
+    FREMOVEXATTR = 16,
+    SETXATTRAT = 463,
+    GETXATTRAT = 464,
+    LISTXATTRAT = 465,
+    REMOVEXATTRAT = 466,
     GETCWD = 17,
     FLOCK = 32,
     MKNODAT = 33,
@@ -244,6 +250,7 @@ nrs! {
     GETPRIORITY = 141,
     SCHED_SETATTR = 274,
     CLOCK_SETTIME = 112,
+    SYSLOG = 116,
     SETTIMEOFDAY = 170,
     ADJTIMEX = 171,
     CLOCK_ADJTIME = 266,
@@ -544,10 +551,19 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         // I/O の優先度はない (どれも同じ)。聞かれたら IOPRIO_CLASS_NONE
         IOPRIO_SET => Ok(0),
         IOPRIO_GET => Ok(0),
-        // xattr は持っていない
-        LISTXATTR | LLISTXATTR | FLISTXATTR => Ok(0),
-        GETXATTR | LGETXATTR | FGETXATTR => Err(-ENODATA),
-        SETXATTR | LSETXATTR | FSETXATTR => Err(-EOPNOTSUPP),
+        // 拡張属性 (ext4 の user.* と trusted.*。ほかのファイルシステムは EOPNOTSUPP)
+        SETXATTR | LSETXATTR => sysfile::setxattr(None, sysfile::AT_FDCWD, a[0] as usize, if nr == LSETXATTR { sysfile::AT_SYMLINK_NOFOLLOW } else { 0 }, a[1] as usize, a[2] as usize, a[3] as usize, a[4]),
+        FSETXATTR => sysfile::setxattr(Some(a[0]), 0, 0, 0, a[1] as usize, a[2] as usize, a[3] as usize, a[4]),
+        GETXATTR | LGETXATTR => sysfile::getxattr(None, sysfile::AT_FDCWD, a[0] as usize, if nr == LGETXATTR { sysfile::AT_SYMLINK_NOFOLLOW } else { 0 }, a[1] as usize, a[2] as usize, a[3] as usize),
+        FGETXATTR => sysfile::getxattr(Some(a[0]), 0, 0, 0, a[1] as usize, a[2] as usize, a[3] as usize),
+        LISTXATTR | LLISTXATTR => sysfile::listxattr(None, sysfile::AT_FDCWD, a[0] as usize, if nr == LLISTXATTR { sysfile::AT_SYMLINK_NOFOLLOW } else { 0 }, a[1] as usize, a[2] as usize),
+        FLISTXATTR => sysfile::listxattr(Some(a[0]), 0, 0, 0, a[1] as usize, a[2] as usize),
+        REMOVEXATTR | LREMOVEXATTR => sysfile::removexattr(None, sysfile::AT_FDCWD, a[0] as usize, if nr == LREMOVEXATTR { sysfile::AT_SYMLINK_NOFOLLOW } else { 0 }, a[1] as usize),
+        FREMOVEXATTR => sysfile::removexattr(Some(a[0]), 0, 0, 0, a[1] as usize),
+        SETXATTRAT => sysfile::setxattrat(int(a[0]), a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5] as usize),
+        GETXATTRAT => sysfile::getxattrat(int(a[0]), a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5] as usize),
+        LISTXATTRAT => sysfile::listxattrat(int(a[0]), a[1] as usize, a[2], a[3] as usize, a[4] as usize),
+        REMOVEXATTRAT => sysfile::removexattrat(int(a[0]), a[1] as usize, a[2], a[3] as usize),
         // 先読みのお願いは聞くだけ (ext4 の読み込みが自分で先読みする)
         FADVISE64 => sysfile::fadvise(a[0], a[1] as i64, a[2] as i64, a[3]),
         READAHEAD => Ok(0),
@@ -663,6 +679,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLOCK_GETRES => sys_clock_getres(a[0], a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize, a[1] as usize),
         SETTIMEOFDAY => sys_settimeofday(a[0] as usize, a[1] as usize),
+        SYSLOG => crate::kmsg::syslog(a[0] as i32, a[1] as usize, a[2] as i32),
         CLOCK_SETTIME => sys_clock_settime(a[0] as i32, a[1] as usize),
         ADJTIMEX => sys_adjtimex(a[0] as usize),
         CLOCK_ADJTIME => sys_clock_adjtime(a[0] as i32, a[1] as usize),

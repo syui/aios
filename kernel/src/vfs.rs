@@ -123,6 +123,20 @@ pub trait Inode {
     fn page_cacheable(&self) -> bool {
         false
     }
+    /// 拡張属性 (Linux の xattr_handler)。name は名前空間つき ("user.a")。持たないファイルシステムは EOPNOTSUPP (Linux の
+    /// IOP_XATTR のない inode: 手本の Linux の tmpfs も TMPFS_XATTR なし)。許しは呼ぶほう (sysfile の xattr_permission)
+    fn getxattr(&self, _name: &str) -> Result<Vec<u8>, i64> {
+        Err(-EOPNOTSUPP)
+    }
+    /// value が None なら消す (なければ ENODATA)。flags は XATTR_CREATE (1: あれば EEXIST) と XATTR_REPLACE (2: なければ
+    /// ENODATA)
+    fn setxattr(&self, _name: &str, _value: Option<&[u8]>, _flags: u32) -> Result<(), i64> {
+        Err(-EOPNOTSUPP)
+    }
+    /// 名前の一覧 (名前空間つき。trusted.* は呼ぶほうが CAP_SYS_ADMIN でなければ外す)
+    fn listxattr(&self) -> Result<Vec<String>, i64> {
+        Ok(Vec::new())
+    }
     /// foff のページがメモリにあるか (mincore: Linux のページキャッシュにあるか)。読みこみはしない。None は分からない
     /// (vm.rs の写しの表だけを見る)
     fn resident(&self, _foff: usize) -> Option<bool> {

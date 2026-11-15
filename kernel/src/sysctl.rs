@@ -137,6 +137,14 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/hostname", get: crate::syscall::hostname, set: Some(|s| crate::syscall::set_hostname(s.as_bytes())) },
     Entry { path: "kernel/domainname", get: crate::syscall::domainname, set: Some(|s| crate::syscall::set_domainname(s.as_bytes())) },
     Entry { path: "kernel/ostype", get: || crate::ns::sysname().to_string(), set: None },
+    // 端末のレベル、レベルのないメッセージのレベル、端末のレベルの下限、端末のレベルの既定 (Linux の printk。1 つ目は
+    // syslog の CONSOLE_LEVEL などで変わる)
+    Entry { path: "kernel/printk", get: || format!("{}\t4\t1\t7", crate::kmsg::console_loglevel()), set: None },
+    Entry {
+        path: "kernel/dmesg_restrict",
+        get: || format!("{}", crate::kmsg::dmesg_restrict() as u8),
+        set: Some(|s| Ok(crate::kmsg::set_dmesg_restrict(num(s, 0, 1)? == 1))),
+    },
     Entry { path: "kernel/osrelease", get: crate::ns::release, set: None },
     Entry {
         path: "kernel/uname",

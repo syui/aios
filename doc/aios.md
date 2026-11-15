@@ -675,8 +675,24 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   500 増え、時計を合わせると ntp_clear、答えは TIME_ERROR (5) か TIME_OK)。ADJ_SETOFFSET は時計を動かす。周波数や
   オフセットで時計の進みを変えること (slew)、TAI の差を CLOCK_TAI に足すこと、壁の時計で決めたタイマーを合わせなおす
   こと (clock_was_set) はまだ
-- のこり (Linux にあって aios で ENOSYS): removexattr の 3 つと *xattrat (aios は xattr をまだ持たない: list は 0、get は
-  ENODATA、set は EOPNOTSUPP)、syslog (dmesg)、ptrace、SysV の msg と
+- syslog (klogctl。test/syslog.c、Linux と root でない形 4 行、root の形 6 行同じ): kmsg.rs の輪から Linux の do_syslog と
+  同じに。dmesg_restrict (/proc/sys/kernel/dmesg_restrict、既定 0) が 0 なら READ_ALL と SIZE_BUFFER はだれでも、ほかは
+  CAP_SYSLOG がなければ EPERM (知らない番号も)。行は "<6>[秒.µs] 本文" (aios のメッセージはレベルを持たないので KERN_INFO)。
+  READ_ALL は入る分だけ終わりの行から、READ は読んだところから先を (なければ 50 ms ずつ見て待つ。はじめの行は切って
+  渡せる)、READ_CLEAR と CLEAR は READ_ALL を空に、CONSOLE_OFF / ON / LEVEL は /proc/sys/kernel/printk の 1 つ目に (aios は
+  シリアルにはいつもみな出す)。/proc/kmsg はこれまでどおり (Linux は root だけで読むと消える)
+- 拡張属性 (xattr。test/xattr.c、Linux と ext4 で 16 行、tmpfs で 3 行同じ): setxattr・getxattr・listxattr・removexattr と
+  l・f のもの、setxattrat などの *xattrat (Linux 6.13)。前は list は 0、get は ENODATA、set は EOPNOTSUPP、remove は ENOSYS
+  だった。VFS (sysfile.rs) は Linux の fs/xattr.c と同じ順と答え (名前は 1〜255 バイト (でなければ ERANGE)、値は 65536 まで
+  (E2BIG)、XATTR_CREATE と XATTR_REPLACE、xattr_permission: trusted.* は CAP_SYS_ADMIN、user.* はふつうのファイルと
+  ディレクトリだけ、chattr +i / +a は EPERM、それから inode の許し。security.* は commoncap の許しと security.capability の
+  形)。ext4 (extfs.rs) は Linux の fs/ext4/xattr.c と同じ置き方: まず inode の中 (128 + i_extra_isize から)、入らなければ
+  i_file_acl のブロック (項は (番号, 名前の長さ, 名前) の順、項と値のハッシュ、ブロックのハッシュとチェックサム)、空になれば
+  ブロックを放し、共有のブロック (数え > 1) は写してから変え、inode を消すときは放す。手本の Linux の設定にあわせて user.*
+  と trusted.* だけ (security.* と ACL は EOPNOTSUPP。値を別の inode に持つ ea_inode もなし: ブロックに入らなければ
+  ENOSPC)。tmpfs は手本と同じく持たない (EOPNOTSUPP)。aios が書いたものを e2fsck -fn は直すものなしと見、debugfs の
+  ea_list で読める
+- のこり (Linux にあって aios で ENOSYS): ptrace、SysV の msg と
   sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
   futex_requeue、mseal、file_getattr・file_setattr、listns など

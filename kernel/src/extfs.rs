@@ -929,6 +929,103 @@ type Slot = (u64, usize, usize, usize);
 /// ディレクトリの項目の場所: (ブロック, 位置, rec_len, 同じブロックの前の項目 (位置, rec_len))
 type Entry = (u64, usize, usize, Option<(usize, usize)>);
 
+// ---- 拡張属性 (Linux の fs/ext4/xattr.c) ----
+// inode の中 (128 + i_extra_isize から inode の終わりまで: 頭に 4 バイトの印、値の場所ははじめの項から) と、i_file_acl の
+// ブロック (32 バイトの頭: 印、数え (共有の数)、ブロックの数、ハッシュ、チェックサム。値の場所はブロックのはじめから)。
+// 項は 16 バイト (名前の長さ、名前空間の番号、値の場所、値の inode、値の大きさ、ハッシュ) と名前 (4 にそろえる)、4 バイトの
+// 0 で終わり、値は終わりのほうから (4 にそろえる)。ブロックの項は (番号, 名前の長さ, 名前) の順。手本の Linux の設定では
+// user.* (1) と trusted.* (4) だけ (security.* と ACL はなし: EOPNOTSUPP)。値を別の inode に持つもの (ea_inode) は読めない
+
+const XATTR_MAGIC: u32 = 0xEA02_0000;
+const ENODATA: i64 = 61;
+
+#[derive(Clone)]
+struct Xa {
+    index: u8,
+    name: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// 名前空間つきの名前から (番号, 名前): "user." と "trusted." だけ。名前空間だけ ("user.") は EINVAL
+fn xa_name(name: &str) -> Result<(u8, Vec<u8>), i64> {
+    for (p, i) in [("user.", 1u8), ("trusted.", 4)] {
+        if let Some(s) = name.strip_prefix(p) {
+            if s.is_empty() {
+                return Err(-EINVAL);
+            }
+            return Ok((i, s.as_bytes().to_vec()));
+        }
+    }
+    Err(-EOPNOTSUPP)
+}
+
+/// 項の大きさ (名前を 4 にそろえて) と値の大きさ (4 にそろえて)
+fn xa_size(x: &Xa) -> usize {
+    ((16 + x.name.len() + 3) & !3) + ((x.value.len() + 3) & !3)
+}
+
+/// 項のハッシュ (Linux の ext4_xattr_hash_entry: 名前はバイトごと、値は 4 バイトの語ごと)
+fn xa_hash(x: &Xa) -> u32 {
+    let mut h: u32 = 0;
+    for &c in &x.name {
+        h = (h << 5) ^ (h >> 27) ^ c as u32;
+    }
+    for w in x.value.chunks(4) {
+        let mut b = [0u8; 4];
+        b[..w.len()].copy_from_slice(w);
+        h = (h << 16) ^ (h >> 16) ^ u32::from_le_bytes(b);
+    }
+    h
+}
+
+/// 項を読む: first から 4 バイトの 0 まで。値は base からの場所。こわれていれば EIO、値を別の inode に持つものは EOPNOTSUPP
+fn xa_parse(d: &[u8], first: usize, base: usize) -> Result<Vec<Xa>, i64> {
+    let mut out = Vec::new();
+    let mut at = first;
+    while at + 4 <= d.len() && u32_at(d, at) != 0 {
+        if at + 16 > d.len() {
+            return Err(-EIO);
+        }
+        let nl = d[at] as usize;
+        let (offs, inum, size) = (u16_at(d, at + 2) as usize, u32_at(d, at + 4), u32_at(d, at + 8) as usize);
+        if inum != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        if at + 16 + nl > d.len() || (size != 0 && base + offs + size > d.len()) {
+            return Err(-EIO);
+        }
+        let value = if size == 0 { Vec::new() } else { d[base + offs..base + offs + size].to_vec() };
+        out.push(Xa { index: d[at + 1], name: d[at + 16..at + 16 + nl].to_vec(), value });
+        at += (16 + nl + 3) & !3;
+    }
+    Ok(out)
+}
+
+/// 項を書く: d をみな 0 にしてから、first から項を、値は d の終わりから下へ (場所は base から)。entry のハッシュも
+fn xa_build(d: &mut [u8], first: usize, base: usize, list: &[Xa]) {
+    d[first..].fill(0);
+    let mut at = first;
+    let mut top = d.len();
+    for x in list {
+        let vl = (x.value.len() + 3) & !3;
+        let offs = if x.value.is_empty() {
+            0
+        } else {
+            top -= vl;
+            d[top..top + x.value.len()].copy_from_slice(&x.value);
+            top - base
+        };
+        d[at] = x.name.len() as u8;
+        d[at + 1] = x.index;
+        put16(d, at + 2, offs as u16);
+        put32(d, at + 4, 0);
+        put32(d, at + 8, x.value.len() as u32);
+        put32(d, at + 12, xa_hash(x));
+        d[at + 16..at + 16 + x.name.len()].copy_from_slice(&x.name);
+        at += (16 + x.name.len() + 3) & !3;
+    }
+}
+
 /// ディスク上の inode (inode_size バイトまるごと)
 #[derive(Clone)]
 struct Raw(Vec<u8>);
@@ -2407,6 +2504,196 @@ impl ExtFs {
         self.sb_add_free_inodes(1);
         self.adirty.borrow_mut().ib.insert(g);
         Ok(())
+    }
+
+    // ---- 拡張属性 ----
+
+    /// i_file_acl (拡張属性のブロック)
+    // [lockless]
+    fn xa_block_of(r: &Raw) -> u64 {
+        u32_at(&r.0, 0x68) as u64 | (u16_at(&r.0, 0x76) as u64) << 32
+    }
+
+    // [lockless]
+    fn xa_set_block_of(r: &mut Raw, b: u64) {
+        put32(&mut r.0, 0x68, b as u32);
+        put16(&mut r.0, 0x76, (b >> 32) as u16);
+    }
+
+    /// inode の中の拡張属性のところ (はじめ, 終わり)。なければ None
+    fn xa_ibody(&self, r: &Raw) -> Option<(usize, usize)> {
+        if self.inode_size <= 128 {
+            return None;
+        }
+        let start = 128 + u16_at(&r.0, 0x80) as usize;
+        (start + 8 <= self.inode_size).then_some((start, self.inode_size))
+    }
+
+    /// 拡張属性をみな読む: (inode の中のもの、ブロックのもの、ブロックの (番号, 数え))
+    fn xa_load(&self, r: &Raw) -> Result<(Vec<Xa>, Vec<Xa>, Option<(u64, u32)>), i64> {
+        let ib = match self.xa_ibody(r) {
+            Some((s, e)) if u32_at(&r.0, s) == XATTR_MAGIC => xa_parse(&r.0[s..e], 4, 4)?,
+            _ => Vec::new(),
+        };
+        let b = Self::xa_block_of(r);
+        if b == 0 {
+            return Ok((ib, Vec::new(), None));
+        }
+        let d = self.read_block(b)?;
+        if u32_at(&d, 0) != XATTR_MAGIC || u32_at(&d, 8) != 1 {
+            return Err(-EIO);
+        }
+        Ok((ib, xa_parse(&d, 32, 0)?, Some((b, u32_at(&d, 4)))))
+    }
+
+    /// 拡張属性のブロックの中身を作る (頭、項、ブロックのハッシュ、チェックサム。Linux の ext4_xattr_rehash と
+    /// ext4_xattr_block_csum)
+    fn xa_fill_block(&self, b: u64, d: &mut [u8], refcount: u32, list: &[Xa]) {
+        d.fill(0);
+        put32(d, 0, XATTR_MAGIC);
+        put32(d, 4, refcount);
+        put32(d, 8, 1);
+        xa_build(d, 32, 0, list);
+        let mut h: u32 = 0;
+        for x in list {
+            let e = xa_hash(x);
+            if e == 0 {
+                h = 0;
+                break;
+            }
+            h = (h << 16) ^ (h >> 16) ^ e;
+        }
+        put32(d, 12, h);
+        self.xa_csum(b, d);
+    }
+
+    /// 拡張属性のブロックのチェックサム (ブロックの番号と、チェックサムを 0 にしたブロック)
+    // [lockless]
+    fn xa_csum(&self, b: u64, d: &mut [u8]) {
+        if !self.csum {
+            return;
+        }
+        put32(d, 16, 0);
+        let c = crc32c(crc32c(self.csum_seed, &b.to_le_bytes()), d);
+        put32(d, 16, c);
+    }
+
+    /// inode の拡張属性のブロックを放す (共有なら数えを 1 つ減らすだけ)。i_file_acl と i_blocks も (消すときは release から:
+    /// ext4 のロックの中。Rc にはさわらない)
+    // [lockless]
+    fn xa_drop_block(&self, r: &mut Raw) -> Result<(), i64> {
+        let b = Self::xa_block_of(r);
+        if b == 0 {
+            return Ok(());
+        }
+        let shared = self.with_block(b, |d| u32_at(d, 0) == XATTR_MAGIC && u32_at(d, 4) > 1)?;
+        if shared {
+            self.modify_block(b, |d| {
+                put32(d, 4, u32_at(d, 4) - 1);
+                self.xa_csum(b, d);
+            })?;
+        } else {
+            self.free_block(b)?;
+        }
+        Self::xa_set_block_of(r, 0);
+        r.add_blocks512(-((self.bsize / 512) as i64), self.bsize);
+        Ok(())
+    }
+
+    /// 拡張属性を変える (Linux の ext4_xattr_set_handle): XATTR_CREATE であれば EEXIST、XATTR_REPLACE か消すのでなければ
+    /// ENODATA。入れるのは、まず inode の中 (入らなければブロック。ブロックにも入らなければ ENOSPC)、前にあったところからは
+    /// 消す。ブロックが空になれば放し、共有のブロックは写してから変える。ctime を進める
+    fn xa_set(&self, ino: u32, index: u8, name: &[u8], value: Option<&[u8]>, flags: u32) -> Result<(), i64> {
+        let mut r = self.read_inode(ino)?;
+        let (mut ib, mut bl, blk) = self.xa_load(&r)?;
+        let hit = |l: &Vec<Xa>| l.iter().position(|x| x.index == index && x.name == name);
+        let (in_ib, in_bl) = (hit(&ib), hit(&bl));
+        let exists = in_ib.is_some() || in_bl.is_some();
+        if flags & 1 != 0 && exists {
+            return Err(-EEXIST);
+        }
+        if (flags & 2 != 0 || value.is_none()) && !exists {
+            return Err(-ENODATA);
+        }
+        let ib_room = self.xa_ibody(&r).map_or(0, |(s, e)| e - s - 4);
+        let fits_ib = |l: &[Xa]| l.iter().map(xa_size).sum::<usize>() + 4 <= ib_room;
+        let fits_bl = |l: &[Xa]| 32 + l.iter().map(xa_size).sum::<usize>() + 4 <= self.bsize;
+        match value {
+            None => {
+                if let Some(i) = in_ib {
+                    ib.remove(i);
+                } else if let Some(j) = in_bl {
+                    bl.remove(j);
+                }
+            }
+            Some(v) => {
+                let new = Xa { index, name: name.to_vec(), value: v.to_vec() };
+                let mut ib2 = ib.clone();
+                match in_ib {
+                    Some(i) => ib2[i] = new.clone(),
+                    None => ib2.push(new.clone()),
+                }
+                if ib_room > 0 && fits_ib(&ib2) {
+                    ib = ib2;
+                    if let Some(j) = in_bl {
+                        bl.remove(j);
+                    }
+                } else {
+                    let mut bl2 = bl.clone();
+                    match in_bl {
+                        Some(j) => bl2[j] = new,
+                        None => {
+                            let key = |x: &Xa| (x.index, x.name.len(), x.name.clone());
+                            let at = bl2.iter().position(|x| key(x) >= key(&new)).unwrap_or(bl2.len());
+                            bl2.insert(at, new);
+                        }
+                    }
+                    if !fits_bl(&bl2) {
+                        return Err(-ENOSPC);
+                    }
+                    bl = bl2;
+                    if let Some(i) = in_ib {
+                        ib.remove(i);
+                    }
+                }
+            }
+        }
+        // inode の中
+        if let Some((s, e)) = self.xa_ibody(&r) {
+            if ib.is_empty() {
+                r.0[s..e].fill(0);
+            } else {
+                put32(&mut r.0, s, XATTR_MAGIC);
+                xa_build(&mut r.0[s..e], 4, 4, &ib);
+            }
+        }
+        // ブロック
+        let per = (self.bsize / 512) as i64;
+        if bl.is_empty() {
+            self.xa_drop_block(&mut r)?;
+        } else {
+            match blk {
+                Some((b, 1)) => self.modify_block(b, |d| self.xa_fill_block(b, d, 1, &bl))?,
+                Some((b, _)) => {
+                    // 共有のブロック: 写してから (もとのものは数えを減らす)
+                    let nb = self.alloc_block(self.group_start(self.group_of(ino)))?;
+                    self.modify_block(b, |d| {
+                        put32(d, 4, u32_at(d, 4) - 1);
+                        self.xa_csum(b, d);
+                    })?;
+                    self.modify_block(nb, |d| self.xa_fill_block(nb, d, 1, &bl))?;
+                    Self::xa_set_block_of(&mut r, nb);
+                }
+                None => {
+                    let nb = self.alloc_block(self.group_start(self.group_of(ino)))?;
+                    self.modify_block(nb, |d| self.xa_fill_block(nb, d, 1, &bl))?;
+                    Self::xa_set_block_of(&mut r, nb);
+                    r.add_blocks512(per, self.bsize);
+                }
+            }
+        }
+        put32(&mut r.0, 12, now_secs());
+        self.write_inode(ino, &r)
     }
 
     // ---- チェックサム (metadata_csum) ----
@@ -4155,6 +4442,8 @@ impl ExtFs {
         if !is_fast_symlink(r) && r.mode() & S_IFMT != S_IFCHR {
             self.trunc_blocks(ino, r, 0)?;
         }
+        // 拡張属性のブロック (Linux の ext4_xattr_delete_inode)
+        self.xa_drop_block(r)?;
         put32(&mut r.0, 20, now_secs()); // dtime
         r.set_size(0);
         self.write_inode(ino, r)?;
@@ -5476,6 +5765,37 @@ impl ExtInode {
 }
 
 impl Inode for ExtInode {
+    fn getxattr(&self, name: &str) -> Result<Vec<u8>, i64> {
+        let _e = fs_lock();
+        let (index, n) = xa_name(name)?;
+        let (ib, bl, _) = self.fs.xa_load(&self.raw()?)?;
+        ib.iter().chain(bl.iter()).find(|x| x.index == index && x.name == n).map(|x| x.value.clone()).ok_or(-ENODATA)
+    }
+
+    fn setxattr(&self, name: &str, value: Option<&[u8]>, flags: u32) -> Result<(), i64> {
+        let _e = fs_lock();
+        let (index, n) = xa_name(name)?;
+        self.write_op(|| self.fs.xa_set(self.ino, index, &n, value, flags))
+    }
+
+    /// inode の中のもの、それからブロックのもの (Linux の ext4_listxattr)。名前空間を持たないもの (system.data など) は出さない
+    fn listxattr(&self) -> Result<Vec<String>, i64> {
+        let _e = fs_lock();
+        let (ib, bl, _) = self.fs.xa_load(&self.raw()?)?;
+        Ok(ib
+            .iter()
+            .chain(bl.iter())
+            .filter_map(|x| {
+                let p = match x.index {
+                    1 => "user.",
+                    4 => "trusted.",
+                    _ => return None,
+                };
+                Some(alloc::format!("{}{}", p, String::from_utf8_lossy(&x.name)))
+            })
+            .collect())
+    }
+
     fn id(&self) -> (usize, u64) {
         (self.fs.fs, self.ino as u64)
     }
