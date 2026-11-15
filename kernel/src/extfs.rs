@@ -5559,6 +5559,20 @@ impl Inode for ExtInode {
         true
     }
 
+    /// foff のブロックがブロックのキャッシュにあるか (mincore。読みこまない)。穴は false
+    fn resident(&self, foff: usize) -> Option<bool> {
+        let _e = fs_lock();
+        if self.fs.bsize != PGSIZE {
+            return None;
+        }
+        let mut r = self.raw().ok()?;
+        if r.mode() & S_IFMT != S_IFREG || r.flags() & INLINE_DATA_FL != 0 {
+            return None;
+        }
+        let b = self.fs.map(self.ino, &mut r, (foff / PGSIZE) as u64, false).ok()?;
+        Some(b != 0 && self.fs.cached(b))
+    }
+
     /// ファイルの foff のページそのもの: ブロックのキャッシュのページ (ブロックが 1 ページのとき。参照をひとつ足して)。
     /// 穴 (と未初期化のブロック) は None。alloc なら、ブロックをとって (写しの穴のページを引きとって: adopt_hole)
     /// 書き出す印をつけ、更新時刻をいまに (写しに書くとき: Linux の page_mkwrite)。終わりの先 (同じページの中) は 0 に

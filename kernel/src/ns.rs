@@ -45,6 +45,8 @@ fn next_id() -> u64 {
 pub struct Uts {
     pub id: u64,
     pub name: RefCell<([u8; 64], usize)>,
+    /// NIS のドメイン名 (uname の domainname、setdomainname)
+    pub domain: RefCell<([u8; 64], usize)>,
     pub uname: core::cell::Cell<Uname>,
 }
 
@@ -223,7 +225,8 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
     }
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
-        c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name), uname: core::cell::Cell::new(current_uname(c)) }));
+        let domain = current_domain(c);
+        c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name), domain: RefCell::new(domain), uname: core::cell::Cell::new(current_uname(c)) }));
     }
     if flags & CLONE_NEWNET != 0 {
         c.ns.net = Some(Rc::new(Net { id: next_id() }));
@@ -267,26 +270,63 @@ pub fn hostname() -> ([u8; 64], usize) {
     current_name(&crate::proc::current().cred)
 }
 
-/// ホスト名を変える。はじめの UTS は root だけ、新しく作った UTS の中ならだれでも
-pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
+/// ドメイン名 (Linux の UTS_DOMAINNAME の既定は "(none)")
+static DOMAIN: Bkl<([u8; 64], usize)> = Bkl::new({
+    let mut b = [0u8; 64];
+    let s = b"(none)";
+    let mut i = 0;
+    while i < s.len() {
+        b[i] = s[i];
+        i += 1;
+    }
+    (b, s.len())
+});
+
+fn current_domain(c: &crate::cred::Cred) -> ([u8; 64], usize) {
+    match &c.ns.uts {
+        Some(u) => *u.domain.borrow(),
+        None => *DOMAIN.get(),
+    }
+}
+
+/// いまのプロセスから見たドメイン名
+pub fn domainname() -> ([u8; 64], usize) {
+    current_domain(&crate::proc::current().cred)
+}
+
+/// sethostname と setdomainname がしてよいか (Linux の ns_capable(uts_ns->user_ns, CAP_SYS_ADMIN))。はじめの UTS は
+/// root だけ、新しく作った UTS の中ならだれでも。自分の UTS でも LSM はみな聞く (landlock の CAPABILITY_USE、AppArmor)
+pub fn uts_may_set() -> bool {
+    let c = &crate::proc::current().cred;
+    match &c.ns.uts {
+        Some(_) => crate::security::capable(c, crate::cred::CAP_SYS_ADMIN, true),
+        None => c.capable(crate::cred::CAP_SYS_ADMIN),
+    }
+}
+
+/// ホスト名 (domain なら ドメイン名) を変える。check なら uts_may_set を見る (sysctl の書き手は呼ぶほうで見る)
+pub fn set_uts_name(name: &[u8], domain: bool, check: bool) -> Result<(), i64> {
+    if check && !uts_may_set() {
+        return Err(-EPERM);
+    }
     if name.len() > 64 {
         return Err(-22);
     }
     let mut b = [0u8; 64];
     b[..name.len()].copy_from_slice(name);
     let c = &crate::proc::current().cred;
-    match &c.ns.uts {
-        // 自分の UTS (CAP_SYS_ADMIN を持つ) でも、LSM はみな聞く (Linux の ns_capable: landlock の CAPABILITY_USE、AppArmor)
-        Some(_) if check && !crate::security::capable(c, crate::cred::CAP_SYS_ADMIN, true) => return Err(-EPERM),
-        Some(u) => *u.name.borrow_mut() = (b, name.len()),
-        None => {
-            if check && !c.capable(crate::cred::CAP_SYS_ADMIN) {
-                return Err(-EPERM);
-            }
-            *HOSTNAME.get() = (b, name.len());
-        }
+    match (&c.ns.uts, domain) {
+        (Some(u), false) => *u.name.borrow_mut() = (b, name.len()),
+        (Some(u), true) => *u.domain.borrow_mut() = (b, name.len()),
+        (None, false) => *HOSTNAME.get() = (b, name.len()),
+        (None, true) => *DOMAIN.get() = (b, name.len()),
     }
     Ok(())
+}
+
+/// ホスト名を変える
+pub fn set_hostname(name: &[u8], check: bool) -> Result<(), i64> {
+    set_uts_name(name, false, check)
 }
 
 // ---- uname の形 ----

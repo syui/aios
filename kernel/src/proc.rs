@@ -129,6 +129,9 @@ pub struct Mm {
     pub auxv: Vec<u64>,
     /// PR_SET_THP_DISABLE の印 (fork でも exec でも受けつぐ: Linux の MMF_DISABLE_THP)
     pub thp_disable: bool,
+    /// mlockall の MCL_FUTURE (Linux の mm->def_flags の VM_LOCKED (1) と VM_LOCKONFAULT (2)): これから写すものにも
+    /// mlock をかける。fork と exec では受けつがない
+    pub def_lock: u8,
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
     pub args: (usize, usize, usize),
     /// PR_GET_DUMPABLE / PR_SET_DUMPABLE (0 作らない、1 作る、2 root の権利で)。exec で 1 (setuid / setgid のもので
@@ -775,7 +778,7 @@ impl Proc {
             self.personality &= !PER_CLEAR_ON_SETID;
         }
         let thp_disable = self.mm.as_ref().is_some_and(|m| m.get().thp_disable);
-        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv, thp_disable }));
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv, thp_disable, def_lock: 0 }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -1512,7 +1515,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new(), thp_disable: false }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new(), thp_disable: false, def_lock: 0 }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -2180,7 +2183,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             None => m.pt.fork(),
         };
         let pt = pt.ok_or(-ENOMEM)?;
-        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone(), thp_disable: m.thp_disable })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone(), thp_disable: m.thp_disable, def_lock: 0 })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()

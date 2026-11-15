@@ -187,6 +187,16 @@ nrs! {
     SETSID = 157,
     UNAME = 160,
     SETHOSTNAME = 161,
+    SETDOMAINNAME = 162,
+    GETCPU = 168,
+    SCHED_RR_GET_INTERVAL = 127,
+    RESTART_SYSCALL = 128,
+    VHANGUP = 58,
+    MLOCK = 228,
+    MUNLOCK = 229,
+    MLOCKALL = 230,
+    MUNLOCKALL = 231,
+    MLOCK2 = 284,
     UNSHARE = 97,
     GETRLIMIT = 163,
     SETRLIMIT = 164,
@@ -647,7 +657,45 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         CLOCK_GETRES => sys_clock_getres(a[0], a[1] as usize),
         GETTIMEOFDAY => sys_gettimeofday(a[0] as usize),
         UNAME => sys_uname(a[0] as usize),
-        SETHOSTNAME => sys_sethostname(a[0] as usize, a[1] as usize),
+        SETHOSTNAME => sys_set_uts(a[0] as usize, a[1], false),
+        SETDOMAINNAME => sys_set_uts(a[0] as usize, a[1], true),
+        // CPU の番号と NUMA の節 (いつも 0)。渡されたところにだけ書く (Linux と同じ)
+        GETCPU => (if a[0] != 0 { out(a[0] as usize, &(crate::smp::id() as u32).to_le_bytes()) } else { Ok(()) })
+            .and_then(|_| if a[1] != 0 { out(a[1] as usize, &0u32.to_le_bytes()) } else { Ok(()) })
+            .map(|_| 0),
+        // SCHED_OTHER の時間の幅。Linux の CFS は、ほかに走るもののない列では 0 (get_rr_interval_fair)、そうでなくても
+        // 1 jiffy に満たない slice は 0 になる。aios の線はみな SCHED_OTHER なので 0
+        SCHED_RR_GET_INTERVAL => {
+            if (a[0] as i32) < 0 {
+                Err(crate::why::inval())
+            } else if a[0] as i32 != 0 && crate::ns::arg_pid(a[0] as i32 as i64).ok().and_then(|g| proc::find_any(g as u32)).is_none() {
+                Err(-3)
+            } else {
+                out(a[1] as usize, &timespec(0)).map(|_| 0)
+            }
+        }
+        // やりなおすもの (Linux の restart_block) を持たない: do_no_restart_syscall と同じ EINTR。aios は眠りの
+        // システムコールを、番号を変えずに同じ引数でやりなおす (signal.rs)
+        RESTART_SYSCALL => Err(-4),
+        MLOCK => sys_mlock(a[0] as usize, a[1] as usize, false),
+        MLOCK2 if a[2] & !1 != 0 => Err(crate::why::inval()),
+        MLOCK2 => sys_mlock(a[0] as usize, a[1] as usize, a[2] & 1 != 0),
+        MUNLOCK => sys_munlock(a[0] as usize, a[1] as usize),
+        MLOCKALL => sys_mlockall(a[0]),
+        MUNLOCKALL => {
+            let m = proc::current().mm();
+            m.def_lock = 0;
+            m.pt.set_locked_all(false, false);
+            Ok(0)
+        }
+        // 制御端末を切る: CAP_SYS_TTY_CONFIG がなければ EPERM (Linux と同じ)。持っていても、aios はまだ端末を切らない
+        VHANGUP => {
+            if p.cred.capable(crate::cred::CAP_SYS_TTY_CONFIG) {
+                Ok(0)
+            } else {
+                Err(-EPERM)
+            }
+        }
         REBOOT => sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32),
         SYSINFO => sys_sysinfo(a[0] as usize),
         GETRLIMIT => sys_getrlimit(a[0] as u32, a[1] as usize),
@@ -860,6 +908,10 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         {
             let Some(mm) = p.mm.as_ref() else { return false };
             let m = mm.get();
+            // mlockall の MCL_FUTURE はふつうの道で (かけて写す)
+            if m.def_lock != 0 {
+                return false;
+            }
             let len = pg_up(a[1] as usize);
             if mm.private() {
                 let Some(va) = m.pt.fast_map(m.mmap_next, len, prot_bits(a[2])) else { return false };
@@ -881,6 +933,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
             && a[1] <= crate::vm::MAXVA as u64
             && (a[4] as i32) >= 0 =>
         {
+            if p.mm.as_ref().is_some_and(|m| m.get().def_lock != 0) {
+                return false;
+            }
             match crate::vm::fast_mmap_file(p, a[4] as i32 as u64, a[1] as usize, a[2], a[5] as usize) {
                 Some(r) => r,
                 None => return false,
@@ -1005,15 +1060,137 @@ fn sys_gettimeofday(tv: usize) -> R {
 
 /// uname の nodename (sethostname で変わる。init が起動のときに /etc/hostname を入れる)
 
-fn sys_sethostname(name: usize, len: usize) -> R {
-    if len > 64 {
+/// sethostname と setdomainname (Linux と同じ順: 許しがなければ EPERM、長さ (int) が 0 より小さいか 64 より大きければ
+/// EINVAL、読めなければ EFAULT)。root か、新しく作った UTS の中 (ns.rs)
+fn sys_set_uts(name: usize, len: u64, domain: bool) -> R {
+    if !crate::ns::uts_may_set() {
+        return Err(-EPERM);
+    }
+    let len = len as i32;
+    if !(0..=64).contains(&len) {
         return Err(crate::why::inval());
     }
+    let len = len as usize;
     let mut b = [0u8; 64];
     proc::current().pt().copy_in(&mut b[..len], name).ok_or(-14)?;
-    // root か、新しく作った UTS の中 (ns.rs)
-    crate::ns::set_hostname(&b[..len], true)?;
+    crate::ns::set_uts_name(&b[..len], domain, false)?;
     Ok(0)
+}
+
+// ---- mlock (Linux の mm/mlock.c) ----
+
+const RLIMIT_MEMLOCK: usize = 8;
+
+/// mlock してよいか (Linux の can_do_mlock): RLIMIT_MEMLOCK が 0 でないか、CAP_IPC_LOCK
+fn can_do_mlock(p: &proc::Proc) -> bool {
+    proc::rlimit(p, RLIMIT_MEMLOCK)[0] != 0 || p.cred.capable(crate::cred::CAP_IPC_LOCK)
+}
+
+/// RLIMIT_MEMLOCK (ソフト) のページの数
+fn memlock_pages(p: &proc::Proc) -> u64 {
+    proc::rlimit(p, RLIMIT_MEMLOCK)[0] >> 12
+}
+
+/// これから bytes を mlock して写してよいか (Linux の mlock_future_ok: かけないもの、CAP_IPC_LOCK は いつもよい)
+fn mlock_future_ok(p: &proc::Proc, locked: bool, bytes: usize) -> bool {
+    if !locked {
+        return true;
+    }
+    let pages = (bytes >> 12) as u64 + p.mm().pt.locked_pages() as u64;
+    pages <= memlock_pages(p) || p.cred.capable(crate::cred::CAP_IPC_LOCK)
+}
+
+/// mlock と mlock2 (Linux の do_mlock): RLIMIT_MEMLOCK が 0 で CAP_IPC_LOCK もなければ EPERM。番地のページの端数は長さに
+/// 足す (そろえてあふれれば 0)。かけたものと合わせて RLIMIT_MEMLOCK をこえれば ENOMEM (範囲のうちもうかけたところは
+/// 数えなおさない)。終わりがあふれれば EINVAL、領域がなければ ENOMEM (すきまの前まではかける)。それからページを写す
+/// (写せなければ ENOMEM: PROT_NONE など。かけたまま)
+fn sys_mlock(start: usize, len: usize, onfault: bool) -> R {
+    const ENOMEM: i64 = 12;
+    let p = proc::current();
+    if !can_do_mlock(p) {
+        return Err(-EPERM);
+    }
+    let len = len.wrapping_add(start & 0xfff).wrapping_add(0xfff) & !0xfff;
+    let start = start & !0xfff;
+    let limit = memlock_pages(p);
+    let pt = &mut p.mm().pt;
+    let mut locked = (len >> 12) as u64 + pt.locked_pages() as u64;
+    if locked > limit && !p.cred.capable(crate::cred::CAP_IPC_LOCK) {
+        locked -= pt.locked_in(start, start.wrapping_add(len)) as u64;
+    }
+    if locked > limit && !p.cred.capable(crate::cred::CAP_IPC_LOCK) {
+        return Err(-ENOMEM);
+    }
+    let end = start.checked_add(len).ok_or_else(crate::why::inval)?;
+    if end == start {
+        return Ok(0);
+    }
+    pt.set_locked(start, end, true, onfault)?;
+    if !pt.populate_locked(start, end, false) {
+        return Err(-ENOMEM);
+    }
+    Ok(0)
+}
+
+/// munlock (Linux と同じく許しは要らない。領域がなければ ENOMEM、すきまの前までは外す)
+fn sys_munlock(start: usize, len: usize) -> R {
+    let len = len.wrapping_add(start & 0xfff).wrapping_add(0xfff) & !0xfff;
+    let start = start & !0xfff;
+    let end = start.checked_add(len).ok_or_else(crate::why::inval)?;
+    if end == start {
+        return Ok(0);
+    }
+    proc::current().mm().pt.set_locked(start, end, false, false).map(|_| 0)
+}
+
+/// mlockall (Linux と同じ順: flags が 0 か、知らないものか、MCL_ONFAULT だけなら EINVAL、can_do_mlock でなければ
+/// EPERM、MCL_CURRENT で VmSize が RLIMIT_MEMLOCK をこえれば ENOMEM)。MCL_FUTURE はこれから写すものにも (Mm::def_lock)。
+/// MCL_CURRENT は今の領域みなにかけて写す (写せないものは飛ばす)
+fn sys_mlockall(flags: u64) -> R {
+    const ENOMEM: i64 = 12;
+    const MCL_CURRENT: u64 = 1;
+    const MCL_FUTURE: u64 = 2;
+    const MCL_ONFAULT: u64 = 4;
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 || flags == MCL_ONFAULT {
+        return Err(crate::why::inval());
+    }
+    let p = proc::current();
+    if !can_do_mlock(p) {
+        return Err(-EPERM);
+    }
+    let m = p.mm();
+    if flags & MCL_CURRENT != 0 && (m.pt.vsize() >> 12) as u64 > memlock_pages(p) && !p.cred.capable(crate::cred::CAP_IPC_LOCK) {
+        return Err(-ENOMEM);
+    }
+    let onfault = flags & MCL_ONFAULT != 0;
+    m.def_lock = if flags & MCL_FUTURE != 0 { 1 | if onfault { 2 } else { 0 } } else { 0 };
+    if flags & MCL_CURRENT != 0 {
+        m.pt.set_locked_all(true, onfault);
+        m.pt.populate_locked(0, crate::vm::MAXVA, true);
+    }
+    Ok(0)
+}
+
+/// 写したばかりの [va, va + len) に mlock をかけて写す (MAP_LOCKED と MCL_FUTURE。Linux の mmap_region と
+/// vm_mmap_pgoff の mm_populate: 写せないものは気にしない)。MAP_POPULATE も写す
+fn lock_new(m: &mut proc::Mm, va: usize, len: usize, lock: u8, populate: bool) {
+    if lock & 1 != 0 {
+        let _ = m.pt.set_locked(va, va + len, true, lock & 2 != 0);
+    }
+    if lock & 3 == 1 || populate {
+        m.pt.populate_locked(va, va + len, true);
+    }
+}
+
+/// いまのドメイン名 (/proc/sys/kernel/domainname)
+pub fn domainname() -> String {
+    let (b, l) = crate::ns::domainname();
+    String::from_utf8_lossy(&b[..l]).into_owned()
+}
+
+/// ドメイン名を変える (/proc/sys/kernel/domainname。root かは呼ぶほうで見る)
+pub fn set_domainname(name: &[u8]) -> Result<(), i64> {
+    crate::ns::set_uts_name(name, true, false)
 }
 
 /// いまのホスト名 (/proc/sys/kernel/hostname)
@@ -1034,7 +1211,8 @@ fn sys_uname(buf: usize) -> R {
     const FIELD: usize = 65;
     let (hb, hl) = crate::ns::hostname();
     let release = crate::ns::release();
-    let fields: [&[u8]; 6] = [crate::ns::sysname().as_bytes(), &hb[..hl], release.as_bytes(), crate::ns::version().as_bytes(), b"aarch64", b""];
+    let (db, dl) = crate::ns::domainname();
+    let fields: [&[u8]; 6] = [crate::ns::sysname().as_bytes(), &hb[..hl], release.as_bytes(), crate::ns::version().as_bytes(), b"aarch64", &db[..dl]];
     let mut u = [0u8; FIELD * 6];
     for (i, f) in fields.iter().enumerate() {
         u[i * FIELD..i * FIELD + f.len()].copy_from_slice(f);
@@ -1167,12 +1345,21 @@ fn sys_prlimit(pid: i32, resource: u32, new: usize, old: usize) -> R {
 
 fn sys_brk(addr: usize) -> i64 {
     let m = proc::current().mm();
-    if addr < m.heap_start {
+    // heap の始めより前と、ユーザーの番地の外 (ページにそろえるとあふれる -1 なども) は、いまの brk のまま (Linux は
+    // そろえて 0 になったものを伸ばそうとして ENOMEM になり、もとの brk を返す)
+    if addr < m.heap_start || addr > crate::vm::MAXVA {
         return m.brk as i64;
     }
     let (old, new) = (pg_up(m.brk), pg_up(addr));
+    // mlockall の MCL_FUTURE: 伸ばすところも RLIMIT_MEMLOCK の中で (Linux の check_brk_limits)、かけて写す
+    if new > old && !mlock_future_ok(proc::current(), m.def_lock & 1 != 0, new - old) {
+        return m.brk as i64;
+    }
     if new != old && m.pt.resize(m.heap_start, old, new).is_none() {
         return m.brk as i64;
+    }
+    if new > old && m.def_lock != 0 {
+        lock_new(m, old, new - old, m.def_lock, false);
     }
     m.brk = addr;
     addr as i64
@@ -1184,6 +1371,9 @@ const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_DROPPABLE: u64 = 0x08;
 const MAP_NORESERVE: u64 = 0x4000;
+const MAP_LOCKED: u64 = 0x2000;
+const MAP_POPULATE: u64 = 0x8000;
+const MAP_NONBLOCK: u64 = 0x1_0000;
 const MAP_STACK: u64 = 0x2_0000;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const PROT_WRITE: u64 = 0x2;
@@ -1240,8 +1430,18 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         }
         Backing::Anon
     };
-    let m = proc::current().mm();
+    let p = proc::current();
+    let m = p.mm();
     let len = pg_up(len);
+    // mlock をかけて写すか (MAP_LOCKED か mlockall の MCL_FUTURE。Linux の do_mmap: can_do_mlock でなければ EPERM、
+    // RLIMIT_MEMLOCK をこえれば EAGAIN)
+    let lock = if flags & MAP_LOCKED != 0 { 1 } else { 0 } | m.def_lock;
+    if flags & MAP_LOCKED != 0 && !can_do_mlock(p) {
+        return Err(-EPERM);
+    }
+    if !mlock_future_ok(p, lock & 1 != 0, len) {
+        return Err(-11);
+    }
     let va = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         if addr & 0xfff != 0 {
             return Err(crate::why::inval());
@@ -1267,6 +1467,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     }
     if kind == MAP_DROPPABLE {
         m.pt.set_wipe(va);
+    }
+    if lock != 0 || flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE {
+        lock_new(m, va, len, lock, flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE);
     }
     Ok(va as i64)
 }
@@ -1317,9 +1520,16 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     if old_size == 0 || v.end < old_end {
         return Err(-EFAULT);
     }
+    // mlock した領域を伸ばすなら RLIMIT_MEMLOCK の中で (Linux の vma_to_resize: EAGAIN)
+    if v.locked && new_size > old_size && !mlock_future_ok(proc::current(), true, new_size - old_size) {
+        return Err(-11);
+    }
     if flags & MREMAP_FIXED == 0 {
         // その場で伸ばす (領域の終わりまで使っていて、その先が空いているとき)
         if v.end == old_end && m.pt.extend(vstart, old + new_size).is_some() {
+            if v.locked && !v.onfault {
+                m.pt.populate_locked(old + old_size, old + new_size, true);
+            }
             return Ok(old as i64);
         }
         if flags & MREMAP_MAYMOVE == 0 {
@@ -1342,6 +1552,9 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
         va
     };
     m.pt.map(dst, dst + new_size, v.prot, false, Backing::Anon).ok_or(-ENOMEM)?;
+    if v.locked {
+        let _ = m.pt.set_locked(dst, dst + new_size, true, v.onfault);
+    }
     if v.prot & PROT_READ != 0 {
         let mut buf = alloc::vec![0u8; PGSIZE];
         for off in (0..old_size.min(new_size)).step_by(PGSIZE) {
@@ -1458,18 +1671,33 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
 
 /// mincore: ページがメモリにあるか。写してある領域はみな「ある」と答える (スワップに出ていても読めば戻る)。
 /// 写していないところがあれば ENOMEM
+/// mincore (Linux と同じ順: そろっていない番地は EINVAL、ユーザーの外は ENOMEM、長さ 0 は 0、vec がユーザーの外なら
+/// EFAULT)。ページがあるかを 1 バイトずつ (vm::PageTable::mincore)。領域のないところに来たら、そこまでを書いて ENOMEM
 fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {
     const ENOMEM: i64 = 12;
     if addr & 0xfff != 0 {
         return Err(crate::why::inval());
     }
-    let n = pg_up(len) / 4096;
-    let m = proc::current().mm();
-    if (0..n).any(|i| m.pt.find(addr + i * 4096).is_none()) {
+    if addr.checked_add(len).is_none_or(|e| e > crate::vm::MAXVA) {
         return Err(-ENOMEM);
     }
-    out(vec, &alloc::vec![1u8; n])?;
-    Ok(0)
+    let n = len / 4096 + (len % 4096 != 0) as usize;
+    if n == 0 {
+        return Ok(0);
+    }
+    if vec.checked_add(n).is_none_or(|e| e > crate::vm::MAXVA) {
+        return Err(-EFAULT);
+    }
+    let p = proc::current();
+    let c = &p.cred;
+    let (v, gap) = p.mm().pt.mincore(addr, n, |ino| {
+        let m = ino.meta();
+        m.uid == c.fsuid || c.may(&m, crate::cred::W, false)
+    });
+    if !v.is_empty() {
+        out(vec, &v)?;
+    }
+    if gap { Err(-ENOMEM) } else { Ok(0) }
 }
 
 /// capget(hdr, data): capability (root は全部、ほかはなし。aios は capability を分けない)。

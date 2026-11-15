@@ -480,6 +480,15 @@ impl Inode for TmpInode {
         }
     }
 
+    /// ページを持っているか (mincore。tmpfs の中身はみなメモリ: 穴は持たない)
+    fn resident(&self, foff: usize) -> Option<bool> {
+        match &*self.node.borrow() {
+            Node::File(Data::Static(b)) => Some(foff < b.len()),
+            Node::File(Data::Owned(p)) => Some(p.pages.contains_key(&(foff / PGSIZE))),
+            _ => None,
+        }
+    }
+
     /// ファイルの foff のページそのもの (参照をひとつ足して)。Linux の tmpfs (shmem_fault) と同じく、読むだけでも
     /// ページをとる (穴は 0 のページに。とれなければ ENOSPC: SIGBUS)
     fn page_frame(&self, foff: usize, _alloc: bool) -> Result<Option<*mut u8>, i64> {

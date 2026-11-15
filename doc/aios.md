@@ -637,6 +637,31 @@ madvise と prctl も Linux の答えに (2026-11-15。前は知らない値も 
 - shm の nattch (shm.rs の attaches) が、ほかのプロセスの領域の木を hold なしで読んでいた (そのプロセスのロックなしの
   munmap と同時になると、木をたどる途中でこわれてカーネルが止まる: ctests の shm で 1 度)。/proc/PID/maps と同じく hold で
   ロックなしの書き手を止めてから数える
+
+Linux にあって aios では ENOSYS だったシステムコール (2026-11-15。test/sysnos.c が 0〜499 の番号をみな引数 -1 で呼び、
+ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろえていく:
+
+- 小さなもの (test/sysmisc.c、Linux と 9 行同じ): brk はユーザーの外 (-1 など: ページにそろえるとあふれる) をいまの brk の
+  ままに (前は heap を外してしまい、プロセスが落ちた)。getcpu (CPU の番号と節 0)、sched_rr_get_interval (SCHED_OTHER は
+  0: Linux の CFS も 1 jiffy に満たない slice は 0)、restart_syscall (やりなおすものがないので EINTR)、setdomainname と
+  uname の domainname と /proc/sys/kernel/domainname (既定は Linux と同じ "(none)"、UTS の namespace ごと)、vhangup
+  (CAP_SYS_TTY_CONFIG がなければ EPERM。持っていても端末はまだ切らない)。sethostname も Linux と同じく許しを長さより先に
+  見る
+- mlock、munlock、mlock2 (MLOCK_ONFAULT)、mlockall (MCL_CURRENT、MCL_FUTURE、MCL_ONFAULT)、munlockall、mmap の
+  MAP_LOCKED と MAP_POPULATE (test/mlock.c、Linux と 20 行同じ): Linux の mm/mlock.c と同じ順と答え (RLIMIT_MEMLOCK が 0 で
+  CAP_IPC_LOCK もなければ EPERM、こえれば ENOMEM (MAP_LOCKED と mremap は EAGAIN)、すきまはそこまでかけて ENOMEM、ページを
+  先に写す (写せない PROT_NONE は ENOMEM))。Vma::locked と onfault、Mm::def_lock (MCL_FUTURE: 新しい mmap と brk にも。速い
+  mmap はふつうの道へ)。mlock した領域はスワップへ出さず、ファイルのページも外さない。fork と exec では受けつがない。
+  /proc/PID/status の VmLck、smaps の Locked (Pss) と VmFlags の lo・lf (dc と wf も)
+- mincore (test/mincore.c、Linux と 7 行同じ): 前はいつもみな 1。PTE にページのあるものと、ファイルの写しでページキャッシュ
+  にあるもの (写しの表か、Inode::resident: tmpfs は持っているページ、ext4 はブロックのキャッシュにあるもの) が 1。書けない
+  ほかの人のファイルの写しはみな 1 (Linux の can_do_mincore)。すきまはそこまで書いて ENOMEM
+- のこり (Linux にあって aios で ENOSYS): removexattr の 3 つと *xattrat (aios は xattr をまだ持たない: list は 0、get は
+  ENODATA、set は EOPNOTSUPP)、settimeofday・clock_settime・adjtimex・clock_adjtime、syslog (dmesg)、ptrace、SysV の msg と
+  sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、sched_setattr・sched_getattr
+  (と nice: getpriority はいつも 20)、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
+  mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
+  futex_requeue、mseal、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

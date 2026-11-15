@@ -527,8 +527,13 @@ impl ProcInode {
                 let queued = ths.iter().map(|t| t.sig_pending.count_ones() + t.sig_shared.count_ones()).sum::<u32>();
                 let sig = crate::signal::status_text(p, shared, queued);
                 let (vsize, rss) = mem_of(p);
+                let locked = p.mm.as_ref().map_or(0, |m| {
+                    let m = m.get();
+                    let _h = m.pt.hold();
+                    m.pt.locked_pages()
+                });
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n{}NoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n{}NoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
                     p.comm(),
                     state_name(p),
                     crate::ns::local_or_0(p.tgid),
@@ -543,6 +548,7 @@ impl ProcInode {
                     crate::ns::show_gid(c.sgid),
                     crate::ns::show_gid(c.fsgid),
                     vsize / 1024,
+                    locked * 4,
                     rss * 4,
                     threads,
                     sig,

@@ -123,6 +123,11 @@ pub trait Inode {
     fn page_cacheable(&self) -> bool {
         false
     }
+    /// foff のページがメモリにあるか (mincore: Linux のページキャッシュにあるか)。読みこみはしない。None は分からない
+    /// (vm.rs の写しの表だけを見る)
+    fn resident(&self, _foff: usize) -> Option<bool> {
+        None
+    }
     /// 長さ 0 の write も write_at に渡す (Linux の proc のファイルは 0 バイトでも書き手が呼ばれ、数として読めなければ
     /// EINVAL。ふつうのファイルは generic_write_checks で何もせず 0)
     fn writes_empty(&self) -> bool {

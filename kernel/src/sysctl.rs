@@ -135,6 +135,7 @@ fn num(s: &str, lo: usize, hi: usize) -> Result<usize, i64> {
 
 pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/hostname", get: crate::syscall::hostname, set: Some(|s| crate::syscall::set_hostname(s.as_bytes())) },
+    Entry { path: "kernel/domainname", get: crate::syscall::domainname, set: Some(|s| crate::syscall::set_domainname(s.as_bytes())) },
     Entry { path: "kernel/ostype", get: || crate::ns::sysname().to_string(), set: None },
     Entry { path: "kernel/osrelease", get: crate::ns::release, set: None },
     Entry {

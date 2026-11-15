@@ -1221,6 +1221,10 @@ pub struct Vma {
     pub droppable: bool,
     /// fork した子に領域ごと写さない (MADV_DONTFORK: VM_DONTCOPY)
     pub dontcopy: bool,
+    /// mlock をかけた (VM_LOCKED: スワップへ出さず、ファイルのページも外さない。fork した子には受けつがない)
+    pub locked: bool,
+    /// MLOCK_ONFAULT / MCL_ONFAULT (VM_LOCKONFAULT: かけても先には写さない)
+    pub onfault: bool,
 }
 
 /// ページフォールトの結果
@@ -2110,7 +2114,7 @@ impl PageTable {
         self.unmap_inner(start, end);
         self.note(b'm', start, end, prot);
         self.last_end = end;
-        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false, droppable: false, dontcopy: false });
+        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
@@ -2275,7 +2279,7 @@ impl PageTable {
             match self.vmas.get_mut(&start) {
                 Some(v) if v.end == old_end => v.end = new_end,
                 _ => {
-                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false, droppable: false, dontcopy: false });
+                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
                 }
             }
         } else if new_end < old_end {
@@ -2426,8 +2430,8 @@ impl PageTable {
             (Some(&s), Some(v)) => (s, v.end),
             _ => return alloc::string::String::new(),
         };
-        // (rss, sc, sd, pc, pd, rf, anon, swap) はバイト、(pss, pss_dirty, pss_anon, pss_file) は 12 ビットの端数つき
-        let mut t = [0u64; 12];
+        // (rss, sc, sd, pc, pd, rf, anon, swap) はバイト、(pss, pss_dirty, pss_anon, pss_file, pss_locked) は 12 ビットの端数つき
+        let mut t = [0u64; 13];
         for (&s, v) in &self.vmas {
             if matches!(v.back, Backing::Pages { .. }) {
                 continue;
@@ -2462,6 +2466,9 @@ impl PageTable {
                     t[9] += share;
                 }
                 t[if cached.is_none() { 10 } else { 11 }] += share;
+                if v.locked {
+                    t[12] += share;
+                }
                 match (mapcount >= 2, dirty) {
                     (true, true) => t[2] += pg,
                     (true, false) => t[1] += pg,
@@ -2498,7 +2505,7 @@ impl PageTable {
             ("Private_Hugetlb:", 0),
             ("Swap:", kb(t[7])),
             ("SwapPss:", kb(t[7])),
-            ("Locked:", 0),
+            ("Locked:", t[12] >> 22),
         ];
         for (k, n) in rows {
             let _ = writeln!(out, "{:<16}{:>8} kB", k, n);
@@ -2672,7 +2679,8 @@ impl PageTable {
                 ("Private_Hugetlb:", 0),
                 ("Swap:", kb(swap)),
                 ("SwapPss:", kb(swap)),
-                ("Locked:", 0),
+                // mlock した領域は Pss (Linux の pss_locked)
+                ("Locked:", if v.locked { pss >> 22 } else { 0 }),
             ];
             for (k, n) in rows {
                 let _ = writeln!(out, "{:<16}{:>8} kB", k, n);
@@ -2691,7 +2699,11 @@ impl PageTable {
                 (true, "me"),
                 (v.shared, "ms"),
                 (matches!(v.back, Backing::Pages { .. }), "pf"),
+                (v.locked, "lo"),
+                (v.dontcopy, "dc"),
+                (v.onfault, "lf"),
                 (!v.shared && w, "ac"),
+                (v.wipe, "wf"),
             ] {
                 if on {
                     f.push_str(name);
@@ -3509,7 +3521,7 @@ impl PageTable {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
                 self.last_end = end;
-                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false, droppable: false, dontcopy: false });
+                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
                 Ok(va)
             }
             _ => Err((back, name)),
@@ -3653,9 +3665,146 @@ impl PageTable {
         self.vmas.iter().filter(|(_, v)| !v.wipe && !v.dontcopy).map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
     }
 
-    /// fork した子に渡す領域 (MADV_DONTFORK のものはのぞく)
+    /// fork した子に渡す領域 (MADV_DONTFORK のものはのぞく)。mlock は受けつがない (Linux の dup_mmap も VM_LOCKED と
+    /// VM_LOCKONFAULT を落とす)
     fn child_vmas(&self) -> BTreeMap<usize, Vma> {
-        self.vmas.iter().filter(|(_, v)| !v.dontcopy).map(|(&s, v)| (s, v.clone())).collect()
+        self.vmas
+            .iter()
+            .filter(|(_, v)| !v.dontcopy)
+            .map(|(&s, v)| {
+                let mut c = v.clone();
+                c.locked = false;
+                c.onfault = false;
+                (s, c)
+            })
+            .collect()
+    }
+
+    /// mincore (Linux の do_mincore): start から n ページの、ページがあるか (1) ないか (0)。あるのは PTE にページのあるもの
+    /// (PROT_NONE にしたものも) と、ファイルの写しでページキャッシュにあるもの。スワップへ出したものと装置のページは 0。
+    /// 書けないファイル (持ち主でもない: may_write が false) の写しはみな 1 (Linux の can_do_mincore: ほかの人のページ
+    /// キャッシュをのぞかせない)。領域のないところに来たら、そこまでを返して true (呼ぶほうは ENOMEM)
+    pub fn mincore(&self, start: usize, n: usize, may_write: impl Fn(&InodeRef) -> bool) -> (Vec<u8>, bool) {
+        let mut out = Vec::with_capacity(n);
+        let mut va = start;
+        while out.len() < n {
+            let Some((s, v)) = self.find(va) else { return (out, true) };
+            let vend = v.end.min(start + n * PGSIZE);
+            let all = match &v.back {
+                Backing::File { ino, .. } => !may_write(ino),
+                _ => false,
+            };
+            while va < vend {
+                let e = self.walk(va, false).map(|p| unsafe { *p }).unwrap_or(0);
+                let have = all
+                    || match &v.back {
+                        Backing::Pages { .. } => false,
+                        _ if has_page(e) => true,
+                        Backing::File { ino, off, .. } if e == 0 => {
+                            let foff = off + (va - s);
+                            let key = file_key(ino, foff);
+                            PRIV.lock().pages.contains_key(&key) || shared_file().contains_key(&key) || ino.resident(foff).unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                out.push(have as u8);
+                va += PGSIZE;
+            }
+        }
+        (out, false)
+    }
+
+    /// mlock をかけた領域のページの数 (Linux の mm->locked_vm: /proc の VmLck)
+    pub fn locked_pages(&self) -> usize {
+        self.vmas.iter().filter(|(_, v)| v.locked).map(|(&s, v)| (v.end - s) / PGSIZE).sum()
+    }
+
+    /// [start, end) のうち、もう mlock をかけたページの数 (Linux の count_mm_mlocked_page_nr)
+    pub fn locked_in(&self, start: usize, end: usize) -> usize {
+        if end <= start {
+            return 0;
+        }
+        self.vmas_in(start, end).filter(|(_, v)| v.locked).map(|(&s, v)| (v.end.min(end) - s.max(start)) / PGSIZE).sum()
+    }
+
+    /// mlock をかけない領域 (Linux の mlock_fixup が飛ばすもの: 装置のページ (VM_PFNMAP / VM_IO)、MAP_DROPPABLE)
+    fn unlockable(v: &Vma) -> bool {
+        matches!(v.back, Backing::Pages { .. }) || v.droppable
+    }
+
+    /// [start, end) の領域に mlock をかける・外す (Linux の apply_vma_lock_flags と mlock_fixup)。start に領域がなければ
+    /// ENOMEM。すきまに来たら、そこまでのものは変えて ENOMEM。かけない領域 (unlockable) はそのまま
+    pub fn set_locked(&mut self, start: usize, end: usize, locked: bool, onfault: bool) -> Result<(), i64> {
+        const ENOMEM: i64 = 12;
+        let _m = self.mutating();
+        let onfault = locked && onfault;
+        let mut va = start;
+        while va < end {
+            let Some((_, v)) = self.find(va) else { return Err(-ENOMEM) };
+            let piece = v.end.min(end);
+            if !Self::unlockable(v) && (v.locked != locked || v.onfault != onfault) {
+                self.split(va);
+                self.split(piece);
+                if let Some(v) = self.vmas.get_mut(&va) {
+                    v.locked = locked;
+                    v.onfault = onfault;
+                }
+            }
+            va = piece;
+        }
+        Ok(())
+    }
+
+    /// すべての領域に mlock をかける・外す (mlockall の MCL_CURRENT、munlockall)
+    pub fn set_locked_all(&mut self, locked: bool, onfault: bool) {
+        let _m = self.mutating();
+        for v in self.vmas.values_mut() {
+            if !Self::unlockable(v) {
+                v.locked = locked;
+                v.onfault = locked && onfault;
+            }
+        }
+    }
+
+    /// mlock をかけたところのページを先に写す (Linux の __mm_populate と populate_vma_page_range)。領域のないところ、
+    /// 装置のページ、ONFAULT の領域は飛ばす。私有で書ける領域は書いて (COW を分けて)、ほかは読んで (実行だけのものは
+    /// 実行として) 写す。写せなければ (PROT_NONE など) false (ignore_errors ならその領域を飛ばして続ける)
+    pub fn populate_locked(&mut self, start: usize, end: usize, ignore_errors: bool) -> bool {
+        let mut va = start;
+        while va < end {
+            let Some((_, v)) = self.find(va) else {
+                match self.vmas.range(va..end).next() {
+                    Some((&s, _)) => {
+                        va = s;
+                        continue;
+                    }
+                    None => break,
+                }
+            };
+            let vend = v.end.min(end);
+            if matches!(v.back, Backing::Pages { .. }) || v.onfault {
+                va = vend;
+                continue;
+            }
+            let write = v.prot & PROT_WRITE != 0 && !v.shared;
+            let exec = v.prot & PROT_READ == 0 && v.prot & PROT_EXEC != 0;
+            let none = v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+            while va < vend {
+                let ok = !none && {
+                    let e = self.walk(va, false).map(|p| unsafe { *p }).unwrap_or(0);
+                    (e & PTE_VALID != 0 && e & PTE_USER != 0 && (!write || e & PTE_RDONLY == 0)) || self.fault(va, write, exec).is_ok()
+                };
+                if !ok {
+                    if !ignore_errors {
+                        return false;
+                    }
+                    va = vend;
+                    break;
+                }
+                va += PGSIZE;
+            }
+        }
+        true
     }
 
     /// start から始まる領域を、fork した子に中身を写さないものに (MAP_DROPPABLE)
@@ -3836,7 +3985,7 @@ impl PageTable {
     pub fn reclaim_file(&mut self, want: usize) -> usize {
         let _m = self.mutating();
         let hand = self.fclock;
-        let file = |v: &Vma| matches!(v.back, Backing::File { .. });
+        let file = |v: &Vma| matches!(v.back, Backing::File { .. }) && !v.locked;
         // ファイルを写した領域を、針のところから一周 (領域の先頭, 見はじめ, 終わり)
         let mut ranges = Vec::new();
         for (&s, v) in &self.vmas {
@@ -3913,12 +4062,12 @@ impl PageTable {
         let mut ranges = Vec::new();
         let hand = self.clock;
         for (&s, v) in &self.vmas {
-            if !v.shared && v.end > hand {
+            if !v.shared && !v.locked && v.end > hand {
                 ranges.push((s.max(hand), v.end));
             }
         }
         for (&s, v) in &self.vmas {
-            if !v.shared && s < hand {
+            if !v.shared && !v.locked && s < hand {
                 ranges.push((s, v.end.min(hand)));
             }
         }
