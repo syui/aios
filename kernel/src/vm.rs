@@ -3680,6 +3680,98 @@ impl PageTable {
             .collect()
     }
 
+    /// /proc/PID/status と statm の数 (Linux の task_mem。ページの数): [RssAnon, RssFile, RssShmem, VmData, VmStk, VmExe,
+    /// VmLib, VmPTE, VmSwap, ファイルの写しの (はじめ, 終わり) は別に]。stack をふくむ領域が VmStk、私有で書けるほかの領域が
+    /// VmData、実行できて書けない領域のうち exe (動かしているプログラムのパス) のものが VmExe、ほかが VmLib (vDSO も)。
+    /// RssFile はページキャッシュのページを写しているもの、RssShmem は MAP_SHARED の無名、ほかは RssAnon。装置のページは
+    /// 数えない (Linux の VM_PFNMAP)。VmPTE は根より下のテーブルのページ
+    pub fn status_mem(&self, stack: usize, exe: &str) -> [usize; 9] {
+        let mut m = [0usize; 9];
+        let exe = exe.trim_start_matches('/');
+        for (&s, v) in &self.vmas {
+            let pages = (v.end - s) / PGSIZE;
+            let is_stack = s <= stack && stack < v.end;
+            let (w, x) = (v.prot & PROT_WRITE != 0, v.prot & PROT_EXEC != 0);
+            if is_stack {
+                m[4] += pages;
+            } else if w && !v.shared {
+                m[3] += pages;
+            }
+            if x && !w && !is_stack {
+                if v.name.as_deref().is_some_and(|n| n.trim_start_matches('/') == exe) {
+                    m[5] += pages;
+                } else {
+                    m[6] += pages;
+                }
+            }
+            if matches!(v.back, Backing::Pages { .. }) {
+                continue;
+            }
+            self.each_entry(s, v.end, |va, pte| {
+                let e = unsafe { *pte };
+                if is_swap(e) {
+                    m[8] += 1;
+                    return;
+                }
+                let page = page_of(e);
+                let cached = match &v.back {
+                    Backing::File { ino, off, .. } => {
+                        let key = file_key(ino, off + (va - s));
+                        shared_file().get(&key).is_some_and(|c| c.page == page) || PRIV.lock().pages.get(&key).is_some_and(|c| c.page == page)
+                    }
+                    _ => false,
+                };
+                if v.shared && matches!(v.back, Backing::Anon) {
+                    m[2] += 1;
+                } else if cached {
+                    m[1] += 1;
+                } else {
+                    m[0] += 1;
+                }
+            });
+        }
+        fn tables(t: *mut u64, level: usize) -> usize {
+            if level >= 3 {
+                return 0;
+            }
+            let mut n = 0;
+            for i in 0..512 {
+                let e = unsafe { *t.add(i) };
+                if e & PTE_VALID != 0 {
+                    n += 1 + tables(table_at(e), level + 1);
+                }
+            }
+            n
+        }
+        m[7] = if self.root.is_null() { 0 } else { tables(self.root, 1) };
+        m
+    }
+
+    /// 動かしているプログラムの写し (Linux の start_code、end_code、start_data、end_data のかわり): exe のパスの領域の
+    /// うち、実行できるもののはじめと終わり、書けるもののはじめと終わり
+    pub fn exe_ranges(&self, exe: &str) -> (usize, usize, usize, usize) {
+        let exe = exe.trim_start_matches('/');
+        let (mut sc, mut ec, mut sd, mut ed) = (usize::MAX, 0, 0, 0);
+        for (&s, v) in &self.vmas {
+            if !v.name.as_deref().is_some_and(|n| n.trim_start_matches('/') == exe) {
+                continue;
+            }
+            if v.prot & PROT_EXEC != 0 {
+                sc = sc.min(s);
+                ec = ec.max(v.end);
+            } else if v.prot & PROT_WRITE != 0 {
+                if sd == 0 {
+                    sd = s;
+                }
+                ed = ed.max(v.end);
+            }
+        }
+        if sc == usize::MAX {
+            sc = 0;
+        }
+        (sc, ec, sd, ed)
+    }
+
     /// mincore (Linux の do_mincore): start から n ページの、ページがあるか (1) ないか (0)。あるのは PTE にページのあるもの
     /// (PROT_NONE にしたものも) と、ファイルの写しでページキャッシュにあるもの。スワップへ出したものと装置のページは 0。
     /// 書けないファイル (持ち主でもない: may_write が false) の写しはみな 1 (Linux の can_do_mincore: ほかの人のページ

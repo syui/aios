@@ -519,45 +519,13 @@ impl ProcInode {
             }
             Node::Status(pid) => {
                 let p = leader_any(pid)?;
-                let c = &p.cred;
                 let ths = proc::threads_of(p.tgid);
                 let threads = ths.len();
                 // プロセスに来たもの (Linux の shared_pending) は、どのスレッドが持っていてもまとめて ShdPnd に
                 let shared = ths.iter().fold(0, |a, t| a | t.sig_shared);
                 let queued = ths.iter().map(|t| t.sig_pending.count_ones() + t.sig_shared.count_ones()).sum::<u32>();
                 let sig = crate::signal::status_text(p, shared, queued);
-                let (vsize, rss) = mem_of(p);
-                let locked = p.mm.as_ref().map_or(0, |m| {
-                    let m = m.get();
-                    let _h = m.pt.hold();
-                    m.pt.locked_pages()
-                });
-                format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n{}NoNewPrivs:\t{}\nLandlock:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n{}",
-                    p.comm(),
-                    state_name(p),
-                    crate::ns::local_or_0(p.tgid),
-                    crate::ns::local_or_0(p.pid),
-                    crate::ns::local_or_0(p.ppid),
-                    crate::ns::show_uid(c.uid),
-                    crate::ns::show_uid(c.euid),
-                    crate::ns::show_uid(c.suid),
-                    crate::ns::show_uid(c.fsuid),
-                    crate::ns::show_gid(c.gid),
-                    crate::ns::show_gid(c.egid),
-                    crate::ns::show_gid(c.sgid),
-                    crate::ns::show_gid(c.fsgid),
-                    vsize / 1024,
-                    locked * 4,
-                    rss * 4,
-                    threads,
-                    sig,
-                    c.no_new_privs as u8,
-                    crate::landlock::layers(c),
-                    crate::seccomp::mode(c).0,
-                    crate::seccomp::mode(c).1,
-                    spec_status(p.spec_ssb)
-                )
+                status_text(p, threads, &sig)
             }
             Node::Cmdline(pid) => {
                 let p = leader(pid)?;
@@ -583,10 +551,19 @@ impl ProcInode {
                 let (_, e, end) = p.mm.as_ref().map_or((0, 0, 0), |m| m.get().args);
                 String::from_utf8_lossy(&user_bytes(p, e, end).unwrap_or_default()).into_owned()
             }
+            // statm (Linux の task_statm: size resident shared text lib data dt。shared はファイルと共有メモリの RSS、text は
+            // VmExe、data は VmData と VmStk、lib と dt は 0)
             Node::Statm(pid) => {
                 let p = leader(pid)?;
-                let (vsize, rss) = mem_of(p);
-                format!("{} {} 0 0 0 {} 0\n", vsize / crate::memlayout::PGSIZE, rss, rss)
+                match &p.mm {
+                    Some(m) => {
+                        let mm = m.get();
+                        let _h = mm.pt.hold();
+                        let sm = mm.pt.status_mem(crate::exec::USER_STACK_TOP - 1, &mm.exe);
+                        format!("{} {} {} {} 0 {} 0\n", mm.pt.vsize() / crate::memlayout::PGSIZE, sm[0] + sm[1] + sm[2], sm[1] + sm[2], sm[5], sm[3] + sm[4])
+                    }
+                    None => "0 0 0 0 0 0 0\n".to_string(),
+                }
             }
             Node::StatAll => stat_all(),
             Node::Diskstats => crate::block::proc_diskstats(),
@@ -900,6 +877,100 @@ fn state_name(p: &Proc) -> &'static str {
 }
 
 /// /proc/PID/stat (Linux の fs/proc/array.c と同じ 52 項目)
+/// /proc/PID/status (Linux の proc_pid_status と同じ行と順: task_state、task_mem、task_sig、task_cap、seccomp、
+/// 投機の手当て、CPU、切りかえの数)。Landlock (かかっている層の数) は aios が足したもの (aish が読む)。VmPeak と VmHWM は
+/// 読んだときまでのいちばん大きなもの (Linux は領域を外すときにも覚える)。Cap* は aios の資格 (root がみな持つ) から
+fn status_text(p: &Proc, threads: usize, sig: &str) -> String {
+    let c = &p.cred;
+    let umask = p.files.as_ref().map(|f| f.get().umask);
+    // FDSize: fd の表の大きさ (Linux は 64 から、128 の 2 のべき倍に伸ばす)
+    let nfds = p.files.as_ref().map_or(0, |f| f.get().fds.len());
+    let mut fdsize = 64;
+    while fdsize < nfds {
+        fdsize = if fdsize == 64 { 128 } else { fdsize * 2 };
+    }
+    let groups: Vec<String> = c.groups.iter().map(|&g| format!("{}", crate::ns::show_gid(g))).collect();
+    // NStgid などは、見ている人の PID の namespace から、そのプロセスの namespace まで
+    let nested = p.pid_ns.is_some() && proc::current().pid_ns.is_none();
+    let ns_ids = |g: u32| {
+        let mut s = format!("{}", crate::ns::local_or_0(g));
+        if nested && let Some(t) = proc::find_any(g) {
+            s += &format!("\t{}", t.vpid);
+        }
+        s
+    };
+    let (vsize, rss_pages, locked, sm, peak, hwm) = match &p.mm {
+        Some(m) => {
+            let mm = m.get();
+            let _h = mm.pt.hold();
+            let stack = crate::exec::USER_STACK_TOP - 1;
+            let sm = mm.pt.status_mem(stack, &mm.exe);
+            let vsize = mm.pt.vsize();
+            let rss = sm[0] + sm[1] + sm[2];
+            mm.peak_vm = mm.peak_vm.max(vsize);
+            mm.peak_rss = mm.peak_rss.max(rss);
+            (vsize, rss, mm.pt.locked_pages(), sm, mm.peak_vm, mm.peak_rss)
+        }
+        None => (0, 0, 0, [0; 9], 0, 0),
+    };
+    let kb = |pages: usize| pages * 4;
+    let caps: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::security::capget(c) } else { 0 };
+    let bnd = ((1u64 << 41) - 1) & !p.capbset_dropped;
+    let cpus = crate::smp::online().max(1);
+    let mut s = String::new();
+    s += &format!("Name:\t{}\n", p.comm());
+    if let Some(u) = umask {
+        s += &format!("Umask:\t{:04o}\n", u);
+    }
+    s += &format!("State:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n", state_name(p), crate::ns::local_or_0(p.tgid), crate::ns::local_or_0(p.pid), crate::ns::local_or_0(p.ppid));
+    s += &format!(
+        "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
+        crate::ns::show_uid(c.uid),
+        crate::ns::show_uid(c.euid),
+        crate::ns::show_uid(c.suid),
+        crate::ns::show_uid(c.fsuid),
+        crate::ns::show_gid(c.gid),
+        crate::ns::show_gid(c.egid),
+        crate::ns::show_gid(c.sgid),
+        crate::ns::show_gid(c.fsgid)
+    );
+    s += &format!("FDSize:\t{}\nGroups:\t{}\n", fdsize, groups.join(" "));
+    s += &format!("NStgid:\t{}\nNSpid:\t{}\nNSpgid:\t{}\nNSsid:\t{}\nKthread:\t{}\n", ns_ids(p.tgid), ns_ids(p.pid), ns_ids(p.pgid), ns_ids(p.sid), p.kthread as u8);
+    if p.mm.is_some() {
+        for (k, v) in [
+            ("VmPeak", peak / 1024),
+            ("VmSize", vsize / 1024),
+            ("VmLck", kb(locked)),
+            ("VmPin", 0),
+            ("VmHWM", kb(hwm)),
+            ("VmRSS", kb(rss_pages)),
+            ("RssAnon", kb(sm[0])),
+            ("RssFile", kb(sm[1])),
+            ("RssShmem", kb(sm[2])),
+            ("VmData", kb(sm[3])),
+            ("VmStk", kb(sm[4])),
+            ("VmExe", kb(sm[5])),
+            ("VmLib", kb(sm[6])),
+            ("VmPTE", kb(sm[7])),
+            ("VmSwap", kb(sm[8])),
+        ] {
+            s += &format!("{}:\t{:8} kB\n", k, v);
+        }
+        s += "CoreDumping:\t0\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffff\n";
+    }
+    s += &format!("Threads:\t{}\n", threads);
+    s += sig;
+    s += &format!("CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n", 0, caps, caps, bnd, 0);
+    s += &format!("NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n", c.no_new_privs as u8, crate::seccomp::mode(c).0, crate::seccomp::mode(c).1);
+    s += &format!("Landlock:\t{}\n", crate::landlock::layers(c));
+    s += &spec_status(p.spec_ssb);
+    let mask = if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+    let list = if cpus == 1 { "0".to_string() } else { format!("0-{}", cpus - 1) };
+    s += &format!("Cpus_allowed:\t{:x}\nCpus_allowed_list:\t{}\n", mask, list);
+    s += &format!("voluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}\n", p.nvcsw, p.nivcsw);
+    s
+}
+
 /// (VmSize バイト, RSS ページ)
 fn mem_of(p: &Proc) -> (usize, usize) {
     match &p.mm {
@@ -943,13 +1014,46 @@ fn stat_line(p: &Proc, whole: bool) -> String {
         mem_of(p).0,
         mem_of(p).1
     );
-    // 残り (rsslim から exit_code まで) は 0。rt_priority (40) と policy (41) だけ
-    for i in 25..=52 {
-        match i {
-            40 => s.push_str(&format!(" {}", p.rt_priority)),
-            41 => s.push_str(&format!(" {}", p.policy)),
-            _ => s.push_str(" 0"),
+    // 残り (rsslim から exit_code まで: Linux の do_task_stat)。コードやデータの場所、引数と環境の場所、exit_code は、
+    // メモリを読んでよい人 (mm_access) にだけ。シグナルは 10 進 (Linux 2.0 のなごり)。exit_signal はプロセスなら SIGCHLD
+    let permitted = mm_access(p.tgid).is_ok();
+    let (code, args, start_brk) = match &p.mm {
+        Some(m) if permitted => {
+            let mm = m.get();
+            let _h = mm.pt.hold();
+            (mm.pt.exe_ranges(&mm.exe), mm.args, mm.heap_start)
         }
+        _ => ((0, 0, 0, 0), (0, 0, 0), 0),
+    };
+    let (ign, cgt) = crate::signal::ign_cgt(p);
+    let wchan = permitted && threads < 2 && !matches!(state_char(p), 'R');
+    let sstack = if permitted && p.mm.is_some() { crate::exec::USER_STACK_TOP - 1 } else { 0 };
+    for i in 25..=52 {
+        let v: alloc::string::String = match i {
+            25 => format!("{}", proc::rlimit(p, 5)[0]),
+            26 => format!("{}", if permitted { code.0.max(1) } else { 0 }),
+            27 => format!("{}", if permitted { code.1.max(1) } else { 0 }),
+            28 => format!("{}", sstack),
+            31 => format!("{}", p.sig_pending | p.sig_shared),
+            32 => format!("{}", p.sig_mask),
+            33 => format!("{}", ign),
+            34 => format!("{}", cgt),
+            35 => format!("{}", wchan as u8),
+            38 => format!("{}", if p.pid != p.tgid { -1 } else { 17 }),
+            39 => format!("{}", p.cpu),
+            40 => format!("{}", p.rt_priority),
+            41 => format!("{}", p.policy),
+            45 => format!("{}", code.2),
+            46 => format!("{}", code.3),
+            47 => format!("{}", start_brk),
+            48 => format!("{}", args.0),
+            49 => format!("{}", args.1),
+            50 => format!("{}", args.1),
+            51 => format!("{}", args.2),
+            _ => "0".to_string(),
+        };
+        s.push(' ');
+        s.push_str(&v);
     }
     s.push('\n');
     s

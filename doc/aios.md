@@ -692,6 +692,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   と trusted.* だけ (security.* と ACL は EOPNOTSUPP。値を別の inode に持つ ea_inode もなし: ブロックに入らなければ
   ENOSPC)。tmpfs は手本と同じく持たない (EOPNOTSUPP)。aios が書いたものを e2fsck -fn は直すものなしと見、debugfs の
   ea_list で読める
+- /proc/PID/status、stat、statm を Linux の形に (test/procstatus.c、Linux と 57 行同じ: 行の名前のならびと決まった値)。
+  status は Linux の proc_pid_status と同じ行と順 (Umask、Ngid、TracerPid、FDSize、Groups、NStgid・NSpid・NSpgid・NSsid、
+  Kthread、VmPeak から VmSwap までの 15 行 (Linux と同じく 8 けたの右寄せ)、CoreDumping、THP_enabled、untag_mask、Cap*、
+  Cpus_allowed、切りかえの数)。Landlock (層の数) は aios が足したもの (aish が読む)。RssAnon・RssFile・RssShmem は
+  ページキャッシュのページを写しているかで分ける (vm::PageTable::status_mem)、VmPeak と VmHWM は読んだときまでの
+  いちばん大きなもの。aios はスタックの 8 MiB をはじめから領域にするので VmStk は Linux より大きい。stat の 25〜52 番目
+  (rsslim、コードとデータの場所、シグナル (10 進)、wchan、exit_signal、processor、引数と環境の場所) も Linux の
+  do_task_stat と同じく、場所はメモリを読んでよい人にだけ。statm も size resident shared text lib data dt に
 - のこり (Linux にあって aios で ENOSYS): ptrace、SysV の msg と
   sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・

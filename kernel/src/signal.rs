@@ -261,7 +261,8 @@ fn discard(p: &mut Proc, mask: u64) {
 
 /// /proc/PID/status のシグナルの行 (SigQ、SigPnd、ShdPnd、SigBlk、SigIgn、SigCgt: Linux の task_sig)。leader は見る
 /// スレッド、shared はスレッドグループのみなのプロセスに来たもの。SigQ の上限は RLIMIT_SIGPENDING のソフト (Linux と同じ)
-pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String {
+/// 無視するシグナルとハンドラのあるシグナル (/proc/PID/status の SigIgn と SigCgt、stat の sigignore と sigcatch)
+pub fn ign_cgt(p: &Proc) -> (u64, u64) {
     let (mut ign, mut cgt) = (0u64, 0u64);
     for sig in 1..NSIG as i32 {
         match action(p, sig).handler {
@@ -270,6 +271,11 @@ pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String 
             _ => cgt |= bit(sig),
         }
     }
+    (ign, cgt)
+}
+
+pub fn status_text(p: &Proc, shared: u64, queued: u32) -> alloc::string::String {
+    let (ign, cgt) = ign_cgt(p);
     alloc::format!(
         "SigQ:\t{}/{}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n",
         queued,
