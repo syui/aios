@@ -2012,6 +2012,13 @@ pub fn exit(code: i32) -> ! {
     exit_status(exited(code))
 }
 
+/// プロセス (スレッドグループ) が終わるときに呼ぶもの (なくてもよい部分が main.rs で置く)
+static EXIT_HOOK: crate::cell::Early<Option<fn(u32)>> = crate::cell::Early::new(None);
+
+pub fn register_exit_hook(f: fn(u32)) {
+    EXIT_HOOK.set(Some(f));
+}
+
 fn exit_status(status: i32) -> ! {
     let p = current();
     crate::debug::trace_exit(p.pid, status as i64);
@@ -2047,6 +2054,10 @@ fn exit_status(status: i32) -> ! {
     // 代表スレッド: 残りのスレッドも止める
     for t in p.siblings() {
         kill_proc(t);
+    }
+    // プロセスが終わるときのもの (System V のセマフォの SEM_UNDO: sem.rs。Linux の exit_sem)
+    if let Some(f) = *EXIT_HOOK.get() {
+        f(p.tgid);
     }
     if p.tgid == 1 {
         panic!("init exited with status {}", status);

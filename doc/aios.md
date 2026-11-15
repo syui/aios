@@ -700,8 +700,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   いちばん大きなもの。aios はスタックの 8 MiB をはじめから領域にするので VmStk は Linux より大きい。stat の 25〜52 番目
   (rsslim、コードとデータの場所、シグナル (10 進)、wchan、exit_signal、processor、引数と環境の場所) も Linux の
   do_task_stat と同じく、場所はメモリを読んでよい人にだけ。statm も size resident shared text lib data dt に
-- のこり (Linux にあって aios で ENOSYS): ptrace、SysV の msg と
-  sem、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
+- System V のメッセージの列とセマフォ (msg.rs と sem.rs。test/sysvipc.c、Linux と 21 行同じ): msgget・msgsnd・msgrcv・
+  msgctl と semget・semctl・semop・semtimedop を Linux の ipc/msg.c と ipc/sem.c と同じ順と答えに (shm.rs と同じく IPC の
+  namespace ごとの表と番号の配りかた)。msgrcv の型 (0、正、負はそれ以下でいちばん小さいもの、MSG_EXCEPT)、E2BIG と
+  MSG_NOERROR、列がいっぱいなら待つ (IPC_NOWAIT は EAGAIN)、IPC_SET の msg_qbytes、IPC_RMID は待っているものを EIDRM で
+  起こす。semop はみなできるときだけみなする、SEMVMX (32767)、GETNCNT と GETZCNT (待っているものを止めた操作で数える)、
+  SEM_UNDO はプロセスが終わるときに足す (proc::register_exit_hook。SETVAL と SETALL は戻しを消す)、semtimedop の時間切れは
+  EAGAIN。/proc/sysvipc/msg と sem も (ipcs)。MSG_COPY は手本の設定にない (ENOSYS)
+- のこり (Linux にあって aios で ENOSYS): ptrace、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
   futex_requeue、mseal、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを

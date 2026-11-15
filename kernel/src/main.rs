@@ -26,6 +26,8 @@ mod landlock;
 mod timerfd;
 mod signalfd;
 mod shm;
+mod msg;
+mod sem;
 mod console;
 mod tty;
 mod block;
@@ -184,6 +186,9 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(timerfd::SYSCALLS, timerfd::sys);
     syscall::register(signalfd::SYSCALLS, signalfd::sys);
     syscall::register(shm::SYSCALLS, shm::sys);
+    syscall::register(msg::SYSCALLS, msg::sys);
+    syscall::register(sem::SYSCALLS, sem::sys);
+    proc::register_exit_hook(sem::exit);
     syscall::register(inotify::SYSCALLS, inotify::sys);
     // ファイルのロック (Linux の CONFIG_FILE_LOCKING): flock と、fcntl のロック・閉じたときに外すもの (file::FileLocks)
     file::register_locks(&locks::OPS);

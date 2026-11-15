@@ -163,6 +163,8 @@ enum Node {
     /// /proc/sysvipc と、その中の shm (System V の共有メモリの一覧: shm.rs。ipcs が読む)
     SysvipcDir,
     SysvipcShm,
+    SysvipcMsg,
+    SysvipcSem,
 }
 
 pub struct ProcInode {
@@ -366,6 +368,8 @@ impl ProcInode {
             Node::AiStack(t) => (t as u64) << 16 | 31,
             Node::SysvipcDir => 56,
             Node::SysvipcShm => 57,
+            Node::SysvipcMsg => 59,
+            Node::SysvipcSem => 60,
         }
     }
 
@@ -569,6 +573,8 @@ impl ProcInode {
             Node::Diskstats => crate::block::proc_diskstats(),
             Node::Buddyinfo => buddyinfo(),
             Node::SysvipcShm => crate::shm::proc_text(),
+            Node::SysvipcMsg => crate::msg::proc_text(),
+            Node::SysvipcSem => crate::sem::proc_text(),
             Node::Vmstat => {
                 use core::sync::atomic::Ordering::Relaxed;
                 // ページ (4 KiB) の数と、Linux の vmstat が読む数え (ないものは 0)
@@ -1617,6 +1623,8 @@ impl Inode for ProcInode {
             (Node::Root, "net") => Node::NetLink,
             (Node::Root, "sysvipc") => Node::SysvipcDir,
             (Node::SysvipcDir, "shm") => Node::SysvipcShm,
+            (Node::SysvipcDir, "msg") => Node::SysvipcMsg,
+            (Node::SysvipcDir, "sem") => Node::SysvipcSem,
             (Node::Root, "ai") if !crate::parts::off(crate::parts::Part::Aiproc) => Node::AiDir,
             (Node::AiDir, "threads") => Node::AiThreads,
             (Node::AiDir, "bkl") => Node::AiBkl,
@@ -1806,7 +1814,11 @@ impl Inode for ProcInode {
                     add(format!("{}", p.tgid), Node::AiFd(p.tgid));
                 }
             }
-            Node::SysvipcDir => add("shm".into(), Node::SysvipcShm),
+            Node::SysvipcDir => {
+                add("msg".into(), Node::SysvipcMsg);
+                add("sem".into(), Node::SysvipcSem);
+                add("shm".into(), Node::SysvipcShm);
+            }
             Node::NetDir => {
                 add("pnp".into(), Node::Pnp);
                 add("route".into(), Node::Route);
