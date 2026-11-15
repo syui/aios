@@ -32,6 +32,7 @@ pub const CAP_SYS_MODULE: u32 = 16;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_NICE: u32 = 23;
@@ -233,8 +234,12 @@ fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
 /// 見られないように (持ちもの (mm) のないカーネルのスレッドはそのまま)
 pub fn changed(p: &mut proc::Proc, new: &Cred) {
     let o = &p.cred;
-    if (new.euid != o.euid || new.egid != o.egid || new.fsuid != o.fsuid || new.fsgid != o.fsgid) && p.mm.is_some() {
-        p.mm().dumpable = crate::exec::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    if new.euid != o.euid || new.egid != o.egid || new.fsuid != o.fsuid || new.fsgid != o.fsgid {
+        // PDEATHSIG も外れる (Linux の commit_creds)
+        p.pdeath_signal = 0;
+        if p.mm.is_some() {
+            p.mm().dumpable = crate::exec::SUID_DUMPABLE.load(core::sync::atomic::Ordering::Relaxed) as u8;
+        }
     }
 }
 

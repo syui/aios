@@ -127,6 +127,8 @@ pub struct Mm {
     pub exe_id: (usize, u64),
     /// exec で積んだ auxv (型と値の並び。AT_NULL まで: /proc/PID/auxv。Linux の mm->saved_auxv)
     pub auxv: Vec<u64>,
+    /// PR_SET_THP_DISABLE の印 (fork でも exec でも受けつぐ: Linux の MMF_DISABLE_THP)
+    pub thp_disable: bool,
     /// 引数と環境の文字列の場所 (arg_start, env_start, env_end)
     pub args: (usize, usize, usize),
     /// PR_GET_DUMPABLE / PR_SET_DUMPABLE (0 作らない、1 作る、2 root の権利で)。exec で 1 (setuid / setgid のもので
@@ -446,6 +448,16 @@ pub struct Proc {
     pub default_slack_ns: u64,
     /// いま入っているシステムコールの番号 (ユーザーからほかの入り方で入ったなら -1: trap.rs。/proc/PID/syscall)
     pub sysno: i64,
+    /// 親が終わったときに受けるシグナル (prctl の PR_SET_PDEATHSIG: スレッドごと。fork した子は 0、id が変われば 0)
+    pub pdeath_signal: u8,
+    /// みなし子をひきとる (PR_SET_CHILD_SUBREAPER: 代表スレッドに。fork では受けつがない: Linux の is_child_subreaper)
+    pub child_subreaper: bool,
+    /// securebits (PR_GET/SET_SECUREBITS と KEEPCAPS: Linux の cred->securebits。exec で KEEP_CAPS は外れる) と、
+    /// 落とした capability (PR_CAPBSET_DROP: ビットが立っているものが落としたもの)。aios は覚えて見せるだけ
+    pub securebits: u32,
+    pub capbset_dropped: u64,
+    /// PR_MCE_KILL (0 既定、1 遅く、2 はやく: Linux の PF_MCE_PROCESS と PF_MCE_EARLY)。aios は覚えて見せるだけ
+    pub mce_kill: u8,
     /// CPU をゆずった数: 眠った (自分から) と、走れるままゆずった (Linux の nvcsw と nivcsw: /proc/PID/sched)
     pub nvcsw: u64,
     pub nivcsw: u64,
@@ -619,6 +631,11 @@ impl Proc {
         timer_slack_ns: 50_000,
         default_slack_ns: 50_000,
         sysno: -1,
+        pdeath_signal: 0,
+        child_subreaper: false,
+        securebits: 0,
+        capbset_dropped: 0,
+        mce_kill: 0,
         nvcsw: 0,
         nivcsw: 0,
         timers: Vec::new(),
@@ -757,7 +774,8 @@ impl Proc {
         if (img.setuid.is_some() || img.setgid.is_some()) && !self.cred.no_new_privs && self.cred.ns.user.is_none() {
             self.personality &= !PER_CLEAR_ON_SETID;
         }
-        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv }));
+        let thp_disable = self.mm.as_ref().is_some_and(|m| m.get().thp_disable);
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv, thp_disable }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -1065,9 +1083,11 @@ fn kid_unlink(child: usize) {
     ps[child].sib = Sib::NONE;
 }
 
-/// me (スロット) の子をみな init にわたす (Linux の forget_original_parent): init の子の並びの末尾へ同じ順で。子の
-/// スレッドの ppid も 1 に (getppid。Linux は子のスレッドみなの real_parent を変える)。終わっている (ゾンビの) 子は、
-/// Linux と同じく init に SIGCHLD を送って、wait で眠っている init を起こす (ゾンビがいなければ init は起こさない)
+/// me (スロット) の子をみな、いちばん近い CHILD_SUBREAPER の先祖 (生きているもの)、なければ init にわたす (Linux の
+/// forget_original_parent と find_new_reaper): その子の並びの末尾へ同じ順で。子のスレッドの ppid も (getppid。Linux は
+/// 子のスレッドみなの real_parent を変える)。PDEATHSIG をつけている子のスレッドには、そのプロセスにシグナルを (Linux と
+/// 同じく SI_USER、送り手は終わるプロセス)。終わっている (ゾンビの) 子は、ひきとる人に SIGCHLD を送って、wait で眠って
+/// いれば起こす (ゾンビがいなければ起こさない)
 fn reparent_kids(me: usize) {
     let ps = procs();
     let first = ps[me].kids.0;
@@ -1076,12 +1096,34 @@ fn reparent_kids(me: usize) {
     }
     ps[me].kids = (NONE, NONE);
     let tgid = ps[me].tgid;
+    let mut reaper = 1;
+    let mut a = ps[me].ppid;
+    for _ in 0..NPROC {
+        if a <= 1 {
+            break;
+        }
+        let Some(l) = find_leader(a) else { break };
+        if l.child_subreaper && l.group_exit.is_none() && !l.killed {
+            reaper = l.tgid;
+            break;
+        }
+        a = l.ppid;
+    }
+    let (me_uid, me_tgid) = (ps[me].cred.uid, tgid);
+    let mut deaths = Vec::new();
     for c in live() {
         if c.ppid == tgid && c.tgid != tgid {
-            c.ppid = 1;
+            c.ppid = reaper;
+            if c.pdeath_signal != 0 && c.state != State::Zombie {
+                deaths.push((c.tgid, c.pdeath_signal as i32));
+            }
         }
     }
-    let init = find(1).map(|p| slot_of(p));
+    for (t, sig) in deaths {
+        let info = SigInfo { pid: me_tgid, uid: me_uid, ..SigInfo::from(crate::signal::SI_USER) };
+        let _ = crate::signal::send_group(t, sig, info);
+    }
+    let init = find(reaper).map(|p| slot_of(p));
     let mut zombie = false;
     let mut i = first;
     while i != NONE {
@@ -1470,7 +1512,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new() }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new(), thp_disable: false }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -2138,7 +2180,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             None => m.pt.fork(),
         };
         let pt = pt.ok_or(-ENOMEM)?;
-        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone() })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone(), thp_disable: m.thp_disable })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
@@ -2181,7 +2223,11 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.oom_score_adj = l.oom_score_adj;
         child.oom_score_adj_min = l.oom_score_adj_min;
     }
-    // personality とタイマーのゆとりはスレッドごと (copy_process: ゆとりの既定は親のいまの値)
+    // personality とタイマーのゆとりはスレッドごと (copy_process: ゆとりの既定は親のいまの値)。securebits と落とした
+    // capability は資格 (cred) と同じく受けつぐ。PDEATHSIG は受けつがない
+    child.securebits = parent.securebits;
+    child.capbset_dropped = parent.capbset_dropped;
+    child.mce_kill = parent.mce_kill;
     child.personality = parent.personality;
     child.timer_slack_ns = parent.timer_slack_ns;
     child.default_slack_ns = parent.timer_slack_ns;
@@ -2343,6 +2389,11 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
         dumpable = suid_dumpable;
     }
     p.mm().dumpable = dumpable;
+    // id が変われば PDEATHSIG は外れる (commit_creds)。KEEP_CAPS は exec で外れる
+    if p.cred.euid != old_euid || p.cred.egid != old_egid || p.cred.fsuid != old_fsuid || p.cred.fsgid != old_fsgid {
+        p.pdeath_signal = 0;
+    }
+    p.securebits &= !(1 << 4);
     if fatal {
         crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
     }

@@ -1215,8 +1215,12 @@ pub struct Vma {
     pub back: Backing,
     /// 写したファイルのパス (/proc/PID/maps と、落ちたときの知らせ)
     pub name: Option<alloc::rc::Rc<str>>,
-    /// fork した子には中身を写さない (0 のページから: Linux の VM_WIPEONFORK。MAP_DROPPABLE)
+    /// fork した子には中身を写さない (0 のページから: Linux の VM_WIPEONFORK。MAP_DROPPABLE と MADV_WIPEONFORK)
     pub wipe: bool,
+    /// MAP_DROPPABLE で作った (MADV_KEEPONFORK で wipe を外せない: VM_DROPPABLE)
+    pub droppable: bool,
+    /// fork した子に領域ごと写さない (MADV_DONTFORK: VM_DONTCOPY)
+    pub dontcopy: bool,
 }
 
 /// ページフォールトの結果
@@ -2106,7 +2110,7 @@ impl PageTable {
         self.unmap_inner(start, end);
         self.note(b'm', start, end, prot);
         self.last_end = end;
-        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false });
+        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false, droppable: false, dontcopy: false });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
@@ -2271,7 +2275,7 @@ impl PageTable {
             match self.vmas.get_mut(&start) {
                 Some(v) if v.end == old_end => v.end = new_end,
                 _ => {
-                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false });
+                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false, droppable: false, dontcopy: false });
                 }
             }
         } else if new_end < old_end {
@@ -3505,7 +3509,7 @@ impl PageTable {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
                 self.last_end = end;
-                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false });
+                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false, droppable: false, dontcopy: false });
                 Ok(va)
             }
             _ => Err((back, name)),
@@ -3632,7 +3636,7 @@ impl PageTable {
     pub fn fork(&mut self) -> Option<PageTable> {
         let _m = self.mutating();
         let mut new = PageTable::new()?;
-        new.vmas = self.vmas.clone();
+        new.vmas = self.child_vmas();
         let ok = self.copy_ptes(&new, &self.areas(), false);
         flush_all_in(self.root_pa());
         if !ok {
@@ -3646,14 +3650,64 @@ impl PageTable {
     /// 子は 0 のページから
     // [lockless]
     fn areas(&self) -> Vec<(usize, usize, u8, bool)> {
-        self.vmas.iter().filter(|(_, v)| !v.wipe).map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
+        self.vmas.iter().filter(|(_, v)| !v.wipe && !v.dontcopy).map(|(&s, v)| (s, v.end, v.prot, v.shared)).collect()
+    }
+
+    /// fork した子に渡す領域 (MADV_DONTFORK のものはのぞく)
+    fn child_vmas(&self) -> BTreeMap<usize, Vma> {
+        self.vmas.iter().filter(|(_, v)| !v.dontcopy).map(|(&s, v)| (s, v.clone())).collect()
     }
 
     /// start から始まる領域を、fork した子に中身を写さないものに (MAP_DROPPABLE)
     pub fn set_wipe(&mut self, start: usize) {
         if let Some(v) = self.vmas.get_mut(&start) {
             v.wipe = true;
+            v.droppable = true;
         }
+    }
+
+    /// madvise の領域ごとのもの (Linux の madvise_walk_vmas): [start, end) の領域をみな check で見て (だめならそのエラー)、
+    /// 範囲の端で分けてから apply する。写していないところがあれば true (呼ぶほうは写したところにしてから ENOMEM)
+    pub fn advise(&mut self, start: usize, end: usize, check: impl Fn(&Vma) -> Result<(), i64>, mut apply: impl FnMut(&mut Vma)) -> Result<bool, i64> {
+        let _m = self.mutating();
+        let mut gap = false;
+        let mut va = start;
+        while va < end {
+            match self.find(va) {
+                Some((_, v)) => {
+                    check(v)?;
+                    va = v.end;
+                }
+                None => {
+                    gap = true;
+                    match self.vmas.range(va..).next() {
+                        Some((&s, _)) if s < end => va = s,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        self.split(start);
+        self.split(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            apply(v);
+        }
+        Ok(gap)
+    }
+
+    /// [start, end) のページを写しておく (MADV_POPULATE_READ / WRITE)。写していないところは false
+    pub fn populate(&mut self, start: usize, end: usize, write: bool) -> bool {
+        let mut va = start;
+        while va < end {
+            if self.find(va).is_none() {
+                return false;
+            }
+            if self.user_pa(va, write, false).is_none() {
+                return false;
+            }
+            va += PGSIZE;
+        }
+        true
     }
 
     /// fork: areas の PTE を new へ写す (private の領域は両方とも COW に)。TLB は呼ぶほうが消す。unlocked (大きなロック
@@ -3733,7 +3787,7 @@ impl PageTable {
             return self.fork();
         }
         let mut new = pre.pt;
-        new.vmas = self.vmas.clone();
+        new.vmas = self.child_vmas();
         Some(new)
     }
 

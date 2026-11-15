@@ -142,8 +142,11 @@ fn attaches(ino: &InodeRef) -> usize {
             continue;
         }
         seen.push(pt);
-        // SAFETY: 大きなロックの中で、生きているプロセスのアドレス空間を読むだけ (/proc/PID/maps と同じ)
-        n += unsafe { &*pt }.vmas_iter().filter(|(_, v)| matches!(&v.back, crate::vm::Backing::File { ino: i, .. } if same(i, ino))).count();
+        // SAFETY: 大きなロックの中で、生きているプロセスのアドレス空間を読むだけ (/proc/PID/maps と同じ)。そのプロセスの
+        // ロックなしの mmap / munmap (vm::PageTable::fast_unmap) が領域の木を変えている途中でないように hold で止める
+        let t = unsafe { &*pt };
+        let _h = t.hold();
+        n += t.vmas_iter().filter(|(_, v)| matches!(&v.back, crate::vm::Backing::File { ino: i, .. } if same(i, ino))).count();
     }
     n
 }

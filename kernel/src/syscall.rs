@@ -1381,14 +1381,77 @@ fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
     proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map(|_| 0).map_err(|_| -ENOMEM)
 }
 
-/// MADV_DONTNEED は無名のページを捨てる (次に触れると 0)。ほかは何もしない
+/// madvise (Linux の do_madvise と同じ順: 知らない値・そろっていない番地・あふれる長さは EINVAL、長さ 0 は 0。写して
+/// いないところがあれば、写したところにしてから ENOMEM)。
+///   DONTNEED (と _LOCKED)  無名のページを捨てる (次に触れると 0)
+///   FREE                    私有の無名だけ (ほかは EINVAL)。aios は捨てない (中身はそのまま: Linux もメモリが足りるうちは)
+///   REMOVE                  ファイルのないものは EINVAL、共有で書けるファイルのものでなければ EACCES。穴をあけるのは
+///                           まだできない (EOPNOTSUPP)
+///   DONTFORK / DOFORK       fork した子に領域ごと写さない / 写す
+///   WIPEONFORK / KEEPONFORK 私有の無名だけ (ほかは EINVAL)。子では 0 から。MAP_DROPPABLE のものは KEEPONFORK で外せない
+///   POPULATE_READ / WRITE   ページを写しておく (読めない・書けない領域は EINVAL)
+///   NORMAL RANDOM SEQUENTIAL WILLNEED DONTDUMP DODUMP COLD PAGEOUT  何もしない (DODUMP と COLD と PAGEOUT は、ページを
+///                           持たない装置の写しなら EINVAL)
+/// GUARD_INSTALL / REMOVE (Linux 6.13 の見張りのページ) はまだない: EINVAL (glibc は mprotect にする)。HUGEPAGE、MERGEABLE、
+/// HWPOISON などは手本の Linux の設定にもないので EINVAL
 fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
-    const MADV_DONTNEED: u64 = 4;
-    if addr & 0xfff != 0 {
+    const ENOMEM: i64 = 12;
+    const EACCES: i64 = 13;
+    const DONTNEED: u64 = 4;
+    const FREE: u64 = 8;
+    const REMOVE: u64 = 9;
+    const DONTFORK: u64 = 10;
+    const DOFORK: u64 = 11;
+    const DODUMP: u64 = 17;
+    const WIPEONFORK: u64 = 18;
+    const KEEPONFORK: u64 = 19;
+    const COLD: u64 = 20;
+    const PAGEOUT: u64 = 21;
+    const POPULATE_READ: u64 = 22;
+    const POPULATE_WRITE: u64 = 23;
+    const DONTNEED_LOCKED: u64 = 24;
+    if !matches!(advice, 0..=4 | 8..=11 | 16..=24) || addr & 0xfff != 0 {
         return Err(crate::why::inval());
     }
-    if advice == MADV_DONTNEED {
-        proc::current().pt().discard(addr, addr + pg_up(len));
+    let alen = len.checked_add(0xfff).map(|l| l & !0xfff).ok_or_else(crate::why::inval)?;
+    let end = addr.checked_add(alen).ok_or_else(crate::why::inval)?;
+    if end == addr {
+        return Ok(0);
+    }
+    let pt = proc::current().pt();
+    let anon_private = |v: &crate::vm::Vma| matches!(v.back, Backing::Anon) && !v.shared;
+    let gap = match advice {
+        DONTNEED | DONTNEED_LOCKED => {
+            let gap = pt.advise(addr, end, |_| Ok(()), |_| {})?;
+            pt.discard(addr, end);
+            gap
+        }
+        FREE => pt.advise(addr, end, |v| if anon_private(v) { Ok(()) } else { Err(crate::why::inval()) }, |_| {})?,
+        REMOVE => pt.advise(
+            addr,
+            end,
+            |v| match &v.back {
+                Backing::File { .. } if v.shared && v.prot & crate::vm::PROT_WRITE != 0 => Err(-EOPNOTSUPP),
+                Backing::File { .. } => Err(-EACCES),
+                _ => Err(crate::why::inval()),
+            },
+            |_| {},
+        )?,
+        DONTFORK | DOFORK => pt.advise(addr, end, |_| Ok(()), |v| v.dontcopy = advice == DONTFORK)?,
+        WIPEONFORK => pt.advise(addr, end, |v| if anon_private(v) { Ok(()) } else { Err(crate::why::inval()) }, |v| v.wipe = true)?,
+        KEEPONFORK => pt.advise(addr, end, |v| if v.droppable { Err(crate::why::inval()) } else { Ok(()) }, |v| v.wipe = false)?,
+        POPULATE_READ | POPULATE_WRITE => {
+            let write = advice == POPULATE_WRITE;
+            let want = if write { crate::vm::PROT_WRITE } else { crate::vm::PROT_READ };
+            let gap = pt.advise(addr, end, |v| if v.prot & want != 0 { Ok(()) } else { Err(crate::why::inval()) }, |_| {})?;
+            pt.populate(addr, end, write);
+            gap
+        }
+        DODUMP | COLD | PAGEOUT => pt.advise(addr, end, |v| if matches!(v.back, Backing::Pages { .. }) { Err(crate::why::inval()) } else { Ok(()) }, |_| {})?,
+        _ => pt.advise(addr, end, |_| Ok(()), |_| {})?,
+    };
+    if gap {
+        return Err(-ENOMEM);
     }
     Ok(0)
 }
@@ -1952,7 +2015,8 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> R {
 }
 
 /// prctl: 名前 (PR_SET_NAME / PR_GET_NAME)、no_new_privs、seccomp、投機の止め方 (PR_GET/SET_SPECULATION_CTRL)、dumpable、
-/// タイマーのゆとり (PR_SET/GET_TIMERSLACK)。
+/// タイマーのゆとり (PR_SET/GET_TIMERSLACK)、PDEATHSIG、CHILD_SUBREAPER、KEEPCAPS と SECUREBITS、CAPBSET、CAP_AMBIENT、
+/// TIMING、THP_DISABLE、TSC、MCE_KILL、IO_FLUSHER。知らないものは EINVAL (Linux と同じ)。
 /// ほかは何もしない
 fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_SPECULATION_CTRL: u64 = 52;
@@ -1967,8 +2031,164 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_SET_DUMPABLE: u64 = 4;
     const PR_GET_TIMERSLACK: u64 = 30;
     const PR_SET_TIMERSLACK: u64 = 29;
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
+    const PR_GET_KEEPCAPS: u64 = 7;
+    const PR_SET_KEEPCAPS: u64 = 8;
+    const PR_GET_TIMING: u64 = 13;
+    const PR_SET_TIMING: u64 = 14;
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_CAPBSET_DROP: u64 = 24;
+    const PR_GET_TSC: u64 = 25;
+    const PR_SET_TSC: u64 = 26;
+    const PR_GET_SECUREBITS: u64 = 27;
+    const PR_SET_SECUREBITS: u64 = 28;
+    const PR_MCE_KILL: u64 = 33;
+    const PR_MCE_KILL_GET: u64 = 34;
+    const PR_SET_MM: u64 = 35;
+    const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    const PR_SET_THP_DISABLE: u64 = 41;
+    const PR_GET_THP_DISABLE: u64 = 42;
+    const PR_CAP_AMBIENT: u64 = 47;
+    const PR_SET_IO_FLUSHER: u64 = 57;
+    const PR_GET_IO_FLUSHER: u64 = 58;
+    /// CAP_LAST_CAP (40: CAP_CHECKPOINT_RESTORE)
+    const CAP_LAST: u64 = 40;
+    const EPERM: i64 = 1;
+    let put_int = |va: usize, v: i32| out(va, &v.to_le_bytes());
     let p = proc::current();
     match op {
+        // 親が終わったときのシグナル (0 から 64。proc::reparent_kids が送る)
+        PR_SET_PDEATHSIG => {
+            if arg > 64 {
+                return Err(crate::why::inval());
+            }
+            p.pdeath_signal = arg as u8;
+        }
+        PR_GET_PDEATHSIG => put_int(arg, p.pdeath_signal as i32)?,
+        // みなし子をひきとる (代表スレッドに。proc::reparent_kids が見る)
+        PR_SET_CHILD_SUBREAPER => {
+            let l = if p.pid != p.tgid { proc::find_leader_any(p.tgid) } else { None };
+            match l {
+                Some(l) => l.child_subreaper = arg != 0,
+                None => p.child_subreaper = arg != 0,
+            }
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let l = if p.pid != p.tgid { proc::find_leader_any(p.tgid) } else { None };
+            let v = l.map_or(p.child_subreaper, |l| l.child_subreaper);
+            put_int(arg, v as i32)?;
+        }
+        // securebits の KEEP_CAPS (4)。LOCKED (5) なら変えられない
+        PR_GET_KEEPCAPS => return Ok((p.securebits >> 4 & 1) as i64),
+        PR_SET_KEEPCAPS => {
+            if arg > 1 {
+                return Err(crate::why::inval());
+            }
+            if p.securebits & 1 << 5 != 0 {
+                return Err(-EPERM);
+            }
+            p.securebits = p.securebits & !(1 << 4) | (arg as u32) << 4;
+        }
+        PR_GET_SECUREBITS => return Ok(p.securebits as i64),
+        // CAP_SETPCAP がなければ、知らないビット (0xfff の外)・ロックしたものを変える・ロックを外すのは EPERM (Linux の
+        // cap_task_prctl)
+        PR_SET_SECUREBITS => {
+            let old = p.securebits as u64;
+            let locks = old & 0xaaa;
+            if (locks >> 1) & (old ^ arg as u64) != 0 || locks & !(arg as u64) != 0 || arg as u64 & !0xfff != 0 || !p.cred.capable(cred::CAP_SETPCAP) {
+                return Err(-EPERM);
+            }
+            p.securebits = arg as u32;
+        }
+        PR_CAPBSET_READ => {
+            if arg as u64 > CAP_LAST {
+                return Err(crate::why::inval());
+            }
+            return Ok((p.capbset_dropped >> arg & 1 == 0) as i64);
+        }
+        PR_CAPBSET_DROP => {
+            if !p.cred.capable(cred::CAP_SETPCAP) {
+                return Err(-EPERM);
+            }
+            if arg as u64 > CAP_LAST {
+                return Err(crate::why::inval());
+            }
+            p.capbset_dropped |= 1 << arg;
+        }
+        // ambient の capability はない: IS_SET は 0、RAISE は EPERM (継ぐ集合が空: Linux の root も同じ)
+        PR_CAP_AMBIENT => {
+            if arg == 4 {
+                if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                    return Err(crate::why::inval());
+                }
+                return Ok(0);
+            }
+            if arg3 as u64 > CAP_LAST || arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            return match arg {
+                1 | 3 => Ok(0),
+                2 => Err(-EPERM),
+                _ => Err(crate::why::inval()),
+            };
+        }
+        PR_GET_TIMING => return Ok(0),
+        PR_SET_TIMING => {
+            if arg != 0 {
+                return Err(crate::why::inval());
+            }
+        }
+        // 大きなページは aios にないが、印は持ちものごとに覚える (fork と exec で受けつぐ)
+        PR_SET_THP_DISABLE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            p.mm().thp_disable = arg != 0;
+        }
+        PR_GET_THP_DISABLE => {
+            if arg != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            return Ok(p.mm().thp_disable as i64);
+        }
+        // カウンタ (CNTVCT) はいつも読める (PR_TSC_ENABLE)。止める (PR_TSC_SIGSEGV) はまだ
+        PR_GET_TSC => put_int(arg, 1)?,
+        PR_SET_TSC => {
+            if arg != 1 {
+                return Err(crate::why::inval());
+            }
+        }
+        PR_MCE_KILL => {
+            if arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            p.mce_kill = match (arg, arg3) {
+                (0, 0) => 0,
+                (1, 0) => 1,
+                (1, 1) => 2,
+                (1, 2) => 0,
+                _ => return Err(crate::why::inval()),
+            };
+        }
+        PR_MCE_KILL_GET => {
+            if arg != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(crate::why::inval());
+            }
+            return Ok(match p.mce_kill {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            });
+        }
+        PR_SET_MM | PR_GET_IO_FLUSHER | PR_SET_IO_FLUSHER if !p.cred.capable(cred::CAP_SYS_RESOURCE) => return Err(-EPERM),
+        PR_GET_IO_FLUSHER => return Ok(0),
+        PR_SET_IO_FLUSHER => {
+            if arg > 1 {
+                return Err(crate::why::inval());
+            }
+        }
         // タイマーのゆとり: 0 なら fork したときの値にもどす (Linux の prctl。aios のタイマーは使わない)
         PR_SET_TIMERSLACK => p.timer_slack_ns = if arg == 0 { p.default_slack_ns } else { arg as u64 },
         PR_GET_TIMERSLACK => return Ok(p.timer_slack_ns as i64),
@@ -2016,7 +2236,8 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             let ssb = p.spec_ssb;
             crate::cpuvuln::task_spsr(&mut p.tf().spsr, ssb);
         }
-        _ => {}
+        // 知らないもの (手本の Linux の設定にないもの: SET_MM の中身、TID_ADDRESS、SET_VMA、MEMORY_MERGE、SVE など) は EINVAL
+        _ => return Err(crate::why::inval()),
     }
     Ok(0)
 }

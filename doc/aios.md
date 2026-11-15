@@ -614,6 +614,29 @@ test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のペ�
 - task/TID: Linux と同じ 36 の名前 (スレッドごとのものは stat、status、comm、syscall、sched、personality。ほかはプロセスのもの)。
   test/procpid.c は /proc/self (41) と task/TID (36) のならびと種類と許可が Linux 7.4 と同じ (stack は手本にないので見ない)
 - まだ: cgroup、io、wchan、schedstat、coredump_filter、timers など (手本の Linux の設定にもない)
+
+madvise と prctl も Linux の答えに (2026-11-15。前は知らない値も 0 で受け、多くを何もせず 0 にしていた):
+
+- madvise (syscall.rs の sys_madvise、vm.rs の advise): Linux の do_madvise と同じ順で、知らない値・そろっていない番地・
+  あふれる長さは EINVAL、長さ 0 は 0、写していないところがあれば写したところにしてから ENOMEM。DONTNEED (と _LOCKED) は
+  捨てる、FREE は私有の無名だけ (aios は捨てずに中身を残す: Linux もメモリが足りるうちは)、REMOVE はファイルのないもの
+  EINVAL・共有で書けるファイルでなければ EACCES (穴をあけるのはまだ: EOPNOTSUPP)、DONTFORK / DOFORK (fork した子に
+  領域ごと写さない: Vma::dontcopy)、WIPEONFORK / KEEPONFORK (私有の無名だけ。子では 0 から: Vma::wipe。MAP_DROPPABLE の
+  ものは外せない)、POPULATE_READ / WRITE (先に写す。読めない・書けない領域は EINVAL)、ほかの知らせ (NORMAL、RANDOM、
+  SEQUENTIAL、WILLNEED、DONTDUMP、DODUMP、COLD、PAGEOUT) は何もしない。GUARD_INSTALL / REMOVE (Linux 6.13 の見張りの
+  ページ) はまだなので EINVAL (glibc は mprotect で見張りのページを作る)。HUGEPAGE、MERGEABLE、HWPOISON などは手本の Linux
+  の設定にもないので EINVAL。test/madvise.c は Linux 7.4 と 8 行同じ
+- prctl: 知らないものは EINVAL (Linux と同じ。手本の設定にない SET_VMA、TID_ADDRESS、MEMORY_MERGE、SVE なども)。
+  PDEATHSIG (0〜64。スレッドごと、fork した子は 0、id が変われば 0。親のプロセスが終わると、みなし子をわたすときに
+  そのプロセスへ SI_USER で送る: Linux は子を作ったスレッドが終わったときに送るが、aios の子は代表スレッドのものなので、
+  プロセスが終わったとき)、CHILD_SUBREAPER (代表スレッドに。終わったプロセスの子は、いちばん近い SUBREAPER の先祖
+  (生きているもの) へ、なければ init へ: Linux の find_new_reaper)、KEEPCAPS と SECUREBITS (CAP_SETPCAP がなければ
+  EPERM)、CAPBSET_READ / DROP、CAP_AMBIENT (ambient はない: IS_SET は 0、RAISE は EPERM)、TIMING、THP_DISABLE (持ち
+  ものごと、fork と exec で受けつぐ)、TSC (いつも読める)、MCE_KILL、IO_FLUSHER と SET_MM (CAP_SYS_RESOURCE がなければ
+  EPERM)。securebits、capability の境界、MCE_KILL は覚えて見せるだけ。test/prctl.c は Linux 7.4 と 13 行同じ
+- shm の nattch (shm.rs の attaches) が、ほかのプロセスの領域の木を hold なしで読んでいた (そのプロセスのロックなしの
+  munmap と同時になると、木をたどる途中でこわれてカーネルが止まる: ctests の shm で 1 度)。/proc/PID/maps と同じく hold で
+  ロックなしの書き手を止めてから数える
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
