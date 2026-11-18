@@ -394,7 +394,11 @@ pub fn set_root(r: InodeRef, source: &str, fstype: &str) {
     mount_at_refresh();
 }
 
+/// いまのプロセスの namespace の根 (pivot_root で入れかえたもの。なければはじめからのルート)
 pub fn root() -> InodeRef {
+    if let Some(r) = crate::proc::current_mnt().and_then(|ns| ns.top.borrow().as_ref().map(|m| m.root.clone())) {
+        return r;
+    }
     ROOT.get().clone().expect("no root filesystem")
 }
 
@@ -425,7 +429,9 @@ pub struct MountNs {
     /// 作ったときのユーザーの namespace (その中の root がマウントしてよい)
     pub owner: u64,
     /// ルート (/) のマウントの番号
-    root_id: u32,
+    root_id: core::cell::Cell<u32>,
+    /// pivot_root でルートにしたマウント (根、もと、種類。at と target は使わない)。None ははじめからのルート (ROOT)
+    top: core::cell::RefCell<Option<Mount>>,
     list: core::cell::RefCell<Vec<Mount>>,
 }
 
@@ -448,7 +454,15 @@ static ALL_MNT: Bkl<Vec<alloc::rc::Weak<MountNs>>> = Bkl::new(Vec::new());
 
 fn init_mnt() -> Rc<MountNs> {
     (*INIT_MNT.get())
-        .get_or_insert_with(|| Rc::new(MountNs { id: crate::ns::INIT_MNT, owner: crate::ns::INIT_USER, root_id: new_mnt_id(), list: core::cell::RefCell::new(Vec::new()) }))
+        .get_or_insert_with(|| {
+            Rc::new(MountNs {
+                id: crate::ns::INIT_MNT,
+                owner: crate::ns::INIT_USER,
+                root_id: core::cell::Cell::new(new_mnt_id()),
+                top: core::cell::RefCell::new(None),
+                list: core::cell::RefCell::new(Vec::new()),
+            })
+        })
         .clone()
 }
 
@@ -459,11 +473,17 @@ fn current_mnt() -> Rc<MountNs> {
 
 /// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)。写したマウントは新しい番号 (Linux の copy_tree)
 pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
-    let mut list = current_mnt().list.borrow().clone();
+    let from = current_mnt();
+    let mut list = from.list.borrow().clone();
     for m in list.iter_mut() {
         m.id = new_mnt_id();
     }
-    let n = Rc::new(MountNs { id, owner, root_id: new_mnt_id(), list: core::cell::RefCell::new(list) });
+    let root_id = new_mnt_id();
+    let top = from.top.borrow().clone().map(|mut m| {
+        m.id = root_id;
+        m
+    });
+    let n = Rc::new(MountNs { id, owner, root_id: core::cell::Cell::new(root_id), top: core::cell::RefCell::new(top), list: core::cell::RefCell::new(list) });
     let all = ALL_MNT.get();
     all.retain(|w| w.strong_count() > 0);
     all.push(Rc::downgrade(&n));
@@ -601,7 +621,7 @@ fn mount_at_refresh() {
     let l = ns.list.borrow();
     let rootfs = ROOT.get().as_ref().map(|r| r.id().0);
     let alone = rootfs.is_some_and(|fs| !l.iter().any(|m| m.root.id().0 == fs));
-    ROOT_FS_MNT.store(if alone { ns.root_id as u64 } else { 0 }, SeqCst);
+    ROOT_FS_MNT.store(if alone { ns.root_id.get() as u64 } else { 0 }, SeqCst);
     if l.len() > MOUNT_AT.len() {
         MOUNT_MANY.store(true, SeqCst);
     }
@@ -652,17 +672,30 @@ pub fn check_writable(path: &str) -> Result<(), i64> {
     if deepest.is_some_and(|m| m.ro) { Err(-EROFS) } else { Ok(()) }
 }
 
-/// path にかぶせてあるもの (いちばん上) を外す
-pub fn umount(path: &str) -> Result<(), i64> {
+/// path にかぶせてあるもの (いちばん上) を外す。detach (MNT_DETACH) なら、その下にあるマウントもいっしょに (Linux の
+/// umount_tree)
+pub fn umount(path: &str, detach: bool) -> Result<(), i64> {
     let top = resolve("", path, true)?;
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
     let i = l.iter().rposition(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
     // その上にまだかぶせてあるものがあれば外せない
-    if l[i + 1..].iter().any(|m| m.at == top.id()) {
+    if !detach && l[i + 1..].iter().any(|m| m.at == top.id()) {
         return Err(-16); // EBUSY
     }
-    let was_ro = l.remove(i).ro;
+    let gone = l.remove(i);
+    let mut was_ro = gone.ro;
+    if detach {
+        let t = gone.target.clone();
+        let mut k = i;
+        while k < l.len() {
+            if under(&l[k].target, &t) {
+                was_ro |= l.remove(k).ro;
+            } else {
+                k += 1;
+            }
+        }
+    }
     drop(l);
     if was_ro {
         ro_refresh();
@@ -670,6 +703,112 @@ pub fn umount(path: &str) -> Result<(), i64> {
     mount_at_refresh();
     names_changed();
     // 閉じたファイルの棚 (file::Shelf) に、外したものの inode が残らないように
+    crate::file::shelf_flush_all();
+    Ok(())
+}
+
+/// a と b (先頭 / なし。どちらかが "" でも) をつなぐ
+fn join_rel(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b.into(),
+        (_, true) => a.into(),
+        _ => alloc::format!("{}/{}", a, b),
+    }
+}
+
+/// p (t の下) の t から先 (先頭 / なし)
+fn below<'a>(p: &'a str, t: &str) -> &'a str {
+    p[t.len()..].trim_start_matches('/')
+}
+
+/// pivot_root (Linux の fs/namespace.c の do_pivot_root)。root はいまのプロセスの根 (chroot の根。"" は namespace の
+/// 根)、new と old はたどったあとのパス、old_id は old のディレクトリ (マウントの上ならそのいちばん上の根)。
+/// たしかめは Linux と同じ順: new か old が根と同じマウントにあれば EBUSY、根がマウントの根でない、根のマウントに親が
+/// ない (はじめの namespace の根: Linux の rootfs と同じに見る。速い道ははじめの根を見ている)、new がマウントの根でない、
+/// old が new の下にない、は EINVAL。
+/// それから、new のマウント (N) を根のマウント (R) のいたところへ、R を old へ。namespace の根が R なら N がその
+/// namespace の根になり (top)、R は old にかぶせたマウントに。ほかのマウントのパスも、そのプロセスたちの cwd と root
+/// (文字) も同じに書きかえる: N の下は根の下へ、R の下は old の下へ (Linux はディレクトリで覚えているので変わらない
+/// もの)。根そのものだった cwd と root は N (Linux の chroot_fs_refs)
+pub fn pivot_root(root: &str, new: &str, old: &str, old_id: (usize, u64)) -> Result<(), i64> {
+    const EBUSY: i64 = 16;
+    let ns = current_mnt();
+    let mut l = ns.list.borrow_mut();
+    let n = l.len();
+    let (new_m, root_m, old_m) = (containing(&l, new, n), containing(&l, root, n), containing(&l, old, n));
+    if new_m == root_m || old_m == root_m {
+        return Err(-EBUSY);
+    }
+    let root_of = |m: Option<usize>| m.map_or(String::new(), |i| l[i].target.clone());
+    if root_of(root_m) != root || (root_m.is_none() && is_init_mnt(&ns)) {
+        return Err(crate::why::inval());
+    }
+    let Some(ni) = new_m.filter(|&i| l[i].target == new) else { return Err(crate::why::inval()) };
+    if !under(old, new) || !under(new, root) {
+        return Err(crate::why::inval());
+    }
+    let nt = l[ni].target.clone();
+    let rel_old = String::from(below(old, &nt));
+    // 書きかえ: N の下は根の下へ、根の下 (N でないところ) は old の下へ
+    let map = |p: &str| -> String {
+        if under(p, &nt) {
+            join_rel(root, below(p, &nt))
+        } else if under(p, root) {
+            join_rel(&join_rel(root, &rel_old), below(p, root))
+        } else {
+            p.into()
+        }
+    };
+    let mut nm = l.remove(ni);
+    let mut rm = match root_m {
+        Some(ri) => {
+            let ri = if ri > ni { ri - 1 } else { ri };
+            let rm = l.remove(ri);
+            nm.at = rm.at;
+            rm
+        }
+        // 根が namespace の根: N を根に (番号も)、もとの根を old にかぶせるマウントに
+        None => {
+            let id = ns.root_id.replace(nm.id);
+            let old_top = ns.top.borrow_mut().replace(nm.clone());
+            match old_top {
+                Some(mut t) => {
+                    t.id = id;
+                    t
+                }
+                None => {
+                    let (source, fstype) = ROOT_INFO.get().clone();
+                    Mount { id, at: (0, 0), root: ROOT.get().clone().expect("no root filesystem"), root_path: "/".into(), source, target: String::new(), fstype, ro: false }
+                }
+            }
+        }
+    };
+    rm.at = old_id;
+    rm.target = join_rel(root, &rel_old);
+    for m in l.iter_mut() {
+        m.target = map(&m.target);
+    }
+    nm.target = String::from(root);
+    // 親が子より前に (mountinfo の親の番号と、重ねたものの上下): N のあとに R (old が N の根なら、R が上に重なる)
+    if root_m.is_some() {
+        l.push(nm);
+    }
+    l.push(rm);
+    l.sort_by_key(|m| if m.target.is_empty() { 0 } else { m.target.split('/').count() });
+    drop(l);
+    // その namespace のプロセスの cwd と root (根そのものだったものは N: もとのパスのまま)
+    let fix = |p: &str| if p == root { String::from(root) } else { map(p) };
+    crate::proc::each_files_in_mnt(ns.id, |f| {
+        let (c, r) = (fix(&f.cwd), fix(&f.root));
+        if c != f.cwd {
+            f.set_cwd(c);
+        }
+        if r != f.root {
+            f.set_root(r);
+        }
+    });
+    mount_at_refresh();
+    names_changed();
     crate::file::shelf_flush_all();
     Ok(())
 }
@@ -684,7 +823,7 @@ fn mount_of_in(ns: &MountNs, path: &str) -> (u64, bool) {
     let l = ns.list.borrow();
     match containing(&l, path, l.len()) {
         Some(i) => (l[i].id as u64, path == l[i].target),
-        None => (ns.root_id as u64, path.is_empty()),
+        None => (ns.root_id.get() as u64, path.is_empty()),
     }
 }
 
@@ -698,7 +837,7 @@ pub fn init_mount_of_fs(ino: &InodeRef) -> Option<(u64, bool)> {
     let mut found = None;
     let root = ROOT.get().clone();
     if root.as_ref().is_some_and(|r| r.id().0 == fs) {
-        found = Some((ns.root_id as u64, root.as_ref().is_some_and(|r| r.id() == ino.id())));
+        found = Some((ns.root_id.get() as u64, root.as_ref().is_some_and(|r| r.id() == ino.id())));
     }
     for m in l.iter().filter(|m| m.root.id().0 == fs) {
         if found.is_some() {
@@ -742,14 +881,20 @@ pub fn mountinfo_text_of(ns: Option<Rc<MountNs>>, root: &str) -> String {
         alloc::format!("{} {} {}:{} {} {} {},relatime - {} {} {}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, rw, mangle(fstype, true), mangle(source, true), rw)
     };
     let mut s = String::new();
+    let rid = ns.root_id.get();
     if let Some(p) = shown("") {
-        let (src, ty) = ROOT_INFO.get().clone();
-        let fs = ROOT.get().as_ref().map_or(0, |r| r.id().0);
-        s.push_str(&line(ns.root_id, ns.root_id, fs_dev(fs), "/", &p, false, &ty, &src));
+        match &*ns.top.borrow() {
+            Some(t) => s.push_str(&line(rid, rid, fs_dev(t.root.id().0), &t.root_path, &p, t.ro, &t.fstype, &t.source)),
+            None => {
+                let (src, ty) = ROOT_INFO.get().clone();
+                let fs = ROOT.get().as_ref().map_or(0, |r| r.id().0);
+                s.push_str(&line(rid, rid, fs_dev(fs), "/", &p, false, &ty, &src));
+            }
+        }
     }
     for (i, m) in l.iter().enumerate() {
         let Some(p) = shown(&m.target) else { continue };
-        let parent = containing(&l, &m.target, i).map_or(ns.root_id, |j| l[j].id);
+        let parent = containing(&l, &m.target, i).map_or(rid, |j| l[j].id);
         s.push_str(&line(m.id, parent, fs_dev(m.root.id().0), &m.root_path, &p, m.ro, &m.fstype, &m.source));
     }
     s
@@ -762,9 +907,16 @@ pub fn mounts_text() -> String {
 
 /// /proc/PID/mounts (ns の表。None ははじめのもの)
 pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
-    let (src, ty) = ROOT_INFO.get().clone();
-    let mut s = alloc::format!("{} / {} rw 0 0\n", mangle(&src, true), mangle(&ty, true));
-    for m in ns.unwrap_or_else(init_mnt).list.borrow().iter() {
+    let ns = ns.unwrap_or_else(init_mnt);
+    let (src, ty, ro) = match &*ns.top.borrow() {
+        Some(t) => (t.source.clone(), t.fstype.clone(), t.ro),
+        None => {
+            let (s, t) = ROOT_INFO.get().clone();
+            (s, t, false)
+        }
+    };
+    let mut s = alloc::format!("{} / {} {} 0 0\n", mangle(&src, true), mangle(&ty, true), if ro { "ro" } else { "rw" });
+    for m in ns.list.borrow().iter() {
         s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), if m.ro { "ro" } else { "rw" }));
     }
     s
@@ -783,6 +935,7 @@ fn sync_roots() {
     let mut tables = alloc::vec![init_mnt()];
     tables.extend(ALL_MNT.get().iter().filter_map(|w| w.upgrade()));
     for t in tables {
+        roots.extend(t.top.borrow().iter().map(|m| m.root.clone()));
         roots.extend(t.list.borrow().iter().map(|m| m.root.clone()));
     }
     for r in roots {

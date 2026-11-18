@@ -2876,11 +2876,19 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     Ok(0)
 }
 
-/// umount2(target, flags): いちばん上にかぶせたものを外す
-pub fn umount2(targetp: usize, _flags: u64) -> R {
+/// umount2(target, flags): いちばん上にかぶせたものを外す。MNT_DETACH はその下のマウントもいっしょに、UMOUNT_NOFOLLOW は
+/// 最後のリンクをたどらない。知らない flags は EINVAL (MNT_FORCE と MNT_EXPIRE は受けるだけ)
+pub fn umount2(targetp: usize, flags: u64) -> R {
+    const MNT_FORCE: u64 = 1;
+    const MNT_DETACH: u64 = 2;
+    const MNT_EXPIRE: u64 = 4;
+    const UMOUNT_NOFOLLOW: u64 = 8;
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+        return Err(crate::why::inval());
+    }
     may_mount()?;
     let cwd = proc::current().files().cwd.clone();
-    let (full, _) = vfs::lookup(&cwd, &user_str(targetp)?, true)?;
+    let (full, _) = vfs::lookup(&cwd, &user_str(targetp)?, flags & UMOUNT_NOFOLLOW == 0)?;
     // LSM (security_sb_umount。AppArmor): マウントの根でなければ (EINVAL) のあと、外す前に
     if crate::security::path_mediated() {
         if !vfs::mounted(&full) {
@@ -2888,7 +2896,26 @@ pub fn umount2(targetp: usize, _flags: u64) -> R {
         }
         crate::security::sb_umount(&crate::security::path_name(&full, true))?;
     }
-    vfs::umount(&full)?;
+    vfs::umount(&full, flags & MNT_DETACH != 0)?;
+    Ok(0)
+}
+
+/// pivot_root(new_root, put_old) (Linux の fs/namespace.c): マウントしてよいか (EPERM)、new_root と put_old をたどる
+/// (ディレクトリでなければ ENOTDIR)。あとは vfs::pivot_root
+pub fn pivot_root(newp: usize, oldp: usize) -> R {
+    may_mount()?;
+    let files = proc::current().files();
+    let cwd = files.cwd.clone();
+    let (new, ni) = vfs::lookup(&cwd, &user_str(newp)?, true)?;
+    if !ni.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    let (old, oi) = vfs::lookup(&cwd, &user_str(oldp)?, true)?;
+    if !oi.meta().is_dir() {
+        return Err(-ENOTDIR);
+    }
+    let root = files.root.clone();
+    vfs::pivot_root(&root, &new, &old, oi.id())?;
     Ok(0)
 }
 

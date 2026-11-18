@@ -11,7 +11,8 @@
 // 作るには root か no_new_privs が要る (aios には user namespace がないので、Linux のように root 以外を
 // 止めるのではなく、できることが減るだけの namespace は、setuid のプログラムをだませない no_new_privs で許す)。
 // 新しい UTS の中ではホスト名を変えられる (外には見えないので、root でなくても)
-// /proc/PID/ns/uts は「uts:[番号]」へのリンク (同じものか見分けるため)
+// /proc/PID/ns/uts は「uts:[番号]」へのリンク (同じものか見分けるため)。開くと nsfs の口 (NsInode: その namespace を
+// 持っておく) になり、setns でそこへ入れる (下の「setns と nsfs」)
 use crate::cell::Bkl;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -44,6 +45,8 @@ fn next_id() -> u64 {
 /// UTS: ホスト名と、uname の形 (Uname: aios か linux)
 pub struct Uts {
     pub id: u64,
+    /// 持ち主のユーザーの namespace の番号 (作ったときのもの。はじめのものは INIT_USER: Linux の ns->user_ns)
+    pub owner: u64,
     pub name: RefCell<([u8; 64], usize)>,
     /// NIS のドメイン名 (uname の domainname、setdomainname)
     pub domain: RefCell<([u8; 64], usize)>,
@@ -53,11 +56,13 @@ pub struct Uts {
 /// IPC: 番号だけ (System V の共有メモリ (shm.rs) の表は番号ごと。なくなったら、そこのかたまりも消える)
 pub struct Ipc {
     pub id: u64,
+    pub owner: u64,
 }
 
 /// NET: 番号 (中のソケットは番号で分ける) と lo の様子 (lo_state)
 pub struct Net {
     pub id: u64,
+    pub owner: u64,
 }
 
 impl Drop for Net {
@@ -122,6 +127,7 @@ pub fn set_lo(up: bool) -> Result<(), i64> {
 /// PID: 中の番号を配る
 pub struct Pid {
     pub id: u64,
+    pub owner: u64,
     next: core::cell::Cell<u32>,
 }
 
@@ -209,7 +215,9 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         }
         // LSM (landlock の NAMESPACE_USE: Linux の security_namespace_init)
         crate::security::namespace_init(c, CLONE_NEWUSER)?;
-        c.ns.user = Some(Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) }));
+        let u = Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) });
+        USERS.get().insert(u.id, Rc::downgrade(&u));
+        c.ns.user = Some(u);
     }
     if flags & !CLONE_NEWUSER & SUPPORTED != 0 {
         // Linux の ns_capable(CAP_SYS_ADMIN): capability と LSM みな (landlock の CAPABILITY_USE、AppArmor の capability)。
@@ -223,16 +231,18 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         }
         crate::security::namespace_init(c, flags & !CLONE_NEWUSER)?;
     }
+    // 持ち主は、いっしょに作ったユーザーの namespace (あれば)
+    let owner = c.ns.user_id();
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
         let domain = current_domain(c);
-        c.ns.uts = Some(Rc::new(Uts { id: next_id(), name: RefCell::new(name), domain: RefCell::new(domain), uname: core::cell::Cell::new(current_uname(c)) }));
+        c.ns.uts = Some(Rc::new(Uts { id: next_id(), owner, name: RefCell::new(name), domain: RefCell::new(domain), uname: core::cell::Cell::new(current_uname(c)) }));
     }
     if flags & CLONE_NEWNET != 0 {
-        c.ns.net = Some(Rc::new(Net { id: next_id() }));
+        c.ns.net = Some(Rc::new(Net { id: next_id(), owner }));
     }
     if flags & CLONE_NEWIPC != 0 {
-        c.ns.ipc = Some(Rc::new(Ipc { id: next_id() }));
+        c.ns.ipc = Some(Rc::new(Ipc { id: next_id(), owner }));
     }
     if flags & CLONE_NEWNS != 0 {
         c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));
@@ -242,7 +252,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         if c.ns.pid.is_some() || crate::proc::current().pid_ns.is_some() {
             return Err(crate::why::inval());
         }
-        c.ns.pid = Some(Rc::new(Pid { id: next_id(), next: core::cell::Cell::new(0) }));
+        c.ns.pid = Some(Rc::new(Pid { id: next_id(), owner, next: core::cell::Cell::new(0) }));
     }
     Ok(())
 }
@@ -490,6 +500,15 @@ pub struct User {
     pub maps: RefCell<Maps>,
 }
 
+/// ユーザーの namespace を番号から (ns_capable が、持ち主の namespace を作った人を見る)
+static USERS: Bkl<alloc::collections::BTreeMap<u64, alloc::rc::Weak<User>>> = Bkl::new(alloc::collections::BTreeMap::new());
+
+impl Drop for User {
+    fn drop(&mut self) {
+        USERS.get().remove(&self.id);
+    }
+}
+
 /// (中の番号, 外の番号, いくつ) の並び。None はまだ書いていない
 #[derive(Default)]
 pub struct Maps {
@@ -652,4 +671,304 @@ pub fn write_setgroups(u: &Option<Rc<User>>, text: &[u8]) -> Result<(), i64> {
         _ => return Err(crate::why::inval()),
     }
     Ok(())
+}
+
+// ---- setns と nsfs (Linux の kernel/nsproxy.c と fs/nsfs.c) ----
+
+/// namespace そのもの (None ははじめからあるもの)。nsfs の口が持ち、setns がそれへ入れる
+#[derive(Clone)]
+pub enum Which {
+    Uts(Option<Rc<Uts>>),
+    Ipc(Option<Rc<Ipc>>),
+    Net(Option<Rc<Net>>),
+    Mnt(Option<Rc<crate::vfs::MountNs>>),
+    Pid(Option<Rc<Pid>>),
+    User(Option<Rc<User>>),
+}
+
+impl Which {
+    /// CLONE_NEW* (Linux の ns_type)
+    pub fn flag(&self) -> u64 {
+        match self {
+            Which::Uts(_) => CLONE_NEWUTS,
+            Which::Ipc(_) => CLONE_NEWIPC,
+            Which::Net(_) => CLONE_NEWNET,
+            Which::Mnt(_) => CLONE_NEWNS,
+            Which::Pid(_) => CLONE_NEWPID,
+            Which::User(_) => CLONE_NEWUSER,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Which::Uts(_) => "uts",
+            Which::Ipc(_) => "ipc",
+            Which::Net(_) => "net",
+            Which::Mnt(_) => "mnt",
+            Which::Pid(_) => "pid",
+            Which::User(_) => "user",
+        }
+    }
+
+    /// 番号 (/proc/PID/ns のリンクの [N] と、nsfs の inode の番号)
+    pub fn id(&self) -> u64 {
+        match self {
+            Which::Uts(u) => u.as_ref().map_or(INIT_UTS, |u| u.id),
+            Which::Ipc(i) => i.as_ref().map_or(INIT_IPC, |i| i.id),
+            Which::Net(n) => n.as_ref().map_or(INIT_NET, |n| n.id),
+            Which::Mnt(m) => m.as_ref().map_or(INIT_MNT, |m| m.id),
+            Which::Pid(p) => p.as_ref().map_or(INIT_PID, |p| p.id),
+            Which::User(u) => u.as_ref().map_or(INIT_USER, |u| u.id),
+        }
+    }
+
+    /// 持ち主のユーザーの namespace の番号 (ユーザーの namespace はそれ自身: 入るには、その中の CAP_SYS_ADMIN)
+    fn owner(&self) -> u64 {
+        match self {
+            Which::Uts(u) => u.as_ref().map_or(INIT_USER, |u| u.owner),
+            Which::Ipc(i) => i.as_ref().map_or(INIT_USER, |i| i.owner),
+            Which::Net(n) => n.as_ref().map_or(INIT_USER, |n| n.owner),
+            Which::Mnt(m) => m.as_ref().map_or(INIT_USER, |m| m.owner),
+            Which::Pid(p) => p.as_ref().map_or(INIT_USER, |p| p.owner),
+            Which::User(_) => self.id(),
+        }
+    }
+}
+
+/// c が、番号 owner のユーザーの namespace の持ち物に cap の力を持つか (Linux の ns_capable と cap_capable)。ユーザーの
+/// namespace の中からは、その namespace のものだけ (aios に入れ子はない。中ではみな持つ)。はじめのところからは、はじめの
+/// ものは capability で、ユーザーの namespace のものは、それを作った人 (euid が同じ) か capability。LSM は聞く
+pub fn ns_capable(c: &crate::cred::Cred, owner: u64, cap: u32) -> bool {
+    match &c.ns.user {
+        Some(u) => u.id == owner && crate::security::capable(c, cap, true),
+        None if owner == INIT_USER => c.capable(cap),
+        None => {
+            let made = USERS.get().get(&owner).and_then(|w| w.upgrade()).is_some_and(|u| u.owner == c.euid);
+            (made && crate::security::capable(c, cap, true)) || c.capable(cap)
+        }
+    }
+}
+
+/// nsfs の口 (/proc/PID/ns/X を開いたもの): namespace を持っておく (閉じるまでなくならない)。0444 のふつうのファイルで、
+/// inode の番号が namespace の番号。読み書きはできない (EINVAL)
+pub struct NsInode {
+    pub which: Which,
+}
+
+static NSFS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn nsfs_id() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    match NSFS.load(Relaxed) {
+        0 => {
+            let id = crate::vfs::new_fs_id();
+            NSFS.store(id, Relaxed);
+            id
+        }
+        id => id,
+    }
+}
+
+impl crate::vfs::Inode for NsInode {
+    fn id(&self) -> (usize, u64) {
+        (nsfs_id(), self.which.id())
+    }
+
+    fn meta(&self) -> crate::vfs::Meta {
+        crate::vfs::Meta { ino: self.which.id(), mode: crate::vfs::S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 }
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn read_at(&self, _off: usize, _buf: &mut [u8]) -> Result<usize, i64> {
+        Err(crate::why::inval())
+    }
+
+    fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, i64> {
+        Err(crate::why::inval())
+    }
+
+    fn truncate(&self, _len: usize) -> Result<(), i64> {
+        Err(crate::why::inval())
+    }
+
+    fn readlink(&self) -> Result<alloc::string::String, i64> {
+        Err(crate::why::inval())
+    }
+
+    fn lookup(&self, _name: &str) -> Result<crate::vfs::InodeRef, i64> {
+        Err(-20)
+    }
+
+    fn readdir(&self) -> Result<Vec<crate::vfs::DirEntry>, i64> {
+        Err(-20)
+    }
+
+    fn create(&self, _name: &str, _mode: u32, _node: crate::vfs::NewNode) -> Result<crate::vfs::InodeRef, i64> {
+        Err(-20)
+    }
+
+    fn link(&self, _name: &str, _target: &crate::vfs::InodeRef) -> Result<(), i64> {
+        Err(-20)
+    }
+
+    fn unlink(&self, _name: &str, _rmdir: bool) -> Result<(), i64> {
+        Err(-20)
+    }
+
+    fn rename(&self, _old: &str, _newdir: &crate::vfs::InodeRef, _new: &str) -> Result<(), i64> {
+        Err(-20)
+    }
+
+    fn set_mode(&self, _mode: u32) -> Result<(), i64> {
+        Err(-EPERM)
+    }
+
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), i64> {
+        Err(-EPERM)
+    }
+
+    fn set_mtime(&self, _ns: u64) -> Result<(), i64> {
+        Err(-EPERM)
+    }
+
+    /// NSFS_MAGIC
+    fn statfs(&self) -> [u8; 120] {
+        crate::tmpfs::statfs_bytes(0x6e73_6673, 4096, 0, 0, 0, 0)
+    }
+}
+
+/// /proc/PID/ns/KIND を開いたもの: (名前 "uts:[N]", nsfs の口)。pid はそのプロセスのもの、pid_for_children はこれから
+/// 作る子のもの
+pub fn ns_file(kind: &str, p: &crate::proc::Proc) -> (alloc::string::String, crate::vfs::InodeRef) {
+    let n = &p.cred.ns;
+    let w = match kind {
+        "uts" => Which::Uts(n.uts.clone()),
+        "ipc" => Which::Ipc(n.ipc.clone()),
+        "net" => Which::Net(n.net.clone()),
+        "mnt" => Which::Mnt(n.mnt.clone()),
+        "pid" => Which::Pid(p.pid_ns.clone()),
+        "pid_for_children" => Which::Pid(n.pid.clone()),
+        _ => Which::User(n.user.clone()),
+    };
+    (alloc::format!("{}:[{}]", w.name(), w.id()), Rc::new(NsInode { which: w }))
+}
+
+/// ひとつの namespace へ入れる (Linux の ops->install)。c は入ったあとの資格情報 (pidfd でいくつも入れるときは、先に
+/// 入れたユーザーの namespace の中から次のものを見る)。mnt なら true (cwd と root をその / に)
+fn install(c: &mut crate::cred::Cred, w: &Which) -> Result<bool, i64> {
+    use crate::cred::{CAP_SYS_ADMIN, CAP_SYS_CHROOT};
+    let me = crate::proc::current();
+    let mine = c.ns.user_id();
+    // cwd と root (fs) をほかのプロセスと分けていない (Linux の fs->users == 1)
+    let fs_private = me.files.as_ref().is_some_and(|f| f.private());
+    if let Which::User(u) = w {
+        // 同じところへもう一度入って力を得ることはできない。スレッドがいても、fs を分けていてもだめ
+        if w.id() == mine || crate::proc::threads_of(me.tgid).len() > 1 || !fs_private {
+            return Err(crate::why::inval());
+        }
+        if !ns_capable(c, w.id(), CAP_SYS_ADMIN) {
+            return Err(-EPERM);
+        }
+        c.ns.user = u.clone();
+        return Ok(false);
+    }
+    if !ns_capable(c, w.owner(), CAP_SYS_ADMIN) {
+        return Err(-EPERM);
+    }
+    if matches!(w, Which::Mnt(_)) && !ns_capable(c, mine, CAP_SYS_CHROOT) {
+        return Err(-EPERM);
+    }
+    if !ns_capable(c, mine, CAP_SYS_ADMIN) {
+        return Err(-EPERM);
+    }
+    match w {
+        Which::Uts(u) => c.ns.uts = u.clone(),
+        Which::Ipc(i) => c.ns.ipc = i.clone(),
+        Which::Net(n) => c.ns.net = n.clone(),
+        Which::Mnt(m) => {
+            if !fs_private {
+                return Err(crate::why::inval());
+            }
+            c.ns.mnt = m.clone();
+            return Ok(true);
+        }
+        Which::Pid(p) => {
+            // いまの (自分の) PID の namespace か、その下のものだけ (aios に入れ子はないので、はじめのところからはどれでも、
+            // 中からはそこだけ)
+            let active = me.pid_ns.as_ref().map(|p| p.id);
+            if active.is_some() && active != p.as_ref().map(|p| p.id) {
+                return Err(crate::why::inval());
+            }
+            c.ns.pid = p.clone();
+        }
+        Which::User(_) => {}
+    }
+    Ok(false)
+}
+
+/// setns(fd, flags) (Linux の kernel/nsproxy.c): fd は nsfs の口 (flags は 0 かその種類: ちがえば EINVAL) か pidfd (flags は
+/// 入る種類の組: 0 や知らないものは EINVAL。相手を ptrace で読めなければ EPERM、終わっていれば ESRCH。ユーザー、mnt、uts、
+/// ipc、pid、net の順に入れる)。ほかの fd は EINVAL。みな入れられたときだけ変える (Linux の nsset)。mnt に入ると cwd と
+/// root はその /
+pub fn setns(fd: i64, flags: u64) -> Result<i64, i64> {
+    const EBADF: i64 = 9;
+    const ESRCH: i64 = 3;
+    let me = crate::proc::current();
+    let f = me.files().get(fd as u64).cloned().ok_or(-EBADF)?;
+    let mut c = me.cred.clone();
+    let mut mnt = false;
+    let b = f.borrow();
+    match &b.kind {
+        crate::file::Kind::Inode(ino, _) if ino.as_any().is::<NsInode>() => {
+            let w = &ino.as_any().downcast_ref::<NsInode>().unwrap().which;
+            if flags != 0 && flags != w.flag() {
+                return Err(crate::why::inval());
+            }
+            mnt = install(&mut c, w)?;
+        }
+        crate::file::Kind::PidFd(pid) => {
+            if flags == 0 || flags & !SUPPORTED != 0 {
+                return Err(crate::why::inval());
+            }
+            let t = crate::proc::find_any(*pid).ok_or(-ESRCH)?;
+            // PTRACE_MODE_READ_REALCREDS (本当の uid と gid が相手の 3 つにみな同じで dumpable、でなければ CAP_SYS_PTRACE。
+            // それから LSM)
+            if t.tgid != me.tgid {
+                let (mc, tc) = (&me.cred, &t.cred);
+                let ids = [tc.uid, tc.euid, tc.suid].iter().all(|&u| u == mc.uid) && [tc.gid, tc.egid, tc.sgid].iter().all(|&g| g == mc.gid);
+                let dump = t.mm.is_none() || crate::pidfd::dumpable(t) == 1;
+                if !((ids && dump) || mc.capable(crate::cred::CAP_SYS_PTRACE)) || crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_READ).is_err() {
+                    return Err(-EPERM);
+                }
+            }
+            if t.state == crate::proc::State::Zombie {
+                return Err(-ESRCH);
+            }
+            let n = &t.cred.ns;
+            let all = [
+                Which::User(n.user.clone()),
+                Which::Mnt(n.mnt.clone()),
+                Which::Uts(n.uts.clone()),
+                Which::Ipc(n.ipc.clone()),
+                Which::Pid(t.pid_ns.clone()),
+                Which::Net(n.net.clone()),
+            ];
+            for w in all.iter().filter(|w| flags & w.flag() != 0) {
+                mnt |= install(&mut c, w)?;
+            }
+        }
+        _ => return Err(crate::why::inval()),
+    }
+    drop(b);
+    me.cred = c;
+    me.sync_cred_work();
+    if mnt {
+        let files = me.files();
+        files.set_root(alloc::string::String::new());
+        files.set_cwd(alloc::string::String::new());
+    }
+    Ok(0)
 }

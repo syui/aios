@@ -1456,6 +1456,8 @@ impl OpenFile {
             Kind::Null => "/dev/null".into(),
             Kind::Zero => "/dev/zero".into(),
             Kind::Random => "/dev/urandom".into(),
+            // nsfs の口は "uts:[N]" (Linux の ns_dname)
+            Kind::Inode(ino, path) if ino.as_any().is::<crate::ns::NsInode>() => path.clone(),
             Kind::Inode(_, path) => alloc::format!("/{}", path),
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => alloc::format!("pipe:[{}]", Rc::as_ptr(p) as usize & 0xffffff),
             Kind::Ops(o) => o.describe(),

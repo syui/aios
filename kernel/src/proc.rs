@@ -908,6 +908,22 @@ pub fn each_files(mut f: impl FnMut(&mut Files)) {
 }
 
 /// 生きているプロセス (代表スレッド) をみな (Vec を使わない: oom.rs は取れないときに呼ばれる)
+/// マウントの namespace の番号 mnt にいるプロセスの Files (スレッドで分けているものは 1 度だけ: pivot_root)
+pub fn each_files_in_mnt(mnt: u64, mut f: impl FnMut(&mut Files)) {
+    let mut seen: Vec<usize> = Vec::new();
+    for p in live() {
+        if p.state != State::Unused
+            && p.state != State::Zombie
+            && p.cred.ns.mnt_id() == mnt
+            && let Some(files) = &p.files
+            && !seen.contains(&files.id())
+        {
+            seen.push(files.id());
+            f(files.get());
+        }
+    }
+}
+
 pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
     for p in live() {
         if p.state != State::Unused && p.state != State::Zombie && !p.thread {

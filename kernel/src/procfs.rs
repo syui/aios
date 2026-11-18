@@ -1198,6 +1198,11 @@ impl Inode for ProcInode {
             let _h = pt.hold();
             return pt.file_maps().into_iter().find(|m| m.0 == s && m.1 == e).map(|m| (m.4, m.5));
         }
+        // ns のリンク: nsfs の口 (setns で入れる。開いているあいだ namespace はなくならない)
+        if let Node::NsLink(pid, k) = self.node {
+            aa_ptrace(pid, true).ok()?;
+            return Some(crate::ns::ns_file(NS_KINDS[k as usize], leader(pid).ok()?));
+        }
         let Node::Fd(pid, n) = self.node else { return None };
         // AppArmor で見られなければ、ふつうのリンクとして (readlink が EACCES にする)
         aa_ptrace(pid, true).ok()?;

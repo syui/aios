@@ -721,7 +721,29 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   COLLAPSE) だけを CAP_SYS_NICE で。iovec ごとに madvise (syscall の madvise_in を相手の表に) して、知らせたバイトの和
   を返す。process_mrelease は終わりかけ (SIGKILL か exit_group) なら 0 (aios はスレッドが終わるときにすぐ返す)、
   そうでなければ EINVAL、アドレス空間を持つスレッドがいなければ ESRCH
-- のこり (Linux にあって aios で ENOSYS): ptrace、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
+- setns と nsfs (Linux 3.0 と 5.8 の pidfd。test/setns.c、Linux と 16 行同じ、root では 19 行): /proc/PID/ns/X を開くと
+  nsfs の口 (ns.rs の NsInode: その namespace を持っておく。0444 のふつうのファイルで inode の番号が namespace の番号、
+  /proc/self/fd/N は "uts:[N]"、statfs は NSFS_MAGIC)。setns は Linux の nsproxy.c と同じ順: fd がなければ EBADF、nsfs の口
+  なら flags は 0 かその種類、pidfd なら flags は入るものの組 (0 や知らないものは EINVAL、相手を ptrace で読めなければ EPERM、
+  ゾンビは ESRCH。ユーザー、mnt、uts、ipc、pid、net の順に)、ほかの fd は EINVAL。入るには持ち主のユーザーの namespace と
+  自分のところの CAP_SYS_ADMIN (ns_capable: aios は uts、ipc、net、pid にも持ち主を持たせた。ユーザーの namespace の中では
+  その namespace のもの、外からは作った人か capability)。mnt は CAP_SYS_CHROOT も要り、cwd と root を分けていれば EINVAL、
+  入ると cwd と root はその /。pid はいまの (自分の) ものか、その下のものだけ (上は EINVAL)。ユーザーの namespace は同じ
+  ところへもう一度は EINVAL、スレッドがいても EINVAL。みな入れられたときだけ変える (Linux の nsset)。ipc に入るときの
+  SEM_UNDO の後始末 (exit_sem) はまだしない
+- pivot_root (test/pivotroot.c は chroot したマウントの中で、test/pivotns.c は namespace の / そのもの (bwrap、runc の
+  pivot_root(".", ".") と umount2(".", MNT_DETACH)) を。Linux と 11 行、6 行同じ、root で): may_mount (EPERM)、new_root と
+  put_old をたどり (ENOENT、ENOTDIR)、Linux の do_pivot_root と同じ順: new か put_old が根と同じマウントにあれば EBUSY、根が
+  マウントの根でない、new がマウントの根でない、put_old が new の下にない、は EINVAL。aios のマウントは「ディレクトリの
+  id にかぶせる」もので、パスは文字なので、表を組みかえる: new のマウント (N) を根のマウント (R) のいたところへ (at を
+  もらう)、R を put_old にかぶせ (重ねたもの (".", ".") は R が上)、ほかのマウントのパスも、その namespace のプロセスの
+  cwd と root の文字も、N の下は根の下へ、R の下は put_old の下へ書きかえる (Linux はディレクトリで覚えているので変わら
+  ないもの。根そのものだったものは N: chroot_fs_refs)。根が namespace の / なら、N がその namespace の根になる
+  (vfs::MountNs の top。vfs::root() はいまのプロセスの namespace の根を返す。番号も N のものに)。はじめの namespace の /
+  からは EINVAL にした (えらんだちがい: Linux はふつうの / ならできるが、aios の大きなロックなしの道 (statc、fastdir) は
+  はじめの namespace の / を ROOT と見ているので)。開いている fd のパスの文字は書きかえない。umount2 は MNT_DETACH で
+  下のマウントもいっしょに外し (Linux の umount_tree)、UMOUNT_NOFOLLOW を見て、知らない flags は EINVAL に
+- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
@@ -1522,7 +1544,7 @@ stack (trace)。追う側の決まりで相手へ read / trace、追われる側
 mount (mount.c): mount(2) で、マウント先をたどったあと、may_mount (EPERM) より先に (Linux の path_mount と同じ順。
 決まりのないプロセスも、マウント先がなければ ENOENT が EPERM より先になった)。remount、bind、伝わり方、move、新しい
 マウントで見るものを分け、マウント先、元、fs の種類、フラグ、データの順に DFA をたどる (しくじったところが info に)。
-umount はマウントの根でなければ EINVAL のあと。aios に pivot_root はない。mount(2) は data (オプションの文字列) も
+umount はマウントの根でなければ EINVAL のあと。pivot_root はまだ見ない (Linux の apparmor_sb_pivotroot)。mount(2) は data (オプションの文字列) も
 受けとるようにした (AppArmor の options= のため)。
 
 network、signal、ptrace、mount の記録の形は、Linux 7.3.1 で同じことをして dmesg (klogctl) に出たものとくらべた
