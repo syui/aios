@@ -486,11 +486,16 @@ fn wake_key(k: Key, nr: i32, bitset: Option<u32>) -> Result<i64, i64> {
 /// FUTEX_REQUEUE / CMP_REQUEUE (Linux の futex_requeue): nr_wake まで起こし、のこりを nr_requeue まで uaddr2 の
 /// 行列のうしろへ。答えは起こした数と移した数の合計。CMP は uaddr の値が cmp でなければ EAGAIN
 fn requeue_op(uaddr: usize, private: bool, uaddr2: usize, nr_wake: i32, nr_requeue: i32, cmp: Option<u32>) -> Result<i64, i64> {
+    requeue_keys(uaddr, private, uaddr2, private, nr_wake, nr_requeue, cmp)
+}
+
+/// requeue_op の中身 (2 つの語の私有かどうかは別々に: futex_requeue の waiters はそれぞれの flags)
+fn requeue_keys(uaddr: usize, private: bool, uaddr2: usize, private2: bool, nr_wake: i32, nr_requeue: i32, cmp: Option<u32>) -> Result<i64, i64> {
     if nr_wake < 0 || nr_requeue < 0 {
         return Err(crate::why::inval());
     }
     let k1 = key_of(uaddr, private)?;
-    let k2 = key_of(uaddr2, private)?;
+    let k2 = key_of(uaddr2, private2)?;
     if let Some(c) = cmp {
         if get(uaddr)? != c {
             return Err(-EAGAIN);
@@ -711,6 +716,77 @@ pub fn waitv(uwaiters: usize, nr: u32, flags: u32, timeout: usize, clockid: u32)
         return Err(-ETIMEDOUT);
     }
     sleep(&ids, dl.unwrap_or(0)).map(|i| i as i64)
+}
+
+// ---- futex2 (Linux 6.7 の futex_wake、futex_wait、futex_requeue) ----
+
+const FUTEX2_NUMA: u32 = 4;
+const FUTEX2_MPOL: u32 = 8;
+
+/// futex2 の flags (Linux の futex2_to_flags と futex_flags_valid): 大きさは FUTEX2_SIZE_U32 だけ、知らない印は EINVAL。
+/// NUMA と MPOL の印は受けるが、ノードは見ない (aios はノードがひとつ)。答えは私有か
+fn flags2(f: u32) -> Result<bool, i64> {
+    if f & !(FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE) != 0 || f & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 {
+        return Err(crate::why::inval());
+    }
+    Ok(f & FUTEX2_PRIVATE != 0)
+}
+
+/// futex_wake (mask は 32 ビットに入ること (futex_validate_input)、0 は EINVAL、nr 0 は起こさない (FLAGS_STRICT))
+pub fn wake2(uaddr: usize, mask: u64, nr: i32, flags: u32) -> Result<i64, i64> {
+    let private = flags2(flags)?;
+    if mask >> 32 != 0 || mask == 0 {
+        return Err(crate::why::inval());
+    }
+    let k = key_of(uaddr, private)?;
+    if nr == 0 {
+        return Ok(0);
+    }
+    wake_key(k, nr, Some(mask as u32))
+}
+
+/// futex_wait (val と mask は 32 ビットに入ること、時間は絶対で CLOCK_MONOTONIC (1) か CLOCK_REALTIME (0) だけ)
+pub fn wait2(uaddr: usize, val: u64, mask: u64, flags: u32, timeout: usize, clockid: i32) -> Result<i64, i64> {
+    let private = flags2(flags)?;
+    if val >> 32 != 0 || mask >> 32 != 0 {
+        return Err(crate::why::inval());
+    }
+    let dl = if timeout != 0 {
+        if clockid != 0 && clockid != 1 {
+            return Err(crate::why::inval());
+        }
+        deadline(WAIT_BITSET, if clockid == 0 { CLOCK_REALTIME } else { 0 }, timeout)?
+    } else {
+        None
+    };
+    wait(uaddr, private, val as u32, dl, mask as u32)
+}
+
+/// futex_requeue (flags は 0 だけ、waiters は struct futex_waitv の 2 つ: それぞれ flags と予約 0 と値をたしかめ、
+/// waiters[0] の値がちがえば EAGAIN。答えは起こした数と移した数)
+pub fn requeue2(uw: usize, flags: u32, nr_wake: i32, nr_requeue: i32) -> Result<i64, i64> {
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let mut b = [0u8; WAITV_SIZE * 2];
+    proc::current().pt().copy_in(&mut b, uw).ok_or(-EFAULT)?;
+    let mut w = [(0usize, 0u64, false); 2];
+    for (i, x) in w.iter_mut().enumerate() {
+        let o = i * WAITV_SIZE;
+        let val = u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let ua = u64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap()) as usize;
+        let fl = u32::from_le_bytes(b[o + 16..o + 20].try_into().unwrap());
+        let reserved = u32::from_le_bytes(b[o + 20..o + 24].try_into().unwrap());
+        if reserved != 0 {
+            return Err(crate::why::inval());
+        }
+        let private = flags2(fl)?;
+        if val >> 32 != 0 {
+            return Err(crate::why::inval());
+        }
+        *x = (ua, val, private);
+    }
+    requeue_keys(w[0].0, w[0].2, w[1].0, w[1].2, nr_wake, nr_requeue, Some(w[0].1 as u32))
 }
 
 // ---- カーネルから ----

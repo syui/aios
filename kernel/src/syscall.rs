@@ -63,6 +63,10 @@ nrs! {
     GETXATTRAT = 464,
     LISTXATTRAT = 465,
     REMOVEXATTRAT = 466,
+    MSEAL = 462,
+    FUTEX_WAKE2 = 454,
+    FUTEX_WAIT2 = 455,
+    FUTEX_REQUEUE2 = 456,
     GETCWD = 17,
     FLOCK = 32,
     MKNODAT = 33,
@@ -614,6 +618,10 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         }
         FUTEX => sys_futex(a[0] as usize, a[1], a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32),
         FUTEX_WAITV => crate::futex::waitv(a[0] as usize, a[1] as u32, a[2] as u32, a[3] as usize, a[4] as u32),
+        FUTEX_WAKE2 => crate::futex::wake2(a[0] as usize, a[1], a[2] as i32, a[3] as u32),
+        FUTEX_WAIT2 => crate::futex::wait2(a[0] as usize, a[1], a[2], a[3] as u32, a[4] as usize, a[5] as i32),
+        FUTEX_REQUEUE2 => crate::futex::requeue2(a[0] as usize, a[1] as u32, a[2] as i32, a[3] as i32),
+        MSEAL => sys_mseal(a[0] as usize, a[1] as usize, a[2]),
         // PID の namespace の中なら、中の番号 (ns.rs)
         GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
         GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
@@ -1912,6 +1920,9 @@ fn sys_brk(addr: usize) -> i64 {
         return m.brk as i64;
     }
     let (old, new) = (pg_up(m.brk), pg_up(addr));
+    if new < old && m.pt.sealed_in(new, old) {
+        return m.brk as i64;
+    }
     // mlockall の MCL_FUTURE: 伸ばすところも RLIMIT_MEMLOCK の中で (Linux の check_brk_limits)、かけて写す
     if new > old && !mlock_future_ok(proc::current(), m.def_lock & 1 != 0, new - old) {
         return m.brk as i64;
@@ -2010,6 +2021,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         if flags & MAP_FIXED_NOREPLACE != 0 && m.pt.overlaps(addr, addr.saturating_add(len)) {
             return Err(-EEXIST);
         }
+        // 封じた領域の上には写せない
+        if m.pt.sealed_in(addr, addr.saturating_add(len)) {
+            return Err(-EPERM);
+        }
         addr
     } else {
         let va = m.pt.free_area(m.mmap_next, len);
@@ -2044,8 +2059,30 @@ fn sys_munmap(addr: usize, len: usize) -> R {
     if addr & 0xfff != 0 || len == 0 {
         return Err(crate::why::inval());
     }
-    proc::current().pt().unmap(addr, addr + pg_up(len));
+    let pt = proc::current().pt();
+    // 封じた領域があれば、どこも外さずに EPERM (Linux の do_vmi_munmap)
+    if pt.sealed_in(addr, addr.saturating_add(pg_up(len))) {
+        return Err(-EPERM);
+    }
+    pt.unmap(addr, addr + pg_up(len));
     Ok(0)
+}
+
+/// mseal (Linux 6.10 の do_mseal: flags は 0 だけ、そろっていない番地と、ページにそろえるとあふれる長さは EINVAL、長さ 0 は
+/// 0、すきまがあれば ENOMEM)
+fn sys_mseal(addr: usize, len: usize, flags: u64) -> R {
+    if flags != 0 || addr & 0xfff != 0 {
+        return Err(crate::why::inval());
+    }
+    let alen = len.wrapping_add(0xfff) & !0xfff;
+    if len != 0 && alen == 0 {
+        return Err(crate::why::inval());
+    }
+    let end = addr.checked_add(alen).ok_or_else(crate::why::inval)?;
+    if end == addr {
+        return Ok(0);
+    }
+    proc::current().pt().seal(addr, end).map(|_| 0)
 }
 
 /// mremap: 領域の大きさを変える (縮める、その場で伸ばす、MREMAP_MAYMOVE なら別の場所へ写す)。
@@ -2063,6 +2100,10 @@ fn sys_mremap(old: usize, old_size: usize, new_size: usize, flags: u64, new_addr
     let (old_size, new_size) = (pg_up(old_size), pg_up(new_size));
     let m = proc::current().mm();
     let Some((vstart, v)) = m.pt.find(old).map(|(s, v)| (s, v.clone())) else { return Err(-EFAULT) };
+    // 封じた領域は動かせない・大きさを変えられない (Linux の mremap の can_modify_vma)。MREMAP_FIXED の行き先も
+    if v.sealed || (flags & MREMAP_FIXED != 0 && m.pt.sealed_in(new_addr, new_addr.saturating_add(new_size))) {
+        return Err(-EPERM);
+    }
     // 大きさ 0 は、共有の領域を写すとき (Linux は MAP_PRIVATE のものを断る)
     if old_size == 0 && !v.shared {
         return Err(crate::why::inval());
@@ -2152,6 +2193,9 @@ fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
     if addr & 0xfff != 0 {
         return Err(crate::why::inval());
     }
+    if proc::current().pt().sealed_in(addr, addr.saturating_add(pg_up(len))) {
+        return Err(-EPERM);
+    }
     proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map(|_| 0).map_err(|_| -ENOMEM)
 }
 
@@ -2193,6 +2237,10 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
         return Ok(0);
     }
     let pt = proc::current().pt();
+    // 捨てる知らせは、封じた読むだけの無名の領域には EPERM (Linux の can_madvise_modify)
+    if matches!(advice, DONTNEED | DONTNEED_LOCKED | FREE | REMOVE | DONTFORK | WIPEONFORK) && pt.sealed_ro_anon_in(addr, end) {
+        return Err(-EPERM);
+    }
     let anon_private = |v: &crate::vm::Vma| matches!(v.back, Backing::Anon) && !v.shared;
     let gap = match advice {
         DONTNEED | DONTNEED_LOCKED => {
@@ -2230,8 +2278,6 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
     Ok(0)
 }
 
-/// mincore: ページがメモリにあるか。写してある領域はみな「ある」と答える (スワップに出ていても読めば戻る)。
-/// 写していないところがあれば ENOMEM
 /// mincore (Linux と同じ順: そろっていない番地は EINVAL、ユーザーの外は ENOMEM、長さ 0 は 0、vec がユーザーの外なら
 /// EFAULT)。ページがあるかを 1 バイトずつ (vm::PageTable::mincore)。領域のないところに来たら、そこまでを書いて ENOMEM
 fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {

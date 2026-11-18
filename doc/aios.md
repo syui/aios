@@ -707,9 +707,16 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   起こす。semop はみなできるときだけみなする、SEMVMX (32767)、GETNCNT と GETZCNT (待っているものを止めた操作で数える)、
   SEM_UNDO はプロセスが終わるときに足す (proc::register_exit_hook。SETVAL と SETALL は戻しを消す)、semtimedop の時間切れは
   EAGAIN。/proc/sysvipc/msg と sem も (ipcs)。MSG_COPY は手本の設定にない (ENOSYS)
+- mseal (Linux 6.10。test/mseal.c、Linux と 8 行同じ): Vma::sealed。flags は 0 だけ、そろっていない番地とあふれる長さは
+  EINVAL、すきまは ENOMEM (どこも封じない)。封じた領域は munmap・mprotect・mremap・MAP_FIXED の mmap・brk で縮めるのが
+  EPERM (いっしょに頼んだ封じていないところも変えない: ロックなしの munmap はふつうの道へ)、読むだけの私有の無名の領域は
+  捨てる madvise (DONTNEED、FREE、REMOVE、DONTFORK、WIPEONFORK) も EPERM。fork した子もそのまま、smaps の VmFlags に sl
+- futex2 (Linux 6.7 の futex_wake、futex_wait、futex_requeue。test/futex2.c、Linux と 5 行同じ): futex.rs の待ち行列を
+  そのまま使う。flags は FUTEX2_SIZE_U32 だけ (NUMA と MPOL の印は受けてノードは見ない)、mask と val は 32 ビットに
+  入ること (でなければ EINVAL: ~0 の mask も)、futex_wake の nr 0 は起こさない、futex_wait の時間は絶対で
+  CLOCK_MONOTONIC と CLOCK_REALTIME だけ、futex_requeue は waiters ごとの私有かどうかで
 - のこり (Linux にあって aios で ENOSYS): ptrace、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
-  mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、futex_wake・futex_wait・
-  futex_requeue、mseal、file_getattr・file_setattr、listns など
+  mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

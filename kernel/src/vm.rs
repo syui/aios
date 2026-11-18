@@ -1225,6 +1225,9 @@ pub struct Vma {
     pub locked: bool,
     /// MLOCK_ONFAULT / MCL_ONFAULT (VM_LOCKONFAULT: かけても先には写さない)
     pub onfault: bool,
+    /// mseal で封じた (VM_SEALED: 外す、prot を変える、動かす、上に写す、読むだけの無名のものを捨てる madvise は EPERM。
+    /// fork した子もそのまま。exec で消える)
+    pub sealed: bool,
 }
 
 /// ページフォールトの結果
@@ -2114,7 +2117,7 @@ impl PageTable {
         self.unmap_inner(start, end);
         self.note(b'm', start, end, prot);
         self.last_end = end;
-        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
+        self.vmas.insert(start, Vma { end, prot, shared, back, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false, sealed: false });
         // 共有の無名メモリは、fork のあとも同じページを指すように今作る
         if shared && matches!(self.vmas[&start].back, Backing::Anon) {
             let mut va = start;
@@ -2279,7 +2282,7 @@ impl PageTable {
             match self.vmas.get_mut(&start) {
                 Some(v) if v.end == old_end => v.end = new_end,
                 _ => {
-                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
+                    self.vmas.insert(old_end, Vma { end: new_end, prot: PROT_RW, shared: false, back: Backing::Anon, name: None, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false, sealed: false });
                 }
             }
         } else if new_end < old_end {
@@ -2704,6 +2707,7 @@ impl PageTable {
                 (v.onfault, "lf"),
                 (!v.shared && w, "ac"),
                 (v.wipe, "wf"),
+                (v.sealed, "sl"),
             ] {
                 if on {
                     f.push_str(name);
@@ -3374,6 +3378,8 @@ impl PageTable {
             None
         } else {
             match self.find(old) {
+                // 封じた領域はふつうの道で (EPERM)
+                Some((_, v)) if v.sealed => None,
                 None => Some(-EFAULT),
                 Some((_, v)) if v.end < old_end => Some(-EFAULT),
                 Some((_, v)) if v.end == old_end && self.vmas.range(old_end..new_end).next().is_none() => None,
@@ -3521,7 +3527,7 @@ impl PageTable {
                 // 空いているところなので、外すもの (unmap_inner) はない
                 self.note(b'm', va, end, prot);
                 self.last_end = end;
-                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false });
+                self.vmas.insert(va, Vma { end, prot, shared: false, back, name, wipe: false, droppable: false, dontcopy: false, locked: false, onfault: false, sealed: false });
                 Ok(va)
             }
             _ => Err((back, name)),
@@ -3557,6 +3563,7 @@ impl PageTable {
         let whole = |s: usize, v: &Vma| s >= start && v.end <= end;
         let plain = self.vmas_in(start, end).all(|(&s, v)| {
             !v.shared
+                && !v.sealed
                 && match v.back {
                     Backing::Anon => v.name.is_none() || whole(s, v),
                     Backing::File { .. } => whole(s, v) && UNMAPPED_N.load(Ordering::Relaxed) < UNMAPPED_MAX,
@@ -3804,6 +3811,33 @@ impl PageTable {
             }
         }
         (out, false)
+    }
+
+    /// [start, end) を封じる (Linux の do_mseal: はじめに見て、すきまがあれば ENOMEM でどこも封じない)
+    pub fn seal(&mut self, start: usize, end: usize) -> Result<(), i64> {
+        const ENOMEM: i64 = 12;
+        let _m = self.mutating();
+        let mut va = start;
+        while va < end {
+            let Some((_, v)) = self.find(va) else { return Err(-ENOMEM) };
+            va = v.end;
+        }
+        self.split(start);
+        self.split(end);
+        for v in self.vmas.range_mut(start..end).map(|(_, v)| v) {
+            v.sealed = true;
+        }
+        Ok(())
+    }
+
+    /// [start, end) に封じた領域があるか (外す・変える前に: Linux の can_modify_mm)
+    pub fn sealed_in(&self, start: usize, end: usize) -> bool {
+        start < end && self.vmas_in(start, end).any(|(_, v)| v.sealed)
+    }
+
+    /// [start, end) に、封じた読むだけの私有の無名の領域があるか (捨てる madvise を断る: Linux の is_ro_anon)
+    pub fn sealed_ro_anon_in(&self, start: usize, end: usize) -> bool {
+        start < end && self.vmas_in(start, end).any(|(_, v)| v.sealed && matches!(v.back, Backing::Anon) && !v.shared && v.prot & PROT_WRITE == 0)
     }
 
     /// mlock をかけた領域のページの数 (Linux の mm->locked_vm: /proc の VmLck)
