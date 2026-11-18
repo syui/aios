@@ -842,7 +842,7 @@ pub fn sync_file_range(fd: u64, off: i64, n: i64, flags: u64) -> R {
     Ok(0)
 }
 
-fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
+pub fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
     if cnt > 1024 {
         return Err(crate::why::inval());
     }
@@ -859,7 +859,7 @@ fn iovecs(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, i64> {
 }
 
 /// iovec の長さの和 (1 つが i64 をこえれば EINVAL: Linux の iovec_from_user)
-fn iov_total(v: &[(usize, usize)]) -> Result<usize, i64> {
+pub fn iov_total(v: &[(usize, usize)]) -> Result<usize, i64> {
     let mut t: usize = 0;
     for &(_, l) in v {
         if l > i64::MAX as usize {

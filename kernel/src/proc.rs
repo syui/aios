@@ -740,6 +740,12 @@ impl Proc {
         &mut self.mm().pt
     }
 
+    /// スレッドグループが終わりかけ (SIGKILL で殺された、exit_group した: Linux の task_will_free_mem の
+    /// SIGNAL_GROUP_EXIT)
+    pub fn group_exiting(&self) -> bool {
+        self.killed || find(self.tgid).is_some_and(|l| l.killed || l.group_exit.is_some())
+    }
+
     /// スレッドグループの代表 (スレッドでない) か
     // [lockless]
     pub fn is_leader(&self) -> bool {

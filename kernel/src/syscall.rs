@@ -64,6 +64,8 @@ nrs! {
     LISTXATTRAT = 465,
     REMOVEXATTRAT = 466,
     MSEAL = 462,
+    PROCESS_MADVISE = 440,
+    PROCESS_MRELEASE = 448,
     FUTEX_WAKE2 = 454,
     FUTEX_WAIT2 = 455,
     FUTEX_REQUEUE2 = 456,
@@ -622,6 +624,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FUTEX_WAIT2 => crate::futex::wait2(a[0] as usize, a[1], a[2], a[3] as u32, a[4] as usize, a[5] as i32),
         FUTEX_REQUEUE2 => crate::futex::requeue2(a[0] as usize, a[1] as u32, a[2] as i32, a[3] as i32),
         MSEAL => sys_mseal(a[0] as usize, a[1] as usize, a[2]),
+        PROCESS_MADVISE => sys_process_madvise(int(a[0]), a[1] as usize, a[2] as usize, a[3] as i32 as i64 as u64, a[4] as u32 as u64),
+        PROCESS_MRELEASE => crate::pidfd::mrelease(int(a[0]), a[1] as u32 as u64),
         // PID の namespace の中なら、中の番号 (ns.rs)
         GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
         GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
@@ -2213,6 +2217,45 @@ fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
 /// GUARD_INSTALL / REMOVE (Linux 6.13 の見張りのページ) はまだない: EINVAL (glibc は mprotect にする)。HUGEPAGE、MERGEABLE、
 /// HWPOISON などは手本の Linux の設定にもないので EINVAL
 fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
+    madvise_in(proc::current().pt(), addr, len, advice)
+}
+
+/// process_madvise(pidfd, vec, vlen, advice, flags) (Linux の mm/madvise.c): pidfd の指すプロセスの iovec の範囲に madvise。
+/// Linux と同じ順: flags が 0 でなければ EINVAL、iovec を写す (1024 をこえれば EINVAL、読めなければ EFAULT)、
+/// pidfd (EBADF、ESRCH)、ptrace で読めるか (EACCES)。ほかのプロセスには、こわさない知らせ (WILLNEED、COLD、PAGEOUT、
+/// COLLAPSE) だけ (でなければ EINVAL) で、CAP_SYS_NICE が要る (でなければ EPERM)。iovec を順に madvise して、知らせた
+/// バイトの和を返す (途中でだめになれば、そこまでの和。1 つもできなければそのエラー)
+fn sys_process_madvise(pidfd: i64, vec: usize, vlen: usize, advice: u64, flags: u64) -> R {
+    const WILLNEED: u64 = 3;
+    const COLD: u64 = 20;
+    const PAGEOUT: u64 = 21;
+    const COLLAPSE: u64 = 25;
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let iov = crate::sysfile::iovecs(vec, vlen)?;
+    crate::sysfile::iov_total(&iov)?;
+    let t = crate::pidfd::mm_task(pidfd)?;
+    let remote = t.tgid != proc::current().tgid;
+    if remote && !matches!(advice, WILLNEED | COLD | PAGEOUT | COLLAPSE) {
+        return Err(crate::why::inval());
+    }
+    if remote && !proc::current().cred.capable(crate::cred::CAP_SYS_NICE) {
+        return Err(-EPERM);
+    }
+    let pt = t.pt();
+    let mut done: usize = 0;
+    for (addr, len) in iov {
+        if let Err(e) = madvise_in(pt, addr, len, advice) {
+            return if done != 0 { Ok(done as i64) } else { Err(e) };
+        }
+        done += len;
+    }
+    Ok(done as i64)
+}
+
+/// madvise を表 pt に (自分のものと、process_madvise の相手のもの)
+fn madvise_in(pt: &mut crate::vm::PageTable, addr: usize, len: usize, advice: u64) -> R {
     const ENOMEM: i64 = 12;
     const EACCES: i64 = 13;
     const DONTNEED: u64 = 4;
@@ -2236,7 +2279,6 @@ fn sys_madvise(addr: usize, len: usize, advice: u64) -> R {
     if end == addr {
         return Ok(0);
     }
-    let pt = proc::current().pt();
     // 捨てる知らせは、封じた読むだけの無名の領域には EPERM (Linux の can_madvise_modify)
     if matches!(advice, DONTNEED | DONTNEED_LOCKED | FREE | REMOVE | DONTFORK | WIPEONFORK) && pt.sealed_ro_anon_in(addr, end) {
         return Err(-EPERM);

@@ -715,8 +715,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   そのまま使う。flags は FUTEX2_SIZE_U32 だけ (NUMA と MPOL の印は受けてノードは見ない)、mask と val は 32 ビットに
   入ること (でなければ EINVAL: ~0 の mask も)、futex_wake の nr 0 は起こさない、futex_wait の時間は絶対で
   CLOCK_MONOTONIC と CLOCK_REALTIME だけ、futex_requeue は waiters ごとの私有かどうかで
+- process_madvise と process_mrelease (Linux 5.10 と 5.15。test/procmadv.c、Linux と 5 行同じ、root でも): process_madvise
+  は Linux と同じ順で flags (0 だけ)、iovec (1024 まで、読めなければ EFAULT)、pidfd (EBADF、ゾンビは ESRCH)、mm_access
+  (PTRACE_MODE_READ_FSCREDS: だめなら EACCES) を見て、ほかのプロセスにはこわさない知らせ (WILLNEED、COLD、PAGEOUT、
+  COLLAPSE) だけを CAP_SYS_NICE で。iovec ごとに madvise (syscall の madvise_in を相手の表に) して、知らせたバイトの和
+  を返す。process_mrelease は終わりかけ (SIGKILL か exit_group) なら 0 (aios はスレッドが終わるときにすぐ返す)、
+  そうでなければ EINVAL、アドレス空間を持つスレッドがいなければ ESRCH
 - のこり (Linux にあって aios で ENOSYS): ptrace、setns、pivot_root、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
-  mount_setattr、open_tree_attr、statmount、listmount)、process_madvise、process_mrelease、file_getattr・file_setattr、listns など
+  mount_setattr、open_tree_attr、statmount、listmount)、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

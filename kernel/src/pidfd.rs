@@ -5,6 +5,8 @@
 //       coredump の印 (PR_SET_DUMPABLE)、知っている印 (supported_mask)。大きさは版ごと (64、72、80、88) で、入らない欄の
 //       印は落とす。systemd の pidfd_get_pid などはこれを使い、なければ fdinfo を読む
 //   pidfd_getfd (438): 相手の fd を写して受けとる (close-on-exec。ptrace で ATTACH できる相手だけ)
+//   process_madvise (440): 相手のアドレス空間に知らせる (ptrace で読める相手だけ。syscall の sys_process_madvise)
+//   process_mrelease (448): 終わりかけの相手のメモリを早く返させる
 //   pidfd_send_signal (424): flags (THREAD、THREAD_GROUP、PROCESS_GROUP のどれか 1 つ) と siginfo (ほかのプロセスへは
 //       si_code が負のものだけ)、pidfd のかわりの PIDFD_SELF_THREAD (-10000) と PIDFD_SELF_THREAD_GROUP (-10001)
 //
@@ -19,6 +21,7 @@ const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
+const EACCES: i64 = 13;
 const ENOTTY: i64 = 25;
 const EREMOTE: i64 = 66;
 
@@ -227,6 +230,47 @@ fn may_attach(t: &crate::proc::Proc) -> Result<(), i64> {
         return Err(-EPERM);
     }
     crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_ATTACH).map_err(|_| -EPERM)
+}
+
+/// pidfd の指すもののアドレス空間をさわれるか (Linux の pidfd_get_task と mm_access(PTRACE_MODE_READ_FSCREDS)):
+/// pidfd でなければ EBADF、片づけられていれば・アドレス空間がなければ (ゾンビ) ESRCH。ほかのスレッドグループなら、
+/// 自分の fs の id が相手の 3 つの uid と 3 つの gid にみな同じで相手が dumpable か (でなければ CAP_SYS_PTRACE)、それから
+/// LSM の ptrace の read。だめなら EACCES。答えは相手
+pub fn mm_task(pidfd: i64) -> Result<&'static mut crate::proc::Proc, i64> {
+    let (pid, _) = of_fd(pidfd)?;
+    let t = task(pid).ok_or(-ESRCH)?;
+    if t.state == crate::proc::State::Zombie || t.mm.is_none() {
+        return Err(-ESRCH);
+    }
+    let me = crate::proc::current();
+    if me.tgid == t.tgid {
+        return Ok(t);
+    }
+    let (c, tc) = (&me.cred, &t.cred);
+    let ids = c.fsuid == tc.uid && c.fsuid == tc.euid && c.fsuid == tc.suid && c.fsgid == tc.gid && c.fsgid == tc.egid && c.fsgid == tc.sgid;
+    if (!ids || dumpable(t) != 1) && !c.capable(crate::cred::CAP_SYS_PTRACE) {
+        return Err(-EACCES);
+    }
+    crate::security::ptrace_access_check(tc, crate::security::PTRACE_MODE_READ).map_err(|_| -EACCES)?;
+    Ok(t)
+}
+
+/// process_mrelease(pidfd, flags) (Linux の mm/oom_kill.c): 終わりかけ (殺された、exit_group した) ものなら、そのメモリを
+/// 早く返させる (aios はスレッドが終わるときにすぐ返すので、もう返したか返すところ: 0)。アドレス空間を持つスレッドが
+/// もういなければ (ゾンビ) ESRCH、終わりかけでなければ EINVAL
+pub fn mrelease(pidfd: i64, flags: u64) -> Result<i64, i64> {
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let (pid, _) = of_fd(pidfd)?;
+    let t = task(pid).ok_or(-ESRCH)?;
+    // アドレス空間をまだ持っているスレッド (Linux の find_lock_task_mm)
+    let p = if t.state != crate::proc::State::Zombie && t.mm.is_some() {
+        t
+    } else {
+        crate::proc::threads_of(t.tgid).into_iter().find(|p| p.mm.is_some()).ok_or(-ESRCH)?
+    };
+    if p.group_exiting() { Ok(0) } else { Err(crate::why::inval()) }
 }
 
 /// pidfd_getfd(pidfd, fd, flags): pidfd の指すものの fd を写して、いまのプロセスの fd (close-on-exec) に
