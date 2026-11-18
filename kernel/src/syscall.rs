@@ -107,6 +107,13 @@ nrs! {
     UMOUNT2 = 39,
     PIVOT_ROOT = 41,
     NAME_TO_HANDLE_AT = 264,
+    OPEN_TREE = 428,
+    MOVE_MOUNT = 429,
+    FSOPEN = 430,
+    FSCONFIG = 431,
+    FSMOUNT = 432,
+    FSPICK = 433,
+    MOUNT_SETATTR = 442,
     OPEN_BY_HANDLE_AT = 265,
     FCHMOD = 52,
     FCHMODAT = 53,
@@ -1999,6 +2006,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             crate::file::Kind::Inode(ino, p) if ino.meta().mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG => {
                 // LSM (AppArmor): 実行して写すなら m (security_mmap_file)
                 crate::security::mmap_file(p, prot, flags & MAP_SHARED == 0, ino.meta().uid)?;
+                // noexec のマウントのものは実行できるように写せない (Linux の do_mmap の path_noexec: EPERM)
+                if prot & crate::vm::PROT_EXEC as u64 != 0 && crate::vfs::mount_flags(p) & crate::vfs::ATTR_NOEXEC != 0 {
+                    return Err(-EPERM);
+                }
                 path = Some(p.clone());
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }

@@ -144,7 +144,7 @@ fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
 }
 
 /// at_path と同じものを探し、たどったパス (先頭 / なし) といっしょに返す (statx のマウント: vfs::mount_of)
-fn at_full(dirfd: i64, path: &str, flags: u64) -> Result<(String, InodeRef), i64> {
+pub fn at_full(dirfd: i64, path: &str, flags: u64) -> Result<(String, InodeRef), i64> {
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     match base_ino(dirfd, path)? {
         Some((dir, dir_path)) => vfs::lookup_at(&dir, &dir_path, path, follow),
@@ -1418,6 +1418,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
     // LSM (security_file_open): 開く口の許しをパスで (AppArmor、それから landlock: ディレクトリは READ_DIR、ほか (デバイスも)
     // は READ_FILE / WRITE_FILE、O_TRUNC は TRUNCATE)。あとで使う TRUNCATE と (デバイスなら) IOCTL_DEV の許しを、開いた
     // ファイルに覚える (lsm_deny: Linux の hook_file_open)
+    // nodev のマウントのデバイスは開けない (Linux の may_open の may_open_dev: EACCES)
+    if matches!(ino.meta().mode & S_IFMT, vfs::S_IFCHR | vfs::S_IFBLK) && vfs::mount_flags(&full) & vfs::ATTR_NODEV != 0 {
+        return Err(-cred::EACCES);
+    }
     let lsm_deny = {
         let m = ino.meta();
         let dev = matches!(m.mode & S_IFMT, vfs::S_IFCHR | vfs::S_IFBLK);
@@ -2803,7 +2807,7 @@ pub fn chroot(pathp: usize) -> R {
 /// マウントしてよいか: (外の) root か、自分のマウントの namespace の中で、no_new_privs か、そのマウントの
 /// namespace を作ったユーザーの namespace の中 (外には見えないし、setuid のプログラムをだませない)。
 /// 砂場 (landlock) の中からはだめ (Linux と同じ)
-fn may_mount() -> Result<(), i64> {
+pub fn may_mount() -> Result<(), i64> {
     let c = cred::current();
     let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id()));
     if c.sandbox.is_some() || !((c.ns.user.is_none() && c.capable(cred::CAP_SYS_ADMIN)) || own) {
@@ -2812,9 +2816,39 @@ fn may_mount() -> Result<(), i64> {
     Ok(())
 }
 
-/// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリとファイル)。
+/// path と inode の O_PATH の口 (open_tree、fsmount: Linux の dentry_open(path, O_PATH))
+pub fn path_fd(ino: InodeRef, path: String, cloexec: bool) -> Result<(i64, FileRef), i64> {
+    let f = file::new(Kind::Inode(ino, path), file_flags(O_PATH));
+    let fd = proc::current().files().add(f.clone(), cloexec, 0).ok_or(-EMFILE)?;
+    Ok((fd as i64, f))
+}
+
+/// mount(2) の MS_* からマウントの印 (vfs::ATTR_*: Linux の path_mount の mnt_flags)
+fn ms_attrs(flags: u64) -> u32 {
+    const MS_NOSUID: u64 = 2;
+    const MS_NODEV: u64 = 4;
+    const MS_NOEXEC: u64 = 8;
+    const MS_NOSYMFOLLOW: u64 = 256;
+    const MS_NOATIME: u64 = 1024;
+    const MS_NODIRATIME: u64 = 2048;
+    const MS_STRICTATIME: u64 = 1 << 24;
+    let mut a = 0;
+    for (ms, at) in [(MS_NOSUID, vfs::ATTR_NOSUID), (MS_NODEV, vfs::ATTR_NODEV), (MS_NOEXEC, vfs::ATTR_NOEXEC), (MS_NODIRATIME, vfs::ATTR_NODIRATIME), (MS_NOSYMFOLLOW, vfs::ATTR_NOSYMFOLLOW)] {
+        if flags & ms != 0 {
+            a |= at;
+        }
+    }
+    if flags & MS_NOATIME != 0 {
+        a |= vfs::ATTR_NOATIME;
+    } else if flags & MS_STRICTATIME != 0 {
+        a |= vfs::ATTR_STRICTATIME;
+    }
+    a
+}
+
+/// mount(source, target, fstype, flags, data): tmpfs、proc、sysfs、bind (MS_BIND、ディレクトリとファイル)、移す (MS_MOVE)。
 /// 伝わり方 (MS_PRIVATE など) は、aios ではいつも private なので何もしない。MS_RDONLY で読むだけ
-/// (MS_REMOUNT で付けなおせる)。移す (MS_MOVE) はない
+/// (MS_REMOUNT で付けなおせる)。MS_NOSUID、MS_NODEV、MS_NOEXEC、atime のものはマウントの印に (vfs::ATTR_*)
 pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize) -> R {
     const MS_RDONLY: u64 = 1;
     const MS_REMOUNT: u64 = 32;
@@ -2830,8 +2864,19 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     if flags & MS_PROPAGATION != 0 {
         return Ok(0);
     }
+    // 移す (Linux の do_move_mount_old: もとのパスがなければ EINVAL)
     if flags & MS_MOVE != 0 {
-        return Err(crate::why::inval());
+        if srcp == 0 {
+            return Err(crate::why::inval());
+        }
+        let src = user_str(srcp)?;
+        if src.is_empty() {
+            return Err(crate::why::inval());
+        }
+        let (sfull, _) = vfs::lookup(&cwd, &src, true)?;
+        let (full, _) = vfs::lookup(&cwd, &target, true)?;
+        vfs::move_mount(&sfull, &full)?;
+        return Ok(0);
     }
     // 付けなおし (mount -o remount,ro): いちばん上のマウントを読むだけに / 書けるように
     if flags & MS_REMOUNT != 0 {
@@ -2848,7 +2893,7 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
         if s.meta().is_dir() != dir.meta().is_dir() {
             return Err(-ENOTDIR);
         }
-        vfs::mount_bind(&full, s, &sfull, flags & MS_RDONLY != 0)?;
+        vfs::mount_bind(&full, s, &sfull, flags & MS_RDONLY != 0, ms_attrs(flags))?;
         return Ok(0);
     }
     if !dir.meta().is_dir() {
@@ -2872,7 +2917,7 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
         (root, source, fstype)
     };
-    vfs::mount_ro(&full, root, &source, &fstype, flags & MS_RDONLY != 0)?;
+    vfs::mount_ro(&full, root, &source, &fstype, flags & MS_RDONLY != 0, ms_attrs(flags))?;
     Ok(0)
 }
 

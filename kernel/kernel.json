@@ -98,6 +98,7 @@
   {"name": "signalfd", "type": "extra", "src": "src/signalfd.rs", "what": "signalfd (signalfd4): ブロックしたシグナルを fd から読む (struct signalfd_siginfo。poll と epoll も。Linux の fs/signalfd.c)。PostgreSQL 17 / 18 のラッチが SIGURG を待つ"},
   {"name": "msg", "type": "extra", "src": "src/msg.rs", "what": "System V のメッセージの列 (msgget、msgsnd、msgrcv、msgctl と /proc/sysvipc/msg。Linux の ipc/msg.c、CONFIG_SYSVIPC)"},
   {"name": "sem", "type": "extra", "src": "src/sem.rs", "what": "System V のセマフォ (semget、semctl、semop、semtimedop と SEM_UNDO、/proc/sysvipc/sem。Linux の ipc/sem.c、CONFIG_SYSVIPC)"},
+  {"name": "newmount", "type": "extra", "src": "src/newmount.rs", "what": "新しい mount の API (fsopen、fsconfig、fsmount、fspick、open_tree、move_mount、mount_setattr: fs のコンテキストの口と、はなれたマウント。Linux の fs/fsopen.c と fs/namespace.c)"},
   {"name": "shm", "type": "extra", "src": "src/shm.rs", "what": "System V の共有メモリ (shmget、shmat、shmdt、shmctl と /proc/sysvipc/shm。Linux の ipc/shm.c、CONFIG_SYSVIPC)。中身は名前のない tmpfs のファイル、shm_nattch は写した領域の数。PostgreSQL がいつも小さなかたまりをとる"},
   {"name": "unix", "type": "extra", "src": "src/unix.rs", "what": "AF_UNIX のソケット (SOCK_STREAM / DGRAM / SEQPACKET と socketpair。Linux の af_unix.c と同じ考え: 受ける行列、truesize の数え、パスと抽象名前空間の名前、SCM_RIGHTS / SCM_CREDENTIALS、MSG_OOB、送られている途中の輪の gc)", "bench": "test/netbench.c (aish の bench の kind net。/proc/ai/prof の socket:*、inet:*、unix:*。記録は bench/net.md)"},
   {"name": "vfat", "type": "extra", "src": "src/vfat.rs", "what": "FAT16 / FAT32 (vfat)。ESP やラズパイの boot の区画を /boot に"},

@@ -27,6 +27,7 @@ mod timerfd;
 mod signalfd;
 mod shm;
 mod msg;
+mod newmount;
 mod sem;
 mod console;
 mod tty;
@@ -187,6 +188,7 @@ pub extern "C" fn kmain() -> ! {
     syscall::register(signalfd::SYSCALLS, signalfd::sys);
     syscall::register(shm::SYSCALLS, shm::sys);
     syscall::register(msg::SYSCALLS, msg::sys);
+    syscall::register(newmount::SYSCALLS, newmount::sys);
     syscall::register(sem::SYSCALLS, sem::sys);
     proc::register_exit_hook(sem::exit);
     syscall::register(inotify::SYSCALLS, inotify::sys);

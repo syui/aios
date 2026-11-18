@@ -756,8 +756,24 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   tmpfs はさがしたもの、ほかはパスの覚え (いまもそこをさすもの)、ディレクトリは .. をたどってマウントの根まで (名前を
   変えたあとも新しいパス)、ふつうのファイルで見つからなければマウントの根 (dirfd にはならないので名前は引かない)。
   ユーザーの namespace の中の CAP_SYS_ADMIN でよい場合 (Linux の may_decode_fh の HANDLE_CHECK_SUBTREE) はまだない
-- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
-  mount_setattr、open_tree_attr、statmount、listmount)、file_getattr・file_setattr、listns など
+- 新しい mount の API (newmount.rs、extra。test/newmount.c、root で Linux と 40 行同じ): fsopen (EPERM、flags、ENODEV) で
+  fs のコンテキストの口 (Kind::Ops の FsCtx)、fsconfig は Linux の順 (cmd ごとの key・value・aux のそろい、知らない cmd は
+  EOPNOTSUPP、fs のコンテキストでなければ EINVAL、作ったあとは EBUSY)。値は共通の印 (ro、rw、sync ...)、tmpfs の size、
+  mode、uid、gid ほか、proc の hidepid ほか、source。知らないものは EINVAL で、口を read すると
+  "e tmpfs: Unknown parameter 'x'" (Linux と同じ書き置き)。FSCONFIG_CMD_CREATE で作り、fsmount (印は
+  MOUNT_ATTR_*、atime は 1 つ) で、はなれたマウント (vfs::detached_*: パスは先頭が NUL の "\0mnt:N" で、ふつうのパスや
+  覚えとまざらない。口が閉じたら捨てる) の O_PATH の口に。その中に作れる。move_mount は、はなれたものなら置き
+  (from の口のパスも置いたところに)、ほかはマウントの根を下のマウントごと移す (プロセスの cwd と root の文字も。
+  to が from の下なら ELOOP、ディレクトリかどうかがちがえば EINVAL)。mount(2) の MS_MOVE も同じもの。open_tree は O_PATH
+  の口、OPEN_TREE_CLONE ならそこを写したはなれたマウント (bind。AT_RECURSIVE で下のものも)。fspick はマウントの根の
+  ファイルシステムの口で、FSCONFIG_CMD_RECONFIGURE の ro / rw はファイルシステム (Linux の SB_RDONLY: vfs の SB_RO。
+  bind したほうからも書けない。mountinfo の終わりの欄)。mount_setattr はマウントの印を変える (大きさ、知らない印、
+  atime のきまり、マウントの根でなければ EINVAL)。マウントの印 (Mount の attrs: nosuid、nodev、noexec、noatime、
+  nodiratime、relatime、nosymfollow) は mountinfo に Linux の順で出し、mount(2) の MS_NOSUID ほかもそこへ。まもるのは
+  noexec (exec は EACCES、実行できるように写すと EPERM)、nodev (デバイスを開くと EACCES)、nosuid (exec の setuid と
+  setgid を見ない)。ないもの: 伝わり方 (受けるだけ)、idmap のマウント、MOVE_MOUNT_BENEATH、FSMOUNT_NAMESPACE、
+  nosymfollow をまもること、使っているマウントの umount の EBUSY (Linux は開いている口や cwd があれば EBUSY)
+- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、open_tree_attr、statmount、listmount、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

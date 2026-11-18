@@ -436,6 +436,52 @@ pub struct Mount {
     fstype: String,
     /// 読むだけ (MS_RDONLY): この下では作る・消す・書くは EROFS
     ro: bool,
+    /// ほかのマウントの印 (Linux の MOUNT_ATTR_*: ATTR_NOSUID など。読むだけは ro に)
+    attrs: u32,
+}
+
+/// マウントの印 (mount_setattr と fsmount の MOUNT_ATTR_* と同じ値。mount(2) の MS_* はここへ写す)
+pub const ATTR_RDONLY: u32 = 0x1;
+pub const ATTR_NOSUID: u32 = 0x2;
+pub const ATTR_NODEV: u32 = 0x4;
+pub const ATTR_NOEXEC: u32 = 0x8;
+/// atime のしかた (ATTR_ATIME の中の値: 0 は relatime)
+pub const ATTR_ATIME: u32 = 0x70;
+pub const ATTR_NOATIME: u32 = 0x10;
+pub const ATTR_STRICTATIME: u32 = 0x20;
+pub const ATTR_NODIRATIME: u32 = 0x80;
+pub const ATTR_NOSYMFOLLOW: u32 = 0x20_0000;
+
+/// mountinfo のマウントの印 (Linux の show_mnt_opts と同じ順: rw/ro、nosuid、nodev、noexec、noatime、nodiratime、
+/// relatime、nosymfollow)
+fn mnt_opts(ro: bool, attrs: u32) -> String {
+    let mut s = String::from(if ro { "ro" } else { "rw" });
+    for (bit, name) in [(ATTR_NOSUID, ",nosuid"), (ATTR_NODEV, ",nodev"), (ATTR_NOEXEC, ",noexec")] {
+        if attrs & bit != 0 {
+            s.push_str(name);
+        }
+    }
+    if attrs & ATTR_ATIME == ATTR_NOATIME {
+        s.push_str(",noatime");
+    }
+    if attrs & ATTR_NODIRATIME != 0 {
+        s.push_str(",nodiratime");
+    }
+    if attrs & ATTR_ATIME == 0 {
+        s.push_str(",relatime");
+    }
+    if attrs & ATTR_NOSYMFOLLOW != 0 {
+        s.push_str(",nosymfollow");
+    }
+    s
+}
+
+/// 読むだけにしたファイルシステム (Linux の SB_RDONLY: fspick と fsconfig の RECONFIGURE、fsopen の ro)。ファイルシステムの
+/// 番号 (InodeRef::id().0)。そのファイルシステムのどのマウントからも書けない
+static SB_RO: Bkl<alloc::collections::BTreeSet<usize>> = Bkl::new(alloc::collections::BTreeSet::new());
+
+fn sb_ro(fs: usize) -> bool {
+    SB_RO.get().contains(&fs)
 }
 
 pub struct MountNs {
@@ -520,7 +566,7 @@ pub fn mount_nodev(name: &str) -> Result<InodeRef, i64> {
 
 /// dir (すでにあるディレクトリ) の上に fs の根をかぶせる (いまの表に)
 pub fn mount(path: &str, fsroot: InodeRef, source: &str, fstype: &str) -> Result<(), i64> {
-    mount_ro(path, fsroot, source, fstype, false)
+    mount_ro(path, fsroot, source, fstype, false, 0)
 }
 
 /// はじめのマウントの namespace の表に読むだけのマウントがある (大きなロックなしの開く・作る・消す (fastdir.rs) は、ある
@@ -533,7 +579,9 @@ pub static RO_MOUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 
 /// RO_MOUNTED を数えなおす (はじめの namespace の表に ro のマウントがあるか)
 fn ro_refresh() {
-    let any = init_mnt().list.try_borrow().map_or(true, |l| l.iter().any(|m| m.ro));
+    let sb = SB_RO.get();
+    let root_ro = ROOT.get().as_ref().is_some_and(|r| sb.contains(&r.id().0));
+    let any = root_ro || init_mnt().list.try_borrow().map_or(true, |l| l.iter().any(|m| m.ro || sb.contains(&m.root.id().0)));
     RO_MOUNTED.store(any, core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -551,25 +599,36 @@ fn ro_mark(ns: &Rc<MountNs>) {
     }
 }
 
-pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool, attrs: u32) -> Result<(), i64> {
     if !resolve("", path, true)?.meta().is_dir() {
         return Err(-ENOTDIR);
     }
-    mount_at(path, fsroot, "/", source, fstype, ro)
+    mount_at(path, fsroot, "/", source, fstype, ro, attrs)
 }
 
 /// bind マウント (MS_BIND): src (先頭 / なし、たどったあと) の root (ディレクトリかファイル。path も同じ種類) を path に。mountinfo の root の欄と、
 /// もと・種類は、src をふくむマウントのもの (Linux と同じ。前の aios は もと が "/src"、種類が "none" だった)
-pub fn mount_bind(path: &str, root: InodeRef, src: &str, ro: bool) -> Result<(), i64> {
-    let (root_path, source, fstype) = {
+pub fn mount_bind(path: &str, root: InodeRef, src: &str, ro: bool, attrs: u32) -> Result<(), i64> {
+    let (root_path, source, fstype, from_attrs, _) = bind_source(src);
+    mount_at(path, root, &root_path, &source, &fstype, ro, attrs | from_attrs)
+}
+
+/// src (たどったあと) をふくむマウントの、bind したときの (root の欄, もと, 種類, 印, 読むだけ)。印はもとのマウントのものを
+/// 受けつぐ (Linux の clone_mnt)
+fn bind_source(src: &str) -> (String, String, String, u32, bool) {
+    {
         let ns = current_mnt();
         let l = ns.list.borrow();
-        let (rp, source, fstype, target) = match containing(&l, src, l.len()) {
-            Some(i) => (l[i].root_path.clone(), l[i].source.clone(), l[i].fstype.clone(), l[i].target.clone()),
-            None => {
-                let (s, t) = ROOT_INFO.get().clone();
-                (String::from("/"), s, t, String::new())
-            }
+        let top = ns.top.borrow();
+        let (rp, source, fstype, target, attrs, ro) = match containing(&l, src, l.len()) {
+            Some(i) => (l[i].root_path.clone(), l[i].source.clone(), l[i].fstype.clone(), l[i].target.clone(), l[i].attrs, l[i].ro),
+            None => match &*top {
+                Some(t) => (t.root_path.clone(), t.source.clone(), t.fstype.clone(), String::new(), t.attrs, t.ro),
+                None => {
+                    let (s, t) = ROOT_INFO.get().clone();
+                    (String::from("/"), s, t, String::new(), 0, false)
+                }
+            },
         };
         let rel = if target.is_empty() { src } else { src[target.len()..].trim_start_matches('/') };
         let rp = if rel.is_empty() {
@@ -579,9 +638,8 @@ pub fn mount_bind(path: &str, root: InodeRef, src: &str, ro: bool) -> Result<(),
         } else {
             alloc::format!("{}/{}", rp, rel)
         };
-        (rp, source, fstype)
-    };
-    mount_at(path, root, &root_path, &source, &fstype, ro)
+        (rp, source, fstype, attrs, ro)
+    }
 }
 
 /// path が t の下 (t そのものも)。t が "" (ルート) ならどれも
@@ -594,13 +652,13 @@ fn containing(l: &[Mount], path: &str, before: usize) -> Option<usize> {
     l[..before].iter().enumerate().filter(|(_, m)| under(path, &m.target)).max_by_key(|(_, m)| m.target.len()).map(|(i, _)| i)
 }
 
-fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype: &str, ro: bool) -> Result<(), i64> {
+fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype: &str, ro: bool, attrs: u32) -> Result<(), i64> {
     let ns = current_mnt();
     if ro {
         ro_mark(&ns);
     }
     let (target, dir) = lookup("", path, true)?;
-    ns.list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro });
+    ns.list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro, attrs });
     // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
     mount_at_refresh();
     names_changed();
@@ -681,9 +739,31 @@ pub fn check_writable(path: &str) -> Result<(), i64> {
     const EROFS: i64 = 30;
     let ns = current_mnt();
     let l = ns.list.borrow();
+    if let Some(id) = detached_id(path) {
+        let d = DETACHED.get();
+        let ro = d.get(&id).and_then(|d| d.mounts.first()).is_some_and(|m| m.ro || sb_ro(m.root.id().0));
+        return if ro { Err(-EROFS) } else { Ok(()) };
+    }
     let under = |t: &str| path == t || (path.len() > t.len() && path.starts_with(t) && path.as_bytes()[t.len()] == b'/');
     let deepest = l.iter().filter(|m| under(&m.target)).max_by_key(|m| m.target.len());
-    if deepest.is_some_and(|m| m.ro) { Err(-EROFS) } else { Ok(()) }
+    let ro = match deepest {
+        Some(m) => m.ro || sb_ro(m.root.id().0),
+        None => !SB_RO.get().is_empty() && sb_ro(root().id().0),
+    };
+    if ro { Err(-EROFS) } else { Ok(()) }
+}
+
+/// path (たどったあと) のあるマウントの印 (ATTR_NOEXEC など: exec、mmap、デバイスを開くときに見る)
+pub fn mount_flags(path: &str) -> u32 {
+    if let Some(id) = detached_id(path) {
+        return DETACHED.get().get(&id).and_then(|d| d.mounts.first()).map_or(0, |m| m.attrs);
+    }
+    let ns = current_mnt();
+    let l = ns.list.borrow();
+    match containing(&l, path, l.len()) {
+        Some(i) => l[i].attrs,
+        None => ns.top.borrow().as_ref().map_or(0, |t| t.attrs),
+    }
 }
 
 /// path にかぶせてあるもの (いちばん上) を外す。detach (MNT_DETACH) なら、その下にあるマウントもいっしょに (Linux の
@@ -792,7 +872,7 @@ pub fn pivot_root(root: &str, new: &str, old: &str, old_id: (usize, u64)) -> Res
                 }
                 None => {
                     let (source, fstype) = ROOT_INFO.get().clone();
-                    Mount { id, at: (0, 0), root: ROOT.get().clone().expect("no root filesystem"), root_path: "/".into(), source, target: String::new(), fstype, ro: false }
+                    Mount { id, at: (0, 0), root: ROOT.get().clone().expect("no root filesystem"), root_path: "/".into(), source, target: String::new(), fstype, ro: false, attrs: 0 }
                 }
             }
         }
@@ -825,6 +905,234 @@ pub fn pivot_root(root: &str, new: &str, old: &str, old_id: (usize, u64)) -> Res
     names_changed();
     crate::file::shelf_flush_all();
     Ok(())
+}
+
+// ---- はなれたマウントと、マウントを移す・印を変える (新しい mount の API: newmount.rs) ----
+
+/// はなれたマウントの木 (fsmount と open_tree の OPEN_TREE_CLONE: Linux の無名のマウントの namespace)。根のマウントと、
+/// いっしょに写した下のもの (target は根からの相対。根は "")。口 (O_PATH の fd) が閉じたら捨てる
+struct Detached {
+    mounts: Vec<Mount>,
+    file: Option<alloc::rc::Weak<core::cell::RefCell<crate::file::OpenFile>>>,
+}
+
+static DETACHED: Bkl<alloc::collections::BTreeMap<u32, Detached>> = Bkl::new(alloc::collections::BTreeMap::new());
+
+/// はなれたマウントの根のパス (先頭が NUL: ふつうのパスにはないので、覚えやマウントの表とまざらない)。中のものはその下
+pub fn detached_path(id: u32) -> String {
+    alloc::format!("\0mnt:{}", id)
+}
+
+/// path がはなれたマウントの中なら、その番号
+pub fn detached_id(path: &str) -> Option<u32> {
+    path.strip_prefix("\0mnt:")?.split('/').next()?.parse().ok()
+}
+
+/// 口が閉じたはなれたマウントを捨てる (Linux の FMODE_NEED_UNMOUNT の dissolve_on_fput)
+fn detached_sweep() {
+    DETACHED.get().retain(|_, d| d.file.as_ref().is_none_or(|w| w.strong_count() > 0));
+}
+
+/// 作ったファイルシステムの根を、はなれたマウントに (fsmount)。番号を返す
+pub fn detached_new(root: InodeRef, source: &str, fstype: &str, ro: bool, attrs: u32) -> u32 {
+    detached_sweep();
+    let id = new_mnt_id();
+    let m = Mount { id, at: (0, 0), root, root_path: "/".into(), source: source.into(), target: String::new(), fstype: fstype.into(), ro, attrs };
+    DETACHED.get().insert(id, Detached { mounts: alloc::vec![m], file: None });
+    id
+}
+
+/// はなれたマウントの口 (閉じたら捨てる)
+pub fn detached_file(id: u32, f: &crate::file::FileRef) {
+    if let Some(d) = DETACHED.get().get_mut(&id) {
+        d.file = Some(Rc::downgrade(f));
+    }
+}
+
+/// path (たどったあと) とその inode を写した、はなれたマウント (open_tree の OPEN_TREE_CLONE: Linux の open_detached_copy。
+/// bind と同じく、もと・種類・印・読むだけはふくむマウントのもの)。recursive (AT_RECURSIVE) なら下のマウントも
+pub fn detached_clone(path: &str, ino: InodeRef, recursive: bool) -> Result<u32, i64> {
+    if detached_id(path).is_some() {
+        return Err(crate::why::inval());
+    }
+    detached_sweep();
+    let (root_path, source, fstype, attrs, ro) = bind_source(path);
+    let id = new_mnt_id();
+    let mut mounts = alloc::vec![Mount { id, at: (0, 0), root: ino, root_path, source, target: String::new(), fstype, ro, attrs }];
+    if recursive {
+        let ns = current_mnt();
+        for m in ns.list.borrow().iter().filter(|m| m.target != path && under(&m.target, path)) {
+            let mut c = m.clone();
+            c.id = new_mnt_id();
+            c.target = below(&m.target, path).into();
+            mounts.push(c);
+        }
+    }
+    DETACHED.get().insert(id, Detached { mounts, file: None });
+    Ok(id)
+}
+
+/// はなれたマウント id を to (たどったあと) に置く (move_mount)。根と to のディレクトリかどうかがちがえば EINVAL
+pub fn detached_attach(id: u32, to: &str) -> Result<(), i64> {
+    if detached_id(to).is_some() {
+        return Err(crate::why::inval());
+    }
+    let dir = resolve("", to, true)?;
+    let is_dir = DETACHED.get().get(&id).ok_or_else(crate::why::inval)?.mounts[0].root.meta().is_dir();
+    if is_dir != dir.meta().is_dir() {
+        return Err(crate::why::inval());
+    }
+    let mut d = DETACHED.get().remove(&id).ok_or_else(crate::why::inval)?;
+    for (k, m) in d.mounts.iter_mut().enumerate() {
+        m.target = join_rel(to, &m.target);
+        if k == 0 {
+            m.at = dir.id();
+        }
+    }
+    let ns = current_mnt();
+    if d.mounts.iter().any(|m| m.ro) {
+        ro_mark(&ns);
+    }
+    ns.list.borrow_mut().extend(d.mounts);
+    ro_refresh();
+    mount_at_refresh();
+    names_changed();
+    Ok(())
+}
+
+/// マウントの根 from を、その下のマウントごと to へ移す (move_mount と mount(2) の MS_MOVE: Linux の do_move_mount)。
+/// from がマウントの根でなければ EINVAL、to が from の下なら ELOOP、ディレクトリかどうかがちがえば EINVAL。その
+/// namespace のプロセスの cwd と root の文字も (from の下は to の下へ)
+pub fn move_mount(from: &str, to: &str) -> Result<(), i64> {
+    if detached_id(to).is_some() {
+        return Err(crate::why::inval());
+    }
+    let ns = current_mnt();
+    let i = {
+        let l = ns.list.borrow();
+        let top = resolve("", from, false)?;
+        l.iter().rposition(|m| m.target == from && m.root.id() == top.id()).filter(|_| !from.is_empty()).ok_or_else(crate::why::inval)?
+    };
+    let dir = resolve("", to, true)?;
+    if ns.list.borrow()[i].root.meta().is_dir() != dir.meta().is_dir() {
+        return Err(crate::why::inval());
+    }
+    if under(to, from) {
+        return Err(-ELOOP);
+    }
+    {
+        let mut l = ns.list.borrow_mut();
+        let (mut kept, mut moved) = (Vec::new(), Vec::new());
+        for (k, m) in core::mem::take(&mut *l).into_iter().enumerate() {
+            if k == i || (m.target != from && under(&m.target, from)) {
+                moved.push((k == i, m));
+            } else {
+                kept.push(m);
+            }
+        }
+        for (root, m) in moved.iter_mut() {
+            m.target = join_rel(to, below(&m.target, from));
+            if *root {
+                m.at = dir.id();
+            }
+        }
+        kept.extend(moved.into_iter().map(|(_, m)| m));
+        kept.sort_by_key(|m| if m.target.is_empty() { 0 } else { m.target.split('/').count() });
+        *l = kept;
+    }
+    let (from, to) = (String::from(from), String::from(to));
+    crate::proc::each_files_in_mnt(ns.id, |f| {
+        for (s, root) in [(f.cwd.clone(), false), (f.root.clone(), true)] {
+            if under(&s, &from) && !from.is_empty() {
+                let n = join_rel(&to, below(&s, &from));
+                if root { f.set_root(n) } else { f.set_cwd(n) }
+            }
+        }
+    });
+    mount_at_refresh();
+    names_changed();
+    Ok(())
+}
+
+/// path (たどったあと) がマウントの根なら (根の inode, 種類) (fspick と mount_setattr: Linux の path_mounted)
+pub fn mount_root(path: &str) -> Option<(InodeRef, String)> {
+    if let Some(id) = detached_id(path) {
+        let d = DETACHED.get();
+        let m = d.get(&id)?.mounts.first()?;
+        return (path == detached_path(id)).then(|| (m.root.clone(), m.fstype.clone()));
+    }
+    let ns = current_mnt();
+    if path.is_empty() {
+        return Some(match &*ns.top.borrow() {
+            Some(t) => (t.root.clone(), t.fstype.clone()),
+            None => (root(), ROOT_INFO.get().1.clone()),
+        });
+    }
+    let l = ns.list.borrow();
+    l.iter().rposition(|m| m.target == path).map(|i| (l[i].root.clone(), l[i].fstype.clone()))
+}
+
+/// マウントの根 path の印を変える (mount_setattr: set を足して clr を外す。ATTR_RDONLY は読むだけ)。recursive なら下の
+/// マウントも。根でなければ EINVAL
+pub fn set_mount_attrs(path: &str, set: u32, clr: u32, recursive: bool) -> Result<(), i64> {
+    let apply = |m: &mut Mount| {
+        let a = ((m.attrs | if m.ro { ATTR_RDONLY } else { 0 }) & !clr) | set;
+        m.ro = a & ATTR_RDONLY != 0;
+        m.attrs = a & !ATTR_RDONLY;
+    };
+    let ns = current_mnt();
+    if set & ATTR_RDONLY != 0 {
+        ro_mark(&ns);
+        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(id) = detached_id(path) {
+        if path != detached_path(id) {
+            return Err(crate::why::inval());
+        }
+        let d = DETACHED.get();
+        let t = d.get_mut(&id).ok_or_else(crate::why::inval)?;
+        let n = if recursive { t.mounts.len() } else { 1 };
+        t.mounts.iter_mut().take(n).for_each(apply);
+        return Ok(());
+    }
+    if path.is_empty() {
+        let mut top = ns.top.borrow_mut();
+        let t = top.get_or_insert_with(|| {
+            let (source, fstype) = ROOT_INFO.get().clone();
+            Mount { id: ns.root_id.get(), at: (0, 0), root: ROOT.get().clone().expect("no root filesystem"), root_path: "/".into(), source, target: String::new(), fstype, ro: false, attrs: 0 }
+        });
+        apply(t);
+    } else {
+        let mut l = ns.list.borrow_mut();
+        let i = l.iter().rposition(|m| m.target == path).ok_or_else(crate::why::inval)?;
+        apply(&mut l[i]);
+    }
+    if recursive {
+        let mut l = ns.list.borrow_mut();
+        for m in l.iter_mut().filter(|m| m.target != path && under(&m.target, path)) {
+            apply(m);
+        }
+    }
+    ro_refresh();
+    Ok(())
+}
+
+/// ファイルシステム fs を読むだけに / 書けるように (fsconfig の ro と RECONFIGURE: Linux の reconfigure_super の SB_RDONLY)。
+/// どのマウントからも
+pub fn set_sb_ro(fs: usize, ro: bool) {
+    if ro {
+        RO_MOUNTED.store(true, core::sync::atomic::Ordering::SeqCst);
+        drop(crate::smp::fs_lock());
+        SB_RO.get().insert(fs);
+    } else {
+        SB_RO.get().remove(&fs);
+    }
+    ro_refresh();
+}
+
+/// 装置のないファイルシステム name があるか (fsopen: なければ ENODEV)
+pub fn has_filesystem(name: &str) -> bool {
+    name == "tmpfs" || FILESYSTEMS.lock().iter().any(|(n, _)| *n == name)
 }
 
 /// path (先頭 / なし、たどったあと) をふくむマウントの、マウント先のパスと根 (open_by_handle_at が、そのファイル
@@ -901,26 +1209,26 @@ pub fn mountinfo_text_of(ns: Option<Rc<MountNs>>, root: &str) -> String {
         let rel = if root.is_empty() { target } else { target[root.len()..].trim_start_matches('/') };
         Some(alloc::format!("/{}", mangle(rel, false)))
     };
-    let line = |id: u32, parent: u32, dev: (u32, u32), root_path: &str, point: &str, ro: bool, fstype: &str, source: &str| {
-        let rw = if ro { "ro" } else { "rw" };
-        alloc::format!("{} {} {}:{} {} {} {},relatime - {} {} {}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, rw, mangle(fstype, true), mangle(source, true), rw)
+    let line = |id: u32, parent: u32, dev: (u32, u32), root_path: &str, point: &str, ro: bool, attrs: u32, fs: usize, fstype: &str, source: &str| {
+        let sb = if sb_ro(fs) { "ro" } else { "rw" };
+        alloc::format!("{} {} {}:{} {} {} {} - {} {} {}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, mnt_opts(ro, attrs), mangle(fstype, true), mangle(source, true), sb)
     };
     let mut s = String::new();
     let rid = ns.root_id.get();
     if let Some(p) = shown("") {
         match &*ns.top.borrow() {
-            Some(t) => s.push_str(&line(rid, rid, fs_dev(t.root.id().0), &t.root_path, &p, t.ro, &t.fstype, &t.source)),
+            Some(t) => s.push_str(&line(rid, rid, fs_dev(t.root.id().0), &t.root_path, &p, t.ro, t.attrs, t.root.id().0, &t.fstype, &t.source)),
             None => {
                 let (src, ty) = ROOT_INFO.get().clone();
                 let fs = ROOT.get().as_ref().map_or(0, |r| r.id().0);
-                s.push_str(&line(rid, rid, fs_dev(fs), "/", &p, false, &ty, &src));
+                s.push_str(&line(rid, rid, fs_dev(fs), "/", &p, false, 0, fs, &ty, &src));
             }
         }
     }
     for (i, m) in l.iter().enumerate() {
         let Some(p) = shown(&m.target) else { continue };
         let parent = containing(&l, &m.target, i).map_or(rid, |j| l[j].id);
-        s.push_str(&line(m.id, parent, fs_dev(m.root.id().0), &m.root_path, &p, m.ro, &m.fstype, &m.source));
+        s.push_str(&line(m.id, parent, fs_dev(m.root.id().0), &m.root_path, &p, m.ro, m.attrs, m.root.id().0, &m.fstype, &m.source));
     }
     s
 }
@@ -942,7 +1250,8 @@ pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
     };
     let mut s = alloc::format!("{} / {} {} 0 0\n", mangle(&src, true), mangle(&ty, true), if ro { "ro" } else { "rw" });
     for m in ns.list.borrow().iter() {
-        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), if m.ro { "ro" } else { "rw" }));
+        let ro = m.ro || sb_ro(m.root.id().0);
+        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), if ro { "ro" } else { "rw" }));
     }
     s
 }

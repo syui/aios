@@ -170,6 +170,10 @@ pub fn check(exe: &str, ino: &crate::vfs::InodeRef) -> Result<crate::security::B
     if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
         return Err(-EACCES);
     }
+    // noexec のマウントのものは実行できない (Linux の do_open_execat の path_noexec)
+    if crate::vfs::mount_flags(exe.trim_start_matches('/')) & crate::vfs::ATTR_NOEXEC != 0 {
+        return Err(-EACCES);
+    }
     crate::security::bprm_creds_for_exec(exe, m.uid)
 }
 
@@ -200,6 +204,9 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
             if m.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG || !crate::cred::current().may(&m, crate::cred::X, false) {
                 return Err(-EACCES);
             }
+            if crate::vfs::mount_flags(exe.trim_start_matches('/')) & crate::vfs::ATTR_NOEXEC != 0 {
+                return Err(-EACCES);
+            }
             b
         }
         None => check(&exe, &ino)?,
@@ -228,8 +235,10 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     }
     // LSM: 新しいラベルでこのプログラムを写せるか (だめなら exec のあと SIGSEGV: Linux と同じ)
     bprm.fatal |= !crate::security::bprm_mmap_file(&bprm, &exe, m.uid);
-    let setuid = (m.mode & crate::cred::S_ISUID != 0).then_some(m.uid);
-    let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0).then_some(m.gid);
+    // nosuid のマウントのものは setuid / setgid を見ない (Linux の bprm_fill_uid の mnt_may_suid)
+    let suid_ok = crate::vfs::mount_flags(exe.trim_start_matches('/')) & crate::vfs::ATTR_NOSUID == 0;
+    let setuid = (m.mode & crate::cred::S_ISUID != 0 && suid_ok).then_some(m.uid);
+    let setgid = (m.mode & crate::cred::S_ISGID != 0 && m.mode & 0o010 != 0 && suid_ok).then_some(m.gid);
     let size = m.size as usize;
     let mut nondump = !crate::cred::current().may(&m, crate::cred::R, false);
     let mut pt = PageTable::new().ok_or(-ENOMEM)?;
