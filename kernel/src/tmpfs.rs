@@ -481,6 +481,53 @@ impl Inode for TmpInode {
     }
 
     /// ページを持っているか (mincore。tmpfs の中身はみなメモリ: 穴は持たない)
+    /// Linux の shmem_encode_fh: 12 バイト (generation、番号の下と上) で種類 1。親つき (connectable) は解けないので作らない
+    fn encode_fh(&self, parent: Option<&InodeRef>) -> Option<(i32, Vec<u8>)> {
+        if parent.is_some() {
+            return None;
+        }
+        let mut v = Vec::with_capacity(12);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&(self.ino as u32).to_le_bytes());
+        v.extend_from_slice(&((self.ino >> 32) as u32).to_le_bytes());
+        Some((1, v))
+    }
+
+    fn can_decode_fh(&self) -> (bool, bool) {
+        (true, false)
+    }
+
+    /// Linux の shmem_fh_to_dentry (種類は見ない。12 バイトより短ければ ESTALE): aios の tmpfs の番号は使いまわさない
+    /// ので generation は 0。根から名前のあるものをさがす (パスもわかる。消して名前のないものは見つからない)
+    fn decode_fh(&self, me: &InodeRef, _ty: i32, fh: &[u8]) -> Result<(InodeRef, Option<String>), i64> {
+        const ESTALE: i64 = 116;
+        if fh.len() < 12 {
+            return Err(-ESTALE);
+        }
+        let w = |i: usize| u32::from_le_bytes(fh[i..i + 4].try_into().unwrap());
+        let ino = w(4) as u64 | (w(8) as u64) << 32;
+        if w(0) != 0 {
+            return Err(-ESTALE);
+        }
+        if self.ino == ino {
+            return Ok((me.clone(), Some(String::new())));
+        }
+        let kids = |n: &TmpInode, at: &str| -> Vec<(Rc<TmpInode>, String)> {
+            match &*n.node.borrow() {
+                Node::Dir(m) => m.iter().map(|(name, c)| (c.clone(), if at.is_empty() { name.clone() } else { alloc::format!("{}/{}", at, name) })).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let mut stack = kids(self, "");
+        while let Some((n, p)) = stack.pop() {
+            if n.ino == ino {
+                return Ok((n as InodeRef, Some(p)));
+            }
+            stack.extend(kids(&n, &p));
+        }
+        Err(-ESTALE)
+    }
+
     fn resident(&self, foff: usize) -> Option<bool> {
         match &*self.node.borrow() {
             Node::File(Data::Static(b)) => Some(foff < b.len()),

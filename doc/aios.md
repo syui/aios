@@ -743,7 +743,20 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   からは EINVAL にした (えらんだちがい: Linux はふつうの / ならできるが、aios の大きなロックなしの道 (statc、fastdir) は
   はじめの namespace の / を ROOT と見ているので)。開いている fd のパスの文字は書きかえない。umount2 は MNT_DETACH で
   下のマウントもいっしょに外し (Linux の umount_tree)、UMOUNT_NOFOLLOW を見て、知らない flags は EINVAL に
-- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、name_to_handle_at・open_by_handle_at、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
+- name_to_handle_at と open_by_handle_at (test/fhandle.c、ext4 と tmpfs で Linux と 22 行同じ、root でも): ファイル
+  ハンドルは Inode の encode_fh / decode_fh (Linux の export_operations)。ext4 は FILEID_INO32_GEN (番号と generation の
+  8 バイト。AT_HANDLE_CONNECTABLE のファイルは親も入れた 16 バイトの FILEID_INO32_GEN_PARENT、上の印 FILEID_IS_CONNECTABLE
+  と、ディレクトリなら FILEID_IS_DIR)、tmpfs は 12 バイト (generation 0: aios の tmpfs は番号を使いまわさない。親つきは
+  解けないので EOPNOTSUPP)、ほか (/proc など) は AT_HANDLE_FID のときだけ番号の 8 バイト (ほかは EOPNOTSUPP)。たしかめは
+  Linux の do_sys_name_to_handle と同じ順 (flags、CONNECTABLE と FID / EMPTY_PATH は EINVAL、たどる、EOPNOTSUPP、handle を
+  読む EFAULT、128 をこえる EINVAL、入らなければ要る大きさと種類 255 で EOVERFLOW)。mount_id は statx と同じ番号。
+  open_by_handle_at は handle_bytes が 0 か 128 をこえる・種類が負か知らない印は EINVAL、mount_fd (EBADF)、
+  CAP_DAC_READ_SEARCH (EPERM)、mount_fd のあるマウントで解く: ext4 は番号から (予約、数をこえる、消したもの、
+  generation のちがいは ESTALE)、tmpfs は根から名前をさがす (種類は見ない: Linux と同じ)。開いたものにつけるパスは、
+  tmpfs はさがしたもの、ほかはパスの覚え (いまもそこをさすもの)、ディレクトリは .. をたどってマウントの根まで (名前を
+  変えたあとも新しいパス)、ふつうのファイルで見つからなければマウントの根 (dirfd にはならないので名前は引かない)。
+  ユーザーの namespace の中の CAP_SYS_ADMIN でよい場合 (Linux の may_decode_fh の HANDLE_CHECK_SUBTREE) はまだない
+- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、新しい mount の API (open_tree、move_mount、fsopen、fsconfig、fsmount、fspick、
   mount_setattr、open_tree_attr、statmount、listmount)、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の

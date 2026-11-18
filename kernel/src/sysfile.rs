@@ -2919,6 +2919,168 @@ pub fn pivot_root(newp: usize, oldp: usize) -> R {
     Ok(0)
 }
 
+const AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
+const AT_HANDLE_CONNECTABLE: u64 = 0x002;
+const AT_HANDLE_FID: u64 = 0x200;
+/// handle_type の上の印 (Linux の FILEID_IS_CONNECTABLE と FILEID_IS_DIR)
+const FILEID_IS_CONNECTABLE: i32 = 0x10000;
+const FILEID_IS_DIR: i32 = 0x20000;
+const MAX_HANDLE_SZ: u32 = 128;
+const ESTALE: i64 = 116;
+
+/// name_to_handle_at(dirfd, path, handle, mount_id, flags) (Linux の fs/fhandle.c): flags は AT_SYMLINK_FOLLOW、
+/// AT_EMPTY_PATH、AT_HANDLE_FID、AT_HANDLE_MNT_ID_UNIQUE、AT_HANDLE_CONNECTABLE だけ (CONNECTABLE は FID とも
+/// EMPTY_PATH ともいっしょにできない: EINVAL)。たどってから、解けるハンドルを作れないファイルシステム (FID なら
+/// どれでも) は EOPNOTSUPP、handle を読めなければ EFAULT、handle_bytes が 128 をこえれば EINVAL、入らなければ要る大きさと
+/// 種類 255 を書いて EOVERFLOW。mount_id は statx の stx_mnt_id (UNIQUE なら 64 ビットの番号)
+pub fn name_to_handle_at(dirfd: i64, pathp: usize, handlep: usize, midp: usize, flags: u64) -> R {
+    const EOPNOTSUPP: i64 = 95;
+    const EOVERFLOW: i64 = 75;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE | AT_HANDLE_CONNECTABLE) != 0 {
+        return Err(crate::why::inval());
+    }
+    let connectable = flags & AT_HANDLE_CONNECTABLE != 0;
+    let fid = flags & AT_HANDLE_FID != 0;
+    if connectable && flags & (AT_HANDLE_FID | AT_EMPTY_PATH) != 0 {
+        return Err(crate::why::inval());
+    }
+    let path = user_str(pathp)?;
+    let nofollow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
+    let (full, ino) = if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(-ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            vfs::lookup("", &proc::current().files().cwd.clone(), true)?
+        } else {
+            let f = file_of(dirfd as u64)?;
+            let b = f.borrow();
+            match &b.kind {
+                Kind::Inode(i, p) => (p.trim_start_matches('/').into(), i.clone()),
+                _ => return Err(-EOPNOTSUPP),
+            }
+        }
+    } else {
+        at_full(dirfd, &path, nofollow)?
+    };
+    let (decode, decode_parent) = ino.can_decode_fh();
+    if !fid && (!decode || (connectable && !decode_parent)) {
+        return Err(-EOPNOTSUPP);
+    }
+    let mut hdr = [0u8; 8];
+    proc::current().pt().copy_in(&mut hdr, handlep).ok_or(-EFAULT)?;
+    let room = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    if room > MAX_HANDLE_SZ {
+        return Err(crate::why::inval());
+    }
+    let dir = ino.meta().is_dir();
+    let parent = if connectable && !dir { Some(vfs::resolve("", dir_of(&full), true)?) } else { None };
+    // ファイルシステムのもの。FID でそれがなければ、番号と generation (0) の 8 バイト (Linux の exportfs_encode_inode_fh)
+    let (mut ty, fh) = match ino.encode_fh(parent.as_ref()) {
+        Some(h) => h,
+        None if fid => (1, [(ino.id().1 as u32).to_le_bytes(), 0u32.to_le_bytes()].concat()),
+        None => return Err(-EOPNOTSUPP),
+    };
+    let fits = fh.len() as u32 <= room & !3;
+    if fits && connectable {
+        ty |= FILEID_IS_CONNECTABLE | if dir { FILEID_IS_DIR } else { 0 };
+    }
+    let (mnt, _) = vfs::mount_of(&full);
+    if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
+        out(midp, &vfs::unique_mnt_id(mnt).to_le_bytes())?;
+    } else {
+        out(midp, &(mnt as u32).to_le_bytes())?;
+    }
+    let mut o = Vec::with_capacity(8 + fh.len());
+    o.extend_from_slice(&(fh.len() as u32).to_le_bytes());
+    o.extend_from_slice(&(if fits { ty } else { 255 }).to_le_bytes());
+    if !fits {
+        out(handlep, &o)?;
+        return Err(-EOVERFLOW);
+    }
+    o.extend_from_slice(&fh);
+    out(handlep, &o)?;
+    Ok(0)
+}
+
+/// open_by_handle_at(mount_fd, handle, flags) (Linux の fs/fhandle.c の handle_to_path と do_handle_open): handle を読み
+/// (EFAULT)、handle_bytes が 0 か 128 をこえる・種類が負か知らない印は EINVAL、mount_fd (AT_FDCWD はいまのディレクトリ。
+/// なければ EBADF)、CAP_DAC_READ_SEARCH がなければ EPERM。mount_fd のあるマウントのファイルシステムで解き (できなければ
+/// ESTALE。FILEID_IS_DIR の印でディレクトリでなくても)、ふつうの open のように開く (リンクは O_PATH でなければ ELOOP)。
+/// 開いたものにつけるパスは、根から見つけたもの (tmpfs)、パスの覚え、ディレクトリなら .. をたどったもの。ふつうの
+/// ファイルで見つからなければマウントの根 (Linux のつながっていない dentry のかわり: dirfd にはならないので名前は引かない)
+pub fn open_by_handle_at(mountfd: i64, handlep: usize, flags: u64) -> R {
+    let mut hdr = [0u8; 8];
+    proc::current().pt().copy_in(&mut hdr, handlep).ok_or(-EFAULT)?;
+    let bytes = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    let ty = i32::from_le_bytes(hdr[4..].try_into().unwrap());
+    if bytes == 0 || bytes > MAX_HANDLE_SZ || ty < 0 || ty & !0xffff & !(FILEID_IS_CONNECTABLE | FILEID_IS_DIR) != 0 {
+        return Err(crate::why::inval());
+    }
+    let anchor = if mountfd == AT_FDCWD {
+        Some(proc::current().files().cwd.clone())
+    } else {
+        let f = file_of(mountfd as u64)?;
+        let b = f.borrow();
+        match &b.kind {
+            Kind::Inode(_, p) => Some(String::from(p.trim_start_matches('/'))),
+            _ => None,
+        }
+    };
+    if !cred::current().capable(cred::CAP_DAC_READ_SEARCH) {
+        return Err(-cred::EPERM);
+    }
+    let mut fh = vec![0u8; bytes as usize];
+    proc::current().pt().copy_in(&mut fh, handlep + 8).ok_or(-EFAULT)?;
+    let anchor = anchor.ok_or(-ESTALE)?;
+    let (target, root) = vfs::mount_root_of(&anchor);
+    let (ino, rel) = root.decode_fh(&root, ty & 0xffff, &fh)?;
+    let dir = ino.meta().is_dir();
+    if ty & FILEID_IS_DIR != 0 && !dir {
+        return Err(-ESTALE);
+    }
+    let join = |r: &str| if target.is_empty() { String::from(r) } else if r.is_empty() { target.clone() } else { alloc::format!("{}/{}", target, r) };
+    let full = match rel {
+        Some(r) => join(&r),
+        None => handle_path(&target, &root, &ino, dir).ok_or(-ESTALE)?,
+    };
+    let flags = open_flags(flags)?;
+    if ino.meta().mode & S_IFMT == vfs::S_IFLNK && flags & O_PATH == 0 {
+        return Err(-vfs::ELOOP);
+    }
+    open_found(Ok((full, ino)), flags & !(O_CREAT | O_EXCL | O_TMPFILE), 0)
+}
+
+/// open_by_handle_at で開いたものにつけるパス (先頭 / なし): パスの覚えにあって、いまもそこをさすもの。でなければ
+/// ディレクトリは .. をたどってマウントの根まで (親の中の名前は番号でさがす)。ふつうのファイルはマウントの根
+fn handle_path(target: &str, root: &InodeRef, ino: &InodeRef, dir: bool) -> Option<String> {
+    let under = |p: &str| target.is_empty() || p == target || p.starts_with(&alloc::format!("{}/", target));
+    if let Some(p) = vfs::path_of_id(ino.id()) {
+        let p = String::from(p.trim_start_matches('/'));
+        if under(&p) && vfs::resolve("", &p, false).is_ok_and(|i| i.id() == ino.id()) {
+            return Some(p);
+        }
+    }
+    if !dir {
+        return Some(target.into());
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = ino.clone();
+    for _ in 0..256 {
+        if cur.id() == root.id() {
+            names.reverse();
+            let rel = names.join("/");
+            return Some(if target.is_empty() { rel } else if rel.is_empty() { target.into() } else { alloc::format!("{}/{}", target, rel) });
+        }
+        let parent = cur.lookup("..").ok()?;
+        let name = parent.readdir().ok()?.into_iter().find(|e| e.ino == cur.id().1 && e.name != "." && e.name != "..")?.name;
+        names.push(name);
+        cur = parent;
+    }
+    None
+}
+
 /// LSM の mount (security_sb_mount。AppArmor の apparmor_sb_mount: 決まりのあるプロセスだけ)。remount、bind、伝わり方、
 /// move、新しいマウントのどれかで、見るものとフラグを分ける (aa_remount、aa_bind_mount、aa_mount_change_type、
 /// aa_move_mount_old、aa_new_mount)

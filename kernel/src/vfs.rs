@@ -142,6 +142,20 @@ pub trait Inode {
     fn resident(&self, _foff: usize) -> Option<bool> {
         None
     }
+    /// ファイルハンドル (name_to_handle_at。Linux の export_operations の encode_fh): (種類, 中身)。parent は
+    /// AT_HANDLE_CONNECTABLE のディレクトリでないもの (親も入れる)。作れないファイルシステムは None
+    fn encode_fh(&self, _parent: Option<&InodeRef>) -> Option<(i32, Vec<u8>)> {
+        None
+    }
+    /// ハンドルを解けるか (fh_to_dentry) と、親つきのものも解けるか (fh_to_parent: AT_HANDLE_CONNECTABLE)
+    fn can_decode_fh(&self) -> (bool, bool) {
+        (false, false)
+    }
+    /// ファイルシステムの根 (me は self) から、ハンドル (種類, 中身) の inode と、わかれば根からのパス
+    /// (open_by_handle_at)。なければ ESTALE
+    fn decode_fh(&self, _me: &InodeRef, _ty: i32, _fh: &[u8]) -> Result<(InodeRef, Option<String>), i64> {
+        Err(-116)
+    }
     /// 長さ 0 の write も write_at に渡す (Linux の proc のファイルは 0 バイトでも書き手が呼ばれ、数として読めなければ
     /// EINVAL。ふつうのファイルは generic_write_checks で何もせず 0)
     fn writes_empty(&self) -> bool {
@@ -811,6 +825,17 @@ pub fn pivot_root(root: &str, new: &str, old: &str, old_id: (usize, u64)) -> Res
     names_changed();
     crate::file::shelf_flush_all();
     Ok(())
+}
+
+/// path (先頭 / なし、たどったあと) をふくむマウントの、マウント先のパスと根 (open_by_handle_at が、そのファイル
+/// システムでハンドルを解く)
+pub fn mount_root_of(path: &str) -> (String, InodeRef) {
+    let ns = current_mnt();
+    let l = ns.list.borrow();
+    match containing(&l, path, l.len()) {
+        Some(i) => (l[i].target.clone(), l[i].root.clone()),
+        None => (String::new(), root()),
+    }
 }
 
 /// path (先頭 / なし、たどったあと) をふくむマウントの番号と、path がそのマウントの根か (statx の stx_mnt_id と

@@ -5880,6 +5880,48 @@ impl Inode for ExtInode {
     }
 
     /// foff のブロックがブロックのキャッシュにあるか (mincore。読みこまない)。穴は false
+    /// FILEID_INO32_GEN (1: inode の番号と generation の 8 バイト)。親つきは FILEID_INO32_GEN_PARENT (2: 親のものも 16
+    /// バイト)。Linux の export_encode_fh
+    fn encode_fh(&self, parent: Option<&InodeRef>) -> Option<(i32, Vec<u8>)> {
+        let _e = fs_lock();
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&self.ino.to_le_bytes());
+        v.extend_from_slice(&self.raw().ok()?.gen_no().to_le_bytes());
+        let Some(p) = parent else { return Some((1, v)) };
+        let pino = self.other(p).ok()?;
+        v.extend_from_slice(&pino.to_le_bytes());
+        v.extend_from_slice(&self.fs.read_inode(pino).ok()?.gen_no().to_le_bytes());
+        Some((2, v))
+    }
+
+    fn can_decode_fh(&self) -> (bool, bool) {
+        (true, true)
+    }
+
+    /// Linux の ext4_fh_to_dentry と ext4_nfs_get_inode (EXT4_IGET_HANDLE): 種類は 1 か 2、予約された番号 (根の 2 は
+    /// よい) と数をこえるもの、使っていない・消したもの (リンクが 0)、generation がちがうものは ESTALE
+    fn decode_fh(&self, _me: &InodeRef, ty: i32, fh: &[u8]) -> Result<(InodeRef, Option<String>), i64> {
+        const ESTALE: i64 = 116;
+        if !matches!(ty, 1 | 2) || fh.len() < 8 {
+            return Err(-ESTALE);
+        }
+        let ino = u32::from_le_bytes(fh[0..4].try_into().unwrap());
+        let generation = u32::from_le_bytes(fh[4..8].try_into().unwrap());
+        let _e = fs_lock();
+        let (first, count) = {
+            let sb = self.fs.sb.borrow();
+            (u32_at(&sb, 84).max(11), u32_at(&sb, 0))
+        };
+        if ino == 0 || (ino < first && ino != 2) || ino > count {
+            return Err(-ESTALE);
+        }
+        let r = self.fs.read_inode(ino).map_err(|_| -ESTALE)?;
+        if r.mode() == 0 || r.links() == 0 || (generation != 0 && r.gen_no() != generation) {
+            return Err(-ESTALE);
+        }
+        Ok((self.at(ino), None))
+    }
+
     fn resident(&self, foff: usize) -> Option<bool> {
         let _e = fs_lock();
         if self.fs.bsize != PGSIZE {
