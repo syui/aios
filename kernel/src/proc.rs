@@ -924,6 +924,53 @@ pub fn each_files_in_mnt(mnt: u64, mut f: impl FnMut(&mut Files)) {
     }
 }
 
+/// マウントの namespace mnt のプロセスが使っているパス (先頭 / なし) を f に。Linux でマウントの数を増やしている
+/// もの: 開いたファイル (O_PATH も)、cwd と root、写したファイル (mmap と、動かしているプログラムのセグメント)。
+/// ファイルには inode の id もつける (同じところに重ねたマウントのどれのものか)。umount の EBUSY (vfs::umount) が数える。
+/// /dev/null などの装置、名前のあるパイプ、bind したソケットはパスを持たないので数えない
+pub fn each_path_in_mnt(mnt: u64, mut f: impl FnMut(&str, Option<(usize, u64)>)) {
+    let mut tables: Vec<usize> = Vec::new();
+    let mut pts: Vec<*const crate::vm::PageTable> = Vec::new();
+    for p in live() {
+        if p.state == State::Zombie || p.cred.ns.mnt_id() != mnt {
+            continue;
+        }
+        if let Some(files) = &p.files
+            && !tables.contains(&files.id())
+        {
+            tables.push(files.id());
+            let t = files.get();
+            // 大きなロックなしの close (file::fast_close_shared) が表を変えている途中でないように
+            let _w = t.gate.write();
+            f(&t.cwd, None);
+            f(&t.root, None);
+            for fd in t.fds.iter().flatten() {
+                if let Ok(of) = fd.file.try_borrow()
+                    && let crate::file::Kind::Inode(ino, path) = &of.kind
+                {
+                    f(path, Some(ino.id()));
+                }
+            }
+        }
+        if p.mm.is_some() {
+            let pt = &p.mm().pt as *const crate::vm::PageTable;
+            if pts.contains(&pt) {
+                continue;
+            }
+            pts.push(pt);
+            // SAFETY: shm.rs の nattch と同じ。大きなロックの中で、生きているプロセスのアドレス空間を読むだけ。ロックなしの
+            // mmap / munmap が領域の木を変えている途中でないように hold で止める
+            let t = unsafe { &*pt };
+            let _h = t.hold();
+            for (_, v) in t.vmas_iter() {
+                if let (crate::vm::Backing::File { ino, .. }, Some(n)) = (&v.back, &v.name) {
+                    f(n, Some(ino.id()));
+                }
+            }
+        }
+    }
+}
+
 pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
     for p in live() {
         if p.state != State::Unused && p.state != State::Zombie && !p.thread {

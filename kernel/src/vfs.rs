@@ -768,16 +768,67 @@ pub fn mount_flags(path: &str) -> u32 {
 
 /// path にかぶせてあるもの (いちばん上) を外す。detach (MNT_DETACH) なら、その下にあるマウントもいっしょに (Linux の
 /// umount_tree)
-pub fn umount(path: &str, detach: bool) -> Result<(), i64> {
-    let top = resolve("", path, true)?;
+pub const MNT_FORCE: u64 = 1;
+pub const MNT_DETACH: u64 = 2;
+pub const MNT_EXPIRE: u64 = 4;
+
+/// MNT_EXPIRE の印をつけたマウントの番号 (Linux の mnt_expiry_mark)
+static EXPIRING: crate::spinlock::SpinLock<Vec<u32>> = crate::spinlock::SpinLock::new(Vec::new());
+
+/// path (先頭 / なし、たどったあと) を使っているもの (開いたファイル、写したファイル、cwd、root) の持ち主のマウント:
+/// path をふくむいちばん深いマウント。同じところに重ねたものは、そのファイルのファイルシステム (fs) のもののうち上の
+/// もの (下のマウントで開いたファイルは、上にかぶせたマウントを止めない)
+fn owner(l: &[Mount], path: &str, fs: Option<usize>) -> Option<usize> {
+    let top = containing(l, path, l.len())?;
+    let same_fs = fs.and_then(|fs| (0..=top).rev().find(|&i| l[i].target == l[top].target && l[i].root.id().0 == fs));
+    Some(same_fs.unwrap_or(top))
+}
+
+/// マウント i を使っているか (Linux の propagate_mount_busy の数): 下のマウントがある (あとからマウント先の中に
+/// かぶせたもの。同じところに重ねたものも) か、この namespace のプロセスがその中のものを使っている (proc::each_path_in_mnt)
+fn mount_busy(ns: &MountNs, l: &[Mount], i: usize) -> bool {
+    if l[i + 1..].iter().any(|m| under(&m.target, &l[i].target)) {
+        return true;
+    }
+    let mut used = false;
+    crate::proc::each_path_in_mnt(ns.id, |p, ino| {
+        // はなれたマウント ("\0mnt:N") のものは、どのマウント先の下でもない
+        used |= !used && !p.starts_with('\0') && owner(l, p, ino.map(|id| id.0)) == Some(i);
+    });
+    used
+}
+
+/// umount2 (Linux の do_umount): path (たどったあと) がマウントの根でなければ EINVAL (ルートも)。MNT_EXPIRE は
+/// DETACH か FORCE といっしょ、または root (chroot の根) のマウントなら EINVAL、使っていれば EBUSY、印がなければ印を
+/// つけて EAGAIN、あれば外す。MNT_DETACH は使っていても下のマウントごと外す。ほかは使っていれば EBUSY (mount_busy)。
+/// MNT_FORCE はファイルシステムに知らせるもの (Linux の umount_begin) がないので、ふつうと同じ。
+/// ないもの: Linux はマウントを通ってたどるたび (mntput) に MNT_EXPIRE の印を消すが、aios は消さない (2 回目はいつも外す)
+pub fn umount(path: &str, flags: u64) -> Result<(), i64> {
+    const EBUSY: i64 = 16;
+    const EAGAIN: i64 = 11;
+    let detach = flags & MNT_DETACH != 0;
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
-    let i = l.iter().rposition(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
-    // その上にまだかぶせてあるものがあれば外せない
-    if !detach && l[i + 1..].iter().any(|m| m.at == top.id()) {
-        return Err(-16); // EBUSY
+    let i = containing(&l, path, l.len()).filter(|&i| l[i].target == path).ok_or_else(|| crate::why::inval())?;
+    if flags & MNT_EXPIRE != 0 {
+        let root = crate::proc::current().files().root.clone();
+        if flags & (MNT_FORCE | MNT_DETACH) != 0 || containing(&l, &root, l.len()) == Some(i) {
+            return Err(crate::why::inval());
+        }
+        if mount_busy(&ns, &l, i) {
+            return Err(-EBUSY);
+        }
+        let mut marks = EXPIRING.lock();
+        if !marks.contains(&l[i].id) {
+            marks.push(l[i].id);
+            return Err(-EAGAIN);
+        }
+    }
+    if !detach && mount_busy(&ns, &l, i) {
+        return Err(-EBUSY);
     }
     let gone = l.remove(i);
+    EXPIRING.lock().retain(|&m| m != gone.id);
     let mut was_ro = gone.ro;
     if detach {
         let t = gone.target.clone();

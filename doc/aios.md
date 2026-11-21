@@ -776,7 +776,18 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   nodiratime、relatime、nosymfollow) は mountinfo に Linux の順で出し、mount(2) の MS_NOSUID ほかもそこへ。まもるのは
   noexec (exec は EACCES、実行できるように写すと EPERM)、nodev (デバイスを開くと EACCES)、nosuid (exec の setuid と
   setgid を見ない)。ないもの: 伝わり方 (受けるだけ)、idmap のマウント、MOVE_MOUNT_BENEATH、FSMOUNT_NAMESPACE、
-  nosymfollow をまもること、使っているマウントの umount の EBUSY (Linux は開いている口や cwd があれば EBUSY)
+  nosymfollow をまもること、fsmount の口が開いているあいだの umount の EBUSY (aios の口のパスは "\0mnt:N" のまま)
+- 使っているマウントの umount (vfs::umount、test/umountbusy.c、root で Linux と 15 行同じ): Linux の do_umount と
+  propagate_mount_busy のように、下のマウントがある (重ねたものも) か、その namespace のプロセスが中のものを使っていれば
+  EBUSY。使っているものは proc::each_path_in_mnt: 開いたファイル (O_PATH も、マウントの根のディレクトリも。ほかの
+  プロセスに受けついだものも)、cwd と root、写したファイル (fd を閉じた mmap、動かしているプログラム)。持ち主のマウントは
+  パスをふくむいちばん深いもの、同じところに重ねたものはそのファイルのファイルシステムのもの (下のマウントで開いた
+  ファイルは上のマウントを止めない)。bind はマウントごと、ほかのマウントの namespace の cwd は数えない。MNT_DETACH は
+  使っていても外し (開いた fd はそのまま読める)、MNT_FORCE はふつうと同じ (tmpfs と ext4 は umount_begin がない)。
+  MNT_EXPIRE は 1 回目に印をつけて EAGAIN、2 回目に外す (使っていれば EBUSY、DETACH か FORCE といっしょ、chroot の根
+  なら EINVAL)。前は、外すマウントを根の inode でさがしていたので、bind した (根が同じ) あとのほうを外していた。いまは
+  パスのマウント。ないもの: たどるたびに MNT_EXPIRE の印を消すこと (Linux の mntput)、装置 (/dev/null など)、名前の
+  あるパイプ、bind したソケットで使っているもの (パスを持たない)
 - vmsplice (splice.rs、extra。test/vmsplice.c、Linux と 23 行同じ): Linux の fs/splice.c と同じ順で flags (SPLICE_F_ALL
   のほかは EINVAL)、fd (開いていない・O_PATH・読めも書けもしない口は EBADF)、iovec (1024 まで、長さが負は EINVAL、
   ユーザーの場所の外は EFAULT) を見て、長さの和が 0 なら 0 (パイプでなくても)、パイプでなければ EBADF。書ける口なら

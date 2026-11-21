@@ -2941,7 +2941,7 @@ pub fn umount2(targetp: usize, flags: u64) -> R {
         }
         crate::security::sb_umount(&crate::security::path_name(&full, true))?;
     }
-    vfs::umount(&full, flags & MNT_DETACH != 0)?;
+    vfs::umount(&full, flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE))?;
     Ok(0)
 }
 

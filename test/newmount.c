@@ -191,7 +191,7 @@ static int body(void) {
   if (dn2 >= 0)
     close(dn2);
   unlink("/tmp/nmprog"), unlink("/tmp/nmnull");
-  // fsmount の口が開いているあいだは Linux の umount は EBUSY (aios はまだ見ない) なので、閉じてから
+  // fsmount の口が開いているあいだは Linux の umount は EBUSY (aios の口のパスは "\0mnt:N" のままで数えない) なので、閉じてから
   close(m2), close(fs2);
   printf("umount nx %ld\n", e(umount2("/tmp/nx", 0)));
   printf("umount (nm2 %ld, nm %ld)\n", e(umount2("/tmp/nm2", 0)), e(umount2("/tmp/nm", 0)));
