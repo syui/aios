@@ -59,7 +59,7 @@ x-edge-app: &edge-app
 services:
   database:
     <<: [*no-ipv6, *hardening]
-    image: ghcr.io/syui/aios-postgres:18.7@sha256:02ea64cbb907d755270074496bc4c28a2a403b9c0cc29fb15de70e47471e96a4
+    image: ghcr.io/syui/aios-postgres:19.0@sha256:5df984410b9261397f6ae68f6d36c2df141e6e3a58faf6ef86dcb107a53e2b4e
     restart: always
     cap_drop: [ALL]
     env_file:
