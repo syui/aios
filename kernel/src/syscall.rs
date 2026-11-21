@@ -71,6 +71,8 @@ nrs! {
     FUTEX_WAKE2 = 454,
     FUTEX_WAIT2 = 455,
     FUTEX_REQUEUE2 = 456,
+    STATMOUNT = 457,
+    LISTMOUNT = 458,
     GETCWD = 17,
     FLOCK = 32,
     MKNODAT = 33,

@@ -480,6 +480,22 @@ fn mnt_opts(ro: bool, attrs: u32) -> String {
 /// 番号 (InodeRef::id().0)。そのファイルシステムのどのマウントからも書けない
 static SB_RO: Bkl<alloc::collections::BTreeSet<usize>> = Bkl::new(alloc::collections::BTreeSet::new());
 
+/// ファイルシステムごとのオプションの文字 (Linux の s_op->show_options: それぞれ "," から。tmpfs::Options が置く)。
+/// mountinfo の終わりの欄、/proc/mounts、statmount の MNT_OPTS と OPT_ARRAY
+static FS_OPTS: Bkl<alloc::collections::BTreeMap<usize, String>> = Bkl::new(alloc::collections::BTreeMap::new());
+
+pub fn set_fs_opts(fs: usize, s: String) {
+    if s.is_empty() {
+        FS_OPTS.get().remove(&fs);
+    } else {
+        FS_OPTS.get().insert(fs, s);
+    }
+}
+
+pub fn fs_opts(fs: usize) -> String {
+    FS_OPTS.get().get(&fs).cloned().unwrap_or_default()
+}
+
 fn sb_ro(fs: usize) -> bool {
     SB_RO.get().contains(&fs)
 }
@@ -531,14 +547,77 @@ fn current_mnt() -> Rc<MountNs> {
     crate::proc::current_mnt().unwrap_or_else(init_mnt)
 }
 
+/// いまのプロセスのマウントの namespace (statmount と listmount)
+pub fn this_mnt_ns() -> Rc<MountNs> {
+    current_mnt()
+}
+
+/// はじめのマウントの namespace (nsfs の Which::Mnt(None))
+pub fn init_mnt_ns() -> Rc<MountNs> {
+    init_mnt()
+}
+
+/// 番号 (MountNs の id) のマウントの namespace (statmount と listmount の mnt_ns_id)。生きているものだけ
+pub fn mnt_ns_by_id(id: u64) -> Option<Rc<MountNs>> {
+    let init = init_mnt();
+    if init.id == id {
+        return Some(init);
+    }
+    ALL_MNT.get().iter().filter_map(|w| w.upgrade()).find(|n| n.id == id)
+}
+
+/// statmount と listmount が見るマウント (Linux の struct mount の見えるところ)
+pub struct MountView {
+    /// マウントの番号 (mountinfo の 1 つめ。unique_mnt_id で 64 ビットの番号)
+    pub id: u32,
+    /// 親の番号 (mountinfo の 2 つめ。根は自分)
+    pub parent: u32,
+    pub root: InodeRef,
+    /// root がそのファイルシステムのどこか ("/" か bind の "/d")
+    pub root_path: String,
+    /// マウント先 (先頭 / なし。根は "")
+    pub target: String,
+    pub source: String,
+    pub fstype: String,
+    /// マウントの読むだけ (MNT_READONLY)
+    pub ro: bool,
+    pub attrs: u32,
+}
+
+/// ns のマウントを、根のマウントから表の順に (mountinfo と同じもの)
+pub fn mount_views(ns: &Rc<MountNs>) -> Vec<MountView> {
+    let l = ns.list.borrow();
+    let rid = ns.root_id.get();
+    let mut v = Vec::with_capacity(l.len() + 1);
+    let root = match &*ns.top.borrow() {
+        Some(t) => MountView { id: rid, parent: rid, root: t.root.clone(), root_path: t.root_path.clone(), target: String::new(), source: t.source.clone(), fstype: t.fstype.clone(), ro: t.ro, attrs: t.attrs },
+        None => {
+            let (source, fstype) = ROOT_INFO.get().clone();
+            MountView { id: rid, parent: rid, root: ROOT.get().clone().expect("no root filesystem"), root_path: "/".into(), target: String::new(), source, fstype, ro: false, attrs: 0 }
+        }
+    };
+    v.push(root);
+    for (i, m) in l.iter().enumerate() {
+        let parent = containing(&l, &m.target, i).map_or(rid, |j| l[j].id);
+        v.push(MountView { id: m.id, parent, root: m.root.clone(), root_path: m.root_path.clone(), target: m.target.clone(), source: m.source.clone(), fstype: m.fstype.clone(), ro: m.ro, attrs: m.attrs });
+    }
+    v
+}
+
+/// ファイルシステム fs が読むだけか (Linux の SB_RDONLY: statmount の sb_flags)
+pub fn sb_readonly(fs: usize) -> bool {
+    sb_ro(fs)
+}
+
 /// いまの表を写した新しい namespace (unshare / clone の CLONE_NEWNS)。写したマウントは新しい番号 (Linux の copy_tree)
 pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
     let from = current_mnt();
+    // 根のマウントから番号をつける (Linux の copy_tree: 根がいちばん小さい。listmount は番号の順)
+    let root_id = new_mnt_id();
     let mut list = from.list.borrow().clone();
     for m in list.iter_mut() {
         m.id = new_mnt_id();
     }
-    let root_id = new_mnt_id();
     let top = from.top.borrow().clone().map(|mut m| {
         m.id = root_id;
         m
@@ -717,11 +796,18 @@ pub fn mounted(path: &str) -> bool {
 }
 
 /// path にかぶせてあるもの (いちばん上) を、読むだけに / 書けるように (mount -o remount,ro)
-pub fn remount(path: &str, ro: bool) -> Result<(), i64> {
-    let top = resolve("", path, true)?;
+pub fn remount(path: &str, ro: bool, sb: bool) -> Result<(), i64> {
     let ns = current_mnt();
     let mut l = ns.list.borrow_mut();
-    let m = l.iter_mut().rev().find(|m| m.root.id() == top.id()).ok_or_else(|| crate::why::inval())?;
+    // path のマウント (前は根の inode でさがしていたので、bind した (根が同じ) あとのほうを変えていた)
+    let i = containing(&l, path, l.len()).filter(|&i| l[i].target == path).ok_or_else(|| crate::why::inval())?;
+    if sb {
+        let fs = l[i].root.id().0;
+        drop(l);
+        set_sb_ro(fs, ro);
+        l = ns.list.borrow_mut();
+    }
+    let m = &mut l[i];
     if ro {
         ro_mark(&ns);
     }
@@ -1262,7 +1348,7 @@ pub fn mountinfo_text_of(ns: Option<Rc<MountNs>>, root: &str) -> String {
     };
     let line = |id: u32, parent: u32, dev: (u32, u32), root_path: &str, point: &str, ro: bool, attrs: u32, fs: usize, fstype: &str, source: &str| {
         let sb = if sb_ro(fs) { "ro" } else { "rw" };
-        alloc::format!("{} {} {}:{} {} {} {} - {} {} {}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, mnt_opts(ro, attrs), mangle(fstype, true), mangle(source, true), sb)
+        alloc::format!("{} {} {}:{} {} {} {} - {} {} {}{}\n", id, parent, dev.0, dev.1, mangle(root_path, false), point, mnt_opts(ro, attrs), mangle(fstype, true), mangle(source, true), sb, fs_opts(fs))
     };
     let mut s = String::new();
     let rid = ns.root_id.get();
@@ -1292,17 +1378,19 @@ pub fn mounts_text() -> String {
 /// /proc/PID/mounts (ns の表。None ははじめのもの)
 pub fn mounts_text_of(ns: Option<Rc<MountNs>>) -> String {
     let ns = ns.unwrap_or_else(init_mnt);
-    let (src, ty, ro) = match &*ns.top.borrow() {
-        Some(t) => (t.source.clone(), t.fstype.clone(), t.ro),
+    // 印は Linux の show_vfsmnt: マウントの印 (rw か ro、nosuid ...、relatime) とファイルシステムのオプション
+    let opts = |ro: bool, attrs: u32, fs: usize| alloc::format!("{}{}", mnt_opts(ro || sb_ro(fs), attrs), fs_opts(fs));
+    let (src, ty, o) = match &*ns.top.borrow() {
+        Some(t) => (t.source.clone(), t.fstype.clone(), opts(t.ro, t.attrs, t.root.id().0)),
         None => {
             let (s, t) = ROOT_INFO.get().clone();
-            (s, t, false)
+            (s, t, opts(false, 0, ROOT.get().as_ref().map_or(0, |r| r.id().0)))
         }
     };
-    let mut s = alloc::format!("{} / {} {} 0 0\n", mangle(&src, true), mangle(&ty, true), if ro { "ro" } else { "rw" });
+    let mut s = alloc::format!("{} / {} {} 0 0\n", mangle(&src, true), mangle(&ty, true), o);
     for m in ns.list.borrow().iter() {
-        let ro = m.ro || sb_ro(m.root.id().0);
-        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), if ro { "ro" } else { "rw" }));
+        let o = opts(m.ro, m.attrs, m.root.id().0);
+        s.push_str(&alloc::format!("{} /{} {} {} 0 0\n", mangle(&m.source, true), mangle(&m.target, false), mangle(&m.fstype, true), o));
     }
     s
 }

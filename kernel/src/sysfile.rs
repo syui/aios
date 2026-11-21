@@ -2878,10 +2878,11 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
         vfs::move_mount(&sfull, &full)?;
         return Ok(0);
     }
-    // 付けなおし (mount -o remount,ro): いちばん上のマウントを読むだけに / 書けるように
+    // 付けなおし (mount -o remount,ro): いちばん上のマウントを読むだけに / 書けるように。MS_BIND があればマウントだけ
+    // (Linux の do_reconfigure_mnt)、なければファイルシステムも (do_remount: SB_RDONLY も)
     if flags & MS_REMOUNT != 0 {
         let (full, _) = vfs::lookup(&cwd, &target, true)?;
-        vfs::remount(&full, flags & MS_RDONLY != 0)?;
+        vfs::remount(&full, flags & MS_RDONLY != 0, flags & MS_BIND == 0)?;
         return Ok(0);
     }
     let (full, dir) = vfs::lookup(&cwd, &target, true)?;
@@ -2902,14 +2903,12 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
     let (root, source, fstype) = {
         let fstype = user_str(typep)?;
         let root = match fstype.as_str() {
-            // /tmp と同じく、だれでも作れて他人のものは消せない (Linux の tmpfs の既定)。持ち主はマウントした人
-            // (Linux の shmem_init_fs_context: current_fsuid / fsgid。ユーザーの namespace の中では中の自分に見える)
+            // data のオプション (mode、uid、gid、size、nr_inodes ...: 知らないものは EINVAL)。わたされなければ /tmp と同じく、
+            // だれでも作れて他人のものは消せない (Linux の tmpfs の既定 1777)。持ち主はマウントした人 (Linux の
+            // shmem_init_fs_context: current_fsuid / fsgid。ユーザーの namespace の中では中の自分に見える)
             "tmpfs" => {
-                let r: InodeRef = crate::tmpfs::new_root();
-                r.set_mode(0o1777)?;
-                let c = cred::current();
-                r.set_owner(Some(c.fsuid), Some(c.fsgid))?;
-                r
+                let data = if datap != 0 { user_str(datap)? } else { String::new() };
+                crate::tmpfs::parse_data(&data)?.new_root()?
             }
             // 装置のないもの (proc、sysfs、securityfs、efivarfs: vfs::register_filesystem で置いたもの。知らなければ ENODEV)
             t => vfs::mount_nodev(t)?,
@@ -2917,6 +2916,11 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
         (root, source, fstype)
     };
+    // MS_RDONLY の新しい tmpfs は、マウントもファイルシステムも読むだけ (Linux の SB_RDONLY と MNT_READONLY)。proc などの
+    // 分けあうファイルシステムは、マウントだけ
+    if flags & MS_RDONLY != 0 && fstype == "tmpfs" {
+        vfs::set_sb_ro(root.id().0, true);
+    }
     vfs::mount_ro(&full, root, &source, &fstype, flags & MS_RDONLY != 0, ms_attrs(flags))?;
     Ok(0)
 }

@@ -440,6 +440,144 @@ pub fn new_root() -> Rc<TmpInode> {
     TmpInode::new(new_fs_id(), S_IFDIR | 0o755, Node::Dir(BTreeMap::new()))
 }
 
+/// tmpfs のマウントのオプション (Linux の shmem_options と shmem_parse_one): わたされたものだけ。mount(2) の data と
+/// fsconfig の両方から。覚えて、mountinfo と statmount に Linux の shmem_show_options と同じに出す (aios は size と
+/// nr_inodes の上限は見ない: どの tmpfs も RAM の半分まで)
+#[derive(Default, Clone)]
+pub struct Options {
+    /// size / nr_blocks (ページ)
+    pub blocks: Option<u64>,
+    pub inodes: Option<u64>,
+    /// 根の mode (既定 1777)
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub noswap: bool,
+}
+
+/// Linux の memparse: 数 (0x は 16 進、0 から始まれば 8 進) と、k m g t p e (大文字も) の倍。(数, のこり)
+fn memparse(s: &str) -> Option<(u64, &str)> {
+    let (radix, body) = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (16, h)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (8, &s[1..])
+    } else {
+        (10, s)
+    };
+    let end = body.find(|c: char| !c.is_digit(radix)).unwrap_or(body.len());
+    if end == 0 && radix != 8 {
+        return None;
+    }
+    let mut n = if end == 0 { 0 } else { u64::from_str_radix(&body[..end], radix).ok()? };
+    let mut rest = &body[end..];
+    let shift = match rest.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => 10,
+        Some('m') => 20,
+        Some('g') => 30,
+        Some('t') => 40,
+        Some('p') => 50,
+        Some('e') => 60,
+        _ => 0,
+    };
+    if shift != 0 {
+        n = n.checked_shl(shift)?;
+        rest = &rest[1..];
+    }
+    Some((n, rest))
+}
+
+impl Options {
+    /// 1 つの値 (Linux の shmem_parse_one)。tmpfs のものでなければ Ok(false)、値がまちがっていれば Err(())
+    pub fn param(&mut self, key: &str, val: Option<&str>) -> Result<bool, ()> {
+        let v = || val.ok_or(());
+        match key {
+            "size" => {
+                let (n, rest) = memparse(v()?).ok_or(())?;
+                let bytes = match rest {
+                    "" => n,
+                    "%" => n.saturating_mul(crate::memlayout::ram_size() as u64) / 100,
+                    _ => return Err(()),
+                };
+                self.blocks = Some(bytes.div_ceil(PGSIZE as u64));
+            }
+            "nr_blocks" | "nr_inodes" => {
+                let (n, rest) = memparse(v()?).ok_or(())?;
+                if !rest.is_empty() || n > i64::MAX as u64 {
+                    return Err(());
+                }
+                if key == "nr_blocks" { self.blocks = Some(n) } else { self.inodes = Some(n) }
+            }
+            "mode" => self.mode = Some(u32::from_str_radix(v()?, 8).map_err(|_| ())? & 0o7777),
+            "uid" => self.uid = Some(v()?.parse().map_err(|_| ())?),
+            "gid" => self.gid = Some(v()?.parse().map_err(|_| ())?),
+            "noswap" => self.noswap = true,
+            "huge" | "mpol" | "inode32" | "inode64" | "quota" | "usrquota" | "grpquota" | "usrquota_block_hardlimit" | "usrquota_inode_hardlimit" | "grpquota_block_hardlimit"
+            | "grpquota_inode_hardlimit" | "casefold" | "strict_encoding" => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Linux の shmem_show_options の文字 (それぞれ "," から。mountinfo の終わりの欄と /proc/mounts に足し、statmount は
+    /// はじめの "," を落とす)。owner は根の持ち主 (Linux の sbinfo->uid / gid: わたされなければマウントした人)
+    pub fn show(&self, owner: (u32, u32)) -> String {
+        let mut s = String::new();
+        if let Some(b) = self.blocks {
+            s.push_str(&alloc::format!(",size={}k", b * (PGSIZE as u64 / 1024)));
+        }
+        if let Some(n) = self.inodes {
+            s.push_str(&alloc::format!(",nr_inodes={}", n));
+        }
+        let mode = self.mode.unwrap_or(0o1777);
+        if mode != 0o1777 {
+            s.push_str(&alloc::format!(",mode={:03o}", mode));
+        }
+        let (uid, gid) = (self.uid.unwrap_or(owner.0), self.gid.unwrap_or(owner.1));
+        if uid != 0 {
+            s.push_str(&alloc::format!(",uid={}", uid));
+        }
+        if gid != 0 {
+            s.push_str(&alloc::format!(",gid={}", gid));
+        }
+        if self.noswap {
+            s.push_str(",noswap");
+        }
+        s
+    }
+
+    /// 新しい tmpfs の根 (mode と持ち主はオプションか、1777 とマウントした人) を作り、オプションをそのファイル
+    /// システムに覚える
+    pub fn new_root(&self) -> Result<InodeRef, i64> {
+        let r: InodeRef = new_root();
+        r.set_mode(self.mode.unwrap_or(0o1777))?;
+        let c = crate::cred::current();
+        let owner = (self.uid.unwrap_or(c.fsuid), self.gid.unwrap_or(c.fsgid));
+        r.set_owner(Some(owner.0), Some(owner.1))?;
+        set_fs_opts(r.id().0, self.show(owner));
+        Ok(r)
+    }
+}
+
+/// mount(2) の data (Linux の generic_parse_monolithic: "," で分けた key か key=value)。ro / rw などファイルシステムによらない
+/// ものは受けるだけ (mount の flags が決める)。知らないものは EINVAL
+pub fn parse_data(data: &str) -> Result<Options, i64> {
+    let mut o = Options::default();
+    for kv in data.split(',').filter(|s| !s.is_empty()) {
+        let (k, v) = match kv.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (kv, None),
+        };
+        if matches!(k, "ro" | "rw" | "sync" | "async" | "dirsync" | "lazytime" | "nolazytime" | "mand" | "nomand" | "source") {
+            continue;
+        }
+        match o.param(k, v) {
+            Ok(true) => {}
+            _ => return Err(crate::why::inval()),
+        }
+    }
+    Ok(o)
+}
+
 impl Inode for TmpInode {
     fn path_cacheable(&self) -> bool {
         true

@@ -842,6 +842,14 @@ impl crate::vfs::Inode for NsInode {
 
 /// /proc/PID/ns/KIND を開いたもの: (名前 "uts:[N]", nsfs の口)。pid はそのプロセスのもの、pid_for_children はこれから
 /// 作る子のもの
+/// nsfs の口のマウントの namespace (statmount と listmount の mnt_ns_fd)。nsfs でないか、ほかの種類なら None (EINVAL)
+pub fn mnt_ns_of(ino: &crate::vfs::InodeRef) -> Option<Rc<crate::vfs::MountNs>> {
+    match &ino.as_any().downcast_ref::<NsInode>()?.which {
+        Which::Mnt(m) => Some(m.clone().unwrap_or_else(crate::vfs::init_mnt_ns)),
+        _ => None,
+    }
+}
+
 pub fn ns_file(kind: &str, p: &crate::proc::Proc) -> (alloc::string::String, crate::vfs::InodeRef) {
     let n = &p.cred.ns;
     let w = match kind {

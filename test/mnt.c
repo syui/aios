@@ -78,7 +78,7 @@ static int readonly(void) {
   int fd = open(f, O_CREAT | O_WRONLY, 0644); if (fd < 0) return 4; write(fd, "hi", 2); close(fd);
   if (mkdir(sub, 0755)) return 5;
   if (mount("none", dir, 0, MS_REMOUNT | MS_RDONLY, 0)) return 6;
-  if (!has_line("/proc/self/mounts", " tmpfs ro ")) return 7;
+  if (!has_line("/proc/self/mounts", " tmpfs ro,")) return 7;
   if (open(f, O_WRONLY) != -1 || errno != EROFS) return 8;
   if (open(g, O_CREAT | O_WRONLY, 0644) != -1 || errno != EROFS) return 9;
   if (unlink(f) != -1 || errno != EROFS) return 10;

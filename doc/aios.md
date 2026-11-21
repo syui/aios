@@ -783,6 +783,23 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   attr はそのまま開く)。OPEN_TREE_CLONE なら写したはなれたマウントに印をつけ (AT_RECURSIVE なら下のものにも)、move_mount
   で置くと mountinfo にその印 (もとはそのまま)。CLONE でなければ、印は置いてあるマウントそのものに (マウントの根で
   なければ EINVAL)。attr がなければ open_tree と同じ (open_tree はこれを attr なしで呼ぶ)
+- statmount と listmount (Linux 6.8、7.4 の形。newmount.rs、test/statmount.c、root で Linux と 27 行同じ): mnt_id_req を
+  Linux の copy_mnt_id_req の順に読み (大きさ E2BIG / EINVAL / EFAULT、知らないところ E2BIG、番号が 2^31 以下は EINVAL)、
+  namespace は mnt_ns_id (なければ ENOENT)、mnt_ns_fd (nsfs の口。ほかは EINVAL)、いまのもの。statmount は Linux の
+  do_statmount の順に入れる: ファイルシステム (st_dev と同じ装置、magic、SB_RDONLY)、マウント (64 ビットの番号と親、
+  mountinfo の番号、印、伝わり方はいつも MS_PRIVATE)、文字 (種類、根、root から見たマウント先、オプション、その並び、
+  もと。はじめに空の文字、それぞれ NUL で終わり、入らなければ EOVERFLOW、size は決まったところ 512 + 文字)、namespace
+  の番号、STATMOUNT_SUPPORTED_MASK。STATMOUNT_BY_FD は口のマウント (はなれたマウントは ENOENT)。listmount はもとの
+  マウント (LSMT_ROOT は根も) の下にあるものを番号の順に (LISTMOUNT_REVERSE は逆)、param の次から nr こまで。新しい
+  namespace の番号は根のマウントから (Linux の copy_tree)。ないもの: 伝わり方 (peer、master、propagate_from は 0)、
+  セキュリティのオプション、subtype、idmap
+- tmpfs のオプション (tmpfs::Options): mount(2) の data も fsconfig と同じに読み (mode、uid、gid、size、nr_blocks、
+  nr_inodes、noswap ほか。知らないものは EINVAL。前は data を読みとばして、いつも 1777 だった)、根の mode と持ち主に
+  し、Linux の shmem_show_options と同じ文字 (",size=1024k,mode=755") をファイルシステムに覚えて、mountinfo の終わりの
+  欄と /proc/mounts と statmount に出す。/proc/mounts の印も Linux の show_vfsmnt の形 (rw,nosuid,...,relatime と
+  オプション)。aios は size と nr_inodes の上限は見ない (どの tmpfs も RAM の半分まで)。MS_RDONLY の新しい tmpfs は
+  ファイルシステムも読むだけ (SB_RDONLY)、MS_REMOUNT は MS_BIND がなければファイルシステムも (do_remount)。remount も
+  umount と同じく、前は根の inode でさがしていたので bind したあとのほうを変えていた。いまはパスのマウント
 - 使っているマウントの umount (vfs::umount、test/umountbusy.c、root で Linux と 15 行同じ): Linux の do_umount と
   propagate_mount_busy のように、下のマウントがある (重ねたものも) か、その namespace のプロセスが中のものを使っていれば
   EBUSY。使っているものは proc::each_path_in_mnt: 開いたファイル (O_PATH も、マウントの根のディレクトリも。ほかの
@@ -801,7 +818,7 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   あとの write もそこに足さない)、あいた箱の分だけ入れ、とちゅうでさわれなければそこまで、読み手がいなければ EPIPE と
   SIGPIPE。読める口ならパイプから手もとへ (入っている分を入れ物に順に)。待つのは SPLICE_F_NONBLOCK がないときだけで、
   fd の O_NONBLOCK は見ない (Linux と同じ)。入れるのはそのときの写し (aios がえらんだちがい vmsplice-snapshot)
-- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、statmount、listmount、file_getattr・file_setattr、listns など
+- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
