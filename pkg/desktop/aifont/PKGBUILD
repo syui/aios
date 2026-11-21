@@ -3,11 +3,9 @@
 #   /usr/share/fonts/aifont/aifont.ttf (デスクトップのプログラムが使う)
 #   /usr/share/icons/ai/ (ai.png ai.svg など。前は ai-icons パッケージ)
 pkgname=aifont
-# 自作のパッケージは版を 0.0.1 にそろえる (もとの UDEV Gothic は v2.1.0)。
-# 前の 2.304 より新しくするため epoch=1 (aipkg -Syu で上がる)
+# 自作のパッケージは版を 0.0.1 にそろえる (もとの UDEV Gothic は v2.1.0)
 pkgver=0.0.1
-pkgrel=3
-epoch=1
+pkgrel=4
 pkgdesc='aifont: UDEV Gothic 35NF (JetBrains Mono, BIZ UDGothic, Nerd Fonts) with custom glyphs, and the ai icons'
 arch=('any')
 url='https://git.syui.ai/ai/font'

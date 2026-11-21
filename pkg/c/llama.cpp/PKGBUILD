@@ -10,15 +10,17 @@
 #   取ってこない (LLAMA_USE_PREBUILT_UI=OFF: 作るときにネットから取るので)。
 #   モデルの置き場所は /var/lib/ai/models、使うものは /var/lib/ai/model.gguf へのリンクにする。それがあれば
 #   etc/systemd/system/llama-server.service が起動のたびに 127.0.0.1:8080 で動かす (doc/aios.md の「ローカルの AI」)
+#   版は upstream の出した版 (タグ vX.Y.Z、2026-08 から。1 から 2 週ごと) を追う。毎日のビルド (タグ bNNNNN、
+#   llama --version は 1.0.0-dev) は追わない
 pkgname=llama.cpp
-pkgver=12602
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='LLM inference in C/C++: the llama binary (server, cli, bench, quantize), static, CPU variants for aios'
 arch=('aarch64')
 url='https://github.com/ggml-org/llama.cpp'
 license=('MIT')
 makedepends=('cmake' 'ninja')
-source=("llama.cpp::git+https://github.com/ggml-org/llama.cpp.git#tag=b$pkgver"
+source=("llama.cpp::git+https://github.com/ggml-org/llama.cpp.git#tag=v$pkgver"
         llama)
 sha256sums=('SKIP'
             'SKIP')
@@ -30,16 +32,20 @@ build() {
   . "$startdir/../zig.sh"
   zig_env
   cmake_cross
-  local v name cpu
+  local v name cpu bnum
+  # 版の番号 (llama --version の build) は git の数から作るが、makepkg のチェックアウトには履歴がない。
+  # 出した版のコミットには毎日のビルドのタグ (bNNNNN) もついているので、それを使う
+  bnum=$(git ls-remote --tags https://github.com/ggml-org/llama.cpp.git |
+    sed -n "s#^$(git -C llama.cpp rev-parse HEAD)\trefs/tags/b\([0-9]*\)\$#\1#p" | head -1)
   for v in $_variants; do
     name=${v%%:*} cpu=${v#*:}
     rm -rf "build-$name"
     # GGML_NATIVE=OFF で ggml は -march を足さず、-mcpu の印 (__ARM_FEATURE_DOTPROD など) で道を選ぶ。
-    # 版の番号 (llama version の build) は git の数から作るが、makepkg のチェックアウトには履歴がないので渡す
+    # LLAMA_BUILD_IS_DEV=OFF: 出した版として作る (upstream の release のビルドと同じ。version は -dev なし)
     cmake -S llama.cpp -B "build-$name" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$srcdir/toolchain.cmake" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
       -DCMAKE_C_FLAGS="-mcpu=$cpu" -DCMAKE_CXX_FLAGS="-mcpu=$cpu" -DCMAKE_EXE_LINKER_FLAGS="-static -s" \
-      -DLLAMA_BUILD_NUMBER="$pkgver" \
+      -DLLAMA_BUILD_NUMBER="${bnum:-0}" -DLLAMA_BUILD_IS_DEV=OFF \
       -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
       -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=ON
