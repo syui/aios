@@ -231,21 +231,19 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         }
         crate::security::namespace_init(c, flags & !CLONE_NEWUSER)?;
     }
-    // 持ち主は、いっしょに作ったユーザーの namespace (あれば)
+    // 持ち主は、いっしょに作ったユーザーの namespace (あれば)。作る順 (番号の順: listns の並び) は Linux の
+    // create_new_namespaces と同じ mnt、uts、ipc、pid、net
     let owner = c.ns.user_id();
+    if flags & CLONE_NEWNS != 0 {
+        c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));
+    }
     if flags & CLONE_NEWUTS != 0 {
         let name = current_name(c);
         let domain = current_domain(c);
         c.ns.uts = Some(Rc::new(Uts { id: next_id(), owner, name: RefCell::new(name), domain: RefCell::new(domain), uname: core::cell::Cell::new(current_uname(c)) }));
     }
-    if flags & CLONE_NEWNET != 0 {
-        c.ns.net = Some(Rc::new(Net { id: next_id(), owner }));
-    }
     if flags & CLONE_NEWIPC != 0 {
         c.ns.ipc = Some(Rc::new(Ipc { id: next_id(), owner }));
-    }
-    if flags & CLONE_NEWNS != 0 {
-        c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));
     }
     if flags & CLONE_NEWPID != 0 {
         // 入れ子はできない
@@ -253,6 +251,9 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
             return Err(crate::why::inval());
         }
         c.ns.pid = Some(Rc::new(Pid { id: next_id(), owner, next: core::cell::Cell::new(0) }));
+    }
+    if flags & CLONE_NEWNET != 0 {
+        c.ns.net = Some(Rc::new(Net { id: next_id(), owner }));
     }
     Ok(())
 }
@@ -979,4 +980,207 @@ pub fn setns(fd: i64, flags: u64) -> Result<i64, i64> {
         files.set_cwd(alloc::string::String::new());
     }
     Ok(0)
+}
+
+// ---- listns と nsfs の ioctl (Linux 6.19、7.4 の形: kernel/nstree.c と fs/nsfs.c) ----
+
+/// Linux の ns_id (listns、nsfs の NS_GET_ID、statmount の mnt_ns_id): はじめのものは Linux と同じ 1〜8 (ipc 1、uts 2、
+/// user 3、pid 4、net 7、mnt 8。cgroup 5 と time 6 は aios にない)、新しいものは作った順 (aios の番号の順。種類によらず
+/// 1 つの数) に 10 から (Linux の ns_tree_gen_id)
+pub fn ns_id(inum: u64) -> u64 {
+    match inum {
+        INIT_IPC => 1,
+        INIT_UTS => 2,
+        INIT_USER => 3,
+        INIT_PID => 4,
+        INIT_NET => 7,
+        INIT_MNT => 8,
+        n => n.saturating_sub(4026532000) + 9,
+    }
+}
+
+/// 使われている (Linux の active な) namespace: 番号 (inum) → (種類 CLONE_NEW*, 持ち主のユーザーの namespace の番号。
+/// はじめのユーザーの namespace は 0)。はじめのものはいつも。プロセスが入っているもの (cred の ns、pid は入っているものと
+/// 子のためのもの)、nsfs の口 (開いた fd) のもの、それらの持ち主のユーザーの namespace (Linux の __ns_ref_active_get が
+/// 持ち主をたどる。aios のユーザーの namespace は入れ子にならないので、持ち主はいつもはじめのもの)
+fn active() -> alloc::collections::BTreeMap<u64, (u64, u64)> {
+    let mut m = alloc::collections::BTreeMap::new();
+    for (id, kind) in [(INIT_IPC, CLONE_NEWIPC), (INIT_UTS, CLONE_NEWUTS), (INIT_PID, CLONE_NEWPID), (INIT_NET, CLONE_NEWNET), (INIT_MNT, CLONE_NEWNS)] {
+        m.insert(id, (kind, INIT_USER));
+    }
+    m.insert(INIT_USER, (CLONE_NEWUSER, 0));
+    let add = |w: &Which, m: &mut alloc::collections::BTreeMap<u64, (u64, u64)>| {
+        let owner = match w {
+            Which::User(u) => u.as_ref().map_or(0, |_| INIT_USER),
+            _ => w.owner(),
+        };
+        m.insert(w.id(), (w.flag(), owner));
+    };
+    for p in crate::proc::live() {
+        if p.state == crate::proc::State::Zombie {
+            continue;
+        }
+        let n = &p.cred.ns;
+        for w in [
+            Which::Uts(n.uts.clone()),
+            Which::Ipc(n.ipc.clone()),
+            Which::Net(n.net.clone()),
+            Which::Mnt(n.mnt.clone()),
+            Which::Pid(n.pid.clone()),
+            Which::Pid(p.pid_ns.clone()),
+            Which::User(n.user.clone()),
+        ] {
+            add(&w, &mut m);
+        }
+    }
+    let mut open = Vec::new();
+    crate::proc::each_open_file(|f| {
+        if let crate::file::Kind::Inode(ino, _) = &f.kind
+            && let Some(n) = ino.as_any().downcast_ref::<NsInode>()
+        {
+            open.push(n.which.clone());
+        }
+    });
+    for w in open {
+        add(&w, &mut m);
+    }
+    // 持ち主のユーザーの namespace も (子の namespace が使われていれば)
+    let owners: Vec<u64> = m.values().map(|&(_, o)| o).filter(|&o| o != 0 && o != INIT_USER).collect();
+    for o in owners {
+        if USERS.get().get(&o).and_then(|w| w.upgrade()).is_some() {
+            m.insert(o, (CLONE_NEWUSER, INIT_USER));
+        }
+    }
+    m
+}
+
+/// いまのプロセスの、その種類の namespace の番号 (Linux の is_current_namespace: pid は入っているもの)
+fn current_of(kind: u64) -> u64 {
+    let p = crate::proc::current();
+    let n = &p.cred.ns;
+    match kind {
+        CLONE_NEWUTS => Which::Uts(n.uts.clone()).id(),
+        CLONE_NEWIPC => Which::Ipc(n.ipc.clone()).id(),
+        CLONE_NEWNET => Which::Net(n.net.clone()).id(),
+        CLONE_NEWNS => Which::Mnt(n.mnt.clone()).id(),
+        CLONE_NEWPID => Which::Pid(p.pid_ns.clone()).id(),
+        _ => n.user_id(),
+    }
+}
+
+/// みな見てよいか (Linux の may_see_all_namespaces: はじめの pid の namespace の中で、はじめのユーザーの namespace の
+/// CAP_SYS_ADMIN)
+fn may_see_all() -> bool {
+    let p = crate::proc::current();
+    p.pid_ns.is_none() && p.cred.ns.user.is_none() && p.cred.capable(crate::cred::CAP_SYS_ADMIN)
+}
+
+/// listns(req, ns_ids, nr_ns_ids, flags) (Linux の順: flags EINVAL、多すぎる EOVERFLOW、入れ物 EFAULT、ns_id_req (大きさ
+/// EFAULT / E2BIG / EINVAL、知らないところ E2BIG、spare EINVAL、知らない種類 EOPNOTSUPP))。使われている namespace を番号の
+/// 順に、ns_type でしぼって (1 つの種類なら、その種類の中で)、ns_id の次から (なければ ENOENT)、nr こまで。見えるのは
+/// 自分のいまのものか、みな見てよい (may_see_all) とき。user_ns_id があれば、そのユーザーの namespace (LISTNS_CURRENT_USER
+/// は自分の。なければ EINVAL) が持ち主のものだけ (みな見てよければみな)
+pub fn listns(reqp: usize, idsp: usize, nr: usize, flags: u64) -> Result<i64, i64> {
+    const EFAULT: i64 = 14;
+    const E2BIG: i64 = 7;
+    const ENOENT: i64 = 2;
+    const EOVERFLOW: i64 = 75;
+    const EOPNOTSUPP: i64 = 95;
+    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+    const CLONE_NEWTIME: u64 = 0x80;
+    const NS_ALL: u64 = CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME;
+    const CURRENT_USER: u64 = u64::MAX;
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    if nr > 1_000_000 {
+        return Err(-EOVERFLOW);
+    }
+    if idsp.checked_add(nr * 8).is_none_or(|e| e > 1 << 48) {
+        return Err(-EFAULT);
+    }
+    let pt = crate::proc::current().pt();
+    let mut sz = [0u8; 4];
+    pt.copy_in(&mut sz, reqp).ok_or(-EFAULT)?;
+    let size = u32::from_le_bytes(sz) as usize;
+    if size > 4096 {
+        return Err(-E2BIG);
+    }
+    if size < 32 {
+        return Err(crate::why::inval());
+    }
+    let mut b = alloc::vec![0u8; size];
+    crate::proc::current().pt().copy_in(&mut b, reqp).ok_or(-EFAULT)?;
+    if b[32..].iter().any(|&x| x != 0) {
+        return Err(-E2BIG);
+    }
+    let w64 = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let w32 = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as u64;
+    let (spare, last, ns_type, user) = (w32(4), w64(8), w32(16), w64(24));
+    if spare != 0 {
+        return Err(crate::why::inval());
+    }
+    if ns_type & !NS_ALL != 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    let act = active();
+    // (ns_id, 種類, 持ち主, いまのものか)
+    let mut all: Vec<(u64, u64, u64, bool)> = act.iter().map(|(&id, &(kind, owner))| (ns_id(id), kind, owner, current_of(kind) == id)).collect();
+    all.sort_by_key(|e| e.0);
+    let see_all = may_see_all();
+    let requested = |k: u64| ns_type == 0 || ns_type & k != 0;
+    let list: Vec<&(u64, u64, u64, bool)> = if user != 0 {
+        let u = if user == CURRENT_USER {
+            crate::proc::current().cred.ns.user_id()
+        } else {
+            act.iter().find(|&(&id, &(kind, _))| kind == CLONE_NEWUSER && ns_id(id) == user).map(|(&id, _)| id).ok_or_else(crate::why::inval)?
+        };
+        let owned: Vec<&(u64, u64, u64, bool)> = all.iter().filter(|e| e.2 == u).collect();
+        let start = if last != 0 { owned.iter().position(|e| e.0 > last).ok_or(-ENOENT)? } else { 0 };
+        owned[start..].iter().copied().filter(|e| requested(e.1) && (see_all || e.3)).collect()
+    } else {
+        let tree: Vec<&(u64, u64, u64, bool)> = if ns_type.count_ones() == 1 {
+            // その種類の木 (aios にない cgroup と time は Linux の「木がない」と同じく EINVAL)
+            if ns_type & (CLONE_NEWCGROUP | CLONE_NEWTIME) != 0 {
+                return Err(crate::why::inval());
+            }
+            all.iter().filter(|e| e.1 == ns_type).collect()
+        } else {
+            all.iter().collect()
+        };
+        let start = if last != 0 { tree.iter().position(|e| e.0 > last).ok_or(-ENOENT)? } else { 0 };
+        tree[start..].iter().copied().filter(|e| requested(e.1) && (see_all || e.3)).collect()
+    };
+    let mut out = Vec::new();
+    for e in list.iter().take(nr) {
+        out.extend_from_slice(&e.0.to_le_bytes());
+    }
+    if !out.is_empty() {
+        crate::proc::current().pt().copy_out(idsp, &out).ok_or(-EFAULT)?;
+    }
+    Ok((out.len() / 8) as i64)
+}
+
+/// nsfs の口の ioctl (Linux の ns_ioctl): NS_GET_NSTYPE (種類 CLONE_NEW*)、NS_GET_ID (ns_id)、NS_GET_MNTNS_ID (マウントの
+/// namespace でなければ EINVAL)、NS_GET_OWNER_UID (ユーザーの namespace を作った人。ほかは EINVAL)。nsfs でなければ None。
+/// NS_GET_USERNS と NS_GET_PARENT (口を返すもの) はまだない
+pub fn nsfs_ioctl(ino: &crate::vfs::InodeRef, req: u64, arg: usize) -> Option<Result<i64, i64>> {
+    const NS_GET_NSTYPE: u64 = 0xb703;
+    const NS_GET_OWNER_UID: u64 = 0xb704;
+    const NS_GET_MNTNS_ID: u64 = 0x8008_b705;
+    const NS_GET_ID: u64 = 0x8008_b70d;
+    const EFAULT: i64 = 14;
+    let w = &ino.as_any().downcast_ref::<NsInode>()?.which;
+    let put = |b: &[u8]| crate::proc::current().pt().copy_out(arg, b).map(|_| 0).ok_or(-EFAULT);
+    Some(match req {
+        NS_GET_NSTYPE => Ok(w.flag() as i64),
+        NS_GET_ID => put(&ns_id(w.id()).to_le_bytes()),
+        NS_GET_MNTNS_ID if w.flag() == CLONE_NEWNS => put(&ns_id(w.id()).to_le_bytes()),
+        NS_GET_MNTNS_ID => Err(crate::why::inval()),
+        NS_GET_OWNER_UID => match w {
+            Which::User(u) => put(&u.as_ref().map_or(0u32, |u| u.owner).to_le_bytes()),
+            _ => Err(crate::why::inval()),
+        },
+        _ => return None,
+    })
 }

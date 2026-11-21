@@ -64,6 +64,7 @@ nrs! {
     LISTXATTRAT = 465,
     REMOVEXATTRAT = 466,
     OPEN_TREE_ATTR = 467,
+    LISTNS = 470,
     MSEAL = 462,
     PROCESS_MADVISE = 440,
     SETNS = 268,
@@ -645,6 +646,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         PROCESS_MADVISE => sys_process_madvise(int(a[0]), a[1] as usize, a[2] as usize, a[3] as i32 as i64 as u64, a[4] as u32 as u64),
         PROCESS_MRELEASE => crate::pidfd::mrelease(int(a[0]), a[1] as u32 as u64),
         SETNS => crate::ns::setns(int(a[0]), a[1] as u32 as u64),
+        LISTNS => crate::ns::listns(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as u32 as u64),
         // PID の namespace の中なら、中の番号 (ns.rs)
         GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
         GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),

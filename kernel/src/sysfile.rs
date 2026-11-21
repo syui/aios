@@ -2698,6 +2698,16 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if let Some(l) = listener {
         return l.ioctl(req, arg);
     }
+    // nsfs の口 (/proc/PID/ns/X: NS_GET_NSTYPE、NS_GET_ID ...。ns.rs)
+    let ns_ino = match &f.borrow().kind {
+        Kind::Inode(i, _) => Some(i.clone()),
+        _ => None,
+    };
+    if let Some(i) = ns_ino
+        && let Some(r) = crate::ns::nsfs_ioctl(&i, req, arg)
+    {
+        return r;
+    }
     // FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (lsattr / chattr。Linux の vfs_fileattr_get / set): 持つのは efivarfs だけ。
     // 変えるのは持ち主か CAP_FOWNER、変えられない印と足すだけの印を変えるのは CAP_LINUX_IMMUTABLE
     const FS_IOC_GETFLAGS: u64 = 0x8008_6601;

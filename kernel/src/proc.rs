@@ -971,6 +971,29 @@ pub fn each_path_in_mnt(mnt: u64, mut f: impl FnMut(&str, Option<(usize, u64)>))
     }
 }
 
+/// 生きているプロセスの fd の表にある開いたファイルをみな f に (表ごとに 1 度。listns が nsfs の口を数える)。借りられない
+/// もの (いま使っている途中) はとばす
+pub fn each_open_file(mut f: impl FnMut(&crate::file::OpenFile)) {
+    let mut tables: Vec<usize> = Vec::new();
+    for p in live() {
+        if p.state == State::Zombie {
+            continue;
+        }
+        if let Some(files) = &p.files
+            && !tables.contains(&files.id())
+        {
+            tables.push(files.id());
+            let t = files.get();
+            let _w = t.gate.write();
+            for fd in t.fds.iter().flatten() {
+                if let Ok(of) = fd.file.try_borrow() {
+                    f(&of);
+                }
+            }
+        }
+    }
+}
+
 pub fn each_leader(mut f: impl FnMut(&mut Proc)) {
     for p in live() {
         if p.state != State::Unused && p.state != State::Zombie && !p.thread {

@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange closeshared cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdrace dad6 dentsfast dev dirents drmatomic drmkms drmrender dumpable efivarfs epoll exec-thread fastmap fhandle flushrace forkcow frag6 fsrace fsuid fsx futex futex2 futexrace inet6 inet6net inetsock inotify ipcns landlock-eexist landlockabi loginuid madvfree madvise mincore mld6 mldrep6 mlock mmapcoh mnt mountinfo mremap mseal ndsilence netlink newmount nftables nfteval nfteval6 nftsk nice ns onlink6 opentreeattr openat2 opencache openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pidnswait pipeslots pivotns pivotroot pmtu6 portparity posrace prctl procfiles procknobs procmadv procmaps procmem procpid procstatus procwait pwfast random rcrace rdnss6 recverr6 rlimit rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify shm settime setns signalfd sigstatus sigtramp sleeps splice statc statmount statcache syncrange sysctl6 syslog sysmisc sysvipc temp6 threadmap ttou umountbusy uname unixrace unixsock userns vdso vgetrandom vmsplice xattr"
+TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chosen clone3 closerange closeshared cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdrace dad6 dentsfast dev dirents drmatomic drmkms drmrender dumpable efivarfs epoll exec-thread fastmap fhandle flushrace forkcow frag6 fsrace fsuid fsx futex futex2 futexrace inet6 inet6net inetsock inotify ipcns landlock-eexist landlockabi listns loginuid madvfree madvise mincore mld6 mldrep6 mlock mmapcoh mnt mountinfo mremap mseal ndsilence netlink newmount nftables nfteval nfteval6 nftsk nice ns onlink6 opentreeattr openat2 opencache openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pidnswait pipeslots pivotns pivotroot pmtu6 portparity posrace prctl procfiles procknobs procmadv procmaps procmem procpid procstatus procwait pwfast random rcrace rdnss6 recverr6 rlimit rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify shm settime setns signalfd sigstatus sigtramp sleeps splice statc statmount statcache syncrange sysctl6 syslog sysmisc sysvipc temp6 threadmap ttou umountbusy uname unixrace unixsock userns vdso vgetrandom vmsplice xattr"
 
 case $1 in
 build)
@@ -78,8 +78,8 @@ run)
     # rdnss6 も root で (raw の ICMPv6 で RS を送る)
     rdnss6) cmd="sudo -n ./$t" ;;
     # pivotroot と pivotns も root で (新しいマウントの namespace で tmpfs を重ねて pivot_root)。newmount (新しい mount の API) と
-    # umountbusy (使っているマウントの umount)、opentreeattr、statmount も
-    pivotroot | pivotns | newmount | umountbusy | opentreeattr | statmount) cmd="sudo -n ./$t" ;;
+    # umountbusy (使っているマウントの umount)、opentreeattr、statmount、listns も
+    pivotroot | pivotns | newmount | umountbusy | opentreeattr | statmount | listns) cmd="sudo -n ./$t" ;;
     # pmtu6 も root で (raw の ICMPv6 で packet too big を作る)
     pmtu6) cmd="sudo -n ./$t" ;;
     # mldrep6 も root で (nftables の counter で MLD の報告を数える。nft がなければ skipped)

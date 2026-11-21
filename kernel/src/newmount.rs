@@ -713,7 +713,7 @@ fn statmount(reqp: usize, bufp: usize, bufsize: usize, flags: u64) -> Result<i64
     }
     if mask & SM_MNT_NS_ID != 0 {
         got |= SM_MNT_NS_ID;
-        put64(&mut sm, 112, ns.id);
+        put64(&mut sm, 112, crate::ns::ns_id(ns.id));
     }
     if mask & SM_SUPPORTED_MASK != 0 {
         got |= SM_SUPPORTED_MASK;

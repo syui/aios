@@ -783,6 +783,16 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   attr はそのまま開く)。OPEN_TREE_CLONE なら写したはなれたマウントに印をつけ (AT_RECURSIVE なら下のものにも)、move_mount
   で置くと mountinfo にその印 (もとはそのまま)。CLONE でなければ、印は置いてあるマウントそのものに (マウントの根で
   なければ EINVAL)。attr がなければ open_tree と同じ (open_tree はこれを attr なしで呼ぶ)
+- listns (Linux 6.19、7.4 の形。ns.rs、test/listns.c、root で Linux と 21 行同じ) と nsfs の ioctl: namespace の番号 (Linux
+  の ns_id。ns::ns_id) は、はじめのものが Linux と同じ 1〜8 (ipc 1、uts 2、user 3、pid 4、net 7、mnt 8)、新しいものは作った
+  順に 10 から (unshare の作る順も Linux の create_new_namespaces と同じ mnt、uts、ipc、pid、net に)。listns は使われて
+  いる namespace (はじめのもの、プロセスが入っているもの、nsfs の口が開いているもの、それらの持ち主のユーザーの
+  namespace) を番号の順に、ns_type でしぼり (1 つの種類ならその種類の中で)、ns_id の次から (なければ ENOENT)。
+  見えるのは自分のいまのものか、はじめの pid の namespace の CAP_SYS_ADMIN ならみな。user_ns_id (LISTNS_CURRENT_USER
+  も) ならその持ち主のものだけ。たしかめる順も Linux と同じ (EINVAL、EOVERFLOW、EFAULT、E2BIG、知らない種類は
+  EOPNOTSUPP)。nsfs の口の ioctl は NS_GET_NSTYPE、NS_GET_ID、NS_GET_MNTNS_ID、NS_GET_OWNER_UID。statmount の
+  mnt_ns_id も同じ番号。ないもの: cgroup と time の namespace (その種類だけでしぼると EINVAL)、NS_GET_USERNS と
+  NS_GET_PARENT (口を返すもの)、プロセスもいない口もないのに Linux が「使っている」と見るもの (ソケットが持つ net など)
 - statmount と listmount (Linux 6.8、7.4 の形。newmount.rs、test/statmount.c、root で Linux と 27 行同じ): mnt_id_req を
   Linux の copy_mnt_id_req の順に読み (大きさ E2BIG / EINVAL / EFAULT、知らないところ E2BIG、番号が 2^31 以下は EINVAL)、
   namespace は mnt_ns_id (なければ ENOENT)、mnt_ns_fd (nsfs の口。ほかは EINVAL)、いまのもの。statmount は Linux の
@@ -818,7 +828,7 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   あとの write もそこに足さない)、あいた箱の分だけ入れ、とちゅうでさわれなければそこまで、読み手がいなければ EPIPE と
   SIGPIPE。読める口ならパイプから手もとへ (入っている分を入れ物に順に)。待つのは SPLICE_F_NONBLOCK がないときだけで、
   fd の O_NONBLOCK は見ない (Linux と同じ)。入れるのはそのときの写し (aios がえらんだちがい vmsplice-snapshot)
-- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、file_getattr・file_setattr、listns など
+- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、file_getattr・file_setattr など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

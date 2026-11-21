@@ -557,13 +557,13 @@ pub fn init_mnt_ns() -> Rc<MountNs> {
     init_mnt()
 }
 
-/// 番号 (MountNs の id) のマウントの namespace (statmount と listmount の mnt_ns_id)。生きているものだけ
+/// ns_id (Linux の ns->ns_id: ns::ns_id) のマウントの namespace (statmount と listmount の mnt_ns_id)。生きているものだけ
 pub fn mnt_ns_by_id(id: u64) -> Option<Rc<MountNs>> {
     let init = init_mnt();
-    if init.id == id {
+    if crate::ns::ns_id(init.id) == id {
         return Some(init);
     }
-    ALL_MNT.get().iter().filter_map(|w| w.upgrade()).find(|n| n.id == id)
+    ALL_MNT.get().iter().filter_map(|w| w.upgrade()).find(|n| crate::ns::ns_id(n.id) == id)
 }
 
 /// statmount と listmount が見るマウント (Linux の struct mount の見えるところ)
