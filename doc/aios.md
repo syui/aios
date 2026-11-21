@@ -812,6 +812,21 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   / で始まるリンクを通った答えを、根のちがう人が使っていた。chroot の外の人が先に /R/a (→ /tmp/x) をたどると、R に
   chroot した人の /a が外の /tmp/x になった (chroot の外が見える。逆に、中の人が先なら外の人に R/tmp/x)。いまは、
   / で始まるリンクを通った覚えに印 (abs) をつけ、chroot の中では使わず、chroot の中でたどったものは覚えない
+- chattr の印と file_getattr / file_setattr (Linux 6.17。test/chattr.c、root で ext4 と tmpfs で Linux と 40 行同じ): ext4 の
+  inode の印 (i_flags) を Linux の fs/ext4 と同じに: FS_IOC_GETFLAGS は見える印 (ふつうのファイルは PROJINHERIT を落とす)、
+  SETFLAGS は見えない印 EOPNOTSUPP、変えられない印は落とし、種類に合わない印 (ファイルの DIRSYNC など) は EOPNOTSUPP、
+  +i のあいだにほかの印を変えるのは EPERM。持ち主か CAP_FOWNER、+i と +a を変えるのは CAP_LINUX_IMMUTABLE (Linux の
+  vfs_fileattr_set)、読むだけのマウントは EROFS。新しいものは親の印を受けつぐ (NODUMP、NOATIME、SYNC、DIRSYNC ...: Linux の
+  EXT4_FL_INHERITED)。FS_IOC_FSGETXATTR / FSSETXATTR と file_getattr / file_setattr は xflags (共通の印) で、大きさは 24 から
+  4096 (残りは 0 に、受けとるときは 0 でなければ E2BIG)、知らない xflags は EINVAL (ioctl は EOPNOTSUPP)、projid は project
+  の機能がないので 0 だけ。+i (変えられない) は書くための open、前に開いた口からの write、truncate と ftruncate、fallocate、
+  unlink、rename、link、chmod、chown、utimensat、xattr を EPERM に、ディレクトリなら中に作る・消すのも。+a (足すだけ) は
+  O_APPEND のない書く口、O_TRUNC、F_SETFL で O_APPEND を外す、切りつめ、穴あけ、消す・名前を変える・リンク、chmod、
+  時刻を決める utimensat が EPERM、書ける口での共有の mmap が EACCES、書きこみはどの口・pwrite でも終わりに (Linux の
+  IS_APPEND。aios がえらんだちがい pwrite-append は印のないものだけ)。ディレクトリの +a は作るのはよく、消すのは EPERM。
+  ないもの: ファイルごとのデータのジャーナル (JOURNAL_DATA を変える) と extent とブロックの表の入れかえ (EXTENTS を変える)
+  は EOPNOTSUPP、+S と +D (書いたらすぐディスクへ) は印だけ、atime (aios は atime を持たない: stat の atime は mtime) なので
+  +A も印だけ。tmpfs は手本の Linux の設定 (CONFIG_TMPFS_XATTR なし) と同じく印を持たない (ENOTTY / EOPNOTSUPP)
 - statmount と listmount (Linux 6.8、7.4 の形。newmount.rs、test/statmount.c、root で Linux と 27 行同じ): mnt_id_req を
   Linux の copy_mnt_id_req の順に読み (大きさ E2BIG / EINVAL / EFAULT、知らないところ E2BIG、番号が 2^31 以下は EINVAL)、
   namespace は mnt_ns_id (なければ ENOENT)、mnt_ns_fd (nsfs の口。ほかは EINVAL)、いまのもの。statmount は Linux の

@@ -1338,6 +1338,10 @@ impl OpenFile {
                 if src.is_empty() && !ino.writes_empty() {
                     return Ok(0);
                 }
+                // 足すだけのもの (chattr +a) に RWF_NOAPPEND は EPERM (Linux の kiocb_set_rw_flags)
+                if append == Some(false) && ino.append_only() {
+                    return Err(-crate::cred::EPERM);
+                }
                 let append = append.unwrap_or(self.flags & O_APPEND != 0);
                 if append {
                     self.offset = ino.meta().size as usize;

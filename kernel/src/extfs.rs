@@ -384,6 +384,31 @@ const EXTENTS_FL: u32 = 0x80000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 const IMMUTABLE_FL: u32 = 0x10;
 const APPEND_FL: u32 = 0x20;
+// chattr の印 (Linux の fs/ext4/ext4.h)。変えられるもの、見えるもの、新しいものが親から受けつぐもの
+const NODUMP_FL: u32 = 0x40;
+const NOATIME_FL: u32 = 0x80;
+const ENCRYPT_FL: u32 = 0x800;
+const JOURNAL_DATA_FL: u32 = 0x4000;
+const DIRSYNC_FL: u32 = 0x1_0000;
+const TOPDIR_FL: u32 = 0x2_0000;
+const VERITY_FL: u32 = 0x10_0000;
+const DAX_FL: u32 = 0x200_0000;
+const PROJINHERIT_FL: u32 = 0x2000_0000;
+const CASEFOLD_FL: u32 = 0x4000_0000;
+const FL_USER_MODIFIABLE: u32 = 0x624B_C0FF;
+const FL_USER_VISIBLE: u32 = 0x725B_DFFF;
+const FL_INHERITED: u32 = 0x6201_C4CF;
+
+/// 種類に合わない印を落とす (Linux の ext4_mask_flags: ディレクトリはみな、ふつうのファイルはディレクトリだけの印のほか、
+/// ほかは NODUMP と NOATIME だけ)
+// [lockless]
+fn mask_flags(mode: u32, flags: u32) -> u32 {
+    match mode & S_IFMT {
+        S_IFDIR => flags,
+        S_IFREG => flags & !(DIRSYNC_FL | TOPDIR_FL | CASEFOLD_FL | PROJINHERIT_FL),
+        _ => flags & (NODUMP_FL | NOATIME_FL),
+    }
+}
 
 // グループの印
 const BG_INODE_UNINIT: u16 = 0x1;
@@ -3193,6 +3218,12 @@ impl ExtFs {
         self.with_block(b, |d| Raw(d[off..off + isz].to_vec()))
     }
 
+    /// inode の印 (i_flags) だけ (chattr の印を見るたびに inode を写さない)
+    fn inode_flags(&self, ino: u32) -> u32 {
+        let (b, off) = self.inode_loc(ino);
+        self.with_block(b, |d| u32_at(d, off + 32)).unwrap_or(0)
+    }
+
     // [lockless]
     fn write_inode(&self, ino: u32, r: &Raw) -> Result<(), i64> {
         // meta() の覚えを、書いたものに入れかえる (Linux のメモリの inode と同じく、書いたあとに読みなおして解かない: 作った
@@ -4456,6 +4487,8 @@ impl ExtFs {
         let mut r = Raw(vec![0; self.inode_size]);
         put16(&mut r.0, 0, mode as u16);
         r.init_owner(pr);
+        // 親の印のうち受けつぐもの (Linux の __ext4_new_inode)
+        r.set_flags(mask_flags(mode, pr.flags() & FL_INHERITED));
         let t = now_secs();
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
@@ -5417,6 +5450,11 @@ impl ExtInode {
         // あれば EEXIST。なければ名前を入れるすき間も (なめるのは 1 度)
         let pr = fs.read_inode(self.ino)?;
         let slot = fs.new_slot(self.ino, &pr, name)?;
+        // 変えられないディレクトリ (chattr +i) には作れない (Linux の may_create の inode_permission。許可が通ったときは
+        // ここで: sysfile::parent_writable)
+        if pr.flags() & IMMUTABLE_FL != 0 {
+            return Err(-EPERM);
+        }
         // 消したディレクトリには作れない (inode をとる前に)
         if pr.links() == 0 {
             return Err(-ENOENT);
@@ -5479,10 +5517,14 @@ impl ExtInode {
         self.dir_only()?;
         let fs = &self.fs;
         let pr = fs.read_inode(self.ino)?;
+        if pr.flags() & IMMUTABLE_FL != 0 {
+            return Err(-EPERM);
+        }
         let ino = fs.alloc_inode(fs.group_of(self.ino), false)?;
         let mut r = Raw(vec![0; fs.inode_size]);
         put16(&mut r.0, 0, (S_IFREG | (mode & 0o7777)) as u16);
         r.init_owner(&pr);
+        r.set_flags(mask_flags(S_IFREG, pr.flags() & FL_INHERITED));
         let t = now_secs();
         for o in [8, 12, 16] {
             put32(&mut r.0, o, t);
@@ -5513,6 +5555,10 @@ impl ExtInode {
         // 引いた場所をそのまま消す (なめるのは 1 度。索引つきなら葉を 1 つ)
         let dr = fs.dir_writable(self.ino)?;
         let (child, at) = fs.entry_at(self.ino, &dr, name)?.ok_or(-ENOENT)?;
+        // 変えられない・足すだけのディレクトリからは消せない (Linux の may_delete)
+        if dr.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 {
+            return Err(-EPERM);
+        }
         let r = self.victim(child, rmdir)?;
         fs.remove_at(self.ino, dr, at, name)?;
         self.drop_victim(child, r)
@@ -5523,6 +5569,10 @@ impl ExtInode {
     fn victim(&self, child: u32, rmdir: bool) -> Result<Raw, i64> {
         let fs = &self.fs;
         let r = fs.read_inode(child)?;
+        // 変えられないものと足すだけのものは消せない (Linux の may_delete。種類を見る前)
+        if r.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 {
+            return Err(-EPERM);
+        }
         let is_dir = r.mode() & S_IFMT == S_IFDIR;
         match (is_dir, rmdir) {
             (true, false) => return Err(-EISDIR),
@@ -5574,12 +5624,20 @@ impl ExtInode {
         if is_dir && fs.is_under(nd, child)? {
             return Err(crate::why::inval());
         }
+        // 変えられない・足すだけのもの、そのディレクトリからは動かせず、変えられないディレクトリへは入れられない (Linux の
+        // may_delete と may_create。先にあるものは victim が見る)
+        if (fs.inode_flags(self.ino) | r.flags()) & (IMMUTABLE_FL | APPEND_FL) != 0 || fs.inode_flags(nd) & IMMUTABLE_FL != 0 {
+            return Err(-EPERM);
+        }
         // 先にあるものは、その項目をその場で動かすものに向けかえ (Linux の ext4_rename の ext4_setent: 名前もハッシュも
         // 変わらない)、元の項目を消してから、上書きされたもののリンクを減らす。前は先の名前を消して足しなおしていた
         // (すき間をさがして、ディレクトリのブロックを 3 度書く)
         let replaced = match fs.find(nd, new) {
             Ok(existing) if existing == child => return Ok(()),
             Ok(existing) => {
+                if fs.inode_flags(nd) & APPEND_FL != 0 {
+                    return Err(-EPERM);
+                }
                 let target = ExtInode::counted(fs, nd);
                 let vr = target.victim(existing, is_dir)?;
                 fs.set_entry(nd, new, child, r.mode())?;
@@ -5616,10 +5674,15 @@ impl ExtInode {
         if a == b {
             return Ok(());
         }
-        let (am, bm) = (fs.read_inode(a)?.mode(), fs.read_inode(b)?.mode());
+        let (ar, br) = (fs.read_inode(a)?, fs.read_inode(b)?);
+        let (am, bm) = (ar.mode(), br.mode());
         let (adir, bdir) = (am & S_IFMT == S_IFDIR, bm & S_IFMT == S_IFDIR);
         if (adir && fs.is_under(nd, a)?) || (bdir && fs.is_under(self.ino, b)?) {
             return Err(crate::why::inval());
+        }
+        // どちらも消して作るのと同じ (Linux の may_delete を両方に)
+        if (fs.inode_flags(self.ino) | fs.inode_flags(nd) | ar.flags() | br.flags()) & (IMMUTABLE_FL | APPEND_FL) != 0 {
+            return Err(-EPERM);
         }
         fs.set_entry(self.ino, old, b, bm)?;
         fs.set_entry(nd, new, a, am)?;
@@ -5714,8 +5777,14 @@ impl ExtInode {
                 S_IFDIR => return Err(-EISDIR),
                 _ => return Err(crate::why::inval()),
             }
+            // 変えられないファイルは、前に開いた口からも書けない (Linux の ext4_generic_write_checks)
+            if r.flags() & IMMUTABLE_FL != 0 {
+                return Err(-EPERM);
+            }
             size0 = r.size() as usize;
-            at = off.unwrap_or(size0);
+            // 足すだけのファイル (chattr +a) は、どの口のどの位置への書きこみも終わりに足す (Linux の iocb_flags の
+            // IS_APPEND: O_APPEND のない前の口も pwrite も)
+            at = if r.flags() & APPEND_FL != 0 { size0 } else { off.unwrap_or(size0) };
             let before = r.clone();
             let res = self.fs.write_data(self.ino, &mut r, at, buf, in_place.then_some(&mut pages));
             // inode が 1 バイトも変わらなければ (同じ秒の中で、大きさもブロックの場所も変わらない書きかえ) 書かない:
@@ -6245,6 +6314,10 @@ impl Inode for ExtInode {
             if r.mode() & S_IFMT == S_IFDIR {
                 return Err(-EPERM);
             }
+            // 変えられないディレクトリには作れず、変えられないもの・足すだけのものにはリンクを作れない (Linux の vfs_link)
+            if self.fs.inode_flags(self.ino) & IMMUTABLE_FL != 0 || r.flags() & (IMMUTABLE_FL | APPEND_FL) != 0 {
+                return Err(-EPERM);
+            }
             // リンクが 0 (消したが開いているもの) は、O_TMPFILE の linkable なものだけ (Linux の vfs_link)
             let tmp = r.links() == 0;
             if tmp && !self.fs.linkable.borrow().contains(&t) {
@@ -6296,6 +6369,89 @@ impl Inode for ExtInode {
         crate::vfs::name_changed(self.id(), old);
         crate::vfs::name_changed(newdir.id(), new);
         self.write_op(|| self.exchange_node(old, newdir, new))
+    }
+
+    fn immutable(&self) -> bool {
+        let _e = fs_lock();
+        self.fs.inode_flags(self.ino) & IMMUTABLE_FL != 0
+    }
+
+    fn append_only(&self) -> bool {
+        let _e = fs_lock();
+        self.fs.inode_flags(self.ino) & APPEND_FL != 0
+    }
+
+    fn guard_flags(&self) -> u32 {
+        let _e = fs_lock();
+        self.fs.inode_flags(self.ino) & (IMMUTABLE_FL | APPEND_FL)
+    }
+
+    /// Linux の ext4_fileattr_get: 見える印 (ふつうのファイルは PROJINHERIT を落とす)。ふつうのファイルとディレクトリだけ
+    /// (リンクと装置は ENOTTY: Linux の ext4 もその inode_operations に fileattr がない)
+    fn fs_flags(&self) -> Result<u32, i64> {
+        let r = self.raw()?;
+        match r.mode() & S_IFMT {
+            S_IFREG => Ok(r.flags() & FL_USER_VISIBLE & !PROJINHERIT_FL),
+            S_IFDIR => Ok(r.flags() & FL_USER_VISIBLE),
+            _ => Err(-25),
+        }
+    }
+
+    /// Linux の ext4_fileattr_set と ext4_ioctl_setflags の順: 見えない印は EOPNOTSUPP、変えられない印は落とし、種類に
+    /// 合わない印は EOPNOTSUPP、+i のあいだにほかの印を変えるのは EPERM、JOURNAL_DATA を変えるのは CAP_SYS_RESOURCE (なければ
+    /// EPERM)、DAX と合わない印は EOPNOTSUPP。それから変えられる印を入れて ctime をいまに。projid は project の機能が
+    /// ないので 0 だけ (ほかは、印を変えたあとで EOPNOTSUPP: Linux の ext4_ioctl_setproject)。
+    /// aios にないもの: ファイルごとのデータのジャーナル (JOURNAL_DATA を変える) と、extent とブロックの表の入れかえ
+    /// (EXTENTS を変える: Linux の ext4_ext_migrate) は EOPNOTSUPP、大文字と小文字を分けないディレクトリ (casefold の機能
+    /// がない: Linux も EOPNOTSUPP)
+    fn set_fs_flags(&self, flags: u32, fsx: Option<u32>) -> Result<(), i64> {
+        let _e = fs_lock();
+        let _p = crate::prof::span("extfs:setattr");
+        let r = self.raw()?;
+        let mode = r.mode();
+        if !matches!(mode & S_IFMT, S_IFREG | S_IFDIR) {
+            return Err(-25);
+        }
+        if flags & !FL_USER_VISIBLE != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        let flags = flags & FL_USER_MODIFIABLE;
+        if mask_flags(mode, flags) != flags {
+            return Err(-EOPNOTSUPP);
+        }
+        let old = r.flags();
+        if old & IMMUTABLE_FL != 0 && flags & IMMUTABLE_FL != 0 && old & !IMMUTABLE_FL != flags & !IMMUTABLE_FL {
+            return Err(-EPERM);
+        }
+        if (flags ^ old) & JOURNAL_DATA_FL != 0 {
+            if !crate::cred::current().capable(crate::cred::CAP_SYS_RESOURCE) {
+                return Err(-EPERM);
+            }
+            return Err(-EOPNOTSUPP);
+        }
+        // DAX と合わない印 (Linux の dax_compatible。ディレクトリの INLINE_DATA は見ない)
+        let (o, n) = if mode & S_IFMT == S_IFDIR { (old & !INLINE_DATA_FL, flags & !INLINE_DATA_FL) } else { (old, flags) };
+        let excl = VERITY_FL | ENCRYPT_FL | JOURNAL_DATA_FL | INLINE_DATA_FL;
+        if (n & DAX_FL != 0 && o & excl != 0) || (n & excl != 0 && o & DAX_FL != 0) {
+            return Err(-EOPNOTSUPP);
+        }
+        if (flags ^ old) & (EXTENTS_FL | CASEFOLD_FL) != 0 {
+            return Err(-EOPNOTSUPP);
+        }
+        if mode & S_IFMT == S_IFDIR {
+            crate::vfs::dir_changed(self.id());
+        }
+        let set = FL_USER_MODIFIABLE & !(JOURNAL_DATA_FL | EXTENTS_FL);
+        self.write_op(|| {
+            self.update(|r| {
+                r.set_flags((r.flags() & !set) | (flags & set));
+                put32(&mut r.0, 12, now_secs());
+            })
+        })?;
+        if fsx.is_some_and(|p| p != 0) {
+            return Err(-EOPNOTSUPP);
+        }
+        Ok(())
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), i64> {

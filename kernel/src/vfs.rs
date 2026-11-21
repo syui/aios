@@ -289,15 +289,27 @@ pub trait Inode {
     /// 開いた (open で OpenFile を作った) / 最後の口を閉じた (Linux の f_op->open と release)。数えるもの (efivarfs) だけ
     fn opened(&self) {}
     fn released(&self) {}
-    /// 変えられない印 (Linux の S_IMMUTABLE): 書くために開く、切りつめる、消す、属性を変えるのは EPERM
+    /// 変えられない印 (Linux の S_IMMUTABLE、chattr +i): 書くために開く、書く、切りつめる、消す、名前を変える、リンク、
+    /// 属性を変えるのは EPERM。ディレクトリなら中に作る・消すのも
     fn immutable(&self) -> bool {
         false
     }
-    /// FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (chattr / lsattr の FS_*_FL)。持たないものは ENOTTY (Linux の fileattr_get がない)
+    /// 足すだけの印 (Linux の S_APPEND、chattr +a): O_APPEND なしで書くために開く、O_TRUNC、切りつめる、消す、名前を
+    /// 変える、リンク、属性を変えるのは EPERM。ディレクトリなら中のものを消せない (作るのはよい)
+    fn append_only(&self) -> bool {
+        false
+    }
+    /// immutable (0x10、FS_IMMUTABLE_FL) と append_only (0x20、FS_APPEND_FL) を 1 度に
+    fn guard_flags(&self) -> u32 {
+        (self.immutable() as u32) << 4 | (self.append_only() as u32) << 5
+    }
+    /// FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (chattr / lsattr の FS_*_FL。Linux の fileattr_get)。持たないものは ENOTTY
     fn fs_flags(&self) -> Result<u32, i64> {
         Err(-25)
     }
-    fn set_fs_flags(&self, _flags: u32) -> Result<(), i64> {
+    /// 印を変える (Linux の fileattr_set: 持ち主か、CAP_LINUX_IMMUTABLE かは呼ぶ側 (sysfile::fileattr_set) が見たあと)。
+    /// fsx は印で表せないもの (xflags の共通でない印、extsize、projid、cowextsize) がわたされたときの projid
+    fn set_fs_flags(&self, _flags: u32, _fsx: Option<u32>) -> Result<(), i64> {
         Err(-25)
     }
 }

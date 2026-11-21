@@ -423,11 +423,12 @@ impl Inode for EfiNode {
         Ok(if self.immutable() { FS_IMMUTABLE_FL } else { 0 })
     }
 
-    fn set_fs_flags(&self, flags: u32) -> Result<(), i64> {
+    fn set_fs_flags(&self, flags: u32, fsx: Option<u32>) -> Result<(), i64> {
         if self.ino == 1 {
             return Err(-ENOTTY);
         }
-        if flags & !FS_IMMUTABLE_FL != 0 {
+        // Linux の efivarfs_fileattr_set: 印で表せないものと、IMMUTABLE のほかの印は EOPNOTSUPP
+        if fsx.is_some() || flags & !FS_IMMUTABLE_FL != 0 {
             return Err(-EOPNOTSUPP);
         }
         self.var(|v| v.immutable = flags & FS_IMMUTABLE_FL != 0)

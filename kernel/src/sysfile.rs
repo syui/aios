@@ -284,9 +284,22 @@ pub fn dir_of(full: &str) -> &str {
     full.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-/// 親ディレクトリに書ける (w と x) か
+/// 親ディレクトリに書ける (w と x) か。変えられない (chattr +i) ディレクトリは、Linux の inode_permission では許可を
+/// 見る前に EPERM: 許可がなければここで EPERM に、あればファイルシステムが作る・消すところで (ext4 は読んでいる inode
+/// の印で。ここで読みなおさない)
 fn parent_writable(c: &Cred, parent: &InodeRef) -> Result<(), i64> {
-    c.check(&parent.meta(), PW | PX)
+    match c.check(&parent.meta(), PW | PX) {
+        Err(e) if e == -cred::EACCES && parent.immutable() => Err(-cred::EPERM),
+        r => r,
+    }
+}
+
+/// 属性を変える (chmod、chown): 変えられないものと足すだけのものは EPERM (Linux の notify_change)
+fn may_setattr(ino: &InodeRef) -> Result<(), i64> {
+    if ino.guard_flags() != 0 {
+        return Err(-cred::EPERM);
+    }
+    Ok(())
 }
 
 /// sticky なディレクトリでは、消す/動かすのは持ち主 (ファイルかディレクトリ) か CAP_FOWNER だけ (Linux の __check_sticky)
@@ -1404,11 +1417,16 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         file::O_WRONLY => PW,
         _ => PR | PW,
     } | if flags & O_TRUNC != 0 { PW } else { 0 };
-    // 変えられない印のあるもの (efivarfs) を書くために開くのは EPERM (Linux の inode_permission: 許可を見る前)
-    if want & PW != 0 && ino.immutable() {
+    // 変えられないもの (chattr +i、efivarfs) を書くために開くのは EPERM (Linux の inode_permission: 許可を見る前)。
+    // 足すだけのもの (+a) は、書くなら O_APPEND で、O_TRUNC なしで (Linux の may_open: 許可のあと)
+    let guard = if want & PW != 0 { ino.guard_flags() } else { 0 };
+    if guard & 0x10 != 0 {
         return Err(-vfs::EPERM);
     }
     vfs::may(&ino, &ino.meta(), cred::current(), want)?;
+    if guard & 0x20 != 0 && (flags & file::O_APPEND as u64 == 0 || flags & O_TRUNC != 0) {
+        return Err(-vfs::EPERM);
+    }
     if reg_write {
         if proc::executing(ino.id()) {
             return Err(-ETXTBSY);
@@ -2051,10 +2069,19 @@ pub fn ftruncate(fd: u64, len: i64) -> R {
     if !f.borrow().writable() {
         return Err(crate::why::inval());
     }
+    // 足すだけのもの (chattr +a) は切りつめられない (Linux の do_ftruncate)。変えられないもの (+i) は下で
+    let guard = ino.guard_flags();
+    if guard & 0x20 != 0 {
+        return Err(-vfs::EPERM);
+    }
     writable_fd(fd)?;
     // LSM (security_file_truncate): 開いたときに覚えた許しで (landlock の TRUNCATE)
     crate::security::file_truncate(&f)?;
     lsm_fd(PathOp::Truncate, fd)?;
+    // 変えられないもの (chattr +i) は、前に開いた口からも切りつめられない (Linux の ext4_setattr)
+    if guard & 0x10 != 0 {
+        return Err(-vfs::EPERM);
+    }
     vfs::drop_privs(&ino)?;
     // ftruncate(2) は大きさが変わらなくても時刻を変える (Linux の do_truncate が ATTR_MTIME | ATTR_CTIME を渡す。
     // truncate(2) は渡さないので、tmpfs は大きさが変わらなければ変えない: tmpfs::truncate)
@@ -2110,6 +2137,14 @@ pub fn fallocate(fd: u64, mode: u64, off: i64, len: i64) -> R {
     if !f.borrow().writable() {
         return Err(-EBADF);
     }
+    // 足すだけのもの (chattr +a) は場所をとるだけ、変えられないもの (+i) は何も (Linux の vfs_fallocate)
+    let guard = match &f.borrow().kind {
+        Kind::Inode(i, _) => i.guard_flags(),
+        _ => 0,
+    };
+    if (mode & !KEEP_SIZE != 0 && guard & 0x20 != 0) || guard & 0x10 != 0 {
+        return Err(-vfs::EPERM);
+    }
     match f.borrow().stat().mode & S_IFMT {
         vfs::S_IFIFO => return Err(-file::ESPIPE),
         vfs::S_IFDIR => return Err(-EISDIR),
@@ -2140,7 +2175,15 @@ pub fn truncate(pathp: usize, len: i64) -> R {
         _ => return Err(crate::why::inval()),
     }
     vfs::check_writable(&full)?;
+    // 変えられないもの (chattr +i) は許可を見る前に、足すだけのもの (+a) は許可のあとで EPERM (Linux の vfs_truncate)
+    let guard = ino.guard_flags();
+    if guard & 0x10 != 0 {
+        return Err(-vfs::EPERM);
+    }
     cred::current().check(&ino.meta(), PW)?;
+    if guard & 0x20 != 0 {
+        return Err(-vfs::EPERM);
+    }
     // 動かしているプログラムは切りつめられない (Linux の vfs_truncate の get_write_access)
     if proc::executing(ino.id()) {
         return Err(-ETXTBSY);
@@ -2154,6 +2197,7 @@ pub fn truncate(pathp: usize, len: i64) -> R {
 
 /// 持ち主か root だけ。グループに入っていなければ setgid は落とす
 fn chmod(ino: &InodeRef, mode: u64) -> R {
+    may_setattr(ino)?;
     let c = cred::current();
     let m = ino.meta();
     if !c.owns(&m) {
@@ -2285,6 +2329,7 @@ fn chown_ids(uid: u64, gid: u64) -> Result<(Option<u32>, Option<u32>), i64> {
 }
 
 fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
+    may_setattr(ino)?;
     let c = cred::current();
     let m = ino.meta();
     let (uid, gid) = chown_ids(uid, gid)?;
@@ -2457,6 +2502,12 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         return Err(crate::why::inval());
     }
     vfs::check_writable(&full)?;
+    // 変えられないもの (chattr +i) は何も、足すだけのもの (+a) は時刻を決めて変えるのが EPERM (Linux の notify_change)
+    let set = t.is_some_and(|t| t.iter().any(|x| x.1 != UTIME_NOW && x.1 != UTIME_OMIT));
+    let guard = ino.guard_flags();
+    if guard & 0x10 != 0 || (set && guard & 0x20 != 0) {
+        return Err(-cred::EPERM);
+    }
     // 許可: いまにするだけ (NULL か {NOW, NOW}) なら持ち主か書ける人 (EACCES)、ほかは持ち主か root (EPERM)
     let c = cred::current();
     let m = ino.meta();
@@ -2552,6 +2603,13 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             const MASK: u32 = file::O_APPEND | O_NONBLOCK | O_DIRECT | O_NOATIME;
             let arg = arg as u32;
             let mut f = entry.file.borrow_mut();
+            // 足すだけのもの (chattr +a) の O_APPEND は変えられない (Linux の setfl)
+            if (arg ^ f.flags) & file::O_APPEND != 0
+                && let Kind::Inode(i, _) = &f.kind
+                && i.append_only()
+            {
+                return Err(-cred::EPERM);
+            }
             let (owner, odirect) = match &f.kind {
                 Kind::Inode(i, _) => (Some(i.meta().uid), i.meta().mode & S_IFMT == vfs::S_IFREG),
                 Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => (Some(p.uid.load(core::sync::atomic::Ordering::Relaxed)), true),
@@ -2641,6 +2699,181 @@ pub fn pipe2(fds: usize, flags: u64) -> R {
     Ok(0)
 }
 
+// ---- chattr の印 (Linux の fs/file_attr.c) ----
+
+/// 印 (FS_*_FL) と xflags (FS_XFLAG_*) の、どちらにもあるもの: SYNC、IMMUTABLE、APPEND、NODUMP、NOATIME、DAX、PROJINHERIT、
+/// VERITY、CASEFOLD
+const FL_XFLAGS: [(u32, u32); 9] = [(0x8, 0x20), (0x10, 0x8), (0x20, 0x10), (0x40, 0x80), (0x80, 0x40), (0x200_0000, 0x8000), (0x2000_0000, 0x200), (0x10_0000, 0x2_0000), (0x4000_0000, 0x4_0000)];
+/// FS_COMMON_FL と FS_XFLAG_COMMON (CASEFOLD のほか)
+const FS_COMMON_FL: u32 = 0x2210_00f8;
+const XFLAG_COMMON: u32 = 0x2_82f8;
+/// 読むだけの xflags (PREALLOC、HASATTR、VERITY、CASEFOLD、CASENONPRESERVING) と、知っている xflags みな (FS_XFLAGS_MASK)
+const XFLAG_RDONLY: u32 = 0x800e_0002;
+const XFLAGS_MASK: u32 = 0x800f_fffb;
+const XFLAG_EXTSIZE: u32 = 0x800;
+const XFLAG_EXTSZINHERIT: u32 = 0x1000;
+const XFLAG_COWEXTSIZE: u32 = 0x1_0000;
+const XFLAG_DAX: u32 = 0x8000;
+const XFLAG_VERITY: u32 = 0x2_0000;
+const XFLAG_PROJINHERIT: u32 = 0x200;
+
+fn flags_to_xflags(flags: u32) -> u32 {
+    FL_XFLAGS.iter().filter(|(f, _)| flags & f != 0).fold(0, |a, (_, x)| a | x)
+}
+
+fn xflags_to_flags(x: u32) -> u32 {
+    FL_XFLAGS.iter().filter(|(_, xf)| x & xf != 0).fold(0, |a, (f, _)| a | f)
+}
+
+/// 変える印 (Linux の struct file_kattr): 印から (SETFLAGS) か、xflags と extsize、projid、cowextsize から (FSSETXATTR と
+/// file_setattr)
+struct FileAttr {
+    flags: Option<u32>,
+    xflags: u32,
+    extsize: u32,
+    projid: u32,
+    cowextsize: u32,
+}
+
+impl FileAttr {
+    fn flags(f: u32) -> FileAttr {
+        FileAttr { flags: Some(f), xflags: 0, extsize: 0, projid: 0, cowextsize: 0 }
+    }
+    /// 読むだけの xflags は落とす (Linux の fileattr_fill_xflags の前)
+    fn xflags(x: u32, extsize: u32, projid: u32, cowextsize: u32) -> FileAttr {
+        FileAttr { flags: None, xflags: x & !XFLAG_RDONLY, extsize, projid, cowextsize }
+    }
+}
+
+/// 印を変える (Linux の vfs_fileattr_set): 持たないものは ENOTTY、持ち主か CAP_FOWNER (でなければ EPERM)、いまの印を
+/// 読んで足りないところを埋め、fileattr_set_prepare のたしかめ (IMMUTABLE と APPEND を変えるのは CAP_LINUX_IMMUTABLE、
+/// ユーザーの namespace の中で projid と PROJINHERIT を変えるのは EINVAL、extsize の印の種類、DAX)、それからファイル
+/// システム。読むだけのマウント (EROFS) は呼ぶ側で
+fn fileattr_set(ino: &InodeRef, mut fa: FileAttr) -> Result<(), i64> {
+    let old = ino.fs_flags()?;
+    let c = cred::current();
+    let m = ino.meta();
+    if c.fsuid != m.uid && !c.capable(cred::CAP_FOWNER) {
+        return Err(-vfs::EPERM);
+    }
+    // いまのもの (aios の ext4 と efivarfs は、印で表せない xflags と extsize、projid を持たない: みな 0)
+    let old_x = flags_to_xflags(old);
+    let flags = match fa.flags {
+        Some(f) => {
+            fa.xflags = flags_to_xflags(f);
+            f
+        }
+        None => xflags_to_flags(fa.xflags) | (old & !FS_COMMON_FL),
+    };
+    if (flags ^ old) & 0x30 != 0 && !c.capable(cred::CAP_LINUX_IMMUTABLE) {
+        return Err(-vfs::EPERM);
+    }
+    if c.ns.user.is_some() {
+        if fa.projid != 0 || (old_x ^ fa.xflags) & XFLAG_PROJINHERIT != 0 {
+            return Err(crate::why::inval());
+        }
+    } else if fa.projid == u32::MAX {
+        return Err(crate::why::inval());
+    }
+    let (reg, dir) = (m.mode & S_IFMT == vfs::S_IFREG, m.is_dir());
+    if (fa.xflags & XFLAG_EXTSIZE != 0 && !reg) || (fa.xflags & XFLAG_EXTSZINHERIT != 0 && !dir) || (fa.xflags & XFLAG_COWEXTSIZE != 0 && !reg && !dir) {
+        return Err(crate::why::inval());
+    }
+    if fa.xflags & XFLAG_DAX != 0 && ((!reg && !dir) || old_x & XFLAG_VERITY != 0) {
+        return Err(crate::why::inval());
+    }
+    if fa.extsize == 0 {
+        fa.xflags &= !(XFLAG_EXTSIZE | XFLAG_EXTSZINHERIT);
+    }
+    if fa.cowextsize == 0 {
+        fa.xflags &= !XFLAG_COWEXTSIZE;
+    }
+    // 印で表せないもの (Linux の fileattr_has_fsx)
+    let fsx = fa.flags.is_none() && (fa.xflags & !XFLAG_COMMON != 0 || fa.extsize != 0 || fa.projid != 0 || fa.cowextsize != 0);
+    ino.set_fs_flags(flags, fsx.then_some(fa.projid))?;
+    inotify::self_event(ino, inotify::IN_ATTRIB);
+    Ok(())
+}
+
+/// file_getattr / file_setattr (Linux 6.17) の、ファイル: フラグ (AT_SYMLINK_NOFOLLOW と AT_EMPTY_PATH のほかは EINVAL) と
+/// 大きさ (4096 より大きければ E2BIG、24 より小さければ EINVAL) を見たあとで。空のパスで AT_EMPTY_PATH なら dfd そのもの
+/// (O_PATH の口は EBADF: Linux の fdget)、ほかはたどる。(inode, パス)
+fn file_attr_target(dfd: i64, pathp: usize, at_flags: u64) -> Result<(Option<InodeRef>, String), i64> {
+    let path = if pathp == 0 && at_flags & AT_EMPTY_PATH != 0 { String::new() } else { user_str(pathp)? };
+    if path.is_empty() && at_flags & AT_EMPTY_PATH != 0 && dfd >= 0 {
+        let f = file_of(dfd as u64)?;
+        let f = f.borrow();
+        if f.flags & file::O_PATH != 0 {
+            return Err(-EBADF);
+        }
+        return Ok(match &f.kind {
+            Kind::Inode(i, p) => (Some(i.clone()), String::from(p.trim_start_matches('/'))),
+            // パイプやソケットの inode には印がない
+            _ => (None, String::new()),
+        });
+    }
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    let fl = at_flags & AT_SYMLINK_NOFOLLOW;
+    let ino = at_path(dfd, &path, fl)?;
+    Ok((Some(ino), old_path(dfd, pathp, fl)?))
+}
+
+fn file_attr_checks(usize_: usize, at_flags: u64) -> Result<(), i64> {
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(crate::why::inval());
+    }
+    if usize_ > 4096 {
+        return Err(-E2BIG);
+    }
+    if usize_ < 24 {
+        return Err(crate::why::inval());
+    }
+    Ok(())
+}
+
+/// file_getattr(dfd, path, ufattr, usize, at_flags): 印を struct file_attr (xflags、extsize、nextents、projid、
+/// cowextsize。24 バイト。大きい入れものの残りは 0) に。印を持たないものは EOPNOTSUPP
+pub fn file_getattr(dfd: i64, pathp: usize, ufattr: usize, usize_: usize, at_flags: u64) -> R {
+    file_attr_checks(usize_, at_flags)?;
+    let (ino, _) = file_attr_target(dfd, pathp, at_flags)?;
+    let flags = match ino.map(|i| i.fs_flags()) {
+        Some(Ok(f)) => f,
+        Some(Err(e)) if e != -ENOTTY => return Err(e),
+        _ => return Err(-vfs::EOPNOTSUPP),
+    };
+    let mut b = vec![0u8; usize_];
+    b[..8].copy_from_slice(&((flags_to_xflags(flags) & XFLAGS_MASK) as u64).to_le_bytes());
+    out(ufattr, &b)?;
+    Ok(0)
+}
+
+/// file_setattr(dfd, path, ufattr, usize, at_flags): struct file_attr を読み (大きい入れものの残りが 0 でなければ E2BIG:
+/// copy_struct_from_user)、知らない xflags は EINVAL、たどって、読むだけのマウントなら EROFS、それから fileattr_set
+/// (印を持たないものは EOPNOTSUPP)
+pub fn file_setattr(dfd: i64, pathp: usize, ufattr: usize, usize_: usize, at_flags: u64) -> R {
+    file_attr_checks(usize_, at_flags)?;
+    let mut b = vec![0u8; usize_];
+    proc::current().pt().copy_in(&mut b, ufattr).ok_or(-EFAULT)?;
+    if b[24..].iter().any(|&x| x != 0) {
+        return Err(-E2BIG);
+    }
+    let x = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let w = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+    if x & !(XFLAGS_MASK as u64) != 0 {
+        return Err(crate::why::inval());
+    }
+    let fa = FileAttr::xflags(x as u32, w(8), w(16), w(20));
+    let (ino, full) = file_attr_target(dfd, pathp, at_flags)?;
+    let Some(ino) = ino else { return Err(-vfs::EOPNOTSUPP) };
+    vfs::check_writable(&full)?;
+    match fileattr_set(&ino, fa) {
+        Err(e) if e == -ENOTTY => Err(-vfs::EOPNOTSUPP),
+        r => r.map(|_| 0),
+    }
+}
+
 pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     let f = file_of(fd)?;
     // O_PATH の fd は ioctl に使えない (Linux の fdget)
@@ -2708,33 +2941,42 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     {
         return r;
     }
-    // FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (lsattr / chattr。Linux の vfs_fileattr_get / set): 持つのは efivarfs だけ。
-    // 変えるのは持ち主か CAP_FOWNER、変えられない印と足すだけの印を変えるのは CAP_LINUX_IMMUTABLE
+    // FS_IOC_GETFLAGS / SETFLAGS (lsattr / chattr) と FS_IOC_FSGETXATTR / FSSETXATTR (xfs_io)。Linux の ioctl_getflags ほか:
+    // 持つのは ext4 と efivarfs (ほかは ENOTTY)
     const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
     const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
-    if req == FS_IOC_GETFLAGS || req == FS_IOC_SETFLAGS {
+    const FS_IOC_FSGETXATTR: u64 = 0x801c_581f;
+    const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
+    if matches!(req, FS_IOC_GETFLAGS | FS_IOC_SETFLAGS | FS_IOC_FSGETXATTR | FS_IOC_FSSETXATTR) {
         let ino = match &f.borrow().kind {
             Kind::Inode(i, _) => i.clone(),
             _ => return Err(-ENOTTY),
         };
-        let old = ino.fs_flags()?;
-        if req == FS_IOC_GETFLAGS {
-            return out(arg, &old.to_le_bytes()).map(|_| 0);
+        match req {
+            FS_IOC_GETFLAGS => return out(arg, &ino.fs_flags()?.to_le_bytes()).map(|_| 0),
+            FS_IOC_FSGETXATTR => {
+                let x = flags_to_xflags(ino.fs_flags()?) & XFLAGS_MASK;
+                let mut b = [0u8; 28];
+                b[..4].copy_from_slice(&x.to_le_bytes());
+                return out(arg, &b).map(|_| 0);
+            }
+            FS_IOC_SETFLAGS => {
+                let mut v = [0u8; 4];
+                proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
+                writable_fd(fd)?;
+                return fileattr_set(&ino, FileAttr::flags(u32::from_le_bytes(v))).map(|_| 0);
+            }
+            _ => {
+                let mut b = [0u8; 28];
+                proc::current().pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
+                let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+                if w(0) & !XFLAGS_MASK != 0 {
+                    return Err(-vfs::EOPNOTSUPP);
+                }
+                writable_fd(fd)?;
+                return fileattr_set(&ino, FileAttr::xflags(w(0), w(1), w(3), w(4))).map(|_| 0);
+            }
         }
-        let mut v = [0u8; 4];
-        proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
-        let new = u32::from_le_bytes(v);
-        let c = cred::current();
-        if c.fsuid != ino.meta().uid && !c.capable(cred::CAP_FOWNER) {
-            return Err(-vfs::EPERM);
-        }
-        const FS_IMMUTABLE_FL: u32 = 0x10;
-        const FS_APPEND_FL: u32 = 0x20;
-        if (old ^ new) & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 && !c.capable(cred::CAP_LINUX_IMMUTABLE) {
-            return Err(-vfs::EPERM);
-        }
-        ino.set_fs_flags(new)?;
-        return Ok(0);
     }
     // FIONREAD: いま読めるバイト数 (パイプ、AF_UNIX のソケット (listen しているものは EINVAL)、TCP / UDP のソケット、
     // ふつうのファイル)。端末のものは tty の ioctl で
@@ -3572,7 +3814,7 @@ fn xattr_name(p: usize) -> Result<String, i64> {
 fn xattr_permission(ino: &InodeRef, name: &str, write: bool) -> Result<(), i64> {
     let c = cred::current();
     let m = ino.meta();
-    if write && (ino.immutable() || ino.fs_flags().is_ok_and(|f| f & 0x20 != 0)) {
+    if write && ino.guard_flags() != 0 {
         return Err(-cred::EPERM);
     }
     if name.starts_with("security.") || name.starts_with("system.") {

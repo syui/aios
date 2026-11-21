@@ -66,6 +66,8 @@ nrs! {
     OPEN_TREE_ATTR = 467,
     LISTNS = 470,
     FCHROOT = 472,
+    FILE_GETATTR = 468,
+    FILE_SETATTR = 469,
     MSEAL = 462,
     PROCESS_MADVISE = 440,
     SETNS = 268,
@@ -651,6 +653,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         SETNS => crate::ns::setns(int(a[0]), a[1] as u32 as u64),
         LISTNS => crate::ns::listns(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as u32 as u64),
         FCHROOT => sysfile::fchroot(int(a[0]), a[1] as u32 as u64),
+        FILE_GETATTR => sysfile::file_getattr(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize, a[4] as u32 as u64),
+        FILE_SETATTR => sysfile::file_setattr(int(a[0]), a[1] as usize, a[2] as usize, a[3] as usize, a[4] as u32 as u64),
         // PID の namespace の中なら、中の番号 (ns.rs)
         GETPID => Ok(crate::ns::local_or_0(proc::current().tgid) as i64),
         GETPGID => crate::ns::arg_pid(int(a[0])).and_then(|p| signal::getpgid(p as u32)).map(|g| crate::ns::local_or_0(g as u32) as i64),
@@ -2014,6 +2018,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
             // ふつうのファイルだけ (ディレクトリやパイプは ENODEV: Linux に mmap がない)。fend は MAX: ファイルの終わりは
             // 触れたときの大きさで見る (その先のページは SIGBUS。vm.rs)
             crate::file::Kind::Inode(ino, p) if ino.meta().mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG => {
+                // 足すだけのもの (chattr +a) を書ける口で共有に写すのは EACCES (Linux の do_mmap)
+                if flags & MAP_SHARED != 0 && mode != crate::file::O_RDONLY && ino.append_only() {
+                    return Err(-EACCES);
+                }
                 // LSM (AppArmor): 実行して写すなら m (security_mmap_file)
                 crate::security::mmap_file(p, prot, flags & MAP_SHARED == 0, ino.meta().uid)?;
                 // noexec のマウントのものは実行できるように写せない (Linux の do_mmap の path_noexec: EPERM)
