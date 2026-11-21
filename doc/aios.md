@@ -798,6 +798,20 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   EOPNOTSUPP)。nsfs の口の ioctl は NS_GET_NSTYPE、NS_GET_ID、NS_GET_MNTNS_ID、NS_GET_OWNER_UID。statmount の
   mnt_ns_id も同じ番号。ないもの: cgroup と time の namespace (その種類だけでしぼると EINVAL)、NS_GET_USERNS と
   NS_GET_PARENT (口を返すもの)、プロセスもいない口もないのに Linux が「使っている」と見るもの (ソケットが持つ net など)
+- fchroot (Linux 7.4。sysfile.rs、test/fchroot.c、root で Linux と 8 行同じ): 開いているディレクトリ (O_PATH でもよい) を根に。
+  Linux と同じ順 (flags は EINVAL、fd がなければ EBADF、ディレクトリでなければ ENOTDIR、通れなければ EACCES、
+  CAP_SYS_CHROOT がなければ EPERM)。fd が FD_FAILFS_ROOT (-10004) なら、なにも見えない根 (Linux の failfs。vfs::FAILFS:
+  パスにならない字を根の印に): 絶対パスと / で始まるリンクはみな EOPNOTSUPP、cwd からの相対パスと .. (名前空間の
+  ルートまで) はそのまま、/proc/PID/root は failfs:/。これは CAP_SYS_CHROOT がなくても、no_new_privs で (でなければ
+  EPERM)、fd の表をほかのスレッドと分けておらず (EINVAL)、chroot の中でなければ (EPERM) できる。chroot(2) のたしかめる
+  順も Linux と同じに (引く、ディレクトリか、通れるか、CAP_SYS_CHROOT。前は CAP が先で、通れるかを見ていなかった)。
+  getcwd は根の外の cwd (chroot の前の cwd、failfs の根) に Linux と同じく "(unreachable)" をつける (前は本当のルート
+  からのパスを返していた。glibc はこれを見て自分で .. をたどりなおし、ENOENT か EOPNOTSUPP に)。aios は fs_struct を
+  fd の表といっしょに持つので、「fs を分けている」は fd の表を分けているか (CLONE_FILES だけで分けた子も数える)
+- chroot と / で始まるリンク (test/chrootlink.c): パスの覚え (vfs の PATHS) の鍵にプロセスの根が入っていないので、
+  / で始まるリンクを通った答えを、根のちがう人が使っていた。chroot の外の人が先に /R/a (→ /tmp/x) をたどると、R に
+  chroot した人の /a が外の /tmp/x になった (chroot の外が見える。逆に、中の人が先なら外の人に R/tmp/x)。いまは、
+  / で始まるリンクを通った覚えに印 (abs) をつけ、chroot の中では使わず、chroot の中でたどったものは覚えない
 - statmount と listmount (Linux 6.8、7.4 の形。newmount.rs、test/statmount.c、root で Linux と 27 行同じ): mnt_id_req を
   Linux の copy_mnt_id_req の順に読み (大きさ E2BIG / EINVAL / EFAULT、知らないところ E2BIG、番号が 2^31 以下は EINVAL)、
   namespace は mnt_ns_id (なければ ENOENT)、mnt_ns_fd (nsfs の口。ほかは EINVAL)、いまのもの。statmount は Linux の

@@ -20,6 +20,11 @@ pub const ELOOP: i64 = 40;
 pub const EOPNOTSUPP: i64 = 95;
 pub const EIO: i64 = 5;
 
+/// fchroot(FD_FAILFS_ROOT) の根 (Linux 7.4 の failfs: なにも見えない根)。パスにならない字なので、プロセスの根
+/// (proc::Files の root) の印に使う: 絶対パスと / で始まるリンクは EOPNOTSUPP、cwd からの相対パスはそのまま (.. は
+/// 名前空間のルートまで上がれる)
+pub const FAILFS: &str = "\0failfs";
+
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFSOCK: u32 = 0o140000;
@@ -1028,7 +1033,7 @@ pub fn pivot_root(root: &str, new: &str, old: &str, old_id: (usize, u64)) -> Res
     l.sort_by_key(|m| if m.target.is_empty() { 0 } else { m.target.split('/').count() });
     drop(l);
     // その namespace のプロセスの cwd と root (根そのものだったものは N: もとのパスのまま)
-    let fix = |p: &str| if p == root { String::from(root) } else { map(p) };
+    let fix = |p: &str| if p == root || p == FAILFS { String::from(p) } else { map(p) };
     crate::proc::each_files_in_mnt(ns.id, |f| {
         let (c, r) = (fix(&f.cwd), fix(&f.root));
         if c != f.cwd {
@@ -1652,6 +1657,10 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     if path.is_empty() {
         return Err(-ENOENT);
     }
+    // failfs の根からは、絶対パスはみな EOPNOTSUPP (Linux の failfs_permission: 根を通れない)
+    if path.starts_with('/') && crate::proc::failfs_root() {
+        return Err(-EOPNOTSUPP);
+    }
     // 文字の上で畳むと Linux とちがうパス (normal) は、1 つずつたどる (覚えない)。畳んだパスは使いまわしの
     // 入れもの (NORM) に作り、覚えにあれば鍵を作らずに答える (なかったときだけ、写して鍵にする)
     // (覚えを捨てるのは先に: inode を捨てると ext4 の後片づけが動くので、NORM を作ってから使うまでのあいだには何もしない)
@@ -1667,9 +1676,16 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
         return Ok(f(&w, &i));
     }
     let mnt = current_mnt().id;
+    // chroot の中では、/ で始まるリンクを通った覚え (根が本当のルートの人の答え) は使わず、覚えもしない
+    let chrooted = crate::proc::chrooted();
+    let mut others = false;
     // 通ったところの名前やディレクトリが変わっていれば (版がちがえば)、古い答え: 捨てて引きなおす
     // (捨てるのはここで: inode を捨てると ext4 の後片づけが動くので、ファイルシステムの中ではなく)
     let stale = match cache.get_mut(PathKeyRef::new(mnt, norm, follow).key()).map(|e| (e.fresh(), e)) {
+        Some((true, e)) if chrooted && e.abs => {
+            others = true;
+            false
+        }
         Some((true, e)) => {
             PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             e.used = true;
@@ -1679,7 +1695,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
                 for g in &e.gates {
                     if let Err(err) = cred.check(&Meta { mode: g.mode, uid: g.uid, gid: g.gid, ..Meta::default() }, crate::cred::X) {
                         // どのディレクトリかは覚えていないので、わけ (why.rs) のために 1 つずつたどりなおす (しくじる道だけ)
-                        let mut t = Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() };
+                        let mut t = Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new(), abs: false };
                         let p = norm.clone();
                         return Err(walk(None, p, follow, &mut t).err().unwrap_or(err));
                     }
@@ -1698,7 +1714,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
         cache.remove(&key);
     }
     PATHS_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut t = Trace { ok: true, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() };
+    let mut t = Trace { ok: !others, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new(), abs: false };
     // 親のディレクトリを覚えていれば、そこから最後の名前だけを引く (Linux の dcache も名前ごと: 作ったばかりの
     // ファイルの stat で、ディレクトリまでを引きなおさない)。通ったディレクトリと通れるかは親の覚えから
     let mut start = None;
@@ -1706,6 +1722,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     if let Some(cut) = key.path.rfind('/') {
         if let Some(e) = cache.get_mut(PathKeyRef::new(key.mnt, &key.path[..cut], true).key())
             && e.fresh()
+            && !(chrooted && e.abs)
         {
             let cred = crate::proc::current_cred_ref();
             if let Some((walked, ino)) = &e.found {
@@ -1715,6 +1732,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
                     rest = key.path[cut + 1..].to_string();
                     t.dirs = e.dirs.clone();
                     t.gates = e.gates.clone();
+                    t.abs = e.abs;
                 }
             }
         }
@@ -1741,7 +1759,9 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
             let (dirs, gates) = (t.dirs[..d].to_vec(), t.gates[..g].to_vec());
             cache.entry(PathKey::new(key.mnt, walked.clone(), true)).or_insert_with(|| PathEntry::new(Some((walked, ino)), dirs, gates));
         }
-        cache.insert(key, PathEntry::new(r.as_ref().ok().cloned(), t.dirs, t.gates));
+        let mut e = PathEntry::new(r.as_ref().ok().cloned(), t.dirs, t.gates);
+        e.abs = t.abs;
+        cache.insert(key, e);
     }
     r.map(|(w, i)| f(&w, &i))
 }
@@ -1773,6 +1793,8 @@ struct PathEntry {
     gates: Vec<Gate>,
     /// 前にたしかめた (作った) ときの CHANGES
     checked: u64,
+    /// / で始まるリンクを通った (答えがプロセスの根で変わる: 根が本当のルートの人の答え。chroot の中では使わない)
+    abs: bool,
 }
 
 impl PathEntry {
@@ -1780,7 +1802,7 @@ impl PathEntry {
         if let Some((_, i)) = &found {
             *HOLDS.get().entry(i.id()).or_insert(0) += 1;
         }
-        PathEntry { found, used: false, dirs, gates, checked: CHANGES.load(core::sync::atomic::Ordering::Acquire) }
+        PathEntry { found, used: false, dirs, gates, checked: CHANGES.load(core::sync::atomic::Ordering::Acquire), abs: false }
     }
 
     /// 通ったところがどれも変わっていないか。前にたしかめてから版の表がまったく変わっていなければ、見なくてよい
@@ -1829,6 +1851,8 @@ struct Trace {
     dirs: Vec<Pass>,
     gates: Vec<Gate>,
     prefixes: Vec<(String, InodeRef, usize, usize)>,
+    /// / で始まるリンクを通った (PathEntry の abs)
+    abs: bool,
 }
 
 /// 覚えの鍵: (マウントの namespace, 正規化したパス, 最後のリンクをたどるか)。並びはパスのハッシュが先 (BTreeMap が引くたびに
@@ -2230,7 +2254,7 @@ pub fn lookup_at(dir: &InodeRef, dir_path: &str, path: &str, follow: bool) -> Re
         return lookup(dir_path, path, follow);
     }
     let rel = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
-    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new() })
+    walk(Some((dir.clone(), dir_path.trim_matches('/').to_string())), rel, follow, &mut Trace { ok: false, dirs: Vec::new(), gates: Vec::new(), prefixes: Vec::new(), abs: false })
 }
 
 /// 文字の上で畳んでも Linux と同じ答えになるパス: 名前のあとの .. がなく (先頭の .. は基準のディレクトリを戻る
@@ -2328,6 +2352,14 @@ fn walk(mut start: Option<(InodeRef, String)>, mut path: String, follow: bool, t
                     start = Some((cur.clone(), walked.clone()));
                     target.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/")
                 } else {
+                    // プロセスの根から: 答えは根で変わる (chroot の中では覚えない。failfs の根なら通れない)
+                    if crate::proc::failfs_root() {
+                        return Err(-EOPNOTSUPP);
+                    }
+                    t.abs = true;
+                    if crate::proc::chrooted() {
+                        t.ok = false;
+                    }
                     normalize(&walked, &target)
                 };
                 for rest in &comps[i + 1..] {
@@ -2404,6 +2436,7 @@ fn cached_at_by<T>(dir: &InodeRef, dir_path: &str, path: &str, follow: bool, wal
     if let Some(e) = cache.get_mut(PathKeyRef::new(mnt, norm, follow).key())
         && e.fresh()
         && e.gates.len() >= g0
+        && !(e.abs && crate::proc::chrooted())
     {
         PATHS_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         e.used = true;
@@ -2540,11 +2573,14 @@ fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() { name.to_string() } else { alloc::format!("{}/{}", dir, name) }
 }
 
-/// プロセスのルート (chroot。なければ名前空間のルート)
+/// プロセスのルート (chroot。なければ名前空間のルート)。failfs の根は通れない (EOPNOTSUPP)
 fn proc_root() -> Result<Step, i64> {
     let r = crate::proc::current_root();
     if r.is_empty() {
         return Ok((String::new(), cross(root()), false));
+    }
+    if r == FAILFS {
+        return Err(-EOPNOTSUPP);
     }
     let (p, i) = lookup("", &r, true)?;
     Ok((p, i, false))
@@ -2553,9 +2589,12 @@ fn proc_root() -> Result<Step, i64> {
 /// ディレクトリのパス (たどったあとのもの) と、その上のディレクトリをみな。いちばん上はプロセスのルート (パスが
 /// ルートの外なら (chroot の前に開いたもの)、名前空間のルート。normalize と同じく、そこからは .. で上に出る)
 fn chain(path: &str) -> Result<Vec<Step>, i64> {
-    let r = proc_root()?;
-    let inside = r.0.is_empty() || path == r.0 || path.starts_with(&alloc::format!("{}/", r.0));
-    let (rest, mut out) = if inside { (&path[r.0.len()..], alloc::vec![r]) } else { (path, alloc::vec![(String::new(), cross(root()), false)]) };
+    // failfs の根なら、どのパスも根の外
+    let r = if crate::proc::failfs_root() { None } else { Some(proc_root()?) };
+    let (rest, mut out) = match r {
+        Some(r) if r.0.is_empty() || path == r.0 || path.starts_with(&alloc::format!("{}/", r.0)) => (&path[r.0.len()..], alloc::vec![r]),
+        _ => (path, alloc::vec![(String::new(), cross(root()), false)]),
+    };
     for c in rest.split('/').filter(|c| !c.is_empty()) {
         let (w, cur) = out.last().map(|s| (s.0.clone(), s.1.clone())).unwrap();
         let raw = cur.lookup(c)?;

@@ -1431,6 +1431,16 @@ pub fn current_root() -> String {
     }
 }
 
+/// chroot しているか (根が本当のルートでない。current_root のように写さずに)
+pub fn chrooted() -> bool {
+    cur().is_some_and(|i| !procs()[i].files().root.is_empty())
+}
+
+/// 根が failfs (fchroot の FD_FAILFS_ROOT: vfs::FAILFS) か
+pub fn failfs_root() -> bool {
+    cur().is_some_and(|i| procs()[i].files().root == crate::vfs::FAILFS)
+}
+
 pub fn nprocs() -> usize {
     live().filter(|p| p.state != State::Unused).count()
 }

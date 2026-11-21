@@ -1584,7 +1584,12 @@ impl Inode for ProcInode {
             }
             Node::Cwd(pid) => Ok(format!("/{}", leader(pid)?.files().cwd)),
             // chroot していれば、その場所 (pidof はこれが自分と同じものだけ探す)
-            Node::RootLink(pid) => Ok(format!("/{}", leader(pid)?.files().root)),
+            // failfs の根 (fchroot の FD_FAILFS_ROOT) は Linux の failfs_dname と同じ名前
+            Node::RootLink(pid) => {
+                let l = leader(pid)?;
+                let root = &l.files().root;
+                Ok(if root == crate::vfs::FAILFS { "failfs:/".into() } else { format!("/{}", root) })
+            }
             Node::Exe(pid) => {
                 let p = leader(pid)?;
                 // カーネルのスレッドにはプログラムがない (Linux も ENOENT)

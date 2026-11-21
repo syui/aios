@@ -2765,12 +2765,17 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
 
 pub fn getcwd(buf: usize, len: usize) -> R {
     let files = proc::current().files();
-    // chroot の中ではルートからのパス
-    let cwd = match files.cwd.strip_prefix(files.root.as_str()) {
-        Some(c) if !files.root.is_empty() && (c.is_empty() || c.starts_with('/')) => String::from(c.trim_start_matches('/')),
-        _ => files.cwd.clone(),
+    // chroot の中ではルートからのパス。根の外 (chroot の前の cwd、failfs の根) は、本当のルートからのパスの前に
+    // "(unreachable)" (Linux と同じ。glibc はこれを見て、自分で .. をたどりなおす)
+    let (cwd, out_of_root) = match files.cwd.strip_prefix(files.root.as_str()) {
+        _ if files.root.is_empty() => (files.cwd.clone(), false),
+        Some(c) if c.is_empty() || c.starts_with('/') => (String::from(c.trim_start_matches('/')), false),
+        _ => (files.cwd.clone(), true),
     };
-    let mut s = Vec::with_capacity(cwd.len() + 2);
+    let mut s = Vec::with_capacity(cwd.len() + 15);
+    if out_of_root {
+        s.extend_from_slice(b"(unreachable)");
+    }
     s.push(b'/');
     s.extend_from_slice(cwd.as_bytes());
     s.push(0);
@@ -2798,19 +2803,64 @@ pub fn chdir(pathp: usize) -> R {
 /// 見えかたが変わるだけ。LSM は聞く)
 pub fn chroot(pathp: usize) -> R {
     let path = user_str(pathp)?;
-    let c = cred::current();
-    let may = if c.ns.user.is_some() { crate::security::capable(c, cred::CAP_SYS_CHROOT, true) } else { c.capable(cred::CAP_SYS_CHROOT) };
-    // 砂場 (landlock) の中でもできる (Linux の landlock は chroot を見ない: 書けるところは inode で決まるので変わらない)。
-    // aibox --image は seccomp で止める (chroot だけの container の外へ出られないように)
-    if !may {
-        return Err(-cred::EPERM);
-    }
     let files = proc::current().files();
+    // Linux と同じ順: 引く、ディレクトリか、通れるか (MAY_EXEC)、CAP_SYS_CHROOT
     let (full, ino) = vfs::lookup(&files.cwd, &path, true)?;
     if !ino.meta().is_dir() {
         return Err(-ENOTDIR);
     }
+    cred::current().check(&ino.meta(), PX)?;
+    // 砂場 (landlock) の中でもできる (Linux の landlock は chroot を見ない: 書けるところは inode で決まるので変わらない)。
+    // aibox --image は seccomp で止める (chroot だけの container の外へ出られないように)
+    if !may_chroot(cred::current()) {
+        return Err(-cred::EPERM);
+    }
     files.set_root(full);
+    Ok(0)
+}
+
+/// CAP_SYS_CHROOT があるか (いまのユーザーの namespace の中で: Linux の ns_capable(current_user_ns(), ...))
+fn may_chroot(c: &Cred) -> bool {
+    if c.ns.user.is_some() { crate::security::capable(c, cred::CAP_SYS_CHROOT, true) } else { c.capable(cred::CAP_SYS_CHROOT) }
+}
+
+/// fchroot(fd, flags) (Linux 7.4): 開いているディレクトリ (O_PATH でもよい) を根に。fd が FD_FAILFS_ROOT なら、なにも
+/// 見えない根 (vfs::FAILFS: 絶対パスはみな EOPNOTSUPP)。こちらは CAP_SYS_CHROOT がなくても、no_new_privs で (でなければ
+/// EPERM)、表をほかのスレッドと分けておらず (EINVAL: 分けた人が setuid のプログラムを動かせる)、chroot の中でなければ
+/// (EPERM: 前の根の .. の止めがなくなる) できる
+pub fn fchroot(fd: i64, flags: u64) -> R {
+    const FD_FAILFS_ROOT: i64 = -10004;
+    if flags != 0 {
+        return Err(crate::why::inval());
+    }
+    let p = proc::current();
+    let root = if fd == FD_FAILFS_ROOT {
+        let c = cred::current();
+        if !may_chroot(c) {
+            if !c.no_new_privs {
+                return Err(-cred::EPERM);
+            }
+            if !p.files.as_ref().is_some_and(|f| f.private()) {
+                return Err(crate::why::inval());
+            }
+            if proc::chrooted() {
+                return Err(-cred::EPERM);
+            }
+        }
+        String::from(vfs::FAILFS)
+    } else {
+        let f = file_of(fd as u64)?;
+        let (ino, path) = match &f.borrow().kind {
+            Kind::Inode(i, p) if i.meta().is_dir() => (i.clone(), String::from(p.trim_matches('/'))),
+            _ => return Err(-ENOTDIR),
+        };
+        cred::current().check(&ino.meta(), PX)?;
+        if !may_chroot(cred::current()) {
+            return Err(-cred::EPERM);
+        }
+        path
+    };
+    p.files().set_root(root);
     Ok(0)
 }
 
