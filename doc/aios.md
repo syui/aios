@@ -783,6 +783,11 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   attr はそのまま開く)。OPEN_TREE_CLONE なら写したはなれたマウントに印をつけ (AT_RECURSIVE なら下のものにも)、move_mount
   で置くと mountinfo にその印 (もとはそのまま)。CLONE でなければ、印は置いてあるマウントそのものに (マウントの根で
   なければ EINVAL)。attr がなければ open_tree と同じ (open_tree はこれを attr なしで呼ぶ)
+- remap_file_pages (Linux 4.0 からは mmap でまねるもの。syscall.rs、test/remapfp.c、tmpfs と ext4 で Linux と 14 行同じ):
+  Linux の mm/mmap.c と同じ順で prot (0 でなければ EINVAL)、start と size をページに落として長さ 0・あふれ・pgoff の
+  あふれは EINVAL、頭の領域が MAP_SHARED のファイルでなければ EINVAL、LSM、範囲がすきまなく同じファイル・同じ印の領域
+  (前に写しなおして分かれたものも) でなければ EINVAL、封じた領域は EPERM。そこをファイルの pgoff から mmap の MAP_FIXED
+  と同じ道で写しなおす (prot と mlock は領域のもの、MAP_NONBLOCK でなければ先に読む)。/proc/PID/maps の位置も
 - listns (Linux 6.19、7.4 の形。ns.rs、test/listns.c、root で Linux と 21 行同じ) と nsfs の ioctl: namespace の番号 (Linux
   の ns_id。ns::ns_id) は、はじめのものが Linux と同じ 1〜8 (ipc 1、uts 2、user 3、pid 4、net 7、mnt 8)、新しいものは作った
   順に 10 から (unshare の作る順も Linux の create_new_namespaces と同じ mnt、uts、ipc、pid、net に)。listns は使われて
@@ -828,7 +833,7 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   あとの write もそこに足さない)、あいた箱の分だけ入れ、とちゅうでさわれなければそこまで、読み手がいなければ EPIPE と
   SIGPIPE。読める口ならパイプから手もとへ (入っている分を入れ物に順に)。待つのは SPLICE_F_NONBLOCK がないときだけで、
   fd の O_NONBLOCK は見ない (Linux と同じ)。入れるのはそのときの写し (aios がえらんだちがい vmsplice-snapshot)
-- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、file_getattr・file_setattr など
+- のこり (Linux にあって aios で ENOSYS): ptrace、file_getattr・file_setattr など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

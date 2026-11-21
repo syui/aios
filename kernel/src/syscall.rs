@@ -281,6 +281,7 @@ nrs! {
     MSYNC = 227,
     MINCORE = 232,
     MADVISE = 233,
+    REMAP_FILE_PAGES = 234,
     // NUMA (メモリをどのノードに置くか)。aios はノードが 1 つなので、Linux の NUMA なしと同じく何もせず成功
     MBIND = 235,
     GET_MEMPOLICY = 236,
@@ -643,6 +644,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         FUTEX_WAIT2 => crate::futex::wait2(a[0] as usize, a[1], a[2], a[3] as u32, a[4] as usize, a[5] as i32),
         FUTEX_REQUEUE2 => crate::futex::requeue2(a[0] as usize, a[1] as u32, a[2] as i32, a[3] as i32),
         MSEAL => sys_mseal(a[0] as usize, a[1] as usize, a[2]),
+        REMAP_FILE_PAGES => sys_remap_file_pages(a[0] as usize, a[1] as usize, a[2], a[3] as usize, a[4]),
         PROCESS_MADVISE => sys_process_madvise(int(a[0]), a[1] as usize, a[2] as usize, a[3] as i32 as i64 as u64, a[4] as u32 as u64),
         PROCESS_MRELEASE => crate::pidfd::mrelease(int(a[0]), a[1] as u32 as u64),
         SETNS => crate::ns::setns(int(a[0]), a[1] as u32 as u64),
@@ -2112,6 +2114,61 @@ fn sys_mseal(addr: usize, len: usize, flags: u64) -> R {
         return Ok(0);
     }
     proc::current().pt().seal(addr, end).map(|_| 0)
+}
+
+/// remap_file_pages (Linux 4.0 からは mmap でまねるもの: mm/mmap.c。Linux の順): prot が 0 でなければ EINVAL、start と
+/// size をページに落とし、size が 0 かあふれる、pgoff があふれるなら EINVAL、start の領域が MAP_SHARED のファイルでなければ
+/// EINVAL、LSM (security_mmap_file)、範囲がすきまなく同じファイル・同じ印の領域 (前に写しなおして分かれたものも) で
+/// なければ EINVAL、封じた領域は EPERM (do_mmap)。そこをファイルの pgoff から MAP_SHARED | MAP_FIXED | MAP_POPULATE で
+/// 写しなおす (prot と mlock は領域のもの。MAP_NONBLOCK なら先に読まない。ほかの flags は見ない)
+fn sys_remap_file_pages(start: usize, size: usize, prot: u64, pgoff: usize, flags: u64) -> R {
+    if prot != 0 {
+        return Err(crate::why::inval());
+    }
+    let (start, size) = (start & !0xfff, size & !0xfff);
+    let end = match start.checked_add(size) {
+        Some(e) if e > start => e,
+        _ => return Err(crate::why::inval()),
+    };
+    if pgoff.checked_add(size >> 12).is_none() {
+        return Err(crate::why::inval());
+    }
+    let p = proc::current();
+    let m = p.mm();
+    // 領域の印 (Linux の vm_flags: これがみな同じ領域だけをまたげる)
+    let key = |v: &crate::vm::Vma| (v.prot, v.shared, v.locked, v.onfault, v.wipe, v.droppable, v.dontcopy, v.sealed);
+    let (ino, name, vprot, locked, k0) = {
+        let Some((_, v)) = m.pt.find(start) else { return Err(crate::why::inval()) };
+        let Backing::File { ino, .. } = &v.back else { return Err(crate::why::inval()) };
+        if !v.shared {
+            return Err(crate::why::inval());
+        }
+        (ino.clone(), v.name.clone(), v.prot, v.locked, key(v))
+    };
+    if let Some(n) = &name {
+        crate::security::mmap_file(n, vprot as u64, false, ino.meta().uid)?;
+    }
+    let mut cur = start;
+    while cur < end {
+        let Some((_, v)) = m.pt.find(cur) else { return Err(crate::why::inval()) };
+        if !matches!(&v.back, Backing::File { ino: i, .. } if i.id() == ino.id()) || key(v) != k0 {
+            return Err(crate::why::inval());
+        }
+        cur = v.end;
+    }
+    if m.pt.sealed_in(start, end) {
+        return Err(-EPERM);
+    }
+    let back = Backing::File { ino: ino.clone(), off: pgoff * 4096, fend: usize::MAX, ver: crate::vm::file_ver(&ino) };
+    m.pt.map(start, end, vprot, true, back).ok_or(-ENOMEM)?;
+    if let Some(n) = name {
+        m.pt.set_name(start, &n);
+    }
+    let populate = flags & MAP_NONBLOCK == 0;
+    if locked || populate {
+        lock_new(m, start, size, if locked { 1 } else { 0 }, populate);
+    }
+    Ok(0)
 }
 
 /// mremap: 領域の大きさを変える (縮める、その場で伸ばす、MREMAP_MAYMOVE なら別の場所へ写す)。
