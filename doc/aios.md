@@ -777,6 +777,12 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   noexec (exec は EACCES、実行できるように写すと EPERM)、nodev (デバイスを開くと EACCES)、nosuid (exec の setuid と
   setgid を見ない)。ないもの: 伝わり方 (受けるだけ)、idmap のマウント、MOVE_MOUNT_BENEATH、FSMOUNT_NAMESPACE、
   nosymfollow をまもること、fsmount の口が開いているあいだの umount の EBUSY (aios の口のパスは "\0mnt:N" のまま)
+- open_tree_attr (Linux 6.15。newmount.rs、test/opentreeattr.c、root で Linux と 9 行同じ): open_tree と、写した
+  マウントへの mount_setattr を 1 回で。Linux の順で、attr がないのに大きさがあれば EINVAL、open_tree のたしかめ (flags、
+  CLONE は EPERM、たどる)、それから attr を mount_setattr と同じに (read_attr: E2BIG、EINVAL、EPERM、EFAULT。なにもしない
+  attr はそのまま開く)。OPEN_TREE_CLONE なら写したはなれたマウントに印をつけ (AT_RECURSIVE なら下のものにも)、move_mount
+  で置くと mountinfo にその印 (もとはそのまま)。CLONE でなければ、印は置いてあるマウントそのものに (マウントの根で
+  なければ EINVAL)。attr がなければ open_tree と同じ (open_tree はこれを attr なしで呼ぶ)
 - 使っているマウントの umount (vfs::umount、test/umountbusy.c、root で Linux と 15 行同じ): Linux の do_umount と
   propagate_mount_busy のように、下のマウントがある (重ねたものも) か、その namespace のプロセスが中のものを使っていれば
   EBUSY。使っているものは proc::each_path_in_mnt: 開いたファイル (O_PATH も、マウントの根のディレクトリも。ほかの
@@ -795,7 +801,7 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   あとの write もそこに足さない)、あいた箱の分だけ入れ、とちゅうでさわれなければそこまで、読み手がいなければ EPIPE と
   SIGPIPE。読める口ならパイプから手もとへ (入っている分を入れ物に順に)。待つのは SPLICE_F_NONBLOCK がないときだけで、
   fd の O_NONBLOCK は見ない (Linux と同じ)。入れるのはそのときの写し (aios がえらんだちがい vmsplice-snapshot)
-- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、open_tree_attr、statmount、listmount、file_getattr・file_setattr、listns など
+- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、statmount、listmount、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の

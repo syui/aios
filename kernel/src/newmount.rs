@@ -1,5 +1,5 @@
 // 新しい mount の API (Linux 5.2: fs/fsopen.c と fs/namespace.c): fsopen、fsconfig、fsmount、fspick、open_tree、
-// move_mount、mount_setattr
+// move_mount、mount_setattr。open_tree_attr (Linux 6.15: open_tree と、写したマウントへの mount_setattr を 1 回で)
 //
 //   fsopen("tmpfs") でファイルシステムをつくる口 (fs のコンテキスト: Kind::Ops の FsCtx) を開き、fsconfig で値を入れ
 //   (知らないものは EINVAL で、口を read すると "e tmpfs: Unknown parameter 'x'" の理由)、FSCONFIG_CMD_CREATE で作る。
@@ -325,10 +325,20 @@ fn fspick(dfd: i64, pathp: usize, flags: u64) -> Result<i64, i64> {
     ctx_fd(FsCtx::new(fstype, Phase::Reconf, Some(root)), flags & CLOEXEC != 0)
 }
 
-/// open_tree(dfd, path, flags) (Linux の vfs_open_tree: flags、AT_RECURSIVE は OPEN_TREE_CLONE とだけ EINVAL、CLONE は
-/// マウントしてよいか EPERM、たどる)。CLONE ならそこを写したはなれたマウント、でなければそこの O_PATH の口
+/// open_tree(dfd, path, flags): attr のない open_tree_attr
 fn open_tree(dfd: i64, pathp: usize, flags: u64) -> Result<i64, i64> {
+    open_tree_attr(dfd, pathp, flags, 0, 0)
+}
+
+/// open_tree_attr(dfd, path, flags, attr, size) (Linux 6.15。Linux の順: attr がないのに size があれば EINVAL、
+/// vfs_open_tree (flags、AT_RECURSIVE は OPEN_TREE_CLONE とだけ EINVAL、CLONE はマウントしてよいか EPERM、たどる)、
+/// それから attr (read_attr)。CLONE ならそこを写したはなれたマウントに印をつけ (AT_RECURSIVE なら下のものにも)、その口。
+/// でなければ、印があればそこのマウントそのものにつけ (マウントの根でなければ EINVAL)、そこの O_PATH の口
+fn open_tree_attr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) -> Result<i64, i64> {
     const CLONE: u64 = 1;
+    if attrp == 0 && size != 0 {
+        return Err(crate::why::inval());
+    }
     if flags & !(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | CLONE | O_CLOEXEC) != 0 || flags & (AT_RECURSIVE | CLONE) == AT_RECURSIVE {
         return Err(crate::why::inval());
     }
@@ -337,11 +347,22 @@ fn open_tree(dfd: i64, pathp: usize, flags: u64) -> Result<i64, i64> {
         may_mount()?;
     }
     let (full, ino, _) = path_of(dfd, &user_str(pathp)?, flags & AT_SYMLINK_NOFOLLOW == 0, flags & AT_EMPTY_PATH != 0)?;
+    let attr = if attrp != 0 { read_attr(attrp, size)? } else { None };
     let cloexec = flags & O_CLOEXEC != 0;
     if !clone {
+        if let Some((set, clr)) = attr {
+            if !vfs::mount_root(&full).is_some_and(|(r, _)| r.id() == ino.id()) {
+                return Err(crate::why::inval());
+            }
+            vfs::set_mount_attrs(&full, set, clr, false)?;
+        }
         return path_fd(ino, full, cloexec).map(|(fd, _)| fd);
     }
-    let id = vfs::detached_clone(&full, ino.clone(), flags & AT_RECURSIVE != 0)?;
+    let recursive = flags & AT_RECURSIVE != 0;
+    let id = vfs::detached_clone(&full, ino.clone(), recursive)?;
+    if let Some((set, clr)) = attr {
+        vfs::set_mount_attrs(&vfs::detached_path(id), set, clr, recursive)?;
+    }
     let (fd, file) = path_fd(ino, vfs::detached_path(id), cloexec)?;
     vfs::detached_file(id, &file);
     Ok(fd)
@@ -387,14 +408,12 @@ fn move_mount(fdfd: i64, fpathp: usize, tdfd: i64, tpathp: usize, flags: u64) ->
     Ok(0)
 }
 
-/// mount_setattr(dfd, path, flags, attr, size) (Linux の順: flags EINVAL、大きすぎる E2BIG、小さい EINVAL、EPERM、写す
-/// (知らないところが 0 でなければ E2BIG)、なにもしなければ 0、印のたしかめ (伝わり方は 1 つ、atime は ATTR_ATIME を
-/// clr にして set に 1 つ) EINVAL、たどる、マウントの根でなければ EINVAL)
-fn mount_setattr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) -> Result<i64, i64> {
+/// mount_attr を読んでたしかめる (Linux の wants_mount_setattr と build_mount_kattr の順): 大きすぎる E2BIG、小さい
+/// EINVAL、マウントしてよいか EPERM、写す EFAULT (知らないところが 0 でなければ E2BIG)、なにもしなければ None、印の
+/// たしかめ (伝わり方は 1 つ、atime は ATTR_ATIME を clr にして set に 1 つ) EINVAL、idmap のマウントはない (EINVAL)。
+/// (つける印, 外す印)
+fn read_attr(attrp: usize, size: usize) -> Result<Option<(u32, u32)>, i64> {
     const PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
-    if flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
-        return Err(crate::why::inval());
-    }
     if size > 4096 {
         return Err(-E2BIG);
     }
@@ -410,12 +429,12 @@ fn mount_setattr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) 
     let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     let (set, clr, prop) = (w(0), w(1), w(2));
     if set == 0 && clr == 0 && prop == 0 {
-        return Ok(0);
+        return Ok(None);
     }
     if prop & !PROPAGATION != 0 || prop.count_ones() > 1 || (set | clr) & !(ATTR_VALID | ATTR_IDMAP) as u64 != 0 {
         return Err(crate::why::inval());
     }
-    let (mut set, mut clr) = (set as u32, clr as u32);
+    let (set, clr) = (set as u32, clr as u32);
     if clr & vfs::ATTR_ATIME != 0 {
         if clr & vfs::ATTR_ATIME != vfs::ATTR_ATIME || !matches!(set & vfs::ATTR_ATIME, 0 | vfs::ATTR_NOATIME | vfs::ATTR_STRICTATIME) {
             return Err(crate::why::inval());
@@ -423,12 +442,19 @@ fn mount_setattr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) 
     } else if set & vfs::ATTR_ATIME != 0 {
         return Err(crate::why::inval());
     }
-    // idmap のマウントはない
     if set & ATTR_IDMAP != 0 {
         return Err(crate::why::inval());
     }
-    set &= !ATTR_IDMAP;
-    clr &= !ATTR_IDMAP;
+    Ok(Some((set & !ATTR_IDMAP, clr & !ATTR_IDMAP)))
+}
+
+/// mount_setattr(dfd, path, flags, attr, size) (Linux の順: flags EINVAL、attr (read_attr。なにもしなければ 0)、たどる、
+/// マウントの根でなければ EINVAL)
+fn mount_setattr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) -> Result<i64, i64> {
+    if flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
+        return Err(crate::why::inval());
+    }
+    let Some((set, clr)) = read_attr(attrp, size)? else { return Ok(0) };
     let (full, ino, _) = path_of(dfd, &user_str(pathp)?, flags & AT_SYMLINK_NOFOLLOW == 0, flags & AT_EMPTY_PATH != 0)?;
     if !vfs::mount_root(&full).is_some_and(|(r, _)| r.id() == ino.id()) {
         return Err(crate::why::inval());
@@ -440,7 +466,7 @@ fn mount_setattr(dfd: i64, pathp: usize, flags: u64, attrp: usize, size: usize) 
 /// システムコール (main.rs が syscall::register で置く)
 pub const SYSCALLS: &[u64] = {
     use crate::syscall::nr::*;
-    &[OPEN_TREE, MOVE_MOUNT, FSOPEN, FSCONFIG, FSMOUNT, FSPICK, MOUNT_SETATTR]
+    &[OPEN_TREE, MOVE_MOUNT, FSOPEN, FSCONFIG, FSMOUNT, FSPICK, MOUNT_SETATTR, OPEN_TREE_ATTR]
 };
 
 pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
@@ -454,6 +480,7 @@ pub fn sys(n: u64, a: &[u64; 6]) -> Result<i64, i64> {
         OPEN_TREE => open_tree(int(a[0]), a[1] as usize, a[2] as u32 as u64),
         MOVE_MOUNT => move_mount(int(a[0]), a[1] as usize, int(a[2]), a[3] as usize, a[4] as u32 as u64),
         MOUNT_SETATTR => mount_setattr(int(a[0]), a[1] as usize, a[2] as u32 as u64, a[3] as usize, a[4] as usize),
+        OPEN_TREE_ATTR => open_tree_attr(int(a[0]), a[1] as usize, a[2] as u32 as u64, a[3] as usize, a[4] as usize),
         _ => Err(-38),
     }
 }
