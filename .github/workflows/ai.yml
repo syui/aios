@@ -88,7 +88,7 @@ jobs:
           courier)
             pw="ci-$(openssl rand -hex 8)"
             docker network create ai-ci
-            docker run -d --name database --network ai-ci -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=courier postgres:18-alpine
+            docker run -d --name database --network ai-ci -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=courier postgres:19-alpine
             for i in $(seq 1 30); do docker exec database pg_isready -U postgres -d courier && break; sleep 2; done
             $run --name courier --network ai-ci -p 127.0.0.1:3300:3300 \
               -e COURIER_DB_POSTGRES_URL="postgres://postgres:$pw@database/courier" -e COURIER_API_KEY="ci-$(openssl rand -hex 8)" aios-courier:ci

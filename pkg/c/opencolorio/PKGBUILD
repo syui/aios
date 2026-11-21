@@ -7,7 +7,7 @@
 #   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
 pkgname=opencolorio
 pkgver=2.5.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Color management framework for visual effects and animation (static, for aios)'
 arch=('aarch64')
 url='https://opencolorio.org/'

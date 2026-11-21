@@ -15,12 +15,12 @@ pw=atpw
 up() {
   sudo ap -Syu --noconfirm >/dev/null 2>&1
   sudo ap -Sy --noconfirm nodejs git base-devel python >/dev/null 2>&1
-  for i in aios-postgres:18.7 aios-redis:8.10.3 aios-node:latest; do ap image pull ghcr.io/syui/$i 2>&1 | tail -1; done
+  for i in aios-postgres:19.0 aios-redis:8.10.3 aios-node:latest; do ap image pull ghcr.io/syui/$i 2>&1 | tail -1; done
   mkdir -p ~/at/data/postgres ~/at/data/redis ~/at/configs/postgres/init ~/at/build
   printf 'CREATE DATABASE plc;\nCREATE DATABASE bgs;\nCREATE DATABASE carstore;\nCREATE DATABASE bsky;\n' > ~/at/configs/postgres/init/init.sql
   (aibox -b ~/at/data/postgres:/var/lib/postgresql -b ~/at/configs/postgres/init:/docker-entrypoint-initdb.d:ro \
     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=$pw -e POSTGRES_DB=healthcheck \
-    --image ghcr.io/syui/aios-postgres:18.7 > ~/at/pg.log 2>&1 &)
+    --image ghcr.io/syui/aios-postgres:19.0 > ~/at/pg.log 2>&1 &)
   (aibox -b ~/at/data/redis:/data --image ghcr.io/syui/aios-redis:8.10.3 > ~/at/redis.log 2>&1 &)
   [ -x ~/.local/bin/pnpm ] || npm install -g --prefix ~/.local pnpm@11.11.0 > ~/at/pnpm-i.log 2>&1
   cd ~/at/build

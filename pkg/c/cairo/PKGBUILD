@@ -20,7 +20,7 @@ prepare() {
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  meson_cross zlib libpng freetype2 expat fontconfig pixman pcre2 libffi glib2
+  meson_cross zlib libpng brotli freetype2 expat fontconfig pixman pcre2 libffi glib2
   cd "cairo-$pkgver"
   meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dxlib=disabled -Dxcb=disabled -Dquartz=disabled -Dtee=disabled -Dpng=enabled -Dfreetype=enabled -Dfontconfig=enabled -Dglib=enabled -Dspectre=disabled -Dtests=disabled -Dzlib=enabled -Dgtk_doc=false -Dsymbol-lookup=disabled -Dlzo=disabled

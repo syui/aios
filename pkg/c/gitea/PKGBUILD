@@ -2,7 +2,7 @@
 #   (sha256 を確かめて) /opt/c/bin/gitea に入れる (nodejs と同じ形)。うごくときに git を使う (aios の git パッケージ)。
 #   container image は image/gitea.json (ghcr.io/syui/aios-gitea)。版は dl.gitea.com の version.json を pkg_check が見る
 pkgname=gitea
-pkgver=28.3.0
+pkgver=28.4.0
 pkgrel=1
 _latest_url=https://dl.gitea.com/gitea/version.json
 _latest_regex='"version":"([0-9]+[.][0-9]+[.][0-9]+)"'
@@ -13,7 +13,7 @@ license=('MIT')
 depends=('git')
 source=("https://dl.gitea.com/gitea/$pkgver/gitea-$pkgver-linux-arm64.xz"
         "gitea-$pkgver-LICENSE::https://raw.githubusercontent.com/go-gitea/gitea/v$pkgver/LICENSE")
-sha256sums=('c11d54a5e07ad47e5f84aa4e169d6645542fdea56943fd7e1176602db0c5a076'
+sha256sums=('b33a221b9d970a262fc71bbb6e993ad5c4549ed597f078c04ea2112900280a0c'
             'ed2f10a9d78b8c6c9ef33f1420d0eb266981891caf2f15d630553f02dc60d3ae')
 
 package() {

@@ -13,7 +13,7 @@
 #   ビルドには cmake、ninja、qemu-aarch64、wayland-scanner が要る。4 コアで数時間
 pkgname=blender
 pkgver=5.3.0
-pkgrel=1
+pkgrel=2
 _eigen=8a1083e9bf41b91fdea6546681f806154efdc25a
 _sse2neon=227cc413fb2d50b2a10073087be96b59d5364aea
 pkgdesc='Free and open source 3D creation suite (Wayland and OpenGL, for aios)'

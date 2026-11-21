@@ -5,7 +5,7 @@
     "/lib/ld-musl-aarch64.so.1",
     "/etc/ld-musl-aarch64.path",
     "/opt/c/lib/libpq.so.5",
-    "/opt/c/lib/libpq.so.5.18",
+    "/opt/c/lib/libpq.so.5.19",
     "/opt/c/lib/libz.so.1",
     "/opt/c/lib/libz.so.1.4",
     "/opt/c/lib/libzstd.so.1",
@@ -51,7 +51,7 @@
     "WorkingDir": "/var/lib/postgresql",
     "Env": [
       "PATH=/opt/c/bin:/usr/bin",
-      "PGDATA=/var/lib/postgresql/18/docker",
+      "PGDATA=/var/lib/postgresql/19/docker",
       "LANG=C.UTF-8"
     ],
     "ExposedPorts": {"5432/tcp": {}},

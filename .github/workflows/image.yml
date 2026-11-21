@@ -212,7 +212,7 @@ jobs:
       - name: Test postgres
         run: |
           # 公式の postgres と同じ約束: POSTGRES_USER / PASSWORD / DB、/docker-entrypoint-initdb.d の .sql (ai/at の
-          # configs/postgres/init/init.sql と同じく DB を作る)、PGDATA は /var/lib/postgresql/18/docker
+          # configs/postgres/init/init.sql と同じく DB を作る)、PGDATA は /var/lib/postgresql/19/docker
           mkdir -p out/pginit
           printf 'CREATE DATABASE plc;\nCREATE DATABASE bsky;\n' > out/pginit/init.sql
           pw="ci-$(openssl rand -hex 8)"
@@ -269,7 +269,7 @@ jobs:
           dc exec -T redis redis-cli bgsave
           for i in $(seq 1 20); do dc exec -T redis redis-cli info persistence | grep -q 'rdb_bgsave_in_progress:0' && break; sleep 1; done
           dc exec -T redis redis-cli info persistence | grep 'rdb_last_bgsave_status:ok'
-          sudo ls -ln $c/data/redis/dump.rdb $c/data/postgres/18/docker/PG_VERSION
+          sudo ls -ln $c/data/redis/dump.rdb $c/data/postgres/19/docker/PG_VERSION
           for s in database redis; do
             docker inspect -f "$s user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} cap_drop={{.HostConfig.CapDrop}}" "$(dc ps -q $s)" | tee -a out/compose-inspect.log
           done

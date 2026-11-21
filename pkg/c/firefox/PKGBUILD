@@ -6,7 +6,7 @@
 #   ディスクは 15GB ほど、時間は 4 コアで数時間
 #   musl のためのパッチは Alpine Linux (aports/community/firefox) のものを使わせてもらっている
 pkgname=firefox
-pkgver=160.0
+pkgver=160.0.1
 pkgrel=1
 pkgdesc='Mozilla Firefox web browser (Wayland only, for aios)'
 arch=('aarch64')
@@ -24,7 +24,7 @@ source=("https://archive.mozilla.org/pub/firefox/releases/$pkgver/source/firefox
         aios-configure.patch
         wayland-without-dbus.patch
         aios-prefs.js)
-sha256sums=('2b23d2bf6716ea16b45c10aa5c275c78a1d7ff50ad53150809ab27424c58fd81'
+sha256sums=('7b9d95ddf24f7bbf5d0d05698bc02a66dac1eca438f80e093c5c76af7648b06d'
             SKIP SKIP SKIP SKIP SKIP SKIP)
 
 # ビルドするマシンの LLVM (clang-20 / llvm-20 があればそれ)
@@ -90,7 +90,7 @@ SH
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols alsa-lib
+  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman brotli freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols alsa-lib
   local root=$srcdir/sysroot tc=$srcdir/tc zlib z d
   unset CPPFLAGS LDFLAGS CFLAGS CXXFLAGS CC CXX AR RANLIB
   mkdir -p "$tc"

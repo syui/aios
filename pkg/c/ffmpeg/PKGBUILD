@@ -2,8 +2,8 @@
 #   Firefox は H.264 や AAC をこれで読む (dlopen)。外のライブラリは使わない (zlib と ALSA だけ)。LGPL のまま
 #   Zig (aarch64-linux-musl) と configure でクロスビルドする。/opt/c に入る
 pkgname=ffmpeg
-pkgver=9.0.2
-pkgrel=3
+pkgver=9.1
+pkgrel=1
 pkgdesc='Complete solution to record, convert and stream audio and video: libav* and ffmpeg, ffprobe (shared, for aios)'
 arch=('aarch64')
 url='https://ffmpeg.org/'
@@ -11,7 +11,7 @@ license=('LGPL-2.1-or-later')
 depends=('musl' 'zlib' 'alsa-lib')
 makedepends=('clang' 'llvm')
 source=("https://ffmpeg.org/releases/ffmpeg-$pkgver.tar.xz")
-sha256sums=('8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e')
+sha256sums=('1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433')
 
 # ビルドするマシンの clang と LLVM の道具
 _host_llvm=${HOST_LLVM:-20}

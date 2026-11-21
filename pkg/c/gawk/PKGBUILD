@@ -3,8 +3,8 @@
 #   (provides / conflicts / replaces: ap -Syu で入れかわる。/opt/c/bin/awk は gawk へのリンク)
 #   Zig (aarch64-linux-musl) でクロスビルドして静的に /opt/c に入る (動的な拡張は使わない)
 pkgname=gawk
-pkgver=5.4.1
-pkgrel=4
+pkgver=5.4.2
+pkgrel=1
 pkgdesc='GNU version of awk, as awk (static, for aios)'
 arch=('aarch64')
 url='https://www.gnu.org/software/gawk/'
@@ -13,7 +13,7 @@ provides=('awk')
 conflicts=('awk')
 replaces=('awk')
 source=("https://ftp.gnu.org/gnu/gawk/gawk-$pkgver.tar.xz")
-sha256sums=('07f6f7342b7febe4313fc2c2542ad93d64fe20ad8717200109f105a826f5fd37')
+sha256sums=('b95e4909533b5f988c6b5e5539b3b3ddf76e7d7df02ca2e5b5b7d6f62db78e6a')
 
 prepare() {
   rm -rf "gawk-$pkgver"

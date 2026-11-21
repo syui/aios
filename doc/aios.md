@@ -472,9 +472,9 @@ docker compose build && docker compose up -d                      # envs/ と co
 - aios の VM でも did-method-plc を pnpm install と tsc の build、モックの DB の PlcServer で DID を作ってハンドルを変える
   まで通った
 - database と redis は aios の image (ghcr.io/syui/aios-postgres、aios-redis。digest で固める。2026-11-13)。公式の
-  postgres:18-alpine と redis:alpine は root で起きて data を chown してから下りるが、aios のものははじめから 65532 で、
+  postgres:19-alpine と redis:alpine は root で起きて data を chown してから下りるが、aios のものははじめから 65532 で、
   cap もいらない (compose は cap_drop: ALL)。そのかわり data/postgres と data/redis は 65532 のものにしておく (公式の
-  alpine の Postgres で作ったデータ (uid 70) を使うときも chown -R。どちらも PostgreSQL 18 と musl)。image.yml は
+  alpine の Postgres で作ったデータ (uid 70) を使うときも chown -R。どちらも PostgreSQL 19 と musl)。image.yml は
   compose.yml そのもの (image だけその場で作ったもの) で database と redis を docker compose up --wait し、init.sql の DB、
   TCP の scram (まちがったパスワードは断る)、redis の BGSAVE が data/redis に書けること、65532・読むだけの根・cap なしを
   たしかめる。plc のテストの Postgres も aios-postgres。ここで aish (image の /bin/sh) の set -e のちがいが出た:
@@ -515,8 +515,8 @@ Postgres といっしょに起こして表 (device_tokens) ができたかを見
   (compose.yml の redis は bsky が depends_on するだけ) が、使えるように。aios の VM で PING、SET / GET、BGSAVE (fork)、
   redis-benchmark まで。起きるときに fork した子の /proc/self/smaps の Shared_Dirty を見る (arm64 の古いカーネルの
   バグのたしかめ) ので、smaps を足した (下)
-- postgresql (pkg/c/postgresql、PostgreSQL 18.7): 拡張を dlopen で読むので musl に動的に (zlib、zstd、OpenSSL。contrib も:
-  bsky が pg_trgm を使う)。18 の tar には bison と flex の出力がないので作るマシンのものを、タイムゾーンの表は作るマシンの
+- postgresql (pkg/c/postgresql、PostgreSQL 19.0。2026-11-21 に 18.7 から): 拡張を dlopen で読むので musl に動的に (zlib、zstd、OpenSSL。contrib も:
+  bsky が pg_trgm を使う)。18 からの tar には bison と flex の出力がないので作るマシンのものを、タイムゾーンの表は作るマシンの
   zic で。postgres は自分の関数を拡張に見せる (--export-dynamic) が、configure はクロスでは試せずに落とすので make に
   LDFLAGS_EX_BE でわたす (18.7-2。なければ initdb が dict_snowball.so で palloc0: symbol not found)。aios の上でも動く
   (2026-11-13): initdb、pg_ctl start / stop、psql (Unix ソケットと TCP の scram)、CREATE DATABASE、pg_trgm、起こし

@@ -2,8 +2,8 @@
 # uv: Python のパッケージと Python そのものを入れる (uv python install で 3.15 (0.13 からの既定) など
 # python-build-standalone の aarch64-musl の Python が来る。Python を C からビルドしなくてよい)
 pkgname=uv
-pkgver=0.13.7
-pkgrel=2
+pkgver=0.13.9
+pkgrel=1
 pkgdesc='An extremely fast Python package and project manager, written in Rust'
 arch=('aarch64')
 url='https://github.com/astral-sh/uv'
@@ -38,7 +38,8 @@ build() {
   # uv-python-managed の zstd 0.13 (zstd-safe 7) は直った版がない (0.14 から) が、あてはまらない: 使うのは
   # read::Decoder::with_buffer と write::Encoder::new だけ (with_context は使わない)、default-features = false なので
   # legacy と seekable の機能は入らない
-  cargo_update rustls@0.23.46 rustls-webpki@0.103.16 h2@0.4.20 memmap2@0.9.11 event-listener@5.4.2 zstd@0.14.3 zstd-safe@8.2.0 ctutils@0.4.4
+  # quinn-proto (RUSTSEC-2026-0523 RUSTSEC-2026-0524) と quinn-udp (RUSTSEC-2026-0538) も (0.13.9 の Cargo.lock は 0.11.18 と 0.5.15)
+  cargo_update rustls@0.23.46 rustls-webpki@0.103.16 h2@0.4.20 memmap2@0.9.11 event-listener@5.4.2 zstd@0.14.3 zstd-safe@8.2.0 ctutils@0.4.4 quinn-proto@0.11.19 quinn-udp@0.5.16
   musl_build --bin uv --bin uvx
 }
 

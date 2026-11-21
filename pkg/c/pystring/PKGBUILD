@@ -3,7 +3,7 @@
 #   で直に作って libpystring.a と pystring/pystring.h を /opt/c に入れる (OpenColorIO の Findpystring が探す形)
 #   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
 pkgname=pystring
-pkgver=1.1.3
+pkgver=1.1.5
 pkgrel=1
 pkgdesc='C++ functions matching the interface and behavior of Python string methods (static, for aios)'
 arch=('aarch64')

@@ -3,15 +3,15 @@
 # CMake だけで作る (libmbedcrypto.a は TF-PSA-Crypto のものを同じ名前で入れる。curl はそのままつながる)
 # 静的なライブラリ (libmbedtls.a, libmbedx509.a, libmbedcrypto.a) とヘッダーを /opt/c に入れる
 pkgname=mbedtls
-pkgver=4.2.0
-pkgrel=4
+pkgver=4.3.0
+pkgrel=1
 pkgdesc='Small TLS library (static, for aios)'
 arch=('aarch64')
 url='https://www.trustedfirmware.org/projects/mbed-tls/'
 makedepends=('cmake' 'ninja')
 license=('Apache-2.0 OR GPL-2.0-or-later')
 source=("https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$pkgver/mbedtls-$pkgver.tar.bz2")
-sha256sums=('2bed9d713b4668f76553b097e72b8aa30bc8f112a940d7ae228d524bbde6ffea')
+sha256sums=('1c87cba094cb40f097ebe0eba440a74939b71dab4e1d0d566bc90749ff381d18')
 
 prepare() {
   rm -rf "mbedtls-$pkgver"

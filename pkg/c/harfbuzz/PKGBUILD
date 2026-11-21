@@ -2,15 +2,15 @@
 #   pkg/c/meson.sh の meson_cross で、Zig (aarch64-linux-musl) と meson でクロスビルドする。/opt/c に入る
 #   ビルドには meson、ninja、qemu-aarch64 (途中で aios 用のものを動かす) が要る
 pkgname=harfbuzz
-pkgver=15.1.0
-pkgrel=2
+pkgver=15.2.0
+pkgrel=1
 pkgdesc='OpenType text shaping engine (shared, for aios)'
 arch=('aarch64')
 license=('MIT')
 depends=('musl' 'freetype2' 'glib2')
 makedepends=('meson' 'ninja' 'qemu-user')
 source=("https://github.com/harfbuzz/harfbuzz/releases/download/$pkgver/harfbuzz-$pkgver.tar.xz")
-sha256sums=('0fc7c565443a5f4be7da65ac5ee5bd737d9b158dc908708b7689a0a5796b0c8d')
+sha256sums=('e2ec49090744383cdbe7df808c1cedaafba06a97be8dc4211fe546ba585f12cb')
 
 prepare() {
   rm -rf "harfbuzz-$pkgver"
@@ -20,7 +20,7 @@ prepare() {
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  meson_cross zlib libpng freetype2 pcre2 libffi glib2
+  meson_cross zlib libpng brotli freetype2 pcre2 libffi glib2
   cd "harfbuzz-$pkgver"
   meson setup build --wrap-mode=nofallback --cross-file "$srcdir/cross.ini" --prefix="$PREFIX" --libdir=lib --buildtype=release \
     -Dfreetype=enabled -Dglib=enabled -Dgobject=enabled -Dicu=disabled -Dcairo=disabled -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled -Dutilities=disabled -Dbenchmark=disabled
