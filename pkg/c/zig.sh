@@ -149,22 +149,35 @@ zig_env() {
 # c_deps NAME...: ほかの C のパッケージ (repo/aarch64/c/NAME-*.pkg.tar.zst、なければ作る) を
 # $srcdir/sysroot に広げ、そこの include と lib を CPPFLAGS / LDFLAGS / PKG_CONFIG に足す
 # (makepkg の makedepends の代わり。ビルドするマシンの /opt/c は触らない)
-# 広げた版は $srcdir/.c_deps に NAME=VER-REL で書きとめる。mkpkg.sh が .PKGINFO の makedepend にし、aish の pkg_check が
-# それより新しいライブラリがあれば rebuild に出す (静的にリンクしたものは、作りなおすまで古いままなので)
+# それぞれの依存 (.PKGINFO の depend) もたどって広げる (Alpine の -dev が依存の -dev を連れてくるのと同じ): .pc の
+# Requires.private にある依存の依存 (freetype2 の libbrotlidec など) がないと、pkg-config が --cflags でもことわるので
+# 広げた版は $srcdir/.c_deps に NAME=VER-REL で書きとめる (名前をあげたものだけ)。mkpkg.sh が .PKGINFO の makedepend にし、
+# aish の pkg_check がそれより新しいライブラリがあれば rebuild に出す (静的にリンクしたものは、作りなおすまで古いままなので)
 c_deps() {
-  local top root n f
+  local top root n f d queue seen=" " named=" $* "
   top=$(cd "$startdir/../../.." && pwd)
   root=$srcdir/sysroot
   rm -rf "$root"
   mkdir -p "$root"
   : > "$srcdir/.c_deps"
-  for n in "$@"; do
+  queue="$*"
+  while [ -n "$queue" ]; do
+    n=${queue%% *}
+    [ "$n" = "$queue" ] && queue= || queue=${queue#* }
+    case "$seen" in *" $n "*) continue ;; esac
+    seen="$seen$n "
     f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst 2>/dev/null | head -1)
     if [ -z "$f" ]; then
+      # たどった依存で C のパッケージでないもの (ca-certificates など) はとばす。名前をあげたものはなければ作る
+      case "$named" in *" $n "*) ;; *) [ -d "$top/pkg/c/$n" ] || continue ;; esac
       "$top/bin/mkpkg.sh" "$top/pkg/c/$n" >&2
       f=$(ls "$top/repo/aarch64/c/$n"-[0-9]*-[0-9]*-*.pkg.tar.zst | head -1)
     fi
     zstd -dcq "$f" | tar -xf - -C "$root" --exclude=.PKGINFO
+    for d in $(zstd -dcq "$f" | tar -xOf - .PKGINFO | sed -n 's/^depend = \([^<>=]*\).*/\1/p'); do
+      queue="${queue:+$queue }$d"
+    done
+    case "$named" in *" $n "*) ;; *) continue ;; esac
     # NAME-VER-REL-ARCH.pkg.tar.zst → NAME=VER-REL
     f=${f##*/}
     f=${f%-*.pkg.tar.zst}

@@ -90,7 +90,7 @@ SH
 build() {
   . "$startdir/../zig.sh"
   zig_env
-  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman brotli freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols alsa-lib
+  c_deps musl zlib libffi wayland libxkbcommon pcre2 glib2 libpng expat fribidi pixman freetype2 harfbuzz fontconfig cairo pango gdk-pixbuf2 atk libepoxy gtk3 egl-headers wayland-protocols alsa-lib
   local root=$srcdir/sysroot tc=$srcdir/tc zlib z d
   unset CPPFLAGS LDFLAGS CFLAGS CXXFLAGS CC CXX AR RANLIB
   mkdir -p "$tc"

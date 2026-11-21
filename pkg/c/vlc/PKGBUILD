@@ -39,7 +39,7 @@ build() {
   . "$startdir/../zig.sh"
   zig_env
   # ncurses は静的 (PIC) で、ncurses のプラグインの中に入る
-  c_deps zlib ffmpeg alsa-lib libffi pcre2 glib2 wayland wayland-protocols brotli freetype2 fribidi harfbuzz fontconfig libpng expat ncurses
+  c_deps zlib ffmpeg alsa-lib libffi pcre2 glib2 wayland wayland-protocols freetype2 fribidi harfbuzz fontconfig libpng expat ncurses
   shared_env
   # zig は __DATE__ と __TIME__ をエラーにする (-Wdate-time。VLC は vlc --version に作った日を出す)
   # -fPIC: プログラム (vlc、vlc-cache-gen) も。PIC でないと stderr や __stack_chk_guard を COPY の再配置で

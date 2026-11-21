@@ -118,6 +118,10 @@ pkg_update。
 - 中にまるごと入っているライブラリ (静的リンク。`c_deps` のもの) の見はり: 作るときに入れた版を `.PKGINFO` の
   `makedepend = NAME=VER-REL` に残し (zig.sh の `c_deps` と mkpkg.sh)、`pkg_check` はそれより新しいライブラリがあるものを
   `rebuild` に出す (`pkg_edit` の `rebuild` → build → test → push)。
+- `c_deps` は名前をあげたものの依存 (`.PKGINFO` の `depend`) もたどって sysroot に広げる (Alpine の -dev が依存の -dev を
+  連れてくるのと同じ)。`.pc` の `Requires.private` にある依存の依存がないと、pkg-config は `--cflags` でもことわる
+  (2026-11-21: freetype2 を brotli つきにしたら、freetype2 を使う fontconfig、cairo、firefox などがみな作れなくなって
+  いた)。`makedepend` に残すのは名前をあげたものだけ
 - 新しい版のあるライブラリには、それを入れているもの (`embedded in: ...`)、`pkg_build` の答えにも作りなおすもの (`rebuild`)。
 - 作った Zig も `makedepend = zig=ZIG_VERSION-ZIG_REL` に残し (zig.sh の `zig_env`。`ZIG_REL` は zig_fix_libc の直しの回)、
   いまの zig.sh とちがうもので作ったものも `rebuild` に出す (古い libc.so の見本でリンクしたもののように、
