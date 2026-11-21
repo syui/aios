@@ -1,30 +1,27 @@
 # xkeyboard-config: キーボードの配列のデータ (xkb)。/usr/share/X11/xkb に入る
 #   libxkbcommon が名前 (us、jp など) からキーマップを組み立てるのに使う (GTK は起動のときに使う)
 #   データだけなので、このマシンの meson でそのまま入れる
+#   2.49 から x.org に tarball を置かなくなった (お知らせは git のタグだけ) ので、Arch と同じく git のタグから作る
 pkgname=xkeyboard-config
-pkgver=2.48
-pkgrel=2
+pkgver=2.49
+pkgrel=1
 pkgdesc='X keyboard configuration files (xkb data, used by libxkbcommon)'
 arch=('any')
 url='https://www.freedesktop.org/wiki/Software/XKeyboardConfig/'
 license=('HPND' 'MIT')
 makedepends=('meson' 'ninja' 'python')
-source=("https://www.x.org/releases/individual/data/xkeyboard-config/xkeyboard-config-$pkgver.tar.xz")
-sha256sums=('b77041324f0109f77161ee43743fe04baa485866af8460d31e476ad3f7648fd5')
-
-prepare() {
-  rm -rf "xkeyboard-config-$pkgver"
-  tar -xf "xkeyboard-config-$pkgver.tar.xz"
-}
+source=("xkeyboard-config::git+https://gitlab.freedesktop.org/xkeyboard-config/xkeyboard-config.git#tag=xkeyboard-config-$pkgver")
+sha256sums=('SKIP')
 
 build() {
-  cd "xkeyboard-config-$pkgver"
+  cd xkeyboard-config
+  rm -rf build
   meson setup build --wrap-mode=nofallback --prefix=/usr -Dxorg-rules-symlinks=false -Dnls=false
   ninja -C build
 }
 
 package() {
-  cd "xkeyboard-config-$pkgver"
+  cd xkeyboard-config
   DESTDIR="$pkgdir" ninja -C build install
   rm -rf "$pkgdir/usr/share/man"
   # 2.48 からデータは /usr/share/xkeyboard-config-2 で、/usr/share/X11/xkb はそこへのリンク。
