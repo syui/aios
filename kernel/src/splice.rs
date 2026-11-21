@@ -1,4 +1,4 @@
-// splice、tee、sendfile、copy_file_range (Linux の fs/splice.c と、fs/read_write.c の do_sendfile と vfs_copy_file_range)。
+// splice、vmsplice、tee、sendfile、copy_file_range (Linux の fs/splice.c と、fs/read_write.c の do_sendfile と vfs_copy_file_range)。
 // パイプの箱をじかにあやつるもの (Linux の fs/splice.c が include/linux/pipe_fs_i.h の形で pipe_inode_info を見るのと同じく、
 // file::Pipe の中を見る) もここ。パイプそのものは file.rs (Linux の fs/pipe.c)。main.rs が syscall::register と
 // syscall::register_fast_splice (大きなロックなしの splice) でつなぐ
@@ -16,7 +16,7 @@ const EFAULT: i64 = 14;
 
 pub const SYSCALLS: &[u64] = {
     use crate::syscall::nr::*;
-    &[SENDFILE, SPLICE, TEE, COPY_FILE_RANGE]
+    &[SENDFILE, VMSPLICE, SPLICE, TEE, COPY_FILE_RANGE]
 };
 
 pub fn sys(n: u64, a: &[u64; 6]) -> R {
@@ -25,6 +25,7 @@ pub fn sys(n: u64, a: &[u64; 6]) -> R {
         SENDFILE => sendfile(a[0], a[1], a[2] as usize, a[3] as usize),
         COPY_FILE_RANGE => copy_file_range(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
         SPLICE => splice(a[0], a[1] as usize, a[2], a[3] as usize, a[4] as usize, a[5]),
+        VMSPLICE => vmsplice(a[0], a[1] as usize, a[2] as usize, a[3]),
         TEE => tee(a[0], a[1], a[2] as usize, a[3]),
         _ => Err(-38),
     }
@@ -130,6 +131,115 @@ fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, fl
         }
         (None, None) => Err(crate::why::inval()),
     }
+}
+
+/// Linux の arm64 の TASK_SIZE_MAX (48 ビットの VA): access_ok がこれより上を EFAULT にする
+const TASK_SIZE_MAX: usize = 1 << 48;
+
+/// vmsplice(2) (Linux の fs/splice.c の vmsplice、vmsplice_type、import_iovec の順): flags (SPLICE_F_ALL のほか
+/// は EINVAL)、fd (開いていない・O_PATH・読めも書けもしない口は EBADF)、iovec (1024 こより多い・長さが負は EINVAL、
+/// iovec か入れ物がユーザーの場所の外なら EFAULT)。長さの和が 0 なら 0 (パイプでなくても)。パイプでなければ EBADF。
+/// 書ける口なら手もとのメモリをパイプへ (vmsplice_to_pipe)、ほかは (読める口) パイプから手もとへ (vmsplice_to_user)。
+/// 待つのは SPLICE_F_NONBLOCK がないときだけ (fd の O_NONBLOCK は見ない。Linux と同じ)。
+/// aios がえらんだちがい (vmsplice-snapshot): Linux はユーザーのページそのものを箱に入れる (あとでそのメモリを変えると、
+/// 読む前ならパイプの中身も変わる。SPLICE_F_GIFT のページは読み手に移せる) が、aios は vmsplice のときに写す
+fn vmsplice(fd: u64, iov: usize, nr_segs: usize, flags: u64) -> R {
+    let flags = flags as u32 as u64;
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(crate::why::inval());
+    }
+    let f = file_of(fd as u32 as u64)?;
+    let to_pipe = {
+        let b = f.borrow();
+        if b.writable() {
+            true
+        } else if b.readable() {
+            false
+        } else {
+            return Err(-EBADF);
+        }
+    };
+    let v = crate::sysfile::iovecs(iov, nr_segs)?;
+    let total = crate::sysfile::iov_total(&v)?;
+    if v.iter().any(|&(b, l)| l > TASK_SIZE_MAX || b > TASK_SIZE_MAX - l) {
+        return Err(-EFAULT);
+    }
+    if total == 0 {
+        return Ok(0);
+    }
+    let p = match &f.borrow().kind {
+        Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => p.clone(),
+        _ => return Err(-EBADF),
+    };
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    let n = if to_pipe { vmsplice_to_pipe(&p, &v, nonblock)? } else { vmsplice_to_user(&p, &v, total, nonblock)? };
+    Ok(n as i64)
+}
+
+/// 手もとのメモリをパイプへ (Linux の vmsplice_to_pipe と iter_to_pipe): 箱があくのを待ち (読み手がいなければ EPIPE と
+/// SIGPIPE)、入れ物を順に、その 1 ページの中のかけらごとに足さない箱ひとつへ (同じページでも入れ物がちがえば別の箱)。
+/// 箱がいっぱいになったらそこまで。さわれないところに来たら、それまでに入れた分 (なければ EFAULT)
+fn vmsplice_to_pipe(p: &Rc<PipeCell>, v: &[(usize, usize)], nonblock: bool) -> Result<usize, i64> {
+    if let Err(e) = Pipe::wait_space(p, nonblock) {
+        if e == -EPIPE {
+            sigpipe();
+        }
+        return Err(e);
+    }
+    let mut buf = uninit(PGSIZE)?;
+    let mut total = 0;
+    'segs: for &(base, len) in v {
+        let mut off = 0;
+        while off < len {
+            let va = base + off;
+            let k = (PGSIZE - va % PGSIZE).min(len - off);
+            if p.borrow().full() {
+                break 'segs;
+            }
+            if proc::current().pt().copy_in(&mut buf[..k], va).is_none() {
+                if total == 0 {
+                    return Err(-EFAULT);
+                }
+                break 'segs;
+            }
+            let n = Pipe::splice_in(p, va as u64, &buf[..k]);
+            total += n;
+            if n < k {
+                break 'segs;
+            }
+            off += k;
+        }
+    }
+    Ok(total)
+}
+
+/// パイプから手もとへ (Linux の vmsplice_to_user と __splice_from_pipe、pipe_to_user): 中身が来るまで待ち (書き手が
+/// いなければ 0、nonblock は EAGAIN)、入っている分を入れ物に順に写して、写せた分を読み減らす (書き手を起こす)。
+/// さわれない入れ物に来たら、それまでの分 (なければ EFAULT。中身は残る)
+fn vmsplice_to_user(p: &Rc<PipeCell>, v: &[(usize, usize)], total: usize, nonblock: bool) -> Result<usize, i64> {
+    let data = Pipe::peek_wait(p, total, nonblock)?;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let mut done = 0;
+    for &(base, len) in v {
+        let k = len.min(data.len() - done);
+        if k == 0 {
+            if done == data.len() {
+                break;
+            }
+            continue;
+        }
+        if proc::current().pt().copy_out(base, &data[done..done + k]).is_none() {
+            break;
+        }
+        done += k;
+    }
+    if done == 0 {
+        return Err(-EFAULT);
+    }
+    Pipe::discard(p, done, true)?;
+    Ok(done)
 }
 
 /// パイプ a の中身を fo の pos へ len バイトまで書く (Linux の iter_file_splice_write): 中身が来るまで待ち (書き手が

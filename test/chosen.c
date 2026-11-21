@@ -237,6 +237,30 @@ static void splice_snapshot(void) {
     rm(".ch-ss2");
 }
 
+static void vmsplice_snapshot(void) {
+    // "abc" を vmsplice でパイプに入れてから、そのメモリを "XYZ" に書きかえる。パイプから読むと、aios は入れたときの
+    // 写し (abc)。Linux はページそのものを入れているので、書きかえたもの (XYZ) が見える
+    char got[200], b[8] = {0};
+    char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int p[2];
+    if (m == MAP_FAILED || pipe(p) != 0) {
+        printf("FAIL vmsplice-snapshot (%s): mmap or pipe\n", dir);
+        fails++;
+        return;
+    }
+    memcpy(m, "abc", 3);
+    struct iovec v = {m, 3};
+    long r = vmsplice(p[1], &v, 1, 0);
+    int e = errno;
+    memcpy(m, "XYZ", 3);
+    long n = read(p[0], b, 3);
+    snprintf(got, sizeof got, "vmsplice = %ld%s%s, read %ld: %.3s", r, r < 0 ? " " : "", r < 0 ? strerror(e) : "", n, b);
+    check("vmsplice-snapshot", r == 3 && n == 3 && !memcmp(b, "abc", 3), r == 3 && n == 3 && !memcmp(b, "XYZ", 3), got);
+    close(p[0]);
+    close(p[1]);
+    munmap(m, 4096);
+}
+
 #ifndef SYS_preadv2
 #if defined(__x86_64__)
 #define SYS_preadv2 327
@@ -606,6 +630,7 @@ int main(int argc, char **argv) {
         // ファイルシステムによらないもの
         if (i == 1) {
             select_ebadf();
+            vmsplice_snapshot();
             lock_deadlock();
             recvmmsg_timeout();
             send_notconn();

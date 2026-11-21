@@ -777,7 +777,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   noexec (exec は EACCES、実行できるように写すと EPERM)、nodev (デバイスを開くと EACCES)、nosuid (exec の setuid と
   setgid を見ない)。ないもの: 伝わり方 (受けるだけ)、idmap のマウント、MOVE_MOUNT_BENEATH、FSMOUNT_NAMESPACE、
   nosymfollow をまもること、使っているマウントの umount の EBUSY (Linux は開いている口や cwd があれば EBUSY)
-- のこり (Linux にあって aios で ENOSYS): ptrace、vmsplice、remap_file_pages、open_tree_attr、statmount、listmount、file_getattr・file_setattr、listns など
+- vmsplice (splice.rs、extra。test/vmsplice.c、Linux と 23 行同じ): Linux の fs/splice.c と同じ順で flags (SPLICE_F_ALL
+  のほかは EINVAL)、fd (開いていない・O_PATH・読めも書けもしない口は EBADF)、iovec (1024 まで、長さが負は EINVAL、
+  ユーザーの場所の外は EFAULT) を見て、長さの和が 0 なら 0 (パイプでなくても)、パイプでなければ EBADF。書ける口なら
+  手もとのメモリをパイプへ: 入れ物の 1 ページの中のかけらごとに足さない箱ひとつ (同じページでも入れ物がちがえば別の箱、
+  あとの write もそこに足さない)、あいた箱の分だけ入れ、とちゅうでさわれなければそこまで、読み手がいなければ EPIPE と
+  SIGPIPE。読める口ならパイプから手もとへ (入っている分を入れ物に順に)。待つのは SPLICE_F_NONBLOCK がないときだけで、
+  fd の O_NONBLOCK は見ない (Linux と同じ)。入れるのはそのときの写し (aios がえらんだちがい vmsplice-snapshot)
+- のこり (Linux にあって aios で ENOSYS): ptrace、remap_file_pages、open_tree_attr、statmount、listmount、file_getattr・file_setattr、listns など
 - gcc-libs (pkg/c/gcc-libs、GCC 16.2.0): musl 用の libstdc++.so.6 だけ (binutils と musl の sysroot から GCC のクロスを
   作り、libgcc と libstdc++-v3 まで。Alpine と同じく symvers なし)。libgcc_s.so.1 は libunwind のパッケージ (LLVM の
   libunwind) のものを使う (libstdc++ の外の記号で aios にないのは、なくてもよい WEAK の _ITM_ などだけ)。npm の
@@ -3741,6 +3748,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | zero-range-tmpfs | tmpfs でも fallocate の ZERO_RANGE ができる (0 にして、KEEP_SIZE でなければ大きくする。ext4 と同じ) | tmpfs (shmem) は KEEP_SIZE と PUNCH_HOLE だけで、ZERO_RANGE は EOPNOTSUPP | 使えるかがファイルシステムで変わらない。/tmp でも、穴あけと場所とりの 2 回に分けなくてよい。memfd の封は、書く封 (F_SEAL_WRITE) と大きくする封 (F_SEAL_GROW) を先に両方見る (半分だけ 0 にならない)。ロボットは Linux で、穴をあけてから場所をとってまねる |
 | sendfile-self | 同じファイルの中の sendfile は copy_file_range と同じ決まり: 読みはじめたときの終わりまでを写し、読むところと書くところが重なれば EINVAL | 重なっても写す。読むのがページキャッシュのページそのもの (写しをとらない) なので、同じ回に書いたものが読みにまざり、答えが内側のくぎり (16 ページ) やページのまとまり (folio) の大きさで変わる | 答えがきちんと決まる (同じことをする copy_file_range と同じ決まり)。ロボットは Linux で、長さ 0 の sendfile でほかのしらべをしてから、長さを終わりまでに縮め、重なりを見てまねる |
 | splice-snapshot | ファイルからパイプへの splice / sendfile は、そのときの中身をパイプの箱に写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない | ページキャッシュのページそのものを箱に入れる (写さない)。読む前にファイルが変われば、パイプからもそれが読める。切りつめると、端のページの残りが 0 で読める | パイプに入れたものは、入れたときのもの (cat や cp が、書きかえ中のファイルのまぜこぜを送らない)。aios はもとから写しているので、そのぶん速くもならない。ロボットは Linux で、そのときの中身の写し (名前のないファイル) から入れてまねる |
+| vmsplice-snapshot | vmsplice でパイプに入れるものは、そのときの手もとのメモリの写し。あとでそのメモリを書きかえても、パイプの中身は変わらない | ユーザーのページそのものを箱に入れる (写さない)。読む前に書きかえれば、パイプからもそれが読める (SPLICE_F_GIFT のページは読み手に移せる) | パイプに入れたものは、入れたときのもの (splice-snapshot と同じ)。aios のパイプの箱はいつもカーネルのページで、ユーザーのページを持たない。箱の数え方 (入れ物の 1 ページの中のかけらごとに 1 つ) は Linux と同じ |
 | pipe-fault | パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT) | パイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す) | どこまでできたかがそのまま分かる。ふつうのファイルでは Linux もバイトごとなので、パイプだけ箱ごとなのは中の作りが見えているだけ |
 | pipe-nowait | パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く | splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP | aios のパイプは splice でも写しを入れる (splice-snapshot) ので、読むときに待つことがない。フラグが黙って効かなくなるのは分かりにくい |
 | unix-gc-now | 送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じた、たがいの fd を持ちあって閉じた) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF や ECONNRESET) | ほかの AF_UNIX のソケットが閉じたとき (か、送られている途中のものが多すぎるとき) に、うしろ (kworker) で片づける。それまで輪の中のソケットは生きていて、相手からはつながったまま (読めば EAGAIN、待てばいつまでも) | 答えが、ほかのソケットが閉じたかや、うしろの仕事がいつ走ったかで変わらない。もうだれも使えないソケットに相手が待ちつづけない。ロボットは Linux で、ほかの AF_UNIX のソケットを作って閉じて片づけを起こし、終わるのを待ってまねる |

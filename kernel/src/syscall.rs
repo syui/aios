@@ -136,6 +136,7 @@ nrs! {
     PSELECT6 = 72,
     PPOLL = 73,
     SIGNALFD4 = 74,
+    VMSPLICE = 75,
     SPLICE = 76,
     TEE = 77,
     READLINKAT = 78,

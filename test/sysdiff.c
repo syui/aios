@@ -290,6 +290,7 @@ static const struct {
     {"zero-range-tmpfs", "tmpfs でも fallocate の ZERO_RANGE ができる (ext4 と同じ)。Linux の tmpfs は EOPNOTSUPP"},
     {"sendfile-self", "同じファイルの中の sendfile は copy_file_range と同じ: 読みはじめたときの終わりまでを写し、重なれば EINVAL。Linux は重なっても写し、同じ回に書いたものが読みにまざる"},
     {"splice-snapshot", "ファイルからパイプへの splice / sendfile は、そのときの中身をパイプに写す。あとでファイルを書いたり切りつめたりしても、パイプの中身は変わらない。Linux はページキャッシュのページそのものを入れるので、読む前に変わればそれが読める"},
+    {"vmsplice-snapshot", "vmsplice でパイプに入れるものは、そのときの手もとのメモリの写し。あとでそのメモリを変えても、パイプの中身は変わらない。Linux はユーザーのページそのものを入れるので、読む前に変えればそれが読める"},
     {"pipe-fault", "パイプの readv / writev で途中の入れ物にさわれないとき、さわれる分をみな読み書きしてその数を返す (なにもできなければ EFAULT)。Linux はパイプの箱 (4 KiB) ごとに写し、途中でさわれなくなった箱は捨てる (7 バイトの writev は EFAULT、12000 バイトは 4096。readv は写した分も数えず箱に残す)"},
     {"pipe-nowait", "パイプの preadv2 / pwritev2 の RWF_NOWAIT は、そのパイプを splice や tee に使ったあとも効く (待たない)。Linux は splice に使った (しくじっても) パイプの FMODE_NOWAIT を消すので、それからは EOPNOTSUPP"},
     {"unix-gc-now", "送られている途中の AF_UNIX のソケットの輪 (自分の fd を自分の行列に入れて閉じたものなど) は、fd を閉じたそのシステムコールの終わりに片づける (相手からはすぐ EOF)。Linux はほかの AF_UNIX のソケットが閉じたときに、うしろ (kworker) で片づけるので、それまで相手からはつながったまま"},
