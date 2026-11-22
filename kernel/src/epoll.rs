@@ -387,6 +387,17 @@ pub fn write(e: &EventFdRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     }
 }
 
+/// カーネルから 1 を足す (Linux の eventfd_signal: 数があふれるときは足さない)。DRM の syncobj の EVENTFD
+pub fn signal(e: &EventFdRef) {
+    let mut ev = e.borrow_mut();
+    if ev.count < u64::MAX {
+        ev.count += 1;
+    }
+    ev.generation += 1;
+    proc::wakeup(chan(e));
+    proc::poll_wake(chan(e));
+}
+
 /// いまの数 (/proc/ai/fd)
 pub fn count(e: &EventFdRef) -> u64 {
     e.borrow().count

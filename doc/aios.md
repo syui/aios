@@ -2994,8 +2994,9 @@ GPU で描くには、Linux と同じ DRM (/dev/dri/card0 と /dev/dri/renderD12
 6. atomic (DRM_CLIENT_CAP_ATOMIC: Wayland の compositor の多くが使う) とカーソル (2026-11-14): `test/drmatomic.c` は
    Linux と同じ 39 行。aiwm も DRM の上で (atomic で映し、カーソルは cursor plane)。3D のない virtio-gpu でも
    Linux と同じく /dev/dri を置く (`LINUX_GPU=2d test/drm-linux.sh` の答えと同じ)
-7. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
-8. 本物の機械
+7. syncobj (2026-11-22): fence を入れる箱 (Vulkan と explicit sync の compositor が使う)。`test/drmsyncobj.c` は Linux と同じ
+8. venus (Vulkan を virtio-gpu の上で: blob の資源と host_visible、context_init。QEMU 9.2 から)
+9. 本物の機械
 
 ためすには、ホストに画面 (X か Wayland。なければ Xvfb) を用意して、GL のある画面で起こす: `AIOS_DISPLAY=sdl,gl=on`
 (bin/run.sh は画面に gl=on などがあれば virtio-gpu-gl-device にする)。中で `sudo modprobe virtio_gpu` と `ap -S mesa`。
@@ -3043,9 +3044,29 @@ aios の作り (drm.rs):
   (HOTSPOT_X と HOTSPOT_Y) を言ったときだけ見せる (Linux と同じ)。古い MODE_CURSOR と MODE_CURSOR2 は BO から
   framebuffer を作って plane に (drm_mode_cursor_universal)
 
+- syncobj (syncobj.rs、2026-11-22。Linux の drm_syncobj.c): fence を入れる箱 (2 値と timeline)。DRM_CAP_SYNCOBJ と
+  SYNCOBJ_TIMELINE は 1 (Linux の virtio_gpu は DRIVER_SYNCOBJ と DRIVER_SYNCOBJ_TIMELINE)。CREATE と DESTROY (ハンドルは
+  いちばん小さい空いた番号)、HANDLE_TO_FD と FD_TO_HANDLE (anon_inode:syncobj_file、O_CLOEXEC。EXPORT_SYNC_FILE と
+  IMPORT_SYNC_FILE で sync_file と出し入れ)、WAIT と TIMELINE_WAIT (WAIT_ALL、WAIT_FOR_SUBMIT、WAIT_AVAILABLE、絶対時刻の
+  期限で ETIME、シグナルで EINTR と SA_RESTART のやり直し)、RESET、SIGNAL、TIMELINE_SIGNAL、QUERY (LAST_SUBMITTED)、
+  TRANSFER、EVENTFD と、EXECBUFFER の in (RESET) と out の syncobj。card0 でも使える (DRM_RENDER_ALLOW だけ)。GPU の命令は
+  ホストが終えてから返るので、箱に入る fence はみな終わっている: 待つのは fence が入るまで (ほかのスレッドやプロセスが
+  SIGNAL するまで) だけ。timeline の前の点もみな終わっているので、Linux の dma_fence_chain_walk と同じく、たどるとすぐ消える:
+  箱はいちばん新しい点 (番号、同じ流れの前の点の番号、流れ、中の fence、終わった印) だけを覚える。そこから Linux の細かな
+  答えも同じになる: 前の点を出すと stub の sync_file、新しい点は dma_fence_chain、順でない点を足すと番号は前より小さく
+  ならない、点 0 の TRANSFER は 2 値の箱にも chain のまま入る (QUERY で番号が見える)、WAIT_ALL で待ったときの
+  first_signaled ははじめに見たときのまま (なければ ~0)。終わった fence の名前は Linux 6.17 からの dma_fence_driver_name と
+  dma_fence_timeline_name と同じく detached-driver と signaled-timeline (sync_file の名前は
+  detached-driver-signaled-timeli に切れる)。timeline の点 (dma_fence_chain) は中身が終わっていても、だれかが終わったかを
+  聞くまで印が立たない: ふつうの QUERY、WAIT、poll、置き場なしの FILE_INFO、EVENTFD は聞き、QUERY の LAST_SUBMITTED と
+  WAIT_AVAILABLE は聞かない (名前が dma_fence_chain-unboundN-点 のままか変わるかまで Linux と同じ)。sync_file の MERGE も、
+  終わったものどうしは Linux の dma_fence_unwrap_merge と同じくいちばん遅い時刻の stub 1 つに。test/drmsyncobj.c は Linux
+  (LINUX_GPU=2d と 3D の test/drm-linux.sh) と同じ答え。ひとつだけ: 2 値の箱の HANDLE_TO_FD と FD_TO_HANDLE に点をわたすと、
+  aios は本流の Linux 7.4 と同じく EINVAL (c2d3a7300695)。手本の Alpine の 6.18.64 は 0 (stable に入った 2e3649e23723 を、
+  本流は ee8ade4d9678 でもどした)
+
 Linux とのちがい (いまは): IN_FENCE_FD は -1 と終わった sync_file だけ。FB_DAMAGE_CLIPS は受けとるが、いつも画面ぜんぶを
-写す。syncobj もない (DRM_CAP_SYNCOBJ は 0、その ioctl は
-EOPNOTSUPP。Linux 6.18 の virtio_gpu はある)。画面の大きさが変わったときのできごと (hotplug) もまだ。
+写す。画面の大きさが変わったときのできごと (hotplug) もまだ。
 Linux は命令を出してすぐ返り、fence が終わりを知らせる (aios はホストが終えるまで待つ: CPU と GPU が並んで動かないので、
 たくさん出すものは遅い)。/dev/dri は 0666 (Linux は udev が video / render のグループに)。MAP_PRIVATE の mmap も断らない
 (Linux は EINVAL)

@@ -37,6 +37,7 @@ mod cred;
 mod security;
 mod debug;
 mod drm;
+mod syncobj;
 mod edid;
 mod crypto;
 mod dtb;

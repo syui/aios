@@ -17,13 +17,14 @@
 // 画面に出す KMS (card0 の MODE_*) は kms.rs。card0 をはじめに開いたファイルが master (Linux の drm_master_open)、
 // GET_MAGIC と AUTH_MAGIC、SET_MASTER と DROP_MASTER も Linux と同じ。KMS のできごと (page flip) はファイルの列に入り、
 // read で読む (poll で POLLIN)。PRIME (dma-buf: BO を fd にして、ほかのプロセスや GBM へ) は Linux と同じ答え (DRM_CAP_PRIME は
-// import と export の 3。dma-buf の fd は mmap と DMA_BUF_IOCTL_SYNC。同じファイルにもどせば同じハンドル)。syncobj はまだ
-// (DRM_CAP_SYNCOBJ は 0、その ioctl は EOPNOTSUPP)
+// import と export の 3。dma-buf の fd は mmap と DMA_BUF_IOCTL_SYNC。同じファイルにもどせば同じハンドル)。syncobj
+// (DRM_CAP_SYNCOBJ と SYNCOBJ_TIMELINE は 1。EXECBUFFER の in / out の syncobj も) は syncobj.rs
 use crate::cell::Bkl;
 use crate::file::{self, FileOps, FileRef, Kind};
 use crate::gpu;
 use crate::kalloc;
 use crate::memlayout::{v2p, PGSIZE};
+use crate::syncobj::Fence;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::rc::Rc;
@@ -305,6 +306,17 @@ pub fn init(pa: usize) {
     println!("drm: /dev/dri/card0 and renderD128 (virtio_gpu: {})", if virgl { "virgl" } else { "2D" });
 }
 
+/// 命令の列を写したカーネルのページ (落としたら返す)
+struct Pages(Vec<*mut u8>);
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        for &p in &self.0 {
+            kalloc::put(p);
+        }
+    }
+}
+
 /// 開いた DRM の口 (Linux の drm_file)
 pub struct DrmFile {
     minor: u32,
@@ -313,6 +325,8 @@ pub struct DrmFile {
     /// 開いたプロセス (SET_MASTER: 前に master だったファイルを、同じプロセスがまた master にするとき)
     tgid: u32,
     st: Bkl<State>,
+    /// syncobj のハンドル (syncobj.rs)
+    syncobjs: Bkl<crate::syncobj::Table>,
 }
 
 struct State {
@@ -352,7 +366,7 @@ impl DrmFile {
         }
         let authed = was_master || crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN);
         let st = State { ctx, ctx_made: false, handles: BTreeMap::new(), events: VecDeque::new(), space: 4096, egen: 0, universal: false, aspect: false, stereo: false, atomic: false, writeback: false, hotspot: false, was_master, authed };
-        DrmFile { minor, id, tgid: crate::proc::current().tgid, st: Bkl::new(st) }
+        DrmFile { minor, id, tgid: crate::proc::current().tgid, st: Bkl::new(st), syncobjs: Bkl::new(BTreeMap::new()) }
     }
 
     fn render(&self) -> bool {
@@ -538,8 +552,8 @@ impl DrmFile {
             NR_MODESET_CTL => (8, W, false),
             NR_WAIT_VBLANK | NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => (24, RW, false),
             NR_PRIME_HANDLE_TO_FD | NR_PRIME_FD_TO_HANDLE => (12, RW, true),
-            // syncobj はまだ (GET_CAP で 0 と答えるもの): Linux の、その力のないドライバと同じ EOPNOTSUPP
-            0xbf..=0xc5 | 0xca..=0xcd | 0xcf => return Err(-EOPNOTSUPP),
+            // syncobj (syncobj.rs): render の口でも (DRM_RENDER_ALLOW だけ)
+            n if crate::syncobj::size(n).is_some() => (crate::syncobj::size(n).unwrap_or(0), RW, true),
             // KMS (kms.rs): render の口では使えない
             n if n >= COMMAND_END => match crate::kms::spec(n) {
                 Some((size, dir, _)) => (size, dir, false),
@@ -648,6 +662,7 @@ impl DrmFile {
                 // 命令はホストが終えてから返るので、待つものはない (NOWAIT でも EBUSY にならない)。flags は見ない (Linux 6.18 も)
                 self.bo(le32(a, 0)).map(|_| ()).ok_or(-ENOENT)
             }
+            n if crate::syncobj::size(n).is_some() => crate::syncobj::ioctl(&self.syncobjs, n, a),
             n if n >= COMMAND_END => crate::kms::ioctl(self, n, a),
             // blob の資源と、capset をえらんで作るコンテキストは、デバイスにない (RESOURCE_BLOB、CONTEXT_INIT が 0)
             _ => Err(-EINVAL),
@@ -825,20 +840,13 @@ impl DrmFile {
         if flags & !(FENCE_FD_IN | FENCE_FD_OUT | RING_IDX) != 0 {
             return Err(-EINVAL);
         }
-        // ring はコンテキストを capset で作ったときだけ (CONTEXT_INIT がないので、ない)。syncobj もまだ
-        if flags & RING_IDX != 0 || le32(a, 40) != 0 || le32(a, 44) != 0 {
+        // ring はコンテキストを capset で作ったときだけ (CONTEXT_INIT がないので、ない)
+        if flags & RING_IDX != 0 {
             return Err(-EINVAL);
         }
         let ctx = self.context()?;
         let me = crate::proc::current();
-        // 前の印 (sync_file): どれももう終わっているので、本物かだけを見る
-        if flags & FENCE_FD_IN != 0 {
-            let f = me.files().get(fence_fd as u64).cloned().ok_or(-EINVAL)?;
-            if f.borrow().kind.ops::<SyncFile>().is_none() {
-                return Err(-EINVAL);
-            }
-        }
-        // 命令が使う BO (ホストが終えるまで落とさない)
+        // ここから Linux の virtio_gpu_init_submit と同じ順: 命令が使う BO (ホストが終えるまで落とさない)
         let mut hb = vec![0u8; nh * 4];
         if nh > 0 {
             me.pt().copy_in(&mut hb, handles).ok_or(-EFAULT)?;
@@ -852,39 +860,36 @@ impl DrmFile {
         if n + 2 > 256 {
             return Err(-ENOMEM);
         }
-        let mut pages: Vec<*mut u8> = Vec::with_capacity(n);
-        let free = |pages: Vec<*mut u8>| {
-            for p in pages {
-                kalloc::put(p);
-            }
-        };
+        let mut pages = Pages(Vec::with_capacity(n));
         for i in 0..n {
-            let Some(p) = kalloc::alloc_dirty() else {
-                free(pages);
-                return Err(-ENOMEM);
-            };
-            pages.push(p);
+            let p = kalloc::alloc_dirty().ok_or(-ENOMEM)?;
+            pages.0.push(p);
             let len = (size - i * PGSIZE).min(PGSIZE);
             let b = unsafe { core::slice::from_raw_parts_mut(p, len) };
-            if me.pt().copy_in(b, cmd + i * PGSIZE).is_none() {
-                free(pages);
-                return Err(-EFAULT);
-            }
+            me.pt().copy_in(b, cmd + i * PGSIZE).ok_or(-EFAULT)?;
         }
-        // 終わりの印の fd は先に作っておく (fd が足りなければ出さない: Linux の get_unused_fd_flags)
+        // 終わりの印の fd は先に作っておく (fd が足りなければ出さない: Linux の get_unused_fd_flags)。しくじったら閉じる
         let d = DEV.get();
         d.fence += 1;
         let fence = d.fence;
         let mut out_fd = None;
         if flags & FENCE_FD_OUT != 0 {
-            let sf = SyncFile::new(fence);
-            match me.files().add(file::new(Kind::Ops(Rc::new(sf)), file::O_RDONLY), true, 0) {
-                Some(fd) => out_fd = Some(fd),
-                None => {
-                    free(pages);
-                    return Err(-EMFILE);
-                }
+            let sf = SyncFile::new(Fence::Gpu { seq: fence, ts: 0 });
+            out_fd = Some(me.files().add(file::new(Kind::Ops(Rc::new(sf)), file::O_RDONLY), true, 0).ok_or(-EMFILE)?);
+        }
+        let undo = |e: i64| {
+            if let Some(fd) = out_fd {
+                drop(crate::proc::current().files().set(fd, None));
             }
+            e
+        };
+        // syncobj (out: parse_post_deps、in: parse_deps)。in の fence はみな終わっているので待たない
+        let (stride, n_in, n_out) = (le32(a, 36), le32(a, 40), le32(a, 44));
+        let post = crate::syncobj::exec_out(&self.syncobjs, le64(a, 56), stride, n_out).map_err(undo)?;
+        let reset = crate::syncobj::exec_in(&self.syncobjs, le64(a, 48), stride, n_in).map_err(undo)?;
+        // 前の印 (sync_file): どれももう終わっているので、本物かだけを見る
+        if flags & FENCE_FD_IN != 0 && sync_file_fence(fence_fd).is_none() {
+            return Err(undo(-EINVAL));
         }
         let mut q = gpu::hdr3d(SUBMIT_3D, gpu::FLAG_FENCE, fence, ctx);
         put32(&mut q, size as u32);
@@ -892,9 +897,9 @@ impl DrmFile {
         let g = gpu()?;
         let mut r = [0u8; 24];
         // ホストが描き終えるまで (fence の答え)。大きなロックは放す
-        gpu::unlocked(|| g.call(&q, &pages, size, 24, &mut r));
+        gpu::unlocked(|| g.call(&q, &pages.0, size, 24, &mut r));
         let now = crate::timer::uptime_ns();
-        free(pages);
+        drop(pages);
         drop(bos);
         if let Some(fd) = out_fd {
             if let Some(f) = crate::proc::current().files().get(fd as u64).cloned() {
@@ -903,6 +908,15 @@ impl DrmFile {
                 }
             }
             set32(a, 28, fd as u32);
+        }
+        // out の syncobj に終わった fence を (点があれば timeline に)、それから in の RESET のものを空に (Linux の
+        // process_post_deps と cleanup_submit の順)
+        let done = Fence::Gpu { seq: fence, ts: now };
+        for (s, point) in post {
+            if point != 0 { s.add_point(done.clone(), point) } else { s.replace(Some(done.clone())) }
+        }
+        for s in reset {
+            s.replace(None);
         }
         Ok(())
     }
@@ -949,6 +963,8 @@ impl DrmFile {
             self.ctx_resource(CTX_DETACH_RESOURCE, bo.res);
         }
         drop(handles);
+        // syncobj のハンドルを落とす (drm_syncobj_release。fd にしたものは残る)
+        drop(core::mem::take(self.syncobjs.get()));
         // 映していた framebuffer をとめ、ユーザーの blob を消す (drm_fb_release)
         crate::kms::file_closed(self.id);
         let st = self.st.get();
@@ -999,8 +1015,8 @@ fn get_cap(a: &mut [u8]) -> Result<(), i64> {
         TIMESTAMP_MONOTONIC => 1,
         // DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT
         PRIME => 3,
-        // syncobj はまだ
-        SYNCOBJ | SYNCOBJ_TIMELINE => 0,
+        // syncobj (Linux の virtio_gpu は DRIVER_SYNCOBJ と DRIVER_SYNCOBJ_TIMELINE)
+        SYNCOBJ | SYNCOBJ_TIMELINE => 1,
         c => crate::kms::cap(c)?,
     };
     set64(a, 8, v);
@@ -1185,21 +1201,31 @@ impl FileOps for DmaBuf {
 
 /// 終わりの印 (Linux の sync_file: anon_inode:sync_file)。命令はホストが終えてから返るので、いつも終わっている
 pub struct SyncFile {
-    /// (fence の番号, 終わった時刻 ns)。fence はどれもデバイスの 1 本の流れ (Linux の fence context) のもの
-    fences: Vec<(u64, Cell<u64>)>,
+    /// 中の fence (sync_file_get_fence が返すもの)。EXECBUFFER の印は、ホストが終えたら時刻を書く (signal)
+    fence: core::cell::RefCell<Fence>,
     /// MERGE でつけた名前 (Linux の user_name。なければ fence から作る)
     name: String,
 }
 
+/// fd の sync_file の fence (sync_file_get_fence)。KMS の OUT_FENCE_PTR のもの (kms.rs) は終わった印。ほかは None
+pub fn sync_file_fence(fd: i32) -> Option<Fence> {
+    let f = if fd < 0 { None } else { crate::proc::current().files().get(fd as u64).cloned() }?;
+    let b = f.borrow();
+    match b.kind.ops::<SyncFile>() {
+        Some(sf) => Some(sf.fence.borrow().clone()),
+        None => (b.describe() == "anon_inode:sync_file").then(Fence::now),
+    }
+}
+
 impl SyncFile {
-    fn new(fence: u64) -> SyncFile {
-        SyncFile { fences: vec![(fence, Cell::new(0))], name: String::new() }
+    pub fn new(fence: Fence) -> SyncFile {
+        SyncFile { fence: core::cell::RefCell::new(fence), name: String::new() }
     }
 
     /// 終わった時刻を書く (命令の答えが来たとき)
     fn signal(&self, now: u64) {
-        for f in &self.fences {
-            f.1.set(now);
+        if let Fence::Gpu { ts, .. } = &mut *self.fence.borrow_mut() {
+            *ts = now;
         }
     }
 
@@ -1218,11 +1244,10 @@ impl SyncFile {
                 }
                 let f2 = me.files().get(le32(&m, 32) as u64).cloned().ok_or(-EBADF)?;
                 let other = f2.borrow().kind.ops::<SyncFile>().ok_or(-EINVAL)?;
-                // 同じ流れの fence は、あとのもの 1 つにまとまる (Linux の dma_fence_unwrap_merge)
-                let last = self.fences.iter().chain(other.fences.iter()).max_by_key(|f| f.0).cloned();
+                // どれも終わっているので、いちばん遅い時刻の印 1 つにまとまる (Linux の dma_fence_unwrap_merge)
+                let merged = Fence::merged(&[self.fence.borrow().clone(), other.fence.borrow().clone()]);
                 let n = m[..32].iter().position(|&c| c == 0).unwrap_or(31).min(31);
-                let name = String::from_utf8_lossy(&m[..n]).into_owned();
-                let sf = SyncFile { fences: last.into_iter().collect(), name };
+                let sf = SyncFile { fence: core::cell::RefCell::new(merged), name: String::from_utf8_lossy(&m[..n]).into_owned() };
                 let fd = me.files().add(file::new(Kind::Ops(Rc::new(sf)), file::O_RDONLY), true, 0).ok_or(-EMFILE)?;
                 set32(&mut m, 36, fd as u32);
                 if me.pt().copy_out(arg, &m).is_none() {
@@ -1239,32 +1264,34 @@ impl SyncFile {
                     return Err(-EINVAL);
                 }
                 let (want, buf) = (le32(&i, 40) as usize, le64(&i, 48) as usize);
-                let name = match self.fences.as_slice() {
-                    _ if !self.name.is_empty() => self.name.clone(),
-                    [(seq, _)] => format!("virtio_gpu-controlq1-{}", seq),
-                    _ => "dma_fence_array".into(),
-                };
+                let fence = self.fence.borrow().clone();
+                // 置き場がなければ、全体の status を聞く (dma_fence_get_status: timeline の点にも印が立つ)
+                if want == 0 {
+                    fence.check();
+                }
+                let leaves = fence.leaves();
+                let name = if self.name.is_empty() { fence.name() } else { self.name.clone() };
                 i[..32].fill(0);
                 i[..name.len().min(31)].copy_from_slice(&name.as_bytes()[..name.len().min(31)]);
                 set32(&mut i, 32, 1);
                 if want > 0 {
-                    if want < self.fences.len() {
+                    if want < leaves.len() {
                         return Err(-EINVAL);
                     }
                     // sync_fence_info: obj_name[32], driver_name[32], status, flags, timestamp_ns
-                    let mut out = Vec::with_capacity(self.fences.len() * 80);
-                    for (_, ts) in &self.fences {
-                        let ts = ts.get();
+                    let mut out = Vec::with_capacity(leaves.len() * 80);
+                    for l in &leaves {
+                        let (obj, drv) = l.names();
                         let mut e = [0u8; 80];
-                        e[..8].copy_from_slice(b"controlq");
-                        e[32..42].copy_from_slice(b"virtio_gpu");
+                        e[..obj.len()].copy_from_slice(obj.as_bytes());
+                        e[32..32 + drv.len()].copy_from_slice(drv.as_bytes());
                         set32(&mut e, 64, 1);
-                        set64(&mut e, 72, ts);
+                        set64(&mut e, 72, l.ts());
                         out.extend_from_slice(&e);
                     }
                     me.pt().copy_out(buf, &out).ok_or(-EFAULT)?;
                 }
-                set32(&mut i, 40, self.fences.len() as u32);
+                set32(&mut i, 40, leaves.len() as u32);
                 me.pt().copy_out(arg, &i).ok_or(-EFAULT)?;
                 Ok(0)
             }
@@ -1281,8 +1308,9 @@ impl FileOps for SyncFile {
     fn pollable(&self) -> bool {
         true
     }
-    /// いつも読める (終わっている: POLLIN)
+    /// いつも読める (終わっている: POLLIN)。終わったかを聞くので、timeline の点にも印が立つ (sync_file_poll)
     fn readiness(&self) -> (bool, bool, bool) {
+        self.fence.borrow().check();
         (true, false, false)
     }
     fn poll_keys(&self) -> Option<Vec<usize>> {
