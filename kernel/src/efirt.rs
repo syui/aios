@@ -1,5 +1,5 @@
 // UEFI のランタイムサービス: ExitBootServices のあとも、ファームウェアの変数 (GetVariable、SetVariable、
-// GetNextVariableName、QueryVariableInfo) を呼ぶ (efivarfs.rs が使う。Linux の drivers/firmware/efi/runtime-wrappers.c)
+// GetNextVariableName、QueryVariableInfo) と時計 (GetTime: RTC を ACPI に書かない機械の起動の時刻) を呼ぶ (efivarfs.rs が使う。Linux の drivers/firmware/efi/runtime-wrappers.c)
 //
 // EFI スタブ (efi.rs) が覚えたランタイムの領域 (メモリマップの EFI_MEMORY_RUNTIME) を、物理アドレスと同じ仮想アドレス
 // (1:1) に写した表を作っておき、呼ぶあいだだけ TTBR0 をその表にする (SetVirtualAddressMap は呼ばない: UEFI では、
@@ -26,6 +26,7 @@ pub const ABORTED: Status = ERR | 21;
 pub const SECURITY_VIOLATION: Status = ERR | 26;
 
 // EFI_RUNTIME_SERVICES の中の場所
+const RT_GET_TIME: usize = 0x18;
 const RT_GET_VARIABLE: usize = 0x48;
 const RT_GET_NEXT_VARIABLE_NAME: usize = 0x50;
 const RT_SET_VARIABLE: usize = 0x58;
@@ -173,6 +174,46 @@ fn call(off: usize, a: [usize; 5]) -> Status {
         fp_load(&fp);
     }
     r
+}
+
+/// EFI_TIME (16 バイト)
+#[repr(C, align(8))]
+struct EfiTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    _pad1: u8,
+    nanosecond: u32,
+    _timezone: i16,
+    _daylight: u8,
+    _pad2: u8,
+}
+
+/// GetTime: ファームウェアの時計 (RTC) の時刻を 1970 からの秒に。Linux の rtc-efi と同じく、タイムゾーンと夏時間は見ない
+/// (UTC とみる)。ランタイムサービスがないか、ありえない日時なら None
+pub fn get_time() -> Option<u64> {
+    let mut t = EfiTime { year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, _pad1: 0, nanosecond: 0, _timezone: 0, _daylight: 0, _pad2: 0 };
+    if call(RT_GET_TIME, [&mut t as *mut EfiTime as usize, 0, 0, 0, 0]) != SUCCESS {
+        return None;
+    }
+    epoch_of(t.year as i64, t.month as i64, t.day as i64, t.hour as u64, t.minute as u64, t.second as u64)
+}
+
+/// 日時 (UTC) を 1970 からの秒に (日の数は Howard Hinnant の days_from_civil)。範囲の外は None
+fn epoch_of(y: i64, m: i64, d: i64, hh: u64, mm: u64, ss: u64) -> Option<u64> {
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days as u64 * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 
 /// UEFI の変数の名前 (UTF-16、NUL で終わる) と GUID

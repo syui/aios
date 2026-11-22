@@ -29,6 +29,13 @@ fn rearm() {
 /// settimeofday、clock_settime、adjtimex の ADJ_SETOFFSET で変わる (set_realtime。負にもなりうるので足すのは wrapping)
 static REAL_OFF: AtomicU64 = AtomicU64::new(0);
 
+/// 起動の時刻を RTC (PL031) から読んだか (読めなければカーネルを作った時刻: main.rs が EFI の GetTime で合わせなおす)
+static RTC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn has_rtc() -> bool {
+    RTC.load(Ordering::Relaxed)
+}
+
 pub fn init() {
     // ACPI は PL031 を書かない (Linux は EFI の GetTime): QEMU の表 (OEM が BOCHS) なら virt の決まった場所
     let rtc = if crate::dtb::present() {
@@ -38,6 +45,7 @@ pub fn init() {
     } else {
         Some(0x0901_0000)
     };
+    RTC.store(rtc.is_some(), Ordering::Relaxed);
     let epoch = match rtc {
         Some(pa) => crate::mmio::r32(crate::memlayout::p2v(pa)) as u64,
         None => env!("AIOS_BUILD_EPOCH").parse().unwrap_or(0),

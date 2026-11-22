@@ -227,6 +227,17 @@ pub extern "C" fn kmain() -> ! {
     timer::every(1, posix_timers::tick);
     timer::every(1, timerfd::tick);
     vdso::init();
+    // ACPI の機械は RTC を表に書かない (PL031 は DTB だけ): 読めなければ、時刻は EFI の GetTime から (Linux の rtc-efi)。
+    // QEMU は PL031 も読めるので、ちがいを出す (test/acpi-boot.sh でたしかめる)
+    if has_acpi && let Some(t) = efirt::get_time() {
+        if timer::has_rtc() {
+            let rtc = timer::epoch_ns() / 1_000_000_000;
+            println!("efi: GetTime {} (the RTC says {}, {}s apart)", t, rtc, t.abs_diff(rtc));
+        } else {
+            timer::set_realtime(t * 1_000_000_000);
+            println!("efi: the time is from GetTime ({})", t);
+        }
+    }
     uart::init();
     // 乱数: 起動のときのもと (UEFI がくれたもの、DTB の rng-seed、CPU の RNDR) と、乱数の装置 (virtio-rng かラズパイのもの)。
     // 使う人 (ネット、exec) より前に
