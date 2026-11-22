@@ -551,6 +551,8 @@ pub enum Verdict {
     Trap(u16),
     /// SIGSYS で終わる
     Kill,
+    /// PTRACE_O_TRACESECCOMP の tracer に知らせる (PTRACE_EVENT_SECCOMP、値は GETEVENTMSG に)
+    Trace(u16),
 }
 
 /// システムコール nr (引数 args、呼んだ場所 pc) をしてよいか
@@ -591,7 +593,7 @@ pub fn check(s: &State, nr: u64, args: &[u64; 6], pc: u64) -> Verdict {
             Some(f) => Verdict::Notify(f.clone(), d),
             None => Verdict::Errno(-ENOSYS),
         },
-        RET_TRACE => Verdict::Errno(-ENOSYS),
+        RET_TRACE => Verdict::Trace(data),
         // KILL_THREAD、KILL_PROCESS、知らない答え (Linux は KILL_PROCESS とみなす)
         _ => Verdict::Kill,
     }
@@ -762,6 +764,7 @@ impl crate::security::Seccomp for Ops {
             Verdict::Errno(e) => Permit::Errno(e),
             Verdict::Trap(errno) => Permit::Trap(errno),
             Verdict::Kill => Permit::Kill,
+            Verdict::Trace(data) => Permit::Trace(data),
             Verdict::Notify(f, data) => match notify(&f, data) {
                 Notified::Continue => Permit::Allow,
                 Notified::Return(v) => Permit::Return(v),

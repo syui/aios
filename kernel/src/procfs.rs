@@ -537,7 +537,7 @@ impl ProcInode {
                 let threads = ths.len();
                 // プロセスに来たもの (Linux の shared_pending) は、どのスレッドが持っていてもまとめて ShdPnd に
                 let shared = ths.iter().fold(0, |a, t| a | t.sig_shared);
-                let queued = ths.iter().map(|t| t.sig_pending.count_ones() + t.sig_shared.count_ones()).sum::<u32>();
+                let queued = ths.iter().map(|t| t.sig_pending.count_ones() + t.sig_shared.count_ones() + t.sig_more.len() as u32).sum::<u32>();
                 let sig = crate::signal::status_text(p, shared, queued);
                 status_text(p, threads, &sig)
             }

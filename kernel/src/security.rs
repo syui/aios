@@ -457,6 +457,8 @@ pub enum Permit {
     Trap(u16),
     /// プロセスを止める (SECCOMP_RET_KILL_*)
     Kill,
+    /// tracer に知らせる (SECCOMP_RET_TRACE。値は PTRACE_GETEVENTMSG に)
+    Trace(u16),
     /// listener の答えの値で返す (システムコールはしない)
     Return(i64),
     /// listener を待つあいだにシグナルで割りこまれた (always ならハンドラのあとでもいつもやりなおす)

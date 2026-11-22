@@ -4,6 +4,10 @@ use crate::trap::TrapFrame;
 use alloc::vec::Vec;
 
 pub const NSIG: usize = 65;
+/// RT シグナルのはじめ (カーネルの番号: glibc と musl の SIGRTMIN はここから 2 つか 3 つ先)
+const SIGRTMIN_: i32 = 32;
+/// 1 つのスレッドに並べておく RT シグナルの 2 つめからの数の上限 (Linux は RLIMIT_SIGPENDING: ユーザーごと)
+const RT_QUEUE_MAX: usize = 4096;
 
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
@@ -52,6 +56,11 @@ pub const CLD_TRAPPED: i32 = 4;
 pub const PTRACE_O_TRACESYSGOOD: u32 = 1;
 pub const PTRACE_O_TRACEEXEC: u32 = 0x10;
 pub const PTRACE_O_EXITKILL: u32 = 0x10_0000;
+pub const PTRACE_O_TRACEVFORKDONE: u32 = 0x20;
+pub const PTRACE_O_TRACESECCOMP: u32 = 0x80;
+/// PTRACE_EVENT_VFORK_DONE と PTRACE_EVENT_SECCOMP (status >> 16)
+pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
+pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 /// PTRACE_INTERRUPT の止まり (status >> 16)
 pub const PTRACE_EVENT_STOP: i32 = 128;
 pub const SIGTSTP: i32 = 20;
@@ -99,10 +108,12 @@ pub struct SigInfo {
     pub status: i32,
     pub value: u64,
     pub timerid: i32,
+    /// ためた順の番号 (queue がつける。PTRACE_PEEKSIGINFO がためた順に見せる: Linux の pending の list の順)
+    pub seq: u64,
 }
 
 impl SigInfo {
-    pub const ZERO: SigInfo = SigInfo { code: 0, pid: 0, uid: 0, addr: 0, status: 0, value: 0, timerid: 0 };
+    pub const ZERO: SigInfo = SigInfo { code: 0, pid: 0, uid: 0, addr: 0, status: 0, value: 0, timerid: 0, seq: 0 };
 
     pub fn from(code: i32) -> SigInfo {
         let (pid, uid) = proc::current_ids();
@@ -230,12 +241,22 @@ fn dequeue(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
         if set != 0 {
             let s = if set & SYNCHRONOUS != 0 { set & SYNCHRONOUS } else { set };
             let sig = s.trailing_zeros() as i32 + 1;
+            // 同じ RT シグナルがまだ並んでいれば、次のものを先頭にして印は残す (Linux の collect_signal)
+            let next = p.sig_more.iter().position(|e| e.0 == shared && e.1 == sig).map(|i| p.sig_more.remove(i).2);
             return Some(if shared {
-                p.sig_shared &= !bit(sig);
-                (sig, p.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]))
+                let info = p.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]);
+                match next {
+                    Some(n) => p.sig_shared_info.get_or_insert_with(|| alloc::boxed::Box::new([SigInfo::ZERO; NSIG]))[sig as usize] = n,
+                    None => p.sig_shared &= !bit(sig),
+                }
+                (sig, info)
             } else {
-                p.sig_pending &= !bit(sig);
-                (sig, p.sig_info[sig as usize])
+                let info = p.sig_info[sig as usize];
+                match next {
+                    Some(n) => p.sig_info[sig as usize] = n,
+                    None => p.sig_pending &= !bit(sig),
+                }
+                (sig, info)
             });
         }
     }
@@ -246,11 +267,18 @@ fn dequeue(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
 pub fn hand_over(from: &mut Proc, to: &mut Proc) {
     let move_ = from.sig_shared & !to.sig_shared;
     for sig in 1..NSIG as i32 {
+        let i = from.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]);
         if move_ & bit(sig) != 0 {
-            let i = from.sig_shared_info.as_ref().map_or(SigInfo::ZERO, |i| i[sig as usize]);
             to.sig_shared_info.get_or_insert_with(|| alloc::boxed::Box::new([SigInfo::ZERO; NSIG]))[sig as usize] = i;
+        } else if from.sig_shared & bit(sig) != 0 && sig >= SIGRTMIN_ {
+            // どちらにもある RT シグナルは、並べてのこす
+            to.sig_more.push((true, sig, i));
         }
     }
+    // 並んでいた RT シグナルの 2 つめからも
+    let more: alloc::vec::Vec<_> = from.sig_more.extract_if(.., |e| e.0).collect();
+    to.sig_more.extend(more);
+    to.sig_more.sort_by_key(|e| e.2.seq);
     to.sig_shared |= move_;
     from.sig_shared = 0;
     if move_ & !to.sig_mask != 0 {
@@ -265,7 +293,37 @@ pub fn hand_over(from: &mut Proc, to: &mut Proc) {
 fn discard(p: &mut Proc, mask: u64) {
     p.sig_pending &= !mask;
     p.sig_shared &= !mask;
+    if !p.sig_more.is_empty() {
+        p.sig_more.retain(|e| mask & bit(e.1) == 0);
+    }
 }
+
+/// ためている順のシグナルの列 (PTRACE_PEEKSIGINFO: Linux の pending の list)。shared ならプロセスに来たもの (スレッド
+/// グループのみなが預かっているもの)、でなければスレッド t に来たもの
+pub fn pending_list(t: &Proc, shared: bool) -> alloc::vec::Vec<(i32, SigInfo)> {
+    let mut v = alloc::vec::Vec::new();
+    let mut take = |p: &Proc| {
+        let (set, first) = if shared { (p.sig_shared, p.sig_shared_info.as_deref()) } else { (p.sig_pending, Some(&p.sig_info)) };
+        for sig in 1..NSIG as i32 {
+            if set & bit(sig) != 0 {
+                v.push((sig, first.map_or(SigInfo::ZERO, |i| i[sig as usize])));
+            }
+        }
+        v.extend(p.sig_more.iter().filter(|e| e.0 == shared).map(|e| (e.1, e.2)));
+    };
+    if shared {
+        for th in proc::threads_of(t.tgid) {
+            take(th);
+        }
+    } else {
+        take(t);
+    }
+    v.sort_by_key(|e| e.1.seq);
+    v
+}
+
+/// ためた順の番号
+static SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// /proc/PID/status のシグナルの行 (SigQ、SigPnd、ShdPnd、SigBlk、SigIgn、SigCgt: Linux の task_sig)。leader は見る
 /// スレッド、shared はスレッドグループのみなのプロセスに来たもの。SigQ の上限は RLIMIT_SIGPENDING のソフト (Linux と同じ)
@@ -332,14 +390,21 @@ fn queue(t: &mut Proc, sig: i32, info: SigInfo, shared: bool) {
     }
     // もう来ているなら、はじめのものの情報を残す (Linux の legacy_queue: ふつうのシグナルは 2 つめを捨てる)。スレッドに
     // 来たものとプロセスに来たものは別にたまる
+    // RT シグナル (32 から) は来た数だけならべる (Linux の __send_signal: legacy_queue でないもの)
+    let info = SigInfo { seq: SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed), ..info };
+    let rt = sig >= SIGRTMIN_;
     if shared {
         if t.sig_shared & b == 0 {
             t.sig_shared_info.get_or_insert_with(|| alloc::boxed::Box::new([SigInfo::ZERO; NSIG]))[sig as usize] = info;
+        } else if rt && t.sig_more.len() < RT_QUEUE_MAX {
+            t.sig_more.push((true, sig, info));
         }
         t.sig_shared |= b;
     } else {
         if t.sig_pending & b == 0 {
             t.sig_info[sig as usize] = info;
+        } else if rt && t.sig_more.len() < RT_QUEUE_MAX {
+            t.sig_more.push((false, sig, info));
         }
         t.sig_pending |= b;
     }
@@ -532,6 +597,13 @@ fn continue_group(tgid: u32) {
     for th in proc::threads_of(tgid) {
         discard(th, STOP_MASK);
     }
+    // PTRACE_LISTEN で待っているものは、もう一度知らせる (Linux の ptrace_trap_notify)
+    for th in proc::threads_of(tgid) {
+        if core::mem::take(&mut th.pt_listen) {
+            th.pt_retrap = true;
+            proc::wakeup(proc::pt_chan(th));
+        }
+    }
     let Some(l) = proc::find_leader(tgid) else { return };
     if !l.stopped {
         return;
@@ -689,9 +761,7 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let interrupted = if core::mem::take(&mut p.no_restart) { None } else { interrupted };
     // PTRACE_INTERRUPT を受けた: PTRACE_EVENT_STOP で止まる (Linux の do_jobctl_trap)
     if core::mem::take(&mut p.pt_interrupt) && p.ptracer != 0 {
-        let code = PTRACE_EVENT_STOP << 8 | SIGTRAP;
-        ptrace_stop(tf, code << 8 | 0x7f, SIGTRAP, SigInfo { code, ..SigInfo::ZERO });
-        proc::check_killed();
+        traced_stop(tf, SIGTRAP);
     }
     let mut handled = false;
     loop {
@@ -704,6 +774,8 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             if ns == 0 {
                 continue;
             }
+            // PTRACE_SETSIGINFO で書きかえたかもしれない (番号も)
+            let (sig, info) = proc::current().pt_info;
             if ns != sig {
                 let info = SigInfo { code: SI_USER, pid: crate::ns::local_or_0(p.ptracer), uid: proc::find_leader(p.ptracer).map_or(0, |t| crate::ns::show_uid(t.cred.uid)), ..SigInfo::ZERO };
                 if p.sig_mask & bit(ns) != 0 {
@@ -784,6 +856,10 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                         continue;
                     }
                     stop_group(p.tgid, sig);
+                    if p.ptracer != 0 {
+                        traced_stop(tf, sig);
+                        continue;
+                    }
                     proc::stop_while_stopped();
                     continue;
                 }
@@ -853,6 +929,59 @@ fn ptrace_stop_kind(tf: &mut TrapFrame, status: i32, sig: i32, info: SigInfo, ki
         return 0;
     }
     p.pt_resume.take().unwrap_or(0)
+}
+
+/// ptrace されているもののグループの止まり (Linux の do_signal_stop と do_jobctl_trap): tracer に知らせて、続けさせられる
+/// まで止まる。SEIZE したものは PTRACE_EVENT_STOP で (グループが止まっていればそのシグナル、もう動いていれば SIGTRAP)、
+/// でなければシグナルの番号で。PTRACE_LISTEN されたら止まったまま SIGCONT を待ち、来たらまた知らせる
+fn traced_stop(tf: &mut TrapFrame, sig: i32) {
+    loop {
+        let p = proc::current();
+        if p.ptracer == 0 || p.killed {
+            return;
+        }
+        let stopped = proc::find_leader(p.tgid).is_some_and(|l| l.stopped);
+        let s = if p.pt_seized && !stopped { SIGTRAP } else { sig };
+        let code = if p.pt_seized { s | PTRACE_EVENT_STOP << 8 } else { s };
+        let info = SigInfo { code, pid: crate::ns::local_or_0(p.tgid), uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
+        p.pt_listen = false;
+        ptrace_stop(tf, code << 8 | 0x7f, s, info);
+        proc::check_killed();
+        if !core::mem::take(&mut proc::current().pt_retrap) {
+            return;
+        }
+    }
+}
+
+/// tracer が PTRACE_SETSIGINFO で渡した siginfo_t (128 バイト) を、番号と中身に (siginfo_bytes の逆)
+pub fn siginfo_from(b: &[u8; 128]) -> (i32, SigInfo) {
+    let i32_at = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let sig = i32_at(0);
+    let mut i = SigInfo { code: i32_at(8), ..SigInfo::ZERO };
+    match sig {
+        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => i.addr = u64_at(16),
+        SIGSYS => {
+            i.timerid = i32_at(4);
+            i.addr = u64_at(16);
+            i.status = i32_at(24);
+        }
+        SIGCHLD => {
+            i.pid = i32_at(16) as u32;
+            i.uid = i32_at(20) as u32;
+            i.status = i32_at(24);
+        }
+        _ if i.code == SI_TIMER => {
+            i.timerid = i32_at(16);
+            i.value = u64_at(24);
+        }
+        _ => {
+            i.pid = i32_at(16) as u32;
+            i.uid = i32_at(20) as u32;
+            i.value = u64_at(24);
+        }
+    }
+    (sig, i)
 }
 
 /// PTRACE_SYSCALL の止まり (システムコールの入口と出口: trap.rs)。SIGTRAP (TRACESYSGOOD なら | 0x80)。続けさせたときの

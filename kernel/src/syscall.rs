@@ -438,8 +438,8 @@ fn pos_guard(nr: u64, a: &[u64; 6]) -> [Option<crate::file::PosSlow>; 2] {
 pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     use nr::*;
     // 引数は 6 つ (x0〜x5)。tf.x を 31 ぜんぶ写すと、それだけでシステムコールごとに 248 バイト
-    let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
-    let nr = tf.x[8];
+    let mut a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
+    let mut nr = tf.x[8];
     crate::debug::trace_sys_enter(nr, a[0]);
     let p = proc::current();
     p.orig_x0 = a[0];
@@ -454,8 +454,35 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     // で眠るあいだに、ほかのスレッドの TSYNC で入れかわっても消えないように)
     if let Some(s) = p.cred.seccomp.clone() {
         let args = [a[0], a[1], a[2], a[3], a[4], a[5]];
-        match crate::security::seccomp_permit_syscall(&s, nr, &args, tf.elr) {
+        let mut permit = crate::security::seccomp_permit_syscall(&s, nr, &args, tf.elr);
+        // SECCOMP_RET_TRACE (Linux の __seccomp_filter): PTRACE_O_TRACESECCOMP の tracer がいなければ ENOSYS。いれば
+        // PTRACE_EVENT_SECCOMP で止まって見せ、tracer が番号を -1 にしたら呼ばない (x0 は tracer が書いたもの)。番号や
+        // 引数を変えたかもしれないので、もう一度フィルタに (こんどの TRACE は通す)
+        if let crate::security::Permit::Trace(data) = permit {
+            let p = proc::current();
+            if p.ptracer == 0 || p.pt_opts & signal::PTRACE_O_TRACESECCOMP == 0 {
+                permit = crate::security::Permit::Errno(-ENOSYS);
+            } else {
+                p.pt_scno = None;
+                signal::ptrace_event(signal::PTRACE_EVENT_SECCOMP, data as u64);
+                proc::check_killed();
+                if let Some(n) = proc::current().pt_scno.take() {
+                    nr = n;
+                }
+                if nr as i32 == -1 {
+                    crate::debug::trace_sys_exit(nr, tf.x[0] as i64);
+                    return None;
+                }
+                a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
+                permit = match crate::security::seccomp_permit_syscall(&s, nr, &a, tf.elr) {
+                    crate::security::Permit::Trace(_) => crate::security::Permit::Allow,
+                    v => v,
+                };
+            }
+        }
+        match permit {
             crate::security::Permit::Allow => {}
+            crate::security::Permit::Trace(_) => unreachable!(),
             crate::security::Permit::Errno(e) => {
                 tf.x[0] = e as u64;
                 crate::debug::trace_sys_exit(nr, e);

@@ -506,6 +506,9 @@ pub struct Proc {
     /// sig_shared の siginfo (はじめてプロセスに来たときにヒープに。表 (NPROC) に 2.6 KiB ずつ持つと、カーネルが
     /// 64 MiB をこえて UEFI の起動で置き場をとれなかった)
     pub sig_shared_info: Option<alloc::boxed::Box<[SigInfo; NSIG]>>,
+    /// 同じ RT シグナルの 2 つめから (プロセスに来たものか、番号、siginfo): ためた順。はじめのものは sig_info と
+    /// sig_shared_info に
+    pub sig_more: Vec<(bool, i32, SigInfo)>,
     pub sig_mask: u64,
     pub sig_info: [SigInfo; NSIG],
     /// sigsuspend で一時的に変える前のマスク
@@ -625,6 +628,9 @@ pub struct Proc {
     pub pt_opts: u32,
     pub pt_syscall: bool,
     pub pt_interrupt: bool,
+    /// PTRACE_LISTEN: グループの止まりのまま SIGCONT を待っている。来たら pt_retrap を立てて起こす (また知らせる)
+    pub pt_listen: bool,
+    pub pt_retrap: bool,
     /// ptrace で止まっている: wait に知らせる status (0 は止まっていない)、もう知らせたか、そのときの siginfo (番号と中身)、
     /// ユーザーのレジスタ (止まっているあいだだけ: tracee のカーネルのスタックの上)、tracer が続けさせたとき入れるシグナル
     pub pt_status: i32,
@@ -747,6 +753,7 @@ impl Proc {
         sig_mask: 0,
         sig_info: [SigInfo::ZERO; NSIG],
         sig_shared_info: None,
+        sig_more: Vec::new(),
         saved_mask: None,
         sigwait: 0,
         altstack: AltStack::NONE,
@@ -815,6 +822,8 @@ impl Proc {
         pt_msg: 0,
         pt_event: None,
         pt_scno: None,
+        pt_listen: false,
+        pt_retrap: false,
         execed: false,
         utime: 0,
         cpu_ns: 0,
@@ -2616,12 +2625,21 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     crate::smp::wake_idle();
     drop(_p);
     if vfork {
+        // PTRACE_EVENT_VFORK は待つ前に (Linux の kernel_clone: ptrace_event_pid のあとで wait_for_vfork_done)
+        if let Some((ev, msg)) = current().pt_event.take() {
+            crate::signal::ptrace_event(ev, msg);
+        }
         // シグナルではやめない (止められたときだけ)。届いているシグナルがあると眠れないので、そのあいだはゆずりながら
         let me = current().pid;
         while find(tid).is_some_and(|c| c.vfork_parent == me) && !current().killed {
             if sleep(chan).is_err() {
                 yield_now();
             }
+        }
+        // 子がアドレス空間を離れた: PTRACE_O_TRACEVFORKDONE なら PTRACE_EVENT_VFORK_DONE (GETEVENTMSG は子の番号)
+        let p = current();
+        if p.ptracer != 0 && p.pt_opts & crate::signal::PTRACE_O_TRACEVFORKDONE != 0 && !p.killed {
+            crate::signal::ptrace_event(crate::signal::PTRACE_EVENT_VFORK_DONE, crate::ns::to_local(tid).unwrap_or(tid) as u64);
         }
     }
     Ok(tid)
@@ -3050,7 +3068,9 @@ pub fn stop_while_stopped() {
             return;
         }
         let p = current();
-        if p.killed {
+        // ptrace されているものは、グループの止まりも tracer に知らせて止まる (signal.rs の traced_stop)。tracer が続け
+        // させたら、グループが止まっていても走る (Linux と同じ)
+        if p.killed || p.ptracer != 0 {
             return;
         }
         let Some(l) = find(p.tgid) else { return };
@@ -3071,7 +3091,7 @@ pub fn stop_while_stopped() {
 pub fn ptrace_sleep() {
     loop {
         let p = current();
-        if p.killed || p.ptracer == 0 || p.pt_resume.is_some() {
+        if p.killed || p.ptracer == 0 || p.pt_resume.is_some() || p.pt_retrap {
             return;
         }
         p.chan = pt_chan(p);

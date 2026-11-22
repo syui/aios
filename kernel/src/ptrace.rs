@@ -31,6 +31,13 @@ const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_SETREGSET: u64 = 0x4205;
 const PTRACE_SEIZE: u64 = 0x4206;
 const PTRACE_INTERRUPT: u64 = 0x4207;
+const PTRACE_SETSIGINFO: u64 = 0x4203;
+const PTRACE_LISTEN: u64 = 0x4208;
+const PTRACE_PEEKSIGINFO: u64 = 0x4209;
+/// PEEKSIGINFO の flags: プロセス (スレッドグループ) に来たものを
+const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+/// seccomp を止める (CHECKPOINT_RESTORE がいる: 手本の Linux にもないので EINVAL)
+const PTRACE_O_SUSPEND_SECCOMP: u64 = 0x20_0000;
 /// 知っている PTRACE_O_* (Linux の PTRACE_O_MASK)
 const PTRACE_O_MASK: u64 = 0x0030_00ff;
 /// GETREGSET の NT_PRSTATUS (struct user_pt_regs: x0〜x30、sp、pc、pstate の 272 バイト)
@@ -91,6 +98,9 @@ fn attach(t: &'static mut Proc, seize: bool, addr: usize, data: usize) -> R {
     let me = proc::current();
     if seize && (addr != 0 || data as u64 & !PTRACE_O_MASK != 0) {
         return Err(if addr != 0 { -EIO } else { -EINVAL });
+    }
+    if seize && data as u64 & PTRACE_O_SUSPEND_SECCOMP != 0 {
+        return Err(-EINVAL);
     }
     // カーネルのスレッド、自分のスレッドグループ、もうつながっているものは EPERM
     if t.kthread || t.tgid == me.tgid || t.ptracer != 0 || !may_attach(t) {
@@ -172,7 +182,7 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             resume(t, data, false)
         }
         PTRACE_SETOPTIONS => {
-            if data as u64 & !PTRACE_O_MASK != 0 {
+            if data as u64 & !PTRACE_O_MASK != 0 || data as u64 & PTRACE_O_SUSPEND_SECCOMP != 0 {
                 return Err(-EINVAL);
             }
             t.pt_opts = data as u32;
@@ -188,10 +198,48 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             proc::put_user(data, &signal::siginfo_of(sig, &info))?;
             Ok(0)
         }
+        // 止まりの siginfo を書きかえる (シグナルの知らせなら、続けたときにそれが届く: signal.rs の deliver_now)
+        PTRACE_SETSIGINFO => {
+            let mut b = [0u8; 128];
+            proc::get_user(data, &mut b)?;
+            t.pt_info = signal::siginfo_from(&b);
+            Ok(0)
+        }
+        PTRACE_PEEKSIGINFO => peek_siginfo(t, addr, data),
+        // SEIZE したものの グループの止まり (PTRACE_EVENT_STOP) のときだけ: 止まったまま SIGCONT を待ち、来たらまた知らせる
+        PTRACE_LISTEN => {
+            if !t.pt_seized || t.pt_info.1.code >> 8 != signal::PTRACE_EVENT_STOP {
+                return Err(-EIO);
+            }
+            t.pt_listen = true;
+            Ok(0)
+        }
         PTRACE_GETREGSET | PTRACE_SETREGSET => regset(t, req == PTRACE_SETREGSET, addr as u64, data),
         // PEEKUSR / POKEUSR (arm64 にはない) ほか、知らないもの
         _ => Err(-EIO),
     }
+}
+
+/// まだ届いていないシグナルの siginfo を off 番目から nr こ (Linux の ptrace_peek_siginfo)。args は
+/// struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }。読めた数 (はじめの 1 つが書けなければ EFAULT)
+fn peek_siginfo(t: &Proc, args: usize, out: usize) -> R {
+    let mut b = [0u8; 16];
+    proc::get_user(args, &mut b).map_err(|_| -EFAULT)?;
+    let off = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
+    let nr = i32::from_le_bytes(b[12..16].try_into().unwrap());
+    if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || nr < 0 {
+        return Err(-EINVAL);
+    }
+    let list = signal::pending_list(t, flags & PTRACE_PEEKSIGINFO_SHARED != 0);
+    let mut n = 0usize;
+    for (sig, info) in list.iter().skip(off.min(usize::MAX as u64) as usize).take(nr as usize) {
+        if proc::put_user(out + n * 128, &signal::siginfo_of(*sig, info)).is_err() {
+            return if n > 0 { Ok(n as i64) } else { Err(-EFAULT) };
+        }
+        n += 1;
+    }
+    Ok(n as i64)
 }
 
 /// tracee のメモリを読む (Linux の ptrace_access_vm: /proc/PID/mem と同じ道)。読めたバイト数

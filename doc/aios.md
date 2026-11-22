@@ -853,7 +853,19 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   POKEDATA は書けない写しにも書く (MAP_PRIVATE ならそのページを写しなおす: FOLL_FORCE。ブレークポイント)。
   GETREGSET / SETREGSET の NT_PRFPREG (v0〜v31、fpsr、fpcr: 528 バイト) と NT_ARM_SYSTEM_CALL (入口で番号を変える。
   -1 なら呼ばない。ユーザーの x8 は変えない)、PTRACE_GET_SYSCALL_INFO (入口 80、出口 33、ほか 24 バイト)。
-  のこりは todo.json の syscall-gaps
+  test/ptrace3.c (Linux 7.4-rc3 と 7 行同じ): SETSIGINFO (止まりの siginfo を書きかえ、シグナルの知らせなら続けたときに
+  それが届く: si_code や値も)、PEEKSIGINFO (まだ届いていないシグナルの siginfo を off 番目から nr こ、ためた順に。
+  PEEKSIGINFO_SHARED でプロセスに来たもの。知らない flags と nr < 0 は EINVAL)。そのために RT シグナル (32 から) は
+  同じ番号も 1 つずつためる (signal.rs の sig_more: Linux の sigqueue の列。値も順も。4096 こまで。/proc/PID/status の
+  SigQ にも数える)。PTRACE_O_TRACEVFORKDONE は vfork の子がアドレス空間を離れたら親が PTRACE_EVENT_VFORK_DONE
+  (GETEVENTMSG は子の pid。PTRACE_EVENT_VFORK は待つ前に)。seccomp の SECCOMP_RET_TRACE は PTRACE_O_TRACESECCOMP の
+  tracer がいれば PTRACE_EVENT_SECCOMP で止まり (GETEVENTMSG はフィルタの値)、tracer が番号を -1 にしたら呼ばない (x0 は
+  tracer が書いたもの)、変えたら新しい番号と引数でフィルタをもう一度 (こんどの TRACE は通す)。tracer がいなければ ENOSYS
+  (前はいつも ENOSYS)。ptrace されているもののグループの止まり (SIGSTOP など) も tracer に知らせる (Linux の
+  do_jobctl_trap: SEIZE なら PTRACE_EVENT_STOP で、グループがもう動いていれば SIGTRAP。でなければシグナルの番号で) し、
+  tracer が続けさせたら走る。LISTEN (SEIZE したものの PTRACE_EVENT_STOP の止まりだけ、でなければ EIO) は止まったまま
+  SIGCONT を待ち、来たらまた PTRACE_EVENT_STOP で知らせる。PTRACE_O_SUSPEND_SECCOMP は CHECKPOINT_RESTORE のない
+  Linux (手本) と同じ EINVAL。のこりは todo.json の syscall-gaps
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、
