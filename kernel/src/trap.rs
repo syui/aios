@@ -379,13 +379,32 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             crate::vm::balance();
             match esr >> 26 {
                 EC_SVC64 => {
-                    // PTRACE_SYSCALL: 入口と出口で止まる
+                    // PTRACE_SYSCALL: 入口と出口で止まる。入口で tracer が番号を変えたら (NT_ARM_SYSTEM_CALL) それを、-1 なら
+                    // 呼ばずに (x0 はそのまま)。ユーザーの x8 は変えない (Linux は regs->syscallno に持つ)
+                    let mut scno = None;
                     if proc::current().pt_syscall {
-                        signal::ptrace_syscall(tf);
+                        signal::ptrace_syscall(tf, true);
+                        scno = proc::current().pt_scno.take().map(|n| (n, tf.x[8]));
                     }
-                    let intr = syscall::dispatch(tf);
+                    let intr = match scno {
+                        Some((n, _)) if n as i32 == -1 => None,
+                        Some((n, _)) => {
+                            tf.x[8] = n;
+                            syscall::dispatch(tf)
+                        }
+                        None => syscall::dispatch(tf),
+                    };
+                    if let Some((n, x8)) = scno
+                        && tf.x[8] == n
+                    {
+                        tf.x[8] = x8;
+                    }
+                    // fork と exec の知らせ (PTRACE_O_TRACEFORK ほか)
+                    if let Some((ev, msg)) = proc::current().pt_event.take() {
+                        signal::ptrace_event(ev, msg);
+                    }
                     if proc::current().pt_syscall {
-                        signal::ptrace_syscall(tf);
+                        signal::ptrace_syscall(tf, false);
                     }
                     // 書き出しが追いつかないほど書いた: 書き出しのスレッドを待つ
                     if proc::current().dirtied {

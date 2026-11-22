@@ -24,6 +24,8 @@ const PTRACE_ATTACH: u64 = 16;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SYSCALL: u64 = 24;
 const PTRACE_SETOPTIONS: u64 = 0x4200;
+const PTRACE_GETEVENTMSG: u64 = 0x4201;
+const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
 const PTRACE_GETSIGINFO: u64 = 0x4202;
 const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_SETREGSET: u64 = 0x4205;
@@ -34,6 +36,13 @@ const PTRACE_O_MASK: u64 = 0x0030_00ff;
 /// GETREGSET の NT_PRSTATUS (struct user_pt_regs: x0〜x30、sp、pc、pstate の 272 バイト)
 const NT_PRSTATUS: u64 = 1;
 const PRSTATUS_SIZE: usize = 34 * 8;
+/// NT_PRFPREG (struct user_fpsimd_state: v0〜v31、fpsr、fpcr、と 8 バイトの空き: 528 バイト)
+const NT_PRFPREG: u64 = 2;
+const FPREG_SIZE: usize = 32 * 16 + 16;
+/// NT_ARM_SYSTEM_CALL (いまのシステムコールの番号: 4 バイト)
+const NT_ARM_SYSTEM_CALL: u64 = 0x404;
+/// AUDIT_ARCH_AARCH64 (PTRACE_GET_SYSCALL_INFO の arch)
+const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
 pub const SYSCALLS: &[u64] = {
     use crate::syscall::nr::*;
@@ -144,8 +153,8 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             Ok(0)
         }
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            let mut b = (data as u64).to_le_bytes();
-            if remote(t, addr, &mut b, true) != 8 {
+            let b = (data as u64).to_le_bytes();
+            if poke(t, addr, &b) != 8 {
                 return Err(-EIO);
             }
             Ok(0)
@@ -169,6 +178,11 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             t.pt_opts = data as u32;
             Ok(0)
         }
+        PTRACE_GETEVENTMSG => {
+            proc::put_user(data, &t.pt_msg.to_le_bytes())?;
+            Ok(0)
+        }
+        PTRACE_GET_SYSCALL_INFO => syscall_info(t, addr, data),
         PTRACE_GETSIGINFO => {
             let (sig, info) = t.pt_info;
             proc::put_user(data, &signal::siginfo_of(sig, &info))?;
@@ -180,23 +194,96 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
     }
 }
 
-/// tracee のメモリを読む / 書く (Linux の ptrace_access_vm: /proc/PID/mem と同じ道)。読み書きできたバイト数
-fn remote(t: &Proc, addr: usize, buf: &mut [u8], write: bool) -> usize {
+/// tracee のメモリを読む (Linux の ptrace_access_vm: /proc/PID/mem と同じ道)。読めたバイト数
+fn remote(t: &Proc, addr: usize, buf: &mut [u8], _write: bool) -> usize {
     let Some(mm) = t.mm.as_ref().filter(|_| !t.kthread) else { return 0 };
     let pt = &mut mm.get().pt;
     let _h = pt.hold();
-    if write { pt.write_remote(addr, buf) } else { pt.read_remote(addr, buf) }
+    pt.read_remote(addr, buf)
+}
+
+/// tracee のメモリに書く (FOLL_FORCE: コードにも。vm::PageTable::poke_remote)。書けたバイト数
+fn poke(t: &Proc, addr: usize, buf: &[u8]) -> usize {
+    let Some(mm) = t.mm.as_ref().filter(|_| !t.kthread) else { return 0 };
+    let pt = &mut mm.get().pt;
+    let _h = pt.hold();
+    pt.poke_remote(addr, buf)
+}
+
+/// PTRACE_GET_SYSCALL_INFO (Linux の ptrace_get_syscall_info): struct ptrace_syscall_info を size まで写し、まるごとの
+/// 大きさを返す。op はシステムコールの入口 (番号と引数 6 つ: 80)、出口 (戻り値と、まちがいか: 33)、ほか (24)
+fn syscall_info(t: &mut Proc, size: usize, data: usize) -> R {
+    let tf: &TrapFrame = unsafe { &*t.pt_tf };
+    let mut b = [0u8; 80];
+    b[0] = t.pt_kind;
+    b[4..8].copy_from_slice(&AUDIT_ARCH_AARCH64.to_le_bytes());
+    b[8..16].copy_from_slice(&tf.elr.to_le_bytes());
+    b[16..24].copy_from_slice(&tf.sp_el0.to_le_bytes());
+    let n = match t.pt_kind {
+        1 => {
+            b[24..32].copy_from_slice(&t.pt_scno.unwrap_or(tf.x[8]).to_le_bytes());
+            // 引数の 1 つめは入口の x0 (orig_x0)
+            b[32..40].copy_from_slice(&t.orig_x0.to_le_bytes());
+            for i in 1..6 {
+                b[32 + i * 8..40 + i * 8].copy_from_slice(&tf.x[i].to_le_bytes());
+            }
+            80
+        }
+        2 => {
+            let rval = tf.x[0] as i64;
+            b[24..32].copy_from_slice(&rval.to_le_bytes());
+            b[32] = (-4095..0).contains(&rval) as u8;
+            33
+        }
+        _ => 24,
+    };
+    proc::put_user(data, &b[..n.min(size)])?;
+    Ok(n as i64)
 }
 
 /// GETREGSET / SETREGSET (iovec): NT_PRSTATUS だけ (ほかは EINVAL)。iov_len は写した長さに
 fn regset(t: &mut Proc, set: bool, note: u64, iov: usize) -> R {
-    if note != NT_PRSTATUS {
-        return Err(-EINVAL);
-    }
+    let size = match note {
+        NT_PRSTATUS => PRSTATUS_SIZE,
+        NT_PRFPREG => FPREG_SIZE,
+        NT_ARM_SYSTEM_CALL => 4,
+        _ => return Err(-EINVAL),
+    };
     let mut v = [0u8; 16];
     proc::current().pt().copy_in(&mut v, iov).ok_or(-EFAULT)?;
     let base = u64::from_le_bytes(v[..8].try_into().unwrap()) as usize;
-    let len = (u64::from_le_bytes(v[8..].try_into().unwrap()) as usize).min(PRSTATUS_SIZE);
+    let len = (u64::from_le_bytes(v[8..].try_into().unwrap()) as usize).min(size);
+    if note == NT_PRFPREG {
+        // 止まっている tracee の浮動小数のレジスタは、切りかえたときに p.fp へ (proc の sched)
+        let mut b = [0u8; FPREG_SIZE];
+        for (i, q) in t.fp.q.iter().enumerate() {
+            b[i * 16..i * 16 + 16].copy_from_slice(&q.to_le_bytes());
+        }
+        b[512..516].copy_from_slice(&(t.fp.fpsr as u32).to_le_bytes());
+        b[516..520].copy_from_slice(&(t.fp.fpcr as u32).to_le_bytes());
+        if set {
+            proc::current().pt().copy_in(&mut b[..len], base).ok_or(-EFAULT)?;
+            for i in 0..32 {
+                t.fp.q[i] = u128::from_le_bytes(b[i * 16..i * 16 + 16].try_into().unwrap());
+            }
+            t.fp.fpsr = u32::from_le_bytes(b[512..516].try_into().unwrap()) as u64;
+            t.fp.fpcr = u32::from_le_bytes(b[516..520].try_into().unwrap()) as u64;
+        } else {
+            proc::put_user(base, &b[..len])?;
+        }
+        return iov_len_set(iov, len);
+    }
+    if note == NT_ARM_SYSTEM_CALL {
+        let tf: &TrapFrame = unsafe { &*t.pt_tf };
+        let mut b = (t.pt_scno.unwrap_or(tf.x[8]) as i32).to_le_bytes();
+        if set {
+            proc::current().pt().copy_in(&mut b[..len], base).ok_or(-EFAULT)?;
+            t.pt_scno = Some(i32::from_le_bytes(b) as i64 as u64);
+        } else {
+            proc::put_user(base, &b[..len])?;
+        }
+        return iov_len_set(iov, len);
+    }
     // 止まっているあいだだけ (traced で確かめた)。tracee のカーネルのスタックの上のレジスタ
     let tf: &mut TrapFrame = unsafe { &mut *t.pt_tf };
     let mut b = [0u8; PRSTATUS_SIZE];
@@ -219,8 +306,11 @@ fn regset(t: &mut Proc, set: bool, note: u64, iov: usize) -> R {
     } else {
         proc::put_user(base, &b[..len])?;
     }
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&(len as u64).to_le_bytes());
-    proc::put_user(iov + 8, &out)?;
+    iov_len_set(iov, len)
+}
+
+/// iovec の iov_len を写した長さに
+fn iov_len_set(iov: usize, len: usize) -> R {
+    proc::put_user(iov + 8, &(len as u64).to_le_bytes())?;
     Ok(0)
 }

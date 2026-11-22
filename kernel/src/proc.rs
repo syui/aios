@@ -542,6 +542,13 @@ pub struct Proc {
     pub pt_info: (i32, crate::signal::SigInfo),
     pub pt_tf: *mut crate::trap::TrapFrame,
     pub pt_resume: Option<i32>,
+    /// 止まりの種類 (PTRACE_GET_SYSCALL_INFO の op: 0 ほか、1 システムコールの入口、2 出口)、GETEVENTMSG の値、
+    /// システムコールから戻る前に止まる知らせ (fork と exec: (PTRACE_EVENT_*, 値))、入口で tracer が変えた番号
+    /// (NT_ARM_SYSTEM_CALL。-1 は飛ばす)
+    pub pt_kind: u8,
+    pub pt_msg: u64,
+    pub pt_event: Option<(i32, u64)>,
+    pub pt_scno: Option<u64>,
     /// fork してから exec した (Linux の PF_FORKNOEXEC が消えた): 親はもう setpgid で動かせない (EACCES)
     pub execed: bool,
     /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
@@ -629,7 +636,7 @@ pub struct Proc {
     pub poll_keys: Option<Vec<usize>>,
     context: Context,
     tpidr: u64,
-    fp: FpState,
+    pub fp: FpState,
 }
 
 impl Proc {
@@ -709,6 +716,10 @@ impl Proc {
         pt_info: (0, crate::signal::SigInfo::ZERO),
         pt_tf: core::ptr::null_mut(),
         pt_resume: None,
+        pt_kind: 0,
+        pt_msg: 0,
+        pt_event: None,
+        pt_scno: None,
         execed: false,
         utime: 0,
         cpu_ns: 0,
@@ -2149,6 +2160,11 @@ pub fn register_exit_hook(f: fn(u32)) {
 
 fn exit_status(status: i32) -> ! {
     let p = current();
+    // PTRACE_O_TRACEEXIT: 終わる前に PTRACE_EVENT_EXIT で止まる (値は wait の status。SIGKILL なら止まらない)
+    if p.ptracer != 0 && p.pt_opts & 0x40 != 0 {
+        crate::signal::ptrace_event(6, status as u64);
+    }
+    let p = current();
     crate::debug::trace_exit(p.pid, status as i64);
     // 監査: exit や exit_group の中なら、その記録 (__audit_free)
     if p.audit.is_some() {
@@ -2230,6 +2246,13 @@ fn exit_status(status: i32) -> ! {
             sigchld(p, parent);
         }
         wakeup(parent as *mut Proc as usize);
+    }
+    // 親でない tracer にも知らせる (Linux の exit_notify: tracer が先に終わりを受けとる。proc::wait)
+    if p.ptracer != 0 && p.ptracer != p.ppid
+        && let Some(t) = find_leader(p.ptracer)
+    {
+        sigchld(p, t);
+        wakeup(t as *mut Proc as usize);
     }
     // pidfd を poll / epoll しているもの (印は pidfd_key。印なしで眠っているものも起きる)
     poll_wake(pidfd_key());
@@ -2459,6 +2482,24 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.vfork_parent = parent.pid;
     }
     let chan = vfork_chan(child);
+    // ptrace されていて、その種類の知らせ (PTRACE_O_TRACEFORK / VFORK / CLONE) を頼まれていれば、子も同じ tracer に
+    // つなぎ (SEIZE でなければ SIGSTOP、SEIZE なら PTRACE_EVENT_STOP で止まる)、親は戻る前にその知らせで止まる
+    // (trap.rs が pt_event を見る。Linux の kernel_clone の ptrace_event_pid)。CLONE_UNTRACED ならつながない
+    const CLONE_UNTRACED: u64 = 0x0080_0000;
+    let (event, opt) = if vfork { (2, 0x4) } else if flags & 0xff == crate::signal::SIGCHLD as u64 { (1, 0x2) } else { (3, 0x8) };
+    let parent = current();
+    if parent.ptracer != 0 && parent.pt_opts & opt != 0 && flags & CLONE_UNTRACED == 0 {
+        child.ptracer = parent.ptracer;
+        child.pt_opts = parent.pt_opts;
+        child.pt_seized = parent.pt_seized;
+        child.sync_cred_work();
+        if child.pt_seized {
+            child.pt_interrupt = true;
+        } else {
+            crate::signal::send_thread(child, crate::signal::SIGSTOP, crate::signal::SigInfo::ZERO);
+        }
+        parent.pt_event = Some((event, crate::ns::to_local(tid).unwrap_or(tid) as u64));
+    }
     drop(_p);
     let _p = crate::debug::span("proc:fork_run");
     make_runnable(child);
@@ -2517,7 +2558,10 @@ pub fn execve_target(t: exec::Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Res
     // ptrace されていれば (SEIZE でなく、PTRACE_O_TRACEEXEC でもなければ) 自分に SIGTRAP (Linux の ptrace_event の
     // 古い形の exec の知らせ)
     let p = current();
-    if p.ptracer != 0 && !p.pt_seized && p.pt_opts & crate::signal::PTRACE_O_TRACEEXEC == 0 {
+    if p.ptracer != 0 && p.pt_opts & crate::signal::PTRACE_O_TRACEEXEC != 0 {
+        // PTRACE_EVENT_EXEC (値は exec の前の tid)。新しいプログラムで、戻る前に止まる (trap.rs)
+        p.pt_event = Some((4, crate::ns::to_local(p.pid).unwrap_or(p.pid) as u64));
+    } else if p.ptracer != 0 && !p.pt_seized {
         crate::signal::send_thread(p, crate::signal::SIGTRAP, crate::signal::SigInfo::from(crate::signal::SI_USER));
     }
     Ok(())
@@ -2645,6 +2689,10 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 continue;
             }
             have = true;
+            // ほかの人が ptrace している子の終わりは、tracer が受けとってから (Linux の wait_consider_task)
+            if c.state == State::Zombie && c.ptracer != 0 && c.ptracer != my_tgid {
+                continue;
+            }
             let keep = options & WNOWAIT != 0;
             // ptrace で止まった子 (WUNTRACED がなくても: Linux の wait_task_stopped の ptrace)
             if c.ptracer == my_tgid && c.pt_status != 0 && !c.pt_reported {
@@ -2683,7 +2731,7 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             }
         }
         // 子でない tracee (ATTACH したもの: Linux の ptraced の並び)
-        for t in live().filter(|t| t.state != State::Unused && t.state != State::Zombie && t.ptracer == my_tgid && t.ppid != my_tgid) {
+        for t in live().filter(|t| t.state != State::Unused && t.ptracer == my_tgid && t.ppid != my_tgid) {
             let wanted = match pid {
                 p if p > 0 => t.pid as i64 == p,
                 0 => t.pgid == my_pgid,
@@ -2694,6 +2742,20 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                 continue;
             }
             have = true;
+            // 終わった tracee: tracer が終わりを受けとり、離して本当の親にわたす (回収は親)
+            if t.state == State::Zombie {
+                if options & WEXITED == 0 {
+                    continue;
+                }
+                let r = (crate::ns::to_local(t.pid).unwrap_or(t.pid), t.xstatus);
+                if options & WNOWAIT == 0 {
+                    t.ptracer = 0;
+                    if let Some(parent) = find_leader_any(t.ppid) {
+                        wakeup(parent as *mut Proc as usize);
+                    }
+                }
+                return Ok(r);
+            }
             if t.pt_status != 0 && !t.pt_reported {
                 if options & WNOWAIT == 0 {
                     t.pt_reported = true;

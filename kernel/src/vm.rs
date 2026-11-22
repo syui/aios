@@ -2551,6 +2551,24 @@ impl PageTable {
         done
     }
 
+    /// ptrace の POKETEXT / POKEDATA (Linux の FOLL_FORCE): 書けない写し (コード) にも、MAP_PRIVATE ならそのページを
+    /// 写しなおして書く (ブレークポイント)。共有で書けない領域には書かない。書けたバイト数
+    pub fn poke_remote(&mut self, mut va: usize, buf: &[u8]) -> usize {
+        let mut done = 0;
+        while done < buf.len() {
+            let Some(force) = self.find(va).and_then(|(_, v)| if v.prot & PROT_WRITE != 0 { Some(false) } else if !v.shared { Some(true) } else { None }) else { break };
+            let Some(pa) = self.user_pa(va, true, force) else { break };
+            let n = (PGSIZE - (va & (PGSIZE - 1))).min(buf.len() - done);
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf[done..].as_ptr(), p2v(pa) as *mut u8, n);
+                sync_icache(p2v(pa), n);
+            }
+            done += n;
+            va += n;
+        }
+        done
+    }
+
     /// /proc/PID/pagemap の 1 ページの 8 バイト (Linux の pte_to_pagemap_entry): 63 present、62 swapped、61 file (ページ
     /// キャッシュのページか共有の無名)、56 exclusive (写しているのが 1 つだけ)、PFN は show_pfn のときだけ (CAP_SYS_ADMIN)
     pub fn pagemap_entry(&self, va: usize, show_pfn: bool) -> u64 {

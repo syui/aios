@@ -825,7 +825,15 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   (/proc/PID/mem と同じ道。読めなければ EIO)、GETREGSET と SETREGSET の NT_PRSTATUS (x0〜x30、sp、pc、pstate。
   iov_len は写した長さに。ほかの note は EINVAL)、GETSIGINFO、SETOPTIONS (知らない印は EINVAL)、DETACH。PEEKUSR
   ほか知らないものは EIO。tracer が終われば tracee は離れる (PTRACE_O_EXITKILL なら殺す)。/proc/PID/status の
-  TracerPid。のこりは todo.json の syscall-gaps
+  TracerPid。知らせ (test/ptrace2.c、Linux と 10 行同じ): PTRACE_O_TRACEFORK / VFORK / CLONE なら新しい子も同じ tracer に
+  つながり (SIGSTOP で、SEIZE なら PTRACE_EVENT_STOP で止まる)、親はシステムコールから戻る前に PTRACE_EVENT_FORK ほかで
+  止まる (GETEVENTMSG は子の pid)。TRACEEXEC は新しいプログラムで PTRACE_EVENT_EXEC (値は前の tid)、TRACEEXIT は終わる
+  前に PTRACE_EVENT_EXIT (値は wait の status。SIGKILL なら止まらない)。子でない tracee の終わりは tracer が先に wait で
+  受けとり (本当の親はそれまで回収できない)、無視するシグナルも ptrace されていれば捨てずに tracer に見せる。POKETEXT と
+  POKEDATA は書けない写しにも書く (MAP_PRIVATE ならそのページを写しなおす: FOLL_FORCE。ブレークポイント)。
+  GETREGSET / SETREGSET の NT_PRFPREG (v0〜v31、fpsr、fpcr: 528 バイト) と NT_ARM_SYSTEM_CALL (入口で番号を変える。
+  -1 なら呼ばない。ユーザーの x8 は変えない)、PTRACE_GET_SYSCALL_INFO (入口 80、出口 33、ほか 24 バイト)。
+  のこりは todo.json の syscall-gaps
 - cwd からの相対パスの許可 (test/cwdperm.c、root で ext4 と tmpfs で Linux と同じ): Linux は cwd (と開いているディレクトリ)
   から先だけを通れればよい (0700 のディレクトリの中に cd してから setuid した人も、cwd の中は使える)。aios のパスの覚えと
   ロックなしの stat の表は根からのパスで引くので、上のディレクトリが通れないと EACCES だった。いまは、根からたどって
